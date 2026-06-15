@@ -1,6 +1,7 @@
 mod backend;
 mod inspect;
 mod lora;
+mod moe;
 mod parallel;
 mod parallel_modules;
 mod runtime;
