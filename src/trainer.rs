@@ -17,6 +17,7 @@ use crate::{
         Config, init_logging, load_config, prepare_run_directory, validate_config,
         write_resolved_config,
     },
+    tch_train::train_tch_tiny_lm,
     text_data::{SftDataset, SftSample, TokenizedDataset, load_sft_dataset, load_text_dataset},
     toy_model::{AdamW, QwenLikeModel, masked_cross_entropy_loss, masked_logits_gradient},
 };
@@ -92,6 +93,27 @@ pub fn train(config_path: &Path, resume_from: Option<PathBuf>) -> Result<()> {
         println!("run_dir: {}", run_paths.root.display());
         println!("resolved_config: {}", run_paths.resolved_config.display());
         println!("log_file: {}", run_paths.logs.join("train.log").display());
+
+        return Ok(());
+    }
+
+    if matches!(config.train.backend, BackendKind::Tch)
+        && config.model.architecture == "tch_tiny_lm"
+    {
+        let summary = train_tch_tiny_lm(&config)?;
+        info!(
+            initial_loss = summary.initial_loss,
+            final_loss = summary.final_loss,
+            embedding_grad_defined = summary.embedding_grad_defined,
+            lm_head_grad_defined = summary.lm_head_grad_defined,
+            "tch tiny lm smoke complete"
+        );
+        println!("rustrain tch tiny lm smoke complete");
+        println!("run_dir: {}", run_paths.root.display());
+        println!("initial_loss: {:.6}", summary.initial_loss);
+        println!("final_loss: {:.6}", summary.final_loss);
+        println!("embedding_grad_defined: {}", summary.embedding_grad_defined);
+        println!("lm_head_grad_defined: {}", summary.lm_head_grad_defined);
 
         return Ok(());
     }

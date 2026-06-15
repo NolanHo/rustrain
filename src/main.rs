@@ -7,6 +7,7 @@ mod parallel_modules;
 mod qwen_module;
 mod qwen_parity;
 mod runtime;
+mod tch_train;
 mod text_data;
 mod toy_model;
 mod trainer;
