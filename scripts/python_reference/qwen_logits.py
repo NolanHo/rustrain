@@ -8,6 +8,7 @@ import json
 from pathlib import Path
 
 import torch
+from safetensors.torch import save_file
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 
@@ -19,7 +20,21 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--model-path", type=Path, default=DEFAULT_MODEL)
     parser.add_argument("--prompt-file", type=Path, default=DEFAULT_PROMPT)
-    parser.add_argument("--output", type=Path, default=Path("runs/parity/qwen_logits.pt"))
+    parser.add_argument(
+        "--output",
+        type=Path,
+        default=Path("runs/parity/qwen2_5_0_5b_logits.pt"),
+    )
+    parser.add_argument(
+        "--safetensors-output",
+        type=Path,
+        default=Path("runs/parity/qwen2_5_0_5b_logits.safetensors"),
+    )
+    parser.add_argument(
+        "--summary-output",
+        type=Path,
+        default=Path("data/parity/qwen2_5_0_5b_logits_summary.json"),
+    )
     parser.add_argument("--top-k", type=int, default=8)
     args = parser.parse_args()
 
@@ -56,6 +71,14 @@ def main() -> None:
         },
         args.output,
     )
+    args.safetensors_output.parent.mkdir(parents=True, exist_ok=True)
+    save_file(
+        {
+            "input_ids": inputs["input_ids"].cpu().contiguous(),
+            "logits": logits,
+        },
+        args.safetensors_output,
+    )
 
     summary = {
         "model_path": str(args.model_path),
@@ -69,7 +92,10 @@ def main() -> None:
             for token_id, value in zip(indices.tolist(), values.tolist())
         ],
         "output": str(args.output),
+        "safetensors_output": str(args.safetensors_output),
     }
+    args.summary_output.parent.mkdir(parents=True, exist_ok=True)
+    args.summary_output.write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n")
     print(json.dumps(summary, indent=2, sort_keys=True))
 
 

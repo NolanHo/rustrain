@@ -57,5 +57,6 @@
   "model_path": "/vePFS-Mindverse/share/huggingface/Qwen2.5-0.5B-Instruct",
   "output": "runs/parity/qwen2_5_0_5b_logits.pt",
   "prompt": "rustrain parity check: explain why Rust training needs deterministic logits.",
-  "prompt_file": "data/parity/qwen_prompt.txt"
+  "prompt_file": "data/parity/qwen_prompt.txt",
+  "safetensors_output": "runs/parity/qwen2_5_0_5b_logits.safetensors"
 }
