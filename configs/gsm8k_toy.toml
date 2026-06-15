@@ -20,6 +20,7 @@ rms_norm_eps = 0.000001
 
 [train]
 max_steps = 20
+backend = "nd_array"
 micro_batch_size = 1
 global_batch_size = 1
 gradient_accumulation_steps = 2

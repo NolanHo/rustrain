@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use tracing::info;
 
 use crate::{
+    backend::{Backend, NdArrayBackend},
     runtime::{
         Config, init_logging, load_config, prepare_run_directory, validate_config,
         write_resolved_config,
@@ -38,6 +39,13 @@ pub fn train(config_path: &Path, resume_from: Option<PathBuf>) -> Result<()> {
     info!(checkpoints_dir = %run_paths.checkpoints.display(), "created checkpoint directory");
     info!(seed = config.run.seed, "seed configured");
     info!(device = ?config.train.device, dtype = ?config.train.dtype, "training policy configured");
+    let backend = NdArrayBackend;
+    info!(
+        backend = ?backend.kind(),
+        supports_autograd = backend.supports_autograd(),
+        supports_cuda = backend.supports_cuda(),
+        "backend configured"
+    );
     info!(model = ?config.model, "model config");
     info!(train = ?config.train, "train config");
     info!(parallel = ?config.parallel, "parallel config");

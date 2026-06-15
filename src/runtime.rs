@@ -8,6 +8,8 @@ use chrono::Local;
 use serde::{Deserialize, Serialize};
 use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
+use crate::backend::BackendKind;
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Config {
     pub run: RunConfig,
@@ -47,6 +49,8 @@ pub struct TrainConfig {
     pub max_steps: u64,
     #[serde(default)]
     pub resume_from: Option<PathBuf>,
+    #[serde(default = "default_backend")]
+    pub backend: BackendKind,
     pub micro_batch_size: usize,
     pub global_batch_size: usize,
     pub gradient_accumulation_steps: usize,
@@ -116,8 +120,10 @@ pub fn load_config(path: &Path) -> Result<Config> {
 }
 
 pub fn validate_config(config: &Config) -> Result<()> {
-    if !matches!(config.train.device, Device::Cpu) {
-        return Err(anyhow!("M1 toy backend only supports device = \"cpu\""));
+    if matches!(config.train.backend, BackendKind::NdArray)
+        && !matches!(config.train.device, Device::Cpu)
+    {
+        return Err(anyhow!("ndarray backend only supports device = \"cpu\""));
     }
 
     let model = &config.model;
@@ -269,4 +275,8 @@ fn default_train_split() -> f32 {
 
 fn default_eval_every() -> u64 {
     0
+}
+
+fn default_backend() -> BackendKind {
+    BackendKind::NdArray
 }
