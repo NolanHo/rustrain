@@ -2,7 +2,7 @@ use std::{collections::BTreeMap, fs, path::Path};
 
 use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
-use tch::{Device, IndexOp, Kind, Tensor};
+use tch::{Device, IndexOp, Kind, Reduction, Tensor, no_grad};
 
 #[derive(Debug, Serialize)]
 pub struct DiffStats {
@@ -64,6 +64,18 @@ struct QwenGenerateParitySummary {
     generated_ids: Vec<i64>,
     new_token_ids: Vec<i64>,
     reference_match: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct QwenTiedHeadTrainSummary {
+    model_path: String,
+    reference_fixture: String,
+    trainable_tensor: String,
+    learning_rate: f64,
+    initial_loss: f64,
+    final_loss: f64,
+    grad_defined: bool,
+    grad_norm: f64,
 }
 
 pub fn qwen_module_parity(model_safetensors: &Path, fixture: &Path) -> Result<()> {
@@ -231,6 +243,70 @@ pub fn qwen_generate_parity(model_path: &Path, reference_fixture: &Path) -> Resu
     Ok(())
 }
 
+pub fn qwen_tied_head_train_smoke(
+    model_path: &Path,
+    reference_fixture: &Path,
+    learning_rate: f64,
+) -> Result<()> {
+    if learning_rate <= 0.0 {
+        bail!("learning_rate must be positive");
+    }
+
+    let config = read_runtime_config(&model_path.join("config.json"))?;
+    let mut weights = read_safetensors_map(&model_path.join("model.safetensors"))?;
+    let reference = read_safetensors_map(reference_fixture)?;
+    let input_ids = tensor(&reference, "input_ids")?.to_kind(Kind::Int64);
+    if input_ids.size()[1] < 2 {
+        bail!("training fixture must contain at least two tokens");
+    }
+
+    let mut embed_tokens = tensor(&weights, "model.embed_tokens.weight")?
+        .to_kind(Kind::Float)
+        .set_requires_grad(true);
+    weights.insert(
+        "model.embed_tokens.weight".to_string(),
+        embed_tokens.shallow_clone(),
+    );
+
+    let initial_loss = qwen_causal_lm_loss(&input_ids, &weights, &config)?.double_value(&[]);
+    let loss = qwen_causal_lm_loss(&input_ids, &weights, &config)?;
+    loss.backward();
+    let grad = embed_tokens.grad();
+    let grad_defined = grad.defined();
+    let grad_norm = if grad_defined {
+        grad.norm().double_value(&[])
+    } else {
+        0.0
+    };
+    if !grad_defined || grad_norm <= 0.0 {
+        bail!("tied embedding gradient was not populated");
+    }
+
+    let update = &grad * learning_rate;
+    let _ = no_grad(|| embed_tokens.f_sub_(&update))?;
+
+    let final_loss = qwen_causal_lm_loss(&input_ids, &weights, &config)?.double_value(&[]);
+    if final_loss >= initial_loss {
+        bail!(
+            "Qwen tied-head train smoke failed to reduce loss: initial_loss={initial_loss}, final_loss={final_loss}"
+        );
+    }
+
+    let summary = QwenTiedHeadTrainSummary {
+        model_path: model_path.display().to_string(),
+        reference_fixture: reference_fixture.display().to_string(),
+        trainable_tensor: "model.embed_tokens.weight".to_string(),
+        learning_rate,
+        initial_loss,
+        final_loss,
+        grad_defined,
+        grad_norm,
+    };
+    println!("{}", serde_json::to_string_pretty(&summary)?);
+
+    Ok(())
+}
+
 fn read_runtime_config(path: &Path) -> Result<QwenRuntimeConfig> {
     let contents =
         fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
@@ -372,6 +448,22 @@ pub fn qwen_forward_from_ids(
     Ok(hidden.linear::<&Tensor>(&embed_tokens, None))
 }
 
+fn qwen_causal_lm_loss(
+    input_ids: &Tensor,
+    weights: &BTreeMap<String, Tensor>,
+    config: &QwenRuntimeConfig,
+) -> Result<Tensor> {
+    let logits = qwen_forward_from_ids(input_ids, weights, config)?;
+    let seq_len = input_ids.size()[1];
+    let shifted_logits = logits.narrow(1, 0, seq_len - 1);
+    let targets = input_ids.narrow(1, 1, seq_len - 1);
+    let vocab_size = shifted_logits.size()[2];
+    Ok(shifted_logits
+        .reshape([-1, vocab_size])
+        .log_softmax(-1, Kind::Float)
+        .g_nll_loss::<&Tensor>(&targets.reshape([-1]), None, Reduction::Mean, -100))
+}
+
 pub fn qwen_greedy_generate(
     input_ids: &Tensor,
     weights: &BTreeMap<String, Tensor>,
@@ -501,5 +593,84 @@ mod tests {
 
         let values: Vec<f32> = Vec::<f32>::try_from(output.reshape([4])).unwrap();
         assert_eq!(values, vec![-3.0, -4.0, 1.0, 2.0]);
+    }
+
+    #[test]
+    fn qwen_causal_lm_loss_is_finite_for_tiny_weights() {
+        let config = QwenRuntimeConfig {
+            num_hidden_layers: 1,
+            num_attention_heads: 2,
+            num_key_value_heads: 1,
+            rms_norm_eps: 1e-6,
+            rope_theta: 10_000.0,
+        };
+        let weights = tiny_qwen_weights();
+        let input_ids = Tensor::from_slice(&[0_i64, 1, 2, 3]).reshape([1, 4]);
+
+        let loss = qwen_causal_lm_loss(&input_ids, &weights, &config).expect("loss should run");
+
+        assert_eq!(loss.size(), Vec::<i64>::new());
+        assert!(loss.isfinite().int64_value(&[]) == 1);
+    }
+
+    fn tiny_qwen_weights() -> BTreeMap<String, Tensor> {
+        let mut weights = BTreeMap::new();
+        weights.insert(
+            "model.embed_tokens.weight".to_string(),
+            Tensor::arange(24, (Kind::Float, Device::Cpu)).reshape([6, 4]) / 24.0,
+        );
+        weights.insert(
+            "model.norm.weight".to_string(),
+            Tensor::ones([4], (Kind::Float, Device::Cpu)),
+        );
+        weights.insert(
+            "model.layers.0.input_layernorm.weight".to_string(),
+            Tensor::ones([4], (Kind::Float, Device::Cpu)),
+        );
+        weights.insert(
+            "model.layers.0.post_attention_layernorm.weight".to_string(),
+            Tensor::ones([4], (Kind::Float, Device::Cpu)),
+        );
+        weights.insert(
+            "model.layers.0.self_attn.q_proj.weight".to_string(),
+            Tensor::eye(4, (Kind::Float, Device::Cpu)),
+        );
+        weights.insert(
+            "model.layers.0.self_attn.q_proj.bias".to_string(),
+            Tensor::zeros([4], (Kind::Float, Device::Cpu)),
+        );
+        weights.insert(
+            "model.layers.0.self_attn.k_proj.weight".to_string(),
+            Tensor::ones([2, 4], (Kind::Float, Device::Cpu)) * 0.05,
+        );
+        weights.insert(
+            "model.layers.0.self_attn.k_proj.bias".to_string(),
+            Tensor::zeros([2], (Kind::Float, Device::Cpu)),
+        );
+        weights.insert(
+            "model.layers.0.self_attn.v_proj.weight".to_string(),
+            Tensor::ones([2, 4], (Kind::Float, Device::Cpu)) * 0.03,
+        );
+        weights.insert(
+            "model.layers.0.self_attn.v_proj.bias".to_string(),
+            Tensor::zeros([2], (Kind::Float, Device::Cpu)),
+        );
+        weights.insert(
+            "model.layers.0.self_attn.o_proj.weight".to_string(),
+            Tensor::ones([4, 4], (Kind::Float, Device::Cpu)) * 0.02,
+        );
+        weights.insert(
+            "model.layers.0.mlp.gate_proj.weight".to_string(),
+            Tensor::ones([8, 4], (Kind::Float, Device::Cpu)) * 0.01,
+        );
+        weights.insert(
+            "model.layers.0.mlp.up_proj.weight".to_string(),
+            Tensor::ones([8, 4], (Kind::Float, Device::Cpu)) * 0.02,
+        );
+        weights.insert(
+            "model.layers.0.mlp.down_proj.weight".to_string(),
+            Tensor::ones([4, 8], (Kind::Float, Device::Cpu)) * 0.03,
+        );
+        weights
     }
 }

@@ -79,6 +79,17 @@ enum Command {
         #[arg(long, default_value = "runs/parity/qwen2_5_0_5b_generate.safetensors")]
         reference_fixture: PathBuf,
     },
+    QwenTiedHeadTrainSmoke {
+        #[arg(
+            long,
+            default_value = "/vePFS-Mindverse/share/huggingface/Qwen2.5-0.5B-Instruct"
+        )]
+        model_path: PathBuf,
+        #[arg(long, default_value = "runs/parity/qwen2_5_0_5b_logits.safetensors")]
+        reference_fixture: PathBuf,
+        #[arg(long, default_value_t = 1e-4)]
+        learning_rate: f64,
+    },
 }
 
 fn main() -> Result<()> {
@@ -111,5 +122,12 @@ fn main() -> Result<()> {
             model_path,
             reference_fixture,
         } => qwen_module::qwen_generate_parity(&model_path, &reference_fixture),
+        Command::QwenTiedHeadTrainSmoke {
+            model_path,
+            reference_fixture,
+            learning_rate,
+        } => {
+            qwen_module::qwen_tied_head_train_smoke(&model_path, &reference_fixture, learning_rate)
+        }
     }
 }
