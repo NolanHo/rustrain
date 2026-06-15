@@ -2,12 +2,14 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow};
 use ndarray::{Array2, array};
+use rand::{SeedableRng, rngs::StdRng};
+use rand_distr::{Distribution, Normal};
 use serde::{Deserialize, Serialize};
 use tracing::info;
 
 use crate::{
     backend::{Backend, NdArrayBackend},
-    lora::lora_smoke,
+    lora::{LoraLinear, lora_smoke},
     moe::{deepseek_moe_smoke, moe_smoke},
     parallel::{ProcessGroup, SingleRankProcessGroup},
     parallel_modules::tp1_module_smoke,
@@ -15,8 +17,8 @@ use crate::{
         Config, init_logging, load_config, prepare_run_directory, validate_config,
         write_resolved_config,
     },
-    text_data::{TokenizedDataset, load_text_dataset},
-    toy_model::{AdamW, QwenLikeModel},
+    text_data::{SftDataset, SftSample, TokenizedDataset, load_sft_dataset, load_text_dataset},
+    toy_model::{AdamW, QwenLikeModel, masked_cross_entropy_loss, masked_logits_gradient},
 };
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -93,8 +95,11 @@ pub fn train(config_path: &Path, resume_from: Option<PathBuf>) -> Result<()> {
         return Ok(());
     }
 
-    if config.data.is_some() {
-        return train_text_data(&config, &run_paths);
+    if let Some(data) = &config.data {
+        return match data.kind {
+            crate::runtime::DataKind::Text => train_text_data(&config, &run_paths),
+            crate::runtime::DataKind::InstructionJsonl => train_sft_data(&config, &run_paths),
+        };
     }
 
     train_fixed_batch(&config, &run_paths)
@@ -251,6 +256,168 @@ fn train_text_data(config: &Config, run_paths: &crate::runtime::RunPaths) -> Res
     );
 
     Ok(())
+}
+
+fn train_sft_data(config: &Config, run_paths: &crate::runtime::RunPaths) -> Result<()> {
+    let data_config = config.data.as_ref().expect("data config should exist");
+    let dataset = load_sft_dataset(
+        data_config,
+        config.model.vocab_size,
+        config.model.seq_len,
+        &run_paths.cache,
+    )?;
+    let SftDataset {
+        tokenizer,
+        train_samples,
+        eval_samples,
+    } = dataset;
+    let base_model = QwenLikeModel::new(config.model.clone(), config.run.seed);
+    let mut adapter = initialize_lm_head_lora(&base_model, config.run.seed + 1, 4, 8.0);
+    let prompt = train_samples[0].tokens[..(train_samples[0].tokens.len() / 2).max(1)].to_vec();
+    let before_generated = base_model.generate_greedy(&prompt, 4);
+    let initial_eval = eval_sft_loss(&base_model, &adapter, &eval_samples);
+    let mut last_eval = initial_eval;
+
+    info!(
+        train_samples = train_samples.len(),
+        eval_samples = eval_samples.len(),
+        trainable_adapter_params = adapter.adapter_param_count(),
+        initial_eval_loss = initial_eval,
+        "starting local SFT training"
+    );
+
+    for step in 1..=config.train.max_steps {
+        for accumulation_index in 0..config.train.gradient_accumulation_steps {
+            let sample =
+                &train_samples[(step as usize + accumulation_index - 1) % train_samples.len()];
+            sft_step(
+                &base_model,
+                &mut adapter,
+                sample,
+                config.train.learning_rate,
+            );
+        }
+
+        let train_loss = sft_loss(
+            &base_model,
+            &adapter,
+            &train_samples[(step as usize - 1) % train_samples.len()],
+        );
+        if step == 1 || step == config.train.max_steps || step % 10 == 0 {
+            info!(step, train_loss, "SFT train step");
+        }
+
+        if config.train.eval_every > 0 && step % config.train.eval_every == 0 {
+            last_eval = eval_sft_loss(&base_model, &adapter, &eval_samples);
+            info!(step, eval_loss = last_eval, "SFT eval step");
+        }
+    }
+
+    let final_eval = eval_sft_loss(&base_model, &adapter, &eval_samples);
+    let adapter_path = run_paths.checkpoints.join("adapter-final.toml");
+    adapter.save_adapter(&adapter_path)?;
+
+    let mut reloaded_adapter = initialize_lm_head_lora(&base_model, config.run.seed + 1, 4, 8.0);
+    reloaded_adapter.load_adapter(&adapter_path)?;
+    let reload_eval = eval_sft_loss(&base_model, &reloaded_adapter, &eval_samples);
+    if (final_eval - reload_eval).abs() > 1e-5 {
+        return Err(anyhow!(
+            "SFT adapter reload parity failed: final_eval={final_eval}, reload_eval={reload_eval}"
+        ));
+    }
+
+    let after_generated = generate_with_lora_lm_head(&base_model, &reloaded_adapter, &prompt, 4);
+    let before_path = run_paths.root.join("generate_before.txt");
+    let after_path = run_paths.root.join("generate_after.txt");
+    std::fs::write(&before_path, tokenizer.decode_lossy(&before_generated))
+        .with_context(|| format!("failed to write {}", before_path.display()))?;
+    std::fs::write(&after_path, tokenizer.decode_lossy(&after_generated))
+        .with_context(|| format!("failed to write {}", after_path.display()))?;
+
+    info!(
+        final_eval,
+        reload_eval,
+        adapter_checkpoint = %adapter_path.display(),
+        generate_before = %before_path.display(),
+        generate_after = %after_path.display(),
+        "SFT training complete"
+    );
+
+    println!("rustrain M7-lite complete");
+    println!("run_dir: {}", run_paths.root.display());
+    println!("initial_eval_loss: {initial_eval:.6}");
+    println!("last_logged_eval_loss: {last_eval:.6}");
+    println!("final_eval_loss: {final_eval:.6}");
+    println!("reload_eval_loss: {reload_eval:.6}");
+    println!("adapter_checkpoint: {}", adapter_path.display());
+    println!("generate_before: {}", before_path.display());
+    println!("generate_after: {}", after_path.display());
+
+    Ok(())
+}
+
+fn initialize_lm_head_lora(
+    model: &QwenLikeModel,
+    seed: u64,
+    rank: usize,
+    alpha: f32,
+) -> LoraLinear {
+    let (in_features, out_features) = model.lm_head_dim();
+    let mut rng = StdRng::seed_from_u64(seed);
+    let normal = Normal::new(0.0, 0.02).expect("normal init should be valid");
+    let lora_a = Array2::from_shape_fn((in_features, rank), |_| normal.sample(&mut rng));
+    let lora_b = Array2::zeros((rank, out_features));
+    LoraLinear::with_adapter(model.lm_head_weight(), lora_a, lora_b, alpha)
+}
+
+fn sft_step(model: &QwenLikeModel, adapter: &mut LoraLinear, sample: &SftSample, lr: f32) {
+    let inputs = &sample.tokens[..sample.tokens.len() - 1];
+    let targets = sample.tokens[1..].to_vec();
+    let activations = model.forward(inputs);
+    let logits = adapter.forward(&activations.hidden);
+    let grad_logits = masked_logits_gradient(&logits, &targets, &sample.target_mask);
+    adapter.step_adapter(&activations.hidden, &grad_logits, lr);
+}
+
+fn sft_loss(model: &QwenLikeModel, adapter: &LoraLinear, sample: &SftSample) -> f32 {
+    let inputs = &sample.tokens[..sample.tokens.len() - 1];
+    let targets = sample.tokens[1..].to_vec();
+    let activations = model.forward(inputs);
+    let logits = adapter.forward(&activations.hidden);
+    masked_cross_entropy_loss(&logits, &targets, &sample.target_mask)
+}
+
+fn eval_sft_loss(model: &QwenLikeModel, adapter: &LoraLinear, samples: &[SftSample]) -> f32 {
+    samples
+        .iter()
+        .map(|sample| sft_loss(model, adapter, sample))
+        .sum::<f32>()
+        / samples.len() as f32
+}
+
+fn generate_with_lora_lm_head(
+    model: &QwenLikeModel,
+    adapter: &LoraLinear,
+    prompt: &[usize],
+    max_new_tokens: usize,
+) -> Vec<usize> {
+    let mut tokens = prompt.to_vec();
+
+    for _ in 0..max_new_tokens {
+        let activations = model.forward(&tokens);
+        let logits = adapter.forward(&activations.hidden);
+        let last = logits.row(logits.nrows() - 1);
+        let next = last
+            .iter()
+            .copied()
+            .enumerate()
+            .max_by(|(_, left), (_, right)| left.total_cmp(right))
+            .map(|(index, _)| index)
+            .expect("logits should be non-empty");
+        tokens.push(next);
+    }
+
+    tokens
 }
 
 fn load_or_initialize(config: &Config) -> Result<(QwenLikeModel, AdamW, u64)> {

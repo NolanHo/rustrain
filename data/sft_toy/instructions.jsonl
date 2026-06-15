@@ -1,0 +1,6 @@
+{"instruction":"Reply with the project name.","response":"rustrain"}
+{"instruction":"Name the language used by rustrain.","response":"Rust"}
+{"instruction":"What does the trainer write after training?","response":"checkpoint"}
+{"instruction":"Answer with the backend used in the toy run.","response":"ndarray"}
+{"instruction":"Complete the phrase: response only loss trains the","response":"answer tokens"}
+{"instruction":"Give the short name for low rank adaptation.","response":"LoRA"}

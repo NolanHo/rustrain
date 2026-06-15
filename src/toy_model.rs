@@ -37,6 +37,7 @@ pub struct LossOutput {
     pub loss: f32,
     pub logits: Array2<f32>,
     pub targets: Vec<usize>,
+    pub target_mask: Vec<bool>,
     pub activations: ForwardActivations,
 }
 
@@ -94,28 +95,34 @@ impl QwenLikeModel {
     }
 
     pub fn loss(&self, tokens: &[usize]) -> LossOutput {
+        let target_mask = vec![true; tokens.len() - 1];
+        self.loss_with_target_mask(tokens, &target_mask)
+    }
+
+    pub fn loss_with_target_mask(&self, tokens: &[usize], target_mask: &[bool]) -> LossOutput {
         let inputs = &tokens[..tokens.len() - 1];
         let targets = tokens[1..].to_vec();
+        assert_eq!(
+            target_mask.len(),
+            targets.len(),
+            "target mask should align with causal targets"
+        );
         let activations = self.forward(inputs);
         let logits = self.logits_from_activations(&activations);
-        let loss = cross_entropy_loss(&logits, &targets);
+        let loss = masked_cross_entropy_loss(&logits, &targets, target_mask);
 
         LossOutput {
             loss,
             logits,
             targets,
+            target_mask: target_mask.to_vec(),
             activations,
         }
     }
 
     pub fn lm_head_gradient(&self, output: &LossOutput) -> Array2<f32> {
-        let mut grad_logits = softmax(&output.logits);
-        let denom = output.targets.len() as f32;
-
-        for (position, target) in output.targets.iter().copied().enumerate() {
-            grad_logits[[position, target]] -= 1.0;
-        }
-        grad_logits /= denom;
+        let grad_logits =
+            masked_logits_gradient(&output.logits, &output.targets, &output.target_mask);
 
         output.activations.hidden.t().dot(&grad_logits)
     }
@@ -126,6 +133,10 @@ impl QwenLikeModel {
 
     pub fn lm_head_dim(&self) -> (usize, usize) {
         self.lm_head.dim()
+    }
+
+    pub fn lm_head_weight(&self) -> Array2<f32> {
+        self.lm_head.clone()
     }
 
     pub fn generate_greedy(&self, prompt: &[usize], max_new_tokens: usize) -> Vec<usize> {
@@ -292,15 +303,48 @@ fn softmax_vec(logits: &[f32]) -> Vec<f32> {
     probs
 }
 
-fn cross_entropy_loss(logits: &Array2<f32>, targets: &[usize]) -> f32 {
+pub fn masked_cross_entropy_loss(
+    logits: &Array2<f32>,
+    targets: &[usize],
+    target_mask: &[bool],
+) -> f32 {
     let probs = softmax(logits);
     let mut loss = 0.0;
+    let mut denom = 0usize;
 
     for (position, target) in targets.iter().copied().enumerate() {
+        if !target_mask[position] {
+            continue;
+        }
         loss -= probs[[position, target]].max(1e-9).ln();
+        denom += 1;
     }
 
-    loss / targets.len() as f32
+    assert!(denom > 0, "masked loss requires at least one target");
+    loss / denom as f32
+}
+
+pub fn masked_logits_gradient(
+    logits: &Array2<f32>,
+    targets: &[usize],
+    target_mask: &[bool],
+) -> Array2<f32> {
+    let mut grad_logits = softmax(logits);
+    let denom = target_mask.iter().filter(|enabled| **enabled).count();
+    assert!(denom > 0, "masked gradient requires at least one target");
+
+    for (position, target) in targets.iter().copied().enumerate() {
+        if target_mask[position] {
+            grad_logits[[position, target]] -= 1.0;
+            grad_logits
+                .row_mut(position)
+                .mapv_inplace(|value| value / denom as f32);
+        } else {
+            grad_logits.row_mut(position).fill(0.0);
+        }
+    }
+
+    grad_logits
 }
 
 fn rand_matrix(rows: usize, cols: usize, rng: &mut StdRng, scale: f32) -> Array2<f32> {
@@ -440,5 +484,16 @@ mod tests {
             .map(|value| value.abs())
             .fold(0.0, f32::max);
         assert!(max_delta < 1e-7, "max gradient delta was {max_delta}");
+    }
+
+    #[test]
+    fn masked_loss_ignores_disabled_targets() {
+        let logits = ndarray::array![[8.0, 0.0], [0.0, 8.0]];
+        let targets = vec![1, 1];
+        let masked = masked_cross_entropy_loss(&logits, &targets, &[false, true]);
+        let unmasked = masked_cross_entropy_loss(&logits, &targets, &[true, true]);
+
+        assert!(masked < 0.001);
+        assert!(unmasked > 3.0);
     }
 }

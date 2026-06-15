@@ -78,6 +78,7 @@ pub struct DataConfig {
 #[serde(rename_all = "snake_case")]
 pub enum DataKind {
     Text,
+    InstructionJsonl,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

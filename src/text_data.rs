@@ -24,6 +24,27 @@ pub struct TokenizedDataset {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SftDataset {
+    pub tokenizer: ByteTokenizer,
+    pub train_samples: Vec<SftSample>,
+    pub eval_samples: Vec<SftSample>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SftSample {
+    pub tokens: Vec<usize>,
+    pub target_mask: Vec<bool>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct InstructionRecord {
+    instruction: String,
+    #[serde(default)]
+    input: String,
+    response: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct TokenCache {
     source_paths: Vec<PathBuf>,
     vocab_size: usize,
@@ -31,6 +52,14 @@ struct TokenCache {
     eval_tokens: Vec<usize>,
     train_sequences: Vec<Vec<usize>>,
     eval_sequences: Vec<Vec<usize>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SftCache {
+    source_paths: Vec<PathBuf>,
+    vocab_size: usize,
+    train_samples: Vec<SftSample>,
+    eval_samples: Vec<SftSample>,
 }
 
 impl ByteTokenizer {
@@ -41,6 +70,20 @@ impl ByteTokenizer {
     pub fn encode(&self, text: &str) -> Vec<usize> {
         text.bytes()
             .map(|byte| (byte as usize) % self.vocab_size)
+            .collect()
+    }
+
+    pub fn decode_lossy(&self, tokens: &[usize]) -> String {
+        tokens
+            .iter()
+            .copied()
+            .filter_map(|token| {
+                if (32..=126).contains(&token) || token == b'\n' as usize {
+                    Some(token as u8 as char)
+                } else {
+                    None
+                }
+            })
             .collect()
     }
 }
@@ -104,6 +147,110 @@ pub fn load_text_dataset(
     Ok(dataset)
 }
 
+pub fn load_sft_dataset(
+    data: &DataConfig,
+    vocab_size: usize,
+    seq_len: usize,
+    cache_dir: &Path,
+) -> Result<SftDataset> {
+    let tokenizer = ByteTokenizer::new(vocab_size);
+    let mut samples = Vec::new();
+    let mut source_paths = Vec::new();
+
+    for path in &data.paths {
+        let files = if path.is_dir() {
+            sorted_files(path)?
+        } else {
+            vec![path.clone()]
+        };
+
+        for file in files {
+            let contents = fs::read_to_string(&file)
+                .with_context(|| format!("failed to read {}", file.display()))?;
+            for (line_index, line) in contents.lines().enumerate() {
+                if line.trim().is_empty() {
+                    continue;
+                }
+                let record: InstructionRecord = serde_json::from_str(line).with_context(|| {
+                    format!(
+                        "failed to parse JSONL record {}:{}",
+                        file.display(),
+                        line_index + 1
+                    )
+                })?;
+                samples.push(format_sft_sample(&tokenizer, seq_len, &record)?);
+            }
+            source_paths.push(file);
+        }
+    }
+
+    if samples.len() < 2 {
+        return Err(anyhow!("SFT dataset needs at least two samples"));
+    }
+
+    let split_at = ((samples.len() as f32) * data.train_split).floor() as usize;
+    let split_at = split_at.clamp(1, samples.len() - 1);
+    let train_samples = samples[..split_at].to_vec();
+    let eval_samples = samples[split_at..].to_vec();
+    let dataset = SftDataset {
+        tokenizer,
+        train_samples,
+        eval_samples,
+    };
+
+    write_sft_cache(cache_dir, &source_paths, vocab_size, &dataset)?;
+
+    Ok(dataset)
+}
+
+fn format_sft_sample(
+    tokenizer: &ByteTokenizer,
+    seq_len: usize,
+    record: &InstructionRecord,
+) -> Result<SftSample> {
+    let prompt = if record.input.trim().is_empty() {
+        format!("Instruction:\n{}\n\nResponse:\n", record.instruction)
+    } else {
+        format!(
+            "Instruction:\n{}\n\nInput:\n{}\n\nResponse:\n",
+            record.instruction, record.input
+        )
+    };
+    let response = format!("{}\n", record.response);
+    let prompt_tokens = tokenizer.encode(&prompt);
+    let response_tokens = tokenizer.encode(&response);
+
+    if response_tokens.is_empty() {
+        return Err(anyhow!("SFT response must not be empty"));
+    }
+    if prompt_tokens.len() + response_tokens.len() < 2 {
+        return Err(anyhow!("SFT sample must contain at least two tokens"));
+    }
+
+    let prompt_len = prompt_tokens.len();
+    let mut tokens = prompt_tokens;
+    tokens.extend(response_tokens);
+    let truncate_start = tokens.len().saturating_sub(seq_len);
+    if tokens.len() > seq_len {
+        tokens = tokens[truncate_start..].to_vec();
+    }
+
+    let response_start = prompt_len.saturating_sub(truncate_start);
+    let response_start = response_start.min(tokens.len() - 1);
+    let target_mask = (0..tokens.len() - 1)
+        .map(|target_index| target_index + 1 >= response_start)
+        .collect::<Vec<_>>();
+
+    if !target_mask.iter().any(|enabled| *enabled) {
+        return Err(anyhow!("SFT sample response mask is empty"));
+    }
+
+    Ok(SftSample {
+        tokens,
+        target_mask,
+    })
+}
+
 fn pack_sequences(tokens: &[usize], seq_len: usize) -> Vec<Vec<usize>> {
     tokens
         .windows(seq_len)
@@ -149,6 +296,27 @@ fn write_cache(
     })
 }
 
+fn write_sft_cache(
+    cache_dir: &Path,
+    source_paths: &[PathBuf],
+    vocab_size: usize,
+    dataset: &SftDataset,
+) -> Result<()> {
+    let cache = SftCache {
+        source_paths: source_paths.to_vec(),
+        vocab_size,
+        train_samples: dataset.train_samples.clone(),
+        eval_samples: dataset.eval_samples.clone(),
+    };
+    let contents = toml::to_string(&cache).context("failed to serialize SFT tokenized cache")?;
+    fs::write(cache_dir.join("sft_tokenized.toml"), contents).with_context(|| {
+        format!(
+            "failed to write {}",
+            cache_dir.join("sft_tokenized.toml").display()
+        )
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use std::io::Write;
@@ -183,5 +351,50 @@ mod tests {
         assert!(!dataset.eval_sequences.is_empty());
         assert_eq!(dataset.train_sequences[0].len(), 8);
         assert!(cache_dir.join("tokenized.toml").exists());
+    }
+
+    #[test]
+    fn sft_dataset_builds_response_only_masks_and_cache() {
+        let dir = tempdir().expect("temp dir should be created");
+        let data_dir = dir.path().join("sft");
+        let cache_dir = dir.path().join("cache");
+        fs::create_dir_all(&data_dir).expect("sft dir should be created");
+        fs::create_dir_all(&cache_dir).expect("cache dir should be created");
+        let mut file = fs::File::create(data_dir.join("sample.jsonl")).expect("file should open");
+        writeln!(
+            file,
+            "{{\"instruction\":\"say hi\",\"response\":\"hi\"}}\n{{\"instruction\":\"say bye\",\"input\":\"politely\",\"response\":\"bye\"}}"
+        )
+        .expect("file should write");
+
+        let data = DataConfig {
+            kind: DataKind::InstructionJsonl,
+            paths: vec![data_dir],
+            train_split: 0.5,
+        };
+        let dataset =
+            load_sft_dataset(&data, 128, 64, &cache_dir).expect("SFT dataset should load");
+
+        assert_eq!(dataset.train_samples.len(), 1);
+        assert_eq!(dataset.eval_samples.len(), 1);
+        assert!(
+            dataset.train_samples[0]
+                .target_mask
+                .iter()
+                .any(|enabled| *enabled)
+        );
+        assert!(
+            dataset.train_samples[0]
+                .target_mask
+                .iter()
+                .any(|enabled| !*enabled)
+        );
+        let response_targets = dataset.train_samples[0]
+            .target_mask
+            .iter()
+            .filter(|enabled| **enabled)
+            .count();
+        assert!(response_targets > 2);
+        assert!(cache_dir.join("sft_tokenized.toml").exists());
     }
 }

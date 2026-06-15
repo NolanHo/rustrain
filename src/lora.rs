@@ -81,14 +81,12 @@ impl LoraLinear {
         ]
     }
 
-    #[cfg(test)]
     pub fn save_adapter(&self, path: &std::path::Path) -> Result<()> {
         let contents = self.adapter_toml()?;
         std::fs::write(path, contents)
             .with_context(|| format!("failed to write {}", path.display()))
     }
 
-    #[cfg(test)]
     pub fn load_adapter(&mut self, path: &std::path::Path) -> Result<()> {
         let contents = std::fs::read_to_string(path)
             .with_context(|| format!("failed to read adapter {}", path.display()))?;
@@ -100,6 +98,21 @@ impl LoraLinear {
         self.alpha = adapter.alpha;
         self.merged = false;
         Ok(())
+    }
+
+    pub fn step_adapter(&mut self, input: &Array2<f32>, grad_output: &Array2<f32>, lr: f32) {
+        assert!(!self.merged, "cannot train a merged LoRA adapter");
+        let scale = self.alpha / self.rank as f32;
+        let grad_delta = input.t().dot(grad_output) * scale;
+        let grad_a = grad_delta.dot(&self.lora_b.t());
+        let grad_b = self.lora_a.t().dot(&grad_delta);
+
+        self.lora_a -= &(grad_a * lr);
+        self.lora_b -= &(grad_b * lr);
+    }
+
+    pub fn adapter_param_count(&self) -> usize {
+        self.lora_a.len() + self.lora_b.len()
     }
 
     pub fn adapter_toml(&self) -> Result<String> {
@@ -248,5 +261,21 @@ mod tests {
 
         assert_eq!(before, merged);
         assert_eq!(before, unmerged);
+    }
+
+    #[test]
+    fn adapter_step_changes_only_lora_path() {
+        let base = array![[1.0, 0.0], [0.0, 1.0]];
+        let input = array![[1.0, 2.0]];
+        let grad = array![[0.5, -0.25]];
+        let mut layer =
+            LoraLinear::with_adapter(base.clone(), array![[0.1], [0.2]], array![[0.3, -0.1]], 1.0);
+        let before = layer.forward(&input);
+
+        layer.step_adapter(&input, &grad, 0.1);
+
+        assert_ne!(before, layer.forward(&input));
+        assert_eq!(layer.base_weight, base);
+        assert_eq!(layer.adapter_param_count(), 4);
     }
 }
