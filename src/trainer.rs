@@ -8,7 +8,7 @@ use tracing::info;
 use crate::{
     backend::{Backend, NdArrayBackend},
     lora::lora_smoke,
-    moe::moe_smoke,
+    moe::{deepseek_moe_smoke, moe_smoke},
     parallel::{ProcessGroup, SingleRankProcessGroup},
     parallel_modules::tp1_module_smoke,
     runtime::{
@@ -49,6 +49,7 @@ pub fn train(config_path: &Path, resume_from: Option<PathBuf>) -> Result<()> {
     process_group.all_reduce_sum(&mut collective_smoke);
     let gathered = process_group.all_gather(&collective_smoke);
     process_group.barrier();
+    let deepseek_moe_stats = deepseek_moe_smoke();
     info!(
         backend = ?backend.kind(),
         supports_autograd = backend.supports_autograd(),
@@ -62,8 +63,21 @@ pub fn train(config_path: &Path, resume_from: Option<PathBuf>) -> Result<()> {
         tp1_module_smoke = tp1_module_smoke(),
         lora_trainable_params = lora_smoke(),
         moe_activated_params = moe_smoke(),
+        deepseek_moe_layers = deepseek_moe_stats.layers.len(),
+        deepseek_moe_shared_params = deepseek_moe_stats.shared_params,
+        deepseek_moe_routed_params = deepseek_moe_stats.routed_params,
+        deepseek_moe_total_params = deepseek_moe_stats.total_params,
+        deepseek_moe_activated_params = deepseek_moe_stats.activated_params,
         "parallel process group configured"
     );
+    for layer in &deepseek_moe_stats.layers {
+        info!(
+            layer = layer.layer_index,
+            routed_expert_load = ?layer.routed_expert_load,
+            load_balance_loss = layer.load_balance_loss,
+            "deepseek moe layer stats"
+        );
+    }
     info!(model = ?config.model, "model config");
     info!(train = ?config.train, "train config");
     info!(parallel = ?config.parallel, "parallel config");
