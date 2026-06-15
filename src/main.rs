@@ -1,4 +1,5 @@
 mod backend;
+mod distributed_smoke;
 mod inspect;
 mod lora;
 mod moe;
@@ -114,6 +115,21 @@ enum Command {
         #[arg(long, default_value_t = 1e-4)]
         learning_rate: f64,
     },
+    ParallelDpSmoke {
+        #[arg(long, default_value = "runs/parallel-dp-smoke")]
+        output_dir: PathBuf,
+        #[arg(long, default_value_t = 2)]
+        world_size: usize,
+    },
+    #[command(hide = true)]
+    ParallelDpRankSmoke {
+        #[arg(long)]
+        output_dir: PathBuf,
+        #[arg(long)]
+        rank: usize,
+        #[arg(long)]
+        world_size: usize,
+    },
 }
 
 fn main() -> Result<()> {
@@ -174,5 +190,14 @@ fn main() -> Result<()> {
             &delta_output,
             learning_rate,
         ),
+        Command::ParallelDpSmoke {
+            output_dir,
+            world_size,
+        } => distributed_smoke::run_data_parallel_smoke(&output_dir, world_size),
+        Command::ParallelDpRankSmoke {
+            output_dir,
+            rank,
+            world_size,
+        } => distributed_smoke::run_data_parallel_rank(output_dir, rank, world_size),
     }
 }
