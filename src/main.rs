@@ -87,6 +87,11 @@ enum Command {
         model_path: PathBuf,
         #[arg(long, default_value = "runs/parity/qwen2_5_0_5b_logits.safetensors")]
         reference_fixture: PathBuf,
+        #[arg(
+            long,
+            default_value = "runs/parity/qwen2_5_0_5b_tied_head_delta.safetensors"
+        )]
+        delta_output: PathBuf,
         #[arg(long, default_value_t = 1e-4)]
         learning_rate: f64,
     },
@@ -125,9 +130,13 @@ fn main() -> Result<()> {
         Command::QwenTiedHeadTrainSmoke {
             model_path,
             reference_fixture,
+            delta_output,
             learning_rate,
-        } => {
-            qwen_module::qwen_tied_head_train_smoke(&model_path, &reference_fixture, learning_rate)
-        }
+        } => qwen_module::qwen_tied_head_train_smoke(
+            &model_path,
+            &reference_fixture,
+            &delta_output,
+            learning_rate,
+        ),
     }
 }

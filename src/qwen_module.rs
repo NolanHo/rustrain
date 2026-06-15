@@ -70,10 +70,13 @@ struct QwenGenerateParitySummary {
 struct QwenTiedHeadTrainSummary {
     model_path: String,
     reference_fixture: String,
+    delta_output: String,
     trainable_tensor: String,
     learning_rate: f64,
     initial_loss: f64,
     final_loss: f64,
+    reloaded_loss: f64,
+    reload_delta: f64,
     grad_defined: bool,
     grad_norm: f64,
 }
@@ -246,6 +249,7 @@ pub fn qwen_generate_parity(model_path: &Path, reference_fixture: &Path) -> Resu
 pub fn qwen_tied_head_train_smoke(
     model_path: &Path,
     reference_fixture: &Path,
+    delta_output: &Path,
     learning_rate: f64,
 ) -> Result<()> {
     if learning_rate <= 0.0 {
@@ -291,14 +295,47 @@ pub fn qwen_tied_head_train_smoke(
             "Qwen tied-head train smoke failed to reduce loss: initial_loss={initial_loss}, final_loss={final_loss}"
         );
     }
+    let base_embed_tokens = tensor(
+        &read_safetensors_map(&model_path.join("model.safetensors"))?,
+        "model.embed_tokens.weight",
+    )?
+    .to_kind(Kind::Float);
+    let delta = &embed_tokens - &base_embed_tokens;
+    if let Some(parent) = delta_output.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+    Tensor::write_safetensors(
+        &[(&"model.embed_tokens.weight.delta", &delta)],
+        delta_output,
+    )
+    .with_context(|| format!("failed to write {}", delta_output.display()))?;
+
+    let mut reloaded_weights = read_safetensors_map(&model_path.join("model.safetensors"))?;
+    let delta_tensors = read_safetensors_map(delta_output)?;
+    let reloaded_embed = tensor(&reloaded_weights, "model.embed_tokens.weight")?
+        .to_kind(Kind::Float)
+        + tensor(&delta_tensors, "model.embed_tokens.weight.delta")?.to_kind(Kind::Float);
+    reloaded_weights.insert("model.embed_tokens.weight".to_string(), reloaded_embed);
+    let reloaded_loss =
+        qwen_causal_lm_loss(&input_ids, &reloaded_weights, &config)?.double_value(&[]);
+    let reload_delta = (final_loss - reloaded_loss).abs();
+    if reload_delta > 1e-5 {
+        bail!(
+            "Qwen tied-head delta reload parity failed: final_loss={final_loss}, reloaded_loss={reloaded_loss}, reload_delta={reload_delta}"
+        );
+    }
 
     let summary = QwenTiedHeadTrainSummary {
         model_path: model_path.display().to_string(),
         reference_fixture: reference_fixture.display().to_string(),
+        delta_output: delta_output.display().to_string(),
         trainable_tensor: "model.embed_tokens.weight".to_string(),
         learning_rate,
         initial_loss,
         final_loss,
+        reloaded_loss,
+        reload_delta,
         grad_defined,
         grad_norm,
     };
