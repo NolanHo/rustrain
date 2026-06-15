@@ -1,4 +1,5 @@
 mod backend;
+mod inspect;
 mod runtime;
 mod text_data;
 mod toy_model;
@@ -25,6 +26,14 @@ enum Command {
         #[arg(long)]
         resume_from: Option<PathBuf>,
     },
+    Inspect {
+        #[arg(long)]
+        model_path: PathBuf,
+        #[arg(long, default_value = "rustrain")]
+        prompt: String,
+        #[arg(long, default_value_t = 12)]
+        tensor_limit: usize,
+    },
 }
 
 fn main() -> Result<()> {
@@ -35,5 +44,10 @@ fn main() -> Result<()> {
             config,
             resume_from,
         } => trainer::train(&config, resume_from),
+        Command::Inspect {
+            model_path,
+            prompt,
+            tensor_limit,
+        } => inspect::inspect_model(&model_path, &prompt, tensor_limit),
     }
 }
