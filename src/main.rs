@@ -121,6 +121,10 @@ enum Command {
         #[arg(long, default_value_t = 2)]
         world_size: usize,
     },
+    ParallelTpSmoke {
+        #[arg(long, default_value_t = 2)]
+        world_size: usize,
+    },
     #[command(hide = true)]
     ParallelDpRankSmoke {
         #[arg(long)]
@@ -194,6 +198,9 @@ fn main() -> Result<()> {
             output_dir,
             world_size,
         } => distributed_smoke::run_data_parallel_smoke(&output_dir, world_size),
+        Command::ParallelTpSmoke { world_size } => {
+            distributed_smoke::run_tensor_parallel_smoke(world_size)
+        }
         Command::ParallelDpRankSmoke {
             output_dir,
             rank,

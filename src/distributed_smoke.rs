@@ -5,6 +5,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow, bail};
+use ndarray::{Array2, Axis, array, concatenate, s};
 use serde::{Deserialize, Serialize};
 
 const DP_WEIGHT: [f64; 2] = [0.2, -0.1];
@@ -36,6 +37,15 @@ struct DpSmokeSummary {
     grad_max_delta: f64,
     rank_logs: Vec<String>,
     rank0_checkpoint: String,
+}
+
+#[derive(Debug, Serialize)]
+struct TensorParallelSmokeSummary {
+    world_size: usize,
+    column_max_delta: f64,
+    row_max_delta: f64,
+    column_rank_shapes: Vec<Vec<usize>>,
+    row_rank_shapes: Vec<Vec<usize>>,
 }
 
 pub fn run_data_parallel_smoke(output_dir: &Path, world_size: usize) -> Result<()> {
@@ -194,6 +204,56 @@ pub fn run_data_parallel_rank(output_dir: PathBuf, rank: usize, world_size: usiz
     Ok(())
 }
 
+pub fn run_tensor_parallel_smoke(world_size: usize) -> Result<()> {
+    if world_size != 2 {
+        bail!("M13 TP smoke currently expects world_size = 2");
+    }
+
+    let input = array![[1.0_f64, 2.0, -1.0], [0.5, -0.25, 1.5]];
+    let column_weight = array![
+        [0.2_f64, -0.1, 0.4, 0.3],
+        [0.5, 0.7, -0.2, 0.1],
+        [-0.3, 0.6, 0.8, -0.4],
+    ];
+    let full_column = input.dot(&column_weight);
+    let column_rank0 = input.dot(&column_weight.slice(s![.., 0..2]).to_owned());
+    let column_rank1 = input.dot(&column_weight.slice(s![.., 2..4]).to_owned());
+    let gathered_column = concatenate(Axis(1), &[column_rank0.view(), column_rank1.view()])
+        .context("failed to gather column-parallel outputs")?;
+    let column_max_delta = max_abs_diff(&full_column, &gathered_column);
+
+    let row_weight = array![[0.3_f64, -0.5], [0.1, 0.2], [-0.4, 0.6], [0.8, -0.7],];
+    let row_input = array![[1.0_f64, 2.0, -1.0, 0.25], [0.5, -0.5, 1.5, 2.0]];
+    let full_row = row_input.dot(&row_weight);
+    let row_rank0 = row_input
+        .slice(s![.., 0..2])
+        .to_owned()
+        .dot(&row_weight.slice(s![0..2, ..]).to_owned());
+    let row_rank1 = row_input
+        .slice(s![.., 2..4])
+        .to_owned()
+        .dot(&row_weight.slice(s![2..4, ..]).to_owned());
+    let reduced_row = row_rank0.clone() + row_rank1.clone();
+    let row_max_delta = max_abs_diff(&full_row, &reduced_row);
+
+    if column_max_delta > 1e-12 || row_max_delta > 1e-12 {
+        bail!(
+            "TP=2 parity failed: column_max_delta={column_max_delta}, row_max_delta={row_max_delta}"
+        );
+    }
+
+    let summary = TensorParallelSmokeSummary {
+        world_size,
+        column_max_delta,
+        row_max_delta,
+        column_rank_shapes: vec![column_rank0.shape().to_vec(), column_rank1.shape().to_vec()],
+        row_rank_shapes: vec![row_rank0.shape().to_vec(), row_rank1.shape().to_vec()],
+    };
+    println!("{}", serde_json::to_string_pretty(&summary)?);
+
+    Ok(())
+}
+
 fn compute_dp_stats(rank: usize, world_size: usize) -> DpRankStats {
     let mut sample_count = 0;
     let mut loss_sum = 0.0;
@@ -218,6 +278,14 @@ fn compute_dp_stats(rank: usize, world_size: usize) -> DpRankStats {
         loss_sum,
         grad_sum,
     }
+}
+
+fn max_abs_diff(actual: &Array2<f64>, expected: &Array2<f64>) -> f64 {
+    actual
+        .iter()
+        .zip(expected.iter())
+        .map(|(actual, expected)| (actual - expected).abs())
+        .fold(0.0_f64, f64::max)
 }
 
 #[cfg(test)]
@@ -254,5 +322,10 @@ mod tests {
         assert!(temp.path().join("rank-1.log").exists());
         assert!(temp.path().join("rank0-checkpoint.json").exists());
         assert!(!temp.path().join("rank1-checkpoint.json").exists());
+    }
+
+    #[test]
+    fn tensor_parallel_smoke_runs_tp2_parity() {
+        run_tensor_parallel_smoke(2).expect("TP=2 parity should pass");
     }
 }
