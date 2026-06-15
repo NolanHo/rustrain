@@ -1,0 +1,16 @@
+{
+  "model_safetensors": "/vePFS-Mindverse/share/huggingface/Qwen2.5-0.5B-Instruct/model.safetensors",
+  "fixture": "runs/parity/qwen_layer0_modules.safetensors",
+  "attention_diff": {
+    "max_abs": 7.450580596923828e-8,
+    "mean_abs": 2.411774779886855e-9
+  },
+  "rms_norm_diff": {
+    "max_abs": 0.0,
+    "mean_abs": 0.0
+  },
+  "mlp_diff": {
+    "max_abs": 0.0,
+    "mean_abs": 0.0
+  }
+}

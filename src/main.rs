@@ -57,7 +57,7 @@ enum Command {
             default_value = "/vePFS-Mindverse/share/huggingface/Qwen2.5-0.5B-Instruct/model.safetensors"
         )]
         model_safetensors: PathBuf,
-        #[arg(long, default_value = "runs/parity/qwen_layer0_mlp.safetensors")]
+        #[arg(long, default_value = "runs/parity/qwen_layer0_modules.safetensors")]
         fixture: PathBuf,
     },
 }
