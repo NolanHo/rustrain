@@ -4,6 +4,7 @@ mod lora;
 mod moe;
 mod parallel;
 mod parallel_modules;
+mod qwen_module;
 mod qwen_parity;
 mod runtime;
 mod text_data;
@@ -50,6 +51,15 @@ enum Command {
         #[arg(long, default_value = "data/parity/qwen2_5_0_5b_logits_summary.json")]
         reference_summary: PathBuf,
     },
+    QwenModuleParity {
+        #[arg(
+            long,
+            default_value = "/vePFS-Mindverse/share/huggingface/Qwen2.5-0.5B-Instruct/model.safetensors"
+        )]
+        model_safetensors: PathBuf,
+        #[arg(long, default_value = "runs/parity/qwen_layer0_mlp.safetensors")]
+        fixture: PathBuf,
+    },
 }
 
 fn main() -> Result<()> {
@@ -70,5 +80,9 @@ fn main() -> Result<()> {
             prompt_file,
             reference_summary,
         } => qwen_parity::qwen_parity_smoke(&model_path, &prompt_file, &reference_summary),
+        Command::QwenModuleParity {
+            model_safetensors,
+            fixture,
+        } => qwen_module::qwen_module_parity(&model_safetensors, &fixture),
     }
 }
