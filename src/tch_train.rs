@@ -15,6 +15,28 @@ pub struct TchTrainSmokeSummary {
     pub lm_head_grad_defined: bool,
 }
 
+#[derive(Debug, serde::Serialize)]
+struct TchCudaProbeSummary {
+    cuda_available: bool,
+    device_count: i64,
+}
+
+pub fn probe_tch_cuda() -> Result<()> {
+    let summary = TchCudaProbeSummary {
+        cuda_available: Cuda::is_available(),
+        device_count: Cuda::device_count(),
+    };
+    println!("{}", serde_json::to_string_pretty(&summary)?);
+    if !summary.cuda_available {
+        return Err(anyhow!("tch CUDA is not available"));
+    }
+    if summary.device_count == 0 {
+        return Err(anyhow!("tch CUDA is available but reports zero devices"));
+    }
+
+    Ok(())
+}
+
 pub fn train_tch_tiny_lm(config: &Config) -> Result<TchTrainSmokeSummary> {
     if config.train.max_steps == 0 {
         return Err(anyhow!("tch_tiny_lm requires train.max_steps > 0"));

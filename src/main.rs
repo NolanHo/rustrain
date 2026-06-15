@@ -115,6 +115,7 @@ enum Command {
         #[arg(long, default_value_t = 1e-4)]
         learning_rate: f64,
     },
+    TchCudaProbe,
     ParallelDpSmoke {
         #[arg(long, default_value = "runs/parallel-dp-smoke")]
         output_dir: PathBuf,
@@ -198,6 +199,7 @@ fn main() -> Result<()> {
             &delta_output,
             learning_rate,
         ),
+        Command::TchCudaProbe => tch_train::probe_tch_cuda(),
         Command::ParallelDpSmoke {
             output_dir,
             world_size,
