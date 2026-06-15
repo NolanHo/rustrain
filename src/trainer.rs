@@ -8,6 +8,7 @@ use tracing::info;
 use crate::{
     backend::{Backend, NdArrayBackend},
     parallel::{ProcessGroup, SingleRankProcessGroup},
+    parallel_modules::tp1_module_smoke,
     runtime::{
         Config, init_logging, load_config, prepare_run_directory, validate_config,
         write_resolved_config,
@@ -56,6 +57,7 @@ pub fn train(config_path: &Path, resume_from: Option<PathBuf>) -> Result<()> {
         rank = process_group.rank_info().rank,
         world_size = process_group.rank_info().world_size,
         gathered = gathered.len(),
+        tp1_module_smoke = tp1_module_smoke(),
         "parallel process group configured"
     );
     info!(model = ?config.model, "model config");
