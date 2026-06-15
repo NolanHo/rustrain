@@ -1,5 +1,6 @@
 mod backend;
 mod inspect;
+mod parallel;
 mod runtime;
 mod text_data;
 mod toy_model;

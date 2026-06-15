@@ -1,12 +1,13 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow};
-use ndarray::Array2;
+use ndarray::{Array2, array};
 use serde::{Deserialize, Serialize};
 use tracing::info;
 
 use crate::{
     backend::{Backend, NdArrayBackend},
+    parallel::{ProcessGroup, SingleRankProcessGroup},
     runtime::{
         Config, init_logging, load_config, prepare_run_directory, validate_config,
         write_resolved_config,
@@ -40,11 +41,22 @@ pub fn train(config_path: &Path, resume_from: Option<PathBuf>) -> Result<()> {
     info!(seed = config.run.seed, "seed configured");
     info!(device = ?config.train.device, dtype = ?config.train.dtype, "training policy configured");
     let backend = NdArrayBackend;
+    let process_group = SingleRankProcessGroup::new(&config.parallel);
+    let mut collective_smoke = array![[1.0_f32]];
+    process_group.all_reduce_sum(&mut collective_smoke);
+    let gathered = process_group.all_gather(&collective_smoke);
+    process_group.barrier();
     info!(
         backend = ?backend.kind(),
         supports_autograd = backend.supports_autograd(),
         supports_cuda = backend.supports_cuda(),
         "backend configured"
+    );
+    info!(
+        rank = process_group.rank_info().rank,
+        world_size = process_group.rank_info().world_size,
+        gathered = gathered.len(),
+        "parallel process group configured"
     );
     info!(model = ?config.model, "model config");
     info!(train = ?config.train, "train config");
