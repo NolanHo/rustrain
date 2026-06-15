@@ -1,11 +1,11 @@
 use anyhow::{Result, anyhow};
 use tch::{
-    Device, Kind, Reduction, Tensor, nn,
+    Cuda, Device, Kind, Reduction, Tensor, nn,
     nn::{Module, OptimizerConfig},
 };
 use tracing::info;
 
-use crate::runtime::Config;
+use crate::runtime::{Config, Device as RuntimeDevice};
 
 #[derive(Debug, Clone)]
 pub struct TchTrainSmokeSummary {
@@ -20,7 +20,7 @@ pub fn train_tch_tiny_lm(config: &Config) -> Result<TchTrainSmokeSummary> {
         return Err(anyhow!("tch_tiny_lm requires train.max_steps > 0"));
     }
 
-    let device = Device::Cpu;
+    let device = tch_device(config)?;
     let vs = nn::VarStore::new(device);
     let root = vs.root();
     let embedding = nn::embedding(
@@ -47,7 +47,8 @@ pub fn train_tch_tiny_lm(config: &Config) -> Result<TchTrainSmokeSummary> {
     }
     .build(&vs, config.train.learning_rate as f64)?;
 
-    let input_ids = fixed_tch_batch(config.model.vocab_size as i64, config.model.seq_len as i64);
+    let input_ids = fixed_tch_batch(config.model.vocab_size as i64, config.model.seq_len as i64)
+        .to_device(device);
     let targets = input_ids.narrow(1, 1, config.model.seq_len as i64 - 1);
     let initial_loss = tch_lm_loss(&embedding, &lm_head, &input_ids, &targets).double_value(&[]);
     let mut embedding_grad_defined = false;
@@ -97,6 +98,21 @@ fn fixed_tch_batch(vocab_size: i64, seq_len: i64) -> Tensor {
     Tensor::from_slice(&tokens).reshape([1, seq_len])
 }
 
+fn tch_device(config: &Config) -> Result<Device> {
+    match config.train.device {
+        RuntimeDevice::Cpu => Ok(Device::Cpu),
+        RuntimeDevice::Cuda => {
+            if Cuda::is_available() {
+                Ok(Device::Cuda(0))
+            } else {
+                Err(anyhow!(
+                    "config requested device=cuda, but tch CUDA is not available"
+                ))
+            }
+        }
+    }
+}
+
 fn tch_lm_loss(
     embedding: &nn::Embedding,
     lm_head: &nn::Linear,
@@ -123,7 +139,32 @@ mod tests {
 
     #[test]
     fn tch_tiny_lm_trains_all_parameter_groups() {
-        let config = Config {
+        let config = tiny_tch_config(RuntimeDevice::Cpu);
+
+        let summary = train_tch_tiny_lm(&config).expect("tch tiny lm should train");
+
+        assert!(summary.final_loss < summary.initial_loss);
+        assert!(summary.embedding_grad_defined);
+        assert!(summary.lm_head_grad_defined);
+    }
+
+    #[test]
+    fn tch_cuda_request_fails_clearly_when_unavailable() {
+        if tch::Cuda::is_available() {
+            return;
+        }
+        let config = tiny_tch_config(RuntimeDevice::Cuda);
+
+        let error = train_tch_tiny_lm(&config).expect_err("missing CUDA should fail");
+
+        assert!(
+            error.to_string().contains("tch CUDA is not available"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    fn tiny_tch_config(device: RuntimeDevice) -> Config {
+        Config {
             run: RunConfig {
                 name: "test".to_string(),
                 base_dir: "runs".into(),
@@ -157,7 +198,7 @@ mod tests {
                 adam_beta2: 0.999,
                 adam_eps: 1e-8,
                 dtype: DType::Fp32,
-                device: RuntimeDevice::Cpu,
+                device,
                 checkpoint_every: 0,
                 eval_every: 0,
             },
@@ -169,12 +210,6 @@ mod tests {
                 expert_model_parallel_size: 1,
                 context_parallel_size: 1,
             },
-        };
-
-        let summary = train_tch_tiny_lm(&config).expect("tch tiny lm should train");
-
-        assert!(summary.final_loss < summary.initial_loss);
-        assert!(summary.embedding_grad_defined);
-        assert!(summary.lm_head_grad_defined);
+        }
     }
 }
