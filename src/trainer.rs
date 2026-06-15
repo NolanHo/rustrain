@@ -7,6 +7,7 @@ use tracing::info;
 
 use crate::{
     backend::{Backend, NdArrayBackend},
+    lora::lora_smoke,
     parallel::{ProcessGroup, SingleRankProcessGroup},
     parallel_modules::tp1_module_smoke,
     runtime::{
@@ -58,6 +59,7 @@ pub fn train(config_path: &Path, resume_from: Option<PathBuf>) -> Result<()> {
         world_size = process_group.rank_info().world_size,
         gathered = gathered.len(),
         tp1_module_smoke = tp1_module_smoke(),
+        lora_trainable_params = lora_smoke(),
         "parallel process group configured"
     );
     info!(model = ?config.model, "model config");
