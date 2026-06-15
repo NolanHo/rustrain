@@ -55,6 +55,17 @@ struct QwenLogitsParitySummary {
     last_token_topk: Vec<TopLogit>,
 }
 
+#[derive(Debug, Serialize)]
+struct QwenGenerateParitySummary {
+    model_path: String,
+    reference_fixture: String,
+    prompt_len: usize,
+    max_new_tokens: usize,
+    generated_ids: Vec<i64>,
+    new_token_ids: Vec<i64>,
+    reference_match: bool,
+}
+
 pub fn qwen_module_parity(model_safetensors: &Path, fixture: &Path) -> Result<()> {
     let weights = read_safetensors_map(model_safetensors)?;
     let fixture_tensors = read_safetensors_map(fixture)?;
@@ -173,6 +184,47 @@ pub fn qwen_logits_parity(model_path: &Path, reference_fixture: &Path) -> Result
         logits_shape: actual_logits.size(),
         logits_diff,
         last_token_topk,
+    };
+    println!("{}", serde_json::to_string_pretty(&summary)?);
+
+    Ok(())
+}
+
+pub fn qwen_generate_parity(model_path: &Path, reference_fixture: &Path) -> Result<()> {
+    let config = read_runtime_config(&model_path.join("config.json"))?;
+    let weights = read_safetensors_map(&model_path.join("model.safetensors"))?;
+    let reference = read_safetensors_map(reference_fixture)?;
+    let input_ids = tensor(&reference, "input_ids")?.to_kind(Kind::Int64);
+    let expected_generated = tensor(&reference, "generated_ids")?.to_kind(Kind::Int64);
+    let expected_ids: Vec<i64> =
+        Vec::<i64>::try_from(expected_generated.reshape([-1]).to_device(Device::Cpu))?;
+    let prompt_len = input_ids.size()[1] as usize;
+    if expected_ids.len() < prompt_len {
+        bail!(
+            "reference generated ids shorter than prompt: generated={}, prompt={prompt_len}",
+            expected_ids.len()
+        );
+    }
+    let max_new_tokens = expected_ids.len() - prompt_len;
+    let generated = qwen_greedy_generate(&input_ids, &weights, &config, max_new_tokens)?;
+    let generated_ids: Vec<i64> =
+        Vec::<i64>::try_from(generated.reshape([-1]).to_device(Device::Cpu))?;
+    let reference_match = generated_ids == expected_ids;
+    if !reference_match {
+        bail!(
+            "greedy generation parity failed: expected {:?}, got {:?}",
+            expected_ids,
+            generated_ids
+        );
+    }
+    let summary = QwenGenerateParitySummary {
+        model_path: model_path.display().to_string(),
+        reference_fixture: reference_fixture.display().to_string(),
+        prompt_len,
+        max_new_tokens,
+        new_token_ids: generated_ids[prompt_len..].to_vec(),
+        generated_ids,
+        reference_match,
     };
     println!("{}", serde_json::to_string_pretty(&summary)?);
 
@@ -318,6 +370,21 @@ pub fn qwen_forward_from_ids(
     }
     let hidden = rms_norm(&hidden, &final_norm, config.rms_norm_eps);
     Ok(hidden.linear::<&Tensor>(&embed_tokens, None))
+}
+
+pub fn qwen_greedy_generate(
+    input_ids: &Tensor,
+    weights: &BTreeMap<String, Tensor>,
+    config: &QwenRuntimeConfig,
+    max_new_tokens: usize,
+) -> Result<Tensor> {
+    let mut generated = input_ids.shallow_clone();
+    for _ in 0..max_new_tokens {
+        let logits = qwen_forward_from_ids(&generated, weights, config)?;
+        let next_token = logits.i((0, -1)).argmax(-1, false).reshape([1, 1]);
+        generated = Tensor::cat(&[&generated, &next_token], 1);
+    }
+    Ok(generated)
 }
 
 #[allow(clippy::too_many_arguments)]

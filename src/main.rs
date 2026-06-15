@@ -69,6 +69,15 @@ enum Command {
         #[arg(long, default_value = "runs/parity/qwen2_5_0_5b_logits.safetensors")]
         reference_fixture: PathBuf,
     },
+    QwenGenerateParity {
+        #[arg(
+            long,
+            default_value = "/vePFS-Mindverse/share/huggingface/Qwen2.5-0.5B-Instruct"
+        )]
+        model_path: PathBuf,
+        #[arg(long, default_value = "runs/parity/qwen2_5_0_5b_generate.safetensors")]
+        reference_fixture: PathBuf,
+    },
 }
 
 fn main() -> Result<()> {
@@ -97,5 +106,9 @@ fn main() -> Result<()> {
             model_path,
             reference_fixture,
         } => qwen_module::qwen_logits_parity(&model_path, &reference_fixture),
+        Command::QwenGenerateParity {
+            model_path,
+            reference_fixture,
+        } => qwen_module::qwen_generate_parity(&model_path, &reference_fixture),
     }
 }
