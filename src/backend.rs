@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 #[serde(rename_all = "snake_case")]
 pub enum BackendKind {
     NdArray,
+    Tch,
 }
 
 pub trait Backend {
@@ -14,6 +15,9 @@ pub trait Backend {
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct NdArrayBackend;
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct TchBackend;
 
 impl Backend for NdArrayBackend {
     fn kind(&self) -> BackendKind {
@@ -29,6 +33,34 @@ impl Backend for NdArrayBackend {
     }
 }
 
+impl Backend for TchBackend {
+    fn kind(&self) -> BackendKind {
+        BackendKind::Tch
+    }
+
+    fn supports_autograd(&self) -> bool {
+        true
+    }
+
+    fn supports_cuda(&self) -> bool {
+        tch::Cuda::is_available()
+    }
+}
+
+pub fn tch_cpu_autograd_smoke() -> bool {
+    let weight = tch::Tensor::from_slice(&[1.0_f32, -2.0, 0.5, 3.0])
+        .reshape([2, 2])
+        .set_requires_grad(true);
+    let input = tch::Tensor::from_slice(&[2.0_f32, 1.0]).reshape([1, 2]);
+    let output = input.matmul(&weight);
+    let loss = output.square().mean(tch::Kind::Float);
+
+    loss.backward();
+    let grad = weight.grad();
+
+    grad.defined() && grad.size() == vec![2, 2]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -40,5 +72,14 @@ mod tests {
         assert_eq!(backend.kind(), BackendKind::NdArray);
         assert!(!backend.supports_autograd());
         assert!(!backend.supports_cuda());
+    }
+
+    #[test]
+    fn tch_backend_reports_autograd_and_runs_cpu_backward() {
+        let backend = TchBackend;
+
+        assert_eq!(backend.kind(), BackendKind::Tch);
+        assert!(backend.supports_autograd());
+        assert!(tch_cpu_autograd_smoke());
     }
 }

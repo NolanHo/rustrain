@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use tracing::info;
 
 use crate::{
-    backend::{Backend, NdArrayBackend},
+    backend::{Backend, BackendKind, NdArrayBackend, TchBackend, tch_cpu_autograd_smoke},
     lora::{LoraLinear, lora_smoke},
     moe::{deepseek_moe_smoke, moe_smoke},
     parallel::{ProcessGroup, SingleRankProcessGroup},
@@ -45,7 +45,7 @@ pub fn train(config_path: &Path, resume_from: Option<PathBuf>) -> Result<()> {
     info!(checkpoints_dir = %run_paths.checkpoints.display(), "created checkpoint directory");
     info!(seed = config.run.seed, "seed configured");
     info!(device = ?config.train.device, dtype = ?config.train.dtype, "training policy configured");
-    let backend = NdArrayBackend;
+    let backend = RuntimeBackend::from_kind(config.train.backend);
     let process_group = SingleRankProcessGroup::new(&config.parallel);
     let mut collective_smoke = array![[1.0_f32]];
     process_group.all_reduce_sum(&mut collective_smoke);
@@ -56,6 +56,7 @@ pub fn train(config_path: &Path, resume_from: Option<PathBuf>) -> Result<()> {
         backend = ?backend.kind(),
         supports_autograd = backend.supports_autograd(),
         supports_cuda = backend.supports_cuda(),
+        tch_cpu_autograd_smoke = backend.tch_cpu_autograd_smoke(),
         "backend configured"
     );
     info!(
@@ -103,6 +104,48 @@ pub fn train(config_path: &Path, resume_from: Option<PathBuf>) -> Result<()> {
     }
 
     train_fixed_batch(&config, &run_paths)
+}
+
+#[derive(Debug, Clone, Copy)]
+enum RuntimeBackend {
+    NdArray(NdArrayBackend),
+    Tch(TchBackend),
+}
+
+impl RuntimeBackend {
+    fn from_kind(kind: BackendKind) -> Self {
+        match kind {
+            BackendKind::NdArray => Self::NdArray(NdArrayBackend),
+            BackendKind::Tch => Self::Tch(TchBackend),
+        }
+    }
+
+    fn tch_cpu_autograd_smoke(&self) -> bool {
+        matches!(self, Self::Tch(_)) && tch_cpu_autograd_smoke()
+    }
+}
+
+impl Backend for RuntimeBackend {
+    fn kind(&self) -> BackendKind {
+        match self {
+            Self::NdArray(backend) => backend.kind(),
+            Self::Tch(backend) => backend.kind(),
+        }
+    }
+
+    fn supports_autograd(&self) -> bool {
+        match self {
+            Self::NdArray(backend) => backend.supports_autograd(),
+            Self::Tch(backend) => backend.supports_autograd(),
+        }
+    }
+
+    fn supports_cuda(&self) -> bool {
+        match self {
+            Self::NdArray(backend) => backend.supports_cuda(),
+            Self::Tch(backend) => backend.supports_cuda(),
+        }
+    }
 }
 
 fn train_fixed_batch(config: &Config, run_paths: &crate::runtime::RunPaths) -> Result<()> {
