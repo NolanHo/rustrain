@@ -66,6 +66,16 @@ def main() -> None:
         cache_position=None,
         position_embeddings=position_embeddings,
     )[0]
+    layer_output = layer0(
+        hidden_states=hidden,
+        attention_mask=None,
+        position_ids=position_ids,
+        past_key_value=None,
+        output_attentions=False,
+        use_cache=False,
+        cache_position=None,
+        position_embeddings=position_embeddings,
+    )[0]
     normed = layer0.post_attention_layernorm(hidden)
     mlp_output = layer0.mlp(normed)
 
@@ -78,6 +88,7 @@ def main() -> None:
             "attention_output": attention_output.cpu().contiguous(),
             "post_attention_normed": normed.cpu().contiguous(),
             "mlp_output": mlp_output.cpu().contiguous(),
+            "layer0_output": layer_output.cpu().contiguous(),
         },
         args.output,
     )
@@ -94,6 +105,8 @@ def main() -> None:
         "post_attention_normed_shape": list(normed.shape),
         "mlp_output_shape": list(mlp_output.shape),
         "mlp_output_checksum": float(mlp_output.float().sum().item()),
+        "layer0_output_shape": list(layer_output.shape),
+        "layer0_output_checksum": float(layer_output.float().sum().item()),
     }
     args.summary_output.parent.mkdir(parents=True, exist_ok=True)
     args.summary_output.write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n")

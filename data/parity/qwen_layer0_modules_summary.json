@@ -31,6 +31,12 @@
     60788,
     13
   ],
+  "layer0_output_checksum": 58.16873550415039,
+  "layer0_output_shape": [
+    1,
+    13,
+    896
+  ],
   "mlp_output_checksum": -14.770387649536133,
   "mlp_output_shape": [
     1,

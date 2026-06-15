@@ -17,6 +17,7 @@ struct QwenModuleParitySummary {
     attention_diff: DiffStats,
     rms_norm_diff: DiffStats,
     mlp_diff: DiffStats,
+    layer0_diff: DiffStats,
 }
 
 pub fn qwen_module_parity(model_safetensors: &Path, fixture: &Path) -> Result<()> {
@@ -27,7 +28,10 @@ pub fn qwen_module_parity(model_safetensors: &Path, fixture: &Path) -> Result<()
     let expected_attention = tensor(&fixture_tensors, "attention_output")?.to_kind(Kind::Float);
     let expected_norm = tensor(&fixture_tensors, "post_attention_normed")?.to_kind(Kind::Float);
     let expected_mlp = tensor(&fixture_tensors, "mlp_output")?.to_kind(Kind::Float);
+    let expected_layer0 = tensor(&fixture_tensors, "layer0_output")?.to_kind(Kind::Float);
 
+    let input_norm_weight =
+        tensor(&weights, "model.layers.0.input_layernorm.weight")?.to_kind(Kind::Float);
     let q_proj = tensor(&weights, "model.layers.0.self_attn.q_proj.weight")?.to_kind(Kind::Float);
     let q_bias = tensor(&weights, "model.layers.0.self_attn.q_proj.bias")?.to_kind(Kind::Float);
     let k_proj = tensor(&weights, "model.layers.0.self_attn.k_proj.weight")?.to_kind(Kind::Float);
@@ -56,9 +60,25 @@ pub fn qwen_module_parity(model_safetensors: &Path, fixture: &Path) -> Result<()
     );
     let actual_norm = rms_norm(&input, &norm_weight, 1e-6);
     let actual_mlp = qwen_mlp(&actual_norm, &gate_proj, &up_proj, &down_proj);
+    let actual_layer0 = qwen_layer(
+        &input,
+        &input_norm_weight,
+        &q_proj,
+        &q_bias,
+        &k_proj,
+        &k_bias,
+        &v_proj,
+        &v_bias,
+        &o_proj,
+        &norm_weight,
+        &gate_proj,
+        &up_proj,
+        &down_proj,
+    );
     let attention_diff = diff_stats(&actual_attention, &expected_attention)?;
     let rms_norm_diff = diff_stats(&actual_norm, &expected_norm)?;
     let mlp_diff = diff_stats(&actual_mlp, &expected_mlp)?;
+    let layer0_diff = diff_stats(&actual_layer0, &expected_layer0)?;
 
     if attention_diff.max_abs > 1e-4 {
         bail!(
@@ -72,6 +92,9 @@ pub fn qwen_module_parity(model_safetensors: &Path, fixture: &Path) -> Result<()
     if mlp_diff.max_abs > 1e-4 {
         bail!("MLP parity failed: max_abs={}", mlp_diff.max_abs);
     }
+    if layer0_diff.max_abs > 1e-4 {
+        bail!("layer0 parity failed: max_abs={}", layer0_diff.max_abs);
+    }
 
     let summary = QwenModuleParitySummary {
         model_safetensors: model_safetensors.display().to_string(),
@@ -79,6 +102,7 @@ pub fn qwen_module_parity(model_safetensors: &Path, fixture: &Path) -> Result<()
         attention_diff,
         rms_norm_diff,
         mlp_diff,
+        layer0_diff,
     };
     println!("{}", serde_json::to_string_pretty(&summary)?);
 
@@ -108,6 +132,42 @@ fn qwen_mlp(input: &Tensor, gate_proj: &Tensor, up_proj: &Tensor, down_proj: &Te
     let gate = input.linear::<&Tensor>(gate_proj, None);
     let up = input.linear::<&Tensor>(up_proj, None);
     (gate.silu() * up).linear::<&Tensor>(down_proj, None)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn qwen_layer(
+    input: &Tensor,
+    input_norm_weight: &Tensor,
+    q_proj: &Tensor,
+    q_bias: &Tensor,
+    k_proj: &Tensor,
+    k_bias: &Tensor,
+    v_proj: &Tensor,
+    v_bias: &Tensor,
+    o_proj: &Tensor,
+    post_attention_norm_weight: &Tensor,
+    gate_proj: &Tensor,
+    up_proj: &Tensor,
+    down_proj: &Tensor,
+) -> Tensor {
+    let attention_input = rms_norm(input, input_norm_weight, 1e-6);
+    let attention_output = qwen_attention(
+        &attention_input,
+        q_proj,
+        q_bias,
+        k_proj,
+        k_bias,
+        v_proj,
+        v_bias,
+        o_proj,
+        14,
+        2,
+        1_000_000.0,
+    );
+    let after_attention = input + attention_output;
+    let mlp_input = rms_norm(&after_attention, post_attention_norm_weight, 1e-6);
+    let mlp_output = qwen_mlp(&mlp_input, gate_proj, up_proj, down_proj);
+    after_attention + mlp_output
 }
 
 #[allow(clippy::too_many_arguments)]
