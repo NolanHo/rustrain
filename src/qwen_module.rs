@@ -1,6 +1,7 @@
 use std::{collections::BTreeMap, fs, path::Path};
 
 use anyhow::{Context, Result, anyhow, bail};
+use rand::{Rng, SeedableRng, rngs::StdRng};
 use serde::{Deserialize, Serialize};
 use tch::{Device, IndexOp, Kind, Reduction, Tensor, no_grad};
 
@@ -64,6 +65,20 @@ struct QwenGenerateParitySummary {
     generated_ids: Vec<i64>,
     new_token_ids: Vec<i64>,
     reference_match: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct QwenSamplingSmokeSummary {
+    model_path: String,
+    reference_fixture: String,
+    prompt_len: usize,
+    max_new_tokens: usize,
+    temperature: f64,
+    top_k: usize,
+    top_p: f64,
+    seed: u64,
+    generated_ids: Vec<i64>,
+    new_token_ids: Vec<i64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -240,6 +255,57 @@ pub fn qwen_generate_parity(model_path: &Path, reference_fixture: &Path) -> Resu
         new_token_ids: generated_ids[prompt_len..].to_vec(),
         generated_ids,
         reference_match,
+    };
+    println!("{}", serde_json::to_string_pretty(&summary)?);
+
+    Ok(())
+}
+
+pub fn qwen_sampling_smoke(
+    model_path: &Path,
+    reference_fixture: &Path,
+    max_new_tokens: usize,
+    temperature: f64,
+    top_k: usize,
+    top_p: f64,
+    seed: u64,
+) -> Result<()> {
+    let config = read_runtime_config(&model_path.join("config.json"))?;
+    let weights = read_safetensors_map(&model_path.join("model.safetensors"))?;
+    let reference = read_safetensors_map(reference_fixture)?;
+    let input_ids = tensor(&reference, "input_ids")?.to_kind(Kind::Int64);
+    let prompt_len = input_ids.size()[1] as usize;
+    let generated = qwen_sample_generate(
+        &input_ids,
+        &weights,
+        &config,
+        max_new_tokens,
+        temperature,
+        top_k,
+        top_p,
+        seed,
+    )?;
+    let generated_ids: Vec<i64> =
+        Vec::<i64>::try_from(generated.reshape([-1]).to_device(Device::Cpu))?;
+    let new_token_ids = generated_ids[prompt_len..].to_vec();
+    if new_token_ids.len() != max_new_tokens {
+        bail!(
+            "sampling smoke generated {} tokens, expected {max_new_tokens}",
+            new_token_ids.len()
+        );
+    }
+
+    let summary = QwenSamplingSmokeSummary {
+        model_path: model_path.display().to_string(),
+        reference_fixture: reference_fixture.display().to_string(),
+        prompt_len,
+        max_new_tokens,
+        temperature,
+        top_k,
+        top_p,
+        seed,
+        generated_ids,
+        new_token_ids,
     };
     println!("{}", serde_json::to_string_pretty(&summary)?);
 
@@ -517,6 +583,99 @@ pub fn qwen_greedy_generate(
 }
 
 #[allow(clippy::too_many_arguments)]
+pub fn qwen_sample_generate(
+    input_ids: &Tensor,
+    weights: &BTreeMap<String, Tensor>,
+    config: &QwenRuntimeConfig,
+    max_new_tokens: usize,
+    temperature: f64,
+    top_k: usize,
+    top_p: f64,
+    seed: u64,
+) -> Result<Tensor> {
+    let mut generated = input_ids.shallow_clone();
+    let mut rng = StdRng::seed_from_u64(seed);
+    for _ in 0..max_new_tokens {
+        let logits = qwen_forward_from_ids(&generated, weights, config)?;
+        let next_token =
+            sample_token_from_logits(&logits.i((0, -1)), temperature, top_k, top_p, &mut rng)?
+                .reshape([1, 1]);
+        generated = Tensor::cat(&[&generated, &next_token], 1);
+    }
+    Ok(generated)
+}
+
+fn sample_token_from_logits(
+    logits: &Tensor,
+    temperature: f64,
+    top_k: usize,
+    top_p: f64,
+    rng: &mut StdRng,
+) -> Result<Tensor> {
+    if temperature <= 0.0 {
+        bail!("temperature must be positive");
+    }
+    if !(0.0..=1.0).contains(&top_p) || top_p == 0.0 {
+        bail!("top_p must be in (0, 1]");
+    }
+
+    let logits: Vec<f32> =
+        Vec::<f32>::try_from(logits.to_kind(Kind::Float).to_device(Device::Cpu))?;
+    let mut candidates: Vec<(i64, f64)> = logits
+        .into_iter()
+        .enumerate()
+        .filter_map(|(token_id, logit)| {
+            let scaled = f64::from(logit) / temperature;
+            scaled.is_finite().then_some((token_id as i64, scaled))
+        })
+        .collect();
+    if candidates.is_empty() {
+        bail!("no finite logits available for sampling");
+    }
+    candidates.sort_by(|a, b| b.1.total_cmp(&a.1));
+    if top_k > 0 && top_k < candidates.len() {
+        candidates.truncate(top_k);
+    }
+
+    let max_logit = candidates[0].1;
+    let mut probs: Vec<(i64, f64)> = candidates
+        .into_iter()
+        .map(|(token_id, logit)| (token_id, (logit - max_logit).exp()))
+        .collect();
+    let total: f64 = probs.iter().map(|(_, prob)| *prob).sum();
+    if total <= 0.0 || !total.is_finite() {
+        bail!("sampling probabilities are not finite");
+    }
+    for (_, prob) in &mut probs {
+        *prob /= total;
+    }
+
+    if top_p < 1.0 {
+        let mut cumulative = 0.0;
+        let mut keep = 0usize;
+        for (_, prob) in &probs {
+            keep += 1;
+            cumulative += *prob;
+            if cumulative >= top_p {
+                break;
+            }
+        }
+        probs.truncate(keep.max(1));
+    }
+
+    let renorm_total: f64 = probs.iter().map(|(_, prob)| *prob).sum();
+    let mut draw = rng.gen_range(0.0..renorm_total);
+    for (token_id, prob) in probs {
+        if draw <= prob {
+            return Ok(Tensor::from_slice(&[token_id]).to_kind(Kind::Int64));
+        }
+        draw -= prob;
+    }
+
+    bail!("sampling draw did not select a token")
+}
+
+#[allow(clippy::too_many_arguments)]
 pub fn qwen_attention(
     input: &Tensor,
     q_proj: &Tensor,
@@ -648,6 +807,17 @@ mod tests {
 
         assert_eq!(loss.size(), Vec::<i64>::new());
         assert!(loss.isfinite().int64_value(&[]) == 1);
+    }
+
+    #[test]
+    fn sampling_respects_top_k_and_top_p_filters() {
+        let logits = Tensor::from_slice(&[0.0_f32, 1.0, 2.0, 3.0]);
+        let mut rng = StdRng::seed_from_u64(7);
+
+        let token =
+            sample_token_from_logits(&logits, 0.8, 1, 0.5, &mut rng).expect("sample should run");
+
+        assert_eq!(token.int64_value(&[0]), 3);
     }
 
     fn tiny_qwen_weights() -> BTreeMap<String, Tensor> {

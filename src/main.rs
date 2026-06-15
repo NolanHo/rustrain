@@ -79,6 +79,25 @@ enum Command {
         #[arg(long, default_value = "runs/parity/qwen2_5_0_5b_generate.safetensors")]
         reference_fixture: PathBuf,
     },
+    QwenSamplingSmoke {
+        #[arg(
+            long,
+            default_value = "/vePFS-Mindverse/share/huggingface/Qwen2.5-0.5B-Instruct"
+        )]
+        model_path: PathBuf,
+        #[arg(long, default_value = "runs/parity/qwen2_5_0_5b_generate.safetensors")]
+        reference_fixture: PathBuf,
+        #[arg(long, default_value_t = 4)]
+        max_new_tokens: usize,
+        #[arg(long, default_value_t = 0.8)]
+        temperature: f64,
+        #[arg(long, default_value_t = 20)]
+        top_k: usize,
+        #[arg(long, default_value_t = 0.9)]
+        top_p: f64,
+        #[arg(long, default_value_t = 0)]
+        seed: u64,
+    },
     QwenTiedHeadTrainSmoke {
         #[arg(
             long,
@@ -127,6 +146,23 @@ fn main() -> Result<()> {
             model_path,
             reference_fixture,
         } => qwen_module::qwen_generate_parity(&model_path, &reference_fixture),
+        Command::QwenSamplingSmoke {
+            model_path,
+            reference_fixture,
+            max_new_tokens,
+            temperature,
+            top_k,
+            top_p,
+            seed,
+        } => qwen_module::qwen_sampling_smoke(
+            &model_path,
+            &reference_fixture,
+            max_new_tokens,
+            temperature,
+            top_k,
+            top_p,
+            seed,
+        ),
         Command::QwenTiedHeadTrainSmoke {
             model_path,
             reference_fixture,
