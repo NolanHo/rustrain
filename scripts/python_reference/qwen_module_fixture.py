@@ -52,6 +52,7 @@ def main() -> None:
 
     input_ids = tokenizer(prompt, return_tensors="pt", add_special_tokens=False)["input_ids"]
     layer0 = model.model.layers[0]
+    layer1 = model.model.layers[1]
     hidden = model.model.embed_tokens(input_ids)
     attention_normed = layer0.input_layernorm(hidden)
     position_ids = torch.arange(input_ids.shape[1], dtype=torch.long).unsqueeze(0)
@@ -76,6 +77,16 @@ def main() -> None:
         cache_position=None,
         position_embeddings=position_embeddings,
     )[0]
+    layer1_output = layer1(
+        hidden_states=layer_output,
+        attention_mask=None,
+        position_ids=position_ids,
+        past_key_value=None,
+        output_attentions=False,
+        use_cache=False,
+        cache_position=None,
+        position_embeddings=position_embeddings,
+    )[0]
     normed = layer0.post_attention_layernorm(hidden)
     mlp_output = layer0.mlp(normed)
 
@@ -89,6 +100,7 @@ def main() -> None:
             "post_attention_normed": normed.cpu().contiguous(),
             "mlp_output": mlp_output.cpu().contiguous(),
             "layer0_output": layer_output.cpu().contiguous(),
+            "layer1_output": layer1_output.cpu().contiguous(),
         },
         args.output,
     )
@@ -107,6 +119,8 @@ def main() -> None:
         "mlp_output_checksum": float(mlp_output.float().sum().item()),
         "layer0_output_shape": list(layer_output.shape),
         "layer0_output_checksum": float(layer_output.float().sum().item()),
+        "layer1_output_shape": list(layer1_output.shape),
+        "layer1_output_checksum": float(layer1_output.float().sum().item()),
     }
     args.summary_output.parent.mkdir(parents=True, exist_ok=True)
     args.summary_output.write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n")

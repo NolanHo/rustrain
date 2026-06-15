@@ -37,6 +37,12 @@
     13,
     896
   ],
+  "layer1_output_checksum": 12.081291198730469,
+  "layer1_output_shape": [
+    1,
+    13,
+    896
+  ],
   "mlp_output_checksum": -14.770387649536133,
   "mlp_output_shape": [
     1,
