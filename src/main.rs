@@ -4,6 +4,7 @@ mod lora;
 mod moe;
 mod parallel;
 mod parallel_modules;
+mod qwen_parity;
 mod runtime;
 mod text_data;
 mod toy_model;
@@ -38,6 +39,17 @@ enum Command {
         #[arg(long, default_value_t = 12)]
         tensor_limit: usize,
     },
+    QwenParitySmoke {
+        #[arg(
+            long,
+            default_value = "/vePFS-Mindverse/share/huggingface/Qwen2.5-0.5B-Instruct"
+        )]
+        model_path: PathBuf,
+        #[arg(long, default_value = "data/parity/qwen_prompt.txt")]
+        prompt_file: PathBuf,
+        #[arg(long, default_value = "data/parity/qwen2_5_0_5b_logits_summary.json")]
+        reference_summary: PathBuf,
+    },
 }
 
 fn main() -> Result<()> {
@@ -53,5 +65,10 @@ fn main() -> Result<()> {
             prompt,
             tensor_limit,
         } => inspect::inspect_model(&model_path, &prompt, tensor_limit),
+        Command::QwenParitySmoke {
+            model_path,
+            prompt_file,
+            reference_summary,
+        } => qwen_parity::qwen_parity_smoke(&model_path, &prompt_file, &reference_summary),
     }
 }
