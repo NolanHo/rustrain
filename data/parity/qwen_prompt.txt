@@ -1,0 +1,1 @@
+rustrain parity check: explain why Rust training needs deterministic logits.
