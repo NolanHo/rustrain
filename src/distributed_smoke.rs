@@ -48,6 +48,15 @@ struct TensorParallelSmokeSummary {
     row_rank_shapes: Vec<Vec<usize>>,
 }
 
+#[derive(Debug, Serialize)]
+struct ExpertParallelSmokeSummary {
+    world_size: usize,
+    expert_count: usize,
+    output_max_delta: f64,
+    expert_load: Vec<usize>,
+    rank_token_counts: Vec<usize>,
+}
+
 pub fn run_data_parallel_smoke(output_dir: &Path, world_size: usize) -> Result<()> {
     if world_size != 2 {
         bail!("M12 DP smoke currently expects world_size = 2");
@@ -254,6 +263,66 @@ pub fn run_tensor_parallel_smoke(world_size: usize) -> Result<()> {
     Ok(())
 }
 
+pub fn run_expert_parallel_smoke(world_size: usize) -> Result<()> {
+    if world_size != 2 {
+        bail!("M17 EP smoke currently expects world_size = 2");
+    }
+
+    let tokens = array![
+        [1.0_f64, 0.0, 0.5],
+        [0.0, 1.0, -0.5],
+        [1.0, 1.0, 0.0],
+        [-1.0, 0.5, 1.0],
+    ];
+    let router = array![
+        [0.9_f64, -0.2, 0.1, 0.0],
+        [0.1, 0.8, -0.4, 0.2],
+        [0.0, -0.3, 0.7, 0.6],
+    ];
+    let expert_scales = [
+        [1.0_f64, 0.5, -0.25],
+        [-0.5, 1.5, 0.25],
+        [0.25, -1.0, 1.25],
+        [1.2, 0.3, 0.8],
+    ];
+
+    let assignments = route_top1(&tokens, &router);
+    let reference = expert_outputs(&tokens, &assignments, &expert_scales);
+    let mut expert_load = vec![0usize; expert_scales.len()];
+    let mut rank_buckets = vec![Vec::<usize>::new(); world_size];
+    for (token_index, expert_index) in assignments.iter().copied().enumerate() {
+        expert_load[expert_index] += 1;
+        rank_buckets[expert_index / (expert_scales.len() / world_size)].push(token_index);
+    }
+
+    let mut gathered = Array2::<f64>::zeros(tokens.dim());
+    for bucket in &rank_buckets {
+        for &token_index in bucket {
+            let expert_index = assignments[token_index];
+            for hidden_index in 0..tokens.ncols() {
+                gathered[[token_index, hidden_index]] =
+                    tokens[[token_index, hidden_index]] * expert_scales[expert_index][hidden_index];
+            }
+        }
+    }
+
+    let output_max_delta = max_abs_diff(&gathered, &reference);
+    if output_max_delta > 1e-12 {
+        bail!("EP=2 all-to-all parity failed: output_max_delta={output_max_delta}");
+    }
+
+    let summary = ExpertParallelSmokeSummary {
+        world_size,
+        expert_count: expert_scales.len(),
+        output_max_delta,
+        expert_load,
+        rank_token_counts: rank_buckets.iter().map(Vec::len).collect(),
+    };
+    println!("{}", serde_json::to_string_pretty(&summary)?);
+
+    Ok(())
+}
+
 fn compute_dp_stats(rank: usize, world_size: usize) -> DpRankStats {
     let mut sample_count = 0;
     let mut loss_sum = 0.0;
@@ -286,6 +355,37 @@ fn max_abs_diff(actual: &Array2<f64>, expected: &Array2<f64>) -> f64 {
         .zip(expected.iter())
         .map(|(actual, expected)| (actual - expected).abs())
         .fold(0.0_f64, f64::max)
+}
+
+fn route_top1(tokens: &Array2<f64>, router: &Array2<f64>) -> Vec<usize> {
+    tokens
+        .dot(router)
+        .rows()
+        .into_iter()
+        .map(|scores| {
+            scores
+                .iter()
+                .enumerate()
+                .max_by(|(_, left), (_, right)| left.total_cmp(right))
+                .map(|(index, _)| index)
+                .expect("router should produce at least one expert score")
+        })
+        .collect()
+}
+
+fn expert_outputs(
+    tokens: &Array2<f64>,
+    assignments: &[usize],
+    expert_scales: &[[f64; 3]],
+) -> Array2<f64> {
+    let mut output = Array2::<f64>::zeros(tokens.dim());
+    for (token_index, expert_index) in assignments.iter().copied().enumerate() {
+        for hidden_index in 0..tokens.ncols() {
+            output[[token_index, hidden_index]] =
+                tokens[[token_index, hidden_index]] * expert_scales[expert_index][hidden_index];
+        }
+    }
+    output
 }
 
 #[cfg(test)]
@@ -327,5 +427,10 @@ mod tests {
     #[test]
     fn tensor_parallel_smoke_runs_tp2_parity() {
         run_tensor_parallel_smoke(2).expect("TP=2 parity should pass");
+    }
+
+    #[test]
+    fn expert_parallel_smoke_runs_ep2_all_to_all_parity() {
+        run_expert_parallel_smoke(2).expect("EP=2 parity should pass");
     }
 }
