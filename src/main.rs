@@ -1,4 +1,5 @@
 mod runtime;
+mod text_data;
 mod toy_model;
 mod trainer;
 
@@ -20,6 +21,8 @@ enum Command {
     Train {
         #[arg(short, long)]
         config: PathBuf,
+        #[arg(long)]
+        resume_from: Option<PathBuf>,
     },
 }
 
@@ -27,6 +30,9 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Command::Train { config } => trainer::train(&config),
+        Command::Train {
+            config,
+            resume_from,
+        } => trainer::train(&config, resume_from),
     }
 }

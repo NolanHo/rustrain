@@ -13,6 +13,8 @@ pub struct Config {
     pub run: RunConfig,
     pub model: ModelConfig,
     pub train: TrainConfig,
+    #[serde(default)]
+    pub data: Option<DataConfig>,
     pub parallel: ParallelConfig,
 }
 
@@ -43,6 +45,8 @@ pub struct ModelConfig {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct TrainConfig {
     pub max_steps: u64,
+    #[serde(default)]
+    pub resume_from: Option<PathBuf>,
     pub micro_batch_size: usize,
     pub global_batch_size: usize,
     pub gradient_accumulation_steps: usize,
@@ -54,6 +58,22 @@ pub struct TrainConfig {
     pub dtype: DType,
     pub device: Device,
     pub checkpoint_every: u64,
+    #[serde(default = "default_eval_every")]
+    pub eval_every: u64,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct DataConfig {
+    pub kind: DataKind,
+    pub paths: Vec<PathBuf>,
+    #[serde(default = "default_train_split")]
+    pub train_split: f32,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DataKind {
+    Text,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -85,6 +105,7 @@ pub struct RunPaths {
     pub root: PathBuf,
     pub checkpoints: PathBuf,
     pub logs: PathBuf,
+    pub cache: PathBuf,
     pub resolved_config: PathBuf,
 }
 
@@ -188,6 +209,14 @@ pub fn validate_config(config: &Config) -> Result<()> {
     if config.train.adam_eps <= 0.0 {
         return Err(anyhow!("adam_eps must be greater than zero"));
     }
+    if let Some(data) = &config.data {
+        if data.paths.is_empty() {
+            return Err(anyhow!("data.paths must not be empty"));
+        }
+        if !(0.0..1.0).contains(&data.train_split) {
+            return Err(anyhow!("data.train_split must be in (0, 1)"));
+        }
+    }
 
     Ok(())
 }
@@ -197,16 +226,19 @@ pub fn prepare_run_directory(run: &RunConfig) -> Result<RunPaths> {
     let root = run.base_dir.join(format!("{}-{timestamp}", run.name));
     let checkpoints = root.join("checkpoints");
     let logs = root.join("logs");
+    let cache = root.join("cache");
     let resolved_config = root.join("resolved_config.toml");
 
     fs::create_dir_all(&checkpoints)
         .with_context(|| format!("failed to create {}", checkpoints.display()))?;
     fs::create_dir_all(&logs).with_context(|| format!("failed to create {}", logs.display()))?;
+    fs::create_dir_all(&cache).with_context(|| format!("failed to create {}", cache.display()))?;
 
     Ok(RunPaths {
         root,
         checkpoints,
         logs,
+        cache,
         resolved_config,
     })
 }
@@ -229,4 +261,12 @@ pub fn init_logging(log_dir: &Path) -> Result<tracing_appender::non_blocking::Wo
 pub fn write_resolved_config(config: &Config, path: &Path) -> Result<()> {
     let contents = toml::to_string_pretty(config).context("failed to serialize resolved config")?;
     fs::write(path, contents).with_context(|| format!("failed to write {}", path.display()))
+}
+
+fn default_train_split() -> f32 {
+    0.8
+}
+
+fn default_eval_every() -> u64 {
+    0
 }
