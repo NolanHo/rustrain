@@ -201,6 +201,8 @@ enum Command {
             default_value = "/tmp/rustrain-qwen-full-train-delta.safetensors"
         )]
         delta_output: PathBuf,
+        #[arg(long, default_value = "fp32")]
+        dtype: String,
         #[arg(long, default_value_t = 1e-6)]
         learning_rate: f64,
     },
@@ -340,11 +342,13 @@ fn main() -> Result<()> {
             model_path,
             reference_fixture,
             delta_output,
+            dtype,
             learning_rate,
         } => qwen_module::qwen_full_train_smoke(
             &model_path,
             &reference_fixture,
             &delta_output,
+            qwen_module::QwenComputeDType::parse(&dtype)?,
             learning_rate,
         ),
         Command::TchCudaProbe => tch_train::probe_tch_cuda(),

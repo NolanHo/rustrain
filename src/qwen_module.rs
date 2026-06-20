@@ -186,6 +186,7 @@ struct QwenFullTrainSmokeSummary {
     delta_output: String,
     optimizer_output: String,
     manifest_output: String,
+    compute_kind: String,
     learning_rate: f64,
     initial_loss: f64,
     final_loss: f64,
@@ -265,7 +266,14 @@ struct QwenTrainableSession {
     config: QwenRuntimeConfig,
     weights: BTreeMap<String, Tensor>,
     input_ids: Tensor,
+    compute_kind: Kind,
     registry: QwenTrainableRegistry,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum QwenComputeDType {
+    Fp32,
+    Bf16,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -323,6 +331,30 @@ struct QwenSftBatch {
     response_tokens: Vec<usize>,
     masked_positions: usize,
     padding_tokens: usize,
+}
+
+impl QwenComputeDType {
+    pub fn parse(value: &str) -> Result<Self> {
+        match value {
+            "fp32" => Ok(Self::Fp32),
+            "bf16" => Ok(Self::Bf16),
+            other => bail!("unsupported Qwen compute dtype {other}; expected fp32 or bf16"),
+        }
+    }
+
+    fn kind(self) -> Kind {
+        match self {
+            Self::Fp32 => Kind::Float,
+            Self::Bf16 => Kind::BFloat16,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Fp32 => "fp32",
+            Self::Bf16 => "bf16",
+        }
+    }
 }
 
 pub fn qwen_module_parity(model_safetensors: &Path, fixture: &Path) -> Result<()> {
@@ -1084,6 +1116,7 @@ pub fn qwen_full_train_smoke(
     model_path: &Path,
     reference_fixture: &Path,
     delta_output: &Path,
+    dtype: QwenComputeDType,
     learning_rate: f64,
 ) -> Result<()> {
     if learning_rate <= 0.0 {
@@ -1095,7 +1128,7 @@ pub fn qwen_full_train_smoke(
     let reference = read_safetensors_map(reference_fixture)?;
     let input_ids = tensor(&reference, "input_ids")?.to_kind(Kind::Int64);
 
-    let mut session = QwenTrainableSession::from_weights(config, weights, input_ids)?;
+    let mut session = QwenTrainableSession::from_weights(config, weights, input_ids, dtype.kind())?;
     let first_step = session.train_step(learning_rate, 1)?;
     let initial_loss = first_step.loss_before;
     let final_loss = first_step.loss_after;
@@ -1145,6 +1178,7 @@ pub fn qwen_full_train_smoke(
         session.config,
         read_safetensors_map(&model_path.join("model.safetensors"))?,
         session.input_ids.shallow_clone(),
+        dtype.kind(),
         &manifest,
     )?;
     let reloaded_loss = resumed_session.loss_value()?;
@@ -1174,6 +1208,7 @@ pub fn qwen_full_train_smoke(
         delta_output: delta_output.display().to_string(),
         optimizer_output: optimizer_output.display().to_string(),
         manifest_output: manifest_output.display().to_string(),
+        compute_kind: dtype.label().to_string(),
         learning_rate,
         initial_loss,
         final_loss,
@@ -1384,6 +1419,7 @@ impl QwenTrainableSession {
         config: QwenRuntimeConfig,
         mut weights: BTreeMap<String, Tensor>,
         input_ids: Tensor,
+        compute_kind: Kind,
     ) -> Result<Self> {
         if input_ids.size()[1] < 2 {
             bail!("training fixture must contain at least two tokens");
@@ -1393,6 +1429,7 @@ impl QwenTrainableSession {
             config,
             weights,
             input_ids,
+            compute_kind,
             registry,
         })
     }
@@ -1401,6 +1438,7 @@ impl QwenTrainableSession {
         config: QwenRuntimeConfig,
         mut weights: BTreeMap<String, Tensor>,
         input_ids: Tensor,
+        compute_kind: Kind,
         manifest: &QwenDeltaCheckpointManifest,
     ) -> Result<Self> {
         if input_ids.size()[1] < 2 {
@@ -1411,17 +1449,29 @@ impl QwenTrainableSession {
             config,
             weights,
             input_ids,
+            compute_kind,
             registry,
         })
     }
 
     fn loss_value(&self) -> Result<f64> {
-        Ok(qwen_causal_lm_loss(&self.input_ids, &self.weights, &self.config)?.double_value(&[]))
+        Ok(qwen_causal_lm_loss_with_kind(
+            &self.input_ids,
+            &self.weights,
+            &self.config,
+            self.compute_kind,
+        )?
+        .double_value(&[]))
     }
 
     fn train_step(&mut self, learning_rate: f64, step: i32) -> Result<QwenTrainStepResult> {
         self.registry.zero_grad();
-        let loss = qwen_causal_lm_loss(&self.input_ids, &self.weights, &self.config)?;
+        let loss = qwen_causal_lm_loss_with_kind(
+            &self.input_ids,
+            &self.weights,
+            &self.config,
+            self.compute_kind,
+        )?;
         let loss_before = loss.double_value(&[]);
         loss.backward();
         let artifacts = self
@@ -1951,34 +2001,32 @@ fn tensor_snapshot(tensor: &Tensor) -> Tensor {
 
 impl QwenLayerWeights {
     pub fn load(weights: &BTreeMap<String, Tensor>, layer_index: usize) -> Result<Self> {
+        Self::load_with_kind(weights, layer_index, Kind::Float)
+    }
+
+    fn load_with_kind(
+        weights: &BTreeMap<String, Tensor>,
+        layer_index: usize,
+        kind: Kind,
+    ) -> Result<Self> {
         let prefix = format!("model.layers.{layer_index}");
         Ok(Self {
-            input_norm: tensor(weights, &format!("{prefix}.input_layernorm.weight"))?
-                .to_kind(Kind::Float),
-            q_proj: tensor(weights, &format!("{prefix}.self_attn.q_proj.weight"))?
-                .to_kind(Kind::Float),
-            q_bias: tensor(weights, &format!("{prefix}.self_attn.q_proj.bias"))?
-                .to_kind(Kind::Float),
-            k_proj: tensor(weights, &format!("{prefix}.self_attn.k_proj.weight"))?
-                .to_kind(Kind::Float),
-            k_bias: tensor(weights, &format!("{prefix}.self_attn.k_proj.bias"))?
-                .to_kind(Kind::Float),
-            v_proj: tensor(weights, &format!("{prefix}.self_attn.v_proj.weight"))?
-                .to_kind(Kind::Float),
-            v_bias: tensor(weights, &format!("{prefix}.self_attn.v_proj.bias"))?
-                .to_kind(Kind::Float),
-            o_proj: tensor(weights, &format!("{prefix}.self_attn.o_proj.weight"))?
-                .to_kind(Kind::Float),
+            input_norm: tensor(weights, &format!("{prefix}.input_layernorm.weight"))?.to_kind(kind),
+            q_proj: tensor(weights, &format!("{prefix}.self_attn.q_proj.weight"))?.to_kind(kind),
+            q_bias: tensor(weights, &format!("{prefix}.self_attn.q_proj.bias"))?.to_kind(kind),
+            k_proj: tensor(weights, &format!("{prefix}.self_attn.k_proj.weight"))?.to_kind(kind),
+            k_bias: tensor(weights, &format!("{prefix}.self_attn.k_proj.bias"))?.to_kind(kind),
+            v_proj: tensor(weights, &format!("{prefix}.self_attn.v_proj.weight"))?.to_kind(kind),
+            v_bias: tensor(weights, &format!("{prefix}.self_attn.v_proj.bias"))?.to_kind(kind),
+            o_proj: tensor(weights, &format!("{prefix}.self_attn.o_proj.weight"))?.to_kind(kind),
             post_attention_norm: tensor(
                 weights,
                 &format!("{prefix}.post_attention_layernorm.weight"),
             )?
-            .to_kind(Kind::Float),
-            gate_proj: tensor(weights, &format!("{prefix}.mlp.gate_proj.weight"))?
-                .to_kind(Kind::Float),
-            up_proj: tensor(weights, &format!("{prefix}.mlp.up_proj.weight"))?.to_kind(Kind::Float),
-            down_proj: tensor(weights, &format!("{prefix}.mlp.down_proj.weight"))?
-                .to_kind(Kind::Float),
+            .to_kind(kind),
+            gate_proj: tensor(weights, &format!("{prefix}.mlp.gate_proj.weight"))?.to_kind(kind),
+            up_proj: tensor(weights, &format!("{prefix}.mlp.up_proj.weight"))?.to_kind(kind),
+            down_proj: tensor(weights, &format!("{prefix}.mlp.down_proj.weight"))?.to_kind(kind),
         })
     }
 }
@@ -1988,7 +2036,10 @@ pub fn qwen_layer(
     weights: &QwenLayerWeights,
     config: &QwenRuntimeConfig,
 ) -> Tensor {
-    let attention_input = rms_norm(input, &weights.input_norm, config.rms_norm_eps);
+    let compute_kind = weights.q_proj.kind();
+    let input = input.to_kind(compute_kind);
+    let attention_input =
+        rms_norm(&input, &weights.input_norm, config.rms_norm_eps).to_kind(compute_kind);
     let attention_output = qwen_attention(
         &attention_input,
         &weights.q_proj,
@@ -2005,7 +2056,8 @@ pub fn qwen_layer(
         &after_attention,
         &weights.post_attention_norm,
         config.rms_norm_eps,
-    );
+    )
+    .to_kind(compute_kind);
     let mlp_output = qwen_mlp(
         &mlp_input,
         &weights.gate_proj,
@@ -2020,14 +2072,23 @@ pub fn qwen_forward_from_ids(
     weights: &BTreeMap<String, Tensor>,
     config: &QwenRuntimeConfig,
 ) -> Result<Tensor> {
-    let embed_tokens = tensor(weights, "model.embed_tokens.weight")?.to_kind(Kind::Float);
-    let final_norm = tensor(weights, "model.norm.weight")?.to_kind(Kind::Float);
+    qwen_forward_from_ids_with_kind(input_ids, weights, config, Kind::Float)
+}
+
+fn qwen_forward_from_ids_with_kind(
+    input_ids: &Tensor,
+    weights: &BTreeMap<String, Tensor>,
+    config: &QwenRuntimeConfig,
+    compute_kind: Kind,
+) -> Result<Tensor> {
+    let embed_tokens = tensor(weights, "model.embed_tokens.weight")?.to_kind(compute_kind);
+    let final_norm = tensor(weights, "model.norm.weight")?.to_kind(compute_kind);
     let mut hidden = Tensor::embedding(&embed_tokens, input_ids, -1, false, false);
     for layer_index in 0..config.num_hidden_layers {
-        let layer = QwenLayerWeights::load(weights, layer_index)?;
+        let layer = QwenLayerWeights::load_with_kind(weights, layer_index, compute_kind)?;
         hidden = qwen_layer(&hidden, &layer, config);
     }
-    let hidden = rms_norm(&hidden, &final_norm, config.rms_norm_eps);
+    let hidden = rms_norm(&hidden, &final_norm, config.rms_norm_eps).to_kind(compute_kind);
     Ok(hidden.linear::<&Tensor>(&embed_tokens, None))
 }
 
@@ -2101,7 +2162,16 @@ fn qwen_causal_lm_loss(
     weights: &BTreeMap<String, Tensor>,
     config: &QwenRuntimeConfig,
 ) -> Result<Tensor> {
-    let logits = qwen_forward_from_ids(input_ids, weights, config)?;
+    qwen_causal_lm_loss_with_kind(input_ids, weights, config, Kind::Float)
+}
+
+fn qwen_causal_lm_loss_with_kind(
+    input_ids: &Tensor,
+    weights: &BTreeMap<String, Tensor>,
+    config: &QwenRuntimeConfig,
+    compute_kind: Kind,
+) -> Result<Tensor> {
+    let logits = qwen_forward_from_ids_with_kind(input_ids, weights, config, compute_kind)?;
     let seq_len = input_ids.size()[1];
     let shifted_logits = logits.narrow(1, 0, seq_len - 1);
     let targets = input_ids.narrow(1, 1, seq_len - 1);
@@ -2315,6 +2385,8 @@ pub fn qwen_attention(
         .reshape([batch_size, seq_len, config.num_key_value_heads, head_dim])
         .transpose(1, 2);
     let (cos, sin) = rope_cos_sin(seq_len, head_dim, config.rope_theta, input.device());
+    let cos = cos.to_kind(input.kind());
+    let sin = sin.to_kind(input.kind());
     let q = apply_rotary(&q, &cos, &sin);
     let k = apply_rotary(&k, &cos, &sin);
     let k = repeat_kv(&k, kv_repeat);
@@ -2322,7 +2394,7 @@ pub fn qwen_attention(
     let scores = q.matmul(&k.transpose(-2, -1)) / (head_dim as f64).sqrt();
     let causal_mask = Tensor::ones([seq_len, seq_len], (Kind::Bool, input.device())).triu(1);
     let scores = scores.masked_fill(&causal_mask, f64::NEG_INFINITY);
-    let probs = scores.softmax(-1, Kind::Float);
+    let probs = scores.softmax(-1, Kind::Float).to_kind(v.kind());
     let context = probs
         .matmul(&v)
         .transpose(1, 2)
@@ -2674,6 +2746,8 @@ fn qwen_attention_with_cache(
         input.device(),
         position_offset,
     );
+    let cos = cos.to_kind(input.kind());
+    let sin = sin.to_kind(input.kind());
     let q = apply_rotary(&q, &cos, &sin);
     let k = apply_rotary(&k, &cos, &sin);
     let (k, v) = if let Some(cache) = past_cache {
@@ -2699,7 +2773,9 @@ fn qwen_attention_with_cache(
     } else {
         scores
     };
-    let probs = scores.softmax(-1, Kind::Float);
+    let probs = scores
+        .softmax(-1, Kind::Float)
+        .to_kind(v_for_attention.kind());
     let context =
         probs
             .matmul(&v_for_attention)
@@ -3149,6 +3225,7 @@ mod tests {
             config,
             tiny_qwen_weights(),
             input_ids.shallow_clone(),
+            Kind::Float,
         )
         .expect("session should build");
         let first_step = continuous_session
@@ -3183,9 +3260,14 @@ mod tests {
             final_loss: first_step.loss_after,
             tensors: first_step.artifacts.manifest_tensors,
         };
-        let mut resumed_session =
-            QwenTrainableSession::from_manifest(config, tiny_qwen_weights(), input_ids, &manifest)
-                .expect("session should resume");
+        let mut resumed_session = QwenTrainableSession::from_manifest(
+            config,
+            tiny_qwen_weights(),
+            input_ids,
+            Kind::Float,
+            &manifest,
+        )
+        .expect("session should resume");
         assert!((first_step.loss_after - resumed_session.loss_value().unwrap()).abs() < 1e-6);
 
         let continuous_second = continuous_session

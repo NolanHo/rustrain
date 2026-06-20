@@ -93,8 +93,9 @@ scripts/gpu_run.sh cargo run -- qwen-full-train-smoke
 - Trainer production basics such as scheduler, grad clipping, RSS memory
   metrics, and Ray-worker GPU memory reporting are implemented for toy/tch
   paths; real tokenizer-backed padded LoRA SFT batching exists, and the tiny
-  `tch` CUDA path has an explicit bf16 compute policy smoke. Full Qwen
-  bf16/mixed-precision training is still future work.
+  `tch` CUDA path plus the representative Qwen full-train smoke have explicit
+  bf16 compute policy smokes. General trainer mixed-precision ownership is
+  still future work.
 
 Internal planning details live in `_internal_docs/TODO.md`; that directory is
 ignored by git.
