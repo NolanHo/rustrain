@@ -189,6 +189,16 @@ struct QwenDeltaTensorManifestEntry {
     delta_norm: f64,
 }
 
+struct AdamSlotNames {
+    m: String,
+    v: String,
+}
+
+struct AdamState {
+    m: Tensor,
+    v: Tensor,
+}
+
 pub fn qwen_module_parity(model_safetensors: &Path, fixture: &Path) -> Result<()> {
     let weights = read_safetensors_map(model_safetensors)?;
     let fixture_tensors = read_safetensors_map(fixture)?;
@@ -793,32 +803,28 @@ pub fn qwen_full_train_smoke(
             bail!("trainable tensor {name} did not receive a gradient");
         }
 
-        let adam_m = &grad * (1.0 - 0.9);
-        let adam_v = grad.pow_tensor_scalar(2.0) * (1.0 - 0.999);
-        let m_hat = &adam_m / (1.0 - 0.9);
-        let v_hat = &adam_v / (1.0 - 0.999);
-        let update = (m_hat / v_hat.sqrt().g_add_scalar(1e-8)) * learning_rate;
+        let adam_state = adamw_next_state(None, &grad, 0.9, 0.999);
+        let update = adamw_update(&adam_state, learning_rate, 0.9, 0.999, 1, 1e-8);
         let _ = no_grad(|| trainable.f_sub_(&update))?;
         weights.insert(name.clone(), trainable.shallow_clone());
         let base = tensor(&base_weights, &name)?.to_kind(Kind::Float);
         let delta = &trainable - &base;
         let delta_norm = delta.norm().double_value(&[]);
         let delta_name = format!("{name}.delta");
-        let adam_m_name = format!("{name}.adam_m");
-        let adam_v_name = format!("{name}.adam_v");
+        let adam_names = adam_slot_names(&name);
         manifest_tensors.push(QwenDeltaTensorManifestEntry {
             name: name.clone(),
             delta_name: delta_name.clone(),
-            adam_m_name: Some(adam_m_name.clone()),
-            adam_v_name: Some(adam_v_name.clone()),
+            adam_m_name: Some(adam_names.m.clone()),
+            adam_v_name: Some(adam_names.v.clone()),
             shape: trainable.size(),
             dtype: "float32".to_string(),
             grad_norm,
             delta_norm,
         });
         delta_entries.push((delta_name, delta));
-        optimizer_entries.push((adam_m_name, adam_m));
-        optimizer_entries.push((adam_v_name, adam_v));
+        optimizer_entries.push((adam_names.m, adam_state.m));
+        optimizer_entries.push((adam_names.v, adam_state.v));
         tensor_summaries.push(TrainableTensorSummary {
             name,
             grad_defined,
@@ -911,6 +917,46 @@ fn optimizer_state_path(delta_output: &Path) -> std::path::PathBuf {
     let mut path = delta_output.as_os_str().to_os_string();
     path.push(".optimizer.safetensors");
     path.into()
+}
+
+fn adam_slot_names(name: &str) -> AdamSlotNames {
+    AdamSlotNames {
+        m: format!("{name}.adam_m"),
+        v: format!("{name}.adam_v"),
+    }
+}
+
+fn adamw_next_state(
+    previous: Option<&AdamState>,
+    grad: &Tensor,
+    beta1: f64,
+    beta2: f64,
+) -> AdamState {
+    let m = if let Some(previous) = previous {
+        &previous.m * beta1 + grad * (1.0 - beta1)
+    } else {
+        grad * (1.0 - beta1)
+    };
+    let grad_sq = grad.pow_tensor_scalar(2.0);
+    let v = if let Some(previous) = previous {
+        &previous.v * beta2 + grad_sq * (1.0 - beta2)
+    } else {
+        grad_sq * (1.0 - beta2)
+    };
+    AdamState { m, v }
+}
+
+fn adamw_update(
+    state: &AdamState,
+    learning_rate: f64,
+    beta1: f64,
+    beta2: f64,
+    step: i32,
+    eps: f64,
+) -> Tensor {
+    let m_hat = &state.m / (1.0 - beta1.powi(step));
+    let v_hat = &state.v / (1.0 - beta2.powi(step));
+    (m_hat / v_hat.sqrt().g_add_scalar(eps)) * learning_rate
 }
 
 fn write_qwen_delta_manifest(
@@ -1855,6 +1901,77 @@ mod tests {
         assert_eq!(
             reloaded.tensors[0].adam_m_name,
             manifest.tensors[0].adam_m_name
+        );
+    }
+
+    #[test]
+    fn qwen_optimizer_slots_reload_reproduces_next_adam_step() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let optimizer_output = temp.path().join("optimizer.safetensors");
+        let tensor_name = "model.layers.0.self_attn.q_proj.weight";
+        let slot_names = adam_slot_names(tensor_name);
+        let first_grad = Tensor::from_slice(&[0.5_f32, -0.25, 0.125, -0.75]).reshape([2, 2]);
+        let second_grad = Tensor::from_slice(&[-0.2_f32, 0.4, -0.6, 0.8]).reshape([2, 2]);
+        let base_weight = Tensor::from_slice(&[1.0_f32, 2.0, 3.0, 4.0]).reshape([2, 2]);
+        let learning_rate = 1e-3;
+        let beta1 = 0.9;
+        let beta2 = 0.999;
+        let eps = 1e-8;
+
+        let first_state = adamw_next_state(None, &first_grad, beta1, beta2);
+        let first_update = adamw_update(&first_state, learning_rate, beta1, beta2, 1, eps);
+        let after_first = &base_weight - first_update;
+        Tensor::write_safetensors(
+            &[
+                (slot_names.m.as_str(), &first_state.m),
+                (slot_names.v.as_str(), &first_state.v),
+            ],
+            &optimizer_output,
+        )
+        .expect("optimizer slots should write");
+
+        let reloaded_slots = read_safetensors_map(&optimizer_output).expect("slots should reload");
+        let reloaded_state = AdamState {
+            m: tensor(&reloaded_slots, &slot_names.m)
+                .expect("m slot should exist")
+                .to_kind(Kind::Float),
+            v: tensor(&reloaded_slots, &slot_names.v)
+                .expect("v slot should exist")
+                .to_kind(Kind::Float),
+        };
+        let continuous_second_state =
+            adamw_next_state(Some(&first_state), &second_grad, beta1, beta2);
+        let reloaded_second_state =
+            adamw_next_state(Some(&reloaded_state), &second_grad, beta1, beta2);
+        let continuous_after_second = &after_first
+            - adamw_update(
+                &continuous_second_state,
+                learning_rate,
+                beta1,
+                beta2,
+                2,
+                eps,
+            );
+        let reloaded_after_second = &after_first
+            - adamw_update(&reloaded_second_state, learning_rate, beta1, beta2, 2, eps);
+
+        assert!(
+            diff_stats(&continuous_second_state.m, &reloaded_second_state.m)
+                .expect("m state diff should compute")
+                .max_abs
+                < 1e-8
+        );
+        assert!(
+            diff_stats(&continuous_second_state.v, &reloaded_second_state.v)
+                .expect("v state diff should compute")
+                .max_abs
+                < 1e-8
+        );
+        assert!(
+            diff_stats(&continuous_after_second, &reloaded_after_second)
+                .expect("weight diff should compute")
+                .max_abs
+                < 1e-8
         );
     }
 
