@@ -5,7 +5,10 @@ use tch::{
 };
 use tracing::info;
 
-use crate::runtime::{Config, Device as RuntimeDevice, LrScheduler};
+use crate::{
+    metrics::memory_rss_mb,
+    runtime::{Config, Device as RuntimeDevice, LrScheduler},
+};
 
 #[derive(Debug, Clone)]
 pub struct TchTrainSmokeSummary {
@@ -15,6 +18,7 @@ pub struct TchTrainSmokeSummary {
     pub lm_head_grad_defined: bool,
     pub first_step_grad_norm: f64,
     pub final_learning_rate: f64,
+    pub memory_rss_mb: Option<f64>,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -128,6 +132,7 @@ pub fn train_tch_tiny_lm(config: &Config) -> Result<TchTrainSmokeSummary> {
         lm_head_grad_defined,
         first_step_grad_norm,
         final_learning_rate,
+        memory_rss_mb: memory_rss_mb(),
     })
 }
 
@@ -209,6 +214,7 @@ mod tests {
         assert!(summary.lm_head_grad_defined);
         assert!(summary.first_step_grad_norm > 0.0);
         assert!((summary.final_learning_rate - 1e-2).abs() < 1e-8);
+        assert!(summary.memory_rss_mb.is_none_or(|value| value > 0.0));
     }
 
     #[test]

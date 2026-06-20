@@ -2,6 +2,7 @@ mod backend;
 mod distributed_smoke;
 mod inspect;
 mod lora;
+mod metrics;
 mod moe;
 mod parallel;
 mod parallel_modules;

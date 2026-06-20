@@ -89,9 +89,9 @@ cargo run -- qwen-full-train-smoke
 - Multi-GPU DP/TP/EP are toy smokes, not real NCCL-backed distributed training.
 - Real Qwen checkpoint manifest support has started with delta metadata, but
   full optimizer state and distributed checkpoint layout are not done.
-- Trainer production basics such as scheduler and grad clipping are implemented
-  for local toy/tch paths; memory metrics and real tokenizer-backed batching
-  remain partial.
+- Trainer production basics such as scheduler, grad clipping, and CPU RSS memory
+  metrics are implemented for local toy/tch paths; GPU memory metrics and real
+  tokenizer-backed batching remain partial.
 
 Internal planning details live in `_internal_docs/TODO.md`; that directory is
 ignored by git.

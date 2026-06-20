@@ -10,6 +10,7 @@ use tracing::info;
 use crate::{
     backend::{Backend, BackendKind, NdArrayBackend, TchBackend, tch_cpu_autograd_smoke},
     lora::{LoraLinear, lora_smoke},
+    metrics::memory_rss_mb,
     moe::{deepseek_moe_smoke, moe_smoke},
     parallel::{ProcessGroup, SingleRankProcessGroup},
     parallel_modules::tp1_module_smoke,
@@ -108,6 +109,7 @@ pub fn train(config_path: &Path, resume_from: Option<PathBuf>) -> Result<()> {
             lm_head_grad_defined = summary.lm_head_grad_defined,
             first_step_grad_norm = summary.first_step_grad_norm,
             final_lr = summary.final_learning_rate,
+            memory_rss_mb = summary.memory_rss_mb,
             "tch tiny lm smoke complete"
         );
         println!("rustrain tch tiny lm smoke complete");
@@ -118,6 +120,9 @@ pub fn train(config_path: &Path, resume_from: Option<PathBuf>) -> Result<()> {
         println!("lm_head_grad_defined: {}", summary.lm_head_grad_defined);
         println!("first_step_grad_norm: {:.6}", summary.first_step_grad_norm);
         println!("final_learning_rate: {:.8}", summary.final_learning_rate);
+        if let Some(memory_rss_mb) = summary.memory_rss_mb {
+            println!("memory_rss_mb: {memory_rss_mb:.2}");
+        }
 
         return Ok(());
     }
@@ -230,7 +235,10 @@ fn train_fixed_batch(config: &Config, run_paths: &crate::runtime::RunPaths) -> R
 
     info!(
         final_loss,
-        reload_loss, reload_delta, "checkpoint reload parity"
+        reload_loss,
+        reload_delta,
+        memory_rss_mb = memory_rss_mb(),
+        "checkpoint reload parity"
     );
     info!(?generated, "generate smoke test");
 
@@ -239,6 +247,9 @@ fn train_fixed_batch(config: &Config, run_paths: &crate::runtime::RunPaths) -> R
     println!("initial_loss: {initial:.6}");
     println!("final_loss: {final_loss:.6}");
     println!("reload_loss: {reload_loss:.6}");
+    if let Some(memory_rss_mb) = memory_rss_mb() {
+        println!("memory_rss_mb: {memory_rss_mb:.2}");
+    }
     println!("checkpoint: {}", checkpoint_path.display());
     println!("generated_tokens: {generated:?}");
 
@@ -322,7 +333,11 @@ fn train_text_data(config: &Config, run_paths: &crate::runtime::RunPaths) -> Res
 
     info!(
         final_eval,
-        reload_eval, tokens_per_second, samples_per_second, "text-data training complete"
+        reload_eval,
+        tokens_per_second,
+        samples_per_second,
+        memory_rss_mb = memory_rss_mb(),
+        "text-data training complete"
     );
 
     println!("rustrain M2-lite complete");
@@ -333,6 +348,9 @@ fn train_text_data(config: &Config, run_paths: &crate::runtime::RunPaths) -> Res
     println!("reload_eval_loss: {reload_eval:.6}");
     println!("tokens_per_second: {tokens_per_second:.2}");
     println!("samples_per_second: {samples_per_second:.2}");
+    if let Some(memory_rss_mb) = memory_rss_mb() {
+        println!("memory_rss_mb: {memory_rss_mb:.2}");
+    }
     println!("checkpoint: {}", checkpoint_path.display());
     println!(
         "tokenized_cache: {}",
@@ -430,6 +448,7 @@ fn train_sft_data(config: &Config, run_paths: &crate::runtime::RunPaths) -> Resu
         generate_before = %before_path.display(),
         generate_after = %after_path.display(),
         samples_per_second,
+        memory_rss_mb = memory_rss_mb(),
         "SFT training complete"
     );
 
@@ -440,6 +459,9 @@ fn train_sft_data(config: &Config, run_paths: &crate::runtime::RunPaths) -> Resu
     println!("final_eval_loss: {final_eval:.6}");
     println!("reload_eval_loss: {reload_eval:.6}");
     println!("samples_per_second: {samples_per_second:.2}");
+    if let Some(memory_rss_mb) = memory_rss_mb() {
+        println!("memory_rss_mb: {memory_rss_mb:.2}");
+    }
     println!("adapter_checkpoint: {}", adapter_path.display());
     println!("generate_before: {}", before_path.display());
     println!("generate_after: {}", after_path.display());
