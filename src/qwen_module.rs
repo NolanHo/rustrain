@@ -107,6 +107,22 @@ struct QwenLoraSmokeSummary {
 }
 
 #[derive(Debug, Serialize)]
+struct QwenLoraTrainSmokeSummary {
+    model_path: String,
+    fixture: String,
+    adapter_output: String,
+    rank: i64,
+    alpha: f64,
+    learning_rate: f64,
+    initial_loss: f64,
+    final_loss: f64,
+    reloaded_loss: f64,
+    reload_delta: f64,
+    base_requires_grad: bool,
+    trainable_tensors: Vec<TrainableTensorSummary>,
+}
+
+#[derive(Debug, Serialize)]
 struct QwenTiedHeadTrainSummary {
     model_path: String,
     reference_fixture: String,
@@ -501,6 +517,127 @@ pub fn qwen_lora_smoke(
     Ok(())
 }
 
+pub fn qwen_lora_train_smoke(
+    model_path: &Path,
+    fixture: &Path,
+    adapter_output: &Path,
+    rank: i64,
+    alpha: f64,
+    learning_rate: f64,
+) -> Result<()> {
+    if rank <= 0 {
+        bail!("rank must be positive");
+    }
+    if alpha <= 0.0 {
+        bail!("alpha must be positive");
+    }
+    if learning_rate <= 0.0 {
+        bail!("learning_rate must be positive");
+    }
+
+    let weights = read_safetensors_map(&model_path.join("model.safetensors"))?;
+    let fixture_tensors = read_safetensors_map(fixture)?;
+    let attention_input = tensor(&fixture_tensors, "input_attention_normed")?.to_kind(Kind::Float);
+    let base_target_output = tensor(&fixture_tensors, "attention_output")?.to_kind(Kind::Float);
+    let config = read_runtime_config(&model_path.join("config.json"))?;
+    let layer0 = QwenLayerWeights::load(&weights, 0)?;
+    let target_output = lora_train_target(&base_target_output);
+    let adapter = QwenAttentionLoraAdapter::deterministic_trainable(
+        layer0.q_proj.size()[1],
+        layer0.q_proj.size()[0],
+        layer0.v_proj.size()[0],
+        rank,
+        alpha,
+    );
+    let base_requires_grad = layer0.q_proj.requires_grad()
+        || layer0.k_proj.requires_grad()
+        || layer0.v_proj.requires_grad()
+        || layer0.o_proj.requires_grad();
+
+    let initial_loss =
+        qwen_attention_lora_mse_loss(&attention_input, &target_output, &layer0, &adapter, &config)
+            .double_value(&[]);
+    let loss =
+        qwen_attention_lora_mse_loss(&attention_input, &target_output, &layer0, &adapter, &config);
+    loss.backward();
+
+    let base_tensors: BTreeMap<String, Tensor> = adapter
+        .trainable_tensors()
+        .into_iter()
+        .map(|(name, tensor)| (name, tensor_snapshot(&tensor)))
+        .collect();
+    let mut tensor_summaries = Vec::new();
+    for (name, mut tensor) in adapter.trainable_tensors() {
+        let grad = tensor.grad();
+        let grad_defined = grad.defined();
+        let grad_norm = if grad_defined {
+            grad.norm().double_value(&[])
+        } else {
+            0.0
+        };
+        if !grad_defined || grad_norm <= 0.0 {
+            bail!("LoRA tensor {name} did not receive a gradient");
+        }
+        let _ = no_grad(|| tensor.f_sub_(&(&grad * learning_rate)))?;
+        let delta_norm = (&tensor
+            - base_tensors
+                .get(&name)
+                .ok_or_else(|| anyhow!("missing base LoRA tensor {name}"))?)
+        .norm()
+        .double_value(&[]);
+        tensor_summaries.push(TrainableTensorSummary {
+            name,
+            grad_defined,
+            grad_norm,
+            delta_norm,
+        });
+    }
+
+    let final_loss =
+        qwen_attention_lora_mse_loss(&attention_input, &target_output, &layer0, &adapter, &config)
+            .double_value(&[]);
+    if final_loss >= initial_loss {
+        bail!(
+            "Qwen LoRA train smoke failed to reduce loss: initial_loss={initial_loss}, final_loss={final_loss}"
+        );
+    }
+
+    adapter.save(adapter_output)?;
+    let reloaded = QwenAttentionLoraAdapter::load(adapter_output)?;
+    let reloaded_loss = qwen_attention_lora_mse_loss(
+        &attention_input,
+        &target_output,
+        &layer0,
+        &reloaded,
+        &config,
+    )
+    .double_value(&[]);
+    let reload_delta = (final_loss - reloaded_loss).abs();
+    if reload_delta > 1e-7 {
+        bail!(
+            "Qwen LoRA adapter reload loss parity failed: final_loss={final_loss}, reloaded_loss={reloaded_loss}, reload_delta={reload_delta}"
+        );
+    }
+
+    let summary = QwenLoraTrainSmokeSummary {
+        model_path: model_path.display().to_string(),
+        fixture: fixture.display().to_string(),
+        adapter_output: adapter_output.display().to_string(),
+        rank,
+        alpha,
+        learning_rate,
+        initial_loss,
+        final_loss,
+        reloaded_loss,
+        reload_delta,
+        base_requires_grad,
+        trainable_tensors: tensor_summaries,
+    };
+    println!("{}", serde_json::to_string_pretty(&summary)?);
+
+    Ok(())
+}
+
 pub fn qwen_tied_head_train_smoke(
     model_path: &Path,
     reference_fixture: &Path,
@@ -888,6 +1025,21 @@ impl QwenAttentionLoraAdapter {
         }
     }
 
+    fn deterministic_trainable(
+        in_features: i64,
+        q_out_features: i64,
+        v_out_features: i64,
+        rank: i64,
+        alpha: f64,
+    ) -> Self {
+        let adapter = Self::deterministic(in_features, q_out_features, v_out_features, rank, alpha);
+        let _ = adapter.q_a.set_requires_grad(true);
+        let _ = adapter.q_b.set_requires_grad(true);
+        let _ = adapter.v_a.set_requires_grad(true);
+        let _ = adapter.v_b.set_requires_grad(true);
+        adapter
+    }
+
     fn save(&self, path: &Path) -> Result<()> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)
@@ -936,6 +1088,27 @@ impl QwenAttentionLoraAdapter {
         ]
     }
 
+    fn trainable_tensors(&self) -> Vec<(String, Tensor)> {
+        vec![
+            (
+                "model.layers.0.self_attn.q_proj.lora_a".to_string(),
+                self.q_a.shallow_clone(),
+            ),
+            (
+                "model.layers.0.self_attn.q_proj.lora_b".to_string(),
+                self.q_b.shallow_clone(),
+            ),
+            (
+                "model.layers.0.self_attn.v_proj.lora_a".to_string(),
+                self.v_a.shallow_clone(),
+            ),
+            (
+                "model.layers.0.self_attn.v_proj.lora_b".to_string(),
+                self.v_b.shallow_clone(),
+            ),
+        ]
+    }
+
     fn q_delta(&self, device: Device) -> Tensor {
         self.q_b
             .to_device(device)
@@ -957,6 +1130,12 @@ fn deterministic_lora_tensor<const N: usize>(shape: [i64; N], scale: f64) -> Ten
         .map(|index| ((index % 17) as f64 - 8.0) as f32 * scale as f32)
         .collect();
     Tensor::from_slice(&values).reshape(shape)
+}
+
+fn tensor_snapshot(tensor: &Tensor) -> Tensor {
+    let mut snapshot = Tensor::zeros_like(tensor);
+    snapshot.copy_(tensor);
+    snapshot
 }
 
 impl QwenLayerWeights {
@@ -1323,6 +1502,27 @@ fn qwen_attention_with_lora(
     )
 }
 
+fn qwen_attention_lora_mse_loss(
+    input: &Tensor,
+    target: &Tensor,
+    weights: &QwenLayerWeights,
+    adapter: &QwenAttentionLoraAdapter,
+    config: &QwenRuntimeConfig,
+) -> Tensor {
+    qwen_attention_with_lora(input, weights, adapter, config).mse_loss(target, Reduction::Mean)
+}
+
+fn lora_train_target(base_output: &Tensor) -> Tensor {
+    let values = Tensor::arange(
+        base_output.numel() as i64,
+        (Kind::Float, base_output.device()),
+    )
+    .reshape(base_output.size())
+    .fmod(11.0)
+        / 10_000.0;
+    base_output + values
+}
+
 #[allow(clippy::too_many_arguments)]
 fn qwen_attention_with_cache(
     input: &Tensor,
@@ -1642,6 +1842,55 @@ mod tests {
             .max_abs
                 < 1e-8
         );
+    }
+
+    #[test]
+    fn qwen_attention_lora_train_step_reduces_tiny_mse_and_reloads() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let adapter_output = temp.path().join("adapter.safetensors");
+        let config = QwenRuntimeConfig {
+            num_hidden_layers: 1,
+            num_attention_heads: 2,
+            num_key_value_heads: 1,
+            rms_norm_eps: 1e-6,
+            rope_theta: 10_000.0,
+        };
+        let weights = tiny_qwen_weights();
+        let layer = QwenLayerWeights::load(&weights, 0).expect("layer should load");
+        let input = Tensor::arange(12, (Kind::Float, Device::Cpu)).reshape([1, 3, 4]) / 12.0;
+        let target = qwen_attention(
+            &input,
+            &layer.q_proj,
+            &layer.q_bias,
+            &layer.k_proj,
+            &layer.k_bias,
+            &layer.v_proj,
+            &layer.v_bias,
+            &layer.o_proj,
+            &config,
+        ) + Tensor::ones([1, 3, 4], (Kind::Float, Device::Cpu)) * 0.01;
+        let adapter = QwenAttentionLoraAdapter::deterministic_trainable(4, 4, 2, 2, 8.0);
+
+        let initial_loss = qwen_attention_lora_mse_loss(&input, &target, &layer, &adapter, &config)
+            .double_value(&[]);
+        let loss = qwen_attention_lora_mse_loss(&input, &target, &layer, &adapter, &config);
+        loss.backward();
+        for (_, mut tensor) in adapter.trainable_tensors() {
+            let grad = tensor.grad();
+            assert!(grad.defined());
+            let _ = no_grad(|| tensor.f_sub_(&(&grad * 1.0))).expect("update should apply");
+        }
+        let final_loss = qwen_attention_lora_mse_loss(&input, &target, &layer, &adapter, &config)
+            .double_value(&[]);
+        assert!(final_loss < initial_loss);
+
+        adapter.save(&adapter_output).expect("adapter should save");
+        let reloaded =
+            QwenAttentionLoraAdapter::load(&adapter_output).expect("adapter should reload");
+        let reloaded_loss =
+            qwen_attention_lora_mse_loss(&input, &target, &layer, &reloaded, &config)
+                .double_value(&[]);
+        assert!((final_loss - reloaded_loss).abs() < 1e-8);
     }
 
     #[test]

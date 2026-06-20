@@ -32,6 +32,7 @@ The script runs:
 - `cargo run -- train --config configs/gsm8k_toy.toml`
 - `cargo run -- train --config configs/sft_debug.toml`
 - `cargo run -- qwen-lora-smoke`
+- `cargo run -- qwen-lora-train-smoke`
 - `cargo run -- qwen-kv-cache-parity`
 - `cargo run -- parallel-dp-smoke --output-dir runs/parallel-dp-smoke`
 - `cargo run -- parallel-tp-smoke`
@@ -67,6 +68,7 @@ cargo run -- qwen-generate-parity
 cargo run -- qwen-sampling-smoke
 cargo run -- qwen-kv-cache-parity
 cargo run -- qwen-lora-smoke
+cargo run -- qwen-lora-train-smoke
 ```
 
 The full-train smoke command is present, but A800 execution must be used for
@@ -82,8 +84,8 @@ cargo run -- qwen-full-train-smoke
 - Real full-Qwen training is only partially done: the command and representative
   trainable tensor path exist, but the A800 full-checkpoint smoke still needs to
   be run when the worker is reachable.
-- Real Qwen module-level LoRA for layer0 attention `q_proj`/`v_proj` is
-  implemented; trainer-integrated LoRA SFT is not done yet.
+- Real Qwen module-level LoRA train/reload smoke for layer0 attention
+  `q_proj`/`v_proj` is implemented; trainer-integrated LoRA SFT is not done yet.
 - KV-cache greedy parity is implemented; cached sampling and Python cached
   generation parity are future work.
 - Multi-GPU DP/TP/EP are toy smokes, not real NCCL-backed distributed training.

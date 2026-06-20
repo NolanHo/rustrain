@@ -126,6 +126,26 @@ enum Command {
         #[arg(long, default_value_t = 8.0)]
         alpha: f64,
     },
+    QwenLoraTrainSmoke {
+        #[arg(
+            long,
+            default_value = "/vePFS-Mindverse/share/huggingface/Qwen2.5-0.5B-Instruct"
+        )]
+        model_path: PathBuf,
+        #[arg(long, default_value = "runs/parity/qwen_layer0_modules.safetensors")]
+        fixture: PathBuf,
+        #[arg(
+            long,
+            default_value = "/tmp/rustrain-qwen-lora-trained-adapter.safetensors"
+        )]
+        adapter_output: PathBuf,
+        #[arg(long, default_value_t = 4)]
+        rank: i64,
+        #[arg(long, default_value_t = 8.0)]
+        alpha: f64,
+        #[arg(long, default_value_t = 1e3)]
+        learning_rate: f64,
+    },
     QwenTiedHeadTrainSmoke {
         #[arg(
             long,
@@ -243,6 +263,21 @@ fn main() -> Result<()> {
             rank,
             alpha,
         } => qwen_module::qwen_lora_smoke(&model_path, &fixture, &adapter_output, rank, alpha),
+        Command::QwenLoraTrainSmoke {
+            model_path,
+            fixture,
+            adapter_output,
+            rank,
+            alpha,
+            learning_rate,
+        } => qwen_module::qwen_lora_train_smoke(
+            &model_path,
+            &fixture,
+            &adapter_output,
+            rank,
+            alpha,
+            learning_rate,
+        ),
         Command::QwenTiedHeadTrainSmoke {
             model_path,
             reference_fixture,
