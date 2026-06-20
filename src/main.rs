@@ -251,6 +251,11 @@ enum Command {
         #[arg(long)]
         output_dir: PathBuf,
     },
+    #[command(hide = true)]
+    NcclDpGradientRankSmoke {
+        #[arg(long)]
+        output_dir: PathBuf,
+    },
 }
 
 fn main() -> Result<()> {
@@ -404,6 +409,9 @@ fn main() -> Result<()> {
         Command::PrintLaunchEnv => launcher::print_launch_env(),
         Command::NcclAllReduceRankSmoke { output_dir } => {
             nccl_smoke::run_nccl_all_reduce_rank(output_dir)
+        }
+        Command::NcclDpGradientRankSmoke { output_dir } => {
+            nccl_smoke::run_nccl_dp_gradient_rank(output_dir)
         }
     }
 }
