@@ -102,6 +102,9 @@ Qwen training is not implemented yet.
 The Qwen DP smoke writes a rank0-only JSON checkpoint manifest after gradient
 sync succeeds; non-rank0 summaries record the same checkpoint path but do not
 write it.
+It also all-reduces full CUDA gradient tensors for the focused layer0 attention
+parameter set, applies one averaged SGD step on each rank, and checks that the
+global post-update loss is lower.
 
 ## Current Major Gaps
 

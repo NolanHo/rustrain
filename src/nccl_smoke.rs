@@ -9,6 +9,7 @@ use std::{
 
 use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
+use tch::{Kind, Tensor};
 
 const NCCL_UNIQUE_ID_BYTES: usize = 128;
 const CUDA_MEMCPY_HOST_TO_DEVICE: c_int = 1;
@@ -233,6 +234,23 @@ pub fn all_reduce_f32_for_launch(output_dir: &Path, values: &[f32]) -> Result<Ve
     nccl_all_reduce_values(unique_id, rank, world_size, local_rank, values)
 }
 
+pub fn all_reduce_tensor_f32_for_launch(output_dir: &Path, tensor: &Tensor) -> Result<Tensor> {
+    let rank = parse_env_usize("RANK")?;
+    let local_rank = parse_env_usize("LOCAL_RANK")?;
+    let world_size = parse_env_usize("WORLD_SIZE")?;
+    if rank >= world_size {
+        bail!("rank {rank} must be smaller than world_size {world_size}");
+    }
+    let tensor = tensor.to_kind(Kind::Float).contiguous();
+    if tensor.numel() == 0 {
+        bail!("NCCL tensor all-reduce input must not be empty");
+    }
+    fs::create_dir_all(output_dir)
+        .with_context(|| format!("failed to create {}", output_dir.display()))?;
+    let unique_id = shared_unique_id(output_dir, rank)?;
+    unsafe { nccl_all_reduce_tensor_unsafe(unique_id, rank, world_size, local_rank, &tensor) }
+}
+
 fn shared_unique_id(output_dir: &Path, rank: usize) -> Result<NcclUniqueId> {
     let id_path = output_dir.join("nccl-unique-id.bin");
     if rank == 0 {
@@ -276,6 +294,44 @@ fn nccl_all_reduce_values(
     input: &[f32],
 ) -> Result<Vec<f32>> {
     unsafe { nccl_all_reduce_values_unsafe(unique_id, rank, world_size, local_rank, input) }
+}
+
+unsafe fn nccl_all_reduce_tensor_unsafe(
+    unique_id: NcclUniqueId,
+    rank: usize,
+    world_size: usize,
+    local_rank: usize,
+    input: &Tensor,
+) -> Result<Tensor> {
+    check_cuda(
+        unsafe { cudaSetDevice(local_rank as c_int) },
+        "cudaSetDevice",
+    )?;
+    let output = input.zeros_like();
+    let mut comm: NcclComm = ptr::null_mut();
+    check_nccl(
+        unsafe { ncclCommInitRank(&mut comm, world_size as c_int, unique_id, rank as c_int) },
+        "ncclCommInitRank",
+    )?;
+    let reduce_result = check_nccl(
+        unsafe {
+            ncclAllReduce(
+                input.data_ptr().cast_const(),
+                output.data_ptr(),
+                input.numel(),
+                NCCL_FLOAT32,
+                NCCL_SUM,
+                comm,
+                ptr::null_mut(),
+            )
+        },
+        "ncclAllReduce",
+    )
+    .and_then(|_| check_cuda(unsafe { cudaDeviceSynchronize() }, "cudaDeviceSynchronize"));
+    let destroy_result = check_nccl(unsafe { ncclCommDestroy(comm) }, "ncclCommDestroy");
+    reduce_result?;
+    destroy_result?;
+    Ok(output)
 }
 
 unsafe fn nccl_all_reduce_values_unsafe(

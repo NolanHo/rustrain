@@ -211,7 +211,10 @@ struct QwenDpGradientRankSummary {
     max_grad_delta: f32,
     loss_delta: f64,
     local_loss: f64,
+    post_update_loss: f64,
     global_loss: f64,
+    global_post_update_loss: f64,
+    global_loss_improved: bool,
     expected_loss: f64,
     checkpoint_written: bool,
     checkpoint_path: String,
@@ -233,6 +236,9 @@ struct QwenDpCheckpointManifest {
     max_grad_delta: f32,
     expected_loss: f64,
     dtype: String,
+    learning_rate: f64,
+    post_update_loss: f64,
+    global_post_update_loss: f64,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -1382,6 +1388,30 @@ pub fn qwen_dp_gradient_smoke(
         );
     }
 
+    println!("qwen attention DP rank {rank}: reducing full gradients");
+    let averaged_grads = local_session
+        .all_reduce_average_grads(&output_dir.join("qwen-dp-full-gradient"), world_size)?;
+    let learning_rate = 1.0;
+    local_session.apply_sgd_step(&averaged_grads, learning_rate)?;
+    let post_update_loss = local_session.loss_value();
+    wait_for_rank_barrier(
+        &output_dir.join("qwen-dp-post-update-loss-ready"),
+        rank,
+        world_size,
+        Duration::from_secs(300),
+    )?;
+    let reduced_post_update_loss = nccl_smoke::all_reduce_f32_for_launch(
+        &output_dir.join("qwen-dp-post-update-loss"),
+        &[post_update_loss as f32],
+    )?[0];
+    let global_post_update_loss = reduced_post_update_loss as f64 / world_size as f64;
+    let global_loss_improved = global_post_update_loss < global_loss;
+    if !global_loss_improved {
+        bail!(
+            "Qwen DP gradient update did not reduce global loss: rank={rank}, global_loss={global_loss}, global_post_update_loss={global_post_update_loss}"
+        );
+    }
+
     let checkpoint_path = output_dir.join("qwen-dp-rank0-checkpoint.json");
     let checkpoint_written = if rank == 0 {
         let manifest = QwenDpCheckpointManifest {
@@ -1392,6 +1422,9 @@ pub fn qwen_dp_gradient_smoke(
             max_grad_delta,
             expected_loss,
             dtype: dtype.label().to_string(),
+            learning_rate,
+            post_update_loss,
+            global_post_update_loss,
         };
         fs::write(
             &checkpoint_path,
@@ -1411,7 +1444,10 @@ pub fn qwen_dp_gradient_smoke(
         max_grad_delta,
         loss_delta,
         local_loss,
+        post_update_loss,
         global_loss,
+        global_post_update_loss,
+        global_loss_improved,
         expected_loss,
         checkpoint_written,
         checkpoint_path: checkpoint_path.display().to_string(),
@@ -1747,6 +1783,17 @@ impl QwenAttentionDpSession {
         for (_, parameter) in self.parameters_mut() {
             parameter.zero_grad();
         }
+        let loss = self.loss_tensor();
+        let loss_value = loss.double_value(&[]);
+        loss.backward();
+        Ok(loss_value)
+    }
+
+    fn loss_value(&self) -> f64 {
+        self.loss_tensor().double_value(&[])
+    }
+
+    fn loss_tensor(&self) -> Tensor {
         let output = qwen_attention(
             &self.input,
             &self.q_proj.to_kind(self.compute_kind),
@@ -1758,10 +1805,43 @@ impl QwenAttentionDpSession {
             &self.o_proj.to_kind(self.compute_kind),
             &self.config,
         );
-        let loss = output.mse_loss(&self.target, Reduction::Mean);
-        let loss_value = loss.double_value(&[]);
-        loss.backward();
-        Ok(loss_value)
+        output.mse_loss(&self.target, Reduction::Mean)
+    }
+
+    fn all_reduce_average_grads(
+        &self,
+        output_dir: &Path,
+        world_size: usize,
+    ) -> Result<Vec<Tensor>> {
+        let mut averaged = Vec::new();
+        for (index, (name, parameter)) in self.parameters().iter().enumerate() {
+            let grad = parameter.grad();
+            if !grad.defined() {
+                bail!("trainable tensor {name} did not receive a gradient");
+            }
+            let reduced = nccl_smoke::all_reduce_tensor_f32_for_launch(
+                &output_dir.join(format!("grad-{index}")),
+                &grad,
+            )?;
+            averaged.push(reduced / world_size as f64);
+        }
+        Ok(averaged)
+    }
+
+    fn apply_sgd_step(&mut self, averaged_grads: &[Tensor], learning_rate: f64) -> Result<()> {
+        let mut parameters = self.parameters_mut();
+        if averaged_grads.len() != parameters.len() {
+            bail!(
+                "averaged gradient count mismatch: got {}, expected {}",
+                averaged_grads.len(),
+                parameters.len()
+            );
+        }
+        for ((_, parameter), grad) in parameters.iter_mut().zip(averaged_grads.iter()) {
+            let update = grad.to_device(parameter.device()) * learning_rate;
+            let _ = no_grad(|| parameter.f_sub_(&update))?;
+        }
+        Ok(())
     }
 
     fn grad_entries(&self) -> Result<Vec<(String, Tensor)>> {
