@@ -96,6 +96,27 @@ struct QwenTiedHeadTrainSummary {
     grad_norm: f64,
 }
 
+#[derive(Debug, Serialize)]
+struct TrainableTensorSummary {
+    name: String,
+    grad_defined: bool,
+    grad_norm: f64,
+    delta_norm: f64,
+}
+
+#[derive(Debug, Serialize)]
+struct QwenFullTrainSmokeSummary {
+    model_path: String,
+    reference_fixture: String,
+    delta_output: String,
+    learning_rate: f64,
+    initial_loss: f64,
+    final_loss: f64,
+    reloaded_loss: f64,
+    reload_delta: f64,
+    trainable_tensors: Vec<TrainableTensorSummary>,
+}
+
 pub fn qwen_module_parity(model_safetensors: &Path, fixture: &Path) -> Result<()> {
     let weights = read_safetensors_map(model_safetensors)?;
     let fixture_tensors = read_safetensors_map(fixture)?;
@@ -408,6 +429,138 @@ pub fn qwen_tied_head_train_smoke(
     println!("{}", serde_json::to_string_pretty(&summary)?);
 
     Ok(())
+}
+
+pub fn qwen_full_train_smoke(
+    model_path: &Path,
+    reference_fixture: &Path,
+    delta_output: &Path,
+    learning_rate: f64,
+) -> Result<()> {
+    if learning_rate <= 0.0 {
+        bail!("learning_rate must be positive");
+    }
+
+    let config = read_runtime_config(&model_path.join("config.json"))?;
+    let mut weights = read_safetensors_map(&model_path.join("model.safetensors"))?;
+    let reference = read_safetensors_map(reference_fixture)?;
+    let input_ids = tensor(&reference, "input_ids")?.to_kind(Kind::Int64);
+    if input_ids.size()[1] < 2 {
+        bail!("training fixture must contain at least two tokens");
+    }
+
+    let trainable_names = representative_trainable_qwen_tensors();
+    let mut trainable_tensors = Vec::with_capacity(trainable_names.len());
+    for name in &trainable_names {
+        let trainable = tensor(&weights, name)?
+            .to_kind(Kind::Float)
+            .set_requires_grad(true);
+        weights.insert((*name).to_string(), trainable.shallow_clone());
+        trainable_tensors.push(((*name).to_string(), trainable));
+    }
+
+    let initial_loss = qwen_causal_lm_loss(&input_ids, &weights, &config)?.double_value(&[]);
+    let loss = qwen_causal_lm_loss(&input_ids, &weights, &config)?;
+    loss.backward();
+
+    let base_weights = read_safetensors_map(&model_path.join("model.safetensors"))?;
+    let mut delta_entries: Vec<(String, Tensor)> = Vec::with_capacity(trainable_tensors.len());
+    let mut tensor_summaries = Vec::with_capacity(trainable_tensors.len());
+    for (name, mut trainable) in trainable_tensors {
+        let grad = trainable.grad();
+        let grad_defined = grad.defined();
+        let grad_norm = if grad_defined {
+            grad.norm().double_value(&[])
+        } else {
+            0.0
+        };
+        if !grad_defined || grad_norm <= 0.0 {
+            bail!("trainable tensor {name} did not receive a gradient");
+        }
+
+        let update = &grad * learning_rate;
+        let _ = no_grad(|| trainable.f_sub_(&update))?;
+        weights.insert(name.clone(), trainable.shallow_clone());
+        let base = tensor(&base_weights, &name)?.to_kind(Kind::Float);
+        let delta = &trainable - &base;
+        let delta_norm = delta.norm().double_value(&[]);
+        delta_entries.push((format!("{name}.delta"), delta));
+        tensor_summaries.push(TrainableTensorSummary {
+            name,
+            grad_defined,
+            grad_norm,
+            delta_norm,
+        });
+    }
+
+    let final_loss = qwen_causal_lm_loss(&input_ids, &weights, &config)?.double_value(&[]);
+    if final_loss >= initial_loss {
+        bail!(
+            "Qwen full train smoke failed to reduce loss: initial_loss={initial_loss}, final_loss={final_loss}"
+        );
+    }
+
+    if let Some(parent) = delta_output.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+    let delta_refs: Vec<(&str, &Tensor)> = delta_entries
+        .iter()
+        .map(|(name, tensor)| (name.as_str(), tensor))
+        .collect();
+    Tensor::write_safetensors(&delta_refs, delta_output)
+        .with_context(|| format!("failed to write {}", delta_output.display()))?;
+
+    let mut reloaded_weights = read_safetensors_map(&model_path.join("model.safetensors"))?;
+    let delta_tensors = read_safetensors_map(delta_output)?;
+    for name in &trainable_names {
+        let delta_name = format!("{name}.delta");
+        let reloaded = tensor(&reloaded_weights, name)?.to_kind(Kind::Float)
+            + tensor(&delta_tensors, &delta_name)?.to_kind(Kind::Float);
+        reloaded_weights.insert((*name).to_string(), reloaded);
+    }
+    let reloaded_loss =
+        qwen_causal_lm_loss(&input_ids, &reloaded_weights, &config)?.double_value(&[]);
+    let reload_delta = (final_loss - reloaded_loss).abs();
+    if reload_delta > 1e-5 {
+        bail!(
+            "Qwen full train delta reload parity failed: final_loss={final_loss}, reloaded_loss={reloaded_loss}, reload_delta={reload_delta}"
+        );
+    }
+
+    let summary = QwenFullTrainSmokeSummary {
+        model_path: model_path.display().to_string(),
+        reference_fixture: reference_fixture.display().to_string(),
+        delta_output: delta_output.display().to_string(),
+        learning_rate,
+        initial_loss,
+        final_loss,
+        reloaded_loss,
+        reload_delta,
+        trainable_tensors: tensor_summaries,
+    };
+    println!("{}", serde_json::to_string_pretty(&summary)?);
+
+    Ok(())
+}
+
+fn representative_trainable_qwen_tensors() -> Vec<&'static str> {
+    vec![
+        "model.embed_tokens.weight",
+        "model.layers.0.input_layernorm.weight",
+        "model.layers.0.self_attn.q_proj.weight",
+        "model.layers.0.self_attn.q_proj.bias",
+        "model.layers.0.self_attn.k_proj.weight",
+        "model.layers.0.self_attn.k_proj.bias",
+        "model.layers.0.self_attn.v_proj.weight",
+        "model.layers.0.self_attn.v_proj.bias",
+        "model.layers.0.self_attn.o_proj.weight",
+        "model.layers.0.post_attention_layernorm.weight",
+        "model.layers.0.mlp.gate_proj.weight",
+        "model.layers.0.mlp.up_proj.weight",
+        "model.layers.0.mlp.down_proj.weight",
+        "model.norm.weight",
+    ]
 }
 
 fn read_runtime_config(path: &Path) -> Result<QwenRuntimeConfig> {
@@ -807,6 +960,71 @@ mod tests {
 
         assert_eq!(loss.size(), Vec::<i64>::new());
         assert!(loss.isfinite().int64_value(&[]) == 1);
+    }
+
+    #[test]
+    fn representative_full_train_tensors_get_gradients_and_reload() {
+        let config = QwenRuntimeConfig {
+            num_hidden_layers: 1,
+            num_attention_heads: 2,
+            num_key_value_heads: 1,
+            rms_norm_eps: 1e-6,
+            rope_theta: 10_000.0,
+        };
+        let mut weights = tiny_qwen_weights();
+        let input_ids = Tensor::from_slice(&[0_i64, 1, 2, 3]).reshape([1, 4]);
+        let trainable_names = representative_trainable_qwen_tensors();
+        let mut trainable_tensors = Vec::new();
+        for name in &trainable_names {
+            let trainable = tensor(&weights, name)
+                .expect("representative tensor should exist")
+                .to_kind(Kind::Float)
+                .set_requires_grad(true);
+            weights.insert((*name).to_string(), trainable.shallow_clone());
+            trainable_tensors.push(((*name).to_string(), trainable));
+        }
+
+        let initial_loss = qwen_causal_lm_loss(&input_ids, &weights, &config)
+            .expect("loss should run")
+            .double_value(&[]);
+        let loss = qwen_causal_lm_loss(&input_ids, &weights, &config).expect("loss should run");
+        loss.backward();
+
+        let base_weights = tiny_qwen_weights();
+        let mut deltas = BTreeMap::new();
+        for (name, mut trainable) in trainable_tensors {
+            let grad = trainable.grad();
+            assert!(grad.defined(), "{name} should receive a gradient");
+            assert!(
+                grad.norm().double_value(&[]) > 0.0,
+                "{name} grad should be non-zero"
+            );
+
+            let _ = no_grad(|| trainable.f_sub_(&(&grad * 1e-2))).expect("update should apply");
+            let base = tensor(&base_weights, &name)
+                .expect("base tensor should exist")
+                .to_kind(Kind::Float);
+            deltas.insert(name.clone(), &trainable - &base);
+            weights.insert(name, trainable);
+        }
+
+        let final_loss = qwen_causal_lm_loss(&input_ids, &weights, &config)
+            .expect("loss should run")
+            .double_value(&[]);
+        assert!(final_loss < initial_loss);
+
+        let mut reloaded_weights = tiny_qwen_weights();
+        for (name, delta) in deltas {
+            let reloaded = tensor(&reloaded_weights, &name)
+                .expect("base tensor should exist")
+                .to_kind(Kind::Float)
+                + delta;
+            reloaded_weights.insert(name, reloaded);
+        }
+        let reloaded_loss = qwen_causal_lm_loss(&input_ids, &reloaded_weights, &config)
+            .expect("loss should run")
+            .double_value(&[]);
+        assert!((final_loss - reloaded_loss).abs() < 1e-6);
     }
 
     #[test]

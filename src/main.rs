@@ -115,6 +115,22 @@ enum Command {
         #[arg(long, default_value_t = 1e-4)]
         learning_rate: f64,
     },
+    QwenFullTrainSmoke {
+        #[arg(
+            long,
+            default_value = "/vePFS-Mindverse/share/huggingface/Qwen2.5-0.5B-Instruct"
+        )]
+        model_path: PathBuf,
+        #[arg(long, default_value = "runs/parity/qwen2_5_0_5b_logits.safetensors")]
+        reference_fixture: PathBuf,
+        #[arg(
+            long,
+            default_value = "/tmp/rustrain-qwen-full-train-delta.safetensors"
+        )]
+        delta_output: PathBuf,
+        #[arg(long, default_value_t = 1e-6)]
+        learning_rate: f64,
+    },
     TchCudaProbe,
     ParallelDpSmoke {
         #[arg(long, default_value = "runs/parallel-dp-smoke")]
@@ -194,6 +210,17 @@ fn main() -> Result<()> {
             delta_output,
             learning_rate,
         } => qwen_module::qwen_tied_head_train_smoke(
+            &model_path,
+            &reference_fixture,
+            &delta_output,
+            learning_rate,
+        ),
+        Command::QwenFullTrainSmoke {
+            model_path,
+            reference_fixture,
+            delta_output,
+            learning_rate,
+        } => qwen_module::qwen_full_train_smoke(
             &model_path,
             &reference_fixture,
             &delta_output,
