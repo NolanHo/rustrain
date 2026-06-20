@@ -11,9 +11,9 @@ as milestone-sized, verifiable smokes.
 ## GPU-Only Verification
 
 All smoke, test, parity, and training verification runs on the GPU host through
-Ray `num_gpus=1` workers. The local machine is only for editing and git
-operations; local CPU runs are not accepted as development smoke or milestone
-evidence.
+Ray `num_gpus=1` workers. The local machine is only for editing, git
+operations, and launching remote jobs. Do not run local CPU smoke or
+verification commands for development evidence.
 
 Run one command on a Ray GPU worker:
 
@@ -30,8 +30,8 @@ scripts/verify_gpu.sh
 Both scripts SSH to `root@192.168.42.106:2222`, submit work to Ray with
 `num_gpus=1`, enter the remote checkout, and source `scripts/tch_a800_env.sh`
 before running project commands. Do not run `cargo test`, train smokes, or
-parity commands directly in the plain SSH shell; that shell does not expose the
-GPU devices.
+parity commands on the local machine or directly in the plain SSH shell; the
+plain shell does not expose the GPU devices.
 
 The required remote checkout is:
 
@@ -70,22 +70,28 @@ scripts/gpu_run.sh cargo run -- qwen-full-train-smoke
 
 ## Current Major Gaps
 
-- Real full-Qwen training is partially reusable: representative Qwen parameters
-  now go through a trainable registry, but this is not yet a trainer-owned full
-  model module.
-- Real Qwen module-level LoRA now uses a target-layer/module registry for layer0
-  attention `q_proj`/`v_proj`; trainer-owned full-model LoRA injection is not
-  done yet.
+- G5 full checkpoint resume is incomplete: representative Qwen delta tensors
+  and Adam optimizer slots are persisted, but manifest-driven reload still
+  needs to restore weights plus optimizer state and prove next-step parity.
+- C4/G1 trainer-owned Qwen training is incomplete: representative Qwen
+  parameters now go through a trainable registry, but this is not yet a
+  reusable train/eval model module with checkpoint ownership.
+- G6 trainer-level real SFT data is incomplete: tokenizer-backed padded
+  response-only batches exist for the focused LoRA SFT smoke, but the general
+  trainer loop does not own that dataset and batching path yet.
+- Real Qwen module-level LoRA now uses a target-layer/module registry for
+  layer0 attention `q_proj`/`v_proj`; trainer-owned full-model LoRA injection
+  is not done yet.
 - KV-cache greedy parity and cached sampling parity are implemented; Python
   cached-generation parity is future work.
-- Multi-GPU DP/TP/EP are toy smokes, not real NCCL-backed distributed training.
-- Real Qwen checkpoint manifest support has delta metadata and representative
-  Adam slot persistence, but full train resume and distributed checkpoint layout
-  are not done.
+- G4 real distributed training is missing: multi-GPU DP/TP/EP are toy or
+  simulated smokes, not NCCL-backed rank-local Qwen training.
+- Distributed checkpoint layout is not defined.
 - Trainer production basics such as scheduler, grad clipping, RSS memory
   metrics, and Ray-worker GPU memory reporting are implemented for toy/tch
   paths; real tokenizer-backed padded LoRA SFT batching exists, and the tiny
-  `tch` CUDA path has an explicit bf16 compute policy smoke.
+  `tch` CUDA path has an explicit bf16 compute policy smoke. Full Qwen
+  bf16/mixed-precision training is still future work.
 
 Internal planning details live in `_internal_docs/TODO.md`; that directory is
 ignored by git.
