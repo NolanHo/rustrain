@@ -94,6 +94,19 @@ struct QwenKvCacheParitySummary {
 }
 
 #[derive(Debug, Serialize)]
+struct QwenLoraSmokeSummary {
+    model_path: String,
+    fixture: String,
+    adapter_output: String,
+    rank: i64,
+    alpha: f64,
+    zero_lora_max_delta: f64,
+    nonzero_lora_max_delta: f64,
+    reload_max_delta: f64,
+    trainable_tensors: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
 struct QwenTiedHeadTrainSummary {
     model_path: String,
     reference_fixture: String,
@@ -402,6 +415,86 @@ pub fn qwen_kv_cache_parity(
         full_context_ids,
         cached_ids,
         reference_match,
+    };
+    println!("{}", serde_json::to_string_pretty(&summary)?);
+
+    Ok(())
+}
+
+pub fn qwen_lora_smoke(
+    model_path: &Path,
+    fixture: &Path,
+    adapter_output: &Path,
+    rank: i64,
+    alpha: f64,
+) -> Result<()> {
+    if rank <= 0 {
+        bail!("rank must be positive");
+    }
+    if alpha <= 0.0 {
+        bail!("alpha must be positive");
+    }
+
+    let weights = read_safetensors_map(&model_path.join("model.safetensors"))?;
+    let fixture_tensors = read_safetensors_map(fixture)?;
+    let attention_input = tensor(&fixture_tensors, "input_attention_normed")?.to_kind(Kind::Float);
+    let config = read_runtime_config(&model_path.join("config.json"))?;
+    let layer0 = QwenLayerWeights::load(&weights, 0)?;
+    let base = qwen_attention(
+        &attention_input,
+        &layer0.q_proj,
+        &layer0.q_bias,
+        &layer0.k_proj,
+        &layer0.k_bias,
+        &layer0.v_proj,
+        &layer0.v_bias,
+        &layer0.o_proj,
+        &config,
+    );
+    let zero_adapter = QwenAttentionLoraAdapter::zeros(
+        layer0.q_proj.size()[1],
+        layer0.q_proj.size()[0],
+        layer0.v_proj.size()[0],
+        rank,
+        alpha,
+    );
+    let zero_output = qwen_attention_with_lora(&attention_input, &layer0, &zero_adapter, &config);
+    let zero_lora_max_delta = diff_stats(&zero_output, &base)?.max_abs;
+    if zero_lora_max_delta > 1e-7 {
+        bail!("zero LoRA changed attention output: max_delta={zero_lora_max_delta}");
+    }
+
+    let adapter = QwenAttentionLoraAdapter::deterministic(
+        layer0.q_proj.size()[1],
+        layer0.q_proj.size()[0],
+        layer0.v_proj.size()[0],
+        rank,
+        alpha,
+    );
+    let adapted_output = qwen_attention_with_lora(&attention_input, &layer0, &adapter, &config);
+    let nonzero_lora_max_delta = diff_stats(&adapted_output, &base)?.max_abs;
+    if nonzero_lora_max_delta <= 0.0 {
+        bail!("non-zero LoRA did not change attention output");
+    }
+
+    adapter.save(adapter_output)?;
+    let reloaded = QwenAttentionLoraAdapter::load(adapter_output)?;
+    let reloaded_output = qwen_attention_with_lora(&attention_input, &layer0, &reloaded, &config);
+    let reload_max_delta = diff_stats(&reloaded_output, &adapted_output)?.max_abs;
+    if reload_max_delta > 1e-7 {
+        bail!("LoRA adapter reload changed output: max_delta={reload_max_delta}");
+    }
+
+    let summary = QwenLoraSmokeSummary {
+        model_path: model_path.display().to_string(),
+        fixture: fixture.display().to_string(),
+        adapter_output: adapter_output.display().to_string(),
+        rank,
+        alpha,
+        zero_lora_max_delta,
+        nonzero_lora_max_delta,
+        reload_max_delta,
+        trainable_tensors: reloaded.trainable_tensor_names(),
     };
     println!("{}", serde_json::to_string_pretty(&summary)?);
 
@@ -747,6 +840,125 @@ struct QwenLayerCache {
     value: Tensor,
 }
 
+struct QwenAttentionLoraAdapter {
+    q_a: Tensor,
+    q_b: Tensor,
+    v_a: Tensor,
+    v_b: Tensor,
+    rank: i64,
+    alpha: f64,
+}
+
+impl QwenAttentionLoraAdapter {
+    fn zeros(
+        in_features: i64,
+        q_out_features: i64,
+        v_out_features: i64,
+        rank: i64,
+        alpha: f64,
+    ) -> Self {
+        Self {
+            q_a: Tensor::zeros([rank, in_features], (Kind::Float, Device::Cpu)),
+            q_b: Tensor::zeros([q_out_features, rank], (Kind::Float, Device::Cpu)),
+            v_a: Tensor::zeros([rank, in_features], (Kind::Float, Device::Cpu)),
+            v_b: Tensor::zeros([v_out_features, rank], (Kind::Float, Device::Cpu)),
+            rank,
+            alpha,
+        }
+    }
+
+    fn deterministic(
+        in_features: i64,
+        q_out_features: i64,
+        v_out_features: i64,
+        rank: i64,
+        alpha: f64,
+    ) -> Self {
+        let q_a = deterministic_lora_tensor([rank, in_features], 0.0005);
+        let q_b = deterministic_lora_tensor([q_out_features, rank], -0.0003);
+        let v_a = deterministic_lora_tensor([rank, in_features], -0.0004);
+        let v_b = deterministic_lora_tensor([v_out_features, rank], 0.0002);
+        Self {
+            q_a,
+            q_b,
+            v_a,
+            v_b,
+            rank,
+            alpha,
+        }
+    }
+
+    fn save(&self, path: &Path) -> Result<()> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create {}", parent.display()))?;
+        }
+        let rank = Tensor::from_slice(&[self.rank]);
+        let alpha = Tensor::from_slice(&[self.alpha as f32]);
+        Tensor::write_safetensors(
+            &[
+                (&"q_proj.lora_a", &self.q_a),
+                (&"q_proj.lora_b", &self.q_b),
+                (&"v_proj.lora_a", &self.v_a),
+                (&"v_proj.lora_b", &self.v_b),
+                (&"rank", &rank),
+                (&"alpha", &alpha),
+            ],
+            path,
+        )
+        .with_context(|| format!("failed to write {}", path.display()))
+    }
+
+    fn load(path: &Path) -> Result<Self> {
+        let tensors = read_safetensors_map(path)?;
+        let q_a = tensor(&tensors, "q_proj.lora_a")?.to_kind(Kind::Float);
+        let q_b = tensor(&tensors, "q_proj.lora_b")?.to_kind(Kind::Float);
+        let v_a = tensor(&tensors, "v_proj.lora_a")?.to_kind(Kind::Float);
+        let v_b = tensor(&tensors, "v_proj.lora_b")?.to_kind(Kind::Float);
+        let rank = tensor(&tensors, "rank")?.int64_value(&[0]);
+        let alpha = tensor(&tensors, "alpha")?.double_value(&[0]);
+        Ok(Self {
+            q_a,
+            q_b,
+            v_a,
+            v_b,
+            rank,
+            alpha,
+        })
+    }
+
+    fn trainable_tensor_names(&self) -> Vec<String> {
+        vec![
+            "model.layers.0.self_attn.q_proj.lora_a".to_string(),
+            "model.layers.0.self_attn.q_proj.lora_b".to_string(),
+            "model.layers.0.self_attn.v_proj.lora_a".to_string(),
+            "model.layers.0.self_attn.v_proj.lora_b".to_string(),
+        ]
+    }
+
+    fn q_delta(&self, device: Device) -> Tensor {
+        self.q_b
+            .to_device(device)
+            .matmul(&self.q_a.to_device(device))
+            * (self.alpha / self.rank as f64)
+    }
+
+    fn v_delta(&self, device: Device) -> Tensor {
+        self.v_b
+            .to_device(device)
+            .matmul(&self.v_a.to_device(device))
+            * (self.alpha / self.rank as f64)
+    }
+}
+
+fn deterministic_lora_tensor<const N: usize>(shape: [i64; N], scale: f64) -> Tensor {
+    let len = shape.iter().product::<i64>() as usize;
+    let values: Vec<f32> = (0..len)
+        .map(|index| ((index % 17) as f64 - 8.0) as f32 * scale as f32)
+        .collect();
+    Tensor::from_slice(&values).reshape(shape)
+}
+
 impl QwenLayerWeights {
     pub fn load(weights: &BTreeMap<String, Tensor>, layer_index: usize) -> Result<Self> {
         let prefix = format!("model.layers.{layer_index}");
@@ -1090,6 +1302,27 @@ pub fn qwen_attention(
     context.linear::<&Tensor>(o_proj, None)
 }
 
+fn qwen_attention_with_lora(
+    input: &Tensor,
+    weights: &QwenLayerWeights,
+    adapter: &QwenAttentionLoraAdapter,
+    config: &QwenRuntimeConfig,
+) -> Tensor {
+    let q_proj = &weights.q_proj + adapter.q_delta(input.device());
+    let v_proj = &weights.v_proj + adapter.v_delta(input.device());
+    qwen_attention(
+        input,
+        &q_proj,
+        &weights.q_bias,
+        &weights.k_proj,
+        &weights.k_bias,
+        &v_proj,
+        &weights.v_bias,
+        &weights.o_proj,
+        config,
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 fn qwen_attention_with_cache(
     input: &Tensor,
@@ -1373,6 +1606,41 @@ mod tests {
         assert_eq!(
             reloaded.tensors[0].delta_name,
             manifest.tensors[0].delta_name
+        );
+    }
+
+    #[test]
+    fn qwen_attention_lora_adapter_roundtrips_mismatched_q_v_shapes() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let adapter_output = temp.path().join("adapter.safetensors");
+        let adapter = QwenAttentionLoraAdapter::deterministic(4, 6, 2, 2, 8.0);
+
+        assert_eq!(adapter.q_delta(Device::Cpu).size(), vec![6, 4]);
+        assert_eq!(adapter.v_delta(Device::Cpu).size(), vec![2, 4]);
+
+        adapter.save(&adapter_output).expect("adapter should write");
+        let reloaded =
+            QwenAttentionLoraAdapter::load(&adapter_output).expect("adapter should reload");
+
+        assert_eq!(reloaded.q_delta(Device::Cpu).size(), vec![6, 4]);
+        assert_eq!(reloaded.v_delta(Device::Cpu).size(), vec![2, 4]);
+        assert!(
+            diff_stats(
+                &reloaded.q_delta(Device::Cpu),
+                &adapter.q_delta(Device::Cpu)
+            )
+            .expect("q delta diff should compute")
+            .max_abs
+                < 1e-8
+        );
+        assert!(
+            diff_stats(
+                &reloaded.v_delta(Device::Cpu),
+                &adapter.v_delta(Device::Cpu)
+            )
+            .expect("v delta diff should compute")
+            .max_abs
+                < 1e-8
         );
     }
 

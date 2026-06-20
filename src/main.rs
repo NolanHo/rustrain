@@ -110,6 +110,21 @@ enum Command {
         #[arg(long, default_value_t = 4)]
         max_new_tokens: usize,
     },
+    QwenLoraSmoke {
+        #[arg(
+            long,
+            default_value = "/vePFS-Mindverse/share/huggingface/Qwen2.5-0.5B-Instruct"
+        )]
+        model_path: PathBuf,
+        #[arg(long, default_value = "runs/parity/qwen_layer0_modules.safetensors")]
+        fixture: PathBuf,
+        #[arg(long, default_value = "/tmp/rustrain-qwen-lora-adapter.safetensors")]
+        adapter_output: PathBuf,
+        #[arg(long, default_value_t = 4)]
+        rank: i64,
+        #[arg(long, default_value_t = 8.0)]
+        alpha: f64,
+    },
     QwenTiedHeadTrainSmoke {
         #[arg(
             long,
@@ -220,6 +235,13 @@ fn main() -> Result<()> {
             reference_fixture,
             max_new_tokens,
         } => qwen_module::qwen_kv_cache_parity(&model_path, &reference_fixture, max_new_tokens),
+        Command::QwenLoraSmoke {
+            model_path,
+            fixture,
+            adapter_output,
+            rank,
+            alpha,
+        } => qwen_module::qwen_lora_smoke(&model_path, &fixture, &adapter_output, rank, alpha),
         Command::QwenTiedHeadTrainSmoke {
             model_path,
             reference_fixture,
