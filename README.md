@@ -76,12 +76,15 @@ A minimal local-rank launcher is available for rank process management:
 ```sh
 scripts/gpu_run.sh cargo run -- launch --nproc-per-node 2 print-launch-env
 scripts/gpu_run.sh cargo run -- launch --nproc-per-node 2 parallel-dp-rank-smoke --output-dir /tmp/rustrain-runs/launch-dp-rank-smoke/dp
+RUSTRAIN_RAY_NUM_GPUS=2 scripts/gpu_run.sh cargo run -- launch --nproc-per-node 2 --output-dir /tmp/rustrain-runs/nccl-all-reduce-smoke nccl-all-reduce-rank-smoke --output-dir /tmp/rustrain-runs/nccl-all-reduce-smoke/ranks
 ```
 
 The launcher sets `RANK`, `LOCAL_RANK`, `WORLD_SIZE`, `LOCAL_WORLD_SIZE`,
 `MASTER_ADDR`, and `MASTER_PORT`, captures rank-local logs, and writes a
-`launch-summary.json`. It does not yet provide NCCL-backed gradient
-synchronization or real multi-GPU Qwen training.
+`launch-summary.json`. `scripts/gpu_run.sh` defaults to one Ray GPU; set
+`RUSTRAIN_RAY_NUM_GPUS=2` for two-rank GPU collective smokes. A minimal NCCL
+f32 all-reduce smoke exists, but trainer-owned gradient synchronization and
+real multi-GPU Qwen training are not implemented yet.
 
 ## Current Major Gaps
 
@@ -102,9 +105,9 @@ synchronization or real multi-GPU Qwen training.
   is not done yet.
 - KV-cache greedy parity and cached sampling parity are implemented; Python
   cached-generation parity is future work.
-- G4 launcher process management exists, but real distributed training is still
-  missing: multi-GPU DP/TP/EP are toy or simulated smokes, not NCCL-backed
-  rank-local Qwen training.
+- G4 launcher process management and a minimal NCCL all-reduce smoke exist, but
+  real distributed training is still missing: DP/TP/EP trainer/model paths are
+  not NCCL-backed rank-local Qwen training yet.
 - Distributed checkpoint layout is not defined.
 - Trainer production basics such as scheduler, grad clipping, RSS memory
   metrics, and Ray-worker GPU memory reporting are implemented for toy/tch

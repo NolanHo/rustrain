@@ -5,6 +5,7 @@ mod launcher;
 mod lora;
 mod metrics;
 mod moe;
+mod nccl_smoke;
 mod parallel;
 mod parallel_modules;
 mod qwen_module;
@@ -245,6 +246,11 @@ enum Command {
     },
     #[command(hide = true)]
     PrintLaunchEnv,
+    #[command(hide = true)]
+    NcclAllReduceRankSmoke {
+        #[arg(long)]
+        output_dir: PathBuf,
+    },
 }
 
 fn main() -> Result<()> {
@@ -396,5 +402,8 @@ fn main() -> Result<()> {
             world_size,
         } => distributed_smoke::run_data_parallel_rank_from_args(output_dir, rank, world_size),
         Command::PrintLaunchEnv => launcher::print_launch_env(),
+        Command::NcclAllReduceRankSmoke { output_dir } => {
+            nccl_smoke::run_nccl_all_reduce_rank(output_dir)
+        }
     }
 }
