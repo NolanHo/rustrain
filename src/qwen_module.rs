@@ -1,4 +1,8 @@
-use std::{collections::BTreeMap, fs, path::Path};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fs,
+    path::Path,
+};
 
 use anyhow::{Context, Result, anyhow, bail};
 use rand::{Rng, SeedableRng, rngs::StdRng};
@@ -295,6 +299,15 @@ struct QwenSftTokenSample {
 
 struct QwenSftExample {
     instruction: String,
+    input: String,
+    response: String,
+}
+
+#[derive(Deserialize)]
+struct QwenSftRecord {
+    instruction: String,
+    #[serde(default)]
+    input: String,
     response: String,
 }
 
@@ -810,6 +823,8 @@ pub fn qwen_lora_train_smoke(
 pub fn qwen_lora_sft_smoke(
     model_path: &Path,
     adapter_output: &Path,
+    sft_jsonl: Option<&Path>,
+    sft_batch_size: usize,
     instruction: &str,
     response: &str,
     rank: i64,
@@ -825,23 +840,32 @@ pub fn qwen_lora_sft_smoke(
     if learning_rate <= 0.0 {
         bail!("learning_rate must be positive");
     }
+    if sft_batch_size == 0 {
+        bail!("sft_batch_size must be positive");
+    }
 
     let tokenizer = Tokenizer::from_file(model_path.join("tokenizer.json"))
         .map_err(|error| anyhow!("failed to load tokenizer: {error}"))?;
-    let dataset = QwenSftDataset::from_instruction_pairs(
-        &tokenizer,
-        &[
-            QwenSftExample {
-                instruction: instruction.to_string(),
-                response: response.to_string(),
-            },
-            QwenSftExample {
-                instruction: "Name the project.".to_string(),
-                response: "rustrain".to_string(),
-            },
-        ],
-    )?;
-    let batch = dataset.padded_batch(0, dataset.len())?;
+    let dataset = if let Some(sft_jsonl) = sft_jsonl {
+        QwenSftDataset::from_jsonl_path(&tokenizer, sft_jsonl)?
+    } else {
+        QwenSftDataset::from_instruction_pairs(
+            &tokenizer,
+            &[
+                QwenSftExample {
+                    instruction: instruction.to_string(),
+                    input: String::new(),
+                    response: response.to_string(),
+                },
+                QwenSftExample {
+                    instruction: "Name the project.".to_string(),
+                    input: String::new(),
+                    response: "rustrain".to_string(),
+                },
+            ],
+        )?
+    };
+    let batch = dataset.padded_batch(0, sft_batch_size.min(dataset.len()))?;
     let weights = read_safetensors_map(&model_path.join("model.safetensors"))?;
     let config = read_runtime_config(&model_path.join("config.json"))?;
     let layer0 = QwenLayerWeights::load(&weights, 0)?;
@@ -2345,14 +2369,16 @@ impl QwenSftDataset {
         }
         let samples = examples
             .iter()
-            .map(|example| {
-                qwen_sft_token_sample(tokenizer, &example.instruction, &example.response)
-            })
+            .map(|example| qwen_sft_token_sample(tokenizer, example))
             .collect::<Result<Vec<_>>>()?;
         Ok(Self {
             samples,
             pad_token_id: qwen_pad_token_id(tokenizer),
         })
+    }
+
+    fn from_jsonl_path(tokenizer: &Tokenizer, path: &Path) -> Result<Self> {
+        Self::from_instruction_pairs(tokenizer, &qwen_sft_examples_from_jsonl_path(path)?)
     }
 
     fn padded_batch(&self, start: usize, batch_size: usize) -> Result<QwenSftBatch> {
@@ -2376,15 +2402,83 @@ impl QwenSftDataset {
     }
 }
 
+fn qwen_sft_examples_from_jsonl_path(path: &Path) -> Result<Vec<QwenSftExample>> {
+    let mut files = Vec::new();
+    if path.is_dir() {
+        let mut sorted = BTreeSet::new();
+        for entry in
+            fs::read_dir(path).with_context(|| format!("failed to list {}", path.display()))?
+        {
+            let entry =
+                entry.with_context(|| format!("failed to read entry in {}", path.display()))?;
+            let file_type = entry
+                .file_type()
+                .with_context(|| format!("failed to inspect {}", entry.path().display()))?;
+            if file_type.is_file() {
+                sorted.insert(entry.path());
+            }
+        }
+        files.extend(sorted);
+    } else {
+        files.push(path.to_path_buf());
+    }
+
+    if files.is_empty() {
+        bail!("SFT JSONL path {} did not contain files", path.display());
+    }
+
+    let mut examples = Vec::new();
+    for file in files {
+        let contents = fs::read_to_string(&file)
+            .with_context(|| format!("failed to read {}", file.display()))?;
+        for (line_index, line) in contents.lines().enumerate() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            let record: QwenSftRecord = serde_json::from_str(line).with_context(|| {
+                format!(
+                    "failed to parse SFT JSONL record {}:{}",
+                    file.display(),
+                    line_index + 1
+                )
+            })?;
+            examples.push(QwenSftExample {
+                instruction: record.instruction,
+                input: record.input,
+                response: record.response,
+            });
+        }
+    }
+
+    if examples.is_empty() {
+        bail!("SFT JSONL path {} did not contain examples", path.display());
+    }
+    Ok(examples)
+}
+
 fn qwen_sft_token_sample(
     tokenizer: &Tokenizer,
-    instruction: &str,
+    example: &QwenSftExample,
+) -> Result<QwenSftTokenSample> {
+    let prompt = if example.input.trim().is_empty() {
+        format!("Instruction:\n{}\n\nResponse:\n", example.instruction)
+    } else {
+        format!(
+            "Instruction:\n{}\n\nInput:\n{}\n\nResponse:\n",
+            example.instruction, example.input
+        )
+    };
+    qwen_sft_token_sample_from_prompt(tokenizer, &prompt, &example.response)
+}
+
+fn qwen_sft_token_sample_from_prompt(
+    tokenizer: &Tokenizer,
+    prompt: &str,
     response: &str,
 ) -> Result<QwenSftTokenSample> {
-    let prompt = format!("Instruction:\n{instruction}\n\nResponse:\n");
     let response = format!("{response}\n");
     let prompt_encoding = tokenizer
-        .encode(prompt.as_str(), false)
+        .encode(prompt, false)
         .map_err(|error| anyhow!("failed to encode prompt: {error}"))?;
     let response_encoding = tokenizer
         .encode(response.as_str(), false)
@@ -3314,6 +3408,30 @@ mod tests {
         assert_eq!(mask_values, vec![1.0, 1.0, 0.0, 1.0, 1.0, 1.0]);
         assert_eq!(batch.masked_positions, 5);
         assert_eq!(batch.padding_tokens, 0);
+    }
+
+    #[test]
+    fn qwen_sft_jsonl_reader_loads_instruction_input_response_records() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let jsonl = temp.path().join("samples.jsonl");
+        fs::write(
+            &jsonl,
+            r#"{"instruction":"Reply with the project name.","response":"rustrain"}
+{"instruction":"Name the language.","input":"rustrain implementation","response":"Rust"}
+"#,
+        )
+        .expect("jsonl should write");
+
+        let examples =
+            qwen_sft_examples_from_jsonl_path(&jsonl).expect("examples should load from jsonl");
+
+        assert_eq!(examples.len(), 2);
+        assert_eq!(examples[0].instruction, "Reply with the project name.");
+        assert_eq!(examples[0].input, "");
+        assert_eq!(examples[0].response, "rustrain");
+        assert_eq!(examples[1].instruction, "Name the language.");
+        assert_eq!(examples[1].input, "rustrain implementation");
+        assert_eq!(examples[1].response, "Rust");
     }
 
     #[test]

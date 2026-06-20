@@ -157,6 +157,10 @@ enum Command {
             default_value = "/tmp/rustrain-qwen-lora-sft-adapter.safetensors"
         )]
         adapter_output: PathBuf,
+        #[arg(long)]
+        sft_jsonl: Option<PathBuf>,
+        #[arg(long, default_value_t = 2)]
+        sft_batch_size: usize,
         #[arg(long, default_value = "Reply with the project name.")]
         instruction: String,
         #[arg(long, default_value = "rustrain")]
@@ -303,6 +307,8 @@ fn main() -> Result<()> {
         Command::QwenLoraSftSmoke {
             model_path,
             adapter_output,
+            sft_jsonl,
+            sft_batch_size,
             instruction,
             response,
             rank,
@@ -311,6 +317,8 @@ fn main() -> Result<()> {
         } => qwen_module::qwen_lora_sft_smoke(
             &model_path,
             &adapter_output,
+            sft_jsonl.as_deref(),
+            sft_batch_size,
             &instruction,
             &response,
             rank,

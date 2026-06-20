@@ -79,8 +79,9 @@ scripts/gpu_run.sh cargo run -- qwen-full-train-smoke
   loss evaluation, and manifest resume. Wiring that surface into the general
   trainer remains open.
 - G6 trainer-level real SFT data is incomplete: tokenizer-backed
-  `QwenSftDataset` padded response-only batches now feed the focused LoRA SFT
-  smoke, but the general trainer loop does not own that dataset path yet.
+  `QwenSftDataset` padded response-only batches, including optional
+  instruction JSONL input, now feed the focused LoRA SFT smoke. The general
+  trainer loop does not own that dataset path yet.
 - Real Qwen module-level LoRA now uses a target-layer/module registry for
   layer0 attention `q_proj`/`v_proj`; trainer-owned full-model LoRA injection
   is not done yet.
