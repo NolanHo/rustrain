@@ -99,6 +99,9 @@ all-reduce, toy DP gradient all-reduce, and `tch` autograd DP gradient smokes
 exist, including a `trainer::train` config path for tiny `tch` DP=2 and a
 focused real-Qwen layer0 attention DP gradient-signature smoke. Real multi-GPU
 Qwen training is not implemented yet.
+The Qwen DP smoke writes a rank0-only JSON checkpoint manifest after gradient
+sync succeeds; non-rank0 summaries record the same checkpoint path but do not
+write it.
 
 ## Current Major Gaps
 

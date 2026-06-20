@@ -213,6 +213,8 @@ struct QwenDpGradientRankSummary {
     local_loss: f64,
     global_loss: f64,
     expected_loss: f64,
+    checkpoint_written: bool,
+    checkpoint_path: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -220,6 +222,17 @@ struct QwenGradSignature {
     name: String,
     shape: Vec<i64>,
     samples: Vec<f32>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct QwenDpCheckpointManifest {
+    format: String,
+    writer_rank: usize,
+    world_size: usize,
+    tensor_count: usize,
+    max_grad_delta: f32,
+    expected_loss: f64,
+    dtype: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -1369,6 +1382,27 @@ pub fn qwen_dp_gradient_smoke(
         );
     }
 
+    let checkpoint_path = output_dir.join("qwen-dp-rank0-checkpoint.json");
+    let checkpoint_written = if rank == 0 {
+        let manifest = QwenDpCheckpointManifest {
+            format: "rustrain.qwen_dp_rank0.v1".to_string(),
+            writer_rank: rank,
+            world_size,
+            tensor_count: local_grads.len(),
+            max_grad_delta,
+            expected_loss,
+            dtype: dtype.label().to_string(),
+        };
+        fs::write(
+            &checkpoint_path,
+            serde_json::to_string_pretty(&manifest)? + "\n",
+        )
+        .with_context(|| format!("failed to write {}", checkpoint_path.display()))?;
+        true
+    } else {
+        false
+    };
+
     let summary = QwenDpGradientRankSummary {
         rank,
         world_size,
@@ -1379,6 +1413,8 @@ pub fn qwen_dp_gradient_smoke(
         local_loss,
         global_loss,
         expected_loss,
+        checkpoint_written,
+        checkpoint_path: checkpoint_path.display().to_string(),
     };
     let summary_path = output_dir.join(format!("qwen-dp-gradient-rank-{rank}.json"));
     fs::write(&summary_path, serde_json::to_string_pretty(&summary)?)
