@@ -74,9 +74,10 @@ scripts/gpu_run.sh cargo run -- qwen-full-train-smoke
   smoke: manifest-driven reload restores delta tensors plus Adam optimizer
   slots and proves next-step parity. Distributed checkpoint layout is still
   open.
-- C4/G1 trainer-owned Qwen training is incomplete: representative Qwen
-  parameters now go through a trainable registry, but this is not yet a
-  reusable train/eval model module with checkpoint ownership.
+- C4/G1 trainer-owned Qwen training is still incomplete, but the full-train
+  smoke now uses a reusable `QwenTrainableSession` surface for train steps,
+  loss evaluation, and manifest resume. Wiring that surface into the general
+  trainer remains open.
 - G6 trainer-level real SFT data is incomplete: tokenizer-backed padded
   response-only batches exist for the focused LoRA SFT smoke, but the general
   trainer loop does not own that dataset and batching path yet.

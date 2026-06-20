@@ -251,6 +251,19 @@ struct QwenTrainableRegistry {
     parameters: Vec<QwenTrainableParameter>,
 }
 
+struct QwenTrainStepResult {
+    loss_before: f64,
+    loss_after: f64,
+    artifacts: QwenTrainStepArtifacts,
+}
+
+struct QwenTrainableSession {
+    config: QwenRuntimeConfig,
+    weights: BTreeMap<String, Tensor>,
+    input_ids: Tensor,
+    registry: QwenTrainableRegistry,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 struct QwenLoraConfig {
     target_layers: Vec<usize>,
@@ -1034,22 +1047,14 @@ pub fn qwen_full_train_smoke(
     }
 
     let config = read_runtime_config(&model_path.join("config.json"))?;
-    let mut weights = read_safetensors_map(&model_path.join("model.safetensors"))?;
+    let weights = read_safetensors_map(&model_path.join("model.safetensors"))?;
     let reference = read_safetensors_map(reference_fixture)?;
     let input_ids = tensor(&reference, "input_ids")?.to_kind(Kind::Int64);
-    if input_ids.size()[1] < 2 {
-        bail!("training fixture must contain at least two tokens");
-    }
 
-    let mut registry = QwenTrainableRegistry::representative(&mut weights)?;
-
-    let initial_loss = qwen_causal_lm_loss(&input_ids, &weights, &config)?.double_value(&[]);
-    let loss = qwen_causal_lm_loss(&input_ids, &weights, &config)?;
-    loss.backward();
-
-    let step_artifacts = registry.adamw_step(&mut weights, learning_rate, 1)?;
-
-    let final_loss = qwen_causal_lm_loss(&input_ids, &weights, &config)?.double_value(&[]);
+    let mut session = QwenTrainableSession::from_weights(config, weights, input_ids)?;
+    let first_step = session.train_step(learning_rate, 1)?;
+    let initial_loss = first_step.loss_before;
+    let final_loss = first_step.loss_after;
     if final_loss >= initial_loss {
         bail!(
             "Qwen full train smoke failed to reduce loss: initial_loss={initial_loss}, final_loss={final_loss}"
@@ -1060,7 +1065,8 @@ pub fn qwen_full_train_smoke(
         fs::create_dir_all(parent)
             .with_context(|| format!("failed to create {}", parent.display()))?;
     }
-    let delta_refs: Vec<(&str, &Tensor)> = step_artifacts
+    let delta_refs: Vec<(&str, &Tensor)> = first_step
+        .artifacts
         .delta_entries
         .iter()
         .map(|(name, tensor)| (name.as_str(), tensor))
@@ -1068,7 +1074,8 @@ pub fn qwen_full_train_smoke(
     Tensor::write_safetensors(&delta_refs, delta_output)
         .with_context(|| format!("failed to write {}", delta_output.display()))?;
     let optimizer_output = optimizer_state_path(delta_output);
-    let optimizer_refs: Vec<(&str, &Tensor)> = step_artifacts
+    let optimizer_refs: Vec<(&str, &Tensor)> = first_step
+        .artifacts
         .optimizer_entries
         .iter()
         .map(|(name, tensor)| (name.as_str(), tensor))
@@ -1086,15 +1093,17 @@ pub fn qwen_full_train_smoke(
         learning_rate,
         initial_loss,
         final_loss,
-        tensors: step_artifacts.manifest_tensors,
+        tensors: first_step.artifacts.manifest_tensors,
     };
     write_qwen_delta_manifest(&manifest_output, &manifest)?;
 
-    let mut reloaded_weights = read_safetensors_map(&model_path.join("model.safetensors"))?;
-    let mut resumed_registry =
-        QwenTrainableRegistry::load_from_manifest(&mut reloaded_weights, &manifest)?;
-    let reloaded_loss =
-        qwen_causal_lm_loss(&input_ids, &reloaded_weights, &config)?.double_value(&[]);
+    let mut resumed_session = QwenTrainableSession::from_manifest(
+        session.config,
+        read_safetensors_map(&model_path.join("model.safetensors"))?,
+        session.input_ids.shallow_clone(),
+        &manifest,
+    )?;
+    let reloaded_loss = resumed_session.loss_value()?;
     let reload_delta = (final_loss - reloaded_loss).abs();
     if reload_delta > 1e-5 {
         bail!(
@@ -1102,19 +1111,12 @@ pub fn qwen_full_train_smoke(
         );
     }
 
-    let resume_loss = qwen_causal_lm_loss(&input_ids, &reloaded_weights, &config)?;
-    let resume_loss_value = resume_loss.double_value(&[]);
-    resume_loss.backward();
-    resumed_registry.adamw_step(&mut reloaded_weights, learning_rate, 2)?;
-    let resumed_second_loss =
-        qwen_causal_lm_loss(&input_ids, &reloaded_weights, &config)?.double_value(&[]);
+    let resumed_second_step = resumed_session.train_step(learning_rate, 2)?;
+    let resume_loss_value = resumed_second_step.loss_before;
+    let resumed_second_loss = resumed_second_step.loss_after;
 
-    registry.zero_grad();
-    let continuous_loss = qwen_causal_lm_loss(&input_ids, &weights, &config)?;
-    continuous_loss.backward();
-    registry.adamw_step(&mut weights, learning_rate, 2)?;
-    let continuous_second_loss =
-        qwen_causal_lm_loss(&input_ids, &weights, &config)?.double_value(&[]);
+    let continuous_second_step = session.train_step(learning_rate, 2)?;
+    let continuous_second_loss = continuous_second_step.loss_after;
     let second_step_delta = (continuous_second_loss - resumed_second_loss).abs();
     if second_step_delta > 1e-5 {
         bail!(
@@ -1137,7 +1139,7 @@ pub fn qwen_full_train_smoke(
         continuous_second_loss,
         resumed_second_loss,
         second_step_delta,
-        trainable_tensors: step_artifacts.tensor_summaries,
+        trainable_tensors: first_step.artifacts.tensor_summaries,
     };
     println!("{}", serde_json::to_string_pretty(&summary)?);
 
@@ -1330,6 +1332,63 @@ impl QwenTrainableRegistry {
         }
 
         Ok(Self { parameters })
+    }
+}
+
+impl QwenTrainableSession {
+    fn from_weights(
+        config: QwenRuntimeConfig,
+        mut weights: BTreeMap<String, Tensor>,
+        input_ids: Tensor,
+    ) -> Result<Self> {
+        if input_ids.size()[1] < 2 {
+            bail!("training fixture must contain at least two tokens");
+        }
+        let registry = QwenTrainableRegistry::representative(&mut weights)?;
+        Ok(Self {
+            config,
+            weights,
+            input_ids,
+            registry,
+        })
+    }
+
+    fn from_manifest(
+        config: QwenRuntimeConfig,
+        mut weights: BTreeMap<String, Tensor>,
+        input_ids: Tensor,
+        manifest: &QwenDeltaCheckpointManifest,
+    ) -> Result<Self> {
+        if input_ids.size()[1] < 2 {
+            bail!("training fixture must contain at least two tokens");
+        }
+        let registry = QwenTrainableRegistry::load_from_manifest(&mut weights, manifest)?;
+        Ok(Self {
+            config,
+            weights,
+            input_ids,
+            registry,
+        })
+    }
+
+    fn loss_value(&self) -> Result<f64> {
+        Ok(qwen_causal_lm_loss(&self.input_ids, &self.weights, &self.config)?.double_value(&[]))
+    }
+
+    fn train_step(&mut self, learning_rate: f64, step: i32) -> Result<QwenTrainStepResult> {
+        self.registry.zero_grad();
+        let loss = qwen_causal_lm_loss(&self.input_ids, &self.weights, &self.config)?;
+        let loss_before = loss.double_value(&[]);
+        loss.backward();
+        let artifacts = self
+            .registry
+            .adamw_step(&mut self.weights, learning_rate, step)?;
+        let loss_after = self.loss_value()?;
+        Ok(QwenTrainStepResult {
+            loss_before,
+            loss_after,
+            artifacts,
+        })
     }
 }
 
@@ -2917,6 +2976,73 @@ mod tests {
                 diff.max_abs
             );
         }
+    }
+
+    #[test]
+    fn qwen_trainable_session_trains_and_resumes_from_manifest() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let delta_output = temp.path().join("session-delta.safetensors");
+        let optimizer_output = optimizer_state_path(&delta_output);
+        let config = QwenRuntimeConfig {
+            num_hidden_layers: 1,
+            num_attention_heads: 2,
+            num_key_value_heads: 1,
+            rms_norm_eps: 1e-6,
+            rope_theta: 10_000.0,
+        };
+        let input_ids = Tensor::from_slice(&[0_i64, 1, 2, 3]).reshape([1, 4]);
+        let learning_rate = 1e-2;
+
+        let mut continuous_session = QwenTrainableSession::from_weights(
+            config,
+            tiny_qwen_weights(),
+            input_ids.shallow_clone(),
+        )
+        .expect("session should build");
+        let first_step = continuous_session
+            .train_step(learning_rate, 1)
+            .expect("first step should train");
+        assert!(first_step.loss_after < first_step.loss_before);
+
+        let delta_refs: Vec<(&str, &Tensor)> = first_step
+            .artifacts
+            .delta_entries
+            .iter()
+            .map(|(name, tensor)| (name.as_str(), tensor))
+            .collect();
+        Tensor::write_safetensors(&delta_refs, &delta_output).expect("delta should write");
+        let optimizer_refs: Vec<(&str, &Tensor)> = first_step
+            .artifacts
+            .optimizer_entries
+            .iter()
+            .map(|(name, tensor)| (name.as_str(), tensor))
+            .collect();
+        Tensor::write_safetensors(&optimizer_refs, &optimizer_output)
+            .expect("optimizer should write");
+        let manifest = QwenDeltaCheckpointManifest {
+            format: "rustrain.qwen_delta.v1".to_string(),
+            base_model_path: "tiny-qwen".to_string(),
+            reference_fixture: "inline".to_string(),
+            delta_safetensors: delta_output.display().to_string(),
+            optimizer_safetensors: Some(optimizer_output.display().to_string()),
+            train_step: 1,
+            learning_rate,
+            initial_loss: first_step.loss_before,
+            final_loss: first_step.loss_after,
+            tensors: first_step.artifacts.manifest_tensors,
+        };
+        let mut resumed_session =
+            QwenTrainableSession::from_manifest(config, tiny_qwen_weights(), input_ids, &manifest)
+                .expect("session should resume");
+        assert!((first_step.loss_after - resumed_session.loss_value().unwrap()).abs() < 1e-6);
+
+        let continuous_second = continuous_session
+            .train_step(learning_rate, 2)
+            .expect("continuous second step should train");
+        let resumed_second = resumed_session
+            .train_step(learning_rate, 2)
+            .expect("resumed second step should train");
+        assert!((continuous_second.loss_after - resumed_second.loss_after).abs() < 1e-6);
     }
 
     #[test]
