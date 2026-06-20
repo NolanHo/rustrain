@@ -99,6 +99,17 @@ enum Command {
         #[arg(long, default_value_t = 0)]
         seed: u64,
     },
+    QwenKvCacheParity {
+        #[arg(
+            long,
+            default_value = "/vePFS-Mindverse/share/huggingface/Qwen2.5-0.5B-Instruct"
+        )]
+        model_path: PathBuf,
+        #[arg(long, default_value = "runs/parity/qwen2_5_0_5b_generate.safetensors")]
+        reference_fixture: PathBuf,
+        #[arg(long, default_value_t = 4)]
+        max_new_tokens: usize,
+    },
     QwenTiedHeadTrainSmoke {
         #[arg(
             long,
@@ -204,6 +215,11 @@ fn main() -> Result<()> {
             top_p,
             seed,
         ),
+        Command::QwenKvCacheParity {
+            model_path,
+            reference_fixture,
+            max_new_tokens,
+        } => qwen_module::qwen_kv_cache_parity(&model_path, &reference_fixture, max_new_tokens),
         Command::QwenTiedHeadTrainSmoke {
             model_path,
             reference_fixture,

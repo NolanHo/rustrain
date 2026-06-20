@@ -82,6 +82,18 @@ struct QwenSamplingSmokeSummary {
 }
 
 #[derive(Debug, Serialize)]
+struct QwenKvCacheParitySummary {
+    model_path: String,
+    reference_fixture: String,
+    prompt_len: usize,
+    max_new_tokens: usize,
+    full_context_ids: Vec<i64>,
+    cached_ids: Vec<i64>,
+    new_token_ids: Vec<i64>,
+    reference_match: bool,
+}
+
+#[derive(Debug, Serialize)]
 struct QwenTiedHeadTrainSummary {
     model_path: String,
     reference_fixture: String,
@@ -351,6 +363,45 @@ pub fn qwen_sampling_smoke(
         seed,
         generated_ids,
         new_token_ids,
+    };
+    println!("{}", serde_json::to_string_pretty(&summary)?);
+
+    Ok(())
+}
+
+pub fn qwen_kv_cache_parity(
+    model_path: &Path,
+    reference_fixture: &Path,
+    max_new_tokens: usize,
+) -> Result<()> {
+    let config = read_runtime_config(&model_path.join("config.json"))?;
+    let weights = read_safetensors_map(&model_path.join("model.safetensors"))?;
+    let reference = read_safetensors_map(reference_fixture)?;
+    let input_ids = tensor(&reference, "input_ids")?.to_kind(Kind::Int64);
+    let prompt_len = input_ids.size()[1] as usize;
+    let full_context = qwen_greedy_generate(&input_ids, &weights, &config, max_new_tokens)?;
+    let cached = qwen_greedy_generate_with_cache(&input_ids, &weights, &config, max_new_tokens)?;
+    let full_context_ids: Vec<i64> =
+        Vec::<i64>::try_from(full_context.reshape([-1]).to_device(Device::Cpu))?;
+    let cached_ids: Vec<i64> = Vec::<i64>::try_from(cached.reshape([-1]).to_device(Device::Cpu))?;
+    let reference_match = full_context_ids == cached_ids;
+    if !reference_match {
+        bail!(
+            "KV-cache greedy parity failed: full_context={:?}, cached={:?}",
+            full_context_ids,
+            cached_ids
+        );
+    }
+
+    let summary = QwenKvCacheParitySummary {
+        model_path: model_path.display().to_string(),
+        reference_fixture: reference_fixture.display().to_string(),
+        prompt_len,
+        max_new_tokens,
+        new_token_ids: cached_ids[prompt_len..].to_vec(),
+        full_context_ids,
+        cached_ids,
+        reference_match,
     };
     println!("{}", serde_json::to_string_pretty(&summary)?);
 
@@ -691,6 +742,11 @@ pub struct QwenLayerWeights {
     down_proj: Tensor,
 }
 
+struct QwenLayerCache {
+    key: Tensor,
+    value: Tensor,
+}
+
 impl QwenLayerWeights {
     pub fn load(weights: &BTreeMap<String, Tensor>, layer_index: usize) -> Result<Self> {
         let prefix = format!("model.layers.{layer_index}");
@@ -773,6 +829,71 @@ pub fn qwen_forward_from_ids(
     Ok(hidden.linear::<&Tensor>(&embed_tokens, None))
 }
 
+fn qwen_forward_with_cache(
+    input_ids: &Tensor,
+    weights: &BTreeMap<String, Tensor>,
+    config: &QwenRuntimeConfig,
+    past_cache: Option<Vec<QwenLayerCache>>,
+) -> Result<(Tensor, Vec<QwenLayerCache>)> {
+    let embed_tokens = tensor(weights, "model.embed_tokens.weight")?.to_kind(Kind::Float);
+    let final_norm = tensor(weights, "model.norm.weight")?.to_kind(Kind::Float);
+    let position_offset = past_cache
+        .as_ref()
+        .and_then(|cache| cache.first())
+        .map(|layer_cache| layer_cache.key.size()[2])
+        .unwrap_or(0);
+    let mut past_cache = past_cache.map(|cache| cache.into_iter());
+    let mut next_cache = Vec::with_capacity(config.num_hidden_layers);
+    let mut hidden = Tensor::embedding(&embed_tokens, input_ids, -1, false, false);
+
+    for layer_index in 0..config.num_hidden_layers {
+        let layer = QwenLayerWeights::load(weights, layer_index)?;
+        let past_layer_cache = past_cache.as_mut().and_then(|cache| cache.next());
+        let (layer_hidden, layer_cache) =
+            qwen_layer_with_cache(&hidden, &layer, config, past_layer_cache, position_offset);
+        hidden = layer_hidden;
+        next_cache.push(layer_cache);
+    }
+    let hidden = rms_norm(&hidden, &final_norm, config.rms_norm_eps);
+    Ok((hidden.linear::<&Tensor>(&embed_tokens, None), next_cache))
+}
+
+fn qwen_layer_with_cache(
+    input: &Tensor,
+    weights: &QwenLayerWeights,
+    config: &QwenRuntimeConfig,
+    past_cache: Option<QwenLayerCache>,
+    position_offset: i64,
+) -> (Tensor, QwenLayerCache) {
+    let attention_input = rms_norm(input, &weights.input_norm, config.rms_norm_eps);
+    let (attention_output, cache) = qwen_attention_with_cache(
+        &attention_input,
+        &weights.q_proj,
+        &weights.q_bias,
+        &weights.k_proj,
+        &weights.k_bias,
+        &weights.v_proj,
+        &weights.v_bias,
+        &weights.o_proj,
+        config,
+        past_cache,
+        position_offset,
+    );
+    let after_attention = input + attention_output;
+    let mlp_input = rms_norm(
+        &after_attention,
+        &weights.post_attention_norm,
+        config.rms_norm_eps,
+    );
+    let mlp_output = qwen_mlp(
+        &mlp_input,
+        &weights.gate_proj,
+        &weights.up_proj,
+        &weights.down_proj,
+    );
+    (after_attention + mlp_output, cache)
+}
+
 fn qwen_causal_lm_loss(
     input_ids: &Tensor,
     weights: &BTreeMap<String, Tensor>,
@@ -801,6 +922,30 @@ pub fn qwen_greedy_generate(
         let next_token = logits.i((0, -1)).argmax(-1, false).reshape([1, 1]);
         generated = Tensor::cat(&[&generated, &next_token], 1);
     }
+    Ok(generated)
+}
+
+pub fn qwen_greedy_generate_with_cache(
+    input_ids: &Tensor,
+    weights: &BTreeMap<String, Tensor>,
+    config: &QwenRuntimeConfig,
+    max_new_tokens: usize,
+) -> Result<Tensor> {
+    let mut generated = input_ids.shallow_clone();
+    let (logits, mut cache) = qwen_forward_with_cache(input_ids, weights, config, None)?;
+    let mut next_token = logits.i((0, -1)).argmax(-1, false).reshape([1, 1]);
+
+    for step in 0..max_new_tokens {
+        generated = Tensor::cat(&[&generated, &next_token], 1);
+        if step + 1 == max_new_tokens {
+            break;
+        }
+        let (decode_logits, updated_cache) =
+            qwen_forward_with_cache(&next_token, weights, config, Some(cache))?;
+        cache = updated_cache;
+        next_token = decode_logits.i((0, -1)).argmax(-1, false).reshape([1, 1]);
+    }
+
     Ok(generated)
 }
 
@@ -945,11 +1090,97 @@ pub fn qwen_attention(
     context.linear::<&Tensor>(o_proj, None)
 }
 
+#[allow(clippy::too_many_arguments)]
+fn qwen_attention_with_cache(
+    input: &Tensor,
+    q_proj: &Tensor,
+    q_bias: &Tensor,
+    k_proj: &Tensor,
+    k_bias: &Tensor,
+    v_proj: &Tensor,
+    v_bias: &Tensor,
+    o_proj: &Tensor,
+    config: &QwenRuntimeConfig,
+    past_cache: Option<QwenLayerCache>,
+    position_offset: i64,
+) -> (Tensor, QwenLayerCache) {
+    let shape = input.size();
+    let batch_size = shape[0];
+    let seq_len = shape[1];
+    let hidden_size = shape[2];
+    let head_dim = hidden_size / config.num_attention_heads;
+    let kv_repeat = config.num_attention_heads / config.num_key_value_heads;
+
+    let q = input
+        .linear(q_proj, Some(q_bias))
+        .reshape([batch_size, seq_len, config.num_attention_heads, head_dim])
+        .transpose(1, 2);
+    let k = input
+        .linear(k_proj, Some(k_bias))
+        .reshape([batch_size, seq_len, config.num_key_value_heads, head_dim])
+        .transpose(1, 2);
+    let v = input
+        .linear(v_proj, Some(v_bias))
+        .reshape([batch_size, seq_len, config.num_key_value_heads, head_dim])
+        .transpose(1, 2);
+    let (cos, sin) = rope_cos_sin_with_offset(
+        seq_len,
+        head_dim,
+        config.rope_theta,
+        input.device(),
+        position_offset,
+    );
+    let q = apply_rotary(&q, &cos, &sin);
+    let k = apply_rotary(&k, &cos, &sin);
+    let (k, v) = if let Some(cache) = past_cache {
+        (
+            Tensor::cat(&[&cache.key, &k], 2),
+            Tensor::cat(&[&cache.value, &v], 2),
+        )
+    } else {
+        (k, v)
+    };
+    let cache = QwenLayerCache {
+        key: k.shallow_clone(),
+        value: v.shallow_clone(),
+    };
+    let total_seq_len = k.size()[2];
+    let k_for_attention = repeat_kv(&k, kv_repeat);
+    let v_for_attention = repeat_kv(&v, kv_repeat);
+    let scores = q.matmul(&k_for_attention.transpose(-2, -1)) / (head_dim as f64).sqrt();
+    let scores = if position_offset == 0 {
+        let causal_mask =
+            Tensor::ones([seq_len, total_seq_len], (Kind::Bool, input.device())).triu(1);
+        scores.masked_fill(&causal_mask, f64::NEG_INFINITY)
+    } else {
+        scores
+    };
+    let probs = scores.softmax(-1, Kind::Float);
+    let context =
+        probs
+            .matmul(&v_for_attention)
+            .transpose(1, 2)
+            .reshape([batch_size, seq_len, hidden_size]);
+
+    (context.linear::<&Tensor>(o_proj, None), cache)
+}
+
 fn rope_cos_sin(seq_len: i64, head_dim: i64, theta: f64, device: Device) -> (Tensor, Tensor) {
+    rope_cos_sin_with_offset(seq_len, head_dim, theta, device, 0)
+}
+
+fn rope_cos_sin_with_offset(
+    seq_len: i64,
+    head_dim: i64,
+    theta: f64,
+    device: Device,
+    position_offset: i64,
+) -> (Tensor, Tensor) {
     let half = head_dim / 2;
     let inv_freq = Tensor::arange(half, (Kind::Float, device)) * 2.0;
     let inv_freq = (-(&inv_freq / head_dim as f64) * theta.ln()).exp();
-    let positions = Tensor::arange(seq_len, (Kind::Float, device)).unsqueeze(1);
+    let positions =
+        (Tensor::arange(seq_len, (Kind::Float, device)) + position_offset as f64).unsqueeze(1);
     let freqs = positions.matmul(&inv_freq.unsqueeze(0));
     let emb = Tensor::cat(&[&freqs, &freqs], -1).unsqueeze(0).unsqueeze(0);
     (emb.cos(), emb.sin())
@@ -1143,6 +1374,28 @@ mod tests {
             reloaded.tensors[0].delta_name,
             manifest.tensors[0].delta_name
         );
+    }
+
+    #[test]
+    fn cached_greedy_matches_full_context_greedy_for_tiny_weights() {
+        let config = QwenRuntimeConfig {
+            num_hidden_layers: 1,
+            num_attention_heads: 2,
+            num_key_value_heads: 1,
+            rms_norm_eps: 1e-6,
+            rope_theta: 10_000.0,
+        };
+        let weights = tiny_qwen_weights();
+        let input_ids = Tensor::from_slice(&[0_i64, 1, 2]).reshape([1, 3]);
+
+        let full = qwen_greedy_generate(&input_ids, &weights, &config, 3)
+            .expect("full-context generate should run");
+        let cached = qwen_greedy_generate_with_cache(&input_ids, &weights, &config, 3)
+            .expect("cached generate should run");
+        let full_ids: Vec<i64> = Vec::<i64>::try_from(full.reshape([-1])).unwrap();
+        let cached_ids: Vec<i64> = Vec::<i64>::try_from(cached.reshape([-1])).unwrap();
+
+        assert_eq!(cached_ids, full_ids);
     }
 
     fn tiny_qwen_weights() -> BTreeMap<String, Tensor> {
