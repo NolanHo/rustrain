@@ -264,6 +264,7 @@ fn train_text_data(config: &Config, run_paths: &crate::runtime::RunPaths) -> Res
     let total_tokens = config.train.max_steps as usize
         * config.train.gradient_accumulation_steps
         * config.model.seq_len;
+    let total_samples = config.train.max_steps as usize * config.train.gradient_accumulation_steps;
     let started = std::time::Instant::now();
 
     info!(
@@ -307,6 +308,7 @@ fn train_text_data(config: &Config, run_paths: &crate::runtime::RunPaths) -> Res
     let final_eval = eval_loss(&model, &eval_sequences);
     let elapsed = started.elapsed().as_secs_f32().max(1e-6);
     let tokens_per_second = total_tokens as f32 / elapsed;
+    let samples_per_second = total_samples as f32 / elapsed;
     let checkpoint_path = run_paths.checkpoints.join("model-final.toml");
     save_checkpoint(&checkpoint_path, config.train.max_steps, &model, &optimizer)?;
 
@@ -320,7 +322,7 @@ fn train_text_data(config: &Config, run_paths: &crate::runtime::RunPaths) -> Res
 
     info!(
         final_eval,
-        reload_eval, tokens_per_second, "text-data training complete"
+        reload_eval, tokens_per_second, samples_per_second, "text-data training complete"
     );
 
     println!("rustrain M2-lite complete");
@@ -330,6 +332,7 @@ fn train_text_data(config: &Config, run_paths: &crate::runtime::RunPaths) -> Res
     println!("final_eval_loss: {final_eval:.6}");
     println!("reload_eval_loss: {reload_eval:.6}");
     println!("tokens_per_second: {tokens_per_second:.2}");
+    println!("samples_per_second: {samples_per_second:.2}");
     println!("checkpoint: {}", checkpoint_path.display());
     println!(
         "tokenized_cache: {}",
@@ -358,6 +361,8 @@ fn train_sft_data(config: &Config, run_paths: &crate::runtime::RunPaths) -> Resu
     let before_generated = base_model.generate_greedy(&prompt, 4);
     let initial_eval = eval_sft_loss(&base_model, &adapter, &eval_samples);
     let mut last_eval = initial_eval;
+    let total_samples = config.train.max_steps as usize * config.train.gradient_accumulation_steps;
+    let started = std::time::Instant::now();
 
     info!(
         train_samples = train_samples.len(),
@@ -396,6 +401,8 @@ fn train_sft_data(config: &Config, run_paths: &crate::runtime::RunPaths) -> Resu
     }
 
     let final_eval = eval_sft_loss(&base_model, &adapter, &eval_samples);
+    let elapsed = started.elapsed().as_secs_f32().max(1e-6);
+    let samples_per_second = total_samples as f32 / elapsed;
     let adapter_path = run_paths.checkpoints.join("adapter-final.toml");
     adapter.save_adapter(&adapter_path)?;
 
@@ -422,6 +429,7 @@ fn train_sft_data(config: &Config, run_paths: &crate::runtime::RunPaths) -> Resu
         adapter_checkpoint = %adapter_path.display(),
         generate_before = %before_path.display(),
         generate_after = %after_path.display(),
+        samples_per_second,
         "SFT training complete"
     );
 
@@ -431,6 +439,7 @@ fn train_sft_data(config: &Config, run_paths: &crate::runtime::RunPaths) -> Resu
     println!("last_logged_eval_loss: {last_eval:.6}");
     println!("final_eval_loss: {final_eval:.6}");
     println!("reload_eval_loss: {reload_eval:.6}");
+    println!("samples_per_second: {samples_per_second:.2}");
     println!("adapter_checkpoint: {}", adapter_path.display());
     println!("generate_before: {}", before_path.display());
     println!("generate_after: {}", after_path.display());
