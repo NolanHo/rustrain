@@ -10,6 +10,12 @@ pub fn memory_rss_mb() -> Option<f64> {
     Some(kb / 1024.0)
 }
 
+pub fn gpu_memory_allocated_mb() -> Option<f64> {
+    // tch 0.20 exposes CUDA availability but not allocator memory counters.
+    // Keep the metric surface stable so a future NVML or allocator backend can fill it in.
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -19,5 +25,10 @@ mod tests {
         if let Some(memory_rss_mb) = memory_rss_mb() {
             assert!(memory_rss_mb > 0.0);
         }
+    }
+
+    #[test]
+    fn gpu_memory_metric_is_optional() {
+        assert!(gpu_memory_allocated_mb().is_none_or(|value| value >= 0.0));
     }
 }

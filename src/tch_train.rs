@@ -19,6 +19,7 @@ pub struct TchTrainSmokeSummary {
     pub first_step_grad_norm: f64,
     pub final_learning_rate: f64,
     pub memory_rss_mb: Option<f64>,
+    pub gpu_memory_allocated_mb: Option<f64>,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -133,6 +134,7 @@ pub fn train_tch_tiny_lm(config: &Config) -> Result<TchTrainSmokeSummary> {
         first_step_grad_norm,
         final_learning_rate,
         memory_rss_mb: memory_rss_mb(),
+        gpu_memory_allocated_mb: crate::metrics::gpu_memory_allocated_mb(),
     })
 }
 
@@ -215,6 +217,11 @@ mod tests {
         assert!(summary.first_step_grad_norm > 0.0);
         assert!((summary.final_learning_rate - 1e-2).abs() < 1e-8);
         assert!(summary.memory_rss_mb.is_none_or(|value| value > 0.0));
+        assert!(
+            summary
+                .gpu_memory_allocated_mb
+                .is_none_or(|value| value >= 0.0)
+        );
     }
 
     #[test]
