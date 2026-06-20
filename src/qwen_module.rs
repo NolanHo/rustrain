@@ -284,12 +284,23 @@ struct QwenLoraRegistry {
     adapters: BTreeMap<usize, QwenAttentionLoraAdapter>,
 }
 
+#[derive(Clone)]
 struct QwenSftTokenSample {
     prompt_tokens: usize,
     response_tokens: usize,
     masked_positions: usize,
     token_ids: Vec<i64>,
     mask_values: Vec<f32>,
+}
+
+struct QwenSftExample {
+    instruction: String,
+    response: String,
+}
+
+struct QwenSftDataset {
+    samples: Vec<QwenSftTokenSample>,
+    pad_token_id: i64,
 }
 
 struct QwenSftBatch {
@@ -817,11 +828,20 @@ pub fn qwen_lora_sft_smoke(
 
     let tokenizer = Tokenizer::from_file(model_path.join("tokenizer.json"))
         .map_err(|error| anyhow!("failed to load tokenizer: {error}"))?;
-    let samples = vec![
-        qwen_sft_token_sample(&tokenizer, instruction, response)?,
-        qwen_sft_token_sample(&tokenizer, "Name the project.", "rustrain")?,
-    ];
-    let batch = qwen_sft_padded_batch(&samples, qwen_pad_token_id(&tokenizer))?;
+    let dataset = QwenSftDataset::from_instruction_pairs(
+        &tokenizer,
+        &[
+            QwenSftExample {
+                instruction: instruction.to_string(),
+                response: response.to_string(),
+            },
+            QwenSftExample {
+                instruction: "Name the project.".to_string(),
+                response: "rustrain".to_string(),
+            },
+        ],
+    )?;
+    let batch = dataset.padded_batch(0, dataset.len())?;
     let weights = read_safetensors_map(&model_path.join("model.safetensors"))?;
     let config = read_runtime_config(&model_path.join("config.json"))?;
     let layer0 = QwenLayerWeights::load(&weights, 0)?;
@@ -2318,6 +2338,44 @@ fn qwen_attention_lora_mse_loss(
     qwen_attention_with_lora(input, weights, adapter, config).mse_loss(target, Reduction::Mean)
 }
 
+impl QwenSftDataset {
+    fn from_instruction_pairs(tokenizer: &Tokenizer, examples: &[QwenSftExample]) -> Result<Self> {
+        if examples.is_empty() {
+            bail!("SFT dataset must contain at least one example");
+        }
+        let samples = examples
+            .iter()
+            .map(|example| {
+                qwen_sft_token_sample(tokenizer, &example.instruction, &example.response)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Self {
+            samples,
+            pad_token_id: qwen_pad_token_id(tokenizer),
+        })
+    }
+
+    fn padded_batch(&self, start: usize, batch_size: usize) -> Result<QwenSftBatch> {
+        if batch_size == 0 {
+            bail!("SFT batch size must be positive");
+        }
+        if self.samples.is_empty() {
+            bail!("SFT dataset must contain at least one sample");
+        }
+        let samples = (0..batch_size)
+            .map(|offset| {
+                let index = (start + offset) % self.samples.len();
+                self.samples[index].clone()
+            })
+            .collect::<Vec<_>>();
+        qwen_sft_padded_batch(&samples, self.pad_token_id)
+    }
+
+    fn len(&self) -> usize {
+        self.samples.len()
+    }
+}
+
 fn qwen_sft_token_sample(
     tokenizer: &Tokenizer,
     instruction: &str,
@@ -3220,6 +3278,42 @@ mod tests {
         assert_eq!(mask_values, vec![0.0, 1.0, 1.0, 1.0, 0.0, 0.0]);
         assert_eq!(batch.masked_positions, 3);
         assert_eq!(batch.padding_tokens, 2);
+    }
+
+    #[test]
+    fn qwen_sft_dataset_builds_wrapping_padded_batches() {
+        let dataset = QwenSftDataset {
+            samples: vec![
+                QwenSftTokenSample {
+                    prompt_tokens: 2,
+                    response_tokens: 1,
+                    masked_positions: 1,
+                    token_ids: vec![1, 2, 3],
+                    mask_values: vec![0.0, 1.0],
+                },
+                QwenSftTokenSample {
+                    prompt_tokens: 1,
+                    response_tokens: 2,
+                    masked_positions: 2,
+                    token_ids: vec![4, 5, 6],
+                    mask_values: vec![1.0, 1.0],
+                },
+            ],
+            pad_token_id: 0,
+        };
+
+        let batch = dataset
+            .padded_batch(1, 3)
+            .expect("wrapping batch should build");
+        let input_values: Vec<i64> = Vec::<i64>::try_from(batch.input_ids.reshape([-1])).unwrap();
+        let mask_values: Vec<f32> = Vec::<f32>::try_from(batch.target_mask.reshape([-1])).unwrap();
+
+        assert_eq!(dataset.len(), 2);
+        assert_eq!(batch.input_ids.size(), vec![3, 3]);
+        assert_eq!(input_values, vec![4, 5, 6, 1, 2, 3, 4, 5, 6]);
+        assert_eq!(mask_values, vec![1.0, 1.0, 0.0, 1.0, 1.0, 1.0]);
+        assert_eq!(batch.masked_positions, 5);
+        assert_eq!(batch.padding_tokens, 0);
     }
 
     #[test]
