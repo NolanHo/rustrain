@@ -73,6 +73,7 @@ pub fn launch(
             .env("LOCAL_WORLD_SIZE", nproc_per_node.to_string())
             .env("MASTER_ADDR", master_addr)
             .env("MASTER_PORT", master_port.to_string())
+            .env("RUSTRAIN_LAUNCH_OUTPUT_DIR", output_dir)
             .stdout(Stdio::from(log_file))
             .stderr(Stdio::from(err_file));
         children.push((
@@ -115,7 +116,14 @@ pub fn launch(
     println!("{summary_json}");
 
     if !failed.is_empty() {
-        bail!("launch ranks failed: {failed:?}");
+        let mut details = Vec::new();
+        for rank in &failed {
+            let log_path = output_dir.join(format!("rank-{rank}.log"));
+            let log = fs::read_to_string(&log_path)
+                .unwrap_or_else(|error| format!("failed to read {}: {error}", log_path.display()));
+            details.push(format!("rank {rank} log {}:\n{log}", log_path.display()));
+        }
+        bail!("launch ranks failed: {failed:?}\n{}", details.join("\n"));
     }
 
     Ok(())

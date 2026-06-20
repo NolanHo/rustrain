@@ -47,6 +47,63 @@ pub fn train(config_path: &Path, resume_from: Option<PathBuf>) -> Result<()> {
     info!(checkpoints_dir = %run_paths.checkpoints.display(), "created checkpoint directory");
     info!(seed = config.run.seed, "seed configured");
     info!(device = ?config.train.device, dtype = ?config.train.dtype, "training policy configured");
+
+    if matches!(config.train.backend, BackendKind::Tch)
+        && config.model.architecture == "tch_tiny_lm"
+    {
+        let backend = RuntimeBackend::from_kind(config.train.backend);
+        info!(
+            backend = ?backend.kind(),
+            supports_autograd = backend.supports_autograd(),
+            supports_cuda = backend.supports_cuda(),
+            "backend configured"
+        );
+        info!(model = ?config.model, "model config");
+        info!(train = ?config.train, "train config");
+        info!(parallel = ?config.parallel, "parallel config");
+
+        let summary = train_tch_tiny_lm(&config)?;
+        info!(
+            initial_loss = summary.initial_loss,
+            final_loss = summary.final_loss,
+            embedding_grad_defined = summary.embedding_grad_defined,
+            lm_head_grad_defined = summary.lm_head_grad_defined,
+            first_step_grad_norm = summary.first_step_grad_norm,
+            final_lr = summary.final_learning_rate,
+            compute_kind = summary.compute_kind,
+            data_parallel_size = summary.data_parallel_size,
+            dp_grad_max_delta = summary.dp_grad_max_delta,
+            dp_loss_delta = summary.dp_loss_delta,
+            memory_rss_mb = summary.memory_rss_mb,
+            gpu_memory_allocated_mb = summary.gpu_memory_allocated_mb,
+            "tch tiny lm smoke complete"
+        );
+        println!("rustrain tch tiny lm smoke complete");
+        println!("run_dir: {}", run_paths.root.display());
+        println!("initial_loss: {:.6}", summary.initial_loss);
+        println!("final_loss: {:.6}", summary.final_loss);
+        println!("embedding_grad_defined: {}", summary.embedding_grad_defined);
+        println!("lm_head_grad_defined: {}", summary.lm_head_grad_defined);
+        println!("first_step_grad_norm: {:.6}", summary.first_step_grad_norm);
+        println!("final_learning_rate: {:.8}", summary.final_learning_rate);
+        println!("compute_kind: {}", summary.compute_kind);
+        println!("data_parallel_size: {}", summary.data_parallel_size);
+        if let Some(dp_grad_max_delta) = summary.dp_grad_max_delta {
+            println!("dp_grad_max_delta: {dp_grad_max_delta:.8}");
+        }
+        if let Some(dp_loss_delta) = summary.dp_loss_delta {
+            println!("dp_loss_delta: {dp_loss_delta:.8}");
+        }
+        if let Some(memory_rss_mb) = summary.memory_rss_mb {
+            println!("memory_rss_mb: {memory_rss_mb:.2}");
+        }
+        if let Some(gpu_memory_allocated_mb) = summary.gpu_memory_allocated_mb {
+            println!("gpu_memory_allocated_mb: {gpu_memory_allocated_mb:.2}");
+        }
+
+        return Ok(());
+    }
+
     let backend = RuntimeBackend::from_kind(config.train.backend);
     let process_group = SingleRankProcessGroup::new(&config.parallel);
     let mut collective_smoke = array![[1.0_f32]];
@@ -94,41 +151,6 @@ pub fn train(config_path: &Path, resume_from: Option<PathBuf>) -> Result<()> {
         println!("run_dir: {}", run_paths.root.display());
         println!("resolved_config: {}", run_paths.resolved_config.display());
         println!("log_file: {}", run_paths.logs.join("train.log").display());
-
-        return Ok(());
-    }
-
-    if matches!(config.train.backend, BackendKind::Tch)
-        && config.model.architecture == "tch_tiny_lm"
-    {
-        let summary = train_tch_tiny_lm(&config)?;
-        info!(
-            initial_loss = summary.initial_loss,
-            final_loss = summary.final_loss,
-            embedding_grad_defined = summary.embedding_grad_defined,
-            lm_head_grad_defined = summary.lm_head_grad_defined,
-            first_step_grad_norm = summary.first_step_grad_norm,
-            final_lr = summary.final_learning_rate,
-            compute_kind = summary.compute_kind,
-            memory_rss_mb = summary.memory_rss_mb,
-            gpu_memory_allocated_mb = summary.gpu_memory_allocated_mb,
-            "tch tiny lm smoke complete"
-        );
-        println!("rustrain tch tiny lm smoke complete");
-        println!("run_dir: {}", run_paths.root.display());
-        println!("initial_loss: {:.6}", summary.initial_loss);
-        println!("final_loss: {:.6}", summary.final_loss);
-        println!("embedding_grad_defined: {}", summary.embedding_grad_defined);
-        println!("lm_head_grad_defined: {}", summary.lm_head_grad_defined);
-        println!("first_step_grad_norm: {:.6}", summary.first_step_grad_norm);
-        println!("final_learning_rate: {:.8}", summary.final_learning_rate);
-        println!("compute_kind: {}", summary.compute_kind);
-        if let Some(memory_rss_mb) = summary.memory_rss_mb {
-            println!("memory_rss_mb: {memory_rss_mb:.2}");
-        }
-        if let Some(gpu_memory_allocated_mb) = summary.gpu_memory_allocated_mb {
-            println!("gpu_memory_allocated_mb: {gpu_memory_allocated_mb:.2}");
-        }
 
         return Ok(());
     }

@@ -200,11 +200,13 @@ pub fn validate_config(config: &Config) -> Result<()> {
         ("context_parallel_size", parallel.context_parallel_size),
     ];
 
+    let is_tch_tiny_lm = matches!(config.train.backend, BackendKind::Tch)
+        && config.model.architecture == "tch_tiny_lm";
     for (name, value) in parallel_sizes {
         if value == 0 {
             return Err(anyhow!("{name} must be greater than zero"));
         }
-        if value != 1 {
+        if value != 1 && !(is_tch_tiny_lm && name == "data_parallel_size" && value == 2) {
             return Err(anyhow!("M1 toy backend requires {name} = 1"));
         }
     }

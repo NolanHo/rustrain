@@ -25,6 +25,9 @@ pub struct TchTrainSmokeSummary {
     pub compute_kind: String,
     pub memory_rss_mb: Option<f64>,
     pub gpu_memory_allocated_mb: Option<f64>,
+    pub data_parallel_size: usize,
+    pub dp_grad_max_delta: Option<f32>,
+    pub dp_loss_delta: Option<f64>,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -66,6 +69,9 @@ pub fn probe_tch_cuda() -> Result<()> {
 pub fn train_tch_tiny_lm(config: &Config) -> Result<TchTrainSmokeSummary> {
     if config.train.max_steps == 0 {
         return Err(anyhow!("tch_tiny_lm requires train.max_steps > 0"));
+    }
+    if config.parallel.data_parallel_size > 1 {
+        return train_tch_tiny_lm_data_parallel(config);
     }
 
     let device = tch_device(config)?;
@@ -158,6 +164,84 @@ pub fn train_tch_tiny_lm(config: &Config) -> Result<TchTrainSmokeSummary> {
         compute_kind: format!("{compute_kind:?}"),
         memory_rss_mb: memory_rss_mb(),
         gpu_memory_allocated_mb: crate::metrics::gpu_memory_allocated_mb(),
+        data_parallel_size: config.parallel.data_parallel_size,
+        dp_grad_max_delta: None,
+        dp_loss_delta: None,
+    })
+}
+
+fn train_tch_tiny_lm_data_parallel(config: &Config) -> Result<TchTrainSmokeSummary> {
+    if config.parallel.data_parallel_size != 2 {
+        bail!("tch_tiny_lm data-parallel smoke currently expects data_parallel_size=2");
+    }
+    let rank = parse_env_usize("RANK")?;
+    let local_rank = parse_env_usize("LOCAL_RANK")?;
+    let world_size = parse_env_usize("WORLD_SIZE")?;
+    if world_size != config.parallel.data_parallel_size {
+        bail!(
+            "WORLD_SIZE={world_size} does not match data_parallel_size={}",
+            config.parallel.data_parallel_size
+        );
+    }
+    if rank >= world_size {
+        bail!("rank {rank} must be smaller than world_size {world_size}");
+    }
+
+    let device = match config.train.device {
+        RuntimeDevice::Cuda => Device::Cuda(local_rank),
+        RuntimeDevice::Cpu => bail!("tch_tiny_lm data-parallel smoke requires device=cuda"),
+    };
+    let local = tch_dp_gradient_for_rank(rank, world_size, device)?;
+    let reduce_dir = std::env::var("RUSTRAIN_LAUNCH_OUTPUT_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| {
+            config
+                .run
+                .base_dir
+                .join("tch-trainer-dp-gradient")
+                .join(&config.run.name)
+        })
+        .join("trainer-dp-reduce");
+    let reduced = nccl_smoke::all_reduce_f32_for_launch(&reduce_dir.join("grad"), &local.grad)?;
+    let averaged_grad = reduced
+        .iter()
+        .map(|value| *value / world_size as f32)
+        .collect::<Vec<_>>();
+    let reduced_loss =
+        nccl_smoke::all_reduce_f32_for_launch(&reduce_dir.join("loss"), &[local.loss as f32])?[0];
+    let global_loss = reduced_loss as f64 / world_size as f64;
+
+    let expected = tch_dp_gradient_for_rank(0, 1, device)?;
+    let grad_max_delta = averaged_grad
+        .iter()
+        .copied()
+        .zip(expected.grad.iter().copied())
+        .map(|(actual, expected)| (actual - expected).abs())
+        .fold(0.0_f32, f32::max);
+    let loss_delta = (global_loss - expected.loss).abs();
+    if grad_max_delta > 1e-5 || loss_delta > 1e-5 {
+        bail!(
+            "trainer tch DP gradient mismatch: rank={rank}, grad_max_delta={grad_max_delta}, loss_delta={loss_delta}"
+        );
+    }
+
+    Ok(TchTrainSmokeSummary {
+        initial_loss: expected.loss,
+        final_loss: global_loss,
+        embedding_grad_defined: true,
+        lm_head_grad_defined: true,
+        first_step_grad_norm: averaged_grad
+            .iter()
+            .map(|value| (*value as f64).powi(2))
+            .sum::<f64>()
+            .sqrt(),
+        final_learning_rate: learning_rate_for_step(config, 1),
+        compute_kind: format!("{:?}", tch_compute_kind(config)),
+        memory_rss_mb: memory_rss_mb(),
+        gpu_memory_allocated_mb: crate::metrics::gpu_memory_allocated_mb(),
+        data_parallel_size: world_size,
+        dp_grad_max_delta: Some(grad_max_delta),
+        dp_loss_delta: Some(loss_delta),
     })
 }
 

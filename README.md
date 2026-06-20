@@ -79,6 +79,7 @@ scripts/gpu_run.sh cargo run -- launch --nproc-per-node 2 parallel-dp-rank-smoke
 RUSTRAIN_RAY_NUM_GPUS=2 scripts/gpu_run.sh cargo run -- launch --nproc-per-node 2 --output-dir /tmp/rustrain-runs/nccl-all-reduce-smoke nccl-all-reduce-rank-smoke --output-dir /tmp/rustrain-runs/nccl-all-reduce-smoke/ranks
 RUSTRAIN_RAY_NUM_GPUS=2 scripts/gpu_run.sh cargo run -- launch --nproc-per-node 2 --output-dir /tmp/rustrain-runs/nccl-dp-gradient-smoke nccl-dp-gradient-rank-smoke --output-dir /tmp/rustrain-runs/nccl-dp-gradient-smoke/ranks
 RUSTRAIN_RAY_NUM_GPUS=2 scripts/gpu_run.sh cargo run -- launch --nproc-per-node 2 --output-dir /tmp/rustrain-runs/tch-dp-gradient-smoke tch-dp-gradient-rank-smoke --output-dir /tmp/rustrain-runs/tch-dp-gradient-smoke/ranks
+RUSTRAIN_RAY_NUM_GPUS=2 scripts/gpu_run.sh cargo run -- launch --nproc-per-node 2 --output-dir /tmp/rustrain-runs/tch-trainer-dp2-launch train --config configs/tch_smoke_cuda_dp2.toml
 ```
 
 The launcher sets `RANK`, `LOCAL_RANK`, `WORLD_SIZE`, `LOCAL_WORLD_SIZE`,
@@ -86,8 +87,8 @@ The launcher sets `RANK`, `LOCAL_RANK`, `WORLD_SIZE`, `LOCAL_WORLD_SIZE`,
 `launch-summary.json`. `scripts/gpu_run.sh` defaults to one Ray GPU; set
 `RUSTRAIN_RAY_NUM_GPUS=2` for two-rank GPU collective smokes. Minimal NCCL f32
 all-reduce, toy DP gradient all-reduce, and `tch` autograd DP gradient smokes
-exist, but `trainer::train` integration and real multi-GPU Qwen training are
-not implemented yet.
+exist, including a `trainer::train` config path for tiny `tch` DP=2. Real
+multi-GPU Qwen training is not implemented yet.
 
 ## Current Major Gaps
 
@@ -109,8 +110,8 @@ not implemented yet.
 - KV-cache greedy parity and cached sampling parity are implemented; Python
   cached-generation parity is future work.
 - G4 launcher process management plus NCCL scalar, toy DP gradient, and `tch`
-  autograd DP gradient smokes exist, but real distributed training is still
-  missing: DP/TP/EP trainer/model paths are not NCCL-backed rank-local Qwen
+  autograd DP=2 trainer smokes exist, but real distributed training is still
+  missing: Qwen DP/TP/EP trainer/model paths are not NCCL-backed rank-local
   training yet.
 - Distributed checkpoint layout is not defined.
 - Trainer production basics such as scheduler, grad clipping, RSS memory
