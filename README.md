@@ -89,6 +89,7 @@ RUSTRAIN_RAY_NUM_GPUS=2 scripts/gpu_run.sh cargo run -- launch --nproc-per-node 
 RUSTRAIN_RAY_NUM_GPUS=2 scripts/gpu_run.sh cargo run -- launch --nproc-per-node 2 --output-dir /tmp/rustrain-runs/tch-dp-gradient-smoke tch-dp-gradient-rank-smoke --output-dir /tmp/rustrain-runs/tch-dp-gradient-smoke/ranks
 RUSTRAIN_RAY_NUM_GPUS=2 scripts/gpu_run.sh cargo run -- launch --nproc-per-node 2 --output-dir /tmp/rustrain-runs/tch-trainer-dp2-launch train --config configs/tch_smoke_cuda_dp2.toml
 RUSTRAIN_RAY_NUM_GPUS=2 scripts/gpu_run.sh env RUSTRAIN_LAUNCH_TIMEOUT_SECS=300 cargo run -- launch --nproc-per-node 2 --output-dir /tmp/rustrain-runs/qwen-dp-gradient-smoke-fp32 qwen-dp-gradient-rank-smoke --dtype fp32 --output-dir /tmp/rustrain-runs/qwen-dp-gradient-smoke-fp32/ranks
+RUSTRAIN_RAY_NUM_GPUS=2 scripts/gpu_run.sh env RUSTRAIN_LAUNCH_TIMEOUT_SECS=300 cargo run -- launch --nproc-per-node 2 --output-dir /tmp/rustrain-runs/qwen-dp-gradient-smoke-steps3 qwen-dp-gradient-rank-smoke --dtype fp32 --steps 3 --learning-rate 1.0 --output-dir /tmp/rustrain-runs/qwen-dp-gradient-smoke-steps3/ranks
 ```
 
 The launcher sets `RANK`, `LOCAL_RANK`, `WORLD_SIZE`, `LOCAL_WORLD_SIZE`,
@@ -103,8 +104,9 @@ The Qwen DP smoke writes a rank0-only JSON checkpoint manifest after gradient
 sync succeeds; non-rank0 summaries record the same checkpoint path but do not
 write it.
 It also all-reduces full CUDA gradient tensors for the focused layer0 attention
-parameter set, applies one averaged SGD step on each rank, and checks that the
-global post-update loss is lower.
+parameter set, applies configurable multi-step averaged SGD on each rank, and
+checks that the global post-update loss is lower. This is still a focused
+layer0 attention DP smoke, not trainer-owned full-Qwen distributed training.
 
 ## Current Major Gaps
 
@@ -125,10 +127,10 @@ global post-update loss is lower.
   is not done yet.
 - KV-cache greedy parity and cached sampling parity are implemented; Python
   cached-generation parity is future work.
-- G4 launcher process management plus NCCL scalar, toy DP gradient, and `tch`
-  autograd DP=2 trainer smokes exist, but real distributed training is still
-  missing: Qwen DP/TP/EP trainer/model paths are not NCCL-backed rank-local
-  training yet.
+- G4 launcher process management plus NCCL scalar, toy DP gradient, `tch`
+  autograd DP=2 trainer smokes, and a focused multi-step Qwen layer0 attention
+  DP smoke exist, but real distributed training is still missing: Qwen DP/TP/EP
+  trainer/model paths are not NCCL-backed rank-local training yet.
 - Distributed checkpoint layout is not defined.
 - Trainer production basics such as scheduler, grad clipping, RSS memory
   metrics, and Ray-worker GPU memory reporting are implemented for toy/tch

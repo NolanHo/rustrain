@@ -208,6 +208,8 @@ struct QwenDpGradientRankSummary {
     world_size: usize,
     local_sequence_count: usize,
     tensor_count: usize,
+    steps: usize,
+    learning_rate: f64,
     max_grad_delta: f32,
     loss_delta: f64,
     local_loss: f64,
@@ -215,6 +217,7 @@ struct QwenDpGradientRankSummary {
     global_loss: f64,
     global_post_update_loss: f64,
     global_loss_improved: bool,
+    global_step_losses: Vec<f64>,
     expected_loss: f64,
     checkpoint_written: bool,
     checkpoint_path: String,
@@ -236,9 +239,11 @@ struct QwenDpCheckpointManifest {
     max_grad_delta: f32,
     expected_loss: f64,
     dtype: String,
+    steps: usize,
     learning_rate: f64,
     post_update_loss: f64,
     global_post_update_loss: f64,
+    global_step_losses: Vec<f64>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -1286,10 +1291,18 @@ pub fn qwen_dp_gradient_smoke(
     reference_fixture: &Path,
     output_dir: PathBuf,
     dtype: QwenComputeDType,
+    steps: usize,
+    learning_rate: f64,
 ) -> Result<()> {
     let rank = parse_env_usize("RANK")?;
     let local_rank = parse_env_usize("LOCAL_RANK")?;
     let world_size = parse_env_usize("WORLD_SIZE")?;
+    if steps == 0 {
+        bail!("Qwen DP gradient smoke requires at least one step");
+    }
+    if !learning_rate.is_finite() || learning_rate <= 0.0 {
+        bail!("Qwen DP gradient smoke requires a positive finite learning rate");
+    }
     if world_size != 2 {
         bail!("Qwen DP gradient smoke expects WORLD_SIZE=2");
     }
@@ -1388,23 +1401,35 @@ pub fn qwen_dp_gradient_smoke(
         );
     }
 
-    println!("qwen attention DP rank {rank}: reducing full gradients");
-    let averaged_grads = local_session
-        .all_reduce_average_grads(&output_dir.join("qwen-dp-full-gradient"), world_size)?;
-    let learning_rate = 1.0;
-    local_session.apply_sgd_step(&averaged_grads, learning_rate)?;
-    let post_update_loss = local_session.loss_value();
-    wait_for_rank_barrier(
-        &output_dir.join("qwen-dp-post-update-loss-ready"),
-        rank,
-        world_size,
-        Duration::from_secs(300),
-    )?;
-    let reduced_post_update_loss = nccl_smoke::all_reduce_f32_for_launch(
-        &output_dir.join("qwen-dp-post-update-loss"),
-        &[post_update_loss as f32],
-    )?[0];
-    let global_post_update_loss = reduced_post_update_loss as f64 / world_size as f64;
+    let mut global_step_losses = vec![global_loss];
+    let mut post_update_loss = local_loss;
+    for step in 0..steps {
+        if step > 0 {
+            println!("qwen attention DP rank {rank}: running backward for step {step}");
+            local_session.loss_and_backward()?;
+        }
+        println!("qwen attention DP rank {rank}: reducing full gradients for step {step}");
+        let averaged_grads = local_session.all_reduce_average_grads(
+            &output_dir.join(format!("qwen-dp-full-gradient-step-{step}")),
+            world_size,
+        )?;
+        local_session.apply_sgd_step(&averaged_grads, learning_rate)?;
+        post_update_loss = local_session.loss_value();
+        wait_for_rank_barrier(
+            &output_dir.join(format!("qwen-dp-post-update-loss-ready-step-{step}")),
+            rank,
+            world_size,
+            Duration::from_secs(300),
+        )?;
+        let reduced_post_update_loss = nccl_smoke::all_reduce_f32_for_launch(
+            &output_dir.join(format!("qwen-dp-post-update-loss-step-{step}")),
+            &[post_update_loss as f32],
+        )?[0];
+        global_step_losses.push(reduced_post_update_loss as f64 / world_size as f64);
+    }
+    let global_post_update_loss = *global_step_losses
+        .last()
+        .ok_or_else(|| anyhow!("missing Qwen DP post-update loss"))?;
     let global_loss_improved = global_post_update_loss < global_loss;
     if !global_loss_improved {
         bail!(
@@ -1422,9 +1447,11 @@ pub fn qwen_dp_gradient_smoke(
             max_grad_delta,
             expected_loss,
             dtype: dtype.label().to_string(),
+            steps,
             learning_rate,
             post_update_loss,
             global_post_update_loss,
+            global_step_losses: global_step_losses.clone(),
         };
         fs::write(
             &checkpoint_path,
@@ -1441,6 +1468,8 @@ pub fn qwen_dp_gradient_smoke(
         world_size,
         local_sequence_count: local_session.input.size()[0] as usize,
         tensor_count: local_grads.len(),
+        steps,
+        learning_rate,
         max_grad_delta,
         loss_delta,
         local_loss,
@@ -1448,6 +1477,7 @@ pub fn qwen_dp_gradient_smoke(
         global_loss,
         global_post_update_loss,
         global_loss_improved,
+        global_step_losses,
         expected_loss,
         checkpoint_written,
         checkpoint_path: checkpoint_path.display().to_string(),

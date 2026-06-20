@@ -221,6 +221,10 @@ enum Command {
         output_dir: PathBuf,
         #[arg(long, default_value = "fp32")]
         dtype: String,
+        #[arg(long, default_value_t = 1)]
+        steps: usize,
+        #[arg(long, default_value_t = 1.0)]
+        learning_rate: f64,
     },
     Launch {
         #[arg(long)]
@@ -401,11 +405,15 @@ fn main() -> Result<()> {
             reference_fixture,
             output_dir,
             dtype,
+            steps,
+            learning_rate,
         } => qwen_module::qwen_dp_gradient_smoke(
             &model_path,
             &reference_fixture,
             output_dir,
             qwen_module::QwenComputeDType::parse(&dtype)?,
+            steps,
+            learning_rate,
         ),
         Command::Launch {
             nproc_per_node,
