@@ -221,6 +221,24 @@ struct AdamState {
     v: Tensor,
 }
 
+struct QwenTrainableParameter {
+    name: String,
+    tensor: Tensor,
+    base: Tensor,
+    adam: Option<AdamState>,
+}
+
+struct QwenTrainStepArtifacts {
+    tensor_summaries: Vec<TrainableTensorSummary>,
+    manifest_tensors: Vec<QwenDeltaTensorManifestEntry>,
+    delta_entries: Vec<(String, Tensor)>,
+    optimizer_entries: Vec<(String, Tensor)>,
+}
+
+struct QwenTrainableRegistry {
+    parameters: Vec<QwenTrainableParameter>,
+}
+
 struct QwenSftTokenSample {
     input_ids: Tensor,
     target_mask: Tensor,
@@ -961,67 +979,13 @@ pub fn qwen_full_train_smoke(
         bail!("training fixture must contain at least two tokens");
     }
 
-    let trainable_names = representative_trainable_qwen_tensors();
-    let mut trainable_tensors = Vec::with_capacity(trainable_names.len());
-    for name in &trainable_names {
-        let trainable = tensor(&weights, name)?
-            .to_kind(Kind::Float)
-            .set_requires_grad(true);
-        weights.insert((*name).to_string(), trainable.shallow_clone());
-        trainable_tensors.push(((*name).to_string(), trainable));
-    }
+    let mut registry = QwenTrainableRegistry::representative(&mut weights)?;
 
     let initial_loss = qwen_causal_lm_loss(&input_ids, &weights, &config)?.double_value(&[]);
     let loss = qwen_causal_lm_loss(&input_ids, &weights, &config)?;
     loss.backward();
 
-    let base_weights = read_safetensors_map(&model_path.join("model.safetensors"))?;
-    let mut delta_entries: Vec<(String, Tensor)> = Vec::with_capacity(trainable_tensors.len());
-    let mut optimizer_entries: Vec<(String, Tensor)> =
-        Vec::with_capacity(trainable_tensors.len() * 2);
-    let mut tensor_summaries = Vec::with_capacity(trainable_tensors.len());
-    let mut manifest_tensors = Vec::with_capacity(trainable_tensors.len());
-    for (name, mut trainable) in trainable_tensors {
-        let grad = trainable.grad();
-        let grad_defined = grad.defined();
-        let grad_norm = if grad_defined {
-            grad.norm().double_value(&[])
-        } else {
-            0.0
-        };
-        if !grad_defined || grad_norm <= 0.0 {
-            bail!("trainable tensor {name} did not receive a gradient");
-        }
-
-        let adam_state = adamw_next_state(None, &grad, 0.9, 0.999);
-        let update = adamw_update(&adam_state, learning_rate, 0.9, 0.999, 1, 1e-8);
-        let _ = no_grad(|| trainable.f_sub_(&update))?;
-        weights.insert(name.clone(), trainable.shallow_clone());
-        let base = tensor(&base_weights, &name)?.to_kind(Kind::Float);
-        let delta = &trainable - &base;
-        let delta_norm = delta.norm().double_value(&[]);
-        let delta_name = format!("{name}.delta");
-        let adam_names = adam_slot_names(&name);
-        manifest_tensors.push(QwenDeltaTensorManifestEntry {
-            name: name.clone(),
-            delta_name: delta_name.clone(),
-            adam_m_name: Some(adam_names.m.clone()),
-            adam_v_name: Some(adam_names.v.clone()),
-            shape: trainable.size(),
-            dtype: "float32".to_string(),
-            grad_norm,
-            delta_norm,
-        });
-        delta_entries.push((delta_name, delta));
-        optimizer_entries.push((adam_names.m, adam_state.m));
-        optimizer_entries.push((adam_names.v, adam_state.v));
-        tensor_summaries.push(TrainableTensorSummary {
-            name,
-            grad_defined,
-            grad_norm,
-            delta_norm,
-        });
-    }
+    let step_artifacts = registry.adamw_step(&mut weights, learning_rate, 1)?;
 
     let final_loss = qwen_causal_lm_loss(&input_ids, &weights, &config)?.double_value(&[]);
     if final_loss >= initial_loss {
@@ -1034,14 +998,16 @@ pub fn qwen_full_train_smoke(
         fs::create_dir_all(parent)
             .with_context(|| format!("failed to create {}", parent.display()))?;
     }
-    let delta_refs: Vec<(&str, &Tensor)> = delta_entries
+    let delta_refs: Vec<(&str, &Tensor)> = step_artifacts
+        .delta_entries
         .iter()
         .map(|(name, tensor)| (name.as_str(), tensor))
         .collect();
     Tensor::write_safetensors(&delta_refs, delta_output)
         .with_context(|| format!("failed to write {}", delta_output.display()))?;
     let optimizer_output = optimizer_state_path(delta_output);
-    let optimizer_refs: Vec<(&str, &Tensor)> = optimizer_entries
+    let optimizer_refs: Vec<(&str, &Tensor)> = step_artifacts
+        .optimizer_entries
         .iter()
         .map(|(name, tensor)| (name.as_str(), tensor))
         .collect();
@@ -1058,18 +1024,17 @@ pub fn qwen_full_train_smoke(
         learning_rate,
         initial_loss,
         final_loss,
-        tensors: manifest_tensors,
+        tensors: step_artifacts.manifest_tensors,
     };
     write_qwen_delta_manifest(&manifest_output, &manifest)?;
 
     let mut reloaded_weights = read_safetensors_map(&model_path.join("model.safetensors"))?;
     let delta_tensors = read_safetensors_map(delta_output)?;
-    for name in &trainable_names {
-        let delta_name = format!("{name}.delta");
-        let reloaded = tensor(&reloaded_weights, name)?.to_kind(Kind::Float)
-            + tensor(&delta_tensors, &delta_name)?.to_kind(Kind::Float);
-        reloaded_weights.insert((*name).to_string(), reloaded);
-    }
+    QwenTrainableRegistry::apply_delta_checkpoint(
+        &mut reloaded_weights,
+        &delta_tensors,
+        &manifest.tensors,
+    )?;
     let reloaded_loss =
         qwen_causal_lm_loss(&input_ids, &reloaded_weights, &config)?.double_value(&[]);
     let reload_delta = (final_loss - reloaded_loss).abs();
@@ -1090,7 +1055,7 @@ pub fn qwen_full_train_smoke(
         final_loss,
         reloaded_loss,
         reload_delta,
-        trainable_tensors: tensor_summaries,
+        trainable_tensors: step_artifacts.tensor_summaries,
     };
     println!("{}", serde_json::to_string_pretty(&summary)?);
 
@@ -1113,6 +1078,117 @@ fn adam_slot_names(name: &str) -> AdamSlotNames {
     AdamSlotNames {
         m: format!("{name}.adam_m"),
         v: format!("{name}.adam_v"),
+    }
+}
+
+impl QwenTrainableRegistry {
+    fn representative(weights: &mut BTreeMap<String, Tensor>) -> Result<Self> {
+        Self::from_names(weights, representative_trainable_qwen_tensors())
+    }
+
+    fn from_names(
+        weights: &mut BTreeMap<String, Tensor>,
+        names: Vec<&'static str>,
+    ) -> Result<Self> {
+        let mut parameters = Vec::with_capacity(names.len());
+        for name in names {
+            let base = tensor(weights, name)?.to_kind(Kind::Float);
+            let trainable = base.shallow_clone().set_requires_grad(true);
+            weights.insert(name.to_string(), trainable.shallow_clone());
+            parameters.push(QwenTrainableParameter {
+                name: name.to_string(),
+                tensor: trainable,
+                base: tensor_snapshot(&base),
+                adam: None,
+            });
+        }
+        Ok(Self { parameters })
+    }
+
+    #[cfg(test)]
+    fn parameter_names(&self) -> Vec<String> {
+        self.parameters
+            .iter()
+            .map(|parameter| parameter.name.clone())
+            .collect()
+    }
+
+    fn adamw_step(
+        &mut self,
+        weights: &mut BTreeMap<String, Tensor>,
+        learning_rate: f64,
+        step: i32,
+    ) -> Result<QwenTrainStepArtifacts> {
+        let mut tensor_summaries = Vec::with_capacity(self.parameters.len());
+        let mut manifest_tensors = Vec::with_capacity(self.parameters.len());
+        let mut delta_entries = Vec::with_capacity(self.parameters.len());
+        let mut optimizer_entries = Vec::with_capacity(self.parameters.len() * 2);
+
+        for parameter in &mut self.parameters {
+            let grad = parameter.tensor.grad();
+            let grad_defined = grad.defined();
+            let grad_norm = if grad_defined {
+                grad.norm().double_value(&[])
+            } else {
+                0.0
+            };
+            if !grad_defined || grad_norm <= 0.0 {
+                bail!(
+                    "trainable tensor {} did not receive a gradient",
+                    parameter.name
+                );
+            }
+
+            let adam_state = adamw_next_state(parameter.adam.as_ref(), &grad, 0.9, 0.999);
+            let update = adamw_update(&adam_state, learning_rate, 0.9, 0.999, step, 1e-8);
+            let _ = no_grad(|| parameter.tensor.f_sub_(&update))?;
+            weights.insert(parameter.name.clone(), parameter.tensor.shallow_clone());
+
+            let delta = &parameter.tensor - &parameter.base;
+            let delta_norm = delta.norm().double_value(&[]);
+            let delta_name = format!("{}.delta", parameter.name);
+            let adam_names = adam_slot_names(&parameter.name);
+            manifest_tensors.push(QwenDeltaTensorManifestEntry {
+                name: parameter.name.clone(),
+                delta_name: delta_name.clone(),
+                adam_m_name: Some(adam_names.m.clone()),
+                adam_v_name: Some(adam_names.v.clone()),
+                shape: parameter.tensor.size(),
+                dtype: "float32".to_string(),
+                grad_norm,
+                delta_norm,
+            });
+            delta_entries.push((delta_name, delta));
+            optimizer_entries.push((adam_names.m, adam_state.m.shallow_clone()));
+            optimizer_entries.push((adam_names.v, adam_state.v.shallow_clone()));
+            tensor_summaries.push(TrainableTensorSummary {
+                name: parameter.name.clone(),
+                grad_defined,
+                grad_norm,
+                delta_norm,
+            });
+            parameter.adam = Some(adam_state);
+        }
+
+        Ok(QwenTrainStepArtifacts {
+            tensor_summaries,
+            manifest_tensors,
+            delta_entries,
+            optimizer_entries,
+        })
+    }
+
+    fn apply_delta_checkpoint(
+        weights: &mut BTreeMap<String, Tensor>,
+        delta_tensors: &BTreeMap<String, Tensor>,
+        manifest_tensors: &[QwenDeltaTensorManifestEntry],
+    ) -> Result<()> {
+        for entry in manifest_tensors {
+            let reloaded = tensor(weights, &entry.name)?.to_kind(Kind::Float)
+                + tensor(delta_tensors, &entry.delta_name)?.to_kind(Kind::Float);
+            weights.insert(entry.name.clone(), reloaded);
+        }
+        Ok(())
     }
 }
 
@@ -2105,39 +2181,49 @@ mod tests {
         };
         let mut weights = tiny_qwen_weights();
         let input_ids = Tensor::from_slice(&[0_i64, 1, 2, 3]).reshape([1, 4]);
-        let trainable_names = representative_trainable_qwen_tensors();
-        let mut trainable_tensors = Vec::new();
-        for name in &trainable_names {
-            let trainable = tensor(&weights, name)
-                .expect("representative tensor should exist")
-                .to_kind(Kind::Float)
-                .set_requires_grad(true);
-            weights.insert((*name).to_string(), trainable.shallow_clone());
-            trainable_tensors.push(((*name).to_string(), trainable));
-        }
+        let mut registry =
+            QwenTrainableRegistry::representative(&mut weights).expect("registry should build");
+        assert_eq!(
+            registry.parameter_names(),
+            representative_trainable_qwen_tensors()
+        );
 
         let initial_loss = qwen_causal_lm_loss(&input_ids, &weights, &config)
             .expect("loss should run")
             .double_value(&[]);
         let loss = qwen_causal_lm_loss(&input_ids, &weights, &config).expect("loss should run");
         loss.backward();
-
-        let base_weights = tiny_qwen_weights();
-        let mut deltas = BTreeMap::new();
-        for (name, mut trainable) in trainable_tensors {
-            let grad = trainable.grad();
-            assert!(grad.defined(), "{name} should receive a gradient");
+        let artifacts = registry
+            .adamw_step(&mut weights, 1e-2, 1)
+            .expect("optimizer step should apply");
+        assert_eq!(
+            artifacts.tensor_summaries.len(),
+            representative_trainable_qwen_tensors().len()
+        );
+        assert_eq!(
+            artifacts.manifest_tensors.len(),
+            representative_trainable_qwen_tensors().len()
+        );
+        assert_eq!(
+            artifacts.optimizer_entries.len(),
+            representative_trainable_qwen_tensors().len() * 2
+        );
+        for summary in &artifacts.tensor_summaries {
             assert!(
-                grad.norm().double_value(&[]) > 0.0,
-                "{name} grad should be non-zero"
+                summary.grad_defined,
+                "{} should receive a gradient",
+                summary.name
             );
-
-            let _ = no_grad(|| trainable.f_sub_(&(&grad * 1e-2))).expect("update should apply");
-            let base = tensor(&base_weights, &name)
-                .expect("base tensor should exist")
-                .to_kind(Kind::Float);
-            deltas.insert(name.clone(), &trainable - &base);
-            weights.insert(name, trainable);
+            assert!(
+                summary.grad_norm > 0.0,
+                "{} grad should be non-zero",
+                summary.name
+            );
+            assert!(
+                summary.delta_norm > 0.0,
+                "{} delta should be non-zero",
+                summary.name
+            );
         }
 
         let final_loss = qwen_causal_lm_loss(&input_ids, &weights, &config)
@@ -2146,13 +2232,17 @@ mod tests {
         assert!(final_loss < initial_loss);
 
         let mut reloaded_weights = tiny_qwen_weights();
-        for (name, delta) in deltas {
-            let reloaded = tensor(&reloaded_weights, &name)
-                .expect("base tensor should exist")
-                .to_kind(Kind::Float)
-                + delta;
-            reloaded_weights.insert(name, reloaded);
-        }
+        let delta_tensors: BTreeMap<String, Tensor> = artifacts
+            .delta_entries
+            .into_iter()
+            .map(|(name, tensor)| (name, tensor))
+            .collect();
+        QwenTrainableRegistry::apply_delta_checkpoint(
+            &mut reloaded_weights,
+            &delta_tensors,
+            &artifacts.manifest_tensors,
+        )
+        .expect("delta reload should apply");
         let reloaded_loss = qwen_causal_lm_loss(&input_ids, &reloaded_weights, &config)
             .expect("loss should run")
             .double_value(&[]);

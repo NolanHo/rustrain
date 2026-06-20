@@ -70,9 +70,9 @@ scripts/gpu_run.sh cargo run -- qwen-full-train-smoke
 
 ## Current Major Gaps
 
-- Real full-Qwen training is only partially done: the command and representative
-  trainable tensor path are verified, but the code is still smoke-level rather
-  than a reusable trainer-owned Qwen module.
+- Real full-Qwen training is partially reusable: representative Qwen parameters
+  now go through a trainable registry, but this is not yet a trainer-owned full
+  model module.
 - Real Qwen module-level LoRA train/reload and a focused response-only SFT smoke
   exist for layer0 attention `q_proj`/`v_proj`; configurable trainer-owned LoRA
   injection is not done yet.
