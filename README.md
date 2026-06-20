@@ -12,8 +12,8 @@ as milestone-sized, verifiable smokes.
 
 All smoke, test, parity, and training verification runs on the GPU host through
 Ray `num_gpus=1` workers. The local machine is only for editing, git
-operations, and launching remote jobs. Do not run local CPU smoke or
-verification commands for development evidence.
+operations, and launching remote jobs. Local CPU smoke is not allowed, including
+as temporary development evidence.
 
 Run one command on a Ray GPU worker:
 
@@ -29,9 +29,10 @@ scripts/verify_gpu.sh
 
 Both scripts SSH to `root@192.168.42.106:2222`, submit work to Ray with
 `num_gpus=1`, enter the remote checkout, and source `scripts/tch_a800_env.sh`
-before running project commands. Do not run `cargo test`, train smokes, or
-parity commands on the local machine or directly in the plain SSH shell; the
-plain shell does not expose the GPU devices.
+before running project commands. Do not run `cargo test`, train smokes, parity
+commands, or quick local CPU checks on the local machine or directly in the
+plain SSH shell; the plain shell does not expose the GPU devices. If a check is
+worth running, run it on a Ray GPU worker.
 
 The required remote checkout is:
 
