@@ -135,10 +135,12 @@ struct QwenLoraSftSmokeSummary {
     adapter_output: String,
     target_layers: Vec<usize>,
     target_modules: Vec<String>,
-    prompt_tokens: usize,
-    response_tokens: usize,
+    batch_size: usize,
+    prompt_tokens: Vec<usize>,
+    response_tokens: Vec<usize>,
     sequence_tokens: usize,
     response_masked_positions: usize,
+    padding_tokens: usize,
     rank: i64,
     alpha: f64,
     learning_rate: f64,
@@ -266,11 +268,20 @@ struct QwenLoraRegistry {
 }
 
 struct QwenSftTokenSample {
-    input_ids: Tensor,
-    target_mask: Tensor,
     prompt_tokens: usize,
     response_tokens: usize,
     masked_positions: usize,
+    token_ids: Vec<i64>,
+    mask_values: Vec<f32>,
+}
+
+struct QwenSftBatch {
+    input_ids: Tensor,
+    target_mask: Tensor,
+    prompt_tokens: Vec<usize>,
+    response_tokens: Vec<usize>,
+    masked_positions: usize,
+    padding_tokens: usize,
 }
 
 pub fn qwen_module_parity(model_safetensors: &Path, fixture: &Path) -> Result<()> {
@@ -789,7 +800,11 @@ pub fn qwen_lora_sft_smoke(
 
     let tokenizer = Tokenizer::from_file(model_path.join("tokenizer.json"))
         .map_err(|error| anyhow!("failed to load tokenizer: {error}"))?;
-    let sample = qwen_sft_token_sample(&tokenizer, instruction, response)?;
+    let samples = vec![
+        qwen_sft_token_sample(&tokenizer, instruction, response)?,
+        qwen_sft_token_sample(&tokenizer, "Name the project.", "rustrain")?,
+    ];
+    let batch = qwen_sft_padded_batch(&samples, qwen_pad_token_id(&tokenizer))?;
     let weights = read_safetensors_map(&model_path.join("model.safetensors"))?;
     let config = read_runtime_config(&model_path.join("config.json"))?;
     let layer0 = QwenLayerWeights::load(&weights, 0)?;
@@ -801,16 +816,16 @@ pub fn qwen_lora_sft_smoke(
         || layer0.o_proj.requires_grad();
 
     let initial_loss = qwen_attention_lora_sft_loss(
-        &sample.input_ids,
-        &sample.target_mask,
+        &batch.input_ids,
+        &batch.target_mask,
         &weights,
         registry.layer_adapter(0)?,
         &config,
     )?
     .double_value(&[]);
     let loss = qwen_attention_lora_sft_loss(
-        &sample.input_ids,
-        &sample.target_mask,
+        &batch.input_ids,
+        &batch.target_mask,
         &weights,
         registry.layer_adapter(0)?,
         &config,
@@ -850,8 +865,8 @@ pub fn qwen_lora_sft_smoke(
     }
 
     let final_loss = qwen_attention_lora_sft_loss(
-        &sample.input_ids,
-        &sample.target_mask,
+        &batch.input_ids,
+        &batch.target_mask,
         &weights,
         registry.layer_adapter(0)?,
         &config,
@@ -866,8 +881,8 @@ pub fn qwen_lora_sft_smoke(
     registry.save(adapter_output)?;
     let reloaded = QwenLoraRegistry::load(adapter_output)?;
     let reloaded_loss = qwen_attention_lora_sft_loss(
-        &sample.input_ids,
-        &sample.target_mask,
+        &batch.input_ids,
+        &batch.target_mask,
         &weights,
         reloaded.layer_adapter(0)?,
         &config,
@@ -885,10 +900,12 @@ pub fn qwen_lora_sft_smoke(
         adapter_output: adapter_output.display().to_string(),
         target_layers: lora_config.target_layers.clone(),
         target_modules: lora_config.target_module_names(),
-        prompt_tokens: sample.prompt_tokens,
-        response_tokens: sample.response_tokens,
-        sequence_tokens: sample.input_ids.size()[1] as usize,
-        response_masked_positions: sample.masked_positions,
+        batch_size: batch.prompt_tokens.len(),
+        prompt_tokens: batch.prompt_tokens,
+        response_tokens: batch.response_tokens,
+        sequence_tokens: batch.input_ids.size()[1] as usize,
+        response_masked_positions: batch.masked_positions,
+        padding_tokens: batch.padding_tokens,
         rank,
         alpha,
         learning_rate,
@@ -2208,13 +2225,76 @@ fn qwen_sft_token_sample(
     }
 
     Ok(QwenSftTokenSample {
-        input_ids: Tensor::from_slice(&token_ids)
-            .to_kind(Kind::Int64)
-            .reshape([1, token_ids.len() as i64]),
-        target_mask: Tensor::from_slice(&mask_values).reshape([1, target_len as i64, 1]),
         prompt_tokens: prompt_tokens.len(),
         response_tokens: response_tokens.len(),
         masked_positions,
+        token_ids,
+        mask_values,
+    })
+}
+
+fn qwen_pad_token_id(tokenizer: &Tokenizer) -> i64 {
+    tokenizer
+        .get_padding()
+        .map(|padding| i64::from(padding.pad_id))
+        .or_else(|| tokenizer.token_to_id("<|endoftext|>").map(i64::from))
+        .unwrap_or(0)
+}
+
+fn qwen_sft_padded_batch(
+    samples: &[QwenSftTokenSample],
+    pad_token_id: i64,
+) -> Result<QwenSftBatch> {
+    if samples.is_empty() {
+        bail!("SFT batch must contain at least one sample");
+    }
+    let max_len = samples
+        .iter()
+        .map(|sample| sample.token_ids.len())
+        .max()
+        .ok_or_else(|| anyhow!("SFT batch must contain at least one sample"))?;
+    if max_len < 2 {
+        bail!("SFT batch sequence length must be at least two tokens");
+    }
+
+    let batch_size = samples.len();
+    let mut input_values = Vec::with_capacity(batch_size * max_len);
+    let mut mask_values = Vec::with_capacity(batch_size * (max_len - 1));
+    let mut prompt_tokens = Vec::with_capacity(batch_size);
+    let mut response_tokens = Vec::with_capacity(batch_size);
+    let mut masked_positions = 0usize;
+    let mut padding_tokens = 0usize;
+
+    for sample in samples {
+        prompt_tokens.push(sample.prompt_tokens);
+        response_tokens.push(sample.response_tokens);
+        input_values.extend(sample.token_ids.iter().copied());
+        let pad_len = max_len - sample.token_ids.len();
+        input_values.extend(std::iter::repeat(pad_token_id).take(pad_len));
+        padding_tokens += pad_len;
+
+        mask_values.extend(sample.mask_values.iter().copied());
+        masked_positions += sample.masked_positions;
+        mask_values.extend(std::iter::repeat(0.0).take(max_len - 1 - sample.mask_values.len()));
+    }
+
+    if masked_positions == 0 {
+        bail!("SFT batch response-only mask is empty");
+    }
+
+    Ok(QwenSftBatch {
+        input_ids: Tensor::from_slice(&input_values)
+            .to_kind(Kind::Int64)
+            .reshape([batch_size as i64, max_len as i64]),
+        target_mask: Tensor::from_slice(&mask_values).reshape([
+            batch_size as i64,
+            (max_len - 1) as i64,
+            1,
+        ]),
+        prompt_tokens,
+        response_tokens,
+        masked_positions,
+        padding_tokens,
     })
 }
 
@@ -2790,6 +2870,37 @@ mod tests {
             .max_abs
                 < 1e-8
         );
+    }
+
+    #[test]
+    fn qwen_sft_padded_batch_masks_padding_targets() {
+        let samples = vec![
+            QwenSftTokenSample {
+                prompt_tokens: 2,
+                response_tokens: 2,
+                masked_positions: 2,
+                token_ids: vec![10, 11, 12, 13],
+                mask_values: vec![0.0, 1.0, 1.0],
+            },
+            QwenSftTokenSample {
+                prompt_tokens: 1,
+                response_tokens: 1,
+                masked_positions: 1,
+                token_ids: vec![20, 21],
+                mask_values: vec![1.0],
+            },
+        ];
+
+        let batch = qwen_sft_padded_batch(&samples, 0).expect("batch should build");
+        let input_values: Vec<i64> = Vec::<i64>::try_from(batch.input_ids.reshape([-1])).unwrap();
+        let mask_values: Vec<f32> = Vec::<f32>::try_from(batch.target_mask.reshape([-1])).unwrap();
+
+        assert_eq!(batch.input_ids.size(), vec![2, 4]);
+        assert_eq!(batch.target_mask.size(), vec![2, 3, 1]);
+        assert_eq!(input_values, vec![10, 11, 12, 13, 20, 21, 0, 0]);
+        assert_eq!(mask_values, vec![0.0, 1.0, 1.0, 1.0, 0.0, 0.0]);
+        assert_eq!(batch.masked_positions, 3);
+        assert_eq!(batch.padding_tokens, 2);
     }
 
     #[test]

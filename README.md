@@ -84,7 +84,8 @@ scripts/gpu_run.sh cargo run -- qwen-full-train-smoke
   are not done.
 - Trainer production basics such as scheduler, grad clipping, RSS memory
   metrics, and Ray-worker GPU memory reporting are implemented for toy/tch
-  paths; real tokenizer-backed batching and bf16/mixed precision remain partial.
+  paths; real tokenizer-backed padded LoRA SFT batching exists, while bf16/mixed
+  precision remains partial.
 
 Internal planning details live in `_internal_docs/TODO.md`; that directory is
 ignored by git.
