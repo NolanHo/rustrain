@@ -10,15 +10,23 @@ as milestone-sized, verifiable smokes.
 
 ## GPU-Only Verification
 
-All smoke, test, parity, and training verification runs on the GPU host through
-Ray `num_gpus=1` workers. The local machine is only for editing, git
-operations, and launching remote jobs. Local CPU smoke is forbidden: do not use
-it for development feedback, debugging evidence, or final acceptance.
+All smoke, test, parity, training, and `cargo check` verification runs on Ray
+GPU workers submitted through the GPU host. The local machine is only for
+editing, git operations, and launching remote jobs. Local CPU smoke is
+forbidden: do not use it for development feedback, debugging evidence, or final
+acceptance.
 
 Run one command on a Ray GPU worker:
 
 ```sh
 scripts/gpu_run.sh cargo run -- tch-cuda-probe
+```
+
+To verify uncommitted local edits on the Ray GPU worker, stage the current
+working tree into the worker runtime:
+
+```sh
+RUSTRAIN_SYNC_TO_WORKER=1 scripts/gpu_run.sh cargo check
 ```
 
 Run the focused verification suite:
@@ -27,12 +35,12 @@ Run the focused verification suite:
 scripts/verify_gpu.sh
 ```
 
-Both scripts SSH to `root@192.168.42.106:2222`, submit work to Ray with
-`num_gpus=1`, enter the remote checkout, and source `scripts/tch_a800_env.sh`
-before running project commands. Do not run `cargo test`, train smokes, parity
-commands, or quick local CPU checks on the local machine. Do not run them
-directly in the plain SSH shell either; that shell does not expose the GPU
-devices. If a check is worth running, run it on a Ray GPU worker.
+Both scripts SSH to `root@192.168.42.106:2222`, submit work to Ray with GPU
+resources, enter the remote checkout, and source `scripts/tch_a800_env.sh`
+before running project commands. Do not run `cargo check`, `cargo test`, train
+smokes, parity commands, or quick local CPU checks on the local machine. Do not
+run them directly in the plain SSH shell either; that shell does not expose the
+GPU devices. If a check is worth running, run it on a Ray GPU worker.
 
 The required remote checkout is:
 
@@ -80,6 +88,7 @@ RUSTRAIN_RAY_NUM_GPUS=2 scripts/gpu_run.sh cargo run -- launch --nproc-per-node 
 RUSTRAIN_RAY_NUM_GPUS=2 scripts/gpu_run.sh cargo run -- launch --nproc-per-node 2 --output-dir /tmp/rustrain-runs/nccl-dp-gradient-smoke nccl-dp-gradient-rank-smoke --output-dir /tmp/rustrain-runs/nccl-dp-gradient-smoke/ranks
 RUSTRAIN_RAY_NUM_GPUS=2 scripts/gpu_run.sh cargo run -- launch --nproc-per-node 2 --output-dir /tmp/rustrain-runs/tch-dp-gradient-smoke tch-dp-gradient-rank-smoke --output-dir /tmp/rustrain-runs/tch-dp-gradient-smoke/ranks
 RUSTRAIN_RAY_NUM_GPUS=2 scripts/gpu_run.sh cargo run -- launch --nproc-per-node 2 --output-dir /tmp/rustrain-runs/tch-trainer-dp2-launch train --config configs/tch_smoke_cuda_dp2.toml
+RUSTRAIN_RAY_NUM_GPUS=2 scripts/gpu_run.sh env RUSTRAIN_LAUNCH_TIMEOUT_SECS=300 cargo run -- launch --nproc-per-node 2 --output-dir /tmp/rustrain-runs/qwen-dp-gradient-smoke-fp32 qwen-dp-gradient-rank-smoke --dtype fp32 --output-dir /tmp/rustrain-runs/qwen-dp-gradient-smoke-fp32/ranks
 ```
 
 The launcher sets `RANK`, `LOCAL_RANK`, `WORLD_SIZE`, `LOCAL_WORLD_SIZE`,
@@ -87,8 +96,9 @@ The launcher sets `RANK`, `LOCAL_RANK`, `WORLD_SIZE`, `LOCAL_WORLD_SIZE`,
 `launch-summary.json`. `scripts/gpu_run.sh` defaults to one Ray GPU; set
 `RUSTRAIN_RAY_NUM_GPUS=2` for two-rank GPU collective smokes. Minimal NCCL f32
 all-reduce, toy DP gradient all-reduce, and `tch` autograd DP gradient smokes
-exist, including a `trainer::train` config path for tiny `tch` DP=2. Real
-multi-GPU Qwen training is not implemented yet.
+exist, including a `trainer::train` config path for tiny `tch` DP=2 and a
+focused real-Qwen layer0 attention DP gradient-signature smoke. Real multi-GPU
+Qwen training is not implemented yet.
 
 ## Current Major Gaps
 

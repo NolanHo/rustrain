@@ -1,7 +1,9 @@
 use std::{
     fs,
-    path::Path,
-    process::{Command, Stdio},
+    path::{Path, PathBuf},
+    process::{Child, Command, ExitStatus, Stdio},
+    thread::sleep,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result, bail};
@@ -21,6 +23,7 @@ struct RankSummary {
     local_rank: usize,
     world_size: usize,
     status_code: Option<i32>,
+    timed_out: bool,
     log_path: String,
 }
 
@@ -54,6 +57,7 @@ pub fn launch(
     fs::create_dir_all(output_dir)
         .with_context(|| format!("failed to create {}", output_dir.display()))?;
     let current_exe = std::env::current_exe().context("failed to locate current executable")?;
+    let timeout = launch_timeout()?;
 
     let mut children = Vec::with_capacity(nproc_per_node);
     for rank in 0..nproc_per_node {
@@ -85,21 +89,20 @@ pub fn launch(
         ));
     }
 
+    let wait_results = wait_for_ranks(children, timeout)?;
     let mut ranks = Vec::with_capacity(nproc_per_node);
     let mut failed = Vec::new();
-    for (rank, log_path, mut child) in children {
-        let status = child
-            .wait()
-            .with_context(|| format!("failed to wait for rank {rank}"))?;
-        if !status.success() {
-            failed.push(rank);
+    for wait_result in wait_results {
+        if !wait_result.success() {
+            failed.push(wait_result.rank);
         }
         ranks.push(RankSummary {
-            rank,
-            local_rank: rank,
+            rank: wait_result.rank,
+            local_rank: wait_result.rank,
             world_size: nproc_per_node,
-            status_code: status.code(),
-            log_path: log_path.display().to_string(),
+            status_code: wait_result.status.and_then(|status| status.code()),
+            timed_out: wait_result.timed_out,
+            log_path: wait_result.log_path.display().to_string(),
         });
     }
 
@@ -145,6 +148,81 @@ fn read_launch_env() -> Result<LaunchEnvSummary> {
         master_port: parse_env_u16("MASTER_PORT")?,
         cuda_visible_devices: std::env::var("CUDA_VISIBLE_DEVICES").ok(),
     })
+}
+
+#[derive(Debug)]
+struct RankWaitResult {
+    rank: usize,
+    log_path: PathBuf,
+    status: Option<ExitStatus>,
+    timed_out: bool,
+}
+
+impl RankWaitResult {
+    fn success(&self) -> bool {
+        !self.timed_out && self.status.is_some_and(|status| status.success())
+    }
+}
+
+fn wait_for_ranks(
+    children: Vec<(usize, PathBuf, Child)>,
+    timeout: Option<Duration>,
+) -> Result<Vec<RankWaitResult>> {
+    let start = Instant::now();
+    let mut running: Vec<(usize, PathBuf, Child)> = children;
+    let mut results = Vec::with_capacity(running.len());
+    loop {
+        let mut index = 0;
+        while index < running.len() {
+            let (rank, _, child) = &mut running[index];
+            if let Some(status) = child
+                .try_wait()
+                .with_context(|| format!("failed to poll rank {rank}"))?
+            {
+                let (rank, log_path, _) = running.remove(index);
+                results.push(RankWaitResult {
+                    rank,
+                    log_path,
+                    status: Some(status),
+                    timed_out: false,
+                });
+            } else {
+                index += 1;
+            }
+        }
+        if running.is_empty() {
+            results.sort_by_key(|result| result.rank);
+            return Ok(results);
+        }
+        if timeout.is_some_and(|timeout| start.elapsed() >= timeout) {
+            for (rank, log_path, child) in &mut running {
+                let _ = child.kill();
+                let status = child.wait().ok();
+                results.push(RankWaitResult {
+                    rank: *rank,
+                    log_path: log_path.clone(),
+                    status,
+                    timed_out: true,
+                });
+            }
+            results.sort_by_key(|result| result.rank);
+            return Ok(results);
+        }
+        sleep(Duration::from_millis(100));
+    }
+}
+
+fn launch_timeout() -> Result<Option<Duration>> {
+    let Some(raw) = std::env::var("RUSTRAIN_LAUNCH_TIMEOUT_SECS").ok() else {
+        return Ok(None);
+    };
+    let seconds = raw
+        .parse::<u64>()
+        .with_context(|| "RUSTRAIN_LAUNCH_TIMEOUT_SECS must be an integer number of seconds")?;
+    if seconds == 0 {
+        return Ok(None);
+    }
+    Ok(Some(Duration::from_secs(seconds)))
 }
 
 fn parse_env_usize(name: &str) -> Result<usize> {

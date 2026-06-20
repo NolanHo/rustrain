@@ -208,6 +208,20 @@ enum Command {
         #[arg(long, default_value_t = 1e-6)]
         learning_rate: f64,
     },
+    #[command(hide = true)]
+    QwenDpGradientRankSmoke {
+        #[arg(
+            long,
+            default_value = "/vePFS-Mindverse/share/huggingface/Qwen2.5-0.5B-Instruct"
+        )]
+        model_path: PathBuf,
+        #[arg(long, default_value = "runs/parity/qwen_layer0_modules.safetensors")]
+        reference_fixture: PathBuf,
+        #[arg(long)]
+        output_dir: PathBuf,
+        #[arg(long, default_value = "fp32")]
+        dtype: String,
+    },
     Launch {
         #[arg(long)]
         nproc_per_node: usize,
@@ -381,6 +395,17 @@ fn main() -> Result<()> {
             &delta_output,
             qwen_module::QwenComputeDType::parse(&dtype)?,
             learning_rate,
+        ),
+        Command::QwenDpGradientRankSmoke {
+            model_path,
+            reference_fixture,
+            output_dir,
+            dtype,
+        } => qwen_module::qwen_dp_gradient_smoke(
+            &model_path,
+            &reference_fixture,
+            output_dir,
+            qwen_module::QwenComputeDType::parse(&dtype)?,
         ),
         Command::Launch {
             nproc_per_node,
