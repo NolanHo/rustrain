@@ -1,6 +1,7 @@
 mod backend;
 mod distributed_smoke;
 mod inspect;
+mod launcher;
 mod lora;
 mod metrics;
 mod moe;
@@ -206,6 +207,18 @@ enum Command {
         #[arg(long, default_value_t = 1e-6)]
         learning_rate: f64,
     },
+    Launch {
+        #[arg(long)]
+        nproc_per_node: usize,
+        #[arg(long, default_value = "/tmp/rustrain-runs/launch")]
+        output_dir: PathBuf,
+        #[arg(long, default_value = "127.0.0.1")]
+        master_addr: String,
+        #[arg(long, default_value_t = 29500)]
+        master_port: u16,
+        #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
+        command: Vec<String>,
+    },
     TchCudaProbe,
     ParallelDpSmoke {
         #[arg(long, default_value = "runs/parallel-dp-smoke")]
@@ -226,10 +239,12 @@ enum Command {
         #[arg(long)]
         output_dir: PathBuf,
         #[arg(long)]
-        rank: usize,
+        rank: Option<usize>,
         #[arg(long)]
-        world_size: usize,
+        world_size: Option<usize>,
     },
+    #[command(hide = true)]
+    PrintLaunchEnv,
 }
 
 fn main() -> Result<()> {
@@ -351,6 +366,19 @@ fn main() -> Result<()> {
             qwen_module::QwenComputeDType::parse(&dtype)?,
             learning_rate,
         ),
+        Command::Launch {
+            nproc_per_node,
+            output_dir,
+            master_addr,
+            master_port,
+            command,
+        } => launcher::launch(
+            nproc_per_node,
+            &output_dir,
+            &master_addr,
+            master_port,
+            &command,
+        ),
         Command::TchCudaProbe => tch_train::probe_tch_cuda(),
         Command::ParallelDpSmoke {
             output_dir,
@@ -366,6 +394,7 @@ fn main() -> Result<()> {
             output_dir,
             rank,
             world_size,
-        } => distributed_smoke::run_data_parallel_rank(output_dir, rank, world_size),
+        } => distributed_smoke::run_data_parallel_rank_from_args(output_dir, rank, world_size),
+        Command::PrintLaunchEnv => launcher::print_launch_env(),
     }
 }

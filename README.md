@@ -69,6 +69,20 @@ real checkpoint:
 scripts/gpu_run.sh cargo run -- qwen-full-train-smoke
 ```
 
+## Distributed Launch
+
+A minimal local-rank launcher is available for rank process management:
+
+```sh
+scripts/gpu_run.sh cargo run -- launch --nproc-per-node 2 print-launch-env
+scripts/gpu_run.sh cargo run -- launch --nproc-per-node 2 parallel-dp-rank-smoke --output-dir /tmp/rustrain-runs/launch-dp-rank-smoke/dp
+```
+
+The launcher sets `RANK`, `LOCAL_RANK`, `WORLD_SIZE`, `LOCAL_WORLD_SIZE`,
+`MASTER_ADDR`, and `MASTER_PORT`, captures rank-local logs, and writes a
+`launch-summary.json`. It does not yet provide NCCL-backed gradient
+synchronization or real multi-GPU Qwen training.
+
 ## Current Major Gaps
 
 - G5 representative checkpoint resume is implemented for the Qwen full-train
@@ -88,8 +102,9 @@ scripts/gpu_run.sh cargo run -- qwen-full-train-smoke
   is not done yet.
 - KV-cache greedy parity and cached sampling parity are implemented; Python
   cached-generation parity is future work.
-- G4 real distributed training is missing: multi-GPU DP/TP/EP are toy or
-  simulated smokes, not NCCL-backed rank-local Qwen training.
+- G4 launcher process management exists, but real distributed training is still
+  missing: multi-GPU DP/TP/EP are toy or simulated smokes, not NCCL-backed
+  rank-local Qwen training.
 - Distributed checkpoint layout is not defined.
 - Trainer production basics such as scheduler, grad clipping, RSS memory
   metrics, and Ray-worker GPU memory reporting are implemented for toy/tch

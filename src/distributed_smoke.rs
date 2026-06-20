@@ -213,6 +213,20 @@ pub fn run_data_parallel_rank(output_dir: PathBuf, rank: usize, world_size: usiz
     Ok(())
 }
 
+pub fn run_data_parallel_rank_from_args(
+    output_dir: PathBuf,
+    rank: Option<usize>,
+    world_size: Option<usize>,
+) -> Result<()> {
+    let rank = rank
+        .map(Ok)
+        .unwrap_or_else(|| parse_launcher_usize_env("RANK"))?;
+    let world_size = world_size
+        .map(Ok)
+        .unwrap_or_else(|| parse_launcher_usize_env("WORLD_SIZE"))?;
+    run_data_parallel_rank(output_dir, rank, world_size)
+}
+
 pub fn run_tensor_parallel_smoke(world_size: usize) -> Result<()> {
     if world_size != 2 {
         bail!("M13 TP smoke currently expects world_size = 2");
@@ -347,6 +361,18 @@ fn compute_dp_stats(rank: usize, world_size: usize) -> DpRankStats {
         loss_sum,
         grad_sum,
     }
+}
+
+fn parse_launcher_usize_env(name: &str) -> Result<usize> {
+    std::env::var(name)
+        .with_context(|| {
+            format!(
+                "{name} is not set; pass --{} or run through rustrain launch",
+                name.to_ascii_lowercase()
+            )
+        })?
+        .parse::<usize>()
+        .with_context(|| format!("{name} must be a usize"))
 }
 
 fn max_abs_diff(actual: &Array2<f64>, expected: &Array2<f64>) -> f64 {
