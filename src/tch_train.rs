@@ -7,7 +7,7 @@ use tracing::info;
 
 use crate::{
     metrics::memory_rss_mb,
-    runtime::{Config, Device as RuntimeDevice, LrScheduler},
+    runtime::{Config, DType, Device as RuntimeDevice, LrScheduler},
 };
 
 #[derive(Debug, Clone)]
@@ -18,6 +18,7 @@ pub struct TchTrainSmokeSummary {
     pub lm_head_grad_defined: bool,
     pub first_step_grad_norm: f64,
     pub final_learning_rate: f64,
+    pub compute_kind: String,
     pub memory_rss_mb: Option<f64>,
     pub gpu_memory_allocated_mb: Option<f64>,
 }
@@ -50,6 +51,7 @@ pub fn train_tch_tiny_lm(config: &Config) -> Result<TchTrainSmokeSummary> {
     }
 
     let device = tch_device(config)?;
+    let compute_kind = tch_compute_kind(config);
     let vs = nn::VarStore::new(device);
     let root = vs.root();
     let embedding = nn::embedding(
@@ -79,7 +81,8 @@ pub fn train_tch_tiny_lm(config: &Config) -> Result<TchTrainSmokeSummary> {
     let input_ids = fixed_tch_batch(config.model.vocab_size as i64, config.model.seq_len as i64)
         .to_device(device);
     let targets = input_ids.narrow(1, 1, config.model.seq_len as i64 - 1);
-    let initial_loss = tch_lm_loss(&embedding, &lm_head, &input_ids, &targets).double_value(&[]);
+    let initial_loss =
+        tch_lm_loss(&embedding, &lm_head, &input_ids, &targets, compute_kind).double_value(&[]);
     let mut embedding_grad_defined = false;
     let mut lm_head_grad_defined = false;
     let mut first_step_grad_norm = 0.0;
@@ -89,7 +92,7 @@ pub fn train_tch_tiny_lm(config: &Config) -> Result<TchTrainSmokeSummary> {
         let learning_rate = learning_rate_for_step(config, step);
         optimizer.set_lr(learning_rate);
         optimizer.zero_grad();
-        let loss = tch_lm_loss(&embedding, &lm_head, &input_ids, &targets);
+        let loss = tch_lm_loss(&embedding, &lm_head, &input_ids, &targets, compute_kind);
         loss.backward();
         let grad_norm = grad_norm(&vs.trainable_variables());
         if let Some(max_grad_norm) = config.train.max_grad_norm {
@@ -114,7 +117,8 @@ pub fn train_tch_tiny_lm(config: &Config) -> Result<TchTrainSmokeSummary> {
         }
     }
 
-    let final_loss = tch_lm_loss(&embedding, &lm_head, &input_ids, &targets).double_value(&[]);
+    let final_loss =
+        tch_lm_loss(&embedding, &lm_head, &input_ids, &targets, compute_kind).double_value(&[]);
     if final_loss >= initial_loss {
         return Err(anyhow!(
             "tch tiny lm failed to reduce loss: initial_loss={initial_loss}, final_loss={final_loss}"
@@ -133,6 +137,7 @@ pub fn train_tch_tiny_lm(config: &Config) -> Result<TchTrainSmokeSummary> {
         lm_head_grad_defined,
         first_step_grad_norm,
         final_learning_rate,
+        compute_kind: format!("{compute_kind:?}"),
         memory_rss_mb: memory_rss_mb(),
         gpu_memory_allocated_mb: crate::metrics::gpu_memory_allocated_mb(),
     })
@@ -181,15 +186,27 @@ fn tch_device(config: &Config) -> Result<Device> {
     }
 }
 
+fn tch_compute_kind(config: &Config) -> Kind {
+    match config.train.dtype {
+        DType::Fp32 => Kind::Float,
+        DType::Fp16 => Kind::Half,
+        DType::Bf16 => Kind::BFloat16,
+    }
+}
+
 fn tch_lm_loss(
     embedding: &nn::Embedding,
     lm_head: &nn::Linear,
     input_ids: &Tensor,
     targets: &Tensor,
+    compute_kind: Kind,
 ) -> Tensor {
-    let hidden = embedding.forward(input_ids);
+    let hidden = embedding.forward(input_ids).to_kind(compute_kind);
     let hidden = hidden.narrow(1, 0, input_ids.size()[1] - 1);
-    let logits = lm_head.forward(&hidden);
+    let weight = lm_head.ws.to_kind(compute_kind);
+    let logits = hidden
+        .linear::<&Tensor>(&weight, lm_head.bs.as_ref())
+        .to_kind(Kind::Float);
     let vocab_size = logits.size()[2];
     logits
         .reshape([-1, vocab_size])
@@ -216,6 +233,7 @@ mod tests {
         assert!(summary.lm_head_grad_defined);
         assert!(summary.first_step_grad_norm > 0.0);
         assert!((summary.final_learning_rate - 1e-2).abs() < 1e-8);
+        assert_eq!(summary.compute_kind, "Float");
         assert!(summary.memory_rss_mb.is_none_or(|value| value > 0.0));
         assert!(
             summary
@@ -249,6 +267,17 @@ mod tests {
 
         assert!(summary.first_step_grad_norm > 0.0);
         assert!(summary.final_learning_rate < config.train.learning_rate as f64);
+    }
+
+    #[test]
+    fn tch_dtype_policy_maps_runtime_dtype_to_compute_kind() {
+        let mut config = tiny_tch_config(RuntimeDevice::Cpu);
+        config.train.dtype = DType::Fp32;
+        assert_eq!(tch_compute_kind(&config), Kind::Float);
+        config.train.dtype = DType::Fp16;
+        assert_eq!(tch_compute_kind(&config), Kind::Half);
+        config.train.dtype = DType::Bf16;
+        assert_eq!(tch_compute_kind(&config), Kind::BFloat16);
     }
 
     fn tiny_tch_config(device: RuntimeDevice) -> Config {

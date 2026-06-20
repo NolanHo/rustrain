@@ -109,6 +109,7 @@ pub fn train(config_path: &Path, resume_from: Option<PathBuf>) -> Result<()> {
             lm_head_grad_defined = summary.lm_head_grad_defined,
             first_step_grad_norm = summary.first_step_grad_norm,
             final_lr = summary.final_learning_rate,
+            compute_kind = summary.compute_kind,
             memory_rss_mb = summary.memory_rss_mb,
             gpu_memory_allocated_mb = summary.gpu_memory_allocated_mb,
             "tch tiny lm smoke complete"
@@ -121,6 +122,7 @@ pub fn train(config_path: &Path, resume_from: Option<PathBuf>) -> Result<()> {
         println!("lm_head_grad_defined: {}", summary.lm_head_grad_defined);
         println!("first_step_grad_norm: {:.6}", summary.first_step_grad_norm);
         println!("final_learning_rate: {:.8}", summary.final_learning_rate);
+        println!("compute_kind: {}", summary.compute_kind);
         if let Some(memory_rss_mb) = summary.memory_rss_mb {
             println!("memory_rss_mb: {memory_rss_mb:.2}");
         }

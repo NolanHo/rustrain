@@ -19,6 +19,8 @@ remote_run cargo run -- tch-cuda-probe
 remote_run cargo test qwen_delta_manifest_roundtrips
 remote_run cargo test qwen_causal_lm_loss_is_finite_for_tiny_weights
 remote_run cargo test tch_tiny_lm_trains_all_parameter_groups
+remote_run cargo test tch_dtype_policy_maps_runtime_dtype_to_compute_kind
 remote_run cargo run -- train --config configs/tch_smoke_cuda.toml
+remote_run cargo run -- train --config configs/tch_smoke_cuda_bf16.toml
 remote_run cargo run -- qwen-sampling-smoke
 remote_run cargo run -- qwen-lora-sft-smoke
