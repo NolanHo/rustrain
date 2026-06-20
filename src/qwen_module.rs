@@ -101,6 +101,8 @@ struct QwenLoraSmokeSummary {
     model_path: String,
     fixture: String,
     adapter_output: String,
+    target_layers: Vec<usize>,
+    target_modules: Vec<String>,
     rank: i64,
     alpha: f64,
     zero_lora_max_delta: f64,
@@ -114,6 +116,8 @@ struct QwenLoraTrainSmokeSummary {
     model_path: String,
     fixture: String,
     adapter_output: String,
+    target_layers: Vec<usize>,
+    target_modules: Vec<String>,
     rank: i64,
     alpha: f64,
     learning_rate: f64,
@@ -129,6 +133,8 @@ struct QwenLoraTrainSmokeSummary {
 struct QwenLoraSftSmokeSummary {
     model_path: String,
     adapter_output: String,
+    target_layers: Vec<usize>,
+    target_modules: Vec<String>,
     prompt_tokens: usize,
     response_tokens: usize,
     sequence_tokens: usize,
@@ -237,6 +243,26 @@ struct QwenTrainStepArtifacts {
 
 struct QwenTrainableRegistry {
     parameters: Vec<QwenTrainableParameter>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+struct QwenLoraConfig {
+    target_layers: Vec<usize>,
+    target_modules: Vec<QwenLoraTargetModule>,
+    rank: i64,
+    alpha: i64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum QwenLoraTargetModule {
+    QProj,
+    VProj,
+}
+
+struct QwenLoraRegistry {
+    config: QwenLoraConfig,
+    adapters: BTreeMap<usize, QwenAttentionLoraAdapter>,
 }
 
 struct QwenSftTokenSample {
@@ -553,35 +579,39 @@ pub fn qwen_lora_smoke(
         &layer0.o_proj,
         &config,
     );
-    let zero_adapter = QwenAttentionLoraAdapter::zeros(
-        layer0.q_proj.size()[1],
-        layer0.q_proj.size()[0],
-        layer0.v_proj.size()[0],
-        rank,
-        alpha,
+    let lora_config = QwenLoraConfig::layer0_qv(rank, alpha)?;
+    let zero_registry = QwenLoraRegistry::zeros(&weights, &lora_config)?;
+    let zero_output = qwen_attention_with_lora(
+        &attention_input,
+        &layer0,
+        zero_registry.layer_adapter(0)?,
+        &config,
     );
-    let zero_output = qwen_attention_with_lora(&attention_input, &layer0, &zero_adapter, &config);
     let zero_lora_max_delta = diff_stats(&zero_output, &base)?.max_abs;
     if zero_lora_max_delta > 1e-7 {
         bail!("zero LoRA changed attention output: max_delta={zero_lora_max_delta}");
     }
 
-    let adapter = QwenAttentionLoraAdapter::deterministic(
-        layer0.q_proj.size()[1],
-        layer0.q_proj.size()[0],
-        layer0.v_proj.size()[0],
-        rank,
-        alpha,
+    let registry = QwenLoraRegistry::deterministic(&weights, &lora_config, false)?;
+    let adapted_output = qwen_attention_with_lora(
+        &attention_input,
+        &layer0,
+        registry.layer_adapter(0)?,
+        &config,
     );
-    let adapted_output = qwen_attention_with_lora(&attention_input, &layer0, &adapter, &config);
     let nonzero_lora_max_delta = diff_stats(&adapted_output, &base)?.max_abs;
     if nonzero_lora_max_delta <= 0.0 {
         bail!("non-zero LoRA did not change attention output");
     }
 
-    adapter.save(adapter_output)?;
-    let reloaded = QwenAttentionLoraAdapter::load(adapter_output)?;
-    let reloaded_output = qwen_attention_with_lora(&attention_input, &layer0, &reloaded, &config);
+    registry.save(adapter_output)?;
+    let reloaded = QwenLoraRegistry::load(adapter_output)?;
+    let reloaded_output = qwen_attention_with_lora(
+        &attention_input,
+        &layer0,
+        reloaded.layer_adapter(0)?,
+        &config,
+    );
     let reload_max_delta = diff_stats(&reloaded_output, &adapted_output)?.max_abs;
     if reload_max_delta > 1e-7 {
         bail!("LoRA adapter reload changed output: max_delta={reload_max_delta}");
@@ -591,6 +621,8 @@ pub fn qwen_lora_smoke(
         model_path: model_path.display().to_string(),
         fixture: fixture.display().to_string(),
         adapter_output: adapter_output.display().to_string(),
+        target_layers: lora_config.target_layers.clone(),
+        target_modules: lora_config.target_module_names(),
         rank,
         alpha,
         zero_lora_max_delta,
@@ -628,32 +660,37 @@ pub fn qwen_lora_train_smoke(
     let config = read_runtime_config(&model_path.join("config.json"))?;
     let layer0 = QwenLayerWeights::load(&weights, 0)?;
     let target_output = lora_train_target(&base_target_output);
-    let adapter = QwenAttentionLoraAdapter::deterministic_trainable(
-        layer0.q_proj.size()[1],
-        layer0.q_proj.size()[0],
-        layer0.v_proj.size()[0],
-        rank,
-        alpha,
-    );
+    let lora_config = QwenLoraConfig::layer0_qv(rank, alpha)?;
+    let registry = QwenLoraRegistry::deterministic(&weights, &lora_config, true)?;
     let base_requires_grad = layer0.q_proj.requires_grad()
         || layer0.k_proj.requires_grad()
         || layer0.v_proj.requires_grad()
         || layer0.o_proj.requires_grad();
 
-    let initial_loss =
-        qwen_attention_lora_mse_loss(&attention_input, &target_output, &layer0, &adapter, &config)
-            .double_value(&[]);
-    let loss =
-        qwen_attention_lora_mse_loss(&attention_input, &target_output, &layer0, &adapter, &config);
+    let initial_loss = qwen_attention_lora_mse_loss(
+        &attention_input,
+        &target_output,
+        &layer0,
+        registry.layer_adapter(0)?,
+        &config,
+    )
+    .double_value(&[]);
+    let loss = qwen_attention_lora_mse_loss(
+        &attention_input,
+        &target_output,
+        &layer0,
+        registry.layer_adapter(0)?,
+        &config,
+    );
     loss.backward();
 
-    let base_tensors: BTreeMap<String, Tensor> = adapter
+    let base_tensors: BTreeMap<String, Tensor> = registry
         .trainable_tensors()
         .into_iter()
         .map(|(name, tensor)| (name, tensor_snapshot(&tensor)))
         .collect();
     let mut tensor_summaries = Vec::new();
-    for (name, mut tensor) in adapter.trainable_tensors() {
+    for (name, mut tensor) in registry.trainable_tensors() {
         let grad = tensor.grad();
         let grad_defined = grad.defined();
         let grad_norm = if grad_defined {
@@ -679,22 +716,27 @@ pub fn qwen_lora_train_smoke(
         });
     }
 
-    let final_loss =
-        qwen_attention_lora_mse_loss(&attention_input, &target_output, &layer0, &adapter, &config)
-            .double_value(&[]);
+    let final_loss = qwen_attention_lora_mse_loss(
+        &attention_input,
+        &target_output,
+        &layer0,
+        registry.layer_adapter(0)?,
+        &config,
+    )
+    .double_value(&[]);
     if final_loss >= initial_loss {
         bail!(
             "Qwen LoRA train smoke failed to reduce loss: initial_loss={initial_loss}, final_loss={final_loss}"
         );
     }
 
-    adapter.save(adapter_output)?;
-    let reloaded = QwenAttentionLoraAdapter::load(adapter_output)?;
+    registry.save(adapter_output)?;
+    let reloaded = QwenLoraRegistry::load(adapter_output)?;
     let reloaded_loss = qwen_attention_lora_mse_loss(
         &attention_input,
         &target_output,
         &layer0,
-        &reloaded,
+        reloaded.layer_adapter(0)?,
         &config,
     )
     .double_value(&[]);
@@ -709,6 +751,8 @@ pub fn qwen_lora_train_smoke(
         model_path: model_path.display().to_string(),
         fixture: fixture.display().to_string(),
         adapter_output: adapter_output.display().to_string(),
+        target_layers: lora_config.target_layers.clone(),
+        target_modules: lora_config.target_module_names(),
         rank,
         alpha,
         learning_rate,
@@ -749,13 +793,8 @@ pub fn qwen_lora_sft_smoke(
     let weights = read_safetensors_map(&model_path.join("model.safetensors"))?;
     let config = read_runtime_config(&model_path.join("config.json"))?;
     let layer0 = QwenLayerWeights::load(&weights, 0)?;
-    let adapter = QwenAttentionLoraAdapter::deterministic_trainable(
-        layer0.q_proj.size()[1],
-        layer0.q_proj.size()[0],
-        layer0.v_proj.size()[0],
-        rank,
-        alpha,
-    );
+    let lora_config = QwenLoraConfig::layer0_qv(rank, alpha)?;
+    let registry = QwenLoraRegistry::deterministic(&weights, &lora_config, true)?;
     let base_requires_grad = layer0.q_proj.requires_grad()
         || layer0.k_proj.requires_grad()
         || layer0.v_proj.requires_grad()
@@ -765,7 +804,7 @@ pub fn qwen_lora_sft_smoke(
         &sample.input_ids,
         &sample.target_mask,
         &weights,
-        &adapter,
+        registry.layer_adapter(0)?,
         &config,
     )?
     .double_value(&[]);
@@ -773,18 +812,18 @@ pub fn qwen_lora_sft_smoke(
         &sample.input_ids,
         &sample.target_mask,
         &weights,
-        &adapter,
+        registry.layer_adapter(0)?,
         &config,
     )?;
     loss.backward();
 
-    let base_tensors: BTreeMap<String, Tensor> = adapter
+    let base_tensors: BTreeMap<String, Tensor> = registry
         .trainable_tensors()
         .into_iter()
         .map(|(name, tensor)| (name, tensor_snapshot(&tensor)))
         .collect();
     let mut tensor_summaries = Vec::new();
-    for (name, mut tensor) in adapter.trainable_tensors() {
+    for (name, mut tensor) in registry.trainable_tensors() {
         let grad = tensor.grad();
         let grad_defined = grad.defined();
         let grad_norm = if grad_defined {
@@ -814,7 +853,7 @@ pub fn qwen_lora_sft_smoke(
         &sample.input_ids,
         &sample.target_mask,
         &weights,
-        &adapter,
+        registry.layer_adapter(0)?,
         &config,
     )?
     .double_value(&[]);
@@ -824,13 +863,13 @@ pub fn qwen_lora_sft_smoke(
         );
     }
 
-    adapter.save(adapter_output)?;
-    let reloaded = QwenAttentionLoraAdapter::load(adapter_output)?;
+    registry.save(adapter_output)?;
+    let reloaded = QwenLoraRegistry::load(adapter_output)?;
     let reloaded_loss = qwen_attention_lora_sft_loss(
         &sample.input_ids,
         &sample.target_mask,
         &weights,
-        &reloaded,
+        reloaded.layer_adapter(0)?,
         &config,
     )?
     .double_value(&[]);
@@ -844,6 +883,8 @@ pub fn qwen_lora_sft_smoke(
     let summary = QwenLoraSftSmokeSummary {
         model_path: model_path.display().to_string(),
         adapter_output: adapter_output.display().to_string(),
+        target_layers: lora_config.target_layers.clone(),
+        target_modules: lora_config.target_module_names(),
         prompt_tokens: sample.prompt_tokens,
         response_tokens: sample.response_tokens,
         sequence_tokens: sample.input_ids.size()[1] as usize,
@@ -1332,6 +1373,215 @@ struct QwenAttentionLoraAdapter {
     alpha: f64,
 }
 
+impl QwenLoraTargetModule {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::QProj => "q_proj",
+            Self::VProj => "v_proj",
+        }
+    }
+}
+
+impl QwenLoraConfig {
+    fn layer0_qv(rank: i64, alpha: f64) -> Result<Self> {
+        if rank <= 0 {
+            bail!("rank must be positive");
+        }
+        if alpha <= 0.0 {
+            bail!("alpha must be positive");
+        }
+        if alpha.fract() != 0.0 || alpha > i64::MAX as f64 {
+            bail!("alpha must be representable as an integer for safetensors metadata");
+        }
+        Ok(Self {
+            target_layers: vec![0],
+            target_modules: vec![QwenLoraTargetModule::QProj, QwenLoraTargetModule::VProj],
+            rank,
+            alpha: alpha as i64,
+        })
+    }
+
+    fn alpha_f64(&self) -> f64 {
+        self.alpha as f64
+    }
+
+    fn target_module_names(&self) -> Vec<String> {
+        self.target_modules
+            .iter()
+            .map(|module| module.as_str().to_string())
+            .collect()
+    }
+
+    fn includes(&self, module: QwenLoraTargetModule) -> bool {
+        self.target_modules.contains(&module)
+    }
+}
+
+impl QwenLoraRegistry {
+    fn zeros(weights: &BTreeMap<String, Tensor>, config: &QwenLoraConfig) -> Result<Self> {
+        Self::build(weights, config, false, false)
+    }
+
+    fn deterministic(
+        weights: &BTreeMap<String, Tensor>,
+        config: &QwenLoraConfig,
+        trainable: bool,
+    ) -> Result<Self> {
+        Self::build(weights, config, true, trainable)
+    }
+
+    fn build(
+        weights: &BTreeMap<String, Tensor>,
+        config: &QwenLoraConfig,
+        deterministic: bool,
+        trainable: bool,
+    ) -> Result<Self> {
+        if !config.includes(QwenLoraTargetModule::QProj)
+            || !config.includes(QwenLoraTargetModule::VProj)
+        {
+            bail!("current Qwen attention LoRA registry requires q_proj and v_proj targets");
+        }
+        let mut adapters = BTreeMap::new();
+        for layer_index in &config.target_layers {
+            let layer = QwenLayerWeights::load(weights, *layer_index)?;
+            let adapter = if deterministic {
+                if trainable {
+                    QwenAttentionLoraAdapter::deterministic_trainable(
+                        layer.q_proj.size()[1],
+                        layer.q_proj.size()[0],
+                        layer.v_proj.size()[0],
+                        config.rank,
+                        config.alpha_f64(),
+                    )
+                } else {
+                    QwenAttentionLoraAdapter::deterministic(
+                        layer.q_proj.size()[1],
+                        layer.q_proj.size()[0],
+                        layer.v_proj.size()[0],
+                        config.rank,
+                        config.alpha_f64(),
+                    )
+                }
+            } else {
+                QwenAttentionLoraAdapter::zeros(
+                    layer.q_proj.size()[1],
+                    layer.q_proj.size()[0],
+                    layer.v_proj.size()[0],
+                    config.rank,
+                    config.alpha_f64(),
+                )
+            };
+            adapters.insert(*layer_index, adapter);
+        }
+        Ok(Self {
+            config: config.clone(),
+            adapters,
+        })
+    }
+
+    fn layer_adapter(&self, layer_index: usize) -> Result<&QwenAttentionLoraAdapter> {
+        self.adapters
+            .get(&layer_index)
+            .ok_or_else(|| anyhow!("missing LoRA adapter for layer {layer_index}"))
+    }
+
+    fn trainable_tensor_names(&self) -> Vec<String> {
+        self.trainable_tensors()
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect()
+    }
+
+    fn trainable_tensors(&self) -> Vec<(String, Tensor)> {
+        self.adapters
+            .iter()
+            .flat_map(|(layer_index, adapter)| adapter.trainable_tensors(*layer_index))
+            .collect()
+    }
+
+    fn save(&self, path: &Path) -> Result<()> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create {}", parent.display()))?;
+        }
+        let mut entries: Vec<(String, Tensor)> = Vec::new();
+        entries.push((
+            "config.rank".to_string(),
+            Tensor::from_slice(&[self.config.rank]),
+        ));
+        entries.push((
+            "config.alpha".to_string(),
+            Tensor::from_slice(&[self.config.alpha]),
+        ));
+        let layers: Vec<i64> = self
+            .config
+            .target_layers
+            .iter()
+            .map(|layer| *layer as i64)
+            .collect();
+        entries.push((
+            "config.target_layers".to_string(),
+            Tensor::from_slice(&layers),
+        ));
+        let modules: Vec<i64> = self
+            .config
+            .target_modules
+            .iter()
+            .map(|module| match module {
+                QwenLoraTargetModule::QProj => 0,
+                QwenLoraTargetModule::VProj => 1,
+            })
+            .collect();
+        entries.push((
+            "config.target_modules".to_string(),
+            Tensor::from_slice(&modules),
+        ));
+        for (layer_index, adapter) in &self.adapters {
+            entries.extend(adapter.safetensor_entries(*layer_index));
+        }
+        let refs: Vec<(&str, &Tensor)> = entries
+            .iter()
+            .map(|(name, tensor)| (name.as_str(), tensor))
+            .collect();
+        Tensor::write_safetensors(&refs, path)
+            .with_context(|| format!("failed to write {}", path.display()))
+    }
+
+    fn load(path: &Path) -> Result<Self> {
+        let tensors = read_safetensors_map(path)?;
+        let rank = tensor(&tensors, "config.rank")?.int64_value(&[0]);
+        let alpha = tensor(&tensors, "config.alpha")?.int64_value(&[0]);
+        let target_layers: Vec<usize> =
+            Vec::<i64>::try_from(tensor(&tensors, "config.target_layers")?)?
+                .into_iter()
+                .map(|layer| layer as usize)
+                .collect();
+        let target_modules: Vec<QwenLoraTargetModule> =
+            Vec::<i64>::try_from(tensor(&tensors, "config.target_modules")?)?
+                .into_iter()
+                .map(|module| match module {
+                    0 => Ok(QwenLoraTargetModule::QProj),
+                    1 => Ok(QwenLoraTargetModule::VProj),
+                    other => Err(anyhow!("unknown LoRA target module id {other}")),
+                })
+                .collect::<Result<Vec<_>>>()?;
+        let config = QwenLoraConfig {
+            target_layers,
+            target_modules,
+            rank,
+            alpha,
+        };
+        let mut adapters = BTreeMap::new();
+        for layer_index in &config.target_layers {
+            adapters.insert(
+                *layer_index,
+                QwenAttentionLoraAdapter::load_from_tensors(&tensors, *layer_index, &config)?,
+            );
+        }
+        Ok(Self { config, adapters })
+    }
+}
+
 impl QwenAttentionLoraAdapter {
     fn zeros(
         in_features: i64,
@@ -1386,6 +1636,7 @@ impl QwenAttentionLoraAdapter {
         adapter
     }
 
+    #[cfg(test)]
     fn save(&self, path: &Path) -> Result<()> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)
@@ -1407,6 +1658,7 @@ impl QwenAttentionLoraAdapter {
         .with_context(|| format!("failed to write {}", path.display()))
     }
 
+    #[cfg(test)]
     fn load(path: &Path) -> Result<Self> {
         let tensors = read_safetensors_map(path)?;
         let q_a = tensor(&tensors, "q_proj.lora_a")?.to_kind(Kind::Float);
@@ -1425,33 +1677,43 @@ impl QwenAttentionLoraAdapter {
         })
     }
 
-    fn trainable_tensor_names(&self) -> Vec<String> {
+    fn load_from_tensors(
+        tensors: &BTreeMap<String, Tensor>,
+        layer_index: usize,
+        config: &QwenLoraConfig,
+    ) -> Result<Self> {
+        let prefix = format!("model.layers.{layer_index}.self_attn");
+        let q_a = tensor(tensors, &format!("{prefix}.q_proj.lora_a"))?.to_kind(Kind::Float);
+        let q_b = tensor(tensors, &format!("{prefix}.q_proj.lora_b"))?.to_kind(Kind::Float);
+        let v_a = tensor(tensors, &format!("{prefix}.v_proj.lora_a"))?.to_kind(Kind::Float);
+        let v_b = tensor(tensors, &format!("{prefix}.v_proj.lora_b"))?.to_kind(Kind::Float);
+        Ok(Self {
+            q_a,
+            q_b,
+            v_a,
+            v_b,
+            rank: config.rank,
+            alpha: config.alpha_f64(),
+        })
+    }
+
+    fn safetensor_entries(&self, layer_index: usize) -> Vec<(String, Tensor)> {
+        let prefix = format!("model.layers.{layer_index}.self_attn");
         vec![
-            "model.layers.0.self_attn.q_proj.lora_a".to_string(),
-            "model.layers.0.self_attn.q_proj.lora_b".to_string(),
-            "model.layers.0.self_attn.v_proj.lora_a".to_string(),
-            "model.layers.0.self_attn.v_proj.lora_b".to_string(),
+            (format!("{prefix}.q_proj.lora_a"), self.q_a.shallow_clone()),
+            (format!("{prefix}.q_proj.lora_b"), self.q_b.shallow_clone()),
+            (format!("{prefix}.v_proj.lora_a"), self.v_a.shallow_clone()),
+            (format!("{prefix}.v_proj.lora_b"), self.v_b.shallow_clone()),
         ]
     }
 
-    fn trainable_tensors(&self) -> Vec<(String, Tensor)> {
+    fn trainable_tensors(&self, layer_index: usize) -> Vec<(String, Tensor)> {
+        let prefix = format!("model.layers.{layer_index}.self_attn");
         vec![
-            (
-                "model.layers.0.self_attn.q_proj.lora_a".to_string(),
-                self.q_a.shallow_clone(),
-            ),
-            (
-                "model.layers.0.self_attn.q_proj.lora_b".to_string(),
-                self.q_b.shallow_clone(),
-            ),
-            (
-                "model.layers.0.self_attn.v_proj.lora_a".to_string(),
-                self.v_a.shallow_clone(),
-            ),
-            (
-                "model.layers.0.self_attn.v_proj.lora_b".to_string(),
-                self.v_b.shallow_clone(),
-            ),
+            (format!("{prefix}.q_proj.lora_a"), self.q_a.shallow_clone()),
+            (format!("{prefix}.q_proj.lora_b"), self.q_b.shallow_clone()),
+            (format!("{prefix}.v_proj.lora_a"), self.v_a.shallow_clone()),
+            (format!("{prefix}.v_proj.lora_b"), self.v_b.shallow_clone()),
         ]
     }
 
@@ -2450,7 +2712,7 @@ mod tests {
             .double_value(&[]);
         let loss = qwen_attention_lora_mse_loss(&input, &target, &layer, &adapter, &config);
         loss.backward();
-        for (_, mut tensor) in adapter.trainable_tensors() {
+        for (_, mut tensor) in adapter.trainable_tensors(0) {
             let grad = tensor.grad();
             assert!(grad.defined());
             let _ = no_grad(|| tensor.f_sub_(&(&grad * 1.0))).expect("update should apply");
@@ -2466,6 +2728,68 @@ mod tests {
             qwen_attention_lora_mse_loss(&input, &target, &layer, &reloaded, &config)
                 .double_value(&[]);
         assert!((final_loss - reloaded_loss).abs() < 1e-8);
+    }
+
+    #[test]
+    fn qwen_lora_registry_roundtrips_configured_layer_targets() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let adapter_output = temp.path().join("adapter.safetensors");
+        let weights = tiny_qwen_weights();
+        let config = QwenLoraConfig::layer0_qv(2, 8.0).expect("config should build");
+        let registry = QwenLoraRegistry::deterministic(&weights, &config, true)
+            .expect("registry should build");
+
+        assert_eq!(registry.config.target_layers, vec![0]);
+        assert_eq!(
+            registry.config.target_modules,
+            vec![QwenLoraTargetModule::QProj, QwenLoraTargetModule::VProj]
+        );
+        assert_eq!(
+            registry.trainable_tensor_names(),
+            vec![
+                "model.layers.0.self_attn.q_proj.lora_a".to_string(),
+                "model.layers.0.self_attn.q_proj.lora_b".to_string(),
+                "model.layers.0.self_attn.v_proj.lora_a".to_string(),
+                "model.layers.0.self_attn.v_proj.lora_b".to_string(),
+            ]
+        );
+
+        registry
+            .save(&adapter_output)
+            .expect("registry should save");
+        let reloaded = QwenLoraRegistry::load(&adapter_output).expect("registry should reload");
+
+        assert_eq!(reloaded.config, config);
+        assert!(
+            diff_stats(
+                &reloaded
+                    .layer_adapter(0)
+                    .expect("layer adapter")
+                    .q_delta(Device::Cpu),
+                &registry
+                    .layer_adapter(0)
+                    .expect("layer adapter")
+                    .q_delta(Device::Cpu),
+            )
+            .expect("q delta diff should compute")
+            .max_abs
+                < 1e-8
+        );
+        assert!(
+            diff_stats(
+                &reloaded
+                    .layer_adapter(0)
+                    .expect("layer adapter")
+                    .v_delta(Device::Cpu),
+                &registry
+                    .layer_adapter(0)
+                    .expect("layer adapter")
+                    .v_delta(Device::Cpu),
+            )
+            .expect("v delta diff should compute")
+            .max_abs
+                < 1e-8
+        );
     }
 
     #[test]
