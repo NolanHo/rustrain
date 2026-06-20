@@ -79,7 +79,9 @@ struct QwenSamplingSmokeSummary {
     top_p: f64,
     seed: u64,
     generated_ids: Vec<i64>,
+    cached_ids: Vec<i64>,
     new_token_ids: Vec<i64>,
+    cache_match: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -416,8 +418,27 @@ pub fn qwen_sampling_smoke(
         top_p,
         seed,
     )?;
+    let cached = qwen_sample_generate_with_cache(
+        &input_ids,
+        &weights,
+        &config,
+        max_new_tokens,
+        temperature,
+        top_k,
+        top_p,
+        seed,
+    )?;
     let generated_ids: Vec<i64> =
         Vec::<i64>::try_from(generated.reshape([-1]).to_device(Device::Cpu))?;
+    let cached_ids: Vec<i64> = Vec::<i64>::try_from(cached.reshape([-1]).to_device(Device::Cpu))?;
+    let cache_match = generated_ids == cached_ids;
+    if !cache_match {
+        bail!(
+            "cached sampling diverged from full-context sampling: full={:?}, cached={:?}",
+            generated_ids,
+            cached_ids
+        );
+    }
     let new_token_ids = generated_ids[prompt_len..].to_vec();
     if new_token_ids.len() != max_new_tokens {
         bail!(
@@ -436,7 +457,9 @@ pub fn qwen_sampling_smoke(
         top_p,
         seed,
         generated_ids,
+        cached_ids,
         new_token_ids,
+        cache_match,
     };
     println!("{}", serde_json::to_string_pretty(&summary)?);
 
@@ -1607,6 +1630,45 @@ pub fn qwen_sample_generate(
                 .reshape([1, 1]);
         generated = Tensor::cat(&[&generated, &next_token], 1);
     }
+    Ok(generated)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn qwen_sample_generate_with_cache(
+    input_ids: &Tensor,
+    weights: &BTreeMap<String, Tensor>,
+    config: &QwenRuntimeConfig,
+    max_new_tokens: usize,
+    temperature: f64,
+    top_k: usize,
+    top_p: f64,
+    seed: u64,
+) -> Result<Tensor> {
+    let mut generated = input_ids.shallow_clone();
+    let mut rng = StdRng::seed_from_u64(seed);
+    let (logits, mut cache) = qwen_forward_with_cache(input_ids, weights, config, None)?;
+    let mut next_token =
+        sample_token_from_logits(&logits.i((0, -1)), temperature, top_k, top_p, &mut rng)?
+            .reshape([1, 1]);
+
+    for step in 0..max_new_tokens {
+        generated = Tensor::cat(&[&generated, &next_token], 1);
+        if step + 1 == max_new_tokens {
+            break;
+        }
+        let (decode_logits, updated_cache) =
+            qwen_forward_with_cache(&next_token, weights, config, Some(cache))?;
+        cache = updated_cache;
+        next_token = sample_token_from_logits(
+            &decode_logits.i((0, -1)),
+            temperature,
+            top_k,
+            top_p,
+            &mut rng,
+        )?
+        .reshape([1, 1]);
+    }
+
     Ok(generated)
 }
 
