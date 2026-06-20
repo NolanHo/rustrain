@@ -229,6 +229,7 @@ struct QwenSessionDpRankSummary {
     world_size: usize,
     local_batch_size: usize,
     tensor_count: usize,
+    steps: usize,
     learning_rate: f64,
     max_grad_delta: f32,
     loss_delta: f64,
@@ -237,6 +238,7 @@ struct QwenSessionDpRankSummary {
     global_loss: f64,
     global_post_update_loss: f64,
     global_loss_improved: bool,
+    global_step_losses: Vec<f64>,
     expected_loss: f64,
     checkpoint_written: bool,
     checkpoint_path: String,
@@ -252,9 +254,11 @@ struct QwenSessionDpCheckpointManifest {
     max_grad_delta: f32,
     expected_loss: f64,
     dtype: String,
+    steps: usize,
     learning_rate: f64,
     post_update_loss: f64,
     global_post_update_loss: f64,
+    global_step_losses: Vec<f64>,
     trainable_tensors: Vec<String>,
 }
 
@@ -1529,6 +1533,7 @@ pub fn qwen_session_dp_rank_smoke(
     model_path: &Path,
     output_dir: PathBuf,
     dtype: QwenComputeDType,
+    steps: usize,
     learning_rate: f64,
 ) -> Result<()> {
     let rank = parse_env_usize("RANK")?;
@@ -1539,6 +1544,9 @@ pub fn qwen_session_dp_rank_smoke(
     }
     if rank >= world_size {
         bail!("rank {rank} must be smaller than world_size {world_size}");
+    }
+    if steps == 0 {
+        bail!("Qwen session DP smoke requires at least one step");
     }
     if !learning_rate.is_finite() || learning_rate <= 0.0 {
         bail!("Qwen session DP smoke requires a positive finite learning rate");
@@ -1630,28 +1638,44 @@ pub fn qwen_session_dp_rank_smoke(
         bail!("Qwen session DP gradient mismatch: rank={rank}, max_grad_delta={max_grad_delta}");
     }
 
-    println!("qwen session DP rank {rank}: reducing full gradients");
-    let averaged_grads = local_session.all_reduce_average_grads(
-        &output_dir.join("qwen-session-dp-full-gradient"),
-        world_size,
-    )?;
-    let trainable_summaries = local_session.apply_sgd_step(&averaged_grads, learning_rate)?;
-    let post_update_loss = local_session.loss_value()?;
-    wait_for_rank_barrier(
-        &output_dir.join("qwen-session-dp-post-update-loss-ready"),
-        rank,
-        world_size,
-        Duration::from_secs(300),
-    )?;
-    let reduced_post_update_loss = nccl_smoke::all_reduce_f32_for_launch(
-        &output_dir.join("qwen-session-dp-post-update-loss"),
-        &[post_update_loss as f32],
-    )?[0];
-    let global_post_update_loss = reduced_post_update_loss as f64 / world_size as f64;
+    let mut global_step_losses = vec![global_loss];
+    let mut post_update_loss = local_loss;
+    let mut trainable_summaries = Vec::new();
+    for step in 0..steps {
+        if step > 0 {
+            println!("qwen session DP rank {rank}: running backward for step {step}");
+            local_session.loss_and_backward()?;
+        }
+        println!("qwen session DP rank {rank}: reducing full gradients for step {step}");
+        let averaged_grads = local_session.all_reduce_average_grads(
+            &output_dir.join(format!("qwen-session-dp-full-gradient-step-{step}")),
+            world_size,
+        )?;
+        let artifacts =
+            local_session.apply_adamw_step(&averaged_grads, learning_rate, (step + 1) as i32)?;
+        trainable_summaries = artifacts.tensor_summaries;
+        post_update_loss = local_session.loss_value()?;
+        wait_for_rank_barrier(
+            &output_dir.join(format!(
+                "qwen-session-dp-post-update-loss-ready-step-{step}"
+            )),
+            rank,
+            world_size,
+            Duration::from_secs(300),
+        )?;
+        let reduced_post_update_loss = nccl_smoke::all_reduce_f32_for_launch(
+            &output_dir.join(format!("qwen-session-dp-post-update-loss-step-{step}")),
+            &[post_update_loss as f32],
+        )?[0];
+        global_step_losses.push(reduced_post_update_loss as f64 / world_size as f64);
+    }
+    let global_post_update_loss = *global_step_losses
+        .last()
+        .ok_or_else(|| anyhow!("missing Qwen session DP post-update loss"))?;
     let global_loss_improved = global_post_update_loss < global_loss;
     if !global_loss_improved {
         bail!(
-            "Qwen session DP update did not reduce global loss: rank={rank}, global_loss={global_loss}, global_post_update_loss={global_post_update_loss}"
+            "Qwen session DP AdamW update did not reduce global loss: rank={rank}, global_loss={global_loss}, global_post_update_loss={global_post_update_loss}"
         );
     }
 
@@ -1666,9 +1690,11 @@ pub fn qwen_session_dp_rank_smoke(
             max_grad_delta,
             expected_loss,
             dtype: dtype.label().to_string(),
+            steps,
             learning_rate,
             post_update_loss,
             global_post_update_loss,
+            global_step_losses: global_step_losses.clone(),
             trainable_tensors: trainable_tensors.clone(),
         };
         fs::write(
@@ -1686,6 +1712,7 @@ pub fn qwen_session_dp_rank_smoke(
         world_size,
         local_batch_size: local_session.input_ids.size()[0] as usize,
         tensor_count: local_grads.len(),
+        steps,
         learning_rate,
         max_grad_delta,
         loss_delta,
@@ -1694,6 +1721,7 @@ pub fn qwen_session_dp_rank_smoke(
         global_loss,
         global_post_update_loss,
         global_loss_improved,
+        global_step_losses,
         expected_loss,
         checkpoint_written,
         checkpoint_path: checkpoint_path.display().to_string(),
@@ -1788,25 +1816,44 @@ impl QwenTrainableRegistry {
         learning_rate: f64,
         step: i32,
     ) -> Result<QwenTrainStepArtifacts> {
+        let grads = self.grad_entries()?;
+        self.adamw_step_with_grads(weights, &grads, learning_rate, step)
+    }
+
+    fn adamw_step_with_grads(
+        &mut self,
+        weights: &mut BTreeMap<String, Tensor>,
+        averaged_grads: &[(String, Tensor)],
+        learning_rate: f64,
+        step: i32,
+    ) -> Result<QwenTrainStepArtifacts> {
+        if averaged_grads.len() != self.parameters.len() {
+            bail!(
+                "averaged gradient count mismatch: got {}, expected {}",
+                averaged_grads.len(),
+                self.parameters.len()
+            );
+        }
         let mut tensor_summaries = Vec::with_capacity(self.parameters.len());
         let mut manifest_tensors = Vec::with_capacity(self.parameters.len());
         let mut delta_entries = Vec::with_capacity(self.parameters.len());
         let mut optimizer_entries = Vec::with_capacity(self.parameters.len() * 2);
 
-        for parameter in &mut self.parameters {
-            let grad = parameter.tensor.grad();
-            let grad_defined = grad.defined();
-            let grad_norm = if grad_defined {
-                grad.norm().double_value(&[])
-            } else {
-                0.0
-            };
-            if !grad_defined || grad_norm <= 0.0 {
+        for (parameter, (grad_name, grad)) in self.parameters.iter_mut().zip(averaged_grads.iter())
+        {
+            if &parameter.name != grad_name {
                 bail!(
-                    "trainable tensor {} did not receive a gradient",
+                    "averaged gradient order mismatch: got {}, expected {}",
+                    grad_name,
                     parameter.name
                 );
             }
+            let grad = grad.to_device(parameter.tensor.device());
+            let grad_norm = grad.norm().double_value(&[]);
+            if grad_norm <= 0.0 {
+                bail!("averaged gradient for {} has zero norm", parameter.name);
+            }
+            let grad_defined = true;
 
             let adam_state = adamw_next_state(parameter.adam.as_ref(), &grad, 0.9, 0.999);
             let update = adamw_update(&adam_state, learning_rate, 0.9, 0.999, step, 1e-8);
@@ -1873,50 +1920,6 @@ impl QwenTrainableRegistry {
             .iter()
             .map(|parameter| parameter.name.clone())
             .collect()
-    }
-
-    fn apply_sgd_step(
-        &mut self,
-        weights: &mut BTreeMap<String, Tensor>,
-        averaged_grads: &[(String, Tensor)],
-        learning_rate: f64,
-    ) -> Result<Vec<TrainableTensorSummary>> {
-        if averaged_grads.len() != self.parameters.len() {
-            bail!(
-                "averaged gradient count mismatch: got {}, expected {}",
-                averaged_grads.len(),
-                self.parameters.len()
-            );
-        }
-        let mut summaries = Vec::with_capacity(self.parameters.len());
-        for (parameter, (grad_name, grad)) in self.parameters.iter_mut().zip(averaged_grads.iter())
-        {
-            if &parameter.name != grad_name {
-                bail!(
-                    "averaged gradient order mismatch: got {}, expected {}",
-                    grad_name,
-                    parameter.name
-                );
-            }
-            let grad = grad.to_device(parameter.tensor.device());
-            let grad_norm = grad.norm().double_value(&[]);
-            if grad_norm <= 0.0 {
-                bail!("averaged gradient for {} has zero norm", parameter.name);
-            }
-            let update = &grad * learning_rate;
-            let _ = no_grad(|| parameter.tensor.f_sub_(&update))?;
-            weights.insert(parameter.name.clone(), parameter.tensor.shallow_clone());
-            let delta_norm = (&parameter.tensor - &parameter.base)
-                .norm()
-                .double_value(&[]);
-            summaries.push(TrainableTensorSummary {
-                name: parameter.name.clone(),
-                grad_defined: true,
-                grad_norm,
-                delta_norm,
-            });
-        }
-        Ok(summaries)
     }
 
     fn apply_delta_checkpoint(
@@ -2097,13 +2100,14 @@ impl QwenTrainableSession {
         Ok(averaged)
     }
 
-    fn apply_sgd_step(
+    fn apply_adamw_step(
         &mut self,
         averaged_grads: &[(String, Tensor)],
         learning_rate: f64,
-    ) -> Result<Vec<TrainableTensorSummary>> {
+        step: i32,
+    ) -> Result<QwenTrainStepArtifacts> {
         self.registry
-            .apply_sgd_step(&mut self.weights, averaged_grads, learning_rate)
+            .adamw_step_with_grads(&mut self.weights, averaged_grads, learning_rate, step)
     }
 
     fn train_step(&mut self, learning_rate: f64, step: i32) -> Result<QwenTrainStepResult> {
