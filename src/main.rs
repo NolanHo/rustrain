@@ -146,6 +146,28 @@ enum Command {
         #[arg(long, default_value_t = 1e3)]
         learning_rate: f64,
     },
+    QwenLoraSftSmoke {
+        #[arg(
+            long,
+            default_value = "/vePFS-Mindverse/share/huggingface/Qwen2.5-0.5B-Instruct"
+        )]
+        model_path: PathBuf,
+        #[arg(
+            long,
+            default_value = "/tmp/rustrain-qwen-lora-sft-adapter.safetensors"
+        )]
+        adapter_output: PathBuf,
+        #[arg(long, default_value = "Reply with the project name.")]
+        instruction: String,
+        #[arg(long, default_value = "rustrain")]
+        response: String,
+        #[arg(long, default_value_t = 4)]
+        rank: i64,
+        #[arg(long, default_value_t = 8.0)]
+        alpha: f64,
+        #[arg(long, default_value_t = 100.0)]
+        learning_rate: f64,
+    },
     QwenTiedHeadTrainSmoke {
         #[arg(
             long,
@@ -274,6 +296,23 @@ fn main() -> Result<()> {
             &model_path,
             &fixture,
             &adapter_output,
+            rank,
+            alpha,
+            learning_rate,
+        ),
+        Command::QwenLoraSftSmoke {
+            model_path,
+            adapter_output,
+            instruction,
+            response,
+            rank,
+            alpha,
+            learning_rate,
+        } => qwen_module::qwen_lora_sft_smoke(
+            &model_path,
+            &adapter_output,
+            &instruction,
+            &response,
             rank,
             alpha,
             learning_rate,

@@ -4,6 +4,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use rand::{Rng, SeedableRng, rngs::StdRng};
 use serde::{Deserialize, Serialize};
 use tch::{Device, IndexOp, Kind, Reduction, Tensor, no_grad};
+use tokenizers::Tokenizer;
 
 #[derive(Debug, Serialize)]
 pub struct DiffStats {
@@ -123,6 +124,25 @@ struct QwenLoraTrainSmokeSummary {
 }
 
 #[derive(Debug, Serialize)]
+struct QwenLoraSftSmokeSummary {
+    model_path: String,
+    adapter_output: String,
+    prompt_tokens: usize,
+    response_tokens: usize,
+    sequence_tokens: usize,
+    response_masked_positions: usize,
+    rank: i64,
+    alpha: f64,
+    learning_rate: f64,
+    initial_loss: f64,
+    final_loss: f64,
+    reloaded_loss: f64,
+    reload_delta: f64,
+    base_requires_grad: bool,
+    trainable_tensors: Vec<TrainableTensorSummary>,
+}
+
+#[derive(Debug, Serialize)]
 struct QwenTiedHeadTrainSummary {
     model_path: String,
     reference_fixture: String,
@@ -197,6 +217,14 @@ struct AdamSlotNames {
 struct AdamState {
     m: Tensor,
     v: Tensor,
+}
+
+struct QwenSftTokenSample {
+    input_ids: Tensor,
+    target_mask: Tensor,
+    prompt_tokens: usize,
+    response_tokens: usize,
+    masked_positions: usize,
 }
 
 pub fn qwen_module_parity(model_safetensors: &Path, fixture: &Path) -> Result<()> {
@@ -640,6 +668,145 @@ pub fn qwen_lora_train_smoke(
         model_path: model_path.display().to_string(),
         fixture: fixture.display().to_string(),
         adapter_output: adapter_output.display().to_string(),
+        rank,
+        alpha,
+        learning_rate,
+        initial_loss,
+        final_loss,
+        reloaded_loss,
+        reload_delta,
+        base_requires_grad,
+        trainable_tensors: tensor_summaries,
+    };
+    println!("{}", serde_json::to_string_pretty(&summary)?);
+
+    Ok(())
+}
+
+pub fn qwen_lora_sft_smoke(
+    model_path: &Path,
+    adapter_output: &Path,
+    instruction: &str,
+    response: &str,
+    rank: i64,
+    alpha: f64,
+    learning_rate: f64,
+) -> Result<()> {
+    if rank <= 0 {
+        bail!("rank must be positive");
+    }
+    if alpha <= 0.0 {
+        bail!("alpha must be positive");
+    }
+    if learning_rate <= 0.0 {
+        bail!("learning_rate must be positive");
+    }
+
+    let tokenizer = Tokenizer::from_file(model_path.join("tokenizer.json"))
+        .map_err(|error| anyhow!("failed to load tokenizer: {error}"))?;
+    let sample = qwen_sft_token_sample(&tokenizer, instruction, response)?;
+    let weights = read_safetensors_map(&model_path.join("model.safetensors"))?;
+    let config = read_runtime_config(&model_path.join("config.json"))?;
+    let layer0 = QwenLayerWeights::load(&weights, 0)?;
+    let adapter = QwenAttentionLoraAdapter::deterministic_trainable(
+        layer0.q_proj.size()[1],
+        layer0.q_proj.size()[0],
+        layer0.v_proj.size()[0],
+        rank,
+        alpha,
+    );
+    let base_requires_grad = layer0.q_proj.requires_grad()
+        || layer0.k_proj.requires_grad()
+        || layer0.v_proj.requires_grad()
+        || layer0.o_proj.requires_grad();
+
+    let initial_loss = qwen_attention_lora_sft_loss(
+        &sample.input_ids,
+        &sample.target_mask,
+        &weights,
+        &adapter,
+        &config,
+    )?
+    .double_value(&[]);
+    let loss = qwen_attention_lora_sft_loss(
+        &sample.input_ids,
+        &sample.target_mask,
+        &weights,
+        &adapter,
+        &config,
+    )?;
+    loss.backward();
+
+    let base_tensors: BTreeMap<String, Tensor> = adapter
+        .trainable_tensors()
+        .into_iter()
+        .map(|(name, tensor)| (name, tensor_snapshot(&tensor)))
+        .collect();
+    let mut tensor_summaries = Vec::new();
+    for (name, mut tensor) in adapter.trainable_tensors() {
+        let grad = tensor.grad();
+        let grad_defined = grad.defined();
+        let grad_norm = if grad_defined {
+            grad.norm().double_value(&[])
+        } else {
+            0.0
+        };
+        if !grad_defined || grad_norm <= 0.0 {
+            bail!("LoRA tensor {name} did not receive a gradient");
+        }
+        let _ = no_grad(|| tensor.f_sub_(&(&grad * learning_rate)))?;
+        let delta_norm = (&tensor
+            - base_tensors
+                .get(&name)
+                .ok_or_else(|| anyhow!("missing base LoRA tensor {name}"))?)
+        .norm()
+        .double_value(&[]);
+        tensor_summaries.push(TrainableTensorSummary {
+            name,
+            grad_defined,
+            grad_norm,
+            delta_norm,
+        });
+    }
+
+    let final_loss = qwen_attention_lora_sft_loss(
+        &sample.input_ids,
+        &sample.target_mask,
+        &weights,
+        &adapter,
+        &config,
+    )?
+    .double_value(&[]);
+    if final_loss >= initial_loss {
+        bail!(
+            "Qwen LoRA SFT smoke failed to reduce response-only loss: initial_loss={initial_loss}, final_loss={final_loss}"
+        );
+    }
+
+    adapter.save(adapter_output)?;
+    let reloaded = QwenAttentionLoraAdapter::load(adapter_output)?;
+    let reloaded_loss = qwen_attention_lora_sft_loss(
+        &sample.input_ids,
+        &sample.target_mask,
+        &weights,
+        &reloaded,
+        &config,
+    )?
+    .double_value(&[]);
+    let reload_delta = (final_loss - reloaded_loss).abs();
+    if reload_delta > 1e-7 {
+        bail!(
+            "Qwen LoRA SFT adapter reload loss parity failed: final_loss={final_loss}, reloaded_loss={reloaded_loss}, reload_delta={reload_delta}"
+        );
+    }
+
+    let summary = QwenLoraSftSmokeSummary {
+        model_path: model_path.display().to_string(),
+        adapter_output: adapter_output.display().to_string(),
+        prompt_tokens: sample.prompt_tokens,
+        response_tokens: sample.response_tokens,
+        sequence_tokens: sample.input_ids.size()[1] as usize,
+        response_masked_positions: sample.masked_positions,
         rank,
         alpha,
         learning_rate,
@@ -1590,6 +1757,96 @@ fn qwen_attention_lora_mse_loss(
     config: &QwenRuntimeConfig,
 ) -> Tensor {
     qwen_attention_with_lora(input, weights, adapter, config).mse_loss(target, Reduction::Mean)
+}
+
+fn qwen_sft_token_sample(
+    tokenizer: &Tokenizer,
+    instruction: &str,
+    response: &str,
+) -> Result<QwenSftTokenSample> {
+    let prompt = format!("Instruction:\n{instruction}\n\nResponse:\n");
+    let response = format!("{response}\n");
+    let prompt_encoding = tokenizer
+        .encode(prompt.as_str(), false)
+        .map_err(|error| anyhow!("failed to encode prompt: {error}"))?;
+    let response_encoding = tokenizer
+        .encode(response.as_str(), false)
+        .map_err(|error| anyhow!("failed to encode response: {error}"))?;
+    let prompt_tokens: Vec<i64> = prompt_encoding
+        .get_ids()
+        .iter()
+        .map(|token| i64::from(*token))
+        .collect();
+    let response_tokens: Vec<i64> = response_encoding
+        .get_ids()
+        .iter()
+        .map(|token| i64::from(*token))
+        .collect();
+    if prompt_tokens.is_empty() || response_tokens.is_empty() {
+        bail!("SFT prompt and response must both tokenize to at least one token");
+    }
+
+    let mut token_ids = prompt_tokens.clone();
+    token_ids.extend(response_tokens.iter().copied());
+    if token_ids.len() < 2 {
+        bail!("SFT sample must contain at least two tokens");
+    }
+    let target_len = token_ids.len() - 1;
+    let prompt_len = prompt_tokens.len();
+    let mask_values: Vec<f32> = (0..target_len)
+        .map(|target_index| {
+            if target_index + 1 >= prompt_len {
+                1.0
+            } else {
+                0.0
+            }
+        })
+        .collect();
+    let masked_positions = mask_values.iter().filter(|value| **value > 0.0).count();
+    if masked_positions == 0 {
+        bail!("SFT response-only mask is empty");
+    }
+
+    Ok(QwenSftTokenSample {
+        input_ids: Tensor::from_slice(&token_ids)
+            .to_kind(Kind::Int64)
+            .reshape([1, token_ids.len() as i64]),
+        target_mask: Tensor::from_slice(&mask_values).reshape([1, target_len as i64, 1]),
+        prompt_tokens: prompt_tokens.len(),
+        response_tokens: response_tokens.len(),
+        masked_positions,
+    })
+}
+
+fn qwen_attention_lora_sft_loss(
+    input_ids: &Tensor,
+    target_mask: &Tensor,
+    weights: &BTreeMap<String, Tensor>,
+    adapter: &QwenAttentionLoraAdapter,
+    config: &QwenRuntimeConfig,
+) -> Result<Tensor> {
+    let embed_tokens = tensor(weights, "model.embed_tokens.weight")?.to_kind(Kind::Float);
+    let layer0 = QwenLayerWeights::load(weights, 0)?;
+    let hidden = Tensor::embedding(&embed_tokens, input_ids, -1, false, false);
+    let attention_input = rms_norm(&hidden, &layer0.input_norm, config.rms_norm_eps);
+    let base_output = qwen_attention(
+        &attention_input,
+        &layer0.q_proj,
+        &layer0.q_bias,
+        &layer0.k_proj,
+        &layer0.k_bias,
+        &layer0.v_proj,
+        &layer0.v_bias,
+        &layer0.o_proj,
+        config,
+    );
+    let target = lora_train_target(&base_output);
+    let adapted = qwen_attention_with_lora(&attention_input, &layer0, adapter, config);
+    let shifted_adapted = adapted.narrow(1, 0, input_ids.size()[1] - 1);
+    let shifted_target = target.narrow(1, 0, input_ids.size()[1] - 1);
+    let mask = target_mask.to_device(adapted.device());
+    let squared = (shifted_adapted - shifted_target).pow_tensor_scalar(2.0) * &mask;
+    Ok(squared.sum(Kind::Float) / mask.sum(Kind::Float))
 }
 
 fn lora_train_target(base_output: &Tensor) -> Tensor {
