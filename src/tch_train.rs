@@ -1,12 +1,16 @@
-use anyhow::{Result, anyhow};
+use std::{fs, path::PathBuf};
+
+use anyhow::{Context, Result, anyhow, bail};
 use tch::{
     Cuda, Device, Kind, Reduction, Tensor, nn,
-    nn::{Module, OptimizerConfig},
+    nn::{Init, Module, OptimizerConfig},
+    no_grad,
 };
 use tracing::info;
 
 use crate::{
     metrics::memory_rss_mb,
+    nccl_smoke,
     runtime::{Config, DType, Device as RuntimeDevice, LrScheduler},
 };
 
@@ -27,6 +31,20 @@ pub struct TchTrainSmokeSummary {
 struct TchCudaProbeSummary {
     cuda_available: bool,
     device_count: i64,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct TchDpGradientRankSummary {
+    rank: usize,
+    world_size: usize,
+    local_rank: usize,
+    local_loss: f64,
+    global_loss: f64,
+    expected_loss: f64,
+    loss_delta: f64,
+    reduced_grad: Vec<f32>,
+    expected_grad: Vec<f32>,
+    grad_max_delta: f32,
 }
 
 pub fn probe_tch_cuda() -> Result<()> {
@@ -143,6 +161,64 @@ pub fn train_tch_tiny_lm(config: &Config) -> Result<TchTrainSmokeSummary> {
     })
 }
 
+pub fn run_tch_dp_gradient_rank_smoke(output_dir: PathBuf) -> Result<()> {
+    let rank = parse_env_usize("RANK")?;
+    let local_rank = parse_env_usize("LOCAL_RANK")?;
+    let world_size = parse_env_usize("WORLD_SIZE")?;
+    if world_size != 2 {
+        bail!("tch DP gradient smoke expects WORLD_SIZE=2");
+    }
+    if rank >= world_size {
+        bail!("rank {rank} must be smaller than world_size {world_size}");
+    }
+    fs::create_dir_all(&output_dir)
+        .with_context(|| format!("failed to create {}", output_dir.display()))?;
+
+    let device = Device::Cuda(local_rank);
+    let local = tch_dp_gradient_for_rank(rank, world_size, device)?;
+    let reduced = nccl_smoke::all_reduce_f32_for_launch(&output_dir, &local.grad)?;
+    let averaged_grad = reduced
+        .iter()
+        .map(|value| *value / world_size as f32)
+        .collect::<Vec<_>>();
+    let reduced_loss =
+        nccl_smoke::all_reduce_f32_for_launch(&output_dir.join("loss"), &[local.loss as f32])?[0];
+    let global_loss = reduced_loss as f64 / world_size as f64;
+
+    let expected = tch_dp_gradient_for_rank(0, 1, device)?;
+    let grad_max_delta = averaged_grad
+        .iter()
+        .copied()
+        .zip(expected.grad.iter().copied())
+        .map(|(actual, expected)| (actual - expected).abs())
+        .fold(0.0_f32, f32::max);
+    let loss_delta = (global_loss - expected.loss).abs();
+    if grad_max_delta > 1e-5 || loss_delta > 1e-5 {
+        bail!(
+            "tch DP gradient mismatch: rank={rank}, grad_max_delta={grad_max_delta}, loss_delta={loss_delta}"
+        );
+    }
+
+    let summary = TchDpGradientRankSummary {
+        rank,
+        world_size,
+        local_rank,
+        local_loss: local.loss,
+        global_loss,
+        expected_loss: expected.loss,
+        loss_delta,
+        reduced_grad: averaged_grad,
+        expected_grad: expected.grad,
+        grad_max_delta,
+    };
+    let summary_path = output_dir.join(format!("tch-dp-gradient-rank-{rank}.json"));
+    fs::write(&summary_path, serde_json::to_string_pretty(&summary)?)
+        .with_context(|| format!("failed to write {}", summary_path.display()))?;
+    println!("{}", serde_json::to_string_pretty(&summary)?);
+
+    Ok(())
+}
+
 fn learning_rate_for_step(config: &Config, step: u64) -> f64 {
     match config.train.lr_scheduler {
         LrScheduler::Constant => config.train.learning_rate as f64,
@@ -152,6 +228,92 @@ fn learning_rate_for_step(config: &Config, step: u64) -> f64 {
             config.train.learning_rate as f64 * (1.0 - progress)
         }
     }
+}
+
+struct TchDpGradient {
+    loss: f64,
+    grad: Vec<f32>,
+}
+
+fn tch_dp_gradient_for_rank(
+    rank: usize,
+    world_size: usize,
+    device: Device,
+) -> Result<TchDpGradient> {
+    let vs = nn::VarStore::new(device);
+    let root = vs.root();
+    let mut weight = root.var("weight", &[2, 2], Init::Const(0.0));
+    let _ = no_grad(|| {
+        weight.f_copy_(
+            &Tensor::from_slice(&[0.2_f32, -0.1, 0.4, 0.3])
+                .reshape([2, 2])
+                .to_device(device),
+        )
+    })
+    .context("failed to initialize DP smoke weight")?;
+
+    let (input, target) = tch_dp_batch_for_rank(rank, world_size, device)?;
+    let logits = input.matmul(&weight);
+    let loss = logits.mse_loss(&target, Reduction::Mean);
+    let loss_value = loss.double_value(&[]);
+    loss.backward();
+    let grad = weight.grad();
+    if !grad.defined() {
+        bail!("tch DP smoke weight gradient is not defined");
+    }
+    let grad = tensor_to_f32_vec(&grad)?;
+
+    Ok(TchDpGradient {
+        loss: loss_value,
+        grad,
+    })
+}
+
+fn tch_dp_batch_for_rank(
+    rank: usize,
+    world_size: usize,
+    device: Device,
+) -> Result<(Tensor, Tensor)> {
+    const INPUTS: [[f32; 2]; 4] = [[1.0, 0.0], [0.0, 1.0], [1.0, 1.0], [2.0, -1.0]];
+    const TARGETS: [[f32; 2]; 4] = [[0.5, -0.2], [0.1, 0.3], [0.7, 0.0], [1.0, -0.5]];
+
+    let mut input_values = Vec::new();
+    let mut target_values = Vec::new();
+    for (sample_index, (input, target)) in INPUTS.iter().zip(TARGETS).enumerate() {
+        if sample_index % world_size != rank {
+            continue;
+        }
+        input_values.extend_from_slice(input);
+        target_values.extend_from_slice(&target);
+    }
+    let sample_count = input_values.len() / 2;
+    if sample_count == 0 {
+        bail!("rank {rank} received no samples for world_size {world_size}");
+    }
+
+    let input = Tensor::from_slice(&input_values)
+        .reshape([sample_count as i64, 2])
+        .to_device(device);
+    let target = Tensor::from_slice(&target_values)
+        .reshape([sample_count as i64, 2])
+        .to_device(device);
+    Ok((input, target))
+}
+
+fn tensor_to_f32_vec(tensor: &Tensor) -> Result<Vec<f32>> {
+    let tensor = tensor
+        .to_device(Device::Cpu)
+        .to_kind(Kind::Float)
+        .reshape([-1]);
+    Vec::<f32>::try_from(&tensor)
+        .map_err(|error| anyhow!("failed to copy tensor to Vec<f32>: {error}"))
+}
+
+fn parse_env_usize(name: &str) -> Result<usize> {
+    std::env::var(name)
+        .with_context(|| format!("{name} is not set; run through rustrain launch"))?
+        .parse::<usize>()
+        .with_context(|| format!("{name} must be a usize"))
 }
 
 fn grad_norm(trainable_variables: &[Tensor]) -> f64 {
@@ -278,6 +440,28 @@ mod tests {
         assert_eq!(tch_compute_kind(&config), Kind::Half);
         config.train.dtype = DType::Bf16;
         assert_eq!(tch_compute_kind(&config), Kind::BFloat16);
+    }
+
+    #[test]
+    fn tch_dp_gradient_partitions_match_global_batch() {
+        let rank0 =
+            tch_dp_gradient_for_rank(0, 2, Device::Cpu).expect("rank0 gradient should compute");
+        let rank1 =
+            tch_dp_gradient_for_rank(1, 2, Device::Cpu).expect("rank1 gradient should compute");
+        let single =
+            tch_dp_gradient_for_rank(0, 1, Device::Cpu).expect("global gradient should compute");
+
+        let averaged_grad = rank0
+            .grad
+            .iter()
+            .zip(rank1.grad.iter())
+            .map(|(left, right)| (left + right) / 2.0)
+            .collect::<Vec<_>>();
+        for (actual, expected) in averaged_grad.into_iter().zip(single.grad) {
+            assert!((actual - expected).abs() < 1e-6);
+        }
+        let global_loss = (rank0.loss + rank1.loss) / 2.0;
+        assert!((global_loss - single.loss).abs() < 1e-6);
     }
 
     fn tiny_tch_config(device: RuntimeDevice) -> Config {

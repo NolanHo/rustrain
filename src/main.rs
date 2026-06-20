@@ -256,6 +256,11 @@ enum Command {
         #[arg(long)]
         output_dir: PathBuf,
     },
+    #[command(hide = true)]
+    TchDpGradientRankSmoke {
+        #[arg(long)]
+        output_dir: PathBuf,
+    },
 }
 
 fn main() -> Result<()> {
@@ -412,6 +417,9 @@ fn main() -> Result<()> {
         }
         Command::NcclDpGradientRankSmoke { output_dir } => {
             nccl_smoke::run_nccl_dp_gradient_rank(output_dir)
+        }
+        Command::TchDpGradientRankSmoke { output_dir } => {
+            tch_train::run_tch_dp_gradient_rank_smoke(output_dir)
         }
     }
 }

@@ -220,6 +220,19 @@ pub fn run_nccl_dp_gradient_rank(output_dir: PathBuf) -> Result<()> {
     Ok(())
 }
 
+pub fn all_reduce_f32_for_launch(output_dir: &Path, values: &[f32]) -> Result<Vec<f32>> {
+    let rank = parse_env_usize("RANK")?;
+    let local_rank = parse_env_usize("LOCAL_RANK")?;
+    let world_size = parse_env_usize("WORLD_SIZE")?;
+    if rank >= world_size {
+        bail!("rank {rank} must be smaller than world_size {world_size}");
+    }
+    fs::create_dir_all(output_dir)
+        .with_context(|| format!("failed to create {}", output_dir.display()))?;
+    let unique_id = shared_unique_id(output_dir, rank)?;
+    nccl_all_reduce_values(unique_id, rank, world_size, local_rank, values)
+}
+
 fn shared_unique_id(output_dir: &Path, rank: usize) -> Result<NcclUniqueId> {
     let id_path = output_dir.join("nccl-unique-id.bin");
     if rank == 0 {
