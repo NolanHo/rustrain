@@ -383,7 +383,12 @@ impl AdamW {
         }
     }
 
-    pub fn step_lm_head(&mut self, model: &mut QwenLikeModel, grad: &Array2<f32>) {
+    pub fn step_lm_head_with_lr(
+        &mut self,
+        model: &mut QwenLikeModel,
+        grad: &Array2<f32>,
+        learning_rate: f32,
+    ) {
         self.step += 1;
         self.lm_head_m = &self.lm_head_m * self.beta1 + grad * (1.0 - self.beta1);
         self.lm_head_v =
@@ -395,7 +400,7 @@ impl AdamW {
         let v_hat = &self.lm_head_v / bias_correction2;
         let adam_update = m_hat / v_hat.mapv(|value| value.sqrt() + self.eps);
         let decoupled_decay = model.lm_head.mapv(|value| self.weight_decay * value);
-        let update = (adam_update + decoupled_decay) * self.learning_rate;
+        let update = (adam_update + decoupled_decay) * learning_rate;
 
         model.apply_lm_head_update(&update);
     }
@@ -433,7 +438,7 @@ mod tests {
         for _ in 0..30 {
             let output = model.loss(&tokens);
             let grad = model.lm_head_gradient(&output);
-            optimizer.step_lm_head(&mut model, &grad);
+            optimizer.step_lm_head_with_lr(&mut model, &grad, 0.05);
         }
 
         let final_loss = model.loss(&tokens).loss;

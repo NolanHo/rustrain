@@ -59,6 +59,10 @@ pub struct TrainConfig {
     pub adam_beta1: f32,
     pub adam_beta2: f32,
     pub adam_eps: f32,
+    #[serde(default = "default_lr_scheduler")]
+    pub lr_scheduler: LrScheduler,
+    #[serde(default)]
+    pub max_grad_norm: Option<f32>,
     pub dtype: DType,
     pub device: Device,
     pub checkpoint_every: u64,
@@ -94,6 +98,13 @@ pub enum DType {
 pub enum Device {
     Cpu,
     Cuda,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum LrScheduler {
+    Constant,
+    LinearDecay,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -216,6 +227,14 @@ pub fn validate_config(config: &Config) -> Result<()> {
     if config.train.adam_eps <= 0.0 {
         return Err(anyhow!("adam_eps must be greater than zero"));
     }
+    if config.train.learning_rate <= 0.0 {
+        return Err(anyhow!("learning_rate must be greater than zero"));
+    }
+    if let Some(max_grad_norm) = config.train.max_grad_norm {
+        if max_grad_norm <= 0.0 {
+            return Err(anyhow!("max_grad_norm must be greater than zero"));
+        }
+    }
     if let Some(data) = &config.data {
         if data.paths.is_empty() {
             return Err(anyhow!("data.paths must not be empty"));
@@ -276,6 +295,10 @@ fn default_train_split() -> f32 {
 
 fn default_eval_every() -> u64 {
     0
+}
+
+fn default_lr_scheduler() -> LrScheduler {
+    LrScheduler::Constant
 }
 
 fn default_backend() -> BackendKind {

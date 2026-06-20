@@ -14,7 +14,7 @@ use crate::{
     parallel::{ProcessGroup, SingleRankProcessGroup},
     parallel_modules::tp1_module_smoke,
     runtime::{
-        Config, init_logging, load_config, prepare_run_directory, validate_config,
+        Config, LrScheduler, init_logging, load_config, prepare_run_directory, validate_config,
         write_resolved_config,
     },
     tch_train::train_tch_tiny_lm,
@@ -106,6 +106,8 @@ pub fn train(config_path: &Path, resume_from: Option<PathBuf>) -> Result<()> {
             final_loss = summary.final_loss,
             embedding_grad_defined = summary.embedding_grad_defined,
             lm_head_grad_defined = summary.lm_head_grad_defined,
+            first_step_grad_norm = summary.first_step_grad_norm,
+            final_lr = summary.final_learning_rate,
             "tch tiny lm smoke complete"
         );
         println!("rustrain tch tiny lm smoke complete");
@@ -114,6 +116,8 @@ pub fn train(config_path: &Path, resume_from: Option<PathBuf>) -> Result<()> {
         println!("final_loss: {:.6}", summary.final_loss);
         println!("embedding_grad_defined: {}", summary.embedding_grad_defined);
         println!("lm_head_grad_defined: {}", summary.lm_head_grad_defined);
+        println!("first_step_grad_norm: {:.6}", summary.first_step_grad_norm);
+        println!("final_learning_rate: {:.8}", summary.final_learning_rate);
 
         return Ok(());
     }
@@ -178,10 +182,11 @@ fn train_fixed_batch(config: &Config, run_paths: &crate::runtime::RunPaths) -> R
     info!(initial_loss = initial, "starting one-batch overfit");
 
     for step in (start_step + 1)..=config.train.max_steps {
-        train_step(
+        let metrics = train_step(
             config,
             &mut model,
             &mut optimizer,
+            step,
             std::slice::from_ref(&tokens),
         )?;
 
@@ -190,6 +195,9 @@ fn train_fixed_batch(config: &Config, run_paths: &crate::runtime::RunPaths) -> R
             info!(
                 step,
                 loss = step_loss,
+                lr = metrics.learning_rate,
+                grad_norm = metrics.grad_norm,
+                clipped_grad_norm = metrics.clipped_grad_norm,
                 grad_accumulation_steps = config.train.gradient_accumulation_steps,
                 "train step"
             );
@@ -268,16 +276,24 @@ fn train_text_data(config: &Config, run_paths: &crate::runtime::RunPaths) -> Res
 
     for step in (start_step + 1)..=config.train.max_steps {
         let sequence = &train_sequences[(step as usize - 1) % train_sequences.len()];
-        train_step(
+        let metrics = train_step(
             config,
             &mut model,
             &mut optimizer,
+            step,
             std::slice::from_ref(sequence),
         )?;
 
         let train_loss = model.loss(sequence).loss;
         if step == 1 || step == config.train.max_steps || step % 10 == 0 {
-            info!(step, train_loss, "text train step");
+            info!(
+                step,
+                train_loss,
+                lr = metrics.learning_rate,
+                grad_norm = metrics.grad_norm,
+                clipped_grad_norm = metrics.clipped_grad_norm,
+                "text train step"
+            );
         }
 
         if config.train.eval_every > 0 && step % config.train.eval_every == 0 {
@@ -355,12 +371,8 @@ fn train_sft_data(config: &Config, run_paths: &crate::runtime::RunPaths) -> Resu
         for accumulation_index in 0..config.train.gradient_accumulation_steps {
             let sample =
                 &train_samples[(step as usize + accumulation_index - 1) % train_samples.len()];
-            sft_step(
-                &base_model,
-                &mut adapter,
-                sample,
-                config.train.learning_rate,
-            );
+            let learning_rate = learning_rate_for_step(config, step);
+            sft_step(&base_model, &mut adapter, sample, learning_rate);
         }
 
         let train_loss = sft_loss(
@@ -369,7 +381,12 @@ fn train_sft_data(config: &Config, run_paths: &crate::runtime::RunPaths) -> Resu
             &train_samples[(step as usize - 1) % train_samples.len()],
         );
         if step == 1 || step == config.train.max_steps || step % 10 == 0 {
-            info!(step, train_loss, "SFT train step");
+            info!(
+                step,
+                train_loss,
+                lr = learning_rate_for_step(config, step),
+                "SFT train step"
+            );
         }
 
         if config.train.eval_every > 0 && step % config.train.eval_every == 0 {
@@ -507,8 +524,9 @@ fn train_step(
     config: &Config,
     model: &mut QwenLikeModel,
     optimizer: &mut AdamW,
+    step: u64,
     sequences: &[Vec<usize>],
-) -> Result<()> {
+) -> Result<TrainStepMetrics> {
     let mut grad_accum = Array2::zeros(model.lm_head_dim());
     for accumulation_index in 0..config.train.gradient_accumulation_steps {
         let sequence = &sequences[accumulation_index % sequences.len()];
@@ -517,9 +535,49 @@ fn train_step(
     }
 
     grad_accum /= config.train.gradient_accumulation_steps as f32;
-    optimizer.step_lm_head(model, &grad_accum);
+    let grad_norm = l2_norm(&grad_accum);
+    let clipped_grad_norm = clip_gradient(&mut grad_accum, config.train.max_grad_norm);
+    let learning_rate = learning_rate_for_step(config, step);
+    optimizer.step_lm_head_with_lr(model, &grad_accum, learning_rate);
 
-    Ok(())
+    Ok(TrainStepMetrics {
+        learning_rate,
+        grad_norm,
+        clipped_grad_norm,
+    })
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TrainStepMetrics {
+    learning_rate: f32,
+    grad_norm: f32,
+    clipped_grad_norm: f32,
+}
+
+fn learning_rate_for_step(config: &Config, step: u64) -> f32 {
+    match config.train.lr_scheduler {
+        LrScheduler::Constant => config.train.learning_rate,
+        LrScheduler::LinearDecay => {
+            let max_steps = config.train.max_steps.max(1) as f32;
+            let progress = (step.saturating_sub(1) as f32 / max_steps).clamp(0.0, 1.0);
+            config.train.learning_rate * (1.0 - progress)
+        }
+    }
+}
+
+fn clip_gradient(grad: &mut Array2<f32>, max_grad_norm: Option<f32>) -> f32 {
+    let grad_norm = l2_norm(grad);
+    if let Some(max_grad_norm) = max_grad_norm {
+        if grad_norm > max_grad_norm {
+            *grad *= max_grad_norm / (grad_norm + 1e-12);
+            return max_grad_norm;
+        }
+    }
+    grad_norm
+}
+
+fn l2_norm(values: &Array2<f32>) -> f32 {
+    values.iter().map(|value| value * value).sum::<f32>().sqrt()
 }
 
 fn maybe_save_checkpoint(
@@ -581,7 +639,12 @@ mod tests {
     use tempfile::NamedTempFile;
 
     use super::*;
-    use crate::runtime::ModelConfig;
+    use crate::{
+        backend::BackendKind,
+        runtime::{
+            DType, Device, LrScheduler, ModelConfig, ParallelConfig, RunConfig, TrainConfig,
+        },
+    };
 
     fn tiny_config() -> ModelConfig {
         ModelConfig {
@@ -608,7 +671,7 @@ mod tests {
         let tokens = vec![3, 10, 1, 8, 15, 6, 13, 4];
         let output = model.loss(&tokens);
         let grad = model.lm_head_gradient(&output);
-        optimizer.step_lm_head(&mut model, &grad);
+        optimizer.step_lm_head_with_lr(&mut model, &grad, 0.05);
 
         let before = model.loss(&tokens).loss;
         let file = NamedTempFile::new().expect("temp checkpoint should be created");
@@ -619,5 +682,62 @@ mod tests {
 
         assert_eq!(reloaded.step, 1);
         assert!((before - after).abs() < 1e-6);
+    }
+
+    #[test]
+    fn train_step_applies_scheduler_and_grad_clipping() {
+        let config = tiny_train_config(LrScheduler::LinearDecay, Some(0.001), 4);
+        let mut model = QwenLikeModel::new(config.model.clone(), 23);
+        let mut optimizer = AdamW::new(model.lm_head_dim(), 0.05, 0.9, 0.999, 1e-8, 0.01);
+        let tokens = vec![3, 10, 1, 8, 15, 6, 13, 4];
+
+        let metrics = train_step(&config, &mut model, &mut optimizer, 3, &[tokens])
+            .expect("train step should run");
+
+        assert_eq!(metrics.learning_rate, 0.025);
+        assert!(metrics.grad_norm > metrics.clipped_grad_norm);
+        assert!((metrics.clipped_grad_norm - 0.001).abs() < 1e-8);
+    }
+
+    fn tiny_train_config(
+        lr_scheduler: LrScheduler,
+        max_grad_norm: Option<f32>,
+        max_steps: u64,
+    ) -> Config {
+        Config {
+            run: RunConfig {
+                name: "test".to_string(),
+                base_dir: "runs".into(),
+                seed: 0,
+            },
+            model: tiny_config(),
+            train: TrainConfig {
+                max_steps,
+                resume_from: None,
+                backend: BackendKind::NdArray,
+                micro_batch_size: 1,
+                global_batch_size: 1,
+                gradient_accumulation_steps: 1,
+                learning_rate: 0.05,
+                weight_decay: 0.01,
+                adam_beta1: 0.9,
+                adam_beta2: 0.999,
+                adam_eps: 1e-8,
+                lr_scheduler,
+                max_grad_norm,
+                dtype: DType::Fp32,
+                device: Device::Cpu,
+                checkpoint_every: 0,
+                eval_every: 0,
+            },
+            data: None,
+            parallel: ParallelConfig {
+                tensor_model_parallel_size: 1,
+                pipeline_model_parallel_size: 1,
+                data_parallel_size: 1,
+                expert_model_parallel_size: 1,
+                context_parallel_size: 1,
+            },
+        }
     }
 }

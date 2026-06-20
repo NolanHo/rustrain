@@ -5,7 +5,7 @@ use tch::{
 };
 use tracing::info;
 
-use crate::runtime::{Config, Device as RuntimeDevice};
+use crate::runtime::{Config, Device as RuntimeDevice, LrScheduler};
 
 #[derive(Debug, Clone)]
 pub struct TchTrainSmokeSummary {
@@ -13,6 +13,8 @@ pub struct TchTrainSmokeSummary {
     pub final_loss: f64,
     pub embedding_grad_defined: bool,
     pub lm_head_grad_defined: bool,
+    pub first_step_grad_norm: f64,
+    pub final_learning_rate: f64,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -75,21 +77,33 @@ pub fn train_tch_tiny_lm(config: &Config) -> Result<TchTrainSmokeSummary> {
     let initial_loss = tch_lm_loss(&embedding, &lm_head, &input_ids, &targets).double_value(&[]);
     let mut embedding_grad_defined = false;
     let mut lm_head_grad_defined = false;
+    let mut first_step_grad_norm = 0.0;
+    let mut final_learning_rate = config.train.learning_rate as f64;
 
     for step in 1..=config.train.max_steps {
+        let learning_rate = learning_rate_for_step(config, step);
+        optimizer.set_lr(learning_rate);
         optimizer.zero_grad();
         let loss = tch_lm_loss(&embedding, &lm_head, &input_ids, &targets);
         loss.backward();
+        let grad_norm = grad_norm(&vs.trainable_variables());
+        if let Some(max_grad_norm) = config.train.max_grad_norm {
+            optimizer.clip_grad_norm(max_grad_norm as f64);
+        }
         if step == 1 {
             embedding_grad_defined = embedding.ws.grad().defined();
             lm_head_grad_defined = lm_head.ws.grad().defined();
+            first_step_grad_norm = grad_norm;
         }
+        final_learning_rate = learning_rate;
         optimizer.step();
 
         if step == 1 || step == config.train.max_steps || step % 10 == 0 {
             info!(
                 step,
                 loss = loss.double_value(&[]),
+                lr = learning_rate,
+                grad_norm,
                 "tch tiny lm train step"
             );
         }
@@ -112,7 +126,32 @@ pub fn train_tch_tiny_lm(config: &Config) -> Result<TchTrainSmokeSummary> {
         final_loss,
         embedding_grad_defined,
         lm_head_grad_defined,
+        first_step_grad_norm,
+        final_learning_rate,
     })
+}
+
+fn learning_rate_for_step(config: &Config, step: u64) -> f64 {
+    match config.train.lr_scheduler {
+        LrScheduler::Constant => config.train.learning_rate as f64,
+        LrScheduler::LinearDecay => {
+            let max_steps = config.train.max_steps.max(1) as f64;
+            let progress = (step.saturating_sub(1) as f64 / max_steps).clamp(0.0, 1.0);
+            config.train.learning_rate as f64 * (1.0 - progress)
+        }
+    }
+}
+
+fn grad_norm(trainable_variables: &[Tensor]) -> f64 {
+    trainable_variables
+        .iter()
+        .filter_map(|tensor| {
+            let grad = tensor.grad();
+            grad.defined()
+                .then(|| grad.square().sum(Kind::Float).double_value(&[]))
+        })
+        .sum::<f64>()
+        .sqrt()
 }
 
 fn fixed_tch_batch(vocab_size: i64, seq_len: i64) -> Tensor {
@@ -168,6 +207,8 @@ mod tests {
         assert!(summary.final_loss < summary.initial_loss);
         assert!(summary.embedding_grad_defined);
         assert!(summary.lm_head_grad_defined);
+        assert!(summary.first_step_grad_norm > 0.0);
+        assert!((summary.final_learning_rate - 1e-2).abs() < 1e-8);
     }
 
     #[test]
@@ -183,6 +224,18 @@ mod tests {
             error.to_string().contains("tch CUDA is not available"),
             "unexpected error: {error:#}"
         );
+    }
+
+    #[test]
+    fn tch_tiny_lm_applies_linear_decay_and_reports_grad_norm() {
+        let mut config = tiny_tch_config(RuntimeDevice::Cpu);
+        config.train.lr_scheduler = crate::runtime::LrScheduler::LinearDecay;
+        config.train.max_grad_norm = Some(0.01);
+
+        let summary = train_tch_tiny_lm(&config).expect("tch tiny lm should train");
+
+        assert!(summary.first_step_grad_norm > 0.0);
+        assert!(summary.final_learning_rate < config.train.learning_rate as f64);
     }
 
     fn tiny_tch_config(device: RuntimeDevice) -> Config {
@@ -219,6 +272,8 @@ mod tests {
                 adam_beta1: 0.9,
                 adam_beta2: 0.999,
                 adam_eps: 1e-8,
+                lr_scheduler: crate::runtime::LrScheduler::Constant,
+                max_grad_norm: None,
                 dtype: DType::Fp32,
                 device,
                 checkpoint_every: 0,
