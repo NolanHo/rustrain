@@ -8,75 +8,52 @@ MoE toy modules, and CUDA smoke tests through `tch-rs`.
 This repository is not yet a production trainer. The current code is organized
 as milestone-sized, verifiable smokes.
 
-## Local CPU Verification
+## GPU Verification
 
-Source the local PyTorch/tch environment first:
+All verification runs on the GPU host. The local machine is only for editing and
+git operations.
 
 ```sh
-source scripts/tch_env.sh
+scripts/verify_gpu.sh
 ```
 
-Run the default CPU verification set:
+The script SSHes to `root@192.168.42.106:2222`, enters the remote checkout, and
+sources `scripts/tch_a800_env.sh` before running project commands.
+
+The required remote checkout is:
 
 ```sh
-scripts/verify_cpu.sh
+/vePFS-Mindverse/user/nolanho/code/rustrain
 ```
 
-The script runs:
+Current bootstrap fallback while the shared checkout is being prepared:
 
-- `cargo test`
-- `cargo run -- train --config configs/debug.toml`
-- `cargo run -- train --config configs/qwen3_mini.toml`
-- `cargo run -- train --config configs/tch_smoke.toml`
-- `cargo run -- train --config configs/text_debug.toml`
-- `cargo run -- train --config configs/gsm8k_toy.toml`
-- `cargo run -- train --config configs/sft_debug.toml`
-- `cargo run -- qwen-lora-smoke`
-- `cargo run -- qwen-lora-train-smoke`
-- `cargo run -- qwen-kv-cache-parity`
-- `cargo run -- parallel-dp-smoke --output-dir runs/parallel-dp-smoke`
-- `cargo run -- parallel-tp-smoke`
-- `cargo run -- parallel-ep-smoke`
-
-## A800 CUDA Verification
-
-On the A800 worker, source the CUDA PyTorch/tch environment:
-
-```sh
-source scripts/tch_a800_env.sh
-```
-
-Then run:
-
-```sh
-cargo run -- tch-cuda-probe
-cargo run -- train --config configs/tch_smoke_cuda.toml
+tar --exclude .git --exclude target --exclude runs -cf - . \
+  | ssh -p 2222 root@192.168.42.106 'rm -rf /root/rustrain && mkdir -p /root/rustrain && cd /root/rustrain && tar -xf -'
+RUSTRAIN_REMOTE_DIR=/root/rustrain scripts/verify_gpu.sh
 ```
 
 The A800 config writes runs to `/tmp/rustrain-runs` because the shared project
-checkout may be read-only from the worker.
+checkout may be read-only from the worker. If `tch-cuda-probe` reports
+`device_count: 0`, the SSH target has not exposed GPU devices and milestone
+acceptance is blocked until the runtime is fixed.
 
 ## Real Qwen Smokes
 
-The current real-model path targets the local Qwen2.5 checkpoint:
+The current real-model path targets the Qwen2.5 checkpoint under
+`/vePFS-Mindverse/share/huggingface` on the GPU host:
 
 ```sh
-source scripts/tch_env.sh
-cargo run -- inspect --model-path /vePFS-Mindverse/share/huggingface/Qwen2.5-0.5B-Instruct
-cargo run -- qwen-logits-parity
-cargo run -- qwen-generate-parity
-cargo run -- qwen-sampling-smoke
-cargo run -- qwen-kv-cache-parity
-cargo run -- qwen-lora-smoke
-cargo run -- qwen-lora-train-smoke
+ssh -p 2222 root@192.168.42.106 \
+  'cd /vePFS-Mindverse/user/nolanho/code/rustrain && source scripts/tch_a800_env.sh && cargo run -- qwen-logits-parity'
 ```
 
-The full-train smoke command is present, but A800 execution must be used for
-the real checkpoint:
+The full-train smoke command is present, but GPU execution must be used for the
+real checkpoint:
 
 ```sh
-source scripts/tch_a800_env.sh
-cargo run -- qwen-full-train-smoke
+ssh -p 2222 root@192.168.42.106 \
+  'cd /vePFS-Mindverse/user/nolanho/code/rustrain && source scripts/tch_a800_env.sh && cargo run -- qwen-full-train-smoke'
 ```
 
 ## Current Major Gaps
@@ -90,11 +67,11 @@ cargo run -- qwen-full-train-smoke
   generation parity are future work.
 - Multi-GPU DP/TP/EP are toy smokes, not real NCCL-backed distributed training.
 - Real Qwen checkpoint manifest support has started with delta metadata, but
-  full optimizer state and distributed checkpoint layout are not done.
-- Trainer production basics such as scheduler, grad clipping, CPU RSS memory
-  metrics, and a reserved GPU-memory metric field are implemented for local
-  toy/tch paths; actual GPU allocator/NVML memory values and real
-  tokenizer-backed batching remain partial.
+  optimizer reload parity and distributed checkpoint layout are not done.
+- Trainer production basics such as scheduler, grad clipping, RSS memory
+  metrics, and a reserved GPU-memory metric field are implemented for toy/tch
+  paths; actual GPU allocator/NVML memory values and real tokenizer-backed
+  batching remain partial.
 
 Internal planning details live in `_internal_docs/TODO.md`; that directory is
 ignored by git.

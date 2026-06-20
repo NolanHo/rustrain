@@ -150,6 +150,7 @@ struct QwenFullTrainSmokeSummary {
     model_path: String,
     reference_fixture: String,
     delta_output: String,
+    optimizer_output: String,
     manifest_output: String,
     learning_rate: f64,
     initial_loss: f64,
@@ -165,6 +166,8 @@ struct QwenDeltaCheckpointManifest {
     base_model_path: String,
     reference_fixture: String,
     delta_safetensors: String,
+    #[serde(default)]
+    optimizer_safetensors: Option<String>,
     train_step: u64,
     learning_rate: f64,
     initial_loss: f64,
@@ -176,6 +179,10 @@ struct QwenDeltaCheckpointManifest {
 struct QwenDeltaTensorManifestEntry {
     name: String,
     delta_name: String,
+    #[serde(default)]
+    adam_m_name: Option<String>,
+    #[serde(default)]
+    adam_v_name: Option<String>,
     shape: Vec<i64>,
     dtype: String,
     grad_norm: f64,
@@ -770,6 +777,8 @@ pub fn qwen_full_train_smoke(
 
     let base_weights = read_safetensors_map(&model_path.join("model.safetensors"))?;
     let mut delta_entries: Vec<(String, Tensor)> = Vec::with_capacity(trainable_tensors.len());
+    let mut optimizer_entries: Vec<(String, Tensor)> =
+        Vec::with_capacity(trainable_tensors.len() * 2);
     let mut tensor_summaries = Vec::with_capacity(trainable_tensors.len());
     let mut manifest_tensors = Vec::with_capacity(trainable_tensors.len());
     for (name, mut trainable) in trainable_tensors {
@@ -784,22 +793,32 @@ pub fn qwen_full_train_smoke(
             bail!("trainable tensor {name} did not receive a gradient");
         }
 
-        let update = &grad * learning_rate;
+        let adam_m = &grad * (1.0 - 0.9);
+        let adam_v = grad.pow_tensor_scalar(2.0) * (1.0 - 0.999);
+        let m_hat = &adam_m / (1.0 - 0.9);
+        let v_hat = &adam_v / (1.0 - 0.999);
+        let update = (m_hat / v_hat.sqrt().g_add_scalar(1e-8)) * learning_rate;
         let _ = no_grad(|| trainable.f_sub_(&update))?;
         weights.insert(name.clone(), trainable.shallow_clone());
         let base = tensor(&base_weights, &name)?.to_kind(Kind::Float);
         let delta = &trainable - &base;
         let delta_norm = delta.norm().double_value(&[]);
         let delta_name = format!("{name}.delta");
+        let adam_m_name = format!("{name}.adam_m");
+        let adam_v_name = format!("{name}.adam_v");
         manifest_tensors.push(QwenDeltaTensorManifestEntry {
             name: name.clone(),
             delta_name: delta_name.clone(),
+            adam_m_name: Some(adam_m_name.clone()),
+            adam_v_name: Some(adam_v_name.clone()),
             shape: trainable.size(),
             dtype: "float32".to_string(),
             grad_norm,
             delta_norm,
         });
         delta_entries.push((delta_name, delta));
+        optimizer_entries.push((adam_m_name, adam_m));
+        optimizer_entries.push((adam_v_name, adam_v));
         tensor_summaries.push(TrainableTensorSummary {
             name,
             grad_defined,
@@ -825,12 +844,20 @@ pub fn qwen_full_train_smoke(
         .collect();
     Tensor::write_safetensors(&delta_refs, delta_output)
         .with_context(|| format!("failed to write {}", delta_output.display()))?;
+    let optimizer_output = optimizer_state_path(delta_output);
+    let optimizer_refs: Vec<(&str, &Tensor)> = optimizer_entries
+        .iter()
+        .map(|(name, tensor)| (name.as_str(), tensor))
+        .collect();
+    Tensor::write_safetensors(&optimizer_refs, &optimizer_output)
+        .with_context(|| format!("failed to write {}", optimizer_output.display()))?;
     let manifest_output = delta_manifest_path(delta_output);
     let manifest = QwenDeltaCheckpointManifest {
         format: "rustrain.qwen_delta.v1".to_string(),
         base_model_path: model_path.display().to_string(),
         reference_fixture: reference_fixture.display().to_string(),
         delta_safetensors: delta_output.display().to_string(),
+        optimizer_safetensors: Some(optimizer_output.display().to_string()),
         train_step: 1,
         learning_rate,
         initial_loss,
@@ -860,6 +887,7 @@ pub fn qwen_full_train_smoke(
         model_path: model_path.display().to_string(),
         reference_fixture: reference_fixture.display().to_string(),
         delta_output: delta_output.display().to_string(),
+        optimizer_output: optimizer_output.display().to_string(),
         manifest_output: manifest_output.display().to_string(),
         learning_rate,
         initial_loss,
@@ -876,6 +904,12 @@ pub fn qwen_full_train_smoke(
 fn delta_manifest_path(delta_output: &Path) -> std::path::PathBuf {
     let mut path = delta_output.as_os_str().to_os_string();
     path.push(".json");
+    path.into()
+}
+
+fn optimizer_state_path(delta_output: &Path) -> std::path::PathBuf {
+    let mut path = delta_output.as_os_str().to_os_string();
+    path.push(".optimizer.safetensors");
     path.into()
 }
 
@@ -1781,6 +1815,7 @@ mod tests {
             base_model_path: "/models/qwen".to_string(),
             reference_fixture: "fixture.safetensors".to_string(),
             delta_safetensors: delta_output.display().to_string(),
+            optimizer_safetensors: Some(optimizer_state_path(&delta_output).display().to_string()),
             train_step: 1,
             learning_rate: 1e-6,
             initial_loss: 2.0,
@@ -1788,6 +1823,8 @@ mod tests {
             tensors: vec![QwenDeltaTensorManifestEntry {
                 name: "model.layers.0.self_attn.q_proj.weight".to_string(),
                 delta_name: "model.layers.0.self_attn.q_proj.weight.delta".to_string(),
+                adam_m_name: Some("model.layers.0.self_attn.q_proj.weight.adam_m".to_string()),
+                adam_v_name: Some("model.layers.0.self_attn.q_proj.weight.adam_v".to_string()),
                 shape: vec![4, 4],
                 dtype: "float32".to_string(),
                 grad_norm: 3.0,
@@ -1802,10 +1839,22 @@ mod tests {
         .expect("manifest should parse");
 
         assert_eq!(manifest_output, temp.path().join("delta.safetensors.json"));
+        assert_eq!(
+            optimizer_state_path(&delta_output),
+            temp.path().join("delta.safetensors.optimizer.safetensors")
+        );
         assert_eq!(reloaded.format, "rustrain.qwen_delta.v1");
+        assert_eq!(
+            reloaded.optimizer_safetensors,
+            manifest.optimizer_safetensors
+        );
         assert_eq!(
             reloaded.tensors[0].delta_name,
             manifest.tensors[0].delta_name
+        );
+        assert_eq!(
+            reloaded.tensors[0].adam_m_name,
+            manifest.tensors[0].adam_m_name
         );
     }
 
