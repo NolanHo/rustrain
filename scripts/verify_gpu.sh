@@ -5,43 +5,14 @@ REMOTE_HOST="${RUSTRAIN_REMOTE_HOST:-root@192.168.42.106}"
 REMOTE_PORT="${RUSTRAIN_REMOTE_PORT:-2222}"
 REMOTE_DIR="${RUSTRAIN_REMOTE_DIR:-/vePFS-Mindverse/user/nolanho/code/rustrain}"
 REMOTE_PYTHON="${RUSTRAIN_REMOTE_PYTHON:-/opt/venv/bin/python}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 remote_run() {
-  local command="$*"
-  ssh -p "${REMOTE_PORT}" "${REMOTE_HOST}" "${REMOTE_PYTHON} - '${REMOTE_DIR}' '${command}'" <<'PY'
-import ray
-import subprocess
-import sys
-
-remote_dir = sys.argv[1]
-command = sys.argv[2]
-
-ray.init(address="auto")
-
-@ray.remote(num_gpus=1)
-def run_on_gpu_worker(remote_dir: str, command: str) -> str:
-    script = f"""
-set -euo pipefail
-if [ ! -x "$HOME/.cargo/bin/cargo" ]; then
-  curl https://sh.rustup.rs -sSf | sh -s -- -y --profile minimal --default-toolchain stable
-fi
-. "$HOME/.cargo/env"
-cd "{remote_dir}"
-source scripts/tch_a800_env.sh
-{command}
-"""
-    result = subprocess.run(
-        ["bash", "-lc", script],
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-    )
-    if result.returncode != 0:
-        raise RuntimeError(result.stdout)
-    return result.stdout
-
-print(ray.get(run_on_gpu_worker.remote(remote_dir, command)), end="")
-PY
+  RUSTRAIN_REMOTE_HOST="${REMOTE_HOST}" \
+    RUSTRAIN_REMOTE_PORT="${REMOTE_PORT}" \
+    RUSTRAIN_REMOTE_DIR="${REMOTE_DIR}" \
+    RUSTRAIN_REMOTE_PYTHON="${REMOTE_PYTHON}" \
+    "${SCRIPT_DIR}/gpu_run.sh" "$@"
 }
 
 remote_run cargo run -- tch-cuda-probe

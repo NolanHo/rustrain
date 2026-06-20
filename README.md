@@ -8,17 +8,30 @@ MoE toy modules, and CUDA smoke tests through `tch-rs`.
 This repository is not yet a production trainer. The current code is organized
 as milestone-sized, verifiable smokes.
 
-## GPU Verification
+## GPU-Only Verification
 
-All verification runs on the GPU host. The local machine is only for editing and
-git operations.
+All smoke, test, parity, and training verification runs on the GPU host through
+Ray `num_gpus=1` workers. The local machine is only for editing and git
+operations; local CPU runs are not accepted as development smoke or milestone
+evidence.
+
+Run one command on a Ray GPU worker:
+
+```sh
+scripts/gpu_run.sh cargo run -- tch-cuda-probe
+```
+
+Run the focused verification suite:
 
 ```sh
 scripts/verify_gpu.sh
 ```
 
-The script SSHes to `root@192.168.42.106:2222`, enters the remote checkout, and
-sources `scripts/tch_a800_env.sh` before running project commands.
+Both scripts SSH to `root@192.168.42.106:2222`, submit work to Ray with
+`num_gpus=1`, enter the remote checkout, and source `scripts/tch_a800_env.sh`
+before running project commands. Do not run `cargo test`, train smokes, or
+parity commands directly in the plain SSH shell; that shell does not expose the
+GPU devices.
 
 The required remote checkout is:
 
@@ -28,6 +41,7 @@ The required remote checkout is:
 
 Current bootstrap fallback while the shared checkout is being prepared:
 
+```sh
 tar --exclude .git --exclude target --exclude runs -cf - . \
   | ssh -p 2222 root@192.168.42.106 'rm -rf /root/rustrain && mkdir -p /root/rustrain && cd /root/rustrain && tar -xf -'
 RUSTRAIN_REMOTE_DIR=/root/rustrain scripts/verify_gpu.sh
@@ -44,34 +58,33 @@ The current real-model path targets the Qwen2.5 checkpoint under
 `/vePFS-Mindverse/share/huggingface` on the GPU host:
 
 ```sh
-ssh -p 2222 root@192.168.42.106 \
-  'cd /vePFS-Mindverse/user/nolanho/code/rustrain && source scripts/tch_a800_env.sh && cargo run -- qwen-logits-parity'
+scripts/gpu_run.sh cargo run -- qwen-logits-parity
 ```
 
 The full-train smoke command is present, but GPU execution must be used for the
 real checkpoint:
 
 ```sh
-ssh -p 2222 root@192.168.42.106 \
-  'cd /vePFS-Mindverse/user/nolanho/code/rustrain && source scripts/tch_a800_env.sh && cargo run -- qwen-full-train-smoke'
+scripts/gpu_run.sh cargo run -- qwen-full-train-smoke
 ```
 
 ## Current Major Gaps
 
 - Real full-Qwen training is only partially done: the command and representative
-  trainable tensor path exist, but the A800 full-checkpoint smoke still needs to
-  be run when the worker is reachable.
-- Real Qwen module-level LoRA train/reload smoke for layer0 attention
-  `q_proj`/`v_proj` is implemented; trainer-integrated LoRA SFT is not done yet.
-- KV-cache greedy parity is implemented; cached sampling and Python cached
-  generation parity are future work.
+  trainable tensor path are verified, but the code is still smoke-level rather
+  than a reusable trainer-owned Qwen module.
+- Real Qwen module-level LoRA train/reload and a focused response-only SFT smoke
+  exist for layer0 attention `q_proj`/`v_proj`; configurable trainer-owned LoRA
+  injection is not done yet.
+- KV-cache greedy parity and cached sampling parity are implemented; Python
+  cached-generation parity is future work.
 - Multi-GPU DP/TP/EP are toy smokes, not real NCCL-backed distributed training.
-- Real Qwen checkpoint manifest support has started with delta metadata, but
-  optimizer reload parity and distributed checkpoint layout are not done.
+- Real Qwen checkpoint manifest support has delta metadata and representative
+  Adam slot persistence, but full train resume and distributed checkpoint layout
+  are not done.
 - Trainer production basics such as scheduler, grad clipping, RSS memory
-  metrics, and a reserved GPU-memory metric field are implemented for toy/tch
-  paths; actual GPU allocator/NVML memory values and real tokenizer-backed
-  batching remain partial.
+  metrics, and Ray-worker GPU memory reporting are implemented for toy/tch
+  paths; real tokenizer-backed batching and bf16/mixed precision remain partial.
 
 Internal planning details live in `_internal_docs/TODO.md`; that directory is
 ignored by git.
