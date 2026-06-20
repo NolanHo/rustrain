@@ -70,9 +70,10 @@ scripts/gpu_run.sh cargo run -- qwen-full-train-smoke
 
 ## Current Major Gaps
 
-- G5 full checkpoint resume is incomplete: representative Qwen delta tensors
-  and Adam optimizer slots are persisted, but manifest-driven reload still
-  needs to restore weights plus optimizer state and prove next-step parity.
+- G5 representative checkpoint resume is implemented for the Qwen full-train
+  smoke: manifest-driven reload restores delta tensors plus Adam optimizer
+  slots and proves next-step parity. Distributed checkpoint layout is still
+  open.
 - C4/G1 trainer-owned Qwen training is incomplete: representative Qwen
   parameters now go through a trainable registry, but this is not yet a
   reusable train/eval model module with checkpoint ownership.

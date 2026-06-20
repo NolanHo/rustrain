@@ -187,6 +187,10 @@ struct QwenFullTrainSmokeSummary {
     final_loss: f64,
     reloaded_loss: f64,
     reload_delta: f64,
+    resume_loss: f64,
+    continuous_second_loss: f64,
+    resumed_second_loss: f64,
+    second_step_delta: f64,
     trainable_tensors: Vec<TrainableTensorSummary>,
 }
 
@@ -1087,18 +1091,34 @@ pub fn qwen_full_train_smoke(
     write_qwen_delta_manifest(&manifest_output, &manifest)?;
 
     let mut reloaded_weights = read_safetensors_map(&model_path.join("model.safetensors"))?;
-    let delta_tensors = read_safetensors_map(delta_output)?;
-    QwenTrainableRegistry::apply_delta_checkpoint(
-        &mut reloaded_weights,
-        &delta_tensors,
-        &manifest.tensors,
-    )?;
+    let mut resumed_registry =
+        QwenTrainableRegistry::load_from_manifest(&mut reloaded_weights, &manifest)?;
     let reloaded_loss =
         qwen_causal_lm_loss(&input_ids, &reloaded_weights, &config)?.double_value(&[]);
     let reload_delta = (final_loss - reloaded_loss).abs();
     if reload_delta > 1e-5 {
         bail!(
             "Qwen full train delta reload parity failed: final_loss={final_loss}, reloaded_loss={reloaded_loss}, reload_delta={reload_delta}"
+        );
+    }
+
+    let resume_loss = qwen_causal_lm_loss(&input_ids, &reloaded_weights, &config)?;
+    let resume_loss_value = resume_loss.double_value(&[]);
+    resume_loss.backward();
+    resumed_registry.adamw_step(&mut reloaded_weights, learning_rate, 2)?;
+    let resumed_second_loss =
+        qwen_causal_lm_loss(&input_ids, &reloaded_weights, &config)?.double_value(&[]);
+
+    registry.zero_grad();
+    let continuous_loss = qwen_causal_lm_loss(&input_ids, &weights, &config)?;
+    continuous_loss.backward();
+    registry.adamw_step(&mut weights, learning_rate, 2)?;
+    let continuous_second_loss =
+        qwen_causal_lm_loss(&input_ids, &weights, &config)?.double_value(&[]);
+    let second_step_delta = (continuous_second_loss - resumed_second_loss).abs();
+    if second_step_delta > 1e-5 {
+        bail!(
+            "Qwen full train manifest resume parity failed: continuous_second_loss={continuous_second_loss}, resumed_second_loss={resumed_second_loss}, second_step_delta={second_step_delta}"
         );
     }
 
@@ -1113,6 +1133,10 @@ pub fn qwen_full_train_smoke(
         final_loss,
         reloaded_loss,
         reload_delta,
+        resume_loss: resume_loss_value,
+        continuous_second_loss,
+        resumed_second_loss,
+        second_step_delta,
         trainable_tensors: step_artifacts.tensor_summaries,
     };
     println!("{}", serde_json::to_string_pretty(&summary)?);
@@ -1236,6 +1260,12 @@ impl QwenTrainableRegistry {
         })
     }
 
+    fn zero_grad(&mut self) {
+        for parameter in &mut self.parameters {
+            parameter.tensor.zero_grad();
+        }
+    }
+
     fn apply_delta_checkpoint(
         weights: &mut BTreeMap<String, Tensor>,
         delta_tensors: &BTreeMap<String, Tensor>,
@@ -1247,6 +1277,59 @@ impl QwenTrainableRegistry {
             weights.insert(entry.name.clone(), reloaded);
         }
         Ok(())
+    }
+
+    fn load_from_manifest(
+        weights: &mut BTreeMap<String, Tensor>,
+        manifest: &QwenDeltaCheckpointManifest,
+    ) -> Result<Self> {
+        if manifest.format != "rustrain.qwen_delta.v1" {
+            bail!(
+                "unsupported Qwen delta checkpoint format {}",
+                manifest.format
+            );
+        }
+        let delta_tensors = read_safetensors_map(Path::new(&manifest.delta_safetensors))?;
+        Self::apply_delta_checkpoint(weights, &delta_tensors, &manifest.tensors)?;
+        let optimizer_tensors = if let Some(path) = &manifest.optimizer_safetensors {
+            Some(read_safetensors_map(Path::new(path))?)
+        } else {
+            None
+        };
+
+        let mut parameters = Vec::with_capacity(manifest.tensors.len());
+        for entry in &manifest.tensors {
+            let reloaded = tensor(weights, &entry.name)?.to_kind(Kind::Float);
+            let base = tensor_snapshot(
+                &(reloaded.shallow_clone()
+                    - tensor(&delta_tensors, &entry.delta_name)?.to_kind(Kind::Float)),
+            );
+            let trainable = reloaded.set_requires_grad(true);
+            weights.insert(entry.name.clone(), trainable.shallow_clone());
+            let adam = match (
+                optimizer_tensors.as_ref(),
+                entry.adam_m_name.as_ref(),
+                entry.adam_v_name.as_ref(),
+            ) {
+                (Some(optimizer_tensors), Some(m_name), Some(v_name)) => Some(AdamState {
+                    m: tensor(optimizer_tensors, m_name)?.to_kind(Kind::Float),
+                    v: tensor(optimizer_tensors, v_name)?.to_kind(Kind::Float),
+                }),
+                (None, None, None) => None,
+                _ => bail!(
+                    "incomplete optimizer state for trainable tensor {}",
+                    entry.name
+                ),
+            };
+            parameters.push(QwenTrainableParameter {
+                name: entry.name.clone(),
+                tensor: trainable,
+                base,
+                adam,
+            });
+        }
+
+        Ok(Self { parameters })
     }
 }
 
@@ -2724,6 +2807,116 @@ mod tests {
                 .max_abs
                 < 1e-8
         );
+    }
+
+    #[test]
+    fn qwen_manifest_resume_reproduces_second_full_train_step() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let delta_output = temp.path().join("delta.safetensors");
+        let optimizer_output = optimizer_state_path(&delta_output);
+        let manifest_output = delta_manifest_path(&delta_output);
+        let config = QwenRuntimeConfig {
+            num_hidden_layers: 1,
+            num_attention_heads: 2,
+            num_key_value_heads: 1,
+            rms_norm_eps: 1e-6,
+            rope_theta: 10_000.0,
+        };
+        let input_ids = Tensor::from_slice(&[0_i64, 1, 2, 3]).reshape([1, 4]);
+        let learning_rate = 1e-2;
+
+        let mut continuous_weights = tiny_qwen_weights();
+        let mut continuous_registry =
+            QwenTrainableRegistry::representative(&mut continuous_weights)
+                .expect("registry should build");
+        let initial_loss = qwen_causal_lm_loss(&input_ids, &continuous_weights, &config)
+            .expect("loss should run")
+            .double_value(&[]);
+        let first_loss =
+            qwen_causal_lm_loss(&input_ids, &continuous_weights, &config).expect("loss should run");
+        first_loss.backward();
+        let first_artifacts = continuous_registry
+            .adamw_step(&mut continuous_weights, learning_rate, 1)
+            .expect("first optimizer step should apply");
+        let final_loss = qwen_causal_lm_loss(&input_ids, &continuous_weights, &config)
+            .expect("loss should run")
+            .double_value(&[]);
+
+        let delta_refs: Vec<(&str, &Tensor)> = first_artifacts
+            .delta_entries
+            .iter()
+            .map(|(name, tensor)| (name.as_str(), tensor))
+            .collect();
+        Tensor::write_safetensors(&delta_refs, &delta_output).expect("delta should write");
+        let optimizer_refs: Vec<(&str, &Tensor)> = first_artifacts
+            .optimizer_entries
+            .iter()
+            .map(|(name, tensor)| (name.as_str(), tensor))
+            .collect();
+        Tensor::write_safetensors(&optimizer_refs, &optimizer_output)
+            .expect("optimizer should write");
+        let manifest = QwenDeltaCheckpointManifest {
+            format: "rustrain.qwen_delta.v1".to_string(),
+            base_model_path: "tiny-qwen".to_string(),
+            reference_fixture: "inline".to_string(),
+            delta_safetensors: delta_output.display().to_string(),
+            optimizer_safetensors: Some(optimizer_output.display().to_string()),
+            train_step: 1,
+            learning_rate,
+            initial_loss,
+            final_loss,
+            tensors: first_artifacts.manifest_tensors,
+        };
+        write_qwen_delta_manifest(&manifest_output, &manifest).expect("manifest should write");
+        let reloaded_manifest: QwenDeltaCheckpointManifest = serde_json::from_str(
+            &fs::read_to_string(&manifest_output).expect("manifest should read"),
+        )
+        .expect("manifest should parse");
+
+        let mut resumed_weights = tiny_qwen_weights();
+        let mut resumed_registry =
+            QwenTrainableRegistry::load_from_manifest(&mut resumed_weights, &reloaded_manifest)
+                .expect("registry should load from manifest");
+        let resumed_loss = qwen_causal_lm_loss(&input_ids, &resumed_weights, &config)
+            .expect("loss should run")
+            .double_value(&[]);
+        assert!((final_loss - resumed_loss).abs() < 1e-6);
+
+        continuous_registry.zero_grad();
+        let continuous_second_loss =
+            qwen_causal_lm_loss(&input_ids, &continuous_weights, &config).expect("loss should run");
+        continuous_second_loss.backward();
+        continuous_registry
+            .adamw_step(&mut continuous_weights, learning_rate, 2)
+            .expect("continuous second step should apply");
+
+        let resumed_second_loss =
+            qwen_causal_lm_loss(&input_ids, &resumed_weights, &config).expect("loss should run");
+        resumed_second_loss.backward();
+        resumed_registry
+            .adamw_step(&mut resumed_weights, learning_rate, 2)
+            .expect("resumed second step should apply");
+
+        let continuous_after_second = qwen_causal_lm_loss(&input_ids, &continuous_weights, &config)
+            .expect("loss should run")
+            .double_value(&[]);
+        let resumed_after_second = qwen_causal_lm_loss(&input_ids, &resumed_weights, &config)
+            .expect("loss should run")
+            .double_value(&[]);
+        assert!((continuous_after_second - resumed_after_second).abs() < 1e-6);
+
+        for name in representative_trainable_qwen_tensors() {
+            let diff = diff_stats(
+                tensor(&continuous_weights, name).expect("continuous tensor should exist"),
+                tensor(&resumed_weights, name).expect("resumed tensor should exist"),
+            )
+            .expect("diff should compute");
+            assert!(
+                diff.max_abs < 1e-6,
+                "{name} should match after manifest-resumed second step, max_abs={}",
+                diff.max_abs
+            );
+        }
     }
 
     #[test]
