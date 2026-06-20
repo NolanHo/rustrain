@@ -226,6 +226,20 @@ enum Command {
         #[arg(long, default_value_t = 1.0)]
         learning_rate: f64,
     },
+    #[command(hide = true)]
+    QwenSessionDpRankSmoke {
+        #[arg(
+            long,
+            default_value = "/vePFS-Mindverse/share/huggingface/Qwen2.5-0.5B-Instruct"
+        )]
+        model_path: PathBuf,
+        #[arg(long)]
+        output_dir: PathBuf,
+        #[arg(long, default_value = "fp32")]
+        dtype: String,
+        #[arg(long, default_value_t = 1e-6)]
+        learning_rate: f64,
+    },
     Launch {
         #[arg(long)]
         nproc_per_node: usize,
@@ -413,6 +427,17 @@ fn main() -> Result<()> {
             output_dir,
             qwen_module::QwenComputeDType::parse(&dtype)?,
             steps,
+            learning_rate,
+        ),
+        Command::QwenSessionDpRankSmoke {
+            model_path,
+            output_dir,
+            dtype,
+            learning_rate,
+        } => qwen_module::qwen_session_dp_rank_smoke(
+            &model_path,
+            output_dir,
+            qwen_module::QwenComputeDType::parse(&dtype)?,
             learning_rate,
         ),
         Command::Launch {

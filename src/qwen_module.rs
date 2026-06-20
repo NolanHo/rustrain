@@ -223,6 +223,41 @@ struct QwenDpGradientRankSummary {
     checkpoint_path: String,
 }
 
+#[derive(Debug, Serialize)]
+struct QwenSessionDpRankSummary {
+    rank: usize,
+    world_size: usize,
+    local_batch_size: usize,
+    tensor_count: usize,
+    learning_rate: f64,
+    max_grad_delta: f32,
+    loss_delta: f64,
+    local_loss: f64,
+    post_update_loss: f64,
+    global_loss: f64,
+    global_post_update_loss: f64,
+    global_loss_improved: bool,
+    expected_loss: f64,
+    checkpoint_written: bool,
+    checkpoint_path: String,
+    trainable_tensors: Vec<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct QwenSessionDpCheckpointManifest {
+    format: String,
+    writer_rank: usize,
+    world_size: usize,
+    tensor_count: usize,
+    max_grad_delta: f32,
+    expected_loss: f64,
+    dtype: String,
+    learning_rate: f64,
+    post_update_loss: f64,
+    global_post_update_loss: f64,
+    trainable_tensors: Vec<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct QwenGradSignature {
     name: String,
@@ -1490,6 +1525,192 @@ pub fn qwen_dp_gradient_smoke(
     Ok(())
 }
 
+pub fn qwen_session_dp_rank_smoke(
+    model_path: &Path,
+    output_dir: PathBuf,
+    dtype: QwenComputeDType,
+    learning_rate: f64,
+) -> Result<()> {
+    let rank = parse_env_usize("RANK")?;
+    let local_rank = parse_env_usize("LOCAL_RANK")?;
+    let world_size = parse_env_usize("WORLD_SIZE")?;
+    if world_size != 2 {
+        bail!("Qwen session DP smoke expects WORLD_SIZE=2");
+    }
+    if rank >= world_size {
+        bail!("rank {rank} must be smaller than world_size {world_size}");
+    }
+    if !learning_rate.is_finite() || learning_rate <= 0.0 {
+        bail!("Qwen session DP smoke requires a positive finite learning rate");
+    }
+
+    let device = Device::Cuda(local_rank);
+    fs::create_dir_all(&output_dir)
+        .with_context(|| format!("failed to create {}", output_dir.display()))?;
+    let output_dir = qwen_dp_artifact_dir(&output_dir)?;
+    fs::create_dir_all(&output_dir)
+        .with_context(|| format!("failed to create {}", output_dir.display()))?;
+
+    let config = read_runtime_config(&model_path.join("config.json"))?;
+    let weights = read_safetensors_map(&model_path.join("model.safetensors"))?;
+    let trainable_names = qwen_session_dp_trainable_tensors();
+    let global_input = qwen_session_dp_global_input(&weights, device)?;
+    let local_input = global_input.narrow(0, rank as i64, 1);
+
+    println!("qwen session DP rank {rank}: loading representative session");
+    let mut local_session = QwenTrainableSession::from_names_on_device(
+        config,
+        weights,
+        local_input,
+        dtype.kind(),
+        trainable_names.clone(),
+        device,
+    )?;
+    println!("qwen session DP rank {rank}: running local backward");
+    let local_loss = local_session.loss_and_backward()?;
+    let local_grads = local_session.grad_entries()?;
+
+    let expected_path = output_dir.join("qwen-session-dp-expected-signatures.json");
+    let (expected_loss, expected_signatures) = if rank == 0 {
+        println!("qwen session DP rank {rank}: running expected global backward");
+        let mut expected_session = QwenTrainableSession::from_names_on_device(
+            config,
+            read_safetensors_map(&model_path.join("model.safetensors"))?,
+            global_input.shallow_clone(),
+            dtype.kind(),
+            trainable_names.clone(),
+            device,
+        )?;
+        let expected_loss = expected_session.loss_and_backward()?;
+        let expected_signatures = grad_signatures(&expected_session.grad_entries()?)?;
+        fs::write(
+            &expected_path,
+            serde_json::to_string_pretty(&(expected_loss, &expected_signatures))?,
+        )
+        .with_context(|| format!("failed to write {}", expected_path.display()))?;
+        (expected_loss, expected_signatures)
+    } else {
+        println!("qwen session DP rank {rank}: waiting for expected signatures");
+        wait_for_expected_signatures(&expected_path, Duration::from_secs(300))?
+    };
+
+    println!("qwen session DP rank {rank}: reducing gradient signatures");
+    let mut local_signature_values = Vec::new();
+    let mut expected_signature_values = Vec::new();
+    for ((name, local_grad), expected) in local_grads.iter().zip(expected_signatures.iter()) {
+        if name != &expected.name {
+            bail!(
+                "gradient tensor order mismatch: local {name} != expected {}",
+                expected.name
+            );
+        }
+        let local_signature = grad_signature(name, local_grad)?;
+        local_signature_values.extend(local_signature.values());
+        expected_signature_values.extend(expected.values());
+    }
+    wait_for_rank_barrier(
+        &output_dir.join("qwen-session-dp-gradient-signatures-ready"),
+        rank,
+        world_size,
+        Duration::from_secs(300),
+    )?;
+    let reduced_signatures = nccl_smoke::all_reduce_f32_for_launch(
+        &output_dir.join("qwen-session-dp-gradient-signatures"),
+        &local_signature_values,
+    )?;
+    let averaged_signatures: Vec<f32> = reduced_signatures
+        .into_iter()
+        .map(|value| value / world_size as f32)
+        .collect();
+    let max_grad_delta =
+        signature_values_max_delta(&averaged_signatures, &expected_signature_values)?;
+    let global_loss = expected_loss;
+    let loss_delta = 0.0;
+    if max_grad_delta > 5e-4 {
+        bail!("Qwen session DP gradient mismatch: rank={rank}, max_grad_delta={max_grad_delta}");
+    }
+
+    println!("qwen session DP rank {rank}: reducing full gradients");
+    let averaged_grads = local_session.all_reduce_average_grads(
+        &output_dir.join("qwen-session-dp-full-gradient"),
+        world_size,
+    )?;
+    let trainable_summaries = local_session.apply_sgd_step(&averaged_grads, learning_rate)?;
+    let post_update_loss = local_session.loss_value()?;
+    wait_for_rank_barrier(
+        &output_dir.join("qwen-session-dp-post-update-loss-ready"),
+        rank,
+        world_size,
+        Duration::from_secs(300),
+    )?;
+    let reduced_post_update_loss = nccl_smoke::all_reduce_f32_for_launch(
+        &output_dir.join("qwen-session-dp-post-update-loss"),
+        &[post_update_loss as f32],
+    )?[0];
+    let global_post_update_loss = reduced_post_update_loss as f64 / world_size as f64;
+    let global_loss_improved = global_post_update_loss < global_loss;
+    if !global_loss_improved {
+        bail!(
+            "Qwen session DP update did not reduce global loss: rank={rank}, global_loss={global_loss}, global_post_update_loss={global_post_update_loss}"
+        );
+    }
+
+    let trainable_tensors = local_session.parameter_names();
+    let checkpoint_path = output_dir.join("qwen-session-dp-rank0-checkpoint.json");
+    let checkpoint_written = if rank == 0 {
+        let manifest = QwenSessionDpCheckpointManifest {
+            format: "rustrain.qwen_session_dp_rank0.v1".to_string(),
+            writer_rank: rank,
+            world_size,
+            tensor_count: local_grads.len(),
+            max_grad_delta,
+            expected_loss,
+            dtype: dtype.label().to_string(),
+            learning_rate,
+            post_update_loss,
+            global_post_update_loss,
+            trainable_tensors: trainable_tensors.clone(),
+        };
+        fs::write(
+            &checkpoint_path,
+            serde_json::to_string_pretty(&manifest)? + "\n",
+        )
+        .with_context(|| format!("failed to write {}", checkpoint_path.display()))?;
+        true
+    } else {
+        false
+    };
+
+    let summary = QwenSessionDpRankSummary {
+        rank,
+        world_size,
+        local_batch_size: local_session.input_ids.size()[0] as usize,
+        tensor_count: local_grads.len(),
+        learning_rate,
+        max_grad_delta,
+        loss_delta,
+        local_loss,
+        post_update_loss,
+        global_loss,
+        global_post_update_loss,
+        global_loss_improved,
+        expected_loss,
+        checkpoint_written,
+        checkpoint_path: checkpoint_path.display().to_string(),
+        trainable_tensors,
+    };
+    let summary_path = output_dir.join(format!("qwen-session-dp-rank-{rank}.json"));
+    fs::write(&summary_path, serde_json::to_string_pretty(&summary)?)
+        .with_context(|| format!("failed to write {}", summary_path.display()))?;
+    println!("{}", serde_json::to_string_pretty(&summary)?);
+    println!(
+        "qwen session DP rank {rank}: updated {} trainable tensors",
+        trainable_summaries.len()
+    );
+
+    Ok(())
+}
+
 fn qwen_dp_artifact_dir(output_dir: &Path) -> Result<PathBuf> {
     let port = std::env::var("MASTER_PORT")
         .context("MASTER_PORT is not set; run through rustrain launch")?;
@@ -1539,12 +1760,26 @@ impl QwenTrainableRegistry {
         Ok(Self { parameters })
     }
 
-    #[cfg(test)]
-    fn parameter_names(&self) -> Vec<String> {
-        self.parameters
-            .iter()
-            .map(|parameter| parameter.name.clone())
-            .collect()
+    fn from_names_on_device(
+        weights: &mut BTreeMap<String, Tensor>,
+        names: Vec<&'static str>,
+        device: Device,
+    ) -> Result<Self> {
+        let mut parameters = Vec::with_capacity(names.len());
+        for name in names {
+            let base = tensor(weights, name)?
+                .to_kind(Kind::Float)
+                .to_device(device);
+            let trainable = base.shallow_clone().set_requires_grad(true);
+            weights.insert(name.to_string(), trainable.shallow_clone());
+            parameters.push(QwenTrainableParameter {
+                name: name.to_string(),
+                tensor: trainable,
+                base: tensor_snapshot(&base),
+                adam: None,
+            });
+        }
+        Ok(Self { parameters })
     }
 
     fn adamw_step(
@@ -1616,6 +1851,72 @@ impl QwenTrainableRegistry {
         for parameter in &mut self.parameters {
             parameter.tensor.zero_grad();
         }
+    }
+
+    fn grad_entries(&self) -> Result<Vec<(String, Tensor)>> {
+        let mut entries = Vec::with_capacity(self.parameters.len());
+        for parameter in &self.parameters {
+            let grad = parameter.tensor.grad();
+            if !grad.defined() {
+                bail!(
+                    "trainable tensor {} did not receive a gradient",
+                    parameter.name
+                );
+            }
+            entries.push((parameter.name.clone(), grad.to_kind(Kind::Float)));
+        }
+        Ok(entries)
+    }
+
+    fn parameter_names(&self) -> Vec<String> {
+        self.parameters
+            .iter()
+            .map(|parameter| parameter.name.clone())
+            .collect()
+    }
+
+    fn apply_sgd_step(
+        &mut self,
+        weights: &mut BTreeMap<String, Tensor>,
+        averaged_grads: &[(String, Tensor)],
+        learning_rate: f64,
+    ) -> Result<Vec<TrainableTensorSummary>> {
+        if averaged_grads.len() != self.parameters.len() {
+            bail!(
+                "averaged gradient count mismatch: got {}, expected {}",
+                averaged_grads.len(),
+                self.parameters.len()
+            );
+        }
+        let mut summaries = Vec::with_capacity(self.parameters.len());
+        for (parameter, (grad_name, grad)) in self.parameters.iter_mut().zip(averaged_grads.iter())
+        {
+            if &parameter.name != grad_name {
+                bail!(
+                    "averaged gradient order mismatch: got {}, expected {}",
+                    grad_name,
+                    parameter.name
+                );
+            }
+            let grad = grad.to_device(parameter.tensor.device());
+            let grad_norm = grad.norm().double_value(&[]);
+            if grad_norm <= 0.0 {
+                bail!("averaged gradient for {} has zero norm", parameter.name);
+            }
+            let update = &grad * learning_rate;
+            let _ = no_grad(|| parameter.tensor.f_sub_(&update))?;
+            weights.insert(parameter.name.clone(), parameter.tensor.shallow_clone());
+            let delta_norm = (&parameter.tensor - &parameter.base)
+                .norm()
+                .double_value(&[]);
+            summaries.push(TrainableTensorSummary {
+                name: parameter.name.clone(),
+                grad_defined: true,
+                grad_norm,
+                delta_norm,
+            });
+        }
+        Ok(summaries)
     }
 
     fn apply_delta_checkpoint(
@@ -1705,6 +2006,30 @@ impl QwenTrainableSession {
         })
     }
 
+    fn from_names_on_device(
+        config: QwenRuntimeConfig,
+        mut weights: BTreeMap<String, Tensor>,
+        input_ids: Tensor,
+        compute_kind: Kind,
+        names: Vec<&'static str>,
+        device: Device,
+    ) -> Result<Self> {
+        if input_ids.size()[1] < 2 {
+            bail!("training fixture must contain at least two tokens");
+        }
+        for tensor in weights.values_mut() {
+            *tensor = tensor.to_device(device);
+        }
+        let registry = QwenTrainableRegistry::from_names_on_device(&mut weights, names, device)?;
+        Ok(Self {
+            config,
+            weights,
+            input_ids: input_ids.to_device(device),
+            compute_kind,
+            registry,
+        })
+    }
+
     fn from_manifest(
         config: QwenRuntimeConfig,
         mut weights: BTreeMap<String, Tensor>,
@@ -1735,7 +2060,7 @@ impl QwenTrainableSession {
         .double_value(&[]))
     }
 
-    fn train_step(&mut self, learning_rate: f64, step: i32) -> Result<QwenTrainStepResult> {
+    fn loss_and_backward(&mut self) -> Result<f64> {
         self.registry.zero_grad();
         let loss = qwen_causal_lm_loss_with_kind(
             &self.input_ids,
@@ -1743,8 +2068,46 @@ impl QwenTrainableSession {
             &self.config,
             self.compute_kind,
         )?;
-        let loss_before = loss.double_value(&[]);
+        let loss_value = loss.double_value(&[]);
         loss.backward();
+        Ok(loss_value)
+    }
+
+    fn grad_entries(&self) -> Result<Vec<(String, Tensor)>> {
+        self.registry.grad_entries()
+    }
+
+    fn parameter_names(&self) -> Vec<String> {
+        self.registry.parameter_names()
+    }
+
+    fn all_reduce_average_grads(
+        &self,
+        output_dir: &Path,
+        world_size: usize,
+    ) -> Result<Vec<(String, Tensor)>> {
+        let mut averaged = Vec::new();
+        for (index, (name, grad)) in self.grad_entries()?.into_iter().enumerate() {
+            let reduced = nccl_smoke::all_reduce_tensor_f32_for_launch(
+                &output_dir.join(format!("grad-{index}")),
+                &grad,
+            )?;
+            averaged.push((name, reduced / world_size as f64));
+        }
+        Ok(averaged)
+    }
+
+    fn apply_sgd_step(
+        &mut self,
+        averaged_grads: &[(String, Tensor)],
+        learning_rate: f64,
+    ) -> Result<Vec<TrainableTensorSummary>> {
+        self.registry
+            .apply_sgd_step(&mut self.weights, averaged_grads, learning_rate)
+    }
+
+    fn train_step(&mut self, learning_rate: f64, step: i32) -> Result<QwenTrainStepResult> {
+        let loss_before = self.loss_and_backward()?;
         let artifacts = self
             .registry
             .adamw_step(&mut self.weights, learning_rate, step)?;
@@ -2105,6 +2468,40 @@ fn representative_trainable_qwen_tensors() -> Vec<&'static str> {
         "model.layers.0.mlp.down_proj.weight",
         "model.norm.weight",
     ]
+}
+
+fn qwen_session_dp_trainable_tensors() -> Vec<&'static str> {
+    vec![
+        "model.layers.0.input_layernorm.weight",
+        "model.layers.0.self_attn.q_proj.weight",
+        "model.layers.0.self_attn.q_proj.bias",
+        "model.layers.0.self_attn.k_proj.weight",
+        "model.layers.0.self_attn.k_proj.bias",
+        "model.layers.0.self_attn.v_proj.weight",
+        "model.layers.0.self_attn.v_proj.bias",
+        "model.layers.0.self_attn.o_proj.weight",
+        "model.layers.0.post_attention_layernorm.weight",
+        "model.layers.0.mlp.gate_proj.weight",
+        "model.layers.0.mlp.up_proj.weight",
+        "model.layers.0.mlp.down_proj.weight",
+        "model.norm.weight",
+    ]
+}
+
+fn qwen_session_dp_global_input(
+    weights: &BTreeMap<String, Tensor>,
+    device: Device,
+) -> Result<Tensor> {
+    let vocab_size = tensor(weights, "model.embed_tokens.weight")?.size()[0];
+    if vocab_size < 2048 {
+        bail!("Qwen session DP smoke expects vocab_size >= 2048, got {vocab_size}");
+    }
+    Ok(
+        Tensor::from_slice(&[101_i64, 872, 198, 3838, 645, 211, 777, 198, 1339, 899])
+            .reshape([2, 5])
+            .to_kind(Kind::Int64)
+            .to_device(device),
+    )
 }
 
 fn read_runtime_config(path: &Path) -> Result<QwenRuntimeConfig> {
