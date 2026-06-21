@@ -168,11 +168,20 @@ struct QwenSessionTpRankSummary {
     layer0_train_final_loss: f64,
     layer0_train_loss_improved: bool,
     layer0_train_learning_rate: f64,
+    layer0_train_q_grad_norm: f64,
+    layer0_train_k_grad_norm: f64,
+    layer0_train_v_grad_norm: f64,
+    layer0_train_o_grad_norm: f64,
+    layer0_train_gate_grad_norm: f64,
+    layer0_train_up_grad_norm: f64,
+    layer0_train_down_grad_norm: f64,
     sharded_rank_manifest_output: String,
     sharded_global_manifest_output: String,
     sharded_manifest_tensor_count: usize,
     sharded_restore_max_abs: f64,
     sharded_restore_mean_abs: f64,
+    sharded_next_update_max_abs: f64,
+    sharded_next_update_mean_abs: f64,
     mlp_intermediate_start: i64,
     mlp_intermediate_end: i64,
     mlp_activation_shard_shape: Vec<i64>,
@@ -207,6 +216,32 @@ struct QwenTpAttentionShardWeights<'a> {
     v_proj: &'a Tensor,
     v_bias: &'a Tensor,
     o_proj: &'a Tensor,
+}
+
+struct QwenSessionTpLayer0SgdUpdate {
+    initial_loss: f64,
+    final_loss: f64,
+    initial_output: Tensor,
+    final_output: Tensor,
+    q_grad_norm: f64,
+    k_grad_norm: f64,
+    v_grad_norm: f64,
+    o_grad_norm: f64,
+    gate_grad_norm: f64,
+    up_grad_norm: f64,
+    down_grad_norm: f64,
+}
+
+struct QwenSessionTpFocusedLayer0Shards {
+    input_norm: Tensor,
+    post_attention_norm: Tensor,
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    o: Tensor,
+    gate: Tensor,
+    up: Tensor,
+    down: Tensor,
 }
 
 #[derive(Debug, Deserialize)]
@@ -5493,153 +5528,32 @@ fn qwen_session_tp_rank_smoke(
     }
 
     let layer0_target = (&full_layer0 * 0.5).detach();
-    let layer0_train_q = q_shard_base
-        .detach()
-        .shallow_clone()
-        .set_requires_grad(true);
-    let layer0_train_k = k_shard_base
-        .detach()
-        .shallow_clone()
-        .set_requires_grad(true);
-    let layer0_train_v = v_shard_base
-        .detach()
-        .shallow_clone()
-        .set_requires_grad(true);
-    let layer0_train_o = o_shard_base
-        .detach()
-        .shallow_clone()
-        .set_requires_grad(true);
-    let layer0_train_gate = gate_shard_base
-        .detach()
-        .shallow_clone()
-        .set_requires_grad(true);
-    let layer0_train_up = up_shard_base
-        .detach()
-        .shallow_clone()
-        .set_requires_grad(true);
-    let layer0_train_down = down_shard_base
-        .detach()
-        .shallow_clone()
-        .set_requires_grad(true);
-    let (layer0_train_initial_loss, layer0_output_grad, layer0_initial_output) =
-        qwen_session_tp_layer0_global_mse_loss_and_grad(
-            &layer0_input,
-            &input_norm_full,
-            &post_attention_norm_full,
-            QwenTpAttentionShardWeights {
-                q_proj: &layer0_train_q,
-                q_bias: &q_bias_full.narrow(0, q_output_start, q_output_size),
-                k_proj: &layer0_train_k,
-                k_bias: &k_bias_full.narrow(0, kv_output_start, kv_output_size),
-                v_proj: &layer0_train_v,
-                v_bias: &v_bias_full.narrow(0, kv_output_start, kv_output_size),
-                o_proj: &layer0_train_o,
-            },
-            &layer0_train_gate,
-            &layer0_train_up,
-            &layer0_train_down,
-            &runtime_config,
-            attention.q_heads_per_rank,
-            attention.kv_heads_per_rank,
-            &layer0_target,
-            &output_dir.join("layer0-train-initial"),
-        )?;
-    let layer0_attention_contribution = qwen_session_tp_layer0_local_contributions(
-        &layer0_input,
-        &input_norm_full,
-        QwenTpAttentionShardWeights {
-            q_proj: &layer0_train_q,
-            q_bias: &q_bias_full.narrow(0, q_output_start, q_output_size),
-            k_proj: &layer0_train_k,
-            k_bias: &k_bias_full.narrow(0, kv_output_start, kv_output_size),
-            v_proj: &layer0_train_v,
-            v_bias: &v_bias_full.narrow(0, kv_output_start, kv_output_size),
-            o_proj: &layer0_train_o,
-        },
-        &runtime_config,
-        attention.q_heads_per_rank,
-        attention.kv_heads_per_rank,
-    );
-    let reduced_attention_for_train = nccl_smoke::all_reduce_tensor_f32_for_launch(
-        &output_dir.join("layer0-train-backward-attention"),
-        &layer0_attention_contribution,
-    )?;
-    let layer0_mlp_contribution = qwen_session_tp_layer0_mlp_contribution(
-        &layer0_input,
-        &post_attention_norm_full,
-        &reduced_attention_for_train.detach(),
-        &layer0_train_gate,
-        &layer0_train_up,
-        &layer0_train_down,
-        &runtime_config,
-    );
-    ((layer0_attention_contribution + layer0_mlp_contribution) * layer0_output_grad)
-        .sum(Kind::Float)
-        .backward();
-    let layer0_grads = [
-        ("q", layer0_train_q.grad()),
-        ("k", layer0_train_k.grad()),
-        ("v", layer0_train_v.grad()),
-        ("o", layer0_train_o.grad()),
-        ("gate", layer0_train_gate.grad()),
-        ("up", layer0_train_up.grad()),
-        ("down", layer0_train_down.grad()),
-    ];
-    for (name, grad) in &layer0_grads {
-        if !grad.defined() || grad.norm().double_value(&[]) <= 0.0 {
-            bail!("Qwen session TP layer0 train smoke expected positive {name} grad norm");
-        }
-    }
-    let layer0_train_learning_rate = 1e-3;
-    let mut candidate_q = layer0_train_q.detach().shallow_clone();
-    let mut candidate_k = layer0_train_k.detach().shallow_clone();
-    let mut candidate_v = layer0_train_v.detach().shallow_clone();
-    let mut candidate_o = layer0_train_o.detach().shallow_clone();
-    let mut candidate_gate = layer0_train_gate.detach().shallow_clone();
-    let mut candidate_up = layer0_train_up.detach().shallow_clone();
-    let mut candidate_down = layer0_train_down.detach().shallow_clone();
-    no_grad(|| -> Result<()> {
-        let _ = candidate_q
-            .f_sub_(&(layer0_train_q.grad().shallow_clone() * layer0_train_learning_rate))?;
-        let _ = candidate_k
-            .f_sub_(&(layer0_train_k.grad().shallow_clone() * layer0_train_learning_rate))?;
-        let _ = candidate_v
-            .f_sub_(&(layer0_train_v.grad().shallow_clone() * layer0_train_learning_rate))?;
-        let _ = candidate_o
-            .f_sub_(&(layer0_train_o.grad().shallow_clone() * layer0_train_learning_rate))?;
-        let _ = candidate_gate
-            .f_sub_(&(layer0_train_gate.grad().shallow_clone() * layer0_train_learning_rate))?;
-        let _ = candidate_up
-            .f_sub_(&(layer0_train_up.grad().shallow_clone() * layer0_train_learning_rate))?;
-        let _ = candidate_down
-            .f_sub_(&(layer0_train_down.grad().shallow_clone() * layer0_train_learning_rate))?;
-        Ok(())
-    })?;
-    let (layer0_train_final_loss, _, _) = qwen_session_tp_layer0_global_mse_loss_and_grad(
+    let layer0_update = qwen_session_tp_layer0_sgd_update(
         &layer0_input,
         &input_norm_full,
         &post_attention_norm_full,
-        QwenTpAttentionShardWeights {
-            q_proj: &candidate_q,
-            q_bias: &q_bias_full.narrow(0, q_output_start, q_output_size),
-            k_proj: &candidate_k,
-            k_bias: &k_bias_full.narrow(0, kv_output_start, kv_output_size),
-            v_proj: &candidate_v,
-            v_bias: &v_bias_full.narrow(0, kv_output_start, kv_output_size),
-            o_proj: &candidate_o,
-        },
-        &candidate_gate,
-        &candidate_up,
-        &candidate_down,
+        &q_shard_base,
+        &q_bias_full.narrow(0, q_output_start, q_output_size),
+        &k_shard_base,
+        &k_bias_full.narrow(0, kv_output_start, kv_output_size),
+        &v_shard_base,
+        &v_bias_full.narrow(0, kv_output_start, kv_output_size),
+        &o_shard_base,
+        &gate_shard_base,
+        &up_shard_base,
+        &down_shard_base,
         &runtime_config,
         attention.q_heads_per_rank,
         attention.kv_heads_per_rank,
         &layer0_target,
-        &output_dir.join("layer0-train-candidate-output"),
+        1e-3,
+        &output_dir.join("layer0-train"),
     )?;
-    if layer0_train_final_loss >= layer0_train_initial_loss {
+    if layer0_update.final_loss >= layer0_update.initial_loss {
         bail!(
-            "Qwen session TP layer0 train smoke did not reduce loss: initial={layer0_train_initial_loss}, final={layer0_train_final_loss}"
+            "Qwen session TP layer0 train smoke did not reduce loss: initial={}, final={}",
+            layer0_update.initial_loss,
+            layer0_update.final_loss
         );
     }
     let (
@@ -5669,7 +5583,7 @@ fn qwen_session_tp_rank_smoke(
         &down_proj_full,
         config,
     )?;
-    let sharded_restore_diff = qwen_session_tp_focused_sharded_restore_diff(
+    let (sharded_restore_diff, restored_shards) = qwen_session_tp_focused_sharded_restore(
         &sharded_global_manifest_output,
         rank,
         &layer0_input,
@@ -5704,6 +5618,37 @@ fn qwen_session_tp_rank_smoke(
             sharded_restore_diff.mean_abs
         );
     }
+    let sharded_update = qwen_session_tp_layer0_sgd_update(
+        &layer0_input,
+        &restored_shards.input_norm,
+        &restored_shards.post_attention_norm,
+        &restored_shards.q,
+        &q_bias_full.narrow(0, q_output_start, q_output_size),
+        &restored_shards.k,
+        &k_bias_full.narrow(0, kv_output_start, kv_output_size),
+        &restored_shards.v,
+        &v_bias_full.narrow(0, kv_output_start, kv_output_size),
+        &restored_shards.o,
+        &restored_shards.gate,
+        &restored_shards.up,
+        &restored_shards.down,
+        &runtime_config,
+        attention.q_heads_per_rank,
+        attention.kv_heads_per_rank,
+        &layer0_target,
+        1e-3,
+        &output_dir.join("layer0-sharded-next-update"),
+    )?;
+    let sharded_next_update_diff =
+        diff_stats(&sharded_update.final_output, &layer0_update.final_output)?;
+    if sharded_next_update_diff.max_abs > 1e-3 {
+        bail!(
+            "Qwen session TP focused sharded next-update parity failed: rank={}, max_abs={}, mean_abs={}",
+            rank,
+            sharded_next_update_diff.max_abs,
+            sharded_next_update_diff.mean_abs
+        );
+    }
 
     let summary = QwenSessionTpRankSummary {
         rank,
@@ -5728,18 +5673,27 @@ fn qwen_session_tp_rank_smoke(
         attention_train_k_grad_norm: attention_k_grad_norm,
         attention_train_v_grad_norm: attention_v_grad_norm,
         attention_train_o_grad_norm: attention_o_grad_norm,
-        layer0_reduced_output_shape: layer0_initial_output.size(),
+        layer0_reduced_output_shape: layer0_update.initial_output.size(),
         layer0_max_abs: layer0_diff.max_abs,
         layer0_mean_abs: layer0_diff.mean_abs,
-        layer0_train_initial_loss,
-        layer0_train_final_loss,
-        layer0_train_loss_improved: layer0_train_final_loss < layer0_train_initial_loss,
-        layer0_train_learning_rate,
+        layer0_train_initial_loss: layer0_update.initial_loss,
+        layer0_train_final_loss: layer0_update.final_loss,
+        layer0_train_loss_improved: layer0_update.final_loss < layer0_update.initial_loss,
+        layer0_train_learning_rate: 1e-3,
+        layer0_train_q_grad_norm: layer0_update.q_grad_norm,
+        layer0_train_k_grad_norm: layer0_update.k_grad_norm,
+        layer0_train_v_grad_norm: layer0_update.v_grad_norm,
+        layer0_train_o_grad_norm: layer0_update.o_grad_norm,
+        layer0_train_gate_grad_norm: layer0_update.gate_grad_norm,
+        layer0_train_up_grad_norm: layer0_update.up_grad_norm,
+        layer0_train_down_grad_norm: layer0_update.down_grad_norm,
         sharded_rank_manifest_output: sharded_rank_manifest_output.display().to_string(),
         sharded_global_manifest_output: sharded_global_manifest_output.display().to_string(),
         sharded_manifest_tensor_count,
         sharded_restore_max_abs: sharded_restore_diff.max_abs,
         sharded_restore_mean_abs: sharded_restore_diff.mean_abs,
+        sharded_next_update_max_abs: sharded_next_update_diff.max_abs,
+        sharded_next_update_mean_abs: sharded_next_update_diff.mean_abs,
         mlp_intermediate_start: intermediate_start,
         mlp_intermediate_end: intermediate_start + intermediate_shard_size,
         mlp_activation_shard_shape: activation_shard.size(),
@@ -6050,7 +6004,7 @@ fn write_qwen_session_tp_focused_sharded_manifest(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn qwen_session_tp_focused_sharded_restore_diff(
+fn qwen_session_tp_focused_sharded_restore(
     global_manifest_output: &Path,
     rank: usize,
     layer0_input: &Tensor,
@@ -6063,7 +6017,7 @@ fn qwen_session_tp_focused_sharded_restore_diff(
     kv_heads_per_rank: i64,
     reduce_dir: &Path,
     expected_shards: &[(&str, &Tensor)],
-) -> Result<DiffStats> {
+) -> Result<(DiffStats, QwenSessionTpFocusedLayer0Shards)> {
     let global_text = fs::read_to_string(global_manifest_output)
         .with_context(|| format!("failed to read {}", global_manifest_output.display()))?;
     let global_manifest: QwenShardedCheckpointManifest = serde_json::from_str(&global_text)
@@ -6120,29 +6074,220 @@ fn qwen_session_tp_focused_sharded_restore_diff(
     let down_shard = tensor(&shard_tensors, "model.layers.0.mlp.down_proj.weight")?
         .to_kind(Kind::Float)
         .to_device(layer0_input.device());
+    let restored_shards = QwenSessionTpFocusedLayer0Shards {
+        input_norm,
+        post_attention_norm,
+        q: q_shard,
+        k: k_shard,
+        v: v_shard,
+        o: o_shard,
+        gate: gate_shard,
+        up: up_shard,
+        down: down_shard,
+    };
     let (_, _, restored_layer0) = qwen_session_tp_layer0_global_mse_loss_and_grad(
         layer0_input,
-        &input_norm,
-        &post_attention_norm,
+        &restored_shards.input_norm,
+        &restored_shards.post_attention_norm,
         QwenTpAttentionShardWeights {
-            q_proj: &q_shard,
+            q_proj: &restored_shards.q,
             q_bias: q_bias_shard,
-            k_proj: &k_shard,
+            k_proj: &restored_shards.k,
             k_bias: k_bias_shard,
-            v_proj: &v_shard,
+            v_proj: &restored_shards.v,
             v_bias: v_bias_shard,
-            o_proj: &o_shard,
+            o_proj: &restored_shards.o,
         },
-        &gate_shard,
-        &up_shard,
-        &down_shard,
+        &restored_shards.gate,
+        &restored_shards.up,
+        &restored_shards.down,
         runtime_config,
         q_heads_per_rank,
         kv_heads_per_rank,
         full_layer0,
         reduce_dir,
     )?;
-    diff_stats(&restored_layer0, full_layer0)
+    Ok((diff_stats(&restored_layer0, full_layer0)?, restored_shards))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn qwen_session_tp_layer0_sgd_update(
+    input: &Tensor,
+    input_norm_weight: &Tensor,
+    post_attention_norm_weight: &Tensor,
+    q_shard_weight: &Tensor,
+    q_bias_shard: &Tensor,
+    k_shard_weight: &Tensor,
+    k_bias_shard: &Tensor,
+    v_shard_weight: &Tensor,
+    v_bias_shard: &Tensor,
+    o_shard_weight: &Tensor,
+    gate_shard_weight: &Tensor,
+    up_shard_weight: &Tensor,
+    down_shard_weight: &Tensor,
+    config: &QwenRuntimeConfig,
+    q_heads_per_rank: i64,
+    kv_heads_per_rank: i64,
+    target: &Tensor,
+    learning_rate: f64,
+    reduce_dir: &Path,
+) -> Result<QwenSessionTpLayer0SgdUpdate> {
+    let train_q = q_shard_weight
+        .detach()
+        .shallow_clone()
+        .set_requires_grad(true);
+    let train_k = k_shard_weight
+        .detach()
+        .shallow_clone()
+        .set_requires_grad(true);
+    let train_v = v_shard_weight
+        .detach()
+        .shallow_clone()
+        .set_requires_grad(true);
+    let train_o = o_shard_weight
+        .detach()
+        .shallow_clone()
+        .set_requires_grad(true);
+    let train_gate = gate_shard_weight
+        .detach()
+        .shallow_clone()
+        .set_requires_grad(true);
+    let train_up = up_shard_weight
+        .detach()
+        .shallow_clone()
+        .set_requires_grad(true);
+    let train_down = down_shard_weight
+        .detach()
+        .shallow_clone()
+        .set_requires_grad(true);
+    let (initial_loss, output_grad, initial_output) =
+        qwen_session_tp_layer0_global_mse_loss_and_grad(
+            input,
+            input_norm_weight,
+            post_attention_norm_weight,
+            QwenTpAttentionShardWeights {
+                q_proj: &train_q,
+                q_bias: q_bias_shard,
+                k_proj: &train_k,
+                k_bias: k_bias_shard,
+                v_proj: &train_v,
+                v_bias: v_bias_shard,
+                o_proj: &train_o,
+            },
+            &train_gate,
+            &train_up,
+            &train_down,
+            config,
+            q_heads_per_rank,
+            kv_heads_per_rank,
+            target,
+            &reduce_dir.join("initial"),
+        )?;
+    let attention_contribution = qwen_session_tp_layer0_local_contributions(
+        input,
+        input_norm_weight,
+        QwenTpAttentionShardWeights {
+            q_proj: &train_q,
+            q_bias: q_bias_shard,
+            k_proj: &train_k,
+            k_bias: k_bias_shard,
+            v_proj: &train_v,
+            v_bias: v_bias_shard,
+            o_proj: &train_o,
+        },
+        config,
+        q_heads_per_rank,
+        kv_heads_per_rank,
+    );
+    let reduced_attention_for_train = nccl_smoke::all_reduce_tensor_f32_for_launch(
+        &reduce_dir.join("backward-attention"),
+        &attention_contribution,
+    )?;
+    let mlp_contribution = qwen_session_tp_layer0_mlp_contribution(
+        input,
+        post_attention_norm_weight,
+        &reduced_attention_for_train.detach(),
+        &train_gate,
+        &train_up,
+        &train_down,
+        config,
+    );
+    ((attention_contribution + mlp_contribution) * output_grad)
+        .sum(Kind::Float)
+        .backward();
+    let q_grad = train_q.grad();
+    let k_grad = train_k.grad();
+    let v_grad = train_v.grad();
+    let o_grad = train_o.grad();
+    let gate_grad = train_gate.grad();
+    let up_grad = train_up.grad();
+    let down_grad = train_down.grad();
+    let layer0_grads = [
+        ("q", &q_grad),
+        ("k", &k_grad),
+        ("v", &v_grad),
+        ("o", &o_grad),
+        ("gate", &gate_grad),
+        ("up", &up_grad),
+        ("down", &down_grad),
+    ];
+    for (name, grad) in layer0_grads {
+        if !grad.defined() || grad.norm().double_value(&[]) <= 0.0 {
+            bail!("Qwen session TP layer0 train smoke expected positive {name} grad norm");
+        }
+    }
+    let mut candidate_q = train_q.detach().shallow_clone();
+    let mut candidate_k = train_k.detach().shallow_clone();
+    let mut candidate_v = train_v.detach().shallow_clone();
+    let mut candidate_o = train_o.detach().shallow_clone();
+    let mut candidate_gate = train_gate.detach().shallow_clone();
+    let mut candidate_up = train_up.detach().shallow_clone();
+    let mut candidate_down = train_down.detach().shallow_clone();
+    no_grad(|| -> Result<()> {
+        let _ = candidate_q.f_sub_(&(q_grad.shallow_clone() * learning_rate))?;
+        let _ = candidate_k.f_sub_(&(k_grad.shallow_clone() * learning_rate))?;
+        let _ = candidate_v.f_sub_(&(v_grad.shallow_clone() * learning_rate))?;
+        let _ = candidate_o.f_sub_(&(o_grad.shallow_clone() * learning_rate))?;
+        let _ = candidate_gate.f_sub_(&(gate_grad.shallow_clone() * learning_rate))?;
+        let _ = candidate_up.f_sub_(&(up_grad.shallow_clone() * learning_rate))?;
+        let _ = candidate_down.f_sub_(&(down_grad.shallow_clone() * learning_rate))?;
+        Ok(())
+    })?;
+    let (final_loss, _, final_output) = qwen_session_tp_layer0_global_mse_loss_and_grad(
+        input,
+        input_norm_weight,
+        post_attention_norm_weight,
+        QwenTpAttentionShardWeights {
+            q_proj: &candidate_q,
+            q_bias: q_bias_shard,
+            k_proj: &candidate_k,
+            k_bias: k_bias_shard,
+            v_proj: &candidate_v,
+            v_bias: v_bias_shard,
+            o_proj: &candidate_o,
+        },
+        &candidate_gate,
+        &candidate_up,
+        &candidate_down,
+        config,
+        q_heads_per_rank,
+        kv_heads_per_rank,
+        target,
+        &reduce_dir.join("candidate-output"),
+    )?;
+    Ok(QwenSessionTpLayer0SgdUpdate {
+        initial_loss,
+        final_loss,
+        initial_output,
+        final_output,
+        q_grad_norm: q_grad.norm().double_value(&[]),
+        k_grad_norm: k_grad.norm().double_value(&[]),
+        v_grad_norm: v_grad.norm().double_value(&[]),
+        o_grad_norm: o_grad.norm().double_value(&[]),
+        gate_grad_norm: gate_grad.norm().double_value(&[]),
+        up_grad_norm: up_grad.norm().double_value(&[]),
+        down_grad_norm: down_grad.norm().double_value(&[]),
+    })
 }
 
 #[allow(clippy::too_many_arguments)]

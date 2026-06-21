@@ -147,10 +147,11 @@ loss-reducing joint attention+MLP shard update. The smoke writes rank-owned
 focused TP shard manifests for layer0 attention/MLP tensors under the shared
 `rustrain.qwen_sharded.v1` schema, with zero Adam slots as checkpoint-contract
 evidence, and restores those rank-owned shards to reproduce the focused fused
-layer0 output within tolerance. Real production tensor-parallel Qwen training
-is not implemented yet; the remaining TP gap is full train-step execution,
-full-parameter TP backward/update, autograd-aware production collectives, and
-sharded checkpoint next-step resume.
+layer0 output plus the next focused shard update within tolerance. Real
+production tensor-parallel Qwen training is not implemented yet; the remaining
+TP gap is full train-step execution, full-parameter TP backward/update,
+autograd-aware production collectives, and trainer-owned sharded checkpoint
+resume.
 The Qwen DP smoke writes a rank0-only JSON checkpoint manifest after gradient
 sync succeeds; non-rank0 summaries record the same checkpoint path but do not
 write it.
@@ -187,8 +188,8 @@ ownership remain open.
   representative DP smoke writes rank-owned shard manifests and verifies
   rank-local sharded reload plus next-step resume parity. The focused TP=2
   layer0 smoke writes rank-owned shards and verifies focused restore output
-  parity from the global sharded manifest. The single-GPU session trainer also
-  has a tokenizer-backed JSONL batch/resume verifier at
+  plus next-update parity from the global sharded manifest. The single-GPU
+  session trainer also has a tokenizer-backed JSONL batch/resume verifier at
   `configs/qwen_session_single_sft.toml`; the DP=2 session trainer has the
   same JSONL batch path at `configs/qwen_session_dp2_sft.toml`. Production
   checkpoint/resume over full real data streams remains open.
@@ -229,9 +230,10 @@ ownership remain open.
   backward/update, fused layer0 TP, and focused TP sharded-manifest smokes also
   run through `train --config configs/qwen_session_tp2.toml`; that focused TP
   path restores rank-owned shards through the global sharded manifest and
-  checks fused layer0 output parity. Real production distributed training is
-  still missing: full Qwen model/data, production TP train-step execution, and
-  production sharded checkpoint ownership are not yet implemented.
+  checks fused layer0 output plus next-update parity. Real production
+  distributed training is still missing: full Qwen model/data, production TP
+  train-step execution, and production sharded checkpoint ownership are not yet
+  implemented.
 - Production distributed checkpoint rules are documented in
   [docs/checkpoints.md](docs/checkpoints.md), with a validated
   `rustrain.qwen_sharded.v1` manifest schema and representative rank-owned

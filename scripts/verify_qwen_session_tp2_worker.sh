@@ -76,6 +76,17 @@ for path in summaries:
         raise SystemExit(
             f"{path} layer0 train final loss {data['layer0_train_final_loss']} is not below initial {data['layer0_train_initial_loss']}"
         )
+    for key in [
+        "layer0_train_q_grad_norm",
+        "layer0_train_k_grad_norm",
+        "layer0_train_v_grad_norm",
+        "layer0_train_o_grad_norm",
+        "layer0_train_gate_grad_norm",
+        "layer0_train_up_grad_norm",
+        "layer0_train_down_grad_norm",
+    ]:
+        if float(data[key]) <= 0.0:
+            raise SystemExit(f"{path} expected positive {key}, got {data[key]}")
     for key in ["mlp_train_gate_grad_norm", "mlp_train_up_grad_norm", "mlp_train_down_grad_norm"]:
         if float(data[key]) <= 0.0:
             raise SystemExit(f"{path} expected positive {key}, got {data[key]}")
@@ -92,6 +103,8 @@ for path in summaries:
         raise SystemExit(f"{path} expected 9 TP sharded manifest tensors, got {data['sharded_manifest_tensor_count']}")
     if float(data["sharded_restore_max_abs"]) > 1e-3:
         raise SystemExit(f"{path} sharded_restore_max_abs too large: {data['sharded_restore_max_abs']}")
+    if float(data["sharded_next_update_max_abs"]) > 1e-3:
+        raise SystemExit(f"{path} sharded_next_update_max_abs too large: {data['sharded_next_update_max_abs']}")
     rank_manifest_path = pathlib.Path(data["sharded_rank_manifest_output"])
     if not rank_manifest_path.exists():
         raise SystemExit(f"{path} missing TP rank sharded manifest {rank_manifest_path}")
@@ -133,6 +146,8 @@ for path in summaries:
             "mlp_train_final_loss": data["mlp_train_final_loss"],
             "sharded_restore_max_abs": data["sharded_restore_max_abs"],
             "sharded_restore_mean_abs": data["sharded_restore_mean_abs"],
+            "sharded_next_update_max_abs": data["sharded_next_update_max_abs"],
+            "sharded_next_update_mean_abs": data["sharded_next_update_mean_abs"],
         }
     )
 
