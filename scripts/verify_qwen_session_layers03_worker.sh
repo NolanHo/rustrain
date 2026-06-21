@@ -5,11 +5,12 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/require_gpu_worker.sh"
 
 CONFIG="${RUSTRAIN_QWEN_SESSION_LAYERS_CONFIG:-configs/qwen_session_single_layers03.toml}"
+EXPECTED_COMPUTE_KIND="${RUSTRAIN_EXPECTED_QWEN_COMPUTE_KIND:-fp32}"
 OUTPUT="$(mktemp)"
 
 cargo run -- train --config "${CONFIG}" | tee "${OUTPUT}"
 
-python - "${OUTPUT}" <<'PY'
+python - "${OUTPUT}" "${EXPECTED_COMPUTE_KIND}" <<'PY'
 import ast
 import pathlib
 import sys
@@ -22,6 +23,7 @@ for line in pathlib.Path(sys.argv[1]).read_text().splitlines():
     values[key] = value
 
 required = [
+    "compute_kind",
     "train_steps",
     "step_losses",
     "first_step_grad_norm",
@@ -38,6 +40,11 @@ missing = [key for key in required if key not in values]
 if missing:
     raise SystemExit(f"layer03 run is missing fields: {missing}")
 
+expected_compute_kind = sys.argv[2]
+if values["compute_kind"] != expected_compute_kind:
+    raise SystemExit(
+        f"expected compute_kind {expected_compute_kind}, got {values['compute_kind']}"
+    )
 if int(values["train_steps"]) != 1:
     raise SystemExit(f"expected train_steps 1, got {values['train_steps']}")
 if int(values["trainable_tensors"]) != 50:
@@ -66,6 +73,7 @@ if float(values["second_step_delta"]) > 1e-5:
 
 print(
     "qwen_session_layers03_verified: "
+    f"compute_kind={values['compute_kind']} "
     f"step_losses={step_losses} "
     f"trainable_tensors={values['trainable_tensors']} "
     f"reload_delta={values['reload_delta']} "

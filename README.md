@@ -164,7 +164,9 @@ trainable transformer layers from `model.trainable_layers` and defaults to
 `[0]`; `configs/qwen_session_single_layers01.toml` verifies a layer0+layer1
 single-GPU path with 26 trainable tensors, and
 `configs/qwen_session_single_layers03.toml` verifies a layer0-layer3
-single-GPU path with 50 trainable tensors. Full production Qwen trainer
+single-GPU path with 50 trainable tensors. The same layer0-layer3 path also
+has bf16 coverage through `configs/qwen_session_single_layers03_bf16.toml`.
+Full production Qwen trainer
 ownership, full real data streaming, and production-grade sharded checkpoint
 ownership remain open.
 
@@ -228,8 +230,9 @@ ownership remain open.
   metrics, and Ray-worker GPU memory reporting are implemented for toy/tch
   paths; real tokenizer-backed padded LoRA SFT batching is wired through
   minimal fp32/bf16 Qwen trainer configs with scheduler and grad clipping. The
-  tiny `tch` CUDA path, representative Qwen session single/DP paths, and Qwen
-  LoRA SFT resume verifier now have explicit bf16 compute-policy coverage.
+  tiny `tch` CUDA path, representative Qwen session single/DP paths, the
+  layer0-layer3 Qwen session path, and Qwen LoRA SFT resume verifier now have
+  explicit bf16 compute-policy coverage.
   Mixed precision over future full production Qwen model/data paths remains
   future work.
 
