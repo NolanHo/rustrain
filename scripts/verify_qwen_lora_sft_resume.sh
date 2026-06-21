@@ -8,28 +8,38 @@ EXPECTED_COMPUTE_KIND="${RUSTRAIN_EXPECTED_QWEN_COMPUTE_KIND:-}"
 
 cargo run -- train --config "${CONFIG}" | tee "${BASE_OUTPUT}"
 
-ADAPTER_OUTPUT="$(
+BASE_MANIFEST_CURSOR="$(
   python - "${BASE_OUTPUT}" <<'PY'
 import pathlib
 import sys
 
+values = {}
 for line in pathlib.Path(sys.argv[1]).read_text().splitlines():
-    if line.startswith("adapter_checkpoint: "):
-        print(line.split(": ", 1)[1])
-        break
-else:
-    raise SystemExit("base run did not print adapter_checkpoint")
+    if ": " in line:
+        key, value = line.split(": ", 1)
+        values[key] = value
+manifest = values.get("adapter_manifest")
+cursor_next = values.get("data_cursor_next")
+if manifest is None:
+    raise SystemExit("base run did not print adapter_manifest")
+if cursor_next is None:
+    raise SystemExit("base run did not print data_cursor_next")
+print(f"{manifest}\t{cursor_next}")
 PY
 )"
+ADAPTER_MANIFEST="${BASE_MANIFEST_CURSOR%%$'\t'*}"
+BASE_DATA_CURSOR_NEXT="${BASE_MANIFEST_CURSOR##*$'\t'}"
 
-cargo run -- train --config "${CONFIG}" --resume-from "${ADAPTER_OUTPUT}" \
+cargo run -- train --config "${CONFIG}" --resume-from "${ADAPTER_MANIFEST}" \
   | tee "${RESUME_OUTPUT}"
 
-python - "${RESUME_OUTPUT}" "${EXPECTED_COMPUTE_KIND}" <<'PY'
+python - "${RESUME_OUTPUT}" "${EXPECTED_COMPUTE_KIND}" "${BASE_DATA_CURSOR_NEXT}" <<'PY'
 import ast
+import math
 import pathlib
 import sys
 
+base_data_cursor_next = int(sys.argv[3])
 values = {}
 for line in pathlib.Path(sys.argv[1]).read_text().splitlines():
     if ": " not in line:
@@ -41,12 +51,19 @@ required = [
     "compute_kind",
     "resume_from",
     "resumed_adapter",
+    "adapter_manifest",
     "dataset_total_samples",
     "dataset_total_tokens",
     "dataset_response_tokens",
     "dataset_masked_positions",
     "dataset_max_sequence_tokens",
     "dataset_order_seed",
+    "data_cursor_start",
+    "data_cursor_end",
+    "data_cursor_next",
+    "batch_size",
+    "global_batch_size",
+    "gradient_accumulation_steps",
     "initial_loss",
     "final_loss",
     "reload_delta",
@@ -82,9 +99,21 @@ for key in [
 ]:
     if int(values[key]) <= 0:
         raise SystemExit(f"{key} must be positive, got {values[key]}")
-if not float(values["final_loss"]) < float(values["initial_loss"]):
+for key in ["initial_loss", "final_loss"]:
+    if not math.isfinite(float(values[key])):
+        raise SystemExit(f"{key} must be finite, got {values[key]}")
+if int(values["data_cursor_start"]) != base_data_cursor_next:
     raise SystemExit(
-        f"resume loss did not improve: initial={values['initial_loss']} final={values['final_loss']}"
+        f"resume data_cursor_start {values['data_cursor_start']} did not continue from base data_cursor_next {base_data_cursor_next}"
+    )
+expected_cursor_end = int(values["data_cursor_start"]) + int(values["steps"]) * int(values["global_batch_size"])
+if int(values["data_cursor_end"]) != expected_cursor_end:
+    raise SystemExit(
+        f"expected data_cursor_end {expected_cursor_end}, got {values['data_cursor_end']}"
+    )
+if int(values["data_cursor_next"]) != expected_cursor_end:
+    raise SystemExit(
+        f"expected data_cursor_next {expected_cursor_end}, got {values['data_cursor_next']}"
     )
 for key in [
     "reload_delta",
@@ -127,6 +156,8 @@ if not generated:
 print(
     "qwen_lora_sft_resume_verified: "
     f"resume_from={values['resume_from']} "
+    f"data_cursor_start={values['data_cursor_start']} "
+    f"data_cursor_next={values['data_cursor_next']} "
     f"initial_loss={values['initial_loss']} "
     f"final_loss={values['final_loss']} "
     f"reload_delta={values['reload_delta']} "

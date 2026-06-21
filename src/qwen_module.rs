@@ -146,6 +146,7 @@ struct QwenLoraTrainSmokeSummary {
 pub(crate) struct QwenLoraSftTrainSummary {
     pub(crate) model_path: String,
     pub(crate) adapter_output: String,
+    pub(crate) adapter_manifest_output: String,
     pub(crate) compute_kind: String,
     pub(crate) step_adapter_checkpoints: Vec<String>,
     pub(crate) resume_from: Option<String>,
@@ -160,6 +161,9 @@ pub(crate) struct QwenLoraSftTrainSummary {
     pub(crate) dataset_masked_positions: usize,
     pub(crate) dataset_max_sequence_tokens: usize,
     pub(crate) dataset_order_seed: u64,
+    pub(crate) data_cursor_start: usize,
+    pub(crate) data_cursor_end: usize,
+    pub(crate) data_cursor_next: usize,
     pub(crate) batch_size: usize,
     pub(crate) global_batch_size: usize,
     pub(crate) gradient_accumulation_steps: usize,
@@ -205,6 +209,27 @@ pub(crate) struct QwenLoraSftTrainSummary {
 pub(crate) struct QwenLoraSftEvalStep {
     pub(crate) step: usize,
     pub(crate) eval_loss: f64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct QwenLoraSftAdapterManifest {
+    format: String,
+    base_model_path: String,
+    adapter_safetensors: String,
+    compute_kind: String,
+    steps: usize,
+    train_step: u64,
+    data_cursor_start: usize,
+    data_cursor_end: usize,
+    data_cursor_next: usize,
+    dataset_order_seed: u64,
+    dataset_total_samples: usize,
+    dataset_train_samples: usize,
+    dataset_eval_samples: usize,
+    batch_size: usize,
+    gradient_accumulation_steps: usize,
+    target_layers: Vec<usize>,
+    target_modules: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -863,6 +888,46 @@ impl QwenLoraSftTrainPolicy {
             dataset_order_seed: 0,
         }
     }
+}
+
+fn qwen_lora_sft_adapter_manifest_path(adapter_output: &Path) -> PathBuf {
+    PathBuf::from(format!("{}.json", adapter_output.display()))
+}
+
+fn read_qwen_lora_sft_resume_manifest(
+    resume_from: &Path,
+) -> Result<Option<QwenLoraSftAdapterManifest>> {
+    if resume_from.extension().and_then(|value| value.to_str()) != Some("json") {
+        return Ok(None);
+    }
+    let text = fs::read_to_string(resume_from)
+        .with_context(|| format!("failed to read {}", resume_from.display()))?;
+    let manifest: QwenLoraSftAdapterManifest = serde_json::from_str(&text)
+        .with_context(|| format!("failed to parse {}", resume_from.display()))?;
+    if manifest.format != "rustrain.qwen_lora_sft_adapter.v1" {
+        bail!(
+            "unsupported Qwen LoRA SFT adapter manifest format {}",
+            manifest.format
+        );
+    }
+    Ok(Some(manifest))
+}
+
+fn write_qwen_lora_sft_adapter_manifest(
+    manifest_output: &Path,
+    manifest: &QwenLoraSftAdapterManifest,
+) -> Result<()> {
+    if let Some(parent) = manifest_output.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+    fs::write(
+        manifest_output,
+        serde_json::to_string_pretty(manifest)
+            .context("failed to serialize Qwen LoRA SFT adapter manifest")?
+            + "\n",
+    )
+    .with_context(|| format!("failed to write {}", manifest_output.display()))
 }
 
 impl QwenComputeDType {
@@ -1552,12 +1617,24 @@ fn qwen_lora_sft_train(
     let (train_dataset, eval_dataset) = dataset.train_eval_split(train_split)?;
     let train_batch_size = sft_batch_size.min(train_dataset.len());
     let eval_batch_size = sft_batch_size.min(eval_dataset.len());
-    let initial_batch = train_dataset.padded_batch(0, train_batch_size)?;
+    let resume_manifest = resume_from
+        .map(read_qwen_lora_sft_resume_manifest)
+        .transpose()?
+        .flatten();
+    let data_cursor_start = resume_manifest
+        .as_ref()
+        .map(|manifest| manifest.data_cursor_next)
+        .unwrap_or(0);
+    let initial_batch = train_dataset.padded_batch(data_cursor_start, train_batch_size)?;
     let eval_batch = eval_dataset.padded_batch(0, eval_batch_size)?;
     let weights = read_safetensors_map(&model_path.join("model.safetensors"))?;
     let config = read_runtime_config(&model_path.join("config.json"))?;
-    let registry = if let Some(resume_from) = resume_from {
-        let registry = QwenLoraRegistry::load(resume_from)?;
+    let resume_adapter_path = resume_manifest
+        .as_ref()
+        .map(|manifest| PathBuf::from(&manifest.adapter_safetensors))
+        .or_else(|| resume_from.map(PathBuf::from));
+    let registry = if let Some(resume_adapter_path) = resume_adapter_path.as_ref() {
+        let registry = QwenLoraRegistry::load(resume_adapter_path)?;
         if registry.config != lora_config {
             bail!(
                 "Qwen LoRA SFT resume adapter config does not match current [lora] config: resume={:?}, current={:?}",
@@ -1618,14 +1695,17 @@ fn qwen_lora_sft_train(
     let mut step_adapter_checkpoints = Vec::new();
     let mut eval_history = Vec::new();
     let train_started = Instant::now();
+    let data_cursor_end =
+        data_cursor_start + steps * gradient_accumulation_steps * train_batch_size;
+    let data_cursor_next = data_cursor_end;
 
     for step in 0..steps {
         for (_, mut tensor) in registry.trainable_tensors() {
             tensor.zero_grad();
         }
         for accumulation_index in 0..gradient_accumulation_steps {
-            let sample_start =
-                (step * gradient_accumulation_steps + accumulation_index) * train_batch_size;
+            let sample_start = data_cursor_start
+                + (step * gradient_accumulation_steps + accumulation_index) * train_batch_size;
             let step_batch = train_dataset.padded_batch(sample_start, train_batch_size)?;
             let loss = qwen_lora_sft_loss(
                 &step_batch.input_ids,
@@ -1750,6 +1830,27 @@ fn qwen_lora_sft_train(
     }
 
     registry.save(adapter_output)?;
+    let adapter_manifest_output = qwen_lora_sft_adapter_manifest_path(adapter_output);
+    let adapter_manifest = QwenLoraSftAdapterManifest {
+        format: "rustrain.qwen_lora_sft_adapter.v1".to_string(),
+        base_model_path: model_path.display().to_string(),
+        adapter_safetensors: adapter_output.display().to_string(),
+        compute_kind: dtype.label().to_string(),
+        steps,
+        train_step: data_cursor_next as u64,
+        data_cursor_start,
+        data_cursor_end,
+        data_cursor_next,
+        dataset_order_seed: policy.dataset_order_seed,
+        dataset_total_samples: dataset_summary.samples,
+        dataset_train_samples: train_dataset.len(),
+        dataset_eval_samples: eval_dataset.len(),
+        batch_size: train_batch_size,
+        gradient_accumulation_steps,
+        target_layers: lora_config.target_layers.clone(),
+        target_modules: lora_config.target_module_names(),
+    };
+    write_qwen_lora_sft_adapter_manifest(&adapter_manifest_output, &adapter_manifest)?;
     let reloaded = QwenLoraRegistry::load(adapter_output)?;
     let reloaded_loss = qwen_lora_sft_loss(
         &initial_batch.input_ids,
@@ -1877,6 +1978,7 @@ fn qwen_lora_sft_train(
     let summary = QwenLoraSftTrainSummary {
         model_path: model_path.display().to_string(),
         adapter_output: adapter_output.display().to_string(),
+        adapter_manifest_output: adapter_manifest_output.display().to_string(),
         compute_kind: dtype.label().to_string(),
         step_adapter_checkpoints,
         resume_from: resume_from.map(|path| path.display().to_string()),
@@ -1891,6 +1993,9 @@ fn qwen_lora_sft_train(
         dataset_masked_positions: dataset_summary.masked_positions,
         dataset_max_sequence_tokens: dataset_summary.max_sequence_tokens,
         dataset_order_seed: policy.dataset_order_seed,
+        data_cursor_start,
+        data_cursor_end,
+        data_cursor_next,
         batch_size: initial_batch.prompt_tokens.len(),
         global_batch_size: train_batch_size * gradient_accumulation_steps,
         gradient_accumulation_steps,

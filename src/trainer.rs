@@ -272,6 +272,9 @@ pub fn train(config_path: &Path, resume_from: Option<PathBuf>) -> Result<()> {
             dataset_masked_positions = summary.dataset_masked_positions,
             dataset_max_sequence_tokens = summary.dataset_max_sequence_tokens,
             dataset_order_seed = summary.dataset_order_seed,
+            data_cursor_start = summary.data_cursor_start,
+            data_cursor_end = summary.data_cursor_end,
+            data_cursor_next = summary.data_cursor_next,
             batch_size = summary.batch_size,
             global_batch_size = summary.global_batch_size,
             gradient_accumulation_steps = summary.gradient_accumulation_steps,
@@ -288,6 +291,7 @@ pub fn train(config_path: &Path, resume_from: Option<PathBuf>) -> Result<()> {
         println!("run_dir: {}", run_paths.root.display());
         println!("resolved_config: {}", run_paths.resolved_config.display());
         println!("adapter_checkpoint: {}", summary.adapter_output);
+        println!("adapter_manifest: {}", summary.adapter_manifest_output);
         println!("compute_kind: {}", summary.compute_kind);
         println!(
             "step_adapter_checkpoints: {:?}",
@@ -314,6 +318,9 @@ pub fn train(config_path: &Path, resume_from: Option<PathBuf>) -> Result<()> {
             summary.dataset_max_sequence_tokens
         );
         println!("dataset_order_seed: {}", summary.dataset_order_seed);
+        println!("data_cursor_start: {}", summary.data_cursor_start);
+        println!("data_cursor_end: {}", summary.data_cursor_end);
+        println!("data_cursor_next: {}", summary.data_cursor_next);
         println!("initial_loss: {:.9}", summary.initial_loss);
         println!("final_loss: {:.9}", summary.final_loss);
         println!("initial_eval_loss: {:.9}", summary.initial_eval_loss);
