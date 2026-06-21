@@ -109,6 +109,10 @@ non-rank0 ranks do not write checkpoint files.
 configured trainable transformer layers `[0, 1]`. That DP path has 25 trainable
 tensors because it excludes the tied embedding and owns the configured layer
 tensors plus final norm.
+`configs/qwen_session_dp2_layers01_sft.toml` combines that multi-layer DP
+training surface with tokenizer-backed JSONL batches, so the rank0 manifest and
+global sharded manifest must also preserve dataset provenance and cursor fields
+for the layer0+layer1 trainable set.
 
 Rank0 artifacts:
 
@@ -156,7 +160,11 @@ optimizer safetensors through the global manifest, verifies reload loss parity,
 and verifies next-step resume parity against a continuous rank0-manifest run.
 The layer0+layer1 DP verifier uses the same global manifest path and checks
 that both rank-local sharded restore and the following sharded train step match
-the continuous rank0-manifest run.
+the continuous rank0-manifest run. Its JSONL variant additionally checks that
+the global sharded manifest's `consumed_samples`, `data_cursor_next`,
+`data_epoch_next`, `data_sample_offset_next`, `data_train_samples`,
+`dataset_source_files`, and `dataset_fingerprint` match the rank-local
+summaries.
 The focused Qwen TP=2 layer0 smoke also writes rank-owned model shard files and
 a global `rustrain.qwen_sharded.v1` manifest for its layer0 attention/MLP tensor
 partitions. That TP manifest is checkpoint-contract evidence only: optimizer

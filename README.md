@@ -112,6 +112,7 @@ RUSTRAIN_RAY_NUM_GPUS=2 scripts/gpu_run.sh env RUSTRAIN_LAUNCH_TIMEOUT_SECS=300 
 RUSTRAIN_RAY_NUM_GPUS=2 scripts/gpu_run.sh env RUSTRAIN_LAUNCH_TIMEOUT_SECS=600 cargo run -- launch --nproc-per-node 2 --output-dir /tmp/rustrain-runs/qwen-session-dp-adamw-smoke qwen-session-dp-rank-smoke --dtype fp32 --steps 2 --learning-rate 0.000001 --output-dir /tmp/rustrain-runs/qwen-session-dp-adamw-smoke/ranks
 RUSTRAIN_RAY_NUM_GPUS=2 scripts/gpu_run.sh env RUSTRAIN_LAUNCH_TIMEOUT_SECS=600 cargo run -- launch --nproc-per-node 2 --output-dir /tmp/rustrain-runs/qwen-session-trainer-dp2 train --config configs/qwen_session_dp2.toml
 RUSTRAIN_RAY_NUM_GPUS=2 scripts/gpu_run.sh env RUSTRAIN_LAUNCH_TIMEOUT_SECS=900 bash scripts/verify_qwen_session_dp2_layers01_worker.sh
+RUSTRAIN_RAY_NUM_GPUS=2 scripts/gpu_run.sh env RUSTRAIN_LAUNCH_TIMEOUT_SECS=900 RUSTRAIN_QWEN_SESSION_DP_LAYERS_CONFIG=configs/qwen_session_dp2_layers01_sft.toml RUSTRAIN_EXPECTED_DATASET_ORDER_SEED=777 bash scripts/verify_qwen_session_dp2_layers01_worker.sh
 RUSTRAIN_RAY_NUM_GPUS=2 scripts/gpu_run.sh cargo run -- launch --nproc-per-node 2 --output-dir /tmp/rustrain-runs/qwen-session-trainer-tp2 train --config configs/qwen_session_tp2.toml
 RUSTRAIN_RAY_NUM_GPUS=2 scripts/gpu_run.sh cargo run -- launch --nproc-per-node 2 --output-dir /tmp/rustrain-runs/ep-rank-local-smoke parallel-ep-rank-smoke --output-dir /tmp/rustrain-runs/ep-rank-local-smoke/ranks
 RUSTRAIN_RAY_NUM_GPUS=2 scripts/gpu_run.sh cargo run -- launch --nproc-per-node 2 --output-dir /tmp/rustrain-runs/ep-nccl-smoke parallel-ep-nccl-rank-smoke --output-dir /tmp/rustrain-runs/ep-nccl-smoke/ranks
@@ -194,6 +195,10 @@ has bf16 coverage through `configs/qwen_session_single_layers03_bf16.toml`.
 trainer path to layer0+layer1. Its verifier expects 25 trainable tensors
 because the representative DP path intentionally excludes the tied embedding
 and trains the configured transformer layers plus final norm.
+`configs/qwen_session_dp2_layers01_sft.toml` runs the same layer0+layer1
+DP trainer over tokenizer-backed JSONL instruction batches and verifies dataset
+provenance, sample cursor progress, rank0 checkpoint parity, and sharded
+checkpoint next-step parity.
 Toy MoE has an explicit single-rank smoke command and verifier:
 `cargo run -- moe-smoke` prints a JSON summary for TinyMoe and DeepSeek-style
 toy MoE stats, and `scripts/verify_moe_smoke_worker.sh` asserts expert load,
@@ -272,7 +277,10 @@ production-grade sharded checkpoint ownership remain open.
   `configs/qwen_session_dp2_sft.toml` extends that representative JSONL batch
   path through the 2-rank DP trainer. `configs/qwen_session_dp2_layers01.toml`
   verifies the same representative DP trainer over layer0+layer1 with sharded
-  checkpoint reload and next-step resume parity.
+  checkpoint reload and next-step resume parity, and
+  `configs/qwen_session_dp2_layers01_sft.toml` extends that multi-layer DP
+  evidence to tokenizer-backed JSONL batches with manifest-backed data cursor
+  and provenance checks.
   Full model/data/checkpoint trainer ownership remains open.
 - G6 trainer-level real SFT data now has minimal Qwen LoRA SFT config paths:
   `train --config configs/qwen_lora_sft.toml` loads tokenizer-backed
