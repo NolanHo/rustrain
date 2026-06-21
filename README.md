@@ -134,9 +134,12 @@ safetensors, and verifies next-step resume parity from that rank0 checkpoint.
 The same representative path is wired through
 `train --config configs/qwen_session_dp2.toml`; bf16 coverage for the same
 representative DP path is available through
-`configs/qwen_session_dp2_bf16.toml`. Full production Qwen trainer ownership,
-real data batching, and production-grade sharded checkpoint/resume rules remain
-open.
+`configs/qwen_session_dp2_bf16.toml`. The session registry now expands
+trainable transformer layers from `model.trainable_layers` and defaults to
+`[0]`; `configs/qwen_session_single_layers01.toml` verifies a layer0+layer1
+single-GPU path with 26 trainable tensors. Full production Qwen trainer
+ownership, real data batching, and production-grade sharded checkpoint/resume
+rules remain open.
 
 ## Current Major Gaps
 
@@ -153,7 +156,9 @@ open.
   single-GPU plus DP=2 config paths are wired through `train --config`. The
   single-GPU path now respects configured `max_steps` and reports step losses.
   It can also resume from its saved delta manifest through `--resume-from` and
-  reports throughput, gradient norm, RSS, and GPU memory metrics.
+  reports throughput, gradient norm, RSS, and GPU memory metrics. The session
+  registry can now expand configured trainable layer sets instead of being
+  fixed to layer0.
   Full model/data/checkpoint trainer ownership remains open.
 - G6 trainer-level real SFT data now has minimal Qwen LoRA SFT config paths:
   `train --config configs/qwen_lora_sft.toml` loads tokenizer-backed

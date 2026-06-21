@@ -46,6 +46,8 @@ pub struct ModelConfig {
     pub activation: String,
     pub rope: bool,
     pub rms_norm_eps: f32,
+    #[serde(default)]
+    pub trainable_layers: Option<Vec<usize>>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -164,6 +166,20 @@ pub fn validate_config(config: &Config) -> Result<()> {
     }
     if model.num_layers == 0 {
         return Err(anyhow!("num_layers must be greater than zero"));
+    }
+    if let Some(trainable_layers) = &model.trainable_layers {
+        if trainable_layers.is_empty() {
+            return Err(anyhow!("model.trainable_layers must not be empty when set"));
+        }
+        for layer in trainable_layers {
+            if *layer >= model.num_layers {
+                return Err(anyhow!(
+                    "model.trainable_layers contains layer {} outside model.num_layers {}",
+                    layer,
+                    model.num_layers
+                ));
+            }
+        }
     }
     if model.num_attention_heads == 0 || model.num_key_value_heads == 0 {
         return Err(anyhow!(
@@ -444,6 +460,7 @@ mod tests {
                 activation: "swiglu".to_string(),
                 rope: true,
                 rms_norm_eps: 1e-6,
+                trainable_layers: None,
             },
             train: TrainConfig {
                 max_steps: 2,

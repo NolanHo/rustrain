@@ -443,6 +443,7 @@ fn main() -> Result<()> {
             qwen_module::QwenComputeDType::parse(&dtype)?,
             steps,
             learning_rate,
+            &[0],
         ),
         Command::Launch {
             nproc_per_node,

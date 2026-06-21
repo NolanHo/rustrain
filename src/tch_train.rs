@@ -570,6 +570,7 @@ mod tests {
                 activation: "swiglu".to_string(),
                 rope: true,
                 rms_norm_eps: 1e-6,
+                trainable_layers: None,
             },
             train: TrainConfig {
                 max_steps: 3,

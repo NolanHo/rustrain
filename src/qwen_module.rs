@@ -2132,6 +2132,7 @@ fn qwen_session_single_summary(
     train_steps: usize,
     learning_rate: f64,
     resume_from: Option<&Path>,
+    trainable_layers: &[usize],
 ) -> Result<QwenFullTrainSmokeSummary> {
     if train_steps == 0 {
         bail!("qwen session single trainer requires max_steps > 0");
@@ -2165,7 +2166,13 @@ fn qwen_session_single_summary(
         )
     } else {
         (
-            QwenTrainableSession::from_weights(config, weights, input_ids, dtype.kind())?,
+            QwenTrainableSession::from_trainable_layers(
+                config,
+                weights,
+                input_ids,
+                dtype.kind(),
+                trainable_layers,
+            )?,
             1,
         )
     };
@@ -2519,6 +2526,7 @@ pub fn qwen_session_dp_rank_smoke(
     dtype: QwenComputeDType,
     steps: usize,
     learning_rate: f64,
+    trainable_layers: &[usize],
 ) -> Result<()> {
     let rank = parse_env_usize("RANK")?;
     let local_rank = parse_env_usize("LOCAL_RANK")?;
@@ -2545,17 +2553,17 @@ pub fn qwen_session_dp_rank_smoke(
 
     let config = read_runtime_config(&model_path.join("config.json"))?;
     let weights = read_safetensors_map(&model_path.join("model.safetensors"))?;
-    let trainable_names = qwen_session_dp_trainable_tensors();
     let global_input = qwen_session_dp_global_input(&weights, device)?;
     let local_input = global_input.narrow(0, rank as i64, 1);
 
     println!("qwen session DP rank {rank}: loading representative session");
-    let mut local_session = QwenTrainableSession::from_names_on_device(
+    let mut local_session = QwenTrainableSession::from_trainable_layers_on_device(
         config,
         weights,
         local_input.shallow_clone(),
         dtype.kind(),
-        trainable_names.clone(),
+        trainable_layers,
+        false,
         device,
     )?;
     println!("qwen session DP rank {rank}: running local backward");
@@ -2565,12 +2573,13 @@ pub fn qwen_session_dp_rank_smoke(
     let expected_path = output_dir.join("qwen-session-dp-expected-signatures.json");
     let (expected_loss, expected_signatures) = if rank == 0 {
         println!("qwen session DP rank {rank}: running expected global backward");
-        let mut expected_session = QwenTrainableSession::from_names_on_device(
+        let mut expected_session = QwenTrainableSession::from_trainable_layers_on_device(
             config,
             read_safetensors_map(&model_path.join("model.safetensors"))?,
             global_input.shallow_clone(),
             dtype.kind(),
-            trainable_names.clone(),
+            trainable_layers,
+            false,
             device,
         )?;
         let expected_loss = expected_session.loss_and_backward()?;
@@ -3104,6 +3113,7 @@ pub fn train_qwen_session_dp_from_config(config: &Config, _run_paths: &RunPaths)
         dtype,
         config.train.max_steps as usize,
         config.train.learning_rate as f64,
+        &qwen_session_trainable_layers_from_config(config),
     )
 }
 
@@ -3144,6 +3154,7 @@ pub(crate) fn train_qwen_session_single_from_config(
         config.train.max_steps as usize,
         config.train.learning_rate as f64,
         config.train.resume_from.as_deref(),
+        &qwen_session_trainable_layers_from_config(config),
     )
 }
 
@@ -3177,17 +3188,14 @@ impl QwenTrainableRegistry {
         Self::from_names(weights, representative_trainable_qwen_tensors())
     }
 
-    fn from_names(
-        weights: &mut BTreeMap<String, Tensor>,
-        names: Vec<&'static str>,
-    ) -> Result<Self> {
+    fn from_names(weights: &mut BTreeMap<String, Tensor>, names: Vec<String>) -> Result<Self> {
         let mut parameters = Vec::with_capacity(names.len());
         for name in names {
-            let base = tensor(weights, name)?.to_kind(Kind::Float);
+            let base = tensor(weights, &name)?.to_kind(Kind::Float);
             let trainable = base.shallow_clone().set_requires_grad(true);
-            weights.insert(name.to_string(), trainable.shallow_clone());
+            weights.insert(name.clone(), trainable.shallow_clone());
             parameters.push(QwenTrainableParameter {
-                name: name.to_string(),
+                name,
                 tensor: trainable,
                 base: tensor_snapshot(&base),
                 adam: None,
@@ -3198,18 +3206,18 @@ impl QwenTrainableRegistry {
 
     fn from_names_on_device(
         weights: &mut BTreeMap<String, Tensor>,
-        names: Vec<&'static str>,
+        names: Vec<String>,
         device: Device,
     ) -> Result<Self> {
         let mut parameters = Vec::with_capacity(names.len());
         for name in names {
-            let base = tensor(weights, name)?
+            let base = tensor(weights, &name)?
                 .to_kind(Kind::Float)
                 .to_device(device);
             let trainable = base.shallow_clone().set_requires_grad(true);
-            weights.insert(name.to_string(), trainable.shallow_clone());
+            weights.insert(name.clone(), trainable.shallow_clone());
             parameters.push(QwenTrainableParameter {
-                name: name.to_string(),
+                name,
                 tensor: trainable,
                 base: tensor_snapshot(&base),
                 adam: None,
@@ -3424,12 +3432,48 @@ impl QwenTrainableSession {
         })
     }
 
+    fn from_trainable_layers(
+        config: QwenRuntimeConfig,
+        weights: BTreeMap<String, Tensor>,
+        input_ids: Tensor,
+        compute_kind: Kind,
+        trainable_layers: &[usize],
+    ) -> Result<Self> {
+        Self::from_names(
+            config,
+            weights,
+            input_ids,
+            compute_kind,
+            qwen_trainable_tensors_for_layers(trainable_layers, true),
+        )
+    }
+
+    fn from_names(
+        config: QwenRuntimeConfig,
+        mut weights: BTreeMap<String, Tensor>,
+        input_ids: Tensor,
+        compute_kind: Kind,
+        names: Vec<String>,
+    ) -> Result<Self> {
+        if input_ids.size()[1] < 2 {
+            bail!("training fixture must contain at least two tokens");
+        }
+        let registry = QwenTrainableRegistry::from_names(&mut weights, names)?;
+        Ok(Self {
+            config,
+            weights,
+            input_ids,
+            compute_kind,
+            registry,
+        })
+    }
+
     fn from_names_on_device(
         config: QwenRuntimeConfig,
         mut weights: BTreeMap<String, Tensor>,
         input_ids: Tensor,
         compute_kind: Kind,
-        names: Vec<&'static str>,
+        names: Vec<String>,
         device: Device,
     ) -> Result<Self> {
         if input_ids.size()[1] < 2 {
@@ -3446,6 +3490,25 @@ impl QwenTrainableSession {
             compute_kind,
             registry,
         })
+    }
+
+    fn from_trainable_layers_on_device(
+        config: QwenRuntimeConfig,
+        weights: BTreeMap<String, Tensor>,
+        input_ids: Tensor,
+        compute_kind: Kind,
+        trainable_layers: &[usize],
+        include_embed_tokens: bool,
+        device: Device,
+    ) -> Result<Self> {
+        Self::from_names_on_device(
+            config,
+            weights,
+            input_ids,
+            compute_kind,
+            qwen_trainable_tensors_for_layers(trainable_layers, include_embed_tokens),
+            device,
+        )
     }
 
     fn from_manifest(
@@ -3889,41 +3952,49 @@ fn write_qwen_delta_manifest(
     .with_context(|| format!("failed to write {}", manifest_output.display()))
 }
 
-fn representative_trainable_qwen_tensors() -> Vec<&'static str> {
-    vec![
-        "model.embed_tokens.weight",
-        "model.layers.0.input_layernorm.weight",
-        "model.layers.0.self_attn.q_proj.weight",
-        "model.layers.0.self_attn.q_proj.bias",
-        "model.layers.0.self_attn.k_proj.weight",
-        "model.layers.0.self_attn.k_proj.bias",
-        "model.layers.0.self_attn.v_proj.weight",
-        "model.layers.0.self_attn.v_proj.bias",
-        "model.layers.0.self_attn.o_proj.weight",
-        "model.layers.0.post_attention_layernorm.weight",
-        "model.layers.0.mlp.gate_proj.weight",
-        "model.layers.0.mlp.up_proj.weight",
-        "model.layers.0.mlp.down_proj.weight",
-        "model.norm.weight",
-    ]
+fn representative_trainable_qwen_tensors() -> Vec<String> {
+    qwen_trainable_tensors_for_layers(&[0], true)
 }
 
-fn qwen_session_dp_trainable_tensors() -> Vec<&'static str> {
-    vec![
-        "model.layers.0.input_layernorm.weight",
-        "model.layers.0.self_attn.q_proj.weight",
-        "model.layers.0.self_attn.q_proj.bias",
-        "model.layers.0.self_attn.k_proj.weight",
-        "model.layers.0.self_attn.k_proj.bias",
-        "model.layers.0.self_attn.v_proj.weight",
-        "model.layers.0.self_attn.v_proj.bias",
-        "model.layers.0.self_attn.o_proj.weight",
-        "model.layers.0.post_attention_layernorm.weight",
-        "model.layers.0.mlp.gate_proj.weight",
-        "model.layers.0.mlp.up_proj.weight",
-        "model.layers.0.mlp.down_proj.weight",
-        "model.norm.weight",
-    ]
+fn qwen_session_default_trainable_layers() -> Vec<usize> {
+    vec![0]
+}
+
+fn qwen_session_trainable_layers_from_config(config: &Config) -> Vec<usize> {
+    config
+        .model
+        .trainable_layers
+        .clone()
+        .unwrap_or_else(qwen_session_default_trainable_layers)
+}
+
+fn qwen_trainable_tensors_for_layers(
+    trainable_layers: &[usize],
+    include_embed_tokens: bool,
+) -> Vec<String> {
+    let mut names = Vec::new();
+    if include_embed_tokens {
+        names.push("model.embed_tokens.weight".to_string());
+    }
+    for layer in trainable_layers {
+        let prefix = format!("model.layers.{layer}");
+        names.extend([
+            format!("{prefix}.input_layernorm.weight"),
+            format!("{prefix}.self_attn.q_proj.weight"),
+            format!("{prefix}.self_attn.q_proj.bias"),
+            format!("{prefix}.self_attn.k_proj.weight"),
+            format!("{prefix}.self_attn.k_proj.bias"),
+            format!("{prefix}.self_attn.v_proj.weight"),
+            format!("{prefix}.self_attn.v_proj.bias"),
+            format!("{prefix}.self_attn.o_proj.weight"),
+            format!("{prefix}.post_attention_layernorm.weight"),
+            format!("{prefix}.mlp.gate_proj.weight"),
+            format!("{prefix}.mlp.up_proj.weight"),
+            format!("{prefix}.mlp.down_proj.weight"),
+        ]);
+    }
+    names.push("model.norm.weight".to_string());
+    names
 }
 
 fn qwen_session_dp_global_input(
@@ -5797,6 +5868,55 @@ mod tests {
     }
 
     #[test]
+    fn trainable_tensor_names_expand_over_configured_layers() {
+        let names = qwen_trainable_tensors_for_layers(&[0, 1], true);
+
+        assert!(names.contains(&"model.embed_tokens.weight".to_string()));
+        assert!(names.contains(&"model.norm.weight".to_string()));
+        assert!(names.contains(&"model.layers.0.self_attn.q_proj.weight".to_string()));
+        assert!(names.contains(&"model.layers.1.self_attn.q_proj.weight".to_string()));
+        assert!(names.contains(&"model.layers.1.mlp.down_proj.weight".to_string()));
+        assert_eq!(names.len(), 26);
+
+        let dp_names = qwen_trainable_tensors_for_layers(&[0, 1], false);
+        assert!(!dp_names.contains(&"model.embed_tokens.weight".to_string()));
+        assert_eq!(dp_names.len(), 25);
+    }
+
+    #[test]
+    fn qwen_trainable_session_can_train_multiple_layers() {
+        let config = QwenRuntimeConfig {
+            num_hidden_layers: 2,
+            num_attention_heads: 2,
+            num_key_value_heads: 1,
+            rms_norm_eps: 1e-6,
+            rope_theta: 10_000.0,
+        };
+        let input_ids = Tensor::from_slice(&[0_i64, 1, 2, 3]).reshape([1, 4]);
+        let mut session = QwenTrainableSession::from_trainable_layers(
+            config,
+            two_layer_tiny_qwen_weights(),
+            input_ids,
+            Kind::Float,
+            &[0, 1],
+        )
+        .expect("multi-layer session should build");
+
+        let step = session
+            .train_step(1e-2, 1)
+            .expect("multi-layer session should train");
+
+        assert!(step.loss_after < step.loss_before);
+        assert_eq!(step.artifacts.tensor_summaries.len(), 26);
+        assert!(step.artifacts.tensor_summaries.iter().any(|summary| {
+            summary.name == "model.layers.1.self_attn.q_proj.weight" && summary.grad_norm > 0.0
+        }));
+        assert!(step.artifacts.tensor_summaries.iter().any(|summary| {
+            summary.name == "model.layers.1.mlp.down_proj.weight" && summary.grad_norm > 0.0
+        }));
+    }
+
+    #[test]
     fn sampling_respects_top_k_and_top_p_filters() {
         let logits = Tensor::from_slice(&[0.0_f32, 1.0, 2.0, 3.0]);
         let mut rng = StdRng::seed_from_u64(7);
@@ -6134,8 +6254,8 @@ mod tests {
 
         for name in representative_trainable_qwen_tensors() {
             let diff = diff_stats(
-                tensor(&continuous_weights, name).expect("continuous tensor should exist"),
-                tensor(&resumed_weights, name).expect("resumed tensor should exist"),
+                tensor(&continuous_weights, &name).expect("continuous tensor should exist"),
+                tensor(&resumed_weights, &name).expect("resumed tensor should exist"),
             )
             .expect("diff should compute");
             assert!(
@@ -7028,6 +7148,33 @@ mod tests {
             "model.layers.0.mlp.down_proj.weight".to_string(),
             Tensor::ones([4, 8], (Kind::Float, Device::Cpu)) * 0.03,
         );
+        weights
+    }
+
+    fn two_layer_tiny_qwen_weights() -> BTreeMap<String, Tensor> {
+        let mut weights = tiny_qwen_weights();
+        let layer0_names = [
+            "input_layernorm.weight",
+            "post_attention_layernorm.weight",
+            "self_attn.q_proj.weight",
+            "self_attn.q_proj.bias",
+            "self_attn.k_proj.weight",
+            "self_attn.k_proj.bias",
+            "self_attn.v_proj.weight",
+            "self_attn.v_proj.bias",
+            "self_attn.o_proj.weight",
+            "mlp.gate_proj.weight",
+            "mlp.up_proj.weight",
+            "mlp.down_proj.weight",
+        ];
+        for suffix in layer0_names {
+            let layer0_name = format!("model.layers.0.{suffix}");
+            let layer1_name = format!("model.layers.1.{suffix}");
+            let value = tensor(&weights, &layer0_name)
+                .expect("layer0 tensor should exist")
+                .shallow_clone();
+            weights.insert(layer1_name, value * 0.9);
+        }
         weights
     }
 }
