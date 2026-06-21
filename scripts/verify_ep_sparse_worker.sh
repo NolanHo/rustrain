@@ -91,16 +91,46 @@ for path in summaries:
         raise SystemExit(
             f"{path} train_final_loss {data['train_final_loss']} >= train_initial_loss {data['train_initial_loss']}"
         )
-    for key in [
-        "checkpoint_manifest_output",
-        "checkpoint_model_safetensors",
-        "checkpoint_optimizer_safetensors",
-    ]:
-        artifact = pathlib.Path(data[key])
+    manifest_path = pathlib.Path(data["checkpoint_manifest_output"])
+    model_path = pathlib.Path(data["checkpoint_model_safetensors"])
+    optimizer_path = pathlib.Path(data["checkpoint_optimizer_safetensors"])
+    for artifact in (manifest_path, model_path, optimizer_path):
         if not artifact.exists():
-            raise SystemExit(f"{path} missing {key} artifact {artifact}")
+            raise SystemExit(f"{path} expected checkpoint artifact {artifact} to exist")
+    manifest = json.loads(manifest_path.read_text())
+    if manifest["format"] != "rustrain.ep_sharded.v1":
+        raise SystemExit(f"{manifest_path} unexpected format {manifest['format']}")
+    if manifest["rank"] != rank or manifest["world_size"] != 2:
+        raise SystemExit(f"{manifest_path} rank/world_size mismatch")
+    if manifest["local_rank"] != rank:
+        raise SystemExit(f"{manifest_path} local_rank {manifest['local_rank']} != rank {rank}")
+    if [manifest["owned_expert_start"], manifest["owned_expert_end"]] != owned_range:
+        raise SystemExit(f"{manifest_path} owned expert range mismatch")
+    if manifest["model_safetensors"] != str(model_path):
+        raise SystemExit(f"{manifest_path} model_safetensors mismatch")
+    if manifest["optimizer_safetensors"] != str(optimizer_path):
+        raise SystemExit(f"{manifest_path} optimizer_safetensors mismatch")
+    if manifest["optimizer"] != "adamw":
+        raise SystemExit(f"{manifest_path} optimizer {manifest['optimizer']} != adamw")
     if int(data["checkpoint_tensor_count"]) != 1:
         raise SystemExit(f"{path} checkpoint_tensor_count {data['checkpoint_tensor_count']} != 1")
+    if len(manifest["shards"]) != 1:
+        raise SystemExit(f"{manifest_path} expected exactly one owned expert shard")
+    shard = manifest["shards"][0]
+    if shard["name"] != f"experts.{owned_range[0]}..{owned_range[1]}.scale":
+        raise SystemExit(f"{manifest_path} unexpected shard logical name {shard['name']}")
+    if shard["shard_name"] != "experts.scale":
+        raise SystemExit(f"{manifest_path} unexpected shard_name {shard['shard_name']}")
+    if shard["optimizer_m_name"] != "experts.scale.adam_m":
+        raise SystemExit(f"{manifest_path} unexpected optimizer_m_name {shard['optimizer_m_name']}")
+    if shard["optimizer_v_name"] != "experts.scale.adam_v":
+        raise SystemExit(f"{manifest_path} unexpected optimizer_v_name {shard['optimizer_v_name']}")
+    if shard["partition"] != "expert_model_parallel":
+        raise SystemExit(f"{manifest_path} unexpected partition {shard['partition']}")
+    if shard["dtype"] != "float32":
+        raise SystemExit(f"{manifest_path} unexpected dtype {shard['dtype']}")
+    if shard["shard_shape"] != [2, 3] or shard["global_shape"] != [4, 3]:
+        raise SystemExit(f"{manifest_path} unexpected shard/global shape {shard}")
     if float(data["reload_scale_max_abs"]) > 1e-7:
         raise SystemExit(f"{path} reload_scale_max_abs too large: {data['reload_scale_max_abs']}")
     if float(data["reload_optimizer_max_abs"]) > 1e-7:

@@ -198,9 +198,12 @@ sparse forward lowers the MSE loss. It also writes rank-owned toy expert
 model/optimizer safetensors under `rustrain.ep_sharded.v1`, reloads the owned
 expert scales and optimizer tensors, verifies reloaded sparse-forward loss
 parity, and checks the next sparse update from reloaded state matches the
-continuous next update. Production EP is still open: a production MoE layer,
-autograd-aware sparse collectives, trainer-owned expert parameters, and
-production expert optimizer/checkpoint ownership are not implemented.
+continuous next update. The sparse verifier checks the rank-owned manifest
+contract, safetensors paths, optimizer slot names, shard shapes, dtype, and
+expert-model-parallel partition metadata. Production EP is still open: a
+production MoE layer, autograd-aware sparse collectives, trainer-owned expert
+parameters, and production expert optimizer/checkpoint ownership are not
+implemented.
 Full production Qwen trainer ownership, full real data streaming, and
 production-grade sharded checkpoint ownership remain open.
 
