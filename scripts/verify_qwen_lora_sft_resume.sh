@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${SCRIPT_DIR}/require_gpu_worker.sh"
+
 BASE_OUTPUT="$(mktemp)"
 RESUME_OUTPUT="$(mktemp)"
 CONFIG="${RUSTRAIN_QWEN_LORA_SFT_CONFIG:-configs/qwen_lora_sft.toml}"
