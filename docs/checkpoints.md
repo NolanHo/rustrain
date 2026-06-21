@@ -44,6 +44,14 @@ The manifest must record:
 - `initial_loss` and `final_loss`: smoke evidence around the stored update.
 - Tensor entries with base tensor name, delta tensor name, Adam m slot name,
   Adam v slot name, shape, dtype, and gradient norm evidence.
+- When the run is backed by tokenizer JSONL data, dataset provenance and data
+  progress fields:
+  - `dataset_source_files` and `dataset_source_sample_counts`.
+  - `dataset_fingerprint`.
+  - `dataset_shuffle`.
+  - `data_cursor_start`, `data_cursor_end`, and `data_cursor_next`.
+  - `data_epoch_*` and `data_sample_offset_*`, derived from
+    `cursor / train_samples` and `cursor % train_samples`.
 
 Acceptance:
 
@@ -53,6 +61,9 @@ Acceptance:
   within tolerance against a continuous in-memory run.
 - Missing tensor names, malformed optimizer slot names, and unsupported format
   identifiers fail clearly.
+- Resume rejects changed JSONL provenance or shuffle semantics when the manifest
+  contains dataset metadata; legacy manifests without provenance remain
+  loadable.
 
 ## Distributed Checkpoint Semantics
 
@@ -78,6 +89,9 @@ The rank0 manifest must record:
 - `tensor_count`.
 - Delta and optimizer safetensors paths.
 - Tensor entries with AdamW slot names for every trainable tensor.
+- For JSONL-backed representative runs, the same dataset provenance,
+  cursor/epoch/offset, and shuffle fields used by single-rank Qwen delta
+  manifests.
 
 Acceptance:
 
@@ -88,6 +102,9 @@ Acceptance:
   within tolerance.
 - Rank-local summaries agree on world size, train step count, tensor count,
   global loss improvement, reload delta, and next-step delta.
+- JSONL-backed DP resume starts from manifest `data_cursor_next`, advances the
+  cursor by `steps * local_batch_size * world_size`, and preserves dataset
+  provenance in the next rank0 manifest.
 
 ### Representative Sharded Checkpoints and Future Production
 
@@ -110,6 +127,10 @@ Required manifest structure:
 - A base model identity and tokenizer identity.
 - Global train state: global step, consumed samples/tokens, RNG seeds, dtype,
   optimizer, scheduler, and parallel config.
+- JSONL dataset provenance: source files, per-source sample counts, content/path
+  fingerprint, shuffle flag, and train-sample count.
+- JSONL data progress: `data_cursor_next`, `data_epoch_next`, and
+  `data_sample_offset_next`, consistent with `consumed_samples`.
 - Shard entries mapping logical parameter names to rank-owned safetensors
   shards.
 - Optimizer shard entries for AdamW first and second moments.
@@ -127,5 +148,13 @@ Minimum acceptance before calling production sharded checkpointing implemented:
   for the representative DP session smoke.
 - Manifest validation rejects missing rank shards, wrong world size, wrong
   parallel config, and missing optimizer slots.
+- Manifest validation rejects partial dataset provenance, non-JSONL dataset
+  source paths, inconsistent data cursor/epoch/offset fields, and mismatched
+  dataset provenance during resume. Done for the representative DP session
+  smoke and schema tests.
+- The standard distributed verifier covers rank0-manifest external resume for
+  `configs/qwen_session_dp2_sft.toml`: a base DP launch writes a rank0
+  checkpoint, a second DP launch resumes from it on both ranks, and the resumed
+  run verifies rank0 plus sharded reload/next-step parity.
 
 Until that production path exists, production checkpoint/resume remains open.
