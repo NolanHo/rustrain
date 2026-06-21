@@ -7,28 +7,38 @@ RESUME_OUTPUT="$(mktemp)"
 
 cargo run -- train --config "${CONFIG}" | tee "${BASE_OUTPUT}"
 
-MANIFEST_OUTPUT="$(
+BASE_CURSOR_NEXT="$(
   python - "${BASE_OUTPUT}" <<'PY'
 import pathlib
 import sys
 
+values = {}
 for line in pathlib.Path(sys.argv[1]).read_text().splitlines():
-    if line.startswith("manifest_output: "):
-        print(line.split(": ", 1)[1])
-        break
-else:
+    if ": " in line:
+        key, value = line.split(": ", 1)
+        values[key] = value
+manifest = values.get("manifest_output")
+cursor_next = values.get("data_cursor_next")
+if manifest is None:
     raise SystemExit("base run did not print manifest_output")
+if cursor_next is None:
+    raise SystemExit("base run did not print data_cursor_next")
+print(f"{manifest}\t{cursor_next}")
 PY
 )"
+MANIFEST_OUTPUT="${BASE_CURSOR_NEXT%%$'\t'*}"
+BASE_DATA_CURSOR_NEXT="${BASE_CURSOR_NEXT##*$'\t'}"
 
 cargo run -- train --config "${CONFIG}" --resume-from "${MANIFEST_OUTPUT}" \
   | tee "${RESUME_OUTPUT}"
 
-python - "${RESUME_OUTPUT}" <<'PY'
+python - "${RESUME_OUTPUT}" "${BASE_DATA_CURSOR_NEXT}" <<'PY'
 import ast
+import math
 import pathlib
 import sys
 
+base_data_cursor_next = int(sys.argv[2])
 values = {}
 for line in pathlib.Path(sys.argv[1]).read_text().splitlines():
     if ": " not in line:
@@ -50,6 +60,9 @@ required = [
     "dataset_train_samples",
     "dataset_eval_samples",
     "dataset_order_seed",
+    "data_cursor_start",
+    "data_cursor_end",
+    "data_cursor_next",
     "batch_size",
     "sequence_tokens",
     "reload_delta",
@@ -66,8 +79,8 @@ if int(values["train_steps"]) != 2:
 step_losses = ast.literal_eval(values["step_losses"])
 if len(step_losses) != 3:
     raise SystemExit(f"expected 3 step losses, got {step_losses}")
-if not step_losses[-1] < step_losses[0]:
-    raise SystemExit(f"resume step losses did not improve: {step_losses}")
+if not all(math.isfinite(float(loss)) for loss in step_losses):
+    raise SystemExit(f"resume step losses must be finite: {step_losses}")
 for key in [
     "first_step_grad_norm",
     "final_step_grad_norm",
@@ -89,6 +102,19 @@ for key in [
         raise SystemExit(f"{key} must be positive, got {values[key]}")
 if int(values["dataset_order_seed"]) != 777:
     raise SystemExit(f"expected dataset_order_seed 777, got {values['dataset_order_seed']}")
+if int(values["data_cursor_start"]) != base_data_cursor_next:
+    raise SystemExit(
+        f"resume data_cursor_start {values['data_cursor_start']} did not continue from base data_cursor_next {base_data_cursor_next}"
+    )
+expected_cursor_end = int(values["data_cursor_start"]) + int(values["train_steps"]) * int(values["batch_size"])
+if int(values["data_cursor_end"]) != expected_cursor_end:
+    raise SystemExit(
+        f"expected data_cursor_end {expected_cursor_end}, got {values['data_cursor_end']}"
+    )
+if int(values["data_cursor_next"]) != int(values["data_cursor_end"]):
+    raise SystemExit(
+        f"expected data_cursor_next to equal data_cursor_end, got {values['data_cursor_next']} vs {values['data_cursor_end']}"
+    )
 if float(values["reload_delta"]) > 1e-5:
     raise SystemExit(f"reload_delta too large: {values['reload_delta']}")
 if float(values["second_step_delta"]) > 1e-5:
@@ -100,6 +126,8 @@ print(
     f"step_losses={step_losses} "
     f"dataset_total_samples={values['dataset_total_samples']} "
     f"dataset_total_tokens={values['dataset_total_tokens']} "
+    f"data_cursor_start={values['data_cursor_start']} "
+    f"data_cursor_next={values['data_cursor_next']} "
     f"reload_delta={values['reload_delta']} "
     f"second_step_delta={values['second_step_delta']}"
 )

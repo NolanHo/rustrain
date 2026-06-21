@@ -143,6 +143,9 @@ pub fn train(config_path: &Path, resume_from: Option<PathBuf>) -> Result<()> {
                 dataset_train_samples = summary.dataset_train_samples,
                 dataset_eval_samples = summary.dataset_eval_samples,
                 dataset_order_seed = summary.dataset_order_seed,
+                data_cursor_start = summary.data_cursor_start,
+                data_cursor_end = summary.data_cursor_end,
+                data_cursor_next = summary.data_cursor_next,
                 batch_size = summary.batch_size,
                 sequence_tokens = summary.sequence_tokens,
                 trainable_tensors = summary.trainable_tensors.len(),
@@ -184,6 +187,15 @@ pub fn train(config_path: &Path, resume_from: Option<PathBuf>) -> Result<()> {
             }
             if let Some(dataset_order_seed) = summary.dataset_order_seed {
                 println!("dataset_order_seed: {dataset_order_seed}");
+            }
+            if let Some(data_cursor_start) = summary.data_cursor_start {
+                println!("data_cursor_start: {data_cursor_start}");
+            }
+            if let Some(data_cursor_end) = summary.data_cursor_end {
+                println!("data_cursor_end: {data_cursor_end}");
+            }
+            if let Some(data_cursor_next) = summary.data_cursor_next {
+                println!("data_cursor_next: {data_cursor_next}");
             }
             println!("batch_size: {}", summary.batch_size);
             println!("sequence_tokens: {}", summary.sequence_tokens);
