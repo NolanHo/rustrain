@@ -37,10 +37,13 @@ scripts/verify_gpu.sh
 
 Both scripts SSH to `root@192.168.42.106:2222`, submit work to Ray with GPU
 resources, enter the remote checkout, and source `scripts/tch_a800_env.sh`
-before running project commands. Do not run `cargo check`, `cargo test`, train
-smokes, parity commands, or quick local CPU checks on the local machine. Do not
-run them directly in the plain SSH shell either; that shell does not expose the
-GPU devices. If a check is worth running, run it on a Ray GPU worker.
+before running project commands. `scripts/verify_gpu.sh` stages the current
+working tree by default; set `RUSTRAIN_SYNC_TO_WORKER=0` only when you explicitly
+want to validate the remote checkout as-is. Do not run `cargo check`, `cargo
+test`, train smokes, parity commands, or quick local CPU checks on the local
+machine. Do not run them directly in the plain SSH shell either; that shell does
+not expose the GPU devices. If a check is worth running, run it on a Ray GPU
+worker.
 
 The preferred remote checkout is:
 
