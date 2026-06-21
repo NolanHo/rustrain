@@ -134,8 +134,13 @@ down-proj input columns, sums rank-local contributions on rank0, and verifies
 parity against the full layer0 MLP. A second MLP smoke uses NCCL all-reduce to
 sum those rank-local output contributions on every rank and checks the same
 full-MLP parity. The `qwen_trainable_session` trainer entry also accepts
-`tensor_model_parallel_size = 2` for a focused layer0 TP parity config path.
-Real multi-GPU Qwen training is not implemented yet.
+`tensor_model_parallel_size = 2` for a focused layer0 TP config path: it checks
+attention and MLP NCCL output parity, then runs a focused MLP shard
+backward/update smoke with positive gate/up/down shard gradients and a lower
+post-update global MSE loss. Real production tensor-parallel Qwen training is
+not implemented yet; the remaining TP gap is full train-step execution,
+full-parameter TP backward/update, production collectives, and sharded
+checkpoint/resume.
 The Qwen DP smoke writes a rank0-only JSON checkpoint manifest after gradient
 sync succeeds; non-rank0 summaries record the same checkpoint path but do not
 write it.
@@ -203,9 +208,12 @@ ownership remain open.
 - G4 launcher process management plus NCCL scalar, toy DP gradient, `tch`
   autograd DP=2 trainer smokes, focused multi-step Qwen layer0 attention DP,
   representative `QwenTrainableSession` DP smokes, and a representative Qwen
-  DP `train --config` path with rank0 checkpoint/resume parity exist. Real
-  production distributed training is still missing: full Qwen model/data and
-  production sharded checkpoint ownership are not yet implemented.
+  DP `train --config` path with rank0 checkpoint/resume parity exist. Focused
+  TP=2 attention/MLP NCCL output parity and MLP shard backward/update smoke
+  also run through `train --config configs/qwen_session_tp2.toml`. Real
+  production distributed training is still missing: full Qwen model/data,
+  production TP train-step execution, and production sharded checkpoint
+  ownership are not yet implemented.
 - Production distributed checkpoint rules are documented in
   [docs/checkpoints.md](docs/checkpoints.md), with a validated
   `rustrain.qwen_sharded.v1` manifest schema and representative rank-owned
