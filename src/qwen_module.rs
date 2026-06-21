@@ -798,6 +798,12 @@ impl QwenShardedCheckpointManifest {
         if self.optimizer.is_empty() {
             bail!("Qwen sharded checkpoint requires optimizer");
         }
+        if self.scheduler.is_empty() {
+            bail!("Qwen sharded checkpoint requires scheduler");
+        }
+        if self.global_step == 0 {
+            bail!("Qwen sharded checkpoint global_step must be positive");
+        }
         if self.consumed_samples == 0 {
             bail!("Qwen sharded checkpoint consumed_samples must be positive");
         }
@@ -879,6 +885,7 @@ impl QwenShardedCheckpointManifest {
         }
 
         let mut seen_ranks = BTreeSet::new();
+        let mut seen_rank_axes = BTreeSet::new();
         for rank in &self.ranks {
             if !seen_ranks.insert(rank.rank) {
                 bail!(
@@ -893,6 +900,27 @@ impl QwenShardedCheckpointManifest {
                 );
             }
             self.parallel.validate_rank(rank)?;
+            let rank_axes = (
+                rank.data_parallel_rank,
+                rank.tensor_model_parallel_rank,
+                rank.pipeline_model_parallel_rank,
+                rank.expert_model_parallel_rank,
+                rank.context_parallel_rank,
+            );
+            if !seen_rank_axes.insert(rank_axes) {
+                bail!(
+                    "Qwen sharded checkpoint contains duplicate parallel rank axes {:?}",
+                    rank_axes
+                );
+            }
+            let expected_linear_rank = self.parallel.linear_rank(rank);
+            if rank.rank != expected_linear_rank {
+                bail!(
+                    "Qwen sharded checkpoint rank {} does not match linear parallel rank {}",
+                    rank.rank,
+                    expected_linear_rank
+                );
+            }
             if rank.model_safetensors.is_empty() {
                 bail!(
                     "Qwen sharded checkpoint rank {} is missing model_safetensors",
@@ -911,8 +939,42 @@ impl QwenShardedCheckpointManifest {
                     rank.rank
                 );
             }
+            let mut seen_tensor_names = BTreeSet::new();
+            let mut seen_model_shards = BTreeSet::new();
+            let mut seen_optimizer_slots = BTreeSet::new();
             for shard in &rank.shards {
                 shard.validate(rank.rank)?;
+                if !seen_tensor_names.insert(shard.name.as_str()) {
+                    bail!(
+                        "Qwen sharded checkpoint rank {} contains duplicate tensor shard {}",
+                        rank.rank,
+                        shard.name
+                    );
+                }
+                if !seen_model_shards.insert(shard.shard_name.as_str()) {
+                    bail!(
+                        "Qwen sharded checkpoint rank {} contains duplicate shard_name {}",
+                        rank.rank,
+                        shard.shard_name
+                    );
+                }
+                for slot in [&shard.optimizer_m_name, &shard.optimizer_v_name] {
+                    if !seen_optimizer_slots.insert(slot.as_str()) {
+                        bail!(
+                            "Qwen sharded checkpoint rank {} contains duplicate optimizer slot {}",
+                            rank.rank,
+                            slot
+                        );
+                    }
+                    if slot == &shard.shard_name {
+                        bail!(
+                            "Qwen sharded checkpoint rank {} tensor {} optimizer slot {} collides with shard_name",
+                            rank.rank,
+                            shard.name,
+                            slot
+                        );
+                    }
+                }
             }
         }
         for expected_rank in 0..expected_world_size {
@@ -987,6 +1049,17 @@ impl QwenShardedParallelManifest {
         }
         Ok(())
     }
+
+    fn linear_rank(&self, rank: &QwenRankShardManifest) -> usize {
+        (((rank.data_parallel_rank * self.tensor_model_parallel_size
+            + rank.tensor_model_parallel_rank)
+            * self.pipeline_model_parallel_size
+            + rank.pipeline_model_parallel_rank)
+            * self.expert_model_parallel_size
+            + rank.expert_model_parallel_rank)
+            * self.context_parallel_size
+            + rank.context_parallel_rank
+    }
 }
 
 #[allow(dead_code)]
@@ -1013,16 +1086,60 @@ impl QwenTensorShardManifestEntry {
                 self.name
             );
         }
+        if self.global_shape.len() != self.shard_shape.len() {
+            bail!(
+                "Qwen sharded checkpoint rank {rank} tensor {} global_shape rank {} does not match shard_shape rank {}",
+                self.name,
+                self.global_shape.len(),
+                self.shard_shape.len()
+            );
+        }
+        for (dim_index, (&global_dim, &shard_dim)) in self
+            .global_shape
+            .iter()
+            .zip(self.shard_shape.iter())
+            .enumerate()
+        {
+            if global_dim <= 0 || shard_dim <= 0 {
+                bail!(
+                    "Qwen sharded checkpoint rank {rank} tensor {} shape dim {dim_index} must be positive",
+                    self.name
+                );
+            }
+            if shard_dim > global_dim {
+                bail!(
+                    "Qwen sharded checkpoint rank {rank} tensor {} shard_shape dim {dim_index} exceeds global_shape",
+                    self.name
+                );
+            }
+        }
         if self.dtype.is_empty() {
             bail!(
                 "Qwen sharded checkpoint rank {rank} tensor {} is missing dtype",
                 self.name
             );
         }
+        if !matches!(self.dtype.as_str(), "float32" | "fp32" | "bf16") {
+            bail!(
+                "Qwen sharded checkpoint rank {rank} tensor {} has unsupported dtype {}",
+                self.name,
+                self.dtype
+            );
+        }
         if self.partition.is_empty() {
             bail!(
                 "Qwen sharded checkpoint rank {rank} tensor {} is missing partition policy",
                 self.name
+            );
+        }
+        if !matches!(
+            self.partition.as_str(),
+            "replicated_dp" | "replicated_norm_smoke" | "tp_row" | "tp_col"
+        ) {
+            bail!(
+                "Qwen sharded checkpoint rank {rank} tensor {} has unsupported partition policy {}",
+                self.name,
+                self.partition
             );
         }
         Ok(())
@@ -10514,7 +10631,16 @@ mod tests {
 
     #[test]
     fn qwen_sharded_checkpoint_manifest_validates_rank_owned_shards() {
-        let manifest = tiny_qwen_sharded_manifest();
+        let mut manifest = tiny_qwen_sharded_manifest();
+        let mut replicated_norm_shard = manifest.ranks[0].shards[0].clone();
+        replicated_norm_shard.name = "model.layers.0.input_layernorm.weight".to_string();
+        replicated_norm_shard.shard_name = "rank0.input_layernorm".to_string();
+        replicated_norm_shard.optimizer_m_name = "rank0.input_layernorm.m".to_string();
+        replicated_norm_shard.optimizer_v_name = "rank0.input_layernorm.v".to_string();
+        replicated_norm_shard.global_shape = vec![4];
+        replicated_norm_shard.shard_shape = vec![4];
+        replicated_norm_shard.partition = "replicated_norm_smoke".to_string();
+        manifest.ranks[0].shards.push(replicated_norm_shard);
         let encoded = serde_json::to_string_pretty(&manifest).expect("manifest should serialize");
         let decoded: QwenShardedCheckpointManifest =
             serde_json::from_str(&encoded).expect("manifest should deserialize");
@@ -10556,6 +10682,123 @@ mod tests {
             .expect_err("missing optimizer slots should fail");
 
         assert!(error.to_string().contains("missing optimizer slots"));
+    }
+
+    #[test]
+    fn qwen_sharded_checkpoint_manifest_rejects_invalid_global_metadata() {
+        let mut missing_scheduler = tiny_qwen_sharded_manifest();
+        missing_scheduler.scheduler.clear();
+        let missing_scheduler_error = missing_scheduler
+            .validate()
+            .expect_err("missing scheduler should fail")
+            .to_string();
+        assert!(missing_scheduler_error.contains("requires scheduler"));
+
+        let mut zero_step = tiny_qwen_sharded_manifest();
+        zero_step.global_step = 0;
+        let zero_step_error = zero_step
+            .validate()
+            .expect_err("zero global_step should fail")
+            .to_string();
+        assert!(zero_step_error.contains("global_step must be positive"));
+    }
+
+    #[test]
+    fn qwen_sharded_checkpoint_manifest_rejects_invalid_parallel_rank_axes() {
+        let mut duplicate_axes = tiny_qwen_sharded_manifest();
+        duplicate_axes.ranks[1].data_parallel_rank = 0;
+        duplicate_axes.ranks[1].rank = 1;
+        let duplicate_axes_error = duplicate_axes
+            .validate()
+            .expect_err("duplicate parallel rank axes should fail")
+            .to_string();
+        assert!(duplicate_axes_error.contains("duplicate parallel rank axes"));
+
+        let mut wrong_linear_rank = tiny_qwen_sharded_manifest();
+        wrong_linear_rank.ranks.swap(0, 1);
+        wrong_linear_rank.ranks[0].rank = 0;
+        wrong_linear_rank.ranks[1].rank = 1;
+        let wrong_linear_rank_error = wrong_linear_rank
+            .validate()
+            .expect_err("rank id that disagrees with axes should fail")
+            .to_string();
+        assert!(wrong_linear_rank_error.contains("does not match linear parallel rank"));
+    }
+
+    #[test]
+    fn qwen_sharded_checkpoint_manifest_rejects_invalid_shard_shapes() {
+        let mut rank_mismatch = tiny_qwen_sharded_manifest();
+        rank_mismatch.ranks[0].shards[0].shard_shape = vec![4, 4, 1];
+        let rank_mismatch_error = rank_mismatch
+            .validate()
+            .expect_err("shape rank mismatch should fail")
+            .to_string();
+        assert!(rank_mismatch_error.contains("global_shape rank"));
+
+        let mut oversized_shard = tiny_qwen_sharded_manifest();
+        oversized_shard.ranks[0].shards[0].shard_shape = vec![5, 4];
+        let oversized_shard_error = oversized_shard
+            .validate()
+            .expect_err("oversized shard shape should fail")
+            .to_string();
+        assert!(oversized_shard_error.contains("exceeds global_shape"));
+
+        let mut zero_dim = tiny_qwen_sharded_manifest();
+        zero_dim.ranks[0].shards[0].global_shape = vec![4, 0];
+        let zero_dim_error = zero_dim
+            .validate()
+            .expect_err("zero shape dim should fail")
+            .to_string();
+        assert!(zero_dim_error.contains("shape dim 1 must be positive"));
+    }
+
+    #[test]
+    fn qwen_sharded_checkpoint_manifest_rejects_invalid_shard_contract_fields() {
+        let mut unsupported_dtype = tiny_qwen_sharded_manifest();
+        unsupported_dtype.ranks[0].shards[0].dtype = "int8".to_string();
+        let unsupported_dtype_error = unsupported_dtype
+            .validate()
+            .expect_err("unsupported dtype should fail")
+            .to_string();
+        assert!(unsupported_dtype_error.contains("unsupported dtype int8"));
+
+        let mut unsupported_partition = tiny_qwen_sharded_manifest();
+        unsupported_partition.ranks[0].shards[0].partition = "rank0_delta".to_string();
+        let unsupported_partition_error = unsupported_partition
+            .validate()
+            .expect_err("unsupported partition should fail")
+            .to_string();
+        assert!(unsupported_partition_error.contains("unsupported partition policy"));
+
+        let mut duplicate_tensor = tiny_qwen_sharded_manifest();
+        let repeated_shard = duplicate_tensor.ranks[0].shards[0].clone();
+        duplicate_tensor.ranks[0].shards.push(repeated_shard);
+        let duplicate_tensor_error = duplicate_tensor
+            .validate()
+            .expect_err("duplicate tensor shard should fail")
+            .to_string();
+        assert!(duplicate_tensor_error.contains("duplicate tensor shard"));
+
+        let mut duplicate_slot = tiny_qwen_sharded_manifest();
+        let mut second_shard = duplicate_slot.ranks[0].shards[0].clone();
+        second_shard.name = "model.layers.0.self_attn.k_proj.weight".to_string();
+        second_shard.shard_name = "rank0.k_proj".to_string();
+        second_shard.optimizer_m_name = "rank0.q_proj.v".to_string();
+        second_shard.optimizer_v_name = "rank0.k_proj.v".to_string();
+        duplicate_slot.ranks[0].shards.push(second_shard);
+        let duplicate_slot_error = duplicate_slot
+            .validate()
+            .expect_err("duplicate optimizer slot should fail")
+            .to_string();
+        assert!(duplicate_slot_error.contains("duplicate optimizer slot"));
+
+        let mut slot_collision = tiny_qwen_sharded_manifest();
+        slot_collision.ranks[0].shards[0].optimizer_m_name = "rank0.q_proj".to_string();
+        let slot_collision_error = slot_collision
+            .validate()
+            .expect_err("optimizer slot colliding with shard_name should fail")
+            .to_string();
+        assert!(slot_collision_error.contains("collides with shard_name"));
     }
 
     #[test]

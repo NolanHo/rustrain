@@ -217,6 +217,11 @@ Minimum acceptance before calling production sharded checkpointing implemented:
   for the representative DP session smoke.
 - Manifest validation rejects missing rank shards, wrong world size, wrong
   parallel config, and missing optimizer slots.
+- Manifest validation rejects duplicate rank-axis ownership, rank ids that do
+  not match the linearized parallel axes, empty scheduler/global-step metadata,
+  invalid shard shape metadata, unsupported shard dtype or partition policies,
+  duplicate rank-local tensor shard names, and duplicate or colliding optimizer
+  slot names. Done for the representative Qwen sharded schema tests.
 - Manifest validation rejects partial dataset provenance, non-JSONL dataset
   source paths, inconsistent data cursor/epoch/offset fields, and mismatched
   dataset provenance during resume. Done for the representative DP session
