@@ -240,6 +240,8 @@ pub fn validate_config(config: &Config) -> Result<()> {
         && config.model.architecture == "qwen_trainable_session";
     let is_qwen_lora_sft = matches!(config.train.backend, BackendKind::Tch)
         && config.model.architecture == "qwen_lora_sft";
+    let is_tch_moe_ep_session = matches!(config.train.backend, BackendKind::Tch)
+        && config.model.architecture == "tch_moe_ep_session";
     for (name, value) in parallel_sizes {
         if value == 0 {
             return Err(anyhow!("{name} must be greater than zero"));
@@ -251,6 +253,11 @@ pub fn validate_config(config: &Config) -> Result<()> {
             && !(is_qwen_trainable_session
                 && name == "tensor_model_parallel_size"
                 && value == 2
+                && parallel.data_parallel_size == 1)
+            && !(is_tch_moe_ep_session
+                && name == "expert_model_parallel_size"
+                && value == 2
+                && parallel.tensor_model_parallel_size == 1
                 && parallel.data_parallel_size == 1)
         {
             return Err(anyhow!("M1 toy backend requires {name} = 1"));
@@ -268,6 +275,26 @@ pub fn validate_config(config: &Config) -> Result<()> {
             return Err(anyhow!(
                 "{} requires model.model_path",
                 config.model.architecture
+            ));
+        }
+    }
+
+    if is_tch_moe_ep_session {
+        if !matches!(config.train.device, Device::Cuda) {
+            return Err(anyhow!("tch_moe_ep_session requires device = \"cuda\""));
+        }
+        if config.parallel.expert_model_parallel_size != 2 {
+            return Err(anyhow!(
+                "tch_moe_ep_session currently expects expert_model_parallel_size = 2"
+            ));
+        }
+        if config.parallel.tensor_model_parallel_size != 1
+            || config.parallel.pipeline_model_parallel_size != 1
+            || config.parallel.data_parallel_size != 1
+            || config.parallel.context_parallel_size != 1
+        {
+            return Err(anyhow!(
+                "tch_moe_ep_session currently expects TP/PP/DP/CP sizes to remain 1"
             ));
         }
     }

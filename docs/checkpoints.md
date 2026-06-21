@@ -168,7 +168,9 @@ range and writes two model shards, `experts.up.weight` and
 `experts.down.weight`, plus AdamW `adam_m`/`adam_v` optimizer slots for each
 shard. This is checkpoint-contract evidence for rank-owned `tch-rs` expert MLP
 parameters after sparse send/recv dispatch and gradient return; it is not a
-production MoE trainer checkpoint.
+production MoE trainer checkpoint. The same focused EP path is wired through
+`train --config configs/tch_moe_ep2.toml`, so the trainer entrypoint produces
+the same rank-owned checkpoint artifacts under a launch output directory.
 
 Required manifest structure:
 

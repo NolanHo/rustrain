@@ -9,6 +9,7 @@ use tracing::info;
 
 use crate::{
     backend::{Backend, BackendKind, NdArrayBackend, TchBackend, tch_cpu_autograd_smoke},
+    distributed_smoke::run_expert_parallel_tch_moe_rank_smoke,
     lora::{LoraLinear, lora_smoke},
     metrics::{gpu_memory_allocated_mb, memory_rss_mb},
     moe::{deepseek_moe_smoke, moe_smoke},
@@ -468,6 +469,34 @@ pub fn train(config_path: &Path, resume_from: Option<PathBuf>) -> Result<()> {
         println!("padding_tokens: {}", summary.padding_tokens);
         println!("target_layers: {:?}", summary.target_layers);
         println!("target_modules: {:?}", summary.target_modules);
+
+        return Ok(());
+    }
+
+    if matches!(config.train.backend, BackendKind::Tch)
+        && config.model.architecture == "tch_moe_ep_session"
+    {
+        let backend = RuntimeBackend::from_kind(config.train.backend);
+        info!(
+            backend = ?backend.kind(),
+            supports_autograd = backend.supports_autograd(),
+            supports_cuda = backend.supports_cuda(),
+            "backend configured"
+        );
+        info!(model = ?config.model, "model config");
+        info!(train = ?config.train, "train config");
+        info!(parallel = ?config.parallel, "parallel config");
+
+        let rank_output_dir = std::env::var("RUSTRAIN_LAUNCH_OUTPUT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| run_paths.root.clone())
+            .join("ep-tch-moe-ranks");
+        run_expert_parallel_tch_moe_rank_smoke(rank_output_dir.clone())?;
+        info!(rank_output_dir = %rank_output_dir.display(), "tch MoE EP trainer-entry smoke complete");
+        println!("rustrain tch MoE EP trainer-entry complete");
+        println!("run_dir: {}", run_paths.root.display());
+        println!("resolved_config: {}", run_paths.resolved_config.display());
+        println!("rank_output_dir: {}", rank_output_dir.display());
 
         return Ok(());
     }
