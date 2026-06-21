@@ -199,23 +199,23 @@ pub(crate) struct TrainableTensorSummary {
 }
 
 #[derive(Debug, Serialize)]
-struct QwenFullTrainSmokeSummary {
-    model_path: String,
-    reference_fixture: String,
-    delta_output: String,
-    optimizer_output: String,
-    manifest_output: String,
-    compute_kind: String,
-    learning_rate: f64,
-    initial_loss: f64,
-    final_loss: f64,
-    reloaded_loss: f64,
-    reload_delta: f64,
-    resume_loss: f64,
-    continuous_second_loss: f64,
-    resumed_second_loss: f64,
-    second_step_delta: f64,
-    trainable_tensors: Vec<TrainableTensorSummary>,
+pub(crate) struct QwenFullTrainSmokeSummary {
+    pub(crate) model_path: String,
+    pub(crate) reference_fixture: String,
+    pub(crate) delta_output: String,
+    pub(crate) optimizer_output: String,
+    pub(crate) manifest_output: String,
+    pub(crate) compute_kind: String,
+    pub(crate) learning_rate: f64,
+    pub(crate) initial_loss: f64,
+    pub(crate) final_loss: f64,
+    pub(crate) reloaded_loss: f64,
+    pub(crate) reload_delta: f64,
+    pub(crate) resume_loss: f64,
+    pub(crate) continuous_second_loss: f64,
+    pub(crate) resumed_second_loss: f64,
+    pub(crate) second_step_delta: f64,
+    pub(crate) trainable_tensors: Vec<TrainableTensorSummary>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1485,6 +1485,25 @@ pub fn qwen_full_train_smoke(
     dtype: QwenComputeDType,
     learning_rate: f64,
 ) -> Result<()> {
+    let summary = qwen_full_train_summary(
+        model_path,
+        reference_fixture,
+        delta_output,
+        dtype,
+        learning_rate,
+    )?;
+    println!("{}", serde_json::to_string_pretty(&summary)?);
+
+    Ok(())
+}
+
+fn qwen_full_train_summary(
+    model_path: &Path,
+    reference_fixture: &Path,
+    delta_output: &Path,
+    dtype: QwenComputeDType,
+    learning_rate: f64,
+) -> Result<QwenFullTrainSmokeSummary> {
     if learning_rate <= 0.0 {
         bail!("learning_rate must be positive");
     }
@@ -1568,7 +1587,7 @@ pub fn qwen_full_train_smoke(
         );
     }
 
-    let summary = QwenFullTrainSmokeSummary {
+    Ok(QwenFullTrainSmokeSummary {
         model_path: model_path.display().to_string(),
         reference_fixture: reference_fixture.display().to_string(),
         delta_output: delta_output.display().to_string(),
@@ -1585,10 +1604,113 @@ pub fn qwen_full_train_smoke(
         resumed_second_loss,
         second_step_delta,
         trainable_tensors: first_step.artifacts.tensor_summaries,
-    };
-    println!("{}", serde_json::to_string_pretty(&summary)?);
+    })
+}
 
-    Ok(())
+fn qwen_session_single_summary(
+    model_path: &Path,
+    delta_output: &Path,
+    dtype: QwenComputeDType,
+    learning_rate: f64,
+) -> Result<QwenFullTrainSmokeSummary> {
+    if learning_rate <= 0.0 {
+        bail!("learning_rate must be positive");
+    }
+
+    let config = read_runtime_config(&model_path.join("config.json"))?;
+    let weights = read_safetensors_map(&model_path.join("model.safetensors"))?;
+    let input_ids = qwen_session_dp_global_input(&weights, Device::Cpu)?.narrow(0, 0, 1);
+    let mut session = QwenTrainableSession::from_weights(config, weights, input_ids, dtype.kind())?;
+    let first_step = session.train_step(learning_rate, 1)?;
+    let initial_loss = first_step.loss_before;
+    let final_loss = first_step.loss_after;
+    if final_loss >= initial_loss {
+        bail!(
+            "Qwen session single trainer failed to reduce loss: initial_loss={initial_loss}, final_loss={final_loss}"
+        );
+    }
+
+    if let Some(parent) = delta_output.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+    let delta_refs: Vec<(&str, &Tensor)> = first_step
+        .artifacts
+        .delta_entries
+        .iter()
+        .map(|(name, tensor)| (name.as_str(), tensor))
+        .collect();
+    Tensor::write_safetensors(&delta_refs, delta_output)
+        .with_context(|| format!("failed to write {}", delta_output.display()))?;
+    let optimizer_output = optimizer_state_path(delta_output);
+    let optimizer_refs: Vec<(&str, &Tensor)> = first_step
+        .artifacts
+        .optimizer_entries
+        .iter()
+        .map(|(name, tensor)| (name.as_str(), tensor))
+        .collect();
+    Tensor::write_safetensors(&optimizer_refs, &optimizer_output)
+        .with_context(|| format!("failed to write {}", optimizer_output.display()))?;
+    let manifest_output = delta_manifest_path(delta_output);
+    let manifest = QwenDeltaCheckpointManifest {
+        format: "rustrain.qwen_delta.v1".to_string(),
+        base_model_path: model_path.display().to_string(),
+        reference_fixture: "qwen_session_single_fixed_tokens".to_string(),
+        delta_safetensors: delta_output.display().to_string(),
+        optimizer_safetensors: Some(optimizer_output.display().to_string()),
+        train_step: 1,
+        learning_rate,
+        initial_loss,
+        final_loss,
+        tensors: first_step.artifacts.manifest_tensors,
+    };
+    write_qwen_delta_manifest(&manifest_output, &manifest)?;
+
+    let mut resumed_session = QwenTrainableSession::from_manifest(
+        session.config,
+        read_safetensors_map(&model_path.join("model.safetensors"))?,
+        session.input_ids.shallow_clone(),
+        dtype.kind(),
+        &manifest,
+    )?;
+    let reloaded_loss = resumed_session.loss_value()?;
+    let reload_delta = (final_loss - reloaded_loss).abs();
+    if reload_delta > 1e-5 {
+        bail!(
+            "Qwen session single delta reload parity failed: final_loss={final_loss}, reloaded_loss={reloaded_loss}, reload_delta={reload_delta}"
+        );
+    }
+
+    let resumed_second_step = resumed_session.train_step(learning_rate, 2)?;
+    let resume_loss_value = resumed_second_step.loss_before;
+    let resumed_second_loss = resumed_second_step.loss_after;
+    let continuous_second_step = session.train_step(learning_rate, 2)?;
+    let continuous_second_loss = continuous_second_step.loss_after;
+    let second_step_delta = (continuous_second_loss - resumed_second_loss).abs();
+    if second_step_delta > 1e-5 {
+        bail!(
+            "Qwen session single manifest resume parity failed: continuous_second_loss={continuous_second_loss}, resumed_second_loss={resumed_second_loss}, second_step_delta={second_step_delta}"
+        );
+    }
+
+    Ok(QwenFullTrainSmokeSummary {
+        model_path: model_path.display().to_string(),
+        reference_fixture: "qwen_session_single_fixed_tokens".to_string(),
+        delta_output: delta_output.display().to_string(),
+        optimizer_output: optimizer_output.display().to_string(),
+        manifest_output: manifest_output.display().to_string(),
+        compute_kind: dtype.label().to_string(),
+        learning_rate,
+        initial_loss,
+        final_loss,
+        reloaded_loss,
+        reload_delta,
+        resume_loss: resume_loss_value,
+        continuous_second_loss,
+        resumed_second_loss,
+        second_step_delta,
+        trainable_tensors: first_step.artifacts.tensor_summaries,
+    })
 }
 
 pub fn qwen_dp_gradient_smoke(
@@ -2128,6 +2250,44 @@ pub fn train_qwen_session_dp_from_config(config: &Config, _run_paths: &RunPaths)
         output_dir,
         dtype,
         config.train.max_steps as usize,
+        config.train.learning_rate as f64,
+    )
+}
+
+pub(crate) fn train_qwen_session_single_from_config(
+    config: &Config,
+    run_paths: &RunPaths,
+) -> Result<QwenFullTrainSmokeSummary> {
+    if config.model.architecture != "qwen_trainable_session" {
+        bail!(
+            "qwen session trainer expects architecture = qwen_trainable_session, got {}",
+            config.model.architecture
+        );
+    }
+    if !matches!(config.train.device, RuntimeDevice::Cuda) {
+        bail!("qwen session trainer requires device = cuda");
+    }
+    if config.parallel.data_parallel_size != 1 {
+        bail!("qwen session single trainer expects data_parallel_size = 1");
+    }
+    let model_path = config
+        .model
+        .model_path
+        .as_ref()
+        .context("qwen session trainer requires model.model_path")?;
+    let dtype = match config.train.dtype {
+        crate::runtime::DType::Fp32 => QwenComputeDType::Fp32,
+        crate::runtime::DType::Bf16 => QwenComputeDType::Bf16,
+        crate::runtime::DType::Fp16 => {
+            bail!("qwen session trainer does not support fp16 yet; use fp32 or bf16")
+        }
+    };
+    qwen_session_single_summary(
+        model_path,
+        &run_paths
+            .checkpoints
+            .join("qwen-session-single-delta.safetensors"),
+        dtype,
         config.train.learning_rate as f64,
     )
 }

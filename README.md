@@ -127,9 +127,9 @@ remain open.
   also has rank0 delta/optimizer artifacts and next-step resume parity. A
   production sharded checkpoint layout is still open.
 - C4/G1 trainer-owned Qwen training is still incomplete, but the full-train
-  smoke now uses a reusable `QwenTrainableSession` surface and a representative
-  DP config path is wired through `train --config`. Full model/data/checkpoint
-  trainer ownership remains open.
+  smoke now uses a reusable `QwenTrainableSession` surface, and representative
+  single-GPU plus DP=2 config paths are wired through `train --config`. Full
+  model/data/checkpoint trainer ownership remains open.
 - G6 trainer-level real SFT data now has a minimal Qwen LoRA SFT config path:
   `train --config configs/qwen_lora_sft.toml` loads tokenizer-backed
   instruction JSONL batches, trains configured focused q/v LoRA targets, and

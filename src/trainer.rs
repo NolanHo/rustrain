@@ -14,7 +14,10 @@ use crate::{
     moe::{deepseek_moe_smoke, moe_smoke},
     parallel::{ProcessGroup, SingleRankProcessGroup},
     parallel_modules::tp1_module_smoke,
-    qwen_module::{train_qwen_lora_sft_from_config, train_qwen_session_dp_from_config},
+    qwen_module::{
+        train_qwen_lora_sft_from_config, train_qwen_session_dp_from_config,
+        train_qwen_session_single_from_config,
+    },
     runtime::{
         Config, LrScheduler, init_logging, load_config, prepare_run_directory, validate_config,
         write_resolved_config,
@@ -119,11 +122,40 @@ pub fn train(config_path: &Path, resume_from: Option<PathBuf>) -> Result<()> {
         info!(train = ?config.train, "train config");
         info!(parallel = ?config.parallel, "parallel config");
 
-        train_qwen_session_dp_from_config(&config, &run_paths)?;
-        info!("qwen trainable session trainer DP smoke complete");
-        println!("rustrain qwen trainable session DP complete");
-        println!("run_dir: {}", run_paths.root.display());
-        println!("resolved_config: {}", run_paths.resolved_config.display());
+        if config.parallel.data_parallel_size == 1 {
+            let summary = train_qwen_session_single_from_config(&config, &run_paths)?;
+            info!(
+                initial_loss = summary.initial_loss,
+                final_loss = summary.final_loss,
+                reload_delta = summary.reload_delta,
+                second_step_delta = summary.second_step_delta,
+                trainable_tensors = summary.trainable_tensors.len(),
+                "qwen trainable session trainer single-rank smoke complete"
+            );
+            println!("rustrain qwen trainable session complete");
+            println!("run_dir: {}", run_paths.root.display());
+            println!("resolved_config: {}", run_paths.resolved_config.display());
+            println!("delta_output: {}", summary.delta_output);
+            println!("optimizer_output: {}", summary.optimizer_output);
+            println!("manifest_output: {}", summary.manifest_output);
+            println!("initial_loss: {:.9}", summary.initial_loss);
+            println!("final_loss: {:.9}", summary.final_loss);
+            println!("reloaded_loss: {:.9}", summary.reloaded_loss);
+            println!("reload_delta: {:.9}", summary.reload_delta);
+            println!(
+                "continuous_second_loss: {:.9}",
+                summary.continuous_second_loss
+            );
+            println!("resumed_second_loss: {:.9}", summary.resumed_second_loss);
+            println!("second_step_delta: {:.9}", summary.second_step_delta);
+            println!("trainable_tensors: {}", summary.trainable_tensors.len());
+        } else {
+            train_qwen_session_dp_from_config(&config, &run_paths)?;
+            info!("qwen trainable session trainer DP smoke complete");
+            println!("rustrain qwen trainable session DP complete");
+            println!("run_dir: {}", run_paths.root.display());
+            println!("resolved_config: {}", run_paths.resolved_config.display());
+        }
 
         return Ok(());
     }
