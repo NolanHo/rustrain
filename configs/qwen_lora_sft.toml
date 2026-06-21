@@ -35,7 +35,7 @@ adam_eps = 0.00000001
 dtype = "fp32"
 device = "cuda"
 checkpoint_every = 1
-eval_every = 0
+eval_every = 1
 
 [data]
 kind = "instruction_jsonl"

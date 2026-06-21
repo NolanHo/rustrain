@@ -181,6 +181,7 @@ pub fn train(config_path: &Path, resume_from: Option<PathBuf>) -> Result<()> {
             resume_from = ?summary.resume_from,
             resumed_adapter = summary.resumed_adapter,
             initial_eval_loss = summary.initial_eval_loss,
+            eval_history = ?summary.eval_history,
             final_eval_loss = summary.final_eval_loss,
             reloaded_eval_loss = summary.reloaded_eval_loss,
             eval_reload_delta = summary.eval_reload_delta,
@@ -233,6 +234,7 @@ pub fn train(config_path: &Path, resume_from: Option<PathBuf>) -> Result<()> {
         println!("initial_loss: {:.9}", summary.initial_loss);
         println!("final_loss: {:.9}", summary.final_loss);
         println!("initial_eval_loss: {:.9}", summary.initial_eval_loss);
+        println!("eval_history: {:?}", summary.eval_history);
         println!("final_eval_loss: {:.9}", summary.final_eval_loss);
         println!("reloaded_eval_loss: {:.9}", summary.reloaded_eval_loss);
         println!("eval_reload_delta: {:.9}", summary.eval_reload_delta);

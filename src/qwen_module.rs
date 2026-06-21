@@ -10,6 +10,7 @@ use rand::{Rng, SeedableRng, rngs::StdRng};
 use serde::{Deserialize, Serialize};
 use tch::{Device, IndexOp, Kind, Reduction, Tensor, no_grad};
 use tokenizers::Tokenizer;
+use tracing::info;
 
 use crate::nccl_smoke;
 use crate::runtime::{
@@ -168,6 +169,7 @@ pub(crate) struct QwenLoraSftTrainSummary {
     pub(crate) initial_loss: f64,
     pub(crate) final_loss: f64,
     pub(crate) initial_eval_loss: f64,
+    pub(crate) eval_history: Vec<QwenLoraSftEvalStep>,
     pub(crate) final_eval_loss: f64,
     pub(crate) reloaded_eval_loss: f64,
     pub(crate) eval_reload_delta: f64,
@@ -189,6 +191,12 @@ pub(crate) struct QwenLoraSftTrainSummary {
     pub(crate) memory_rss_mb: Option<f64>,
     pub(crate) gpu_memory_allocated_mb: Option<f64>,
     pub(crate) trainable_tensors: Vec<TrainableTensorSummary>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct QwenLoraSftEvalStep {
+    pub(crate) step: usize,
+    pub(crate) eval_loss: f64,
 }
 
 #[derive(Debug, Serialize)]
@@ -1077,6 +1085,7 @@ pub fn qwen_lora_sft_smoke(
         0.5,
         1,
         0,
+        0,
         QwenLoraSftTrainPolicy::constant_without_clip(),
     )?;
     println!("{}", serde_json::to_string_pretty(&summary)?);
@@ -1139,6 +1148,7 @@ pub fn train_qwen_lora_sft_from_config(
         data.train_split,
         config.train.gradient_accumulation_steps,
         config.train.checkpoint_every,
+        config.train.eval_every,
         QwenLoraSftTrainPolicy::from_config(config),
     )
 }
@@ -1159,6 +1169,7 @@ fn qwen_lora_sft_train(
     train_split: f32,
     gradient_accumulation_steps: usize,
     checkpoint_every: u64,
+    eval_every: u64,
     policy: QwenLoraSftTrainPolicy,
 ) -> Result<QwenLoraSftTrainSummary> {
     if learning_rate <= 0.0 {
@@ -1263,6 +1274,7 @@ fn qwen_lora_sft_train(
     let mut final_step_clipped_grad_norm = 0.0;
     let mut final_learning_rate = learning_rate;
     let mut step_adapter_checkpoints = Vec::new();
+    let mut eval_history = Vec::new();
     let train_started = Instant::now();
 
     for step in 0..steps {
@@ -1343,6 +1355,22 @@ fn qwen_lora_sft_train(
                 checkpoint_dir.join(format!("qwen-lora-sft-step-{step_number}.safetensors"));
             registry.save(&step_adapter_output)?;
             step_adapter_checkpoints.push(step_adapter_output.display().to_string());
+        }
+        if qwen_lora_sft_should_eval_step(step_number, eval_every) {
+            let eval_loss = qwen_lora_sft_loss(
+                &eval_batch.input_ids,
+                &eval_batch.target_mask,
+                &weights,
+                &lora_config,
+                &registry,
+                &config,
+            )?
+            .double_value(&[]);
+            info!(step = step_number, eval_loss, "Qwen LoRA SFT eval step");
+            eval_history.push(QwenLoraSftEvalStep {
+                step: step_number,
+                eval_loss,
+            });
         }
     }
     let train_elapsed_secs = train_started.elapsed().as_secs_f64().max(1e-9);
@@ -1491,6 +1519,7 @@ fn qwen_lora_sft_train(
         initial_loss,
         final_loss,
         initial_eval_loss,
+        eval_history,
         final_eval_loss,
         reloaded_eval_loss,
         eval_reload_delta,
@@ -1514,6 +1543,10 @@ fn qwen_lora_sft_train(
         trainable_tensors: tensor_summaries,
     };
     Ok(summary)
+}
+
+fn qwen_lora_sft_should_eval_step(step_number: usize, eval_every: u64) -> bool {
+    eval_every > 0 && (step_number as u64) % eval_every == 0
 }
 
 pub fn qwen_tied_head_train_smoke(
@@ -5864,6 +5897,15 @@ mod tests {
         assert_eq!(examples[0].instruction, "first");
         assert_eq!(examples[1].instruction, "second");
         assert_eq!(examples[2].instruction, "third");
+    }
+
+    #[test]
+    fn qwen_lora_sft_eval_every_selects_periodic_steps() {
+        assert!(!qwen_lora_sft_should_eval_step(1, 0));
+        assert!(qwen_lora_sft_should_eval_step(1, 1));
+        assert!(!qwen_lora_sft_should_eval_step(1, 2));
+        assert!(qwen_lora_sft_should_eval_step(2, 2));
+        assert!(qwen_lora_sft_should_eval_step(4, 2));
     }
 
     #[test]
