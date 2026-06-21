@@ -126,7 +126,10 @@ real-Qwen TP=2 linear smoke shards the real layer0 attention `q_proj`, `k_proj`,
 gathered shard outputs match the full linear projections. A companion TP=2
 attention smoke shards Q/K/V heads, applies rank-local attention, sums O-proj
 input-column contributions on rank0, and verifies parity against full layer0
-attention. Real multi-GPU Qwen training is not implemented yet.
+attention. A matching TP=2 MLP smoke shards gate/up intermediate rows and
+down-proj input columns, sums rank-local contributions on rank0, and verifies
+parity against the full layer0 MLP. Real multi-GPU Qwen training is not
+implemented yet.
 The Qwen DP smoke writes a rank0-only JSON checkpoint manifest after gradient
 sync succeeds; non-rank0 summaries record the same checkpoint path but do not
 write it.
