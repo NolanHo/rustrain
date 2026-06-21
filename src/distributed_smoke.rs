@@ -367,6 +367,19 @@ impl ExpertParallelGlobalCheckpointManifest {
         {
             bail!("EP global checkpoint parallel sizes must be positive");
         }
+        if self.parallel.data_parallel_size != 1
+            || self.parallel.tensor_model_parallel_size != 1
+            || self.parallel.pipeline_model_parallel_size != 1
+            || self.parallel.context_parallel_size != 1
+        {
+            bail!(
+                "EP global checkpoint currently expects DP/TP/PP/CP sizes to be 1, got DP={} TP={} PP={} CP={}",
+                self.parallel.data_parallel_size,
+                self.parallel.tensor_model_parallel_size,
+                self.parallel.pipeline_model_parallel_size,
+                self.parallel.context_parallel_size
+            );
+        }
         if self.ranks.len() != self.parallel.expert_model_parallel_size {
             bail!(
                 "EP global checkpoint expected {} rank manifests, got {}",
@@ -420,6 +433,12 @@ impl ExpertParallelGlobalCheckpointManifest {
                 if rank.shards.is_empty() {
                     bail!("EP rank {} checkpoint has no shards", rank.rank);
                 }
+                if rank.model_safetensors.is_empty() || rank.optimizer_safetensors.is_empty() {
+                    bail!(
+                        "EP rank {} checkpoint requires model and optimizer safetensors",
+                        rank.rank
+                    );
+                }
                 Ok(rank)
             })
             .collect::<Result<Vec<_>>>()?;
@@ -459,6 +478,32 @@ impl ExpertParallelGlobalCheckpointManifest {
                         "EP rank {} shard {} is missing shape metadata",
                         rank.rank,
                         shard.name
+                    );
+                }
+                if shard.optimizer_m_name.is_empty() || shard.optimizer_v_name.is_empty() {
+                    bail!(
+                        "EP rank {} shard {} is missing optimizer slot metadata",
+                        rank.rank,
+                        shard.name
+                    );
+                }
+                if shard.global_shape[0] != ep_expert_count() as i64 {
+                    bail!(
+                        "EP rank {} shard {} global expert dimension {} does not match {}",
+                        rank.rank,
+                        shard.name,
+                        shard.global_shape[0],
+                        ep_expert_count()
+                    );
+                }
+                if shard.shard_shape[0] as usize != rank.owned_expert_end - rank.owned_expert_start
+                {
+                    bail!(
+                        "EP rank {} shard {} shard expert dimension {} does not match owned expert count {}",
+                        rank.rank,
+                        shard.name,
+                        shard.shard_shape[0],
+                        rank.owned_expert_end - rank.owned_expert_start
                     );
                 }
                 if shard.dtype.is_empty() {
@@ -3553,6 +3598,42 @@ mod tests {
     }
 
     #[test]
+    fn ep_global_checkpoint_manifest_rejects_wrong_world_size() {
+        let mut manifest = tiny_ep_global_manifest();
+        manifest.ranks[1].world_size = 3;
+
+        let error = manifest
+            .validate()
+            .expect_err("wrong rank world size should fail")
+            .to_string();
+        assert!(error.contains("does not match global EP size"));
+    }
+
+    #[test]
+    fn ep_global_checkpoint_manifest_rejects_non_ep_parallel_axes() {
+        let mut manifest = tiny_ep_global_manifest();
+        manifest.parallel.tensor_model_parallel_size = 2;
+
+        let error = manifest
+            .validate()
+            .expect_err("non-EP parallel axis should fail")
+            .to_string();
+        assert!(error.contains("expects DP/TP/PP/CP sizes to be 1"));
+    }
+
+    #[test]
+    fn ep_global_checkpoint_manifest_rejects_mismatched_rank_step() {
+        let mut manifest = tiny_ep_global_manifest();
+        manifest.ranks[1].global_step = 2;
+
+        let error = manifest
+            .validate()
+            .expect_err("mismatched rank step should fail")
+            .to_string();
+        assert!(error.contains("does not match global step"));
+    }
+
+    #[test]
     fn ep_global_checkpoint_manifest_rejects_non_contiguous_experts() {
         let mut manifest = tiny_ep_global_manifest();
         manifest.ranks[1].owned_expert_start = 3;
@@ -3562,6 +3643,39 @@ mod tests {
             .expect_err("expert range gap should fail")
             .to_string();
         assert!(error.contains("does not continue"));
+    }
+
+    #[test]
+    fn ep_global_checkpoint_manifest_rejects_missing_optimizer_slots() {
+        let mut manifest = tiny_ep_global_manifest();
+        manifest.ranks[0].shards[0].optimizer_m_name.clear();
+
+        let error = manifest
+            .validate()
+            .expect_err("missing optimizer slot should fail")
+            .to_string();
+        assert!(error.contains("missing optimizer slot metadata"));
+    }
+
+    #[test]
+    fn ep_global_checkpoint_manifest_rejects_wrong_shard_expert_dimensions() {
+        let mut wrong_global = tiny_ep_global_manifest();
+        wrong_global.ranks[0].shards[0].global_shape[0] = 3;
+
+        let wrong_global_error = wrong_global
+            .validate()
+            .expect_err("wrong global expert dimension should fail")
+            .to_string();
+        assert!(wrong_global_error.contains("global expert dimension"));
+
+        let mut wrong_shard = tiny_ep_global_manifest();
+        wrong_shard.ranks[0].shards[0].shard_shape[0] = 1;
+
+        let wrong_shard_error = wrong_shard
+            .validate()
+            .expect_err("wrong shard expert dimension should fail")
+            .to_string();
+        assert!(wrong_shard_error.contains("shard expert dimension"));
     }
 
     #[test]
