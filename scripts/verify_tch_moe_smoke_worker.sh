@@ -37,14 +37,17 @@ required = [
     "initial_load_balance_loss",
     "final_load_balance_loss",
     "checkpoint_output",
+    "optimizer_output",
     "reloaded_loss",
     "reload_delta",
+    "reload_optimizer_max_abs",
     "continuous_second_loss",
     "resumed_second_loss",
     "second_step_delta",
     "second_step_router_max_abs",
     "second_step_expert_up_max_abs",
     "second_step_expert_down_max_abs",
+    "second_step_optimizer_max_abs",
     "expert_load",
     "total_params",
     "activated_params",
@@ -87,6 +90,9 @@ if not summary["activated_params"] < summary["total_params"]:
 checkpoint = pathlib.Path(summary["checkpoint_output"])
 if not checkpoint.exists() or checkpoint.stat().st_size == 0:
     raise SystemExit(f"checkpoint_output missing or empty: {checkpoint}")
+optimizer = pathlib.Path(summary["optimizer_output"])
+if not optimizer.exists() or optimizer.stat().st_size == 0:
+    raise SystemExit(f"optimizer_output missing or empty: {optimizer}")
 if len(summary["expert_load"]) != summary["num_experts"]:
     raise SystemExit(f"unexpected expert_load length: {summary['expert_load']}")
 if sum(summary["expert_load"]) != summary["tokens"]:
@@ -127,10 +133,12 @@ if abs(float(summary["reloaded_loss"]) - float(summary["final_loss"])) > 1e-7:
     )
 for key in [
     "reload_delta",
+    "reload_optimizer_max_abs",
     "second_step_delta",
     "second_step_router_max_abs",
     "second_step_expert_up_max_abs",
     "second_step_expert_down_max_abs",
+    "second_step_optimizer_max_abs",
 ]:
     if float(summary[key]) > 1e-7:
         raise SystemExit(f"{key} too large: {summary[key]}")

@@ -186,8 +186,8 @@ load-balance loss, activated/total parameter counts, and output summaries on a
 Ray GPU worker. A CUDA `tch-rs` autograd MoE smoke is also available through
 `cargo run -- tch-moe-smoke`; `scripts/verify_tch_moe_smoke_worker.sh` checks
 that router and expert tensors receive gradients, the task loss decreases,
-activated parameters remain below total parameters, and a safetensors checkpoint
-reload reproduces the next SGD step on a Ray GPU worker.
+activated parameters remain below total parameters, and model plus AdamW
+optimizer safetensors reload reproduces the next train step on a Ray GPU worker.
 Expert-parallel coverage is still toy-sized, but it now has three real
 launcher-backed two-rank paths: `parallel-ep-rank-smoke` verifies rank-local
 expert ownership and token coverage, `parallel-ep-nccl-rank-smoke` builds

@@ -72,14 +72,17 @@ struct TchMoeSmokeSummary {
     initial_load_balance_loss: f64,
     final_load_balance_loss: f64,
     checkpoint_output: String,
+    optimizer_output: String,
     reloaded_loss: f64,
     reload_delta: f64,
+    reload_optimizer_max_abs: f64,
     continuous_second_loss: f64,
     resumed_second_loss: f64,
     second_step_delta: f64,
     second_step_router_max_abs: f64,
     second_step_expert_up_max_abs: f64,
     second_step_expert_down_max_abs: f64,
+    second_step_optimizer_max_abs: f64,
     expert_load: Vec<usize>,
     total_params: usize,
     activated_params: usize,
@@ -103,7 +106,17 @@ struct TchMoeForward {
     expert_load: Vec<usize>,
 }
 
-struct TchMoeSgdStep {
+struct TchMoeAdamState {
+    router_m: Tensor,
+    router_v: Tensor,
+    expert_up_m: Tensor,
+    expert_up_v: Tensor,
+    expert_down_m: Tensor,
+    expert_down_v: Tensor,
+    step: i64,
+}
+
+struct TchMoeTrainStep {
     loss_before: f64,
     router_grad_defined: bool,
     expert_up_grad_defined: bool,
@@ -111,6 +124,54 @@ struct TchMoeSgdStep {
     router_grad_norm: f64,
     expert_up_grad_norm: f64,
     expert_down_grad_norm: f64,
+    updated_state: TchMoeAdamState,
+}
+
+struct TchMoeCheckpoint {
+    router: Tensor,
+    expert_up: Tensor,
+    expert_down: Tensor,
+    state: TchMoeAdamState,
+}
+
+impl TchMoeAdamState {
+    fn zeros_like(router: &Tensor, expert_up: &Tensor, expert_down: &Tensor) -> Self {
+        Self {
+            router_m: Tensor::zeros_like(router),
+            router_v: Tensor::zeros_like(router),
+            expert_up_m: Tensor::zeros_like(expert_up),
+            expert_up_v: Tensor::zeros_like(expert_up),
+            expert_down_m: Tensor::zeros_like(expert_down),
+            expert_down_v: Tensor::zeros_like(expert_down),
+            step: 0,
+        }
+    }
+
+    fn clone_state(&self) -> Self {
+        Self {
+            router_m: self.router_m.shallow_clone(),
+            router_v: self.router_v.shallow_clone(),
+            expert_up_m: self.expert_up_m.shallow_clone(),
+            expert_up_v: self.expert_up_v.shallow_clone(),
+            expert_down_m: self.expert_down_m.shallow_clone(),
+            expert_down_v: self.expert_down_v.shallow_clone(),
+            step: self.step,
+        }
+    }
+
+    fn max_abs_diff(&self, other: &Self) -> Result<f64> {
+        Ok([
+            tensor_max_abs_diff(&self.router_m, &other.router_m)?,
+            tensor_max_abs_diff(&self.router_v, &other.router_v)?,
+            tensor_max_abs_diff(&self.expert_up_m, &other.expert_up_m)?,
+            tensor_max_abs_diff(&self.expert_up_v, &other.expert_up_v)?,
+            tensor_max_abs_diff(&self.expert_down_m, &other.expert_down_m)?,
+            tensor_max_abs_diff(&self.expert_down_v, &other.expert_down_v)?,
+            (self.step - other.step).abs() as f64,
+        ]
+        .into_iter()
+        .fold(0.0_f64, f64::max))
+    }
 }
 
 pub fn probe_tch_cuda() -> Result<()> {
@@ -147,8 +208,12 @@ fn tch_moe_smoke_summary() -> Result<TchMoeSmokeSummary> {
     let num_experts = 3;
     let top_k = 1;
     let train_steps = 8;
-    let learning_rate = 0.2;
+    let learning_rate = 0.01;
     let aux_loss_weight = 0.01;
+    let beta1 = 0.9;
+    let beta2 = 0.999;
+    let eps = 1e-8;
+    let weight_decay = 0.0;
 
     let input = Tensor::from_slice(&[
         0.2_f32, -0.1, 0.4, 0.7, -0.3, 0.8, 0.1, -0.5, 0.6, 0.2, -0.4, 0.3, 0.9, -0.7, 0.2, 0.1,
@@ -197,10 +262,11 @@ fn tch_moe_smoke_summary() -> Result<TchMoeSmokeSummary> {
     let initial_task_loss = initial.task_loss.double_value(&[]);
     let initial_load_balance_loss = initial.load_balance_loss.double_value(&[]);
 
-    let mut first_step: Option<TchMoeSgdStep> = None;
+    let mut state = TchMoeAdamState::zeros_like(&router, &expert_up, &expert_down);
+    let mut first_step: Option<TchMoeTrainStep> = None;
 
     for step in 1..=train_steps {
-        let step_summary = tch_moe_sgd_step(
+        let step_summary = tch_moe_adamw_step(
             &input,
             &target,
             &mut router,
@@ -209,7 +275,13 @@ fn tch_moe_smoke_summary() -> Result<TchMoeSmokeSummary> {
             num_experts,
             aux_loss_weight,
             learning_rate,
+            beta1,
+            beta2,
+            eps,
+            weight_decay,
+            &state,
         )?;
+        state = step_summary.updated_state.clone_state();
         if step == 1 {
             first_step = Some(step_summary);
         }
@@ -236,9 +308,28 @@ fn tch_moe_smoke_summary() -> Result<TchMoeSmokeSummary> {
                 std::process::id()
             ))
         });
-    write_tch_moe_checkpoint(&checkpoint_output, &router, &expert_up, &expert_down)?;
-    let (mut reloaded_router, mut reloaded_expert_up, mut reloaded_expert_down) =
-        read_tch_moe_checkpoint(&checkpoint_output, device)?;
+    let optimizer_output = checkpoint_output.with_file_name(format!(
+        "{}.optimizer.safetensors",
+        checkpoint_output
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .unwrap_or("rustrain-tch-moe")
+    ));
+    write_tch_moe_checkpoint(
+        &checkpoint_output,
+        &optimizer_output,
+        &router,
+        &expert_up,
+        &expert_down,
+        &state,
+    )?;
+    let TchMoeCheckpoint {
+        router: mut reloaded_router,
+        expert_up: mut reloaded_expert_up,
+        expert_down: mut reloaded_expert_down,
+        state: reloaded_state,
+    } = read_tch_moe_checkpoint(&checkpoint_output, device)?;
+    let reload_optimizer_max_abs = state.max_abs_diff(&reloaded_state)?;
     let reloaded_forward = tch_moe_forward(
         &input,
         &target,
@@ -254,7 +345,7 @@ fn tch_moe_smoke_summary() -> Result<TchMoeSmokeSummary> {
     let mut continuous_router = router.detach().set_requires_grad(true);
     let mut continuous_expert_up = expert_up.detach().set_requires_grad(true);
     let mut continuous_expert_down = expert_down.detach().set_requires_grad(true);
-    let continuous_second = tch_moe_sgd_step(
+    let continuous_second = tch_moe_adamw_step(
         &input,
         &target,
         &mut continuous_router,
@@ -263,8 +354,13 @@ fn tch_moe_smoke_summary() -> Result<TchMoeSmokeSummary> {
         num_experts,
         aux_loss_weight,
         learning_rate,
+        beta1,
+        beta2,
+        eps,
+        weight_decay,
+        &state,
     )?;
-    let resumed_second = tch_moe_sgd_step(
+    let resumed_second = tch_moe_adamw_step(
         &input,
         &target,
         &mut reloaded_router,
@@ -273,6 +369,11 @@ fn tch_moe_smoke_summary() -> Result<TchMoeSmokeSummary> {
         num_experts,
         aux_loss_weight,
         learning_rate,
+        beta1,
+        beta2,
+        eps,
+        weight_decay,
+        &reloaded_state,
     )?;
     let continuous_second_loss = continuous_second.loss_before;
     let resumed_second_loss = resumed_second.loss_before;
@@ -282,6 +383,9 @@ fn tch_moe_smoke_summary() -> Result<TchMoeSmokeSummary> {
         tensor_max_abs_diff(&continuous_expert_up, &reloaded_expert_up)?;
     let second_step_expert_down_max_abs =
         tensor_max_abs_diff(&continuous_expert_down, &reloaded_expert_down)?;
+    let second_step_optimizer_max_abs = continuous_second
+        .updated_state
+        .max_abs_diff(&resumed_second.updated_state)?;
 
     if final_loss >= initial_loss {
         bail!(
@@ -316,13 +420,15 @@ fn tch_moe_smoke_summary() -> Result<TchMoeSmokeSummary> {
         );
     }
     if reload_delta > 1e-7
+        || reload_optimizer_max_abs > 1e-7
         || second_step_delta > 1e-7
         || second_step_router_max_abs > 1e-7
         || second_step_expert_up_max_abs > 1e-7
         || second_step_expert_down_max_abs > 1e-7
+        || second_step_optimizer_max_abs > 1e-7
     {
         bail!(
-            "tch MoE checkpoint resume parity failed: reload_delta={reload_delta}, second_step_delta={second_step_delta}, router={second_step_router_max_abs}, expert_up={second_step_expert_up_max_abs}, expert_down={second_step_expert_down_max_abs}"
+            "tch MoE checkpoint resume parity failed: reload_delta={reload_delta}, reload_optimizer_max_abs={reload_optimizer_max_abs}, second_step_delta={second_step_delta}, router={second_step_router_max_abs}, expert_up={second_step_expert_up_max_abs}, expert_down={second_step_expert_down_max_abs}, optimizer={second_step_optimizer_max_abs}"
         );
     }
 
@@ -350,14 +456,17 @@ fn tch_moe_smoke_summary() -> Result<TchMoeSmokeSummary> {
         initial_load_balance_loss,
         final_load_balance_loss,
         checkpoint_output: checkpoint_output.display().to_string(),
+        optimizer_output: optimizer_output.display().to_string(),
         reloaded_loss,
         reload_delta,
+        reload_optimizer_max_abs,
         continuous_second_loss,
         resumed_second_loss,
         second_step_delta,
         second_step_router_max_abs,
         second_step_expert_up_max_abs,
         second_step_expert_down_max_abs,
+        second_step_optimizer_max_abs,
         expert_load: final_forward.expert_load,
         total_params,
         activated_params,
@@ -685,7 +794,7 @@ fn tch_moe_forward(
     })
 }
 
-fn tch_moe_sgd_step(
+fn tch_moe_adamw_step(
     input: &Tensor,
     target: &Tensor,
     router: &mut Tensor,
@@ -694,7 +803,12 @@ fn tch_moe_sgd_step(
     num_experts: i64,
     aux_loss_weight: f64,
     learning_rate: f64,
-) -> Result<TchMoeSgdStep> {
+    beta1: f64,
+    beta2: f64,
+    eps: f64,
+    weight_decay: f64,
+    state: &TchMoeAdamState,
+) -> Result<TchMoeTrainStep> {
     router.zero_grad();
     expert_up.zero_grad();
     expert_down.zero_grad();
@@ -717,14 +831,52 @@ fn tch_moe_sgd_step(
     let expert_up_grad_norm = tensor_l2_norm(&expert_up.grad());
     let expert_down_grad_norm = tensor_l2_norm(&expert_down.grad());
 
+    let next_step = state.step + 1;
+    let (router_update, router_m, router_v) = adamw_parameter_update(
+        router,
+        &router.grad(),
+        &state.router_m,
+        &state.router_v,
+        learning_rate,
+        beta1,
+        beta2,
+        next_step,
+        eps,
+        weight_decay,
+    );
+    let (expert_up_update, expert_up_m, expert_up_v) = adamw_parameter_update(
+        expert_up,
+        &expert_up.grad(),
+        &state.expert_up_m,
+        &state.expert_up_v,
+        learning_rate,
+        beta1,
+        beta2,
+        next_step,
+        eps,
+        weight_decay,
+    );
+    let (expert_down_update, expert_down_m, expert_down_v) = adamw_parameter_update(
+        expert_down,
+        &expert_down.grad(),
+        &state.expert_down_m,
+        &state.expert_down_v,
+        learning_rate,
+        beta1,
+        beta2,
+        next_step,
+        eps,
+        weight_decay,
+    );
+
     no_grad(|| -> Result<()> {
-        let _ = router.f_sub_(&(&router.grad() * learning_rate))?;
-        let _ = expert_up.f_sub_(&(&expert_up.grad() * learning_rate))?;
-        let _ = expert_down.f_sub_(&(&expert_down.grad() * learning_rate))?;
+        let _ = router.f_sub_(&router_update)?;
+        let _ = expert_up.f_sub_(&expert_up_update)?;
+        let _ = expert_down.f_sub_(&expert_down_update)?;
         Ok(())
     })?;
 
-    Ok(TchMoeSgdStep {
+    Ok(TchMoeTrainStep {
         loss_before,
         router_grad_defined,
         expert_up_grad_defined,
@@ -732,16 +884,54 @@ fn tch_moe_sgd_step(
         router_grad_norm,
         expert_up_grad_norm,
         expert_down_grad_norm,
+        updated_state: TchMoeAdamState {
+            router_m,
+            router_v,
+            expert_up_m,
+            expert_up_v,
+            expert_down_m,
+            expert_down_v,
+            step: next_step,
+        },
     })
 }
 
+fn adamw_parameter_update(
+    parameter: &Tensor,
+    grad: &Tensor,
+    previous_m: &Tensor,
+    previous_v: &Tensor,
+    learning_rate: f64,
+    beta1: f64,
+    beta2: f64,
+    step: i64,
+    eps: f64,
+    weight_decay: f64,
+) -> (Tensor, Tensor, Tensor) {
+    let m = previous_m * beta1 + grad * (1.0 - beta1);
+    let v = previous_v * beta2 + grad.square() * (1.0 - beta2);
+    let bias_correction1 = 1.0 - beta1.powi(step as i32);
+    let bias_correction2 = 1.0 - beta2.powi(step as i32);
+    let m_hat = &m / bias_correction1;
+    let v_hat = &v / bias_correction2;
+    let adaptive_update = m_hat / (v_hat.sqrt() + eps);
+    let update = if weight_decay == 0.0 {
+        adaptive_update * learning_rate
+    } else {
+        (adaptive_update + parameter * weight_decay) * learning_rate
+    };
+    (update, m, v)
+}
+
 fn write_tch_moe_checkpoint(
-    path: &Path,
+    model_path: &Path,
+    optimizer_path: &Path,
     router: &Tensor,
     expert_up: &Tensor,
     expert_down: &Tensor,
+    state: &TchMoeAdamState,
 ) -> Result<()> {
-    if let Some(parent) = path.parent() {
+    if let Some(parent) = model_path.parent() {
         fs::create_dir_all(parent)
             .with_context(|| format!("failed to create {}", parent.display()))?;
     }
@@ -751,14 +941,38 @@ fn write_tch_moe_checkpoint(
             ("experts.up.weight", expert_up),
             ("experts.down.weight", expert_down),
         ],
-        path,
+        model_path,
     )
-    .with_context(|| format!("failed to write {}", path.display()))
+    .with_context(|| format!("failed to write {}", model_path.display()))?;
+    Tensor::write_safetensors(
+        &[
+            ("router.weight.adam_m", &state.router_m),
+            ("router.weight.adam_v", &state.router_v),
+            ("experts.up.weight.adam_m", &state.expert_up_m),
+            ("experts.up.weight.adam_v", &state.expert_up_v),
+            ("experts.down.weight.adam_m", &state.expert_down_m),
+            ("experts.down.weight.adam_v", &state.expert_down_v),
+            ("optimizer.step", &Tensor::from_slice(&[state.step])),
+        ],
+        optimizer_path,
+    )
+    .with_context(|| format!("failed to write {}", optimizer_path.display()))
 }
 
-fn read_tch_moe_checkpoint(path: &Path, device: Device) -> Result<(Tensor, Tensor, Tensor)> {
-    let tensors = Tensor::read_safetensors(path)
-        .with_context(|| format!("failed to read {}", path.display()))?
+fn read_tch_moe_checkpoint(model_path: &Path, device: Device) -> Result<TchMoeCheckpoint> {
+    let optimizer_path = model_path.with_file_name(format!(
+        "{}.optimizer.safetensors",
+        model_path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .unwrap_or("rustrain-tch-moe")
+    ));
+    let tensors = Tensor::read_safetensors(model_path)
+        .with_context(|| format!("failed to read {}", model_path.display()))?
+        .into_iter()
+        .collect::<BTreeMap<_, _>>();
+    let optimizer_tensors = Tensor::read_safetensors(&optimizer_path)
+        .with_context(|| format!("failed to read {}", optimizer_path.display()))?
         .into_iter()
         .collect::<BTreeMap<_, _>>();
     let router = tensor_from_map(&tensors, "router.weight")?
@@ -770,7 +984,29 @@ fn read_tch_moe_checkpoint(path: &Path, device: Device) -> Result<(Tensor, Tenso
     let expert_down = tensor_from_map(&tensors, "experts.down.weight")?
         .to_device(device)
         .set_requires_grad(true);
-    Ok((router, expert_up, expert_down))
+    let step = tensor_from_map(&optimizer_tensors, "optimizer.step")?
+        .to_device(Device::Cpu)
+        .int64_value(&[0]);
+    Ok(TchMoeCheckpoint {
+        router,
+        expert_up,
+        expert_down,
+        state: TchMoeAdamState {
+            router_m: tensor_from_map(&optimizer_tensors, "router.weight.adam_m")?
+                .to_device(device),
+            router_v: tensor_from_map(&optimizer_tensors, "router.weight.adam_v")?
+                .to_device(device),
+            expert_up_m: tensor_from_map(&optimizer_tensors, "experts.up.weight.adam_m")?
+                .to_device(device),
+            expert_up_v: tensor_from_map(&optimizer_tensors, "experts.up.weight.adam_v")?
+                .to_device(device),
+            expert_down_m: tensor_from_map(&optimizer_tensors, "experts.down.weight.adam_m")?
+                .to_device(device),
+            expert_down_v: tensor_from_map(&optimizer_tensors, "experts.down.weight.adam_v")?
+                .to_device(device),
+            step,
+        },
+    })
 }
 
 fn tensor_from_map<'a>(tensors: &'a BTreeMap<String, Tensor>, name: &str) -> Result<&'a Tensor> {
