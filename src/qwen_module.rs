@@ -505,6 +505,20 @@ impl QwenShardedCheckpointManifest {
         if self.consumed_tokens == 0 {
             bail!("Qwen sharded checkpoint consumed_tokens must be positive");
         }
+        if !self.dataset_fingerprint.is_empty() {
+            if self.dataset_source_files.is_empty() {
+                bail!("Qwen sharded checkpoint dataset_fingerprint requires dataset_source_files");
+            }
+            if self
+                .dataset_source_files
+                .iter()
+                .any(|source| !source.ends_with(".jsonl"))
+            {
+                bail!("Qwen sharded checkpoint dataset_source_files must only contain JSONL paths");
+            }
+        } else if !self.dataset_source_files.is_empty() {
+            bail!("Qwen sharded checkpoint dataset_source_files require dataset_fingerprint");
+        }
         if let Some(data_cursor_next) = self.data_cursor_next {
             if data_cursor_next != self.consumed_samples {
                 bail!(
@@ -7134,6 +7148,40 @@ mod tests {
                 .to_string()
                 .contains("data_sample_offset_next 5 must match")
         );
+    }
+
+    #[test]
+    fn qwen_sharded_checkpoint_manifest_validates_dataset_provenance_shape() {
+        let mut legacy_manifest = tiny_qwen_sharded_manifest();
+        legacy_manifest.dataset_source_files.clear();
+        legacy_manifest.dataset_fingerprint.clear();
+        legacy_manifest
+            .validate()
+            .expect("legacy sharded manifest without provenance should validate");
+
+        let mut missing_sources = tiny_qwen_sharded_manifest();
+        missing_sources.dataset_source_files.clear();
+        let missing_sources_error = missing_sources
+            .validate()
+            .expect_err("fingerprint without source files should fail")
+            .to_string();
+        assert!(missing_sources_error.contains("requires dataset_source_files"));
+
+        let mut missing_fingerprint = tiny_qwen_sharded_manifest();
+        missing_fingerprint.dataset_fingerprint.clear();
+        let missing_fingerprint_error = missing_fingerprint
+            .validate()
+            .expect_err("source files without fingerprint should fail")
+            .to_string();
+        assert!(missing_fingerprint_error.contains("require dataset_fingerprint"));
+
+        let mut non_jsonl_source = tiny_qwen_sharded_manifest();
+        non_jsonl_source.dataset_source_files = vec!["data/README.md".to_string()];
+        let non_jsonl_source_error = non_jsonl_source
+            .validate()
+            .expect_err("non-jsonl source file should fail")
+            .to_string();
+        assert!(non_jsonl_source_error.contains("must only contain JSONL paths"));
     }
 
     #[test]
