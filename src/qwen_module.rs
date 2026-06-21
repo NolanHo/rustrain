@@ -143,6 +143,17 @@ struct QwenSessionTpRankSummary {
     world_size: usize,
     local_rank: usize,
     model_path: String,
+    resume_from: Option<String>,
+    resumed_sharded_checkpoint: bool,
+    resume_global_step: Option<u64>,
+    resume_rank_manifest_output: Option<String>,
+    resume_model_safetensors: Option<String>,
+    resume_optimizer_safetensors: Option<String>,
+    resume_sharded_manifest_tensor_count: Option<usize>,
+    resume_restore_max_abs: Option<f64>,
+    resume_restore_mean_abs: Option<f64>,
+    resume_next_update_max_abs: Option<f64>,
+    resume_next_update_mean_abs: Option<f64>,
     tensor_model_parallel_size: usize,
     data_parallel_size: usize,
     attention_q_head_start: i64,
@@ -242,6 +253,16 @@ struct QwenSessionTpFocusedLayer0Shards {
     gate: Tensor,
     up: Tensor,
     down: Tensor,
+}
+
+struct QwenSessionTpFocusedResume {
+    global_step: u64,
+    rank_manifest_output: String,
+    model_safetensors: String,
+    optimizer_safetensors: String,
+    tensor_count: usize,
+    restore_diff: DiffStats,
+    next_update_diff: DiffStats,
 }
 
 #[derive(Debug, Deserialize)]
@@ -5649,12 +5670,66 @@ fn qwen_session_tp_rank_smoke(
             sharded_next_update_diff.mean_abs
         );
     }
+    let external_resume = config
+        .train
+        .resume_from
+        .as_deref()
+        .map(|resume_from| {
+            qwen_session_tp_focused_external_resume(
+                resume_from,
+                rank,
+                world_size,
+                &layer0_input,
+                &full_layer0,
+                &q_bias_full.narrow(0, q_output_start, q_output_size),
+                &k_bias_full.narrow(0, kv_output_start, kv_output_size),
+                &v_bias_full.narrow(0, kv_output_start, kv_output_size),
+                &runtime_config,
+                attention.q_heads_per_rank,
+                attention.kv_heads_per_rank,
+                &layer0_target,
+                &layer0_update.final_output,
+                &output_dir.join("layer0-sharded-external-resume"),
+            )
+        })
+        .transpose()?;
 
     let summary = QwenSessionTpRankSummary {
         rank,
         world_size,
         local_rank,
         model_path: model_path.display().to_string(),
+        resume_from: config
+            .train
+            .resume_from
+            .as_ref()
+            .map(|path| path.display().to_string()),
+        resumed_sharded_checkpoint: external_resume.is_some(),
+        resume_global_step: external_resume.as_ref().map(|resume| resume.global_step),
+        resume_rank_manifest_output: external_resume
+            .as_ref()
+            .map(|resume| resume.rank_manifest_output.clone()),
+        resume_model_safetensors: external_resume
+            .as_ref()
+            .map(|resume| resume.model_safetensors.clone()),
+        resume_optimizer_safetensors: external_resume
+            .as_ref()
+            .map(|resume| resume.optimizer_safetensors.clone()),
+        resume_sharded_manifest_tensor_count: external_resume
+            .as_ref()
+            .map(|resume| resume.tensor_count),
+        resume_restore_max_abs: external_resume
+            .as_ref()
+            .map(|resume| resume.restore_diff.max_abs),
+        resume_restore_mean_abs: external_resume
+            .as_ref()
+            .map(|resume| resume.restore_diff.mean_abs),
+        resume_next_update_max_abs: external_resume
+            .as_ref()
+            .map(|resume| resume.next_update_diff.max_abs),
+        resume_next_update_mean_abs: external_resume
+            .as_ref()
+            .map(|resume| resume.next_update_diff.mean_abs),
         tensor_model_parallel_size: config.parallel.tensor_model_parallel_size,
         data_parallel_size: config.parallel.data_parallel_size,
         attention_q_head_start: attention.q_head_start,
@@ -6108,6 +6183,137 @@ fn qwen_session_tp_focused_sharded_restore(
         reduce_dir,
     )?;
     Ok((diff_stats(&restored_layer0, full_layer0)?, restored_shards))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn qwen_session_tp_focused_external_resume(
+    global_manifest_output: &Path,
+    rank: usize,
+    world_size: usize,
+    layer0_input: &Tensor,
+    full_layer0: &Tensor,
+    q_bias_shard: &Tensor,
+    k_bias_shard: &Tensor,
+    v_bias_shard: &Tensor,
+    runtime_config: &QwenRuntimeConfig,
+    q_heads_per_rank: i64,
+    kv_heads_per_rank: i64,
+    layer0_target: &Tensor,
+    reference_update_output: &Tensor,
+    reduce_dir: &Path,
+) -> Result<QwenSessionTpFocusedResume> {
+    let global_text = fs::read_to_string(global_manifest_output)
+        .with_context(|| format!("failed to read {}", global_manifest_output.display()))?;
+    let global_manifest: QwenShardedCheckpointManifest = serde_json::from_str(&global_text)
+        .with_context(|| format!("failed to parse {}", global_manifest_output.display()))?;
+    global_manifest.validate()?;
+    if global_manifest.parallel.tensor_model_parallel_size != world_size {
+        bail!(
+            "Qwen session TP focused resume tensor_model_parallel_size {} does not match WORLD_SIZE {world_size}",
+            global_manifest.parallel.tensor_model_parallel_size
+        );
+    }
+    if global_manifest.parallel.data_parallel_size != 1 {
+        bail!(
+            "Qwen session TP focused resume expects data_parallel_size=1, got {}",
+            global_manifest.parallel.data_parallel_size
+        );
+    }
+    let rank_manifest = global_manifest
+        .ranks
+        .iter()
+        .find(|entry| entry.rank == rank)
+        .ok_or_else(|| anyhow!("missing TP sharded rank manifest for rank {rank}"))?;
+    if rank_manifest.tensor_model_parallel_rank != rank {
+        bail!(
+            "Qwen session TP focused resume expected tensor_model_parallel_rank {rank}, got {}",
+            rank_manifest.tensor_model_parallel_rank
+        );
+    }
+    if rank_manifest.shards.len() != 9 {
+        bail!(
+            "Qwen session TP focused resume expected 9 focused layer0 shards, got {}",
+            rank_manifest.shards.len()
+        );
+    }
+    let optimizer_tensors = read_safetensors_map(Path::new(&rank_manifest.optimizer_safetensors))?;
+    for shard in &rank_manifest.shards {
+        let optimizer_m = tensor(&optimizer_tensors, &shard.optimizer_m_name)?;
+        let optimizer_v = tensor(&optimizer_tensors, &shard.optimizer_v_name)?;
+        if optimizer_m.size() != shard.shard_shape || optimizer_v.size() != shard.shard_shape {
+            bail!(
+                "Qwen session TP focused resume optimizer slot shape mismatch for rank={}, tensor={}",
+                rank,
+                shard.name
+            );
+        }
+    }
+    let (restore_diff, restored_shards) = qwen_session_tp_focused_sharded_restore(
+        global_manifest_output,
+        rank,
+        layer0_input,
+        full_layer0,
+        q_bias_shard,
+        k_bias_shard,
+        v_bias_shard,
+        runtime_config,
+        q_heads_per_rank,
+        kv_heads_per_rank,
+        reduce_dir,
+        &[],
+    )?;
+    if restore_diff.max_abs > 1e-3 {
+        bail!(
+            "Qwen session TP focused external resume restore parity failed: rank={}, max_abs={}, mean_abs={}",
+            rank,
+            restore_diff.max_abs,
+            restore_diff.mean_abs
+        );
+    }
+    let resumed_update = qwen_session_tp_layer0_sgd_update(
+        layer0_input,
+        &restored_shards.input_norm,
+        &restored_shards.post_attention_norm,
+        &restored_shards.q,
+        q_bias_shard,
+        &restored_shards.k,
+        k_bias_shard,
+        &restored_shards.v,
+        v_bias_shard,
+        &restored_shards.o,
+        &restored_shards.gate,
+        &restored_shards.up,
+        &restored_shards.down,
+        runtime_config,
+        q_heads_per_rank,
+        kv_heads_per_rank,
+        layer0_target,
+        1e-3,
+        &reduce_dir.join("next-update"),
+    )?;
+    let next_update_diff = diff_stats(&resumed_update.final_output, reference_update_output)?;
+    if next_update_diff.max_abs > 1e-3 {
+        bail!(
+            "Qwen session TP focused external resume next-update parity failed: rank={}, max_abs={}, mean_abs={}",
+            rank,
+            next_update_diff.max_abs,
+            next_update_diff.mean_abs
+        );
+    }
+    Ok(QwenSessionTpFocusedResume {
+        global_step: global_manifest.global_step,
+        rank_manifest_output: global_manifest_output
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join(format!("qwen-session-tp-sharded-rank-{rank}.json"))
+            .display()
+            .to_string(),
+        model_safetensors: rank_manifest.model_safetensors.clone(),
+        optimizer_safetensors: rank_manifest.optimizer_safetensors.clone(),
+        tensor_count: rank_manifest.shards.len(),
+        restore_diff,
+        next_update_diff,
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
