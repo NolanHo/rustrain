@@ -41,6 +41,12 @@ required = [
     "compute_kind",
     "resume_from",
     "resumed_adapter",
+    "dataset_total_samples",
+    "dataset_total_tokens",
+    "dataset_response_tokens",
+    "dataset_masked_positions",
+    "dataset_max_sequence_tokens",
+    "dataset_order_seed",
     "initial_loss",
     "final_loss",
     "reload_delta",
@@ -67,6 +73,15 @@ if expected_compute_kind and values["compute_kind"] != expected_compute_kind:
     )
 if values["resumed_adapter"] != "true":
     raise SystemExit("resume run did not report resumed_adapter: true")
+for key in [
+    "dataset_total_samples",
+    "dataset_total_tokens",
+    "dataset_response_tokens",
+    "dataset_masked_positions",
+    "dataset_max_sequence_tokens",
+]:
+    if int(values[key]) <= 0:
+        raise SystemExit(f"{key} must be positive, got {values[key]}")
 if not float(values["final_loss"]) < float(values["initial_loss"]):
     raise SystemExit(
         f"resume loss did not improve: initial={values['initial_loss']} final={values['final_loss']}"

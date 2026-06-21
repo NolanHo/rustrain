@@ -6,7 +6,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow, bail};
-use rand::{Rng, SeedableRng, rngs::StdRng};
+use rand::{Rng, SeedableRng, rngs::StdRng, seq::SliceRandom};
 use serde::{Deserialize, Serialize};
 use tch::{Device, IndexOp, Kind, Reduction, Tensor, no_grad};
 use tokenizers::Tokenizer;
@@ -153,6 +153,12 @@ pub(crate) struct QwenLoraSftTrainSummary {
     pub(crate) target_modules: Vec<String>,
     pub(crate) train_samples: usize,
     pub(crate) eval_samples: usize,
+    pub(crate) dataset_total_samples: usize,
+    pub(crate) dataset_total_tokens: usize,
+    pub(crate) dataset_response_tokens: usize,
+    pub(crate) dataset_masked_positions: usize,
+    pub(crate) dataset_max_sequence_tokens: usize,
+    pub(crate) dataset_order_seed: u64,
     pub(crate) batch_size: usize,
     pub(crate) global_batch_size: usize,
     pub(crate) gradient_accumulation_steps: usize,
@@ -763,10 +769,20 @@ struct QwenSftBatch {
     padding_tokens: usize,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct QwenSftDatasetSummary {
+    samples: usize,
+    total_tokens: usize,
+    response_tokens: usize,
+    masked_positions: usize,
+    max_sequence_tokens: usize,
+}
+
 #[derive(Clone)]
 struct QwenLoraSftTrainPolicy {
     lr_scheduler: LrScheduler,
     max_grad_norm: Option<f64>,
+    dataset_order_seed: u64,
 }
 
 impl QwenLoraSftTrainPolicy {
@@ -774,6 +790,7 @@ impl QwenLoraSftTrainPolicy {
         Self {
             lr_scheduler: config.train.lr_scheduler.clone(),
             max_grad_norm: config.train.max_grad_norm.map(f64::from),
+            dataset_order_seed: config.run.seed,
         }
     }
 
@@ -781,6 +798,7 @@ impl QwenLoraSftTrainPolicy {
         Self {
             lr_scheduler: LrScheduler::Constant,
             max_grad_norm: None,
+            dataset_order_seed: 0,
         }
     }
 }
@@ -1466,7 +1484,9 @@ fn qwen_lora_sft_train(
                 },
             ],
         )?
-    };
+    }
+    .shuffle_by_seed(policy.dataset_order_seed);
+    let dataset_summary = dataset.summary();
     let (train_dataset, eval_dataset) = dataset.train_eval_split(train_split)?;
     let train_batch_size = sft_batch_size.min(train_dataset.len());
     let eval_batch_size = sft_batch_size.min(eval_dataset.len());
@@ -1803,6 +1823,12 @@ fn qwen_lora_sft_train(
         target_modules: lora_config.target_module_names(),
         train_samples: train_dataset.len(),
         eval_samples: eval_dataset.len(),
+        dataset_total_samples: dataset_summary.samples,
+        dataset_total_tokens: dataset_summary.total_tokens,
+        dataset_response_tokens: dataset_summary.response_tokens,
+        dataset_masked_positions: dataset_summary.masked_positions,
+        dataset_max_sequence_tokens: dataset_summary.max_sequence_tokens,
+        dataset_order_seed: policy.dataset_order_seed,
         batch_size: initial_batch.prompt_tokens.len(),
         global_batch_size: train_batch_size * gradient_accumulation_steps,
         gradient_accumulation_steps,
@@ -5173,6 +5199,39 @@ impl QwenSftDataset {
         ))
     }
 
+    fn shuffle_by_seed(mut self, seed: u64) -> Self {
+        let mut rng = StdRng::seed_from_u64(seed);
+        self.samples.shuffle(&mut rng);
+        self
+    }
+
+    fn summary(&self) -> QwenSftDatasetSummary {
+        QwenSftDatasetSummary {
+            samples: self.samples.len(),
+            total_tokens: self
+                .samples
+                .iter()
+                .map(|sample| sample.token_ids.len())
+                .sum(),
+            response_tokens: self
+                .samples
+                .iter()
+                .map(|sample| sample.response_tokens)
+                .sum(),
+            masked_positions: self
+                .samples
+                .iter()
+                .map(|sample| sample.masked_positions)
+                .sum(),
+            max_sequence_tokens: self
+                .samples
+                .iter()
+                .map(|sample| sample.token_ids.len())
+                .max()
+                .unwrap_or(0),
+        }
+    }
+
     fn padded_batch(&self, start: usize, batch_size: usize) -> Result<QwenSftBatch> {
         if batch_size == 0 {
             bail!("SFT batch size must be positive");
@@ -6708,6 +6767,50 @@ mod tests {
         assert_eq!(eval.len(), 2);
         assert_eq!(train_values, vec![2, 12, 0, 10, 1, 11]);
         assert_eq!(eval_values, vec![3, 13, 4, 14]);
+    }
+
+    #[test]
+    fn qwen_sft_dataset_shuffle_is_seeded_and_summarized() {
+        let dataset = QwenSftDataset {
+            samples: (0..5)
+                .map(|index| QwenSftTokenSample {
+                    prompt_tokens: 1,
+                    response_tokens: (index + 1) as usize,
+                    masked_positions: (index + 1) as usize,
+                    token_ids: vec![index, index + 10, index + 20],
+                    mask_values: vec![0.0, 1.0],
+                })
+                .collect(),
+            pad_token_id: 0,
+        };
+
+        let summary = dataset.summary();
+        let shuffled_a = dataset.clone().shuffle_by_seed(17);
+        let shuffled_b = dataset.clone().shuffle_by_seed(17);
+        let shuffled_c = dataset.shuffle_by_seed(18);
+        let order_a = shuffled_a
+            .samples
+            .iter()
+            .map(|sample| sample.token_ids[0])
+            .collect::<Vec<_>>();
+        let order_b = shuffled_b
+            .samples
+            .iter()
+            .map(|sample| sample.token_ids[0])
+            .collect::<Vec<_>>();
+        let order_c = shuffled_c
+            .samples
+            .iter()
+            .map(|sample| sample.token_ids[0])
+            .collect::<Vec<_>>();
+
+        assert_eq!(summary.samples, 5);
+        assert_eq!(summary.total_tokens, 15);
+        assert_eq!(summary.response_tokens, 15);
+        assert_eq!(summary.masked_positions, 15);
+        assert_eq!(summary.max_sequence_tokens, 3);
+        assert_eq!(order_a, order_b);
+        assert_ne!(order_a, order_c);
     }
 
     #[test]

@@ -162,7 +162,9 @@ open.
   trainer path now verifies the saved adapter through full-Qwen forward logits,
   greedy generation reload parity, and focused merge/unmerge parity. It also
   uses the trainer scheduler and grad clipping knobs, logs `eval_every` step
-  eval history, and has a bf16 variant at `configs/qwen_lora_sft_bf16.toml`.
+  eval history, applies seeded deterministic dataset ordering, reports dataset
+  sample/token/mask summaries, and has a bf16 variant at
+  `configs/qwen_lora_sft_bf16.toml`.
   Production data loading and arbitrary-module LoRA injection are still open.
 - Real Qwen module-level LoRA now uses a target-layer/module registry for
   configured attention and MLP projection modules; trainer-owned full-model LoRA

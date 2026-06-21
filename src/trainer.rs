@@ -230,6 +230,12 @@ pub fn train(config_path: &Path, resume_from: Option<PathBuf>) -> Result<()> {
             gpu_memory_allocated_mb = summary.gpu_memory_allocated_mb,
             train_samples = summary.train_samples,
             eval_samples = summary.eval_samples,
+            dataset_total_samples = summary.dataset_total_samples,
+            dataset_total_tokens = summary.dataset_total_tokens,
+            dataset_response_tokens = summary.dataset_response_tokens,
+            dataset_masked_positions = summary.dataset_masked_positions,
+            dataset_max_sequence_tokens = summary.dataset_max_sequence_tokens,
+            dataset_order_seed = summary.dataset_order_seed,
             batch_size = summary.batch_size,
             global_batch_size = summary.global_batch_size,
             gradient_accumulation_steps = summary.gradient_accumulation_steps,
@@ -257,6 +263,21 @@ pub fn train(config_path: &Path, resume_from: Option<PathBuf>) -> Result<()> {
         }
         println!("train_samples: {}", summary.train_samples);
         println!("eval_samples: {}", summary.eval_samples);
+        println!("dataset_total_samples: {}", summary.dataset_total_samples);
+        println!("dataset_total_tokens: {}", summary.dataset_total_tokens);
+        println!(
+            "dataset_response_tokens: {}",
+            summary.dataset_response_tokens
+        );
+        println!(
+            "dataset_masked_positions: {}",
+            summary.dataset_masked_positions
+        );
+        println!(
+            "dataset_max_sequence_tokens: {}",
+            summary.dataset_max_sequence_tokens
+        );
+        println!("dataset_order_seed: {}", summary.dataset_order_seed);
         println!("initial_loss: {:.9}", summary.initial_loss);
         println!("final_loss: {:.9}", summary.final_loss);
         println!("initial_eval_loss: {:.9}", summary.initial_eval_loss);
