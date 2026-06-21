@@ -30,15 +30,37 @@ kv_heads = []
 intermediate = []
 global_manifests = set()
 rank_manifest_by_rank = {}
-causal_grad_norm_by_tensor = {
-    "model.layers.0.self_attn.q_proj.weight": "causal_train_q_grad_norm",
-    "model.layers.0.self_attn.k_proj.weight": "causal_train_k_grad_norm",
-    "model.layers.0.self_attn.v_proj.weight": "causal_train_v_grad_norm",
-    "model.layers.0.self_attn.o_proj.weight": "causal_train_o_grad_norm",
-    "model.layers.0.mlp.gate_proj.weight": "causal_train_gate_grad_norm",
-    "model.layers.0.mlp.up_proj.weight": "causal_train_up_grad_norm",
-    "model.layers.0.mlp.down_proj.weight": "causal_train_down_grad_norm",
+causal_grad_evidence_by_tensor = {
+    "model.layers.0.self_attn.q_proj.weight": (
+        "causal_train_q_grad_norm",
+        "causal_train_q_grad_sum",
+    ),
+    "model.layers.0.self_attn.k_proj.weight": (
+        "causal_train_k_grad_norm",
+        "causal_train_k_grad_sum",
+    ),
+    "model.layers.0.self_attn.v_proj.weight": (
+        "causal_train_v_grad_norm",
+        "causal_train_v_grad_sum",
+    ),
+    "model.layers.0.self_attn.o_proj.weight": (
+        "causal_train_o_grad_norm",
+        "causal_train_o_grad_sum",
+    ),
+    "model.layers.0.mlp.gate_proj.weight": (
+        "causal_train_gate_grad_norm",
+        "causal_train_gate_grad_sum",
+    ),
+    "model.layers.0.mlp.up_proj.weight": (
+        "causal_train_up_grad_norm",
+        "causal_train_up_grad_sum",
+    ),
+    "model.layers.0.mlp.down_proj.weight": (
+        "causal_train_down_grad_norm",
+        "causal_train_down_grad_sum",
+    ),
 }
+adam_beta1 = 0.9
 adam_beta2 = 0.999
 
 
@@ -236,7 +258,15 @@ for path in summaries:
                     raise SystemExit(
                         f"{rank_manifest_path} optimizer slot {slot_name} for {entry['name']} is all zero"
                     )
-            grad_norm_key = causal_grad_norm_by_tensor[entry["name"]]
+            grad_norm_key, grad_sum_key = causal_grad_evidence_by_tensor[entry["name"]]
+            expected_m_sum = (1.0 - adam_beta1) * float(data[grad_sum_key])
+            actual_m_sum = optimizer_shapes[entry["optimizer_m_name"]]["sum"]
+            m_tolerance = max(1e-6, abs(expected_m_sum) * 1e-3)
+            if abs(actual_m_sum - expected_m_sum) > m_tolerance:
+                raise SystemExit(
+                    f"{rank_manifest_path} optimizer m slot {entry['optimizer_m_name']} sum {actual_m_sum} "
+                    f"does not match first-step AdamW expectation {expected_m_sum} for {entry['name']}"
+                )
             expected_v_sum = (1.0 - adam_beta2) * float(data[grad_norm_key]) ** 2
             actual_v_sum = optimizer_shapes[entry["optimizer_v_name"]]["sum"]
             tolerance = max(1e-8, abs(expected_v_sum) * 1e-3)

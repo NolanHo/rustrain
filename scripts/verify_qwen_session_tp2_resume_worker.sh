@@ -50,10 +50,52 @@ from safetensors import safe_open
 
 base_manifest = pathlib.Path(sys.argv[1])
 base_manifest_data = json.loads(base_manifest.read_text())
+base_output_dir = pathlib.Path(os.environ["BASE_OUTPUT_DIR"])
 resume_output_dir = pathlib.Path(os.environ["RESUME_OUTPUT_DIR"])
+base_summaries = sorted(base_output_dir.rglob("qwen-session-tp-rank-*.json"))
+if len(base_summaries) != 2:
+    raise SystemExit(f"expected 2 base TP rank summaries under {base_output_dir}, found {len(base_summaries)}")
 summaries = sorted(resume_output_dir.rglob("qwen-session-tp-rank-*.json"))
 if len(summaries) != 2:
     raise SystemExit(f"expected 2 resume TP rank summaries under {resume_output_dir}, found {len(summaries)}")
+
+causal_grad_evidence_by_tensor = {
+    "model.layers.0.self_attn.q_proj.weight": (
+        "causal_train_q_grad_norm",
+        "causal_train_q_grad_sum",
+    ),
+    "model.layers.0.self_attn.k_proj.weight": (
+        "causal_train_k_grad_norm",
+        "causal_train_k_grad_sum",
+    ),
+    "model.layers.0.self_attn.v_proj.weight": (
+        "causal_train_v_grad_norm",
+        "causal_train_v_grad_sum",
+    ),
+    "model.layers.0.self_attn.o_proj.weight": (
+        "causal_train_o_grad_norm",
+        "causal_train_o_grad_sum",
+    ),
+    "model.layers.0.mlp.gate_proj.weight": (
+        "causal_train_gate_grad_norm",
+        "causal_train_gate_grad_sum",
+    ),
+    "model.layers.0.mlp.up_proj.weight": (
+        "causal_train_up_grad_norm",
+        "causal_train_up_grad_sum",
+    ),
+    "model.layers.0.mlp.down_proj.weight": (
+        "causal_train_down_grad_norm",
+        "causal_train_down_grad_sum",
+    ),
+}
+adam_beta1 = 0.9
+adam_beta2 = 0.999
+base_summary_by_rank = {}
+for path in base_summaries:
+    summary = json.loads(path.read_text())
+    rank = int(summary["rank"])
+    base_summary_by_rank[rank] = summary
 
 
 def tensor_shapes(path):
@@ -77,7 +119,7 @@ def tensor_shape_sums(path):
     return tensors
 
 
-def validate_tp_global_manifest(manifest_path, expected_global_step):
+def validate_tp_global_manifest(manifest_path, expected_global_step, summary_by_rank):
     manifest_path = pathlib.Path(manifest_path)
     if not manifest_path.exists():
         raise SystemExit(f"missing TP sharded global manifest {manifest_path}")
@@ -167,10 +209,33 @@ def validate_tp_global_manifest(manifest_path, expected_global_step):
                     raise SystemExit(
                         f"{manifest_path} rank {rank} optimizer slot {slot_name} for {shard['name']} is all zero"
                     )
+            if shard["partition"] in {"tp_row", "tp_col"}:
+                rank_summary = summary_by_rank.get(rank)
+                if rank_summary is None:
+                    raise SystemExit(f"{manifest_path} missing rank {rank} summary for optimizer formula checks")
+                grad_norm_key, grad_sum_key = causal_grad_evidence_by_tensor[shard["name"]]
+                expected_m_sum = (1.0 - adam_beta1) * float(rank_summary[grad_sum_key])
+                actual_m_sum = optimizer_shapes[shard["optimizer_m_name"]]["sum"]
+                m_tolerance = max(1e-6, abs(expected_m_sum) * 1e-3)
+                if abs(actual_m_sum - expected_m_sum) > m_tolerance:
+                    raise SystemExit(
+                        f"{manifest_path} rank {rank} optimizer m slot {shard['optimizer_m_name']} "
+                        f"sum {actual_m_sum} does not match first-step AdamW expectation {expected_m_sum} "
+                        f"for {shard['name']}"
+                    )
+                expected_v_sum = (1.0 - adam_beta2) * float(rank_summary[grad_norm_key]) ** 2
+                actual_v_sum = optimizer_shapes[shard["optimizer_v_name"]]["sum"]
+                v_tolerance = max(1e-8, abs(expected_v_sum) * 1e-3)
+                if abs(actual_v_sum - expected_v_sum) > v_tolerance:
+                    raise SystemExit(
+                        f"{manifest_path} rank {rank} optimizer v slot {shard['optimizer_v_name']} "
+                        f"sum {actual_v_sum} does not match first-step AdamW expectation {expected_v_sum} "
+                        f"for {shard['name']}"
+                    )
     return manifest
 
 
-base_manifest_data = validate_tp_global_manifest(base_manifest, expected_global_step=1)
+base_manifest_data = validate_tp_global_manifest(base_manifest, expected_global_step=1, summary_by_rank=base_summary_by_rank)
 
 evidence = []
 resume_global_manifests = set()
@@ -226,7 +291,15 @@ for path in summaries:
 if len(resume_global_manifests) != 1:
     raise SystemExit(f"expected one resumed launch global manifest, got {sorted(resume_global_manifests)}")
 resume_global_manifest_path = pathlib.Path(next(iter(resume_global_manifests)))
-resume_manifest = validate_tp_global_manifest(resume_global_manifest_path, expected_global_step=1)
+resume_summary_by_rank = {}
+for path in summaries:
+    summary = json.loads(path.read_text())
+    resume_summary_by_rank[int(summary["rank"])] = summary
+resume_manifest = validate_tp_global_manifest(
+    resume_global_manifest_path,
+    expected_global_step=1,
+    summary_by_rank=resume_summary_by_rank,
+)
 for rank_manifest in resume_manifest["ranks"]:
     rank = int(rank_manifest["rank"])
     rank_manifest_path = resume_global_manifest_path.parent / f"qwen-session-tp-sharded-rank-{rank}.json"

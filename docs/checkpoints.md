@@ -167,12 +167,13 @@ tokenizer identity, global step, consumed sample/token counts, seed, dtype,
 optimizer, scheduler, explicit lack of JSONL provenance for the focused smoke,
 exact parallel topology, embedded rank manifests, every declared rank-owned
 model shard plus AdamW slot shape, and non-zero optimizer slots for TP-owned
-trainable shards in the written safetensors files. The baseline TP verifier
-also checks the AdamW v slot sum against `(1 - beta2) * grad_norm^2` from the
-focused causal-LM shard gradient evidence. The focused external TP resume
-verifier repeats the same manifest and artifact checks for the base checkpoint
-and the resumed launch's newly written global manifest while verifying restore
-and next-update parity.
+trainable shards in the written safetensors files. The TP verifiers also check
+the focused AdamW first-step slot formulas against causal-LM shard gradient
+evidence: `adam_m.sum == (1 - beta1) * grad.sum` and
+`adam_v.sum == (1 - beta2) * grad_norm^2`. The focused external TP resume
+verifier repeats the same manifest, artifact, and optimizer slot formula checks
+for the base checkpoint and the resumed launch's newly written global manifest
+while verifying restore and next-update parity.
 Production full-parameter TP checkpoint resume and full production sharded
 restore over external streaming real data remain open.
 The focused EP `parallel-ep-tch-moe-rank-smoke` also writes

@@ -158,11 +158,12 @@ shards to reproduce the focused fused layer0 output plus the next focused shard
 update within tolerance. The TP verifier also checks the global manifest
 identity, progress/provenance defaults, embedded rank manifests, every declared
 rank-owned model shard plus AdamW slot shape, and non-zero optimizer slots for
-TP-owned trainable shards in the written safetensors files. The baseline TP
-verifier additionally checks the AdamW v slot sum against the focused causal
-gradient norm and configured beta2; the external TP
-resume verifier repeats those checks for both the base manifest and the resumed
-launch manifest while verifying restore and next-update parity.
+TP-owned trainable shards in the written safetensors files. The TP verifiers
+also check the AdamW first-step slot formulas for focused causal gradients:
+`adam_m.sum == (1 - beta1) * grad.sum` and
+`adam_v.sum == (1 - beta2) * grad_norm^2`. The external TP resume verifier
+repeats those checks for both the base manifest and the resumed launch manifest
+while verifying restore and next-update parity.
 Real production tensor-parallel Qwen training is not implemented yet; the
 remaining TP gap is full-parameter TP backward/update, autograd-aware
 production collectives, and trainer-owned sharded checkpoint resume.
