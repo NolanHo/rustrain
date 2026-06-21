@@ -277,11 +277,19 @@ pub fn validate_config(config: &Config) -> Result<()> {
         if lora.target_modules.is_empty() {
             return Err(anyhow!("lora.target_modules must not be empty"));
         }
-        let supported_lora_modules = ["q_proj", "k_proj", "v_proj", "o_proj"];
+        let supported_lora_modules = [
+            "q_proj",
+            "k_proj",
+            "v_proj",
+            "o_proj",
+            "gate_proj",
+            "up_proj",
+            "down_proj",
+        ];
         for module in &lora.target_modules {
             if !supported_lora_modules.contains(&module.as_str()) {
                 return Err(anyhow!(
-                    "qwen_lora_sft unsupported lora.target_modules entry {}; supported: q_proj, k_proj, v_proj, o_proj",
+                    "qwen_lora_sft unsupported lora.target_modules entry {}; supported: q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj",
                     module
                 ));
             }
