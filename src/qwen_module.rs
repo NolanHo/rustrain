@@ -159,6 +159,13 @@ struct QwenSessionTpRankSummary {
     mlp_reduced_output_shape: Vec<i64>,
     mlp_max_abs: f64,
     mlp_mean_abs: f64,
+    mlp_train_initial_loss: f64,
+    mlp_train_final_loss: f64,
+    mlp_train_loss_improved: bool,
+    mlp_train_learning_rate: f64,
+    mlp_train_gate_grad_norm: f64,
+    mlp_train_up_grad_norm: f64,
+    mlp_train_down_grad_norm: f64,
 }
 
 struct QwenTpAttentionContribution {
@@ -4999,17 +5006,17 @@ fn qwen_session_tp_rank_smoke(
     }
 
     let weights = read_safetensors_map(&model_path.join("model.safetensors"))?;
-    let gate_proj = tensor(&weights, "model.layers.0.mlp.gate_proj.weight")?
+    let gate_proj_full = tensor(&weights, "model.layers.0.mlp.gate_proj.weight")?
         .to_kind(Kind::Float)
         .to_device(device);
-    let up_proj = tensor(&weights, "model.layers.0.mlp.up_proj.weight")?
+    let up_proj_full = tensor(&weights, "model.layers.0.mlp.up_proj.weight")?
         .to_kind(Kind::Float)
         .to_device(device);
-    let down_proj = tensor(&weights, "model.layers.0.mlp.down_proj.weight")?
+    let down_proj_full = tensor(&weights, "model.layers.0.mlp.down_proj.weight")?
         .to_kind(Kind::Float)
         .to_device(device);
-    let hidden_size = gate_proj.size()[1];
-    let intermediate_size = gate_proj.size()[0];
+    let hidden_size = gate_proj_full.size()[1];
+    let intermediate_size = gate_proj_full.size()[0];
     if intermediate_size % world_size as i64 != 0 {
         bail!("Qwen session TP MLP smoke requires intermediate size divisible by WORLD_SIZE");
     }
@@ -5019,24 +5026,20 @@ fn qwen_session_tp_rank_smoke(
         .reshape([1, 7, hidden_size])
         .fmod(19.0)
         / 19.0;
-    let gate_shard = mlp_input.linear::<&Tensor>(
-        &gate_proj.narrow(0, intermediate_start, intermediate_shard_size),
-        None,
-    );
-    let up_shard = mlp_input.linear::<&Tensor>(
-        &up_proj.narrow(0, intermediate_start, intermediate_shard_size),
-        None,
-    );
-    let activation_shard = gate_shard.silu() * up_shard;
-    let mlp_contribution = activation_shard.linear::<&Tensor>(
-        &down_proj.narrow(1, intermediate_start, intermediate_shard_size),
-        None,
+    let gate_shard_base = gate_proj_full.narrow(0, intermediate_start, intermediate_shard_size);
+    let up_shard_base = up_proj_full.narrow(0, intermediate_start, intermediate_shard_size);
+    let down_shard_base = down_proj_full.narrow(1, intermediate_start, intermediate_shard_size);
+    let (activation_shard, mlp_contribution) = qwen_tp_mlp_shard_contribution(
+        &mlp_input,
+        &gate_shard_base,
+        &up_shard_base,
+        &down_shard_base,
     );
     let mlp_reduced = nccl_smoke::all_reduce_tensor_f32_for_launch(
         &output_dir.join("mlp-output-contribution"),
         &mlp_contribution,
     )?;
-    let mlp_full = qwen_mlp(&mlp_input, &gate_proj, &up_proj, &down_proj);
+    let mlp_full = qwen_mlp(&mlp_input, &gate_proj_full, &up_proj_full, &down_proj_full);
     let mlp_diff = diff_stats(&mlp_reduced, &mlp_full)?;
     if mlp_diff.max_abs > 1e-5 {
         bail!(
@@ -5044,6 +5047,98 @@ fn qwen_session_tp_rank_smoke(
             rank,
             mlp_diff.max_abs,
             mlp_diff.mean_abs
+        );
+    }
+
+    let target = (&mlp_full * 0.5).detach();
+    let train_gate = gate_shard_base
+        .detach()
+        .shallow_clone()
+        .set_requires_grad(true);
+    let train_up = up_shard_base
+        .detach()
+        .shallow_clone()
+        .set_requires_grad(true);
+    let train_down = down_shard_base
+        .detach()
+        .shallow_clone()
+        .set_requires_grad(true);
+    let (train_initial_loss, output_grad) = qwen_session_tp_mlp_global_mse_loss_and_grad(
+        &mlp_input,
+        &train_gate,
+        &train_up,
+        &train_down,
+        &target,
+        &output_dir.join("mlp-train-initial-output"),
+    )?;
+    let local_contribution =
+        qwen_tp_mlp_shard_contribution(&mlp_input, &train_gate, &train_up, &train_down).1;
+    (local_contribution * output_grad)
+        .sum(Kind::Float)
+        .backward();
+    let gate_grad = train_gate.grad();
+    let up_grad = train_up.grad();
+    let down_grad = train_down.grad();
+    if !gate_grad.defined() || !up_grad.defined() || !down_grad.defined() {
+        bail!("Qwen session TP MLP train smoke expected all shard gradients to be defined");
+    }
+    let gate_grad_norm = gate_grad.norm().double_value(&[]);
+    let up_grad_norm = up_grad.norm().double_value(&[]);
+    let down_grad_norm = down_grad.norm().double_value(&[]);
+    if gate_grad_norm <= 0.0 || up_grad_norm <= 0.0 || down_grad_norm <= 0.0 {
+        bail!(
+            "Qwen session TP MLP train smoke expected positive grad norms: gate={gate_grad_norm}, up={up_grad_norm}, down={down_grad_norm}"
+        );
+    }
+    let config_learning_rate = config.train.learning_rate as f64;
+    if !config_learning_rate.is_finite() || config_learning_rate <= 0.0 {
+        bail!("Qwen session TP MLP train smoke requires positive finite learning_rate");
+    }
+    let mut train_final_loss = train_initial_loss;
+    let mut train_learning_rate = config_learning_rate;
+    for candidate_learning_rate in [
+        config_learning_rate,
+        config_learning_rate * 10.0,
+        config_learning_rate * 100.0,
+        config_learning_rate * 1000.0,
+        1e-3,
+        1e-2,
+    ] {
+        if !candidate_learning_rate.is_finite() || candidate_learning_rate <= 0.0 {
+            continue;
+        }
+        let mut candidate_gate = train_gate.detach().shallow_clone();
+        let mut candidate_up = train_up.detach().shallow_clone();
+        let mut candidate_down = train_down.detach().shallow_clone();
+        no_grad(|| -> Result<()> {
+            let _ =
+                candidate_gate.f_sub_(&(gate_grad.shallow_clone() * candidate_learning_rate))?;
+            let _ = candidate_up.f_sub_(&(up_grad.shallow_clone() * candidate_learning_rate))?;
+            let _ =
+                candidate_down.f_sub_(&(down_grad.shallow_clone() * candidate_learning_rate))?;
+            Ok(())
+        })?;
+        let (candidate_loss, _) = qwen_session_tp_mlp_global_mse_loss_and_grad(
+            &mlp_input,
+            &candidate_gate,
+            &candidate_up,
+            &candidate_down,
+            &target,
+            &output_dir.join(format!(
+                "mlp-train-candidate-output-{candidate_learning_rate:.0e}"
+            )),
+        )?;
+        if candidate_loss < train_final_loss {
+            train_final_loss = candidate_loss;
+            train_learning_rate = candidate_learning_rate;
+        }
+        if train_final_loss < train_initial_loss {
+            break;
+        }
+    }
+    if train_final_loss >= train_initial_loss {
+        bail!(
+            "Qwen session TP MLP train smoke did not reduce loss: initial={train_initial_loss}, final={train_final_loss}"
         );
     }
 
@@ -5068,12 +5163,54 @@ fn qwen_session_tp_rank_smoke(
         mlp_reduced_output_shape: mlp_reduced.size(),
         mlp_max_abs: mlp_diff.max_abs,
         mlp_mean_abs: mlp_diff.mean_abs,
+        mlp_train_initial_loss: train_initial_loss,
+        mlp_train_final_loss: train_final_loss,
+        mlp_train_loss_improved: train_final_loss < train_initial_loss,
+        mlp_train_learning_rate: train_learning_rate,
+        mlp_train_gate_grad_norm: gate_grad_norm,
+        mlp_train_up_grad_norm: up_grad_norm,
+        mlp_train_down_grad_norm: down_grad_norm,
     };
     let summary_path = output_dir.join(format!("qwen-session-tp-rank-{rank}.json"));
     fs::write(&summary_path, serde_json::to_string_pretty(&summary)?)
         .with_context(|| format!("failed to write {}", summary_path.display()))?;
     println!("{}", serde_json::to_string_pretty(&summary)?);
     Ok(())
+}
+
+fn qwen_tp_mlp_shard_contribution(
+    input: &Tensor,
+    gate_shard_weight: &Tensor,
+    up_shard_weight: &Tensor,
+    down_input_shard_weight: &Tensor,
+) -> (Tensor, Tensor) {
+    let gate_shard = input.linear::<&Tensor>(gate_shard_weight, None);
+    let up_shard = input.linear::<&Tensor>(up_shard_weight, None);
+    let activation_shard = gate_shard.silu() * up_shard;
+    let output_contribution = activation_shard.linear::<&Tensor>(down_input_shard_weight, None);
+    (activation_shard, output_contribution)
+}
+
+fn qwen_session_tp_mlp_global_mse_loss_and_grad(
+    input: &Tensor,
+    gate_shard_weight: &Tensor,
+    up_shard_weight: &Tensor,
+    down_input_shard_weight: &Tensor,
+    target: &Tensor,
+    reduce_dir: &Path,
+) -> Result<(f64, Tensor)> {
+    let local_contribution = qwen_tp_mlp_shard_contribution(
+        input,
+        gate_shard_weight,
+        up_shard_weight,
+        down_input_shard_weight,
+    )
+    .1;
+    let reduced = nccl_smoke::all_reduce_tensor_f32_for_launch(reduce_dir, &local_contribution)?;
+    let diff = &reduced - target;
+    let loss = diff.pow_tensor_scalar(2.0).mean(Kind::Float);
+    let output_grad = (&diff * (2.0 / diff.numel() as f64)).detach();
+    Ok((loss.double_value(&[]), output_grad))
 }
 
 pub(crate) fn train_qwen_session_single_from_config(
