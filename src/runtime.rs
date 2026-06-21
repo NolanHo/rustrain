@@ -248,6 +248,10 @@ pub fn validate_config(config: &Config) -> Result<()> {
             && !((is_tch_tiny_lm || is_qwen_trainable_session)
                 && name == "data_parallel_size"
                 && value == 2)
+            && !(is_qwen_trainable_session
+                && name == "tensor_model_parallel_size"
+                && value == 2
+                && parallel.data_parallel_size == 1)
         {
             return Err(anyhow!("M1 toy backend requires {name} = 1"));
         }

@@ -16,7 +16,7 @@ use crate::{
     parallel_modules::tp1_module_smoke,
     qwen_module::{
         train_qwen_lora_sft_from_config, train_qwen_session_dp_from_config,
-        train_qwen_session_single_from_config,
+        train_qwen_session_single_from_config, train_qwen_session_tp_from_config,
     },
     runtime::{
         Config, LrScheduler, init_logging, load_config, prepare_run_directory, validate_config,
@@ -123,7 +123,15 @@ pub fn train(config_path: &Path, resume_from: Option<PathBuf>) -> Result<()> {
         info!(train = ?config.train, "train config");
         info!(parallel = ?config.parallel, "parallel config");
 
-        if config.parallel.data_parallel_size == 1 {
+        if config.parallel.tensor_model_parallel_size == 2
+            && config.parallel.data_parallel_size == 1
+        {
+            train_qwen_session_tp_from_config(&config, &run_paths)?;
+            info!("qwen trainable session trainer TP smoke complete");
+            println!("rustrain qwen trainable session TP complete");
+            println!("run_dir: {}", run_paths.root.display());
+            println!("resolved_config: {}", run_paths.resolved_config.display());
+        } else if config.parallel.data_parallel_size == 1 {
             let summary = train_qwen_session_single_from_config(&config, &run_paths)?;
             info!(
                 initial_loss = summary.initial_loss,

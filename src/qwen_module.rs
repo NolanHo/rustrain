@@ -137,6 +137,30 @@ struct QwenTpMlpNcclRankSummary {
     mean_abs: f64,
 }
 
+#[derive(Debug, Serialize)]
+struct QwenSessionTpRankSummary {
+    rank: usize,
+    world_size: usize,
+    local_rank: usize,
+    model_path: String,
+    tensor_model_parallel_size: usize,
+    data_parallel_size: usize,
+    attention_q_head_start: i64,
+    attention_q_head_end: i64,
+    attention_kv_head_start: i64,
+    attention_kv_head_end: i64,
+    attention_context_shard_shape: Vec<i64>,
+    attention_reduced_output_shape: Vec<i64>,
+    attention_max_abs: f64,
+    attention_mean_abs: f64,
+    mlp_intermediate_start: i64,
+    mlp_intermediate_end: i64,
+    mlp_activation_shard_shape: Vec<i64>,
+    mlp_reduced_output_shape: Vec<i64>,
+    mlp_max_abs: f64,
+    mlp_mean_abs: f64,
+}
+
 struct QwenTpAttentionContribution {
     input: Tensor,
     context_shard: Tensor,
@@ -4892,6 +4916,166 @@ pub fn train_qwen_session_dp_from_config(config: &Config, _run_paths: &RunPaths)
     )
 }
 
+pub fn train_qwen_session_tp_from_config(config: &Config, _run_paths: &RunPaths) -> Result<()> {
+    if config.model.architecture != "qwen_trainable_session" {
+        bail!(
+            "qwen session trainer expects architecture = qwen_trainable_session, got {}",
+            config.model.architecture
+        );
+    }
+    if !matches!(config.train.device, RuntimeDevice::Cuda) {
+        bail!("qwen session trainer requires device = cuda");
+    }
+    if config.parallel.tensor_model_parallel_size != 2 {
+        bail!("qwen session TP trainer currently expects tensor_model_parallel_size = 2");
+    }
+    if config.parallel.data_parallel_size != 1 {
+        bail!("qwen session TP trainer currently expects data_parallel_size = 1");
+    }
+    let model_path = config
+        .model
+        .model_path
+        .as_ref()
+        .context("qwen session trainer requires model.model_path")?;
+    let output_dir = std::env::var("RUSTRAIN_LAUNCH_OUTPUT_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| {
+            config
+                .run
+                .base_dir
+                .join("qwen-session-trainer-tp")
+                .join(&config.run.name)
+        })
+        .join("qwen-session-tp-ranks");
+    qwen_session_tp_rank_smoke(model_path, output_dir, config)
+}
+
+fn qwen_session_tp_rank_smoke(
+    model_path: &Path,
+    output_dir: PathBuf,
+    config: &Config,
+) -> Result<()> {
+    let rank = parse_env_usize("RANK")?;
+    let local_rank = parse_env_usize("LOCAL_RANK")?;
+    let world_size = parse_env_usize("WORLD_SIZE")?;
+    if world_size != config.parallel.tensor_model_parallel_size {
+        bail!(
+            "WORLD_SIZE={world_size} does not match tensor_model_parallel_size={}",
+            config.parallel.tensor_model_parallel_size
+        );
+    }
+    if world_size != 2 {
+        bail!("Qwen session TP smoke expects WORLD_SIZE=2");
+    }
+    if rank >= world_size {
+        bail!("rank {rank} must be smaller than world_size {world_size}");
+    }
+    let device = Device::Cuda(local_rank);
+    fs::create_dir_all(&output_dir)
+        .with_context(|| format!("failed to create {}", output_dir.display()))?;
+    let output_dir = qwen_tp_artifact_dir(&output_dir)?;
+    fs::create_dir_all(&output_dir)
+        .with_context(|| format!("failed to create {}", output_dir.display()))?;
+
+    let attention = qwen_tp_attention_contribution(
+        model_path,
+        device,
+        rank,
+        world_size,
+        "Qwen session TP attention",
+    )?;
+    let attention_reduced = nccl_smoke::all_reduce_tensor_f32_for_launch(
+        &output_dir.join("attention-output-contribution"),
+        &attention.output_contribution,
+    )?;
+    let attention_diff = diff_stats(&attention_reduced, &attention.full_output)?;
+    if attention_diff.max_abs > 1e-5 {
+        bail!(
+            "Qwen session TP attention parity failed: rank={}, max_abs={}, mean_abs={}",
+            rank,
+            attention_diff.max_abs,
+            attention_diff.mean_abs
+        );
+    }
+
+    let weights = read_safetensors_map(&model_path.join("model.safetensors"))?;
+    let gate_proj = tensor(&weights, "model.layers.0.mlp.gate_proj.weight")?
+        .to_kind(Kind::Float)
+        .to_device(device);
+    let up_proj = tensor(&weights, "model.layers.0.mlp.up_proj.weight")?
+        .to_kind(Kind::Float)
+        .to_device(device);
+    let down_proj = tensor(&weights, "model.layers.0.mlp.down_proj.weight")?
+        .to_kind(Kind::Float)
+        .to_device(device);
+    let hidden_size = gate_proj.size()[1];
+    let intermediate_size = gate_proj.size()[0];
+    if intermediate_size % world_size as i64 != 0 {
+        bail!("Qwen session TP MLP smoke requires intermediate size divisible by WORLD_SIZE");
+    }
+    let intermediate_shard_size = intermediate_size / world_size as i64;
+    let intermediate_start = rank as i64 * intermediate_shard_size;
+    let mlp_input = Tensor::arange(hidden_size * 7, (Kind::Float, device))
+        .reshape([1, 7, hidden_size])
+        .fmod(19.0)
+        / 19.0;
+    let gate_shard = mlp_input.linear::<&Tensor>(
+        &gate_proj.narrow(0, intermediate_start, intermediate_shard_size),
+        None,
+    );
+    let up_shard = mlp_input.linear::<&Tensor>(
+        &up_proj.narrow(0, intermediate_start, intermediate_shard_size),
+        None,
+    );
+    let activation_shard = gate_shard.silu() * up_shard;
+    let mlp_contribution = activation_shard.linear::<&Tensor>(
+        &down_proj.narrow(1, intermediate_start, intermediate_shard_size),
+        None,
+    );
+    let mlp_reduced = nccl_smoke::all_reduce_tensor_f32_for_launch(
+        &output_dir.join("mlp-output-contribution"),
+        &mlp_contribution,
+    )?;
+    let mlp_full = qwen_mlp(&mlp_input, &gate_proj, &up_proj, &down_proj);
+    let mlp_diff = diff_stats(&mlp_reduced, &mlp_full)?;
+    if mlp_diff.max_abs > 1e-5 {
+        bail!(
+            "Qwen session TP MLP parity failed: rank={}, max_abs={}, mean_abs={}",
+            rank,
+            mlp_diff.max_abs,
+            mlp_diff.mean_abs
+        );
+    }
+
+    let summary = QwenSessionTpRankSummary {
+        rank,
+        world_size,
+        local_rank,
+        model_path: model_path.display().to_string(),
+        tensor_model_parallel_size: config.parallel.tensor_model_parallel_size,
+        data_parallel_size: config.parallel.data_parallel_size,
+        attention_q_head_start: attention.q_head_start,
+        attention_q_head_end: attention.q_head_start + attention.q_heads_per_rank,
+        attention_kv_head_start: attention.kv_head_start,
+        attention_kv_head_end: attention.kv_head_start + attention.kv_heads_per_rank,
+        attention_context_shard_shape: attention.context_shard.size(),
+        attention_reduced_output_shape: attention_reduced.size(),
+        attention_max_abs: attention_diff.max_abs,
+        attention_mean_abs: attention_diff.mean_abs,
+        mlp_intermediate_start: intermediate_start,
+        mlp_intermediate_end: intermediate_start + intermediate_shard_size,
+        mlp_activation_shard_shape: activation_shard.size(),
+        mlp_reduced_output_shape: mlp_reduced.size(),
+        mlp_max_abs: mlp_diff.max_abs,
+        mlp_mean_abs: mlp_diff.mean_abs,
+    };
+    let summary_path = output_dir.join(format!("qwen-session-tp-rank-{rank}.json"));
+    fs::write(&summary_path, serde_json::to_string_pretty(&summary)?)
+        .with_context(|| format!("failed to write {}", summary_path.display()))?;
+    println!("{}", serde_json::to_string_pretty(&summary)?);
+    Ok(())
+}
+
 pub(crate) fn train_qwen_session_single_from_config(
     config: &Config,
     run_paths: &RunPaths,
@@ -4935,6 +5119,12 @@ pub(crate) fn train_qwen_session_single_from_config(
 }
 
 fn qwen_dp_artifact_dir(output_dir: &Path) -> Result<PathBuf> {
+    let port = std::env::var("MASTER_PORT")
+        .context("MASTER_PORT is not set; run through rustrain launch")?;
+    Ok(output_dir.join(format!("launch-{port}")))
+}
+
+fn qwen_tp_artifact_dir(output_dir: &Path) -> Result<PathBuf> {
     let port = std::env::var("MASTER_PORT")
         .context("MASTER_PORT is not set; run through rustrain launch")?;
     Ok(output_dir.join(format!("launch-{port}")))
