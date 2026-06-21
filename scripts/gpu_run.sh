@@ -30,8 +30,10 @@ trap cleanup_remote_archive EXIT
 if [ "${SYNC_TO_WORKER}" = "1" ]; then
   LOCAL_ARCHIVE="$(mktemp)"
   tar --exclude .git --exclude target --exclude runs -cf "${LOCAL_ARCHIVE}" .
-  if [ -f runs/parity/qwen_layer0_modules.safetensors ]; then
-    tar -rf "${LOCAL_ARCHIVE}" runs/parity/qwen_layer0_modules.safetensors
+  if [ -d runs/parity ]; then
+    find runs/parity -maxdepth 1 -type f -name '*.safetensors' \
+      ! -name 'qwen2_5_0_5b_tied_head_delta.safetensors' \
+      -print0 | xargs -0 -r tar -rf "${LOCAL_ARCHIVE}"
   fi
   REMOTE_ARCHIVE="/tmp/rustrain-gpu-run-${USER:-user}-$$.tar"
   scp "${SSH_OPT_ARGS[@]}" -P "${REMOTE_PORT}" "${LOCAL_ARCHIVE}" "${REMOTE_HOST}:${REMOTE_ARCHIVE}" >/dev/null

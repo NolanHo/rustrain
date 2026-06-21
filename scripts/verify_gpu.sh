@@ -42,4 +42,4 @@ remote_run bash scripts/verify_qwen_session_single_bf16_worker.sh
 remote_run bash scripts/verify_qwen_session_single_resume.sh
 remote_run bash scripts/verify_qwen_session_single_sft_resume.sh
 remote_run bash scripts/verify_qwen_session_layers01_worker.sh
-remote_run cargo run -- qwen-full-train-smoke --dtype bf16 --delta-output /tmp/rustrain-qwen-full-train-delta-bf16.safetensors
+remote_run bash scripts/verify_qwen_full_train_smoke_worker.sh
