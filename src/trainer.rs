@@ -150,7 +150,10 @@ pub fn train(config_path: &Path, resume_from: Option<PathBuf>) -> Result<()> {
             reload_delta = summary.reload_delta,
             full_forward_adapter_delta = summary.full_forward_adapter_delta,
             full_forward_reload_delta = summary.full_forward_reload_delta,
+            full_forward_merge_delta = summary.full_forward_merge_delta,
+            full_forward_unmerge_delta = summary.full_forward_unmerge_delta,
             full_generate_reload_match = summary.full_generate_reload_match,
+            full_generate_merge_match = summary.full_generate_merge_match,
             full_generate_new_token_ids = ?summary.full_generate_new_token_ids,
             steps = summary.steps,
             final_learning_rate = summary.final_learning_rate,
@@ -182,8 +185,20 @@ pub fn train(config_path: &Path, resume_from: Option<PathBuf>) -> Result<()> {
             summary.full_forward_reload_delta
         );
         println!(
+            "full_forward_merge_delta: {:.9}",
+            summary.full_forward_merge_delta
+        );
+        println!(
+            "full_forward_unmerge_delta: {:.9}",
+            summary.full_forward_unmerge_delta
+        );
+        println!(
             "full_generate_reload_match: {}",
             summary.full_generate_reload_match
+        );
+        println!(
+            "full_generate_merge_match: {}",
+            summary.full_generate_merge_match
         );
         println!(
             "full_generate_new_token_ids: {:?}",

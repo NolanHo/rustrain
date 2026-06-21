@@ -163,7 +163,10 @@ pub(crate) struct QwenLoraSftTrainSummary {
     pub(crate) reload_delta: f64,
     pub(crate) full_forward_adapter_delta: f64,
     pub(crate) full_forward_reload_delta: f64,
+    pub(crate) full_forward_merge_delta: f64,
+    pub(crate) full_forward_unmerge_delta: f64,
     pub(crate) full_generate_reload_match: bool,
+    pub(crate) full_generate_merge_match: bool,
     pub(crate) full_generate_new_token_ids: Vec<i64>,
     pub(crate) base_requires_grad: bool,
     pub(crate) first_step_grad_norm: f64,
@@ -1304,18 +1307,39 @@ fn qwen_lora_sft_train(
             "Qwen LoRA SFT full forward reload parity failed: max_delta={full_forward_reload_delta}"
         );
     }
+    let merged_weights = reloaded.merge_into_weights(&weights)?;
+    let merged_logits = qwen_forward_from_ids(&batch.input_ids, &merged_weights, &config)?;
+    let full_forward_merge_delta = diff_stats(&merged_logits, &adapted_logits)?.max_abs;
+    if full_forward_merge_delta > 1e-7 {
+        bail!("Qwen LoRA SFT merge parity failed: max_delta={full_forward_merge_delta}");
+    }
+    let unmerged_weights = reloaded.unmerge_from_weights(&merged_weights)?;
+    let unmerged_logits = qwen_forward_from_ids(&batch.input_ids, &unmerged_weights, &config)?;
+    let full_forward_unmerge_delta = diff_stats(&unmerged_logits, &base_logits)?.max_abs;
+    if full_forward_unmerge_delta > 5e-4 {
+        bail!("Qwen LoRA SFT unmerge parity failed: max_delta={full_forward_unmerge_delta}");
+    }
     let prompt_ids = batch.input_ids.i(0).reshape([1, batch.input_ids.size()[1]]);
     let generated = qwen_greedy_generate_with_lora(&prompt_ids, &weights, &config, &registry, 2)?;
     let reloaded_generated =
         qwen_greedy_generate_with_lora(&prompt_ids, &weights, &config, &reloaded, 2)?;
+    let merged_generated = qwen_greedy_generate(&prompt_ids, &merged_weights, &config, 2)?;
     let generated_ids: Vec<i64> =
         Vec::<i64>::try_from(generated.reshape([-1]).to_device(Device::Cpu))?;
     let reloaded_generated_ids: Vec<i64> =
         Vec::<i64>::try_from(reloaded_generated.reshape([-1]).to_device(Device::Cpu))?;
+    let merged_generated_ids: Vec<i64> =
+        Vec::<i64>::try_from(merged_generated.reshape([-1]).to_device(Device::Cpu))?;
     let full_generate_reload_match = generated_ids == reloaded_generated_ids;
     if !full_generate_reload_match {
         bail!(
             "Qwen LoRA SFT full generate reload parity failed: generated={generated_ids:?}, reloaded={reloaded_generated_ids:?}"
+        );
+    }
+    let full_generate_merge_match = generated_ids == merged_generated_ids;
+    if !full_generate_merge_match {
+        bail!(
+            "Qwen LoRA SFT full generate merge parity failed: generated={generated_ids:?}, merged={merged_generated_ids:?}"
         );
     }
     let full_generate_new_token_ids = generated_ids[batch.input_ids.size()[1] as usize..].to_vec();
@@ -1342,7 +1366,10 @@ fn qwen_lora_sft_train(
         reload_delta,
         full_forward_adapter_delta,
         full_forward_reload_delta,
+        full_forward_merge_delta,
+        full_forward_unmerge_delta,
         full_generate_reload_match,
+        full_generate_merge_match,
         full_generate_new_token_ids,
         base_requires_grad,
         first_step_grad_norm,
@@ -3131,6 +3158,45 @@ impl QwenLoraRegistry {
 
     fn adapter_for_layer(&self, layer_index: usize) -> Option<&QwenAttentionLoraAdapter> {
         self.adapters.get(&layer_index)
+    }
+
+    fn merge_into_weights(
+        &self,
+        weights: &BTreeMap<String, Tensor>,
+    ) -> Result<BTreeMap<String, Tensor>> {
+        self.apply_to_weights(weights, 1.0)
+    }
+
+    fn unmerge_from_weights(
+        &self,
+        weights: &BTreeMap<String, Tensor>,
+    ) -> Result<BTreeMap<String, Tensor>> {
+        self.apply_to_weights(weights, -1.0)
+    }
+
+    fn apply_to_weights(
+        &self,
+        weights: &BTreeMap<String, Tensor>,
+        scale: f64,
+    ) -> Result<BTreeMap<String, Tensor>> {
+        let mut merged = weights
+            .iter()
+            .map(|(name, tensor)| (name.clone(), tensor_snapshot(tensor)))
+            .collect::<BTreeMap<_, _>>();
+        for (layer_index, adapter) in &self.adapters {
+            let prefix = format!("model.layers.{layer_index}.self_attn");
+            let q_name = format!("{prefix}.q_proj.weight");
+            let v_name = format!("{prefix}.v_proj.weight");
+            let q_weight = tensor(&merged, &q_name)?.to_kind(Kind::Float);
+            let v_weight = tensor(&merged, &v_name)?.to_kind(Kind::Float);
+            let merged_q = q_weight.shallow_clone()
+                + adapter.q_delta(q_weight.device()).to_kind(Kind::Float) * scale;
+            let merged_v = v_weight.shallow_clone()
+                + adapter.v_delta(v_weight.device()).to_kind(Kind::Float) * scale;
+            merged.insert(q_name, merged_q);
+            merged.insert(v_name, merged_v);
+        }
+        Ok(merged)
     }
 
     fn trainable_tensor_names(&self) -> Vec<String> {
@@ -4977,16 +5043,43 @@ mod tests {
                 .max_abs
                 < 1e-8
         );
+        let merged_weights = reloaded
+            .merge_into_weights(&weights)
+            .expect("LoRA weights should merge");
+        let merged_logits = qwen_forward_from_ids(&input_ids, &merged_weights, &config)
+            .expect("merged forward should run");
+        assert!(
+            diff_stats(&merged_logits, &adapted_logits)
+                .expect("merge diff should compute")
+                .max_abs
+                < 1e-8
+        );
+        let unmerged_weights = reloaded
+            .unmerge_from_weights(&merged_weights)
+            .expect("LoRA weights should unmerge");
+        let unmerged_logits = qwen_forward_from_ids(&input_ids, &unmerged_weights, &config)
+            .expect("unmerged forward should run");
+        assert!(
+            diff_stats(&unmerged_logits, &base_logits)
+                .expect("unmerge diff should compute")
+                .max_abs
+                < 1e-8
+        );
 
         let generated = qwen_greedy_generate_with_lora(&input_ids, &weights, &config, &registry, 2)
             .expect("LoRA generate should run");
         let reloaded_generated =
             qwen_greedy_generate_with_lora(&input_ids, &weights, &config, &reloaded, 2)
                 .expect("reloaded LoRA generate should run");
+        let merged_generated = qwen_greedy_generate(&input_ids, &merged_weights, &config, 2)
+            .expect("merged LoRA generate should run");
         let generated_ids: Vec<i64> = Vec::<i64>::try_from(generated.reshape([-1])).unwrap();
         let reloaded_generated_ids: Vec<i64> =
             Vec::<i64>::try_from(reloaded_generated.reshape([-1])).unwrap();
+        let merged_generated_ids: Vec<i64> =
+            Vec::<i64>::try_from(merged_generated.reshape([-1])).unwrap();
         assert_eq!(reloaded_generated_ids, generated_ids);
+        assert_eq!(merged_generated_ids, generated_ids);
     }
 
     #[test]
