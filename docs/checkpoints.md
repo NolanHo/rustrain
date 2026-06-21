@@ -162,6 +162,13 @@ also verifies a focused causal-LM train-step over a real token batch, but the
 checkpoint artifacts still only cover focused layer0 TP shard state with smoke
 optimizer slots. Production full-parameter TP checkpoint resume and full
 production sharded restore over external streaming real data remain open.
+The focused EP `parallel-ep-tch-moe-rank-smoke` also writes
+`rustrain.ep_sharded.v1` rank manifests. Each rank owns a contiguous expert
+range and writes two model shards, `experts.up.weight` and
+`experts.down.weight`, plus AdamW `adam_m`/`adam_v` optimizer slots for each
+shard. This is checkpoint-contract evidence for rank-owned `tch-rs` expert MLP
+parameters after sparse send/recv dispatch and gradient return; it is not a
+production MoE trainer checkpoint.
 
 Required manifest structure:
 

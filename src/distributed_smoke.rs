@@ -142,6 +142,48 @@ struct ExpertParallelSparseRankSummary {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+struct ExpertParallelTchMoeRankSummary {
+    rank: usize,
+    world_size: usize,
+    local_rank: usize,
+    source_token_indices: Vec<usize>,
+    owned_expert_start: usize,
+    owned_expert_end: usize,
+    owned_token_indices: Vec<usize>,
+    global_expert_load: Vec<usize>,
+    load_balance_loss: f64,
+    dispatch_send_counts: Vec<usize>,
+    dispatch_recv_counts: Vec<usize>,
+    combine_send_counts: Vec<usize>,
+    combine_recv_counts: Vec<usize>,
+    assembled_output_shape: Vec<i64>,
+    reference_output_shape: Vec<i64>,
+    sparse_output_max_abs: f64,
+    sparse_output_mean_abs: f64,
+    train_initial_loss: f64,
+    train_final_loss: f64,
+    train_loss_improved: bool,
+    expert_up_grad_norm: f64,
+    expert_down_grad_norm: f64,
+    checkpoint_manifest_output: String,
+    checkpoint_model_safetensors: String,
+    checkpoint_optimizer_safetensors: String,
+    checkpoint_tensor_count: usize,
+    reload_expert_up_max_abs: f64,
+    reload_expert_down_max_abs: f64,
+    reload_optimizer_max_abs: f64,
+    reload_loss: f64,
+    reload_loss_delta: f64,
+    continuous_second_loss: f64,
+    resumed_second_loss: f64,
+    second_step_delta: f64,
+    second_step_expert_up_max_abs: f64,
+    second_step_expert_down_max_abs: f64,
+    second_step_optimizer_max_abs: f64,
+    second_step_optimizer_step_delta: i64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
 struct ExpertParallelCheckpointManifest {
     format: String,
     rank: usize,
@@ -187,6 +229,14 @@ struct ExpertParallelAdamState {
     step: i64,
 }
 
+struct ExpertParallelTchMoeAdamState {
+    up_m: Tensor,
+    up_v: Tensor,
+    down_m: Tensor,
+    down_v: Tensor,
+    step: i64,
+}
+
 struct ExpertParallelAdamStep {
     pre_loss: f64,
     post_loss: Option<f64>,
@@ -204,6 +254,16 @@ struct ExpertParallelSparseSgdStep {
     updated_scales: Tensor,
     updated_state: ExpertParallelAdamState,
     grad_norm: f64,
+}
+
+struct ExpertParallelTchMoeAdamStep {
+    initial_loss: f64,
+    final_loss: Option<f64>,
+    updated_expert_up: Tensor,
+    updated_expert_down: Tensor,
+    updated_state: ExpertParallelTchMoeAdamState,
+    up_grad_norm: f64,
+    down_grad_norm: f64,
 }
 
 struct ExpertParallelCheckpointWrite {
@@ -226,6 +286,12 @@ struct ExpertParallelSparseForward {
     dispatch_recv_counts: Vec<usize>,
     combine_send_counts: Vec<usize>,
     combine_recv_counts: Vec<usize>,
+}
+
+struct ExpertParallelTchMoeCheckpointRead {
+    expert_up: Tensor,
+    expert_down: Tensor,
+    state: ExpertParallelTchMoeAdamState,
 }
 
 pub fn run_data_parallel_smoke(output_dir: &Path, world_size: usize) -> Result<()> {
@@ -986,6 +1052,264 @@ pub fn run_expert_parallel_sparse_rank_smoke(output_dir: PathBuf) -> Result<()> 
     Ok(())
 }
 
+pub fn run_expert_parallel_tch_moe_rank_smoke(output_dir: PathBuf) -> Result<()> {
+    let rank = parse_launcher_usize_env("RANK")?;
+    let local_rank = parse_launcher_usize_env("LOCAL_RANK")?;
+    let world_size = parse_launcher_usize_env("WORLD_SIZE")?;
+    if world_size != 2 {
+        bail!("EP tch MoE rank smoke currently expects WORLD_SIZE=2");
+    }
+    if rank >= world_size {
+        bail!("rank {rank} must be smaller than world_size {world_size}");
+    }
+    fs::create_dir_all(&output_dir)
+        .with_context(|| format!("failed to create {}", output_dir.display()))?;
+
+    let device = Device::Cuda(local_rank);
+    let tokens = ep_tokens_tensor(device);
+    let router = ep_router_tensor(device);
+    let assignments = route_top1_tensor(&tokens, &router)?;
+    let global_expert_load = ep_global_expert_load(&assignments);
+    let load_balance_loss = ep_load_balance_loss(&global_expert_load);
+    let experts_per_rank = ep_expert_count() / world_size;
+    let owned_expert_start = rank * experts_per_rank;
+    let owned_expert_end = owned_expert_start + experts_per_rank;
+    let local_up = ep_tch_moe_owned_expert_up_tensor(owned_expert_start, owned_expert_end, device);
+    let local_down =
+        ep_tch_moe_owned_expert_down_tensor(owned_expert_start, owned_expert_end, device);
+
+    let forward = ep_tch_moe_sparse_forward(
+        &output_dir,
+        "ep-tch-moe-forward",
+        rank,
+        world_size,
+        &tokens,
+        &assignments,
+        owned_expert_start,
+        owned_expert_end,
+        &local_up,
+        &local_down,
+    )?;
+    let reference = ep_tch_moe_reference_output_tensor(&tokens, &assignments)?;
+    let reference_rows = ep_sparse_pack_token_rows(&reference, &forward.source_token_indices);
+    let sparse_diff = tensor_diff_stats(&forward.assembled_output, &reference_rows)?;
+    if sparse_diff.0 > 1e-6 {
+        bail!(
+            "EP tch MoE sparse dispatch/combine mismatch: rank={rank}, max_abs={}, mean_abs={}",
+            sparse_diff.0,
+            sparse_diff.1
+        );
+    }
+
+    let target_rows = &reference_rows * 0.25;
+    let adam = ExpertParallelAdamConfig {
+        learning_rate: 0.05,
+        beta1: 0.9,
+        beta2: 0.999,
+        eps: 1e-8,
+        weight_decay: 0.0,
+    };
+    let initial_state = ExpertParallelTchMoeAdamState {
+        up_m: Tensor::zeros_like(&local_up),
+        up_v: Tensor::zeros_like(&local_up),
+        down_m: Tensor::zeros_like(&local_down),
+        down_v: Tensor::zeros_like(&local_down),
+        step: 0,
+    };
+    let first_step = ep_tch_moe_adam_step(
+        &output_dir,
+        "ep-tch-moe-first-step",
+        rank,
+        world_size,
+        &tokens,
+        &assignments,
+        owned_expert_start,
+        owned_expert_end,
+        &local_up,
+        &local_down,
+        &initial_state,
+        &target_rows,
+        &adam,
+        Some("ep-tch-moe-updated-forward"),
+    )?;
+    let train_final_loss = first_step
+        .final_loss
+        .ok_or_else(|| anyhow!("EP tch MoE first step did not compute post-update loss"))?;
+    let train_loss_improved = train_final_loss < first_step.initial_loss;
+    if !train_loss_improved {
+        bail!(
+            "EP tch MoE train smoke did not lower loss on rank {rank}: initial={}, final={train_final_loss}",
+            first_step.initial_loss
+        );
+    }
+
+    let checkpoint = write_ep_tch_moe_rank_checkpoint(
+        &output_dir,
+        rank,
+        world_size,
+        local_rank,
+        owned_expert_start,
+        owned_expert_end,
+        &first_step.updated_expert_up,
+        &first_step.updated_expert_down,
+        &first_step.updated_state,
+        &adam,
+    )?;
+    let reloaded = read_ep_tch_moe_rank_checkpoint(&checkpoint)?;
+    let reloaded_up = reloaded.expert_up.to_device(device);
+    let reloaded_down = reloaded.expert_down.to_device(device);
+    let reloaded_state = ExpertParallelTchMoeAdamState {
+        up_m: reloaded.state.up_m.to_device(device),
+        up_v: reloaded.state.up_v.to_device(device),
+        down_m: reloaded.state.down_m.to_device(device),
+        down_v: reloaded.state.down_v.to_device(device),
+        step: reloaded.state.step,
+    };
+    let reload_expert_up_max_abs =
+        tensor_max_abs_diff(&reloaded_up, &first_step.updated_expert_up)?;
+    let reload_expert_down_max_abs =
+        tensor_max_abs_diff(&reloaded_down, &first_step.updated_expert_down)?;
+    let reload_optimizer_max_abs =
+        ep_tch_moe_adam_state_max_abs_diff(&reloaded_state, &first_step.updated_state)?;
+    if reload_expert_up_max_abs > 1e-7
+        || reload_expert_down_max_abs > 1e-7
+        || reload_optimizer_max_abs > 1e-7
+    {
+        bail!(
+            "EP tch MoE checkpoint reload mismatch on rank {rank}: up={reload_expert_up_max_abs}, down={reload_expert_down_max_abs}, optimizer={reload_optimizer_max_abs}"
+        );
+    }
+    let reloaded_forward = ep_tch_moe_sparse_forward(
+        &output_dir,
+        "ep-tch-moe-reloaded-forward",
+        rank,
+        world_size,
+        &tokens,
+        &assignments,
+        owned_expert_start,
+        owned_expert_end,
+        &reloaded_up,
+        &reloaded_down,
+    )?;
+    let reload_loss = (&reloaded_forward.assembled_output - &target_rows)
+        .square()
+        .mean(Kind::Float)
+        .double_value(&[]);
+    let reload_loss_delta = (reload_loss - train_final_loss).abs();
+    if reload_loss_delta > 1e-7 {
+        bail!(
+            "EP tch MoE checkpoint reload loss mismatch on rank {rank}: reload_loss={reload_loss}, train_final_loss={train_final_loss}, delta={reload_loss_delta}"
+        );
+    }
+
+    let continuous_second = ep_tch_moe_adam_step(
+        &output_dir,
+        "ep-tch-moe-continuous-second",
+        rank,
+        world_size,
+        &tokens,
+        &assignments,
+        owned_expert_start,
+        owned_expert_end,
+        &first_step.updated_expert_up,
+        &first_step.updated_expert_down,
+        &first_step.updated_state,
+        &target_rows,
+        &adam,
+        None,
+    )?;
+    let resumed_second = ep_tch_moe_adam_step(
+        &output_dir,
+        "ep-tch-moe-resumed-second",
+        rank,
+        world_size,
+        &tokens,
+        &assignments,
+        owned_expert_start,
+        owned_expert_end,
+        &reloaded_up,
+        &reloaded_down,
+        &reloaded_state,
+        &target_rows,
+        &adam,
+        None,
+    )?;
+    let second_step_delta = (continuous_second.initial_loss - resumed_second.initial_loss).abs();
+    let second_step_expert_up_max_abs = tensor_max_abs_diff(
+        &continuous_second.updated_expert_up,
+        &resumed_second.updated_expert_up,
+    )?;
+    let second_step_expert_down_max_abs = tensor_max_abs_diff(
+        &continuous_second.updated_expert_down,
+        &resumed_second.updated_expert_down,
+    )?;
+    let second_step_optimizer_max_abs = ep_tch_moe_adam_state_max_abs_diff(
+        &continuous_second.updated_state,
+        &resumed_second.updated_state,
+    )?;
+    let second_step_optimizer_step_delta =
+        (continuous_second.updated_state.step - resumed_second.updated_state.step).abs();
+    if second_step_delta > 1e-7
+        || second_step_expert_up_max_abs > 1e-7
+        || second_step_expert_down_max_abs > 1e-7
+        || second_step_optimizer_max_abs > 1e-7
+        || second_step_optimizer_step_delta != 0
+    {
+        bail!(
+            "EP tch MoE checkpoint next-step parity failed on rank {rank}: loss_delta={second_step_delta}, up_delta={second_step_expert_up_max_abs}, down_delta={second_step_expert_down_max_abs}, optimizer_delta={second_step_optimizer_max_abs}, optimizer_step_delta={second_step_optimizer_step_delta}"
+        );
+    }
+
+    let summary = ExpertParallelTchMoeRankSummary {
+        rank,
+        world_size,
+        local_rank,
+        source_token_indices: forward.source_token_indices,
+        owned_expert_start,
+        owned_expert_end,
+        owned_token_indices: forward.owned_token_indices,
+        global_expert_load,
+        load_balance_loss,
+        dispatch_send_counts: forward.dispatch_send_counts,
+        dispatch_recv_counts: forward.dispatch_recv_counts,
+        combine_send_counts: forward.combine_send_counts,
+        combine_recv_counts: forward.combine_recv_counts,
+        assembled_output_shape: forward.assembled_output.size(),
+        reference_output_shape: reference_rows.size(),
+        sparse_output_max_abs: sparse_diff.0,
+        sparse_output_mean_abs: sparse_diff.1,
+        train_initial_loss: first_step.initial_loss,
+        train_final_loss,
+        train_loss_improved,
+        expert_up_grad_norm: first_step.up_grad_norm,
+        expert_down_grad_norm: first_step.down_grad_norm,
+        checkpoint_manifest_output: checkpoint.manifest_path.display().to_string(),
+        checkpoint_model_safetensors: checkpoint.model_safetensors.display().to_string(),
+        checkpoint_optimizer_safetensors: checkpoint.optimizer_safetensors.display().to_string(),
+        checkpoint_tensor_count: checkpoint.tensor_count,
+        reload_expert_up_max_abs,
+        reload_expert_down_max_abs,
+        reload_optimizer_max_abs,
+        reload_loss,
+        reload_loss_delta,
+        continuous_second_loss: continuous_second.initial_loss,
+        resumed_second_loss: resumed_second.initial_loss,
+        second_step_delta,
+        second_step_expert_up_max_abs,
+        second_step_expert_down_max_abs,
+        second_step_optimizer_max_abs,
+        second_step_optimizer_step_delta,
+    };
+    let summary_path = output_dir.join(format!("ep-tch-moe-rank-{rank}.json"));
+    fs::write(
+        &summary_path,
+        serde_json::to_string_pretty(&summary)? + "\n",
+    )
+    .with_context(|| format!("failed to write {}", summary_path.display()))?;
+    println!("{}", serde_json::to_string_pretty(&summary)?);
+    Ok(())
+}
+
 fn compute_dp_stats(rank: usize, world_size: usize) -> DpRankStats {
     let mut sample_count = 0;
     let mut loss_sum = 0.0;
@@ -1072,6 +1396,38 @@ fn ep_all_expert_scales_tensor(device: Device) -> Tensor {
 
 fn ep_owned_expert_scales_tensor(start: usize, end: usize, device: Device) -> Tensor {
     ep_all_expert_scales_tensor(device).narrow(0, start as i64, (end - start) as i64)
+}
+
+fn ep_tch_moe_expert_hidden_size() -> i64 {
+    5
+}
+
+fn ep_tch_moe_all_expert_up_tensor(device: Device) -> Tensor {
+    let count = ep_expert_count() as i64 * 3 * ep_tch_moe_expert_hidden_size();
+    Tensor::arange(count, (Kind::Float, device)).reshape([
+        ep_expert_count() as i64,
+        3,
+        ep_tch_moe_expert_hidden_size(),
+    ]) / 50.0
+        - 0.3
+}
+
+fn ep_tch_moe_all_expert_down_tensor(device: Device) -> Tensor {
+    let count = ep_expert_count() as i64 * ep_tch_moe_expert_hidden_size() * 3;
+    Tensor::arange(count, (Kind::Float, device)).reshape([
+        ep_expert_count() as i64,
+        ep_tch_moe_expert_hidden_size(),
+        3,
+    ]) / 60.0
+        - 0.25
+}
+
+fn ep_tch_moe_owned_expert_up_tensor(start: usize, end: usize, device: Device) -> Tensor {
+    ep_tch_moe_all_expert_up_tensor(device).narrow(0, start as i64, (end - start) as i64)
+}
+
+fn ep_tch_moe_owned_expert_down_tensor(start: usize, end: usize, device: Device) -> Tensor {
+    ep_tch_moe_all_expert_down_tensor(device).narrow(0, start as i64, (end - start) as i64)
 }
 
 fn route_top1_tensor(tokens: &Tensor, router: &Tensor) -> Result<Vec<usize>> {
@@ -1331,6 +1687,17 @@ fn ep_reference_output_tensor(tokens: &Tensor, assignments: &[usize]) -> Result<
     )
 }
 
+fn ep_tch_moe_reference_output_tensor(tokens: &Tensor, assignments: &[usize]) -> Result<Tensor> {
+    ep_tch_moe_local_output_tensor(
+        tokens,
+        assignments,
+        0,
+        ep_expert_count(),
+        &ep_tch_moe_all_expert_up_tensor(tokens.device()),
+        &ep_tch_moe_all_expert_down_tensor(tokens.device()),
+    )
+}
+
 fn ep_local_output_tensor(
     tokens: &Tensor,
     assignments: &[usize],
@@ -1344,6 +1711,34 @@ fn ep_local_output_tensor(
         let row = if (owned_expert_start..owned_expert_end).contains(&expert_index) {
             let local_expert_index = (expert_index - owned_expert_start) as i64;
             token * owned_scales.get(local_expert_index)
+        } else {
+            Tensor::zeros([tokens.size()[1]], (Kind::Float, tokens.device()))
+        };
+        rows.push(row);
+    }
+    Ok(Tensor::stack(&rows.iter().collect::<Vec<_>>(), 0))
+}
+
+fn ep_tch_moe_local_output_tensor(
+    tokens: &Tensor,
+    assignments: &[usize],
+    owned_expert_start: usize,
+    owned_expert_end: usize,
+    owned_up: &Tensor,
+    owned_down: &Tensor,
+) -> Result<Tensor> {
+    let mut rows = Vec::with_capacity(assignments.len());
+    for (token_index, expert_index) in assignments.iter().copied().enumerate() {
+        let token = tokens.get(token_index as i64);
+        let row = if (owned_expert_start..owned_expert_end).contains(&expert_index) {
+            let local_expert_index = (expert_index - owned_expert_start) as i64;
+            let hidden = token
+                .unsqueeze(0)
+                .matmul(&owned_up.get(local_expert_index))
+                .gelu("none");
+            hidden
+                .matmul(&owned_down.get(local_expert_index))
+                .squeeze_dim(0)
         } else {
             Tensor::zeros([tokens.size()[1]], (Kind::Float, tokens.device()))
         };
@@ -1387,6 +1782,174 @@ fn ep_sparse_local_expert_outputs(
         }
         let local_expert_index = (expert_index - owned_expert_start) as i64;
         rows.push(dispatched_tokens.get(row_index as i64) * owned_scales.get(local_expert_index));
+    }
+    Ok(if rows.is_empty() {
+        Tensor::zeros(
+            [0, dispatched_tokens.size()[1]],
+            (Kind::Float, dispatched_tokens.device()),
+        )
+    } else {
+        Tensor::stack(&rows.iter().collect::<Vec<_>>(), 0)
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn ep_tch_moe_sparse_forward(
+    output_dir: &Path,
+    step_name: &str,
+    rank: usize,
+    world_size: usize,
+    tokens: &Tensor,
+    assignments: &[usize],
+    owned_expert_start: usize,
+    owned_expert_end: usize,
+    local_up: &Tensor,
+    local_down: &Tensor,
+) -> Result<ExpertParallelSparseForward> {
+    let source_token_indices = ep_source_token_indices(rank, world_size, assignments.len());
+    let dispatch_send_plan =
+        ep_sparse_dispatch_send_plan(rank, world_size, assignments, assignments.len())?;
+    let dispatch_recv_plan = ep_sparse_dispatch_recv_plan(rank, world_size, assignments)?;
+    let dispatch_sends = dispatch_send_plan
+        .iter()
+        .map(|plan| {
+            (
+                plan.peer,
+                ep_sparse_pack_token_rows(tokens, &plan.token_indices),
+            )
+        })
+        .collect::<Vec<_>>();
+    let dispatch_recvs = dispatch_recv_plan
+        .iter()
+        .map(|plan| {
+            (
+                plan.peer,
+                vec![plan.token_indices.len() as i64, tokens.size()[1]],
+            )
+        })
+        .collect::<Vec<_>>();
+    let dispatched = nccl_smoke::send_recv_tensors_f32_for_launch(
+        &output_dir.join(format!("{step_name}-dispatch")),
+        &dispatch_sends,
+        &dispatch_recvs,
+    )?;
+
+    let mut combine_sends = Vec::with_capacity(dispatched.len());
+    let mut owned_token_indices = Vec::new();
+    for (peer, payload) in dispatched {
+        let plan = dispatch_recv_plan
+            .iter()
+            .find(|plan| plan.peer == peer)
+            .ok_or_else(|| anyhow!("missing dispatch recv plan from peer {peer}"))?;
+        owned_token_indices.extend(plan.token_indices.iter().copied());
+        let output = ep_tch_moe_sparse_local_expert_outputs(
+            &payload,
+            &plan.token_indices,
+            assignments,
+            owned_expert_start,
+            owned_expert_end,
+            local_up,
+            local_down,
+        )?;
+        combine_sends.push((peer, output));
+    }
+    owned_token_indices.sort_unstable();
+
+    let combine_recv_plan = ep_sparse_combine_recv_plan(rank, world_size, assignments)?;
+    let combine_recvs = combine_recv_plan
+        .iter()
+        .map(|plan| {
+            (
+                plan.peer,
+                vec![plan.token_indices.len() as i64, tokens.size()[1]],
+            )
+        })
+        .collect::<Vec<_>>();
+    let combined = nccl_smoke::send_recv_tensors_f32_for_launch(
+        &output_dir.join(format!("{step_name}-combine")),
+        &combine_sends,
+        &combine_recvs,
+    )?;
+
+    let mut assembled_rows = Vec::with_capacity(source_token_indices.len());
+    for token_index in &source_token_indices {
+        let owner_rank = ep_expert_owner_rank(assignments[*token_index], world_size);
+        let payload = combined
+            .iter()
+            .find(|(peer, _)| *peer == owner_rank)
+            .map(|(_, tensor)| tensor)
+            .ok_or_else(|| {
+                anyhow!("missing combined output from expert owner rank {owner_rank}")
+            })?;
+        let plan = combine_recv_plan
+            .iter()
+            .find(|plan| plan.peer == owner_rank)
+            .ok_or_else(|| anyhow!("missing combine recv plan from rank {owner_rank}"))?;
+        let row_position = plan
+            .token_indices
+            .iter()
+            .position(|candidate| candidate == token_index)
+            .ok_or_else(|| anyhow!("token {token_index} missing from combine recv plan"))?;
+        assembled_rows.push(payload.get(row_position as i64));
+    }
+    let assembled_output = Tensor::stack(&assembled_rows.iter().collect::<Vec<_>>(), 0);
+
+    Ok(ExpertParallelSparseForward {
+        assembled_output,
+        source_token_indices,
+        owned_token_indices,
+        dispatch_send_counts: dispatch_send_plan
+            .iter()
+            .map(|plan| plan.token_indices.len())
+            .collect(),
+        dispatch_recv_counts: dispatch_recv_plan
+            .iter()
+            .map(|plan| plan.token_indices.len())
+            .collect(),
+        combine_send_counts: dispatch_recv_plan
+            .iter()
+            .map(|plan| plan.token_indices.len())
+            .collect(),
+        combine_recv_counts: combine_recv_plan
+            .iter()
+            .map(|plan| plan.token_indices.len())
+            .collect(),
+    })
+}
+
+fn ep_tch_moe_sparse_local_expert_outputs(
+    dispatched_tokens: &Tensor,
+    token_indices: &[usize],
+    assignments: &[usize],
+    owned_expert_start: usize,
+    owned_expert_end: usize,
+    owned_up: &Tensor,
+    owned_down: &Tensor,
+) -> Result<Tensor> {
+    if dispatched_tokens.size()[0] != token_indices.len() as i64 {
+        bail!(
+            "EP tch MoE dispatched token count mismatch: payload={}, metadata={}",
+            dispatched_tokens.size()[0],
+            token_indices.len()
+        );
+    }
+    let mut rows = Vec::with_capacity(token_indices.len());
+    for (row_index, token_index) in token_indices.iter().copied().enumerate() {
+        let expert_index = assignments[token_index];
+        if !(owned_expert_start..owned_expert_end).contains(&expert_index) {
+            bail!("EP tch MoE rank received token {token_index} for unowned expert {expert_index}");
+        }
+        let local_expert_index = (expert_index - owned_expert_start) as i64;
+        let token = dispatched_tokens.get(row_index as i64);
+        let hidden = token
+            .unsqueeze(0)
+            .matmul(&owned_up.get(local_expert_index))
+            .gelu("none");
+        rows.push(
+            hidden
+                .matmul(&owned_down.get(local_expert_index))
+                .squeeze_dim(0),
+        );
     }
     Ok(if rows.is_empty() {
         Tensor::zeros(
@@ -1503,6 +2066,145 @@ fn ep_sparse_sgd_step(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
+fn ep_tch_moe_adam_step(
+    output_dir: &Path,
+    step_name: &str,
+    rank: usize,
+    world_size: usize,
+    tokens: &Tensor,
+    assignments: &[usize],
+    owned_expert_start: usize,
+    owned_expert_end: usize,
+    local_up: &Tensor,
+    local_down: &Tensor,
+    state: &ExpertParallelTchMoeAdamState,
+    target_rows: &Tensor,
+    adam: &ExpertParallelAdamConfig,
+    post_update_step_name: Option<&str>,
+) -> Result<ExpertParallelTchMoeAdamStep> {
+    let forward = ep_tch_moe_sparse_forward(
+        output_dir,
+        &format!("{step_name}-forward"),
+        rank,
+        world_size,
+        tokens,
+        assignments,
+        owned_expert_start,
+        owned_expert_end,
+        local_up,
+        local_down,
+    )?;
+    let source_grad =
+        (&forward.assembled_output - target_rows) * (2.0 / target_rows.numel() as f64);
+    let initial_loss = (&forward.assembled_output - target_rows)
+        .square()
+        .mean(Kind::Float)
+        .double_value(&[]);
+    let gradient_sends = ep_sparse_output_gradient_sends(
+        rank,
+        world_size,
+        assignments,
+        &forward.source_token_indices,
+        &source_grad,
+    )?;
+    let gradient_recv_plan = ep_sparse_dispatch_recv_plan(rank, world_size, assignments)?;
+    let gradient_recvs = gradient_recv_plan
+        .iter()
+        .map(|plan| {
+            (
+                plan.peer,
+                vec![plan.token_indices.len() as i64, tokens.size()[1]],
+            )
+        })
+        .collect::<Vec<_>>();
+    let received_gradients = nccl_smoke::send_recv_tensors_f32_for_launch(
+        &output_dir.join(format!("{step_name}-output-grad")),
+        &gradient_sends,
+        &gradient_recvs,
+    )?;
+
+    let train_up = local_up.detach().set_requires_grad(true);
+    let train_down = local_down.detach().set_requires_grad(true);
+    let local_output_grad_loss = ep_tch_moe_local_output_grad_bridge(
+        &received_gradients,
+        &gradient_recv_plan,
+        tokens,
+        assignments,
+        owned_expert_start,
+        owned_expert_end,
+        &train_up,
+        &train_down,
+    )?;
+    local_output_grad_loss.backward();
+    let up_grad = train_up.grad();
+    let down_grad = train_down.grad();
+    let up_grad_norm = up_grad.norm().double_value(&[]);
+    let down_grad_norm = down_grad.norm().double_value(&[]);
+    if !up_grad.defined() || !down_grad.defined() || up_grad_norm <= 0.0 || down_grad_norm <= 0.0 {
+        bail!(
+            "EP tch MoE train smoke expected positive expert gradients: up={up_grad_norm}, down={down_grad_norm}"
+        );
+    }
+
+    let next_step = state.step + 1;
+    let (updated_up, up_m, up_v) = ep_adamw_update_tensor(
+        local_up,
+        &up_grad,
+        &state.up_m,
+        &state.up_v,
+        next_step,
+        adam,
+    );
+    let (updated_down, down_m, down_v) = ep_adamw_update_tensor(
+        local_down,
+        &down_grad,
+        &state.down_m,
+        &state.down_v,
+        next_step,
+        adam,
+    );
+    let updated_state = ExpertParallelTchMoeAdamState {
+        up_m,
+        up_v,
+        down_m,
+        down_v,
+        step: next_step,
+    };
+    let final_loss = if let Some(step_name) = post_update_step_name {
+        let updated_forward = ep_tch_moe_sparse_forward(
+            output_dir,
+            step_name,
+            rank,
+            world_size,
+            tokens,
+            assignments,
+            owned_expert_start,
+            owned_expert_end,
+            &updated_up,
+            &updated_down,
+        )?;
+        Some(
+            (&updated_forward.assembled_output - target_rows)
+                .square()
+                .mean(Kind::Float)
+                .double_value(&[]),
+        )
+    } else {
+        None
+    };
+
+    Ok(ExpertParallelTchMoeAdamStep {
+        initial_loss,
+        final_loss,
+        updated_expert_up: updated_up,
+        updated_expert_down: updated_down,
+        updated_state,
+        up_grad_norm,
+        down_grad_norm,
+    })
+}
+
 fn ep_sparse_output_gradient_sends(
     _rank: usize,
     world_size: usize,
@@ -1537,6 +2239,57 @@ fn ep_sparse_output_gradient_sends(
             (peer, payload)
         })
         .collect())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn ep_tch_moe_local_output_grad_bridge(
+    received_gradients: &[(usize, Tensor)],
+    gradient_recv_plan: &[ExpertParallelSparsePeerPlan],
+    tokens: &Tensor,
+    assignments: &[usize],
+    owned_expert_start: usize,
+    owned_expert_end: usize,
+    local_up: &Tensor,
+    local_down: &Tensor,
+) -> Result<Tensor> {
+    let mut terms = Vec::new();
+    for plan in gradient_recv_plan {
+        let payload = received_gradients
+            .iter()
+            .find(|(peer, _)| *peer == plan.peer)
+            .map(|(_, tensor)| tensor)
+            .ok_or_else(|| anyhow!("missing output gradient payload from peer {}", plan.peer))?;
+        if payload.size()[0] != plan.token_indices.len() as i64 {
+            bail!(
+                "EP tch MoE output grad count mismatch from peer {}: payload={}, metadata={}",
+                plan.peer,
+                payload.size()[0],
+                plan.token_indices.len()
+            );
+        }
+        for (row_index, token_index) in plan.token_indices.iter().copied().enumerate() {
+            let expert_index = assignments[token_index];
+            if !(owned_expert_start..owned_expert_end).contains(&expert_index) {
+                bail!(
+                    "EP tch MoE rank received output grad for token {token_index} assigned to unowned expert {expert_index}"
+                );
+            }
+            let local_expert_index = (expert_index - owned_expert_start) as i64;
+            let token = tokens.get(token_index as i64);
+            let hidden = token
+                .unsqueeze(0)
+                .matmul(&local_up.get(local_expert_index))
+                .gelu("none");
+            let output = hidden
+                .matmul(&local_down.get(local_expert_index))
+                .squeeze_dim(0);
+            terms.push((output * payload.get(row_index as i64)).sum(Kind::Float));
+        }
+    }
+    if terms.is_empty() {
+        bail!("EP tch MoE rank has no owned tokens and cannot produce gradient evidence");
+    }
+    Ok(Tensor::stack(&terms.iter().collect::<Vec<_>>(), 0).sum(Kind::Float))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1580,6 +2333,27 @@ fn ep_sparse_scale_grad_from_output_grads(
         }
     }
     Ok(scale_grad)
+}
+
+fn ep_adamw_update_tensor(
+    parameter: &Tensor,
+    grad: &Tensor,
+    m: &Tensor,
+    v: &Tensor,
+    step: i64,
+    adam: &ExpertParallelAdamConfig,
+) -> (Tensor, Tensor, Tensor) {
+    let next_m = m * adam.beta1 + grad * (1.0 - adam.beta1);
+    let next_v = v * adam.beta2 + grad.square() * (1.0 - adam.beta2);
+    let m_hat = &next_m / (1.0 - adam.beta1.powi(step as i32));
+    let v_hat = &next_v / (1.0 - adam.beta2.powi(step as i32));
+    let decayed = if adam.weight_decay == 0.0 {
+        parameter.shallow_clone()
+    } else {
+        parameter * (1.0 - adam.learning_rate * adam.weight_decay)
+    };
+    let updated = (decayed - (m_hat / (v_hat.sqrt() + adam.eps)) * adam.learning_rate).detach();
+    (updated, next_m.detach(), next_v.detach())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1803,6 +2577,185 @@ fn read_ep_rank_checkpoint(
             step: manifest.global_step as i64,
         },
     ))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write_ep_tch_moe_rank_checkpoint(
+    output_dir: &Path,
+    rank: usize,
+    world_size: usize,
+    local_rank: usize,
+    owned_expert_start: usize,
+    owned_expert_end: usize,
+    expert_up: &Tensor,
+    expert_down: &Tensor,
+    state: &ExpertParallelTchMoeAdamState,
+    adam: &ExpertParallelAdamConfig,
+) -> Result<ExpertParallelCheckpointWrite> {
+    let rank_dir = output_dir.join(format!("ep-tch-moe-checkpoint-rank-{rank}"));
+    fs::create_dir_all(&rank_dir)
+        .with_context(|| format!("failed to create {}", rank_dir.display()))?;
+    let model_safetensors = rank_dir.join("model.safetensors");
+    let optimizer_safetensors = rank_dir.join("optimizer.safetensors");
+    let up_name = "experts.up.weight";
+    let down_name = "experts.down.weight";
+    let up_m_name = "experts.up.weight.adam_m";
+    let up_v_name = "experts.up.weight.adam_v";
+    let down_m_name = "experts.down.weight.adam_m";
+    let down_v_name = "experts.down.weight.adam_v";
+
+    Tensor::write_safetensors(
+        &[(up_name, expert_up), (down_name, expert_down)],
+        &model_safetensors,
+    )
+    .with_context(|| format!("failed to write {}", model_safetensors.display()))?;
+    Tensor::write_safetensors(
+        &[
+            (up_m_name, &state.up_m),
+            (up_v_name, &state.up_v),
+            (down_m_name, &state.down_m),
+            (down_v_name, &state.down_v),
+        ],
+        &optimizer_safetensors,
+    )
+    .with_context(|| format!("failed to write {}", optimizer_safetensors.display()))?;
+
+    let manifest = ExpertParallelCheckpointManifest {
+        format: "rustrain.ep_sharded.v1".to_string(),
+        rank,
+        world_size,
+        local_rank,
+        global_step: state.step as u64,
+        owned_expert_start,
+        owned_expert_end,
+        model_safetensors: model_safetensors.display().to_string(),
+        optimizer_safetensors: optimizer_safetensors.display().to_string(),
+        optimizer: "adamw".to_string(),
+        learning_rate: adam.learning_rate,
+        beta1: adam.beta1,
+        beta2: adam.beta2,
+        eps: adam.eps,
+        weight_decay: adam.weight_decay,
+        shards: vec![
+            ExpertParallelCheckpointShard {
+                name: format!("experts.{owned_expert_start}..{owned_expert_end}.up.weight"),
+                shard_name: up_name.to_string(),
+                optimizer_m_name: up_m_name.to_string(),
+                optimizer_v_name: up_v_name.to_string(),
+                global_shape: vec![
+                    ep_expert_count() as i64,
+                    expert_up.size()[1],
+                    expert_up.size()[2],
+                ],
+                shard_shape: expert_up.size(),
+                dtype: "float32".to_string(),
+                partition: "expert_model_parallel".to_string(),
+            },
+            ExpertParallelCheckpointShard {
+                name: format!("experts.{owned_expert_start}..{owned_expert_end}.down.weight"),
+                shard_name: down_name.to_string(),
+                optimizer_m_name: down_m_name.to_string(),
+                optimizer_v_name: down_v_name.to_string(),
+                global_shape: vec![
+                    ep_expert_count() as i64,
+                    expert_down.size()[1],
+                    expert_down.size()[2],
+                ],
+                shard_shape: expert_down.size(),
+                dtype: "float32".to_string(),
+                partition: "expert_model_parallel".to_string(),
+            },
+        ],
+    };
+    let manifest_path = rank_dir.join("manifest.json");
+    fs::write(
+        &manifest_path,
+        serde_json::to_string_pretty(&manifest)? + "\n",
+    )
+    .with_context(|| format!("failed to write {}", manifest_path.display()))?;
+
+    Ok(ExpertParallelCheckpointWrite {
+        manifest_path,
+        model_safetensors,
+        optimizer_safetensors,
+        tensor_count: manifest.shards.len(),
+    })
+}
+
+fn read_ep_tch_moe_rank_checkpoint(
+    checkpoint: &ExpertParallelCheckpointWrite,
+) -> Result<ExpertParallelTchMoeCheckpointRead> {
+    let manifest: ExpertParallelCheckpointManifest = serde_json::from_str(
+        &fs::read_to_string(&checkpoint.manifest_path)
+            .with_context(|| format!("failed to read {}", checkpoint.manifest_path.display()))?,
+    )?;
+    if manifest.format != "rustrain.ep_sharded.v1" {
+        bail!(
+            "unsupported EP tch MoE checkpoint format {}",
+            manifest.format
+        );
+    }
+    if manifest.shards.len() != 2 {
+        bail!(
+            "EP tch MoE checkpoint expected two rank-owned expert shards, got {}",
+            manifest.shards.len()
+        );
+    }
+    let up_shard = manifest
+        .shards
+        .iter()
+        .find(|shard| shard.shard_name == "experts.up.weight")
+        .ok_or_else(|| anyhow!("missing experts.up.weight shard"))?;
+    let down_shard = manifest
+        .shards
+        .iter()
+        .find(|shard| shard.shard_name == "experts.down.weight")
+        .ok_or_else(|| anyhow!("missing experts.down.weight shard"))?;
+    let model_tensors = read_tensor_map(Path::new(&manifest.model_safetensors))?;
+    let optimizer_tensors = read_tensor_map(Path::new(&manifest.optimizer_safetensors))?;
+    let expert_up = tensor_from_map(&model_tensors, &up_shard.shard_name)?.shallow_clone();
+    let expert_down = tensor_from_map(&model_tensors, &down_shard.shard_name)?.shallow_clone();
+    let up_m = tensor_from_map(&optimizer_tensors, &up_shard.optimizer_m_name)?.shallow_clone();
+    let up_v = tensor_from_map(&optimizer_tensors, &up_shard.optimizer_v_name)?.shallow_clone();
+    let down_m = tensor_from_map(&optimizer_tensors, &down_shard.optimizer_m_name)?.shallow_clone();
+    let down_v = tensor_from_map(&optimizer_tensors, &down_shard.optimizer_v_name)?.shallow_clone();
+    if expert_up.size() != up_shard.shard_shape
+        || up_m.size() != up_shard.shard_shape
+        || up_v.size() != up_shard.shard_shape
+        || expert_down.size() != down_shard.shard_shape
+        || down_m.size() != down_shard.shard_shape
+        || down_v.size() != down_shard.shard_shape
+    {
+        bail!(
+            "EP tch MoE checkpoint shard shape mismatch: up={:?}/{:?}, down={:?}/{:?}",
+            expert_up.size(),
+            up_shard.shard_shape,
+            expert_down.size(),
+            down_shard.shard_shape
+        );
+    }
+    Ok(ExpertParallelTchMoeCheckpointRead {
+        expert_up,
+        expert_down,
+        state: ExpertParallelTchMoeAdamState {
+            up_m,
+            up_v,
+            down_m,
+            down_v,
+            step: manifest.global_step as i64,
+        },
+    })
+}
+
+fn ep_tch_moe_adam_state_max_abs_diff(
+    actual: &ExpertParallelTchMoeAdamState,
+    expected: &ExpertParallelTchMoeAdamState,
+) -> Result<f64> {
+    Ok(tensor_max_abs_diff(&actual.up_m, &expected.up_m)?
+        .max(tensor_max_abs_diff(&actual.up_v, &expected.up_v)?)
+        .max(tensor_max_abs_diff(&actual.down_m, &expected.down_m)?)
+        .max(tensor_max_abs_diff(&actual.down_v, &expected.down_v)?)
+        .max((actual.step - expected.step).abs() as f64))
 }
 
 fn read_tensor_map(path: &Path) -> Result<BTreeMap<String, Tensor>> {

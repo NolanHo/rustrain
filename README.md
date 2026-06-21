@@ -211,9 +211,14 @@ expert scales and optimizer tensors, verifies reloaded sparse-forward loss
 parity, and checks the next sparse update from reloaded state matches the
 continuous next update. The sparse verifier checks the rank-owned manifest
 contract, safetensors paths, optimizer slot names, shard shapes, dtype, and
-expert-model-parallel partition metadata. Production EP is still open: a
-production MoE layer, autograd-aware sparse collectives, trainer-owned expert
-parameters, and production expert optimizer/checkpoint ownership are not
+expert-model-parallel partition metadata. A focused two-rank CUDA
+`parallel-ep-tch-moe-rank-smoke` now uses the same sparse send/recv plan with
+rank-owned `tch-rs` expert up/down MLP weights, bridges returned output
+gradients through real autograd, verifies positive expert gradients and
+loss-reducing AdamW updates, then writes two rank-owned expert shards under
+`rustrain.ep_sharded.v1` and verifies reload plus next-step parity. Production
+EP is still open: autograd-aware sparse collectives, trainer-owned production
+MoE integration, and full expert optimizer/checkpoint ownership are not
 implemented.
 Full production Qwen trainer ownership, full real data streaming, and
 production-grade sharded checkpoint ownership remain open.
