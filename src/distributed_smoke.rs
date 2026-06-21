@@ -111,6 +111,8 @@ struct ExpertParallelSparseRankSummary {
     owned_expert_start: usize,
     owned_expert_end: usize,
     owned_token_indices: Vec<usize>,
+    global_expert_load: Vec<usize>,
+    load_balance_loss: f64,
     dispatch_send_counts: Vec<usize>,
     dispatch_recv_counts: Vec<usize>,
     combine_send_counts: Vec<usize>,
@@ -732,6 +734,8 @@ pub fn run_expert_parallel_sparse_rank_smoke(output_dir: PathBuf) -> Result<()> 
     let router = ep_router_tensor(device);
     let assignments = route_top1_tensor(&tokens, &router)?;
     let source_token_indices = ep_source_token_indices(rank, world_size, assignments.len());
+    let global_expert_load = ep_global_expert_load(&assignments);
+    let load_balance_loss = ep_load_balance_loss(&global_expert_load);
     let experts_per_rank = ep_expert_count() / world_size;
     let owned_expert_start = rank * experts_per_rank;
     let owned_expert_end = owned_expert_start + experts_per_rank;
@@ -841,6 +845,8 @@ pub fn run_expert_parallel_sparse_rank_smoke(output_dir: PathBuf) -> Result<()> 
         owned_expert_start,
         owned_expert_end,
         owned_token_indices,
+        global_expert_load,
+        load_balance_loss,
         dispatch_send_counts: dispatch_send_plan
             .iter()
             .map(|plan| plan.token_indices.len())
@@ -985,6 +991,26 @@ fn ep_owned_expert_load(
         }
     }
     expert_load
+}
+
+fn ep_global_expert_load(assignments: &[usize]) -> Vec<usize> {
+    let mut expert_load = vec![0usize; ep_expert_count()];
+    for &expert_index in assignments {
+        expert_load[expert_index] += 1;
+    }
+    expert_load
+}
+
+fn ep_load_balance_loss(expert_load: &[usize]) -> f64 {
+    let total = expert_load.iter().sum::<usize>().max(1) as f64;
+    let expected = 1.0 / expert_load.len().max(1) as f64;
+    expert_load
+        .iter()
+        .map(|load| {
+            let fraction = *load as f64 / total;
+            (fraction - expected).powi(2)
+        })
+        .sum()
 }
 
 fn ep_source_token_indices(rank: usize, world_size: usize, token_count: usize) -> Vec<usize> {

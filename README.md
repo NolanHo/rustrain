@@ -190,8 +190,9 @@ rank-owned expert checkpoints. `parallel-ep-sparse-rank-smoke` verifies a
 toy sparse NCCL send/recv dispatch and combine path: source ranks dispatch
 routed token payloads to expert-owner ranks, owner ranks compute local expert
 outputs, and outputs are sent back to source ranks for parity with the
-single-process reference. Production EP is still open: a production MoE layer,
-autograd-aware collectives, load-balancing loss, trainer ownership, and
+single-process reference; it also reports the global expert load and toy
+load-balancing auxiliary loss on every rank. Production EP is still open: a
+production MoE layer, autograd-aware collectives, trainer ownership, and
 production expert optimizer/checkpoint ownership are not implemented.
 Full production Qwen trainer ownership, full real data streaming, and
 production-grade sharded checkpoint ownership remain open.

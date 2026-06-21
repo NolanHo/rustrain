@@ -77,6 +77,10 @@ for path in summaries:
         raise SystemExit(f"{path} reference_output_shape {data['reference_output_shape']} != [2, 3]")
     if float(data["sparse_output_max_abs"]) > 1e-6:
         raise SystemExit(f"{path} sparse_output_max_abs too large: {data['sparse_output_max_abs']}")
+    if data["global_expert_load"] != [2, 1, 0, 1]:
+        raise SystemExit(f"{path} global_expert_load {data['global_expert_load']} != [2, 1, 0, 1]")
+    if abs(float(data["load_balance_loss"]) - 0.125) > 1e-9:
+        raise SystemExit(f"{path} load_balance_loss {data['load_balance_loss']} != 0.125")
     source_tokens.extend(data["source_token_indices"])
     owned_tokens.extend(data["owned_token_indices"])
     evidence.append(
@@ -89,6 +93,8 @@ for path in summaries:
             "dispatch_recv_counts": data["dispatch_recv_counts"],
             "combine_send_counts": data["combine_send_counts"],
             "combine_recv_counts": data["combine_recv_counts"],
+            "global_expert_load": data["global_expert_load"],
+            "load_balance_loss": data["load_balance_loss"],
             "sparse_output_max_abs": data["sparse_output_max_abs"],
         }
     )
