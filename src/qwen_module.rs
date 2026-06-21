@@ -51,8 +51,14 @@ struct QwenTpLinearRankSummary {
     world_size: usize,
     local_rank: usize,
     model_path: String,
-    tensor_name: String,
     input_shape: Vec<i64>,
+    projections: Vec<QwenTpProjectionShardSummary>,
+}
+
+#[derive(Debug, Serialize)]
+struct QwenTpProjectionShardSummary {
+    name: String,
+    tensor_name: String,
     full_output_shape: Vec<i64>,
     shard_output_shape: Vec<i64>,
     shard_start: i64,
@@ -3218,25 +3224,75 @@ pub fn qwen_tp_linear_rank_smoke(model_path: &Path, output_dir: PathBuf) -> Resu
         .with_context(|| format!("failed to create {}", output_dir.display()))?;
 
     let weights = read_safetensors_map(&model_path.join("model.safetensors"))?;
-    let tensor_name = "model.layers.0.self_attn.q_proj.weight";
-    let weight = tensor(&weights, tensor_name)?
+    let q_weight = tensor(&weights, "model.layers.0.self_attn.q_proj.weight")?
         .to_kind(Kind::Float)
         .to_device(device);
-    let hidden_size = weight.size()[1];
-    let output_size = weight.size()[0];
-    if output_size % world_size as i64 != 0 {
-        bail!("Qwen TP linear rank smoke requires output size divisible by WORLD_SIZE");
-    }
-    let shard_size = output_size / world_size as i64;
-    let shard_start = rank as i64 * shard_size;
-    let shard = weight.narrow(0, shard_start, shard_size);
+    let hidden_size = q_weight.size()[1];
     let input = Tensor::arange(hidden_size * 3, (Kind::Float, device))
         .reshape([3, hidden_size])
         .fmod(17.0)
         / 17.0;
-    let shard_output = input.matmul(&shard.transpose(0, 1));
+
+    let projection_specs = [
+        (
+            "q_proj",
+            "model.layers.0.self_attn.q_proj.weight",
+            Some("model.layers.0.self_attn.q_proj.bias"),
+        ),
+        (
+            "k_proj",
+            "model.layers.0.self_attn.k_proj.weight",
+            Some("model.layers.0.self_attn.k_proj.bias"),
+        ),
+        (
+            "v_proj",
+            "model.layers.0.self_attn.v_proj.weight",
+            Some("model.layers.0.self_attn.v_proj.bias"),
+        ),
+        ("o_proj", "model.layers.0.self_attn.o_proj.weight", None),
+    ];
+
+    let mut local_projection_summaries = Vec::with_capacity(projection_specs.len());
+    let mut shard_entries = Vec::with_capacity(projection_specs.len());
+    for (name, weight_name, bias_name) in projection_specs {
+        let weight = tensor(&weights, weight_name)?
+            .to_kind(Kind::Float)
+            .to_device(device);
+        let output_size = weight.size()[0];
+        if output_size % world_size as i64 != 0 {
+            bail!("Qwen TP linear rank smoke requires {name} output size divisible by WORLD_SIZE");
+        }
+        let shard_size = output_size / world_size as i64;
+        let shard_start = rank as i64 * shard_size;
+        let shard = weight.narrow(0, shard_start, shard_size);
+        let mut shard_output = input.matmul(&shard.transpose(0, 1));
+        if let Some(bias_name) = bias_name {
+            let bias = tensor(&weights, bias_name)?
+                .to_kind(Kind::Float)
+                .to_device(device)
+                .narrow(0, shard_start, shard_size);
+            shard_output += bias;
+        }
+        let tensor_name = format!("{name}_shard_output");
+        local_projection_summaries.push(QwenTpProjectionShardSummary {
+            name: name.to_string(),
+            tensor_name: weight_name.to_string(),
+            full_output_shape: vec![input.size()[0], output_size],
+            shard_output_shape: shard_output.size(),
+            shard_start,
+            shard_end: shard_start + shard_size,
+            max_abs: None,
+            mean_abs: None,
+        });
+        shard_entries.push((tensor_name, shard_output));
+    }
+
+    let shard_refs: Vec<(&str, &Tensor)> = shard_entries
+        .iter()
+        .map(|(name, tensor)| (name.as_str(), tensor))
+        .collect();
     let shard_path = output_dir.join(format!("qwen-tp-linear-rank-{rank}.safetensors"));
-    Tensor::write_safetensors(&[("shard_output", &shard_output)], &shard_path)
+    Tensor::write_safetensors(&shard_refs, &shard_path)
         .with_context(|| format!("failed to write {}", shard_path.display()))?;
 
     wait_for_rank_barrier(
@@ -3246,46 +3302,52 @@ pub fn qwen_tp_linear_rank_smoke(model_path: &Path, output_dir: PathBuf) -> Resu
         Duration::from_secs(300),
     )?;
 
-    let (max_abs, mean_abs) = if rank == 0 {
-        let mut shard_outputs = Vec::with_capacity(world_size);
-        for shard_rank in 0..world_size {
-            let tensors = read_safetensors_map(
-                &output_dir.join(format!("qwen-tp-linear-rank-{shard_rank}.safetensors")),
-            )?;
-            shard_outputs.push(
-                tensor(&tensors, "shard_output")?
+    let mut projection_summaries = local_projection_summaries;
+    if rank == 0 {
+        for (projection_index, (name, weight_name, bias_name)) in
+            projection_specs.into_iter().enumerate()
+        {
+            let mut shard_outputs = Vec::with_capacity(world_size);
+            for shard_rank in 0..world_size {
+                let tensors = read_safetensors_map(
+                    &output_dir.join(format!("qwen-tp-linear-rank-{shard_rank}.safetensors")),
+                )?;
+                shard_outputs.push(
+                    tensor(&tensors, &format!("{name}_shard_output"))?
+                        .to_kind(Kind::Float)
+                        .to_device(device),
+                );
+            }
+            let gathered = Tensor::cat(&shard_outputs.iter().collect::<Vec<_>>(), 1);
+            let weight = tensor(&weights, weight_name)?
+                .to_kind(Kind::Float)
+                .to_device(device);
+            let mut full_output = input.matmul(&weight.transpose(0, 1));
+            if let Some(bias_name) = bias_name {
+                full_output += tensor(&weights, bias_name)?
                     .to_kind(Kind::Float)
-                    .to_device(device),
-            );
+                    .to_device(device);
+            }
+            let diff = diff_stats(&gathered, &full_output)?;
+            if diff.max_abs > 1e-5 {
+                bail!(
+                    "Qwen TP {name} shard parity failed: max_abs={}, mean_abs={}",
+                    diff.max_abs,
+                    diff.mean_abs
+                );
+            }
+            projection_summaries[projection_index].max_abs = Some(diff.max_abs);
+            projection_summaries[projection_index].mean_abs = Some(diff.mean_abs);
         }
-        let gathered = Tensor::cat(&shard_outputs.iter().collect::<Vec<_>>(), 1);
-        let full_output = input.matmul(&weight.transpose(0, 1));
-        let diff = diff_stats(&gathered, &full_output)?;
-        if diff.max_abs > 1e-5 {
-            bail!(
-                "Qwen TP linear shard parity failed: max_abs={}, mean_abs={}",
-                diff.max_abs,
-                diff.mean_abs
-            );
-        }
-        (Some(diff.max_abs), Some(diff.mean_abs))
-    } else {
-        (None, None)
-    };
+    }
 
     let summary = QwenTpLinearRankSummary {
         rank,
         world_size,
         local_rank,
         model_path: model_path.display().to_string(),
-        tensor_name: tensor_name.to_string(),
         input_shape: input.size(),
-        full_output_shape: vec![input.size()[0], output_size],
-        shard_output_shape: shard_output.size(),
-        shard_start,
-        shard_end: shard_start + shard_size,
-        max_abs,
-        mean_abs,
+        projections: projection_summaries,
     };
     let summary_path = output_dir.join(format!("qwen-tp-linear-rank-{rank}.json"));
     fs::write(&summary_path, serde_json::to_string_pretty(&summary)?)

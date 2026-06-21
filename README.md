@@ -121,9 +121,10 @@ GPU token plus ordinal for each rank in both `launch-summary.json` and
 all-reduce, toy DP gradient all-reduce, and `tch` autograd DP gradient smokes
 exist, including a `trainer::train` config path for tiny `tch` DP=2 and a
 focused real-Qwen layer0 attention DP gradient-signature smoke. A focused
-real-Qwen TP=2 linear smoke shards the real layer0 `q_proj` output dimension
-across two CUDA ranks and verifies the gathered shard output matches the full
-linear projection. Real multi-GPU Qwen training is not implemented yet.
+real-Qwen TP=2 linear smoke shards the real layer0 attention `q_proj`, `k_proj`,
+`v_proj`, and `o_proj` output dimensions across two CUDA ranks and verifies the
+gathered shard outputs match the full linear projections. Real multi-GPU Qwen
+training is not implemented yet.
 The Qwen DP smoke writes a rank0-only JSON checkpoint manifest after gradient
 sync succeeds; non-rank0 summaries record the same checkpoint path but do not
 write it.

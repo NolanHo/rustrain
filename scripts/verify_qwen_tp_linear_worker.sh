@@ -25,8 +25,9 @@ summaries = sorted(rank_dir.glob("qwen-tp-linear-rank-*.json"))
 if len(summaries) != 2:
     raise SystemExit(f"expected 2 TP rank summaries under {rank_dir}, found {len(summaries)}")
 
+expected_projection_names = ["q_proj", "k_proj", "v_proj", "o_proj"]
 evidence = []
-covered = []
+covered_by_projection = {name: [] for name in expected_projection_names}
 for path in summaries:
     data = json.loads(path.read_text())
     rank = int(data["rank"])
@@ -34,31 +35,54 @@ for path in summaries:
         raise SystemExit(f"{path} world_size {data['world_size']} != 2")
     if data["local_rank"] != rank:
         raise SystemExit(f"{path} local_rank {data['local_rank']} != rank {rank}")
-    shard_shape = data["shard_output_shape"]
-    full_shape = data["full_output_shape"]
-    if shard_shape[0] != full_shape[0]:
-        raise SystemExit(f"{path} batch dimension mismatch: shard={shard_shape}, full={full_shape}")
-    if shard_shape[1] * 2 != full_shape[1]:
-        raise SystemExit(f"{path} shard dimension {shard_shape[1]} is not half of full {full_shape[1]}")
-    covered.append((int(data["shard_start"]), int(data["shard_end"])))
-    if rank == 0:
-        if data["max_abs"] is None or data["mean_abs"] is None:
-            raise SystemExit(f"{path} rank0 missing parity diff fields")
-        if float(data["max_abs"]) > 1e-5:
-            raise SystemExit(f"{path} max_abs too large: {data['max_abs']}")
-    evidence.append(
-        {
-            "rank": rank,
-            "shard_start": data["shard_start"],
-            "shard_end": data["shard_end"],
-            "shard_output_shape": shard_shape,
-            "max_abs": data["max_abs"],
-        }
-    )
+    projections = data.get("projections")
+    if not isinstance(projections, list):
+        raise SystemExit(f"{path} missing projections list")
+    names = [projection.get("name") for projection in projections]
+    if names != expected_projection_names:
+        raise SystemExit(f"{path} projections {names} != {expected_projection_names}")
 
-covered.sort()
-if covered[0][0] != 0 or covered[0][1] != covered[1][0]:
-    raise SystemExit(f"TP shards are not contiguous: {covered}")
+    rank_evidence = {"rank": rank, "projections": []}
+    for projection in projections:
+        name = projection["name"]
+        shard_shape = projection["shard_output_shape"]
+        full_shape = projection["full_output_shape"]
+        if shard_shape[0] != full_shape[0]:
+            raise SystemExit(
+                f"{path} {name} batch dimension mismatch: shard={shard_shape}, full={full_shape}"
+            )
+        if shard_shape[1] * 2 != full_shape[1]:
+            raise SystemExit(
+                f"{path} {name} shard dimension {shard_shape[1]} is not half of full {full_shape[1]}"
+            )
+        covered_by_projection[name].append(
+            (int(projection["shard_start"]), int(projection["shard_end"]))
+        )
+        if rank == 0:
+            if projection["max_abs"] is None or projection["mean_abs"] is None:
+                raise SystemExit(f"{path} rank0 missing {name} parity diff fields")
+            if float(projection["max_abs"]) > 1e-5:
+                raise SystemExit(f"{path} {name} max_abs too large: {projection['max_abs']}")
+        else:
+            if projection["max_abs"] is not None or projection["mean_abs"] is not None:
+                raise SystemExit(f"{path} non-rank0 unexpectedly has {name} parity diff fields")
+        rank_evidence["projections"].append(
+            {
+                "name": name,
+                "shard_start": projection["shard_start"],
+                "shard_end": projection["shard_end"],
+                "shard_output_shape": shard_shape,
+                "max_abs": projection["max_abs"],
+            }
+        )
+    evidence.append(rank_evidence)
+
+for name, covered in covered_by_projection.items():
+    covered.sort()
+    if len(covered) != 2:
+        raise SystemExit(f"{name} expected two TP shards, found {covered}")
+    if covered[0][0] != 0 or covered[0][1] != covered[1][0]:
+        raise SystemExit(f"{name} TP shards are not contiguous: {covered}")
 
 launch_summary = json.loads((output_dir / "launch-summary.json").read_text())
 assigned = [rank["assigned_cuda_visible_device"] for rank in launch_summary["ranks"]]
