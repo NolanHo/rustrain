@@ -142,6 +142,8 @@ pub fn train(config_path: &Path, resume_from: Option<PathBuf>) -> Result<()> {
                 dataset_total_tokens = summary.dataset_total_tokens,
                 dataset_train_samples = summary.dataset_train_samples,
                 dataset_eval_samples = summary.dataset_eval_samples,
+                dataset_source_files = ?summary.dataset_source_files,
+                dataset_fingerprint = ?summary.dataset_fingerprint,
                 dataset_order_seed = summary.dataset_order_seed,
                 data_cursor_start = summary.data_cursor_start,
                 data_cursor_end = summary.data_cursor_end,
@@ -190,6 +192,12 @@ pub fn train(config_path: &Path, resume_from: Option<PathBuf>) -> Result<()> {
             }
             if let Some(dataset_eval_samples) = summary.dataset_eval_samples {
                 println!("dataset_eval_samples: {dataset_eval_samples}");
+            }
+            if let Some(dataset_source_files) = &summary.dataset_source_files {
+                println!("dataset_source_files: {dataset_source_files:?}");
+            }
+            if let Some(dataset_fingerprint) = &summary.dataset_fingerprint {
+                println!("dataset_fingerprint: {dataset_fingerprint}");
             }
             if let Some(dataset_order_seed) = summary.dataset_order_seed {
                 println!("dataset_order_seed: {dataset_order_seed}");
@@ -295,6 +303,8 @@ pub fn train(config_path: &Path, resume_from: Option<PathBuf>) -> Result<()> {
             dataset_response_tokens = summary.dataset_response_tokens,
             dataset_masked_positions = summary.dataset_masked_positions,
             dataset_max_sequence_tokens = summary.dataset_max_sequence_tokens,
+            dataset_source_files = ?summary.dataset_source_files,
+            dataset_fingerprint = summary.dataset_fingerprint,
             dataset_order_seed = summary.dataset_order_seed,
             data_cursor_start = summary.data_cursor_start,
             data_cursor_end = summary.data_cursor_end,
@@ -347,6 +357,8 @@ pub fn train(config_path: &Path, resume_from: Option<PathBuf>) -> Result<()> {
             "dataset_max_sequence_tokens: {}",
             summary.dataset_max_sequence_tokens
         );
+        println!("dataset_source_files: {:?}", summary.dataset_source_files);
+        println!("dataset_fingerprint: {}", summary.dataset_fingerprint);
         println!("dataset_order_seed: {}", summary.dataset_order_seed);
         println!("data_cursor_start: {}", summary.data_cursor_start);
         println!("data_cursor_end: {}", summary.data_cursor_end);

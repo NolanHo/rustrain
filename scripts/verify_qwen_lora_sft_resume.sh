@@ -38,6 +38,7 @@ cargo run -- train --config "${CONFIG}" --resume-from "${ADAPTER_MANIFEST}" \
 
 python - "${RESUME_OUTPUT}" "${EXPECTED_COMPUTE_KIND}" "${BASE_DATA_CURSOR_NEXT}" <<'PY'
 import ast
+import json
 import math
 import pathlib
 import sys
@@ -60,6 +61,8 @@ required = [
     "dataset_response_tokens",
     "dataset_masked_positions",
     "dataset_max_sequence_tokens",
+    "dataset_source_files",
+    "dataset_fingerprint",
     "dataset_order_seed",
     "data_cursor_start",
     "data_cursor_end",
@@ -108,6 +111,22 @@ for key in [
 ]:
     if int(values[key]) <= 0:
         raise SystemExit(f"{key} must be positive, got {values[key]}")
+dataset_source_files = ast.literal_eval(values["dataset_source_files"])
+if not dataset_source_files:
+    raise SystemExit("dataset_source_files must not be empty")
+if not all(str(path).endswith(".jsonl") for path in dataset_source_files):
+    raise SystemExit(f"dataset_source_files must only contain JSONL paths, got {dataset_source_files}")
+if not values["dataset_fingerprint"]:
+    raise SystemExit("dataset_fingerprint must not be empty")
+adapter_manifest = json.loads(pathlib.Path(values["adapter_manifest"]).read_text())
+if adapter_manifest.get("dataset_source_files") != dataset_source_files:
+    raise SystemExit(
+        f"adapter manifest dataset_source_files {adapter_manifest.get('dataset_source_files')} did not match summary {dataset_source_files}"
+    )
+if adapter_manifest.get("dataset_fingerprint") != values["dataset_fingerprint"]:
+    raise SystemExit(
+        f"adapter manifest dataset_fingerprint {adapter_manifest.get('dataset_fingerprint')} did not match summary {values['dataset_fingerprint']}"
+    )
 for key in ["initial_loss", "final_loss"]:
     if not math.isfinite(float(values[key])):
         raise SystemExit(f"{key} must be finite, got {values[key]}")

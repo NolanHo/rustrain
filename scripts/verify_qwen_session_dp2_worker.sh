@@ -55,6 +55,8 @@ for path in rank_summaries:
             "dataset_total_tokens",
             "dataset_train_samples",
             "dataset_eval_samples",
+            "dataset_source_files",
+            "dataset_fingerprint",
             "dataset_order_seed",
             "data_cursor_start",
             "data_cursor_end",
@@ -83,6 +85,15 @@ for path in rank_summaries:
         ]:
             if int(data[key]) <= 0:
                 raise SystemExit(f"{path} {key} must be positive, got {data[key]}")
+        dataset_source_files = data["dataset_source_files"]
+        if not dataset_source_files:
+            raise SystemExit(f"{path} dataset_source_files must not be empty")
+        if not all(str(source).endswith(".jsonl") for source in dataset_source_files):
+            raise SystemExit(
+                f"{path} dataset_source_files must only contain JSONL paths, got {dataset_source_files}"
+            )
+        if not data["dataset_fingerprint"]:
+            raise SystemExit(f"{path} dataset_fingerprint must not be empty")
         if int(data["dataset_order_seed"]) != int(expected_dataset_seed):
             raise SystemExit(
                 f"{path} dataset_order_seed {data['dataset_order_seed']} does not match expected {expected_dataset_seed}"
@@ -116,6 +127,14 @@ for path in rank_summaries:
                     f"{path} expected {offset_key} {expected_offset}, got {data[offset_key]} from {cursor_key}={cursor}"
                 )
         sharded_manifest = json.loads(pathlib.Path(data["sharded_global_manifest_output"]).read_text())
+        if sharded_manifest.get("dataset_source_files") != dataset_source_files:
+            raise SystemExit(
+                f"{path} sharded dataset_source_files {sharded_manifest.get('dataset_source_files')} does not match summary {dataset_source_files}"
+            )
+        if sharded_manifest.get("dataset_fingerprint") != data["dataset_fingerprint"]:
+            raise SystemExit(
+                f"{path} sharded dataset_fingerprint {sharded_manifest.get('dataset_fingerprint')} does not match summary {data['dataset_fingerprint']}"
+            )
         if int(sharded_manifest["consumed_samples"]) != expected_cursor_end:
             raise SystemExit(
                 f"{path} sharded consumed_samples {sharded_manifest['consumed_samples']} does not match expected {expected_cursor_end}"
@@ -136,6 +155,16 @@ for path in rank_summaries:
             raise SystemExit(
                 f"{path} sharded data_sample_offset_next {sharded_manifest['data_sample_offset_next']} does not match rank summary"
             )
+        if data["checkpoint_written"]:
+            rank0_manifest = json.loads(pathlib.Path(data["manifest_output"]).read_text())
+            if rank0_manifest.get("dataset_source_files") != dataset_source_files:
+                raise SystemExit(
+                    f"{path} rank0 manifest dataset_source_files {rank0_manifest.get('dataset_source_files')} does not match summary {dataset_source_files}"
+                )
+            if rank0_manifest.get("dataset_fingerprint") != data["dataset_fingerprint"]:
+                raise SystemExit(
+                    f"{path} rank0 manifest dataset_fingerprint {rank0_manifest.get('dataset_fingerprint')} does not match summary {data['dataset_fingerprint']}"
+                )
     evidence.append(
         {
             "rank": data["rank"],
@@ -143,6 +172,8 @@ for path in rank_summaries:
             "checkpoint_written": data["checkpoint_written"],
             "dataset_order_seed": data.get("dataset_order_seed"),
             "dataset_total_samples": data.get("dataset_total_samples"),
+            "dataset_source_files": data.get("dataset_source_files"),
+            "dataset_fingerprint": data.get("dataset_fingerprint"),
             "data_cursor_start": data.get("data_cursor_start"),
             "data_cursor_next": data.get("data_cursor_next"),
             "data_epoch_next": data.get("data_epoch_next"),

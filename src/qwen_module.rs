@@ -160,6 +160,8 @@ pub(crate) struct QwenLoraSftTrainSummary {
     pub(crate) dataset_response_tokens: usize,
     pub(crate) dataset_masked_positions: usize,
     pub(crate) dataset_max_sequence_tokens: usize,
+    pub(crate) dataset_source_files: Vec<String>,
+    pub(crate) dataset_fingerprint: String,
     pub(crate) dataset_order_seed: u64,
     pub(crate) data_cursor_start: usize,
     pub(crate) data_cursor_end: usize,
@@ -240,6 +242,10 @@ struct QwenLoraSftAdapterManifest {
     data_sample_offset_end: usize,
     #[serde(default)]
     data_sample_offset_next: usize,
+    #[serde(default)]
+    dataset_source_files: Vec<String>,
+    #[serde(default)]
+    dataset_fingerprint: String,
     dataset_order_seed: u64,
     dataset_total_samples: usize,
     dataset_train_samples: usize,
@@ -296,6 +302,8 @@ pub(crate) struct QwenFullTrainSmokeSummary {
     pub(crate) dataset_total_tokens: Option<usize>,
     pub(crate) dataset_train_samples: Option<usize>,
     pub(crate) dataset_eval_samples: Option<usize>,
+    pub(crate) dataset_source_files: Option<Vec<String>>,
+    pub(crate) dataset_fingerprint: Option<String>,
     pub(crate) dataset_order_seed: Option<u64>,
     pub(crate) data_cursor_start: Option<usize>,
     pub(crate) data_cursor_end: Option<usize>,
@@ -351,6 +359,8 @@ struct QwenSessionDpRankSummary {
     dataset_total_tokens: Option<usize>,
     dataset_train_samples: Option<usize>,
     dataset_eval_samples: Option<usize>,
+    dataset_source_files: Option<Vec<String>>,
+    dataset_fingerprint: Option<String>,
     dataset_order_seed: Option<u64>,
     data_cursor_start: Option<usize>,
     data_cursor_end: Option<usize>,
@@ -423,6 +433,10 @@ struct QwenSessionDpCheckpointManifest {
     data_sample_offset_end: Option<usize>,
     #[serde(default)]
     data_sample_offset_next: Option<usize>,
+    #[serde(default)]
+    dataset_source_files: Vec<String>,
+    #[serde(default)]
+    dataset_fingerprint: String,
     learning_rate: f64,
     delta_safetensors: String,
     optimizer_safetensors: String,
@@ -457,6 +471,8 @@ impl QwenSessionDpCheckpointManifest {
             data_sample_offset_start: self.data_sample_offset_start,
             data_sample_offset_end: self.data_sample_offset_end,
             data_sample_offset_next: self.data_sample_offset_next,
+            dataset_source_files: self.dataset_source_files.clone(),
+            dataset_fingerprint: self.dataset_fingerprint.clone(),
             learning_rate: self.learning_rate,
             initial_loss: self.expected_loss,
             final_loss: self.global_post_update_loss,
@@ -727,6 +743,10 @@ struct QwenDeltaCheckpointManifest {
     data_sample_offset_end: Option<usize>,
     #[serde(default)]
     data_sample_offset_next: Option<usize>,
+    #[serde(default)]
+    dataset_source_files: Vec<String>,
+    #[serde(default)]
+    dataset_fingerprint: String,
     learning_rate: f64,
     initial_loss: f64,
     final_loss: f64,
@@ -764,6 +784,10 @@ struct QwenShardedCheckpointManifest {
     data_sample_offset_next: Option<u64>,
     #[serde(default)]
     data_train_samples: Option<u64>,
+    #[serde(default)]
+    dataset_source_files: Vec<String>,
+    #[serde(default)]
+    dataset_fingerprint: String,
     seed: u64,
     dtype: String,
     optimizer: String,
@@ -860,6 +884,8 @@ struct QwenSessionBatchPlan {
     dataset_total_tokens: Option<usize>,
     dataset_train_samples: Option<usize>,
     dataset_eval_samples: Option<usize>,
+    dataset_source_files: Option<Vec<String>>,
+    dataset_fingerprint: Option<String>,
     dataset_order_seed: Option<u64>,
     train_sample_count: Option<usize>,
     data_epoch_start: Option<usize>,
@@ -879,6 +905,8 @@ struct QwenSessionDpBatchPlan {
     dataset_total_tokens: Option<usize>,
     dataset_train_samples: Option<usize>,
     dataset_eval_samples: Option<usize>,
+    dataset_source_files: Option<Vec<String>>,
+    dataset_fingerprint: Option<String>,
     dataset_order_seed: Option<u64>,
     train_sample_count: Option<usize>,
     data_epoch_start: Option<usize>,
@@ -951,6 +979,12 @@ struct QwenSftExample {
     response: String,
 }
 
+struct QwenSftExampleSet {
+    examples: Vec<QwenSftExample>,
+    source_files: Vec<String>,
+    fingerprint: String,
+}
+
 #[derive(Deserialize)]
 struct QwenSftRecord {
     instruction: String,
@@ -964,6 +998,8 @@ struct QwenSftDataset {
     samples: Vec<QwenSftTokenSample>,
     pad_token_id: i64,
     epoch_shuffle_seed: Option<u64>,
+    source_files: Vec<String>,
+    fingerprint: String,
 }
 
 struct QwenSftBatch {
@@ -982,6 +1018,8 @@ struct QwenSftDatasetSummary {
     response_tokens: usize,
     masked_positions: usize,
     max_sequence_tokens: usize,
+    source_files: Vec<String>,
+    fingerprint: String,
 }
 
 #[derive(Clone)]
@@ -1972,6 +2010,8 @@ fn qwen_lora_sft_train(
         data_sample_offset_start,
         data_sample_offset_end,
         data_sample_offset_next,
+        dataset_source_files: dataset_summary.source_files.clone(),
+        dataset_fingerprint: dataset_summary.fingerprint.clone(),
         dataset_order_seed: policy.dataset_order_seed,
         dataset_total_samples: dataset_summary.samples,
         dataset_train_samples: train_dataset.len(),
@@ -2123,6 +2163,8 @@ fn qwen_lora_sft_train(
         dataset_response_tokens: dataset_summary.response_tokens,
         dataset_masked_positions: dataset_summary.masked_positions,
         dataset_max_sequence_tokens: dataset_summary.max_sequence_tokens,
+        dataset_source_files: dataset_summary.source_files,
+        dataset_fingerprint: dataset_summary.fingerprint,
         dataset_order_seed: policy.dataset_order_seed,
         data_cursor_start,
         data_cursor_end,
@@ -2368,6 +2410,8 @@ fn qwen_full_train_summary(
         data_sample_offset_start: None,
         data_sample_offset_end: None,
         data_sample_offset_next: None,
+        dataset_source_files: Vec::new(),
+        dataset_fingerprint: String::new(),
         learning_rate,
         initial_loss,
         final_loss,
@@ -2437,6 +2481,8 @@ fn qwen_full_train_summary(
         dataset_total_tokens: None,
         dataset_train_samples: None,
         dataset_eval_samples: None,
+        dataset_source_files: None,
+        dataset_fingerprint: None,
         dataset_order_seed: None,
         data_cursor_start: None,
         data_cursor_end: None,
@@ -2624,6 +2670,8 @@ fn qwen_session_single_summary(
         data_sample_offset_start: batch_plan.data_sample_offset_start,
         data_sample_offset_end: batch_plan.data_sample_offset_end,
         data_sample_offset_next: batch_plan.data_sample_offset_next,
+        dataset_source_files: batch_plan.dataset_source_files.clone().unwrap_or_default(),
+        dataset_fingerprint: batch_plan.dataset_fingerprint.clone().unwrap_or_default(),
         learning_rate,
         initial_loss,
         final_loss,
@@ -2688,6 +2736,8 @@ fn qwen_session_single_summary(
         dataset_total_tokens: batch_plan.dataset_total_tokens,
         dataset_train_samples: batch_plan.dataset_train_samples,
         dataset_eval_samples: batch_plan.dataset_eval_samples,
+        dataset_source_files: batch_plan.dataset_source_files,
+        dataset_fingerprint: batch_plan.dataset_fingerprint,
         dataset_order_seed: batch_plan.dataset_order_seed,
         data_cursor_start: batch_plan.train_sample_count.map(|_| data_cursor_start),
         data_cursor_end: batch_plan.train_sample_count.map(|_| data_cursor_end),
@@ -3157,6 +3207,8 @@ pub fn qwen_session_dp_rank_smoke(
             data_sample_offset_start: batch_plan.data_sample_offset_start,
             data_sample_offset_end: batch_plan.data_sample_offset_end,
             data_sample_offset_next: batch_plan.data_sample_offset_next,
+            dataset_source_files: batch_plan.dataset_source_files.clone().unwrap_or_default(),
+            dataset_fingerprint: batch_plan.dataset_fingerprint.clone().unwrap_or_default(),
             learning_rate,
             delta_safetensors: delta_output.display().to_string(),
             optimizer_safetensors: optimizer_output.display().to_string(),
@@ -3290,6 +3342,8 @@ pub fn qwen_session_dp_rank_smoke(
             batch_plan.data_epoch_next,
             batch_plan.data_sample_offset_next,
             batch_plan.train_sample_count,
+            batch_plan.dataset_source_files.as_deref().unwrap_or(&[]),
+            batch_plan.dataset_fingerprint.as_deref().unwrap_or(""),
             &sharded_global_manifest_output,
         )?;
     }
@@ -3387,6 +3441,8 @@ pub fn qwen_session_dp_rank_smoke(
         dataset_total_tokens: batch_plan.dataset_total_tokens,
         dataset_train_samples: batch_plan.dataset_train_samples,
         dataset_eval_samples: batch_plan.dataset_eval_samples,
+        dataset_source_files: batch_plan.dataset_source_files,
+        dataset_fingerprint: batch_plan.dataset_fingerprint,
         dataset_order_seed: batch_plan.dataset_order_seed,
         data_cursor_start: batch_plan.train_sample_count.map(|_| data_cursor_start),
         data_cursor_end: batch_plan.train_sample_count.map(|_| data_cursor_end),
@@ -3544,6 +3600,8 @@ fn write_qwen_session_dp_global_sharded_manifest(
     data_epoch_next: Option<usize>,
     data_sample_offset_next: Option<usize>,
     data_train_samples: Option<usize>,
+    dataset_source_files: &[String],
+    dataset_fingerprint: &str,
     manifest_output: &Path,
 ) -> Result<()> {
     let mut ranks = Vec::with_capacity(world_size);
@@ -3573,6 +3631,8 @@ fn write_qwen_session_dp_global_sharded_manifest(
         data_epoch_next: data_epoch_next.map(|value| value as u64),
         data_sample_offset_next: data_sample_offset_next.map(|value| value as u64),
         data_train_samples: data_train_samples.map(|value| value as u64),
+        dataset_source_files: dataset_source_files.to_vec(),
+        dataset_fingerprint: dataset_fingerprint.to_string(),
         seed: 42,
         dtype: dtype.label().to_string(),
         optimizer: "adamw".to_string(),
@@ -3632,6 +3692,8 @@ fn qwen_sharded_rank_to_delta_manifest(
             .data_sample_offset_next
             .map(|value| usize::try_from(value).context("data_sample_offset_next overflowed usize"))
             .transpose()?,
+        dataset_source_files: manifest.dataset_source_files.clone(),
+        dataset_fingerprint: manifest.dataset_fingerprint.clone(),
         learning_rate,
         initial_loss,
         final_loss,
@@ -4617,6 +4679,8 @@ fn qwen_session_fixed_batch_plan(
         dataset_total_tokens: None,
         dataset_train_samples: None,
         dataset_eval_samples: None,
+        dataset_source_files: None,
+        dataset_fingerprint: None,
         dataset_order_seed: None,
         train_sample_count: None,
         data_epoch_start: None,
@@ -4686,6 +4750,8 @@ fn qwen_session_batch_plan_from_config(
         dataset_total_tokens: Some(dataset_summary.total_tokens),
         dataset_train_samples: Some(train_dataset.len()),
         dataset_eval_samples: Some(eval_dataset.len()),
+        dataset_source_files: Some(dataset_summary.source_files),
+        dataset_fingerprint: Some(dataset_summary.fingerprint),
         dataset_order_seed: Some(runtime_config.run.seed),
         train_sample_count: Some(train_dataset.len()),
         data_epoch_start: Some(data_epoch_start),
@@ -4714,6 +4780,8 @@ fn qwen_session_fixed_dp_batch_plan(
         dataset_total_tokens: None,
         dataset_train_samples: None,
         dataset_eval_samples: None,
+        dataset_source_files: None,
+        dataset_fingerprint: None,
         dataset_order_seed: None,
         train_sample_count: None,
         data_epoch_start: None,
@@ -4785,6 +4853,8 @@ fn qwen_session_dp_batch_plan_from_config(
         dataset_total_tokens: Some(dataset_summary.total_tokens),
         dataset_train_samples: Some(train_dataset.len()),
         dataset_eval_samples: Some(eval_dataset.len()),
+        dataset_source_files: Some(dataset_summary.source_files),
+        dataset_fingerprint: Some(dataset_summary.fingerprint),
         dataset_order_seed: Some(runtime_config.run.seed),
         train_sample_count: Some(train_dataset.len()),
         data_epoch_start: Some(data_epoch_start),
@@ -6027,11 +6097,28 @@ impl QwenSftDataset {
             samples,
             pad_token_id: qwen_pad_token_id(tokenizer),
             epoch_shuffle_seed: None,
+            source_files: Vec::new(),
+            fingerprint: qwen_sft_dataset_fingerprint(&[], examples),
         })
     }
 
     fn from_jsonl_paths(tokenizer: &Tokenizer, paths: &[PathBuf]) -> Result<Self> {
-        Self::from_instruction_pairs(tokenizer, &qwen_sft_examples_from_jsonl_paths(paths)?)
+        let example_set = qwen_sft_examples_from_jsonl_paths(paths)?;
+        if example_set.examples.is_empty() {
+            bail!("SFT dataset must contain at least one example");
+        }
+        let samples = example_set
+            .examples
+            .iter()
+            .map(|example| qwen_sft_token_sample(tokenizer, example))
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Self {
+            samples,
+            pad_token_id: qwen_pad_token_id(tokenizer),
+            epoch_shuffle_seed: None,
+            source_files: example_set.source_files,
+            fingerprint: example_set.fingerprint,
+        })
     }
 
     fn train_eval_split(&self, train_split: f32) -> Result<(Self, Self)> {
@@ -6048,11 +6135,15 @@ impl QwenSftDataset {
                 samples: self.samples[..split_at].to_vec(),
                 pad_token_id: self.pad_token_id,
                 epoch_shuffle_seed: self.epoch_shuffle_seed,
+                source_files: self.source_files.clone(),
+                fingerprint: self.fingerprint.clone(),
             },
             Self {
                 samples: self.samples[split_at..].to_vec(),
                 pad_token_id: self.pad_token_id,
                 epoch_shuffle_seed: self.epoch_shuffle_seed,
+                source_files: self.source_files.clone(),
+                fingerprint: self.fingerprint.clone(),
             },
         ))
     }
@@ -6088,6 +6179,8 @@ impl QwenSftDataset {
                 .map(|sample| sample.token_ids.len())
                 .max()
                 .unwrap_or(0),
+            source_files: self.source_files.clone(),
+            fingerprint: self.fingerprint.clone(),
         }
     }
 
@@ -6138,44 +6231,35 @@ fn qwen_epoch_permutation_index(
     order[offset]
 }
 
-fn qwen_sft_examples_from_jsonl_paths(paths: &[PathBuf]) -> Result<Vec<QwenSftExample>> {
+fn qwen_sft_examples_from_jsonl_paths(paths: &[PathBuf]) -> Result<QwenSftExampleSet> {
     if paths.is_empty() {
         bail!("SFT dataset must contain at least one JSONL path");
     }
     let mut examples = Vec::new();
+    let mut source_files = BTreeSet::new();
     for path in paths {
-        examples.extend(qwen_sft_examples_from_jsonl_path(path)?);
+        let example_set = qwen_sft_examples_from_jsonl_path(path)?;
+        examples.extend(example_set.examples);
+        source_files.extend(example_set.source_files);
     }
-    Ok(examples)
+    let source_files = source_files.into_iter().collect::<Vec<_>>();
+    let fingerprint = qwen_sft_dataset_fingerprint(&source_files, &examples);
+    Ok(QwenSftExampleSet {
+        examples,
+        source_files,
+        fingerprint,
+    })
 }
 
-fn qwen_sft_examples_from_jsonl_path(path: &Path) -> Result<Vec<QwenSftExample>> {
-    let mut files = Vec::new();
-    if path.is_dir() {
-        let mut sorted = BTreeSet::new();
-        for entry in
-            fs::read_dir(path).with_context(|| format!("failed to list {}", path.display()))?
-        {
-            let entry =
-                entry.with_context(|| format!("failed to read entry in {}", path.display()))?;
-            let file_type = entry
-                .file_type()
-                .with_context(|| format!("failed to inspect {}", entry.path().display()))?;
-            if file_type.is_file() {
-                sorted.insert(entry.path());
-            }
-        }
-        files.extend(sorted);
-    } else {
-        files.push(path.to_path_buf());
-    }
+fn qwen_sft_examples_from_jsonl_path(path: &Path) -> Result<QwenSftExampleSet> {
+    let files = qwen_sft_jsonl_files(path)?;
 
     if files.is_empty() {
         bail!("SFT JSONL path {} did not contain files", path.display());
     }
 
     let mut examples = Vec::new();
-    for file in files {
+    for file in &files {
         let contents = fs::read_to_string(&file)
             .with_context(|| format!("failed to read {}", file.display()))?;
         for (line_index, line) in contents.lines().enumerate() {
@@ -6200,7 +6284,65 @@ fn qwen_sft_examples_from_jsonl_path(path: &Path) -> Result<Vec<QwenSftExample>>
     if examples.is_empty() {
         bail!("SFT JSONL path {} did not contain examples", path.display());
     }
-    Ok(examples)
+    let source_files = files
+        .iter()
+        .map(|file| file.display().to_string())
+        .collect::<Vec<_>>();
+    let fingerprint = qwen_sft_dataset_fingerprint(&source_files, &examples);
+    Ok(QwenSftExampleSet {
+        examples,
+        source_files,
+        fingerprint,
+    })
+}
+
+fn qwen_sft_jsonl_files(path: &Path) -> Result<Vec<PathBuf>> {
+    if path.is_dir() {
+        let mut sorted = BTreeSet::new();
+        for entry in
+            fs::read_dir(path).with_context(|| format!("failed to list {}", path.display()))?
+        {
+            let entry =
+                entry.with_context(|| format!("failed to read entry in {}", path.display()))?;
+            let file_type = entry
+                .file_type()
+                .with_context(|| format!("failed to inspect {}", entry.path().display()))?;
+            if file_type.is_file()
+                && entry.path().extension().and_then(|value| value.to_str()) == Some("jsonl")
+            {
+                sorted.insert(entry.path());
+            }
+        }
+        Ok(sorted.into_iter().collect())
+    } else {
+        Ok(vec![path.to_path_buf()])
+    }
+}
+
+fn qwen_sft_dataset_fingerprint(source_files: &[String], examples: &[QwenSftExample]) -> String {
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    for file in source_files {
+        qwen_sft_hash_bytes(&mut hash, b"path");
+        qwen_sft_hash_bytes(&mut hash, file.as_bytes());
+        qwen_sft_hash_bytes(&mut hash, b"\0");
+    }
+    for example in examples {
+        qwen_sft_hash_bytes(&mut hash, b"instruction");
+        qwen_sft_hash_bytes(&mut hash, example.instruction.as_bytes());
+        qwen_sft_hash_bytes(&mut hash, b"\0input");
+        qwen_sft_hash_bytes(&mut hash, example.input.as_bytes());
+        qwen_sft_hash_bytes(&mut hash, b"\0response");
+        qwen_sft_hash_bytes(&mut hash, example.response.as_bytes());
+        qwen_sft_hash_bytes(&mut hash, b"\0");
+    }
+    format!("{hash:016x}")
+}
+
+fn qwen_sft_hash_bytes(hash: &mut u64, bytes: &[u8]) {
+    for byte in bytes {
+        *hash ^= u64::from(*byte);
+        *hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
 }
 
 fn qwen_sft_token_sample(
@@ -6762,6 +6904,8 @@ mod tests {
             data_sample_offset_start: None,
             data_sample_offset_end: None,
             data_sample_offset_next: None,
+            dataset_source_files: Vec::new(),
+            dataset_fingerprint: String::new(),
             learning_rate: 1e-6,
             initial_loss: 2.0,
             final_loss: 1.5,
@@ -6874,6 +7018,8 @@ mod tests {
             Some(2),
             Some(2),
             Some(5),
+            &manifest.dataset_source_files,
+            &manifest.dataset_fingerprint,
             &output,
         )
         .expect("global manifest should write");
@@ -6891,6 +7037,8 @@ mod tests {
         assert_eq!(decoded.data_epoch_next, Some(2));
         assert_eq!(decoded.data_sample_offset_next, Some(2));
         assert_eq!(decoded.data_train_samples, Some(5));
+        assert_eq!(decoded.dataset_source_files, manifest.dataset_source_files);
+        assert_eq!(decoded.dataset_fingerprint, manifest.dataset_fingerprint);
         assert_eq!(decoded.ranks.len(), 2);
     }
 
@@ -7068,6 +7216,8 @@ mod tests {
             data_sample_offset_start: None,
             data_sample_offset_end: None,
             data_sample_offset_next: None,
+            dataset_source_files: Vec::new(),
+            dataset_fingerprint: String::new(),
             learning_rate,
             initial_loss,
             final_loss,
@@ -7183,6 +7333,8 @@ mod tests {
             data_sample_offset_start: None,
             data_sample_offset_end: None,
             data_sample_offset_next: None,
+            dataset_source_files: Vec::new(),
+            dataset_fingerprint: String::new(),
             learning_rate,
             initial_loss: first_step.loss_before,
             final_loss: first_step.loss_after,
@@ -7709,6 +7861,8 @@ mod tests {
             ],
             pad_token_id: 0,
             epoch_shuffle_seed: None,
+            source_files: Vec::new(),
+            fingerprint: String::new(),
         };
 
         let batch = dataset
@@ -7748,6 +7902,8 @@ mod tests {
                 .collect(),
             pad_token_id: 0,
             epoch_shuffle_seed: None,
+            source_files: Vec::new(),
+            fingerprint: String::new(),
         };
 
         let (train, eval) = dataset
@@ -7782,6 +7938,8 @@ mod tests {
                 .collect(),
             pad_token_id: 0,
             epoch_shuffle_seed: None,
+            source_files: Vec::new(),
+            fingerprint: String::new(),
         };
 
         let summary = dataset.summary();
@@ -7827,6 +7985,8 @@ mod tests {
                 .collect(),
             pad_token_id: 0,
             epoch_shuffle_seed: None,
+            source_files: Vec::new(),
+            fingerprint: String::new(),
         }
         .shuffle_by_seed(777);
 
@@ -7908,10 +8068,13 @@ mod tests {
         )
         .expect("jsonl should write");
 
-        let examples =
+        let example_set =
             qwen_sft_examples_from_jsonl_path(&jsonl).expect("examples should load from jsonl");
+        let examples = &example_set.examples;
 
         assert_eq!(examples.len(), 2);
+        assert_eq!(example_set.source_files, vec![jsonl.display().to_string()]);
+        assert!(!example_set.fingerprint.is_empty());
         assert_eq!(examples[0].instruction, "Reply with the project name.");
         assert_eq!(examples[0].input, "");
         assert_eq!(examples[0].response, "rustrain");
@@ -7928,6 +8091,7 @@ mod tests {
         fs::create_dir(&dir).expect("shard dir should be created");
         let second = dir.join("b.jsonl");
         let third = dir.join("a.jsonl");
+        let ignored = dir.join("ignored.txt");
         fs::write(
             &first,
             r#"{"instruction":"first","response":"one"}
@@ -7946,11 +8110,26 @@ mod tests {
 "#,
         )
         .expect("third jsonl should write");
+        fs::write(
+            &ignored,
+            r#"{"instruction":"ignored","response":"ignored"}
+"#,
+        )
+        .expect("ignored file should write");
 
-        let examples = qwen_sft_examples_from_jsonl_paths(&[first, dir])
+        let example_set = qwen_sft_examples_from_jsonl_paths(&[first.clone(), dir.clone()])
             .expect("examples should aggregate from multiple paths");
+        let examples = &example_set.examples;
 
         assert_eq!(examples.len(), 3);
+        assert_eq!(example_set.source_files.len(), 3);
+        assert!(
+            example_set
+                .source_files
+                .iter()
+                .all(|path| path.ends_with(".jsonl"))
+        );
+        assert!(!example_set.fingerprint.is_empty());
         assert_eq!(examples[0].instruction, "first");
         assert_eq!(examples[1].instruction, "second");
         assert_eq!(examples[2].instruction, "third");
@@ -7999,6 +8178,8 @@ mod tests {
             data_epoch_next: Some(1),
             data_sample_offset_next: Some(3),
             data_train_samples: Some(5),
+            dataset_source_files: vec!["data/train.jsonl".to_string()],
+            dataset_fingerprint: "abc123".to_string(),
             seed: 42,
             dtype: "float32".to_string(),
             optimizer: "adamw".to_string(),
