@@ -112,17 +112,20 @@ layer0 attention DP smoke, not trainer-owned full-Qwen distributed training.
 The `QwenTrainableSession` path also has a representative DP rank smoke: it
 runs rank-local Qwen forward/backward on CUDA, all-reduces 13 representative
 layer0/norm/MLP gradients with NCCL, applies multi-step averaged AdamW updates,
-and checks global loss improvement. The same representative path is wired
-through `train --config configs/qwen_session_dp2.toml`; full production Qwen
-trainer ownership, real data batching, and distributed checkpoint/resume rules
+checks global loss improvement, writes rank0 delta and AdamW optimizer
+safetensors, and verifies next-step resume parity from that rank0 checkpoint.
+The same representative path is wired through
+`train --config configs/qwen_session_dp2.toml`; full production Qwen trainer
+ownership, real data batching, and sharded distributed checkpoint/resume rules
 remain open.
 
 ## Current Major Gaps
 
 - G5 representative checkpoint resume is implemented for the Qwen full-train
   smoke: manifest-driven reload restores delta tensors plus Adam optimizer
-  slots and proves next-step parity. Distributed checkpoint layout is still
-  open.
+  slots and proves next-step parity. The representative Qwen DP trainer path
+  also has rank0 delta/optimizer artifacts and next-step resume parity. A
+  production sharded checkpoint layout is still open.
 - C4/G1 trainer-owned Qwen training is still incomplete, but the full-train
   smoke now uses a reusable `QwenTrainableSession` surface and a representative
   DP config path is wired through `train --config`. Full model/data/checkpoint
@@ -139,9 +142,10 @@ remain open.
 - G4 launcher process management plus NCCL scalar, toy DP gradient, `tch`
   autograd DP=2 trainer smokes, focused multi-step Qwen layer0 attention DP,
   representative `QwenTrainableSession` DP smokes, and a representative Qwen
-  DP `train --config` path exist. Real production distributed training is still
-  missing: full Qwen model/data/checkpoint ownership is not yet implemented.
-- Distributed checkpoint layout is not defined.
+  DP `train --config` path with rank0 checkpoint/resume parity exist. Real
+  production distributed training is still missing: full Qwen model/data and
+  sharded checkpoint ownership are not yet implemented.
+- Production distributed checkpoint layout is not defined.
 - Trainer production basics such as scheduler, grad clipping, RSS memory
   metrics, and Ray-worker GPU memory reporting are implemented for toy/tch
   paths; real tokenizer-backed padded LoRA SFT batching exists, and the tiny

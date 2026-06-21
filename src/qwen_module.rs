@@ -175,7 +175,7 @@ struct QwenTiedHeadTrainSummary {
     grad_norm: f64,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 struct TrainableTensorSummary {
     name: String,
     grad_defined: bool,
@@ -243,12 +243,21 @@ struct QwenSessionDpRankSummary {
     expected_loss: f64,
     checkpoint_written: bool,
     checkpoint_path: String,
+    delta_output: String,
+    optimizer_output: String,
+    manifest_output: String,
+    reloaded_loss: f64,
+    reload_delta: f64,
+    continuous_next_loss: f64,
+    resumed_next_loss: f64,
+    next_step_delta: f64,
     trainable_tensors: Vec<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 struct QwenSessionDpCheckpointManifest {
     format: String,
+    base_model_path: String,
     writer_rank: usize,
     world_size: usize,
     tensor_count: usize,
@@ -256,11 +265,38 @@ struct QwenSessionDpCheckpointManifest {
     expected_loss: f64,
     dtype: String,
     steps: usize,
+    train_step: u64,
     learning_rate: f64,
+    delta_safetensors: String,
+    optimizer_safetensors: String,
     post_update_loss: f64,
     global_post_update_loss: f64,
     global_step_losses: Vec<f64>,
     trainable_tensors: Vec<String>,
+    tensors: Vec<QwenDeltaTensorManifestEntry>,
+}
+
+impl QwenSessionDpCheckpointManifest {
+    fn to_delta_manifest(&self) -> Result<QwenDeltaCheckpointManifest> {
+        if self.format != "rustrain.qwen_session_dp_rank0.v1" {
+            bail!(
+                "unsupported Qwen session DP checkpoint format {}",
+                self.format
+            );
+        }
+        Ok(QwenDeltaCheckpointManifest {
+            format: "rustrain.qwen_delta.v1".to_string(),
+            base_model_path: self.base_model_path.clone(),
+            reference_fixture: "qwen_session_dp_global_input".to_string(),
+            delta_safetensors: self.delta_safetensors.clone(),
+            optimizer_safetensors: Some(self.optimizer_safetensors.clone()),
+            train_step: self.train_step,
+            learning_rate: self.learning_rate,
+            initial_loss: self.expected_loss,
+            final_loss: self.global_post_update_loss,
+            tensors: self.tensors.clone(),
+        })
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -301,7 +337,7 @@ struct QwenDeltaCheckpointManifest {
     tensors: Vec<QwenDeltaTensorManifestEntry>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct QwenDeltaTensorManifestEntry {
     name: String,
     delta_name: String,
@@ -1570,7 +1606,7 @@ pub fn qwen_session_dp_rank_smoke(
     let mut local_session = QwenTrainableSession::from_names_on_device(
         config,
         weights,
-        local_input,
+        local_input.shallow_clone(),
         dtype.kind(),
         trainable_names.clone(),
         device,
@@ -1642,6 +1678,7 @@ pub fn qwen_session_dp_rank_smoke(
     let mut global_step_losses = vec![global_loss];
     let mut post_update_loss = local_loss;
     let mut trainable_summaries = Vec::new();
+    let mut last_artifacts: Option<QwenTrainStepArtifacts> = None;
     for step in 0..steps {
         if step > 0 {
             println!("qwen session DP rank {rank}: running backward for step {step}");
@@ -1654,7 +1691,8 @@ pub fn qwen_session_dp_rank_smoke(
         )?;
         let artifacts =
             local_session.apply_adamw_step(&averaged_grads, learning_rate, (step + 1) as i32)?;
-        trainable_summaries = artifacts.tensor_summaries;
+        trainable_summaries = artifacts.tensor_summaries.clone();
+        last_artifacts = Some(artifacts);
         post_update_loss = local_session.loss_value()?;
         wait_for_rank_barrier(
             &output_dir.join(format!(
@@ -1679,12 +1717,31 @@ pub fn qwen_session_dp_rank_smoke(
             "Qwen session DP AdamW update did not reduce global loss: rank={rank}, global_loss={global_loss}, global_post_update_loss={global_post_update_loss}"
         );
     }
+    let last_artifacts =
+        last_artifacts.context("missing Qwen session DP artifacts from final training step")?;
 
     let trainable_tensors = local_session.parameter_names();
     let checkpoint_path = output_dir.join("qwen-session-dp-rank0-checkpoint.json");
+    let delta_output = output_dir.join("qwen-session-dp-rank0-delta.safetensors");
+    let optimizer_output = optimizer_state_path(&delta_output);
     let checkpoint_written = if rank == 0 {
+        let delta_refs: Vec<(&str, &Tensor)> = last_artifacts
+            .delta_entries
+            .iter()
+            .map(|(name, tensor)| (name.as_str(), tensor))
+            .collect();
+        Tensor::write_safetensors(&delta_refs, &delta_output)
+            .with_context(|| format!("failed to write {}", delta_output.display()))?;
+        let optimizer_refs: Vec<(&str, &Tensor)> = last_artifacts
+            .optimizer_entries
+            .iter()
+            .map(|(name, tensor)| (name.as_str(), tensor))
+            .collect();
+        Tensor::write_safetensors(&optimizer_refs, &optimizer_output)
+            .with_context(|| format!("failed to write {}", optimizer_output.display()))?;
         let manifest = QwenSessionDpCheckpointManifest {
             format: "rustrain.qwen_session_dp_rank0.v1".to_string(),
+            base_model_path: model_path.display().to_string(),
             writer_rank: rank,
             world_size,
             tensor_count: local_grads.len(),
@@ -1692,11 +1749,15 @@ pub fn qwen_session_dp_rank_smoke(
             expected_loss,
             dtype: dtype.label().to_string(),
             steps,
+            train_step: steps as u64,
             learning_rate,
+            delta_safetensors: delta_output.display().to_string(),
+            optimizer_safetensors: optimizer_output.display().to_string(),
             post_update_loss,
             global_post_update_loss,
             global_step_losses: global_step_losses.clone(),
             trainable_tensors: trainable_tensors.clone(),
+            tensors: last_artifacts.manifest_tensors.clone(),
         };
         fs::write(
             &checkpoint_path,
@@ -1707,6 +1768,56 @@ pub fn qwen_session_dp_rank_smoke(
     } else {
         false
     };
+    wait_for_rank_barrier(
+        &output_dir.join("qwen-session-dp-rank0-checkpoint-written"),
+        rank,
+        world_size,
+        Duration::from_secs(300),
+    )?;
+    let checkpoint_text = fs::read_to_string(&checkpoint_path)
+        .with_context(|| format!("failed to read {}", checkpoint_path.display()))?;
+    let checkpoint_manifest: QwenSessionDpCheckpointManifest =
+        serde_json::from_str(&checkpoint_text)
+            .with_context(|| format!("failed to parse {}", checkpoint_path.display()))?;
+    let mut delta_manifest = checkpoint_manifest.to_delta_manifest()?;
+    delta_manifest.delta_safetensors = delta_output.display().to_string();
+    delta_manifest.optimizer_safetensors = Some(optimizer_output.display().to_string());
+    let mut resumed_session = QwenTrainableSession::from_manifest_on_device(
+        config,
+        read_safetensors_map(&model_path.join("model.safetensors"))?,
+        local_input.shallow_clone(),
+        dtype.kind(),
+        &delta_manifest,
+        Some(device),
+    )?;
+    let reloaded_loss = resumed_session.loss_value()?;
+    let reload_delta = (post_update_loss - reloaded_loss).abs();
+    if reload_delta > 1e-5 {
+        bail!(
+            "Qwen session DP rank0 checkpoint reload parity failed: rank={rank}, post_update_loss={post_update_loss}, reloaded_loss={reloaded_loss}, reload_delta={reload_delta}"
+        );
+    }
+
+    local_session.loss_and_backward()?;
+    resumed_session.loss_and_backward()?;
+    let continuous_next_grads = local_session.all_reduce_average_grads(
+        &output_dir.join("qwen-session-dp-continuous-next-gradient"),
+        world_size,
+    )?;
+    let resumed_next_grads = resumed_session.all_reduce_average_grads(
+        &output_dir.join("qwen-session-dp-resumed-next-gradient"),
+        world_size,
+    )?;
+    local_session.apply_adamw_step(&continuous_next_grads, learning_rate, (steps + 1) as i32)?;
+    resumed_session.apply_adamw_step(&resumed_next_grads, learning_rate, (steps + 1) as i32)?;
+    let continuous_next_loss = local_session.loss_value()?;
+    let resumed_next_loss = resumed_session.loss_value()?;
+    let next_step_delta = (continuous_next_loss - resumed_next_loss).abs();
+    if next_step_delta > 1e-5 {
+        bail!(
+            "Qwen session DP rank0 checkpoint resume parity failed: rank={rank}, continuous_next_loss={continuous_next_loss}, resumed_next_loss={resumed_next_loss}, next_step_delta={next_step_delta}"
+        );
+    }
 
     let summary = QwenSessionDpRankSummary {
         rank,
@@ -1726,6 +1837,14 @@ pub fn qwen_session_dp_rank_smoke(
         expected_loss,
         checkpoint_written,
         checkpoint_path: checkpoint_path.display().to_string(),
+        delta_output: delta_output.display().to_string(),
+        optimizer_output: optimizer_output.display().to_string(),
+        manifest_output: checkpoint_path.display().to_string(),
+        reloaded_loss,
+        reload_delta,
+        continuous_next_loss,
+        resumed_next_loss,
+        next_step_delta,
         trainable_tensors,
     };
     let summary_path = output_dir.join(format!("qwen-session-dp-rank-{rank}.json"));
@@ -1973,8 +2092,11 @@ impl QwenTrainableRegistry {
         manifest_tensors: &[QwenDeltaTensorManifestEntry],
     ) -> Result<()> {
         for entry in manifest_tensors {
-            let reloaded = tensor(weights, &entry.name)?.to_kind(Kind::Float)
-                + tensor(delta_tensors, &entry.delta_name)?.to_kind(Kind::Float);
+            let base = tensor(weights, &entry.name)?.to_kind(Kind::Float);
+            let delta = tensor(delta_tensors, &entry.delta_name)?
+                .to_kind(Kind::Float)
+                .to_device(base.device());
+            let reloaded = base + delta;
             weights.insert(entry.name.clone(), reloaded);
         }
         Ok(())
@@ -2001,10 +2123,10 @@ impl QwenTrainableRegistry {
         let mut parameters = Vec::with_capacity(manifest.tensors.len());
         for entry in &manifest.tensors {
             let reloaded = tensor(weights, &entry.name)?.to_kind(Kind::Float);
-            let base = tensor_snapshot(
-                &(reloaded.shallow_clone()
-                    - tensor(&delta_tensors, &entry.delta_name)?.to_kind(Kind::Float)),
-            );
+            let delta = tensor(&delta_tensors, &entry.delta_name)?
+                .to_kind(Kind::Float)
+                .to_device(reloaded.device());
+            let base = tensor_snapshot(&(reloaded.shallow_clone() - delta));
             let trainable = reloaded.set_requires_grad(true);
             weights.insert(entry.name.clone(), trainable.shallow_clone());
             let adam = match (
@@ -2013,8 +2135,12 @@ impl QwenTrainableRegistry {
                 entry.adam_v_name.as_ref(),
             ) {
                 (Some(optimizer_tensors), Some(m_name), Some(v_name)) => Some(AdamState {
-                    m: tensor(optimizer_tensors, m_name)?.to_kind(Kind::Float),
-                    v: tensor(optimizer_tensors, v_name)?.to_kind(Kind::Float),
+                    m: tensor(optimizer_tensors, m_name)?
+                        .to_kind(Kind::Float)
+                        .to_device(trainable.device()),
+                    v: tensor(optimizer_tensors, v_name)?
+                        .to_kind(Kind::Float)
+                        .to_device(trainable.device()),
                 }),
                 (None, None, None) => None,
                 _ => bail!(
@@ -2080,19 +2206,38 @@ impl QwenTrainableSession {
 
     fn from_manifest(
         config: QwenRuntimeConfig,
-        mut weights: BTreeMap<String, Tensor>,
+        weights: BTreeMap<String, Tensor>,
         input_ids: Tensor,
         compute_kind: Kind,
         manifest: &QwenDeltaCheckpointManifest,
     ) -> Result<Self> {
+        Self::from_manifest_on_device(config, weights, input_ids, compute_kind, manifest, None)
+    }
+
+    fn from_manifest_on_device(
+        config: QwenRuntimeConfig,
+        mut weights: BTreeMap<String, Tensor>,
+        input_ids: Tensor,
+        compute_kind: Kind,
+        manifest: &QwenDeltaCheckpointManifest,
+        device: Option<Device>,
+    ) -> Result<Self> {
         if input_ids.size()[1] < 2 {
             bail!("training fixture must contain at least two tokens");
+        }
+        if let Some(device) = device {
+            for tensor in weights.values_mut() {
+                *tensor = tensor.to_device(device);
+            }
         }
         let registry = QwenTrainableRegistry::load_from_manifest(&mut weights, manifest)?;
         Ok(Self {
             config,
             weights,
-            input_ids,
+            input_ids: match device {
+                Some(device) => input_ids.to_device(device),
+                None => input_ids,
+            },
             compute_kind,
             registry,
         })
