@@ -179,9 +179,9 @@ rules remain open.
   metrics, and Ray-worker GPU memory reporting are implemented for toy/tch
   paths; real tokenizer-backed padded LoRA SFT batching is wired through a
   minimal Qwen trainer config with scheduler and grad clipping, and the tiny
-  `tch` CUDA path plus the representative Qwen full-train smoke have explicit
-  bf16 compute policy smokes. General trainer mixed-precision ownership is
-  still future work.
+  `tch` CUDA path plus representative Qwen `train --config` session paths have
+  explicit bf16 compute policy smokes. General trainer mixed-precision ownership
+  across all production paths is still future work.
 
 Internal planning details live in `_internal_docs/TODO.md`; that directory is
 ignored by git.
