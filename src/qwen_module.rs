@@ -436,11 +436,13 @@ struct QwenLoraConfig {
     alpha: i64,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 #[serde(rename_all = "snake_case")]
 enum QwenLoraTargetModule {
     QProj,
+    KProj,
     VProj,
+    OProj,
 }
 
 struct QwenLoraRegistry {
@@ -3152,29 +3154,56 @@ struct QwenLayerCache {
 }
 
 struct QwenAttentionLoraAdapter {
-    q_a: Tensor,
-    q_b: Tensor,
-    v_a: Tensor,
-    v_b: Tensor,
+    modules: BTreeMap<QwenLoraTargetModule, QwenLoraModuleAdapter>,
     rank: i64,
     alpha: f64,
+}
+
+struct QwenLoraModuleAdapter {
+    a: Tensor,
+    b: Tensor,
 }
 
 impl QwenLoraTargetModule {
     fn as_str(self) -> &'static str {
         match self {
             Self::QProj => "q_proj",
+            Self::KProj => "k_proj",
             Self::VProj => "v_proj",
+            Self::OProj => "o_proj",
         }
     }
 
     fn parse(value: &str) -> Result<Self> {
         match value {
             "q_proj" => Ok(Self::QProj),
+            "k_proj" => Ok(Self::KProj),
             "v_proj" => Ok(Self::VProj),
+            "o_proj" => Ok(Self::OProj),
             other => {
-                bail!("unsupported Qwen LoRA target module {other}; supported: q_proj, v_proj")
+                bail!(
+                    "unsupported Qwen LoRA target module {other}; supported: q_proj, k_proj, v_proj, o_proj"
+                )
             }
+        }
+    }
+
+    fn id(self) -> i64 {
+        match self {
+            Self::QProj => 0,
+            Self::KProj => 1,
+            Self::VProj => 2,
+            Self::OProj => 3,
+        }
+    }
+
+    fn from_id(id: i64) -> Result<Self> {
+        match id {
+            0 => Ok(Self::QProj),
+            1 => Ok(Self::KProj),
+            2 => Ok(Self::VProj),
+            3 => Ok(Self::OProj),
+            other => Err(anyhow!("unknown LoRA target module id {other}")),
         }
     }
 }
@@ -3221,6 +3250,12 @@ impl QwenLoraConfig {
         if target_modules.is_empty() {
             bail!("target_modules must not be empty");
         }
+        let mut seen_modules = BTreeSet::new();
+        for module in &target_modules {
+            if !seen_modules.insert(*module) {
+                bail!("target_modules must not contain duplicates");
+            }
+        }
         if alpha.fract() != 0.0 || alpha > i64::MAX as f64 {
             bail!("alpha must be representable as an integer for safetensors metadata");
         }
@@ -3241,10 +3276,6 @@ impl QwenLoraConfig {
             .iter()
             .map(|module| module.as_str().to_string())
             .collect()
-    }
-
-    fn includes(&self, module: QwenLoraTargetModule) -> bool {
-        self.target_modules.contains(&module)
     }
 }
 
@@ -3267,40 +3298,33 @@ impl QwenLoraRegistry {
         deterministic: bool,
         trainable: bool,
     ) -> Result<Self> {
-        if !config.includes(QwenLoraTargetModule::QProj)
-            || !config.includes(QwenLoraTargetModule::VProj)
-        {
-            bail!("current Qwen attention LoRA registry requires q_proj and v_proj targets");
-        }
         let mut adapters = BTreeMap::new();
         for layer_index in &config.target_layers {
             let layer = QwenLayerWeights::load(weights, *layer_index)?;
+            let module_specs = config
+                .target_modules
+                .iter()
+                .map(|module| {
+                    let weight = layer.lora_target_weight(*module);
+                    (*module, weight.size()[1], weight.size()[0])
+                })
+                .collect::<Vec<_>>();
             let adapter = if deterministic {
                 if trainable {
                     QwenAttentionLoraAdapter::deterministic_trainable(
-                        layer.q_proj.size()[1],
-                        layer.q_proj.size()[0],
-                        layer.v_proj.size()[0],
+                        &module_specs,
                         config.rank,
                         config.alpha_f64(),
                     )
                 } else {
                     QwenAttentionLoraAdapter::deterministic(
-                        layer.q_proj.size()[1],
-                        layer.q_proj.size()[0],
-                        layer.v_proj.size()[0],
+                        &module_specs,
                         config.rank,
                         config.alpha_f64(),
                     )
                 }
             } else {
-                QwenAttentionLoraAdapter::zeros(
-                    layer.q_proj.size()[1],
-                    layer.q_proj.size()[0],
-                    layer.v_proj.size()[0],
-                    config.rank,
-                    config.alpha_f64(),
-                )
+                QwenAttentionLoraAdapter::zeros(&module_specs, config.rank, config.alpha_f64())
             };
             adapters.insert(*layer_index, adapter);
         }
@@ -3345,16 +3369,14 @@ impl QwenLoraRegistry {
             .collect::<BTreeMap<_, _>>();
         for (layer_index, adapter) in &self.adapters {
             let prefix = format!("model.layers.{layer_index}.self_attn");
-            let q_name = format!("{prefix}.q_proj.weight");
-            let v_name = format!("{prefix}.v_proj.weight");
-            let q_weight = tensor(&merged, &q_name)?.to_kind(Kind::Float);
-            let v_weight = tensor(&merged, &v_name)?.to_kind(Kind::Float);
-            let merged_q = q_weight.shallow_clone()
-                + adapter.q_delta(q_weight.device()).to_kind(Kind::Float) * scale;
-            let merged_v = v_weight.shallow_clone()
-                + adapter.v_delta(v_weight.device()).to_kind(Kind::Float) * scale;
-            merged.insert(q_name, merged_q);
-            merged.insert(v_name, merged_v);
+            for module in &self.config.target_modules {
+                let name = format!("{prefix}.{}.weight", module.as_str());
+                let weight = tensor(&merged, &name)?.to_kind(Kind::Float);
+                let delta = adapter
+                    .delta(*module, weight.device())?
+                    .to_kind(Kind::Float);
+                merged.insert(name, weight.shallow_clone() + delta * scale);
+            }
         }
         Ok(merged)
     }
@@ -3401,10 +3423,7 @@ impl QwenLoraRegistry {
             .config
             .target_modules
             .iter()
-            .map(|module| match module {
-                QwenLoraTargetModule::QProj => 0,
-                QwenLoraTargetModule::VProj => 1,
-            })
+            .map(|module| module.id())
             .collect();
         entries.push((
             "config.target_modules".to_string(),
@@ -3433,11 +3452,7 @@ impl QwenLoraRegistry {
         let target_modules: Vec<QwenLoraTargetModule> =
             Vec::<i64>::try_from(tensor(&tensors, "config.target_modules")?)?
                 .into_iter()
-                .map(|module| match module {
-                    0 => Ok(QwenLoraTargetModule::QProj),
-                    1 => Ok(QwenLoraTargetModule::VProj),
-                    other => Err(anyhow!("unknown LoRA target module id {other}")),
-                })
+                .map(QwenLoraTargetModule::from_id)
                 .collect::<Result<Vec<_>>>()?;
         let config = QwenLoraConfig {
             target_layers,
@@ -3457,56 +3472,62 @@ impl QwenLoraRegistry {
 }
 
 impl QwenAttentionLoraAdapter {
-    fn zeros(
-        in_features: i64,
-        q_out_features: i64,
-        v_out_features: i64,
-        rank: i64,
-        alpha: f64,
-    ) -> Self {
+    fn zeros(module_specs: &[(QwenLoraTargetModule, i64, i64)], rank: i64, alpha: f64) -> Self {
+        let modules = module_specs
+            .iter()
+            .map(|(module, in_features, out_features)| {
+                (
+                    *module,
+                    QwenLoraModuleAdapter {
+                        a: Tensor::zeros([rank, *in_features], (Kind::Float, Device::Cpu)),
+                        b: Tensor::zeros([*out_features, rank], (Kind::Float, Device::Cpu)),
+                    },
+                )
+            })
+            .collect();
         Self {
-            q_a: Tensor::zeros([rank, in_features], (Kind::Float, Device::Cpu)),
-            q_b: Tensor::zeros([q_out_features, rank], (Kind::Float, Device::Cpu)),
-            v_a: Tensor::zeros([rank, in_features], (Kind::Float, Device::Cpu)),
-            v_b: Tensor::zeros([v_out_features, rank], (Kind::Float, Device::Cpu)),
+            modules,
             rank,
             alpha,
         }
     }
 
     fn deterministic(
-        in_features: i64,
-        q_out_features: i64,
-        v_out_features: i64,
+        module_specs: &[(QwenLoraTargetModule, i64, i64)],
         rank: i64,
         alpha: f64,
     ) -> Self {
-        let q_a = deterministic_lora_tensor([rank, in_features], 0.0005);
-        let q_b = deterministic_lora_tensor([q_out_features, rank], -0.0003);
-        let v_a = deterministic_lora_tensor([rank, in_features], -0.0004);
-        let v_b = deterministic_lora_tensor([v_out_features, rank], 0.0002);
+        let modules = module_specs
+            .iter()
+            .enumerate()
+            .map(|(index, (module, in_features, out_features))| {
+                let scale = 0.0002 + index as f64 * 0.0001;
+                (
+                    *module,
+                    QwenLoraModuleAdapter {
+                        a: deterministic_lora_tensor([rank, *in_features], scale),
+                        b: deterministic_lora_tensor([*out_features, rank], -scale * 0.6),
+                    },
+                )
+            })
+            .collect();
         Self {
-            q_a,
-            q_b,
-            v_a,
-            v_b,
+            modules,
             rank,
             alpha,
         }
     }
 
     fn deterministic_trainable(
-        in_features: i64,
-        q_out_features: i64,
-        v_out_features: i64,
+        module_specs: &[(QwenLoraTargetModule, i64, i64)],
         rank: i64,
         alpha: f64,
     ) -> Self {
-        let adapter = Self::deterministic(in_features, q_out_features, v_out_features, rank, alpha);
-        let _ = adapter.q_a.set_requires_grad(true);
-        let _ = adapter.q_b.set_requires_grad(true);
-        let _ = adapter.v_a.set_requires_grad(true);
-        let _ = adapter.v_b.set_requires_grad(true);
+        let adapter = Self::deterministic(module_specs, rank, alpha);
+        for module_adapter in adapter.modules.values() {
+            let _ = module_adapter.a.set_requires_grad(true);
+            let _ = module_adapter.b.set_requires_grad(true);
+        }
         adapter
     }
 
@@ -3520,10 +3541,38 @@ impl QwenAttentionLoraAdapter {
         let alpha = Tensor::from_slice(&[self.alpha as f32]);
         Tensor::write_safetensors(
             &[
-                (&"q_proj.lora_a", &self.q_a),
-                (&"q_proj.lora_b", &self.q_b),
-                (&"v_proj.lora_a", &self.v_a),
-                (&"v_proj.lora_b", &self.v_b),
+                (
+                    &"q_proj.lora_a",
+                    &self
+                        .modules
+                        .get(&QwenLoraTargetModule::QProj)
+                        .context("missing q_proj adapter")?
+                        .a,
+                ),
+                (
+                    &"q_proj.lora_b",
+                    &self
+                        .modules
+                        .get(&QwenLoraTargetModule::QProj)
+                        .context("missing q_proj adapter")?
+                        .b,
+                ),
+                (
+                    &"v_proj.lora_a",
+                    &self
+                        .modules
+                        .get(&QwenLoraTargetModule::VProj)
+                        .context("missing v_proj adapter")?
+                        .a,
+                ),
+                (
+                    &"v_proj.lora_b",
+                    &self
+                        .modules
+                        .get(&QwenLoraTargetModule::VProj)
+                        .context("missing v_proj adapter")?
+                        .b,
+                ),
                 (&"rank", &rank),
                 (&"alpha", &alpha),
             ],
@@ -3541,11 +3590,17 @@ impl QwenAttentionLoraAdapter {
         let v_b = tensor(&tensors, "v_proj.lora_b")?.to_kind(Kind::Float);
         let rank = tensor(&tensors, "rank")?.int64_value(&[0]);
         let alpha = tensor(&tensors, "alpha")?.double_value(&[0]);
+        let mut modules = BTreeMap::new();
+        modules.insert(
+            QwenLoraTargetModule::QProj,
+            QwenLoraModuleAdapter { a: q_a, b: q_b },
+        );
+        modules.insert(
+            QwenLoraTargetModule::VProj,
+            QwenLoraModuleAdapter { a: v_a, b: v_b },
+        );
         Ok(Self {
-            q_a,
-            q_b,
-            v_a,
-            v_b,
+            modules,
             rank,
             alpha,
         })
@@ -3557,15 +3612,20 @@ impl QwenAttentionLoraAdapter {
         config: &QwenLoraConfig,
     ) -> Result<Self> {
         let prefix = format!("model.layers.{layer_index}.self_attn");
-        let q_a = tensor(tensors, &format!("{prefix}.q_proj.lora_a"))?.to_kind(Kind::Float);
-        let q_b = tensor(tensors, &format!("{prefix}.q_proj.lora_b"))?.to_kind(Kind::Float);
-        let v_a = tensor(tensors, &format!("{prefix}.v_proj.lora_a"))?.to_kind(Kind::Float);
-        let v_b = tensor(tensors, &format!("{prefix}.v_proj.lora_b"))?.to_kind(Kind::Float);
+        let mut modules = BTreeMap::new();
+        for module in &config.target_modules {
+            modules.insert(
+                *module,
+                QwenLoraModuleAdapter {
+                    a: tensor(tensors, &format!("{prefix}.{}.lora_a", module.as_str()))?
+                        .to_kind(Kind::Float),
+                    b: tensor(tensors, &format!("{prefix}.{}.lora_b", module.as_str()))?
+                        .to_kind(Kind::Float),
+                },
+            );
+        }
         Ok(Self {
-            q_a,
-            q_b,
-            v_a,
-            v_b,
+            modules,
             rank: config.rank,
             alpha: config.alpha_f64(),
         })
@@ -3573,36 +3633,52 @@ impl QwenAttentionLoraAdapter {
 
     fn safetensor_entries(&self, layer_index: usize) -> Vec<(String, Tensor)> {
         let prefix = format!("model.layers.{layer_index}.self_attn");
-        vec![
-            (format!("{prefix}.q_proj.lora_a"), self.q_a.shallow_clone()),
-            (format!("{prefix}.q_proj.lora_b"), self.q_b.shallow_clone()),
-            (format!("{prefix}.v_proj.lora_a"), self.v_a.shallow_clone()),
-            (format!("{prefix}.v_proj.lora_b"), self.v_b.shallow_clone()),
-        ]
+        self.modules
+            .iter()
+            .flat_map(|(module, adapter)| {
+                [
+                    (
+                        format!("{prefix}.{}.lora_a", module.as_str()),
+                        adapter.a.shallow_clone(),
+                    ),
+                    (
+                        format!("{prefix}.{}.lora_b", module.as_str()),
+                        adapter.b.shallow_clone(),
+                    ),
+                ]
+            })
+            .collect()
     }
 
     fn trainable_tensors(&self, layer_index: usize) -> Vec<(String, Tensor)> {
         let prefix = format!("model.layers.{layer_index}.self_attn");
-        vec![
-            (format!("{prefix}.q_proj.lora_a"), self.q_a.shallow_clone()),
-            (format!("{prefix}.q_proj.lora_b"), self.q_b.shallow_clone()),
-            (format!("{prefix}.v_proj.lora_a"), self.v_a.shallow_clone()),
-            (format!("{prefix}.v_proj.lora_b"), self.v_b.shallow_clone()),
-        ]
+        self.modules
+            .iter()
+            .flat_map(|(module, adapter)| {
+                [
+                    (
+                        format!("{prefix}.{}.lora_a", module.as_str()),
+                        adapter.a.shallow_clone(),
+                    ),
+                    (
+                        format!("{prefix}.{}.lora_b", module.as_str()),
+                        adapter.b.shallow_clone(),
+                    ),
+                ]
+            })
+            .collect()
     }
 
-    fn q_delta(&self, device: Device) -> Tensor {
-        self.q_b
+    fn delta(&self, module: QwenLoraTargetModule, device: Device) -> Result<Tensor> {
+        let adapter = self
+            .modules
+            .get(&module)
+            .ok_or_else(|| anyhow!("missing {} LoRA adapter", module.as_str()))?;
+        Ok(adapter
+            .b
             .to_device(device)
-            .matmul(&self.q_a.to_device(device))
-            * (self.alpha / self.rank as f64)
-    }
-
-    fn v_delta(&self, device: Device) -> Tensor {
-        self.v_b
-            .to_device(device)
-            .matmul(&self.v_a.to_device(device))
-            * (self.alpha / self.rank as f64)
+            .matmul(&adapter.a.to_device(device))
+            * (self.alpha / self.rank as f64))
     }
 }
 
@@ -3649,6 +3725,15 @@ impl QwenLayerWeights {
             up_proj: tensor(weights, &format!("{prefix}.mlp.up_proj.weight"))?.to_kind(kind),
             down_proj: tensor(weights, &format!("{prefix}.mlp.down_proj.weight"))?.to_kind(kind),
         })
+    }
+
+    fn lora_target_weight(&self, module: QwenLoraTargetModule) -> &Tensor {
+        match module {
+            QwenLoraTargetModule::QProj => &self.q_proj,
+            QwenLoraTargetModule::KProj => &self.k_proj,
+            QwenLoraTargetModule::VProj => &self.v_proj,
+            QwenLoraTargetModule::OProj => &self.o_proj,
+        }
     }
 }
 
@@ -4067,19 +4152,56 @@ fn qwen_attention_with_lora(
     adapter: &QwenAttentionLoraAdapter,
     config: &QwenRuntimeConfig,
 ) -> Tensor {
-    let q_proj = &weights.q_proj + adapter.q_delta(input.device());
-    let v_proj = &weights.v_proj + adapter.v_delta(input.device());
+    let q_proj = lora_weight_or_base(
+        adapter,
+        QwenLoraTargetModule::QProj,
+        &weights.q_proj,
+        input.device(),
+    );
+    let k_proj = lora_weight_or_base(
+        adapter,
+        QwenLoraTargetModule::KProj,
+        &weights.k_proj,
+        input.device(),
+    );
+    let v_proj = lora_weight_or_base(
+        adapter,
+        QwenLoraTargetModule::VProj,
+        &weights.v_proj,
+        input.device(),
+    );
+    let o_proj = lora_weight_or_base(
+        adapter,
+        QwenLoraTargetModule::OProj,
+        &weights.o_proj,
+        input.device(),
+    );
     qwen_attention(
         input,
         &q_proj,
         &weights.q_bias,
-        &weights.k_proj,
+        &k_proj,
         &weights.k_bias,
         &v_proj,
         &weights.v_bias,
-        &weights.o_proj,
+        &o_proj,
         config,
     )
+}
+
+fn lora_weight_or_base(
+    adapter: &QwenAttentionLoraAdapter,
+    module: QwenLoraTargetModule,
+    base: &Tensor,
+    device: Device,
+) -> Tensor {
+    if adapter.modules.contains_key(&module) {
+        base + adapter
+            .delta(module, device)
+            .expect("LoRA module should have a delta")
+    } else {
+        base.shallow_clone()
+    }
 }
 
 fn qwen_layer_with_lora(
@@ -4995,21 +5117,56 @@ mod tests {
     fn qwen_attention_lora_adapter_roundtrips_mismatched_q_v_shapes() {
         let temp = tempfile::tempdir().expect("temp dir should be created");
         let adapter_output = temp.path().join("adapter.safetensors");
-        let adapter = QwenAttentionLoraAdapter::deterministic(4, 6, 2, 2, 8.0);
+        let adapter = QwenAttentionLoraAdapter::deterministic(
+            &[
+                (QwenLoraTargetModule::QProj, 4, 6),
+                (QwenLoraTargetModule::VProj, 4, 2),
+            ],
+            2,
+            8.0,
+        );
 
-        assert_eq!(adapter.q_delta(Device::Cpu).size(), vec![6, 4]);
-        assert_eq!(adapter.v_delta(Device::Cpu).size(), vec![2, 4]);
+        assert_eq!(
+            adapter
+                .delta(QwenLoraTargetModule::QProj, Device::Cpu)
+                .expect("q delta")
+                .size(),
+            vec![6, 4]
+        );
+        assert_eq!(
+            adapter
+                .delta(QwenLoraTargetModule::VProj, Device::Cpu)
+                .expect("v delta")
+                .size(),
+            vec![2, 4]
+        );
 
         adapter.save(&adapter_output).expect("adapter should write");
         let reloaded =
             QwenAttentionLoraAdapter::load(&adapter_output).expect("adapter should reload");
 
-        assert_eq!(reloaded.q_delta(Device::Cpu).size(), vec![6, 4]);
-        assert_eq!(reloaded.v_delta(Device::Cpu).size(), vec![2, 4]);
+        assert_eq!(
+            reloaded
+                .delta(QwenLoraTargetModule::QProj, Device::Cpu)
+                .expect("q delta")
+                .size(),
+            vec![6, 4]
+        );
+        assert_eq!(
+            reloaded
+                .delta(QwenLoraTargetModule::VProj, Device::Cpu)
+                .expect("v delta")
+                .size(),
+            vec![2, 4]
+        );
         assert!(
             diff_stats(
-                &reloaded.q_delta(Device::Cpu),
-                &adapter.q_delta(Device::Cpu)
+                &reloaded
+                    .delta(QwenLoraTargetModule::QProj, Device::Cpu)
+                    .expect("reloaded q delta"),
+                &adapter
+                    .delta(QwenLoraTargetModule::QProj, Device::Cpu)
+                    .expect("q delta")
             )
             .expect("q delta diff should compute")
             .max_abs
@@ -5017,8 +5174,12 @@ mod tests {
         );
         assert!(
             diff_stats(
-                &reloaded.v_delta(Device::Cpu),
-                &adapter.v_delta(Device::Cpu)
+                &reloaded
+                    .delta(QwenLoraTargetModule::VProj, Device::Cpu)
+                    .expect("reloaded v delta"),
+                &adapter
+                    .delta(QwenLoraTargetModule::VProj, Device::Cpu)
+                    .expect("v delta")
             )
             .expect("v delta diff should compute")
             .max_abs
@@ -5051,7 +5212,14 @@ mod tests {
             &layer.o_proj,
             &config,
         ) + Tensor::ones([1, 3, 4], (Kind::Float, Device::Cpu)) * 0.01;
-        let adapter = QwenAttentionLoraAdapter::deterministic_trainable(4, 4, 2, 2, 8.0);
+        let adapter = QwenAttentionLoraAdapter::deterministic_trainable(
+            &[
+                (QwenLoraTargetModule::QProj, 4, 4),
+                (QwenLoraTargetModule::VProj, 4, 2),
+            ],
+            2,
+            8.0,
+        );
 
         let initial_loss = qwen_attention_lora_mse_loss(&input, &target, &layer, &adapter, &config)
             .double_value(&[]);
@@ -5084,7 +5252,12 @@ mod tests {
             rank: 2,
             alpha: 8.0,
             target_layers: vec![0],
-            target_modules: vec!["q_proj".to_string(), "v_proj".to_string()],
+            target_modules: vec![
+                "q_proj".to_string(),
+                "k_proj".to_string(),
+                "v_proj".to_string(),
+                "o_proj".to_string(),
+            ],
         };
         let config = QwenLoraConfig::from_runtime(&runtime_config).expect("config should build");
         let registry = QwenLoraRegistry::deterministic(&weights, &config, true)
@@ -5093,15 +5266,24 @@ mod tests {
         assert_eq!(registry.config.target_layers, vec![0]);
         assert_eq!(
             registry.config.target_modules,
-            vec![QwenLoraTargetModule::QProj, QwenLoraTargetModule::VProj]
+            vec![
+                QwenLoraTargetModule::QProj,
+                QwenLoraTargetModule::KProj,
+                QwenLoraTargetModule::VProj,
+                QwenLoraTargetModule::OProj,
+            ]
         );
         assert_eq!(
             registry.trainable_tensor_names(),
             vec![
                 "model.layers.0.self_attn.q_proj.lora_a".to_string(),
                 "model.layers.0.self_attn.q_proj.lora_b".to_string(),
+                "model.layers.0.self_attn.k_proj.lora_a".to_string(),
+                "model.layers.0.self_attn.k_proj.lora_b".to_string(),
                 "model.layers.0.self_attn.v_proj.lora_a".to_string(),
                 "model.layers.0.self_attn.v_proj.lora_b".to_string(),
+                "model.layers.0.self_attn.o_proj.lora_a".to_string(),
+                "model.layers.0.self_attn.o_proj.lora_b".to_string(),
             ]
         );
 
@@ -5116,11 +5298,13 @@ mod tests {
                 &reloaded
                     .layer_adapter(0)
                     .expect("layer adapter")
-                    .q_delta(Device::Cpu),
+                    .delta(QwenLoraTargetModule::QProj, Device::Cpu)
+                    .expect("reloaded q delta"),
                 &registry
                     .layer_adapter(0)
                     .expect("layer adapter")
-                    .q_delta(Device::Cpu),
+                    .delta(QwenLoraTargetModule::QProj, Device::Cpu)
+                    .expect("q delta"),
             )
             .expect("q delta diff should compute")
             .max_abs
@@ -5131,15 +5315,35 @@ mod tests {
                 &reloaded
                     .layer_adapter(0)
                     .expect("layer adapter")
-                    .v_delta(Device::Cpu),
+                    .delta(QwenLoraTargetModule::VProj, Device::Cpu)
+                    .expect("reloaded v delta"),
                 &registry
                     .layer_adapter(0)
                     .expect("layer adapter")
-                    .v_delta(Device::Cpu),
+                    .delta(QwenLoraTargetModule::VProj, Device::Cpu)
+                    .expect("v delta"),
             )
             .expect("v delta diff should compute")
             .max_abs
                 < 1e-8
+        );
+        assert_eq!(
+            reloaded
+                .layer_adapter(0)
+                .expect("layer adapter")
+                .delta(QwenLoraTargetModule::KProj, Device::Cpu)
+                .expect("k delta")
+                .size(),
+            vec![2, 4]
+        );
+        assert_eq!(
+            reloaded
+                .layer_adapter(0)
+                .expect("layer adapter")
+                .delta(QwenLoraTargetModule::OProj, Device::Cpu)
+                .expect("o delta")
+                .size(),
+            vec![4, 4]
         );
     }
 
@@ -5149,7 +5353,7 @@ mod tests {
             rank: 2,
             alpha: 8.0,
             target_layers: vec![0],
-            target_modules: vec!["k_proj".to_string()],
+            target_modules: vec!["gate_proj".to_string()],
         };
         let error = QwenLoraConfig::from_runtime(&runtime_config)
             .expect_err("unsupported target should fail");
@@ -5157,7 +5361,7 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("unsupported Qwen LoRA target module k_proj")
+                .contains("unsupported Qwen LoRA target module gate_proj")
         );
     }
 

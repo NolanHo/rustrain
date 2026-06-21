@@ -277,12 +277,23 @@ pub fn validate_config(config: &Config) -> Result<()> {
         if lora.target_modules.is_empty() {
             return Err(anyhow!("lora.target_modules must not be empty"));
         }
-        if lora.target_modules.len() != 2
-            || !lora.target_modules.iter().any(|module| module == "q_proj")
-            || !lora.target_modules.iter().any(|module| module == "v_proj")
+        let supported_lora_modules = ["q_proj", "k_proj", "v_proj", "o_proj"];
+        for module in &lora.target_modules {
+            if !supported_lora_modules.contains(&module.as_str()) {
+                return Err(anyhow!(
+                    "qwen_lora_sft unsupported lora.target_modules entry {}; supported: q_proj, k_proj, v_proj, o_proj",
+                    module
+                ));
+            }
+        }
+        let mut unique_modules = std::collections::BTreeSet::new();
+        if lora
+            .target_modules
+            .iter()
+            .any(|module| !unique_modules.insert(module))
         {
             return Err(anyhow!(
-                "qwen_lora_sft currently supports lora.target_modules = [\"q_proj\", \"v_proj\"]"
+                "qwen_lora_sft lora.target_modules must not contain duplicates"
             ));
         }
         if config.train.micro_batch_size == 0 {

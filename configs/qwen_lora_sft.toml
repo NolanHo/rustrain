@@ -46,7 +46,7 @@ train_split = 0.8
 rank = 4
 alpha = 8.0
 target_layers = [0]
-target_modules = ["q_proj", "v_proj"]
+target_modules = ["q_proj", "k_proj", "v_proj", "o_proj"]
 
 [parallel]
 tensor_model_parallel_size = 1
