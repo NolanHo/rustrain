@@ -12,7 +12,10 @@ use tch::{Device, IndexOp, Kind, Reduction, Tensor, no_grad};
 use tokenizers::Tokenizer;
 
 use crate::nccl_smoke;
-use crate::runtime::{Config, DataKind, Device as RuntimeDevice, LrScheduler, RunPaths};
+use crate::runtime::{
+    Config, DataKind, Device as RuntimeDevice, LoraConfig as RuntimeLoraConfig, LrScheduler,
+    RunPaths,
+};
 
 #[derive(Debug, Serialize)]
 pub struct DiffStats {
@@ -1027,6 +1030,7 @@ pub fn qwen_lora_sft_smoke(
     alpha: f64,
     learning_rate: f64,
 ) -> Result<()> {
+    let lora_config = QwenLoraConfig::layer0_qv(rank, alpha)?;
     let summary = qwen_lora_sft_train(
         model_path,
         adapter_output,
@@ -1034,8 +1038,7 @@ pub fn qwen_lora_sft_smoke(
         sft_batch_size,
         instruction,
         response,
-        rank,
-        alpha,
+        lora_config,
         learning_rate,
         1,
         QwenLoraSftTrainPolicy::constant_without_clip(),
@@ -1076,6 +1079,12 @@ pub fn train_qwen_lora_sft_from_config(
     if data.paths.len() != 1 {
         bail!("qwen LoRA SFT trainer currently expects exactly one data path");
     }
+    let lora_config = QwenLoraConfig::from_runtime(
+        config
+            .lora
+            .as_ref()
+            .ok_or_else(|| anyhow!("qwen_lora_sft requires [lora] config"))?,
+    )?;
     let adapter_output = run_paths
         .checkpoints
         .join("qwen-lora-sft-adapter.safetensors");
@@ -1086,8 +1095,7 @@ pub fn train_qwen_lora_sft_from_config(
         config.train.micro_batch_size,
         "Reply with rustrain.",
         "rustrain",
-        4,
-        8.0,
+        lora_config,
         config.train.learning_rate as f64,
         config.train.max_steps as usize,
         QwenLoraSftTrainPolicy::from_config(config),
@@ -1102,18 +1110,11 @@ fn qwen_lora_sft_train(
     sft_batch_size: usize,
     instruction: &str,
     response: &str,
-    rank: i64,
-    alpha: f64,
+    lora_config: QwenLoraConfig,
     learning_rate: f64,
     steps: usize,
     policy: QwenLoraSftTrainPolicy,
 ) -> Result<QwenLoraSftTrainSummary> {
-    if rank <= 0 {
-        bail!("rank must be positive");
-    }
-    if alpha <= 0.0 {
-        bail!("alpha must be positive");
-    }
     if learning_rate <= 0.0 {
         bail!("learning_rate must be positive");
     }
@@ -1148,19 +1149,25 @@ fn qwen_lora_sft_train(
     let batch = dataset.padded_batch(0, sft_batch_size.min(dataset.len()))?;
     let weights = read_safetensors_map(&model_path.join("model.safetensors"))?;
     let config = read_runtime_config(&model_path.join("config.json"))?;
-    let layer0 = QwenLayerWeights::load(&weights, 0)?;
-    let lora_config = QwenLoraConfig::layer0_qv(rank, alpha)?;
     let registry = QwenLoraRegistry::deterministic(&weights, &lora_config, true)?;
-    let base_requires_grad = layer0.q_proj.requires_grad()
-        || layer0.k_proj.requires_grad()
-        || layer0.v_proj.requires_grad()
-        || layer0.o_proj.requires_grad();
+    let sft_layer = *lora_config
+        .target_layers
+        .first()
+        .ok_or_else(|| anyhow!("LoRA config must include at least one target layer"))?;
+    let base_layer = QwenLayerWeights::load(&weights, sft_layer)?;
+    let base_requires_grad = base_layer.q_proj.requires_grad()
+        || base_layer.k_proj.requires_grad()
+        || base_layer.v_proj.requires_grad()
+        || base_layer.o_proj.requires_grad();
+    let rank = lora_config.rank;
+    let alpha = lora_config.alpha_f64();
 
     let initial_loss = qwen_attention_lora_sft_loss(
         &batch.input_ids,
         &batch.target_mask,
         &weights,
-        registry.layer_adapter(0)?,
+        sft_layer,
+        registry.layer_adapter(sft_layer)?,
         &config,
     )?
     .double_value(&[]);
@@ -1184,7 +1191,8 @@ fn qwen_lora_sft_train(
             &batch.input_ids,
             &batch.target_mask,
             &weights,
-            registry.layer_adapter(0)?,
+            sft_layer,
+            registry.layer_adapter(sft_layer)?,
             &config,
         )?;
         loss.backward();
@@ -1249,7 +1257,8 @@ fn qwen_lora_sft_train(
         &batch.input_ids,
         &batch.target_mask,
         &weights,
-        registry.layer_adapter(0)?,
+        sft_layer,
+        registry.layer_adapter(sft_layer)?,
         &config,
     )?
     .double_value(&[]);
@@ -1265,7 +1274,8 @@ fn qwen_lora_sft_train(
         &batch.input_ids,
         &batch.target_mask,
         &weights,
-        reloaded.layer_adapter(0)?,
+        sft_layer,
+        reloaded.layer_adapter(sft_layer)?,
         &config,
     )?
     .double_value(&[]);
@@ -2932,22 +2942,66 @@ impl QwenLoraTargetModule {
             Self::VProj => "v_proj",
         }
     }
+
+    fn parse(value: &str) -> Result<Self> {
+        match value {
+            "q_proj" => Ok(Self::QProj),
+            "v_proj" => Ok(Self::VProj),
+            other => {
+                bail!("unsupported Qwen LoRA target module {other}; supported: q_proj, v_proj")
+            }
+        }
+    }
 }
 
 impl QwenLoraConfig {
     fn layer0_qv(rank: i64, alpha: f64) -> Result<Self> {
+        Self::new(
+            vec![0],
+            vec![QwenLoraTargetModule::QProj, QwenLoraTargetModule::VProj],
+            rank,
+            alpha,
+        )
+    }
+
+    fn from_runtime(config: &RuntimeLoraConfig) -> Result<Self> {
+        let target_modules = config
+            .target_modules
+            .iter()
+            .map(|module| QwenLoraTargetModule::parse(module))
+            .collect::<Result<Vec<_>>>()?;
+        Self::new(
+            config.target_layers.clone(),
+            target_modules,
+            config.rank,
+            config.alpha,
+        )
+    }
+
+    fn new(
+        target_layers: Vec<usize>,
+        target_modules: Vec<QwenLoraTargetModule>,
+        rank: i64,
+        alpha: f64,
+    ) -> Result<Self> {
         if rank <= 0 {
             bail!("rank must be positive");
         }
         if alpha <= 0.0 {
             bail!("alpha must be positive");
         }
+        if target_layers.is_empty() {
+            bail!("target_layers must not be empty");
+        }
+        if target_modules.is_empty() {
+            bail!("target_modules must not be empty");
+        }
         if alpha.fract() != 0.0 || alpha > i64::MAX as f64 {
             bail!("alpha must be representable as an integer for safetensors metadata");
         }
         Ok(Self {
-            target_layers: vec![0],
-            target_modules: vec![QwenLoraTargetModule::QProj, QwenLoraTargetModule::VProj],
+            target_layers,
+            target_modules,
             rank,
             alpha: alpha as i64,
         })
@@ -3967,26 +4021,27 @@ fn qwen_attention_lora_sft_loss(
     input_ids: &Tensor,
     target_mask: &Tensor,
     weights: &BTreeMap<String, Tensor>,
+    layer_index: usize,
     adapter: &QwenAttentionLoraAdapter,
     config: &QwenRuntimeConfig,
 ) -> Result<Tensor> {
     let embed_tokens = tensor(weights, "model.embed_tokens.weight")?.to_kind(Kind::Float);
-    let layer0 = QwenLayerWeights::load(weights, 0)?;
+    let layer = QwenLayerWeights::load(weights, layer_index)?;
     let hidden = Tensor::embedding(&embed_tokens, input_ids, -1, false, false);
-    let attention_input = rms_norm(&hidden, &layer0.input_norm, config.rms_norm_eps);
+    let attention_input = rms_norm(&hidden, &layer.input_norm, config.rms_norm_eps);
     let base_output = qwen_attention(
         &attention_input,
-        &layer0.q_proj,
-        &layer0.q_bias,
-        &layer0.k_proj,
-        &layer0.k_bias,
-        &layer0.v_proj,
-        &layer0.v_bias,
-        &layer0.o_proj,
+        &layer.q_proj,
+        &layer.q_bias,
+        &layer.k_proj,
+        &layer.k_bias,
+        &layer.v_proj,
+        &layer.v_bias,
+        &layer.o_proj,
         config,
     );
     let target = lora_train_target(&base_output);
-    let adapted = qwen_attention_with_lora(&attention_input, &layer0, adapter, config);
+    let adapted = qwen_attention_with_lora(&attention_input, &layer, adapter, config);
     let shifted_adapted = adapted.narrow(1, 0, input_ids.size()[1] - 1);
     let shifted_target = target.narrow(1, 0, input_ids.size()[1] - 1);
     let mask = target_mask.to_device(adapted.device());
@@ -4693,7 +4748,13 @@ mod tests {
         let temp = tempfile::tempdir().expect("temp dir should be created");
         let adapter_output = temp.path().join("adapter.safetensors");
         let weights = tiny_qwen_weights();
-        let config = QwenLoraConfig::layer0_qv(2, 8.0).expect("config should build");
+        let runtime_config = RuntimeLoraConfig {
+            rank: 2,
+            alpha: 8.0,
+            target_layers: vec![0],
+            target_modules: vec!["q_proj".to_string(), "v_proj".to_string()],
+        };
+        let config = QwenLoraConfig::from_runtime(&runtime_config).expect("config should build");
         let registry = QwenLoraRegistry::deterministic(&weights, &config, true)
             .expect("registry should build");
 
@@ -4747,6 +4808,24 @@ mod tests {
             .expect("v delta diff should compute")
             .max_abs
                 < 1e-8
+        );
+    }
+
+    #[test]
+    fn qwen_lora_config_rejects_unsupported_target_module() {
+        let runtime_config = RuntimeLoraConfig {
+            rank: 2,
+            alpha: 8.0,
+            target_layers: vec![0],
+            target_modules: vec!["k_proj".to_string()],
+        };
+        let error = QwenLoraConfig::from_runtime(&runtime_config)
+            .expect_err("unsupported target should fail");
+
+        assert!(
+            error
+                .to_string()
+                .contains("unsupported Qwen LoRA target module k_proj")
         );
     }
 

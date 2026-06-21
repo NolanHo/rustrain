@@ -558,6 +558,7 @@ mod tests {
             model: ModelConfig {
                 name: "tch_tiny_lm".to_string(),
                 architecture: "tch_tiny_lm".to_string(),
+                model_path: None,
                 vocab_size: 16,
                 hidden_size: 8,
                 num_layers: 1,
@@ -590,6 +591,7 @@ mod tests {
                 eval_every: 0,
             },
             data: None,
+            lora: None,
             parallel: ParallelConfig {
                 tensor_model_parallel_size: 1,
                 pipeline_model_parallel_size: 1,

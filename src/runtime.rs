@@ -17,6 +17,8 @@ pub struct Config {
     pub train: TrainConfig,
     #[serde(default)]
     pub data: Option<DataConfig>,
+    #[serde(default)]
+    pub lora: Option<LoraConfig>,
     pub parallel: ParallelConfig,
 }
 
@@ -78,6 +80,14 @@ pub struct DataConfig {
     pub paths: Vec<PathBuf>,
     #[serde(default = "default_train_split")]
     pub train_split: f32,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct LoraConfig {
+    pub rank: i64,
+    pub alpha: f64,
+    pub target_layers: Vec<usize>,
+    pub target_modules: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -237,6 +247,44 @@ pub fn validate_config(config: &Config) -> Result<()> {
     }
 
     if is_qwen_lora_sft {
+        let lora = config
+            .lora
+            .as_ref()
+            .ok_or_else(|| anyhow!("qwen_lora_sft requires [lora] config"))?;
+        if lora.rank <= 0 {
+            return Err(anyhow!("lora.rank must be greater than zero"));
+        }
+        if lora.alpha <= 0.0 {
+            return Err(anyhow!("lora.alpha must be greater than zero"));
+        }
+        if lora.target_layers.is_empty() {
+            return Err(anyhow!("lora.target_layers must not be empty"));
+        }
+        if lora.target_layers.len() != 1 {
+            return Err(anyhow!(
+                "qwen_lora_sft currently supports exactly one lora.target_layers entry"
+            ));
+        }
+        for layer in &lora.target_layers {
+            if *layer >= config.model.num_layers {
+                return Err(anyhow!(
+                    "lora.target_layers contains layer {} outside model.num_layers {}",
+                    layer,
+                    config.model.num_layers
+                ));
+            }
+        }
+        if lora.target_modules.is_empty() {
+            return Err(anyhow!("lora.target_modules must not be empty"));
+        }
+        if lora.target_modules.len() != 2
+            || !lora.target_modules.iter().any(|module| module == "q_proj")
+            || !lora.target_modules.iter().any(|module| module == "v_proj")
+        {
+            return Err(anyhow!(
+                "qwen_lora_sft currently supports lora.target_modules = [\"q_proj\", \"v_proj\"]"
+            ));
+        }
         if config.train.micro_batch_size == 0 {
             return Err(anyhow!("qwen_lora_sft requires micro_batch_size > 0"));
         }

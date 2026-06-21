@@ -414,6 +414,7 @@ mod tests {
         ModelConfig {
             name: "test_qwen_like".to_string(),
             architecture: "qwen_like".to_string(),
+            model_path: None,
             vocab_size: 16,
             hidden_size: 16,
             num_layers: 1,

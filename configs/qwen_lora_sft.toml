@@ -42,6 +42,12 @@ kind = "instruction_jsonl"
 paths = ["data/sft_toy/instructions.jsonl"]
 train_split = 0.8
 
+[lora]
+rank = 4
+alpha = 8.0
+target_layers = [0]
+target_modules = ["q_proj", "v_proj"]
+
 [parallel]
 tensor_model_parallel_size = 1
 pipeline_model_parallel_size = 1
