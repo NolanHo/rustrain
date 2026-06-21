@@ -67,6 +67,24 @@ struct QwenTpProjectionShardSummary {
     mean_abs: Option<f64>,
 }
 
+#[derive(Debug, Serialize)]
+struct QwenTpAttentionRankSummary {
+    rank: usize,
+    world_size: usize,
+    local_rank: usize,
+    model_path: String,
+    input_shape: Vec<i64>,
+    q_head_start: i64,
+    q_head_end: i64,
+    kv_head_start: i64,
+    kv_head_end: i64,
+    context_shard_shape: Vec<i64>,
+    output_contribution_shape: Vec<i64>,
+    full_output_shape: Vec<i64>,
+    max_abs: Option<f64>,
+    mean_abs: Option<f64>,
+}
+
 #[derive(Debug, Deserialize)]
 struct QwenModelConfig {
     num_hidden_layers: usize,
@@ -3350,6 +3368,184 @@ pub fn qwen_tp_linear_rank_smoke(model_path: &Path, output_dir: PathBuf) -> Resu
         projections: projection_summaries,
     };
     let summary_path = output_dir.join(format!("qwen-tp-linear-rank-{rank}.json"));
+    fs::write(&summary_path, serde_json::to_string_pretty(&summary)?)
+        .with_context(|| format!("failed to write {}", summary_path.display()))?;
+    println!("{}", serde_json::to_string_pretty(&summary)?);
+
+    Ok(())
+}
+
+pub fn qwen_tp_attention_rank_smoke(model_path: &Path, output_dir: PathBuf) -> Result<()> {
+    let rank = parse_env_usize("RANK")?;
+    let local_rank = parse_env_usize("LOCAL_RANK")?;
+    let world_size = parse_env_usize("WORLD_SIZE")?;
+    if world_size != 2 {
+        bail!("Qwen TP attention rank smoke expects WORLD_SIZE=2");
+    }
+    if rank >= world_size {
+        bail!("rank {rank} must be smaller than world_size {world_size}");
+    }
+    let device = Device::Cuda(local_rank);
+    fs::create_dir_all(&output_dir)
+        .with_context(|| format!("failed to create {}", output_dir.display()))?;
+
+    let config = read_runtime_config(&model_path.join("config.json"))?;
+    if config.num_attention_heads % world_size as i64 != 0 {
+        bail!("Qwen TP attention smoke requires attention heads divisible by WORLD_SIZE");
+    }
+    if config.num_key_value_heads % world_size as i64 != 0 {
+        bail!("Qwen TP attention smoke requires KV heads divisible by WORLD_SIZE");
+    }
+    let weights = read_safetensors_map(&model_path.join("model.safetensors"))?;
+    let q_weight = tensor(&weights, "model.layers.0.self_attn.q_proj.weight")?
+        .to_kind(Kind::Float)
+        .to_device(device);
+    let hidden_size = q_weight.size()[1];
+    let head_dim = hidden_size / config.num_attention_heads;
+    let q_heads_per_rank = config.num_attention_heads / world_size as i64;
+    let kv_heads_per_rank = config.num_key_value_heads / world_size as i64;
+    let q_head_start = rank as i64 * q_heads_per_rank;
+    let kv_head_start = rank as i64 * kv_heads_per_rank;
+    let q_output_start = q_head_start * head_dim;
+    let q_output_size = q_heads_per_rank * head_dim;
+    let kv_output_start = kv_head_start * head_dim;
+    let kv_output_size = kv_heads_per_rank * head_dim;
+
+    let input = Tensor::arange(hidden_size * 9, (Kind::Float, device))
+        .reshape([1, 9, hidden_size])
+        .fmod(23.0)
+        / 23.0;
+    let batch_size = input.size()[0];
+    let seq_len = input.size()[1];
+
+    let q_proj = tensor(&weights, "model.layers.0.self_attn.q_proj.weight")?
+        .to_kind(Kind::Float)
+        .to_device(device);
+    let q_bias = tensor(&weights, "model.layers.0.self_attn.q_proj.bias")?
+        .to_kind(Kind::Float)
+        .to_device(device);
+    let k_proj = tensor(&weights, "model.layers.0.self_attn.k_proj.weight")?
+        .to_kind(Kind::Float)
+        .to_device(device);
+    let k_bias = tensor(&weights, "model.layers.0.self_attn.k_proj.bias")?
+        .to_kind(Kind::Float)
+        .to_device(device);
+    let v_proj = tensor(&weights, "model.layers.0.self_attn.v_proj.weight")?
+        .to_kind(Kind::Float)
+        .to_device(device);
+    let v_bias = tensor(&weights, "model.layers.0.self_attn.v_proj.bias")?
+        .to_kind(Kind::Float)
+        .to_device(device);
+    let o_proj = tensor(&weights, "model.layers.0.self_attn.o_proj.weight")?
+        .to_kind(Kind::Float)
+        .to_device(device);
+
+    let q_shard = input
+        .linear(
+            &q_proj.narrow(0, q_output_start, q_output_size),
+            Some(&q_bias.narrow(0, q_output_start, q_output_size)),
+        )
+        .reshape([batch_size, seq_len, q_heads_per_rank, head_dim])
+        .transpose(1, 2);
+    let k_shard = input
+        .linear(
+            &k_proj.narrow(0, kv_output_start, kv_output_size),
+            Some(&k_bias.narrow(0, kv_output_start, kv_output_size)),
+        )
+        .reshape([batch_size, seq_len, kv_heads_per_rank, head_dim])
+        .transpose(1, 2);
+    let v_shard = input
+        .linear(
+            &v_proj.narrow(0, kv_output_start, kv_output_size),
+            Some(&v_bias.narrow(0, kv_output_start, kv_output_size)),
+        )
+        .reshape([batch_size, seq_len, kv_heads_per_rank, head_dim])
+        .transpose(1, 2);
+
+    let (cos, sin) = rope_cos_sin(seq_len, head_dim, config.rope_theta, device);
+    let cos = cos.to_kind(input.kind());
+    let sin = sin.to_kind(input.kind());
+    let q_shard = apply_rotary(&q_shard, &cos, &sin);
+    let k_shard = apply_rotary(&k_shard, &cos, &sin);
+    let local_kv_repeat = q_heads_per_rank / kv_heads_per_rank;
+    let k_for_attention = repeat_kv(&k_shard, local_kv_repeat);
+    let v_for_attention = repeat_kv(&v_shard, local_kv_repeat);
+    let scores = q_shard.matmul(&k_for_attention.transpose(-2, -1)) / (head_dim as f64).sqrt();
+    let causal_mask = Tensor::ones([seq_len, seq_len], (Kind::Bool, device)).triu(1);
+    let scores = scores.masked_fill(&causal_mask, f64::NEG_INFINITY);
+    let probs = scores
+        .softmax(-1, Kind::Float)
+        .to_kind(v_for_attention.kind());
+    let context_shard = probs.matmul(&v_for_attention).transpose(1, 2).reshape([
+        batch_size,
+        seq_len,
+        q_output_size,
+    ]);
+    let output_contribution =
+        context_shard.linear::<&Tensor>(&o_proj.narrow(1, q_output_start, q_output_size), None);
+
+    Tensor::write_safetensors(
+        &[("output_contribution", &output_contribution)],
+        &output_dir.join(format!("qwen-tp-attention-rank-{rank}.safetensors")),
+    )
+    .with_context(|| format!("failed to write rank {rank} TP attention contribution"))?;
+
+    wait_for_rank_barrier(
+        &output_dir.join("qwen-tp-attention-contributions-written"),
+        rank,
+        world_size,
+        Duration::from_secs(300),
+    )?;
+
+    let full_output_shape = vec![batch_size, seq_len, hidden_size];
+    let (max_abs, mean_abs) =
+        if rank == 0 {
+            let mut contributions = Vec::with_capacity(world_size);
+            for shard_rank in 0..world_size {
+                let tensors = read_safetensors_map(
+                    &output_dir.join(format!("qwen-tp-attention-rank-{shard_rank}.safetensors")),
+                )?;
+                contributions.push(
+                    tensor(&tensors, "output_contribution")?
+                        .to_kind(Kind::Float)
+                        .to_device(device),
+                );
+            }
+            let gathered = Tensor::stack(&contributions.iter().collect::<Vec<_>>(), 0)
+                .sum_dim_intlist([0].as_slice(), false, Kind::Float);
+            let full_output = qwen_attention(
+                &input, &q_proj, &q_bias, &k_proj, &k_bias, &v_proj, &v_bias, &o_proj, &config,
+            );
+            let diff = diff_stats(&gathered, &full_output)?;
+            if diff.max_abs > 1e-5 {
+                bail!(
+                    "Qwen TP attention parity failed: max_abs={}, mean_abs={}",
+                    diff.max_abs,
+                    diff.mean_abs
+                );
+            }
+            (Some(diff.max_abs), Some(diff.mean_abs))
+        } else {
+            (None, None)
+        };
+
+    let summary = QwenTpAttentionRankSummary {
+        rank,
+        world_size,
+        local_rank,
+        model_path: model_path.display().to_string(),
+        input_shape: input.size(),
+        q_head_start,
+        q_head_end: q_head_start + q_heads_per_rank,
+        kv_head_start,
+        kv_head_end: kv_head_start + kv_heads_per_rank,
+        context_shard_shape: context_shard.size(),
+        output_contribution_shape: output_contribution.size(),
+        full_output_shape,
+        max_abs,
+        mean_abs,
+    };
+    let summary_path = output_dir.join(format!("qwen-tp-attention-rank-{rank}.json"));
     fs::write(&summary_path, serde_json::to_string_pretty(&summary)?)
         .with_context(|| format!("failed to write {}", summary_path.display()))?;
     println!("{}", serde_json::to_string_pretty(&summary)?);

@@ -123,8 +123,10 @@ exist, including a `trainer::train` config path for tiny `tch` DP=2 and a
 focused real-Qwen layer0 attention DP gradient-signature smoke. A focused
 real-Qwen TP=2 linear smoke shards the real layer0 attention `q_proj`, `k_proj`,
 `v_proj`, and `o_proj` output dimensions across two CUDA ranks and verifies the
-gathered shard outputs match the full linear projections. Real multi-GPU Qwen
-training is not implemented yet.
+gathered shard outputs match the full linear projections. A companion TP=2
+attention smoke shards Q/K/V heads, applies rank-local attention, sums O-proj
+input-column contributions on rank0, and verifies parity against full layer0
+attention. Real multi-GPU Qwen training is not implemented yet.
 The Qwen DP smoke writes a rank0-only JSON checkpoint manifest after gradient
 sync succeeds; non-rank0 summaries record the same checkpoint path but do not
 write it.

@@ -261,6 +261,16 @@ enum Command {
         #[arg(long)]
         output_dir: PathBuf,
     },
+    #[command(hide = true)]
+    QwenTpAttentionRankSmoke {
+        #[arg(
+            long,
+            default_value = "/vePFS-Mindverse/share/huggingface/Qwen2.5-0.5B-Instruct"
+        )]
+        model_path: PathBuf,
+        #[arg(long)]
+        output_dir: PathBuf,
+    },
     Launch {
         #[arg(long)]
         nproc_per_node: usize,
@@ -475,6 +485,10 @@ fn main() -> Result<()> {
             model_path,
             output_dir,
         } => qwen_module::qwen_tp_linear_rank_smoke(&model_path, output_dir),
+        Command::QwenTpAttentionRankSmoke {
+            model_path,
+            output_dir,
+        } => qwen_module::qwen_tp_attention_rank_smoke(&model_path, output_dir),
         Command::Launch {
             nproc_per_node,
             output_dir,
