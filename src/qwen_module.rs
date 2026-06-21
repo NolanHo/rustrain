@@ -289,6 +289,8 @@ struct QwenSessionDpRankSummary {
     sharded_global_manifest_output: String,
     reloaded_loss: f64,
     reload_delta: f64,
+    sharded_reloaded_loss: f64,
+    sharded_reload_delta: f64,
     continuous_next_loss: f64,
     resumed_next_loss: f64,
     next_step_delta: f64,
@@ -2606,6 +2608,43 @@ pub fn qwen_session_dp_rank_smoke(
         world_size,
         Duration::from_secs(300),
     )?;
+    let sharded_global_text =
+        fs::read_to_string(&sharded_global_manifest_output).with_context(|| {
+            format!(
+                "failed to read {}",
+                sharded_global_manifest_output.display()
+            )
+        })?;
+    let sharded_global_manifest: QwenShardedCheckpointManifest =
+        serde_json::from_str(&sharded_global_text).with_context(|| {
+            format!(
+                "failed to parse {}",
+                sharded_global_manifest_output.display()
+            )
+        })?;
+    sharded_global_manifest.validate()?;
+    let sharded_delta_manifest = qwen_sharded_rank_to_delta_manifest(
+        &sharded_global_manifest,
+        rank,
+        expected_loss,
+        global_post_update_loss,
+        learning_rate,
+    )?;
+    let sharded_resumed_session = QwenTrainableSession::from_manifest_on_device(
+        config,
+        read_safetensors_map(&model_path.join("model.safetensors"))?,
+        local_input.shallow_clone(),
+        dtype.kind(),
+        &sharded_delta_manifest,
+        Some(device),
+    )?;
+    let sharded_reloaded_loss = sharded_resumed_session.loss_value()?;
+    let sharded_reload_delta = (post_update_loss - sharded_reloaded_loss).abs();
+    if sharded_reload_delta > 1e-5 {
+        bail!(
+            "Qwen session DP sharded checkpoint reload parity failed: rank={rank}, post_update_loss={post_update_loss}, sharded_reloaded_loss={sharded_reloaded_loss}, sharded_reload_delta={sharded_reload_delta}"
+        );
+    }
 
     let summary = QwenSessionDpRankSummary {
         rank,
@@ -2632,6 +2671,8 @@ pub fn qwen_session_dp_rank_smoke(
         sharded_global_manifest_output: sharded_global_manifest_output.display().to_string(),
         reloaded_loss,
         reload_delta,
+        sharded_reloaded_loss,
+        sharded_reload_delta,
         continuous_next_loss,
         resumed_next_loss,
         next_step_delta,
@@ -2782,6 +2823,46 @@ fn write_qwen_session_dp_global_sharded_manifest(
         serde_json::to_string_pretty(&manifest)? + "\n",
     )
     .with_context(|| format!("failed to write {}", manifest_output.display()))
+}
+
+fn qwen_sharded_rank_to_delta_manifest(
+    manifest: &QwenShardedCheckpointManifest,
+    rank: usize,
+    initial_loss: f64,
+    final_loss: f64,
+    learning_rate: f64,
+) -> Result<QwenDeltaCheckpointManifest> {
+    manifest.validate()?;
+    let rank_manifest = manifest
+        .ranks
+        .iter()
+        .find(|entry| entry.rank == rank)
+        .ok_or_else(|| anyhow!("Qwen sharded checkpoint is missing rank {rank}"))?;
+    Ok(QwenDeltaCheckpointManifest {
+        format: "rustrain.qwen_delta.v1".to_string(),
+        base_model_path: manifest.base_model_path.clone(),
+        reference_fixture: format!("qwen_sharded_rank_{rank}"),
+        delta_safetensors: rank_manifest.model_safetensors.clone(),
+        optimizer_safetensors: Some(rank_manifest.optimizer_safetensors.clone()),
+        train_step: manifest.global_step,
+        learning_rate,
+        initial_loss,
+        final_loss,
+        tensors: rank_manifest
+            .shards
+            .iter()
+            .map(|shard| QwenDeltaTensorManifestEntry {
+                name: shard.name.clone(),
+                delta_name: shard.shard_name.clone(),
+                adam_m_name: Some(shard.optimizer_m_name.clone()),
+                adam_v_name: Some(shard.optimizer_v_name.clone()),
+                shape: shard.global_shape.clone(),
+                dtype: shard.dtype.clone(),
+                grad_norm: 0.0,
+                delta_norm: 0.0,
+            })
+            .collect(),
+    })
 }
 
 pub fn train_qwen_session_dp_from_config(config: &Config, _run_paths: &RunPaths) -> Result<()> {
@@ -5599,6 +5680,31 @@ mod tests {
         assert_eq!(decoded.format, "rustrain.qwen_sharded.v1");
         assert_eq!(decoded.global_step, 3);
         assert_eq!(decoded.ranks.len(), 2);
+    }
+
+    #[test]
+    fn qwen_sharded_rank_manifest_converts_to_delta_manifest() {
+        let manifest = tiny_qwen_sharded_manifest();
+
+        let delta = qwen_sharded_rank_to_delta_manifest(&manifest, 1, 2.0, 1.5, 1e-6)
+            .expect("rank should convert");
+
+        assert_eq!(delta.format, "rustrain.qwen_delta.v1");
+        assert_eq!(delta.reference_fixture, "qwen_sharded_rank_1");
+        assert_eq!(delta.delta_safetensors, "rank1/model.safetensors");
+        assert_eq!(
+            delta.optimizer_safetensors,
+            Some("rank1/optimizer.safetensors".to_string())
+        );
+        assert_eq!(
+            delta.tensors[0].name,
+            "model.layers.0.self_attn.q_proj.weight"
+        );
+        assert_eq!(delta.tensors[0].delta_name, "rank1.q_proj");
+        assert_eq!(
+            delta.tensors[0].adam_m_name,
+            Some("rank1.q_proj.m".to_string())
+        );
     }
 
     #[test]

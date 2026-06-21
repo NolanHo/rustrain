@@ -19,7 +19,7 @@ remote_run_2gpu() {
     "${SCRIPT_DIR}/gpu_run.sh" "$@"
 }
 
-remote_run_2gpu env RUSTRAIN_LAUNCH_TIMEOUT_SECS=600 cargo run -- launch \
-  --nproc-per-node 2 \
-  --output-dir "${OUTPUT_DIR}" \
-  train --config configs/qwen_session_dp2.toml
+remote_run_2gpu env \
+  RUSTRAIN_LAUNCH_TIMEOUT_SECS=600 \
+  RUSTRAIN_DISTRIBUTED_VERIFY_OUTPUT_DIR="${OUTPUT_DIR}" \
+  bash scripts/verify_qwen_session_dp2_worker.sh
