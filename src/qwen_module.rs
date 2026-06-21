@@ -144,6 +144,8 @@ struct QwenLoraTrainSmokeSummary {
 pub(crate) struct QwenLoraSftTrainSummary {
     pub(crate) model_path: String,
     pub(crate) adapter_output: String,
+    pub(crate) resume_from: Option<String>,
+    pub(crate) resumed_adapter: bool,
     pub(crate) target_layers: Vec<usize>,
     pub(crate) target_modules: Vec<String>,
     pub(crate) train_samples: usize,
@@ -1058,6 +1060,7 @@ pub fn qwen_lora_sft_smoke(
         model_path,
         adapter_output,
         sft_paths.as_deref(),
+        None,
         sft_batch_size,
         instruction,
         response,
@@ -1117,6 +1120,7 @@ pub fn train_qwen_lora_sft_from_config(
         model_path,
         &adapter_output,
         Some(&data.paths),
+        config.train.resume_from.as_deref(),
         config.train.micro_batch_size,
         "Reply with rustrain.",
         "rustrain",
@@ -1134,6 +1138,7 @@ fn qwen_lora_sft_train(
     model_path: &Path,
     adapter_output: &Path,
     sft_paths: Option<&[PathBuf]>,
+    resume_from: Option<&Path>,
     sft_batch_size: usize,
     instruction: &str,
     response: &str,
@@ -1188,7 +1193,19 @@ fn qwen_lora_sft_train(
     let eval_batch = eval_dataset.padded_batch(0, eval_batch_size)?;
     let weights = read_safetensors_map(&model_path.join("model.safetensors"))?;
     let config = read_runtime_config(&model_path.join("config.json"))?;
-    let registry = QwenLoraRegistry::deterministic(&weights, &lora_config, true)?;
+    let registry = if let Some(resume_from) = resume_from {
+        let registry = QwenLoraRegistry::load(resume_from)?;
+        if registry.config != lora_config {
+            bail!(
+                "Qwen LoRA SFT resume adapter config does not match current [lora] config: resume={:?}, current={:?}",
+                registry.config,
+                lora_config
+            );
+        }
+        registry
+    } else {
+        QwenLoraRegistry::deterministic(&weights, &lora_config, true)?
+    };
     let mut base_requires_grad = false;
     for layer_index in &lora_config.target_layers {
         let base_layer = QwenLayerWeights::load(&weights, *layer_index)?;
@@ -1425,6 +1442,8 @@ fn qwen_lora_sft_train(
     let summary = QwenLoraSftTrainSummary {
         model_path: model_path.display().to_string(),
         adapter_output: adapter_output.display().to_string(),
+        resume_from: resume_from.map(|path| path.display().to_string()),
+        resumed_adapter: resume_from.is_some(),
         target_layers: lora_config.target_layers.clone(),
         target_modules: lora_config.target_module_names(),
         train_samples: train_dataset.len(),
@@ -3736,8 +3755,12 @@ impl QwenAttentionLoraAdapter {
             modules.insert(
                 *module,
                 QwenLoraModuleAdapter {
-                    a: tensor(tensors, &format!("{prefix}.lora_a"))?.to_kind(Kind::Float),
-                    b: tensor(tensors, &format!("{prefix}.lora_b"))?.to_kind(Kind::Float),
+                    a: tensor(tensors, &format!("{prefix}.lora_a"))?
+                        .to_kind(Kind::Float)
+                        .set_requires_grad(true),
+                    b: tensor(tensors, &format!("{prefix}.lora_b"))?
+                        .to_kind(Kind::Float)
+                        .set_requires_grad(true),
                 },
             );
         }
@@ -5476,6 +5499,12 @@ mod tests {
         let reloaded = QwenLoraRegistry::load(&adapter_output).expect("registry should reload");
 
         assert_eq!(reloaded.config, config);
+        for (name, tensor) in reloaded.trainable_tensors() {
+            assert!(
+                tensor.requires_grad(),
+                "{name} should remain trainable after reload"
+            );
+        }
         assert!(
             diff_stats(
                 &reloaded

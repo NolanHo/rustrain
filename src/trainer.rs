@@ -178,6 +178,8 @@ pub fn train(config_path: &Path, resume_from: Option<PathBuf>) -> Result<()> {
         info!(
             initial_loss = summary.initial_loss,
             final_loss = summary.final_loss,
+            resume_from = ?summary.resume_from,
+            resumed_adapter = summary.resumed_adapter,
             initial_eval_loss = summary.initial_eval_loss,
             final_eval_loss = summary.final_eval_loss,
             reloaded_eval_loss = summary.reloaded_eval_loss,
@@ -213,6 +215,10 @@ pub fn train(config_path: &Path, resume_from: Option<PathBuf>) -> Result<()> {
         println!("run_dir: {}", run_paths.root.display());
         println!("resolved_config: {}", run_paths.resolved_config.display());
         println!("adapter_checkpoint: {}", summary.adapter_output);
+        println!("resumed_adapter: {}", summary.resumed_adapter);
+        if let Some(resume_from) = &summary.resume_from {
+            println!("resume_from: {resume_from}");
+        }
         println!("train_samples: {}", summary.train_samples);
         println!("eval_samples: {}", summary.eval_samples);
         println!("initial_loss: {:.9}", summary.initial_loss);
