@@ -112,6 +112,8 @@ RUSTRAIN_RAY_NUM_GPUS=2 scripts/gpu_run.sh env RUSTRAIN_LAUNCH_TIMEOUT_SECS=300 
 RUSTRAIN_RAY_NUM_GPUS=2 scripts/gpu_run.sh env RUSTRAIN_LAUNCH_TIMEOUT_SECS=600 cargo run -- launch --nproc-per-node 2 --output-dir /tmp/rustrain-runs/qwen-session-dp-adamw-smoke qwen-session-dp-rank-smoke --dtype fp32 --steps 2 --learning-rate 0.000001 --output-dir /tmp/rustrain-runs/qwen-session-dp-adamw-smoke/ranks
 RUSTRAIN_RAY_NUM_GPUS=2 scripts/gpu_run.sh env RUSTRAIN_LAUNCH_TIMEOUT_SECS=600 cargo run -- launch --nproc-per-node 2 --output-dir /tmp/rustrain-runs/qwen-session-trainer-dp2 train --config configs/qwen_session_dp2.toml
 RUSTRAIN_RAY_NUM_GPUS=2 scripts/gpu_run.sh cargo run -- launch --nproc-per-node 2 --output-dir /tmp/rustrain-runs/qwen-session-trainer-tp2 train --config configs/qwen_session_tp2.toml
+RUSTRAIN_RAY_NUM_GPUS=2 scripts/gpu_run.sh cargo run -- launch --nproc-per-node 2 --output-dir /tmp/rustrain-runs/ep-rank-local-smoke parallel-ep-rank-smoke --output-dir /tmp/rustrain-runs/ep-rank-local-smoke/ranks
+RUSTRAIN_RAY_NUM_GPUS=2 scripts/gpu_run.sh cargo run -- launch --nproc-per-node 2 --output-dir /tmp/rustrain-runs/ep-nccl-smoke parallel-ep-nccl-rank-smoke --output-dir /tmp/rustrain-runs/ep-nccl-smoke/ranks
 scripts/verify_gpu_distributed.sh
 ```
 
@@ -177,9 +179,16 @@ single-GPU path with 26 trainable tensors, and
 `configs/qwen_session_single_layers03.toml` verifies a layer0-layer3
 single-GPU path with 50 trainable tensors. The same layer0-layer3 path also
 has bf16 coverage through `configs/qwen_session_single_layers03_bf16.toml`.
-Full production Qwen trainer
-ownership, full real data streaming, and production-grade sharded checkpoint
-ownership remain open.
+Expert-parallel coverage is still toy-sized, but it now has two real
+launcher-backed two-rank paths: `parallel-ep-rank-smoke` verifies rank-local
+expert ownership and token coverage, while `parallel-ep-nccl-rank-smoke` builds
+rank-local expert output tensors on CUDA, combines dense contributions with
+NCCL all-reduce, and verifies an explicit gradient-bridge update lowers a tiny
+MSE target. Production EP is still open: sparse MoE dispatch/combine
+collectives, autograd-aware collectives, load-balancing loss, trainer
+ownership, and expert optimizer checkpointing are not implemented.
+Full production Qwen trainer ownership, full real data streaming, and
+production-grade sharded checkpoint ownership remain open.
 
 ## Current Major Gaps
 
@@ -234,10 +243,12 @@ ownership remain open.
   TP sharded-manifest smokes also run through
   `train --config configs/qwen_session_tp2.toml`; that focused TP path restores
   rank-owned shards through the global sharded manifest and checks fused layer0
-  output plus next-update parity. Real production distributed training is still
-  missing: full Qwen model/data integration, full-parameter production TP
-  backward/update, production collectives, and production sharded checkpoint
-  ownership are not yet implemented.
+  output plus next-update parity. EP has toy rank-local and CUDA/NCCL combine
+  smokes, but not production sparse all-to-all or trainer-owned expert state.
+  Real production distributed training is still missing: full Qwen model/data
+  integration, full-parameter production TP backward/update, production
+  collectives, production EP, and production sharded checkpoint ownership are
+  not yet implemented.
 - Production distributed checkpoint rules are documented in
   [docs/checkpoints.md](docs/checkpoints.md), with a validated
   `rustrain.qwen_sharded.v1` manifest schema and representative rank-owned
