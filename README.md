@@ -35,14 +35,21 @@ Run the focused verification suite:
 scripts/verify_gpu.sh
 ```
 
+Run the representative 2-GPU distributed verification suite:
+
+```sh
+scripts/verify_gpu_distributed.sh
+```
+
 Both scripts SSH to `root@192.168.42.106:2222`, submit work to Ray with GPU
 resources, enter the remote checkout, and source `scripts/tch_a800_env.sh`
 before running project commands. `scripts/verify_gpu.sh` stages the current
-working tree by default; set `RUSTRAIN_SYNC_TO_WORKER=0` only when you explicitly
-want to validate the remote checkout as-is. Do not run `cargo check`, `cargo
-test`, train smokes, parity commands, or quick local CPU checks on the local
-machine. Do not run them directly in the plain SSH shell either; that shell does
-not expose the GPU devices. If a check is worth running, run it on a Ray GPU
+working tree by default, and `scripts/verify_gpu_distributed.sh` does the same
+while reserving two Ray GPUs; set `RUSTRAIN_SYNC_TO_WORKER=0` only when you
+explicitly want to validate the remote checkout as-is. Do not run `cargo check`,
+`cargo test`, train smokes, parity commands, or quick local CPU checks on the
+local machine. Do not run them directly in the plain SSH shell either; that shell
+does not expose the GPU devices. If a check is worth running, run it on a Ray GPU
 worker.
 
 The preferred remote checkout is:
@@ -101,6 +108,7 @@ RUSTRAIN_RAY_NUM_GPUS=2 scripts/gpu_run.sh env RUSTRAIN_LAUNCH_TIMEOUT_SECS=300 
 RUSTRAIN_RAY_NUM_GPUS=2 scripts/gpu_run.sh env RUSTRAIN_LAUNCH_TIMEOUT_SECS=300 cargo run -- launch --nproc-per-node 2 --output-dir /tmp/rustrain-runs/qwen-dp-gradient-smoke-steps3 qwen-dp-gradient-rank-smoke --dtype fp32 --steps 3 --learning-rate 1.0 --output-dir /tmp/rustrain-runs/qwen-dp-gradient-smoke-steps3/ranks
 RUSTRAIN_RAY_NUM_GPUS=2 scripts/gpu_run.sh env RUSTRAIN_LAUNCH_TIMEOUT_SECS=600 cargo run -- launch --nproc-per-node 2 --output-dir /tmp/rustrain-runs/qwen-session-dp-adamw-smoke qwen-session-dp-rank-smoke --dtype fp32 --steps 2 --learning-rate 0.000001 --output-dir /tmp/rustrain-runs/qwen-session-dp-adamw-smoke/ranks
 RUSTRAIN_RAY_NUM_GPUS=2 scripts/gpu_run.sh env RUSTRAIN_LAUNCH_TIMEOUT_SECS=600 cargo run -- launch --nproc-per-node 2 --output-dir /tmp/rustrain-runs/qwen-session-trainer-dp2 train --config configs/qwen_session_dp2.toml
+scripts/verify_gpu_distributed.sh
 ```
 
 The launcher sets `RANK`, `LOCAL_RANK`, `WORLD_SIZE`, `LOCAL_WORLD_SIZE`,
