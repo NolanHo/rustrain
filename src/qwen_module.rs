@@ -960,6 +960,7 @@ struct QwenSftRecord {
 struct QwenSftDataset {
     samples: Vec<QwenSftTokenSample>,
     pad_token_id: i64,
+    epoch_shuffle_seed: Option<u64>,
 }
 
 struct QwenSftBatch {
@@ -5981,6 +5982,7 @@ impl QwenSftDataset {
         Ok(Self {
             samples,
             pad_token_id: qwen_pad_token_id(tokenizer),
+            epoch_shuffle_seed: None,
         })
     }
 
@@ -6001,10 +6003,12 @@ impl QwenSftDataset {
             Self {
                 samples: self.samples[..split_at].to_vec(),
                 pad_token_id: self.pad_token_id,
+                epoch_shuffle_seed: self.epoch_shuffle_seed,
             },
             Self {
                 samples: self.samples[split_at..].to_vec(),
                 pad_token_id: self.pad_token_id,
+                epoch_shuffle_seed: self.epoch_shuffle_seed,
             },
         ))
     }
@@ -6012,6 +6016,7 @@ impl QwenSftDataset {
     fn shuffle_by_seed(mut self, seed: u64) -> Self {
         let mut rng = StdRng::seed_from_u64(seed);
         self.samples.shuffle(&mut rng);
+        self.epoch_shuffle_seed = Some(seed);
         self
     }
 
@@ -6042,25 +6047,51 @@ impl QwenSftDataset {
         }
     }
 
+    fn sample_at_cursor(&self, cursor: usize) -> Result<QwenSftTokenSample> {
+        if self.samples.is_empty() {
+            bail!("SFT dataset must contain at least one sample");
+        }
+        let dataset_len = self.samples.len();
+        let epoch = cursor / dataset_len;
+        let offset = cursor % dataset_len;
+        let index = if let Some(seed) = self.epoch_shuffle_seed {
+            qwen_epoch_permutation_index(dataset_len, seed, epoch, offset)
+        } else {
+            offset
+        };
+        self.samples
+            .get(index)
+            .cloned()
+            .ok_or_else(|| anyhow!("SFT cursor resolved out-of-range sample index {index}"))
+    }
+
     fn padded_batch(&self, start: usize, batch_size: usize) -> Result<QwenSftBatch> {
         if batch_size == 0 {
             bail!("SFT batch size must be positive");
         }
-        if self.samples.is_empty() {
-            bail!("SFT dataset must contain at least one sample");
-        }
         let samples = (0..batch_size)
-            .map(|offset| {
-                let index = (start + offset) % self.samples.len();
-                self.samples[index].clone()
-            })
-            .collect::<Vec<_>>();
+            .map(|offset| self.sample_at_cursor(start + offset))
+            .collect::<Result<Vec<_>>>()?;
         qwen_sft_padded_batch(&samples, self.pad_token_id)
     }
 
     fn len(&self) -> usize {
         self.samples.len()
     }
+}
+
+fn qwen_epoch_permutation_index(
+    dataset_len: usize,
+    dataset_order_seed: u64,
+    epoch: usize,
+    offset: usize,
+) -> usize {
+    let mut order = (0..dataset_len).collect::<Vec<_>>();
+    let mut rng = StdRng::seed_from_u64(
+        dataset_order_seed ^ ((epoch as u64).wrapping_add(1)).wrapping_mul(0x9E37_79B9_7F4A_7C15),
+    );
+    order.shuffle(&mut rng);
+    order[offset]
 }
 
 fn qwen_sft_examples_from_jsonl_paths(paths: &[PathBuf]) -> Result<Vec<QwenSftExample>> {
@@ -7633,6 +7664,7 @@ mod tests {
                 },
             ],
             pad_token_id: 0,
+            epoch_shuffle_seed: None,
         };
 
         let batch = dataset
@@ -7671,6 +7703,7 @@ mod tests {
                 })
                 .collect(),
             pad_token_id: 0,
+            epoch_shuffle_seed: None,
         };
 
         let (train, eval) = dataset
@@ -7704,6 +7737,7 @@ mod tests {
                 })
                 .collect(),
             pad_token_id: 0,
+            epoch_shuffle_seed: None,
         };
 
         let summary = dataset.summary();
@@ -7733,6 +7767,57 @@ mod tests {
         assert_eq!(summary.max_sequence_tokens, 3);
         assert_eq!(order_a, order_b);
         assert_ne!(order_a, order_c);
+    }
+
+    #[test]
+    fn qwen_sft_dataset_epoch_shuffle_is_cursor_stable() {
+        let dataset = QwenSftDataset {
+            samples: (0..6)
+                .map(|index| QwenSftTokenSample {
+                    prompt_tokens: 1,
+                    response_tokens: 1,
+                    masked_positions: 1,
+                    token_ids: vec![index, index + 10],
+                    mask_values: vec![1.0],
+                })
+                .collect(),
+            pad_token_id: 0,
+            epoch_shuffle_seed: None,
+        }
+        .shuffle_by_seed(777);
+
+        let epoch0_a = (0..dataset.len())
+            .map(|cursor| dataset.sample_at_cursor(cursor).unwrap().token_ids[0])
+            .collect::<Vec<_>>();
+        let epoch0_b = (0..dataset.len())
+            .map(|cursor| dataset.sample_at_cursor(cursor).unwrap().token_ids[0])
+            .collect::<Vec<_>>();
+        let epoch1 = (dataset.len()..dataset.len() * 2)
+            .map(|cursor| dataset.sample_at_cursor(cursor).unwrap().token_ids[0])
+            .collect::<Vec<_>>();
+        let epoch2 = (dataset.len() * 2..dataset.len() * 3)
+            .map(|cursor| dataset.sample_at_cursor(cursor).unwrap().token_ids[0])
+            .collect::<Vec<_>>();
+
+        assert_eq!(epoch0_a, epoch0_b);
+        assert!(epoch0_a != epoch1 || epoch0_a != epoch2);
+
+        let wrapped_batch = dataset
+            .padded_batch(dataset.len() - 1, 3)
+            .expect("epoch-crossing batch should build");
+        let wrapped_values: Vec<i64> =
+            Vec::<i64>::try_from(wrapped_batch.input_ids.reshape([-1])).unwrap();
+        assert_eq!(
+            wrapped_values,
+            vec![
+                epoch0_a[dataset.len() - 1],
+                epoch0_a[dataset.len() - 1] + 10,
+                epoch1[0],
+                epoch1[0] + 10,
+                epoch1[1],
+                epoch1[1] + 10,
+            ]
+        );
     }
 
     #[test]
