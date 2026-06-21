@@ -149,6 +149,8 @@ pub(crate) struct QwenLoraSftTrainSummary {
     pub(crate) train_samples: usize,
     pub(crate) eval_samples: usize,
     pub(crate) batch_size: usize,
+    pub(crate) global_batch_size: usize,
+    pub(crate) gradient_accumulation_steps: usize,
     pub(crate) eval_batch_size: usize,
     pub(crate) prompt_tokens: Vec<usize>,
     pub(crate) response_tokens: Vec<usize>,
@@ -1063,6 +1065,7 @@ pub fn qwen_lora_sft_smoke(
         learning_rate,
         1,
         0.5,
+        1,
         QwenLoraSftTrainPolicy::constant_without_clip(),
     )?;
     println!("{}", serde_json::to_string_pretty(&summary)?);
@@ -1121,6 +1124,7 @@ pub fn train_qwen_lora_sft_from_config(
         config.train.learning_rate as f64,
         config.train.max_steps as usize,
         data.train_split,
+        config.train.gradient_accumulation_steps,
         QwenLoraSftTrainPolicy::from_config(config),
     )
 }
@@ -1137,6 +1141,7 @@ fn qwen_lora_sft_train(
     learning_rate: f64,
     steps: usize,
     train_split: f32,
+    gradient_accumulation_steps: usize,
     policy: QwenLoraSftTrainPolicy,
 ) -> Result<QwenLoraSftTrainSummary> {
     if learning_rate <= 0.0 {
@@ -1147,6 +1152,9 @@ fn qwen_lora_sft_train(
     }
     if steps == 0 {
         bail!("steps must be positive");
+    }
+    if gradient_accumulation_steps == 0 {
+        bail!("gradient_accumulation_steps must be positive");
     }
     if !(0.0..1.0).contains(&train_split) {
         bail!("train_split must be in (0, 1)");
@@ -1230,16 +1238,20 @@ fn qwen_lora_sft_train(
         for (_, mut tensor) in registry.trainable_tensors() {
             tensor.zero_grad();
         }
-        let step_batch = train_dataset.padded_batch(step * train_batch_size, train_batch_size)?;
-        let loss = qwen_lora_sft_loss(
-            &step_batch.input_ids,
-            &step_batch.target_mask,
-            &weights,
-            &lora_config,
-            &registry,
-            &config,
-        )?;
-        loss.backward();
+        for accumulation_index in 0..gradient_accumulation_steps {
+            let sample_start =
+                (step * gradient_accumulation_steps + accumulation_index) * train_batch_size;
+            let step_batch = train_dataset.padded_batch(sample_start, train_batch_size)?;
+            let loss = qwen_lora_sft_loss(
+                &step_batch.input_ids,
+                &step_batch.target_mask,
+                &weights,
+                &lora_config,
+                &registry,
+                &config,
+            )? / gradient_accumulation_steps as f64;
+            loss.backward();
+        }
 
         tensor_summaries.clear();
         let trainable_tensors = registry.trainable_tensors();
@@ -1418,6 +1430,8 @@ fn qwen_lora_sft_train(
         train_samples: train_dataset.len(),
         eval_samples: eval_dataset.len(),
         batch_size: initial_batch.prompt_tokens.len(),
+        global_batch_size: train_batch_size * gradient_accumulation_steps,
+        gradient_accumulation_steps,
         eval_batch_size,
         prompt_tokens: initial_batch.prompt_tokens,
         response_tokens: initial_batch.response_tokens,
@@ -5721,9 +5735,7 @@ mod tests {
         let train_batch = train
             .padded_batch(2, 3)
             .expect("train wrapping batch should build");
-        let eval_batch = eval
-            .padded_batch(0, 2)
-            .expect("eval batch should build");
+        let eval_batch = eval.padded_batch(0, 2).expect("eval batch should build");
         let train_values: Vec<i64> =
             Vec::<i64>::try_from(train_batch.input_ids.reshape([-1])).unwrap();
         let eval_values: Vec<i64> =

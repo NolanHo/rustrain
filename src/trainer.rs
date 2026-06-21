@@ -199,6 +199,8 @@ pub fn train(config_path: &Path, resume_from: Option<PathBuf>) -> Result<()> {
             train_samples = summary.train_samples,
             eval_samples = summary.eval_samples,
             batch_size = summary.batch_size,
+            global_batch_size = summary.global_batch_size,
+            gradient_accumulation_steps = summary.gradient_accumulation_steps,
             eval_batch_size = summary.eval_batch_size,
             sequence_tokens = summary.sequence_tokens,
             response_masked_positions = summary.response_masked_positions,
@@ -258,6 +260,11 @@ pub fn train(config_path: &Path, resume_from: Option<PathBuf>) -> Result<()> {
             summary.final_step_clipped_grad_norm
         );
         println!("batch_size: {}", summary.batch_size);
+        println!("global_batch_size: {}", summary.global_batch_size);
+        println!(
+            "gradient_accumulation_steps: {}",
+            summary.gradient_accumulation_steps
+        );
         println!("eval_batch_size: {}", summary.eval_batch_size);
         println!("sequence_tokens: {}", summary.sequence_tokens);
         println!(

@@ -302,9 +302,11 @@ pub fn validate_config(config: &Config) -> Result<()> {
         if config.train.micro_batch_size == 0 {
             return Err(anyhow!("qwen_lora_sft requires micro_batch_size > 0"));
         }
-        if config.train.global_batch_size != config.train.micro_batch_size {
+        let expected_global_batch_size =
+            config.train.micro_batch_size * config.train.gradient_accumulation_steps;
+        if config.train.global_batch_size != expected_global_batch_size {
             return Err(anyhow!(
-                "qwen_lora_sft currently requires global_batch_size = micro_batch_size"
+                "qwen_lora_sft requires global_batch_size = micro_batch_size * gradient_accumulation_steps"
             ));
         }
     } else if config.train.micro_batch_size != 1 || config.train.global_batch_size != 1 {
@@ -401,4 +403,93 @@ fn default_lr_scheduler() -> LrScheduler {
 
 fn default_backend() -> BackendKind {
     BackendKind::NdArray
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn qwen_lora_sft_global_batch_matches_gradient_accumulation() {
+        let mut config = qwen_lora_sft_config();
+
+        validate_config(&config).expect("matching accumulated global batch should validate");
+
+        config.train.global_batch_size = 2;
+        let error = validate_config(&config).expect_err("mismatched global batch should fail");
+        assert!(error.to_string().contains(
+            "qwen_lora_sft requires global_batch_size = micro_batch_size * gradient_accumulation_steps"
+        ));
+    }
+
+    fn qwen_lora_sft_config() -> Config {
+        Config {
+            run: RunConfig {
+                name: "qwen_lora_sft_test".to_string(),
+                base_dir: "/tmp/rustrain-runs".into(),
+                seed: 0,
+            },
+            model: ModelConfig {
+                name: "qwen2_5_0_5b_lora_sft".to_string(),
+                architecture: "qwen_lora_sft".to_string(),
+                model_path: Some("/vePFS-Mindverse/share/huggingface/Qwen2.5-0.5B-Instruct".into()),
+                vocab_size: 151936,
+                hidden_size: 896,
+                num_layers: 24,
+                num_attention_heads: 14,
+                num_key_value_heads: 2,
+                intermediate_size: 4864,
+                seq_len: 32,
+                norm: "rmsnorm".to_string(),
+                activation: "swiglu".to_string(),
+                rope: true,
+                rms_norm_eps: 1e-6,
+            },
+            train: TrainConfig {
+                max_steps: 2,
+                resume_from: None,
+                backend: BackendKind::Tch,
+                micro_batch_size: 2,
+                global_batch_size: 4,
+                gradient_accumulation_steps: 2,
+                learning_rate: 100.0,
+                weight_decay: 0.0,
+                adam_beta1: 0.9,
+                adam_beta2: 0.999,
+                adam_eps: 1e-8,
+                lr_scheduler: LrScheduler::LinearDecay,
+                max_grad_norm: Some(0.0001),
+                dtype: DType::Fp32,
+                device: Device::Cuda,
+                checkpoint_every: 0,
+                eval_every: 0,
+            },
+            data: Some(DataConfig {
+                kind: DataKind::InstructionJsonl,
+                paths: vec!["data/sft_toy/instructions.jsonl".into()],
+                train_split: 0.8,
+            }),
+            lora: Some(LoraConfig {
+                rank: 4,
+                alpha: 8.0,
+                target_layers: vec![0, 1],
+                target_modules: vec![
+                    "q_proj".to_string(),
+                    "k_proj".to_string(),
+                    "v_proj".to_string(),
+                    "o_proj".to_string(),
+                    "gate_proj".to_string(),
+                    "up_proj".to_string(),
+                    "down_proj".to_string(),
+                ],
+            }),
+            parallel: ParallelConfig {
+                tensor_model_parallel_size: 1,
+                pipeline_model_parallel_size: 1,
+                data_parallel_size: 1,
+                expert_model_parallel_size: 1,
+                context_parallel_size: 1,
+            },
+        }
+    }
 }
