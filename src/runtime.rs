@@ -206,6 +206,8 @@ pub fn validate_config(config: &Config) -> Result<()> {
         && config.model.architecture == "tch_tiny_lm";
     let is_qwen_trainable_session = matches!(config.train.backend, BackendKind::Tch)
         && config.model.architecture == "qwen_trainable_session";
+    let is_qwen_lora_sft = matches!(config.train.backend, BackendKind::Tch)
+        && config.model.architecture == "qwen_lora_sft";
     for (name, value) in parallel_sizes {
         if value == 0 {
             return Err(anyhow!("{name} must be greater than zero"));
@@ -219,16 +221,31 @@ pub fn validate_config(config: &Config) -> Result<()> {
         }
     }
 
-    if is_qwen_trainable_session {
+    if is_qwen_trainable_session || is_qwen_lora_sft {
         if !matches!(config.train.device, Device::Cuda) {
-            return Err(anyhow!("qwen_trainable_session requires device = \"cuda\""));
+            return Err(anyhow!(
+                "{} requires device = \"cuda\"",
+                config.model.architecture
+            ));
         }
         if config.model.model_path.is_none() {
-            return Err(anyhow!("qwen_trainable_session requires model.model_path"));
+            return Err(anyhow!(
+                "{} requires model.model_path",
+                config.model.architecture
+            ));
         }
     }
 
-    if config.train.micro_batch_size != 1 || config.train.global_batch_size != 1 {
+    if is_qwen_lora_sft {
+        if config.train.micro_batch_size == 0 {
+            return Err(anyhow!("qwen_lora_sft requires micro_batch_size > 0"));
+        }
+        if config.train.global_batch_size != config.train.micro_batch_size {
+            return Err(anyhow!(
+                "qwen_lora_sft currently requires global_batch_size = micro_batch_size"
+            ));
+        }
+    } else if config.train.micro_batch_size != 1 || config.train.global_batch_size != 1 {
         return Err(anyhow!(
             "M1 toy backend currently requires micro_batch_size = global_batch_size = 1"
         ));

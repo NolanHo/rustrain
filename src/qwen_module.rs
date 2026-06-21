@@ -12,7 +12,7 @@ use tch::{Device, IndexOp, Kind, Reduction, Tensor, no_grad};
 use tokenizers::Tokenizer;
 
 use crate::nccl_smoke;
-use crate::runtime::{Config, Device as RuntimeDevice, RunPaths};
+use crate::runtime::{Config, DataKind, Device as RuntimeDevice, RunPaths};
 
 #[derive(Debug, Serialize)]
 pub struct DiffStats {
@@ -138,26 +138,27 @@ struct QwenLoraTrainSmokeSummary {
 }
 
 #[derive(Debug, Serialize)]
-struct QwenLoraSftSmokeSummary {
-    model_path: String,
-    adapter_output: String,
-    target_layers: Vec<usize>,
-    target_modules: Vec<String>,
-    batch_size: usize,
-    prompt_tokens: Vec<usize>,
-    response_tokens: Vec<usize>,
-    sequence_tokens: usize,
-    response_masked_positions: usize,
-    padding_tokens: usize,
-    rank: i64,
-    alpha: f64,
-    learning_rate: f64,
-    initial_loss: f64,
-    final_loss: f64,
-    reloaded_loss: f64,
-    reload_delta: f64,
-    base_requires_grad: bool,
-    trainable_tensors: Vec<TrainableTensorSummary>,
+pub(crate) struct QwenLoraSftTrainSummary {
+    pub(crate) model_path: String,
+    pub(crate) adapter_output: String,
+    pub(crate) target_layers: Vec<usize>,
+    pub(crate) target_modules: Vec<String>,
+    pub(crate) batch_size: usize,
+    pub(crate) prompt_tokens: Vec<usize>,
+    pub(crate) response_tokens: Vec<usize>,
+    pub(crate) sequence_tokens: usize,
+    pub(crate) response_masked_positions: usize,
+    pub(crate) padding_tokens: usize,
+    pub(crate) rank: i64,
+    pub(crate) alpha: f64,
+    pub(crate) learning_rate: f64,
+    pub(crate) steps: usize,
+    pub(crate) initial_loss: f64,
+    pub(crate) final_loss: f64,
+    pub(crate) reloaded_loss: f64,
+    pub(crate) reload_delta: f64,
+    pub(crate) base_requires_grad: bool,
+    pub(crate) trainable_tensors: Vec<TrainableTensorSummary>,
 }
 
 #[derive(Debug, Serialize)]
@@ -176,11 +177,11 @@ struct QwenTiedHeadTrainSummary {
 }
 
 #[derive(Debug, Clone, Serialize)]
-struct TrainableTensorSummary {
-    name: String,
-    grad_defined: bool,
-    grad_norm: f64,
-    delta_norm: f64,
+pub(crate) struct TrainableTensorSummary {
+    pub(crate) name: String,
+    pub(crate) grad_defined: bool,
+    pub(crate) grad_norm: f64,
+    pub(crate) delta_norm: f64,
 }
 
 #[derive(Debug, Serialize)]
@@ -1000,6 +1001,84 @@ pub fn qwen_lora_sft_smoke(
     alpha: f64,
     learning_rate: f64,
 ) -> Result<()> {
+    let summary = qwen_lora_sft_train(
+        model_path,
+        adapter_output,
+        sft_jsonl,
+        sft_batch_size,
+        instruction,
+        response,
+        rank,
+        alpha,
+        learning_rate,
+        1,
+    )?;
+    println!("{}", serde_json::to_string_pretty(&summary)?);
+
+    Ok(())
+}
+
+pub fn train_qwen_lora_sft_from_config(
+    config: &Config,
+    run_paths: &RunPaths,
+) -> Result<QwenLoraSftTrainSummary> {
+    if config.model.architecture != "qwen_lora_sft" {
+        bail!(
+            "qwen LoRA SFT trainer expects architecture = qwen_lora_sft, got {}",
+            config.model.architecture
+        );
+    }
+    if !matches!(config.train.device, RuntimeDevice::Cuda) {
+        bail!("qwen LoRA SFT trainer requires device = cuda");
+    }
+    if config.parallel.data_parallel_size != 1 {
+        bail!("qwen LoRA SFT trainer currently expects data_parallel_size = 1");
+    }
+    let model_path = config
+        .model
+        .model_path
+        .as_ref()
+        .context("qwen LoRA SFT trainer requires model.model_path")?;
+    let data = config
+        .data
+        .as_ref()
+        .context("qwen LoRA SFT trainer requires [data] instruction_jsonl")?;
+    if data.kind != DataKind::InstructionJsonl {
+        bail!("qwen LoRA SFT trainer requires data.kind = instruction_jsonl");
+    }
+    if data.paths.len() != 1 {
+        bail!("qwen LoRA SFT trainer currently expects exactly one data path");
+    }
+    let adapter_output = run_paths
+        .checkpoints
+        .join("qwen-lora-sft-adapter.safetensors");
+    qwen_lora_sft_train(
+        model_path,
+        &adapter_output,
+        Some(&data.paths[0]),
+        config.train.micro_batch_size,
+        "Reply with rustrain.",
+        "rustrain",
+        4,
+        8.0,
+        config.train.learning_rate as f64,
+        config.train.max_steps as usize,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn qwen_lora_sft_train(
+    model_path: &Path,
+    adapter_output: &Path,
+    sft_jsonl: Option<&Path>,
+    sft_batch_size: usize,
+    instruction: &str,
+    response: &str,
+    rank: i64,
+    alpha: f64,
+    learning_rate: f64,
+    steps: usize,
+) -> Result<QwenLoraSftTrainSummary> {
     if rank <= 0 {
         bail!("rank must be positive");
     }
@@ -1011,6 +1090,9 @@ pub fn qwen_lora_sft_smoke(
     }
     if sft_batch_size == 0 {
         bail!("sft_batch_size must be positive");
+    }
+    if steps == 0 {
+        bail!("steps must be positive");
     }
 
     let tokenizer = Tokenizer::from_file(model_path.join("tokenizer.json"))
@@ -1053,14 +1135,6 @@ pub fn qwen_lora_sft_smoke(
         &config,
     )?
     .double_value(&[]);
-    let loss = qwen_attention_lora_sft_loss(
-        &batch.input_ids,
-        &batch.target_mask,
-        &weights,
-        registry.layer_adapter(0)?,
-        &config,
-    )?;
-    loss.backward();
 
     let base_tensors: BTreeMap<String, Tensor> = registry
         .trainable_tensors()
@@ -1068,30 +1142,47 @@ pub fn qwen_lora_sft_smoke(
         .map(|(name, tensor)| (name, tensor_snapshot(&tensor)))
         .collect();
     let mut tensor_summaries = Vec::new();
-    for (name, mut tensor) in registry.trainable_tensors() {
-        let grad = tensor.grad();
-        let grad_defined = grad.defined();
-        let grad_norm = if grad_defined {
-            grad.norm().double_value(&[])
-        } else {
-            0.0
-        };
-        if !grad_defined || grad_norm <= 0.0 {
-            bail!("LoRA tensor {name} did not receive a gradient");
+
+    for step in 0..steps {
+        for (_, mut tensor) in registry.trainable_tensors() {
+            tensor.zero_grad();
         }
-        let _ = no_grad(|| tensor.f_sub_(&(&grad * learning_rate)))?;
-        let delta_norm = (&tensor
-            - base_tensors
-                .get(&name)
-                .ok_or_else(|| anyhow!("missing base LoRA tensor {name}"))?)
-        .norm()
-        .double_value(&[]);
-        tensor_summaries.push(TrainableTensorSummary {
-            name,
-            grad_defined,
-            grad_norm,
-            delta_norm,
-        });
+        let loss = qwen_attention_lora_sft_loss(
+            &batch.input_ids,
+            &batch.target_mask,
+            &weights,
+            registry.layer_adapter(0)?,
+            &config,
+        )?;
+        loss.backward();
+
+        tensor_summaries.clear();
+        for (name, mut tensor) in registry.trainable_tensors() {
+            let grad = tensor.grad();
+            let grad_defined = grad.defined();
+            let grad_norm = if grad_defined {
+                grad.norm().double_value(&[])
+            } else {
+                0.0
+            };
+            if !grad_defined || grad_norm <= 0.0 {
+                bail!("LoRA tensor {name} did not receive a gradient");
+            }
+            let step_lr = learning_rate / (step + 1) as f64;
+            let _ = no_grad(|| tensor.f_sub_(&(&grad * step_lr)))?;
+            let delta_norm = (&tensor
+                - base_tensors
+                    .get(&name)
+                    .ok_or_else(|| anyhow!("missing base LoRA tensor {name}"))?)
+            .norm()
+            .double_value(&[]);
+            tensor_summaries.push(TrainableTensorSummary {
+                name,
+                grad_defined,
+                grad_norm,
+                delta_norm,
+            });
+        }
     }
 
     let final_loss = qwen_attention_lora_sft_loss(
@@ -1125,7 +1216,7 @@ pub fn qwen_lora_sft_smoke(
         );
     }
 
-    let summary = QwenLoraSftSmokeSummary {
+    let summary = QwenLoraSftTrainSummary {
         model_path: model_path.display().to_string(),
         adapter_output: adapter_output.display().to_string(),
         target_layers: lora_config.target_layers.clone(),
@@ -1139,6 +1230,7 @@ pub fn qwen_lora_sft_smoke(
         rank,
         alpha,
         learning_rate,
+        steps,
         initial_loss,
         final_loss,
         reloaded_loss,
@@ -1146,9 +1238,7 @@ pub fn qwen_lora_sft_smoke(
         base_requires_grad,
         trainable_tensors: tensor_summaries,
     };
-    println!("{}", serde_json::to_string_pretty(&summary)?);
-
-    Ok(())
+    Ok(summary)
 }
 
 pub fn qwen_tied_head_train_smoke(

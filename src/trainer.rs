@@ -14,7 +14,7 @@ use crate::{
     moe::{deepseek_moe_smoke, moe_smoke},
     parallel::{ProcessGroup, SingleRankProcessGroup},
     parallel_modules::tp1_module_smoke,
-    qwen_module::train_qwen_session_dp_from_config,
+    qwen_module::{train_qwen_lora_sft_from_config, train_qwen_session_dp_from_config},
     runtime::{
         Config, LrScheduler, init_logging, load_config, prepare_run_directory, validate_config,
         write_resolved_config,
@@ -124,6 +124,57 @@ pub fn train(config_path: &Path, resume_from: Option<PathBuf>) -> Result<()> {
         println!("rustrain qwen trainable session DP complete");
         println!("run_dir: {}", run_paths.root.display());
         println!("resolved_config: {}", run_paths.resolved_config.display());
+
+        return Ok(());
+    }
+
+    if matches!(config.train.backend, BackendKind::Tch)
+        && config.model.architecture == "qwen_lora_sft"
+    {
+        let backend = RuntimeBackend::from_kind(config.train.backend);
+        info!(
+            backend = ?backend.kind(),
+            supports_autograd = backend.supports_autograd(),
+            supports_cuda = backend.supports_cuda(),
+            "backend configured"
+        );
+        info!(model = ?config.model, "model config");
+        info!(train = ?config.train, "train config");
+        info!(parallel = ?config.parallel, "parallel config");
+
+        let summary = train_qwen_lora_sft_from_config(&config, &run_paths)?;
+        info!(
+            initial_loss = summary.initial_loss,
+            final_loss = summary.final_loss,
+            reloaded_loss = summary.reloaded_loss,
+            reload_delta = summary.reload_delta,
+            steps = summary.steps,
+            batch_size = summary.batch_size,
+            sequence_tokens = summary.sequence_tokens,
+            response_masked_positions = summary.response_masked_positions,
+            padding_tokens = summary.padding_tokens,
+            adapter_checkpoint = %summary.adapter_output,
+            trainable_tensors = summary.trainable_tensors.len(),
+            "qwen LoRA SFT trainer complete"
+        );
+        println!("rustrain qwen LoRA SFT complete");
+        println!("run_dir: {}", run_paths.root.display());
+        println!("resolved_config: {}", run_paths.resolved_config.display());
+        println!("adapter_checkpoint: {}", summary.adapter_output);
+        println!("initial_loss: {:.9}", summary.initial_loss);
+        println!("final_loss: {:.9}", summary.final_loss);
+        println!("reloaded_loss: {:.9}", summary.reloaded_loss);
+        println!("reload_delta: {:.9}", summary.reload_delta);
+        println!("steps: {}", summary.steps);
+        println!("batch_size: {}", summary.batch_size);
+        println!("sequence_tokens: {}", summary.sequence_tokens);
+        println!(
+            "response_masked_positions: {}",
+            summary.response_masked_positions
+        );
+        println!("padding_tokens: {}", summary.padding_tokens);
+        println!("target_layers: {:?}", summary.target_layers);
+        println!("target_modules: {:?}", summary.target_modules);
 
         return Ok(());
     }
