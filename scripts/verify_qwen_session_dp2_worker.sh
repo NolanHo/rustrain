@@ -113,6 +113,22 @@ for path in rank_summaries:
             raise SystemExit(
                 f"{path} sharded consumed_samples {sharded_manifest['consumed_samples']} does not match expected {expected_cursor_end}"
             )
+        if int(sharded_manifest["data_cursor_next"]) != expected_cursor_end:
+            raise SystemExit(
+                f"{path} sharded data_cursor_next {sharded_manifest['data_cursor_next']} does not match expected {expected_cursor_end}"
+            )
+        if int(sharded_manifest["data_train_samples"]) != train_samples:
+            raise SystemExit(
+                f"{path} sharded data_train_samples {sharded_manifest['data_train_samples']} does not match expected {train_samples}"
+            )
+        if int(sharded_manifest["data_epoch_next"]) != expected_cursor_end // train_samples:
+            raise SystemExit(
+                f"{path} sharded data_epoch_next {sharded_manifest['data_epoch_next']} does not match rank summary"
+            )
+        if int(sharded_manifest["data_sample_offset_next"]) != expected_cursor_end % train_samples:
+            raise SystemExit(
+                f"{path} sharded data_sample_offset_next {sharded_manifest['data_sample_offset_next']} does not match rank summary"
+            )
     evidence.append(
         {
             "rank": data["rank"],

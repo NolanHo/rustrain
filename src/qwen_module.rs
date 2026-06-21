@@ -480,6 +480,41 @@ impl QwenShardedCheckpointManifest {
         if self.optimizer.is_empty() {
             bail!("Qwen sharded checkpoint requires optimizer");
         }
+        if self.consumed_samples == 0 {
+            bail!("Qwen sharded checkpoint consumed_samples must be positive");
+        }
+        if self.consumed_tokens == 0 {
+            bail!("Qwen sharded checkpoint consumed_tokens must be positive");
+        }
+        if let Some(data_cursor_next) = self.data_cursor_next {
+            if data_cursor_next != self.consumed_samples {
+                bail!(
+                    "Qwen sharded checkpoint data_cursor_next {data_cursor_next} must match consumed_samples {}",
+                    self.consumed_samples
+                );
+            }
+        }
+        if let Some(data_train_samples) = self.data_train_samples {
+            if data_train_samples == 0 {
+                bail!("Qwen sharded checkpoint data_train_samples must be positive");
+            }
+            if let Some(data_epoch_next) = self.data_epoch_next {
+                let expected_epoch = self.consumed_samples / data_train_samples;
+                if data_epoch_next != expected_epoch {
+                    bail!(
+                        "Qwen sharded checkpoint data_epoch_next {data_epoch_next} must match consumed_samples/data_train_samples {expected_epoch}"
+                    );
+                }
+            }
+            if let Some(data_sample_offset_next) = self.data_sample_offset_next {
+                let expected_offset = self.consumed_samples % data_train_samples;
+                if data_sample_offset_next != expected_offset {
+                    bail!(
+                        "Qwen sharded checkpoint data_sample_offset_next {data_sample_offset_next} must match consumed_samples%data_train_samples {expected_offset}"
+                    );
+                }
+            }
+        }
         let expected_world_size = self.parallel.world_size()?;
         if self.ranks.len() != expected_world_size {
             bail!(
@@ -718,6 +753,14 @@ struct QwenShardedCheckpointManifest {
     global_step: u64,
     consumed_samples: u64,
     consumed_tokens: u64,
+    #[serde(default)]
+    data_cursor_next: Option<u64>,
+    #[serde(default)]
+    data_epoch_next: Option<u64>,
+    #[serde(default)]
+    data_sample_offset_next: Option<u64>,
+    #[serde(default)]
+    data_train_samples: Option<u64>,
     seed: u64,
     dtype: String,
     optimizer: String,
@@ -3240,6 +3283,9 @@ pub fn qwen_session_dp_rank_smoke(
             batch_plan
                 .train_sample_count
                 .map(|_| data_cursor_next * batch_plan.sequence_tokens),
+            batch_plan.data_epoch_next,
+            batch_plan.data_sample_offset_next,
+            batch_plan.train_sample_count,
             &sharded_global_manifest_output,
         )?;
     }
@@ -3450,6 +3496,9 @@ fn write_qwen_session_dp_global_sharded_manifest(
     dtype: QwenComputeDType,
     consumed_samples: Option<usize>,
     consumed_tokens: Option<usize>,
+    data_epoch_next: Option<usize>,
+    data_sample_offset_next: Option<usize>,
+    data_train_samples: Option<usize>,
     manifest_output: &Path,
 ) -> Result<()> {
     let mut ranks = Vec::with_capacity(world_size);
@@ -3462,19 +3511,23 @@ fn write_qwen_session_dp_global_sharded_manifest(
             .with_context(|| format!("failed to parse {}", rank_manifest_output.display()))?;
         ranks.push(rank_manifest);
     }
+    let consumed_samples_value = consumed_samples.unwrap_or(world_size * steps);
+    let consumed_tokens_value = consumed_tokens.unwrap_or(world_size * steps * 5);
     let manifest = QwenShardedCheckpointManifest {
         format: "rustrain.qwen_sharded.v1".to_string(),
         base_model_path: model_path.display().to_string(),
         tokenizer_path: model_path.join("tokenizer.json").display().to_string(),
         global_step: steps as u64,
-        consumed_samples: consumed_samples
-            .unwrap_or(world_size * steps)
+        consumed_samples: consumed_samples_value
             .try_into()
             .context("consumed_samples overflowed u64")?,
-        consumed_tokens: consumed_tokens
-            .unwrap_or(world_size * steps * 5)
+        consumed_tokens: consumed_tokens_value
             .try_into()
             .context("consumed_tokens overflowed u64")?,
+        data_cursor_next: consumed_samples.map(|value| value as u64),
+        data_epoch_next: data_epoch_next.map(|value| value as u64),
+        data_sample_offset_next: data_sample_offset_next.map(|value| value as u64),
+        data_train_samples: data_train_samples.map(|value| value as u64),
         seed: 42,
         dtype: dtype.label().to_string(),
         optimizer: "adamw".to_string(),
@@ -3518,13 +3571,22 @@ fn qwen_sharded_rank_to_delta_manifest(
         train_step: manifest.global_step,
         data_cursor_start: None,
         data_cursor_end: None,
-        data_cursor_next: None,
+        data_cursor_next: manifest
+            .data_cursor_next
+            .map(|value| usize::try_from(value).context("data_cursor_next overflowed usize"))
+            .transpose()?,
         data_epoch_start: None,
         data_epoch_end: None,
-        data_epoch_next: None,
+        data_epoch_next: manifest
+            .data_epoch_next
+            .map(|value| usize::try_from(value).context("data_epoch_next overflowed usize"))
+            .transpose()?,
         data_sample_offset_start: None,
         data_sample_offset_end: None,
-        data_sample_offset_next: None,
+        data_sample_offset_next: manifest
+            .data_sample_offset_next
+            .map(|value| usize::try_from(value).context("data_sample_offset_next overflowed usize"))
+            .transpose()?,
         learning_rate,
         initial_loss,
         final_loss,
@@ -6734,6 +6796,9 @@ mod tests {
             QwenComputeDType::Fp32,
             Some(12),
             Some(60),
+            Some(2),
+            Some(2),
+            Some(5),
             &output,
         )
         .expect("global manifest should write");
@@ -6747,7 +6812,27 @@ mod tests {
         assert_eq!(decoded.global_step, 3);
         assert_eq!(decoded.consumed_samples, 12);
         assert_eq!(decoded.consumed_tokens, 60);
+        assert_eq!(decoded.data_cursor_next, Some(12));
+        assert_eq!(decoded.data_epoch_next, Some(2));
+        assert_eq!(decoded.data_sample_offset_next, Some(2));
+        assert_eq!(decoded.data_train_samples, Some(5));
         assert_eq!(decoded.ranks.len(), 2);
+    }
+
+    #[test]
+    fn qwen_sharded_checkpoint_manifest_rejects_inconsistent_data_progress() {
+        let mut manifest = tiny_qwen_sharded_manifest();
+        manifest.data_sample_offset_next = Some(5);
+
+        let error = manifest
+            .validate()
+            .expect_err("inconsistent data progress should fail");
+
+        assert!(
+            error
+                .to_string()
+                .contains("data_sample_offset_next 5 must match")
+        );
     }
 
     #[test]
@@ -7781,6 +7866,10 @@ mod tests {
             global_step: 3,
             consumed_samples: 8,
             consumed_tokens: 40,
+            data_cursor_next: Some(8),
+            data_epoch_next: Some(1),
+            data_sample_offset_next: Some(3),
+            data_train_samples: Some(5),
             seed: 42,
             dtype: "float32".to_string(),
             optimizer: "adamw".to_string(),
