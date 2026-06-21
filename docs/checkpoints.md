@@ -222,6 +222,10 @@ Minimum acceptance before calling production sharded checkpointing implemented:
   invalid shard shape metadata, unsupported shard dtype or partition policies,
   duplicate rank-local tensor shard names, and duplicate or colliding optimizer
   slot names. Done for the representative Qwen sharded schema tests.
+- Manifest validation can also open rank-owned model and optimizer
+  safetensors, require every declared shard and AdamW slot to exist, and reject
+  artifact shapes that do not match manifest `shard_shape`. Done for the
+  representative Qwen sharded artifact tests and DP/TP resume verifiers.
 - Manifest validation rejects partial dataset provenance, non-JSONL dataset
   source paths, inconsistent data cursor/epoch/offset fields, and mismatched
   dataset provenance during resume. Done for the representative DP session

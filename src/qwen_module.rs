@@ -984,6 +984,77 @@ impl QwenShardedCheckpointManifest {
         }
         Ok(())
     }
+
+    fn validate_artifacts(&self) -> Result<()> {
+        self.validate()?;
+        for rank in &self.ranks {
+            let model_tensors = read_safetensors_map(Path::new(&rank.model_safetensors))
+                .with_context(|| {
+                    format!(
+                        "failed to validate Qwen sharded checkpoint rank {} model artifacts",
+                        rank.rank
+                    )
+                })?;
+            let optimizer_tensors = read_safetensors_map(Path::new(&rank.optimizer_safetensors))
+                .with_context(|| {
+                    format!(
+                        "failed to validate Qwen sharded checkpoint rank {} optimizer artifacts",
+                        rank.rank
+                    )
+                })?;
+            for shard in &rank.shards {
+                let model_tensor =
+                    tensor(&model_tensors, &shard.shard_name).with_context(|| {
+                        format!(
+                            "Qwen sharded checkpoint rank {} missing model shard {} for {}",
+                            rank.rank, shard.shard_name, shard.name
+                        )
+                    })?;
+                if model_tensor.size() != shard.shard_shape {
+                    bail!(
+                        "Qwen sharded checkpoint rank {} model shard {} shape {:?} does not match manifest shard_shape {:?}",
+                        rank.rank,
+                        shard.shard_name,
+                        model_tensor.size(),
+                        shard.shard_shape
+                    );
+                }
+                let optimizer_m = tensor(&optimizer_tensors, &shard.optimizer_m_name)
+                    .with_context(|| {
+                        format!(
+                            "Qwen sharded checkpoint rank {} missing optimizer m slot {} for {}",
+                            rank.rank, shard.optimizer_m_name, shard.name
+                        )
+                    })?;
+                let optimizer_v = tensor(&optimizer_tensors, &shard.optimizer_v_name)
+                    .with_context(|| {
+                        format!(
+                            "Qwen sharded checkpoint rank {} missing optimizer v slot {} for {}",
+                            rank.rank, shard.optimizer_v_name, shard.name
+                        )
+                    })?;
+                if optimizer_m.size() != shard.shard_shape {
+                    bail!(
+                        "Qwen sharded checkpoint rank {} optimizer m slot {} shape {:?} does not match manifest shard_shape {:?}",
+                        rank.rank,
+                        shard.optimizer_m_name,
+                        optimizer_m.size(),
+                        shard.shard_shape
+                    );
+                }
+                if optimizer_v.size() != shard.shard_shape {
+                    bail!(
+                        "Qwen sharded checkpoint rank {} optimizer v slot {} shape {:?} does not match manifest shard_shape {:?}",
+                        rank.rank,
+                        shard.optimizer_v_name,
+                        optimizer_v.size(),
+                        shard.shard_shape
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 #[allow(dead_code)]
@@ -4729,7 +4800,7 @@ pub fn qwen_session_dp_rank_smoke(
                 sharded_global_manifest_output.display()
             )
         })?;
-    sharded_global_manifest.validate()?;
+    sharded_global_manifest.validate_artifacts()?;
     qwen_validate_optional_sft_resume_dataset(
         &sharded_global_manifest.dataset_source_files,
         &sharded_global_manifest.dataset_source_sample_counts,
@@ -5027,7 +5098,7 @@ fn write_qwen_session_dp_global_sharded_manifest(
         },
         ranks,
     };
-    manifest.validate()?;
+    manifest.validate_artifacts()?;
     fs::write(
         manifest_output,
         serde_json::to_string_pretty(&manifest)? + "\n",
@@ -6243,7 +6314,7 @@ fn write_qwen_session_tp_focused_sharded_manifest(
             },
             ranks,
         };
-        manifest.validate()?;
+        manifest.validate_artifacts()?;
         fs::write(
             &global_manifest_output,
             serde_json::to_string_pretty(&manifest)? + "\n",
@@ -6260,7 +6331,7 @@ fn write_qwen_session_tp_focused_sharded_manifest(
         .with_context(|| format!("failed to read {}", global_manifest_output.display()))?;
     let global_manifest: QwenShardedCheckpointManifest = serde_json::from_str(&global_text)
         .with_context(|| format!("failed to parse {}", global_manifest_output.display()))?;
-    global_manifest.validate()?;
+    global_manifest.validate_artifacts()?;
     let tensor_count = global_manifest
         .ranks
         .iter()
@@ -6289,7 +6360,7 @@ fn qwen_session_tp_focused_sharded_restore(
         .with_context(|| format!("failed to read {}", global_manifest_output.display()))?;
     let global_manifest: QwenShardedCheckpointManifest = serde_json::from_str(&global_text)
         .with_context(|| format!("failed to parse {}", global_manifest_output.display()))?;
-    global_manifest.validate()?;
+    global_manifest.validate_artifacts()?;
     let rank_manifest = global_manifest
         .ranks
         .iter()
@@ -6398,7 +6469,7 @@ fn qwen_session_tp_focused_external_resume(
         .with_context(|| format!("failed to read {}", global_manifest_output.display()))?;
     let global_manifest: QwenShardedCheckpointManifest = serde_json::from_str(&global_text)
         .with_context(|| format!("failed to parse {}", global_manifest_output.display()))?;
-    global_manifest.validate()?;
+    global_manifest.validate_artifacts()?;
     if global_manifest.parallel.tensor_model_parallel_size != world_size {
         bail!(
             "Qwen session TP focused resume tensor_model_parallel_size {} does not match WORLD_SIZE {world_size}",
@@ -10802,6 +10873,62 @@ mod tests {
     }
 
     #[test]
+    fn qwen_sharded_checkpoint_manifest_validates_rank_owned_artifacts() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let manifest =
+            tiny_qwen_sharded_manifest_with_artifacts(temp.path()).expect("artifacts should write");
+
+        manifest
+            .validate_artifacts()
+            .expect("rank-owned artifacts should validate");
+    }
+
+    #[test]
+    fn qwen_sharded_checkpoint_manifest_rejects_missing_model_artifact_tensor() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let mut manifest =
+            tiny_qwen_sharded_manifest_with_artifacts(temp.path()).expect("artifacts should write");
+        manifest.ranks[0].shards[0].shard_name = "rank0.missing_q_proj".to_string();
+
+        let error = manifest
+            .validate_artifacts()
+            .expect_err("missing model shard should fail")
+            .to_string();
+
+        assert!(error.contains("missing model shard rank0.missing_q_proj"));
+    }
+
+    #[test]
+    fn qwen_sharded_checkpoint_manifest_rejects_missing_optimizer_artifact_tensor() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let mut manifest =
+            tiny_qwen_sharded_manifest_with_artifacts(temp.path()).expect("artifacts should write");
+        manifest.ranks[0].shards[0].optimizer_m_name = "rank0.q_proj.missing_m".to_string();
+
+        let error = manifest
+            .validate_artifacts()
+            .expect_err("missing optimizer slot should fail")
+            .to_string();
+
+        assert!(error.contains("missing optimizer m slot rank0.q_proj.missing_m"));
+    }
+
+    #[test]
+    fn qwen_sharded_checkpoint_manifest_rejects_artifact_shape_mismatch() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let mut manifest =
+            tiny_qwen_sharded_manifest_with_artifacts(temp.path()).expect("artifacts should write");
+        manifest.ranks[0].shards[0].shard_shape = vec![4, 2];
+
+        let error = manifest
+            .validate_artifacts()
+            .expect_err("artifact shape mismatch should fail")
+            .to_string();
+
+        assert!(error.contains("shape [4, 4] does not match manifest shard_shape [4, 2]"));
+    }
+
+    #[test]
     fn qwen_session_dp_global_sharded_manifest_writes_schema_root() {
         let temp = tempfile::tempdir().expect("temp dir should be created");
         let manifest = tiny_qwen_sharded_manifest();
@@ -12581,6 +12708,60 @@ mod tests {
                 },
             ],
         }
+    }
+
+    fn tiny_qwen_sharded_manifest_with_artifacts(
+        root: &Path,
+    ) -> Result<QwenShardedCheckpointManifest> {
+        let mut manifest = tiny_qwen_sharded_manifest();
+        for rank in &mut manifest.ranks {
+            let rank_dir = root.join(format!("rank{}", rank.rank));
+            fs::create_dir_all(&rank_dir)
+                .with_context(|| format!("failed to create {}", rank_dir.display()))?;
+            let model_safetensors = rank_dir.join("model.safetensors");
+            let optimizer_safetensors = rank_dir.join("optimizer.safetensors");
+            let model_entries = rank
+                .shards
+                .iter()
+                .map(|shard| {
+                    (
+                        shard.shard_name.clone(),
+                        Tensor::ones(shard.shard_shape.as_slice(), (Kind::Float, Device::Cpu)),
+                    )
+                })
+                .collect::<Vec<_>>();
+            let optimizer_entries = rank
+                .shards
+                .iter()
+                .flat_map(|shard| {
+                    [
+                        (
+                            shard.optimizer_m_name.clone(),
+                            Tensor::zeros(shard.shard_shape.as_slice(), (Kind::Float, Device::Cpu)),
+                        ),
+                        (
+                            shard.optimizer_v_name.clone(),
+                            Tensor::zeros(shard.shard_shape.as_slice(), (Kind::Float, Device::Cpu)),
+                        ),
+                    ]
+                })
+                .collect::<Vec<_>>();
+            let model_refs = model_entries
+                .iter()
+                .map(|(name, tensor)| (name.as_str(), tensor))
+                .collect::<Vec<_>>();
+            let optimizer_refs = optimizer_entries
+                .iter()
+                .map(|(name, tensor)| (name.as_str(), tensor))
+                .collect::<Vec<_>>();
+            Tensor::write_safetensors(&model_refs, &model_safetensors)
+                .with_context(|| format!("failed to write {}", model_safetensors.display()))?;
+            Tensor::write_safetensors(&optimizer_refs, &optimizer_safetensors)
+                .with_context(|| format!("failed to write {}", optimizer_safetensors.display()))?;
+            rank.model_safetensors = model_safetensors.display().to_string();
+            rank.optimizer_safetensors = optimizer_safetensors.display().to_string();
+        }
+        Ok(manifest)
     }
 
     fn tiny_qwen_weights() -> BTreeMap<String, Tensor> {
