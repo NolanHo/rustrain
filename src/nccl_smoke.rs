@@ -49,6 +49,24 @@ unsafe extern "C" {
         comm: NcclComm,
         stream: CudaStream,
     ) -> NcclResult;
+    fn ncclSend(
+        sendbuff: *const c_void,
+        count: usize,
+        datatype: NcclDataType,
+        peer: c_int,
+        comm: NcclComm,
+        stream: CudaStream,
+    ) -> NcclResult;
+    fn ncclRecv(
+        recvbuff: *mut c_void,
+        count: usize,
+        datatype: NcclDataType,
+        peer: c_int,
+        comm: NcclComm,
+        stream: CudaStream,
+    ) -> NcclResult;
+    fn ncclGroupStart() -> NcclResult;
+    fn ncclGroupEnd() -> NcclResult;
     fn ncclCommDestroy(comm: NcclComm) -> NcclResult;
     fn ncclGetErrorString(result: NcclResult) -> *const c_char;
 }
@@ -251,6 +269,26 @@ pub fn all_reduce_tensor_f32_for_launch(output_dir: &Path, tensor: &Tensor) -> R
     unsafe { nccl_all_reduce_tensor_unsafe(unique_id, rank, world_size, local_rank, &tensor) }
 }
 
+pub fn send_recv_tensors_f32_for_launch(
+    output_dir: &Path,
+    sends: &[(usize, Tensor)],
+    recvs: &[(usize, Vec<i64>)],
+) -> Result<Vec<(usize, Tensor)>> {
+    let rank = parse_env_usize("RANK")?;
+    let local_rank = parse_env_usize("LOCAL_RANK")?;
+    let world_size = parse_env_usize("WORLD_SIZE")?;
+    if rank >= world_size {
+        bail!("rank {rank} must be smaller than world_size {world_size}");
+    }
+    if sends.is_empty() && recvs.is_empty() {
+        return Ok(Vec::new());
+    }
+    fs::create_dir_all(output_dir)
+        .with_context(|| format!("failed to create {}", output_dir.display()))?;
+    let unique_id = shared_unique_id(output_dir, rank)?;
+    unsafe { nccl_send_recv_tensors_unsafe(unique_id, rank, world_size, local_rank, sends, recvs) }
+}
+
 fn shared_unique_id(output_dir: &Path, rank: usize) -> Result<NcclUniqueId> {
     let id_path = output_dir.join("nccl-unique-id.bin");
     if rank == 0 {
@@ -411,6 +449,98 @@ unsafe fn nccl_all_reduce_values_unsafe(
     check_cuda(unsafe { cudaFree(send) }, "cudaFree(send)")?;
     check_cuda(unsafe { cudaFree(recv) }, "cudaFree(recv)")?;
     output
+}
+
+unsafe fn nccl_send_recv_tensors_unsafe(
+    unique_id: NcclUniqueId,
+    rank: usize,
+    world_size: usize,
+    local_rank: usize,
+    sends: &[(usize, Tensor)],
+    recvs: &[(usize, Vec<i64>)],
+) -> Result<Vec<(usize, Tensor)>> {
+    check_cuda(
+        unsafe { cudaSetDevice(local_rank as c_int) },
+        "cudaSetDevice",
+    )?;
+
+    let send_tensors = sends
+        .iter()
+        .map(|(peer, tensor)| {
+            if *peer >= world_size {
+                bail!("NCCL send peer {peer} must be smaller than world_size {world_size}");
+            }
+            let tensor = tensor.to_kind(Kind::Float).contiguous();
+            Ok((*peer, tensor))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let recv_tensors = recvs
+        .iter()
+        .map(|(peer, shape)| {
+            if *peer >= world_size {
+                bail!("NCCL recv peer {peer} must be smaller than world_size {world_size}");
+            }
+            if shape.is_empty() || shape.iter().any(|dim| *dim < 0) {
+                bail!("NCCL recv shape for peer {peer} must be non-empty and non-negative");
+            }
+            let tensor = Tensor::zeros(
+                shape.as_slice(),
+                (Kind::Float, tch::Device::Cuda(local_rank)),
+            );
+            Ok((*peer, tensor))
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    let mut comm: NcclComm = ptr::null_mut();
+    check_nccl(
+        unsafe { ncclCommInitRank(&mut comm, world_size as c_int, unique_id, rank as c_int) },
+        "ncclCommInitRank",
+    )?;
+    let transfer_result = (|| {
+        check_nccl(unsafe { ncclGroupStart() }, "ncclGroupStart")?;
+        for (peer, tensor) in &recv_tensors {
+            if tensor.numel() == 0 {
+                continue;
+            }
+            check_nccl(
+                unsafe {
+                    ncclRecv(
+                        tensor.data_ptr(),
+                        tensor.numel(),
+                        NCCL_FLOAT32,
+                        *peer as c_int,
+                        comm,
+                        ptr::null_mut(),
+                    )
+                },
+                "ncclRecv",
+            )?;
+        }
+        for (peer, tensor) in &send_tensors {
+            if tensor.numel() == 0 {
+                continue;
+            }
+            check_nccl(
+                unsafe {
+                    ncclSend(
+                        tensor.data_ptr().cast_const(),
+                        tensor.numel(),
+                        NCCL_FLOAT32,
+                        *peer as c_int,
+                        comm,
+                        ptr::null_mut(),
+                    )
+                },
+                "ncclSend",
+            )?;
+        }
+        check_nccl(unsafe { ncclGroupEnd() }, "ncclGroupEnd")?;
+        check_cuda(unsafe { cudaDeviceSynchronize() }, "cudaDeviceSynchronize")
+    })();
+    let destroy_result = check_nccl(unsafe { ncclCommDestroy(comm) }, "ncclCommDestroy");
+    transfer_result?;
+    destroy_result?;
+    Ok(recv_tensors)
 }
 
 #[derive(Debug)]

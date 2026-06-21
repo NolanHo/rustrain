@@ -103,6 +103,25 @@ struct ExpertParallelNcclRankSummary {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+struct ExpertParallelSparseRankSummary {
+    rank: usize,
+    world_size: usize,
+    local_rank: usize,
+    source_token_indices: Vec<usize>,
+    owned_expert_start: usize,
+    owned_expert_end: usize,
+    owned_token_indices: Vec<usize>,
+    dispatch_send_counts: Vec<usize>,
+    dispatch_recv_counts: Vec<usize>,
+    combine_send_counts: Vec<usize>,
+    combine_recv_counts: Vec<usize>,
+    assembled_output_shape: Vec<i64>,
+    reference_output_shape: Vec<i64>,
+    sparse_output_max_abs: f64,
+    sparse_output_mean_abs: f64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
 struct ExpertParallelCheckpointManifest {
     format: String,
     rank: usize,
@@ -164,6 +183,11 @@ struct ExpertParallelCheckpointWrite {
     model_safetensors: PathBuf,
     optimizer_safetensors: PathBuf,
     tensor_count: usize,
+}
+
+struct ExpertParallelSparsePeerPlan {
+    peer: usize,
+    token_indices: Vec<usize>,
 }
 
 pub fn run_data_parallel_smoke(output_dir: &Path, world_size: usize) -> Result<()> {
@@ -690,6 +714,164 @@ pub fn run_expert_parallel_nccl_rank_smoke(output_dir: PathBuf) -> Result<()> {
     Ok(())
 }
 
+pub fn run_expert_parallel_sparse_rank_smoke(output_dir: PathBuf) -> Result<()> {
+    let rank = parse_launcher_usize_env("RANK")?;
+    let local_rank = parse_launcher_usize_env("LOCAL_RANK")?;
+    let world_size = parse_launcher_usize_env("WORLD_SIZE")?;
+    if world_size != 2 {
+        bail!("EP sparse rank smoke currently expects WORLD_SIZE=2");
+    }
+    if rank >= world_size {
+        bail!("rank {rank} must be smaller than world_size {world_size}");
+    }
+    fs::create_dir_all(&output_dir)
+        .with_context(|| format!("failed to create {}", output_dir.display()))?;
+
+    let device = Device::Cuda(local_rank);
+    let tokens = ep_tokens_tensor(device);
+    let router = ep_router_tensor(device);
+    let assignments = route_top1_tensor(&tokens, &router)?;
+    let source_token_indices = ep_source_token_indices(rank, world_size, assignments.len());
+    let experts_per_rank = ep_expert_count() / world_size;
+    let owned_expert_start = rank * experts_per_rank;
+    let owned_expert_end = owned_expert_start + experts_per_rank;
+
+    let dispatch_send_plan =
+        ep_sparse_dispatch_send_plan(rank, world_size, &assignments, assignments.len())?;
+    let dispatch_recv_plan = ep_sparse_dispatch_recv_plan(rank, world_size, &assignments)?;
+    let dispatch_sends = dispatch_send_plan
+        .iter()
+        .map(|plan| {
+            (
+                plan.peer,
+                ep_sparse_pack_token_rows(&tokens, &plan.token_indices),
+            )
+        })
+        .collect::<Vec<_>>();
+    let dispatch_recvs = dispatch_recv_plan
+        .iter()
+        .map(|plan| {
+            (
+                plan.peer,
+                vec![plan.token_indices.len() as i64, tokens.size()[1]],
+            )
+        })
+        .collect::<Vec<_>>();
+    let dispatched = nccl_smoke::send_recv_tensors_f32_for_launch(
+        &output_dir.join("ep-sparse-dispatch"),
+        &dispatch_sends,
+        &dispatch_recvs,
+    )?;
+
+    let local_scales = ep_owned_expert_scales_tensor(owned_expert_start, owned_expert_end, device);
+    let mut combine_sends = Vec::with_capacity(dispatched.len());
+    let mut owned_token_indices = Vec::new();
+    for (peer, payload) in dispatched {
+        let plan = dispatch_recv_plan
+            .iter()
+            .find(|plan| plan.peer == peer)
+            .ok_or_else(|| anyhow!("missing dispatch recv plan from peer {peer}"))?;
+        owned_token_indices.extend(plan.token_indices.iter().copied());
+        let output = ep_sparse_local_expert_outputs(
+            &payload,
+            &plan.token_indices,
+            &assignments,
+            owned_expert_start,
+            owned_expert_end,
+            &local_scales,
+        )?;
+        combine_sends.push((peer, output));
+    }
+    owned_token_indices.sort_unstable();
+
+    let combine_recv_plan = ep_sparse_combine_recv_plan(rank, world_size, &assignments)?;
+    let combine_recvs = combine_recv_plan
+        .iter()
+        .map(|plan| {
+            (
+                plan.peer,
+                vec![plan.token_indices.len() as i64, tokens.size()[1]],
+            )
+        })
+        .collect::<Vec<_>>();
+    let combined = nccl_smoke::send_recv_tensors_f32_for_launch(
+        &output_dir.join("ep-sparse-combine"),
+        &combine_sends,
+        &combine_recvs,
+    )?;
+
+    let mut assembled_rows = Vec::with_capacity(source_token_indices.len());
+    for token_index in &source_token_indices {
+        let owner_rank = ep_expert_owner_rank(assignments[*token_index], world_size);
+        let payload = combined
+            .iter()
+            .find(|(peer, _)| *peer == owner_rank)
+            .map(|(_, tensor)| tensor)
+            .ok_or_else(|| {
+                anyhow!("missing combined output from expert owner rank {owner_rank}")
+            })?;
+        let plan = combine_recv_plan
+            .iter()
+            .find(|plan| plan.peer == owner_rank)
+            .ok_or_else(|| anyhow!("missing combine recv plan from rank {owner_rank}"))?;
+        let row_position = plan
+            .token_indices
+            .iter()
+            .position(|candidate| candidate == token_index)
+            .ok_or_else(|| anyhow!("token {token_index} missing from combine recv plan"))?;
+        assembled_rows.push(payload.get(row_position as i64));
+    }
+    let assembled_output = Tensor::stack(&assembled_rows.iter().collect::<Vec<_>>(), 0);
+    let reference = ep_reference_output_tensor(&tokens, &assignments)?;
+    let reference_rows = ep_sparse_pack_token_rows(&reference, &source_token_indices);
+    let sparse_diff = tensor_diff_stats(&assembled_output, &reference_rows)?;
+    if sparse_diff.0 > 1e-6 {
+        bail!(
+            "EP sparse dispatch/combine mismatch: rank={rank}, max_abs={}, mean_abs={}",
+            sparse_diff.0,
+            sparse_diff.1
+        );
+    }
+
+    let summary = ExpertParallelSparseRankSummary {
+        rank,
+        world_size,
+        local_rank,
+        source_token_indices,
+        owned_expert_start,
+        owned_expert_end,
+        owned_token_indices,
+        dispatch_send_counts: dispatch_send_plan
+            .iter()
+            .map(|plan| plan.token_indices.len())
+            .collect(),
+        dispatch_recv_counts: dispatch_recv_plan
+            .iter()
+            .map(|plan| plan.token_indices.len())
+            .collect(),
+        combine_send_counts: dispatch_recv_plan
+            .iter()
+            .map(|plan| plan.token_indices.len())
+            .collect(),
+        combine_recv_counts: combine_recv_plan
+            .iter()
+            .map(|plan| plan.token_indices.len())
+            .collect(),
+        assembled_output_shape: assembled_output.size(),
+        reference_output_shape: reference_rows.size(),
+        sparse_output_max_abs: sparse_diff.0,
+        sparse_output_mean_abs: sparse_diff.1,
+    };
+    let summary_path = output_dir.join(format!("ep-sparse-rank-{rank}.json"));
+    fs::write(
+        &summary_path,
+        serde_json::to_string_pretty(&summary)? + "\n",
+    )
+    .with_context(|| format!("failed to write {}", summary_path.display()))?;
+    println!("{}", serde_json::to_string_pretty(&summary)?);
+    Ok(())
+}
+
 fn compute_dp_stats(rank: usize, world_size: usize) -> DpRankStats {
     let mut sample_count = 0;
     let mut loss_sum = 0.0;
@@ -805,6 +987,84 @@ fn ep_owned_expert_load(
     expert_load
 }
 
+fn ep_source_token_indices(rank: usize, world_size: usize, token_count: usize) -> Vec<usize> {
+    (0..token_count)
+        .filter(|token_index| token_index % world_size == rank)
+        .collect()
+}
+
+fn ep_expert_owner_rank(expert_index: usize, world_size: usize) -> usize {
+    expert_index / (ep_expert_count() / world_size)
+}
+
+fn ep_sparse_dispatch_send_plan(
+    rank: usize,
+    world_size: usize,
+    assignments: &[usize],
+    token_count: usize,
+) -> Result<Vec<ExpertParallelSparsePeerPlan>> {
+    let source_tokens = ep_source_token_indices(rank, world_size, token_count);
+    (0..world_size)
+        .map(|peer| {
+            let token_indices = source_tokens
+                .iter()
+                .copied()
+                .filter(|token_index| {
+                    ep_expert_owner_rank(assignments[*token_index], world_size) == peer
+                })
+                .collect::<Vec<_>>();
+            Ok(ExpertParallelSparsePeerPlan {
+                peer,
+                token_indices,
+            })
+        })
+        .collect()
+}
+
+fn ep_sparse_dispatch_recv_plan(
+    rank: usize,
+    world_size: usize,
+    assignments: &[usize],
+) -> Result<Vec<ExpertParallelSparsePeerPlan>> {
+    (0..world_size)
+        .map(|peer| {
+            let token_indices = ep_source_token_indices(peer, world_size, assignments.len())
+                .into_iter()
+                .filter(|token_index| {
+                    ep_expert_owner_rank(assignments[*token_index], world_size) == rank
+                })
+                .collect::<Vec<_>>();
+            Ok(ExpertParallelSparsePeerPlan {
+                peer,
+                token_indices,
+            })
+        })
+        .collect()
+}
+
+fn ep_sparse_combine_recv_plan(
+    rank: usize,
+    world_size: usize,
+    assignments: &[usize],
+) -> Result<Vec<ExpertParallelSparsePeerPlan>> {
+    let source_tokens = ep_source_token_indices(rank, world_size, assignments.len());
+    (0..world_size)
+        .map(|peer| {
+            let token_indices = source_tokens
+                .iter()
+                .copied()
+                .filter(|token_index| {
+                    ep_expert_owner_rank(assignments[*token_index], world_size) == peer
+                })
+                .collect::<Vec<_>>();
+            Ok(ExpertParallelSparsePeerPlan {
+                peer,
+                token_indices,
+            })
+        })
+        .collect()
+}
+
 fn ep_reference_output_tensor(tokens: &Tensor, assignments: &[usize]) -> Result<Tensor> {
     ep_local_output_tensor(
         tokens,
@@ -834,6 +1094,52 @@ fn ep_local_output_tensor(
         rows.push(row);
     }
     Ok(Tensor::stack(&rows.iter().collect::<Vec<_>>(), 0))
+}
+
+fn ep_sparse_pack_token_rows(tensor: &Tensor, token_indices: &[usize]) -> Tensor {
+    if token_indices.is_empty() {
+        Tensor::zeros([0, tensor.size()[1]], (Kind::Float, tensor.device()))
+    } else {
+        let rows = token_indices
+            .iter()
+            .map(|token_index| tensor.get(*token_index as i64))
+            .collect::<Vec<_>>();
+        Tensor::stack(&rows.iter().collect::<Vec<_>>(), 0)
+    }
+}
+
+fn ep_sparse_local_expert_outputs(
+    dispatched_tokens: &Tensor,
+    token_indices: &[usize],
+    assignments: &[usize],
+    owned_expert_start: usize,
+    owned_expert_end: usize,
+    owned_scales: &Tensor,
+) -> Result<Tensor> {
+    if dispatched_tokens.size()[0] != token_indices.len() as i64 {
+        bail!(
+            "EP sparse dispatched token count mismatch: payload={}, metadata={}",
+            dispatched_tokens.size()[0],
+            token_indices.len()
+        );
+    }
+    let mut rows = Vec::with_capacity(token_indices.len());
+    for (row_index, token_index) in token_indices.iter().copied().enumerate() {
+        let expert_index = assignments[token_index];
+        if !(owned_expert_start..owned_expert_end).contains(&expert_index) {
+            bail!("EP sparse rank received token {token_index} for unowned expert {expert_index}");
+        }
+        let local_expert_index = (expert_index - owned_expert_start) as i64;
+        rows.push(dispatched_tokens.get(row_index as i64) * owned_scales.get(local_expert_index));
+    }
+    Ok(if rows.is_empty() {
+        Tensor::zeros(
+            [0, dispatched_tokens.size()[1]],
+            (Kind::Float, dispatched_tokens.device()),
+        )
+    } else {
+        Tensor::stack(&rows.iter().collect::<Vec<_>>(), 0)
+    })
 }
 
 #[allow(clippy::too_many_arguments)]

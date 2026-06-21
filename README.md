@@ -179,17 +179,20 @@ single-GPU path with 26 trainable tensors, and
 `configs/qwen_session_single_layers03.toml` verifies a layer0-layer3
 single-GPU path with 50 trainable tensors. The same layer0-layer3 path also
 has bf16 coverage through `configs/qwen_session_single_layers03_bf16.toml`.
-Expert-parallel coverage is still toy-sized, but it now has two real
+Expert-parallel coverage is still toy-sized, but it now has three real
 launcher-backed two-rank paths: `parallel-ep-rank-smoke` verifies rank-local
-expert ownership and token coverage, while `parallel-ep-nccl-rank-smoke` builds
+expert ownership and token coverage, `parallel-ep-nccl-rank-smoke` builds
 rank-local expert output tensors on CUDA, combines dense contributions with
 NCCL all-reduce, verifies an explicit gradient-bridge AdamW update lowers a
 tiny MSE target, writes rank-owned expert scale and optimizer safetensors under
 `rustrain.ep_sharded.v1`, and verifies reload plus next-step parity from those
-rank-owned expert checkpoints. Production EP is still open: sparse MoE
-dispatch/combine collectives, autograd-aware collectives, load-balancing loss,
-trainer ownership, and production expert optimizer/checkpoint ownership are not
-implemented.
+rank-owned expert checkpoints. `parallel-ep-sparse-rank-smoke` verifies a
+toy sparse NCCL send/recv dispatch and combine path: source ranks dispatch
+routed token payloads to expert-owner ranks, owner ranks compute local expert
+outputs, and outputs are sent back to source ranks for parity with the
+single-process reference. Production EP is still open: a production MoE layer,
+autograd-aware collectives, load-balancing loss, trainer ownership, and
+production expert optimizer/checkpoint ownership are not implemented.
 Full production Qwen trainer ownership, full real data streaming, and
 production-grade sharded checkpoint ownership remain open.
 
@@ -247,12 +250,12 @@ production-grade sharded checkpoint ownership remain open.
   `train --config configs/qwen_session_tp2.toml`; that focused TP path restores
   rank-owned shards through the global sharded manifest and checks fused layer0
   output plus next-update parity. EP has toy rank-local and CUDA/NCCL combine
-  smokes plus rank-owned toy expert scale/optimizer checkpoint reload and
-  next-step parity, but not production sparse all-to-all or trainer-owned
-  expert state. Real production distributed training is still missing: full
-  Qwen model/data integration, full-parameter production TP backward/update,
-  production collectives, production EP, and production sharded checkpoint
-  ownership are not yet implemented.
+  smokes, a toy sparse NCCL send/recv dispatch/combine smoke, and rank-owned
+  toy expert scale/optimizer checkpoint reload plus next-step parity, but not
+  production MoE or trainer-owned expert state. Real production distributed
+  training is still missing: full Qwen model/data integration, full-parameter
+  production TP backward/update, production collectives, production EP, and
+  production sharded checkpoint ownership are not yet implemented.
 - Production distributed checkpoint rules are documented in
   [docs/checkpoints.md](docs/checkpoints.md), with a validated
   `rustrain.qwen_sharded.v1` manifest schema and representative rank-owned
