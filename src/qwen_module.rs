@@ -168,6 +168,9 @@ struct QwenSessionTpRankSummary {
     layer0_train_final_loss: f64,
     layer0_train_loss_improved: bool,
     layer0_train_learning_rate: f64,
+    sharded_rank_manifest_output: String,
+    sharded_global_manifest_output: String,
+    sharded_manifest_tensor_count: usize,
     mlp_intermediate_start: i64,
     mlp_intermediate_end: i64,
     mlp_activation_shard_shape: Vec<i64>,
@@ -5637,6 +5640,33 @@ fn qwen_session_tp_rank_smoke(
             "Qwen session TP layer0 train smoke did not reduce loss: initial={layer0_train_initial_loss}, final={layer0_train_final_loss}"
         );
     }
+    let (
+        sharded_rank_manifest_output,
+        sharded_global_manifest_output,
+        sharded_manifest_tensor_count,
+    ) = write_qwen_session_tp_focused_sharded_manifest(
+        &output_dir,
+        model_path,
+        rank,
+        world_size,
+        &input_norm_full,
+        &post_attention_norm_full,
+        &q_shard_base,
+        &k_shard_base,
+        &v_shard_base,
+        &o_shard_base,
+        &gate_shard_base,
+        &up_shard_base,
+        &down_shard_base,
+        &q_proj_full,
+        &k_proj_full,
+        &v_proj_full,
+        &o_proj_full,
+        &gate_proj_full,
+        &up_proj_full,
+        &down_proj_full,
+        config,
+    )?;
 
     let summary = QwenSessionTpRankSummary {
         rank,
@@ -5668,6 +5698,9 @@ fn qwen_session_tp_rank_smoke(
         layer0_train_final_loss,
         layer0_train_loss_improved: layer0_train_final_loss < layer0_train_initial_loss,
         layer0_train_learning_rate,
+        sharded_rank_manifest_output: sharded_rank_manifest_output.display().to_string(),
+        sharded_global_manifest_output: sharded_global_manifest_output.display().to_string(),
+        sharded_manifest_tensor_count,
         mlp_intermediate_start: intermediate_start,
         mlp_intermediate_end: intermediate_start + intermediate_shard_size,
         mlp_activation_shard_shape: activation_shard.size(),
@@ -5722,6 +5755,259 @@ fn qwen_session_tp_mlp_global_mse_loss_and_grad(
     let loss = diff.pow_tensor_scalar(2.0).mean(Kind::Float);
     let output_grad = (&diff * (2.0 / diff.numel() as f64)).detach();
     Ok((loss.double_value(&[]), output_grad))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write_qwen_session_tp_focused_sharded_manifest(
+    output_dir: &Path,
+    model_path: &Path,
+    rank: usize,
+    world_size: usize,
+    input_norm: &Tensor,
+    post_attention_norm: &Tensor,
+    q_shard: &Tensor,
+    k_shard: &Tensor,
+    v_shard: &Tensor,
+    o_shard: &Tensor,
+    gate_shard: &Tensor,
+    up_shard: &Tensor,
+    down_shard: &Tensor,
+    q_full: &Tensor,
+    k_full: &Tensor,
+    v_full: &Tensor,
+    o_full: &Tensor,
+    gate_full: &Tensor,
+    up_full: &Tensor,
+    down_full: &Tensor,
+    config: &Config,
+) -> Result<(PathBuf, PathBuf, usize)> {
+    let rank_dir = output_dir.join(format!("tp-sharded-rank-{rank}"));
+    fs::create_dir_all(&rank_dir)
+        .with_context(|| format!("failed to create {}", rank_dir.display()))?;
+    let model_safetensors = rank_dir.join("model.safetensors");
+    let optimizer_safetensors = rank_dir.join("optimizer.safetensors");
+    let model_entries: Vec<(String, Tensor)> = vec![
+        (
+            "model.layers.0.input_layernorm.weight".to_string(),
+            input_norm.contiguous(),
+        ),
+        (
+            "model.layers.0.post_attention_layernorm.weight".to_string(),
+            post_attention_norm.contiguous(),
+        ),
+        (
+            "model.layers.0.self_attn.q_proj.weight".to_string(),
+            q_shard.contiguous(),
+        ),
+        (
+            "model.layers.0.self_attn.k_proj.weight".to_string(),
+            k_shard.contiguous(),
+        ),
+        (
+            "model.layers.0.self_attn.v_proj.weight".to_string(),
+            v_shard.contiguous(),
+        ),
+        (
+            "model.layers.0.self_attn.o_proj.weight".to_string(),
+            o_shard.contiguous(),
+        ),
+        (
+            "model.layers.0.mlp.gate_proj.weight".to_string(),
+            gate_shard.contiguous(),
+        ),
+        (
+            "model.layers.0.mlp.up_proj.weight".to_string(),
+            up_shard.contiguous(),
+        ),
+        (
+            "model.layers.0.mlp.down_proj.weight".to_string(),
+            down_shard.contiguous(),
+        ),
+    ];
+    let model_refs: Vec<(&str, &Tensor)> = model_entries
+        .iter()
+        .map(|(name, tensor)| (name.as_str(), tensor))
+        .collect();
+    Tensor::write_safetensors(&model_refs, &model_safetensors)
+        .with_context(|| format!("failed to write {}", model_safetensors.display()))?;
+
+    let optimizer_entries: Vec<(String, Tensor)> = model_entries
+        .iter()
+        .flat_map(|(name, tensor)| {
+            [
+                (format!("{name}.adam_m"), Tensor::zeros_like(tensor)),
+                (format!("{name}.adam_v"), Tensor::zeros_like(tensor)),
+            ]
+        })
+        .collect();
+    let optimizer_refs: Vec<(&str, &Tensor)> = optimizer_entries
+        .iter()
+        .map(|(name, tensor)| (name.as_str(), tensor))
+        .collect();
+    Tensor::write_safetensors(&optimizer_refs, &optimizer_safetensors)
+        .with_context(|| format!("failed to write {}", optimizer_safetensors.display()))?;
+
+    let shard_specs = [
+        (
+            "model.layers.0.input_layernorm.weight",
+            input_norm,
+            input_norm,
+            "replicated_norm_smoke",
+        ),
+        (
+            "model.layers.0.post_attention_layernorm.weight",
+            post_attention_norm,
+            post_attention_norm,
+            "replicated_norm_smoke",
+        ),
+        (
+            "model.layers.0.self_attn.q_proj.weight",
+            q_full,
+            q_shard,
+            "tp_row",
+        ),
+        (
+            "model.layers.0.self_attn.k_proj.weight",
+            k_full,
+            k_shard,
+            "tp_row",
+        ),
+        (
+            "model.layers.0.self_attn.v_proj.weight",
+            v_full,
+            v_shard,
+            "tp_row",
+        ),
+        (
+            "model.layers.0.self_attn.o_proj.weight",
+            o_full,
+            o_shard,
+            "tp_col",
+        ),
+        (
+            "model.layers.0.mlp.gate_proj.weight",
+            gate_full,
+            gate_shard,
+            "tp_row",
+        ),
+        (
+            "model.layers.0.mlp.up_proj.weight",
+            up_full,
+            up_shard,
+            "tp_row",
+        ),
+        (
+            "model.layers.0.mlp.down_proj.weight",
+            down_full,
+            down_shard,
+            "tp_col",
+        ),
+    ];
+    let shards = shard_specs
+        .into_iter()
+        .map(
+            |(name, global_tensor, shard_tensor, partition)| QwenTensorShardManifestEntry {
+                name: name.to_string(),
+                shard_name: name.to_string(),
+                optimizer_m_name: format!("{name}.adam_m"),
+                optimizer_v_name: format!("{name}.adam_v"),
+                global_shape: global_tensor.size(),
+                shard_shape: shard_tensor.size(),
+                dtype: "fp32".to_string(),
+                partition: partition.to_string(),
+                tied_group: None,
+            },
+        )
+        .collect::<Vec<_>>();
+    let rank_manifest = QwenRankShardManifest {
+        rank,
+        data_parallel_rank: 0,
+        tensor_model_parallel_rank: rank,
+        pipeline_model_parallel_rank: 0,
+        expert_model_parallel_rank: 0,
+        context_parallel_rank: 0,
+        model_safetensors: model_safetensors.display().to_string(),
+        optimizer_safetensors: optimizer_safetensors.display().to_string(),
+        shards,
+    };
+    let rank_manifest_output = output_dir.join(format!("qwen-session-tp-sharded-rank-{rank}.json"));
+    fs::write(
+        &rank_manifest_output,
+        serde_json::to_string_pretty(&rank_manifest)? + "\n",
+    )
+    .with_context(|| format!("failed to write {}", rank_manifest_output.display()))?;
+    wait_for_rank_barrier(
+        &output_dir.join("qwen-session-tp-sharded-rank-manifests-written"),
+        rank,
+        world_size,
+        Duration::from_secs(300),
+    )?;
+
+    let global_manifest_output = output_dir.join("qwen-session-tp-sharded-global.json");
+    if rank == 0 {
+        let mut ranks = Vec::with_capacity(world_size);
+        for shard_rank in 0..world_size {
+            let rank_manifest_path =
+                output_dir.join(format!("qwen-session-tp-sharded-rank-{shard_rank}.json"));
+            let text = fs::read_to_string(&rank_manifest_path)
+                .with_context(|| format!("failed to read {}", rank_manifest_path.display()))?;
+            let rank_manifest: QwenRankShardManifest = serde_json::from_str(&text)
+                .with_context(|| format!("failed to parse {}", rank_manifest_path.display()))?;
+            ranks.push(rank_manifest);
+        }
+        let manifest = QwenShardedCheckpointManifest {
+            format: "rustrain.qwen_sharded.v1".to_string(),
+            base_model_path: model_path.display().to_string(),
+            tokenizer_path: model_path.join("tokenizer.json").display().to_string(),
+            global_step: config.train.max_steps,
+            consumed_samples: world_size as u64,
+            consumed_tokens: (world_size * config.model.seq_len) as u64,
+            data_cursor_next: None,
+            data_epoch_next: None,
+            data_sample_offset_next: None,
+            data_train_samples: None,
+            dataset_source_files: Vec::new(),
+            dataset_source_sample_counts: Vec::new(),
+            dataset_fingerprint: String::new(),
+            dataset_shuffle: true,
+            seed: config.run.seed,
+            dtype: "fp32".to_string(),
+            optimizer: "adamw_zero_slots_smoke".to_string(),
+            scheduler: "constant".to_string(),
+            parallel: QwenShardedParallelManifest {
+                data_parallel_size: 1,
+                tensor_model_parallel_size: world_size,
+                pipeline_model_parallel_size: 1,
+                expert_model_parallel_size: 1,
+                context_parallel_size: 1,
+            },
+            ranks,
+        };
+        manifest.validate()?;
+        fs::write(
+            &global_manifest_output,
+            serde_json::to_string_pretty(&manifest)? + "\n",
+        )
+        .with_context(|| format!("failed to write {}", global_manifest_output.display()))?;
+    }
+    wait_for_rank_barrier(
+        &output_dir.join("qwen-session-tp-sharded-global-manifest-written"),
+        rank,
+        world_size,
+        Duration::from_secs(300),
+    )?;
+    let global_text = fs::read_to_string(&global_manifest_output)
+        .with_context(|| format!("failed to read {}", global_manifest_output.display()))?;
+    let global_manifest: QwenShardedCheckpointManifest = serde_json::from_str(&global_text)
+        .with_context(|| format!("failed to parse {}", global_manifest_output.display()))?;
+    global_manifest.validate()?;
+    let tensor_count = global_manifest
+        .ranks
+        .iter()
+        .find(|entry| entry.rank == rank)
+        .map(|entry| entry.shards.len())
+        .ok_or_else(|| anyhow!("missing TP sharded rank manifest for rank {rank}"))?;
+    Ok((rank_manifest_output, global_manifest_output, tensor_count))
 }
 
 #[allow(clippy::too_many_arguments)]

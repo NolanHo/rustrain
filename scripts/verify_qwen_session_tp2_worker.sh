@@ -26,6 +26,7 @@ evidence = []
 q_heads = []
 kv_heads = []
 intermediate = []
+global_manifests = set()
 for path in summaries:
     data = json.loads(path.read_text())
     rank = int(data["rank"])
@@ -87,6 +88,29 @@ for path in summaries:
         raise SystemExit(f"{path} unexpected layer0 reduced output shape {layer0_reduced}")
     if mlp_reduced != [1, 7, 896]:
         raise SystemExit(f"{path} unexpected MLP reduced output shape {mlp_reduced}")
+    if int(data["sharded_manifest_tensor_count"]) != 9:
+        raise SystemExit(f"{path} expected 9 TP sharded manifest tensors, got {data['sharded_manifest_tensor_count']}")
+    rank_manifest_path = pathlib.Path(data["sharded_rank_manifest_output"])
+    if not rank_manifest_path.exists():
+        raise SystemExit(f"{path} missing TP rank sharded manifest {rank_manifest_path}")
+    rank_manifest = json.loads(rank_manifest_path.read_text())
+    if rank_manifest["rank"] != rank:
+        raise SystemExit(f"{rank_manifest_path} rank {rank_manifest['rank']} != {rank}")
+    if rank_manifest["tensor_model_parallel_rank"] != rank:
+        raise SystemExit(
+            f"{rank_manifest_path} tensor_model_parallel_rank {rank_manifest['tensor_model_parallel_rank']} != {rank}"
+        )
+    if len(rank_manifest["shards"]) != 9:
+        raise SystemExit(f"{rank_manifest_path} expected 9 shards, got {len(rank_manifest['shards'])}")
+    partitions = {entry["partition"] for entry in rank_manifest["shards"]}
+    if not {"tp_row", "tp_col", "replicated_norm_smoke"}.issubset(partitions):
+        raise SystemExit(f"{rank_manifest_path} missing expected TP partitions, got {sorted(partitions)}")
+    for entry in rank_manifest["shards"]:
+        if not entry["optimizer_m_name"] or not entry["optimizer_v_name"]:
+            raise SystemExit(f"{rank_manifest_path} shard {entry['name']} missing optimizer slots")
+        if not entry["global_shape"] or not entry["shard_shape"]:
+            raise SystemExit(f"{rank_manifest_path} shard {entry['name']} missing shapes")
+    global_manifests.add(data["sharded_global_manifest_output"])
     q_heads.append((int(data["attention_q_head_start"]), int(data["attention_q_head_end"])))
     kv_heads.append((int(data["attention_kv_head_start"]), int(data["attention_kv_head_end"])))
     intermediate.append((int(data["mlp_intermediate_start"]), int(data["mlp_intermediate_end"])))
@@ -121,6 +145,22 @@ launch_summary = json.loads((output_dir / "launch-summary.json").read_text())
 assigned = [rank["assigned_cuda_visible_device"] for rank in launch_summary["ranks"]]
 if len(set(assigned)) != 2:
     raise SystemExit(f"expected distinct launch GPU assignments, got {assigned}")
+
+if len(global_manifests) != 1:
+    raise SystemExit(f"expected one shared TP global manifest, got {global_manifests}")
+global_manifest_path = pathlib.Path(next(iter(global_manifests)))
+if not global_manifest_path.exists():
+    raise SystemExit(f"missing TP global sharded manifest {global_manifest_path}")
+global_manifest = json.loads(global_manifest_path.read_text())
+if global_manifest["format"] != "rustrain.qwen_sharded.v1":
+    raise SystemExit(f"unexpected TP global manifest format {global_manifest['format']}")
+parallel = global_manifest["parallel"]
+if parallel["tensor_model_parallel_size"] != 2 or parallel["data_parallel_size"] != 1:
+    raise SystemExit(f"unexpected TP global parallel config {parallel}")
+if len(global_manifest["ranks"]) != 2:
+    raise SystemExit(f"expected 2 TP global rank manifests, got {len(global_manifest['ranks'])}")
+if sorted(rank["tensor_model_parallel_rank"] for rank in global_manifest["ranks"]) != [0, 1]:
+    raise SystemExit("TP global manifest does not cover tensor parallel ranks 0 and 1")
 
 print(json.dumps({"qwen_session_tp2_verified": evidence, "assigned_cuda_visible_devices": assigned}, indent=2))
 PY

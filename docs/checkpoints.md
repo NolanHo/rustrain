@@ -117,6 +117,10 @@ writes rank-owned shard manifests plus a global manifest. The representative
 2-rank trainer verification restores each rank from its rank-owned model and
 optimizer safetensors through the global manifest, verifies reload loss parity,
 and verifies next-step resume parity against a continuous rank0-manifest run.
+The focused Qwen TP=2 layer0 smoke also writes rank-owned model shard files and
+a global `rustrain.qwen_sharded.v1` manifest for its layer0 attention/MLP tensor
+partitions. That TP manifest is checkpoint-contract evidence only: optimizer
+slots are zero smoke placeholders, and TP restore/next-step parity remains open.
 Full production sharded restore over external streaming real data remains open.
 
 Required manifest structure:
