@@ -303,6 +303,9 @@ struct QwenSessionDpRankSummary {
     dataset_train_samples: Option<usize>,
     dataset_eval_samples: Option<usize>,
     dataset_order_seed: Option<u64>,
+    data_cursor_start: Option<usize>,
+    data_cursor_end: Option<usize>,
+    data_cursor_next: Option<usize>,
     tensor_count: usize,
     steps: usize,
     learning_rate: f64,
@@ -344,6 +347,12 @@ struct QwenSessionDpCheckpointManifest {
     dtype: String,
     steps: usize,
     train_step: u64,
+    #[serde(default)]
+    data_cursor_start: Option<usize>,
+    #[serde(default)]
+    data_cursor_end: Option<usize>,
+    #[serde(default)]
+    data_cursor_next: Option<usize>,
     learning_rate: f64,
     delta_safetensors: String,
     optimizer_safetensors: String,
@@ -369,9 +378,9 @@ impl QwenSessionDpCheckpointManifest {
             delta_safetensors: self.delta_safetensors.clone(),
             optimizer_safetensors: Some(self.optimizer_safetensors.clone()),
             train_step: self.train_step,
-            data_cursor_start: None,
-            data_cursor_end: None,
-            data_cursor_next: None,
+            data_cursor_start: self.data_cursor_start,
+            data_cursor_end: self.data_cursor_end,
+            data_cursor_next: self.data_cursor_next,
             learning_rate: self.learning_rate,
             initial_loss: self.expected_loss,
             final_loss: self.global_post_update_loss,
@@ -734,6 +743,7 @@ struct QwenSessionDpBatchPlan {
     dataset_train_samples: Option<usize>,
     dataset_eval_samples: Option<usize>,
     dataset_order_seed: Option<u64>,
+    train_sample_count: Option<usize>,
     local_batch_size: usize,
     sequence_tokens: usize,
 }
@@ -2775,10 +2785,16 @@ pub fn qwen_session_dp_rank_smoke(
     let mut post_update_loss = local_loss;
     let mut trainable_summaries = Vec::new();
     let mut last_artifacts: Option<QwenTrainStepArtifacts> = None;
+    let global_batch_size = batch_plan.local_batch_size * world_size;
     for step in 0..steps {
+        let batch_index = if batch_plan.train_sample_count.is_some() {
+            step * global_batch_size
+        } else {
+            step
+        };
         let global_step_batch = batch_plan
             .global_train_batches
-            .get(step)
+            .get(batch_index)
             .ok_or_else(|| anyhow!("missing qwen session DP batch for step {step}"))?;
         let local_step_batch = global_step_batch.narrow(
             0,
@@ -2827,6 +2843,9 @@ pub fn qwen_session_dp_rank_smoke(
         last_artifacts.context("missing Qwen session DP artifacts from final training step")?;
 
     let trainable_tensors = local_session.parameter_names();
+    let data_cursor_start = 0usize;
+    let data_cursor_end = steps * global_batch_size;
+    let data_cursor_next = data_cursor_end;
     let checkpoint_path = output_dir.join("qwen-session-dp-rank0-checkpoint.json");
     let delta_output = output_dir.join("qwen-session-dp-rank0-delta.safetensors");
     let optimizer_output = optimizer_state_path(&delta_output);
@@ -2856,6 +2875,9 @@ pub fn qwen_session_dp_rank_smoke(
             dtype: dtype.label().to_string(),
             steps,
             train_step: steps as u64,
+            data_cursor_start: batch_plan.train_sample_count.map(|_| data_cursor_start),
+            data_cursor_end: batch_plan.train_sample_count.map(|_| data_cursor_end),
+            data_cursor_next: batch_plan.train_sample_count.map(|_| data_cursor_next),
             learning_rate,
             delta_safetensors: delta_output.display().to_string(),
             optimizer_safetensors: optimizer_output.display().to_string(),
@@ -2898,7 +2920,11 @@ pub fn qwen_session_dp_rank_smoke(
     )?;
     let final_step_batch = batch_plan
         .global_train_batches
-        .get(steps - 1)
+        .get(if batch_plan.train_sample_count.is_some() {
+            (steps - 1) * global_batch_size
+        } else {
+            steps - 1
+        })
         .ok_or_else(|| anyhow!("missing qwen session DP final batch"))?;
     let local_final_step_batch = final_step_batch.narrow(
         0,
@@ -2916,7 +2942,11 @@ pub fn qwen_session_dp_rank_smoke(
 
     let next_step_batch = batch_plan
         .global_train_batches
-        .get(steps)
+        .get(if batch_plan.train_sample_count.is_some() {
+            data_cursor_next
+        } else {
+            steps
+        })
         .ok_or_else(|| anyhow!("missing qwen session DP next-step batch"))?;
     let local_next_step_batch = next_step_batch.narrow(
         0,
@@ -2954,6 +2984,10 @@ pub fn qwen_session_dp_rank_smoke(
         steps,
         learning_rate,
         dtype,
+        batch_plan.train_sample_count.map(|_| data_cursor_next),
+        batch_plan
+            .train_sample_count
+            .map(|_| data_cursor_next * batch_plan.sequence_tokens),
         &last_artifacts,
     )?;
     wait_for_rank_barrier(
@@ -2970,6 +3004,10 @@ pub fn qwen_session_dp_rank_smoke(
             world_size,
             steps,
             dtype,
+            batch_plan.train_sample_count.map(|_| data_cursor_next),
+            batch_plan
+                .train_sample_count
+                .map(|_| data_cursor_next * batch_plan.sequence_tokens),
             &sharded_global_manifest_output,
         )?;
     }
@@ -3030,6 +3068,9 @@ pub fn qwen_session_dp_rank_smoke(
         dataset_train_samples: batch_plan.dataset_train_samples,
         dataset_eval_samples: batch_plan.dataset_eval_samples,
         dataset_order_seed: batch_plan.dataset_order_seed,
+        data_cursor_start: batch_plan.train_sample_count.map(|_| data_cursor_start),
+        data_cursor_end: batch_plan.train_sample_count.map(|_| data_cursor_end),
+        data_cursor_next: batch_plan.train_sample_count.map(|_| data_cursor_next),
         tensor_count: local_grads.len(),
         steps,
         learning_rate,
@@ -3078,6 +3119,8 @@ fn write_qwen_session_dp_rank_sharded_manifest(
     steps: usize,
     learning_rate: f64,
     dtype: QwenComputeDType,
+    consumed_samples: Option<usize>,
+    consumed_tokens: Option<usize>,
     artifacts: &QwenTrainStepArtifacts,
 ) -> Result<PathBuf> {
     let rank_dir = output_dir.join(format!("sharded-rank-{rank}"));
@@ -3147,6 +3190,8 @@ fn write_qwen_session_dp_rank_sharded_manifest(
         "rank": rank,
         "world_size": world_size,
         "steps": steps,
+        "consumed_samples": consumed_samples,
+        "consumed_tokens": consumed_tokens,
         "learning_rate": learning_rate,
         "dtype": dtype.label(),
     });
@@ -3165,6 +3210,8 @@ fn write_qwen_session_dp_global_sharded_manifest(
     world_size: usize,
     steps: usize,
     dtype: QwenComputeDType,
+    consumed_samples: Option<usize>,
+    consumed_tokens: Option<usize>,
     manifest_output: &Path,
 ) -> Result<()> {
     let mut ranks = Vec::with_capacity(world_size);
@@ -3182,8 +3229,14 @@ fn write_qwen_session_dp_global_sharded_manifest(
         base_model_path: model_path.display().to_string(),
         tokenizer_path: model_path.join("tokenizer.json").display().to_string(),
         global_step: steps as u64,
-        consumed_samples: world_size as u64 * steps as u64,
-        consumed_tokens: world_size as u64 * steps as u64 * 5,
+        consumed_samples: consumed_samples
+            .unwrap_or(world_size * steps)
+            .try_into()
+            .context("consumed_samples overflowed u64")?,
+        consumed_tokens: consumed_tokens
+            .unwrap_or(world_size * steps * 5)
+            .try_into()
+            .context("consumed_tokens overflowed u64")?,
         seed: 42,
         dtype: dtype.label().to_string(),
         optimizer: "adamw".to_string(),
@@ -4291,6 +4344,7 @@ fn qwen_session_fixed_dp_batch_plan(
         dataset_train_samples: None,
         dataset_eval_samples: None,
         dataset_order_seed: None,
+        train_sample_count: None,
         local_batch_size: 1,
         sequence_tokens: 5,
     })
@@ -4325,11 +4379,11 @@ fn qwen_session_dp_batch_plan_from_config(
         .min(train_dataset.len())
         .max(1);
     let global_batch_size = local_batch_size * world_size;
-    let required_batches = train_steps + 2;
+    let required_batches = train_steps * global_batch_size + 1;
     let global_train_batches = (0..required_batches)
-        .map(|step| {
+        .map(|global_sample_cursor| {
             train_dataset
-                .padded_batch(step * global_batch_size, global_batch_size)
+                .padded_batch(global_sample_cursor, global_batch_size)
                 .map(|batch| batch.input_ids.to_device(device))
         })
         .collect::<Result<Vec<_>>>()?;
@@ -4346,6 +4400,7 @@ fn qwen_session_dp_batch_plan_from_config(
         dataset_train_samples: Some(train_dataset.len()),
         dataset_eval_samples: Some(eval_dataset.len()),
         dataset_order_seed: Some(runtime_config.run.seed),
+        train_sample_count: Some(train_dataset.len()),
         local_batch_size,
     })
 }
@@ -6386,6 +6441,8 @@ mod tests {
             2,
             3,
             QwenComputeDType::Fp32,
+            Some(12),
+            Some(60),
             &output,
         )
         .expect("global manifest should write");
@@ -6397,6 +6454,8 @@ mod tests {
         decoded.validate().expect("global manifest should validate");
         assert_eq!(decoded.format, "rustrain.qwen_sharded.v1");
         assert_eq!(decoded.global_step, 3);
+        assert_eq!(decoded.consumed_samples, 12);
+        assert_eq!(decoded.consumed_tokens, 60);
         assert_eq!(decoded.ranks.len(), 2);
     }
 

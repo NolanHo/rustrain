@@ -46,6 +46,9 @@ for path in rank_summaries:
             "dataset_train_samples",
             "dataset_eval_samples",
             "dataset_order_seed",
+            "data_cursor_start",
+            "data_cursor_end",
+            "data_cursor_next",
             "sequence_tokens",
             "local_batch_size",
         ]
@@ -68,6 +71,22 @@ for path in rank_summaries:
             raise SystemExit(
                 f"{path} dataset_order_seed {data['dataset_order_seed']} does not match expected {expected_dataset_seed}"
             )
+        expected_cursor_end = int(data["steps"]) * int(data["local_batch_size"]) * int(data["world_size"])
+        if int(data["data_cursor_start"]) != 0:
+            raise SystemExit(f"{path} expected data_cursor_start 0, got {data['data_cursor_start']}")
+        if int(data["data_cursor_end"]) != expected_cursor_end:
+            raise SystemExit(
+                f"{path} expected data_cursor_end {expected_cursor_end}, got {data['data_cursor_end']}"
+            )
+        if int(data["data_cursor_next"]) != expected_cursor_end:
+            raise SystemExit(
+                f"{path} expected data_cursor_next {expected_cursor_end}, got {data['data_cursor_next']}"
+            )
+        sharded_manifest = json.loads(pathlib.Path(data["sharded_global_manifest_output"]).read_text())
+        if int(sharded_manifest["consumed_samples"]) != expected_cursor_end:
+            raise SystemExit(
+                f"{path} sharded consumed_samples {sharded_manifest['consumed_samples']} does not match expected {expected_cursor_end}"
+            )
     evidence.append(
         {
             "rank": data["rank"],
@@ -75,6 +94,8 @@ for path in rank_summaries:
             "checkpoint_written": data["checkpoint_written"],
             "dataset_order_seed": data.get("dataset_order_seed"),
             "dataset_total_samples": data.get("dataset_total_samples"),
+            "data_cursor_start": data.get("data_cursor_start"),
+            "data_cursor_next": data.get("data_cursor_next"),
             "sequence_tokens": data.get("sequence_tokens"),
             "reload_delta": data["reload_delta"],
             "sharded_reload_delta": sharded_reload_delta,
