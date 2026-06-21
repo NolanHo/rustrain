@@ -87,6 +87,31 @@ for path in summaries:
     ]:
         if float(data[key]) <= 0.0:
             raise SystemExit(f"{path} expected positive {key}, got {data[key]}")
+    if data["causal_train_input_shape"] != [1, 5]:
+        raise SystemExit(f"{path} unexpected causal_train_input_shape {data['causal_train_input_shape']}")
+    if float(data["causal_train_initial_loss_delta"]) > 1e-2:
+        raise SystemExit(
+            f"{path} causal_train_initial_loss_delta too large: {data['causal_train_initial_loss_delta']}"
+        )
+    if not data.get("causal_train_loss_improved"):
+        raise SystemExit(
+            f"{path} expected causal LM train loss to improve, initial={data.get('causal_train_initial_loss')} final={data.get('causal_train_final_loss')}"
+        )
+    if float(data["causal_train_final_loss"]) >= float(data["causal_train_initial_loss"]):
+        raise SystemExit(
+            f"{path} causal LM final loss {data['causal_train_final_loss']} is not below initial {data['causal_train_initial_loss']}"
+        )
+    for key in [
+        "causal_train_q_grad_norm",
+        "causal_train_k_grad_norm",
+        "causal_train_v_grad_norm",
+        "causal_train_o_grad_norm",
+        "causal_train_gate_grad_norm",
+        "causal_train_up_grad_norm",
+        "causal_train_down_grad_norm",
+    ]:
+        if float(data[key]) <= 0.0:
+            raise SystemExit(f"{path} expected positive {key}, got {data[key]}")
     for key in ["mlp_train_gate_grad_norm", "mlp_train_up_grad_norm", "mlp_train_down_grad_norm"]:
         if float(data[key]) <= 0.0:
             raise SystemExit(f"{path} expected positive {key}, got {data[key]}")
@@ -142,6 +167,9 @@ for path in summaries:
             "layer0_max_abs": data["layer0_max_abs"],
             "layer0_train_initial_loss": data["layer0_train_initial_loss"],
             "layer0_train_final_loss": data["layer0_train_final_loss"],
+            "causal_train_full_loss": data["causal_train_full_loss"],
+            "causal_train_initial_loss": data["causal_train_initial_loss"],
+            "causal_train_final_loss": data["causal_train_final_loss"],
             "mlp_train_initial_loss": data["mlp_train_initial_loss"],
             "mlp_train_final_loss": data["mlp_train_final_loss"],
             "sharded_restore_max_abs": data["sharded_restore_max_abs"],

@@ -124,9 +124,11 @@ slots are zero smoke placeholders. The same focused smoke restores each rank's
 model shards through the global manifest and verifies the fused layer0 output
 against the full layer0 reference within tolerance, then applies the same
 focused shard SGD update from the restored shards and verifies next-update
-output parity against the continuous focused path. Trainer-owned TP checkpoint
-resume and full production sharded restore over external streaming real data
-remain open.
+output parity against the continuous focused path. The trainer-entry TP path
+also verifies a focused causal-LM train-step over a real token batch, but the
+checkpoint artifacts still only cover focused layer0 TP shard state with smoke
+optimizer slots. Production full-parameter TP checkpoint resume and full
+production sharded restore over external streaming real data remain open.
 
 Required manifest structure:
 
