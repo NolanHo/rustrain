@@ -230,6 +230,8 @@ pub(crate) struct QwenFullTrainSmokeSummary {
     pub(crate) optimizer_output: String,
     pub(crate) manifest_output: String,
     pub(crate) compute_kind: String,
+    pub(crate) resume_from: Option<String>,
+    pub(crate) resumed_checkpoint: bool,
     pub(crate) train_steps: usize,
     pub(crate) learning_rate: f64,
     pub(crate) step_losses: Vec<f64>,
@@ -2001,6 +2003,8 @@ fn qwen_full_train_summary(
         optimizer_output: optimizer_output.display().to_string(),
         manifest_output: manifest_output.display().to_string(),
         compute_kind: dtype.label().to_string(),
+        resume_from: None,
+        resumed_checkpoint: false,
         train_steps: 1,
         learning_rate,
         step_losses: vec![initial_loss, final_loss],
@@ -2022,6 +2026,7 @@ fn qwen_session_single_summary(
     dtype: QwenComputeDType,
     train_steps: usize,
     learning_rate: f64,
+    resume_from: Option<&Path>,
 ) -> Result<QwenFullTrainSmokeSummary> {
     if train_steps == 0 {
         bail!("qwen session single trainer requires max_steps > 0");
@@ -2033,12 +2038,38 @@ fn qwen_session_single_summary(
     let config = read_runtime_config(&model_path.join("config.json"))?;
     let weights = read_safetensors_map(&model_path.join("model.safetensors"))?;
     let input_ids = qwen_session_dp_global_input(&weights, Device::Cpu)?.narrow(0, 0, 1);
-    let mut session = QwenTrainableSession::from_weights(config, weights, input_ids, dtype.kind())?;
+    let (mut session, start_step) = if let Some(resume_from) = resume_from {
+        let manifest_text = fs::read_to_string(resume_from)
+            .with_context(|| format!("failed to read {}", resume_from.display()))?;
+        let manifest: QwenDeltaCheckpointManifest = serde_json::from_str(&manifest_text)
+            .with_context(|| format!("failed to parse {}", resume_from.display()))?;
+        let start_step = manifest
+            .train_step
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("Qwen session resume train_step overflowed"))?
+            as usize;
+        (
+            QwenTrainableSession::from_manifest(
+                config,
+                weights,
+                input_ids,
+                dtype.kind(),
+                &manifest,
+            )?,
+            start_step,
+        )
+    } else {
+        (
+            QwenTrainableSession::from_weights(config, weights, input_ids, dtype.kind())?,
+            1,
+        )
+    };
     let mut step_losses = Vec::with_capacity(train_steps + 1);
     let mut last_step = None;
-    for step in 1..=train_steps {
+    let end_step = start_step + train_steps - 1;
+    for step in start_step..=end_step {
         let step_result = session.train_step(learning_rate, step as i32)?;
-        if step == 1 {
+        if step == start_step {
             step_losses.push(step_result.loss_before);
         }
         step_losses.push(step_result.loss_after);
@@ -2084,7 +2115,7 @@ fn qwen_session_single_summary(
         reference_fixture: "qwen_session_single_fixed_tokens".to_string(),
         delta_safetensors: delta_output.display().to_string(),
         optimizer_safetensors: Some(optimizer_output.display().to_string()),
-        train_step: train_steps as u64,
+        train_step: end_step as u64,
         learning_rate,
         initial_loss,
         final_loss,
@@ -2107,7 +2138,7 @@ fn qwen_session_single_summary(
         );
     }
 
-    let next_step = train_steps + 1;
+    let next_step = end_step + 1;
     let resumed_second_step = resumed_session.train_step(learning_rate, next_step as i32)?;
     let resume_loss_value = resumed_second_step.loss_before;
     let resumed_second_loss = resumed_second_step.loss_after;
@@ -2127,6 +2158,8 @@ fn qwen_session_single_summary(
         optimizer_output: optimizer_output.display().to_string(),
         manifest_output: manifest_output.display().to_string(),
         compute_kind: dtype.label().to_string(),
+        resume_from: resume_from.map(|path| path.display().to_string()),
+        resumed_checkpoint: resume_from.is_some(),
         train_steps,
         learning_rate,
         step_losses,
@@ -2969,6 +3002,7 @@ pub(crate) fn train_qwen_session_single_from_config(
         dtype,
         config.train.max_steps as usize,
         config.train.learning_rate as f64,
+        config.train.resume_from.as_deref(),
     )
 }
 
