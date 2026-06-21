@@ -126,7 +126,9 @@ real-Qwen TP=2 linear smoke shards the real layer0 attention `q_proj`, `k_proj`,
 gathered shard outputs match the full linear projections. A companion TP=2
 attention smoke shards Q/K/V heads, applies rank-local attention, sums O-proj
 input-column contributions on rank0, and verifies parity against full layer0
-attention. A matching TP=2 MLP smoke shards gate/up intermediate rows and
+attention; a second attention smoke uses NCCL all-reduce for the same summed
+output contribution parity on every rank. A matching TP=2 MLP smoke shards
+gate/up intermediate rows and
 down-proj input columns, sums rank-local contributions on rank0, and verifies
 parity against the full layer0 MLP. A second MLP smoke uses NCCL all-reduce to
 sum those rank-local output contributions on every rank and checks the same

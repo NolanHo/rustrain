@@ -272,6 +272,16 @@ enum Command {
         output_dir: PathBuf,
     },
     #[command(hide = true)]
+    QwenTpAttentionNcclRankSmoke {
+        #[arg(
+            long,
+            default_value = "/vePFS-Mindverse/share/huggingface/Qwen2.5-0.5B-Instruct"
+        )]
+        model_path: PathBuf,
+        #[arg(long)]
+        output_dir: PathBuf,
+    },
+    #[command(hide = true)]
     QwenTpMlpRankSmoke {
         #[arg(
             long,
@@ -509,6 +519,10 @@ fn main() -> Result<()> {
             model_path,
             output_dir,
         } => qwen_module::qwen_tp_attention_rank_smoke(&model_path, output_dir),
+        Command::QwenTpAttentionNcclRankSmoke {
+            model_path,
+            output_dir,
+        } => qwen_module::qwen_tp_attention_nccl_rank_smoke(&model_path, output_dir),
         Command::QwenTpMlpRankSmoke {
             model_path,
             output_dir,
