@@ -125,6 +125,13 @@ struct ExpertParallelSparseRankSummary {
     train_final_loss: f64,
     train_loss_improved: bool,
     scale_grad_norm: f64,
+    checkpoint_manifest_output: String,
+    checkpoint_model_safetensors: String,
+    checkpoint_optimizer_safetensors: String,
+    checkpoint_tensor_count: usize,
+    reload_scale_max_abs: f64,
+    reload_loss: f64,
+    reload_loss_delta: f64,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -818,7 +825,7 @@ pub fn run_expert_parallel_sparse_rank_smoke(output_dir: PathBuf) -> Result<()> 
     if scale_grad_norm <= 0.0 {
         bail!("EP sparse train smoke expected positive local expert scale grad norm");
     }
-    let updated_scales = (&local_scales - &(scale_grad * 0.25)).detach();
+    let updated_scales = (&local_scales - &(&scale_grad * 0.25)).detach();
     let updated_forward = ep_sparse_forward(
         &output_dir,
         "ep-sparse-updated-forward",
@@ -838,6 +845,56 @@ pub fn run_expert_parallel_sparse_rank_smoke(output_dir: PathBuf) -> Result<()> 
     if !train_loss_improved {
         bail!(
             "EP sparse train smoke did not lower loss on rank {rank}: initial={train_initial_loss}, final={train_final_loss}"
+        );
+    }
+    let sparse_state = ExpertParallelAdamState {
+        m: scale_grad.detach(),
+        v: scale_grad.square().detach(),
+        step: 1,
+    };
+    let sparse_adam = ExpertParallelAdamConfig {
+        learning_rate: 0.25,
+        beta1: 0.0,
+        beta2: 0.0,
+        eps: 0.0,
+        weight_decay: 0.0,
+    };
+    let checkpoint = write_ep_rank_checkpoint(
+        &output_dir,
+        rank,
+        world_size,
+        local_rank,
+        owned_expert_start,
+        owned_expert_end,
+        &updated_scales,
+        &sparse_state,
+        &sparse_adam,
+    )?;
+    let (reloaded_scales, _reloaded_state) = read_ep_rank_checkpoint(&checkpoint)?;
+    let reloaded_scales = reloaded_scales.to_device(device);
+    let reload_scale_max_abs = tensor_max_abs_diff(&reloaded_scales, &updated_scales)?;
+    if reload_scale_max_abs > 1e-7 {
+        bail!("EP sparse checkpoint reload mismatch on rank {rank}: scale={reload_scale_max_abs}");
+    }
+    let reloaded_forward = ep_sparse_forward(
+        &output_dir,
+        "ep-sparse-reloaded-forward",
+        rank,
+        world_size,
+        &tokens,
+        &assignments,
+        owned_expert_start,
+        owned_expert_end,
+        &reloaded_scales,
+    )?;
+    let reload_loss = (&reloaded_forward.assembled_output - &target_rows)
+        .square()
+        .mean(Kind::Float)
+        .double_value(&[]);
+    let reload_loss_delta = (reload_loss - train_final_loss).abs();
+    if reload_loss_delta > 1e-7 {
+        bail!(
+            "EP sparse checkpoint reload loss mismatch on rank {rank}: reload_loss={reload_loss}, train_final_loss={train_final_loss}, delta={reload_loss_delta}"
         );
     }
 
@@ -863,6 +920,13 @@ pub fn run_expert_parallel_sparse_rank_smoke(output_dir: PathBuf) -> Result<()> 
         train_final_loss,
         train_loss_improved,
         scale_grad_norm,
+        checkpoint_manifest_output: checkpoint.manifest_path.display().to_string(),
+        checkpoint_model_safetensors: checkpoint.model_safetensors.display().to_string(),
+        checkpoint_optimizer_safetensors: checkpoint.optimizer_safetensors.display().to_string(),
+        checkpoint_tensor_count: checkpoint.tensor_count,
+        reload_scale_max_abs,
+        reload_loss,
+        reload_loss_delta,
     };
     let summary_path = output_dir.join(format!("ep-sparse-rank-{rank}.json"));
     fs::write(

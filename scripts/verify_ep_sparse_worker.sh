@@ -91,6 +91,20 @@ for path in summaries:
         raise SystemExit(
             f"{path} train_final_loss {data['train_final_loss']} >= train_initial_loss {data['train_initial_loss']}"
         )
+    for key in [
+        "checkpoint_manifest_output",
+        "checkpoint_model_safetensors",
+        "checkpoint_optimizer_safetensors",
+    ]:
+        artifact = pathlib.Path(data[key])
+        if not artifact.exists():
+            raise SystemExit(f"{path} missing {key} artifact {artifact}")
+    if int(data["checkpoint_tensor_count"]) != 1:
+        raise SystemExit(f"{path} checkpoint_tensor_count {data['checkpoint_tensor_count']} != 1")
+    if float(data["reload_scale_max_abs"]) > 1e-7:
+        raise SystemExit(f"{path} reload_scale_max_abs too large: {data['reload_scale_max_abs']}")
+    if float(data["reload_loss_delta"]) > 1e-7:
+        raise SystemExit(f"{path} reload_loss_delta too large: {data['reload_loss_delta']}")
     source_tokens.extend(data["source_token_indices"])
     owned_tokens.extend(data["owned_token_indices"])
     evidence.append(
@@ -110,6 +124,10 @@ for path in summaries:
             "train_initial_loss": data["train_initial_loss"],
             "train_final_loss": data["train_final_loss"],
             "train_loss_improved": data["train_loss_improved"],
+            "checkpoint_manifest_output": data["checkpoint_manifest_output"],
+            "reload_scale_max_abs": data["reload_scale_max_abs"],
+            "reload_loss": data["reload_loss"],
+            "reload_loss_delta": data["reload_loss_delta"],
         }
     )
 
