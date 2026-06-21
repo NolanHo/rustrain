@@ -1778,6 +1778,14 @@ fn qwen_lora_sft_train(
         .map(read_qwen_lora_sft_resume_manifest)
         .transpose()?
         .flatten();
+    if let Some(manifest) = resume_manifest.as_ref() {
+        qwen_validate_sft_resume_dataset(
+            &manifest.dataset_source_files,
+            &manifest.dataset_fingerprint,
+            &dataset_summary,
+            "Qwen LoRA SFT adapter resume",
+        )?;
+    }
     let data_cursor_start = resume_manifest
         .as_ref()
         .map(|manifest| manifest.data_cursor_next)
@@ -2556,6 +2564,15 @@ fn qwen_session_single_summary(
         train_steps,
         runtime_config,
     )?;
+    if let Some(manifest) = loaded_manifest.as_ref() {
+        qwen_validate_optional_sft_resume_dataset(
+            &manifest.dataset_source_files,
+            &manifest.dataset_fingerprint,
+            batch_plan.dataset_source_files.as_deref(),
+            batch_plan.dataset_fingerprint.as_deref(),
+            "Qwen session checkpoint resume",
+        )?;
+    }
     let (mut session, start_step, data_cursor_start) =
         if let Some(manifest) = loaded_manifest.as_ref() {
             (
@@ -6345,6 +6362,53 @@ fn qwen_sft_hash_bytes(hash: &mut u64, bytes: &[u8]) {
     }
 }
 
+fn qwen_validate_sft_resume_dataset(
+    manifest_source_files: &[String],
+    manifest_fingerprint: &str,
+    dataset_summary: &QwenSftDatasetSummary,
+    context: &str,
+) -> Result<()> {
+    qwen_validate_optional_sft_resume_dataset(
+        manifest_source_files,
+        manifest_fingerprint,
+        Some(&dataset_summary.source_files),
+        Some(&dataset_summary.fingerprint),
+        context,
+    )
+}
+
+fn qwen_validate_optional_sft_resume_dataset(
+    manifest_source_files: &[String],
+    manifest_fingerprint: &str,
+    dataset_source_files: Option<&[String]>,
+    dataset_fingerprint: Option<&str>,
+    context: &str,
+) -> Result<()> {
+    if manifest_fingerprint.is_empty() && manifest_source_files.is_empty() {
+        return Ok(());
+    }
+    let Some(dataset_fingerprint) = dataset_fingerprint else {
+        bail!("{context} manifest has dataset provenance but current run has no JSONL dataset");
+    };
+    if dataset_fingerprint.is_empty() {
+        bail!("{context} current JSONL dataset fingerprint is empty");
+    }
+    if manifest_fingerprint != dataset_fingerprint {
+        bail!(
+            "{context} dataset fingerprint mismatch: manifest={manifest_fingerprint}, current={dataset_fingerprint}"
+        );
+    }
+    let Some(dataset_source_files) = dataset_source_files else {
+        bail!("{context} manifest has dataset source files but current run has none");
+    };
+    if manifest_source_files != dataset_source_files {
+        bail!(
+            "{context} dataset source files mismatch: manifest={manifest_source_files:?}, current={dataset_source_files:?}"
+        );
+    }
+    Ok(())
+}
+
 fn qwen_sft_token_sample(
     tokenizer: &Tokenizer,
     example: &QwenSftExample,
@@ -8081,6 +8145,49 @@ mod tests {
         assert_eq!(examples[1].instruction, "Name the language.");
         assert_eq!(examples[1].input, "rustrain implementation");
         assert_eq!(examples[1].response, "Rust");
+    }
+
+    #[test]
+    fn qwen_sft_resume_dataset_validation_rejects_changed_data() {
+        let summary = QwenSftDatasetSummary {
+            samples: 2,
+            total_tokens: 8,
+            response_tokens: 2,
+            masked_positions: 2,
+            max_sequence_tokens: 4,
+            source_files: vec!["data/train.jsonl".to_string()],
+            fingerprint: "fingerprint-a".to_string(),
+        };
+
+        qwen_validate_sft_resume_dataset(
+            &summary.source_files,
+            &summary.fingerprint,
+            &summary,
+            "test resume",
+        )
+        .expect("matching provenance should pass");
+        qwen_validate_sft_resume_dataset(&[], "", &summary, "legacy resume")
+            .expect("legacy manifests without provenance should pass");
+
+        let fingerprint_error = qwen_validate_sft_resume_dataset(
+            &summary.source_files,
+            "fingerprint-b",
+            &summary,
+            "test resume",
+        )
+        .expect_err("changed content fingerprint should fail")
+        .to_string();
+        assert!(fingerprint_error.contains("dataset fingerprint mismatch"));
+
+        let source_error = qwen_validate_sft_resume_dataset(
+            &["data/other.jsonl".to_string()],
+            &summary.fingerprint,
+            &summary,
+            "test resume",
+        )
+        .expect_err("changed source files should fail")
+        .to_string();
+        assert!(source_error.contains("dataset source files mismatch"));
     }
 
     #[test]
