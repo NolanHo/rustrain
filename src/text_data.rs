@@ -351,6 +351,7 @@ mod tests {
         let data = DataConfig {
             kind: DataKind::Text,
             paths: vec![data_dir],
+            eval_paths: Vec::new(),
             train_split: 0.75,
             max_samples: None,
             shuffle: true,
@@ -380,6 +381,7 @@ mod tests {
         let data = DataConfig {
             kind: DataKind::InstructionJsonl,
             paths: vec![data_dir],
+            eval_paths: Vec::new(),
             train_split: 0.5,
             max_samples: None,
             shuffle: true,
@@ -427,6 +429,7 @@ mod tests {
         let data = DataConfig {
             kind: DataKind::InstructionJsonl,
             paths: vec![data_dir],
+            eval_paths: Vec::new(),
             train_split: 0.5,
             max_samples: Some(2),
             shuffle: true,

@@ -1,0 +1,57 @@
+[run]
+name = "qwen_lora_sft_eval_paths"
+base_dir = "/tmp/rustrain-runs"
+seed = 777
+
+[model]
+name = "qwen2_5_0_5b_lora_sft"
+architecture = "qwen_lora_sft"
+model_path = "/vePFS-Mindverse/share/huggingface/Qwen2.5-0.5B-Instruct"
+vocab_size = 151936
+hidden_size = 896
+num_layers = 24
+num_attention_heads = 14
+num_key_value_heads = 2
+intermediate_size = 4864
+seq_len = 32
+norm = "rmsnorm"
+activation = "swiglu"
+rope = true
+rms_norm_eps = 0.000001
+
+[train]
+max_steps = 1
+backend = "tch"
+micro_batch_size = 1
+global_batch_size = 1
+gradient_accumulation_steps = 1
+learning_rate = 100.0
+lr_scheduler = "constant"
+max_grad_norm = 0.0001
+weight_decay = 0.0
+adam_beta1 = 0.9
+adam_beta2 = 0.999
+adam_eps = 0.00000001
+dtype = "fp32"
+device = "cuda"
+checkpoint_every = 1
+eval_every = 1
+
+[data]
+kind = "instruction_jsonl"
+paths = ["data/sft_toy/instructions.jsonl"]
+eval_paths = ["data/sft_toy/more_instructions.jsonl"]
+train_split = 0.5
+
+[lora]
+rank = 4
+alpha = 8.0
+target_layers = [0]
+target_modules = ["q_proj", "v_proj"]
+
+[parallel]
+tensor_model_parallel_size = 1
+pipeline_model_parallel_size = 1
+data_parallel_size = 1
+expert_model_parallel_size = 1
+context_parallel_size = 1

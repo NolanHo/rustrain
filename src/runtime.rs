@@ -80,6 +80,8 @@ pub struct TrainConfig {
 pub struct DataConfig {
     pub kind: DataKind,
     pub paths: Vec<PathBuf>,
+    #[serde(default)]
+    pub eval_paths: Vec<PathBuf>,
     #[serde(default = "default_train_split")]
     pub train_split: f32,
     #[serde(default)]
@@ -511,6 +513,7 @@ mod tests {
             data: Some(DataConfig {
                 kind: DataKind::InstructionJsonl,
                 paths: vec!["data/sft_toy/instructions.jsonl".into()],
+                eval_paths: Vec::new(),
                 train_split: 0.8,
                 max_samples: None,
                 shuffle: true,

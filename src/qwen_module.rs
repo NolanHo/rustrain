@@ -1094,6 +1094,12 @@ struct QwenSftDatasetSummary {
     shuffle: bool,
 }
 
+struct QwenSftTrainEvalDatasets {
+    combined_summary: QwenSftDatasetSummary,
+    train_dataset: QwenSftDataset,
+    eval_dataset: QwenSftDataset,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct QwenSftSourceSampleCount {
     pub(crate) path: String,
@@ -1745,6 +1751,7 @@ pub fn qwen_lora_sft_smoke(
         adapter_output,
         checkpoint_dir,
         sft_paths.as_deref(),
+        &[],
         None,
         None,
         sft_batch_size,
@@ -1817,6 +1824,7 @@ pub fn train_qwen_lora_sft_from_config(
         &adapter_output,
         &run_paths.checkpoints,
         Some(&data.paths),
+        &data.eval_paths,
         data.max_samples,
         config.train.resume_from.as_deref(),
         config.train.micro_batch_size,
@@ -1840,6 +1848,7 @@ fn qwen_lora_sft_train(
     adapter_output: &Path,
     checkpoint_dir: &Path,
     sft_paths: Option<&[PathBuf]>,
+    eval_paths: &[PathBuf],
     max_samples: Option<usize>,
     resume_from: Option<&Path>,
     sft_batch_size: usize,
@@ -1874,9 +1883,17 @@ fn qwen_lora_sft_train(
     let tokenizer = Tokenizer::from_file(model_path.join("tokenizer.json"))
         .map_err(|error| anyhow!("failed to load tokenizer: {error}"))?;
     let dataset = if let Some(sft_paths) = sft_paths {
-        QwenSftDataset::from_jsonl_paths_with_limit(&tokenizer, sft_paths, max_samples)?
+        qwen_sft_train_eval_datasets_from_paths(
+            &tokenizer,
+            sft_paths,
+            eval_paths,
+            max_samples,
+            train_split,
+            policy.dataset_shuffle,
+            policy.dataset_order_seed,
+        )?
     } else {
-        QwenSftDataset::from_instruction_pairs(
+        let dataset = QwenSftDataset::from_instruction_pairs(
             &tokenizer,
             &[
                 QwenSftExample {
@@ -1892,12 +1909,20 @@ fn qwen_lora_sft_train(
                     source_file: None,
                 },
             ],
-        )?
+        )?;
+        let dataset =
+            qwen_apply_sft_shuffle(dataset, policy.dataset_shuffle, policy.dataset_order_seed);
+        let combined_summary = dataset.summary();
+        let (train_dataset, eval_dataset) = dataset.train_eval_split(train_split)?;
+        QwenSftTrainEvalDatasets {
+            combined_summary,
+            train_dataset,
+            eval_dataset,
+        }
     };
-    let dataset =
-        qwen_apply_sft_shuffle(dataset, policy.dataset_shuffle, policy.dataset_order_seed);
-    let dataset_summary = dataset.summary();
-    let (train_dataset, eval_dataset) = dataset.train_eval_split(train_split)?;
+    let dataset_summary = dataset.combined_summary;
+    let train_dataset = dataset.train_dataset;
+    let eval_dataset = dataset.eval_dataset;
     let train_batch_size = sft_batch_size.min(train_dataset.len());
     let eval_batch_size = sft_batch_size.min(eval_dataset.len());
     let resume_manifest = resume_from
@@ -4989,17 +5014,18 @@ fn qwen_session_batch_plan_from_config(
     }
     let tokenizer = Tokenizer::from_file(model_path.join("tokenizer.json"))
         .map_err(|error| anyhow!("failed to load tokenizer: {error}"))?;
-    let dataset = qwen_apply_sft_shuffle(
-        QwenSftDataset::from_jsonl_paths_with_limit(
-            &tokenizer,
-            &data_config.paths,
-            data_config.max_samples,
-        )?,
+    let datasets = qwen_sft_train_eval_datasets_from_paths(
+        &tokenizer,
+        &data_config.paths,
+        &data_config.eval_paths,
+        data_config.max_samples,
+        data_config.train_split,
         data_config.shuffle,
         runtime_config.run.seed,
-    );
-    let dataset_summary = dataset.summary();
-    let (train_dataset, eval_dataset) = dataset.train_eval_split(data_config.train_split)?;
+    )?;
+    let dataset_summary = datasets.combined_summary;
+    let train_dataset = datasets.train_dataset;
+    let eval_dataset = datasets.eval_dataset;
     let batch_size = runtime_config
         .train
         .micro_batch_size
@@ -5103,17 +5129,18 @@ fn qwen_session_dp_batch_plan_from_config(
     }
     let tokenizer = Tokenizer::from_file(model_path.join("tokenizer.json"))
         .map_err(|error| anyhow!("failed to load tokenizer: {error}"))?;
-    let dataset = qwen_apply_sft_shuffle(
-        QwenSftDataset::from_jsonl_paths_with_limit(
-            &tokenizer,
-            &data_config.paths,
-            data_config.max_samples,
-        )?,
+    let datasets = qwen_sft_train_eval_datasets_from_paths(
+        &tokenizer,
+        &data_config.paths,
+        &data_config.eval_paths,
+        data_config.max_samples,
+        data_config.train_split,
         data_config.shuffle,
         runtime_config.run.seed,
-    );
-    let dataset_summary = dataset.summary();
-    let (train_dataset, eval_dataset) = dataset.train_eval_split(data_config.train_split)?;
+    )?;
+    let dataset_summary = datasets.combined_summary;
+    let train_dataset = datasets.train_dataset;
+    let eval_dataset = datasets.eval_dataset;
     let local_batch_size = runtime_config
         .train
         .micro_batch_size
@@ -6523,6 +6550,18 @@ impl QwenSftDataset {
     fn len(&self) -> usize {
         self.samples.len()
     }
+
+    fn with_source_metadata(
+        mut self,
+        source_files: Vec<String>,
+        source_sample_counts: Vec<QwenSftSourceSampleCount>,
+        fingerprint: String,
+    ) -> Self {
+        self.source_files = source_files;
+        self.source_sample_counts = source_sample_counts;
+        self.fingerprint = fingerprint;
+        self
+    }
 }
 
 fn qwen_apply_sft_shuffle(dataset: QwenSftDataset, shuffle: bool, seed: u64) -> QwenSftDataset {
@@ -6531,6 +6570,116 @@ fn qwen_apply_sft_shuffle(dataset: QwenSftDataset, shuffle: bool, seed: u64) -> 
     } else {
         dataset
     }
+}
+
+fn qwen_sft_train_eval_datasets_from_paths(
+    tokenizer: &Tokenizer,
+    train_paths: &[PathBuf],
+    eval_paths: &[PathBuf],
+    max_samples: Option<usize>,
+    train_split: f32,
+    shuffle: bool,
+    seed: u64,
+) -> Result<QwenSftTrainEvalDatasets> {
+    let train_dataset =
+        QwenSftDataset::from_jsonl_paths_with_limit(tokenizer, train_paths, max_samples)?;
+    if eval_paths.is_empty() {
+        let dataset = qwen_apply_sft_shuffle(train_dataset, shuffle, seed);
+        let combined_summary = dataset.summary();
+        let (train_dataset, eval_dataset) = dataset.train_eval_split(train_split)?;
+        return Ok(QwenSftTrainEvalDatasets {
+            combined_summary,
+            train_dataset,
+            eval_dataset,
+        });
+    }
+
+    let eval_dataset = QwenSftDataset::from_jsonl_paths_with_limit(tokenizer, eval_paths, None)?;
+    let train_summary = train_dataset.summary();
+    let eval_summary = eval_dataset.summary();
+    let combined_source_files =
+        qwen_merge_sft_source_files(&train_summary.source_files, &eval_summary.source_files);
+    let combined_source_sample_counts = qwen_merge_sft_source_sample_counts(
+        &train_summary.source_sample_counts,
+        &eval_summary.source_sample_counts,
+    );
+    let combined_fingerprint = qwen_combine_sft_fingerprints(
+        &combined_source_files,
+        &train_summary.fingerprint,
+        &eval_summary.fingerprint,
+    );
+    let train_dataset = qwen_apply_sft_shuffle(
+        train_dataset.with_source_metadata(
+            combined_source_files.clone(),
+            combined_source_sample_counts.clone(),
+            combined_fingerprint.clone(),
+        ),
+        shuffle,
+        seed,
+    );
+    let eval_dataset = eval_dataset.with_source_metadata(
+        combined_source_files.clone(),
+        combined_source_sample_counts.clone(),
+        combined_fingerprint.clone(),
+    );
+    Ok(QwenSftTrainEvalDatasets {
+        combined_summary: QwenSftDatasetSummary {
+            samples: train_summary.samples + eval_summary.samples,
+            total_tokens: train_summary.total_tokens + eval_summary.total_tokens,
+            response_tokens: train_summary.response_tokens + eval_summary.response_tokens,
+            masked_positions: train_summary.masked_positions + eval_summary.masked_positions,
+            max_sequence_tokens: train_summary
+                .max_sequence_tokens
+                .max(eval_summary.max_sequence_tokens),
+            source_files: combined_source_files,
+            source_sample_counts: combined_source_sample_counts,
+            fingerprint: combined_fingerprint,
+            shuffle,
+        },
+        train_dataset,
+        eval_dataset,
+    })
+}
+
+fn qwen_merge_sft_source_files(train: &[String], eval: &[String]) -> Vec<String> {
+    train
+        .iter()
+        .chain(eval.iter())
+        .cloned()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+fn qwen_merge_sft_source_sample_counts(
+    train: &[QwenSftSourceSampleCount],
+    eval: &[QwenSftSourceSampleCount],
+) -> Vec<QwenSftSourceSampleCount> {
+    let mut counts = BTreeMap::new();
+    for source_count in train.iter().chain(eval.iter()) {
+        *counts.entry(source_count.path.clone()).or_insert(0) += source_count.samples;
+    }
+    counts
+        .into_iter()
+        .map(|(path, samples)| QwenSftSourceSampleCount { path, samples })
+        .collect()
+}
+
+fn qwen_combine_sft_fingerprints(
+    source_files: &[String],
+    train_fingerprint: &str,
+    eval_fingerprint: &str,
+) -> String {
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    qwen_sft_hash_bytes(&mut hash, b"train");
+    qwen_sft_hash_bytes(&mut hash, train_fingerprint.as_bytes());
+    qwen_sft_hash_bytes(&mut hash, b"\0eval");
+    qwen_sft_hash_bytes(&mut hash, eval_fingerprint.as_bytes());
+    for file in source_files {
+        qwen_sft_hash_bytes(&mut hash, b"\0path");
+        qwen_sft_hash_bytes(&mut hash, file.as_bytes());
+    }
+    format!("{hash:016x}")
 }
 
 fn qwen_epoch_permutation_index(
@@ -8868,6 +9017,51 @@ mod tests {
         assert_eq!(examples[1].instruction, "Name the language.");
         assert_eq!(examples[1].input, "rustrain implementation");
         assert_eq!(examples[1].response, "Rust");
+    }
+
+    #[test]
+    fn qwen_sft_explicit_eval_metadata_combines_train_and_eval_sources() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let train_jsonl = temp.path().join("train.jsonl");
+        let eval_jsonl = temp.path().join("eval.jsonl");
+        let train_file = train_jsonl.display().to_string();
+        let eval_file = eval_jsonl.display().to_string();
+        let source_files = qwen_merge_sft_source_files(
+            std::slice::from_ref(&train_file),
+            std::slice::from_ref(&eval_file),
+        );
+        let source_counts = qwen_merge_sft_source_sample_counts(
+            &[QwenSftSourceSampleCount {
+                path: train_file.clone(),
+                samples: 3,
+            }],
+            &[QwenSftSourceSampleCount {
+                path: eval_file.clone(),
+                samples: 2,
+            }],
+        );
+        let fingerprint =
+            qwen_combine_sft_fingerprints(&source_files, "train-fingerprint", "eval-fingerprint");
+
+        assert_eq!(source_files, vec![eval_file.clone(), train_file.clone()]);
+        assert_eq!(
+            source_counts,
+            vec![
+                QwenSftSourceSampleCount {
+                    path: eval_file,
+                    samples: 2,
+                },
+                QwenSftSourceSampleCount {
+                    path: train_file,
+                    samples: 3,
+                },
+            ]
+        );
+        assert!(!fingerprint.is_empty());
+        assert_ne!(
+            fingerprint,
+            qwen_combine_sft_fingerprints(&source_files, "train-fingerprint", "other-eval")
+        );
     }
 
     #[test]
