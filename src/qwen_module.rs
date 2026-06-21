@@ -3255,6 +3255,13 @@ pub fn qwen_session_dp_rank_smoke(
     let checkpoint_manifest: QwenSessionDpCheckpointManifest =
         serde_json::from_str(&checkpoint_text)
             .with_context(|| format!("failed to parse {}", checkpoint_path.display()))?;
+    qwen_validate_optional_sft_resume_dataset(
+        &checkpoint_manifest.dataset_source_files,
+        &checkpoint_manifest.dataset_fingerprint,
+        batch_plan.dataset_source_files.as_deref(),
+        batch_plan.dataset_fingerprint.as_deref(),
+        "Qwen session DP rank0 checkpoint resume",
+    )?;
     let mut delta_manifest = checkpoint_manifest.to_delta_manifest()?;
     delta_manifest.delta_safetensors = delta_output.display().to_string();
     delta_manifest.optimizer_safetensors = Some(optimizer_output.display().to_string());
@@ -3385,6 +3392,13 @@ pub fn qwen_session_dp_rank_smoke(
             )
         })?;
     sharded_global_manifest.validate()?;
+    qwen_validate_optional_sft_resume_dataset(
+        &sharded_global_manifest.dataset_source_files,
+        &sharded_global_manifest.dataset_fingerprint,
+        batch_plan.dataset_source_files.as_deref(),
+        batch_plan.dataset_fingerprint.as_deref(),
+        "Qwen session DP sharded checkpoint resume",
+    )?;
     let sharded_delta_manifest = qwen_sharded_rank_to_delta_manifest(
         &sharded_global_manifest,
         rank,
@@ -7120,6 +7134,50 @@ mod tests {
                 .to_string()
                 .contains("data_sample_offset_next 5 must match")
         );
+    }
+
+    #[test]
+    fn qwen_sharded_checkpoint_resume_dataset_validation_rejects_changed_data() {
+        let manifest = tiny_qwen_sharded_manifest();
+        let summary = QwenSftDatasetSummary {
+            samples: 5,
+            total_tokens: 40,
+            response_tokens: 10,
+            masked_positions: 10,
+            max_sequence_tokens: 8,
+            source_files: manifest.dataset_source_files.clone(),
+            fingerprint: manifest.dataset_fingerprint.clone(),
+        };
+
+        qwen_validate_sft_resume_dataset(
+            &manifest.dataset_source_files,
+            &manifest.dataset_fingerprint,
+            &summary,
+            "sharded resume",
+        )
+        .expect("matching sharded provenance should pass");
+        qwen_validate_sft_resume_dataset(&[], "", &summary, "legacy sharded resume")
+            .expect("legacy sharded manifests without provenance should pass");
+
+        let fingerprint_error = qwen_validate_sft_resume_dataset(
+            &manifest.dataset_source_files,
+            "changed-fingerprint",
+            &summary,
+            "sharded resume",
+        )
+        .expect_err("changed sharded fingerprint should fail")
+        .to_string();
+        assert!(fingerprint_error.contains("dataset fingerprint mismatch"));
+
+        let source_error = qwen_validate_sft_resume_dataset(
+            &["data/changed.jsonl".to_string()],
+            &manifest.dataset_fingerprint,
+            &summary,
+            "sharded resume",
+        )
+        .expect_err("changed sharded source files should fail")
+        .to_string();
+        assert!(source_error.contains("dataset source files mismatch"));
     }
 
     #[test]
