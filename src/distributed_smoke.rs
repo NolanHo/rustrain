@@ -57,6 +57,18 @@ struct ExpertParallelSmokeSummary {
     rank_token_counts: Vec<usize>,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+struct ExpertParallelRankSummary {
+    rank: usize,
+    world_size: usize,
+    local_rank: usize,
+    owned_expert_start: usize,
+    owned_expert_end: usize,
+    owned_token_indices: Vec<usize>,
+    expert_load: Vec<usize>,
+    local_output_path: String,
+}
+
 pub fn run_data_parallel_smoke(output_dir: &Path, world_size: usize) -> Result<()> {
     if world_size != 2 {
         bail!("M12 DP smoke currently expects world_size = 2");
@@ -282,23 +294,9 @@ pub fn run_expert_parallel_smoke(world_size: usize) -> Result<()> {
         bail!("M17 EP smoke currently expects world_size = 2");
     }
 
-    let tokens = array![
-        [1.0_f64, 0.0, 0.5],
-        [0.0, 1.0, -0.5],
-        [1.0, 1.0, 0.0],
-        [-1.0, 0.5, 1.0],
-    ];
-    let router = array![
-        [0.9_f64, -0.2, 0.1, 0.0],
-        [0.1, 0.8, -0.4, 0.2],
-        [0.0, -0.3, 0.7, 0.6],
-    ];
-    let expert_scales = [
-        [1.0_f64, 0.5, -0.25],
-        [-0.5, 1.5, 0.25],
-        [0.25, -1.0, 1.25],
-        [1.2, 0.3, 0.8],
-    ];
+    let tokens = ep_tokens();
+    let router = ep_router();
+    let expert_scales = ep_expert_scales();
 
     let assignments = route_top1(&tokens, &router);
     let reference = expert_outputs(&tokens, &assignments, &expert_scales);
@@ -337,6 +335,68 @@ pub fn run_expert_parallel_smoke(world_size: usize) -> Result<()> {
     Ok(())
 }
 
+pub fn run_expert_parallel_rank_smoke(output_dir: PathBuf) -> Result<()> {
+    let rank = parse_launcher_usize_env("RANK")?;
+    let local_rank = parse_launcher_usize_env("LOCAL_RANK")?;
+    let world_size = parse_launcher_usize_env("WORLD_SIZE")?;
+    if world_size != 2 {
+        bail!("EP rank-local smoke currently expects WORLD_SIZE=2");
+    }
+    if rank >= world_size {
+        bail!("rank {rank} must be smaller than world_size {world_size}");
+    }
+    fs::create_dir_all(&output_dir)
+        .with_context(|| format!("failed to create {}", output_dir.display()))?;
+
+    let tokens = ep_tokens();
+    let router = ep_router();
+    let expert_scales = ep_expert_scales();
+    let assignments = route_top1(&tokens, &router);
+    let experts_per_rank = expert_scales.len() / world_size;
+    let owned_expert_start = rank * experts_per_rank;
+    let owned_expert_end = owned_expert_start + experts_per_rank;
+    let mut local_output = Array2::<f64>::zeros(tokens.dim());
+    let mut owned_token_indices = Vec::new();
+    let mut expert_load = vec![0usize; expert_scales.len()];
+    for (token_index, expert_index) in assignments.iter().copied().enumerate() {
+        if !(owned_expert_start..owned_expert_end).contains(&expert_index) {
+            continue;
+        }
+        owned_token_indices.push(token_index);
+        expert_load[expert_index] += 1;
+        for hidden_index in 0..tokens.ncols() {
+            local_output[[token_index, hidden_index]] =
+                tokens[[token_index, hidden_index]] * expert_scales[expert_index][hidden_index];
+        }
+    }
+
+    let local_output_path = output_dir.join(format!("ep-rank-{rank}-output.json"));
+    fs::write(
+        &local_output_path,
+        serde_json::to_string_pretty(&array2_to_rows(&local_output))? + "\n",
+    )
+    .with_context(|| format!("failed to write {}", local_output_path.display()))?;
+
+    let summary = ExpertParallelRankSummary {
+        rank,
+        world_size,
+        local_rank,
+        owned_expert_start,
+        owned_expert_end,
+        owned_token_indices,
+        expert_load,
+        local_output_path: local_output_path.display().to_string(),
+    };
+    let summary_path = output_dir.join(format!("ep-rank-{rank}.json"));
+    fs::write(
+        &summary_path,
+        serde_json::to_string_pretty(&summary)? + "\n",
+    )
+    .with_context(|| format!("failed to write {}", summary_path.display()))?;
+    println!("{}", serde_json::to_string_pretty(&summary)?);
+    Ok(())
+}
+
 fn compute_dp_stats(rank: usize, world_size: usize) -> DpRankStats {
     let mut sample_count = 0;
     let mut loss_sum = 0.0;
@@ -361,6 +421,36 @@ fn compute_dp_stats(rank: usize, world_size: usize) -> DpRankStats {
         loss_sum,
         grad_sum,
     }
+}
+
+fn ep_tokens() -> Array2<f64> {
+    array![
+        [1.0_f64, 0.0, 0.5],
+        [0.0, 1.0, -0.5],
+        [1.0, 1.0, 0.0],
+        [-1.0, 0.5, 1.0],
+    ]
+}
+
+fn ep_router() -> Array2<f64> {
+    array![
+        [0.9_f64, -0.2, 0.1, 0.0],
+        [0.1, 0.8, -0.4, 0.2],
+        [0.0, -0.3, 0.7, 0.6],
+    ]
+}
+
+fn ep_expert_scales() -> [[f64; 3]; 4] {
+    [
+        [1.0_f64, 0.5, -0.25],
+        [-0.5, 1.5, 0.25],
+        [0.25, -1.0, 1.25],
+        [1.2, 0.3, 0.8],
+    ]
+}
+
+fn array2_to_rows(array: &Array2<f64>) -> Vec<Vec<f64>> {
+    array.rows().into_iter().map(|row| row.to_vec()).collect()
 }
 
 fn parse_launcher_usize_env(name: &str) -> Result<usize> {

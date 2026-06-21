@@ -338,6 +338,11 @@ enum Command {
         world_size: Option<usize>,
     },
     #[command(hide = true)]
+    ParallelEpRankSmoke {
+        #[arg(long)]
+        output_dir: PathBuf,
+    },
+    #[command(hide = true)]
     PrintLaunchEnv,
     #[command(hide = true)]
     NcclAllReduceRankSmoke {
@@ -560,6 +565,9 @@ fn main() -> Result<()> {
             rank,
             world_size,
         } => distributed_smoke::run_data_parallel_rank_from_args(output_dir, rank, world_size),
+        Command::ParallelEpRankSmoke { output_dir } => {
+            distributed_smoke::run_expert_parallel_rank_smoke(output_dir)
+        }
         Command::PrintLaunchEnv => launcher::print_launch_env(),
         Command::NcclAllReduceRankSmoke { output_dir } => {
             nccl_smoke::run_nccl_all_reduce_rank(output_dir)
