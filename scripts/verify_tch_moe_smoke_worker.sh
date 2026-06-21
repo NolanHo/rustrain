@@ -36,6 +36,15 @@ required = [
     "final_task_loss",
     "initial_load_balance_loss",
     "final_load_balance_loss",
+    "checkpoint_output",
+    "reloaded_loss",
+    "reload_delta",
+    "continuous_second_loss",
+    "resumed_second_loss",
+    "second_step_delta",
+    "second_step_router_max_abs",
+    "second_step_expert_up_max_abs",
+    "second_step_expert_down_max_abs",
     "expert_load",
     "total_params",
     "activated_params",
@@ -75,6 +84,9 @@ if summary["activated_params"] != 60:
     raise SystemExit(f"unexpected activated_params: {summary['activated_params']}")
 if not summary["activated_params"] < summary["total_params"]:
     raise SystemExit("activated_params must be less than total_params")
+checkpoint = pathlib.Path(summary["checkpoint_output"])
+if not checkpoint.exists() or checkpoint.stat().st_size == 0:
+    raise SystemExit(f"checkpoint_output missing or empty: {checkpoint}")
 if len(summary["expert_load"]) != summary["num_experts"]:
     raise SystemExit(f"unexpected expert_load length: {summary['expert_load']}")
 if sum(summary["expert_load"]) != summary["tokens"]:
@@ -109,12 +121,27 @@ if float(summary["initial_load_balance_loss"]) < 0.0:
     raise SystemExit("initial load-balance loss must be non-negative")
 if float(summary["final_load_balance_loss"]) < 0.0:
     raise SystemExit("final load-balance loss must be non-negative")
+if abs(float(summary["reloaded_loss"]) - float(summary["final_loss"])) > 1e-7:
+    raise SystemExit(
+        f"reloaded_loss does not match final_loss: {summary['reloaded_loss']} vs {summary['final_loss']}"
+    )
+for key in [
+    "reload_delta",
+    "second_step_delta",
+    "second_step_router_max_abs",
+    "second_step_expert_up_max_abs",
+    "second_step_expert_down_max_abs",
+]:
+    if float(summary[key]) > 1e-7:
+        raise SystemExit(f"{key} too large: {summary[key]}")
 
 print(
     "tch_moe_smoke_verified: "
     f"loss={summary['initial_loss']}->{summary['final_loss']} "
     f"task_loss={summary['initial_task_loss']}->{summary['final_task_loss']} "
     f"expert_load={summary['expert_load']} "
-    f"params={summary['activated_params']}/{summary['total_params']}"
+    f"params={summary['activated_params']}/{summary['total_params']} "
+    f"reload_delta={summary['reload_delta']} "
+    f"second_step_delta={summary['second_step_delta']}"
 )
 PY

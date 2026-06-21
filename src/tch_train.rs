@@ -1,4 +1,8 @@
-use std::{fs, path::PathBuf};
+use std::{
+    collections::BTreeMap,
+    fs,
+    path::{Path, PathBuf},
+};
 
 use anyhow::{Context, Result, anyhow, bail};
 use tch::{
@@ -67,6 +71,15 @@ struct TchMoeSmokeSummary {
     final_task_loss: f64,
     initial_load_balance_loss: f64,
     final_load_balance_loss: f64,
+    checkpoint_output: String,
+    reloaded_loss: f64,
+    reload_delta: f64,
+    continuous_second_loss: f64,
+    resumed_second_loss: f64,
+    second_step_delta: f64,
+    second_step_router_max_abs: f64,
+    second_step_expert_up_max_abs: f64,
+    second_step_expert_down_max_abs: f64,
     expert_load: Vec<usize>,
     total_params: usize,
     activated_params: usize,
@@ -88,6 +101,16 @@ struct TchMoeForward {
     task_loss: Tensor,
     load_balance_loss: Tensor,
     expert_load: Vec<usize>,
+}
+
+struct TchMoeSgdStep {
+    loss_before: f64,
+    router_grad_defined: bool,
+    expert_up_grad_defined: bool,
+    expert_down_grad_defined: bool,
+    router_grad_norm: f64,
+    expert_up_grad_norm: f64,
+    expert_down_grad_norm: f64,
 }
 
 pub fn probe_tch_cuda() -> Result<()> {
@@ -174,44 +197,24 @@ fn tch_moe_smoke_summary() -> Result<TchMoeSmokeSummary> {
     let initial_task_loss = initial.task_loss.double_value(&[]);
     let initial_load_balance_loss = initial.load_balance_loss.double_value(&[]);
 
-    let mut router_grad_defined = false;
-    let mut expert_up_grad_defined = false;
-    let mut expert_down_grad_defined = false;
-    let mut router_grad_norm = 0.0;
-    let mut expert_up_grad_norm = 0.0;
-    let mut expert_down_grad_norm = 0.0;
+    let mut first_step: Option<TchMoeSgdStep> = None;
 
     for step in 1..=train_steps {
-        router.zero_grad();
-        expert_up.zero_grad();
-        expert_down.zero_grad();
-        let forward = tch_moe_forward(
+        let step_summary = tch_moe_sgd_step(
             &input,
             &target,
-            &router,
-            &expert_up,
-            &expert_down,
+            &mut router,
+            &mut expert_up,
+            &mut expert_down,
             num_experts,
             aux_loss_weight,
+            learning_rate,
         )?;
-        forward.loss.backward();
-
         if step == 1 {
-            router_grad_defined = router.grad().defined();
-            expert_up_grad_defined = expert_up.grad().defined();
-            expert_down_grad_defined = expert_down.grad().defined();
-            router_grad_norm = tensor_l2_norm(&router.grad());
-            expert_up_grad_norm = tensor_l2_norm(&expert_up.grad());
-            expert_down_grad_norm = tensor_l2_norm(&expert_down.grad());
+            first_step = Some(step_summary);
         }
-
-        no_grad(|| -> Result<()> {
-            let _ = router.f_sub_(&(&router.grad() * learning_rate))?;
-            let _ = expert_up.f_sub_(&(&expert_up.grad() * learning_rate))?;
-            let _ = expert_down.f_sub_(&(&expert_down.grad() * learning_rate))?;
-            Ok(())
-        })?;
     }
+    let first_step = first_step.ok_or_else(|| anyhow!("missing first MoE SGD step summary"))?;
 
     let final_forward = tch_moe_forward(
         &input,
@@ -225,6 +228,61 @@ fn tch_moe_smoke_summary() -> Result<TchMoeSmokeSummary> {
     let final_loss = final_forward.loss.double_value(&[]);
     let final_task_loss = final_forward.task_loss.double_value(&[]);
     let final_load_balance_loss = final_forward.load_balance_loss.double_value(&[]);
+    let checkpoint_output = std::env::var("RUSTRAIN_TCH_MOE_CHECKPOINT")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| {
+            std::env::temp_dir().join(format!(
+                "rustrain-tch-moe-{}.safetensors",
+                std::process::id()
+            ))
+        });
+    write_tch_moe_checkpoint(&checkpoint_output, &router, &expert_up, &expert_down)?;
+    let (mut reloaded_router, mut reloaded_expert_up, mut reloaded_expert_down) =
+        read_tch_moe_checkpoint(&checkpoint_output, device)?;
+    let reloaded_forward = tch_moe_forward(
+        &input,
+        &target,
+        &reloaded_router,
+        &reloaded_expert_up,
+        &reloaded_expert_down,
+        num_experts,
+        aux_loss_weight,
+    )?;
+    let reloaded_loss = reloaded_forward.loss.double_value(&[]);
+    let reload_delta = (reloaded_loss - final_loss).abs();
+
+    let mut continuous_router = router.detach().set_requires_grad(true);
+    let mut continuous_expert_up = expert_up.detach().set_requires_grad(true);
+    let mut continuous_expert_down = expert_down.detach().set_requires_grad(true);
+    let continuous_second = tch_moe_sgd_step(
+        &input,
+        &target,
+        &mut continuous_router,
+        &mut continuous_expert_up,
+        &mut continuous_expert_down,
+        num_experts,
+        aux_loss_weight,
+        learning_rate,
+    )?;
+    let resumed_second = tch_moe_sgd_step(
+        &input,
+        &target,
+        &mut reloaded_router,
+        &mut reloaded_expert_up,
+        &mut reloaded_expert_down,
+        num_experts,
+        aux_loss_weight,
+        learning_rate,
+    )?;
+    let continuous_second_loss = continuous_second.loss_before;
+    let resumed_second_loss = resumed_second.loss_before;
+    let second_step_delta = (continuous_second_loss - resumed_second_loss).abs();
+    let second_step_router_max_abs = tensor_max_abs_diff(&continuous_router, &reloaded_router)?;
+    let second_step_expert_up_max_abs =
+        tensor_max_abs_diff(&continuous_expert_up, &reloaded_expert_up)?;
+    let second_step_expert_down_max_abs =
+        tensor_max_abs_diff(&continuous_expert_down, &reloaded_expert_down)?;
+
     if final_loss >= initial_loss {
         bail!(
             "tch MoE smoke did not reduce loss: initial_loss={initial_loss}, final_loss={final_loss}"
@@ -235,14 +293,36 @@ fn tch_moe_smoke_summary() -> Result<TchMoeSmokeSummary> {
             "tch MoE smoke did not reduce task loss: initial_task_loss={initial_task_loss}, final_task_loss={final_task_loss}"
         );
     }
-    if !router_grad_defined || !expert_up_grad_defined || !expert_down_grad_defined {
+    if !first_step.router_grad_defined
+        || !first_step.expert_up_grad_defined
+        || !first_step.expert_down_grad_defined
+    {
         bail!(
-            "tch MoE smoke missing gradients: router={router_grad_defined}, expert_up={expert_up_grad_defined}, expert_down={expert_down_grad_defined}"
+            "tch MoE smoke missing gradients: router={}, expert_up={}, expert_down={}",
+            first_step.router_grad_defined,
+            first_step.expert_up_grad_defined,
+            first_step.expert_down_grad_defined
         );
     }
-    if router_grad_norm <= 0.0 || expert_up_grad_norm <= 0.0 || expert_down_grad_norm <= 0.0 {
+    if first_step.router_grad_norm <= 0.0
+        || first_step.expert_up_grad_norm <= 0.0
+        || first_step.expert_down_grad_norm <= 0.0
+    {
         bail!(
-            "tch MoE smoke gradients must be positive: router={router_grad_norm}, expert_up={expert_up_grad_norm}, expert_down={expert_down_grad_norm}"
+            "tch MoE smoke gradients must be positive: router={}, expert_up={}, expert_down={}",
+            first_step.router_grad_norm,
+            first_step.expert_up_grad_norm,
+            first_step.expert_down_grad_norm
+        );
+    }
+    if reload_delta > 1e-7
+        || second_step_delta > 1e-7
+        || second_step_router_max_abs > 1e-7
+        || second_step_expert_up_max_abs > 1e-7
+        || second_step_expert_down_max_abs > 1e-7
+    {
+        bail!(
+            "tch MoE checkpoint resume parity failed: reload_delta={reload_delta}, second_step_delta={second_step_delta}, router={second_step_router_max_abs}, expert_up={second_step_expert_up_max_abs}, expert_down={second_step_expert_down_max_abs}"
         );
     }
 
@@ -269,15 +349,24 @@ fn tch_moe_smoke_summary() -> Result<TchMoeSmokeSummary> {
         final_task_loss,
         initial_load_balance_loss,
         final_load_balance_loss,
+        checkpoint_output: checkpoint_output.display().to_string(),
+        reloaded_loss,
+        reload_delta,
+        continuous_second_loss,
+        resumed_second_loss,
+        second_step_delta,
+        second_step_router_max_abs,
+        second_step_expert_up_max_abs,
+        second_step_expert_down_max_abs,
         expert_load: final_forward.expert_load,
         total_params,
         activated_params,
-        router_grad_defined,
-        expert_up_grad_defined,
-        expert_down_grad_defined,
-        router_grad_norm,
-        expert_up_grad_norm,
-        expert_down_grad_norm,
+        router_grad_defined: first_step.router_grad_defined,
+        expert_up_grad_defined: first_step.expert_up_grad_defined,
+        expert_down_grad_defined: first_step.expert_down_grad_defined,
+        router_grad_norm: first_step.router_grad_norm,
+        expert_up_grad_norm: first_step.expert_up_grad_norm,
+        expert_down_grad_norm: first_step.expert_down_grad_norm,
         router_delta_norm: tensor_l2_norm(
             &(router.detach().to_device(Device::Cpu) - &initial_router),
         ),
@@ -596,6 +685,100 @@ fn tch_moe_forward(
     })
 }
 
+fn tch_moe_sgd_step(
+    input: &Tensor,
+    target: &Tensor,
+    router: &mut Tensor,
+    expert_up: &mut Tensor,
+    expert_down: &mut Tensor,
+    num_experts: i64,
+    aux_loss_weight: f64,
+    learning_rate: f64,
+) -> Result<TchMoeSgdStep> {
+    router.zero_grad();
+    expert_up.zero_grad();
+    expert_down.zero_grad();
+    let forward = tch_moe_forward(
+        input,
+        target,
+        router,
+        expert_up,
+        expert_down,
+        num_experts,
+        aux_loss_weight,
+    )?;
+    let loss_before = forward.loss.double_value(&[]);
+    forward.loss.backward();
+
+    let router_grad_defined = router.grad().defined();
+    let expert_up_grad_defined = expert_up.grad().defined();
+    let expert_down_grad_defined = expert_down.grad().defined();
+    let router_grad_norm = tensor_l2_norm(&router.grad());
+    let expert_up_grad_norm = tensor_l2_norm(&expert_up.grad());
+    let expert_down_grad_norm = tensor_l2_norm(&expert_down.grad());
+
+    no_grad(|| -> Result<()> {
+        let _ = router.f_sub_(&(&router.grad() * learning_rate))?;
+        let _ = expert_up.f_sub_(&(&expert_up.grad() * learning_rate))?;
+        let _ = expert_down.f_sub_(&(&expert_down.grad() * learning_rate))?;
+        Ok(())
+    })?;
+
+    Ok(TchMoeSgdStep {
+        loss_before,
+        router_grad_defined,
+        expert_up_grad_defined,
+        expert_down_grad_defined,
+        router_grad_norm,
+        expert_up_grad_norm,
+        expert_down_grad_norm,
+    })
+}
+
+fn write_tch_moe_checkpoint(
+    path: &Path,
+    router: &Tensor,
+    expert_up: &Tensor,
+    expert_down: &Tensor,
+) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+    Tensor::write_safetensors(
+        &[
+            ("router.weight", router),
+            ("experts.up.weight", expert_up),
+            ("experts.down.weight", expert_down),
+        ],
+        path,
+    )
+    .with_context(|| format!("failed to write {}", path.display()))
+}
+
+fn read_tch_moe_checkpoint(path: &Path, device: Device) -> Result<(Tensor, Tensor, Tensor)> {
+    let tensors = Tensor::read_safetensors(path)
+        .with_context(|| format!("failed to read {}", path.display()))?
+        .into_iter()
+        .collect::<BTreeMap<_, _>>();
+    let router = tensor_from_map(&tensors, "router.weight")?
+        .to_device(device)
+        .set_requires_grad(true);
+    let expert_up = tensor_from_map(&tensors, "experts.up.weight")?
+        .to_device(device)
+        .set_requires_grad(true);
+    let expert_down = tensor_from_map(&tensors, "experts.down.weight")?
+        .to_device(device)
+        .set_requires_grad(true);
+    Ok((router, expert_up, expert_down))
+}
+
+fn tensor_from_map<'a>(tensors: &'a BTreeMap<String, Tensor>, name: &str) -> Result<&'a Tensor> {
+    tensors
+        .get(name)
+        .ok_or_else(|| anyhow!("missing tensor {name}"))
+}
+
 struct TchDpGradient {
     loss: f64,
     grad: Vec<f32>,
@@ -696,6 +879,21 @@ fn grad_norm(trainable_variables: &[Tensor]) -> f64 {
 
 fn tensor_l2_norm(tensor: &Tensor) -> f64 {
     tensor.square().sum(Kind::Float).sqrt().double_value(&[])
+}
+
+fn tensor_max_abs_diff(actual: &Tensor, expected: &Tensor) -> Result<f64> {
+    if actual.size() != expected.size() {
+        bail!(
+            "shape mismatch: actual {:?}, expected {:?}",
+            actual.size(),
+            expected.size()
+        );
+    }
+    Ok((actual - expected)
+        .abs()
+        .max()
+        .to_device(Device::Cpu)
+        .double_value(&[]))
 }
 
 fn fixed_tch_batch(vocab_size: i64, seq_len: i64) -> Tensor {
