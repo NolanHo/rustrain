@@ -132,9 +132,11 @@ layer0/norm/MLP gradients with NCCL, applies multi-step averaged AdamW updates,
 checks global loss improvement, writes rank0 delta and AdamW optimizer
 safetensors, and verifies next-step resume parity from that rank0 checkpoint.
 The same representative path is wired through
-`train --config configs/qwen_session_dp2.toml`; full production Qwen trainer
-ownership, real data batching, and production-grade sharded checkpoint/resume
-rules remain open.
+`train --config configs/qwen_session_dp2.toml`; bf16 coverage for the same
+representative DP path is available through
+`configs/qwen_session_dp2_bf16.toml`. Full production Qwen trainer ownership,
+real data batching, and production-grade sharded checkpoint/resume rules remain
+open.
 
 ## Current Major Gaps
 
@@ -153,15 +155,15 @@ rules remain open.
   It can also resume from its saved delta manifest through `--resume-from` and
   reports throughput, gradient norm, RSS, and GPU memory metrics.
   Full model/data/checkpoint trainer ownership remains open.
-- G6 trainer-level real SFT data now has a minimal Qwen LoRA SFT config path:
+- G6 trainer-level real SFT data now has minimal Qwen LoRA SFT config paths:
   `train --config configs/qwen_lora_sft.toml` loads tokenizer-backed
   instruction JSONL batches, trains configured attention and MLP LoRA targets,
   reloads the adapter, and supports `--resume-from` for saved adapters. The
   trainer path now verifies the saved adapter through full-Qwen forward logits,
   greedy generation reload parity, and focused merge/unmerge parity. It also
-  uses the trainer scheduler and grad clipping knobs, and logs `eval_every` step
-  eval history. Production data loading and arbitrary-module LoRA injection are
-  still open.
+  uses the trainer scheduler and grad clipping knobs, logs `eval_every` step
+  eval history, and has a bf16 variant at `configs/qwen_lora_sft_bf16.toml`.
+  Production data loading and arbitrary-module LoRA injection are still open.
 - Real Qwen module-level LoRA now uses a target-layer/module registry for
   configured attention and MLP projection modules; trainer-owned full-model LoRA
   injection is not done yet. The current Qwen LoRA SFT config exposes rank,
@@ -181,11 +183,12 @@ rules remain open.
   real data batches are not implemented yet.
 - Trainer production basics such as scheduler, grad clipping, RSS memory
   metrics, and Ray-worker GPU memory reporting are implemented for toy/tch
-  paths; real tokenizer-backed padded LoRA SFT batching is wired through a
-  minimal Qwen trainer config with scheduler and grad clipping, and the tiny
-  `tch` CUDA path plus representative Qwen `train --config` session paths have
-  explicit bf16 compute policy smokes. General trainer mixed-precision ownership
-  across all production paths is still future work.
+  paths; real tokenizer-backed padded LoRA SFT batching is wired through
+  minimal fp32/bf16 Qwen trainer configs with scheduler and grad clipping. The
+  tiny `tch` CUDA path, representative Qwen session single/DP paths, and Qwen
+  LoRA SFT resume verifier now have explicit bf16 compute-policy coverage.
+  Mixed precision over future full production Qwen model/data paths remains
+  future work.
 
 Internal planning details live in `_internal_docs/TODO.md`; that directory is
 ignored by git.

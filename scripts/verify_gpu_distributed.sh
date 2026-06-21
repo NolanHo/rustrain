@@ -23,3 +23,10 @@ remote_run_2gpu env \
   RUSTRAIN_LAUNCH_TIMEOUT_SECS=600 \
   RUSTRAIN_DISTRIBUTED_VERIFY_OUTPUT_DIR="${OUTPUT_DIR}" \
   bash scripts/verify_qwen_session_dp2_worker.sh
+
+remote_run_2gpu env \
+  RUSTRAIN_LAUNCH_TIMEOUT_SECS=600 \
+  RUSTRAIN_DISTRIBUTED_VERIFY_OUTPUT_DIR="${OUTPUT_DIR}-bf16" \
+  RUSTRAIN_QWEN_SESSION_DP_CONFIG=configs/qwen_session_dp2_bf16.toml \
+  RUSTRAIN_EXPECTED_QWEN_COMPUTE_KIND=bf16 \
+  bash scripts/verify_qwen_session_dp2_worker.sh

@@ -3,8 +3,10 @@ set -euo pipefail
 
 BASE_OUTPUT="$(mktemp)"
 RESUME_OUTPUT="$(mktemp)"
+CONFIG="${RUSTRAIN_QWEN_LORA_SFT_CONFIG:-configs/qwen_lora_sft.toml}"
+EXPECTED_COMPUTE_KIND="${RUSTRAIN_EXPECTED_QWEN_COMPUTE_KIND:-}"
 
-cargo run -- train --config configs/qwen_lora_sft.toml | tee "${BASE_OUTPUT}"
+cargo run -- train --config "${CONFIG}" | tee "${BASE_OUTPUT}"
 
 ADAPTER_OUTPUT="$(
   python - "${BASE_OUTPUT}" <<'PY'
@@ -20,10 +22,10 @@ else:
 PY
 )"
 
-cargo run -- train --config configs/qwen_lora_sft.toml --resume-from "${ADAPTER_OUTPUT}" \
+cargo run -- train --config "${CONFIG}" --resume-from "${ADAPTER_OUTPUT}" \
   | tee "${RESUME_OUTPUT}"
 
-python - "${RESUME_OUTPUT}" <<'PY'
+python - "${RESUME_OUTPUT}" "${EXPECTED_COMPUTE_KIND}" <<'PY'
 import ast
 import pathlib
 import sys
@@ -36,6 +38,7 @@ for line in pathlib.Path(sys.argv[1]).read_text().splitlines():
     values[key] = value
 
 required = [
+    "compute_kind",
     "resume_from",
     "resumed_adapter",
     "initial_loss",
@@ -57,6 +60,11 @@ required = [
 missing = [key for key in required if key not in values]
 if missing:
     raise SystemExit(f"resume run is missing fields: {missing}")
+expected_compute_kind = sys.argv[2]
+if expected_compute_kind and values["compute_kind"] != expected_compute_kind:
+    raise SystemExit(
+        f"compute_kind {values['compute_kind']} does not match expected {expected_compute_kind}"
+    )
 if values["resumed_adapter"] != "true":
     raise SystemExit("resume run did not report resumed_adapter: true")
 if not float(values["final_loss"]) < float(values["initial_loss"]):
@@ -67,17 +75,27 @@ for key in [
     "reload_delta",
     "eval_reload_delta",
     "full_forward_reload_delta",
-    "full_forward_merge_delta",
 ]:
     if float(values[key]) > 1e-6:
         raise SystemExit(f"{key} too large: {values[key]}")
-if float(values["full_forward_unmerge_delta"]) > 1e-3:
+merge_tolerance = 5.0 if values["compute_kind"] == "bf16" else 1e-6
+if float(values["full_forward_merge_delta"]) > merge_tolerance:
+    raise SystemExit(
+        f"full_forward_merge_delta too large: {values['full_forward_merge_delta']}"
+    )
+unmerge_tolerance = 5.0 if values["compute_kind"] == "bf16" else 1e-3
+if float(values["full_forward_unmerge_delta"]) > unmerge_tolerance:
     raise SystemExit(
         f"full_forward_unmerge_delta too large: {values['full_forward_unmerge_delta']}"
     )
-for key in ["full_generate_reload_match", "full_generate_merge_match"]:
-    if values[key] != "true":
-        raise SystemExit(f"{key} must be true, got {values[key]}")
+if values["full_generate_reload_match"] != "true":
+    raise SystemExit(
+        f"full_generate_reload_match must be true, got {values['full_generate_reload_match']}"
+    )
+if values["compute_kind"] != "bf16" and values["full_generate_merge_match"] != "true":
+    raise SystemExit(
+        f"full_generate_merge_match must be true, got {values['full_generate_merge_match']}"
+    )
 for key in [
     "first_step_grad_norm",
     "final_step_grad_norm",

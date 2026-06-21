@@ -145,6 +145,7 @@ struct QwenLoraTrainSmokeSummary {
 pub(crate) struct QwenLoraSftTrainSummary {
     pub(crate) model_path: String,
     pub(crate) adapter_output: String,
+    pub(crate) compute_kind: String,
     pub(crate) step_adapter_checkpoints: Vec<String>,
     pub(crate) resume_from: Option<String>,
     pub(crate) resumed_adapter: bool,
@@ -277,6 +278,7 @@ struct QwenDpGradientRankSummary {
 struct QwenSessionDpRankSummary {
     rank: usize,
     world_size: usize,
+    dtype: String,
     local_batch_size: usize,
     tensor_count: usize,
     steps: usize,
@@ -1332,6 +1334,7 @@ pub fn qwen_lora_sft_smoke(
         1,
         0,
         0,
+        QwenComputeDType::Fp32,
         QwenLoraSftTrainPolicy::constant_without_clip(),
     )?;
     println!("{}", serde_json::to_string_pretty(&summary)?);
@@ -1376,6 +1379,13 @@ pub fn train_qwen_lora_sft_from_config(
             .as_ref()
             .ok_or_else(|| anyhow!("qwen_lora_sft requires [lora] config"))?,
     )?;
+    let dtype = match config.train.dtype {
+        crate::runtime::DType::Fp32 => QwenComputeDType::Fp32,
+        crate::runtime::DType::Bf16 => QwenComputeDType::Bf16,
+        crate::runtime::DType::Fp16 => {
+            bail!("qwen LoRA SFT trainer does not support fp16 yet; use fp32 or bf16")
+        }
+    };
     let adapter_output = run_paths
         .checkpoints
         .join("qwen-lora-sft-adapter.safetensors");
@@ -1395,6 +1405,7 @@ pub fn train_qwen_lora_sft_from_config(
         config.train.gradient_accumulation_steps,
         config.train.checkpoint_every,
         config.train.eval_every,
+        dtype,
         QwenLoraSftTrainPolicy::from_config(config),
     )
 }
@@ -1416,6 +1427,7 @@ fn qwen_lora_sft_train(
     gradient_accumulation_steps: usize,
     checkpoint_every: u64,
     eval_every: u64,
+    dtype: QwenComputeDType,
     policy: QwenLoraSftTrainPolicy,
 ) -> Result<QwenLoraSftTrainSummary> {
     if learning_rate <= 0.0 {
@@ -1497,6 +1509,7 @@ fn qwen_lora_sft_train(
         &lora_config,
         &registry,
         &config,
+        dtype.kind(),
     )?
     .double_value(&[]);
     let initial_eval_loss = qwen_lora_sft_loss(
@@ -1506,6 +1519,7 @@ fn qwen_lora_sft_train(
         &lora_config,
         &registry,
         &config,
+        dtype.kind(),
     )?
     .double_value(&[]);
 
@@ -1538,6 +1552,7 @@ fn qwen_lora_sft_train(
                 &lora_config,
                 &registry,
                 &config,
+                dtype.kind(),
             )? / gradient_accumulation_steps as f64;
             loss.backward();
         }
@@ -1610,6 +1625,7 @@ fn qwen_lora_sft_train(
                 &lora_config,
                 &registry,
                 &config,
+                dtype.kind(),
             )?
             .double_value(&[]);
             info!(step = step_number, eval_loss, "Qwen LoRA SFT eval step");
@@ -1632,6 +1648,7 @@ fn qwen_lora_sft_train(
         &lora_config,
         &registry,
         &config,
+        dtype.kind(),
     )?
     .double_value(&[]);
     let final_eval_loss = qwen_lora_sft_loss(
@@ -1641,6 +1658,7 @@ fn qwen_lora_sft_train(
         &lora_config,
         &registry,
         &config,
+        dtype.kind(),
     )?
     .double_value(&[]);
     if final_loss >= initial_loss {
@@ -1658,6 +1676,7 @@ fn qwen_lora_sft_train(
         &lora_config,
         &reloaded,
         &config,
+        dtype.kind(),
     )?
     .double_value(&[]);
     let reload_delta = (final_loss - reloaded_loss).abs();
@@ -1673,6 +1692,7 @@ fn qwen_lora_sft_train(
         &lora_config,
         &reloaded,
         &config,
+        dtype.kind(),
     )?
     .double_value(&[]);
     let eval_reload_delta = (final_eval_loss - reloaded_eval_loss).abs();
@@ -1681,11 +1701,22 @@ fn qwen_lora_sft_train(
             "Qwen LoRA SFT adapter reload eval parity failed: final_eval_loss={final_eval_loss}, reloaded_eval_loss={reloaded_eval_loss}, eval_reload_delta={eval_reload_delta}"
         );
     }
-    let base_logits = qwen_forward_from_ids(&initial_batch.input_ids, &weights, &config)?;
-    let adapted_logits =
-        qwen_forward_from_ids_with_lora(&initial_batch.input_ids, &weights, &config, &registry)?;
-    let reloaded_logits =
-        qwen_forward_from_ids_with_lora(&initial_batch.input_ids, &weights, &config, &reloaded)?;
+    let base_logits =
+        qwen_forward_from_ids_with_kind(&initial_batch.input_ids, &weights, &config, dtype.kind())?;
+    let adapted_logits = qwen_forward_from_ids_with_lora(
+        &initial_batch.input_ids,
+        &weights,
+        &config,
+        &registry,
+        dtype.kind(),
+    )?;
+    let reloaded_logits = qwen_forward_from_ids_with_lora(
+        &initial_batch.input_ids,
+        &weights,
+        &config,
+        &reloaded,
+        dtype.kind(),
+    )?;
     let full_forward_adapter_delta = diff_stats(&adapted_logits, &base_logits)?.max_abs;
     if full_forward_adapter_delta <= 0.0 {
         bail!("Qwen LoRA SFT adapter did not change full forward logits");
@@ -1697,26 +1728,49 @@ fn qwen_lora_sft_train(
         );
     }
     let merged_weights = reloaded.merge_into_weights(&weights)?;
-    let merged_logits = qwen_forward_from_ids(&initial_batch.input_ids, &merged_weights, &config)?;
+    let merged_logits = qwen_forward_from_ids_with_kind(
+        &initial_batch.input_ids,
+        &merged_weights,
+        &config,
+        dtype.kind(),
+    )?;
     let full_forward_merge_delta = diff_stats(&merged_logits, &adapted_logits)?.max_abs;
-    if full_forward_merge_delta > 1e-7 {
-        bail!("Qwen LoRA SFT merge parity failed: max_delta={full_forward_merge_delta}");
+    let full_forward_merge_tolerance = match dtype {
+        QwenComputeDType::Fp32 => 1e-7,
+        QwenComputeDType::Bf16 => 5.0,
+    };
+    if full_forward_merge_delta > full_forward_merge_tolerance {
+        bail!(
+            "Qwen LoRA SFT merge parity failed: max_delta={full_forward_merge_delta}, tolerance={full_forward_merge_tolerance}"
+        );
     }
     let unmerged_weights = reloaded.unmerge_from_weights(&merged_weights)?;
-    let unmerged_logits =
-        qwen_forward_from_ids(&initial_batch.input_ids, &unmerged_weights, &config)?;
+    let unmerged_logits = qwen_forward_from_ids_with_kind(
+        &initial_batch.input_ids,
+        &unmerged_weights,
+        &config,
+        dtype.kind(),
+    )?;
     let full_forward_unmerge_delta = diff_stats(&unmerged_logits, &base_logits)?.max_abs;
-    if full_forward_unmerge_delta > 5e-4 {
-        bail!("Qwen LoRA SFT unmerge parity failed: max_delta={full_forward_unmerge_delta}");
+    let full_forward_unmerge_tolerance = match dtype {
+        QwenComputeDType::Fp32 => 5e-4,
+        QwenComputeDType::Bf16 => 5.0,
+    };
+    if full_forward_unmerge_delta > full_forward_unmerge_tolerance {
+        bail!(
+            "Qwen LoRA SFT unmerge parity failed: max_delta={full_forward_unmerge_delta}, tolerance={full_forward_unmerge_tolerance}"
+        );
     }
     let prompt_ids = initial_batch
         .input_ids
         .i(0)
         .reshape([1, initial_batch.input_ids.size()[1]]);
-    let generated = qwen_greedy_generate_with_lora(&prompt_ids, &weights, &config, &registry, 2)?;
+    let generated =
+        qwen_greedy_generate_with_lora(&prompt_ids, &weights, &config, &registry, 2, dtype.kind())?;
     let reloaded_generated =
-        qwen_greedy_generate_with_lora(&prompt_ids, &weights, &config, &reloaded, 2)?;
-    let merged_generated = qwen_greedy_generate(&prompt_ids, &merged_weights, &config, 2)?;
+        qwen_greedy_generate_with_lora(&prompt_ids, &weights, &config, &reloaded, 2, dtype.kind())?;
+    let merged_generated =
+        qwen_greedy_generate_with_kind(&prompt_ids, &merged_weights, &config, 2, dtype.kind())?;
     let generated_ids: Vec<i64> =
         Vec::<i64>::try_from(generated.reshape([-1]).to_device(Device::Cpu))?;
     let reloaded_generated_ids: Vec<i64> =
@@ -1730,7 +1784,7 @@ fn qwen_lora_sft_train(
         );
     }
     let full_generate_merge_match = generated_ids == merged_generated_ids;
-    if !full_generate_merge_match {
+    if !full_generate_merge_match && dtype == QwenComputeDType::Fp32 {
         bail!(
             "Qwen LoRA SFT full generate merge parity failed: generated={generated_ids:?}, merged={merged_generated_ids:?}"
         );
@@ -1741,6 +1795,7 @@ fn qwen_lora_sft_train(
     let summary = QwenLoraSftTrainSummary {
         model_path: model_path.display().to_string(),
         adapter_output: adapter_output.display().to_string(),
+        compute_kind: dtype.label().to_string(),
         step_adapter_checkpoints,
         resume_from: resume_from.map(|path| path.display().to_string()),
         resumed_adapter: resume_from.is_some(),
@@ -2537,8 +2592,14 @@ pub fn qwen_session_dp_rank_smoke(
         signature_values_max_delta(&averaged_signatures, &expected_signature_values)?;
     let global_loss = expected_loss;
     let loss_delta = 0.0;
-    if max_grad_delta > 5e-4 {
-        bail!("Qwen session DP gradient mismatch: rank={rank}, max_grad_delta={max_grad_delta}");
+    let max_grad_delta_tolerance = match dtype {
+        QwenComputeDType::Fp32 => 5e-4,
+        QwenComputeDType::Bf16 => 1.0,
+    };
+    if max_grad_delta > max_grad_delta_tolerance {
+        bail!(
+            "Qwen session DP gradient mismatch: rank={rank}, max_grad_delta={max_grad_delta}, tolerance={max_grad_delta_tolerance}"
+        );
     }
 
     let mut global_step_losses = vec![global_loss];
@@ -2759,6 +2820,7 @@ pub fn qwen_session_dp_rank_smoke(
     let summary = QwenSessionDpRankSummary {
         rank,
         world_size,
+        dtype: dtype.label().to_string(),
         local_batch_size: local_session.input_ids.size()[0] as usize,
         tensor_count: local_grads.len(),
         steps,
@@ -4562,7 +4624,7 @@ pub fn qwen_layer(
         &weights.up_proj,
         &weights.down_proj,
     );
-    after_attention + mlp_output
+    (after_attention + mlp_output).to_kind(compute_kind)
 }
 
 pub fn qwen_forward_from_ids(
@@ -4595,19 +4657,20 @@ fn qwen_forward_from_ids_with_lora(
     weights: &BTreeMap<String, Tensor>,
     config: &QwenRuntimeConfig,
     registry: &QwenLoraRegistry,
+    compute_kind: Kind,
 ) -> Result<Tensor> {
-    let embed_tokens = tensor(weights, "model.embed_tokens.weight")?.to_kind(Kind::Float);
-    let final_norm = tensor(weights, "model.norm.weight")?.to_kind(Kind::Float);
+    let embed_tokens = tensor(weights, "model.embed_tokens.weight")?.to_kind(compute_kind);
+    let final_norm = tensor(weights, "model.norm.weight")?.to_kind(compute_kind);
     let mut hidden = Tensor::embedding(&embed_tokens, input_ids, -1, false, false);
     for layer_index in 0..config.num_hidden_layers {
-        let layer = QwenLayerWeights::load(weights, layer_index)?;
+        let layer = QwenLayerWeights::load_with_kind(weights, layer_index, compute_kind)?;
         hidden = if let Some(adapter) = registry.adapter_for_layer(layer_index) {
             qwen_layer_with_lora(&hidden, &layer, adapter, config)
         } else {
             qwen_layer(&hidden, &layer, config)
         };
     }
-    let hidden = rms_norm(&hidden, &final_norm, config.rms_norm_eps);
+    let hidden = rms_norm(&hidden, &final_norm, config.rms_norm_eps).to_kind(compute_kind);
     Ok(hidden.linear::<&Tensor>(&embed_tokens, None))
 }
 
@@ -4716,16 +4779,34 @@ pub fn qwen_greedy_generate(
     Ok(generated)
 }
 
+fn qwen_greedy_generate_with_kind(
+    input_ids: &Tensor,
+    weights: &BTreeMap<String, Tensor>,
+    config: &QwenRuntimeConfig,
+    max_new_tokens: usize,
+    compute_kind: Kind,
+) -> Result<Tensor> {
+    let mut generated = input_ids.shallow_clone();
+    for _ in 0..max_new_tokens {
+        let logits = qwen_forward_from_ids_with_kind(&generated, weights, config, compute_kind)?;
+        let next_token = logits.i((0, -1)).argmax(-1, false).reshape([1, 1]);
+        generated = Tensor::cat(&[&generated, &next_token], 1);
+    }
+    Ok(generated)
+}
+
 fn qwen_greedy_generate_with_lora(
     input_ids: &Tensor,
     weights: &BTreeMap<String, Tensor>,
     config: &QwenRuntimeConfig,
     registry: &QwenLoraRegistry,
     max_new_tokens: usize,
+    compute_kind: Kind,
 ) -> Result<Tensor> {
     let mut generated = input_ids.shallow_clone();
     for _ in 0..max_new_tokens {
-        let logits = qwen_forward_from_ids_with_lora(&generated, weights, config, registry)?;
+        let logits =
+            qwen_forward_from_ids_with_lora(&generated, weights, config, registry, compute_kind)?;
         let next_token = logits.i((0, -1)).argmax(-1, false).reshape([1, 1]);
         generated = Tensor::cat(&[&generated, &next_token], 1);
     }
@@ -4987,12 +5068,15 @@ fn lora_weight_or_base(
     base: &Tensor,
     device: Device,
 ) -> Tensor {
+    let base = base.to_device(device);
     if adapter.modules.contains_key(&module) {
-        base + adapter
+        let delta = adapter
             .delta(module, device)
             .expect("LoRA module should have a delta")
+            .to_kind(base.kind());
+        base + delta
     } else {
-        base.shallow_clone()
+        base
     }
 }
 
@@ -5036,7 +5120,7 @@ fn qwen_layer_with_lora(
             device,
         ),
     );
-    after_attention + mlp_output
+    (after_attention + mlp_output).to_kind(compute_kind)
 }
 
 fn qwen_attention_lora_mse_loss(
@@ -5318,6 +5402,7 @@ fn qwen_lora_sft_loss(
     lora_config: &QwenLoraConfig,
     registry: &QwenLoraRegistry,
     config: &QwenRuntimeConfig,
+    compute_kind: Kind,
 ) -> Result<Tensor> {
     if lora_config.target_layers.is_empty() {
         bail!("LoRA config must include at least one target layer");
@@ -5332,6 +5417,7 @@ fn qwen_lora_sft_loss(
             *layer_index,
             registry.layer_adapter(*layer_index)?,
             config,
+            compute_kind,
         )?);
     }
     Ok(Tensor::stack(&layer_losses.iter().collect::<Vec<_>>(), 0).mean(Kind::Float))
@@ -5344,9 +5430,10 @@ fn qwen_layer_lora_sft_loss(
     layer_index: usize,
     adapter: &QwenAttentionLoraAdapter,
     config: &QwenRuntimeConfig,
+    compute_kind: Kind,
 ) -> Result<Tensor> {
-    let embed_tokens = tensor(weights, "model.embed_tokens.weight")?.to_kind(Kind::Float);
-    let layer = QwenLayerWeights::load(weights, layer_index)?;
+    let embed_tokens = tensor(weights, "model.embed_tokens.weight")?.to_kind(compute_kind);
+    let layer = QwenLayerWeights::load_with_kind(weights, layer_index, compute_kind)?;
     let hidden = Tensor::embedding(&embed_tokens, input_ids, -1, false, false);
     let base_output = qwen_layer(&hidden, &layer, config);
     let target = lora_train_target(&base_output);
@@ -6381,7 +6468,7 @@ mod tests {
         let base_logits =
             qwen_forward_from_ids(&input_ids, &weights, &config).expect("base forward should run");
         let adapted_logits =
-            qwen_forward_from_ids_with_lora(&input_ids, &weights, &config, &registry)
+            qwen_forward_from_ids_with_lora(&input_ids, &weights, &config, &registry, Kind::Float)
                 .expect("LoRA forward should run");
         assert!(
             diff_stats(&adapted_logits, &base_logits)
@@ -6395,7 +6482,7 @@ mod tests {
             .expect("registry should save");
         let reloaded = QwenLoraRegistry::load(&adapter_output).expect("registry should reload");
         let reloaded_logits =
-            qwen_forward_from_ids_with_lora(&input_ids, &weights, &config, &reloaded)
+            qwen_forward_from_ids_with_lora(&input_ids, &weights, &config, &reloaded, Kind::Float)
                 .expect("reloaded LoRA forward should run");
         assert!(
             diff_stats(&reloaded_logits, &adapted_logits)
@@ -6426,11 +6513,24 @@ mod tests {
                 < 1e-8
         );
 
-        let generated = qwen_greedy_generate_with_lora(&input_ids, &weights, &config, &registry, 2)
-            .expect("LoRA generate should run");
-        let reloaded_generated =
-            qwen_greedy_generate_with_lora(&input_ids, &weights, &config, &reloaded, 2)
-                .expect("reloaded LoRA generate should run");
+        let generated = qwen_greedy_generate_with_lora(
+            &input_ids,
+            &weights,
+            &config,
+            &registry,
+            2,
+            Kind::Float,
+        )
+        .expect("LoRA generate should run");
+        let reloaded_generated = qwen_greedy_generate_with_lora(
+            &input_ids,
+            &weights,
+            &config,
+            &reloaded,
+            2,
+            Kind::Float,
+        )
+        .expect("reloaded LoRA generate should run");
         let merged_generated = qwen_greedy_generate(&input_ids, &merged_weights, &config, 2)
             .expect("merged LoRA generate should run");
         let generated_ids: Vec<i64> = Vec::<i64>::try_from(generated.reshape([-1])).unwrap();
@@ -6488,7 +6588,7 @@ mod tests {
         let base_logits =
             qwen_forward_from_ids(&input_ids, &weights, &config).expect("base forward should run");
         let adapted_logits =
-            qwen_forward_from_ids_with_lora(&input_ids, &weights, &config, &registry)
+            qwen_forward_from_ids_with_lora(&input_ids, &weights, &config, &registry, Kind::Float)
                 .expect("LoRA forward should run");
         assert!(
             diff_stats(&adapted_logits, &base_logits)

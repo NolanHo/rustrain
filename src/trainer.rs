@@ -68,6 +68,7 @@ pub fn train(config_path: &Path, resume_from: Option<PathBuf>) -> Result<()> {
 
         let summary = train_tch_tiny_lm(&config)?;
         info!(
+            compute_kind = summary.compute_kind,
             initial_loss = summary.initial_loss,
             final_loss = summary.final_loss,
             embedding_grad_defined = summary.embedding_grad_defined,
@@ -245,6 +246,7 @@ pub fn train(config_path: &Path, resume_from: Option<PathBuf>) -> Result<()> {
         println!("run_dir: {}", run_paths.root.display());
         println!("resolved_config: {}", run_paths.resolved_config.display());
         println!("adapter_checkpoint: {}", summary.adapter_output);
+        println!("compute_kind: {}", summary.compute_kind);
         println!(
             "step_adapter_checkpoints: {:?}",
             summary.step_adapter_checkpoints
