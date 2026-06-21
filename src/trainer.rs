@@ -149,6 +149,10 @@ pub fn train(config_path: &Path, resume_from: Option<PathBuf>) -> Result<()> {
             reloaded_loss = summary.reloaded_loss,
             reload_delta = summary.reload_delta,
             steps = summary.steps,
+            final_learning_rate = summary.final_learning_rate,
+            first_step_grad_norm = summary.first_step_grad_norm,
+            final_step_grad_norm = summary.final_step_grad_norm,
+            final_step_clipped_grad_norm = summary.final_step_clipped_grad_norm,
             batch_size = summary.batch_size,
             sequence_tokens = summary.sequence_tokens,
             response_masked_positions = summary.response_masked_positions,
@@ -166,6 +170,13 @@ pub fn train(config_path: &Path, resume_from: Option<PathBuf>) -> Result<()> {
         println!("reloaded_loss: {:.9}", summary.reloaded_loss);
         println!("reload_delta: {:.9}", summary.reload_delta);
         println!("steps: {}", summary.steps);
+        println!("final_learning_rate: {:.9}", summary.final_learning_rate);
+        println!("first_step_grad_norm: {:.9}", summary.first_step_grad_norm);
+        println!("final_step_grad_norm: {:.9}", summary.final_step_grad_norm);
+        println!(
+            "final_step_clipped_grad_norm: {:.9}",
+            summary.final_step_clipped_grad_norm
+        );
         println!("batch_size: {}", summary.batch_size);
         println!("sequence_tokens: {}", summary.sequence_tokens);
         println!(

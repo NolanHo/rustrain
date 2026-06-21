@@ -12,7 +12,7 @@ use tch::{Device, IndexOp, Kind, Reduction, Tensor, no_grad};
 use tokenizers::Tokenizer;
 
 use crate::nccl_smoke;
-use crate::runtime::{Config, DataKind, Device as RuntimeDevice, RunPaths};
+use crate::runtime::{Config, DataKind, Device as RuntimeDevice, LrScheduler, RunPaths};
 
 #[derive(Debug, Serialize)]
 pub struct DiffStats {
@@ -152,12 +152,16 @@ pub(crate) struct QwenLoraSftTrainSummary {
     pub(crate) rank: i64,
     pub(crate) alpha: f64,
     pub(crate) learning_rate: f64,
+    pub(crate) final_learning_rate: f64,
     pub(crate) steps: usize,
     pub(crate) initial_loss: f64,
     pub(crate) final_loss: f64,
     pub(crate) reloaded_loss: f64,
     pub(crate) reload_delta: f64,
     pub(crate) base_requires_grad: bool,
+    pub(crate) first_step_grad_norm: f64,
+    pub(crate) final_step_grad_norm: f64,
+    pub(crate) final_step_clipped_grad_norm: f64,
     pub(crate) trainable_tensors: Vec<TrainableTensorSummary>,
 }
 
@@ -469,6 +473,28 @@ struct QwenSftBatch {
     response_tokens: Vec<usize>,
     masked_positions: usize,
     padding_tokens: usize,
+}
+
+#[derive(Clone)]
+struct QwenLoraSftTrainPolicy {
+    lr_scheduler: LrScheduler,
+    max_grad_norm: Option<f64>,
+}
+
+impl QwenLoraSftTrainPolicy {
+    fn from_config(config: &Config) -> Self {
+        Self {
+            lr_scheduler: config.train.lr_scheduler.clone(),
+            max_grad_norm: config.train.max_grad_norm.map(f64::from),
+        }
+    }
+
+    fn constant_without_clip() -> Self {
+        Self {
+            lr_scheduler: LrScheduler::Constant,
+            max_grad_norm: None,
+        }
+    }
 }
 
 impl QwenComputeDType {
@@ -1012,6 +1038,7 @@ pub fn qwen_lora_sft_smoke(
         alpha,
         learning_rate,
         1,
+        QwenLoraSftTrainPolicy::constant_without_clip(),
     )?;
     println!("{}", serde_json::to_string_pretty(&summary)?);
 
@@ -1063,6 +1090,7 @@ pub fn train_qwen_lora_sft_from_config(
         8.0,
         config.train.learning_rate as f64,
         config.train.max_steps as usize,
+        QwenLoraSftTrainPolicy::from_config(config),
     )
 }
 
@@ -1078,6 +1106,7 @@ fn qwen_lora_sft_train(
     alpha: f64,
     learning_rate: f64,
     steps: usize,
+    policy: QwenLoraSftTrainPolicy,
 ) -> Result<QwenLoraSftTrainSummary> {
     if rank <= 0 {
         bail!("rank must be positive");
@@ -1142,6 +1171,10 @@ fn qwen_lora_sft_train(
         .map(|(name, tensor)| (name, tensor_snapshot(&tensor)))
         .collect();
     let mut tensor_summaries = Vec::new();
+    let mut first_step_grad_norm = 0.0;
+    let mut final_step_grad_norm = 0.0;
+    let mut final_step_clipped_grad_norm = 0.0;
+    let mut final_learning_rate = learning_rate;
 
     for step in 0..steps {
         for (_, mut tensor) in registry.trainable_tensors() {
@@ -1157,19 +1190,46 @@ fn qwen_lora_sft_train(
         loss.backward();
 
         tensor_summaries.clear();
-        for (name, mut tensor) in registry.trainable_tensors() {
-            let grad = tensor.grad();
-            let grad_defined = grad.defined();
-            let grad_norm = if grad_defined {
-                grad.norm().double_value(&[])
-            } else {
-                0.0
-            };
-            if !grad_defined || grad_norm <= 0.0 {
-                bail!("LoRA tensor {name} did not receive a gradient");
-            }
-            let step_lr = learning_rate / (step + 1) as f64;
-            let _ = no_grad(|| tensor.f_sub_(&(&grad * step_lr)))?;
+        let trainable_tensors = registry.trainable_tensors();
+        let grad_entries = trainable_tensors
+            .iter()
+            .map(|(name, tensor)| {
+                let grad = tensor.grad();
+                let grad_defined = grad.defined();
+                let grad_norm = if grad_defined {
+                    grad.norm().double_value(&[])
+                } else {
+                    0.0
+                };
+                if !grad_defined || grad_norm <= 0.0 {
+                    bail!("LoRA tensor {name} did not receive a gradient");
+                }
+                Ok((name.clone(), tensor.shallow_clone(), grad, grad_norm))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let grad_norm = grad_entries
+            .iter()
+            .map(|(_, _, _, norm)| norm.powi(2))
+            .sum::<f64>()
+            .sqrt();
+        let (clipped_grad_norm, clip_scale) = qwen_lora_clip_scale(grad_norm, policy.max_grad_norm);
+        let step_number = step + 1;
+        let step_lr = qwen_lora_sft_learning_rate(
+            learning_rate,
+            policy.lr_scheduler.clone(),
+            step_number,
+            steps,
+        );
+        if step == 0 {
+            first_step_grad_norm = grad_norm;
+        }
+        final_step_grad_norm = grad_norm;
+        final_step_clipped_grad_norm = clipped_grad_norm;
+        final_learning_rate = step_lr;
+
+        for (name, mut tensor, grad, grad_norm) in grad_entries {
+            let clipped_grad = grad * clip_scale;
+            let _ = no_grad(|| tensor.f_sub_(&(clipped_grad * step_lr)))?;
             let delta_norm = (&tensor
                 - base_tensors
                     .get(&name)
@@ -1178,7 +1238,7 @@ fn qwen_lora_sft_train(
             .double_value(&[]);
             tensor_summaries.push(TrainableTensorSummary {
                 name,
-                grad_defined,
+                grad_defined: true,
                 grad_norm,
                 delta_norm,
             });
@@ -1230,12 +1290,16 @@ fn qwen_lora_sft_train(
         rank,
         alpha,
         learning_rate,
+        final_learning_rate,
         steps,
         initial_loss,
         final_loss,
         reloaded_loss,
         reload_delta,
         base_requires_grad,
+        first_step_grad_norm,
+        final_step_grad_norm,
+        final_step_clipped_grad_norm,
         trainable_tensors: tensor_summaries,
     };
     Ok(summary)
@@ -3928,6 +3992,32 @@ fn qwen_attention_lora_sft_loss(
     let mask = target_mask.to_device(adapted.device());
     let squared = (shifted_adapted - shifted_target).pow_tensor_scalar(2.0) * &mask;
     Ok(squared.sum(Kind::Float) / mask.sum(Kind::Float))
+}
+
+fn qwen_lora_sft_learning_rate(
+    base_learning_rate: f64,
+    scheduler: LrScheduler,
+    step: usize,
+    max_steps: usize,
+) -> f64 {
+    match scheduler {
+        LrScheduler::Constant => base_learning_rate,
+        LrScheduler::LinearDecay => {
+            let max_steps = max_steps.max(1) as f64;
+            let progress = ((step.saturating_sub(1)) as f64 / max_steps).clamp(0.0, 1.0);
+            base_learning_rate * (1.0 - progress)
+        }
+    }
+}
+
+fn qwen_lora_clip_scale(grad_norm: f64, max_grad_norm: Option<f64>) -> (f64, f64) {
+    if let Some(max_grad_norm) = max_grad_norm {
+        if grad_norm > max_grad_norm {
+            let scale = max_grad_norm / (grad_norm + 1e-12);
+            return (max_grad_norm, scale);
+        }
+    }
+    (grad_norm, 1.0)
 }
 
 fn lora_train_target(base_output: &Tensor) -> Tensor {

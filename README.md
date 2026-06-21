@@ -133,7 +133,8 @@ remain open.
 - G6 trainer-level real SFT data now has a minimal Qwen LoRA SFT config path:
   `train --config configs/qwen_lora_sft.toml` loads tokenizer-backed
   instruction JSONL batches, trains layer0 q/v LoRA, and reloads the adapter.
-  Production data loading and arbitrary-module LoRA injection are still open.
+  It also uses the trainer scheduler and grad clipping knobs. Production data
+  loading and arbitrary-module LoRA injection are still open.
 - Real Qwen module-level LoRA now uses a target-layer/module registry for
   layer0 attention `q_proj`/`v_proj`; trainer-owned full-model LoRA injection
   is not done yet.
@@ -149,9 +150,10 @@ remain open.
 - Trainer production basics such as scheduler, grad clipping, RSS memory
   metrics, and Ray-worker GPU memory reporting are implemented for toy/tch
   paths; real tokenizer-backed padded LoRA SFT batching is wired through a
-  minimal Qwen trainer config, and the tiny `tch` CUDA path plus the
-  representative Qwen full-train smoke have explicit bf16 compute policy
-  smokes. General trainer mixed-precision ownership is still future work.
+  minimal Qwen trainer config with scheduler and grad clipping, and the tiny
+  `tch` CUDA path plus the representative Qwen full-train smoke have explicit
+  bf16 compute policy smokes. General trainer mixed-precision ownership is
+  still future work.
 
 Internal planning details live in `_internal_docs/TODO.md`; that directory is
 ignored by git.
