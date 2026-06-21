@@ -12,9 +12,9 @@ as milestone-sized, verifiable smokes.
 
 All smoke, test, parity, training, and `cargo check` verification runs on Ray
 GPU workers submitted through the GPU host. The local machine is only for
-editing, git operations, and launching remote jobs. Local CPU smoke is
-forbidden: do not use it for development feedback, debugging evidence, or final
-acceptance.
+editing, git operations, and launching remote jobs. Local CPU smoke is not a
+fallback at any stage: do not use it for development feedback, debugging
+evidence, or final acceptance.
 
 Run one command on a Ray GPU worker:
 
@@ -47,9 +47,9 @@ before running project commands. `scripts/verify_gpu.sh` stages the current
 working tree by default, and `scripts/verify_gpu_distributed.sh` does the same
 while reserving two Ray GPUs; set `RUSTRAIN_SYNC_TO_WORKER=0` only when you
 explicitly want to validate the remote checkout as-is. Do not run `cargo check`,
-`cargo test`, train smokes, parity commands, or quick local CPU checks on the
-local machine. Do not run them directly in the plain SSH shell either; that shell
-does not expose the GPU devices. If a check is worth running, run it on a Ray GPU
+`cargo test`, train smokes, parity commands, or local CPU checks on the local
+machine. Do not run them directly in the plain SSH shell either; that shell does
+not expose the GPU devices. If a check is worth running, run it on a Ray GPU
 worker.
 
 The preferred remote checkout is:
