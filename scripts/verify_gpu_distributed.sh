@@ -50,6 +50,13 @@ remote_run_2gpu env \
 
 remote_run_2gpu env \
   RUSTRAIN_LAUNCH_TIMEOUT_SECS=900 \
+  RUSTRAIN_DISTRIBUTED_VERIFY_OUTPUT_DIR="${OUTPUT_DIR}-layers01-bf16" \
+  RUSTRAIN_QWEN_SESSION_DP_LAYERS_CONFIG=configs/qwen_session_dp2_layers01_bf16.toml \
+  RUSTRAIN_EXPECTED_QWEN_COMPUTE_KIND=bf16 \
+  bash scripts/verify_qwen_session_dp2_layers01_worker.sh
+
+remote_run_2gpu env \
+  RUSTRAIN_LAUNCH_TIMEOUT_SECS=900 \
   RUSTRAIN_DISTRIBUTED_VERIFY_OUTPUT_DIR="${OUTPUT_DIR}-layers01-sft" \
   RUSTRAIN_QWEN_SESSION_DP_LAYERS_CONFIG=configs/qwen_session_dp2_layers01_sft.toml \
   RUSTRAIN_EXPECTED_DATASET_ORDER_SEED=777 \

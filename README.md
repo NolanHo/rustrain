@@ -112,6 +112,7 @@ RUSTRAIN_RAY_NUM_GPUS=2 scripts/gpu_run.sh env RUSTRAIN_LAUNCH_TIMEOUT_SECS=300 
 RUSTRAIN_RAY_NUM_GPUS=2 scripts/gpu_run.sh env RUSTRAIN_LAUNCH_TIMEOUT_SECS=600 cargo run -- launch --nproc-per-node 2 --output-dir /tmp/rustrain-runs/qwen-session-dp-adamw-smoke qwen-session-dp-rank-smoke --dtype fp32 --steps 2 --learning-rate 0.000001 --output-dir /tmp/rustrain-runs/qwen-session-dp-adamw-smoke/ranks
 RUSTRAIN_RAY_NUM_GPUS=2 scripts/gpu_run.sh env RUSTRAIN_LAUNCH_TIMEOUT_SECS=600 cargo run -- launch --nproc-per-node 2 --output-dir /tmp/rustrain-runs/qwen-session-trainer-dp2 train --config configs/qwen_session_dp2.toml
 RUSTRAIN_RAY_NUM_GPUS=2 scripts/gpu_run.sh env RUSTRAIN_LAUNCH_TIMEOUT_SECS=900 bash scripts/verify_qwen_session_dp2_layers01_worker.sh
+RUSTRAIN_RAY_NUM_GPUS=2 scripts/gpu_run.sh env RUSTRAIN_LAUNCH_TIMEOUT_SECS=900 RUSTRAIN_QWEN_SESSION_DP_LAYERS_CONFIG=configs/qwen_session_dp2_layers01_bf16.toml RUSTRAIN_EXPECTED_QWEN_COMPUTE_KIND=bf16 bash scripts/verify_qwen_session_dp2_layers01_worker.sh
 RUSTRAIN_RAY_NUM_GPUS=2 scripts/gpu_run.sh env RUSTRAIN_LAUNCH_TIMEOUT_SECS=900 RUSTRAIN_QWEN_SESSION_DP_LAYERS_CONFIG=configs/qwen_session_dp2_layers01_sft.toml RUSTRAIN_EXPECTED_DATASET_ORDER_SEED=777 bash scripts/verify_qwen_session_dp2_layers01_worker.sh
 RUSTRAIN_RAY_NUM_GPUS=2 scripts/gpu_run.sh env RUSTRAIN_LAUNCH_TIMEOUT_SECS=900 RUSTRAIN_DISTRIBUTED_BASE_OUTPUT_DIR=/tmp/rustrain-runs/qwen-session-dp2-layers01-sft-resume-base RUSTRAIN_DISTRIBUTED_RESUME_OUTPUT_DIR=/tmp/rustrain-runs/qwen-session-dp2-layers01-sft-resume-continue RUSTRAIN_QWEN_SESSION_DP_CONFIG=configs/qwen_session_dp2_layers01_sft.toml RUSTRAIN_EXPECTED_DATASET_ORDER_SEED=777 RUSTRAIN_EXPECTED_QWEN_DP_TRAINABLE_TENSORS=25 RUSTRAIN_EXPECTED_QWEN_DP_TRAINABLE_NAMES=model.layers.0.self_attn.q_proj.weight,model.layers.0.mlp.down_proj.weight,model.layers.1.self_attn.q_proj.weight,model.layers.1.mlp.down_proj.weight,model.norm.weight bash scripts/verify_qwen_session_dp2_resume_worker.sh
 RUSTRAIN_RAY_NUM_GPUS=2 scripts/gpu_run.sh cargo run -- launch --nproc-per-node 2 --output-dir /tmp/rustrain-runs/qwen-session-trainer-tp2 train --config configs/qwen_session_tp2.toml
@@ -196,6 +197,8 @@ has bf16 coverage through `configs/qwen_session_single_layers03_bf16.toml`.
 trainer path to layer0+layer1. Its verifier expects 25 trainable tensors
 because the representative DP path intentionally excludes the tied embedding
 and trains the configured transformer layers plus final norm.
+`configs/qwen_session_dp2_layers01_bf16.toml` verifies the same 25-tensor
+layer0+layer1 DP path under bf16 compute.
 `configs/qwen_session_dp2_layers01_sft.toml` runs the same layer0+layer1
 DP trainer over tokenizer-backed JSONL instruction batches and verifies dataset
 provenance, sample cursor progress, rank0 checkpoint parity, and sharded
@@ -282,7 +285,9 @@ production-grade sharded checkpoint ownership remain open.
   `configs/qwen_session_dp2_sft.toml` extends that representative JSONL batch
   path through the 2-rank DP trainer. `configs/qwen_session_dp2_layers01.toml`
   verifies the same representative DP trainer over layer0+layer1 with sharded
-  checkpoint reload and next-step resume parity, and
+  checkpoint reload and next-step resume parity,
+  `configs/qwen_session_dp2_layers01_bf16.toml` verifies the same multi-layer
+  DP trainable set under bf16 compute, and
   `configs/qwen_session_dp2_layers01_sft.toml` extends that multi-layer DP
   evidence to tokenizer-backed JSONL batches with manifest-backed data cursor
   and provenance checks. The layers01 JSONL path now also has an external
@@ -335,8 +340,8 @@ production-grade sharded checkpoint ownership remain open.
   paths; real tokenizer-backed padded LoRA SFT batching is wired through
   minimal fp32/bf16 Qwen trainer configs with scheduler and grad clipping. The
   tiny `tch` CUDA path, representative Qwen session single/DP paths, the
-  layer0-layer3 Qwen session path, and Qwen LoRA SFT resume verifier now have
-  explicit bf16 compute-policy coverage.
+  layer0-layer3 Qwen session path, the DP layer0+layer1 Qwen session path, and
+  Qwen LoRA SFT resume verifier now have explicit bf16 compute-policy coverage.
   Mixed precision over future full production Qwen model/data paths remains
   future work.
 
