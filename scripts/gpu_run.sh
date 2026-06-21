@@ -13,8 +13,8 @@ REMOTE_DIR="${RUSTRAIN_REMOTE_DIR:-/vePFS-Mindverse/user/nolanho/code/rustrain}"
 REMOTE_FALLBACK_DIR="${RUSTRAIN_REMOTE_FALLBACK_DIR:-/root/rustrain}"
 REMOTE_PYTHON="${RUSTRAIN_REMOTE_PYTHON:-/opt/venv/bin/python}"
 RAY_NUM_GPUS="${RUSTRAIN_RAY_NUM_GPUS:-1}"
-SYNC_TO_WORKER="${RUSTRAIN_SYNC_TO_WORKER:-0}"
-SSH_OPTS="${RUSTRAIN_SSH_OPTS:-}"
+SYNC_TO_WORKER="${RUSTRAIN_SYNC_TO_WORKER:-1}"
+SSH_OPTS="${RUSTRAIN_SSH_OPTS:--o StrictHostKeyChecking=no -o UserKnownHostsFile=/tmp/rustrain_gpu_known_hosts -o GlobalKnownHostsFile=/dev/null}"
 REMOTE_ARCHIVE=""
 NO_REMOTE_ARCHIVE="__RUSTRAIN_NO_ARCHIVE__"
 
@@ -80,7 +80,7 @@ def run_on_gpu_worker(
     staged = archive_bytes is not None
     if staged:
         digest = hashlib.sha256(archive_bytes).hexdigest()[:16]
-        work_dir = f"/tmp/rustrain-gpu-run-{digest}"
+        work_dir = f"/tmp/rustrain-gpu-run-{digest}-{os.getpid()}"
         shutil.rmtree(work_dir, ignore_errors=True)
         os.makedirs(work_dir, exist_ok=True)
         work_dir_abs = os.path.abspath(work_dir)

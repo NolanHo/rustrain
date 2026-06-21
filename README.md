@@ -22,11 +22,13 @@ Run one command on a Ray GPU worker:
 scripts/gpu_run.sh cargo run -- tch-cuda-probe
 ```
 
-To verify uncommitted local edits on the Ray GPU worker, stage the current
-working tree into the worker runtime:
+By default `scripts/gpu_run.sh` stages the current working tree into a
+temporary Ray worker directory before running the command, so development
+feedback comes from the current local edits on GPU, not from an older remote
+checkout:
 
 ```sh
-RUSTRAIN_SYNC_TO_WORKER=1 scripts/gpu_run.sh cargo check
+scripts/gpu_run.sh cargo check
 ```
 
 Run the focused verification suite:
@@ -43,10 +45,10 @@ scripts/verify_gpu_distributed.sh
 
 Both scripts SSH to `root@192.168.42.106:2222`, submit work to Ray with GPU
 resources, enter the remote checkout, and source `scripts/tch_a800_env.sh`
-before running project commands. `scripts/verify_gpu.sh` stages the current
-working tree by default, and `scripts/verify_gpu_distributed.sh` does the same
-while reserving two Ray GPUs; set `RUSTRAIN_SYNC_TO_WORKER=0` only when you
-explicitly want to validate the remote checkout as-is. Do not run `cargo check`,
+before running project commands. `scripts/gpu_run.sh`, `scripts/verify_gpu.sh`,
+and `scripts/verify_gpu_distributed.sh` all stage the current working tree by
+default; set `RUSTRAIN_SYNC_TO_WORKER=0` only when you explicitly want to
+validate the remote checkout as-is. Do not run `cargo check`,
 `cargo test`, train smokes, parity commands, or local CPU checks on the local
 machine. Do not run them directly in the plain SSH shell either; that shell does
 not expose the GPU devices. If a check is worth running, run it on a Ray GPU
@@ -59,10 +61,10 @@ The preferred remote checkout is:
 ```
 
 If that shared checkout is not available on the Ray worker,
-`scripts/gpu_run.sh` automatically falls back to `/root/rustrain`. To verify
-uncommitted local edits, keep using `RUSTRAIN_SYNC_TO_WORKER=1`; it stages the
-current working tree into a temporary worker directory and does not depend on
-either remote checkout.
+`scripts/gpu_run.sh` automatically falls back to `/root/rustrain` only when
+`RUSTRAIN_SYNC_TO_WORKER=0`. Normal development commands keep the default
+`RUSTRAIN_SYNC_TO_WORKER=1`, stage the current working tree into a temporary
+worker directory, and do not depend on either remote checkout.
 
 To refresh the bootstrap fallback manually:
 
@@ -95,7 +97,8 @@ scripts/gpu_run.sh cargo run -- qwen-full-train-smoke
 
 ## Distributed Launch
 
-A minimal local-rank launcher is available for rank process management:
+A minimal per-node rank launcher is available inside the Ray GPU worker for rank
+process management:
 
 ```sh
 scripts/gpu_run.sh cargo run -- launch --nproc-per-node 2 print-launch-env
