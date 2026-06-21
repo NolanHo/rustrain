@@ -28,6 +28,7 @@ remote_run cargo test tch_dtype_policy_maps_runtime_dtype_to_compute_kind
 remote_run cargo run -- train --config configs/tch_smoke_cuda.toml
 remote_run cargo run -- train --config configs/tch_smoke_cuda_bf16.toml
 remote_run cargo run -- qwen-sampling-smoke
+remote_run bash scripts/verify_qwen_kv_cache_worker.sh
 remote_run cargo run -- qwen-lora-sft-smoke
 remote_run cargo run -- train --config configs/qwen_lora_sft.toml
 remote_run bash scripts/verify_qwen_lora_sft_resume.sh
