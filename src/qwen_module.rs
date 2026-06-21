@@ -146,7 +146,10 @@ pub(crate) struct QwenLoraSftTrainSummary {
     pub(crate) adapter_output: String,
     pub(crate) target_layers: Vec<usize>,
     pub(crate) target_modules: Vec<String>,
+    pub(crate) train_samples: usize,
+    pub(crate) eval_samples: usize,
     pub(crate) batch_size: usize,
+    pub(crate) eval_batch_size: usize,
     pub(crate) prompt_tokens: Vec<usize>,
     pub(crate) response_tokens: Vec<usize>,
     pub(crate) sequence_tokens: usize,
@@ -159,6 +162,10 @@ pub(crate) struct QwenLoraSftTrainSummary {
     pub(crate) steps: usize,
     pub(crate) initial_loss: f64,
     pub(crate) final_loss: f64,
+    pub(crate) initial_eval_loss: f64,
+    pub(crate) final_eval_loss: f64,
+    pub(crate) reloaded_eval_loss: f64,
+    pub(crate) eval_reload_delta: f64,
     pub(crate) reloaded_loss: f64,
     pub(crate) reload_delta: f64,
     pub(crate) full_forward_adapter_delta: f64,
@@ -476,6 +483,7 @@ struct QwenSftRecord {
     response: String,
 }
 
+#[derive(Clone)]
 struct QwenSftDataset {
     samples: Vec<QwenSftTokenSample>,
     pad_token_id: i64,
@@ -1054,6 +1062,7 @@ pub fn qwen_lora_sft_smoke(
         lora_config,
         learning_rate,
         1,
+        0.5,
         QwenLoraSftTrainPolicy::constant_without_clip(),
     )?;
     println!("{}", serde_json::to_string_pretty(&summary)?);
@@ -1111,6 +1120,7 @@ pub fn train_qwen_lora_sft_from_config(
         lora_config,
         config.train.learning_rate as f64,
         config.train.max_steps as usize,
+        data.train_split,
         QwenLoraSftTrainPolicy::from_config(config),
     )
 }
@@ -1126,6 +1136,7 @@ fn qwen_lora_sft_train(
     lora_config: QwenLoraConfig,
     learning_rate: f64,
     steps: usize,
+    train_split: f32,
     policy: QwenLoraSftTrainPolicy,
 ) -> Result<QwenLoraSftTrainSummary> {
     if learning_rate <= 0.0 {
@@ -1136,6 +1147,9 @@ fn qwen_lora_sft_train(
     }
     if steps == 0 {
         bail!("steps must be positive");
+    }
+    if !(0.0..1.0).contains(&train_split) {
+        bail!("train_split must be in (0, 1)");
     }
 
     let tokenizer = Tokenizer::from_file(model_path.join("tokenizer.json"))
@@ -1159,7 +1173,11 @@ fn qwen_lora_sft_train(
             ],
         )?
     };
-    let batch = dataset.padded_batch(0, sft_batch_size.min(dataset.len()))?;
+    let (train_dataset, eval_dataset) = dataset.train_eval_split(train_split)?;
+    let train_batch_size = sft_batch_size.min(train_dataset.len());
+    let eval_batch_size = sft_batch_size.min(eval_dataset.len());
+    let initial_batch = train_dataset.padded_batch(0, train_batch_size)?;
+    let eval_batch = eval_dataset.padded_batch(0, eval_batch_size)?;
     let weights = read_safetensors_map(&model_path.join("model.safetensors"))?;
     let config = read_runtime_config(&model_path.join("config.json"))?;
     let registry = QwenLoraRegistry::deterministic(&weights, &lora_config, true)?;
@@ -1179,8 +1197,17 @@ fn qwen_lora_sft_train(
     let alpha = lora_config.alpha_f64();
 
     let initial_loss = qwen_lora_sft_loss(
-        &batch.input_ids,
-        &batch.target_mask,
+        &initial_batch.input_ids,
+        &initial_batch.target_mask,
+        &weights,
+        &lora_config,
+        &registry,
+        &config,
+    )?
+    .double_value(&[]);
+    let initial_eval_loss = qwen_lora_sft_loss(
+        &eval_batch.input_ids,
+        &eval_batch.target_mask,
         &weights,
         &lora_config,
         &registry,
@@ -1203,9 +1230,10 @@ fn qwen_lora_sft_train(
         for (_, mut tensor) in registry.trainable_tensors() {
             tensor.zero_grad();
         }
+        let step_batch = train_dataset.padded_batch(step * train_batch_size, train_batch_size)?;
         let loss = qwen_lora_sft_loss(
-            &batch.input_ids,
-            &batch.target_mask,
+            &step_batch.input_ids,
+            &step_batch.target_mask,
             &weights,
             &lora_config,
             &registry,
@@ -1270,8 +1298,17 @@ fn qwen_lora_sft_train(
     }
 
     let final_loss = qwen_lora_sft_loss(
-        &batch.input_ids,
-        &batch.target_mask,
+        &initial_batch.input_ids,
+        &initial_batch.target_mask,
+        &weights,
+        &lora_config,
+        &registry,
+        &config,
+    )?
+    .double_value(&[]);
+    let final_eval_loss = qwen_lora_sft_loss(
+        &eval_batch.input_ids,
+        &eval_batch.target_mask,
         &weights,
         &lora_config,
         &registry,
@@ -1287,8 +1324,8 @@ fn qwen_lora_sft_train(
     registry.save(adapter_output)?;
     let reloaded = QwenLoraRegistry::load(adapter_output)?;
     let reloaded_loss = qwen_lora_sft_loss(
-        &batch.input_ids,
-        &batch.target_mask,
+        &initial_batch.input_ids,
+        &initial_batch.target_mask,
         &weights,
         &lora_config,
         &reloaded,
@@ -1301,11 +1338,26 @@ fn qwen_lora_sft_train(
             "Qwen LoRA SFT adapter reload loss parity failed: final_loss={final_loss}, reloaded_loss={reloaded_loss}, reload_delta={reload_delta}"
         );
     }
-    let base_logits = qwen_forward_from_ids(&batch.input_ids, &weights, &config)?;
+    let reloaded_eval_loss = qwen_lora_sft_loss(
+        &eval_batch.input_ids,
+        &eval_batch.target_mask,
+        &weights,
+        &lora_config,
+        &reloaded,
+        &config,
+    )?
+    .double_value(&[]);
+    let eval_reload_delta = (final_eval_loss - reloaded_eval_loss).abs();
+    if eval_reload_delta > 1e-7 {
+        bail!(
+            "Qwen LoRA SFT adapter reload eval parity failed: final_eval_loss={final_eval_loss}, reloaded_eval_loss={reloaded_eval_loss}, eval_reload_delta={eval_reload_delta}"
+        );
+    }
+    let base_logits = qwen_forward_from_ids(&initial_batch.input_ids, &weights, &config)?;
     let adapted_logits =
-        qwen_forward_from_ids_with_lora(&batch.input_ids, &weights, &config, &registry)?;
+        qwen_forward_from_ids_with_lora(&initial_batch.input_ids, &weights, &config, &registry)?;
     let reloaded_logits =
-        qwen_forward_from_ids_with_lora(&batch.input_ids, &weights, &config, &reloaded)?;
+        qwen_forward_from_ids_with_lora(&initial_batch.input_ids, &weights, &config, &reloaded)?;
     let full_forward_adapter_delta = diff_stats(&adapted_logits, &base_logits)?.max_abs;
     if full_forward_adapter_delta <= 0.0 {
         bail!("Qwen LoRA SFT adapter did not change full forward logits");
@@ -1317,18 +1369,22 @@ fn qwen_lora_sft_train(
         );
     }
     let merged_weights = reloaded.merge_into_weights(&weights)?;
-    let merged_logits = qwen_forward_from_ids(&batch.input_ids, &merged_weights, &config)?;
+    let merged_logits = qwen_forward_from_ids(&initial_batch.input_ids, &merged_weights, &config)?;
     let full_forward_merge_delta = diff_stats(&merged_logits, &adapted_logits)?.max_abs;
     if full_forward_merge_delta > 1e-7 {
         bail!("Qwen LoRA SFT merge parity failed: max_delta={full_forward_merge_delta}");
     }
     let unmerged_weights = reloaded.unmerge_from_weights(&merged_weights)?;
-    let unmerged_logits = qwen_forward_from_ids(&batch.input_ids, &unmerged_weights, &config)?;
+    let unmerged_logits =
+        qwen_forward_from_ids(&initial_batch.input_ids, &unmerged_weights, &config)?;
     let full_forward_unmerge_delta = diff_stats(&unmerged_logits, &base_logits)?.max_abs;
     if full_forward_unmerge_delta > 5e-4 {
         bail!("Qwen LoRA SFT unmerge parity failed: max_delta={full_forward_unmerge_delta}");
     }
-    let prompt_ids = batch.input_ids.i(0).reshape([1, batch.input_ids.size()[1]]);
+    let prompt_ids = initial_batch
+        .input_ids
+        .i(0)
+        .reshape([1, initial_batch.input_ids.size()[1]]);
     let generated = qwen_greedy_generate_with_lora(&prompt_ids, &weights, &config, &registry, 2)?;
     let reloaded_generated =
         qwen_greedy_generate_with_lora(&prompt_ids, &weights, &config, &reloaded, 2)?;
@@ -1351,19 +1407,23 @@ fn qwen_lora_sft_train(
             "Qwen LoRA SFT full generate merge parity failed: generated={generated_ids:?}, merged={merged_generated_ids:?}"
         );
     }
-    let full_generate_new_token_ids = generated_ids[batch.input_ids.size()[1] as usize..].to_vec();
+    let full_generate_new_token_ids =
+        generated_ids[initial_batch.input_ids.size()[1] as usize..].to_vec();
 
     let summary = QwenLoraSftTrainSummary {
         model_path: model_path.display().to_string(),
         adapter_output: adapter_output.display().to_string(),
         target_layers: lora_config.target_layers.clone(),
         target_modules: lora_config.target_module_names(),
-        batch_size: batch.prompt_tokens.len(),
-        prompt_tokens: batch.prompt_tokens,
-        response_tokens: batch.response_tokens,
-        sequence_tokens: batch.input_ids.size()[1] as usize,
-        response_masked_positions: batch.masked_positions,
-        padding_tokens: batch.padding_tokens,
+        train_samples: train_dataset.len(),
+        eval_samples: eval_dataset.len(),
+        batch_size: initial_batch.prompt_tokens.len(),
+        eval_batch_size,
+        prompt_tokens: initial_batch.prompt_tokens,
+        response_tokens: initial_batch.response_tokens,
+        sequence_tokens: initial_batch.input_ids.size()[1] as usize,
+        response_masked_positions: initial_batch.masked_positions,
+        padding_tokens: initial_batch.padding_tokens,
         rank,
         alpha,
         learning_rate,
@@ -1371,6 +1431,10 @@ fn qwen_lora_sft_train(
         steps,
         initial_loss,
         final_loss,
+        initial_eval_loss,
+        final_eval_loss,
+        reloaded_eval_loss,
+        eval_reload_delta,
         reloaded_loss,
         reload_delta,
         full_forward_adapter_delta,
@@ -4306,6 +4370,27 @@ impl QwenSftDataset {
         Self::from_instruction_pairs(tokenizer, &qwen_sft_examples_from_jsonl_paths(paths)?)
     }
 
+    fn train_eval_split(&self, train_split: f32) -> Result<(Self, Self)> {
+        if !(0.0..1.0).contains(&train_split) {
+            bail!("SFT train_split must be in (0, 1)");
+        }
+        if self.samples.len() < 2 {
+            bail!("SFT train/eval split requires at least two samples");
+        }
+        let split_at = ((self.samples.len() as f32) * train_split).floor() as usize;
+        let split_at = split_at.clamp(1, self.samples.len() - 1);
+        Ok((
+            Self {
+                samples: self.samples[..split_at].to_vec(),
+                pad_token_id: self.pad_token_id,
+            },
+            Self {
+                samples: self.samples[split_at..].to_vec(),
+                pad_token_id: self.pad_token_id,
+            },
+        ))
+    }
+
     fn padded_batch(&self, start: usize, batch_size: usize) -> Result<QwenSftBatch> {
         if batch_size == 0 {
             bail!("SFT batch size must be positive");
@@ -5613,6 +5698,41 @@ mod tests {
         assert_eq!(mask_values, vec![1.0, 1.0, 0.0, 1.0, 1.0, 1.0]);
         assert_eq!(batch.masked_positions, 5);
         assert_eq!(batch.padding_tokens, 0);
+    }
+
+    #[test]
+    fn qwen_sft_dataset_split_keeps_train_and_eval_batches() {
+        let dataset = QwenSftDataset {
+            samples: (0..5)
+                .map(|index| QwenSftTokenSample {
+                    prompt_tokens: 1,
+                    response_tokens: 1,
+                    masked_positions: 1,
+                    token_ids: vec![index, index + 10],
+                    mask_values: vec![1.0],
+                })
+                .collect(),
+            pad_token_id: 0,
+        };
+
+        let (train, eval) = dataset
+            .train_eval_split(0.6)
+            .expect("split should keep both sides");
+        let train_batch = train
+            .padded_batch(2, 3)
+            .expect("train wrapping batch should build");
+        let eval_batch = eval
+            .padded_batch(0, 2)
+            .expect("eval batch should build");
+        let train_values: Vec<i64> =
+            Vec::<i64>::try_from(train_batch.input_ids.reshape([-1])).unwrap();
+        let eval_values: Vec<i64> =
+            Vec::<i64>::try_from(eval_batch.input_ids.reshape([-1])).unwrap();
+
+        assert_eq!(train.len(), 3);
+        assert_eq!(eval.len(), 2);
+        assert_eq!(train_values, vec![2, 12, 0, 10, 1, 11]);
+        assert_eq!(eval_values, vec![3, 13, 4, 14]);
     }
 
     #[test]

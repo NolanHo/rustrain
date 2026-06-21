@@ -178,6 +178,10 @@ pub fn train(config_path: &Path, resume_from: Option<PathBuf>) -> Result<()> {
         info!(
             initial_loss = summary.initial_loss,
             final_loss = summary.final_loss,
+            initial_eval_loss = summary.initial_eval_loss,
+            final_eval_loss = summary.final_eval_loss,
+            reloaded_eval_loss = summary.reloaded_eval_loss,
+            eval_reload_delta = summary.eval_reload_delta,
             reloaded_loss = summary.reloaded_loss,
             reload_delta = summary.reload_delta,
             full_forward_adapter_delta = summary.full_forward_adapter_delta,
@@ -192,7 +196,10 @@ pub fn train(config_path: &Path, resume_from: Option<PathBuf>) -> Result<()> {
             first_step_grad_norm = summary.first_step_grad_norm,
             final_step_grad_norm = summary.final_step_grad_norm,
             final_step_clipped_grad_norm = summary.final_step_clipped_grad_norm,
+            train_samples = summary.train_samples,
+            eval_samples = summary.eval_samples,
             batch_size = summary.batch_size,
+            eval_batch_size = summary.eval_batch_size,
             sequence_tokens = summary.sequence_tokens,
             response_masked_positions = summary.response_masked_positions,
             padding_tokens = summary.padding_tokens,
@@ -204,8 +211,14 @@ pub fn train(config_path: &Path, resume_from: Option<PathBuf>) -> Result<()> {
         println!("run_dir: {}", run_paths.root.display());
         println!("resolved_config: {}", run_paths.resolved_config.display());
         println!("adapter_checkpoint: {}", summary.adapter_output);
+        println!("train_samples: {}", summary.train_samples);
+        println!("eval_samples: {}", summary.eval_samples);
         println!("initial_loss: {:.9}", summary.initial_loss);
         println!("final_loss: {:.9}", summary.final_loss);
+        println!("initial_eval_loss: {:.9}", summary.initial_eval_loss);
+        println!("final_eval_loss: {:.9}", summary.final_eval_loss);
+        println!("reloaded_eval_loss: {:.9}", summary.reloaded_eval_loss);
+        println!("eval_reload_delta: {:.9}", summary.eval_reload_delta);
         println!("reloaded_loss: {:.9}", summary.reloaded_loss);
         println!("reload_delta: {:.9}", summary.reload_delta);
         println!(
@@ -245,6 +258,7 @@ pub fn train(config_path: &Path, resume_from: Option<PathBuf>) -> Result<()> {
             summary.final_step_clipped_grad_norm
         );
         println!("batch_size: {}", summary.batch_size);
+        println!("eval_batch_size: {}", summary.eval_batch_size);
         println!("sequence_tokens: {}", summary.sequence_tokens);
         println!(
             "response_masked_positions: {}",
