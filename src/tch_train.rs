@@ -50,6 +50,46 @@ struct TchDpGradientRankSummary {
     grad_max_delta: f32,
 }
 
+#[derive(Debug, serde::Serialize)]
+struct TchMoeSmokeSummary {
+    device: String,
+    train_steps: usize,
+    learning_rate: f64,
+    aux_loss_weight: f64,
+    tokens: i64,
+    hidden_size: i64,
+    expert_hidden_size: i64,
+    num_experts: i64,
+    top_k: i64,
+    initial_loss: f64,
+    final_loss: f64,
+    initial_task_loss: f64,
+    final_task_loss: f64,
+    initial_load_balance_loss: f64,
+    final_load_balance_loss: f64,
+    expert_load: Vec<usize>,
+    total_params: usize,
+    activated_params: usize,
+    router_grad_defined: bool,
+    expert_up_grad_defined: bool,
+    expert_down_grad_defined: bool,
+    router_grad_norm: f64,
+    expert_up_grad_norm: f64,
+    expert_down_grad_norm: f64,
+    router_delta_norm: f64,
+    expert_up_delta_norm: f64,
+    expert_down_delta_norm: f64,
+    memory_rss_mb: Option<f64>,
+    gpu_memory_allocated_mb: Option<f64>,
+}
+
+struct TchMoeForward {
+    loss: Tensor,
+    task_loss: Tensor,
+    load_balance_loss: Tensor,
+    expert_load: Vec<usize>,
+}
+
 pub fn probe_tch_cuda() -> Result<()> {
     let summary = TchCudaProbeSummary {
         cuda_available: Cuda::is_available(),
@@ -64,6 +104,192 @@ pub fn probe_tch_cuda() -> Result<()> {
     }
 
     Ok(())
+}
+
+pub fn run_tch_moe_smoke() -> Result<()> {
+    let summary = tch_moe_smoke_summary()?;
+    println!("{}", serde_json::to_string_pretty(&summary)?);
+    Ok(())
+}
+
+fn tch_moe_smoke_summary() -> Result<TchMoeSmokeSummary> {
+    if !Cuda::is_available() || Cuda::device_count() == 0 {
+        bail!("tch MoE smoke requires a visible CUDA GPU");
+    }
+
+    let device = Device::Cuda(0);
+    let tokens = 6;
+    let hidden_size = 4;
+    let expert_hidden_size = 6;
+    let num_experts = 3;
+    let top_k = 1;
+    let train_steps = 8;
+    let learning_rate = 0.2;
+    let aux_loss_weight = 0.01;
+
+    let input = Tensor::from_slice(&[
+        0.2_f32, -0.1, 0.4, 0.7, -0.3, 0.8, 0.1, -0.5, 0.6, 0.2, -0.4, 0.3, 0.9, -0.7, 0.2, 0.1,
+        -0.5, -0.2, 0.8, 0.4, 0.3, 0.5, -0.6, 0.2,
+    ])
+    .reshape([tokens, hidden_size])
+    .to_device(device);
+    let target = Tensor::zeros([tokens, hidden_size], (Kind::Float, device));
+
+    let mut router = Tensor::from_slice(&[
+        0.3_f32, -0.2, 0.1, -0.1, 0.4, 0.2, 0.2, 0.1, -0.3, -0.4, 0.2, 0.5,
+    ])
+    .reshape([hidden_size, num_experts])
+    .to_device(device)
+    .set_requires_grad(true);
+    let mut expert_up = (Tensor::arange(
+        num_experts * hidden_size * expert_hidden_size,
+        (Kind::Float, device),
+    )
+    .reshape([num_experts, hidden_size, expert_hidden_size])
+        / 80.0
+        - 0.4)
+        .set_requires_grad(true);
+    let mut expert_down = (Tensor::arange(
+        num_experts * expert_hidden_size * hidden_size,
+        (Kind::Float, device),
+    )
+    .reshape([num_experts, expert_hidden_size, hidden_size])
+        / 90.0
+        - 0.3)
+        .set_requires_grad(true);
+
+    let initial_router = router.detach().to_device(Device::Cpu);
+    let initial_expert_up = expert_up.detach().to_device(Device::Cpu);
+    let initial_expert_down = expert_down.detach().to_device(Device::Cpu);
+    let initial = tch_moe_forward(
+        &input,
+        &target,
+        &router,
+        &expert_up,
+        &expert_down,
+        num_experts,
+        aux_loss_weight,
+    )?;
+    let initial_loss = initial.loss.double_value(&[]);
+    let initial_task_loss = initial.task_loss.double_value(&[]);
+    let initial_load_balance_loss = initial.load_balance_loss.double_value(&[]);
+
+    let mut router_grad_defined = false;
+    let mut expert_up_grad_defined = false;
+    let mut expert_down_grad_defined = false;
+    let mut router_grad_norm = 0.0;
+    let mut expert_up_grad_norm = 0.0;
+    let mut expert_down_grad_norm = 0.0;
+
+    for step in 1..=train_steps {
+        router.zero_grad();
+        expert_up.zero_grad();
+        expert_down.zero_grad();
+        let forward = tch_moe_forward(
+            &input,
+            &target,
+            &router,
+            &expert_up,
+            &expert_down,
+            num_experts,
+            aux_loss_weight,
+        )?;
+        forward.loss.backward();
+
+        if step == 1 {
+            router_grad_defined = router.grad().defined();
+            expert_up_grad_defined = expert_up.grad().defined();
+            expert_down_grad_defined = expert_down.grad().defined();
+            router_grad_norm = tensor_l2_norm(&router.grad());
+            expert_up_grad_norm = tensor_l2_norm(&expert_up.grad());
+            expert_down_grad_norm = tensor_l2_norm(&expert_down.grad());
+        }
+
+        no_grad(|| -> Result<()> {
+            let _ = router.f_sub_(&(&router.grad() * learning_rate))?;
+            let _ = expert_up.f_sub_(&(&expert_up.grad() * learning_rate))?;
+            let _ = expert_down.f_sub_(&(&expert_down.grad() * learning_rate))?;
+            Ok(())
+        })?;
+    }
+
+    let final_forward = tch_moe_forward(
+        &input,
+        &target,
+        &router,
+        &expert_up,
+        &expert_down,
+        num_experts,
+        aux_loss_weight,
+    )?;
+    let final_loss = final_forward.loss.double_value(&[]);
+    let final_task_loss = final_forward.task_loss.double_value(&[]);
+    let final_load_balance_loss = final_forward.load_balance_loss.double_value(&[]);
+    if final_loss >= initial_loss {
+        bail!(
+            "tch MoE smoke did not reduce loss: initial_loss={initial_loss}, final_loss={final_loss}"
+        );
+    }
+    if final_task_loss >= initial_task_loss {
+        bail!(
+            "tch MoE smoke did not reduce task loss: initial_task_loss={initial_task_loss}, final_task_loss={final_task_loss}"
+        );
+    }
+    if !router_grad_defined || !expert_up_grad_defined || !expert_down_grad_defined {
+        bail!(
+            "tch MoE smoke missing gradients: router={router_grad_defined}, expert_up={expert_up_grad_defined}, expert_down={expert_down_grad_defined}"
+        );
+    }
+    if router_grad_norm <= 0.0 || expert_up_grad_norm <= 0.0 || expert_down_grad_norm <= 0.0 {
+        bail!(
+            "tch MoE smoke gradients must be positive: router={router_grad_norm}, expert_up={expert_up_grad_norm}, expert_down={expert_down_grad_norm}"
+        );
+    }
+
+    let total_params = (hidden_size * num_experts
+        + num_experts * hidden_size * expert_hidden_size
+        + num_experts * expert_hidden_size * hidden_size) as usize;
+    let activated_params = (hidden_size * num_experts
+        + top_k * (hidden_size * expert_hidden_size + expert_hidden_size * hidden_size))
+        as usize;
+
+    Ok(TchMoeSmokeSummary {
+        device: format!("{device:?}"),
+        train_steps,
+        learning_rate,
+        aux_loss_weight,
+        tokens,
+        hidden_size,
+        expert_hidden_size,
+        num_experts,
+        top_k,
+        initial_loss,
+        final_loss,
+        initial_task_loss,
+        final_task_loss,
+        initial_load_balance_loss,
+        final_load_balance_loss,
+        expert_load: final_forward.expert_load,
+        total_params,
+        activated_params,
+        router_grad_defined,
+        expert_up_grad_defined,
+        expert_down_grad_defined,
+        router_grad_norm,
+        expert_up_grad_norm,
+        expert_down_grad_norm,
+        router_delta_norm: tensor_l2_norm(
+            &(router.detach().to_device(Device::Cpu) - &initial_router),
+        ),
+        expert_up_delta_norm: tensor_l2_norm(
+            &(expert_up.detach().to_device(Device::Cpu) - &initial_expert_up),
+        ),
+        expert_down_delta_norm: tensor_l2_norm(
+            &(expert_down.detach().to_device(Device::Cpu) - &initial_expert_down),
+        ),
+        memory_rss_mb: memory_rss_mb(),
+        gpu_memory_allocated_mb: crate::metrics::gpu_memory_allocated_mb(),
+    })
 }
 
 pub fn train_tch_tiny_lm(config: &Config) -> Result<TchTrainSmokeSummary> {
@@ -314,6 +540,62 @@ fn learning_rate_for_step(config: &Config, step: u64) -> f64 {
     }
 }
 
+fn tch_moe_forward(
+    input: &Tensor,
+    target: &Tensor,
+    router: &Tensor,
+    expert_up: &Tensor,
+    expert_down: &Tensor,
+    num_experts: i64,
+    aux_loss_weight: f64,
+) -> Result<TchMoeForward> {
+    let logits = input.matmul(router);
+    let routing_probs = logits.softmax(-1, Kind::Float);
+    let expert_indices = routing_probs.argmax(-1, false);
+    let selected_weights = routing_probs
+        .gather(1, &expert_indices.unsqueeze(1), false)
+        .squeeze_dim(1);
+
+    let mut token_outputs = Vec::with_capacity(input.size()[0] as usize);
+    let mut expert_load = vec![0usize; num_experts as usize];
+    for token_index in 0..input.size()[0] {
+        let expert_index = expert_indices.int64_value(&[token_index]);
+        expert_load[expert_index as usize] += 1;
+        let token = input.get(token_index).unsqueeze(0);
+        let up = expert_up.get(expert_index);
+        let down = expert_down.get(expert_index);
+        let output = token.matmul(&up).relu().matmul(&down).squeeze_dim(0)
+            * selected_weights.get(token_index);
+        token_outputs.push(output);
+    }
+    let output = Tensor::stack(&token_outputs.iter().collect::<Vec<_>>(), 0);
+    let task_loss = output.mse_loss(target, Reduction::Mean);
+    let load = Tensor::from_slice(
+        &expert_load
+            .iter()
+            .map(|load| *load as f32)
+            .collect::<Vec<_>>(),
+    )
+    .to_device(input.device());
+    let load_fraction = &load / load.sum(Kind::Float).clamp_min(1.0);
+    let prob_fraction = routing_probs.mean_dim([0].as_slice(), false, Kind::Float);
+    let expected = Tensor::full(
+        [num_experts],
+        1.0 / num_experts as f64,
+        (Kind::Float, input.device()),
+    );
+    let load_balance_loss = (&load_fraction - &expected).square().mean(Kind::Float)
+        + (&prob_fraction - &expected).square().mean(Kind::Float);
+    let loss = &task_loss + &load_balance_loss * aux_loss_weight;
+
+    Ok(TchMoeForward {
+        loss,
+        task_loss,
+        load_balance_loss,
+        expert_load,
+    })
+}
+
 struct TchDpGradient {
     loss: f64,
     grad: Vec<f32>,
@@ -410,6 +692,10 @@ fn grad_norm(trainable_variables: &[Tensor]) -> f64 {
         })
         .sum::<f64>()
         .sqrt()
+}
+
+fn tensor_l2_norm(tensor: &Tensor) -> f64 {
+    tensor.square().sum(Kind::Float).sqrt().double_value(&[])
 }
 
 fn fixed_tch_batch(vocab_size: i64, seq_len: i64) -> Tensor {

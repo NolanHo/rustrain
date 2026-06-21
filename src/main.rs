@@ -209,6 +209,7 @@ enum Command {
         learning_rate: f64,
     },
     MoeSmoke,
+    TchMoeSmoke,
     #[command(hide = true)]
     QwenDpGradientRankSmoke {
         #[arg(
@@ -498,6 +499,7 @@ fn main() -> Result<()> {
             );
             Ok(())
         }
+        Command::TchMoeSmoke => tch_train::run_tch_moe_smoke(),
         Command::QwenDpGradientRankSmoke {
             model_path,
             reference_fixture,

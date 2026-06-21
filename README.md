@@ -183,7 +183,10 @@ Toy MoE has an explicit single-rank smoke command and verifier:
 `cargo run -- moe-smoke` prints a JSON summary for TinyMoe and DeepSeek-style
 toy MoE stats, and `scripts/verify_moe_smoke_worker.sh` asserts expert load,
 load-balance loss, activated/total parameter counts, and output summaries on a
-Ray GPU worker.
+Ray GPU worker. A CUDA `tch-rs` autograd MoE smoke is also available through
+`cargo run -- tch-moe-smoke`; `scripts/verify_tch_moe_smoke_worker.sh` checks
+that router and expert tensors receive gradients, the task loss decreases, and
+activated parameters remain below total parameters on a Ray GPU worker.
 Expert-parallel coverage is still toy-sized, but it now has three real
 launcher-backed two-rank paths: `parallel-ep-rank-smoke` verifies rank-local
 expert ownership and token coverage, `parallel-ep-nccl-rank-smoke` builds

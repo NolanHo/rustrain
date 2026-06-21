@@ -21,6 +21,7 @@ remote_run cargo run -- tch-cuda-probe
 remote_run cargo fmt --check
 remote_run cargo check
 remote_run bash scripts/verify_moe_smoke_worker.sh
+remote_run bash scripts/verify_tch_moe_smoke_worker.sh
 remote_run cargo test qwen_delta_manifest_roundtrips
 remote_run cargo test qwen_causal_lm_loss_is_finite_for_tiny_weights
 remote_run cargo test qwen_lora
