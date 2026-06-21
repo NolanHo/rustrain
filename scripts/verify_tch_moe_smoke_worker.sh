@@ -38,6 +38,7 @@ required = [
     "final_load_balance_loss",
     "checkpoint_output",
     "optimizer_output",
+    "manifest_output",
     "reloaded_loss",
     "reload_delta",
     "reload_optimizer_max_abs",
@@ -93,6 +94,82 @@ if not checkpoint.exists() or checkpoint.stat().st_size == 0:
 optimizer = pathlib.Path(summary["optimizer_output"])
 if not optimizer.exists() or optimizer.stat().st_size == 0:
     raise SystemExit(f"optimizer_output missing or empty: {optimizer}")
+manifest_path = pathlib.Path(summary["manifest_output"])
+if not manifest_path.exists() or manifest_path.stat().st_size == 0:
+    raise SystemExit(f"manifest_output missing or empty: {manifest_path}")
+manifest = json.loads(manifest_path.read_text())
+if manifest.get("format") != "rustrain.tch_moe.v1":
+    raise SystemExit(f"unexpected manifest format: {manifest.get('format')}")
+if manifest.get("global_step") != summary["train_steps"]:
+    raise SystemExit(
+        f"manifest global_step should equal train_steps: {manifest.get('global_step')} vs {summary['train_steps']}"
+    )
+if manifest.get("model_safetensors") != str(checkpoint):
+    raise SystemExit("manifest model_safetensors does not match summary checkpoint_output")
+if manifest.get("optimizer_safetensors") != str(optimizer):
+    raise SystemExit("manifest optimizer_safetensors does not match summary optimizer_output")
+model_tensors = {entry["name"]: entry for entry in manifest.get("model_tensors", [])}
+expected_model_tensors = {
+    "router.weight": [summary["hidden_size"], summary["num_experts"]],
+    "experts.up.weight": [
+        summary["num_experts"],
+        summary["hidden_size"],
+        summary["expert_hidden_size"],
+    ],
+    "experts.down.weight": [
+        summary["num_experts"],
+        summary["expert_hidden_size"],
+        summary["hidden_size"],
+    ],
+}
+if set(model_tensors) != set(expected_model_tensors):
+    raise SystemExit(f"unexpected model tensor names: {sorted(model_tensors)}")
+for name, shape in expected_model_tensors.items():
+    entry = model_tensors[name]
+    if entry.get("shape") != shape:
+        raise SystemExit(f"{name} shape mismatch: {entry.get('shape')} vs {shape}")
+    if entry.get("dtype") != "Float":
+        raise SystemExit(f"{name} dtype mismatch: {entry.get('dtype')}")
+optimizer_slots = {entry["name"]: entry for entry in manifest.get("optimizer_slots", [])}
+expected_slots = {
+    "router.weight.adam_m": [summary["hidden_size"], summary["num_experts"]],
+    "router.weight.adam_v": [summary["hidden_size"], summary["num_experts"]],
+    "experts.up.weight.adam_m": [
+        summary["num_experts"],
+        summary["hidden_size"],
+        summary["expert_hidden_size"],
+    ],
+    "experts.up.weight.adam_v": [
+        summary["num_experts"],
+        summary["hidden_size"],
+        summary["expert_hidden_size"],
+    ],
+    "experts.down.weight.adam_m": [
+        summary["num_experts"],
+        summary["expert_hidden_size"],
+        summary["hidden_size"],
+    ],
+    "experts.down.weight.adam_v": [
+        summary["num_experts"],
+        summary["expert_hidden_size"],
+        summary["hidden_size"],
+    ],
+}
+if set(optimizer_slots) != set(expected_slots):
+    raise SystemExit(f"unexpected optimizer slot names: {sorted(optimizer_slots)}")
+for name, shape in expected_slots.items():
+    entry = optimizer_slots[name]
+    if entry.get("shape") != shape:
+        raise SystemExit(f"{name} shape mismatch: {entry.get('shape')} vs {shape}")
+    if entry.get("dtype") != "Float":
+        raise SystemExit(f"{name} dtype mismatch: {entry.get('dtype')}")
+step_tensor = manifest.get("optimizer_step_tensor", {})
+if step_tensor.get("name") != "optimizer.step":
+    raise SystemExit(f"unexpected optimizer step tensor name: {step_tensor.get('name')}")
+if step_tensor.get("shape") != [1]:
+    raise SystemExit(f"unexpected optimizer step shape: {step_tensor.get('shape')}")
+if step_tensor.get("dtype") != "Int64":
+    raise SystemExit(f"unexpected optimizer step dtype: {step_tensor.get('dtype')}")
 if len(summary["expert_load"]) != summary["num_experts"]:
     raise SystemExit(f"unexpected expert_load length: {summary['expert_load']}")
 if sum(summary["expert_load"]) != summary["tokens"]:
@@ -150,6 +227,7 @@ print(
     f"expert_load={summary['expert_load']} "
     f"params={summary['activated_params']}/{summary['total_params']} "
     f"reload_delta={summary['reload_delta']} "
-    f"second_step_delta={summary['second_step_delta']}"
+    f"second_step_delta={summary['second_step_delta']} "
+    f"manifest={summary['manifest_output']}"
 )
 PY

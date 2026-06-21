@@ -73,6 +73,7 @@ struct TchMoeSmokeSummary {
     final_load_balance_loss: f64,
     checkpoint_output: String,
     optimizer_output: String,
+    manifest_output: String,
     reloaded_loss: f64,
     reload_delta: f64,
     reload_optimizer_max_abs: f64,
@@ -132,6 +133,24 @@ struct TchMoeCheckpoint {
     expert_up: Tensor,
     expert_down: Tensor,
     state: TchMoeAdamState,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct TchMoeCheckpointManifest {
+    format: String,
+    global_step: i64,
+    model_safetensors: String,
+    optimizer_safetensors: String,
+    model_tensors: Vec<TchMoeTensorManifest>,
+    optimizer_slots: Vec<TchMoeTensorManifest>,
+    optimizer_step_tensor: TchMoeTensorManifest,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct TchMoeTensorManifest {
+    name: String,
+    shape: Vec<i64>,
+    dtype: String,
 }
 
 impl TchMoeAdamState {
@@ -315,9 +334,11 @@ fn tch_moe_smoke_summary() -> Result<TchMoeSmokeSummary> {
             .and_then(|stem| stem.to_str())
             .unwrap_or("rustrain-tch-moe")
     ));
+    let manifest_output = tch_moe_manifest_path(&checkpoint_output);
     write_tch_moe_checkpoint(
         &checkpoint_output,
         &optimizer_output,
+        &manifest_output,
         &router,
         &expert_up,
         &expert_down,
@@ -457,6 +478,7 @@ fn tch_moe_smoke_summary() -> Result<TchMoeSmokeSummary> {
         final_load_balance_loss,
         checkpoint_output: checkpoint_output.display().to_string(),
         optimizer_output: optimizer_output.display().to_string(),
+        manifest_output: manifest_output.display().to_string(),
         reloaded_loss,
         reload_delta,
         reload_optimizer_max_abs,
@@ -926,6 +948,7 @@ fn adamw_parameter_update(
 fn write_tch_moe_checkpoint(
     model_path: &Path,
     optimizer_path: &Path,
+    manifest_path: &Path,
     router: &Tensor,
     expert_up: &Tensor,
     expert_down: &Tensor,
@@ -944,6 +967,7 @@ fn write_tch_moe_checkpoint(
         model_path,
     )
     .with_context(|| format!("failed to write {}", model_path.display()))?;
+    let optimizer_step = Tensor::from_slice(&[state.step]);
     Tensor::write_safetensors(
         &[
             ("router.weight.adam_m", &state.router_m),
@@ -952,11 +976,36 @@ fn write_tch_moe_checkpoint(
             ("experts.up.weight.adam_v", &state.expert_up_v),
             ("experts.down.weight.adam_m", &state.expert_down_m),
             ("experts.down.weight.adam_v", &state.expert_down_v),
-            ("optimizer.step", &Tensor::from_slice(&[state.step])),
+            ("optimizer.step", &optimizer_step),
         ],
         optimizer_path,
     )
-    .with_context(|| format!("failed to write {}", optimizer_path.display()))
+    .with_context(|| format!("failed to write {}", optimizer_path.display()))?;
+    let manifest = TchMoeCheckpointManifest {
+        format: "rustrain.tch_moe.v1".to_string(),
+        global_step: state.step,
+        model_safetensors: model_path.display().to_string(),
+        optimizer_safetensors: optimizer_path.display().to_string(),
+        model_tensors: vec![
+            tch_moe_tensor_manifest("router.weight", router),
+            tch_moe_tensor_manifest("experts.up.weight", expert_up),
+            tch_moe_tensor_manifest("experts.down.weight", expert_down),
+        ],
+        optimizer_slots: vec![
+            tch_moe_tensor_manifest("router.weight.adam_m", &state.router_m),
+            tch_moe_tensor_manifest("router.weight.adam_v", &state.router_v),
+            tch_moe_tensor_manifest("experts.up.weight.adam_m", &state.expert_up_m),
+            tch_moe_tensor_manifest("experts.up.weight.adam_v", &state.expert_up_v),
+            tch_moe_tensor_manifest("experts.down.weight.adam_m", &state.expert_down_m),
+            tch_moe_tensor_manifest("experts.down.weight.adam_v", &state.expert_down_v),
+        ],
+        optimizer_step_tensor: tch_moe_tensor_manifest("optimizer.step", &optimizer_step),
+    };
+    fs::write(
+        manifest_path,
+        serde_json::to_string_pretty(&manifest)? + "\n",
+    )
+    .with_context(|| format!("failed to write {}", manifest_path.display()))
 }
 
 fn read_tch_moe_checkpoint(model_path: &Path, device: Device) -> Result<TchMoeCheckpoint> {
@@ -1007,6 +1056,18 @@ fn read_tch_moe_checkpoint(model_path: &Path, device: Device) -> Result<TchMoeCh
             step,
         },
     })
+}
+
+fn tch_moe_manifest_path(model_path: &Path) -> PathBuf {
+    PathBuf::from(format!("{}.json", model_path.display()))
+}
+
+fn tch_moe_tensor_manifest(name: &str, tensor: &Tensor) -> TchMoeTensorManifest {
+    TchMoeTensorManifest {
+        name: name.to_string(),
+        shape: tensor.size(),
+        dtype: format!("{:?}", tensor.kind()),
+    }
 }
 
 fn tensor_from_map<'a>(tensors: &'a BTreeMap<String, Tensor>, name: &str) -> Result<&'a Tensor> {

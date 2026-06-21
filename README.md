@@ -188,6 +188,8 @@ Ray GPU worker. A CUDA `tch-rs` autograd MoE smoke is also available through
 that router and expert tensors receive gradients, the task loss decreases,
 activated parameters remain below total parameters, and model plus AdamW
 optimizer safetensors reload reproduces the next train step on a Ray GPU worker.
+It also writes a `rustrain.tch_moe.v1` manifest covering model tensor shapes,
+AdamW slot names, checkpoint paths, and completed step metadata.
 Expert-parallel coverage is still toy-sized, but it now has three real
 launcher-backed two-rank paths: `parallel-ep-rank-smoke` verifies rank-local
 expert ownership and token coverage, `parallel-ep-nccl-rank-smoke` builds

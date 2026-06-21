@@ -65,6 +65,39 @@ Acceptance:
   contains dataset metadata; legacy manifests without provenance remain
   loadable.
 
+### Single-GPU `tch-rs` MoE Smoke Checkpoints
+
+The CUDA `tch-moe-smoke` path writes a tiny single-process MoE checkpoint as
+checkpoint-contract evidence for autograd parameters and AdamW state. It is not
+a production expert-parallel checkpoint format.
+
+Files:
+
+- `<name>.safetensors`: router and expert model tensors.
+- `<name>.optimizer.safetensors`: AdamW first and second moments plus
+  `optimizer.step`.
+- `<name>.safetensors.json`: manifest.
+
+The manifest must record:
+
+- `format = "rustrain.tch_moe.v1"`.
+- `global_step`: completed AdamW step count.
+- `model_safetensors` and `optimizer_safetensors` paths.
+- Model tensor entries for `router.weight`, `experts.up.weight`, and
+  `experts.down.weight`, including shape and dtype.
+- AdamW slot entries for each model tensor's `adam_m` and `adam_v` state,
+  including shape and dtype.
+- `optimizer_step_tensor` metadata for the stored scalar step tensor.
+
+Acceptance:
+
+- Model and optimizer safetensors exist and are non-empty.
+- The manifest paths match the written safetensors files.
+- Manifest tensor names, AdamW slot names, shapes, dtypes, and `global_step`
+  match the smoke summary.
+- Reloading model tensors plus optimizer slots reproduces post-train loss and
+  the next AdamW step within tolerance.
+
 ## Distributed Checkpoint Semantics
 
 ### Rank0 Replicated DP Checkpoints
