@@ -30,6 +30,9 @@ remote_run_2gpu bash scripts/verify_ep_nccl_worker.sh
 remote_run_2gpu bash scripts/verify_ep_sparse_worker.sh
 remote_run_2gpu bash scripts/verify_ep_tch_moe_worker.sh
 remote_run_2gpu bash scripts/verify_tch_moe_ep2_trainer_worker.sh
+remote_run_2gpu env \
+  RUSTRAIN_LAUNCH_TIMEOUT_SECS=900 \
+  bash scripts/verify_tch_moe_ep2_resume_worker.sh
 remote_run_2gpu bash scripts/verify_qwen_session_tp2_worker.sh
 remote_run_2gpu env \
   RUSTRAIN_LAUNCH_TIMEOUT_SECS=900 \

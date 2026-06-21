@@ -221,9 +221,11 @@ EP now also has a focused trainer-entry config, `configs/tch_moe_ep2.toml`,
 which runs the same two-rank path through `train --config` and writes a shared
 `rustrain.ep_sharded.v1` global manifest that embeds the two rank manifests,
 the EP topology, global step, consumed sample/token counts, dtype, optimizer,
-and scheduler metadata. Full production EP is still open: autograd-aware sparse
-collectives, trainer-owned production MoE integration, and full expert
-optimizer/checkpoint ownership are not implemented.
+and scheduler metadata. A second trainer launch can pass that manifest through
+`--resume-from` to restore the focused rank-owned expert model/AdamW shards and
+verify reload plus next-step parity. Full production EP is still open:
+autograd-aware sparse collectives, trainer-owned production MoE integration,
+and full expert optimizer/checkpoint ownership are not implemented.
 Full production Qwen trainer ownership, full real data streaming, and
 production-grade sharded checkpoint ownership remain open.
 

@@ -491,7 +491,10 @@ pub fn train(config_path: &Path, resume_from: Option<PathBuf>) -> Result<()> {
             .map(PathBuf::from)
             .unwrap_or_else(|_| run_paths.root.clone())
             .join("ep-tch-moe-ranks");
-        run_expert_parallel_tch_moe_rank_smoke(rank_output_dir.clone())?;
+        run_expert_parallel_tch_moe_rank_smoke(
+            rank_output_dir.clone(),
+            config.train.resume_from.as_deref(),
+        )?;
         info!(rank_output_dir = %rank_output_dir.display(), "tch MoE EP trainer-entry smoke complete");
         println!("rustrain tch MoE EP trainer-entry complete");
         println!("run_dir: {}", run_paths.root.display());

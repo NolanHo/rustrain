@@ -175,7 +175,11 @@ shared `rustrain.ep_sharded.v1` global manifest. The global manifest is marked
 with `manifest_kind = "global"` and embeds the two rank manifests plus the EP
 parallel topology, global step, consumed sample/token counts, dtype, optimizer,
 and scheduler metadata. Rank manifests are marked with `manifest_kind = "rank"`;
-the field defaults to `rank` for backward-compatible readers.
+the field defaults to `rank` for backward-compatible readers. The focused
+trainer-entry EP path also accepts that global manifest through `--resume-from`
+and restores each rank's owned expert MLP shards plus AdamW slots to verify
+reload and next-step parity. This remains focused checkpoint-contract evidence,
+not a production MoE trainer checkpoint.
 
 Required manifest structure:
 

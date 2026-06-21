@@ -147,6 +147,8 @@ struct ExpertParallelTchMoeRankSummary {
     rank: usize,
     world_size: usize,
     local_rank: usize,
+    resume_from: Option<String>,
+    resumed_sharded_checkpoint: bool,
     source_token_indices: Vec<usize>,
     owned_expert_start: usize,
     owned_expert_end: usize,
@@ -183,6 +185,20 @@ struct ExpertParallelTchMoeRankSummary {
     second_step_expert_down_max_abs: f64,
     second_step_optimizer_max_abs: f64,
     second_step_optimizer_step_delta: i64,
+    resume_global_step: Option<u64>,
+    resume_rank_manifest_output: Option<String>,
+    resume_model_safetensors: Option<String>,
+    resume_optimizer_safetensors: Option<String>,
+    resume_sharded_manifest_tensor_count: Option<usize>,
+    resume_reload_expert_up_max_abs: Option<f64>,
+    resume_reload_expert_down_max_abs: Option<f64>,
+    resume_reload_optimizer_max_abs: Option<f64>,
+    resume_reload_loss_delta: Option<f64>,
+    resume_next_step_delta: Option<f64>,
+    resume_next_step_expert_up_max_abs: Option<f64>,
+    resume_next_step_expert_down_max_abs: Option<f64>,
+    resume_next_step_optimizer_max_abs: Option<f64>,
+    resume_next_step_optimizer_step_delta: Option<i64>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -386,6 +402,17 @@ struct ExpertParallelCheckpointShard {
     shard_shape: Vec<i64>,
     dtype: String,
     partition: String,
+}
+
+struct ExpertParallelTchMoeExternalResume {
+    global_step: u64,
+    rank_manifest_output: String,
+    model_safetensors: String,
+    optimizer_safetensors: String,
+    sharded_manifest_tensor_count: usize,
+    expert_up: Tensor,
+    expert_down: Tensor,
+    state: ExpertParallelTchMoeAdamState,
 }
 
 struct ExpertParallelAdamConfig {
@@ -1225,7 +1252,10 @@ pub fn run_expert_parallel_sparse_rank_smoke(output_dir: PathBuf) -> Result<()> 
     Ok(())
 }
 
-pub fn run_expert_parallel_tch_moe_rank_smoke(output_dir: PathBuf) -> Result<()> {
+pub fn run_expert_parallel_tch_moe_rank_smoke(
+    output_dir: PathBuf,
+    resume_from: Option<&Path>,
+) -> Result<()> {
     let rank = parse_launcher_usize_env("RANK")?;
     let local_rank = parse_launcher_usize_env("LOCAL_RANK")?;
     let world_size = parse_launcher_usize_env("WORLD_SIZE")?;
@@ -1435,10 +1465,110 @@ pub fn run_expert_parallel_tch_moe_rank_smoke(output_dir: PathBuf) -> Result<()>
         );
     }
 
+    let external_resume = resume_from
+        .map(|resume_from| {
+            let resumed =
+                read_ep_tch_moe_rank_from_global_manifest(resume_from, rank, world_size)?;
+            let resume_up = resumed.expert_up.to_device(device);
+            let resume_down = resumed.expert_down.to_device(device);
+            let resume_state = ExpertParallelTchMoeAdamState {
+                up_m: resumed.state.up_m.to_device(device),
+                up_v: resumed.state.up_v.to_device(device),
+                down_m: resumed.state.down_m.to_device(device),
+                down_v: resumed.state.down_v.to_device(device),
+                step: resumed.state.step,
+            };
+            let resume_reload_expert_up_max_abs =
+                tensor_max_abs_diff(&resume_up, &first_step.updated_expert_up)?;
+            let resume_reload_expert_down_max_abs =
+                tensor_max_abs_diff(&resume_down, &first_step.updated_expert_down)?;
+            let resume_reload_optimizer_max_abs =
+                ep_tch_moe_adam_state_max_abs_diff(&resume_state, &first_step.updated_state)?;
+            let resume_forward = ep_tch_moe_sparse_forward(
+                &output_dir,
+                "ep-tch-moe-external-resume-forward",
+                rank,
+                world_size,
+                &tokens,
+                &assignments,
+                owned_expert_start,
+                owned_expert_end,
+                &resume_up,
+                &resume_down,
+            )?;
+            let resume_reload_loss = (&resume_forward.assembled_output - &target_rows)
+                .square()
+                .mean(Kind::Float)
+                .double_value(&[]);
+            let resume_reload_loss_delta = (resume_reload_loss - train_final_loss).abs();
+            let external_resumed_second = ep_tch_moe_adam_step(
+                &output_dir,
+                "ep-tch-moe-external-resume-second",
+                rank,
+                world_size,
+                &tokens,
+                &assignments,
+                owned_expert_start,
+                owned_expert_end,
+                &resume_up,
+                &resume_down,
+                &resume_state,
+                &target_rows,
+                &adam,
+                None,
+            )?;
+            let resume_next_step_delta =
+                (continuous_second.initial_loss - external_resumed_second.initial_loss).abs();
+            let resume_next_step_expert_up_max_abs = tensor_max_abs_diff(
+                &continuous_second.updated_expert_up,
+                &external_resumed_second.updated_expert_up,
+            )?;
+            let resume_next_step_expert_down_max_abs = tensor_max_abs_diff(
+                &continuous_second.updated_expert_down,
+                &external_resumed_second.updated_expert_down,
+            )?;
+            let resume_next_step_optimizer_max_abs = ep_tch_moe_adam_state_max_abs_diff(
+                &continuous_second.updated_state,
+                &external_resumed_second.updated_state,
+            )?;
+            let resume_next_step_optimizer_step_delta = (continuous_second.updated_state.step
+                - external_resumed_second.updated_state.step)
+                .abs();
+            if resume_reload_expert_up_max_abs > 1e-7
+                || resume_reload_expert_down_max_abs > 1e-7
+                || resume_reload_optimizer_max_abs > 1e-7
+                || resume_reload_loss_delta > 1e-7
+                || resume_next_step_delta > 1e-7
+                || resume_next_step_expert_up_max_abs > 1e-7
+                || resume_next_step_expert_down_max_abs > 1e-7
+                || resume_next_step_optimizer_max_abs > 1e-7
+                || resume_next_step_optimizer_step_delta != 0
+            {
+                bail!(
+                    "EP tch MoE external resume parity failed on rank {rank}: reload_up={resume_reload_expert_up_max_abs}, reload_down={resume_reload_expert_down_max_abs}, reload_optimizer={resume_reload_optimizer_max_abs}, reload_loss_delta={resume_reload_loss_delta}, next_loss_delta={resume_next_step_delta}, next_up_delta={resume_next_step_expert_up_max_abs}, next_down_delta={resume_next_step_expert_down_max_abs}, next_optimizer_delta={resume_next_step_optimizer_max_abs}, next_step_delta={resume_next_step_optimizer_step_delta}"
+                );
+            }
+            Ok::<_, anyhow::Error>((
+                resumed,
+                resume_reload_expert_up_max_abs,
+                resume_reload_expert_down_max_abs,
+                resume_reload_optimizer_max_abs,
+                resume_reload_loss_delta,
+                resume_next_step_delta,
+                resume_next_step_expert_up_max_abs,
+                resume_next_step_expert_down_max_abs,
+                resume_next_step_optimizer_max_abs,
+                resume_next_step_optimizer_step_delta,
+            ))
+        })
+        .transpose()?;
+
     let summary = ExpertParallelTchMoeRankSummary {
         rank,
         world_size,
         local_rank,
+        resume_from: resume_from.map(|path| path.display().to_string()),
+        resumed_sharded_checkpoint: external_resume.is_some(),
         source_token_indices: forward.source_token_indices,
         owned_expert_start,
         owned_expert_end,
@@ -1475,6 +1605,44 @@ pub fn run_expert_parallel_tch_moe_rank_smoke(output_dir: PathBuf) -> Result<()>
         second_step_expert_down_max_abs,
         second_step_optimizer_max_abs,
         second_step_optimizer_step_delta,
+        resume_global_step: external_resume
+            .as_ref()
+            .map(|(resume, ..)| resume.global_step),
+        resume_rank_manifest_output: external_resume
+            .as_ref()
+            .map(|(resume, ..)| resume.rank_manifest_output.clone()),
+        resume_model_safetensors: external_resume
+            .as_ref()
+            .map(|(resume, ..)| resume.model_safetensors.clone()),
+        resume_optimizer_safetensors: external_resume
+            .as_ref()
+            .map(|(resume, ..)| resume.optimizer_safetensors.clone()),
+        resume_sharded_manifest_tensor_count: external_resume
+            .as_ref()
+            .map(|(resume, ..)| resume.sharded_manifest_tensor_count),
+        resume_reload_expert_up_max_abs: external_resume.as_ref().map(|(_, value, ..)| *value),
+        resume_reload_expert_down_max_abs: external_resume.as_ref().map(|(_, _, value, ..)| *value),
+        resume_reload_optimizer_max_abs: external_resume
+            .as_ref()
+            .map(|(_, _, _, value, ..)| *value),
+        resume_reload_loss_delta: external_resume
+            .as_ref()
+            .map(|(_, _, _, _, value, ..)| *value),
+        resume_next_step_delta: external_resume
+            .as_ref()
+            .map(|(_, _, _, _, _, value, ..)| *value),
+        resume_next_step_expert_up_max_abs: external_resume
+            .as_ref()
+            .map(|(_, _, _, _, _, _, value, ..)| *value),
+        resume_next_step_expert_down_max_abs: external_resume
+            .as_ref()
+            .map(|(_, _, _, _, _, _, _, value, ..)| *value),
+        resume_next_step_optimizer_max_abs: external_resume
+            .as_ref()
+            .map(|(_, _, _, _, _, _, _, _, value, ..)| *value),
+        resume_next_step_optimizer_step_delta: external_resume
+            .as_ref()
+            .map(|(_, _, _, _, _, _, _, _, _, value)| *value),
     };
     let summary_path = output_dir.join(format!("ep-tch-moe-rank-{rank}.json"));
     fs::write(
@@ -2951,6 +3119,103 @@ fn write_ep_tch_moe_global_checkpoint_manifest(
             .with_context(|| format!("failed to parse {}", global_manifest_output.display()))?;
     global_manifest.validate()?;
     Ok(global_manifest_output)
+}
+
+fn read_ep_tch_moe_rank_from_global_manifest(
+    resume_from: &Path,
+    rank: usize,
+    world_size: usize,
+) -> Result<ExpertParallelTchMoeExternalResume> {
+    let text = fs::read_to_string(resume_from)
+        .with_context(|| format!("failed to read {}", resume_from.display()))?;
+    let manifest: ExpertParallelGlobalCheckpointManifest = serde_json::from_str(&text)
+        .with_context(|| format!("failed to parse {}", resume_from.display()))?;
+    manifest.validate()?;
+    if manifest.parallel.expert_model_parallel_size != world_size {
+        bail!(
+            "EP tch MoE resume expert_model_parallel_size {} does not match WORLD_SIZE {world_size}",
+            manifest.parallel.expert_model_parallel_size
+        );
+    }
+    if manifest.parallel.data_parallel_size != 1
+        || manifest.parallel.tensor_model_parallel_size != 1
+        || manifest.parallel.pipeline_model_parallel_size != 1
+        || manifest.parallel.context_parallel_size != 1
+    {
+        bail!(
+            "EP tch MoE resume expects only expert parallelism, got DP={} TP={} PP={} CP={}",
+            manifest.parallel.data_parallel_size,
+            manifest.parallel.tensor_model_parallel_size,
+            manifest.parallel.pipeline_model_parallel_size,
+            manifest.parallel.context_parallel_size
+        );
+    }
+    let rank_manifest = manifest
+        .ranks
+        .iter()
+        .find(|rank_manifest| rank_manifest.rank == rank)
+        .ok_or_else(|| anyhow!("EP tch MoE resume manifest is missing rank {rank}"))?;
+    if rank_manifest.local_rank != rank {
+        bail!(
+            "EP tch MoE resume expected local_rank {rank}, got {}",
+            rank_manifest.local_rank
+        );
+    }
+    if rank_manifest.shards.len() != 2 {
+        bail!(
+            "EP tch MoE resume expected two expert MLP shards, got {}",
+            rank_manifest.shards.len()
+        );
+    }
+    let up_shard = rank_manifest
+        .shards
+        .iter()
+        .find(|shard| shard.shard_name == "experts.up.weight")
+        .ok_or_else(|| anyhow!("EP tch MoE resume missing experts.up.weight shard"))?;
+    let down_shard = rank_manifest
+        .shards
+        .iter()
+        .find(|shard| shard.shard_name == "experts.down.weight")
+        .ok_or_else(|| anyhow!("EP tch MoE resume missing experts.down.weight shard"))?;
+    let model_tensors = read_tensor_map(Path::new(&rank_manifest.model_safetensors))?;
+    let optimizer_tensors = read_tensor_map(Path::new(&rank_manifest.optimizer_safetensors))?;
+    let expert_up = tensor_from_map(&model_tensors, &up_shard.shard_name)?.shallow_clone();
+    let expert_down = tensor_from_map(&model_tensors, &down_shard.shard_name)?.shallow_clone();
+    let up_m = tensor_from_map(&optimizer_tensors, &up_shard.optimizer_m_name)?.shallow_clone();
+    let up_v = tensor_from_map(&optimizer_tensors, &up_shard.optimizer_v_name)?.shallow_clone();
+    let down_m = tensor_from_map(&optimizer_tensors, &down_shard.optimizer_m_name)?.shallow_clone();
+    let down_v = tensor_from_map(&optimizer_tensors, &down_shard.optimizer_v_name)?.shallow_clone();
+    if expert_up.size() != up_shard.shard_shape
+        || up_m.size() != up_shard.shard_shape
+        || up_v.size() != up_shard.shard_shape
+        || expert_down.size() != down_shard.shard_shape
+        || down_m.size() != down_shard.shard_shape
+        || down_v.size() != down_shard.shard_shape
+    {
+        bail!(
+            "EP tch MoE resume shard shape mismatch: up={:?}/{:?}, down={:?}/{:?}",
+            expert_up.size(),
+            up_shard.shard_shape,
+            expert_down.size(),
+            down_shard.shard_shape
+        );
+    }
+    Ok(ExpertParallelTchMoeExternalResume {
+        global_step: manifest.global_step,
+        rank_manifest_output: resume_from.display().to_string(),
+        model_safetensors: rank_manifest.model_safetensors.clone(),
+        optimizer_safetensors: rank_manifest.optimizer_safetensors.clone(),
+        sharded_manifest_tensor_count: rank_manifest.shards.len(),
+        expert_up,
+        expert_down,
+        state: ExpertParallelTchMoeAdamState {
+            up_m,
+            up_v,
+            down_m,
+            down_v,
+            step: rank_manifest.global_step as i64,
+        },
+    })
 }
 
 fn read_ep_tch_moe_rank_checkpoint(

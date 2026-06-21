@@ -600,7 +600,7 @@ fn main() -> Result<()> {
             distributed_smoke::run_expert_parallel_sparse_rank_smoke(output_dir)
         }
         Command::ParallelEpTchMoeRankSmoke { output_dir } => {
-            distributed_smoke::run_expert_parallel_tch_moe_rank_smoke(output_dir)
+            distributed_smoke::run_expert_parallel_tch_moe_rank_smoke(output_dir, None)
         }
         Command::PrintLaunchEnv => launcher::print_launch_env(),
         Command::NcclAllReduceRankSmoke { output_dir } => {
