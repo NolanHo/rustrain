@@ -95,28 +95,7 @@ pub fn load_text_dataset(
     cache_dir: &Path,
 ) -> Result<TokenizedDataset> {
     let tokenizer = ByteTokenizer::new(vocab_size);
-    let mut text = String::new();
-    let mut source_paths = Vec::new();
-
-    for path in &data.paths {
-        if path.is_dir() {
-            for file in sorted_files(path)? {
-                text.push_str(
-                    &fs::read_to_string(&file)
-                        .with_context(|| format!("failed to read {}", file.display()))?,
-                );
-                text.push('\n');
-                source_paths.push(file);
-            }
-        } else {
-            text.push_str(
-                &fs::read_to_string(path)
-                    .with_context(|| format!("failed to read {}", path.display()))?,
-            );
-            text.push('\n');
-            source_paths.push(path.clone());
-        }
-    }
+    let (text, mut source_paths) = read_text_paths(&data.paths)?;
 
     let tokens = tokenizer.encode(&text);
     if tokens.len() < seq_len * 2 {
@@ -127,10 +106,30 @@ pub fn load_text_dataset(
         ));
     }
 
-    let split_at = ((tokens.len() as f32) * data.train_split).floor() as usize;
-    let split_at = split_at.clamp(seq_len, tokens.len() - seq_len);
-    let train_tokens = tokens[..split_at].to_vec();
-    let eval_tokens = tokens[split_at..].to_vec();
+    let (train_tokens, eval_tokens) = if data.eval_paths.is_empty() {
+        let split_at = ((tokens.len() as f32) * data.train_split).floor() as usize;
+        let split_at = split_at.clamp(seq_len, tokens.len() - seq_len);
+        (tokens[..split_at].to_vec(), tokens[split_at..].to_vec())
+    } else {
+        let (eval_text, eval_source_paths) = read_text_paths(&data.eval_paths)?;
+        source_paths.extend(eval_source_paths);
+        let eval_tokens = tokenizer.encode(&eval_text);
+        if eval_tokens.len() < seq_len {
+            return Err(anyhow!(
+                "text eval dataset needs at least {} tokens, got {}",
+                seq_len,
+                eval_tokens.len()
+            ));
+        }
+        if tokens.len() < seq_len {
+            return Err(anyhow!(
+                "text train dataset needs at least {} tokens, got {}",
+                seq_len,
+                tokens.len()
+            ));
+        }
+        (tokens, eval_tokens)
+    };
     let train_sequences = pack_sequences(&train_tokens, seq_len);
     let eval_sequences = pack_sequences(&eval_tokens, seq_len);
 
@@ -154,35 +153,7 @@ pub fn load_sft_dataset(
     cache_dir: &Path,
 ) -> Result<SftDataset> {
     let tokenizer = ByteTokenizer::new(vocab_size);
-    let mut samples = Vec::new();
-    let mut source_paths = Vec::new();
-
-    for path in &data.paths {
-        let files = if path.is_dir() {
-            sorted_files(path)?
-        } else {
-            vec![path.clone()]
-        };
-
-        for file in files {
-            let contents = fs::read_to_string(&file)
-                .with_context(|| format!("failed to read {}", file.display()))?;
-            for (line_index, line) in contents.lines().enumerate() {
-                if line.trim().is_empty() {
-                    continue;
-                }
-                let record: InstructionRecord = serde_json::from_str(line).with_context(|| {
-                    format!(
-                        "failed to parse JSONL record {}:{}",
-                        file.display(),
-                        line_index + 1
-                    )
-                })?;
-                samples.push(format_sft_sample(&tokenizer, seq_len, &record)?);
-            }
-            source_paths.push(file);
-        }
-    }
+    let (mut samples, mut source_paths) = read_sft_paths(&data.paths, &tokenizer, seq_len)?;
 
     if samples.len() < 2 {
         return Err(anyhow!("SFT dataset needs at least two samples"));
@@ -196,10 +167,19 @@ pub fn load_sft_dataset(
         }
     }
 
-    let split_at = ((samples.len() as f32) * data.train_split).floor() as usize;
-    let split_at = split_at.clamp(1, samples.len() - 1);
-    let train_samples = samples[..split_at].to_vec();
-    let eval_samples = samples[split_at..].to_vec();
+    let (train_samples, eval_samples) = if data.eval_paths.is_empty() {
+        let split_at = ((samples.len() as f32) * data.train_split).floor() as usize;
+        let split_at = split_at.clamp(1, samples.len() - 1);
+        (samples[..split_at].to_vec(), samples[split_at..].to_vec())
+    } else {
+        let (eval_samples, eval_source_paths) =
+            read_sft_paths(&data.eval_paths, &tokenizer, seq_len)?;
+        if eval_samples.is_empty() {
+            return Err(anyhow!("SFT eval dataset needs at least one sample"));
+        }
+        source_paths.extend(eval_source_paths);
+        (samples, eval_samples)
+    };
     let dataset = SftDataset {
         tokenizer,
         train_samples,
@@ -265,6 +245,67 @@ fn pack_sequences(tokens: &[usize], seq_len: usize) -> Vec<Vec<usize>> {
         .step_by(seq_len)
         .map(|window| window.to_vec())
         .collect()
+}
+
+fn read_text_paths(paths: &[PathBuf]) -> Result<(String, Vec<PathBuf>)> {
+    let mut text = String::new();
+    let mut source_paths = Vec::new();
+    for path in paths {
+        if path.is_dir() {
+            for file in sorted_files(path)? {
+                text.push_str(
+                    &fs::read_to_string(&file)
+                        .with_context(|| format!("failed to read {}", file.display()))?,
+                );
+                text.push('\n');
+                source_paths.push(file);
+            }
+        } else {
+            text.push_str(
+                &fs::read_to_string(path)
+                    .with_context(|| format!("failed to read {}", path.display()))?,
+            );
+            text.push('\n');
+            source_paths.push(path.clone());
+        }
+    }
+    Ok((text, source_paths))
+}
+
+fn read_sft_paths(
+    paths: &[PathBuf],
+    tokenizer: &ByteTokenizer,
+    seq_len: usize,
+) -> Result<(Vec<SftSample>, Vec<PathBuf>)> {
+    let mut samples = Vec::new();
+    let mut source_paths = Vec::new();
+    for path in paths {
+        let files = if path.is_dir() {
+            sorted_files(path)?
+        } else {
+            vec![path.clone()]
+        };
+
+        for file in files {
+            let contents = fs::read_to_string(&file)
+                .with_context(|| format!("failed to read {}", file.display()))?;
+            for (line_index, line) in contents.lines().enumerate() {
+                if line.trim().is_empty() {
+                    continue;
+                }
+                let record: InstructionRecord = serde_json::from_str(line).with_context(|| {
+                    format!(
+                        "failed to parse JSONL record {}:{}",
+                        file.display(),
+                        line_index + 1
+                    )
+                })?;
+                samples.push(format_sft_sample(tokenizer, seq_len, &record)?);
+            }
+            source_paths.push(file);
+        }
+    }
+    Ok((samples, source_paths))
 }
 
 fn sorted_files(path: &Path) -> Result<Vec<PathBuf>> {
@@ -365,6 +406,48 @@ mod tests {
     }
 
     #[test]
+    fn text_dataset_uses_explicit_eval_paths() {
+        let dir = tempdir().expect("temp dir should be created");
+        let train_dir = dir.path().join("train");
+        let eval_dir = dir.path().join("eval");
+        let cache_dir = dir.path().join("cache");
+        fs::create_dir_all(&train_dir).expect("train dir should be created");
+        fs::create_dir_all(&eval_dir).expect("eval dir should be created");
+        fs::create_dir_all(&cache_dir).expect("cache dir should be created");
+        fs::write(
+            train_dir.join("train.txt"),
+            "aaaaaaaa bbbbbbbb cccccccc dddddddd eeeeeeee\n",
+        )
+        .expect("train file should write");
+        fs::write(eval_dir.join("eval.txt"), "zzzzzzzz yyyyyyyy xxxxxxxx\n")
+            .expect("eval file should write");
+
+        let data = DataConfig {
+            kind: DataKind::Text,
+            paths: vec![train_dir],
+            eval_paths: vec![eval_dir],
+            train_split: 0.5,
+            max_samples: None,
+            shuffle: true,
+        };
+        let dataset = load_text_dataset(&data, 128, 8, &cache_dir).expect("dataset should load");
+
+        assert!(
+            dataset
+                .tokenizer
+                .decode_lossy(&dataset.train_sequences[0])
+                .contains("a")
+        );
+        assert!(
+            dataset
+                .tokenizer
+                .decode_lossy(&dataset.eval_sequences[0])
+                .contains("z")
+        );
+        assert!(cache_dir.join("tokenized.toml").exists());
+    }
+
+    #[test]
     fn sft_dataset_builds_response_only_masks_and_cache() {
         let dir = tempdir().expect("temp dir should be created");
         let data_dir = dir.path().join("sft");
@@ -409,6 +492,42 @@ mod tests {
             .filter(|enabled| **enabled)
             .count();
         assert!(response_targets > 2);
+        assert!(cache_dir.join("sft_tokenized.toml").exists());
+    }
+
+    #[test]
+    fn sft_dataset_uses_explicit_eval_paths() {
+        let dir = tempdir().expect("temp dir should be created");
+        let train_dir = dir.path().join("train_sft");
+        let eval_dir = dir.path().join("eval_sft");
+        let cache_dir = dir.path().join("cache");
+        fs::create_dir_all(&train_dir).expect("train SFT dir should be created");
+        fs::create_dir_all(&eval_dir).expect("eval SFT dir should be created");
+        fs::create_dir_all(&cache_dir).expect("cache dir should be created");
+        fs::write(
+            train_dir.join("train.jsonl"),
+            "{\"instruction\":\"train one\",\"response\":\"alpha\"}\n{\"instruction\":\"train two\",\"response\":\"beta\"}\n{\"instruction\":\"train three\",\"response\":\"gamma\"}\n",
+        )
+        .expect("train jsonl should write");
+        fs::write(
+            eval_dir.join("eval.jsonl"),
+            "{\"instruction\":\"eval one\",\"response\":\"delta\"}\n",
+        )
+        .expect("eval jsonl should write");
+
+        let data = DataConfig {
+            kind: DataKind::InstructionJsonl,
+            paths: vec![train_dir],
+            eval_paths: vec![eval_dir],
+            train_split: 0.34,
+            max_samples: None,
+            shuffle: true,
+        };
+        let dataset =
+            load_sft_dataset(&data, 128, 64, &cache_dir).expect("SFT dataset should load");
+
+        assert_eq!(dataset.train_samples.len(), 3);
+        assert_eq!(dataset.eval_samples.len(), 1);
         assert!(cache_dir.join("sft_tokenized.toml").exists());
     }
 
