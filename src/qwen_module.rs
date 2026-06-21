@@ -171,6 +171,8 @@ struct QwenSessionTpRankSummary {
     sharded_rank_manifest_output: String,
     sharded_global_manifest_output: String,
     sharded_manifest_tensor_count: usize,
+    sharded_restore_max_abs: f64,
+    sharded_restore_mean_abs: f64,
     mlp_intermediate_start: i64,
     mlp_intermediate_end: i64,
     mlp_activation_shard_shape: Vec<i64>,
@@ -5667,6 +5669,41 @@ fn qwen_session_tp_rank_smoke(
         &down_proj_full,
         config,
     )?;
+    let sharded_restore_diff = qwen_session_tp_focused_sharded_restore_diff(
+        &sharded_global_manifest_output,
+        rank,
+        &layer0_input,
+        &full_layer0,
+        &q_bias_full.narrow(0, q_output_start, q_output_size),
+        &k_bias_full.narrow(0, kv_output_start, kv_output_size),
+        &v_bias_full.narrow(0, kv_output_start, kv_output_size),
+        &runtime_config,
+        attention.q_heads_per_rank,
+        attention.kv_heads_per_rank,
+        &output_dir.join("layer0-sharded-restore"),
+        &[
+            ("model.layers.0.input_layernorm.weight", &input_norm_full),
+            (
+                "model.layers.0.post_attention_layernorm.weight",
+                &post_attention_norm_full,
+            ),
+            ("model.layers.0.self_attn.q_proj.weight", &q_shard_base),
+            ("model.layers.0.self_attn.k_proj.weight", &k_shard_base),
+            ("model.layers.0.self_attn.v_proj.weight", &v_shard_base),
+            ("model.layers.0.self_attn.o_proj.weight", &o_shard_base),
+            ("model.layers.0.mlp.gate_proj.weight", &gate_shard_base),
+            ("model.layers.0.mlp.up_proj.weight", &up_shard_base),
+            ("model.layers.0.mlp.down_proj.weight", &down_shard_base),
+        ],
+    )?;
+    if sharded_restore_diff.max_abs > 1e-3 {
+        bail!(
+            "Qwen session TP focused sharded restore parity failed: rank={}, max_abs={}, mean_abs={}",
+            rank,
+            sharded_restore_diff.max_abs,
+            sharded_restore_diff.mean_abs
+        );
+    }
 
     let summary = QwenSessionTpRankSummary {
         rank,
@@ -5701,6 +5738,8 @@ fn qwen_session_tp_rank_smoke(
         sharded_rank_manifest_output: sharded_rank_manifest_output.display().to_string(),
         sharded_global_manifest_output: sharded_global_manifest_output.display().to_string(),
         sharded_manifest_tensor_count,
+        sharded_restore_max_abs: sharded_restore_diff.max_abs,
+        sharded_restore_mean_abs: sharded_restore_diff.mean_abs,
         mlp_intermediate_start: intermediate_start,
         mlp_intermediate_end: intermediate_start + intermediate_shard_size,
         mlp_activation_shard_shape: activation_shard.size(),
@@ -6008,6 +6047,102 @@ fn write_qwen_session_tp_focused_sharded_manifest(
         .map(|entry| entry.shards.len())
         .ok_or_else(|| anyhow!("missing TP sharded rank manifest for rank {rank}"))?;
     Ok((rank_manifest_output, global_manifest_output, tensor_count))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn qwen_session_tp_focused_sharded_restore_diff(
+    global_manifest_output: &Path,
+    rank: usize,
+    layer0_input: &Tensor,
+    full_layer0: &Tensor,
+    q_bias_shard: &Tensor,
+    k_bias_shard: &Tensor,
+    v_bias_shard: &Tensor,
+    runtime_config: &QwenRuntimeConfig,
+    q_heads_per_rank: i64,
+    kv_heads_per_rank: i64,
+    reduce_dir: &Path,
+    expected_shards: &[(&str, &Tensor)],
+) -> Result<DiffStats> {
+    let global_text = fs::read_to_string(global_manifest_output)
+        .with_context(|| format!("failed to read {}", global_manifest_output.display()))?;
+    let global_manifest: QwenShardedCheckpointManifest = serde_json::from_str(&global_text)
+        .with_context(|| format!("failed to parse {}", global_manifest_output.display()))?;
+    global_manifest.validate()?;
+    let rank_manifest = global_manifest
+        .ranks
+        .iter()
+        .find(|entry| entry.rank == rank)
+        .ok_or_else(|| anyhow!("missing TP sharded rank manifest for rank {rank}"))?;
+    let shard_tensors = read_safetensors_map(Path::new(&rank_manifest.model_safetensors))?;
+    for (name, expected) in expected_shards {
+        let restored = tensor(&shard_tensors, name)?
+            .to_kind(Kind::Float)
+            .to_device(expected.device());
+        let diff = diff_stats(&restored, expected)?;
+        if diff.max_abs > 1e-7 {
+            bail!(
+                "Qwen session TP focused sharded restore roundtrip failed: rank={}, tensor={}, max_abs={}, mean_abs={}",
+                rank,
+                name,
+                diff.max_abs,
+                diff.mean_abs
+            );
+        }
+    }
+    let input_norm = tensor(&shard_tensors, "model.layers.0.input_layernorm.weight")?
+        .to_kind(Kind::Float)
+        .to_device(layer0_input.device());
+    let post_attention_norm = tensor(
+        &shard_tensors,
+        "model.layers.0.post_attention_layernorm.weight",
+    )?
+    .to_kind(Kind::Float)
+    .to_device(layer0_input.device());
+    let q_shard = tensor(&shard_tensors, "model.layers.0.self_attn.q_proj.weight")?
+        .to_kind(Kind::Float)
+        .to_device(layer0_input.device());
+    let k_shard = tensor(&shard_tensors, "model.layers.0.self_attn.k_proj.weight")?
+        .to_kind(Kind::Float)
+        .to_device(layer0_input.device());
+    let v_shard = tensor(&shard_tensors, "model.layers.0.self_attn.v_proj.weight")?
+        .to_kind(Kind::Float)
+        .to_device(layer0_input.device());
+    let o_shard = tensor(&shard_tensors, "model.layers.0.self_attn.o_proj.weight")?
+        .to_kind(Kind::Float)
+        .to_device(layer0_input.device());
+    let gate_shard = tensor(&shard_tensors, "model.layers.0.mlp.gate_proj.weight")?
+        .to_kind(Kind::Float)
+        .to_device(layer0_input.device());
+    let up_shard = tensor(&shard_tensors, "model.layers.0.mlp.up_proj.weight")?
+        .to_kind(Kind::Float)
+        .to_device(layer0_input.device());
+    let down_shard = tensor(&shard_tensors, "model.layers.0.mlp.down_proj.weight")?
+        .to_kind(Kind::Float)
+        .to_device(layer0_input.device());
+    let (_, _, restored_layer0) = qwen_session_tp_layer0_global_mse_loss_and_grad(
+        layer0_input,
+        &input_norm,
+        &post_attention_norm,
+        QwenTpAttentionShardWeights {
+            q_proj: &q_shard,
+            q_bias: q_bias_shard,
+            k_proj: &k_shard,
+            k_bias: k_bias_shard,
+            v_proj: &v_shard,
+            v_bias: v_bias_shard,
+            o_proj: &o_shard,
+        },
+        &gate_shard,
+        &up_shard,
+        &down_shard,
+        runtime_config,
+        q_heads_per_rank,
+        kv_heads_per_rank,
+        full_layer0,
+        reduce_dir,
+    )?;
+    diff_stats(&restored_layer0, full_layer0)
 }
 
 #[allow(clippy::too_many_arguments)]

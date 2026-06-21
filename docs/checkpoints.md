@@ -120,8 +120,11 @@ and verifies next-step resume parity against a continuous rank0-manifest run.
 The focused Qwen TP=2 layer0 smoke also writes rank-owned model shard files and
 a global `rustrain.qwen_sharded.v1` manifest for its layer0 attention/MLP tensor
 partitions. That TP manifest is checkpoint-contract evidence only: optimizer
-slots are zero smoke placeholders, and TP restore/next-step parity remains open.
-Full production sharded restore over external streaming real data remains open.
+slots are zero smoke placeholders. The same focused smoke restores each rank's
+model shards through the global manifest and verifies the fused layer0 output
+against the full layer0 reference within tolerance. TP next-step resume parity
+and full production sharded restore over external streaming real data remain
+open.
 
 Required manifest structure:
 
@@ -145,9 +148,11 @@ Minimum acceptance before calling production sharded checkpointing implemented:
 - A DP=2 or TP=2 Qwen training path writes distinct rank-owned shard files.
 - A fresh launched production run restores those shards without reading
   rank0-only model deltas as the source of truth. Representative DP session
-  smoke coverage exists; production run ownership remains open.
+  smoke coverage exists, and focused TP layer0 smoke coverage exists for
+  output restore parity; production run ownership remains open.
 - The restored production run reproduces loss before the next step within
-  tolerance. Done for the representative DP session smoke.
+  tolerance. Done for the representative DP session smoke; focused TP layer0
+  restore reproduces fused output parity, not a production loss resume.
 - The next step after restore matches a continuous run within tolerance. Done
   for the representative DP session smoke.
 - Manifest validation rejects missing rank shards, wrong world size, wrong

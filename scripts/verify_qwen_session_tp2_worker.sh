@@ -90,6 +90,8 @@ for path in summaries:
         raise SystemExit(f"{path} unexpected MLP reduced output shape {mlp_reduced}")
     if int(data["sharded_manifest_tensor_count"]) != 9:
         raise SystemExit(f"{path} expected 9 TP sharded manifest tensors, got {data['sharded_manifest_tensor_count']}")
+    if float(data["sharded_restore_max_abs"]) > 1e-3:
+        raise SystemExit(f"{path} sharded_restore_max_abs too large: {data['sharded_restore_max_abs']}")
     rank_manifest_path = pathlib.Path(data["sharded_rank_manifest_output"])
     if not rank_manifest_path.exists():
         raise SystemExit(f"{path} missing TP rank sharded manifest {rank_manifest_path}")
@@ -129,6 +131,8 @@ for path in summaries:
             "layer0_train_final_loss": data["layer0_train_final_loss"],
             "mlp_train_initial_loss": data["mlp_train_initial_loss"],
             "mlp_train_final_loss": data["mlp_train_final_loss"],
+            "sharded_restore_max_abs": data["sharded_restore_max_abs"],
+            "sharded_restore_mean_abs": data["sharded_restore_mean_abs"],
         }
     )
 
