@@ -14,12 +14,15 @@ REMOTE_FALLBACK_DIR="${RUSTRAIN_REMOTE_FALLBACK_DIR:-/root/rustrain}"
 REMOTE_PYTHON="${RUSTRAIN_REMOTE_PYTHON:-/opt/venv/bin/python}"
 RAY_NUM_GPUS="${RUSTRAIN_RAY_NUM_GPUS:-1}"
 SYNC_TO_WORKER="${RUSTRAIN_SYNC_TO_WORKER:-0}"
+SSH_OPTS="${RUSTRAIN_SSH_OPTS:-}"
 REMOTE_ARCHIVE=""
 NO_REMOTE_ARCHIVE="__RUSTRAIN_NO_ARCHIVE__"
 
+read -r -a SSH_OPT_ARGS <<<"${SSH_OPTS}"
+
 cleanup_remote_archive() {
   if [ -n "${REMOTE_ARCHIVE}" ]; then
-    ssh -p "${REMOTE_PORT}" "${REMOTE_HOST}" "rm -f '${REMOTE_ARCHIVE}'" >/dev/null 2>&1 || true
+    ssh "${SSH_OPT_ARGS[@]}" -p "${REMOTE_PORT}" "${REMOTE_HOST}" "rm -f '${REMOTE_ARCHIVE}'" >/dev/null 2>&1 || true
   fi
 }
 trap cleanup_remote_archive EXIT
@@ -31,13 +34,13 @@ if [ "${SYNC_TO_WORKER}" = "1" ]; then
     tar -rf "${LOCAL_ARCHIVE}" runs/parity/qwen_layer0_modules.safetensors
   fi
   REMOTE_ARCHIVE="/tmp/rustrain-gpu-run-${USER:-user}-$$.tar"
-  scp -P "${REMOTE_PORT}" "${LOCAL_ARCHIVE}" "${REMOTE_HOST}:${REMOTE_ARCHIVE}" >/dev/null
+  scp "${SSH_OPT_ARGS[@]}" -P "${REMOTE_PORT}" "${LOCAL_ARCHIVE}" "${REMOTE_HOST}:${REMOTE_ARCHIVE}" >/dev/null
   rm -f "${LOCAL_ARCHIVE}"
 fi
 
 REMOTE_ARCHIVE_ARG="${REMOTE_ARCHIVE:-${NO_REMOTE_ARCHIVE}}"
 
-ssh -p "${REMOTE_PORT}" "${REMOTE_HOST}" "${REMOTE_PYTHON}" - "${REMOTE_DIR}" "${REMOTE_FALLBACK_DIR}" "${RAY_NUM_GPUS}" "${REMOTE_ARCHIVE_ARG}" "$@" <<'PY'
+ssh "${SSH_OPT_ARGS[@]}" -p "${REMOTE_PORT}" "${REMOTE_HOST}" "${REMOTE_PYTHON}" - "${REMOTE_DIR}" "${REMOTE_FALLBACK_DIR}" "${RAY_NUM_GPUS}" "${REMOTE_ARCHIVE_ARG}" "$@" <<'PY'
 import ray
 import hashlib
 import io
