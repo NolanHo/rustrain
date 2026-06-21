@@ -187,6 +187,14 @@ pub fn load_sft_dataset(
     if samples.len() < 2 {
         return Err(anyhow!("SFT dataset needs at least two samples"));
     }
+    if let Some(max_samples) = data.max_samples {
+        samples.truncate(max_samples);
+        if samples.len() < 2 {
+            return Err(anyhow!(
+                "SFT dataset needs at least two samples after max_samples"
+            ));
+        }
+    }
 
     let split_at = ((samples.len() as f32) * data.train_split).floor() as usize;
     let split_at = split_at.clamp(1, samples.len() - 1);
@@ -344,6 +352,7 @@ mod tests {
             kind: DataKind::Text,
             paths: vec![data_dir],
             train_split: 0.75,
+            max_samples: None,
         };
         let dataset = load_text_dataset(&data, 64, 8, &cache_dir).expect("dataset should load");
 
@@ -371,6 +380,7 @@ mod tests {
             kind: DataKind::InstructionJsonl,
             paths: vec![data_dir],
             train_split: 0.5,
+            max_samples: None,
         };
         let dataset =
             load_sft_dataset(&data, 128, 64, &cache_dir).expect("SFT dataset should load");
@@ -396,5 +406,32 @@ mod tests {
             .count();
         assert!(response_targets > 2);
         assert!(cache_dir.join("sft_tokenized.toml").exists());
+    }
+
+    #[test]
+    fn sft_dataset_respects_max_samples_before_split() {
+        let dir = tempdir().expect("temp dir should be created");
+        let data_dir = dir.path().join("sft");
+        let cache_dir = dir.path().join("cache");
+        fs::create_dir_all(&data_dir).expect("sft dir should be created");
+        fs::create_dir_all(&cache_dir).expect("cache dir should be created");
+        let mut file = fs::File::create(data_dir.join("sample.jsonl")).expect("file should open");
+        writeln!(
+            file,
+            "{{\"instruction\":\"one\",\"response\":\"1\"}}\n{{\"instruction\":\"two\",\"response\":\"2\"}}\n{{\"instruction\":\"three\",\"response\":\"3\"}}\n{{\"instruction\":\"four\",\"response\":\"4\"}}"
+        )
+        .expect("file should write");
+
+        let data = DataConfig {
+            kind: DataKind::InstructionJsonl,
+            paths: vec![data_dir],
+            train_split: 0.5,
+            max_samples: Some(2),
+        };
+        let dataset =
+            load_sft_dataset(&data, 128, 64, &cache_dir).expect("SFT dataset should load");
+
+        assert_eq!(dataset.train_samples.len(), 1);
+        assert_eq!(dataset.eval_samples.len(), 1);
     }
 }

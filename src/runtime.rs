@@ -82,6 +82,8 @@ pub struct DataConfig {
     pub paths: Vec<PathBuf>,
     #[serde(default = "default_train_split")]
     pub train_split: f32,
+    #[serde(default)]
+    pub max_samples: Option<usize>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -358,6 +360,11 @@ pub fn validate_config(config: &Config) -> Result<()> {
         if !(0.0..1.0).contains(&data.train_split) {
             return Err(anyhow!("data.train_split must be in (0, 1)"));
         }
+        if matches!(data.max_samples, Some(0)) {
+            return Err(anyhow!(
+                "data.max_samples must be greater than zero when set"
+            ));
+        }
     }
 
     Ok(())
@@ -438,6 +445,20 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn data_max_samples_must_be_positive_when_set() {
+        let mut config = qwen_lora_sft_config();
+        config.data.as_mut().unwrap().max_samples = Some(0);
+
+        let error = validate_config(&config).expect_err("zero max_samples should fail");
+
+        assert!(
+            error
+                .to_string()
+                .contains("data.max_samples must be greater than zero")
+        );
+    }
+
     fn qwen_lora_sft_config() -> Config {
         Config {
             run: RunConfig {
@@ -485,6 +506,7 @@ mod tests {
                 kind: DataKind::InstructionJsonl,
                 paths: vec!["data/sft_toy/instructions.jsonl".into()],
                 train_split: 0.8,
+                max_samples: None,
             }),
             lora: Some(LoraConfig {
                 rank: 4,

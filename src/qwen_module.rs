@@ -1030,6 +1030,7 @@ struct QwenSftExample {
     instruction: String,
     input: String,
     response: String,
+    source_file: Option<String>,
 }
 
 struct QwenSftExampleSet {
@@ -1688,6 +1689,7 @@ pub fn qwen_lora_sft_smoke(
         checkpoint_dir,
         sft_paths.as_deref(),
         None,
+        None,
         sft_batch_size,
         instruction,
         response,
@@ -1758,6 +1760,7 @@ pub fn train_qwen_lora_sft_from_config(
         &adapter_output,
         &run_paths.checkpoints,
         Some(&data.paths),
+        data.max_samples,
         config.train.resume_from.as_deref(),
         config.train.micro_batch_size,
         "Reply with rustrain.",
@@ -1780,6 +1783,7 @@ fn qwen_lora_sft_train(
     adapter_output: &Path,
     checkpoint_dir: &Path,
     sft_paths: Option<&[PathBuf]>,
+    max_samples: Option<usize>,
     resume_from: Option<&Path>,
     sft_batch_size: usize,
     instruction: &str,
@@ -1813,7 +1817,7 @@ fn qwen_lora_sft_train(
     let tokenizer = Tokenizer::from_file(model_path.join("tokenizer.json"))
         .map_err(|error| anyhow!("failed to load tokenizer: {error}"))?;
     let dataset = if let Some(sft_paths) = sft_paths {
-        QwenSftDataset::from_jsonl_paths(&tokenizer, sft_paths)?
+        QwenSftDataset::from_jsonl_paths_with_limit(&tokenizer, sft_paths, max_samples)?
     } else {
         QwenSftDataset::from_instruction_pairs(
             &tokenizer,
@@ -1822,11 +1826,13 @@ fn qwen_lora_sft_train(
                     instruction: instruction.to_string(),
                     input: String::new(),
                     response: response.to_string(),
+                    source_file: None,
                 },
                 QwenSftExample {
                     instruction: "Name the project.".to_string(),
                     input: String::new(),
                     response: "rustrain".to_string(),
+                    source_file: None,
                 },
             ],
         )?
@@ -4909,8 +4915,12 @@ fn qwen_session_batch_plan_from_config(
     }
     let tokenizer = Tokenizer::from_file(model_path.join("tokenizer.json"))
         .map_err(|error| anyhow!("failed to load tokenizer: {error}"))?;
-    let dataset = QwenSftDataset::from_jsonl_paths(&tokenizer, &data_config.paths)?
-        .shuffle_by_seed(runtime_config.run.seed);
+    let dataset = QwenSftDataset::from_jsonl_paths_with_limit(
+        &tokenizer,
+        &data_config.paths,
+        data_config.max_samples,
+    )?
+    .shuffle_by_seed(runtime_config.run.seed);
     let dataset_summary = dataset.summary();
     let (train_dataset, eval_dataset) = dataset.train_eval_split(data_config.train_split)?;
     let batch_size = runtime_config
@@ -5014,8 +5024,12 @@ fn qwen_session_dp_batch_plan_from_config(
     }
     let tokenizer = Tokenizer::from_file(model_path.join("tokenizer.json"))
         .map_err(|error| anyhow!("failed to load tokenizer: {error}"))?;
-    let dataset = QwenSftDataset::from_jsonl_paths(&tokenizer, &data_config.paths)?
-        .shuffle_by_seed(runtime_config.run.seed);
+    let dataset = QwenSftDataset::from_jsonl_paths_with_limit(
+        &tokenizer,
+        &data_config.paths,
+        data_config.max_samples,
+    )?
+    .shuffle_by_seed(runtime_config.run.seed);
     let dataset_summary = dataset.summary();
     let (train_dataset, eval_dataset) = dataset.train_eval_split(data_config.train_split)?;
     let local_batch_size = runtime_config
@@ -6303,8 +6317,13 @@ impl QwenSftDataset {
         })
     }
 
-    fn from_jsonl_paths(tokenizer: &Tokenizer, paths: &[PathBuf]) -> Result<Self> {
+    fn from_jsonl_paths_with_limit(
+        tokenizer: &Tokenizer,
+        paths: &[PathBuf],
+        max_samples: Option<usize>,
+    ) -> Result<Self> {
         let example_set = qwen_sft_examples_from_jsonl_paths(paths)?;
+        let example_set = qwen_sft_limit_example_set(example_set, max_samples)?;
         if example_set.examples.is_empty() {
             bail!("SFT dataset must contain at least one example");
         }
@@ -6465,6 +6484,41 @@ fn qwen_sft_examples_from_jsonl_paths(paths: &[PathBuf]) -> Result<QwenSftExampl
     })
 }
 
+fn qwen_sft_limit_example_set(
+    mut example_set: QwenSftExampleSet,
+    max_samples: Option<usize>,
+) -> Result<QwenSftExampleSet> {
+    let Some(max_samples) = max_samples else {
+        return Ok(example_set);
+    };
+    if max_samples == 0 {
+        bail!("SFT data.max_samples must be greater than zero");
+    }
+    if example_set.examples.len() <= max_samples {
+        return Ok(example_set);
+    }
+    example_set.examples.truncate(max_samples);
+    let mut source_counts = BTreeMap::new();
+    for example in &example_set.examples {
+        let Some(source_file) = &example.source_file else {
+            continue;
+        };
+        *source_counts.entry(source_file.clone()).or_insert(0) += 1;
+    }
+    let source_files = source_counts.keys().cloned().collect::<Vec<_>>();
+    let source_sample_counts = source_counts
+        .into_iter()
+        .map(|(path, samples)| QwenSftSourceSampleCount { path, samples })
+        .collect::<Vec<_>>();
+    let fingerprint = qwen_sft_dataset_fingerprint(&source_files, &example_set.examples);
+    Ok(QwenSftExampleSet {
+        examples: example_set.examples,
+        source_files,
+        source_sample_counts,
+        fingerprint,
+    })
+}
+
 fn qwen_sft_examples_from_jsonl_path(path: &Path) -> Result<QwenSftExampleSet> {
     let files = qwen_sft_jsonl_files(path)?;
 
@@ -6493,6 +6547,7 @@ fn qwen_sft_examples_from_jsonl_path(path: &Path) -> Result<QwenSftExampleSet> {
                 instruction: record.instruction,
                 input: record.input,
                 response: record.response,
+                source_file: Some(file.display().to_string()),
             });
         }
         source_sample_counts.push(QwenSftSourceSampleCount {
@@ -8621,6 +8676,56 @@ mod tests {
         assert_eq!(examples[0].instruction, "first");
         assert_eq!(examples[1].instruction, "second");
         assert_eq!(examples[2].instruction, "third");
+    }
+
+    #[test]
+    fn qwen_sft_example_limit_recomputes_source_counts_and_fingerprint() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let first = temp.path().join("first.jsonl");
+        let second = temp.path().join("second.jsonl");
+        fs::write(
+            &first,
+            r#"{"instruction":"one","response":"a"}
+{"instruction":"two","response":"b"}
+"#,
+        )
+        .expect("first jsonl should write");
+        fs::write(
+            &second,
+            r#"{"instruction":"three","response":"c"}
+{"instruction":"four","response":"d"}
+"#,
+        )
+        .expect("second jsonl should write");
+
+        let full = qwen_sft_examples_from_jsonl_paths(&[first.clone(), second.clone()])
+            .expect("full examples should load");
+        let limited = qwen_sft_limit_example_set(full, Some(3)).expect("example set should limit");
+
+        assert_eq!(limited.examples.len(), 3);
+        assert_eq!(
+            limited.source_files,
+            vec![first.display().to_string(), second.display().to_string()]
+        );
+        assert_eq!(
+            limited.source_sample_counts,
+            vec![
+                QwenSftSourceSampleCount {
+                    path: first.display().to_string(),
+                    samples: 2,
+                },
+                QwenSftSourceSampleCount {
+                    path: second.display().to_string(),
+                    samples: 1,
+                },
+            ]
+        );
+        assert_eq!(limited.examples[0].instruction, "one");
+        assert_eq!(limited.examples[2].instruction, "three");
+        assert_eq!(
+            limited.fingerprint,
+            qwen_sft_dataset_fingerprint(&limited.source_files, &limited.examples)
+        );
     }
 
     #[test]
