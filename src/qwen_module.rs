@@ -164,6 +164,12 @@ pub(crate) struct QwenLoraSftTrainSummary {
     pub(crate) data_cursor_start: usize,
     pub(crate) data_cursor_end: usize,
     pub(crate) data_cursor_next: usize,
+    pub(crate) data_epoch_start: usize,
+    pub(crate) data_epoch_end: usize,
+    pub(crate) data_epoch_next: usize,
+    pub(crate) data_sample_offset_start: usize,
+    pub(crate) data_sample_offset_end: usize,
+    pub(crate) data_sample_offset_next: usize,
     pub(crate) batch_size: usize,
     pub(crate) global_batch_size: usize,
     pub(crate) gradient_accumulation_steps: usize,
@@ -222,6 +228,18 @@ struct QwenLoraSftAdapterManifest {
     data_cursor_start: usize,
     data_cursor_end: usize,
     data_cursor_next: usize,
+    #[serde(default)]
+    data_epoch_start: usize,
+    #[serde(default)]
+    data_epoch_end: usize,
+    #[serde(default)]
+    data_epoch_next: usize,
+    #[serde(default)]
+    data_sample_offset_start: usize,
+    #[serde(default)]
+    data_sample_offset_end: usize,
+    #[serde(default)]
+    data_sample_offset_next: usize,
     dataset_order_seed: u64,
     dataset_total_samples: usize,
     dataset_train_samples: usize,
@@ -282,6 +300,12 @@ pub(crate) struct QwenFullTrainSmokeSummary {
     pub(crate) data_cursor_start: Option<usize>,
     pub(crate) data_cursor_end: Option<usize>,
     pub(crate) data_cursor_next: Option<usize>,
+    pub(crate) data_epoch_start: Option<usize>,
+    pub(crate) data_epoch_end: Option<usize>,
+    pub(crate) data_epoch_next: Option<usize>,
+    pub(crate) data_sample_offset_start: Option<usize>,
+    pub(crate) data_sample_offset_end: Option<usize>,
+    pub(crate) data_sample_offset_next: Option<usize>,
     pub(crate) batch_size: usize,
     pub(crate) sequence_tokens: usize,
     pub(crate) initial_loss: f64,
@@ -331,6 +355,12 @@ struct QwenSessionDpRankSummary {
     data_cursor_start: Option<usize>,
     data_cursor_end: Option<usize>,
     data_cursor_next: Option<usize>,
+    data_epoch_start: Option<usize>,
+    data_epoch_end: Option<usize>,
+    data_epoch_next: Option<usize>,
+    data_sample_offset_start: Option<usize>,
+    data_sample_offset_end: Option<usize>,
+    data_sample_offset_next: Option<usize>,
     tensor_count: usize,
     steps: usize,
     learning_rate: f64,
@@ -378,6 +408,18 @@ struct QwenSessionDpCheckpointManifest {
     data_cursor_end: Option<usize>,
     #[serde(default)]
     data_cursor_next: Option<usize>,
+    #[serde(default)]
+    data_epoch_start: Option<usize>,
+    #[serde(default)]
+    data_epoch_end: Option<usize>,
+    #[serde(default)]
+    data_epoch_next: Option<usize>,
+    #[serde(default)]
+    data_sample_offset_start: Option<usize>,
+    #[serde(default)]
+    data_sample_offset_end: Option<usize>,
+    #[serde(default)]
+    data_sample_offset_next: Option<usize>,
     learning_rate: f64,
     delta_safetensors: String,
     optimizer_safetensors: String,
@@ -406,6 +448,12 @@ impl QwenSessionDpCheckpointManifest {
             data_cursor_start: self.data_cursor_start,
             data_cursor_end: self.data_cursor_end,
             data_cursor_next: self.data_cursor_next,
+            data_epoch_start: self.data_epoch_start,
+            data_epoch_end: self.data_epoch_end,
+            data_epoch_next: self.data_epoch_next,
+            data_sample_offset_start: self.data_sample_offset_start,
+            data_sample_offset_end: self.data_sample_offset_end,
+            data_sample_offset_next: self.data_sample_offset_next,
             learning_rate: self.learning_rate,
             initial_loss: self.expected_loss,
             final_loss: self.global_post_update_loss,
@@ -629,6 +677,18 @@ struct QwenDeltaCheckpointManifest {
     data_cursor_end: Option<usize>,
     #[serde(default)]
     data_cursor_next: Option<usize>,
+    #[serde(default)]
+    data_epoch_start: Option<usize>,
+    #[serde(default)]
+    data_epoch_end: Option<usize>,
+    #[serde(default)]
+    data_epoch_next: Option<usize>,
+    #[serde(default)]
+    data_sample_offset_start: Option<usize>,
+    #[serde(default)]
+    data_sample_offset_end: Option<usize>,
+    #[serde(default)]
+    data_sample_offset_next: Option<usize>,
     learning_rate: f64,
     initial_loss: f64,
     final_loss: f64,
@@ -756,6 +816,12 @@ struct QwenSessionBatchPlan {
     dataset_eval_samples: Option<usize>,
     dataset_order_seed: Option<u64>,
     train_sample_count: Option<usize>,
+    data_epoch_start: Option<usize>,
+    data_epoch_end: Option<usize>,
+    data_epoch_next: Option<usize>,
+    data_sample_offset_start: Option<usize>,
+    data_sample_offset_end: Option<usize>,
+    data_sample_offset_next: Option<usize>,
     batch_size: usize,
     sequence_tokens: usize,
 }
@@ -769,6 +835,12 @@ struct QwenSessionDpBatchPlan {
     dataset_eval_samples: Option<usize>,
     dataset_order_seed: Option<u64>,
     train_sample_count: Option<usize>,
+    data_epoch_start: Option<usize>,
+    data_epoch_end: Option<usize>,
+    data_epoch_next: Option<usize>,
+    data_sample_offset_start: Option<usize>,
+    data_sample_offset_end: Option<usize>,
+    data_sample_offset_next: Option<usize>,
     local_batch_size: usize,
     sequence_tokens: usize,
 }
@@ -1698,6 +1770,12 @@ fn qwen_lora_sft_train(
     let data_cursor_end =
         data_cursor_start + steps * gradient_accumulation_steps * train_batch_size;
     let data_cursor_next = data_cursor_end;
+    let (data_epoch_start, data_sample_offset_start) =
+        qwen_data_epoch_and_offset(data_cursor_start, train_dataset.len())?;
+    let (data_epoch_end, data_sample_offset_end) =
+        qwen_data_epoch_and_offset(data_cursor_end, train_dataset.len())?;
+    let (data_epoch_next, data_sample_offset_next) =
+        qwen_data_epoch_and_offset(data_cursor_next, train_dataset.len())?;
 
     for step in 0..steps {
         for (_, mut tensor) in registry.trainable_tensors() {
@@ -1841,6 +1919,12 @@ fn qwen_lora_sft_train(
         data_cursor_start,
         data_cursor_end,
         data_cursor_next,
+        data_epoch_start,
+        data_epoch_end,
+        data_epoch_next,
+        data_sample_offset_start,
+        data_sample_offset_end,
+        data_sample_offset_next,
         dataset_order_seed: policy.dataset_order_seed,
         dataset_total_samples: dataset_summary.samples,
         dataset_train_samples: train_dataset.len(),
@@ -1996,6 +2080,12 @@ fn qwen_lora_sft_train(
         data_cursor_start,
         data_cursor_end,
         data_cursor_next,
+        data_epoch_start,
+        data_epoch_end,
+        data_epoch_next,
+        data_sample_offset_start,
+        data_sample_offset_end,
+        data_sample_offset_next,
         batch_size: initial_batch.prompt_tokens.len(),
         global_batch_size: train_batch_size * gradient_accumulation_steps,
         gradient_accumulation_steps,
@@ -2041,6 +2131,13 @@ fn qwen_lora_sft_train(
 
 fn qwen_lora_sft_should_eval_step(step_number: usize, eval_every: u64) -> bool {
     eval_every > 0 && (step_number as u64) % eval_every == 0
+}
+
+fn qwen_data_epoch_and_offset(cursor: usize, sample_count: usize) -> Result<(usize, usize)> {
+    if sample_count == 0 {
+        bail!("data epoch metadata requires at least one training sample");
+    }
+    Ok((cursor / sample_count, cursor % sample_count))
 }
 
 pub fn qwen_tied_head_train_smoke(
@@ -2218,6 +2315,12 @@ fn qwen_full_train_summary(
         data_cursor_start: None,
         data_cursor_end: None,
         data_cursor_next: None,
+        data_epoch_start: None,
+        data_epoch_end: None,
+        data_epoch_next: None,
+        data_sample_offset_start: None,
+        data_sample_offset_end: None,
+        data_sample_offset_next: None,
         learning_rate,
         initial_loss,
         final_loss,
@@ -2291,6 +2394,12 @@ fn qwen_full_train_summary(
         data_cursor_start: None,
         data_cursor_end: None,
         data_cursor_next: None,
+        data_epoch_start: None,
+        data_epoch_end: None,
+        data_epoch_next: None,
+        data_sample_offset_start: None,
+        data_sample_offset_end: None,
+        data_sample_offset_next: None,
         batch_size: session.input_ids.size()[0] as usize,
         sequence_tokens: session.input_ids.size()[1] as usize,
         initial_loss,
@@ -2462,6 +2571,12 @@ fn qwen_session_single_summary(
         data_cursor_start: Some(data_cursor_start),
         data_cursor_end: Some(data_cursor_end),
         data_cursor_next: Some(data_cursor_next),
+        data_epoch_start: batch_plan.data_epoch_start,
+        data_epoch_end: batch_plan.data_epoch_end,
+        data_epoch_next: batch_plan.data_epoch_next,
+        data_sample_offset_start: batch_plan.data_sample_offset_start,
+        data_sample_offset_end: batch_plan.data_sample_offset_end,
+        data_sample_offset_next: batch_plan.data_sample_offset_next,
         learning_rate,
         initial_loss,
         final_loss,
@@ -2530,6 +2645,12 @@ fn qwen_session_single_summary(
         data_cursor_start: batch_plan.train_sample_count.map(|_| data_cursor_start),
         data_cursor_end: batch_plan.train_sample_count.map(|_| data_cursor_end),
         data_cursor_next: batch_plan.train_sample_count.map(|_| data_cursor_next),
+        data_epoch_start: batch_plan.data_epoch_start,
+        data_epoch_end: batch_plan.data_epoch_end,
+        data_epoch_next: batch_plan.data_epoch_next,
+        data_sample_offset_start: batch_plan.data_sample_offset_start,
+        data_sample_offset_end: batch_plan.data_sample_offset_end,
+        data_sample_offset_next: batch_plan.data_sample_offset_next,
         batch_size: batch_plan.batch_size,
         sequence_tokens: batch_plan.sequence_tokens,
         initial_loss,
@@ -2983,6 +3104,12 @@ pub fn qwen_session_dp_rank_smoke(
             data_cursor_start: batch_plan.train_sample_count.map(|_| data_cursor_start),
             data_cursor_end: batch_plan.train_sample_count.map(|_| data_cursor_end),
             data_cursor_next: batch_plan.train_sample_count.map(|_| data_cursor_next),
+            data_epoch_start: batch_plan.data_epoch_start,
+            data_epoch_end: batch_plan.data_epoch_end,
+            data_epoch_next: batch_plan.data_epoch_next,
+            data_sample_offset_start: batch_plan.data_sample_offset_start,
+            data_sample_offset_end: batch_plan.data_sample_offset_end,
+            data_sample_offset_next: batch_plan.data_sample_offset_next,
             learning_rate,
             delta_safetensors: delta_output.display().to_string(),
             optimizer_safetensors: optimizer_output.display().to_string(),
@@ -3176,6 +3303,12 @@ pub fn qwen_session_dp_rank_smoke(
         data_cursor_start: batch_plan.train_sample_count.map(|_| data_cursor_start),
         data_cursor_end: batch_plan.train_sample_count.map(|_| data_cursor_end),
         data_cursor_next: batch_plan.train_sample_count.map(|_| data_cursor_next),
+        data_epoch_start: batch_plan.data_epoch_start,
+        data_epoch_end: batch_plan.data_epoch_end,
+        data_epoch_next: batch_plan.data_epoch_next,
+        data_sample_offset_start: batch_plan.data_sample_offset_start,
+        data_sample_offset_end: batch_plan.data_sample_offset_end,
+        data_sample_offset_next: batch_plan.data_sample_offset_next,
         tensor_count: local_grads.len(),
         steps,
         learning_rate,
@@ -3386,6 +3519,12 @@ fn qwen_sharded_rank_to_delta_manifest(
         data_cursor_start: None,
         data_cursor_end: None,
         data_cursor_next: None,
+        data_epoch_start: None,
+        data_epoch_end: None,
+        data_epoch_next: None,
+        data_sample_offset_start: None,
+        data_sample_offset_end: None,
+        data_sample_offset_next: None,
         learning_rate,
         initial_loss,
         final_loss,
@@ -4373,6 +4512,12 @@ fn qwen_session_fixed_batch_plan(
         dataset_eval_samples: None,
         dataset_order_seed: None,
         train_sample_count: None,
+        data_epoch_start: None,
+        data_epoch_end: None,
+        data_epoch_next: None,
+        data_sample_offset_start: None,
+        data_sample_offset_end: None,
+        data_sample_offset_next: None,
         batch_size: 1,
         sequence_tokens: 5,
     })
@@ -4406,6 +4551,14 @@ fn qwen_session_batch_plan_from_config(
         .min(train_dataset.len())
         .max(1);
     let required_batches = data_cursor_start + train_steps * batch_size + 1;
+    let data_cursor_end = data_cursor_start + train_steps * batch_size;
+    let data_cursor_next = data_cursor_end;
+    let (data_epoch_start, data_sample_offset_start) =
+        qwen_data_epoch_and_offset(data_cursor_start, train_dataset.len())?;
+    let (data_epoch_end, data_sample_offset_end) =
+        qwen_data_epoch_and_offset(data_cursor_end, train_dataset.len())?;
+    let (data_epoch_next, data_sample_offset_next) =
+        qwen_data_epoch_and_offset(data_cursor_next, train_dataset.len())?;
     let train_batches = (0..required_batches)
         .map(|sample_cursor| {
             train_dataset
@@ -4428,6 +4581,12 @@ fn qwen_session_batch_plan_from_config(
         dataset_eval_samples: Some(eval_dataset.len()),
         dataset_order_seed: Some(runtime_config.run.seed),
         train_sample_count: Some(train_dataset.len()),
+        data_epoch_start: Some(data_epoch_start),
+        data_epoch_end: Some(data_epoch_end),
+        data_epoch_next: Some(data_epoch_next),
+        data_sample_offset_start: Some(data_sample_offset_start),
+        data_sample_offset_end: Some(data_sample_offset_end),
+        data_sample_offset_next: Some(data_sample_offset_next),
         batch_size,
     })
 }
@@ -4450,6 +4609,12 @@ fn qwen_session_fixed_dp_batch_plan(
         dataset_eval_samples: None,
         dataset_order_seed: None,
         train_sample_count: None,
+        data_epoch_start: None,
+        data_epoch_end: None,
+        data_epoch_next: None,
+        data_sample_offset_start: None,
+        data_sample_offset_end: None,
+        data_sample_offset_next: None,
         local_batch_size: 1,
         sequence_tokens: 5,
     })
@@ -4485,6 +4650,15 @@ fn qwen_session_dp_batch_plan_from_config(
         .max(1);
     let global_batch_size = local_batch_size * world_size;
     let required_batches = train_steps * global_batch_size + 1;
+    let data_cursor_start = 0usize;
+    let data_cursor_end = train_steps * global_batch_size;
+    let data_cursor_next = data_cursor_end;
+    let (data_epoch_start, data_sample_offset_start) =
+        qwen_data_epoch_and_offset(data_cursor_start, train_dataset.len())?;
+    let (data_epoch_end, data_sample_offset_end) =
+        qwen_data_epoch_and_offset(data_cursor_end, train_dataset.len())?;
+    let (data_epoch_next, data_sample_offset_next) =
+        qwen_data_epoch_and_offset(data_cursor_next, train_dataset.len())?;
     let global_train_batches = (0..required_batches)
         .map(|global_sample_cursor| {
             train_dataset
@@ -4506,6 +4680,12 @@ fn qwen_session_dp_batch_plan_from_config(
         dataset_eval_samples: Some(eval_dataset.len()),
         dataset_order_seed: Some(runtime_config.run.seed),
         train_sample_count: Some(train_dataset.len()),
+        data_epoch_start: Some(data_epoch_start),
+        data_epoch_end: Some(data_epoch_end),
+        data_epoch_next: Some(data_epoch_next),
+        data_sample_offset_start: Some(data_sample_offset_start),
+        data_sample_offset_end: Some(data_sample_offset_end),
+        data_sample_offset_next: Some(data_sample_offset_next),
         local_batch_size,
     })
 }
@@ -6439,6 +6619,12 @@ mod tests {
             data_cursor_start: None,
             data_cursor_end: None,
             data_cursor_next: None,
+            data_epoch_start: None,
+            data_epoch_end: None,
+            data_epoch_next: None,
+            data_sample_offset_start: None,
+            data_sample_offset_end: None,
+            data_sample_offset_next: None,
             learning_rate: 1e-6,
             initial_loss: 2.0,
             final_loss: 1.5,
@@ -6716,6 +6902,12 @@ mod tests {
             data_cursor_start: None,
             data_cursor_end: None,
             data_cursor_next: None,
+            data_epoch_start: None,
+            data_epoch_end: None,
+            data_epoch_next: None,
+            data_sample_offset_start: None,
+            data_sample_offset_end: None,
+            data_sample_offset_next: None,
             learning_rate,
             initial_loss,
             final_loss,
@@ -6825,6 +7017,12 @@ mod tests {
             data_cursor_start: None,
             data_cursor_end: None,
             data_cursor_next: None,
+            data_epoch_start: None,
+            data_epoch_end: None,
+            data_epoch_next: None,
+            data_sample_offset_start: None,
+            data_sample_offset_end: None,
+            data_sample_offset_next: None,
             learning_rate,
             initial_loss: first_step.loss_before,
             final_loss: first_step.loss_after,
@@ -7364,6 +7562,15 @@ mod tests {
         assert_eq!(mask_values, vec![1.0, 1.0, 0.0, 1.0, 1.0, 1.0]);
         assert_eq!(batch.masked_positions, 5);
         assert_eq!(batch.padding_tokens, 0);
+    }
+
+    #[test]
+    fn qwen_data_epoch_metadata_tracks_wrapping_cursor() {
+        assert_eq!(qwen_data_epoch_and_offset(0, 6).unwrap(), (0, 0));
+        assert_eq!(qwen_data_epoch_and_offset(5, 6).unwrap(), (0, 5));
+        assert_eq!(qwen_data_epoch_and_offset(6, 6).unwrap(), (1, 0));
+        assert_eq!(qwen_data_epoch_and_offset(16, 6).unwrap(), (2, 4));
+        assert!(qwen_data_epoch_and_offset(0, 0).is_err());
     }
 
     #[test]

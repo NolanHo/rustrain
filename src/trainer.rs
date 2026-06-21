@@ -146,6 +146,12 @@ pub fn train(config_path: &Path, resume_from: Option<PathBuf>) -> Result<()> {
                 data_cursor_start = summary.data_cursor_start,
                 data_cursor_end = summary.data_cursor_end,
                 data_cursor_next = summary.data_cursor_next,
+                data_epoch_start = summary.data_epoch_start,
+                data_epoch_end = summary.data_epoch_end,
+                data_epoch_next = summary.data_epoch_next,
+                data_sample_offset_start = summary.data_sample_offset_start,
+                data_sample_offset_end = summary.data_sample_offset_end,
+                data_sample_offset_next = summary.data_sample_offset_next,
                 batch_size = summary.batch_size,
                 sequence_tokens = summary.sequence_tokens,
                 trainable_tensors = summary.trainable_tensors.len(),
@@ -196,6 +202,24 @@ pub fn train(config_path: &Path, resume_from: Option<PathBuf>) -> Result<()> {
             }
             if let Some(data_cursor_next) = summary.data_cursor_next {
                 println!("data_cursor_next: {data_cursor_next}");
+            }
+            if let Some(data_epoch_start) = summary.data_epoch_start {
+                println!("data_epoch_start: {data_epoch_start}");
+            }
+            if let Some(data_epoch_end) = summary.data_epoch_end {
+                println!("data_epoch_end: {data_epoch_end}");
+            }
+            if let Some(data_epoch_next) = summary.data_epoch_next {
+                println!("data_epoch_next: {data_epoch_next}");
+            }
+            if let Some(data_sample_offset_start) = summary.data_sample_offset_start {
+                println!("data_sample_offset_start: {data_sample_offset_start}");
+            }
+            if let Some(data_sample_offset_end) = summary.data_sample_offset_end {
+                println!("data_sample_offset_end: {data_sample_offset_end}");
+            }
+            if let Some(data_sample_offset_next) = summary.data_sample_offset_next {
+                println!("data_sample_offset_next: {data_sample_offset_next}");
             }
             println!("batch_size: {}", summary.batch_size);
             println!("sequence_tokens: {}", summary.sequence_tokens);
@@ -275,6 +299,12 @@ pub fn train(config_path: &Path, resume_from: Option<PathBuf>) -> Result<()> {
             data_cursor_start = summary.data_cursor_start,
             data_cursor_end = summary.data_cursor_end,
             data_cursor_next = summary.data_cursor_next,
+            data_epoch_start = summary.data_epoch_start,
+            data_epoch_end = summary.data_epoch_end,
+            data_epoch_next = summary.data_epoch_next,
+            data_sample_offset_start = summary.data_sample_offset_start,
+            data_sample_offset_end = summary.data_sample_offset_end,
+            data_sample_offset_next = summary.data_sample_offset_next,
             batch_size = summary.batch_size,
             global_batch_size = summary.global_batch_size,
             gradient_accumulation_steps = summary.gradient_accumulation_steps,
@@ -321,6 +351,18 @@ pub fn train(config_path: &Path, resume_from: Option<PathBuf>) -> Result<()> {
         println!("data_cursor_start: {}", summary.data_cursor_start);
         println!("data_cursor_end: {}", summary.data_cursor_end);
         println!("data_cursor_next: {}", summary.data_cursor_next);
+        println!("data_epoch_start: {}", summary.data_epoch_start);
+        println!("data_epoch_end: {}", summary.data_epoch_end);
+        println!("data_epoch_next: {}", summary.data_epoch_next);
+        println!(
+            "data_sample_offset_start: {}",
+            summary.data_sample_offset_start
+        );
+        println!("data_sample_offset_end: {}", summary.data_sample_offset_end);
+        println!(
+            "data_sample_offset_next: {}",
+            summary.data_sample_offset_next
+        );
         println!("initial_loss: {:.9}", summary.initial_loss);
         println!("final_loss: {:.9}", summary.final_loss);
         println!("initial_eval_loss: {:.9}", summary.initial_eval_loss);

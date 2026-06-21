@@ -52,6 +52,12 @@ for path in rank_summaries:
             "data_cursor_start",
             "data_cursor_end",
             "data_cursor_next",
+            "data_epoch_start",
+            "data_epoch_end",
+            "data_epoch_next",
+            "data_sample_offset_start",
+            "data_sample_offset_end",
+            "data_sample_offset_next",
             "sequence_tokens",
             "local_batch_size",
         ]
@@ -85,6 +91,23 @@ for path in rank_summaries:
             raise SystemExit(
                 f"{path} expected data_cursor_next {expected_cursor_end}, got {data['data_cursor_next']}"
             )
+        train_samples = int(data["dataset_train_samples"])
+        for cursor_key, epoch_key, offset_key in [
+            ("data_cursor_start", "data_epoch_start", "data_sample_offset_start"),
+            ("data_cursor_end", "data_epoch_end", "data_sample_offset_end"),
+            ("data_cursor_next", "data_epoch_next", "data_sample_offset_next"),
+        ]:
+            cursor = int(data[cursor_key])
+            expected_epoch = cursor // train_samples
+            expected_offset = cursor % train_samples
+            if int(data[epoch_key]) != expected_epoch:
+                raise SystemExit(
+                    f"{path} expected {epoch_key} {expected_epoch}, got {data[epoch_key]} from {cursor_key}={cursor}"
+                )
+            if int(data[offset_key]) != expected_offset:
+                raise SystemExit(
+                    f"{path} expected {offset_key} {expected_offset}, got {data[offset_key]} from {cursor_key}={cursor}"
+                )
         sharded_manifest = json.loads(pathlib.Path(data["sharded_global_manifest_output"]).read_text())
         if int(sharded_manifest["consumed_samples"]) != expected_cursor_end:
             raise SystemExit(
@@ -99,6 +122,8 @@ for path in rank_summaries:
             "dataset_total_samples": data.get("dataset_total_samples"),
             "data_cursor_start": data.get("data_cursor_start"),
             "data_cursor_next": data.get("data_cursor_next"),
+            "data_epoch_next": data.get("data_epoch_next"),
+            "data_sample_offset_next": data.get("data_sample_offset_next"),
             "sequence_tokens": data.get("sequence_tokens"),
             "reload_delta": data["reload_delta"],
             "sharded_reload_delta": sharded_reload_delta,

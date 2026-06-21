@@ -64,6 +64,12 @@ required = [
     "data_cursor_start",
     "data_cursor_end",
     "data_cursor_next",
+    "data_epoch_start",
+    "data_epoch_end",
+    "data_epoch_next",
+    "data_sample_offset_start",
+    "data_sample_offset_end",
+    "data_sample_offset_next",
     "batch_size",
     "global_batch_size",
     "gradient_accumulation_steps",
@@ -118,6 +124,23 @@ if int(values["data_cursor_next"]) != expected_cursor_end:
     raise SystemExit(
         f"expected data_cursor_next {expected_cursor_end}, got {values['data_cursor_next']}"
     )
+train_samples = int(values["train_samples"])
+for cursor_key, epoch_key, offset_key in [
+    ("data_cursor_start", "data_epoch_start", "data_sample_offset_start"),
+    ("data_cursor_end", "data_epoch_end", "data_sample_offset_end"),
+    ("data_cursor_next", "data_epoch_next", "data_sample_offset_next"),
+]:
+    cursor = int(values[cursor_key])
+    expected_epoch = cursor // train_samples
+    expected_offset = cursor % train_samples
+    if int(values[epoch_key]) != expected_epoch:
+        raise SystemExit(
+            f"expected {epoch_key} {expected_epoch}, got {values[epoch_key]} from {cursor_key}={cursor}"
+        )
+    if int(values[offset_key]) != expected_offset:
+        raise SystemExit(
+            f"expected {offset_key} {expected_offset}, got {values[offset_key]} from {cursor_key}={cursor}"
+        )
 for key in [
     "reload_delta",
     "eval_reload_delta",
@@ -161,6 +184,8 @@ print(
     f"resume_from={values['resume_from']} "
     f"data_cursor_start={values['data_cursor_start']} "
     f"data_cursor_next={values['data_cursor_next']} "
+    f"data_epoch_next={values['data_epoch_next']} "
+    f"data_sample_offset_next={values['data_sample_offset_next']} "
     f"initial_loss={values['initial_loss']} "
     f"final_loss={values['final_loss']} "
     f"reload_delta={values['reload_delta']} "
