@@ -444,6 +444,7 @@ fn main() -> Result<()> {
             steps,
             learning_rate,
             &[0],
+            None,
         ),
         Command::Launch {
             nproc_per_node,

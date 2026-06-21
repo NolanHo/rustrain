@@ -4,6 +4,7 @@ set -euo pipefail
 OUTPUT_DIR="${RUSTRAIN_DISTRIBUTED_VERIFY_OUTPUT_DIR:?RUSTRAIN_DISTRIBUTED_VERIFY_OUTPUT_DIR is required}"
 CONFIG="${RUSTRAIN_QWEN_SESSION_DP_CONFIG:-configs/qwen_session_dp2.toml}"
 EXPECTED_DTYPE="${RUSTRAIN_EXPECTED_QWEN_COMPUTE_KIND:-}"
+EXPECTED_DATASET_SEED="${RUSTRAIN_EXPECTED_DATASET_ORDER_SEED:-}"
 
 cargo run -- launch \
   --nproc-per-node 2 \
@@ -17,6 +18,7 @@ import pathlib
 
 output_dir = pathlib.Path(os.environ["RUSTRAIN_DISTRIBUTED_VERIFY_OUTPUT_DIR"])
 expected_dtype = os.environ.get("RUSTRAIN_EXPECTED_QWEN_COMPUTE_KIND")
+expected_dataset_seed = os.environ.get("RUSTRAIN_EXPECTED_DATASET_ORDER_SEED")
 rank_summaries = sorted(output_dir.rglob("qwen-session-dp-rank-*.json"))
 if len(rank_summaries) != 2:
     raise SystemExit(
@@ -37,11 +39,43 @@ for path in rank_summaries:
         raise SystemExit(
             f"{path} dtype {data.get('dtype')} does not match expected {expected_dtype}"
         )
+    if expected_dataset_seed:
+        required_dataset_fields = [
+            "dataset_total_samples",
+            "dataset_total_tokens",
+            "dataset_train_samples",
+            "dataset_eval_samples",
+            "dataset_order_seed",
+            "sequence_tokens",
+            "local_batch_size",
+        ]
+        missing_dataset_fields = [
+            key for key in required_dataset_fields if data.get(key) is None
+        ]
+        if missing_dataset_fields:
+            raise SystemExit(f"{path} is missing dataset fields: {missing_dataset_fields}")
+        for key in [
+            "dataset_total_samples",
+            "dataset_total_tokens",
+            "dataset_train_samples",
+            "dataset_eval_samples",
+            "sequence_tokens",
+            "local_batch_size",
+        ]:
+            if int(data[key]) <= 0:
+                raise SystemExit(f"{path} {key} must be positive, got {data[key]}")
+        if int(data["dataset_order_seed"]) != int(expected_dataset_seed):
+            raise SystemExit(
+                f"{path} dataset_order_seed {data['dataset_order_seed']} does not match expected {expected_dataset_seed}"
+            )
     evidence.append(
         {
             "rank": data["rank"],
             "dtype": data.get("dtype"),
             "checkpoint_written": data["checkpoint_written"],
+            "dataset_order_seed": data.get("dataset_order_seed"),
+            "dataset_total_samples": data.get("dataset_total_samples"),
+            "sequence_tokens": data.get("sequence_tokens"),
             "reload_delta": data["reload_delta"],
             "sharded_reload_delta": sharded_reload_delta,
             "sharded_global_manifest_output": data["sharded_global_manifest_output"],
