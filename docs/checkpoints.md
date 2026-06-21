@@ -118,6 +118,13 @@ second DP=2 run resumes from that manifest and must start at the base
 `data_cursor_next`, advance by `steps * local_batch_size * world_size`, keep the
 same dataset provenance, and keep the expected 25 trainable tensors for layers
 0 and 1 plus final norm.
+`configs/qwen_session_dp2_layers03_sft.toml` and
+`configs/qwen_session_dp2_layers03_sft_bf16.toml` exercise the same external
+resume contract for the layer0-layer3 representative JSONL DP path. Those
+configs must preserve the same cursor/provenance fields, but the expected
+trainable registry expands to 49 tensors for layers 0 through 3 plus final norm.
+Both the fp32 and bf16 layer0-layer3 SFT resume paths still exclude the tied
+embedding by design.
 
 Rank0 artifacts:
 
@@ -154,6 +161,9 @@ Acceptance:
 - The layer0+layer1 JSONL external resume path verifies both the cursor
   continuity contract and the 25-tensor trainable registry in the resumed
   summaries and manifest.
+- The layer0-layer3 JSONL external resume paths verify the same cursor
+  continuity contract and the 49-tensor trainable registry for both fp32 and
+  bf16 resumed summaries and manifests.
 
 ### Representative Sharded Checkpoints and Future Production
 
