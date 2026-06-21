@@ -198,6 +198,10 @@ pub fn train(config_path: &Path, resume_from: Option<PathBuf>) -> Result<()> {
             first_step_grad_norm = summary.first_step_grad_norm,
             final_step_grad_norm = summary.final_step_grad_norm,
             final_step_clipped_grad_norm = summary.final_step_clipped_grad_norm,
+            tokens_per_second = summary.tokens_per_second,
+            samples_per_second = summary.samples_per_second,
+            memory_rss_mb = summary.memory_rss_mb,
+            gpu_memory_allocated_mb = summary.gpu_memory_allocated_mb,
             train_samples = summary.train_samples,
             eval_samples = summary.eval_samples,
             batch_size = summary.batch_size,
@@ -265,6 +269,14 @@ pub fn train(config_path: &Path, resume_from: Option<PathBuf>) -> Result<()> {
             "final_step_clipped_grad_norm: {:.9}",
             summary.final_step_clipped_grad_norm
         );
+        println!("tokens_per_second: {:.2}", summary.tokens_per_second);
+        println!("samples_per_second: {:.2}", summary.samples_per_second);
+        if let Some(memory_rss_mb) = summary.memory_rss_mb {
+            println!("memory_rss_mb: {memory_rss_mb:.2}");
+        }
+        if let Some(gpu_memory_allocated_mb) = summary.gpu_memory_allocated_mb {
+            println!("gpu_memory_allocated_mb: {gpu_memory_allocated_mb:.2}");
+        }
         println!("batch_size: {}", summary.batch_size);
         println!("global_batch_size: {}", summary.global_batch_size);
         println!(

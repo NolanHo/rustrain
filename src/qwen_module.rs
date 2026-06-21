@@ -183,6 +183,10 @@ pub(crate) struct QwenLoraSftTrainSummary {
     pub(crate) first_step_grad_norm: f64,
     pub(crate) final_step_grad_norm: f64,
     pub(crate) final_step_clipped_grad_norm: f64,
+    pub(crate) tokens_per_second: f64,
+    pub(crate) samples_per_second: f64,
+    pub(crate) memory_rss_mb: Option<f64>,
+    pub(crate) gpu_memory_allocated_mb: Option<f64>,
     pub(crate) trainable_tensors: Vec<TrainableTensorSummary>,
 }
 
@@ -1250,6 +1254,7 @@ fn qwen_lora_sft_train(
     let mut final_step_grad_norm = 0.0;
     let mut final_step_clipped_grad_norm = 0.0;
     let mut final_learning_rate = learning_rate;
+    let train_started = Instant::now();
 
     for step in 0..steps {
         for (_, mut tensor) in registry.trainable_tensors() {
@@ -1325,6 +1330,11 @@ fn qwen_lora_sft_train(
             });
         }
     }
+    let train_elapsed_secs = train_started.elapsed().as_secs_f64().max(1e-9);
+    let trained_samples = train_batch_size * gradient_accumulation_steps * steps;
+    let trained_tokens = trained_samples * initial_batch.input_ids.size()[1] as usize;
+    let samples_per_second = trained_samples as f64 / train_elapsed_secs;
+    let tokens_per_second = trained_tokens as f64 / train_elapsed_secs;
 
     let final_loss = qwen_lora_sft_loss(
         &initial_batch.input_ids,
@@ -1481,6 +1491,10 @@ fn qwen_lora_sft_train(
         first_step_grad_norm,
         final_step_grad_norm,
         final_step_clipped_grad_norm,
+        tokens_per_second,
+        samples_per_second,
+        memory_rss_mb: crate::metrics::memory_rss_mb(),
+        gpu_memory_allocated_mb: crate::metrics::gpu_memory_allocated_mb(),
         trainable_tensors: tensor_summaries,
     };
     Ok(summary)
