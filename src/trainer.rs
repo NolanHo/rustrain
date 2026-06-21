@@ -134,6 +134,7 @@ pub fn train(config_path: &Path, resume_from: Option<PathBuf>) -> Result<()> {
         } else if config.parallel.data_parallel_size == 1 {
             let summary = train_qwen_session_single_from_config(&config, &run_paths)?;
             info!(
+                compute_kind = summary.compute_kind,
                 initial_loss = summary.initial_loss,
                 final_loss = summary.final_loss,
                 reload_delta = summary.reload_delta,
@@ -175,6 +176,7 @@ pub fn train(config_path: &Path, resume_from: Option<PathBuf>) -> Result<()> {
             println!("delta_output: {}", summary.delta_output);
             println!("optimizer_output: {}", summary.optimizer_output);
             println!("manifest_output: {}", summary.manifest_output);
+            println!("compute_kind: {}", summary.compute_kind);
             if let Some(resume_from) = &summary.resume_from {
                 println!("resume_from: {resume_from}");
             }
