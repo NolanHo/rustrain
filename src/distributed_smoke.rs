@@ -524,6 +524,74 @@ impl ExpertParallelGlobalCheckpointManifest {
         }
         Ok(())
     }
+
+    fn validate_artifacts(&self) -> Result<()> {
+        self.validate()?;
+        for rank in &self.ranks {
+            let model_tensors =
+                read_tensor_map(Path::new(&rank.model_safetensors)).with_context(|| {
+                    format!("failed to validate EP rank {} model artifacts", rank.rank)
+                })?;
+            let optimizer_tensors = read_tensor_map(Path::new(&rank.optimizer_safetensors))
+                .with_context(|| {
+                    format!(
+                        "failed to validate EP rank {} optimizer artifacts",
+                        rank.rank
+                    )
+                })?;
+            for shard in &rank.shards {
+                let model_tensor = tensor_from_map(&model_tensors, &shard.shard_name)
+                    .with_context(|| {
+                        format!(
+                            "EP rank {} missing model shard {} for {}",
+                            rank.rank, shard.shard_name, shard.name
+                        )
+                    })?;
+                if model_tensor.size() != shard.shard_shape {
+                    bail!(
+                        "EP rank {} model shard {} shape {:?} does not match manifest shard_shape {:?}",
+                        rank.rank,
+                        shard.shard_name,
+                        model_tensor.size(),
+                        shard.shard_shape
+                    );
+                }
+                let optimizer_m = tensor_from_map(&optimizer_tensors, &shard.optimizer_m_name)
+                    .with_context(|| {
+                        format!(
+                            "EP rank {} missing optimizer m slot {} for {}",
+                            rank.rank, shard.optimizer_m_name, shard.name
+                        )
+                    })?;
+                let optimizer_v = tensor_from_map(&optimizer_tensors, &shard.optimizer_v_name)
+                    .with_context(|| {
+                        format!(
+                            "EP rank {} missing optimizer v slot {} for {}",
+                            rank.rank, shard.optimizer_v_name, shard.name
+                        )
+                    })?;
+                if optimizer_m.size() != shard.shard_shape {
+                    bail!(
+                        "EP rank {} optimizer m slot {} shape {:?} does not match manifest shard_shape {:?}",
+                        rank.rank,
+                        shard.optimizer_m_name,
+                        optimizer_m.size(),
+                        shard.shard_shape
+                    );
+                }
+                if optimizer_v.size() != shard.shard_shape {
+                    bail!(
+                        "EP rank {} optimizer v slot {} shape {:?} does not match manifest shard_shape {:?}",
+                        rank.rank,
+                        shard.optimizer_v_name,
+                        optimizer_v.size(),
+                        shard.shard_shape
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -3244,7 +3312,7 @@ fn write_ep_tch_moe_global_checkpoint_manifest(
             },
             ranks,
         };
-        manifest.validate()?;
+        manifest.validate_artifacts()?;
         fs::write(
             &global_manifest_output,
             serde_json::to_string_pretty(&manifest)? + "\n",
@@ -3262,7 +3330,7 @@ fn write_ep_tch_moe_global_checkpoint_manifest(
     let global_manifest: ExpertParallelGlobalCheckpointManifest =
         serde_json::from_str(&global_text)
             .with_context(|| format!("failed to parse {}", global_manifest_output.display()))?;
-    global_manifest.validate()?;
+    global_manifest.validate_artifacts()?;
     Ok(global_manifest_output)
 }
 
@@ -3275,7 +3343,7 @@ fn read_ep_tch_moe_rank_from_global_manifest(
         .with_context(|| format!("failed to read {}", resume_from.display()))?;
     let manifest: ExpertParallelGlobalCheckpointManifest = serde_json::from_str(&text)
         .with_context(|| format!("failed to parse {}", resume_from.display()))?;
-    manifest.validate()?;
+    manifest.validate_artifacts()?;
     if manifest.parallel.expert_model_parallel_size != world_size {
         bail!(
             "EP tch MoE resume expert_model_parallel_size {} does not match WORLD_SIZE {world_size}",
@@ -3727,6 +3795,62 @@ mod tests {
         assert!(mismatched_cursor_error.contains("must match consumed_samples"));
     }
 
+    #[test]
+    fn ep_global_checkpoint_manifest_validates_rank_owned_artifacts() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let manifest =
+            tiny_ep_global_manifest_with_artifacts(temp.path()).expect("artifacts should write");
+
+        manifest
+            .validate_artifacts()
+            .expect("rank-owned artifacts should validate");
+    }
+
+    #[test]
+    fn ep_global_checkpoint_manifest_rejects_missing_model_artifact_tensor() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let mut manifest =
+            tiny_ep_global_manifest_with_artifacts(temp.path()).expect("artifacts should write");
+        manifest.ranks[0].shards[0].shard_name = "experts.missing_up.weight".to_string();
+
+        let error = manifest
+            .validate_artifacts()
+            .expect_err("missing model shard should fail")
+            .to_string();
+
+        assert!(error.contains("missing model shard experts.missing_up.weight"));
+    }
+
+    #[test]
+    fn ep_global_checkpoint_manifest_rejects_missing_optimizer_artifact_tensor() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let mut manifest =
+            tiny_ep_global_manifest_with_artifacts(temp.path()).expect("artifacts should write");
+        manifest.ranks[0].shards[0].optimizer_m_name = "experts.up.weight.missing_m".to_string();
+
+        let error = manifest
+            .validate_artifacts()
+            .expect_err("missing optimizer slot should fail")
+            .to_string();
+
+        assert!(error.contains("missing optimizer m slot experts.up.weight.missing_m"));
+    }
+
+    #[test]
+    fn ep_global_checkpoint_manifest_rejects_artifact_shape_mismatch() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let mut manifest =
+            tiny_ep_global_manifest_with_artifacts(temp.path()).expect("artifacts should write");
+        manifest.ranks[0].shards[0].shard_shape = vec![2, 3, 1];
+
+        let error = manifest
+            .validate_artifacts()
+            .expect_err("artifact shape mismatch should fail")
+            .to_string();
+
+        assert!(error.contains("shape [2, 3, 2] does not match manifest shard_shape [2, 3, 1]"));
+    }
+
     fn tiny_ep_global_manifest() -> ExpertParallelGlobalCheckpointManifest {
         ExpertParallelGlobalCheckpointManifest {
             format: "rustrain.ep_sharded.v1".to_string(),
@@ -3760,6 +3884,60 @@ mod tests {
                 tiny_ep_rank_manifest(1, 2, 4),
             ],
         }
+    }
+
+    fn tiny_ep_global_manifest_with_artifacts(
+        root: &Path,
+    ) -> Result<ExpertParallelGlobalCheckpointManifest> {
+        let mut manifest = tiny_ep_global_manifest();
+        for rank in &mut manifest.ranks {
+            let rank_dir = root.join(format!("rank{}", rank.rank));
+            fs::create_dir_all(&rank_dir)
+                .with_context(|| format!("failed to create {}", rank_dir.display()))?;
+            let model_safetensors = rank_dir.join("model.safetensors");
+            let optimizer_safetensors = rank_dir.join("optimizer.safetensors");
+            let model_entries = rank
+                .shards
+                .iter()
+                .map(|shard| {
+                    (
+                        shard.shard_name.clone(),
+                        Tensor::ones(shard.shard_shape.as_slice(), (Kind::Float, Device::Cpu)),
+                    )
+                })
+                .collect::<Vec<_>>();
+            let optimizer_entries = rank
+                .shards
+                .iter()
+                .flat_map(|shard| {
+                    [
+                        (
+                            shard.optimizer_m_name.clone(),
+                            Tensor::zeros(shard.shard_shape.as_slice(), (Kind::Float, Device::Cpu)),
+                        ),
+                        (
+                            shard.optimizer_v_name.clone(),
+                            Tensor::zeros(shard.shard_shape.as_slice(), (Kind::Float, Device::Cpu)),
+                        ),
+                    ]
+                })
+                .collect::<Vec<_>>();
+            let model_refs = model_entries
+                .iter()
+                .map(|(name, tensor)| (name.as_str(), tensor))
+                .collect::<Vec<_>>();
+            let optimizer_refs = optimizer_entries
+                .iter()
+                .map(|(name, tensor)| (name.as_str(), tensor))
+                .collect::<Vec<_>>();
+            Tensor::write_safetensors(&model_refs, &model_safetensors)
+                .with_context(|| format!("failed to write {}", model_safetensors.display()))?;
+            Tensor::write_safetensors(&optimizer_refs, &optimizer_safetensors)
+                .with_context(|| format!("failed to write {}", optimizer_safetensors.display()))?;
+            rank.model_safetensors = model_safetensors.display().to_string();
+            rank.optimizer_safetensors = optimizer_safetensors.display().to_string();
+        }
+        Ok(manifest)
     }
 
     fn tiny_ep_rank_manifest(

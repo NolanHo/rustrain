@@ -183,6 +183,9 @@ trainer-entry EP path also accepts that global manifest through `--resume-from`
 and restores each rank's owned expert MLP shards plus AdamW slots to verify
 reload and next-step parity. This remains focused checkpoint-contract evidence,
 not a production MoE trainer checkpoint.
+The focused EP global manifest validator also opens each rank-owned model and
+optimizer safetensors, requires declared expert shards and AdamW slots to
+exist, and rejects artifact shapes that do not match the manifest shard shape.
 
 Required manifest structure:
 
