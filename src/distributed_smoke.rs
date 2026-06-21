@@ -3530,4 +3530,178 @@ mod tests {
     fn expert_parallel_smoke_runs_ep2_all_to_all_parity() {
         run_expert_parallel_smoke(2).expect("EP=2 parity should pass");
     }
+
+    #[test]
+    fn ep_global_checkpoint_manifest_validates_rank_owned_shards() {
+        let manifest = tiny_ep_global_manifest();
+
+        manifest
+            .validate()
+            .expect("valid EP global manifest should pass");
+    }
+
+    #[test]
+    fn ep_global_checkpoint_manifest_rejects_missing_rank() {
+        let mut manifest = tiny_ep_global_manifest();
+        manifest.ranks.pop();
+
+        let error = manifest
+            .validate()
+            .expect_err("missing rank should fail")
+            .to_string();
+        assert!(error.contains("expected 2 rank manifests"));
+    }
+
+    #[test]
+    fn ep_global_checkpoint_manifest_rejects_non_contiguous_experts() {
+        let mut manifest = tiny_ep_global_manifest();
+        manifest.ranks[1].owned_expert_start = 3;
+
+        let error = manifest
+            .validate()
+            .expect_err("expert range gap should fail")
+            .to_string();
+        assert!(error.contains("does not continue"));
+    }
+
+    #[test]
+    fn ep_global_checkpoint_manifest_rejects_partial_dataset_provenance() {
+        let mut manifest = tiny_ep_global_manifest();
+        manifest.dataset_fingerprint = "abc123".to_string();
+
+        let error = manifest
+            .validate()
+            .expect_err("fingerprint without source files should fail")
+            .to_string();
+        assert!(error.contains("dataset_fingerprint requires dataset_source_files"));
+    }
+
+    #[test]
+    fn ep_global_checkpoint_manifest_rejects_non_jsonl_dataset_sources() {
+        let mut manifest = tiny_ep_global_manifest();
+        manifest.dataset_source_files = vec!["data/train.txt".to_string()];
+        manifest.dataset_fingerprint = "abc123".to_string();
+
+        let error = manifest
+            .validate()
+            .expect_err("non-jsonl source should fail")
+            .to_string();
+        assert!(error.contains("must only contain JSONL paths"));
+    }
+
+    #[test]
+    fn ep_global_checkpoint_manifest_rejects_inconsistent_data_progress() {
+        let mut missing_epoch = tiny_ep_global_manifest();
+        missing_epoch.data_cursor_next = Some(4);
+        missing_epoch.data_sample_offset_next = Some(4);
+
+        let missing_epoch_error = missing_epoch
+            .validate()
+            .expect_err("cursor without epoch should fail")
+            .to_string();
+        assert!(missing_epoch_error.contains("must be present together"));
+
+        let mut mismatched_cursor = tiny_ep_global_manifest();
+        mismatched_cursor.data_cursor_next = Some(3);
+        mismatched_cursor.data_epoch_next = Some(0);
+        mismatched_cursor.data_sample_offset_next = Some(3);
+
+        let mismatched_cursor_error = mismatched_cursor
+            .validate()
+            .expect_err("cursor not matching consumed samples should fail")
+            .to_string();
+        assert!(mismatched_cursor_error.contains("must match consumed_samples"));
+    }
+
+    fn tiny_ep_global_manifest() -> ExpertParallelGlobalCheckpointManifest {
+        ExpertParallelGlobalCheckpointManifest {
+            format: "rustrain.ep_sharded.v1".to_string(),
+            manifest_kind: "global".to_string(),
+            base_model_path: "rustrain://focused-tch-moe-ep-smoke".to_string(),
+            tokenizer_path: String::new(),
+            global_step: 1,
+            consumed_samples: 4,
+            consumed_tokens: 4,
+            data_cursor_next: None,
+            data_epoch_next: None,
+            data_sample_offset_next: None,
+            data_train_samples: None,
+            dataset_source_files: Vec::new(),
+            dataset_source_sample_counts: Vec::new(),
+            dataset_fingerprint: String::new(),
+            dataset_shuffle: true,
+            seed: 0,
+            dtype: "float32".to_string(),
+            optimizer: "adamw".to_string(),
+            scheduler: "constant".to_string(),
+            parallel: ExpertParallelGlobalParallelManifest {
+                data_parallel_size: 1,
+                tensor_model_parallel_size: 1,
+                pipeline_model_parallel_size: 1,
+                expert_model_parallel_size: 2,
+                context_parallel_size: 1,
+            },
+            ranks: vec![
+                tiny_ep_rank_manifest(0, 0, 2),
+                tiny_ep_rank_manifest(1, 2, 4),
+            ],
+        }
+    }
+
+    fn tiny_ep_rank_manifest(
+        rank: usize,
+        owned_expert_start: usize,
+        owned_expert_end: usize,
+    ) -> ExpertParallelCheckpointManifest {
+        ExpertParallelCheckpointManifest {
+            format: "rustrain.ep_sharded.v1".to_string(),
+            manifest_kind: "rank".to_string(),
+            rank,
+            world_size: 2,
+            local_rank: rank,
+            global_step: 1,
+            owned_expert_start,
+            owned_expert_end,
+            model_safetensors: format!("rank{rank}/model.safetensors"),
+            optimizer_safetensors: format!("rank{rank}/optimizer.safetensors"),
+            optimizer: "adamw".to_string(),
+            learning_rate: 0.05,
+            beta1: 0.9,
+            beta2: 0.999,
+            eps: 1e-8,
+            weight_decay: 0.0,
+            shards: vec![
+                tiny_ep_checkpoint_shard(
+                    format!("experts.{owned_expert_start}..{owned_expert_end}.up.weight"),
+                    "experts.up.weight",
+                    vec![4, 3, 2],
+                    vec![2, 3, 2],
+                ),
+                tiny_ep_checkpoint_shard(
+                    format!("experts.{owned_expert_start}..{owned_expert_end}.down.weight"),
+                    "experts.down.weight",
+                    vec![4, 2, 3],
+                    vec![2, 2, 3],
+                ),
+            ],
+        }
+    }
+
+    fn tiny_ep_checkpoint_shard(
+        name: String,
+        shard_name: &str,
+        global_shape: Vec<i64>,
+        shard_shape: Vec<i64>,
+    ) -> ExpertParallelCheckpointShard {
+        ExpertParallelCheckpointShard {
+            name,
+            shard_name: shard_name.to_string(),
+            optimizer_m_name: format!("{shard_name}.adam_m"),
+            optimizer_v_name: format!("{shard_name}.adam_v"),
+            global_shape,
+            shard_shape,
+            dtype: "float32".to_string(),
+            partition: "expert_model_parallel".to_string(),
+        }
+    }
 }
