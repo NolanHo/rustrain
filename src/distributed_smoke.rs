@@ -3,6 +3,7 @@ use std::{
     fs,
     path::{Path, PathBuf},
     process::Command,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -166,6 +167,7 @@ struct ExpertParallelTchMoeRankSummary {
     expert_up_grad_norm: f64,
     expert_down_grad_norm: f64,
     checkpoint_manifest_output: String,
+    ep_global_manifest_output: String,
     checkpoint_model_safetensors: String,
     checkpoint_optimizer_safetensors: String,
     checkpoint_tensor_count: usize,
@@ -186,6 +188,8 @@ struct ExpertParallelTchMoeRankSummary {
 #[derive(Debug, Serialize, Deserialize)]
 struct ExpertParallelCheckpointManifest {
     format: String,
+    #[serde(default = "ep_rank_manifest_kind")]
+    manifest_kind: String,
     rank: usize,
     world_size: usize,
     local_rank: usize,
@@ -201,6 +205,175 @@ struct ExpertParallelCheckpointManifest {
     eps: f64,
     weight_decay: f64,
     shards: Vec<ExpertParallelCheckpointShard>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct ExpertParallelGlobalCheckpointManifest {
+    format: String,
+    manifest_kind: String,
+    global_step: u64,
+    consumed_samples: u64,
+    consumed_tokens: u64,
+    dtype: String,
+    optimizer: String,
+    scheduler: String,
+    parallel: ExpertParallelGlobalParallelManifest,
+    ranks: Vec<ExpertParallelCheckpointManifest>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct ExpertParallelGlobalParallelManifest {
+    data_parallel_size: usize,
+    tensor_model_parallel_size: usize,
+    pipeline_model_parallel_size: usize,
+    expert_model_parallel_size: usize,
+    context_parallel_size: usize,
+}
+
+fn ep_rank_manifest_kind() -> String {
+    "rank".to_string()
+}
+
+impl ExpertParallelGlobalCheckpointManifest {
+    fn validate(&self) -> Result<()> {
+        if self.format != "rustrain.ep_sharded.v1" {
+            bail!("unsupported EP sharded checkpoint format {}", self.format);
+        }
+        if self.manifest_kind != "global" {
+            bail!(
+                "EP global checkpoint manifest_kind must be global, got {}",
+                self.manifest_kind
+            );
+        }
+        if self.global_step == 0 {
+            bail!("EP global checkpoint global_step must be positive");
+        }
+        if self.consumed_samples == 0 || self.consumed_tokens == 0 {
+            bail!("EP global checkpoint requires positive consumed samples/tokens");
+        }
+        if self.dtype.is_empty() || self.optimizer.is_empty() || self.scheduler.is_empty() {
+            bail!("EP global checkpoint requires dtype, optimizer, and scheduler");
+        }
+        if self.parallel.expert_model_parallel_size == 0
+            || self.parallel.data_parallel_size == 0
+            || self.parallel.tensor_model_parallel_size == 0
+            || self.parallel.pipeline_model_parallel_size == 0
+            || self.parallel.context_parallel_size == 0
+        {
+            bail!("EP global checkpoint parallel sizes must be positive");
+        }
+        if self.ranks.len() != self.parallel.expert_model_parallel_size {
+            bail!(
+                "EP global checkpoint expected {} rank manifests, got {}",
+                self.parallel.expert_model_parallel_size,
+                self.ranks.len()
+            );
+        }
+        let mut expected_start = 0;
+        let mut ranks = self
+            .ranks
+            .iter()
+            .map(|rank| {
+                if rank.format != "rustrain.ep_sharded.v1" {
+                    bail!(
+                        "EP rank {} has unsupported checkpoint format {}",
+                        rank.rank,
+                        rank.format
+                    );
+                }
+                if rank.manifest_kind != "rank" {
+                    bail!(
+                        "EP rank {} manifest_kind must be rank, got {}",
+                        rank.rank,
+                        rank.manifest_kind
+                    );
+                }
+                if rank.world_size != self.parallel.expert_model_parallel_size {
+                    bail!(
+                        "EP rank {} world_size {} does not match global EP size {}",
+                        rank.rank,
+                        rank.world_size,
+                        self.parallel.expert_model_parallel_size
+                    );
+                }
+                if rank.global_step != self.global_step {
+                    bail!(
+                        "EP rank {} global_step {} does not match global step {}",
+                        rank.rank,
+                        rank.global_step,
+                        self.global_step
+                    );
+                }
+                if rank.optimizer != self.optimizer {
+                    bail!(
+                        "EP rank {} optimizer {} does not match global optimizer {}",
+                        rank.rank,
+                        rank.optimizer,
+                        self.optimizer
+                    );
+                }
+                if rank.shards.is_empty() {
+                    bail!("EP rank {} checkpoint has no shards", rank.rank);
+                }
+                Ok(rank)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        ranks.sort_by_key(|rank| rank.rank);
+        for (expected_rank, rank) in ranks.iter().enumerate() {
+            if rank.rank != expected_rank || rank.local_rank != expected_rank {
+                bail!(
+                    "EP global checkpoint rank ordering mismatch: expected rank/local_rank {}, got {}/{}",
+                    expected_rank,
+                    rank.rank,
+                    rank.local_rank
+                );
+            }
+            if rank.owned_expert_start != expected_start {
+                bail!(
+                    "EP rank {} owned expert start {} does not continue from {}",
+                    rank.rank,
+                    rank.owned_expert_start,
+                    expected_start
+                );
+            }
+            if rank.owned_expert_end <= rank.owned_expert_start {
+                bail!("EP rank {} owns an empty expert range", rank.rank);
+            }
+            expected_start = rank.owned_expert_end;
+            for shard in &rank.shards {
+                if shard.partition != "expert_model_parallel" {
+                    bail!(
+                        "EP rank {} shard {} has unexpected partition {}",
+                        rank.rank,
+                        shard.name,
+                        shard.partition
+                    );
+                }
+                if shard.global_shape.is_empty() || shard.shard_shape.is_empty() {
+                    bail!(
+                        "EP rank {} shard {} is missing shape metadata",
+                        rank.rank,
+                        shard.name
+                    );
+                }
+                if shard.dtype.is_empty() {
+                    bail!(
+                        "EP rank {} shard {} is missing dtype",
+                        rank.rank,
+                        shard.name
+                    );
+                }
+            }
+        }
+        if expected_start != ep_expert_count() {
+            bail!(
+                "EP global checkpoint covers {} experts, expected {}",
+                expected_start,
+                ep_expert_count()
+            );
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -1155,6 +1328,8 @@ pub fn run_expert_parallel_tch_moe_rank_smoke(output_dir: PathBuf) -> Result<()>
         &first_step.updated_state,
         &adam,
     )?;
+    let ep_global_manifest_output =
+        write_ep_tch_moe_global_checkpoint_manifest(&output_dir, rank, world_size, &checkpoint)?;
     let reloaded = read_ep_tch_moe_rank_checkpoint(&checkpoint)?;
     let reloaded_up = reloaded.expert_up.to_device(device);
     let reloaded_down = reloaded.expert_down.to_device(device);
@@ -1284,6 +1459,7 @@ pub fn run_expert_parallel_tch_moe_rank_smoke(output_dir: PathBuf) -> Result<()>
         expert_up_grad_norm: first_step.up_grad_norm,
         expert_down_grad_norm: first_step.down_grad_norm,
         checkpoint_manifest_output: checkpoint.manifest_path.display().to_string(),
+        ep_global_manifest_output: ep_global_manifest_output.display().to_string(),
         checkpoint_model_safetensors: checkpoint.model_safetensors.display().to_string(),
         checkpoint_optimizer_safetensors: checkpoint.optimizer_safetensors.display().to_string(),
         checkpoint_tensor_count: checkpoint.tensor_count,
@@ -2495,6 +2671,7 @@ fn write_ep_rank_checkpoint(
 
     let manifest = ExpertParallelCheckpointManifest {
         format: "rustrain.ep_sharded.v1".to_string(),
+        manifest_kind: "rank".to_string(),
         rank,
         world_size,
         local_rank,
@@ -2622,6 +2799,7 @@ fn write_ep_tch_moe_rank_checkpoint(
 
     let manifest = ExpertParallelCheckpointManifest {
         format: "rustrain.ep_sharded.v1".to_string(),
+        manifest_kind: "rank".to_string(),
         rank,
         world_size,
         local_rank,
@@ -2680,6 +2858,99 @@ fn write_ep_tch_moe_rank_checkpoint(
         optimizer_safetensors,
         tensor_count: manifest.shards.len(),
     })
+}
+
+fn wait_for_ep_rank_barrier(
+    dir: &Path,
+    rank: usize,
+    world_size: usize,
+    timeout: Duration,
+) -> Result<()> {
+    fs::create_dir_all(dir).with_context(|| format!("failed to create {}", dir.display()))?;
+    let ready_path = dir.join(format!("rank-{rank}.ready"));
+    fs::write(&ready_path, b"ready")
+        .with_context(|| format!("failed to write {}", ready_path.display()))?;
+    let start = Instant::now();
+    loop {
+        let all_ready = (0..world_size).all(|rank| dir.join(format!("rank-{rank}.ready")).exists());
+        if all_ready {
+            return Ok(());
+        }
+        if start.elapsed() > timeout {
+            bail!("timed out waiting for EP barrier {}", dir.display());
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+fn write_ep_tch_moe_global_checkpoint_manifest(
+    output_dir: &Path,
+    rank: usize,
+    world_size: usize,
+    checkpoint: &ExpertParallelCheckpointWrite,
+) -> Result<PathBuf> {
+    let rank_manifest_link = output_dir.join(format!("ep-tch-moe-manifest-rank-{rank}.json"));
+    let rank_manifest_text = fs::read_to_string(&checkpoint.manifest_path)
+        .with_context(|| format!("failed to read {}", checkpoint.manifest_path.display()))?;
+    fs::write(&rank_manifest_link, &rank_manifest_text)
+        .with_context(|| format!("failed to write {}", rank_manifest_link.display()))?;
+    wait_for_ep_rank_barrier(
+        &output_dir.join("ep-tch-moe-rank-manifests-written"),
+        rank,
+        world_size,
+        Duration::from_secs(300),
+    )?;
+
+    let global_manifest_output = output_dir.join("ep-tch-moe-sharded-global.json");
+    if rank == 0 {
+        let mut ranks = Vec::with_capacity(world_size);
+        for shard_rank in 0..world_size {
+            let rank_manifest_path =
+                output_dir.join(format!("ep-tch-moe-manifest-rank-{shard_rank}.json"));
+            let text = fs::read_to_string(&rank_manifest_path)
+                .with_context(|| format!("failed to read {}", rank_manifest_path.display()))?;
+            let rank_manifest: ExpertParallelCheckpointManifest = serde_json::from_str(&text)
+                .with_context(|| format!("failed to parse {}", rank_manifest_path.display()))?;
+            ranks.push(rank_manifest);
+        }
+        let manifest = ExpertParallelGlobalCheckpointManifest {
+            format: "rustrain.ep_sharded.v1".to_string(),
+            manifest_kind: "global".to_string(),
+            global_step: 1,
+            consumed_samples: ep_tokens().nrows() as u64,
+            consumed_tokens: ep_tokens().nrows() as u64,
+            dtype: "float32".to_string(),
+            optimizer: "adamw".to_string(),
+            scheduler: "constant".to_string(),
+            parallel: ExpertParallelGlobalParallelManifest {
+                data_parallel_size: 1,
+                tensor_model_parallel_size: 1,
+                pipeline_model_parallel_size: 1,
+                expert_model_parallel_size: world_size,
+                context_parallel_size: 1,
+            },
+            ranks,
+        };
+        manifest.validate()?;
+        fs::write(
+            &global_manifest_output,
+            serde_json::to_string_pretty(&manifest)? + "\n",
+        )
+        .with_context(|| format!("failed to write {}", global_manifest_output.display()))?;
+    }
+    wait_for_ep_rank_barrier(
+        &output_dir.join("ep-tch-moe-global-manifest-written"),
+        rank,
+        world_size,
+        Duration::from_secs(300),
+    )?;
+    let global_text = fs::read_to_string(&global_manifest_output)
+        .with_context(|| format!("failed to read {}", global_manifest_output.display()))?;
+    let global_manifest: ExpertParallelGlobalCheckpointManifest =
+        serde_json::from_str(&global_text)
+            .with_context(|| format!("failed to parse {}", global_manifest_output.display()))?;
+    global_manifest.validate()?;
+    Ok(global_manifest_output)
 }
 
 fn read_ep_tch_moe_rank_checkpoint(

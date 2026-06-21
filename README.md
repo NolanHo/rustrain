@@ -218,9 +218,12 @@ gradients through real autograd, verifies positive expert gradients and
 loss-reducing AdamW updates, then writes two rank-owned expert shards under
 `rustrain.ep_sharded.v1` and verifies reload plus next-step parity. Production
 EP now also has a focused trainer-entry config, `configs/tch_moe_ep2.toml`,
-which runs the same two-rank path through `train --config`. Full production EP
-is still open: autograd-aware sparse collectives, trainer-owned production MoE
-integration, and full expert optimizer/checkpoint ownership are not implemented.
+which runs the same two-rank path through `train --config` and writes a shared
+`rustrain.ep_sharded.v1` global manifest that embeds the two rank manifests,
+the EP topology, global step, consumed sample/token counts, dtype, optimizer,
+and scheduler metadata. Full production EP is still open: autograd-aware sparse
+collectives, trainer-owned production MoE integration, and full expert
+optimizer/checkpoint ownership are not implemented.
 Full production Qwen trainer ownership, full real data streaming, and
 production-grade sharded checkpoint ownership remain open.
 

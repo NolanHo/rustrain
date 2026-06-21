@@ -54,6 +54,8 @@ expected = {
 evidence = []
 source_tokens = []
 owned_tokens = []
+global_manifest_paths = set()
+rank_manifest_payloads = {}
 for path in rank_summaries:
     data = json.loads(path.read_text())
     rank = int(data["rank"])
@@ -106,6 +108,8 @@ for path in rank_summaries:
     manifest = json.loads(manifest_path.read_text())
     if manifest["format"] != "rustrain.ep_sharded.v1":
         raise SystemExit(f"{manifest_path} unexpected format {manifest['format']}")
+    if manifest.get("manifest_kind") != "rank":
+        raise SystemExit(f"{manifest_path} expected rank manifest_kind, got {manifest.get('manifest_kind')}")
     if manifest["rank"] != rank or manifest["world_size"] != 2:
         raise SystemExit(f"{manifest_path} rank/world_size mismatch")
     if [manifest["owned_expert_start"], manifest["owned_expert_end"]] != owned_range:
@@ -115,6 +119,20 @@ for path in rank_summaries:
     shard_names = sorted(shard["shard_name"] for shard in manifest["shards"])
     if shard_names != ["experts.down.weight", "experts.up.weight"]:
         raise SystemExit(f"{manifest_path} unexpected shard names {shard_names}")
+    for shard in manifest["shards"]:
+        if shard["partition"] != "expert_model_parallel":
+            raise SystemExit(f"{manifest_path} shard {shard['name']} unexpected partition {shard['partition']}")
+        if shard["dtype"] != "float32":
+            raise SystemExit(f"{manifest_path} shard {shard['name']} unexpected dtype {shard['dtype']}")
+        if not shard["global_shape"] or not shard["shard_shape"]:
+            raise SystemExit(f"{manifest_path} shard {shard['name']} missing shapes")
+        if not shard["optimizer_m_name"] or not shard["optimizer_v_name"]:
+            raise SystemExit(f"{manifest_path} shard {shard['name']} missing optimizer slot names")
+    global_manifest_path = pathlib.Path(data["ep_global_manifest_output"])
+    if not global_manifest_path.exists():
+        raise SystemExit(f"{path} missing EP global manifest {global_manifest_path}")
+    global_manifest_paths.add(str(global_manifest_path))
+    rank_manifest_payloads[rank] = manifest
     source_tokens.extend(data["source_token_indices"])
     owned_tokens.extend(data["owned_token_indices"])
     evidence.append(
@@ -134,16 +152,56 @@ if sorted(source_tokens) != [0, 1, 2, 3]:
 if sorted(owned_tokens) != [0, 1, 2, 3]:
     raise SystemExit(f"owned token coverage is wrong: {owned_tokens}")
 
+if len(global_manifest_paths) != 1:
+    raise SystemExit(f"expected one shared EP global manifest, got {sorted(global_manifest_paths)}")
+global_manifest_path = pathlib.Path(next(iter(global_manifest_paths)))
+global_manifest = json.loads(global_manifest_path.read_text())
+if global_manifest["format"] != "rustrain.ep_sharded.v1":
+    raise SystemExit(f"{global_manifest_path} unexpected global format {global_manifest['format']}")
+if global_manifest.get("manifest_kind") != "global":
+    raise SystemExit(f"{global_manifest_path} expected global manifest_kind, got {global_manifest.get('manifest_kind')}")
+parallel = global_manifest["parallel"]
+expected_parallel = {
+    "data_parallel_size": 1,
+    "tensor_model_parallel_size": 1,
+    "pipeline_model_parallel_size": 1,
+    "expert_model_parallel_size": 2,
+    "context_parallel_size": 1,
+}
+if parallel != expected_parallel:
+    raise SystemExit(f"{global_manifest_path} unexpected parallel config {parallel}")
+if global_manifest["global_step"] != 1:
+    raise SystemExit(f"{global_manifest_path} expected global_step 1, got {global_manifest['global_step']}")
+if global_manifest["optimizer"] != "adamw" or global_manifest["scheduler"] != "constant":
+    raise SystemExit(f"{global_manifest_path} unexpected optimizer/scheduler")
+if global_manifest["consumed_samples"] != 4 or global_manifest["consumed_tokens"] != 4:
+    raise SystemExit(f"{global_manifest_path} unexpected consumed samples/tokens")
+if len(global_manifest["ranks"]) != 2:
+    raise SystemExit(f"{global_manifest_path} expected two rank manifests, got {len(global_manifest['ranks'])}")
+global_ranks = sorted(global_manifest["ranks"], key=lambda item: item["rank"])
+if [rank["rank"] for rank in global_ranks] != [0, 1]:
+    raise SystemExit(f"{global_manifest_path} rank coverage is wrong")
+expert_ranges = [[rank["owned_expert_start"], rank["owned_expert_end"]] for rank in global_ranks]
+if expert_ranges != [[0, 2], [2, 4]]:
+    raise SystemExit(f"{global_manifest_path} unexpected expert ranges {expert_ranges}")
+for global_rank in global_ranks:
+    rank = global_rank["rank"]
+    if global_rank != rank_manifest_payloads[rank]:
+        raise SystemExit(f"{global_manifest_path} embedded rank {rank} manifest differs from rank manifest")
+
 for rank in [0, 1]:
     log_text = pathlib.Path(launch_summary["ranks"][rank]["log_path"]).read_text()
     if "rustrain tch MoE EP trainer-entry complete" not in log_text:
         raise SystemExit(f"rank {rank} log did not include trainer-entry completion marker")
+    if str(global_manifest_path) not in log_text:
+        raise SystemExit(f"rank {rank} log did not include EP global manifest path")
 
 print(
     json.dumps(
         {
             "tch_moe_ep2_trainer_verified": evidence,
             "assigned_cuda_visible_devices": assigned,
+            "ep_global_manifest_output": str(global_manifest_path),
         },
         indent=2,
     )

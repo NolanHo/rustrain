@@ -170,7 +170,12 @@ shard. This is checkpoint-contract evidence for rank-owned `tch-rs` expert MLP
 parameters after sparse send/recv dispatch and gradient return; it is not a
 production MoE trainer checkpoint. The same focused EP path is wired through
 `train --config configs/tch_moe_ep2.toml`, so the trainer entrypoint produces
-the same rank-owned checkpoint artifacts under a launch output directory.
+the same rank-owned checkpoint artifacts under a launch output directory and a
+shared `rustrain.ep_sharded.v1` global manifest. The global manifest is marked
+with `manifest_kind = "global"` and embeds the two rank manifests plus the EP
+parallel topology, global step, consumed sample/token counts, dtype, optimizer,
+and scheduler metadata. Rank manifests are marked with `manifest_kind = "rank"`;
+the field defaults to `rank` for backward-compatible readers.
 
 Required manifest structure:
 

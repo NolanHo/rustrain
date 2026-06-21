@@ -497,6 +497,12 @@ pub fn train(config_path: &Path, resume_from: Option<PathBuf>) -> Result<()> {
         println!("run_dir: {}", run_paths.root.display());
         println!("resolved_config: {}", run_paths.resolved_config.display());
         println!("rank_output_dir: {}", rank_output_dir.display());
+        println!(
+            "ep_global_manifest_output: {}",
+            rank_output_dir
+                .join("ep-tch-moe-sharded-global.json")
+                .display()
+        );
 
         return Ok(());
     }
