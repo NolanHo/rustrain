@@ -138,8 +138,8 @@ representative DP path is available through
 trainable transformer layers from `model.trainable_layers` and defaults to
 `[0]`; `configs/qwen_session_single_layers01.toml` verifies a layer0+layer1
 single-GPU path with 26 trainable tensors. Full production Qwen trainer
-ownership, real data batching, and production-grade sharded checkpoint/resume
-rules remain open.
+ownership, full real data streaming, and production-grade sharded checkpoint
+ownership remain open.
 
 ## Current Major Gaps
 
@@ -149,8 +149,8 @@ rules remain open.
   also has rank0 delta/optimizer artifacts and next-step resume parity. A
   production sharded checkpoint schema is defined and validated, and the
   representative DP smoke writes rank-owned shard manifests and verifies
-  rank-local sharded reload loss parity. The single-GPU session trainer also
-  has a tokenizer-backed JSONL batch/resume verifier at
+  rank-local sharded reload plus next-step resume parity. The single-GPU
+  session trainer also has a tokenizer-backed JSONL batch/resume verifier at
   `configs/qwen_session_single_sft.toml`; the DP=2 session trainer has the
   same JSONL batch path at `configs/qwen_session_dp2_sft.toml`. Production
   checkpoint/resume over full real data streams remains open.
@@ -192,8 +192,8 @@ rules remain open.
 - Production distributed checkpoint rules are documented in
   [docs/checkpoints.md](docs/checkpoints.md), with a validated
   `rustrain.qwen_sharded.v1` manifest schema and representative rank-owned
-  writer/restore smoke. Production sharded restore and next-step resume over
-  real data batches are not implemented yet.
+  writer/restore/next-step resume smoke. Full production sharded resume over
+  external streaming real data remains open.
 - Trainer production basics such as scheduler, grad clipping, RSS memory
   metrics, and Ray-worker GPU memory reporting are implemented for toy/tch
   paths; real tokenizer-backed padded LoRA SFT batching is wired through

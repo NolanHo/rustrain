@@ -38,6 +38,13 @@ for path in rank_summaries:
         raise SystemExit(
             f"{path} sharded_reload_delta {sharded_reload_delta} exceeds tolerance"
         )
+    sharded_next_step_delta = data.get("sharded_next_step_delta")
+    if sharded_next_step_delta is None:
+        raise SystemExit(f"{path} is missing sharded_next_step_delta")
+    if sharded_next_step_delta > 1e-5:
+        raise SystemExit(
+            f"{path} sharded_next_step_delta {sharded_next_step_delta} exceeds tolerance"
+        )
     if expected_dtype and data.get("dtype") != expected_dtype:
         raise SystemExit(
             f"{path} dtype {data.get('dtype')} does not match expected {expected_dtype}"
@@ -143,6 +150,7 @@ for path in rank_summaries:
             "sequence_tokens": data.get("sequence_tokens"),
             "reload_delta": data["reload_delta"],
             "sharded_reload_delta": sharded_reload_delta,
+            "sharded_next_step_delta": sharded_next_step_delta,
             "sharded_global_manifest_output": data["sharded_global_manifest_output"],
         }
     )

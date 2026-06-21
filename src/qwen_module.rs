@@ -387,6 +387,9 @@ struct QwenSessionDpRankSummary {
     continuous_next_loss: f64,
     resumed_next_loss: f64,
     next_step_delta: f64,
+    sharded_continuous_next_loss: f64,
+    sharded_resumed_next_loss: f64,
+    sharded_next_step_delta: f64,
     trainable_tensors: Vec<String>,
 }
 
@@ -3335,6 +3338,44 @@ pub fn qwen_session_dp_rank_smoke(
             "Qwen session DP sharded checkpoint reload parity failed: rank={rank}, post_update_loss={post_update_loss}, sharded_reloaded_loss={sharded_reloaded_loss}, sharded_reload_delta={sharded_reload_delta}"
         );
     }
+    let mut sharded_continuous_session = QwenTrainableSession::from_manifest_on_device(
+        config,
+        read_safetensors_map(&model_path.join("model.safetensors"))?,
+        local_input.shallow_clone(),
+        dtype.kind(),
+        &delta_manifest,
+        Some(device),
+    )?;
+    sharded_continuous_session.set_input_ids(&local_next_step_batch);
+    sharded_resumed_session.set_input_ids(&local_next_step_batch);
+    sharded_continuous_session.loss_and_backward()?;
+    sharded_resumed_session.loss_and_backward()?;
+    let sharded_continuous_next_grads = sharded_continuous_session.all_reduce_average_grads(
+        &output_dir.join("qwen-session-dp-sharded-continuous-next-gradient"),
+        world_size,
+    )?;
+    let sharded_resumed_next_grads = sharded_resumed_session.all_reduce_average_grads(
+        &output_dir.join("qwen-session-dp-sharded-resumed-next-gradient"),
+        world_size,
+    )?;
+    sharded_continuous_session.apply_adamw_step(
+        &sharded_continuous_next_grads,
+        learning_rate,
+        (steps + 1) as i32,
+    )?;
+    sharded_resumed_session.apply_adamw_step(
+        &sharded_resumed_next_grads,
+        learning_rate,
+        (steps + 1) as i32,
+    )?;
+    let sharded_continuous_next_loss = sharded_continuous_session.loss_value()?;
+    let sharded_resumed_next_loss = sharded_resumed_session.loss_value()?;
+    let sharded_next_step_delta = (sharded_continuous_next_loss - sharded_resumed_next_loss).abs();
+    if sharded_next_step_delta > 1e-5 {
+        bail!(
+            "Qwen session DP sharded checkpoint resume parity failed: rank={rank}, sharded_continuous_next_loss={sharded_continuous_next_loss}, sharded_resumed_next_loss={sharded_resumed_next_loss}, sharded_next_step_delta={sharded_next_step_delta}"
+        );
+    }
 
     let summary = QwenSessionDpRankSummary {
         rank,
@@ -3382,6 +3423,9 @@ pub fn qwen_session_dp_rank_smoke(
         continuous_next_loss,
         resumed_next_loss,
         next_step_delta,
+        sharded_continuous_next_loss,
+        sharded_resumed_next_loss,
+        sharded_next_step_delta,
         trainable_tensors,
     };
     let summary_path = output_dir.join(format!("qwen-session-dp-rank-{rank}.json"));
