@@ -98,9 +98,9 @@ The reserved manifest identifier is `rustrain.qwen_sharded.v1`. The current code
 defines and validates this schema, and the representative Qwen session DP smoke
 writes rank-owned shard manifests plus a global manifest. The representative
 2-rank trainer verification restores each rank from its rank-owned model and
-optimizer safetensors through the global manifest and verifies reload loss
-parity. Production sharded restore over real data batches, including next-step
-resume parity, remains open.
+optimizer safetensors through the global manifest, verifies reload loss parity,
+and verifies next-step resume parity against a continuous rank0-manifest run.
+Full production sharded restore over external streaming real data remains open.
 
 Required manifest structure:
 
@@ -119,10 +119,12 @@ Minimum acceptance before calling production sharded checkpointing implemented:
 
 - A DP=2 or TP=2 Qwen training path writes distinct rank-owned shard files.
 - A fresh launched production run restores those shards without reading
-  rank0-only model deltas as the source of truth.
+  rank0-only model deltas as the source of truth. Representative DP session
+  smoke coverage exists; production run ownership remains open.
 - The restored production run reproduces loss before the next step within
-  tolerance.
-- The next step after restore matches a continuous run within tolerance.
+  tolerance. Done for the representative DP session smoke.
+- The next step after restore matches a continuous run within tolerance. Done
+  for the representative DP session smoke.
 - Manifest validation rejects missing rank shards, wrong world size, wrong
   parallel config, and missing optimizer slots.
 
