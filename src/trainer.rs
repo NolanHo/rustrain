@@ -212,6 +212,7 @@ pub fn train(config_path: &Path, resume_from: Option<PathBuf>) -> Result<()> {
             response_masked_positions = summary.response_masked_positions,
             padding_tokens = summary.padding_tokens,
             adapter_checkpoint = %summary.adapter_output,
+            step_adapter_checkpoints = ?summary.step_adapter_checkpoints,
             trainable_tensors = summary.trainable_tensors.len(),
             "qwen LoRA SFT trainer complete"
         );
@@ -219,6 +220,10 @@ pub fn train(config_path: &Path, resume_from: Option<PathBuf>) -> Result<()> {
         println!("run_dir: {}", run_paths.root.display());
         println!("resolved_config: {}", run_paths.resolved_config.display());
         println!("adapter_checkpoint: {}", summary.adapter_output);
+        println!(
+            "step_adapter_checkpoints: {:?}",
+            summary.step_adapter_checkpoints
+        );
         println!("resumed_adapter: {}", summary.resumed_adapter);
         if let Some(resume_from) = &summary.resume_from {
             println!("resume_from: {resume_from}");

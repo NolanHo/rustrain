@@ -144,6 +144,7 @@ struct QwenLoraTrainSmokeSummary {
 pub(crate) struct QwenLoraSftTrainSummary {
     pub(crate) model_path: String,
     pub(crate) adapter_output: String,
+    pub(crate) step_adapter_checkpoints: Vec<String>,
     pub(crate) resume_from: Option<String>,
     pub(crate) resumed_adapter: bool,
     pub(crate) target_layers: Vec<usize>,
@@ -1060,9 +1061,11 @@ pub fn qwen_lora_sft_smoke(
 ) -> Result<()> {
     let lora_config = QwenLoraConfig::layer0_qv(rank, alpha)?;
     let sft_paths = sft_jsonl.map(|path| vec![path.to_path_buf()]);
+    let checkpoint_dir = adapter_output.parent().unwrap_or_else(|| Path::new("."));
     let summary = qwen_lora_sft_train(
         model_path,
         adapter_output,
+        checkpoint_dir,
         sft_paths.as_deref(),
         None,
         sft_batch_size,
@@ -1073,6 +1076,7 @@ pub fn qwen_lora_sft_smoke(
         1,
         0.5,
         1,
+        0,
         QwenLoraSftTrainPolicy::constant_without_clip(),
     )?;
     println!("{}", serde_json::to_string_pretty(&summary)?);
@@ -1123,6 +1127,7 @@ pub fn train_qwen_lora_sft_from_config(
     qwen_lora_sft_train(
         model_path,
         &adapter_output,
+        &run_paths.checkpoints,
         Some(&data.paths),
         config.train.resume_from.as_deref(),
         config.train.micro_batch_size,
@@ -1133,6 +1138,7 @@ pub fn train_qwen_lora_sft_from_config(
         config.train.max_steps as usize,
         data.train_split,
         config.train.gradient_accumulation_steps,
+        config.train.checkpoint_every,
         QwenLoraSftTrainPolicy::from_config(config),
     )
 }
@@ -1141,6 +1147,7 @@ pub fn train_qwen_lora_sft_from_config(
 fn qwen_lora_sft_train(
     model_path: &Path,
     adapter_output: &Path,
+    checkpoint_dir: &Path,
     sft_paths: Option<&[PathBuf]>,
     resume_from: Option<&Path>,
     sft_batch_size: usize,
@@ -1151,6 +1158,7 @@ fn qwen_lora_sft_train(
     steps: usize,
     train_split: f32,
     gradient_accumulation_steps: usize,
+    checkpoint_every: u64,
     policy: QwenLoraSftTrainPolicy,
 ) -> Result<QwenLoraSftTrainSummary> {
     if learning_rate <= 0.0 {
@@ -1254,6 +1262,7 @@ fn qwen_lora_sft_train(
     let mut final_step_grad_norm = 0.0;
     let mut final_step_clipped_grad_norm = 0.0;
     let mut final_learning_rate = learning_rate;
+    let mut step_adapter_checkpoints = Vec::new();
     let train_started = Instant::now();
 
     for step in 0..steps {
@@ -1328,6 +1337,12 @@ fn qwen_lora_sft_train(
                 grad_norm,
                 delta_norm,
             });
+        }
+        if checkpoint_every > 0 && (step_number as u64) % checkpoint_every == 0 {
+            let step_adapter_output =
+                checkpoint_dir.join(format!("qwen-lora-sft-step-{step_number}.safetensors"));
+            registry.save(&step_adapter_output)?;
+            step_adapter_checkpoints.push(step_adapter_output.display().to_string());
         }
     }
     let train_elapsed_secs = train_started.elapsed().as_secs_f64().max(1e-9);
@@ -1452,6 +1467,7 @@ fn qwen_lora_sft_train(
     let summary = QwenLoraSftTrainSummary {
         model_path: model_path.display().to_string(),
         adapter_output: adapter_output.display().to_string(),
+        step_adapter_checkpoints,
         resume_from: resume_from.map(|path| path.display().to_string()),
         resumed_adapter: resume_from.is_some(),
         target_layers: lora_config.target_layers.clone(),
