@@ -5,9 +5,18 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/require_gpu_worker.sh"
 
 MAX_NEW_TOKENS="${RUSTRAIN_QWEN_KV_CACHE_MAX_NEW_TOKENS:-4}"
+FIXTURE="$(mktemp --suffix=.safetensors)"
+SUMMARY="$(mktemp --suffix=.json)"
 OUTPUT="$(mktemp)"
 
-cargo run -- qwen-kv-cache-parity --max-new-tokens "${MAX_NEW_TOKENS}" | tee "${OUTPUT}"
+python scripts/python_reference/qwen_generate.py \
+  --max-new-tokens "${MAX_NEW_TOKENS}" \
+  --output "${FIXTURE}" \
+  --summary-output "${SUMMARY}"
+
+cargo run -- qwen-kv-cache-parity \
+  --reference-fixture "${FIXTURE}" \
+  --max-new-tokens "${MAX_NEW_TOKENS}" | tee "${OUTPUT}"
 
 python - "${OUTPUT}" "${MAX_NEW_TOKENS}" <<'PY'
 import json
@@ -27,8 +36,10 @@ required = [
     "max_new_tokens",
     "full_context_ids",
     "cached_ids",
+    "python_cached_ids",
     "new_token_ids",
     "reference_match",
+    "python_cached_reference_match",
 ]
 missing = [key for key in required if key not in summary]
 if missing:
@@ -41,6 +52,10 @@ if summary["reference_match"] is not True:
     raise SystemExit("cached greedy generation did not match full-context generation")
 if summary["full_context_ids"] != summary["cached_ids"]:
     raise SystemExit("full_context_ids and cached_ids differ")
+if summary["python_cached_reference_match"] is not True:
+    raise SystemExit("cached greedy generation did not match Python cached reference")
+if summary["python_cached_ids"] != summary["cached_ids"]:
+    raise SystemExit("python_cached_ids and cached_ids differ")
 prompt_len = int(summary["prompt_len"])
 expected_len = prompt_len + expected_new_tokens
 if len(summary["cached_ids"]) != expected_len:

@@ -57,7 +57,30 @@ def main() -> None:
         logits = model(input_ids=generated, use_cache=False).logits
         next_token = logits[:, -1].argmax(dim=-1, keepdim=True)
         generated = torch.cat([generated, next_token], dim=1)
+
+    cached_generated = inputs["input_ids"]
+    outputs = model(input_ids=cached_generated, use_cache=True)
+    past_key_values = outputs.past_key_values
+    next_token = outputs.logits[:, -1].argmax(dim=-1, keepdim=True)
+    for step in range(args.max_new_tokens):
+        cached_generated = torch.cat([cached_generated, next_token], dim=1)
+        if step + 1 == args.max_new_tokens:
+            break
+        outputs = model(
+            input_ids=next_token,
+            past_key_values=past_key_values,
+            use_cache=True,
+        )
+        past_key_values = outputs.past_key_values
+        next_token = outputs.logits[:, -1].argmax(dim=-1, keepdim=True)
+
     generated = generated.cpu().contiguous()
+    cached_generated = cached_generated.cpu().contiguous()
+    if not torch.equal(generated, cached_generated):
+        raise RuntimeError(
+            "cached greedy generation diverged from full-context generation: "
+            f"full={generated[0].tolist()} cached={cached_generated[0].tolist()}"
+        )
     generated_text = tokenizer.decode(generated[0], skip_special_tokens=False)
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
@@ -65,6 +88,7 @@ def main() -> None:
         {
             "input_ids": inputs["input_ids"].cpu().contiguous(),
             "generated_ids": generated,
+            "cached_generated_ids": cached_generated,
         },
         args.output,
     )
@@ -75,6 +99,7 @@ def main() -> None:
         "prompt": prompt,
         "input_ids": inputs["input_ids"][0].tolist(),
         "generated_ids": generated[0].tolist(),
+        "cached_generated_ids": cached_generated[0].tolist(),
         "new_token_ids": generated[0, inputs["input_ids"].shape[1] :].tolist(),
         "max_new_tokens": args.max_new_tokens,
         "generated_text": generated_text,

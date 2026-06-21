@@ -211,8 +211,10 @@ struct QwenGenerateParitySummary {
     prompt_len: usize,
     max_new_tokens: usize,
     generated_ids: Vec<i64>,
+    cached_generated_ids: Option<Vec<i64>>,
     new_token_ids: Vec<i64>,
     reference_match: bool,
+    cached_reference_match: Option<bool>,
 }
 
 #[derive(Debug, Serialize)]
@@ -237,10 +239,12 @@ struct QwenKvCacheParitySummary {
     reference_fixture: String,
     prompt_len: usize,
     max_new_tokens: usize,
+    python_cached_ids: Option<Vec<i64>>,
     full_context_ids: Vec<i64>,
     cached_ids: Vec<i64>,
     new_token_ids: Vec<i64>,
     reference_match: bool,
+    python_cached_reference_match: Option<bool>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1530,6 +1534,16 @@ pub fn qwen_generate_parity(model_path: &Path, reference_fixture: &Path) -> Resu
     let reference = read_safetensors_map(reference_fixture)?;
     let input_ids = tensor(&reference, "input_ids")?.to_kind(Kind::Int64);
     let expected_generated = tensor(&reference, "generated_ids")?.to_kind(Kind::Int64);
+    let expected_cached_ids = if let Some(expected_cached) = reference.get("cached_generated_ids") {
+        Some(Vec::<i64>::try_from(
+            expected_cached
+                .to_kind(Kind::Int64)
+                .reshape([-1])
+                .to_device(Device::Cpu),
+        )?)
+    } else {
+        None
+    };
     let expected_ids: Vec<i64> =
         Vec::<i64>::try_from(expected_generated.reshape([-1]).to_device(Device::Cpu))?;
     let prompt_len = input_ids.size()[1] as usize;
@@ -1551,6 +1565,16 @@ pub fn qwen_generate_parity(model_path: &Path, reference_fixture: &Path) -> Resu
             generated_ids
         );
     }
+    let cached_reference_match = expected_cached_ids
+        .as_ref()
+        .map(|cached_ids| cached_ids == &generated_ids);
+    if cached_reference_match == Some(false) {
+        bail!(
+            "cached Python greedy generation fixture differs from Rust full-context generation: expected {:?}, got {:?}",
+            expected_cached_ids.as_ref().expect("checked Some"),
+            generated_ids
+        );
+    }
     let summary = QwenGenerateParitySummary {
         model_path: model_path.display().to_string(),
         reference_fixture: reference_fixture.display().to_string(),
@@ -1558,7 +1582,9 @@ pub fn qwen_generate_parity(model_path: &Path, reference_fixture: &Path) -> Resu
         max_new_tokens,
         new_token_ids: generated_ids[prompt_len..].to_vec(),
         generated_ids,
+        cached_generated_ids: expected_cached_ids,
         reference_match,
+        cached_reference_match,
     };
     println!("{}", serde_json::to_string_pretty(&summary)?);
 
@@ -1646,6 +1672,16 @@ pub fn qwen_kv_cache_parity(
     let weights = read_safetensors_map(&model_path.join("model.safetensors"))?;
     let reference = read_safetensors_map(reference_fixture)?;
     let input_ids = tensor(&reference, "input_ids")?.to_kind(Kind::Int64);
+    let python_cached_ids = if let Some(expected_cached) = reference.get("cached_generated_ids") {
+        Some(Vec::<i64>::try_from(
+            expected_cached
+                .to_kind(Kind::Int64)
+                .reshape([-1])
+                .to_device(Device::Cpu),
+        )?)
+    } else {
+        None
+    };
     let prompt_len = input_ids.size()[1] as usize;
     let full_context = qwen_greedy_generate(&input_ids, &weights, &config, max_new_tokens)?;
     let cached = qwen_greedy_generate_with_cache(&input_ids, &weights, &config, max_new_tokens)?;
@@ -1660,16 +1696,28 @@ pub fn qwen_kv_cache_parity(
             cached_ids
         );
     }
+    let python_cached_reference_match = python_cached_ids
+        .as_ref()
+        .map(|reference_ids| reference_ids == &cached_ids);
+    if python_cached_reference_match == Some(false) {
+        bail!(
+            "KV-cache greedy parity failed against Python cached generation: python={:?}, rust={:?}",
+            python_cached_ids.as_ref().expect("checked Some"),
+            cached_ids
+        );
+    }
 
     let summary = QwenKvCacheParitySummary {
         model_path: model_path.display().to_string(),
         reference_fixture: reference_fixture.display().to_string(),
         prompt_len,
         max_new_tokens,
+        python_cached_ids,
         new_token_ids: cached_ids[prompt_len..].to_vec(),
         full_context_ids,
         cached_ids,
         reference_match,
+        python_cached_reference_match,
     };
     println!("{}", serde_json::to_string_pretty(&summary)?);
 
