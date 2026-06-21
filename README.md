@@ -133,8 +133,8 @@ checks global loss improvement, writes rank0 delta and AdamW optimizer
 safetensors, and verifies next-step resume parity from that rank0 checkpoint.
 The same representative path is wired through
 `train --config configs/qwen_session_dp2.toml`; full production Qwen trainer
-ownership, real data batching, and sharded distributed checkpoint/resume rules
-remain open.
+ownership, real data batching, and production-grade sharded checkpoint/resume
+rules remain open.
 
 ## Current Major Gaps
 
@@ -143,8 +143,9 @@ remain open.
   slots and proves next-step parity. The representative Qwen DP trainer path
   also has rank0 delta/optimizer artifacts and next-step resume parity. A
   production sharded checkpoint schema is defined and validated, and the
-  representative DP smoke writes rank-owned shard manifests. Sharded restore is
-  still open.
+  representative DP smoke writes rank-owned shard manifests and verifies
+  rank-local sharded reload loss parity. Production checkpoint/resume over real
+  data batches remains open.
 - C4/G1 trainer-owned Qwen training is still incomplete, but the full-train
   smoke now uses a reusable `QwenTrainableSession` surface, and representative
   single-GPU plus DP=2 config paths are wired through `train --config`. Full
@@ -168,11 +169,12 @@ remain open.
   representative `QwenTrainableSession` DP smokes, and a representative Qwen
   DP `train --config` path with rank0 checkpoint/resume parity exist. Real
   production distributed training is still missing: full Qwen model/data and
-  sharded checkpoint ownership are not yet implemented.
+  production sharded checkpoint ownership are not yet implemented.
 - Production distributed checkpoint rules are documented in
   [docs/checkpoints.md](docs/checkpoints.md), with a validated
   `rustrain.qwen_sharded.v1` manifest schema and representative rank-owned
-  writer smoke. Sharded restore is not implemented yet.
+  writer/restore smoke. Production sharded restore and next-step resume over
+  real data batches are not implemented yet.
 - Trainer production basics such as scheduler, grad clipping, RSS memory
   metrics, and Ray-worker GPU memory reporting are implemented for toy/tch
   paths; real tokenizer-backed padded LoRA SFT batching is wired through a

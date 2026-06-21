@@ -89,15 +89,18 @@ Acceptance:
 - Rank-local summaries agree on world size, train step count, tensor count,
   global loss improvement, reload delta, and next-step delta.
 
-### Future Sharded Production Checkpoints
+### Representative Sharded Checkpoints and Future Production
 
 Production distributed training must not overload the rank0 replicated format.
 It needs a separate sharded format with explicit rank-local ownership.
 
 The reserved manifest identifier is `rustrain.qwen_sharded.v1`. The current code
 defines and validates this schema, and the representative Qwen session DP smoke
-writes rank-owned shard manifests plus a global manifest. Fresh-run restore from
-those shards is still not implemented.
+writes rank-owned shard manifests plus a global manifest. The representative
+2-rank trainer verification restores each rank from its rank-owned model and
+optimizer safetensors through the global manifest and verifies reload loss
+parity. Production sharded restore over real data batches, including next-step
+resume parity, remains open.
 
 Required manifest structure:
 
@@ -112,14 +115,15 @@ Required manifest structure:
 - Optimizer shard entries for AdamW first and second moments.
 - Restore policy for replicated tensors, partitioned tensors, and tied weights.
 
-Minimum acceptance before calling sharded checkpointing implemented:
+Minimum acceptance before calling production sharded checkpointing implemented:
 
-- A DP=2 or TP=2 Qwen training smoke writes distinct rank-owned shard files.
-- A fresh launched run restores those shards without reading rank0-only model
-  deltas as the source of truth.
-- The restored run reproduces loss before the next step within tolerance.
+- A DP=2 or TP=2 Qwen training path writes distinct rank-owned shard files.
+- A fresh launched production run restores those shards without reading
+  rank0-only model deltas as the source of truth.
+- The restored production run reproduces loss before the next step within
+  tolerance.
 - The next step after restore matches a continuous run within tolerance.
 - Manifest validation rejects missing rank shards, wrong world size, wrong
   parallel config, and missing optimizer slots.
 
-Until that sharded format exists, production checkpoint/resume remains open.
+Until that production path exists, production checkpoint/resume remains open.
