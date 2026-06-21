@@ -20,7 +20,7 @@ rope = true
 rms_norm_eps = 0.000001
 
 [train]
-max_steps = 1
+max_steps = 2
 backend = "tch"
 micro_batch_size = 1
 global_batch_size = 1

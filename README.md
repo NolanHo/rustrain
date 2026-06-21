@@ -148,8 +148,9 @@ rules remain open.
   data batches remains open.
 - C4/G1 trainer-owned Qwen training is still incomplete, but the full-train
   smoke now uses a reusable `QwenTrainableSession` surface, and representative
-  single-GPU plus DP=2 config paths are wired through `train --config`. Full
-  model/data/checkpoint trainer ownership remains open.
+  single-GPU plus DP=2 config paths are wired through `train --config`. The
+  single-GPU path now respects configured `max_steps` and reports step losses.
+  Full model/data/checkpoint trainer ownership remains open.
 - G6 trainer-level real SFT data now has a minimal Qwen LoRA SFT config path:
   `train --config configs/qwen_lora_sft.toml` loads tokenizer-backed
   instruction JSONL batches, trains configured attention and MLP LoRA targets,

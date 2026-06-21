@@ -230,7 +230,9 @@ pub(crate) struct QwenFullTrainSmokeSummary {
     pub(crate) optimizer_output: String,
     pub(crate) manifest_output: String,
     pub(crate) compute_kind: String,
+    pub(crate) train_steps: usize,
     pub(crate) learning_rate: f64,
+    pub(crate) step_losses: Vec<f64>,
     pub(crate) initial_loss: f64,
     pub(crate) final_loss: f64,
     pub(crate) reloaded_loss: f64,
@@ -1999,7 +2001,9 @@ fn qwen_full_train_summary(
         optimizer_output: optimizer_output.display().to_string(),
         manifest_output: manifest_output.display().to_string(),
         compute_kind: dtype.label().to_string(),
+        train_steps: 1,
         learning_rate,
+        step_losses: vec![initial_loss, final_loss],
         initial_loss,
         final_loss,
         reloaded_loss,
@@ -2016,8 +2020,12 @@ fn qwen_session_single_summary(
     model_path: &Path,
     delta_output: &Path,
     dtype: QwenComputeDType,
+    train_steps: usize,
     learning_rate: f64,
 ) -> Result<QwenFullTrainSmokeSummary> {
+    if train_steps == 0 {
+        bail!("qwen session single trainer requires max_steps > 0");
+    }
     if learning_rate <= 0.0 {
         bail!("learning_rate must be positive");
     }
@@ -2026,9 +2034,24 @@ fn qwen_session_single_summary(
     let weights = read_safetensors_map(&model_path.join("model.safetensors"))?;
     let input_ids = qwen_session_dp_global_input(&weights, Device::Cpu)?.narrow(0, 0, 1);
     let mut session = QwenTrainableSession::from_weights(config, weights, input_ids, dtype.kind())?;
-    let first_step = session.train_step(learning_rate, 1)?;
-    let initial_loss = first_step.loss_before;
-    let final_loss = first_step.loss_after;
+    let mut step_losses = Vec::with_capacity(train_steps + 1);
+    let mut last_step = None;
+    for step in 1..=train_steps {
+        let step_result = session.train_step(learning_rate, step as i32)?;
+        if step == 1 {
+            step_losses.push(step_result.loss_before);
+        }
+        step_losses.push(step_result.loss_after);
+        last_step = Some(step_result);
+    }
+    let final_step = last_step.expect("train_steps > 0 guarantees a final step");
+    let final_artifacts = final_step.artifacts;
+    let initial_loss = *step_losses
+        .first()
+        .expect("step_losses should contain initial loss");
+    let final_loss = *step_losses
+        .last()
+        .expect("step_losses should contain final loss");
     if final_loss >= initial_loss {
         bail!(
             "Qwen session single trainer failed to reduce loss: initial_loss={initial_loss}, final_loss={final_loss}"
@@ -2039,8 +2062,7 @@ fn qwen_session_single_summary(
         fs::create_dir_all(parent)
             .with_context(|| format!("failed to create {}", parent.display()))?;
     }
-    let delta_refs: Vec<(&str, &Tensor)> = first_step
-        .artifacts
+    let delta_refs: Vec<(&str, &Tensor)> = final_artifacts
         .delta_entries
         .iter()
         .map(|(name, tensor)| (name.as_str(), tensor))
@@ -2048,8 +2070,7 @@ fn qwen_session_single_summary(
     Tensor::write_safetensors(&delta_refs, delta_output)
         .with_context(|| format!("failed to write {}", delta_output.display()))?;
     let optimizer_output = optimizer_state_path(delta_output);
-    let optimizer_refs: Vec<(&str, &Tensor)> = first_step
-        .artifacts
+    let optimizer_refs: Vec<(&str, &Tensor)> = final_artifacts
         .optimizer_entries
         .iter()
         .map(|(name, tensor)| (name.as_str(), tensor))
@@ -2063,11 +2084,11 @@ fn qwen_session_single_summary(
         reference_fixture: "qwen_session_single_fixed_tokens".to_string(),
         delta_safetensors: delta_output.display().to_string(),
         optimizer_safetensors: Some(optimizer_output.display().to_string()),
-        train_step: 1,
+        train_step: train_steps as u64,
         learning_rate,
         initial_loss,
         final_loss,
-        tensors: first_step.artifacts.manifest_tensors,
+        tensors: final_artifacts.manifest_tensors.clone(),
     };
     write_qwen_delta_manifest(&manifest_output, &manifest)?;
 
@@ -2086,10 +2107,11 @@ fn qwen_session_single_summary(
         );
     }
 
-    let resumed_second_step = resumed_session.train_step(learning_rate, 2)?;
+    let next_step = train_steps + 1;
+    let resumed_second_step = resumed_session.train_step(learning_rate, next_step as i32)?;
     let resume_loss_value = resumed_second_step.loss_before;
     let resumed_second_loss = resumed_second_step.loss_after;
-    let continuous_second_step = session.train_step(learning_rate, 2)?;
+    let continuous_second_step = session.train_step(learning_rate, next_step as i32)?;
     let continuous_second_loss = continuous_second_step.loss_after;
     let second_step_delta = (continuous_second_loss - resumed_second_loss).abs();
     if second_step_delta > 1e-5 {
@@ -2105,7 +2127,9 @@ fn qwen_session_single_summary(
         optimizer_output: optimizer_output.display().to_string(),
         manifest_output: manifest_output.display().to_string(),
         compute_kind: dtype.label().to_string(),
+        train_steps,
         learning_rate,
+        step_losses,
         initial_loss,
         final_loss,
         reloaded_loss,
@@ -2114,7 +2138,7 @@ fn qwen_session_single_summary(
         continuous_second_loss,
         resumed_second_loss,
         second_step_delta,
-        trainable_tensors: first_step.artifacts.tensor_summaries,
+        trainable_tensors: final_artifacts.tensor_summaries,
     })
 }
 
@@ -2943,6 +2967,7 @@ pub(crate) fn train_qwen_session_single_from_config(
             .checkpoints
             .join("qwen-session-single-delta.safetensors"),
         dtype,
+        config.train.max_steps as usize,
         config.train.learning_rate as f64,
     )
 }

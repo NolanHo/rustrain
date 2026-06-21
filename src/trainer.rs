@@ -129,6 +129,7 @@ pub fn train(config_path: &Path, resume_from: Option<PathBuf>) -> Result<()> {
                 final_loss = summary.final_loss,
                 reload_delta = summary.reload_delta,
                 second_step_delta = summary.second_step_delta,
+                train_steps = summary.train_steps,
                 trainable_tensors = summary.trainable_tensors.len(),
                 "qwen trainable session trainer single-rank smoke complete"
             );
@@ -138,6 +139,8 @@ pub fn train(config_path: &Path, resume_from: Option<PathBuf>) -> Result<()> {
             println!("delta_output: {}", summary.delta_output);
             println!("optimizer_output: {}", summary.optimizer_output);
             println!("manifest_output: {}", summary.manifest_output);
+            println!("train_steps: {}", summary.train_steps);
+            println!("step_losses: {:?}", summary.step_losses);
             println!("initial_loss: {:.9}", summary.initial_loss);
             println!("final_loss: {:.9}", summary.final_loss);
             println!("reloaded_loss: {:.9}", summary.reloaded_loss);
