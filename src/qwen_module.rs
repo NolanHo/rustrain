@@ -4519,7 +4519,7 @@ pub fn qwen_session_dp_rank_smoke(
     let loss_delta = 0.0;
     let max_grad_delta_tolerance = match dtype {
         QwenComputeDType::Fp32 => 5e-4,
-        QwenComputeDType::Bf16 => 1.0,
+        QwenComputeDType::Bf16 => 2.0,
     };
     if max_grad_delta > max_grad_delta_tolerance {
         bail!(

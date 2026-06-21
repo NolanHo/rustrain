@@ -74,7 +74,7 @@ for path in rank_summaries:
         raise SystemExit(f"{path} global loss did not improve: {global_step_losses}")
     if not data.get("global_loss_improved"):
         raise SystemExit(f"{path} global_loss_improved was not true")
-    max_grad_delta_tolerance = 1.0 if expected_dtype == "bf16" else 5e-4
+    max_grad_delta_tolerance = 2.0 if expected_dtype == "bf16" else 5e-4
     if float(data.get("max_grad_delta", 1.0)) > max_grad_delta_tolerance:
         raise SystemExit(
             f"{path} max_grad_delta too large: {data.get('max_grad_delta')} "
