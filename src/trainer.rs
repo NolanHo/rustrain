@@ -146,6 +146,7 @@ pub fn train(config_path: &Path, resume_from: Option<PathBuf>) -> Result<()> {
                 dataset_source_sample_counts = ?summary.dataset_source_sample_counts,
                 dataset_fingerprint = ?summary.dataset_fingerprint,
                 dataset_order_seed = summary.dataset_order_seed,
+                dataset_shuffle = summary.dataset_shuffle,
                 data_cursor_start = summary.data_cursor_start,
                 data_cursor_end = summary.data_cursor_end,
                 data_cursor_next = summary.data_cursor_next,
@@ -205,6 +206,9 @@ pub fn train(config_path: &Path, resume_from: Option<PathBuf>) -> Result<()> {
             }
             if let Some(dataset_order_seed) = summary.dataset_order_seed {
                 println!("dataset_order_seed: {dataset_order_seed}");
+            }
+            if let Some(dataset_shuffle) = summary.dataset_shuffle {
+                println!("dataset_shuffle: {dataset_shuffle}");
             }
             if let Some(data_cursor_start) = summary.data_cursor_start {
                 println!("data_cursor_start: {data_cursor_start}");
@@ -311,6 +315,7 @@ pub fn train(config_path: &Path, resume_from: Option<PathBuf>) -> Result<()> {
             dataset_source_sample_counts = ?summary.dataset_source_sample_counts,
             dataset_fingerprint = summary.dataset_fingerprint,
             dataset_order_seed = summary.dataset_order_seed,
+            dataset_shuffle = summary.dataset_shuffle,
             data_cursor_start = summary.data_cursor_start,
             data_cursor_end = summary.data_cursor_end,
             data_cursor_next = summary.data_cursor_next,
@@ -369,6 +374,7 @@ pub fn train(config_path: &Path, resume_from: Option<PathBuf>) -> Result<()> {
         );
         println!("dataset_fingerprint: {}", summary.dataset_fingerprint);
         println!("dataset_order_seed: {}", summary.dataset_order_seed);
+        println!("dataset_shuffle: {}", summary.dataset_shuffle);
         println!("data_cursor_start: {}", summary.data_cursor_start);
         println!("data_cursor_end: {}", summary.data_cursor_end);
         println!("data_cursor_next: {}", summary.data_cursor_next);

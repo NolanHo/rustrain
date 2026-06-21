@@ -84,6 +84,8 @@ pub struct DataConfig {
     pub train_split: f32,
     #[serde(default)]
     pub max_samples: Option<usize>,
+    #[serde(default = "default_data_shuffle")]
+    pub shuffle: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -416,6 +418,10 @@ fn default_train_split() -> f32 {
     0.8
 }
 
+fn default_data_shuffle() -> bool {
+    true
+}
+
 fn default_eval_every() -> u64 {
     0
 }
@@ -507,6 +513,7 @@ mod tests {
                 paths: vec!["data/sft_toy/instructions.jsonl".into()],
                 train_split: 0.8,
                 max_samples: None,
+                shuffle: true,
             }),
             lora: Some(LoraConfig {
                 rank: 4,

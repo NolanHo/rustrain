@@ -1,0 +1,78 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${SCRIPT_DIR}/require_gpu_worker.sh"
+
+CONFIG="${RUSTRAIN_QWEN_LORA_SFT_NO_SHUFFLE_CONFIG:-configs/qwen_lora_sft_no_shuffle.toml}"
+OUTPUT="$(mktemp)"
+
+cargo run -- train --config "${CONFIG}" | tee "${OUTPUT}"
+
+python - "${OUTPUT}" <<'PY'
+import json
+import pathlib
+import sys
+
+output_path = pathlib.Path(sys.argv[1])
+values = {}
+for line in output_path.read_text().splitlines():
+    if ": " not in line:
+        continue
+    key, value = line.split(": ", 1)
+    values[key] = value
+
+required = [
+    "adapter_manifest",
+    "dataset_total_samples",
+    "dataset_source_files",
+    "dataset_source_sample_counts",
+    "dataset_fingerprint",
+    "dataset_order_seed",
+    "dataset_shuffle",
+    "sequence_tokens",
+    "reload_delta",
+    "eval_reload_delta",
+    "full_forward_reload_delta",
+    "full_generate_reload_match",
+]
+missing = [key for key in required if key not in values]
+if missing:
+    raise SystemExit(f"no-shuffle run is missing fields: {missing}")
+
+if values["dataset_shuffle"] != "false":
+    raise SystemExit(f"expected dataset_shuffle false, got {values['dataset_shuffle']}")
+if int(values["dataset_order_seed"]) != 777:
+    raise SystemExit(f"expected dataset_order_seed 777, got {values['dataset_order_seed']}")
+if int(values["dataset_total_samples"]) != 4:
+    raise SystemExit(f"expected dataset_total_samples 4, got {values['dataset_total_samples']}")
+if int(values["sequence_tokens"]) != 13:
+    raise SystemExit(
+        "shuffle=false should use the first JSONL training sample before shuffling; "
+        f"expected sequence_tokens 13, got {values['sequence_tokens']}"
+    )
+
+manifest = json.loads(pathlib.Path(values["adapter_manifest"]).read_text())
+if manifest.get("dataset_shuffle") is not False:
+    raise SystemExit(f"manifest dataset_shuffle should be false, got {manifest.get('dataset_shuffle')}")
+if manifest.get("dataset_order_seed") != 777:
+    raise SystemExit(f"manifest dataset_order_seed should be 777, got {manifest.get('dataset_order_seed')}")
+if manifest.get("dataset_total_samples") != 4:
+    raise SystemExit(
+        f"manifest dataset_total_samples {manifest.get('dataset_total_samples')} != 4"
+    )
+
+for key in ["reload_delta", "eval_reload_delta", "full_forward_reload_delta"]:
+    if float(values[key]) > 1e-6:
+        raise SystemExit(f"{key} too large: {values[key]}")
+if values["full_generate_reload_match"] != "true":
+    raise SystemExit("full_generate_reload_match must be true")
+
+print(
+    "qwen_lora_sft_no_shuffle_verified: "
+    f"dataset_shuffle={values['dataset_shuffle']} "
+    f"dataset_order_seed={values['dataset_order_seed']} "
+    f"sequence_tokens={values['sequence_tokens']} "
+    f"dataset_fingerprint={values['dataset_fingerprint']}"
+)
+PY

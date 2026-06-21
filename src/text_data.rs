@@ -353,6 +353,7 @@ mod tests {
             paths: vec![data_dir],
             train_split: 0.75,
             max_samples: None,
+            shuffle: true,
         };
         let dataset = load_text_dataset(&data, 64, 8, &cache_dir).expect("dataset should load");
 
@@ -381,6 +382,7 @@ mod tests {
             paths: vec![data_dir],
             train_split: 0.5,
             max_samples: None,
+            shuffle: true,
         };
         let dataset =
             load_sft_dataset(&data, 128, 64, &cache_dir).expect("SFT dataset should load");
@@ -427,6 +429,7 @@ mod tests {
             paths: vec![data_dir],
             train_split: 0.5,
             max_samples: Some(2),
+            shuffle: true,
         };
         let dataset =
             load_sft_dataset(&data, 128, 64, &cache_dir).expect("SFT dataset should load");

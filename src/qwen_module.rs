@@ -164,6 +164,7 @@ pub(crate) struct QwenLoraSftTrainSummary {
     pub(crate) dataset_source_sample_counts: Vec<QwenSftSourceSampleCount>,
     pub(crate) dataset_fingerprint: String,
     pub(crate) dataset_order_seed: u64,
+    pub(crate) dataset_shuffle: bool,
     pub(crate) data_cursor_start: usize,
     pub(crate) data_cursor_end: usize,
     pub(crate) data_cursor_next: usize,
@@ -250,6 +251,8 @@ struct QwenLoraSftAdapterManifest {
     #[serde(default)]
     dataset_fingerprint: String,
     dataset_order_seed: u64,
+    #[serde(default = "qwen_manifest_default_dataset_shuffle")]
+    dataset_shuffle: bool,
     dataset_total_samples: usize,
     dataset_train_samples: usize,
     dataset_eval_samples: usize,
@@ -309,6 +312,7 @@ pub(crate) struct QwenFullTrainSmokeSummary {
     pub(crate) dataset_source_sample_counts: Option<Vec<QwenSftSourceSampleCount>>,
     pub(crate) dataset_fingerprint: Option<String>,
     pub(crate) dataset_order_seed: Option<u64>,
+    pub(crate) dataset_shuffle: Option<bool>,
     pub(crate) data_cursor_start: Option<usize>,
     pub(crate) data_cursor_end: Option<usize>,
     pub(crate) data_cursor_next: Option<usize>,
@@ -369,6 +373,7 @@ struct QwenSessionDpRankSummary {
     dataset_source_sample_counts: Option<Vec<QwenSftSourceSampleCount>>,
     dataset_fingerprint: Option<String>,
     dataset_order_seed: Option<u64>,
+    dataset_shuffle: Option<bool>,
     data_cursor_start: Option<usize>,
     data_cursor_end: Option<usize>,
     data_cursor_next: Option<usize>,
@@ -446,6 +451,8 @@ struct QwenSessionDpCheckpointManifest {
     dataset_source_sample_counts: Vec<QwenSftSourceSampleCount>,
     #[serde(default)]
     dataset_fingerprint: String,
+    #[serde(default = "qwen_manifest_default_dataset_shuffle")]
+    dataset_shuffle: bool,
     learning_rate: f64,
     delta_safetensors: String,
     optimizer_safetensors: String,
@@ -483,6 +490,7 @@ impl QwenSessionDpCheckpointManifest {
             dataset_source_files: self.dataset_source_files.clone(),
             dataset_source_sample_counts: self.dataset_source_sample_counts.clone(),
             dataset_fingerprint: self.dataset_fingerprint.clone(),
+            dataset_shuffle: self.dataset_shuffle,
             learning_rate: self.learning_rate,
             initial_loss: self.expected_loss,
             final_loss: self.global_post_update_loss,
@@ -796,6 +804,8 @@ struct QwenDeltaCheckpointManifest {
     dataset_source_sample_counts: Vec<QwenSftSourceSampleCount>,
     #[serde(default)]
     dataset_fingerprint: String,
+    #[serde(default = "qwen_manifest_default_dataset_shuffle")]
+    dataset_shuffle: bool,
     learning_rate: f64,
     initial_loss: f64,
     final_loss: f64,
@@ -839,6 +849,8 @@ struct QwenShardedCheckpointManifest {
     dataset_source_sample_counts: Vec<QwenSftSourceSampleCount>,
     #[serde(default)]
     dataset_fingerprint: String,
+    #[serde(default = "qwen_manifest_default_dataset_shuffle")]
+    dataset_shuffle: bool,
     seed: u64,
     dtype: String,
     optimizer: String,
@@ -939,6 +951,7 @@ struct QwenSessionBatchPlan {
     dataset_source_sample_counts: Option<Vec<QwenSftSourceSampleCount>>,
     dataset_fingerprint: Option<String>,
     dataset_order_seed: Option<u64>,
+    dataset_shuffle: Option<bool>,
     train_sample_count: Option<usize>,
     data_epoch_start: Option<usize>,
     data_epoch_end: Option<usize>,
@@ -961,6 +974,7 @@ struct QwenSessionDpBatchPlan {
     dataset_source_sample_counts: Option<Vec<QwenSftSourceSampleCount>>,
     dataset_fingerprint: Option<String>,
     dataset_order_seed: Option<u64>,
+    dataset_shuffle: Option<bool>,
     train_sample_count: Option<usize>,
     data_epoch_start: Option<usize>,
     data_epoch_end: Option<usize>,
@@ -1077,6 +1091,7 @@ struct QwenSftDatasetSummary {
     source_files: Vec<String>,
     source_sample_counts: Vec<QwenSftSourceSampleCount>,
     fingerprint: String,
+    shuffle: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1090,6 +1105,7 @@ struct QwenLoraSftTrainPolicy {
     lr_scheduler: LrScheduler,
     max_grad_norm: Option<f64>,
     dataset_order_seed: u64,
+    dataset_shuffle: bool,
 }
 
 impl QwenLoraSftTrainPolicy {
@@ -1098,6 +1114,11 @@ impl QwenLoraSftTrainPolicy {
             lr_scheduler: config.train.lr_scheduler.clone(),
             max_grad_norm: config.train.max_grad_norm.map(f64::from),
             dataset_order_seed: config.run.seed,
+            dataset_shuffle: config
+                .data
+                .as_ref()
+                .map(|data| data.shuffle)
+                .unwrap_or(true),
         }
     }
 
@@ -1106,8 +1127,13 @@ impl QwenLoraSftTrainPolicy {
             lr_scheduler: LrScheduler::Constant,
             max_grad_norm: None,
             dataset_order_seed: 0,
+            dataset_shuffle: true,
         }
     }
+}
+
+fn qwen_manifest_default_dataset_shuffle() -> bool {
+    true
 }
 
 fn qwen_lora_sft_adapter_manifest_path(adapter_output: &Path) -> PathBuf {
@@ -1836,8 +1862,9 @@ fn qwen_lora_sft_train(
                 },
             ],
         )?
-    }
-    .shuffle_by_seed(policy.dataset_order_seed);
+    };
+    let dataset =
+        qwen_apply_sft_shuffle(dataset, policy.dataset_shuffle, policy.dataset_order_seed);
     let dataset_summary = dataset.summary();
     let (train_dataset, eval_dataset) = dataset.train_eval_split(train_split)?;
     let train_batch_size = sft_batch_size.min(train_dataset.len());
@@ -1851,6 +1878,7 @@ fn qwen_lora_sft_train(
             &manifest.dataset_source_files,
             &manifest.dataset_source_sample_counts,
             &manifest.dataset_fingerprint,
+            manifest.dataset_shuffle,
             &dataset_summary,
             "Qwen LoRA SFT adapter resume",
         )?;
@@ -2091,6 +2119,7 @@ fn qwen_lora_sft_train(
         dataset_source_sample_counts: dataset_summary.source_sample_counts.clone(),
         dataset_fingerprint: dataset_summary.fingerprint.clone(),
         dataset_order_seed: policy.dataset_order_seed,
+        dataset_shuffle: dataset_summary.shuffle,
         dataset_total_samples: dataset_summary.samples,
         dataset_train_samples: train_dataset.len(),
         dataset_eval_samples: eval_dataset.len(),
@@ -2245,6 +2274,7 @@ fn qwen_lora_sft_train(
         dataset_source_sample_counts: dataset_summary.source_sample_counts,
         dataset_fingerprint: dataset_summary.fingerprint,
         dataset_order_seed: policy.dataset_order_seed,
+        dataset_shuffle: dataset_summary.shuffle,
         data_cursor_start,
         data_cursor_end,
         data_cursor_next,
@@ -2492,6 +2522,7 @@ fn qwen_full_train_summary(
         dataset_source_files: Vec::new(),
         dataset_source_sample_counts: Vec::new(),
         dataset_fingerprint: String::new(),
+        dataset_shuffle: true,
         learning_rate,
         initial_loss,
         final_loss,
@@ -2565,6 +2596,7 @@ fn qwen_full_train_summary(
         dataset_source_sample_counts: None,
         dataset_fingerprint: None,
         dataset_order_seed: None,
+        dataset_shuffle: None,
         data_cursor_start: None,
         data_cursor_end: None,
         data_cursor_next: None,
@@ -2642,9 +2674,11 @@ fn qwen_session_single_summary(
             &manifest.dataset_source_files,
             &manifest.dataset_source_sample_counts,
             &manifest.dataset_fingerprint,
+            manifest.dataset_shuffle,
             batch_plan.dataset_source_files.as_deref(),
             batch_plan.dataset_source_sample_counts.as_deref(),
             batch_plan.dataset_fingerprint.as_deref(),
+            batch_plan.dataset_shuffle,
             "Qwen session checkpoint resume",
         )?;
     }
@@ -2768,6 +2802,7 @@ fn qwen_session_single_summary(
             .clone()
             .unwrap_or_default(),
         dataset_fingerprint: batch_plan.dataset_fingerprint.clone().unwrap_or_default(),
+        dataset_shuffle: batch_plan.dataset_shuffle.unwrap_or(true),
         learning_rate,
         initial_loss,
         final_loss,
@@ -2836,6 +2871,7 @@ fn qwen_session_single_summary(
         dataset_source_sample_counts: batch_plan.dataset_source_sample_counts,
         dataset_fingerprint: batch_plan.dataset_fingerprint,
         dataset_order_seed: batch_plan.dataset_order_seed,
+        dataset_shuffle: batch_plan.dataset_shuffle,
         data_cursor_start: batch_plan.train_sample_count.map(|_| data_cursor_start),
         data_cursor_end: batch_plan.train_sample_count.map(|_| data_cursor_end),
         data_cursor_next: batch_plan.train_sample_count.map(|_| data_cursor_next),
@@ -3148,9 +3184,11 @@ pub fn qwen_session_dp_rank_smoke(
             &manifest.dataset_source_files,
             &manifest.dataset_source_sample_counts,
             &manifest.dataset_fingerprint,
+            manifest.dataset_shuffle,
             batch_plan.dataset_source_files.as_deref(),
             batch_plan.dataset_source_sample_counts.as_deref(),
             batch_plan.dataset_fingerprint.as_deref(),
+            batch_plan.dataset_shuffle,
             "Qwen session DP external checkpoint resume",
         )?;
     }
@@ -3374,6 +3412,7 @@ pub fn qwen_session_dp_rank_smoke(
                 .clone()
                 .unwrap_or_default(),
             dataset_fingerprint: batch_plan.dataset_fingerprint.clone().unwrap_or_default(),
+            dataset_shuffle: batch_plan.dataset_shuffle.unwrap_or(true),
             learning_rate,
             delta_safetensors: delta_output.display().to_string(),
             optimizer_safetensors: optimizer_output.display().to_string(),
@@ -3407,9 +3446,11 @@ pub fn qwen_session_dp_rank_smoke(
         &checkpoint_manifest.dataset_source_files,
         &checkpoint_manifest.dataset_source_sample_counts,
         &checkpoint_manifest.dataset_fingerprint,
+        checkpoint_manifest.dataset_shuffle,
         batch_plan.dataset_source_files.as_deref(),
         batch_plan.dataset_source_sample_counts.as_deref(),
         batch_plan.dataset_fingerprint.as_deref(),
+        batch_plan.dataset_shuffle,
         "Qwen session DP rank0 checkpoint resume",
     )?;
     let mut delta_manifest = checkpoint_manifest.to_delta_manifest()?;
@@ -3530,6 +3571,7 @@ pub fn qwen_session_dp_rank_smoke(
                 .as_deref()
                 .unwrap_or(&[]),
             batch_plan.dataset_fingerprint.as_deref().unwrap_or(""),
+            batch_plan.dataset_shuffle.unwrap_or(true),
             &sharded_global_manifest_output,
         )?;
     }
@@ -3558,9 +3600,11 @@ pub fn qwen_session_dp_rank_smoke(
         &sharded_global_manifest.dataset_source_files,
         &sharded_global_manifest.dataset_source_sample_counts,
         &sharded_global_manifest.dataset_fingerprint,
+        sharded_global_manifest.dataset_shuffle,
         batch_plan.dataset_source_files.as_deref(),
         batch_plan.dataset_source_sample_counts.as_deref(),
         batch_plan.dataset_fingerprint.as_deref(),
+        batch_plan.dataset_shuffle,
         "Qwen session DP sharded checkpoint resume",
     )?;
     let sharded_delta_manifest = qwen_sharded_rank_to_delta_manifest(
@@ -3642,6 +3686,7 @@ pub fn qwen_session_dp_rank_smoke(
         dataset_source_sample_counts: batch_plan.dataset_source_sample_counts,
         dataset_fingerprint: batch_plan.dataset_fingerprint,
         dataset_order_seed: batch_plan.dataset_order_seed,
+        dataset_shuffle: batch_plan.dataset_shuffle,
         data_cursor_start: batch_plan.train_sample_count.map(|_| data_cursor_start),
         data_cursor_end: batch_plan.train_sample_count.map(|_| data_cursor_end),
         data_cursor_next: batch_plan.train_sample_count.map(|_| data_cursor_next),
@@ -3801,6 +3846,7 @@ fn write_qwen_session_dp_global_sharded_manifest(
     dataset_source_files: &[String],
     dataset_source_sample_counts: &[QwenSftSourceSampleCount],
     dataset_fingerprint: &str,
+    dataset_shuffle: bool,
     manifest_output: &Path,
 ) -> Result<()> {
     let mut ranks = Vec::with_capacity(world_size);
@@ -3833,6 +3879,7 @@ fn write_qwen_session_dp_global_sharded_manifest(
         dataset_source_files: dataset_source_files.to_vec(),
         dataset_source_sample_counts: dataset_source_sample_counts.to_vec(),
         dataset_fingerprint: dataset_fingerprint.to_string(),
+        dataset_shuffle,
         seed: 42,
         dtype: dtype.label().to_string(),
         optimizer: "adamw".to_string(),
@@ -3895,6 +3942,7 @@ fn qwen_sharded_rank_to_delta_manifest(
         dataset_source_files: manifest.dataset_source_files.clone(),
         dataset_source_sample_counts: manifest.dataset_source_sample_counts.clone(),
         dataset_fingerprint: manifest.dataset_fingerprint.clone(),
+        dataset_shuffle: manifest.dataset_shuffle,
         learning_rate,
         initial_loss,
         final_loss,
@@ -4885,6 +4933,7 @@ fn qwen_session_fixed_batch_plan(
         dataset_source_sample_counts: None,
         dataset_fingerprint: None,
         dataset_order_seed: None,
+        dataset_shuffle: None,
         train_sample_count: None,
         data_epoch_start: None,
         data_epoch_end: None,
@@ -4915,12 +4964,15 @@ fn qwen_session_batch_plan_from_config(
     }
     let tokenizer = Tokenizer::from_file(model_path.join("tokenizer.json"))
         .map_err(|error| anyhow!("failed to load tokenizer: {error}"))?;
-    let dataset = QwenSftDataset::from_jsonl_paths_with_limit(
-        &tokenizer,
-        &data_config.paths,
-        data_config.max_samples,
-    )?
-    .shuffle_by_seed(runtime_config.run.seed);
+    let dataset = qwen_apply_sft_shuffle(
+        QwenSftDataset::from_jsonl_paths_with_limit(
+            &tokenizer,
+            &data_config.paths,
+            data_config.max_samples,
+        )?,
+        data_config.shuffle,
+        runtime_config.run.seed,
+    );
     let dataset_summary = dataset.summary();
     let (train_dataset, eval_dataset) = dataset.train_eval_split(data_config.train_split)?;
     let batch_size = runtime_config
@@ -4961,6 +5013,7 @@ fn qwen_session_batch_plan_from_config(
         dataset_source_sample_counts: Some(dataset_summary.source_sample_counts),
         dataset_fingerprint: Some(dataset_summary.fingerprint),
         dataset_order_seed: Some(runtime_config.run.seed),
+        dataset_shuffle: Some(dataset_summary.shuffle),
         train_sample_count: Some(train_dataset.len()),
         data_epoch_start: Some(data_epoch_start),
         data_epoch_end: Some(data_epoch_end),
@@ -4992,6 +5045,7 @@ fn qwen_session_fixed_dp_batch_plan(
         dataset_source_sample_counts: None,
         dataset_fingerprint: None,
         dataset_order_seed: None,
+        dataset_shuffle: None,
         train_sample_count: None,
         data_epoch_start: None,
         data_epoch_end: None,
@@ -5024,12 +5078,15 @@ fn qwen_session_dp_batch_plan_from_config(
     }
     let tokenizer = Tokenizer::from_file(model_path.join("tokenizer.json"))
         .map_err(|error| anyhow!("failed to load tokenizer: {error}"))?;
-    let dataset = QwenSftDataset::from_jsonl_paths_with_limit(
-        &tokenizer,
-        &data_config.paths,
-        data_config.max_samples,
-    )?
-    .shuffle_by_seed(runtime_config.run.seed);
+    let dataset = qwen_apply_sft_shuffle(
+        QwenSftDataset::from_jsonl_paths_with_limit(
+            &tokenizer,
+            &data_config.paths,
+            data_config.max_samples,
+        )?,
+        data_config.shuffle,
+        runtime_config.run.seed,
+    );
     let dataset_summary = dataset.summary();
     let (train_dataset, eval_dataset) = dataset.train_eval_split(data_config.train_split)?;
     let local_batch_size = runtime_config
@@ -5070,6 +5127,7 @@ fn qwen_session_dp_batch_plan_from_config(
         dataset_source_sample_counts: Some(dataset_summary.source_sample_counts),
         dataset_fingerprint: Some(dataset_summary.fingerprint),
         dataset_order_seed: Some(runtime_config.run.seed),
+        dataset_shuffle: Some(dataset_summary.shuffle),
         train_sample_count: Some(train_dataset.len()),
         data_epoch_start: Some(data_epoch_start),
         data_epoch_end: Some(data_epoch_end),
@@ -6405,6 +6463,7 @@ impl QwenSftDataset {
             source_files: self.source_files.clone(),
             source_sample_counts: self.source_sample_counts.clone(),
             fingerprint: self.fingerprint.clone(),
+            shuffle: self.epoch_shuffle_seed.is_some(),
         }
     }
 
@@ -6438,6 +6497,14 @@ impl QwenSftDataset {
 
     fn len(&self) -> usize {
         self.samples.len()
+    }
+}
+
+fn qwen_apply_sft_shuffle(dataset: QwenSftDataset, shuffle: bool, seed: u64) -> QwenSftDataset {
+    if shuffle {
+        dataset.shuffle_by_seed(seed)
+    } else {
+        dataset
     }
 }
 
@@ -6625,6 +6692,7 @@ fn qwen_validate_sft_resume_dataset(
     manifest_source_files: &[String],
     manifest_source_sample_counts: &[QwenSftSourceSampleCount],
     manifest_fingerprint: &str,
+    manifest_shuffle: bool,
     dataset_summary: &QwenSftDatasetSummary,
     context: &str,
 ) -> Result<()> {
@@ -6632,9 +6700,11 @@ fn qwen_validate_sft_resume_dataset(
         manifest_source_files,
         manifest_source_sample_counts,
         manifest_fingerprint,
+        manifest_shuffle,
         Some(&dataset_summary.source_files),
         Some(&dataset_summary.source_sample_counts),
         Some(&dataset_summary.fingerprint),
+        Some(dataset_summary.shuffle),
         context,
     )
 }
@@ -6643,9 +6713,11 @@ fn qwen_validate_optional_sft_resume_dataset(
     manifest_source_files: &[String],
     manifest_source_sample_counts: &[QwenSftSourceSampleCount],
     manifest_fingerprint: &str,
+    manifest_shuffle: bool,
     dataset_source_files: Option<&[String]>,
     dataset_source_sample_counts: Option<&[QwenSftSourceSampleCount]>,
     dataset_fingerprint: Option<&str>,
+    dataset_shuffle: Option<bool>,
     context: &str,
 ) -> Result<()> {
     if manifest_fingerprint.is_empty()
@@ -6663,6 +6735,14 @@ fn qwen_validate_optional_sft_resume_dataset(
     if manifest_fingerprint != dataset_fingerprint {
         bail!(
             "{context} dataset fingerprint mismatch: manifest={manifest_fingerprint}, current={dataset_fingerprint}"
+        );
+    }
+    let Some(dataset_shuffle) = dataset_shuffle else {
+        bail!("{context} manifest has dataset shuffle provenance but current run has none");
+    };
+    if manifest_shuffle != dataset_shuffle {
+        bail!(
+            "{context} dataset shuffle mismatch: manifest={manifest_shuffle}, current={dataset_shuffle}"
         );
     }
     let Some(dataset_source_files) = dataset_source_files else {
@@ -7248,6 +7328,7 @@ mod tests {
             dataset_source_files: Vec::new(),
             dataset_source_sample_counts: Vec::new(),
             dataset_fingerprint: String::new(),
+            dataset_shuffle: true,
             learning_rate: 1e-6,
             initial_loss: 2.0,
             final_loss: 1.5,
@@ -7363,6 +7444,7 @@ mod tests {
             &manifest.dataset_source_files,
             &manifest.dataset_source_sample_counts,
             &manifest.dataset_fingerprint,
+            manifest.dataset_shuffle,
             &output,
         )
         .expect("global manifest should write");
@@ -7471,23 +7553,26 @@ mod tests {
             source_files: manifest.dataset_source_files.clone(),
             source_sample_counts: manifest.dataset_source_sample_counts.clone(),
             fingerprint: manifest.dataset_fingerprint.clone(),
+            shuffle: manifest.dataset_shuffle,
         };
 
         qwen_validate_sft_resume_dataset(
             &manifest.dataset_source_files,
             &manifest.dataset_source_sample_counts,
             &manifest.dataset_fingerprint,
+            manifest.dataset_shuffle,
             &summary,
             "sharded resume",
         )
         .expect("matching sharded provenance should pass");
-        qwen_validate_sft_resume_dataset(&[], &[], "", &summary, "legacy sharded resume")
+        qwen_validate_sft_resume_dataset(&[], &[], "", true, &summary, "legacy sharded resume")
             .expect("legacy sharded manifests without provenance should pass");
 
         let fingerprint_error = qwen_validate_sft_resume_dataset(
             &manifest.dataset_source_files,
             &manifest.dataset_source_sample_counts,
             "changed-fingerprint",
+            manifest.dataset_shuffle,
             &summary,
             "sharded resume",
         )
@@ -7499,12 +7584,25 @@ mod tests {
             &["data/changed.jsonl".to_string()],
             &manifest.dataset_source_sample_counts,
             &manifest.dataset_fingerprint,
+            manifest.dataset_shuffle,
             &summary,
             "sharded resume",
         )
         .expect_err("changed sharded source files should fail")
         .to_string();
         assert!(source_error.contains("dataset source files mismatch"));
+
+        let shuffle_error = qwen_validate_sft_resume_dataset(
+            &manifest.dataset_source_files,
+            &manifest.dataset_source_sample_counts,
+            &manifest.dataset_fingerprint,
+            !manifest.dataset_shuffle,
+            &summary,
+            "sharded resume",
+        )
+        .expect_err("changed sharded shuffle policy should fail")
+        .to_string();
+        assert!(shuffle_error.contains("dataset shuffle mismatch"));
     }
 
     #[test]
@@ -7668,6 +7766,7 @@ mod tests {
             dataset_source_files: Vec::new(),
             dataset_source_sample_counts: Vec::new(),
             dataset_fingerprint: String::new(),
+            dataset_shuffle: true,
             learning_rate,
             initial_loss,
             final_loss,
@@ -7786,6 +7885,7 @@ mod tests {
             dataset_source_files: Vec::new(),
             dataset_source_sample_counts: Vec::new(),
             dataset_fingerprint: String::new(),
+            dataset_shuffle: true,
             learning_rate,
             initial_loss: first_step.loss_before,
             final_loss: first_step.loss_after,
@@ -8421,8 +8521,44 @@ mod tests {
         assert_eq!(summary.response_tokens, 15);
         assert_eq!(summary.masked_positions, 15);
         assert_eq!(summary.max_sequence_tokens, 3);
+        assert!(!summary.shuffle);
+        assert!(shuffled_a.summary().shuffle);
         assert_eq!(order_a, order_b);
         assert_ne!(order_a, order_c);
+    }
+
+    #[test]
+    fn qwen_sft_dataset_shuffle_can_be_disabled() {
+        let dataset = QwenSftDataset {
+            samples: (0..5)
+                .map(|index| QwenSftTokenSample {
+                    prompt_tokens: 1,
+                    response_tokens: 1,
+                    masked_positions: 1,
+                    token_ids: vec![index, index + 10],
+                    mask_values: vec![1.0],
+                })
+                .collect(),
+            pad_token_id: 0,
+            epoch_shuffle_seed: None,
+            source_files: Vec::new(),
+            source_sample_counts: Vec::new(),
+            fingerprint: String::new(),
+        };
+
+        let unshuffled = qwen_apply_sft_shuffle(dataset.clone(), false, 777);
+        let shuffled = qwen_apply_sft_shuffle(dataset, true, 777);
+        let unshuffled_order = (0..unshuffled.len())
+            .map(|cursor| unshuffled.sample_at_cursor(cursor).unwrap().token_ids[0])
+            .collect::<Vec<_>>();
+        let shuffled_order = (0..shuffled.len())
+            .map(|cursor| shuffled.sample_at_cursor(cursor).unwrap().token_ids[0])
+            .collect::<Vec<_>>();
+
+        assert_eq!(unshuffled_order, vec![0, 1, 2, 3, 4]);
+        assert!(!unshuffled.summary().shuffle);
+        assert!(shuffled.summary().shuffle);
+        assert_ne!(unshuffled_order, shuffled_order);
     }
 
     #[test]
@@ -8559,23 +8695,26 @@ mod tests {
                 samples: 2,
             }],
             fingerprint: "fingerprint-a".to_string(),
+            shuffle: true,
         };
 
         qwen_validate_sft_resume_dataset(
             &summary.source_files,
             &summary.source_sample_counts,
             &summary.fingerprint,
+            true,
             &summary,
             "test resume",
         )
         .expect("matching provenance should pass");
-        qwen_validate_sft_resume_dataset(&[], &[], "", &summary, "legacy resume")
+        qwen_validate_sft_resume_dataset(&[], &[], "", true, &summary, "legacy resume")
             .expect("legacy manifests without provenance should pass");
 
         let fingerprint_error = qwen_validate_sft_resume_dataset(
             &summary.source_files,
             &summary.source_sample_counts,
             "fingerprint-b",
+            true,
             &summary,
             "test resume",
         )
@@ -8587,6 +8726,7 @@ mod tests {
             &["data/other.jsonl".to_string()],
             &summary.source_sample_counts,
             &summary.fingerprint,
+            true,
             &summary,
             "test resume",
         )
@@ -8601,12 +8741,25 @@ mod tests {
                 samples: 3,
             }],
             &summary.fingerprint,
+            true,
             &summary,
             "test resume",
         )
         .expect_err("changed source sample counts should fail")
         .to_string();
         assert!(count_error.contains("dataset source sample counts mismatch"));
+
+        let shuffle_error = qwen_validate_sft_resume_dataset(
+            &summary.source_files,
+            &summary.source_sample_counts,
+            &summary.fingerprint,
+            false,
+            &summary,
+            "test resume",
+        )
+        .expect_err("changed shuffle policy should fail")
+        .to_string();
+        assert!(shuffle_error.contains("dataset shuffle mismatch"));
     }
 
     #[test]
@@ -8777,6 +8930,7 @@ mod tests {
                 samples: 5,
             }],
             dataset_fingerprint: "abc123".to_string(),
+            dataset_shuffle: true,
             seed: 42,
             dtype: "float32".to_string(),
             optimizer: "adamw".to_string(),
