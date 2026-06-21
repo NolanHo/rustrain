@@ -251,6 +251,16 @@ enum Command {
         #[arg(long, default_value_t = 0)]
         data_cursor_start: usize,
     },
+    #[command(hide = true)]
+    QwenTpLinearRankSmoke {
+        #[arg(
+            long,
+            default_value = "/vePFS-Mindverse/share/huggingface/Qwen2.5-0.5B-Instruct"
+        )]
+        model_path: PathBuf,
+        #[arg(long)]
+        output_dir: PathBuf,
+    },
     Launch {
         #[arg(long)]
         nproc_per_node: usize,
@@ -461,6 +471,10 @@ fn main() -> Result<()> {
             world_size,
             data_cursor_start,
         } => qwen_module::qwen_session_dp_data_plan(&config, world_size, data_cursor_start),
+        Command::QwenTpLinearRankSmoke {
+            model_path,
+            output_dir,
+        } => qwen_module::qwen_tp_linear_rank_smoke(&model_path, output_dir),
         Command::Launch {
             nproc_per_node,
             output_dir,

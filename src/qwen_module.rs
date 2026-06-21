@@ -45,6 +45,22 @@ struct QwenModuleParitySummary {
     layer1_diff: DiffStats,
 }
 
+#[derive(Debug, Serialize)]
+struct QwenTpLinearRankSummary {
+    rank: usize,
+    world_size: usize,
+    local_rank: usize,
+    model_path: String,
+    tensor_name: String,
+    input_shape: Vec<i64>,
+    full_output_shape: Vec<i64>,
+    shard_output_shape: Vec<i64>,
+    shard_start: i64,
+    shard_end: i64,
+    max_abs: Option<f64>,
+    mean_abs: Option<f64>,
+}
+
 #[derive(Debug, Deserialize)]
 struct QwenModelConfig {
     num_hidden_layers: usize,
@@ -3180,6 +3196,98 @@ pub fn qwen_dp_gradient_smoke(
         checkpoint_path: checkpoint_path.display().to_string(),
     };
     let summary_path = output_dir.join(format!("qwen-dp-gradient-rank-{rank}.json"));
+    fs::write(&summary_path, serde_json::to_string_pretty(&summary)?)
+        .with_context(|| format!("failed to write {}", summary_path.display()))?;
+    println!("{}", serde_json::to_string_pretty(&summary)?);
+
+    Ok(())
+}
+
+pub fn qwen_tp_linear_rank_smoke(model_path: &Path, output_dir: PathBuf) -> Result<()> {
+    let rank = parse_env_usize("RANK")?;
+    let local_rank = parse_env_usize("LOCAL_RANK")?;
+    let world_size = parse_env_usize("WORLD_SIZE")?;
+    if world_size != 2 {
+        bail!("Qwen TP linear rank smoke expects WORLD_SIZE=2");
+    }
+    if rank >= world_size {
+        bail!("rank {rank} must be smaller than world_size {world_size}");
+    }
+    let device = Device::Cuda(local_rank);
+    fs::create_dir_all(&output_dir)
+        .with_context(|| format!("failed to create {}", output_dir.display()))?;
+
+    let weights = read_safetensors_map(&model_path.join("model.safetensors"))?;
+    let tensor_name = "model.layers.0.self_attn.q_proj.weight";
+    let weight = tensor(&weights, tensor_name)?
+        .to_kind(Kind::Float)
+        .to_device(device);
+    let hidden_size = weight.size()[1];
+    let output_size = weight.size()[0];
+    if output_size % world_size as i64 != 0 {
+        bail!("Qwen TP linear rank smoke requires output size divisible by WORLD_SIZE");
+    }
+    let shard_size = output_size / world_size as i64;
+    let shard_start = rank as i64 * shard_size;
+    let shard = weight.narrow(0, shard_start, shard_size);
+    let input = Tensor::arange(hidden_size * 3, (Kind::Float, device))
+        .reshape([3, hidden_size])
+        .fmod(17.0)
+        / 17.0;
+    let shard_output = input.matmul(&shard.transpose(0, 1));
+    let shard_path = output_dir.join(format!("qwen-tp-linear-rank-{rank}.safetensors"));
+    Tensor::write_safetensors(&[("shard_output", &shard_output)], &shard_path)
+        .with_context(|| format!("failed to write {}", shard_path.display()))?;
+
+    wait_for_rank_barrier(
+        &output_dir.join("qwen-tp-linear-shards-written"),
+        rank,
+        world_size,
+        Duration::from_secs(300),
+    )?;
+
+    let (max_abs, mean_abs) = if rank == 0 {
+        let mut shard_outputs = Vec::with_capacity(world_size);
+        for shard_rank in 0..world_size {
+            let tensors = read_safetensors_map(
+                &output_dir.join(format!("qwen-tp-linear-rank-{shard_rank}.safetensors")),
+            )?;
+            shard_outputs.push(
+                tensor(&tensors, "shard_output")?
+                    .to_kind(Kind::Float)
+                    .to_device(device),
+            );
+        }
+        let gathered = Tensor::cat(&shard_outputs.iter().collect::<Vec<_>>(), 1);
+        let full_output = input.matmul(&weight.transpose(0, 1));
+        let diff = diff_stats(&gathered, &full_output)?;
+        if diff.max_abs > 1e-5 {
+            bail!(
+                "Qwen TP linear shard parity failed: max_abs={}, mean_abs={}",
+                diff.max_abs,
+                diff.mean_abs
+            );
+        }
+        (Some(diff.max_abs), Some(diff.mean_abs))
+    } else {
+        (None, None)
+    };
+
+    let summary = QwenTpLinearRankSummary {
+        rank,
+        world_size,
+        local_rank,
+        model_path: model_path.display().to_string(),
+        tensor_name: tensor_name.to_string(),
+        input_shape: input.size(),
+        full_output_shape: vec![input.size()[0], output_size],
+        shard_output_shape: shard_output.size(),
+        shard_start,
+        shard_end: shard_start + shard_size,
+        max_abs,
+        mean_abs,
+    };
+    let summary_path = output_dir.join(format!("qwen-tp-linear-rank-{rank}.json"));
     fs::write(&summary_path, serde_json::to_string_pretty(&summary)?)
         .with_context(|| format!("failed to write {}", summary_path.display()))?;
     println!("{}", serde_json::to_string_pretty(&summary)?);
