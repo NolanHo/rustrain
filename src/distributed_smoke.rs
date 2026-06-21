@@ -130,8 +130,15 @@ struct ExpertParallelSparseRankSummary {
     checkpoint_optimizer_safetensors: String,
     checkpoint_tensor_count: usize,
     reload_scale_max_abs: f64,
+    reload_optimizer_max_abs: f64,
     reload_loss: f64,
     reload_loss_delta: f64,
+    continuous_second_loss: f64,
+    resumed_second_loss: f64,
+    second_step_delta: f64,
+    second_step_scale_max_abs: f64,
+    second_step_optimizer_max_abs: f64,
+    second_step_optimizer_step_delta: i64,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -189,6 +196,14 @@ struct ExpertParallelAdamStep {
     reduced_output_shape: Vec<i64>,
     combine_max_abs: f64,
     combine_mean_abs: f64,
+}
+
+struct ExpertParallelSparseSgdStep {
+    initial_loss: f64,
+    final_loss: Option<f64>,
+    updated_scales: Tensor,
+    updated_state: ExpertParallelAdamState,
+    grad_norm: f64,
 }
 
 struct ExpertParallelCheckpointWrite {
@@ -784,74 +799,34 @@ pub fn run_expert_parallel_sparse_rank_smoke(output_dir: PathBuf) -> Result<()> 
     }
 
     let target_rows = &reference_rows * 0.5;
-    let source_grad =
-        (&forward.assembled_output - &target_rows) * (2.0 / target_rows.numel() as f64);
-    let train_initial_loss = (&forward.assembled_output - &target_rows)
-        .square()
-        .mean(Kind::Float)
-        .double_value(&[]);
-    let gradient_sends = ep_sparse_output_gradient_sends(
+    let first_step = ep_sparse_sgd_step(
+        &output_dir,
+        "ep-sparse-first-step",
         rank,
         world_size,
-        &assignments,
-        &forward.source_token_indices,
-        &source_grad,
-    )?;
-    let gradient_recv_plan = ep_sparse_dispatch_recv_plan(rank, world_size, &assignments)?;
-    let gradient_recvs = gradient_recv_plan
-        .iter()
-        .map(|plan| {
-            (
-                plan.peer,
-                vec![plan.token_indices.len() as i64, tokens.size()[1]],
-            )
-        })
-        .collect::<Vec<_>>();
-    let received_gradients = nccl_smoke::send_recv_tensors_f32_for_launch(
-        &output_dir.join("ep-sparse-output-grad"),
-        &gradient_sends,
-        &gradient_recvs,
-    )?;
-    let scale_grad = ep_sparse_scale_grad_from_output_grads(
-        &received_gradients,
-        &gradient_recv_plan,
         &tokens,
         &assignments,
         owned_expert_start,
         owned_expert_end,
         &local_scales,
+        &ExpertParallelAdamState {
+            m: Tensor::zeros_like(&local_scales),
+            v: Tensor::zeros_like(&local_scales),
+            step: 0,
+        },
+        &target_rows,
+        Some("ep-sparse-updated-forward"),
     )?;
-    let scale_grad_norm = scale_grad.norm().double_value(&[]);
-    if scale_grad_norm <= 0.0 {
-        bail!("EP sparse train smoke expected positive local expert scale grad norm");
-    }
-    let updated_scales = (&local_scales - &(&scale_grad * 0.25)).detach();
-    let updated_forward = ep_sparse_forward(
-        &output_dir,
-        "ep-sparse-updated-forward",
-        rank,
-        world_size,
-        &tokens,
-        &assignments,
-        owned_expert_start,
-        owned_expert_end,
-        &updated_scales,
-    )?;
-    let train_final_loss = (&updated_forward.assembled_output - &target_rows)
-        .square()
-        .mean(Kind::Float)
-        .double_value(&[]);
-    let train_loss_improved = train_final_loss < train_initial_loss;
+    let train_final_loss = first_step
+        .final_loss
+        .ok_or_else(|| anyhow!("EP sparse first step did not compute post-update loss"))?;
+    let train_loss_improved = train_final_loss < first_step.initial_loss;
     if !train_loss_improved {
         bail!(
-            "EP sparse train smoke did not lower loss on rank {rank}: initial={train_initial_loss}, final={train_final_loss}"
+            "EP sparse train smoke did not lower loss on rank {rank}: initial={}, final={train_final_loss}",
+            first_step.initial_loss
         );
     }
-    let sparse_state = ExpertParallelAdamState {
-        m: scale_grad.detach(),
-        v: scale_grad.square().detach(),
-        step: 1,
-    };
     let sparse_adam = ExpertParallelAdamConfig {
         learning_rate: 0.25,
         beta1: 0.0,
@@ -866,13 +841,22 @@ pub fn run_expert_parallel_sparse_rank_smoke(output_dir: PathBuf) -> Result<()> 
         local_rank,
         owned_expert_start,
         owned_expert_end,
-        &updated_scales,
-        &sparse_state,
+        &first_step.updated_scales,
+        &first_step.updated_state,
         &sparse_adam,
     )?;
-    let (reloaded_scales, _reloaded_state) = read_ep_rank_checkpoint(&checkpoint)?;
+    let (reloaded_scales, reloaded_state) = read_ep_rank_checkpoint(&checkpoint)?;
     let reloaded_scales = reloaded_scales.to_device(device);
-    let reload_scale_max_abs = tensor_max_abs_diff(&reloaded_scales, &updated_scales)?;
+    let reloaded_state = ExpertParallelAdamState {
+        m: reloaded_state.m.to_device(device),
+        v: reloaded_state.v.to_device(device),
+        step: reloaded_state.step,
+    };
+    let reload_scale_max_abs = tensor_max_abs_diff(&reloaded_scales, &first_step.updated_scales)?;
+    let reload_optimizer_max_abs =
+        tensor_max_abs_diff(&reloaded_state.m, &first_step.updated_state.m)?.max(
+            tensor_max_abs_diff(&reloaded_state.v, &first_step.updated_state.v)?,
+        );
     if reload_scale_max_abs > 1e-7 {
         bail!("EP sparse checkpoint reload mismatch on rank {rank}: scale={reload_scale_max_abs}");
     }
@@ -897,6 +881,63 @@ pub fn run_expert_parallel_sparse_rank_smoke(output_dir: PathBuf) -> Result<()> 
             "EP sparse checkpoint reload loss mismatch on rank {rank}: reload_loss={reload_loss}, train_final_loss={train_final_loss}, delta={reload_loss_delta}"
         );
     }
+    if reload_optimizer_max_abs > 1e-7 {
+        bail!(
+            "EP sparse checkpoint optimizer reload mismatch on rank {rank}: optimizer={reload_optimizer_max_abs}"
+        );
+    }
+    let continuous_second = ep_sparse_sgd_step(
+        &output_dir,
+        "ep-sparse-continuous-second",
+        rank,
+        world_size,
+        &tokens,
+        &assignments,
+        owned_expert_start,
+        owned_expert_end,
+        &first_step.updated_scales,
+        &first_step.updated_state,
+        &target_rows,
+        None,
+    )?;
+    let resumed_second = ep_sparse_sgd_step(
+        &output_dir,
+        "ep-sparse-resumed-second",
+        rank,
+        world_size,
+        &tokens,
+        &assignments,
+        owned_expert_start,
+        owned_expert_end,
+        &reloaded_scales,
+        &reloaded_state,
+        &target_rows,
+        None,
+    )?;
+    let second_step_delta = (continuous_second.initial_loss - resumed_second.initial_loss).abs();
+    let second_step_scale_max_abs = tensor_max_abs_diff(
+        &continuous_second.updated_scales,
+        &resumed_second.updated_scales,
+    )?;
+    let second_step_optimizer_max_abs = tensor_max_abs_diff(
+        &continuous_second.updated_state.m,
+        &resumed_second.updated_state.m,
+    )?
+    .max(tensor_max_abs_diff(
+        &continuous_second.updated_state.v,
+        &resumed_second.updated_state.v,
+    )?);
+    let second_step_optimizer_step_delta =
+        (continuous_second.updated_state.step - resumed_second.updated_state.step).abs();
+    if second_step_delta > 1e-7
+        || second_step_scale_max_abs > 1e-7
+        || second_step_optimizer_max_abs > 1e-7
+        || second_step_optimizer_step_delta != 0
+    {
+        bail!(
+            "EP sparse checkpoint next-step parity failed on rank {rank}: loss_delta={second_step_delta}, scale_delta={second_step_scale_max_abs}, optimizer_delta={second_step_optimizer_max_abs}, optimizer_step_delta={second_step_optimizer_step_delta}"
+        );
+    }
 
     let summary = ExpertParallelSparseRankSummary {
         rank,
@@ -916,17 +957,24 @@ pub fn run_expert_parallel_sparse_rank_smoke(output_dir: PathBuf) -> Result<()> 
         reference_output_shape: reference_rows.size(),
         sparse_output_max_abs: sparse_diff.0,
         sparse_output_mean_abs: sparse_diff.1,
-        train_initial_loss,
+        train_initial_loss: first_step.initial_loss,
         train_final_loss,
         train_loss_improved,
-        scale_grad_norm,
+        scale_grad_norm: first_step.grad_norm,
         checkpoint_manifest_output: checkpoint.manifest_path.display().to_string(),
         checkpoint_model_safetensors: checkpoint.model_safetensors.display().to_string(),
         checkpoint_optimizer_safetensors: checkpoint.optimizer_safetensors.display().to_string(),
         checkpoint_tensor_count: checkpoint.tensor_count,
         reload_scale_max_abs,
+        reload_optimizer_max_abs,
         reload_loss,
         reload_loss_delta,
+        continuous_second_loss: continuous_second.initial_loss,
+        resumed_second_loss: resumed_second.initial_loss,
+        second_step_delta,
+        second_step_scale_max_abs,
+        second_step_optimizer_max_abs,
+        second_step_optimizer_step_delta,
     };
     let summary_path = output_dir.join(format!("ep-sparse-rank-{rank}.json"));
     fs::write(
@@ -1347,6 +1395,111 @@ fn ep_sparse_local_expert_outputs(
         )
     } else {
         Tensor::stack(&rows.iter().collect::<Vec<_>>(), 0)
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn ep_sparse_sgd_step(
+    output_dir: &Path,
+    step_name: &str,
+    rank: usize,
+    world_size: usize,
+    tokens: &Tensor,
+    assignments: &[usize],
+    owned_expert_start: usize,
+    owned_expert_end: usize,
+    local_scales: &Tensor,
+    state: &ExpertParallelAdamState,
+    target_rows: &Tensor,
+    post_update_step_name: Option<&str>,
+) -> Result<ExpertParallelSparseSgdStep> {
+    let forward = ep_sparse_forward(
+        output_dir,
+        &format!("{step_name}-forward"),
+        rank,
+        world_size,
+        tokens,
+        assignments,
+        owned_expert_start,
+        owned_expert_end,
+        local_scales,
+    )?;
+    let source_grad =
+        (&forward.assembled_output - target_rows) * (2.0 / target_rows.numel() as f64);
+    let initial_loss = (&forward.assembled_output - target_rows)
+        .square()
+        .mean(Kind::Float)
+        .double_value(&[]);
+    let gradient_sends = ep_sparse_output_gradient_sends(
+        rank,
+        world_size,
+        assignments,
+        &forward.source_token_indices,
+        &source_grad,
+    )?;
+    let gradient_recv_plan = ep_sparse_dispatch_recv_plan(rank, world_size, assignments)?;
+    let gradient_recvs = gradient_recv_plan
+        .iter()
+        .map(|plan| {
+            (
+                plan.peer,
+                vec![plan.token_indices.len() as i64, tokens.size()[1]],
+            )
+        })
+        .collect::<Vec<_>>();
+    let received_gradients = nccl_smoke::send_recv_tensors_f32_for_launch(
+        &output_dir.join(format!("{step_name}-output-grad")),
+        &gradient_sends,
+        &gradient_recvs,
+    )?;
+    let scale_grad = ep_sparse_scale_grad_from_output_grads(
+        &received_gradients,
+        &gradient_recv_plan,
+        tokens,
+        assignments,
+        owned_expert_start,
+        owned_expert_end,
+        local_scales,
+    )?;
+    let grad_norm = scale_grad.norm().double_value(&[]);
+    if grad_norm <= 0.0 {
+        bail!("EP sparse train smoke expected positive local expert scale grad norm");
+    }
+    let updated_scales = (local_scales - &(&scale_grad * 0.25)).detach();
+    let next_step = state.step + 1;
+    let updated_state = ExpertParallelAdamState {
+        m: scale_grad.detach(),
+        v: scale_grad.square().detach(),
+        step: next_step,
+    };
+    let final_loss = if let Some(step_name) = post_update_step_name {
+        let updated_forward = ep_sparse_forward(
+            output_dir,
+            step_name,
+            rank,
+            world_size,
+            tokens,
+            assignments,
+            owned_expert_start,
+            owned_expert_end,
+            &updated_scales,
+        )?;
+        Some(
+            (&updated_forward.assembled_output - target_rows)
+                .square()
+                .mean(Kind::Float)
+                .double_value(&[]),
+        )
+    } else {
+        None
+    };
+
+    Ok(ExpertParallelSparseSgdStep {
+        initial_loss,
+        final_loss,
+        updated_scales,
+        updated_state,
+        grad_norm,
     })
 }
 
