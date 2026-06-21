@@ -14,8 +14,8 @@ use tracing::info;
 
 use crate::nccl_smoke;
 use crate::runtime::{
-    Config, DataKind, Device as RuntimeDevice, LoraConfig as RuntimeLoraConfig, LrScheduler,
-    RunPaths,
+    Config, DataKind as RuntimeDataKind, Device as RuntimeDevice, LoraConfig as RuntimeLoraConfig,
+    LrScheduler, RunPaths,
 };
 
 #[derive(Debug, Serialize)]
@@ -248,6 +248,13 @@ pub(crate) struct QwenFullTrainSmokeSummary {
     pub(crate) samples_per_second: f64,
     pub(crate) memory_rss_mb: Option<f64>,
     pub(crate) gpu_memory_allocated_mb: Option<f64>,
+    pub(crate) dataset_total_samples: Option<usize>,
+    pub(crate) dataset_total_tokens: Option<usize>,
+    pub(crate) dataset_train_samples: Option<usize>,
+    pub(crate) dataset_eval_samples: Option<usize>,
+    pub(crate) dataset_order_seed: Option<u64>,
+    pub(crate) batch_size: usize,
+    pub(crate) sequence_tokens: usize,
     pub(crate) initial_loss: f64,
     pub(crate) final_loss: f64,
     pub(crate) reloaded_loss: f64,
@@ -684,6 +691,19 @@ struct QwenTrainableSession {
     input_ids: Tensor,
     compute_kind: Kind,
     registry: QwenTrainableRegistry,
+}
+
+struct QwenSessionBatchPlan {
+    initial_input_ids: Tensor,
+    train_batches: Vec<Tensor>,
+    reference_fixture: String,
+    dataset_total_samples: Option<usize>,
+    dataset_total_tokens: Option<usize>,
+    dataset_train_samples: Option<usize>,
+    dataset_eval_samples: Option<usize>,
+    dataset_order_seed: Option<u64>,
+    batch_size: usize,
+    sequence_tokens: usize,
 }
 
 struct QwenAttentionDpSession {
@@ -1385,7 +1405,7 @@ pub fn train_qwen_lora_sft_from_config(
         .data
         .as_ref()
         .context("qwen LoRA SFT trainer requires [data] instruction_jsonl")?;
-    if data.kind != DataKind::InstructionJsonl {
+    if data.kind != RuntimeDataKind::InstructionJsonl {
         bail!("qwen LoRA SFT trainer requires data.kind = instruction_jsonl");
     }
     if data.paths.is_empty() {
@@ -2113,6 +2133,13 @@ fn qwen_full_train_summary(
         samples_per_second: 0.0,
         memory_rss_mb: crate::metrics::memory_rss_mb(),
         gpu_memory_allocated_mb: crate::metrics::gpu_memory_allocated_mb(),
+        dataset_total_samples: None,
+        dataset_total_tokens: None,
+        dataset_train_samples: None,
+        dataset_eval_samples: None,
+        dataset_order_seed: None,
+        batch_size: session.input_ids.size()[0] as usize,
+        sequence_tokens: session.input_ids.size()[1] as usize,
         initial_loss,
         final_loss,
         reloaded_loss,
@@ -2133,6 +2160,7 @@ fn qwen_session_single_summary(
     learning_rate: f64,
     resume_from: Option<&Path>,
     trainable_layers: &[usize],
+    runtime_config: Option<&Config>,
 ) -> Result<QwenFullTrainSmokeSummary> {
     if train_steps == 0 {
         bail!("qwen session single trainer requires max_steps > 0");
@@ -2143,7 +2171,8 @@ fn qwen_session_single_summary(
 
     let config = read_runtime_config(&model_path.join("config.json"))?;
     let weights = read_safetensors_map(&model_path.join("model.safetensors"))?;
-    let input_ids = qwen_session_dp_global_input(&weights, Device::Cpu)?.narrow(0, 0, 1);
+    let batch_plan =
+        qwen_session_batch_plan_from_config(model_path, &weights, train_steps, runtime_config)?;
     let (mut session, start_step) = if let Some(resume_from) = resume_from {
         let manifest_text = fs::read_to_string(resume_from)
             .with_context(|| format!("failed to read {}", resume_from.display()))?;
@@ -2158,7 +2187,7 @@ fn qwen_session_single_summary(
             QwenTrainableSession::from_manifest(
                 config,
                 weights,
-                input_ids,
+                batch_plan.initial_input_ids.shallow_clone(),
                 dtype.kind(),
                 &manifest,
             )?,
@@ -2169,7 +2198,7 @@ fn qwen_session_single_summary(
             QwenTrainableSession::from_trainable_layers(
                 config,
                 weights,
-                input_ids,
+                batch_plan.initial_input_ids.shallow_clone(),
                 dtype.kind(),
                 trainable_layers,
             )?,
@@ -2183,6 +2212,12 @@ fn qwen_session_single_summary(
     let mut final_step_grad_norm = 0.0;
     let train_started = Instant::now();
     for step in start_step..=end_step {
+        let batch_index = step - start_step;
+        let input_ids = batch_plan
+            .train_batches
+            .get(batch_index)
+            .ok_or_else(|| anyhow!("missing qwen trainable session batch for step {step}"))?;
+        session.set_input_ids(input_ids);
         let step_result = session.train_step(learning_rate, step as i32)?;
         if step == start_step {
             step_losses.push(step_result.loss_before);
@@ -2265,9 +2300,15 @@ fn qwen_session_single_summary(
     }
 
     let next_step = end_step + 1;
+    let next_batch = batch_plan
+        .train_batches
+        .get(train_steps)
+        .ok_or_else(|| anyhow!("missing qwen trainable session next-step batch"))?;
+    resumed_session.set_input_ids(next_batch);
     let resumed_second_step = resumed_session.train_step(learning_rate, next_step as i32)?;
     let resume_loss_value = resumed_second_step.loss_before;
     let resumed_second_loss = resumed_second_step.loss_after;
+    session.set_input_ids(next_batch);
     let continuous_second_step = session.train_step(learning_rate, next_step as i32)?;
     let continuous_second_loss = continuous_second_step.loss_after;
     let second_step_delta = (continuous_second_loss - resumed_second_loss).abs();
@@ -2279,7 +2320,7 @@ fn qwen_session_single_summary(
 
     Ok(QwenFullTrainSmokeSummary {
         model_path: model_path.display().to_string(),
-        reference_fixture: "qwen_session_single_fixed_tokens".to_string(),
+        reference_fixture: batch_plan.reference_fixture,
         delta_output: delta_output.display().to_string(),
         optimizer_output: optimizer_output.display().to_string(),
         manifest_output: manifest_output.display().to_string(),
@@ -2295,6 +2336,13 @@ fn qwen_session_single_summary(
         samples_per_second,
         memory_rss_mb: crate::metrics::memory_rss_mb(),
         gpu_memory_allocated_mb: crate::metrics::gpu_memory_allocated_mb(),
+        dataset_total_samples: batch_plan.dataset_total_samples,
+        dataset_total_tokens: batch_plan.dataset_total_tokens,
+        dataset_train_samples: batch_plan.dataset_train_samples,
+        dataset_eval_samples: batch_plan.dataset_eval_samples,
+        dataset_order_seed: batch_plan.dataset_order_seed,
+        batch_size: batch_plan.batch_size,
+        sequence_tokens: batch_plan.sequence_tokens,
         initial_loss,
         final_loss,
         reloaded_loss,
@@ -3155,6 +3203,7 @@ pub(crate) fn train_qwen_session_single_from_config(
         config.train.learning_rate as f64,
         config.train.resume_from.as_deref(),
         &qwen_session_trainable_layers_from_config(config),
+        Some(config),
     )
 }
 
@@ -3579,6 +3628,10 @@ impl QwenTrainableSession {
 
     fn parameter_names(&self) -> Vec<String> {
         self.registry.parameter_names()
+    }
+
+    fn set_input_ids(&mut self, input_ids: &Tensor) {
+        self.input_ids = input_ids.to_device(self.input_ids.device());
     }
 
     fn all_reduce_average_grads(
@@ -4011,6 +4064,76 @@ fn qwen_session_dp_global_input(
             .to_kind(Kind::Int64)
             .to_device(device),
     )
+}
+
+fn qwen_session_fixed_batch_plan(
+    weights: &BTreeMap<String, Tensor>,
+) -> Result<QwenSessionBatchPlan> {
+    let input_ids = qwen_session_dp_global_input(weights, Device::Cpu)?.narrow(0, 0, 1);
+    Ok(QwenSessionBatchPlan {
+        initial_input_ids: input_ids.shallow_clone(),
+        train_batches: vec![input_ids.shallow_clone(), input_ids],
+        reference_fixture: "qwen_session_single_fixed_tokens".to_string(),
+        dataset_total_samples: None,
+        dataset_total_tokens: None,
+        dataset_train_samples: None,
+        dataset_eval_samples: None,
+        dataset_order_seed: None,
+        batch_size: 1,
+        sequence_tokens: 5,
+    })
+}
+
+fn qwen_session_batch_plan_from_config(
+    model_path: &Path,
+    weights: &BTreeMap<String, Tensor>,
+    train_steps: usize,
+    runtime_config: Option<&Config>,
+) -> Result<QwenSessionBatchPlan> {
+    let Some(runtime_config) = runtime_config else {
+        return qwen_session_fixed_batch_plan(weights);
+    };
+    let Some(data_config) = runtime_config.data.as_ref() else {
+        return qwen_session_fixed_batch_plan(weights);
+    };
+    if data_config.kind != RuntimeDataKind::InstructionJsonl {
+        bail!("qwen trainable session data path supports kind = instruction_jsonl");
+    }
+    let tokenizer = Tokenizer::from_file(model_path.join("tokenizer.json"))
+        .map_err(|error| anyhow!("failed to load tokenizer: {error}"))?;
+    let dataset = QwenSftDataset::from_jsonl_paths(&tokenizer, &data_config.paths)?
+        .shuffle_by_seed(runtime_config.run.seed);
+    let dataset_summary = dataset.summary();
+    let (train_dataset, eval_dataset) = dataset.train_eval_split(data_config.train_split)?;
+    let batch_size = runtime_config
+        .train
+        .micro_batch_size
+        .min(train_dataset.len())
+        .max(1);
+    let required_batches = train_steps + 2;
+    let train_batches = (0..required_batches)
+        .map(|step| {
+            train_dataset
+                .padded_batch(step * batch_size, batch_size)
+                .map(|batch| batch.input_ids)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let initial_input_ids = train_batches
+        .first()
+        .ok_or_else(|| anyhow!("qwen trainable session batch plan produced no batches"))?
+        .shallow_clone();
+    Ok(QwenSessionBatchPlan {
+        sequence_tokens: initial_input_ids.size()[1] as usize,
+        initial_input_ids,
+        train_batches,
+        reference_fixture: "qwen_session_single_jsonl".to_string(),
+        dataset_total_samples: Some(dataset_summary.samples),
+        dataset_total_tokens: Some(dataset_summary.total_tokens),
+        dataset_train_samples: Some(train_dataset.len()),
+        dataset_eval_samples: Some(eval_dataset.len()),
+        dataset_order_seed: Some(runtime_config.run.seed),
+        batch_size,
+    })
 }
 
 fn read_runtime_config(path: &Path) -> Result<QwenRuntimeConfig> {
@@ -6931,6 +7054,23 @@ mod tests {
         assert_eq!(summary.max_sequence_tokens, 3);
         assert_eq!(order_a, order_b);
         assert_ne!(order_a, order_c);
+    }
+
+    #[test]
+    fn qwen_session_fixed_batch_plan_reports_fixture_metadata() {
+        let mut weights = tiny_qwen_weights();
+        weights.insert(
+            "model.embed_tokens.weight".to_string(),
+            Tensor::zeros([2048, 4], (Kind::Float, Device::Cpu)),
+        );
+
+        let plan = qwen_session_fixed_batch_plan(&weights).expect("fixed plan should build");
+
+        assert_eq!(plan.reference_fixture, "qwen_session_single_fixed_tokens");
+        assert_eq!(plan.batch_size, 1);
+        assert_eq!(plan.sequence_tokens, 5);
+        assert_eq!(plan.train_batches.len(), 2);
+        assert!(plan.dataset_total_samples.is_none());
     }
 
     #[test]

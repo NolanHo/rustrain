@@ -149,8 +149,10 @@ rules remain open.
   also has rank0 delta/optimizer artifacts and next-step resume parity. A
   production sharded checkpoint schema is defined and validated, and the
   representative DP smoke writes rank-owned shard manifests and verifies
-  rank-local sharded reload loss parity. Production checkpoint/resume over real
-  data batches remains open.
+  rank-local sharded reload loss parity. The single-GPU session trainer also
+  has a tokenizer-backed JSONL batch/resume verifier at
+  `configs/qwen_session_single_sft.toml`. Production checkpoint/resume over
+  full real data streams remains open.
 - C4/G1 trainer-owned Qwen training is still incomplete, but the full-train
   smoke now uses a reusable `QwenTrainableSession` surface, and representative
   single-GPU plus DP=2 config paths are wired through `train --config`. The
@@ -158,7 +160,8 @@ rules remain open.
   It can also resume from its saved delta manifest through `--resume-from` and
   reports throughput, gradient norm, RSS, and GPU memory metrics. The session
   registry can now expand configured trainable layer sets instead of being
-  fixed to layer0.
+  fixed to layer0, and `configs/qwen_session_single_sft.toml` feeds
+  tokenizer-backed instruction JSONL batches through the same trainer path.
   Full model/data/checkpoint trainer ownership remains open.
 - G6 trainer-level real SFT data now has minimal Qwen LoRA SFT config paths:
   `train --config configs/qwen_lora_sft.toml` loads tokenizer-backed

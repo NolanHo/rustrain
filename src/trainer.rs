@@ -138,6 +138,13 @@ pub fn train(config_path: &Path, resume_from: Option<PathBuf>) -> Result<()> {
                 samples_per_second = summary.samples_per_second,
                 memory_rss_mb = summary.memory_rss_mb,
                 gpu_memory_allocated_mb = summary.gpu_memory_allocated_mb,
+                dataset_total_samples = summary.dataset_total_samples,
+                dataset_total_tokens = summary.dataset_total_tokens,
+                dataset_train_samples = summary.dataset_train_samples,
+                dataset_eval_samples = summary.dataset_eval_samples,
+                dataset_order_seed = summary.dataset_order_seed,
+                batch_size = summary.batch_size,
+                sequence_tokens = summary.sequence_tokens,
                 trainable_tensors = summary.trainable_tensors.len(),
                 "qwen trainable session trainer single-rank smoke complete"
             );
@@ -163,6 +170,23 @@ pub fn train(config_path: &Path, resume_from: Option<PathBuf>) -> Result<()> {
             if let Some(gpu_memory_allocated_mb) = summary.gpu_memory_allocated_mb {
                 println!("gpu_memory_allocated_mb: {gpu_memory_allocated_mb:.2}");
             }
+            if let Some(dataset_total_samples) = summary.dataset_total_samples {
+                println!("dataset_total_samples: {dataset_total_samples}");
+            }
+            if let Some(dataset_total_tokens) = summary.dataset_total_tokens {
+                println!("dataset_total_tokens: {dataset_total_tokens}");
+            }
+            if let Some(dataset_train_samples) = summary.dataset_train_samples {
+                println!("dataset_train_samples: {dataset_train_samples}");
+            }
+            if let Some(dataset_eval_samples) = summary.dataset_eval_samples {
+                println!("dataset_eval_samples: {dataset_eval_samples}");
+            }
+            if let Some(dataset_order_seed) = summary.dataset_order_seed {
+                println!("dataset_order_seed: {dataset_order_seed}");
+            }
+            println!("batch_size: {}", summary.batch_size);
+            println!("sequence_tokens: {}", summary.sequence_tokens);
             println!("initial_loss: {:.9}", summary.initial_loss);
             println!("final_loss: {:.9}", summary.final_loss);
             println!("reloaded_loss: {:.9}", summary.reloaded_loss);
