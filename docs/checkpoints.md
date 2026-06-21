@@ -105,6 +105,10 @@ Acceptance:
 The current representative DP Qwen session path uses replicated data-parallel
 weights. Rank0 writes the checkpoint artifacts after gradient synchronization;
 non-rank0 ranks do not write checkpoint files.
+`configs/qwen_session_dp2_layers01.toml` exercises the same contract with
+configured trainable transformer layers `[0, 1]`. That DP path has 25 trainable
+tensors because it excludes the tied embedding and owns the configured layer
+tensors plus final norm.
 
 Rank0 artifacts:
 
@@ -150,6 +154,9 @@ writes rank-owned shard manifests plus a global manifest. The representative
 2-rank trainer verification restores each rank from its rank-owned model and
 optimizer safetensors through the global manifest, verifies reload loss parity,
 and verifies next-step resume parity against a continuous rank0-manifest run.
+The layer0+layer1 DP verifier uses the same global manifest path and checks
+that both rank-local sharded restore and the following sharded train step match
+the continuous rank0-manifest run.
 The focused Qwen TP=2 layer0 smoke also writes rank-owned model shard files and
 a global `rustrain.qwen_sharded.v1` manifest for its layer0 attention/MLP tensor
 partitions. That TP manifest is checkpoint-contract evidence only: optimizer
