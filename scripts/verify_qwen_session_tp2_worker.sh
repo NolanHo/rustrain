@@ -30,6 +30,16 @@ kv_heads = []
 intermediate = []
 global_manifests = set()
 rank_manifest_by_rank = {}
+causal_grad_norm_by_tensor = {
+    "model.layers.0.self_attn.q_proj.weight": "causal_train_q_grad_norm",
+    "model.layers.0.self_attn.k_proj.weight": "causal_train_k_grad_norm",
+    "model.layers.0.self_attn.v_proj.weight": "causal_train_v_grad_norm",
+    "model.layers.0.self_attn.o_proj.weight": "causal_train_o_grad_norm",
+    "model.layers.0.mlp.gate_proj.weight": "causal_train_gate_grad_norm",
+    "model.layers.0.mlp.up_proj.weight": "causal_train_up_grad_norm",
+    "model.layers.0.mlp.down_proj.weight": "causal_train_down_grad_norm",
+}
+adam_beta2 = 0.999
 
 
 def tensor_shapes(path):
@@ -47,6 +57,7 @@ def tensor_shape_sums(path):
             tensor = handle.get_tensor(key)
             tensors[key] = {
                 "shape": list(tensor.shape),
+                "sum": float(tensor.sum().item()),
                 "abs_sum": float(tensor.abs().sum().item()),
             }
     return tensors
@@ -225,6 +236,15 @@ for path in summaries:
                     raise SystemExit(
                         f"{rank_manifest_path} optimizer slot {slot_name} for {entry['name']} is all zero"
                     )
+            grad_norm_key = causal_grad_norm_by_tensor[entry["name"]]
+            expected_v_sum = (1.0 - adam_beta2) * float(data[grad_norm_key]) ** 2
+            actual_v_sum = optimizer_shapes[entry["optimizer_v_name"]]["sum"]
+            tolerance = max(1e-8, abs(expected_v_sum) * 1e-3)
+            if abs(actual_v_sum - expected_v_sum) > tolerance:
+                raise SystemExit(
+                    f"{rank_manifest_path} optimizer v slot {entry['optimizer_v_name']} sum {actual_v_sum} "
+                    f"does not match first-step AdamW expectation {expected_v_sum} for {entry['name']}"
+                )
     global_manifests.add(data["sharded_global_manifest_output"])
     q_heads.append((int(data["attention_q_head_start"]), int(data["attention_q_head_end"])))
     kv_heads.append((int(data["attention_kv_head_start"]), int(data["attention_kv_head_end"])))
@@ -311,7 +331,7 @@ if int(global_manifest["seed"]) != 42:
     raise SystemExit(f"unexpected TP seed {global_manifest['seed']}")
 if global_manifest["dtype"] != "fp32":
     raise SystemExit(f"unexpected TP dtype {global_manifest['dtype']}")
-if global_manifest["optimizer"] != "adamw_gradient_slots_smoke":
+if global_manifest["optimizer"] != "adamw_first_step_slots_smoke":
     raise SystemExit(f"unexpected TP optimizer {global_manifest['optimizer']}")
 if global_manifest["scheduler"] != "constant":
     raise SystemExit(f"unexpected TP scheduler {global_manifest['scheduler']}")

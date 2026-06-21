@@ -71,6 +71,7 @@ def tensor_shape_sums(path):
             tensor = handle.get_tensor(key)
             tensors[key] = {
                 "shape": list(tensor.shape),
+                "sum": float(tensor.sum().item()),
                 "abs_sum": float(tensor.abs().sum().item()),
             }
     return tensors
@@ -108,8 +109,8 @@ def validate_tp_global_manifest(manifest_path, expected_global_step):
         raise SystemExit(f"{manifest_path} seed {manifest['seed']} != 42")
     if manifest["dtype"] != "fp32":
         raise SystemExit(f"{manifest_path} dtype {manifest['dtype']} != fp32")
-    if manifest["optimizer"] != "adamw_gradient_slots_smoke":
-        raise SystemExit(f"{manifest_path} optimizer {manifest['optimizer']} != adamw_gradient_slots_smoke")
+    if manifest["optimizer"] != "adamw_first_step_slots_smoke":
+        raise SystemExit(f"{manifest_path} optimizer {manifest['optimizer']} != adamw_first_step_slots_smoke")
     if manifest["scheduler"] != "constant":
         raise SystemExit(f"{manifest_path} scheduler {manifest['scheduler']} != constant")
     expected_parallel = {

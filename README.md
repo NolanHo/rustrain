@@ -152,13 +152,15 @@ real causal loss, and an explicit output-gradient bridge verifies q/k/v/o plus
 gate/up/down shard gradients and a loss-reducing shard update. The smoke writes
 rank-owned focused TP shard manifests for layer0 attention/MLP tensors under
 the shared `rustrain.qwen_sharded.v1` schema. Its optimizer safetensors contain
-gradient-derived AdamW m/v smoke slots for the TP row/column shards, while the
+first-step AdamW m/v smoke slots for the TP row/column shards, while the
 replicated norm smoke slots remain zero. The smoke restores those rank-owned
 shards to reproduce the focused fused layer0 output plus the next focused shard
 update within tolerance. The TP verifier also checks the global manifest
 identity, progress/provenance defaults, embedded rank manifests, every declared
 rank-owned model shard plus AdamW slot shape, and non-zero optimizer slots for
-TP-owned trainable shards in the written safetensors files; the external TP
+TP-owned trainable shards in the written safetensors files. The baseline TP
+verifier additionally checks the AdamW v slot sum against the focused causal
+gradient norm and configured beta2; the external TP
 resume verifier repeats those checks for both the base manifest and the resumed
 launch manifest while verifying restore and next-update parity.
 Real production tensor-parallel Qwen training is not implemented yet; the

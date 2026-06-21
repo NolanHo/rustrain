@@ -6197,6 +6197,8 @@ fn write_qwen_session_tp_focused_sharded_manifest(
     Tensor::write_safetensors(&model_refs, &model_safetensors)
         .with_context(|| format!("failed to write {}", model_safetensors.display()))?;
 
+    let beta1 = config.train.adam_beta1 as f64;
+    let beta2 = config.train.adam_beta2 as f64;
     let optimizer_slot_grad_map = optimizer_slot_grads
         .iter()
         .map(|(name, grad)| (*name, *grad))
@@ -6206,13 +6208,15 @@ fn write_qwen_session_tp_focused_sharded_manifest(
         .flat_map(|(name, tensor)| {
             let grad = optimizer_slot_grad_map.get(name.as_str()).copied();
             let first_moment = grad
-                .map(|grad| grad.detach().to_device(tensor.device()).contiguous())
+                .map(|grad| (grad.detach().to_device(tensor.device()) * (1.0 - beta1)).contiguous())
                 .unwrap_or_else(|| Tensor::zeros_like(tensor));
             let second_moment = grad
                 .map(|grad| {
-                    grad.detach()
+                    (grad
+                        .detach()
                         .to_device(tensor.device())
                         .pow_tensor_scalar(2.0)
+                        * (1.0 - beta2))
                         .contiguous()
                 })
                 .unwrap_or_else(|| Tensor::zeros_like(tensor));
@@ -6354,7 +6358,7 @@ fn write_qwen_session_tp_focused_sharded_manifest(
             dataset_shuffle: true,
             seed: config.run.seed,
             dtype: "fp32".to_string(),
-            optimizer: "adamw_gradient_slots_smoke".to_string(),
+            optimizer: "adamw_first_step_slots_smoke".to_string(),
             scheduler: "constant".to_string(),
             parallel: QwenShardedParallelManifest {
                 data_parallel_size: 1,
