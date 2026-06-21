@@ -7,6 +7,9 @@ use std::{
 use anyhow::{Context, Result, anyhow, bail};
 use ndarray::{Array2, Axis, array, concatenate, s};
 use serde::{Deserialize, Serialize};
+use tch::{Device, Kind, Tensor};
+
+use crate::nccl_smoke;
 
 const DP_WEIGHT: [f64; 2] = [0.2, -0.1];
 const DP_DATASET: [([f64; 2], f64); 4] = [
@@ -67,6 +70,24 @@ struct ExpertParallelRankSummary {
     owned_token_indices: Vec<usize>,
     expert_load: Vec<usize>,
     local_output_path: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct ExpertParallelNcclRankSummary {
+    rank: usize,
+    world_size: usize,
+    local_rank: usize,
+    owned_expert_start: usize,
+    owned_expert_end: usize,
+    owned_token_indices: Vec<usize>,
+    expert_load: Vec<usize>,
+    reduced_output_shape: Vec<i64>,
+    combine_max_abs: f64,
+    combine_mean_abs: f64,
+    train_initial_loss: f64,
+    train_final_loss: f64,
+    train_loss_improved: bool,
+    scale_grad_norm: f64,
 }
 
 pub fn run_data_parallel_smoke(output_dir: &Path, world_size: usize) -> Result<()> {
@@ -397,6 +418,139 @@ pub fn run_expert_parallel_rank_smoke(output_dir: PathBuf) -> Result<()> {
     Ok(())
 }
 
+pub fn run_expert_parallel_nccl_rank_smoke(output_dir: PathBuf) -> Result<()> {
+    let rank = parse_launcher_usize_env("RANK")?;
+    let local_rank = parse_launcher_usize_env("LOCAL_RANK")?;
+    let world_size = parse_launcher_usize_env("WORLD_SIZE")?;
+    if world_size != 2 {
+        bail!("EP NCCL rank smoke currently expects WORLD_SIZE=2");
+    }
+    if rank >= world_size {
+        bail!("rank {rank} must be smaller than world_size {world_size}");
+    }
+    fs::create_dir_all(&output_dir)
+        .with_context(|| format!("failed to create {}", output_dir.display()))?;
+
+    let device = Device::Cuda(local_rank);
+    let tokens = ep_tokens_tensor(device);
+    let router = ep_router_tensor(device);
+    let assignments = route_top1_tensor(&tokens, &router)?;
+    let reference = ep_reference_output_tensor(&tokens, &assignments)?;
+    let target = &reference * 0.5;
+    let experts_per_rank = ep_expert_count() / world_size;
+    let owned_expert_start = rank * experts_per_rank;
+    let owned_expert_end = owned_expert_start + experts_per_rank;
+    let owned_token_indices = assignments
+        .iter()
+        .enumerate()
+        .filter_map(|(token_index, expert_index)| {
+            (owned_expert_start..owned_expert_end)
+                .contains(expert_index)
+                .then_some(token_index)
+        })
+        .collect::<Vec<_>>();
+    let expert_load = ep_owned_expert_load(&assignments, owned_expert_start, owned_expert_end);
+
+    let local_scales = ep_owned_expert_scales_tensor(owned_expert_start, owned_expert_end, device)
+        .set_requires_grad(true);
+    let local_output = ep_local_output_tensor(
+        &tokens,
+        &assignments,
+        owned_expert_start,
+        owned_expert_end,
+        &local_scales,
+    )?;
+    let reduced_output = nccl_smoke::all_reduce_tensor_f32_for_launch(
+        &output_dir.join("ep-nccl-combine"),
+        &local_output,
+    )?;
+    let reduced_output = reduced_output.set_requires_grad(true);
+    let combine_diff = tensor_diff_stats(&reduced_output, &reference)?;
+    if combine_diff.0 > 1e-6 {
+        bail!(
+            "EP NCCL combine mismatch: rank={rank}, max_abs={}, mean_abs={}",
+            combine_diff.0,
+            combine_diff.1
+        );
+    }
+
+    let initial_loss_tensor = (&reduced_output - &target).square().mean(Kind::Float);
+    let initial_loss = initial_loss_tensor.double_value(&[]);
+    let output_grads =
+        Tensor::run_backward(&[initial_loss_tensor], &[&reduced_output], false, false);
+    let output_grad = output_grads
+        .into_iter()
+        .next()
+        .ok_or_else(|| anyhow!("EP NCCL smoke did not produce an output gradient"))?;
+    if !output_grad.defined() || output_grad.norm().double_value(&[]) <= 0.0 {
+        bail!("EP NCCL smoke output gradient is missing or zero on rank {rank}");
+    }
+    let local_train_output = ep_local_output_tensor(
+        &tokens,
+        &assignments,
+        owned_expert_start,
+        owned_expert_end,
+        &local_scales,
+    )?;
+    (local_train_output * &output_grad.detach())
+        .sum(Kind::Float)
+        .backward();
+    let scale_grad = local_scales.grad();
+    let scale_grad_norm = scale_grad.norm().double_value(&[]);
+    if !scale_grad.defined() || scale_grad_norm <= 0.0 {
+        bail!("EP NCCL smoke local expert scale gradient is missing or zero on rank {rank}");
+    }
+
+    let learning_rate = 0.25;
+    let updated_scales = (&local_scales - &(scale_grad * learning_rate)).detach();
+    let updated_local_output = ep_local_output_tensor(
+        &tokens,
+        &assignments,
+        owned_expert_start,
+        owned_expert_end,
+        &updated_scales,
+    )?;
+    let updated_reduced = nccl_smoke::all_reduce_tensor_f32_for_launch(
+        &output_dir.join("ep-nccl-updated-combine"),
+        &updated_local_output,
+    )?;
+    let final_loss = (&updated_reduced - &target)
+        .square()
+        .mean(Kind::Float)
+        .double_value(&[]);
+    let train_loss_improved = final_loss < initial_loss;
+    if !train_loss_improved {
+        bail!(
+            "EP NCCL train smoke did not lower loss on rank {rank}: initial={initial_loss}, final={final_loss}"
+        );
+    }
+
+    let summary = ExpertParallelNcclRankSummary {
+        rank,
+        world_size,
+        local_rank,
+        owned_expert_start,
+        owned_expert_end,
+        owned_token_indices,
+        expert_load,
+        reduced_output_shape: reduced_output.size(),
+        combine_max_abs: combine_diff.0,
+        combine_mean_abs: combine_diff.1,
+        train_initial_loss: initial_loss,
+        train_final_loss: final_loss,
+        train_loss_improved,
+        scale_grad_norm,
+    };
+    let summary_path = output_dir.join(format!("ep-nccl-rank-{rank}.json"));
+    fs::write(
+        &summary_path,
+        serde_json::to_string_pretty(&summary)? + "\n",
+    )
+    .with_context(|| format!("failed to write {}", summary_path.display()))?;
+    println!("{}", serde_json::to_string_pretty(&summary)?);
+    Ok(())
+}
+
 fn compute_dp_stats(rank: usize, world_size: usize) -> DpRankStats {
     let mut sample_count = 0;
     let mut loss_sum = 0.0;
@@ -449,8 +603,113 @@ fn ep_expert_scales() -> [[f64; 3]; 4] {
     ]
 }
 
+fn ep_expert_count() -> usize {
+    ep_expert_scales().len()
+}
+
 fn array2_to_rows(array: &Array2<f64>) -> Vec<Vec<f64>> {
     array.rows().into_iter().map(|row| row.to_vec()).collect()
+}
+
+fn ep_tokens_tensor(device: Device) -> Tensor {
+    Tensor::from_slice(&[
+        1.0_f32, 0.0, 0.5, 0.0, 1.0, -0.5, 1.0, 1.0, 0.0, -1.0, 0.5, 1.0,
+    ])
+    .reshape([4, 3])
+    .to_device(device)
+}
+
+fn ep_router_tensor(device: Device) -> Tensor {
+    Tensor::from_slice(&[
+        0.9_f32, -0.2, 0.1, 0.0, 0.1, 0.8, -0.4, 0.2, 0.0, -0.3, 0.7, 0.6,
+    ])
+    .reshape([3, 4])
+    .to_device(device)
+}
+
+fn ep_all_expert_scales_tensor(device: Device) -> Tensor {
+    Tensor::from_slice(&[
+        1.0_f32, 0.5, -0.25, -0.5, 1.5, 0.25, 0.25, -1.0, 1.25, 1.2, 0.3, 0.8,
+    ])
+    .reshape([4, 3])
+    .to_device(device)
+}
+
+fn ep_owned_expert_scales_tensor(start: usize, end: usize, device: Device) -> Tensor {
+    ep_all_expert_scales_tensor(device).narrow(0, start as i64, (end - start) as i64)
+}
+
+fn route_top1_tensor(tokens: &Tensor, router: &Tensor) -> Result<Vec<usize>> {
+    let assignments = tokens
+        .matmul(router)
+        .argmax(1, false)
+        .to_device(Device::Cpu);
+    Vec::<i64>::try_from(assignments)?
+        .into_iter()
+        .map(|value| {
+            usize::try_from(value).with_context(|| format!("invalid expert assignment {value}"))
+        })
+        .collect()
+}
+
+fn ep_owned_expert_load(
+    assignments: &[usize],
+    owned_expert_start: usize,
+    owned_expert_end: usize,
+) -> Vec<usize> {
+    let mut expert_load = vec![0usize; ep_expert_count()];
+    for &expert_index in assignments {
+        if (owned_expert_start..owned_expert_end).contains(&expert_index) {
+            expert_load[expert_index] += 1;
+        }
+    }
+    expert_load
+}
+
+fn ep_reference_output_tensor(tokens: &Tensor, assignments: &[usize]) -> Result<Tensor> {
+    ep_local_output_tensor(
+        tokens,
+        assignments,
+        0,
+        ep_expert_count(),
+        &ep_all_expert_scales_tensor(tokens.device()),
+    )
+}
+
+fn ep_local_output_tensor(
+    tokens: &Tensor,
+    assignments: &[usize],
+    owned_expert_start: usize,
+    owned_expert_end: usize,
+    owned_scales: &Tensor,
+) -> Result<Tensor> {
+    let mut rows = Vec::with_capacity(assignments.len());
+    for (token_index, expert_index) in assignments.iter().copied().enumerate() {
+        let token = tokens.get(token_index as i64);
+        let row = if (owned_expert_start..owned_expert_end).contains(&expert_index) {
+            let local_expert_index = (expert_index - owned_expert_start) as i64;
+            token * owned_scales.get(local_expert_index)
+        } else {
+            Tensor::zeros([tokens.size()[1]], (Kind::Float, tokens.device()))
+        };
+        rows.push(row);
+    }
+    Ok(Tensor::stack(&rows.iter().collect::<Vec<_>>(), 0))
+}
+
+fn tensor_diff_stats(actual: &Tensor, expected: &Tensor) -> Result<(f64, f64)> {
+    if actual.size() != expected.size() {
+        bail!(
+            "shape mismatch: actual {:?}, expected {:?}",
+            actual.size(),
+            expected.size()
+        );
+    }
+    let diff = (actual - expected).abs().to_device(Device::Cpu);
+    Ok((
+        diff.max().double_value(&[]),
+        diff.mean(Kind::Float).double_value(&[]),
+    ))
 }
 
 fn parse_launcher_usize_env(name: &str) -> Result<usize> {
