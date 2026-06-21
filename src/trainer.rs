@@ -14,6 +14,7 @@ use crate::{
     moe::{deepseek_moe_smoke, moe_smoke},
     parallel::{ProcessGroup, SingleRankProcessGroup},
     parallel_modules::tp1_module_smoke,
+    qwen_module::train_qwen_session_dp_from_config,
     runtime::{
         Config, LrScheduler, init_logging, load_config, prepare_run_directory, validate_config,
         write_resolved_config,
@@ -100,6 +101,29 @@ pub fn train(config_path: &Path, resume_from: Option<PathBuf>) -> Result<()> {
         if let Some(gpu_memory_allocated_mb) = summary.gpu_memory_allocated_mb {
             println!("gpu_memory_allocated_mb: {gpu_memory_allocated_mb:.2}");
         }
+
+        return Ok(());
+    }
+
+    if matches!(config.train.backend, BackendKind::Tch)
+        && config.model.architecture == "qwen_trainable_session"
+    {
+        let backend = RuntimeBackend::from_kind(config.train.backend);
+        info!(
+            backend = ?backend.kind(),
+            supports_autograd = backend.supports_autograd(),
+            supports_cuda = backend.supports_cuda(),
+            "backend configured"
+        );
+        info!(model = ?config.model, "model config");
+        info!(train = ?config.train, "train config");
+        info!(parallel = ?config.parallel, "parallel config");
+
+        train_qwen_session_dp_from_config(&config, &run_paths)?;
+        info!("qwen trainable session trainer DP smoke complete");
+        println!("rustrain qwen trainable session DP complete");
+        println!("run_dir: {}", run_paths.root.display());
+        println!("resolved_config: {}", run_paths.resolved_config.display());
 
         return Ok(());
     }

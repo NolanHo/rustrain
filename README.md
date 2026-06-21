@@ -91,6 +91,7 @@ RUSTRAIN_RAY_NUM_GPUS=2 scripts/gpu_run.sh cargo run -- launch --nproc-per-node 
 RUSTRAIN_RAY_NUM_GPUS=2 scripts/gpu_run.sh env RUSTRAIN_LAUNCH_TIMEOUT_SECS=300 cargo run -- launch --nproc-per-node 2 --output-dir /tmp/rustrain-runs/qwen-dp-gradient-smoke-fp32 qwen-dp-gradient-rank-smoke --dtype fp32 --output-dir /tmp/rustrain-runs/qwen-dp-gradient-smoke-fp32/ranks
 RUSTRAIN_RAY_NUM_GPUS=2 scripts/gpu_run.sh env RUSTRAIN_LAUNCH_TIMEOUT_SECS=300 cargo run -- launch --nproc-per-node 2 --output-dir /tmp/rustrain-runs/qwen-dp-gradient-smoke-steps3 qwen-dp-gradient-rank-smoke --dtype fp32 --steps 3 --learning-rate 1.0 --output-dir /tmp/rustrain-runs/qwen-dp-gradient-smoke-steps3/ranks
 RUSTRAIN_RAY_NUM_GPUS=2 scripts/gpu_run.sh env RUSTRAIN_LAUNCH_TIMEOUT_SECS=600 cargo run -- launch --nproc-per-node 2 --output-dir /tmp/rustrain-runs/qwen-session-dp-adamw-smoke qwen-session-dp-rank-smoke --dtype fp32 --steps 2 --learning-rate 0.000001 --output-dir /tmp/rustrain-runs/qwen-session-dp-adamw-smoke/ranks
+RUSTRAIN_RAY_NUM_GPUS=2 scripts/gpu_run.sh env RUSTRAIN_LAUNCH_TIMEOUT_SECS=600 cargo run -- launch --nproc-per-node 2 --output-dir /tmp/rustrain-runs/qwen-session-trainer-dp2 train --config configs/qwen_session_dp2.toml
 ```
 
 The launcher sets `RANK`, `LOCAL_RANK`, `WORLD_SIZE`, `LOCAL_WORLD_SIZE`,
@@ -111,8 +112,10 @@ layer0 attention DP smoke, not trainer-owned full-Qwen distributed training.
 The `QwenTrainableSession` path also has a representative DP rank smoke: it
 runs rank-local Qwen forward/backward on CUDA, all-reduces 13 representative
 layer0/norm/MLP gradients with NCCL, applies multi-step averaged AdamW updates,
-and checks global loss improvement. General `trainer::train` ownership of this
-real-Qwen DP path remains open.
+and checks global loss improvement. The same representative path is wired
+through `train --config configs/qwen_session_dp2.toml`; full production Qwen
+trainer ownership, real data batching, and distributed checkpoint/resume rules
+remain open.
 
 ## Current Major Gaps
 
@@ -121,9 +124,9 @@ real-Qwen DP path remains open.
   slots and proves next-step parity. Distributed checkpoint layout is still
   open.
 - C4/G1 trainer-owned Qwen training is still incomplete, but the full-train
-  smoke now uses a reusable `QwenTrainableSession` surface for train steps,
-  loss evaluation, and manifest resume. Wiring that surface into the general
-  trainer remains open.
+  smoke now uses a reusable `QwenTrainableSession` surface and a representative
+  DP config path is wired through `train --config`. Full model/data/checkpoint
+  trainer ownership remains open.
 - G6 trainer-level real SFT data is incomplete: tokenizer-backed
   `QwenSftDataset` padded response-only batches, including optional
   instruction JSONL input, now feed the focused LoRA SFT smoke. The general
@@ -135,9 +138,9 @@ real-Qwen DP path remains open.
   cached-generation parity is future work.
 - G4 launcher process management plus NCCL scalar, toy DP gradient, `tch`
   autograd DP=2 trainer smokes, focused multi-step Qwen layer0 attention DP,
-  and representative `QwenTrainableSession` DP smokes exist, but real
-  distributed training is still missing: the general Qwen trainer/model path is
-  not yet a multi-step NCCL-backed rank-local training loop.
+  representative `QwenTrainableSession` DP smokes, and a representative Qwen
+  DP `train --config` path exist. Real production distributed training is still
+  missing: full Qwen model/data/checkpoint ownership is not yet implemented.
 - Distributed checkpoint layout is not defined.
 - Trainer production basics such as scheduler, grad clipping, RSS memory
   metrics, and Ray-worker GPU memory reporting are implemented for toy/tch

@@ -31,6 +31,8 @@ pub struct RunConfig {
 pub struct ModelConfig {
     pub name: String,
     pub architecture: String,
+    #[serde(default)]
+    pub model_path: Option<PathBuf>,
     pub vocab_size: usize,
     pub hidden_size: usize,
     pub num_layers: usize,
@@ -202,12 +204,27 @@ pub fn validate_config(config: &Config) -> Result<()> {
 
     let is_tch_tiny_lm = matches!(config.train.backend, BackendKind::Tch)
         && config.model.architecture == "tch_tiny_lm";
+    let is_qwen_trainable_session = matches!(config.train.backend, BackendKind::Tch)
+        && config.model.architecture == "qwen_trainable_session";
     for (name, value) in parallel_sizes {
         if value == 0 {
             return Err(anyhow!("{name} must be greater than zero"));
         }
-        if value != 1 && !(is_tch_tiny_lm && name == "data_parallel_size" && value == 2) {
+        if value != 1
+            && !((is_tch_tiny_lm || is_qwen_trainable_session)
+                && name == "data_parallel_size"
+                && value == 2)
+        {
             return Err(anyhow!("M1 toy backend requires {name} = 1"));
+        }
+    }
+
+    if is_qwen_trainable_session {
+        if !matches!(config.train.device, Device::Cuda) {
+            return Err(anyhow!("qwen_trainable_session requires device = \"cuda\""));
+        }
+        if config.model.model_path.is_none() {
+            return Err(anyhow!("qwen_trainable_session requires model.model_path"));
         }
     }
 

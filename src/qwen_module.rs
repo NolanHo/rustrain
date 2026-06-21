@@ -12,6 +12,7 @@ use tch::{Device, IndexOp, Kind, Reduction, Tensor, no_grad};
 use tokenizers::Tokenizer;
 
 use crate::nccl_smoke;
+use crate::runtime::{Config, Device as RuntimeDevice, RunPaths};
 
 #[derive(Debug, Serialize)]
 pub struct DiffStats {
@@ -1737,6 +1738,50 @@ pub fn qwen_session_dp_rank_smoke(
     );
 
     Ok(())
+}
+
+pub fn train_qwen_session_dp_from_config(config: &Config, _run_paths: &RunPaths) -> Result<()> {
+    if config.model.architecture != "qwen_trainable_session" {
+        bail!(
+            "qwen session trainer expects architecture = qwen_trainable_session, got {}",
+            config.model.architecture
+        );
+    }
+    if !matches!(config.train.device, RuntimeDevice::Cuda) {
+        bail!("qwen session trainer requires device = cuda");
+    }
+    if config.parallel.data_parallel_size != 2 {
+        bail!("qwen session trainer currently expects data_parallel_size = 2");
+    }
+    let model_path = config
+        .model
+        .model_path
+        .as_ref()
+        .context("qwen session trainer requires model.model_path")?;
+    let output_dir = std::env::var("RUSTRAIN_LAUNCH_OUTPUT_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| {
+            config
+                .run
+                .base_dir
+                .join("qwen-session-trainer-dp")
+                .join(&config.run.name)
+        })
+        .join("qwen-session-dp-ranks");
+    let dtype = match config.train.dtype {
+        crate::runtime::DType::Fp32 => QwenComputeDType::Fp32,
+        crate::runtime::DType::Bf16 => QwenComputeDType::Bf16,
+        crate::runtime::DType::Fp16 => {
+            bail!("qwen session trainer does not support fp16 yet; use fp32 or bf16")
+        }
+    };
+    qwen_session_dp_rank_smoke(
+        model_path,
+        output_dir,
+        dtype,
+        config.train.max_steps as usize,
+        config.train.learning_rate as f64,
+    )
 }
 
 fn qwen_dp_artifact_dir(output_dir: &Path) -> Result<PathBuf> {
