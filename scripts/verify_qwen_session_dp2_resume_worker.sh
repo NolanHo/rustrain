@@ -8,7 +8,9 @@ BASE_OUTPUT_DIR="${RUSTRAIN_DISTRIBUTED_BASE_OUTPUT_DIR:?RUSTRAIN_DISTRIBUTED_BA
 RESUME_OUTPUT_DIR="${RUSTRAIN_DISTRIBUTED_RESUME_OUTPUT_DIR:?RUSTRAIN_DISTRIBUTED_RESUME_OUTPUT_DIR is required}"
 CONFIG="${RUSTRAIN_QWEN_SESSION_DP_CONFIG:-configs/qwen_session_dp2_sft.toml}"
 EXPECTED_DATASET_SEED="${RUSTRAIN_EXPECTED_DATASET_ORDER_SEED:-}"
-export BASE_OUTPUT_DIR RESUME_OUTPUT_DIR EXPECTED_DATASET_SEED
+EXPECTED_TRAINABLE_TENSORS="${RUSTRAIN_EXPECTED_QWEN_DP_TRAINABLE_TENSORS:-}"
+EXPECTED_TRAINABLE_NAMES="${RUSTRAIN_EXPECTED_QWEN_DP_TRAINABLE_NAMES:-}"
+export BASE_OUTPUT_DIR RESUME_OUTPUT_DIR EXPECTED_DATASET_SEED EXPECTED_TRAINABLE_TENSORS EXPECTED_TRAINABLE_NAMES
 
 cargo run -- launch \
   --nproc-per-node 2 \
@@ -45,12 +47,29 @@ import pathlib
 base_output_dir = pathlib.Path(os.environ["BASE_OUTPUT_DIR"])
 resume_output_dir = pathlib.Path(os.environ["RESUME_OUTPUT_DIR"])
 expected_dataset_seed = os.environ.get("EXPECTED_DATASET_SEED")
+expected_trainable_tensors = os.environ.get("EXPECTED_TRAINABLE_TENSORS")
+expected_trainable_names = [
+    name.strip()
+    for name in os.environ.get("EXPECTED_TRAINABLE_NAMES", "").split(",")
+    if name.strip()
+]
 
 base_rank0_paths = sorted(base_output_dir.rglob("qwen-session-dp-rank-0.json"))
 if len(base_rank0_paths) != 1:
     raise SystemExit(f"expected one base rank0 summary, found {len(base_rank0_paths)}")
 base_rank0 = json.loads(base_rank0_paths[0].read_text())
 base_cursor_next = int(base_rank0["data_cursor_next"])
+if expected_trainable_tensors:
+    base_trainable_tensors = base_rank0.get("trainable_tensors")
+    if not isinstance(base_trainable_tensors, list):
+        raise SystemExit("base rank0 trainable_tensors must be a list")
+    if len(base_trainable_tensors) != int(expected_trainable_tensors):
+        raise SystemExit(
+            f"base rank0 expected {expected_trainable_tensors} trainable tensors, got {len(base_trainable_tensors)}"
+        )
+    for name in expected_trainable_names:
+        if name not in base_trainable_tensors:
+            raise SystemExit(f"base rank0 missing expected trainable tensor {name}")
 
 resume_summaries = sorted(resume_output_dir.rglob("qwen-session-dp-rank-*.json"))
 if len(resume_summaries) != 2:
@@ -82,10 +101,34 @@ for path in resume_summaries:
         raise SystemExit(f"{path} dataset_source_files must not be empty")
     if not data.get("dataset_fingerprint"):
         raise SystemExit(f"{path} dataset_fingerprint must not be empty")
+    trainable_tensors = data.get("trainable_tensors")
+    if expected_trainable_tensors:
+        if not isinstance(trainable_tensors, list):
+            raise SystemExit(f"{path} trainable_tensors must be a list")
+        if len(trainable_tensors) != int(expected_trainable_tensors):
+            raise SystemExit(
+                f"{path} expected {expected_trainable_tensors} trainable tensors, got {len(trainable_tensors)}"
+            )
+        if "model.embed_tokens.weight" in trainable_tensors:
+            raise SystemExit(f"{path} DP representative path must not train tied embedding")
+        for name in expected_trainable_names:
+            if name not in trainable_tensors:
+                raise SystemExit(f"{path} missing expected trainable tensor {name}")
     for key in ["reload_delta", "next_step_delta", "sharded_reload_delta", "sharded_next_step_delta"]:
         if float(data[key]) > 1e-5:
             raise SystemExit(f"{path} {key} too large: {data[key]}")
     manifest = json.loads(pathlib.Path(data["manifest_output"]).read_text())
+    if expected_trainable_tensors:
+        if manifest.get("trainable_tensors") != trainable_tensors:
+            raise SystemExit(f"{path} manifest trainable_tensors do not match summary")
+        if int(manifest.get("tensor_count", -1)) != int(expected_trainable_tensors):
+            raise SystemExit(
+                f"{path} manifest tensor_count {manifest.get('tensor_count')} != {expected_trainable_tensors}"
+            )
+        if len(manifest.get("tensors", [])) != int(expected_trainable_tensors):
+            raise SystemExit(
+                f"{path} expected {expected_trainable_tensors} manifest tensors, got {len(manifest.get('tensors', []))}"
+            )
     if int(manifest["data_cursor_start"]) != base_cursor_next:
         raise SystemExit(
             f"{path} manifest data_cursor_start {manifest['data_cursor_start']} did not continue from {base_cursor_next}"
@@ -106,6 +149,7 @@ for path in resume_summaries:
             "data_cursor_start": data["data_cursor_start"],
             "data_cursor_next": data["data_cursor_next"],
             "dataset_fingerprint": data["dataset_fingerprint"],
+            "trainable_tensors": len(trainable_tensors) if isinstance(trainable_tensors, list) else None,
             "reload_delta": data["reload_delta"],
             "sharded_reload_delta": data["sharded_reload_delta"],
             "sharded_next_step_delta": data["sharded_next_step_delta"],

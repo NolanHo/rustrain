@@ -112,7 +112,12 @@ tensors plus final norm.
 `configs/qwen_session_dp2_layers01_sft.toml` combines that multi-layer DP
 training surface with tokenizer-backed JSONL batches, so the rank0 manifest and
 global sharded manifest must also preserve dataset provenance and cursor fields
-for the layer0+layer1 trainable set.
+for the layer0+layer1 trainable set. The external DP resume verifier runs the
+same config twice: a base DP=2 JSONL run writes the rank0 manifest, then a
+second DP=2 run resumes from that manifest and must start at the base
+`data_cursor_next`, advance by `steps * local_batch_size * world_size`, keep the
+same dataset provenance, and keep the expected 25 trainable tensors for layers
+0 and 1 plus final norm.
 
 Rank0 artifacts:
 
@@ -146,6 +151,9 @@ Acceptance:
 - JSONL-backed DP resume starts from manifest `data_cursor_next`, advances the
   cursor by `steps * local_batch_size * world_size`, and preserves dataset
   provenance in the next rank0 manifest.
+- The layer0+layer1 JSONL external resume path verifies both the cursor
+  continuity contract and the 25-tensor trainable registry in the resumed
+  summaries and manifest.
 
 ### Representative Sharded Checkpoints and Future Production
 
