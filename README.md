@@ -116,6 +116,7 @@ RUSTRAIN_RAY_NUM_GPUS=2 scripts/gpu_run.sh env RUSTRAIN_LAUNCH_TIMEOUT_SECS=900 
 RUSTRAIN_RAY_NUM_GPUS=2 scripts/gpu_run.sh env RUSTRAIN_LAUNCH_TIMEOUT_SECS=900 RUSTRAIN_QWEN_SESSION_DP_LAYERS_CONFIG=configs/qwen_session_dp2_layers01_sft.toml RUSTRAIN_EXPECTED_DATASET_ORDER_SEED=777 bash scripts/verify_qwen_session_dp2_layers01_worker.sh
 RUSTRAIN_RAY_NUM_GPUS=2 scripts/gpu_run.sh env RUSTRAIN_LAUNCH_TIMEOUT_SECS=900 RUSTRAIN_QWEN_SESSION_DP_LAYERS_CONFIG=configs/qwen_session_dp2_layers01_sft_bf16.toml RUSTRAIN_EXPECTED_QWEN_COMPUTE_KIND=bf16 RUSTRAIN_EXPECTED_DATASET_ORDER_SEED=777 bash scripts/verify_qwen_session_dp2_layers01_worker.sh
 RUSTRAIN_RAY_NUM_GPUS=2 scripts/gpu_run.sh env RUSTRAIN_LAUNCH_TIMEOUT_SECS=900 RUSTRAIN_DISTRIBUTED_BASE_OUTPUT_DIR=/tmp/rustrain-runs/qwen-session-dp2-layers01-sft-resume-base RUSTRAIN_DISTRIBUTED_RESUME_OUTPUT_DIR=/tmp/rustrain-runs/qwen-session-dp2-layers01-sft-resume-continue RUSTRAIN_QWEN_SESSION_DP_CONFIG=configs/qwen_session_dp2_layers01_sft.toml RUSTRAIN_EXPECTED_DATASET_ORDER_SEED=777 RUSTRAIN_EXPECTED_QWEN_DP_TRAINABLE_TENSORS=25 RUSTRAIN_EXPECTED_QWEN_DP_TRAINABLE_NAMES=model.layers.0.self_attn.q_proj.weight,model.layers.0.mlp.down_proj.weight,model.layers.1.self_attn.q_proj.weight,model.layers.1.mlp.down_proj.weight,model.norm.weight bash scripts/verify_qwen_session_dp2_resume_worker.sh
+RUSTRAIN_RAY_NUM_GPUS=2 scripts/gpu_run.sh env RUSTRAIN_LAUNCH_TIMEOUT_SECS=900 RUSTRAIN_DISTRIBUTED_BASE_OUTPUT_DIR=/tmp/rustrain-runs/qwen-session-dp2-layers01-sft-bf16-resume-base RUSTRAIN_DISTRIBUTED_RESUME_OUTPUT_DIR=/tmp/rustrain-runs/qwen-session-dp2-layers01-sft-bf16-resume-continue RUSTRAIN_QWEN_SESSION_DP_CONFIG=configs/qwen_session_dp2_layers01_sft_bf16.toml RUSTRAIN_EXPECTED_DATASET_ORDER_SEED=777 RUSTRAIN_EXPECTED_QWEN_DP_TRAINABLE_TENSORS=25 RUSTRAIN_EXPECTED_QWEN_DP_TRAINABLE_NAMES=model.layers.0.self_attn.q_proj.weight,model.layers.0.mlp.down_proj.weight,model.layers.1.self_attn.q_proj.weight,model.layers.1.mlp.down_proj.weight,model.norm.weight bash scripts/verify_qwen_session_dp2_resume_worker.sh
 RUSTRAIN_RAY_NUM_GPUS=2 scripts/gpu_run.sh cargo run -- launch --nproc-per-node 2 --output-dir /tmp/rustrain-runs/qwen-session-trainer-tp2 train --config configs/qwen_session_tp2.toml
 RUSTRAIN_RAY_NUM_GPUS=2 scripts/gpu_run.sh cargo run -- launch --nproc-per-node 2 --output-dir /tmp/rustrain-runs/ep-rank-local-smoke parallel-ep-rank-smoke --output-dir /tmp/rustrain-runs/ep-rank-local-smoke/ranks
 RUSTRAIN_RAY_NUM_GPUS=2 scripts/gpu_run.sh cargo run -- launch --nproc-per-node 2 --output-dir /tmp/rustrain-runs/ep-nccl-smoke parallel-ep-nccl-rank-smoke --output-dir /tmp/rustrain-runs/ep-nccl-smoke/ranks
@@ -205,9 +206,9 @@ DP trainer over tokenizer-backed JSONL instruction batches and verifies dataset
 provenance, sample cursor progress, rank0 checkpoint parity, and sharded
 checkpoint next-step parity. `configs/qwen_session_dp2_layers01_sft_bf16.toml`
 verifies that same tokenizer-backed multi-layer DP path under bf16 compute. The
-fp32 SFT config is also covered by the external resume verifier: it starts a
-fresh DP=2 JSONL run, resumes from the emitted rank0 manifest, requires the
-resumed cursor to continue from the base `data_cursor_next`, and checks the
+fp32 and bf16 SFT configs are also covered by the external resume verifier: it
+starts a fresh DP=2 JSONL run, resumes from the emitted rank0 manifest, requires
+the resumed cursor to continue from the base `data_cursor_next`, and checks the
 25-tensor layer0+layer1 trainable set in the resumed rank summaries and
 manifest.
 Toy MoE has an explicit single-rank smoke command and verifier:
@@ -295,8 +296,8 @@ production-grade sharded checkpoint ownership remain open.
   evidence to tokenizer-backed JSONL batches with manifest-backed data cursor
   and provenance checks. `configs/qwen_session_dp2_layers01_sft_bf16.toml`
   verifies the tokenizer-backed multi-layer DP path under bf16 compute. The
-  layers01 JSONL path now also has an external resume verifier that proves the
-  next run starts from the prior
+  layers01 JSONL path now also has fp32 and bf16 external resume verifiers that
+  prove the next run starts from the prior
   `data_cursor_next` while preserving dataset provenance and the 25-tensor
   trainable registry.
   Full model/data/checkpoint trainer ownership remains open.
