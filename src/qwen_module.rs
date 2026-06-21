@@ -16,7 +16,7 @@ use tracing::info;
 use crate::nccl_smoke;
 use crate::runtime::{
     Config, DataKind as RuntimeDataKind, Device as RuntimeDevice, LoraConfig as RuntimeLoraConfig,
-    LrScheduler, RunPaths,
+    LrScheduler, RunPaths, load_config,
 };
 
 #[derive(Debug, Serialize)]
@@ -413,6 +413,35 @@ struct QwenSessionDpRankSummary {
     sharded_resumed_next_loss: f64,
     sharded_next_step_delta: f64,
     trainable_tensors: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct QwenSessionDpDataPlanSummary {
+    config_path: String,
+    model_path: String,
+    world_size: usize,
+    local_batch_size: usize,
+    global_batch_size: usize,
+    train_steps: usize,
+    required_batches: usize,
+    data_cursor_start: usize,
+    data_cursor_end: usize,
+    data_cursor_next: usize,
+    data_epoch_start: usize,
+    data_epoch_end: usize,
+    data_epoch_next: usize,
+    data_sample_offset_start: usize,
+    data_sample_offset_end: usize,
+    data_sample_offset_next: usize,
+    dataset_total_samples: usize,
+    dataset_total_tokens: usize,
+    dataset_train_samples: usize,
+    dataset_eval_samples: usize,
+    dataset_source_files: Vec<String>,
+    dataset_source_sample_counts: Vec<QwenSftSourceSampleCount>,
+    dataset_fingerprint: String,
+    dataset_order_seed: u64,
+    dataset_shuffle: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -4011,6 +4040,100 @@ fn qwen_sharded_rank_to_delta_manifest(
             })
             .collect(),
     })
+}
+
+pub fn qwen_session_dp_data_plan(
+    config_path: &Path,
+    world_size: usize,
+    data_cursor_start: usize,
+) -> Result<()> {
+    if world_size == 0 {
+        bail!("qwen session DP data plan requires world_size > 0");
+    }
+    let config = load_config(config_path)?;
+    if config.model.architecture != "qwen_trainable_session" {
+        bail!(
+            "qwen session DP data plan expects architecture = qwen_trainable_session, got {}",
+            config.model.architecture
+        );
+    }
+    if config.parallel.data_parallel_size != world_size {
+        bail!(
+            "qwen session DP data plan world_size {world_size} does not match config data_parallel_size {}",
+            config.parallel.data_parallel_size
+        );
+    }
+    let model_path = config
+        .model
+        .model_path
+        .as_ref()
+        .context("qwen session DP data plan requires model.model_path")?;
+    let data_config = config
+        .data
+        .as_ref()
+        .context("qwen session DP data plan requires [data]")?;
+    if data_config.kind != RuntimeDataKind::InstructionJsonl {
+        bail!("qwen session DP data plan supports kind = instruction_jsonl");
+    }
+    let tokenizer = Tokenizer::from_file(model_path.join("tokenizer.json"))
+        .map_err(|error| anyhow!("failed to load tokenizer: {error}"))?;
+    let datasets = qwen_sft_train_eval_datasets_from_paths(
+        &tokenizer,
+        &data_config.paths,
+        &data_config.eval_paths,
+        data_config.max_samples,
+        data_config.train_split,
+        data_config.shuffle,
+        config.run.seed,
+    )?;
+    let dataset_summary = datasets.combined_summary;
+    let train_dataset = datasets.train_dataset;
+    let eval_dataset = datasets.eval_dataset;
+    let local_batch_size = config
+        .train
+        .micro_batch_size
+        .min(train_dataset.len())
+        .max(1);
+    let global_batch_size = local_batch_size * world_size;
+    let train_steps = config.train.max_steps as usize;
+    let required_batches = train_steps * global_batch_size + 1;
+    let data_cursor_end = data_cursor_start + train_steps * global_batch_size;
+    let data_cursor_next = data_cursor_end;
+    let (data_epoch_start, data_sample_offset_start) =
+        qwen_data_epoch_and_offset(data_cursor_start, train_dataset.len())?;
+    let (data_epoch_end, data_sample_offset_end) =
+        qwen_data_epoch_and_offset(data_cursor_end, train_dataset.len())?;
+    let (data_epoch_next, data_sample_offset_next) =
+        qwen_data_epoch_and_offset(data_cursor_next, train_dataset.len())?;
+    let summary = QwenSessionDpDataPlanSummary {
+        config_path: config_path.display().to_string(),
+        model_path: model_path.display().to_string(),
+        world_size,
+        local_batch_size,
+        global_batch_size,
+        train_steps,
+        required_batches,
+        data_cursor_start,
+        data_cursor_end,
+        data_cursor_next,
+        data_epoch_start,
+        data_epoch_end,
+        data_epoch_next,
+        data_sample_offset_start,
+        data_sample_offset_end,
+        data_sample_offset_next,
+        dataset_total_samples: dataset_summary.samples,
+        dataset_total_tokens: dataset_summary.total_tokens,
+        dataset_train_samples: train_dataset.len(),
+        dataset_eval_samples: eval_dataset.len(),
+        dataset_source_files: dataset_summary.source_files,
+        dataset_source_sample_counts: dataset_summary.source_sample_counts,
+        dataset_fingerprint: dataset_summary.fingerprint,
+        dataset_order_seed: config.run.seed,
+        dataset_shuffle: dataset_summary.shuffle,
+    };
+    println!("{}", serde_json::to_string_pretty(&summary)?);
+    Ok(())
 }
 
 pub fn train_qwen_session_dp_from_config(config: &Config, _run_paths: &RunPaths) -> Result<()> {

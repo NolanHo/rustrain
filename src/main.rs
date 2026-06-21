@@ -242,6 +242,15 @@ enum Command {
         #[arg(long, default_value_t = 1e-6)]
         learning_rate: f64,
     },
+    #[command(hide = true)]
+    QwenSessionDpDataPlan {
+        #[arg(long)]
+        config: PathBuf,
+        #[arg(long, default_value_t = 2)]
+        world_size: usize,
+        #[arg(long, default_value_t = 0)]
+        data_cursor_start: usize,
+    },
     Launch {
         #[arg(long)]
         nproc_per_node: usize,
@@ -447,6 +456,11 @@ fn main() -> Result<()> {
             None,
             None,
         ),
+        Command::QwenSessionDpDataPlan {
+            config,
+            world_size,
+            data_cursor_start,
+        } => qwen_module::qwen_session_dp_data_plan(&config, world_size, data_cursor_start),
         Command::Launch {
             nproc_per_node,
             output_dir,
