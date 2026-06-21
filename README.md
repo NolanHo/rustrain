@@ -156,7 +156,9 @@ remain open.
   DP `train --config` path with rank0 checkpoint/resume parity exist. Real
   production distributed training is still missing: full Qwen model/data and
   sharded checkpoint ownership are not yet implemented.
-- Production distributed checkpoint layout is not defined.
+- Production distributed checkpoint rules are documented in
+  [docs/checkpoints.md](docs/checkpoints.md), but the sharded checkpoint format
+  is not implemented yet.
 - Trainer production basics such as scheduler, grad clipping, RSS memory
   metrics, and Ray-worker GPU memory reporting are implemented for toy/tch
   paths; real tokenizer-backed padded LoRA SFT batching is wired through a
