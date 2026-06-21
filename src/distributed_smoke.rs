@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     fs,
     path::{Path, PathBuf},
     process::Command,
@@ -88,6 +89,81 @@ struct ExpertParallelNcclRankSummary {
     train_final_loss: f64,
     train_loss_improved: bool,
     scale_grad_norm: f64,
+    checkpoint_manifest_output: String,
+    checkpoint_model_safetensors: String,
+    checkpoint_optimizer_safetensors: String,
+    checkpoint_tensor_count: usize,
+    reload_scale_max_abs: f64,
+    reload_optimizer_max_abs: f64,
+    continuous_second_loss: f64,
+    resumed_second_loss: f64,
+    second_step_delta: f64,
+    second_step_scale_max_abs: f64,
+    second_step_optimizer_max_abs: f64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct ExpertParallelCheckpointManifest {
+    format: String,
+    rank: usize,
+    world_size: usize,
+    local_rank: usize,
+    global_step: u64,
+    owned_expert_start: usize,
+    owned_expert_end: usize,
+    model_safetensors: String,
+    optimizer_safetensors: String,
+    optimizer: String,
+    learning_rate: f64,
+    beta1: f64,
+    beta2: f64,
+    eps: f64,
+    weight_decay: f64,
+    shards: Vec<ExpertParallelCheckpointShard>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct ExpertParallelCheckpointShard {
+    name: String,
+    shard_name: String,
+    optimizer_m_name: String,
+    optimizer_v_name: String,
+    global_shape: Vec<i64>,
+    shard_shape: Vec<i64>,
+    dtype: String,
+    partition: String,
+}
+
+struct ExpertParallelAdamConfig {
+    learning_rate: f64,
+    beta1: f64,
+    beta2: f64,
+    eps: f64,
+    weight_decay: f64,
+}
+
+struct ExpertParallelAdamState {
+    m: Tensor,
+    v: Tensor,
+    step: i64,
+}
+
+struct ExpertParallelAdamStep {
+    pre_loss: f64,
+    post_loss: Option<f64>,
+    updated_scales: Tensor,
+    updated_state: ExpertParallelAdamState,
+    grad_norm: f64,
+    reduced_output_shape: Vec<i64>,
+    combine_max_abs: f64,
+    combine_mean_abs: f64,
+}
+
+struct ExpertParallelCheckpointWrite {
+    manifest_path: PathBuf,
+    model_safetensors: PathBuf,
+    optimizer_safetensors: PathBuf,
+    tensor_count: usize,
 }
 
 pub fn run_data_parallel_smoke(output_dir: &Path, world_size: usize) -> Result<()> {
@@ -451,77 +527,129 @@ pub fn run_expert_parallel_nccl_rank_smoke(output_dir: PathBuf) -> Result<()> {
         .collect::<Vec<_>>();
     let expert_load = ep_owned_expert_load(&assignments, owned_expert_start, owned_expert_end);
 
-    let local_scales = ep_owned_expert_scales_tensor(owned_expert_start, owned_expert_end, device)
-        .set_requires_grad(true);
-    let local_output = ep_local_output_tensor(
+    let local_scales = ep_owned_expert_scales_tensor(owned_expert_start, owned_expert_end, device);
+    let adam = ExpertParallelAdamConfig {
+        learning_rate: 0.25,
+        beta1: 0.9,
+        beta2: 0.999,
+        eps: 1e-8,
+        weight_decay: 0.0,
+    };
+    let initial_state = ExpertParallelAdamState {
+        m: Tensor::zeros_like(&local_scales),
+        v: Tensor::zeros_like(&local_scales),
+        step: 0,
+    };
+    let first_step = ep_nccl_adam_step(
+        &output_dir.join("ep-nccl-combine"),
+        Some(&output_dir.join("ep-nccl-updated-combine")),
         &tokens,
         &assignments,
         owned_expert_start,
         owned_expert_end,
         &local_scales,
+        &initial_state,
+        &target,
+        Some(&reference),
+        &adam,
     )?;
-    let reduced_output = nccl_smoke::all_reduce_tensor_f32_for_launch(
-        &output_dir.join("ep-nccl-combine"),
-        &local_output,
-    )?;
-    let reduced_output = reduced_output.set_requires_grad(true);
-    let combine_diff = tensor_diff_stats(&reduced_output, &reference)?;
-    if combine_diff.0 > 1e-6 {
+    if first_step.combine_max_abs > 1e-6 {
         bail!(
             "EP NCCL combine mismatch: rank={rank}, max_abs={}, mean_abs={}",
-            combine_diff.0,
-            combine_diff.1
+            first_step.combine_max_abs,
+            first_step.combine_mean_abs
         );
     }
 
-    let initial_loss_tensor = (&reduced_output - &target).square().mean(Kind::Float);
-    let initial_loss = initial_loss_tensor.double_value(&[]);
-    let output_grads =
-        Tensor::run_backward(&[initial_loss_tensor], &[&reduced_output], false, false);
-    let output_grad = output_grads
-        .into_iter()
-        .next()
-        .ok_or_else(|| anyhow!("EP NCCL smoke did not produce an output gradient"))?;
-    if !output_grad.defined() || output_grad.norm().double_value(&[]) <= 0.0 {
-        bail!("EP NCCL smoke output gradient is missing or zero on rank {rank}");
-    }
-    let local_train_output = ep_local_output_tensor(
-        &tokens,
-        &assignments,
-        owned_expert_start,
-        owned_expert_end,
-        &local_scales,
-    )?;
-    (local_train_output * &output_grad.detach())
-        .sum(Kind::Float)
-        .backward();
-    let scale_grad = local_scales.grad();
-    let scale_grad_norm = scale_grad.norm().double_value(&[]);
-    if !scale_grad.defined() || scale_grad_norm <= 0.0 {
+    if first_step.grad_norm <= 0.0 {
         bail!("EP NCCL smoke local expert scale gradient is missing or zero on rank {rank}");
     }
 
-    let learning_rate = 0.25;
-    let updated_scales = (&local_scales - &(scale_grad * learning_rate)).detach();
-    let updated_local_output = ep_local_output_tensor(
+    let final_loss = first_step
+        .post_loss
+        .ok_or_else(|| anyhow!("EP NCCL first step did not compute post-update loss"))?;
+    let train_loss_improved = final_loss < first_step.pre_loss;
+    if !train_loss_improved {
+        bail!(
+            "EP NCCL train smoke did not lower loss on rank {rank}: initial={}, final={final_loss}",
+            first_step.pre_loss
+        );
+    }
+
+    let checkpoint = write_ep_rank_checkpoint(
+        &output_dir,
+        rank,
+        world_size,
+        local_rank,
+        owned_expert_start,
+        owned_expert_end,
+        &first_step.updated_scales,
+        &first_step.updated_state,
+        &adam,
+    )?;
+    let (reloaded_scales, reloaded_state) = read_ep_rank_checkpoint(&checkpoint)?;
+    let reloaded_scales = reloaded_scales.to_device(device);
+    let reloaded_state = ExpertParallelAdamState {
+        m: reloaded_state.m.to_device(device),
+        v: reloaded_state.v.to_device(device),
+        step: reloaded_state.step,
+    };
+    let reload_scale_max_abs = tensor_max_abs_diff(&reloaded_scales, &first_step.updated_scales)?;
+    let reload_optimizer_max_abs =
+        tensor_max_abs_diff(&reloaded_state.m, &first_step.updated_state.m)?.max(
+            tensor_max_abs_diff(&reloaded_state.v, &first_step.updated_state.v)?,
+        );
+    if reload_scale_max_abs > 1e-7 || reload_optimizer_max_abs > 1e-7 {
+        bail!(
+            "EP checkpoint reload mismatch on rank {rank}: scale={reload_scale_max_abs}, optimizer={reload_optimizer_max_abs}"
+        );
+    }
+
+    let continuous_second = ep_nccl_adam_step(
+        &output_dir.join("ep-nccl-continuous-second"),
+        None,
         &tokens,
         &assignments,
         owned_expert_start,
         owned_expert_end,
-        &updated_scales,
+        &first_step.updated_scales,
+        &first_step.updated_state,
+        &target,
+        None,
+        &adam,
     )?;
-    let updated_reduced = nccl_smoke::all_reduce_tensor_f32_for_launch(
-        &output_dir.join("ep-nccl-updated-combine"),
-        &updated_local_output,
+    let resumed_second = ep_nccl_adam_step(
+        &output_dir.join("ep-nccl-resumed-second"),
+        None,
+        &tokens,
+        &assignments,
+        owned_expert_start,
+        owned_expert_end,
+        &reloaded_scales,
+        &reloaded_state,
+        &target,
+        None,
+        &adam,
     )?;
-    let final_loss = (&updated_reduced - &target)
-        .square()
-        .mean(Kind::Float)
-        .double_value(&[]);
-    let train_loss_improved = final_loss < initial_loss;
-    if !train_loss_improved {
+    let second_step_delta = (continuous_second.pre_loss - resumed_second.pre_loss).abs();
+    let second_step_scale_max_abs = tensor_max_abs_diff(
+        &continuous_second.updated_scales,
+        &resumed_second.updated_scales,
+    )?;
+    let second_step_optimizer_max_abs = tensor_max_abs_diff(
+        &continuous_second.updated_state.m,
+        &resumed_second.updated_state.m,
+    )?
+    .max(tensor_max_abs_diff(
+        &continuous_second.updated_state.v,
+        &resumed_second.updated_state.v,
+    )?);
+    if second_step_delta > 1e-6
+        || second_step_scale_max_abs > 1e-6
+        || second_step_optimizer_max_abs > 1e-6
+    {
         bail!(
-            "EP NCCL train smoke did not lower loss on rank {rank}: initial={initial_loss}, final={final_loss}"
+            "EP checkpoint next-step parity failed on rank {rank}: loss_delta={second_step_delta}, scale_delta={second_step_scale_max_abs}, optimizer_delta={second_step_optimizer_max_abs}"
         );
     }
 
@@ -533,13 +661,24 @@ pub fn run_expert_parallel_nccl_rank_smoke(output_dir: PathBuf) -> Result<()> {
         owned_expert_end,
         owned_token_indices,
         expert_load,
-        reduced_output_shape: reduced_output.size(),
-        combine_max_abs: combine_diff.0,
-        combine_mean_abs: combine_diff.1,
-        train_initial_loss: initial_loss,
+        reduced_output_shape: first_step.reduced_output_shape,
+        combine_max_abs: first_step.combine_max_abs,
+        combine_mean_abs: first_step.combine_mean_abs,
+        train_initial_loss: first_step.pre_loss,
         train_final_loss: final_loss,
         train_loss_improved,
-        scale_grad_norm,
+        scale_grad_norm: first_step.grad_norm,
+        checkpoint_manifest_output: checkpoint.manifest_path.display().to_string(),
+        checkpoint_model_safetensors: checkpoint.model_safetensors.display().to_string(),
+        checkpoint_optimizer_safetensors: checkpoint.optimizer_safetensors.display().to_string(),
+        checkpoint_tensor_count: checkpoint.tensor_count,
+        reload_scale_max_abs,
+        reload_optimizer_max_abs,
+        continuous_second_loss: continuous_second.pre_loss,
+        resumed_second_loss: resumed_second.pre_loss,
+        second_step_delta,
+        second_step_scale_max_abs,
+        second_step_optimizer_max_abs,
     };
     let summary_path = output_dir.join(format!("ep-nccl-rank-{rank}.json"));
     fs::write(
@@ -697,6 +836,241 @@ fn ep_local_output_tensor(
     Ok(Tensor::stack(&rows.iter().collect::<Vec<_>>(), 0))
 }
 
+#[allow(clippy::too_many_arguments)]
+fn ep_nccl_adam_step(
+    reduce_dir: &Path,
+    post_update_reduce_dir: Option<&Path>,
+    tokens: &Tensor,
+    assignments: &[usize],
+    owned_expert_start: usize,
+    owned_expert_end: usize,
+    scales: &Tensor,
+    state: &ExpertParallelAdamState,
+    target: &Tensor,
+    reference: Option<&Tensor>,
+    adam: &ExpertParallelAdamConfig,
+) -> Result<ExpertParallelAdamStep> {
+    let train_scales = scales.detach().set_requires_grad(true);
+    let local_output = ep_local_output_tensor(
+        tokens,
+        assignments,
+        owned_expert_start,
+        owned_expert_end,
+        &train_scales,
+    )?;
+    let reduced_output = nccl_smoke::all_reduce_tensor_f32_for_launch(reduce_dir, &local_output)?;
+    let reduced_output = reduced_output.set_requires_grad(true);
+    let reduced_output_shape = reduced_output.size();
+    let (combine_max_abs, combine_mean_abs) = if let Some(reference) = reference {
+        tensor_diff_stats(&reduced_output, reference)?
+    } else {
+        (0.0, 0.0)
+    };
+
+    let loss_tensor = (&reduced_output - target).square().mean(Kind::Float);
+    let pre_loss = loss_tensor.double_value(&[]);
+    let output_grads = Tensor::run_backward(&[loss_tensor], &[&reduced_output], false, false);
+    let output_grad = output_grads
+        .into_iter()
+        .next()
+        .ok_or_else(|| anyhow!("EP NCCL Adam step did not produce an output gradient"))?;
+    if !output_grad.defined() || output_grad.norm().double_value(&[]) <= 0.0 {
+        bail!("EP NCCL Adam step output gradient is missing or zero");
+    }
+
+    let local_train_output = ep_local_output_tensor(
+        tokens,
+        assignments,
+        owned_expert_start,
+        owned_expert_end,
+        &train_scales,
+    )?;
+    (local_train_output * &output_grad.detach())
+        .sum(Kind::Float)
+        .backward();
+    let grad = train_scales.grad();
+    let grad_norm = grad.norm().double_value(&[]);
+    if !grad.defined() || grad_norm <= 0.0 {
+        bail!("EP NCCL Adam step local expert scale gradient is missing or zero");
+    }
+
+    let next_step = state.step + 1;
+    let m = &state.m * adam.beta1 + &grad * (1.0 - adam.beta1);
+    let v = &state.v * adam.beta2 + grad.square() * (1.0 - adam.beta2);
+    let m_hat = &m / (1.0 - adam.beta1.powi(next_step as i32));
+    let v_hat = &v / (1.0 - adam.beta2.powi(next_step as i32));
+    let decayed = if adam.weight_decay == 0.0 {
+        scales.shallow_clone()
+    } else {
+        scales * (1.0 - adam.learning_rate * adam.weight_decay)
+    };
+    let updated_scales =
+        (decayed - (m_hat / (v_hat.sqrt() + adam.eps)) * adam.learning_rate).detach();
+    let updated_state = ExpertParallelAdamState {
+        m: m.detach(),
+        v: v.detach(),
+        step: next_step,
+    };
+
+    let post_loss = if let Some(post_reduce_dir) = post_update_reduce_dir {
+        let updated_local_output = ep_local_output_tensor(
+            tokens,
+            assignments,
+            owned_expert_start,
+            owned_expert_end,
+            &updated_scales,
+        )?;
+        let updated_reduced =
+            nccl_smoke::all_reduce_tensor_f32_for_launch(post_reduce_dir, &updated_local_output)?;
+        Some(
+            (&updated_reduced - target)
+                .square()
+                .mean(Kind::Float)
+                .double_value(&[]),
+        )
+    } else {
+        None
+    };
+
+    Ok(ExpertParallelAdamStep {
+        pre_loss,
+        post_loss,
+        updated_scales,
+        updated_state,
+        grad_norm,
+        reduced_output_shape,
+        combine_max_abs,
+        combine_mean_abs,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write_ep_rank_checkpoint(
+    output_dir: &Path,
+    rank: usize,
+    world_size: usize,
+    local_rank: usize,
+    owned_expert_start: usize,
+    owned_expert_end: usize,
+    scales: &Tensor,
+    state: &ExpertParallelAdamState,
+    adam: &ExpertParallelAdamConfig,
+) -> Result<ExpertParallelCheckpointWrite> {
+    let rank_dir = output_dir.join(format!("ep-checkpoint-rank-{rank}"));
+    fs::create_dir_all(&rank_dir)
+        .with_context(|| format!("failed to create {}", rank_dir.display()))?;
+    let model_safetensors = rank_dir.join("model.safetensors");
+    let optimizer_safetensors = rank_dir.join("optimizer.safetensors");
+    let scale_name = "experts.scale";
+    let m_name = "experts.scale.adam_m";
+    let v_name = "experts.scale.adam_v";
+
+    Tensor::write_safetensors(&[(scale_name, scales)], &model_safetensors)
+        .with_context(|| format!("failed to write {}", model_safetensors.display()))?;
+    Tensor::write_safetensors(
+        &[(m_name, &state.m), (v_name, &state.v)],
+        &optimizer_safetensors,
+    )
+    .with_context(|| format!("failed to write {}", optimizer_safetensors.display()))?;
+
+    let manifest = ExpertParallelCheckpointManifest {
+        format: "rustrain.ep_sharded.v1".to_string(),
+        rank,
+        world_size,
+        local_rank,
+        global_step: state.step as u64,
+        owned_expert_start,
+        owned_expert_end,
+        model_safetensors: model_safetensors.display().to_string(),
+        optimizer_safetensors: optimizer_safetensors.display().to_string(),
+        optimizer: "adamw".to_string(),
+        learning_rate: adam.learning_rate,
+        beta1: adam.beta1,
+        beta2: adam.beta2,
+        eps: adam.eps,
+        weight_decay: adam.weight_decay,
+        shards: vec![ExpertParallelCheckpointShard {
+            name: format!("experts.{owned_expert_start}..{owned_expert_end}.scale"),
+            shard_name: scale_name.to_string(),
+            optimizer_m_name: m_name.to_string(),
+            optimizer_v_name: v_name.to_string(),
+            global_shape: vec![ep_expert_count() as i64, scales.size()[1]],
+            shard_shape: scales.size(),
+            dtype: "float32".to_string(),
+            partition: "expert_model_parallel".to_string(),
+        }],
+    };
+    let manifest_path = rank_dir.join("manifest.json");
+    fs::write(
+        &manifest_path,
+        serde_json::to_string_pretty(&manifest)? + "\n",
+    )
+    .with_context(|| format!("failed to write {}", manifest_path.display()))?;
+
+    Ok(ExpertParallelCheckpointWrite {
+        manifest_path,
+        model_safetensors,
+        optimizer_safetensors,
+        tensor_count: manifest.shards.len(),
+    })
+}
+
+fn read_ep_rank_checkpoint(
+    checkpoint: &ExpertParallelCheckpointWrite,
+) -> Result<(Tensor, ExpertParallelAdamState)> {
+    let manifest: ExpertParallelCheckpointManifest = serde_json::from_str(
+        &fs::read_to_string(&checkpoint.manifest_path)
+            .with_context(|| format!("failed to read {}", checkpoint.manifest_path.display()))?,
+    )?;
+    if manifest.format != "rustrain.ep_sharded.v1" {
+        bail!("unsupported EP checkpoint format {}", manifest.format);
+    }
+    if manifest.shards.len() != 1 {
+        bail!(
+            "EP checkpoint expected exactly one rank-owned expert shard, got {}",
+            manifest.shards.len()
+        );
+    }
+    let shard = &manifest.shards[0];
+    let model_tensors = read_tensor_map(Path::new(&manifest.model_safetensors))?;
+    let optimizer_tensors = read_tensor_map(Path::new(&manifest.optimizer_safetensors))?;
+    let scales = tensor_from_map(&model_tensors, &shard.shard_name)?.shallow_clone();
+    let m = tensor_from_map(&optimizer_tensors, &shard.optimizer_m_name)?.shallow_clone();
+    let v = tensor_from_map(&optimizer_tensors, &shard.optimizer_v_name)?.shallow_clone();
+    if scales.size() != shard.shard_shape
+        || m.size() != shard.shard_shape
+        || v.size() != shard.shard_shape
+    {
+        bail!(
+            "EP checkpoint shard shape mismatch: shard={:?}, scales={:?}, m={:?}, v={:?}",
+            shard.shard_shape,
+            scales.size(),
+            m.size(),
+            v.size()
+        );
+    }
+    Ok((
+        scales,
+        ExpertParallelAdamState {
+            m,
+            v,
+            step: manifest.global_step as i64,
+        },
+    ))
+}
+
+fn read_tensor_map(path: &Path) -> Result<BTreeMap<String, Tensor>> {
+    let tensors = Tensor::read_safetensors(path)
+        .with_context(|| format!("failed to read {}", path.display()))?;
+    Ok(tensors.into_iter().collect())
+}
+
+fn tensor_from_map<'a>(tensors: &'a BTreeMap<String, Tensor>, name: &str) -> Result<&'a Tensor> {
+    tensors
+        .get(name)
+        .ok_or_else(|| anyhow!("missing tensor {name}"))
+}
+
 fn tensor_diff_stats(actual: &Tensor, expected: &Tensor) -> Result<(f64, f64)> {
     if actual.size() != expected.size() {
         bail!(
@@ -710,6 +1084,19 @@ fn tensor_diff_stats(actual: &Tensor, expected: &Tensor) -> Result<(f64, f64)> {
         diff.max().double_value(&[]),
         diff.mean(Kind::Float).double_value(&[]),
     ))
+}
+
+fn tensor_max_abs_diff(actual: &Tensor, expected: &Tensor) -> Result<f64> {
+    if actual.size() != expected.size() {
+        bail!(
+            "shape mismatch: actual {:?}, expected {:?}",
+            actual.size(),
+            expected.size()
+        );
+    }
+    let actual = actual.to_device(Device::Cpu);
+    let expected = expected.to_device(Device::Cpu);
+    Ok((actual - expected).abs().max().double_value(&[]))
 }
 
 fn parse_launcher_usize_env(name: &str) -> Result<usize> {
