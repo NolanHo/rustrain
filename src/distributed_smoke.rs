@@ -227,14 +227,42 @@ struct ExpertParallelCheckpointManifest {
 struct ExpertParallelGlobalCheckpointManifest {
     format: String,
     manifest_kind: String,
+    #[serde(default)]
+    base_model_path: String,
+    #[serde(default)]
+    tokenizer_path: String,
     global_step: u64,
     consumed_samples: u64,
     consumed_tokens: u64,
+    #[serde(default)]
+    data_cursor_next: Option<usize>,
+    #[serde(default)]
+    data_epoch_next: Option<usize>,
+    #[serde(default)]
+    data_sample_offset_next: Option<usize>,
+    #[serde(default)]
+    data_train_samples: Option<usize>,
+    #[serde(default)]
+    dataset_source_files: Vec<String>,
+    #[serde(default)]
+    dataset_source_sample_counts: Vec<ExpertParallelDatasetSourceSampleCount>,
+    #[serde(default)]
+    dataset_fingerprint: String,
+    #[serde(default = "ep_manifest_default_dataset_shuffle")]
+    dataset_shuffle: bool,
+    #[serde(default)]
+    seed: u64,
     dtype: String,
     optimizer: String,
     scheduler: String,
     parallel: ExpertParallelGlobalParallelManifest,
     ranks: Vec<ExpertParallelCheckpointManifest>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct ExpertParallelDatasetSourceSampleCount {
+    path: String,
+    samples: usize,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -248,6 +276,10 @@ struct ExpertParallelGlobalParallelManifest {
 
 fn ep_rank_manifest_kind() -> String {
     "rank".to_string()
+}
+
+fn ep_manifest_default_dataset_shuffle() -> bool {
+    true
 }
 
 impl ExpertParallelGlobalCheckpointManifest {
@@ -266,6 +298,63 @@ impl ExpertParallelGlobalCheckpointManifest {
         }
         if self.consumed_samples == 0 || self.consumed_tokens == 0 {
             bail!("EP global checkpoint requires positive consumed samples/tokens");
+        }
+        if !self.dataset_fingerprint.is_empty() {
+            if self.dataset_source_files.is_empty() {
+                bail!("EP global checkpoint dataset_fingerprint requires dataset_source_files");
+            }
+            if self
+                .dataset_source_files
+                .iter()
+                .any(|source| !source.ends_with(".jsonl"))
+            {
+                bail!("EP global checkpoint dataset_source_files must only contain JSONL paths");
+            }
+            if !self.dataset_source_sample_counts.is_empty() {
+                let count_paths = self
+                    .dataset_source_sample_counts
+                    .iter()
+                    .map(|entry| entry.path.as_str())
+                    .collect::<Vec<_>>();
+                let source_paths = self
+                    .dataset_source_files
+                    .iter()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>();
+                if count_paths != source_paths {
+                    bail!(
+                        "EP global checkpoint dataset_source_sample_counts must match dataset_source_files order"
+                    );
+                }
+                if self
+                    .dataset_source_sample_counts
+                    .iter()
+                    .any(|entry| entry.samples == 0)
+                {
+                    bail!("EP global checkpoint dataset source sample counts must be positive");
+                }
+            }
+        }
+        if let Some(train_samples) = self.data_train_samples {
+            if train_samples == 0 {
+                bail!("EP global checkpoint data_train_samples must be positive when set");
+            }
+        }
+        if self.data_cursor_next.is_some()
+            != (self.data_epoch_next.is_some() && self.data_sample_offset_next.is_some())
+        {
+            bail!(
+                "EP global checkpoint data cursor, epoch, and sample offset must be present together"
+            );
+        }
+        if let Some(cursor_next) = self.data_cursor_next {
+            if cursor_next as u64 != self.consumed_samples {
+                bail!(
+                    "EP global checkpoint data_cursor_next {} must match consumed_samples {}",
+                    cursor_next,
+                    self.consumed_samples
+                );
+            }
         }
         if self.dtype.is_empty() || self.optimizer.is_empty() || self.scheduler.is_empty() {
             bail!("EP global checkpoint requires dtype, optimizer, and scheduler");
@@ -3084,9 +3173,20 @@ fn write_ep_tch_moe_global_checkpoint_manifest(
         let manifest = ExpertParallelGlobalCheckpointManifest {
             format: "rustrain.ep_sharded.v1".to_string(),
             manifest_kind: "global".to_string(),
+            base_model_path: "rustrain://focused-tch-moe-ep-smoke".to_string(),
+            tokenizer_path: String::new(),
             global_step: 1,
             consumed_samples: ep_tokens().nrows() as u64,
             consumed_tokens: ep_tokens().nrows() as u64,
+            data_cursor_next: None,
+            data_epoch_next: None,
+            data_sample_offset_next: None,
+            data_train_samples: None,
+            dataset_source_files: Vec::new(),
+            dataset_source_sample_counts: Vec::new(),
+            dataset_fingerprint: String::new(),
+            dataset_shuffle: true,
+            seed: 0,
             dtype: "float32".to_string(),
             optimizer: "adamw".to_string(),
             scheduler: "constant".to_string(),

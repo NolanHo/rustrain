@@ -176,6 +176,25 @@ if global_manifest["optimizer"] != "adamw" or global_manifest["scheduler"] != "c
     raise SystemExit(f"{global_manifest_path} unexpected optimizer/scheduler")
 if global_manifest["consumed_samples"] != 4 or global_manifest["consumed_tokens"] != 4:
     raise SystemExit(f"{global_manifest_path} unexpected consumed samples/tokens")
+if global_manifest["base_model_path"] != "rustrain://focused-tch-moe-ep-smoke":
+    raise SystemExit(f"{global_manifest_path} unexpected base_model_path {global_manifest['base_model_path']}")
+if global_manifest["tokenizer_path"] != "":
+    raise SystemExit(f"{global_manifest_path} unexpected tokenizer_path {global_manifest['tokenizer_path']}")
+if global_manifest["seed"] != 0:
+    raise SystemExit(f"{global_manifest_path} unexpected seed {global_manifest['seed']}")
+for key in ["data_cursor_next", "data_epoch_next", "data_sample_offset_next", "data_train_samples"]:
+    if global_manifest.get(key) is not None:
+        raise SystemExit(f"{global_manifest_path} expected {key}=null, got {global_manifest.get(key)}")
+if global_manifest["dataset_source_files"] != []:
+    raise SystemExit(f"{global_manifest_path} unexpected dataset_source_files {global_manifest['dataset_source_files']}")
+if global_manifest["dataset_source_sample_counts"] != []:
+    raise SystemExit(
+        f"{global_manifest_path} unexpected dataset_source_sample_counts {global_manifest['dataset_source_sample_counts']}"
+    )
+if global_manifest["dataset_fingerprint"] != "":
+    raise SystemExit(f"{global_manifest_path} unexpected dataset_fingerprint {global_manifest['dataset_fingerprint']}")
+if global_manifest["dataset_shuffle"] is not True:
+    raise SystemExit(f"{global_manifest_path} unexpected dataset_shuffle {global_manifest['dataset_shuffle']}")
 if len(global_manifest["ranks"]) != 2:
     raise SystemExit(f"{global_manifest_path} expected two rank manifests, got {len(global_manifest['ranks'])}")
 global_ranks = sorted(global_manifest["ranks"], key=lambda item: item["rank"])

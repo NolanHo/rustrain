@@ -60,6 +60,25 @@ if base_manifest_data.get("manifest_kind") != "global":
 parallel = base_manifest_data["parallel"]
 if parallel["expert_model_parallel_size"] != 2:
     raise SystemExit(f"unexpected base EP parallel config {parallel}")
+if base_manifest_data["base_model_path"] != "rustrain://focused-tch-moe-ep-smoke":
+    raise SystemExit(f"unexpected base_model_path {base_manifest_data['base_model_path']}")
+if base_manifest_data["tokenizer_path"] != "":
+    raise SystemExit(f"unexpected tokenizer_path {base_manifest_data['tokenizer_path']}")
+if base_manifest_data["seed"] != 0:
+    raise SystemExit(f"unexpected seed {base_manifest_data['seed']}")
+for key in ["data_cursor_next", "data_epoch_next", "data_sample_offset_next", "data_train_samples"]:
+    if base_manifest_data.get(key) is not None:
+        raise SystemExit(f"expected {key}=null, got {base_manifest_data.get(key)}")
+if base_manifest_data["dataset_source_files"] != []:
+    raise SystemExit(f"unexpected dataset_source_files {base_manifest_data['dataset_source_files']}")
+if base_manifest_data["dataset_source_sample_counts"] != []:
+    raise SystemExit(
+        f"unexpected dataset_source_sample_counts {base_manifest_data['dataset_source_sample_counts']}"
+    )
+if base_manifest_data["dataset_fingerprint"] != "":
+    raise SystemExit(f"unexpected dataset_fingerprint {base_manifest_data['dataset_fingerprint']}")
+if base_manifest_data["dataset_shuffle"] is not True:
+    raise SystemExit(f"unexpected dataset_shuffle {base_manifest_data['dataset_shuffle']}")
 
 evidence = []
 for path in summaries:

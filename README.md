@@ -221,7 +221,8 @@ EP now also has a focused trainer-entry config, `configs/tch_moe_ep2.toml`,
 which runs the same two-rank path through `train --config` and writes a shared
 `rustrain.ep_sharded.v1` global manifest that embeds the two rank manifests,
 the EP topology, global step, consumed sample/token counts, dtype, optimizer,
-and scheduler metadata. A second trainer launch can pass that manifest through
+and scheduler metadata, plus focused smoke identity and dataset provenance/data
+progress slots. A second trainer launch can pass that manifest through
 `--resume-from` to restore the focused rank-owned expert model/AdamW shards and
 verify reload plus next-step parity. Full production EP is still open:
 autograd-aware sparse collectives, trainer-owned production MoE integration,
