@@ -148,6 +148,10 @@ pub fn train(config_path: &Path, resume_from: Option<PathBuf>) -> Result<()> {
             final_loss = summary.final_loss,
             reloaded_loss = summary.reloaded_loss,
             reload_delta = summary.reload_delta,
+            full_forward_adapter_delta = summary.full_forward_adapter_delta,
+            full_forward_reload_delta = summary.full_forward_reload_delta,
+            full_generate_reload_match = summary.full_generate_reload_match,
+            full_generate_new_token_ids = ?summary.full_generate_new_token_ids,
             steps = summary.steps,
             final_learning_rate = summary.final_learning_rate,
             first_step_grad_norm = summary.first_step_grad_norm,
@@ -169,6 +173,22 @@ pub fn train(config_path: &Path, resume_from: Option<PathBuf>) -> Result<()> {
         println!("final_loss: {:.9}", summary.final_loss);
         println!("reloaded_loss: {:.9}", summary.reloaded_loss);
         println!("reload_delta: {:.9}", summary.reload_delta);
+        println!(
+            "full_forward_adapter_delta: {:.9}",
+            summary.full_forward_adapter_delta
+        );
+        println!(
+            "full_forward_reload_delta: {:.9}",
+            summary.full_forward_reload_delta
+        );
+        println!(
+            "full_generate_reload_match: {}",
+            summary.full_generate_reload_match
+        );
+        println!(
+            "full_generate_new_token_ids: {:?}",
+            summary.full_generate_new_token_ids
+        );
         println!("steps: {}", summary.steps);
         println!("final_learning_rate: {:.9}", summary.final_learning_rate);
         println!("first_step_grad_norm: {:.9}", summary.first_step_grad_norm);

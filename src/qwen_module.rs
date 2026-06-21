@@ -161,6 +161,10 @@ pub(crate) struct QwenLoraSftTrainSummary {
     pub(crate) final_loss: f64,
     pub(crate) reloaded_loss: f64,
     pub(crate) reload_delta: f64,
+    pub(crate) full_forward_adapter_delta: f64,
+    pub(crate) full_forward_reload_delta: f64,
+    pub(crate) full_generate_reload_match: bool,
+    pub(crate) full_generate_new_token_ids: Vec<i64>,
     pub(crate) base_requires_grad: bool,
     pub(crate) first_step_grad_norm: f64,
     pub(crate) final_step_grad_norm: f64,
@@ -1285,6 +1289,36 @@ fn qwen_lora_sft_train(
             "Qwen LoRA SFT adapter reload loss parity failed: final_loss={final_loss}, reloaded_loss={reloaded_loss}, reload_delta={reload_delta}"
         );
     }
+    let base_logits = qwen_forward_from_ids(&batch.input_ids, &weights, &config)?;
+    let adapted_logits =
+        qwen_forward_from_ids_with_lora(&batch.input_ids, &weights, &config, &registry)?;
+    let reloaded_logits =
+        qwen_forward_from_ids_with_lora(&batch.input_ids, &weights, &config, &reloaded)?;
+    let full_forward_adapter_delta = diff_stats(&adapted_logits, &base_logits)?.max_abs;
+    if full_forward_adapter_delta <= 0.0 {
+        bail!("Qwen LoRA SFT adapter did not change full forward logits");
+    }
+    let full_forward_reload_delta = diff_stats(&reloaded_logits, &adapted_logits)?.max_abs;
+    if full_forward_reload_delta > 1e-7 {
+        bail!(
+            "Qwen LoRA SFT full forward reload parity failed: max_delta={full_forward_reload_delta}"
+        );
+    }
+    let prompt_ids = batch.input_ids.i(0).reshape([1, batch.input_ids.size()[1]]);
+    let generated = qwen_greedy_generate_with_lora(&prompt_ids, &weights, &config, &registry, 2)?;
+    let reloaded_generated =
+        qwen_greedy_generate_with_lora(&prompt_ids, &weights, &config, &reloaded, 2)?;
+    let generated_ids: Vec<i64> =
+        Vec::<i64>::try_from(generated.reshape([-1]).to_device(Device::Cpu))?;
+    let reloaded_generated_ids: Vec<i64> =
+        Vec::<i64>::try_from(reloaded_generated.reshape([-1]).to_device(Device::Cpu))?;
+    let full_generate_reload_match = generated_ids == reloaded_generated_ids;
+    if !full_generate_reload_match {
+        bail!(
+            "Qwen LoRA SFT full generate reload parity failed: generated={generated_ids:?}, reloaded={reloaded_generated_ids:?}"
+        );
+    }
+    let full_generate_new_token_ids = generated_ids[batch.input_ids.size()[1] as usize..].to_vec();
 
     let summary = QwenLoraSftTrainSummary {
         model_path: model_path.display().to_string(),
@@ -1306,6 +1340,10 @@ fn qwen_lora_sft_train(
         final_loss,
         reloaded_loss,
         reload_delta,
+        full_forward_adapter_delta,
+        full_forward_reload_delta,
+        full_generate_reload_match,
+        full_generate_new_token_ids,
         base_requires_grad,
         first_step_grad_norm,
         final_step_grad_norm,
@@ -3091,6 +3129,10 @@ impl QwenLoraRegistry {
             .ok_or_else(|| anyhow!("missing LoRA adapter for layer {layer_index}"))
     }
 
+    fn adapter_for_layer(&self, layer_index: usize) -> Option<&QwenAttentionLoraAdapter> {
+        self.adapters.get(&layer_index)
+    }
+
     fn trainable_tensor_names(&self) -> Vec<String> {
         self.trainable_tensors()
             .into_iter()
@@ -3445,6 +3487,27 @@ fn qwen_forward_from_ids_with_kind(
     Ok(hidden.linear::<&Tensor>(&embed_tokens, None))
 }
 
+fn qwen_forward_from_ids_with_lora(
+    input_ids: &Tensor,
+    weights: &BTreeMap<String, Tensor>,
+    config: &QwenRuntimeConfig,
+    registry: &QwenLoraRegistry,
+) -> Result<Tensor> {
+    let embed_tokens = tensor(weights, "model.embed_tokens.weight")?.to_kind(Kind::Float);
+    let final_norm = tensor(weights, "model.norm.weight")?.to_kind(Kind::Float);
+    let mut hidden = Tensor::embedding(&embed_tokens, input_ids, -1, false, false);
+    for layer_index in 0..config.num_hidden_layers {
+        let layer = QwenLayerWeights::load(weights, layer_index)?;
+        hidden = if let Some(adapter) = registry.adapter_for_layer(layer_index) {
+            qwen_layer_with_lora(&hidden, &layer, adapter, config)
+        } else {
+            qwen_layer(&hidden, &layer, config)
+        };
+    }
+    let hidden = rms_norm(&hidden, &final_norm, config.rms_norm_eps);
+    Ok(hidden.linear::<&Tensor>(&embed_tokens, None))
+}
+
 fn qwen_forward_with_cache(
     input_ids: &Tensor,
     weights: &BTreeMap<String, Tensor>,
@@ -3544,6 +3607,22 @@ pub fn qwen_greedy_generate(
     let mut generated = input_ids.shallow_clone();
     for _ in 0..max_new_tokens {
         let logits = qwen_forward_from_ids(&generated, weights, config)?;
+        let next_token = logits.i((0, -1)).argmax(-1, false).reshape([1, 1]);
+        generated = Tensor::cat(&[&generated, &next_token], 1);
+    }
+    Ok(generated)
+}
+
+fn qwen_greedy_generate_with_lora(
+    input_ids: &Tensor,
+    weights: &BTreeMap<String, Tensor>,
+    config: &QwenRuntimeConfig,
+    registry: &QwenLoraRegistry,
+    max_new_tokens: usize,
+) -> Result<Tensor> {
+    let mut generated = input_ids.shallow_clone();
+    for _ in 0..max_new_tokens {
+        let logits = qwen_forward_from_ids_with_lora(&generated, weights, config, registry)?;
         let next_token = logits.i((0, -1)).argmax(-1, false).reshape([1, 1]);
         generated = Tensor::cat(&[&generated, &next_token], 1);
     }
@@ -3775,6 +3854,33 @@ fn qwen_attention_with_lora(
         &weights.o_proj,
         config,
     )
+}
+
+fn qwen_layer_with_lora(
+    input: &Tensor,
+    weights: &QwenLayerWeights,
+    adapter: &QwenAttentionLoraAdapter,
+    config: &QwenRuntimeConfig,
+) -> Tensor {
+    let compute_kind = weights.q_proj.kind();
+    let input = input.to_kind(compute_kind);
+    let attention_input =
+        rms_norm(&input, &weights.input_norm, config.rms_norm_eps).to_kind(compute_kind);
+    let attention_output = qwen_attention_with_lora(&attention_input, weights, adapter, config);
+    let after_attention = input + attention_output;
+    let mlp_input = rms_norm(
+        &after_attention,
+        &weights.post_attention_norm,
+        config.rms_norm_eps,
+    )
+    .to_kind(compute_kind);
+    let mlp_output = qwen_mlp(
+        &mlp_input,
+        &weights.gate_proj,
+        &weights.up_proj,
+        &weights.down_proj,
+    );
+    after_attention + mlp_output
 }
 
 fn qwen_attention_lora_mse_loss(
@@ -4827,6 +4933,60 @@ mod tests {
                 .to_string()
                 .contains("unsupported Qwen LoRA target module k_proj")
         );
+    }
+
+    #[test]
+    fn qwen_lora_full_forward_and_generate_reload_parity() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let adapter_output = temp.path().join("adapter.safetensors");
+        let config = QwenRuntimeConfig {
+            num_hidden_layers: 1,
+            num_attention_heads: 2,
+            num_key_value_heads: 1,
+            rms_norm_eps: 1e-6,
+            rope_theta: 10_000.0,
+        };
+        let weights = tiny_qwen_weights();
+        let lora_config = QwenLoraConfig::layer0_qv(2, 8.0).expect("config should build");
+        let registry = QwenLoraRegistry::deterministic(&weights, &lora_config, false)
+            .expect("registry should build");
+        let input_ids = Tensor::from_slice(&[0_i64, 1, 2]).reshape([1, 3]);
+
+        let base_logits =
+            qwen_forward_from_ids(&input_ids, &weights, &config).expect("base forward should run");
+        let adapted_logits =
+            qwen_forward_from_ids_with_lora(&input_ids, &weights, &config, &registry)
+                .expect("LoRA forward should run");
+        assert!(
+            diff_stats(&adapted_logits, &base_logits)
+                .expect("adapter diff should compute")
+                .max_abs
+                > 0.0
+        );
+
+        registry
+            .save(&adapter_output)
+            .expect("registry should save");
+        let reloaded = QwenLoraRegistry::load(&adapter_output).expect("registry should reload");
+        let reloaded_logits =
+            qwen_forward_from_ids_with_lora(&input_ids, &weights, &config, &reloaded)
+                .expect("reloaded LoRA forward should run");
+        assert!(
+            diff_stats(&reloaded_logits, &adapted_logits)
+                .expect("reload diff should compute")
+                .max_abs
+                < 1e-8
+        );
+
+        let generated = qwen_greedy_generate_with_lora(&input_ids, &weights, &config, &registry, 2)
+            .expect("LoRA generate should run");
+        let reloaded_generated =
+            qwen_greedy_generate_with_lora(&input_ids, &weights, &config, &reloaded, 2)
+                .expect("reloaded LoRA generate should run");
+        let generated_ids: Vec<i64> = Vec::<i64>::try_from(generated.reshape([-1])).unwrap();
+        let reloaded_generated_ids: Vec<i64> =
+            Vec::<i64>::try_from(reloaded_generated.reshape([-1])).unwrap();
+        assert_eq!(reloaded_generated_ids, generated_ids);
     }
 
     #[test]

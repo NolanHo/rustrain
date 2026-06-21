@@ -133,9 +133,10 @@ remain open.
 - G6 trainer-level real SFT data now has a minimal Qwen LoRA SFT config path:
   `train --config configs/qwen_lora_sft.toml` loads tokenizer-backed
   instruction JSONL batches, trains configured focused q/v LoRA targets, and
-  reloads the adapter. It also uses the trainer scheduler and grad clipping
-  knobs. Production data loading and arbitrary-module LoRA injection are still
-  open.
+  reloads the adapter. The trainer path now verifies the saved adapter through
+  full-Qwen forward logits and greedy generation reload parity. It also uses
+  the trainer scheduler and grad clipping knobs. Production data loading and
+  arbitrary-module LoRA injection are still open.
 - Real Qwen module-level LoRA now uses a target-layer/module registry for
   focused attention `q_proj`/`v_proj`; trainer-owned full-model LoRA injection
   is not done yet. The current Qwen LoRA SFT config exposes rank, alpha,
