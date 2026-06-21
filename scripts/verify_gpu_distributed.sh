@@ -30,3 +30,11 @@ remote_run_2gpu env \
   RUSTRAIN_QWEN_SESSION_DP_CONFIG=configs/qwen_session_dp2_bf16.toml \
   RUSTRAIN_EXPECTED_QWEN_COMPUTE_KIND=bf16 \
   bash scripts/verify_qwen_session_dp2_worker.sh
+
+remote_run_2gpu env \
+  RUSTRAIN_LAUNCH_TIMEOUT_SECS=900 \
+  RUSTRAIN_DISTRIBUTED_BASE_OUTPUT_DIR="${OUTPUT_DIR}-resume-base" \
+  RUSTRAIN_DISTRIBUTED_RESUME_OUTPUT_DIR="${OUTPUT_DIR}-resume-continue" \
+  RUSTRAIN_QWEN_SESSION_DP_CONFIG=configs/qwen_session_dp2_sft.toml \
+  RUSTRAIN_EXPECTED_DATASET_ORDER_SEED=777 \
+  bash scripts/verify_qwen_session_dp2_resume_worker.sh
