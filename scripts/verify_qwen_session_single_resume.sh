@@ -40,6 +40,10 @@ required = [
     "resumed_checkpoint",
     "train_steps",
     "step_losses",
+    "first_step_grad_norm",
+    "final_step_grad_norm",
+    "tokens_per_second",
+    "samples_per_second",
     "reload_delta",
     "second_step_delta",
 ]
@@ -55,6 +59,14 @@ if len(step_losses) != 3:
     raise SystemExit(f"expected 3 step losses, got {step_losses}")
 if not step_losses[-1] < step_losses[0]:
     raise SystemExit(f"resume step losses did not improve: {step_losses}")
+for key in [
+    "first_step_grad_norm",
+    "final_step_grad_norm",
+    "tokens_per_second",
+    "samples_per_second",
+]:
+    if float(values[key]) <= 0.0:
+        raise SystemExit(f"{key} must be positive, got {values[key]}")
 if float(values["reload_delta"]) > 1e-5:
     raise SystemExit(f"reload_delta too large: {values['reload_delta']}")
 if float(values["second_step_delta"]) > 1e-5:

@@ -150,7 +150,8 @@ rules remain open.
   smoke now uses a reusable `QwenTrainableSession` surface, and representative
   single-GPU plus DP=2 config paths are wired through `train --config`. The
   single-GPU path now respects configured `max_steps` and reports step losses.
-  It can also resume from its saved delta manifest through `--resume-from`.
+  It can also resume from its saved delta manifest through `--resume-from` and
+  reports throughput, gradient norm, RSS, and GPU memory metrics.
   Full model/data/checkpoint trainer ownership remains open.
 - G6 trainer-level real SFT data now has a minimal Qwen LoRA SFT config path:
   `train --config configs/qwen_lora_sft.toml` loads tokenizer-backed

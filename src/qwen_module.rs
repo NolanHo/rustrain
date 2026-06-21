@@ -235,6 +235,12 @@ pub(crate) struct QwenFullTrainSmokeSummary {
     pub(crate) train_steps: usize,
     pub(crate) learning_rate: f64,
     pub(crate) step_losses: Vec<f64>,
+    pub(crate) first_step_grad_norm: f64,
+    pub(crate) final_step_grad_norm: f64,
+    pub(crate) tokens_per_second: f64,
+    pub(crate) samples_per_second: f64,
+    pub(crate) memory_rss_mb: Option<f64>,
+    pub(crate) gpu_memory_allocated_mb: Option<f64>,
     pub(crate) initial_loss: f64,
     pub(crate) final_loss: f64,
     pub(crate) reloaded_loss: f64,
@@ -2008,6 +2014,24 @@ fn qwen_full_train_summary(
         train_steps: 1,
         learning_rate,
         step_losses: vec![initial_loss, final_loss],
+        first_step_grad_norm: first_step
+            .artifacts
+            .tensor_summaries
+            .iter()
+            .map(|summary| summary.grad_norm * summary.grad_norm)
+            .sum::<f64>()
+            .sqrt(),
+        final_step_grad_norm: first_step
+            .artifacts
+            .tensor_summaries
+            .iter()
+            .map(|summary| summary.grad_norm * summary.grad_norm)
+            .sum::<f64>()
+            .sqrt(),
+        tokens_per_second: 0.0,
+        samples_per_second: 0.0,
+        memory_rss_mb: crate::metrics::memory_rss_mb(),
+        gpu_memory_allocated_mb: crate::metrics::gpu_memory_allocated_mb(),
         initial_loss,
         final_loss,
         reloaded_loss,
@@ -2067,14 +2091,28 @@ fn qwen_session_single_summary(
     let mut step_losses = Vec::with_capacity(train_steps + 1);
     let mut last_step = None;
     let end_step = start_step + train_steps - 1;
+    let mut first_step_grad_norm = 0.0;
+    let mut final_step_grad_norm = 0.0;
+    let train_started = Instant::now();
     for step in start_step..=end_step {
         let step_result = session.train_step(learning_rate, step as i32)?;
         if step == start_step {
             step_losses.push(step_result.loss_before);
         }
         step_losses.push(step_result.loss_after);
+        let step_grad_norm = qwen_train_artifacts_grad_norm(&step_result.artifacts);
+        if step == start_step {
+            first_step_grad_norm = step_grad_norm;
+        }
+        final_step_grad_norm = step_grad_norm;
         last_step = Some(step_result);
     }
+    let train_elapsed_secs = train_started.elapsed().as_secs_f64().max(1e-9);
+    let local_batch_size = session.input_ids.size()[0] as f64;
+    let sequence_tokens = session.input_ids.size()[1] as f64;
+    let samples_per_second = local_batch_size * train_steps as f64 / train_elapsed_secs;
+    let tokens_per_second =
+        local_batch_size * sequence_tokens * train_steps as f64 / train_elapsed_secs;
     let final_step = last_step.expect("train_steps > 0 guarantees a final step");
     let final_artifacts = final_step.artifacts;
     let initial_loss = *step_losses
@@ -2163,6 +2201,12 @@ fn qwen_session_single_summary(
         train_steps,
         learning_rate,
         step_losses,
+        first_step_grad_norm,
+        final_step_grad_norm,
+        tokens_per_second,
+        samples_per_second,
+        memory_rss_mb: crate::metrics::memory_rss_mb(),
+        gpu_memory_allocated_mb: crate::metrics::gpu_memory_allocated_mb(),
         initial_loss,
         final_loss,
         reloaded_loss,
@@ -2173,6 +2217,15 @@ fn qwen_session_single_summary(
         second_step_delta,
         trainable_tensors: final_artifacts.tensor_summaries,
     })
+}
+
+fn qwen_train_artifacts_grad_norm(artifacts: &QwenTrainStepArtifacts) -> f64 {
+    artifacts
+        .tensor_summaries
+        .iter()
+        .map(|summary| summary.grad_norm * summary.grad_norm)
+        .sum::<f64>()
+        .sqrt()
 }
 
 pub fn qwen_dp_gradient_smoke(

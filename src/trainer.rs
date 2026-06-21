@@ -131,6 +131,12 @@ pub fn train(config_path: &Path, resume_from: Option<PathBuf>) -> Result<()> {
                 second_step_delta = summary.second_step_delta,
                 resumed_checkpoint = summary.resumed_checkpoint,
                 train_steps = summary.train_steps,
+                first_step_grad_norm = summary.first_step_grad_norm,
+                final_step_grad_norm = summary.final_step_grad_norm,
+                tokens_per_second = summary.tokens_per_second,
+                samples_per_second = summary.samples_per_second,
+                memory_rss_mb = summary.memory_rss_mb,
+                gpu_memory_allocated_mb = summary.gpu_memory_allocated_mb,
                 trainable_tensors = summary.trainable_tensors.len(),
                 "qwen trainable session trainer single-rank smoke complete"
             );
@@ -146,6 +152,16 @@ pub fn train(config_path: &Path, resume_from: Option<PathBuf>) -> Result<()> {
             println!("resumed_checkpoint: {}", summary.resumed_checkpoint);
             println!("train_steps: {}", summary.train_steps);
             println!("step_losses: {:?}", summary.step_losses);
+            println!("first_step_grad_norm: {:.9}", summary.first_step_grad_norm);
+            println!("final_step_grad_norm: {:.9}", summary.final_step_grad_norm);
+            println!("tokens_per_second: {:.2}", summary.tokens_per_second);
+            println!("samples_per_second: {:.2}", summary.samples_per_second);
+            if let Some(memory_rss_mb) = summary.memory_rss_mb {
+                println!("memory_rss_mb: {memory_rss_mb:.2}");
+            }
+            if let Some(gpu_memory_allocated_mb) = summary.gpu_memory_allocated_mb {
+                println!("gpu_memory_allocated_mb: {gpu_memory_allocated_mb:.2}");
+            }
             println!("initial_loss: {:.9}", summary.initial_loss);
             println!("final_loss: {:.9}", summary.final_loss);
             println!("reloaded_loss: {:.9}", summary.reloaded_loss);
