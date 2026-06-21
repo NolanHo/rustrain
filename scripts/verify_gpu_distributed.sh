@@ -6,6 +6,7 @@ REMOTE_PORT="${RUSTRAIN_REMOTE_PORT:-2222}"
 REMOTE_DIR="${RUSTRAIN_REMOTE_DIR:-/vePFS-Mindverse/user/nolanho/code/rustrain}"
 REMOTE_PYTHON="${RUSTRAIN_REMOTE_PYTHON:-/opt/venv/bin/python}"
 SYNC_TO_WORKER="${RUSTRAIN_SYNC_TO_WORKER:-1}"
+OUTPUT_DIR="${RUSTRAIN_DISTRIBUTED_VERIFY_OUTPUT_DIR:-/tmp/rustrain-runs/qwen-session-trainer-dp2-verify-$(date +%Y%m%d-%H%M%S)-$$}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 remote_run_2gpu() {
@@ -20,5 +21,5 @@ remote_run_2gpu() {
 
 remote_run_2gpu env RUSTRAIN_LAUNCH_TIMEOUT_SECS=600 cargo run -- launch \
   --nproc-per-node 2 \
-  --output-dir /tmp/rustrain-runs/qwen-session-trainer-dp2-verify \
+  --output-dir "${OUTPUT_DIR}" \
   train --config configs/qwen_session_dp2.toml

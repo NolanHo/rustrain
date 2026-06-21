@@ -95,7 +95,9 @@ Production distributed training must not overload the rank0 replicated format.
 It needs a separate sharded format with explicit rank-local ownership.
 
 The reserved manifest identifier is `rustrain.qwen_sharded.v1`. The current code
-defines and validates this schema, but no trainer path writes or restores it yet.
+defines and validates this schema, and the representative Qwen session DP smoke
+writes rank-owned shard manifests plus a global manifest. Fresh-run restore from
+those shards is still not implemented.
 
 Required manifest structure:
 

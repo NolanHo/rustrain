@@ -285,6 +285,8 @@ struct QwenSessionDpRankSummary {
     delta_output: String,
     optimizer_output: String,
     manifest_output: String,
+    sharded_rank_manifest_output: String,
+    sharded_global_manifest_output: String,
     reloaded_loss: f64,
     reload_delta: f64,
     continuous_next_loss: f64,
@@ -2571,6 +2573,40 @@ pub fn qwen_session_dp_rank_smoke(
         );
     }
 
+    let sharded_rank_manifest_output = write_qwen_session_dp_rank_sharded_manifest(
+        &output_dir,
+        model_path,
+        rank,
+        world_size,
+        steps,
+        learning_rate,
+        dtype,
+        &last_artifacts,
+    )?;
+    wait_for_rank_barrier(
+        &output_dir.join("qwen-session-dp-sharded-rank-manifests-written"),
+        rank,
+        world_size,
+        Duration::from_secs(300),
+    )?;
+    let sharded_global_manifest_output = output_dir.join("qwen-session-dp-sharded-global.json");
+    if rank == 0 {
+        write_qwen_session_dp_global_sharded_manifest(
+            &output_dir,
+            model_path,
+            world_size,
+            steps,
+            dtype,
+            &sharded_global_manifest_output,
+        )?;
+    }
+    wait_for_rank_barrier(
+        &output_dir.join("qwen-session-dp-sharded-global-manifest-written"),
+        rank,
+        world_size,
+        Duration::from_secs(300),
+    )?;
+
     let summary = QwenSessionDpRankSummary {
         rank,
         world_size,
@@ -2592,6 +2628,8 @@ pub fn qwen_session_dp_rank_smoke(
         delta_output: delta_output.display().to_string(),
         optimizer_output: optimizer_output.display().to_string(),
         manifest_output: checkpoint_path.display().to_string(),
+        sharded_rank_manifest_output: sharded_rank_manifest_output.display().to_string(),
+        sharded_global_manifest_output: sharded_global_manifest_output.display().to_string(),
         reloaded_loss,
         reload_delta,
         continuous_next_loss,
@@ -2609,6 +2647,141 @@ pub fn qwen_session_dp_rank_smoke(
     );
 
     Ok(())
+}
+
+fn write_qwen_session_dp_rank_sharded_manifest(
+    output_dir: &Path,
+    model_path: &Path,
+    rank: usize,
+    world_size: usize,
+    steps: usize,
+    learning_rate: f64,
+    dtype: QwenComputeDType,
+    artifacts: &QwenTrainStepArtifacts,
+) -> Result<PathBuf> {
+    let rank_dir = output_dir.join(format!("sharded-rank-{rank}"));
+    fs::create_dir_all(&rank_dir)
+        .with_context(|| format!("failed to create {}", rank_dir.display()))?;
+    let model_safetensors = rank_dir.join("model.safetensors");
+    let optimizer_safetensors = rank_dir.join("optimizer.safetensors");
+    let model_refs: Vec<(&str, &Tensor)> = artifacts
+        .delta_entries
+        .iter()
+        .map(|(name, tensor)| (name.as_str(), tensor))
+        .collect();
+    Tensor::write_safetensors(&model_refs, &model_safetensors)
+        .with_context(|| format!("failed to write {}", model_safetensors.display()))?;
+    let optimizer_refs: Vec<(&str, &Tensor)> = artifacts
+        .optimizer_entries
+        .iter()
+        .map(|(name, tensor)| (name.as_str(), tensor))
+        .collect();
+    Tensor::write_safetensors(&optimizer_refs, &optimizer_safetensors)
+        .with_context(|| format!("failed to write {}", optimizer_safetensors.display()))?;
+
+    let shards = artifacts
+        .manifest_tensors
+        .iter()
+        .map(|entry| {
+            Ok(QwenTensorShardManifestEntry {
+                name: entry.name.clone(),
+                shard_name: entry.delta_name.clone(),
+                optimizer_m_name: entry
+                    .adam_m_name
+                    .clone()
+                    .ok_or_else(|| anyhow!("missing Adam m slot for {}", entry.name))?,
+                optimizer_v_name: entry
+                    .adam_v_name
+                    .clone()
+                    .ok_or_else(|| anyhow!("missing Adam v slot for {}", entry.name))?,
+                global_shape: entry.shape.clone(),
+                shard_shape: entry.shape.clone(),
+                dtype: entry.dtype.clone(),
+                partition: "replicated_dp".to_string(),
+                tied_group: None,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let rank_manifest = QwenRankShardManifest {
+        rank,
+        data_parallel_rank: rank,
+        tensor_model_parallel_rank: 0,
+        pipeline_model_parallel_rank: 0,
+        expert_model_parallel_rank: 0,
+        context_parallel_rank: 0,
+        model_safetensors: model_safetensors.display().to_string(),
+        optimizer_safetensors: optimizer_safetensors.display().to_string(),
+        shards,
+    };
+    let rank_manifest_output = output_dir.join(format!("qwen-session-dp-sharded-rank-{rank}.json"));
+    fs::write(
+        &rank_manifest_output,
+        serde_json::to_string_pretty(&rank_manifest)? + "\n",
+    )
+    .with_context(|| format!("failed to write {}", rank_manifest_output.display()))?;
+
+    let smoke_metadata = serde_json::json!({
+        "format": "rustrain.qwen_session_dp_shard_smoke.v1",
+        "base_model_path": model_path.display().to_string(),
+        "rank": rank,
+        "world_size": world_size,
+        "steps": steps,
+        "learning_rate": learning_rate,
+        "dtype": dtype.label(),
+    });
+    fs::write(
+        rank_dir.join("smoke-metadata.json"),
+        serde_json::to_string_pretty(&smoke_metadata)? + "\n",
+    )
+    .with_context(|| format!("failed to write sharded smoke metadata for rank {rank}"))?;
+
+    Ok(rank_manifest_output)
+}
+
+fn write_qwen_session_dp_global_sharded_manifest(
+    output_dir: &Path,
+    model_path: &Path,
+    world_size: usize,
+    steps: usize,
+    dtype: QwenComputeDType,
+    manifest_output: &Path,
+) -> Result<()> {
+    let mut ranks = Vec::with_capacity(world_size);
+    for rank in 0..world_size {
+        let rank_manifest_output =
+            output_dir.join(format!("qwen-session-dp-sharded-rank-{rank}.json"));
+        let text = fs::read_to_string(&rank_manifest_output)
+            .with_context(|| format!("failed to read {}", rank_manifest_output.display()))?;
+        let rank_manifest: QwenRankShardManifest = serde_json::from_str(&text)
+            .with_context(|| format!("failed to parse {}", rank_manifest_output.display()))?;
+        ranks.push(rank_manifest);
+    }
+    let manifest = QwenShardedCheckpointManifest {
+        format: "rustrain.qwen_sharded.v1".to_string(),
+        base_model_path: model_path.display().to_string(),
+        tokenizer_path: model_path.join("tokenizer.json").display().to_string(),
+        global_step: steps as u64,
+        consumed_samples: world_size as u64 * steps as u64,
+        consumed_tokens: world_size as u64 * steps as u64 * 5,
+        seed: 42,
+        dtype: dtype.label().to_string(),
+        optimizer: "adamw".to_string(),
+        scheduler: "constant".to_string(),
+        parallel: QwenShardedParallelManifest {
+            data_parallel_size: world_size,
+            tensor_model_parallel_size: 1,
+            pipeline_model_parallel_size: 1,
+            expert_model_parallel_size: 1,
+            context_parallel_size: 1,
+        },
+        ranks,
+    };
+    manifest.validate()?;
+    fs::write(
+        manifest_output,
+        serde_json::to_string_pretty(&manifest)? + "\n",
+    )
+    .with_context(|| format!("failed to write {}", manifest_output.display()))
 }
 
 pub fn train_qwen_session_dp_from_config(config: &Config, _run_paths: &RunPaths) -> Result<()> {
@@ -5392,6 +5565,40 @@ mod tests {
             .expect_err("missing optimizer slots should fail");
 
         assert!(error.to_string().contains("missing optimizer slots"));
+    }
+
+    #[test]
+    fn qwen_session_dp_global_sharded_manifest_writes_schema_root() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let manifest = tiny_qwen_sharded_manifest();
+        for rank in &manifest.ranks {
+            fs::write(
+                temp.path()
+                    .join(format!("qwen-session-dp-sharded-rank-{}.json", rank.rank)),
+                serde_json::to_string_pretty(rank).expect("rank manifest should serialize"),
+            )
+            .expect("rank manifest should write");
+        }
+        let output = temp.path().join("global.json");
+
+        write_qwen_session_dp_global_sharded_manifest(
+            temp.path(),
+            Path::new("/models/qwen"),
+            2,
+            3,
+            QwenComputeDType::Fp32,
+            &output,
+        )
+        .expect("global manifest should write");
+        let decoded: QwenShardedCheckpointManifest = serde_json::from_str(
+            &fs::read_to_string(&output).expect("global manifest should read"),
+        )
+        .expect("global manifest should parse");
+
+        decoded.validate().expect("global manifest should validate");
+        assert_eq!(decoded.format, "rustrain.qwen_sharded.v1");
+        assert_eq!(decoded.global_step, 3);
+        assert_eq!(decoded.ranks.len(), 2);
     }
 
     #[test]
