@@ -153,21 +153,24 @@ and verifies next-step resume parity against a continuous rank0-manifest run.
 The focused Qwen TP=2 layer0 smoke also writes rank-owned model shard files and
 a global `rustrain.qwen_sharded.v1` manifest for its layer0 attention/MLP tensor
 partitions. That TP manifest is checkpoint-contract evidence only: optimizer
-slots are zero smoke placeholders. The same focused smoke restores each rank's
-model shards through the global manifest and verifies the fused layer0 output
-against the full layer0 reference within tolerance, then applies the same
-focused shard SGD update from the restored shards and verifies next-update
-output parity against the continuous focused path. The trainer-entry TP path
-also verifies a focused causal-LM train-step over a real token batch, but the
-checkpoint artifacts still only cover focused layer0 TP shard state with smoke
-optimizer slots. The focused TP verifier now also checks the global manifest's
-base model identity, tokenizer identity, global step, consumed sample/token
-counts, seed, dtype, optimizer, scheduler, explicit lack of JSONL provenance for
-the focused smoke, exact parallel topology, embedded rank manifests, and every
-declared rank-owned model shard plus AdamW slot shape in the written safetensors
-files. The focused external TP resume verifier repeats the same manifest and
-artifact-shape checks for the base checkpoint and the resumed launch's newly
-written global manifest while verifying restore and next-update parity.
+slots for TP row/column shards are gradient-derived smoke AdamW m/v tensors, and
+replicated norm slots remain zero because the focused TP train step does not
+update them. The same focused smoke restores each rank's model shards through
+the global manifest and verifies the fused layer0 output against the full
+layer0 reference within tolerance, then applies the same focused shard SGD
+update from the restored shards and verifies next-update output parity against
+the continuous focused path. The trainer-entry TP path also verifies a focused
+causal-LM train-step over a real token batch, but the checkpoint artifacts still
+only cover focused layer0 TP shard state with smoke optimizer slots. The
+focused TP verifier now also checks the global manifest's base model identity,
+tokenizer identity, global step, consumed sample/token counts, seed, dtype,
+optimizer, scheduler, explicit lack of JSONL provenance for the focused smoke,
+exact parallel topology, embedded rank manifests, every declared rank-owned
+model shard plus AdamW slot shape, and non-zero optimizer slots for TP-owned
+trainable shards in the written safetensors files. The focused external TP
+resume verifier repeats the same manifest and artifact checks for the base
+checkpoint and the resumed launch's newly written global manifest while
+verifying restore and next-update parity.
 Production full-parameter TP checkpoint resume and full production sharded
 restore over external streaming real data remain open.
 The focused EP `parallel-ep-tch-moe-rank-smoke` also writes

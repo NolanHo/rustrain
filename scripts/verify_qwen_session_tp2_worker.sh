@@ -40,6 +40,18 @@ def tensor_shapes(path):
     return tensors
 
 
+def tensor_shape_sums(path):
+    tensors = {}
+    with safe_open(str(path), framework="pt", device="cpu") as handle:
+        for key in handle.keys():
+            tensor = handle.get_tensor(key)
+            tensors[key] = {
+                "shape": list(tensor.shape),
+                "abs_sum": float(tensor.abs().sum().item()),
+            }
+    return tensors
+
+
 for path in summaries:
     data = json.loads(path.read_text())
     rank = int(data["rank"])
@@ -180,7 +192,7 @@ for path in summaries:
     if not optimizer_path.exists() or optimizer_path.stat().st_size == 0:
         raise SystemExit(f"{rank_manifest_path} missing or empty optimizer_safetensors {optimizer_path}")
     model_shapes = tensor_shapes(model_path)
-    optimizer_shapes = tensor_shapes(optimizer_path)
+    optimizer_shapes = tensor_shape_sums(optimizer_path)
     for entry in rank_manifest["shards"]:
         if not entry["optimizer_m_name"] or not entry["optimizer_v_name"]:
             raise SystemExit(f"{rank_manifest_path} shard {entry['name']} missing optimizer slots")
@@ -196,16 +208,23 @@ for path in summaries:
             raise SystemExit(f"{rank_manifest_path} optimizer safetensors missing m slot {entry['optimizer_m_name']}")
         if entry["optimizer_v_name"] not in optimizer_shapes:
             raise SystemExit(f"{rank_manifest_path} optimizer safetensors missing v slot {entry['optimizer_v_name']}")
-        if optimizer_shapes[entry["optimizer_m_name"]] != entry["shard_shape"]:
+        if optimizer_shapes[entry["optimizer_m_name"]]["shape"] != entry["shard_shape"]:
             raise SystemExit(
                 f"{rank_manifest_path} optimizer m slot {entry['optimizer_m_name']} shape "
-                f"{optimizer_shapes[entry['optimizer_m_name']]} != {entry['shard_shape']}"
+                f"{optimizer_shapes[entry['optimizer_m_name']]['shape']} != {entry['shard_shape']}"
             )
-        if optimizer_shapes[entry["optimizer_v_name"]] != entry["shard_shape"]:
+        if optimizer_shapes[entry["optimizer_v_name"]]["shape"] != entry["shard_shape"]:
             raise SystemExit(
                 f"{rank_manifest_path} optimizer v slot {entry['optimizer_v_name']} shape "
-                f"{optimizer_shapes[entry['optimizer_v_name']]} != {entry['shard_shape']}"
+                f"{optimizer_shapes[entry['optimizer_v_name']]['shape']} != {entry['shard_shape']}"
             )
+        if entry["partition"] in {"tp_row", "tp_col"}:
+            for slot_key in ["optimizer_m_name", "optimizer_v_name"]:
+                slot_name = entry[slot_key]
+                if optimizer_shapes[slot_name]["abs_sum"] <= 0.0:
+                    raise SystemExit(
+                        f"{rank_manifest_path} optimizer slot {slot_name} for {entry['name']} is all zero"
+                    )
     global_manifests.add(data["sharded_global_manifest_output"])
     q_heads.append((int(data["attention_q_head_start"]), int(data["attention_q_head_end"])))
     kv_heads.append((int(data["attention_kv_head_start"]), int(data["attention_kv_head_end"])))
@@ -292,7 +311,7 @@ if int(global_manifest["seed"]) != 42:
     raise SystemExit(f"unexpected TP seed {global_manifest['seed']}")
 if global_manifest["dtype"] != "fp32":
     raise SystemExit(f"unexpected TP dtype {global_manifest['dtype']}")
-if global_manifest["optimizer"] != "adamw_zero_slots_smoke":
+if global_manifest["optimizer"] != "adamw_gradient_slots_smoke":
     raise SystemExit(f"unexpected TP optimizer {global_manifest['optimizer']}")
 if global_manifest["scheduler"] != "constant":
     raise SystemExit(f"unexpected TP scheduler {global_manifest['scheduler']}")

@@ -262,6 +262,13 @@ struct QwenSessionTpCausalLmSgdUpdate {
     initial_loss: f64,
     final_loss: f64,
     learning_rate: f64,
+    q_grad: Tensor,
+    k_grad: Tensor,
+    v_grad: Tensor,
+    o_grad: Tensor,
+    gate_grad: Tensor,
+    up_grad: Tensor,
+    down_grad: Tensor,
     q_grad_norm: f64,
     k_grad_norm: f64,
     v_grad_norm: f64,
@@ -5844,6 +5851,33 @@ fn qwen_session_tp_rank_smoke(
         &gate_shard_base,
         &up_shard_base,
         &down_shard_base,
+        &[
+            (
+                "model.layers.0.self_attn.q_proj.weight",
+                &causal_train.q_grad,
+            ),
+            (
+                "model.layers.0.self_attn.k_proj.weight",
+                &causal_train.k_grad,
+            ),
+            (
+                "model.layers.0.self_attn.v_proj.weight",
+                &causal_train.v_grad,
+            ),
+            (
+                "model.layers.0.self_attn.o_proj.weight",
+                &causal_train.o_grad,
+            ),
+            (
+                "model.layers.0.mlp.gate_proj.weight",
+                &causal_train.gate_grad,
+            ),
+            ("model.layers.0.mlp.up_proj.weight", &causal_train.up_grad),
+            (
+                "model.layers.0.mlp.down_proj.weight",
+                &causal_train.down_grad,
+            ),
+        ],
         &q_proj_full,
         &k_proj_full,
         &v_proj_full,
@@ -6103,6 +6137,7 @@ fn write_qwen_session_tp_focused_sharded_manifest(
     gate_shard: &Tensor,
     up_shard: &Tensor,
     down_shard: &Tensor,
+    optimizer_slot_grads: &[(&str, &Tensor)],
     q_full: &Tensor,
     k_full: &Tensor,
     v_full: &Tensor,
@@ -6162,12 +6197,28 @@ fn write_qwen_session_tp_focused_sharded_manifest(
     Tensor::write_safetensors(&model_refs, &model_safetensors)
         .with_context(|| format!("failed to write {}", model_safetensors.display()))?;
 
+    let optimizer_slot_grad_map = optimizer_slot_grads
+        .iter()
+        .map(|(name, grad)| (*name, *grad))
+        .collect::<BTreeMap<_, _>>();
     let optimizer_entries: Vec<(String, Tensor)> = model_entries
         .iter()
         .flat_map(|(name, tensor)| {
+            let grad = optimizer_slot_grad_map.get(name.as_str()).copied();
+            let first_moment = grad
+                .map(|grad| grad.detach().to_device(tensor.device()).contiguous())
+                .unwrap_or_else(|| Tensor::zeros_like(tensor));
+            let second_moment = grad
+                .map(|grad| {
+                    grad.detach()
+                        .to_device(tensor.device())
+                        .pow_tensor_scalar(2.0)
+                        .contiguous()
+                })
+                .unwrap_or_else(|| Tensor::zeros_like(tensor));
             [
-                (format!("{name}.adam_m"), Tensor::zeros_like(tensor)),
-                (format!("{name}.adam_v"), Tensor::zeros_like(tensor)),
+                (format!("{name}.adam_m"), first_moment),
+                (format!("{name}.adam_v"), second_moment),
             ]
         })
         .collect();
@@ -6303,7 +6354,7 @@ fn write_qwen_session_tp_focused_sharded_manifest(
             dataset_shuffle: true,
             seed: config.run.seed,
             dtype: "fp32".to_string(),
-            optimizer: "adamw_zero_slots_smoke".to_string(),
+            optimizer: "adamw_gradient_slots_smoke".to_string(),
             scheduler: "constant".to_string(),
             parallel: QwenShardedParallelManifest {
                 data_parallel_size: 1,
@@ -7072,6 +7123,13 @@ fn qwen_session_tp_causal_lm_sgd_update(
         initial_loss,
         final_loss: best_loss,
         learning_rate: best_learning_rate,
+        q_grad: q_grad.detach().contiguous(),
+        k_grad: k_grad.detach().contiguous(),
+        v_grad: v_grad.detach().contiguous(),
+        o_grad: o_grad.detach().contiguous(),
+        gate_grad: gate_grad.detach().contiguous(),
+        up_grad: up_grad.detach().contiguous(),
+        down_grad: down_grad.detach().contiguous(),
         q_grad_norm: q_grad.norm().double_value(&[]),
         k_grad_norm: k_grad.norm().double_value(&[]),
         v_grad_norm: v_grad.norm().double_value(&[]),

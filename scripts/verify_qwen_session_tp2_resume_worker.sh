@@ -64,6 +64,18 @@ def tensor_shapes(path):
     return tensors
 
 
+def tensor_shape_sums(path):
+    tensors = {}
+    with safe_open(str(path), framework="pt", device="cpu") as handle:
+        for key in handle.keys():
+            tensor = handle.get_tensor(key)
+            tensors[key] = {
+                "shape": list(tensor.shape),
+                "abs_sum": float(tensor.abs().sum().item()),
+            }
+    return tensors
+
+
 def validate_tp_global_manifest(manifest_path, expected_global_step):
     manifest_path = pathlib.Path(manifest_path)
     if not manifest_path.exists():
@@ -96,8 +108,8 @@ def validate_tp_global_manifest(manifest_path, expected_global_step):
         raise SystemExit(f"{manifest_path} seed {manifest['seed']} != 42")
     if manifest["dtype"] != "fp32":
         raise SystemExit(f"{manifest_path} dtype {manifest['dtype']} != fp32")
-    if manifest["optimizer"] != "adamw_zero_slots_smoke":
-        raise SystemExit(f"{manifest_path} optimizer {manifest['optimizer']} != adamw_zero_slots_smoke")
+    if manifest["optimizer"] != "adamw_gradient_slots_smoke":
+        raise SystemExit(f"{manifest_path} optimizer {manifest['optimizer']} != adamw_gradient_slots_smoke")
     if manifest["scheduler"] != "constant":
         raise SystemExit(f"{manifest_path} scheduler {manifest['scheduler']} != constant")
     expected_parallel = {
@@ -132,7 +144,7 @@ def validate_tp_global_manifest(manifest_path, expected_global_step):
         if not optimizer_path.exists() or optimizer_path.stat().st_size == 0:
             raise SystemExit(f"{manifest_path} rank {rank} missing optimizer_safetensors {optimizer_path}")
         model_shapes = tensor_shapes(model_path)
-        optimizer_shapes = tensor_shapes(optimizer_path)
+        optimizer_shapes = tensor_shape_sums(optimizer_path)
         for shard in rank_manifest["shards"]:
             if shard["shard_name"] not in model_shapes:
                 raise SystemExit(f"{manifest_path} rank {rank} missing model shard {shard['shard_name']}")
@@ -145,10 +157,14 @@ def validate_tp_global_manifest(manifest_path, expected_global_step):
                 slot_name = shard[slot_key]
                 if slot_name not in optimizer_shapes:
                     raise SystemExit(f"{manifest_path} rank {rank} missing optimizer slot {slot_name}")
-                if optimizer_shapes[slot_name] != shard["shard_shape"]:
+                if optimizer_shapes[slot_name]["shape"] != shard["shard_shape"]:
                     raise SystemExit(
                         f"{manifest_path} rank {rank} optimizer slot {slot_name} shape "
-                        f"{optimizer_shapes[slot_name]} != {shard['shard_shape']}"
+                        f"{optimizer_shapes[slot_name]['shape']} != {shard['shard_shape']}"
+                    )
+                if shard["partition"] in {"tp_row", "tp_col"} and optimizer_shapes[slot_name]["abs_sum"] <= 0.0:
+                    raise SystemExit(
+                        f"{manifest_path} rank {rank} optimizer slot {slot_name} for {shard['name']} is all zero"
                     )
     return manifest
 
