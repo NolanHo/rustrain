@@ -161,6 +161,7 @@ pub(crate) struct QwenLoraSftTrainSummary {
     pub(crate) dataset_masked_positions: usize,
     pub(crate) dataset_max_sequence_tokens: usize,
     pub(crate) dataset_source_files: Vec<String>,
+    pub(crate) dataset_source_sample_counts: Vec<QwenSftSourceSampleCount>,
     pub(crate) dataset_fingerprint: String,
     pub(crate) dataset_order_seed: u64,
     pub(crate) data_cursor_start: usize,
@@ -245,6 +246,8 @@ struct QwenLoraSftAdapterManifest {
     #[serde(default)]
     dataset_source_files: Vec<String>,
     #[serde(default)]
+    dataset_source_sample_counts: Vec<QwenSftSourceSampleCount>,
+    #[serde(default)]
     dataset_fingerprint: String,
     dataset_order_seed: u64,
     dataset_total_samples: usize,
@@ -303,6 +306,7 @@ pub(crate) struct QwenFullTrainSmokeSummary {
     pub(crate) dataset_train_samples: Option<usize>,
     pub(crate) dataset_eval_samples: Option<usize>,
     pub(crate) dataset_source_files: Option<Vec<String>>,
+    pub(crate) dataset_source_sample_counts: Option<Vec<QwenSftSourceSampleCount>>,
     pub(crate) dataset_fingerprint: Option<String>,
     pub(crate) dataset_order_seed: Option<u64>,
     pub(crate) data_cursor_start: Option<usize>,
@@ -362,6 +366,7 @@ struct QwenSessionDpRankSummary {
     dataset_train_samples: Option<usize>,
     dataset_eval_samples: Option<usize>,
     dataset_source_files: Option<Vec<String>>,
+    dataset_source_sample_counts: Option<Vec<QwenSftSourceSampleCount>>,
     dataset_fingerprint: Option<String>,
     dataset_order_seed: Option<u64>,
     data_cursor_start: Option<usize>,
@@ -438,6 +443,8 @@ struct QwenSessionDpCheckpointManifest {
     #[serde(default)]
     dataset_source_files: Vec<String>,
     #[serde(default)]
+    dataset_source_sample_counts: Vec<QwenSftSourceSampleCount>,
+    #[serde(default)]
     dataset_fingerprint: String,
     learning_rate: f64,
     delta_safetensors: String,
@@ -474,6 +481,7 @@ impl QwenSessionDpCheckpointManifest {
             data_sample_offset_end: self.data_sample_offset_end,
             data_sample_offset_next: self.data_sample_offset_next,
             dataset_source_files: self.dataset_source_files.clone(),
+            dataset_source_sample_counts: self.dataset_source_sample_counts.clone(),
             dataset_fingerprint: self.dataset_fingerprint.clone(),
             learning_rate: self.learning_rate,
             initial_loss: self.expected_loss,
@@ -518,8 +526,31 @@ impl QwenShardedCheckpointManifest {
             {
                 bail!("Qwen sharded checkpoint dataset_source_files must only contain JSONL paths");
             }
+            if !self.dataset_source_sample_counts.is_empty() {
+                let count_paths = self
+                    .dataset_source_sample_counts
+                    .iter()
+                    .map(|entry| entry.path.clone())
+                    .collect::<Vec<_>>();
+                if count_paths != self.dataset_source_files {
+                    bail!(
+                        "Qwen sharded checkpoint dataset_source_sample_counts must match dataset_source_files"
+                    );
+                }
+                if self
+                    .dataset_source_sample_counts
+                    .iter()
+                    .any(|entry| entry.samples == 0)
+                {
+                    bail!("Qwen sharded checkpoint dataset_source_sample_counts must be positive");
+                }
+            }
         } else if !self.dataset_source_files.is_empty() {
             bail!("Qwen sharded checkpoint dataset_source_files require dataset_fingerprint");
+        } else if !self.dataset_source_sample_counts.is_empty() {
+            bail!(
+                "Qwen sharded checkpoint dataset_source_sample_counts require dataset_fingerprint"
+            );
         }
         if let Some(data_cursor_next) = self.data_cursor_next {
             if data_cursor_next != self.consumed_samples {
@@ -762,6 +793,8 @@ struct QwenDeltaCheckpointManifest {
     #[serde(default)]
     dataset_source_files: Vec<String>,
     #[serde(default)]
+    dataset_source_sample_counts: Vec<QwenSftSourceSampleCount>,
+    #[serde(default)]
     dataset_fingerprint: String,
     learning_rate: f64,
     initial_loss: f64,
@@ -802,6 +835,8 @@ struct QwenShardedCheckpointManifest {
     data_train_samples: Option<u64>,
     #[serde(default)]
     dataset_source_files: Vec<String>,
+    #[serde(default)]
+    dataset_source_sample_counts: Vec<QwenSftSourceSampleCount>,
     #[serde(default)]
     dataset_fingerprint: String,
     seed: u64,
@@ -901,6 +936,7 @@ struct QwenSessionBatchPlan {
     dataset_train_samples: Option<usize>,
     dataset_eval_samples: Option<usize>,
     dataset_source_files: Option<Vec<String>>,
+    dataset_source_sample_counts: Option<Vec<QwenSftSourceSampleCount>>,
     dataset_fingerprint: Option<String>,
     dataset_order_seed: Option<u64>,
     train_sample_count: Option<usize>,
@@ -922,6 +958,7 @@ struct QwenSessionDpBatchPlan {
     dataset_train_samples: Option<usize>,
     dataset_eval_samples: Option<usize>,
     dataset_source_files: Option<Vec<String>>,
+    dataset_source_sample_counts: Option<Vec<QwenSftSourceSampleCount>>,
     dataset_fingerprint: Option<String>,
     dataset_order_seed: Option<u64>,
     train_sample_count: Option<usize>,
@@ -998,6 +1035,7 @@ struct QwenSftExample {
 struct QwenSftExampleSet {
     examples: Vec<QwenSftExample>,
     source_files: Vec<String>,
+    source_sample_counts: Vec<QwenSftSourceSampleCount>,
     fingerprint: String,
 }
 
@@ -1015,6 +1053,7 @@ struct QwenSftDataset {
     pad_token_id: i64,
     epoch_shuffle_seed: Option<u64>,
     source_files: Vec<String>,
+    source_sample_counts: Vec<QwenSftSourceSampleCount>,
     fingerprint: String,
 }
 
@@ -1035,7 +1074,14 @@ struct QwenSftDatasetSummary {
     masked_positions: usize,
     max_sequence_tokens: usize,
     source_files: Vec<String>,
+    source_sample_counts: Vec<QwenSftSourceSampleCount>,
     fingerprint: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct QwenSftSourceSampleCount {
+    pub(crate) path: String,
+    pub(crate) samples: usize,
 }
 
 #[derive(Clone)]
@@ -1797,6 +1843,7 @@ fn qwen_lora_sft_train(
     if let Some(manifest) = resume_manifest.as_ref() {
         qwen_validate_sft_resume_dataset(
             &manifest.dataset_source_files,
+            &manifest.dataset_source_sample_counts,
             &manifest.dataset_fingerprint,
             &dataset_summary,
             "Qwen LoRA SFT adapter resume",
@@ -2035,6 +2082,7 @@ fn qwen_lora_sft_train(
         data_sample_offset_end,
         data_sample_offset_next,
         dataset_source_files: dataset_summary.source_files.clone(),
+        dataset_source_sample_counts: dataset_summary.source_sample_counts.clone(),
         dataset_fingerprint: dataset_summary.fingerprint.clone(),
         dataset_order_seed: policy.dataset_order_seed,
         dataset_total_samples: dataset_summary.samples,
@@ -2188,6 +2236,7 @@ fn qwen_lora_sft_train(
         dataset_masked_positions: dataset_summary.masked_positions,
         dataset_max_sequence_tokens: dataset_summary.max_sequence_tokens,
         dataset_source_files: dataset_summary.source_files,
+        dataset_source_sample_counts: dataset_summary.source_sample_counts,
         dataset_fingerprint: dataset_summary.fingerprint,
         dataset_order_seed: policy.dataset_order_seed,
         data_cursor_start,
@@ -2435,6 +2484,7 @@ fn qwen_full_train_summary(
         data_sample_offset_end: None,
         data_sample_offset_next: None,
         dataset_source_files: Vec::new(),
+        dataset_source_sample_counts: Vec::new(),
         dataset_fingerprint: String::new(),
         learning_rate,
         initial_loss,
@@ -2506,6 +2556,7 @@ fn qwen_full_train_summary(
         dataset_train_samples: None,
         dataset_eval_samples: None,
         dataset_source_files: None,
+        dataset_source_sample_counts: None,
         dataset_fingerprint: None,
         dataset_order_seed: None,
         data_cursor_start: None,
@@ -2583,8 +2634,10 @@ fn qwen_session_single_summary(
     if let Some(manifest) = loaded_manifest.as_ref() {
         qwen_validate_optional_sft_resume_dataset(
             &manifest.dataset_source_files,
+            &manifest.dataset_source_sample_counts,
             &manifest.dataset_fingerprint,
             batch_plan.dataset_source_files.as_deref(),
+            batch_plan.dataset_source_sample_counts.as_deref(),
             batch_plan.dataset_fingerprint.as_deref(),
             "Qwen session checkpoint resume",
         )?;
@@ -2704,6 +2757,10 @@ fn qwen_session_single_summary(
         data_sample_offset_end: batch_plan.data_sample_offset_end,
         data_sample_offset_next: batch_plan.data_sample_offset_next,
         dataset_source_files: batch_plan.dataset_source_files.clone().unwrap_or_default(),
+        dataset_source_sample_counts: batch_plan
+            .dataset_source_sample_counts
+            .clone()
+            .unwrap_or_default(),
         dataset_fingerprint: batch_plan.dataset_fingerprint.clone().unwrap_or_default(),
         learning_rate,
         initial_loss,
@@ -2770,6 +2827,7 @@ fn qwen_session_single_summary(
         dataset_train_samples: batch_plan.dataset_train_samples,
         dataset_eval_samples: batch_plan.dataset_eval_samples,
         dataset_source_files: batch_plan.dataset_source_files,
+        dataset_source_sample_counts: batch_plan.dataset_source_sample_counts,
         dataset_fingerprint: batch_plan.dataset_fingerprint,
         dataset_order_seed: batch_plan.dataset_order_seed,
         data_cursor_start: batch_plan.train_sample_count.map(|_| data_cursor_start),
@@ -3082,8 +3140,10 @@ pub fn qwen_session_dp_rank_smoke(
     if let Some(manifest) = loaded_manifest.as_ref() {
         qwen_validate_optional_sft_resume_dataset(
             &manifest.dataset_source_files,
+            &manifest.dataset_source_sample_counts,
             &manifest.dataset_fingerprint,
             batch_plan.dataset_source_files.as_deref(),
+            batch_plan.dataset_source_sample_counts.as_deref(),
             batch_plan.dataset_fingerprint.as_deref(),
             "Qwen session DP external checkpoint resume",
         )?;
@@ -3303,6 +3363,10 @@ pub fn qwen_session_dp_rank_smoke(
             data_sample_offset_end: batch_plan.data_sample_offset_end,
             data_sample_offset_next: batch_plan.data_sample_offset_next,
             dataset_source_files: batch_plan.dataset_source_files.clone().unwrap_or_default(),
+            dataset_source_sample_counts: batch_plan
+                .dataset_source_sample_counts
+                .clone()
+                .unwrap_or_default(),
             dataset_fingerprint: batch_plan.dataset_fingerprint.clone().unwrap_or_default(),
             learning_rate,
             delta_safetensors: delta_output.display().to_string(),
@@ -3335,8 +3399,10 @@ pub fn qwen_session_dp_rank_smoke(
             .with_context(|| format!("failed to parse {}", checkpoint_path.display()))?;
     qwen_validate_optional_sft_resume_dataset(
         &checkpoint_manifest.dataset_source_files,
+        &checkpoint_manifest.dataset_source_sample_counts,
         &checkpoint_manifest.dataset_fingerprint,
         batch_plan.dataset_source_files.as_deref(),
+        batch_plan.dataset_source_sample_counts.as_deref(),
         batch_plan.dataset_fingerprint.as_deref(),
         "Qwen session DP rank0 checkpoint resume",
     )?;
@@ -3453,6 +3519,10 @@ pub fn qwen_session_dp_rank_smoke(
             batch_plan.data_sample_offset_next,
             batch_plan.train_sample_count,
             batch_plan.dataset_source_files.as_deref().unwrap_or(&[]),
+            batch_plan
+                .dataset_source_sample_counts
+                .as_deref()
+                .unwrap_or(&[]),
             batch_plan.dataset_fingerprint.as_deref().unwrap_or(""),
             &sharded_global_manifest_output,
         )?;
@@ -3480,8 +3550,10 @@ pub fn qwen_session_dp_rank_smoke(
     sharded_global_manifest.validate()?;
     qwen_validate_optional_sft_resume_dataset(
         &sharded_global_manifest.dataset_source_files,
+        &sharded_global_manifest.dataset_source_sample_counts,
         &sharded_global_manifest.dataset_fingerprint,
         batch_plan.dataset_source_files.as_deref(),
+        batch_plan.dataset_source_sample_counts.as_deref(),
         batch_plan.dataset_fingerprint.as_deref(),
         "Qwen session DP sharded checkpoint resume",
     )?;
@@ -3561,6 +3633,7 @@ pub fn qwen_session_dp_rank_smoke(
         dataset_train_samples: batch_plan.dataset_train_samples,
         dataset_eval_samples: batch_plan.dataset_eval_samples,
         dataset_source_files: batch_plan.dataset_source_files,
+        dataset_source_sample_counts: batch_plan.dataset_source_sample_counts,
         dataset_fingerprint: batch_plan.dataset_fingerprint,
         dataset_order_seed: batch_plan.dataset_order_seed,
         data_cursor_start: batch_plan.train_sample_count.map(|_| data_cursor_start),
@@ -3720,6 +3793,7 @@ fn write_qwen_session_dp_global_sharded_manifest(
     data_sample_offset_next: Option<usize>,
     data_train_samples: Option<usize>,
     dataset_source_files: &[String],
+    dataset_source_sample_counts: &[QwenSftSourceSampleCount],
     dataset_fingerprint: &str,
     manifest_output: &Path,
 ) -> Result<()> {
@@ -3751,6 +3825,7 @@ fn write_qwen_session_dp_global_sharded_manifest(
         data_sample_offset_next: data_sample_offset_next.map(|value| value as u64),
         data_train_samples: data_train_samples.map(|value| value as u64),
         dataset_source_files: dataset_source_files.to_vec(),
+        dataset_source_sample_counts: dataset_source_sample_counts.to_vec(),
         dataset_fingerprint: dataset_fingerprint.to_string(),
         seed: 42,
         dtype: dtype.label().to_string(),
@@ -3812,6 +3887,7 @@ fn qwen_sharded_rank_to_delta_manifest(
             .map(|value| usize::try_from(value).context("data_sample_offset_next overflowed usize"))
             .transpose()?,
         dataset_source_files: manifest.dataset_source_files.clone(),
+        dataset_source_sample_counts: manifest.dataset_source_sample_counts.clone(),
         dataset_fingerprint: manifest.dataset_fingerprint.clone(),
         learning_rate,
         initial_loss,
@@ -4800,6 +4876,7 @@ fn qwen_session_fixed_batch_plan(
         dataset_train_samples: None,
         dataset_eval_samples: None,
         dataset_source_files: None,
+        dataset_source_sample_counts: None,
         dataset_fingerprint: None,
         dataset_order_seed: None,
         train_sample_count: None,
@@ -4871,6 +4948,7 @@ fn qwen_session_batch_plan_from_config(
         dataset_train_samples: Some(train_dataset.len()),
         dataset_eval_samples: Some(eval_dataset.len()),
         dataset_source_files: Some(dataset_summary.source_files),
+        dataset_source_sample_counts: Some(dataset_summary.source_sample_counts),
         dataset_fingerprint: Some(dataset_summary.fingerprint),
         dataset_order_seed: Some(runtime_config.run.seed),
         train_sample_count: Some(train_dataset.len()),
@@ -4901,6 +4979,7 @@ fn qwen_session_fixed_dp_batch_plan(
         dataset_train_samples: None,
         dataset_eval_samples: None,
         dataset_source_files: None,
+        dataset_source_sample_counts: None,
         dataset_fingerprint: None,
         dataset_order_seed: None,
         train_sample_count: None,
@@ -4974,6 +5053,7 @@ fn qwen_session_dp_batch_plan_from_config(
         dataset_train_samples: Some(train_dataset.len()),
         dataset_eval_samples: Some(eval_dataset.len()),
         dataset_source_files: Some(dataset_summary.source_files),
+        dataset_source_sample_counts: Some(dataset_summary.source_sample_counts),
         dataset_fingerprint: Some(dataset_summary.fingerprint),
         dataset_order_seed: Some(runtime_config.run.seed),
         train_sample_count: Some(train_dataset.len()),
@@ -6218,6 +6298,7 @@ impl QwenSftDataset {
             pad_token_id: qwen_pad_token_id(tokenizer),
             epoch_shuffle_seed: None,
             source_files: Vec::new(),
+            source_sample_counts: Vec::new(),
             fingerprint: qwen_sft_dataset_fingerprint(&[], examples),
         })
     }
@@ -6237,6 +6318,7 @@ impl QwenSftDataset {
             pad_token_id: qwen_pad_token_id(tokenizer),
             epoch_shuffle_seed: None,
             source_files: example_set.source_files,
+            source_sample_counts: example_set.source_sample_counts,
             fingerprint: example_set.fingerprint,
         })
     }
@@ -6256,6 +6338,7 @@ impl QwenSftDataset {
                 pad_token_id: self.pad_token_id,
                 epoch_shuffle_seed: self.epoch_shuffle_seed,
                 source_files: self.source_files.clone(),
+                source_sample_counts: self.source_sample_counts.clone(),
                 fingerprint: self.fingerprint.clone(),
             },
             Self {
@@ -6263,6 +6346,7 @@ impl QwenSftDataset {
                 pad_token_id: self.pad_token_id,
                 epoch_shuffle_seed: self.epoch_shuffle_seed,
                 source_files: self.source_files.clone(),
+                source_sample_counts: self.source_sample_counts.clone(),
                 fingerprint: self.fingerprint.clone(),
             },
         ))
@@ -6300,6 +6384,7 @@ impl QwenSftDataset {
                 .max()
                 .unwrap_or(0),
             source_files: self.source_files.clone(),
+            source_sample_counts: self.source_sample_counts.clone(),
             fingerprint: self.fingerprint.clone(),
         }
     }
@@ -6357,16 +6442,25 @@ fn qwen_sft_examples_from_jsonl_paths(paths: &[PathBuf]) -> Result<QwenSftExampl
     }
     let mut examples = Vec::new();
     let mut source_files = BTreeSet::new();
+    let mut source_sample_counts = BTreeMap::new();
     for path in paths {
         let example_set = qwen_sft_examples_from_jsonl_path(path)?;
         examples.extend(example_set.examples);
         source_files.extend(example_set.source_files);
+        for source_count in example_set.source_sample_counts {
+            *source_sample_counts.entry(source_count.path).or_insert(0) += source_count.samples;
+        }
     }
     let source_files = source_files.into_iter().collect::<Vec<_>>();
+    let source_sample_counts = source_sample_counts
+        .into_iter()
+        .map(|(path, samples)| QwenSftSourceSampleCount { path, samples })
+        .collect::<Vec<_>>();
     let fingerprint = qwen_sft_dataset_fingerprint(&source_files, &examples);
     Ok(QwenSftExampleSet {
         examples,
         source_files,
+        source_sample_counts,
         fingerprint,
     })
 }
@@ -6379,9 +6473,11 @@ fn qwen_sft_examples_from_jsonl_path(path: &Path) -> Result<QwenSftExampleSet> {
     }
 
     let mut examples = Vec::new();
+    let mut source_sample_counts = Vec::new();
     for file in &files {
         let contents = fs::read_to_string(&file)
             .with_context(|| format!("failed to read {}", file.display()))?;
+        let before = examples.len();
         for (line_index, line) in contents.lines().enumerate() {
             if line.trim().is_empty() {
                 continue;
@@ -6399,6 +6495,10 @@ fn qwen_sft_examples_from_jsonl_path(path: &Path) -> Result<QwenSftExampleSet> {
                 response: record.response,
             });
         }
+        source_sample_counts.push(QwenSftSourceSampleCount {
+            path: file.display().to_string(),
+            samples: examples.len() - before,
+        });
     }
 
     if examples.is_empty() {
@@ -6412,6 +6512,7 @@ fn qwen_sft_examples_from_jsonl_path(path: &Path) -> Result<QwenSftExampleSet> {
     Ok(QwenSftExampleSet {
         examples,
         source_files,
+        source_sample_counts,
         fingerprint,
     })
 }
@@ -6467,14 +6568,17 @@ fn qwen_sft_hash_bytes(hash: &mut u64, bytes: &[u8]) {
 
 fn qwen_validate_sft_resume_dataset(
     manifest_source_files: &[String],
+    manifest_source_sample_counts: &[QwenSftSourceSampleCount],
     manifest_fingerprint: &str,
     dataset_summary: &QwenSftDatasetSummary,
     context: &str,
 ) -> Result<()> {
     qwen_validate_optional_sft_resume_dataset(
         manifest_source_files,
+        manifest_source_sample_counts,
         manifest_fingerprint,
         Some(&dataset_summary.source_files),
+        Some(&dataset_summary.source_sample_counts),
         Some(&dataset_summary.fingerprint),
         context,
     )
@@ -6482,12 +6586,17 @@ fn qwen_validate_sft_resume_dataset(
 
 fn qwen_validate_optional_sft_resume_dataset(
     manifest_source_files: &[String],
+    manifest_source_sample_counts: &[QwenSftSourceSampleCount],
     manifest_fingerprint: &str,
     dataset_source_files: Option<&[String]>,
+    dataset_source_sample_counts: Option<&[QwenSftSourceSampleCount]>,
     dataset_fingerprint: Option<&str>,
     context: &str,
 ) -> Result<()> {
-    if manifest_fingerprint.is_empty() && manifest_source_files.is_empty() {
+    if manifest_fingerprint.is_empty()
+        && manifest_source_files.is_empty()
+        && manifest_source_sample_counts.is_empty()
+    {
         return Ok(());
     }
     let Some(dataset_fingerprint) = dataset_fingerprint else {
@@ -6508,6 +6617,16 @@ fn qwen_validate_optional_sft_resume_dataset(
         bail!(
             "{context} dataset source files mismatch: manifest={manifest_source_files:?}, current={dataset_source_files:?}"
         );
+    }
+    if !manifest_source_sample_counts.is_empty() {
+        let Some(dataset_source_sample_counts) = dataset_source_sample_counts else {
+            bail!("{context} manifest has dataset source sample counts but current run has none");
+        };
+        if manifest_source_sample_counts != dataset_source_sample_counts {
+            bail!(
+                "{context} dataset source sample counts mismatch: manifest={manifest_source_sample_counts:?}, current={dataset_source_sample_counts:?}"
+            );
+        }
     }
     Ok(())
 }
@@ -7072,6 +7191,7 @@ mod tests {
             data_sample_offset_end: None,
             data_sample_offset_next: None,
             dataset_source_files: Vec::new(),
+            dataset_source_sample_counts: Vec::new(),
             dataset_fingerprint: String::new(),
             learning_rate: 1e-6,
             initial_loss: 2.0,
@@ -7186,6 +7306,7 @@ mod tests {
             Some(2),
             Some(5),
             &manifest.dataset_source_files,
+            &manifest.dataset_source_sample_counts,
             &manifest.dataset_fingerprint,
             &output,
         )
@@ -7205,6 +7326,10 @@ mod tests {
         assert_eq!(decoded.data_sample_offset_next, Some(2));
         assert_eq!(decoded.data_train_samples, Some(5));
         assert_eq!(decoded.dataset_source_files, manifest.dataset_source_files);
+        assert_eq!(
+            decoded.dataset_source_sample_counts,
+            manifest.dataset_source_sample_counts
+        );
         assert_eq!(decoded.dataset_fingerprint, manifest.dataset_fingerprint);
         assert_eq!(decoded.ranks.len(), 2);
     }
@@ -7229,6 +7354,7 @@ mod tests {
     fn qwen_sharded_checkpoint_manifest_validates_dataset_provenance_shape() {
         let mut legacy_manifest = tiny_qwen_sharded_manifest();
         legacy_manifest.dataset_source_files.clear();
+        legacy_manifest.dataset_source_sample_counts.clear();
         legacy_manifest.dataset_fingerprint.clear();
         legacy_manifest
             .validate()
@@ -7257,6 +7383,25 @@ mod tests {
             .expect_err("non-jsonl source file should fail")
             .to_string();
         assert!(non_jsonl_source_error.contains("must only contain JSONL paths"));
+
+        let mut mismatched_counts = tiny_qwen_sharded_manifest();
+        mismatched_counts.dataset_source_sample_counts = vec![QwenSftSourceSampleCount {
+            path: "data/other.jsonl".to_string(),
+            samples: 5,
+        }];
+        let mismatched_counts_error = mismatched_counts
+            .validate()
+            .expect_err("mismatched source sample count paths should fail")
+            .to_string();
+        assert!(mismatched_counts_error.contains("dataset_source_sample_counts must match"));
+
+        let mut zero_count = tiny_qwen_sharded_manifest();
+        zero_count.dataset_source_sample_counts[0].samples = 0;
+        let zero_count_error = zero_count
+            .validate()
+            .expect_err("zero source sample count should fail")
+            .to_string();
+        assert!(zero_count_error.contains("dataset_source_sample_counts must be positive"));
     }
 
     #[test]
@@ -7269,21 +7414,24 @@ mod tests {
             masked_positions: 10,
             max_sequence_tokens: 8,
             source_files: manifest.dataset_source_files.clone(),
+            source_sample_counts: manifest.dataset_source_sample_counts.clone(),
             fingerprint: manifest.dataset_fingerprint.clone(),
         };
 
         qwen_validate_sft_resume_dataset(
             &manifest.dataset_source_files,
+            &manifest.dataset_source_sample_counts,
             &manifest.dataset_fingerprint,
             &summary,
             "sharded resume",
         )
         .expect("matching sharded provenance should pass");
-        qwen_validate_sft_resume_dataset(&[], "", &summary, "legacy sharded resume")
+        qwen_validate_sft_resume_dataset(&[], &[], "", &summary, "legacy sharded resume")
             .expect("legacy sharded manifests without provenance should pass");
 
         let fingerprint_error = qwen_validate_sft_resume_dataset(
             &manifest.dataset_source_files,
+            &manifest.dataset_source_sample_counts,
             "changed-fingerprint",
             &summary,
             "sharded resume",
@@ -7294,6 +7442,7 @@ mod tests {
 
         let source_error = qwen_validate_sft_resume_dataset(
             &["data/changed.jsonl".to_string()],
+            &manifest.dataset_source_sample_counts,
             &manifest.dataset_fingerprint,
             &summary,
             "sharded resume",
@@ -7462,6 +7611,7 @@ mod tests {
             data_sample_offset_end: None,
             data_sample_offset_next: None,
             dataset_source_files: Vec::new(),
+            dataset_source_sample_counts: Vec::new(),
             dataset_fingerprint: String::new(),
             learning_rate,
             initial_loss,
@@ -7579,6 +7729,7 @@ mod tests {
             data_sample_offset_end: None,
             data_sample_offset_next: None,
             dataset_source_files: Vec::new(),
+            dataset_source_sample_counts: Vec::new(),
             dataset_fingerprint: String::new(),
             learning_rate,
             initial_loss: first_step.loss_before,
@@ -8107,6 +8258,7 @@ mod tests {
             pad_token_id: 0,
             epoch_shuffle_seed: None,
             source_files: Vec::new(),
+            source_sample_counts: Vec::new(),
             fingerprint: String::new(),
         };
 
@@ -8148,6 +8300,7 @@ mod tests {
             pad_token_id: 0,
             epoch_shuffle_seed: None,
             source_files: Vec::new(),
+            source_sample_counts: Vec::new(),
             fingerprint: String::new(),
         };
 
@@ -8184,6 +8337,7 @@ mod tests {
             pad_token_id: 0,
             epoch_shuffle_seed: None,
             source_files: Vec::new(),
+            source_sample_counts: Vec::new(),
             fingerprint: String::new(),
         };
 
@@ -8231,6 +8385,7 @@ mod tests {
             pad_token_id: 0,
             epoch_shuffle_seed: None,
             source_files: Vec::new(),
+            source_sample_counts: Vec::new(),
             fingerprint: String::new(),
         }
         .shuffle_by_seed(777);
@@ -8319,6 +8474,13 @@ mod tests {
 
         assert_eq!(examples.len(), 2);
         assert_eq!(example_set.source_files, vec![jsonl.display().to_string()]);
+        assert_eq!(
+            example_set.source_sample_counts,
+            vec![QwenSftSourceSampleCount {
+                path: jsonl.display().to_string(),
+                samples: 2,
+            }]
+        );
         assert!(!example_set.fingerprint.is_empty());
         assert_eq!(examples[0].instruction, "Reply with the project name.");
         assert_eq!(examples[0].input, "");
@@ -8337,21 +8499,27 @@ mod tests {
             masked_positions: 2,
             max_sequence_tokens: 4,
             source_files: vec!["data/train.jsonl".to_string()],
+            source_sample_counts: vec![QwenSftSourceSampleCount {
+                path: "data/train.jsonl".to_string(),
+                samples: 2,
+            }],
             fingerprint: "fingerprint-a".to_string(),
         };
 
         qwen_validate_sft_resume_dataset(
             &summary.source_files,
+            &summary.source_sample_counts,
             &summary.fingerprint,
             &summary,
             "test resume",
         )
         .expect("matching provenance should pass");
-        qwen_validate_sft_resume_dataset(&[], "", &summary, "legacy resume")
+        qwen_validate_sft_resume_dataset(&[], &[], "", &summary, "legacy resume")
             .expect("legacy manifests without provenance should pass");
 
         let fingerprint_error = qwen_validate_sft_resume_dataset(
             &summary.source_files,
+            &summary.source_sample_counts,
             "fingerprint-b",
             &summary,
             "test resume",
@@ -8362,6 +8530,7 @@ mod tests {
 
         let source_error = qwen_validate_sft_resume_dataset(
             &["data/other.jsonl".to_string()],
+            &summary.source_sample_counts,
             &summary.fingerprint,
             &summary,
             "test resume",
@@ -8369,6 +8538,20 @@ mod tests {
         .expect_err("changed source files should fail")
         .to_string();
         assert!(source_error.contains("dataset source files mismatch"));
+
+        let count_error = qwen_validate_sft_resume_dataset(
+            &summary.source_files,
+            &[QwenSftSourceSampleCount {
+                path: "data/train.jsonl".to_string(),
+                samples: 3,
+            }],
+            &summary.fingerprint,
+            &summary,
+            "test resume",
+        )
+        .expect_err("changed source sample counts should fail")
+        .to_string();
+        assert!(count_error.contains("dataset source sample counts mismatch"));
     }
 
     #[test]
@@ -8411,6 +8594,23 @@ mod tests {
 
         assert_eq!(examples.len(), 3);
         assert_eq!(example_set.source_files.len(), 3);
+        assert_eq!(
+            example_set.source_sample_counts,
+            vec![
+                QwenSftSourceSampleCount {
+                    path: first.display().to_string(),
+                    samples: 1,
+                },
+                QwenSftSourceSampleCount {
+                    path: third.display().to_string(),
+                    samples: 1,
+                },
+                QwenSftSourceSampleCount {
+                    path: second.display().to_string(),
+                    samples: 1,
+                },
+            ]
+        );
         assert!(
             example_set
                 .source_files
@@ -8467,6 +8667,10 @@ mod tests {
             data_sample_offset_next: Some(3),
             data_train_samples: Some(5),
             dataset_source_files: vec!["data/train.jsonl".to_string()],
+            dataset_source_sample_counts: vec![QwenSftSourceSampleCount {
+                path: "data/train.jsonl".to_string(),
+                samples: 5,
+            }],
             dataset_fingerprint: "abc123".to_string(),
             seed: 42,
             dtype: "float32".to_string(),

@@ -143,6 +143,7 @@ pub fn train(config_path: &Path, resume_from: Option<PathBuf>) -> Result<()> {
                 dataset_train_samples = summary.dataset_train_samples,
                 dataset_eval_samples = summary.dataset_eval_samples,
                 dataset_source_files = ?summary.dataset_source_files,
+                dataset_source_sample_counts = ?summary.dataset_source_sample_counts,
                 dataset_fingerprint = ?summary.dataset_fingerprint,
                 dataset_order_seed = summary.dataset_order_seed,
                 data_cursor_start = summary.data_cursor_start,
@@ -195,6 +196,9 @@ pub fn train(config_path: &Path, resume_from: Option<PathBuf>) -> Result<()> {
             }
             if let Some(dataset_source_files) = &summary.dataset_source_files {
                 println!("dataset_source_files: {dataset_source_files:?}");
+            }
+            if let Some(dataset_source_sample_counts) = &summary.dataset_source_sample_counts {
+                println!("dataset_source_sample_counts: {dataset_source_sample_counts:?}");
             }
             if let Some(dataset_fingerprint) = &summary.dataset_fingerprint {
                 println!("dataset_fingerprint: {dataset_fingerprint}");
@@ -304,6 +308,7 @@ pub fn train(config_path: &Path, resume_from: Option<PathBuf>) -> Result<()> {
             dataset_masked_positions = summary.dataset_masked_positions,
             dataset_max_sequence_tokens = summary.dataset_max_sequence_tokens,
             dataset_source_files = ?summary.dataset_source_files,
+            dataset_source_sample_counts = ?summary.dataset_source_sample_counts,
             dataset_fingerprint = summary.dataset_fingerprint,
             dataset_order_seed = summary.dataset_order_seed,
             data_cursor_start = summary.data_cursor_start,
@@ -358,6 +363,10 @@ pub fn train(config_path: &Path, resume_from: Option<PathBuf>) -> Result<()> {
             summary.dataset_max_sequence_tokens
         );
         println!("dataset_source_files: {:?}", summary.dataset_source_files);
+        println!(
+            "dataset_source_sample_counts: {:?}",
+            summary.dataset_source_sample_counts
+        );
         println!("dataset_fingerprint: {}", summary.dataset_fingerprint);
         println!("dataset_order_seed: {}", summary.dataset_order_seed);
         println!("data_cursor_start: {}", summary.data_cursor_start);
