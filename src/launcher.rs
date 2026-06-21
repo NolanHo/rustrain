@@ -22,6 +22,8 @@ struct RankSummary {
     rank: usize,
     local_rank: usize,
     world_size: usize,
+    assigned_cuda_visible_device: Option<String>,
+    assigned_cuda_device_ordinal: Option<usize>,
     status_code: Option<i32>,
     timed_out: bool,
     log_path: String,
@@ -36,6 +38,8 @@ pub struct LaunchEnvSummary {
     pub master_addr: String,
     pub master_port: u16,
     pub cuda_visible_devices: Option<String>,
+    pub assigned_cuda_visible_device: Option<String>,
+    pub assigned_cuda_device_ordinal: Option<usize>,
 }
 
 pub fn launch(
@@ -58,6 +62,9 @@ pub fn launch(
         .with_context(|| format!("failed to create {}", output_dir.display()))?;
     let current_exe = std::env::current_exe().context("failed to locate current executable")?;
     let timeout = launch_timeout()?;
+    let visible_cuda_devices =
+        parse_visible_cuda_devices(std::env::var("CUDA_VISIBLE_DEVICES").ok());
+    validate_visible_cuda_devices(nproc_per_node, visible_cuda_devices.as_deref())?;
 
     let mut children = Vec::with_capacity(nproc_per_node);
     for rank in 0..nproc_per_node {
@@ -80,6 +87,14 @@ pub fn launch(
             .env("RUSTRAIN_LAUNCH_OUTPUT_DIR", output_dir)
             .stdout(Stdio::from(log_file))
             .stderr(Stdio::from(err_file));
+        if let Some(assigned_device) = visible_cuda_devices
+            .as_ref()
+            .and_then(|devices| devices.get(rank))
+        {
+            child
+                .env("RUSTRAIN_ASSIGNED_CUDA_VISIBLE_DEVICE", assigned_device)
+                .env("RUSTRAIN_ASSIGNED_CUDA_DEVICE_ORDINAL", rank.to_string());
+        }
         children.push((
             rank,
             log_path,
@@ -100,6 +115,14 @@ pub fn launch(
             rank: wait_result.rank,
             local_rank: wait_result.rank,
             world_size: nproc_per_node,
+            assigned_cuda_visible_device: visible_cuda_devices
+                .as_ref()
+                .and_then(|devices| devices.get(wait_result.rank))
+                .cloned(),
+            assigned_cuda_device_ordinal: visible_cuda_devices
+                .as_ref()
+                .and_then(|devices| devices.get(wait_result.rank))
+                .map(|_| wait_result.rank),
             status_code: wait_result.status.and_then(|status| status.code()),
             timed_out: wait_result.timed_out,
             log_path: wait_result.log_path.display().to_string(),
@@ -147,7 +170,42 @@ fn read_launch_env() -> Result<LaunchEnvSummary> {
         master_addr: std::env::var("MASTER_ADDR").context("MASTER_ADDR is not set")?,
         master_port: parse_env_u16("MASTER_PORT")?,
         cuda_visible_devices: std::env::var("CUDA_VISIBLE_DEVICES").ok(),
+        assigned_cuda_visible_device: std::env::var("RUSTRAIN_ASSIGNED_CUDA_VISIBLE_DEVICE").ok(),
+        assigned_cuda_device_ordinal: std::env::var("RUSTRAIN_ASSIGNED_CUDA_DEVICE_ORDINAL")
+            .ok()
+            .map(|raw| {
+                raw.parse::<usize>()
+                    .with_context(|| "RUSTRAIN_ASSIGNED_CUDA_DEVICE_ORDINAL must be a usize")
+            })
+            .transpose()?,
     })
+}
+
+fn parse_visible_cuda_devices(raw: Option<String>) -> Option<Vec<String>> {
+    raw.map(|raw| {
+        raw.split(',')
+            .map(str::trim)
+            .filter(|device| !device.is_empty())
+            .map(ToOwned::to_owned)
+            .collect()
+    })
+}
+
+fn validate_visible_cuda_devices(
+    nproc_per_node: usize,
+    visible_cuda_devices: Option<&[String]>,
+) -> Result<()> {
+    let Some(visible_cuda_devices) = visible_cuda_devices else {
+        return Ok(());
+    };
+    if visible_cuda_devices.len() < nproc_per_node {
+        bail!(
+            "launch requested {nproc_per_node} local ranks but CUDA_VISIBLE_DEVICES exposes only {} device(s): {}",
+            visible_cuda_devices.len(),
+            visible_cuda_devices.join(",")
+        );
+    }
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -251,5 +309,25 @@ mod tests {
         let error = launch(2, temp.path(), "127.0.0.1", 29500, &[])
             .expect_err("empty command should be rejected");
         assert!(error.to_string().contains("requires a child command"));
+    }
+
+    #[test]
+    fn launch_parses_visible_cuda_devices() {
+        let devices = parse_visible_cuda_devices(Some("0, 2,GPU-abc".to_string()))
+            .expect("CUDA_VISIBLE_DEVICES should be parsed");
+        assert_eq!(devices, vec!["0", "2", "GPU-abc"]);
+    }
+
+    #[test]
+    fn launch_rejects_more_ranks_than_visible_cuda_devices() {
+        let devices = parse_visible_cuda_devices(Some("0".to_string()))
+            .expect("CUDA_VISIBLE_DEVICES should be parsed");
+        let error = validate_visible_cuda_devices(2, Some(&devices))
+            .expect_err("too many local ranks should be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("CUDA_VISIBLE_DEVICES exposes only 1 device")
+        );
     }
 }

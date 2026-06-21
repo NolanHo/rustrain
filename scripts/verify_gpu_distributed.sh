@@ -19,6 +19,8 @@ remote_run_2gpu() {
     "${SCRIPT_DIR}/gpu_run.sh" "$@"
 }
 
+remote_run_2gpu bash scripts/verify_launch_gpu_assignment_worker.sh
+
 remote_run_2gpu env \
   RUSTRAIN_LAUNCH_TIMEOUT_SECS=600 \
   RUSTRAIN_DISTRIBUTED_VERIFY_OUTPUT_DIR="${OUTPUT_DIR}" \

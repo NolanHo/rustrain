@@ -113,7 +113,10 @@ scripts/verify_gpu_distributed.sh
 
 The launcher sets `RANK`, `LOCAL_RANK`, `WORLD_SIZE`, `LOCAL_WORLD_SIZE`,
 `MASTER_ADDR`, and `MASTER_PORT`, captures rank-local logs, and writes a
-`launch-summary.json`. `scripts/gpu_run.sh` defaults to one Ray GPU; set
+`launch-summary.json`. When `CUDA_VISIBLE_DEVICES` is set, it rejects launches
+that request more local ranks than visible GPUs and records the assigned visible
+GPU token plus ordinal for each rank in both `launch-summary.json` and
+`print-launch-env`. `scripts/gpu_run.sh` defaults to one Ray GPU; set
 `RUSTRAIN_RAY_NUM_GPUS=2` for two-rank GPU collective smokes. Minimal NCCL f32
 all-reduce, toy DP gradient all-reduce, and `tch` autograd DP gradient smokes
 exist, including a `trainer::train` config path for tiny `tch` DP=2 and a
