@@ -5740,6 +5740,74 @@ mod tests {
     }
 
     #[test]
+    fn qwen_lora_full_layer_targets_affect_forward_and_merge() {
+        let config = QwenRuntimeConfig {
+            num_hidden_layers: 1,
+            num_attention_heads: 2,
+            num_key_value_heads: 1,
+            rms_norm_eps: 1e-6,
+            rope_theta: 10_000.0,
+        };
+        let weights = tiny_qwen_weights();
+        let lora_config = QwenLoraConfig::new(
+            vec![0],
+            vec![
+                QwenLoraTargetModule::QProj,
+                QwenLoraTargetModule::KProj,
+                QwenLoraTargetModule::VProj,
+                QwenLoraTargetModule::OProj,
+                QwenLoraTargetModule::GateProj,
+                QwenLoraTargetModule::UpProj,
+                QwenLoraTargetModule::DownProj,
+            ],
+            2,
+            8.0,
+        )
+        .expect("config should build");
+        let registry = QwenLoraRegistry::deterministic(&weights, &lora_config, false)
+            .expect("registry should build");
+        let input_ids = Tensor::from_slice(&[0_i64, 1, 2]).reshape([1, 3]);
+
+        for module in &lora_config.target_modules {
+            let weight =
+                tensor(&weights, &module.weight_name(0)).expect("base weight should exist");
+            assert_eq!(
+                registry
+                    .layer_adapter(0)
+                    .expect("layer adapter should exist")
+                    .delta(*module, Device::Cpu)
+                    .expect("delta should build")
+                    .size(),
+                weight.size()
+            );
+        }
+
+        let base_logits =
+            qwen_forward_from_ids(&input_ids, &weights, &config).expect("base forward should run");
+        let adapted_logits =
+            qwen_forward_from_ids_with_lora(&input_ids, &weights, &config, &registry)
+                .expect("LoRA forward should run");
+        assert!(
+            diff_stats(&adapted_logits, &base_logits)
+                .expect("adapter diff should compute")
+                .max_abs
+                > 0.0
+        );
+
+        let merged_weights = registry
+            .merge_into_weights(&weights)
+            .expect("LoRA weights should merge");
+        let merged_logits = qwen_forward_from_ids(&input_ids, &merged_weights, &config)
+            .expect("merged forward should run");
+        assert!(
+            diff_stats(&merged_logits, &adapted_logits)
+                .expect("merge diff should compute")
+                .max_abs
+                < 1e-8
+        );
+    }
+
+    #[test]
     fn qwen_sft_padded_batch_masks_padding_targets() {
         let samples = vec![
             QwenSftTokenSample {

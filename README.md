@@ -138,16 +138,16 @@ remain open.
   model/data/checkpoint trainer ownership remains open.
 - G6 trainer-level real SFT data now has a minimal Qwen LoRA SFT config path:
   `train --config configs/qwen_lora_sft.toml` loads tokenizer-backed
-  instruction JSONL batches, trains configured focused q/v LoRA targets, and
-  reloads the adapter. The trainer path now verifies the saved adapter through
+  instruction JSONL batches, trains configured attention and MLP LoRA targets,
+  and reloads the adapter. The trainer path now verifies the saved adapter through
   full-Qwen forward logits, greedy generation reload parity, and focused
   merge/unmerge parity. It also uses the trainer scheduler and grad clipping
   knobs, and logs `eval_every` step eval history. Production data loading and
   arbitrary-module LoRA injection are still open.
 - Real Qwen module-level LoRA now uses a target-layer/module registry for
-  focused attention `q_proj`/`v_proj`; trainer-owned full-model LoRA injection
-  is not done yet. The current Qwen LoRA SFT config exposes rank, alpha,
-  target layer, and q/v target modules for that focused path.
+  configured attention and MLP projection modules; trainer-owned full-model LoRA
+  injection is not done yet. The current Qwen LoRA SFT config exposes rank,
+  alpha, target layers, and target modules for that focused path.
 - KV-cache greedy parity and cached sampling parity are implemented; Python
   cached-generation parity is future work.
 - G4 launcher process management plus NCCL scalar, toy DP gradient, `tch`
