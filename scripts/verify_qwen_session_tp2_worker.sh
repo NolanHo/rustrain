@@ -41,6 +41,22 @@ for path in summaries:
         raise SystemExit(f"{path} attention_max_abs too large: {data['attention_max_abs']}")
     if float(data["mlp_max_abs"]) > 1e-5:
         raise SystemExit(f"{path} mlp_max_abs too large: {data['mlp_max_abs']}")
+    if not data.get("attention_train_loss_improved"):
+        raise SystemExit(
+            f"{path} expected attention train loss to improve, initial={data.get('attention_train_initial_loss')} final={data.get('attention_train_final_loss')}"
+        )
+    if float(data["attention_train_final_loss"]) >= float(data["attention_train_initial_loss"]):
+        raise SystemExit(
+            f"{path} attention train final loss {data['attention_train_final_loss']} is not below initial {data['attention_train_initial_loss']}"
+        )
+    for key in [
+        "attention_train_q_grad_norm",
+        "attention_train_k_grad_norm",
+        "attention_train_v_grad_norm",
+        "attention_train_o_grad_norm",
+    ]:
+        if float(data[key]) <= 0.0:
+            raise SystemExit(f"{path} expected positive {key}, got {data[key]}")
     if not data.get("mlp_train_loss_improved"):
         raise SystemExit(
             f"{path} expected MLP train loss to improve, initial={data.get('mlp_train_initial_loss')} final={data.get('mlp_train_final_loss')}"
@@ -69,6 +85,8 @@ for path in summaries:
             "mlp_intermediate": [data["mlp_intermediate_start"], data["mlp_intermediate_end"]],
             "attention_max_abs": data["attention_max_abs"],
             "mlp_max_abs": data["mlp_max_abs"],
+            "attention_train_initial_loss": data["attention_train_initial_loss"],
+            "attention_train_final_loss": data["attention_train_final_loss"],
             "mlp_train_initial_loss": data["mlp_train_initial_loss"],
             "mlp_train_final_loss": data["mlp_train_final_loss"],
         }

@@ -153,6 +153,14 @@ struct QwenSessionTpRankSummary {
     attention_reduced_output_shape: Vec<i64>,
     attention_max_abs: f64,
     attention_mean_abs: f64,
+    attention_train_initial_loss: f64,
+    attention_train_final_loss: f64,
+    attention_train_loss_improved: bool,
+    attention_train_learning_rate: f64,
+    attention_train_q_grad_norm: f64,
+    attention_train_k_grad_norm: f64,
+    attention_train_v_grad_norm: f64,
+    attention_train_o_grad_norm: f64,
     mlp_intermediate_start: i64,
     mlp_intermediate_end: i64,
     mlp_activation_shard_shape: Vec<i64>,
@@ -177,6 +185,16 @@ struct QwenTpAttentionContribution {
     q_heads_per_rank: i64,
     kv_head_start: i64,
     kv_heads_per_rank: i64,
+}
+
+struct QwenTpAttentionShardWeights<'a> {
+    q_proj: &'a Tensor,
+    q_bias: &'a Tensor,
+    k_proj: &'a Tensor,
+    k_bias: &'a Tensor,
+    v_proj: &'a Tensor,
+    v_bias: &'a Tensor,
+    o_proj: &'a Tensor,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1600,7 +1618,7 @@ pub fn qwen_sampling_smoke(
     top_p: f64,
     seed: u64,
 ) -> Result<()> {
-    let config = read_runtime_config(&model_path.join("config.json"))?;
+    let runtime_config = read_runtime_config(&model_path.join("config.json"))?;
     let weights = read_safetensors_map(&model_path.join("model.safetensors"))?;
     let reference = read_safetensors_map(reference_fixture)?;
     let input_ids = tensor(&reference, "input_ids")?.to_kind(Kind::Int64);
@@ -1608,7 +1626,7 @@ pub fn qwen_sampling_smoke(
     let generated = qwen_sample_generate(
         &input_ids,
         &weights,
-        &config,
+        &runtime_config,
         max_new_tokens,
         temperature,
         top_k,
@@ -1618,7 +1636,7 @@ pub fn qwen_sampling_smoke(
     let cached = qwen_sample_generate_with_cache(
         &input_ids,
         &weights,
-        &config,
+        &runtime_config,
         max_new_tokens,
         temperature,
         top_k,
@@ -3712,52 +3730,25 @@ fn qwen_tp_attention_contribution(
         .reshape([1, 9, hidden_size])
         .fmod(23.0)
         / 23.0;
-    let batch_size = input.size()[0];
-    let seq_len = input.size()[1];
-
-    let q_shard = input
-        .linear(
-            &q_proj.narrow(0, q_output_start, q_output_size),
-            Some(&q_bias.narrow(0, q_output_start, q_output_size)),
-        )
-        .reshape([batch_size, seq_len, q_heads_per_rank, head_dim])
-        .transpose(1, 2);
-    let k_shard = input
-        .linear(
-            &k_proj.narrow(0, kv_output_start, kv_output_size),
-            Some(&k_bias.narrow(0, kv_output_start, kv_output_size)),
-        )
-        .reshape([batch_size, seq_len, kv_heads_per_rank, head_dim])
-        .transpose(1, 2);
-    let v_shard = input
-        .linear(
-            &v_proj.narrow(0, kv_output_start, kv_output_size),
-            Some(&v_bias.narrow(0, kv_output_start, kv_output_size)),
-        )
-        .reshape([batch_size, seq_len, kv_heads_per_rank, head_dim])
-        .transpose(1, 2);
-
-    let (cos, sin) = rope_cos_sin(seq_len, head_dim, config.rope_theta, device);
-    let cos = cos.to_kind(input.kind());
-    let sin = sin.to_kind(input.kind());
-    let q_shard = apply_rotary(&q_shard, &cos, &sin);
-    let k_shard = apply_rotary(&k_shard, &cos, &sin);
-    let local_kv_repeat = q_heads_per_rank / kv_heads_per_rank;
-    let k_for_attention = repeat_kv(&k_shard, local_kv_repeat);
-    let v_for_attention = repeat_kv(&v_shard, local_kv_repeat);
-    let scores = q_shard.matmul(&k_for_attention.transpose(-2, -1)) / (head_dim as f64).sqrt();
-    let causal_mask = Tensor::ones([seq_len, seq_len], (Kind::Bool, device)).triu(1);
-    let scores = scores.masked_fill(&causal_mask, f64::NEG_INFINITY);
-    let probs = scores
-        .softmax(-1, Kind::Float)
-        .to_kind(v_for_attention.kind());
-    let context_shard = probs.matmul(&v_for_attention).transpose(1, 2).reshape([
-        batch_size,
-        seq_len,
+    let (context_shard, output_contribution) = qwen_tp_attention_shard_contribution(
+        &input,
+        QwenTpAttentionShardWeights {
+            q_proj: &q_proj,
+            q_bias: &q_bias,
+            k_proj: &k_proj,
+            k_bias: &k_bias,
+            v_proj: &v_proj,
+            v_bias: &v_bias,
+            o_proj: &o_proj,
+        },
+        &config,
+        q_output_start,
         q_output_size,
-    ]);
-    let output_contribution =
-        context_shard.linear::<&Tensor>(&o_proj.narrow(1, q_output_start, q_output_size), None);
+        kv_output_start,
+        kv_output_size,
+        q_heads_per_rank,
+        kv_heads_per_rank,
+    );
     let full_output = qwen_attention(
         &input, &q_proj, &q_bias, &k_proj, &k_bias, &v_proj, &v_bias, &o_proj, &config,
     );
@@ -3772,6 +3763,69 @@ fn qwen_tp_attention_contribution(
         kv_head_start,
         kv_heads_per_rank,
     })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn qwen_tp_attention_shard_contribution(
+    input: &Tensor,
+    weights: QwenTpAttentionShardWeights<'_>,
+    config: &QwenRuntimeConfig,
+    q_output_start: i64,
+    q_output_size: i64,
+    kv_output_start: i64,
+    kv_output_size: i64,
+    q_heads_per_rank: i64,
+    kv_heads_per_rank: i64,
+) -> (Tensor, Tensor) {
+    let batch_size = input.size()[0];
+    let seq_len = input.size()[1];
+    let hidden_size = input.size()[2];
+    let head_dim = hidden_size / config.num_attention_heads;
+    let q_shard = input
+        .linear(
+            &weights.q_proj.narrow(0, q_output_start, q_output_size),
+            Some(&weights.q_bias.narrow(0, q_output_start, q_output_size)),
+        )
+        .reshape([batch_size, seq_len, q_heads_per_rank, head_dim])
+        .transpose(1, 2);
+    let k_shard = input
+        .linear(
+            &weights.k_proj.narrow(0, kv_output_start, kv_output_size),
+            Some(&weights.k_bias.narrow(0, kv_output_start, kv_output_size)),
+        )
+        .reshape([batch_size, seq_len, kv_heads_per_rank, head_dim])
+        .transpose(1, 2);
+    let v_shard = input
+        .linear(
+            &weights.v_proj.narrow(0, kv_output_start, kv_output_size),
+            Some(&weights.v_bias.narrow(0, kv_output_start, kv_output_size)),
+        )
+        .reshape([batch_size, seq_len, kv_heads_per_rank, head_dim])
+        .transpose(1, 2);
+    let (cos, sin) = rope_cos_sin(seq_len, head_dim, config.rope_theta, input.device());
+    let cos = cos.to_kind(input.kind());
+    let sin = sin.to_kind(input.kind());
+    let q_shard = apply_rotary(&q_shard, &cos, &sin);
+    let k_shard = apply_rotary(&k_shard, &cos, &sin);
+    let local_kv_repeat = q_heads_per_rank / kv_heads_per_rank;
+    let k_for_attention = repeat_kv(&k_shard, local_kv_repeat);
+    let v_for_attention = repeat_kv(&v_shard, local_kv_repeat);
+    let scores = q_shard.matmul(&k_for_attention.transpose(-2, -1)) / (head_dim as f64).sqrt();
+    let causal_mask = Tensor::ones([seq_len, seq_len], (Kind::Bool, input.device())).triu(1);
+    let scores = scores.masked_fill(&causal_mask, f64::NEG_INFINITY);
+    let probs = scores
+        .softmax(-1, Kind::Float)
+        .to_kind(v_for_attention.kind());
+    let context_shard = probs.matmul(&v_for_attention).transpose(1, 2).reshape([
+        batch_size,
+        seq_len,
+        q_output_size,
+    ]);
+    let output_contribution = context_shard.linear::<&Tensor>(
+        &weights.o_proj.narrow(1, q_output_start, q_output_size),
+        None,
+    );
+    (context_shard, output_contribution)
 }
 
 pub fn qwen_tp_mlp_rank_smoke(model_path: &Path, output_dir: PathBuf) -> Result<()> {
@@ -5053,7 +5107,186 @@ fn qwen_session_tp_rank_smoke(
         );
     }
 
+    let runtime_config = read_runtime_config(&model_path.join("config.json"))?;
     let weights = read_safetensors_map(&model_path.join("model.safetensors"))?;
+    let q_proj_full = tensor(&weights, "model.layers.0.self_attn.q_proj.weight")?
+        .to_kind(Kind::Float)
+        .to_device(device);
+    let q_bias_full = tensor(&weights, "model.layers.0.self_attn.q_proj.bias")?
+        .to_kind(Kind::Float)
+        .to_device(device);
+    let k_proj_full = tensor(&weights, "model.layers.0.self_attn.k_proj.weight")?
+        .to_kind(Kind::Float)
+        .to_device(device);
+    let k_bias_full = tensor(&weights, "model.layers.0.self_attn.k_proj.bias")?
+        .to_kind(Kind::Float)
+        .to_device(device);
+    let v_proj_full = tensor(&weights, "model.layers.0.self_attn.v_proj.weight")?
+        .to_kind(Kind::Float)
+        .to_device(device);
+    let v_bias_full = tensor(&weights, "model.layers.0.self_attn.v_proj.bias")?
+        .to_kind(Kind::Float)
+        .to_device(device);
+    let o_proj_full = tensor(&weights, "model.layers.0.self_attn.o_proj.weight")?
+        .to_kind(Kind::Float)
+        .to_device(device);
+    let head_dim = q_proj_full.size()[1] / runtime_config.num_attention_heads;
+    let q_output_start = attention.q_head_start * head_dim;
+    let q_output_size = attention.q_heads_per_rank * head_dim;
+    let kv_output_start = attention.kv_head_start * head_dim;
+    let kv_output_size = attention.kv_heads_per_rank * head_dim;
+    let q_shard_base = q_proj_full.narrow(0, q_output_start, q_output_size);
+    let k_shard_base = k_proj_full.narrow(0, kv_output_start, kv_output_size);
+    let v_shard_base = v_proj_full.narrow(0, kv_output_start, kv_output_size);
+    let o_shard_base = o_proj_full.narrow(1, q_output_start, q_output_size);
+
+    let attention_target = (&attention.full_output * 0.5).detach();
+    let train_q = q_shard_base
+        .detach()
+        .shallow_clone()
+        .set_requires_grad(true);
+    let train_k = k_shard_base
+        .detach()
+        .shallow_clone()
+        .set_requires_grad(true);
+    let train_v = v_shard_base
+        .detach()
+        .shallow_clone()
+        .set_requires_grad(true);
+    let train_o = o_shard_base
+        .detach()
+        .shallow_clone()
+        .set_requires_grad(true);
+    let (attention_train_initial_loss, attention_output_grad) =
+        qwen_session_tp_attention_global_mse_loss_and_grad(
+            &attention.input,
+            QwenTpAttentionShardWeights {
+                q_proj: &train_q,
+                q_bias: &q_bias_full.narrow(0, q_output_start, q_output_size),
+                k_proj: &train_k,
+                k_bias: &k_bias_full.narrow(0, kv_output_start, kv_output_size),
+                v_proj: &train_v,
+                v_bias: &v_bias_full.narrow(0, kv_output_start, kv_output_size),
+                o_proj: &train_o,
+            },
+            &runtime_config,
+            0,
+            q_output_size,
+            0,
+            kv_output_size,
+            attention.q_heads_per_rank,
+            attention.kv_heads_per_rank,
+            &attention_target,
+            &output_dir.join("attention-train-initial-output"),
+        )?;
+    let attention_local_contribution = qwen_tp_attention_shard_contribution(
+        &attention.input,
+        QwenTpAttentionShardWeights {
+            q_proj: &train_q,
+            q_bias: &q_bias_full.narrow(0, q_output_start, q_output_size),
+            k_proj: &train_k,
+            k_bias: &k_bias_full.narrow(0, kv_output_start, kv_output_size),
+            v_proj: &train_v,
+            v_bias: &v_bias_full.narrow(0, kv_output_start, kv_output_size),
+            o_proj: &train_o,
+        },
+        &runtime_config,
+        0,
+        q_output_size,
+        0,
+        kv_output_size,
+        attention.q_heads_per_rank,
+        attention.kv_heads_per_rank,
+    )
+    .1;
+    (attention_local_contribution * attention_output_grad)
+        .sum(Kind::Float)
+        .backward();
+    let q_grad = train_q.grad();
+    let k_grad = train_k.grad();
+    let v_grad = train_v.grad();
+    let o_grad = train_o.grad();
+    if !q_grad.defined() || !k_grad.defined() || !v_grad.defined() || !o_grad.defined() {
+        bail!("Qwen session TP attention train smoke expected all shard gradients to be defined");
+    }
+    let attention_q_grad_norm = q_grad.norm().double_value(&[]);
+    let attention_k_grad_norm = k_grad.norm().double_value(&[]);
+    let attention_v_grad_norm = v_grad.norm().double_value(&[]);
+    let attention_o_grad_norm = o_grad.norm().double_value(&[]);
+    if attention_q_grad_norm <= 0.0
+        || attention_k_grad_norm <= 0.0
+        || attention_v_grad_norm <= 0.0
+        || attention_o_grad_norm <= 0.0
+    {
+        bail!(
+            "Qwen session TP attention train smoke expected positive grad norms: q={attention_q_grad_norm}, k={attention_k_grad_norm}, v={attention_v_grad_norm}, o={attention_o_grad_norm}"
+        );
+    }
+    let config_learning_rate = config.train.learning_rate as f64;
+    if !config_learning_rate.is_finite() || config_learning_rate <= 0.0 {
+        bail!("Qwen session TP train smoke requires positive finite learning_rate");
+    }
+    let mut attention_train_final_loss = attention_train_initial_loss;
+    let mut attention_train_learning_rate = config_learning_rate;
+    for candidate_learning_rate in [
+        config_learning_rate,
+        config_learning_rate * 10.0,
+        config_learning_rate * 100.0,
+        config_learning_rate * 1000.0,
+        1e-3,
+        1e-2,
+    ] {
+        if !candidate_learning_rate.is_finite() || candidate_learning_rate <= 0.0 {
+            continue;
+        }
+        let mut candidate_q = train_q.detach().shallow_clone();
+        let mut candidate_k = train_k.detach().shallow_clone();
+        let mut candidate_v = train_v.detach().shallow_clone();
+        let mut candidate_o = train_o.detach().shallow_clone();
+        no_grad(|| -> Result<()> {
+            let _ = candidate_q.f_sub_(&(q_grad.shallow_clone() * candidate_learning_rate))?;
+            let _ = candidate_k.f_sub_(&(k_grad.shallow_clone() * candidate_learning_rate))?;
+            let _ = candidate_v.f_sub_(&(v_grad.shallow_clone() * candidate_learning_rate))?;
+            let _ = candidate_o.f_sub_(&(o_grad.shallow_clone() * candidate_learning_rate))?;
+            Ok(())
+        })?;
+        let (candidate_loss, _) = qwen_session_tp_attention_global_mse_loss_and_grad(
+            &attention.input,
+            QwenTpAttentionShardWeights {
+                q_proj: &candidate_q,
+                q_bias: &q_bias_full.narrow(0, q_output_start, q_output_size),
+                k_proj: &candidate_k,
+                k_bias: &k_bias_full.narrow(0, kv_output_start, kv_output_size),
+                v_proj: &candidate_v,
+                v_bias: &v_bias_full.narrow(0, kv_output_start, kv_output_size),
+                o_proj: &candidate_o,
+            },
+            &runtime_config,
+            0,
+            q_output_size,
+            0,
+            kv_output_size,
+            attention.q_heads_per_rank,
+            attention.kv_heads_per_rank,
+            &attention_target,
+            &output_dir.join(format!(
+                "attention-train-candidate-output-{candidate_learning_rate:.0e}"
+            )),
+        )?;
+        if candidate_loss < attention_train_final_loss {
+            attention_train_final_loss = candidate_loss;
+            attention_train_learning_rate = candidate_learning_rate;
+        }
+        if attention_train_final_loss < attention_train_initial_loss {
+            break;
+        }
+    }
+    if attention_train_final_loss >= attention_train_initial_loss {
+        bail!(
+            "Qwen session TP attention train smoke did not reduce loss: initial={attention_train_initial_loss}, final={attention_train_final_loss}"
+        );
+    }
+
     let gate_proj_full = tensor(&weights, "model.layers.0.mlp.gate_proj.weight")?
         .to_kind(Kind::Float)
         .to_device(device);
@@ -5138,10 +5371,6 @@ fn qwen_session_tp_rank_smoke(
             "Qwen session TP MLP train smoke expected positive grad norms: gate={gate_grad_norm}, up={up_grad_norm}, down={down_grad_norm}"
         );
     }
-    let config_learning_rate = config.train.learning_rate as f64;
-    if !config_learning_rate.is_finite() || config_learning_rate <= 0.0 {
-        bail!("Qwen session TP MLP train smoke requires positive finite learning_rate");
-    }
     let mut train_final_loss = train_initial_loss;
     let mut train_learning_rate = config_learning_rate;
     for candidate_learning_rate in [
@@ -5205,6 +5434,14 @@ fn qwen_session_tp_rank_smoke(
         attention_reduced_output_shape: attention_reduced.size(),
         attention_max_abs: attention_diff.max_abs,
         attention_mean_abs: attention_diff.mean_abs,
+        attention_train_initial_loss,
+        attention_train_final_loss,
+        attention_train_loss_improved: attention_train_final_loss < attention_train_initial_loss,
+        attention_train_learning_rate,
+        attention_train_q_grad_norm: attention_q_grad_norm,
+        attention_train_k_grad_norm: attention_k_grad_norm,
+        attention_train_v_grad_norm: attention_v_grad_norm,
+        attention_train_o_grad_norm: attention_o_grad_norm,
         mlp_intermediate_start: intermediate_start,
         mlp_intermediate_end: intermediate_start + intermediate_shard_size,
         mlp_activation_shard_shape: activation_shard.size(),
@@ -5252,6 +5489,39 @@ fn qwen_session_tp_mlp_global_mse_loss_and_grad(
         gate_shard_weight,
         up_shard_weight,
         down_input_shard_weight,
+    )
+    .1;
+    let reduced = nccl_smoke::all_reduce_tensor_f32_for_launch(reduce_dir, &local_contribution)?;
+    let diff = &reduced - target;
+    let loss = diff.pow_tensor_scalar(2.0).mean(Kind::Float);
+    let output_grad = (&diff * (2.0 / diff.numel() as f64)).detach();
+    Ok((loss.double_value(&[]), output_grad))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn qwen_session_tp_attention_global_mse_loss_and_grad(
+    input: &Tensor,
+    weights: QwenTpAttentionShardWeights<'_>,
+    config: &QwenRuntimeConfig,
+    q_output_start: i64,
+    q_output_size: i64,
+    kv_output_start: i64,
+    kv_output_size: i64,
+    q_heads_per_rank: i64,
+    kv_heads_per_rank: i64,
+    target: &Tensor,
+    reduce_dir: &Path,
+) -> Result<(f64, Tensor)> {
+    let local_contribution = qwen_tp_attention_shard_contribution(
+        input,
+        weights,
+        config,
+        q_output_start,
+        q_output_size,
+        kv_output_start,
+        kv_output_size,
+        q_heads_per_rank,
+        kv_heads_per_rank,
     )
     .1;
     let reduced = nccl_smoke::all_reduce_tensor_f32_for_launch(reduce_dir, &local_contribution)?;
