@@ -281,6 +281,16 @@ enum Command {
         #[arg(long)]
         output_dir: PathBuf,
     },
+    #[command(hide = true)]
+    QwenTpMlpNcclRankSmoke {
+        #[arg(
+            long,
+            default_value = "/vePFS-Mindverse/share/huggingface/Qwen2.5-0.5B-Instruct"
+        )]
+        model_path: PathBuf,
+        #[arg(long)]
+        output_dir: PathBuf,
+    },
     Launch {
         #[arg(long)]
         nproc_per_node: usize,
@@ -503,6 +513,10 @@ fn main() -> Result<()> {
             model_path,
             output_dir,
         } => qwen_module::qwen_tp_mlp_rank_smoke(&model_path, output_dir),
+        Command::QwenTpMlpNcclRankSmoke {
+            model_path,
+            output_dir,
+        } => qwen_module::qwen_tp_mlp_nccl_rank_smoke(&model_path, output_dir),
         Command::Launch {
             nproc_per_node,
             output_dir,

@@ -23,6 +23,7 @@ remote_run_2gpu bash scripts/verify_launch_gpu_assignment_worker.sh
 remote_run_2gpu bash scripts/verify_qwen_tp_linear_worker.sh
 remote_run_2gpu bash scripts/verify_qwen_tp_attention_worker.sh
 remote_run_2gpu bash scripts/verify_qwen_tp_mlp_worker.sh
+remote_run_2gpu bash scripts/verify_qwen_tp_mlp_nccl_worker.sh
 
 remote_run_2gpu env \
   RUSTRAIN_LAUNCH_TIMEOUT_SECS=600 \

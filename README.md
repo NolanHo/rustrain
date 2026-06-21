@@ -128,8 +128,9 @@ attention smoke shards Q/K/V heads, applies rank-local attention, sums O-proj
 input-column contributions on rank0, and verifies parity against full layer0
 attention. A matching TP=2 MLP smoke shards gate/up intermediate rows and
 down-proj input columns, sums rank-local contributions on rank0, and verifies
-parity against the full layer0 MLP. Real multi-GPU Qwen training is not
-implemented yet.
+parity against the full layer0 MLP. A second MLP smoke uses NCCL all-reduce to
+sum those rank-local output contributions on every rank and checks the same
+full-MLP parity. Real multi-GPU Qwen training is not implemented yet.
 The Qwen DP smoke writes a rank0-only JSON checkpoint manifest after gradient
 sync succeeds; non-rank0 summaries record the same checkpoint path but do not
 write it.

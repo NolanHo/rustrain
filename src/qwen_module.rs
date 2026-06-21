@@ -101,6 +101,23 @@ struct QwenTpMlpRankSummary {
     mean_abs: Option<f64>,
 }
 
+#[derive(Debug, Serialize)]
+struct QwenTpMlpNcclRankSummary {
+    rank: usize,
+    world_size: usize,
+    local_rank: usize,
+    model_path: String,
+    input_shape: Vec<i64>,
+    intermediate_start: i64,
+    intermediate_end: i64,
+    activation_shard_shape: Vec<i64>,
+    output_contribution_shape: Vec<i64>,
+    reduced_output_shape: Vec<i64>,
+    full_output_shape: Vec<i64>,
+    max_abs: f64,
+    mean_abs: f64,
+}
+
 #[derive(Debug, Deserialize)]
 struct QwenModelConfig {
     num_hidden_layers: usize,
@@ -3676,6 +3693,93 @@ pub fn qwen_tp_mlp_rank_smoke(model_path: &Path, output_dir: PathBuf) -> Result<
         mean_abs,
     };
     let summary_path = output_dir.join(format!("qwen-tp-mlp-rank-{rank}.json"));
+    fs::write(&summary_path, serde_json::to_string_pretty(&summary)?)
+        .with_context(|| format!("failed to write {}", summary_path.display()))?;
+    println!("{}", serde_json::to_string_pretty(&summary)?);
+
+    Ok(())
+}
+
+pub fn qwen_tp_mlp_nccl_rank_smoke(model_path: &Path, output_dir: PathBuf) -> Result<()> {
+    let rank = parse_env_usize("RANK")?;
+    let local_rank = parse_env_usize("LOCAL_RANK")?;
+    let world_size = parse_env_usize("WORLD_SIZE")?;
+    if world_size != 2 {
+        bail!("Qwen TP MLP NCCL rank smoke expects WORLD_SIZE=2");
+    }
+    if rank >= world_size {
+        bail!("rank {rank} must be smaller than world_size {world_size}");
+    }
+    let device = Device::Cuda(local_rank);
+    fs::create_dir_all(&output_dir)
+        .with_context(|| format!("failed to create {}", output_dir.display()))?;
+
+    let weights = read_safetensors_map(&model_path.join("model.safetensors"))?;
+    let gate_proj = tensor(&weights, "model.layers.0.mlp.gate_proj.weight")?
+        .to_kind(Kind::Float)
+        .to_device(device);
+    let up_proj = tensor(&weights, "model.layers.0.mlp.up_proj.weight")?
+        .to_kind(Kind::Float)
+        .to_device(device);
+    let down_proj = tensor(&weights, "model.layers.0.mlp.down_proj.weight")?
+        .to_kind(Kind::Float)
+        .to_device(device);
+    let hidden_size = gate_proj.size()[1];
+    let intermediate_size = gate_proj.size()[0];
+    if intermediate_size % world_size as i64 != 0 {
+        bail!("Qwen TP MLP NCCL smoke requires intermediate size divisible by WORLD_SIZE");
+    }
+    let intermediate_shard_size = intermediate_size / world_size as i64;
+    let intermediate_start = rank as i64 * intermediate_shard_size;
+    let input = Tensor::arange(hidden_size * 7, (Kind::Float, device))
+        .reshape([1, 7, hidden_size])
+        .fmod(19.0)
+        / 19.0;
+    let gate_shard = input.linear::<&Tensor>(
+        &gate_proj.narrow(0, intermediate_start, intermediate_shard_size),
+        None,
+    );
+    let up_shard = input.linear::<&Tensor>(
+        &up_proj.narrow(0, intermediate_start, intermediate_shard_size),
+        None,
+    );
+    let activation_shard = gate_shard.silu() * up_shard;
+    let output_contribution = activation_shard.linear::<&Tensor>(
+        &down_proj.narrow(1, intermediate_start, intermediate_shard_size),
+        None,
+    );
+
+    let reduced_output = nccl_smoke::all_reduce_tensor_f32_for_launch(
+        &output_dir.join("nccl-output-contribution"),
+        &output_contribution,
+    )?;
+    let full_output = qwen_mlp(&input, &gate_proj, &up_proj, &down_proj);
+    let diff = diff_stats(&reduced_output, &full_output)?;
+    if diff.max_abs > 1e-5 {
+        bail!(
+            "Qwen TP MLP NCCL parity failed: rank={}, max_abs={}, mean_abs={}",
+            rank,
+            diff.max_abs,
+            diff.mean_abs
+        );
+    }
+
+    let summary = QwenTpMlpNcclRankSummary {
+        rank,
+        world_size,
+        local_rank,
+        model_path: model_path.display().to_string(),
+        input_shape: input.size(),
+        intermediate_start,
+        intermediate_end: intermediate_start + intermediate_shard_size,
+        activation_shard_shape: activation_shard.size(),
+        output_contribution_shape: output_contribution.size(),
+        reduced_output_shape: reduced_output.size(),
+        full_output_shape: full_output.size(),
+        max_abs: diff.max_abs,
+        mean_abs: diff.mean_abs,
+    };
+    let summary_path = output_dir.join(format!("qwen-tp-mlp-nccl-rank-{rank}.json"));
     fs::write(&summary_path, serde_json::to_string_pretty(&summary)?)
         .with_context(|| format!("failed to write {}", summary_path.display()))?;
     println!("{}", serde_json::to_string_pretty(&summary)?);
