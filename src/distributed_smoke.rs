@@ -121,6 +121,10 @@ struct ExpertParallelSparseRankSummary {
     reference_output_shape: Vec<i64>,
     sparse_output_max_abs: f64,
     sparse_output_mean_abs: f64,
+    train_initial_loss: f64,
+    train_final_loss: f64,
+    train_loss_improved: bool,
+    scale_grad_norm: f64,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -190,6 +194,16 @@ struct ExpertParallelCheckpointWrite {
 struct ExpertParallelSparsePeerPlan {
     peer: usize,
     token_indices: Vec<usize>,
+}
+
+struct ExpertParallelSparseForward {
+    assembled_output: Tensor,
+    source_token_indices: Vec<usize>,
+    owned_token_indices: Vec<usize>,
+    dispatch_send_counts: Vec<usize>,
+    dispatch_recv_counts: Vec<usize>,
+    combine_send_counts: Vec<usize>,
+    combine_recv_counts: Vec<usize>,
 }
 
 pub fn run_data_parallel_smoke(output_dir: &Path, world_size: usize) -> Result<()> {
@@ -733,102 +747,27 @@ pub fn run_expert_parallel_sparse_rank_smoke(output_dir: PathBuf) -> Result<()> 
     let tokens = ep_tokens_tensor(device);
     let router = ep_router_tensor(device);
     let assignments = route_top1_tensor(&tokens, &router)?;
-    let source_token_indices = ep_source_token_indices(rank, world_size, assignments.len());
     let global_expert_load = ep_global_expert_load(&assignments);
     let load_balance_loss = ep_load_balance_loss(&global_expert_load);
     let experts_per_rank = ep_expert_count() / world_size;
     let owned_expert_start = rank * experts_per_rank;
     let owned_expert_end = owned_expert_start + experts_per_rank;
-
-    let dispatch_send_plan =
-        ep_sparse_dispatch_send_plan(rank, world_size, &assignments, assignments.len())?;
-    let dispatch_recv_plan = ep_sparse_dispatch_recv_plan(rank, world_size, &assignments)?;
-    let dispatch_sends = dispatch_send_plan
-        .iter()
-        .map(|plan| {
-            (
-                plan.peer,
-                ep_sparse_pack_token_rows(&tokens, &plan.token_indices),
-            )
-        })
-        .collect::<Vec<_>>();
-    let dispatch_recvs = dispatch_recv_plan
-        .iter()
-        .map(|plan| {
-            (
-                plan.peer,
-                vec![plan.token_indices.len() as i64, tokens.size()[1]],
-            )
-        })
-        .collect::<Vec<_>>();
-    let dispatched = nccl_smoke::send_recv_tensors_f32_for_launch(
-        &output_dir.join("ep-sparse-dispatch"),
-        &dispatch_sends,
-        &dispatch_recvs,
-    )?;
-
     let local_scales = ep_owned_expert_scales_tensor(owned_expert_start, owned_expert_end, device);
-    let mut combine_sends = Vec::with_capacity(dispatched.len());
-    let mut owned_token_indices = Vec::new();
-    for (peer, payload) in dispatched {
-        let plan = dispatch_recv_plan
-            .iter()
-            .find(|plan| plan.peer == peer)
-            .ok_or_else(|| anyhow!("missing dispatch recv plan from peer {peer}"))?;
-        owned_token_indices.extend(plan.token_indices.iter().copied());
-        let output = ep_sparse_local_expert_outputs(
-            &payload,
-            &plan.token_indices,
-            &assignments,
-            owned_expert_start,
-            owned_expert_end,
-            &local_scales,
-        )?;
-        combine_sends.push((peer, output));
-    }
-    owned_token_indices.sort_unstable();
 
-    let combine_recv_plan = ep_sparse_combine_recv_plan(rank, world_size, &assignments)?;
-    let combine_recvs = combine_recv_plan
-        .iter()
-        .map(|plan| {
-            (
-                plan.peer,
-                vec![plan.token_indices.len() as i64, tokens.size()[1]],
-            )
-        })
-        .collect::<Vec<_>>();
-    let combined = nccl_smoke::send_recv_tensors_f32_for_launch(
-        &output_dir.join("ep-sparse-combine"),
-        &combine_sends,
-        &combine_recvs,
+    let forward = ep_sparse_forward(
+        &output_dir,
+        "ep-sparse-forward",
+        rank,
+        world_size,
+        &tokens,
+        &assignments,
+        owned_expert_start,
+        owned_expert_end,
+        &local_scales,
     )?;
-
-    let mut assembled_rows = Vec::with_capacity(source_token_indices.len());
-    for token_index in &source_token_indices {
-        let owner_rank = ep_expert_owner_rank(assignments[*token_index], world_size);
-        let payload = combined
-            .iter()
-            .find(|(peer, _)| *peer == owner_rank)
-            .map(|(_, tensor)| tensor)
-            .ok_or_else(|| {
-                anyhow!("missing combined output from expert owner rank {owner_rank}")
-            })?;
-        let plan = combine_recv_plan
-            .iter()
-            .find(|plan| plan.peer == owner_rank)
-            .ok_or_else(|| anyhow!("missing combine recv plan from rank {owner_rank}"))?;
-        let row_position = plan
-            .token_indices
-            .iter()
-            .position(|candidate| candidate == token_index)
-            .ok_or_else(|| anyhow!("token {token_index} missing from combine recv plan"))?;
-        assembled_rows.push(payload.get(row_position as i64));
-    }
-    let assembled_output = Tensor::stack(&assembled_rows.iter().collect::<Vec<_>>(), 0);
     let reference = ep_reference_output_tensor(&tokens, &assignments)?;
-    let reference_rows = ep_sparse_pack_token_rows(&reference, &source_token_indices);
-    let sparse_diff = tensor_diff_stats(&assembled_output, &reference_rows)?;
+    let reference_rows = ep_sparse_pack_token_rows(&reference, &forward.source_token_indices);
+    let sparse_diff = tensor_diff_stats(&forward.assembled_output, &reference_rows)?;
     if sparse_diff.0 > 1e-6 {
         bail!(
             "EP sparse dispatch/combine mismatch: rank={rank}, max_abs={}, mean_abs={}",
@@ -837,36 +776,93 @@ pub fn run_expert_parallel_sparse_rank_smoke(output_dir: PathBuf) -> Result<()> 
         );
     }
 
+    let target_rows = &reference_rows * 0.5;
+    let source_grad =
+        (&forward.assembled_output - &target_rows) * (2.0 / target_rows.numel() as f64);
+    let train_initial_loss = (&forward.assembled_output - &target_rows)
+        .square()
+        .mean(Kind::Float)
+        .double_value(&[]);
+    let gradient_sends = ep_sparse_output_gradient_sends(
+        rank,
+        world_size,
+        &assignments,
+        &forward.source_token_indices,
+        &source_grad,
+    )?;
+    let gradient_recv_plan = ep_sparse_dispatch_recv_plan(rank, world_size, &assignments)?;
+    let gradient_recvs = gradient_recv_plan
+        .iter()
+        .map(|plan| {
+            (
+                plan.peer,
+                vec![plan.token_indices.len() as i64, tokens.size()[1]],
+            )
+        })
+        .collect::<Vec<_>>();
+    let received_gradients = nccl_smoke::send_recv_tensors_f32_for_launch(
+        &output_dir.join("ep-sparse-output-grad"),
+        &gradient_sends,
+        &gradient_recvs,
+    )?;
+    let scale_grad = ep_sparse_scale_grad_from_output_grads(
+        &received_gradients,
+        &gradient_recv_plan,
+        &tokens,
+        &assignments,
+        owned_expert_start,
+        owned_expert_end,
+        &local_scales,
+    )?;
+    let scale_grad_norm = scale_grad.norm().double_value(&[]);
+    if scale_grad_norm <= 0.0 {
+        bail!("EP sparse train smoke expected positive local expert scale grad norm");
+    }
+    let updated_scales = (&local_scales - &(scale_grad * 0.25)).detach();
+    let updated_forward = ep_sparse_forward(
+        &output_dir,
+        "ep-sparse-updated-forward",
+        rank,
+        world_size,
+        &tokens,
+        &assignments,
+        owned_expert_start,
+        owned_expert_end,
+        &updated_scales,
+    )?;
+    let train_final_loss = (&updated_forward.assembled_output - &target_rows)
+        .square()
+        .mean(Kind::Float)
+        .double_value(&[]);
+    let train_loss_improved = train_final_loss < train_initial_loss;
+    if !train_loss_improved {
+        bail!(
+            "EP sparse train smoke did not lower loss on rank {rank}: initial={train_initial_loss}, final={train_final_loss}"
+        );
+    }
+
     let summary = ExpertParallelSparseRankSummary {
         rank,
         world_size,
         local_rank,
-        source_token_indices,
+        source_token_indices: forward.source_token_indices,
         owned_expert_start,
         owned_expert_end,
-        owned_token_indices,
+        owned_token_indices: forward.owned_token_indices,
         global_expert_load,
         load_balance_loss,
-        dispatch_send_counts: dispatch_send_plan
-            .iter()
-            .map(|plan| plan.token_indices.len())
-            .collect(),
-        dispatch_recv_counts: dispatch_recv_plan
-            .iter()
-            .map(|plan| plan.token_indices.len())
-            .collect(),
-        combine_send_counts: dispatch_recv_plan
-            .iter()
-            .map(|plan| plan.token_indices.len())
-            .collect(),
-        combine_recv_counts: combine_recv_plan
-            .iter()
-            .map(|plan| plan.token_indices.len())
-            .collect(),
-        assembled_output_shape: assembled_output.size(),
+        dispatch_send_counts: forward.dispatch_send_counts,
+        dispatch_recv_counts: forward.dispatch_recv_counts,
+        combine_send_counts: forward.combine_send_counts,
+        combine_recv_counts: forward.combine_recv_counts,
+        assembled_output_shape: forward.assembled_output.size(),
         reference_output_shape: reference_rows.size(),
         sparse_output_max_abs: sparse_diff.0,
         sparse_output_mean_abs: sparse_diff.1,
+        train_initial_loss,
+        train_final_loss,
+        train_loss_improved,
+        scale_grad_norm,
     };
     let summary_path = output_dir.join(format!("ep-sparse-rank-{rank}.json"));
     fs::write(
@@ -1091,6 +1087,128 @@ fn ep_sparse_combine_recv_plan(
         .collect()
 }
 
+#[allow(clippy::too_many_arguments)]
+fn ep_sparse_forward(
+    output_dir: &Path,
+    step_name: &str,
+    rank: usize,
+    world_size: usize,
+    tokens: &Tensor,
+    assignments: &[usize],
+    owned_expert_start: usize,
+    owned_expert_end: usize,
+    local_scales: &Tensor,
+) -> Result<ExpertParallelSparseForward> {
+    let source_token_indices = ep_source_token_indices(rank, world_size, assignments.len());
+    let dispatch_send_plan =
+        ep_sparse_dispatch_send_plan(rank, world_size, assignments, assignments.len())?;
+    let dispatch_recv_plan = ep_sparse_dispatch_recv_plan(rank, world_size, assignments)?;
+    let dispatch_sends = dispatch_send_plan
+        .iter()
+        .map(|plan| {
+            (
+                plan.peer,
+                ep_sparse_pack_token_rows(tokens, &plan.token_indices),
+            )
+        })
+        .collect::<Vec<_>>();
+    let dispatch_recvs = dispatch_recv_plan
+        .iter()
+        .map(|plan| {
+            (
+                plan.peer,
+                vec![plan.token_indices.len() as i64, tokens.size()[1]],
+            )
+        })
+        .collect::<Vec<_>>();
+    let dispatched = nccl_smoke::send_recv_tensors_f32_for_launch(
+        &output_dir.join(format!("{step_name}-dispatch")),
+        &dispatch_sends,
+        &dispatch_recvs,
+    )?;
+
+    let mut combine_sends = Vec::with_capacity(dispatched.len());
+    let mut owned_token_indices = Vec::new();
+    for (peer, payload) in dispatched {
+        let plan = dispatch_recv_plan
+            .iter()
+            .find(|plan| plan.peer == peer)
+            .ok_or_else(|| anyhow!("missing dispatch recv plan from peer {peer}"))?;
+        owned_token_indices.extend(plan.token_indices.iter().copied());
+        let output = ep_sparse_local_expert_outputs(
+            &payload,
+            &plan.token_indices,
+            assignments,
+            owned_expert_start,
+            owned_expert_end,
+            local_scales,
+        )?;
+        combine_sends.push((peer, output));
+    }
+    owned_token_indices.sort_unstable();
+
+    let combine_recv_plan = ep_sparse_combine_recv_plan(rank, world_size, assignments)?;
+    let combine_recvs = combine_recv_plan
+        .iter()
+        .map(|plan| {
+            (
+                plan.peer,
+                vec![plan.token_indices.len() as i64, tokens.size()[1]],
+            )
+        })
+        .collect::<Vec<_>>();
+    let combined = nccl_smoke::send_recv_tensors_f32_for_launch(
+        &output_dir.join(format!("{step_name}-combine")),
+        &combine_sends,
+        &combine_recvs,
+    )?;
+
+    let mut assembled_rows = Vec::with_capacity(source_token_indices.len());
+    for token_index in &source_token_indices {
+        let owner_rank = ep_expert_owner_rank(assignments[*token_index], world_size);
+        let payload = combined
+            .iter()
+            .find(|(peer, _)| *peer == owner_rank)
+            .map(|(_, tensor)| tensor)
+            .ok_or_else(|| {
+                anyhow!("missing combined output from expert owner rank {owner_rank}")
+            })?;
+        let plan = combine_recv_plan
+            .iter()
+            .find(|plan| plan.peer == owner_rank)
+            .ok_or_else(|| anyhow!("missing combine recv plan from rank {owner_rank}"))?;
+        let row_position = plan
+            .token_indices
+            .iter()
+            .position(|candidate| candidate == token_index)
+            .ok_or_else(|| anyhow!("token {token_index} missing from combine recv plan"))?;
+        assembled_rows.push(payload.get(row_position as i64));
+    }
+    let assembled_output = Tensor::stack(&assembled_rows.iter().collect::<Vec<_>>(), 0);
+
+    Ok(ExpertParallelSparseForward {
+        assembled_output,
+        source_token_indices,
+        owned_token_indices,
+        dispatch_send_counts: dispatch_send_plan
+            .iter()
+            .map(|plan| plan.token_indices.len())
+            .collect(),
+        dispatch_recv_counts: dispatch_recv_plan
+            .iter()
+            .map(|plan| plan.token_indices.len())
+            .collect(),
+        combine_send_counts: dispatch_recv_plan
+            .iter()
+            .map(|plan| plan.token_indices.len())
+            .collect(),
+        combine_recv_counts: combine_recv_plan
+            .iter()
+            .map(|plan| plan.token_indices.len())
+            .collect(),
+    })
+}
+
 fn ep_reference_output_tensor(tokens: &Tensor, assignments: &[usize]) -> Result<Tensor> {
     ep_local_output_tensor(
         tokens,
@@ -1166,6 +1284,85 @@ fn ep_sparse_local_expert_outputs(
     } else {
         Tensor::stack(&rows.iter().collect::<Vec<_>>(), 0)
     })
+}
+
+fn ep_sparse_output_gradient_sends(
+    _rank: usize,
+    world_size: usize,
+    assignments: &[usize],
+    source_token_indices: &[usize],
+    source_grad: &Tensor,
+) -> Result<Vec<(usize, Tensor)>> {
+    if source_grad.size()[0] != source_token_indices.len() as i64 {
+        bail!(
+            "EP sparse source grad count mismatch: payload={}, metadata={}",
+            source_grad.size()[0],
+            source_token_indices.len()
+        );
+    }
+    let feature_dim = source_grad.size()[1];
+    let mut peer_rows = (0..world_size)
+        .map(|_| Vec::<Tensor>::new())
+        .collect::<Vec<_>>();
+    for (row_index, token_index) in source_token_indices.iter().copied().enumerate() {
+        let owner_rank = ep_expert_owner_rank(assignments[token_index], world_size);
+        peer_rows[owner_rank].push(source_grad.get(row_index as i64));
+    }
+    Ok(peer_rows
+        .into_iter()
+        .enumerate()
+        .map(|(peer, rows)| {
+            let payload = if rows.is_empty() {
+                Tensor::zeros([0, feature_dim], (Kind::Float, source_grad.device()))
+            } else {
+                Tensor::stack(&rows.iter().collect::<Vec<_>>(), 0)
+            };
+            (peer, payload)
+        })
+        .collect())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn ep_sparse_scale_grad_from_output_grads(
+    received_gradients: &[(usize, Tensor)],
+    gradient_recv_plan: &[ExpertParallelSparsePeerPlan],
+    tokens: &Tensor,
+    assignments: &[usize],
+    owned_expert_start: usize,
+    owned_expert_end: usize,
+    local_scales: &Tensor,
+) -> Result<Tensor> {
+    let scale_grad = Tensor::zeros_like(local_scales);
+    for plan in gradient_recv_plan {
+        let payload = received_gradients
+            .iter()
+            .find(|(peer, _)| *peer == plan.peer)
+            .map(|(_, tensor)| tensor)
+            .ok_or_else(|| anyhow!("missing output gradient payload from peer {}", plan.peer))?;
+        if payload.size()[0] != plan.token_indices.len() as i64 {
+            bail!(
+                "EP sparse output grad count mismatch from peer {}: payload={}, metadata={}",
+                plan.peer,
+                payload.size()[0],
+                plan.token_indices.len()
+            );
+        }
+        for (row_index, token_index) in plan.token_indices.iter().copied().enumerate() {
+            let expert_index = assignments[token_index];
+            if !(owned_expert_start..owned_expert_end).contains(&expert_index) {
+                bail!(
+                    "EP sparse rank received output grad for token {token_index} assigned to unowned expert {expert_index}"
+                );
+            }
+            let local_expert_index = (expert_index - owned_expert_start) as i64;
+            let grad_row = payload.get(row_index as i64);
+            let token_row = tokens.get(token_index as i64);
+            let row_scale_grad = grad_row * token_row;
+            let updated_row = scale_grad.get(local_expert_index) + row_scale_grad;
+            scale_grad.get(local_expert_index).copy_(&updated_row);
+        }
+    }
+    Ok(scale_grad)
 }
 
 #[allow(clippy::too_many_arguments)]

@@ -81,6 +81,16 @@ for path in summaries:
         raise SystemExit(f"{path} global_expert_load {data['global_expert_load']} != [2, 1, 0, 1]")
     if abs(float(data["load_balance_loss"]) - 0.125) > 1e-9:
         raise SystemExit(f"{path} load_balance_loss {data['load_balance_loss']} != 0.125")
+    if float(data["scale_grad_norm"]) <= 0.0:
+        raise SystemExit(f"{path} scale_grad_norm must be positive: {data['scale_grad_norm']}")
+    if not data["train_loss_improved"]:
+        raise SystemExit(
+            f"{path} expected train_loss_improved, initial={data['train_initial_loss']} final={data['train_final_loss']}"
+        )
+    if float(data["train_final_loss"]) >= float(data["train_initial_loss"]):
+        raise SystemExit(
+            f"{path} train_final_loss {data['train_final_loss']} >= train_initial_loss {data['train_initial_loss']}"
+        )
     source_tokens.extend(data["source_token_indices"])
     owned_tokens.extend(data["owned_token_indices"])
     evidence.append(
@@ -96,6 +106,10 @@ for path in summaries:
             "global_expert_load": data["global_expert_load"],
             "load_balance_loss": data["load_balance_loss"],
             "sparse_output_max_abs": data["sparse_output_max_abs"],
+            "scale_grad_norm": data["scale_grad_norm"],
+            "train_initial_loss": data["train_initial_loss"],
+            "train_final_loss": data["train_final_loss"],
+            "train_loss_improved": data["train_loss_improved"],
         }
     )
 
