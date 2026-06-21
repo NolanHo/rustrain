@@ -179,6 +179,11 @@ single-GPU path with 26 trainable tensors, and
 `configs/qwen_session_single_layers03.toml` verifies a layer0-layer3
 single-GPU path with 50 trainable tensors. The same layer0-layer3 path also
 has bf16 coverage through `configs/qwen_session_single_layers03_bf16.toml`.
+Toy MoE has an explicit single-rank smoke command and verifier:
+`cargo run -- moe-smoke` prints a JSON summary for TinyMoe and DeepSeek-style
+toy MoE stats, and `scripts/verify_moe_smoke_worker.sh` asserts expert load,
+load-balance loss, activated/total parameter counts, and output summaries on a
+Ray GPU worker.
 Expert-parallel coverage is still toy-sized, but it now has three real
 launcher-backed two-rank paths: `parallel-ep-rank-smoke` verifies rank-local
 expert ownership and token coverage, `parallel-ep-nccl-rank-smoke` builds

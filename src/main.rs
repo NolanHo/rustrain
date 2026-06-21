@@ -208,6 +208,7 @@ enum Command {
         #[arg(long, default_value_t = 1e-6)]
         learning_rate: f64,
     },
+    MoeSmoke,
     #[command(hide = true)]
     QwenDpGradientRankSmoke {
         #[arg(
@@ -490,6 +491,13 @@ fn main() -> Result<()> {
             qwen_module::QwenComputeDType::parse(&dtype)?,
             learning_rate,
         ),
+        Command::MoeSmoke => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&moe::moe_smoke_summary())?
+            );
+            Ok(())
+        }
         Command::QwenDpGradientRankSmoke {
             model_path,
             reference_fixture,
