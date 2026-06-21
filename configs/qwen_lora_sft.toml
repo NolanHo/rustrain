@@ -39,7 +39,7 @@ eval_every = 0
 
 [data]
 kind = "instruction_jsonl"
-paths = ["data/sft_toy/instructions.jsonl"]
+paths = ["data/sft_toy/instructions.jsonl", "data/sft_toy/more_instructions.jsonl"]
 train_split = 0.8
 
 [lora]

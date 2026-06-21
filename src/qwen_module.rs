@@ -1043,10 +1043,11 @@ pub fn qwen_lora_sft_smoke(
     learning_rate: f64,
 ) -> Result<()> {
     let lora_config = QwenLoraConfig::layer0_qv(rank, alpha)?;
+    let sft_paths = sft_jsonl.map(|path| vec![path.to_path_buf()]);
     let summary = qwen_lora_sft_train(
         model_path,
         adapter_output,
-        sft_jsonl,
+        sft_paths.as_deref(),
         sft_batch_size,
         instruction,
         response,
@@ -1088,8 +1089,8 @@ pub fn train_qwen_lora_sft_from_config(
     if data.kind != DataKind::InstructionJsonl {
         bail!("qwen LoRA SFT trainer requires data.kind = instruction_jsonl");
     }
-    if data.paths.len() != 1 {
-        bail!("qwen LoRA SFT trainer currently expects exactly one data path");
+    if data.paths.is_empty() {
+        bail!("qwen LoRA SFT trainer requires at least one data path");
     }
     let lora_config = QwenLoraConfig::from_runtime(
         config
@@ -1103,7 +1104,7 @@ pub fn train_qwen_lora_sft_from_config(
     qwen_lora_sft_train(
         model_path,
         &adapter_output,
-        Some(&data.paths[0]),
+        Some(&data.paths),
         config.train.micro_batch_size,
         "Reply with rustrain.",
         "rustrain",
@@ -1118,7 +1119,7 @@ pub fn train_qwen_lora_sft_from_config(
 fn qwen_lora_sft_train(
     model_path: &Path,
     adapter_output: &Path,
-    sft_jsonl: Option<&Path>,
+    sft_paths: Option<&[PathBuf]>,
     sft_batch_size: usize,
     instruction: &str,
     response: &str,
@@ -1139,8 +1140,8 @@ fn qwen_lora_sft_train(
 
     let tokenizer = Tokenizer::from_file(model_path.join("tokenizer.json"))
         .map_err(|error| anyhow!("failed to load tokenizer: {error}"))?;
-    let dataset = if let Some(sft_jsonl) = sft_jsonl {
-        QwenSftDataset::from_jsonl_path(&tokenizer, sft_jsonl)?
+    let dataset = if let Some(sft_paths) = sft_paths {
+        QwenSftDataset::from_jsonl_paths(&tokenizer, sft_paths)?
     } else {
         QwenSftDataset::from_instruction_pairs(
             &tokenizer,
@@ -4301,8 +4302,8 @@ impl QwenSftDataset {
         })
     }
 
-    fn from_jsonl_path(tokenizer: &Tokenizer, path: &Path) -> Result<Self> {
-        Self::from_instruction_pairs(tokenizer, &qwen_sft_examples_from_jsonl_path(path)?)
+    fn from_jsonl_paths(tokenizer: &Tokenizer, paths: &[PathBuf]) -> Result<Self> {
+        Self::from_instruction_pairs(tokenizer, &qwen_sft_examples_from_jsonl_paths(paths)?)
     }
 
     fn padded_batch(&self, start: usize, batch_size: usize) -> Result<QwenSftBatch> {
@@ -4324,6 +4325,17 @@ impl QwenSftDataset {
     fn len(&self) -> usize {
         self.samples.len()
     }
+}
+
+fn qwen_sft_examples_from_jsonl_paths(paths: &[PathBuf]) -> Result<Vec<QwenSftExample>> {
+    if paths.is_empty() {
+        bail!("SFT dataset must contain at least one JSONL path");
+    }
+    let mut examples = Vec::new();
+    for path in paths {
+        examples.extend(qwen_sft_examples_from_jsonl_path(path)?);
+    }
+    Ok(examples)
 }
 
 fn qwen_sft_examples_from_jsonl_path(path: &Path) -> Result<Vec<QwenSftExample>> {
@@ -5625,6 +5637,42 @@ mod tests {
         assert_eq!(examples[1].instruction, "Name the language.");
         assert_eq!(examples[1].input, "rustrain implementation");
         assert_eq!(examples[1].response, "Rust");
+    }
+
+    #[test]
+    fn qwen_sft_jsonl_reader_aggregates_multiple_paths_and_directories() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let first = temp.path().join("first.jsonl");
+        let dir = temp.path().join("shard_dir");
+        fs::create_dir(&dir).expect("shard dir should be created");
+        let second = dir.join("b.jsonl");
+        let third = dir.join("a.jsonl");
+        fs::write(
+            &first,
+            r#"{"instruction":"first","response":"one"}
+"#,
+        )
+        .expect("first jsonl should write");
+        fs::write(
+            &second,
+            r#"{"instruction":"third","response":"three"}
+"#,
+        )
+        .expect("second jsonl should write");
+        fs::write(
+            &third,
+            r#"{"instruction":"second","response":"two"}
+"#,
+        )
+        .expect("third jsonl should write");
+
+        let examples = qwen_sft_examples_from_jsonl_paths(&[first, dir])
+            .expect("examples should aggregate from multiple paths");
+
+        assert_eq!(examples.len(), 3);
+        assert_eq!(examples[0].instruction, "first");
+        assert_eq!(examples[1].instruction, "second");
+        assert_eq!(examples[2].instruction, "third");
     }
 
     #[test]
