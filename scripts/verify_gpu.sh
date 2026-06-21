@@ -31,6 +31,8 @@ remote_run cargo run -- qwen-sampling-smoke
 remote_run cargo run -- qwen-lora-sft-smoke
 remote_run cargo run -- train --config configs/qwen_lora_sft.toml
 remote_run bash scripts/verify_qwen_lora_sft_resume.sh
+remote_run bash scripts/verify_qwen_session_sft_eval_paths_worker.sh
+remote_run bash scripts/verify_qwen_session_dp2_sft_eval_paths_worker.sh
 remote_run cargo run -- train --config configs/qwen_lora_sft_bf16.toml
 remote_run env RUSTRAIN_QWEN_LORA_SFT_CONFIG=configs/qwen_lora_sft_bf16.toml RUSTRAIN_EXPECTED_QWEN_COMPUTE_KIND=bf16 bash scripts/verify_qwen_lora_sft_resume.sh
 remote_run cargo run -- train --config configs/qwen_session_single_bf16.toml
