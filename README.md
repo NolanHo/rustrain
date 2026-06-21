@@ -206,8 +206,8 @@ ownership remain open.
   configured attention and MLP projection modules; trainer-owned full-model LoRA
   injection is not done yet. The current Qwen LoRA SFT config exposes rank,
   alpha, target layers, and target modules for that focused path.
-- KV-cache greedy parity and cached sampling parity are implemented; Python
-  cached-generation parity is future work.
+- KV-cache greedy parity, cached sampling parity, and Python Transformers
+  cached-generation parity are implemented.
 - G4 launcher process management plus NCCL scalar, toy DP gradient, `tch`
   autograd DP=2 trainer smokes, focused multi-step Qwen layer0 attention DP,
   representative `QwenTrainableSession` DP smokes, and a representative Qwen
