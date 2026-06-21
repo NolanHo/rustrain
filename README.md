@@ -156,7 +156,9 @@ checkpoint-contract evidence, and restores those rank-owned shards to reproduce
 the focused fused layer0 output plus the next focused shard update within
 tolerance. The TP verifier also checks the global manifest identity,
 progress/provenance defaults, embedded rank manifests, and every declared
-rank-owned model shard plus AdamW slot shape in the written safetensors files.
+rank-owned model shard plus AdamW slot shape in the written safetensors files;
+the external TP resume verifier repeats those checks for both the base manifest
+and the resumed launch manifest while verifying restore and next-update parity.
 Real production tensor-parallel Qwen training is not implemented yet; the
 remaining TP gap is full-parameter TP backward/update, autograd-aware
 production collectives, and trainer-owned sharded checkpoint resume.

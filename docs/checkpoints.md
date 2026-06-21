@@ -165,8 +165,11 @@ base model identity, tokenizer identity, global step, consumed sample/token
 counts, seed, dtype, optimizer, scheduler, explicit lack of JSONL provenance for
 the focused smoke, exact parallel topology, embedded rank manifests, and every
 declared rank-owned model shard plus AdamW slot shape in the written safetensors
-files. Production full-parameter TP checkpoint resume and full production
-sharded restore over external streaming real data remain open.
+files. The focused external TP resume verifier repeats the same manifest and
+artifact-shape checks for the base checkpoint and the resumed launch's newly
+written global manifest while verifying restore and next-update parity.
+Production full-parameter TP checkpoint resume and full production sharded
+restore over external streaming real data remain open.
 The focused EP `parallel-ep-tch-moe-rank-smoke` also writes
 `rustrain.ep_sharded.v1` rank manifests. Each rank owns a contiguous expert
 range and writes two model shards, `experts.up.weight` and
