@@ -1176,6 +1176,37 @@ fn write_qwen_lora_sft_adapter_manifest(
     .with_context(|| format!("failed to write {}", manifest_output.display()))
 }
 
+fn qwen_validate_lora_resume_config(
+    manifest: Option<&QwenLoraSftAdapterManifest>,
+    adapter_config: &QwenLoraConfig,
+    current_config: &QwenLoraConfig,
+) -> Result<()> {
+    if let Some(manifest) = manifest {
+        if manifest.target_layers != current_config.target_layers {
+            bail!(
+                "Qwen LoRA SFT resume manifest target_layers do not match current [lora] config: manifest={:?}, current={:?}",
+                manifest.target_layers,
+                current_config.target_layers
+            );
+        }
+        if manifest.target_modules != current_config.target_module_names() {
+            bail!(
+                "Qwen LoRA SFT resume manifest target_modules do not match current [lora] config: manifest={:?}, current={:?}",
+                manifest.target_modules,
+                current_config.target_module_names()
+            );
+        }
+    }
+    if adapter_config != current_config {
+        bail!(
+            "Qwen LoRA SFT resume adapter config does not match current [lora] config: resume={:?}, current={:?}",
+            adapter_config,
+            current_config
+        );
+    }
+    Ok(())
+}
+
 impl QwenComputeDType {
     pub fn parse(value: &str) -> Result<Self> {
         match value {
@@ -1897,13 +1928,7 @@ fn qwen_lora_sft_train(
         .or_else(|| resume_from.map(PathBuf::from));
     let registry = if let Some(resume_adapter_path) = resume_adapter_path.as_ref() {
         let registry = QwenLoraRegistry::load(resume_adapter_path)?;
-        if registry.config != lora_config {
-            bail!(
-                "Qwen LoRA SFT resume adapter config does not match current [lora] config: resume={:?}, current={:?}",
-                registry.config,
-                lora_config
-            );
-        }
+        qwen_validate_lora_resume_config(resume_manifest.as_ref(), &registry.config, &lora_config)?;
         registry
     } else {
         QwenLoraRegistry::deterministic(&weights, &lora_config, true)?
@@ -8178,6 +8203,86 @@ mod tests {
                 .size(),
             vec![4, 8]
         );
+    }
+
+    #[test]
+    fn qwen_lora_sft_resume_config_validation_checks_manifest_and_adapter() {
+        let current = QwenLoraConfig::new(
+            vec![0, 1],
+            vec![
+                QwenLoraTargetModule::QProj,
+                QwenLoraTargetModule::VProj,
+                QwenLoraTargetModule::DownProj,
+            ],
+            4,
+            8.0,
+        )
+        .expect("current config should build");
+        let mut manifest = QwenLoraSftAdapterManifest {
+            format: "rustrain.qwen_lora_sft_adapter.v1".to_string(),
+            base_model_path: "/models/qwen".to_string(),
+            adapter_safetensors: "/tmp/adapter.safetensors".to_string(),
+            compute_kind: "fp32".to_string(),
+            steps: 2,
+            train_step: 4,
+            data_cursor_start: 0,
+            data_cursor_end: 4,
+            data_cursor_next: 4,
+            data_epoch_start: 0,
+            data_epoch_end: 0,
+            data_epoch_next: 0,
+            data_sample_offset_start: 0,
+            data_sample_offset_end: 4,
+            data_sample_offset_next: 4,
+            dataset_source_files: vec!["data/train.jsonl".to_string()],
+            dataset_source_sample_counts: vec![QwenSftSourceSampleCount {
+                path: "data/train.jsonl".to_string(),
+                samples: 4,
+            }],
+            dataset_fingerprint: "abc123".to_string(),
+            dataset_order_seed: 777,
+            dataset_shuffle: true,
+            dataset_total_samples: 4,
+            dataset_train_samples: 3,
+            dataset_eval_samples: 1,
+            batch_size: 1,
+            gradient_accumulation_steps: 1,
+            target_layers: current.target_layers.clone(),
+            target_modules: current.target_module_names(),
+        };
+
+        qwen_validate_lora_resume_config(Some(&manifest), &current, &current)
+            .expect("matching manifest and adapter config should pass");
+        qwen_validate_lora_resume_config(None, &current, &current)
+            .expect("direct adapter resume should pass without manifest metadata");
+
+        let adapter_mismatch = QwenLoraConfig::new(
+            vec![0, 1],
+            vec![QwenLoraTargetModule::QProj, QwenLoraTargetModule::VProj],
+            4,
+            8.0,
+        )
+        .expect("adapter mismatch config should build");
+        let adapter_error =
+            qwen_validate_lora_resume_config(Some(&manifest), &adapter_mismatch, &current)
+                .expect_err("adapter config mismatch should fail")
+                .to_string();
+        assert!(adapter_error.contains("resume adapter config does not match"));
+
+        manifest.target_modules = vec!["q_proj".to_string(), "v_proj".to_string()];
+        let manifest_module_error =
+            qwen_validate_lora_resume_config(Some(&manifest), &current, &current)
+                .expect_err("manifest module mismatch should fail")
+                .to_string();
+        assert!(manifest_module_error.contains("resume manifest target_modules"));
+
+        manifest.target_modules = current.target_module_names();
+        manifest.target_layers = vec![0];
+        let manifest_layer_error =
+            qwen_validate_lora_resume_config(Some(&manifest), &current, &current)
+                .expect_err("manifest layer mismatch should fail")
+                .to_string();
+        assert!(manifest_layer_error.contains("resume manifest target_layers"));
     }
 
     #[test]

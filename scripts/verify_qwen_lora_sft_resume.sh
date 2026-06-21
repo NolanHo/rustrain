@@ -64,6 +64,7 @@ required = [
     "dataset_source_files",
     "dataset_fingerprint",
     "dataset_order_seed",
+    "dataset_shuffle",
     "data_cursor_start",
     "data_cursor_end",
     "data_cursor_next",
@@ -126,6 +127,28 @@ if adapter_manifest.get("dataset_source_files") != dataset_source_files:
 if adapter_manifest.get("dataset_fingerprint") != values["dataset_fingerprint"]:
     raise SystemExit(
         f"adapter manifest dataset_fingerprint {adapter_manifest.get('dataset_fingerprint')} did not match summary {values['dataset_fingerprint']}"
+    )
+if str(adapter_manifest.get("dataset_shuffle")).lower() != values["dataset_shuffle"]:
+    raise SystemExit(
+        f"adapter manifest dataset_shuffle {adapter_manifest.get('dataset_shuffle')} did not match summary {values['dataset_shuffle']}"
+    )
+expected_target_layers = [0, 1]
+expected_target_modules = [
+    "q_proj",
+    "k_proj",
+    "v_proj",
+    "o_proj",
+    "gate_proj",
+    "up_proj",
+    "down_proj",
+]
+if adapter_manifest.get("target_layers") != expected_target_layers:
+    raise SystemExit(
+        f"adapter manifest target_layers {adapter_manifest.get('target_layers')} != {expected_target_layers}"
+    )
+if adapter_manifest.get("target_modules") != expected_target_modules:
+    raise SystemExit(
+        f"adapter manifest target_modules {adapter_manifest.get('target_modules')} != {expected_target_modules}"
     )
 for key in ["initial_loss", "final_loss"]:
     if not math.isfinite(float(values[key])):
