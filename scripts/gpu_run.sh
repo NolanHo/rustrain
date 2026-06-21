@@ -10,10 +10,12 @@ fi
 REMOTE_HOST="${RUSTRAIN_REMOTE_HOST:-root@192.168.42.106}"
 REMOTE_PORT="${RUSTRAIN_REMOTE_PORT:-2222}"
 REMOTE_DIR="${RUSTRAIN_REMOTE_DIR:-/vePFS-Mindverse/user/nolanho/code/rustrain}"
+REMOTE_FALLBACK_DIR="${RUSTRAIN_REMOTE_FALLBACK_DIR:-/root/rustrain}"
 REMOTE_PYTHON="${RUSTRAIN_REMOTE_PYTHON:-/opt/venv/bin/python}"
 RAY_NUM_GPUS="${RUSTRAIN_RAY_NUM_GPUS:-1}"
 SYNC_TO_WORKER="${RUSTRAIN_SYNC_TO_WORKER:-0}"
 REMOTE_ARCHIVE=""
+NO_REMOTE_ARCHIVE="__RUSTRAIN_NO_ARCHIVE__"
 
 cleanup_remote_archive() {
   if [ -n "${REMOTE_ARCHIVE}" ]; then
@@ -33,7 +35,9 @@ if [ "${SYNC_TO_WORKER}" = "1" ]; then
   rm -f "${LOCAL_ARCHIVE}"
 fi
 
-ssh -p "${REMOTE_PORT}" "${REMOTE_HOST}" "${REMOTE_PYTHON}" - "${REMOTE_DIR}" "${RAY_NUM_GPUS}" "${REMOTE_ARCHIVE}" "$@" <<'PY'
+REMOTE_ARCHIVE_ARG="${REMOTE_ARCHIVE:-${NO_REMOTE_ARCHIVE}}"
+
+ssh -p "${REMOTE_PORT}" "${REMOTE_HOST}" "${REMOTE_PYTHON}" - "${REMOTE_DIR}" "${REMOTE_FALLBACK_DIR}" "${RAY_NUM_GPUS}" "${REMOTE_ARCHIVE_ARG}" "$@" <<'PY'
 import ray
 import hashlib
 import io
@@ -45,9 +49,12 @@ import sys
 import tarfile
 
 remote_dir = sys.argv[1]
-ray_num_gpus = float(sys.argv[2])
-remote_archive = sys.argv[3]
-command = shlex.join(sys.argv[4:])
+remote_fallback_dir = sys.argv[2]
+ray_num_gpus = float(sys.argv[3])
+remote_archive = sys.argv[4]
+if remote_archive == "__RUSTRAIN_NO_ARCHIVE__":
+    remote_archive = ""
+command = shlex.join(sys.argv[5:])
 archive_bytes = None
 if remote_archive:
     with open(remote_archive, "rb") as archive_file:
@@ -56,7 +63,12 @@ if remote_archive:
 ray.init(address="auto")
 
 @ray.remote(num_gpus=ray_num_gpus)
-def run_on_gpu_worker(remote_dir: str, command: str, archive_bytes: bytes | None) -> str:
+def run_on_gpu_worker(
+    remote_dir: str,
+    remote_fallback_dir: str,
+    command: str,
+    archive_bytes: bytes | None,
+) -> str:
     accelerator_ids = ray.get_runtime_context().get_accelerator_ids().get("GPU", [])
     subprocess_env = os.environ.copy()
     if accelerator_ids and not subprocess_env.get("CUDA_VISIBLE_DEVICES"):
@@ -75,6 +87,15 @@ def run_on_gpu_worker(remote_dir: str, command: str, archive_bytes: bytes | None
                 if target != work_dir_abs and not target.startswith(work_dir_abs + os.sep):
                     raise RuntimeError(f"refusing unsafe archive path: {member.name}")
             archive.extractall(work_dir_abs)
+    elif not os.path.isdir(work_dir):
+        if remote_fallback_dir and os.path.isdir(remote_fallback_dir):
+            work_dir = remote_fallback_dir
+        else:
+            raise RuntimeError(
+                "remote checkout does not exist and no fallback is available: "
+                f"remote_dir={remote_dir}, fallback={remote_fallback_dir}; "
+                "set RUSTRAIN_SYNC_TO_WORKER=1 to stage the local worktree"
+            )
     worker_header = (
         f"Ray worker host={os.uname().nodename} "
         f"accelerator_ids={accelerator_ids} "
@@ -117,5 +138,15 @@ RUSTRAIN_GPU_PROBE
         raise RuntimeError(worker_header + result.stdout)
     return worker_header + result.stdout
 
-print(ray.get(run_on_gpu_worker.remote(remote_dir, command, archive_bytes)), end="")
+print(
+    ray.get(
+        run_on_gpu_worker.remote(
+            remote_dir,
+            remote_fallback_dir,
+            command,
+            archive_bytes,
+        )
+    ),
+    end="",
+)
 PY

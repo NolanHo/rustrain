@@ -42,18 +42,24 @@ smokes, parity commands, or quick local CPU checks on the local machine. Do not
 run them directly in the plain SSH shell either; that shell does not expose the
 GPU devices. If a check is worth running, run it on a Ray GPU worker.
 
-The required remote checkout is:
+The preferred remote checkout is:
 
 ```sh
 /vePFS-Mindverse/user/nolanho/code/rustrain
 ```
 
-Current bootstrap fallback while the shared checkout is being prepared:
+If that shared checkout is not available on the Ray worker,
+`scripts/gpu_run.sh` automatically falls back to `/root/rustrain`. To verify
+uncommitted local edits, keep using `RUSTRAIN_SYNC_TO_WORKER=1`; it stages the
+current working tree into a temporary worker directory and does not depend on
+either remote checkout.
+
+To refresh the bootstrap fallback manually:
 
 ```sh
 tar --exclude .git --exclude target --exclude runs -cf - . \
   | ssh -p 2222 root@192.168.42.106 'rm -rf /root/rustrain && mkdir -p /root/rustrain && cd /root/rustrain && tar -xf -'
-RUSTRAIN_REMOTE_DIR=/root/rustrain scripts/verify_gpu.sh
+scripts/verify_gpu.sh
 ```
 
 The A800 config writes runs to `/tmp/rustrain-runs` because the shared project
