@@ -1162,24 +1162,27 @@ fn qwen_lora_sft_train(
     let weights = read_safetensors_map(&model_path.join("model.safetensors"))?;
     let config = read_runtime_config(&model_path.join("config.json"))?;
     let registry = QwenLoraRegistry::deterministic(&weights, &lora_config, true)?;
-    let sft_layer = *lora_config
-        .target_layers
-        .first()
-        .ok_or_else(|| anyhow!("LoRA config must include at least one target layer"))?;
-    let base_layer = QwenLayerWeights::load(&weights, sft_layer)?;
-    let base_requires_grad = base_layer.q_proj.requires_grad()
-        || base_layer.k_proj.requires_grad()
-        || base_layer.v_proj.requires_grad()
-        || base_layer.o_proj.requires_grad();
+    let mut base_requires_grad = false;
+    for layer_index in &lora_config.target_layers {
+        let base_layer = QwenLayerWeights::load(&weights, *layer_index)?;
+        base_requires_grad = base_requires_grad
+            || base_layer.q_proj.requires_grad()
+            || base_layer.k_proj.requires_grad()
+            || base_layer.v_proj.requires_grad()
+            || base_layer.o_proj.requires_grad()
+            || base_layer.gate_proj.requires_grad()
+            || base_layer.up_proj.requires_grad()
+            || base_layer.down_proj.requires_grad();
+    }
     let rank = lora_config.rank;
     let alpha = lora_config.alpha_f64();
 
-    let initial_loss = qwen_layer_lora_sft_loss(
+    let initial_loss = qwen_lora_sft_loss(
         &batch.input_ids,
         &batch.target_mask,
         &weights,
-        sft_layer,
-        registry.layer_adapter(sft_layer)?,
+        &lora_config,
+        &registry,
         &config,
     )?
     .double_value(&[]);
@@ -1199,12 +1202,12 @@ fn qwen_lora_sft_train(
         for (_, mut tensor) in registry.trainable_tensors() {
             tensor.zero_grad();
         }
-        let loss = qwen_layer_lora_sft_loss(
+        let loss = qwen_lora_sft_loss(
             &batch.input_ids,
             &batch.target_mask,
             &weights,
-            sft_layer,
-            registry.layer_adapter(sft_layer)?,
+            &lora_config,
+            &registry,
             &config,
         )?;
         loss.backward();
@@ -1265,12 +1268,12 @@ fn qwen_lora_sft_train(
         }
     }
 
-    let final_loss = qwen_layer_lora_sft_loss(
+    let final_loss = qwen_lora_sft_loss(
         &batch.input_ids,
         &batch.target_mask,
         &weights,
-        sft_layer,
-        registry.layer_adapter(sft_layer)?,
+        &lora_config,
+        &registry,
         &config,
     )?
     .double_value(&[]);
@@ -1282,12 +1285,12 @@ fn qwen_lora_sft_train(
 
     registry.save(adapter_output)?;
     let reloaded = QwenLoraRegistry::load(adapter_output)?;
-    let reloaded_loss = qwen_layer_lora_sft_loss(
+    let reloaded_loss = qwen_lora_sft_loss(
         &batch.input_ids,
         &batch.target_mask,
         &weights,
-        sft_layer,
-        reloaded.layer_adapter(sft_layer)?,
+        &lora_config,
+        &reloaded,
         &config,
     )?
     .double_value(&[]);
@@ -4511,6 +4514,32 @@ fn qwen_sft_padded_batch(
         masked_positions,
         padding_tokens,
     })
+}
+
+fn qwen_lora_sft_loss(
+    input_ids: &Tensor,
+    target_mask: &Tensor,
+    weights: &BTreeMap<String, Tensor>,
+    lora_config: &QwenLoraConfig,
+    registry: &QwenLoraRegistry,
+    config: &QwenRuntimeConfig,
+) -> Result<Tensor> {
+    if lora_config.target_layers.is_empty() {
+        bail!("LoRA config must include at least one target layer");
+    }
+
+    let mut layer_losses = Vec::with_capacity(lora_config.target_layers.len());
+    for layer_index in &lora_config.target_layers {
+        layer_losses.push(qwen_layer_lora_sft_loss(
+            input_ids,
+            target_mask,
+            weights,
+            *layer_index,
+            registry.layer_adapter(*layer_index)?,
+            config,
+        )?);
+    }
+    Ok(Tensor::stack(&layer_losses.iter().collect::<Vec<_>>(), 0).mean(Kind::Float))
 }
 
 fn qwen_layer_lora_sft_loss(

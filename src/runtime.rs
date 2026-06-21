@@ -260,11 +260,6 @@ pub fn validate_config(config: &Config) -> Result<()> {
         if lora.target_layers.is_empty() {
             return Err(anyhow!("lora.target_layers must not be empty"));
         }
-        if lora.target_layers.len() != 1 {
-            return Err(anyhow!(
-                "qwen_lora_sft currently supports exactly one lora.target_layers entry"
-            ));
-        }
         for layer in &lora.target_layers {
             if *layer >= config.model.num_layers {
                 return Err(anyhow!(
