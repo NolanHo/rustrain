@@ -41,6 +41,8 @@ for path in summaries:
         raise SystemExit(f"{path} attention_max_abs too large: {data['attention_max_abs']}")
     if float(data["mlp_max_abs"]) > 1e-5:
         raise SystemExit(f"{path} mlp_max_abs too large: {data['mlp_max_abs']}")
+    if float(data["layer0_max_abs"]) > 1e-5:
+        raise SystemExit(f"{path} layer0_max_abs too large: {data['layer0_max_abs']}")
     if not data.get("attention_train_loss_improved"):
         raise SystemExit(
             f"{path} expected attention train loss to improve, initial={data.get('attention_train_initial_loss')} final={data.get('attention_train_final_loss')}"
@@ -65,13 +67,24 @@ for path in summaries:
         raise SystemExit(
             f"{path} MLP train final loss {data['mlp_train_final_loss']} is not below initial {data['mlp_train_initial_loss']}"
         )
+    if not data.get("layer0_train_loss_improved"):
+        raise SystemExit(
+            f"{path} expected layer0 train loss to improve, initial={data.get('layer0_train_initial_loss')} final={data.get('layer0_train_final_loss')}"
+        )
+    if float(data["layer0_train_final_loss"]) >= float(data["layer0_train_initial_loss"]):
+        raise SystemExit(
+            f"{path} layer0 train final loss {data['layer0_train_final_loss']} is not below initial {data['layer0_train_initial_loss']}"
+        )
     for key in ["mlp_train_gate_grad_norm", "mlp_train_up_grad_norm", "mlp_train_down_grad_norm"]:
         if float(data[key]) <= 0.0:
             raise SystemExit(f"{path} expected positive {key}, got {data[key]}")
     attention_reduced = data["attention_reduced_output_shape"]
+    layer0_reduced = data["layer0_reduced_output_shape"]
     mlp_reduced = data["mlp_reduced_output_shape"]
     if attention_reduced != [1, 9, 896]:
         raise SystemExit(f"{path} unexpected attention reduced output shape {attention_reduced}")
+    if layer0_reduced != [1, 6, 896]:
+        raise SystemExit(f"{path} unexpected layer0 reduced output shape {layer0_reduced}")
     if mlp_reduced != [1, 7, 896]:
         raise SystemExit(f"{path} unexpected MLP reduced output shape {mlp_reduced}")
     q_heads.append((int(data["attention_q_head_start"]), int(data["attention_q_head_end"])))
@@ -87,6 +100,9 @@ for path in summaries:
             "mlp_max_abs": data["mlp_max_abs"],
             "attention_train_initial_loss": data["attention_train_initial_loss"],
             "attention_train_final_loss": data["attention_train_final_loss"],
+            "layer0_max_abs": data["layer0_max_abs"],
+            "layer0_train_initial_loss": data["layer0_train_initial_loss"],
+            "layer0_train_final_loss": data["layer0_train_final_loss"],
             "mlp_train_initial_loss": data["mlp_train_initial_loss"],
             "mlp_train_final_loss": data["mlp_train_final_loss"],
         }

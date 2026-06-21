@@ -140,10 +140,13 @@ full-MLP parity. The `qwen_trainable_session` trainer entry also accepts
 `tensor_model_parallel_size = 2` for a focused layer0 TP config path: it checks
 attention and MLP NCCL output parity, then runs focused attention and MLP shard
 backward/update smokes with positive q/k/v/o plus gate/up/down shard gradients
-and lower post-update global MSE losses. Real production tensor-parallel Qwen
-training is not implemented yet; the remaining TP gap is full train-step
-execution, full-parameter TP backward/update, production collectives, and
-sharded checkpoint/resume.
+and lower post-update global MSE losses. It also runs a fused layer0 TP smoke
+that all-reduces attention output before the post-attention norm, all-reduces
+MLP contributions, verifies full layer0 output parity, and checks a
+loss-reducing joint attention+MLP shard update. Real production tensor-parallel
+Qwen training is not implemented yet; the remaining TP gap is full train-step
+execution, full-parameter TP backward/update, autograd-aware production
+collectives, and sharded checkpoint/resume.
 The Qwen DP smoke writes a rank0-only JSON checkpoint manifest after gradient
 sync succeeds; non-rank0 summaries record the same checkpoint path but do not
 write it.
@@ -217,7 +220,7 @@ ownership remain open.
   representative `QwenTrainableSession` DP smokes, and a representative Qwen
   DP `train --config` path with rank0 checkpoint/resume parity exist. Focused
   TP=2 attention/MLP NCCL output parity plus attention/MLP shard
-  backward/update smokes also run through
+  backward/update and fused layer0 TP smokes also run through
   `train --config configs/qwen_session_tp2.toml`. Real
   production distributed training is still missing: full Qwen model/data,
   production TP train-step execution, and production sharded checkpoint
