@@ -94,6 +94,9 @@ Acceptance:
 Production distributed training must not overload the rank0 replicated format.
 It needs a separate sharded format with explicit rank-local ownership.
 
+The reserved manifest identifier is `rustrain.qwen_sharded.v1`. The current code
+defines and validates this schema, but no trainer path writes or restores it yet.
+
 Required manifest structure:
 
 - A global manifest at the checkpoint root.

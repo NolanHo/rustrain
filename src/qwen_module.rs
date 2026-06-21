@@ -338,6 +338,183 @@ impl QwenSessionDpCheckpointManifest {
     }
 }
 
+#[allow(dead_code)]
+impl QwenShardedCheckpointManifest {
+    fn validate(&self) -> Result<()> {
+        if self.format != "rustrain.qwen_sharded.v1" {
+            bail!("unsupported Qwen sharded checkpoint format {}", self.format);
+        }
+        if self.base_model_path.is_empty() {
+            bail!("Qwen sharded checkpoint requires base_model_path");
+        }
+        if self.tokenizer_path.is_empty() {
+            bail!("Qwen sharded checkpoint requires tokenizer_path");
+        }
+        if self.dtype.is_empty() {
+            bail!("Qwen sharded checkpoint requires dtype");
+        }
+        if self.optimizer.is_empty() {
+            bail!("Qwen sharded checkpoint requires optimizer");
+        }
+        let expected_world_size = self.parallel.world_size()?;
+        if self.ranks.len() != expected_world_size {
+            bail!(
+                "Qwen sharded checkpoint rank manifest count {} does not match world size {expected_world_size}",
+                self.ranks.len()
+            );
+        }
+
+        let mut seen_ranks = BTreeSet::new();
+        for rank in &self.ranks {
+            if !seen_ranks.insert(rank.rank) {
+                bail!(
+                    "Qwen sharded checkpoint contains duplicate rank {}",
+                    rank.rank
+                );
+            }
+            if rank.rank >= expected_world_size {
+                bail!(
+                    "Qwen sharded checkpoint rank {} exceeds world size {expected_world_size}",
+                    rank.rank
+                );
+            }
+            self.parallel.validate_rank(rank)?;
+            if rank.model_safetensors.is_empty() {
+                bail!(
+                    "Qwen sharded checkpoint rank {} is missing model_safetensors",
+                    rank.rank
+                );
+            }
+            if rank.optimizer_safetensors.is_empty() {
+                bail!(
+                    "Qwen sharded checkpoint rank {} is missing optimizer_safetensors",
+                    rank.rank
+                );
+            }
+            if rank.shards.is_empty() {
+                bail!(
+                    "Qwen sharded checkpoint rank {} must own at least one tensor shard",
+                    rank.rank
+                );
+            }
+            for shard in &rank.shards {
+                shard.validate(rank.rank)?;
+            }
+        }
+        for expected_rank in 0..expected_world_size {
+            if !seen_ranks.contains(&expected_rank) {
+                bail!("Qwen sharded checkpoint is missing rank {expected_rank}");
+            }
+        }
+        Ok(())
+    }
+}
+
+#[allow(dead_code)]
+impl QwenShardedParallelManifest {
+    fn world_size(&self) -> Result<usize> {
+        let sizes = [
+            self.data_parallel_size,
+            self.tensor_model_parallel_size,
+            self.pipeline_model_parallel_size,
+            self.expert_model_parallel_size,
+            self.context_parallel_size,
+        ];
+        if sizes.iter().any(|size| *size == 0) {
+            bail!("Qwen sharded checkpoint parallel sizes must be positive");
+        }
+        sizes.into_iter().try_fold(1usize, |world_size, size| {
+            world_size
+                .checked_mul(size)
+                .ok_or_else(|| anyhow!("Qwen sharded checkpoint parallel world size overflowed"))
+        })
+    }
+
+    fn validate_rank(&self, rank: &QwenRankShardManifest) -> Result<()> {
+        if rank.data_parallel_rank >= self.data_parallel_size {
+            bail!(
+                "Qwen sharded checkpoint rank {} has data_parallel_rank {} outside size {}",
+                rank.rank,
+                rank.data_parallel_rank,
+                self.data_parallel_size
+            );
+        }
+        if rank.tensor_model_parallel_rank >= self.tensor_model_parallel_size {
+            bail!(
+                "Qwen sharded checkpoint rank {} has tensor_model_parallel_rank {} outside size {}",
+                rank.rank,
+                rank.tensor_model_parallel_rank,
+                self.tensor_model_parallel_size
+            );
+        }
+        if rank.pipeline_model_parallel_rank >= self.pipeline_model_parallel_size {
+            bail!(
+                "Qwen sharded checkpoint rank {} has pipeline_model_parallel_rank {} outside size {}",
+                rank.rank,
+                rank.pipeline_model_parallel_rank,
+                self.pipeline_model_parallel_size
+            );
+        }
+        if rank.expert_model_parallel_rank >= self.expert_model_parallel_size {
+            bail!(
+                "Qwen sharded checkpoint rank {} has expert_model_parallel_rank {} outside size {}",
+                rank.rank,
+                rank.expert_model_parallel_rank,
+                self.expert_model_parallel_size
+            );
+        }
+        if rank.context_parallel_rank >= self.context_parallel_size {
+            bail!(
+                "Qwen sharded checkpoint rank {} has context_parallel_rank {} outside size {}",
+                rank.rank,
+                rank.context_parallel_rank,
+                self.context_parallel_size
+            );
+        }
+        Ok(())
+    }
+}
+
+#[allow(dead_code)]
+impl QwenTensorShardManifestEntry {
+    fn validate(&self, rank: usize) -> Result<()> {
+        if self.name.is_empty() {
+            bail!("Qwen sharded checkpoint rank {rank} has a shard without a tensor name");
+        }
+        if self.shard_name.is_empty() {
+            bail!(
+                "Qwen sharded checkpoint rank {rank} tensor {} is missing shard_name",
+                self.name
+            );
+        }
+        if self.optimizer_m_name.is_empty() || self.optimizer_v_name.is_empty() {
+            bail!(
+                "Qwen sharded checkpoint rank {rank} tensor {} is missing optimizer slots",
+                self.name
+            );
+        }
+        if self.global_shape.is_empty() || self.shard_shape.is_empty() {
+            bail!(
+                "Qwen sharded checkpoint rank {rank} tensor {} is missing shape metadata",
+                self.name
+            );
+        }
+        if self.dtype.is_empty() {
+            bail!(
+                "Qwen sharded checkpoint rank {rank} tensor {} is missing dtype",
+                self.name
+            );
+        }
+        if self.partition.is_empty() {
+            bail!(
+                "Qwen sharded checkpoint rank {rank} tensor {} is missing partition policy",
+                self.name
+            );
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct QwenGradSignature {
     name: String,
@@ -388,6 +565,61 @@ struct QwenDeltaTensorManifestEntry {
     dtype: String,
     grad_norm: f64,
     delta_norm: f64,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct QwenShardedCheckpointManifest {
+    format: String,
+    base_model_path: String,
+    tokenizer_path: String,
+    global_step: u64,
+    consumed_samples: u64,
+    consumed_tokens: u64,
+    seed: u64,
+    dtype: String,
+    optimizer: String,
+    scheduler: String,
+    parallel: QwenShardedParallelManifest,
+    ranks: Vec<QwenRankShardManifest>,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct QwenShardedParallelManifest {
+    data_parallel_size: usize,
+    tensor_model_parallel_size: usize,
+    pipeline_model_parallel_size: usize,
+    expert_model_parallel_size: usize,
+    context_parallel_size: usize,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct QwenRankShardManifest {
+    rank: usize,
+    data_parallel_rank: usize,
+    tensor_model_parallel_rank: usize,
+    pipeline_model_parallel_rank: usize,
+    expert_model_parallel_rank: usize,
+    context_parallel_rank: usize,
+    model_safetensors: String,
+    optimizer_safetensors: String,
+    shards: Vec<QwenTensorShardManifestEntry>,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct QwenTensorShardManifestEntry {
+    name: String,
+    shard_name: String,
+    optimizer_m_name: String,
+    optimizer_v_name: String,
+    global_shape: Vec<i64>,
+    shard_shape: Vec<i64>,
+    dtype: String,
+    partition: String,
+    tied_group: Option<String>,
 }
 
 struct AdamSlotNames {
@@ -5117,6 +5349,52 @@ mod tests {
     }
 
     #[test]
+    fn qwen_sharded_checkpoint_manifest_validates_rank_owned_shards() {
+        let manifest = tiny_qwen_sharded_manifest();
+        let encoded = serde_json::to_string_pretty(&manifest).expect("manifest should serialize");
+        let decoded: QwenShardedCheckpointManifest =
+            serde_json::from_str(&encoded).expect("manifest should deserialize");
+
+        decoded.validate().expect("manifest should validate");
+        assert_eq!(decoded.format, "rustrain.qwen_sharded.v1");
+        assert_eq!(decoded.parallel.world_size().unwrap(), 2);
+        assert_eq!(
+            decoded.ranks[0].shards[0].optimizer_m_name,
+            "rank0.q_proj.m"
+        );
+        assert_eq!(
+            decoded.ranks[1].shards[0].optimizer_v_name,
+            "rank1.q_proj.v"
+        );
+    }
+
+    #[test]
+    fn qwen_sharded_checkpoint_manifest_rejects_missing_rank() {
+        let mut manifest = tiny_qwen_sharded_manifest();
+        manifest.ranks.pop();
+
+        let error = manifest.validate().expect_err("missing rank should fail");
+
+        assert!(
+            error
+                .to_string()
+                .contains("rank manifest count 1 does not match world size 2")
+        );
+    }
+
+    #[test]
+    fn qwen_sharded_checkpoint_manifest_rejects_missing_optimizer_slots() {
+        let mut manifest = tiny_qwen_sharded_manifest();
+        manifest.ranks[0].shards[0].optimizer_m_name.clear();
+
+        let error = manifest
+            .validate()
+            .expect_err("missing optimizer slots should fail");
+
+        assert!(error.to_string().contains("missing optimizer slots"));
+    }
+
+    #[test]
     fn qwen_optimizer_slots_reload_reproduces_next_adam_step() {
         let temp = tempfile::tempdir().expect("temp dir should be created");
         let optimizer_output = temp.path().join("optimizer.safetensors");
@@ -5996,6 +6274,72 @@ mod tests {
         let cached_ids: Vec<i64> = Vec::<i64>::try_from(cached.reshape([-1])).unwrap();
 
         assert_eq!(cached_ids, full_ids);
+    }
+
+    fn tiny_qwen_sharded_manifest() -> QwenShardedCheckpointManifest {
+        QwenShardedCheckpointManifest {
+            format: "rustrain.qwen_sharded.v1".to_string(),
+            base_model_path: "/models/qwen".to_string(),
+            tokenizer_path: "/models/qwen/tokenizer.json".to_string(),
+            global_step: 3,
+            consumed_samples: 8,
+            consumed_tokens: 40,
+            seed: 42,
+            dtype: "float32".to_string(),
+            optimizer: "adamw".to_string(),
+            scheduler: "linear_decay".to_string(),
+            parallel: QwenShardedParallelManifest {
+                data_parallel_size: 2,
+                tensor_model_parallel_size: 1,
+                pipeline_model_parallel_size: 1,
+                expert_model_parallel_size: 1,
+                context_parallel_size: 1,
+            },
+            ranks: vec![
+                QwenRankShardManifest {
+                    rank: 0,
+                    data_parallel_rank: 0,
+                    tensor_model_parallel_rank: 0,
+                    pipeline_model_parallel_rank: 0,
+                    expert_model_parallel_rank: 0,
+                    context_parallel_rank: 0,
+                    model_safetensors: "rank0/model.safetensors".to_string(),
+                    optimizer_safetensors: "rank0/optimizer.safetensors".to_string(),
+                    shards: vec![QwenTensorShardManifestEntry {
+                        name: "model.layers.0.self_attn.q_proj.weight".to_string(),
+                        shard_name: "rank0.q_proj".to_string(),
+                        optimizer_m_name: "rank0.q_proj.m".to_string(),
+                        optimizer_v_name: "rank0.q_proj.v".to_string(),
+                        global_shape: vec![4, 4],
+                        shard_shape: vec![4, 4],
+                        dtype: "float32".to_string(),
+                        partition: "replicated_dp".to_string(),
+                        tied_group: None,
+                    }],
+                },
+                QwenRankShardManifest {
+                    rank: 1,
+                    data_parallel_rank: 1,
+                    tensor_model_parallel_rank: 0,
+                    pipeline_model_parallel_rank: 0,
+                    expert_model_parallel_rank: 0,
+                    context_parallel_rank: 0,
+                    model_safetensors: "rank1/model.safetensors".to_string(),
+                    optimizer_safetensors: "rank1/optimizer.safetensors".to_string(),
+                    shards: vec![QwenTensorShardManifestEntry {
+                        name: "model.layers.0.self_attn.q_proj.weight".to_string(),
+                        shard_name: "rank1.q_proj".to_string(),
+                        optimizer_m_name: "rank1.q_proj.m".to_string(),
+                        optimizer_v_name: "rank1.q_proj.v".to_string(),
+                        global_shape: vec![4, 4],
+                        shard_shape: vec![4, 4],
+                        dtype: "float32".to_string(),
+                        partition: "replicated_dp".to_string(),
+                        tied_group: None,
+                    }],
+                },
+            ],
+        }
     }
 
     fn tiny_qwen_weights() -> BTreeMap<String, Tensor> {

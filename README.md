@@ -142,7 +142,8 @@ remain open.
   smoke: manifest-driven reload restores delta tensors plus Adam optimizer
   slots and proves next-step parity. The representative Qwen DP trainer path
   also has rank0 delta/optimizer artifacts and next-step resume parity. A
-  production sharded checkpoint layout is still open.
+  production sharded checkpoint schema is defined and validated, but sharded
+  writers and restore are still open.
 - C4/G1 trainer-owned Qwen training is still incomplete, but the full-train
   smoke now uses a reusable `QwenTrainableSession` surface, and representative
   single-GPU plus DP=2 config paths are wired through `train --config`. Full
@@ -168,8 +169,9 @@ remain open.
   production distributed training is still missing: full Qwen model/data and
   sharded checkpoint ownership are not yet implemented.
 - Production distributed checkpoint rules are documented in
-  [docs/checkpoints.md](docs/checkpoints.md), but the sharded checkpoint format
-  is not implemented yet.
+  [docs/checkpoints.md](docs/checkpoints.md), with a validated
+  `rustrain.qwen_sharded.v1` manifest schema. Sharded checkpoint writers and
+  restore are not implemented yet.
 - Trainer production basics such as scheduler, grad clipping, RSS memory
   metrics, and Ray-worker GPU memory reporting are implemented for toy/tch
   paths; real tokenizer-backed padded LoRA SFT batching is wired through a
