@@ -9,10 +9,12 @@ CONFIG="${RUSTRAIN_QWEN_SESSION_DP_LAYERS_CONFIG:-configs/qwen_session_dp2_layer
 EXPECTED_TRAINABLE_TENSORS="${RUSTRAIN_EXPECTED_QWEN_DP_TRAINABLE_TENSORS:-25}"
 EXPECTED_DTYPE="${RUSTRAIN_EXPECTED_QWEN_COMPUTE_KIND:-fp32}"
 EXPECTED_DATASET_SEED="${RUSTRAIN_EXPECTED_DATASET_ORDER_SEED:-}"
+EXPECTED_TRAINABLE_NAMES="${RUSTRAIN_EXPECTED_QWEN_DP_TRAINABLE_NAMES:-model.layers.0.self_attn.q_proj.weight,model.layers.0.mlp.down_proj.weight,model.layers.1.self_attn.q_proj.weight,model.layers.1.mlp.down_proj.weight,model.norm.weight}"
 export RUSTRAIN_DISTRIBUTED_VERIFY_OUTPUT_DIR="${OUTPUT_DIR}"
 export RUSTRAIN_EXPECTED_QWEN_DP_TRAINABLE_TENSORS="${EXPECTED_TRAINABLE_TENSORS}"
 export RUSTRAIN_EXPECTED_QWEN_COMPUTE_KIND="${EXPECTED_DTYPE}"
 export RUSTRAIN_EXPECTED_DATASET_ORDER_SEED="${EXPECTED_DATASET_SEED}"
+export RUSTRAIN_EXPECTED_QWEN_DP_TRAINABLE_NAMES="${EXPECTED_TRAINABLE_NAMES}"
 
 cargo run -- launch \
   --nproc-per-node 2 \
@@ -28,19 +30,17 @@ output_dir = pathlib.Path(os.environ["RUSTRAIN_DISTRIBUTED_VERIFY_OUTPUT_DIR"])
 expected_trainable_tensors = int(os.environ["RUSTRAIN_EXPECTED_QWEN_DP_TRAINABLE_TENSORS"])
 expected_dtype = os.environ.get("RUSTRAIN_EXPECTED_QWEN_COMPUTE_KIND")
 expected_dataset_seed = os.environ.get("RUSTRAIN_EXPECTED_DATASET_ORDER_SEED")
+expected_trainable_names = [
+    name.strip()
+    for name in os.environ["RUSTRAIN_EXPECTED_QWEN_DP_TRAINABLE_NAMES"].split(",")
+    if name.strip()
+]
 rank_summaries = sorted(output_dir.rglob("qwen-session-dp-rank-*.json"))
 if len(rank_summaries) != 2:
     raise SystemExit(
         f"expected 2 qwen session DP rank summaries under {output_dir}, found {len(rank_summaries)}"
     )
 
-expected_layer_names = [
-    "model.layers.0.self_attn.q_proj.weight",
-    "model.layers.0.mlp.down_proj.weight",
-    "model.layers.1.self_attn.q_proj.weight",
-    "model.layers.1.mlp.down_proj.weight",
-    "model.norm.weight",
-]
 evidence = []
 rank0_manifest_path = None
 for path in rank_summaries:
@@ -63,7 +63,7 @@ for path in rank_summaries:
         )
     if "model.embed_tokens.weight" in trainable_tensors:
         raise SystemExit(f"{path} DP representative path must not train tied embedding")
-    for name in expected_layer_names:
+    for name in expected_trainable_names:
         if name not in trainable_tensors:
             raise SystemExit(f"{path} missing expected trainable tensor {name}")
 
