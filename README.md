@@ -162,7 +162,9 @@ representative DP path is available through
 `configs/qwen_session_dp2_bf16.toml`. The session registry now expands
 trainable transformer layers from `model.trainable_layers` and defaults to
 `[0]`; `configs/qwen_session_single_layers01.toml` verifies a layer0+layer1
-single-GPU path with 26 trainable tensors. Full production Qwen trainer
+single-GPU path with 26 trainable tensors, and
+`configs/qwen_session_single_layers03.toml` verifies a layer0-layer3
+single-GPU path with 50 trainable tensors. Full production Qwen trainer
 ownership, full real data streaming, and production-grade sharded checkpoint
 ownership remain open.
 

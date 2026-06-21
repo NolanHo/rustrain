@@ -43,4 +43,5 @@ remote_run bash scripts/verify_qwen_session_single_bf16_worker.sh
 remote_run bash scripts/verify_qwen_session_single_resume.sh
 remote_run bash scripts/verify_qwen_session_single_sft_resume.sh
 remote_run bash scripts/verify_qwen_session_layers01_worker.sh
+remote_run bash scripts/verify_qwen_session_layers03_worker.sh
 remote_run bash scripts/verify_qwen_full_train_smoke_worker.sh
