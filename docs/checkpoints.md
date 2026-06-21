@@ -160,8 +160,13 @@ focused shard SGD update from the restored shards and verifies next-update
 output parity against the continuous focused path. The trainer-entry TP path
 also verifies a focused causal-LM train-step over a real token batch, but the
 checkpoint artifacts still only cover focused layer0 TP shard state with smoke
-optimizer slots. Production full-parameter TP checkpoint resume and full
-production sharded restore over external streaming real data remain open.
+optimizer slots. The focused TP verifier now also checks the global manifest's
+base model identity, tokenizer identity, global step, consumed sample/token
+counts, seed, dtype, optimizer, scheduler, explicit lack of JSONL provenance for
+the focused smoke, exact parallel topology, embedded rank manifests, and every
+declared rank-owned model shard plus AdamW slot shape in the written safetensors
+files. Production full-parameter TP checkpoint resume and full production
+sharded restore over external streaming real data remain open.
 The focused EP `parallel-ep-tch-moe-rank-smoke` also writes
 `rustrain.ep_sharded.v1` rank manifests. Each rank owns a contiguous expert
 range and writes two model shards, `experts.up.weight` and

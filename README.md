@@ -154,8 +154,11 @@ rank-owned focused TP shard manifests for layer0 attention/MLP tensors under
 the shared `rustrain.qwen_sharded.v1` schema, with zero Adam slots as
 checkpoint-contract evidence, and restores those rank-owned shards to reproduce
 the focused fused layer0 output plus the next focused shard update within
-tolerance. Real production tensor-parallel Qwen training is not implemented
-yet; the remaining TP gap is full-parameter TP backward/update, autograd-aware
+tolerance. The TP verifier also checks the global manifest identity,
+progress/provenance defaults, embedded rank manifests, and every declared
+rank-owned model shard plus AdamW slot shape in the written safetensors files.
+Real production tensor-parallel Qwen training is not implemented yet; the
+remaining TP gap is full-parameter TP backward/update, autograd-aware
 production collectives, and trainer-owned sharded checkpoint resume.
 The Qwen DP smoke writes a rank0-only JSON checkpoint manifest after gradient
 sync succeeds; non-rank0 summaries record the same checkpoint path but do not

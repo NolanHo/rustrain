@@ -17,6 +17,8 @@ import json
 import pathlib
 import sys
 
+from safetensors import safe_open
+
 output_dir = pathlib.Path(sys.argv[1])
 summaries = sorted(output_dir.rglob("qwen-session-tp-rank-*.json"))
 if len(summaries) != 2:
@@ -27,6 +29,17 @@ q_heads = []
 kv_heads = []
 intermediate = []
 global_manifests = set()
+rank_manifest_by_rank = {}
+
+
+def tensor_shapes(path):
+    tensors = {}
+    with safe_open(str(path), framework="pt", device="cpu") as handle:
+        for key in handle.keys():
+            tensors[key] = list(handle.get_tensor(key).shape)
+    return tensors
+
+
 for path in summaries:
     data = json.loads(path.read_text())
     rank = int(data["rank"])
@@ -134,22 +147,65 @@ for path in summaries:
     if not rank_manifest_path.exists():
         raise SystemExit(f"{path} missing TP rank sharded manifest {rank_manifest_path}")
     rank_manifest = json.loads(rank_manifest_path.read_text())
+    rank_manifest_by_rank[rank] = (rank_manifest_path, rank_manifest)
     if rank_manifest["rank"] != rank:
         raise SystemExit(f"{rank_manifest_path} rank {rank_manifest['rank']} != {rank}")
     if rank_manifest["tensor_model_parallel_rank"] != rank:
         raise SystemExit(
             f"{rank_manifest_path} tensor_model_parallel_rank {rank_manifest['tensor_model_parallel_rank']} != {rank}"
         )
+    if rank_manifest["data_parallel_rank"] != 0:
+        raise SystemExit(f"{rank_manifest_path} expected data_parallel_rank 0, got {rank_manifest['data_parallel_rank']}")
+    if rank_manifest["pipeline_model_parallel_rank"] != 0:
+        raise SystemExit(
+            f"{rank_manifest_path} expected pipeline_model_parallel_rank 0, got {rank_manifest['pipeline_model_parallel_rank']}"
+        )
+    if rank_manifest["expert_model_parallel_rank"] != 0:
+        raise SystemExit(
+            f"{rank_manifest_path} expected expert_model_parallel_rank 0, got {rank_manifest['expert_model_parallel_rank']}"
+        )
+    if rank_manifest["context_parallel_rank"] != 0:
+        raise SystemExit(
+            f"{rank_manifest_path} expected context_parallel_rank 0, got {rank_manifest['context_parallel_rank']}"
+        )
     if len(rank_manifest["shards"]) != 9:
         raise SystemExit(f"{rank_manifest_path} expected 9 shards, got {len(rank_manifest['shards'])}")
     partitions = {entry["partition"] for entry in rank_manifest["shards"]}
     if not {"tp_row", "tp_col", "replicated_norm_smoke"}.issubset(partitions):
         raise SystemExit(f"{rank_manifest_path} missing expected TP partitions, got {sorted(partitions)}")
+    model_path = pathlib.Path(rank_manifest["model_safetensors"])
+    optimizer_path = pathlib.Path(rank_manifest["optimizer_safetensors"])
+    if not model_path.exists() or model_path.stat().st_size == 0:
+        raise SystemExit(f"{rank_manifest_path} missing or empty model_safetensors {model_path}")
+    if not optimizer_path.exists() or optimizer_path.stat().st_size == 0:
+        raise SystemExit(f"{rank_manifest_path} missing or empty optimizer_safetensors {optimizer_path}")
+    model_shapes = tensor_shapes(model_path)
+    optimizer_shapes = tensor_shapes(optimizer_path)
     for entry in rank_manifest["shards"]:
         if not entry["optimizer_m_name"] or not entry["optimizer_v_name"]:
             raise SystemExit(f"{rank_manifest_path} shard {entry['name']} missing optimizer slots")
         if not entry["global_shape"] or not entry["shard_shape"]:
             raise SystemExit(f"{rank_manifest_path} shard {entry['name']} missing shapes")
+        if entry["shard_name"] not in model_shapes:
+            raise SystemExit(f"{rank_manifest_path} model safetensors missing shard {entry['shard_name']}")
+        if model_shapes[entry["shard_name"]] != entry["shard_shape"]:
+            raise SystemExit(
+                f"{rank_manifest_path} shard {entry['shard_name']} shape {model_shapes[entry['shard_name']]} != {entry['shard_shape']}"
+            )
+        if entry["optimizer_m_name"] not in optimizer_shapes:
+            raise SystemExit(f"{rank_manifest_path} optimizer safetensors missing m slot {entry['optimizer_m_name']}")
+        if entry["optimizer_v_name"] not in optimizer_shapes:
+            raise SystemExit(f"{rank_manifest_path} optimizer safetensors missing v slot {entry['optimizer_v_name']}")
+        if optimizer_shapes[entry["optimizer_m_name"]] != entry["shard_shape"]:
+            raise SystemExit(
+                f"{rank_manifest_path} optimizer m slot {entry['optimizer_m_name']} shape "
+                f"{optimizer_shapes[entry['optimizer_m_name']]} != {entry['shard_shape']}"
+            )
+        if optimizer_shapes[entry["optimizer_v_name"]] != entry["shard_shape"]:
+            raise SystemExit(
+                f"{rank_manifest_path} optimizer v slot {entry['optimizer_v_name']} shape "
+                f"{optimizer_shapes[entry['optimizer_v_name']]} != {entry['shard_shape']}"
+            )
     global_manifests.add(data["sharded_global_manifest_output"])
     q_heads.append((int(data["attention_q_head_start"]), int(data["attention_q_head_end"])))
     kv_heads.append((int(data["attention_kv_head_start"]), int(data["attention_kv_head_end"])))
@@ -201,13 +257,67 @@ if not global_manifest_path.exists():
 global_manifest = json.loads(global_manifest_path.read_text())
 if global_manifest["format"] != "rustrain.qwen_sharded.v1":
     raise SystemExit(f"unexpected TP global manifest format {global_manifest['format']}")
+if global_manifest["base_model_path"] != "/vePFS-Mindverse/share/huggingface/Qwen2.5-0.5B-Instruct":
+    raise SystemExit(f"unexpected TP base_model_path {global_manifest['base_model_path']}")
+if global_manifest["tokenizer_path"] != "/vePFS-Mindverse/share/huggingface/Qwen2.5-0.5B-Instruct/tokenizer.json":
+    raise SystemExit(f"unexpected TP tokenizer_path {global_manifest['tokenizer_path']}")
+if int(global_manifest["global_step"]) != 1:
+    raise SystemExit(f"unexpected TP global_step {global_manifest['global_step']}")
+if int(global_manifest["consumed_samples"]) != 2:
+    raise SystemExit(f"unexpected TP consumed_samples {global_manifest['consumed_samples']}")
+if int(global_manifest["consumed_tokens"]) != 10:
+    raise SystemExit(f"unexpected TP consumed_tokens {global_manifest['consumed_tokens']}")
+if global_manifest["data_cursor_next"] is not None:
+    raise SystemExit(f"focused TP global manifest should not claim data_cursor_next: {global_manifest['data_cursor_next']}")
+if global_manifest["data_epoch_next"] is not None:
+    raise SystemExit(f"focused TP global manifest should not claim data_epoch_next: {global_manifest['data_epoch_next']}")
+if global_manifest["data_sample_offset_next"] is not None:
+    raise SystemExit(
+        f"focused TP global manifest should not claim data_sample_offset_next: {global_manifest['data_sample_offset_next']}"
+    )
+if global_manifest["data_train_samples"] is not None:
+    raise SystemExit(f"focused TP global manifest should not claim data_train_samples: {global_manifest['data_train_samples']}")
+if global_manifest["dataset_source_files"] != []:
+    raise SystemExit(f"focused TP global manifest should not claim dataset_source_files: {global_manifest['dataset_source_files']}")
+if global_manifest["dataset_source_sample_counts"] != []:
+    raise SystemExit(
+        "focused TP global manifest should not claim dataset_source_sample_counts: "
+        f"{global_manifest['dataset_source_sample_counts']}"
+    )
+if global_manifest["dataset_fingerprint"] != "":
+    raise SystemExit(f"focused TP global manifest should not claim dataset_fingerprint: {global_manifest['dataset_fingerprint']}")
+if global_manifest["dataset_shuffle"] is not True:
+    raise SystemExit(f"unexpected TP dataset_shuffle {global_manifest['dataset_shuffle']}")
+if int(global_manifest["seed"]) != 42:
+    raise SystemExit(f"unexpected TP seed {global_manifest['seed']}")
+if global_manifest["dtype"] != "fp32":
+    raise SystemExit(f"unexpected TP dtype {global_manifest['dtype']}")
+if global_manifest["optimizer"] != "adamw_zero_slots_smoke":
+    raise SystemExit(f"unexpected TP optimizer {global_manifest['optimizer']}")
+if global_manifest["scheduler"] != "constant":
+    raise SystemExit(f"unexpected TP scheduler {global_manifest['scheduler']}")
 parallel = global_manifest["parallel"]
-if parallel["tensor_model_parallel_size"] != 2 or parallel["data_parallel_size"] != 1:
+expected_parallel = {
+    "data_parallel_size": 1,
+    "tensor_model_parallel_size": 2,
+    "pipeline_model_parallel_size": 1,
+    "expert_model_parallel_size": 1,
+    "context_parallel_size": 1,
+}
+if parallel != expected_parallel:
     raise SystemExit(f"unexpected TP global parallel config {parallel}")
 if len(global_manifest["ranks"]) != 2:
     raise SystemExit(f"expected 2 TP global rank manifests, got {len(global_manifest['ranks'])}")
 if sorted(rank["tensor_model_parallel_rank"] for rank in global_manifest["ranks"]) != [0, 1]:
     raise SystemExit("TP global manifest does not cover tensor parallel ranks 0 and 1")
+for global_rank in global_manifest["ranks"]:
+    rank = int(global_rank["rank"])
+    manifest_pair = rank_manifest_by_rank.get(rank)
+    if manifest_pair is None:
+        raise SystemExit(f"TP global manifest references rank {rank}, but no rank manifest was verified")
+    _, rank_manifest = manifest_pair
+    if global_rank != rank_manifest:
+        raise SystemExit(f"TP global manifest embedded rank {rank} does not match rank manifest file")
 
 print(json.dumps({"qwen_session_tp2_verified": evidence, "assigned_cuda_visible_devices": assigned}, indent=2))
 PY
