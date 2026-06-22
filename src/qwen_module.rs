@@ -1647,6 +1647,10 @@ struct QwenSftFieldMap {
     min_prompt_chars: Option<usize>,
     #[serde(default)]
     max_prompt_chars: Option<usize>,
+    #[serde(default)]
+    min_sample_chars: Option<usize>,
+    #[serde(default)]
+    max_sample_chars: Option<usize>,
     source_weights: Vec<usize>,
 }
 
@@ -1667,6 +1671,8 @@ impl QwenSftFieldMap {
             max_input_chars: data.max_input_chars,
             min_prompt_chars: data.min_prompt_chars,
             max_prompt_chars: data.max_prompt_chars,
+            min_sample_chars: data.min_sample_chars,
+            max_sample_chars: data.max_sample_chars,
             source_weights: data.source_weights.clone(),
         };
         map.validate()?;
@@ -1754,6 +1760,24 @@ impl QwenSftFieldMap {
                 );
             }
         }
+        if let Some(min_sample_chars) = self.min_sample_chars {
+            if min_sample_chars == 0 {
+                bail!("data.min_sample_chars must be greater than zero");
+            }
+        }
+        if let Some(max_sample_chars) = self.max_sample_chars {
+            if max_sample_chars == 0 {
+                bail!("data.max_sample_chars must be greater than zero");
+            }
+            if self
+                .min_sample_chars
+                .is_some_and(|min_sample_chars| max_sample_chars < min_sample_chars)
+            {
+                bail!(
+                    "data.max_sample_chars must be greater than or equal to data.min_sample_chars"
+                );
+            }
+        }
         Ok(())
     }
 }
@@ -1776,6 +1800,8 @@ impl Default for QwenSftFieldMap {
             max_input_chars: None,
             min_prompt_chars: None,
             max_prompt_chars: None,
+            min_sample_chars: None,
+            max_sample_chars: None,
             source_weights: Vec::new(),
         }
     }
@@ -11659,16 +11685,19 @@ fn qwen_normalize_jsonl_field(value: String, field_map: &QwenSftFieldMap) -> Str
 }
 
 fn qwen_sft_record_passes_filters(record: &QwenSftRecord, field_map: &QwenSftFieldMap) -> bool {
-    let prompt_chars =
-        if field_map.min_prompt_chars.is_some() || field_map.max_prompt_chars.is_some() {
-            Some(
-                qwen_render_sft_record_prompt(record, field_map)
-                    .chars()
-                    .count(),
-            )
-        } else {
-            None
-        };
+    let needs_prompt_chars = field_map.min_prompt_chars.is_some()
+        || field_map.max_prompt_chars.is_some()
+        || field_map.min_sample_chars.is_some()
+        || field_map.max_sample_chars.is_some();
+    let prompt_chars = if needs_prompt_chars {
+        Some(
+            qwen_render_sft_record_prompt(record, field_map)
+                .chars()
+                .count(),
+        )
+    } else {
+        None
+    };
     qwen_sft_length_filter_passes(
         record.response.chars().count(),
         Some(field_map.min_response_chars),
@@ -11686,6 +11715,10 @@ fn qwen_sft_record_passes_filters(record: &QwenSftRecord, field_map: &QwenSftFie
             chars,
             field_map.min_prompt_chars,
             field_map.max_prompt_chars,
+        ) && qwen_sft_length_filter_passes(
+            chars + record.response.chars().count(),
+            field_map.min_sample_chars,
+            field_map.max_sample_chars,
         )
     })
 }
@@ -11816,6 +11849,16 @@ fn qwen_sft_hash_field_map(hash: &mut u64, field_map: &QwenSftFieldMap) {
     if let Some(max_prompt_chars) = field_map.max_prompt_chars {
         qwen_sft_hash_bytes(hash, b"max_prompt_chars");
         qwen_sft_hash_bytes(hash, max_prompt_chars.to_string().as_bytes());
+        qwen_sft_hash_bytes(hash, b"\0");
+    }
+    if let Some(min_sample_chars) = field_map.min_sample_chars {
+        qwen_sft_hash_bytes(hash, b"min_sample_chars");
+        qwen_sft_hash_bytes(hash, min_sample_chars.to_string().as_bytes());
+        qwen_sft_hash_bytes(hash, b"\0");
+    }
+    if let Some(max_sample_chars) = field_map.max_sample_chars {
+        qwen_sft_hash_bytes(hash, b"max_sample_chars");
+        qwen_sft_hash_bytes(hash, max_sample_chars.to_string().as_bytes());
         qwen_sft_hash_bytes(hash, b"\0");
     }
     qwen_sft_hash_bytes(hash, b"source_weights");
@@ -15050,6 +15093,87 @@ mod tests {
                 .map(|example| (example.instruction.as_str(), example.input.as_str()))
                 .collect::<Vec<_>>(),
             vec![("first", "ok"), ("second", "")]
+        );
+        assert_eq!(
+            source_index
+                .samples
+                .iter()
+                .map(|sample| sample.index_in_file)
+                .collect::<Vec<_>>(),
+            vec![1, 3]
+        );
+    }
+
+    #[test]
+    fn qwen_sft_filters_sample_lengths_before_limit_and_streaming_index() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let jsonl = temp.path().join("samples.jsonl");
+        let cache_path = temp.path().join("cache").join("offset-index.json");
+        fs::write(
+            &jsonl,
+            r#"{"instruction":"a","response":"x"}
+{"instruction":"first","input":"ok","response":"valid"}
+{"instruction":"too long","response":"this response is too long"}
+{"instruction":"second","response":"works"}
+{"instruction":"tiny","response":"z"}
+"#,
+        )
+        .expect("jsonl should write");
+        let paths = vec![jsonl.clone()];
+        let field_map = QwenSftFieldMap {
+            prompt_template: "Q:{instruction}\nA:".to_string(),
+            prompt_with_input_template: "Q:{instruction}\nI:{input}\nA:".to_string(),
+            min_sample_chars: Some(16),
+            max_sample_chars: Some(22),
+            ..QwenSftFieldMap::default()
+        };
+
+        let loaded = qwen_sft_examples_from_jsonl_paths_with_limit(&paths, Some(2), &field_map)
+            .expect("filtered examples should load");
+        let streamed = qwen_sft_streaming_source_summary(&paths, Some(2), &field_map)
+            .expect("filtered streaming summary should scan");
+        let source_index = qwen_sft_streaming_source_index(&paths, Some(2), &field_map)
+            .expect("filtered source index should build");
+        let raw_window = qwen_sft_examples_by_raw_indices(&source_index.samples, &field_map)
+            .expect("filtered raw window should read");
+        let cache = qwen_sft_streaming_source_index_with_cache(
+            &paths,
+            Some(2),
+            Some(&cache_path),
+            &field_map,
+        )
+        .expect("filtered cache should write");
+        let cache_mismatch = qwen_sft_streaming_source_index_with_cache(
+            &paths,
+            Some(2),
+            Some(&cache_path),
+            &QwenSftFieldMap::default(),
+        )
+        .expect_err("sample filter drift should reject cache")
+        .to_string();
+
+        assert_eq!(
+            loaded
+                .examples
+                .iter()
+                .map(|example| (example.instruction.as_str(), example.response.as_str()))
+                .collect::<Vec<_>>(),
+            vec![("first", "valid"), ("second", "works")]
+        );
+        assert_eq!(streamed.samples, loaded.examples.len());
+        assert_eq!(streamed.source_files, loaded.source_files);
+        assert_eq!(streamed.source_sample_counts, loaded.source_sample_counts);
+        assert_eq!(streamed.fingerprint, loaded.fingerprint);
+        assert_eq!(cache.index.samples, source_index.samples);
+        assert!(cache.cache_written);
+        assert!(cache_mismatch.contains("field_map"));
+        assert_eq!(
+            raw_window
+                .examples
+                .iter()
+                .map(|example| (example.instruction.as_str(), example.response.as_str()))
+                .collect::<Vec<_>>(),
+            vec![("first", "valid"), ("second", "works")]
         );
         assert_eq!(
             source_index

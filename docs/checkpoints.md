@@ -150,10 +150,11 @@ Acceptance:
   `data.max_response_chars`, optional `data.min_instruction_chars`, optional
   `data.max_instruction_chars`, optional `data.min_input_chars`, optional
   `data.max_input_chars`, optional `data.min_prompt_chars`, optional
-  `data.max_prompt_chars`, and training `data.source_weights`, so stale
-  caches from a different external schema, prompt format, normalization policy,
-  instruction/input/prompt/response filtering policy, or source weighting
-  policy are rejected.
+  `data.max_prompt_chars`, optional `data.min_sample_chars`, optional
+  `data.max_sample_chars`, and training `data.source_weights`, so stale caches
+  from a different external schema, prompt format, normalization policy,
+  instruction/input/prompt/sample/response filtering policy, or source
+  weighting policy are rejected.
 - Adapter reload preserves SFT train/eval loss, full-Qwen forward logits, and
   greedy generation output.
 - Merge/unmerge parity is checked for the focused full-Qwen adapter path, with
