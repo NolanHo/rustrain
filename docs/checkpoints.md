@@ -169,7 +169,7 @@ Acceptance:
   `configs/qwen_session_dp2_sft_arrow.toml` now train the single-GPU and DP=2
   `qwen_trainable_session` paths directly from bounded Arrow sources and write
   the same delta/sharded manifest cursor/provenance fields as JSONL SFT runs.
-  The single-GPU Arrow path also supports one explicit held-out Arrow
+  The single-GPU and DP=2 Arrow paths also support one explicit held-out Arrow
   `data.eval_paths` file capped by `data.max_eval_samples`. Arrow index-cache
   semantics, large-stream zero-materialization, and production distributed
   Arrow trainer ownership remain open.
