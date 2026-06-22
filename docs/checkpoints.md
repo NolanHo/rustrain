@@ -146,8 +146,9 @@ Acceptance:
   the cached HuggingFace Arrow dataset
   `/vePFS-Mindverse/share/huggingface/datasets/iamtarun___code_instructions_120k_alpaca`,
   using `scripts/export_instruction_arrow_jsonl.py`, which accepts Arrow IPC
-  stream or file caches, maps the dataset's `output` column into the normalized
-  JSONL `response` field, writes two JSONL shards, and checks tokenizer-free
+  stream or file caches, scans Arrow record batches without materializing the
+  full table, maps the dataset's `output` column into the normalized JSONL
+  `response` field, writes two JSONL shards, and checks tokenizer-free
   streaming metadata, tokenizer-backed batch parity, cursor wrap, and cache
   write/hit behavior on that
   external-cache-derived source. The offset-index cache is keyed by source paths,
