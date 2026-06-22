@@ -115,6 +115,8 @@ pub struct DataConfig {
     #[serde(default)]
     pub max_response_chars: Option<usize>,
     #[serde(default)]
+    pub instruction_contains_any: Vec<String>,
+    #[serde(default)]
     pub response_contains_any: Vec<String>,
     #[serde(default)]
     pub response_excludes_any: Vec<String>,
@@ -485,6 +487,15 @@ pub fn validate_config(config: &Config) -> Result<()> {
             }
         }
         if data
+            .instruction_contains_any
+            .iter()
+            .any(|needle| needle.is_empty())
+        {
+            return Err(anyhow!(
+                "data.instruction_contains_any entries must not be empty"
+            ));
+        }
+        if data
             .response_contains_any
             .iter()
             .any(|needle| needle.is_empty())
@@ -811,6 +822,7 @@ mod tests {
                 trim_fields: default_trim_fields(),
                 min_response_chars: default_min_response_chars(),
                 max_response_chars: None,
+                instruction_contains_any: Vec::new(),
                 response_contains_any: Vec::new(),
                 response_excludes_any: Vec::new(),
                 min_instruction_chars: None,

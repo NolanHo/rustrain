@@ -149,7 +149,8 @@ Acceptance:
   `data.system_field`, plus `data.prompt_template`,
   `data.prompt_with_input_template`, and `data.trim_fields`,
   `data.min_response_chars`, optional
-  `data.max_response_chars`, optional `data.response_contains_any`, optional
+  `data.max_response_chars`, optional `data.instruction_contains_any`,
+  optional `data.response_contains_any`, optional
   `data.response_excludes_any`, optional `data.min_instruction_chars`,
   optional `data.max_instruction_chars`, optional `data.min_input_chars`,
   optional `data.max_input_chars`, optional `data.min_system_chars`, optional
@@ -160,9 +161,9 @@ Acceptance:
   `data.skip_invalid_records`, so stale
   caches from a different external file state, external schema, prompt format,
   normalization policy, instruction/input/system/prompt/sample/response
-  filtering or response include/exclude substring/dedupe policy, source
-  weighting policy, per-source sample-limit policy, or invalid-record handling
-  policy are rejected.
+  filtering or instruction/response substring/dedupe policy, source weighting
+  policy, per-source sample-limit policy, or invalid-record handling policy
+  are rejected.
   When `data.system_field` is unset, the system field is omitted from dataset
   hashing so existing default fingerprints remain stable; when set, the
   normalized system value participates in prompt rendering, deduplication, and
