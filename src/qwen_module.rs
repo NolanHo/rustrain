@@ -1905,7 +1905,8 @@ impl QwenComputeDType {
 }
 
 pub fn qwen_module_parity(model_safetensors: &Path, fixture: &Path) -> Result<()> {
-    let weights = read_safetensors_map(model_safetensors)?;
+    let model_safetensors = resolve_qwen_model_safetensors_path(model_safetensors)?;
+    let weights = read_safetensors_map(&model_safetensors)?;
     let fixture_tensors = read_safetensors_map(fixture)?;
     let input = tensor(&fixture_tensors, "embedded_hidden")?.to_kind(Kind::Float);
     let attention_input = tensor(&fixture_tensors, "input_attention_normed")?.to_kind(Kind::Float);
@@ -1985,6 +1986,19 @@ pub fn qwen_module_parity(model_safetensors: &Path, fixture: &Path) -> Result<()
     println!("{}", serde_json::to_string_pretty(&summary)?);
 
     Ok(())
+}
+
+fn resolve_qwen_model_safetensors_path(model_safetensors: &Path) -> Result<PathBuf> {
+    if model_safetensors.exists() {
+        return Ok(model_safetensors.to_path_buf());
+    }
+    if model_safetensors.file_name().and_then(|name| name.to_str()) != Some("model.safetensors") {
+        return Ok(model_safetensors.to_path_buf());
+    }
+    let Some(model_path) = model_safetensors.parent() else {
+        return Ok(model_safetensors.to_path_buf());
+    };
+    Ok(resolve_qwen_model_path(model_path)?.join("model.safetensors"))
 }
 
 pub fn qwen_logits_parity(model_path: &Path, reference_fixture: &Path) -> Result<()> {
@@ -14345,6 +14359,31 @@ not-json
         };
 
         assert!(error.contains("no complete HF hub snapshot"));
+    }
+
+    #[test]
+    fn qwen_model_safetensors_path_resolves_with_hf_hub_snapshot() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let legacy_safetensors = temp
+            .path()
+            .join("Qwen2.5-0.5B-Instruct")
+            .join("model.safetensors");
+        let complete_snapshot = temp
+            .path()
+            .join("hub")
+            .join("models--Qwen--Qwen2.5-0.5B-Instruct")
+            .join("snapshots")
+            .join("222");
+        fs::create_dir_all(&complete_snapshot).expect("complete snapshot dir should write");
+        fs::write(complete_snapshot.join("config.json"), "{}").expect("config should write");
+        fs::write(complete_snapshot.join("tokenizer.json"), "{}").expect("tokenizer should write");
+        fs::write(complete_snapshot.join("model.safetensors"), "")
+            .expect("safetensors marker should write");
+
+        let resolved = resolve_qwen_model_safetensors_path(&legacy_safetensors)
+            .expect("legacy safetensors path should resolve through HF hub");
+
+        assert_eq!(resolved, complete_snapshot.join("model.safetensors"));
     }
 
     fn tiny_qwen_sharded_manifest() -> QwenShardedCheckpointManifest {
