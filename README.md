@@ -433,16 +433,21 @@ production-grade sharded checkpoint ownership remain open.
   split sizes, explicit `data.eval_paths`, fingerprints, and cursor/epoch
   windows without materializing tokenized samples.
   Instruction JSONL configs can map external dataset schemas with
-  `data.instruction_field`, `data.input_field`, and `data.response_field`; the
-  defaults remain `instruction`, `input`, and `response`, with missing input
-  fields treated as empty strings. They can also override
+  `data.instruction_field`, `data.input_field`, `data.response_field`, and
+  optional `data.system_field`; the defaults remain `instruction`, `input`,
+  and `response`, with no system field and with missing input/system fields
+  treated as empty strings. They can also override
   `data.prompt_template` and `data.prompt_with_input_template` to render
   external instruction formats before the response is appended for response-only
   loss; the default templates preserve the existing `Instruction`/`Input`/
-  `Response` format and support `{instruction}` plus `{input}` placeholders.
-  `data.trim_fields` defaults to `true` and trims JSONL instruction/input/
-  response strings before template rendering; set it to `false` to preserve
-  exact field whitespace. `data.min_response_chars` defaults to `1` and skips
+  `Response` format and support `{instruction}`, `{input}`, and `{system}`
+  placeholders. `data.system_field = "..."` makes the normalized system value
+  part of prompt rendering, exact sample deduplication, and dataset/cache
+  identity; leaving it unset preserves the previous fingerprint and cache
+  identity for existing configs. `data.trim_fields` defaults to `true` and
+  trims JSONL instruction/input/system/response strings before template
+  rendering; set it to `false` to preserve exact field whitespace.
+  `data.min_response_chars` defaults to `1` and skips
   JSONL records whose normalized response is empty or shorter than the
   configured character count; `data.max_response_chars` can optionally skip
   records whose normalized response is longer than the configured character
@@ -455,9 +460,9 @@ production-grade sharded checkpoint ownership remain open.
   `data.min_sample_chars` and `data.max_sample_chars` apply optional bounds to
   the rendered prompt plus normalized response. `data.dedupe_samples` defaults
   to `false`; set it to `true` to keep the first normalized
-  instruction/input/response triple and skip exact duplicate records. These
-  transforms run before train/eval splitting, `max_samples`, and streaming
-  offset-index construction.
+  system/instruction/input/response tuple and skip exact duplicate records.
+  These transforms run before train/eval splitting, `max_samples`, and
+  streaming offset-index construction.
   `data.max_eval_samples` can optionally cap explicit held-out
   `data.eval_paths`; it defaults to unlimited and never affects training
   source offset caches.

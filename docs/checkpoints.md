@@ -144,9 +144,10 @@ Acceptance:
   config twice and requires the first run to write the offset-index cache and
   the second run to hit it. The offset-index cache is keyed by source paths,
   `max_samples`, and the JSONL field mapping from `data.instruction_field`,
-  `data.input_field`, and `data.response_field`, plus
-  `data.prompt_template`, `data.prompt_with_input_template`, and
-  `data.trim_fields`, `data.min_response_chars`, optional
+  `data.input_field`, `data.response_field`, and optional
+  `data.system_field`, plus `data.prompt_template`,
+  `data.prompt_with_input_template`, and `data.trim_fields`,
+  `data.min_response_chars`, optional
   `data.max_response_chars`, optional `data.min_instruction_chars`, optional
   `data.max_instruction_chars`, optional `data.min_input_chars`, optional
   `data.max_input_chars`, optional `data.min_prompt_chars`, optional
@@ -155,7 +156,10 @@ Acceptance:
   `data.source_weights`, so stale caches from a different external schema,
   prompt format, normalization policy,
   instruction/input/prompt/sample/response filtering or dedupe policy, or
-  source weighting policy are rejected.
+  source weighting policy are rejected. When `data.system_field` is unset, the
+  system field is omitted from dataset hashing so existing default fingerprints
+  remain stable; when set, the normalized system value participates in prompt
+  rendering, deduplication, and fingerprint/cache identity.
 - Explicit held-out `data.eval_paths` can be capped with
   `data.max_eval_samples`. This limit participates in combined dataset
   provenance and resume fingerprints through the selected eval records, but it

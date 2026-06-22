@@ -98,6 +98,8 @@ pub struct DataConfig {
     pub input_field: String,
     #[serde(default = "default_response_field")]
     pub response_field: String,
+    #[serde(default)]
+    pub system_field: Option<String>,
     #[serde(default = "default_prompt_template")]
     pub prompt_template: String,
     #[serde(default = "default_prompt_with_input_template")]
@@ -726,6 +728,7 @@ mod tests {
                 instruction_field: default_instruction_field(),
                 input_field: default_input_field(),
                 response_field: default_response_field(),
+                system_field: None,
                 prompt_template: default_prompt_template(),
                 prompt_with_input_template: default_prompt_with_input_template(),
                 trim_fields: default_trim_fields(),

@@ -38,6 +38,7 @@ pub struct SftSample {
 
 #[derive(Debug, Clone)]
 struct InstructionRecord {
+    system: String,
     instruction: String,
     input: String,
     response: String,
@@ -60,6 +61,7 @@ struct SftCache {
     min_response_chars: usize,
     max_response_chars: Option<usize>,
     max_eval_samples: Option<usize>,
+    system_field: Option<String>,
     min_instruction_chars: Option<usize>,
     max_instruction_chars: Option<usize>,
     min_input_chars: Option<usize>,
@@ -218,6 +220,7 @@ pub fn load_sft_dataset(
         data.min_response_chars,
         data.max_response_chars,
         data.max_eval_samples,
+        data.system_field.clone(),
         data.min_instruction_chars,
         data.max_instruction_chars,
         data.min_input_chars,
@@ -383,8 +386,8 @@ fn read_sft_paths(
 
 fn sft_record_dedupe_key(record: &InstructionRecord) -> String {
     format!(
-        "{}\0{}\0{}",
-        record.instruction, record.input, record.response
+        "{}\0{}\0{}\0{}",
+        record.system, record.instruction, record.input, record.response
     )
 }
 
@@ -416,6 +419,10 @@ fn instruction_record_from_jsonl_line(data: &DataConfig, line: &str) -> Result<I
         required_jsonl_string_field(&values, &data.instruction_field)?,
         data,
     );
+    let system = match &data.system_field {
+        Some(field) => normalize_jsonl_field(optional_jsonl_string_field(&values, field)?, data),
+        None => String::new(),
+    };
     let input = normalize_jsonl_field(
         optional_jsonl_string_field(&values, &data.input_field)?,
         data,
@@ -425,6 +432,7 @@ fn instruction_record_from_jsonl_line(data: &DataConfig, line: &str) -> Result<I
         data,
     );
     Ok(InstructionRecord {
+        system,
         instruction,
         input,
         response,
@@ -522,6 +530,7 @@ fn render_sft_prompt(
         prompt_with_input_template
     };
     Ok(template
+        .replace("{system}", &record.system)
         .replace("{instruction}", &record.instruction)
         .replace("{input}", &record.input))
 }
@@ -570,6 +579,7 @@ fn write_sft_cache(
     min_response_chars: usize,
     max_response_chars: Option<usize>,
     max_eval_samples: Option<usize>,
+    system_field: Option<String>,
     min_instruction_chars: Option<usize>,
     max_instruction_chars: Option<usize>,
     min_input_chars: Option<usize>,
@@ -588,6 +598,7 @@ fn write_sft_cache(
         min_response_chars,
         max_response_chars,
         max_eval_samples,
+        system_field,
         min_instruction_chars,
         max_instruction_chars,
         min_input_chars,
@@ -645,6 +656,7 @@ mod tests {
             instruction_field: "instruction".to_string(),
             input_field: "input".to_string(),
             response_field: "response".to_string(),
+            system_field: None,
             prompt_template: "Instruction:\n{instruction}\n\nResponse:\n".to_string(),
             prompt_with_input_template:
                 "Instruction:\n{instruction}\n\nInput:\n{input}\n\nResponse:\n".to_string(),
@@ -699,6 +711,7 @@ mod tests {
             instruction_field: "instruction".to_string(),
             input_field: "input".to_string(),
             response_field: "response".to_string(),
+            system_field: None,
             prompt_template: "Instruction:\n{instruction}\n\nResponse:\n".to_string(),
             prompt_with_input_template:
                 "Instruction:\n{instruction}\n\nInput:\n{input}\n\nResponse:\n".to_string(),
@@ -759,6 +772,7 @@ mod tests {
             instruction_field: "instruction".to_string(),
             input_field: "input".to_string(),
             response_field: "response".to_string(),
+            system_field: None,
             prompt_template: "Instruction:\n{instruction}\n\nResponse:\n".to_string(),
             prompt_with_input_template:
                 "Instruction:\n{instruction}\n\nInput:\n{input}\n\nResponse:\n".to_string(),
@@ -827,6 +841,7 @@ mod tests {
             instruction_field: "instruction".to_string(),
             input_field: "input".to_string(),
             response_field: "response".to_string(),
+            system_field: None,
             prompt_template: "Q: {instruction}\nA: ".to_string(),
             prompt_with_input_template: "Q: {instruction}\nContext: {input}\nA: ".to_string(),
             trim_fields: true,
@@ -868,8 +883,66 @@ mod tests {
     }
 
     #[test]
+    fn sft_dataset_uses_configured_system_field_in_prompt_templates() {
+        let dir = tempdir().expect("temp dir should be created");
+        let data_dir = dir.path().join("sft");
+        let cache_dir = dir.path().join("cache");
+        fs::create_dir_all(&data_dir).expect("sft dir should be created");
+        fs::create_dir_all(&cache_dir).expect("cache dir should be created");
+        fs::write(
+            data_dir.join("sample.jsonl"),
+            "{\"system\":\"Be concise.\",\"instruction\":\"name project\",\"response\":\"rustrain\"}\n{\"system\":\"Use one word.\",\"instruction\":\"name language\",\"response\":\"Rust\"}\n",
+        )
+        .expect("jsonl should write");
+
+        let data = DataConfig {
+            kind: DataKind::InstructionJsonl,
+            paths: vec![data_dir],
+            eval_paths: Vec::new(),
+            train_split: 0.5,
+            max_samples: None,
+            max_eval_samples: None,
+            shuffle: false,
+            index_cache: None,
+            instruction_field: "instruction".to_string(),
+            input_field: "input".to_string(),
+            response_field: "response".to_string(),
+            system_field: Some("system".to_string()),
+            prompt_template: "System: {system}\nQ: {instruction}\nA: ".to_string(),
+            prompt_with_input_template: "System: {system}\nQ: {instruction}\nI: {input}\nA: "
+                .to_string(),
+            trim_fields: true,
+            min_response_chars: 1,
+            max_response_chars: None,
+            min_instruction_chars: None,
+            max_instruction_chars: None,
+            min_input_chars: None,
+            max_input_chars: None,
+            min_prompt_chars: None,
+            max_prompt_chars: None,
+            min_sample_chars: None,
+            max_sample_chars: None,
+            dedupe_samples: false,
+            source_weights: Vec::new(),
+        };
+        let dataset =
+            load_sft_dataset(&data, 128, 96, &cache_dir).expect("SFT dataset should load");
+        let decoded = dataset
+            .train_samples
+            .iter()
+            .chain(dataset.eval_samples.iter())
+            .map(|sample| dataset.tokenizer.decode_lossy(&sample.tokens))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(decoded.contains("System: Be concise."));
+        assert!(decoded.contains("System: Use one word."));
+    }
+
+    #[test]
     fn sft_dataset_trim_fields_controls_prompt_normalization() {
         let record = InstructionRecord {
+            system: "  stay brief  ".to_string(),
             instruction: "  name project  ".to_string(),
             input: "  rust trainer  ".to_string(),
             response: "  rustrain  ".to_string(),
@@ -886,6 +959,7 @@ mod tests {
             instruction_field: "instruction".to_string(),
             input_field: "input".to_string(),
             response_field: "response".to_string(),
+            system_field: None,
             prompt_template: "Q:{instruction}\nA:".to_string(),
             prompt_with_input_template: "Q:{instruction}\nI:{input}\nA:".to_string(),
             trim_fields: true,
@@ -907,11 +981,13 @@ mod tests {
             ..trim_data.clone()
         };
         let trimmed = InstructionRecord {
+            system: normalize_jsonl_field(record.system.clone(), &trim_data),
             instruction: normalize_jsonl_field(record.instruction.clone(), &trim_data),
             input: normalize_jsonl_field(record.input.clone(), &trim_data),
             response: normalize_jsonl_field(record.response.clone(), &trim_data),
         };
         let raw = InstructionRecord {
+            system: normalize_jsonl_field(record.system.clone(), &raw_data),
             instruction: normalize_jsonl_field(record.instruction.clone(), &raw_data),
             input: normalize_jsonl_field(record.input.clone(), &raw_data),
             response: normalize_jsonl_field(record.response.clone(), &raw_data),
@@ -971,6 +1047,7 @@ mod tests {
             instruction_field: "instruction".to_string(),
             input_field: "input".to_string(),
             response_field: "response".to_string(),
+            system_field: None,
             prompt_template: "Instruction:\n{instruction}\n\nResponse:\n".to_string(),
             prompt_with_input_template:
                 "Instruction:\n{instruction}\n\nInput:\n{input}\n\nResponse:\n".to_string(),
@@ -1028,6 +1105,7 @@ mod tests {
             instruction_field: "instruction".to_string(),
             input_field: "input".to_string(),
             response_field: "response".to_string(),
+            system_field: None,
             prompt_template: "Instruction:\n{instruction}\n\nResponse:\n".to_string(),
             prompt_with_input_template:
                 "Instruction:\n{instruction}\n\nInput:\n{input}\n\nResponse:\n".to_string(),
@@ -1086,6 +1164,7 @@ mod tests {
             instruction_field: "instruction".to_string(),
             input_field: "input".to_string(),
             response_field: "response".to_string(),
+            system_field: None,
             prompt_template: "Instruction:\n{instruction}\n\nResponse:\n".to_string(),
             prompt_with_input_template:
                 "Instruction:\n{instruction}\n\nInput:\n{input}\n\nResponse:\n".to_string(),
@@ -1145,6 +1224,7 @@ mod tests {
             instruction_field: "instruction".to_string(),
             input_field: "input".to_string(),
             response_field: "response".to_string(),
+            system_field: None,
             prompt_template: "Instruction:\n{instruction}\n\nResponse:\n".to_string(),
             prompt_with_input_template:
                 "Instruction:\n{instruction}\n\nInput:\n{input}\n\nResponse:\n".to_string(),
@@ -1204,6 +1284,7 @@ mod tests {
             instruction_field: "instruction".to_string(),
             input_field: "input".to_string(),
             response_field: "response".to_string(),
+            system_field: None,
             prompt_template: "Instruction:\n{instruction}\n\nResponse:\n".to_string(),
             prompt_with_input_template:
                 "Instruction:\n{instruction}\n\nInput:\n{input}\n\nResponse:\n".to_string(),
@@ -1265,6 +1346,7 @@ mod tests {
             instruction_field: "instruction".to_string(),
             input_field: "input".to_string(),
             response_field: "response".to_string(),
+            system_field: None,
             prompt_template: "Instruction:\n{instruction}\n\nResponse:\n".to_string(),
             prompt_with_input_template:
                 "Instruction:\n{instruction}\n\nInput:\n{input}\n\nResponse:\n".to_string(),
@@ -1328,6 +1410,7 @@ mod tests {
             instruction_field: "instruction".to_string(),
             input_field: "input".to_string(),
             response_field: "response".to_string(),
+            system_field: None,
             prompt_template: "Q:{instruction}\nA:".to_string(),
             prompt_with_input_template: "Q:{instruction}\nI:{input}\nA:".to_string(),
             trim_fields: true,
@@ -1389,6 +1472,7 @@ mod tests {
             instruction_field: "instruction".to_string(),
             input_field: "input".to_string(),
             response_field: "response".to_string(),
+            system_field: None,
             prompt_template: "Q:{instruction}\nA:".to_string(),
             prompt_with_input_template: "Q:{instruction}\nI:{input}\nA:".to_string(),
             trim_fields: true,
@@ -1458,6 +1542,7 @@ mod tests {
             instruction_field: "instruction".to_string(),
             input_field: "input".to_string(),
             response_field: "response".to_string(),
+            system_field: None,
             prompt_template: "Instruction:\n{instruction}\n\nResponse:\n".to_string(),
             prompt_with_input_template:
                 "Instruction:\n{instruction}\n\nInput:\n{input}\n\nResponse:\n".to_string(),
@@ -1516,6 +1601,7 @@ mod tests {
             instruction_field: "instruction".to_string(),
             input_field: "input".to_string(),
             response_field: "response".to_string(),
+            system_field: None,
             prompt_template: "Instruction:\n{instruction}\n\nResponse:\n".to_string(),
             prompt_with_input_template:
                 "Instruction:\n{instruction}\n\nInput:\n{input}\n\nResponse:\n".to_string(),
@@ -1576,6 +1662,7 @@ mod tests {
             instruction_field: "instruction".to_string(),
             input_field: "input".to_string(),
             response_field: "response".to_string(),
+            system_field: None,
             prompt_template: "Instruction:\n{instruction}\n\nResponse:\n".to_string(),
             prompt_with_input_template:
                 "Instruction:\n{instruction}\n\nInput:\n{input}\n\nResponse:\n".to_string(),

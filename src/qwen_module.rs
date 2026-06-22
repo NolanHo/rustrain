@@ -1563,6 +1563,7 @@ struct QwenSftTokenSample {
 
 #[derive(Clone)]
 struct QwenSftExample {
+    system: String,
     instruction: String,
     input: String,
     response: String,
@@ -1619,6 +1620,7 @@ struct QwenSftRawExampleWindow {
 }
 
 struct QwenSftRecord {
+    system: String,
     instruction: String,
     input: String,
     response: String,
@@ -1629,6 +1631,8 @@ struct QwenSftFieldMap {
     instruction: String,
     input: String,
     response: String,
+    #[serde(default)]
+    system: Option<String>,
     prompt_template: String,
     prompt_with_input_template: String,
     trim_fields: bool,
@@ -1662,6 +1666,7 @@ impl QwenSftFieldMap {
             instruction: data.instruction_field.clone(),
             input: data.input_field.clone(),
             response: data.response_field.clone(),
+            system: data.system_field.clone(),
             prompt_template: data.prompt_template.clone(),
             prompt_with_input_template: data.prompt_with_input_template.clone(),
             trim_fields: data.trim_fields,
@@ -1691,6 +1696,13 @@ impl QwenSftFieldMap {
         }
         if self.response.trim().is_empty() {
             bail!("data.response_field must not be empty");
+        }
+        if self
+            .system
+            .as_ref()
+            .is_some_and(|field| field.trim().is_empty())
+        {
+            bail!("data.system_field must not be empty when set");
         }
         if self.prompt_template.is_empty() {
             bail!("data.prompt_template must not be empty");
@@ -1791,6 +1803,7 @@ impl Default for QwenSftFieldMap {
             instruction: "instruction".to_string(),
             input: "input".to_string(),
             response: "response".to_string(),
+            system: None,
             prompt_template: "Instruction:\n{instruction}\n\nResponse:\n".to_string(),
             prompt_with_input_template:
                 "Instruction:\n{instruction}\n\nInput:\n{input}\n\nResponse:\n".to_string(),
@@ -2835,11 +2848,13 @@ fn qwen_lora_sft_train(
             &tokenizer,
             &[
                 QwenSftExample {
+                    system: String::new(),
                     instruction: instruction.to_string(),
                     input: String::new(),
                     response: response.to_string(),
                 },
                 QwenSftExample {
+                    system: String::new(),
                     instruction: "Name the project.".to_string(),
                     input: String::new(),
                     response: "rustrain".to_string(),
@@ -11374,6 +11389,7 @@ fn qwen_sft_examples_by_raw_indices(
             loaded.insert(
                 (path.clone(), *index_in_file),
                 QwenSftExample {
+                    system: record.system,
                     instruction: record.instruction,
                     input: record.input,
                     response: record.response,
@@ -11456,6 +11472,7 @@ fn qwen_sft_examples_from_jsonl_path_with_limit(
                 }
             }
             let example = QwenSftExample {
+                system: record.system,
                 instruction: record.instruction,
                 input: record.input,
                 response: record.response,
@@ -11665,7 +11682,7 @@ fn qwen_sft_streaming_fingerprint(
                     if max_samples.is_some_and(|limit| samples >= limit) {
                         break;
                     }
-                    qwen_sft_hash_record(&mut hash, &record);
+                    qwen_sft_hash_record(&mut hash, &record, field_map.system.is_some());
                     samples += 1;
                 }
             }
@@ -11707,6 +11724,12 @@ fn qwen_sft_record_from_jsonl_line(
         qwen_required_jsonl_string_field(&values, &field_map.instruction)?,
         field_map,
     );
+    let system = match &field_map.system {
+        Some(field) => {
+            qwen_normalize_jsonl_field(qwen_optional_jsonl_string_field(&values, field)?, field_map)
+        }
+        None => String::new(),
+    };
     let input = qwen_normalize_jsonl_field(
         qwen_optional_jsonl_string_field(&values, &field_map.input)?,
         field_map,
@@ -11716,6 +11739,7 @@ fn qwen_sft_record_from_jsonl_line(
         field_map,
     );
     Ok(QwenSftRecord {
+        system,
         instruction,
         input,
         response,
@@ -11732,8 +11756,8 @@ fn qwen_normalize_jsonl_field(value: String, field_map: &QwenSftFieldMap) -> Str
 
 fn qwen_sft_record_dedupe_key(record: &QwenSftRecord) -> String {
     format!(
-        "{}\0{}\0{}",
-        record.instruction, record.input, record.response
+        "{}\0{}\0{}\0{}",
+        record.system, record.instruction, record.input, record.response
     )
 }
 
@@ -11791,6 +11815,7 @@ fn qwen_render_sft_record_prompt(record: &QwenSftRecord, field_map: &QwenSftFiel
         &field_map.prompt_with_input_template
     };
     template
+        .replace("{system}", &record.system)
         .replace("{instruction}", &record.instruction)
         .replace("{input}", &record.input)
 }
@@ -11830,12 +11855,17 @@ fn qwen_sft_dataset_fingerprint(
         qwen_sft_hash_bytes(&mut hash, b"\0");
     }
     for example in examples {
-        qwen_sft_hash_example(&mut hash, example);
+        qwen_sft_hash_example(&mut hash, example, field_map.system.is_some());
     }
     format!("{hash:016x}")
 }
 
-fn qwen_sft_hash_record(hash: &mut u64, record: &QwenSftRecord) {
+fn qwen_sft_hash_record(hash: &mut u64, record: &QwenSftRecord, include_system: bool) {
+    if include_system {
+        qwen_sft_hash_bytes(hash, b"system");
+        qwen_sft_hash_bytes(hash, record.system.as_bytes());
+        qwen_sft_hash_bytes(hash, b"\0");
+    }
     qwen_sft_hash_bytes(hash, b"instruction");
     qwen_sft_hash_bytes(hash, record.instruction.as_bytes());
     qwen_sft_hash_bytes(hash, b"\0input");
@@ -11853,6 +11883,11 @@ fn qwen_sft_hash_field_map(hash: &mut u64, field_map: &QwenSftFieldMap) {
     qwen_sft_hash_bytes(hash, b"\0");
     qwen_sft_hash_bytes(hash, field_map.response.as_bytes());
     qwen_sft_hash_bytes(hash, b"\0");
+    if let Some(system) = &field_map.system {
+        qwen_sft_hash_bytes(hash, b"system");
+        qwen_sft_hash_bytes(hash, system.as_bytes());
+        qwen_sft_hash_bytes(hash, b"\0");
+    }
     qwen_sft_hash_bytes(hash, field_map.prompt_template.as_bytes());
     qwen_sft_hash_bytes(hash, b"\0");
     qwen_sft_hash_bytes(hash, field_map.prompt_with_input_template.as_bytes());
@@ -11927,7 +11962,12 @@ fn qwen_sft_hash_field_map(hash: &mut u64, field_map: &QwenSftFieldMap) {
     qwen_sft_hash_bytes(hash, b"\0");
 }
 
-fn qwen_sft_hash_example(hash: &mut u64, example: &QwenSftExample) {
+fn qwen_sft_hash_example(hash: &mut u64, example: &QwenSftExample, include_system: bool) {
+    if include_system {
+        qwen_sft_hash_bytes(hash, b"system");
+        qwen_sft_hash_bytes(hash, example.system.as_bytes());
+        qwen_sft_hash_bytes(hash, b"\0");
+    }
     qwen_sft_hash_bytes(hash, b"instruction");
     qwen_sft_hash_bytes(hash, example.instruction.as_bytes());
     qwen_sft_hash_bytes(hash, b"\0input");
@@ -12039,6 +12079,7 @@ fn qwen_render_sft_prompt(example: &QwenSftExample, field_map: &QwenSftFieldMap)
         &field_map.prompt_with_input_template
     };
     Ok(template
+        .replace("{system}", &example.system)
         .replace("{instruction}", &example.instruction)
         .replace("{input}", &example.input))
 }
@@ -14358,8 +14399,8 @@ mod tests {
         let cache_path = temp.path().join("cache").join("offset-index.json");
         fs::write(
             &jsonl,
-            r#"{"prompt":"Summarize the project.","context":"Rust training code","answer":"rustrain"}
-{"prompt":"Name the language.","answer":"Rust"}
+            r#"{"sys":"Be concise.","prompt":"Summarize the project.","context":"Rust training code","answer":"rustrain"}
+{"sys":"Use one word.","prompt":"Name the language.","answer":"Rust"}
 "#,
         )
         .expect("jsonl should write");
@@ -14368,6 +14409,10 @@ mod tests {
             instruction: "prompt".to_string(),
             input: "context".to_string(),
             response: "answer".to_string(),
+            system: Some("sys".to_string()),
+            prompt_template: "System: {system}\nQ: {instruction}\nA: ".to_string(),
+            prompt_with_input_template: "System: {system}\nQ: {instruction}\nI: {input}\nA: "
+                .to_string(),
             ..QwenSftFieldMap::default()
         };
 
@@ -14386,6 +14431,10 @@ mod tests {
             response: "completion".to_string(),
             ..field_map.clone()
         };
+        let mismatched_system_map = QwenSftFieldMap {
+            system: Some("system_prompt".to_string()),
+            ..field_map.clone()
+        };
         let mismatch = qwen_sft_streaming_source_index_with_cache(
             &paths,
             None,
@@ -14394,22 +14443,39 @@ mod tests {
         )
         .expect_err("cache should reject different field maps")
         .to_string();
+        let system_mismatch = qwen_sft_streaming_source_index_with_cache(
+            &paths,
+            None,
+            Some(&cache_path),
+            &mismatched_system_map,
+        )
+        .expect_err("cache should reject different system fields")
+        .to_string();
 
         assert_eq!(loaded.examples.len(), 2);
+        assert_eq!(loaded.examples[0].system, "Be concise.");
         assert_eq!(loaded.examples[0].instruction, "Summarize the project.");
         assert_eq!(loaded.examples[0].input, "Rust training code");
         assert_eq!(loaded.examples[0].response, "rustrain");
+        assert_eq!(loaded.examples[1].system, "Use one word.");
         assert_eq!(loaded.examples[1].input, "");
         assert_eq!(streamed.samples, loaded.examples.len());
         assert_eq!(streamed.fingerprint, loaded.fingerprint);
         assert_eq!(raw_window.examples[0].response, "rustrain");
         assert!(first_cache.cache_written);
         assert!(mismatch.contains("field_map"));
+        assert!(system_mismatch.contains("field_map"));
+        assert!(
+            qwen_render_sft_prompt(&loaded.examples[0], &field_map)
+                .expect("system prompt should render")
+                .contains("System: Be concise.")
+        );
     }
 
     #[test]
     fn qwen_sft_prompt_template_changes_tokenized_prompt_and_fingerprint() {
         let example = QwenSftExample {
+            system: String::new(),
             instruction: "Name the project.".to_string(),
             input: "Rust trainer".to_string(),
             response: "rustrain".to_string(),
@@ -14459,11 +14525,13 @@ mod tests {
             qwen_sft_record_from_jsonl_line(line, &trim_map).expect("trimmed record should parse");
         let raw = qwen_sft_record_from_jsonl_line(line, &raw_map).expect("raw record should parse");
         let trimmed_example = QwenSftExample {
+            system: trimmed.system.clone(),
             instruction: trimmed.instruction.clone(),
             input: trimmed.input.clone(),
             response: trimmed.response.clone(),
         };
         let raw_example = QwenSftExample {
+            system: raw.system.clone(),
             instruction: raw.instruction.clone(),
             input: raw.input.clone(),
             response: raw.response.clone(),

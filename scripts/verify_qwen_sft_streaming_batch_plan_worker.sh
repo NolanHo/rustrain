@@ -189,6 +189,7 @@ expected_field_map = {
     "instruction": "instruction",
     "input": "input",
     "response": "response",
+    "system": None,
     "prompt_template": "Instruction:\n{instruction}\n\nResponse:\n",
     "prompt_with_input_template": "Instruction:\n{instruction}\n\nInput:\n{input}\n\nResponse:\n",
     "trim_fields": True,
