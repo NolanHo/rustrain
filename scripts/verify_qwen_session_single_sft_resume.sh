@@ -71,6 +71,7 @@ required = [
     "dataset_source_files",
     "dataset_fingerprint",
     "dataset_order_seed",
+    "streaming_train_batches",
     "data_cursor_start",
     "data_cursor_end",
     "data_cursor_next",
@@ -91,6 +92,10 @@ if missing:
     raise SystemExit(f"resume run is missing fields: {missing}")
 if values["resumed_checkpoint"] != "true":
     raise SystemExit("resume run did not report resumed_checkpoint: true")
+if values["streaming_train_batches"] != "true":
+    raise SystemExit(
+        f"resume run did not report streaming_train_batches: true, got {values['streaming_train_batches']}"
+    )
 if expected_compute_kind and values["compute_kind"] != expected_compute_kind:
     raise SystemExit(
         f"expected compute_kind {expected_compute_kind}, got {values['compute_kind']}"

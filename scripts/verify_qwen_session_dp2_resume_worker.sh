@@ -131,6 +131,10 @@ if expected_dataset_fingerprint and base_rank0.get("dataset_fingerprint") != exp
     raise SystemExit(
         f"base rank0 dataset_fingerprint {base_rank0.get('dataset_fingerprint')} != {expected_dataset_fingerprint}"
     )
+if base_rank0.get("streaming_train_batches") is not True:
+    raise SystemExit(
+        f"base rank0 expected streaming_train_batches true, got {base_rank0.get('streaming_train_batches')}"
+    )
 
 resume_summaries = sorted(resume_output_dir.rglob("qwen-session-dp-rank-*.json"))
 if len(resume_summaries) != 2:
@@ -164,6 +168,10 @@ for path in resume_summaries:
         raise SystemExit(f"{path} dataset_source_files must not be empty")
     if not data.get("dataset_fingerprint"):
         raise SystemExit(f"{path} dataset_fingerprint must not be empty")
+    if data.get("streaming_train_batches") is not True:
+        raise SystemExit(
+            f"{path} expected streaming_train_batches true, got {data.get('streaming_train_batches')}"
+        )
     if expected_dataset_total_samples and int(data["dataset_total_samples"]) != int(expected_dataset_total_samples):
         raise SystemExit(
             f"{path} dataset_total_samples {data['dataset_total_samples']} != {expected_dataset_total_samples}"
@@ -275,6 +283,7 @@ for path in resume_summaries:
             "data_cursor_start": data["data_cursor_start"],
             "data_cursor_next": data["data_cursor_next"],
             "dataset_fingerprint": data["dataset_fingerprint"],
+            "streaming_train_batches": data.get("streaming_train_batches"),
             "dtype": data.get("dtype"),
             "trainable_tensors": len(trainable_tensors) if isinstance(trainable_tensors, list) else None,
             "reload_delta": data["reload_delta"],

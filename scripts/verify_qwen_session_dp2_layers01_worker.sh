@@ -108,6 +108,7 @@ for path in rank_summaries:
             "dataset_source_files",
             "dataset_fingerprint",
             "dataset_order_seed",
+            "streaming_train_batches",
             "data_cursor_start",
             "data_cursor_end",
             "data_cursor_next",
@@ -147,6 +148,10 @@ for path in rank_summaries:
         if int(data["dataset_order_seed"]) != int(expected_dataset_seed):
             raise SystemExit(
                 f"{path} dataset_order_seed {data['dataset_order_seed']} does not match expected {expected_dataset_seed}"
+            )
+        if data.get("streaming_train_batches") is not True:
+            raise SystemExit(
+                f"{path} expected streaming_train_batches true, got {data.get('streaming_train_batches')}"
             )
         expected_cursor_end = int(data["steps"]) * int(data["local_batch_size"]) * int(data["world_size"])
         if int(data["data_cursor_start"]) != 0:
@@ -239,6 +244,7 @@ for path in rank_summaries:
             "dataset_total_samples": data.get("dataset_total_samples"),
             "dataset_source_files": data.get("dataset_source_files"),
             "dataset_fingerprint": data.get("dataset_fingerprint"),
+            "streaming_train_batches": data.get("streaming_train_batches"),
             "data_cursor_next": data.get("data_cursor_next"),
             "data_epoch_next": data.get("data_epoch_next"),
             "data_sample_offset_next": data.get("data_sample_offset_next"),

@@ -75,6 +75,7 @@ required = [
     "dataset_fingerprint",
     "dataset_order_seed",
     "dataset_shuffle",
+    "streaming_train_batches",
     "data_cursor_start",
     "data_cursor_end",
     "data_cursor_next",
@@ -113,6 +114,10 @@ if expected_compute_kind and values["compute_kind"] != expected_compute_kind:
     )
 if values["resumed_adapter"] != "true":
     raise SystemExit("resume run did not report resumed_adapter: true")
+if values["streaming_train_batches"] != "true":
+    raise SystemExit(
+        f"resume run did not report streaming_train_batches: true, got {values['streaming_train_batches']}"
+    )
 for key in [
     "dataset_total_samples",
     "dataset_total_tokens",
@@ -268,6 +273,7 @@ required = [
     "resume_from",
     "resumed_adapter",
     "adapter_manifest",
+    "streaming_train_batches",
     "data_cursor_start",
     "data_cursor_next",
     "initial_loss",
@@ -294,6 +300,10 @@ if values["resume_from"] != adapter_checkpoint:
     )
 if values["resumed_adapter"] != "true":
     raise SystemExit("direct resume did not report resumed_adapter: true")
+if values["streaming_train_batches"] != "true":
+    raise SystemExit(
+        f"direct resume did not report streaming_train_batches: true, got {values['streaming_train_batches']}"
+    )
 if int(values["data_cursor_start"]) != 0:
     raise SystemExit(
         f"direct .safetensors resume should not claim manifest cursor continuity, got data_cursor_start={values['data_cursor_start']}"
