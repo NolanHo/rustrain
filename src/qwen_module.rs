@@ -2680,6 +2680,21 @@ fn qwen_lora_sft_train(
         qwen_data_epoch_and_offset(data_cursor_end, train_dataset.len())?;
     let (data_epoch_next, data_sample_offset_next) =
         qwen_data_epoch_and_offset(data_cursor_next, train_dataset.len())?;
+    let streaming_window = sft_paths
+        .map(|paths| {
+            qwen_sft_streaming_token_window_from_jsonl(
+                &tokenizer,
+                paths,
+                eval_paths,
+                max_samples,
+                train_split,
+                policy.dataset_shuffle,
+                policy.dataset_order_seed,
+                data_cursor_start,
+                steps * gradient_accumulation_steps * train_batch_size,
+            )
+        })
+        .transpose()?;
 
     for step in 0..steps {
         for (_, mut tensor) in registry.trainable_tensors() {
@@ -2688,7 +2703,32 @@ fn qwen_lora_sft_train(
         for accumulation_index in 0..gradient_accumulation_steps {
             let sample_start = data_cursor_start
                 + (step * gradient_accumulation_steps + accumulation_index) * train_batch_size;
-            let step_batch = train_dataset.padded_batch(sample_start, train_batch_size)?;
+            let step_batch = if let Some(streaming_window) = streaming_window.as_ref() {
+                let relative_start =
+                    (step * gradient_accumulation_steps + accumulation_index) * train_batch_size;
+                let relative_end = relative_start + train_batch_size;
+                let streaming_batch = qwen_sft_padded_batch(
+                    &streaming_window.samples[relative_start..relative_end],
+                    train_dataset.pad_token_id,
+                )?;
+                let reference_batch = train_dataset.padded_batch(sample_start, train_batch_size)?;
+                let input_delta = tensor_i64_max_abs_diff(
+                    &streaming_batch.input_ids,
+                    &reference_batch.input_ids,
+                )?;
+                let mask_delta = tensor_max_abs_diff(
+                    &streaming_batch.target_mask,
+                    &reference_batch.target_mask,
+                )?;
+                if input_delta != 0 || mask_delta > 0.0 {
+                    bail!(
+                        "Qwen LoRA SFT streaming batch mismatch at cursor {sample_start}: input_delta={input_delta}, mask_delta={mask_delta}"
+                    );
+                }
+                streaming_batch
+            } else {
+                train_dataset.padded_batch(sample_start, train_batch_size)?
+            };
             let loss = qwen_lora_sft_loss(
                 &step_batch.input_ids,
                 &step_batch.target_mask,
@@ -5623,6 +5663,7 @@ pub fn qwen_sft_streaming_batch_plan(
     let streaming_window = qwen_sft_streaming_token_window_from_jsonl(
         &tokenizer,
         &data_config.paths,
+        &data_config.eval_paths,
         data_config.max_samples,
         data_config.train_split,
         data_config.shuffle,
@@ -8706,6 +8747,7 @@ fn qwen_session_batch_plan_from_config(
     let streaming_window = qwen_sft_streaming_token_window_from_jsonl(
         &tokenizer,
         &data_config.paths,
+        &data_config.eval_paths,
         data_config.max_samples,
         data_config.train_split,
         data_config.shuffle,
@@ -8849,6 +8891,7 @@ fn qwen_session_dp_batch_plan_from_config(
     let streaming_window = qwen_sft_streaming_token_window_from_jsonl(
         &tokenizer,
         &data_config.paths,
+        &data_config.eval_paths,
         data_config.max_samples,
         data_config.train_split,
         data_config.shuffle,
@@ -10326,6 +10369,7 @@ fn qwen_sft_streaming_cursor_window(
 fn qwen_sft_streaming_token_window_from_jsonl(
     tokenizer: &Tokenizer,
     paths: &[PathBuf],
+    eval_paths: &[PathBuf],
     max_samples: Option<usize>,
     train_split: f32,
     shuffle: bool,
@@ -10337,8 +10381,13 @@ fn qwen_sft_streaming_token_window_from_jsonl(
         bail!("SFT streaming token window requires at least one sample");
     }
     let source_index = qwen_sft_streaming_source_index(paths, max_samples)?;
-    let (train_samples, _) =
-        qwen_sft_train_eval_sample_counts(source_index.samples.len(), train_split)?;
+    let train_samples = if eval_paths.is_empty() {
+        let (train_samples, _) =
+            qwen_sft_train_eval_sample_counts(source_index.samples.len(), train_split)?;
+        train_samples
+    } else {
+        source_index.samples.len()
+    };
     let mut train_indices = source_index.samples;
     if shuffle {
         let mut rng = StdRng::seed_from_u64(seed);

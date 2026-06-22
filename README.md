@@ -415,11 +415,13 @@ production-grade sharded checkpoint ownership remain open.
   `cargo run -- qwen-sft-streaming-batch-plan --config ...` resolves the next
   cursor window to raw JSONL source indices, reads and tokenizes only those
   window records, then verifies the padded `input_ids` plus response masks match
-  the current materialized dataset path. The single-GPU and DP=2
-  `qwen_trainable_session` JSONL SFT trainer paths now use the same raw-index
-  streaming window to build train batches, while keeping materialized dataset
-  metadata as a parity guard. A production zero-materialization loader for large
-  external streams is still open.
+  the current materialized dataset path. The LoRA SFT trainer plus single-GPU
+  and DP=2 `qwen_trainable_session` JSONL SFT trainer paths now use the same
+  raw-index streaming window to build train batches, while keeping materialized
+  dataset metadata as a parity guard. When explicit `data.eval_paths` are
+  configured, the streaming window keeps the full train source instead of
+  applying `train_split` to it. A production zero-materialization loader for
+  large external streams is still open.
   Production data loading and arbitrary-module LoRA injection are still open.
 - Real Qwen module-level LoRA now uses a target-layer/module registry for
   configured attention and MLP projection modules; trainer-owned full-model LoRA
