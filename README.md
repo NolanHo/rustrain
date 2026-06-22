@@ -451,9 +451,12 @@ production-grade sharded checkpoint ownership remain open.
   JSONL records whose normalized response is empty or shorter than the
   configured character count; `data.max_response_chars` can optionally skip
   records whose normalized response is longer than the configured character
-  count. `data.min_instruction_chars` and `data.max_instruction_chars` can
-  optionally skip records whose normalized instruction is outside configured
-  character bounds. `data.min_input_chars` and `data.max_input_chars` apply the
+  count. `data.response_contains_any` can optionally require normalized
+  responses to contain at least one configured substring. Empty substring
+  entries are rejected. `data.min_instruction_chars` and
+  `data.max_instruction_chars` can optionally skip records whose normalized
+  instruction is outside configured character bounds. `data.min_input_chars`
+  and `data.max_input_chars` apply the
   same optional bounds to the normalized input field. `data.min_system_chars`
   and `data.max_system_chars` apply optional bounds to the normalized system
   field when `data.system_field` is configured. `data.min_prompt_chars` and
@@ -495,11 +498,11 @@ production-grade sharded checkpoint ownership remain open.
   verifier twice to prove first-run writes and second-run hits. Offset-index
   cache files also record source JSONL file size/mtime metadata, the JSONL
   field mapping, prompt templates, field trimming policy,
-  instruction/input/system/prompt/sample/response length filters, dedupe
-  policy, and source-weighting policy, so a cache created for one external
-  dataset state or schema is rejected if reused after source file changes or
-  with a different field map, prompt format, normalization policy, filtering
-  policy, or weighting policy.
+  instruction/input/system/prompt/sample/response length filters, response
+  substring filters, dedupe policy, and source-weighting policy, so a cache
+  created for one external dataset state or schema is rejected if reused after
+  source file changes or with a different field map, prompt format,
+  normalization policy, filtering policy, or weighting policy.
   Those trainer summaries now expose
   `streaming_train_batches = true` for tokenizer-backed
   JSONL SFT runs, and the focused LoRA, single-GPU session, and DP session

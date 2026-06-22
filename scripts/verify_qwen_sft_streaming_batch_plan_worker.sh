@@ -207,6 +207,7 @@ expected_field_map = {
     "trim_fields": True,
     "min_response_chars": 1,
     "max_response_chars": None,
+    "response_contains_any": [],
     "min_instruction_chars": None,
     "max_instruction_chars": None,
     "min_input_chars": None,

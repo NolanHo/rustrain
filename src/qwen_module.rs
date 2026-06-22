@@ -1652,6 +1652,8 @@ struct QwenSftFieldMap {
     #[serde(default)]
     max_response_chars: Option<usize>,
     #[serde(default)]
+    response_contains_any: Vec<String>,
+    #[serde(default)]
     min_instruction_chars: Option<usize>,
     #[serde(default)]
     max_instruction_chars: Option<usize>,
@@ -1690,6 +1692,7 @@ impl QwenSftFieldMap {
             trim_fields: data.trim_fields,
             min_response_chars: data.min_response_chars,
             max_response_chars: data.max_response_chars,
+            response_contains_any: data.response_contains_any.clone(),
             min_instruction_chars: data.min_instruction_chars,
             max_instruction_chars: data.max_instruction_chars,
             min_input_chars: data.min_input_chars,
@@ -1751,6 +1754,13 @@ impl QwenSftFieldMap {
                     "data.max_response_chars must be greater than or equal to data.min_response_chars"
                 );
             }
+        }
+        if self
+            .response_contains_any
+            .iter()
+            .any(|needle| needle.is_empty())
+        {
+            bail!("data.response_contains_any entries must not be empty");
         }
         if let Some(min_instruction_chars) = self.min_instruction_chars {
             if min_instruction_chars == 0 {
@@ -1859,6 +1869,7 @@ impl Default for QwenSftFieldMap {
             trim_fields: true,
             min_response_chars: 1,
             max_response_chars: None,
+            response_contains_any: Vec::new(),
             min_instruction_chars: None,
             max_instruction_chars: None,
             min_input_chars: None,
@@ -11957,6 +11968,9 @@ fn qwen_sft_record_passes_filters(record: &QwenSftRecord, field_map: &QwenSftFie
         record.response.chars().count(),
         Some(field_map.min_response_chars),
         field_map.max_response_chars,
+    ) && qwen_sft_string_contains_any_filter_passes(
+        &record.response,
+        &field_map.response_contains_any,
     ) && qwen_sft_length_filter_passes(
         record.instruction.chars().count(),
         field_map.min_instruction_chars,
@@ -11988,6 +12002,10 @@ fn qwen_sft_length_filter_passes(
     max_chars: Option<usize>,
 ) -> bool {
     min_chars.is_none_or(|limit| chars >= limit) && max_chars.is_none_or(|limit| chars <= limit)
+}
+
+fn qwen_sft_string_contains_any_filter_passes(value: &str, needles: &[String]) -> bool {
+    needles.is_empty() || needles.iter().any(|needle| value.contains(needle))
 }
 
 fn qwen_render_sft_record_prompt(record: &QwenSftRecord, field_map: &QwenSftFieldMap) -> String {
@@ -12089,6 +12107,14 @@ fn qwen_sft_hash_field_map(hash: &mut u64, field_map: &QwenSftFieldMap) {
     if let Some(max_response_chars) = field_map.max_response_chars {
         qwen_sft_hash_bytes(hash, b"max_response_chars");
         qwen_sft_hash_bytes(hash, max_response_chars.to_string().as_bytes());
+        qwen_sft_hash_bytes(hash, b"\0");
+    }
+    if !field_map.response_contains_any.is_empty() {
+        qwen_sft_hash_bytes(hash, b"response_contains_any");
+        for needle in &field_map.response_contains_any {
+            qwen_sft_hash_bytes(hash, needle.as_bytes());
+            qwen_sft_hash_bytes(hash, b",");
+        }
         qwen_sft_hash_bytes(hash, b"\0");
     }
     if let Some(min_instruction_chars) = field_map.min_instruction_chars {
@@ -15204,6 +15230,92 @@ mod tests {
                 .map(|sample| sample.index_in_file)
                 .collect::<Vec<_>>(),
             vec![2, 3]
+        );
+    }
+
+    #[test]
+    fn qwen_sft_filters_responses_by_substring_before_limit_and_streaming_index() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let jsonl = temp.path().join("samples.jsonl");
+        let cache_path = temp.path().join("cache").join("offset-index.json");
+        fs::write(
+            &jsonl,
+            r#"{"instruction":"first","response":"approved answer"}
+{"instruction":"skip","response":"ordinary reply"}
+{"instruction":"second","response":"contains verified marker"}
+{"instruction":"third","response":"approved final"}
+"#,
+        )
+        .expect("jsonl should write");
+        let paths = vec![jsonl.clone()];
+        let field_map = QwenSftFieldMap {
+            response_contains_any: vec!["approved".to_string(), "verified".to_string()],
+            ..QwenSftFieldMap::default()
+        };
+
+        let loaded = qwen_sft_examples_from_jsonl_paths_with_limit(&paths, Some(3), &field_map)
+            .expect("filtered examples should load");
+        let streamed = qwen_sft_streaming_source_summary(&paths, Some(3), &field_map)
+            .expect("filtered streaming summary should scan");
+        let source_index = qwen_sft_streaming_source_index(&paths, Some(3), &field_map)
+            .expect("filtered source index should build");
+        let raw_window = qwen_sft_examples_by_raw_indices(&source_index.samples, &field_map)
+            .expect("filtered raw window should read");
+        let cache = qwen_sft_streaming_source_index_with_cache(
+            &paths,
+            Some(3),
+            Some(&cache_path),
+            &field_map,
+        )
+        .expect("filtered cache should write");
+        let cache_mismatch = qwen_sft_streaming_source_index_with_cache(
+            &paths,
+            Some(3),
+            Some(&cache_path),
+            &QwenSftFieldMap::default(),
+        )
+        .expect_err("response substring drift should reject cache")
+        .to_string();
+
+        assert_eq!(
+            loaded
+                .examples
+                .iter()
+                .map(|example| example.instruction.as_str())
+                .collect::<Vec<_>>(),
+            vec!["first", "second", "third"]
+        );
+        assert_eq!(streamed.samples, loaded.examples.len());
+        assert_eq!(streamed.source_files, loaded.source_files);
+        assert_eq!(streamed.source_sample_counts, loaded.source_sample_counts);
+        assert_eq!(streamed.fingerprint, loaded.fingerprint);
+        assert_eq!(cache.index.samples, source_index.samples);
+        assert!(cache_mismatch.contains("field_map"));
+        assert_ne!(
+            loaded.fingerprint,
+            qwen_sft_streaming_fingerprint(
+                &paths,
+                Some(3),
+                &loaded.source_files,
+                &QwenSftFieldMap::default()
+            )
+            .expect("default fingerprint should compute")
+        );
+        assert_eq!(
+            raw_window
+                .examples
+                .iter()
+                .map(|example| example.instruction.as_str())
+                .collect::<Vec<_>>(),
+            vec!["first", "second", "third"]
+        );
+        assert_eq!(
+            source_index
+                .samples
+                .iter()
+                .map(|sample| sample.index_in_file)
+                .collect::<Vec<_>>(),
+            vec![0, 2, 3]
         );
     }
 
