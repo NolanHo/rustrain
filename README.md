@@ -479,6 +479,10 @@ production-grade sharded checkpoint ownership remain open.
   normalization, filtering, deduplication, splitting, and streaming indexing.
   The default empty list preserves existing fingerprints. `data.system_field`
   is not required when `data.field_defaults` injects a default system prompt.
+  `data.field_case_transforms` can then lowercase or uppercase `system`,
+  `instruction`, `input`, `response`, or `all` after replacements and before
+  whitespace normalization and filtering. The default empty list preserves
+  existing fingerprints.
   These transforms run before train/eval splitting, `max_samples`, and
   streaming offset-index construction.
   `data.max_eval_samples` can optionally cap explicit held-out

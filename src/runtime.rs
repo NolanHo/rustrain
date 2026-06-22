@@ -157,6 +157,8 @@ pub struct DataConfig {
     #[serde(default)]
     pub field_defaults: Vec<FieldDefault>,
     #[serde(default)]
+    pub field_case_transforms: Vec<FieldCaseTransform>,
+    #[serde(default)]
     pub source_weights: Vec<usize>,
     #[serde(default)]
     pub source_max_samples: Vec<usize>,
@@ -194,6 +196,19 @@ pub enum FieldDefaultTarget {
     Instruction,
     Input,
     Response,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct FieldCaseTransform {
+    pub field: FieldReplacementTarget,
+    pub case: FieldCaseTransformKind,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum FieldCaseTransformKind {
+    Lowercase,
+    Uppercase,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -768,6 +783,13 @@ pub fn validate_config(config: &Config) -> Result<()> {
                 ));
             }
         }
+        for transform in &data.field_case_transforms {
+            if matches!(transform.field, FieldReplacementTarget::System) && !has_system_source {
+                return Err(anyhow!(
+                    "data.field_case_transforms targeting system requires data.system_field, data.chat_messages_field, or a system field_default to be set"
+                ));
+            }
+        }
     }
 
     Ok(())
@@ -978,6 +1000,7 @@ mod tests {
                 field_replacements: Vec::new(),
                 normalize_whitespace: false,
                 field_defaults: Vec::new(),
+                field_case_transforms: Vec::new(),
                 source_weights: Vec::new(),
                 source_max_samples: Vec::new(),
                 skip_invalid_records: false,
