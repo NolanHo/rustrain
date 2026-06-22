@@ -3458,6 +3458,7 @@ fn qwen_session_single_summary(
     resume_from: Option<&Path>,
     trainable_layers: &[usize],
     runtime_config: Option<&Config>,
+    streaming_index_cache: Option<&Path>,
 ) -> Result<QwenFullTrainSmokeSummary> {
     if train_steps == 0 {
         bail!("qwen session single trainer requires max_steps > 0");
@@ -3497,9 +3498,7 @@ fn qwen_session_single_summary(
         data_cursor_start,
         train_steps,
         runtime_config,
-        runtime_config
-            .and_then(|config| config.data.as_ref())
-            .and_then(|data| data.index_cache.as_deref()),
+        streaming_index_cache,
     )?;
     if let Some(manifest) = loaded_manifest.as_ref() {
         qwen_validate_optional_sft_resume_dataset(
@@ -7906,6 +7905,11 @@ pub(crate) fn train_qwen_session_single_from_config(
             bail!("qwen session trainer does not support fp16 yet; use fp32 or bf16")
         }
     };
+    let streaming_index_cache = config.data.as_ref().map(|data| {
+        data.index_cache.clone().unwrap_or_else(|| {
+            qwen_sft_streaming_index_cache_path(&run_paths.cache, "qwen-session-single")
+        })
+    });
     qwen_session_single_summary(
         model_path,
         &run_paths
@@ -7917,6 +7921,7 @@ pub(crate) fn train_qwen_session_single_from_config(
         config.train.resume_from.as_deref(),
         &qwen_session_trainable_layers_from_config(config),
         Some(config),
+        streaming_index_cache.as_deref(),
     )
 }
 
