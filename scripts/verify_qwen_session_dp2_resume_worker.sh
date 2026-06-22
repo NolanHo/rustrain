@@ -11,7 +11,15 @@ EXPECTED_DATASET_SEED="${RUSTRAIN_EXPECTED_DATASET_ORDER_SEED:-}"
 EXPECTED_TRAINABLE_TENSORS="${RUSTRAIN_EXPECTED_QWEN_DP_TRAINABLE_TENSORS:-}"
 EXPECTED_TRAINABLE_NAMES="${RUSTRAIN_EXPECTED_QWEN_DP_TRAINABLE_NAMES:-}"
 EXPECTED_DTYPE="${RUSTRAIN_EXPECTED_QWEN_COMPUTE_KIND:-}"
+EXPECTED_DATASET_TOTAL_SAMPLES="${RUSTRAIN_EXPECTED_DATASET_TOTAL_SAMPLES:-}"
+EXPECTED_DATASET_TRAIN_SAMPLES="${RUSTRAIN_EXPECTED_DATASET_TRAIN_SAMPLES:-}"
+EXPECTED_DATASET_EVAL_SAMPLES="${RUSTRAIN_EXPECTED_DATASET_EVAL_SAMPLES:-}"
+EXPECTED_DATASET_SOURCE_FILES="${RUSTRAIN_EXPECTED_DATASET_SOURCE_FILES:-}"
+EXPECTED_DATASET_SOURCE_SAMPLE_COUNTS="${RUSTRAIN_EXPECTED_DATASET_SOURCE_SAMPLE_COUNTS:-}"
+EXPECTED_DATASET_FINGERPRINT="${RUSTRAIN_EXPECTED_DATASET_FINGERPRINT:-}"
 export BASE_OUTPUT_DIR RESUME_OUTPUT_DIR EXPECTED_DATASET_SEED EXPECTED_TRAINABLE_TENSORS EXPECTED_TRAINABLE_NAMES EXPECTED_DTYPE
+export EXPECTED_DATASET_TOTAL_SAMPLES EXPECTED_DATASET_TRAIN_SAMPLES EXPECTED_DATASET_EVAL_SAMPLES
+export EXPECTED_DATASET_SOURCE_FILES EXPECTED_DATASET_SOURCE_SAMPLE_COUNTS EXPECTED_DATASET_FINGERPRINT
 
 cargo run -- launch \
   --nproc-per-node 2 \
@@ -50,6 +58,24 @@ resume_output_dir = pathlib.Path(os.environ["RESUME_OUTPUT_DIR"])
 expected_dataset_seed = os.environ.get("EXPECTED_DATASET_SEED")
 expected_trainable_tensors = os.environ.get("EXPECTED_TRAINABLE_TENSORS")
 expected_dtype = os.environ.get("EXPECTED_DTYPE")
+expected_dataset_total_samples = os.environ.get("EXPECTED_DATASET_TOTAL_SAMPLES")
+expected_dataset_train_samples = os.environ.get("EXPECTED_DATASET_TRAIN_SAMPLES")
+expected_dataset_eval_samples = os.environ.get("EXPECTED_DATASET_EVAL_SAMPLES")
+expected_dataset_source_files = [
+    source.strip()
+    for source in os.environ.get("EXPECTED_DATASET_SOURCE_FILES", "").split(",")
+    if source.strip()
+]
+expected_dataset_source_sample_counts = {}
+for entry in os.environ.get("EXPECTED_DATASET_SOURCE_SAMPLE_COUNTS", "").split(","):
+    entry = entry.strip()
+    if not entry:
+        continue
+    path, sep, samples = entry.rpartition(":")
+    if not sep or not path:
+        raise SystemExit(f"invalid EXPECTED_DATASET_SOURCE_SAMPLE_COUNTS entry: {entry}")
+    expected_dataset_source_sample_counts[path] = int(samples)
+expected_dataset_fingerprint = os.environ.get("EXPECTED_DATASET_FINGERPRINT")
 expected_trainable_names = [
     name.strip()
     for name in os.environ.get("EXPECTED_TRAINABLE_NAMES", "").split(",")
@@ -76,6 +102,35 @@ if expected_trainable_tensors:
     for name in expected_trainable_names:
         if name not in base_trainable_tensors:
             raise SystemExit(f"base rank0 missing expected trainable tensor {name}")
+if expected_dataset_total_samples and int(base_rank0["dataset_total_samples"]) != int(expected_dataset_total_samples):
+    raise SystemExit(
+        f"base rank0 dataset_total_samples {base_rank0['dataset_total_samples']} != {expected_dataset_total_samples}"
+    )
+if expected_dataset_train_samples and int(base_rank0["dataset_train_samples"]) != int(expected_dataset_train_samples):
+    raise SystemExit(
+        f"base rank0 dataset_train_samples {base_rank0['dataset_train_samples']} != {expected_dataset_train_samples}"
+    )
+if expected_dataset_eval_samples and int(base_rank0["dataset_eval_samples"]) != int(expected_dataset_eval_samples):
+    raise SystemExit(
+        f"base rank0 dataset_eval_samples {base_rank0['dataset_eval_samples']} != {expected_dataset_eval_samples}"
+    )
+if expected_dataset_source_files and base_rank0.get("dataset_source_files") != expected_dataset_source_files:
+    raise SystemExit(
+        f"base rank0 dataset_source_files {base_rank0.get('dataset_source_files')} != {expected_dataset_source_files}"
+    )
+if expected_dataset_source_sample_counts:
+    base_counts = {
+        entry["path"]: entry["samples"]
+        for entry in base_rank0.get("dataset_source_sample_counts") or []
+    }
+    if base_counts != expected_dataset_source_sample_counts:
+        raise SystemExit(
+            f"base rank0 dataset_source_sample_counts {base_counts} != {expected_dataset_source_sample_counts}"
+        )
+if expected_dataset_fingerprint and base_rank0.get("dataset_fingerprint") != expected_dataset_fingerprint:
+    raise SystemExit(
+        f"base rank0 dataset_fingerprint {base_rank0.get('dataset_fingerprint')} != {expected_dataset_fingerprint}"
+    )
 
 resume_summaries = sorted(resume_output_dir.rglob("qwen-session-dp-rank-*.json"))
 if len(resume_summaries) != 2:
@@ -109,6 +164,35 @@ for path in resume_summaries:
         raise SystemExit(f"{path} dataset_source_files must not be empty")
     if not data.get("dataset_fingerprint"):
         raise SystemExit(f"{path} dataset_fingerprint must not be empty")
+    if expected_dataset_total_samples and int(data["dataset_total_samples"]) != int(expected_dataset_total_samples):
+        raise SystemExit(
+            f"{path} dataset_total_samples {data['dataset_total_samples']} != {expected_dataset_total_samples}"
+        )
+    if expected_dataset_train_samples and int(data["dataset_train_samples"]) != int(expected_dataset_train_samples):
+        raise SystemExit(
+            f"{path} dataset_train_samples {data['dataset_train_samples']} != {expected_dataset_train_samples}"
+        )
+    if expected_dataset_eval_samples and int(data["dataset_eval_samples"]) != int(expected_dataset_eval_samples):
+        raise SystemExit(
+            f"{path} dataset_eval_samples {data['dataset_eval_samples']} != {expected_dataset_eval_samples}"
+        )
+    if expected_dataset_source_files and data.get("dataset_source_files") != expected_dataset_source_files:
+        raise SystemExit(
+            f"{path} dataset_source_files {data.get('dataset_source_files')} != {expected_dataset_source_files}"
+        )
+    if expected_dataset_source_sample_counts:
+        counts = {
+            entry["path"]: entry["samples"]
+            for entry in data.get("dataset_source_sample_counts") or []
+        }
+        if counts != expected_dataset_source_sample_counts:
+            raise SystemExit(
+                f"{path} dataset_source_sample_counts {counts} != {expected_dataset_source_sample_counts}"
+            )
+    if expected_dataset_fingerprint and data.get("dataset_fingerprint") != expected_dataset_fingerprint:
+        raise SystemExit(
+            f"{path} dataset_fingerprint {data.get('dataset_fingerprint')} != {expected_dataset_fingerprint}"
+        )
     trainable_tensors = data.get("trainable_tensors")
     if expected_trainable_tensors:
         if not isinstance(trainable_tensors, list):
@@ -145,10 +229,44 @@ for path in resume_summaries:
         raise SystemExit(
             f"{path} manifest data_cursor_next {manifest['data_cursor_next']} != expected {expected_cursor_next}"
         )
+    if expected_dataset_source_files and manifest.get("dataset_source_files") != expected_dataset_source_files:
+        raise SystemExit(
+            f"{path} manifest dataset_source_files {manifest.get('dataset_source_files')} != {expected_dataset_source_files}"
+        )
+    if expected_dataset_source_sample_counts:
+        manifest_counts = {
+            entry["path"]: entry["samples"]
+            for entry in manifest.get("dataset_source_sample_counts") or []
+        }
+        if manifest_counts != expected_dataset_source_sample_counts:
+            raise SystemExit(
+                f"{path} manifest dataset_source_sample_counts {manifest_counts} != {expected_dataset_source_sample_counts}"
+            )
+    if expected_dataset_fingerprint and manifest.get("dataset_fingerprint") != expected_dataset_fingerprint:
+        raise SystemExit(
+            f"{path} manifest dataset_fingerprint {manifest.get('dataset_fingerprint')} != {expected_dataset_fingerprint}"
+        )
     sharded_manifest = json.loads(pathlib.Path(data["sharded_global_manifest_output"]).read_text())
     if int(sharded_manifest["data_cursor_next"]) != expected_cursor_next:
         raise SystemExit(
             f"{path} sharded data_cursor_next {sharded_manifest['data_cursor_next']} != expected {expected_cursor_next}"
+        )
+    if expected_dataset_source_files and sharded_manifest.get("dataset_source_files") != expected_dataset_source_files:
+        raise SystemExit(
+            f"{path} sharded dataset_source_files {sharded_manifest.get('dataset_source_files')} != {expected_dataset_source_files}"
+        )
+    if expected_dataset_source_sample_counts:
+        sharded_counts = {
+            entry["path"]: entry["samples"]
+            for entry in sharded_manifest.get("dataset_source_sample_counts") or []
+        }
+        if sharded_counts != expected_dataset_source_sample_counts:
+            raise SystemExit(
+                f"{path} sharded dataset_source_sample_counts {sharded_counts} != {expected_dataset_source_sample_counts}"
+            )
+    if expected_dataset_fingerprint and sharded_manifest.get("dataset_fingerprint") != expected_dataset_fingerprint:
+        raise SystemExit(
+            f"{path} sharded dataset_fingerprint {sharded_manifest.get('dataset_fingerprint')} != {expected_dataset_fingerprint}"
         )
     evidence.append(
         {

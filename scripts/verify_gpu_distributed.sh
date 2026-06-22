@@ -159,6 +159,12 @@ remote_run_2gpu env \
 
 remote_run_2gpu env \
   RUSTRAIN_LAUNCH_TIMEOUT_SECS=900 \
+  RUSTRAIN_DISTRIBUTED_BASE_OUTPUT_DIR="${OUTPUT_DIR}-sft-max-samples-resume-base" \
+  RUSTRAIN_DISTRIBUTED_RESUME_OUTPUT_DIR="${OUTPUT_DIR}-sft-max-samples-resume-continue" \
+  bash scripts/verify_qwen_session_dp2_sft_max_samples_resume_worker.sh
+
+remote_run_2gpu env \
+  RUSTRAIN_LAUNCH_TIMEOUT_SECS=900 \
   RUSTRAIN_DISTRIBUTED_BASE_OUTPUT_DIR="${OUTPUT_DIR}-layers01-sft-resume-base" \
   RUSTRAIN_DISTRIBUTED_RESUME_OUTPUT_DIR="${OUTPUT_DIR}-layers01-sft-resume-continue" \
   RUSTRAIN_QWEN_SESSION_DP_CONFIG=configs/qwen_session_dp2_layers01_sft.toml \

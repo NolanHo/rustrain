@@ -21,7 +21,7 @@ rms_norm_eps = 0.000001
 trainable_layers = [0]
 
 [train]
-max_steps = 2
+max_steps = 1
 backend = "tch"
 micro_batch_size = 1
 global_batch_size = 1
