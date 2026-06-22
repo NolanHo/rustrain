@@ -207,6 +207,41 @@ enum Command {
         #[arg(long, default_value = "output")]
         response_column: String,
     },
+    #[command(hide = true)]
+    QwenSftArrowBatchPlan {
+        #[arg(long)]
+        input: PathBuf,
+        #[arg(
+            long,
+            default_value = "/vePFS-Mindverse/share/huggingface/Qwen2.5-0.5B-Instruct"
+        )]
+        model_path: PathBuf,
+        #[arg(long, default_value_t = 2)]
+        world_size: usize,
+        #[arg(long, default_value_t = 2)]
+        local_batch_size: usize,
+        #[arg(long, default_value_t = 2)]
+        train_steps: usize,
+        #[arg(long, default_value_t = 94)]
+        data_cursor_start: usize,
+        #[arg(long, default_value_t = 128)]
+        limit: usize,
+        #[arg(long, default_value_t = 0.75)]
+        train_split: f32,
+        #[arg(long, default_value = "instruction")]
+        instruction_column: String,
+        #[arg(long, default_value = "input")]
+        input_column: String,
+        #[arg(long, default_value = "output")]
+        response_column: String,
+        #[arg(long, default_value = "Instruction: {instruction}\\nResponse: ")]
+        prompt_template: String,
+        #[arg(
+            long,
+            default_value = "Instruction: {instruction}\\nInput: {input}\\nResponse: "
+        )]
+        prompt_with_input_template: String,
+    },
     QwenTiedHeadTrainSmoke {
         #[arg(
             long,
@@ -534,6 +569,35 @@ fn main() -> Result<()> {
             &instruction_column,
             &input_column,
             &response_column,
+        ),
+        Command::QwenSftArrowBatchPlan {
+            input,
+            model_path,
+            world_size,
+            local_batch_size,
+            train_steps,
+            data_cursor_start,
+            limit,
+            train_split,
+            instruction_column,
+            input_column,
+            response_column,
+            prompt_template,
+            prompt_with_input_template,
+        } => qwen_module::qwen_sft_arrow_batch_plan(
+            &input,
+            &model_path,
+            world_size,
+            local_batch_size,
+            train_steps,
+            data_cursor_start,
+            limit,
+            train_split,
+            &instruction_column,
+            &input_column,
+            &response_column,
+            &prompt_template,
+            &prompt_with_input_template,
         ),
         Command::QwenTiedHeadTrainSmoke {
             model_path,

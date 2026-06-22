@@ -26,6 +26,21 @@ cargo run -- qwen-sft-arrow-source-summary \
   --response-column output \
   | tee "${ARROW_SUMMARY_OUTPUT}"
 
+ARROW_BATCH_OUTPUT="${WORK_DIR}/arrow-batch-plan.out"
+cargo run -- qwen-sft-arrow-batch-plan \
+  --input "${HF_ARROW}" \
+  --model-path "/vePFS-Mindverse/share/huggingface/Qwen2.5-0.5B-Instruct" \
+  --world-size 2 \
+  --local-batch-size 2 \
+  --train-steps 2 \
+  --data-cursor-start 94 \
+  --limit 128 \
+  --train-split 0.75 \
+  --response-column output \
+  --prompt-template "Instruction: {instruction}\\nResponse: " \
+  --prompt-with-input-template "Instruction: {instruction}\\nInput: {input}\\nResponse: " \
+  | tee "${ARROW_BATCH_OUTPUT}"
+
 python scripts/export_instruction_arrow_jsonl.py \
   --input "${HF_ARROW}" \
   --output "${DATA_DIR}/alpaca_bounded.jsonl" \
@@ -127,6 +142,7 @@ cargo run -- qwen-sft-streaming-batch-plan \
 
 python - \
   "${ARROW_SUMMARY_OUTPUT}" \
+  "${ARROW_BATCH_OUTPUT}" \
   "${DATA_OUTPUT}" \
   "${BATCH_OUTPUT}" \
   "${CACHE_FIRST_OUTPUT}" \
@@ -139,13 +155,14 @@ import pathlib
 import sys
 
 arrow_summary_output = pathlib.Path(sys.argv[1])
-data_output = pathlib.Path(sys.argv[2])
-batch_output = pathlib.Path(sys.argv[3])
-cache_first_output = pathlib.Path(sys.argv[4])
-cache_second_output = pathlib.Path(sys.argv[5])
-cache_path = pathlib.Path(sys.argv[6])
-data_dir = pathlib.Path(sys.argv[7])
-hf_arrow = pathlib.Path(sys.argv[8])
+arrow_batch_output = pathlib.Path(sys.argv[2])
+data_output = pathlib.Path(sys.argv[3])
+batch_output = pathlib.Path(sys.argv[4])
+cache_first_output = pathlib.Path(sys.argv[5])
+cache_second_output = pathlib.Path(sys.argv[6])
+cache_path = pathlib.Path(sys.argv[7])
+data_dir = pathlib.Path(sys.argv[8])
+hf_arrow = pathlib.Path(sys.argv[9])
 
 
 def load_json(path: pathlib.Path) -> dict:
@@ -157,6 +174,7 @@ def load_json(path: pathlib.Path) -> dict:
 
 
 arrow_summary = load_json(arrow_summary_output)
+arrow_batch = load_json(arrow_batch_output)
 data_plan = load_json(data_output)
 batch_plan = load_json(batch_output)
 cache_first = load_json(cache_first_output)
@@ -169,6 +187,14 @@ bounded_metadata = json.loads(
 source_files = [str(data_dir / f"alpaca_{index}.jsonl") for index in range(2)]
 source_counts = [{"path": path, "samples": 64} for path in source_files]
 export_outputs = [{"path": path, "rows": 64} for path in source_files]
+expected_window = [
+    {
+        "cursor": cursor,
+        "epoch": 0 if cursor < 96 else 1,
+        "sample_offset": cursor if cursor < 96 else cursor - 96,
+    }
+    for cursor in range(94, 106)
+]
 
 if pathlib.Path(metadata["source_arrow"]) != hf_arrow:
     raise SystemExit(f"metadata source_arrow {metadata['source_arrow']} != {hf_arrow}")
@@ -214,6 +240,43 @@ if arrow_summary.get("source_sample_counts") != [{"path": str(hf_arrow), "sample
 if not isinstance(arrow_summary.get("fingerprint"), str) or len(arrow_summary["fingerprint"]) != 16:
     raise SystemExit(f"Arrow summary fingerprint should be a 16-char hash: {arrow_summary.get('fingerprint')}")
 
+if pathlib.Path(arrow_batch.get("input", "")) != hf_arrow:
+    raise SystemExit(f"Arrow batch-plan input {arrow_batch.get('input')} != {hf_arrow}")
+if arrow_batch.get("arrow_ipc_format") != metadata.get("arrow_ipc_format"):
+    raise SystemExit(f"Arrow batch-plan format {arrow_batch.get('arrow_ipc_format')} != metadata {metadata.get('arrow_ipc_format')}")
+for key, expected in {
+    "world_size": 2,
+    "local_batch_size": 2,
+    "global_batch_size": 4,
+    "train_steps": 2,
+    "train_batch_count": 3,
+    "data_cursor_start": 94,
+    "data_cursor_end": 102,
+    "data_cursor_next": 102,
+    "dataset_total_samples": 128,
+    "dataset_train_samples": 96,
+    "dataset_eval_samples": 32,
+    "tokenizer_loaded": True,
+    "tokenized_samples_materialized": False,
+    "jsonl_materialized": False,
+    "streaming_window_samples": 12,
+    "streaming_raw_samples_read": 12,
+}.items():
+    if arrow_batch.get(key) != expected:
+        raise SystemExit(f"Arrow batch-plan {key} {arrow_batch.get(key)!r} != {expected!r}")
+if arrow_batch.get("train_window_sample_cursors") != expected_window:
+    raise SystemExit(
+        f"Arrow batch-plan cursors {arrow_batch.get('train_window_sample_cursors')} != {expected_window}"
+    )
+if arrow_batch.get("dataset_source_files") != [str(hf_arrow)]:
+    raise SystemExit(f"Arrow batch-plan source_files mismatch: {arrow_batch.get('dataset_source_files')}")
+if arrow_batch.get("dataset_source_sample_counts") != [{"path": str(hf_arrow), "samples": 128}]:
+    raise SystemExit(f"Arrow batch-plan source counts mismatch: {arrow_batch.get('dataset_source_sample_counts')}")
+if arrow_batch.get("column_map", {}).get("response") != "output":
+    raise SystemExit(f"Arrow batch-plan did not record response source column: {arrow_batch}")
+if not isinstance(arrow_batch.get("dataset_fingerprint"), str) or len(arrow_batch["dataset_fingerprint"]) != 16:
+    raise SystemExit(f"Arrow batch-plan fingerprint should be a 16-char hash: {arrow_batch.get('dataset_fingerprint')}")
+
 if pathlib.Path(bounded_metadata["source_arrow"]) != hf_arrow:
     raise SystemExit(f"bounded metadata source_arrow {bounded_metadata['source_arrow']} != {hf_arrow}")
 if bounded_metadata.get("arrow_ipc_format") != "stream":
@@ -236,15 +299,6 @@ for index, line in enumerate(bounded_lines):
     record = json.loads(line)
     if not isinstance(record.get("instruction"), str) or not isinstance(record.get("response"), str):
         raise SystemExit(f"bounded export row {index} has invalid record: {record}")
-
-expected_window = [
-    {
-        "cursor": cursor,
-        "epoch": 0 if cursor < 96 else 1,
-        "sample_offset": cursor if cursor < 96 else cursor - 96,
-    }
-    for cursor in range(94, 106)
-]
 
 for key, expected in {
     "world_size": 2,
@@ -363,6 +417,18 @@ verify_batch_plan(batch_plan, "batch-plan")
 verify_batch_plan(cache_first, "cache-first")
 verify_batch_plan(cache_second, "cache-second")
 
+for key in [
+    "train_window_sample_cursors",
+    "batch_sequence_tokens",
+    "batch_masked_positions",
+    "batch_padding_tokens",
+    "batch_token_fingerprints",
+]:
+    if arrow_batch.get(key) != batch_plan.get(key):
+        raise SystemExit(
+            f"Arrow batch-plan {key} {arrow_batch.get(key)} != JSONL batch-plan {batch_plan.get(key)}"
+        )
+
 if batch_plan.get("streaming_index_cache_path") is not None:
     raise SystemExit("uncached batch plan unexpectedly reported a cache path")
 if batch_plan.get("streaming_index_cache_hit") is not False or batch_plan.get("streaming_index_cache_written") is not False:
@@ -403,6 +469,7 @@ print(
     "qwen_sft_streaming_hf_cache_verified: "
     f"source_rows={metadata['source_rows']} "
     f"arrow_samples={arrow_summary['samples']} "
+    f"arrow_window_samples={arrow_batch['streaming_window_samples']} "
     f"exported_rows={metadata['exported_rows']} "
     f"train_samples={data_plan['dataset_train_samples']} "
     f"streaming_window_samples={batch_plan['streaming_window_samples']} "

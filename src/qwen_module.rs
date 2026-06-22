@@ -1807,6 +1807,14 @@ struct QwenSftExternalMetadata {
     contents: String,
 }
 
+struct QwenSftArrowExampleSet {
+    examples: Vec<QwenSftExample>,
+    source_rows: usize,
+    arrow_ipc_format: String,
+    columns: Vec<String>,
+    fingerprint: String,
+}
+
 impl QwenSftFieldMap {
     fn from_runtime_data(data: &RuntimeDataConfig) -> Result<Self> {
         let map = Self {
@@ -2405,6 +2413,42 @@ struct QwenSftArrowSourceSummary {
     fingerprint: String,
     tokenized_samples_materialized: bool,
     jsonl_materialized: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct QwenSftArrowBatchPlanSummary {
+    input: String,
+    model_path: String,
+    arrow_ipc_format: String,
+    world_size: usize,
+    local_batch_size: usize,
+    global_batch_size: usize,
+    train_steps: usize,
+    required_batches: usize,
+    train_batch_count: usize,
+    data_cursor_start: usize,
+    data_cursor_end: usize,
+    data_cursor_next: usize,
+    train_window_start_cursor: usize,
+    train_window_end_cursor_exclusive: usize,
+    train_window_sample_cursors: Vec<QwenSftStreamingCursorEntry>,
+    dataset_total_samples: usize,
+    dataset_train_samples: usize,
+    dataset_eval_samples: usize,
+    dataset_source_files: Vec<String>,
+    dataset_source_sample_counts: Vec<QwenSftSourceSampleCount>,
+    dataset_fingerprint: String,
+    column_map: QwenSftArrowColumnMap,
+    tokenizer_loaded: bool,
+    tokenized_samples_materialized: bool,
+    jsonl_materialized: bool,
+    streaming_window_samples: usize,
+    streaming_raw_samples_read: usize,
+    streaming_raw_sample_indices: Vec<QwenSftRawSampleIndex>,
+    batch_sequence_tokens: Vec<usize>,
+    batch_masked_positions: Vec<usize>,
+    batch_padding_tokens: Vec<usize>,
+    batch_token_fingerprints: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -6633,6 +6677,135 @@ pub fn qwen_sft_arrow_source_summary(
     };
     field_map.validate()?;
     let summary = qwen_sft_arrow_source_summary_from_ipc(input, limit, &field_map)?;
+    println!("{}", serde_json::to_string_pretty(&summary)?);
+    Ok(())
+}
+
+pub fn qwen_sft_arrow_batch_plan(
+    input: &Path,
+    model_path: &Path,
+    world_size: usize,
+    local_batch_size: usize,
+    train_steps: usize,
+    data_cursor_start: usize,
+    limit: usize,
+    train_split: f32,
+    instruction_column: &str,
+    input_column: &str,
+    response_column: &str,
+    prompt_template: &str,
+    prompt_with_input_template: &str,
+) -> Result<()> {
+    if world_size == 0 {
+        bail!("qwen SFT Arrow batch plan requires world_size > 0");
+    }
+    if local_batch_size == 0 {
+        bail!("qwen SFT Arrow batch plan requires local_batch_size > 0");
+    }
+    if limit == 0 {
+        bail!("qwen SFT Arrow batch plan requires limit > 0");
+    }
+    if !input.is_file() {
+        bail!(
+            "qwen SFT Arrow source input must be a file: {}",
+            input.display()
+        );
+    }
+    let model_path = resolve_qwen_model_path(model_path)?;
+    let tokenizer = Tokenizer::from_file(model_path.join("tokenizer.json"))
+        .map_err(|error| anyhow!("failed to load tokenizer: {error}"))?;
+    let field_map = QwenSftFieldMap {
+        instruction: instruction_column.to_string(),
+        input: input_column.to_string(),
+        response: response_column.to_string(),
+        prompt_template: qwen_decode_cli_template_escapes(prompt_template),
+        prompt_with_input_template: qwen_decode_cli_template_escapes(prompt_with_input_template),
+        ..QwenSftFieldMap::default()
+    };
+    field_map.validate()?;
+    let arrow = qwen_sft_arrow_examples_from_ipc(input, Some(limit), &field_map)?;
+    let (dataset_train_samples, dataset_eval_samples) =
+        qwen_sft_train_eval_sample_counts(arrow.examples.len(), train_split)?;
+    let global_batch_size = local_batch_size * world_size;
+    let required_batches = train_steps * global_batch_size + 1;
+    let train_batch_count = train_steps + 1;
+    let data_cursor_end = data_cursor_start + train_steps * global_batch_size;
+    let data_cursor_next = data_cursor_end;
+    let train_window_sample_cursors = qwen_sft_streaming_cursor_window(
+        data_cursor_start,
+        required_batches,
+        global_batch_size,
+        dataset_train_samples,
+    )?;
+    let train_window_end_cursor_exclusive = train_window_sample_cursors
+        .last()
+        .map(|entry| entry.cursor + 1)
+        .unwrap_or(data_cursor_start);
+    let train_examples = &arrow.examples[..dataset_train_samples];
+    let window_examples = train_window_sample_cursors
+        .iter()
+        .map(|cursor| train_examples[cursor.sample_offset].clone())
+        .collect::<Vec<_>>();
+    let samples = window_examples
+        .iter()
+        .map(|example| qwen_sft_token_sample(&tokenizer, example, &field_map))
+        .collect::<Result<Vec<_>>>()?;
+    let pad_token_id = qwen_pad_token_id(&tokenizer);
+    let mut batch_sequence_tokens = Vec::with_capacity(train_batch_count);
+    let mut batch_masked_positions = Vec::with_capacity(train_batch_count);
+    let mut batch_padding_tokens = Vec::with_capacity(train_batch_count);
+    let mut batch_token_fingerprints = Vec::with_capacity(train_batch_count);
+    for batch_index in 0..train_batch_count {
+        let offset = batch_index * global_batch_size;
+        let end = offset + global_batch_size;
+        let batch = qwen_sft_padded_batch(&samples[offset..end], pad_token_id)?;
+        batch_sequence_tokens.push(batch.input_ids.size()[1] as usize);
+        batch_masked_positions.push(batch.masked_positions);
+        batch_padding_tokens.push(batch.padding_tokens);
+        batch_token_fingerprints.push(qwen_tensor_i64_fingerprint(&batch.input_ids)?);
+    }
+    let input = input.display().to_string();
+    let summary = QwenSftArrowBatchPlanSummary {
+        input: input.clone(),
+        model_path: model_path.display().to_string(),
+        arrow_ipc_format: arrow.arrow_ipc_format,
+        world_size,
+        local_batch_size,
+        global_batch_size,
+        train_steps,
+        required_batches,
+        train_batch_count,
+        data_cursor_start,
+        data_cursor_end,
+        data_cursor_next,
+        train_window_start_cursor: data_cursor_start,
+        train_window_end_cursor_exclusive,
+        train_window_sample_cursors,
+        dataset_total_samples: arrow.examples.len(),
+        dataset_train_samples,
+        dataset_eval_samples,
+        dataset_source_files: vec![input.clone()],
+        dataset_source_sample_counts: vec![QwenSftSourceSampleCount {
+            path: input.clone(),
+            samples: arrow.examples.len(),
+        }],
+        dataset_fingerprint: arrow.fingerprint,
+        column_map: QwenSftArrowColumnMap {
+            instruction: field_map.instruction,
+            input: field_map.input,
+            response: field_map.response,
+        },
+        tokenizer_loaded: true,
+        tokenized_samples_materialized: false,
+        jsonl_materialized: false,
+        streaming_window_samples: samples.len(),
+        streaming_raw_samples_read: window_examples.len(),
+        streaming_raw_sample_indices: Vec::new(),
+        batch_sequence_tokens,
+        batch_masked_positions,
+        batch_padding_tokens,
+        batch_token_fingerprints,
+    };
     println!("{}", serde_json::to_string_pretty(&summary)?);
     Ok(())
 }
@@ -12174,13 +12347,47 @@ fn qwen_sft_arrow_source_summary_from_ipc(
     limit: usize,
     field_map: &QwenSftFieldMap,
 ) -> Result<QwenSftArrowSourceSummary> {
+    let arrow = qwen_sft_arrow_examples_from_ipc(path, Some(limit), field_map)?;
+    let source_file = path.display().to_string();
+    Ok(QwenSftArrowSourceSummary {
+        input: source_file.clone(),
+        arrow_ipc_format: arrow.arrow_ipc_format,
+        limit,
+        source_rows: arrow.source_rows,
+        source_rows_exact: true,
+        columns: arrow.columns,
+        column_map: QwenSftArrowColumnMap {
+            instruction: field_map.instruction.clone(),
+            input: field_map.input.clone(),
+            response: field_map.response.clone(),
+        },
+        samples: arrow.examples.len(),
+        source_files: vec![source_file.clone()],
+        source_sample_counts: vec![QwenSftSourceSampleCount {
+            path: source_file,
+            samples: arrow.examples.len(),
+        }],
+        fingerprint: arrow.fingerprint,
+        tokenized_samples_materialized: false,
+        jsonl_materialized: false,
+    })
+}
+
+fn qwen_sft_arrow_examples_from_ipc(
+    path: &Path,
+    max_samples: Option<usize>,
+    field_map: &QwenSftFieldMap,
+) -> Result<QwenSftArrowExampleSet> {
+    if max_samples == Some(0) {
+        bail!("qwen SFT Arrow source max_samples must be greater than zero");
+    }
     let stream_attempt = fs::File::open(path)
         .with_context(|| format!("failed to read {}", path.display()))
         .and_then(|file| {
             let reader = ArrowStreamReader::try_new(file, None).with_context(|| {
                 format!("failed to open {} as Arrow IPC stream", path.display())
             })?;
-            qwen_sft_arrow_source_summary_from_batches(path, limit, field_map, "stream", reader)
+            qwen_sft_arrow_examples_from_batches(path, max_samples, field_map, "stream", reader)
         });
     match stream_attempt {
         Ok(summary) => Ok(summary),
@@ -12193,18 +12400,18 @@ fn qwen_sft_arrow_source_summary_from_ipc(
                     path.display()
                 )
             })?;
-            qwen_sft_arrow_source_summary_from_batches(path, limit, field_map, "file", reader)
+            qwen_sft_arrow_examples_from_batches(path, max_samples, field_map, "file", reader)
         }
     }
 }
 
-fn qwen_sft_arrow_source_summary_from_batches<I>(
+fn qwen_sft_arrow_examples_from_batches<I>(
     path: &Path,
-    limit: usize,
+    max_samples: Option<usize>,
     field_map: &QwenSftFieldMap,
     arrow_ipc_format: &str,
     mut batches: I,
-) -> Result<QwenSftArrowSourceSummary>
+) -> Result<QwenSftArrowExampleSet>
 where
     I: Iterator<Item = std::result::Result<RecordBatch, arrow::error::ArrowError>>,
 {
@@ -12242,7 +12449,7 @@ where
             instruction_index,
             input_index,
             response_index,
-            limit,
+            max_samples,
             field_map,
             &regex_plan,
             &mut seen_records,
@@ -12253,13 +12460,13 @@ where
         let batch =
             batch.with_context(|| format!("failed to read Arrow batch from {}", path.display()))?;
         source_rows += batch.num_rows();
-        if examples.len() < limit {
+        if !max_samples.is_some_and(|limit| examples.len() >= limit) {
             qwen_sft_arrow_collect_examples_from_batch(
                 &batch,
                 instruction_index,
                 input_index,
                 response_index,
-                limit,
+                max_samples,
                 field_map,
                 &regex_plan,
                 &mut seen_records,
@@ -12273,7 +12480,9 @@ where
             path.display()
         );
     }
-    if examples.len() < limit {
+    if let Some(limit) = max_samples
+        && examples.len() < limit
+    {
         bail!(
             "SFT Arrow source {} produced {} examples, below limit {}",
             path.display(),
@@ -12284,27 +12493,12 @@ where
     let source_file = path.display().to_string();
     let source_files = vec![source_file.clone()];
     let fingerprint = qwen_sft_dataset_fingerprint(&source_files, &examples, field_map);
-    Ok(QwenSftArrowSourceSummary {
-        input: source_file.clone(),
-        arrow_ipc_format: arrow_ipc_format.to_string(),
-        limit,
+    Ok(QwenSftArrowExampleSet {
+        examples,
         source_rows,
-        source_rows_exact: true,
+        arrow_ipc_format: arrow_ipc_format.to_string(),
         columns,
-        column_map: QwenSftArrowColumnMap {
-            instruction: field_map.instruction.clone(),
-            input: field_map.input.clone(),
-            response: field_map.response.clone(),
-        },
-        samples: examples.len(),
-        source_files,
-        source_sample_counts: vec![QwenSftSourceSampleCount {
-            path: source_file,
-            samples: examples.len(),
-        }],
         fingerprint,
-        tokenized_samples_materialized: false,
-        jsonl_materialized: false,
     })
 }
 
@@ -12331,14 +12525,14 @@ fn qwen_sft_arrow_collect_examples_from_batch(
     instruction_index: usize,
     input_index: usize,
     response_index: usize,
-    limit: usize,
+    max_samples: Option<usize>,
     field_map: &QwenSftFieldMap,
     regex_plan: &QwenSftRegexPlan,
     seen_records: &mut Option<HashSet<String>>,
     examples: &mut Vec<QwenSftExample>,
 ) -> Result<()> {
     for row in 0..batch.num_rows() {
-        if examples.len() >= limit {
+        if max_samples.is_some_and(|limit| examples.len() >= limit) {
             break;
         }
         let mut record = QwenSftRecord {
@@ -13613,6 +13807,30 @@ fn qwen_render_sft_prompt(example: &QwenSftExample, field_map: &QwenSftFieldMap)
         .replace("{system}", &example.system)
         .replace("{instruction}", &example.instruction)
         .replace("{input}", &example.input))
+}
+
+fn qwen_decode_cli_template_escapes(value: &str) -> String {
+    let mut decoded = String::with_capacity(value.len());
+    let mut chars = value.chars();
+    while let Some(ch) = chars.next() {
+        if ch != '\\' {
+            decoded.push(ch);
+            continue;
+        }
+        match chars.next() {
+            Some('n') => decoded.push('\n'),
+            Some('r') => decoded.push('\r'),
+            Some('t') => decoded.push('\t'),
+            Some('\\') => decoded.push('\\'),
+            Some('"') => decoded.push('"'),
+            Some(other) => {
+                decoded.push('\\');
+                decoded.push(other);
+            }
+            None => decoded.push('\\'),
+        }
+    }
+    decoded
 }
 
 fn qwen_sft_token_sample_from_prompt(
@@ -17033,6 +17251,36 @@ mod tests {
             "### User\nName the project.\nContext: Rust trainer\n### Assistant\n"
         );
         assert_ne!(default_fingerprint, custom_fingerprint);
+    }
+
+    #[test]
+    fn qwen_sft_cli_template_escapes_match_config_templates() {
+        let example = QwenSftExample {
+            system: String::new(),
+            instruction: "Name the project.".to_string(),
+            input: "Rust trainer".to_string(),
+            response: "rustrain".to_string(),
+        };
+        let field_map = QwenSftFieldMap {
+            prompt_template: qwen_decode_cli_template_escapes(
+                "Instruction: {instruction}\\nResponse: ",
+            ),
+            prompt_with_input_template: qwen_decode_cli_template_escapes(
+                "Instruction: {instruction}\\nInput: {input}\\nResponse: ",
+            ),
+            ..QwenSftFieldMap::default()
+        };
+
+        let prompt =
+            qwen_render_sft_prompt(&example, &field_map).expect("CLI prompt should render");
+
+        assert_eq!(
+            prompt,
+            "Instruction: Name the project.\nInput: Rust trainer\nResponse: "
+        );
+        assert_eq!(qwen_decode_cli_template_escapes(r"one\ttwo"), "one\ttwo");
+        assert_eq!(qwen_decode_cli_template_escapes(r"one\\two"), r"one\two");
+        assert_eq!(qwen_decode_cli_template_escapes(r#"one\"two"#), "one\"two");
     }
 
     #[test]
