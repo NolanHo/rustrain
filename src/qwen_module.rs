@@ -5454,22 +5454,19 @@ pub fn qwen_session_dp_rank_smoke(
         (1, 0)
     };
     let runtime_data = runtime_config.and_then(|config| config.data.as_ref());
-    let dp_streaming_index_cache = runtime_data.and_then(|data| {
-        if data.kind == RuntimeDataKind::InstructionJsonl {
-            Some(
-                data.index_cache
-                    .as_ref()
-                    .map(|path| qwen_sft_rank_index_cache_path(path, rank))
-                    .unwrap_or_else(|| {
-                        qwen_sft_streaming_index_cache_path(
-                            &output_dir.join(format!("rank-{rank}-cache")),
-                            "qwen-session-dp",
-                        )
-                    }),
-            )
-        } else {
-            data.index_cache.clone()
-        }
+    let dp_streaming_index_cache = runtime_data.and_then(|data| match data.kind {
+        RuntimeDataKind::InstructionJsonl | RuntimeDataKind::InstructionArrow => Some(
+            data.index_cache
+                .as_ref()
+                .map(|path| qwen_sft_rank_index_cache_path(path, rank))
+                .unwrap_or_else(|| {
+                    qwen_sft_streaming_index_cache_path(
+                        &output_dir.join(format!("rank-{rank}-cache")),
+                        "qwen-session-dp",
+                    )
+                }),
+        ),
+        _ => data.index_cache.clone(),
     });
     let batch_plan = qwen_session_dp_batch_plan_from_config(
         &model_path,

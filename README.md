@@ -598,9 +598,11 @@ production-grade sharded checkpoint ownership remain open.
   `data.source_max_samples` with the same ordering as JSONL: per-source raw
   limits apply before source weighting, and global `data.max_samples` applies
   after weighting; explicit Arrow eval paths remain unweighted held-out data.
-  Bounded Arrow SFT also honors `data.index_cache` by writing and reusing a
-  row-index cache keyed by Arrow source file metadata, the SFT field map, and
-  `data.max_samples`; trainer summaries expose the same
+  Bounded single-GPU and DP=2 Arrow SFT also honor `data.index_cache` by
+  writing and reusing a row-index cache keyed by Arrow source file metadata,
+  the SFT field map, and `data.max_samples`; DP=2 derives rank-local cache
+  files from the configured path to avoid shared writers, and trainer summaries
+  expose the same
   `streaming_index_cache_path`, `streaming_index_cache_hit`, and
   `streaming_index_cache_written` fields as JSONL SFT.
   A production zero-materialization training loader for large external streams,
