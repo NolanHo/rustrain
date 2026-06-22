@@ -329,10 +329,11 @@ production-grade sharded checkpoint ownership remain open.
   rank-local sharded reload plus next-step resume parity. The focused TP=2
   layer0 smoke writes rank-owned shards and verifies focused restore output
   plus next-update parity from the global sharded manifest. The single-GPU
-  session trainer also has a tokenizer-backed JSONL batch/resume verifier at
-  `configs/qwen_session_single_sft.toml`; the DP=2 session trainer has the
-  same JSONL batch path at `configs/qwen_session_dp2_sft.toml`. Production
-  checkpoint/resume over full real data streams remains open.
+  session trainer also has tokenizer-backed JSONL batch/resume verifiers for
+  the default layer0 path and the layer0-layer7 fp32/bf16 paths. The DP=2
+  session trainer has tokenizer-backed JSONL batch and external resume
+  verifiers through layer0-layer7 in fp32/bf16. Production checkpoint/resume
+  over full real data streams remains open.
 - C4/G1 trainer-owned Qwen training is still incomplete, but the full-train
   smoke now uses a reusable `QwenTrainableSession` surface, and representative
   single-GPU plus DP=2 config paths are wired through `train --config`. The
@@ -423,9 +424,10 @@ production-grade sharded checkpoint ownership remain open.
   paths; real tokenizer-backed padded LoRA SFT batching is wired through
   minimal fp32/bf16 Qwen trainer configs with scheduler and grad clipping. The
   tiny `tch` CUDA path, representative Qwen session single/DP paths, the
-  layer0-layer3 Qwen session path, the DP layer0+layer1 and layer0-layer3 Qwen
-  session paths, the DP layer0+layer1 and layer0-layer3 JSONL SFT paths, and
-  Qwen LoRA SFT resume verifier now have explicit bf16 compute-policy coverage.
+  single-GPU layer0-layer7 Qwen session path, the DP layer0+layer1,
+  layer0-layer3, and layer0-layer7 Qwen session paths, the single-GPU and DP
+  layer0-layer7 JSONL SFT resume paths, and Qwen LoRA SFT resume verifier now
+  have explicit bf16 compute-policy coverage.
   Mixed precision over future full production Qwen model/data paths remains
   future work.
 
