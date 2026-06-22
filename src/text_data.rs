@@ -64,6 +64,7 @@ struct SftCache {
     instruction_excludes_any: Vec<String>,
     response_contains_any: Vec<String>,
     response_excludes_any: Vec<String>,
+    input_contains_any: Vec<String>,
     max_eval_samples: Option<usize>,
     system_field: Option<String>,
     min_system_chars: Option<usize>,
@@ -231,6 +232,7 @@ pub fn load_sft_dataset(
         &data.instruction_excludes_any,
         &data.response_contains_any,
         &data.response_excludes_any,
+        &data.input_contains_any,
         data.max_eval_samples,
         data.system_field.clone(),
         data.min_system_chars,
@@ -545,6 +547,7 @@ fn sft_record_passes_filters(data: &DataConfig, record: &InstructionRecord) -> R
         && string_excludes_any_filter_passes(&record.response, &data.response_excludes_any)
         && string_contains_any_filter_passes(&record.instruction, &data.instruction_contains_any)
         && string_excludes_any_filter_passes(&record.instruction, &data.instruction_excludes_any)
+        && string_contains_any_filter_passes(&record.input, &data.input_contains_any)
         && length_filter_passes(
             record.instruction.chars().count(),
             data.min_instruction_chars,
@@ -681,6 +684,7 @@ fn write_sft_cache(
     instruction_excludes_any: &[String],
     response_contains_any: &[String],
     response_excludes_any: &[String],
+    input_contains_any: &[String],
     max_eval_samples: Option<usize>,
     system_field: Option<String>,
     min_system_chars: Option<usize>,
@@ -708,6 +712,7 @@ fn write_sft_cache(
         instruction_excludes_any: instruction_excludes_any.to_vec(),
         response_contains_any: response_contains_any.to_vec(),
         response_excludes_any: response_excludes_any.to_vec(),
+        input_contains_any: input_contains_any.to_vec(),
         max_eval_samples,
         system_field,
         min_system_chars,
@@ -784,6 +789,7 @@ mod tests {
             instruction_excludes_any: Vec::new(),
             response_contains_any: Vec::new(),
             response_excludes_any: Vec::new(),
+            input_contains_any: Vec::new(),
             min_instruction_chars: None,
             max_instruction_chars: None,
             min_input_chars: None,
@@ -847,6 +853,7 @@ mod tests {
             instruction_excludes_any: Vec::new(),
             response_contains_any: Vec::new(),
             response_excludes_any: Vec::new(),
+            input_contains_any: Vec::new(),
             min_instruction_chars: None,
             max_instruction_chars: None,
             min_input_chars: None,
@@ -916,6 +923,7 @@ mod tests {
             instruction_excludes_any: Vec::new(),
             response_contains_any: Vec::new(),
             response_excludes_any: Vec::new(),
+            input_contains_any: Vec::new(),
             min_instruction_chars: None,
             max_instruction_chars: None,
             min_input_chars: None,
@@ -992,6 +1000,7 @@ mod tests {
             instruction_excludes_any: Vec::new(),
             response_contains_any: Vec::new(),
             response_excludes_any: Vec::new(),
+            input_contains_any: Vec::new(),
             min_instruction_chars: None,
             max_instruction_chars: None,
             min_input_chars: None,
@@ -1067,6 +1076,7 @@ mod tests {
             instruction_excludes_any: Vec::new(),
             response_contains_any: Vec::new(),
             response_excludes_any: Vec::new(),
+            input_contains_any: Vec::new(),
             min_instruction_chars: None,
             max_instruction_chars: None,
             min_input_chars: None,
@@ -1132,6 +1142,7 @@ mod tests {
             instruction_excludes_any: Vec::new(),
             response_contains_any: Vec::new(),
             response_excludes_any: Vec::new(),
+            input_contains_any: Vec::new(),
             min_instruction_chars: None,
             max_instruction_chars: None,
             min_input_chars: None,
@@ -1193,6 +1204,7 @@ mod tests {
             instruction_excludes_any: Vec::new(),
             response_contains_any: Vec::new(),
             response_excludes_any: Vec::new(),
+            input_contains_any: Vec::new(),
             min_instruction_chars: None,
             max_instruction_chars: None,
             min_input_chars: None,
@@ -1290,6 +1302,7 @@ mod tests {
             instruction_excludes_any: Vec::new(),
             response_contains_any: Vec::new(),
             response_excludes_any: Vec::new(),
+            input_contains_any: Vec::new(),
             min_instruction_chars: None,
             max_instruction_chars: None,
             min_input_chars: None,
@@ -1356,6 +1369,7 @@ mod tests {
             instruction_excludes_any: Vec::new(),
             response_contains_any: Vec::new(),
             response_excludes_any: Vec::new(),
+            input_contains_any: Vec::new(),
             min_instruction_chars: None,
             max_instruction_chars: None,
             min_input_chars: None,
@@ -1423,6 +1437,7 @@ mod tests {
             instruction_excludes_any: Vec::new(),
             response_contains_any: Vec::new(),
             response_excludes_any: Vec::new(),
+            input_contains_any: Vec::new(),
             min_instruction_chars: None,
             max_instruction_chars: None,
             min_input_chars: None,
@@ -1491,6 +1506,7 @@ mod tests {
             instruction_excludes_any: Vec::new(),
             response_contains_any: vec!["approved".to_string(), "verified".to_string()],
             response_excludes_any: Vec::new(),
+            input_contains_any: Vec::new(),
             min_instruction_chars: None,
             max_instruction_chars: None,
             min_input_chars: None,
@@ -1560,6 +1576,7 @@ mod tests {
             instruction_excludes_any: Vec::new(),
             response_contains_any: Vec::new(),
             response_excludes_any: Vec::new(),
+            input_contains_any: Vec::new(),
             min_instruction_chars: None,
             max_instruction_chars: None,
             min_input_chars: None,
@@ -1630,6 +1647,7 @@ mod tests {
             instruction_excludes_any: vec!["banned".to_string()],
             response_contains_any: Vec::new(),
             response_excludes_any: Vec::new(),
+            input_contains_any: Vec::new(),
             min_instruction_chars: None,
             max_instruction_chars: None,
             min_input_chars: None,
@@ -1700,6 +1718,7 @@ mod tests {
             instruction_excludes_any: Vec::new(),
             response_contains_any: Vec::new(),
             response_excludes_any: vec!["banned".to_string()],
+            input_contains_any: Vec::new(),
             min_instruction_chars: None,
             max_instruction_chars: None,
             min_input_chars: None,
@@ -1770,6 +1789,7 @@ mod tests {
             instruction_excludes_any: Vec::new(),
             response_contains_any: Vec::new(),
             response_excludes_any: Vec::new(),
+            input_contains_any: Vec::new(),
             min_instruction_chars: None,
             max_instruction_chars: None,
             min_input_chars: None,
@@ -1838,6 +1858,7 @@ mod tests {
             instruction_excludes_any: Vec::new(),
             response_contains_any: Vec::new(),
             response_excludes_any: Vec::new(),
+            input_contains_any: Vec::new(),
             min_instruction_chars: Some(3),
             max_instruction_chars: Some(6),
             min_input_chars: None,
@@ -1908,6 +1929,7 @@ mod tests {
             instruction_excludes_any: Vec::new(),
             response_contains_any: Vec::new(),
             response_excludes_any: Vec::new(),
+            input_contains_any: Vec::new(),
             min_instruction_chars: None,
             max_instruction_chars: None,
             min_input_chars: Some(2),
@@ -1940,6 +1962,81 @@ mod tests {
         assert!(!second.contains("skip short"));
         assert!(!first.contains("skip long"));
         assert!(!second.contains("skip long"));
+    }
+
+    #[test]
+    fn sft_dataset_filters_inputs_by_substring_before_split_and_limit() {
+        let dir = tempdir().expect("temp dir should be created");
+        let data_dir = dir.path().join("sft");
+        let cache_dir = dir.path().join("cache");
+        fs::create_dir_all(&data_dir).expect("sft dir should be created");
+        fs::create_dir_all(&cache_dir).expect("cache dir should be created");
+        fs::write(
+            data_dir.join("sample.jsonl"),
+            "{\"instruction\":\"first\",\"input\":\"keep context\",\"response\":\"answer one\"}\n{\"instruction\":\"skip\",\"input\":\"ordinary context\",\"response\":\"answer skip\"}\n{\"instruction\":\"second\",\"input\":\"selected context\",\"response\":\"answer two\"}\n{\"instruction\":\"third\",\"input\":\"keep extra\",\"response\":\"answer three\"}\n",
+        )
+        .expect("jsonl should write");
+
+        let data = DataConfig {
+            kind: DataKind::InstructionJsonl,
+            paths: vec![data_dir],
+            eval_paths: Vec::new(),
+            train_split: 0.67,
+            max_samples: Some(3),
+            max_eval_samples: None,
+            shuffle: false,
+            index_cache: None,
+            instruction_field: "instruction".to_string(),
+            input_field: "input".to_string(),
+            response_field: "response".to_string(),
+            system_field: None,
+            min_system_chars: None,
+            max_system_chars: None,
+            prompt_template: "Instruction:\n{instruction}\n\nResponse:\n".to_string(),
+            prompt_with_input_template:
+                "Instruction:\n{instruction}\n\nInput:\n{input}\n\nResponse:\n".to_string(),
+            trim_fields: true,
+            min_response_chars: 1,
+            max_response_chars: None,
+            instruction_contains_any: Vec::new(),
+            instruction_excludes_any: Vec::new(),
+            response_contains_any: Vec::new(),
+            response_excludes_any: Vec::new(),
+            input_contains_any: vec!["keep".to_string(), "selected".to_string()],
+            min_instruction_chars: None,
+            max_instruction_chars: None,
+            min_input_chars: None,
+            max_input_chars: None,
+            min_prompt_chars: None,
+            max_prompt_chars: None,
+            min_sample_chars: None,
+            max_sample_chars: None,
+            dedupe_samples: false,
+            source_weights: Vec::new(),
+            source_max_samples: Vec::new(),
+            skip_invalid_records: false,
+        };
+        let dataset =
+            load_sft_dataset(&data, 128, 96, &cache_dir).expect("SFT dataset should load");
+        let decoded = dataset
+            .train_samples
+            .iter()
+            .chain(dataset.eval_samples.iter())
+            .map(|sample| dataset.tokenizer.decode_lossy(&sample.tokens))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert_eq!(dataset.train_samples.len(), 2);
+        assert_eq!(dataset.eval_samples.len(), 1);
+        assert!(decoded.contains("first"));
+        assert!(decoded.contains("Input:\nkeep context"));
+        assert!(decoded.contains("second"));
+        assert!(decoded.contains("Input:\nselected context"));
+        assert!(decoded.contains("third"));
+        assert!(decoded.contains("Input:\nkeep extra"));
+        assert!(!decoded.contains("skip"));
+        assert!(!decoded.contains("ordinary context"));
+        assert!(!decoded.contains("answer skip"));
     }
 
     #[test]
@@ -1979,6 +2076,7 @@ mod tests {
             instruction_excludes_any: Vec::new(),
             response_contains_any: Vec::new(),
             response_excludes_any: Vec::new(),
+            input_contains_any: Vec::new(),
             min_instruction_chars: None,
             max_instruction_chars: None,
             min_input_chars: None,
@@ -2049,6 +2147,7 @@ mod tests {
             instruction_excludes_any: Vec::new(),
             response_contains_any: Vec::new(),
             response_excludes_any: Vec::new(),
+            input_contains_any: Vec::new(),
             min_instruction_chars: None,
             max_instruction_chars: None,
             min_input_chars: None,
@@ -2128,6 +2227,7 @@ mod tests {
             instruction_excludes_any: Vec::new(),
             response_contains_any: Vec::new(),
             response_excludes_any: Vec::new(),
+            input_contains_any: Vec::new(),
             min_instruction_chars: None,
             max_instruction_chars: None,
             min_input_chars: None,
@@ -2202,6 +2302,7 @@ mod tests {
             instruction_excludes_any: Vec::new(),
             response_contains_any: Vec::new(),
             response_excludes_any: Vec::new(),
+            input_contains_any: Vec::new(),
             min_instruction_chars: None,
             max_instruction_chars: None,
             min_input_chars: None,
@@ -2272,6 +2373,7 @@ mod tests {
             instruction_excludes_any: Vec::new(),
             response_contains_any: Vec::new(),
             response_excludes_any: Vec::new(),
+            input_contains_any: Vec::new(),
             min_instruction_chars: None,
             max_instruction_chars: None,
             min_input_chars: None,
@@ -2340,6 +2442,7 @@ mod tests {
             instruction_excludes_any: Vec::new(),
             response_contains_any: Vec::new(),
             response_excludes_any: Vec::new(),
+            input_contains_any: Vec::new(),
             min_instruction_chars: None,
             max_instruction_chars: None,
             min_input_chars: None,
@@ -2416,6 +2519,7 @@ mod tests {
             instruction_excludes_any: Vec::new(),
             response_contains_any: Vec::new(),
             response_excludes_any: Vec::new(),
+            input_contains_any: Vec::new(),
             min_instruction_chars: None,
             max_instruction_chars: None,
             min_input_chars: None,
