@@ -15,7 +15,14 @@ python - "${OUTPUT}" "${EXPECTED_TOTAL}" "${EXPECTED_SOURCE}" <<'PY'
 import ast
 import json
 import pathlib
+import re
 import sys
+
+def parse_source_sample_counts(text):
+    entries = re.findall(r'QwenSftSourceSampleCount \{ path: "([^"]+)", samples: (\d+) \}', text)
+    if not entries:
+        raise SystemExit(f"dataset_source_sample_counts did not contain parseable entries: {text}")
+    return [{"path": path, "samples": int(samples)} for path, samples in entries]
 
 output_path = pathlib.Path(sys.argv[1])
 expected_total = int(sys.argv[2])
@@ -55,13 +62,11 @@ if values["streaming_train_batches"] != "true":
 source_files = ast.literal_eval(values["dataset_source_files"])
 if source_files != [expected_source]:
     raise SystemExit(f"expected source_files {[expected_source]}, got {source_files}")
-if expected_source not in values["dataset_source_sample_counts"]:
+expected_counts = [{"path": expected_source, "samples": expected_total}]
+source_sample_counts = parse_source_sample_counts(values["dataset_source_sample_counts"])
+if source_sample_counts != expected_counts:
     raise SystemExit(
-        f"dataset_source_sample_counts does not mention {expected_source}: {values['dataset_source_sample_counts']}"
-    )
-if f"samples: {expected_total}" not in values["dataset_source_sample_counts"]:
-    raise SystemExit(
-        f"dataset_source_sample_counts does not record samples={expected_total}: {values['dataset_source_sample_counts']}"
+        f"dataset_source_sample_counts {source_sample_counts} != {expected_counts}"
     )
 
 manifest = json.loads(pathlib.Path(values["adapter_manifest"]).read_text())
@@ -73,7 +78,6 @@ if manifest.get("dataset_source_files") != source_files:
     raise SystemExit(
         f"manifest source files {manifest.get('dataset_source_files')} != {source_files}"
     )
-expected_counts = [{"path": expected_source, "samples": expected_total}]
 if manifest.get("dataset_source_sample_counts") != expected_counts:
     raise SystemExit(
         f"manifest source sample counts {manifest.get('dataset_source_sample_counts')} != {expected_counts}"

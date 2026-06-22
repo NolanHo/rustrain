@@ -51,7 +51,40 @@ import ast
 import json
 import math
 import pathlib
+import re
 import sys
+
+def parse_source_sample_counts(text):
+    entries = re.findall(r'QwenSftSourceSampleCount \{ path: "([^"]+)", samples: (\d+) \}', text)
+    if not entries:
+        raise SystemExit(f"dataset_source_sample_counts did not contain parseable entries: {text}")
+    return [{"path": path, "samples": int(samples)} for path, samples in entries]
+
+def verify_source_sample_counts(counts, dataset_source_files, dataset_total_samples, context):
+    if not isinstance(counts, list) or not counts:
+        raise SystemExit(f"{context} dataset_source_sample_counts must be a non-empty list")
+    count_paths = []
+    total = 0
+    for entry in counts:
+        if not isinstance(entry, dict):
+            raise SystemExit(f"{context} dataset_source_sample_counts entry must be an object: {entry}")
+        path = entry.get("path")
+        samples = entry.get("samples")
+        if not path:
+            raise SystemExit(f"{context} dataset_source_sample_counts entry is missing path: {entry}")
+        if samples is None or int(samples) <= 0:
+            raise SystemExit(f"{context} dataset_source_sample_counts entry must have positive samples: {entry}")
+        count_paths.append(path)
+        total += int(samples)
+    if count_paths != dataset_source_files:
+        raise SystemExit(
+            f"{context} dataset_source_sample_counts paths {count_paths} do not match dataset_source_files {dataset_source_files}"
+        )
+    if total != int(dataset_total_samples):
+        raise SystemExit(
+            f"{context} dataset_source_sample_counts total {total} does not match dataset_total_samples {dataset_total_samples}"
+        )
+    return counts
 
 base_data_cursor_next = int(sys.argv[3])
 values = {}
@@ -72,6 +105,7 @@ required = [
     "dataset_masked_positions",
     "dataset_max_sequence_tokens",
     "dataset_source_files",
+    "dataset_source_sample_counts",
     "dataset_fingerprint",
     "dataset_order_seed",
     "dataset_shuffle",
@@ -132,6 +166,12 @@ if not dataset_source_files:
     raise SystemExit("dataset_source_files must not be empty")
 if not all(str(path).endswith(".jsonl") for path in dataset_source_files):
     raise SystemExit(f"dataset_source_files must only contain JSONL paths, got {dataset_source_files}")
+dataset_source_sample_counts = verify_source_sample_counts(
+    parse_source_sample_counts(values["dataset_source_sample_counts"]),
+    dataset_source_files,
+    values["dataset_total_samples"],
+    "resume stdout",
+)
 if not values["dataset_fingerprint"]:
     raise SystemExit("dataset_fingerprint must not be empty")
 adapter_manifest = json.loads(pathlib.Path(values["adapter_manifest"]).read_text())
@@ -143,6 +183,16 @@ if adapter_manifest.get("dataset_source_files") != dataset_source_files:
     raise SystemExit(
         f"adapter manifest dataset_source_files {adapter_manifest.get('dataset_source_files')} did not match summary {dataset_source_files}"
     )
+if adapter_manifest.get("dataset_source_sample_counts") != dataset_source_sample_counts:
+    raise SystemExit(
+        f"adapter manifest dataset_source_sample_counts {adapter_manifest.get('dataset_source_sample_counts')} did not match summary {dataset_source_sample_counts}"
+    )
+verify_source_sample_counts(
+    adapter_manifest.get("dataset_source_sample_counts"),
+    dataset_source_files,
+    values["dataset_total_samples"],
+    "adapter manifest",
+)
 if adapter_manifest.get("dataset_fingerprint") != values["dataset_fingerprint"]:
     raise SystemExit(
         f"adapter manifest dataset_fingerprint {adapter_manifest.get('dataset_fingerprint')} did not match summary {values['dataset_fingerprint']}"

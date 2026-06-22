@@ -13,7 +13,14 @@ python - "${OUTPUT}" <<'PY'
 import ast
 import json
 import pathlib
+import re
 import sys
+
+def parse_source_sample_counts(text):
+    entries = re.findall(r'QwenSftSourceSampleCount \{ path: "([^"]+)", samples: (\d+) \}', text)
+    if not entries:
+        raise SystemExit(f"dataset_source_sample_counts did not contain parseable entries: {text}")
+    return [{"path": path, "samples": int(samples)} for path, samples in entries]
 
 output_path = pathlib.Path(sys.argv[1])
 values = {}
@@ -60,11 +67,15 @@ if values["streaming_train_batches"] != "true":
     raise SystemExit(
         f"expected streaming_train_batches true, got {values['streaming_train_batches']}"
     )
-for expected in ["instructions.jsonl\", samples: 6", "more_instructions.jsonl\", samples: 2"]:
-    if expected not in values["dataset_source_sample_counts"]:
-        raise SystemExit(
-            f"dataset_source_sample_counts missing {expected}: {values['dataset_source_sample_counts']}"
-        )
+expected_counts = [
+    {"path": "data/sft_toy/instructions.jsonl", "samples": 6},
+    {"path": "data/sft_toy/more_instructions.jsonl", "samples": 2},
+]
+source_sample_counts = parse_source_sample_counts(values["dataset_source_sample_counts"])
+if source_sample_counts != expected_counts:
+    raise SystemExit(
+        f"dataset_source_sample_counts {source_sample_counts} != {expected_counts}"
+    )
 
 manifest = json.loads(pathlib.Path(values["adapter_manifest"]).read_text())
 if manifest.get("dataset_total_samples") != 8:
@@ -82,6 +93,10 @@ if manifest.get("dataset_eval_samples") != 2:
 if manifest.get("dataset_source_files") != expected_sources:
     raise SystemExit(
         f"manifest source files {manifest.get('dataset_source_files')} != {expected_sources}"
+    )
+if manifest.get("dataset_source_sample_counts") != expected_counts:
+    raise SystemExit(
+        f"manifest source sample counts {manifest.get('dataset_source_sample_counts')} != {expected_counts}"
     )
 if manifest.get("dataset_fingerprint") != values["dataset_fingerprint"]:
     raise SystemExit("manifest dataset_fingerprint does not match stdout")
