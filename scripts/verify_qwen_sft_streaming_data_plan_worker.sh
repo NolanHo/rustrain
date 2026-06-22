@@ -44,6 +44,8 @@ checks = {
     "data_sample_offset_start": 2,
     "data_sample_offset_end": 1,
     "data_sample_offset_next": 1,
+    "train_window_start_cursor": 2,
+    "train_window_end_cursor_exclusive": 6,
     "dataset_total_samples": 4,
     "dataset_train_samples": 3,
     "dataset_eval_samples": 1,
@@ -55,6 +57,17 @@ checks = {
 for key, expected in checks.items():
     if data.get(key) != expected:
         raise SystemExit(f"{key} {data.get(key)} != {expected}")
+
+expected_window = [
+    {"cursor": 2, "epoch": 0, "sample_offset": 2},
+    {"cursor": 3, "epoch": 1, "sample_offset": 0},
+    {"cursor": 4, "epoch": 1, "sample_offset": 1},
+    {"cursor": 5, "epoch": 1, "sample_offset": 2},
+]
+if data.get("train_window_sample_cursors") != expected_window:
+    raise SystemExit(
+        f"train_window_sample_cursors {data.get('train_window_sample_cursors')} != {expected_window}"
+    )
 
 expected_counts = [{"path": expected_source, "samples": 4}]
 for key in ["dataset_source_sample_counts", "train_source_sample_counts"]:

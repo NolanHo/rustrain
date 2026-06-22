@@ -61,6 +61,8 @@ checks = {
     "data_sample_offset_start": 4,
     "data_sample_offset_end": 0,
     "data_sample_offset_next": 0,
+    "train_window_start_cursor": 4,
+    "train_window_end_cursor_exclusive": 10,
     "dataset_total_samples": 10,
     "dataset_train_samples": 8,
     "dataset_eval_samples": 2,
@@ -72,6 +74,18 @@ checks = {
 for key, expected in checks.items():
     if data.get(key) != expected:
         raise SystemExit(f"{key} {data.get(key)} != {expected}")
+expected_window = [
+    {"cursor": 4, "epoch": 0, "sample_offset": 4},
+    {"cursor": 5, "epoch": 0, "sample_offset": 5},
+    {"cursor": 6, "epoch": 0, "sample_offset": 6},
+    {"cursor": 7, "epoch": 0, "sample_offset": 7},
+    {"cursor": 8, "epoch": 1, "sample_offset": 0},
+    {"cursor": 9, "epoch": 1, "sample_offset": 1},
+]
+if data.get("train_window_sample_cursors") != expected_window:
+    raise SystemExit(
+        f"train_window_sample_cursors {data.get('train_window_sample_cursors')} != {expected_window}"
+    )
 if data.get("dataset_source_files") != expected_sources:
     raise SystemExit(
         f"dataset_source_files {data.get('dataset_source_files')} != {expected_sources}"

@@ -1598,6 +1598,13 @@ struct QwenSftStreamingSourceSummary {
     fingerprint: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct QwenSftStreamingCursorEntry {
+    cursor: usize,
+    epoch: usize,
+    sample_offset: usize,
+}
+
 #[derive(Debug, Serialize)]
 struct QwenSftStreamingDataPlanSummary {
     config_path: String,
@@ -1619,6 +1626,9 @@ struct QwenSftStreamingDataPlanSummary {
     data_sample_offset_start: usize,
     data_sample_offset_end: usize,
     data_sample_offset_next: usize,
+    train_window_start_cursor: usize,
+    train_window_end_cursor_exclusive: usize,
+    train_window_sample_cursors: Vec<QwenSftStreamingCursorEntry>,
     dataset_total_samples: usize,
     dataset_train_samples: usize,
     dataset_eval_samples: usize,
@@ -5425,6 +5435,17 @@ pub fn qwen_sft_streaming_data_plan(
         qwen_data_epoch_and_offset(data_cursor_end, dataset_train_samples)?;
     let (data_epoch_next, data_sample_offset_next) =
         qwen_data_epoch_and_offset(data_cursor_next, dataset_train_samples)?;
+    let train_window_sample_cursors = qwen_sft_streaming_cursor_window(
+        data_cursor_start,
+        required_batches,
+        global_batch_size,
+        dataset_train_samples,
+    )?;
+    let train_window_start_cursor = data_cursor_start;
+    let train_window_end_cursor_exclusive = train_window_sample_cursors
+        .last()
+        .map(|entry| entry.cursor + 1)
+        .unwrap_or(data_cursor_start);
 
     let summary = QwenSftStreamingDataPlanSummary {
         config_path: config_path.display().to_string(),
@@ -5454,6 +5475,9 @@ pub fn qwen_sft_streaming_data_plan(
         data_sample_offset_start,
         data_sample_offset_end,
         data_sample_offset_next,
+        train_window_start_cursor,
+        train_window_end_cursor_exclusive,
+        train_window_sample_cursors,
         dataset_total_samples,
         dataset_train_samples,
         dataset_eval_samples,
@@ -10015,6 +10039,35 @@ fn qwen_sft_train_eval_sample_counts(
     Ok((train_samples, total_samples - train_samples))
 }
 
+fn qwen_sft_streaming_cursor_window(
+    data_cursor_start: usize,
+    required_batches: usize,
+    global_batch_size: usize,
+    train_sample_count: usize,
+) -> Result<Vec<QwenSftStreamingCursorEntry>> {
+    if required_batches == 0 {
+        bail!("SFT streaming cursor window requires at least one batch");
+    }
+    if global_batch_size == 0 {
+        bail!("SFT streaming cursor window requires global_batch_size > 0");
+    }
+    if train_sample_count == 0 {
+        bail!("SFT streaming cursor window requires at least one training sample");
+    }
+    let needed_samples = required_batches + global_batch_size - 1;
+    (0..needed_samples)
+        .map(|relative| {
+            let cursor = data_cursor_start + relative;
+            let (epoch, sample_offset) = qwen_data_epoch_and_offset(cursor, train_sample_count)?;
+            Ok(QwenSftStreamingCursorEntry {
+                cursor,
+                epoch,
+                sample_offset,
+            })
+        })
+        .collect()
+}
+
 fn qwen_apply_sft_shuffle(dataset: QwenSftDataset, shuffle: bool, seed: u64) -> QwenSftDataset {
     if shuffle {
         dataset.shuffle_by_seed(seed)
@@ -13111,6 +13164,18 @@ mod tests {
         assert_eq!(data_cursor_end, 4);
         assert_eq!((epoch_start, offset_start), (0, 2));
         assert_eq!((epoch_next, offset_next), (1, 1));
+    }
+
+    #[test]
+    fn qwen_sft_streaming_cursor_window_covers_next_batch_overlap() {
+        let cursors =
+            qwen_sft_streaming_cursor_window(2, 3, 2, 3).expect("cursor window should build");
+        let compact = cursors
+            .iter()
+            .map(|entry| (entry.cursor, entry.epoch, entry.sample_offset))
+            .collect::<Vec<_>>();
+
+        assert_eq!(compact, vec![(2, 0, 2), (3, 1, 0), (4, 1, 1), (5, 1, 2)]);
     }
 
     #[test]
