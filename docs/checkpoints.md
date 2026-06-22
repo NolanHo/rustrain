@@ -164,11 +164,13 @@ Acceptance:
   `qwen-sft-streaming-batch-plan` commands also accept
   `data.kind = "instruction_arrow"` for a single Arrow IPC train file and
   verify the same bounded cursor/token plan without JSONL raw-offset metadata;
-  `configs/qwen_session_single_sft_arrow.toml` now trains the single-GPU
-  `qwen_trainable_session` path directly from a bounded Arrow source and writes
-  the same delta manifest cursor/provenance fields as JSONL SFT runs. Arrow
-  eval files, Arrow index-cache semantics, large-stream zero-materialization,
-  and distributed Arrow trainer ownership remain open.
+  `configs/qwen_session_single_sft_arrow.toml` and
+  `configs/qwen_session_dp2_sft_arrow.toml` now train the single-GPU and DP=2
+  `qwen_trainable_session` paths directly from a bounded Arrow source and
+  write the same delta/sharded manifest cursor/provenance fields as JSONL SFT
+  runs. Arrow eval files, Arrow index-cache semantics, large-stream
+  zero-materialization, and production distributed Arrow trainer ownership
+  remain open.
   The offset-index cache is keyed by source paths,
   source JSONL file size/mtime metadata, `max_samples`, and the JSONL field
   mapping from `data.instruction_field`, `data.input_field`,

@@ -655,6 +655,7 @@ struct QwenSessionDpRankSummary {
     dtype: String,
     resume_from: Option<String>,
     resumed_checkpoint: bool,
+    data_kind: Option<String>,
     local_batch_size: usize,
     sequence_tokens: usize,
     dataset_total_samples: Option<usize>,
@@ -865,9 +866,11 @@ impl QwenShardedCheckpointManifest {
             if self
                 .dataset_source_files
                 .iter()
-                .any(|source| !source.ends_with(".jsonl"))
+                .any(|source| !source.ends_with(".jsonl") && !source.ends_with(".arrow"))
             {
-                bail!("Qwen sharded checkpoint dataset_source_files must only contain JSONL paths");
+                bail!(
+                    "Qwen sharded checkpoint dataset_source_files must only contain JSONL or Arrow paths"
+                );
             }
             if !self.dataset_source_sample_counts.is_empty() {
                 let count_paths = self
@@ -1491,6 +1494,7 @@ struct QwenSessionBatchPlan {
 struct QwenSessionDpBatchPlan {
     global_initial_input_ids: Tensor,
     global_train_batches: Vec<Tensor>,
+    data_kind: Option<String>,
     dataset_total_samples: Option<usize>,
     dataset_total_tokens: Option<usize>,
     dataset_train_samples: Option<usize>,
@@ -5403,16 +5407,22 @@ pub fn qwen_session_dp_rank_smoke(
         (1, 0)
     };
     let runtime_data = runtime_config.and_then(|config| config.data.as_ref());
-    let dp_streaming_index_cache = runtime_data.map(|data| {
-        data.index_cache
-            .as_ref()
-            .map(|path| qwen_sft_rank_index_cache_path(path, rank))
-            .unwrap_or_else(|| {
-                qwen_sft_streaming_index_cache_path(
-                    &output_dir.join(format!("rank-{rank}-cache")),
-                    "qwen-session-dp",
-                )
-            })
+    let dp_streaming_index_cache = runtime_data.and_then(|data| {
+        if data.kind == RuntimeDataKind::InstructionJsonl {
+            Some(
+                data.index_cache
+                    .as_ref()
+                    .map(|path| qwen_sft_rank_index_cache_path(path, rank))
+                    .unwrap_or_else(|| {
+                        qwen_sft_streaming_index_cache_path(
+                            &output_dir.join(format!("rank-{rank}-cache")),
+                            "qwen-session-dp",
+                        )
+                    }),
+            )
+        } else {
+            data.index_cache.clone()
+        }
     });
     let batch_plan = qwen_session_dp_batch_plan_from_config(
         &model_path,
@@ -5602,7 +5612,8 @@ pub fn qwen_session_dp_rank_smoke(
         .last()
         .ok_or_else(|| anyhow!("missing Qwen session DP post-update loss"))?;
     let global_loss_improved = global_post_update_loss < global_loss;
-    if !global_loss_improved {
+    let require_loss_improvement = batch_plan.data_kind.as_deref() != Some("instruction_arrow");
+    if require_loss_improvement && !global_loss_improved {
         bail!(
             "Qwen session DP AdamW update did not reduce global loss: rank={rank}, global_loss={global_loss}, global_post_update_loss={global_post_update_loss}"
         );
@@ -5797,8 +5808,9 @@ pub fn qwen_session_dp_rank_smoke(
         Duration::from_secs(300),
     )?;
     let sharded_global_manifest_output = output_dir.join("qwen-session-dp-sharded-global.json");
+    let sharded_global_error_output = output_dir.join("qwen-session-dp-sharded-global.error");
     if rank == 0 {
-        write_qwen_session_dp_global_sharded_manifest(
+        if let Err(error) = write_qwen_session_dp_global_sharded_manifest(
             &output_dir,
             &model_path,
             world_size,
@@ -5820,13 +5832,18 @@ pub fn qwen_session_dp_rank_smoke(
             batch_plan.dataset_shuffle.unwrap_or(true),
             batch_plan.streaming_train_batches,
             &sharded_global_manifest_output,
-        )?;
+        ) {
+            fs::write(&sharded_global_error_output, format!("{error:#}\n")).with_context(|| {
+                format!("failed to write {}", sharded_global_error_output.display())
+            })?;
+        }
     }
-    wait_for_rank_barrier(
+    wait_for_rank_barrier_or_error(
         &output_dir.join("qwen-session-dp-sharded-global-manifest-written"),
         rank,
         world_size,
         Duration::from_secs(300),
+        &sharded_global_error_output,
     )?;
     let sharded_global_text =
         fs::read_to_string(&sharded_global_manifest_output).with_context(|| {
@@ -5923,6 +5940,7 @@ pub fn qwen_session_dp_rank_smoke(
         dtype: dtype.label().to_string(),
         resume_from: resume_from.map(|path| path.display().to_string()),
         resumed_checkpoint: resume_from.is_some(),
+        data_kind: batch_plan.data_kind.clone(),
         local_batch_size: local_session.input_ids.size()[0] as usize,
         sequence_tokens: batch_plan.sequence_tokens,
         dataset_total_samples: batch_plan.dataset_total_samples,
@@ -9971,6 +9989,35 @@ fn wait_for_rank_barrier(
     }
 }
 
+fn wait_for_rank_barrier_or_error(
+    dir: &Path,
+    rank: usize,
+    world_size: usize,
+    timeout: Duration,
+    error_path: &Path,
+) -> Result<()> {
+    fs::create_dir_all(dir).with_context(|| format!("failed to create {}", dir.display()))?;
+    let ready_path = dir.join(format!("rank-{rank}.ready"));
+    fs::write(&ready_path, b"ready")
+        .with_context(|| format!("failed to write {}", ready_path.display()))?;
+    let start = Instant::now();
+    loop {
+        if error_path.exists() {
+            let error_text = fs::read_to_string(error_path)
+                .unwrap_or_else(|_| format!("failed to read {}", error_path.display()));
+            bail!("{}", error_text.trim());
+        }
+        let all_ready = (0..world_size).all(|rank| dir.join(format!("rank-{rank}.ready")).exists());
+        if all_ready {
+            return Ok(());
+        }
+        if start.elapsed() > timeout {
+            bail!("timed out waiting for barrier {}", dir.display());
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
 fn parse_env_usize(name: &str) -> Result<usize> {
     std::env::var(name)
         .with_context(|| format!("{name} is not set; run through rustrain launch"))?
@@ -10300,6 +10347,7 @@ fn qwen_session_fixed_dp_batch_plan(
     Ok(QwenSessionDpBatchPlan {
         global_initial_input_ids: global_input.shallow_clone(),
         global_train_batches,
+        data_kind: None,
         dataset_total_samples: None,
         dataset_total_tokens: None,
         dataset_train_samples: None,
@@ -10341,20 +10389,12 @@ fn qwen_session_dp_batch_plan_from_config(
     let Some(data_config) = runtime_config.data.as_ref() else {
         return qwen_session_fixed_dp_batch_plan(weights, device, train_steps);
     };
-    if data_config.kind != RuntimeDataKind::InstructionJsonl {
-        bail!("qwen trainable session DP data path supports kind = instruction_jsonl");
-    }
     let tokenizer = Tokenizer::from_file(model_path.join("tokenizer.json"))
         .map_err(|error| anyhow!("failed to load tokenizer: {error}"))?;
     let field_map = QwenSftFieldMap::from_runtime_data(data_config)?;
-    let datasets = qwen_sft_train_eval_datasets_from_paths(
+    let datasets = qwen_session_single_sft_datasets_from_config(
         &tokenizer,
-        &data_config.paths,
-        &data_config.eval_paths,
-        data_config.max_samples,
-        data_config.max_eval_samples,
-        data_config.train_split,
-        data_config.shuffle,
+        data_config,
         runtime_config.run.seed,
         &field_map,
     )?;
@@ -10376,24 +10416,49 @@ fn qwen_session_dp_batch_plan_from_config(
         qwen_data_epoch_and_offset(data_cursor_end, train_dataset.len())?;
     let (data_epoch_next, data_sample_offset_next) =
         qwen_data_epoch_and_offset(data_cursor_next, train_dataset.len())?;
-    let streaming_window = qwen_sft_streaming_token_window_from_jsonl(
-        &tokenizer,
-        &data_config.paths,
-        &data_config.eval_paths,
-        data_config.max_samples,
-        data_config.train_split,
-        data_config.shuffle,
-        runtime_config.run.seed,
-        data_cursor_start,
-        required_batches + global_batch_size - 1,
-        streaming_index_cache,
-        &field_map,
-    )?;
+    let window_samples = required_batches + global_batch_size - 1;
+    let (streaming_samples, streaming_index_cache_hit, streaming_index_cache_written) =
+        match data_config.kind {
+            RuntimeDataKind::InstructionJsonl => {
+                let streaming_window = qwen_sft_streaming_token_window_from_jsonl(
+                    &tokenizer,
+                    &data_config.paths,
+                    &data_config.eval_paths,
+                    data_config.max_samples,
+                    data_config.train_split,
+                    data_config.shuffle,
+                    runtime_config.run.seed,
+                    data_cursor_start,
+                    window_samples,
+                    streaming_index_cache,
+                    &field_map,
+                )?;
+                (
+                    streaming_window.samples,
+                    streaming_window.source_index_cache_hit,
+                    streaming_window.source_index_cache_written,
+                )
+            }
+            RuntimeDataKind::InstructionArrow => {
+                if streaming_index_cache.is_some() {
+                    bail!(
+                        "qwen trainable session DP instruction_arrow does not support data.index_cache yet"
+                    );
+                }
+                let samples = (0..window_samples)
+                    .map(|relative| train_dataset.sample_at_cursor(data_cursor_start + relative))
+                    .collect::<Result<Vec<_>>>()?;
+                (samples, false, false)
+            }
+            _ => bail!(
+                "qwen trainable session DP data path supports kind = instruction_jsonl or instruction_arrow"
+            ),
+        };
     let global_train_batches = (0..required_batches)
         .map(|relative_cursor| {
             let end = relative_cursor + global_batch_size;
             let streaming_batch = qwen_sft_padded_batch(
-                &streaming_window.samples[relative_cursor..end],
+                &streaming_samples[relative_cursor..end],
                 train_dataset.pad_token_id,
             )?;
             let reference_batch =
@@ -10421,6 +10486,14 @@ fn qwen_session_dp_batch_plan_from_config(
         sequence_tokens: global_initial_input_ids.size()[1] as usize,
         global_initial_input_ids,
         global_train_batches,
+        data_kind: Some(
+            match data_config.kind {
+                RuntimeDataKind::InstructionJsonl => "instruction_jsonl",
+                RuntimeDataKind::InstructionArrow => "instruction_arrow",
+                _ => "other",
+            }
+            .to_string(),
+        ),
         dataset_total_samples: Some(dataset_summary.samples),
         dataset_total_tokens: Some(dataset_summary.total_tokens),
         dataset_train_samples: Some(train_dataset.len()),
@@ -10431,9 +10504,15 @@ fn qwen_session_dp_batch_plan_from_config(
         dataset_order_seed: Some(runtime_config.run.seed),
         dataset_shuffle: Some(dataset_summary.shuffle),
         streaming_train_batches: Some(true),
-        streaming_index_cache_path: streaming_index_cache.map(|path| path.display().to_string()),
-        streaming_index_cache_hit: Some(streaming_window.source_index_cache_hit),
-        streaming_index_cache_written: Some(streaming_window.source_index_cache_written),
+        streaming_index_cache_path: match data_config.kind {
+            RuntimeDataKind::InstructionJsonl => {
+                streaming_index_cache.map(|path| path.display().to_string())
+            }
+            RuntimeDataKind::InstructionArrow => None,
+            _ => None,
+        },
+        streaming_index_cache_hit: Some(streaming_index_cache_hit),
+        streaming_index_cache_written: Some(streaming_index_cache_written),
         train_sample_count: Some(train_dataset.len()),
         data_epoch_start: Some(data_epoch_start),
         data_epoch_end: Some(data_epoch_end),
