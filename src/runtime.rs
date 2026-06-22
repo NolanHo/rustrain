@@ -5,6 +5,7 @@ use std::{
 
 use anyhow::{Context, Result, anyhow};
 use chrono::Local;
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -153,6 +154,8 @@ pub struct DataConfig {
     #[serde(default)]
     pub field_replacements: Vec<FieldReplacement>,
     #[serde(default)]
+    pub field_regex_replacements: Vec<FieldRegexReplacement>,
+    #[serde(default)]
     pub normalize_whitespace: bool,
     #[serde(default)]
     pub field_defaults: Vec<FieldDefault>,
@@ -174,6 +177,13 @@ pub struct DataConfig {
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct FieldReplacement {
+    pub field: FieldReplacementTarget,
+    pub pattern: String,
+    pub replacement: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct FieldRegexReplacement {
     pub field: FieldReplacementTarget,
     pub pattern: String,
     pub replacement: String,
@@ -811,6 +821,24 @@ pub fn validate_config(config: &Config) -> Result<()> {
                 ));
             }
         }
+        for replacement in &data.field_regex_replacements {
+            if replacement.pattern.is_empty() {
+                return Err(anyhow!(
+                    "data.field_regex_replacements pattern entries must not be empty"
+                ));
+            }
+            Regex::new(&replacement.pattern).map_err(|error| {
+                anyhow!(
+                    "data.field_regex_replacements invalid regex pattern {:?}: {error}",
+                    replacement.pattern
+                )
+            })?;
+            if matches!(replacement.field, FieldReplacementTarget::System) && !has_system_source {
+                return Err(anyhow!(
+                    "data.field_regex_replacements targeting system requires data.system_field, data.chat_messages_field, or a system field_default to be set"
+                ));
+            }
+        }
         for default in &data.field_defaults {
             if default.value.is_empty() {
                 return Err(anyhow!(
@@ -987,6 +1015,29 @@ mod tests {
         );
     }
 
+    #[test]
+    fn data_field_regex_replacements_must_be_valid_regexes() {
+        let mut config = qwen_lora_sft_config();
+        config
+            .data
+            .as_mut()
+            .unwrap()
+            .field_regex_replacements
+            .push(FieldRegexReplacement {
+                field: FieldReplacementTarget::Instruction,
+                pattern: "[".to_string(),
+                replacement: "x".to_string(),
+            });
+
+        let error = validate_config(&config).expect_err("invalid regex should fail");
+
+        assert!(
+            error
+                .to_string()
+                .contains("data.field_regex_replacements invalid regex pattern")
+        );
+    }
+
     fn qwen_lora_sft_config() -> Config {
         Config {
             run: RunConfig {
@@ -1069,6 +1120,7 @@ mod tests {
                 max_sample_chars: None,
                 dedupe_samples: false,
                 field_replacements: Vec::new(),
+                field_regex_replacements: Vec::new(),
                 normalize_whitespace: false,
                 field_defaults: Vec::new(),
                 field_case_transforms: Vec::new(),

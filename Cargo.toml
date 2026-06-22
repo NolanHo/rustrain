@@ -10,6 +10,7 @@ clap = { version = "4.5.40", features = ["derive"] }
 ndarray = { version = "0.16.1", features = ["serde"] }
 rand = "0.8.5"
 rand_distr = "0.4.3"
+regex = "1.11.3"
 safetensors = "0.8.0"
 serde = { version = "1.0.219", features = ["derive"] }
 serde_json = "1.0.145"

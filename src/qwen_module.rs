@@ -18,8 +18,8 @@ use crate::nccl_smoke;
 use crate::runtime::{
     Config, DataConfig as RuntimeDataConfig, DataKind as RuntimeDataKind, Device as RuntimeDevice,
     FieldAffix, FieldCaseTransform, FieldCaseTransformKind, FieldDefault, FieldDefaultTarget,
-    FieldReplacement, FieldReplacementTarget, FieldSplit, FieldSplitSide, FieldTruncation,
-    LoraConfig as RuntimeLoraConfig, LrScheduler, RunPaths, load_config,
+    FieldRegexReplacement, FieldReplacement, FieldReplacementTarget, FieldSplit, FieldSplitSide,
+    FieldTruncation, LoraConfig as RuntimeLoraConfig, LrScheduler, RunPaths, load_config,
 };
 
 #[derive(Debug, Serialize)]
@@ -1701,6 +1701,8 @@ struct QwenSftFieldMap {
     #[serde(default)]
     field_replacements: Vec<FieldReplacement>,
     #[serde(default)]
+    field_regex_replacements: Vec<FieldRegexReplacement>,
+    #[serde(default)]
     normalize_whitespace: bool,
     #[serde(default)]
     field_defaults: Vec<FieldDefault>,
@@ -1752,6 +1754,7 @@ impl QwenSftFieldMap {
             max_sample_chars: data.max_sample_chars,
             dedupe_samples: data.dedupe_samples,
             field_replacements: data.field_replacements.clone(),
+            field_regex_replacements: data.field_regex_replacements.clone(),
             normalize_whitespace: data.normalize_whitespace,
             field_defaults: data.field_defaults.clone(),
             field_case_transforms: data.field_case_transforms.clone(),
@@ -1987,6 +1990,22 @@ impl QwenSftFieldMap {
                 );
             }
         }
+        for replacement in &self.field_regex_replacements {
+            if replacement.pattern.is_empty() {
+                bail!("data.field_regex_replacements pattern entries must not be empty");
+            }
+            regex::Regex::new(&replacement.pattern).map_err(|error| {
+                anyhow!(
+                    "data.field_regex_replacements invalid regex pattern {:?}: {error}",
+                    replacement.pattern
+                )
+            })?;
+            if matches!(replacement.field, FieldReplacementTarget::System) && !has_system_source {
+                bail!(
+                    "data.field_regex_replacements targeting system requires data.system_field, data.chat_messages_field, or a system field_default to be set"
+                );
+            }
+        }
         for default in &self.field_defaults {
             if default.value.is_empty() {
                 bail!("data.field_defaults value entries must not be empty");
@@ -2076,6 +2095,7 @@ impl Default for QwenSftFieldMap {
             max_sample_chars: None,
             dedupe_samples: false,
             field_replacements: Vec::new(),
+            field_regex_replacements: Vec::new(),
             normalize_whitespace: false,
             field_defaults: Vec::new(),
             field_case_transforms: Vec::new(),
@@ -12046,6 +12066,7 @@ fn qwen_sft_record_from_jsonl_line(
         let mut record = qwen_sft_record_from_chat_messages(&values, messages_field, field_map)?;
         qwen_apply_field_defaults(&mut record, &field_map.field_defaults);
         qwen_apply_field_replacements(&mut record, &field_map.field_replacements);
+        qwen_apply_field_regex_replacements(&mut record, &field_map.field_regex_replacements)?;
         qwen_apply_field_case_transforms(&mut record, &field_map.field_case_transforms);
         qwen_apply_field_affixes(&mut record, &field_map.field_affixes);
         qwen_apply_field_splits(&mut record, &field_map.field_splits);
@@ -12089,6 +12110,7 @@ fn qwen_sft_record_from_jsonl_line(
     };
     qwen_apply_field_defaults(&mut record, &field_map.field_defaults);
     qwen_apply_field_replacements(&mut record, &field_map.field_replacements);
+    qwen_apply_field_regex_replacements(&mut record, &field_map.field_regex_replacements)?;
     qwen_apply_field_case_transforms(&mut record, &field_map.field_case_transforms);
     qwen_apply_field_affixes(&mut record, &field_map.field_affixes);
     qwen_apply_field_splits(&mut record, &field_map.field_splits);
@@ -12234,6 +12256,53 @@ fn qwen_apply_field_replacements(record: &mut QwenSftRecord, replacements: &[Fie
                 .replace(&replacement.pattern, &replacement.replacement);
         }
     }
+}
+
+fn qwen_apply_field_regex_replacements(
+    record: &mut QwenSftRecord,
+    replacements: &[FieldRegexReplacement],
+) -> Result<()> {
+    for replacement in replacements {
+        let regex = regex::Regex::new(&replacement.pattern).with_context(|| {
+            format!(
+                "invalid data.field_regex_replacements pattern {:?}",
+                replacement.pattern
+            )
+        })?;
+        if matches!(
+            replacement.field,
+            FieldReplacementTarget::System | FieldReplacementTarget::All
+        ) {
+            record.system = regex
+                .replace_all(&record.system, replacement.replacement.as_str())
+                .into_owned();
+        }
+        if matches!(
+            replacement.field,
+            FieldReplacementTarget::Instruction | FieldReplacementTarget::All
+        ) {
+            record.instruction = regex
+                .replace_all(&record.instruction, replacement.replacement.as_str())
+                .into_owned();
+        }
+        if matches!(
+            replacement.field,
+            FieldReplacementTarget::Input | FieldReplacementTarget::All
+        ) {
+            record.input = regex
+                .replace_all(&record.input, replacement.replacement.as_str())
+                .into_owned();
+        }
+        if matches!(
+            replacement.field,
+            FieldReplacementTarget::Response | FieldReplacementTarget::All
+        ) {
+            record.response = regex
+                .replace_all(&record.response, replacement.replacement.as_str())
+                .into_owned();
+        }
+    }
+    Ok(())
 }
 
 fn qwen_apply_field_defaults(record: &mut QwenSftRecord, defaults: &[FieldDefault]) {
@@ -12632,6 +12701,17 @@ fn qwen_sft_hash_field_map(hash: &mut u64, field_map: &QwenSftFieldMap) {
     if !field_map.field_replacements.is_empty() {
         qwen_sft_hash_bytes(hash, b"field_replacements");
         for replacement in &field_map.field_replacements {
+            qwen_sft_hash_bytes(hash, format!("{:?}", replacement.field).as_bytes());
+            qwen_sft_hash_bytes(hash, b"\0");
+            qwen_sft_hash_bytes(hash, replacement.pattern.as_bytes());
+            qwen_sft_hash_bytes(hash, b"\0");
+            qwen_sft_hash_bytes(hash, replacement.replacement.as_bytes());
+            qwen_sft_hash_bytes(hash, b"\0");
+        }
+    }
+    if !field_map.field_regex_replacements.is_empty() {
+        qwen_sft_hash_bytes(hash, b"field_regex_replacements");
+        for replacement in &field_map.field_regex_replacements {
             qwen_sft_hash_bytes(hash, format!("{:?}", replacement.field).as_bytes());
             qwen_sft_hash_bytes(hash, b"\0");
             qwen_sft_hash_bytes(hash, replacement.pattern.as_bytes());
@@ -15663,6 +15743,83 @@ mod tests {
     }
 
     #[test]
+    fn qwen_sft_regex_replacements_apply_before_filters_and_fingerprint() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let jsonl = temp.path().join("samples.jsonl");
+        let cache_path = temp.path().join("cache").join("offset-index.json");
+        fs::write(
+            &jsonl,
+            r#"{"instruction":"Keep project-123 token","response":"APPROVED:42"}
+{"instruction":"Drop project-456 token","response":"DENIED:99"}
+"#,
+        )
+        .expect("jsonl should write");
+        let paths = vec![jsonl.clone()];
+        let field_map = QwenSftFieldMap {
+            instruction_contains_any: vec!["project-id token".to_string()],
+            response_contains_any: vec!["approved id".to_string()],
+            min_response_chars: 8,
+            field_regex_replacements: vec![
+                FieldRegexReplacement {
+                    field: FieldReplacementTarget::Instruction,
+                    pattern: r"project-\d+".to_string(),
+                    replacement: "project-id".to_string(),
+                },
+                FieldRegexReplacement {
+                    field: FieldReplacementTarget::Response,
+                    pattern: r"APPROVED:\d+".to_string(),
+                    replacement: "approved id".to_string(),
+                },
+            ],
+            ..QwenSftFieldMap::default()
+        };
+        let loaded = qwen_sft_examples_from_jsonl_paths_with_limit(&paths, None, &field_map)
+            .expect("regex replacement examples should load");
+        let streamed = qwen_sft_streaming_source_summary(&paths, None, &field_map)
+            .expect("regex replacement streaming summary should scan");
+        let source_index = qwen_sft_streaming_source_index(&paths, None, &field_map)
+            .expect("regex replacement source index should build");
+        let raw_window = qwen_sft_examples_by_raw_indices(&source_index.samples, &field_map)
+            .expect("regex replacement raw window should read");
+        let first_cache =
+            qwen_sft_streaming_source_index_with_cache(&paths, None, Some(&cache_path), &field_map)
+                .expect("regex replacement cache should write");
+        let default_fingerprint = qwen_sft_streaming_fingerprint(
+            &paths,
+            None,
+            &loaded.source_files,
+            &QwenSftFieldMap::default(),
+        )
+        .expect("default fingerprint should compute");
+        let regex_mismatch = QwenSftFieldMap {
+            field_regex_replacements: vec![FieldRegexReplacement {
+                field: FieldReplacementTarget::Instruction,
+                pattern: r"project-\d+".to_string(),
+                replacement: "other".to_string(),
+            }],
+            ..field_map.clone()
+        };
+        let cache_mismatch = qwen_sft_streaming_source_index_with_cache(
+            &paths,
+            None,
+            Some(&cache_path),
+            &regex_mismatch,
+        )
+        .expect_err("cache should reject changed regex replacements")
+        .to_string();
+
+        assert_eq!(loaded.examples.len(), 1);
+        assert_eq!(loaded.examples[0].instruction, "Keep project-id token");
+        assert_eq!(loaded.examples[0].response, "approved id");
+        assert_eq!(raw_window.examples, loaded.examples);
+        assert_eq!(streamed.samples, loaded.examples.len());
+        assert_eq!(streamed.fingerprint, loaded.fingerprint);
+        assert_ne!(loaded.fingerprint, default_fingerprint);
+        assert!(first_cache.cache_written);
+        assert!(cache_mismatch.contains("field_map"));
+    }
+
+    #[test]
     fn qwen_sft_normalizes_whitespace_after_replacements_before_filters_and_fingerprint() {
         let temp = tempfile::tempdir().expect("temp dir should be created");
         let jsonl = temp.path().join("samples.jsonl");
@@ -15684,6 +15841,7 @@ mod tests {
                 pattern: "PROJECT_TOKEN".to_string(),
                 replacement: "rust   train".to_string(),
             }],
+            field_regex_replacements: Vec::new(),
             normalize_whitespace: true,
             ..QwenSftFieldMap::default()
         };

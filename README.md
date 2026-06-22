@@ -479,6 +479,13 @@ production-grade sharded checkpoint ownership remain open.
   normalization, filtering, deduplication, splitting, and streaming indexing.
   The default empty list preserves existing fingerprints. `data.system_field`
   is not required when `data.field_defaults` injects a default system prompt.
+  `data.field_replacements` applies literal string replacements, and
+  `data.field_regex_replacements` applies Rust regex replacements, to
+  `system`, `instruction`, `input`, `response`, or `all`; both run before case
+  transforms, whitespace normalization, filtering, deduplication, source
+  weighting, splitting, and streaming indexing. Regex entries must have a
+  non-empty valid pattern, and the default empty list preserves existing
+  fingerprints.
   `data.field_case_transforms` can then lowercase or uppercase `system`,
   `instruction`, `input`, `response`, or `all` after replacements and before
   whitespace normalization and filtering. The default empty list preserves

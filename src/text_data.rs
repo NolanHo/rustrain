@@ -5,12 +5,13 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow};
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 
 use crate::runtime::{
     DataConfig, FieldAffix, FieldCaseTransform, FieldCaseTransformKind, FieldDefault,
-    FieldDefaultTarget, FieldReplacement, FieldReplacementTarget, FieldSplit, FieldSplitSide,
-    FieldTruncation,
+    FieldDefaultTarget, FieldRegexReplacement, FieldReplacement, FieldReplacementTarget,
+    FieldSplit, FieldSplitSide, FieldTruncation,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -79,6 +80,7 @@ struct SftCache {
     input_contains_any: Vec<String>,
     input_excludes_any: Vec<String>,
     field_replacements: Vec<FieldReplacement>,
+    field_regex_replacements: Vec<FieldRegexReplacement>,
     normalize_whitespace: bool,
     field_defaults: Vec<FieldDefault>,
     field_case_transforms: Vec<FieldCaseTransform>,
@@ -264,6 +266,7 @@ pub fn load_sft_dataset(
         &data.input_contains_any,
         &data.input_excludes_any,
         &data.field_replacements,
+        &data.field_regex_replacements,
         data.normalize_whitespace,
         &data.field_defaults,
         &data.field_case_transforms,
@@ -512,6 +515,7 @@ fn instruction_record_from_jsonl_line(data: &DataConfig, line: &str) -> Result<I
         let mut record = instruction_record_from_chat_messages(&values, messages_field, data)?;
         apply_field_defaults(&mut record, &data.field_defaults);
         apply_field_replacements(&mut record, &data.field_replacements);
+        apply_field_regex_replacements(&mut record, &data.field_regex_replacements)?;
         apply_field_case_transforms(&mut record, &data.field_case_transforms);
         apply_field_affixes(&mut record, &data.field_affixes);
         apply_field_splits(&mut record, &data.field_splits);
@@ -553,6 +557,7 @@ fn instruction_record_from_jsonl_line(data: &DataConfig, line: &str) -> Result<I
     };
     apply_field_defaults(&mut record, &data.field_defaults);
     apply_field_replacements(&mut record, &data.field_replacements);
+    apply_field_regex_replacements(&mut record, &data.field_regex_replacements)?;
     apply_field_case_transforms(&mut record, &data.field_case_transforms);
     apply_field_affixes(&mut record, &data.field_affixes);
     apply_field_splits(&mut record, &data.field_splits);
@@ -759,6 +764,53 @@ fn apply_field_replacements(record: &mut InstructionRecord, replacements: &[Fiel
                 .replace(&replacement.pattern, &replacement.replacement);
         }
     }
+}
+
+fn apply_field_regex_replacements(
+    record: &mut InstructionRecord,
+    replacements: &[FieldRegexReplacement],
+) -> Result<()> {
+    for replacement in replacements {
+        let regex = Regex::new(&replacement.pattern).with_context(|| {
+            format!(
+                "invalid data.field_regex_replacements pattern {:?}",
+                replacement.pattern
+            )
+        })?;
+        if matches!(
+            replacement.field,
+            FieldReplacementTarget::System | FieldReplacementTarget::All
+        ) {
+            record.system = regex
+                .replace_all(&record.system, replacement.replacement.as_str())
+                .into_owned();
+        }
+        if matches!(
+            replacement.field,
+            FieldReplacementTarget::Instruction | FieldReplacementTarget::All
+        ) {
+            record.instruction = regex
+                .replace_all(&record.instruction, replacement.replacement.as_str())
+                .into_owned();
+        }
+        if matches!(
+            replacement.field,
+            FieldReplacementTarget::Input | FieldReplacementTarget::All
+        ) {
+            record.input = regex
+                .replace_all(&record.input, replacement.replacement.as_str())
+                .into_owned();
+        }
+        if matches!(
+            replacement.field,
+            FieldReplacementTarget::Response | FieldReplacementTarget::All
+        ) {
+            record.response = regex
+                .replace_all(&record.response, replacement.replacement.as_str())
+                .into_owned();
+        }
+    }
+    Ok(())
 }
 
 fn apply_field_defaults(record: &mut InstructionRecord, defaults: &[FieldDefault]) {
@@ -1091,6 +1143,7 @@ fn write_sft_cache(
     input_contains_any: &[String],
     input_excludes_any: &[String],
     field_replacements: &[FieldReplacement],
+    field_regex_replacements: &[FieldRegexReplacement],
     normalize_whitespace: bool,
     field_defaults: &[FieldDefault],
     field_case_transforms: &[FieldCaseTransform],
@@ -1136,6 +1189,7 @@ fn write_sft_cache(
         input_contains_any: input_contains_any.to_vec(),
         input_excludes_any: input_excludes_any.to_vec(),
         field_replacements: field_replacements.to_vec(),
+        field_regex_replacements: field_regex_replacements.to_vec(),
         normalize_whitespace,
         field_defaults: field_defaults.to_vec(),
         field_case_transforms: field_case_transforms.to_vec(),
@@ -1178,7 +1232,9 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
-    use crate::runtime::{DataConfig, DataKind, FieldReplacement, FieldReplacementTarget};
+    use crate::runtime::{
+        DataConfig, DataKind, FieldRegexReplacement, FieldReplacement, FieldReplacementTarget,
+    };
 
     #[test]
     fn text_dataset_is_packed_and_cached() {
@@ -1234,6 +1290,7 @@ mod tests {
             max_sample_chars: None,
             dedupe_samples: false,
             field_replacements: Vec::new(),
+            field_regex_replacements: Vec::new(),
             normalize_whitespace: false,
             field_defaults: Vec::new(),
             field_case_transforms: Vec::new(),
@@ -1309,6 +1366,7 @@ mod tests {
             max_sample_chars: None,
             dedupe_samples: false,
             field_replacements: Vec::new(),
+            field_regex_replacements: Vec::new(),
             normalize_whitespace: false,
             field_defaults: Vec::new(),
             field_case_transforms: Vec::new(),
@@ -1390,6 +1448,7 @@ mod tests {
             max_sample_chars: None,
             dedupe_samples: false,
             field_replacements: Vec::new(),
+            field_regex_replacements: Vec::new(),
             normalize_whitespace: false,
             field_defaults: Vec::new(),
             field_case_transforms: Vec::new(),
@@ -1478,6 +1537,7 @@ mod tests {
             max_sample_chars: None,
             dedupe_samples: false,
             field_replacements: Vec::new(),
+            field_regex_replacements: Vec::new(),
             normalize_whitespace: false,
             field_defaults: Vec::new(),
             field_case_transforms: Vec::new(),
@@ -1565,6 +1625,7 @@ mod tests {
             max_sample_chars: None,
             dedupe_samples: false,
             field_replacements: Vec::new(),
+            field_regex_replacements: Vec::new(),
             normalize_whitespace: false,
             field_defaults: Vec::new(),
             field_case_transforms: Vec::new(),
@@ -1642,6 +1703,7 @@ mod tests {
             max_sample_chars: None,
             dedupe_samples: false,
             field_replacements: Vec::new(),
+            field_regex_replacements: Vec::new(),
             normalize_whitespace: false,
             field_defaults: Vec::new(),
             field_case_transforms: Vec::new(),
@@ -1721,6 +1783,7 @@ mod tests {
             max_sample_chars: None,
             dedupe_samples: false,
             field_replacements: Vec::new(),
+            field_regex_replacements: Vec::new(),
             normalize_whitespace: false,
             field_defaults: Vec::new(),
             field_case_transforms: Vec::new(),
@@ -1803,6 +1866,7 @@ mod tests {
             max_sample_chars: None,
             dedupe_samples: false,
             field_replacements: Vec::new(),
+            field_regex_replacements: Vec::new(),
             normalize_whitespace: false,
             field_defaults: Vec::new(),
             field_case_transforms: Vec::new(),
@@ -1879,6 +1943,7 @@ mod tests {
             max_sample_chars: None,
             dedupe_samples: false,
             field_replacements: Vec::new(),
+            field_regex_replacements: Vec::new(),
             normalize_whitespace: false,
             field_defaults: Vec::new(),
             field_case_transforms: Vec::new(),
@@ -1988,6 +2053,7 @@ mod tests {
             max_sample_chars: None,
             dedupe_samples: false,
             field_replacements: Vec::new(),
+            field_regex_replacements: Vec::new(),
             normalize_whitespace: false,
             field_defaults: Vec::new(),
             field_case_transforms: Vec::new(),
@@ -2066,6 +2132,7 @@ mod tests {
             max_sample_chars: None,
             dedupe_samples: false,
             field_replacements: Vec::new(),
+            field_regex_replacements: Vec::new(),
             normalize_whitespace: false,
             field_defaults: Vec::new(),
             field_case_transforms: Vec::new(),
@@ -2145,6 +2212,7 @@ mod tests {
             max_sample_chars: None,
             dedupe_samples: false,
             field_replacements: Vec::new(),
+            field_regex_replacements: Vec::new(),
             normalize_whitespace: false,
             field_defaults: Vec::new(),
             field_case_transforms: Vec::new(),
@@ -2225,6 +2293,7 @@ mod tests {
             max_sample_chars: None,
             dedupe_samples: false,
             field_replacements: Vec::new(),
+            field_regex_replacements: Vec::new(),
             normalize_whitespace: false,
             field_defaults: Vec::new(),
             field_case_transforms: Vec::new(),
@@ -2306,6 +2375,7 @@ mod tests {
             max_sample_chars: None,
             dedupe_samples: false,
             field_replacements: Vec::new(),
+            field_regex_replacements: Vec::new(),
             normalize_whitespace: false,
             field_defaults: Vec::new(),
             field_case_transforms: Vec::new(),
@@ -2388,6 +2458,7 @@ mod tests {
             max_sample_chars: None,
             dedupe_samples: false,
             field_replacements: Vec::new(),
+            field_regex_replacements: Vec::new(),
             normalize_whitespace: false,
             field_defaults: Vec::new(),
             field_case_transforms: Vec::new(),
@@ -2470,6 +2541,7 @@ mod tests {
             max_sample_chars: None,
             dedupe_samples: false,
             field_replacements: Vec::new(),
+            field_regex_replacements: Vec::new(),
             normalize_whitespace: false,
             field_defaults: Vec::new(),
             field_case_transforms: Vec::new(),
@@ -2552,6 +2624,7 @@ mod tests {
             max_sample_chars: None,
             dedupe_samples: false,
             field_replacements: Vec::new(),
+            field_regex_replacements: Vec::new(),
             normalize_whitespace: false,
             field_defaults: Vec::new(),
             field_case_transforms: Vec::new(),
@@ -2632,6 +2705,7 @@ mod tests {
             max_sample_chars: None,
             dedupe_samples: false,
             field_replacements: Vec::new(),
+            field_regex_replacements: Vec::new(),
             normalize_whitespace: false,
             field_defaults: Vec::new(),
             field_case_transforms: Vec::new(),
@@ -2714,6 +2788,7 @@ mod tests {
             max_sample_chars: None,
             dedupe_samples: false,
             field_replacements: Vec::new(),
+            field_regex_replacements: Vec::new(),
             normalize_whitespace: false,
             field_defaults: Vec::new(),
             field_case_transforms: Vec::new(),
@@ -2798,6 +2873,7 @@ mod tests {
             max_sample_chars: None,
             dedupe_samples: false,
             field_replacements: Vec::new(),
+            field_regex_replacements: Vec::new(),
             normalize_whitespace: false,
             field_defaults: Vec::new(),
             field_case_transforms: Vec::new(),
@@ -2884,6 +2960,7 @@ mod tests {
             max_sample_chars: None,
             dedupe_samples: false,
             field_replacements: Vec::new(),
+            field_regex_replacements: Vec::new(),
             normalize_whitespace: false,
             field_defaults: Vec::new(),
             field_case_transforms: Vec::new(),
@@ -2969,6 +3046,7 @@ mod tests {
             max_sample_chars: None,
             dedupe_samples: false,
             field_replacements: Vec::new(),
+            field_regex_replacements: Vec::new(),
             normalize_whitespace: false,
             field_defaults: Vec::new(),
             field_case_transforms: Vec::new(),
@@ -3051,6 +3129,7 @@ mod tests {
             max_sample_chars: Some(22),
             dedupe_samples: false,
             field_replacements: Vec::new(),
+            field_regex_replacements: Vec::new(),
             normalize_whitespace: false,
             field_defaults: Vec::new(),
             field_case_transforms: Vec::new(),
@@ -3142,6 +3221,7 @@ mod tests {
             max_sample_chars: None,
             dedupe_samples: false,
             field_replacements: Vec::new(),
+            field_regex_replacements: Vec::new(),
             normalize_whitespace: false,
             field_defaults: Vec::new(),
             field_case_transforms: Vec::new(),
@@ -3228,6 +3308,7 @@ mod tests {
             max_sample_chars: None,
             dedupe_samples: false,
             field_replacements: Vec::new(),
+            field_regex_replacements: Vec::new(),
             normalize_whitespace: false,
             field_defaults: Vec::new(),
             field_case_transforms: Vec::new(),
@@ -3310,6 +3391,7 @@ mod tests {
             max_sample_chars: None,
             dedupe_samples: true,
             field_replacements: Vec::new(),
+            field_regex_replacements: Vec::new(),
             normalize_whitespace: false,
             field_defaults: Vec::new(),
             field_case_transforms: Vec::new(),
@@ -3390,6 +3472,7 @@ mod tests {
             max_sample_chars: None,
             dedupe_samples: false,
             field_replacements: Vec::new(),
+            field_regex_replacements: Vec::new(),
             normalize_whitespace: false,
             field_defaults: Vec::new(),
             field_case_transforms: Vec::new(),
@@ -3477,6 +3560,7 @@ mod tests {
             max_sample_chars: None,
             dedupe_samples: false,
             field_replacements: Vec::new(),
+            field_regex_replacements: Vec::new(),
             normalize_whitespace: false,
             field_defaults: Vec::new(),
             field_case_transforms: Vec::new(),
@@ -3564,6 +3648,7 @@ mod tests {
             max_sample_chars: None,
             dedupe_samples: false,
             field_replacements: Vec::new(),
+            field_regex_replacements: Vec::new(),
             normalize_whitespace: false,
             field_defaults: Vec::new(),
             field_case_transforms: Vec::new(),
@@ -3662,6 +3747,7 @@ mod tests {
                     replacement: "approved".to_string(),
                 },
             ],
+            field_regex_replacements: Vec::new(),
             normalize_whitespace: false,
             field_defaults: Vec::new(),
             field_case_transforms: Vec::new(),
@@ -3691,6 +3777,102 @@ mod tests {
         assert!(!decoded.contains("PROJECT_TOKEN"));
         assert!(cache_text.contains("field_replacements"));
         assert!(cache_text.contains("PROJECT_TOKEN"));
+    }
+
+    #[test]
+    fn sft_dataset_applies_regex_replacements_before_filters_and_cache() {
+        let dir = tempdir().expect("temp dir should be created");
+        let data_dir = dir.path().join("sft");
+        let cache_dir = dir.path().join("cache");
+        fs::create_dir_all(&data_dir).expect("sft dir should be created");
+        fs::create_dir_all(&cache_dir).expect("cache dir should be created");
+        fs::write(
+            data_dir.join("sample.jsonl"),
+            "{\"instruction\":\"Keep project-123 token\",\"response\":\"APPROVED:42\"}\n{\"instruction\":\"Also project-777 token\",\"response\":\"APPROVED:84\"}\n{\"instruction\":\"Drop project-456 token\",\"response\":\"DENIED:99\"}\n",
+        )
+        .expect("jsonl should write");
+
+        let data = DataConfig {
+            kind: DataKind::InstructionJsonl,
+            paths: vec![data_dir],
+            eval_paths: Vec::new(),
+            train_split: 0.5,
+            max_samples: None,
+            max_eval_samples: None,
+            shuffle: false,
+            index_cache: None,
+            instruction_field: "instruction".to_string(),
+            input_field: "input".to_string(),
+            response_field: "response".to_string(),
+            system_field: None,
+            chat_messages_field: None,
+            min_system_chars: None,
+            max_system_chars: None,
+            system_contains_any: Vec::new(),
+            system_excludes_any: Vec::new(),
+            prompt_template: "Instruction:\n{instruction}\n\nResponse:\n".to_string(),
+            prompt_with_input_template:
+                "Instruction:\n{instruction}\n\nInput:\n{input}\n\nResponse:\n".to_string(),
+            trim_fields: true,
+            min_response_chars: 8,
+            max_response_chars: None,
+            instruction_contains_any: vec!["project-id token".to_string()],
+            instruction_excludes_any: Vec::new(),
+            response_contains_any: vec!["approved id".to_string()],
+            response_excludes_any: Vec::new(),
+            input_contains_any: Vec::new(),
+            input_excludes_any: Vec::new(),
+            min_instruction_chars: None,
+            max_instruction_chars: None,
+            min_input_chars: None,
+            max_input_chars: None,
+            min_prompt_chars: None,
+            max_prompt_chars: None,
+            min_sample_chars: None,
+            max_sample_chars: None,
+            dedupe_samples: false,
+            field_replacements: Vec::new(),
+            field_regex_replacements: vec![
+                FieldRegexReplacement {
+                    field: FieldReplacementTarget::Instruction,
+                    pattern: r"project-\d+".to_string(),
+                    replacement: "project-id".to_string(),
+                },
+                FieldRegexReplacement {
+                    field: FieldReplacementTarget::Response,
+                    pattern: r"APPROVED:\d+".to_string(),
+                    replacement: "approved id".to_string(),
+                },
+            ],
+            normalize_whitespace: false,
+            field_defaults: Vec::new(),
+            field_case_transforms: Vec::new(),
+            field_affixes: Vec::new(),
+            field_splits: Vec::new(),
+            field_truncations: Vec::new(),
+            source_weights: Vec::new(),
+            source_max_samples: Vec::new(),
+            skip_invalid_records: false,
+        };
+        let dataset =
+            load_sft_dataset(&data, 128, 96, &cache_dir).expect("SFT dataset should load");
+        let decoded = dataset
+            .train_samples
+            .iter()
+            .chain(dataset.eval_samples.iter())
+            .map(|sample| dataset.tokenizer.decode_lossy(&sample.tokens))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let cache_text =
+            fs::read_to_string(cache_dir.join("sft_tokenized.toml")).expect("cache should read");
+
+        assert_eq!(dataset.train_samples.len(), 1);
+        assert_eq!(dataset.eval_samples.len(), 1);
+        assert!(decoded.contains("project-id token"));
+        assert!(decoded.contains("approved id"));
+        assert!(!decoded.contains("project-123"));
+        assert!(cache_text.contains("field_regex_replacements"));
+        assert!(cache_text.contains("project-id"));
     }
 
     #[test]
@@ -3746,6 +3928,7 @@ mod tests {
             max_sample_chars: None,
             dedupe_samples: false,
             field_replacements: Vec::new(),
+            field_regex_replacements: Vec::new(),
             normalize_whitespace: false,
             field_defaults: vec![
                 FieldDefault {
@@ -3853,6 +4036,7 @@ mod tests {
                 pattern: "PROJECT_TOKEN".to_string(),
                 replacement: "rust   train".to_string(),
             }],
+            field_regex_replacements: Vec::new(),
             normalize_whitespace: true,
             field_defaults: Vec::new(),
             field_case_transforms: Vec::new(),
@@ -3941,6 +4125,7 @@ mod tests {
                 pattern: "PROJECT_TOKEN".to_string(),
                 replacement: "RUSTRain".to_string(),
             }],
+            field_regex_replacements: Vec::new(),
             normalize_whitespace: false,
             field_defaults: Vec::new(),
             field_case_transforms: vec![
@@ -4040,6 +4225,7 @@ mod tests {
             max_sample_chars: None,
             dedupe_samples: false,
             field_replacements: Vec::new(),
+            field_regex_replacements: Vec::new(),
             normalize_whitespace: false,
             field_defaults: vec![FieldDefault {
                 field: FieldDefaultTarget::System,
@@ -4148,6 +4334,7 @@ mod tests {
             max_sample_chars: None,
             dedupe_samples: false,
             field_replacements: Vec::new(),
+            field_regex_replacements: Vec::new(),
             normalize_whitespace: false,
             field_defaults: Vec::new(),
             field_case_transforms: Vec::new(),
@@ -4246,6 +4433,7 @@ mod tests {
             max_sample_chars: None,
             dedupe_samples: false,
             field_replacements: Vec::new(),
+            field_regex_replacements: Vec::new(),
             normalize_whitespace: false,
             field_defaults: Vec::new(),
             field_case_transforms: Vec::new(),
@@ -4353,6 +4541,7 @@ mod tests {
             max_sample_chars: None,
             dedupe_samples: false,
             field_replacements: Vec::new(),
+            field_regex_replacements: Vec::new(),
             normalize_whitespace: false,
             field_defaults: Vec::new(),
             field_case_transforms: Vec::new(),

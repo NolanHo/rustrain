@@ -149,7 +149,8 @@ Acceptance:
   `data.system_field`, and optional `data.chat_messages_field`, plus
   `data.prompt_template`, `data.prompt_with_input_template`,
   `data.trim_fields`, optional `data.field_defaults`, optional
-  `data.field_replacements`, optional `data.field_case_transforms`, optional
+  `data.field_replacements`, optional `data.field_regex_replacements`, optional
+  `data.field_case_transforms`, optional
   `data.field_affixes`, optional `data.field_splits`, optional
   `data.field_truncations`, optional `data.normalize_whitespace`,
   `data.min_response_chars`, optional
