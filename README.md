@@ -367,6 +367,10 @@ production-grade sharded checkpoint ownership remain open.
   `configs/qwen_session_single_layers07_sft.toml` extends the single-GPU
   JSONL SFT resume path to layer0-layer7 with 98 trainable tensors and
   manifest-backed data cursor continuity.
+  `configs/qwen_session_single_sft_max_samples.toml` verifies that the
+  representative single-GPU JSONL SFT session path applies `data.max_samples`
+  during JSONL reading and records only the consumed source files in checkpoint
+  provenance.
   `configs/qwen_session_single_layers07_sft_bf16.toml` verifies the same
   single-GPU layer0-layer7 JSONL SFT resume path under bf16 compute.
   `configs/qwen_session_dp2_layers01_sft_bf16.toml`
