@@ -120,6 +120,10 @@ if not all(str(path).endswith(".jsonl") for path in dataset_source_files):
 if not values["dataset_fingerprint"]:
     raise SystemExit("dataset_fingerprint must not be empty")
 adapter_manifest = json.loads(pathlib.Path(values["adapter_manifest"]).read_text())
+if adapter_manifest.get("compute_kind") != values["compute_kind"]:
+    raise SystemExit(
+        f"adapter manifest compute_kind {adapter_manifest.get('compute_kind')} did not match summary {values['compute_kind']}"
+    )
 if adapter_manifest.get("dataset_source_files") != dataset_source_files:
     raise SystemExit(
         f"adapter manifest dataset_source_files {adapter_manifest.get('dataset_source_files')} did not match summary {dataset_source_files}"
