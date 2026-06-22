@@ -111,6 +111,10 @@ Acceptance:
 
 - Resuming from the adapter manifest rejects changed LoRA target layers/modules
   and changed JSONL provenance.
+- Manifest-backed resume rejects `compute_kind` drift between the saved adapter
+  manifest and the current train dtype. Direct `.safetensors` adapter resume
+  without manifest metadata remains a compatibility path and cannot enforce
+  this dtype identity check.
 - Resume starts from manifest `data_cursor_next`, advances by
   `steps * global_batch_size`, and preserves cursor/epoch/offset consistency.
 - Adapter reload preserves SFT train/eval loss, full-Qwen forward logits, and

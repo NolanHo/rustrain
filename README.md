@@ -389,7 +389,10 @@ production-grade sharded checkpoint ownership remain open.
   uses the trainer scheduler and grad clipping knobs, logs `eval_every` step
   eval history, applies seeded deterministic dataset ordering, reports dataset
   sample/token/mask summaries, and has a bf16 variant at
-  `configs/qwen_lora_sft_bf16.toml`.
+  `configs/qwen_lora_sft_bf16.toml`. Manifest-backed adapter resume rejects
+  `compute_kind` drift from the current train dtype; direct `.safetensors`
+  adapter resume remains available for compatibility when manifest metadata is
+  absent.
   Production data loading and arbitrary-module LoRA injection are still open.
 - Real Qwen module-level LoRA now uses a target-layer/module registry for
   configured attention and MLP projection modules; trainer-owned full-model LoRA
