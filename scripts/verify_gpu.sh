@@ -39,6 +39,7 @@ remote_run bash scripts/verify_qwen_lora_sft_no_shuffle_worker.sh
 remote_run bash scripts/verify_qwen_lora_sft_eval_paths_worker.sh
 remote_run bash scripts/verify_qwen_sft_streaming_data_plan_worker.sh
 remote_run bash scripts/verify_qwen_sft_streaming_batch_plan_worker.sh
+remote_run bash scripts/verify_qwen_sft_streaming_scale_worker.sh
 remote_run bash scripts/verify_qwen_lora_sft_trainer_index_cache_worker.sh
 remote_run bash scripts/verify_qwen_sft_trainer_index_cache_worker.sh
 remote_run bash scripts/verify_qwen_sft_trainer_default_index_cache_worker.sh
