@@ -72,6 +72,7 @@ paths = [
   "${DATA_DIR}/alpaca_0.jsonl",
   "${DATA_DIR}/alpaca_1.jsonl",
 ]
+external_metadata_paths = ["${DATA_DIR}/export_metadata.json"]
 train_split = 0.75
 shuffle = false
 prompt_template = "Instruction: {instruction}\\nResponse: "

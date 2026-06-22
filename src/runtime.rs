@@ -179,6 +179,8 @@ pub struct DataConfig {
     pub source_max_samples: Vec<usize>,
     #[serde(default)]
     pub skip_invalid_records: bool,
+    #[serde(default)]
+    pub external_metadata_paths: Vec<PathBuf>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -944,6 +946,25 @@ pub fn validate_config(config: &Config) -> Result<()> {
                 ));
             }
         }
+        for path in &data.external_metadata_paths {
+            if path.as_os_str().is_empty() {
+                return Err(anyhow!(
+                    "data.external_metadata_paths entries must not be empty"
+                ));
+            }
+            if !path.exists() {
+                return Err(anyhow!(
+                    "data.external_metadata_paths entry does not exist: {}",
+                    path.display()
+                ));
+            }
+            if !path.is_file() {
+                return Err(anyhow!(
+                    "data.external_metadata_paths entry must be a file: {}",
+                    path.display()
+                ));
+            }
+        }
     }
 
     Ok(())
@@ -1210,6 +1231,7 @@ mod tests {
                 source_weights: Vec::new(),
                 source_max_samples: Vec::new(),
                 skip_invalid_records: false,
+                external_metadata_paths: Vec::new(),
             }),
             lora: Some(LoraConfig {
                 rank: 4,

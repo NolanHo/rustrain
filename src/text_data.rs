@@ -1418,6 +1418,7 @@ mod tests {
             source_weights: Vec::new(),
             source_max_samples: Vec::new(),
             skip_invalid_records: false,
+            external_metadata_paths: Vec::new(),
         };
         let dataset = load_text_dataset(&data, 64, 8, &cache_dir).expect("dataset should load");
 
@@ -1497,6 +1498,7 @@ mod tests {
             source_weights: Vec::new(),
             source_max_samples: Vec::new(),
             skip_invalid_records: false,
+            external_metadata_paths: Vec::new(),
         };
         let dataset = load_text_dataset(&data, 128, 8, &cache_dir).expect("dataset should load");
 
@@ -1582,6 +1584,7 @@ mod tests {
             source_weights: Vec::new(),
             source_max_samples: Vec::new(),
             skip_invalid_records: false,
+            external_metadata_paths: Vec::new(),
         };
         let dataset =
             load_sft_dataset(&data, 128, 64, &cache_dir).expect("SFT dataset should load");
@@ -1674,6 +1677,7 @@ mod tests {
             source_weights: Vec::new(),
             source_max_samples: Vec::new(),
             skip_invalid_records: false,
+            external_metadata_paths: Vec::new(),
         };
         let dataset =
             load_sft_dataset(&data, 128, 96, &cache_dir).expect("SFT dataset should load");
@@ -1765,6 +1769,7 @@ mod tests {
             source_weights: Vec::new(),
             source_max_samples: Vec::new(),
             skip_invalid_records: false,
+            external_metadata_paths: Vec::new(),
         };
         let dataset =
             load_sft_dataset(&data, 128, 96, &cache_dir).expect("SFT dataset should load");
@@ -1846,6 +1851,7 @@ mod tests {
             source_weights: Vec::new(),
             source_max_samples: Vec::new(),
             skip_invalid_records: false,
+            external_metadata_paths: Vec::new(),
         };
         let dataset =
             load_sft_dataset(&data, 128, 96, &cache_dir).expect("SFT dataset should load");
@@ -1929,6 +1935,7 @@ mod tests {
             source_weights: Vec::new(),
             source_max_samples: Vec::new(),
             skip_invalid_records: false,
+            external_metadata_paths: Vec::new(),
         };
         let dataset =
             load_sft_dataset(&data, 128, 96, &cache_dir).expect("SFT dataset should load");
@@ -2015,6 +2022,7 @@ mod tests {
             source_weights: Vec::new(),
             source_max_samples: Vec::new(),
             skip_invalid_records: false,
+            external_metadata_paths: Vec::new(),
         };
         let dataset =
             load_sft_dataset(&data, 128, 96, &cache_dir).expect("SFT dataset should load");
@@ -2095,6 +2103,7 @@ mod tests {
             source_weights: Vec::new(),
             source_max_samples: Vec::new(),
             skip_invalid_records: false,
+            external_metadata_paths: Vec::new(),
         };
         let raw_data = DataConfig {
             trim_fields: false,
@@ -2208,6 +2217,7 @@ mod tests {
             source_weights: Vec::new(),
             source_max_samples: Vec::new(),
             skip_invalid_records: false,
+            external_metadata_paths: Vec::new(),
         };
         let dataset =
             load_sft_dataset(&data, 128, 64, &cache_dir).expect("SFT dataset should load");
@@ -2290,6 +2300,7 @@ mod tests {
             source_weights: Vec::new(),
             source_max_samples: Vec::new(),
             skip_invalid_records: false,
+            external_metadata_paths: Vec::new(),
         };
         let dataset =
             load_sft_dataset(&data, 128, 64, &cache_dir).expect("SFT dataset should load");
@@ -2373,6 +2384,7 @@ mod tests {
             source_weights: Vec::new(),
             source_max_samples: Vec::new(),
             skip_invalid_records: false,
+            external_metadata_paths: Vec::new(),
         };
         let dataset =
             load_sft_dataset(&data, 128, 64, &cache_dir).expect("SFT dataset should load");
@@ -2457,6 +2469,7 @@ mod tests {
             source_weights: Vec::new(),
             source_max_samples: Vec::new(),
             skip_invalid_records: false,
+            external_metadata_paths: Vec::new(),
         };
         let dataset =
             load_sft_dataset(&data, 128, 96, &cache_dir).expect("SFT dataset should load");
@@ -2542,6 +2555,7 @@ mod tests {
             source_weights: Vec::new(),
             source_max_samples: Vec::new(),
             skip_invalid_records: false,
+            external_metadata_paths: Vec::new(),
         };
         let dataset =
             load_sft_dataset(&data, 128, 96, &cache_dir).expect("SFT dataset should load");
@@ -2628,6 +2642,7 @@ mod tests {
             source_weights: Vec::new(),
             source_max_samples: Vec::new(),
             skip_invalid_records: false,
+            external_metadata_paths: Vec::new(),
         };
         let dataset =
             load_sft_dataset(&data, 128, 96, &cache_dir).expect("SFT dataset should load");
@@ -2714,6 +2729,7 @@ mod tests {
             source_weights: Vec::new(),
             source_max_samples: Vec::new(),
             skip_invalid_records: false,
+            external_metadata_paths: Vec::new(),
         };
         let dataset =
             load_sft_dataset(&data, 128, 96, &cache_dir).expect("SFT dataset should load");
@@ -2800,6 +2816,7 @@ mod tests {
             source_weights: Vec::new(),
             source_max_samples: Vec::new(),
             skip_invalid_records: false,
+            external_metadata_paths: Vec::new(),
         };
         let dataset =
             load_sft_dataset(&data, 128, 64, &cache_dir).expect("SFT dataset should load");
@@ -2884,6 +2901,7 @@ mod tests {
             source_weights: Vec::new(),
             source_max_samples: Vec::new(),
             skip_invalid_records: false,
+            external_metadata_paths: Vec::new(),
         };
         let dataset =
             load_sft_dataset(&data, 128, 64, &cache_dir).expect("SFT dataset should load");
@@ -2970,6 +2988,7 @@ mod tests {
             source_weights: Vec::new(),
             source_max_samples: Vec::new(),
             skip_invalid_records: false,
+            external_metadata_paths: Vec::new(),
         };
         let dataset =
             load_sft_dataset(&data, 128, 64, &cache_dir).expect("SFT dataset should load");
@@ -3058,6 +3077,7 @@ mod tests {
             source_weights: Vec::new(),
             source_max_samples: Vec::new(),
             skip_invalid_records: false,
+            external_metadata_paths: Vec::new(),
         };
         let dataset =
             load_sft_dataset(&data, 128, 96, &cache_dir).expect("SFT dataset should load");
@@ -3148,6 +3168,7 @@ mod tests {
             source_weights: Vec::new(),
             source_max_samples: Vec::new(),
             skip_invalid_records: false,
+            external_metadata_paths: Vec::new(),
         };
         let dataset =
             load_sft_dataset(&data, 128, 96, &cache_dir).expect("SFT dataset should load");
@@ -3237,6 +3258,7 @@ mod tests {
             source_weights: Vec::new(),
             source_max_samples: Vec::new(),
             skip_invalid_records: false,
+            external_metadata_paths: Vec::new(),
         };
         let dataset =
             load_sft_dataset(&data, 128, 64, &cache_dir).expect("SFT dataset should load");
@@ -3323,6 +3345,7 @@ mod tests {
             source_weights: Vec::new(),
             source_max_samples: Vec::new(),
             skip_invalid_records: false,
+            external_metadata_paths: Vec::new(),
         };
         let dataset =
             load_sft_dataset(&data, 128, 64, &cache_dir).expect("SFT dataset should load");
@@ -3418,6 +3441,7 @@ mod tests {
             source_weights: vec![2, 2],
             source_max_samples: Vec::new(),
             skip_invalid_records: false,
+            external_metadata_paths: Vec::new(),
         };
         let dataset =
             load_sft_dataset(&data, 128, 64, &cache_dir).expect("SFT dataset should load");
@@ -3508,6 +3532,7 @@ mod tests {
             source_weights: vec![2, 2],
             source_max_samples: vec![1, 2],
             skip_invalid_records: false,
+            external_metadata_paths: Vec::new(),
         };
         let dataset =
             load_sft_dataset(&data, 128, 64, &cache_dir).expect("SFT dataset should load");
@@ -3594,6 +3619,7 @@ mod tests {
             source_weights: Vec::new(),
             source_max_samples: Vec::new(),
             skip_invalid_records: false,
+            external_metadata_paths: Vec::new(),
         };
         let dataset =
             load_sft_dataset(&data, 128, 64, &cache_dir).expect("SFT dataset should load");
@@ -3678,6 +3704,7 @@ mod tests {
             source_weights: Vec::new(),
             source_max_samples: Vec::new(),
             skip_invalid_records: false,
+            external_metadata_paths: Vec::new(),
         };
 
         let strict_error = load_sft_dataset(&data, 128, 64, &cache_dir)
@@ -3769,6 +3796,7 @@ mod tests {
             source_weights: Vec::new(),
             source_max_samples: Vec::new(),
             skip_invalid_records: true,
+            external_metadata_paths: Vec::new(),
         };
         let dataset =
             load_sft_dataset(&data, 128, 96, &cache_dir).expect("chat SFT dataset should load");
@@ -3860,6 +3888,7 @@ mod tests {
             source_weights: Vec::new(),
             source_max_samples: Vec::new(),
             skip_invalid_records: false,
+            external_metadata_paths: Vec::new(),
         };
         let dataset =
             load_sft_dataset(&data, 128, 96, &cache_dir).expect("nested SFT dataset should load");
@@ -3962,6 +3991,7 @@ mod tests {
             source_weights: Vec::new(),
             source_max_samples: Vec::new(),
             skip_invalid_records: false,
+            external_metadata_paths: Vec::new(),
         };
         let dataset =
             load_sft_dataset(&data, 128, 96, &cache_dir).expect("SFT dataset should load");
@@ -4061,6 +4091,7 @@ mod tests {
             source_weights: Vec::new(),
             source_max_samples: Vec::new(),
             skip_invalid_records: false,
+            external_metadata_paths: Vec::new(),
         };
         let dataset =
             load_sft_dataset(&data, 128, 96, &cache_dir).expect("SFT dataset should load");
@@ -4154,6 +4185,7 @@ mod tests {
             source_weights: Vec::new(),
             source_max_samples: Vec::new(),
             skip_invalid_records: false,
+            external_metadata_paths: Vec::new(),
         };
         let dataset =
             load_sft_dataset(&data, 128, 96, &cache_dir).expect("SFT dataset should load");
@@ -4264,6 +4296,7 @@ mod tests {
             source_weights: Vec::new(),
             source_max_samples: Vec::new(),
             skip_invalid_records: false,
+            external_metadata_paths: Vec::new(),
         };
         let dataset =
             load_sft_dataset(&data, 128, 96, &cache_dir).expect("SFT dataset should load");
@@ -4358,6 +4391,7 @@ mod tests {
             source_weights: Vec::new(),
             source_max_samples: Vec::new(),
             skip_invalid_records: false,
+            external_metadata_paths: Vec::new(),
         };
         let dataset =
             load_sft_dataset(&data, 128, 96, &cache_dir).expect("SFT dataset should load");
@@ -4463,6 +4497,7 @@ mod tests {
             source_weights: Vec::new(),
             source_max_samples: Vec::new(),
             skip_invalid_records: false,
+            external_metadata_paths: Vec::new(),
         };
         let dataset =
             load_sft_dataset(&data, 128, 96, &cache_dir).expect("SFT dataset should load");
@@ -4577,6 +4612,7 @@ mod tests {
             source_weights: Vec::new(),
             source_max_samples: Vec::new(),
             skip_invalid_records: false,
+            external_metadata_paths: Vec::new(),
         };
         let dataset =
             load_sft_dataset(&data, 128, 96, &cache_dir).expect("SFT dataset should load");
@@ -4681,6 +4717,7 @@ mod tests {
             source_weights: Vec::new(),
             source_max_samples: Vec::new(),
             skip_invalid_records: false,
+            external_metadata_paths: Vec::new(),
         };
         let dataset =
             load_sft_dataset(&data, 128, 96, &cache_dir).expect("SFT dataset should load");
@@ -4784,6 +4821,7 @@ mod tests {
             source_weights: Vec::new(),
             source_max_samples: Vec::new(),
             skip_invalid_records: false,
+            external_metadata_paths: Vec::new(),
         };
         let dataset =
             load_sft_dataset(&data, 128, 96, &cache_dir).expect("SFT dataset should load");
@@ -4889,6 +4927,7 @@ mod tests {
             source_weights: Vec::new(),
             source_max_samples: Vec::new(),
             skip_invalid_records: false,
+            external_metadata_paths: Vec::new(),
         };
         let dataset =
             load_sft_dataset(&data, 128, 96, &cache_dir).expect("SFT dataset should load");
@@ -4984,6 +5023,7 @@ mod tests {
             source_weights: Vec::new(),
             source_max_samples: Vec::new(),
             skip_invalid_records: false,
+            external_metadata_paths: Vec::new(),
         };
         let dataset =
             load_sft_dataset(&data, 128, 64, &cache_dir).expect("SFT dataset should load");

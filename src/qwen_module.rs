@@ -1792,6 +1792,14 @@ struct QwenSftFieldMap {
     source_max_samples: Vec<usize>,
     #[serde(default)]
     skip_invalid_records: bool,
+    #[serde(default)]
+    external_metadata: Vec<QwenSftExternalMetadata>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct QwenSftExternalMetadata {
+    path: String,
+    contents: String,
 }
 
 impl QwenSftFieldMap {
@@ -1840,6 +1848,9 @@ impl QwenSftFieldMap {
             source_weights: data.source_weights.clone(),
             source_max_samples: data.source_max_samples.clone(),
             skip_invalid_records: data.skip_invalid_records,
+            external_metadata: qwen_sft_external_metadata_from_paths(
+                &data.external_metadata_paths,
+            )?,
         };
         map.validate()?;
         Ok(map)
@@ -2214,8 +2225,24 @@ impl Default for QwenSftFieldMap {
             source_weights: Vec::new(),
             source_max_samples: Vec::new(),
             skip_invalid_records: false,
+            external_metadata: Vec::new(),
         }
     }
+}
+
+fn qwen_sft_external_metadata_from_paths(
+    paths: &[PathBuf],
+) -> Result<Vec<QwenSftExternalMetadata>> {
+    let mut metadata = Vec::new();
+    for path in paths {
+        let contents = fs::read_to_string(path)
+            .with_context(|| format!("failed to read {}", path.display()))?;
+        metadata.push(QwenSftExternalMetadata {
+            path: path.display().to_string(),
+            contents,
+        });
+    }
+    Ok(metadata)
 }
 
 #[derive(Clone)]
@@ -13169,6 +13196,15 @@ fn qwen_sft_hash_field_map(hash: &mut u64, field_map: &QwenSftFieldMap) {
         }
         qwen_sft_hash_bytes(hash, b"\0");
     }
+    if !field_map.external_metadata.is_empty() {
+        qwen_sft_hash_bytes(hash, b"external_metadata");
+        for metadata in &field_map.external_metadata {
+            qwen_sft_hash_bytes(hash, metadata.path.as_bytes());
+            qwen_sft_hash_bytes(hash, b"\0");
+            qwen_sft_hash_bytes(hash, metadata.contents.as_bytes());
+            qwen_sft_hash_bytes(hash, b"\0");
+        }
+    }
 }
 
 fn qwen_sft_hash_example(hash: &mut u64, example: &QwenSftExample, include_system: bool) {
@@ -18993,6 +19029,74 @@ not-json
             Err(error) => error.to_string(),
         };
         assert!(source_metadata_mismatch.contains("source_files"));
+    }
+
+    #[test]
+    fn qwen_sft_external_metadata_participates_in_fingerprint_and_cache() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let jsonl = temp.path().join("train.jsonl");
+        let metadata_path = temp.path().join("arrow-export.json");
+        let cache_path = temp.path().join("cache").join("offset-index.json");
+        fs::write(
+            &jsonl,
+            r#"{"instruction":"zero","response":"zero"}
+{"instruction":"one","response":"one"}
+"#,
+        )
+        .expect("jsonl should write");
+        fs::write(
+            &metadata_path,
+            r#"{"source_arrow":"/datasets/source.arrow","exported_rows":2}"#,
+        )
+        .expect("metadata should write");
+        let paths = vec![jsonl.clone()];
+        let metadata = qwen_sft_external_metadata_from_paths(std::slice::from_ref(&metadata_path))
+            .expect("metadata should load");
+        let field_map = QwenSftFieldMap {
+            external_metadata: metadata.clone(),
+            ..QwenSftFieldMap::default()
+        };
+        let no_metadata_map = QwenSftFieldMap::default();
+        let loaded = qwen_sft_examples_from_jsonl_paths_with_limit(&paths, None, &field_map)
+            .expect("examples should load");
+        let without_metadata =
+            qwen_sft_examples_from_jsonl_paths_with_limit(&paths, None, &no_metadata_map)
+                .expect("examples should load without metadata");
+
+        assert_ne!(loaded.fingerprint, without_metadata.fingerprint);
+
+        let first =
+            qwen_sft_streaming_source_index_with_cache(&paths, None, Some(&cache_path), &field_map)
+                .expect("first cache load should build index");
+        assert!(first.cache_written);
+
+        let cache_mismatch = match qwen_sft_streaming_source_index_with_cache(
+            &paths,
+            None,
+            Some(&cache_path),
+            &no_metadata_map,
+        ) {
+            Ok(_) => panic!("missing external metadata should reject cache"),
+            Err(error) => error.to_string(),
+        };
+        assert!(cache_mismatch.contains("field_map"));
+
+        fs::write(
+            &metadata_path,
+            r#"{"source_arrow":"/datasets/changed.arrow","exported_rows":2}"#,
+        )
+        .expect("metadata rewrite should update provenance");
+        let changed_metadata =
+            qwen_sft_external_metadata_from_paths(std::slice::from_ref(&metadata_path))
+                .expect("changed metadata should load");
+        let changed_map = QwenSftFieldMap {
+            external_metadata: changed_metadata,
+            ..QwenSftFieldMap::default()
+        };
+        let changed = qwen_sft_examples_from_jsonl_paths_with_limit(&paths, None, &changed_map)
+            .expect("examples should load with changed metadata");
+
+        assert_ne!(loaded.fingerprint, changed.fingerprint);
     }
 
     #[test]

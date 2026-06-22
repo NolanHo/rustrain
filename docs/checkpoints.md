@@ -149,9 +149,10 @@ Acceptance:
   stream or file caches, scans Arrow record batches without materializing the
   full table, can skip exact full-source row counting with
   `--no-full-row-count`, maps the dataset's `output` column into the normalized
-  JSONL `response` field, writes two JSONL shards, and checks tokenizer-free
-  streaming metadata, tokenizer-backed batch parity, cursor wrap, and cache
-  write/hit behavior on that
+  JSONL `response` field, writes two JSONL shards, attaches the export metadata
+  through `data.external_metadata_paths`, and checks tokenizer-free streaming
+  metadata, tokenizer-backed batch parity, cursor wrap, and cache write/hit
+  behavior on that
   external-cache-derived source. The offset-index cache is keyed by source paths,
   source JSONL file size/mtime metadata, `max_samples`, and the JSONL field
   mapping from `data.instruction_field`, `data.input_field`,
@@ -175,8 +176,8 @@ Acceptance:
   `data.max_system_chars`, optional `data.min_prompt_chars`, optional
   `data.max_prompt_chars`, optional `data.min_sample_chars`, optional
   `data.max_sample_chars`, optional `data.dedupe_samples`, and training
-  `data.source_weights` plus optional `data.source_max_samples` and optional
-  `data.skip_invalid_records`, so stale
+  `data.source_weights` plus optional `data.source_max_samples`, optional
+  `data.skip_invalid_records`, and optional `data.external_metadata_paths`, so stale
   caches from a different external file state, external schema, prompt format,
   default/replacement/case/affix/strip/split/truncation/normalization policy,
   field-regex filtering policy,

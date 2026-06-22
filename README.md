@@ -528,6 +528,10 @@ production-grade sharded checkpoint ownership remain open.
   missing or non-string required fields fail clearly. Set it to `true` to skip
   those invalid records before filtering, deduplication, source weighting,
   source limits, global `max_samples`, and streaming offset-index construction.
+  `data.external_metadata_paths` can point at sidecar files such as Arrow export
+  metadata; Qwen JSONL SFT includes their paths and contents in dataset
+  fingerprints and offset-index cache identity so an exported JSONL subset keeps
+  provenance for the external source it came from.
   `cargo run -- qwen-sft-streaming-batch-plan --config ...` resolves the next
   cursor window to raw JSONL source indices, reads and tokenizes only those
   window records, then verifies the padded `input_ids` plus response masks match
@@ -546,8 +550,8 @@ production-grade sharded checkpoint ownership remain open.
   policy, field defaults, field replacements, whitespace normalization policy,
   instruction/input/system/prompt/sample/response length filters, field regex
   filters, response include/exclude substring filters, instruction substring
-  filters, dedupe
-  policy, and source-weighting policy, so a cache
+  filters, dedupe policy, external metadata sidecars, and source-weighting
+  policy, so a cache
   created for one external dataset state or schema is rejected if reused after
   source file changes or with a different field map, prompt format,
   normalization policy, filtering policy, or weighting policy.
@@ -568,7 +572,8 @@ production-grade sharded checkpoint ownership remain open.
   stream or file caches, scans Arrow record batches without materializing the
   full table, can skip exact full-source row counting with
   `--no-full-row-count`, maps its `output` column into the normalized JSONL
-  `response` field, writes a two-shard JSONL export, and runs the same
+  `response` field, writes a two-shard JSONL export, attaches the export
+  metadata through `data.external_metadata_paths`, and runs the same
   tokenizer-free plan, tokenizer-backed batch parity, cursor wrap, and
   offset-index cache write/hit checks. A production
   zero-materialization loader for large external streams is still open.
