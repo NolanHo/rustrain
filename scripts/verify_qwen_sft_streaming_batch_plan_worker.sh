@@ -47,7 +47,9 @@ checks = {
     "dataset_shuffle": True,
     "tokenizer_loaded": True,
     "tokenized_samples_materialized": True,
+    "reference_tokenized_samples_materialized": True,
     "streaming_window_samples": 4,
+    "streaming_raw_samples_read": 3,
     "materialized_input_max_delta": 0,
     "materialized_mask_max_delta": 0.0,
 }
@@ -95,9 +97,20 @@ if any(value <= 0 for value in batch_masked_positions):
 if any(not isinstance(value, str) or len(value) != 16 for value in batch_token_fingerprints):
     raise SystemExit(f"bad batch_token_fingerprints: {batch_token_fingerprints}")
 
+raw_indices = data.get("streaming_raw_sample_indices")
+expected_raw_indices = [
+    {"path": expected_source, "index_in_file": 3, "global_index": 3},
+    {"path": expected_source, "index_in_file": 3, "global_index": 3},
+    {"path": expected_source, "index_in_file": 2, "global_index": 2},
+    {"path": expected_source, "index_in_file": 1, "global_index": 1},
+]
+if raw_indices != expected_raw_indices:
+    raise SystemExit(f"streaming_raw_sample_indices {raw_indices} != {expected_raw_indices}")
+
 print(
     "qwen_sft_streaming_batch_plan_verified: "
     f"streaming_window_samples={data['streaming_window_samples']} "
+    f"streaming_raw_samples_read={data['streaming_raw_samples_read']} "
     f"batch_sequence_tokens={batch_sequence_tokens} "
     f"materialized_input_max_delta={data['materialized_input_max_delta']} "
     f"materialized_mask_max_delta={data['materialized_mask_max_delta']}"

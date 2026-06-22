@@ -1531,6 +1531,7 @@ struct QwenSftTokenSample {
     mask_values: Vec<f32>,
 }
 
+#[derive(Clone)]
 struct QwenSftExample {
     instruction: String,
     input: String,
@@ -1542,6 +1543,29 @@ struct QwenSftExampleSet {
     source_files: Vec<String>,
     source_sample_counts: Vec<QwenSftSourceSampleCount>,
     fingerprint: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+struct QwenSftRawSampleIndex {
+    path: String,
+    index_in_file: usize,
+    global_index: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct QwenSftStreamingSourceIndex {
+    samples: Vec<QwenSftRawSampleIndex>,
+}
+
+struct QwenSftStreamingTokenWindow {
+    samples: Vec<QwenSftTokenSample>,
+    raw_sample_indices: Vec<QwenSftRawSampleIndex>,
+    raw_samples_read: usize,
+}
+
+struct QwenSftRawExampleWindow {
+    examples: Vec<QwenSftExample>,
+    raw_samples_read: usize,
 }
 
 #[derive(Deserialize)]
@@ -1673,7 +1697,10 @@ struct QwenSftStreamingBatchPlanSummary {
     dataset_shuffle: bool,
     tokenizer_loaded: bool,
     tokenized_samples_materialized: bool,
+    reference_tokenized_samples_materialized: bool,
     streaming_window_samples: usize,
+    streaming_raw_samples_read: usize,
+    streaming_raw_sample_indices: Vec<QwenSftRawSampleIndex>,
     batch_sequence_tokens: Vec<usize>,
     batch_masked_positions: Vec<usize>,
     batch_padding_tokens: Vec<usize>,
@@ -5593,8 +5620,13 @@ pub fn qwen_sft_streaming_batch_plan(
         .map(|entry| entry.cursor + 1)
         .unwrap_or(data_cursor_start);
 
-    let streaming_window_samples = qwen_sft_streaming_token_window(
-        &train_dataset,
+    let streaming_window = qwen_sft_streaming_token_window_from_jsonl(
+        &tokenizer,
+        &data_config.paths,
+        data_config.max_samples,
+        data_config.train_split,
+        data_config.shuffle,
+        config.run.seed,
         data_cursor_start,
         train_window_sample_cursors.len(),
     )?;
@@ -5609,7 +5641,7 @@ pub fn qwen_sft_streaming_batch_plan(
         let offset = batch_index * global_batch_size;
         let end = offset + global_batch_size;
         let streaming_batch = qwen_sft_padded_batch(
-            &streaming_window_samples[offset..end],
+            &streaming_window.samples[offset..end],
             train_dataset.pad_token_id,
         )?;
         let materialized_batch =
@@ -5653,7 +5685,10 @@ pub fn qwen_sft_streaming_batch_plan(
         dataset_shuffle: dataset_summary.shuffle,
         tokenizer_loaded: true,
         tokenized_samples_materialized: true,
-        streaming_window_samples: streaming_window_samples.len(),
+        reference_tokenized_samples_materialized: true,
+        streaming_window_samples: streaming_window.samples.len(),
+        streaming_raw_samples_read: streaming_window.raw_samples_read,
+        streaming_raw_sample_indices: streaming_window.raw_sample_indices,
         batch_sequence_tokens,
         batch_masked_positions,
         batch_padding_tokens,
@@ -10234,17 +10269,56 @@ fn qwen_sft_streaming_cursor_window(
         .collect()
 }
 
-fn qwen_sft_streaming_token_window(
-    dataset: &QwenSftDataset,
+fn qwen_sft_streaming_token_window_from_jsonl(
+    tokenizer: &Tokenizer,
+    paths: &[PathBuf],
+    max_samples: Option<usize>,
+    train_split: f32,
+    shuffle: bool,
+    seed: u64,
     data_cursor_start: usize,
     window_samples: usize,
-) -> Result<Vec<QwenSftTokenSample>> {
+) -> Result<QwenSftStreamingTokenWindow> {
     if window_samples == 0 {
         bail!("SFT streaming token window requires at least one sample");
     }
-    (0..window_samples)
-        .map(|relative| dataset.sample_at_cursor(data_cursor_start + relative))
-        .collect()
+    let source_index = qwen_sft_streaming_source_index(paths, max_samples)?;
+    let (train_samples, _) =
+        qwen_sft_train_eval_sample_counts(source_index.samples.len(), train_split)?;
+    let mut train_indices = source_index.samples;
+    if shuffle {
+        let mut rng = StdRng::seed_from_u64(seed);
+        train_indices.shuffle(&mut rng);
+    }
+    train_indices.truncate(train_samples);
+    if train_indices.is_empty() {
+        bail!("SFT streaming token window requires at least one training sample");
+    }
+
+    let raw_sample_indices = (0..window_samples)
+        .map(|relative| {
+            let cursor = data_cursor_start + relative;
+            let epoch = cursor / train_indices.len();
+            let offset = cursor % train_indices.len();
+            let index = if shuffle {
+                qwen_epoch_permutation_index(train_indices.len(), seed, epoch, offset)
+            } else {
+                offset
+            };
+            train_indices[index].clone()
+        })
+        .collect::<Vec<_>>();
+    let raw_window = qwen_sft_examples_by_raw_indices(&raw_sample_indices)?;
+    let samples = raw_window
+        .examples
+        .iter()
+        .map(|example| qwen_sft_token_sample(tokenizer, example))
+        .collect::<Result<Vec<_>>>()?;
+    Ok(QwenSftStreamingTokenWindow {
+        samples,
+        raw_sample_indices,
+        raw_samples_read: raw_window.raw_samples_read,
+    })
 }
 
 fn qwen_apply_sft_shuffle(dataset: QwenSftDataset, shuffle: bool, seed: u64) -> QwenSftDataset {
@@ -10418,6 +10492,139 @@ fn qwen_sft_examples_from_jsonl_paths_with_limit(
         source_files,
         source_sample_counts,
         fingerprint,
+    })
+}
+
+fn qwen_sft_streaming_source_index(
+    paths: &[PathBuf],
+    max_samples: Option<usize>,
+) -> Result<QwenSftStreamingSourceIndex> {
+    if paths.is_empty() {
+        bail!("SFT dataset must contain at least one JSONL path");
+    }
+    if max_samples == Some(0) {
+        bail!("SFT data.max_samples must be greater than zero");
+    }
+    let mut samples = Vec::new();
+
+    for path in paths {
+        if max_samples.is_some_and(|limit| samples.len() >= limit) {
+            break;
+        }
+        for file in qwen_sft_jsonl_files(path)? {
+            if max_samples.is_some_and(|limit| samples.len() >= limit) {
+                break;
+            }
+            let file_path = file.display().to_string();
+            let reader = BufReader::new(
+                fs::File::open(&file)
+                    .with_context(|| format!("failed to read {}", file.display()))?,
+            );
+            for (line_index, line) in reader.lines().enumerate() {
+                if max_samples.is_some_and(|limit| samples.len() >= limit) {
+                    break;
+                }
+                let line = line.with_context(|| {
+                    format!(
+                        "failed to read SFT JSONL record {}:{}",
+                        file.display(),
+                        line_index + 1
+                    )
+                })?;
+                if line.trim().is_empty() {
+                    continue;
+                }
+                let record: QwenSftRecord = serde_json::from_str(&line).with_context(|| {
+                    format!(
+                        "failed to parse SFT JSONL record {}:{}",
+                        file.display(),
+                        line_index + 1
+                    )
+                })?;
+                drop(record);
+                samples.push(QwenSftRawSampleIndex {
+                    path: file_path.clone(),
+                    index_in_file: line_index,
+                    global_index: samples.len(),
+                });
+            }
+        }
+    }
+    if samples.is_empty() {
+        bail!("SFT dataset must contain at least one example");
+    }
+
+    Ok(QwenSftStreamingSourceIndex { samples })
+}
+
+fn qwen_sft_examples_by_raw_indices(
+    raw_indices: &[QwenSftRawSampleIndex],
+) -> Result<QwenSftRawExampleWindow> {
+    if raw_indices.is_empty() {
+        bail!("SFT streaming raw index read requires at least one sample");
+    }
+    let mut by_path: BTreeMap<String, BTreeSet<usize>> = BTreeMap::new();
+    for raw_index in raw_indices {
+        by_path
+            .entry(raw_index.path.clone())
+            .or_default()
+            .insert(raw_index.index_in_file);
+    }
+
+    let mut loaded = BTreeMap::new();
+    for (path, wanted_indices) in &by_path {
+        let reader =
+            BufReader::new(fs::File::open(path).with_context(|| format!("failed to read {path}"))?);
+        for (line_index, line) in reader.lines().enumerate() {
+            if !wanted_indices.contains(&line_index) {
+                continue;
+            }
+            let line = line.with_context(|| {
+                format!("failed to read SFT JSONL record {path}:{}", line_index + 1)
+            })?;
+            if line.trim().is_empty() {
+                continue;
+            }
+            let record: QwenSftRecord = serde_json::from_str(&line).with_context(|| {
+                format!("failed to parse SFT JSONL record {path}:{}", line_index + 1)
+            })?;
+            loaded.insert(
+                (path.clone(), line_index),
+                QwenSftExample {
+                    instruction: record.instruction,
+                    input: record.input,
+                    response: record.response,
+                },
+            );
+            if loaded
+                .keys()
+                .filter(|(loaded_path, _)| loaded_path == path)
+                .count()
+                == wanted_indices.len()
+            {
+                break;
+            }
+        }
+    }
+
+    let examples = raw_indices
+        .iter()
+        .map(|raw_index| {
+            loaded
+                .get(&(raw_index.path.clone(), raw_index.index_in_file))
+                .cloned()
+                .ok_or_else(|| {
+                    anyhow!(
+                        "SFT streaming raw sample not found: {}:{}",
+                        raw_index.path,
+                        raw_index.index_in_file + 1
+                    )
+                })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(QwenSftRawExampleWindow {
+        examples,
+        raw_samples_read: loaded.len(),
     })
 }
 
@@ -13399,6 +13606,67 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(compact, vec![(2, 0, 2), (3, 1, 0), (4, 1, 1), (5, 1, 2)]);
+    }
+
+    #[test]
+    fn qwen_sft_streaming_raw_index_reads_only_cursor_window() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let jsonl = temp.path().join("train.jsonl");
+        fs::write(
+            &jsonl,
+            r#"{"instruction":"zero","response":"a"}
+{"instruction":"one","response":"b"}
+{"instruction":"two","response":"c"}
+{"instruction":"three","response":"d"}
+"#,
+        )
+        .expect("jsonl should write");
+        let paths = vec![jsonl.clone()];
+        let source_index =
+            qwen_sft_streaming_source_index(&paths, None).expect("source index should build");
+        let (train_samples, _) =
+            qwen_sft_train_eval_sample_counts(source_index.samples.len(), 0.75)
+                .expect("split should compute");
+        let mut train_indices = source_index.samples;
+        let mut rng = StdRng::seed_from_u64(777);
+        train_indices.shuffle(&mut rng);
+        train_indices.truncate(train_samples);
+        let raw_indices = (0..4)
+            .map(|relative| {
+                let cursor = 2 + relative;
+                let epoch = cursor / train_indices.len();
+                let offset = cursor % train_indices.len();
+                let index = qwen_epoch_permutation_index(train_indices.len(), 777, epoch, offset);
+                train_indices[index].clone()
+            })
+            .collect::<Vec<_>>();
+        let raw_window =
+            qwen_sft_examples_by_raw_indices(&raw_indices).expect("raw examples should read");
+
+        assert_eq!(raw_window.examples.len(), 4);
+        assert_eq!(raw_window.raw_samples_read, 3);
+        assert_eq!(
+            raw_window
+                .examples
+                .iter()
+                .map(|example| example.instruction.as_str())
+                .collect::<Vec<_>>(),
+            vec!["three", "three", "two", "one"]
+        );
+        assert_eq!(
+            raw_indices
+                .iter()
+                .map(|index| index.index_in_file)
+                .collect::<Vec<_>>(),
+            vec![3, 3, 2, 1]
+        );
+        assert_eq!(
+            raw_indices
+                .iter()
+                .map(|index| index.path.clone())
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([jsonl.display().to_string()])
+        );
     }
 
     #[test]
