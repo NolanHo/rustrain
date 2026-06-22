@@ -28,8 +28,12 @@ cargo run -- train --config configs/qwen_session_single.toml --resume-from "${MA
 
 python - "${RESUME_OUTPUT}" <<'PY'
 import ast
+import json
 import pathlib
 import sys
+
+sys.path.insert(0, str(pathlib.Path.cwd() / "scripts"))
+from qwen_verify_utils import require_complete_qwen_base_model_path
 
 values = {}
 for line in pathlib.Path(sys.argv[1]).read_text().splitlines():
@@ -43,6 +47,7 @@ required = [
     "resumed_checkpoint",
     "train_steps",
     "step_losses",
+    "manifest_output",
     "first_step_grad_norm",
     "final_step_grad_norm",
     "tokens_per_second",
@@ -55,6 +60,17 @@ if missing:
     raise SystemExit(f"resume run is missing fields: {missing}")
 if values["resumed_checkpoint"] != "true":
     raise SystemExit("resume run did not report resumed_checkpoint: true")
+base_manifest = pathlib.Path(values["resume_from"])
+resume_manifest = pathlib.Path(values["manifest_output"])
+if not base_manifest.is_file():
+    raise SystemExit(f"resume_from manifest does not exist: {base_manifest}")
+if not resume_manifest.is_file():
+    raise SystemExit(f"resume manifest_output does not exist: {resume_manifest}")
+if resume_manifest == base_manifest:
+    raise SystemExit("resume run reused the base manifest path instead of writing a fresh manifest")
+for manifest_path in [base_manifest, resume_manifest]:
+    manifest = json.loads(manifest_path.read_text())
+    require_complete_qwen_base_model_path(manifest, manifest_path)
 if int(values["train_steps"]) != 2:
     raise SystemExit(f"expected train_steps 2, got {values['train_steps']}")
 step_losses = ast.literal_eval(values["step_losses"])
@@ -78,6 +94,7 @@ if float(values["second_step_delta"]) > 1e-5:
 print(
     "qwen_session_single_resume_verified: "
     f"resume_from={values['resume_from']} "
+    f"manifest_output={values['manifest_output']} "
     f"step_losses={step_losses} "
     f"reload_delta={values['reload_delta']} "
     f"second_step_delta={values['second_step_delta']}"
