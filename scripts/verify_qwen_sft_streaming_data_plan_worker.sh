@@ -6,7 +6,8 @@ source "${SCRIPT_DIR}/require_gpu_worker.sh"
 
 CONFIG="${RUSTRAIN_QWEN_SFT_STREAMING_DATA_PLAN_CONFIG:-configs/qwen_session_dp2_sft_max_samples.toml}"
 EXPECTED_SOURCE="${RUSTRAIN_EXPECTED_STREAMING_SOURCE:-data/sft_toy/instructions.jsonl}"
-EXPECTED_FINGERPRINT="${RUSTRAIN_EXPECTED_STREAMING_FINGERPRINT:-1f1a505dc2c37e79}"
+EXPECTED_SECOND_SOURCE="${RUSTRAIN_EXPECTED_STREAMING_SECOND_SOURCE:-data/sft_toy/more_instructions.jsonl}"
+EXPECTED_FINGERPRINT="${RUSTRAIN_EXPECTED_STREAMING_FINGERPRINT:-3bfd266239e4b9b9}"
 OUTPUT="$(mktemp)"
 
 cargo run -- qwen-sft-streaming-data-plan \
@@ -15,14 +16,15 @@ cargo run -- qwen-sft-streaming-data-plan \
   --data-cursor-start 2 \
   | tee "${OUTPUT}"
 
-python - "${OUTPUT}" "${EXPECTED_SOURCE}" "${EXPECTED_FINGERPRINT}" <<'PY'
+python - "${OUTPUT}" "${EXPECTED_SOURCE}" "${EXPECTED_SECOND_SOURCE}" "${EXPECTED_FINGERPRINT}" <<'PY'
 import json
 import pathlib
 import sys
 
 text = pathlib.Path(sys.argv[1]).read_text()
 expected_source = sys.argv[2]
-expected_fingerprint = sys.argv[3]
+expected_second_source = sys.argv[3]
+expected_fingerprint = sys.argv[4]
 start = text.find("{")
 if start < 0:
     raise SystemExit(f"streaming data plan output did not contain JSON: {text}")
@@ -57,6 +59,12 @@ checks = {
 for key, expected in checks.items():
     if data.get(key) != expected:
         raise SystemExit(f"{key} {data.get(key)} != {expected}")
+if data.get("data_paths") != [expected_source, expected_second_source]:
+    raise SystemExit(
+        f"data_paths {data.get('data_paths')} != {[expected_source, expected_second_source]}"
+    )
+if data.get("eval_paths") != []:
+    raise SystemExit(f"eval_paths should be empty, got {data.get('eval_paths')}")
 
 expected_window = [
     {"cursor": 2, "epoch": 0, "sample_offset": 2},
