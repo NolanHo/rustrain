@@ -161,7 +161,12 @@ exist, including a `trainer::train` config path for tiny `tch` DP=2 and a
 focused real-Qwen layer0 attention DP gradient-signature smoke. A focused
 real-Qwen TP=2 linear smoke shards the real layer0 attention `q_proj`, `k_proj`,
 `v_proj`, and `o_proj` output dimensions across two CUDA ranks and verifies the
-gathered shard outputs match the full linear projections. A companion TP=2
+gathered shard outputs match the full linear projections. The focused TP
+verifiers also require every rank summary to report the same resolved complete
+Qwen checkpoint path, including `config.json`, `tokenizer.json`, and
+`model.safetensors`; this keeps the public legacy default
+`/vePFS-Mindverse/share/huggingface/Qwen2.5-0.5B-Instruct` usable on workers
+that only expose the HuggingFace `hub/` snapshot layout. A companion TP=2
 attention smoke shards Q/K/V heads, applies rank-local attention, sums O-proj
 input-column contributions on rank0, and verifies parity against full layer0
 attention; a second attention smoke uses NCCL all-reduce for the same summed
@@ -468,8 +473,11 @@ production-grade sharded checkpoint ownership remain open.
 - Production distributed checkpoint rules are documented in
   [docs/checkpoints.md](docs/checkpoints.md), with a validated
   `rustrain.qwen_sharded.v1` manifest schema and representative rank-owned
-  writer/restore/next-step resume smoke. Full production sharded resume over
-  external streaming real data remains open.
+  writer/restore/next-step resume smoke. Qwen sharded manifests record the
+  resolved base checkpoint path rather than assuming the configured legacy path
+  exists, and verifiers require that path to be a complete local Qwen artifact.
+  Full production sharded resume over external streaming real data remains
+  open.
 - Trainer production basics such as scheduler, grad clipping, RSS memory
   metrics, and Ray-worker GPU memory reporting are implemented for toy/tch
   paths; real tokenizer-backed padded LoRA SFT batching is wired through

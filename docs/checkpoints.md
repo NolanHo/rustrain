@@ -43,7 +43,12 @@ Files:
 The manifest must record:
 
 - `format`: stable format identifier.
-- `base_model_path`: local base checkpoint path.
+- `base_model_path`: resolved local base checkpoint path. Qwen paths may start
+  as a configured legacy directory such as
+  `/vePFS-Mindverse/share/huggingface/Qwen2.5-0.5B-Instruct`, but manifests and
+  verifier summaries should record the resolved complete checkpoint directory,
+  including HuggingFace `hub/` snapshots when that is the only worker-visible
+  layout.
 - `reference_fixture`: input/fixture identity used by the smoke.
 - `delta_safetensors`: delta safetensors path.
 - `optimizer_safetensors`: optimizer safetensors path when optimizer state is
@@ -278,8 +283,11 @@ the global sharded manifest's `consumed_samples`, `data_cursor_next`,
 summaries.
 The focused Qwen TP=2 layer0 smoke also writes rank-owned model shard files and
 a global `rustrain.qwen_sharded.v1` manifest for its layer0 attention/MLP tensor
-partitions. That TP manifest is checkpoint-contract evidence only: optimizer
-slots for TP row/column shards are first-step smoke AdamW m/v tensors, and
+partitions. The global manifest records `base_model_path` and `tokenizer_path`
+from the resolved complete Qwen checkpoint, and TP verifiers reject manifests
+or rank summaries whose path does not contain `config.json`, `tokenizer.json`,
+and `model.safetensors`. That TP manifest is checkpoint-contract evidence only:
+optimizer slots for TP row/column shards are first-step smoke AdamW m/v tensors, and
 replicated norm slots remain zero because the focused TP train step does not
 update them. The same focused smoke restores each rank's model shards through
 the global manifest and verifies the fused layer0 output against the full
