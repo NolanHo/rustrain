@@ -6,11 +6,12 @@ source "${SCRIPT_DIR}/require_gpu_worker.sh"
 
 CONFIG="${RUSTRAIN_QWEN_SESSION_LAYERS_CONFIG:-configs/qwen_session_single_layers03.toml}"
 EXPECTED_COMPUTE_KIND="${RUSTRAIN_EXPECTED_QWEN_COMPUTE_KIND:-fp32}"
+EXPECTED_TRAINABLE_TENSORS="${RUSTRAIN_EXPECTED_QWEN_TRAINABLE_TENSORS:-50}"
 OUTPUT="$(mktemp)"
 
 cargo run -- train --config "${CONFIG}" | tee "${OUTPUT}"
 
-python - "${OUTPUT}" "${EXPECTED_COMPUTE_KIND}" <<'PY'
+python - "${OUTPUT}" "${EXPECTED_COMPUTE_KIND}" "${EXPECTED_TRAINABLE_TENSORS}" <<'PY'
 import ast
 import pathlib
 import sys
@@ -41,14 +42,17 @@ if missing:
     raise SystemExit(f"layer03 run is missing fields: {missing}")
 
 expected_compute_kind = sys.argv[2]
+expected_trainable_tensors = int(sys.argv[3])
 if values["compute_kind"] != expected_compute_kind:
     raise SystemExit(
         f"expected compute_kind {expected_compute_kind}, got {values['compute_kind']}"
     )
 if int(values["train_steps"]) != 1:
     raise SystemExit(f"expected train_steps 1, got {values['train_steps']}")
-if int(values["trainable_tensors"]) != 50:
-    raise SystemExit(f"expected 50 trainable tensors for layers [0,1,2,3], got {values['trainable_tensors']}")
+if int(values["trainable_tensors"]) != expected_trainable_tensors:
+    raise SystemExit(
+        f"expected {expected_trainable_tensors} trainable tensors, got {values['trainable_tensors']}"
+    )
 
 step_losses = ast.literal_eval(values["step_losses"])
 if len(step_losses) != 2:

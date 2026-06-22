@@ -207,6 +207,9 @@ single-GPU path with 26 trainable tensors, and
 `configs/qwen_session_single_layers03.toml` verifies a layer0-layer3
 single-GPU path with 50 trainable tensors. The same layer0-layer3 path also
 has bf16 coverage through `configs/qwen_session_single_layers03_bf16.toml`.
+`configs/qwen_session_single_layers07.toml` extends the single-GPU
+representative trainer path to layer0-layer7 with 98 trainable tensors,
+including the tied embedding for the single-rank path.
 `configs/qwen_session_dp2_layers01.toml` extends the representative DP=2
 trainer path to layer0+layer1. Its verifier expects 25 trainable tensors
 because the representative DP path intentionally excludes the tied embedding
@@ -336,6 +339,9 @@ production-grade sharded checkpoint ownership remain open.
   evidence to tokenizer-backed JSONL batches with manifest-backed data cursor
   and provenance checks, and `configs/qwen_session_dp2_layers03_sft.toml`
   extends the tokenizer-backed DP path to layer0-layer3.
+  `configs/qwen_session_single_layers07.toml` extends the single-GPU
+  representative trainer path to layer0-layer7 with 98 trainable tensors,
+  including the tied embedding for the single-rank path.
   `configs/qwen_session_dp2_layers01_sft_bf16.toml`
   verifies the tokenizer-backed layer0+layer1 DP path under bf16 compute, and
   `configs/qwen_session_dp2_layers03_sft_bf16.toml` verifies the
