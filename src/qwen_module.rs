@@ -12223,7 +12223,8 @@ mod tests {
     #[test]
     fn qwen_session_dp_global_sharded_manifest_writes_schema_root() {
         let temp = tempfile::tempdir().expect("temp dir should be created");
-        let manifest = tiny_qwen_sharded_manifest();
+        let manifest =
+            tiny_qwen_sharded_manifest_with_artifacts(temp.path()).expect("artifacts should write");
         for rank in &manifest.ranks {
             fs::write(
                 temp.path()

@@ -550,6 +550,7 @@ mod tests {
                 train_split: 0.8,
                 max_samples: None,
                 shuffle: true,
+                index_cache: None,
             }),
             lora: Some(LoraConfig {
                 rank: 4,
