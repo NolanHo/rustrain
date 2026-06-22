@@ -43,6 +43,32 @@ if len(rank_summaries) != 2:
 
 evidence = []
 rank0_manifest_path = None
+def verify_source_sample_counts(value, dataset_source_files, dataset_total_samples, context):
+    if not isinstance(value, list) or not value:
+        raise SystemExit(f"{context} dataset_source_sample_counts must be a non-empty list")
+    actual_files = []
+    total_samples = 0
+    for entry in value:
+        if not isinstance(entry, dict):
+            raise SystemExit(f"{context} dataset_source_sample_counts entry must be an object: {entry}")
+        source_path = entry.get("path")
+        samples = entry.get("samples")
+        if not source_path:
+            raise SystemExit(f"{context} dataset_source_sample_counts entry is missing path: {entry}")
+        if samples is None or int(samples) <= 0:
+            raise SystemExit(f"{context} dataset_source_sample_counts entry must have positive samples: {entry}")
+        actual_files.append(source_path)
+        total_samples += int(samples)
+    if actual_files != dataset_source_files:
+        raise SystemExit(
+            f"{context} dataset_source_sample_counts paths {actual_files} do not match dataset_source_files {dataset_source_files}"
+        )
+    if total_samples != int(dataset_total_samples):
+        raise SystemExit(
+            f"{context} dataset_source_sample_counts total {total_samples} does not match dataset_total_samples {dataset_total_samples}"
+        )
+    return value
+
 for path in rank_summaries:
     data = json.loads(path.read_text())
     if data.get("world_size") != 2:
@@ -106,6 +132,7 @@ for path in rank_summaries:
             "dataset_train_samples",
             "dataset_eval_samples",
             "dataset_source_files",
+            "dataset_source_sample_counts",
             "dataset_fingerprint",
             "dataset_order_seed",
             "streaming_train_batches",
@@ -143,6 +170,12 @@ for path in rank_summaries:
             raise SystemExit(
                 f"{path} dataset_source_files must only contain JSONL paths, got {dataset_source_files}"
             )
+        dataset_source_sample_counts = verify_source_sample_counts(
+            data["dataset_source_sample_counts"],
+            dataset_source_files,
+            data["dataset_total_samples"],
+            str(path),
+        )
         if not data["dataset_fingerprint"]:
             raise SystemExit(f"{path} dataset_fingerprint must not be empty")
         if int(data["dataset_order_seed"]) != int(expected_dataset_seed):
@@ -185,6 +218,16 @@ for path in rank_summaries:
             raise SystemExit(
                 f"{path} rank0 manifest dataset_source_files {manifest.get('dataset_source_files')} does not match summary {dataset_source_files}"
             )
+        if manifest.get("dataset_source_sample_counts") != dataset_source_sample_counts:
+            raise SystemExit(
+                f"{path} rank0 manifest dataset_source_sample_counts {manifest.get('dataset_source_sample_counts')} does not match summary {dataset_source_sample_counts}"
+            )
+        verify_source_sample_counts(
+            manifest.get("dataset_source_sample_counts"),
+            dataset_source_files,
+            data["dataset_total_samples"],
+            f"{path} rank0 manifest",
+        )
         if manifest.get("dataset_fingerprint") != data["dataset_fingerprint"]:
             raise SystemExit(
                 f"{path} rank0 manifest dataset_fingerprint {manifest.get('dataset_fingerprint')} does not match summary {data['dataset_fingerprint']}"
@@ -214,6 +257,16 @@ for path in rank_summaries:
             raise SystemExit(
                 f"{path} sharded dataset_source_files {sharded_global.get('dataset_source_files')} does not match summary {data['dataset_source_files']}"
             )
+        if sharded_global.get("dataset_source_sample_counts") != dataset_source_sample_counts:
+            raise SystemExit(
+                f"{path} sharded dataset_source_sample_counts {sharded_global.get('dataset_source_sample_counts')} does not match summary {dataset_source_sample_counts}"
+            )
+        verify_source_sample_counts(
+            sharded_global.get("dataset_source_sample_counts"),
+            data["dataset_source_files"],
+            data["dataset_total_samples"],
+            f"{path} sharded global manifest",
+        )
         if sharded_global.get("dataset_fingerprint") != data["dataset_fingerprint"]:
             raise SystemExit(
                 f"{path} sharded dataset_fingerprint {sharded_global.get('dataset_fingerprint')} does not match summary {data['dataset_fingerprint']}"
@@ -251,6 +304,7 @@ for path in rank_summaries:
             "dataset_order_seed": data.get("dataset_order_seed"),
             "dataset_total_samples": data.get("dataset_total_samples"),
             "dataset_source_files": data.get("dataset_source_files"),
+            "dataset_source_sample_counts": data.get("dataset_source_sample_counts"),
             "dataset_fingerprint": data.get("dataset_fingerprint"),
             "streaming_train_batches": data.get("streaming_train_batches"),
             "data_cursor_next": data.get("data_cursor_next"),
