@@ -25,10 +25,25 @@ summaries = sorted(rank_dir.glob("qwen-tp-mlp-nccl-rank-*.json"))
 if len(summaries) != 2:
     raise SystemExit(f"expected 2 TP MLP NCCL rank summaries under {rank_dir}, found {len(summaries)}")
 
+def require_complete_qwen_model_path(path, summary_path):
+    model_path = pathlib.Path(path)
+    missing = [
+        name
+        for name in ("config.json", "tokenizer.json", "model.safetensors")
+        if not (model_path / name).exists()
+    ]
+    if missing:
+        raise SystemExit(
+            f"{summary_path} model_path {model_path} is not a complete Qwen checkpoint; missing {missing}"
+        )
+    return str(model_path)
+
 evidence = []
 intermediate = []
+resolved_model_paths = set()
 for path in summaries:
     data = json.loads(path.read_text())
+    resolved_model_paths.add(require_complete_qwen_model_path(data["model_path"], path))
     rank = int(data["rank"])
     if data["world_size"] != 2:
         raise SystemExit(f"{path} world_size {data['world_size']} != 2")
@@ -64,10 +79,17 @@ intermediate.sort()
 if intermediate[0][0] != 0 or intermediate[0][1] != intermediate[1][0]:
     raise SystemExit(f"intermediate shards are not contiguous: {intermediate}")
 
+if len(resolved_model_paths) != 1:
+    raise SystemExit(f"expected all ranks to resolve the same Qwen model path, got {sorted(resolved_model_paths)}")
+
 launch_summary = json.loads((output_dir / "launch-summary.json").read_text())
 assigned = [rank["assigned_cuda_visible_device"] for rank in launch_summary["ranks"]]
 if len(set(assigned)) != 2:
     raise SystemExit(f"expected distinct launch GPU assignments, got {assigned}")
 
-print(json.dumps({"qwen_tp_mlp_nccl_verified": evidence, "assigned_cuda_visible_devices": assigned}, indent=2))
+print(json.dumps({
+    "qwen_tp_mlp_nccl_verified": evidence,
+    "assigned_cuda_visible_devices": assigned,
+    "resolved_model_path": sorted(resolved_model_paths)[0],
+}, indent=2))
 PY
