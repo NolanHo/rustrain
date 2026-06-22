@@ -24,6 +24,14 @@ Acceptance:
 Representative Qwen smokes do not write a full copy of the base model. They
 write a delta checkpoint against a local HuggingFace checkpoint plus an
 optimizer sidecar.
+`configs/qwen_session_single_sft.toml` exercises the tokenizer-backed
+single-GPU JSONL resume contract for the default representative layer0 trainable
+set. `configs/qwen_session_single_layers07_sft.toml` and
+`configs/qwen_session_single_layers07_sft_bf16.toml` extend that same contract
+to layer0-layer7 in fp32 and bf16 compute. The layer0-layer7 single-rank paths
+expect 98 trainable tensors, including the tied embedding, and must preserve
+manifest-backed dataset provenance plus absolute data cursor continuity across
+external `--resume-from` launches.
 
 Files:
 
@@ -64,6 +72,10 @@ Acceptance:
 - Resume rejects changed JSONL provenance or shuffle semantics when the manifest
   contains dataset metadata; legacy manifests without provenance remain
   loadable.
+- The single-GPU JSONL external resume paths verify cursor continuity,
+  provenance preservation, reload parity, next-step resume parity, and the
+  expected trainable registry. The layer0-layer7 fp32 and bf16 variants both
+  require 98 trainable tensors, including the tied embedding.
 
 ### Single-GPU `tch-rs` MoE Smoke Checkpoints
 

@@ -215,6 +215,8 @@ single-GPU layer0-layer7 path under bf16 compute.
 `configs/qwen_session_single_layers07_sft.toml` extends the single-GPU JSONL
 SFT resume path to layer0-layer7 with 98 trainable tensors and manifest-backed
 data cursor continuity.
+`configs/qwen_session_single_layers07_sft_bf16.toml` verifies the same
+single-GPU layer0-layer7 JSONL SFT resume path under bf16 compute.
 `configs/qwen_session_dp2_layers01.toml` extends the representative DP=2
 trainer path to layer0+layer1. Its verifier expects 25 trainable tensors
 because the representative DP path intentionally excludes the tied embedding
@@ -352,6 +354,8 @@ production-grade sharded checkpoint ownership remain open.
   `configs/qwen_session_single_layers07_sft.toml` extends the single-GPU
   JSONL SFT resume path to layer0-layer7 with 98 trainable tensors and
   manifest-backed data cursor continuity.
+  `configs/qwen_session_single_layers07_sft_bf16.toml` verifies the same
+  single-GPU layer0-layer7 JSONL SFT resume path under bf16 compute.
   `configs/qwen_session_dp2_layers01_sft_bf16.toml`
   verifies the tokenizer-backed layer0+layer1 DP path under bf16 compute, and
   `configs/qwen_session_dp2_layers03_sft_bf16.toml` verifies the
