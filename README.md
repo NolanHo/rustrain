@@ -445,7 +445,10 @@ production-grade sharded checkpoint ownership remain open.
   exact field whitespace. `data.min_response_chars` defaults to `1` and skips
   JSONL records whose normalized response is empty or shorter than the
   configured character count before train/eval splitting, `max_samples`, and
-  streaming offset-index construction.
+  streaming offset-index construction. `data.source_weights` can be empty,
+  length 1, or match `data.paths`; it repeats valid training samples from each
+  configured source before `max_samples` and splitting, while explicit
+  `data.eval_paths` remain unweighted held-out data.
   `cargo run -- qwen-sft-streaming-batch-plan --config ...` resolves the next
   cursor window to raw JSONL source indices, reads and tokenizes only those
   window records, then verifies the padded `input_ids` plus response masks match

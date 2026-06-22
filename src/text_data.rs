@@ -58,6 +58,7 @@ struct SftCache {
     source_paths: Vec<PathBuf>,
     vocab_size: usize,
     min_response_chars: usize,
+    source_weights: Vec<usize>,
     train_samples: Vec<SftSample>,
     eval_samples: Vec<SftSample>,
 }
@@ -153,7 +154,8 @@ pub fn load_sft_dataset(
     cache_dir: &Path,
 ) -> Result<SftDataset> {
     let tokenizer = ByteTokenizer::new(vocab_size);
-    let (mut samples, mut source_paths) = read_sft_paths(data, &data.paths, &tokenizer, seq_len)?;
+    let (mut samples, mut source_paths) =
+        read_sft_paths(data, &data.paths, &tokenizer, seq_len, true)?;
 
     if samples.len() < 2 {
         return Err(anyhow!("SFT dataset needs at least two samples"));
@@ -173,7 +175,7 @@ pub fn load_sft_dataset(
         (samples[..split_at].to_vec(), samples[split_at..].to_vec())
     } else {
         let (eval_samples, eval_source_paths) =
-            read_sft_paths(data, &data.eval_paths, &tokenizer, seq_len)?;
+            read_sft_paths(data, &data.eval_paths, &tokenizer, seq_len, false)?;
         if eval_samples.is_empty() {
             return Err(anyhow!("SFT eval dataset needs at least one sample"));
         }
@@ -191,6 +193,7 @@ pub fn load_sft_dataset(
         &source_paths,
         vocab_size,
         data.min_response_chars,
+        &data.source_weights,
         &dataset,
     )?;
 
@@ -281,10 +284,16 @@ fn read_sft_paths(
     paths: &[PathBuf],
     tokenizer: &ByteTokenizer,
     seq_len: usize,
+    apply_source_weights: bool,
 ) -> Result<(Vec<SftSample>, Vec<PathBuf>)> {
     let mut samples = Vec::new();
     let mut source_paths = Vec::new();
-    for path in paths {
+    let source_weights = if apply_source_weights {
+        sft_source_weights(data, paths.len())?
+    } else {
+        vec![1; paths.len()]
+    };
+    for (path, source_weight) in paths.iter().zip(source_weights.iter().copied()) {
         let files = if path.is_dir() {
             sorted_files(path)?
         } else {
@@ -308,12 +317,36 @@ fn read_sft_paths(
                 if !sft_record_passes_response_filter(&record, data.min_response_chars) {
                     continue;
                 }
-                samples.push(format_sft_sample(data, tokenizer, seq_len, &record)?);
+                let sample = format_sft_sample(data, tokenizer, seq_len, &record)?;
+                for _ in 0..source_weight {
+                    samples.push(sample.clone());
+                }
             }
             source_paths.push(file);
         }
     }
     Ok((samples, source_paths))
+}
+
+fn sft_source_weights(data: &DataConfig, path_count: usize) -> Result<Vec<usize>> {
+    if data.source_weights.is_empty() {
+        return Ok(vec![1; path_count]);
+    }
+    let weights = if data.source_weights.len() == 1 {
+        vec![data.source_weights[0]; path_count]
+    } else if data.source_weights.len() == path_count {
+        data.source_weights.clone()
+    } else {
+        return Err(anyhow!(
+            "data.source_weights must be empty, length 1, or match data.paths length"
+        ));
+    };
+    if weights.iter().any(|weight| *weight == 0) {
+        return Err(anyhow!(
+            "data.source_weights entries must be greater than zero"
+        ));
+    }
+    Ok(weights)
 }
 
 fn instruction_record_from_jsonl_line(data: &DataConfig, line: &str) -> Result<InstructionRecord> {
@@ -438,12 +471,14 @@ fn write_sft_cache(
     source_paths: &[PathBuf],
     vocab_size: usize,
     min_response_chars: usize,
+    source_weights: &[usize],
     dataset: &SftDataset,
 ) -> Result<()> {
     let cache = SftCache {
         source_paths: source_paths.to_vec(),
         vocab_size,
         min_response_chars,
+        source_weights: source_weights.to_vec(),
         train_samples: dataset.train_samples.clone(),
         eval_samples: dataset.eval_samples.clone(),
     };
@@ -495,6 +530,7 @@ mod tests {
                 "Instruction:\n{instruction}\n\nInput:\n{input}\n\nResponse:\n".to_string(),
             trim_fields: true,
             min_response_chars: 1,
+            source_weights: Vec::new(),
         };
         let dataset = load_text_dataset(&data, 64, 8, &cache_dir).expect("dataset should load");
 
@@ -537,6 +573,7 @@ mod tests {
                 "Instruction:\n{instruction}\n\nInput:\n{input}\n\nResponse:\n".to_string(),
             trim_fields: true,
             min_response_chars: 1,
+            source_weights: Vec::new(),
         };
         let dataset = load_text_dataset(&data, 128, 8, &cache_dir).expect("dataset should load");
 
@@ -585,6 +622,7 @@ mod tests {
                 "Instruction:\n{instruction}\n\nInput:\n{input}\n\nResponse:\n".to_string(),
             trim_fields: true,
             min_response_chars: 1,
+            source_weights: Vec::new(),
         };
         let dataset =
             load_sft_dataset(&data, 128, 64, &cache_dir).expect("SFT dataset should load");
@@ -640,6 +678,7 @@ mod tests {
             prompt_with_input_template: "Q: {instruction}\nContext: {input}\nA: ".to_string(),
             trim_fields: true,
             min_response_chars: 1,
+            source_weights: Vec::new(),
         };
         let dataset =
             load_sft_dataset(&data, 128, 96, &cache_dir).expect("SFT dataset should load");
@@ -687,6 +726,7 @@ mod tests {
             prompt_with_input_template: "Q:{instruction}\nI:{input}\nA:".to_string(),
             trim_fields: true,
             min_response_chars: 1,
+            source_weights: Vec::new(),
         };
         let raw_data = DataConfig {
             trim_fields: false,
@@ -761,6 +801,7 @@ mod tests {
                 "Instruction:\n{instruction}\n\nInput:\n{input}\n\nResponse:\n".to_string(),
             trim_fields: true,
             min_response_chars: 1,
+            source_weights: Vec::new(),
         };
         let dataset =
             load_sft_dataset(&data, 128, 64, &cache_dir).expect("SFT dataset should load");
@@ -799,6 +840,7 @@ mod tests {
                 "Instruction:\n{instruction}\n\nInput:\n{input}\n\nResponse:\n".to_string(),
             trim_fields: true,
             min_response_chars: 5,
+            source_weights: Vec::new(),
         };
         let dataset =
             load_sft_dataset(&data, 128, 64, &cache_dir).expect("SFT dataset should load");
@@ -815,6 +857,60 @@ mod tests {
         assert!(second.contains("second"));
         assert!(!first.contains("empty"));
         assert!(!first.contains("short"));
+    }
+
+    #[test]
+    fn sft_dataset_applies_source_weights_before_split_and_limit() {
+        let dir = tempdir().expect("temp dir should be created");
+        let first_dir = dir.path().join("first");
+        let second_dir = dir.path().join("second");
+        let cache_dir = dir.path().join("cache");
+        fs::create_dir_all(&first_dir).expect("first dir should be created");
+        fs::create_dir_all(&second_dir).expect("second dir should be created");
+        fs::create_dir_all(&cache_dir).expect("cache dir should be created");
+        fs::write(
+            first_dir.join("first.jsonl"),
+            "{\"instruction\":\"first\",\"response\":\"alpha\"}\n",
+        )
+        .expect("first jsonl should write");
+        fs::write(
+            second_dir.join("second.jsonl"),
+            "{\"instruction\":\"second\",\"response\":\"beta\"}\n",
+        )
+        .expect("second jsonl should write");
+
+        let data = DataConfig {
+            kind: DataKind::InstructionJsonl,
+            paths: vec![first_dir, second_dir],
+            eval_paths: Vec::new(),
+            train_split: 0.5,
+            max_samples: Some(3),
+            shuffle: false,
+            index_cache: None,
+            instruction_field: "instruction".to_string(),
+            input_field: "input".to_string(),
+            response_field: "response".to_string(),
+            prompt_template: "Instruction:\n{instruction}\n\nResponse:\n".to_string(),
+            prompt_with_input_template:
+                "Instruction:\n{instruction}\n\nInput:\n{input}\n\nResponse:\n".to_string(),
+            trim_fields: true,
+            min_response_chars: 1,
+            source_weights: vec![2, 2],
+        };
+        let dataset =
+            load_sft_dataset(&data, 128, 64, &cache_dir).expect("SFT dataset should load");
+
+        assert_eq!(dataset.train_samples.len(), 1);
+        assert_eq!(dataset.eval_samples.len(), 2);
+        let decoded = dataset
+            .train_samples
+            .iter()
+            .chain(dataset.eval_samples.iter())
+            .map(|sample| dataset.tokenizer.decode_lossy(&sample.tokens))
+            .collect::<Vec<_>>();
+        assert!(decoded[0].contains("first"));
+        assert!(decoded[1].contains("first"));
+        assert!(decoded[2].contains("second"));
     }
 
     #[test]
@@ -847,6 +943,7 @@ mod tests {
                 "Instruction:\n{instruction}\n\nInput:\n{input}\n\nResponse:\n".to_string(),
             trim_fields: true,
             min_response_chars: 1,
+            source_weights: Vec::new(),
         };
         let dataset =
             load_sft_dataset(&data, 128, 64, &cache_dir).expect("SFT dataset should load");

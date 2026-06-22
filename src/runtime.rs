@@ -104,6 +104,8 @@ pub struct DataConfig {
     pub trim_fields: bool,
     #[serde(default = "default_min_response_chars")]
     pub min_response_chars: usize,
+    #[serde(default)]
+    pub source_weights: Vec<usize>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -600,6 +602,7 @@ mod tests {
                 prompt_with_input_template: default_prompt_with_input_template(),
                 trim_fields: default_trim_fields(),
                 min_response_chars: default_min_response_chars(),
+                source_weights: Vec::new(),
             }),
             lora: Some(LoraConfig {
                 rank: 4,
