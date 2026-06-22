@@ -388,7 +388,8 @@ production-grade sharded checkpoint ownership remain open.
   greedy generation reload parity, and focused merge/unmerge parity. It also
   uses the trainer scheduler and grad clipping knobs, logs `eval_every` step
   eval history, applies seeded deterministic dataset ordering, reports dataset
-  sample/token/mask summaries, and has a bf16 variant at
+  sample/token/mask summaries, applies `data.max_samples` during JSONL reading
+  instead of after loading every source file, and has a bf16 variant at
   `configs/qwen_lora_sft_bf16.toml`. Manifest-backed adapter resume rejects
   `compute_kind` drift from the current train dtype; direct `.safetensors`
   adapter resume remains available for compatibility when manifest metadata is
