@@ -11,53 +11,29 @@ HF_ARROW="${RUSTRAIN_HF_SFT_ARROW:-/vePFS-Mindverse/share/huggingface/datasets/i
 DATA_DIR="${WORK_DIR}/data"
 mkdir -p "${DATA_DIR}"
 
-python - "${HF_ARROW}" "${DATA_DIR}" <<'PY'
-import json
+python scripts/export_instruction_arrow_jsonl.py \
+  --input "${HF_ARROW}" \
+  --output "${DATA_DIR}/alpaca.jsonl" \
+  --limit 128 \
+  --response-column output \
+  --metadata-output "${DATA_DIR}/export_metadata.json"
+
+python - "${DATA_DIR}/alpaca.jsonl" "${DATA_DIR}" <<'PY'
 import pathlib
 import sys
 
-import pyarrow.ipc as ipc
-
 source = pathlib.Path(sys.argv[1])
 data_dir = pathlib.Path(sys.argv[2])
-if not source.exists():
-    raise SystemExit(f"HF cached Arrow file is missing: {source}")
-
-with ipc.open_stream(source) as reader:
-    table = reader.read_all()
-
-required_columns = {"instruction", "input", "output"}
-missing = sorted(required_columns.difference(table.schema.names))
-if missing:
-    raise SystemExit(f"{source} is missing required columns: {missing}")
-if table.num_rows < 128:
-    raise SystemExit(f"{source} must contain at least 128 rows, got {table.num_rows}")
-
-rows = []
-for index in range(128):
-    rows.append(
-        {
-            "instruction": table.column("instruction")[index].as_py(),
-            "input": table.column("input")[index].as_py(),
-            "output": table.column("output")[index].as_py(),
-        }
-    )
+lines = source.read_text(encoding="utf-8").splitlines()
+if len(lines) != 128:
+    raise SystemExit(f"expected 128 exported rows, got {len(lines)}")
 
 for shard_index in range(2):
     path = data_dir / f"alpaca_shard_{shard_index}.jsonl"
-    with path.open("w", encoding="utf-8") as handle:
-        for record in rows[shard_index * 64 : (shard_index + 1) * 64]:
-            handle.write(json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n")
-
-metadata = {
-    "source_arrow": str(source),
-    "source_rows": table.num_rows,
-    "exported_rows": len(rows),
-    "columns": table.schema.names,
-}
-(data_dir / "export_metadata.json").write_text(
-    json.dumps(metadata, indent=2, sort_keys=True), encoding="utf-8"
-)
+    path.write_text(
+        "\n".join(lines[shard_index * 64 : (shard_index + 1) * 64]) + "\n",
+        encoding="utf-8",
+    )
 PY
 
 CONFIG="${WORK_DIR}/hf-cache.toml"
@@ -107,7 +83,6 @@ paths = [
 ]
 train_split = 0.75
 shuffle = false
-response_field = "output"
 prompt_template = "Instruction: {instruction}\\nResponse: "
 prompt_with_input_template = "Instruction: {instruction}\\nInput: {input}\\nResponse: "
 
@@ -196,6 +171,8 @@ if metadata["source_rows"] < 100_000 or metadata["exported_rows"] != 128:
 for column in ["instruction", "input", "output"]:
     if column not in metadata["columns"]:
         raise SystemExit(f"HF export metadata missing column {column}: {metadata}")
+if metadata.get("column_map", {}).get("response") != "output":
+    raise SystemExit(f"HF export metadata did not record output response source: {metadata}")
 
 expected_window = [
     {
@@ -345,8 +322,8 @@ if len(cache.get("samples", [])) != 128:
     raise SystemExit(f"cache should contain all 128 raw offsets, got {len(cache.get('samples', []))}")
 if cache.get("source_files") is None or len(cache["source_files"]) != 2:
     raise SystemExit(f"cache should contain two source metadata entries, got {cache.get('source_files')}")
-if cache.get("field_map", {}).get("response") != "output":
-    raise SystemExit(f"cache field_map response should be output: {cache.get('field_map')}")
+if cache.get("field_map", {}).get("response") != "response":
+    raise SystemExit(f"cache field_map response should be exported response: {cache.get('field_map')}")
 summary = cache.get("summary")
 if not isinstance(summary, dict):
     raise SystemExit(f"cache should contain summary metadata, got {summary}")

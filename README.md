@@ -564,10 +564,11 @@ production-grade sharded checkpoint ownership remain open.
   case. The focused GPU suite also exports a small JSONL subset from the
   cached HuggingFace Arrow dataset
   `/vePFS-Mindverse/share/huggingface/datasets/iamtarun___code_instructions_120k_alpaca`,
-  maps its `output` column through `data.response_field`, and runs the same
-  tokenizer-free plan, tokenizer-backed batch parity, cursor wrap, and
-  offset-index cache write/hit checks. A production zero-materialization loader
-  for large external streams is still open.
+  using `scripts/export_instruction_arrow_jsonl.py`, maps its `output` column
+  into the normalized JSONL `response` field, and runs the same tokenizer-free
+  plan, tokenizer-backed batch parity, cursor wrap, and offset-index cache
+  write/hit checks. A production zero-materialization loader for large external
+  streams is still open.
   Production data loading and arbitrary-module LoRA injection are still open.
 - Real Qwen module-level LoRA now uses a target-layer/module registry for
   configured attention and MLP projection modules; trainer-owned full-model LoRA
