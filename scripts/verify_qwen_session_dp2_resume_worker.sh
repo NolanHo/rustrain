@@ -10,7 +10,8 @@ CONFIG="${RUSTRAIN_QWEN_SESSION_DP_CONFIG:-configs/qwen_session_dp2_sft.toml}"
 EXPECTED_DATASET_SEED="${RUSTRAIN_EXPECTED_DATASET_ORDER_SEED:-}"
 EXPECTED_TRAINABLE_TENSORS="${RUSTRAIN_EXPECTED_QWEN_DP_TRAINABLE_TENSORS:-}"
 EXPECTED_TRAINABLE_NAMES="${RUSTRAIN_EXPECTED_QWEN_DP_TRAINABLE_NAMES:-}"
-export BASE_OUTPUT_DIR RESUME_OUTPUT_DIR EXPECTED_DATASET_SEED EXPECTED_TRAINABLE_TENSORS EXPECTED_TRAINABLE_NAMES
+EXPECTED_DTYPE="${RUSTRAIN_EXPECTED_QWEN_COMPUTE_KIND:-}"
+export BASE_OUTPUT_DIR RESUME_OUTPUT_DIR EXPECTED_DATASET_SEED EXPECTED_TRAINABLE_TENSORS EXPECTED_TRAINABLE_NAMES EXPECTED_DTYPE
 
 cargo run -- launch \
   --nproc-per-node 2 \
@@ -48,6 +49,7 @@ base_output_dir = pathlib.Path(os.environ["BASE_OUTPUT_DIR"])
 resume_output_dir = pathlib.Path(os.environ["RESUME_OUTPUT_DIR"])
 expected_dataset_seed = os.environ.get("EXPECTED_DATASET_SEED")
 expected_trainable_tensors = os.environ.get("EXPECTED_TRAINABLE_TENSORS")
+expected_dtype = os.environ.get("EXPECTED_DTYPE")
 expected_trainable_names = [
     name.strip()
     for name in os.environ.get("EXPECTED_TRAINABLE_NAMES", "").split(",")
@@ -59,6 +61,10 @@ if len(base_rank0_paths) != 1:
     raise SystemExit(f"expected one base rank0 summary, found {len(base_rank0_paths)}")
 base_rank0 = json.loads(base_rank0_paths[0].read_text())
 base_cursor_next = int(base_rank0["data_cursor_next"])
+if expected_dtype and base_rank0.get("dtype") != expected_dtype:
+    raise SystemExit(
+        f"base rank0 dtype {base_rank0.get('dtype')} does not match expected {expected_dtype}"
+    )
 if expected_trainable_tensors:
     base_trainable_tensors = base_rank0.get("trainable_tensors")
     if not isinstance(base_trainable_tensors, list):
@@ -82,6 +88,8 @@ for path in resume_summaries:
     data = json.loads(path.read_text())
     if data.get("resumed_checkpoint") is not True:
         raise SystemExit(f"{path} did not report resumed_checkpoint=true")
+    if expected_dtype and data.get("dtype") != expected_dtype:
+        raise SystemExit(f"{path} dtype {data.get('dtype')} does not match expected {expected_dtype}")
     if not data.get("resume_from"):
         raise SystemExit(f"{path} did not report resume_from")
     if int(data["data_cursor_start"]) != base_cursor_next:
@@ -149,6 +157,7 @@ for path in resume_summaries:
             "data_cursor_start": data["data_cursor_start"],
             "data_cursor_next": data["data_cursor_next"],
             "dataset_fingerprint": data["dataset_fingerprint"],
+            "dtype": data.get("dtype"),
             "trainable_tensors": len(trainable_tensors) if isinstance(trainable_tensors, list) else None,
             "reload_delta": data["reload_delta"],
             "sharded_reload_delta": data["sharded_reload_delta"],

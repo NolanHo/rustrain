@@ -172,6 +172,7 @@ remote_run_2gpu env \
   RUSTRAIN_DISTRIBUTED_BASE_OUTPUT_DIR="${OUTPUT_DIR}-layers01-sft-bf16-resume-base" \
   RUSTRAIN_DISTRIBUTED_RESUME_OUTPUT_DIR="${OUTPUT_DIR}-layers01-sft-bf16-resume-continue" \
   RUSTRAIN_QWEN_SESSION_DP_CONFIG=configs/qwen_session_dp2_layers01_sft_bf16.toml \
+  RUSTRAIN_EXPECTED_QWEN_COMPUTE_KIND=bf16 \
   RUSTRAIN_EXPECTED_DATASET_ORDER_SEED=777 \
   RUSTRAIN_EXPECTED_QWEN_DP_TRAINABLE_TENSORS=25 \
   RUSTRAIN_EXPECTED_QWEN_DP_TRAINABLE_NAMES=model.layers.0.self_attn.q_proj.weight,model.layers.0.mlp.down_proj.weight,model.layers.1.self_attn.q_proj.weight,model.layers.1.mlp.down_proj.weight,model.norm.weight \
@@ -202,6 +203,7 @@ remote_run_2gpu env \
   RUSTRAIN_DISTRIBUTED_BASE_OUTPUT_DIR="${OUTPUT_DIR}-layers03-sft-bf16-resume-base" \
   RUSTRAIN_DISTRIBUTED_RESUME_OUTPUT_DIR="${OUTPUT_DIR}-layers03-sft-bf16-resume-continue" \
   RUSTRAIN_QWEN_SESSION_DP_CONFIG=configs/qwen_session_dp2_layers03_sft_bf16.toml \
+  RUSTRAIN_EXPECTED_QWEN_COMPUTE_KIND=bf16 \
   RUSTRAIN_EXPECTED_DATASET_ORDER_SEED=777 \
   RUSTRAIN_EXPECTED_QWEN_DP_TRAINABLE_TENSORS=49 \
   RUSTRAIN_EXPECTED_QWEN_DP_TRAINABLE_NAMES=model.layers.0.self_attn.q_proj.weight,model.layers.0.mlp.down_proj.weight,model.layers.3.self_attn.q_proj.weight,model.layers.3.mlp.down_proj.weight,model.norm.weight \
@@ -212,6 +214,7 @@ remote_run_2gpu env \
   RUSTRAIN_DISTRIBUTED_BASE_OUTPUT_DIR="${OUTPUT_DIR}-layers07-sft-bf16-resume-base" \
   RUSTRAIN_DISTRIBUTED_RESUME_OUTPUT_DIR="${OUTPUT_DIR}-layers07-sft-bf16-resume-continue" \
   RUSTRAIN_QWEN_SESSION_DP_CONFIG=configs/qwen_session_dp2_layers07_sft_bf16.toml \
+  RUSTRAIN_EXPECTED_QWEN_COMPUTE_KIND=bf16 \
   RUSTRAIN_EXPECTED_DATASET_ORDER_SEED=777 \
   RUSTRAIN_EXPECTED_QWEN_DP_TRAINABLE_TENSORS=97 \
   RUSTRAIN_EXPECTED_QWEN_DP_TRAINABLE_NAMES=model.layers.0.self_attn.q_proj.weight,model.layers.0.mlp.down_proj.weight,model.layers.7.self_attn.q_proj.weight,model.layers.7.mlp.down_proj.weight,model.norm.weight \
