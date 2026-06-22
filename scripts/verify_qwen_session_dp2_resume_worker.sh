@@ -66,7 +66,7 @@ expected_dataset_source_files = [
     for source in os.environ.get("EXPECTED_DATASET_SOURCE_FILES", "").split(",")
     if source.strip()
 ]
-expected_dataset_source_sample_counts = {}
+expected_dataset_source_sample_counts = []
 for entry in os.environ.get("EXPECTED_DATASET_SOURCE_SAMPLE_COUNTS", "").split(","):
     entry = entry.strip()
     if not entry:
@@ -74,13 +74,56 @@ for entry in os.environ.get("EXPECTED_DATASET_SOURCE_SAMPLE_COUNTS", "").split("
     path, sep, samples = entry.rpartition(":")
     if not sep or not path:
         raise SystemExit(f"invalid EXPECTED_DATASET_SOURCE_SAMPLE_COUNTS entry: {entry}")
-    expected_dataset_source_sample_counts[path] = int(samples)
+    expected_dataset_source_sample_counts.append({"path": path, "samples": int(samples)})
 expected_dataset_fingerprint = os.environ.get("EXPECTED_DATASET_FINGERPRINT")
 expected_trainable_names = [
     name.strip()
     for name in os.environ.get("EXPECTED_TRAINABLE_NAMES", "").split(",")
     if name.strip()
 ]
+
+def verify_source_sample_counts(data, context):
+    source_files = data.get("dataset_source_files") or []
+    source_counts = data.get("dataset_source_sample_counts") or []
+    if not source_files and not source_counts:
+        return []
+    if not isinstance(source_files, list) or not source_files:
+        raise SystemExit(f"{context} dataset_source_files must be a non-empty list")
+    if not isinstance(source_counts, list) or not source_counts:
+        raise SystemExit(f"{context} dataset_source_sample_counts must be a non-empty list")
+    count_paths = []
+    total_samples = 0
+    normalized = []
+    for entry in source_counts:
+        if not isinstance(entry, dict):
+            raise SystemExit(f"{context} dataset_source_sample_counts entry must be an object: {entry}")
+        path = entry.get("path")
+        samples = entry.get("samples")
+        if not path:
+            raise SystemExit(f"{context} dataset_source_sample_counts entry is missing path: {entry}")
+        if samples is None or int(samples) <= 0:
+            raise SystemExit(f"{context} dataset_source_sample_counts entry must have positive samples: {entry}")
+        count_paths.append(path)
+        total_samples += int(samples)
+        normalized.append({"path": path, "samples": int(samples)})
+    if count_paths != source_files:
+        raise SystemExit(
+            f"{context} dataset_source_sample_counts paths {count_paths} do not match dataset_source_files {source_files}"
+        )
+    total_sample_reference = data.get("dataset_total_samples")
+    if total_sample_reference is None:
+        total_sample_reference = data.get("data_total_samples")
+    if total_sample_reference is None and expected_dataset_total_samples:
+        total_sample_reference = expected_dataset_total_samples
+    if total_sample_reference is not None and total_samples != int(total_sample_reference):
+        raise SystemExit(
+            f"{context} dataset_source_sample_counts total {total_samples} does not match total samples {total_sample_reference}"
+        )
+    if expected_dataset_source_sample_counts and normalized != expected_dataset_source_sample_counts:
+        raise SystemExit(
+            f"{context} dataset_source_sample_counts {normalized} != {expected_dataset_source_sample_counts}"
+        )
+    return normalized
 
 base_rank0_paths = sorted(base_output_dir.rglob("qwen-session-dp-rank-0.json"))
 if len(base_rank0_paths) != 1:
@@ -118,15 +161,7 @@ if expected_dataset_source_files and base_rank0.get("dataset_source_files") != e
     raise SystemExit(
         f"base rank0 dataset_source_files {base_rank0.get('dataset_source_files')} != {expected_dataset_source_files}"
     )
-if expected_dataset_source_sample_counts:
-    base_counts = {
-        entry["path"]: entry["samples"]
-        for entry in base_rank0.get("dataset_source_sample_counts") or []
-    }
-    if base_counts != expected_dataset_source_sample_counts:
-        raise SystemExit(
-            f"base rank0 dataset_source_sample_counts {base_counts} != {expected_dataset_source_sample_counts}"
-        )
+verify_source_sample_counts(base_rank0, "base rank0")
 if expected_dataset_fingerprint and base_rank0.get("dataset_fingerprint") != expected_dataset_fingerprint:
     raise SystemExit(
         f"base rank0 dataset_fingerprint {base_rank0.get('dataset_fingerprint')} != {expected_dataset_fingerprint}"
@@ -188,15 +223,7 @@ for path in resume_summaries:
         raise SystemExit(
             f"{path} dataset_source_files {data.get('dataset_source_files')} != {expected_dataset_source_files}"
         )
-    if expected_dataset_source_sample_counts:
-        counts = {
-            entry["path"]: entry["samples"]
-            for entry in data.get("dataset_source_sample_counts") or []
-        }
-        if counts != expected_dataset_source_sample_counts:
-            raise SystemExit(
-                f"{path} dataset_source_sample_counts {counts} != {expected_dataset_source_sample_counts}"
-            )
+    dataset_source_sample_counts = verify_source_sample_counts(data, str(path))
     if expected_dataset_fingerprint and data.get("dataset_fingerprint") != expected_dataset_fingerprint:
         raise SystemExit(
             f"{path} dataset_fingerprint {data.get('dataset_fingerprint')} != {expected_dataset_fingerprint}"
@@ -245,15 +272,11 @@ for path in resume_summaries:
         raise SystemExit(
             f"{path} manifest dataset_source_files {manifest.get('dataset_source_files')} != {expected_dataset_source_files}"
         )
-    if expected_dataset_source_sample_counts:
-        manifest_counts = {
-            entry["path"]: entry["samples"]
-            for entry in manifest.get("dataset_source_sample_counts") or []
-        }
-        if manifest_counts != expected_dataset_source_sample_counts:
-            raise SystemExit(
-                f"{path} manifest dataset_source_sample_counts {manifest_counts} != {expected_dataset_source_sample_counts}"
-            )
+    manifest_source_sample_counts = verify_source_sample_counts(manifest, f"{path} manifest")
+    if manifest_source_sample_counts != dataset_source_sample_counts:
+        raise SystemExit(
+            f"{path} manifest dataset_source_sample_counts {manifest_source_sample_counts} do not match summary {dataset_source_sample_counts}"
+        )
     if expected_dataset_fingerprint and manifest.get("dataset_fingerprint") != expected_dataset_fingerprint:
         raise SystemExit(
             f"{path} manifest dataset_fingerprint {manifest.get('dataset_fingerprint')} != {expected_dataset_fingerprint}"
@@ -271,15 +294,14 @@ for path in resume_summaries:
         raise SystemExit(
             f"{path} sharded dataset_source_files {sharded_manifest.get('dataset_source_files')} != {expected_dataset_source_files}"
         )
-    if expected_dataset_source_sample_counts:
-        sharded_counts = {
-            entry["path"]: entry["samples"]
-            for entry in sharded_manifest.get("dataset_source_sample_counts") or []
-        }
-        if sharded_counts != expected_dataset_source_sample_counts:
-            raise SystemExit(
-                f"{path} sharded dataset_source_sample_counts {sharded_counts} != {expected_dataset_source_sample_counts}"
-            )
+    sharded_source_sample_counts = verify_source_sample_counts(
+        sharded_manifest,
+        f"{path} sharded manifest",
+    )
+    if sharded_source_sample_counts != dataset_source_sample_counts:
+        raise SystemExit(
+            f"{path} sharded dataset_source_sample_counts {sharded_source_sample_counts} do not match summary {dataset_source_sample_counts}"
+        )
     if expected_dataset_fingerprint and sharded_manifest.get("dataset_fingerprint") != expected_dataset_fingerprint:
         raise SystemExit(
             f"{path} sharded dataset_fingerprint {sharded_manifest.get('dataset_fingerprint')} != {expected_dataset_fingerprint}"
