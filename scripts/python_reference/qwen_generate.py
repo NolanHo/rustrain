@@ -11,6 +11,8 @@ import torch
 from safetensors.torch import save_file
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
+from qwen_model_path import resolve_qwen_model_path
+
 
 DEFAULT_MODEL = Path("/vePFS-Mindverse/share/huggingface/Qwen2.5-0.5B-Instruct")
 DEFAULT_PROMPT = Path("data/parity/qwen_prompt.txt")
@@ -32,18 +34,19 @@ def main() -> None:
         default=Path("data/parity/qwen2_5_0_5b_generate_summary.json"),
     )
     args = parser.parse_args()
+    model_path = resolve_qwen_model_path(args.model_path)
 
     torch.manual_seed(0)
     torch.set_grad_enabled(False)
 
     prompt = args.prompt_file.read_text(encoding="utf-8").strip()
     tokenizer = AutoTokenizer.from_pretrained(
-        args.model_path,
+        model_path,
         local_files_only=True,
         trust_remote_code=True,
     )
     model = AutoModelForCausalLM.from_pretrained(
-        args.model_path,
+        model_path,
         local_files_only=True,
         trust_remote_code=True,
         torch_dtype=torch.float32,
@@ -94,7 +97,7 @@ def main() -> None:
     )
 
     summary = {
-        "model_path": str(args.model_path),
+        "model_path": str(model_path),
         "prompt_file": str(args.prompt_file),
         "prompt": prompt,
         "input_ids": inputs["input_ids"][0].tolist(),

@@ -11,9 +11,19 @@ import torch
 from safetensors.torch import save_file
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
+from qwen_model_path import resolve_qwen_model_path
+
 
 DEFAULT_MODEL = Path("/vePFS-Mindverse/share/huggingface/Qwen2.5-0.5B-Instruct")
 DEFAULT_PROMPT = Path("data/parity/qwen_prompt.txt")
+
+
+def capture_tensor(captures: dict[str, torch.Tensor], name: str, tuple_index: int | None = None):
+    def hook(_module, _inputs, output):
+        tensor = output[tuple_index] if tuple_index is not None else output
+        captures[name] = tensor.detach()
+
+    return hook
 
 
 def main() -> None:
@@ -31,18 +41,19 @@ def main() -> None:
         default=Path("data/parity/qwen_layer0_modules_summary.json"),
     )
     args = parser.parse_args()
+    model_path = resolve_qwen_model_path(args.model_path)
 
     torch.manual_seed(0)
     torch.set_grad_enabled(False)
 
     prompt = args.prompt_file.read_text(encoding="utf-8").strip()
     tokenizer = AutoTokenizer.from_pretrained(
-        args.model_path,
+        model_path,
         local_files_only=True,
         trust_remote_code=True,
     )
     model = AutoModelForCausalLM.from_pretrained(
-        args.model_path,
+        model_path,
         local_files_only=True,
         trust_remote_code=True,
         torch_dtype=torch.float32,
@@ -53,40 +64,29 @@ def main() -> None:
     input_ids = tokenizer(prompt, return_tensors="pt", add_special_tokens=False)["input_ids"]
     layer0 = model.model.layers[0]
     layer1 = model.model.layers[1]
-    hidden = model.model.embed_tokens(input_ids)
-    attention_normed = layer0.input_layernorm(hidden)
-    position_ids = torch.arange(input_ids.shape[1], dtype=torch.long).unsqueeze(0)
-    position_embeddings = model.model.rotary_emb(attention_normed, position_ids)
-    attention_output = layer0.self_attn(
-        hidden_states=attention_normed,
-        attention_mask=None,
-        position_ids=position_ids,
-        past_key_value=None,
-        output_attentions=False,
-        use_cache=False,
-        cache_position=None,
-        position_embeddings=position_embeddings,
-    )[0]
-    layer_output = layer0(
-        hidden_states=hidden,
-        attention_mask=None,
-        position_ids=position_ids,
-        past_key_value=None,
-        output_attentions=False,
-        use_cache=False,
-        cache_position=None,
-        position_embeddings=position_embeddings,
-    )[0]
-    layer1_output = layer1(
-        hidden_states=layer_output,
-        attention_mask=None,
-        position_ids=position_ids,
-        past_key_value=None,
-        output_attentions=False,
-        use_cache=False,
-        cache_position=None,
-        position_embeddings=position_embeddings,
-    )[0]
+    captures: dict[str, torch.Tensor] = {}
+    hooks = [
+        model.model.embed_tokens.register_forward_hook(capture_tensor(captures, "hidden")),
+        layer0.input_layernorm.register_forward_hook(
+            capture_tensor(captures, "attention_normed")
+        ),
+        layer0.self_attn.register_forward_hook(
+            capture_tensor(captures, "attention_output", 0)
+        ),
+        layer0.register_forward_hook(capture_tensor(captures, "layer0_output")),
+        layer1.register_forward_hook(capture_tensor(captures, "layer1_output")),
+    ]
+    try:
+        model(input_ids=input_ids, use_cache=False)
+    finally:
+        for hook in hooks:
+            hook.remove()
+
+    hidden = captures["hidden"]
+    attention_normed = captures["attention_normed"]
+    attention_output = captures["attention_output"]
+    layer_output = captures["layer0_output"]
+    layer1_output = captures["layer1_output"]
     normed = layer0.post_attention_layernorm(hidden)
     mlp_output = layer0.mlp(normed)
 
@@ -106,7 +106,7 @@ def main() -> None:
     )
 
     summary = {
-        "model_path": str(args.model_path),
+        "model_path": str(model_path),
         "prompt_file": str(args.prompt_file),
         "fixture": str(args.output),
         "input_ids": input_ids[0].tolist(),
