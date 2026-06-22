@@ -151,6 +151,8 @@ pub struct DataConfig {
     #[serde(default)]
     pub field_replacements: Vec<FieldReplacement>,
     #[serde(default)]
+    pub normalize_whitespace: bool,
+    #[serde(default)]
     pub source_weights: Vec<usize>,
     #[serde(default)]
     pub source_max_samples: Vec<usize>,
@@ -934,6 +936,7 @@ mod tests {
                 max_sample_chars: None,
                 dedupe_samples: false,
                 field_replacements: Vec::new(),
+                normalize_whitespace: false,
                 source_weights: Vec::new(),
                 source_max_samples: Vec::new(),
                 skip_invalid_records: false,

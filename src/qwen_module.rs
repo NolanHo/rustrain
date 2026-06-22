@@ -1688,6 +1688,8 @@ struct QwenSftFieldMap {
     dedupe_samples: bool,
     #[serde(default)]
     field_replacements: Vec<FieldReplacement>,
+    #[serde(default)]
+    normalize_whitespace: bool,
     source_weights: Vec<usize>,
     #[serde(default)]
     source_max_samples: Vec<usize>,
@@ -1727,6 +1729,7 @@ impl QwenSftFieldMap {
             max_sample_chars: data.max_sample_chars,
             dedupe_samples: data.dedupe_samples,
             field_replacements: data.field_replacements.clone(),
+            normalize_whitespace: data.normalize_whitespace,
             source_weights: data.source_weights.clone(),
             source_max_samples: data.source_max_samples.clone(),
             skip_invalid_records: data.skip_invalid_records,
@@ -1978,6 +1981,7 @@ impl Default for QwenSftFieldMap {
             max_sample_chars: None,
             dedupe_samples: false,
             field_replacements: Vec::new(),
+            normalize_whitespace: false,
             source_weights: Vec::new(),
             source_max_samples: Vec::new(),
             skip_invalid_records: false,
@@ -12006,6 +12010,9 @@ fn qwen_sft_record_from_jsonl_line(
         response,
     };
     qwen_apply_field_replacements(&mut record, &field_map.field_replacements);
+    if field_map.normalize_whitespace {
+        qwen_normalize_record_whitespace(&mut record);
+    }
     Ok(record)
 }
 
@@ -12079,6 +12086,17 @@ fn qwen_apply_field_replacements(record: &mut QwenSftRecord, replacements: &[Fie
                 .replace(&replacement.pattern, &replacement.replacement);
         }
     }
+}
+
+fn qwen_normalize_record_whitespace(record: &mut QwenSftRecord) {
+    record.system = qwen_normalize_whitespace(&record.system);
+    record.instruction = qwen_normalize_whitespace(&record.instruction);
+    record.input = qwen_normalize_whitespace(&record.input);
+    record.response = qwen_normalize_whitespace(&record.response);
+}
+
+fn qwen_normalize_whitespace(value: &str) -> String {
+    value.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 fn qwen_sft_record_dedupe_key(record: &QwenSftRecord) -> String {
@@ -12282,6 +12300,11 @@ fn qwen_sft_hash_field_map(hash: &mut u64, field_map: &QwenSftFieldMap) {
             qwen_sft_hash_bytes(hash, replacement.replacement.as_bytes());
             qwen_sft_hash_bytes(hash, b"\0");
         }
+    }
+    if field_map.normalize_whitespace {
+        qwen_sft_hash_bytes(hash, b"normalize_whitespace");
+        qwen_sft_hash_bytes(hash, b"true");
+        qwen_sft_hash_bytes(hash, b"\0");
     }
     if !field_map.response_contains_any.is_empty() {
         qwen_sft_hash_bytes(hash, b"response_contains_any");
@@ -15012,6 +15035,67 @@ mod tests {
         assert_eq!(streamed.samples, loaded.examples.len());
         assert_eq!(streamed.fingerprint, loaded.fingerprint);
         assert_ne!(loaded.fingerprint, default_fingerprint);
+        assert!(first_cache.cache_written);
+        assert!(cache_mismatch.contains("field_map"));
+    }
+
+    #[test]
+    fn qwen_sft_normalizes_whitespace_after_replacements_before_filters_and_fingerprint() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let jsonl = temp.path().join("samples.jsonl");
+        let cache_path = temp.path().join("cache").join("offset-index.json");
+        fs::write(
+            &jsonl,
+            r#"{"instruction":"Keep PROJECT_TOKEN","response":"approved\t\tanswer"}
+{"instruction":"Also PROJECT_TOKEN","response":"approved   answer"}
+{"instruction":"Drop PROJECT_TOKEN","response":"denied   answer"}
+"#,
+        )
+        .expect("jsonl should write");
+        let paths = vec![jsonl.clone()];
+        let field_map = QwenSftFieldMap {
+            instruction_contains_any: vec!["rust train".to_string()],
+            response_contains_any: vec!["approved answer".to_string()],
+            field_replacements: vec![FieldReplacement {
+                field: FieldReplacementTarget::Instruction,
+                pattern: "PROJECT_TOKEN".to_string(),
+                replacement: "rust   train".to_string(),
+            }],
+            normalize_whitespace: true,
+            ..QwenSftFieldMap::default()
+        };
+        let loaded = qwen_sft_examples_from_jsonl_paths_with_limit(&paths, None, &field_map)
+            .expect("normalized examples should load");
+        let streamed = qwen_sft_streaming_source_summary(&paths, None, &field_map)
+            .expect("normalized streaming summary should scan");
+        let source_index = qwen_sft_streaming_source_index(&paths, None, &field_map)
+            .expect("normalized source index should build");
+        let raw_window = qwen_sft_examples_by_raw_indices(&source_index.samples, &field_map)
+            .expect("normalized raw window should read");
+        let first_cache =
+            qwen_sft_streaming_source_index_with_cache(&paths, None, Some(&cache_path), &field_map)
+                .expect("normalized cache should write");
+        let raw_map = QwenSftFieldMap {
+            normalize_whitespace: false,
+            ..field_map.clone()
+        };
+        let cache_mismatch =
+            qwen_sft_streaming_source_index_with_cache(&paths, None, Some(&cache_path), &raw_map)
+                .expect_err("cache should reject changed whitespace normalization")
+                .to_string();
+        let raw_fingerprint =
+            qwen_sft_streaming_fingerprint(&paths, None, &loaded.source_files, &raw_map)
+                .expect("raw fingerprint should compute");
+
+        assert_eq!(loaded.examples.len(), 2);
+        assert_eq!(loaded.examples[0].instruction, "Keep rust train");
+        assert_eq!(loaded.examples[0].response, "approved answer");
+        assert_eq!(raw_window.examples.len(), loaded.examples.len());
+        assert_eq!(raw_window.examples[1].instruction, "Also rust train");
+        assert_eq!(raw_window.examples[1].response, "approved answer");
+        assert_eq!(streamed.samples, loaded.examples.len());
+        assert_eq!(streamed.fingerprint, loaded.fingerprint);
+        assert_ne!(loaded.fingerprint, raw_fingerprint);
         assert!(first_cache.cache_written);
         assert!(cache_mismatch.contains("field_map"));
     }
