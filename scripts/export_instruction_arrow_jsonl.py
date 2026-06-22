@@ -7,6 +7,7 @@ import argparse
 import json
 from pathlib import Path
 
+import pyarrow as pa
 import pyarrow.ipc as ipc
 
 
@@ -45,8 +46,7 @@ def main() -> None:
     if not args.input.exists():
         raise SystemExit(f"Arrow input is missing: {args.input}")
 
-    with ipc.open_stream(args.input) as reader:
-        table = reader.read_all()
+    table, arrow_ipc_format = read_arrow_table(args.input)
 
     column_map = {
         "instruction": args.instruction_column,
@@ -90,6 +90,7 @@ def main() -> None:
     metadata = {
         "source_arrow": str(args.input),
         "source_rows": table.num_rows,
+        "arrow_ipc_format": arrow_ipc_format,
         "exported_rows": args.limit,
         "columns": table.schema.names,
         "column_map": column_map,
@@ -114,6 +115,21 @@ def write_jsonl(path: Path, rows: list[dict[str, object]]) -> None:
     with path.open("w", encoding="utf-8") as handle:
         for record in rows:
             handle.write(json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n")
+
+
+def read_arrow_table(path: Path) -> tuple[pa.Table, str]:
+    try:
+        with ipc.open_stream(path) as reader:
+            return reader.read_all(), "stream"
+    except (pa.ArrowInvalid, OSError) as stream_error:
+        try:
+            with ipc.open_file(path) as reader:
+                return reader.read_all(), "file"
+        except (pa.ArrowInvalid, OSError) as file_error:
+            raise SystemExit(
+                f"failed to open {path} as Arrow IPC stream or file: "
+                f"stream={stream_error}; file={file_error}"
+            ) from file_error
 
 
 if __name__ == "__main__":

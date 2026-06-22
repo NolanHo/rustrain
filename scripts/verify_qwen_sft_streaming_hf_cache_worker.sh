@@ -152,6 +152,8 @@ if pathlib.Path(metadata["source_arrow"]) != hf_arrow:
     raise SystemExit(f"metadata source_arrow {metadata['source_arrow']} != {hf_arrow}")
 if metadata["source_rows"] < 100_000 or metadata["exported_rows"] != 128:
     raise SystemExit(f"unexpected HF export metadata: {metadata}")
+if metadata.get("arrow_ipc_format") != "stream":
+    raise SystemExit(f"HF export should record Arrow stream format: {metadata}")
 for column in ["instruction", "input", "output"]:
     if column not in metadata["columns"]:
         raise SystemExit(f"HF export metadata missing column {column}: {metadata}")
