@@ -482,6 +482,14 @@ fn sft_source_max_samples(data: &DataConfig, path_count: usize) -> Result<Vec<Op
 fn instruction_record_from_jsonl_line(data: &DataConfig, line: &str) -> Result<InstructionRecord> {
     let values: BTreeMap<String, serde_json::Value> =
         serde_json::from_str(line).context("invalid JSON object")?;
+    if let Some(messages_field) = &data.chat_messages_field {
+        let mut record = instruction_record_from_chat_messages(&values, messages_field, data)?;
+        apply_field_replacements(&mut record, &data.field_replacements);
+        if data.normalize_whitespace {
+            normalize_record_whitespace(&mut record);
+        }
+        return Ok(record);
+    }
     let instruction = normalize_jsonl_field(
         required_jsonl_string_field(&values, &data.instruction_field)?,
         data,
@@ -509,6 +517,65 @@ fn instruction_record_from_jsonl_line(data: &DataConfig, line: &str) -> Result<I
         normalize_record_whitespace(&mut record);
     }
     Ok(record)
+}
+
+fn instruction_record_from_chat_messages(
+    values: &BTreeMap<String, serde_json::Value>,
+    messages_field: &str,
+    data: &DataConfig,
+) -> Result<InstructionRecord> {
+    let messages = match values.get(messages_field) {
+        Some(serde_json::Value::Array(messages)) => messages,
+        Some(_) => return Err(anyhow!("JSONL field {messages_field} must be an array")),
+        None => {
+            return Err(anyhow!(
+                "JSONL record missing required field {messages_field}"
+            ));
+        }
+    };
+    let mut system = String::new();
+    let mut instruction = None;
+    let mut response = None;
+    for (index, message) in messages.iter().enumerate() {
+        let object = match message {
+            serde_json::Value::Object(object) => object,
+            _ => {
+                return Err(anyhow!(
+                    "chat message {messages_field}[{index}] must be an object"
+                ));
+            }
+        };
+        let role = required_chat_message_string_field(object, "role", messages_field, index)?;
+        let content = required_chat_message_string_field(object, "content", messages_field, index)?;
+        let content = normalize_jsonl_field(content, data);
+        match role.as_str() {
+            "system" => {
+                if system.is_empty() {
+                    system = content;
+                } else if !content.is_empty() {
+                    if !system.is_empty() {
+                        system.push('\n');
+                    }
+                    system.push_str(&content);
+                }
+            }
+            "user" | "human" => instruction = Some(content),
+            "assistant" | "gpt" => response = Some(content),
+            _ => {}
+        }
+    }
+    let instruction = instruction
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| anyhow!("chat record missing user message in field {messages_field}"))?;
+    let response = response.filter(|value| !value.is_empty()).ok_or_else(|| {
+        anyhow!("chat record missing assistant message in field {messages_field}")
+    })?;
+    Ok(InstructionRecord {
+        system,
+        instruction,
+        input: String::new(),
+        response,
+    })
 }
 
 fn maybe_instruction_record_from_jsonl_line(
@@ -680,6 +747,23 @@ fn optional_jsonl_string_field(
         Some(serde_json::Value::String(value)) => Ok(value.clone()),
         Some(_) => Err(anyhow!("JSONL field {field} must be a string")),
         None => Ok(String::new()),
+    }
+}
+
+fn required_chat_message_string_field(
+    object: &serde_json::Map<String, serde_json::Value>,
+    field: &str,
+    messages_field: &str,
+    index: usize,
+) -> Result<String> {
+    match object.get(field) {
+        Some(serde_json::Value::String(value)) => Ok(value.clone()),
+        Some(_) => Err(anyhow!(
+            "chat message {messages_field}[{index}].{field} must be a string"
+        )),
+        None => Err(anyhow!(
+            "chat message {messages_field}[{index}] missing required field {field}"
+        )),
     }
 }
 
@@ -2937,6 +3021,88 @@ mod tests {
         assert!(decoded.contains("second"));
         assert!(decoded.contains("third"));
         assert!(!decoded.contains("missing-response"));
+    }
+
+    #[test]
+    fn sft_dataset_supports_chat_messages_records() {
+        let dir = tempdir().expect("temp dir should be created");
+        let data_dir = dir.path().join("sft");
+        let cache_dir = dir.path().join("cache");
+        fs::create_dir_all(&data_dir).expect("sft dir should be created");
+        fs::create_dir_all(&cache_dir).expect("cache dir should be created");
+        fs::write(
+            data_dir.join("chat.jsonl"),
+            "{\"messages\":[{\"role\":\"system\",\"content\":\"Be concise.\"},{\"role\":\"user\",\"content\":\"Name the project.\"},{\"role\":\"assistant\",\"content\":\"rustrain\"}]}\n{\"messages\":[{\"role\":\"system\",\"content\":\"Be concise.\"},{\"role\":\"human\",\"content\":\"Name the language.\"},{\"role\":\"gpt\",\"content\":\"Rust\"}]}\n{\"messages\":[{\"role\":\"system\",\"content\":\"Ignore verbosity.\"},{\"role\":\"user\",\"content\":\"Filtered row.\"},{\"role\":\"assistant\",\"content\":\"skip me\"}]}\n{\"messages\":[{\"role\":\"assistant\",\"content\":\"missing user\"}]}\n",
+        )
+        .expect("jsonl should write");
+
+        let data = DataConfig {
+            kind: DataKind::InstructionJsonl,
+            paths: vec![data_dir],
+            eval_paths: Vec::new(),
+            train_split: 0.5,
+            max_samples: None,
+            max_eval_samples: None,
+            shuffle: false,
+            index_cache: None,
+            instruction_field: "instruction".to_string(),
+            input_field: "input".to_string(),
+            response_field: "response".to_string(),
+            system_field: None,
+            chat_messages_field: Some("messages".to_string()),
+            min_system_chars: None,
+            max_system_chars: None,
+            system_contains_any: vec!["concise".to_string()],
+            system_excludes_any: Vec::new(),
+            prompt_template: "System: {system}\nQ: {instruction}\nA: ".to_string(),
+            prompt_with_input_template: "System: {system}\nQ: {instruction}\nI: {input}\nA: "
+                .to_string(),
+            trim_fields: true,
+            min_response_chars: 1,
+            max_response_chars: None,
+            instruction_contains_any: Vec::new(),
+            instruction_excludes_any: Vec::new(),
+            response_contains_any: Vec::new(),
+            response_excludes_any: Vec::new(),
+            input_contains_any: Vec::new(),
+            input_excludes_any: Vec::new(),
+            min_instruction_chars: None,
+            max_instruction_chars: None,
+            min_input_chars: None,
+            max_input_chars: None,
+            min_prompt_chars: None,
+            max_prompt_chars: None,
+            min_sample_chars: None,
+            max_sample_chars: None,
+            dedupe_samples: false,
+            field_replacements: Vec::new(),
+            normalize_whitespace: false,
+            source_weights: Vec::new(),
+            source_max_samples: Vec::new(),
+            skip_invalid_records: true,
+        };
+        let dataset =
+            load_sft_dataset(&data, 128, 96, &cache_dir).expect("chat SFT dataset should load");
+        let decoded = dataset
+            .train_samples
+            .iter()
+            .chain(dataset.eval_samples.iter())
+            .map(|sample| dataset.tokenizer.decode_lossy(&sample.tokens))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let cache_text =
+            fs::read_to_string(cache_dir.join("sft_tokenized.toml")).expect("cache should read");
+
+        assert_eq!(dataset.train_samples.len(), 1);
+        assert_eq!(dataset.eval_samples.len(), 1);
+        assert!(decoded.contains("System: Be concise."));
+        assert!(decoded.contains("Q: Name the project."));
+        assert!(decoded.contains("rustrain"));
+        assert!(decoded.contains("Rust"));
+        assert!(!decoded.contains("Filtered row"));
+        assert!(!decoded.contains("skip me"));
+        assert!(!decoded.contains("missing user"));
+        assert!(cache_text.contains("chat_messages_field = \"messages\""));
     }
 
     #[test]
