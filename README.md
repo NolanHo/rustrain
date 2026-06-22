@@ -54,6 +54,17 @@ machine. Do not run them directly in the plain SSH shell either; that shell does
 not expose the GPU devices. If a check is worth running, run it on a Ray GPU
 worker.
 
+Current cluster defaults:
+
+- Ray head: `192.168.42.141:6379` (`mint-head`).
+- SSH submission/GPU driver host: `root@192.168.42.106:2222`
+  (`mint-driver`).
+
+Set `RUSTRAIN_RAY_ADDRESS` only when intentionally targeting a different Ray
+cluster. If the shared Ray head file is unavailable, `scripts/gpu_run.sh` falls
+back to `192.168.42.141:6379`; it does not fall back to local or plain-SSH
+execution.
+
 The preferred remote checkout is:
 
 ```sh

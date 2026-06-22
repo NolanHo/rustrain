@@ -77,7 +77,7 @@ if ray_address == "__RUSTRAIN_AUTO_RAY_ADDRESS__":
         with open(ray_head_file, "r", encoding="utf-8") as address_file:
             ray_head = address_file.read().strip()
     except FileNotFoundError:
-        ray_head = "192.168.42.108"
+        ray_head = "192.168.42.141"
     ray_address = f"{ray_head}:6379"
 
 try:

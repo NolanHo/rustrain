@@ -33,6 +33,7 @@ jobs:
       RUSTRAIN_REMOTE_PORT: "2222"
       RUSTRAIN_REMOTE_DIR: /vePFS-Mindverse/user/nolanho/code/rustrain
       RUSTRAIN_REMOTE_PYTHON: /opt/venv/bin/python
+      RUSTRAIN_RAY_ADDRESS: 192.168.42.141:6379
       RUSTRAIN_SYNC_TO_WORKER: ${{ inputs.sync_to_worker }}
       RUSTRAIN_SSH_OPTS: -o StrictHostKeyChecking=no -o UserKnownHostsFile=/tmp/rustrain_gpu_known_hosts -o GlobalKnownHostsFile=/dev/null
     steps:
