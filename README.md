@@ -444,7 +444,9 @@ production-grade sharded checkpoint ownership remain open.
   response strings before template rendering; set it to `false` to preserve
   exact field whitespace. `data.min_response_chars` defaults to `1` and skips
   JSONL records whose normalized response is empty or shorter than the
-  configured character count before train/eval splitting, `max_samples`, and
+  configured character count; `data.max_response_chars` can optionally skip
+  records whose normalized response is longer than the configured character
+  count. Both filters run before train/eval splitting, `max_samples`, and
   streaming offset-index construction. `data.source_weights` can be empty,
   length 1, or match `data.paths`; it repeats valid training samples from each
   configured source before `max_samples` and splitting, while explicit

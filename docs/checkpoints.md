@@ -146,10 +146,10 @@ Acceptance:
   `max_samples`, and the JSONL field mapping from `data.instruction_field`,
   `data.input_field`, and `data.response_field`, plus
   `data.prompt_template`, `data.prompt_with_input_template`, and
-  `data.trim_fields`, `data.min_response_chars`, and training
-  `data.source_weights`, so stale caches from a different external schema,
-  prompt format, normalization policy, response filtering policy, or source
-  weighting policy are rejected.
+  `data.trim_fields`, `data.min_response_chars`, optional
+  `data.max_response_chars`, and training `data.source_weights`, so stale
+  caches from a different external schema, prompt format, normalization policy,
+  response filtering policy, or source weighting policy are rejected.
 - Adapter reload preserves SFT train/eval loss, full-Qwen forward logits, and
   greedy generation output.
 - Merge/unmerge parity is checked for the focused full-Qwen adapter path, with

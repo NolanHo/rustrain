@@ -193,6 +193,7 @@ expected_field_map = {
     "prompt_with_input_template": "Instruction:\n{instruction}\n\nInput:\n{input}\n\nResponse:\n",
     "trim_fields": True,
     "min_response_chars": 1,
+    "max_response_chars": None,
     "source_weights": [],
 }
 for key, expected in expected_field_map.items():

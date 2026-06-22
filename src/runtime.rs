@@ -105,6 +105,8 @@ pub struct DataConfig {
     #[serde(default = "default_min_response_chars")]
     pub min_response_chars: usize,
     #[serde(default)]
+    pub max_response_chars: Option<usize>,
+    #[serde(default)]
     pub source_weights: Vec<usize>,
 }
 
@@ -418,6 +420,18 @@ pub fn validate_config(config: &Config) -> Result<()> {
                 "data.max_samples must be greater than zero when set"
             ));
         }
+        if let Some(max_response_chars) = data.max_response_chars {
+            if max_response_chars == 0 {
+                return Err(anyhow!(
+                    "data.max_response_chars must be greater than zero when set"
+                ));
+            }
+            if max_response_chars < data.min_response_chars {
+                return Err(anyhow!(
+                    "data.max_response_chars must be greater than or equal to data.min_response_chars"
+                ));
+            }
+        }
     }
 
     Ok(())
@@ -602,6 +616,7 @@ mod tests {
                 prompt_with_input_template: default_prompt_with_input_template(),
                 trim_fields: default_trim_fields(),
                 min_response_chars: default_min_response_chars(),
+                max_response_chars: None,
                 source_weights: Vec::new(),
             }),
             lora: Some(LoraConfig {
