@@ -88,6 +88,8 @@ pub struct DataConfig {
     pub max_samples: Option<usize>,
     #[serde(default = "default_data_shuffle")]
     pub shuffle: bool,
+    #[serde(default)]
+    pub index_cache: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

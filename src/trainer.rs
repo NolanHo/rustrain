@@ -158,6 +158,9 @@ pub fn train(config_path: &Path, resume_from: Option<PathBuf>) -> Result<()> {
                 dataset_order_seed = summary.dataset_order_seed,
                 dataset_shuffle = summary.dataset_shuffle,
                 streaming_train_batches = summary.streaming_train_batches,
+                streaming_index_cache_path = ?summary.streaming_index_cache_path,
+                streaming_index_cache_hit = summary.streaming_index_cache_hit,
+                streaming_index_cache_written = summary.streaming_index_cache_written,
                 data_cursor_start = summary.data_cursor_start,
                 data_cursor_end = summary.data_cursor_end,
                 data_cursor_next = summary.data_cursor_next,
@@ -224,6 +227,15 @@ pub fn train(config_path: &Path, resume_from: Option<PathBuf>) -> Result<()> {
             }
             if let Some(streaming_train_batches) = summary.streaming_train_batches {
                 println!("streaming_train_batches: {streaming_train_batches}");
+            }
+            if let Some(streaming_index_cache_path) = &summary.streaming_index_cache_path {
+                println!("streaming_index_cache_path: {streaming_index_cache_path}");
+            }
+            if let Some(streaming_index_cache_hit) = summary.streaming_index_cache_hit {
+                println!("streaming_index_cache_hit: {streaming_index_cache_hit}");
+            }
+            if let Some(streaming_index_cache_written) = summary.streaming_index_cache_written {
+                println!("streaming_index_cache_written: {streaming_index_cache_written}");
             }
             if let Some(data_cursor_start) = summary.data_cursor_start {
                 println!("data_cursor_start: {data_cursor_start}");
@@ -332,6 +344,9 @@ pub fn train(config_path: &Path, resume_from: Option<PathBuf>) -> Result<()> {
             dataset_order_seed = summary.dataset_order_seed,
             dataset_shuffle = summary.dataset_shuffle,
             streaming_train_batches = summary.streaming_train_batches,
+            streaming_index_cache_path = ?summary.streaming_index_cache_path,
+            streaming_index_cache_hit = summary.streaming_index_cache_hit,
+            streaming_index_cache_written = summary.streaming_index_cache_written,
             data_cursor_start = summary.data_cursor_start,
             data_cursor_end = summary.data_cursor_end,
             data_cursor_next = summary.data_cursor_next,
@@ -394,6 +409,17 @@ pub fn train(config_path: &Path, resume_from: Option<PathBuf>) -> Result<()> {
         println!(
             "streaming_train_batches: {}",
             summary.streaming_train_batches
+        );
+        if let Some(streaming_index_cache_path) = &summary.streaming_index_cache_path {
+            println!("streaming_index_cache_path: {streaming_index_cache_path}");
+        }
+        println!(
+            "streaming_index_cache_hit: {}",
+            summary.streaming_index_cache_hit
+        );
+        println!(
+            "streaming_index_cache_written: {}",
+            summary.streaming_index_cache_written
         );
         println!("data_cursor_start: {}", summary.data_cursor_start);
         println!("data_cursor_end: {}", summary.data_cursor_end);

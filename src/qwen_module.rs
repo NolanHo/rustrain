@@ -440,6 +440,9 @@ pub(crate) struct QwenLoraSftTrainSummary {
     pub(crate) dataset_order_seed: u64,
     pub(crate) dataset_shuffle: bool,
     pub(crate) streaming_train_batches: bool,
+    pub(crate) streaming_index_cache_path: Option<String>,
+    pub(crate) streaming_index_cache_hit: bool,
+    pub(crate) streaming_index_cache_written: bool,
     pub(crate) data_cursor_start: usize,
     pub(crate) data_cursor_end: usize,
     pub(crate) data_cursor_next: usize,
@@ -591,6 +594,9 @@ pub(crate) struct QwenFullTrainSmokeSummary {
     pub(crate) dataset_order_seed: Option<u64>,
     pub(crate) dataset_shuffle: Option<bool>,
     pub(crate) streaming_train_batches: Option<bool>,
+    pub(crate) streaming_index_cache_path: Option<String>,
+    pub(crate) streaming_index_cache_hit: Option<bool>,
+    pub(crate) streaming_index_cache_written: Option<bool>,
     pub(crate) data_cursor_start: Option<usize>,
     pub(crate) data_cursor_end: Option<usize>,
     pub(crate) data_cursor_next: Option<usize>,
@@ -653,6 +659,9 @@ struct QwenSessionDpRankSummary {
     dataset_order_seed: Option<u64>,
     dataset_shuffle: Option<bool>,
     streaming_train_batches: Option<bool>,
+    streaming_index_cache_path: Option<String>,
+    streaming_index_cache_hit: Option<bool>,
+    streaming_index_cache_written: Option<bool>,
     data_cursor_start: Option<usize>,
     data_cursor_end: Option<usize>,
     data_cursor_next: Option<usize>,
@@ -1457,6 +1466,9 @@ struct QwenSessionBatchPlan {
     dataset_order_seed: Option<u64>,
     dataset_shuffle: Option<bool>,
     streaming_train_batches: Option<bool>,
+    streaming_index_cache_path: Option<String>,
+    streaming_index_cache_hit: Option<bool>,
+    streaming_index_cache_written: Option<bool>,
     train_sample_count: Option<usize>,
     data_epoch_start: Option<usize>,
     data_epoch_end: Option<usize>,
@@ -1481,6 +1493,9 @@ struct QwenSessionDpBatchPlan {
     dataset_order_seed: Option<u64>,
     dataset_shuffle: Option<bool>,
     streaming_train_batches: Option<bool>,
+    streaming_index_cache_path: Option<String>,
+    streaming_index_cache_hit: Option<bool>,
+    streaming_index_cache_written: Option<bool>,
     train_sample_count: Option<usize>,
     data_epoch_start: Option<usize>,
     data_epoch_end: Option<usize>,
@@ -2442,6 +2457,9 @@ pub fn qwen_lora_sft_smoke(
     let lora_config = QwenLoraConfig::layer0_qv(rank, alpha)?;
     let sft_paths = sft_jsonl.map(|path| vec![path.to_path_buf()]);
     let checkpoint_dir = adapter_output.parent().unwrap_or_else(|| Path::new("."));
+    let streaming_index_cache = sft_paths
+        .as_ref()
+        .map(|_| qwen_sft_streaming_index_cache_path(checkpoint_dir, "qwen-lora-sft"));
     let summary = qwen_lora_sft_train(
         model_path,
         adapter_output,
@@ -2462,6 +2480,7 @@ pub fn qwen_lora_sft_smoke(
         0,
         QwenComputeDType::Fp32,
         QwenLoraSftTrainPolicy::constant_without_clip(),
+        streaming_index_cache.as_deref(),
     )?;
     println!("{}", serde_json::to_string_pretty(&summary)?);
 
@@ -2515,6 +2534,10 @@ pub fn train_qwen_lora_sft_from_config(
     let adapter_output = run_paths
         .checkpoints
         .join("qwen-lora-sft-adapter.safetensors");
+    let streaming_index_cache = data
+        .index_cache
+        .clone()
+        .unwrap_or_else(|| qwen_sft_streaming_index_cache_path(&run_paths.cache, "qwen-lora-sft"));
     qwen_lora_sft_train(
         model_path,
         &adapter_output,
@@ -2535,6 +2558,7 @@ pub fn train_qwen_lora_sft_from_config(
         config.train.eval_every,
         dtype,
         QwenLoraSftTrainPolicy::from_config(config),
+        Some(&streaming_index_cache),
     )
 }
 
@@ -2559,6 +2583,7 @@ fn qwen_lora_sft_train(
     eval_every: u64,
     dtype: QwenComputeDType,
     policy: QwenLoraSftTrainPolicy,
+    streaming_index_cache: Option<&Path>,
 ) -> Result<QwenLoraSftTrainSummary> {
     if learning_rate <= 0.0 {
         bail!("learning_rate must be positive");
@@ -2727,7 +2752,7 @@ fn qwen_lora_sft_train(
                 policy.dataset_order_seed,
                 data_cursor_start,
                 steps * gradient_accumulation_steps * train_batch_size,
-                None,
+                streaming_index_cache,
             )
         })
         .transpose()?;
@@ -3067,6 +3092,13 @@ fn qwen_lora_sft_train(
         dataset_order_seed: policy.dataset_order_seed,
         dataset_shuffle: dataset_summary.shuffle,
         streaming_train_batches: streaming_window.is_some(),
+        streaming_index_cache_path: streaming_index_cache.map(|path| path.display().to_string()),
+        streaming_index_cache_hit: streaming_window
+            .as_ref()
+            .is_some_and(|window| window.source_index_cache_hit),
+        streaming_index_cache_written: streaming_window
+            .as_ref()
+            .is_some_and(|window| window.source_index_cache_written),
         data_cursor_start,
         data_cursor_end,
         data_cursor_next,
@@ -3391,6 +3423,9 @@ fn qwen_full_train_summary(
         dataset_order_seed: None,
         dataset_shuffle: None,
         streaming_train_batches: None,
+        streaming_index_cache_path: None,
+        streaming_index_cache_hit: None,
+        streaming_index_cache_written: None,
         data_cursor_start: None,
         data_cursor_end: None,
         data_cursor_next: None,
@@ -3462,6 +3497,9 @@ fn qwen_session_single_summary(
         data_cursor_start,
         train_steps,
         runtime_config,
+        runtime_config
+            .and_then(|config| config.data.as_ref())
+            .and_then(|data| data.index_cache.as_deref()),
     )?;
     if let Some(manifest) = loaded_manifest.as_ref() {
         qwen_validate_optional_sft_resume_dataset(
@@ -3509,7 +3547,11 @@ fn qwen_session_single_summary(
     let mut final_step_grad_norm = 0.0;
     let train_started = Instant::now();
     for step in start_step..=end_step {
-        let batch_index = data_cursor_start + (step - start_step) * batch_plan.batch_size;
+        let batch_index = if batch_plan.train_sample_count.is_some() {
+            (step - start_step) * batch_plan.batch_size
+        } else {
+            data_cursor_start + (step - start_step) * batch_plan.batch_size
+        };
         let input_ids = batch_plan
             .train_batches
             .get(batch_index)
@@ -3621,7 +3663,11 @@ fn qwen_session_single_summary(
     }
 
     let next_step = end_step + 1;
-    let next_batch_index = data_cursor_next;
+    let next_batch_index = if batch_plan.train_sample_count.is_some() {
+        train_steps * batch_plan.batch_size
+    } else {
+        data_cursor_next
+    };
     let next_batch = batch_plan
         .train_batches
         .get(next_batch_index)
@@ -3668,6 +3714,9 @@ fn qwen_session_single_summary(
         dataset_order_seed: batch_plan.dataset_order_seed,
         dataset_shuffle: batch_plan.dataset_shuffle,
         streaming_train_batches: batch_plan.streaming_train_batches,
+        streaming_index_cache_path: batch_plan.streaming_index_cache_path,
+        streaming_index_cache_hit: batch_plan.streaming_index_cache_hit,
+        streaming_index_cache_written: batch_plan.streaming_index_cache_written,
         data_cursor_start: batch_plan.train_sample_count.map(|_| data_cursor_start),
         data_cursor_end: batch_plan.train_sample_count.map(|_| data_cursor_end),
         data_cursor_next: batch_plan.train_sample_count.map(|_| data_cursor_next),
@@ -4608,6 +4657,18 @@ pub fn qwen_session_dp_rank_smoke(
     } else {
         (1, 0)
     };
+    let runtime_data = runtime_config.and_then(|config| config.data.as_ref());
+    let dp_streaming_index_cache = runtime_data.map(|data| {
+        data.index_cache
+            .as_ref()
+            .map(|path| qwen_sft_rank_index_cache_path(path, rank))
+            .unwrap_or_else(|| {
+                qwen_sft_streaming_index_cache_path(
+                    &output_dir.join(format!("rank-{rank}-cache")),
+                    "qwen-session-dp",
+                )
+            })
+    });
     let batch_plan = qwen_session_dp_batch_plan_from_config(
         model_path,
         &weights,
@@ -4616,6 +4677,7 @@ pub fn qwen_session_dp_rank_smoke(
         world_size,
         device,
         runtime_config,
+        dp_streaming_index_cache.as_deref(),
     )?;
     if let Some(manifest) = loaded_manifest.as_ref() {
         qwen_validate_optional_sft_resume_dataset(
@@ -5128,6 +5190,9 @@ pub fn qwen_session_dp_rank_smoke(
         dataset_order_seed: batch_plan.dataset_order_seed,
         dataset_shuffle: batch_plan.dataset_shuffle,
         streaming_train_batches: batch_plan.streaming_train_batches,
+        streaming_index_cache_path: batch_plan.streaming_index_cache_path,
+        streaming_index_cache_hit: batch_plan.streaming_index_cache_hit,
+        streaming_index_cache_written: batch_plan.streaming_index_cache_written,
         data_cursor_start: batch_plan.train_sample_count.map(|_| data_cursor_start),
         data_cursor_end: batch_plan.train_sample_count.map(|_| data_cursor_end),
         data_cursor_next: batch_plan.train_sample_count.map(|_| data_cursor_next),
@@ -8744,6 +8809,9 @@ fn qwen_session_fixed_batch_plan(
         dataset_order_seed: None,
         dataset_shuffle: None,
         streaming_train_batches: None,
+        streaming_index_cache_path: None,
+        streaming_index_cache_hit: None,
+        streaming_index_cache_written: None,
         train_sample_count: None,
         data_epoch_start: None,
         data_epoch_end: None,
@@ -8762,6 +8830,7 @@ fn qwen_session_batch_plan_from_config(
     data_cursor_start: usize,
     train_steps: usize,
     runtime_config: Option<&Config>,
+    streaming_index_cache: Option<&Path>,
 ) -> Result<QwenSessionBatchPlan> {
     let Some(runtime_config) = runtime_config else {
         return qwen_session_fixed_batch_plan(weights, data_cursor_start, train_steps);
@@ -8791,7 +8860,7 @@ fn qwen_session_batch_plan_from_config(
         .micro_batch_size
         .min(train_dataset.len())
         .max(1);
-    let required_batches = data_cursor_start + train_steps * batch_size + 1;
+    let required_batches = train_steps * batch_size + 1;
     let data_cursor_end = data_cursor_start + train_steps * batch_size;
     let data_cursor_next = data_cursor_end;
     let (data_epoch_start, data_sample_offset_start) =
@@ -8810,7 +8879,7 @@ fn qwen_session_batch_plan_from_config(
         runtime_config.run.seed,
         data_cursor_start,
         required_batches + batch_size - 1,
-        None,
+        streaming_index_cache,
     )?;
     let train_batches = (0..required_batches)
         .map(|relative_cursor| {
@@ -8855,6 +8924,9 @@ fn qwen_session_batch_plan_from_config(
         dataset_order_seed: Some(runtime_config.run.seed),
         dataset_shuffle: Some(dataset_summary.shuffle),
         streaming_train_batches: Some(true),
+        streaming_index_cache_path: streaming_index_cache.map(|path| path.display().to_string()),
+        streaming_index_cache_hit: Some(streaming_window.source_index_cache_hit),
+        streaming_index_cache_written: Some(streaming_window.source_index_cache_written),
         train_sample_count: Some(train_dataset.len()),
         data_epoch_start: Some(data_epoch_start),
         data_epoch_end: Some(data_epoch_end),
@@ -8888,6 +8960,9 @@ fn qwen_session_fixed_dp_batch_plan(
         dataset_order_seed: None,
         dataset_shuffle: None,
         streaming_train_batches: None,
+        streaming_index_cache_path: None,
+        streaming_index_cache_hit: None,
+        streaming_index_cache_written: None,
         train_sample_count: None,
         data_epoch_start: None,
         data_epoch_end: None,
@@ -8908,6 +8983,7 @@ fn qwen_session_dp_batch_plan_from_config(
     world_size: usize,
     device: Device,
     runtime_config: Option<&Config>,
+    streaming_index_cache: Option<&Path>,
 ) -> Result<QwenSessionDpBatchPlan> {
     let Some(runtime_config) = runtime_config else {
         return qwen_session_fixed_dp_batch_plan(weights, device, train_steps);
@@ -8957,7 +9033,7 @@ fn qwen_session_dp_batch_plan_from_config(
         runtime_config.run.seed,
         data_cursor_start,
         required_batches + global_batch_size - 1,
-        None,
+        streaming_index_cache,
     )?;
     let global_train_batches = (0..required_batches)
         .map(|relative_cursor| {
@@ -9001,6 +9077,9 @@ fn qwen_session_dp_batch_plan_from_config(
         dataset_order_seed: Some(runtime_config.run.seed),
         dataset_shuffle: Some(dataset_summary.shuffle),
         streaming_train_batches: Some(true),
+        streaming_index_cache_path: streaming_index_cache.map(|path| path.display().to_string()),
+        streaming_index_cache_hit: Some(streaming_window.source_index_cache_hit),
+        streaming_index_cache_written: Some(streaming_window.source_index_cache_written),
         train_sample_count: Some(train_dataset.len()),
         data_epoch_start: Some(data_epoch_start),
         data_epoch_end: Some(data_epoch_end),
@@ -10425,6 +10504,23 @@ fn qwen_sft_streaming_cursor_window(
             })
         })
         .collect()
+}
+
+fn qwen_sft_streaming_index_cache_path(base_dir: &Path, label: &str) -> PathBuf {
+    base_dir.join(format!("{label}-offset-index.json"))
+}
+
+fn qwen_sft_rank_index_cache_path(path: &Path, rank: usize) -> PathBuf {
+    let extension = path.extension().and_then(|extension| extension.to_str());
+    let stem = path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or("offset-index");
+    let file_name = match extension {
+        Some(extension) if !extension.is_empty() => format!("{stem}.rank-{rank}.{extension}"),
+        _ => format!("{stem}.rank-{rank}"),
+    };
+    path.with_file_name(file_name)
 }
 
 fn qwen_sft_streaming_token_window_from_jsonl(
@@ -14036,6 +14132,21 @@ not-json
                 Err(error) => error.to_string(),
             };
         assert!(mismatch.contains("max_samples"));
+    }
+
+    #[test]
+    fn qwen_sft_rank_index_cache_path_keeps_extension() {
+        let path = PathBuf::from("/tmp/rustrain/cache/offset-index.json");
+        assert_eq!(
+            qwen_sft_rank_index_cache_path(&path, 1),
+            PathBuf::from("/tmp/rustrain/cache/offset-index.rank-1.json")
+        );
+
+        let no_extension = PathBuf::from("/tmp/rustrain/cache/offset-index");
+        assert_eq!(
+            qwen_sft_rank_index_cache_path(&no_extension, 2),
+            PathBuf::from("/tmp/rustrain/cache/offset-index.rank-2")
+        );
     }
 
     #[test]
