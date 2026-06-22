@@ -125,6 +125,12 @@ configs must preserve the same cursor/provenance fields, but the expected
 trainable registry expands to 49 tensors for layers 0 through 3 plus final norm.
 Both the fp32 and bf16 layer0-layer3 SFT resume paths still exclude the tied
 embedding by design.
+`configs/qwen_session_dp2_layers07_sft.toml` and
+`configs/qwen_session_dp2_layers07_sft_bf16.toml` extend that same external
+resume contract to the layer0-layer7 representative JSONL DP path. These paths
+expect 97 trainable tensors for layers 0 through 7 plus final norm, keep the
+same dataset cursor/provenance requirements, and still exclude the tied
+embedding by design.
 
 Rank0 artifacts:
 
@@ -163,6 +169,9 @@ Acceptance:
   summaries and manifest.
 - The layer0-layer3 JSONL external resume paths verify the same cursor
   continuity contract and the 49-tensor trainable registry for both fp32 and
+  bf16 resumed summaries and manifests.
+- The layer0-layer7 JSONL external resume paths verify the same cursor
+  continuity contract and the 97-tensor trainable registry for both fp32 and
   bf16 resumed summaries and manifests.
 
 ### Representative Sharded Checkpoints and Future Production
