@@ -73,6 +73,9 @@ Acceptance:
 
 - Applying the manifest to the base model reproduces the post-step loss within
   tolerance.
+- Verifiers reject Qwen delta manifests unless `base_model_path` points to a
+  resolved complete Qwen checkpoint containing `config.json`, `tokenizer.json`,
+  and `model.safetensors`.
 - Reloading both deltas and optimizer slots reproduces the next AdamW step
   within tolerance against a continuous in-memory run.
 - Missing tensor names, malformed optimizer slot names, and unsupported format
@@ -104,7 +107,9 @@ Files:
 The adapter manifest must record:
 
 - `format = "rustrain.qwen_lora_sft_adapter.v1"`.
-- `base_model_path` and `adapter_safetensors`.
+- `base_model_path` and `adapter_safetensors`. `base_model_path` must point to
+  the resolved complete Qwen checkpoint directory, not an incomplete legacy
+  top-level path.
 - `compute_kind`, `steps`, and `train_step`.
 - Dataset provenance: `dataset_source_files`,
   `dataset_source_sample_counts`, `dataset_fingerprint`,
@@ -118,6 +123,9 @@ Acceptance:
 
 - Resuming from the adapter manifest rejects changed LoRA target layers/modules
   and changed JSONL provenance.
+- Adapter verifiers reject manifests unless `base_model_path` contains the
+  complete Qwen checkpoint files: `config.json`, `tokenizer.json`, and
+  `model.safetensors`.
 - Manifest-backed resume rejects `compute_kind` drift between the saved adapter
   manifest and the current train dtype. Direct `.safetensors` adapter resume
   without manifest metadata remains a compatibility path and cannot enforce

@@ -236,6 +236,10 @@ SFT resume path to layer0-layer7 with 98 trainable tensors and manifest-backed
 data cursor continuity.
 `configs/qwen_session_single_layers07_sft_bf16.toml` verifies the same
 single-GPU layer0-layer7 JSONL SFT resume path under bf16 compute.
+Single-GPU Qwen delta manifests and Qwen LoRA SFT adapter manifests also record
+the resolved complete Qwen checkpoint in `base_model_path`; their verifiers
+reject manifests whose recorded checkpoint is missing `config.json`,
+`tokenizer.json`, or `model.safetensors`.
 `configs/qwen_session_dp2_layers01.toml` extends the representative DP=2
 trainer path to layer0+layer1. Its verifier expects 25 trainable tensors
 because the representative DP path intentionally excludes the tied embedding
@@ -362,9 +366,11 @@ production-grade sharded checkpoint ownership remain open.
   single-GPU plus DP=2 config paths are wired through `train --config`. The
   single-GPU path now respects configured `max_steps` and reports step losses.
   It can also resume from its saved delta manifest through `--resume-from` and
-  reports throughput, gradient norm, RSS, and GPU memory metrics. The session
-  registry can now expand configured trainable layer sets instead of being
-  fixed to layer0, and `configs/qwen_session_single_sft.toml` feeds
+  reports throughput, gradient norm, RSS, and GPU memory metrics. The saved
+  delta manifest records the resolved complete Qwen `base_model_path`, and the
+  single-GPU verifiers reject incomplete legacy paths. The session registry can
+  now expand configured trainable layer sets instead of being fixed to layer0,
+  and `configs/qwen_session_single_sft.toml` feeds
   tokenizer-backed instruction JSONL batches through the same trainer path.
   `configs/qwen_session_dp2_sft.toml` extends that representative JSONL batch
   path through the 2-rank DP trainer. `configs/qwen_session_dp2_layers01.toml`
@@ -420,7 +426,8 @@ production-grade sharded checkpoint ownership remain open.
   `compute_kind` drift from the current train dtype; direct `.safetensors`
   adapter resume remains available for compatibility when manifest metadata is
   absent, restores adapter weights, and writes a fresh manifest without claiming
-  saved data-cursor continuity.
+  saved data-cursor continuity. The adapter manifest records the same resolved
+  complete Qwen `base_model_path` contract as delta checkpoints.
   `cargo run -- qwen-sft-streaming-data-plan --config ...` provides a
   tokenizer-free streaming JSONL scan for SFT provenance, source sample counts,
   split sizes, explicit `data.eval_paths`, fingerprints, and cursor/epoch
