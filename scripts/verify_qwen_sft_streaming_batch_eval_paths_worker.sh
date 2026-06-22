@@ -92,7 +92,7 @@ if sum(int(entry["samples"]) for entry in source_counts) != int(data["dataset_to
     raise SystemExit(
         f"dataset_source_sample_counts total {source_counts} != dataset_total_samples {data['dataset_total_samples']}"
     )
-if data.get("dataset_fingerprint") != "f771c261589611be":
+if data.get("dataset_fingerprint") != "ed5e6bf28c5bdbfe":
     raise SystemExit(f"unexpected dataset_fingerprint {data.get('dataset_fingerprint')}")
 
 raw_indices = data.get("streaming_raw_sample_indices") or []
