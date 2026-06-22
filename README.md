@@ -31,7 +31,7 @@ checkout:
 scripts/gpu_run.sh cargo check
 ```
 
-Run the focused verification suite:
+Run the focused single-GPU verification suite:
 
 ```sh
 scripts/verify_gpu.sh
@@ -45,14 +45,16 @@ scripts/verify_gpu_distributed.sh
 
 Both scripts SSH to `root@192.168.42.106:2222`, submit work to Ray with GPU
 resources, enter the remote checkout, and source `scripts/tch_a800_env.sh`
-before running project commands. `scripts/gpu_run.sh`, `scripts/verify_gpu.sh`,
-and `scripts/verify_gpu_distributed.sh` all stage the current working tree by
+before running project commands. The focused suite uses the default one-GPU Ray
+worker path; DP/TP/EP and other two-rank checks live in
+`scripts/verify_gpu_distributed.sh`, which reserves two Ray GPUs for each
+command. `scripts/gpu_run.sh`, `scripts/verify_gpu.sh`, and
+`scripts/verify_gpu_distributed.sh` all stage the current working tree by
 default; set `RUSTRAIN_SYNC_TO_WORKER=0` only when you explicitly want to
-validate the remote checkout as-is. Do not run `cargo check`,
-`cargo test`, train smokes, parity commands, or local CPU checks on the local
-machine. Do not run them directly in the plain SSH shell either; that shell does
-not expose the GPU devices. If a check is worth running, run it on a Ray GPU
-worker.
+validate the remote checkout as-is. Do not run `cargo check`, `cargo test`,
+train smokes, parity commands, or local CPU checks on the local machine. Do not
+run them directly in the plain SSH shell either; that shell does not expose the
+GPU devices. If a check is worth running, run it on a Ray GPU worker.
 
 Current cluster defaults:
 
@@ -259,9 +261,11 @@ SFT data plan applies `data.max_samples` before train/eval splitting, keeps
 global cursor math consistent with the truncated train set, and records only
 consumed source files in provenance. Its resume verifier also checks that the
 rank0 and sharded checkpoint manifests preserve the truncated provenance and
-continue from the saved global cursor. DP=2 JSONL train batches use the same
-raw-index streaming window as the single-GPU path, with the materialized
-dataset retained as a parity guard.
+continue from the saved global cursor. The DP2 max-samples and eval-paths
+data-plan verifiers run from `scripts/verify_gpu_distributed.sh`, so they use
+the same two-GPU Ray reservation as the rest of the distributed suite. DP=2
+JSONL train batches use the same raw-index streaming window as the single-GPU
+path, with the materialized dataset retained as a parity guard.
 `configs/qwen_session_dp2_layers01_sft_bf16.toml`
 verifies the layer0+layer1 tokenizer-backed DP path under bf16 compute,
 `configs/qwen_session_dp2_layers03_sft_bf16.toml` verifies the layer0-layer3
