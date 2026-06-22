@@ -31,7 +31,8 @@ set. `configs/qwen_session_single_layers07_sft.toml` and
 to layer0-layer7 in fp32 and bf16 compute. The layer0-layer7 single-rank paths
 expect 98 trainable tensors, including the tied embedding, and must preserve
 manifest-backed dataset provenance plus absolute data cursor continuity across
-external `--resume-from` launches.
+external `--resume-from` launches. The bf16 layer0-layer7 path also asserts
+`compute_kind = bf16`.
 
 Files:
 
@@ -75,7 +76,8 @@ Acceptance:
 - The single-GPU JSONL external resume paths verify cursor continuity,
   provenance preservation, reload parity, next-step resume parity, and the
   expected trainable registry. The layer0-layer7 fp32 and bf16 variants both
-  require 98 trainable tensors, including the tied embedding.
+  require 98 trainable tensors, including the tied embedding. The bf16 variant
+  also asserts `compute_kind = bf16`.
 
 ### Single-GPU `tch-rs` MoE Smoke Checkpoints
 
