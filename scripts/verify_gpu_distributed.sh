@@ -115,6 +115,15 @@ remote_run_2gpu env \
 
 remote_run_2gpu env \
   RUSTRAIN_LAUNCH_TIMEOUT_SECS=900 \
+  RUSTRAIN_DISTRIBUTED_VERIFY_OUTPUT_DIR="${OUTPUT_DIR}-layers07-sft" \
+  RUSTRAIN_QWEN_SESSION_DP_LAYERS_CONFIG=configs/qwen_session_dp2_layers07_sft.toml \
+  RUSTRAIN_EXPECTED_QWEN_DP_TRAINABLE_TENSORS=97 \
+  RUSTRAIN_EXPECTED_QWEN_DP_TRAINABLE_NAMES=model.layers.0.self_attn.q_proj.weight,model.layers.0.mlp.down_proj.weight,model.layers.7.self_attn.q_proj.weight,model.layers.7.mlp.down_proj.weight,model.norm.weight \
+  RUSTRAIN_EXPECTED_DATASET_ORDER_SEED=777 \
+  bash scripts/verify_qwen_session_dp2_layers01_worker.sh
+
+remote_run_2gpu env \
+  RUSTRAIN_LAUNCH_TIMEOUT_SECS=900 \
   RUSTRAIN_DISTRIBUTED_VERIFY_OUTPUT_DIR="${OUTPUT_DIR}-layers03-sft-bf16" \
   RUSTRAIN_QWEN_SESSION_DP_LAYERS_CONFIG=configs/qwen_session_dp2_layers03_sft_bf16.toml \
   RUSTRAIN_EXPECTED_QWEN_COMPUTE_KIND=bf16 \
