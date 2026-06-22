@@ -19,24 +19,14 @@ import json
 import pathlib
 import sys
 
+sys.path.insert(0, str(pathlib.Path("scripts").resolve()))
+from qwen_verify_utils import require_complete_qwen_model_path
+
 output_dir = pathlib.Path(sys.argv[1])
 rank_dir = output_dir / "ranks"
 summaries = sorted(rank_dir.glob("qwen-tp-attention-nccl-rank-*.json"))
 if len(summaries) != 2:
     raise SystemExit(f"expected 2 TP attention NCCL rank summaries under {rank_dir}, found {len(summaries)}")
-
-def require_complete_qwen_model_path(path, summary_path):
-    model_path = pathlib.Path(path)
-    missing = [
-        name
-        for name in ("config.json", "tokenizer.json", "model.safetensors")
-        if not (model_path / name).exists()
-    ]
-    if missing:
-        raise SystemExit(
-            f"{summary_path} model_path {model_path} is not a complete Qwen checkpoint; missing {missing}"
-        )
-    return str(model_path)
 
 evidence = []
 q_heads = []
