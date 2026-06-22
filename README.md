@@ -421,8 +421,9 @@ production-grade sharded checkpoint ownership remain open.
   dataset metadata as a parity guard. Those trainer summaries now expose
   `streaming_train_batches = true` for tokenizer-backed JSONL SFT runs, and the
   focused LoRA, single-GPU session, and DP session verifiers require that field
-  so stdout or rank JSON cannot pass while hiding a materialized train-batch
-  path. When explicit `data.eval_paths` are configured, the streaming window
+  in summaries and checkpoint manifests so stdout, rank JSON, or saved
+  artifacts cannot pass while hiding a materialized train-batch path. When
+  explicit `data.eval_paths` are configured, the streaming window
   keeps the full train source instead of applying `train_split` to it; the
   focused GPU suite checks both the
   tokenizer-free data plan and tokenizer-backed batch-plan parity for that
