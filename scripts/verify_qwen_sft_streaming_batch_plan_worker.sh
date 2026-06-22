@@ -180,8 +180,20 @@ for context, summary, expected_hit, expected_written in [
 if not cache_path.exists() or cache_path.stat().st_size == 0:
     raise SystemExit(f"expected non-empty streaming offset index cache at {cache_path}")
 cache = json.loads(cache_path.read_text())
-if cache.get("format") != "rustrain.qwen_sft_offset_index.v5":
+if cache.get("format") != "rustrain.qwen_sft_offset_index.v6":
     raise SystemExit(f"unexpected offset index cache format: {cache.get('format')}")
+source_files = cache.get("source_files")
+if not isinstance(source_files, list) or not source_files:
+    raise SystemExit(f"expected non-empty cache source_files, got {source_files}")
+for entry in source_files:
+    if not isinstance(entry, dict):
+        raise SystemExit(f"cache source_files entry must be an object: {entry}")
+    if not str(entry.get("path", "")).endswith(".jsonl"):
+        raise SystemExit(f"cache source file path must be JSONL: {entry}")
+    if int(entry.get("len", 0)) <= 0:
+        raise SystemExit(f"cache source file len must be positive: {entry}")
+    if int(entry.get("modified_unix_nanos", 0)) <= 0:
+        raise SystemExit(f"cache source file mtime must be positive: {entry}")
 field_map = cache.get("field_map")
 if not isinstance(field_map, dict):
     raise SystemExit(f"expected cache field_map object, got {field_map}")

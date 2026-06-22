@@ -143,8 +143,9 @@ Acceptance:
   `data.index_cache` is configured. The trainer cache verifier runs the same
   config twice and requires the first run to write the offset-index cache and
   the second run to hit it. The offset-index cache is keyed by source paths,
-  `max_samples`, and the JSONL field mapping from `data.instruction_field`,
-  `data.input_field`, `data.response_field`, and optional
+  source JSONL file size/mtime metadata, `max_samples`, and the JSONL field
+  mapping from `data.instruction_field`, `data.input_field`,
+  `data.response_field`, and optional
   `data.system_field`, plus `data.prompt_template`,
   `data.prompt_with_input_template`, and `data.trim_fields`,
   `data.min_response_chars`, optional
@@ -156,10 +157,10 @@ Acceptance:
   `data.max_sample_chars`, optional `data.dedupe_samples`, and training
   `data.source_weights` plus optional `data.source_max_samples` and optional
   `data.skip_invalid_records`, so stale
-  caches from a different external schema, prompt format, normalization policy,
-  instruction/input/system/prompt/sample/response filtering or dedupe policy,
-  source weighting policy, per-source sample-limit policy, or invalid-record
-  handling policy are rejected.
+  caches from a different external file state, external schema, prompt format,
+  normalization policy, instruction/input/system/prompt/sample/response
+  filtering or dedupe policy, source weighting policy, per-source sample-limit
+  policy, or invalid-record handling policy are rejected.
   When `data.system_field` is unset, the system field is omitted from dataset
   hashing so existing default fingerprints remain stable; when set, the
   normalized system value participates in prompt rendering, deduplication, and

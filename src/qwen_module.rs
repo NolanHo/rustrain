@@ -4,7 +4,7 @@ use std::{
     io::{BufRead, BufReader, Seek, SeekFrom},
     path::{Path, PathBuf},
     sync::Arc,
-    time::{Duration, Instant},
+    time::{Duration, Instant, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -1593,10 +1593,18 @@ struct QwenSftStreamingSourceIndex {
 struct QwenSftStreamingSourceIndexCache {
     format: String,
     paths: Vec<String>,
+    source_files: Vec<QwenSftStreamingSourceFileMetadata>,
     max_samples: Option<usize>,
     field_map: QwenSftFieldMap,
     min_response_chars: usize,
     samples: Vec<QwenSftRawSampleIndex>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct QwenSftStreamingSourceFileMetadata {
+    path: String,
+    len: u64,
+    modified_unix_nanos: u128,
 }
 
 #[derive(Debug)]
@@ -11297,13 +11305,14 @@ fn qwen_sft_streaming_source_index_with_cache(
         .iter()
         .map(|path| path.display().to_string())
         .collect::<Vec<_>>();
+    let expected_source_files = qwen_sft_streaming_source_file_metadata(paths)?;
     if let Some(cache_path) = cache_path {
         if cache_path.exists() {
             let contents = fs::read_to_string(cache_path)
                 .with_context(|| format!("failed to read {}", cache_path.display()))?;
             let cache: QwenSftStreamingSourceIndexCache = serde_json::from_str(&contents)
                 .with_context(|| format!("failed to parse {}", cache_path.display()))?;
-            if cache.format != "rustrain.qwen_sft_offset_index.v5" {
+            if cache.format != "rustrain.qwen_sft_offset_index.v6" {
                 bail!(
                     "unsupported SFT streaming index cache format {} in {}",
                     cache.format,
@@ -11315,6 +11324,13 @@ fn qwen_sft_streaming_source_index_with_cache(
                     "SFT streaming index cache paths {:?} do not match {:?}",
                     cache.paths,
                     expected_paths
+                );
+            }
+            if cache.source_files != expected_source_files {
+                bail!(
+                    "SFT streaming index cache source_files {:?} do not match {:?}",
+                    cache.source_files,
+                    expected_source_files
                 );
             }
             if cache.max_samples != max_samples {
@@ -11362,8 +11378,9 @@ fn qwen_sft_streaming_source_index_with_cache(
                 .with_context(|| format!("failed to create {}", parent.display()))?;
         }
         let cache = QwenSftStreamingSourceIndexCache {
-            format: "rustrain.qwen_sft_offset_index.v5".to_string(),
+            format: "rustrain.qwen_sft_offset_index.v6".to_string(),
             paths: expected_paths,
+            source_files: expected_source_files,
             max_samples,
             field_map: field_map.clone(),
             min_response_chars: field_map.min_response_chars,
@@ -11380,6 +11397,36 @@ fn qwen_sft_streaming_source_index_with_cache(
         cache_hit: false,
         cache_written,
     })
+}
+
+fn qwen_sft_streaming_source_file_metadata(
+    paths: &[PathBuf],
+) -> Result<Vec<QwenSftStreamingSourceFileMetadata>> {
+    let mut source_files = Vec::new();
+    for path in paths {
+        for file in qwen_sft_jsonl_files(path)? {
+            let metadata = fs::metadata(&file)
+                .with_context(|| format!("failed to inspect {}", file.display()))?;
+            let modified = metadata
+                .modified()
+                .with_context(|| format!("failed to inspect mtime for {}", file.display()))?;
+            let modified_unix_nanos = modified
+                .duration_since(UNIX_EPOCH)
+                .with_context(|| {
+                    format!(
+                        "mtime for {} is earlier than the Unix epoch",
+                        file.display()
+                    )
+                })?
+                .as_nanos();
+            source_files.push(QwenSftStreamingSourceFileMetadata {
+                path: file.display().to_string(),
+                len: metadata.len(),
+                modified_unix_nanos,
+            });
+        }
+    }
+    Ok(source_files)
 }
 
 fn qwen_sft_examples_by_raw_indices(
@@ -16212,6 +16259,26 @@ not-json
             Err(error) => error.to_string(),
         };
         assert!(min_response_mismatch.contains("field_map"));
+
+        fs::write(
+            &jsonl,
+            r#"{"instruction":"zero","response":"zero"}
+{"instruction":"one","response":"one"}
+{"instruction":"two","response":"two"}
+{"instruction":"three","response":"three"}
+"#,
+        )
+        .expect("jsonl rewrite should update source metadata");
+        let source_metadata_mismatch = match qwen_sft_streaming_source_index_with_cache(
+            &paths,
+            Some(2),
+            Some(&cache_path),
+            &QwenSftFieldMap::default(),
+        ) {
+            Ok(_) => panic!("changed source file metadata should reject cache"),
+            Err(error) => error.to_string(),
+        };
+        assert!(source_metadata_mismatch.contains("source_files"));
     }
 
     #[test]
