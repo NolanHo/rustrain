@@ -180,7 +180,7 @@ for context, summary, expected_hit, expected_written in [
 if not cache_path.exists() or cache_path.stat().st_size == 0:
     raise SystemExit(f"expected non-empty streaming offset index cache at {cache_path}")
 cache = json.loads(cache_path.read_text())
-if cache.get("format") != "rustrain.qwen_sft_offset_index.v6":
+if cache.get("format") != "rustrain.qwen_sft_offset_index.v7":
     raise SystemExit(f"unexpected offset index cache format: {cache.get('format')}")
 source_files = cache.get("source_files")
 if not isinstance(source_files, list) or not source_files:
@@ -239,6 +239,17 @@ if cache.get("min_response_chars") != 1:
     raise SystemExit(f"cache min_response_chars {cache.get('min_response_chars')} != 1")
 if len(cache.get("samples", [])) != 4:
     raise SystemExit(f"expected 4 cached raw sample offsets, got {len(cache.get('samples', []))}")
+summary = cache.get("summary")
+if not isinstance(summary, dict):
+    raise SystemExit(f"expected cache summary object, got {summary}")
+if summary.get("samples") != 4:
+    raise SystemExit(f"cache summary samples {summary.get('samples')} != 4")
+if summary.get("source_files") != [expected_source]:
+    raise SystemExit(f"cache summary source_files {summary.get('source_files')} != {[expected_source]}")
+if summary.get("source_sample_counts") != [{"path": expected_source, "samples": 4}]:
+    raise SystemExit(f"cache summary source_sample_counts {summary.get('source_sample_counts')} != expected")
+if summary.get("fingerprint") != expected_fingerprint:
+    raise SystemExit(f"cache summary fingerprint {summary.get('fingerprint')} != {expected_fingerprint}")
 if cache_hit.get("streaming_raw_sample_indices") != cache_write.get("streaming_raw_sample_indices"):
     raise SystemExit("cache hit raw sample indices differ from cache write run")
 

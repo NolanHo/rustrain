@@ -173,6 +173,26 @@ for context, data, expected_hit, expected_written in [
         raise SystemExit(
             f"{context}: cache_written {data.get('streaming_index_cache_written')} != {expected_written}"
         )
+if not cache_path.exists() or cache_path.stat().st_size == 0:
+    raise SystemExit(f"expected non-empty streaming offset index cache at {cache_path}")
+cache = json.loads(cache_path.read_text(encoding="utf-8"))
+if cache.get("format") != "rustrain.qwen_sft_offset_index.v7":
+    raise SystemExit(f"unexpected cache format {cache.get('format')}")
+if len(cache.get("samples", [])) != 4:
+    raise SystemExit(f"expected 4 cached raw sample offsets, got {len(cache.get('samples', []))}")
+summary = cache.get("summary")
+if not isinstance(summary, dict):
+    raise SystemExit(f"expected cache summary metadata, got {summary}")
+if summary.get("samples") != cache_second.get("dataset_total_samples"):
+    raise SystemExit(f"cache summary samples {summary.get('samples')} != {cache_second.get('dataset_total_samples')}")
+if summary.get("source_files") != cache_second.get("dataset_source_files"):
+    raise SystemExit("cache summary source_files differ from cache-hit data-plan")
+if summary.get("source_sample_counts") != cache_second.get("dataset_source_sample_counts"):
+    raise SystemExit("cache summary source_sample_counts differ from cache-hit data-plan")
+if summary.get("fingerprint") != cache_second.get("dataset_fingerprint"):
+    raise SystemExit(
+        f"cache summary fingerprint {summary.get('fingerprint')} != {cache_second.get('dataset_fingerprint')}"
+    )
 
 print(
     "qwen_sft_streaming_data_plan_verified: "

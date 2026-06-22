@@ -1598,6 +1598,7 @@ struct QwenSftStreamingSourceIndexCache {
     max_samples: Option<usize>,
     field_map: QwenSftFieldMap,
     min_response_chars: usize,
+    summary: QwenSftStreamingSourceSummary,
     samples: Vec<QwenSftRawSampleIndex>,
 }
 
@@ -1611,6 +1612,7 @@ struct QwenSftStreamingSourceFileMetadata {
 #[derive(Debug)]
 struct QwenSftStreamingSourceIndexLoad {
     index: QwenSftStreamingSourceIndex,
+    summary: Option<QwenSftStreamingSourceSummary>,
     cache_hit: bool,
     cache_written: bool,
 }
@@ -2027,7 +2029,7 @@ struct QwenSftTrainEvalDatasets {
     eval_dataset: QwenSftDataset,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct QwenSftStreamingSourceSummary {
     samples: usize,
     source_files: Vec<String>,
@@ -6011,8 +6013,14 @@ pub fn qwen_sft_streaming_data_plan(
             )
         })
         .transpose()?;
-    let train_summary =
-        qwen_sft_streaming_source_summary(&data_config.paths, data_config.max_samples, &field_map)?;
+    let train_summary = if let Some(source_index_load) = &source_index_load {
+        source_index_load
+            .summary
+            .clone()
+            .context("qwen SFT streaming data-plan index cache did not return source summary")?
+    } else {
+        qwen_sft_streaming_source_summary(&data_config.paths, data_config.max_samples, &field_map)?
+    };
     if let Some(source_index_load) = &source_index_load {
         let indexed_samples = source_index_load.index.samples.len();
         if indexed_samples != train_summary.samples {
@@ -11461,7 +11469,7 @@ fn qwen_sft_streaming_source_index_with_cache(
                 .with_context(|| format!("failed to read {}", cache_path.display()))?;
             let cache: QwenSftStreamingSourceIndexCache = serde_json::from_str(&contents)
                 .with_context(|| format!("failed to parse {}", cache_path.display()))?;
-            if cache.format != "rustrain.qwen_sft_offset_index.v6" {
+            if cache.format != "rustrain.qwen_sft_offset_index.v7" {
                 bail!(
                     "unsupported SFT streaming index cache format {} in {}",
                     cache.format,
@@ -11509,10 +11517,18 @@ fn qwen_sft_streaming_source_index_with_cache(
                     cache_path.display()
                 );
             }
+            if cache.summary.samples != cache.samples.len() {
+                bail!(
+                    "SFT streaming index cache summary sample count {} does not match {} raw offsets",
+                    cache.summary.samples,
+                    cache.samples.len()
+                );
+            }
             return Ok(QwenSftStreamingSourceIndexLoad {
                 index: QwenSftStreamingSourceIndex {
                     samples: cache.samples,
                 },
+                summary: Some(cache.summary),
                 cache_hit: true,
                 cache_written: false,
             });
@@ -11520,6 +11536,19 @@ fn qwen_sft_streaming_source_index_with_cache(
     }
 
     let index = qwen_sft_streaming_source_index(paths, max_samples, field_map)?;
+    let summary = if cache_path.is_some() {
+        let summary = qwen_sft_streaming_source_summary(paths, max_samples, field_map)?;
+        if summary.samples != index.samples.len() {
+            bail!(
+                "SFT streaming source summary sample count {} does not match {} raw offsets",
+                summary.samples,
+                index.samples.len()
+            );
+        }
+        Some(summary)
+    } else {
+        None
+    };
     let mut cache_written = false;
     if let Some(cache_path) = cache_path {
         if let Some(parent) = cache_path.parent() {
@@ -11527,12 +11556,15 @@ fn qwen_sft_streaming_source_index_with_cache(
                 .with_context(|| format!("failed to create {}", parent.display()))?;
         }
         let cache = QwenSftStreamingSourceIndexCache {
-            format: "rustrain.qwen_sft_offset_index.v6".to_string(),
+            format: "rustrain.qwen_sft_offset_index.v7".to_string(),
             paths: expected_paths,
             source_files: expected_source_files,
             max_samples,
             field_map: field_map.clone(),
             min_response_chars: field_map.min_response_chars,
+            summary: summary
+                .clone()
+                .context("SFT streaming index cache write requires source summary")?,
             samples: index.samples.clone(),
         };
         let contents = serde_json::to_string_pretty(&cache)
@@ -11543,6 +11575,7 @@ fn qwen_sft_streaming_source_index_with_cache(
     }
     Ok(QwenSftStreamingSourceIndexLoad {
         index,
+        summary,
         cache_hit: false,
         cache_written,
     })

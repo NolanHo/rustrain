@@ -303,7 +303,7 @@ if cache_first.get("streaming_raw_sample_indices") != cache_second.get("streamin
     raise SystemExit("cache hit raw indices differ from cache write raw indices")
 
 cache = json.loads(cache_path.read_text(encoding="utf-8"))
-if cache.get("format") != "rustrain.qwen_sft_offset_index.v6":
+if cache.get("format") != "rustrain.qwen_sft_offset_index.v7":
     raise SystemExit(f"unexpected cache format {cache.get('format')}")
 if len(cache.get("samples", [])) != 200:
     raise SystemExit(f"cache should contain all 200 raw offsets, got {len(cache.get('samples', []))}")
@@ -311,6 +311,17 @@ if cache.get("source_files") is None or len(cache["source_files"]) != 3:
     raise SystemExit(f"cache should contain three source metadata entries, got {cache.get('source_files')}")
 if cache.get("field_map", {}).get("system") != "system":
     raise SystemExit(f"cache field_map system should be set: {cache.get('field_map')}")
+summary = cache.get("summary")
+if not isinstance(summary, dict):
+    raise SystemExit(f"cache should contain summary metadata, got {summary}")
+if summary.get("samples") != data_plan.get("dataset_total_samples"):
+    raise SystemExit(f"cache summary samples {summary.get('samples')} != data-plan total {data_plan.get('dataset_total_samples')}")
+if summary.get("source_files") != data_plan.get("dataset_source_files"):
+    raise SystemExit("cache summary source_files differ from data-plan source files")
+if summary.get("source_sample_counts") != data_plan.get("dataset_source_sample_counts"):
+    raise SystemExit("cache summary source sample counts differ from data-plan")
+if summary.get("fingerprint") != data_plan.get("dataset_fingerprint"):
+    raise SystemExit(f"cache summary fingerprint {summary.get('fingerprint')} != data-plan {data_plan.get('dataset_fingerprint')}")
 
 print(
     "qwen_sft_streaming_scale_verified: "
