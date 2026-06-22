@@ -5,6 +5,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/require_gpu_worker.sh"
 
 CONFIG="${RUSTRAIN_QWEN_SESSION_SINGLE_SFT_CONFIG:-configs/qwen_session_single_sft.toml}"
+EXPECTED_TRAINABLE_TENSORS="${RUSTRAIN_EXPECTED_QWEN_TRAINABLE_TENSORS:-}"
 BASE_OUTPUT="$(mktemp)"
 RESUME_OUTPUT="$(mktemp)"
 
@@ -35,7 +36,7 @@ BASE_DATA_CURSOR_NEXT="${BASE_CURSOR_NEXT##*$'\t'}"
 cargo run -- train --config "${CONFIG}" --resume-from "${MANIFEST_OUTPUT}" \
   | tee "${RESUME_OUTPUT}"
 
-python - "${RESUME_OUTPUT}" "${BASE_DATA_CURSOR_NEXT}" <<'PY'
+python - "${RESUME_OUTPUT}" "${BASE_DATA_CURSOR_NEXT}" "${EXPECTED_TRAINABLE_TENSORS}" <<'PY'
 import ast
 import json
 import math
@@ -43,6 +44,7 @@ import pathlib
 import sys
 
 base_data_cursor_next = int(sys.argv[2])
+expected_trainable_tensors = sys.argv[3]
 values = {}
 for line in pathlib.Path(sys.argv[1]).read_text().splitlines():
     if ": " not in line:
@@ -112,6 +114,10 @@ for key in [
 ]:
     if int(values[key]) <= 0:
         raise SystemExit(f"{key} must be positive, got {values[key]}")
+if expected_trainable_tensors and int(values["trainable_tensors"]) != int(expected_trainable_tensors):
+    raise SystemExit(
+        f"expected {expected_trainable_tensors} trainable tensors, got {values['trainable_tensors']}"
+    )
 dataset_source_files = ast.literal_eval(values["dataset_source_files"])
 if not dataset_source_files:
     raise SystemExit("dataset_source_files must not be empty")
