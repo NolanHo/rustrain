@@ -1664,6 +1664,8 @@ struct QwenSftFieldMap {
     source_weights: Vec<usize>,
     #[serde(default)]
     source_max_samples: Vec<usize>,
+    #[serde(default)]
+    skip_invalid_records: bool,
 }
 
 impl QwenSftFieldMap {
@@ -1691,6 +1693,7 @@ impl QwenSftFieldMap {
             dedupe_samples: data.dedupe_samples,
             source_weights: data.source_weights.clone(),
             source_max_samples: data.source_max_samples.clone(),
+            skip_invalid_records: data.skip_invalid_records,
         };
         map.validate()?;
         Ok(map)
@@ -1859,6 +1862,7 @@ impl Default for QwenSftFieldMap {
             dedupe_samples: false,
             source_weights: Vec::new(),
             source_max_samples: Vec::new(),
+            skip_invalid_records: false,
         }
     }
 }
@@ -11244,14 +11248,12 @@ fn qwen_sft_streaming_source_index(
                     line_index += 1;
                     continue;
                 }
-                let record =
-                    qwen_sft_record_from_jsonl_line(&line, field_map).with_context(|| {
-                        format!(
-                            "failed to parse SFT JSONL record {}:{}",
-                            file.display(),
-                            line_index + 1
-                        )
-                    })?;
+                let Some(record) =
+                    maybe_qwen_sft_record_from_jsonl_line(&line, field_map, &file, line_index + 1)?
+                else {
+                    line_index += 1;
+                    continue;
+                };
                 if !qwen_sft_record_passes_filters(&record, field_map) {
                     line_index += 1;
                     continue;
@@ -11301,7 +11303,7 @@ fn qwen_sft_streaming_source_index_with_cache(
                 .with_context(|| format!("failed to read {}", cache_path.display()))?;
             let cache: QwenSftStreamingSourceIndexCache = serde_json::from_str(&contents)
                 .with_context(|| format!("failed to parse {}", cache_path.display()))?;
-            if cache.format != "rustrain.qwen_sft_offset_index.v4" {
+            if cache.format != "rustrain.qwen_sft_offset_index.v5" {
                 bail!(
                     "unsupported SFT streaming index cache format {} in {}",
                     cache.format,
@@ -11360,7 +11362,7 @@ fn qwen_sft_streaming_source_index_with_cache(
                 .with_context(|| format!("failed to create {}", parent.display()))?;
         }
         let cache = QwenSftStreamingSourceIndexCache {
-            format: "rustrain.qwen_sft_offset_index.v4".to_string(),
+            format: "rustrain.qwen_sft_offset_index.v5".to_string(),
             paths: expected_paths,
             max_samples,
             field_map: field_map.clone(),
@@ -11519,13 +11521,11 @@ fn qwen_sft_examples_from_jsonl_path_with_limit(
             if line.trim().is_empty() {
                 continue;
             }
-            let record = qwen_sft_record_from_jsonl_line(&line, field_map).with_context(|| {
-                format!(
-                    "failed to parse SFT JSONL record {}:{}",
-                    file.display(),
-                    line_index + 1
-                )
-            })?;
+            let Some(record) =
+                maybe_qwen_sft_record_from_jsonl_line(&line, field_map, file, line_index + 1)?
+            else {
+                continue;
+            };
             if !qwen_sft_record_passes_filters(&record, field_map) {
                 continue;
             }
@@ -11628,14 +11628,11 @@ fn qwen_sft_streaming_source_summary(
                 if line.trim().is_empty() {
                     continue;
                 }
-                let record =
-                    qwen_sft_record_from_jsonl_line(&line, field_map).with_context(|| {
-                        format!(
-                            "failed to parse SFT JSONL record {}:{}",
-                            file.display(),
-                            line_index + 1
-                        )
-                    })?;
+                let Some(record) =
+                    maybe_qwen_sft_record_from_jsonl_line(&line, field_map, &file, line_index + 1)?
+                else {
+                    continue;
+                };
                 if !qwen_sft_record_passes_filters(&record, field_map) {
                     continue;
                 }
@@ -11771,14 +11768,11 @@ fn qwen_sft_streaming_fingerprint(
                 if line.trim().is_empty() {
                     continue;
                 }
-                let record =
-                    qwen_sft_record_from_jsonl_line(&line, field_map).with_context(|| {
-                        format!(
-                            "failed to parse SFT JSONL record {}:{}",
-                            file.display(),
-                            line_index + 1
-                        )
-                    })?;
+                let Some(record) =
+                    maybe_qwen_sft_record_from_jsonl_line(&line, field_map, &file, line_index + 1)?
+                else {
+                    continue;
+                };
                 if !qwen_sft_record_passes_filters(&record, field_map) {
                     continue;
                 }
@@ -11854,6 +11848,33 @@ fn qwen_sft_record_from_jsonl_line(
         input,
         response,
     })
+}
+
+fn maybe_qwen_sft_record_from_jsonl_line(
+    line: &str,
+    field_map: &QwenSftFieldMap,
+    file: &Path,
+    line_number: usize,
+) -> Result<Option<QwenSftRecord>> {
+    match qwen_sft_record_from_jsonl_line(line, field_map) {
+        Ok(record) => Ok(Some(record)),
+        Err(error) if field_map.skip_invalid_records => {
+            tracing::warn!(
+                path = %file.display(),
+                line = line_number,
+                error = %error,
+                "skipping invalid SFT JSONL record"
+            );
+            Ok(None)
+        }
+        Err(error) => Err(error).with_context(|| {
+            format!(
+                "failed to parse SFT JSONL record {}:{}",
+                file.display(),
+                line_number
+            )
+        }),
+    }
 }
 
 fn qwen_normalize_jsonl_field(value: String, field_map: &QwenSftFieldMap) -> String {
@@ -12075,6 +12096,11 @@ fn qwen_sft_hash_field_map(hash: &mut u64, field_map: &QwenSftFieldMap) {
     }
     if field_map.dedupe_samples {
         qwen_sft_hash_bytes(hash, b"dedupe_samples");
+        qwen_sft_hash_bytes(hash, b"true");
+        qwen_sft_hash_bytes(hash, b"\0");
+    }
+    if field_map.skip_invalid_records {
+        qwen_sft_hash_bytes(hash, b"skip_invalid_records");
         qwen_sft_hash_bytes(hash, b"true");
         qwen_sft_hash_bytes(hash, b"\0");
     }
@@ -16030,6 +16056,97 @@ not-json
             Err(error) => error.to_string(),
         };
         assert!(error.contains("failed to parse SFT JSONL record"));
+    }
+
+    #[test]
+    fn qwen_sft_skip_invalid_records_keeps_valid_rows_across_paths() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let jsonl = temp.path().join("train.jsonl");
+        let cache_path = temp.path().join("cache").join("offset-index.json");
+        fs::write(
+            &jsonl,
+            r#"{"instruction":"zero","response":"zero"}
+not-json
+{"instruction":"missing-response"}
+{"instruction":"three","response":"three"}
+{"instruction":"four","response":"four"}
+"#,
+        )
+        .expect("jsonl should write");
+        let paths = vec![jsonl.clone()];
+        let strict_error = match qwen_sft_examples_from_jsonl_paths_with_limit(
+            &paths,
+            None,
+            &QwenSftFieldMap::default(),
+        ) {
+            Ok(_) => panic!("strict materialized read should reject invalid rows"),
+            Err(error) => error.to_string(),
+        };
+        assert!(strict_error.contains("failed to parse SFT JSONL record"));
+
+        let skip_map = QwenSftFieldMap {
+            skip_invalid_records: true,
+            ..QwenSftFieldMap::default()
+        };
+        let loaded = qwen_sft_examples_from_jsonl_paths_with_limit(&paths, Some(2), &skip_map)
+            .expect("materialized read should skip invalid rows");
+        let streamed = qwen_sft_streaming_source_summary(&paths, Some(2), &skip_map)
+            .expect("streaming summary should skip invalid rows");
+        let source_index = qwen_sft_streaming_source_index(&paths, Some(2), &skip_map)
+            .expect("source index should skip invalid rows");
+        let raw_window = qwen_sft_examples_by_raw_indices(&source_index.samples, &skip_map)
+            .expect("raw indexed window should read valid rows");
+        let cache = qwen_sft_streaming_source_index_with_cache(
+            &paths,
+            Some(2),
+            Some(&cache_path),
+            &skip_map,
+        )
+        .expect("skip-invalid cache should write");
+        let default_cache_mismatch = qwen_sft_streaming_source_index_with_cache(
+            &paths,
+            Some(2),
+            Some(&cache_path),
+            &QwenSftFieldMap::default(),
+        )
+        .expect_err("cache should reject skip-invalid policy drift")
+        .to_string();
+        let default_fingerprint = qwen_sft_dataset_fingerprint(
+            &loaded.source_files,
+            &loaded.examples,
+            &QwenSftFieldMap::default(),
+        );
+
+        assert_eq!(
+            loaded
+                .examples
+                .iter()
+                .map(|example| example.instruction.as_str())
+                .collect::<Vec<_>>(),
+            vec!["zero", "three"]
+        );
+        assert_eq!(streamed.samples, 2);
+        assert_eq!(streamed.fingerprint, loaded.fingerprint);
+        assert_eq!(source_index.samples.len(), 2);
+        assert_eq!(
+            source_index
+                .samples
+                .iter()
+                .map(|sample| sample.index_in_file)
+                .collect::<Vec<_>>(),
+            vec![0, 3]
+        );
+        assert_eq!(
+            raw_window
+                .examples
+                .iter()
+                .map(|example| example.response.as_str())
+                .collect::<Vec<_>>(),
+            vec!["zero", "three"]
+        );
+        assert!(cache.cache_written);
+        assert!(default_cache_mismatch.contains("field_map"));
+        assert_ne!(loaded.fingerprint, default_fingerprint);
     }
 
     #[test]

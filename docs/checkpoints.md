@@ -154,10 +154,12 @@ Acceptance:
   `data.max_system_chars`, optional `data.min_prompt_chars`, optional
   `data.max_prompt_chars`, optional `data.min_sample_chars`, optional
   `data.max_sample_chars`, optional `data.dedupe_samples`, and training
-  `data.source_weights` plus optional `data.source_max_samples`, so stale
+  `data.source_weights` plus optional `data.source_max_samples` and optional
+  `data.skip_invalid_records`, so stale
   caches from a different external schema, prompt format, normalization policy,
   instruction/input/system/prompt/sample/response filtering or dedupe policy,
-  source weighting policy, or per-source sample-limit policy are rejected.
+  source weighting policy, per-source sample-limit policy, or invalid-record
+  handling policy are rejected.
   When `data.system_field` is unset, the system field is omitted from dataset
   hashing so existing default fingerprints remain stable; when set, the
   normalized system value participates in prompt rendering, deduplication, and

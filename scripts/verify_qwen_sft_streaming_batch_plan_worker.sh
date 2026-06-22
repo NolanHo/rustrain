@@ -180,7 +180,7 @@ for context, summary, expected_hit, expected_written in [
 if not cache_path.exists() or cache_path.stat().st_size == 0:
     raise SystemExit(f"expected non-empty streaming offset index cache at {cache_path}")
 cache = json.loads(cache_path.read_text())
-if cache.get("format") != "rustrain.qwen_sft_offset_index.v4":
+if cache.get("format") != "rustrain.qwen_sft_offset_index.v5":
     raise SystemExit(f"unexpected offset index cache format: {cache.get('format')}")
 field_map = cache.get("field_map")
 if not isinstance(field_map, dict):
@@ -208,6 +208,7 @@ expected_field_map = {
     "dedupe_samples": False,
     "source_weights": [],
     "source_max_samples": [],
+    "skip_invalid_records": False,
 }
 for key, expected in expected_field_map.items():
     if field_map.get(key) != expected:

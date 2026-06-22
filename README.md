@@ -476,6 +476,10 @@ production-grade sharded checkpoint ownership remain open.
   of valid raw records consumed from each training source before source
   weighting and before global `data.max_samples`. Explicit `data.eval_paths`
   ignore both source weighting and source max-sample limits.
+  `data.skip_invalid_records` defaults to `false`, so malformed JSONL rows and
+  missing or non-string required fields fail clearly. Set it to `true` to skip
+  those invalid records before filtering, deduplication, source weighting,
+  source limits, global `max_samples`, and streaming offset-index construction.
   `cargo run -- qwen-sft-streaming-batch-plan --config ...` resolves the next
   cursor window to raw JSONL source indices, reads and tokenizes only those
   window records, then verifies the padded `input_ids` plus response masks match

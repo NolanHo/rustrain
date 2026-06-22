@@ -75,6 +75,7 @@ struct SftCache {
     dedupe_samples: bool,
     source_weights: Vec<usize>,
     source_max_samples: Vec<usize>,
+    skip_invalid_records: bool,
     train_samples: Vec<SftSample>,
     eval_samples: Vec<SftSample>,
 }
@@ -237,6 +238,7 @@ pub fn load_sft_dataset(
         data.dedupe_samples,
         &data.source_weights,
         &data.source_max_samples,
+        data.skip_invalid_records,
         &dataset,
     )?;
 
@@ -375,13 +377,11 @@ fn read_sft_paths(
                 if line.trim().is_empty() {
                     continue;
                 }
-                let record = instruction_record_from_jsonl_line(data, line).with_context(|| {
-                    format!(
-                        "failed to parse JSONL record {}:{}",
-                        file.display(),
-                        line_index + 1
-                    )
-                })?;
+                let Some(record) =
+                    maybe_instruction_record_from_jsonl_line(data, line, &file, line_index + 1)?
+                else {
+                    continue;
+                };
                 if !sft_record_passes_filters(data, &record)? {
                     continue;
                 }
@@ -482,6 +482,33 @@ fn instruction_record_from_jsonl_line(data: &DataConfig, line: &str) -> Result<I
         input,
         response,
     })
+}
+
+fn maybe_instruction_record_from_jsonl_line(
+    data: &DataConfig,
+    line: &str,
+    file: &Path,
+    line_number: usize,
+) -> Result<Option<InstructionRecord>> {
+    match instruction_record_from_jsonl_line(data, line) {
+        Ok(record) => Ok(Some(record)),
+        Err(error) if data.skip_invalid_records => {
+            tracing::warn!(
+                path = %file.display(),
+                line = line_number,
+                error = %error,
+                "skipping invalid SFT JSONL record"
+            );
+            Ok(None)
+        }
+        Err(error) => Err(error).with_context(|| {
+            format!(
+                "failed to parse JSONL record {}:{}",
+                file.display(),
+                line_number
+            )
+        }),
+    }
 }
 
 fn sft_record_passes_filters(data: &DataConfig, record: &InstructionRecord) -> Result<bool> {
@@ -642,6 +669,7 @@ fn write_sft_cache(
     dedupe_samples: bool,
     source_weights: &[usize],
     source_max_samples: &[usize],
+    skip_invalid_records: bool,
     dataset: &SftDataset,
 ) -> Result<()> {
     let cache = SftCache {
@@ -664,6 +692,7 @@ fn write_sft_cache(
         dedupe_samples,
         source_weights: source_weights.to_vec(),
         source_max_samples: source_max_samples.to_vec(),
+        skip_invalid_records,
         train_samples: dataset.train_samples.clone(),
         eval_samples: dataset.eval_samples.clone(),
     };
@@ -731,6 +760,7 @@ mod tests {
             dedupe_samples: false,
             source_weights: Vec::new(),
             source_max_samples: Vec::new(),
+            skip_invalid_records: false,
         };
         let dataset = load_text_dataset(&data, 64, 8, &cache_dir).expect("dataset should load");
 
@@ -789,6 +819,7 @@ mod tests {
             dedupe_samples: false,
             source_weights: Vec::new(),
             source_max_samples: Vec::new(),
+            skip_invalid_records: false,
         };
         let dataset = load_text_dataset(&data, 128, 8, &cache_dir).expect("dataset should load");
 
@@ -853,6 +884,7 @@ mod tests {
             dedupe_samples: false,
             source_weights: Vec::new(),
             source_max_samples: Vec::new(),
+            skip_invalid_records: false,
         };
         let dataset =
             load_sft_dataset(&data, 128, 64, &cache_dir).expect("SFT dataset should load");
@@ -924,6 +956,7 @@ mod tests {
             dedupe_samples: false,
             source_weights: Vec::new(),
             source_max_samples: Vec::new(),
+            skip_invalid_records: false,
         };
         let dataset =
             load_sft_dataset(&data, 128, 96, &cache_dir).expect("SFT dataset should load");
@@ -994,6 +1027,7 @@ mod tests {
             dedupe_samples: false,
             source_weights: Vec::new(),
             source_max_samples: Vec::new(),
+            skip_invalid_records: false,
         };
         let dataset =
             load_sft_dataset(&data, 128, 96, &cache_dir).expect("SFT dataset should load");
@@ -1054,6 +1088,7 @@ mod tests {
             dedupe_samples: false,
             source_weights: Vec::new(),
             source_max_samples: Vec::new(),
+            skip_invalid_records: false,
         };
         let dataset =
             load_sft_dataset(&data, 128, 96, &cache_dir).expect("SFT dataset should load");
@@ -1110,6 +1145,7 @@ mod tests {
             dedupe_samples: false,
             source_weights: Vec::new(),
             source_max_samples: Vec::new(),
+            skip_invalid_records: false,
         };
         let raw_data = DataConfig {
             trim_fields: false,
@@ -1202,6 +1238,7 @@ mod tests {
             dedupe_samples: false,
             source_weights: Vec::new(),
             source_max_samples: Vec::new(),
+            skip_invalid_records: false,
         };
         let dataset =
             load_sft_dataset(&data, 128, 64, &cache_dir).expect("SFT dataset should load");
@@ -1263,6 +1300,7 @@ mod tests {
             dedupe_samples: false,
             source_weights: Vec::new(),
             source_max_samples: Vec::new(),
+            skip_invalid_records: false,
         };
         let dataset =
             load_sft_dataset(&data, 128, 64, &cache_dir).expect("SFT dataset should load");
@@ -1325,6 +1363,7 @@ mod tests {
             dedupe_samples: false,
             source_weights: Vec::new(),
             source_max_samples: Vec::new(),
+            skip_invalid_records: false,
         };
         let dataset =
             load_sft_dataset(&data, 128, 64, &cache_dir).expect("SFT dataset should load");
@@ -1388,6 +1427,7 @@ mod tests {
             dedupe_samples: false,
             source_weights: Vec::new(),
             source_max_samples: Vec::new(),
+            skip_invalid_records: false,
         };
         let dataset =
             load_sft_dataset(&data, 128, 64, &cache_dir).expect("SFT dataset should load");
@@ -1451,6 +1491,7 @@ mod tests {
             dedupe_samples: false,
             source_weights: Vec::new(),
             source_max_samples: Vec::new(),
+            skip_invalid_records: false,
         };
         let dataset =
             load_sft_dataset(&data, 128, 64, &cache_dir).expect("SFT dataset should load");
@@ -1516,6 +1557,7 @@ mod tests {
             dedupe_samples: false,
             source_weights: Vec::new(),
             source_max_samples: Vec::new(),
+            skip_invalid_records: false,
         };
         let dataset =
             load_sft_dataset(&data, 128, 64, &cache_dir).expect("SFT dataset should load");
@@ -1582,6 +1624,7 @@ mod tests {
             dedupe_samples: false,
             source_weights: Vec::new(),
             source_max_samples: Vec::new(),
+            skip_invalid_records: false,
         };
         let dataset =
             load_sft_dataset(&data, 128, 64, &cache_dir).expect("SFT dataset should load");
@@ -1647,6 +1690,7 @@ mod tests {
             dedupe_samples: false,
             source_weights: Vec::new(),
             source_max_samples: Vec::new(),
+            skip_invalid_records: false,
         };
         let dataset =
             load_sft_dataset(&data, 128, 64, &cache_dir).expect("SFT dataset should load");
@@ -1721,6 +1765,7 @@ mod tests {
             dedupe_samples: false,
             source_weights: vec![2, 2],
             source_max_samples: Vec::new(),
+            skip_invalid_records: false,
         };
         let dataset =
             load_sft_dataset(&data, 128, 64, &cache_dir).expect("SFT dataset should load");
@@ -1790,6 +1835,7 @@ mod tests {
             dedupe_samples: false,
             source_weights: vec![2, 2],
             source_max_samples: vec![1, 2],
+            skip_invalid_records: false,
         };
         let dataset =
             load_sft_dataset(&data, 128, 64, &cache_dir).expect("SFT dataset should load");
@@ -1855,6 +1901,7 @@ mod tests {
             dedupe_samples: true,
             source_weights: Vec::new(),
             source_max_samples: Vec::new(),
+            skip_invalid_records: false,
         };
         let dataset =
             load_sft_dataset(&data, 128, 64, &cache_dir).expect("SFT dataset should load");
@@ -1871,6 +1918,77 @@ mod tests {
         assert!(second.contains("second"));
         assert!(!first.contains("third"));
         assert!(!second.contains("third"));
+    }
+
+    #[test]
+    fn sft_dataset_skip_invalid_records_keeps_valid_rows() {
+        let dir = tempdir().expect("temp dir should be created");
+        let data_dir = dir.path().join("sft");
+        let cache_dir = dir.path().join("cache");
+        fs::create_dir_all(&data_dir).expect("sft dir should be created");
+        fs::create_dir_all(&cache_dir).expect("cache dir should be created");
+        fs::write(
+            data_dir.join("sample.jsonl"),
+            "{\"instruction\":\"first\",\"response\":\"alpha\"}\nnot-json\n{\"instruction\":\"missing-response\"}\n{\"instruction\":\"second\",\"response\":\"beta\"}\n{\"instruction\":\"third\",\"response\":\"gamma\"}\n",
+        )
+        .expect("jsonl should write");
+
+        let mut data = DataConfig {
+            kind: DataKind::InstructionJsonl,
+            paths: vec![data_dir],
+            eval_paths: Vec::new(),
+            train_split: 0.67,
+            max_samples: None,
+            max_eval_samples: None,
+            shuffle: false,
+            index_cache: None,
+            instruction_field: "instruction".to_string(),
+            input_field: "input".to_string(),
+            response_field: "response".to_string(),
+            system_field: None,
+            min_system_chars: None,
+            max_system_chars: None,
+            prompt_template: "Instruction:\n{instruction}\n\nResponse:\n".to_string(),
+            prompt_with_input_template:
+                "Instruction:\n{instruction}\n\nInput:\n{input}\n\nResponse:\n".to_string(),
+            trim_fields: true,
+            min_response_chars: 1,
+            max_response_chars: None,
+            min_instruction_chars: None,
+            max_instruction_chars: None,
+            min_input_chars: None,
+            max_input_chars: None,
+            min_prompt_chars: None,
+            max_prompt_chars: None,
+            min_sample_chars: None,
+            max_sample_chars: None,
+            dedupe_samples: false,
+            source_weights: Vec::new(),
+            source_max_samples: Vec::new(),
+            skip_invalid_records: false,
+        };
+
+        let strict_error = load_sft_dataset(&data, 128, 64, &cache_dir)
+            .expect_err("strict SFT loading should reject invalid rows")
+            .to_string();
+        assert!(strict_error.contains("failed to parse JSONL record"));
+
+        data.skip_invalid_records = true;
+        let dataset = load_sft_dataset(&data, 128, 64, &cache_dir).expect("valid rows should load");
+        let decoded = dataset
+            .train_samples
+            .iter()
+            .chain(dataset.eval_samples.iter())
+            .map(|sample| dataset.tokenizer.decode_lossy(&sample.tokens))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert_eq!(dataset.train_samples.len(), 2);
+        assert_eq!(dataset.eval_samples.len(), 1);
+        assert!(decoded.contains("first"));
+        assert!(decoded.contains("second"));
+        assert!(decoded.contains("third"));
+        assert!(!decoded.contains("missing-response"));
     }
 
     #[test]
@@ -1919,6 +2037,7 @@ mod tests {
             dedupe_samples: false,
             source_weights: Vec::new(),
             source_max_samples: Vec::new(),
+            skip_invalid_records: false,
         };
         let dataset =
             load_sft_dataset(&data, 128, 64, &cache_dir).expect("SFT dataset should load");

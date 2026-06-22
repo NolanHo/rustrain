@@ -136,6 +136,8 @@ pub struct DataConfig {
     pub source_weights: Vec<usize>,
     #[serde(default)]
     pub source_max_samples: Vec<usize>,
+    #[serde(default)]
+    pub skip_invalid_records: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -798,6 +800,7 @@ mod tests {
                 dedupe_samples: false,
                 source_weights: Vec::new(),
                 source_max_samples: Vec::new(),
+                skip_invalid_records: false,
             }),
             lora: Some(LoraConfig {
                 rank: 4,
