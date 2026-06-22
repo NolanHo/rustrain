@@ -600,6 +600,9 @@ pub fn train(config_path: &Path, resume_from: Option<PathBuf>) -> Result<()> {
         return match data.kind {
             crate::runtime::DataKind::Text => train_text_data(&config, &run_paths),
             crate::runtime::DataKind::InstructionJsonl => train_sft_data(&config, &run_paths),
+            crate::runtime::DataKind::InstructionArrow => Err(anyhow!(
+                "trainer data.kind = instruction_arrow is not implemented yet; use qwen-sft-streaming-data-plan or qwen-sft-streaming-batch-plan for direct Arrow validation"
+            )),
         };
     }
 

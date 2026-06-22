@@ -108,10 +108,71 @@ expert_model_parallel_size = 1
 context_parallel_size = 1
 EOF
 
+ARROW_CONFIG="${WORK_DIR}/hf-cache-arrow.toml"
+cat >"${ARROW_CONFIG}" <<EOF
+[run]
+name = "qwen_sft_streaming_hf_cache_arrow"
+base_dir = "/tmp/rustrain-runs"
+seed = 777
+
+[model]
+name = "qwen2_5_0_5b_sft_streaming_hf_cache_arrow"
+architecture = "qwen_trainable_session"
+model_path = "/vePFS-Mindverse/share/huggingface/Qwen2.5-0.5B-Instruct"
+vocab_size = 151936
+hidden_size = 896
+num_layers = 24
+num_attention_heads = 14
+num_key_value_heads = 2
+intermediate_size = 4864
+seq_len = 128
+norm = "rmsnorm"
+activation = "swiglu"
+rope = true
+rms_norm_eps = 0.000001
+trainable_layers = [0]
+
+[train]
+max_steps = 2
+backend = "tch"
+micro_batch_size = 2
+global_batch_size = 2
+gradient_accumulation_steps = 1
+learning_rate = 0.000001
+weight_decay = 0.0
+adam_beta1 = 0.9
+adam_beta2 = 0.999
+adam_eps = 0.00000001
+dtype = "fp32"
+device = "cuda"
+checkpoint_every = 0
+
+[data]
+kind = "instruction_arrow"
+paths = ["${HF_ARROW}"]
+max_samples = 128
+train_split = 0.75
+shuffle = false
+instruction_field = "instruction"
+input_field = "input"
+response_field = "output"
+prompt_template = "Instruction: {instruction}\\nResponse: "
+prompt_with_input_template = "Instruction: {instruction}\\nInput: {input}\\nResponse: "
+
+[parallel]
+tensor_model_parallel_size = 1
+pipeline_model_parallel_size = 1
+data_parallel_size = 2
+expert_model_parallel_size = 1
+context_parallel_size = 1
+EOF
+
 DATA_OUTPUT="${WORK_DIR}/data-plan.out"
 BATCH_OUTPUT="${WORK_DIR}/batch-plan.out"
 CACHE_FIRST_OUTPUT="${WORK_DIR}/batch-plan-cache-first.out"
 CACHE_SECOND_OUTPUT="${WORK_DIR}/batch-plan-cache-second.out"
+ARROW_DATA_OUTPUT="${WORK_DIR}/arrow-config-data-plan.out"
+ARROW_CONFIG_BATCH_OUTPUT="${WORK_DIR}/arrow-config-batch-plan.out"
 CACHE_PATH="${WORK_DIR}/offset-index.json"
 
 cargo run -- qwen-sft-streaming-data-plan \
@@ -140,6 +201,18 @@ cargo run -- qwen-sft-streaming-batch-plan \
   --index-cache "${CACHE_PATH}" \
   | tee "${CACHE_SECOND_OUTPUT}"
 
+cargo run -- qwen-sft-streaming-data-plan \
+  --config "${ARROW_CONFIG}" \
+  --world-size 2 \
+  --data-cursor-start 94 \
+  | tee "${ARROW_DATA_OUTPUT}"
+
+cargo run -- qwen-sft-streaming-batch-plan \
+  --config "${ARROW_CONFIG}" \
+  --world-size 2 \
+  --data-cursor-start 94 \
+  | tee "${ARROW_CONFIG_BATCH_OUTPUT}"
+
 python - \
   "${ARROW_SUMMARY_OUTPUT}" \
   "${ARROW_BATCH_OUTPUT}" \
@@ -147,6 +220,8 @@ python - \
   "${BATCH_OUTPUT}" \
   "${CACHE_FIRST_OUTPUT}" \
   "${CACHE_SECOND_OUTPUT}" \
+  "${ARROW_DATA_OUTPUT}" \
+  "${ARROW_CONFIG_BATCH_OUTPUT}" \
   "${CACHE_PATH}" \
   "${DATA_DIR}" \
   "${HF_ARROW}" <<'PY'
@@ -160,9 +235,11 @@ data_output = pathlib.Path(sys.argv[3])
 batch_output = pathlib.Path(sys.argv[4])
 cache_first_output = pathlib.Path(sys.argv[5])
 cache_second_output = pathlib.Path(sys.argv[6])
-cache_path = pathlib.Path(sys.argv[7])
-data_dir = pathlib.Path(sys.argv[8])
-hf_arrow = pathlib.Path(sys.argv[9])
+arrow_data_output = pathlib.Path(sys.argv[7])
+arrow_config_batch_output = pathlib.Path(sys.argv[8])
+cache_path = pathlib.Path(sys.argv[9])
+data_dir = pathlib.Path(sys.argv[10])
+hf_arrow = pathlib.Path(sys.argv[11])
 
 
 def load_json(path: pathlib.Path) -> dict:
@@ -179,6 +256,8 @@ data_plan = load_json(data_output)
 batch_plan = load_json(batch_output)
 cache_first = load_json(cache_first_output)
 cache_second = load_json(cache_second_output)
+arrow_data_plan = load_json(arrow_data_output)
+arrow_config_batch = load_json(arrow_config_batch_output)
 metadata = json.loads((data_dir / "export_metadata.json").read_text(encoding="utf-8"))
 bounded_metadata = json.loads(
     (data_dir / "export_metadata_bounded.json").read_text(encoding="utf-8")
@@ -417,6 +496,78 @@ verify_batch_plan(batch_plan, "batch-plan")
 verify_batch_plan(cache_first, "cache-first")
 verify_batch_plan(cache_second, "cache-second")
 
+for key, expected in {
+    "world_size": 2,
+    "local_batch_size": 2,
+    "global_batch_size": 4,
+    "train_steps": 2,
+    "data_cursor_start": 94,
+    "data_cursor_end": 102,
+    "data_cursor_next": 102,
+    "dataset_total_samples": 128,
+    "dataset_train_samples": 96,
+    "dataset_eval_samples": 32,
+    "dataset_order_seed": 777,
+    "dataset_shuffle": False,
+    "tokenizer_loaded": False,
+    "tokenized_samples_materialized": False,
+}.items():
+    if arrow_data_plan.get(key) != expected:
+        raise SystemExit(f"Arrow config data-plan {key} {arrow_data_plan.get(key)!r} != {expected!r}")
+if arrow_data_plan.get("train_window_sample_cursors") != expected_window:
+    raise SystemExit(
+        f"Arrow config data-plan cursors {arrow_data_plan.get('train_window_sample_cursors')} != {expected_window}"
+    )
+if arrow_data_plan.get("dataset_source_files") != [str(hf_arrow)]:
+    raise SystemExit(f"Arrow config data-plan source_files mismatch: {arrow_data_plan.get('dataset_source_files')}")
+if arrow_data_plan.get("dataset_source_sample_counts") != [{"path": str(hf_arrow), "samples": 128}]:
+    raise SystemExit(
+        f"Arrow config data-plan source counts mismatch: {arrow_data_plan.get('dataset_source_sample_counts')}"
+    )
+if arrow_data_plan.get("streaming_index_cache_path") is not None:
+    raise SystemExit("Arrow config data-plan unexpectedly reported an index cache path")
+if not isinstance(arrow_data_plan.get("dataset_fingerprint"), str) or len(arrow_data_plan["dataset_fingerprint"]) != 16:
+    raise SystemExit(f"Arrow config data-plan fingerprint should be a 16-char hash: {arrow_data_plan.get('dataset_fingerprint')}")
+
+for key, expected in {
+    "world_size": 2,
+    "local_batch_size": 2,
+    "global_batch_size": 4,
+    "train_steps": 2,
+    "train_batch_count": 3,
+    "data_cursor_start": 94,
+    "data_cursor_end": 102,
+    "data_cursor_next": 102,
+    "dataset_total_samples": 128,
+    "dataset_train_samples": 96,
+    "dataset_eval_samples": 32,
+    "dataset_order_seed": 777,
+    "dataset_shuffle": False,
+    "tokenizer_loaded": True,
+    "tokenized_samples_materialized": False,
+    "reference_tokenized_samples_materialized": True,
+    "streaming_window_samples": 12,
+    "streaming_raw_samples_read": 12,
+    "materialized_input_max_delta": 0,
+    "materialized_mask_max_delta": 0.0,
+}.items():
+    if arrow_config_batch.get(key) != expected:
+        raise SystemExit(f"Arrow config batch-plan {key} {arrow_config_batch.get(key)!r} != {expected!r}")
+if arrow_config_batch.get("train_window_sample_cursors") != expected_window:
+    raise SystemExit(
+        f"Arrow config batch-plan cursors {arrow_config_batch.get('train_window_sample_cursors')} != {expected_window}"
+    )
+if arrow_config_batch.get("dataset_source_files") != [str(hf_arrow)]:
+    raise SystemExit(f"Arrow config batch-plan source_files mismatch: {arrow_config_batch.get('dataset_source_files')}")
+if arrow_config_batch.get("dataset_source_sample_counts") != [{"path": str(hf_arrow), "samples": 128}]:
+    raise SystemExit(
+        f"Arrow config batch-plan source counts mismatch: {arrow_config_batch.get('dataset_source_sample_counts')}"
+    )
+if arrow_config_batch.get("dataset_fingerprint") != arrow_data_plan.get("dataset_fingerprint"):
+    raise SystemExit("Arrow config batch-plan fingerprint drifted from Arrow config data-plan")
+if arrow_config_batch.get("streaming_raw_sample_indices") != []:
+    raise SystemExit(f"Arrow config batch-plan should not report JSONL raw offsets: {arrow_config_batch.get('streaming_raw_sample_indices')}")
+
 for key in [
     "train_window_sample_cursors",
     "batch_sequence_tokens",
@@ -427,6 +578,10 @@ for key in [
     if arrow_batch.get(key) != batch_plan.get(key):
         raise SystemExit(
             f"Arrow batch-plan {key} {arrow_batch.get(key)} != JSONL batch-plan {batch_plan.get(key)}"
+        )
+    if arrow_config_batch.get(key) != batch_plan.get(key):
+        raise SystemExit(
+            f"Arrow config batch-plan {key} {arrow_config_batch.get(key)} != JSONL batch-plan {batch_plan.get(key)}"
         )
 
 if batch_plan.get("streaming_index_cache_path") is not None:
@@ -470,6 +625,7 @@ print(
     f"source_rows={metadata['source_rows']} "
     f"arrow_samples={arrow_summary['samples']} "
     f"arrow_window_samples={arrow_batch['streaming_window_samples']} "
+    f"arrow_config_window_samples={arrow_config_batch['streaming_window_samples']} "
     f"exported_rows={metadata['exported_rows']} "
     f"train_samples={data_plan['dataset_train_samples']} "
     f"streaming_window_samples={batch_plan['streaming_window_samples']} "

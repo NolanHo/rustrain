@@ -292,6 +292,7 @@ pub struct LoraConfig {
 pub enum DataKind {
     Text,
     InstructionJsonl,
+    InstructionArrow,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

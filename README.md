@@ -583,8 +583,13 @@ production-grade sharded checkpoint ownership remain open.
   applies the configured SFT field map and prompt templates, tokenizes only the
   bounded cursor window, and checks cursor windows, sequence lengths,
   response-mask counts, padding counts, and token fingerprints against the
-  JSONL streaming batch plan. A production zero-materialization training loader
-  for large external streams is still open.
+  JSONL streaming batch plan. The same `qwen-sft-streaming-data-plan` and
+  `qwen-sft-streaming-batch-plan` commands now also accept
+  `data.kind = "instruction_arrow"` for a single Arrow IPC train file with
+  `data.max_samples`, mapped instruction/input/response columns, and prompt
+  templates; this is a direct Arrow plan/verifier path, not trainer-owned
+  Arrow training yet. A production zero-materialization training loader for
+  large external streams is still open.
   Production data loading and arbitrary-module LoRA injection are still open.
 - Real Qwen module-level LoRA now uses a target-layer/module registry for
   configured attention and MLP projection modules; trainer-owned full-model LoRA

@@ -160,6 +160,11 @@ Acceptance:
   applies the same SFT field map and prompt templates, tokenizes the bounded
   streaming cursor window, and verifies cursor, sequence length, response-mask,
   padding, and token-fingerprint parity against the JSONL streaming batch plan.
+  The config-driven `qwen-sft-streaming-data-plan` and
+  `qwen-sft-streaming-batch-plan` commands also accept
+  `data.kind = "instruction_arrow"` for a single Arrow IPC train file and
+  verify the same bounded cursor/token plan without JSONL raw-offset metadata;
+  trainer-owned Arrow training and Arrow index-cache semantics remain open.
   The offset-index cache is keyed by source paths,
   source JSONL file size/mtime metadata, `max_samples`, and the JSONL field
   mapping from `data.instruction_field`, `data.input_field`,
