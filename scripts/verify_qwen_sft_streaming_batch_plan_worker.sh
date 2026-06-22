@@ -226,6 +226,7 @@ expected_field_map = {
     "min_sample_chars": None,
     "max_sample_chars": None,
     "dedupe_samples": False,
+    "field_replacements": [],
     "source_weights": [],
     "source_max_samples": [],
     "skip_invalid_records": False,

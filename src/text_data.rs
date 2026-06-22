@@ -7,7 +7,7 @@ use std::{
 use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
 
-use crate::runtime::DataConfig;
+use crate::runtime::{DataConfig, FieldReplacement, FieldReplacementTarget};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ByteTokenizer {
@@ -66,6 +66,7 @@ struct SftCache {
     response_excludes_any: Vec<String>,
     input_contains_any: Vec<String>,
     input_excludes_any: Vec<String>,
+    field_replacements: Vec<FieldReplacement>,
     max_eval_samples: Option<usize>,
     system_field: Option<String>,
     min_system_chars: Option<usize>,
@@ -237,6 +238,7 @@ pub fn load_sft_dataset(
         &data.response_excludes_any,
         &data.input_contains_any,
         &data.input_excludes_any,
+        &data.field_replacements,
         data.max_eval_samples,
         data.system_field.clone(),
         data.min_system_chars,
@@ -492,12 +494,14 @@ fn instruction_record_from_jsonl_line(data: &DataConfig, line: &str) -> Result<I
         required_jsonl_string_field(&values, &data.response_field)?,
         data,
     );
-    Ok(InstructionRecord {
+    let mut record = InstructionRecord {
         system,
         instruction,
         input,
         response,
-    })
+    };
+    apply_field_replacements(&mut record, &data.field_replacements);
+    Ok(record)
 }
 
 fn maybe_instruction_record_from_jsonl_line(
@@ -602,6 +606,43 @@ fn normalize_jsonl_field(value: String, data: &DataConfig) -> String {
     }
 }
 
+fn apply_field_replacements(record: &mut InstructionRecord, replacements: &[FieldReplacement]) {
+    for replacement in replacements {
+        if matches!(
+            replacement.field,
+            FieldReplacementTarget::System | FieldReplacementTarget::All
+        ) {
+            record.system = record
+                .system
+                .replace(&replacement.pattern, &replacement.replacement);
+        }
+        if matches!(
+            replacement.field,
+            FieldReplacementTarget::Instruction | FieldReplacementTarget::All
+        ) {
+            record.instruction = record
+                .instruction
+                .replace(&replacement.pattern, &replacement.replacement);
+        }
+        if matches!(
+            replacement.field,
+            FieldReplacementTarget::Input | FieldReplacementTarget::All
+        ) {
+            record.input = record
+                .input
+                .replace(&replacement.pattern, &replacement.replacement);
+        }
+        if matches!(
+            replacement.field,
+            FieldReplacementTarget::Response | FieldReplacementTarget::All
+        ) {
+            record.response = record
+                .response
+                .replace(&replacement.pattern, &replacement.replacement);
+        }
+    }
+}
+
 fn required_jsonl_string_field(
     values: &BTreeMap<String, serde_json::Value>,
     field: &str,
@@ -695,6 +736,7 @@ fn write_sft_cache(
     response_excludes_any: &[String],
     input_contains_any: &[String],
     input_excludes_any: &[String],
+    field_replacements: &[FieldReplacement],
     max_eval_samples: Option<usize>,
     system_field: Option<String>,
     min_system_chars: Option<usize>,
@@ -726,6 +768,7 @@ fn write_sft_cache(
         response_excludes_any: response_excludes_any.to_vec(),
         input_contains_any: input_contains_any.to_vec(),
         input_excludes_any: input_excludes_any.to_vec(),
+        field_replacements: field_replacements.to_vec(),
         max_eval_samples,
         system_field,
         min_system_chars,
@@ -763,7 +806,7 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
-    use crate::runtime::{DataConfig, DataKind};
+    use crate::runtime::{DataConfig, DataKind, FieldReplacement, FieldReplacementTarget};
 
     #[test]
     fn text_dataset_is_packed_and_cached() {
@@ -817,6 +860,7 @@ mod tests {
             min_sample_chars: None,
             max_sample_chars: None,
             dedupe_samples: false,
+            field_replacements: Vec::new(),
             source_weights: Vec::new(),
             source_max_samples: Vec::new(),
             skip_invalid_records: false,
@@ -884,6 +928,7 @@ mod tests {
             min_sample_chars: None,
             max_sample_chars: None,
             dedupe_samples: false,
+            field_replacements: Vec::new(),
             source_weights: Vec::new(),
             source_max_samples: Vec::new(),
             skip_invalid_records: false,
@@ -957,6 +1002,7 @@ mod tests {
             min_sample_chars: None,
             max_sample_chars: None,
             dedupe_samples: false,
+            field_replacements: Vec::new(),
             source_weights: Vec::new(),
             source_max_samples: Vec::new(),
             skip_invalid_records: false,
@@ -1037,6 +1083,7 @@ mod tests {
             min_sample_chars: None,
             max_sample_chars: None,
             dedupe_samples: false,
+            field_replacements: Vec::new(),
             source_weights: Vec::new(),
             source_max_samples: Vec::new(),
             skip_invalid_records: false,
@@ -1116,6 +1163,7 @@ mod tests {
             min_sample_chars: None,
             max_sample_chars: None,
             dedupe_samples: false,
+            field_replacements: Vec::new(),
             source_weights: Vec::new(),
             source_max_samples: Vec::new(),
             skip_invalid_records: false,
@@ -1185,6 +1233,7 @@ mod tests {
             min_sample_chars: None,
             max_sample_chars: None,
             dedupe_samples: false,
+            field_replacements: Vec::new(),
             source_weights: Vec::new(),
             source_max_samples: Vec::new(),
             skip_invalid_records: false,
@@ -1256,6 +1305,7 @@ mod tests {
             min_sample_chars: None,
             max_sample_chars: None,
             dedupe_samples: false,
+            field_replacements: Vec::new(),
             source_weights: Vec::new(),
             source_max_samples: Vec::new(),
             skip_invalid_records: false,
@@ -1330,6 +1380,7 @@ mod tests {
             min_sample_chars: None,
             max_sample_chars: None,
             dedupe_samples: false,
+            field_replacements: Vec::new(),
             source_weights: Vec::new(),
             source_max_samples: Vec::new(),
             skip_invalid_records: false,
@@ -1398,6 +1449,7 @@ mod tests {
             min_sample_chars: None,
             max_sample_chars: None,
             dedupe_samples: false,
+            field_replacements: Vec::new(),
             source_weights: Vec::new(),
             source_max_samples: Vec::new(),
             skip_invalid_records: false,
@@ -1499,6 +1551,7 @@ mod tests {
             min_sample_chars: None,
             max_sample_chars: None,
             dedupe_samples: false,
+            field_replacements: Vec::new(),
             source_weights: Vec::new(),
             source_max_samples: Vec::new(),
             skip_invalid_records: false,
@@ -1569,6 +1622,7 @@ mod tests {
             min_sample_chars: None,
             max_sample_chars: None,
             dedupe_samples: false,
+            field_replacements: Vec::new(),
             source_weights: Vec::new(),
             source_max_samples: Vec::new(),
             skip_invalid_records: false,
@@ -1640,6 +1694,7 @@ mod tests {
             min_sample_chars: None,
             max_sample_chars: None,
             dedupe_samples: false,
+            field_replacements: Vec::new(),
             source_weights: Vec::new(),
             source_max_samples: Vec::new(),
             skip_invalid_records: false,
@@ -1712,6 +1767,7 @@ mod tests {
             min_sample_chars: None,
             max_sample_chars: None,
             dedupe_samples: false,
+            field_replacements: Vec::new(),
             source_weights: Vec::new(),
             source_max_samples: Vec::new(),
             skip_invalid_records: false,
@@ -1785,6 +1841,7 @@ mod tests {
             min_sample_chars: None,
             max_sample_chars: None,
             dedupe_samples: false,
+            field_replacements: Vec::new(),
             source_weights: Vec::new(),
             source_max_samples: Vec::new(),
             skip_invalid_records: false,
@@ -1859,6 +1916,7 @@ mod tests {
             min_sample_chars: None,
             max_sample_chars: None,
             dedupe_samples: false,
+            field_replacements: Vec::new(),
             source_weights: Vec::new(),
             source_max_samples: Vec::new(),
             skip_invalid_records: false,
@@ -1933,6 +1991,7 @@ mod tests {
             min_sample_chars: None,
             max_sample_chars: None,
             dedupe_samples: false,
+            field_replacements: Vec::new(),
             source_weights: Vec::new(),
             source_max_samples: Vec::new(),
             skip_invalid_records: false,
@@ -2007,6 +2066,7 @@ mod tests {
             min_sample_chars: None,
             max_sample_chars: None,
             dedupe_samples: false,
+            field_replacements: Vec::new(),
             source_weights: Vec::new(),
             source_max_samples: Vec::new(),
             skip_invalid_records: false,
@@ -2079,6 +2139,7 @@ mod tests {
             min_sample_chars: None,
             max_sample_chars: None,
             dedupe_samples: false,
+            field_replacements: Vec::new(),
             source_weights: Vec::new(),
             source_max_samples: Vec::new(),
             skip_invalid_records: false,
@@ -2153,6 +2214,7 @@ mod tests {
             min_sample_chars: None,
             max_sample_chars: None,
             dedupe_samples: false,
+            field_replacements: Vec::new(),
             source_weights: Vec::new(),
             source_max_samples: Vec::new(),
             skip_invalid_records: false,
@@ -2229,6 +2291,7 @@ mod tests {
             min_sample_chars: None,
             max_sample_chars: None,
             dedupe_samples: false,
+            field_replacements: Vec::new(),
             source_weights: Vec::new(),
             source_max_samples: Vec::new(),
             skip_invalid_records: false,
@@ -2307,6 +2370,7 @@ mod tests {
             min_sample_chars: None,
             max_sample_chars: None,
             dedupe_samples: false,
+            field_replacements: Vec::new(),
             source_weights: Vec::new(),
             source_max_samples: Vec::new(),
             skip_invalid_records: false,
@@ -2384,6 +2448,7 @@ mod tests {
             min_sample_chars: None,
             max_sample_chars: None,
             dedupe_samples: false,
+            field_replacements: Vec::new(),
             source_weights: Vec::new(),
             source_max_samples: Vec::new(),
             skip_invalid_records: false,
@@ -2458,6 +2523,7 @@ mod tests {
             min_sample_chars: Some(16),
             max_sample_chars: Some(22),
             dedupe_samples: false,
+            field_replacements: Vec::new(),
             source_weights: Vec::new(),
             source_max_samples: Vec::new(),
             skip_invalid_records: false,
@@ -2541,6 +2607,7 @@ mod tests {
             min_sample_chars: None,
             max_sample_chars: None,
             dedupe_samples: false,
+            field_replacements: Vec::new(),
             source_weights: vec![2, 2],
             source_max_samples: Vec::new(),
             skip_invalid_records: false,
@@ -2619,6 +2686,7 @@ mod tests {
             min_sample_chars: None,
             max_sample_chars: None,
             dedupe_samples: false,
+            field_replacements: Vec::new(),
             source_weights: vec![2, 2],
             source_max_samples: vec![1, 2],
             skip_invalid_records: false,
@@ -2693,6 +2761,7 @@ mod tests {
             min_sample_chars: None,
             max_sample_chars: None,
             dedupe_samples: true,
+            field_replacements: Vec::new(),
             source_weights: Vec::new(),
             source_max_samples: Vec::new(),
             skip_invalid_records: false,
@@ -2765,6 +2834,7 @@ mod tests {
             min_sample_chars: None,
             max_sample_chars: None,
             dedupe_samples: false,
+            field_replacements: Vec::new(),
             source_weights: Vec::new(),
             source_max_samples: Vec::new(),
             skip_invalid_records: false,
@@ -2791,6 +2861,94 @@ mod tests {
         assert!(decoded.contains("second"));
         assert!(decoded.contains("third"));
         assert!(!decoded.contains("missing-response"));
+    }
+
+    #[test]
+    fn sft_dataset_applies_field_replacements_before_filters_and_cache() {
+        let dir = tempdir().expect("temp dir should be created");
+        let data_dir = dir.path().join("sft");
+        let cache_dir = dir.path().join("cache");
+        fs::create_dir_all(&data_dir).expect("sft dir should be created");
+        fs::create_dir_all(&cache_dir).expect("cache dir should be created");
+        fs::write(
+            data_dir.join("sample.jsonl"),
+            "{\"instruction\":\"Keep PROJECT_TOKEN\",\"response\":\"APPROVED_TOKEN\"}\n{\"instruction\":\"Also PROJECT_TOKEN\",\"response\":\"APPROVED_TOKEN\"}\n{\"instruction\":\"Drop PROJECT_TOKEN\",\"response\":\"DENIED_TOKEN\"}\n",
+        )
+        .expect("jsonl should write");
+
+        let data = DataConfig {
+            kind: DataKind::InstructionJsonl,
+            paths: vec![data_dir],
+            eval_paths: Vec::new(),
+            train_split: 0.5,
+            max_samples: None,
+            max_eval_samples: None,
+            shuffle: false,
+            index_cache: None,
+            instruction_field: "instruction".to_string(),
+            input_field: "input".to_string(),
+            response_field: "response".to_string(),
+            system_field: None,
+            min_system_chars: None,
+            max_system_chars: None,
+            system_contains_any: Vec::new(),
+            system_excludes_any: Vec::new(),
+            prompt_template: "Instruction:\n{instruction}\n\nResponse:\n".to_string(),
+            prompt_with_input_template:
+                "Instruction:\n{instruction}\n\nInput:\n{input}\n\nResponse:\n".to_string(),
+            trim_fields: true,
+            min_response_chars: 8,
+            max_response_chars: None,
+            instruction_contains_any: vec!["rustrain".to_string()],
+            instruction_excludes_any: Vec::new(),
+            response_contains_any: vec!["approved".to_string()],
+            response_excludes_any: Vec::new(),
+            input_contains_any: Vec::new(),
+            input_excludes_any: Vec::new(),
+            min_instruction_chars: None,
+            max_instruction_chars: None,
+            min_input_chars: None,
+            max_input_chars: None,
+            min_prompt_chars: None,
+            max_prompt_chars: None,
+            min_sample_chars: None,
+            max_sample_chars: None,
+            dedupe_samples: false,
+            field_replacements: vec![
+                FieldReplacement {
+                    field: FieldReplacementTarget::Instruction,
+                    pattern: "PROJECT_TOKEN".to_string(),
+                    replacement: "rustrain".to_string(),
+                },
+                FieldReplacement {
+                    field: FieldReplacementTarget::Response,
+                    pattern: "APPROVED_TOKEN".to_string(),
+                    replacement: "approved".to_string(),
+                },
+            ],
+            source_weights: Vec::new(),
+            source_max_samples: Vec::new(),
+            skip_invalid_records: false,
+        };
+        let dataset =
+            load_sft_dataset(&data, 128, 96, &cache_dir).expect("SFT dataset should load");
+        let decoded = dataset
+            .train_samples
+            .iter()
+            .chain(dataset.eval_samples.iter())
+            .map(|sample| dataset.tokenizer.decode_lossy(&sample.tokens))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let cache_text =
+            fs::read_to_string(cache_dir.join("sft_tokenized.toml")).expect("cache should read");
+
+        assert_eq!(dataset.train_samples.len(), 1);
+        assert_eq!(dataset.eval_samples.len(), 1);
+        assert!(decoded.contains("Keep rustrain"));
+        assert!(decoded.contains("approved"));
+        assert!(!decoded.contains("PROJECT_TOKEN"));
+        assert!(cache_text.contains("field_replacements"));
+        assert!(cache_text.contains("PROJECT_TOKEN"));
     }
 
     #[test]
@@ -2845,6 +3003,7 @@ mod tests {
             min_sample_chars: None,
             max_sample_chars: None,
             dedupe_samples: false,
+            field_replacements: Vec::new(),
             source_weights: Vec::new(),
             source_max_samples: Vec::new(),
             skip_invalid_records: false,

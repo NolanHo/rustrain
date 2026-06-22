@@ -149,11 +149,30 @@ pub struct DataConfig {
     #[serde(default)]
     pub dedupe_samples: bool,
     #[serde(default)]
+    pub field_replacements: Vec<FieldReplacement>,
+    #[serde(default)]
     pub source_weights: Vec<usize>,
     #[serde(default)]
     pub source_max_samples: Vec<usize>,
     #[serde(default)]
     pub skip_invalid_records: bool,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct FieldReplacement {
+    pub field: FieldReplacementTarget,
+    pub pattern: String,
+    pub replacement: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum FieldReplacementTarget {
+    System,
+    Instruction,
+    Input,
+    Response,
+    All,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -694,6 +713,20 @@ pub fn validate_config(config: &Config) -> Result<()> {
                 ));
             }
         }
+        for replacement in &data.field_replacements {
+            if replacement.pattern.is_empty() {
+                return Err(anyhow!(
+                    "data.field_replacements pattern entries must not be empty"
+                ));
+            }
+            if matches!(replacement.field, FieldReplacementTarget::System)
+                && data.system_field.is_none()
+            {
+                return Err(anyhow!(
+                    "data.field_replacements targeting system requires data.system_field to be set"
+                ));
+            }
+        }
     }
 
     Ok(())
@@ -900,6 +933,7 @@ mod tests {
                 min_sample_chars: None,
                 max_sample_chars: None,
                 dedupe_samples: false,
+                field_replacements: Vec::new(),
                 source_weights: Vec::new(),
                 source_max_samples: Vec::new(),
                 skip_invalid_records: false,
