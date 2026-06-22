@@ -6,6 +6,7 @@ source "${SCRIPT_DIR}/require_gpu_worker.sh"
 
 CONFIG="${RUSTRAIN_QWEN_SESSION_SINGLE_SFT_CONFIG:-configs/qwen_session_single_sft.toml}"
 EXPECTED_TRAINABLE_TENSORS="${RUSTRAIN_EXPECTED_QWEN_TRAINABLE_TENSORS:-}"
+EXPECTED_COMPUTE_KIND="${RUSTRAIN_EXPECTED_QWEN_COMPUTE_KIND:-}"
 BASE_OUTPUT="$(mktemp)"
 RESUME_OUTPUT="$(mktemp)"
 
@@ -36,7 +37,7 @@ BASE_DATA_CURSOR_NEXT="${BASE_CURSOR_NEXT##*$'\t'}"
 cargo run -- train --config "${CONFIG}" --resume-from "${MANIFEST_OUTPUT}" \
   | tee "${RESUME_OUTPUT}"
 
-python - "${RESUME_OUTPUT}" "${BASE_DATA_CURSOR_NEXT}" "${EXPECTED_TRAINABLE_TENSORS}" <<'PY'
+python - "${RESUME_OUTPUT}" "${BASE_DATA_CURSOR_NEXT}" "${EXPECTED_TRAINABLE_TENSORS}" "${EXPECTED_COMPUTE_KIND}" <<'PY'
 import ast
 import json
 import math
@@ -45,6 +46,7 @@ import sys
 
 base_data_cursor_next = int(sys.argv[2])
 expected_trainable_tensors = sys.argv[3]
+expected_compute_kind = sys.argv[4]
 values = {}
 for line in pathlib.Path(sys.argv[1]).read_text().splitlines():
     if ": " not in line:
@@ -55,6 +57,7 @@ for line in pathlib.Path(sys.argv[1]).read_text().splitlines():
 required = [
     "resume_from",
     "resumed_checkpoint",
+    "compute_kind",
     "train_steps",
     "step_losses",
     "first_step_grad_norm",
@@ -88,6 +91,10 @@ if missing:
     raise SystemExit(f"resume run is missing fields: {missing}")
 if values["resumed_checkpoint"] != "true":
     raise SystemExit("resume run did not report resumed_checkpoint: true")
+if expected_compute_kind and values["compute_kind"] != expected_compute_kind:
+    raise SystemExit(
+        f"expected compute_kind {expected_compute_kind}, got {values['compute_kind']}"
+    )
 if int(values["train_steps"]) != 2:
     raise SystemExit(f"expected train_steps 2, got {values['train_steps']}")
 step_losses = ast.literal_eval(values["step_losses"])
@@ -174,6 +181,7 @@ if float(values["second_step_delta"]) > 1e-5:
 print(
     "qwen_session_single_sft_resume_verified: "
     f"resume_from={values['resume_from']} "
+    f"compute_kind={values['compute_kind']} "
     f"step_losses={step_losses} "
     f"dataset_total_samples={values['dataset_total_samples']} "
     f"dataset_total_tokens={values['dataset_total_tokens']} "
