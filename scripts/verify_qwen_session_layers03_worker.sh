@@ -13,8 +13,12 @@ cargo run -- train --config "${CONFIG}" | tee "${OUTPUT}"
 
 python - "${OUTPUT}" "${EXPECTED_COMPUTE_KIND}" "${EXPECTED_TRAINABLE_TENSORS}" <<'PY'
 import ast
+import json
 import pathlib
 import sys
+
+sys.path.insert(0, str(pathlib.Path("scripts").resolve()))
+from qwen_verify_utils import require_complete_qwen_base_model_path
 
 values = {}
 for line in pathlib.Path(sys.argv[1]).read_text().splitlines():
@@ -35,6 +39,7 @@ required = [
     "gpu_memory_allocated_mb",
     "reload_delta",
     "second_step_delta",
+    "manifest_output",
     "trainable_tensors",
 ]
 missing = [key for key in required if key not in values]
@@ -74,6 +79,9 @@ if float(values["reload_delta"]) > 1e-5:
     raise SystemExit(f"reload_delta too large: {values['reload_delta']}")
 if float(values["second_step_delta"]) > 1e-5:
     raise SystemExit(f"second_step_delta too large: {values['second_step_delta']}")
+manifest_path = pathlib.Path(values["manifest_output"])
+manifest = json.loads(manifest_path.read_text())
+require_complete_qwen_base_model_path(manifest, manifest_path)
 
 print(
     "qwen_session_layers03_verified: "

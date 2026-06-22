@@ -15,8 +15,12 @@ def require_complete_qwen_model_path(path: str, summary_path: Path | str) -> str
     return str(model_path)
 
 
+def require_complete_qwen_base_model_path(manifest: dict, manifest_path: Path | str) -> str:
+    return require_complete_qwen_model_path(manifest["base_model_path"], manifest_path)
+
+
 def require_complete_qwen_manifest_paths(manifest: dict, manifest_path: Path | str) -> str:
-    base_model_path = Path(require_complete_qwen_model_path(manifest["base_model_path"], manifest_path))
+    base_model_path = Path(require_complete_qwen_base_model_path(manifest, manifest_path))
     tokenizer_path = Path(manifest["tokenizer_path"])
     if not tokenizer_path.exists():
         raise SystemExit(f"{manifest_path} tokenizer_path {tokenizer_path} does not exist")

@@ -17,6 +17,9 @@ import json
 import pathlib
 import sys
 
+sys.path.insert(0, str(pathlib.Path("scripts").resolve()))
+from qwen_verify_utils import require_complete_qwen_base_model_path, require_complete_qwen_model_path
+
 text = pathlib.Path(sys.argv[1]).read_text()
 expected_dtype = sys.argv[2]
 start = text.find("{")
@@ -40,6 +43,7 @@ required_fields = [
     "delta_output",
     "optimizer_output",
     "manifest_output",
+    "model_path",
     "trainable_tensors",
 ]
 missing = [key for key in required_fields if key not in summary]
@@ -73,6 +77,15 @@ for key in ["delta_output", "optimizer_output", "manifest_output"]:
     path = pathlib.Path(summary[key])
     if not path.exists() or path.stat().st_size == 0:
         raise SystemExit(f"{key} missing or empty: {path}")
+
+resolved_model_path = require_complete_qwen_model_path(summary["model_path"], "qwen-full-train-smoke summary")
+manifest_path = pathlib.Path(summary["manifest_output"])
+manifest = json.loads(manifest_path.read_text())
+manifest_model_path = require_complete_qwen_base_model_path(manifest, manifest_path)
+if manifest_model_path != resolved_model_path:
+    raise SystemExit(
+        f"manifest base_model_path {manifest_model_path} did not match summary model_path {resolved_model_path}"
+    )
 
 tensors = summary["trainable_tensors"]
 if len(tensors) != 14:

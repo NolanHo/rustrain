@@ -18,6 +18,9 @@ import pathlib
 import re
 import sys
 
+sys.path.insert(0, str(pathlib.Path("scripts").resolve()))
+from qwen_verify_utils import require_complete_qwen_base_model_path
+
 def parse_source_sample_counts(text):
     entries = re.findall(r'QwenSftSourceSampleCount \{ path: "([^"]+)", samples: (\d+) \}', text)
     if not entries:
@@ -86,6 +89,7 @@ for key in ["reload_delta", "second_step_delta"]:
         raise SystemExit(f"{key} too large: {values[key]}")
 
 manifest = json.loads(pathlib.Path(values["manifest_output"]).read_text())
+require_complete_qwen_base_model_path(manifest, values["manifest_output"])
 if manifest.get("dataset_source_files") != source_files:
     raise SystemExit(
         f"manifest source files {manifest.get('dataset_source_files')} != {source_files}"

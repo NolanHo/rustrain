@@ -44,6 +44,9 @@ import math
 import pathlib
 import sys
 
+sys.path.insert(0, str(pathlib.Path("scripts").resolve()))
+from qwen_verify_utils import require_complete_qwen_base_model_path
+
 base_data_cursor_next = int(sys.argv[2])
 expected_trainable_tensors = sys.argv[3]
 expected_compute_kind = sys.argv[4]
@@ -138,6 +141,7 @@ if not all(str(path).endswith(".jsonl") for path in dataset_source_files):
 if not values["dataset_fingerprint"]:
     raise SystemExit("dataset_fingerprint must not be empty")
 manifest = json.loads(pathlib.Path(values["manifest_output"]).read_text())
+require_complete_qwen_base_model_path(manifest, values["manifest_output"])
 if manifest.get("dataset_source_files") != dataset_source_files:
     raise SystemExit(
         f"manifest dataset_source_files {manifest.get('dataset_source_files')} did not match summary {dataset_source_files}"

@@ -54,6 +54,9 @@ import pathlib
 import re
 import sys
 
+sys.path.insert(0, str(pathlib.Path("scripts").resolve()))
+from qwen_verify_utils import require_complete_qwen_base_model_path
+
 def parse_source_sample_counts(text):
     entries = re.findall(r'QwenSftSourceSampleCount \{ path: "([^"]+)", samples: (\d+) \}', text)
     if not entries:
@@ -175,6 +178,7 @@ dataset_source_sample_counts = verify_source_sample_counts(
 if not values["dataset_fingerprint"]:
     raise SystemExit("dataset_fingerprint must not be empty")
 adapter_manifest = json.loads(pathlib.Path(values["adapter_manifest"]).read_text())
+require_complete_qwen_base_model_path(adapter_manifest, values["adapter_manifest"])
 if adapter_manifest.get("compute_kind") != values["compute_kind"]:
     raise SystemExit(
         f"adapter manifest compute_kind {adapter_manifest.get('compute_kind')} did not match summary {values['compute_kind']}"

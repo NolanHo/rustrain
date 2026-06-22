@@ -16,6 +16,9 @@ import pathlib
 import re
 import sys
 
+sys.path.insert(0, str(pathlib.Path("scripts").resolve()))
+from qwen_verify_utils import require_complete_qwen_base_model_path
+
 def parse_source_sample_counts(text):
     entries = re.findall(r'QwenSftSourceSampleCount \{ path: "([^"]+)", samples: (\d+) \}', text)
     if not entries:
@@ -87,6 +90,7 @@ if values["streaming_train_batches"] != "true":
     )
 
 manifest = json.loads(pathlib.Path(values["manifest_output"]).read_text())
+require_complete_qwen_base_model_path(manifest, values["manifest_output"])
 if manifest.get("dataset_source_files") != expected_sources:
     raise SystemExit(
         f"manifest source files {manifest.get('dataset_source_files')} != {expected_sources}"
