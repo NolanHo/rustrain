@@ -8,6 +8,8 @@ use safetensors::SafeTensors;
 use serde::Deserialize;
 use tokenizers::Tokenizer;
 
+use crate::qwen_module::resolve_qwen_model_path;
+
 #[derive(Debug, Deserialize)]
 struct HfConfig {
     model_type: Option<String>,
@@ -24,7 +26,8 @@ struct HfConfig {
 }
 
 pub fn inspect_model(model_path: &Path, prompt: &str, tensor_limit: usize) -> Result<()> {
-    reject_known_non_hf_safetensors(model_path)?;
+    let model_path = resolve_qwen_model_path(model_path)?;
+    reject_known_non_hf_safetensors(&model_path)?;
 
     let config_path = model_path.join("config.json");
     let tokenizer_path = model_path.join("tokenizer.json");
@@ -66,7 +69,7 @@ pub fn inspect_model(model_path: &Path, prompt: &str, tensor_limit: usize) -> Re
     );
 
     inspect_tokenizer(&tokenizer_path, prompt)?;
-    inspect_safetensors(model_path, tensor_limit)?;
+    inspect_safetensors(&model_path, tensor_limit)?;
 
     Ok(())
 }

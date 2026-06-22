@@ -9133,7 +9133,7 @@ fn read_runtime_config(path: &Path) -> Result<QwenRuntimeConfig> {
     })
 }
 
-fn resolve_qwen_model_path(model_path: &Path) -> Result<PathBuf> {
+pub(crate) fn resolve_qwen_model_path(model_path: &Path) -> Result<PathBuf> {
     if qwen_model_path_is_complete(model_path) {
         return Ok(model_path.to_path_buf());
     }
@@ -9198,7 +9198,7 @@ fn resolve_qwen_model_path(model_path: &Path) -> Result<PathBuf> {
         })
 }
 
-fn qwen_model_path_is_complete(model_path: &Path) -> bool {
+pub(crate) fn qwen_model_path_is_complete(model_path: &Path) -> bool {
     model_path.join("config.json").exists()
         && model_path.join("tokenizer.json").exists()
         && model_path.join("model.safetensors").exists()

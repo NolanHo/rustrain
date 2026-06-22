@@ -9,6 +9,8 @@ use safetensors::SafeTensors;
 use serde::{Deserialize, Serialize};
 use tokenizers::Tokenizer;
 
+use crate::qwen_module::resolve_qwen_model_path;
+
 #[derive(Debug, Deserialize)]
 struct QwenConfig {
     model_type: String,
@@ -55,6 +57,7 @@ pub fn qwen_parity_smoke(
     prompt_file: &Path,
     reference_summary: &Path,
 ) -> Result<()> {
+    let model_path = resolve_qwen_model_path(model_path)?;
     let config = read_config(&model_path.join("config.json"))?;
     validate_config(&config)?;
 
@@ -69,7 +72,7 @@ pub fn qwen_parity_smoke(
     let prompt_token_ids = encoding.get_ids().to_vec();
 
     let reference = read_reference_summary(reference_summary)?;
-    let tensor_specs = read_tensor_specs(model_path)?;
+    let tensor_specs = read_tensor_specs(&model_path)?;
     let checked_tensors = validate_qwen_weight_map(&config, &tensor_specs)?;
     let lm_head_weight_present = tensor_specs.contains_key("lm_head.weight");
 
@@ -97,7 +100,7 @@ pub fn qwen_parity_smoke(
         reference_token_ids_match: reference.input_ids == prompt_token_ids,
         prompt_token_ids,
         reference_logits_shape: reference.logits_shape,
-        safetensors_files: safetensor_files(model_path)?.len(),
+        safetensors_files: safetensor_files(&model_path)?.len(),
         checked_tensors,
         tie_word_embeddings: config.tie_word_embeddings,
         lm_head_weight_present,
