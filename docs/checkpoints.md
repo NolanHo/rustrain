@@ -79,6 +79,46 @@ Acceptance:
   require 98 trainable tensors, including the tied embedding. The bf16 variant
   also asserts `compute_kind = bf16`.
 
+### Qwen LoRA SFT Adapter Checkpoints
+
+The focused Qwen LoRA SFT trainer writes adapter-only checkpoints for
+configured projection targets. These checkpoints are not full model
+checkpoints; they restore LoRA adapter tensors against the local base
+HuggingFace checkpoint and the current `[lora]` configuration.
+`configs/qwen_lora_sft.toml` and `configs/qwen_lora_sft_bf16.toml` both use
+target layers `[0, 1]` and target modules `q_proj`, `k_proj`, `v_proj`,
+`o_proj`, `gate_proj`, `up_proj`, and `down_proj`.
+
+Files:
+
+- `<name>.safetensors`: LoRA adapter tensors.
+- `<name>.safetensors.json`: adapter manifest.
+
+The adapter manifest must record:
+
+- `format = "rustrain.qwen_lora_sft_adapter.v1"`.
+- `base_model_path` and `adapter_safetensors`.
+- `compute_kind`, `steps`, and `train_step`.
+- Dataset provenance: `dataset_source_files`,
+  `dataset_source_sample_counts`, `dataset_fingerprint`,
+  `dataset_order_seed`, `dataset_shuffle`, total/train/eval sample counts,
+  and data cursor/epoch/offset fields.
+- Batch and accumulation metadata: `batch_size` and
+  `gradient_accumulation_steps`.
+- LoRA identity: `target_layers` and `target_modules`.
+
+Acceptance:
+
+- Resuming from the adapter manifest rejects changed LoRA target layers/modules
+  and changed JSONL provenance.
+- Resume starts from manifest `data_cursor_next`, advances by
+  `steps * global_batch_size`, and preserves cursor/epoch/offset consistency.
+- Adapter reload preserves SFT train/eval loss, full-Qwen forward logits, and
+  greedy generation output.
+- Merge/unmerge parity is checked for the focused full-Qwen adapter path, with
+  dtype-aware bf16 tolerances.
+- The bf16 adapter resume verifier asserts `compute_kind = bf16`.
+
 ### Single-GPU `tch-rs` MoE Smoke Checkpoints
 
 The CUDA `tch-moe-smoke` path writes a tiny single-process MoE checkpoint as
