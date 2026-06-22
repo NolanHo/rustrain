@@ -485,11 +485,13 @@ production-grade sharded checkpoint ownership remain open.
   existing fingerprints. `data.field_affixes` can add a prefix and/or suffix
   to the same field targets after case transforms and before whitespace
   normalization and filtering; each entry must set at least one of `prefix` or
-  `suffix`. `data.field_truncations` can then cap `system`, `instruction`,
-  `input`, `response`, or `all` to `max_chars` Unicode scalar values after
-  affixes and before whitespace normalization and filtering; each `max_chars`
-  entry must be greater than zero. The default empty list preserves existing
-  fingerprints.
+  `suffix`. `data.field_splits` can then split `system`, `instruction`,
+  `input`, `response`, or `all` at the first `delimiter` and keep the
+  `before` or `after` side. `data.field_truncations` can then cap the same
+  field targets to `max_chars` Unicode scalar values after splits and before
+  whitespace normalization and filtering; split delimiters must be non-empty,
+  and each `max_chars` entry must be greater than zero. Default empty lists
+  preserve existing fingerprints.
   These transforms run before train/eval splitting, `max_samples`, and
   streaming offset-index construction.
   `data.max_eval_samples` can optionally cap explicit held-out

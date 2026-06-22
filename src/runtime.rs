@@ -161,6 +161,8 @@ pub struct DataConfig {
     #[serde(default)]
     pub field_affixes: Vec<FieldAffix>,
     #[serde(default)]
+    pub field_splits: Vec<FieldSplit>,
+    #[serde(default)]
     pub field_truncations: Vec<FieldTruncation>,
     #[serde(default)]
     pub source_weights: Vec<usize>,
@@ -228,6 +230,20 @@ pub struct FieldAffix {
 pub struct FieldTruncation {
     pub field: FieldReplacementTarget,
     pub max_chars: usize,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct FieldSplit {
+    pub field: FieldReplacementTarget,
+    pub delimiter: String,
+    pub side: FieldSplitSide,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum FieldSplitSide {
+    Before,
+    After,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -821,6 +837,18 @@ pub fn validate_config(config: &Config) -> Result<()> {
                 ));
             }
         }
+        for split in &data.field_splits {
+            if split.delimiter.is_empty() {
+                return Err(anyhow!(
+                    "data.field_splits delimiter entries must not be empty"
+                ));
+            }
+            if matches!(split.field, FieldReplacementTarget::System) && !has_system_source {
+                return Err(anyhow!(
+                    "data.field_splits targeting system requires data.system_field, data.chat_messages_field, or a system field_default to be set"
+                ));
+            }
+        }
         for truncation in &data.field_truncations {
             if truncation.max_chars == 0 {
                 return Err(anyhow!(
@@ -1045,6 +1073,7 @@ mod tests {
                 field_defaults: Vec::new(),
                 field_case_transforms: Vec::new(),
                 field_affixes: Vec::new(),
+                field_splits: Vec::new(),
                 field_truncations: Vec::new(),
                 source_weights: Vec::new(),
                 source_max_samples: Vec::new(),
