@@ -1646,6 +1646,72 @@ struct QwenSftRecord {
     response: String,
 }
 
+struct QwenCompiledRegexReplacement {
+    field: FieldReplacementTarget,
+    regex: regex::Regex,
+    replacement: String,
+}
+
+struct QwenCompiledRegexFilter {
+    field: FieldReplacementTarget,
+    regex: regex::Regex,
+}
+
+struct QwenSftRegexPlan {
+    replacements: Vec<QwenCompiledRegexReplacement>,
+    contains_any: Vec<QwenCompiledRegexFilter>,
+    excludes_any: Vec<QwenCompiledRegexFilter>,
+}
+
+impl QwenSftRegexPlan {
+    fn compile(field_map: &QwenSftFieldMap) -> Result<Self> {
+        let replacements = field_map
+            .field_regex_replacements
+            .iter()
+            .map(|replacement| {
+                let regex = regex::Regex::new(&replacement.pattern).with_context(|| {
+                    format!(
+                        "invalid data.field_regex_replacements pattern {:?}",
+                        replacement.pattern
+                    )
+                })?;
+                Ok(QwenCompiledRegexReplacement {
+                    field: replacement.field.clone(),
+                    regex,
+                    replacement: replacement.replacement.clone(),
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let contains_any = qwen_compile_regex_filters(&field_map.field_regex_contains_any)?;
+        let excludes_any = qwen_compile_regex_filters(&field_map.field_regex_excludes_any)?;
+        Ok(Self {
+            replacements,
+            contains_any,
+            excludes_any,
+        })
+    }
+}
+
+fn qwen_compile_regex_filters(
+    filters: &[FieldRegexFilter],
+) -> Result<Vec<QwenCompiledRegexFilter>> {
+    filters
+        .iter()
+        .map(|filter| {
+            let regex = regex::Regex::new(&filter.pattern).with_context(|| {
+                format!(
+                    "invalid data field regex filter pattern {:?}",
+                    filter.pattern
+                )
+            })?;
+            Ok(QwenCompiledRegexFilter {
+                field: filter.field.clone(),
+                regex,
+            })
+        })
+        .collect()
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 struct QwenSftFieldMap {
     instruction: String,
@@ -11242,6 +11308,7 @@ fn qwen_sft_streaming_token_window_from_jsonl(
     if window_samples == 0 {
         bail!("SFT streaming token window requires at least one sample");
     }
+    let regex_plan = QwenSftRegexPlan::compile(field_map)?;
     let source_index_load =
         qwen_sft_streaming_source_index_with_cache(paths, max_samples, index_cache, field_map)?;
     let source_index = source_index_load.index;
@@ -11275,7 +11342,11 @@ fn qwen_sft_streaming_token_window_from_jsonl(
             train_indices[index].clone()
         })
         .collect::<Vec<_>>();
-    let raw_window = qwen_sft_examples_by_raw_indices(&raw_sample_indices, field_map)?;
+    let raw_window = qwen_sft_examples_by_raw_indices_with_regex_plan(
+        &raw_sample_indices,
+        field_map,
+        &regex_plan,
+    )?;
     let samples = raw_window
         .examples
         .iter()
@@ -11454,6 +11525,7 @@ fn qwen_sft_examples_from_jsonl_paths_with_limit(
     }
     let source_weights = qwen_sft_source_weights(paths.len(), field_map)?;
     let source_max_samples = qwen_sft_source_max_samples(paths.len(), field_map)?;
+    let regex_plan = QwenSftRegexPlan::compile(field_map)?;
     let mut examples = Vec::new();
     let mut source_files = BTreeSet::new();
     let mut source_sample_counts = BTreeMap::new();
@@ -11473,6 +11545,7 @@ fn qwen_sft_examples_from_jsonl_paths_with_limit(
             source_limit,
             source_weight,
             field_map,
+            &regex_plan,
             &mut seen_records,
         )?;
         examples.extend(example_set.examples);
@@ -11520,6 +11593,7 @@ fn qwen_sft_streaming_source_scan(
     }
     let source_weights = qwen_sft_source_weights(paths.len(), field_map)?;
     let source_max_samples = qwen_sft_source_max_samples(paths.len(), field_map)?;
+    let regex_plan = QwenSftRegexPlan::compile(field_map)?;
     let mut samples = Vec::new();
     let mut source_files = BTreeSet::new();
     let mut source_sample_counts = BTreeMap::new();
@@ -11571,13 +11645,18 @@ fn qwen_sft_streaming_source_scan(
                     line_index += 1;
                     continue;
                 }
-                let Some(record) =
-                    maybe_qwen_sft_record_from_jsonl_line(&line, field_map, &file, line_index + 1)?
+                let Some(record) = maybe_qwen_sft_record_from_jsonl_line(
+                    &line,
+                    field_map,
+                    &regex_plan,
+                    &file,
+                    line_index + 1,
+                )?
                 else {
                     line_index += 1;
                     continue;
                 };
-                if !qwen_sft_record_passes_filters(&record, field_map)? {
+                if !qwen_sft_record_passes_filters(&record, field_map, &regex_plan) {
                     line_index += 1;
                     continue;
                 }
@@ -11781,6 +11860,15 @@ fn qwen_sft_examples_by_raw_indices(
     raw_indices: &[QwenSftRawSampleIndex],
     field_map: &QwenSftFieldMap,
 ) -> Result<QwenSftRawExampleWindow> {
+    let regex_plan = QwenSftRegexPlan::compile(field_map)?;
+    qwen_sft_examples_by_raw_indices_with_regex_plan(raw_indices, field_map, &regex_plan)
+}
+
+fn qwen_sft_examples_by_raw_indices_with_regex_plan(
+    raw_indices: &[QwenSftRawSampleIndex],
+    field_map: &QwenSftFieldMap,
+    regex_plan: &QwenSftRegexPlan,
+) -> Result<QwenSftRawExampleWindow> {
     if raw_indices.is_empty() {
         bail!("SFT streaming raw index read requires at least one sample");
     }
@@ -11833,13 +11921,14 @@ fn qwen_sft_examples_by_raw_indices(
             if line.trim().is_empty() {
                 continue;
             }
-            let record = qwen_sft_record_from_jsonl_line(&line, field_map).with_context(|| {
-                format!(
-                    "failed to parse SFT JSONL record {path}:{} at byte offset {}",
-                    index_in_file + 1,
-                    byte_offset
-                )
-            })?;
+            let record = qwen_sft_record_from_jsonl_line(&line, field_map, regex_plan)
+                .with_context(|| {
+                    format!(
+                        "failed to parse SFT JSONL record {path}:{} at byte offset {}",
+                        index_in_file + 1,
+                        byte_offset
+                    )
+                })?;
             loaded.insert(
                 (path.clone(), *index_in_file),
                 QwenSftExample {
@@ -11879,6 +11968,7 @@ fn qwen_sft_examples_from_jsonl_path_with_limit(
     source_max_samples: Option<usize>,
     source_weight: usize,
     field_map: &QwenSftFieldMap,
+    regex_plan: &QwenSftRegexPlan,
     seen_records: &mut Option<HashSet<String>>,
 ) -> Result<QwenSftExampleSet> {
     let files = qwen_sft_jsonl_files(path)?;
@@ -11916,12 +12006,17 @@ fn qwen_sft_examples_from_jsonl_path_with_limit(
             if line.trim().is_empty() {
                 continue;
             }
-            let Some(record) =
-                maybe_qwen_sft_record_from_jsonl_line(&line, field_map, file, line_index + 1)?
+            let Some(record) = maybe_qwen_sft_record_from_jsonl_line(
+                &line,
+                field_map,
+                regex_plan,
+                file,
+                line_index + 1,
+            )?
             else {
                 continue;
             };
-            if !qwen_sft_record_passes_filters(&record, field_map)? {
+            if !qwen_sft_record_passes_filters(&record, field_map, regex_plan) {
                 continue;
             }
             if let Some(seen_records) = seen_records {
@@ -12088,6 +12183,7 @@ fn qwen_sft_jsonl_files(path: &Path) -> Result<Vec<PathBuf>> {
 fn qwen_sft_record_from_jsonl_line(
     line: &str,
     field_map: &QwenSftFieldMap,
+    regex_plan: &QwenSftRegexPlan,
 ) -> Result<QwenSftRecord> {
     let values: BTreeMap<String, serde_json::Value> =
         serde_json::from_str(line).context("invalid JSON object")?;
@@ -12095,7 +12191,7 @@ fn qwen_sft_record_from_jsonl_line(
         let mut record = qwen_sft_record_from_chat_messages(&values, messages_field, field_map)?;
         qwen_apply_field_defaults(&mut record, &field_map.field_defaults);
         qwen_apply_field_replacements(&mut record, &field_map.field_replacements);
-        qwen_apply_field_regex_replacements(&mut record, &field_map.field_regex_replacements)?;
+        qwen_apply_field_regex_replacements(&mut record, &regex_plan.replacements);
         qwen_apply_field_case_transforms(&mut record, &field_map.field_case_transforms);
         qwen_apply_field_affixes(&mut record, &field_map.field_affixes);
         qwen_apply_field_splits(&mut record, &field_map.field_splits);
@@ -12139,7 +12235,7 @@ fn qwen_sft_record_from_jsonl_line(
     };
     qwen_apply_field_defaults(&mut record, &field_map.field_defaults);
     qwen_apply_field_replacements(&mut record, &field_map.field_replacements);
-    qwen_apply_field_regex_replacements(&mut record, &field_map.field_regex_replacements)?;
+    qwen_apply_field_regex_replacements(&mut record, &regex_plan.replacements);
     qwen_apply_field_case_transforms(&mut record, &field_map.field_case_transforms);
     qwen_apply_field_affixes(&mut record, &field_map.field_affixes);
     qwen_apply_field_splits(&mut record, &field_map.field_splits);
@@ -12218,10 +12314,11 @@ fn qwen_required_chat_message_string_field(
 fn maybe_qwen_sft_record_from_jsonl_line(
     line: &str,
     field_map: &QwenSftFieldMap,
+    regex_plan: &QwenSftRegexPlan,
     file: &Path,
     line_number: usize,
 ) -> Result<Option<QwenSftRecord>> {
-    match qwen_sft_record_from_jsonl_line(line, field_map) {
+    match qwen_sft_record_from_jsonl_line(line, field_map, regex_plan) {
         Ok(record) => Ok(Some(record)),
         Err(error) if field_map.skip_invalid_records => {
             tracing::warn!(
@@ -12289,20 +12386,15 @@ fn qwen_apply_field_replacements(record: &mut QwenSftRecord, replacements: &[Fie
 
 fn qwen_apply_field_regex_replacements(
     record: &mut QwenSftRecord,
-    replacements: &[FieldRegexReplacement],
-) -> Result<()> {
+    replacements: &[QwenCompiledRegexReplacement],
+) {
     for replacement in replacements {
-        let regex = regex::Regex::new(&replacement.pattern).with_context(|| {
-            format!(
-                "invalid data.field_regex_replacements pattern {:?}",
-                replacement.pattern
-            )
-        })?;
         if matches!(
             replacement.field,
             FieldReplacementTarget::System | FieldReplacementTarget::All
         ) {
-            record.system = regex
+            record.system = replacement
+                .regex
                 .replace_all(&record.system, replacement.replacement.as_str())
                 .into_owned();
         }
@@ -12310,7 +12402,8 @@ fn qwen_apply_field_regex_replacements(
             replacement.field,
             FieldReplacementTarget::Instruction | FieldReplacementTarget::All
         ) {
-            record.instruction = regex
+            record.instruction = replacement
+                .regex
                 .replace_all(&record.instruction, replacement.replacement.as_str())
                 .into_owned();
         }
@@ -12318,7 +12411,8 @@ fn qwen_apply_field_regex_replacements(
             replacement.field,
             FieldReplacementTarget::Input | FieldReplacementTarget::All
         ) {
-            record.input = regex
+            record.input = replacement
+                .regex
                 .replace_all(&record.input, replacement.replacement.as_str())
                 .into_owned();
         }
@@ -12326,12 +12420,12 @@ fn qwen_apply_field_regex_replacements(
             replacement.field,
             FieldReplacementTarget::Response | FieldReplacementTarget::All
         ) {
-            record.response = regex
+            record.response = replacement
+                .regex
                 .replace_all(&record.response, replacement.replacement.as_str())
                 .into_owned();
         }
     }
-    Ok(())
 }
 
 fn qwen_apply_field_defaults(record: &mut QwenSftRecord, defaults: &[FieldDefault]) {
@@ -12529,7 +12623,8 @@ fn qwen_sft_record_dedupe_key(record: &QwenSftRecord) -> String {
 fn qwen_sft_record_passes_filters(
     record: &QwenSftRecord,
     field_map: &QwenSftFieldMap,
-) -> Result<bool> {
+    regex_plan: &QwenSftRegexPlan,
+) -> bool {
     let needs_prompt_chars = field_map.min_prompt_chars.is_some()
         || field_map.max_prompt_chars.is_some()
         || field_map.min_sample_chars.is_some()
@@ -12543,7 +12638,7 @@ fn qwen_sft_record_passes_filters(
     } else {
         None
     };
-    Ok(qwen_sft_length_filter_passes(
+    qwen_sft_length_filter_passes(
         record.response.chars().count(),
         Some(field_map.min_response_chars),
         field_map.max_response_chars,
@@ -12563,24 +12658,23 @@ fn qwen_sft_record_passes_filters(
         record.instruction.chars().count(),
         field_map.min_instruction_chars,
         field_map.max_instruction_chars,
-    ) && qwen_sft_string_contains_any_filter_passes(
-        &record.input,
-        &field_map.input_contains_any,
-    ) && qwen_sft_string_excludes_any_filter_passes(
-        &record.input,
-        &field_map.input_excludes_any,
-    ) && qwen_sft_length_filter_passes(
-        record.input.chars().count(),
-        field_map.min_input_chars,
-        field_map.max_input_chars,
-    ) && qwen_sft_string_contains_any_filter_passes(
-        &record.system,
-        &field_map.system_contains_any,
-    ) && qwen_sft_string_excludes_any_filter_passes(
-        &record.system,
-        &field_map.system_excludes_any,
-    ) && qwen_sft_regex_contains_any_filter_passes(record, &field_map.field_regex_contains_any)?
-        && qwen_sft_regex_excludes_any_filter_passes(record, &field_map.field_regex_excludes_any)?
+    ) && qwen_sft_string_contains_any_filter_passes(&record.input, &field_map.input_contains_any)
+        && qwen_sft_string_excludes_any_filter_passes(&record.input, &field_map.input_excludes_any)
+        && qwen_sft_length_filter_passes(
+            record.input.chars().count(),
+            field_map.min_input_chars,
+            field_map.max_input_chars,
+        )
+        && qwen_sft_string_contains_any_filter_passes(
+            &record.system,
+            &field_map.system_contains_any,
+        )
+        && qwen_sft_string_excludes_any_filter_passes(
+            &record.system,
+            &field_map.system_excludes_any,
+        )
+        && qwen_sft_regex_contains_any_filter_passes(record, &regex_plan.contains_any)
+        && qwen_sft_regex_excludes_any_filter_passes(record, &regex_plan.excludes_any)
         && qwen_sft_length_filter_passes(
             record.system.chars().count(),
             field_map.min_system_chars,
@@ -12596,7 +12690,7 @@ fn qwen_sft_record_passes_filters(
                 field_map.min_sample_chars,
                 field_map.max_sample_chars,
             )
-        }))
+        })
 }
 
 fn qwen_sft_length_filter_passes(
@@ -12617,58 +12711,42 @@ fn qwen_sft_string_excludes_any_filter_passes(value: &str, needles: &[String]) -
 
 fn qwen_sft_regex_contains_any_filter_passes(
     record: &QwenSftRecord,
-    filters: &[FieldRegexFilter],
-) -> Result<bool> {
+    filters: &[QwenCompiledRegexFilter],
+) -> bool {
     if filters.is_empty() {
-        return Ok(true);
+        return true;
     }
     for filter in filters {
-        let regex = regex::Regex::new(&filter.pattern).with_context(|| {
-            format!(
-                "invalid data field regex filter pattern {:?}",
-                filter.pattern
-            )
-        })?;
-        if qwen_sft_regex_filter_matches(record, filter, &regex) {
-            return Ok(true);
+        if qwen_sft_regex_filter_matches(record, filter) {
+            return true;
         }
     }
-    Ok(false)
+    false
 }
 
 fn qwen_sft_regex_excludes_any_filter_passes(
     record: &QwenSftRecord,
-    filters: &[FieldRegexFilter],
-) -> Result<bool> {
+    filters: &[QwenCompiledRegexFilter],
+) -> bool {
     for filter in filters {
-        let regex = regex::Regex::new(&filter.pattern).with_context(|| {
-            format!(
-                "invalid data field regex filter pattern {:?}",
-                filter.pattern
-            )
-        })?;
-        if qwen_sft_regex_filter_matches(record, filter, &regex) {
-            return Ok(false);
+        if qwen_sft_regex_filter_matches(record, filter) {
+            return false;
         }
     }
-    Ok(true)
+    true
 }
 
-fn qwen_sft_regex_filter_matches(
-    record: &QwenSftRecord,
-    filter: &FieldRegexFilter,
-    regex: &regex::Regex,
-) -> bool {
+fn qwen_sft_regex_filter_matches(record: &QwenSftRecord, filter: &QwenCompiledRegexFilter) -> bool {
     match filter.field {
-        FieldReplacementTarget::System => regex.is_match(&record.system),
-        FieldReplacementTarget::Instruction => regex.is_match(&record.instruction),
-        FieldReplacementTarget::Input => regex.is_match(&record.input),
-        FieldReplacementTarget::Response => regex.is_match(&record.response),
+        FieldReplacementTarget::System => filter.regex.is_match(&record.system),
+        FieldReplacementTarget::Instruction => filter.regex.is_match(&record.instruction),
+        FieldReplacementTarget::Input => filter.regex.is_match(&record.input),
+        FieldReplacementTarget::Response => filter.regex.is_match(&record.response),
         FieldReplacementTarget::All => {
-            regex.is_match(&record.system)
-                || regex.is_match(&record.instruction)
-                || regex.is_match(&record.input)
-                || regex.is_match(&record.response)
+            filter.regex.is_match(&record.system)
+                || filter.regex.is_match(&record.instruction)
+                || filter.regex.is_match(&record.input)
+                || filter.regex.is_match(&record.response)
         }
     }
 }
@@ -15427,12 +15505,15 @@ mod tests {
         )
         .expect("jsonl should write");
 
+        let field_map = QwenSftFieldMap::default();
+        let regex_plan = QwenSftRegexPlan::compile(&field_map).expect("regex plan should compile");
         let example_set = qwen_sft_examples_from_jsonl_path_with_limit(
             &jsonl,
             None,
             None,
             1,
-            &QwenSftFieldMap::default(),
+            &field_map,
+            &regex_plan,
             &mut None,
         )
         .expect("examples should load from jsonl");
@@ -16005,6 +16086,56 @@ mod tests {
     }
 
     #[test]
+    fn qwen_sft_reuses_compiled_regex_plan_across_records() {
+        let field_map = QwenSftFieldMap {
+            response_contains_any: vec!["approved id".to_string()],
+            field_regex_replacements: vec![FieldRegexReplacement {
+                field: FieldReplacementTarget::Response,
+                pattern: r"APPROVED:\d+".to_string(),
+                replacement: "approved id".to_string(),
+            }],
+            field_regex_contains_any: vec![FieldRegexFilter {
+                field: FieldReplacementTarget::Instruction,
+                pattern: r"project-\d+".to_string(),
+            }],
+            field_regex_excludes_any: vec![FieldRegexFilter {
+                field: FieldReplacementTarget::Input,
+                pattern: r"blocked".to_string(),
+            }],
+            ..QwenSftFieldMap::default()
+        };
+        let regex_plan = QwenSftRegexPlan::compile(&field_map).expect("regex plan should compile");
+        let first = qwen_sft_record_from_jsonl_line(
+            r#"{"instruction":"Keep project-123","input":"GPU context","response":"APPROVED:42"}"#,
+            &field_map,
+            &regex_plan,
+        )
+        .expect("first record should parse");
+        let second = qwen_sft_record_from_jsonl_line(
+            r#"{"instruction":"Drop project-456","input":"blocked context","response":"APPROVED:99"}"#,
+            &field_map,
+            &regex_plan,
+        )
+        .expect("second record should parse");
+
+        assert_eq!(first.response, "approved id");
+        assert!(qwen_sft_record_passes_filters(
+            &first,
+            &field_map,
+            &regex_plan
+        ));
+        assert_eq!(second.response, "approved id");
+        assert!(!qwen_sft_record_passes_filters(
+            &second,
+            &field_map,
+            &regex_plan
+        ));
+        assert_eq!(regex_plan.replacements.len(), 1);
+        assert_eq!(regex_plan.contains_any.len(), 1);
+        assert_eq!(regex_plan.excludes_any.len(), 1);
+    }
+
+    #[test]
     fn qwen_sft_normalizes_whitespace_after_replacements_before_filters_and_fingerprint() {
         let temp = tempfile::tempdir().expect("temp dir should be created");
         let jsonl = temp.path().join("samples.jsonl");
@@ -16441,9 +16572,14 @@ mod tests {
             trim_fields: false,
             ..QwenSftFieldMap::default()
         };
-        let trimmed =
-            qwen_sft_record_from_jsonl_line(line, &trim_map).expect("trimmed record should parse");
-        let raw = qwen_sft_record_from_jsonl_line(line, &raw_map).expect("raw record should parse");
+        let trim_regex_plan =
+            QwenSftRegexPlan::compile(&trim_map).expect("trim regex plan should compile");
+        let raw_regex_plan =
+            QwenSftRegexPlan::compile(&raw_map).expect("raw regex plan should compile");
+        let trimmed = qwen_sft_record_from_jsonl_line(line, &trim_map, &trim_regex_plan)
+            .expect("trimmed record should parse");
+        let raw = qwen_sft_record_from_jsonl_line(line, &raw_map, &raw_regex_plan)
+            .expect("raw record should parse");
         let trimmed_example = QwenSftExample {
             system: trimmed.system.clone(),
             instruction: trimmed.instruction.clone(),

@@ -491,7 +491,10 @@ production-grade sharded checkpoint ownership remain open.
   records when any selected field matches its regex. These regex filters run
   after transforms and whitespace normalization but before deduplication,
   source weighting, splitting, and streaming indexing; empty or invalid regex
-  patterns are rejected.
+  patterns are rejected. Qwen JSONL SFT scan, streaming-index, and raw-offset
+  replay paths compile regex replacements and filters once per field map and
+  reuse the compiled plan across records, so invalid patterns fail before the
+  scan while cache manifests continue to record the raw serializable config.
   `data.field_case_transforms` can then lowercase or uppercase `system`,
   `instruction`, `input`, `response`, or `all` after replacements and before
   whitespace normalization and filtering. The default empty list preserves

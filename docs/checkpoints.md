@@ -172,7 +172,11 @@ Acceptance:
   instruction/input/system/prompt/sample/response filtering or
   instruction/response substring/dedupe policy, source weighting policy,
   per-source sample-limit policy, or invalid-record handling policy are
-  rejected.
+  rejected. Qwen JSONL SFT loaders compile regex replacement and filter entries
+  once per resolved field map, then reuse that compiled plan for materialized
+  scans, tokenizer-free streaming summaries, offset-index construction, and
+  raw-offset replay; the manifest and cache identity still store and compare
+  the raw serializable regex configuration.
   The field mapping entries can be flat JSON keys or dotted JSON paths; exact
   top-level keys are resolved before path traversal so flat columns containing
   dots keep their existing meaning.
