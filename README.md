@@ -253,6 +253,10 @@ extends that JSONL path to layer0-layer3 with 49 trainable tensors.
 `configs/qwen_session_dp2_layers07_sft.toml` extends the same JSONL path to
 layer0-layer7 with 97 trainable tensors and keeps the dataset
 provenance/cursor and rank0/sharded checkpoint parity checks.
+`configs/qwen_session_dp2_sft_max_samples.toml` verifies that the DP=2 JSONL
+SFT data plan applies `data.max_samples` before train/eval splitting, keeps
+global cursor math consistent with the truncated train set, and records only
+consumed source files in provenance.
 `configs/qwen_session_dp2_layers01_sft_bf16.toml`
 verifies the layer0+layer1 tokenizer-backed DP path under bf16 compute,
 `configs/qwen_session_dp2_layers03_sft_bf16.toml` verifies the layer0-layer3
