@@ -1590,6 +1590,39 @@ struct QwenSftTrainEvalDatasets {
     eval_dataset: QwenSftDataset,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct QwenSftStreamingSourceSummary {
+    samples: usize,
+    source_files: Vec<String>,
+    source_sample_counts: Vec<QwenSftSourceSampleCount>,
+    fingerprint: String,
+}
+
+#[derive(Debug, Serialize)]
+struct QwenSftStreamingDataPlanSummary {
+    config_path: String,
+    data_paths: Vec<String>,
+    eval_paths: Vec<String>,
+    max_samples: Option<usize>,
+    train_split: f32,
+    dataset_total_samples: usize,
+    dataset_train_samples: usize,
+    dataset_eval_samples: usize,
+    dataset_source_files: Vec<String>,
+    dataset_source_sample_counts: Vec<QwenSftSourceSampleCount>,
+    dataset_fingerprint: String,
+    dataset_order_seed: u64,
+    dataset_shuffle: bool,
+    train_source_files: Vec<String>,
+    train_source_sample_counts: Vec<QwenSftSourceSampleCount>,
+    train_fingerprint: String,
+    eval_source_files: Vec<String>,
+    eval_source_sample_counts: Vec<QwenSftSourceSampleCount>,
+    eval_fingerprint: String,
+    tokenizer_loaded: bool,
+    tokenized_samples_materialized: bool,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct QwenSftSourceSampleCount {
     pub(crate) path: String,
@@ -5289,6 +5322,102 @@ pub fn qwen_session_dp_data_plan(
         dataset_fingerprint: dataset_summary.fingerprint,
         dataset_order_seed: config.run.seed,
         dataset_shuffle: dataset_summary.shuffle,
+    };
+    println!("{}", serde_json::to_string_pretty(&summary)?);
+    Ok(())
+}
+
+pub fn qwen_sft_streaming_data_plan(config_path: &Path) -> Result<()> {
+    let config = load_config(config_path)?;
+    let data_config = config
+        .data
+        .as_ref()
+        .context("qwen SFT streaming data plan requires [data]")?;
+    if data_config.kind != RuntimeDataKind::InstructionJsonl {
+        bail!("qwen SFT streaming data plan supports kind = instruction_jsonl");
+    }
+
+    let train_summary =
+        qwen_sft_streaming_source_summary(&data_config.paths, data_config.max_samples)?;
+    let (
+        dataset_total_samples,
+        dataset_train_samples,
+        dataset_eval_samples,
+        dataset_source_files,
+        dataset_source_sample_counts,
+        dataset_fingerprint,
+        eval_summary,
+    ) = if data_config.eval_paths.is_empty() {
+        let (train_samples, eval_samples) =
+            qwen_sft_train_eval_sample_counts(train_summary.samples, data_config.train_split)?;
+        (
+            train_summary.samples,
+            train_samples,
+            eval_samples,
+            train_summary.source_files.clone(),
+            train_summary.source_sample_counts.clone(),
+            train_summary.fingerprint.clone(),
+            QwenSftStreamingSourceSummary {
+                samples: eval_samples,
+                source_files: Vec::new(),
+                source_sample_counts: Vec::new(),
+                fingerprint: String::new(),
+            },
+        )
+    } else {
+        let eval_summary = qwen_sft_streaming_source_summary(&data_config.eval_paths, None)?;
+        let combined_source_files =
+            qwen_merge_sft_source_files(&train_summary.source_files, &eval_summary.source_files);
+        let combined_source_sample_counts = qwen_merge_sft_source_sample_counts(
+            &train_summary.source_sample_counts,
+            &eval_summary.source_sample_counts,
+        );
+        let combined_fingerprint = qwen_combine_sft_fingerprints(
+            &combined_source_files,
+            &train_summary.fingerprint,
+            &eval_summary.fingerprint,
+        );
+        (
+            train_summary.samples + eval_summary.samples,
+            train_summary.samples,
+            eval_summary.samples,
+            combined_source_files,
+            combined_source_sample_counts,
+            combined_fingerprint,
+            eval_summary,
+        )
+    };
+
+    let summary = QwenSftStreamingDataPlanSummary {
+        config_path: config_path.display().to_string(),
+        data_paths: data_config
+            .paths
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect(),
+        eval_paths: data_config
+            .eval_paths
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect(),
+        max_samples: data_config.max_samples,
+        train_split: data_config.train_split,
+        dataset_total_samples,
+        dataset_train_samples,
+        dataset_eval_samples,
+        dataset_source_files,
+        dataset_source_sample_counts,
+        dataset_fingerprint,
+        dataset_order_seed: config.run.seed,
+        dataset_shuffle: data_config.shuffle,
+        train_source_files: train_summary.source_files,
+        train_source_sample_counts: train_summary.source_sample_counts,
+        train_fingerprint: train_summary.fingerprint,
+        eval_source_files: eval_summary.source_files,
+        eval_source_sample_counts: eval_summary.source_sample_counts,
+        eval_fingerprint: eval_summary.fingerprint,
+        tokenizer_loaded: false,
+        tokenized_samples_materialized: false,
     };
     println!("{}", serde_json::to_string_pretty(&summary)?);
     Ok(())
@@ -9715,8 +9844,7 @@ impl QwenSftDataset {
         if self.samples.len() < 2 {
             bail!("SFT train/eval split requires at least two samples");
         }
-        let split_at = ((self.samples.len() as f32) * train_split).floor() as usize;
-        let split_at = split_at.clamp(1, self.samples.len() - 1);
+        let (split_at, _) = qwen_sft_train_eval_sample_counts(self.samples.len(), train_split)?;
         Ok((
             Self {
                 samples: self.samples[..split_at].to_vec(),
@@ -9818,6 +9946,21 @@ impl QwenSftDataset {
         self.fingerprint = fingerprint;
         self
     }
+}
+
+fn qwen_sft_train_eval_sample_counts(
+    total_samples: usize,
+    train_split: f32,
+) -> Result<(usize, usize)> {
+    if !(0.0..1.0).contains(&train_split) {
+        bail!("SFT train_split must be in (0, 1)");
+    }
+    if total_samples < 2 {
+        bail!("SFT train/eval split requires at least two samples");
+    }
+    let train_samples = ((total_samples as f32) * train_split).floor() as usize;
+    let train_samples = train_samples.clamp(1, total_samples - 1);
+    Ok((train_samples, total_samples - train_samples))
 }
 
 fn qwen_apply_sft_shuffle(dataset: QwenSftDataset, shuffle: bool, seed: u64) -> QwenSftDataset {
@@ -10063,6 +10206,136 @@ fn qwen_sft_examples_from_jsonl_path_with_limit(
     })
 }
 
+fn qwen_sft_streaming_source_summary(
+    paths: &[PathBuf],
+    max_samples: Option<usize>,
+) -> Result<QwenSftStreamingSourceSummary> {
+    if paths.is_empty() {
+        bail!("SFT dataset must contain at least one JSONL path");
+    }
+    if max_samples == Some(0) {
+        bail!("SFT data.max_samples must be greater than zero");
+    }
+
+    let mut samples = 0usize;
+    let mut source_files = BTreeSet::new();
+    let mut source_sample_counts = BTreeMap::new();
+    for path in paths {
+        if max_samples.is_some_and(|limit| samples >= limit) {
+            break;
+        }
+        for file in qwen_sft_jsonl_files(path)? {
+            if max_samples.is_some_and(|limit| samples >= limit) {
+                break;
+            }
+            let file_path = file.display().to_string();
+            let reader = BufReader::new(
+                fs::File::open(&file)
+                    .with_context(|| format!("failed to read {}", file.display()))?,
+            );
+            let before = samples;
+            for (line_index, line) in reader.lines().enumerate() {
+                if max_samples.is_some_and(|limit| samples >= limit) {
+                    break;
+                }
+                let line = line.with_context(|| {
+                    format!(
+                        "failed to read SFT JSONL record {}:{}",
+                        file.display(),
+                        line_index + 1
+                    )
+                })?;
+                if line.trim().is_empty() {
+                    continue;
+                }
+                let record: QwenSftRecord = serde_json::from_str(&line).with_context(|| {
+                    format!(
+                        "failed to parse SFT JSONL record {}:{}",
+                        file.display(),
+                        line_index + 1
+                    )
+                })?;
+                source_files.insert(file_path.clone());
+                drop(record);
+                samples += 1;
+            }
+            let consumed = samples - before;
+            if consumed > 0 {
+                *source_sample_counts.entry(file_path).or_insert(0) += consumed;
+            }
+        }
+    }
+    if samples == 0 {
+        bail!("SFT dataset must contain at least one example");
+    }
+
+    let source_files = source_files.into_iter().collect::<Vec<_>>();
+    let fingerprint = qwen_sft_streaming_fingerprint(paths, max_samples, &source_files)?;
+    Ok(QwenSftStreamingSourceSummary {
+        samples,
+        source_files,
+        source_sample_counts: source_sample_counts
+            .into_iter()
+            .map(|(path, samples)| QwenSftSourceSampleCount { path, samples })
+            .collect(),
+        fingerprint,
+    })
+}
+
+fn qwen_sft_streaming_fingerprint(
+    paths: &[PathBuf],
+    max_samples: Option<usize>,
+    source_files: &[String],
+) -> Result<String> {
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    for file in source_files {
+        qwen_sft_hash_bytes(&mut hash, b"path");
+        qwen_sft_hash_bytes(&mut hash, file.as_bytes());
+        qwen_sft_hash_bytes(&mut hash, b"\0");
+    }
+
+    let mut samples = 0usize;
+    for path in paths {
+        if max_samples.is_some_and(|limit| samples >= limit) {
+            break;
+        }
+        for file in qwen_sft_jsonl_files(path)? {
+            if max_samples.is_some_and(|limit| samples >= limit) {
+                break;
+            }
+            let reader = BufReader::new(
+                fs::File::open(&file)
+                    .with_context(|| format!("failed to read {}", file.display()))?,
+            );
+            for (line_index, line) in reader.lines().enumerate() {
+                if max_samples.is_some_and(|limit| samples >= limit) {
+                    break;
+                }
+                let line = line.with_context(|| {
+                    format!(
+                        "failed to read SFT JSONL record {}:{}",
+                        file.display(),
+                        line_index + 1
+                    )
+                })?;
+                if line.trim().is_empty() {
+                    continue;
+                }
+                let record: QwenSftRecord = serde_json::from_str(&line).with_context(|| {
+                    format!(
+                        "failed to parse SFT JSONL record {}:{}",
+                        file.display(),
+                        line_index + 1
+                    )
+                })?;
+                qwen_sft_hash_record(&mut hash, &record);
+                samples += 1;
+            }
+        }
+    }
+    Ok(format!("{hash:016x}"))
+}
+
 fn qwen_sft_jsonl_files(path: &Path) -> Result<Vec<PathBuf>> {
     if path.is_dir() {
         let mut sorted = BTreeSet::new();
@@ -10094,15 +10367,29 @@ fn qwen_sft_dataset_fingerprint(source_files: &[String], examples: &[QwenSftExam
         qwen_sft_hash_bytes(&mut hash, b"\0");
     }
     for example in examples {
-        qwen_sft_hash_bytes(&mut hash, b"instruction");
-        qwen_sft_hash_bytes(&mut hash, example.instruction.as_bytes());
-        qwen_sft_hash_bytes(&mut hash, b"\0input");
-        qwen_sft_hash_bytes(&mut hash, example.input.as_bytes());
-        qwen_sft_hash_bytes(&mut hash, b"\0response");
-        qwen_sft_hash_bytes(&mut hash, example.response.as_bytes());
-        qwen_sft_hash_bytes(&mut hash, b"\0");
+        qwen_sft_hash_example(&mut hash, example);
     }
     format!("{hash:016x}")
+}
+
+fn qwen_sft_hash_record(hash: &mut u64, record: &QwenSftRecord) {
+    qwen_sft_hash_bytes(hash, b"instruction");
+    qwen_sft_hash_bytes(hash, record.instruction.as_bytes());
+    qwen_sft_hash_bytes(hash, b"\0input");
+    qwen_sft_hash_bytes(hash, record.input.as_bytes());
+    qwen_sft_hash_bytes(hash, b"\0response");
+    qwen_sft_hash_bytes(hash, record.response.as_bytes());
+    qwen_sft_hash_bytes(hash, b"\0");
+}
+
+fn qwen_sft_hash_example(hash: &mut u64, example: &QwenSftExample) {
+    qwen_sft_hash_bytes(hash, b"instruction");
+    qwen_sft_hash_bytes(hash, example.instruction.as_bytes());
+    qwen_sft_hash_bytes(hash, b"\0input");
+    qwen_sft_hash_bytes(hash, example.input.as_bytes());
+    qwen_sft_hash_bytes(hash, b"\0response");
+    qwen_sft_hash_bytes(hash, example.response.as_bytes());
+    qwen_sft_hash_bytes(hash, b"\0");
 }
 
 fn qwen_sft_hash_bytes(hash: &mut u64, bytes: &[u8]) {
@@ -12710,6 +12997,45 @@ mod tests {
             limited.fingerprint,
             qwen_sft_dataset_fingerprint(&limited.source_files, &limited.examples)
         );
+    }
+
+    #[test]
+    fn qwen_sft_streaming_summary_matches_jsonl_reader_without_materializing_tokens() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let first = temp.path().join("first.jsonl");
+        let second = temp.path().join("second.jsonl");
+        let third = temp.path().join("third.jsonl");
+        fs::write(
+            &first,
+            r#"{"instruction":"one","response":"a"}
+{"instruction":"two","input":"input","response":"b"}
+"#,
+        )
+        .expect("first jsonl should write");
+        fs::write(
+            &second,
+            r#"{"instruction":"three","response":"c"}
+{"instruction":"four","response":"d"}
+"#,
+        )
+        .expect("second jsonl should write");
+        fs::write(
+            &third,
+            r#"{"instruction":"five","response":"e"}
+"#,
+        )
+        .expect("third jsonl should write");
+
+        let paths = vec![first.clone(), second.clone(), third];
+        let loaded = qwen_sft_examples_from_jsonl_paths_with_limit(&paths, Some(3))
+            .expect("limited examples should load");
+        let streamed = qwen_sft_streaming_source_summary(&paths, Some(3))
+            .expect("streaming summary should scan");
+
+        assert_eq!(streamed.samples, loaded.examples.len());
+        assert_eq!(streamed.source_files, loaded.source_files);
+        assert_eq!(streamed.source_sample_counts, loaded.source_sample_counts);
+        assert_eq!(streamed.fingerprint, loaded.fingerprint);
     }
 
     #[test]

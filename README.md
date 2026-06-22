@@ -406,6 +406,9 @@ production-grade sharded checkpoint ownership remain open.
   adapter resume remains available for compatibility when manifest metadata is
   absent, restores adapter weights, and writes a fresh manifest without claiming
   saved data-cursor continuity.
+  `cargo run -- qwen-sft-streaming-data-plan --config ...` provides a
+  tokenizer-free streaming JSONL scan for SFT provenance, source sample counts,
+  split sizes, and fingerprints without materializing tokenized samples.
   Production data loading and arbitrary-module LoRA injection are still open.
 - Real Qwen module-level LoRA now uses a target-layer/module registry for
   configured attention and MLP projection modules; trainer-owned full-model LoRA

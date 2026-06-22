@@ -174,6 +174,11 @@ enum Command {
         #[arg(long, default_value_t = 100.0)]
         learning_rate: f64,
     },
+    #[command(hide = true)]
+    QwenSftStreamingDataPlan {
+        #[arg(long)]
+        config: PathBuf,
+    },
     QwenTiedHeadTrainSmoke {
         #[arg(
             long,
@@ -473,6 +478,9 @@ fn main() -> Result<()> {
             alpha,
             learning_rate,
         ),
+        Command::QwenSftStreamingDataPlan { config } => {
+            qwen_module::qwen_sft_streaming_data_plan(&config)
+        }
         Command::QwenTiedHeadTrainSmoke {
             model_path,
             reference_fixture,
