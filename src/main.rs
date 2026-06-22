@@ -194,6 +194,19 @@ enum Command {
         #[arg(long)]
         index_cache: Option<PathBuf>,
     },
+    #[command(hide = true)]
+    QwenSftArrowSourceSummary {
+        #[arg(long)]
+        input: PathBuf,
+        #[arg(long, default_value_t = 128)]
+        limit: usize,
+        #[arg(long, default_value = "instruction")]
+        instruction_column: String,
+        #[arg(long, default_value = "input")]
+        input_column: String,
+        #[arg(long, default_value = "output")]
+        response_column: String,
+    },
     QwenTiedHeadTrainSmoke {
         #[arg(
             long,
@@ -508,6 +521,19 @@ fn main() -> Result<()> {
             world_size,
             data_cursor_start,
             index_cache.as_deref(),
+        ),
+        Command::QwenSftArrowSourceSummary {
+            input,
+            limit,
+            instruction_column,
+            input_column,
+            response_column,
+        } => qwen_module::qwen_sft_arrow_source_summary(
+            &input,
+            limit,
+            &instruction_column,
+            &input_column,
+            &response_column,
         ),
         Command::QwenTiedHeadTrainSmoke {
             model_path,

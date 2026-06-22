@@ -19,6 +19,13 @@ python scripts/export_instruction_arrow_jsonl.py \
   --response-column output \
   --metadata-output "${DATA_DIR}/export_metadata.json"
 
+ARROW_SUMMARY_OUTPUT="${WORK_DIR}/arrow-source-summary.out"
+cargo run -- qwen-sft-arrow-source-summary \
+  --input "${HF_ARROW}" \
+  --limit 128 \
+  --response-column output \
+  | tee "${ARROW_SUMMARY_OUTPUT}"
+
 python scripts/export_instruction_arrow_jsonl.py \
   --input "${HF_ARROW}" \
   --output "${DATA_DIR}/alpaca_bounded.jsonl" \
@@ -119,6 +126,7 @@ cargo run -- qwen-sft-streaming-batch-plan \
   | tee "${CACHE_SECOND_OUTPUT}"
 
 python - \
+  "${ARROW_SUMMARY_OUTPUT}" \
   "${DATA_OUTPUT}" \
   "${BATCH_OUTPUT}" \
   "${CACHE_FIRST_OUTPUT}" \
@@ -130,13 +138,14 @@ import json
 import pathlib
 import sys
 
-data_output = pathlib.Path(sys.argv[1])
-batch_output = pathlib.Path(sys.argv[2])
-cache_first_output = pathlib.Path(sys.argv[3])
-cache_second_output = pathlib.Path(sys.argv[4])
-cache_path = pathlib.Path(sys.argv[5])
-data_dir = pathlib.Path(sys.argv[6])
-hf_arrow = pathlib.Path(sys.argv[7])
+arrow_summary_output = pathlib.Path(sys.argv[1])
+data_output = pathlib.Path(sys.argv[2])
+batch_output = pathlib.Path(sys.argv[3])
+cache_first_output = pathlib.Path(sys.argv[4])
+cache_second_output = pathlib.Path(sys.argv[5])
+cache_path = pathlib.Path(sys.argv[6])
+data_dir = pathlib.Path(sys.argv[7])
+hf_arrow = pathlib.Path(sys.argv[8])
 
 
 def load_json(path: pathlib.Path) -> dict:
@@ -147,6 +156,7 @@ def load_json(path: pathlib.Path) -> dict:
     return json.loads(text[start:])
 
 
+arrow_summary = load_json(arrow_summary_output)
 data_plan = load_json(data_output)
 batch_plan = load_json(batch_output)
 cache_first = load_json(cache_first_output)
@@ -177,6 +187,32 @@ if metadata.get("shards") != 2:
     raise SystemExit(f"HF export metadata did not record two shards: {metadata}")
 if metadata.get("output_files") != export_outputs:
     raise SystemExit(f"HF export metadata output_files {metadata.get('output_files')} != {export_outputs}")
+
+if pathlib.Path(arrow_summary.get("input", "")) != hf_arrow:
+    raise SystemExit(f"Arrow summary input {arrow_summary.get('input')} != {hf_arrow}")
+if arrow_summary.get("arrow_ipc_format") != metadata.get("arrow_ipc_format"):
+    raise SystemExit(f"Arrow summary format {arrow_summary.get('arrow_ipc_format')} != metadata {metadata.get('arrow_ipc_format')}")
+if arrow_summary.get("source_rows") != metadata.get("source_rows"):
+    raise SystemExit(f"Arrow summary source_rows {arrow_summary.get('source_rows')} != metadata {metadata.get('source_rows')}")
+if arrow_summary.get("source_rows_exact") is not True:
+    raise SystemExit(f"Arrow summary should record exact source rows: {arrow_summary}")
+if arrow_summary.get("samples") != metadata.get("exported_rows"):
+    raise SystemExit(f"Arrow summary samples {arrow_summary.get('samples')} != exported_rows {metadata.get('exported_rows')}")
+if arrow_summary.get("limit") != 128:
+    raise SystemExit(f"Arrow summary limit mismatch: {arrow_summary}")
+if arrow_summary.get("jsonl_materialized") is not False or arrow_summary.get("tokenized_samples_materialized") is not False:
+    raise SystemExit(f"Arrow summary must not materialize JSONL or tokenized samples: {arrow_summary}")
+if arrow_summary.get("column_map", {}).get("response") != "output":
+    raise SystemExit(f"Arrow summary did not record response source column: {arrow_summary}")
+for column in ["instruction", "input", "output"]:
+    if column not in arrow_summary.get("columns", []):
+        raise SystemExit(f"Arrow summary missing column {column}: {arrow_summary}")
+if arrow_summary.get("source_files") != [str(hf_arrow)]:
+    raise SystemExit(f"Arrow summary source_files mismatch: {arrow_summary.get('source_files')}")
+if arrow_summary.get("source_sample_counts") != [{"path": str(hf_arrow), "samples": 128}]:
+    raise SystemExit(f"Arrow summary source sample counts mismatch: {arrow_summary.get('source_sample_counts')}")
+if not isinstance(arrow_summary.get("fingerprint"), str) or len(arrow_summary["fingerprint"]) != 16:
+    raise SystemExit(f"Arrow summary fingerprint should be a 16-char hash: {arrow_summary.get('fingerprint')}")
 
 if pathlib.Path(bounded_metadata["source_arrow"]) != hf_arrow:
     raise SystemExit(f"bounded metadata source_arrow {bounded_metadata['source_arrow']} != {hf_arrow}")
@@ -366,6 +402,7 @@ if summary.get("fingerprint") != data_plan.get("dataset_fingerprint"):
 print(
     "qwen_sft_streaming_hf_cache_verified: "
     f"source_rows={metadata['source_rows']} "
+    f"arrow_samples={arrow_summary['samples']} "
     f"exported_rows={metadata['exported_rows']} "
     f"train_samples={data_plan['dataset_train_samples']} "
     f"streaming_window_samples={batch_plan['streaming_window_samples']} "

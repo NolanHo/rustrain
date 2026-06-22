@@ -152,8 +152,11 @@ Acceptance:
   JSONL `response` field, writes two JSONL shards, attaches the export metadata
   through `data.external_metadata_paths`, and checks tokenizer-free streaming
   metadata, tokenizer-backed batch parity, cursor wrap, and cache write/hit
-  behavior on that
-  external-cache-derived source. The offset-index cache is keyed by source paths,
+  behavior on that external-cache-derived source. The same verifier also runs
+  the hidden `qwen-sft-arrow-source-summary` command, which scans the Arrow IPC
+  source directly in Rust and reports source rows, mapped columns, sample count,
+  and fingerprint without writing JSONL or tokenizing samples. The offset-index
+  cache is keyed by source paths,
   source JSONL file size/mtime metadata, `max_samples`, and the JSONL field
   mapping from `data.instruction_field`, `data.input_field`,
   `data.response_field`, optional

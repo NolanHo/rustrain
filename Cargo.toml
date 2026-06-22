@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1.0.98"
+arrow = { version = "57.0.0", default-features = false, features = ["ipc"] }
 chrono = { version = "0.4.41", default-features = false, features = ["clock"] }
 clap = { version = "4.5.40", features = ["derive"] }
 ndarray = { version = "0.16.1", features = ["serde"] }

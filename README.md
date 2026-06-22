@@ -575,8 +575,12 @@ production-grade sharded checkpoint ownership remain open.
   `response` field, writes a two-shard JSONL export, attaches the export
   metadata through `data.external_metadata_paths`, and runs the same
   tokenizer-free plan, tokenizer-backed batch parity, cursor wrap, and
-  offset-index cache write/hit checks. A production
-  zero-materialization loader for large external streams is still open.
+  offset-index cache write/hit checks. The same verifier also runs the hidden
+  `qwen-sft-arrow-source-summary` command, which scans the Arrow IPC source
+  directly in Rust and reports source rows, mapped columns, sample count, and
+  fingerprint without writing JSONL or tokenizing samples. A production
+  zero-materialization training loader for large external streams is still
+  open.
   Production data loading and arbitrary-module LoRA injection are still open.
 - Real Qwen module-level LoRA now uses a target-layer/module registry for
   configured attention and MLP projection modules; trainer-owned full-model LoRA
