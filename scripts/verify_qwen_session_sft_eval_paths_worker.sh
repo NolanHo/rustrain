@@ -13,7 +13,14 @@ python - "${OUTPUT}" <<'PY'
 import ast
 import json
 import pathlib
+import re
 import sys
+
+def parse_source_sample_counts(text):
+    entries = re.findall(r'QwenSftSourceSampleCount \{ path: "([^"]+)", samples: (\d+) \}', text)
+    if not entries:
+        raise SystemExit(f"dataset_source_sample_counts did not contain parseable entries: {text}")
+    return [{"path": path, "samples": int(samples)} for path, samples in entries]
 
 output_path = pathlib.Path(sys.argv[1])
 values = {}
@@ -59,11 +66,15 @@ if int(values["dataset_total_samples"]) != 8:
     raise SystemExit(f"expected dataset_total_samples 8, got {values['dataset_total_samples']}")
 if int(values["dataset_order_seed"]) != 777:
     raise SystemExit(f"expected dataset_order_seed 777, got {values['dataset_order_seed']}")
-for expected in ["eval_instructions.jsonl\", samples: 2", "instructions.jsonl\", samples: 6"]:
-    if expected not in values["dataset_source_sample_counts"]:
-        raise SystemExit(
-            f"dataset_source_sample_counts missing {expected}: {values['dataset_source_sample_counts']}"
-        )
+expected_counts = [
+    {"path": "data/sft_toy/eval_instructions.jsonl", "samples": 2},
+    {"path": "data/sft_toy/instructions.jsonl", "samples": 6},
+]
+source_sample_counts = parse_source_sample_counts(values["dataset_source_sample_counts"])
+if source_sample_counts != expected_counts:
+    raise SystemExit(
+        f"dataset_source_sample_counts {source_sample_counts} != {expected_counts}"
+    )
 for key in ["batch_size", "sequence_tokens", "dataset_total_tokens"]:
     if int(values[key]) <= 0:
         raise SystemExit(f"{key} must be positive, got {values[key]}")
@@ -79,6 +90,10 @@ manifest = json.loads(pathlib.Path(values["manifest_output"]).read_text())
 if manifest.get("dataset_source_files") != expected_sources:
     raise SystemExit(
         f"manifest source files {manifest.get('dataset_source_files')} != {expected_sources}"
+    )
+if manifest.get("dataset_source_sample_counts") != expected_counts:
+    raise SystemExit(
+        f"manifest source sample counts {manifest.get('dataset_source_sample_counts')} != {expected_counts}"
     )
 if manifest.get("dataset_fingerprint") != values["dataset_fingerprint"]:
     raise SystemExit("manifest dataset_fingerprint does not match stdout")
