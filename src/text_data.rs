@@ -191,18 +191,16 @@ pub fn load_sft_dataset(
 }
 
 fn format_sft_sample(
+    data: &DataConfig,
     tokenizer: &ByteTokenizer,
     seq_len: usize,
     record: &InstructionRecord,
 ) -> Result<SftSample> {
-    let prompt = if record.input.trim().is_empty() {
-        format!("Instruction:\n{}\n\nResponse:\n", record.instruction)
-    } else {
-        format!(
-            "Instruction:\n{}\n\nInput:\n{}\n\nResponse:\n",
-            record.instruction, record.input
-        )
-    };
+    let prompt = render_sft_prompt(
+        record,
+        &data.prompt_template,
+        &data.prompt_with_input_template,
+    )?;
     let response = format!("{}\n", record.response);
     let prompt_tokens = tokenizer.encode(&prompt);
     let response_tokens = tokenizer.encode(&response);
@@ -300,7 +298,7 @@ fn read_sft_paths(
                         line_index + 1
                     )
                 })?;
-                samples.push(format_sft_sample(tokenizer, seq_len, &record)?);
+                samples.push(format_sft_sample(data, tokenizer, seq_len, &record)?);
             }
             source_paths.push(file);
         }
@@ -341,6 +339,27 @@ fn optional_jsonl_string_field(
         Some(_) => Err(anyhow!("JSONL field {field} must be a string")),
         None => Ok(String::new()),
     }
+}
+
+fn render_sft_prompt(
+    record: &InstructionRecord,
+    prompt_template: &str,
+    prompt_with_input_template: &str,
+) -> Result<String> {
+    if prompt_template.is_empty() {
+        return Err(anyhow!("data.prompt_template must not be empty"));
+    }
+    if prompt_with_input_template.is_empty() {
+        return Err(anyhow!("data.prompt_with_input_template must not be empty"));
+    }
+    let template = if record.input.trim().is_empty() {
+        prompt_template
+    } else {
+        prompt_with_input_template
+    };
+    Ok(template
+        .replace("{instruction}", &record.instruction)
+        .replace("{input}", &record.input))
 }
 
 fn sorted_files(path: &Path) -> Result<Vec<PathBuf>> {
@@ -435,6 +454,9 @@ mod tests {
             instruction_field: "instruction".to_string(),
             input_field: "input".to_string(),
             response_field: "response".to_string(),
+            prompt_template: "Instruction:\n{instruction}\n\nResponse:\n".to_string(),
+            prompt_with_input_template:
+                "Instruction:\n{instruction}\n\nInput:\n{input}\n\nResponse:\n".to_string(),
         };
         let dataset = load_text_dataset(&data, 64, 8, &cache_dir).expect("dataset should load");
 
@@ -472,6 +494,9 @@ mod tests {
             instruction_field: "instruction".to_string(),
             input_field: "input".to_string(),
             response_field: "response".to_string(),
+            prompt_template: "Instruction:\n{instruction}\n\nResponse:\n".to_string(),
+            prompt_with_input_template:
+                "Instruction:\n{instruction}\n\nInput:\n{input}\n\nResponse:\n".to_string(),
         };
         let dataset = load_text_dataset(&data, 128, 8, &cache_dir).expect("dataset should load");
 
@@ -515,6 +540,9 @@ mod tests {
             instruction_field: "instruction".to_string(),
             input_field: "input".to_string(),
             response_field: "response".to_string(),
+            prompt_template: "Instruction:\n{instruction}\n\nResponse:\n".to_string(),
+            prompt_with_input_template:
+                "Instruction:\n{instruction}\n\nInput:\n{input}\n\nResponse:\n".to_string(),
         };
         let dataset =
             load_sft_dataset(&data, 128, 64, &cache_dir).expect("SFT dataset should load");
@@ -540,6 +568,57 @@ mod tests {
             .count();
         assert!(response_targets > 2);
         assert!(cache_dir.join("sft_tokenized.toml").exists());
+    }
+
+    #[test]
+    fn sft_dataset_uses_configured_prompt_templates() {
+        let dir = tempdir().expect("temp dir should be created");
+        let data_dir = dir.path().join("sft");
+        let cache_dir = dir.path().join("cache");
+        fs::create_dir_all(&data_dir).expect("sft dir should be created");
+        fs::create_dir_all(&cache_dir).expect("cache dir should be created");
+        fs::write(
+            data_dir.join("sample.jsonl"),
+            "{\"instruction\":\"name project\",\"input\":\"rust trainer\",\"response\":\"rustrain\"}\n{\"instruction\":\"name language\",\"response\":\"Rust\"}\n",
+        )
+        .expect("jsonl should write");
+
+        let data = DataConfig {
+            kind: DataKind::InstructionJsonl,
+            paths: vec![data_dir],
+            eval_paths: Vec::new(),
+            train_split: 0.5,
+            max_samples: None,
+            shuffle: false,
+            index_cache: None,
+            instruction_field: "instruction".to_string(),
+            input_field: "input".to_string(),
+            response_field: "response".to_string(),
+            prompt_template: "Q: {instruction}\nA: ".to_string(),
+            prompt_with_input_template: "Q: {instruction}\nContext: {input}\nA: ".to_string(),
+        };
+        let dataset =
+            load_sft_dataset(&data, 128, 96, &cache_dir).expect("SFT dataset should load");
+        let decoded = dataset
+            .tokenizer
+            .decode_lossy(&dataset.train_samples[0].tokens);
+
+        assert!(decoded.contains("Q: name project"));
+        assert!(decoded.contains("Context: rust trainer"));
+        assert!(decoded.contains("A: rustrain"));
+        assert!(!decoded.contains("Instruction:"));
+        assert!(
+            dataset.train_samples[0]
+                .target_mask
+                .iter()
+                .any(|enabled| *enabled)
+        );
+        assert!(
+            dataset.train_samples[0]
+                .target_mask
+                .iter()
+                .any(|enabled| !*enabled)
+        );
     }
 
     #[test]
@@ -573,6 +652,9 @@ mod tests {
             instruction_field: "instruction".to_string(),
             input_field: "input".to_string(),
             response_field: "response".to_string(),
+            prompt_template: "Instruction:\n{instruction}\n\nResponse:\n".to_string(),
+            prompt_with_input_template:
+                "Instruction:\n{instruction}\n\nInput:\n{input}\n\nResponse:\n".to_string(),
         };
         let dataset =
             load_sft_dataset(&data, 128, 64, &cache_dir).expect("SFT dataset should load");
@@ -607,6 +689,9 @@ mod tests {
             instruction_field: "instruction".to_string(),
             input_field: "input".to_string(),
             response_field: "response".to_string(),
+            prompt_template: "Instruction:\n{instruction}\n\nResponse:\n".to_string(),
+            prompt_with_input_template:
+                "Instruction:\n{instruction}\n\nInput:\n{input}\n\nResponse:\n".to_string(),
         };
         let dataset =
             load_sft_dataset(&data, 128, 64, &cache_dir).expect("SFT dataset should load");

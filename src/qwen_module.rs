@@ -1628,6 +1628,8 @@ struct QwenSftFieldMap {
     instruction: String,
     input: String,
     response: String,
+    prompt_template: String,
+    prompt_with_input_template: String,
 }
 
 impl QwenSftFieldMap {
@@ -1636,6 +1638,8 @@ impl QwenSftFieldMap {
             instruction: data.instruction_field.clone(),
             input: data.input_field.clone(),
             response: data.response_field.clone(),
+            prompt_template: data.prompt_template.clone(),
+            prompt_with_input_template: data.prompt_with_input_template.clone(),
         };
         map.validate()?;
         Ok(map)
@@ -1651,6 +1655,12 @@ impl QwenSftFieldMap {
         if self.response.trim().is_empty() {
             bail!("data.response_field must not be empty");
         }
+        if self.prompt_template.is_empty() {
+            bail!("data.prompt_template must not be empty");
+        }
+        if self.prompt_with_input_template.is_empty() {
+            bail!("data.prompt_with_input_template must not be empty");
+        }
         Ok(())
     }
 }
@@ -1661,6 +1671,9 @@ impl Default for QwenSftFieldMap {
             instruction: "instruction".to_string(),
             input: "input".to_string(),
             response: "response".to_string(),
+            prompt_template: "Instruction:\n{instruction}\n\nResponse:\n".to_string(),
+            prompt_with_input_template:
+                "Instruction:\n{instruction}\n\nInput:\n{input}\n\nResponse:\n".to_string(),
         }
     }
 }
@@ -10489,7 +10502,7 @@ impl QwenSftDataset {
         }
         let samples = examples
             .iter()
-            .map(|example| qwen_sft_token_sample(tokenizer, example))
+            .map(|example| qwen_sft_token_sample(tokenizer, example, &QwenSftFieldMap::default()))
             .collect::<Result<Vec<_>>>()?;
         Ok(Self {
             samples,
@@ -10515,7 +10528,7 @@ impl QwenSftDataset {
         let samples = example_set
             .examples
             .iter()
-            .map(|example| qwen_sft_token_sample(tokenizer, example))
+            .map(|example| qwen_sft_token_sample(tokenizer, example, field_map))
             .collect::<Result<Vec<_>>>()?;
         Ok(Self {
             samples,
@@ -10752,7 +10765,7 @@ fn qwen_sft_streaming_token_window_from_jsonl(
     let samples = raw_window
         .examples
         .iter()
-        .map(|example| qwen_sft_token_sample(tokenizer, example))
+        .map(|example| qwen_sft_token_sample(tokenizer, example, field_map))
         .collect::<Result<Vec<_>>>()?;
     Ok(QwenSftStreamingTokenWindow {
         samples,
@@ -11494,6 +11507,10 @@ fn qwen_sft_hash_field_map(hash: &mut u64, field_map: &QwenSftFieldMap) {
     qwen_sft_hash_bytes(hash, b"\0");
     qwen_sft_hash_bytes(hash, field_map.response.as_bytes());
     qwen_sft_hash_bytes(hash, b"\0");
+    qwen_sft_hash_bytes(hash, field_map.prompt_template.as_bytes());
+    qwen_sft_hash_bytes(hash, b"\0");
+    qwen_sft_hash_bytes(hash, field_map.prompt_with_input_template.as_bytes());
+    qwen_sft_hash_bytes(hash, b"\0");
 }
 
 fn qwen_sft_hash_example(hash: &mut u64, example: &QwenSftExample) {
@@ -11594,16 +11611,22 @@ fn qwen_validate_optional_sft_resume_dataset(
 fn qwen_sft_token_sample(
     tokenizer: &Tokenizer,
     example: &QwenSftExample,
+    field_map: &QwenSftFieldMap,
 ) -> Result<QwenSftTokenSample> {
-    let prompt = if example.input.trim().is_empty() {
-        format!("Instruction:\n{}\n\nResponse:\n", example.instruction)
-    } else {
-        format!(
-            "Instruction:\n{}\n\nInput:\n{}\n\nResponse:\n",
-            example.instruction, example.input
-        )
-    };
+    let prompt = qwen_render_sft_prompt(example, field_map)?;
     qwen_sft_token_sample_from_prompt(tokenizer, &prompt, &example.response)
+}
+
+fn qwen_render_sft_prompt(example: &QwenSftExample, field_map: &QwenSftFieldMap) -> Result<String> {
+    field_map.validate()?;
+    let template = if example.input.trim().is_empty() {
+        &field_map.prompt_template
+    } else {
+        &field_map.prompt_with_input_template
+    };
+    Ok(template
+        .replace("{instruction}", &example.instruction)
+        .replace("{input}", &example.input))
 }
 
 fn qwen_sft_token_sample_from_prompt(
@@ -13926,6 +13949,7 @@ mod tests {
             instruction: "prompt".to_string(),
             input: "context".to_string(),
             response: "answer".to_string(),
+            ..QwenSftFieldMap::default()
         };
 
         let loaded = qwen_sft_examples_from_jsonl_paths_with_limit(&paths, None, &field_map)
@@ -13962,6 +13986,46 @@ mod tests {
         assert_eq!(raw_window.examples[0].response, "rustrain");
         assert!(first_cache.cache_written);
         assert!(mismatch.contains("field_map"));
+    }
+
+    #[test]
+    fn qwen_sft_prompt_template_changes_tokenized_prompt_and_fingerprint() {
+        let example = QwenSftExample {
+            instruction: "Name the project.".to_string(),
+            input: "Rust trainer".to_string(),
+            response: "rustrain".to_string(),
+        };
+        let default_map = QwenSftFieldMap::default();
+        let custom_map = QwenSftFieldMap {
+            prompt_template: "### User\n{instruction}\n### Assistant\n".to_string(),
+            prompt_with_input_template:
+                "### User\n{instruction}\nContext: {input}\n### Assistant\n".to_string(),
+            ..QwenSftFieldMap::default()
+        };
+        let default_prompt =
+            qwen_render_sft_prompt(&example, &default_map).expect("default prompt should render");
+        let custom_prompt =
+            qwen_render_sft_prompt(&example, &custom_map).expect("custom prompt should render");
+        let default_fingerprint = qwen_sft_dataset_fingerprint(
+            &["data/train.jsonl".to_string()],
+            std::slice::from_ref(&example),
+            &default_map,
+        );
+        let custom_fingerprint = qwen_sft_dataset_fingerprint(
+            &["data/train.jsonl".to_string()],
+            std::slice::from_ref(&example),
+            &custom_map,
+        );
+
+        assert_eq!(
+            default_prompt,
+            "Instruction:\nName the project.\n\nInput:\nRust trainer\n\nResponse:\n"
+        );
+        assert_eq!(
+            custom_prompt,
+            "### User\nName the project.\nContext: Rust trainer\n### Assistant\n"
+        );
+        assert_ne!(default_fingerprint, custom_fingerprint);
     }
 
     #[test]

@@ -96,6 +96,10 @@ pub struct DataConfig {
     pub input_field: String,
     #[serde(default = "default_response_field")]
     pub response_field: String,
+    #[serde(default = "default_prompt_template")]
+    pub prompt_template: String,
+    #[serde(default = "default_prompt_with_input_template")]
+    pub prompt_with_input_template: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -475,6 +479,14 @@ fn default_response_field() -> String {
     "response".to_string()
 }
 
+fn default_prompt_template() -> String {
+    "Instruction:\n{instruction}\n\nResponse:\n".to_string()
+}
+
+fn default_prompt_with_input_template() -> String {
+    "Instruction:\n{instruction}\n\nInput:\n{input}\n\nResponse:\n".to_string()
+}
+
 fn default_eval_every() -> u64 {
     0
 }
@@ -572,6 +584,8 @@ mod tests {
                 instruction_field: default_instruction_field(),
                 input_field: default_input_field(),
                 response_field: default_response_field(),
+                prompt_template: default_prompt_template(),
+                prompt_with_input_template: default_prompt_with_input_template(),
             }),
             lora: Some(LoraConfig {
                 rank: 4,

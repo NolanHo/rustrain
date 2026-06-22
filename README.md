@@ -435,7 +435,11 @@ production-grade sharded checkpoint ownership remain open.
   Instruction JSONL configs can map external dataset schemas with
   `data.instruction_field`, `data.input_field`, and `data.response_field`; the
   defaults remain `instruction`, `input`, and `response`, with missing input
-  fields treated as empty strings.
+  fields treated as empty strings. They can also override
+  `data.prompt_template` and `data.prompt_with_input_template` to render
+  external instruction formats before the response is appended for response-only
+  loss; the default templates preserve the existing `Instruction`/`Input`/
+  `Response` format and support `{instruction}` plus `{input}` placeholders.
   `cargo run -- qwen-sft-streaming-batch-plan --config ...` resolves the next
   cursor window to raw JSONL source indices, reads and tokenizes only those
   window records, then verifies the padded `input_ids` plus response masks match
@@ -449,9 +453,10 @@ production-grade sharded checkpoint ownership remain open.
   `streaming_index_cache_path`, `streaming_index_cache_hit`, and
   `streaming_index_cache_written`, and the focused GPU suites run each cache
   verifier twice to prove first-run writes and second-run hits. Offset-index
-  cache files also record the JSONL field mapping, so a cache created for one
-  external schema is rejected if reused with a different field map. Those trainer
-  summaries now expose `streaming_train_batches = true` for tokenizer-backed
+  cache files also record the JSONL field mapping and prompt templates, so a
+  cache created for one external schema is rejected if reused with a different
+  field map or prompt format. Those trainer summaries now expose
+  `streaming_train_batches = true` for tokenizer-backed
   JSONL SFT runs, and the focused LoRA, single-GPU session, and DP session
   verifiers require that field in summaries and checkpoint manifests so stdout,
   rank JSON, or saved artifacts cannot pass while hiding a materialized
