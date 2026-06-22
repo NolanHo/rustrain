@@ -151,6 +151,10 @@ if str(adapter_manifest.get("dataset_shuffle")).lower() != values["dataset_shuff
     raise SystemExit(
         f"adapter manifest dataset_shuffle {adapter_manifest.get('dataset_shuffle')} did not match summary {values['dataset_shuffle']}"
     )
+if adapter_manifest.get("streaming_train_batches") is not True:
+    raise SystemExit(
+        f"adapter manifest streaming_train_batches {adapter_manifest.get('streaming_train_batches')} is not true"
+    )
 expected_target_layers = [0, 1]
 expected_target_modules = [
     "q_proj",

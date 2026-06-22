@@ -189,6 +189,10 @@ for path in rank_summaries:
             raise SystemExit(
                 f"{path} rank0 manifest dataset_fingerprint {manifest.get('dataset_fingerprint')} does not match summary {data['dataset_fingerprint']}"
             )
+        if manifest.get("streaming_train_batches") is not True:
+            raise SystemExit(
+                f"{path} rank0 manifest streaming_train_batches {manifest.get('streaming_train_batches')} is not true"
+            )
     sharded_global = json.loads(pathlib.Path(data["sharded_global_manifest_output"]).read_text())
     parallel = sharded_global.get("parallel") or {}
     if int(parallel.get("data_parallel_size", -1)) != 2:
@@ -221,6 +225,10 @@ for path in rank_summaries:
         if int(sharded_global["data_cursor_next"]) != int(data["data_cursor_next"]):
             raise SystemExit(
                 f"{path} sharded data_cursor_next {sharded_global['data_cursor_next']} does not match summary {data['data_cursor_next']}"
+            )
+        if sharded_global.get("streaming_train_batches") is not True:
+            raise SystemExit(
+                f"{path} sharded streaming_train_batches {sharded_global.get('streaming_train_batches')} is not true"
             )
         if int(sharded_global["data_train_samples"]) != int(data["dataset_train_samples"]):
             raise SystemExit(

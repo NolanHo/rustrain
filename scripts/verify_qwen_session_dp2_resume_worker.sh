@@ -237,6 +237,10 @@ for path in resume_summaries:
         raise SystemExit(
             f"{path} manifest data_cursor_next {manifest['data_cursor_next']} != expected {expected_cursor_next}"
         )
+    if manifest.get("streaming_train_batches") is not True:
+        raise SystemExit(
+            f"{path} manifest streaming_train_batches {manifest.get('streaming_train_batches')} is not true"
+        )
     if expected_dataset_source_files and manifest.get("dataset_source_files") != expected_dataset_source_files:
         raise SystemExit(
             f"{path} manifest dataset_source_files {manifest.get('dataset_source_files')} != {expected_dataset_source_files}"
@@ -258,6 +262,10 @@ for path in resume_summaries:
     if int(sharded_manifest["data_cursor_next"]) != expected_cursor_next:
         raise SystemExit(
             f"{path} sharded data_cursor_next {sharded_manifest['data_cursor_next']} != expected {expected_cursor_next}"
+        )
+    if sharded_manifest.get("streaming_train_batches") is not True:
+        raise SystemExit(
+            f"{path} sharded streaming_train_batches {sharded_manifest.get('streaming_train_batches')} is not true"
         )
     if expected_dataset_source_files and sharded_manifest.get("dataset_source_files") != expected_dataset_source_files:
         raise SystemExit(

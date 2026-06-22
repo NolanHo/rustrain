@@ -528,6 +528,8 @@ struct QwenLoraSftAdapterManifest {
     dataset_order_seed: u64,
     #[serde(default = "qwen_manifest_default_dataset_shuffle")]
     dataset_shuffle: bool,
+    #[serde(default)]
+    streaming_train_batches: bool,
     dataset_total_samples: usize,
     dataset_train_samples: usize,
     dataset_eval_samples: usize,
@@ -759,6 +761,8 @@ struct QwenSessionDpCheckpointManifest {
     dataset_fingerprint: String,
     #[serde(default = "qwen_manifest_default_dataset_shuffle")]
     dataset_shuffle: bool,
+    #[serde(default)]
+    streaming_train_batches: Option<bool>,
     learning_rate: f64,
     delta_safetensors: String,
     optimizer_safetensors: String,
@@ -797,6 +801,7 @@ impl QwenSessionDpCheckpointManifest {
             dataset_source_sample_counts: self.dataset_source_sample_counts.clone(),
             dataset_fingerprint: self.dataset_fingerprint.clone(),
             dataset_shuffle: self.dataset_shuffle,
+            streaming_train_batches: self.streaming_train_batches,
             learning_rate: self.learning_rate,
             initial_loss: self.expected_loss,
             final_loss: self.global_post_update_loss,
@@ -1300,6 +1305,8 @@ struct QwenDeltaCheckpointManifest {
     dataset_fingerprint: String,
     #[serde(default = "qwen_manifest_default_dataset_shuffle")]
     dataset_shuffle: bool,
+    #[serde(default)]
+    streaming_train_batches: Option<bool>,
     learning_rate: f64,
     initial_loss: f64,
     final_loss: f64,
@@ -1345,6 +1352,8 @@ struct QwenShardedCheckpointManifest {
     dataset_fingerprint: String,
     #[serde(default = "qwen_manifest_default_dataset_shuffle")]
     dataset_shuffle: bool,
+    #[serde(default)]
+    streaming_train_batches: Option<bool>,
     seed: u64,
     dtype: String,
     optimizer: String,
@@ -2879,6 +2888,7 @@ fn qwen_lora_sft_train(
         dataset_fingerprint: dataset_summary.fingerprint.clone(),
         dataset_order_seed: policy.dataset_order_seed,
         dataset_shuffle: dataset_summary.shuffle,
+        streaming_train_batches: streaming_window.is_some(),
         dataset_total_samples: dataset_summary.samples,
         dataset_train_samples: train_dataset.len(),
         dataset_eval_samples: eval_dataset.len(),
@@ -3283,6 +3293,7 @@ fn qwen_full_train_summary(
         dataset_source_sample_counts: Vec::new(),
         dataset_fingerprint: String::new(),
         dataset_shuffle: true,
+        streaming_train_batches: None,
         learning_rate,
         initial_loss,
         final_loss,
@@ -3564,6 +3575,7 @@ fn qwen_session_single_summary(
             .unwrap_or_default(),
         dataset_fingerprint: batch_plan.dataset_fingerprint.clone().unwrap_or_default(),
         dataset_shuffle: batch_plan.dataset_shuffle.unwrap_or(true),
+        streaming_train_batches: batch_plan.streaming_train_batches,
         learning_rate,
         initial_loss,
         final_loss,
@@ -4817,6 +4829,7 @@ pub fn qwen_session_dp_rank_smoke(
                 .unwrap_or_default(),
             dataset_fingerprint: batch_plan.dataset_fingerprint.clone().unwrap_or_default(),
             dataset_shuffle: batch_plan.dataset_shuffle.unwrap_or(true),
+            streaming_train_batches: batch_plan.streaming_train_batches,
             learning_rate,
             delta_safetensors: delta_output.display().to_string(),
             optimizer_safetensors: optimizer_output.display().to_string(),
@@ -4976,6 +4989,7 @@ pub fn qwen_session_dp_rank_smoke(
                 .unwrap_or(&[]),
             batch_plan.dataset_fingerprint.as_deref().unwrap_or(""),
             batch_plan.dataset_shuffle.unwrap_or(true),
+            batch_plan.streaming_train_batches,
             &sharded_global_manifest_output,
         )?;
     }
@@ -5252,6 +5266,7 @@ fn write_qwen_session_dp_global_sharded_manifest(
     dataset_source_sample_counts: &[QwenSftSourceSampleCount],
     dataset_fingerprint: &str,
     dataset_shuffle: bool,
+    streaming_train_batches: Option<bool>,
     manifest_output: &Path,
 ) -> Result<()> {
     let mut ranks = Vec::with_capacity(world_size);
@@ -5285,6 +5300,7 @@ fn write_qwen_session_dp_global_sharded_manifest(
         dataset_source_sample_counts: dataset_source_sample_counts.to_vec(),
         dataset_fingerprint: dataset_fingerprint.to_string(),
         dataset_shuffle,
+        streaming_train_batches,
         seed: 42,
         dtype: dtype.label().to_string(),
         optimizer: "adamw".to_string(),
@@ -5348,6 +5364,7 @@ fn qwen_sharded_rank_to_delta_manifest(
         dataset_source_sample_counts: manifest.dataset_source_sample_counts.clone(),
         dataset_fingerprint: manifest.dataset_fingerprint.clone(),
         dataset_shuffle: manifest.dataset_shuffle,
+        streaming_train_batches: manifest.streaming_train_batches,
         learning_rate,
         initial_loss,
         final_loss,
@@ -6844,6 +6861,7 @@ fn write_qwen_session_tp_focused_sharded_manifest(
             dataset_source_sample_counts: Vec::new(),
             dataset_fingerprint: String::new(),
             dataset_shuffle: true,
+            streaming_train_batches: None,
             seed: config.run.seed,
             dtype: "fp32".to_string(),
             optimizer: "adamw_first_step_slots_smoke".to_string(),
@@ -11691,6 +11709,7 @@ mod tests {
             dataset_source_sample_counts: Vec::new(),
             dataset_fingerprint: String::new(),
             dataset_shuffle: true,
+            streaming_train_batches: None,
             learning_rate: 1e-6,
             initial_loss: 2.0,
             final_loss: 1.5,
@@ -11989,6 +12008,7 @@ mod tests {
             &manifest.dataset_source_sample_counts,
             &manifest.dataset_fingerprint,
             manifest.dataset_shuffle,
+            manifest.streaming_train_batches,
             &output,
         )
         .expect("global manifest should write");
@@ -12311,6 +12331,7 @@ mod tests {
             dataset_source_sample_counts: Vec::new(),
             dataset_fingerprint: String::new(),
             dataset_shuffle: true,
+            streaming_train_batches: None,
             learning_rate,
             initial_loss,
             final_loss,
@@ -12430,6 +12451,7 @@ mod tests {
             dataset_source_sample_counts: Vec::new(),
             dataset_fingerprint: String::new(),
             dataset_shuffle: true,
+            streaming_train_batches: None,
             learning_rate,
             initial_loss: first_step.loss_before,
             final_loss: first_step.loss_after,
@@ -12845,6 +12867,7 @@ mod tests {
             dataset_fingerprint: "abc123".to_string(),
             dataset_order_seed: 777,
             dataset_shuffle: true,
+            streaming_train_batches: true,
             dataset_total_samples: 4,
             dataset_train_samples: 3,
             dataset_eval_samples: 1,
@@ -13835,6 +13858,7 @@ mod tests {
             }],
             dataset_fingerprint: "abc123".to_string(),
             dataset_shuffle: true,
+            streaming_train_batches: Some(true),
             seed: 42,
             dtype: "float32".to_string(),
             optimizer: "adamw".to_string(),

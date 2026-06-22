@@ -58,6 +58,8 @@ The manifest must record:
   - `dataset_source_files` and `dataset_source_sample_counts`.
   - `dataset_fingerprint`.
   - `dataset_shuffle`.
+  - `streaming_train_batches` when the train batches are built from the JSONL
+    streaming window instead of the materialized dataset path.
   - `data_cursor_start`, `data_cursor_end`, and `data_cursor_next`.
   - `data_epoch_*` and `data_sample_offset_*`, derived from
     `cursor / train_samples` and `cursor % train_samples`.
@@ -102,7 +104,7 @@ The adapter manifest must record:
 - Dataset provenance: `dataset_source_files`,
   `dataset_source_sample_counts`, `dataset_fingerprint`,
   `dataset_order_seed`, `dataset_shuffle`, total/train/eval sample counts,
-  and data cursor/epoch/offset fields.
+  `streaming_train_batches`, and data cursor/epoch/offset fields.
 - Batch and accumulation metadata: `batch_size` and
   `gradient_accumulation_steps`.
 - LoRA identity: `target_layers` and `target_modules`.
@@ -214,8 +216,8 @@ The rank0 manifest must record:
 - Delta and optimizer safetensors paths.
 - Tensor entries with AdamW slot names for every trainable tensor.
 - For JSONL-backed representative runs, the same dataset provenance,
-  cursor/epoch/offset, and shuffle fields used by single-rank Qwen delta
-  manifests.
+  cursor/epoch/offset, shuffle, and `streaming_train_batches` fields used by
+  single-rank Qwen delta manifests.
 
 Acceptance:
 

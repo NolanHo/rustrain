@@ -148,6 +148,10 @@ for path in rank_summaries:
             raise SystemExit(
                 f"{path} sharded data_cursor_next {sharded_manifest['data_cursor_next']} does not match expected {expected_cursor_end}"
             )
+        if sharded_manifest.get("streaming_train_batches") is not True:
+            raise SystemExit(
+                f"{path} sharded streaming_train_batches {sharded_manifest.get('streaming_train_batches')} is not true"
+            )
         if int(sharded_manifest["data_train_samples"]) != train_samples:
             raise SystemExit(
                 f"{path} sharded data_train_samples {sharded_manifest['data_train_samples']} does not match expected {train_samples}"
@@ -169,6 +173,10 @@ for path in rank_summaries:
             if rank0_manifest.get("dataset_fingerprint") != data["dataset_fingerprint"]:
                 raise SystemExit(
                     f"{path} rank0 manifest dataset_fingerprint {rank0_manifest.get('dataset_fingerprint')} does not match summary {data['dataset_fingerprint']}"
+                )
+            if rank0_manifest.get("streaming_train_batches") is not True:
+                raise SystemExit(
+                    f"{path} rank0 manifest streaming_train_batches {rank0_manifest.get('streaming_train_batches')} is not true"
                 )
     evidence.append(
         {

@@ -146,6 +146,10 @@ if manifest.get("dataset_fingerprint") != values["dataset_fingerprint"]:
     raise SystemExit(
         f"manifest dataset_fingerprint {manifest.get('dataset_fingerprint')} did not match summary {values['dataset_fingerprint']}"
     )
+if manifest.get("streaming_train_batches") is not True:
+    raise SystemExit(
+        f"manifest streaming_train_batches {manifest.get('streaming_train_batches')} is not true"
+    )
 if int(values["dataset_order_seed"]) != 777:
     raise SystemExit(f"expected dataset_order_seed 777, got {values['dataset_order_seed']}")
 if int(values["data_cursor_start"]) != base_data_cursor_next:
