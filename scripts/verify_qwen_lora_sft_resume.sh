@@ -6,12 +6,13 @@ source "${SCRIPT_DIR}/require_gpu_worker.sh"
 
 BASE_OUTPUT="$(mktemp)"
 RESUME_OUTPUT="$(mktemp)"
+DIRECT_OUTPUT="$(mktemp)"
 CONFIG="${RUSTRAIN_QWEN_LORA_SFT_CONFIG:-configs/qwen_lora_sft.toml}"
 EXPECTED_COMPUTE_KIND="${RUSTRAIN_EXPECTED_QWEN_COMPUTE_KIND:-}"
 
 cargo run -- train --config "${CONFIG}" | tee "${BASE_OUTPUT}"
 
-BASE_MANIFEST_CURSOR="$(
+BASE_RESUME_INPUTS="$(
   python - "${BASE_OUTPUT}" <<'PY'
 import pathlib
 import sys
@@ -22,19 +23,28 @@ for line in pathlib.Path(sys.argv[1]).read_text().splitlines():
         key, value = line.split(": ", 1)
         values[key] = value
 manifest = values.get("adapter_manifest")
+adapter = values.get("adapter_checkpoint")
 cursor_next = values.get("data_cursor_next")
 if manifest is None:
     raise SystemExit("base run did not print adapter_manifest")
+if adapter is None:
+    raise SystemExit("base run did not print adapter_checkpoint")
 if cursor_next is None:
     raise SystemExit("base run did not print data_cursor_next")
-print(f"{manifest}\t{cursor_next}")
+print(f"{manifest}\t{adapter}\t{cursor_next}")
 PY
 )"
-ADAPTER_MANIFEST="${BASE_MANIFEST_CURSOR%%$'\t'*}"
-BASE_DATA_CURSOR_NEXT="${BASE_MANIFEST_CURSOR##*$'\t'}"
+IFS=$'\t' read -r ADAPTER_MANIFEST ADAPTER_CHECKPOINT BASE_DATA_CURSOR_NEXT <<<"${BASE_RESUME_INPUTS}"
 
 cargo run -- train --config "${CONFIG}" --resume-from "${ADAPTER_MANIFEST}" \
   | tee "${RESUME_OUTPUT}"
+
+if [ "${EXPECTED_COMPUTE_KIND}" != "bf16" ]; then
+  cargo run -- train --config "${CONFIG}" --resume-from "${ADAPTER_CHECKPOINT}" \
+    | tee "${DIRECT_OUTPUT}"
+else
+  echo "Skipping direct .safetensors resume continuation for bf16; manifest-backed bf16 resume covers dtype identity."
+fi
 
 python - "${RESUME_OUTPUT}" "${EXPECTED_COMPUTE_KIND}" "${BASE_DATA_CURSOR_NEXT}" <<'PY'
 import ast
@@ -239,3 +249,83 @@ print(
     f"samples_per_second={values['samples_per_second']}"
 )
 PY
+
+if [ "${EXPECTED_COMPUTE_KIND}" != "bf16" ]; then
+python - "${DIRECT_OUTPUT}" "${EXPECTED_COMPUTE_KIND}" "${ADAPTER_CHECKPOINT}" <<'PY'
+import math
+import pathlib
+import sys
+
+values = {}
+for line in pathlib.Path(sys.argv[1]).read_text().splitlines():
+    if ": " not in line:
+        continue
+    key, value = line.split(": ", 1)
+    values[key] = value
+
+required = [
+    "compute_kind",
+    "resume_from",
+    "resumed_adapter",
+    "adapter_manifest",
+    "data_cursor_start",
+    "data_cursor_next",
+    "initial_loss",
+    "final_loss",
+    "reload_delta",
+    "eval_reload_delta",
+    "full_forward_reload_delta",
+    "full_generate_reload_match",
+    "tokens_per_second",
+    "samples_per_second",
+]
+missing = [key for key in required if key not in values]
+if missing:
+    raise SystemExit(f"direct adapter resume run is missing fields: {missing}")
+expected_compute_kind = sys.argv[2]
+adapter_checkpoint = sys.argv[3]
+if expected_compute_kind and values["compute_kind"] != expected_compute_kind:
+    raise SystemExit(
+        f"direct resume compute_kind {values['compute_kind']} does not match expected {expected_compute_kind}"
+    )
+if values["resume_from"] != adapter_checkpoint:
+    raise SystemExit(
+        f"direct resume_from {values['resume_from']} did not match adapter checkpoint {adapter_checkpoint}"
+    )
+if values["resumed_adapter"] != "true":
+    raise SystemExit("direct resume did not report resumed_adapter: true")
+if int(values["data_cursor_start"]) != 0:
+    raise SystemExit(
+        f"direct .safetensors resume should not claim manifest cursor continuity, got data_cursor_start={values['data_cursor_start']}"
+    )
+if int(values["data_cursor_next"]) <= 0:
+    raise SystemExit(f"direct resume data_cursor_next must advance, got {values['data_cursor_next']}")
+if not pathlib.Path(values["adapter_manifest"]).is_file():
+    raise SystemExit(f"direct resume did not write adapter manifest {values['adapter_manifest']}")
+for key in ["initial_loss", "final_loss", "tokens_per_second", "samples_per_second"]:
+    value = float(values[key])
+    if not math.isfinite(value) or value <= 0.0:
+        raise SystemExit(f"{key} must be positive and finite, got {values[key]}")
+if float(values["final_loss"]) >= float(values["initial_loss"]):
+    raise SystemExit(
+        f"direct resume did not reduce loss: initial={values['initial_loss']} final={values['final_loss']}"
+    )
+for key in ["reload_delta", "eval_reload_delta", "full_forward_reload_delta"]:
+    if float(values[key]) > 1e-6:
+        raise SystemExit(f"direct resume {key} too large: {values[key]}")
+if values["full_generate_reload_match"] != "true":
+    raise SystemExit(
+        f"direct resume full_generate_reload_match must be true, got {values['full_generate_reload_match']}"
+    )
+
+print(
+    "qwen_lora_sft_direct_resume_verified: "
+    f"resume_from={values['resume_from']} "
+    f"data_cursor_start={values['data_cursor_start']} "
+    f"data_cursor_next={values['data_cursor_next']} "
+    f"initial_loss={values['initial_loss']} "
+    f"final_loss={values['final_loss']} "
+    f"reload_delta={values['reload_delta']}"
+)
+PY
+fi
