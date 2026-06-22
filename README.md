@@ -454,9 +454,11 @@ production-grade sharded checkpoint ownership remain open.
   count. `data.min_instruction_chars` and `data.max_instruction_chars` can
   optionally skip records whose normalized instruction is outside configured
   character bounds. `data.min_input_chars` and `data.max_input_chars` apply the
-  same optional bounds to the normalized input field. `data.min_prompt_chars`
-  and `data.max_prompt_chars` apply optional bounds to the rendered prompt
-  after template substitution and before appending the response.
+  same optional bounds to the normalized input field. `data.min_system_chars`
+  and `data.max_system_chars` apply optional bounds to the normalized system
+  field when `data.system_field` is configured. `data.min_prompt_chars` and
+  `data.max_prompt_chars` apply optional bounds to the rendered prompt after
+  template substitution and before appending the response.
   `data.min_sample_chars` and `data.max_sample_chars` apply optional bounds to
   the rendered prompt plus normalized response. `data.dedupe_samples` defaults
   to `false`; set it to `true` to keep the first normalized
@@ -484,10 +486,10 @@ production-grade sharded checkpoint ownership remain open.
   `streaming_index_cache_written`, and the focused GPU suites run each cache
   verifier twice to prove first-run writes and second-run hits. Offset-index
   cache files also record the JSONL field mapping, prompt templates, field
-  trimming policy, instruction/input/response length filters, and source-weighting
-  policy, so a cache created for one external schema is rejected if reused with
-  a different field map, prompt format, normalization policy, filtering policy,
-  or weighting policy.
+  trimming policy, instruction/input/system/prompt/sample/response length
+  filters, dedupe policy, and source-weighting policy, so a cache created for
+  one external schema is rejected if reused with a different field map, prompt
+  format, normalization policy, filtering policy, or weighting policy.
   Those trainer summaries now expose
   `streaming_train_batches = true` for tokenizer-backed
   JSONL SFT runs, and the focused LoRA, single-GPU session, and DP session

@@ -62,6 +62,8 @@ struct SftCache {
     max_response_chars: Option<usize>,
     max_eval_samples: Option<usize>,
     system_field: Option<String>,
+    min_system_chars: Option<usize>,
+    max_system_chars: Option<usize>,
     min_instruction_chars: Option<usize>,
     max_instruction_chars: Option<usize>,
     min_input_chars: Option<usize>,
@@ -221,6 +223,8 @@ pub fn load_sft_dataset(
         data.max_response_chars,
         data.max_eval_samples,
         data.system_field.clone(),
+        data.min_system_chars,
+        data.max_system_chars,
         data.min_instruction_chars,
         data.max_instruction_chars,
         data.min_input_chars,
@@ -469,6 +473,10 @@ fn sft_record_passes_filters(data: &DataConfig, record: &InstructionRecord) -> R
         record.input.chars().count(),
         data.min_input_chars,
         data.max_input_chars,
+    ) && length_filter_passes(
+        record.system.chars().count(),
+        data.min_system_chars,
+        data.max_system_chars,
     ) && prompt_chars.is_none_or(|chars| {
         length_filter_passes(chars, data.min_prompt_chars, data.max_prompt_chars)
             && length_filter_passes(
@@ -580,6 +588,8 @@ fn write_sft_cache(
     max_response_chars: Option<usize>,
     max_eval_samples: Option<usize>,
     system_field: Option<String>,
+    min_system_chars: Option<usize>,
+    max_system_chars: Option<usize>,
     min_instruction_chars: Option<usize>,
     max_instruction_chars: Option<usize>,
     min_input_chars: Option<usize>,
@@ -599,6 +609,8 @@ fn write_sft_cache(
         max_response_chars,
         max_eval_samples,
         system_field,
+        min_system_chars,
+        max_system_chars,
         min_instruction_chars,
         max_instruction_chars,
         min_input_chars,
@@ -657,6 +669,8 @@ mod tests {
             input_field: "input".to_string(),
             response_field: "response".to_string(),
             system_field: None,
+            min_system_chars: None,
+            max_system_chars: None,
             prompt_template: "Instruction:\n{instruction}\n\nResponse:\n".to_string(),
             prompt_with_input_template:
                 "Instruction:\n{instruction}\n\nInput:\n{input}\n\nResponse:\n".to_string(),
@@ -712,6 +726,8 @@ mod tests {
             input_field: "input".to_string(),
             response_field: "response".to_string(),
             system_field: None,
+            min_system_chars: None,
+            max_system_chars: None,
             prompt_template: "Instruction:\n{instruction}\n\nResponse:\n".to_string(),
             prompt_with_input_template:
                 "Instruction:\n{instruction}\n\nInput:\n{input}\n\nResponse:\n".to_string(),
@@ -773,6 +789,8 @@ mod tests {
             input_field: "input".to_string(),
             response_field: "response".to_string(),
             system_field: None,
+            min_system_chars: None,
+            max_system_chars: None,
             prompt_template: "Instruction:\n{instruction}\n\nResponse:\n".to_string(),
             prompt_with_input_template:
                 "Instruction:\n{instruction}\n\nInput:\n{input}\n\nResponse:\n".to_string(),
@@ -842,6 +860,8 @@ mod tests {
             input_field: "input".to_string(),
             response_field: "response".to_string(),
             system_field: None,
+            min_system_chars: None,
+            max_system_chars: None,
             prompt_template: "Q: {instruction}\nA: ".to_string(),
             prompt_with_input_template: "Q: {instruction}\nContext: {input}\nA: ".to_string(),
             trim_fields: true,
@@ -908,6 +928,8 @@ mod tests {
             input_field: "input".to_string(),
             response_field: "response".to_string(),
             system_field: Some("system".to_string()),
+            min_system_chars: None,
+            max_system_chars: None,
             prompt_template: "System: {system}\nQ: {instruction}\nA: ".to_string(),
             prompt_with_input_template: "System: {system}\nQ: {instruction}\nI: {input}\nA: "
                 .to_string(),
@@ -940,6 +962,67 @@ mod tests {
     }
 
     #[test]
+    fn sft_dataset_filters_system_lengths_before_split_and_limit() {
+        let dir = tempdir().expect("temp dir should be created");
+        let data_dir = dir.path().join("sft");
+        let cache_dir = dir.path().join("cache");
+        fs::create_dir_all(&data_dir).expect("sft dir should be created");
+        fs::create_dir_all(&cache_dir).expect("cache dir should be created");
+        fs::write(
+            data_dir.join("sample.jsonl"),
+            "{\"system\":\"ai\",\"instruction\":\"too short\",\"response\":\"skip\"}\n{\"system\":\"brief\",\"instruction\":\"first kept\",\"response\":\"one\"}\n{\"system\":\"concise\",\"instruction\":\"second kept\",\"response\":\"two\"}\n{\"system\":\"this system prompt is too long\",\"instruction\":\"too long\",\"response\":\"skip\"}\n",
+        )
+        .expect("jsonl should write");
+
+        let data = DataConfig {
+            kind: DataKind::InstructionJsonl,
+            paths: vec![data_dir],
+            eval_paths: Vec::new(),
+            train_split: 0.5,
+            max_samples: Some(2),
+            max_eval_samples: None,
+            shuffle: false,
+            index_cache: None,
+            instruction_field: "instruction".to_string(),
+            input_field: "input".to_string(),
+            response_field: "response".to_string(),
+            system_field: Some("system".to_string()),
+            min_system_chars: Some(4),
+            max_system_chars: Some(8),
+            prompt_template: "System: {system}\nQ: {instruction}\nA: ".to_string(),
+            prompt_with_input_template: "System: {system}\nQ: {instruction}\nI: {input}\nA: "
+                .to_string(),
+            trim_fields: true,
+            min_response_chars: 1,
+            max_response_chars: None,
+            min_instruction_chars: None,
+            max_instruction_chars: None,
+            min_input_chars: None,
+            max_input_chars: None,
+            min_prompt_chars: None,
+            max_prompt_chars: None,
+            min_sample_chars: None,
+            max_sample_chars: None,
+            dedupe_samples: false,
+            source_weights: Vec::new(),
+        };
+        let dataset =
+            load_sft_dataset(&data, 128, 96, &cache_dir).expect("SFT dataset should load");
+        let decoded = dataset
+            .train_samples
+            .iter()
+            .chain(dataset.eval_samples.iter())
+            .map(|sample| dataset.tokenizer.decode_lossy(&sample.tokens))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(decoded.contains("first kept"));
+        assert!(decoded.contains("second kept"));
+        assert!(!decoded.contains("too short"));
+        assert!(!decoded.contains("too long"));
+    }
+
+    #[test]
     fn sft_dataset_trim_fields_controls_prompt_normalization() {
         let record = InstructionRecord {
             system: "  stay brief  ".to_string(),
@@ -960,6 +1043,8 @@ mod tests {
             input_field: "input".to_string(),
             response_field: "response".to_string(),
             system_field: None,
+            min_system_chars: None,
+            max_system_chars: None,
             prompt_template: "Q:{instruction}\nA:".to_string(),
             prompt_with_input_template: "Q:{instruction}\nI:{input}\nA:".to_string(),
             trim_fields: true,
@@ -1048,6 +1133,8 @@ mod tests {
             input_field: "input".to_string(),
             response_field: "response".to_string(),
             system_field: None,
+            min_system_chars: None,
+            max_system_chars: None,
             prompt_template: "Instruction:\n{instruction}\n\nResponse:\n".to_string(),
             prompt_with_input_template:
                 "Instruction:\n{instruction}\n\nInput:\n{input}\n\nResponse:\n".to_string(),
@@ -1106,6 +1193,8 @@ mod tests {
             input_field: "input".to_string(),
             response_field: "response".to_string(),
             system_field: None,
+            min_system_chars: None,
+            max_system_chars: None,
             prompt_template: "Instruction:\n{instruction}\n\nResponse:\n".to_string(),
             prompt_with_input_template:
                 "Instruction:\n{instruction}\n\nInput:\n{input}\n\nResponse:\n".to_string(),
@@ -1165,6 +1254,8 @@ mod tests {
             input_field: "input".to_string(),
             response_field: "response".to_string(),
             system_field: None,
+            min_system_chars: None,
+            max_system_chars: None,
             prompt_template: "Instruction:\n{instruction}\n\nResponse:\n".to_string(),
             prompt_with_input_template:
                 "Instruction:\n{instruction}\n\nInput:\n{input}\n\nResponse:\n".to_string(),
@@ -1225,6 +1316,8 @@ mod tests {
             input_field: "input".to_string(),
             response_field: "response".to_string(),
             system_field: None,
+            min_system_chars: None,
+            max_system_chars: None,
             prompt_template: "Instruction:\n{instruction}\n\nResponse:\n".to_string(),
             prompt_with_input_template:
                 "Instruction:\n{instruction}\n\nInput:\n{input}\n\nResponse:\n".to_string(),
@@ -1285,6 +1378,8 @@ mod tests {
             input_field: "input".to_string(),
             response_field: "response".to_string(),
             system_field: None,
+            min_system_chars: None,
+            max_system_chars: None,
             prompt_template: "Instruction:\n{instruction}\n\nResponse:\n".to_string(),
             prompt_with_input_template:
                 "Instruction:\n{instruction}\n\nInput:\n{input}\n\nResponse:\n".to_string(),
@@ -1347,6 +1442,8 @@ mod tests {
             input_field: "input".to_string(),
             response_field: "response".to_string(),
             system_field: None,
+            min_system_chars: None,
+            max_system_chars: None,
             prompt_template: "Instruction:\n{instruction}\n\nResponse:\n".to_string(),
             prompt_with_input_template:
                 "Instruction:\n{instruction}\n\nInput:\n{input}\n\nResponse:\n".to_string(),
@@ -1411,6 +1508,8 @@ mod tests {
             input_field: "input".to_string(),
             response_field: "response".to_string(),
             system_field: None,
+            min_system_chars: None,
+            max_system_chars: None,
             prompt_template: "Q:{instruction}\nA:".to_string(),
             prompt_with_input_template: "Q:{instruction}\nI:{input}\nA:".to_string(),
             trim_fields: true,
@@ -1473,6 +1572,8 @@ mod tests {
             input_field: "input".to_string(),
             response_field: "response".to_string(),
             system_field: None,
+            min_system_chars: None,
+            max_system_chars: None,
             prompt_template: "Q:{instruction}\nA:".to_string(),
             prompt_with_input_template: "Q:{instruction}\nI:{input}\nA:".to_string(),
             trim_fields: true,
@@ -1543,6 +1644,8 @@ mod tests {
             input_field: "input".to_string(),
             response_field: "response".to_string(),
             system_field: None,
+            min_system_chars: None,
+            max_system_chars: None,
             prompt_template: "Instruction:\n{instruction}\n\nResponse:\n".to_string(),
             prompt_with_input_template:
                 "Instruction:\n{instruction}\n\nInput:\n{input}\n\nResponse:\n".to_string(),
@@ -1602,6 +1705,8 @@ mod tests {
             input_field: "input".to_string(),
             response_field: "response".to_string(),
             system_field: None,
+            min_system_chars: None,
+            max_system_chars: None,
             prompt_template: "Instruction:\n{instruction}\n\nResponse:\n".to_string(),
             prompt_with_input_template:
                 "Instruction:\n{instruction}\n\nInput:\n{input}\n\nResponse:\n".to_string(),
@@ -1663,6 +1768,8 @@ mod tests {
             input_field: "input".to_string(),
             response_field: "response".to_string(),
             system_field: None,
+            min_system_chars: None,
+            max_system_chars: None,
             prompt_template: "Instruction:\n{instruction}\n\nResponse:\n".to_string(),
             prompt_with_input_template:
                 "Instruction:\n{instruction}\n\nInput:\n{input}\n\nResponse:\n".to_string(),

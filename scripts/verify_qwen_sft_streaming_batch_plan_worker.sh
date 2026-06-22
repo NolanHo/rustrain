@@ -199,6 +199,8 @@ expected_field_map = {
     "max_instruction_chars": None,
     "min_input_chars": None,
     "max_input_chars": None,
+    "min_system_chars": None,
+    "max_system_chars": None,
     "min_prompt_chars": None,
     "max_prompt_chars": None,
     "min_sample_chars": None,

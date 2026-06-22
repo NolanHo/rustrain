@@ -1633,6 +1633,10 @@ struct QwenSftFieldMap {
     response: String,
     #[serde(default)]
     system: Option<String>,
+    #[serde(default)]
+    min_system_chars: Option<usize>,
+    #[serde(default)]
+    max_system_chars: Option<usize>,
     prompt_template: String,
     prompt_with_input_template: String,
     trim_fields: bool,
@@ -1667,6 +1671,8 @@ impl QwenSftFieldMap {
             input: data.input_field.clone(),
             response: data.response_field.clone(),
             system: data.system_field.clone(),
+            min_system_chars: data.min_system_chars,
+            max_system_chars: data.max_system_chars,
             prompt_template: data.prompt_template.clone(),
             prompt_with_input_template: data.prompt_with_input_template.clone(),
             trim_fields: data.trim_fields,
@@ -1703,6 +1709,12 @@ impl QwenSftFieldMap {
             .is_some_and(|field| field.trim().is_empty())
         {
             bail!("data.system_field must not be empty when set");
+        }
+        if self.min_system_chars.is_some() && self.system.is_none() {
+            bail!("data.min_system_chars requires data.system_field to be set");
+        }
+        if self.max_system_chars.is_some() && self.system.is_none() {
+            bail!("data.max_system_chars requires data.system_field to be set");
         }
         if self.prompt_template.is_empty() {
             bail!("data.prompt_template must not be empty");
@@ -1757,6 +1769,24 @@ impl QwenSftFieldMap {
                 bail!("data.max_input_chars must be greater than or equal to data.min_input_chars");
             }
         }
+        if let Some(min_system_chars) = self.min_system_chars {
+            if min_system_chars == 0 {
+                bail!("data.min_system_chars must be greater than zero");
+            }
+        }
+        if let Some(max_system_chars) = self.max_system_chars {
+            if max_system_chars == 0 {
+                bail!("data.max_system_chars must be greater than zero");
+            }
+            if self
+                .min_system_chars
+                .is_some_and(|min_system_chars| max_system_chars < min_system_chars)
+            {
+                bail!(
+                    "data.max_system_chars must be greater than or equal to data.min_system_chars"
+                );
+            }
+        }
         if let Some(min_prompt_chars) = self.min_prompt_chars {
             if min_prompt_chars == 0 {
                 bail!("data.min_prompt_chars must be greater than zero");
@@ -1804,6 +1834,8 @@ impl Default for QwenSftFieldMap {
             input: "input".to_string(),
             response: "response".to_string(),
             system: None,
+            min_system_chars: None,
+            max_system_chars: None,
             prompt_template: "Instruction:\n{instruction}\n\nResponse:\n".to_string(),
             prompt_with_input_template:
                 "Instruction:\n{instruction}\n\nInput:\n{input}\n\nResponse:\n".to_string(),
@@ -11787,6 +11819,10 @@ fn qwen_sft_record_passes_filters(record: &QwenSftRecord, field_map: &QwenSftFie
         record.input.chars().count(),
         field_map.min_input_chars,
         field_map.max_input_chars,
+    ) && qwen_sft_length_filter_passes(
+        record.system.chars().count(),
+        field_map.min_system_chars,
+        field_map.max_system_chars,
     ) && prompt_chars.is_none_or(|chars| {
         qwen_sft_length_filter_passes(
             chars,
@@ -11927,6 +11963,16 @@ fn qwen_sft_hash_field_map(hash: &mut u64, field_map: &QwenSftFieldMap) {
     if let Some(max_input_chars) = field_map.max_input_chars {
         qwen_sft_hash_bytes(hash, b"max_input_chars");
         qwen_sft_hash_bytes(hash, max_input_chars.to_string().as_bytes());
+        qwen_sft_hash_bytes(hash, b"\0");
+    }
+    if let Some(min_system_chars) = field_map.min_system_chars {
+        qwen_sft_hash_bytes(hash, b"min_system_chars");
+        qwen_sft_hash_bytes(hash, min_system_chars.to_string().as_bytes());
+        qwen_sft_hash_bytes(hash, b"\0");
+    }
+    if let Some(max_system_chars) = field_map.max_system_chars {
+        qwen_sft_hash_bytes(hash, b"max_system_chars");
+        qwen_sft_hash_bytes(hash, max_system_chars.to_string().as_bytes());
         qwen_sft_hash_bytes(hash, b"\0");
     }
     if let Some(min_prompt_chars) = field_map.min_prompt_chars {
@@ -15225,6 +15271,92 @@ mod tests {
                 .map(|example| (example.instruction.as_str(), example.input.as_str()))
                 .collect::<Vec<_>>(),
             vec![("first", "ok"), ("second", "mid")]
+        );
+        assert_eq!(
+            source_index
+                .samples
+                .iter()
+                .map(|sample| sample.index_in_file)
+                .collect::<Vec<_>>(),
+            vec![1, 3]
+        );
+    }
+
+    #[test]
+    fn qwen_sft_filters_system_lengths_before_limit_and_streaming_index() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let jsonl = temp.path().join("samples.jsonl");
+        let cache_path = temp.path().join("cache").join("offset-index.json");
+        fs::write(
+            &jsonl,
+            r#"{"system":"ai","instruction":"skip short","response":"short"}
+{"system":"brief","instruction":"first","response":"valid"}
+{"system":"this system prompt is too long","instruction":"skip long","response":"long"}
+{"system":"concise","instruction":"second","response":"works"}
+{"system":"direct","instruction":"third","response":"later"}
+"#,
+        )
+        .expect("jsonl should write");
+        let paths = vec![jsonl.clone()];
+        let field_map = QwenSftFieldMap {
+            system: Some("system".to_string()),
+            min_system_chars: Some(4),
+            max_system_chars: Some(8),
+            prompt_template: "System: {system}\nQ: {instruction}\nA: ".to_string(),
+            prompt_with_input_template: "System: {system}\nQ: {instruction}\nI: {input}\nA: "
+                .to_string(),
+            ..QwenSftFieldMap::default()
+        };
+
+        let loaded = qwen_sft_examples_from_jsonl_paths_with_limit(&paths, Some(2), &field_map)
+            .expect("filtered examples should load");
+        let streamed = qwen_sft_streaming_source_summary(&paths, Some(2), &field_map)
+            .expect("filtered streaming summary should scan");
+        let source_index = qwen_sft_streaming_source_index(&paths, Some(2), &field_map)
+            .expect("filtered source index should build");
+        let raw_window = qwen_sft_examples_by_raw_indices(&source_index.samples, &field_map)
+            .expect("filtered raw window should read");
+        let cache = qwen_sft_streaming_source_index_with_cache(
+            &paths,
+            Some(2),
+            Some(&cache_path),
+            &field_map,
+        )
+        .expect("filtered cache should write");
+        let cache_mismatch = qwen_sft_streaming_source_index_with_cache(
+            &paths,
+            Some(2),
+            Some(&cache_path),
+            &QwenSftFieldMap {
+                system: Some("system".to_string()),
+                ..QwenSftFieldMap::default()
+            },
+        )
+        .expect_err("system filter drift should reject cache")
+        .to_string();
+
+        assert_eq!(
+            loaded
+                .examples
+                .iter()
+                .map(|example| (example.system.as_str(), example.instruction.as_str()))
+                .collect::<Vec<_>>(),
+            vec![("brief", "first"), ("concise", "second")]
+        );
+        assert_eq!(streamed.samples, loaded.examples.len());
+        assert_eq!(streamed.source_files, loaded.source_files);
+        assert_eq!(streamed.source_sample_counts, loaded.source_sample_counts);
+        assert_eq!(streamed.fingerprint, loaded.fingerprint);
+        assert_eq!(cache.index.samples, source_index.samples);
+        assert!(cache.cache_written);
+        assert!(cache_mismatch.contains("field_map"));
+        assert_eq!(
+            raw_window
+                .examples
+                .iter()
+                .map(|example| (example.system.as_str(), example.instruction.as_str()))
+                .collect::<Vec<_>>(),
+            vec![("brief", "first"), ("concise", "second")]
         );
         assert_eq!(
             source_index

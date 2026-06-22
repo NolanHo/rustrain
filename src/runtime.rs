@@ -100,6 +100,10 @@ pub struct DataConfig {
     pub response_field: String,
     #[serde(default)]
     pub system_field: Option<String>,
+    #[serde(default)]
+    pub min_system_chars: Option<usize>,
+    #[serde(default)]
+    pub max_system_chars: Option<usize>,
     #[serde(default = "default_prompt_template")]
     pub prompt_template: String,
     #[serde(default = "default_prompt_with_input_template")]
@@ -503,6 +507,38 @@ pub fn validate_config(config: &Config) -> Result<()> {
                 ));
             }
         }
+        if let Some(min_system_chars) = data.min_system_chars {
+            if data.system_field.is_none() {
+                return Err(anyhow!(
+                    "data.min_system_chars requires data.system_field to be set"
+                ));
+            }
+            if min_system_chars == 0 {
+                return Err(anyhow!(
+                    "data.min_system_chars must be greater than zero when set"
+                ));
+            }
+        }
+        if let Some(max_system_chars) = data.max_system_chars {
+            if data.system_field.is_none() {
+                return Err(anyhow!(
+                    "data.max_system_chars requires data.system_field to be set"
+                ));
+            }
+            if max_system_chars == 0 {
+                return Err(anyhow!(
+                    "data.max_system_chars must be greater than zero when set"
+                ));
+            }
+            if data
+                .min_system_chars
+                .is_some_and(|min_system_chars| max_system_chars < min_system_chars)
+            {
+                return Err(anyhow!(
+                    "data.max_system_chars must be greater than or equal to data.min_system_chars"
+                ));
+            }
+        }
         if let Some(min_prompt_chars) = data.min_prompt_chars {
             if min_prompt_chars == 0 {
                 return Err(anyhow!(
@@ -729,6 +765,8 @@ mod tests {
                 input_field: default_input_field(),
                 response_field: default_response_field(),
                 system_field: None,
+                min_system_chars: None,
+                max_system_chars: None,
                 prompt_template: default_prompt_template(),
                 prompt_with_input_template: default_prompt_with_input_template(),
                 trim_fields: default_trim_fields(),
