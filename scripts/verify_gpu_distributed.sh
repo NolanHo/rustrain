@@ -43,6 +43,9 @@ remote_run_2gpu env \
   RUSTRAIN_DISTRIBUTED_VERIFY_OUTPUT_DIR="${OUTPUT_DIR}" \
   bash scripts/verify_qwen_session_dp2_worker.sh
 
+remote_run_2gpu bash scripts/verify_qwen_session_dp2_sft_max_samples_worker.sh
+remote_run_2gpu bash scripts/verify_qwen_session_dp2_sft_eval_paths_worker.sh
+
 remote_run_2gpu env \
   RUSTRAIN_LAUNCH_TIMEOUT_SECS=900 \
   RUSTRAIN_DISTRIBUTED_VERIFY_OUTPUT_DIR="${OUTPUT_DIR}-layers01" \
