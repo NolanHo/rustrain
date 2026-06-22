@@ -59,14 +59,23 @@ if not data.get("dataset_fingerprint"):
 if data.get("dataset_shuffle") is not True:
     raise SystemExit(f"dataset_shuffle {data.get('dataset_shuffle')} is not true")
 source_counts = data.get("dataset_source_sample_counts") or []
-expected_counts = {
-    "data/sft_toy/eval_instructions.jsonl": 2,
-    "data/sft_toy/instructions.jsonl": 6,
-    "data/sft_toy/more_instructions.jsonl": 2,
-}
-actual_counts = {entry["path"]: entry["samples"] for entry in source_counts}
-if actual_counts != expected_counts:
-    raise SystemExit(f"source counts {actual_counts} != {expected_counts}")
+expected_counts = [
+    {"path": "data/sft_toy/eval_instructions.jsonl", "samples": 2},
+    {"path": "data/sft_toy/instructions.jsonl", "samples": 6},
+    {"path": "data/sft_toy/more_instructions.jsonl", "samples": 2},
+]
+if source_counts != expected_counts:
+    raise SystemExit(f"dataset_source_sample_counts {source_counts} != {expected_counts}")
+if [entry.get("path") for entry in source_counts] != expected_sources:
+    raise SystemExit(
+        f"dataset_source_sample_counts paths {[entry.get('path') for entry in source_counts]} != {expected_sources}"
+    )
+if any(int(entry.get("samples", 0)) <= 0 for entry in source_counts):
+    raise SystemExit(f"dataset_source_sample_counts must be positive: {source_counts}")
+if sum(int(entry["samples"]) for entry in source_counts) != int(data["dataset_total_samples"]):
+    raise SystemExit(
+        f"dataset_source_sample_counts total {source_counts} != dataset_total_samples {data['dataset_total_samples']}"
+    )
 if int(data.get("dataset_total_tokens", 0)) <= 0:
     raise SystemExit(f"dataset_total_tokens must be positive: {data.get('dataset_total_tokens')}")
 

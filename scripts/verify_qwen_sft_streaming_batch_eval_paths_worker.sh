@@ -29,11 +29,11 @@ expected_sources = [
     "data/sft_toy/instructions.jsonl",
     "data/sft_toy/more_instructions.jsonl",
 ]
-expected_counts = {
-    "data/sft_toy/eval_instructions.jsonl": 2,
-    "data/sft_toy/instructions.jsonl": 6,
-    "data/sft_toy/more_instructions.jsonl": 2,
-}
+expected_counts = [
+    {"path": "data/sft_toy/eval_instructions.jsonl", "samples": 2},
+    {"path": "data/sft_toy/instructions.jsonl", "samples": 6},
+    {"path": "data/sft_toy/more_instructions.jsonl", "samples": 2},
+]
 checks = {
     "world_size": 2,
     "local_batch_size": 1,
@@ -79,12 +79,19 @@ if data.get("dataset_source_files") != expected_sources:
     raise SystemExit(
         f"dataset_source_files {data.get('dataset_source_files')} != {expected_sources}"
     )
-actual_counts = {
-    entry["path"]: entry["samples"]
-    for entry in data.get("dataset_source_sample_counts") or []
-}
-if actual_counts != expected_counts:
-    raise SystemExit(f"dataset_source_sample_counts {actual_counts} != {expected_counts}")
+source_counts = data.get("dataset_source_sample_counts") or []
+if source_counts != expected_counts:
+    raise SystemExit(f"dataset_source_sample_counts {source_counts} != {expected_counts}")
+if [entry.get("path") for entry in source_counts] != expected_sources:
+    raise SystemExit(
+        f"dataset_source_sample_counts paths {[entry.get('path') for entry in source_counts]} != {expected_sources}"
+    )
+if any(int(entry.get("samples", 0)) <= 0 for entry in source_counts):
+    raise SystemExit(f"dataset_source_sample_counts must be positive: {source_counts}")
+if sum(int(entry["samples"]) for entry in source_counts) != int(data["dataset_total_samples"]):
+    raise SystemExit(
+        f"dataset_source_sample_counts total {source_counts} != dataset_total_samples {data['dataset_total_samples']}"
+    )
 if data.get("dataset_fingerprint") != "f771c261589611be":
     raise SystemExit(f"unexpected dataset_fingerprint {data.get('dataset_fingerprint')}")
 
