@@ -102,6 +102,8 @@ pub struct DataConfig {
     pub prompt_with_input_template: String,
     #[serde(default = "default_trim_fields")]
     pub trim_fields: bool,
+    #[serde(default = "default_min_response_chars")]
+    pub min_response_chars: usize,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -493,6 +495,10 @@ fn default_trim_fields() -> bool {
     true
 }
 
+fn default_min_response_chars() -> usize {
+    1
+}
+
 fn default_eval_every() -> u64 {
     0
 }
@@ -593,6 +599,7 @@ mod tests {
                 prompt_template: default_prompt_template(),
                 prompt_with_input_template: default_prompt_with_input_template(),
                 trim_fields: default_trim_fields(),
+                min_response_chars: default_min_response_chars(),
             }),
             lora: Some(LoraConfig {
                 rank: 4,

@@ -442,7 +442,10 @@ production-grade sharded checkpoint ownership remain open.
   `Response` format and support `{instruction}` plus `{input}` placeholders.
   `data.trim_fields` defaults to `true` and trims JSONL instruction/input/
   response strings before template rendering; set it to `false` to preserve
-  exact field whitespace.
+  exact field whitespace. `data.min_response_chars` defaults to `1` and skips
+  JSONL records whose normalized response is empty or shorter than the
+  configured character count before train/eval splitting, `max_samples`, and
+  streaming offset-index construction.
   `cargo run -- qwen-sft-streaming-batch-plan --config ...` resolves the next
   cursor window to raw JSONL source indices, reads and tokenizes only those
   window records, then verifies the padded `input_ids` plus response masks match

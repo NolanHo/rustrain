@@ -1594,6 +1594,7 @@ struct QwenSftStreamingSourceIndexCache {
     paths: Vec<String>,
     max_samples: Option<usize>,
     field_map: QwenSftFieldMap,
+    min_response_chars: usize,
     samples: Vec<QwenSftRawSampleIndex>,
 }
 
@@ -1631,6 +1632,7 @@ struct QwenSftFieldMap {
     prompt_template: String,
     prompt_with_input_template: String,
     trim_fields: bool,
+    min_response_chars: usize,
 }
 
 impl QwenSftFieldMap {
@@ -1642,6 +1644,7 @@ impl QwenSftFieldMap {
             prompt_template: data.prompt_template.clone(),
             prompt_with_input_template: data.prompt_with_input_template.clone(),
             trim_fields: data.trim_fields,
+            min_response_chars: data.min_response_chars,
         };
         map.validate()?;
         Ok(map)
@@ -1677,6 +1680,7 @@ impl Default for QwenSftFieldMap {
             prompt_with_input_template:
                 "Instruction:\n{instruction}\n\nInput:\n{input}\n\nResponse:\n".to_string(),
             trim_fields: true,
+            min_response_chars: 1,
         }
     }
 }
@@ -10963,6 +10967,7 @@ fn qwen_sft_examples_from_jsonl_paths_with_limit(
 fn qwen_sft_streaming_source_index(
     paths: &[PathBuf],
     max_samples: Option<usize>,
+    field_map: &QwenSftFieldMap,
 ) -> Result<QwenSftStreamingSourceIndex> {
     if paths.is_empty() {
         bail!("SFT dataset must contain at least one JSONL path");
@@ -11009,6 +11014,18 @@ fn qwen_sft_streaming_source_index(
                     line_index += 1;
                     continue;
                 }
+                let record =
+                    qwen_sft_record_from_jsonl_line(&line, field_map).with_context(|| {
+                        format!(
+                            "failed to parse SFT JSONL record {}:{}",
+                            file.display(),
+                            line_index + 1
+                        )
+                    })?;
+                if !qwen_sft_record_passes_response_filter(&record, field_map) {
+                    line_index += 1;
+                    continue;
+                }
                 samples.push(QwenSftRawSampleIndex {
                     path: file_path.clone(),
                     index_in_file: line_index,
@@ -11042,7 +11059,7 @@ fn qwen_sft_streaming_source_index_with_cache(
                 .with_context(|| format!("failed to read {}", cache_path.display()))?;
             let cache: QwenSftStreamingSourceIndexCache = serde_json::from_str(&contents)
                 .with_context(|| format!("failed to parse {}", cache_path.display()))?;
-            if cache.format != "rustrain.qwen_sft_offset_index.v2" {
+            if cache.format != "rustrain.qwen_sft_offset_index.v3" {
                 bail!(
                     "unsupported SFT streaming index cache format {} in {}",
                     cache.format,
@@ -11070,6 +11087,13 @@ fn qwen_sft_streaming_source_index_with_cache(
                     field_map
                 );
             }
+            if cache.min_response_chars != field_map.min_response_chars {
+                bail!(
+                    "SFT streaming index cache min_response_chars {} does not match {}",
+                    cache.min_response_chars,
+                    field_map.min_response_chars
+                );
+            }
             if cache.samples.is_empty() {
                 bail!(
                     "SFT streaming index cache {} contains no samples",
@@ -11086,7 +11110,7 @@ fn qwen_sft_streaming_source_index_with_cache(
         }
     }
 
-    let index = qwen_sft_streaming_source_index(paths, max_samples)?;
+    let index = qwen_sft_streaming_source_index(paths, max_samples, field_map)?;
     let mut cache_written = false;
     if let Some(cache_path) = cache_path {
         if let Some(parent) = cache_path.parent() {
@@ -11094,10 +11118,11 @@ fn qwen_sft_streaming_source_index_with_cache(
                 .with_context(|| format!("failed to create {}", parent.display()))?;
         }
         let cache = QwenSftStreamingSourceIndexCache {
-            format: "rustrain.qwen_sft_offset_index.v2".to_string(),
+            format: "rustrain.qwen_sft_offset_index.v3".to_string(),
             paths: expected_paths,
             max_samples,
             field_map: field_map.clone(),
+            min_response_chars: field_map.min_response_chars,
             samples: index.samples.clone(),
         };
         let contents = serde_json::to_string_pretty(&cache)
@@ -11250,24 +11275,30 @@ fn qwen_sft_examples_from_jsonl_path_with_limit(
                     line_index + 1
                 )
             })?;
+            if !qwen_sft_record_passes_response_filter(&record, field_map) {
+                continue;
+            }
             examples.push(QwenSftExample {
                 instruction: record.instruction,
                 input: record.input,
                 response: record.response,
             });
         }
-        source_sample_counts.push(QwenSftSourceSampleCount {
-            path: file.display().to_string(),
-            samples: examples.len() - before,
-        });
+        let consumed = examples.len() - before;
+        if consumed > 0 {
+            source_sample_counts.push(QwenSftSourceSampleCount {
+                path: file.display().to_string(),
+                samples: consumed,
+            });
+        }
     }
 
     if examples.is_empty() {
         bail!("SFT JSONL path {} did not contain examples", path.display());
     }
-    let source_files = files
+    let source_files = source_sample_counts
         .iter()
-        .map(|file| file.display().to_string())
+        .map(|count| count.path.clone())
         .collect::<Vec<_>>();
     let fingerprint = qwen_sft_dataset_fingerprint(&source_files, &examples, field_map);
     Ok(QwenSftExampleSet {
@@ -11329,6 +11360,9 @@ fn qwen_sft_streaming_source_summary(
                             line_index + 1
                         )
                     })?;
+                if !qwen_sft_record_passes_response_filter(&record, field_map) {
+                    continue;
+                }
                 source_files.insert(file_path.clone());
                 drop(record);
                 samples += 1;
@@ -11405,6 +11439,9 @@ fn qwen_sft_streaming_fingerprint(
                             line_index + 1
                         )
                     })?;
+                if !qwen_sft_record_passes_response_filter(&record, field_map) {
+                    continue;
+                }
                 qwen_sft_hash_record(&mut hash, &record);
                 samples += 1;
             }
@@ -11467,6 +11504,13 @@ fn qwen_normalize_jsonl_field(value: String, field_map: &QwenSftFieldMap) -> Str
     } else {
         value
     }
+}
+
+fn qwen_sft_record_passes_response_filter(
+    record: &QwenSftRecord,
+    field_map: &QwenSftFieldMap,
+) -> bool {
+    record.response.chars().count() >= field_map.min_response_chars
 }
 
 fn qwen_required_jsonl_string_field(
@@ -11539,6 +11583,9 @@ fn qwen_sft_hash_field_map(hash: &mut u64, field_map: &QwenSftFieldMap) {
             b"raw".as_slice()
         },
     );
+    qwen_sft_hash_bytes(hash, b"\0");
+    qwen_sft_hash_bytes(hash, b"min_response_chars");
+    qwen_sft_hash_bytes(hash, field_map.min_response_chars.to_string().as_bytes());
     qwen_sft_hash_bytes(hash, b"\0");
 }
 
@@ -13985,8 +14032,8 @@ mod tests {
             .expect("custom field examples should load");
         let streamed = qwen_sft_streaming_source_summary(&paths, None, &field_map)
             .expect("custom field streaming summary should scan");
-        let source_index =
-            qwen_sft_streaming_source_index(&paths, None).expect("source index should build");
+        let source_index = qwen_sft_streaming_source_index(&paths, None, &field_map)
+            .expect("source index should build");
         let raw_window = qwen_sft_examples_by_raw_indices(&source_index.samples, &field_map)
             .expect("custom field raw window should read");
         let first_cache =
@@ -14399,6 +14446,65 @@ mod tests {
     }
 
     #[test]
+    fn qwen_sft_filters_short_responses_before_limit_and_streaming_index() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let jsonl = temp.path().join("samples.jsonl");
+        fs::write(
+            &jsonl,
+            r#"{"instruction":"empty","response":""}
+{"instruction":"short","response":"ok"}
+{"instruction":"first","response":"valid"}
+{"instruction":"second","response":"works"}
+{"instruction":"third","response":"later"}
+"#,
+        )
+        .expect("jsonl should write");
+        let paths = vec![jsonl.clone()];
+        let field_map = QwenSftFieldMap {
+            min_response_chars: 5,
+            ..QwenSftFieldMap::default()
+        };
+
+        let loaded = qwen_sft_examples_from_jsonl_paths_with_limit(&paths, Some(2), &field_map)
+            .expect("filtered examples should load");
+        let streamed = qwen_sft_streaming_source_summary(&paths, Some(2), &field_map)
+            .expect("filtered streaming summary should scan");
+        let source_index = qwen_sft_streaming_source_index(&paths, Some(2), &field_map)
+            .expect("filtered source index should build");
+        let raw_window = qwen_sft_examples_by_raw_indices(&source_index.samples, &field_map)
+            .expect("filtered raw window should read");
+
+        assert_eq!(
+            loaded
+                .examples
+                .iter()
+                .map(|example| example.instruction.as_str())
+                .collect::<Vec<_>>(),
+            vec!["first", "second"]
+        );
+        assert_eq!(streamed.samples, loaded.examples.len());
+        assert_eq!(streamed.source_files, loaded.source_files);
+        assert_eq!(streamed.source_sample_counts, loaded.source_sample_counts);
+        assert_eq!(streamed.fingerprint, loaded.fingerprint);
+        assert_eq!(
+            raw_window
+                .examples
+                .iter()
+                .map(|example| example.instruction.as_str())
+                .collect::<Vec<_>>(),
+            vec!["first", "second"]
+        );
+        assert_eq!(
+            source_index
+                .samples
+                .iter()
+                .map(|sample| sample.index_in_file)
+                .collect::<Vec<_>>(),
+            vec![2, 3]
+        );
+    }
+
+    #[test]
     fn qwen_sft_streaming_window_uses_train_split_sample_count() {
         let (train_samples, eval_samples) =
             qwen_sft_train_eval_sample_counts(4, 0.75).expect("split should compute");
@@ -14439,16 +14545,17 @@ mod tests {
         let jsonl = temp.path().join("train.jsonl");
         fs::write(
             &jsonl,
-            r#"{"instruction":"zero","response":"a"}
-{"instruction":"one","response":"b"}
-{"instruction":"two","response":"c"}
-{"instruction":"three","response":"d"}
+            r#"{"instruction":"zero","response":"zero"}
+{"instruction":"one","response":"one"}
+{"instruction":"two","response":"two"}
+{"instruction":"three","response":"three"}
 "#,
         )
         .expect("jsonl should write");
         let paths = vec![jsonl.clone()];
         let source_index =
-            qwen_sft_streaming_source_index(&paths, None).expect("source index should build");
+            qwen_sft_streaming_source_index(&paths, None, &QwenSftFieldMap::default())
+                .expect("source index should build");
         let (train_samples, _) =
             qwen_sft_train_eval_sample_counts(source_index.samples.len(), 0.75)
                 .expect("split should compute");
@@ -14491,7 +14598,7 @@ mod tests {
                 .iter()
                 .map(|index| index.byte_offset)
                 .collect::<Vec<_>>(),
-            vec![112, 112, 75, 38]
+            vec![119, 119, 80, 41]
         );
         assert_eq!(
             raw_indices
@@ -14503,53 +14610,21 @@ mod tests {
     }
 
     #[test]
-    fn qwen_sft_streaming_source_index_is_offset_only_until_window_read() {
+    fn qwen_sft_streaming_source_index_parses_records_before_indexing_offsets() {
         let temp = tempfile::tempdir().expect("temp dir should be created");
         let jsonl = temp.path().join("train.jsonl");
         fs::write(
             &jsonl,
-            r#"{"instruction":"zero","response":"a"}
+            r#"{"instruction":"zero","response":"zero"}
 not-json
-{"instruction":"two","response":"c"}
+{"instruction":"two","response":"two"}
 "#,
         )
         .expect("jsonl should write");
         let paths = vec![jsonl.clone()];
-        let source_index =
-            qwen_sft_streaming_source_index(&paths, None).expect("offset index should build");
-
-        assert_eq!(source_index.samples.len(), 3);
-        assert_eq!(
-            source_index
-                .samples
-                .iter()
-                .map(|sample| (sample.index_in_file, sample.byte_offset))
-                .collect::<Vec<_>>(),
-            vec![(0, 0), (1, 38), (2, 47)]
-        );
-
-        let valid_window = qwen_sft_examples_by_raw_indices(
-            &[
-                source_index.samples[0].clone(),
-                source_index.samples[2].clone(),
-            ],
-            &QwenSftFieldMap::default(),
-        )
-        .expect("valid offset window should parse");
-        assert_eq!(
-            valid_window
-                .examples
-                .iter()
-                .map(|example| example.instruction.as_str())
-                .collect::<Vec<_>>(),
-            vec!["zero", "two"]
-        );
-
-        let error = match qwen_sft_examples_by_raw_indices(
-            &[source_index.samples[1].clone()],
-            &QwenSftFieldMap::default(),
-        ) {
-            Ok(_) => panic!("selected malformed JSONL row should fail at window read"),
+        let error = match qwen_sft_streaming_source_index(&paths, None, &QwenSftFieldMap::default())
+        {
+            Ok(_) => panic!("malformed JSONL row should fail while building the offset index"),
             Err(error) => error.to_string(),
         };
         assert!(error.contains("failed to parse SFT JSONL record"));
@@ -14562,9 +14637,9 @@ not-json
         let cache_path = temp.path().join("cache").join("offset-index.json");
         fs::write(
             &jsonl,
-            r#"{"instruction":"zero","response":"a"}
-{"instruction":"one","response":"b"}
-{"instruction":"two","response":"c"}
+            r#"{"instruction":"zero","response":"zero"}
+{"instruction":"one","response":"one"}
+{"instruction":"two","response":"two"}
 "#,
         )
         .expect("jsonl should write");
@@ -14603,6 +14678,21 @@ not-json
             Err(error) => error.to_string(),
         };
         assert!(mismatch.contains("max_samples"));
+
+        let min_response_mismatch_map = QwenSftFieldMap {
+            min_response_chars: 2,
+            ..QwenSftFieldMap::default()
+        };
+        let min_response_mismatch = match qwen_sft_streaming_source_index_with_cache(
+            &paths,
+            Some(2),
+            Some(&cache_path),
+            &min_response_mismatch_map,
+        ) {
+            Ok(_) => panic!("mismatched min_response_chars should reject cache"),
+            Err(error) => error.to_string(),
+        };
+        assert!(min_response_mismatch.contains("field_map"));
     }
 
     #[test]
