@@ -181,10 +181,12 @@ Acceptance:
   summaries and manifest.
 - The layer0-layer3 JSONL external resume paths verify the same cursor
   continuity contract and the 49-tensor trainable registry for both fp32 and
-  bf16 resumed summaries and manifests.
+  bf16 resumed summaries and manifests. The bf16 path also asserts
+  `compute_kind = bf16`.
 - The layer0-layer7 JSONL external resume paths verify the same cursor
   continuity contract and the 97-tensor trainable registry for both fp32 and
-  bf16 resumed summaries and manifests.
+  bf16 resumed summaries and manifests. The bf16 path also asserts
+  `compute_kind = bf16`.
 
 ### Representative Sharded Checkpoints and Future Production
 
