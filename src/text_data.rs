@@ -74,6 +74,7 @@ struct SftCache {
     max_sample_chars: Option<usize>,
     dedupe_samples: bool,
     source_weights: Vec<usize>,
+    source_max_samples: Vec<usize>,
     train_samples: Vec<SftSample>,
     eval_samples: Vec<SftSample>,
 }
@@ -235,6 +236,7 @@ pub fn load_sft_dataset(
         data.max_sample_chars,
         data.dedupe_samples,
         &data.source_weights,
+        &data.source_max_samples,
         &dataset,
     )?;
 
@@ -336,10 +338,20 @@ fn read_sft_paths(
     } else {
         vec![1; paths.len()]
     };
-    for (path, source_weight) in paths.iter().zip(source_weights.iter().copied()) {
+    let source_max_samples = if apply_source_weights {
+        sft_source_max_samples(data, paths.len())?
+    } else {
+        vec![None; paths.len()]
+    };
+    for ((path, source_weight), source_limit) in paths
+        .iter()
+        .zip(source_weights.iter().copied())
+        .zip(source_max_samples.iter().copied())
+    {
         if max_samples.is_some_and(|limit| samples.len() >= limit) {
             break;
         }
+        let mut source_samples = 0usize;
         let files = if path.is_dir() {
             sorted_files(path)?
         } else {
@@ -347,13 +359,17 @@ fn read_sft_paths(
         };
 
         for file in files {
-            if max_samples.is_some_and(|limit| samples.len() >= limit) {
+            if max_samples.is_some_and(|limit| samples.len() >= limit)
+                || source_limit.is_some_and(|limit| source_samples >= limit)
+            {
                 break;
             }
             let contents = fs::read_to_string(&file)
                 .with_context(|| format!("failed to read {}", file.display()))?;
             for (line_index, line) in contents.lines().enumerate() {
-                if max_samples.is_some_and(|limit| samples.len() >= limit) {
+                if max_samples.is_some_and(|limit| samples.len() >= limit)
+                    || source_limit.is_some_and(|limit| source_samples >= limit)
+                {
                     break;
                 }
                 if line.trim().is_empty() {
@@ -381,6 +397,7 @@ fn read_sft_paths(
                     }
                     samples.push(sample.clone());
                 }
+                source_samples += 1;
             }
             source_paths.push(file);
         }
@@ -414,6 +431,30 @@ fn sft_source_weights(data: &DataConfig, path_count: usize) -> Result<Vec<usize>
         ));
     }
     Ok(weights)
+}
+
+fn sft_source_max_samples(data: &DataConfig, path_count: usize) -> Result<Vec<Option<usize>>> {
+    if data.source_max_samples.is_empty() {
+        return Ok(vec![None; path_count]);
+    }
+    let limits = if data.source_max_samples.len() == 1 {
+        vec![Some(data.source_max_samples[0]); path_count]
+    } else if data.source_max_samples.len() == path_count {
+        data.source_max_samples
+            .iter()
+            .map(|limit| Some(*limit))
+            .collect()
+    } else {
+        return Err(anyhow!(
+            "data.source_max_samples must be empty, length 1, or match data.paths length"
+        ));
+    };
+    if limits.iter().any(|limit| matches!(limit, Some(0))) {
+        return Err(anyhow!(
+            "data.source_max_samples entries must be greater than zero"
+        ));
+    }
+    Ok(limits)
 }
 
 fn instruction_record_from_jsonl_line(data: &DataConfig, line: &str) -> Result<InstructionRecord> {
@@ -600,6 +641,7 @@ fn write_sft_cache(
     max_sample_chars: Option<usize>,
     dedupe_samples: bool,
     source_weights: &[usize],
+    source_max_samples: &[usize],
     dataset: &SftDataset,
 ) -> Result<()> {
     let cache = SftCache {
@@ -621,6 +663,7 @@ fn write_sft_cache(
         max_sample_chars,
         dedupe_samples,
         source_weights: source_weights.to_vec(),
+        source_max_samples: source_max_samples.to_vec(),
         train_samples: dataset.train_samples.clone(),
         eval_samples: dataset.eval_samples.clone(),
     };
@@ -687,6 +730,7 @@ mod tests {
             max_sample_chars: None,
             dedupe_samples: false,
             source_weights: Vec::new(),
+            source_max_samples: Vec::new(),
         };
         let dataset = load_text_dataset(&data, 64, 8, &cache_dir).expect("dataset should load");
 
@@ -744,6 +788,7 @@ mod tests {
             max_sample_chars: None,
             dedupe_samples: false,
             source_weights: Vec::new(),
+            source_max_samples: Vec::new(),
         };
         let dataset = load_text_dataset(&data, 128, 8, &cache_dir).expect("dataset should load");
 
@@ -807,6 +852,7 @@ mod tests {
             max_sample_chars: None,
             dedupe_samples: false,
             source_weights: Vec::new(),
+            source_max_samples: Vec::new(),
         };
         let dataset =
             load_sft_dataset(&data, 128, 64, &cache_dir).expect("SFT dataset should load");
@@ -877,6 +923,7 @@ mod tests {
             max_sample_chars: None,
             dedupe_samples: false,
             source_weights: Vec::new(),
+            source_max_samples: Vec::new(),
         };
         let dataset =
             load_sft_dataset(&data, 128, 96, &cache_dir).expect("SFT dataset should load");
@@ -946,6 +993,7 @@ mod tests {
             max_sample_chars: None,
             dedupe_samples: false,
             source_weights: Vec::new(),
+            source_max_samples: Vec::new(),
         };
         let dataset =
             load_sft_dataset(&data, 128, 96, &cache_dir).expect("SFT dataset should load");
@@ -1005,6 +1053,7 @@ mod tests {
             max_sample_chars: None,
             dedupe_samples: false,
             source_weights: Vec::new(),
+            source_max_samples: Vec::new(),
         };
         let dataset =
             load_sft_dataset(&data, 128, 96, &cache_dir).expect("SFT dataset should load");
@@ -1060,6 +1109,7 @@ mod tests {
             max_sample_chars: None,
             dedupe_samples: false,
             source_weights: Vec::new(),
+            source_max_samples: Vec::new(),
         };
         let raw_data = DataConfig {
             trim_fields: false,
@@ -1151,6 +1201,7 @@ mod tests {
             max_sample_chars: None,
             dedupe_samples: false,
             source_weights: Vec::new(),
+            source_max_samples: Vec::new(),
         };
         let dataset =
             load_sft_dataset(&data, 128, 64, &cache_dir).expect("SFT dataset should load");
@@ -1211,6 +1262,7 @@ mod tests {
             max_sample_chars: None,
             dedupe_samples: false,
             source_weights: Vec::new(),
+            source_max_samples: Vec::new(),
         };
         let dataset =
             load_sft_dataset(&data, 128, 64, &cache_dir).expect("SFT dataset should load");
@@ -1272,6 +1324,7 @@ mod tests {
             max_sample_chars: None,
             dedupe_samples: false,
             source_weights: Vec::new(),
+            source_max_samples: Vec::new(),
         };
         let dataset =
             load_sft_dataset(&data, 128, 64, &cache_dir).expect("SFT dataset should load");
@@ -1334,6 +1387,7 @@ mod tests {
             max_sample_chars: None,
             dedupe_samples: false,
             source_weights: Vec::new(),
+            source_max_samples: Vec::new(),
         };
         let dataset =
             load_sft_dataset(&data, 128, 64, &cache_dir).expect("SFT dataset should load");
@@ -1396,6 +1450,7 @@ mod tests {
             max_sample_chars: None,
             dedupe_samples: false,
             source_weights: Vec::new(),
+            source_max_samples: Vec::new(),
         };
         let dataset =
             load_sft_dataset(&data, 128, 64, &cache_dir).expect("SFT dataset should load");
@@ -1460,6 +1515,7 @@ mod tests {
             max_sample_chars: None,
             dedupe_samples: false,
             source_weights: Vec::new(),
+            source_max_samples: Vec::new(),
         };
         let dataset =
             load_sft_dataset(&data, 128, 64, &cache_dir).expect("SFT dataset should load");
@@ -1525,6 +1581,7 @@ mod tests {
             max_sample_chars: None,
             dedupe_samples: false,
             source_weights: Vec::new(),
+            source_max_samples: Vec::new(),
         };
         let dataset =
             load_sft_dataset(&data, 128, 64, &cache_dir).expect("SFT dataset should load");
@@ -1589,6 +1646,7 @@ mod tests {
             max_sample_chars: Some(22),
             dedupe_samples: false,
             source_weights: Vec::new(),
+            source_max_samples: Vec::new(),
         };
         let dataset =
             load_sft_dataset(&data, 128, 64, &cache_dir).expect("SFT dataset should load");
@@ -1662,6 +1720,7 @@ mod tests {
             max_sample_chars: None,
             dedupe_samples: false,
             source_weights: vec![2, 2],
+            source_max_samples: Vec::new(),
         };
         let dataset =
             load_sft_dataset(&data, 128, 64, &cache_dir).expect("SFT dataset should load");
@@ -1677,6 +1736,78 @@ mod tests {
         assert!(decoded[0].contains("first"));
         assert!(decoded[1].contains("first"));
         assert!(decoded[2].contains("second"));
+    }
+
+    #[test]
+    fn sft_dataset_applies_source_max_samples_before_weighting_and_split() {
+        let dir = tempdir().expect("temp dir should be created");
+        let first_dir = dir.path().join("first");
+        let second_dir = dir.path().join("second");
+        let cache_dir = dir.path().join("cache");
+        fs::create_dir_all(&first_dir).expect("first dir should be created");
+        fs::create_dir_all(&second_dir).expect("second dir should be created");
+        fs::create_dir_all(&cache_dir).expect("cache dir should be created");
+        fs::write(
+            first_dir.join("first.jsonl"),
+            "{\"instruction\":\"first-a\",\"response\":\"alpha\"}\n{\"instruction\":\"first-b\",\"response\":\"skip\"}\n",
+        )
+        .expect("first jsonl should write");
+        fs::write(
+            second_dir.join("second.jsonl"),
+            "{\"instruction\":\"second-a\",\"response\":\"beta\"}\n{\"instruction\":\"second-b\",\"response\":\"gamma\"}\n{\"instruction\":\"second-c\",\"response\":\"skip\"}\n",
+        )
+        .expect("second jsonl should write");
+
+        let data = DataConfig {
+            kind: DataKind::InstructionJsonl,
+            paths: vec![first_dir, second_dir],
+            eval_paths: Vec::new(),
+            train_split: 0.5,
+            max_samples: Some(6),
+            max_eval_samples: None,
+            shuffle: false,
+            index_cache: None,
+            instruction_field: "instruction".to_string(),
+            input_field: "input".to_string(),
+            response_field: "response".to_string(),
+            system_field: None,
+            min_system_chars: None,
+            max_system_chars: None,
+            prompt_template: "Instruction:\n{instruction}\n\nResponse:\n".to_string(),
+            prompt_with_input_template:
+                "Instruction:\n{instruction}\n\nInput:\n{input}\n\nResponse:\n".to_string(),
+            trim_fields: true,
+            min_response_chars: 1,
+            max_response_chars: None,
+            min_instruction_chars: None,
+            max_instruction_chars: None,
+            min_input_chars: None,
+            max_input_chars: None,
+            min_prompt_chars: None,
+            max_prompt_chars: None,
+            min_sample_chars: None,
+            max_sample_chars: None,
+            dedupe_samples: false,
+            source_weights: vec![2, 2],
+            source_max_samples: vec![1, 2],
+        };
+        let dataset =
+            load_sft_dataset(&data, 128, 64, &cache_dir).expect("SFT dataset should load");
+        let decoded = dataset
+            .train_samples
+            .iter()
+            .chain(dataset.eval_samples.iter())
+            .map(|sample| dataset.tokenizer.decode_lossy(&sample.tokens))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert_eq!(dataset.train_samples.len(), 3);
+        assert_eq!(dataset.eval_samples.len(), 3);
+        assert_eq!(decoded.matches("first-a").count(), 2);
+        assert_eq!(decoded.matches("second-a").count(), 2);
+        assert_eq!(decoded.matches("second-b").count(), 2);
+        assert!(!decoded.contains("first-b"));
+        assert!(!decoded.contains("second-c"));
     }
 
     #[test]
@@ -1723,6 +1854,7 @@ mod tests {
             max_sample_chars: None,
             dedupe_samples: true,
             source_weights: Vec::new(),
+            source_max_samples: Vec::new(),
         };
         let dataset =
             load_sft_dataset(&data, 128, 64, &cache_dir).expect("SFT dataset should load");
@@ -1786,6 +1918,7 @@ mod tests {
             max_sample_chars: None,
             dedupe_samples: false,
             source_weights: Vec::new(),
+            source_max_samples: Vec::new(),
         };
         let dataset =
             load_sft_dataset(&data, 128, 64, &cache_dir).expect("SFT dataset should load");

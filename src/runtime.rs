@@ -134,6 +134,8 @@ pub struct DataConfig {
     pub dedupe_samples: bool,
     #[serde(default)]
     pub source_weights: Vec<usize>,
+    #[serde(default)]
+    pub source_max_samples: Vec<usize>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -449,6 +451,19 @@ pub fn validate_config(config: &Config) -> Result<()> {
         if matches!(data.max_eval_samples, Some(0)) {
             return Err(anyhow!(
                 "data.max_eval_samples must be greater than zero when set"
+            ));
+        }
+        if !(data.source_max_samples.is_empty()
+            || data.source_max_samples.len() == 1
+            || data.source_max_samples.len() == data.paths.len())
+        {
+            return Err(anyhow!(
+                "data.source_max_samples must be empty, length 1, or match data.paths length"
+            ));
+        }
+        if data.source_max_samples.iter().any(|limit| *limit == 0) {
+            return Err(anyhow!(
+                "data.source_max_samples entries must be greater than zero"
             ));
         }
         if let Some(max_response_chars) = data.max_response_chars {
@@ -782,6 +797,7 @@ mod tests {
                 max_sample_chars: None,
                 dedupe_samples: false,
                 source_weights: Vec::new(),
+                source_max_samples: Vec::new(),
             }),
             lora: Some(LoraConfig {
                 rank: 4,

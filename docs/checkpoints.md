@@ -154,14 +154,14 @@ Acceptance:
   `data.max_system_chars`, optional `data.min_prompt_chars`, optional
   `data.max_prompt_chars`, optional `data.min_sample_chars`, optional
   `data.max_sample_chars`, optional `data.dedupe_samples`, and training
-  `data.source_weights`, so stale caches from a different external schema,
-  prompt format, normalization policy,
+  `data.source_weights` plus optional `data.source_max_samples`, so stale
+  caches from a different external schema, prompt format, normalization policy,
   instruction/input/system/prompt/sample/response filtering or dedupe policy,
-  or source weighting policy are rejected. When `data.system_field` is unset,
-  the system field is omitted from dataset hashing so existing default
-  fingerprints remain stable; when set, the normalized system value
-  participates in prompt rendering, deduplication, and fingerprint/cache
-  identity.
+  source weighting policy, or per-source sample-limit policy are rejected.
+  When `data.system_field` is unset, the system field is omitted from dataset
+  hashing so existing default fingerprints remain stable; when set, the
+  normalized system value participates in prompt rendering, deduplication, and
+  fingerprint/cache identity.
 - Explicit held-out `data.eval_paths` can be capped with
   `data.max_eval_samples`. This limit participates in combined dataset
   provenance and resume fingerprints through the selected eval records, but it

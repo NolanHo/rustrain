@@ -207,6 +207,7 @@ expected_field_map = {
     "max_sample_chars": None,
     "dedupe_samples": False,
     "source_weights": [],
+    "source_max_samples": [],
 }
 for key, expected in expected_field_map.items():
     if field_map.get(key) != expected:

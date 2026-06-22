@@ -1662,6 +1662,8 @@ struct QwenSftFieldMap {
     #[serde(default)]
     dedupe_samples: bool,
     source_weights: Vec<usize>,
+    #[serde(default)]
+    source_max_samples: Vec<usize>,
 }
 
 impl QwenSftFieldMap {
@@ -1688,6 +1690,7 @@ impl QwenSftFieldMap {
             max_sample_chars: data.max_sample_chars,
             dedupe_samples: data.dedupe_samples,
             source_weights: data.source_weights.clone(),
+            source_max_samples: data.source_max_samples.clone(),
         };
         map.validate()?;
         Ok(map)
@@ -1724,6 +1727,9 @@ impl QwenSftFieldMap {
         }
         if self.source_weights.iter().any(|weight| *weight == 0) {
             bail!("data.source_weights entries must be greater than zero");
+        }
+        if self.source_max_samples.iter().any(|limit| *limit == 0) {
+            bail!("data.source_max_samples entries must be greater than zero");
         }
         if let Some(max_response_chars) = self.max_response_chars {
             if max_response_chars == 0 {
@@ -1852,6 +1858,7 @@ impl Default for QwenSftFieldMap {
             max_sample_chars: None,
             dedupe_samples: false,
             source_weights: Vec::new(),
+            source_max_samples: Vec::new(),
         }
     }
 }
@@ -11059,6 +11066,7 @@ fn qwen_sft_train_eval_datasets_from_paths(
 fn qwen_sft_eval_field_map(field_map: &QwenSftFieldMap) -> QwenSftFieldMap {
     let mut eval_field_map = field_map.clone();
     eval_field_map.source_weights.clear();
+    eval_field_map.source_max_samples.clear();
     eval_field_map
 }
 
@@ -11129,18 +11137,24 @@ fn qwen_sft_examples_from_jsonl_paths_with_limit(
         bail!("SFT data.max_samples must be greater than zero");
     }
     let source_weights = qwen_sft_source_weights(paths.len(), field_map)?;
+    let source_max_samples = qwen_sft_source_max_samples(paths.len(), field_map)?;
     let mut examples = Vec::new();
     let mut source_files = BTreeSet::new();
     let mut source_sample_counts = BTreeMap::new();
     let mut seen_records = field_map.dedupe_samples.then(HashSet::new);
-    for (path, source_weight) in paths.iter().zip(source_weights.iter().copied()) {
+    for ((path, source_weight), source_limit) in paths
+        .iter()
+        .zip(source_weights.iter().copied())
+        .zip(source_max_samples.iter().copied())
+    {
         if max_samples.is_some_and(|limit| examples.len() >= limit) {
             break;
         }
-        let remaining = max_samples.map(|limit| limit.saturating_sub(examples.len()));
+        let global_remaining = max_samples.map(|limit| limit.saturating_sub(examples.len()));
         let example_set = qwen_sft_examples_from_jsonl_path_with_limit(
             path,
-            remaining,
+            global_remaining,
+            source_limit,
             source_weight,
             field_map,
             &mut seen_records,
@@ -11180,15 +11194,23 @@ fn qwen_sft_streaming_source_index(
         bail!("SFT data.max_samples must be greater than zero");
     }
     let source_weights = qwen_sft_source_weights(paths.len(), field_map)?;
+    let source_max_samples = qwen_sft_source_max_samples(paths.len(), field_map)?;
     let mut samples = Vec::new();
     let mut seen_records = field_map.dedupe_samples.then(HashSet::new);
 
-    for (path, source_weight) in paths.iter().zip(source_weights.iter().copied()) {
+    for ((path, source_weight), source_limit) in paths
+        .iter()
+        .zip(source_weights.iter().copied())
+        .zip(source_max_samples.iter().copied())
+    {
         if max_samples.is_some_and(|limit| samples.len() >= limit) {
             break;
         }
+        let mut source_samples = 0usize;
         for file in qwen_sft_jsonl_files(path)? {
-            if max_samples.is_some_and(|limit| samples.len() >= limit) {
+            if max_samples.is_some_and(|limit| samples.len() >= limit)
+                || source_limit.is_some_and(|limit| source_samples >= limit)
+            {
                 break;
             }
             let file_path = file.display().to_string();
@@ -11199,7 +11221,9 @@ fn qwen_sft_streaming_source_index(
             let mut line = String::new();
             let mut line_index = 0usize;
             loop {
-                if max_samples.is_some_and(|limit| samples.len() >= limit) {
+                if max_samples.is_some_and(|limit| samples.len() >= limit)
+                    || source_limit.is_some_and(|limit| source_samples >= limit)
+                {
                     break;
                 }
                 let byte_offset = reader.stream_position().with_context(|| {
@@ -11249,6 +11273,7 @@ fn qwen_sft_streaming_source_index(
                         byte_offset,
                     });
                 }
+                source_samples += 1;
                 line_index += 1;
             }
         }
@@ -11454,6 +11479,7 @@ fn qwen_sft_examples_by_raw_indices(
 fn qwen_sft_examples_from_jsonl_path_with_limit(
     path: &Path,
     max_samples: Option<usize>,
+    source_max_samples: Option<usize>,
     source_weight: usize,
     field_map: &QwenSftFieldMap,
     seen_records: &mut Option<HashSet<String>>,
@@ -11466,8 +11492,11 @@ fn qwen_sft_examples_from_jsonl_path_with_limit(
 
     let mut examples = Vec::new();
     let mut source_sample_counts = Vec::new();
+    let mut source_samples = 0usize;
     for file in &files {
-        if max_samples.is_some_and(|limit| examples.len() >= limit) {
+        if max_samples.is_some_and(|limit| examples.len() >= limit)
+            || source_max_samples.is_some_and(|limit| source_samples >= limit)
+        {
             break;
         }
         let reader = BufReader::new(
@@ -11475,7 +11504,9 @@ fn qwen_sft_examples_from_jsonl_path_with_limit(
         );
         let before = examples.len();
         for (line_index, line) in reader.lines().enumerate() {
-            if max_samples.is_some_and(|limit| examples.len() >= limit) {
+            if max_samples.is_some_and(|limit| examples.len() >= limit)
+                || source_max_samples.is_some_and(|limit| source_samples >= limit)
+            {
                 break;
             }
             let line = line.with_context(|| {
@@ -11515,6 +11546,7 @@ fn qwen_sft_examples_from_jsonl_path_with_limit(
                 }
                 examples.push(example.clone());
             }
+            source_samples += 1;
         }
         let consumed = examples.len() - before;
         if consumed > 0 {
@@ -11553,17 +11585,25 @@ fn qwen_sft_streaming_source_summary(
         bail!("SFT data.max_samples must be greater than zero");
     }
     let source_weights = qwen_sft_source_weights(paths.len(), field_map)?;
+    let source_max_samples = qwen_sft_source_max_samples(paths.len(), field_map)?;
 
     let mut samples = 0usize;
     let mut source_files = BTreeSet::new();
     let mut source_sample_counts = BTreeMap::new();
     let mut seen_records = field_map.dedupe_samples.then(HashSet::new);
-    for (path, source_weight) in paths.iter().zip(source_weights.iter().copied()) {
+    for ((path, source_weight), source_limit) in paths
+        .iter()
+        .zip(source_weights.iter().copied())
+        .zip(source_max_samples.iter().copied())
+    {
         if max_samples.is_some_and(|limit| samples >= limit) {
             break;
         }
+        let mut source_samples = 0usize;
         for file in qwen_sft_jsonl_files(path)? {
-            if max_samples.is_some_and(|limit| samples >= limit) {
+            if max_samples.is_some_and(|limit| samples >= limit)
+                || source_limit.is_some_and(|limit| source_samples >= limit)
+            {
                 break;
             }
             let file_path = file.display().to_string();
@@ -11573,7 +11613,9 @@ fn qwen_sft_streaming_source_summary(
             );
             let before = samples;
             for (line_index, line) in reader.lines().enumerate() {
-                if max_samples.is_some_and(|limit| samples >= limit) {
+                if max_samples.is_some_and(|limit| samples >= limit)
+                    || source_limit.is_some_and(|limit| source_samples >= limit)
+                {
                     break;
                 }
                 let line = line.with_context(|| {
@@ -11610,6 +11652,7 @@ fn qwen_sft_streaming_source_summary(
                     }
                     samples += 1;
                 }
+                source_samples += 1;
             }
             let consumed = samples - before;
             if consumed > 0 {
@@ -11651,6 +11694,30 @@ fn qwen_sft_source_weights(path_count: usize, field_map: &QwenSftFieldMap) -> Re
     Ok(weights)
 }
 
+fn qwen_sft_source_max_samples(
+    path_count: usize,
+    field_map: &QwenSftFieldMap,
+) -> Result<Vec<Option<usize>>> {
+    if field_map.source_max_samples.is_empty() {
+        return Ok(vec![None; path_count]);
+    }
+    let limits = if field_map.source_max_samples.len() == 1 {
+        vec![Some(field_map.source_max_samples[0]); path_count]
+    } else if field_map.source_max_samples.len() == path_count {
+        field_map
+            .source_max_samples
+            .iter()
+            .map(|limit| Some(*limit))
+            .collect()
+    } else {
+        bail!("data.source_max_samples must be empty, length 1, or match data.paths length");
+    };
+    if limits.iter().any(|limit| matches!(limit, Some(0))) {
+        bail!("data.source_max_samples entries must be greater than zero");
+    }
+    Ok(limits)
+}
+
 fn qwen_sft_streaming_fingerprint(
     paths: &[PathBuf],
     max_samples: Option<usize>,
@@ -11668,12 +11735,20 @@ fn qwen_sft_streaming_fingerprint(
     let mut samples = 0usize;
     let mut seen_records = field_map.dedupe_samples.then(HashSet::new);
     let source_weights = qwen_sft_source_weights(paths.len(), field_map)?;
-    for (path, source_weight) in paths.iter().zip(source_weights.iter().copied()) {
+    let source_max_samples = qwen_sft_source_max_samples(paths.len(), field_map)?;
+    for ((path, source_weight), source_limit) in paths
+        .iter()
+        .zip(source_weights.iter().copied())
+        .zip(source_max_samples.iter().copied())
+    {
         if max_samples.is_some_and(|limit| samples >= limit) {
             break;
         }
+        let mut source_samples = 0usize;
         for file in qwen_sft_jsonl_files(path)? {
-            if max_samples.is_some_and(|limit| samples >= limit) {
+            if max_samples.is_some_and(|limit| samples >= limit)
+                || source_limit.is_some_and(|limit| source_samples >= limit)
+            {
                 break;
             }
             let reader = BufReader::new(
@@ -11681,7 +11756,9 @@ fn qwen_sft_streaming_fingerprint(
                     .with_context(|| format!("failed to read {}", file.display()))?,
             );
             for (line_index, line) in reader.lines().enumerate() {
-                if max_samples.is_some_and(|limit| samples >= limit) {
+                if max_samples.is_some_and(|limit| samples >= limit)
+                    || source_limit.is_some_and(|limit| source_samples >= limit)
+                {
                     break;
                 }
                 let line = line.with_context(|| {
@@ -11717,6 +11794,7 @@ fn qwen_sft_streaming_fingerprint(
                     qwen_sft_hash_record(&mut hash, &record, field_map.system.is_some());
                     samples += 1;
                 }
+                source_samples += 1;
             }
         }
     }
@@ -12006,6 +12084,14 @@ fn qwen_sft_hash_field_map(hash: &mut u64, field_map: &QwenSftFieldMap) {
         qwen_sft_hash_bytes(hash, b",");
     }
     qwen_sft_hash_bytes(hash, b"\0");
+    if !field_map.source_max_samples.is_empty() {
+        qwen_sft_hash_bytes(hash, b"source_max_samples");
+        for source_limit in &field_map.source_max_samples {
+            qwen_sft_hash_bytes(hash, source_limit.to_string().as_bytes());
+            qwen_sft_hash_bytes(hash, b",");
+        }
+        qwen_sft_hash_bytes(hash, b"\0");
+    }
 }
 
 fn qwen_sft_hash_example(hash: &mut u64, example: &QwenSftExample, include_system: bool) {
@@ -14413,6 +14499,7 @@ mod tests {
         let example_set = qwen_sft_examples_from_jsonl_path_with_limit(
             &jsonl,
             None,
+            None,
             1,
             &QwenSftFieldMap::default(),
             &mut None,
@@ -15704,6 +15791,118 @@ mod tests {
             loaded.fingerprint,
             qwen_sft_streaming_fingerprint(&paths, Some(3), &loaded.source_files, &unweighted_map)
                 .expect("unweighted fingerprint should compute")
+        );
+    }
+
+    #[test]
+    fn qwen_sft_applies_source_max_samples_before_weighting_and_streaming_index() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let first = temp.path().join("first.jsonl");
+        let second = temp.path().join("second.jsonl");
+        let cache_path = temp.path().join("cache").join("offset-index.json");
+        fs::write(
+            &first,
+            r#"{"instruction":"first-a","response":"alpha"}
+{"instruction":"first-b","response":"skip"}
+"#,
+        )
+        .expect("first jsonl should write");
+        fs::write(
+            &second,
+            r#"{"instruction":"second-a","response":"beta"}
+{"instruction":"second-b","response":"gamma"}
+{"instruction":"second-c","response":"skip"}
+"#,
+        )
+        .expect("second jsonl should write");
+        let paths = vec![first.clone(), second.clone()];
+        let field_map = QwenSftFieldMap {
+            source_weights: vec![2, 2],
+            source_max_samples: vec![1, 2],
+            ..QwenSftFieldMap::default()
+        };
+
+        let loaded = qwen_sft_examples_from_jsonl_paths_with_limit(&paths, Some(6), &field_map)
+            .expect("source-limited examples should load");
+        let streamed = qwen_sft_streaming_source_summary(&paths, Some(6), &field_map)
+            .expect("source-limited streaming summary should scan");
+        let source_index = qwen_sft_streaming_source_index(&paths, Some(6), &field_map)
+            .expect("source-limited source index should build");
+        let raw_window = qwen_sft_examples_by_raw_indices(&source_index.samples, &field_map)
+            .expect("source-limited raw window should read");
+        let cache = qwen_sft_streaming_source_index_with_cache(
+            &paths,
+            Some(6),
+            Some(&cache_path),
+            &field_map,
+        )
+        .expect("source-limited cache should write");
+        let cache_mismatch = qwen_sft_streaming_source_index_with_cache(
+            &paths,
+            Some(6),
+            Some(&cache_path),
+            &QwenSftFieldMap {
+                source_weights: vec![2, 2],
+                ..QwenSftFieldMap::default()
+            },
+        )
+        .expect_err("source max-samples drift should reject cache")
+        .to_string();
+
+        assert_eq!(
+            loaded
+                .examples
+                .iter()
+                .map(|example| example.instruction.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "first-a", "first-a", "second-a", "second-a", "second-b", "second-b"
+            ]
+        );
+        assert_eq!(
+            loaded.source_sample_counts,
+            vec![
+                QwenSftSourceSampleCount {
+                    path: first.display().to_string(),
+                    samples: 2,
+                },
+                QwenSftSourceSampleCount {
+                    path: second.display().to_string(),
+                    samples: 4,
+                },
+            ]
+        );
+        assert_eq!(streamed.samples, loaded.examples.len());
+        assert_eq!(streamed.source_files, loaded.source_files);
+        assert_eq!(streamed.source_sample_counts, loaded.source_sample_counts);
+        assert_eq!(streamed.fingerprint, loaded.fingerprint);
+        assert_eq!(cache.index.samples, source_index.samples);
+        assert!(cache.cache_written);
+        assert!(cache_mismatch.contains("field_map"));
+        assert_eq!(
+            raw_window
+                .examples
+                .iter()
+                .map(|example| example.instruction.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "first-a", "first-a", "second-a", "second-a", "second-b", "second-b"
+            ]
+        );
+        assert_eq!(
+            source_index
+                .samples
+                .iter()
+                .map(|sample| (sample.path.clone(), sample.index_in_file))
+                .collect::<Vec<_>>(),
+            vec![
+                (first.display().to_string(), 0),
+                (first.display().to_string(), 0),
+                (second.display().to_string(), 0),
+                (second.display().to_string(), 0),
+                (second.display().to_string(), 1),
+                (second.display().to_string(), 1),
+            ]
         );
     }
 

@@ -471,7 +471,11 @@ production-grade sharded checkpoint ownership remain open.
   `data.source_weights` can be empty,
   length 1, or match `data.paths`; it repeats valid training samples from each
   configured source before `max_samples` and splitting, while explicit
-  `data.eval_paths` remain unweighted held-out data.
+  `data.eval_paths` remain unweighted held-out data. `data.source_max_samples`
+  can be empty, length 1, or match `data.paths`; when set, it caps the number
+  of valid raw records consumed from each training source before source
+  weighting and before global `data.max_samples`. Explicit `data.eval_paths`
+  ignore both source weighting and source max-sample limits.
   `cargo run -- qwen-sft-streaming-batch-plan --config ...` resolves the next
   cursor window to raw JSONL source indices, reads and tokenizes only those
   window records, then verifies the padded `input_ids` plus response masks match
