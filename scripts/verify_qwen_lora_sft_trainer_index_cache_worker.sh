@@ -30,8 +30,12 @@ cargo run -- train --config "${CONFIG}" | tee "${FIRST_OUTPUT}"
 cargo run -- train --config "${CONFIG}" | tee "${SECOND_OUTPUT}"
 
 python - "${FIRST_OUTPUT}" "${SECOND_OUTPUT}" "${CACHE}" <<'PY'
+import json
 import pathlib
 import sys
+
+sys.path.insert(0, str(pathlib.Path.cwd() / "scripts"))
+from qwen_verify_utils import require_complete_qwen_base_model_path
 
 first_path = pathlib.Path(sys.argv[1])
 second_path = pathlib.Path(sys.argv[2])
@@ -53,6 +57,7 @@ required = [
     "streaming_index_cache_path",
     "streaming_index_cache_hit",
     "streaming_index_cache_written",
+    "adapter_manifest",
     "reload_delta",
     "eval_reload_delta",
     "full_forward_reload_delta",
@@ -70,6 +75,15 @@ for context, values in [("first", first), ("second", second)]:
     for key in ["reload_delta", "eval_reload_delta", "full_forward_reload_delta"]:
         if float(values[key]) > 1e-6:
             raise SystemExit(f"{context} {key} too large: {values[key]}")
+    manifest_path = pathlib.Path(values["adapter_manifest"])
+    if not manifest_path.is_file():
+        raise SystemExit(f"{context} adapter_manifest missing: {manifest_path}")
+    manifest = json.loads(manifest_path.read_text())
+    require_complete_qwen_base_model_path(manifest, manifest_path)
+    if manifest.get("streaming_train_batches") is not True:
+        raise SystemExit(
+            f"{context} adapter manifest streaming_train_batches {manifest.get('streaming_train_batches')} is not true"
+        )
 
 if first["streaming_index_cache_hit"] != "false":
     raise SystemExit(f"first cache_hit should be false: {first['streaming_index_cache_hit']}")

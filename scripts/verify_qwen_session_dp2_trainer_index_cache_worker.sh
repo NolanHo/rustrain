@@ -34,6 +34,12 @@ import json
 import pathlib
 import sys
 
+sys.path.insert(0, str(pathlib.Path.cwd() / "scripts"))
+from qwen_verify_utils import (
+    require_complete_qwen_base_model_path,
+    require_complete_qwen_manifest_paths,
+)
+
 first_dir = pathlib.Path(sys.argv[1])
 second_dir = pathlib.Path(sys.argv[2])
 cache_path = pathlib.Path(sys.argv[3])
@@ -79,6 +85,29 @@ for rank in [0, 1]:
         for key in ["reload_delta", "sharded_reload_delta", "sharded_next_step_delta"]:
             if float(data[key]) > 1e-5:
                 raise SystemExit(f"{context} rank {rank} {key} too large: {data[key]}")
+        sharded_manifest_path = pathlib.Path(data["sharded_global_manifest_output"])
+        if not sharded_manifest_path.is_file():
+            raise SystemExit(
+                f"{context} rank {rank} sharded global manifest missing: {sharded_manifest_path}"
+            )
+        sharded_manifest = json.loads(sharded_manifest_path.read_text())
+        require_complete_qwen_manifest_paths(sharded_manifest, sharded_manifest_path)
+        if sharded_manifest.get("streaming_train_batches") is not True:
+            raise SystemExit(
+                f"{context} rank {rank} sharded streaming_train_batches {sharded_manifest.get('streaming_train_batches')} is not true"
+            )
+        if data.get("checkpoint_written"):
+            rank0_manifest_path = pathlib.Path(data["manifest_output"])
+            if not rank0_manifest_path.is_file():
+                raise SystemExit(
+                    f"{context} rank {rank} rank0 manifest missing: {rank0_manifest_path}"
+                )
+            rank0_manifest = json.loads(rank0_manifest_path.read_text())
+            require_complete_qwen_base_model_path(rank0_manifest, rank0_manifest_path)
+            if rank0_manifest.get("streaming_train_batches") is not True:
+                raise SystemExit(
+                    f"{context} rank {rank} rank0 streaming_train_batches {rank0_manifest.get('streaming_train_batches')} is not true"
+                )
 
 print(
     "qwen_session_dp2_trainer_index_cache_verified: "
