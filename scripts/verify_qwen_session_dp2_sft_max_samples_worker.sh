@@ -44,6 +44,7 @@ checks = {
     "dataset_train_samples": 3,
     "dataset_eval_samples": 1,
     "dataset_order_seed": 777,
+    "streaming_train_batches": True,
 }
 for key, expected in checks.items():
     if data.get(key) != expected:
@@ -71,6 +72,7 @@ print(
     f"source_files={data['dataset_source_files']} "
     f"source_counts={data['dataset_source_sample_counts']} "
     f"fingerprint={data['dataset_fingerprint']} "
-    f"data_cursor_next={data['data_cursor_next']}"
+    f"data_cursor_next={data['data_cursor_next']} "
+    f"streaming_train_batches={data['streaming_train_batches']}"
 )
 PY

@@ -38,6 +38,7 @@ required = [
     "dataset_fingerprint",
     "data_cursor_start",
     "data_cursor_next",
+    "streaming_train_batches",
     "reload_delta",
     "second_step_delta",
     "trainable_tensors",
@@ -69,6 +70,10 @@ if int(values["data_cursor_start"]) != 0:
     raise SystemExit(f"expected data_cursor_start 0, got {values['data_cursor_start']}")
 if int(values["data_cursor_next"]) != 1:
     raise SystemExit(f"expected data_cursor_next 1, got {values['data_cursor_next']}")
+if values["streaming_train_batches"] != "true":
+    raise SystemExit(
+        f"expected streaming_train_batches true, got {values['streaming_train_batches']}"
+    )
 if int(values["trainable_tensors"]) != 14:
     raise SystemExit(f"expected trainable_tensors 14, got {values['trainable_tensors']}")
 for key in ["reload_delta", "second_step_delta"]:
@@ -95,6 +100,10 @@ if int(manifest.get("data_cursor_start")) != int(values["data_cursor_start"]):
     raise SystemExit(
         f"manifest data_cursor_start {manifest.get('data_cursor_start')} != {values['data_cursor_start']}"
     )
+if manifest.get("streaming_train_batches") is not True:
+    raise SystemExit(
+        f"manifest streaming_train_batches {manifest.get('streaming_train_batches')} is not true"
+    )
 
 print(
     "qwen_session_sft_max_samples_verified: "
@@ -104,6 +113,7 @@ print(
     f"dataset_source_files={source_files} "
     f"dataset_source_sample_counts={values['dataset_source_sample_counts']} "
     f"dataset_fingerprint={values['dataset_fingerprint']} "
-    f"data_cursor_next={values['data_cursor_next']}"
+    f"data_cursor_next={values['data_cursor_next']} "
+    f"streaming_train_batches={values['streaming_train_batches']}"
 )
 PY

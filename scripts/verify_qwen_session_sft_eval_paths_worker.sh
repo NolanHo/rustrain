@@ -35,6 +35,8 @@ required = [
     "dataset_order_seed",
     "batch_size",
     "sequence_tokens",
+    "data_cursor_next",
+    "streaming_train_batches",
     "reload_delta",
     "second_step_delta",
 ]
@@ -68,6 +70,10 @@ for key in ["batch_size", "sequence_tokens", "dataset_total_tokens"]:
 for key in ["reload_delta", "second_step_delta"]:
     if float(values[key]) > 1e-5:
         raise SystemExit(f"{key} too large: {values[key]}")
+if values["streaming_train_batches"] != "true":
+    raise SystemExit(
+        f"expected streaming_train_batches true, got {values['streaming_train_batches']}"
+    )
 
 manifest = json.loads(pathlib.Path(values["manifest_output"]).read_text())
 if manifest.get("dataset_source_files") != expected_sources:
@@ -82,6 +88,10 @@ if int(manifest.get("data_cursor_next")) != int(values["data_cursor_next"]):
     raise SystemExit(
         f"manifest data_cursor_next {manifest.get('data_cursor_next')} != {values['data_cursor_next']}"
     )
+if manifest.get("streaming_train_batches") is not True:
+    raise SystemExit(
+        f"manifest streaming_train_batches {manifest.get('streaming_train_batches')} is not true"
+    )
 
 print(
     "qwen_session_sft_eval_paths_verified: "
@@ -90,6 +100,7 @@ print(
     f"dataset_source_files={source_files} "
     f"dataset_fingerprint={values['dataset_fingerprint']} "
     f"reload_delta={values['reload_delta']} "
-    f"second_step_delta={values['second_step_delta']}"
+    f"second_step_delta={values['second_step_delta']} "
+    f"streaming_train_batches={values['streaming_train_batches']}"
 )
 PY

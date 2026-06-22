@@ -721,6 +721,7 @@ struct QwenSessionDpDataPlanSummary {
     dataset_fingerprint: String,
     dataset_order_seed: u64,
     dataset_shuffle: bool,
+    streaming_train_batches: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -5474,6 +5475,7 @@ pub fn qwen_session_dp_data_plan(
         dataset_fingerprint: dataset_summary.fingerprint,
         dataset_order_seed: config.run.seed,
         dataset_shuffle: dataset_summary.shuffle,
+        streaming_train_batches: true,
     };
     println!("{}", serde_json::to_string_pretty(&summary)?);
     Ok(())
