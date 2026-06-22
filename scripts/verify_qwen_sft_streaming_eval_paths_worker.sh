@@ -34,16 +34,16 @@ expected_train_sources = [
     "data/sft_toy/more_instructions.jsonl",
 ]
 expected_eval_sources = ["data/sft_toy/eval_instructions.jsonl"]
-expected_counts = {
-    "data/sft_toy/eval_instructions.jsonl": 2,
-    "data/sft_toy/instructions.jsonl": 6,
-    "data/sft_toy/more_instructions.jsonl": 2,
-}
-expected_train_counts = {
-    "data/sft_toy/instructions.jsonl": 6,
-    "data/sft_toy/more_instructions.jsonl": 2,
-}
-expected_eval_counts = {"data/sft_toy/eval_instructions.jsonl": 2}
+expected_counts = [
+    {"path": "data/sft_toy/eval_instructions.jsonl", "samples": 2},
+    {"path": "data/sft_toy/instructions.jsonl", "samples": 6},
+    {"path": "data/sft_toy/more_instructions.jsonl", "samples": 2},
+]
+expected_train_counts = [
+    {"path": "data/sft_toy/instructions.jsonl", "samples": 6},
+    {"path": "data/sft_toy/more_instructions.jsonl", "samples": 2},
+]
+expected_eval_counts = [{"path": "data/sft_toy/eval_instructions.jsonl", "samples": 2}]
 
 checks = {
     "max_samples": None,
@@ -98,14 +98,22 @@ if data.get("eval_source_files") != expected_eval_sources:
     raise SystemExit(
         f"eval_source_files {data.get('eval_source_files')} != {expected_eval_sources}"
     )
-for key, expected in [
-    ("dataset_source_sample_counts", expected_counts),
-    ("train_source_sample_counts", expected_train_counts),
-    ("eval_source_sample_counts", expected_eval_counts),
+for key, expected, expected_paths, expected_total in [
+    ("dataset_source_sample_counts", expected_counts, expected_sources, data["dataset_total_samples"]),
+    ("train_source_sample_counts", expected_train_counts, expected_train_sources, data["dataset_train_samples"]),
+    ("eval_source_sample_counts", expected_eval_counts, expected_eval_sources, data["dataset_eval_samples"]),
 ]:
-    actual = {entry["path"]: entry["samples"] for entry in data.get(key) or []}
+    actual = data.get(key) or []
     if actual != expected:
         raise SystemExit(f"{key} {actual} != {expected}")
+    if [entry.get("path") for entry in actual] != expected_paths:
+        raise SystemExit(
+            f"{key} paths {[entry.get('path') for entry in actual]} != {expected_paths}"
+        )
+    if any(int(entry.get("samples", 0)) <= 0 for entry in actual):
+        raise SystemExit(f"{key} must contain positive samples: {actual}")
+    if sum(int(entry["samples"]) for entry in actual) != int(expected_total):
+        raise SystemExit(f"{key} total {actual} != expected total {expected_total}")
 for key in ["dataset_fingerprint", "train_fingerprint", "eval_fingerprint"]:
     if not data.get(key):
         raise SystemExit(f"{key} must not be empty")
