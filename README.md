@@ -462,9 +462,11 @@ production-grade sharded checkpoint ownership remain open.
   `streaming_index_cache_path`, `streaming_index_cache_hit`, and
   `streaming_index_cache_written`, and the focused GPU suites run each cache
   verifier twice to prove first-run writes and second-run hits. Offset-index
-  cache files also record the JSONL field mapping, prompt templates, and field
-  trimming policy, so a cache created for one external schema is rejected if
-  reused with a different field map, prompt format, or normalization policy.
+  cache files also record the JSONL field mapping, prompt templates, field
+  trimming policy, response-length filter, and source-weighting policy, so a
+  cache created for one external schema is rejected if reused with a different
+  field map, prompt format, normalization policy, filtering policy, or weighting
+  policy.
   Those trainer summaries now expose
   `streaming_train_batches = true` for tokenizer-backed
   JSONL SFT runs, and the focused LoRA, single-GPU session, and DP session
