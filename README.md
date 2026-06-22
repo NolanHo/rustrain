@@ -587,13 +587,16 @@ production-grade sharded checkpoint ownership remain open.
   `qwen-sft-streaming-batch-plan` commands now also accept
   `data.kind = "instruction_arrow"` for a single Arrow IPC train file with
   `data.max_samples`, mapped instruction/input/response columns, and prompt
-  templates. `configs/qwen_session_single_sft_arrow.toml` and
-  `configs/qwen_session_dp2_sft_arrow.toml` wire the same bounded single-file
-  Arrow source into the single-GPU and DP=2 `qwen_trainable_session` trainer
-  paths, write delta/optimizer/manifest artifacts, and verify manifest-backed
-  data cursor resume/provenance. A production zero-materialization training
-  loader for large external streams, Arrow eval files, Arrow index-cache
-  semantics, and production distributed Arrow trainer ownership remain open.
+  templates. `configs/qwen_session_single_sft_arrow.toml`,
+  `configs/qwen_session_single_sft_arrow_eval_paths.toml`, and
+  `configs/qwen_session_dp2_sft_arrow.toml` wire bounded Arrow sources into the
+  single-GPU and DP=2 `qwen_trainable_session` trainer paths, write
+  delta/optimizer/manifest artifacts, and verify manifest-backed data cursor
+  resume/provenance. The single-GPU Arrow path also supports one explicit Arrow
+  `data.eval_paths` file with `data.max_eval_samples`. A production
+  zero-materialization training loader for large external streams, Arrow
+  index-cache semantics, and production distributed Arrow trainer ownership
+  remain open.
   Production data loading and arbitrary-module LoRA injection are still open.
 - Real Qwen module-level LoRA now uses a target-layer/module registry for
   configured attention and MLP projection modules; trainer-owned full-model LoRA

@@ -6732,8 +6732,18 @@ fn qwen_sft_arrow_validate_config_scope(
     if data_config.paths.len() != 1 {
         bail!("{context} supports exactly one data.paths Arrow IPC file for now");
     }
+    if data_config.eval_paths.len() > 1 {
+        bail!("{context} supports at most one data.eval_paths Arrow IPC file for now");
+    }
     if !data_config.eval_paths.is_empty() {
-        bail!("{context} does not support data.eval_paths for instruction_arrow yet");
+        for path in &data_config.eval_paths {
+            if !path.is_file() {
+                bail!(
+                    "{context} data.eval_paths entry must be an Arrow IPC file: {}",
+                    path.display()
+                );
+            }
+        }
     }
     if data_config.index_cache.is_some() {
         bail!("{context} does not support data.index_cache for instruction_arrow yet");
@@ -6747,6 +6757,38 @@ fn qwen_sft_arrow_validate_config_scope(
     Ok(())
 }
 
+fn qwen_sft_arrow_dataset_from_ipc(
+    tokenizer: &Tokenizer,
+    path: &Path,
+    max_samples: Option<usize>,
+    field_map: &QwenSftFieldMap,
+) -> Result<QwenSftDataset> {
+    if !path.is_file() {
+        bail!(
+            "instruction_arrow data path must be an Arrow IPC file: {}",
+            path.display()
+        );
+    }
+    let arrow = qwen_sft_arrow_examples_from_ipc(path, max_samples, field_map)?;
+    let samples = arrow
+        .examples
+        .iter()
+        .map(|example| qwen_sft_token_sample(tokenizer, example, field_map))
+        .collect::<Result<Vec<_>>>()?;
+    let source_file = path.display().to_string();
+    Ok(QwenSftDataset {
+        samples,
+        pad_token_id: qwen_pad_token_id(tokenizer),
+        epoch_shuffle_seed: None,
+        source_files: vec![source_file.clone()],
+        source_sample_counts: vec![QwenSftSourceSampleCount {
+            path: source_file,
+            samples: arrow.examples.len(),
+        }],
+        fingerprint: arrow.fingerprint,
+    })
+}
+
 fn qwen_sft_arrow_plan_data(
     tokenizer: &Tokenizer,
     data_config: &RuntimeDataConfig,
@@ -6757,35 +6799,71 @@ fn qwen_sft_arrow_plan_data(
         .paths
         .first()
         .context("instruction_arrow requires one data.paths entry")?;
-    if !input.is_file() {
-        bail!(
-            "instruction_arrow data path must be an Arrow IPC file: {}",
-            input.display()
-        );
+    let train_dataset =
+        qwen_sft_arrow_dataset_from_ipc(tokenizer, input, data_config.max_samples, field_map)?;
+    if data_config.eval_paths.is_empty() {
+        let dataset = qwen_apply_sft_shuffle(train_dataset, data_config.shuffle, seed);
+        let dataset_summary = dataset.summary();
+        let (train_dataset, eval_dataset) = dataset.train_eval_split(data_config.train_split)?;
+        return Ok(QwenSftArrowPlanData {
+            dataset_summary,
+            train_dataset,
+            eval_dataset,
+        });
     }
-    let arrow = qwen_sft_arrow_examples_from_ipc(input, data_config.max_samples, field_map)?;
-    let samples = arrow
-        .examples
-        .iter()
-        .map(|example| qwen_sft_token_sample(tokenizer, example, field_map))
-        .collect::<Result<Vec<_>>>()?;
-    let source_file = input.display().to_string();
-    let dataset = QwenSftDataset {
-        samples,
-        pad_token_id: qwen_pad_token_id(tokenizer),
-        epoch_shuffle_seed: None,
-        source_files: vec![source_file.clone()],
-        source_sample_counts: vec![QwenSftSourceSampleCount {
-            path: source_file,
-            samples: arrow.examples.len(),
-        }],
-        fingerprint: arrow.fingerprint,
-    };
-    let dataset = qwen_apply_sft_shuffle(dataset, data_config.shuffle, seed);
-    let dataset_summary = dataset.summary();
-    let (train_dataset, eval_dataset) = dataset.train_eval_split(data_config.train_split)?;
+
+    let eval_input = data_config
+        .eval_paths
+        .first()
+        .context("instruction_arrow eval_paths expected one entry")?;
+    let eval_field_map = qwen_sft_eval_field_map(field_map);
+    let eval_dataset = qwen_sft_arrow_dataset_from_ipc(
+        tokenizer,
+        eval_input,
+        data_config.max_eval_samples,
+        &eval_field_map,
+    )?;
+    let train_summary = train_dataset.summary();
+    let eval_summary = eval_dataset.summary();
+    let combined_source_files =
+        qwen_merge_sft_source_files(&train_summary.source_files, &eval_summary.source_files);
+    let combined_source_sample_counts = qwen_merge_sft_source_sample_counts(
+        &train_summary.source_sample_counts,
+        &eval_summary.source_sample_counts,
+    );
+    let combined_fingerprint = qwen_combine_sft_fingerprints(
+        &combined_source_files,
+        &train_summary.fingerprint,
+        &eval_summary.fingerprint,
+    );
+    let train_dataset = qwen_apply_sft_shuffle(
+        train_dataset.with_source_metadata(
+            combined_source_files.clone(),
+            combined_source_sample_counts.clone(),
+            combined_fingerprint.clone(),
+        ),
+        data_config.shuffle,
+        seed,
+    );
+    let eval_dataset = eval_dataset.with_source_metadata(
+        combined_source_files.clone(),
+        combined_source_sample_counts.clone(),
+        combined_fingerprint.clone(),
+    );
     Ok(QwenSftArrowPlanData {
-        dataset_summary,
+        dataset_summary: QwenSftDatasetSummary {
+            samples: train_summary.samples + eval_summary.samples,
+            total_tokens: train_summary.total_tokens + eval_summary.total_tokens,
+            response_tokens: train_summary.response_tokens + eval_summary.response_tokens,
+            masked_positions: train_summary.masked_positions + eval_summary.masked_positions,
+            max_sequence_tokens: train_summary
+                .max_sequence_tokens
+                .max(eval_summary.max_sequence_tokens),
+            source_files: combined_source_files,
+            source_sample_counts: combined_source_sample_counts,
+            fingerprint: combined_fingerprint,
+            shuffle: data_config.shuffle,
+        },
         train_dataset,
         eval_dataset,
     })
@@ -6810,15 +6888,73 @@ fn qwen_sft_arrow_streaming_data_plan(
             input.display()
         );
     }
-    let arrow = qwen_sft_arrow_examples_from_ipc(input, data_config.max_samples, &field_map)?;
-    let (dataset_train_samples, dataset_eval_samples) =
-        qwen_sft_train_eval_sample_counts(arrow.examples.len(), data_config.train_split)?;
+    let train_arrow = qwen_sft_arrow_examples_from_ipc(input, data_config.max_samples, &field_map)?;
     let source_file = input.display().to_string();
-    let dataset_source_files = vec![source_file.clone()];
-    let dataset_source_sample_counts = vec![QwenSftSourceSampleCount {
+    let train_source_files = vec![source_file.clone()];
+    let train_source_sample_counts = vec![QwenSftSourceSampleCount {
         path: source_file,
-        samples: arrow.examples.len(),
+        samples: train_arrow.examples.len(),
     }];
+    let (
+        dataset_total_samples,
+        dataset_train_samples,
+        dataset_eval_samples,
+        dataset_source_files,
+        dataset_source_sample_counts,
+        dataset_fingerprint,
+        eval_source_files,
+        eval_source_sample_counts,
+        eval_fingerprint,
+    ) = if let Some(eval_input) = data_config.eval_paths.first() {
+        let eval_field_map = qwen_sft_eval_field_map(&field_map);
+        let eval_arrow = qwen_sft_arrow_examples_from_ipc(
+            eval_input,
+            data_config.max_eval_samples,
+            &eval_field_map,
+        )?;
+        let eval_source_file = eval_input.display().to_string();
+        let eval_source_files = vec![eval_source_file.clone()];
+        let eval_source_sample_counts = vec![QwenSftSourceSampleCount {
+            path: eval_source_file,
+            samples: eval_arrow.examples.len(),
+        }];
+        let combined_source_files =
+            qwen_merge_sft_source_files(&train_source_files, &eval_source_files);
+        let combined_source_sample_counts = qwen_merge_sft_source_sample_counts(
+            &train_source_sample_counts,
+            &eval_source_sample_counts,
+        );
+        let combined_fingerprint = qwen_combine_sft_fingerprints(
+            &combined_source_files,
+            &train_arrow.fingerprint,
+            &eval_arrow.fingerprint,
+        );
+        (
+            train_arrow.examples.len() + eval_arrow.examples.len(),
+            train_arrow.examples.len(),
+            eval_arrow.examples.len(),
+            combined_source_files,
+            combined_source_sample_counts,
+            combined_fingerprint,
+            eval_source_files,
+            eval_source_sample_counts,
+            eval_arrow.fingerprint,
+        )
+    } else {
+        let (train_samples, eval_samples) =
+            qwen_sft_train_eval_sample_counts(train_arrow.examples.len(), data_config.train_split)?;
+        (
+            train_arrow.examples.len(),
+            train_samples,
+            eval_samples,
+            train_source_files.clone(),
+            train_source_sample_counts.clone(),
+            train_arrow.fingerprint.clone(),
+            Vec::new(),
+            Vec::new(),
+            String::new(),
+        )
+    };
 
     let local_batch_size = config
         .train
@@ -6855,7 +6991,11 @@ fn qwen_sft_arrow_streaming_data_plan(
             .iter()
             .map(|path| path.display().to_string())
             .collect(),
-        eval_paths: Vec::new(),
+        eval_paths: data_config
+            .eval_paths
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect(),
         max_samples: data_config.max_samples,
         max_eval_samples: data_config.max_eval_samples,
         train_split: data_config.train_split,
@@ -6876,20 +7016,20 @@ fn qwen_sft_arrow_streaming_data_plan(
         train_window_start_cursor,
         train_window_end_cursor_exclusive,
         train_window_sample_cursors,
-        dataset_total_samples: arrow.examples.len(),
+        dataset_total_samples,
         dataset_train_samples,
         dataset_eval_samples,
         dataset_source_files: dataset_source_files.clone(),
         dataset_source_sample_counts: dataset_source_sample_counts.clone(),
-        dataset_fingerprint: arrow.fingerprint.clone(),
+        dataset_fingerprint,
         dataset_order_seed: config.run.seed,
         dataset_shuffle: data_config.shuffle,
-        train_source_files: dataset_source_files,
-        train_source_sample_counts: dataset_source_sample_counts,
-        train_fingerprint: arrow.fingerprint,
-        eval_source_files: Vec::new(),
-        eval_source_sample_counts: Vec::new(),
-        eval_fingerprint: String::new(),
+        train_source_files,
+        train_source_sample_counts,
+        train_fingerprint: train_arrow.fingerprint,
+        eval_source_files,
+        eval_source_sample_counts,
+        eval_fingerprint,
         streaming_index_cache_path: None,
         streaming_index_cache_hit: false,
         streaming_index_cache_written: false,
