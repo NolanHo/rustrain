@@ -18,8 +18,8 @@ use crate::nccl_smoke;
 use crate::runtime::{
     Config, DataConfig as RuntimeDataConfig, DataKind as RuntimeDataKind, Device as RuntimeDevice,
     FieldAffix, FieldCaseTransform, FieldCaseTransformKind, FieldDefault, FieldDefaultTarget,
-    FieldReplacement, FieldReplacementTarget, LoraConfig as RuntimeLoraConfig, LrScheduler,
-    RunPaths, load_config,
+    FieldReplacement, FieldReplacementTarget, FieldTruncation, LoraConfig as RuntimeLoraConfig,
+    LrScheduler, RunPaths, load_config,
 };
 
 #[derive(Debug, Serialize)]
@@ -1708,6 +1708,8 @@ struct QwenSftFieldMap {
     field_case_transforms: Vec<FieldCaseTransform>,
     #[serde(default)]
     field_affixes: Vec<FieldAffix>,
+    #[serde(default)]
+    field_truncations: Vec<FieldTruncation>,
     source_weights: Vec<usize>,
     #[serde(default)]
     source_max_samples: Vec<usize>,
@@ -1752,6 +1754,7 @@ impl QwenSftFieldMap {
             field_defaults: data.field_defaults.clone(),
             field_case_transforms: data.field_case_transforms.clone(),
             field_affixes: data.field_affixes.clone(),
+            field_truncations: data.field_truncations.clone(),
             source_weights: data.source_weights.clone(),
             source_max_samples: data.source_max_samples.clone(),
             skip_invalid_records: data.skip_invalid_records,
@@ -2003,6 +2006,16 @@ impl QwenSftFieldMap {
                 );
             }
         }
+        for truncation in &self.field_truncations {
+            if truncation.max_chars == 0 {
+                bail!("data.field_truncations max_chars entries must be greater than zero");
+            }
+            if matches!(truncation.field, FieldReplacementTarget::System) && !has_system_source {
+                bail!(
+                    "data.field_truncations targeting system requires data.system_field, data.chat_messages_field, or a system field_default to be set"
+                );
+            }
+        }
         Ok(())
     }
 
@@ -2054,6 +2067,7 @@ impl Default for QwenSftFieldMap {
             field_defaults: Vec::new(),
             field_case_transforms: Vec::new(),
             field_affixes: Vec::new(),
+            field_truncations: Vec::new(),
             source_weights: Vec::new(),
             source_max_samples: Vec::new(),
             skip_invalid_records: false,
@@ -12020,6 +12034,7 @@ fn qwen_sft_record_from_jsonl_line(
         qwen_apply_field_replacements(&mut record, &field_map.field_replacements);
         qwen_apply_field_case_transforms(&mut record, &field_map.field_case_transforms);
         qwen_apply_field_affixes(&mut record, &field_map.field_affixes);
+        qwen_apply_field_truncations(&mut record, &field_map.field_truncations);
         if field_map.normalize_whitespace {
             qwen_normalize_record_whitespace(&mut record);
         }
@@ -12061,6 +12076,7 @@ fn qwen_sft_record_from_jsonl_line(
     qwen_apply_field_replacements(&mut record, &field_map.field_replacements);
     qwen_apply_field_case_transforms(&mut record, &field_map.field_case_transforms);
     qwen_apply_field_affixes(&mut record, &field_map.field_affixes);
+    qwen_apply_field_truncations(&mut record, &field_map.field_truncations);
     if field_map.normalize_whitespace {
         qwen_normalize_record_whitespace(&mut record);
     }
@@ -12297,6 +12313,39 @@ fn qwen_apply_field_affix(value: &str, affix: &FieldAffix) -> String {
     transformed.push_str(value);
     transformed.push_str(&affix.suffix);
     transformed
+}
+
+fn qwen_apply_field_truncations(record: &mut QwenSftRecord, truncations: &[FieldTruncation]) {
+    for truncation in truncations {
+        if matches!(
+            truncation.field,
+            FieldReplacementTarget::System | FieldReplacementTarget::All
+        ) {
+            record.system = qwen_truncate_chars(&record.system, truncation.max_chars);
+        }
+        if matches!(
+            truncation.field,
+            FieldReplacementTarget::Instruction | FieldReplacementTarget::All
+        ) {
+            record.instruction = qwen_truncate_chars(&record.instruction, truncation.max_chars);
+        }
+        if matches!(
+            truncation.field,
+            FieldReplacementTarget::Input | FieldReplacementTarget::All
+        ) {
+            record.input = qwen_truncate_chars(&record.input, truncation.max_chars);
+        }
+        if matches!(
+            truncation.field,
+            FieldReplacementTarget::Response | FieldReplacementTarget::All
+        ) {
+            record.response = qwen_truncate_chars(&record.response, truncation.max_chars);
+        }
+    }
+}
+
+fn qwen_truncate_chars(value: &str, max_chars: usize) -> String {
+    value.chars().take(max_chars).collect()
 }
 
 fn qwen_field_default_value(defaults: &[FieldDefault], field: FieldDefaultTarget) -> Option<&str> {
@@ -12567,6 +12616,15 @@ fn qwen_sft_hash_field_map(hash: &mut u64, field_map: &QwenSftFieldMap) {
             qwen_sft_hash_bytes(hash, affix.prefix.as_bytes());
             qwen_sft_hash_bytes(hash, b"\0");
             qwen_sft_hash_bytes(hash, affix.suffix.as_bytes());
+            qwen_sft_hash_bytes(hash, b"\0");
+        }
+    }
+    if !field_map.field_truncations.is_empty() {
+        qwen_sft_hash_bytes(hash, b"field_truncations");
+        for truncation in &field_map.field_truncations {
+            qwen_sft_hash_bytes(hash, format!("{:?}", truncation.field).as_bytes());
+            qwen_sft_hash_bytes(hash, b"\0");
+            qwen_sft_hash_bytes(hash, truncation.max_chars.to_string().as_bytes());
             qwen_sft_hash_bytes(hash, b"\0");
         }
     }
@@ -15764,6 +15822,84 @@ mod tests {
         assert_eq!(streamed.samples, loaded.examples.len());
         assert_eq!(streamed.fingerprint, loaded.fingerprint);
         assert_ne!(loaded.fingerprint, raw_affix_fingerprint);
+        assert!(first_cache.cache_written);
+        assert!(cache_mismatch.contains("field_map"));
+    }
+
+    #[test]
+    fn qwen_sft_applies_field_truncations_before_filters_and_fingerprint() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let jsonl = temp.path().join("samples.jsonl");
+        let cache_path = temp.path().join("cache").join("offset-index.json");
+        fs::write(
+            &jsonl,
+            r#"{"instruction":"Name the rustrain project precisely","input":"GPU worker context","response":"approved response with trailing text"}
+{"instruction":"Name the rustrain project precisely","input":"CPU worker context","response":"denied response with trailing text"}
+"#,
+        )
+        .expect("jsonl should write");
+        let paths = vec![jsonl.clone()];
+        let field_map = QwenSftFieldMap {
+            instruction_contains_any: vec!["Name the rustrain".to_string()],
+            input_contains_any: vec!["GPU".to_string()],
+            response_contains_any: vec!["approved response".to_string()],
+            min_response_chars: 17,
+            max_response_chars: Some(17),
+            field_truncations: vec![
+                FieldTruncation {
+                    field: FieldReplacementTarget::Instruction,
+                    max_chars: 17,
+                },
+                FieldTruncation {
+                    field: FieldReplacementTarget::Input,
+                    max_chars: 3,
+                },
+                FieldTruncation {
+                    field: FieldReplacementTarget::Response,
+                    max_chars: 17,
+                },
+            ],
+            ..QwenSftFieldMap::default()
+        };
+
+        let loaded = qwen_sft_examples_from_jsonl_paths_with_limit(&paths, None, &field_map)
+            .expect("truncated examples should load");
+        let streamed = qwen_sft_streaming_source_summary(&paths, None, &field_map)
+            .expect("truncated streaming summary should scan");
+        let source_index = qwen_sft_streaming_source_index(&paths, None, &field_map)
+            .expect("truncated source index should build");
+        let raw_window = qwen_sft_examples_by_raw_indices(&source_index.samples, &field_map)
+            .expect("truncated raw window should read");
+        let first_cache =
+            qwen_sft_streaming_source_index_with_cache(&paths, None, Some(&cache_path), &field_map)
+                .expect("truncated cache should write");
+        let raw_truncation_map = QwenSftFieldMap {
+            field_truncations: Vec::new(),
+            input_contains_any: Vec::new(),
+            response_contains_any: Vec::new(),
+            max_response_chars: None,
+            ..field_map.clone()
+        };
+        let raw_truncation_fingerprint =
+            qwen_sft_streaming_fingerprint(&paths, None, &loaded.source_files, &raw_truncation_map)
+                .expect("raw-truncation fingerprint should compute");
+        let cache_mismatch = qwen_sft_streaming_source_index_with_cache(
+            &paths,
+            None,
+            Some(&cache_path),
+            &raw_truncation_map,
+        )
+        .expect_err("cache should reject changed truncations")
+        .to_string();
+
+        assert_eq!(loaded.examples.len(), 1);
+        assert_eq!(loaded.examples[0].instruction, "Name the rustrain");
+        assert_eq!(loaded.examples[0].input, "GPU");
+        assert_eq!(loaded.examples[0].response, "approved response");
+        assert_eq!(raw_window.examples, loaded.examples);
+        assert_eq!(streamed.samples, loaded.examples.len());
+        assert_eq!(streamed.fingerprint, loaded.fingerprint);
+        assert_ne!(loaded.fingerprint, raw_truncation_fingerprint);
         assert!(first_cache.cache_written);
         assert!(cache_mismatch.contains("field_map"));
     }

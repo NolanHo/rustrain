@@ -150,7 +150,8 @@ Acceptance:
   `data.prompt_template`, `data.prompt_with_input_template`,
   `data.trim_fields`, optional `data.field_defaults`, optional
   `data.field_replacements`, optional `data.field_case_transforms`, optional
-  `data.field_affixes`, optional `data.normalize_whitespace`,
+  `data.field_affixes`, optional `data.field_truncations`, optional
+  `data.normalize_whitespace`,
   `data.min_response_chars`, optional
   `data.max_response_chars`, optional `data.instruction_contains_any`,
   optional `data.response_contains_any`, optional
@@ -163,7 +164,7 @@ Acceptance:
   `data.source_weights` plus optional `data.source_max_samples` and optional
   `data.skip_invalid_records`, so stale
   caches from a different external file state, external schema, prompt format,
-  default/replacement/normalization policy,
+  default/replacement/case/affix/truncation/normalization policy,
   instruction/input/system/prompt/sample/response filtering or
   instruction/response substring/dedupe policy, source weighting policy,
   per-source sample-limit policy, or invalid-record handling policy are

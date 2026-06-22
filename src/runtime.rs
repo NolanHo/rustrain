@@ -161,6 +161,8 @@ pub struct DataConfig {
     #[serde(default)]
     pub field_affixes: Vec<FieldAffix>,
     #[serde(default)]
+    pub field_truncations: Vec<FieldTruncation>,
+    #[serde(default)]
     pub source_weights: Vec<usize>,
     #[serde(default)]
     pub source_max_samples: Vec<usize>,
@@ -220,6 +222,12 @@ pub struct FieldAffix {
     pub prefix: String,
     #[serde(default)]
     pub suffix: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct FieldTruncation {
+    pub field: FieldReplacementTarget,
+    pub max_chars: usize,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -813,6 +821,18 @@ pub fn validate_config(config: &Config) -> Result<()> {
                 ));
             }
         }
+        for truncation in &data.field_truncations {
+            if truncation.max_chars == 0 {
+                return Err(anyhow!(
+                    "data.field_truncations max_chars entries must be greater than zero"
+                ));
+            }
+            if matches!(truncation.field, FieldReplacementTarget::System) && !has_system_source {
+                return Err(anyhow!(
+                    "data.field_truncations targeting system requires data.system_field, data.chat_messages_field, or a system field_default to be set"
+                ));
+            }
+        }
     }
 
     Ok(())
@@ -1025,6 +1045,7 @@ mod tests {
                 field_defaults: Vec::new(),
                 field_case_transforms: Vec::new(),
                 field_affixes: Vec::new(),
+                field_truncations: Vec::new(),
                 source_weights: Vec::new(),
                 source_max_samples: Vec::new(),
                 skip_invalid_records: false,

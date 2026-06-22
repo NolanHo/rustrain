@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::runtime::{
     DataConfig, FieldAffix, FieldCaseTransform, FieldCaseTransformKind, FieldDefault,
-    FieldDefaultTarget, FieldReplacement, FieldReplacementTarget,
+    FieldDefaultTarget, FieldReplacement, FieldReplacementTarget, FieldTruncation,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -82,6 +82,7 @@ struct SftCache {
     field_defaults: Vec<FieldDefault>,
     field_case_transforms: Vec<FieldCaseTransform>,
     field_affixes: Vec<FieldAffix>,
+    field_truncations: Vec<FieldTruncation>,
     max_eval_samples: Option<usize>,
     min_system_chars: Option<usize>,
     max_system_chars: Option<usize>,
@@ -265,6 +266,7 @@ pub fn load_sft_dataset(
         &data.field_defaults,
         &data.field_case_transforms,
         &data.field_affixes,
+        &data.field_truncations,
         data.max_eval_samples,
         data.min_system_chars,
         data.max_system_chars,
@@ -509,6 +511,7 @@ fn instruction_record_from_jsonl_line(data: &DataConfig, line: &str) -> Result<I
         apply_field_replacements(&mut record, &data.field_replacements);
         apply_field_case_transforms(&mut record, &data.field_case_transforms);
         apply_field_affixes(&mut record, &data.field_affixes);
+        apply_field_truncations(&mut record, &data.field_truncations);
         if data.normalize_whitespace {
             normalize_record_whitespace(&mut record);
         }
@@ -548,6 +551,7 @@ fn instruction_record_from_jsonl_line(data: &DataConfig, line: &str) -> Result<I
     apply_field_replacements(&mut record, &data.field_replacements);
     apply_field_case_transforms(&mut record, &data.field_case_transforms);
     apply_field_affixes(&mut record, &data.field_affixes);
+    apply_field_truncations(&mut record, &data.field_truncations);
     if data.normalize_whitespace {
         normalize_record_whitespace(&mut record);
     }
@@ -846,6 +850,39 @@ fn apply_field_affix(value: &str, affix: &FieldAffix) -> String {
     transformed
 }
 
+fn apply_field_truncations(record: &mut InstructionRecord, truncations: &[FieldTruncation]) {
+    for truncation in truncations {
+        if matches!(
+            truncation.field,
+            FieldReplacementTarget::System | FieldReplacementTarget::All
+        ) {
+            record.system = truncate_chars(&record.system, truncation.max_chars);
+        }
+        if matches!(
+            truncation.field,
+            FieldReplacementTarget::Instruction | FieldReplacementTarget::All
+        ) {
+            record.instruction = truncate_chars(&record.instruction, truncation.max_chars);
+        }
+        if matches!(
+            truncation.field,
+            FieldReplacementTarget::Input | FieldReplacementTarget::All
+        ) {
+            record.input = truncate_chars(&record.input, truncation.max_chars);
+        }
+        if matches!(
+            truncation.field,
+            FieldReplacementTarget::Response | FieldReplacementTarget::All
+        ) {
+            record.response = truncate_chars(&record.response, truncation.max_chars);
+        }
+    }
+}
+
+fn truncate_chars(value: &str, max_chars: usize) -> String {
+    value.chars().take(max_chars).collect()
+}
+
 fn field_default_value(defaults: &[FieldDefault], field: FieldDefaultTarget) -> Option<&str> {
     defaults
         .iter()
@@ -1014,6 +1051,7 @@ fn write_sft_cache(
     field_defaults: &[FieldDefault],
     field_case_transforms: &[FieldCaseTransform],
     field_affixes: &[FieldAffix],
+    field_truncations: &[FieldTruncation],
     max_eval_samples: Option<usize>,
     min_system_chars: Option<usize>,
     max_system_chars: Option<usize>,
@@ -1057,6 +1095,7 @@ fn write_sft_cache(
         field_defaults: field_defaults.to_vec(),
         field_case_transforms: field_case_transforms.to_vec(),
         field_affixes: field_affixes.to_vec(),
+        field_truncations: field_truncations.to_vec(),
         max_eval_samples,
         min_system_chars,
         max_system_chars,
@@ -1153,6 +1192,7 @@ mod tests {
             field_defaults: Vec::new(),
             field_case_transforms: Vec::new(),
             field_affixes: Vec::new(),
+            field_truncations: Vec::new(),
             source_weights: Vec::new(),
             source_max_samples: Vec::new(),
             skip_invalid_records: false,
@@ -1226,6 +1266,7 @@ mod tests {
             field_defaults: Vec::new(),
             field_case_transforms: Vec::new(),
             field_affixes: Vec::new(),
+            field_truncations: Vec::new(),
             source_weights: Vec::new(),
             source_max_samples: Vec::new(),
             skip_invalid_records: false,
@@ -1305,6 +1346,7 @@ mod tests {
             field_defaults: Vec::new(),
             field_case_transforms: Vec::new(),
             field_affixes: Vec::new(),
+            field_truncations: Vec::new(),
             source_weights: Vec::new(),
             source_max_samples: Vec::new(),
             skip_invalid_records: false,
@@ -1391,6 +1433,7 @@ mod tests {
             field_defaults: Vec::new(),
             field_case_transforms: Vec::new(),
             field_affixes: Vec::new(),
+            field_truncations: Vec::new(),
             source_weights: Vec::new(),
             source_max_samples: Vec::new(),
             skip_invalid_records: false,
@@ -1476,6 +1519,7 @@ mod tests {
             field_defaults: Vec::new(),
             field_case_transforms: Vec::new(),
             field_affixes: Vec::new(),
+            field_truncations: Vec::new(),
             source_weights: Vec::new(),
             source_max_samples: Vec::new(),
             skip_invalid_records: false,
@@ -1551,6 +1595,7 @@ mod tests {
             field_defaults: Vec::new(),
             field_case_transforms: Vec::new(),
             field_affixes: Vec::new(),
+            field_truncations: Vec::new(),
             source_weights: Vec::new(),
             source_max_samples: Vec::new(),
             skip_invalid_records: false,
@@ -1628,6 +1673,7 @@ mod tests {
             field_defaults: Vec::new(),
             field_case_transforms: Vec::new(),
             field_affixes: Vec::new(),
+            field_truncations: Vec::new(),
             source_weights: Vec::new(),
             source_max_samples: Vec::new(),
             skip_invalid_records: false,
@@ -1708,6 +1754,7 @@ mod tests {
             field_defaults: Vec::new(),
             field_case_transforms: Vec::new(),
             field_affixes: Vec::new(),
+            field_truncations: Vec::new(),
             source_weights: Vec::new(),
             source_max_samples: Vec::new(),
             skip_invalid_records: false,
@@ -1782,6 +1829,7 @@ mod tests {
             field_defaults: Vec::new(),
             field_case_transforms: Vec::new(),
             field_affixes: Vec::new(),
+            field_truncations: Vec::new(),
             source_weights: Vec::new(),
             source_max_samples: Vec::new(),
             skip_invalid_records: false,
@@ -1889,6 +1937,7 @@ mod tests {
             field_defaults: Vec::new(),
             field_case_transforms: Vec::new(),
             field_affixes: Vec::new(),
+            field_truncations: Vec::new(),
             source_weights: Vec::new(),
             source_max_samples: Vec::new(),
             skip_invalid_records: false,
@@ -1965,6 +2014,7 @@ mod tests {
             field_defaults: Vec::new(),
             field_case_transforms: Vec::new(),
             field_affixes: Vec::new(),
+            field_truncations: Vec::new(),
             source_weights: Vec::new(),
             source_max_samples: Vec::new(),
             skip_invalid_records: false,
@@ -2042,6 +2092,7 @@ mod tests {
             field_defaults: Vec::new(),
             field_case_transforms: Vec::new(),
             field_affixes: Vec::new(),
+            field_truncations: Vec::new(),
             source_weights: Vec::new(),
             source_max_samples: Vec::new(),
             skip_invalid_records: false,
@@ -2120,6 +2171,7 @@ mod tests {
             field_defaults: Vec::new(),
             field_case_transforms: Vec::new(),
             field_affixes: Vec::new(),
+            field_truncations: Vec::new(),
             source_weights: Vec::new(),
             source_max_samples: Vec::new(),
             skip_invalid_records: false,
@@ -2199,6 +2251,7 @@ mod tests {
             field_defaults: Vec::new(),
             field_case_transforms: Vec::new(),
             field_affixes: Vec::new(),
+            field_truncations: Vec::new(),
             source_weights: Vec::new(),
             source_max_samples: Vec::new(),
             skip_invalid_records: false,
@@ -2279,6 +2332,7 @@ mod tests {
             field_defaults: Vec::new(),
             field_case_transforms: Vec::new(),
             field_affixes: Vec::new(),
+            field_truncations: Vec::new(),
             source_weights: Vec::new(),
             source_max_samples: Vec::new(),
             skip_invalid_records: false,
@@ -2359,6 +2413,7 @@ mod tests {
             field_defaults: Vec::new(),
             field_case_transforms: Vec::new(),
             field_affixes: Vec::new(),
+            field_truncations: Vec::new(),
             source_weights: Vec::new(),
             source_max_samples: Vec::new(),
             skip_invalid_records: false,
@@ -2439,6 +2494,7 @@ mod tests {
             field_defaults: Vec::new(),
             field_case_transforms: Vec::new(),
             field_affixes: Vec::new(),
+            field_truncations: Vec::new(),
             source_weights: Vec::new(),
             source_max_samples: Vec::new(),
             skip_invalid_records: false,
@@ -2517,6 +2573,7 @@ mod tests {
             field_defaults: Vec::new(),
             field_case_transforms: Vec::new(),
             field_affixes: Vec::new(),
+            field_truncations: Vec::new(),
             source_weights: Vec::new(),
             source_max_samples: Vec::new(),
             skip_invalid_records: false,
@@ -2597,6 +2654,7 @@ mod tests {
             field_defaults: Vec::new(),
             field_case_transforms: Vec::new(),
             field_affixes: Vec::new(),
+            field_truncations: Vec::new(),
             source_weights: Vec::new(),
             source_max_samples: Vec::new(),
             skip_invalid_records: false,
@@ -2679,6 +2737,7 @@ mod tests {
             field_defaults: Vec::new(),
             field_case_transforms: Vec::new(),
             field_affixes: Vec::new(),
+            field_truncations: Vec::new(),
             source_weights: Vec::new(),
             source_max_samples: Vec::new(),
             skip_invalid_records: false,
@@ -2763,6 +2822,7 @@ mod tests {
             field_defaults: Vec::new(),
             field_case_transforms: Vec::new(),
             field_affixes: Vec::new(),
+            field_truncations: Vec::new(),
             source_weights: Vec::new(),
             source_max_samples: Vec::new(),
             skip_invalid_records: false,
@@ -2846,6 +2906,7 @@ mod tests {
             field_defaults: Vec::new(),
             field_case_transforms: Vec::new(),
             field_affixes: Vec::new(),
+            field_truncations: Vec::new(),
             source_weights: Vec::new(),
             source_max_samples: Vec::new(),
             skip_invalid_records: false,
@@ -2926,6 +2987,7 @@ mod tests {
             field_defaults: Vec::new(),
             field_case_transforms: Vec::new(),
             field_affixes: Vec::new(),
+            field_truncations: Vec::new(),
             source_weights: Vec::new(),
             source_max_samples: Vec::new(),
             skip_invalid_records: false,
@@ -3015,6 +3077,7 @@ mod tests {
             field_defaults: Vec::new(),
             field_case_transforms: Vec::new(),
             field_affixes: Vec::new(),
+            field_truncations: Vec::new(),
             source_weights: vec![2, 2],
             source_max_samples: Vec::new(),
             skip_invalid_records: false,
@@ -3099,6 +3162,7 @@ mod tests {
             field_defaults: Vec::new(),
             field_case_transforms: Vec::new(),
             field_affixes: Vec::new(),
+            field_truncations: Vec::new(),
             source_weights: vec![2, 2],
             source_max_samples: vec![1, 2],
             skip_invalid_records: false,
@@ -3179,6 +3243,7 @@ mod tests {
             field_defaults: Vec::new(),
             field_case_transforms: Vec::new(),
             field_affixes: Vec::new(),
+            field_truncations: Vec::new(),
             source_weights: Vec::new(),
             source_max_samples: Vec::new(),
             skip_invalid_records: false,
@@ -3257,6 +3322,7 @@ mod tests {
             field_defaults: Vec::new(),
             field_case_transforms: Vec::new(),
             field_affixes: Vec::new(),
+            field_truncations: Vec::new(),
             source_weights: Vec::new(),
             source_max_samples: Vec::new(),
             skip_invalid_records: false,
@@ -3342,6 +3408,7 @@ mod tests {
             field_defaults: Vec::new(),
             field_case_transforms: Vec::new(),
             field_affixes: Vec::new(),
+            field_truncations: Vec::new(),
             source_weights: Vec::new(),
             source_max_samples: Vec::new(),
             skip_invalid_records: true,
@@ -3427,6 +3494,7 @@ mod tests {
             field_defaults: Vec::new(),
             field_case_transforms: Vec::new(),
             field_affixes: Vec::new(),
+            field_truncations: Vec::new(),
             source_weights: Vec::new(),
             source_max_samples: Vec::new(),
             skip_invalid_records: false,
@@ -3523,6 +3591,7 @@ mod tests {
             field_defaults: Vec::new(),
             field_case_transforms: Vec::new(),
             field_affixes: Vec::new(),
+            field_truncations: Vec::new(),
             source_weights: Vec::new(),
             source_max_samples: Vec::new(),
             skip_invalid_records: false,
@@ -3622,6 +3691,7 @@ mod tests {
             ],
             field_case_transforms: Vec::new(),
             field_affixes: Vec::new(),
+            field_truncations: Vec::new(),
             source_weights: Vec::new(),
             source_max_samples: Vec::new(),
             skip_invalid_records: false,
@@ -3710,6 +3780,7 @@ mod tests {
             field_defaults: Vec::new(),
             field_case_transforms: Vec::new(),
             field_affixes: Vec::new(),
+            field_truncations: Vec::new(),
             source_weights: Vec::new(),
             source_max_samples: Vec::new(),
             skip_invalid_records: false,
@@ -3809,6 +3880,7 @@ mod tests {
                 },
             ],
             field_affixes: Vec::new(),
+            field_truncations: Vec::new(),
             source_weights: Vec::new(),
             source_max_samples: Vec::new(),
             skip_invalid_records: false,
@@ -3917,6 +3989,7 @@ mod tests {
                     suffix: "</answer>".to_string(),
                 },
             ],
+            field_truncations: Vec::new(),
             source_weights: Vec::new(),
             source_max_samples: Vec::new(),
             skip_invalid_records: false,
@@ -3941,6 +4014,103 @@ mod tests {
         assert!(decoded.contains("rustrain</answer>"));
         assert!(cache_text.contains("field_affixes"));
         assert!(cache_text.contains("</answer>"));
+    }
+
+    #[test]
+    fn sft_dataset_applies_field_truncations_before_filters_and_cache() {
+        let dir = tempdir().expect("temp dir should be created");
+        let data_dir = dir.path().join("sft");
+        let cache_dir = dir.path().join("cache");
+        fs::create_dir_all(&data_dir).expect("sft dir should be created");
+        fs::create_dir_all(&cache_dir).expect("cache dir should be created");
+        fs::write(
+            data_dir.join("sample.jsonl"),
+            "{\"instruction\":\"Name the rustrain project precisely\",\"input\":\"GPU worker context\",\"response\":\"approved response with trailing text\"}\n{\"instruction\":\"Name the rustrain language precisely\",\"input\":\"GPU worker context\",\"response\":\"accepted response with trailing text\"}\n{\"instruction\":\"Name the rustrain project precisely\",\"input\":\"CPU worker context\",\"response\":\"denied response with trailing text\"}\n",
+        )
+        .expect("jsonl should write");
+
+        let data = DataConfig {
+            kind: DataKind::InstructionJsonl,
+            paths: vec![data_dir],
+            eval_paths: Vec::new(),
+            train_split: 0.5,
+            max_samples: None,
+            max_eval_samples: None,
+            shuffle: false,
+            index_cache: None,
+            instruction_field: "instruction".to_string(),
+            input_field: "input".to_string(),
+            response_field: "response".to_string(),
+            system_field: None,
+            chat_messages_field: None,
+            min_system_chars: None,
+            max_system_chars: None,
+            system_contains_any: Vec::new(),
+            system_excludes_any: Vec::new(),
+            prompt_template: "Q: {instruction}\nA: ".to_string(),
+            prompt_with_input_template: "Q: {instruction}\nI: {input}\nA: ".to_string(),
+            trim_fields: true,
+            min_response_chars: 17,
+            max_response_chars: Some(17),
+            instruction_contains_any: vec!["Name the rustrain".to_string()],
+            instruction_excludes_any: Vec::new(),
+            response_contains_any: vec!["response".to_string()],
+            response_excludes_any: Vec::new(),
+            input_contains_any: vec!["GPU".to_string()],
+            input_excludes_any: Vec::new(),
+            min_instruction_chars: None,
+            max_instruction_chars: None,
+            min_input_chars: None,
+            max_input_chars: None,
+            min_prompt_chars: None,
+            max_prompt_chars: None,
+            min_sample_chars: None,
+            max_sample_chars: None,
+            dedupe_samples: false,
+            field_replacements: Vec::new(),
+            normalize_whitespace: false,
+            field_defaults: Vec::new(),
+            field_case_transforms: Vec::new(),
+            field_affixes: Vec::new(),
+            field_truncations: vec![
+                FieldTruncation {
+                    field: FieldReplacementTarget::Instruction,
+                    max_chars: 17,
+                },
+                FieldTruncation {
+                    field: FieldReplacementTarget::Input,
+                    max_chars: 3,
+                },
+                FieldTruncation {
+                    field: FieldReplacementTarget::Response,
+                    max_chars: 17,
+                },
+            ],
+            source_weights: Vec::new(),
+            source_max_samples: Vec::new(),
+            skip_invalid_records: false,
+        };
+        let dataset =
+            load_sft_dataset(&data, 128, 96, &cache_dir).expect("SFT dataset should load");
+        let decoded = dataset
+            .train_samples
+            .iter()
+            .chain(dataset.eval_samples.iter())
+            .map(|sample| dataset.tokenizer.decode_lossy(&sample.tokens))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let cache_text =
+            fs::read_to_string(cache_dir.join("sft_tokenized.toml")).expect("cache should read");
+
+        assert_eq!(dataset.train_samples.len(), 1);
+        assert_eq!(dataset.eval_samples.len(), 1);
+        assert!(decoded.contains("Q: Name the rustrain"));
+        assert!(decoded.contains("I: GPU"));
+        assert!(decoded.contains("approved response"));
+        assert!(decoded.contains("accepted response"));
+        assert!(!decoded.contains("trailing text"));
+        assert!(cache_text.contains("field_truncations"));
+        assert!(cache_text.contains("max_chars = 17"));
     }
 
     #[test]
@@ -4001,6 +4171,7 @@ mod tests {
             field_defaults: Vec::new(),
             field_case_transforms: Vec::new(),
             field_affixes: Vec::new(),
+            field_truncations: Vec::new(),
             source_weights: Vec::new(),
             source_max_samples: Vec::new(),
             skip_invalid_records: false,
