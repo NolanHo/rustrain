@@ -34,6 +34,7 @@ required = [
     "dataset_source_files",
     "dataset_source_sample_counts",
     "dataset_fingerprint",
+    "streaming_train_batches",
     "reload_delta",
     "eval_reload_delta",
     "full_forward_reload_delta",
@@ -46,6 +47,10 @@ if missing:
 if int(values["dataset_total_samples"]) != expected_total:
     raise SystemExit(
         f"expected dataset_total_samples {expected_total}, got {values['dataset_total_samples']}"
+    )
+if values["streaming_train_batches"] != "true":
+    raise SystemExit(
+        f"expected streaming_train_batches true, got {values['streaming_train_batches']}"
     )
 source_files = ast.literal_eval(values["dataset_source_files"])
 if source_files != [expected_source]:
@@ -75,6 +80,10 @@ if manifest.get("dataset_source_sample_counts") != expected_counts:
     )
 if manifest.get("dataset_fingerprint") != values["dataset_fingerprint"]:
     raise SystemExit("manifest dataset_fingerprint does not match stdout")
+if manifest.get("streaming_train_batches") is not True:
+    raise SystemExit(
+        f"manifest streaming_train_batches {manifest.get('streaming_train_batches')} is not true"
+    )
 for key in ["reload_delta", "eval_reload_delta", "full_forward_reload_delta"]:
     if float(values[key]) > 1e-6:
         raise SystemExit(f"{key} too large: {values[key]}")

@@ -30,6 +30,7 @@ required = [
     "dataset_fingerprint",
     "dataset_order_seed",
     "dataset_shuffle",
+    "streaming_train_batches",
     "sequence_tokens",
     "reload_delta",
     "eval_reload_delta",
@@ -42,6 +43,10 @@ if missing:
 
 if values["dataset_shuffle"] != "false":
     raise SystemExit(f"expected dataset_shuffle false, got {values['dataset_shuffle']}")
+if values["streaming_train_batches"] != "true":
+    raise SystemExit(
+        f"expected streaming_train_batches true, got {values['streaming_train_batches']}"
+    )
 if int(values["dataset_order_seed"]) != 777:
     raise SystemExit(f"expected dataset_order_seed 777, got {values['dataset_order_seed']}")
 if int(values["dataset_total_samples"]) != 4:
@@ -60,6 +65,10 @@ if manifest.get("dataset_order_seed") != 777:
 if manifest.get("dataset_total_samples") != 4:
     raise SystemExit(
         f"manifest dataset_total_samples {manifest.get('dataset_total_samples')} != 4"
+    )
+if manifest.get("streaming_train_batches") is not True:
+    raise SystemExit(
+        f"manifest streaming_train_batches {manifest.get('streaming_train_batches')} is not true"
     )
 
 for key in ["reload_delta", "eval_reload_delta", "full_forward_reload_delta"]:
