@@ -1816,6 +1816,8 @@ struct QwenSftArrowExampleSet {
     source_rows: usize,
     arrow_ipc_format: String,
     columns: Vec<String>,
+    source_files: Vec<String>,
+    source_sample_counts: Vec<QwenSftSourceSampleCount>,
     fingerprint: String,
 }
 
@@ -6729,8 +6731,13 @@ fn qwen_sft_arrow_validate_config_scope(
     data_config: &RuntimeDataConfig,
     context: &str,
 ) -> Result<()> {
-    if data_config.paths.len() != 1 {
-        bail!("{context} supports exactly one data.paths Arrow IPC file for now");
+    for path in &data_config.paths {
+        if !path.is_file() {
+            bail!(
+                "{context} data.paths entry must be an Arrow IPC file: {}",
+                path.display()
+            );
+        }
     }
     if data_config.eval_paths.len() > 1 {
         bail!("{context} supports at most one data.eval_paths Arrow IPC file for now");
@@ -6748,13 +6755,29 @@ fn qwen_sft_arrow_validate_config_scope(
     if data_config.index_cache.is_some() {
         bail!("{context} does not support data.index_cache for instruction_arrow yet");
     }
-    if !data_config.source_weights.is_empty() {
-        bail!("{context} does not support data.source_weights for instruction_arrow yet");
-    }
-    if !data_config.source_max_samples.is_empty() {
-        bail!("{context} does not support data.source_max_samples for instruction_arrow yet");
-    }
     Ok(())
+}
+
+fn qwen_sft_arrow_dataset_from_paths(
+    tokenizer: &Tokenizer,
+    paths: &[PathBuf],
+    max_samples: Option<usize>,
+    field_map: &QwenSftFieldMap,
+) -> Result<QwenSftDataset> {
+    let arrow = qwen_sft_arrow_examples_from_paths_with_limit(paths, max_samples, field_map)?;
+    let samples = arrow
+        .examples
+        .iter()
+        .map(|example| qwen_sft_token_sample(tokenizer, example, field_map))
+        .collect::<Result<Vec<_>>>()?;
+    Ok(QwenSftDataset {
+        samples,
+        pad_token_id: qwen_pad_token_id(tokenizer),
+        epoch_shuffle_seed: None,
+        source_files: arrow.source_files,
+        source_sample_counts: arrow.source_sample_counts,
+        fingerprint: arrow.fingerprint,
+    })
 }
 
 fn qwen_sft_arrow_dataset_from_ipc(
@@ -6763,30 +6786,7 @@ fn qwen_sft_arrow_dataset_from_ipc(
     max_samples: Option<usize>,
     field_map: &QwenSftFieldMap,
 ) -> Result<QwenSftDataset> {
-    if !path.is_file() {
-        bail!(
-            "instruction_arrow data path must be an Arrow IPC file: {}",
-            path.display()
-        );
-    }
-    let arrow = qwen_sft_arrow_examples_from_ipc(path, max_samples, field_map)?;
-    let samples = arrow
-        .examples
-        .iter()
-        .map(|example| qwen_sft_token_sample(tokenizer, example, field_map))
-        .collect::<Result<Vec<_>>>()?;
-    let source_file = path.display().to_string();
-    Ok(QwenSftDataset {
-        samples,
-        pad_token_id: qwen_pad_token_id(tokenizer),
-        epoch_shuffle_seed: None,
-        source_files: vec![source_file.clone()],
-        source_sample_counts: vec![QwenSftSourceSampleCount {
-            path: source_file,
-            samples: arrow.examples.len(),
-        }],
-        fingerprint: arrow.fingerprint,
-    })
+    qwen_sft_arrow_dataset_from_paths(tokenizer, &[path.to_path_buf()], max_samples, field_map)
 }
 
 fn qwen_sft_arrow_plan_data(
@@ -6795,12 +6795,12 @@ fn qwen_sft_arrow_plan_data(
     seed: u64,
     field_map: &QwenSftFieldMap,
 ) -> Result<QwenSftArrowPlanData> {
-    let input = data_config
-        .paths
-        .first()
-        .context("instruction_arrow requires one data.paths entry")?;
-    let train_dataset =
-        qwen_sft_arrow_dataset_from_ipc(tokenizer, input, data_config.max_samples, field_map)?;
+    let train_dataset = qwen_sft_arrow_dataset_from_paths(
+        tokenizer,
+        &data_config.paths,
+        data_config.max_samples,
+        field_map,
+    )?;
     if data_config.eval_paths.is_empty() {
         let dataset = qwen_apply_sft_shuffle(train_dataset, data_config.shuffle, seed);
         let dataset_summary = dataset.summary();
@@ -6878,23 +6878,13 @@ fn qwen_sft_arrow_streaming_data_plan(
 ) -> Result<()> {
     qwen_sft_arrow_validate_config_scope(data_config, "qwen SFT Arrow streaming data plan")?;
     let field_map = QwenSftFieldMap::from_runtime_data(data_config)?;
-    let input = data_config
-        .paths
-        .first()
-        .context("instruction_arrow requires one data.paths entry")?;
-    if !input.is_file() {
-        bail!(
-            "instruction_arrow data path must be an Arrow IPC file: {}",
-            input.display()
-        );
-    }
-    let train_arrow = qwen_sft_arrow_examples_from_ipc(input, data_config.max_samples, &field_map)?;
-    let source_file = input.display().to_string();
-    let train_source_files = vec![source_file.clone()];
-    let train_source_sample_counts = vec![QwenSftSourceSampleCount {
-        path: source_file,
-        samples: train_arrow.examples.len(),
-    }];
+    let train_arrow = qwen_sft_arrow_examples_from_paths_with_limit(
+        &data_config.paths,
+        data_config.max_samples,
+        &field_map,
+    )?;
+    let train_source_files = train_arrow.source_files.clone();
+    let train_source_sample_counts = train_arrow.source_sample_counts.clone();
     let (
         dataset_total_samples,
         dataset_train_samples,
@@ -12968,20 +12958,134 @@ fn qwen_sft_arrow_source_summary_from_ipc(
             response: field_map.response.clone(),
         },
         samples: arrow.examples.len(),
-        source_files: vec![source_file.clone()],
-        source_sample_counts: vec![QwenSftSourceSampleCount {
-            path: source_file,
-            samples: arrow.examples.len(),
-        }],
+        source_files: arrow.source_files,
+        source_sample_counts: arrow.source_sample_counts,
         fingerprint: arrow.fingerprint,
         tokenized_samples_materialized: false,
         jsonl_materialized: false,
     })
 }
 
+fn qwen_sft_arrow_examples_from_paths_with_limit(
+    paths: &[PathBuf],
+    max_samples: Option<usize>,
+    field_map: &QwenSftFieldMap,
+) -> Result<QwenSftArrowExampleSet> {
+    if paths.is_empty() {
+        bail!("SFT Arrow dataset must contain at least one path");
+    }
+    if max_samples == Some(0) {
+        bail!("qwen SFT Arrow source max_samples must be greater than zero");
+    }
+    let source_weights = qwen_sft_source_weights(paths.len(), field_map)?;
+    let source_max_samples = qwen_sft_source_max_samples(paths.len(), field_map)?;
+    let mut examples = Vec::new();
+    let mut source_rows = 0usize;
+    let mut arrow_ipc_formats = BTreeSet::new();
+    let mut columns_by_path = BTreeMap::new();
+    let mut source_files = BTreeSet::new();
+    let mut source_sample_counts = BTreeMap::new();
+    let mut seen_examples = field_map.dedupe_samples.then(HashSet::new);
+
+    for ((path, source_weight), source_limit) in paths
+        .iter()
+        .zip(source_weights.iter().copied())
+        .zip(source_max_samples.iter().copied())
+    {
+        if max_samples.is_some_and(|limit| examples.len() >= limit) {
+            break;
+        }
+        if !path.is_file() {
+            bail!(
+                "instruction_arrow data path must be an Arrow IPC file: {}",
+                path.display()
+            );
+        }
+        let source_remaining = match (max_samples, source_limit) {
+            (Some(global_limit), Some(source_limit)) => {
+                Some(source_limit.min(global_limit.saturating_sub(examples.len())))
+            }
+            (Some(global_limit), None) => Some(global_limit.saturating_sub(examples.len())),
+            (None, Some(source_limit)) => Some(source_limit),
+            (None, None) => None,
+        };
+        if source_remaining == Some(0) {
+            continue;
+        }
+        let mut source_field_map = field_map.clone();
+        source_field_map.source_weights.clear();
+        source_field_map.source_max_samples.clear();
+        let arrow = qwen_sft_arrow_examples_from_ipc_with_limit_policy(
+            path,
+            source_remaining,
+            false,
+            &source_field_map,
+        )?;
+        source_rows += arrow.source_rows;
+        arrow_ipc_formats.insert(arrow.arrow_ipc_format.clone());
+        columns_by_path.insert(path.display().to_string(), arrow.columns.clone());
+        for example in arrow.examples {
+            if max_samples.is_some_and(|limit| examples.len() >= limit) {
+                break;
+            }
+            if let Some(seen_examples) = &mut seen_examples {
+                if !seen_examples.insert(qwen_sft_example_dedupe_key(&example)) {
+                    continue;
+                }
+            }
+            let source_file = path.display().to_string();
+            for _ in 0..source_weight {
+                if max_samples.is_some_and(|limit| examples.len() >= limit) {
+                    break;
+                }
+                examples.push(example.clone());
+                source_files.insert(source_file.clone());
+                *source_sample_counts.entry(source_file.clone()).or_insert(0) += 1;
+            }
+        }
+    }
+
+    if examples.is_empty() {
+        bail!("SFT Arrow dataset must contain at least one example");
+    }
+    if let Some(limit) = max_samples
+        && examples.len() < limit
+    {
+        bail!(
+            "SFT Arrow dataset produced {} examples, below limit {}",
+            examples.len(),
+            limit
+        );
+    }
+    let source_files = source_files.into_iter().collect::<Vec<_>>();
+    let source_sample_counts = source_sample_counts
+        .into_iter()
+        .map(|(path, samples)| QwenSftSourceSampleCount { path, samples })
+        .collect::<Vec<_>>();
+    let fingerprint = qwen_sft_dataset_fingerprint(&source_files, &examples, field_map);
+    Ok(QwenSftArrowExampleSet {
+        examples,
+        source_rows,
+        arrow_ipc_format: arrow_ipc_formats.into_iter().collect::<Vec<_>>().join("+"),
+        columns: columns_by_path.values().next().cloned().unwrap_or_default(),
+        source_files,
+        source_sample_counts,
+        fingerprint,
+    })
+}
+
 fn qwen_sft_arrow_examples_from_ipc(
     path: &Path,
     max_samples: Option<usize>,
+    field_map: &QwenSftFieldMap,
+) -> Result<QwenSftArrowExampleSet> {
+    qwen_sft_arrow_examples_from_ipc_with_limit_policy(path, max_samples, true, field_map)
+}
+
+fn qwen_sft_arrow_examples_from_ipc_with_limit_policy(
+    path: &Path,
+    max_samples: Option<usize>,
+    require_exact_limit: bool,
     field_map: &QwenSftFieldMap,
 ) -> Result<QwenSftArrowExampleSet> {
     if max_samples == Some(0) {
@@ -12993,7 +13097,14 @@ fn qwen_sft_arrow_examples_from_ipc(
             let reader = ArrowStreamReader::try_new(file, None).with_context(|| {
                 format!("failed to open {} as Arrow IPC stream", path.display())
             })?;
-            qwen_sft_arrow_examples_from_batches(path, max_samples, field_map, "stream", reader)
+            qwen_sft_arrow_examples_from_batches(
+                path,
+                max_samples,
+                require_exact_limit,
+                field_map,
+                "stream",
+                reader,
+            )
         });
     match stream_attempt {
         Ok(summary) => Ok(summary),
@@ -13006,7 +13117,14 @@ fn qwen_sft_arrow_examples_from_ipc(
                     path.display()
                 )
             })?;
-            qwen_sft_arrow_examples_from_batches(path, max_samples, field_map, "file", reader)
+            qwen_sft_arrow_examples_from_batches(
+                path,
+                max_samples,
+                require_exact_limit,
+                field_map,
+                "file",
+                reader,
+            )
         }
     }
 }
@@ -13014,6 +13132,7 @@ fn qwen_sft_arrow_examples_from_ipc(
 fn qwen_sft_arrow_examples_from_batches<I>(
     path: &Path,
     max_samples: Option<usize>,
+    require_exact_limit: bool,
     field_map: &QwenSftFieldMap,
     arrow_ipc_format: &str,
     mut batches: I,
@@ -13086,7 +13205,8 @@ where
             path.display()
         );
     }
-    if let Some(limit) = max_samples
+    if require_exact_limit
+        && let Some(limit) = max_samples
         && examples.len() < limit
     {
         bail!(
@@ -13098,14 +13218,30 @@ where
     }
     let source_file = path.display().to_string();
     let source_files = vec![source_file.clone()];
+    let sample_count = examples.len();
     let fingerprint = qwen_sft_dataset_fingerprint(&source_files, &examples, field_map);
     Ok(QwenSftArrowExampleSet {
         examples,
         source_rows,
         arrow_ipc_format: arrow_ipc_format.to_string(),
         columns,
+        source_files,
+        source_sample_counts: vec![QwenSftSourceSampleCount {
+            path: source_file,
+            samples: sample_count,
+        }],
         fingerprint,
     })
+}
+
+fn qwen_sft_example_dedupe_key(example: &QwenSftExample) -> String {
+    [
+        example.system.as_str(),
+        example.instruction.as_str(),
+        example.input.as_str(),
+        example.response.as_str(),
+    ]
+    .join("\u{1f}")
 }
 
 fn qwen_arrow_column_index(schema: &SchemaRef, column: &str) -> Result<usize> {
@@ -14829,6 +14965,10 @@ pub fn diff_stats(actual: &Tensor, expected: &Tensor) -> Result<DiffStats> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arrow::{
+        datatypes::{Field, Schema},
+        ipc::writer::StreamWriter,
+    };
 
     #[test]
     fn rms_norm_matches_manual_formula() {
@@ -19867,6 +20007,106 @@ mod tests {
                 (second.display().to_string(), 1),
             ]
         );
+    }
+
+    #[test]
+    fn qwen_sft_arrow_applies_source_limits_and_weights_before_global_limit() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let first = temp.path().join("first.arrow");
+        let second = temp.path().join("second.arrow");
+        write_test_sft_arrow(
+            &first,
+            &[
+                ("first-a", "", "alpha"),
+                ("first-b", "", "beta"),
+                ("first-c", "", "gamma"),
+            ],
+        );
+        write_test_sft_arrow(
+            &second,
+            &[
+                ("second-a", "", "delta"),
+                ("second-b", "", "epsilon"),
+                ("second-c", "", "zeta"),
+            ],
+        );
+        let paths = vec![first.clone(), second.clone()];
+        let field_map = QwenSftFieldMap {
+            response: "output".to_string(),
+            source_weights: vec![2, 1],
+            source_max_samples: vec![1, 2],
+            ..QwenSftFieldMap::default()
+        };
+
+        let loaded = qwen_sft_arrow_examples_from_paths_with_limit(&paths, Some(4), &field_map)
+            .expect("weighted Arrow examples should load");
+        let unweighted = qwen_sft_arrow_examples_from_paths_with_limit(
+            &paths,
+            Some(4),
+            &QwenSftFieldMap {
+                response: "output".to_string(),
+                ..QwenSftFieldMap::default()
+            },
+        )
+        .expect("unweighted Arrow examples should load");
+
+        assert_eq!(
+            loaded
+                .examples
+                .iter()
+                .map(|example| example.instruction.as_str())
+                .collect::<Vec<_>>(),
+            vec!["first-a", "first-a", "second-a", "second-b"]
+        );
+        assert_eq!(
+            loaded.source_files,
+            vec![first.display().to_string(), second.display().to_string()]
+        );
+        assert_eq!(
+            loaded.source_sample_counts,
+            vec![
+                QwenSftSourceSampleCount {
+                    path: first.display().to_string(),
+                    samples: 2,
+                },
+                QwenSftSourceSampleCount {
+                    path: second.display().to_string(),
+                    samples: 2,
+                },
+            ]
+        );
+        assert_ne!(loaded.fingerprint, unweighted.fingerprint);
+    }
+
+    fn write_test_sft_arrow(path: &Path, rows: &[(&str, &str, &str)]) {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("instruction", DataType::Utf8, false),
+            Field::new("input", DataType::Utf8, false),
+            Field::new("output", DataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(
+                    rows.iter()
+                        .map(|(instruction, _, _)| *instruction)
+                        .collect::<Vec<_>>(),
+                )),
+                Arc::new(StringArray::from(
+                    rows.iter().map(|(_, input, _)| *input).collect::<Vec<_>>(),
+                )),
+                Arc::new(StringArray::from(
+                    rows.iter()
+                        .map(|(_, _, response)| *response)
+                        .collect::<Vec<_>>(),
+                )),
+            ],
+        )
+        .expect("test Arrow batch should build");
+        let file = fs::File::create(path).expect("test Arrow file should create");
+        let mut writer = StreamWriter::try_new(file, &schema).expect("test Arrow writer");
+        writer.write(&batch).expect("test Arrow batch should write");
+        writer.finish().expect("test Arrow stream should finish");
     }
 
     #[test]

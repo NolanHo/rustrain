@@ -593,8 +593,12 @@ production-grade sharded checkpoint ownership remain open.
   single-GPU and DP=2 `qwen_trainable_session` trainer paths, write
   delta/optimizer/manifest artifacts, and verify manifest-backed data cursor
   resume/provenance. The single-GPU and DP=2 Arrow paths also support one
-  explicit Arrow `data.eval_paths` file with `data.max_eval_samples`. A
-  production zero-materialization training loader for large external streams,
+  explicit Arrow `data.eval_paths` file with `data.max_eval_samples`.
+  Bounded Arrow train sources now honor `data.source_weights` and
+  `data.source_max_samples` with the same ordering as JSONL: per-source raw
+  limits apply before source weighting, and global `data.max_samples` applies
+  after weighting; explicit Arrow eval paths remain unweighted held-out data.
+  A production zero-materialization training loader for large external streams,
   Arrow index-cache semantics, and production distributed Arrow trainer
   ownership remain open.
   Production data loading and arbitrary-module LoRA injection are still open.
