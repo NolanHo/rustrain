@@ -9178,10 +9178,14 @@ pub(crate) fn train_qwen_session_single_from_config(
             bail!("qwen session trainer does not support fp16 yet; use fp32 or bf16")
         }
     };
-    let streaming_index_cache = config.data.as_ref().map(|data| {
-        data.index_cache.clone().unwrap_or_else(|| {
-            qwen_sft_streaming_index_cache_path(&run_paths.cache, "qwen-session-single")
-        })
+    let streaming_index_cache = config.data.as_ref().and_then(|data| {
+        if data.kind == RuntimeDataKind::InstructionJsonl {
+            Some(data.index_cache.clone().unwrap_or_else(|| {
+                qwen_sft_streaming_index_cache_path(&run_paths.cache, "qwen-session-single")
+            }))
+        } else {
+            data.index_cache.clone()
+        }
     });
     qwen_session_single_summary(
         &model_path,
@@ -10116,20 +10120,12 @@ fn qwen_session_batch_plan_from_config(
     let Some(data_config) = runtime_config.data.as_ref() else {
         return qwen_session_fixed_batch_plan(weights, data_cursor_start, train_steps);
     };
-    if data_config.kind != RuntimeDataKind::InstructionJsonl {
-        bail!("qwen trainable session data path supports kind = instruction_jsonl");
-    }
     let tokenizer = Tokenizer::from_file(model_path.join("tokenizer.json"))
         .map_err(|error| anyhow!("failed to load tokenizer: {error}"))?;
     let field_map = QwenSftFieldMap::from_runtime_data(data_config)?;
-    let datasets = qwen_sft_train_eval_datasets_from_paths(
+    let datasets = qwen_session_single_sft_datasets_from_config(
         &tokenizer,
-        &data_config.paths,
-        &data_config.eval_paths,
-        data_config.max_samples,
-        data_config.max_eval_samples,
-        data_config.train_split,
-        data_config.shuffle,
+        data_config,
         runtime_config.run.seed,
         &field_map,
     )?;
@@ -10150,24 +10146,49 @@ fn qwen_session_batch_plan_from_config(
         qwen_data_epoch_and_offset(data_cursor_end, train_dataset.len())?;
     let (data_epoch_next, data_sample_offset_next) =
         qwen_data_epoch_and_offset(data_cursor_next, train_dataset.len())?;
-    let streaming_window = qwen_sft_streaming_token_window_from_jsonl(
-        &tokenizer,
-        &data_config.paths,
-        &data_config.eval_paths,
-        data_config.max_samples,
-        data_config.train_split,
-        data_config.shuffle,
-        runtime_config.run.seed,
-        data_cursor_start,
-        required_batches + batch_size - 1,
-        streaming_index_cache,
-        &field_map,
-    )?;
+    let window_samples = required_batches + batch_size - 1;
+    let (streaming_samples, streaming_index_cache_hit, streaming_index_cache_written) =
+        match data_config.kind {
+            RuntimeDataKind::InstructionJsonl => {
+                let streaming_window = qwen_sft_streaming_token_window_from_jsonl(
+                    &tokenizer,
+                    &data_config.paths,
+                    &data_config.eval_paths,
+                    data_config.max_samples,
+                    data_config.train_split,
+                    data_config.shuffle,
+                    runtime_config.run.seed,
+                    data_cursor_start,
+                    window_samples,
+                    streaming_index_cache,
+                    &field_map,
+                )?;
+                (
+                    streaming_window.samples,
+                    streaming_window.source_index_cache_hit,
+                    streaming_window.source_index_cache_written,
+                )
+            }
+            RuntimeDataKind::InstructionArrow => {
+                if streaming_index_cache.is_some() {
+                    bail!(
+                        "qwen trainable session instruction_arrow does not support data.index_cache yet"
+                    );
+                }
+                let samples = (0..window_samples)
+                    .map(|relative| train_dataset.sample_at_cursor(data_cursor_start + relative))
+                    .collect::<Result<Vec<_>>>()?;
+                (samples, false, false)
+            }
+            _ => bail!(
+                "qwen trainable session data path supports kind = instruction_jsonl or instruction_arrow"
+            ),
+        };
     let train_batches = (0..required_batches)
         .map(|relative_cursor| {
             let end = relative_cursor + batch_size;
             let streaming_batch = qwen_sft_padded_batch(
-                &streaming_window.samples[relative_cursor..end],
+                &streaming_samples[relative_cursor..end],
                 train_dataset.pad_token_id,
             )?;
             let reference_batch =
@@ -10206,9 +10227,15 @@ fn qwen_session_batch_plan_from_config(
         dataset_order_seed: Some(runtime_config.run.seed),
         dataset_shuffle: Some(dataset_summary.shuffle),
         streaming_train_batches: Some(true),
-        streaming_index_cache_path: streaming_index_cache.map(|path| path.display().to_string()),
-        streaming_index_cache_hit: Some(streaming_window.source_index_cache_hit),
-        streaming_index_cache_written: Some(streaming_window.source_index_cache_written),
+        streaming_index_cache_path: match data_config.kind {
+            RuntimeDataKind::InstructionJsonl => {
+                streaming_index_cache.map(|path| path.display().to_string())
+            }
+            RuntimeDataKind::InstructionArrow => None,
+            _ => None,
+        },
+        streaming_index_cache_hit: Some(streaming_index_cache_hit),
+        streaming_index_cache_written: Some(streaming_index_cache_written),
         train_sample_count: Some(train_dataset.len()),
         data_epoch_start: Some(data_epoch_start),
         data_epoch_end: Some(data_epoch_end),
@@ -10218,6 +10245,47 @@ fn qwen_session_batch_plan_from_config(
         data_sample_offset_next: Some(data_sample_offset_next),
         batch_size,
     })
+}
+
+fn qwen_session_single_sft_datasets_from_config(
+    tokenizer: &Tokenizer,
+    data_config: &RuntimeDataConfig,
+    seed: u64,
+    field_map: &QwenSftFieldMap,
+) -> Result<QwenSftTrainEvalDatasets> {
+    match data_config.kind {
+        RuntimeDataKind::InstructionJsonl => qwen_sft_train_eval_datasets_from_paths(
+            tokenizer,
+            &data_config.paths,
+            &data_config.eval_paths,
+            data_config.max_samples,
+            data_config.max_eval_samples,
+            data_config.train_split,
+            data_config.shuffle,
+            seed,
+            field_map,
+        ),
+        RuntimeDataKind::InstructionArrow => {
+            qwen_sft_arrow_validate_config_scope(
+                data_config,
+                "qwen trainable session instruction_arrow data path",
+            )?;
+            if data_config.max_samples.is_none() {
+                bail!(
+                    "qwen trainable session instruction_arrow requires data.max_samples for the bounded trainer path"
+                );
+            }
+            let plan_data = qwen_sft_arrow_plan_data(tokenizer, data_config, seed, field_map)?;
+            Ok(QwenSftTrainEvalDatasets {
+                combined_summary: plan_data.dataset_summary,
+                train_dataset: plan_data.train_dataset,
+                eval_dataset: plan_data.eval_dataset,
+            })
+        }
+        _ => bail!(
+            "qwen trainable session data path supports kind = instruction_jsonl or instruction_arrow"
+        ),
+    }
 }
 
 fn qwen_session_fixed_dp_batch_plan(
