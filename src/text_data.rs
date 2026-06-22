@@ -59,6 +59,8 @@ struct SftCache {
     vocab_size: usize,
     min_response_chars: usize,
     max_response_chars: Option<usize>,
+    min_instruction_chars: Option<usize>,
+    max_instruction_chars: Option<usize>,
     source_weights: Vec<usize>,
     train_samples: Vec<SftSample>,
     eval_samples: Vec<SftSample>,
@@ -195,6 +197,8 @@ pub fn load_sft_dataset(
         vocab_size,
         data.min_response_chars,
         data.max_response_chars,
+        data.min_instruction_chars,
+        data.max_instruction_chars,
         &data.source_weights,
         &dataset,
     )?;
@@ -316,11 +320,7 @@ fn read_sft_paths(
                         line_index + 1
                     )
                 })?;
-                if !sft_record_passes_response_filter(
-                    &record,
-                    data.min_response_chars,
-                    data.max_response_chars,
-                ) {
+                if !sft_record_passes_filters(data, &record) {
                     continue;
                 }
                 let sample = format_sft_sample(data, tokenizer, seq_len, &record)?;
@@ -377,14 +377,20 @@ fn instruction_record_from_jsonl_line(data: &DataConfig, line: &str) -> Result<I
     })
 }
 
-fn sft_record_passes_response_filter(
-    record: &InstructionRecord,
-    min_response_chars: usize,
-    max_response_chars: Option<usize>,
-) -> bool {
-    let response_chars = record.response.chars().count();
-    response_chars >= min_response_chars
-        && max_response_chars.is_none_or(|limit| response_chars <= limit)
+fn sft_record_passes_filters(data: &DataConfig, record: &InstructionRecord) -> bool {
+    length_filter_passes(
+        record.response.chars().count(),
+        Some(data.min_response_chars),
+        data.max_response_chars,
+    ) && length_filter_passes(
+        record.instruction.chars().count(),
+        data.min_instruction_chars,
+        data.max_instruction_chars,
+    )
+}
+
+fn length_filter_passes(chars: usize, min_chars: Option<usize>, max_chars: Option<usize>) -> bool {
+    min_chars.is_none_or(|limit| chars >= limit) && max_chars.is_none_or(|limit| chars <= limit)
 }
 
 fn normalize_jsonl_field(value: String, data: &DataConfig) -> String {
@@ -481,6 +487,8 @@ fn write_sft_cache(
     vocab_size: usize,
     min_response_chars: usize,
     max_response_chars: Option<usize>,
+    min_instruction_chars: Option<usize>,
+    max_instruction_chars: Option<usize>,
     source_weights: &[usize],
     dataset: &SftDataset,
 ) -> Result<()> {
@@ -489,6 +497,8 @@ fn write_sft_cache(
         vocab_size,
         min_response_chars,
         max_response_chars,
+        min_instruction_chars,
+        max_instruction_chars,
         source_weights: source_weights.to_vec(),
         train_samples: dataset.train_samples.clone(),
         eval_samples: dataset.eval_samples.clone(),
@@ -542,6 +552,8 @@ mod tests {
             trim_fields: true,
             min_response_chars: 1,
             max_response_chars: None,
+            min_instruction_chars: None,
+            max_instruction_chars: None,
             source_weights: Vec::new(),
         };
         let dataset = load_text_dataset(&data, 64, 8, &cache_dir).expect("dataset should load");
@@ -586,6 +598,8 @@ mod tests {
             trim_fields: true,
             min_response_chars: 1,
             max_response_chars: None,
+            min_instruction_chars: None,
+            max_instruction_chars: None,
             source_weights: Vec::new(),
         };
         let dataset = load_text_dataset(&data, 128, 8, &cache_dir).expect("dataset should load");
@@ -636,6 +650,8 @@ mod tests {
             trim_fields: true,
             min_response_chars: 1,
             max_response_chars: None,
+            min_instruction_chars: None,
+            max_instruction_chars: None,
             source_weights: Vec::new(),
         };
         let dataset =
@@ -693,6 +709,8 @@ mod tests {
             trim_fields: true,
             min_response_chars: 1,
             max_response_chars: None,
+            min_instruction_chars: None,
+            max_instruction_chars: None,
             source_weights: Vec::new(),
         };
         let dataset =
@@ -742,6 +760,8 @@ mod tests {
             trim_fields: true,
             min_response_chars: 1,
             max_response_chars: None,
+            min_instruction_chars: None,
+            max_instruction_chars: None,
             source_weights: Vec::new(),
         };
         let raw_data = DataConfig {
@@ -818,6 +838,8 @@ mod tests {
             trim_fields: true,
             min_response_chars: 1,
             max_response_chars: None,
+            min_instruction_chars: None,
+            max_instruction_chars: None,
             source_weights: Vec::new(),
         };
         let dataset =
@@ -858,6 +880,8 @@ mod tests {
             trim_fields: true,
             min_response_chars: 5,
             max_response_chars: None,
+            min_instruction_chars: None,
+            max_instruction_chars: None,
             source_weights: Vec::new(),
         };
         let dataset =
@@ -907,6 +931,8 @@ mod tests {
             trim_fields: true,
             min_response_chars: 1,
             max_response_chars: Some(5),
+            min_instruction_chars: None,
+            max_instruction_chars: None,
             source_weights: Vec::new(),
         };
         let dataset =
@@ -924,6 +950,59 @@ mod tests {
         assert!(second.contains("second"));
         assert!(!first.contains("too long"));
         assert!(!second.contains("too long"));
+    }
+
+    #[test]
+    fn sft_dataset_filters_instruction_lengths_before_split_and_limit() {
+        let dir = tempdir().expect("temp dir should be created");
+        let data_dir = dir.path().join("sft");
+        let cache_dir = dir.path().join("cache");
+        fs::create_dir_all(&data_dir).expect("sft dir should be created");
+        fs::create_dir_all(&cache_dir).expect("cache dir should be created");
+        fs::write(
+            data_dir.join("sample.jsonl"),
+            "{\"instruction\":\"a\",\"response\":\"skip\"}\n{\"instruction\":\"first\",\"response\":\"valid\"}\n{\"instruction\":\"too long\",\"response\":\"skip\"}\n{\"instruction\":\"second\",\"response\":\"works\"}\n{\"instruction\":\"third\",\"response\":\"later\"}\n",
+        )
+        .expect("jsonl should write");
+
+        let data = DataConfig {
+            kind: DataKind::InstructionJsonl,
+            paths: vec![data_dir],
+            eval_paths: Vec::new(),
+            train_split: 0.5,
+            max_samples: Some(2),
+            shuffle: false,
+            index_cache: None,
+            instruction_field: "instruction".to_string(),
+            input_field: "input".to_string(),
+            response_field: "response".to_string(),
+            prompt_template: "Instruction:\n{instruction}\n\nResponse:\n".to_string(),
+            prompt_with_input_template:
+                "Instruction:\n{instruction}\n\nInput:\n{input}\n\nResponse:\n".to_string(),
+            trim_fields: true,
+            min_response_chars: 1,
+            max_response_chars: None,
+            min_instruction_chars: Some(3),
+            max_instruction_chars: Some(6),
+            source_weights: Vec::new(),
+        };
+        let dataset =
+            load_sft_dataset(&data, 128, 64, &cache_dir).expect("SFT dataset should load");
+
+        assert_eq!(dataset.train_samples.len(), 1);
+        assert_eq!(dataset.eval_samples.len(), 1);
+        let first = dataset
+            .tokenizer
+            .decode_lossy(&dataset.train_samples[0].tokens);
+        let second = dataset
+            .tokenizer
+            .decode_lossy(&dataset.eval_samples[0].tokens);
+        assert!(first.contains("first"));
+        assert!(second.contains("second"));
+        assert!(!first.contains("too long"));
+        assert!(!second.contains("too long"));
+        assert!(!first.contains("Instruction:\na"));
+        assert!(!second.contains("Instruction:\na"));
     }
 
     #[test]
@@ -963,6 +1042,8 @@ mod tests {
             trim_fields: true,
             min_response_chars: 1,
             max_response_chars: None,
+            min_instruction_chars: None,
+            max_instruction_chars: None,
             source_weights: vec![2, 2],
         };
         let dataset =
@@ -1012,6 +1093,8 @@ mod tests {
             trim_fields: true,
             min_response_chars: 1,
             max_response_chars: None,
+            min_instruction_chars: None,
+            max_instruction_chars: None,
             source_weights: Vec::new(),
         };
         let dataset =
