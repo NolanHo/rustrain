@@ -155,6 +155,8 @@ pub struct DataConfig {
     #[serde(default)]
     pub normalize_whitespace: bool,
     #[serde(default)]
+    pub field_defaults: Vec<FieldDefault>,
+    #[serde(default)]
     pub source_weights: Vec<usize>,
     #[serde(default)]
     pub source_max_samples: Vec<usize>,
@@ -177,6 +179,21 @@ pub enum FieldReplacementTarget {
     Input,
     Response,
     All,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct FieldDefault {
+    pub field: FieldDefaultTarget,
+    pub value: String,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum FieldDefaultTarget {
+    System,
+    Instruction,
+    Input,
+    Response,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -569,7 +586,12 @@ pub fn validate_config(config: &Config) -> Result<()> {
         {
             return Err(anyhow!("data.input_excludes_any entries must not be empty"));
         }
-        let has_system_source = data.system_field.is_some() || data.chat_messages_field.is_some();
+        let has_system_source = data.system_field.is_some()
+            || data.chat_messages_field.is_some()
+            || data
+                .field_defaults
+                .iter()
+                .any(|default| matches!(default.field, FieldDefaultTarget::System));
         if !data.system_contains_any.is_empty() && !has_system_source {
             return Err(anyhow!(
                 "data.system_contains_any requires data.system_field or data.chat_messages_field to be set"
@@ -736,6 +758,13 @@ pub fn validate_config(config: &Config) -> Result<()> {
             if matches!(replacement.field, FieldReplacementTarget::System) && !has_system_source {
                 return Err(anyhow!(
                     "data.field_replacements targeting system requires data.system_field or data.chat_messages_field to be set"
+                ));
+            }
+        }
+        for default in &data.field_defaults {
+            if default.value.is_empty() {
+                return Err(anyhow!(
+                    "data.field_defaults value entries must not be empty"
                 ));
             }
         }
@@ -948,6 +977,7 @@ mod tests {
                 dedupe_samples: false,
                 field_replacements: Vec::new(),
                 normalize_whitespace: false,
+                field_defaults: Vec::new(),
                 source_weights: Vec::new(),
                 source_max_samples: Vec::new(),
                 skip_invalid_records: false,

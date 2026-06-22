@@ -470,6 +470,11 @@ production-grade sharded checkpoint ownership remain open.
   the rendered prompt plus normalized response. `data.dedupe_samples` defaults
   to `false`; set it to `true` to keep the first normalized
   system/instruction/input/response tuple and skip exact duplicate records.
+  `data.field_defaults` can fill empty or missing `system`, `instruction`,
+  `input`, or `response` values before replacements, whitespace
+  normalization, filtering, deduplication, splitting, and streaming indexing.
+  The default empty list preserves existing fingerprints. `data.system_field`
+  is not required when `data.field_defaults` injects a default system prompt.
   These transforms run before train/eval splitting, `max_samples`, and
   streaming offset-index construction.
   `data.max_eval_samples` can optionally cap explicit held-out
@@ -501,7 +506,8 @@ production-grade sharded checkpoint ownership remain open.
   `streaming_index_cache_written`, and the focused GPU suites run each cache
   verifier twice to prove first-run writes and second-run hits. Offset-index
   cache files also record source JSONL file size/mtime metadata, the JSONL
-  field mapping, prompt templates, field trimming policy,
+  field mapping, optional chat/messages field, prompt templates, field trimming
+  policy, field defaults, field replacements, whitespace normalization policy,
   instruction/input/system/prompt/sample/response length filters, response
   include/exclude substring filters, instruction substring filters, dedupe
   policy, and source-weighting policy, so a cache

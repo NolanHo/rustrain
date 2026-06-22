@@ -17,8 +17,8 @@ use tracing::info;
 use crate::nccl_smoke;
 use crate::runtime::{
     Config, DataConfig as RuntimeDataConfig, DataKind as RuntimeDataKind, Device as RuntimeDevice,
-    FieldReplacement, FieldReplacementTarget, LoraConfig as RuntimeLoraConfig, LrScheduler,
-    RunPaths, load_config,
+    FieldDefault, FieldDefaultTarget, FieldReplacement, FieldReplacementTarget,
+    LoraConfig as RuntimeLoraConfig, LrScheduler, RunPaths, load_config,
 };
 
 #[derive(Debug, Serialize)]
@@ -1701,6 +1701,8 @@ struct QwenSftFieldMap {
     field_replacements: Vec<FieldReplacement>,
     #[serde(default)]
     normalize_whitespace: bool,
+    #[serde(default)]
+    field_defaults: Vec<FieldDefault>,
     source_weights: Vec<usize>,
     #[serde(default)]
     source_max_samples: Vec<usize>,
@@ -1742,6 +1744,7 @@ impl QwenSftFieldMap {
             dedupe_samples: data.dedupe_samples,
             field_replacements: data.field_replacements.clone(),
             normalize_whitespace: data.normalize_whitespace,
+            field_defaults: data.field_defaults.clone(),
             source_weights: data.source_weights.clone(),
             source_max_samples: data.source_max_samples.clone(),
             skip_invalid_records: data.skip_invalid_records,
@@ -1971,11 +1974,21 @@ impl QwenSftFieldMap {
                 );
             }
         }
+        for default in &self.field_defaults {
+            if default.value.is_empty() {
+                bail!("data.field_defaults value entries must not be empty");
+            }
+        }
         Ok(())
     }
 
     fn has_system_source(&self) -> bool {
-        self.system.is_some() || self.chat_messages.is_some()
+        self.system.is_some()
+            || self.chat_messages.is_some()
+            || self
+                .field_defaults
+                .iter()
+                .any(|default| matches!(default.field, FieldDefaultTarget::System))
     }
 }
 
@@ -2014,6 +2027,7 @@ impl Default for QwenSftFieldMap {
             dedupe_samples: false,
             field_replacements: Vec::new(),
             normalize_whitespace: false,
+            field_defaults: Vec::new(),
             source_weights: Vec::new(),
             source_max_samples: Vec::new(),
             skip_invalid_records: false,
@@ -11976,6 +11990,7 @@ fn qwen_sft_record_from_jsonl_line(
         serde_json::from_str(line).context("invalid JSON object")?;
     if let Some(messages_field) = &field_map.chat_messages {
         let mut record = qwen_sft_record_from_chat_messages(&values, messages_field, field_map)?;
+        qwen_apply_field_defaults(&mut record, &field_map.field_defaults);
         qwen_apply_field_replacements(&mut record, &field_map.field_replacements);
         if field_map.normalize_whitespace {
             qwen_normalize_record_whitespace(&mut record);
@@ -11983,7 +11998,11 @@ fn qwen_sft_record_from_jsonl_line(
         return Ok(record);
     }
     let instruction = qwen_normalize_jsonl_field(
-        qwen_required_jsonl_string_field(&values, &field_map.instruction)?,
+        qwen_defaultable_jsonl_string_field(
+            &values,
+            &field_map.instruction,
+            qwen_field_default_value(&field_map.field_defaults, FieldDefaultTarget::Instruction),
+        )?,
         field_map,
     );
     let system = match &field_map.system {
@@ -11997,7 +12016,11 @@ fn qwen_sft_record_from_jsonl_line(
         field_map,
     );
     let response = qwen_normalize_jsonl_field(
-        qwen_required_jsonl_string_field(&values, &field_map.response)?,
+        qwen_defaultable_jsonl_string_field(
+            &values,
+            &field_map.response,
+            qwen_field_default_value(&field_map.field_defaults, FieldDefaultTarget::Response),
+        )?,
         field_map,
     );
     let mut record = QwenSftRecord {
@@ -12006,6 +12029,7 @@ fn qwen_sft_record_from_jsonl_line(
         input,
         response,
     };
+    qwen_apply_field_defaults(&mut record, &field_map.field_defaults);
     qwen_apply_field_replacements(&mut record, &field_map.field_replacements);
     if field_map.normalize_whitespace {
         qwen_normalize_record_whitespace(&mut record);
@@ -12150,6 +12174,33 @@ fn qwen_apply_field_replacements(record: &mut QwenSftRecord, replacements: &[Fie
     }
 }
 
+fn qwen_apply_field_defaults(record: &mut QwenSftRecord, defaults: &[FieldDefault]) {
+    for default in defaults {
+        match default.field {
+            FieldDefaultTarget::System if record.system.trim().is_empty() => {
+                record.system = default.value.clone();
+            }
+            FieldDefaultTarget::Instruction if record.instruction.trim().is_empty() => {
+                record.instruction = default.value.clone();
+            }
+            FieldDefaultTarget::Input if record.input.trim().is_empty() => {
+                record.input = default.value.clone();
+            }
+            FieldDefaultTarget::Response if record.response.trim().is_empty() => {
+                record.response = default.value.clone();
+            }
+            _ => {}
+        }
+    }
+}
+
+fn qwen_field_default_value(defaults: &[FieldDefault], field: FieldDefaultTarget) -> Option<&str> {
+    defaults
+        .iter()
+        .find(|default| default.field == field)
+        .map(|default| default.value.as_str())
+}
+
 fn qwen_normalize_record_whitespace(record: &mut QwenSftRecord) {
     record.system = qwen_normalize_whitespace(&record.system);
     record.instruction = qwen_normalize_whitespace(&record.instruction);
@@ -12263,17 +12314,6 @@ fn qwen_render_sft_record_prompt(record: &QwenSftRecord, field_map: &QwenSftFiel
         .replace("{input}", &record.input)
 }
 
-fn qwen_required_jsonl_string_field(
-    values: &BTreeMap<String, serde_json::Value>,
-    field: &str,
-) -> Result<String> {
-    match values.get(field) {
-        Some(serde_json::Value::String(value)) => Ok(value.clone()),
-        Some(_) => bail!("SFT JSONL field {field} must be a string"),
-        None => bail!("SFT JSONL record missing required field {field}"),
-    }
-}
-
 fn qwen_optional_jsonl_string_field(
     values: &BTreeMap<String, serde_json::Value>,
     field: &str,
@@ -12282,6 +12322,23 @@ fn qwen_optional_jsonl_string_field(
         Some(serde_json::Value::String(value)) => Ok(value.clone()),
         Some(_) => bail!("SFT JSONL field {field} must be a string"),
         None => Ok(String::new()),
+    }
+}
+
+fn qwen_defaultable_jsonl_string_field(
+    values: &BTreeMap<String, serde_json::Value>,
+    field: &str,
+    default_value: Option<&str>,
+) -> Result<String> {
+    match values.get(field) {
+        Some(serde_json::Value::String(value)) if value.trim().is_empty() => {
+            Ok(default_value.unwrap_or(value).to_string())
+        }
+        Some(serde_json::Value::String(value)) => Ok(value.clone()),
+        Some(_) => bail!("SFT JSONL field {field} must be a string"),
+        None => default_value
+            .map(|value| value.to_string())
+            .ok_or_else(|| anyhow!("SFT JSONL record missing required field {field}")),
     }
 }
 
@@ -12357,6 +12414,15 @@ fn qwen_sft_hash_field_map(hash: &mut u64, field_map: &QwenSftFieldMap) {
         qwen_sft_hash_bytes(hash, b"normalize_whitespace");
         qwen_sft_hash_bytes(hash, b"true");
         qwen_sft_hash_bytes(hash, b"\0");
+    }
+    if !field_map.field_defaults.is_empty() {
+        qwen_sft_hash_bytes(hash, b"field_defaults");
+        for default in &field_map.field_defaults {
+            qwen_sft_hash_bytes(hash, format!("{:?}", default.field).as_bytes());
+            qwen_sft_hash_bytes(hash, b"\0");
+            qwen_sft_hash_bytes(hash, default.value.as_bytes());
+            qwen_sft_hash_bytes(hash, b"\0");
+        }
     }
     if !field_map.response_contains_any.is_empty() {
         qwen_sft_hash_bytes(hash, b"response_contains_any");
@@ -15078,6 +15144,101 @@ mod tests {
         assert!(cache_hit.cache_hit);
         assert_eq!(cache_hit.index.samples, source_index.samples);
         assert!(default_parse_error.contains("failed to parse SFT JSONL record"));
+        assert!(cache_mismatch.contains("field_map"));
+    }
+
+    #[test]
+    fn qwen_sft_field_defaults_fill_empty_fields_before_filters_and_fingerprint() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let jsonl = temp.path().join("samples.jsonl");
+        let cache_path = temp.path().join("cache").join("offset-index.json");
+        fs::write(
+            &jsonl,
+            r#"{"instruction":"","response":"","input":""}
+{"response":"kept"}
+"#,
+        )
+        .expect("jsonl should write");
+        let paths = vec![jsonl.clone()];
+        let field_map = QwenSftFieldMap {
+            system_contains_any: vec!["assistant".to_string()],
+            instruction_contains_any: vec!["default instruction".to_string()],
+            input_contains_any: vec!["default input".to_string()],
+            response_contains_any: vec!["default response".to_string()],
+            min_response_chars: 10,
+            field_defaults: vec![
+                FieldDefault {
+                    field: FieldDefaultTarget::System,
+                    value: "system assistant".to_string(),
+                },
+                FieldDefault {
+                    field: FieldDefaultTarget::Instruction,
+                    value: "default instruction".to_string(),
+                },
+                FieldDefault {
+                    field: FieldDefaultTarget::Input,
+                    value: "default input".to_string(),
+                },
+                FieldDefault {
+                    field: FieldDefaultTarget::Response,
+                    value: "default response".to_string(),
+                },
+            ],
+            ..QwenSftFieldMap::default()
+        };
+
+        let loaded = qwen_sft_examples_from_jsonl_paths_with_limit(&paths, None, &field_map)
+            .expect("defaulted examples should load");
+        let streamed = qwen_sft_streaming_source_summary(&paths, None, &field_map)
+            .expect("defaulted streaming summary should scan");
+        let source_index = qwen_sft_streaming_source_index(&paths, None, &field_map)
+            .expect("defaulted source index should build");
+        let raw_window = qwen_sft_examples_by_raw_indices(&source_index.samples, &field_map)
+            .expect("defaulted raw window should read");
+        let first_cache =
+            qwen_sft_streaming_source_index_with_cache(&paths, None, Some(&cache_path), &field_map)
+                .expect("defaulted cache should write");
+        let defaults_without_filters = QwenSftFieldMap {
+            system_contains_any: Vec::new(),
+            instruction_contains_any: Vec::new(),
+            input_contains_any: Vec::new(),
+            response_contains_any: Vec::new(),
+            min_response_chars: 1,
+            ..field_map.clone()
+        };
+        let unfiltered_default_fingerprint = qwen_sft_streaming_fingerprint(
+            &paths,
+            None,
+            &loaded.source_files,
+            &defaults_without_filters,
+        )
+        .expect("defaulted field map fingerprint should compute");
+        let changed_defaults = QwenSftFieldMap {
+            field_defaults: vec![FieldDefault {
+                field: FieldDefaultTarget::Instruction,
+                value: "other instruction".to_string(),
+            }],
+            ..field_map.clone()
+        };
+        let cache_mismatch = qwen_sft_streaming_source_index_with_cache(
+            &paths,
+            None,
+            Some(&cache_path),
+            &changed_defaults,
+        )
+        .expect_err("cache should reject changed defaults")
+        .to_string();
+
+        assert_eq!(loaded.examples.len(), 1);
+        assert_eq!(loaded.examples[0].system, "system assistant");
+        assert_eq!(loaded.examples[0].instruction, "default instruction");
+        assert_eq!(loaded.examples[0].input, "default input");
+        assert_eq!(loaded.examples[0].response, "default response");
+        assert_eq!(streamed.samples, loaded.examples.len());
+        assert_eq!(streamed.fingerprint, loaded.fingerprint);
+        assert_eq!(raw_window.examples, loaded.examples);
+        assert!(first_cache.cache_written);
+        assert_ne!(loaded.fingerprint, unfiltered_default_fingerprint);
         assert!(cache_mismatch.contains("field_map"));
     }
 

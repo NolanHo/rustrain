@@ -7,7 +7,9 @@ use std::{
 use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
 
-use crate::runtime::{DataConfig, FieldReplacement, FieldReplacementTarget};
+use crate::runtime::{
+    DataConfig, FieldDefault, FieldDefaultTarget, FieldReplacement, FieldReplacementTarget,
+};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ByteTokenizer {
@@ -68,6 +70,7 @@ struct SftCache {
     input_excludes_any: Vec<String>,
     field_replacements: Vec<FieldReplacement>,
     normalize_whitespace: bool,
+    field_defaults: Vec<FieldDefault>,
     max_eval_samples: Option<usize>,
     system_field: Option<String>,
     chat_messages_field: Option<String>,
@@ -242,6 +245,7 @@ pub fn load_sft_dataset(
         &data.input_excludes_any,
         &data.field_replacements,
         data.normalize_whitespace,
+        &data.field_defaults,
         data.max_eval_samples,
         data.system_field.clone(),
         data.chat_messages_field.clone(),
@@ -484,6 +488,7 @@ fn instruction_record_from_jsonl_line(data: &DataConfig, line: &str) -> Result<I
         serde_json::from_str(line).context("invalid JSON object")?;
     if let Some(messages_field) = &data.chat_messages_field {
         let mut record = instruction_record_from_chat_messages(&values, messages_field, data)?;
+        apply_field_defaults(&mut record, &data.field_defaults);
         apply_field_replacements(&mut record, &data.field_replacements);
         if data.normalize_whitespace {
             normalize_record_whitespace(&mut record);
@@ -491,7 +496,11 @@ fn instruction_record_from_jsonl_line(data: &DataConfig, line: &str) -> Result<I
         return Ok(record);
     }
     let instruction = normalize_jsonl_field(
-        required_jsonl_string_field(&values, &data.instruction_field)?,
+        defaultable_jsonl_string_field(
+            &values,
+            &data.instruction_field,
+            field_default_value(&data.field_defaults, FieldDefaultTarget::Instruction),
+        )?,
         data,
     );
     let system = match &data.system_field {
@@ -503,7 +512,11 @@ fn instruction_record_from_jsonl_line(data: &DataConfig, line: &str) -> Result<I
         data,
     );
     let response = normalize_jsonl_field(
-        required_jsonl_string_field(&values, &data.response_field)?,
+        defaultable_jsonl_string_field(
+            &values,
+            &data.response_field,
+            field_default_value(&data.field_defaults, FieldDefaultTarget::Response),
+        )?,
         data,
     );
     let mut record = InstructionRecord {
@@ -512,6 +525,7 @@ fn instruction_record_from_jsonl_line(data: &DataConfig, line: &str) -> Result<I
         input,
         response,
     };
+    apply_field_defaults(&mut record, &data.field_defaults);
     apply_field_replacements(&mut record, &data.field_replacements);
     if data.normalize_whitespace {
         normalize_record_whitespace(&mut record);
@@ -717,6 +731,33 @@ fn apply_field_replacements(record: &mut InstructionRecord, replacements: &[Fiel
     }
 }
 
+fn apply_field_defaults(record: &mut InstructionRecord, defaults: &[FieldDefault]) {
+    for default in defaults {
+        match default.field {
+            FieldDefaultTarget::System if record.system.trim().is_empty() => {
+                record.system = default.value.clone();
+            }
+            FieldDefaultTarget::Instruction if record.instruction.trim().is_empty() => {
+                record.instruction = default.value.clone();
+            }
+            FieldDefaultTarget::Input if record.input.trim().is_empty() => {
+                record.input = default.value.clone();
+            }
+            FieldDefaultTarget::Response if record.response.trim().is_empty() => {
+                record.response = default.value.clone();
+            }
+            _ => {}
+        }
+    }
+}
+
+fn field_default_value(defaults: &[FieldDefault], field: FieldDefaultTarget) -> Option<&str> {
+    defaults
+        .iter()
+        .find(|default| default.field == field)
+        .map(|default| default.value.as_str())
+}
+
 fn normalize_record_whitespace(record: &mut InstructionRecord) {
     record.system = normalize_whitespace(&record.system);
     record.instruction = normalize_whitespace(&record.instruction);
@@ -728,17 +769,6 @@ fn normalize_whitespace(value: &str) -> String {
     value.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-fn required_jsonl_string_field(
-    values: &BTreeMap<String, serde_json::Value>,
-    field: &str,
-) -> Result<String> {
-    match values.get(field) {
-        Some(serde_json::Value::String(value)) => Ok(value.clone()),
-        Some(_) => Err(anyhow!("JSONL field {field} must be a string")),
-        None => Err(anyhow!("JSONL record missing required field {field}")),
-    }
-}
-
 fn optional_jsonl_string_field(
     values: &BTreeMap<String, serde_json::Value>,
     field: &str,
@@ -747,6 +777,23 @@ fn optional_jsonl_string_field(
         Some(serde_json::Value::String(value)) => Ok(value.clone()),
         Some(_) => Err(anyhow!("JSONL field {field} must be a string")),
         None => Ok(String::new()),
+    }
+}
+
+fn defaultable_jsonl_string_field(
+    values: &BTreeMap<String, serde_json::Value>,
+    field: &str,
+    default_value: Option<&str>,
+) -> Result<String> {
+    match values.get(field) {
+        Some(serde_json::Value::String(value)) if value.trim().is_empty() => {
+            Ok(default_value.unwrap_or(value).to_string())
+        }
+        Some(serde_json::Value::String(value)) => Ok(value.clone()),
+        Some(_) => Err(anyhow!("JSONL field {field} must be a string")),
+        None => default_value
+            .map(|value| value.to_string())
+            .ok_or_else(|| anyhow!("JSONL record missing required field {field}")),
     }
 }
 
@@ -840,6 +887,7 @@ fn write_sft_cache(
     input_excludes_any: &[String],
     field_replacements: &[FieldReplacement],
     normalize_whitespace: bool,
+    field_defaults: &[FieldDefault],
     max_eval_samples: Option<usize>,
     system_field: Option<String>,
     chat_messages_field: Option<String>,
@@ -874,6 +922,7 @@ fn write_sft_cache(
         input_excludes_any: input_excludes_any.to_vec(),
         field_replacements: field_replacements.to_vec(),
         normalize_whitespace,
+        field_defaults: field_defaults.to_vec(),
         max_eval_samples,
         system_field,
         chat_messages_field,
@@ -969,6 +1018,7 @@ mod tests {
             dedupe_samples: false,
             field_replacements: Vec::new(),
             normalize_whitespace: false,
+            field_defaults: Vec::new(),
             source_weights: Vec::new(),
             source_max_samples: Vec::new(),
             skip_invalid_records: false,
@@ -1039,6 +1089,7 @@ mod tests {
             dedupe_samples: false,
             field_replacements: Vec::new(),
             normalize_whitespace: false,
+            field_defaults: Vec::new(),
             source_weights: Vec::new(),
             source_max_samples: Vec::new(),
             skip_invalid_records: false,
@@ -1115,6 +1166,7 @@ mod tests {
             dedupe_samples: false,
             field_replacements: Vec::new(),
             normalize_whitespace: false,
+            field_defaults: Vec::new(),
             source_weights: Vec::new(),
             source_max_samples: Vec::new(),
             skip_invalid_records: false,
@@ -1198,6 +1250,7 @@ mod tests {
             dedupe_samples: false,
             field_replacements: Vec::new(),
             normalize_whitespace: false,
+            field_defaults: Vec::new(),
             source_weights: Vec::new(),
             source_max_samples: Vec::new(),
             skip_invalid_records: false,
@@ -1280,6 +1333,7 @@ mod tests {
             dedupe_samples: false,
             field_replacements: Vec::new(),
             normalize_whitespace: false,
+            field_defaults: Vec::new(),
             source_weights: Vec::new(),
             source_max_samples: Vec::new(),
             skip_invalid_records: false,
@@ -1352,6 +1406,7 @@ mod tests {
             dedupe_samples: false,
             field_replacements: Vec::new(),
             normalize_whitespace: false,
+            field_defaults: Vec::new(),
             source_weights: Vec::new(),
             source_max_samples: Vec::new(),
             skip_invalid_records: false,
@@ -1426,6 +1481,7 @@ mod tests {
             dedupe_samples: false,
             field_replacements: Vec::new(),
             normalize_whitespace: false,
+            field_defaults: Vec::new(),
             source_weights: Vec::new(),
             source_max_samples: Vec::new(),
             skip_invalid_records: false,
@@ -1503,6 +1559,7 @@ mod tests {
             dedupe_samples: false,
             field_replacements: Vec::new(),
             normalize_whitespace: false,
+            field_defaults: Vec::new(),
             source_weights: Vec::new(),
             source_max_samples: Vec::new(),
             skip_invalid_records: false,
@@ -1574,6 +1631,7 @@ mod tests {
             dedupe_samples: false,
             field_replacements: Vec::new(),
             normalize_whitespace: false,
+            field_defaults: Vec::new(),
             source_weights: Vec::new(),
             source_max_samples: Vec::new(),
             skip_invalid_records: false,
@@ -1678,6 +1736,7 @@ mod tests {
             dedupe_samples: false,
             field_replacements: Vec::new(),
             normalize_whitespace: false,
+            field_defaults: Vec::new(),
             source_weights: Vec::new(),
             source_max_samples: Vec::new(),
             skip_invalid_records: false,
@@ -1751,6 +1810,7 @@ mod tests {
             dedupe_samples: false,
             field_replacements: Vec::new(),
             normalize_whitespace: false,
+            field_defaults: Vec::new(),
             source_weights: Vec::new(),
             source_max_samples: Vec::new(),
             skip_invalid_records: false,
@@ -1825,6 +1885,7 @@ mod tests {
             dedupe_samples: false,
             field_replacements: Vec::new(),
             normalize_whitespace: false,
+            field_defaults: Vec::new(),
             source_weights: Vec::new(),
             source_max_samples: Vec::new(),
             skip_invalid_records: false,
@@ -1900,6 +1961,7 @@ mod tests {
             dedupe_samples: false,
             field_replacements: Vec::new(),
             normalize_whitespace: false,
+            field_defaults: Vec::new(),
             source_weights: Vec::new(),
             source_max_samples: Vec::new(),
             skip_invalid_records: false,
@@ -1976,6 +2038,7 @@ mod tests {
             dedupe_samples: false,
             field_replacements: Vec::new(),
             normalize_whitespace: false,
+            field_defaults: Vec::new(),
             source_weights: Vec::new(),
             source_max_samples: Vec::new(),
             skip_invalid_records: false,
@@ -2053,6 +2116,7 @@ mod tests {
             dedupe_samples: false,
             field_replacements: Vec::new(),
             normalize_whitespace: false,
+            field_defaults: Vec::new(),
             source_weights: Vec::new(),
             source_max_samples: Vec::new(),
             skip_invalid_records: false,
@@ -2130,6 +2194,7 @@ mod tests {
             dedupe_samples: false,
             field_replacements: Vec::new(),
             normalize_whitespace: false,
+            field_defaults: Vec::new(),
             source_weights: Vec::new(),
             source_max_samples: Vec::new(),
             skip_invalid_records: false,
@@ -2207,6 +2272,7 @@ mod tests {
             dedupe_samples: false,
             field_replacements: Vec::new(),
             normalize_whitespace: false,
+            field_defaults: Vec::new(),
             source_weights: Vec::new(),
             source_max_samples: Vec::new(),
             skip_invalid_records: false,
@@ -2282,6 +2348,7 @@ mod tests {
             dedupe_samples: false,
             field_replacements: Vec::new(),
             normalize_whitespace: false,
+            field_defaults: Vec::new(),
             source_weights: Vec::new(),
             source_max_samples: Vec::new(),
             skip_invalid_records: false,
@@ -2359,6 +2426,7 @@ mod tests {
             dedupe_samples: false,
             field_replacements: Vec::new(),
             normalize_whitespace: false,
+            field_defaults: Vec::new(),
             source_weights: Vec::new(),
             source_max_samples: Vec::new(),
             skip_invalid_records: false,
@@ -2438,6 +2506,7 @@ mod tests {
             dedupe_samples: false,
             field_replacements: Vec::new(),
             normalize_whitespace: false,
+            field_defaults: Vec::new(),
             source_weights: Vec::new(),
             source_max_samples: Vec::new(),
             skip_invalid_records: false,
@@ -2519,6 +2588,7 @@ mod tests {
             dedupe_samples: false,
             field_replacements: Vec::new(),
             normalize_whitespace: false,
+            field_defaults: Vec::new(),
             source_weights: Vec::new(),
             source_max_samples: Vec::new(),
             skip_invalid_records: false,
@@ -2599,6 +2669,7 @@ mod tests {
             dedupe_samples: false,
             field_replacements: Vec::new(),
             normalize_whitespace: false,
+            field_defaults: Vec::new(),
             source_weights: Vec::new(),
             source_max_samples: Vec::new(),
             skip_invalid_records: false,
@@ -2676,6 +2747,7 @@ mod tests {
             dedupe_samples: false,
             field_replacements: Vec::new(),
             normalize_whitespace: false,
+            field_defaults: Vec::new(),
             source_weights: Vec::new(),
             source_max_samples: Vec::new(),
             skip_invalid_records: false,
@@ -2762,6 +2834,7 @@ mod tests {
             dedupe_samples: false,
             field_replacements: Vec::new(),
             normalize_whitespace: false,
+            field_defaults: Vec::new(),
             source_weights: vec![2, 2],
             source_max_samples: Vec::new(),
             skip_invalid_records: false,
@@ -2843,6 +2916,7 @@ mod tests {
             dedupe_samples: false,
             field_replacements: Vec::new(),
             normalize_whitespace: false,
+            field_defaults: Vec::new(),
             source_weights: vec![2, 2],
             source_max_samples: vec![1, 2],
             skip_invalid_records: false,
@@ -2920,6 +2994,7 @@ mod tests {
             dedupe_samples: true,
             field_replacements: Vec::new(),
             normalize_whitespace: false,
+            field_defaults: Vec::new(),
             source_weights: Vec::new(),
             source_max_samples: Vec::new(),
             skip_invalid_records: false,
@@ -2995,6 +3070,7 @@ mod tests {
             dedupe_samples: false,
             field_replacements: Vec::new(),
             normalize_whitespace: false,
+            field_defaults: Vec::new(),
             source_weights: Vec::new(),
             source_max_samples: Vec::new(),
             skip_invalid_records: false,
@@ -3077,6 +3153,7 @@ mod tests {
             dedupe_samples: false,
             field_replacements: Vec::new(),
             normalize_whitespace: false,
+            field_defaults: Vec::new(),
             source_weights: Vec::new(),
             source_max_samples: Vec::new(),
             skip_invalid_records: true,
@@ -3170,6 +3247,7 @@ mod tests {
                 },
             ],
             normalize_whitespace: false,
+            field_defaults: Vec::new(),
             source_weights: Vec::new(),
             source_max_samples: Vec::new(),
             skip_invalid_records: false,
@@ -3193,6 +3271,105 @@ mod tests {
         assert!(!decoded.contains("PROJECT_TOKEN"));
         assert!(cache_text.contains("field_replacements"));
         assert!(cache_text.contains("PROJECT_TOKEN"));
+    }
+
+    #[test]
+    fn sft_dataset_applies_field_defaults_before_filters_and_cache() {
+        let dir = tempdir().expect("temp dir should be created");
+        let data_dir = dir.path().join("sft");
+        let cache_dir = dir.path().join("cache");
+        fs::create_dir_all(&data_dir).expect("sft dir should be created");
+        fs::create_dir_all(&cache_dir).expect("cache dir should be created");
+        fs::write(
+            data_dir.join("sample.jsonl"),
+            "{\"instruction\":\"\",\"response\":\"\",\"input\":\"\"}\n{\"response\":\"\",\"input\":\"\"}\n{\"response\":\"kept\"}\n",
+        )
+        .expect("jsonl should write");
+
+        let data = DataConfig {
+            kind: DataKind::InstructionJsonl,
+            paths: vec![data_dir],
+            eval_paths: Vec::new(),
+            train_split: 0.5,
+            max_samples: None,
+            max_eval_samples: None,
+            shuffle: false,
+            index_cache: None,
+            instruction_field: "instruction".to_string(),
+            input_field: "input".to_string(),
+            response_field: "response".to_string(),
+            system_field: None,
+            chat_messages_field: None,
+            min_system_chars: None,
+            max_system_chars: None,
+            system_contains_any: vec!["assistant".to_string()],
+            system_excludes_any: Vec::new(),
+            prompt_template: "System: {system}\nQ: {instruction}\nA: ".to_string(),
+            prompt_with_input_template: "System: {system}\nQ: {instruction}\nI: {input}\nA: "
+                .to_string(),
+            trim_fields: true,
+            min_response_chars: 10,
+            max_response_chars: None,
+            instruction_contains_any: vec!["default instruction".to_string()],
+            instruction_excludes_any: Vec::new(),
+            response_contains_any: vec!["default response".to_string()],
+            response_excludes_any: Vec::new(),
+            input_contains_any: vec!["default input".to_string()],
+            input_excludes_any: Vec::new(),
+            min_instruction_chars: None,
+            max_instruction_chars: None,
+            min_input_chars: None,
+            max_input_chars: None,
+            min_prompt_chars: None,
+            max_prompt_chars: None,
+            min_sample_chars: None,
+            max_sample_chars: None,
+            dedupe_samples: false,
+            field_replacements: Vec::new(),
+            normalize_whitespace: false,
+            field_defaults: vec![
+                FieldDefault {
+                    field: FieldDefaultTarget::System,
+                    value: "system assistant".to_string(),
+                },
+                FieldDefault {
+                    field: FieldDefaultTarget::Instruction,
+                    value: "default instruction".to_string(),
+                },
+                FieldDefault {
+                    field: FieldDefaultTarget::Input,
+                    value: "default input".to_string(),
+                },
+                FieldDefault {
+                    field: FieldDefaultTarget::Response,
+                    value: "default response".to_string(),
+                },
+            ],
+            source_weights: Vec::new(),
+            source_max_samples: Vec::new(),
+            skip_invalid_records: false,
+        };
+        let dataset =
+            load_sft_dataset(&data, 128, 96, &cache_dir).expect("SFT dataset should load");
+        let decoded = dataset
+            .train_samples
+            .iter()
+            .chain(dataset.eval_samples.iter())
+            .map(|sample| dataset.tokenizer.decode_lossy(&sample.tokens))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let cache_text =
+            fs::read_to_string(cache_dir.join("sft_tokenized.toml")).expect("cache should read");
+
+        assert_eq!(dataset.train_samples.len(), 1);
+        assert_eq!(dataset.eval_samples.len(), 1);
+        assert!(decoded.contains("System: system assistant"));
+        assert!(decoded.contains("Q: default instruction"));
+        assert!(decoded.contains("I: default input"));
+        assert!(decoded.contains("default response"));
+        assert!(!decoded.contains("kept"));
+        assert!(cache_text.contains("field_defaults"));
+        assert!(cache_text.contains("default instruction"));
     }
 
     #[test]
@@ -3253,6 +3430,7 @@ mod tests {
                 replacement: "rust   train".to_string(),
             }],
             normalize_whitespace: true,
+            field_defaults: Vec::new(),
             source_weights: Vec::new(),
             source_max_samples: Vec::new(),
             skip_invalid_records: false,
@@ -3333,6 +3511,7 @@ mod tests {
             dedupe_samples: false,
             field_replacements: Vec::new(),
             normalize_whitespace: false,
+            field_defaults: Vec::new(),
             source_weights: Vec::new(),
             source_max_samples: Vec::new(),
             skip_invalid_records: false,
