@@ -71,6 +71,7 @@ struct SftCache {
     min_system_chars: Option<usize>,
     max_system_chars: Option<usize>,
     system_contains_any: Vec<String>,
+    system_excludes_any: Vec<String>,
     min_instruction_chars: Option<usize>,
     max_instruction_chars: Option<usize>,
     min_input_chars: Option<usize>,
@@ -241,6 +242,7 @@ pub fn load_sft_dataset(
         data.min_system_chars,
         data.max_system_chars,
         &data.system_contains_any,
+        &data.system_excludes_any,
         data.min_instruction_chars,
         data.max_instruction_chars,
         data.min_input_chars,
@@ -554,6 +556,7 @@ fn sft_record_passes_filters(data: &DataConfig, record: &InstructionRecord) -> R
         && string_contains_any_filter_passes(&record.input, &data.input_contains_any)
         && string_excludes_any_filter_passes(&record.input, &data.input_excludes_any)
         && string_contains_any_filter_passes(&record.system, &data.system_contains_any)
+        && string_excludes_any_filter_passes(&record.system, &data.system_excludes_any)
         && length_filter_passes(
             record.instruction.chars().count(),
             data.min_instruction_chars,
@@ -697,6 +700,7 @@ fn write_sft_cache(
     min_system_chars: Option<usize>,
     max_system_chars: Option<usize>,
     system_contains_any: &[String],
+    system_excludes_any: &[String],
     min_instruction_chars: Option<usize>,
     max_instruction_chars: Option<usize>,
     min_input_chars: Option<usize>,
@@ -727,6 +731,7 @@ fn write_sft_cache(
         min_system_chars,
         max_system_chars,
         system_contains_any: system_contains_any.to_vec(),
+        system_excludes_any: system_excludes_any.to_vec(),
         min_instruction_chars,
         max_instruction_chars,
         min_input_chars,
@@ -790,6 +795,7 @@ mod tests {
             min_system_chars: None,
             max_system_chars: None,
             system_contains_any: Vec::new(),
+            system_excludes_any: Vec::new(),
             prompt_template: "Instruction:\n{instruction}\n\nResponse:\n".to_string(),
             prompt_with_input_template:
                 "Instruction:\n{instruction}\n\nInput:\n{input}\n\nResponse:\n".to_string(),
@@ -856,6 +862,7 @@ mod tests {
             min_system_chars: None,
             max_system_chars: None,
             system_contains_any: Vec::new(),
+            system_excludes_any: Vec::new(),
             prompt_template: "Instruction:\n{instruction}\n\nResponse:\n".to_string(),
             prompt_with_input_template:
                 "Instruction:\n{instruction}\n\nInput:\n{input}\n\nResponse:\n".to_string(),
@@ -928,6 +935,7 @@ mod tests {
             min_system_chars: None,
             max_system_chars: None,
             system_contains_any: Vec::new(),
+            system_excludes_any: Vec::new(),
             prompt_template: "Instruction:\n{instruction}\n\nResponse:\n".to_string(),
             prompt_with_input_template:
                 "Instruction:\n{instruction}\n\nInput:\n{input}\n\nResponse:\n".to_string(),
@@ -1008,6 +1016,7 @@ mod tests {
             min_system_chars: None,
             max_system_chars: None,
             system_contains_any: Vec::new(),
+            system_excludes_any: Vec::new(),
             prompt_template: "Q: {instruction}\nA: ".to_string(),
             prompt_with_input_template: "Q: {instruction}\nContext: {input}\nA: ".to_string(),
             trim_fields: true,
@@ -1085,6 +1094,7 @@ mod tests {
             min_system_chars: None,
             max_system_chars: None,
             system_contains_any: Vec::new(),
+            system_excludes_any: Vec::new(),
             prompt_template: "System: {system}\nQ: {instruction}\nA: ".to_string(),
             prompt_with_input_template: "System: {system}\nQ: {instruction}\nI: {input}\nA: "
                 .to_string(),
@@ -1153,6 +1163,7 @@ mod tests {
             min_system_chars: Some(4),
             max_system_chars: Some(8),
             system_contains_any: Vec::new(),
+            system_excludes_any: Vec::new(),
             prompt_template: "System: {system}\nQ: {instruction}\nA: ".to_string(),
             prompt_with_input_template: "System: {system}\nQ: {instruction}\nI: {input}\nA: "
                 .to_string(),
@@ -1223,6 +1234,7 @@ mod tests {
             min_system_chars: None,
             max_system_chars: None,
             system_contains_any: vec!["keep".to_string(), "selected".to_string()],
+            system_excludes_any: Vec::new(),
             prompt_template: "System: {system}\nQ: {instruction}\nA: ".to_string(),
             prompt_with_input_template: "System: {system}\nQ: {instruction}\nI: {input}\nA: "
                 .to_string(),
@@ -1268,6 +1280,80 @@ mod tests {
     }
 
     #[test]
+    fn sft_dataset_filters_systems_by_exclude_substring_before_split_and_limit() {
+        let dir = tempdir().expect("temp dir should be created");
+        let data_dir = dir.path().join("sft");
+        let cache_dir = dir.path().join("cache");
+        fs::create_dir_all(&data_dir).expect("sft dir should be created");
+        fs::create_dir_all(&cache_dir).expect("cache dir should be created");
+        fs::write(
+            data_dir.join("sample.jsonl"),
+            "{\"system\":\"keep system\",\"instruction\":\"first\",\"response\":\"answer one\"}\n{\"system\":\"banned system\",\"instruction\":\"skip\",\"response\":\"answer skip\"}\n{\"system\":\"selected system\",\"instruction\":\"second\",\"response\":\"answer two\"}\n{\"system\":\"keep extra\",\"instruction\":\"third\",\"response\":\"answer three\"}\n",
+        )
+        .expect("jsonl should write");
+
+        let data = DataConfig {
+            kind: DataKind::InstructionJsonl,
+            paths: vec![data_dir],
+            eval_paths: Vec::new(),
+            train_split: 0.67,
+            max_samples: Some(3),
+            max_eval_samples: None,
+            shuffle: false,
+            index_cache: None,
+            instruction_field: "instruction".to_string(),
+            input_field: "input".to_string(),
+            response_field: "response".to_string(),
+            system_field: Some("system".to_string()),
+            min_system_chars: None,
+            max_system_chars: None,
+            system_contains_any: Vec::new(),
+            system_excludes_any: vec!["banned".to_string()],
+            prompt_template: "System: {system}\nQ: {instruction}\nA: ".to_string(),
+            prompt_with_input_template: "System: {system}\nQ: {instruction}\nI: {input}\nA: "
+                .to_string(),
+            trim_fields: true,
+            min_response_chars: 1,
+            max_response_chars: None,
+            instruction_contains_any: Vec::new(),
+            instruction_excludes_any: Vec::new(),
+            response_contains_any: Vec::new(),
+            response_excludes_any: Vec::new(),
+            input_contains_any: Vec::new(),
+            input_excludes_any: Vec::new(),
+            min_instruction_chars: None,
+            max_instruction_chars: None,
+            min_input_chars: None,
+            max_input_chars: None,
+            min_prompt_chars: None,
+            max_prompt_chars: None,
+            min_sample_chars: None,
+            max_sample_chars: None,
+            dedupe_samples: false,
+            source_weights: Vec::new(),
+            source_max_samples: Vec::new(),
+            skip_invalid_records: false,
+        };
+        let dataset =
+            load_sft_dataset(&data, 128, 96, &cache_dir).expect("SFT dataset should load");
+        let decoded = dataset
+            .train_samples
+            .iter()
+            .chain(dataset.eval_samples.iter())
+            .map(|sample| dataset.tokenizer.decode_lossy(&sample.tokens))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert_eq!(dataset.train_samples.len(), 2);
+        assert_eq!(dataset.eval_samples.len(), 1);
+        assert!(decoded.contains("System: keep system"));
+        assert!(decoded.contains("System: selected system"));
+        assert!(decoded.contains("System: keep extra"));
+        assert!(!decoded.contains("banned system"));
+        assert!(!decoded.contains("answer skip"));
+    }
+
+    #[test]
     fn sft_dataset_trim_fields_controls_prompt_normalization() {
         let record = InstructionRecord {
             system: "  stay brief  ".to_string(),
@@ -1291,6 +1377,7 @@ mod tests {
             min_system_chars: None,
             max_system_chars: None,
             system_contains_any: Vec::new(),
+            system_excludes_any: Vec::new(),
             prompt_template: "Q:{instruction}\nA:".to_string(),
             prompt_with_input_template: "Q:{instruction}\nI:{input}\nA:".to_string(),
             trim_fields: true,
@@ -1390,6 +1477,7 @@ mod tests {
             min_system_chars: None,
             max_system_chars: None,
             system_contains_any: Vec::new(),
+            system_excludes_any: Vec::new(),
             prompt_template: "Instruction:\n{instruction}\n\nResponse:\n".to_string(),
             prompt_with_input_template:
                 "Instruction:\n{instruction}\n\nInput:\n{input}\n\nResponse:\n".to_string(),
@@ -1459,6 +1547,7 @@ mod tests {
             min_system_chars: None,
             max_system_chars: None,
             system_contains_any: Vec::new(),
+            system_excludes_any: Vec::new(),
             prompt_template: "Instruction:\n{instruction}\n\nResponse:\n".to_string(),
             prompt_with_input_template:
                 "Instruction:\n{instruction}\n\nInput:\n{input}\n\nResponse:\n".to_string(),
@@ -1529,6 +1618,7 @@ mod tests {
             min_system_chars: None,
             max_system_chars: None,
             system_contains_any: Vec::new(),
+            system_excludes_any: Vec::new(),
             prompt_template: "Instruction:\n{instruction}\n\nResponse:\n".to_string(),
             prompt_with_input_template:
                 "Instruction:\n{instruction}\n\nInput:\n{input}\n\nResponse:\n".to_string(),
@@ -1600,6 +1690,7 @@ mod tests {
             min_system_chars: None,
             max_system_chars: None,
             system_contains_any: Vec::new(),
+            system_excludes_any: Vec::new(),
             prompt_template: "Instruction:\n{instruction}\n\nResponse:\n".to_string(),
             prompt_with_input_template:
                 "Instruction:\n{instruction}\n\nInput:\n{input}\n\nResponse:\n".to_string(),
@@ -1672,6 +1763,7 @@ mod tests {
             min_system_chars: None,
             max_system_chars: None,
             system_contains_any: Vec::new(),
+            system_excludes_any: Vec::new(),
             prompt_template: "Instruction:\n{instruction}\n\nResponse:\n".to_string(),
             prompt_with_input_template:
                 "Instruction:\n{instruction}\n\nInput:\n{input}\n\nResponse:\n".to_string(),
@@ -1745,6 +1837,7 @@ mod tests {
             min_system_chars: None,
             max_system_chars: None,
             system_contains_any: Vec::new(),
+            system_excludes_any: Vec::new(),
             prompt_template: "Instruction:\n{instruction}\n\nResponse:\n".to_string(),
             prompt_with_input_template:
                 "Instruction:\n{instruction}\n\nInput:\n{input}\n\nResponse:\n".to_string(),
@@ -1818,6 +1911,7 @@ mod tests {
             min_system_chars: None,
             max_system_chars: None,
             system_contains_any: Vec::new(),
+            system_excludes_any: Vec::new(),
             prompt_template: "Instruction:\n{instruction}\n\nResponse:\n".to_string(),
             prompt_with_input_template:
                 "Instruction:\n{instruction}\n\nInput:\n{input}\n\nResponse:\n".to_string(),
@@ -1891,6 +1985,7 @@ mod tests {
             min_system_chars: None,
             max_system_chars: None,
             system_contains_any: Vec::new(),
+            system_excludes_any: Vec::new(),
             prompt_template: "Instruction:\n{instruction}\n\nResponse:\n".to_string(),
             prompt_with_input_template:
                 "Instruction:\n{instruction}\n\nInput:\n{input}\n\nResponse:\n".to_string(),
@@ -1962,6 +2057,7 @@ mod tests {
             min_system_chars: None,
             max_system_chars: None,
             system_contains_any: Vec::new(),
+            system_excludes_any: Vec::new(),
             prompt_template: "Instruction:\n{instruction}\n\nResponse:\n".to_string(),
             prompt_with_input_template:
                 "Instruction:\n{instruction}\n\nInput:\n{input}\n\nResponse:\n".to_string(),
@@ -2035,6 +2131,7 @@ mod tests {
             min_system_chars: None,
             max_system_chars: None,
             system_contains_any: Vec::new(),
+            system_excludes_any: Vec::new(),
             prompt_template: "Instruction:\n{instruction}\n\nResponse:\n".to_string(),
             prompt_with_input_template:
                 "Instruction:\n{instruction}\n\nInput:\n{input}\n\nResponse:\n".to_string(),
@@ -2110,6 +2207,7 @@ mod tests {
             min_system_chars: None,
             max_system_chars: None,
             system_contains_any: Vec::new(),
+            system_excludes_any: Vec::new(),
             prompt_template: "Instruction:\n{instruction}\n\nResponse:\n".to_string(),
             prompt_with_input_template:
                 "Instruction:\n{instruction}\n\nInput:\n{input}\n\nResponse:\n".to_string(),
@@ -2187,6 +2285,7 @@ mod tests {
             min_system_chars: None,
             max_system_chars: None,
             system_contains_any: Vec::new(),
+            system_excludes_any: Vec::new(),
             prompt_template: "Instruction:\n{instruction}\n\nResponse:\n".to_string(),
             prompt_with_input_template:
                 "Instruction:\n{instruction}\n\nInput:\n{input}\n\nResponse:\n".to_string(),
@@ -2264,6 +2363,7 @@ mod tests {
             min_system_chars: None,
             max_system_chars: None,
             system_contains_any: Vec::new(),
+            system_excludes_any: Vec::new(),
             prompt_template: "Q:{instruction}\nA:".to_string(),
             prompt_with_input_template: "Q:{instruction}\nI:{input}\nA:".to_string(),
             trim_fields: true,
@@ -2337,6 +2437,7 @@ mod tests {
             min_system_chars: None,
             max_system_chars: None,
             system_contains_any: Vec::new(),
+            system_excludes_any: Vec::new(),
             prompt_template: "Q:{instruction}\nA:".to_string(),
             prompt_with_input_template: "Q:{instruction}\nI:{input}\nA:".to_string(),
             trim_fields: true,
@@ -2418,6 +2519,7 @@ mod tests {
             min_system_chars: None,
             max_system_chars: None,
             system_contains_any: Vec::new(),
+            system_excludes_any: Vec::new(),
             prompt_template: "Instruction:\n{instruction}\n\nResponse:\n".to_string(),
             prompt_with_input_template:
                 "Instruction:\n{instruction}\n\nInput:\n{input}\n\nResponse:\n".to_string(),
@@ -2495,6 +2597,7 @@ mod tests {
             min_system_chars: None,
             max_system_chars: None,
             system_contains_any: Vec::new(),
+            system_excludes_any: Vec::new(),
             prompt_template: "Instruction:\n{instruction}\n\nResponse:\n".to_string(),
             prompt_with_input_template:
                 "Instruction:\n{instruction}\n\nInput:\n{input}\n\nResponse:\n".to_string(),
@@ -2568,6 +2671,7 @@ mod tests {
             min_system_chars: None,
             max_system_chars: None,
             system_contains_any: Vec::new(),
+            system_excludes_any: Vec::new(),
             prompt_template: "Instruction:\n{instruction}\n\nResponse:\n".to_string(),
             prompt_with_input_template:
                 "Instruction:\n{instruction}\n\nInput:\n{input}\n\nResponse:\n".to_string(),
@@ -2639,6 +2743,7 @@ mod tests {
             min_system_chars: None,
             max_system_chars: None,
             system_contains_any: Vec::new(),
+            system_excludes_any: Vec::new(),
             prompt_template: "Instruction:\n{instruction}\n\nResponse:\n".to_string(),
             prompt_with_input_template:
                 "Instruction:\n{instruction}\n\nInput:\n{input}\n\nResponse:\n".to_string(),
@@ -2718,6 +2823,7 @@ mod tests {
             min_system_chars: None,
             max_system_chars: None,
             system_contains_any: Vec::new(),
+            system_excludes_any: Vec::new(),
             prompt_template: "Instruction:\n{instruction}\n\nResponse:\n".to_string(),
             prompt_with_input_template:
                 "Instruction:\n{instruction}\n\nInput:\n{input}\n\nResponse:\n".to_string(),

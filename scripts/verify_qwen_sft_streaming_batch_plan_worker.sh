@@ -220,6 +220,7 @@ expected_field_map = {
     "min_system_chars": None,
     "max_system_chars": None,
     "system_contains_any": [],
+    "system_excludes_any": [],
     "min_prompt_chars": None,
     "max_prompt_chars": None,
     "min_sample_chars": None,

@@ -106,6 +106,8 @@ pub struct DataConfig {
     pub max_system_chars: Option<usize>,
     #[serde(default)]
     pub system_contains_any: Vec<String>,
+    #[serde(default)]
+    pub system_excludes_any: Vec<String>,
     #[serde(default = "default_prompt_template")]
     pub prompt_template: String,
     #[serde(default = "default_prompt_with_input_template")]
@@ -549,6 +551,11 @@ pub fn validate_config(config: &Config) -> Result<()> {
                 "data.system_contains_any requires data.system_field to be set"
             ));
         }
+        if !data.system_excludes_any.is_empty() && data.system_field.is_none() {
+            return Err(anyhow!(
+                "data.system_excludes_any requires data.system_field to be set"
+            ));
+        }
         if data
             .system_contains_any
             .iter()
@@ -556,6 +563,15 @@ pub fn validate_config(config: &Config) -> Result<()> {
         {
             return Err(anyhow!(
                 "data.system_contains_any entries must not be empty"
+            ));
+        }
+        if data
+            .system_excludes_any
+            .iter()
+            .any(|needle| needle.is_empty())
+        {
+            return Err(anyhow!(
+                "data.system_excludes_any entries must not be empty"
             ));
         }
         if let Some(min_instruction_chars) = data.min_instruction_chars {
@@ -863,6 +879,7 @@ mod tests {
                 min_system_chars: None,
                 max_system_chars: None,
                 system_contains_any: Vec::new(),
+                system_excludes_any: Vec::new(),
                 prompt_template: default_prompt_template(),
                 prompt_with_input_template: default_prompt_with_input_template(),
                 trim_fields: default_trim_fields(),
