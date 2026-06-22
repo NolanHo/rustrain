@@ -32,6 +32,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--input", type=Path, default=DEFAULT_ARROW)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--limit", type=positive_int, default=128)
+    parser.add_argument("--shards", type=positive_int, default=1)
     parser.add_argument("--instruction-column", default="instruction")
     parser.add_argument("--input-column", default="input")
     parser.add_argument("--response-column", default="output")
@@ -57,16 +58,34 @@ def main() -> None:
         raise SystemExit(f"{args.input} is missing required columns: {missing}")
     if table.num_rows < args.limit:
         raise SystemExit(f"{args.input} has {table.num_rows} rows, below limit {args.limit}")
+    if args.shards > args.limit:
+        raise SystemExit(f"--shards {args.shards} cannot exceed --limit {args.limit}")
 
-    args.output.parent.mkdir(parents=True, exist_ok=True)
-    with args.output.open("w", encoding="utf-8") as handle:
-        for index in range(args.limit):
-            record = {
+    rows = []
+    for index in range(args.limit):
+        rows.append(
+            {
                 "instruction": table.column(args.instruction_column)[index].as_py(),
                 "input": table.column(args.input_column)[index].as_py(),
                 "response": table.column(args.response_column)[index].as_py(),
             }
-            handle.write(json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n")
+        )
+
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+    output_files = []
+    if args.shards == 1:
+        output_files.append({"path": str(args.output), "rows": len(rows)})
+        write_jsonl(args.output, rows)
+    else:
+        for shard_index in range(args.shards):
+            start = shard_index * len(rows) // args.shards
+            end = (shard_index + 1) * len(rows) // args.shards
+            shard_path = args.output.with_name(
+                f"{args.output.stem}_{shard_index}{args.output.suffix}"
+            )
+            shard_rows = rows[start:end]
+            output_files.append({"path": str(shard_path), "rows": len(shard_rows)})
+            write_jsonl(shard_path, shard_rows)
 
     metadata = {
         "source_arrow": str(args.input),
@@ -75,6 +94,8 @@ def main() -> None:
         "columns": table.schema.names,
         "column_map": column_map,
         "output": str(args.output),
+        "shards": args.shards,
+        "output_files": output_files,
     }
     if args.metadata_output:
         args.metadata_output.parent.mkdir(parents=True, exist_ok=True)
@@ -84,8 +105,15 @@ def main() -> None:
 
     print(
         "exported instruction JSONL: "
-        f"source_rows={table.num_rows} exported_rows={args.limit} output={args.output}"
+        f"source_rows={table.num_rows} exported_rows={args.limit} "
+        f"shards={args.shards} output={args.output}"
     )
+
+
+def write_jsonl(path: Path, rows: list[dict[str, object]]) -> None:
+    with path.open("w", encoding="utf-8") as handle:
+        for record in rows:
+            handle.write(json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n")
 
 
 if __name__ == "__main__":

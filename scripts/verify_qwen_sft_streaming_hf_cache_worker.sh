@@ -15,26 +15,9 @@ python scripts/export_instruction_arrow_jsonl.py \
   --input "${HF_ARROW}" \
   --output "${DATA_DIR}/alpaca.jsonl" \
   --limit 128 \
+  --shards 2 \
   --response-column output \
   --metadata-output "${DATA_DIR}/export_metadata.json"
-
-python - "${DATA_DIR}/alpaca.jsonl" "${DATA_DIR}" <<'PY'
-import pathlib
-import sys
-
-source = pathlib.Path(sys.argv[1])
-data_dir = pathlib.Path(sys.argv[2])
-lines = source.read_text(encoding="utf-8").splitlines()
-if len(lines) != 128:
-    raise SystemExit(f"expected 128 exported rows, got {len(lines)}")
-
-for shard_index in range(2):
-    path = data_dir / f"alpaca_shard_{shard_index}.jsonl"
-    path.write_text(
-        "\n".join(lines[shard_index * 64 : (shard_index + 1) * 64]) + "\n",
-        encoding="utf-8",
-    )
-PY
 
 CONFIG="${WORK_DIR}/hf-cache.toml"
 cat >"${CONFIG}" <<EOF
@@ -78,8 +61,8 @@ checkpoint_every = 0
 [data]
 kind = "instruction_jsonl"
 paths = [
-  "${DATA_DIR}/alpaca_shard_0.jsonl",
-  "${DATA_DIR}/alpaca_shard_1.jsonl",
+  "${DATA_DIR}/alpaca_0.jsonl",
+  "${DATA_DIR}/alpaca_1.jsonl",
 ]
 train_split = 0.75
 shuffle = false
@@ -161,8 +144,9 @@ cache_first = load_json(cache_first_output)
 cache_second = load_json(cache_second_output)
 metadata = json.loads((data_dir / "export_metadata.json").read_text(encoding="utf-8"))
 
-source_files = [str(data_dir / f"alpaca_shard_{index}.jsonl") for index in range(2)]
+source_files = [str(data_dir / f"alpaca_{index}.jsonl") for index in range(2)]
 source_counts = [{"path": path, "samples": 64} for path in source_files]
+export_outputs = [{"path": path, "rows": 64} for path in source_files]
 
 if pathlib.Path(metadata["source_arrow"]) != hf_arrow:
     raise SystemExit(f"metadata source_arrow {metadata['source_arrow']} != {hf_arrow}")
@@ -173,6 +157,10 @@ for column in ["instruction", "input", "output"]:
         raise SystemExit(f"HF export metadata missing column {column}: {metadata}")
 if metadata.get("column_map", {}).get("response") != "output":
     raise SystemExit(f"HF export metadata did not record output response source: {metadata}")
+if metadata.get("shards") != 2:
+    raise SystemExit(f"HF export metadata did not record two shards: {metadata}")
+if metadata.get("output_files") != export_outputs:
+    raise SystemExit(f"HF export metadata output_files {metadata.get('output_files')} != {export_outputs}")
 
 expected_window = [
     {
