@@ -115,6 +115,9 @@ Acceptance:
   manifest and the current train dtype. Direct `.safetensors` adapter resume
   without manifest metadata remains a compatibility path and cannot enforce
   this dtype identity check.
+- Direct `.safetensors` adapter resume restores adapter weights but does not
+  claim manifest cursor continuity; the run starts from the configured data
+  cursor origin and writes a fresh adapter manifest.
 - Resume starts from manifest `data_cursor_next`, advances by
   `steps * global_batch_size`, and preserves cursor/epoch/offset consistency.
 - Adapter reload preserves SFT train/eval loss, full-Qwen forward logits, and
