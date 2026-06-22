@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     fs,
     path::{Path, PathBuf},
 };
@@ -36,10 +36,9 @@ pub struct SftSample {
     pub target_mask: Vec<bool>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone)]
 struct InstructionRecord {
     instruction: String,
-    #[serde(default)]
     input: String,
     response: String,
 }
@@ -153,7 +152,7 @@ pub fn load_sft_dataset(
     cache_dir: &Path,
 ) -> Result<SftDataset> {
     let tokenizer = ByteTokenizer::new(vocab_size);
-    let (mut samples, mut source_paths) = read_sft_paths(&data.paths, &tokenizer, seq_len)?;
+    let (mut samples, mut source_paths) = read_sft_paths(data, &data.paths, &tokenizer, seq_len)?;
 
     if samples.len() < 2 {
         return Err(anyhow!("SFT dataset needs at least two samples"));
@@ -173,7 +172,7 @@ pub fn load_sft_dataset(
         (samples[..split_at].to_vec(), samples[split_at..].to_vec())
     } else {
         let (eval_samples, eval_source_paths) =
-            read_sft_paths(&data.eval_paths, &tokenizer, seq_len)?;
+            read_sft_paths(data, &data.eval_paths, &tokenizer, seq_len)?;
         if eval_samples.is_empty() {
             return Err(anyhow!("SFT eval dataset needs at least one sample"));
         }
@@ -273,6 +272,7 @@ fn read_text_paths(paths: &[PathBuf]) -> Result<(String, Vec<PathBuf>)> {
 }
 
 fn read_sft_paths(
+    data: &DataConfig,
     paths: &[PathBuf],
     tokenizer: &ByteTokenizer,
     seq_len: usize,
@@ -293,7 +293,7 @@ fn read_sft_paths(
                 if line.trim().is_empty() {
                     continue;
                 }
-                let record: InstructionRecord = serde_json::from_str(line).with_context(|| {
+                let record = instruction_record_from_jsonl_line(data, line).with_context(|| {
                     format!(
                         "failed to parse JSONL record {}:{}",
                         file.display(),
@@ -306,6 +306,41 @@ fn read_sft_paths(
         }
     }
     Ok((samples, source_paths))
+}
+
+fn instruction_record_from_jsonl_line(data: &DataConfig, line: &str) -> Result<InstructionRecord> {
+    let values: BTreeMap<String, serde_json::Value> =
+        serde_json::from_str(line).context("invalid JSON object")?;
+    let instruction = required_jsonl_string_field(&values, &data.instruction_field)?;
+    let input = optional_jsonl_string_field(&values, &data.input_field)?;
+    let response = required_jsonl_string_field(&values, &data.response_field)?;
+    Ok(InstructionRecord {
+        instruction,
+        input,
+        response,
+    })
+}
+
+fn required_jsonl_string_field(
+    values: &BTreeMap<String, serde_json::Value>,
+    field: &str,
+) -> Result<String> {
+    match values.get(field) {
+        Some(serde_json::Value::String(value)) => Ok(value.clone()),
+        Some(_) => Err(anyhow!("JSONL field {field} must be a string")),
+        None => Err(anyhow!("JSONL record missing required field {field}")),
+    }
+}
+
+fn optional_jsonl_string_field(
+    values: &BTreeMap<String, serde_json::Value>,
+    field: &str,
+) -> Result<String> {
+    match values.get(field) {
+        Some(serde_json::Value::String(value)) => Ok(value.clone()),
+        Some(_) => Err(anyhow!("JSONL field {field} must be a string")),
+        None => Ok(String::new()),
+    }
 }
 
 fn sorted_files(path: &Path) -> Result<Vec<PathBuf>> {
@@ -397,6 +432,9 @@ mod tests {
             max_samples: None,
             shuffle: true,
             index_cache: None,
+            instruction_field: "instruction".to_string(),
+            input_field: "input".to_string(),
+            response_field: "response".to_string(),
         };
         let dataset = load_text_dataset(&data, 64, 8, &cache_dir).expect("dataset should load");
 
@@ -431,6 +469,9 @@ mod tests {
             max_samples: None,
             shuffle: true,
             index_cache: None,
+            instruction_field: "instruction".to_string(),
+            input_field: "input".to_string(),
+            response_field: "response".to_string(),
         };
         let dataset = load_text_dataset(&data, 128, 8, &cache_dir).expect("dataset should load");
 
@@ -471,6 +512,9 @@ mod tests {
             max_samples: None,
             shuffle: true,
             index_cache: None,
+            instruction_field: "instruction".to_string(),
+            input_field: "input".to_string(),
+            response_field: "response".to_string(),
         };
         let dataset =
             load_sft_dataset(&data, 128, 64, &cache_dir).expect("SFT dataset should load");
@@ -526,6 +570,9 @@ mod tests {
             max_samples: None,
             shuffle: true,
             index_cache: None,
+            instruction_field: "instruction".to_string(),
+            input_field: "input".to_string(),
+            response_field: "response".to_string(),
         };
         let dataset =
             load_sft_dataset(&data, 128, 64, &cache_dir).expect("SFT dataset should load");
@@ -557,6 +604,9 @@ mod tests {
             max_samples: Some(2),
             shuffle: true,
             index_cache: None,
+            instruction_field: "instruction".to_string(),
+            input_field: "input".to_string(),
+            response_field: "response".to_string(),
         };
         let dataset =
             load_sft_dataset(&data, 128, 64, &cache_dir).expect("SFT dataset should load");

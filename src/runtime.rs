@@ -90,6 +90,12 @@ pub struct DataConfig {
     pub shuffle: bool,
     #[serde(default)]
     pub index_cache: Option<PathBuf>,
+    #[serde(default = "default_instruction_field")]
+    pub instruction_field: String,
+    #[serde(default = "default_input_field")]
+    pub input_field: String,
+    #[serde(default = "default_response_field")]
+    pub response_field: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -457,6 +463,18 @@ fn default_data_shuffle() -> bool {
     true
 }
 
+fn default_instruction_field() -> String {
+    "instruction".to_string()
+}
+
+fn default_input_field() -> String {
+    "input".to_string()
+}
+
+fn default_response_field() -> String {
+    "response".to_string()
+}
+
 fn default_eval_every() -> u64 {
     0
 }
@@ -551,6 +569,9 @@ mod tests {
                 max_samples: None,
                 shuffle: true,
                 index_cache: None,
+                instruction_field: default_instruction_field(),
+                input_field: default_input_field(),
+                response_field: default_response_field(),
             }),
             lora: Some(LoraConfig {
                 rank: 4,

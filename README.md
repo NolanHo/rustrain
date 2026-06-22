@@ -432,6 +432,10 @@ production-grade sharded checkpoint ownership remain open.
   tokenizer-free streaming JSONL scan for SFT provenance, source sample counts,
   split sizes, explicit `data.eval_paths`, fingerprints, and cursor/epoch
   windows without materializing tokenized samples.
+  Instruction JSONL configs can map external dataset schemas with
+  `data.instruction_field`, `data.input_field`, and `data.response_field`; the
+  defaults remain `instruction`, `input`, and `response`, with missing input
+  fields treated as empty strings.
   `cargo run -- qwen-sft-streaming-batch-plan --config ...` resolves the next
   cursor window to raw JSONL source indices, reads and tokenizes only those
   window records, then verifies the padded `input_ids` plus response masks match
@@ -444,7 +448,9 @@ production-grade sharded checkpoint ownership remain open.
   avoid shared-writer races. Trainer summaries/logs expose
   `streaming_index_cache_path`, `streaming_index_cache_hit`, and
   `streaming_index_cache_written`, and the focused GPU suites run each cache
-  verifier twice to prove first-run writes and second-run hits. Those trainer
+  verifier twice to prove first-run writes and second-run hits. Offset-index
+  cache files also record the JSONL field mapping, so a cache created for one
+  external schema is rejected if reused with a different field map. Those trainer
   summaries now expose `streaming_train_batches = true` for tokenizer-backed
   JSONL SFT runs, and the focused LoRA, single-GPU session, and DP session
   verifiers require that field in summaries and checkpoint manifests so stdout,

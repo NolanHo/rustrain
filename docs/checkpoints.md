@@ -142,7 +142,10 @@ Acceptance:
   `streaming_index_cache_hit`, and `streaming_index_cache_written` when
   `data.index_cache` is configured. The trainer cache verifier runs the same
   config twice and requires the first run to write the offset-index cache and
-  the second run to hit it.
+  the second run to hit it. The offset-index cache is keyed by source paths,
+  `max_samples`, and the JSONL field mapping from `data.instruction_field`,
+  `data.input_field`, and `data.response_field`, so stale caches from a
+  different external schema are rejected.
 - Adapter reload preserves SFT train/eval loss, full-Qwen forward logits, and
   greedy generation output.
 - Merge/unmerge parity is checked for the focused full-Qwen adapter path, with
@@ -354,8 +357,8 @@ Required manifest structure:
 - A base model identity and tokenizer identity.
 - Global train state: global step, consumed samples/tokens, RNG seeds, dtype,
   optimizer, scheduler, and parallel config.
-- JSONL dataset provenance: source files, per-source sample counts, content/path
-  fingerprint, shuffle flag, and train-sample count.
+- JSONL dataset provenance: source files, per-source sample counts,
+  content/path/field-map fingerprint, shuffle flag, and train-sample count.
 - JSONL data progress: `data_cursor_next`, `data_epoch_next`, and
   `data_sample_offset_next`, consistent with `consumed_samples`.
 - Shard entries mapping logical parameter names to rank-owned safetensors
