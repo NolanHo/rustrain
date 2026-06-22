@@ -167,6 +167,9 @@ Acceptance:
   instruction/response substring/dedupe policy, source weighting policy,
   per-source sample-limit policy, or invalid-record handling policy are
   rejected.
+  The field mapping entries can be flat JSON keys or dotted JSON paths; exact
+  top-level keys are resolved before path traversal so flat columns containing
+  dots keep their existing meaning.
   When `data.system_field` is unset, the system field is omitted from dataset
   hashing so existing default fingerprints remain stable; when set, the
   normalized system value participates in prompt rendering, deduplication, and

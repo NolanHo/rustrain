@@ -12042,7 +12042,7 @@ fn qwen_sft_record_from_chat_messages(
     messages_field: &str,
     field_map: &QwenSftFieldMap,
 ) -> Result<QwenSftRecord> {
-    let messages = match values.get(messages_field) {
+    let messages = match qwen_jsonl_path_value(values, messages_field) {
         Some(serde_json::Value::Array(messages)) => messages,
         Some(_) => bail!("SFT JSONL field {messages_field} must be an array"),
         None => bail!("SFT JSONL record missing required field {messages_field}"),
@@ -12318,7 +12318,7 @@ fn qwen_optional_jsonl_string_field(
     values: &BTreeMap<String, serde_json::Value>,
     field: &str,
 ) -> Result<String> {
-    match values.get(field) {
+    match qwen_jsonl_path_value(values, field) {
         Some(serde_json::Value::String(value)) => Ok(value.clone()),
         Some(_) => bail!("SFT JSONL field {field} must be a string"),
         None => Ok(String::new()),
@@ -12330,7 +12330,7 @@ fn qwen_defaultable_jsonl_string_field(
     field: &str,
     default_value: Option<&str>,
 ) -> Result<String> {
-    match values.get(field) {
+    match qwen_jsonl_path_value(values, field) {
         Some(serde_json::Value::String(value)) if value.trim().is_empty() => {
             Ok(default_value.unwrap_or(value).to_string())
         }
@@ -12340,6 +12340,27 @@ fn qwen_defaultable_jsonl_string_field(
             .map(|value| value.to_string())
             .ok_or_else(|| anyhow!("SFT JSONL record missing required field {field}")),
     }
+}
+
+fn qwen_jsonl_path_value<'a>(
+    values: &'a BTreeMap<String, serde_json::Value>,
+    field: &str,
+) -> Option<&'a serde_json::Value> {
+    if let Some(value) = values.get(field) {
+        return Some(value);
+    }
+    let mut segments = field.split('.');
+    let first = segments.next()?;
+    let mut value = values.get(first)?;
+    for segment in segments {
+        match value {
+            serde_json::Value::Object(object) => {
+                value = object.get(segment)?;
+            }
+            _ => return None,
+        }
+    }
+    Some(value)
 }
 
 fn qwen_sft_dataset_fingerprint(
@@ -15072,6 +15093,74 @@ mod tests {
             qwen_render_sft_prompt(&loaded.examples[0], &field_map)
                 .expect("system prompt should render")
                 .contains("System: Be concise.")
+        );
+    }
+
+    #[test]
+    fn qwen_sft_jsonl_reader_supports_dotted_field_paths() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let jsonl = temp.path().join("nested.jsonl");
+        let cache_path = temp.path().join("cache").join("offset-index.json");
+        fs::write(
+            &jsonl,
+            r#"{"meta":{"system":"Be exact."},"payload":{"prompt":"Name the project.","context":"Rust trainer","answer":"rustrain"}}
+{"meta":{"system":"Use one word."},"payload":{"prompt":"Name the language.","answer":"Rust"}}
+"#,
+        )
+        .expect("jsonl should write");
+        let paths = vec![jsonl.clone()];
+        let field_map = QwenSftFieldMap {
+            instruction: "payload.prompt".to_string(),
+            input: "payload.context".to_string(),
+            response: "payload.answer".to_string(),
+            system: Some("meta.system".to_string()),
+            prompt_template: "System: {system}\nQ: {instruction}\nA: ".to_string(),
+            prompt_with_input_template: "System: {system}\nQ: {instruction}\nI: {input}\nA: "
+                .to_string(),
+            ..QwenSftFieldMap::default()
+        };
+
+        let loaded = qwen_sft_examples_from_jsonl_paths_with_limit(&paths, None, &field_map)
+            .expect("nested field examples should load");
+        let streamed = qwen_sft_streaming_source_summary(&paths, None, &field_map)
+            .expect("nested field streaming summary should scan");
+        let source_index = qwen_sft_streaming_source_index(&paths, None, &field_map)
+            .expect("nested field source index should build");
+        let raw_window = qwen_sft_examples_by_raw_indices(&source_index.samples, &field_map)
+            .expect("nested field raw window should read");
+        let first_cache =
+            qwen_sft_streaming_source_index_with_cache(&paths, None, Some(&cache_path), &field_map)
+                .expect("nested field cache should write");
+        let changed_field_map = QwenSftFieldMap {
+            instruction: "payload.question".to_string(),
+            ..field_map.clone()
+        };
+        let cache_mismatch = qwen_sft_streaming_source_index_with_cache(
+            &paths,
+            None,
+            Some(&cache_path),
+            &changed_field_map,
+        )
+        .expect_err("cache should reject changed dotted field paths")
+        .to_string();
+
+        assert_eq!(loaded.examples.len(), 2);
+        assert_eq!(loaded.examples[0].system, "Be exact.");
+        assert_eq!(loaded.examples[0].instruction, "Name the project.");
+        assert_eq!(loaded.examples[0].input, "Rust trainer");
+        assert_eq!(loaded.examples[0].response, "rustrain");
+        assert_eq!(loaded.examples[1].system, "Use one word.");
+        assert_eq!(loaded.examples[1].input, "");
+        assert_eq!(loaded.examples[1].response, "Rust");
+        assert_eq!(streamed.samples, loaded.examples.len());
+        assert_eq!(streamed.fingerprint, loaded.fingerprint);
+        assert_eq!(raw_window.examples, loaded.examples);
+        assert!(first_cache.cache_written);
+        assert!(cache_mismatch.contains("field_map"));
+        assert!(
+            qwen_render_sft_prompt(&loaded.examples[0], &field_map)
+                .expect("nested field prompt should render")
+                .contains("I: Rust trainer")
         );
     }
 

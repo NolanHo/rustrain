@@ -60,6 +60,14 @@ struct TokenCache {
 struct SftCache {
     source_paths: Vec<PathBuf>,
     vocab_size: usize,
+    instruction_field: String,
+    input_field: String,
+    response_field: String,
+    system_field: Option<String>,
+    chat_messages_field: Option<String>,
+    prompt_template: String,
+    prompt_with_input_template: String,
+    trim_fields: bool,
     min_response_chars: usize,
     max_response_chars: Option<usize>,
     instruction_contains_any: Vec<String>,
@@ -72,8 +80,6 @@ struct SftCache {
     normalize_whitespace: bool,
     field_defaults: Vec<FieldDefault>,
     max_eval_samples: Option<usize>,
-    system_field: Option<String>,
-    chat_messages_field: Option<String>,
     min_system_chars: Option<usize>,
     max_system_chars: Option<usize>,
     system_contains_any: Vec<String>,
@@ -235,6 +241,14 @@ pub fn load_sft_dataset(
         cache_dir,
         &source_paths,
         vocab_size,
+        &data.instruction_field,
+        &data.input_field,
+        &data.response_field,
+        data.system_field.clone(),
+        data.chat_messages_field.clone(),
+        &data.prompt_template,
+        &data.prompt_with_input_template,
+        data.trim_fields,
         data.min_response_chars,
         data.max_response_chars,
         &data.instruction_contains_any,
@@ -247,8 +261,6 @@ pub fn load_sft_dataset(
         data.normalize_whitespace,
         &data.field_defaults,
         data.max_eval_samples,
-        data.system_field.clone(),
-        data.chat_messages_field.clone(),
         data.min_system_chars,
         data.max_system_chars,
         &data.system_contains_any,
@@ -538,7 +550,7 @@ fn instruction_record_from_chat_messages(
     messages_field: &str,
     data: &DataConfig,
 ) -> Result<InstructionRecord> {
-    let messages = match values.get(messages_field) {
+    let messages = match jsonl_path_value(values, messages_field) {
         Some(serde_json::Value::Array(messages)) => messages,
         Some(_) => return Err(anyhow!("JSONL field {messages_field} must be an array")),
         None => {
@@ -773,7 +785,7 @@ fn optional_jsonl_string_field(
     values: &BTreeMap<String, serde_json::Value>,
     field: &str,
 ) -> Result<String> {
-    match values.get(field) {
+    match jsonl_path_value(values, field) {
         Some(serde_json::Value::String(value)) => Ok(value.clone()),
         Some(_) => Err(anyhow!("JSONL field {field} must be a string")),
         None => Ok(String::new()),
@@ -785,7 +797,7 @@ fn defaultable_jsonl_string_field(
     field: &str,
     default_value: Option<&str>,
 ) -> Result<String> {
-    match values.get(field) {
+    match jsonl_path_value(values, field) {
         Some(serde_json::Value::String(value)) if value.trim().is_empty() => {
             Ok(default_value.unwrap_or(value).to_string())
         }
@@ -795,6 +807,27 @@ fn defaultable_jsonl_string_field(
             .map(|value| value.to_string())
             .ok_or_else(|| anyhow!("JSONL record missing required field {field}")),
     }
+}
+
+fn jsonl_path_value<'a>(
+    values: &'a BTreeMap<String, serde_json::Value>,
+    field: &str,
+) -> Option<&'a serde_json::Value> {
+    if let Some(value) = values.get(field) {
+        return Some(value);
+    }
+    let mut segments = field.split('.');
+    let first = segments.next()?;
+    let mut value = values.get(first)?;
+    for segment in segments {
+        match value {
+            serde_json::Value::Object(object) => {
+                value = object.get(segment)?;
+            }
+            _ => return None,
+        }
+    }
+    Some(value)
 }
 
 fn required_chat_message_string_field(
@@ -877,6 +910,14 @@ fn write_sft_cache(
     cache_dir: &Path,
     source_paths: &[PathBuf],
     vocab_size: usize,
+    instruction_field: &str,
+    input_field: &str,
+    response_field: &str,
+    system_field: Option<String>,
+    chat_messages_field: Option<String>,
+    prompt_template: &str,
+    prompt_with_input_template: &str,
+    trim_fields: bool,
     min_response_chars: usize,
     max_response_chars: Option<usize>,
     instruction_contains_any: &[String],
@@ -889,8 +930,6 @@ fn write_sft_cache(
     normalize_whitespace: bool,
     field_defaults: &[FieldDefault],
     max_eval_samples: Option<usize>,
-    system_field: Option<String>,
-    chat_messages_field: Option<String>,
     min_system_chars: Option<usize>,
     max_system_chars: Option<usize>,
     system_contains_any: &[String],
@@ -912,6 +951,14 @@ fn write_sft_cache(
     let cache = SftCache {
         source_paths: source_paths.to_vec(),
         vocab_size,
+        instruction_field: instruction_field.to_string(),
+        input_field: input_field.to_string(),
+        response_field: response_field.to_string(),
+        system_field,
+        chat_messages_field,
+        prompt_template: prompt_template.to_string(),
+        prompt_with_input_template: prompt_with_input_template.to_string(),
+        trim_fields,
         min_response_chars,
         max_response_chars,
         instruction_contains_any: instruction_contains_any.to_vec(),
@@ -924,8 +971,6 @@ fn write_sft_cache(
         normalize_whitespace,
         field_defaults: field_defaults.to_vec(),
         max_eval_samples,
-        system_field,
-        chat_messages_field,
         min_system_chars,
         max_system_chars,
         system_contains_any: system_contains_any.to_vec(),
@@ -3180,6 +3225,89 @@ mod tests {
         assert!(!decoded.contains("skip me"));
         assert!(!decoded.contains("missing user"));
         assert!(cache_text.contains("chat_messages_field = \"messages\""));
+    }
+
+    #[test]
+    fn sft_dataset_supports_dotted_jsonl_field_paths() {
+        let dir = tempdir().expect("temp dir should be created");
+        let data_dir = dir.path().join("sft");
+        let cache_dir = dir.path().join("cache");
+        fs::create_dir_all(&data_dir).expect("sft dir should be created");
+        fs::create_dir_all(&cache_dir).expect("cache dir should be created");
+        fs::write(
+            data_dir.join("nested.jsonl"),
+            "{\"meta\":{\"system\":\"Be exact.\"},\"payload\":{\"prompt\":\"Name the project.\",\"context\":\"Rust trainer\",\"answer\":\"rustrain\"}}\n{\"meta\":{\"system\":\"Use one word.\"},\"payload\":{\"prompt\":\"Name the language.\",\"answer\":\"Rust\"}}\n",
+        )
+        .expect("jsonl should write");
+
+        let data = DataConfig {
+            kind: DataKind::InstructionJsonl,
+            paths: vec![data_dir],
+            eval_paths: Vec::new(),
+            train_split: 0.5,
+            max_samples: None,
+            max_eval_samples: None,
+            shuffle: false,
+            index_cache: None,
+            instruction_field: "payload.prompt".to_string(),
+            input_field: "payload.context".to_string(),
+            response_field: "payload.answer".to_string(),
+            system_field: Some("meta.system".to_string()),
+            chat_messages_field: None,
+            min_system_chars: None,
+            max_system_chars: None,
+            system_contains_any: Vec::new(),
+            system_excludes_any: Vec::new(),
+            prompt_template: "System: {system}\nQ: {instruction}\nA: ".to_string(),
+            prompt_with_input_template: "System: {system}\nQ: {instruction}\nI: {input}\nA: "
+                .to_string(),
+            trim_fields: true,
+            min_response_chars: 1,
+            max_response_chars: None,
+            instruction_contains_any: Vec::new(),
+            instruction_excludes_any: Vec::new(),
+            response_contains_any: Vec::new(),
+            response_excludes_any: Vec::new(),
+            input_contains_any: Vec::new(),
+            input_excludes_any: Vec::new(),
+            min_instruction_chars: None,
+            max_instruction_chars: None,
+            min_input_chars: None,
+            max_input_chars: None,
+            min_prompt_chars: None,
+            max_prompt_chars: None,
+            min_sample_chars: None,
+            max_sample_chars: None,
+            dedupe_samples: false,
+            field_replacements: Vec::new(),
+            normalize_whitespace: false,
+            field_defaults: Vec::new(),
+            source_weights: Vec::new(),
+            source_max_samples: Vec::new(),
+            skip_invalid_records: false,
+        };
+        let dataset =
+            load_sft_dataset(&data, 128, 96, &cache_dir).expect("nested SFT dataset should load");
+        let decoded = dataset
+            .train_samples
+            .iter()
+            .chain(dataset.eval_samples.iter())
+            .map(|sample| dataset.tokenizer.decode_lossy(&sample.tokens))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let cache_text =
+            fs::read_to_string(cache_dir.join("sft_tokenized.toml")).expect("cache should read");
+
+        assert_eq!(dataset.train_samples.len(), 1);
+        assert_eq!(dataset.eval_samples.len(), 1);
+        assert!(decoded.contains("System: Be exact."));
+        assert!(decoded.contains("Q: Name the project."));
+        assert!(decoded.contains("I: Rust trainer"));
+        assert!(decoded.contains("rustrain"));
+        assert!(decoded.contains("Use one word."));
+        assert!(decoded.contains("Rust"));
+        assert!(cache_text.contains("payload.prompt"));
+        assert!(cache_text.contains("meta.system"));
     }
 
     #[test]

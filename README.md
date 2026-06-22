@@ -436,7 +436,11 @@ production-grade sharded checkpoint ownership remain open.
   `data.instruction_field`, `data.input_field`, `data.response_field`, and
   optional `data.system_field`; the defaults remain `instruction`, `input`,
   and `response`, with no system field and with missing input/system fields
-  treated as empty strings. They can also override
+  treated as empty strings. These field settings can also be dotted JSON paths
+  such as `payload.prompt` or `meta.system`; an exact top-level key match wins
+  first, so existing flat columns whose names contain dots still work.
+  `data.chat_messages_field` likewise accepts a flat field name or dotted path
+  to a ShareGPT/OpenAI-style messages array. They can also override
   `data.prompt_template` and `data.prompt_with_input_template` to render
   external instruction formats before the response is appended for response-only
   loss; the default templates preserve the existing `Instruction`/`Input`/
