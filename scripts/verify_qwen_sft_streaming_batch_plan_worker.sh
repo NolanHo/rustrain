@@ -208,6 +208,7 @@ expected_field_map = {
     "min_response_chars": 1,
     "max_response_chars": None,
     "response_contains_any": [],
+    "response_excludes_any": [],
     "min_instruction_chars": None,
     "max_instruction_chars": None,
     "min_input_chars": None,

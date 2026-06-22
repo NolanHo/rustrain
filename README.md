@@ -453,7 +453,9 @@ production-grade sharded checkpoint ownership remain open.
   records whose normalized response is longer than the configured character
   count. `data.response_contains_any` can optionally require normalized
   responses to contain at least one configured substring. Empty substring
-  entries are rejected. `data.min_instruction_chars` and
+  entries are rejected. `data.response_excludes_any` can optionally skip
+  records whose normalized response contains any configured substring; empty
+  substring entries are rejected. `data.min_instruction_chars` and
   `data.max_instruction_chars` can optionally skip records whose normalized
   instruction is outside configured character bounds. `data.min_input_chars`
   and `data.max_input_chars` apply the
@@ -499,7 +501,7 @@ production-grade sharded checkpoint ownership remain open.
   cache files also record source JSONL file size/mtime metadata, the JSONL
   field mapping, prompt templates, field trimming policy,
   instruction/input/system/prompt/sample/response length filters, response
-  substring filters, dedupe policy, and source-weighting policy, so a cache
+  include/exclude substring filters, dedupe policy, and source-weighting policy, so a cache
   created for one external dataset state or schema is rejected if reused after
   source file changes or with a different field map, prompt format,
   normalization policy, filtering policy, or weighting policy.
