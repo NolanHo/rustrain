@@ -13419,25 +13419,31 @@ fn qwen_sft_arrow_examples_by_raw_indices(
     if raw_indices.is_empty() {
         bail!("SFT Arrow raw index read requires at least one sample");
     }
+    let mut max_row_by_path: BTreeMap<String, usize> = BTreeMap::new();
     let wanted = raw_indices
         .iter()
-        .map(|index| (index.path.clone(), index.row_index))
+        .map(|index| {
+            max_row_by_path
+                .entry(index.path.clone())
+                .and_modify(|max_row| *max_row = (*max_row).max(index.row_index))
+                .or_insert(index.row_index);
+            (index.path.clone(), index.row_index)
+        })
         .collect::<BTreeSet<_>>();
     let mut loaded = BTreeMap::new();
-    for (path, row_index) in &wanted {
-        let path_buf = PathBuf::from(path);
+    for (path, max_row_index) in max_row_by_path {
+        let path_buf = PathBuf::from(&path);
         let arrow = qwen_sft_arrow_examples_from_ipc_with_limit_policy(
             &path_buf,
-            Some(row_index + 1),
+            Some(max_row_index + 1),
             false,
             field_map,
         )?;
-        let example = arrow
-            .examples
-            .get(*row_index)
-            .cloned()
-            .ok_or_else(|| anyhow!("SFT Arrow row {path}:{row_index} not found"))?;
-        loaded.insert((path.clone(), *row_index), example);
+        for (row_index, example) in arrow.row_indices.into_iter().zip(arrow.examples) {
+            if wanted.contains(&(path.clone(), row_index)) {
+                loaded.insert((path.clone(), row_index), example);
+            }
+        }
     }
     let examples = raw_indices
         .iter()
@@ -20560,6 +20566,47 @@ mod tests {
                 .expect_err("changed Arrow source metadata should reject cache")
                 .to_string();
         assert!(source_mismatch.contains("source_files"));
+    }
+
+    #[test]
+    fn qwen_sft_arrow_raw_index_read_uses_original_row_indices_after_filters() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let arrow = temp.path().join("train.arrow");
+        write_test_sft_arrow(
+            &arrow,
+            &[
+                ("drop", "", "skip"),
+                ("keep-one", "", "alpha"),
+                ("keep-two", "", "beta"),
+            ],
+        );
+        let field_map = QwenSftFieldMap {
+            response: "output".to_string(),
+            response_contains_any: vec!["alpha".to_string(), "beta".to_string()],
+            ..QwenSftFieldMap::default()
+        };
+        let scan = qwen_sft_arrow_source_scan(&[arrow.clone()], Some(2), &field_map)
+            .expect("filtered Arrow source should scan");
+
+        assert_eq!(
+            scan.index
+                .samples
+                .iter()
+                .map(|sample| sample.row_index)
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        let raw_window = qwen_sft_arrow_examples_by_raw_indices(&scan.index.samples, &field_map)
+            .expect("filtered original rows should read");
+        assert_eq!(
+            raw_window
+                .examples
+                .iter()
+                .map(|example| example.instruction.as_str())
+                .collect::<Vec<_>>(),
+            vec!["keep-one", "keep-two"]
+        );
+        assert_eq!(raw_window.raw_samples_read, 2);
     }
 
     fn write_test_sft_arrow(path: &Path, rows: &[(&str, &str, &str)]) {
