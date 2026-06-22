@@ -448,8 +448,10 @@ production-grade sharded checkpoint ownership remain open.
   records whose normalized response is longer than the configured character
   count. `data.min_instruction_chars` and `data.max_instruction_chars` can
   optionally skip records whose normalized instruction is outside configured
-  character bounds. These filters run before train/eval splitting,
-  `max_samples`, and streaming offset-index construction. `data.source_weights` can be empty,
+  character bounds. `data.min_input_chars` and `data.max_input_chars` apply the
+  same optional bounds to the normalized input field. These filters run before
+  train/eval splitting, `max_samples`, and streaming offset-index construction.
+  `data.source_weights` can be empty,
   length 1, or match `data.paths`; it repeats valid training samples from each
   configured source before `max_samples` and splitting, while explicit
   `data.eval_paths` remain unweighted held-out data.
@@ -467,7 +469,7 @@ production-grade sharded checkpoint ownership remain open.
   `streaming_index_cache_written`, and the focused GPU suites run each cache
   verifier twice to prove first-run writes and second-run hits. Offset-index
   cache files also record the JSONL field mapping, prompt templates, field
-  trimming policy, instruction/response length filters, and source-weighting
+  trimming policy, instruction/input/response length filters, and source-weighting
   policy, so a cache created for one external schema is rejected if reused with
   a different field map, prompt format, normalization policy, filtering policy,
   or weighting policy.

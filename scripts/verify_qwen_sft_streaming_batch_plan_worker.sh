@@ -196,6 +196,8 @@ expected_field_map = {
     "max_response_chars": None,
     "min_instruction_chars": None,
     "max_instruction_chars": None,
+    "min_input_chars": None,
+    "max_input_chars": None,
     "source_weights": [],
 }
 for key, expected in expected_field_map.items():
