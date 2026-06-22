@@ -128,6 +128,7 @@ RUSTRAIN_RAY_NUM_GPUS=2 scripts/gpu_run.sh env RUSTRAIN_LAUNCH_TIMEOUT_SECS=900 
 RUSTRAIN_RAY_NUM_GPUS=2 scripts/gpu_run.sh env RUSTRAIN_LAUNCH_TIMEOUT_SECS=900 RUSTRAIN_DISTRIBUTED_BASE_OUTPUT_DIR=/tmp/rustrain-runs/qwen-session-dp2-layers03-sft-resume-base RUSTRAIN_DISTRIBUTED_RESUME_OUTPUT_DIR=/tmp/rustrain-runs/qwen-session-dp2-layers03-sft-resume-continue RUSTRAIN_QWEN_SESSION_DP_CONFIG=configs/qwen_session_dp2_layers03_sft.toml RUSTRAIN_EXPECTED_DATASET_ORDER_SEED=777 RUSTRAIN_EXPECTED_QWEN_DP_TRAINABLE_TENSORS=49 RUSTRAIN_EXPECTED_QWEN_DP_TRAINABLE_NAMES=model.layers.0.self_attn.q_proj.weight,model.layers.0.mlp.down_proj.weight,model.layers.3.self_attn.q_proj.weight,model.layers.3.mlp.down_proj.weight,model.norm.weight bash scripts/verify_qwen_session_dp2_resume_worker.sh
 RUSTRAIN_RAY_NUM_GPUS=2 scripts/gpu_run.sh env RUSTRAIN_LAUNCH_TIMEOUT_SECS=900 RUSTRAIN_DISTRIBUTED_BASE_OUTPUT_DIR=/tmp/rustrain-runs/qwen-session-dp2-layers07-sft-resume-base RUSTRAIN_DISTRIBUTED_RESUME_OUTPUT_DIR=/tmp/rustrain-runs/qwen-session-dp2-layers07-sft-resume-continue RUSTRAIN_QWEN_SESSION_DP_CONFIG=configs/qwen_session_dp2_layers07_sft.toml RUSTRAIN_EXPECTED_DATASET_ORDER_SEED=777 RUSTRAIN_EXPECTED_QWEN_DP_TRAINABLE_TENSORS=97 RUSTRAIN_EXPECTED_QWEN_DP_TRAINABLE_NAMES=model.layers.0.self_attn.q_proj.weight,model.layers.0.mlp.down_proj.weight,model.layers.7.self_attn.q_proj.weight,model.layers.7.mlp.down_proj.weight,model.norm.weight bash scripts/verify_qwen_session_dp2_resume_worker.sh
 RUSTRAIN_RAY_NUM_GPUS=2 scripts/gpu_run.sh env RUSTRAIN_LAUNCH_TIMEOUT_SECS=900 RUSTRAIN_DISTRIBUTED_BASE_OUTPUT_DIR=/tmp/rustrain-runs/qwen-session-dp2-layers03-sft-bf16-resume-base RUSTRAIN_DISTRIBUTED_RESUME_OUTPUT_DIR=/tmp/rustrain-runs/qwen-session-dp2-layers03-sft-bf16-resume-continue RUSTRAIN_QWEN_SESSION_DP_CONFIG=configs/qwen_session_dp2_layers03_sft_bf16.toml RUSTRAIN_EXPECTED_DATASET_ORDER_SEED=777 RUSTRAIN_EXPECTED_QWEN_DP_TRAINABLE_TENSORS=49 RUSTRAIN_EXPECTED_QWEN_DP_TRAINABLE_NAMES=model.layers.0.self_attn.q_proj.weight,model.layers.0.mlp.down_proj.weight,model.layers.3.self_attn.q_proj.weight,model.layers.3.mlp.down_proj.weight,model.norm.weight bash scripts/verify_qwen_session_dp2_resume_worker.sh
+RUSTRAIN_RAY_NUM_GPUS=2 scripts/gpu_run.sh env RUSTRAIN_LAUNCH_TIMEOUT_SECS=900 RUSTRAIN_DISTRIBUTED_BASE_OUTPUT_DIR=/tmp/rustrain-runs/qwen-session-dp2-layers07-sft-bf16-resume-base RUSTRAIN_DISTRIBUTED_RESUME_OUTPUT_DIR=/tmp/rustrain-runs/qwen-session-dp2-layers07-sft-bf16-resume-continue RUSTRAIN_QWEN_SESSION_DP_CONFIG=configs/qwen_session_dp2_layers07_sft_bf16.toml RUSTRAIN_EXPECTED_DATASET_ORDER_SEED=777 RUSTRAIN_EXPECTED_QWEN_DP_TRAINABLE_TENSORS=97 RUSTRAIN_EXPECTED_QWEN_DP_TRAINABLE_NAMES=model.layers.0.self_attn.q_proj.weight,model.layers.0.mlp.down_proj.weight,model.layers.7.self_attn.q_proj.weight,model.layers.7.mlp.down_proj.weight,model.norm.weight bash scripts/verify_qwen_session_dp2_resume_worker.sh
 RUSTRAIN_RAY_NUM_GPUS=2 scripts/gpu_run.sh cargo run -- launch --nproc-per-node 2 --output-dir /tmp/rustrain-runs/qwen-session-trainer-tp2 train --config configs/qwen_session_tp2.toml
 RUSTRAIN_RAY_NUM_GPUS=2 scripts/gpu_run.sh cargo run -- launch --nproc-per-node 2 --output-dir /tmp/rustrain-runs/ep-rank-local-smoke parallel-ep-rank-smoke --output-dir /tmp/rustrain-runs/ep-rank-local-smoke/ranks
 RUSTRAIN_RAY_NUM_GPUS=2 scripts/gpu_run.sh cargo run -- launch --nproc-per-node 2 --output-dir /tmp/rustrain-runs/ep-nccl-smoke parallel-ep-nccl-rank-smoke --output-dir /tmp/rustrain-runs/ep-nccl-smoke/ranks
@@ -237,14 +238,14 @@ verifies the layer0+layer1 tokenizer-backed DP path under bf16 compute,
 JSONL DP path under bf16 compute, and
 `configs/qwen_session_dp2_layers07_sft_bf16.toml` verifies the layer0-layer7
 JSONL DP path under bf16 compute.
-The external resume verifier also covers the layer0+layer1 and layer0-layer3
-fp32/bf16 SFT configs plus the layer0-layer7 fp32 SFT config. It starts a
-fresh DP=2 JSONL run, resumes from the emitted rank0 manifest, requires the
-resumed cursor to continue from the base `data_cursor_next`, and checks the
-expected trainable set in the resumed rank summaries and manifest. The
-layer0+layer1 paths expect 25 trainable tensors, layer0-layer3 paths expect 49
-trainable tensors, and the layer0-layer7 fp32 SFT resume path expects 97
-trainable tensors; all still exclude the tied embedding by design.
+The external resume verifier also covers the layer0+layer1, layer0-layer3, and
+layer0-layer7 fp32/bf16 SFT configs. It starts a fresh DP=2 JSONL run, resumes
+from the emitted rank0 manifest, requires the resumed cursor to continue from
+the base `data_cursor_next`, and checks the expected trainable set in the
+resumed rank summaries and manifest. The layer0+layer1 paths expect 25
+trainable tensors, layer0-layer3 paths expect 49 trainable tensors, and the
+layer0-layer7 paths expect 97 trainable tensors; all still exclude the tied
+embedding by design.
 Toy MoE has an explicit single-rank smoke command and verifier:
 `cargo run -- moe-smoke` prints a JSON summary for TinyMoe and DeepSeek-style
 toy MoE stats, and `scripts/verify_moe_smoke_worker.sh` asserts expert load,
@@ -341,10 +342,10 @@ production-grade sharded checkpoint ownership remain open.
   tokenizer-backed layer0-layer3 DP path under bf16 compute, and
   `configs/qwen_session_dp2_layers07_sft_bf16.toml` verifies the
   tokenizer-backed layer0-layer7 DP path under bf16 compute. The
-  layers01 and layers03 JSONL paths now also have fp32 and bf16 external resume
-  verifiers, and the layers07 JSONL path has an fp32 external resume verifier.
-  These prove the next run starts from the prior `data_cursor_next` while
-  preserving dataset provenance and the expected trainable registry size.
+  layers01, layers03, and layers07 JSONL paths now also have fp32 and bf16
+  external resume verifiers. These prove the next run starts from the prior
+  `data_cursor_next` while preserving dataset provenance and the expected
+  trainable registry size.
   Full model/data/checkpoint trainer ownership remains open.
 - G6 trainer-level real SFT data now has minimal Qwen LoRA SFT config paths:
   `train --config configs/qwen_lora_sft.toml` loads tokenizer-backed
