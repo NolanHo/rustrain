@@ -142,7 +142,13 @@ Acceptance:
   `streaming_index_cache_hit`, and `streaming_index_cache_written` when
   `data.index_cache` is configured. The trainer cache verifier runs the same
   config twice and requires the first run to write the offset-index cache and
-  the second run to hit it. The offset-index cache is keyed by source paths,
+  the second run to hit it. The GPU verifier also exports a JSONL subset from
+  the cached HuggingFace Arrow dataset
+  `/vePFS-Mindverse/share/huggingface/datasets/iamtarun___code_instructions_120k_alpaca`,
+  maps the dataset's `output` column through `data.response_field`, and checks
+  tokenizer-free streaming metadata, tokenizer-backed batch parity, cursor
+  wrap, and cache write/hit behavior on that external-cache-derived source. The
+  offset-index cache is keyed by source paths,
   source JSONL file size/mtime metadata, `max_samples`, and the JSONL field
   mapping from `data.instruction_field`, `data.input_field`,
   `data.response_field`, optional
