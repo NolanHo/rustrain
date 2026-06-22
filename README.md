@@ -598,9 +598,14 @@ production-grade sharded checkpoint ownership remain open.
   `data.source_max_samples` with the same ordering as JSONL: per-source raw
   limits apply before source weighting, and global `data.max_samples` applies
   after weighting; explicit Arrow eval paths remain unweighted held-out data.
+  Bounded Arrow SFT also honors `data.index_cache` by writing and reusing a
+  row-index cache keyed by Arrow source file metadata, the SFT field map, and
+  `data.max_samples`; trainer summaries expose the same
+  `streaming_index_cache_path`, `streaming_index_cache_hit`, and
+  `streaming_index_cache_written` fields as JSONL SFT.
   A production zero-materialization training loader for large external streams,
-  Arrow index-cache semantics, and production distributed Arrow trainer
-  ownership remain open.
+  distributed Arrow trainer ownership, and large-stream cache policy remain
+  open.
   Production data loading and arbitrary-module LoRA injection are still open.
 - Real Qwen module-level LoRA now uses a target-layer/module registry for
   configured attention and MLP projection modules; trainer-owned full-model LoRA
