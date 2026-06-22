@@ -104,8 +104,25 @@ expected_raw_indices = [
     {"path": expected_source, "index_in_file": 2, "global_index": 2},
     {"path": expected_source, "index_in_file": 1, "global_index": 1},
 ]
-if raw_indices != expected_raw_indices:
-    raise SystemExit(f"streaming_raw_sample_indices {raw_indices} != {expected_raw_indices}")
+raw_indices_without_offsets = [
+    {key: value for key, value in entry.items() if key != "byte_offset"}
+    for entry in raw_indices
+]
+if raw_indices_without_offsets != expected_raw_indices:
+    raise SystemExit(
+        f"streaming_raw_sample_indices without byte offsets {raw_indices_without_offsets} != {expected_raw_indices}"
+    )
+offsets_by_sample = {}
+for entry in raw_indices:
+    offset = entry.get("byte_offset")
+    if not isinstance(offset, int) or offset < 0:
+        raise SystemExit(f"streaming raw sample byte_offset must be a non-negative integer: {entry}")
+    sample_key = (entry["path"], entry["index_in_file"], entry["global_index"])
+    previous = offsets_by_sample.setdefault(sample_key, offset)
+    if previous != offset:
+        raise SystemExit(
+            f"duplicate streaming raw sample {sample_key} used inconsistent byte offsets: {previous} vs {offset}"
+        )
 
 print(
     "qwen_sft_streaming_batch_plan_verified: "

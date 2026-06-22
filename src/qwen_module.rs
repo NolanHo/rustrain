@@ -1,7 +1,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
-    io::{BufRead, BufReader},
+    io::{BufRead, BufReader, Seek, SeekFrom},
     path::{Path, PathBuf},
     sync::Arc,
     time::{Duration, Instant},
@@ -1565,6 +1565,7 @@ struct QwenSftRawSampleIndex {
     path: String,
     index_in_file: usize,
     global_index: usize,
+    byte_offset: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -10652,22 +10653,32 @@ fn qwen_sft_streaming_source_index(
                 break;
             }
             let file_path = file.display().to_string();
-            let reader = BufReader::new(
+            let mut reader = BufReader::new(
                 fs::File::open(&file)
                     .with_context(|| format!("failed to read {}", file.display()))?,
             );
-            for (line_index, line) in reader.lines().enumerate() {
+            let mut line = String::new();
+            let mut line_index = 0usize;
+            loop {
                 if max_samples.is_some_and(|limit| samples.len() >= limit) {
                     break;
                 }
-                let line = line.with_context(|| {
+                let byte_offset = reader.stream_position().with_context(|| {
+                    format!("failed to seek SFT JSONL record {}", file.display())
+                })?;
+                line.clear();
+                let bytes_read = reader.read_line(&mut line).with_context(|| {
                     format!(
                         "failed to read SFT JSONL record {}:{}",
                         file.display(),
                         line_index + 1
                     )
                 })?;
+                if bytes_read == 0 {
+                    break;
+                }
                 if line.trim().is_empty() {
+                    line_index += 1;
                     continue;
                 }
                 let record: QwenSftRecord = serde_json::from_str(&line).with_context(|| {
@@ -10682,7 +10693,9 @@ fn qwen_sft_streaming_source_index(
                     path: file_path.clone(),
                     index_in_file: line_index,
                     global_index: samples.len(),
+                    byte_offset,
                 });
+                line_index += 1;
             }
         }
     }
@@ -10708,38 +10721,61 @@ fn qwen_sft_examples_by_raw_indices(
     }
 
     let mut loaded = BTreeMap::new();
+    let mut offsets_by_sample = BTreeMap::new();
+    for raw_index in raw_indices {
+        offsets_by_sample
+            .entry((raw_index.path.clone(), raw_index.index_in_file))
+            .or_insert(raw_index.byte_offset);
+    }
     for (path, wanted_indices) in &by_path {
-        let reader =
-            BufReader::new(fs::File::open(path).with_context(|| format!("failed to read {path}"))?);
-        for (line_index, line) in reader.lines().enumerate() {
-            if !wanted_indices.contains(&line_index) {
+        let mut file = fs::File::open(path).with_context(|| format!("failed to read {path}"))?;
+        for index_in_file in wanted_indices {
+            let byte_offset = *offsets_by_sample
+                .get(&(path.clone(), *index_in_file))
+                .ok_or_else(|| {
+                    anyhow!(
+                        "SFT streaming raw sample offset not found: {}:{}",
+                        path,
+                        index_in_file + 1
+                    )
+                })?;
+            if !wanted_indices.contains(index_in_file) {
                 continue;
             }
-            let line = line.with_context(|| {
-                format!("failed to read SFT JSONL record {path}:{}", line_index + 1)
+            file.seek(SeekFrom::Start(byte_offset)).with_context(|| {
+                format!(
+                    "failed to seek SFT JSONL record {path}:{} at byte offset {}",
+                    index_in_file + 1,
+                    byte_offset
+                )
+            })?;
+            let mut reader = BufReader::new(&file);
+            let mut line = String::new();
+            reader.read_line(&mut line).with_context(|| {
+                format!(
+                    "failed to read SFT JSONL record {path}:{} at byte offset {}",
+                    index_in_file + 1,
+                    byte_offset
+                )
             })?;
             if line.trim().is_empty() {
                 continue;
             }
             let record: QwenSftRecord = serde_json::from_str(&line).with_context(|| {
-                format!("failed to parse SFT JSONL record {path}:{}", line_index + 1)
+                format!(
+                    "failed to parse SFT JSONL record {path}:{} at byte offset {}",
+                    index_in_file + 1,
+                    byte_offset
+                )
             })?;
             loaded.insert(
-                (path.clone(), line_index),
+                (path.clone(), *index_in_file),
                 QwenSftExample {
                     instruction: record.instruction,
                     input: record.input,
                     response: record.response,
                 },
             );
-            if loaded
-                .keys()
-                .filter(|(loaded_path, _)| loaded_path == path)
-                .count()
-                == wanted_indices.len()
-            {
-                break;
-            }
         }
     }
 
@@ -13800,6 +13836,13 @@ mod tests {
                 .map(|index| index.index_in_file)
                 .collect::<Vec<_>>(),
             vec![3, 3, 2, 1]
+        );
+        assert_eq!(
+            raw_indices
+                .iter()
+                .map(|index| index.byte_offset)
+                .collect::<Vec<_>>(),
+            vec![112, 112, 75, 38]
         );
         assert_eq!(
             raw_indices
