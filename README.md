@@ -253,6 +253,10 @@ still excluding the tied embedding by design and still checking rank0 plus
 sharded checkpoint next-step parity.
 `configs/qwen_session_dp2_layers07_bf16.toml` verifies the same layer0-layer7
 fixed-token DP path under bf16 compute.
+The DP sharded global manifest records the resolved complete Qwen checkpoint in
+`base_model_path` plus its `tokenizer_path`; the DP verifiers reject manifests
+whose recorded checkpoint lacks `config.json`, `tokenizer.json`, or
+`model.safetensors`.
 `configs/qwen_session_dp2_layers01_sft.toml` runs the same layer0+layer1
 DP trainer over tokenizer-backed JSONL instruction batches and verifies dataset
 provenance, sample cursor progress, rank0 checkpoint parity, and sharded

@@ -280,13 +280,16 @@ the continuous rank0-manifest run. Its JSONL variant additionally checks that
 the global sharded manifest's `consumed_samples`, `data_cursor_next`,
 `data_epoch_next`, `data_sample_offset_next`, `data_train_samples`,
 `dataset_source_files`, and `dataset_fingerprint` match the rank-local
-summaries.
+summaries. DP verifiers also reject Qwen sharded manifests unless
+`base_model_path` points to a resolved complete Qwen checkpoint containing
+`config.json`, `tokenizer.json`, and `model.safetensors`, and `tokenizer_path`
+belongs to that same checkpoint directory.
 The focused Qwen TP=2 layer0 smoke also writes rank-owned model shard files and
 a global `rustrain.qwen_sharded.v1` manifest for its layer0 attention/MLP tensor
 partitions. The global manifest records `base_model_path` and `tokenizer_path`
-from the resolved complete Qwen checkpoint, and TP verifiers reject manifests
-or rank summaries whose path does not contain `config.json`, `tokenizer.json`,
-and `model.safetensors`. That TP manifest is checkpoint-contract evidence only:
+from the resolved complete Qwen checkpoint, and TP verifiers apply the same
+complete-checkpoint requirement to manifests and rank summaries. That TP
+manifest is checkpoint-contract evidence only:
 optimizer slots for TP row/column shards are first-step smoke AdamW m/v tensors, and
 replicated norm slots remain zero because the focused TP train step does not
 update them. The same focused smoke restores each rank's model shards through
