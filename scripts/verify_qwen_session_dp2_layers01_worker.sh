@@ -25,6 +25,10 @@ python - <<'PY'
 import json
 import os
 import pathlib
+import sys
+
+sys.path.insert(0, str(pathlib.Path("scripts").resolve()))
+from qwen_verify_utils import require_complete_qwen_manifest_paths
 
 output_dir = pathlib.Path(os.environ["RUSTRAIN_DISTRIBUTED_VERIFY_OUTPUT_DIR"])
 expected_trainable_tensors = int(os.environ["RUSTRAIN_EXPECTED_QWEN_DP_TRAINABLE_TENSORS"])
@@ -236,7 +240,9 @@ for path in rank_summaries:
             raise SystemExit(
                 f"{path} rank0 manifest streaming_train_batches {manifest.get('streaming_train_batches')} is not true"
             )
-    sharded_global = json.loads(pathlib.Path(data["sharded_global_manifest_output"]).read_text())
+    sharded_global_path = pathlib.Path(data["sharded_global_manifest_output"])
+    sharded_global = json.loads(sharded_global_path.read_text())
+    require_complete_qwen_manifest_paths(sharded_global, sharded_global_path)
     parallel = sharded_global.get("parallel") or {}
     if int(parallel.get("data_parallel_size", -1)) != 2:
         raise SystemExit(

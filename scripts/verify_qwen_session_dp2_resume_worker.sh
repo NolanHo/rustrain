@@ -52,6 +52,10 @@ python - <<'PY'
 import json
 import os
 import pathlib
+import sys
+
+sys.path.insert(0, str(pathlib.Path("scripts").resolve()))
+from qwen_verify_utils import require_complete_qwen_manifest_paths
 
 base_output_dir = pathlib.Path(os.environ["BASE_OUTPUT_DIR"])
 resume_output_dir = pathlib.Path(os.environ["RESUME_OUTPUT_DIR"])
@@ -281,7 +285,9 @@ for path in resume_summaries:
         raise SystemExit(
             f"{path} manifest dataset_fingerprint {manifest.get('dataset_fingerprint')} != {expected_dataset_fingerprint}"
         )
-    sharded_manifest = json.loads(pathlib.Path(data["sharded_global_manifest_output"]).read_text())
+    sharded_manifest_path = pathlib.Path(data["sharded_global_manifest_output"])
+    sharded_manifest = json.loads(sharded_manifest_path.read_text())
+    require_complete_qwen_manifest_paths(sharded_manifest, sharded_manifest_path)
     if int(sharded_manifest["data_cursor_next"]) != expected_cursor_next:
         raise SystemExit(
             f"{path} sharded data_cursor_next {sharded_manifest['data_cursor_next']} != expected {expected_cursor_next}"

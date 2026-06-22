@@ -18,6 +18,10 @@ python - <<'PY'
 import json
 import os
 import pathlib
+import sys
+
+sys.path.insert(0, str(pathlib.Path("scripts").resolve()))
+from qwen_verify_utils import require_complete_qwen_manifest_paths
 
 output_dir = pathlib.Path(os.environ["RUSTRAIN_DISTRIBUTED_VERIFY_OUTPUT_DIR"])
 expected_dtype = os.environ.get("RUSTRAIN_EXPECTED_QWEN_COMPUTE_KIND")
@@ -71,6 +75,9 @@ for path in rank_summaries:
         raise SystemExit(
             f"{path} sharded_next_step_delta {sharded_next_step_delta} exceeds tolerance"
         )
+    sharded_manifest_path = pathlib.Path(data["sharded_global_manifest_output"])
+    sharded_manifest = json.loads(sharded_manifest_path.read_text())
+    require_complete_qwen_manifest_paths(sharded_manifest, sharded_manifest_path)
     if expected_dtype and data.get("dtype") != expected_dtype:
         raise SystemExit(
             f"{path} dtype {data.get('dtype')} does not match expected {expected_dtype}"
@@ -164,7 +171,6 @@ for path in rank_summaries:
                 raise SystemExit(
                     f"{path} expected {offset_key} {expected_offset}, got {data[offset_key]} from {cursor_key}={cursor}"
                 )
-        sharded_manifest = json.loads(pathlib.Path(data["sharded_global_manifest_output"]).read_text())
         if sharded_manifest.get("dataset_source_files") != dataset_source_files:
             raise SystemExit(
                 f"{path} sharded dataset_source_files {sharded_manifest.get('dataset_source_files')} does not match summary {dataset_source_files}"
