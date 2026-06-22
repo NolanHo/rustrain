@@ -125,6 +125,11 @@ Acceptance:
 - JSONL SFT train summaries must report `streaming_train_batches = true`; the
   LoRA resume verifier checks this for both manifest-backed and direct adapter
   resume runs.
+- JSONL SFT trainer summaries/logs expose `streaming_index_cache_path`,
+  `streaming_index_cache_hit`, and `streaming_index_cache_written` when
+  `data.index_cache` is configured. The trainer cache verifier runs the same
+  config twice and requires the first run to write the offset-index cache and
+  the second run to hit it.
 - Adapter reload preserves SFT train/eval loss, full-Qwen forward logits, and
   greedy generation output.
 - Merge/unmerge parity is checked for the focused full-Qwen adapter path, with
@@ -234,6 +239,12 @@ Acceptance:
 - JSONL-backed DP rank summaries must report `streaming_train_batches = true`;
   the DP worker and external resume verifiers reject summaries that omit it or
   report `false`.
+- JSONL-backed DP rank summaries expose the same
+  `streaming_index_cache_path`, `streaming_index_cache_hit`, and
+  `streaming_index_cache_written` fields when `data.index_cache` is configured.
+  The DP trainer cache verifier derives rank-local offset-index cache paths,
+  then requires both ranks to write their caches on the first launch and hit
+  those caches on the second launch.
 - The layer0+layer1 JSONL external resume paths verify both the cursor
   continuity contract and the 25-tensor trainable registry for both fp32 and
   bf16 resumed summaries and manifests. The bf16 path also asserts
