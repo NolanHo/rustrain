@@ -8703,11 +8703,38 @@ fn qwen_session_batch_plan_from_config(
         qwen_data_epoch_and_offset(data_cursor_end, train_dataset.len())?;
     let (data_epoch_next, data_sample_offset_next) =
         qwen_data_epoch_and_offset(data_cursor_next, train_dataset.len())?;
+    let streaming_window = qwen_sft_streaming_token_window_from_jsonl(
+        &tokenizer,
+        &data_config.paths,
+        data_config.max_samples,
+        data_config.train_split,
+        data_config.shuffle,
+        runtime_config.run.seed,
+        data_cursor_start,
+        required_batches + batch_size - 1,
+    )?;
     let train_batches = (0..required_batches)
-        .map(|sample_cursor| {
-            train_dataset
-                .padded_batch(sample_cursor, batch_size)
-                .map(|batch| batch.input_ids)
+        .map(|relative_cursor| {
+            let end = relative_cursor + batch_size;
+            let streaming_batch = qwen_sft_padded_batch(
+                &streaming_window.samples[relative_cursor..end],
+                train_dataset.pad_token_id,
+            )?;
+            let reference_batch =
+                train_dataset.padded_batch(data_cursor_start + relative_cursor, batch_size)?;
+            let input_delta =
+                tensor_i64_max_abs_diff(&streaming_batch.input_ids, &reference_batch.input_ids)?;
+            let mask_delta =
+                tensor_max_abs_diff(&streaming_batch.target_mask, &reference_batch.target_mask)?;
+            if input_delta != 0 || mask_delta > 0.0 {
+                bail!(
+                    "Qwen session streaming batch mismatch at cursor {}: input_delta={}, mask_delta={}",
+                    data_cursor_start + relative_cursor,
+                    input_delta,
+                    mask_delta
+                );
+            }
+            Ok(streaming_batch.input_ids)
         })
         .collect::<Result<Vec<_>>>()?;
     let initial_input_ids = train_batches
