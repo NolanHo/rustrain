@@ -153,6 +153,8 @@ Acceptance:
   `data.field_case_transforms`, optional
   `data.field_affixes`, optional `data.field_splits`, optional
   `data.field_truncations`, optional `data.normalize_whitespace`,
+  optional `data.field_regex_contains_any`, optional
+  `data.field_regex_excludes_any`,
   `data.min_response_chars`, optional
   `data.max_response_chars`, optional `data.instruction_contains_any`,
   optional `data.response_contains_any`, optional
@@ -166,6 +168,7 @@ Acceptance:
   `data.skip_invalid_records`, so stale
   caches from a different external file state, external schema, prompt format,
   default/replacement/case/affix/split/truncation/normalization policy,
+  field-regex filtering policy,
   instruction/input/system/prompt/sample/response filtering or
   instruction/response substring/dedupe policy, source weighting policy,
   per-source sample-limit policy, or invalid-record handling policy are

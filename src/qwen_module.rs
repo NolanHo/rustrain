@@ -18,8 +18,9 @@ use crate::nccl_smoke;
 use crate::runtime::{
     Config, DataConfig as RuntimeDataConfig, DataKind as RuntimeDataKind, Device as RuntimeDevice,
     FieldAffix, FieldCaseTransform, FieldCaseTransformKind, FieldDefault, FieldDefaultTarget,
-    FieldRegexReplacement, FieldReplacement, FieldReplacementTarget, FieldSplit, FieldSplitSide,
-    FieldTruncation, LoraConfig as RuntimeLoraConfig, LrScheduler, RunPaths, load_config,
+    FieldRegexFilter, FieldRegexReplacement, FieldReplacement, FieldReplacementTarget, FieldSplit,
+    FieldSplitSide, FieldTruncation, LoraConfig as RuntimeLoraConfig, LrScheduler, RunPaths,
+    load_config,
 };
 
 #[derive(Debug, Serialize)]
@@ -1681,6 +1682,10 @@ struct QwenSftFieldMap {
     #[serde(default)]
     input_excludes_any: Vec<String>,
     #[serde(default)]
+    field_regex_contains_any: Vec<FieldRegexFilter>,
+    #[serde(default)]
+    field_regex_excludes_any: Vec<FieldRegexFilter>,
+    #[serde(default)]
     min_instruction_chars: Option<usize>,
     #[serde(default)]
     max_instruction_chars: Option<usize>,
@@ -1744,6 +1749,8 @@ impl QwenSftFieldMap {
             response_excludes_any: data.response_excludes_any.clone(),
             input_contains_any: data.input_contains_any.clone(),
             input_excludes_any: data.input_excludes_any.clone(),
+            field_regex_contains_any: data.field_regex_contains_any.clone(),
+            field_regex_excludes_any: data.field_regex_excludes_any.clone(),
             min_instruction_chars: data.min_instruction_chars,
             max_instruction_chars: data.max_instruction_chars,
             min_input_chars: data.min_input_chars,
@@ -2006,6 +2013,26 @@ impl QwenSftFieldMap {
                 );
             }
         }
+        for filter in self
+            .field_regex_contains_any
+            .iter()
+            .chain(self.field_regex_excludes_any.iter())
+        {
+            if filter.pattern.is_empty() {
+                bail!("data field regex filter pattern entries must not be empty");
+            }
+            regex::Regex::new(&filter.pattern).map_err(|error| {
+                anyhow!(
+                    "data field regex filter invalid regex pattern {:?}: {error}",
+                    filter.pattern
+                )
+            })?;
+            if matches!(filter.field, FieldReplacementTarget::System) && !has_system_source {
+                bail!(
+                    "data field regex filters targeting system require data.system_field, data.chat_messages_field, or a system field_default to be set"
+                );
+            }
+        }
         for default in &self.field_defaults {
             if default.value.is_empty() {
                 bail!("data.field_defaults value entries must not be empty");
@@ -2085,6 +2112,8 @@ impl Default for QwenSftFieldMap {
             response_excludes_any: Vec::new(),
             input_contains_any: Vec::new(),
             input_excludes_any: Vec::new(),
+            field_regex_contains_any: Vec::new(),
+            field_regex_excludes_any: Vec::new(),
             min_instruction_chars: None,
             max_instruction_chars: None,
             min_input_chars: None,
@@ -11548,7 +11577,7 @@ fn qwen_sft_streaming_source_scan(
                     line_index += 1;
                     continue;
                 };
-                if !qwen_sft_record_passes_filters(&record, field_map) {
+                if !qwen_sft_record_passes_filters(&record, field_map)? {
                     line_index += 1;
                     continue;
                 }
@@ -11892,7 +11921,7 @@ fn qwen_sft_examples_from_jsonl_path_with_limit(
             else {
                 continue;
             };
-            if !qwen_sft_record_passes_filters(&record, field_map) {
+            if !qwen_sft_record_passes_filters(&record, field_map)? {
                 continue;
             }
             if let Some(seen_records) = seen_records {
@@ -12497,7 +12526,10 @@ fn qwen_sft_record_dedupe_key(record: &QwenSftRecord) -> String {
     )
 }
 
-fn qwen_sft_record_passes_filters(record: &QwenSftRecord, field_map: &QwenSftFieldMap) -> bool {
+fn qwen_sft_record_passes_filters(
+    record: &QwenSftRecord,
+    field_map: &QwenSftFieldMap,
+) -> Result<bool> {
     let needs_prompt_chars = field_map.min_prompt_chars.is_some()
         || field_map.max_prompt_chars.is_some()
         || field_map.min_sample_chars.is_some()
@@ -12511,7 +12543,7 @@ fn qwen_sft_record_passes_filters(record: &QwenSftRecord, field_map: &QwenSftFie
     } else {
         None
     };
-    qwen_sft_length_filter_passes(
+    Ok(qwen_sft_length_filter_passes(
         record.response.chars().count(),
         Some(field_map.min_response_chars),
         field_map.max_response_chars,
@@ -12531,21 +12563,24 @@ fn qwen_sft_record_passes_filters(record: &QwenSftRecord, field_map: &QwenSftFie
         record.instruction.chars().count(),
         field_map.min_instruction_chars,
         field_map.max_instruction_chars,
-    ) && qwen_sft_string_contains_any_filter_passes(&record.input, &field_map.input_contains_any)
-        && qwen_sft_string_excludes_any_filter_passes(&record.input, &field_map.input_excludes_any)
-        && qwen_sft_length_filter_passes(
-            record.input.chars().count(),
-            field_map.min_input_chars,
-            field_map.max_input_chars,
-        )
-        && qwen_sft_string_contains_any_filter_passes(
-            &record.system,
-            &field_map.system_contains_any,
-        )
-        && qwen_sft_string_excludes_any_filter_passes(
-            &record.system,
-            &field_map.system_excludes_any,
-        )
+    ) && qwen_sft_string_contains_any_filter_passes(
+        &record.input,
+        &field_map.input_contains_any,
+    ) && qwen_sft_string_excludes_any_filter_passes(
+        &record.input,
+        &field_map.input_excludes_any,
+    ) && qwen_sft_length_filter_passes(
+        record.input.chars().count(),
+        field_map.min_input_chars,
+        field_map.max_input_chars,
+    ) && qwen_sft_string_contains_any_filter_passes(
+        &record.system,
+        &field_map.system_contains_any,
+    ) && qwen_sft_string_excludes_any_filter_passes(
+        &record.system,
+        &field_map.system_excludes_any,
+    ) && qwen_sft_regex_contains_any_filter_passes(record, &field_map.field_regex_contains_any)?
+        && qwen_sft_regex_excludes_any_filter_passes(record, &field_map.field_regex_excludes_any)?
         && qwen_sft_length_filter_passes(
             record.system.chars().count(),
             field_map.min_system_chars,
@@ -12561,7 +12596,7 @@ fn qwen_sft_record_passes_filters(record: &QwenSftRecord, field_map: &QwenSftFie
                 field_map.min_sample_chars,
                 field_map.max_sample_chars,
             )
-        })
+        }))
 }
 
 fn qwen_sft_length_filter_passes(
@@ -12578,6 +12613,64 @@ fn qwen_sft_string_contains_any_filter_passes(value: &str, needles: &[String]) -
 
 fn qwen_sft_string_excludes_any_filter_passes(value: &str, needles: &[String]) -> bool {
     needles.iter().all(|needle| !value.contains(needle))
+}
+
+fn qwen_sft_regex_contains_any_filter_passes(
+    record: &QwenSftRecord,
+    filters: &[FieldRegexFilter],
+) -> Result<bool> {
+    if filters.is_empty() {
+        return Ok(true);
+    }
+    for filter in filters {
+        let regex = regex::Regex::new(&filter.pattern).with_context(|| {
+            format!(
+                "invalid data field regex filter pattern {:?}",
+                filter.pattern
+            )
+        })?;
+        if qwen_sft_regex_filter_matches(record, filter, &regex) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn qwen_sft_regex_excludes_any_filter_passes(
+    record: &QwenSftRecord,
+    filters: &[FieldRegexFilter],
+) -> Result<bool> {
+    for filter in filters {
+        let regex = regex::Regex::new(&filter.pattern).with_context(|| {
+            format!(
+                "invalid data field regex filter pattern {:?}",
+                filter.pattern
+            )
+        })?;
+        if qwen_sft_regex_filter_matches(record, filter, &regex) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn qwen_sft_regex_filter_matches(
+    record: &QwenSftRecord,
+    filter: &FieldRegexFilter,
+    regex: &regex::Regex,
+) -> bool {
+    match filter.field {
+        FieldReplacementTarget::System => regex.is_match(&record.system),
+        FieldReplacementTarget::Instruction => regex.is_match(&record.instruction),
+        FieldReplacementTarget::Input => regex.is_match(&record.input),
+        FieldReplacementTarget::Response => regex.is_match(&record.response),
+        FieldReplacementTarget::All => {
+            regex.is_match(&record.system)
+                || regex.is_match(&record.instruction)
+                || regex.is_match(&record.input)
+                || regex.is_match(&record.response)
+        }
+    }
 }
 
 fn qwen_render_sft_record_prompt(record: &QwenSftRecord, field_map: &QwenSftFieldMap) -> String {
@@ -12821,6 +12914,24 @@ fn qwen_sft_hash_field_map(hash: &mut u64, field_map: &QwenSftFieldMap) {
             qwen_sft_hash_bytes(hash, b",");
         }
         qwen_sft_hash_bytes(hash, b"\0");
+    }
+    if !field_map.field_regex_contains_any.is_empty() {
+        qwen_sft_hash_bytes(hash, b"field_regex_contains_any");
+        for filter in &field_map.field_regex_contains_any {
+            qwen_sft_hash_bytes(hash, format!("{:?}", filter.field).as_bytes());
+            qwen_sft_hash_bytes(hash, b"\0");
+            qwen_sft_hash_bytes(hash, filter.pattern.as_bytes());
+            qwen_sft_hash_bytes(hash, b"\0");
+        }
+    }
+    if !field_map.field_regex_excludes_any.is_empty() {
+        qwen_sft_hash_bytes(hash, b"field_regex_excludes_any");
+        for filter in &field_map.field_regex_excludes_any {
+            qwen_sft_hash_bytes(hash, format!("{:?}", filter.field).as_bytes());
+            qwen_sft_hash_bytes(hash, b"\0");
+            qwen_sft_hash_bytes(hash, filter.pattern.as_bytes());
+            qwen_sft_hash_bytes(hash, b"\0");
+        }
     }
     if !field_map.system_contains_any.is_empty() {
         qwen_sft_hash_bytes(hash, b"system_contains_any");
@@ -15814,6 +15925,80 @@ mod tests {
         assert_eq!(raw_window.examples, loaded.examples);
         assert_eq!(streamed.samples, loaded.examples.len());
         assert_eq!(streamed.fingerprint, loaded.fingerprint);
+        assert_ne!(loaded.fingerprint, default_fingerprint);
+        assert!(first_cache.cache_written);
+        assert!(cache_mismatch.contains("field_map"));
+    }
+
+    #[test]
+    fn qwen_sft_filters_fields_by_regex_before_limit_and_streaming_index() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let jsonl = temp.path().join("samples.jsonl");
+        let cache_path = temp.path().join("cache").join("offset-index.json");
+        fs::write(
+            &jsonl,
+            r#"{"instruction":"Keep project-123 token","input":"GPU context","response":"approved answer"}
+{"instruction":"Drop project-456 token","input":"GPU context","response":"DENIED answer"}
+{"instruction":"Skip project-abc token","input":"GPU context","response":"approved answer"}
+"#,
+        )
+        .expect("jsonl should write");
+        let paths = vec![jsonl.clone()];
+        let field_map = QwenSftFieldMap {
+            field_regex_contains_any: vec![FieldRegexFilter {
+                field: FieldReplacementTarget::Instruction,
+                pattern: r"project-\d+".to_string(),
+            }],
+            field_regex_excludes_any: vec![FieldRegexFilter {
+                field: FieldReplacementTarget::Response,
+                pattern: r"DENIED|blocked".to_string(),
+            }],
+            ..QwenSftFieldMap::default()
+        };
+        let loaded = qwen_sft_examples_from_jsonl_paths_with_limit(&paths, None, &field_map)
+            .expect("regex-filtered examples should load");
+        let streamed = qwen_sft_streaming_source_summary(&paths, None, &field_map)
+            .expect("regex-filtered streaming summary should scan");
+        let source_index = qwen_sft_streaming_source_index(&paths, None, &field_map)
+            .expect("regex-filtered source index should build");
+        let raw_window = qwen_sft_examples_by_raw_indices(&source_index.samples, &field_map)
+            .expect("regex-filtered raw window should read");
+        let first_cache =
+            qwen_sft_streaming_source_index_with_cache(&paths, None, Some(&cache_path), &field_map)
+                .expect("regex-filtered cache should write");
+        let default_fingerprint = qwen_sft_streaming_fingerprint(
+            &paths,
+            None,
+            &loaded.source_files,
+            &QwenSftFieldMap::default(),
+        )
+        .expect("default fingerprint should compute");
+        let filter_mismatch = QwenSftFieldMap {
+            field_regex_contains_any: vec![FieldRegexFilter {
+                field: FieldReplacementTarget::Instruction,
+                pattern: r"project-[a-z]+".to_string(),
+            }],
+            ..field_map.clone()
+        };
+        let cache_mismatch = qwen_sft_streaming_source_index_with_cache(
+            &paths,
+            None,
+            Some(&cache_path),
+            &filter_mismatch,
+        )
+        .expect_err("cache should reject changed regex filters")
+        .to_string();
+
+        assert_eq!(loaded.examples.len(), 1);
+        assert_eq!(loaded.examples[0].instruction, "Keep project-123 token");
+        assert_eq!(loaded.examples[0].response, "approved answer");
+        assert_eq!(raw_window.examples, loaded.examples);
+        assert_eq!(streamed.samples, loaded.examples.len());
+        assert_eq!(streamed.source_files, loaded.source_files);
+        assert_eq!(streamed.source_sample_counts, loaded.source_sample_counts);
+        assert_eq!(streamed.fingerprint, loaded.fingerprint);
+        assert_eq!(source_index.samples.len(), 1);
+        assert_eq!(source_index.samples[0].index_in_file, 0);
         assert_ne!(loaded.fingerprint, default_fingerprint);
         assert!(first_cache.cache_written);
         assert!(cache_mismatch.contains("field_map"));

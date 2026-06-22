@@ -10,8 +10,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::runtime::{
     DataConfig, FieldAffix, FieldCaseTransform, FieldCaseTransformKind, FieldDefault,
-    FieldDefaultTarget, FieldRegexReplacement, FieldReplacement, FieldReplacementTarget,
-    FieldSplit, FieldSplitSide, FieldTruncation,
+    FieldDefaultTarget, FieldRegexFilter, FieldRegexReplacement, FieldReplacement,
+    FieldReplacementTarget, FieldSplit, FieldSplitSide, FieldTruncation,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -79,6 +79,8 @@ struct SftCache {
     response_excludes_any: Vec<String>,
     input_contains_any: Vec<String>,
     input_excludes_any: Vec<String>,
+    field_regex_contains_any: Vec<FieldRegexFilter>,
+    field_regex_excludes_any: Vec<FieldRegexFilter>,
     field_replacements: Vec<FieldReplacement>,
     field_regex_replacements: Vec<FieldRegexReplacement>,
     normalize_whitespace: bool,
@@ -265,6 +267,8 @@ pub fn load_sft_dataset(
         &data.response_excludes_any,
         &data.input_contains_any,
         &data.input_excludes_any,
+        &data.field_regex_contains_any,
+        &data.field_regex_excludes_any,
         &data.field_replacements,
         &data.field_regex_replacements,
         data.normalize_whitespace,
@@ -684,6 +688,8 @@ fn sft_record_passes_filters(data: &DataConfig, record: &InstructionRecord) -> R
         && string_excludes_any_filter_passes(&record.input, &data.input_excludes_any)
         && string_contains_any_filter_passes(&record.system, &data.system_contains_any)
         && string_excludes_any_filter_passes(&record.system, &data.system_excludes_any)
+        && field_regex_contains_any_filter_passes(record, &data.field_regex_contains_any)?
+        && field_regex_excludes_any_filter_passes(record, &data.field_regex_excludes_any)?
         && length_filter_passes(
             record.instruction.chars().count(),
             data.min_instruction_chars,
@@ -719,6 +725,64 @@ fn string_contains_any_filter_passes(value: &str, needles: &[String]) -> bool {
 
 fn string_excludes_any_filter_passes(value: &str, needles: &[String]) -> bool {
     needles.iter().all(|needle| !value.contains(needle))
+}
+
+fn field_regex_contains_any_filter_passes(
+    record: &InstructionRecord,
+    filters: &[FieldRegexFilter],
+) -> Result<bool> {
+    if filters.is_empty() {
+        return Ok(true);
+    }
+    for filter in filters {
+        let regex = Regex::new(&filter.pattern).with_context(|| {
+            format!(
+                "invalid data field regex filter pattern {:?}",
+                filter.pattern
+            )
+        })?;
+        if field_regex_filter_matches(record, filter, &regex) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn field_regex_excludes_any_filter_passes(
+    record: &InstructionRecord,
+    filters: &[FieldRegexFilter],
+) -> Result<bool> {
+    for filter in filters {
+        let regex = Regex::new(&filter.pattern).with_context(|| {
+            format!(
+                "invalid data field regex filter pattern {:?}",
+                filter.pattern
+            )
+        })?;
+        if field_regex_filter_matches(record, filter, &regex) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn field_regex_filter_matches(
+    record: &InstructionRecord,
+    filter: &FieldRegexFilter,
+    regex: &Regex,
+) -> bool {
+    match filter.field {
+        FieldReplacementTarget::System => regex.is_match(&record.system),
+        FieldReplacementTarget::Instruction => regex.is_match(&record.instruction),
+        FieldReplacementTarget::Input => regex.is_match(&record.input),
+        FieldReplacementTarget::Response => regex.is_match(&record.response),
+        FieldReplacementTarget::All => {
+            regex.is_match(&record.system)
+                || regex.is_match(&record.instruction)
+                || regex.is_match(&record.input)
+                || regex.is_match(&record.response)
+        }
+    }
 }
 
 fn normalize_jsonl_field(value: String, data: &DataConfig) -> String {
@@ -1142,6 +1206,8 @@ fn write_sft_cache(
     response_excludes_any: &[String],
     input_contains_any: &[String],
     input_excludes_any: &[String],
+    field_regex_contains_any: &[FieldRegexFilter],
+    field_regex_excludes_any: &[FieldRegexFilter],
     field_replacements: &[FieldReplacement],
     field_regex_replacements: &[FieldRegexReplacement],
     normalize_whitespace: bool,
@@ -1188,6 +1254,8 @@ fn write_sft_cache(
         response_excludes_any: response_excludes_any.to_vec(),
         input_contains_any: input_contains_any.to_vec(),
         input_excludes_any: input_excludes_any.to_vec(),
+        field_regex_contains_any: field_regex_contains_any.to_vec(),
+        field_regex_excludes_any: field_regex_excludes_any.to_vec(),
         field_replacements: field_replacements.to_vec(),
         field_regex_replacements: field_regex_replacements.to_vec(),
         normalize_whitespace,
@@ -1280,6 +1348,8 @@ mod tests {
             response_excludes_any: Vec::new(),
             input_contains_any: Vec::new(),
             input_excludes_any: Vec::new(),
+            field_regex_contains_any: Vec::new(),
+            field_regex_excludes_any: Vec::new(),
             min_instruction_chars: None,
             max_instruction_chars: None,
             min_input_chars: None,
@@ -1356,6 +1426,8 @@ mod tests {
             response_excludes_any: Vec::new(),
             input_contains_any: Vec::new(),
             input_excludes_any: Vec::new(),
+            field_regex_contains_any: Vec::new(),
+            field_regex_excludes_any: Vec::new(),
             min_instruction_chars: None,
             max_instruction_chars: None,
             min_input_chars: None,
@@ -1438,6 +1510,8 @@ mod tests {
             response_excludes_any: Vec::new(),
             input_contains_any: Vec::new(),
             input_excludes_any: Vec::new(),
+            field_regex_contains_any: Vec::new(),
+            field_regex_excludes_any: Vec::new(),
             min_instruction_chars: None,
             max_instruction_chars: None,
             min_input_chars: None,
@@ -1527,6 +1601,8 @@ mod tests {
             response_excludes_any: Vec::new(),
             input_contains_any: Vec::new(),
             input_excludes_any: Vec::new(),
+            field_regex_contains_any: Vec::new(),
+            field_regex_excludes_any: Vec::new(),
             min_instruction_chars: None,
             max_instruction_chars: None,
             min_input_chars: None,
@@ -1615,6 +1691,8 @@ mod tests {
             response_excludes_any: Vec::new(),
             input_contains_any: Vec::new(),
             input_excludes_any: Vec::new(),
+            field_regex_contains_any: Vec::new(),
+            field_regex_excludes_any: Vec::new(),
             min_instruction_chars: None,
             max_instruction_chars: None,
             min_input_chars: None,
@@ -1693,6 +1771,8 @@ mod tests {
             response_excludes_any: Vec::new(),
             input_contains_any: Vec::new(),
             input_excludes_any: Vec::new(),
+            field_regex_contains_any: Vec::new(),
+            field_regex_excludes_any: Vec::new(),
             min_instruction_chars: None,
             max_instruction_chars: None,
             min_input_chars: None,
@@ -1773,6 +1853,8 @@ mod tests {
             response_excludes_any: Vec::new(),
             input_contains_any: Vec::new(),
             input_excludes_any: Vec::new(),
+            field_regex_contains_any: Vec::new(),
+            field_regex_excludes_any: Vec::new(),
             min_instruction_chars: None,
             max_instruction_chars: None,
             min_input_chars: None,
@@ -1856,6 +1938,8 @@ mod tests {
             response_excludes_any: Vec::new(),
             input_contains_any: Vec::new(),
             input_excludes_any: Vec::new(),
+            field_regex_contains_any: Vec::new(),
+            field_regex_excludes_any: Vec::new(),
             min_instruction_chars: None,
             max_instruction_chars: None,
             min_input_chars: None,
@@ -1933,6 +2017,8 @@ mod tests {
             response_excludes_any: Vec::new(),
             input_contains_any: Vec::new(),
             input_excludes_any: Vec::new(),
+            field_regex_contains_any: Vec::new(),
+            field_regex_excludes_any: Vec::new(),
             min_instruction_chars: None,
             max_instruction_chars: None,
             min_input_chars: None,
@@ -2043,6 +2129,8 @@ mod tests {
             response_excludes_any: Vec::new(),
             input_contains_any: Vec::new(),
             input_excludes_any: Vec::new(),
+            field_regex_contains_any: Vec::new(),
+            field_regex_excludes_any: Vec::new(),
             min_instruction_chars: None,
             max_instruction_chars: None,
             min_input_chars: None,
@@ -2122,6 +2210,8 @@ mod tests {
             response_excludes_any: Vec::new(),
             input_contains_any: Vec::new(),
             input_excludes_any: Vec::new(),
+            field_regex_contains_any: Vec::new(),
+            field_regex_excludes_any: Vec::new(),
             min_instruction_chars: None,
             max_instruction_chars: None,
             min_input_chars: None,
@@ -2202,6 +2292,8 @@ mod tests {
             response_excludes_any: Vec::new(),
             input_contains_any: Vec::new(),
             input_excludes_any: Vec::new(),
+            field_regex_contains_any: Vec::new(),
+            field_regex_excludes_any: Vec::new(),
             min_instruction_chars: None,
             max_instruction_chars: None,
             min_input_chars: None,
@@ -2283,6 +2375,8 @@ mod tests {
             response_excludes_any: Vec::new(),
             input_contains_any: Vec::new(),
             input_excludes_any: Vec::new(),
+            field_regex_contains_any: Vec::new(),
+            field_regex_excludes_any: Vec::new(),
             min_instruction_chars: None,
             max_instruction_chars: None,
             min_input_chars: None,
@@ -2365,6 +2459,8 @@ mod tests {
             response_excludes_any: Vec::new(),
             input_contains_any: Vec::new(),
             input_excludes_any: Vec::new(),
+            field_regex_contains_any: Vec::new(),
+            field_regex_excludes_any: Vec::new(),
             min_instruction_chars: None,
             max_instruction_chars: None,
             min_input_chars: None,
@@ -2448,6 +2544,8 @@ mod tests {
             response_excludes_any: Vec::new(),
             input_contains_any: Vec::new(),
             input_excludes_any: Vec::new(),
+            field_regex_contains_any: Vec::new(),
+            field_regex_excludes_any: Vec::new(),
             min_instruction_chars: None,
             max_instruction_chars: None,
             min_input_chars: None,
@@ -2531,6 +2629,8 @@ mod tests {
             response_excludes_any: vec!["banned".to_string()],
             input_contains_any: Vec::new(),
             input_excludes_any: Vec::new(),
+            field_regex_contains_any: Vec::new(),
+            field_regex_excludes_any: Vec::new(),
             min_instruction_chars: None,
             max_instruction_chars: None,
             min_input_chars: None,
@@ -2614,6 +2714,8 @@ mod tests {
             response_excludes_any: Vec::new(),
             input_contains_any: Vec::new(),
             input_excludes_any: Vec::new(),
+            field_regex_contains_any: Vec::new(),
+            field_regex_excludes_any: Vec::new(),
             min_instruction_chars: None,
             max_instruction_chars: None,
             min_input_chars: None,
@@ -2695,6 +2797,8 @@ mod tests {
             response_excludes_any: Vec::new(),
             input_contains_any: Vec::new(),
             input_excludes_any: Vec::new(),
+            field_regex_contains_any: Vec::new(),
+            field_regex_excludes_any: Vec::new(),
             min_instruction_chars: Some(3),
             max_instruction_chars: Some(6),
             min_input_chars: None,
@@ -2778,6 +2882,8 @@ mod tests {
             response_excludes_any: Vec::new(),
             input_contains_any: Vec::new(),
             input_excludes_any: Vec::new(),
+            field_regex_contains_any: Vec::new(),
+            field_regex_excludes_any: Vec::new(),
             min_instruction_chars: None,
             max_instruction_chars: None,
             min_input_chars: Some(2),
@@ -2863,6 +2969,8 @@ mod tests {
             response_excludes_any: Vec::new(),
             input_contains_any: vec!["keep".to_string(), "selected".to_string()],
             input_excludes_any: Vec::new(),
+            field_regex_contains_any: Vec::new(),
+            field_regex_excludes_any: Vec::new(),
             min_instruction_chars: None,
             max_instruction_chars: None,
             min_input_chars: None,
@@ -2950,6 +3058,8 @@ mod tests {
             response_excludes_any: Vec::new(),
             input_contains_any: Vec::new(),
             input_excludes_any: vec!["banned".to_string()],
+            field_regex_contains_any: Vec::new(),
+            field_regex_excludes_any: Vec::new(),
             min_instruction_chars: None,
             max_instruction_chars: None,
             min_input_chars: None,
@@ -3036,6 +3146,8 @@ mod tests {
             response_excludes_any: Vec::new(),
             input_contains_any: Vec::new(),
             input_excludes_any: Vec::new(),
+            field_regex_contains_any: Vec::new(),
+            field_regex_excludes_any: Vec::new(),
             min_instruction_chars: None,
             max_instruction_chars: None,
             min_input_chars: None,
@@ -3119,6 +3231,8 @@ mod tests {
             response_excludes_any: Vec::new(),
             input_contains_any: Vec::new(),
             input_excludes_any: Vec::new(),
+            field_regex_contains_any: Vec::new(),
+            field_regex_excludes_any: Vec::new(),
             min_instruction_chars: None,
             max_instruction_chars: None,
             min_input_chars: None,
@@ -3211,6 +3325,8 @@ mod tests {
             response_excludes_any: Vec::new(),
             input_contains_any: Vec::new(),
             input_excludes_any: Vec::new(),
+            field_regex_contains_any: Vec::new(),
+            field_regex_excludes_any: Vec::new(),
             min_instruction_chars: None,
             max_instruction_chars: None,
             min_input_chars: None,
@@ -3298,6 +3414,8 @@ mod tests {
             response_excludes_any: Vec::new(),
             input_contains_any: Vec::new(),
             input_excludes_any: Vec::new(),
+            field_regex_contains_any: Vec::new(),
+            field_regex_excludes_any: Vec::new(),
             min_instruction_chars: None,
             max_instruction_chars: None,
             min_input_chars: None,
@@ -3381,6 +3499,8 @@ mod tests {
             response_excludes_any: Vec::new(),
             input_contains_any: Vec::new(),
             input_excludes_any: Vec::new(),
+            field_regex_contains_any: Vec::new(),
+            field_regex_excludes_any: Vec::new(),
             min_instruction_chars: None,
             max_instruction_chars: None,
             min_input_chars: None,
@@ -3462,6 +3582,8 @@ mod tests {
             response_excludes_any: Vec::new(),
             input_contains_any: Vec::new(),
             input_excludes_any: Vec::new(),
+            field_regex_contains_any: Vec::new(),
+            field_regex_excludes_any: Vec::new(),
             min_instruction_chars: None,
             max_instruction_chars: None,
             min_input_chars: None,
@@ -3550,6 +3672,8 @@ mod tests {
             response_excludes_any: Vec::new(),
             input_contains_any: Vec::new(),
             input_excludes_any: Vec::new(),
+            field_regex_contains_any: Vec::new(),
+            field_regex_excludes_any: Vec::new(),
             min_instruction_chars: None,
             max_instruction_chars: None,
             min_input_chars: None,
@@ -3638,6 +3762,8 @@ mod tests {
             response_excludes_any: Vec::new(),
             input_contains_any: Vec::new(),
             input_excludes_any: Vec::new(),
+            field_regex_contains_any: Vec::new(),
+            field_regex_excludes_any: Vec::new(),
             min_instruction_chars: None,
             max_instruction_chars: None,
             min_input_chars: None,
@@ -3726,6 +3852,8 @@ mod tests {
             response_excludes_any: Vec::new(),
             input_contains_any: Vec::new(),
             input_excludes_any: Vec::new(),
+            field_regex_contains_any: Vec::new(),
+            field_regex_excludes_any: Vec::new(),
             min_instruction_chars: None,
             max_instruction_chars: None,
             min_input_chars: None,
@@ -3822,6 +3950,8 @@ mod tests {
             response_excludes_any: Vec::new(),
             input_contains_any: Vec::new(),
             input_excludes_any: Vec::new(),
+            field_regex_contains_any: Vec::new(),
+            field_regex_excludes_any: Vec::new(),
             min_instruction_chars: None,
             max_instruction_chars: None,
             min_input_chars: None,
@@ -3876,6 +4006,103 @@ mod tests {
     }
 
     #[test]
+    fn sft_dataset_filters_fields_by_regex_before_split_and_cache() {
+        let dir = tempdir().expect("temp dir should be created");
+        let data_dir = dir.path().join("sft");
+        let cache_dir = dir.path().join("cache");
+        fs::create_dir_all(&data_dir).expect("sft dir should be created");
+        fs::create_dir_all(&cache_dir).expect("cache dir should be created");
+        fs::write(
+            data_dir.join("sample.jsonl"),
+            "{\"instruction\":\"Keep project-123 token\",\"input\":\"GPU context\",\"response\":\"approved answer\"}\n{\"instruction\":\"Also project-789 token\",\"input\":\"GPU context\",\"response\":\"approved reply\"}\n{\"instruction\":\"Drop project-456 token\",\"input\":\"GPU context\",\"response\":\"DENIED answer\"}\n{\"instruction\":\"Skip project-abc token\",\"input\":\"GPU context\",\"response\":\"approved answer\"}\n",
+        )
+        .expect("jsonl should write");
+
+        let data = DataConfig {
+            kind: DataKind::InstructionJsonl,
+            paths: vec![data_dir],
+            eval_paths: Vec::new(),
+            train_split: 0.5,
+            max_samples: None,
+            max_eval_samples: None,
+            shuffle: false,
+            index_cache: None,
+            instruction_field: "instruction".to_string(),
+            input_field: "input".to_string(),
+            response_field: "response".to_string(),
+            system_field: None,
+            chat_messages_field: None,
+            min_system_chars: None,
+            max_system_chars: None,
+            system_contains_any: Vec::new(),
+            system_excludes_any: Vec::new(),
+            prompt_template: "Q: {instruction}\nA: ".to_string(),
+            prompt_with_input_template: "Q: {instruction}\nI: {input}\nA: ".to_string(),
+            trim_fields: true,
+            min_response_chars: 1,
+            max_response_chars: None,
+            instruction_contains_any: Vec::new(),
+            instruction_excludes_any: Vec::new(),
+            response_contains_any: Vec::new(),
+            response_excludes_any: Vec::new(),
+            input_contains_any: Vec::new(),
+            input_excludes_any: Vec::new(),
+            field_regex_contains_any: vec![FieldRegexFilter {
+                field: FieldReplacementTarget::Instruction,
+                pattern: r"project-\d+".to_string(),
+            }],
+            field_regex_excludes_any: vec![FieldRegexFilter {
+                field: FieldReplacementTarget::Response,
+                pattern: r"DENIED|blocked".to_string(),
+            }],
+            min_instruction_chars: None,
+            max_instruction_chars: None,
+            min_input_chars: None,
+            max_input_chars: None,
+            min_prompt_chars: None,
+            max_prompt_chars: None,
+            min_sample_chars: None,
+            max_sample_chars: None,
+            dedupe_samples: false,
+            field_replacements: Vec::new(),
+            field_regex_replacements: Vec::new(),
+            normalize_whitespace: false,
+            field_defaults: Vec::new(),
+            field_case_transforms: Vec::new(),
+            field_affixes: Vec::new(),
+            field_splits: Vec::new(),
+            field_truncations: Vec::new(),
+            source_weights: Vec::new(),
+            source_max_samples: Vec::new(),
+            skip_invalid_records: false,
+        };
+        let dataset =
+            load_sft_dataset(&data, 128, 96, &cache_dir).expect("SFT dataset should load");
+        let decoded = dataset
+            .train_samples
+            .iter()
+            .chain(dataset.eval_samples.iter())
+            .map(|sample| dataset.tokenizer.decode_lossy(&sample.tokens))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let cache_text =
+            fs::read_to_string(cache_dir.join("sft_tokenized.toml")).expect("cache should read");
+
+        assert_eq!(dataset.train_samples.len(), 1);
+        assert_eq!(dataset.eval_samples.len(), 1);
+        assert!(decoded.contains("Keep project-123 token"));
+        assert!(decoded.contains("Also project-789 token"));
+        assert!(decoded.contains("approved answer"));
+        assert!(decoded.contains("approved reply"));
+        assert!(!decoded.contains("Drop project-456 token"));
+        assert!(!decoded.contains("DENIED answer"));
+        assert!(!decoded.contains("Skip project-abc token"));
+        assert!(cache_text.contains("field_regex_contains_any"));
+        assert!(cache_text.contains("field_regex_excludes_any"));
+        assert!(cache_text.contains("DENIED|blocked"));
+    }
+
+    #[test]
     fn sft_dataset_applies_field_defaults_before_filters_and_cache() {
         let dir = tempdir().expect("temp dir should be created");
         let data_dir = dir.path().join("sft");
@@ -3918,6 +4145,8 @@ mod tests {
             response_excludes_any: Vec::new(),
             input_contains_any: vec!["default input".to_string()],
             input_excludes_any: Vec::new(),
+            field_regex_contains_any: Vec::new(),
+            field_regex_excludes_any: Vec::new(),
             min_instruction_chars: None,
             max_instruction_chars: None,
             min_input_chars: None,
@@ -4022,6 +4251,8 @@ mod tests {
             response_excludes_any: Vec::new(),
             input_contains_any: Vec::new(),
             input_excludes_any: Vec::new(),
+            field_regex_contains_any: Vec::new(),
+            field_regex_excludes_any: Vec::new(),
             min_instruction_chars: None,
             max_instruction_chars: None,
             min_input_chars: None,
@@ -4111,6 +4342,8 @@ mod tests {
             response_excludes_any: Vec::new(),
             input_contains_any: vec!["gpu context".to_string()],
             input_excludes_any: Vec::new(),
+            field_regex_contains_any: Vec::new(),
+            field_regex_excludes_any: Vec::new(),
             min_instruction_chars: None,
             max_instruction_chars: None,
             min_input_chars: None,
@@ -4215,6 +4448,8 @@ mod tests {
             response_excludes_any: Vec::new(),
             input_contains_any: vec!["ctx=GPU".to_string()],
             input_excludes_any: Vec::new(),
+            field_regex_contains_any: Vec::new(),
+            field_regex_excludes_any: Vec::new(),
             min_instruction_chars: None,
             max_instruction_chars: None,
             min_input_chars: None,
@@ -4324,6 +4559,8 @@ mod tests {
             response_excludes_any: Vec::new(),
             input_contains_any: vec!["GPU".to_string()],
             input_excludes_any: Vec::new(),
+            field_regex_contains_any: Vec::new(),
+            field_regex_excludes_any: Vec::new(),
             min_instruction_chars: None,
             max_instruction_chars: None,
             min_input_chars: None,
@@ -4423,6 +4660,8 @@ mod tests {
             response_excludes_any: Vec::new(),
             input_contains_any: vec!["GPU context".to_string()],
             input_excludes_any: Vec::new(),
+            field_regex_contains_any: Vec::new(),
+            field_regex_excludes_any: Vec::new(),
             min_instruction_chars: None,
             max_instruction_chars: None,
             min_input_chars: None,
@@ -4531,6 +4770,8 @@ mod tests {
             response_excludes_any: Vec::new(),
             input_contains_any: Vec::new(),
             input_excludes_any: Vec::new(),
+            field_regex_contains_any: Vec::new(),
+            field_regex_excludes_any: Vec::new(),
             min_instruction_chars: None,
             max_instruction_chars: None,
             min_input_chars: None,

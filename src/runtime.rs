@@ -134,6 +134,10 @@ pub struct DataConfig {
     #[serde(default)]
     pub input_excludes_any: Vec<String>,
     #[serde(default)]
+    pub field_regex_contains_any: Vec<FieldRegexFilter>,
+    #[serde(default)]
+    pub field_regex_excludes_any: Vec<FieldRegexFilter>,
+    #[serde(default)]
     pub min_instruction_chars: Option<usize>,
     #[serde(default)]
     pub max_instruction_chars: Option<usize>,
@@ -187,6 +191,12 @@ pub struct FieldRegexReplacement {
     pub field: FieldReplacementTarget,
     pub pattern: String,
     pub replacement: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct FieldRegexFilter {
+    pub field: FieldReplacementTarget,
+    pub pattern: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -680,6 +690,28 @@ pub fn validate_config(config: &Config) -> Result<()> {
                 "data.system_excludes_any entries must not be empty"
             ));
         }
+        for filter in data
+            .field_regex_contains_any
+            .iter()
+            .chain(data.field_regex_excludes_any.iter())
+        {
+            if filter.pattern.is_empty() {
+                return Err(anyhow!(
+                    "data field regex filter pattern entries must not be empty"
+                ));
+            }
+            Regex::new(&filter.pattern).map_err(|error| {
+                anyhow!(
+                    "data field regex filter invalid regex pattern {:?}: {error}",
+                    filter.pattern
+                )
+            })?;
+            if matches!(filter.field, FieldReplacementTarget::System) && !has_system_source {
+                return Err(anyhow!(
+                    "data field regex filters targeting system require data.system_field, data.chat_messages_field, or a system field_default to be set"
+                ));
+            }
+        }
         if data
             .chat_messages_field
             .as_ref()
@@ -1038,6 +1070,28 @@ mod tests {
         );
     }
 
+    #[test]
+    fn data_field_regex_filters_must_be_valid_regexes() {
+        let mut config = qwen_lora_sft_config();
+        config
+            .data
+            .as_mut()
+            .unwrap()
+            .field_regex_contains_any
+            .push(FieldRegexFilter {
+                field: FieldReplacementTarget::Instruction,
+                pattern: "[".to_string(),
+            });
+
+        let error = validate_config(&config).expect_err("invalid regex should fail");
+
+        assert!(
+            error
+                .to_string()
+                .contains("data field regex filter invalid regex pattern")
+        );
+    }
+
     fn qwen_lora_sft_config() -> Config {
         Config {
             run: RunConfig {
@@ -1110,6 +1164,8 @@ mod tests {
                 response_excludes_any: Vec::new(),
                 input_contains_any: Vec::new(),
                 input_excludes_any: Vec::new(),
+                field_regex_contains_any: Vec::new(),
+                field_regex_excludes_any: Vec::new(),
                 min_instruction_chars: None,
                 max_instruction_chars: None,
                 min_input_chars: None,

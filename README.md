@@ -485,7 +485,13 @@ production-grade sharded checkpoint ownership remain open.
   transforms, whitespace normalization, filtering, deduplication, source
   weighting, splitting, and streaming indexing. Regex entries must have a
   non-empty valid pattern, and the default empty list preserves existing
-  fingerprints.
+  fingerprints. `data.field_regex_contains_any` can optionally require at
+  least one Rust regex to match a selected `system`, `instruction`, `input`,
+  `response`, or `all` field, while `data.field_regex_excludes_any` skips
+  records when any selected field matches its regex. These regex filters run
+  after transforms and whitespace normalization but before deduplication,
+  source weighting, splitting, and streaming indexing; empty or invalid regex
+  patterns are rejected.
   `data.field_case_transforms` can then lowercase or uppercase `system`,
   `instruction`, `input`, `response`, or `all` after replacements and before
   whitespace normalization and filtering. The default empty list preserves
@@ -532,8 +538,9 @@ production-grade sharded checkpoint ownership remain open.
   cache files also record source JSONL file size/mtime metadata, the JSONL
   field mapping, optional chat/messages field, prompt templates, field trimming
   policy, field defaults, field replacements, whitespace normalization policy,
-  instruction/input/system/prompt/sample/response length filters, response
-  include/exclude substring filters, instruction substring filters, dedupe
+  instruction/input/system/prompt/sample/response length filters, field regex
+  filters, response include/exclude substring filters, instruction substring
+  filters, dedupe
   policy, and source-weighting policy, so a cache
   created for one external dataset state or schema is rejected if reused after
   source file changes or with a different field map, prompt format,
