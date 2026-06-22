@@ -8,6 +8,9 @@ CONFIG="${RUSTRAIN_QWEN_SFT_STREAMING_BATCH_PLAN_CONFIG:-configs/qwen_session_dp
 EXPECTED_SOURCE="${RUSTRAIN_EXPECTED_STREAMING_SOURCE:-data/sft_toy/instructions.jsonl}"
 EXPECTED_FINGERPRINT="${RUSTRAIN_EXPECTED_STREAMING_FINGERPRINT:-1f1a505dc2c37e79}"
 OUTPUT="$(mktemp)"
+CACHE_PATH="$(mktemp -u /tmp/rustrain-qwen-sft-offset-index-XXXXXX.json)"
+CACHED_OUTPUT_FIRST="$(mktemp)"
+CACHED_OUTPUT_SECOND="$(mktemp)"
 
 cargo run -- qwen-sft-streaming-batch-plan \
   --config "${CONFIG}" \
@@ -15,18 +18,38 @@ cargo run -- qwen-sft-streaming-batch-plan \
   --data-cursor-start 2 \
   | tee "${OUTPUT}"
 
-python - "${OUTPUT}" "${EXPECTED_SOURCE}" "${EXPECTED_FINGERPRINT}" <<'PY'
+cargo run -- qwen-sft-streaming-batch-plan \
+  --config "${CONFIG}" \
+  --world-size 2 \
+  --data-cursor-start 2 \
+  --index-cache "${CACHE_PATH}" \
+  | tee "${CACHED_OUTPUT_FIRST}"
+
+cargo run -- qwen-sft-streaming-batch-plan \
+  --config "${CONFIG}" \
+  --world-size 2 \
+  --data-cursor-start 2 \
+  --index-cache "${CACHE_PATH}" \
+  | tee "${CACHED_OUTPUT_SECOND}"
+
+python - "${OUTPUT}" "${CACHED_OUTPUT_FIRST}" "${CACHED_OUTPUT_SECOND}" "${CACHE_PATH}" "${EXPECTED_SOURCE}" "${EXPECTED_FINGERPRINT}" <<'PY'
 import json
 import pathlib
 import sys
 
-text = pathlib.Path(sys.argv[1]).read_text()
-expected_source = sys.argv[2]
-expected_fingerprint = sys.argv[3]
-start = text.find("{")
-if start < 0:
-    raise SystemExit(f"streaming batch plan output did not contain JSON: {text}")
-data = json.loads(text[start:])
+output_paths = [pathlib.Path(sys.argv[index]) for index in range(1, 4)]
+cache_path = pathlib.Path(sys.argv[4])
+expected_source = sys.argv[5]
+expected_fingerprint = sys.argv[6]
+
+def load_json(path):
+    text = path.read_text()
+    start = text.find("{")
+    if start < 0:
+        raise SystemExit(f"streaming batch plan output did not contain JSON: {text}")
+    return json.loads(text[start:])
+
+summaries = [load_json(path) for path in output_paths]
 
 checks = {
     "world_size": 2,
@@ -53,83 +76,125 @@ checks = {
     "materialized_input_max_delta": 0,
     "materialized_mask_max_delta": 0.0,
 }
-for key, expected in checks.items():
-    if data.get(key) != expected:
-        raise SystemExit(f"{key} {data.get(key)} != {expected}")
-
 expected_window = [
     {"cursor": 2, "epoch": 0, "sample_offset": 2},
     {"cursor": 3, "epoch": 1, "sample_offset": 0},
     {"cursor": 4, "epoch": 1, "sample_offset": 1},
     {"cursor": 5, "epoch": 1, "sample_offset": 2},
 ]
-if data.get("train_window_sample_cursors") != expected_window:
-    raise SystemExit(
-        f"train_window_sample_cursors {data.get('train_window_sample_cursors')} != {expected_window}"
-    )
-
-if data.get("dataset_source_files") != [expected_source]:
-    raise SystemExit(f"dataset_source_files {data.get('dataset_source_files')} != {[expected_source]}")
-if data.get("dataset_source_sample_counts") != [{"path": expected_source, "samples": 4}]:
-    raise SystemExit(
-        f"dataset_source_sample_counts {data.get('dataset_source_sample_counts')} did not match"
-    )
-if data.get("dataset_fingerprint") != expected_fingerprint:
-    raise SystemExit(
-        f"dataset_fingerprint {data.get('dataset_fingerprint')} != {expected_fingerprint}"
-    )
-
-batch_sequence_tokens = data.get("batch_sequence_tokens")
-batch_masked_positions = data.get("batch_masked_positions")
-batch_padding_tokens = data.get("batch_padding_tokens")
-batch_token_fingerprints = data.get("batch_token_fingerprints")
-if not all(isinstance(values, list) and len(values) == 2 for values in [
-    batch_sequence_tokens,
-    batch_masked_positions,
-    batch_padding_tokens,
-    batch_token_fingerprints,
-]):
-    raise SystemExit("expected two streaming batches worth of tokenized batch metadata")
-if any(value <= 1 for value in batch_sequence_tokens):
-    raise SystemExit(f"batch_sequence_tokens must be > 1, got {batch_sequence_tokens}")
-if any(value <= 0 for value in batch_masked_positions):
-    raise SystemExit(f"batch_masked_positions must be positive, got {batch_masked_positions}")
-if any(not isinstance(value, str) or len(value) != 16 for value in batch_token_fingerprints):
-    raise SystemExit(f"bad batch_token_fingerprints: {batch_token_fingerprints}")
-
-raw_indices = data.get("streaming_raw_sample_indices")
 expected_raw_indices = [
     {"path": expected_source, "index_in_file": 3, "global_index": 3},
     {"path": expected_source, "index_in_file": 3, "global_index": 3},
     {"path": expected_source, "index_in_file": 2, "global_index": 2},
     {"path": expected_source, "index_in_file": 1, "global_index": 1},
 ]
-raw_indices_without_offsets = [
-    {key: value for key, value in entry.items() if key != "byte_offset"}
-    for entry in raw_indices
-]
-if raw_indices_without_offsets != expected_raw_indices:
-    raise SystemExit(
-        f"streaming_raw_sample_indices without byte offsets {raw_indices_without_offsets} != {expected_raw_indices}"
-    )
-offsets_by_sample = {}
-for entry in raw_indices:
-    offset = entry.get("byte_offset")
-    if not isinstance(offset, int) or offset < 0:
-        raise SystemExit(f"streaming raw sample byte_offset must be a non-negative integer: {entry}")
-    sample_key = (entry["path"], entry["index_in_file"], entry["global_index"])
-    previous = offsets_by_sample.setdefault(sample_key, offset)
-    if previous != offset:
+
+def verify_summary(data, context):
+    for key, expected in checks.items():
+        if data.get(key) != expected:
+            raise SystemExit(f"{context}: {key} {data.get(key)} != {expected}")
+    if data.get("train_window_sample_cursors") != expected_window:
         raise SystemExit(
-            f"duplicate streaming raw sample {sample_key} used inconsistent byte offsets: {previous} vs {offset}"
+            f"{context}: train_window_sample_cursors {data.get('train_window_sample_cursors')} != {expected_window}"
         )
+    if data.get("dataset_source_files") != [expected_source]:
+        raise SystemExit(
+            f"{context}: dataset_source_files {data.get('dataset_source_files')} != {[expected_source]}"
+        )
+    if data.get("dataset_source_sample_counts") != [{"path": expected_source, "samples": 4}]:
+        raise SystemExit(
+            f"{context}: dataset_source_sample_counts {data.get('dataset_source_sample_counts')} did not match"
+        )
+    if data.get("dataset_fingerprint") != expected_fingerprint:
+        raise SystemExit(
+            f"{context}: dataset_fingerprint {data.get('dataset_fingerprint')} != {expected_fingerprint}"
+        )
+    batch_sequence_tokens = data.get("batch_sequence_tokens")
+    batch_masked_positions = data.get("batch_masked_positions")
+    batch_padding_tokens = data.get("batch_padding_tokens")
+    batch_token_fingerprints = data.get("batch_token_fingerprints")
+    if not all(isinstance(values, list) and len(values) == 2 for values in [
+        batch_sequence_tokens,
+        batch_masked_positions,
+        batch_padding_tokens,
+        batch_token_fingerprints,
+    ]):
+        raise SystemExit(f"{context}: expected two streaming batches worth of tokenized batch metadata")
+    if any(value <= 1 for value in batch_sequence_tokens):
+        raise SystemExit(f"{context}: batch_sequence_tokens must be > 1, got {batch_sequence_tokens}")
+    if any(value <= 0 for value in batch_masked_positions):
+        raise SystemExit(f"{context}: batch_masked_positions must be positive, got {batch_masked_positions}")
+    if any(not isinstance(value, str) or len(value) != 16 for value in batch_token_fingerprints):
+        raise SystemExit(f"{context}: bad batch_token_fingerprints: {batch_token_fingerprints}")
+    raw_indices = data.get("streaming_raw_sample_indices")
+    raw_indices_without_offsets = [
+        {key: value for key, value in entry.items() if key != "byte_offset"}
+        for entry in raw_indices
+    ]
+    if raw_indices_without_offsets != expected_raw_indices:
+        raise SystemExit(
+            f"{context}: streaming_raw_sample_indices without byte offsets {raw_indices_without_offsets} != {expected_raw_indices}"
+        )
+    offsets_by_sample = {}
+    for entry in raw_indices:
+        offset = entry.get("byte_offset")
+        if not isinstance(offset, int) or offset < 0:
+            raise SystemExit(f"{context}: streaming raw sample byte_offset must be a non-negative integer: {entry}")
+        sample_key = (entry["path"], entry["index_in_file"], entry["global_index"])
+        previous = offsets_by_sample.setdefault(sample_key, offset)
+        if previous != offset:
+            raise SystemExit(
+                f"{context}: duplicate streaming raw sample {sample_key} used inconsistent byte offsets: {previous} vs {offset}"
+            )
+    return batch_sequence_tokens, raw_indices
+
+uncached, cache_write, cache_hit = summaries
+batch_sequence_tokens, raw_indices = verify_summary(uncached, "uncached")
+verify_summary(cache_write, "cache_write")
+verify_summary(cache_hit, "cache_hit")
+
+if uncached.get("streaming_index_cache_path") is not None:
+    raise SystemExit("uncached summary should not report streaming_index_cache_path")
+if uncached.get("streaming_index_cache_hit") is not False:
+    raise SystemExit("uncached summary should report streaming_index_cache_hit=false")
+if uncached.get("streaming_index_cache_written") is not False:
+    raise SystemExit("uncached summary should report streaming_index_cache_written=false")
+
+for context, summary, expected_hit, expected_written in [
+    ("cache_write", cache_write, False, True),
+    ("cache_hit", cache_hit, True, False),
+]:
+    if summary.get("streaming_index_cache_path") != str(cache_path):
+        raise SystemExit(
+            f"{context}: streaming_index_cache_path {summary.get('streaming_index_cache_path')} != {cache_path}"
+        )
+    if summary.get("streaming_index_cache_hit") is not expected_hit:
+        raise SystemExit(
+            f"{context}: streaming_index_cache_hit {summary.get('streaming_index_cache_hit')} != {expected_hit}"
+        )
+    if summary.get("streaming_index_cache_written") is not expected_written:
+        raise SystemExit(
+            f"{context}: streaming_index_cache_written {summary.get('streaming_index_cache_written')} != {expected_written}"
+        )
+
+if not cache_path.exists() or cache_path.stat().st_size == 0:
+    raise SystemExit(f"expected non-empty streaming offset index cache at {cache_path}")
+cache = json.loads(cache_path.read_text())
+if cache.get("format") != "rustrain.qwen_sft_offset_index.v1":
+    raise SystemExit(f"unexpected offset index cache format: {cache.get('format')}")
+if len(cache.get("samples", [])) != 4:
+    raise SystemExit(f"expected 4 cached raw sample offsets, got {len(cache.get('samples', []))}")
+if cache_hit.get("streaming_raw_sample_indices") != cache_write.get("streaming_raw_sample_indices"):
+    raise SystemExit("cache hit raw sample indices differ from cache write run")
 
 print(
     "qwen_sft_streaming_batch_plan_verified: "
-    f"streaming_window_samples={data['streaming_window_samples']} "
-    f"streaming_raw_samples_read={data['streaming_raw_samples_read']} "
+    f"streaming_window_samples={uncached['streaming_window_samples']} "
+    f"streaming_raw_samples_read={uncached['streaming_raw_samples_read']} "
+    f"cache_path={cache_path} "
+    f"cache_hit={cache_hit['streaming_index_cache_hit']} "
     f"batch_sequence_tokens={batch_sequence_tokens} "
-    f"materialized_input_max_delta={data['materialized_input_max_delta']} "
-    f"materialized_mask_max_delta={data['materialized_mask_max_delta']}"
+    f"materialized_input_max_delta={uncached['materialized_input_max_delta']} "
+    f"materialized_mask_max_delta={uncached['materialized_mask_max_delta']}"
 )
 PY

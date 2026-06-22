@@ -191,6 +191,8 @@ enum Command {
         world_size: usize,
         #[arg(long, default_value_t = 0)]
         data_cursor_start: usize,
+        #[arg(long)]
+        index_cache: Option<PathBuf>,
     },
     QwenTiedHeadTrainSmoke {
         #[arg(
@@ -500,7 +502,13 @@ fn main() -> Result<()> {
             config,
             world_size,
             data_cursor_start,
-        } => qwen_module::qwen_sft_streaming_batch_plan(&config, world_size, data_cursor_start),
+            index_cache,
+        } => qwen_module::qwen_sft_streaming_batch_plan(
+            &config,
+            world_size,
+            data_cursor_start,
+            index_cache.as_deref(),
+        ),
         Command::QwenTiedHeadTrainSmoke {
             model_path,
             reference_fixture,

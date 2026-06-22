@@ -1560,7 +1560,7 @@ struct QwenSftExampleSet {
     fingerprint: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 struct QwenSftRawSampleIndex {
     path: String,
     index_in_file: usize,
@@ -1573,10 +1573,26 @@ struct QwenSftStreamingSourceIndex {
     samples: Vec<QwenSftRawSampleIndex>,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+struct QwenSftStreamingSourceIndexCache {
+    format: String,
+    paths: Vec<String>,
+    max_samples: Option<usize>,
+    samples: Vec<QwenSftRawSampleIndex>,
+}
+
+struct QwenSftStreamingSourceIndexLoad {
+    index: QwenSftStreamingSourceIndex,
+    cache_hit: bool,
+    cache_written: bool,
+}
+
 struct QwenSftStreamingTokenWindow {
     samples: Vec<QwenSftTokenSample>,
     raw_sample_indices: Vec<QwenSftRawSampleIndex>,
     raw_samples_read: usize,
+    source_index_cache_hit: bool,
+    source_index_cache_written: bool,
 }
 
 struct QwenSftRawExampleWindow {
@@ -1714,6 +1730,9 @@ struct QwenSftStreamingBatchPlanSummary {
     tokenizer_loaded: bool,
     tokenized_samples_materialized: bool,
     reference_tokenized_samples_materialized: bool,
+    streaming_index_cache_path: Option<String>,
+    streaming_index_cache_hit: bool,
+    streaming_index_cache_written: bool,
     streaming_window_samples: usize,
     streaming_raw_samples_read: usize,
     streaming_raw_sample_indices: Vec<QwenSftRawSampleIndex>,
@@ -2708,6 +2727,7 @@ fn qwen_lora_sft_train(
                 policy.dataset_order_seed,
                 data_cursor_start,
                 steps * gradient_accumulation_steps * train_batch_size,
+                None,
             )
         })
         .transpose()?;
@@ -5634,6 +5654,7 @@ pub fn qwen_sft_streaming_batch_plan(
     config_path: &Path,
     world_size: usize,
     data_cursor_start: usize,
+    index_cache: Option<&Path>,
 ) -> Result<()> {
     if world_size == 0 {
         bail!("qwen SFT streaming batch plan requires world_size > 0");
@@ -5699,6 +5720,7 @@ pub fn qwen_sft_streaming_batch_plan(
         config.run.seed,
         data_cursor_start,
         train_window_sample_cursors.len(),
+        index_cache,
     )?;
     let mut batch_sequence_tokens = Vec::with_capacity(train_batch_count);
     let mut batch_masked_positions = Vec::with_capacity(train_batch_count);
@@ -5756,6 +5778,9 @@ pub fn qwen_sft_streaming_batch_plan(
         tokenizer_loaded: true,
         tokenized_samples_materialized: true,
         reference_tokenized_samples_materialized: true,
+        streaming_index_cache_path: index_cache.map(|path| path.display().to_string()),
+        streaming_index_cache_hit: streaming_window.source_index_cache_hit,
+        streaming_index_cache_written: streaming_window.source_index_cache_written,
         streaming_window_samples: streaming_window.samples.len(),
         streaming_raw_samples_read: streaming_window.raw_samples_read,
         streaming_raw_sample_indices: streaming_window.raw_sample_indices,
@@ -8785,6 +8810,7 @@ fn qwen_session_batch_plan_from_config(
         runtime_config.run.seed,
         data_cursor_start,
         required_batches + batch_size - 1,
+        None,
     )?;
     let train_batches = (0..required_batches)
         .map(|relative_cursor| {
@@ -8931,6 +8957,7 @@ fn qwen_session_dp_batch_plan_from_config(
         runtime_config.run.seed,
         data_cursor_start,
         required_batches + global_batch_size - 1,
+        None,
     )?;
     let global_train_batches = (0..required_batches)
         .map(|relative_cursor| {
@@ -10410,11 +10437,14 @@ fn qwen_sft_streaming_token_window_from_jsonl(
     seed: u64,
     data_cursor_start: usize,
     window_samples: usize,
+    index_cache: Option<&Path>,
 ) -> Result<QwenSftStreamingTokenWindow> {
     if window_samples == 0 {
         bail!("SFT streaming token window requires at least one sample");
     }
-    let source_index = qwen_sft_streaming_source_index(paths, max_samples)?;
+    let source_index_load =
+        qwen_sft_streaming_source_index_with_cache(paths, max_samples, index_cache)?;
+    let source_index = source_index_load.index;
     let train_samples = if eval_paths.is_empty() {
         let (train_samples, _) =
             qwen_sft_train_eval_sample_counts(source_index.samples.len(), train_split)?;
@@ -10455,6 +10485,8 @@ fn qwen_sft_streaming_token_window_from_jsonl(
         samples,
         raw_sample_indices,
         raw_samples_read: raw_window.raw_samples_read,
+        source_index_cache_hit: source_index_load.cache_hit,
+        source_index_cache_written: source_index_load.cache_written,
     })
 }
 
@@ -10696,6 +10728,84 @@ fn qwen_sft_streaming_source_index(
     }
 
     Ok(QwenSftStreamingSourceIndex { samples })
+}
+
+fn qwen_sft_streaming_source_index_with_cache(
+    paths: &[PathBuf],
+    max_samples: Option<usize>,
+    cache_path: Option<&Path>,
+) -> Result<QwenSftStreamingSourceIndexLoad> {
+    let expected_paths = paths
+        .iter()
+        .map(|path| path.display().to_string())
+        .collect::<Vec<_>>();
+    if let Some(cache_path) = cache_path {
+        if cache_path.exists() {
+            let contents = fs::read_to_string(cache_path)
+                .with_context(|| format!("failed to read {}", cache_path.display()))?;
+            let cache: QwenSftStreamingSourceIndexCache = serde_json::from_str(&contents)
+                .with_context(|| format!("failed to parse {}", cache_path.display()))?;
+            if cache.format != "rustrain.qwen_sft_offset_index.v1" {
+                bail!(
+                    "unsupported SFT streaming index cache format {} in {}",
+                    cache.format,
+                    cache_path.display()
+                );
+            }
+            if cache.paths != expected_paths {
+                bail!(
+                    "SFT streaming index cache paths {:?} do not match {:?}",
+                    cache.paths,
+                    expected_paths
+                );
+            }
+            if cache.max_samples != max_samples {
+                bail!(
+                    "SFT streaming index cache max_samples {:?} does not match {:?}",
+                    cache.max_samples,
+                    max_samples
+                );
+            }
+            if cache.samples.is_empty() {
+                bail!(
+                    "SFT streaming index cache {} contains no samples",
+                    cache_path.display()
+                );
+            }
+            return Ok(QwenSftStreamingSourceIndexLoad {
+                index: QwenSftStreamingSourceIndex {
+                    samples: cache.samples,
+                },
+                cache_hit: true,
+                cache_written: false,
+            });
+        }
+    }
+
+    let index = qwen_sft_streaming_source_index(paths, max_samples)?;
+    let mut cache_written = false;
+    if let Some(cache_path) = cache_path {
+        if let Some(parent) = cache_path.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create {}", parent.display()))?;
+        }
+        let cache = QwenSftStreamingSourceIndexCache {
+            format: "rustrain.qwen_sft_offset_index.v1".to_string(),
+            paths: expected_paths,
+            max_samples,
+            samples: index.samples.clone(),
+        };
+        let contents = serde_json::to_string_pretty(&cache)
+            .context("failed to serialize SFT streaming index cache")?;
+        fs::write(cache_path, contents)
+            .with_context(|| format!("failed to write {}", cache_path.display()))?;
+        cache_written = true;
+    }
+    Ok(QwenSftStreamingSourceIndexLoad {
+        index,
+        cache_hit: false,
+        cache_written,
+    })
 }
 
 fn qwen_sft_examples_by_raw_indices(
@@ -13890,6 +14000,42 @@ not-json
             Err(error) => error.to_string(),
         };
         assert!(error.contains("failed to parse SFT JSONL record"));
+    }
+
+    #[test]
+    fn qwen_sft_streaming_source_index_cache_writes_and_reuses_offsets() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let jsonl = temp.path().join("train.jsonl");
+        let cache_path = temp.path().join("cache").join("offset-index.json");
+        fs::write(
+            &jsonl,
+            r#"{"instruction":"zero","response":"a"}
+{"instruction":"one","response":"b"}
+{"instruction":"two","response":"c"}
+"#,
+        )
+        .expect("jsonl should write");
+        let paths = vec![jsonl.clone()];
+
+        let first = qwen_sft_streaming_source_index_with_cache(&paths, Some(2), Some(&cache_path))
+            .expect("first cache load should build index");
+        assert!(!first.cache_hit);
+        assert!(first.cache_written);
+        assert_eq!(first.index.samples.len(), 2);
+        assert!(cache_path.exists());
+
+        let second = qwen_sft_streaming_source_index_with_cache(&paths, Some(2), Some(&cache_path))
+            .expect("second cache load should hit cache");
+        assert!(second.cache_hit);
+        assert!(!second.cache_written);
+        assert_eq!(second.index.samples, first.index.samples);
+
+        let mismatch =
+            match qwen_sft_streaming_source_index_with_cache(&paths, Some(3), Some(&cache_path)) {
+                Ok(_) => panic!("mismatched max_samples should reject cache"),
+                Err(error) => error.to_string(),
+            };
+        assert!(mismatch.contains("max_samples"));
     }
 
     #[test]
