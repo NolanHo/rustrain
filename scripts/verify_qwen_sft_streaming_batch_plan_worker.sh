@@ -6,7 +6,7 @@ source "${SCRIPT_DIR}/require_gpu_worker.sh"
 
 CONFIG="${RUSTRAIN_QWEN_SFT_STREAMING_BATCH_PLAN_CONFIG:-configs/qwen_session_dp2_sft_max_samples.toml}"
 EXPECTED_SOURCE="${RUSTRAIN_EXPECTED_STREAMING_SOURCE:-data/sft_toy/instructions.jsonl}"
-EXPECTED_FINGERPRINT="${RUSTRAIN_EXPECTED_STREAMING_FINGERPRINT:-1f1a505dc2c37e79}"
+EXPECTED_FINGERPRINT="${RUSTRAIN_EXPECTED_STREAMING_FINGERPRINT:-3bfd266239e4b9b9}"
 OUTPUT="$(mktemp)"
 CACHE_PATH="$(mktemp -u /tmp/rustrain-qwen-sft-offset-index-XXXXXX.json)"
 CACHED_OUTPUT_FIRST="$(mktemp)"
@@ -180,8 +180,26 @@ for context, summary, expected_hit, expected_written in [
 if not cache_path.exists() or cache_path.stat().st_size == 0:
     raise SystemExit(f"expected non-empty streaming offset index cache at {cache_path}")
 cache = json.loads(cache_path.read_text())
-if cache.get("format") != "rustrain.qwen_sft_offset_index.v1":
+if cache.get("format") != "rustrain.qwen_sft_offset_index.v4":
     raise SystemExit(f"unexpected offset index cache format: {cache.get('format')}")
+field_map = cache.get("field_map")
+if not isinstance(field_map, dict):
+    raise SystemExit(f"expected cache field_map object, got {field_map}")
+expected_field_map = {
+    "instruction": "instruction",
+    "input": "input",
+    "response": "response",
+    "prompt_template": "Instruction:\n{instruction}\n\nResponse:\n",
+    "prompt_with_input_template": "Instruction:\n{instruction}\n\nInput:\n{input}\n\nResponse:\n",
+    "trim_fields": True,
+    "min_response_chars": 1,
+    "source_weights": [],
+}
+for key, expected in expected_field_map.items():
+    if field_map.get(key) != expected:
+        raise SystemExit(f"cache field_map[{key!r}] {field_map.get(key)!r} != {expected!r}")
+if cache.get("min_response_chars") != 1:
+    raise SystemExit(f"cache min_response_chars {cache.get('min_response_chars')} != 1")
 if len(cache.get("samples", [])) != 4:
     raise SystemExit(f"expected 4 cached raw sample offsets, got {len(cache.get('samples', []))}")
 if cache_hit.get("streaming_raw_sample_indices") != cache_write.get("streaming_raw_sample_indices"):
