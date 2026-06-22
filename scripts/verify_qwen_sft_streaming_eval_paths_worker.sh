@@ -7,7 +7,11 @@ source "${SCRIPT_DIR}/require_gpu_worker.sh"
 CONFIG="${RUSTRAIN_QWEN_SFT_STREAMING_EVAL_PATHS_CONFIG:-configs/qwen_session_dp2_sft_eval_paths.toml}"
 OUTPUT="$(mktemp)"
 
-cargo run -- qwen-sft-streaming-data-plan --config "${CONFIG}" | tee "${OUTPUT}"
+cargo run -- qwen-sft-streaming-data-plan \
+  --config "${CONFIG}" \
+  --world-size 2 \
+  --data-cursor-start 4 \
+  | tee "${OUTPUT}"
 
 python - "${OUTPUT}" <<'PY'
 import json
@@ -43,6 +47,20 @@ expected_eval_counts = {"data/sft_toy/eval_instructions.jsonl": 2}
 
 checks = {
     "max_samples": None,
+    "world_size": 2,
+    "local_batch_size": 1,
+    "global_batch_size": 2,
+    "train_steps": 2,
+    "required_batches": 5,
+    "data_cursor_start": 4,
+    "data_cursor_end": 8,
+    "data_cursor_next": 8,
+    "data_epoch_start": 0,
+    "data_epoch_end": 1,
+    "data_epoch_next": 1,
+    "data_sample_offset_start": 4,
+    "data_sample_offset_end": 0,
+    "data_sample_offset_next": 0,
     "dataset_total_samples": 10,
     "dataset_train_samples": 8,
     "dataset_eval_samples": 2,

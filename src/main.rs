@@ -178,6 +178,10 @@ enum Command {
     QwenSftStreamingDataPlan {
         #[arg(long)]
         config: PathBuf,
+        #[arg(long, default_value_t = 1)]
+        world_size: usize,
+        #[arg(long, default_value_t = 0)]
+        data_cursor_start: usize,
     },
     QwenTiedHeadTrainSmoke {
         #[arg(
@@ -478,9 +482,11 @@ fn main() -> Result<()> {
             alpha,
             learning_rate,
         ),
-        Command::QwenSftStreamingDataPlan { config } => {
-            qwen_module::qwen_sft_streaming_data_plan(&config)
-        }
+        Command::QwenSftStreamingDataPlan {
+            config,
+            world_size,
+            data_cursor_start,
+        } => qwen_module::qwen_sft_streaming_data_plan(&config, world_size, data_cursor_start),
         Command::QwenTiedHeadTrainSmoke {
             model_path,
             reference_fixture,

@@ -9,7 +9,11 @@ EXPECTED_SOURCE="${RUSTRAIN_EXPECTED_STREAMING_SOURCE:-data/sft_toy/instructions
 EXPECTED_FINGERPRINT="${RUSTRAIN_EXPECTED_STREAMING_FINGERPRINT:-1f1a505dc2c37e79}"
 OUTPUT="$(mktemp)"
 
-cargo run -- qwen-sft-streaming-data-plan --config "${CONFIG}" | tee "${OUTPUT}"
+cargo run -- qwen-sft-streaming-data-plan \
+  --config "${CONFIG}" \
+  --world-size 2 \
+  --data-cursor-start 2 \
+  | tee "${OUTPUT}"
 
 python - "${OUTPUT}" "${EXPECTED_SOURCE}" "${EXPECTED_FINGERPRINT}" <<'PY'
 import json
@@ -26,6 +30,20 @@ data = json.loads(text[start:])
 
 checks = {
     "max_samples": 4,
+    "world_size": 2,
+    "local_batch_size": 1,
+    "global_batch_size": 2,
+    "train_steps": 1,
+    "required_batches": 3,
+    "data_cursor_start": 2,
+    "data_cursor_end": 4,
+    "data_cursor_next": 4,
+    "data_epoch_start": 0,
+    "data_epoch_end": 1,
+    "data_epoch_next": 1,
+    "data_sample_offset_start": 2,
+    "data_sample_offset_end": 1,
+    "data_sample_offset_next": 1,
     "dataset_total_samples": 4,
     "dataset_train_samples": 3,
     "dataset_eval_samples": 1,

@@ -1605,6 +1605,20 @@ struct QwenSftStreamingDataPlanSummary {
     eval_paths: Vec<String>,
     max_samples: Option<usize>,
     train_split: f32,
+    world_size: usize,
+    local_batch_size: usize,
+    global_batch_size: usize,
+    train_steps: usize,
+    required_batches: usize,
+    data_cursor_start: usize,
+    data_cursor_end: usize,
+    data_cursor_next: usize,
+    data_epoch_start: usize,
+    data_epoch_end: usize,
+    data_epoch_next: usize,
+    data_sample_offset_start: usize,
+    data_sample_offset_end: usize,
+    data_sample_offset_next: usize,
     dataset_total_samples: usize,
     dataset_train_samples: usize,
     dataset_eval_samples: usize,
@@ -5327,7 +5341,14 @@ pub fn qwen_session_dp_data_plan(
     Ok(())
 }
 
-pub fn qwen_sft_streaming_data_plan(config_path: &Path) -> Result<()> {
+pub fn qwen_sft_streaming_data_plan(
+    config_path: &Path,
+    world_size: usize,
+    data_cursor_start: usize,
+) -> Result<()> {
+    if world_size == 0 {
+        bail!("qwen SFT streaming data plan requires world_size > 0");
+    }
     let config = load_config(config_path)?;
     let data_config = config
         .data
@@ -5388,6 +5409,23 @@ pub fn qwen_sft_streaming_data_plan(config_path: &Path) -> Result<()> {
         )
     };
 
+    let local_batch_size = config
+        .train
+        .micro_batch_size
+        .min(dataset_train_samples)
+        .max(1);
+    let global_batch_size = local_batch_size * world_size;
+    let train_steps = config.train.max_steps as usize;
+    let required_batches = train_steps * global_batch_size + 1;
+    let data_cursor_end = data_cursor_start + train_steps * global_batch_size;
+    let data_cursor_next = data_cursor_end;
+    let (data_epoch_start, data_sample_offset_start) =
+        qwen_data_epoch_and_offset(data_cursor_start, dataset_train_samples)?;
+    let (data_epoch_end, data_sample_offset_end) =
+        qwen_data_epoch_and_offset(data_cursor_end, dataset_train_samples)?;
+    let (data_epoch_next, data_sample_offset_next) =
+        qwen_data_epoch_and_offset(data_cursor_next, dataset_train_samples)?;
+
     let summary = QwenSftStreamingDataPlanSummary {
         config_path: config_path.display().to_string(),
         data_paths: data_config
@@ -5402,6 +5440,20 @@ pub fn qwen_sft_streaming_data_plan(config_path: &Path) -> Result<()> {
             .collect(),
         max_samples: data_config.max_samples,
         train_split: data_config.train_split,
+        world_size,
+        local_batch_size,
+        global_batch_size,
+        train_steps,
+        required_batches,
+        data_cursor_start,
+        data_cursor_end,
+        data_cursor_next,
+        data_epoch_start,
+        data_epoch_end,
+        data_epoch_next,
+        data_sample_offset_start,
+        data_sample_offset_end,
+        data_sample_offset_next,
         dataset_total_samples,
         dataset_train_samples,
         dataset_eval_samples,
@@ -13036,6 +13088,29 @@ mod tests {
         assert_eq!(streamed.source_files, loaded.source_files);
         assert_eq!(streamed.source_sample_counts, loaded.source_sample_counts);
         assert_eq!(streamed.fingerprint, loaded.fingerprint);
+    }
+
+    #[test]
+    fn qwen_sft_streaming_window_uses_train_split_sample_count() {
+        let (train_samples, eval_samples) =
+            qwen_sft_train_eval_sample_counts(4, 0.75).expect("split should compute");
+        let world_size = 2usize;
+        let local_batch_size = 1usize;
+        let global_batch_size = local_batch_size * world_size;
+        let train_steps = 1usize;
+        let data_cursor_start = 2usize;
+        let data_cursor_end = data_cursor_start + train_steps * global_batch_size;
+        let (epoch_start, offset_start) =
+            qwen_data_epoch_and_offset(data_cursor_start, train_samples)
+                .expect("start cursor should map");
+        let (epoch_next, offset_next) = qwen_data_epoch_and_offset(data_cursor_end, train_samples)
+            .expect("next cursor should map");
+
+        assert_eq!(train_samples, 3);
+        assert_eq!(eval_samples, 1);
+        assert_eq!(data_cursor_end, 4);
+        assert_eq!((epoch_start, offset_start), (0, 2));
+        assert_eq!((epoch_next, offset_next), (1, 1));
     }
 
     #[test]
