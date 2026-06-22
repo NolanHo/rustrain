@@ -100,6 +100,8 @@ pub struct DataConfig {
     pub prompt_template: String,
     #[serde(default = "default_prompt_with_input_template")]
     pub prompt_with_input_template: String,
+    #[serde(default = "default_trim_fields")]
+    pub trim_fields: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -487,6 +489,10 @@ fn default_prompt_with_input_template() -> String {
     "Instruction:\n{instruction}\n\nInput:\n{input}\n\nResponse:\n".to_string()
 }
 
+fn default_trim_fields() -> bool {
+    true
+}
+
 fn default_eval_every() -> u64 {
     0
 }
@@ -586,6 +592,7 @@ mod tests {
                 response_field: default_response_field(),
                 prompt_template: default_prompt_template(),
                 prompt_with_input_template: default_prompt_with_input_template(),
+                trim_fields: default_trim_fields(),
             }),
             lora: Some(LoraConfig {
                 rank: 4,

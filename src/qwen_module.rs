@@ -1630,6 +1630,7 @@ struct QwenSftFieldMap {
     response: String,
     prompt_template: String,
     prompt_with_input_template: String,
+    trim_fields: bool,
 }
 
 impl QwenSftFieldMap {
@@ -1640,6 +1641,7 @@ impl QwenSftFieldMap {
             response: data.response_field.clone(),
             prompt_template: data.prompt_template.clone(),
             prompt_with_input_template: data.prompt_with_input_template.clone(),
+            trim_fields: data.trim_fields,
         };
         map.validate()?;
         Ok(map)
@@ -1674,6 +1676,7 @@ impl Default for QwenSftFieldMap {
             prompt_template: "Instruction:\n{instruction}\n\nResponse:\n".to_string(),
             prompt_with_input_template:
                 "Instruction:\n{instruction}\n\nInput:\n{input}\n\nResponse:\n".to_string(),
+            trim_fields: true,
         }
     }
 }
@@ -11439,14 +11442,31 @@ fn qwen_sft_record_from_jsonl_line(
 ) -> Result<QwenSftRecord> {
     let values: BTreeMap<String, serde_json::Value> =
         serde_json::from_str(line).context("invalid JSON object")?;
-    let instruction = qwen_required_jsonl_string_field(&values, &field_map.instruction)?;
-    let input = qwen_optional_jsonl_string_field(&values, &field_map.input)?;
-    let response = qwen_required_jsonl_string_field(&values, &field_map.response)?;
+    let instruction = qwen_normalize_jsonl_field(
+        qwen_required_jsonl_string_field(&values, &field_map.instruction)?,
+        field_map,
+    );
+    let input = qwen_normalize_jsonl_field(
+        qwen_optional_jsonl_string_field(&values, &field_map.input)?,
+        field_map,
+    );
+    let response = qwen_normalize_jsonl_field(
+        qwen_required_jsonl_string_field(&values, &field_map.response)?,
+        field_map,
+    );
     Ok(QwenSftRecord {
         instruction,
         input,
         response,
     })
+}
+
+fn qwen_normalize_jsonl_field(value: String, field_map: &QwenSftFieldMap) -> String {
+    if field_map.trim_fields {
+        value.trim().to_string()
+    } else {
+        value
+    }
 }
 
 fn qwen_required_jsonl_string_field(
@@ -11510,6 +11530,15 @@ fn qwen_sft_hash_field_map(hash: &mut u64, field_map: &QwenSftFieldMap) {
     qwen_sft_hash_bytes(hash, field_map.prompt_template.as_bytes());
     qwen_sft_hash_bytes(hash, b"\0");
     qwen_sft_hash_bytes(hash, field_map.prompt_with_input_template.as_bytes());
+    qwen_sft_hash_bytes(hash, b"\0");
+    qwen_sft_hash_bytes(
+        hash,
+        if field_map.trim_fields {
+            b"trim".as_slice()
+        } else {
+            b"raw".as_slice()
+        },
+    );
     qwen_sft_hash_bytes(hash, b"\0");
 }
 
@@ -14026,6 +14055,40 @@ mod tests {
             "### User\nName the project.\nContext: Rust trainer\n### Assistant\n"
         );
         assert_ne!(default_fingerprint, custom_fingerprint);
+    }
+
+    #[test]
+    fn qwen_sft_trim_fields_controls_record_normalization_and_fingerprint() {
+        let line = r#"{"instruction":"  Name the project.  ","input":"  Rust trainer  ","response":"  rustrain  "}"#;
+        let trim_map = QwenSftFieldMap::default();
+        let raw_map = QwenSftFieldMap {
+            trim_fields: false,
+            ..QwenSftFieldMap::default()
+        };
+        let trimmed =
+            qwen_sft_record_from_jsonl_line(line, &trim_map).expect("trimmed record should parse");
+        let raw = qwen_sft_record_from_jsonl_line(line, &raw_map).expect("raw record should parse");
+        let trimmed_example = QwenSftExample {
+            instruction: trimmed.instruction.clone(),
+            input: trimmed.input.clone(),
+            response: trimmed.response.clone(),
+        };
+        let raw_example = QwenSftExample {
+            instruction: raw.instruction.clone(),
+            input: raw.input.clone(),
+            response: raw.response.clone(),
+        };
+
+        assert_eq!(trimmed.instruction, "Name the project.");
+        assert_eq!(trimmed.input, "Rust trainer");
+        assert_eq!(trimmed.response, "rustrain");
+        assert_eq!(raw.instruction, "  Name the project.  ");
+        assert_eq!(raw.input, "  Rust trainer  ");
+        assert_eq!(raw.response, "  rustrain  ");
+        assert_ne!(
+            qwen_sft_dataset_fingerprint(&[], &[trimmed_example], &trim_map),
+            qwen_sft_dataset_fingerprint(&[], &[raw_example], &raw_map)
+        );
     }
 
     #[test]

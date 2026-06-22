@@ -309,14 +309,31 @@ fn read_sft_paths(
 fn instruction_record_from_jsonl_line(data: &DataConfig, line: &str) -> Result<InstructionRecord> {
     let values: BTreeMap<String, serde_json::Value> =
         serde_json::from_str(line).context("invalid JSON object")?;
-    let instruction = required_jsonl_string_field(&values, &data.instruction_field)?;
-    let input = optional_jsonl_string_field(&values, &data.input_field)?;
-    let response = required_jsonl_string_field(&values, &data.response_field)?;
+    let instruction = normalize_jsonl_field(
+        required_jsonl_string_field(&values, &data.instruction_field)?,
+        data,
+    );
+    let input = normalize_jsonl_field(
+        optional_jsonl_string_field(&values, &data.input_field)?,
+        data,
+    );
+    let response = normalize_jsonl_field(
+        required_jsonl_string_field(&values, &data.response_field)?,
+        data,
+    );
     Ok(InstructionRecord {
         instruction,
         input,
         response,
     })
+}
+
+fn normalize_jsonl_field(value: String, data: &DataConfig) -> String {
+    if data.trim_fields {
+        value.trim().to_string()
+    } else {
+        value
+    }
 }
 
 fn required_jsonl_string_field(
@@ -457,6 +474,7 @@ mod tests {
             prompt_template: "Instruction:\n{instruction}\n\nResponse:\n".to_string(),
             prompt_with_input_template:
                 "Instruction:\n{instruction}\n\nInput:\n{input}\n\nResponse:\n".to_string(),
+            trim_fields: true,
         };
         let dataset = load_text_dataset(&data, 64, 8, &cache_dir).expect("dataset should load");
 
@@ -497,6 +515,7 @@ mod tests {
             prompt_template: "Instruction:\n{instruction}\n\nResponse:\n".to_string(),
             prompt_with_input_template:
                 "Instruction:\n{instruction}\n\nInput:\n{input}\n\nResponse:\n".to_string(),
+            trim_fields: true,
         };
         let dataset = load_text_dataset(&data, 128, 8, &cache_dir).expect("dataset should load");
 
@@ -543,6 +562,7 @@ mod tests {
             prompt_template: "Instruction:\n{instruction}\n\nResponse:\n".to_string(),
             prompt_with_input_template:
                 "Instruction:\n{instruction}\n\nInput:\n{input}\n\nResponse:\n".to_string(),
+            trim_fields: true,
         };
         let dataset =
             load_sft_dataset(&data, 128, 64, &cache_dir).expect("SFT dataset should load");
@@ -596,6 +616,7 @@ mod tests {
             response_field: "response".to_string(),
             prompt_template: "Q: {instruction}\nA: ".to_string(),
             prompt_with_input_template: "Q: {instruction}\nContext: {input}\nA: ".to_string(),
+            trim_fields: true,
         };
         let dataset =
             load_sft_dataset(&data, 128, 96, &cache_dir).expect("SFT dataset should load");
@@ -619,6 +640,65 @@ mod tests {
                 .iter()
                 .any(|enabled| !*enabled)
         );
+    }
+
+    #[test]
+    fn sft_dataset_trim_fields_controls_prompt_normalization() {
+        let record = InstructionRecord {
+            instruction: "  name project  ".to_string(),
+            input: "  rust trainer  ".to_string(),
+            response: "  rustrain  ".to_string(),
+        };
+        let trim_data = DataConfig {
+            kind: DataKind::InstructionJsonl,
+            paths: Vec::new(),
+            eval_paths: Vec::new(),
+            train_split: 0.5,
+            max_samples: None,
+            shuffle: false,
+            index_cache: None,
+            instruction_field: "instruction".to_string(),
+            input_field: "input".to_string(),
+            response_field: "response".to_string(),
+            prompt_template: "Q:{instruction}\nA:".to_string(),
+            prompt_with_input_template: "Q:{instruction}\nI:{input}\nA:".to_string(),
+            trim_fields: true,
+        };
+        let raw_data = DataConfig {
+            trim_fields: false,
+            ..trim_data.clone()
+        };
+        let trimmed = InstructionRecord {
+            instruction: normalize_jsonl_field(record.instruction.clone(), &trim_data),
+            input: normalize_jsonl_field(record.input.clone(), &trim_data),
+            response: normalize_jsonl_field(record.response.clone(), &trim_data),
+        };
+        let raw = InstructionRecord {
+            instruction: normalize_jsonl_field(record.instruction.clone(), &raw_data),
+            input: normalize_jsonl_field(record.input.clone(), &raw_data),
+            response: normalize_jsonl_field(record.response.clone(), &raw_data),
+        };
+
+        assert_eq!(
+            render_sft_prompt(
+                &trimmed,
+                &trim_data.prompt_template,
+                &trim_data.prompt_with_input_template,
+            )
+            .expect("trimmed prompt should render"),
+            "Q:name project\nI:rust trainer\nA:"
+        );
+        assert_eq!(
+            render_sft_prompt(
+                &raw,
+                &raw_data.prompt_template,
+                &raw_data.prompt_with_input_template,
+            )
+            .expect("raw prompt should render"),
+            "Q:  name project  \nI:  rust trainer  \nA:"
+        );
+        assert_eq!(trimmed.response, "rustrain");
+        assert_eq!(raw.response, "  rustrain  ");
     }
 
     #[test]
@@ -655,6 +735,7 @@ mod tests {
             prompt_template: "Instruction:\n{instruction}\n\nResponse:\n".to_string(),
             prompt_with_input_template:
                 "Instruction:\n{instruction}\n\nInput:\n{input}\n\nResponse:\n".to_string(),
+            trim_fields: true,
         };
         let dataset =
             load_sft_dataset(&data, 128, 64, &cache_dir).expect("SFT dataset should load");
@@ -692,6 +773,7 @@ mod tests {
             prompt_template: "Instruction:\n{instruction}\n\nResponse:\n".to_string(),
             prompt_with_input_template:
                 "Instruction:\n{instruction}\n\nInput:\n{input}\n\nResponse:\n".to_string(),
+            trim_fields: true,
         };
         let dataset =
             load_sft_dataset(&data, 128, 64, &cache_dir).expect("SFT dataset should load");

@@ -145,8 +145,9 @@ Acceptance:
   the second run to hit it. The offset-index cache is keyed by source paths,
   `max_samples`, and the JSONL field mapping from `data.instruction_field`,
   `data.input_field`, and `data.response_field`, plus
-  `data.prompt_template` and `data.prompt_with_input_template`, so stale caches
-  from a different external schema or prompt format are rejected.
+  `data.prompt_template`, `data.prompt_with_input_template`, and
+  `data.trim_fields`, so stale caches from a different external schema, prompt
+  format, or normalization policy are rejected.
 - Adapter reload preserves SFT train/eval loss, full-Qwen forward logits, and
   greedy generation output.
 - Merge/unmerge parity is checked for the focused full-Qwen adapter path, with
@@ -359,8 +360,8 @@ Required manifest structure:
 - Global train state: global step, consumed samples/tokens, RNG seeds, dtype,
   optimizer, scheduler, and parallel config.
 - JSONL dataset provenance: source files, per-source sample counts,
-  content/path/field-map/prompt-template fingerprint, shuffle flag, and
-  train-sample count.
+  content/path/field-map/prompt-template/normalization fingerprint, shuffle
+  flag, and train-sample count.
 - JSONL data progress: `data_cursor_next`, `data_epoch_next`, and
   `data_sample_offset_next`, consistent with `consumed_samples`.
 - Shard entries mapping logical parameter names to rank-owned safetensors
