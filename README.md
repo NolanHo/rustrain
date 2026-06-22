@@ -566,9 +566,10 @@ production-grade sharded checkpoint ownership remain open.
   `/vePFS-Mindverse/share/huggingface/datasets/iamtarun___code_instructions_120k_alpaca`,
   using `scripts/export_instruction_arrow_jsonl.py`, which accepts Arrow IPC
   stream or file caches, scans Arrow record batches without materializing the
-  full table, maps its `output` column into the normalized JSONL `response`
-  field, writes a two-shard JSONL export, and runs the same tokenizer-free
-  plan, tokenizer-backed batch parity, cursor wrap, and
+  full table, can skip exact full-source row counting with
+  `--no-full-row-count`, maps its `output` column into the normalized JSONL
+  `response` field, writes a two-shard JSONL export, and runs the same
+  tokenizer-free plan, tokenizer-backed batch parity, cursor wrap, and
   offset-index cache write/hit checks. A production
   zero-materialization loader for large external streams is still open.
   Production data loading and arbitrary-module LoRA injection are still open.

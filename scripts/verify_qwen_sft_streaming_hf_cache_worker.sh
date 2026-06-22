@@ -19,6 +19,14 @@ python scripts/export_instruction_arrow_jsonl.py \
   --response-column output \
   --metadata-output "${DATA_DIR}/export_metadata.json"
 
+python scripts/export_instruction_arrow_jsonl.py \
+  --input "${HF_ARROW}" \
+  --output "${DATA_DIR}/alpaca_bounded.jsonl" \
+  --limit 5 \
+  --no-full-row-count \
+  --response-column output \
+  --metadata-output "${DATA_DIR}/export_metadata_bounded.json" >/dev/null
+
 CONFIG="${WORK_DIR}/hf-cache.toml"
 cat >"${CONFIG}" <<EOF
 [run]
@@ -143,6 +151,9 @@ batch_plan = load_json(batch_output)
 cache_first = load_json(cache_first_output)
 cache_second = load_json(cache_second_output)
 metadata = json.loads((data_dir / "export_metadata.json").read_text(encoding="utf-8"))
+bounded_metadata = json.loads(
+    (data_dir / "export_metadata_bounded.json").read_text(encoding="utf-8")
+)
 
 source_files = [str(data_dir / f"alpaca_{index}.jsonl") for index in range(2)]
 source_counts = [{"path": path, "samples": 64} for path in source_files]
@@ -152,6 +163,8 @@ if pathlib.Path(metadata["source_arrow"]) != hf_arrow:
     raise SystemExit(f"metadata source_arrow {metadata['source_arrow']} != {hf_arrow}")
 if metadata["source_rows"] < 100_000 or metadata["exported_rows"] != 128:
     raise SystemExit(f"unexpected HF export metadata: {metadata}")
+if metadata.get("source_rows_exact") is not True or metadata.get("source_rows_lower_bound") is not False:
+    raise SystemExit(f"full HF export metadata should record exact source row count: {metadata}")
 if metadata.get("arrow_ipc_format") != "stream":
     raise SystemExit(f"HF export should record Arrow stream format: {metadata}")
 for column in ["instruction", "input", "output"]:
@@ -163,6 +176,29 @@ if metadata.get("shards") != 2:
     raise SystemExit(f"HF export metadata did not record two shards: {metadata}")
 if metadata.get("output_files") != export_outputs:
     raise SystemExit(f"HF export metadata output_files {metadata.get('output_files')} != {export_outputs}")
+
+if pathlib.Path(bounded_metadata["source_arrow"]) != hf_arrow:
+    raise SystemExit(f"bounded metadata source_arrow {bounded_metadata['source_arrow']} != {hf_arrow}")
+if bounded_metadata.get("arrow_ipc_format") != "stream":
+    raise SystemExit(f"bounded HF export should record Arrow stream format: {bounded_metadata}")
+if bounded_metadata.get("source_rows_exact") is not False:
+    raise SystemExit(f"bounded export should not claim exact source_rows: {bounded_metadata}")
+if bounded_metadata.get("source_rows_lower_bound") is not True:
+    raise SystemExit(f"bounded export should mark source_rows as lower bound: {bounded_metadata}")
+if bounded_metadata.get("exported_rows") != 5 or bounded_metadata.get("source_rows", 0) < 5:
+    raise SystemExit(f"bounded export metadata has unexpected counts: {bounded_metadata}")
+if bounded_metadata.get("shards") != 1:
+    raise SystemExit(f"bounded export should use one shard: {bounded_metadata}")
+bounded_output = data_dir / "alpaca_bounded.jsonl"
+if bounded_metadata.get("output_files") != [{"path": str(bounded_output), "rows": 5}]:
+    raise SystemExit(f"bounded export output_files mismatch: {bounded_metadata}")
+bounded_lines = bounded_output.read_text(encoding="utf-8").splitlines()
+if len(bounded_lines) != 5:
+    raise SystemExit(f"bounded export wrote {len(bounded_lines)} rows instead of 5")
+for index, line in enumerate(bounded_lines):
+    record = json.loads(line)
+    if not isinstance(record.get("instruction"), str) or not isinstance(record.get("response"), str):
+        raise SystemExit(f"bounded export row {index} has invalid record: {record}")
 
 expected_window = [
     {
