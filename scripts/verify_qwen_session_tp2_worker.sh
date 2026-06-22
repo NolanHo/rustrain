@@ -19,6 +19,9 @@ import sys
 
 from safetensors import safe_open
 
+sys.path.insert(0, str(pathlib.Path("scripts").resolve()))
+from qwen_verify_utils import require_complete_qwen_manifest_paths
+
 output_dir = pathlib.Path(sys.argv[1])
 summaries = sorted(output_dir.rglob("qwen-session-tp-rank-*.json"))
 if len(summaries) != 2:
@@ -83,26 +86,6 @@ def tensor_shape_sums(path):
                 "abs_sum": float(tensor.abs().sum().item()),
             }
     return tensors
-
-
-def require_complete_qwen_base_model(global_manifest):
-    base_model_path = pathlib.Path(global_manifest["base_model_path"])
-    tokenizer_path = pathlib.Path(global_manifest["tokenizer_path"])
-    required = [
-        base_model_path / "config.json",
-        tokenizer_path,
-        base_model_path / "model.safetensors",
-    ]
-    missing = [str(path) for path in required if not path.exists()]
-    if missing:
-        raise SystemExit(
-            "TP global manifest base model must point to a complete Qwen checkpoint; "
-            f"missing {missing}"
-        )
-    if tokenizer_path.parent != base_model_path:
-        raise SystemExit(
-            f"TP tokenizer_path {tokenizer_path} must live under base_model_path {base_model_path}"
-        )
 
 
 for path in summaries:
@@ -346,7 +329,7 @@ if not global_manifest_path.exists():
 global_manifest = json.loads(global_manifest_path.read_text())
 if global_manifest["format"] != "rustrain.qwen_sharded.v1":
     raise SystemExit(f"unexpected TP global manifest format {global_manifest['format']}")
-require_complete_qwen_base_model(global_manifest)
+require_complete_qwen_manifest_paths(global_manifest, global_manifest_path)
 if int(global_manifest["global_step"]) != 1:
     raise SystemExit(f"unexpected TP global_step {global_manifest['global_step']}")
 if int(global_manifest["consumed_samples"]) != 2:
