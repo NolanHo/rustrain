@@ -1676,8 +1676,16 @@ fn qwen_validate_lora_resume_config(
     manifest: Option<&QwenLoraSftAdapterManifest>,
     adapter_config: &QwenLoraConfig,
     current_config: &QwenLoraConfig,
+    current_compute_kind: &str,
 ) -> Result<()> {
     if let Some(manifest) = manifest {
+        if manifest.compute_kind != current_compute_kind {
+            bail!(
+                "Qwen LoRA SFT resume manifest compute_kind does not match current train dtype: manifest={}, current={}",
+                manifest.compute_kind,
+                current_compute_kind
+            );
+        }
         if manifest.target_layers != current_config.target_layers {
             bail!(
                 "Qwen LoRA SFT resume manifest target_layers do not match current [lora] config: manifest={:?}, current={:?}",
@@ -2487,7 +2495,12 @@ fn qwen_lora_sft_train(
         .or_else(|| resume_from.map(PathBuf::from));
     let registry = if let Some(resume_adapter_path) = resume_adapter_path.as_ref() {
         let registry = QwenLoraRegistry::load(resume_adapter_path)?;
-        qwen_validate_lora_resume_config(resume_manifest.as_ref(), &registry.config, &lora_config)?;
+        qwen_validate_lora_resume_config(
+            resume_manifest.as_ref(),
+            &registry.config,
+            &lora_config,
+            dtype.label(),
+        )?;
         registry
     } else {
         QwenLoraRegistry::deterministic(&weights, &lora_config, true)?
@@ -11912,10 +11925,16 @@ mod tests {
             target_modules: current.target_module_names(),
         };
 
-        qwen_validate_lora_resume_config(Some(&manifest), &current, &current)
+        qwen_validate_lora_resume_config(Some(&manifest), &current, &current, "fp32")
             .expect("matching manifest and adapter config should pass");
-        qwen_validate_lora_resume_config(None, &current, &current)
+        qwen_validate_lora_resume_config(None, &current, &current, "bf16")
             .expect("direct adapter resume should pass without manifest metadata");
+
+        let compute_kind_error =
+            qwen_validate_lora_resume_config(Some(&manifest), &current, &current, "bf16")
+                .expect_err("manifest compute kind mismatch should fail")
+                .to_string();
+        assert!(compute_kind_error.contains("resume manifest compute_kind"));
 
         let adapter_mismatch = QwenLoraConfig::new(
             vec![0, 1],
@@ -11925,14 +11944,14 @@ mod tests {
         )
         .expect("adapter mismatch config should build");
         let adapter_error =
-            qwen_validate_lora_resume_config(Some(&manifest), &adapter_mismatch, &current)
+            qwen_validate_lora_resume_config(Some(&manifest), &adapter_mismatch, &current, "fp32")
                 .expect_err("adapter config mismatch should fail")
                 .to_string();
         assert!(adapter_error.contains("resume adapter config does not match"));
 
         manifest.target_modules = vec!["q_proj".to_string(), "v_proj".to_string()];
         let manifest_module_error =
-            qwen_validate_lora_resume_config(Some(&manifest), &current, &current)
+            qwen_validate_lora_resume_config(Some(&manifest), &current, &current, "fp32")
                 .expect_err("manifest module mismatch should fail")
                 .to_string();
         assert!(manifest_module_error.contains("resume manifest target_modules"));
@@ -11940,7 +11959,7 @@ mod tests {
         manifest.target_modules = current.target_module_names();
         manifest.target_layers = vec![0];
         let manifest_layer_error =
-            qwen_validate_lora_resume_config(Some(&manifest), &current, &current)
+            qwen_validate_lora_resume_config(Some(&manifest), &current, &current, "fp32")
                 .expect_err("manifest layer mismatch should fail")
                 .to_string();
         assert!(manifest_layer_error.contains("resume manifest target_layers"));
