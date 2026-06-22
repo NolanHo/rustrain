@@ -28,7 +28,10 @@ import pathlib
 import sys
 
 sys.path.insert(0, str(pathlib.Path("scripts").resolve()))
-from qwen_verify_utils import require_complete_qwen_manifest_paths
+from qwen_verify_utils import (
+    require_complete_qwen_base_model_path,
+    require_complete_qwen_manifest_paths,
+)
 
 output_dir = pathlib.Path(os.environ["RUSTRAIN_DISTRIBUTED_VERIFY_OUTPUT_DIR"])
 expected_trainable_tensors = int(os.environ["RUSTRAIN_EXPECTED_QWEN_DP_TRAINABLE_TENSORS"])
@@ -119,6 +122,7 @@ for path in rank_summaries:
 
     manifest_path = pathlib.Path(data["manifest_output"])
     manifest = json.loads(manifest_path.read_text())
+    require_complete_qwen_base_model_path(manifest, manifest_path)
     if manifest.get("trainable_tensors") != trainable_tensors:
         raise SystemExit(f"{path} rank0 manifest trainable_tensors do not match summary")
     if len(manifest.get("tensors", [])) != expected_trainable_tensors:

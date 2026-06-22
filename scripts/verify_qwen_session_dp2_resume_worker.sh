@@ -55,7 +55,10 @@ import pathlib
 import sys
 
 sys.path.insert(0, str(pathlib.Path("scripts").resolve()))
-from qwen_verify_utils import require_complete_qwen_manifest_paths
+from qwen_verify_utils import (
+    require_complete_qwen_base_model_path,
+    require_complete_qwen_manifest_paths,
+)
 
 base_output_dir = pathlib.Path(os.environ["BASE_OUTPUT_DIR"])
 resume_output_dir = pathlib.Path(os.environ["RESUME_OUTPUT_DIR"])
@@ -249,6 +252,7 @@ for path in resume_summaries:
         if float(data[key]) > 1e-5:
             raise SystemExit(f"{path} {key} too large: {data[key]}")
     manifest = json.loads(pathlib.Path(data["manifest_output"]).read_text())
+    require_complete_qwen_base_model_path(manifest, data["manifest_output"])
     if expected_trainable_tensors:
         if manifest.get("trainable_tensors") != trainable_tensors:
             raise SystemExit(f"{path} manifest trainable_tensors do not match summary")

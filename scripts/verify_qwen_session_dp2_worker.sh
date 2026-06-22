@@ -21,7 +21,10 @@ import pathlib
 import sys
 
 sys.path.insert(0, str(pathlib.Path("scripts").resolve()))
-from qwen_verify_utils import require_complete_qwen_manifest_paths
+from qwen_verify_utils import (
+    require_complete_qwen_base_model_path,
+    require_complete_qwen_manifest_paths,
+)
 
 output_dir = pathlib.Path(os.environ["RUSTRAIN_DISTRIBUTED_VERIFY_OUTPUT_DIR"])
 expected_dtype = os.environ.get("RUSTRAIN_EXPECTED_QWEN_COMPUTE_KIND")
@@ -215,6 +218,7 @@ for path in rank_summaries:
             )
         if data["checkpoint_written"]:
             rank0_manifest = json.loads(pathlib.Path(data["manifest_output"]).read_text())
+            require_complete_qwen_base_model_path(rank0_manifest, data["manifest_output"])
             if rank0_manifest.get("dataset_source_files") != dataset_source_files:
                 raise SystemExit(
                     f"{path} rank0 manifest dataset_source_files {rank0_manifest.get('dataset_source_files')} does not match summary {dataset_source_files}"
