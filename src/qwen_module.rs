@@ -19,8 +19,8 @@ use crate::runtime::{
     Config, DataConfig as RuntimeDataConfig, DataKind as RuntimeDataKind, Device as RuntimeDevice,
     FieldAffix, FieldCaseTransform, FieldCaseTransformKind, FieldDefault, FieldDefaultTarget,
     FieldRegexFilter, FieldRegexReplacement, FieldReplacement, FieldReplacementTarget, FieldSplit,
-    FieldSplitSide, FieldTruncation, LoraConfig as RuntimeLoraConfig, LrScheduler, RunPaths,
-    load_config,
+    FieldSplitSide, FieldStrip, FieldTruncation, LoraConfig as RuntimeLoraConfig, LrScheduler,
+    RunPaths, load_config,
 };
 
 #[derive(Debug, Serialize)]
@@ -1782,6 +1782,8 @@ struct QwenSftFieldMap {
     #[serde(default)]
     field_affixes: Vec<FieldAffix>,
     #[serde(default)]
+    field_strips: Vec<FieldStrip>,
+    #[serde(default)]
     field_splits: Vec<FieldSplit>,
     #[serde(default)]
     field_truncations: Vec<FieldTruncation>,
@@ -1832,6 +1834,7 @@ impl QwenSftFieldMap {
             field_defaults: data.field_defaults.clone(),
             field_case_transforms: data.field_case_transforms.clone(),
             field_affixes: data.field_affixes.clone(),
+            field_strips: data.field_strips.clone(),
             field_splits: data.field_splits.clone(),
             field_truncations: data.field_truncations.clone(),
             source_weights: data.source_weights.clone(),
@@ -2121,6 +2124,16 @@ impl QwenSftFieldMap {
                 );
             }
         }
+        for strip in &self.field_strips {
+            if strip.prefix.is_empty() && strip.suffix.is_empty() {
+                bail!("data.field_strips entries must set prefix, suffix, or both");
+            }
+            if matches!(strip.field, FieldReplacementTarget::System) && !has_system_source {
+                bail!(
+                    "data.field_strips targeting system requires data.system_field, data.chat_messages_field, or a system field_default to be set"
+                );
+            }
+        }
         for split in &self.field_splits {
             if split.delimiter.is_empty() {
                 bail!("data.field_splits delimiter entries must not be empty");
@@ -2195,6 +2208,7 @@ impl Default for QwenSftFieldMap {
             field_defaults: Vec::new(),
             field_case_transforms: Vec::new(),
             field_affixes: Vec::new(),
+            field_strips: Vec::new(),
             field_splits: Vec::new(),
             field_truncations: Vec::new(),
             source_weights: Vec::new(),
@@ -12194,6 +12208,7 @@ fn qwen_sft_record_from_jsonl_line(
         qwen_apply_field_regex_replacements(&mut record, &regex_plan.replacements);
         qwen_apply_field_case_transforms(&mut record, &field_map.field_case_transforms);
         qwen_apply_field_affixes(&mut record, &field_map.field_affixes);
+        qwen_apply_field_strips(&mut record, &field_map.field_strips);
         qwen_apply_field_splits(&mut record, &field_map.field_splits);
         qwen_apply_field_truncations(&mut record, &field_map.field_truncations);
         if field_map.normalize_whitespace {
@@ -12238,6 +12253,7 @@ fn qwen_sft_record_from_jsonl_line(
     qwen_apply_field_regex_replacements(&mut record, &regex_plan.replacements);
     qwen_apply_field_case_transforms(&mut record, &field_map.field_case_transforms);
     qwen_apply_field_affixes(&mut record, &field_map.field_affixes);
+    qwen_apply_field_strips(&mut record, &field_map.field_strips);
     qwen_apply_field_splits(&mut record, &field_map.field_splits);
     qwen_apply_field_truncations(&mut record, &field_map.field_truncations);
     if field_map.normalize_whitespace {
@@ -12521,6 +12537,47 @@ fn qwen_apply_field_affix(value: &str, affix: &FieldAffix) -> String {
     transformed.push_str(value);
     transformed.push_str(&affix.suffix);
     transformed
+}
+
+fn qwen_apply_field_strips(record: &mut QwenSftRecord, strips: &[FieldStrip]) {
+    for strip in strips {
+        if matches!(
+            strip.field,
+            FieldReplacementTarget::System | FieldReplacementTarget::All
+        ) {
+            record.system = qwen_apply_field_strip(&record.system, strip);
+        }
+        if matches!(
+            strip.field,
+            FieldReplacementTarget::Instruction | FieldReplacementTarget::All
+        ) {
+            record.instruction = qwen_apply_field_strip(&record.instruction, strip);
+        }
+        if matches!(
+            strip.field,
+            FieldReplacementTarget::Input | FieldReplacementTarget::All
+        ) {
+            record.input = qwen_apply_field_strip(&record.input, strip);
+        }
+        if matches!(
+            strip.field,
+            FieldReplacementTarget::Response | FieldReplacementTarget::All
+        ) {
+            record.response = qwen_apply_field_strip(&record.response, strip);
+        }
+    }
+}
+
+fn qwen_apply_field_strip(value: &str, strip: &FieldStrip) -> String {
+    let without_prefix = value
+        .strip_prefix(&strip.prefix)
+        .filter(|_| !strip.prefix.is_empty())
+        .unwrap_or(value);
+    without_prefix
+        .strip_suffix(&strip.suffix)
+        .filter(|_| !strip.suffix.is_empty())
+        .unwrap_or(without_prefix)
+        .to_string()
 }
 
 fn qwen_apply_field_splits(record: &mut QwenSftRecord, splits: &[FieldSplit]) {
@@ -12922,6 +12979,17 @@ fn qwen_sft_hash_field_map(hash: &mut u64, field_map: &QwenSftFieldMap) {
             qwen_sft_hash_bytes(hash, affix.prefix.as_bytes());
             qwen_sft_hash_bytes(hash, b"\0");
             qwen_sft_hash_bytes(hash, affix.suffix.as_bytes());
+            qwen_sft_hash_bytes(hash, b"\0");
+        }
+    }
+    if !field_map.field_strips.is_empty() {
+        qwen_sft_hash_bytes(hash, b"field_strips");
+        for strip in &field_map.field_strips {
+            qwen_sft_hash_bytes(hash, format!("{:?}", strip.field).as_bytes());
+            qwen_sft_hash_bytes(hash, b"\0");
+            qwen_sft_hash_bytes(hash, strip.prefix.as_bytes());
+            qwen_sft_hash_bytes(hash, b"\0");
+            qwen_sft_hash_bytes(hash, strip.suffix.as_bytes());
             qwen_sft_hash_bytes(hash, b"\0");
         }
     }
@@ -16362,6 +16430,87 @@ mod tests {
         assert_eq!(streamed.samples, loaded.examples.len());
         assert_eq!(streamed.fingerprint, loaded.fingerprint);
         assert_ne!(loaded.fingerprint, raw_affix_fingerprint);
+        assert!(first_cache.cache_written);
+        assert!(cache_mismatch.contains("field_map"));
+    }
+
+    #[test]
+    fn qwen_sft_applies_field_strips_before_filters_and_fingerprint() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let jsonl = temp.path().join("samples.jsonl");
+        let cache_path = temp.path().join("cache").join("offset-index.json");
+        fs::write(
+            &jsonl,
+            r#"{"instruction":"PROMPT: Keep GPU prompt","input":"ctx=GPU context","response":"<answer>approved answer</answer>"}
+{"instruction":"PROMPT: Drop CPU prompt","input":"ctx=CPU context","response":"<answer>denied answer</answer>"}
+"#,
+        )
+        .expect("jsonl should write");
+        let paths = vec![jsonl.clone()];
+        let field_map = QwenSftFieldMap {
+            instruction_contains_any: vec!["Keep GPU".to_string()],
+            input_contains_any: vec!["GPU context".to_string()],
+            response_contains_any: vec!["approved answer".to_string()],
+            response_excludes_any: vec!["</answer>".to_string()],
+            field_strips: vec![
+                FieldStrip {
+                    field: FieldReplacementTarget::Instruction,
+                    prefix: "PROMPT: ".to_string(),
+                    suffix: String::new(),
+                },
+                FieldStrip {
+                    field: FieldReplacementTarget::Input,
+                    prefix: "ctx=".to_string(),
+                    suffix: String::new(),
+                },
+                FieldStrip {
+                    field: FieldReplacementTarget::Response,
+                    prefix: "<answer>".to_string(),
+                    suffix: "</answer>".to_string(),
+                },
+            ],
+            ..QwenSftFieldMap::default()
+        };
+
+        let loaded = qwen_sft_examples_from_jsonl_paths_with_limit(&paths, None, &field_map)
+            .expect("stripped examples should load");
+        let streamed = qwen_sft_streaming_source_summary(&paths, None, &field_map)
+            .expect("stripped streaming summary should scan");
+        let source_index = qwen_sft_streaming_source_index(&paths, None, &field_map)
+            .expect("stripped source index should build");
+        let raw_window = qwen_sft_examples_by_raw_indices(&source_index.samples, &field_map)
+            .expect("stripped raw window should read");
+        let first_cache =
+            qwen_sft_streaming_source_index_with_cache(&paths, None, Some(&cache_path), &field_map)
+                .expect("stripped cache should write");
+        let raw_strip_map = QwenSftFieldMap {
+            field_strips: Vec::new(),
+            instruction_contains_any: Vec::new(),
+            input_contains_any: Vec::new(),
+            response_contains_any: Vec::new(),
+            response_excludes_any: Vec::new(),
+            ..field_map.clone()
+        };
+        let raw_strip_fingerprint =
+            qwen_sft_streaming_fingerprint(&paths, None, &loaded.source_files, &raw_strip_map)
+                .expect("raw-strip fingerprint should compute");
+        let cache_mismatch = qwen_sft_streaming_source_index_with_cache(
+            &paths,
+            None,
+            Some(&cache_path),
+            &raw_strip_map,
+        )
+        .expect_err("cache should reject changed strips")
+        .to_string();
+
+        assert_eq!(loaded.examples.len(), 1);
+        assert_eq!(loaded.examples[0].instruction, "Keep GPU prompt");
+        assert_eq!(loaded.examples[0].input, "GPU context");
+        assert_eq!(loaded.examples[0].response, "approved answer");
+        assert_eq!(raw_window.examples, loaded.examples);
+        assert_eq!(streamed.samples, loaded.examples.len());
+        assert_eq!(streamed.fingerprint, loaded.fingerprint);
+        assert_ne!(loaded.fingerprint, raw_strip_fingerprint);
         assert!(first_cache.cache_written);
         assert!(cache_mismatch.contains("field_map"));
     }

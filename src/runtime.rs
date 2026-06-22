@@ -168,6 +168,8 @@ pub struct DataConfig {
     #[serde(default)]
     pub field_affixes: Vec<FieldAffix>,
     #[serde(default)]
+    pub field_strips: Vec<FieldStrip>,
+    #[serde(default)]
     pub field_splits: Vec<FieldSplit>,
     #[serde(default)]
     pub field_truncations: Vec<FieldTruncation>,
@@ -239,6 +241,15 @@ pub enum FieldCaseTransformKind {
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct FieldAffix {
+    pub field: FieldReplacementTarget,
+    #[serde(default)]
+    pub prefix: String,
+    #[serde(default)]
+    pub suffix: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct FieldStrip {
     pub field: FieldReplacementTarget,
     #[serde(default)]
     pub prefix: String,
@@ -897,6 +908,18 @@ pub fn validate_config(config: &Config) -> Result<()> {
                 ));
             }
         }
+        for strip in &data.field_strips {
+            if strip.prefix.is_empty() && strip.suffix.is_empty() {
+                return Err(anyhow!(
+                    "data.field_strips entries must set prefix, suffix, or both"
+                ));
+            }
+            if matches!(strip.field, FieldReplacementTarget::System) && !has_system_source {
+                return Err(anyhow!(
+                    "data.field_strips targeting system requires data.system_field, data.chat_messages_field, or a system field_default to be set"
+                ));
+            }
+        }
         for split in &data.field_splits {
             if split.delimiter.is_empty() {
                 return Err(anyhow!(
@@ -1181,6 +1204,7 @@ mod tests {
                 field_defaults: Vec::new(),
                 field_case_transforms: Vec::new(),
                 field_affixes: Vec::new(),
+                field_strips: Vec::new(),
                 field_splits: Vec::new(),
                 field_truncations: Vec::new(),
                 source_weights: Vec::new(),

@@ -151,7 +151,8 @@ Acceptance:
   `data.trim_fields`, optional `data.field_defaults`, optional
   `data.field_replacements`, optional `data.field_regex_replacements`, optional
   `data.field_case_transforms`, optional
-  `data.field_affixes`, optional `data.field_splits`, optional
+  `data.field_affixes`, optional `data.field_strips`, optional
+  `data.field_splits`, optional
   `data.field_truncations`, optional `data.normalize_whitespace`,
   optional `data.field_regex_contains_any`, optional
   `data.field_regex_excludes_any`,
@@ -167,7 +168,7 @@ Acceptance:
   `data.source_weights` plus optional `data.source_max_samples` and optional
   `data.skip_invalid_records`, so stale
   caches from a different external file state, external schema, prompt format,
-  default/replacement/case/affix/split/truncation/normalization policy,
+  default/replacement/case/affix/strip/split/truncation/normalization policy,
   field-regex filtering policy,
   instruction/input/system/prompt/sample/response filtering or
   instruction/response substring/dedupe policy, source weighting policy,
