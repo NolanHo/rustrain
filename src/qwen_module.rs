@@ -10681,14 +10681,6 @@ fn qwen_sft_streaming_source_index(
                     line_index += 1;
                     continue;
                 }
-                let record: QwenSftRecord = serde_json::from_str(&line).with_context(|| {
-                    format!(
-                        "failed to parse SFT JSONL record {}:{}",
-                        file.display(),
-                        line_index + 1
-                    )
-                })?;
-                drop(record);
                 samples.push(QwenSftRawSampleIndex {
                     path: file_path.clone(),
                     index_in_file: line_index,
@@ -13851,6 +13843,53 @@ mod tests {
                 .collect::<BTreeSet<_>>(),
             BTreeSet::from([jsonl.display().to_string()])
         );
+    }
+
+    #[test]
+    fn qwen_sft_streaming_source_index_is_offset_only_until_window_read() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let jsonl = temp.path().join("train.jsonl");
+        fs::write(
+            &jsonl,
+            r#"{"instruction":"zero","response":"a"}
+not-json
+{"instruction":"two","response":"c"}
+"#,
+        )
+        .expect("jsonl should write");
+        let paths = vec![jsonl.clone()];
+        let source_index =
+            qwen_sft_streaming_source_index(&paths, None).expect("offset index should build");
+
+        assert_eq!(source_index.samples.len(), 3);
+        assert_eq!(
+            source_index
+                .samples
+                .iter()
+                .map(|sample| (sample.index_in_file, sample.byte_offset))
+                .collect::<Vec<_>>(),
+            vec![(0, 0), (1, 38), (2, 47)]
+        );
+
+        let valid_window = qwen_sft_examples_by_raw_indices(&[
+            source_index.samples[0].clone(),
+            source_index.samples[2].clone(),
+        ])
+        .expect("valid offset window should parse");
+        assert_eq!(
+            valid_window
+                .examples
+                .iter()
+                .map(|example| example.instruction.as_str())
+                .collect::<Vec<_>>(),
+            vec!["zero", "two"]
+        );
+
+        let error = match qwen_sft_examples_by_raw_indices(&[source_index.samples[1].clone()]) {
+            Ok(_) => panic!("selected malformed JSONL row should fail at window read"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("failed to parse SFT JSONL record"));
     }
 
     #[test]
