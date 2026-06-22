@@ -410,6 +410,12 @@ production-grade sharded checkpoint ownership remain open.
   tokenizer-free streaming JSONL scan for SFT provenance, source sample counts,
   split sizes, explicit `data.eval_paths`, fingerprints, and cursor/epoch
   windows without materializing tokenized samples.
+  `cargo run -- qwen-sft-streaming-batch-plan --config ...` loads the tokenizer
+  for just the cursor window needed by the next training batches and verifies
+  those padded `input_ids` plus response masks match the current materialized
+  dataset path. This is a window-level bridge to real training batches; a
+  production zero-materialization loader for large external streams is still
+  open.
   Production data loading and arbitrary-module LoRA injection are still open.
 - Real Qwen module-level LoRA now uses a target-layer/module registry for
   configured attention and MLP projection modules; trainer-owned full-model LoRA

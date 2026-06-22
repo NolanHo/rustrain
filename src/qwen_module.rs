@@ -1647,6 +1647,41 @@ struct QwenSftStreamingDataPlanSummary {
     tokenized_samples_materialized: bool,
 }
 
+#[derive(Debug, Serialize)]
+struct QwenSftStreamingBatchPlanSummary {
+    config_path: String,
+    model_path: String,
+    world_size: usize,
+    local_batch_size: usize,
+    global_batch_size: usize,
+    train_steps: usize,
+    required_batches: usize,
+    train_batch_count: usize,
+    data_cursor_start: usize,
+    data_cursor_end: usize,
+    data_cursor_next: usize,
+    train_window_start_cursor: usize,
+    train_window_end_cursor_exclusive: usize,
+    train_window_sample_cursors: Vec<QwenSftStreamingCursorEntry>,
+    dataset_total_samples: usize,
+    dataset_train_samples: usize,
+    dataset_eval_samples: usize,
+    dataset_source_files: Vec<String>,
+    dataset_source_sample_counts: Vec<QwenSftSourceSampleCount>,
+    dataset_fingerprint: String,
+    dataset_order_seed: u64,
+    dataset_shuffle: bool,
+    tokenizer_loaded: bool,
+    tokenized_samples_materialized: bool,
+    streaming_window_samples: usize,
+    batch_sequence_tokens: Vec<usize>,
+    batch_masked_positions: Vec<usize>,
+    batch_padding_tokens: Vec<usize>,
+    batch_token_fingerprints: Vec<String>,
+    materialized_input_max_delta: i64,
+    materialized_mask_max_delta: f64,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct QwenSftSourceSampleCount {
     pub(crate) path: String,
@@ -5494,6 +5529,137 @@ pub fn qwen_sft_streaming_data_plan(
         eval_fingerprint: eval_summary.fingerprint,
         tokenizer_loaded: false,
         tokenized_samples_materialized: false,
+    };
+    println!("{}", serde_json::to_string_pretty(&summary)?);
+    Ok(())
+}
+
+pub fn qwen_sft_streaming_batch_plan(
+    config_path: &Path,
+    world_size: usize,
+    data_cursor_start: usize,
+) -> Result<()> {
+    if world_size == 0 {
+        bail!("qwen SFT streaming batch plan requires world_size > 0");
+    }
+    let config = load_config(config_path)?;
+    let model_path = config
+        .model
+        .model_path
+        .as_ref()
+        .context("qwen SFT streaming batch plan requires model.model_path")?;
+    let data_config = config
+        .data
+        .as_ref()
+        .context("qwen SFT streaming batch plan requires [data]")?;
+    if data_config.kind != RuntimeDataKind::InstructionJsonl {
+        bail!("qwen SFT streaming batch plan supports kind = instruction_jsonl");
+    }
+
+    let tokenizer = Tokenizer::from_file(model_path.join("tokenizer.json"))
+        .map_err(|error| anyhow!("failed to load tokenizer: {error}"))?;
+    let datasets = qwen_sft_train_eval_datasets_from_paths(
+        &tokenizer,
+        &data_config.paths,
+        &data_config.eval_paths,
+        data_config.max_samples,
+        data_config.train_split,
+        data_config.shuffle,
+        config.run.seed,
+    )?;
+    let dataset_summary = datasets.combined_summary;
+    let train_dataset = datasets.train_dataset;
+    let eval_dataset = datasets.eval_dataset;
+
+    let local_batch_size = config
+        .train
+        .micro_batch_size
+        .min(train_dataset.len())
+        .max(1);
+    let global_batch_size = local_batch_size * world_size;
+    let train_steps = config.train.max_steps as usize;
+    let required_batches = train_steps * global_batch_size + 1;
+    let train_batch_count = train_steps + 1;
+    let data_cursor_end = data_cursor_start + train_steps * global_batch_size;
+    let data_cursor_next = data_cursor_end;
+    let train_window_sample_cursors = qwen_sft_streaming_cursor_window(
+        data_cursor_start,
+        required_batches,
+        global_batch_size,
+        train_dataset.len(),
+    )?;
+    let train_window_end_cursor_exclusive = train_window_sample_cursors
+        .last()
+        .map(|entry| entry.cursor + 1)
+        .unwrap_or(data_cursor_start);
+
+    let streaming_window_samples = qwen_sft_streaming_token_window(
+        &train_dataset,
+        data_cursor_start,
+        train_window_sample_cursors.len(),
+    )?;
+    let mut batch_sequence_tokens = Vec::with_capacity(train_batch_count);
+    let mut batch_masked_positions = Vec::with_capacity(train_batch_count);
+    let mut batch_padding_tokens = Vec::with_capacity(train_batch_count);
+    let mut batch_token_fingerprints = Vec::with_capacity(train_batch_count);
+    let mut materialized_input_max_delta = 0_i64;
+    let mut materialized_mask_max_delta = 0.0_f64;
+
+    for batch_index in 0..train_batch_count {
+        let offset = batch_index * global_batch_size;
+        let end = offset + global_batch_size;
+        let streaming_batch = qwen_sft_padded_batch(
+            &streaming_window_samples[offset..end],
+            train_dataset.pad_token_id,
+        )?;
+        let materialized_batch =
+            train_dataset.padded_batch(data_cursor_start + offset, global_batch_size)?;
+        batch_sequence_tokens.push(streaming_batch.input_ids.size()[1] as usize);
+        batch_masked_positions.push(streaming_batch.masked_positions);
+        batch_padding_tokens.push(streaming_batch.padding_tokens);
+        batch_token_fingerprints.push(qwen_tensor_i64_fingerprint(&streaming_batch.input_ids)?);
+        materialized_input_max_delta = materialized_input_max_delta.max(tensor_i64_max_abs_diff(
+            &streaming_batch.input_ids,
+            &materialized_batch.input_ids,
+        )?);
+        materialized_mask_max_delta = materialized_mask_max_delta.max(tensor_max_abs_diff(
+            &streaming_batch.target_mask,
+            &materialized_batch.target_mask,
+        )?);
+    }
+
+    let summary = QwenSftStreamingBatchPlanSummary {
+        config_path: config_path.display().to_string(),
+        model_path: model_path.display().to_string(),
+        world_size,
+        local_batch_size,
+        global_batch_size,
+        train_steps,
+        required_batches,
+        train_batch_count,
+        data_cursor_start,
+        data_cursor_end,
+        data_cursor_next,
+        train_window_start_cursor: data_cursor_start,
+        train_window_end_cursor_exclusive,
+        train_window_sample_cursors,
+        dataset_total_samples: dataset_summary.samples,
+        dataset_train_samples: train_dataset.len(),
+        dataset_eval_samples: eval_dataset.len(),
+        dataset_source_files: dataset_summary.source_files,
+        dataset_source_sample_counts: dataset_summary.source_sample_counts,
+        dataset_fingerprint: dataset_summary.fingerprint,
+        dataset_order_seed: config.run.seed,
+        dataset_shuffle: dataset_summary.shuffle,
+        tokenizer_loaded: true,
+        tokenized_samples_materialized: true,
+        streaming_window_samples: streaming_window_samples.len(),
+        batch_sequence_tokens,
+        batch_masked_positions,
+        batch_padding_tokens,
+        batch_token_fingerprints,
+        materialized_input_max_delta,
+        materialized_mask_max_delta,
     };
     println!("{}", serde_json::to_string_pretty(&summary)?);
     Ok(())
@@ -10068,6 +10234,19 @@ fn qwen_sft_streaming_cursor_window(
         .collect()
 }
 
+fn qwen_sft_streaming_token_window(
+    dataset: &QwenSftDataset,
+    data_cursor_start: usize,
+    window_samples: usize,
+) -> Result<Vec<QwenSftTokenSample>> {
+    if window_samples == 0 {
+        bail!("SFT streaming token window requires at least one sample");
+    }
+    (0..window_samples)
+        .map(|relative| dataset.sample_at_cursor(data_cursor_start + relative))
+        .collect()
+}
+
 fn qwen_apply_sft_shuffle(dataset: QwenSftDataset, shuffle: bool, seed: u64) -> QwenSftDataset {
     if shuffle {
         dataset.shuffle_by_seed(seed)
@@ -10716,6 +10895,50 @@ fn qwen_sft_padded_batch(
         masked_positions,
         padding_tokens,
     })
+}
+
+fn tensor_i64_max_abs_diff(actual: &Tensor, expected: &Tensor) -> Result<i64> {
+    if actual.size() != expected.size() {
+        bail!(
+            "shape mismatch: actual {:?}, expected {:?}",
+            actual.size(),
+            expected.size()
+        );
+    }
+    let actual_values: Vec<i64> =
+        Vec::<i64>::try_from(actual.reshape([-1]).to_device(Device::Cpu))?;
+    let expected_values: Vec<i64> =
+        Vec::<i64>::try_from(expected.reshape([-1]).to_device(Device::Cpu))?;
+    Ok(actual_values
+        .iter()
+        .zip(expected_values.iter())
+        .map(|(actual, expected)| actual.saturating_sub(*expected).abs())
+        .max()
+        .unwrap_or(0))
+}
+
+fn tensor_max_abs_diff(actual: &Tensor, expected: &Tensor) -> Result<f64> {
+    if actual.size() != expected.size() {
+        bail!(
+            "shape mismatch: actual {:?}, expected {:?}",
+            actual.size(),
+            expected.size()
+        );
+    }
+    Ok((actual - expected)
+        .abs()
+        .max()
+        .to_device(Device::Cpu)
+        .double_value(&[]))
+}
+
+fn qwen_tensor_i64_fingerprint(tensor: &Tensor) -> Result<String> {
+    let values: Vec<i64> = Vec::<i64>::try_from(tensor.reshape([-1]).to_device(Device::Cpu))?;
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    for value in values {
+        qwen_sft_hash_bytes(&mut hash, &value.to_le_bytes());
+    }
+    Ok(format!("{hash:016x}"))
 }
 
 fn qwen_lora_sft_loss(
