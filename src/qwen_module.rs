@@ -1988,6 +1988,7 @@ pub fn qwen_module_parity(model_safetensors: &Path, fixture: &Path) -> Result<()
 }
 
 pub fn qwen_logits_parity(model_path: &Path, reference_fixture: &Path) -> Result<()> {
+    let model_path = resolve_qwen_model_path(model_path)?;
     let config = read_runtime_config(&model_path.join("config.json"))?;
     let weights = read_safetensors_map(&model_path.join("model.safetensors"))?;
     let reference = read_safetensors_map(reference_fixture)?;
@@ -2029,6 +2030,7 @@ pub fn qwen_logits_parity(model_path: &Path, reference_fixture: &Path) -> Result
 }
 
 pub fn qwen_generate_parity(model_path: &Path, reference_fixture: &Path) -> Result<()> {
+    let model_path = resolve_qwen_model_path(model_path)?;
     let config = read_runtime_config(&model_path.join("config.json"))?;
     let weights = read_safetensors_map(&model_path.join("model.safetensors"))?;
     let reference = read_safetensors_map(reference_fixture)?;
@@ -2100,6 +2102,7 @@ pub fn qwen_sampling_smoke(
     top_p: f64,
     seed: u64,
 ) -> Result<()> {
+    let model_path = resolve_qwen_model_path(model_path)?;
     let runtime_config = read_runtime_config(&model_path.join("config.json"))?;
     let weights = read_safetensors_map(&model_path.join("model.safetensors"))?;
     let reference = read_safetensors_map(reference_fixture)?;
@@ -2168,6 +2171,7 @@ pub fn qwen_kv_cache_parity(
     reference_fixture: &Path,
     max_new_tokens: usize,
 ) -> Result<()> {
+    let model_path = resolve_qwen_model_path(model_path)?;
     let config = read_runtime_config(&model_path.join("config.json"))?;
     let weights = read_safetensors_map(&model_path.join("model.safetensors"))?;
     let reference = read_safetensors_map(reference_fixture)?;
@@ -2238,6 +2242,7 @@ pub fn qwen_lora_smoke(
         bail!("alpha must be positive");
     }
 
+    let model_path = resolve_qwen_model_path(model_path)?;
     let weights = read_safetensors_map(&model_path.join("model.safetensors"))?;
     let fixture_tensors = read_safetensors_map(fixture)?;
     let attention_input = tensor(&fixture_tensors, "input_attention_normed")?.to_kind(Kind::Float);
@@ -2328,6 +2333,7 @@ pub fn qwen_lora_train_smoke(
         bail!("learning_rate must be positive");
     }
 
+    let model_path = resolve_qwen_model_path(model_path)?;
     let weights = read_safetensors_map(&model_path.join("model.safetensors"))?;
     let fixture_tensors = read_safetensors_map(fixture)?;
     let attention_input = tensor(&fixture_tensors, "input_attention_normed")?.to_kind(Kind::Float);
@@ -2508,6 +2514,7 @@ pub fn train_qwen_lora_sft_from_config(
         .model_path
         .as_ref()
         .context("qwen LoRA SFT trainer requires model.model_path")?;
+    let model_path = resolve_qwen_model_path(model_path)?;
     let data = config
         .data
         .as_ref()
@@ -2539,7 +2546,7 @@ pub fn train_qwen_lora_sft_from_config(
         .clone()
         .unwrap_or_else(|| qwen_sft_streaming_index_cache_path(&run_paths.cache, "qwen-lora-sft"));
     qwen_lora_sft_train(
-        model_path,
+        &model_path,
         &adapter_output,
         &run_paths.checkpoints,
         Some(&data.paths),
@@ -2601,6 +2608,7 @@ fn qwen_lora_sft_train(
         bail!("train_split must be in (0, 1)");
     }
 
+    let model_path = resolve_qwen_model_path(model_path)?;
     let tokenizer = Tokenizer::from_file(model_path.join("tokenizer.json"))
         .map_err(|error| anyhow!("failed to load tokenizer: {error}"))?;
     let dataset = if let Some(sft_paths) = sft_paths {
@@ -3172,6 +3180,7 @@ pub fn qwen_tied_head_train_smoke(
         bail!("learning_rate must be positive");
     }
 
+    let model_path = resolve_qwen_model_path(model_path)?;
     let config = read_runtime_config(&model_path.join("config.json"))?;
     let mut weights = read_safetensors_map(&model_path.join("model.safetensors"))?;
     let reference = read_safetensors_map(reference_fixture)?;
@@ -3290,6 +3299,7 @@ fn qwen_full_train_summary(
         bail!("learning_rate must be positive");
     }
 
+    let model_path = resolve_qwen_model_path(model_path)?;
     let config = read_runtime_config(&model_path.join("config.json"))?;
     let weights = read_safetensors_map(&model_path.join("model.safetensors"))?;
     let reference = read_safetensors_map(reference_fixture)?;
@@ -3467,6 +3477,7 @@ fn qwen_session_single_summary(
         bail!("learning_rate must be positive");
     }
 
+    let model_path = resolve_qwen_model_path(model_path)?;
     let config = read_runtime_config(&model_path.join("config.json"))?;
     let weights = read_safetensors_map(&model_path.join("model.safetensors"))?;
     let loaded_manifest = resume_from
@@ -3493,7 +3504,7 @@ fn qwen_session_single_summary(
         (1, 0)
     };
     let batch_plan = qwen_session_batch_plan_from_config(
-        model_path,
+        &model_path,
         &weights,
         data_cursor_start,
         train_steps,
@@ -3756,6 +3767,7 @@ pub fn qwen_dp_gradient_smoke(
     steps: usize,
     learning_rate: f64,
 ) -> Result<()> {
+    let model_path = resolve_qwen_model_path(model_path)?;
     let rank = parse_env_usize("RANK")?;
     let local_rank = parse_env_usize("LOCAL_RANK")?;
     let world_size = parse_env_usize("WORLD_SIZE")?;
@@ -3953,6 +3965,7 @@ pub fn qwen_dp_gradient_smoke(
 }
 
 pub fn qwen_tp_linear_rank_smoke(model_path: &Path, output_dir: PathBuf) -> Result<()> {
+    let model_path = resolve_qwen_model_path(model_path)?;
     let rank = parse_env_usize("RANK")?;
     let local_rank = parse_env_usize("LOCAL_RANK")?;
     let world_size = parse_env_usize("WORLD_SIZE")?;
@@ -4101,6 +4114,7 @@ pub fn qwen_tp_linear_rank_smoke(model_path: &Path, output_dir: PathBuf) -> Resu
 }
 
 pub fn qwen_tp_attention_rank_smoke(model_path: &Path, output_dir: PathBuf) -> Result<()> {
+    let model_path = resolve_qwen_model_path(model_path)?;
     let rank = parse_env_usize("RANK")?;
     let local_rank = parse_env_usize("LOCAL_RANK")?;
     let world_size = parse_env_usize("WORLD_SIZE")?;
@@ -4115,7 +4129,7 @@ pub fn qwen_tp_attention_rank_smoke(model_path: &Path, output_dir: PathBuf) -> R
         .with_context(|| format!("failed to create {}", output_dir.display()))?;
 
     let contribution =
-        qwen_tp_attention_contribution(model_path, device, rank, world_size, "Qwen TP attention")?;
+        qwen_tp_attention_contribution(&model_path, device, rank, world_size, "Qwen TP attention")?;
 
     Tensor::write_safetensors(
         &[("output_contribution", &contribution.output_contribution)],
@@ -4184,6 +4198,7 @@ pub fn qwen_tp_attention_rank_smoke(model_path: &Path, output_dir: PathBuf) -> R
 }
 
 pub fn qwen_tp_attention_nccl_rank_smoke(model_path: &Path, output_dir: PathBuf) -> Result<()> {
+    let model_path = resolve_qwen_model_path(model_path)?;
     let rank = parse_env_usize("RANK")?;
     let local_rank = parse_env_usize("LOCAL_RANK")?;
     let world_size = parse_env_usize("WORLD_SIZE")?;
@@ -4198,7 +4213,7 @@ pub fn qwen_tp_attention_nccl_rank_smoke(model_path: &Path, output_dir: PathBuf)
         .with_context(|| format!("failed to create {}", output_dir.display()))?;
 
     let contribution = qwen_tp_attention_contribution(
-        model_path,
+        &model_path,
         device,
         rank,
         world_size,
@@ -4394,6 +4409,7 @@ fn qwen_tp_attention_shard_contribution(
 }
 
 pub fn qwen_tp_mlp_rank_smoke(model_path: &Path, output_dir: PathBuf) -> Result<()> {
+    let model_path = resolve_qwen_model_path(model_path)?;
     let rank = parse_env_usize("RANK")?;
     let local_rank = parse_env_usize("LOCAL_RANK")?;
     let world_size = parse_env_usize("WORLD_SIZE")?;
@@ -4508,6 +4524,7 @@ pub fn qwen_tp_mlp_rank_smoke(model_path: &Path, output_dir: PathBuf) -> Result<
 }
 
 pub fn qwen_tp_mlp_nccl_rank_smoke(model_path: &Path, output_dir: PathBuf) -> Result<()> {
+    let model_path = resolve_qwen_model_path(model_path)?;
     let rank = parse_env_usize("RANK")?;
     let local_rank = parse_env_usize("LOCAL_RANK")?;
     let world_size = parse_env_usize("WORLD_SIZE")?;
@@ -4620,6 +4637,7 @@ pub fn qwen_session_dp_rank_smoke(
         bail!("Qwen session DP smoke requires a positive finite learning rate");
     }
 
+    let model_path = resolve_qwen_model_path(model_path)?;
     let device = Device::Cuda(local_rank);
     fs::create_dir_all(&output_dir)
         .with_context(|| format!("failed to create {}", output_dir.display()))?;
@@ -4669,7 +4687,7 @@ pub fn qwen_session_dp_rank_smoke(
             })
     });
     let batch_plan = qwen_session_dp_batch_plan_from_config(
-        model_path,
+        &model_path,
         &weights,
         data_cursor_start,
         steps,
@@ -5032,7 +5050,7 @@ pub fn qwen_session_dp_rank_smoke(
 
     let sharded_rank_manifest_output = write_qwen_session_dp_rank_sharded_manifest(
         &output_dir,
-        model_path,
+        &model_path,
         rank,
         world_size,
         steps,
@@ -5054,7 +5072,7 @@ pub fn qwen_session_dp_rank_smoke(
     if rank == 0 {
         write_qwen_session_dp_global_sharded_manifest(
             &output_dir,
-            model_path,
+            &model_path,
             world_size,
             resume_train_step + steps - 1,
             dtype,
@@ -5497,6 +5515,7 @@ pub fn qwen_session_dp_data_plan(
         .model_path
         .as_ref()
         .context("qwen session DP data plan requires model.model_path")?;
+    let model_path = resolve_qwen_model_path(model_path)?;
     let data_config = config
         .data
         .as_ref()
@@ -5729,6 +5748,7 @@ pub fn qwen_sft_streaming_batch_plan(
         .model_path
         .as_ref()
         .context("qwen SFT streaming batch plan requires model.model_path")?;
+    let model_path = resolve_qwen_model_path(model_path)?;
     let data_config = config
         .data
         .as_ref()
@@ -5877,6 +5897,7 @@ pub fn train_qwen_session_dp_from_config(config: &Config, _run_paths: &RunPaths)
         .model_path
         .as_ref()
         .context("qwen session trainer requires model.model_path")?;
+    let model_path = resolve_qwen_model_path(model_path)?;
     let output_dir = std::env::var("RUSTRAIN_LAUNCH_OUTPUT_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|_| {
@@ -5895,7 +5916,7 @@ pub fn train_qwen_session_dp_from_config(config: &Config, _run_paths: &RunPaths)
         }
     };
     qwen_session_dp_rank_smoke(
-        model_path,
+        &model_path,
         output_dir,
         dtype,
         config.train.max_steps as usize,
@@ -5927,6 +5948,7 @@ pub fn train_qwen_session_tp_from_config(config: &Config, _run_paths: &RunPaths)
         .model_path
         .as_ref()
         .context("qwen session trainer requires model.model_path")?;
+    let model_path = resolve_qwen_model_path(model_path)?;
     let output_dir = std::env::var("RUSTRAIN_LAUNCH_OUTPUT_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|_| {
@@ -5937,7 +5959,7 @@ pub fn train_qwen_session_tp_from_config(config: &Config, _run_paths: &RunPaths)
                 .join(&config.run.name)
         })
         .join("qwen-session-tp-ranks");
-    qwen_session_tp_rank_smoke(model_path, output_dir, config)
+    qwen_session_tp_rank_smoke(&model_path, output_dir, config)
 }
 
 fn qwen_session_tp_rank_smoke(
@@ -7898,6 +7920,7 @@ pub(crate) fn train_qwen_session_single_from_config(
         .model_path
         .as_ref()
         .context("qwen session trainer requires model.model_path")?;
+    let model_path = resolve_qwen_model_path(model_path)?;
     let dtype = match config.train.dtype {
         crate::runtime::DType::Fp32 => QwenComputeDType::Fp32,
         crate::runtime::DType::Bf16 => QwenComputeDType::Bf16,
@@ -7911,7 +7934,7 @@ pub(crate) fn train_qwen_session_single_from_config(
         })
     });
     qwen_session_single_summary(
-        model_path,
+        &model_path,
         &run_paths
             .checkpoints
             .join("qwen-session-single-delta.safetensors"),
@@ -9108,6 +9131,77 @@ fn read_runtime_config(path: &Path) -> Result<QwenRuntimeConfig> {
         rms_norm_eps: config.rms_norm_eps,
         rope_theta: config.rope_theta,
     })
+}
+
+fn resolve_qwen_model_path(model_path: &Path) -> Result<PathBuf> {
+    if qwen_model_path_is_complete(model_path) {
+        return Ok(model_path.to_path_buf());
+    }
+    let Some(model_dir_name) = model_path.file_name().and_then(|name| name.to_str()) else {
+        bail!(
+            "Qwen model path {} is missing config/tokenizer/model files and has no model directory name",
+            model_path.display()
+        );
+    };
+    let Some(root) = model_path.parent() else {
+        bail!(
+            "Qwen model path {} is missing config/tokenizer/model files and has no parent directory",
+            model_path.display()
+        );
+    };
+    let hub_root = root.join("hub");
+    let hub_suffix = format!("--{model_dir_name}");
+    let hub_model_dirs = fs::read_dir(&hub_root)
+        .ok()
+        .into_iter()
+        .flat_map(|entries| entries.filter_map(Result::ok))
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("models--") && name.ends_with(&hub_suffix))
+        })
+        .collect::<Vec<_>>();
+    if hub_model_dirs.is_empty() {
+        bail!(
+            "Qwen model path {} is missing config/tokenizer/model files and no matching HF hub cache entry was found under {}",
+            model_path.display(),
+            hub_root.display()
+        );
+    }
+    let mut candidates = Vec::new();
+    for hub_model_dir in hub_model_dirs {
+        let snapshots_dir = hub_model_dir.join("snapshots");
+        if snapshots_dir.is_dir() {
+            candidates.extend(
+                fs::read_dir(&snapshots_dir)
+                    .with_context(|| format!("failed to list {}", snapshots_dir.display()))?
+                    .map(|entry| entry.map(|entry| entry.path()))
+                    .collect::<std::io::Result<Vec<_>>>()
+                    .with_context(|| {
+                        format!("failed to read entries under {}", snapshots_dir.display())
+                    })?,
+            );
+        }
+    }
+    candidates.sort();
+    candidates
+        .into_iter()
+        .rev()
+        .find(|candidate| qwen_model_path_is_complete(candidate))
+        .ok_or_else(|| {
+            anyhow!(
+                "Qwen model path {} is missing config/tokenizer/model files and no complete HF hub snapshot exists under {}",
+                model_path.display(),
+                hub_root.display()
+            )
+        })
+}
+
+fn qwen_model_path_is_complete(model_path: &Path) -> bool {
+    model_path.join("config.json").exists()
+        && model_path.join("tokenizer.json").exists()
+        && model_path.join("model.safetensors").exists()
 }
 
 pub fn read_safetensors_map(path: &Path) -> Result<BTreeMap<String, Tensor>> {
@@ -14184,6 +14278,73 @@ not-json
         let cached_ids: Vec<i64> = Vec::<i64>::try_from(cached.reshape([-1])).unwrap();
 
         assert_eq!(cached_ids, full_ids);
+    }
+
+    #[test]
+    fn qwen_model_path_resolves_hf_hub_snapshot_when_legacy_dir_is_missing() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let legacy = temp.path().join("Qwen2.5-0.5B-Instruct");
+        let incomplete_snapshot = temp
+            .path()
+            .join("hub")
+            .join("models--Qwen--Qwen2.5-0.5B-Instruct")
+            .join("snapshots")
+            .join("111");
+        let complete_snapshot = temp
+            .path()
+            .join("hub")
+            .join("models--Qwen--Qwen2.5-0.5B-Instruct")
+            .join("snapshots")
+            .join("222");
+        fs::create_dir_all(&incomplete_snapshot).expect("incomplete snapshot dir should write");
+        fs::create_dir_all(&complete_snapshot).expect("complete snapshot dir should write");
+        fs::write(incomplete_snapshot.join("config.json"), "{}").expect("config should write");
+        fs::write(complete_snapshot.join("config.json"), "{}").expect("config should write");
+        fs::write(complete_snapshot.join("tokenizer.json"), "{}").expect("tokenizer should write");
+        fs::write(complete_snapshot.join("model.safetensors"), "")
+            .expect("safetensors marker should write");
+
+        let resolved =
+            resolve_qwen_model_path(&legacy).expect("legacy path should resolve through HF hub");
+
+        assert_eq!(resolved, complete_snapshot);
+    }
+
+    #[test]
+    fn qwen_model_path_keeps_complete_configured_directory() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let model_path = temp.path().join("Qwen2.5-0.5B-Instruct");
+        fs::create_dir_all(&model_path).expect("model dir should write");
+        fs::write(model_path.join("config.json"), "{}").expect("config should write");
+        fs::write(model_path.join("tokenizer.json"), "{}").expect("tokenizer should write");
+        fs::write(model_path.join("model.safetensors"), "")
+            .expect("safetensors marker should write");
+
+        let resolved =
+            resolve_qwen_model_path(&model_path).expect("complete path should not be rewritten");
+
+        assert_eq!(resolved, model_path);
+    }
+
+    #[test]
+    fn qwen_model_path_reports_missing_hf_snapshot() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let legacy = temp.path().join("Qwen2.5-0.5B-Instruct");
+        let incomplete_snapshot = temp
+            .path()
+            .join("hub")
+            .join("models--Qwen--Qwen2.5-0.5B-Instruct")
+            .join("snapshots")
+            .join("111");
+        fs::create_dir_all(&incomplete_snapshot).expect("incomplete snapshot dir should write");
+        fs::write(incomplete_snapshot.join("config.json"), "{}").expect("config should write");
+
+        let error = match resolve_qwen_model_path(&legacy) {
+            Ok(path) => panic!("incomplete cache should fail, resolved {}", path.display()),
+            Err(error) => error.to_string(),
+        };
+
+        assert!(error.contains("no complete HF hub snapshot"));
     }
 
     fn tiny_qwen_sharded_manifest() -> QwenShardedCheckpointManifest {
