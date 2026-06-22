@@ -1591,6 +1591,12 @@ struct QwenSftStreamingSourceIndex {
     samples: Vec<QwenSftRawSampleIndex>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct QwenSftStreamingSourceScan {
+    index: QwenSftStreamingSourceIndex,
+    summary: QwenSftStreamingSourceSummary,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 struct QwenSftStreamingSourceIndexCache {
     format: String,
@@ -11375,11 +11381,20 @@ fn qwen_sft_examples_from_jsonl_paths_with_limit(
     })
 }
 
+#[cfg(test)]
 fn qwen_sft_streaming_source_index(
     paths: &[PathBuf],
     max_samples: Option<usize>,
     field_map: &QwenSftFieldMap,
 ) -> Result<QwenSftStreamingSourceIndex> {
+    Ok(qwen_sft_streaming_source_scan(paths, max_samples, field_map)?.index)
+}
+
+fn qwen_sft_streaming_source_scan(
+    paths: &[PathBuf],
+    max_samples: Option<usize>,
+    field_map: &QwenSftFieldMap,
+) -> Result<QwenSftStreamingSourceScan> {
     if paths.is_empty() {
         bail!("SFT dataset must contain at least one JSONL path");
     }
@@ -11389,6 +11404,8 @@ fn qwen_sft_streaming_source_index(
     let source_weights = qwen_sft_source_weights(paths.len(), field_map)?;
     let source_max_samples = qwen_sft_source_max_samples(paths.len(), field_map)?;
     let mut samples = Vec::new();
+    let mut source_files = BTreeSet::new();
+    let mut source_sample_counts = BTreeMap::new();
     let mut seen_records = field_map.dedupe_samples.then(HashSet::new);
 
     for ((path, source_weight), source_limit) in paths
@@ -11457,12 +11474,14 @@ fn qwen_sft_streaming_source_index(
                     if max_samples.is_some_and(|limit| samples.len() >= limit) {
                         break;
                     }
+                    source_files.insert(file_path.clone());
                     samples.push(QwenSftRawSampleIndex {
                         path: file_path.clone(),
                         index_in_file: line_index,
                         global_index: samples.len(),
                         byte_offset,
                     });
+                    *source_sample_counts.entry(file_path.clone()).or_insert(0) += 1;
                 }
                 source_samples += 1;
                 line_index += 1;
@@ -11473,7 +11492,21 @@ fn qwen_sft_streaming_source_index(
         bail!("SFT dataset must contain at least one example");
     }
 
-    Ok(QwenSftStreamingSourceIndex { samples })
+    let source_files = source_files.into_iter().collect::<Vec<_>>();
+    let index = QwenSftStreamingSourceIndex { samples };
+    let fingerprint = qwen_sft_streaming_fingerprint_from_index(&index, &source_files, field_map)?;
+    Ok(QwenSftStreamingSourceScan {
+        summary: QwenSftStreamingSourceSummary {
+            samples: index.samples.len(),
+            source_files,
+            source_sample_counts: source_sample_counts
+                .into_iter()
+                .map(|(path, samples)| QwenSftSourceSampleCount { path, samples })
+                .collect(),
+            fingerprint,
+        },
+        index,
+    })
 }
 
 fn qwen_sft_streaming_source_index_with_cache(
@@ -11559,17 +11592,9 @@ fn qwen_sft_streaming_source_index_with_cache(
         }
     }
 
-    let index = qwen_sft_streaming_source_index(paths, max_samples, field_map)?;
+    let scan = qwen_sft_streaming_source_scan(paths, max_samples, field_map)?;
     let summary = if cache_path.is_some() {
-        let summary = qwen_sft_streaming_source_summary(paths, max_samples, field_map)?;
-        if summary.samples != index.samples.len() {
-            bail!(
-                "SFT streaming source summary sample count {} does not match {} raw offsets",
-                summary.samples,
-                index.samples.len()
-            );
-        }
-        Some(summary)
+        Some(scan.summary.clone())
     } else {
         None
     };
@@ -11589,7 +11614,7 @@ fn qwen_sft_streaming_source_index_with_cache(
             summary: summary
                 .clone()
                 .context("SFT streaming index cache write requires source summary")?,
-            samples: index.samples.clone(),
+            samples: scan.index.samples.clone(),
         };
         let contents = serde_json::to_string_pretty(&cache)
             .context("failed to serialize SFT streaming index cache")?;
@@ -11598,7 +11623,7 @@ fn qwen_sft_streaming_source_index_with_cache(
         cache_written = true;
     }
     Ok(QwenSftStreamingSourceIndexLoad {
-        index,
+        index: scan.index,
         summary,
         cache_hit: false,
         cache_written,
@@ -11831,100 +11856,7 @@ fn qwen_sft_streaming_source_summary(
     max_samples: Option<usize>,
     field_map: &QwenSftFieldMap,
 ) -> Result<QwenSftStreamingSourceSummary> {
-    if paths.is_empty() {
-        bail!("SFT dataset must contain at least one JSONL path");
-    }
-    if max_samples == Some(0) {
-        bail!("SFT data.max_samples must be greater than zero");
-    }
-    let source_weights = qwen_sft_source_weights(paths.len(), field_map)?;
-    let source_max_samples = qwen_sft_source_max_samples(paths.len(), field_map)?;
-
-    let mut samples = 0usize;
-    let mut source_files = BTreeSet::new();
-    let mut source_sample_counts = BTreeMap::new();
-    let mut seen_records = field_map.dedupe_samples.then(HashSet::new);
-    for ((path, source_weight), source_limit) in paths
-        .iter()
-        .zip(source_weights.iter().copied())
-        .zip(source_max_samples.iter().copied())
-    {
-        if max_samples.is_some_and(|limit| samples >= limit) {
-            break;
-        }
-        let mut source_samples = 0usize;
-        for file in qwen_sft_jsonl_files(path)? {
-            if max_samples.is_some_and(|limit| samples >= limit)
-                || source_limit.is_some_and(|limit| source_samples >= limit)
-            {
-                break;
-            }
-            let file_path = file.display().to_string();
-            let reader = BufReader::new(
-                fs::File::open(&file)
-                    .with_context(|| format!("failed to read {}", file.display()))?,
-            );
-            let before = samples;
-            for (line_index, line) in reader.lines().enumerate() {
-                if max_samples.is_some_and(|limit| samples >= limit)
-                    || source_limit.is_some_and(|limit| source_samples >= limit)
-                {
-                    break;
-                }
-                let line = line.with_context(|| {
-                    format!(
-                        "failed to read SFT JSONL record {}:{}",
-                        file.display(),
-                        line_index + 1
-                    )
-                })?;
-                if line.trim().is_empty() {
-                    continue;
-                }
-                let Some(record) =
-                    maybe_qwen_sft_record_from_jsonl_line(&line, field_map, &file, line_index + 1)?
-                else {
-                    continue;
-                };
-                if !qwen_sft_record_passes_filters(&record, field_map) {
-                    continue;
-                }
-                if let Some(seen_records) = &mut seen_records {
-                    if !seen_records.insert(qwen_sft_record_dedupe_key(&record)) {
-                        continue;
-                    }
-                }
-                source_files.insert(file_path.clone());
-                drop(record);
-                for _ in 0..source_weight {
-                    if max_samples.is_some_and(|limit| samples >= limit) {
-                        break;
-                    }
-                    samples += 1;
-                }
-                source_samples += 1;
-            }
-            let consumed = samples - before;
-            if consumed > 0 {
-                *source_sample_counts.entry(file_path).or_insert(0) += consumed;
-            }
-        }
-    }
-    if samples == 0 {
-        bail!("SFT dataset must contain at least one example");
-    }
-
-    let source_files = source_files.into_iter().collect::<Vec<_>>();
-    let fingerprint = qwen_sft_streaming_fingerprint(paths, max_samples, &source_files, field_map)?;
-    Ok(QwenSftStreamingSourceSummary {
-        samples,
-        source_files,
-        source_sample_counts: source_sample_counts
-            .into_iter()
-            .map(|(path, samples)| QwenSftSourceSampleCount { path, samples })
-            .collect(),
-        fingerprint,
-    })
+    Ok(qwen_sft_streaming_source_scan(paths, max_samples, field_map)?.summary)
 }
 
 fn qwen_sft_source_weights(path_count: usize, field_map: &QwenSftFieldMap) -> Result<Vec<usize>> {
@@ -11968,9 +11900,31 @@ fn qwen_sft_source_max_samples(
     Ok(limits)
 }
 
+#[cfg(test)]
 fn qwen_sft_streaming_fingerprint(
     paths: &[PathBuf],
     max_samples: Option<usize>,
+    source_files: &[String],
+    field_map: &QwenSftFieldMap,
+) -> Result<String> {
+    let index = match qwen_sft_streaming_source_scan(paths, max_samples, field_map) {
+        Ok(scan) => scan.index,
+        Err(error)
+            if error
+                .to_string()
+                .contains("SFT dataset must contain at least one example") =>
+        {
+            QwenSftStreamingSourceIndex {
+                samples: Vec::new(),
+            }
+        }
+        Err(error) => return Err(error),
+    };
+    qwen_sft_streaming_fingerprint_from_index(&index, source_files, field_map)
+}
+
+fn qwen_sft_streaming_fingerprint_from_index(
+    index: &QwenSftStreamingSourceIndex,
     source_files: &[String],
     field_map: &QwenSftFieldMap,
 ) -> Result<String> {
@@ -11982,67 +11936,10 @@ fn qwen_sft_streaming_fingerprint(
         qwen_sft_hash_bytes(&mut hash, b"\0");
     }
 
-    let mut samples = 0usize;
-    let mut seen_records = field_map.dedupe_samples.then(HashSet::new);
-    let source_weights = qwen_sft_source_weights(paths.len(), field_map)?;
-    let source_max_samples = qwen_sft_source_max_samples(paths.len(), field_map)?;
-    for ((path, source_weight), source_limit) in paths
-        .iter()
-        .zip(source_weights.iter().copied())
-        .zip(source_max_samples.iter().copied())
-    {
-        if max_samples.is_some_and(|limit| samples >= limit) {
-            break;
-        }
-        let mut source_samples = 0usize;
-        for file in qwen_sft_jsonl_files(path)? {
-            if max_samples.is_some_and(|limit| samples >= limit)
-                || source_limit.is_some_and(|limit| source_samples >= limit)
-            {
-                break;
-            }
-            let reader = BufReader::new(
-                fs::File::open(&file)
-                    .with_context(|| format!("failed to read {}", file.display()))?,
-            );
-            for (line_index, line) in reader.lines().enumerate() {
-                if max_samples.is_some_and(|limit| samples >= limit)
-                    || source_limit.is_some_and(|limit| source_samples >= limit)
-                {
-                    break;
-                }
-                let line = line.with_context(|| {
-                    format!(
-                        "failed to read SFT JSONL record {}:{}",
-                        file.display(),
-                        line_index + 1
-                    )
-                })?;
-                if line.trim().is_empty() {
-                    continue;
-                }
-                let Some(record) =
-                    maybe_qwen_sft_record_from_jsonl_line(&line, field_map, &file, line_index + 1)?
-                else {
-                    continue;
-                };
-                if !qwen_sft_record_passes_filters(&record, field_map) {
-                    continue;
-                }
-                if let Some(seen_records) = &mut seen_records {
-                    if !seen_records.insert(qwen_sft_record_dedupe_key(&record)) {
-                        continue;
-                    }
-                }
-                for _ in 0..source_weight {
-                    if max_samples.is_some_and(|limit| samples >= limit) {
-                        break;
-                    }
-                    qwen_sft_hash_record(&mut hash, &record, field_map.has_system_source());
-                    samples += 1;
-                }
-                source_samples += 1;
-            }
+    if !index.samples.is_empty() {
+        let raw_window = qwen_sft_examples_by_raw_indices(&index.samples, field_map)?;
+        for example in &raw_window.examples {
+            qwen_sft_hash_example(&mut hash, example, field_map.has_system_source());
         }
     }
     Ok(format!("{hash:016x}"))
@@ -12404,21 +12301,6 @@ fn qwen_sft_dataset_fingerprint(
         qwen_sft_hash_example(&mut hash, example, field_map.has_system_source());
     }
     format!("{hash:016x}")
-}
-
-fn qwen_sft_hash_record(hash: &mut u64, record: &QwenSftRecord, include_system: bool) {
-    if include_system {
-        qwen_sft_hash_bytes(hash, b"system");
-        qwen_sft_hash_bytes(hash, record.system.as_bytes());
-        qwen_sft_hash_bytes(hash, b"\0");
-    }
-    qwen_sft_hash_bytes(hash, b"instruction");
-    qwen_sft_hash_bytes(hash, record.instruction.as_bytes());
-    qwen_sft_hash_bytes(hash, b"\0input");
-    qwen_sft_hash_bytes(hash, record.input.as_bytes());
-    qwen_sft_hash_bytes(hash, b"\0response");
-    qwen_sft_hash_bytes(hash, record.response.as_bytes());
-    qwen_sft_hash_bytes(hash, b"\0");
 }
 
 fn qwen_sft_hash_field_map(hash: &mut u64, field_map: &QwenSftFieldMap) {
