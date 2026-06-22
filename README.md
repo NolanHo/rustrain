@@ -418,9 +418,13 @@ production-grade sharded checkpoint ownership remain open.
   the current materialized dataset path. The LoRA SFT trainer plus single-GPU
   and DP=2 `qwen_trainable_session` JSONL SFT trainer paths now use the same
   raw-index streaming window to build train batches, while keeping materialized
-  dataset metadata as a parity guard. When explicit `data.eval_paths` are
-  configured, the streaming window keeps the full train source instead of
-  applying `train_split` to it; the focused GPU suite checks both the
+  dataset metadata as a parity guard. Those trainer summaries now expose
+  `streaming_train_batches = true` for tokenizer-backed JSONL SFT runs, and the
+  focused LoRA, single-GPU session, and DP session verifiers require that field
+  so stdout or rank JSON cannot pass while hiding a materialized train-batch
+  path. When explicit `data.eval_paths` are configured, the streaming window
+  keeps the full train source instead of applying `train_split` to it; the
+  focused GPU suite checks both the
   tokenizer-free data plan and tokenizer-backed batch-plan parity for that
   case. A production zero-materialization loader for large external streams is
   still open.

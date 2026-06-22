@@ -120,6 +120,9 @@ Acceptance:
   cursor origin and writes a fresh adapter manifest.
 - Resume starts from manifest `data_cursor_next`, advances by
   `steps * global_batch_size`, and preserves cursor/epoch/offset consistency.
+- JSONL SFT train summaries must report `streaming_train_batches = true`; the
+  LoRA resume verifier checks this for both manifest-backed and direct adapter
+  resume runs.
 - Adapter reload preserves SFT train/eval loss, full-Qwen forward logits, and
   greedy generation output.
 - Merge/unmerge parity is checked for the focused full-Qwen adapter path, with
@@ -226,6 +229,9 @@ Acceptance:
 - JSONL-backed DP resume starts from manifest `data_cursor_next`, advances the
   cursor by `steps * local_batch_size * world_size`, and preserves dataset
   provenance in the next rank0 manifest.
+- JSONL-backed DP rank summaries must report `streaming_train_batches = true`;
+  the DP worker and external resume verifiers reject summaries that omit it or
+  report `false`.
 - The layer0+layer1 JSONL external resume paths verify both the cursor
   continuity contract and the 25-tensor trainable registry for both fp32 and
   bf16 resumed summaries and manifests. The bf16 path also asserts
