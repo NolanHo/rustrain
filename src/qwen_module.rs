@@ -1562,7 +1562,7 @@ struct QwenSftTokenSample {
     mask_values: Vec<f32>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct QwenSftExample {
     system: String,
     instruction: String,
@@ -1570,6 +1570,7 @@ struct QwenSftExample {
     response: String,
 }
 
+#[derive(Debug)]
 struct QwenSftExampleSet {
     examples: Vec<QwenSftExample>,
     source_files: Vec<String>,
@@ -1645,6 +1646,8 @@ struct QwenSftFieldMap {
     #[serde(default)]
     system: Option<String>,
     #[serde(default)]
+    chat_messages: Option<String>,
+    #[serde(default)]
     min_system_chars: Option<usize>,
     #[serde(default)]
     max_system_chars: Option<usize>,
@@ -1706,6 +1709,7 @@ impl QwenSftFieldMap {
             input: data.input_field.clone(),
             response: data.response_field.clone(),
             system: data.system_field.clone(),
+            chat_messages: data.chat_messages_field.clone(),
             min_system_chars: data.min_system_chars,
             max_system_chars: data.max_system_chars,
             system_contains_any: data.system_contains_any.clone(),
@@ -1741,6 +1745,7 @@ impl QwenSftFieldMap {
     }
 
     fn validate(&self) -> Result<()> {
+        let has_system_source = self.has_system_source();
         if self.instruction.trim().is_empty() {
             bail!("data.instruction_field must not be empty");
         }
@@ -1757,17 +1762,32 @@ impl QwenSftFieldMap {
         {
             bail!("data.system_field must not be empty when set");
         }
-        if self.min_system_chars.is_some() && self.system.is_none() {
-            bail!("data.min_system_chars requires data.system_field to be set");
+        if self
+            .chat_messages
+            .as_ref()
+            .is_some_and(|field| field.trim().is_empty())
+        {
+            bail!("data.chat_messages_field must not be empty when set");
         }
-        if self.max_system_chars.is_some() && self.system.is_none() {
-            bail!("data.max_system_chars requires data.system_field to be set");
+        if self.min_system_chars.is_some() && !has_system_source {
+            bail!(
+                "data.min_system_chars requires data.system_field or data.chat_messages_field to be set"
+            );
         }
-        if !self.system_contains_any.is_empty() && self.system.is_none() {
-            bail!("data.system_contains_any requires data.system_field to be set");
+        if self.max_system_chars.is_some() && !has_system_source {
+            bail!(
+                "data.max_system_chars requires data.system_field or data.chat_messages_field to be set"
+            );
         }
-        if !self.system_excludes_any.is_empty() && self.system.is_none() {
-            bail!("data.system_excludes_any requires data.system_field to be set");
+        if !self.system_contains_any.is_empty() && !has_system_source {
+            bail!(
+                "data.system_contains_any requires data.system_field or data.chat_messages_field to be set"
+            );
+        }
+        if !self.system_excludes_any.is_empty() && !has_system_source {
+            bail!(
+                "data.system_excludes_any requires data.system_field or data.chat_messages_field to be set"
+            );
         }
         if self.prompt_template.is_empty() {
             bail!("data.prompt_template must not be empty");
@@ -1939,14 +1959,17 @@ impl QwenSftFieldMap {
             if replacement.pattern.is_empty() {
                 bail!("data.field_replacements pattern entries must not be empty");
             }
-            if matches!(replacement.field, FieldReplacementTarget::System) && self.system.is_none()
-            {
+            if matches!(replacement.field, FieldReplacementTarget::System) && !has_system_source {
                 bail!(
-                    "data.field_replacements targeting system requires data.system_field to be set"
+                    "data.field_replacements targeting system requires data.system_field or data.chat_messages_field to be set"
                 );
             }
         }
         Ok(())
+    }
+
+    fn has_system_source(&self) -> bool {
+        self.system.is_some() || self.chat_messages.is_some()
     }
 }
 
@@ -1957,6 +1980,7 @@ impl Default for QwenSftFieldMap {
             input: "input".to_string(),
             response: "response".to_string(),
             system: None,
+            chat_messages: None,
             min_system_chars: None,
             max_system_chars: None,
             system_contains_any: Vec::new(),
@@ -12014,7 +12038,7 @@ fn qwen_sft_streaming_fingerprint(
                     if max_samples.is_some_and(|limit| samples >= limit) {
                         break;
                     }
-                    qwen_sft_hash_record(&mut hash, &record, field_map.system.is_some());
+                    qwen_sft_hash_record(&mut hash, &record, field_map.has_system_source());
                     samples += 1;
                 }
                 source_samples += 1;
@@ -12053,6 +12077,14 @@ fn qwen_sft_record_from_jsonl_line(
 ) -> Result<QwenSftRecord> {
     let values: BTreeMap<String, serde_json::Value> =
         serde_json::from_str(line).context("invalid JSON object")?;
+    if let Some(messages_field) = &field_map.chat_messages {
+        let mut record = qwen_sft_record_from_chat_messages(&values, messages_field, field_map)?;
+        qwen_apply_field_replacements(&mut record, &field_map.field_replacements);
+        if field_map.normalize_whitespace {
+            qwen_normalize_record_whitespace(&mut record);
+        }
+        return Ok(record);
+    }
     let instruction = qwen_normalize_jsonl_field(
         qwen_required_jsonl_string_field(&values, &field_map.instruction)?,
         field_map,
@@ -12082,6 +12114,71 @@ fn qwen_sft_record_from_jsonl_line(
         qwen_normalize_record_whitespace(&mut record);
     }
     Ok(record)
+}
+
+fn qwen_sft_record_from_chat_messages(
+    values: &BTreeMap<String, serde_json::Value>,
+    messages_field: &str,
+    field_map: &QwenSftFieldMap,
+) -> Result<QwenSftRecord> {
+    let messages = match values.get(messages_field) {
+        Some(serde_json::Value::Array(messages)) => messages,
+        Some(_) => bail!("SFT JSONL field {messages_field} must be an array"),
+        None => bail!("SFT JSONL record missing required field {messages_field}"),
+    };
+    let mut system = String::new();
+    let mut instruction = None;
+    let mut response = None;
+    for (index, message) in messages.iter().enumerate() {
+        let object = match message {
+            serde_json::Value::Object(object) => object,
+            _ => bail!("SFT chat message {messages_field}[{index}] must be an object"),
+        };
+        let role = qwen_required_chat_message_string_field(object, "role", messages_field, index)?;
+        let content =
+            qwen_required_chat_message_string_field(object, "content", messages_field, index)?;
+        let content = qwen_normalize_jsonl_field(content, field_map);
+        match role.as_str() {
+            "system" => {
+                if system.is_empty() {
+                    system = content;
+                } else if !content.is_empty() {
+                    if !system.is_empty() {
+                        system.push('\n');
+                    }
+                    system.push_str(&content);
+                }
+            }
+            "user" | "human" => instruction = Some(content),
+            "assistant" | "gpt" => response = Some(content),
+            _ => {}
+        }
+    }
+    let instruction = instruction
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| anyhow!("SFT chat record missing user message in field {messages_field}"))?;
+    let response = response.filter(|value| !value.is_empty()).ok_or_else(|| {
+        anyhow!("SFT chat record missing assistant message in field {messages_field}")
+    })?;
+    Ok(QwenSftRecord {
+        system,
+        instruction,
+        input: String::new(),
+        response,
+    })
+}
+
+fn qwen_required_chat_message_string_field(
+    object: &serde_json::Map<String, serde_json::Value>,
+    field: &str,
+    messages_field: &str,
+    index: usize,
+) -> Result<String> {
+    match object.get(field) {
+        Some(serde_json::Value::String(value)) => Ok(value.clone()),
+        Some(_) => bail!("SFT chat message {messages_field}[{index}].{field} must be a string"),
+        None => bail!("SFT chat message {messages_field}[{index}] missing required field {field}"),
+    }
 }
 
 fn maybe_qwen_sft_record_from_jsonl_line(
@@ -12304,7 +12401,7 @@ fn qwen_sft_dataset_fingerprint(
         qwen_sft_hash_bytes(&mut hash, b"\0");
     }
     for example in examples {
-        qwen_sft_hash_example(&mut hash, example, field_map.system.is_some());
+        qwen_sft_hash_example(&mut hash, example, field_map.has_system_source());
     }
     format!("{hash:016x}")
 }
@@ -12335,6 +12432,11 @@ fn qwen_sft_hash_field_map(hash: &mut u64, field_map: &QwenSftFieldMap) {
     if let Some(system) = &field_map.system {
         qwen_sft_hash_bytes(hash, b"system");
         qwen_sft_hash_bytes(hash, system.as_bytes());
+        qwen_sft_hash_bytes(hash, b"\0");
+    }
+    if let Some(chat_messages) = &field_map.chat_messages {
+        qwen_sft_hash_bytes(hash, b"chat_messages");
+        qwen_sft_hash_bytes(hash, chat_messages.as_bytes());
         qwen_sft_hash_bytes(hash, b"\0");
     }
     qwen_sft_hash_bytes(hash, field_map.prompt_template.as_bytes());
@@ -15023,6 +15125,78 @@ mod tests {
                 .expect("system prompt should render")
                 .contains("System: Be concise.")
         );
+    }
+
+    #[test]
+    fn qwen_sft_jsonl_reader_supports_chat_messages_records() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let jsonl = temp.path().join("chat.jsonl");
+        let cache_path = temp.path().join("cache").join("offset-index.json");
+        fs::write(
+            &jsonl,
+            r#"{"messages":[{"role":"system","content":"Be concise."},{"role":"user","content":"Name the project."},{"role":"assistant","content":"rustrain"}]}
+{"messages":[{"role":"human","content":"Name the language."},{"role":"gpt","content":"Rust"}]}
+{"messages":[{"role":"assistant","content":"missing user"}]}
+"#,
+        )
+        .expect("jsonl should write");
+        let paths = vec![jsonl.clone()];
+        let field_map = QwenSftFieldMap {
+            chat_messages: Some("messages".to_string()),
+            system_contains_any: vec!["concise".to_string()],
+            skip_invalid_records: true,
+            ..QwenSftFieldMap::default()
+        };
+
+        let loaded = qwen_sft_examples_from_jsonl_paths_with_limit(&paths, None, &field_map)
+            .expect("chat examples should load");
+        let streamed = qwen_sft_streaming_source_summary(&paths, None, &field_map)
+            .expect("chat streaming summary should scan");
+        let source_index =
+            qwen_sft_streaming_source_index(&paths, None, &field_map).expect("index should build");
+        let raw_window = qwen_sft_examples_by_raw_indices(&source_index.samples, &field_map)
+            .expect("chat raw window should replay");
+        let first_cache =
+            qwen_sft_streaming_source_index_with_cache(&paths, None, Some(&cache_path), &field_map)
+                .expect("chat cache should write");
+        let cache_hit =
+            qwen_sft_streaming_source_index_with_cache(&paths, None, Some(&cache_path), &field_map)
+                .expect("chat cache should hit");
+        let default_parse_error = qwen_sft_examples_from_jsonl_paths_with_limit(
+            &paths,
+            None,
+            &QwenSftFieldMap::default(),
+        )
+        .expect_err("default field map cannot parse chat rows")
+        .to_string();
+        let changed_chat_field = QwenSftFieldMap {
+            chat_messages: Some("conversations".to_string()),
+            ..field_map.clone()
+        };
+        let cache_mismatch = qwen_sft_streaming_source_index_with_cache(
+            &paths,
+            None,
+            Some(&cache_path),
+            &changed_chat_field,
+        )
+        .expect_err("cache should reject changed chat messages field")
+        .to_string();
+
+        assert_eq!(loaded.examples.len(), 1);
+        assert_eq!(loaded.examples[0].system, "Be concise.");
+        assert_eq!(loaded.examples[0].instruction, "Name the project.");
+        assert_eq!(loaded.examples[0].input, "");
+        assert_eq!(loaded.examples[0].response, "rustrain");
+        assert_eq!(streamed.samples, loaded.examples.len());
+        assert_eq!(streamed.fingerprint, loaded.fingerprint);
+        assert_eq!(raw_window.examples, loaded.examples);
+        assert_eq!(source_index.samples.len(), 1);
+        assert_eq!(source_index.samples[0].index_in_file, 0);
+        assert!(first_cache.cache_written);
+        assert!(cache_hit.cache_hit);
+        assert_eq!(cache_hit.index.samples, source_index.samples);
+        assert!(default_parse_error.contains("failed to parse SFT JSONL record"));
+        assert!(cache_mismatch.contains("field_map"));
     }
 
     #[test]

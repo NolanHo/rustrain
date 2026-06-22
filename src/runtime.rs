@@ -101,6 +101,8 @@ pub struct DataConfig {
     #[serde(default)]
     pub system_field: Option<String>,
     #[serde(default)]
+    pub chat_messages_field: Option<String>,
+    #[serde(default)]
     pub min_system_chars: Option<usize>,
     #[serde(default)]
     pub max_system_chars: Option<usize>,
@@ -567,14 +569,15 @@ pub fn validate_config(config: &Config) -> Result<()> {
         {
             return Err(anyhow!("data.input_excludes_any entries must not be empty"));
         }
-        if !data.system_contains_any.is_empty() && data.system_field.is_none() {
+        let has_system_source = data.system_field.is_some() || data.chat_messages_field.is_some();
+        if !data.system_contains_any.is_empty() && !has_system_source {
             return Err(anyhow!(
-                "data.system_contains_any requires data.system_field to be set"
+                "data.system_contains_any requires data.system_field or data.chat_messages_field to be set"
             ));
         }
-        if !data.system_excludes_any.is_empty() && data.system_field.is_none() {
+        if !data.system_excludes_any.is_empty() && !has_system_source {
             return Err(anyhow!(
-                "data.system_excludes_any requires data.system_field to be set"
+                "data.system_excludes_any requires data.system_field or data.chat_messages_field to be set"
             ));
         }
         if data
@@ -593,6 +596,15 @@ pub fn validate_config(config: &Config) -> Result<()> {
         {
             return Err(anyhow!(
                 "data.system_excludes_any entries must not be empty"
+            ));
+        }
+        if data
+            .chat_messages_field
+            .as_ref()
+            .is_some_and(|field| field.trim().is_empty())
+        {
+            return Err(anyhow!(
+                "data.chat_messages_field must not be empty when set"
             ));
         }
         if let Some(min_instruction_chars) = data.min_instruction_chars {
@@ -640,9 +652,9 @@ pub fn validate_config(config: &Config) -> Result<()> {
             }
         }
         if let Some(min_system_chars) = data.min_system_chars {
-            if data.system_field.is_none() {
+            if !has_system_source {
                 return Err(anyhow!(
-                    "data.min_system_chars requires data.system_field to be set"
+                    "data.min_system_chars requires data.system_field or data.chat_messages_field to be set"
                 ));
             }
             if min_system_chars == 0 {
@@ -652,9 +664,9 @@ pub fn validate_config(config: &Config) -> Result<()> {
             }
         }
         if let Some(max_system_chars) = data.max_system_chars {
-            if data.system_field.is_none() {
+            if !has_system_source {
                 return Err(anyhow!(
-                    "data.max_system_chars requires data.system_field to be set"
+                    "data.max_system_chars requires data.system_field or data.chat_messages_field to be set"
                 ));
             }
             if max_system_chars == 0 {
@@ -721,11 +733,9 @@ pub fn validate_config(config: &Config) -> Result<()> {
                     "data.field_replacements pattern entries must not be empty"
                 ));
             }
-            if matches!(replacement.field, FieldReplacementTarget::System)
-                && data.system_field.is_none()
-            {
+            if matches!(replacement.field, FieldReplacementTarget::System) && !has_system_source {
                 return Err(anyhow!(
-                    "data.field_replacements targeting system requires data.system_field to be set"
+                    "data.field_replacements targeting system requires data.system_field or data.chat_messages_field to be set"
                 ));
             }
         }
@@ -911,6 +921,7 @@ mod tests {
                 input_field: default_input_field(),
                 response_field: default_response_field(),
                 system_field: None,
+                chat_messages_field: None,
                 min_system_chars: None,
                 max_system_chars: None,
                 system_contains_any: Vec::new(),
