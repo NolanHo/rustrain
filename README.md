@@ -115,6 +115,7 @@ RUSTRAIN_RAY_NUM_GPUS=2 scripts/gpu_run.sh env RUSTRAIN_LAUNCH_TIMEOUT_SECS=900 
 RUSTRAIN_RAY_NUM_GPUS=2 scripts/gpu_run.sh env RUSTRAIN_LAUNCH_TIMEOUT_SECS=900 RUSTRAIN_QWEN_SESSION_DP_LAYERS_CONFIG=configs/qwen_session_dp2_layers01_bf16.toml RUSTRAIN_EXPECTED_QWEN_COMPUTE_KIND=bf16 bash scripts/verify_qwen_session_dp2_layers01_worker.sh
 RUSTRAIN_RAY_NUM_GPUS=2 scripts/gpu_run.sh env RUSTRAIN_LAUNCH_TIMEOUT_SECS=900 RUSTRAIN_QWEN_SESSION_DP_LAYERS_CONFIG=configs/qwen_session_dp2_layers03.toml RUSTRAIN_EXPECTED_QWEN_DP_TRAINABLE_TENSORS=49 RUSTRAIN_EXPECTED_QWEN_DP_TRAINABLE_NAMES=model.layers.0.self_attn.q_proj.weight,model.layers.0.mlp.down_proj.weight,model.layers.3.self_attn.q_proj.weight,model.layers.3.mlp.down_proj.weight,model.norm.weight bash scripts/verify_qwen_session_dp2_layers01_worker.sh
 RUSTRAIN_RAY_NUM_GPUS=2 scripts/gpu_run.sh env RUSTRAIN_LAUNCH_TIMEOUT_SECS=900 RUSTRAIN_QWEN_SESSION_DP_LAYERS_CONFIG=configs/qwen_session_dp2_layers03_bf16.toml RUSTRAIN_EXPECTED_QWEN_COMPUTE_KIND=bf16 RUSTRAIN_EXPECTED_QWEN_DP_TRAINABLE_TENSORS=49 RUSTRAIN_EXPECTED_QWEN_DP_TRAINABLE_NAMES=model.layers.0.self_attn.q_proj.weight,model.layers.0.mlp.down_proj.weight,model.layers.3.self_attn.q_proj.weight,model.layers.3.mlp.down_proj.weight,model.norm.weight bash scripts/verify_qwen_session_dp2_layers01_worker.sh
+RUSTRAIN_RAY_NUM_GPUS=2 scripts/gpu_run.sh env RUSTRAIN_LAUNCH_TIMEOUT_SECS=900 RUSTRAIN_QWEN_SESSION_DP_LAYERS_CONFIG=configs/qwen_session_dp2_layers07.toml RUSTRAIN_EXPECTED_QWEN_DP_TRAINABLE_TENSORS=97 RUSTRAIN_EXPECTED_QWEN_DP_TRAINABLE_NAMES=model.layers.0.self_attn.q_proj.weight,model.layers.0.mlp.down_proj.weight,model.layers.7.self_attn.q_proj.weight,model.layers.7.mlp.down_proj.weight,model.norm.weight bash scripts/verify_qwen_session_dp2_layers01_worker.sh
 RUSTRAIN_RAY_NUM_GPUS=2 scripts/gpu_run.sh env RUSTRAIN_LAUNCH_TIMEOUT_SECS=900 RUSTRAIN_QWEN_SESSION_DP_LAYERS_CONFIG=configs/qwen_session_dp2_layers01_sft.toml RUSTRAIN_EXPECTED_DATASET_ORDER_SEED=777 bash scripts/verify_qwen_session_dp2_layers01_worker.sh
 RUSTRAIN_RAY_NUM_GPUS=2 scripts/gpu_run.sh env RUSTRAIN_LAUNCH_TIMEOUT_SECS=900 RUSTRAIN_QWEN_SESSION_DP_LAYERS_CONFIG=configs/qwen_session_dp2_layers03_sft.toml RUSTRAIN_EXPECTED_QWEN_DP_TRAINABLE_TENSORS=49 RUSTRAIN_EXPECTED_QWEN_DP_TRAINABLE_NAMES=model.layers.0.self_attn.q_proj.weight,model.layers.0.mlp.down_proj.weight,model.layers.3.self_attn.q_proj.weight,model.layers.3.mlp.down_proj.weight,model.norm.weight RUSTRAIN_EXPECTED_DATASET_ORDER_SEED=777 bash scripts/verify_qwen_session_dp2_layers01_worker.sh
 RUSTRAIN_RAY_NUM_GPUS=2 scripts/gpu_run.sh env RUSTRAIN_LAUNCH_TIMEOUT_SECS=900 RUSTRAIN_QWEN_SESSION_DP_LAYERS_CONFIG=configs/qwen_session_dp2_layers01_sft_bf16.toml RUSTRAIN_EXPECTED_QWEN_COMPUTE_KIND=bf16 RUSTRAIN_EXPECTED_DATASET_ORDER_SEED=777 bash scripts/verify_qwen_session_dp2_layers01_worker.sh
@@ -212,6 +213,10 @@ trainer path to layer0-layer3 with 49 trainable tensors, again excluding the
 tied embedding by design.
 `configs/qwen_session_dp2_layers03_bf16.toml` verifies the same layer0-layer3
 DP path under bf16 compute.
+`configs/qwen_session_dp2_layers07.toml` extends the fixed-token
+representative DP=2 trainer path to layer0-layer7 with 97 trainable tensors,
+still excluding the tied embedding by design and still checking rank0 plus
+sharded checkpoint next-step parity.
 `configs/qwen_session_dp2_layers01_sft.toml` runs the same layer0+layer1
 DP trainer over tokenizer-backed JSONL instruction batches and verifies dataset
 provenance, sample cursor progress, rank0 checkpoint parity, and sharded
