@@ -65,6 +65,8 @@ if data.get("data_paths") != [expected_source, expected_second_source]:
     )
 if data.get("eval_paths") != []:
     raise SystemExit(f"eval_paths should be empty, got {data.get('eval_paths')}")
+if data.get("max_eval_samples") is not None:
+    raise SystemExit(f"max_eval_samples should be null, got {data.get('max_eval_samples')}")
 
 expected_window = [
     {"cursor": 2, "epoch": 0, "sample_offset": 2},

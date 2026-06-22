@@ -59,6 +59,7 @@ struct SftCache {
     vocab_size: usize,
     min_response_chars: usize,
     max_response_chars: Option<usize>,
+    max_eval_samples: Option<usize>,
     min_instruction_chars: Option<usize>,
     max_instruction_chars: Option<usize>,
     min_input_chars: Option<usize>,
@@ -164,8 +165,14 @@ pub fn load_sft_dataset(
     cache_dir: &Path,
 ) -> Result<SftDataset> {
     let tokenizer = ByteTokenizer::new(vocab_size);
-    let (mut samples, mut source_paths) =
-        read_sft_paths(data, &data.paths, &tokenizer, seq_len, true)?;
+    let (mut samples, mut source_paths) = read_sft_paths(
+        data,
+        &data.paths,
+        &tokenizer,
+        seq_len,
+        true,
+        data.max_samples,
+    )?;
 
     if samples.len() < 2 {
         return Err(anyhow!("SFT dataset needs at least two samples"));
@@ -184,8 +191,14 @@ pub fn load_sft_dataset(
         let split_at = split_at.clamp(1, samples.len() - 1);
         (samples[..split_at].to_vec(), samples[split_at..].to_vec())
     } else {
-        let (eval_samples, eval_source_paths) =
-            read_sft_paths(data, &data.eval_paths, &tokenizer, seq_len, false)?;
+        let (eval_samples, eval_source_paths) = read_sft_paths(
+            data,
+            &data.eval_paths,
+            &tokenizer,
+            seq_len,
+            false,
+            data.max_eval_samples,
+        )?;
         if eval_samples.is_empty() {
             return Err(anyhow!("SFT eval dataset needs at least one sample"));
         }
@@ -204,6 +217,7 @@ pub fn load_sft_dataset(
         vocab_size,
         data.min_response_chars,
         data.max_response_chars,
+        data.max_eval_samples,
         data.min_instruction_chars,
         data.max_instruction_chars,
         data.min_input_chars,
@@ -305,6 +319,7 @@ fn read_sft_paths(
     tokenizer: &ByteTokenizer,
     seq_len: usize,
     apply_source_weights: bool,
+    max_samples: Option<usize>,
 ) -> Result<(Vec<SftSample>, Vec<PathBuf>)> {
     let mut samples = Vec::new();
     let mut source_paths = Vec::new();
@@ -315,6 +330,9 @@ fn read_sft_paths(
         vec![1; paths.len()]
     };
     for (path, source_weight) in paths.iter().zip(source_weights.iter().copied()) {
+        if max_samples.is_some_and(|limit| samples.len() >= limit) {
+            break;
+        }
         let files = if path.is_dir() {
             sorted_files(path)?
         } else {
@@ -322,9 +340,15 @@ fn read_sft_paths(
         };
 
         for file in files {
+            if max_samples.is_some_and(|limit| samples.len() >= limit) {
+                break;
+            }
             let contents = fs::read_to_string(&file)
                 .with_context(|| format!("failed to read {}", file.display()))?;
             for (line_index, line) in contents.lines().enumerate() {
+                if max_samples.is_some_and(|limit| samples.len() >= limit) {
+                    break;
+                }
                 if line.trim().is_empty() {
                     continue;
                 }
@@ -345,6 +369,9 @@ fn read_sft_paths(
                 }
                 let sample = format_sft_sample(data, tokenizer, seq_len, &record)?;
                 for _ in 0..source_weight {
+                    if max_samples.is_some_and(|limit| samples.len() >= limit) {
+                        break;
+                    }
                     samples.push(sample.clone());
                 }
             }
@@ -542,6 +569,7 @@ fn write_sft_cache(
     vocab_size: usize,
     min_response_chars: usize,
     max_response_chars: Option<usize>,
+    max_eval_samples: Option<usize>,
     min_instruction_chars: Option<usize>,
     max_instruction_chars: Option<usize>,
     min_input_chars: Option<usize>,
@@ -559,6 +587,7 @@ fn write_sft_cache(
         vocab_size,
         min_response_chars,
         max_response_chars,
+        max_eval_samples,
         min_instruction_chars,
         max_instruction_chars,
         min_input_chars,
@@ -610,6 +639,7 @@ mod tests {
             eval_paths: Vec::new(),
             train_split: 0.75,
             max_samples: None,
+            max_eval_samples: None,
             shuffle: true,
             index_cache: None,
             instruction_field: "instruction".to_string(),
@@ -663,6 +693,7 @@ mod tests {
             eval_paths: vec![eval_dir],
             train_split: 0.5,
             max_samples: None,
+            max_eval_samples: None,
             shuffle: true,
             index_cache: None,
             instruction_field: "instruction".to_string(),
@@ -722,6 +753,7 @@ mod tests {
             eval_paths: Vec::new(),
             train_split: 0.5,
             max_samples: None,
+            max_eval_samples: None,
             shuffle: true,
             index_cache: None,
             instruction_field: "instruction".to_string(),
@@ -789,6 +821,7 @@ mod tests {
             eval_paths: Vec::new(),
             train_split: 0.5,
             max_samples: None,
+            max_eval_samples: None,
             shuffle: false,
             index_cache: None,
             instruction_field: "instruction".to_string(),
@@ -847,6 +880,7 @@ mod tests {
             eval_paths: Vec::new(),
             train_split: 0.5,
             max_samples: None,
+            max_eval_samples: None,
             shuffle: false,
             index_cache: None,
             instruction_field: "instruction".to_string(),
@@ -931,6 +965,7 @@ mod tests {
             eval_paths: vec![eval_dir],
             train_split: 0.34,
             max_samples: None,
+            max_eval_samples: None,
             shuffle: true,
             index_cache: None,
             instruction_field: "instruction".to_string(),
@@ -962,6 +997,71 @@ mod tests {
     }
 
     #[test]
+    fn sft_dataset_limits_explicit_eval_paths() {
+        let dir = tempdir().expect("temp dir should be created");
+        let train_dir = dir.path().join("train_sft");
+        let eval_dir = dir.path().join("eval_sft");
+        let cache_dir = dir.path().join("cache");
+        fs::create_dir_all(&train_dir).expect("train SFT dir should be created");
+        fs::create_dir_all(&eval_dir).expect("eval SFT dir should be created");
+        fs::create_dir_all(&cache_dir).expect("cache dir should be created");
+        fs::write(
+            train_dir.join("train.jsonl"),
+            "{\"instruction\":\"train one\",\"response\":\"alpha\"}\n{\"instruction\":\"train two\",\"response\":\"beta\"}\n",
+        )
+        .expect("train jsonl should write");
+        fs::write(
+            eval_dir.join("eval.jsonl"),
+            "{\"instruction\":\"eval one\",\"response\":\"gamma\"}\n{\"instruction\":\"eval two\",\"response\":\"delta\"}\n{\"instruction\":\"eval three\",\"response\":\"epsilon\"}\n",
+        )
+        .expect("eval jsonl should write");
+
+        let data = DataConfig {
+            kind: DataKind::InstructionJsonl,
+            paths: vec![train_dir],
+            eval_paths: vec![eval_dir],
+            train_split: 0.5,
+            max_samples: None,
+            max_eval_samples: Some(2),
+            shuffle: false,
+            index_cache: None,
+            instruction_field: "instruction".to_string(),
+            input_field: "input".to_string(),
+            response_field: "response".to_string(),
+            prompt_template: "Instruction:\n{instruction}\n\nResponse:\n".to_string(),
+            prompt_with_input_template:
+                "Instruction:\n{instruction}\n\nInput:\n{input}\n\nResponse:\n".to_string(),
+            trim_fields: true,
+            min_response_chars: 1,
+            max_response_chars: None,
+            min_instruction_chars: None,
+            max_instruction_chars: None,
+            min_input_chars: None,
+            max_input_chars: None,
+            min_prompt_chars: None,
+            max_prompt_chars: None,
+            min_sample_chars: None,
+            max_sample_chars: None,
+            dedupe_samples: false,
+            source_weights: Vec::new(),
+        };
+        let dataset =
+            load_sft_dataset(&data, 128, 64, &cache_dir).expect("SFT dataset should load");
+
+        assert_eq!(dataset.train_samples.len(), 2);
+        assert_eq!(dataset.eval_samples.len(), 2);
+        let eval_decoded = dataset
+            .eval_samples
+            .iter()
+            .map(|sample| dataset.tokenizer.decode_lossy(&sample.tokens))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(eval_decoded.contains("eval one"));
+        assert!(eval_decoded.contains("eval two"));
+        assert!(!eval_decoded.contains("eval three"));
+    }
+
+    #[test]
     fn sft_dataset_filters_short_responses_before_split_and_limit() {
         let dir = tempdir().expect("temp dir should be created");
         let data_dir = dir.path().join("sft");
@@ -980,6 +1080,7 @@ mod tests {
             eval_paths: Vec::new(),
             train_split: 0.5,
             max_samples: Some(2),
+            max_eval_samples: None,
             shuffle: false,
             index_cache: None,
             instruction_field: "instruction".to_string(),
@@ -1038,6 +1139,7 @@ mod tests {
             eval_paths: Vec::new(),
             train_split: 0.5,
             max_samples: Some(2),
+            max_eval_samples: None,
             shuffle: false,
             index_cache: None,
             instruction_field: "instruction".to_string(),
@@ -1096,6 +1198,7 @@ mod tests {
             eval_paths: Vec::new(),
             train_split: 0.5,
             max_samples: Some(2),
+            max_eval_samples: None,
             shuffle: false,
             index_cache: None,
             instruction_field: "instruction".to_string(),
@@ -1156,6 +1259,7 @@ mod tests {
             eval_paths: Vec::new(),
             train_split: 0.5,
             max_samples: Some(2),
+            max_eval_samples: None,
             shuffle: false,
             index_cache: None,
             instruction_field: "instruction".to_string(),
@@ -1218,6 +1322,7 @@ mod tests {
             eval_paths: Vec::new(),
             train_split: 0.5,
             max_samples: Some(2),
+            max_eval_samples: None,
             shuffle: false,
             index_cache: None,
             instruction_field: "instruction".to_string(),
@@ -1278,6 +1383,7 @@ mod tests {
             eval_paths: Vec::new(),
             train_split: 0.5,
             max_samples: Some(2),
+            max_eval_samples: None,
             shuffle: false,
             index_cache: None,
             instruction_field: "instruction".to_string(),
@@ -1346,6 +1452,7 @@ mod tests {
             eval_paths: Vec::new(),
             train_split: 0.5,
             max_samples: Some(3),
+            max_eval_samples: None,
             shuffle: false,
             index_cache: None,
             instruction_field: "instruction".to_string(),
@@ -1403,6 +1510,7 @@ mod tests {
             eval_paths: Vec::new(),
             train_split: 0.5,
             max_samples: Some(2),
+            max_eval_samples: None,
             shuffle: false,
             index_cache: None,
             instruction_field: "instruction".to_string(),
@@ -1462,6 +1570,7 @@ mod tests {
             eval_paths: Vec::new(),
             train_split: 0.5,
             max_samples: Some(2),
+            max_eval_samples: None,
             shuffle: true,
             index_cache: None,
             instruction_field: "instruction".to_string(),

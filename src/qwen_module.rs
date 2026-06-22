@@ -1870,6 +1870,7 @@ struct QwenSftStreamingDataPlanSummary {
     data_paths: Vec<String>,
     eval_paths: Vec<String>,
     max_samples: Option<usize>,
+    max_eval_samples: Option<usize>,
     train_split: f32,
     world_size: usize,
     local_batch_size: usize,
@@ -2823,6 +2824,7 @@ fn qwen_lora_sft_train(
             sft_paths,
             eval_paths,
             max_samples,
+            None,
             train_split,
             policy.dataset_shuffle,
             policy.dataset_order_seed,
@@ -5739,6 +5741,7 @@ pub fn qwen_session_dp_data_plan(
         &data_config.paths,
         &data_config.eval_paths,
         data_config.max_samples,
+        data_config.max_eval_samples,
         data_config.train_split,
         data_config.shuffle,
         config.run.seed,
@@ -5842,8 +5845,11 @@ pub fn qwen_sft_streaming_data_plan(
         )
     } else {
         let eval_field_map = qwen_sft_eval_field_map(&field_map);
-        let eval_summary =
-            qwen_sft_streaming_source_summary(&data_config.eval_paths, None, &eval_field_map)?;
+        let eval_summary = qwen_sft_streaming_source_summary(
+            &data_config.eval_paths,
+            data_config.max_eval_samples,
+            &eval_field_map,
+        )?;
         let combined_source_files =
             qwen_merge_sft_source_files(&train_summary.source_files, &eval_summary.source_files);
         let combined_source_sample_counts = qwen_merge_sft_source_sample_counts(
@@ -5907,6 +5913,7 @@ pub fn qwen_sft_streaming_data_plan(
             .map(|path| path.display().to_string())
             .collect(),
         max_samples: data_config.max_samples,
+        max_eval_samples: data_config.max_eval_samples,
         train_split: data_config.train_split,
         world_size,
         local_batch_size,
@@ -5978,6 +5985,7 @@ pub fn qwen_sft_streaming_batch_plan(
         &data_config.paths,
         &data_config.eval_paths,
         data_config.max_samples,
+        data_config.max_eval_samples,
         data_config.train_split,
         data_config.shuffle,
         config.run.seed,
@@ -9093,6 +9101,7 @@ fn qwen_session_batch_plan_from_config(
         &data_config.paths,
         &data_config.eval_paths,
         data_config.max_samples,
+        data_config.max_eval_samples,
         data_config.train_split,
         data_config.shuffle,
         runtime_config.run.seed,
@@ -9249,6 +9258,7 @@ fn qwen_session_dp_batch_plan_from_config(
         &data_config.paths,
         &data_config.eval_paths,
         data_config.max_samples,
+        data_config.max_eval_samples,
         data_config.train_split,
         data_config.shuffle,
         runtime_config.run.seed,
@@ -10923,6 +10933,7 @@ fn qwen_sft_train_eval_datasets_from_paths(
     train_paths: &[PathBuf],
     eval_paths: &[PathBuf],
     max_samples: Option<usize>,
+    max_eval_samples: Option<usize>,
     train_split: f32,
     shuffle: bool,
     seed: u64,
@@ -10946,8 +10957,12 @@ fn qwen_sft_train_eval_datasets_from_paths(
     }
 
     let eval_field_map = qwen_sft_eval_field_map(field_map);
-    let eval_dataset =
-        QwenSftDataset::from_jsonl_paths_with_limit(tokenizer, eval_paths, None, &eval_field_map)?;
+    let eval_dataset = QwenSftDataset::from_jsonl_paths_with_limit(
+        tokenizer,
+        eval_paths,
+        max_eval_samples,
+        &eval_field_map,
+    )?;
     let train_summary = train_dataset.summary();
     let eval_summary = eval_dataset.summary();
     let combined_source_files =
@@ -14508,6 +14523,92 @@ mod tests {
         assert_ne!(
             fingerprint,
             qwen_combine_sft_fingerprints(&source_files, "train-fingerprint", "other-eval")
+        );
+    }
+
+    #[test]
+    fn qwen_sft_limits_explicit_eval_paths() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let train_jsonl = temp.path().join("train.jsonl");
+        let eval_jsonl = temp.path().join("eval.jsonl");
+        fs::write(
+            &train_jsonl,
+            "{\"instruction\":\"train one\",\"response\":\"alpha\"}\n{\"instruction\":\"train two\",\"response\":\"beta\"}\n",
+        )
+        .expect("train jsonl should write");
+        fs::write(
+            &eval_jsonl,
+            "{\"instruction\":\"eval one\",\"response\":\"gamma\"}\n{\"instruction\":\"eval two\",\"response\":\"delta\"}\n{\"instruction\":\"eval three\",\"response\":\"epsilon\"}\n",
+        )
+        .expect("eval jsonl should write");
+        let train_paths = vec![train_jsonl.clone()];
+        let eval_paths = vec![eval_jsonl.clone()];
+        let field_map = QwenSftFieldMap::default();
+        let eval_field_map = qwen_sft_eval_field_map(&field_map);
+
+        let train_set =
+            qwen_sft_examples_from_jsonl_paths_with_limit(&train_paths, None, &field_map)
+                .expect("train examples should load");
+        let limited_eval_set =
+            qwen_sft_examples_from_jsonl_paths_with_limit(&eval_paths, Some(2), &eval_field_map)
+                .expect("limited eval examples should load");
+        let streaming_eval_summary =
+            qwen_sft_streaming_source_summary(&eval_paths, Some(2), &eval_field_map)
+                .expect("limited eval streaming summary should scan");
+
+        assert_eq!(train_set.examples.len(), 2);
+        assert_eq!(limited_eval_set.examples.len(), 2);
+        assert_eq!(
+            limited_eval_set
+                .examples
+                .iter()
+                .map(|example| example.instruction.as_str())
+                .collect::<Vec<_>>(),
+            vec!["eval one", "eval two"]
+        );
+        assert_eq!(
+            streaming_eval_summary.samples,
+            limited_eval_set.examples.len()
+        );
+        assert_eq!(
+            streaming_eval_summary.source_sample_counts,
+            limited_eval_set.source_sample_counts
+        );
+        assert_eq!(
+            streaming_eval_summary.fingerprint,
+            limited_eval_set.fingerprint
+        );
+
+        let combined_source_files =
+            qwen_merge_sft_source_files(&train_set.source_files, &limited_eval_set.source_files);
+        let combined_source_sample_counts = qwen_merge_sft_source_sample_counts(
+            &train_set.source_sample_counts,
+            &limited_eval_set.source_sample_counts,
+        );
+        assert_eq!(
+            combined_source_sample_counts,
+            vec![
+                QwenSftSourceSampleCount {
+                    path: eval_jsonl.display().to_string(),
+                    samples: 2,
+                },
+                QwenSftSourceSampleCount {
+                    path: train_jsonl.display().to_string(),
+                    samples: 2,
+                },
+            ]
+        );
+        assert_ne!(
+            qwen_combine_sft_fingerprints(
+                &combined_source_files,
+                &train_set.fingerprint,
+                &limited_eval_set.fingerprint,
+            ),
+            qwen_combine_sft_fingerprints(
+                &combined_source_files,
+                &train_set.fingerprint,
+                "unlimited-eval-fingerprint",
+            )
         );
     }
 

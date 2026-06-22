@@ -458,6 +458,9 @@ production-grade sharded checkpoint ownership remain open.
   instruction/input/response triple and skip exact duplicate records. These
   transforms run before train/eval splitting, `max_samples`, and streaming
   offset-index construction.
+  `data.max_eval_samples` can optionally cap explicit held-out
+  `data.eval_paths`; it defaults to unlimited and never affects training
+  source offset caches.
   `data.source_weights` can be empty,
   length 1, or match `data.paths`; it repeats valid training samples from each
   configured source before `max_samples` and splitting, while explicit

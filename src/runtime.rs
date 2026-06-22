@@ -86,6 +86,8 @@ pub struct DataConfig {
     pub train_split: f32,
     #[serde(default)]
     pub max_samples: Option<usize>,
+    #[serde(default)]
+    pub max_eval_samples: Option<usize>,
     #[serde(default = "default_data_shuffle")]
     pub shuffle: bool,
     #[serde(default)]
@@ -438,6 +440,11 @@ pub fn validate_config(config: &Config) -> Result<()> {
                 "data.max_samples must be greater than zero when set"
             ));
         }
+        if matches!(data.max_eval_samples, Some(0)) {
+            return Err(anyhow!(
+                "data.max_eval_samples must be greater than zero when set"
+            ));
+        }
         if let Some(max_response_chars) = data.max_response_chars {
             if max_response_chars == 0 {
                 return Err(anyhow!(
@@ -713,6 +720,7 @@ mod tests {
                 eval_paths: Vec::new(),
                 train_split: 0.8,
                 max_samples: None,
+                max_eval_samples: None,
                 shuffle: true,
                 index_cache: None,
                 instruction_field: default_instruction_field(),

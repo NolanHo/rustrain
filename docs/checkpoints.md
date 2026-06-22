@@ -156,6 +156,11 @@ Acceptance:
   prompt format, normalization policy,
   instruction/input/prompt/sample/response filtering or dedupe policy, or
   source weighting policy are rejected.
+- Explicit held-out `data.eval_paths` can be capped with
+  `data.max_eval_samples`. This limit participates in combined dataset
+  provenance and resume fingerprints through the selected eval records, but it
+  is not part of the training offset-index cache because that cache indexes
+  training sources only.
 - Adapter reload preserves SFT train/eval loss, full-Qwen forward logits, and
   greedy generation output.
 - Merge/unmerge parity is checked for the focused full-Qwen adapter path, with
