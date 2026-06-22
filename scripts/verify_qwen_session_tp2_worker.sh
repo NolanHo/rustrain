@@ -85,6 +85,26 @@ def tensor_shape_sums(path):
     return tensors
 
 
+def require_complete_qwen_base_model(global_manifest):
+    base_model_path = pathlib.Path(global_manifest["base_model_path"])
+    tokenizer_path = pathlib.Path(global_manifest["tokenizer_path"])
+    required = [
+        base_model_path / "config.json",
+        tokenizer_path,
+        base_model_path / "model.safetensors",
+    ]
+    missing = [str(path) for path in required if not path.exists()]
+    if missing:
+        raise SystemExit(
+            "TP global manifest base model must point to a complete Qwen checkpoint; "
+            f"missing {missing}"
+        )
+    if tokenizer_path.parent != base_model_path:
+        raise SystemExit(
+            f"TP tokenizer_path {tokenizer_path} must live under base_model_path {base_model_path}"
+        )
+
+
 for path in summaries:
     data = json.loads(path.read_text())
     rank = int(data["rank"])
@@ -326,10 +346,7 @@ if not global_manifest_path.exists():
 global_manifest = json.loads(global_manifest_path.read_text())
 if global_manifest["format"] != "rustrain.qwen_sharded.v1":
     raise SystemExit(f"unexpected TP global manifest format {global_manifest['format']}")
-if global_manifest["base_model_path"] != "/vePFS-Mindverse/share/huggingface/Qwen2.5-0.5B-Instruct":
-    raise SystemExit(f"unexpected TP base_model_path {global_manifest['base_model_path']}")
-if global_manifest["tokenizer_path"] != "/vePFS-Mindverse/share/huggingface/Qwen2.5-0.5B-Instruct/tokenizer.json":
-    raise SystemExit(f"unexpected TP tokenizer_path {global_manifest['tokenizer_path']}")
+require_complete_qwen_base_model(global_manifest)
 if int(global_manifest["global_step"]) != 1:
     raise SystemExit(f"unexpected TP global_step {global_manifest['global_step']}")
 if int(global_manifest["consumed_samples"]) != 2:
