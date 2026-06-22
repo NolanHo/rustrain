@@ -17,8 +17,9 @@ use tracing::info;
 use crate::nccl_smoke;
 use crate::runtime::{
     Config, DataConfig as RuntimeDataConfig, DataKind as RuntimeDataKind, Device as RuntimeDevice,
-    FieldCaseTransform, FieldCaseTransformKind, FieldDefault, FieldDefaultTarget, FieldReplacement,
-    FieldReplacementTarget, LoraConfig as RuntimeLoraConfig, LrScheduler, RunPaths, load_config,
+    FieldAffix, FieldCaseTransform, FieldCaseTransformKind, FieldDefault, FieldDefaultTarget,
+    FieldReplacement, FieldReplacementTarget, LoraConfig as RuntimeLoraConfig, LrScheduler,
+    RunPaths, load_config,
 };
 
 #[derive(Debug, Serialize)]
@@ -1705,6 +1706,8 @@ struct QwenSftFieldMap {
     field_defaults: Vec<FieldDefault>,
     #[serde(default)]
     field_case_transforms: Vec<FieldCaseTransform>,
+    #[serde(default)]
+    field_affixes: Vec<FieldAffix>,
     source_weights: Vec<usize>,
     #[serde(default)]
     source_max_samples: Vec<usize>,
@@ -1748,6 +1751,7 @@ impl QwenSftFieldMap {
             normalize_whitespace: data.normalize_whitespace,
             field_defaults: data.field_defaults.clone(),
             field_case_transforms: data.field_case_transforms.clone(),
+            field_affixes: data.field_affixes.clone(),
             source_weights: data.source_weights.clone(),
             source_max_samples: data.source_max_samples.clone(),
             skip_invalid_records: data.skip_invalid_records,
@@ -1989,6 +1993,16 @@ impl QwenSftFieldMap {
                 );
             }
         }
+        for affix in &self.field_affixes {
+            if affix.prefix.is_empty() && affix.suffix.is_empty() {
+                bail!("data.field_affixes entries must set prefix, suffix, or both");
+            }
+            if matches!(affix.field, FieldReplacementTarget::System) && !has_system_source {
+                bail!(
+                    "data.field_affixes targeting system requires data.system_field, data.chat_messages_field, or a system field_default to be set"
+                );
+            }
+        }
         Ok(())
     }
 
@@ -2039,6 +2053,7 @@ impl Default for QwenSftFieldMap {
             normalize_whitespace: false,
             field_defaults: Vec::new(),
             field_case_transforms: Vec::new(),
+            field_affixes: Vec::new(),
             source_weights: Vec::new(),
             source_max_samples: Vec::new(),
             skip_invalid_records: false,
@@ -12004,6 +12019,7 @@ fn qwen_sft_record_from_jsonl_line(
         qwen_apply_field_defaults(&mut record, &field_map.field_defaults);
         qwen_apply_field_replacements(&mut record, &field_map.field_replacements);
         qwen_apply_field_case_transforms(&mut record, &field_map.field_case_transforms);
+        qwen_apply_field_affixes(&mut record, &field_map.field_affixes);
         if field_map.normalize_whitespace {
             qwen_normalize_record_whitespace(&mut record);
         }
@@ -12044,6 +12060,7 @@ fn qwen_sft_record_from_jsonl_line(
     qwen_apply_field_defaults(&mut record, &field_map.field_defaults);
     qwen_apply_field_replacements(&mut record, &field_map.field_replacements);
     qwen_apply_field_case_transforms(&mut record, &field_map.field_case_transforms);
+    qwen_apply_field_affixes(&mut record, &field_map.field_affixes);
     if field_map.normalize_whitespace {
         qwen_normalize_record_whitespace(&mut record);
     }
@@ -12242,6 +12259,44 @@ fn qwen_apply_field_case_transform(value: &str, case: FieldCaseTransformKind) ->
         FieldCaseTransformKind::Lowercase => value.to_lowercase(),
         FieldCaseTransformKind::Uppercase => value.to_uppercase(),
     }
+}
+
+fn qwen_apply_field_affixes(record: &mut QwenSftRecord, affixes: &[FieldAffix]) {
+    for affix in affixes {
+        if matches!(
+            affix.field,
+            FieldReplacementTarget::System | FieldReplacementTarget::All
+        ) {
+            record.system = qwen_apply_field_affix(&record.system, affix);
+        }
+        if matches!(
+            affix.field,
+            FieldReplacementTarget::Instruction | FieldReplacementTarget::All
+        ) {
+            record.instruction = qwen_apply_field_affix(&record.instruction, affix);
+        }
+        if matches!(
+            affix.field,
+            FieldReplacementTarget::Input | FieldReplacementTarget::All
+        ) {
+            record.input = qwen_apply_field_affix(&record.input, affix);
+        }
+        if matches!(
+            affix.field,
+            FieldReplacementTarget::Response | FieldReplacementTarget::All
+        ) {
+            record.response = qwen_apply_field_affix(&record.response, affix);
+        }
+    }
+}
+
+fn qwen_apply_field_affix(value: &str, affix: &FieldAffix) -> String {
+    let mut transformed =
+        String::with_capacity(affix.prefix.len() + value.len() + affix.suffix.len());
+    transformed.push_str(&affix.prefix);
+    transformed.push_str(value);
+    transformed.push_str(&affix.suffix);
+    transformed
 }
 
 fn qwen_field_default_value(defaults: &[FieldDefault], field: FieldDefaultTarget) -> Option<&str> {
@@ -12501,6 +12556,17 @@ fn qwen_sft_hash_field_map(hash: &mut u64, field_map: &QwenSftFieldMap) {
             qwen_sft_hash_bytes(hash, format!("{:?}", transform.field).as_bytes());
             qwen_sft_hash_bytes(hash, b"\0");
             qwen_sft_hash_bytes(hash, format!("{:?}", transform.case).as_bytes());
+            qwen_sft_hash_bytes(hash, b"\0");
+        }
+    }
+    if !field_map.field_affixes.is_empty() {
+        qwen_sft_hash_bytes(hash, b"field_affixes");
+        for affix in &field_map.field_affixes {
+            qwen_sft_hash_bytes(hash, format!("{:?}", affix.field).as_bytes());
+            qwen_sft_hash_bytes(hash, b"\0");
+            qwen_sft_hash_bytes(hash, affix.prefix.as_bytes());
+            qwen_sft_hash_bytes(hash, b"\0");
+            qwen_sft_hash_bytes(hash, affix.suffix.as_bytes());
             qwen_sft_hash_bytes(hash, b"\0");
         }
     }
@@ -15607,6 +15673,97 @@ mod tests {
         assert_eq!(streamed.samples, loaded.examples.len());
         assert_eq!(streamed.fingerprint, loaded.fingerprint);
         assert_ne!(loaded.fingerprint, raw_case_fingerprint);
+        assert!(first_cache.cache_written);
+        assert!(cache_mismatch.contains("field_map"));
+    }
+
+    #[test]
+    fn qwen_sft_applies_field_affixes_before_filters_and_fingerprint() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let jsonl = temp.path().join("samples.jsonl");
+        let cache_path = temp.path().join("cache").join("offset-index.json");
+        fs::write(
+            &jsonl,
+            r#"{"instruction":"Name the project","input":"GPU","response":"rustrain"}
+{"instruction":"Name the language","input":"GPU","response":"Rust"}
+"#,
+        )
+        .expect("jsonl should write");
+        let paths = vec![jsonl.clone()];
+        let field_map = QwenSftFieldMap {
+            system_contains_any: vec!["system:".to_string()],
+            instruction_contains_any: vec!["Q: Name".to_string()],
+            input_contains_any: vec!["ctx=GPU".to_string()],
+            response_contains_any: vec!["</answer>".to_string()],
+            field_defaults: vec![FieldDefault {
+                field: FieldDefaultTarget::System,
+                value: "concise".to_string(),
+            }],
+            field_affixes: vec![
+                FieldAffix {
+                    field: FieldReplacementTarget::System,
+                    prefix: "system: ".to_string(),
+                    suffix: String::new(),
+                },
+                FieldAffix {
+                    field: FieldReplacementTarget::Instruction,
+                    prefix: "Q: ".to_string(),
+                    suffix: "?".to_string(),
+                },
+                FieldAffix {
+                    field: FieldReplacementTarget::Input,
+                    prefix: "ctx=".to_string(),
+                    suffix: String::new(),
+                },
+                FieldAffix {
+                    field: FieldReplacementTarget::Response,
+                    prefix: String::new(),
+                    suffix: "</answer>".to_string(),
+                },
+            ],
+            ..QwenSftFieldMap::default()
+        };
+
+        let loaded = qwen_sft_examples_from_jsonl_paths_with_limit(&paths, None, &field_map)
+            .expect("affixed examples should load");
+        let streamed = qwen_sft_streaming_source_summary(&paths, None, &field_map)
+            .expect("affixed streaming summary should scan");
+        let source_index = qwen_sft_streaming_source_index(&paths, None, &field_map)
+            .expect("affixed source index should build");
+        let raw_window = qwen_sft_examples_by_raw_indices(&source_index.samples, &field_map)
+            .expect("affixed raw window should read");
+        let first_cache =
+            qwen_sft_streaming_source_index_with_cache(&paths, None, Some(&cache_path), &field_map)
+                .expect("affixed cache should write");
+        let raw_affix_map = QwenSftFieldMap {
+            field_affixes: Vec::new(),
+            system_contains_any: Vec::new(),
+            instruction_contains_any: Vec::new(),
+            input_contains_any: Vec::new(),
+            response_contains_any: Vec::new(),
+            ..field_map.clone()
+        };
+        let raw_affix_fingerprint =
+            qwen_sft_streaming_fingerprint(&paths, None, &loaded.source_files, &raw_affix_map)
+                .expect("raw-affix fingerprint should compute");
+        let cache_mismatch = qwen_sft_streaming_source_index_with_cache(
+            &paths,
+            None,
+            Some(&cache_path),
+            &raw_affix_map,
+        )
+        .expect_err("cache should reject changed affixes")
+        .to_string();
+
+        assert_eq!(loaded.examples.len(), 2);
+        assert_eq!(loaded.examples[0].system, "system: concise");
+        assert_eq!(loaded.examples[0].instruction, "Q: Name the project?");
+        assert_eq!(loaded.examples[0].input, "ctx=GPU");
+        assert_eq!(loaded.examples[0].response, "rustrain</answer>");
+        assert_eq!(raw_window.examples, loaded.examples);
+        assert_eq!(streamed.samples, loaded.examples.len());
+        assert_eq!(streamed.fingerprint, loaded.fingerprint);
+        assert_ne!(loaded.fingerprint, raw_affix_fingerprint);
         assert!(first_cache.cache_written);
         assert!(cache_mismatch.contains("field_map"));
     }

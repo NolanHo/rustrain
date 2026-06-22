@@ -482,7 +482,10 @@ production-grade sharded checkpoint ownership remain open.
   `data.field_case_transforms` can then lowercase or uppercase `system`,
   `instruction`, `input`, `response`, or `all` after replacements and before
   whitespace normalization and filtering. The default empty list preserves
-  existing fingerprints.
+  existing fingerprints. `data.field_affixes` can add a prefix and/or suffix
+  to the same field targets after case transforms and before whitespace
+  normalization and filtering; each entry must set at least one of `prefix` or
+  `suffix`.
   These transforms run before train/eval splitting, `max_samples`, and
   streaming offset-index construction.
   `data.max_eval_samples` can optionally cap explicit held-out

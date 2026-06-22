@@ -8,8 +8,8 @@ use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
 
 use crate::runtime::{
-    DataConfig, FieldCaseTransform, FieldCaseTransformKind, FieldDefault, FieldDefaultTarget,
-    FieldReplacement, FieldReplacementTarget,
+    DataConfig, FieldAffix, FieldCaseTransform, FieldCaseTransformKind, FieldDefault,
+    FieldDefaultTarget, FieldReplacement, FieldReplacementTarget,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -81,6 +81,7 @@ struct SftCache {
     normalize_whitespace: bool,
     field_defaults: Vec<FieldDefault>,
     field_case_transforms: Vec<FieldCaseTransform>,
+    field_affixes: Vec<FieldAffix>,
     max_eval_samples: Option<usize>,
     min_system_chars: Option<usize>,
     max_system_chars: Option<usize>,
@@ -263,6 +264,7 @@ pub fn load_sft_dataset(
         data.normalize_whitespace,
         &data.field_defaults,
         &data.field_case_transforms,
+        &data.field_affixes,
         data.max_eval_samples,
         data.min_system_chars,
         data.max_system_chars,
@@ -506,6 +508,7 @@ fn instruction_record_from_jsonl_line(data: &DataConfig, line: &str) -> Result<I
         apply_field_defaults(&mut record, &data.field_defaults);
         apply_field_replacements(&mut record, &data.field_replacements);
         apply_field_case_transforms(&mut record, &data.field_case_transforms);
+        apply_field_affixes(&mut record, &data.field_affixes);
         if data.normalize_whitespace {
             normalize_record_whitespace(&mut record);
         }
@@ -544,6 +547,7 @@ fn instruction_record_from_jsonl_line(data: &DataConfig, line: &str) -> Result<I
     apply_field_defaults(&mut record, &data.field_defaults);
     apply_field_replacements(&mut record, &data.field_replacements);
     apply_field_case_transforms(&mut record, &data.field_case_transforms);
+    apply_field_affixes(&mut record, &data.field_affixes);
     if data.normalize_whitespace {
         normalize_record_whitespace(&mut record);
     }
@@ -804,6 +808,44 @@ fn apply_field_case_transform(value: &str, case: FieldCaseTransformKind) -> Stri
     }
 }
 
+fn apply_field_affixes(record: &mut InstructionRecord, affixes: &[FieldAffix]) {
+    for affix in affixes {
+        if matches!(
+            affix.field,
+            FieldReplacementTarget::System | FieldReplacementTarget::All
+        ) {
+            record.system = apply_field_affix(&record.system, affix);
+        }
+        if matches!(
+            affix.field,
+            FieldReplacementTarget::Instruction | FieldReplacementTarget::All
+        ) {
+            record.instruction = apply_field_affix(&record.instruction, affix);
+        }
+        if matches!(
+            affix.field,
+            FieldReplacementTarget::Input | FieldReplacementTarget::All
+        ) {
+            record.input = apply_field_affix(&record.input, affix);
+        }
+        if matches!(
+            affix.field,
+            FieldReplacementTarget::Response | FieldReplacementTarget::All
+        ) {
+            record.response = apply_field_affix(&record.response, affix);
+        }
+    }
+}
+
+fn apply_field_affix(value: &str, affix: &FieldAffix) -> String {
+    let mut transformed =
+        String::with_capacity(affix.prefix.len() + value.len() + affix.suffix.len());
+    transformed.push_str(&affix.prefix);
+    transformed.push_str(value);
+    transformed.push_str(&affix.suffix);
+    transformed
+}
+
 fn field_default_value(defaults: &[FieldDefault], field: FieldDefaultTarget) -> Option<&str> {
     defaults
         .iter()
@@ -971,6 +1013,7 @@ fn write_sft_cache(
     normalize_whitespace: bool,
     field_defaults: &[FieldDefault],
     field_case_transforms: &[FieldCaseTransform],
+    field_affixes: &[FieldAffix],
     max_eval_samples: Option<usize>,
     min_system_chars: Option<usize>,
     max_system_chars: Option<usize>,
@@ -1013,6 +1056,7 @@ fn write_sft_cache(
         normalize_whitespace,
         field_defaults: field_defaults.to_vec(),
         field_case_transforms: field_case_transforms.to_vec(),
+        field_affixes: field_affixes.to_vec(),
         max_eval_samples,
         min_system_chars,
         max_system_chars,
@@ -1108,6 +1152,7 @@ mod tests {
             normalize_whitespace: false,
             field_defaults: Vec::new(),
             field_case_transforms: Vec::new(),
+            field_affixes: Vec::new(),
             source_weights: Vec::new(),
             source_max_samples: Vec::new(),
             skip_invalid_records: false,
@@ -1180,6 +1225,7 @@ mod tests {
             normalize_whitespace: false,
             field_defaults: Vec::new(),
             field_case_transforms: Vec::new(),
+            field_affixes: Vec::new(),
             source_weights: Vec::new(),
             source_max_samples: Vec::new(),
             skip_invalid_records: false,
@@ -1258,6 +1304,7 @@ mod tests {
             normalize_whitespace: false,
             field_defaults: Vec::new(),
             field_case_transforms: Vec::new(),
+            field_affixes: Vec::new(),
             source_weights: Vec::new(),
             source_max_samples: Vec::new(),
             skip_invalid_records: false,
@@ -1343,6 +1390,7 @@ mod tests {
             normalize_whitespace: false,
             field_defaults: Vec::new(),
             field_case_transforms: Vec::new(),
+            field_affixes: Vec::new(),
             source_weights: Vec::new(),
             source_max_samples: Vec::new(),
             skip_invalid_records: false,
@@ -1427,6 +1475,7 @@ mod tests {
             normalize_whitespace: false,
             field_defaults: Vec::new(),
             field_case_transforms: Vec::new(),
+            field_affixes: Vec::new(),
             source_weights: Vec::new(),
             source_max_samples: Vec::new(),
             skip_invalid_records: false,
@@ -1501,6 +1550,7 @@ mod tests {
             normalize_whitespace: false,
             field_defaults: Vec::new(),
             field_case_transforms: Vec::new(),
+            field_affixes: Vec::new(),
             source_weights: Vec::new(),
             source_max_samples: Vec::new(),
             skip_invalid_records: false,
@@ -1577,6 +1627,7 @@ mod tests {
             normalize_whitespace: false,
             field_defaults: Vec::new(),
             field_case_transforms: Vec::new(),
+            field_affixes: Vec::new(),
             source_weights: Vec::new(),
             source_max_samples: Vec::new(),
             skip_invalid_records: false,
@@ -1656,6 +1707,7 @@ mod tests {
             normalize_whitespace: false,
             field_defaults: Vec::new(),
             field_case_transforms: Vec::new(),
+            field_affixes: Vec::new(),
             source_weights: Vec::new(),
             source_max_samples: Vec::new(),
             skip_invalid_records: false,
@@ -1729,6 +1781,7 @@ mod tests {
             normalize_whitespace: false,
             field_defaults: Vec::new(),
             field_case_transforms: Vec::new(),
+            field_affixes: Vec::new(),
             source_weights: Vec::new(),
             source_max_samples: Vec::new(),
             skip_invalid_records: false,
@@ -1835,6 +1888,7 @@ mod tests {
             normalize_whitespace: false,
             field_defaults: Vec::new(),
             field_case_transforms: Vec::new(),
+            field_affixes: Vec::new(),
             source_weights: Vec::new(),
             source_max_samples: Vec::new(),
             skip_invalid_records: false,
@@ -1910,6 +1964,7 @@ mod tests {
             normalize_whitespace: false,
             field_defaults: Vec::new(),
             field_case_transforms: Vec::new(),
+            field_affixes: Vec::new(),
             source_weights: Vec::new(),
             source_max_samples: Vec::new(),
             skip_invalid_records: false,
@@ -1986,6 +2041,7 @@ mod tests {
             normalize_whitespace: false,
             field_defaults: Vec::new(),
             field_case_transforms: Vec::new(),
+            field_affixes: Vec::new(),
             source_weights: Vec::new(),
             source_max_samples: Vec::new(),
             skip_invalid_records: false,
@@ -2063,6 +2119,7 @@ mod tests {
             normalize_whitespace: false,
             field_defaults: Vec::new(),
             field_case_transforms: Vec::new(),
+            field_affixes: Vec::new(),
             source_weights: Vec::new(),
             source_max_samples: Vec::new(),
             skip_invalid_records: false,
@@ -2141,6 +2198,7 @@ mod tests {
             normalize_whitespace: false,
             field_defaults: Vec::new(),
             field_case_transforms: Vec::new(),
+            field_affixes: Vec::new(),
             source_weights: Vec::new(),
             source_max_samples: Vec::new(),
             skip_invalid_records: false,
@@ -2220,6 +2278,7 @@ mod tests {
             normalize_whitespace: false,
             field_defaults: Vec::new(),
             field_case_transforms: Vec::new(),
+            field_affixes: Vec::new(),
             source_weights: Vec::new(),
             source_max_samples: Vec::new(),
             skip_invalid_records: false,
@@ -2299,6 +2358,7 @@ mod tests {
             normalize_whitespace: false,
             field_defaults: Vec::new(),
             field_case_transforms: Vec::new(),
+            field_affixes: Vec::new(),
             source_weights: Vec::new(),
             source_max_samples: Vec::new(),
             skip_invalid_records: false,
@@ -2378,6 +2438,7 @@ mod tests {
             normalize_whitespace: false,
             field_defaults: Vec::new(),
             field_case_transforms: Vec::new(),
+            field_affixes: Vec::new(),
             source_weights: Vec::new(),
             source_max_samples: Vec::new(),
             skip_invalid_records: false,
@@ -2455,6 +2516,7 @@ mod tests {
             normalize_whitespace: false,
             field_defaults: Vec::new(),
             field_case_transforms: Vec::new(),
+            field_affixes: Vec::new(),
             source_weights: Vec::new(),
             source_max_samples: Vec::new(),
             skip_invalid_records: false,
@@ -2534,6 +2596,7 @@ mod tests {
             normalize_whitespace: false,
             field_defaults: Vec::new(),
             field_case_transforms: Vec::new(),
+            field_affixes: Vec::new(),
             source_weights: Vec::new(),
             source_max_samples: Vec::new(),
             skip_invalid_records: false,
@@ -2615,6 +2678,7 @@ mod tests {
             normalize_whitespace: false,
             field_defaults: Vec::new(),
             field_case_transforms: Vec::new(),
+            field_affixes: Vec::new(),
             source_weights: Vec::new(),
             source_max_samples: Vec::new(),
             skip_invalid_records: false,
@@ -2698,6 +2762,7 @@ mod tests {
             normalize_whitespace: false,
             field_defaults: Vec::new(),
             field_case_transforms: Vec::new(),
+            field_affixes: Vec::new(),
             source_weights: Vec::new(),
             source_max_samples: Vec::new(),
             skip_invalid_records: false,
@@ -2780,6 +2845,7 @@ mod tests {
             normalize_whitespace: false,
             field_defaults: Vec::new(),
             field_case_transforms: Vec::new(),
+            field_affixes: Vec::new(),
             source_weights: Vec::new(),
             source_max_samples: Vec::new(),
             skip_invalid_records: false,
@@ -2859,6 +2925,7 @@ mod tests {
             normalize_whitespace: false,
             field_defaults: Vec::new(),
             field_case_transforms: Vec::new(),
+            field_affixes: Vec::new(),
             source_weights: Vec::new(),
             source_max_samples: Vec::new(),
             skip_invalid_records: false,
@@ -2947,6 +3014,7 @@ mod tests {
             normalize_whitespace: false,
             field_defaults: Vec::new(),
             field_case_transforms: Vec::new(),
+            field_affixes: Vec::new(),
             source_weights: vec![2, 2],
             source_max_samples: Vec::new(),
             skip_invalid_records: false,
@@ -3030,6 +3098,7 @@ mod tests {
             normalize_whitespace: false,
             field_defaults: Vec::new(),
             field_case_transforms: Vec::new(),
+            field_affixes: Vec::new(),
             source_weights: vec![2, 2],
             source_max_samples: vec![1, 2],
             skip_invalid_records: false,
@@ -3109,6 +3178,7 @@ mod tests {
             normalize_whitespace: false,
             field_defaults: Vec::new(),
             field_case_transforms: Vec::new(),
+            field_affixes: Vec::new(),
             source_weights: Vec::new(),
             source_max_samples: Vec::new(),
             skip_invalid_records: false,
@@ -3186,6 +3256,7 @@ mod tests {
             normalize_whitespace: false,
             field_defaults: Vec::new(),
             field_case_transforms: Vec::new(),
+            field_affixes: Vec::new(),
             source_weights: Vec::new(),
             source_max_samples: Vec::new(),
             skip_invalid_records: false,
@@ -3270,6 +3341,7 @@ mod tests {
             normalize_whitespace: false,
             field_defaults: Vec::new(),
             field_case_transforms: Vec::new(),
+            field_affixes: Vec::new(),
             source_weights: Vec::new(),
             source_max_samples: Vec::new(),
             skip_invalid_records: true,
@@ -3354,6 +3426,7 @@ mod tests {
             normalize_whitespace: false,
             field_defaults: Vec::new(),
             field_case_transforms: Vec::new(),
+            field_affixes: Vec::new(),
             source_weights: Vec::new(),
             source_max_samples: Vec::new(),
             skip_invalid_records: false,
@@ -3449,6 +3522,7 @@ mod tests {
             normalize_whitespace: false,
             field_defaults: Vec::new(),
             field_case_transforms: Vec::new(),
+            field_affixes: Vec::new(),
             source_weights: Vec::new(),
             source_max_samples: Vec::new(),
             skip_invalid_records: false,
@@ -3547,6 +3621,7 @@ mod tests {
                 },
             ],
             field_case_transforms: Vec::new(),
+            field_affixes: Vec::new(),
             source_weights: Vec::new(),
             source_max_samples: Vec::new(),
             skip_invalid_records: false,
@@ -3634,6 +3709,7 @@ mod tests {
             normalize_whitespace: true,
             field_defaults: Vec::new(),
             field_case_transforms: Vec::new(),
+            field_affixes: Vec::new(),
             source_weights: Vec::new(),
             source_max_samples: Vec::new(),
             skip_invalid_records: false,
@@ -3732,6 +3808,7 @@ mod tests {
                     case: FieldCaseTransformKind::Lowercase,
                 },
             ],
+            field_affixes: Vec::new(),
             source_weights: Vec::new(),
             source_max_samples: Vec::new(),
             skip_invalid_records: false,
@@ -3757,6 +3834,113 @@ mod tests {
         assert!(!decoded.contains("APPROVED ANSWER"));
         assert!(cache_text.contains("field_case_transforms"));
         assert!(cache_text.contains("lowercase"));
+    }
+
+    #[test]
+    fn sft_dataset_applies_field_affixes_before_filters_and_cache() {
+        let dir = tempdir().expect("temp dir should be created");
+        let data_dir = dir.path().join("sft");
+        let cache_dir = dir.path().join("cache");
+        fs::create_dir_all(&data_dir).expect("sft dir should be created");
+        fs::create_dir_all(&cache_dir).expect("cache dir should be created");
+        fs::write(
+            data_dir.join("sample.jsonl"),
+            "{\"instruction\":\"Name the project\",\"input\":\"GPU\",\"response\":\"rustrain\"}\n{\"instruction\":\"Name the language\",\"input\":\"GPU\",\"response\":\"Rust\"}\n",
+        )
+        .expect("jsonl should write");
+
+        let data = DataConfig {
+            kind: DataKind::InstructionJsonl,
+            paths: vec![data_dir],
+            eval_paths: Vec::new(),
+            train_split: 0.5,
+            max_samples: None,
+            max_eval_samples: None,
+            shuffle: false,
+            index_cache: None,
+            instruction_field: "instruction".to_string(),
+            input_field: "input".to_string(),
+            response_field: "response".to_string(),
+            system_field: None,
+            chat_messages_field: None,
+            min_system_chars: None,
+            max_system_chars: None,
+            system_contains_any: vec!["system:".to_string()],
+            system_excludes_any: Vec::new(),
+            prompt_template: "System: {system}\nQ: {instruction}\nA: ".to_string(),
+            prompt_with_input_template: "System: {system}\nQ: {instruction}\nI: {input}\nA: "
+                .to_string(),
+            trim_fields: true,
+            min_response_chars: 10,
+            max_response_chars: None,
+            instruction_contains_any: vec!["Q: Name".to_string()],
+            instruction_excludes_any: Vec::new(),
+            response_contains_any: vec!["</answer>".to_string()],
+            response_excludes_any: Vec::new(),
+            input_contains_any: vec!["ctx=GPU".to_string()],
+            input_excludes_any: Vec::new(),
+            min_instruction_chars: None,
+            max_instruction_chars: None,
+            min_input_chars: None,
+            max_input_chars: None,
+            min_prompt_chars: None,
+            max_prompt_chars: None,
+            min_sample_chars: None,
+            max_sample_chars: None,
+            dedupe_samples: false,
+            field_replacements: Vec::new(),
+            normalize_whitespace: false,
+            field_defaults: vec![FieldDefault {
+                field: FieldDefaultTarget::System,
+                value: "concise".to_string(),
+            }],
+            field_case_transforms: Vec::new(),
+            field_affixes: vec![
+                FieldAffix {
+                    field: FieldReplacementTarget::System,
+                    prefix: "system: ".to_string(),
+                    suffix: String::new(),
+                },
+                FieldAffix {
+                    field: FieldReplacementTarget::Instruction,
+                    prefix: "Q: ".to_string(),
+                    suffix: "?".to_string(),
+                },
+                FieldAffix {
+                    field: FieldReplacementTarget::Input,
+                    prefix: "ctx=".to_string(),
+                    suffix: String::new(),
+                },
+                FieldAffix {
+                    field: FieldReplacementTarget::Response,
+                    prefix: String::new(),
+                    suffix: "</answer>".to_string(),
+                },
+            ],
+            source_weights: Vec::new(),
+            source_max_samples: Vec::new(),
+            skip_invalid_records: false,
+        };
+        let dataset =
+            load_sft_dataset(&data, 128, 96, &cache_dir).expect("SFT dataset should load");
+        let decoded = dataset
+            .train_samples
+            .iter()
+            .chain(dataset.eval_samples.iter())
+            .map(|sample| dataset.tokenizer.decode_lossy(&sample.tokens))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let cache_text =
+            fs::read_to_string(cache_dir.join("sft_tokenized.toml")).expect("cache should read");
+
+        assert_eq!(dataset.train_samples.len(), 1);
+        assert_eq!(dataset.eval_samples.len(), 1);
+        assert!(decoded.contains("System: system: concise"));
+        assert!(decoded.contains("Q: Q: Name the project?"));
+        assert!(decoded.contains("I: ctx=GPU"));
+        assert!(decoded.contains("rustrain</answer>"));
+        assert!(cache_text.contains("field_affixes"));
+        assert!(cache_text.contains("</answer>"));
     }
 
     #[test]
@@ -3816,6 +4000,7 @@ mod tests {
             normalize_whitespace: false,
             field_defaults: Vec::new(),
             field_case_transforms: Vec::new(),
+            field_affixes: Vec::new(),
             source_weights: Vec::new(),
             source_max_samples: Vec::new(),
             skip_invalid_records: false,

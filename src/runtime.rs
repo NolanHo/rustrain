@@ -159,6 +159,8 @@ pub struct DataConfig {
     #[serde(default)]
     pub field_case_transforms: Vec<FieldCaseTransform>,
     #[serde(default)]
+    pub field_affixes: Vec<FieldAffix>,
+    #[serde(default)]
     pub source_weights: Vec<usize>,
     #[serde(default)]
     pub source_max_samples: Vec<usize>,
@@ -209,6 +211,15 @@ pub struct FieldCaseTransform {
 pub enum FieldCaseTransformKind {
     Lowercase,
     Uppercase,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct FieldAffix {
+    pub field: FieldReplacementTarget,
+    #[serde(default)]
+    pub prefix: String,
+    #[serde(default)]
+    pub suffix: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -790,6 +801,18 @@ pub fn validate_config(config: &Config) -> Result<()> {
                 ));
             }
         }
+        for affix in &data.field_affixes {
+            if affix.prefix.is_empty() && affix.suffix.is_empty() {
+                return Err(anyhow!(
+                    "data.field_affixes entries must set prefix, suffix, or both"
+                ));
+            }
+            if matches!(affix.field, FieldReplacementTarget::System) && !has_system_source {
+                return Err(anyhow!(
+                    "data.field_affixes targeting system requires data.system_field, data.chat_messages_field, or a system field_default to be set"
+                ));
+            }
+        }
     }
 
     Ok(())
@@ -1001,6 +1024,7 @@ mod tests {
                 normalize_whitespace: false,
                 field_defaults: Vec::new(),
                 field_case_transforms: Vec::new(),
+                field_affixes: Vec::new(),
                 source_weights: Vec::new(),
                 source_max_samples: Vec::new(),
                 skip_invalid_records: false,

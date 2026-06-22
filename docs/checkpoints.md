@@ -150,7 +150,7 @@ Acceptance:
   `data.prompt_template`, `data.prompt_with_input_template`,
   `data.trim_fields`, optional `data.field_defaults`, optional
   `data.field_replacements`, optional `data.field_case_transforms`, optional
-  `data.normalize_whitespace`,
+  `data.field_affixes`, optional `data.normalize_whitespace`,
   `data.min_response_chars`, optional
   `data.max_response_chars`, optional `data.instruction_contains_any`,
   optional `data.response_contains_any`, optional
