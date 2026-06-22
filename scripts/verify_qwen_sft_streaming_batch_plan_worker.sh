@@ -202,6 +202,7 @@ expected_field_map = {
     "max_prompt_chars": None,
     "min_sample_chars": None,
     "max_sample_chars": None,
+    "dedupe_samples": False,
     "source_weights": [],
 }
 for key, expected in expected_field_map.items():

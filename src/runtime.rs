@@ -123,6 +123,8 @@ pub struct DataConfig {
     #[serde(default)]
     pub max_sample_chars: Option<usize>,
     #[serde(default)]
+    pub dedupe_samples: bool,
+    #[serde(default)]
     pub source_weights: Vec<usize>,
 }
 
@@ -729,6 +731,7 @@ mod tests {
                 max_prompt_chars: None,
                 min_sample_chars: None,
                 max_sample_chars: None,
+                dedupe_samples: false,
                 source_weights: Vec::new(),
             }),
             lora: Some(LoraConfig {
