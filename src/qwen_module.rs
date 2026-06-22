@@ -2081,6 +2081,9 @@ struct QwenSftStreamingDataPlanSummary {
     eval_source_files: Vec<String>,
     eval_source_sample_counts: Vec<QwenSftSourceSampleCount>,
     eval_fingerprint: String,
+    streaming_index_cache_path: Option<String>,
+    streaming_index_cache_hit: bool,
+    streaming_index_cache_written: bool,
     tokenizer_loaded: bool,
     tokenized_samples_materialized: bool,
 }
@@ -5996,8 +5999,30 @@ pub fn qwen_sft_streaming_data_plan(
     }
 
     let field_map = QwenSftFieldMap::from_runtime_data(data_config)?;
+    let source_index_load = data_config
+        .index_cache
+        .as_deref()
+        .map(|index_cache| {
+            qwen_sft_streaming_source_index_with_cache(
+                &data_config.paths,
+                data_config.max_samples,
+                Some(index_cache),
+                &field_map,
+            )
+        })
+        .transpose()?;
     let train_summary =
         qwen_sft_streaming_source_summary(&data_config.paths, data_config.max_samples, &field_map)?;
+    if let Some(source_index_load) = &source_index_load {
+        let indexed_samples = source_index_load.index.samples.len();
+        if indexed_samples != train_summary.samples {
+            bail!(
+                "qwen SFT streaming data-plan index cache sample count {} does not match summary {}",
+                indexed_samples,
+                train_summary.samples
+            );
+        }
+    }
     let (
         dataset_total_samples,
         dataset_train_samples,
@@ -6126,6 +6151,16 @@ pub fn qwen_sft_streaming_data_plan(
         eval_source_files: eval_summary.source_files,
         eval_source_sample_counts: eval_summary.source_sample_counts,
         eval_fingerprint: eval_summary.fingerprint,
+        streaming_index_cache_path: data_config
+            .index_cache
+            .as_ref()
+            .map(|path| path.display().to_string()),
+        streaming_index_cache_hit: source_index_load
+            .as_ref()
+            .is_some_and(|load| load.cache_hit),
+        streaming_index_cache_written: source_index_load
+            .as_ref()
+            .is_some_and(|load| load.cache_written),
         tokenizer_loaded: false,
         tokenized_samples_materialized: false,
     };
