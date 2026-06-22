@@ -115,6 +115,10 @@ pub struct DataConfig {
     #[serde(default)]
     pub max_input_chars: Option<usize>,
     #[serde(default)]
+    pub min_prompt_chars: Option<usize>,
+    #[serde(default)]
+    pub max_prompt_chars: Option<usize>,
+    #[serde(default)]
     pub source_weights: Vec<usize>,
 }
 
@@ -484,6 +488,28 @@ pub fn validate_config(config: &Config) -> Result<()> {
                 ));
             }
         }
+        if let Some(min_prompt_chars) = data.min_prompt_chars {
+            if min_prompt_chars == 0 {
+                return Err(anyhow!(
+                    "data.min_prompt_chars must be greater than zero when set"
+                ));
+            }
+        }
+        if let Some(max_prompt_chars) = data.max_prompt_chars {
+            if max_prompt_chars == 0 {
+                return Err(anyhow!(
+                    "data.max_prompt_chars must be greater than zero when set"
+                ));
+            }
+            if data
+                .min_prompt_chars
+                .is_some_and(|min_prompt_chars| max_prompt_chars < min_prompt_chars)
+            {
+                return Err(anyhow!(
+                    "data.max_prompt_chars must be greater than or equal to data.min_prompt_chars"
+                ));
+            }
+        }
     }
 
     Ok(())
@@ -673,6 +699,8 @@ mod tests {
                 max_instruction_chars: None,
                 min_input_chars: None,
                 max_input_chars: None,
+                min_prompt_chars: None,
+                max_prompt_chars: None,
                 source_weights: Vec::new(),
             }),
             lora: Some(LoraConfig {

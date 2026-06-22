@@ -449,8 +449,11 @@ production-grade sharded checkpoint ownership remain open.
   count. `data.min_instruction_chars` and `data.max_instruction_chars` can
   optionally skip records whose normalized instruction is outside configured
   character bounds. `data.min_input_chars` and `data.max_input_chars` apply the
-  same optional bounds to the normalized input field. These filters run before
-  train/eval splitting, `max_samples`, and streaming offset-index construction.
+  same optional bounds to the normalized input field. `data.min_prompt_chars`
+  and `data.max_prompt_chars` apply optional bounds to the rendered prompt
+  after template substitution and before appending the response. These filters
+  run before train/eval splitting, `max_samples`, and streaming offset-index
+  construction.
   `data.source_weights` can be empty,
   length 1, or match `data.paths`; it repeats valid training samples from each
   configured source before `max_samples` and splitting, while explicit

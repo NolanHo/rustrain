@@ -63,6 +63,8 @@ struct SftCache {
     max_instruction_chars: Option<usize>,
     min_input_chars: Option<usize>,
     max_input_chars: Option<usize>,
+    min_prompt_chars: Option<usize>,
+    max_prompt_chars: Option<usize>,
     source_weights: Vec<usize>,
     train_samples: Vec<SftSample>,
     eval_samples: Vec<SftSample>,
@@ -203,6 +205,8 @@ pub fn load_sft_dataset(
         data.max_instruction_chars,
         data.min_input_chars,
         data.max_input_chars,
+        data.min_prompt_chars,
+        data.max_prompt_chars,
         &data.source_weights,
         &dataset,
     )?;
@@ -324,7 +328,7 @@ fn read_sft_paths(
                         line_index + 1
                     )
                 })?;
-                if !sft_record_passes_filters(data, &record) {
+                if !sft_record_passes_filters(data, &record)? {
                     continue;
                 }
                 let sample = format_sft_sample(data, tokenizer, seq_len, &record)?;
@@ -381,8 +385,21 @@ fn instruction_record_from_jsonl_line(data: &DataConfig, line: &str) -> Result<I
     })
 }
 
-fn sft_record_passes_filters(data: &DataConfig, record: &InstructionRecord) -> bool {
-    length_filter_passes(
+fn sft_record_passes_filters(data: &DataConfig, record: &InstructionRecord) -> Result<bool> {
+    let prompt_chars = if data.min_prompt_chars.is_some() || data.max_prompt_chars.is_some() {
+        Some(
+            render_sft_prompt(
+                record,
+                &data.prompt_template,
+                &data.prompt_with_input_template,
+            )?
+            .chars()
+            .count(),
+        )
+    } else {
+        None
+    };
+    Ok(length_filter_passes(
         record.response.chars().count(),
         Some(data.min_response_chars),
         data.max_response_chars,
@@ -394,7 +411,9 @@ fn sft_record_passes_filters(data: &DataConfig, record: &InstructionRecord) -> b
         record.input.chars().count(),
         data.min_input_chars,
         data.max_input_chars,
-    )
+    ) && prompt_chars.is_none_or(|chars| {
+        length_filter_passes(chars, data.min_prompt_chars, data.max_prompt_chars)
+    }))
 }
 
 fn length_filter_passes(chars: usize, min_chars: Option<usize>, max_chars: Option<usize>) -> bool {
@@ -499,6 +518,8 @@ fn write_sft_cache(
     max_instruction_chars: Option<usize>,
     min_input_chars: Option<usize>,
     max_input_chars: Option<usize>,
+    min_prompt_chars: Option<usize>,
+    max_prompt_chars: Option<usize>,
     source_weights: &[usize],
     dataset: &SftDataset,
 ) -> Result<()> {
@@ -511,6 +532,8 @@ fn write_sft_cache(
         max_instruction_chars,
         min_input_chars,
         max_input_chars,
+        min_prompt_chars,
+        max_prompt_chars,
         source_weights: source_weights.to_vec(),
         train_samples: dataset.train_samples.clone(),
         eval_samples: dataset.eval_samples.clone(),
@@ -568,6 +591,8 @@ mod tests {
             max_instruction_chars: None,
             min_input_chars: None,
             max_input_chars: None,
+            min_prompt_chars: None,
+            max_prompt_chars: None,
             source_weights: Vec::new(),
         };
         let dataset = load_text_dataset(&data, 64, 8, &cache_dir).expect("dataset should load");
@@ -616,6 +641,8 @@ mod tests {
             max_instruction_chars: None,
             min_input_chars: None,
             max_input_chars: None,
+            min_prompt_chars: None,
+            max_prompt_chars: None,
             source_weights: Vec::new(),
         };
         let dataset = load_text_dataset(&data, 128, 8, &cache_dir).expect("dataset should load");
@@ -670,6 +697,8 @@ mod tests {
             max_instruction_chars: None,
             min_input_chars: None,
             max_input_chars: None,
+            min_prompt_chars: None,
+            max_prompt_chars: None,
             source_weights: Vec::new(),
         };
         let dataset =
@@ -731,6 +760,8 @@ mod tests {
             max_instruction_chars: None,
             min_input_chars: None,
             max_input_chars: None,
+            min_prompt_chars: None,
+            max_prompt_chars: None,
             source_weights: Vec::new(),
         };
         let dataset =
@@ -784,6 +815,8 @@ mod tests {
             max_instruction_chars: None,
             min_input_chars: None,
             max_input_chars: None,
+            min_prompt_chars: None,
+            max_prompt_chars: None,
             source_weights: Vec::new(),
         };
         let raw_data = DataConfig {
@@ -864,6 +897,8 @@ mod tests {
             max_instruction_chars: None,
             min_input_chars: None,
             max_input_chars: None,
+            min_prompt_chars: None,
+            max_prompt_chars: None,
             source_weights: Vec::new(),
         };
         let dataset =
@@ -908,6 +943,8 @@ mod tests {
             max_instruction_chars: None,
             min_input_chars: None,
             max_input_chars: None,
+            min_prompt_chars: None,
+            max_prompt_chars: None,
             source_weights: Vec::new(),
         };
         let dataset =
@@ -961,6 +998,8 @@ mod tests {
             max_instruction_chars: None,
             min_input_chars: None,
             max_input_chars: None,
+            min_prompt_chars: None,
+            max_prompt_chars: None,
             source_weights: Vec::new(),
         };
         let dataset =
@@ -1014,6 +1053,8 @@ mod tests {
             max_instruction_chars: Some(6),
             min_input_chars: None,
             max_input_chars: None,
+            min_prompt_chars: None,
+            max_prompt_chars: None,
             source_weights: Vec::new(),
         };
         let dataset =
@@ -1069,6 +1110,8 @@ mod tests {
             max_instruction_chars: None,
             min_input_chars: Some(2),
             max_input_chars: Some(3),
+            min_prompt_chars: None,
+            max_prompt_chars: None,
             source_weights: Vec::new(),
         };
         let dataset =
@@ -1090,6 +1133,63 @@ mod tests {
         assert!(!second.contains("skip short"));
         assert!(!first.contains("skip long"));
         assert!(!second.contains("skip long"));
+    }
+
+    #[test]
+    fn sft_dataset_filters_prompt_lengths_before_split_and_limit() {
+        let dir = tempdir().expect("temp dir should be created");
+        let data_dir = dir.path().join("sft");
+        let cache_dir = dir.path().join("cache");
+        fs::create_dir_all(&data_dir).expect("sft dir should be created");
+        fs::create_dir_all(&cache_dir).expect("cache dir should be created");
+        fs::write(
+            data_dir.join("sample.jsonl"),
+            "{\"instruction\":\"a\",\"response\":\"skip\"}\n{\"instruction\":\"first\",\"input\":\"ok\",\"response\":\"valid\"}\n{\"instruction\":\"this prompt is too long\",\"response\":\"skip\"}\n{\"instruction\":\"second\",\"response\":\"works\"}\n{\"instruction\":\"third\",\"response\":\"later\"}\n",
+        )
+        .expect("jsonl should write");
+
+        let data = DataConfig {
+            kind: DataKind::InstructionJsonl,
+            paths: vec![data_dir],
+            eval_paths: Vec::new(),
+            train_split: 0.5,
+            max_samples: Some(2),
+            shuffle: false,
+            index_cache: None,
+            instruction_field: "instruction".to_string(),
+            input_field: "input".to_string(),
+            response_field: "response".to_string(),
+            prompt_template: "Q:{instruction}\nA:".to_string(),
+            prompt_with_input_template: "Q:{instruction}\nI:{input}\nA:".to_string(),
+            trim_fields: true,
+            min_response_chars: 1,
+            max_response_chars: None,
+            min_instruction_chars: None,
+            max_instruction_chars: None,
+            min_input_chars: None,
+            max_input_chars: None,
+            min_prompt_chars: Some(11),
+            max_prompt_chars: Some(15),
+            source_weights: Vec::new(),
+        };
+        let dataset =
+            load_sft_dataset(&data, 128, 64, &cache_dir).expect("SFT dataset should load");
+
+        assert_eq!(dataset.train_samples.len(), 1);
+        assert_eq!(dataset.eval_samples.len(), 1);
+        let first = dataset
+            .tokenizer
+            .decode_lossy(&dataset.train_samples[0].tokens);
+        let second = dataset
+            .tokenizer
+            .decode_lossy(&dataset.eval_samples[0].tokens);
+        assert!(first.contains("first"));
+        assert!(first.contains("I:ok"));
+        assert!(second.contains("second"));
+        assert!(!first.contains("Q:a"));
+        assert!(!second.contains("Q:a"));
+        assert!(!first.contains("this prompt is too long"));
+        assert!(!second.contains("this prompt is too long"));
     }
 
     #[test]
@@ -1133,6 +1233,8 @@ mod tests {
             max_instruction_chars: None,
             min_input_chars: None,
             max_input_chars: None,
+            min_prompt_chars: None,
+            max_prompt_chars: None,
             source_weights: vec![2, 2],
         };
         let dataset =
@@ -1186,6 +1288,8 @@ mod tests {
             max_instruction_chars: None,
             min_input_chars: None,
             max_input_chars: None,
+            min_prompt_chars: None,
+            max_prompt_chars: None,
             source_weights: Vec::new(),
         };
         let dataset =
