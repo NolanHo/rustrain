@@ -1707,6 +1707,12 @@ struct QwenSftRecord {
     response: String,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum QwenSftArrowColumn {
+    Present(usize),
+    MissingOptional,
+}
+
 struct QwenCompiledRegexReplacement {
     field: FieldReplacementTarget,
     regex: regex::Regex,
@@ -1960,9 +1966,6 @@ impl QwenSftFieldMap {
         let has_system_source = self.has_system_source();
         if self.instruction.trim().is_empty() {
             bail!("data.instruction_field must not be empty");
-        }
-        if self.input.trim().is_empty() {
-            bail!("data.input_field must not be empty");
         }
         if self.response.trim().is_empty() {
             bail!("data.response_field must not be empty");
@@ -13979,9 +13982,11 @@ where
             path.display()
         );
     };
-    let instruction_index = qwen_arrow_column_index(&schema, &field_map.instruction)?;
-    let input_index = qwen_arrow_column_index(&schema, &field_map.input)?;
-    let response_index = qwen_arrow_column_index(&schema, &field_map.response)?;
+    let instruction_index =
+        qwen_arrow_required_column_index(&schema, &field_map.instruction, &["question"])?;
+    let input_index = qwen_arrow_optional_column_index(&schema, &field_map.input)?;
+    let response_index =
+        qwen_arrow_required_column_index(&schema, &field_map.response, &["answer"])?;
     let regex_plan = QwenSftRegexPlan::compile(field_map)?;
     let mut row_indices = Vec::new();
     let mut source_rows = 0usize;
@@ -14061,9 +14066,11 @@ where
         .iter()
         .map(|field| field.name().to_string())
         .collect::<Vec<_>>();
-    let instruction_index = qwen_arrow_column_index(&schema, &field_map.instruction)?;
-    let input_index = qwen_arrow_column_index(&schema, &field_map.input)?;
-    let response_index = qwen_arrow_column_index(&schema, &field_map.response)?;
+    let instruction_index =
+        qwen_arrow_required_column_index(&schema, &field_map.instruction, &["question"])?;
+    let input_index = qwen_arrow_optional_column_index(&schema, &field_map.input)?;
+    let response_index =
+        qwen_arrow_required_column_index(&schema, &field_map.response, &["answer"])?;
     let regex_plan = QwenSftRegexPlan::compile(field_map)?;
     let mut examples = Vec::new();
     let mut row_indices = Vec::new();
@@ -14218,9 +14225,11 @@ where
             path.display()
         );
     };
-    let instruction_index = qwen_arrow_column_index(&schema, &field_map.instruction)?;
-    let input_index = qwen_arrow_column_index(&schema, &field_map.input)?;
-    let response_index = qwen_arrow_column_index(&schema, &field_map.response)?;
+    let instruction_index =
+        qwen_arrow_required_column_index(&schema, &field_map.instruction, &["question"])?;
+    let input_index = qwen_arrow_optional_column_index(&schema, &field_map.input)?;
+    let response_index =
+        qwen_arrow_required_column_index(&schema, &field_map.response, &["answer"])?;
     let regex_plan = QwenSftRegexPlan::compile(field_map)?;
     let mut sample_offset = 0usize;
     let mut source_rows = 0usize;
@@ -14273,28 +14282,60 @@ where
     Ok(())
 }
 
-fn qwen_arrow_column_index(schema: &SchemaRef, column: &str) -> Result<usize> {
-    let index = schema.index_of(column).with_context(|| {
-        format!(
-            "Arrow input is missing required SFT column {column}; columns={:?}",
-            schema
-                .fields()
-                .iter()
-                .map(|field| field.name().as_str())
-                .collect::<Vec<_>>()
-        )
-    })?;
+fn qwen_arrow_required_column_index(
+    schema: &SchemaRef,
+    column: &str,
+    fallback_columns: &[&str],
+) -> Result<usize> {
+    if column.trim().is_empty() {
+        bail!("Arrow required SFT column name must not be empty");
+    }
+    for candidate in std::iter::once(column).chain(fallback_columns.iter().copied()) {
+        if let Some(index) = qwen_arrow_schema_column_index(schema, candidate)? {
+            return Ok(index);
+        }
+    }
+    bail!(
+        "Arrow input is missing required SFT column {column}; fallbacks={fallback_columns:?}; columns={:?}",
+        qwen_arrow_schema_column_names(schema)
+    )
+}
+
+fn qwen_arrow_optional_column_index(
+    schema: &SchemaRef,
+    column: &str,
+) -> Result<QwenSftArrowColumn> {
+    if column.trim().is_empty() {
+        return Ok(QwenSftArrowColumn::MissingOptional);
+    }
+    Ok(qwen_arrow_schema_column_index(schema, column)?
+        .map(QwenSftArrowColumn::Present)
+        .unwrap_or(QwenSftArrowColumn::MissingOptional))
+}
+
+fn qwen_arrow_schema_column_index(schema: &SchemaRef, column: &str) -> Result<Option<usize>> {
+    let Ok(index) = schema.index_of(column) else {
+        return Ok(None);
+    };
     let field = schema.field(index);
     match field.data_type() {
-        DataType::Utf8 | DataType::LargeUtf8 => Ok(index),
+        DataType::Utf8 | DataType::LargeUtf8 => Ok(Some(index)),
         data_type => bail!("Arrow SFT column {column} must be utf8/large_utf8, got {data_type:?}"),
     }
+}
+
+fn qwen_arrow_schema_column_names(schema: &SchemaRef) -> Vec<&str> {
+    schema
+        .fields()
+        .iter()
+        .map(|field| field.name().as_str())
+        .collect()
 }
 
 fn qwen_sft_arrow_collect_examples_from_batch(
     batch: &RecordBatch,
     instruction_index: usize,
-    input_index: usize,
+    input_index: QwenSftArrowColumn,
     response_index: usize,
     max_samples: Option<usize>,
     field_map: &QwenSftFieldMap,
@@ -14339,7 +14380,7 @@ fn qwen_sft_arrow_collect_examples_from_batch(
 fn qwen_sft_arrow_collect_indices_from_batch(
     batch: &RecordBatch,
     instruction_index: usize,
-    input_index: usize,
+    input_index: QwenSftArrowColumn,
     response_index: usize,
     max_samples: Option<usize>,
     field_map: &QwenSftFieldMap,
@@ -14377,7 +14418,7 @@ fn qwen_sft_arrow_collect_indices_from_batch(
 fn qwen_sft_arrow_hash_samples_from_batch(
     batch: &RecordBatch,
     instruction_index: usize,
-    input_index: usize,
+    input_index: QwenSftArrowColumn,
     response_index: usize,
     field_map: &QwenSftFieldMap,
     regex_plan: &QwenSftRegexPlan,
@@ -14423,7 +14464,7 @@ fn qwen_sft_arrow_hash_samples_from_batch(
 fn qwen_sft_arrow_record_from_batch(
     batch: &RecordBatch,
     instruction_index: usize,
-    input_index: usize,
+    input_index: QwenSftArrowColumn,
     response_index: usize,
     field_map: &QwenSftFieldMap,
     regex_plan: &QwenSftRegexPlan,
@@ -14433,7 +14474,7 @@ fn qwen_sft_arrow_record_from_batch(
         system: String::new(),
         instruction: qwen_arrow_string_value(batch.column(instruction_index).as_ref(), row)
             .with_context(|| format!("failed to read Arrow instruction row {row}"))?,
-        input: qwen_arrow_string_value(batch.column(input_index).as_ref(), row)
+        input: qwen_arrow_optional_string_value(batch, input_index, row)
             .with_context(|| format!("failed to read Arrow input row {row}"))?,
         response: qwen_arrow_string_value(batch.column(response_index).as_ref(), row)
             .with_context(|| format!("failed to read Arrow response row {row}"))?,
@@ -14453,6 +14494,19 @@ fn qwen_sft_arrow_record_from_batch(
         qwen_normalize_record_whitespace(&mut record);
     }
     Ok(record)
+}
+
+fn qwen_arrow_optional_string_value(
+    batch: &RecordBatch,
+    column: QwenSftArrowColumn,
+    row: usize,
+) -> Result<String> {
+    match column {
+        QwenSftArrowColumn::Present(index) => {
+            qwen_arrow_string_value(batch.column(index).as_ref(), row)
+        }
+        QwenSftArrowColumn::MissingOptional => Ok(String::new()),
+    }
 }
 
 fn qwen_arrow_string_value(array: &dyn Array, row: usize) -> Result<String> {
@@ -21472,6 +21526,56 @@ response_field = "output"
         assert_eq!(scan.summary.fingerprint, materialized.fingerprint);
     }
 
+    #[test]
+    fn qwen_sft_arrow_reads_question_answer_without_input_column() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let arrow = temp.path().join("qa.arrow");
+        write_test_qa_arrow(
+            &arrow,
+            &[
+                ("What is Rust?", "A systems programming language."),
+                ("What is CUDA?", "A GPU programming platform."),
+            ],
+        );
+        let field_map = QwenSftFieldMap {
+            input: String::new(),
+            ..QwenSftFieldMap::default()
+        };
+
+        let loaded = qwen_sft_arrow_examples_from_ipc(&arrow, Some(2), &field_map)
+            .expect("question/answer Arrow should materialize");
+        let scan = qwen_sft_arrow_source_scan(&[arrow.clone()], Some(2), &field_map)
+            .expect("question/answer Arrow source should scan");
+        let raw_window = qwen_sft_arrow_examples_by_raw_indices(&scan.index.samples, &field_map)
+            .expect("question/answer raw rows should read back");
+
+        assert_eq!(
+            loaded
+                .examples
+                .iter()
+                .map(|example| (
+                    example.instruction.as_str(),
+                    example.input.as_str(),
+                    example.response.as_str()
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                ("What is Rust?", "", "A systems programming language."),
+                ("What is CUDA?", "", "A GPU programming platform."),
+            ]
+        );
+        assert_eq!(loaded.examples, raw_window.examples);
+        assert_eq!(
+            scan.index
+                .samples
+                .iter()
+                .map(|sample| sample.row_index)
+                .collect::<Vec<_>>(),
+            vec![0, 1]
+        );
+        assert_eq!(scan.summary.fingerprint, loaded.fingerprint);
+    }
+
     fn write_test_sft_arrow(path: &Path, rows: &[(&str, &str, &str)]) {
         let schema = Arc::new(Schema::new(vec![
             Field::new("instruction", DataType::Utf8, false),
@@ -21501,6 +21605,33 @@ response_field = "output"
         let mut writer = StreamWriter::try_new(file, &schema).expect("test Arrow writer");
         writer.write(&batch).expect("test Arrow batch should write");
         writer.finish().expect("test Arrow stream should finish");
+    }
+
+    fn write_test_qa_arrow(path: &Path, rows: &[(&str, &str)]) {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("question", DataType::Utf8, false),
+            Field::new("answer", DataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(
+                    rows.iter()
+                        .map(|(question, _)| *question)
+                        .collect::<Vec<_>>(),
+                )),
+                Arc::new(StringArray::from(
+                    rows.iter().map(|(_, answer)| *answer).collect::<Vec<_>>(),
+                )),
+            ],
+        )
+        .expect("test QA Arrow batch should build");
+        let file = fs::File::create(path).expect("test QA Arrow file should create");
+        let mut writer = StreamWriter::try_new(file, &schema).expect("test QA Arrow writer");
+        writer
+            .write(&batch)
+            .expect("test QA Arrow batch should write");
+        writer.finish().expect("test QA Arrow stream should finish");
     }
 
     #[test]
