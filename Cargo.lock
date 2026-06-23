@@ -1657,6 +1657,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tch",
+ "tempfile",
  "tracing",
 ]
 
@@ -1681,6 +1682,7 @@ dependencies = [
  "rustrain-nccl",
  "serde",
  "serde_json",
+ "tempfile",
  "tracing",
 ]
 
@@ -1706,6 +1708,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tch",
+ "tempfile",
  "tokenizers",
  "toml",
  "tracing",
@@ -1748,7 +1751,8 @@ name = "rustrain-train"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "serde",
+ "ndarray",
+ "rustrain-core",
  "tracing",
 ]
 

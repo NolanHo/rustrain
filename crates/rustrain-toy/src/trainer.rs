@@ -7,10 +7,12 @@ use rand_distr::{Distribution, Normal};
 use serde::{Deserialize, Serialize};
 use tracing::info;
 
-use rustrain_core::runtime::{Config, LrScheduler, RunPaths};
+use rustrain_core::runtime::{Config, RunPaths};
 use rustrain_data::text_data::{
     SftDataset, SftSample, TokenizedDataset, load_sft_dataset, load_text_dataset,
 };
+use rustrain_train::clip::{clip_gradient, l2_norm};
+use rustrain_train::lr::learning_rate_for_step as lr_for_step;
 use rustrain_train::metrics::{gpu_memory_allocated_mb, memory_rss_mb};
 
 use crate::lora::LoraLinear;
@@ -465,29 +467,7 @@ struct TrainStepMetrics {
 }
 
 fn learning_rate_for_step(config: &Config, step: u64) -> f32 {
-    match config.train.lr_scheduler {
-        LrScheduler::Constant => config.train.learning_rate,
-        LrScheduler::LinearDecay => {
-            let max_steps = config.train.max_steps.max(1) as f32;
-            let progress = (step.saturating_sub(1) as f32 / max_steps).clamp(0.0, 1.0);
-            config.train.learning_rate * (1.0 - progress)
-        }
-    }
-}
-
-fn clip_gradient(grad: &mut Array2<f32>, max_grad_norm: Option<f32>) -> f32 {
-    let grad_norm = l2_norm(grad);
-    if let Some(max_grad_norm) = max_grad_norm {
-        if grad_norm > max_grad_norm {
-            *grad *= max_grad_norm / (grad_norm + 1e-12);
-            return max_grad_norm;
-        }
-    }
-    grad_norm
-}
-
-fn l2_norm(values: &Array2<f32>) -> f32 {
-    values.iter().map(|value| value * value).sum::<f32>().sqrt()
+    lr_for_step(config, step) as f32
 }
 
 fn maybe_save_checkpoint(

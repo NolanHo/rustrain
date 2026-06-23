@@ -798,13 +798,13 @@ fn dispatch_moe(cmd: MoeCommand) -> Result<()> {
             );
             Ok(())
         }
-        MoeCommand::TchSmoke => tch_train::run_tch_moe_smoke(),
+        MoeCommand::TchSmoke => rustrain_moe::tch_moe::run_tch_moe_smoke(),
         MoeCommand::ParallelDpSmoke {
             output_dir,
             world_size,
-        } => distributed_smoke::run_data_parallel_smoke(&output_dir, world_size),
+        } => rustrain_parallel::dp_tp_smoke::run_data_parallel_smoke(&output_dir, world_size),
         MoeCommand::ParallelTpSmoke { world_size } => {
-            distributed_smoke::run_tensor_parallel_smoke(world_size)
+            rustrain_parallel::dp_tp_smoke::run_tensor_parallel_smoke(world_size)
         }
         MoeCommand::ParallelEpSmoke { world_size } => {
             distributed_smoke::run_expert_parallel_smoke(world_size)
@@ -813,7 +813,9 @@ fn dispatch_moe(cmd: MoeCommand) -> Result<()> {
             output_dir,
             rank,
             world_size,
-        } => distributed_smoke::run_data_parallel_rank_from_args(output_dir, rank, world_size),
+        } => rustrain_parallel::dp_tp_smoke::run_data_parallel_rank_from_args(
+            output_dir, rank, world_size,
+        ),
         MoeCommand::ParallelEpRankSmoke { output_dir } => {
             distributed_smoke::run_expert_parallel_rank_smoke(output_dir)
         }

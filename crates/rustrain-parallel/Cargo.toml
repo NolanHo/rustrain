@@ -15,6 +15,9 @@ tracing.workspace = true
 path = "../rustrain-nccl"
 optional = true
 
+[dev-dependencies]
+tempfile.workspace = true
+
 [features]
 default = []
 nccl = ["dep:rustrain-nccl"]
