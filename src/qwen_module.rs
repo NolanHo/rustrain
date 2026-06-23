@@ -1626,6 +1626,10 @@ struct QwenSftArrowSourceScan {
     summary: QwenSftStreamingSourceSummary,
 }
 
+struct QwenSftArrowSourceRowScan {
+    row_indices: Vec<usize>,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 struct QwenSftStreamingSourceIndexCache {
     format: String,
@@ -13277,25 +13281,17 @@ fn qwen_sft_arrow_source_scan(
         if source_remaining == Some(0) {
             continue;
         }
-        let mut source_field_map = field_map.clone();
-        source_field_map.source_weights.clear();
-        source_field_map.source_max_samples.clear();
-        let arrow = qwen_sft_arrow_examples_from_ipc_with_limit_policy(
+        let source_file = path.display().to_string();
+        let source_scan = qwen_sft_arrow_scan_indices_from_ipc(
             path,
             source_remaining,
-            false,
-            &source_field_map,
+            field_map,
+            &mut seen_examples,
         )?;
-        for (row_index, example) in arrow.row_indices.into_iter().zip(arrow.examples) {
+        for row_index in source_scan.row_indices {
             if max_samples.is_some_and(|limit| samples.len() >= limit) {
                 break;
             }
-            if let Some(seen_examples) = &mut seen_examples {
-                if !seen_examples.insert(qwen_sft_example_dedupe_key(&example)) {
-                    continue;
-                }
-            }
-            let source_file = path.display().to_string();
             for _ in 0..source_weight {
                 if max_samples.is_some_and(|limit| samples.len() >= limit) {
                     break;
@@ -13325,7 +13321,8 @@ fn qwen_sft_arrow_source_scan(
     }
     let source_files = source_files.into_iter().collect::<Vec<_>>();
     let index = QwenSftArrowSourceIndex { samples };
-    let fingerprint = qwen_sft_arrow_fingerprint_from_index(&index, &source_files, field_map)?;
+    let fingerprint =
+        qwen_sft_arrow_streaming_fingerprint_from_index(&index, &source_files, field_map)?;
     let source_sample_counts = source_sample_counts
         .into_iter()
         .map(|(path, samples)| QwenSftSourceSampleCount { path, samples })
@@ -13792,6 +13789,38 @@ fn qwen_sft_arrow_examples_by_raw_indices(
     })
 }
 
+fn qwen_sft_arrow_streaming_fingerprint_from_index(
+    index: &QwenSftArrowSourceIndex,
+    source_files: &[String],
+    field_map: &QwenSftFieldMap,
+) -> Result<String> {
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    qwen_sft_hash_field_map(&mut hash, field_map);
+    for file in source_files {
+        qwen_sft_hash_source_file(&mut hash, file);
+    }
+
+    let mut offset = 0usize;
+    while offset < index.samples.len() {
+        let path = index.samples[offset].path.clone();
+        let end = index.samples[offset..]
+            .iter()
+            .position(|sample| sample.path != path)
+            .map(|relative| offset + relative)
+            .unwrap_or(index.samples.len());
+        qwen_sft_arrow_hash_index_segment_from_ipc(
+            Path::new(&path),
+            &index.samples[offset..end],
+            field_map,
+            &mut hash,
+        )?;
+        offset = end;
+    }
+
+    Ok(format!("{hash:016x}"))
+}
+
+#[cfg(test)]
 fn qwen_sft_arrow_fingerprint_from_index(
     index: &QwenSftArrowSourceIndex,
     source_files: &[String],
@@ -13803,6 +13832,58 @@ fn qwen_sft_arrow_fingerprint_from_index(
         &raw_window.examples,
         field_map,
     ))
+}
+
+fn qwen_sft_arrow_scan_indices_from_ipc(
+    path: &Path,
+    max_samples: Option<usize>,
+    field_map: &QwenSftFieldMap,
+    seen_records: &mut Option<HashSet<String>>,
+) -> Result<QwenSftArrowSourceRowScan> {
+    if max_samples == Some(0) {
+        bail!("qwen SFT Arrow source max_samples must be greater than zero");
+    }
+    let mut stream_seen_records = seen_records.clone();
+    let stream_attempt = fs::File::open(path)
+        .with_context(|| format!("failed to read {}", path.display()))
+        .and_then(|file| {
+            let reader = ArrowStreamReader::try_new(file, None).with_context(|| {
+                format!("failed to open {} as Arrow IPC stream", path.display())
+            })?;
+            qwen_sft_arrow_scan_indices_from_batches(
+                path,
+                max_samples,
+                field_map,
+                &mut stream_seen_records,
+                reader,
+            )
+        });
+    match stream_attempt {
+        Ok(scan) => {
+            *seen_records = stream_seen_records;
+            Ok(scan)
+        }
+        Err(stream_error) => {
+            let mut file_seen_records = seen_records.clone();
+            let file = fs::File::open(path)
+                .with_context(|| format!("failed to read {}", path.display()))?;
+            let reader = ArrowFileReader::try_new(file, None).with_context(|| {
+                format!(
+                    "failed to open {} as Arrow IPC stream or file; stream error: {stream_error}",
+                    path.display()
+                )
+            })?;
+            let scan = qwen_sft_arrow_scan_indices_from_batches(
+                path,
+                max_samples,
+                field_map,
+                &mut file_seen_records,
+                reader,
+            )?;
+            *seen_records = file_seen_records;
+            Ok(scan)
+        }
+    }
 }
 
 fn qwen_sft_arrow_examples_from_ipc(
@@ -13858,6 +13939,82 @@ fn qwen_sft_arrow_examples_from_ipc_with_limit_policy(
             )
         }
     }
+}
+
+fn qwen_sft_arrow_scan_indices_from_batches<I>(
+    path: &Path,
+    max_samples: Option<usize>,
+    field_map: &QwenSftFieldMap,
+    seen_records: &mut Option<HashSet<String>>,
+    mut batches: I,
+) -> Result<QwenSftArrowSourceRowScan>
+where
+    I: Iterator<Item = std::result::Result<RecordBatch, arrow::error::ArrowError>>,
+{
+    let schema = batches
+        .next()
+        .transpose()
+        .with_context(|| format!("failed to read first Arrow batch from {}", path.display()))?
+        .map(|batch| {
+            let schema = batch.schema();
+            (schema, Some(batch))
+        });
+    let Some((schema, first_batch)) = schema else {
+        bail!(
+            "qwen SFT Arrow source {} contained no record batches",
+            path.display()
+        );
+    };
+    let instruction_index = qwen_arrow_column_index(&schema, &field_map.instruction)?;
+    let input_index = qwen_arrow_column_index(&schema, &field_map.input)?;
+    let response_index = qwen_arrow_column_index(&schema, &field_map.response)?;
+    let regex_plan = QwenSftRegexPlan::compile(field_map)?;
+    let mut row_indices = Vec::new();
+    let mut source_rows = 0usize;
+
+    if let Some(batch) = first_batch {
+        let row_base = source_rows;
+        source_rows += batch.num_rows();
+        qwen_sft_arrow_collect_indices_from_batch(
+            &batch,
+            instruction_index,
+            input_index,
+            response_index,
+            max_samples,
+            field_map,
+            &regex_plan,
+            seen_records,
+            row_base,
+            &mut row_indices,
+        )?;
+    }
+    for batch in batches {
+        let batch =
+            batch.with_context(|| format!("failed to read Arrow batch from {}", path.display()))?;
+        let row_base = source_rows;
+        source_rows += batch.num_rows();
+        if !max_samples.is_some_and(|limit| row_indices.len() >= limit) {
+            qwen_sft_arrow_collect_indices_from_batch(
+                &batch,
+                instruction_index,
+                input_index,
+                response_index,
+                max_samples,
+                field_map,
+                &regex_plan,
+                seen_records,
+                row_base,
+                &mut row_indices,
+            )?;
+        }
+    }
+    if row_indices.is_empty() {
+        bail!(
+            "SFT Arrow source {} did not contain examples",
+            path.display()
+        );
+    }
+    Ok(QwenSftArrowSourceRowScan { row_indices })
 }
 
 fn qwen_sft_arrow_examples_from_batches<I>(
@@ -13973,14 +14130,133 @@ where
     })
 }
 
-fn qwen_sft_example_dedupe_key(example: &QwenSftExample) -> String {
-    [
-        example.system.as_str(),
-        example.instruction.as_str(),
-        example.input.as_str(),
-        example.response.as_str(),
-    ]
-    .join("\u{1f}")
+fn qwen_sft_arrow_hash_index_segment_from_ipc(
+    path: &Path,
+    samples: &[QwenSftArrowRawSampleIndex],
+    field_map: &QwenSftFieldMap,
+    hash: &mut u64,
+) -> Result<()> {
+    debug_assert!(!samples.is_empty());
+    let mut stream_hash = *hash;
+    let stream_attempt = fs::File::open(path)
+        .with_context(|| format!("failed to read {}", path.display()))
+        .and_then(|file| {
+            let reader = ArrowStreamReader::try_new(file, None).with_context(|| {
+                format!("failed to open {} as Arrow IPC stream", path.display())
+            })?;
+            qwen_sft_arrow_hash_index_segment_from_batches(
+                path,
+                samples,
+                field_map,
+                &mut stream_hash,
+                reader,
+            )
+        });
+    match stream_attempt {
+        Ok(()) => {
+            *hash = stream_hash;
+            Ok(())
+        }
+        Err(stream_error) => {
+            let mut file_hash = *hash;
+            let file = fs::File::open(path)
+                .with_context(|| format!("failed to read {}", path.display()))?;
+            let reader = ArrowFileReader::try_new(file, None).with_context(|| {
+                format!(
+                    "failed to open {} as Arrow IPC stream or file; stream error: {stream_error}",
+                    path.display()
+                )
+            })?;
+            qwen_sft_arrow_hash_index_segment_from_batches(
+                path,
+                samples,
+                field_map,
+                &mut file_hash,
+                reader,
+            )?;
+            *hash = file_hash;
+            Ok(())
+        }
+    }
+}
+
+fn qwen_sft_arrow_hash_index_segment_from_batches<I>(
+    path: &Path,
+    samples: &[QwenSftArrowRawSampleIndex],
+    field_map: &QwenSftFieldMap,
+    hash: &mut u64,
+    mut batches: I,
+) -> Result<()>
+where
+    I: Iterator<Item = std::result::Result<RecordBatch, arrow::error::ArrowError>>,
+{
+    let schema = batches
+        .next()
+        .transpose()
+        .with_context(|| format!("failed to read first Arrow batch from {}", path.display()))?
+        .map(|batch| {
+            let schema = batch.schema();
+            (schema, Some(batch))
+        });
+    let Some((schema, first_batch)) = schema else {
+        bail!(
+            "qwen SFT Arrow source {} contained no record batches",
+            path.display()
+        );
+    };
+    let instruction_index = qwen_arrow_column_index(&schema, &field_map.instruction)?;
+    let input_index = qwen_arrow_column_index(&schema, &field_map.input)?;
+    let response_index = qwen_arrow_column_index(&schema, &field_map.response)?;
+    let regex_plan = QwenSftRegexPlan::compile(field_map)?;
+    let mut sample_offset = 0usize;
+    let mut source_rows = 0usize;
+
+    if let Some(batch) = first_batch {
+        let row_base = source_rows;
+        source_rows += batch.num_rows();
+        qwen_sft_arrow_hash_samples_from_batch(
+            &batch,
+            instruction_index,
+            input_index,
+            response_index,
+            field_map,
+            &regex_plan,
+            row_base,
+            samples,
+            &mut sample_offset,
+            hash,
+        )?;
+    }
+    for batch in batches {
+        if sample_offset >= samples.len() {
+            break;
+        }
+        let batch =
+            batch.with_context(|| format!("failed to read Arrow batch from {}", path.display()))?;
+        let row_base = source_rows;
+        source_rows += batch.num_rows();
+        qwen_sft_arrow_hash_samples_from_batch(
+            &batch,
+            instruction_index,
+            input_index,
+            response_index,
+            field_map,
+            &regex_plan,
+            row_base,
+            samples,
+            &mut sample_offset,
+            hash,
+        )?;
+    }
+    if sample_offset != samples.len() {
+        let missing = &samples[sample_offset];
+        bail!(
+            "SFT Arrow raw sample not found while hashing: {}:{}",
+            missing.path,
+            missing.row_index
+        );
+    }
+    Ok(())
 }
 
 fn qwen_arrow_column_index(schema: &SchemaRef, column: &str) -> Result<usize> {
@@ -14018,29 +14294,15 @@ fn qwen_sft_arrow_collect_examples_from_batch(
         if max_samples.is_some_and(|limit| examples.len() >= limit) {
             break;
         }
-        let mut record = QwenSftRecord {
-            system: String::new(),
-            instruction: qwen_arrow_string_value(batch.column(instruction_index).as_ref(), row)
-                .with_context(|| format!("failed to read Arrow instruction row {row}"))?,
-            input: qwen_arrow_string_value(batch.column(input_index).as_ref(), row)
-                .with_context(|| format!("failed to read Arrow input row {row}"))?,
-            response: qwen_arrow_string_value(batch.column(response_index).as_ref(), row)
-                .with_context(|| format!("failed to read Arrow response row {row}"))?,
-        };
-        record.instruction = qwen_normalize_jsonl_field(record.instruction, field_map);
-        record.input = qwen_normalize_jsonl_field(record.input, field_map);
-        record.response = qwen_normalize_jsonl_field(record.response, field_map);
-        qwen_apply_field_defaults(&mut record, &field_map.field_defaults);
-        qwen_apply_field_replacements(&mut record, &field_map.field_replacements);
-        qwen_apply_field_regex_replacements(&mut record, &regex_plan.replacements);
-        qwen_apply_field_case_transforms(&mut record, &field_map.field_case_transforms);
-        qwen_apply_field_affixes(&mut record, &field_map.field_affixes);
-        qwen_apply_field_strips(&mut record, &field_map.field_strips);
-        qwen_apply_field_splits(&mut record, &field_map.field_splits);
-        qwen_apply_field_truncations(&mut record, &field_map.field_truncations);
-        if field_map.normalize_whitespace {
-            qwen_normalize_record_whitespace(&mut record);
-        }
+        let record = qwen_sft_arrow_record_from_batch(
+            batch,
+            instruction_index,
+            input_index,
+            response_index,
+            field_map,
+            regex_plan,
+            row,
+        )?;
         if !qwen_sft_record_passes_filters(&record, field_map, regex_plan) {
             continue;
         }
@@ -14058,6 +14320,125 @@ fn qwen_sft_arrow_collect_examples_from_batch(
         row_indices.push(row_base + row);
     }
     Ok(())
+}
+
+fn qwen_sft_arrow_collect_indices_from_batch(
+    batch: &RecordBatch,
+    instruction_index: usize,
+    input_index: usize,
+    response_index: usize,
+    max_samples: Option<usize>,
+    field_map: &QwenSftFieldMap,
+    regex_plan: &QwenSftRegexPlan,
+    seen_records: &mut Option<HashSet<String>>,
+    row_base: usize,
+    row_indices: &mut Vec<usize>,
+) -> Result<()> {
+    for row in 0..batch.num_rows() {
+        if max_samples.is_some_and(|limit| row_indices.len() >= limit) {
+            break;
+        }
+        let record = qwen_sft_arrow_record_from_batch(
+            batch,
+            instruction_index,
+            input_index,
+            response_index,
+            field_map,
+            regex_plan,
+            row,
+        )?;
+        if !qwen_sft_record_passes_filters(&record, field_map, regex_plan) {
+            continue;
+        }
+        if let Some(seen_records) = seen_records {
+            if !seen_records.insert(qwen_sft_record_dedupe_key(&record)) {
+                continue;
+            }
+        }
+        row_indices.push(row_base + row);
+    }
+    Ok(())
+}
+
+fn qwen_sft_arrow_hash_samples_from_batch(
+    batch: &RecordBatch,
+    instruction_index: usize,
+    input_index: usize,
+    response_index: usize,
+    field_map: &QwenSftFieldMap,
+    regex_plan: &QwenSftRegexPlan,
+    row_base: usize,
+    samples: &[QwenSftArrowRawSampleIndex],
+    sample_offset: &mut usize,
+    hash: &mut u64,
+) -> Result<()> {
+    while *sample_offset < samples.len() {
+        let row_index = samples[*sample_offset].row_index;
+        if row_index < row_base {
+            bail!(
+                "SFT Arrow raw sample indices must be sorted by row, got {} before batch base {}",
+                row_index,
+                row_base
+            );
+        }
+        let relative_row = row_index - row_base;
+        if relative_row >= batch.num_rows() {
+            break;
+        }
+        let record = qwen_sft_arrow_record_from_batch(
+            batch,
+            instruction_index,
+            input_index,
+            response_index,
+            field_map,
+            regex_plan,
+            relative_row,
+        )?;
+        let example = QwenSftExample {
+            system: record.system,
+            instruction: record.instruction,
+            input: record.input,
+            response: record.response,
+        };
+        qwen_sft_hash_example(hash, &example, field_map.has_system_source());
+        *sample_offset += 1;
+    }
+    Ok(())
+}
+
+fn qwen_sft_arrow_record_from_batch(
+    batch: &RecordBatch,
+    instruction_index: usize,
+    input_index: usize,
+    response_index: usize,
+    field_map: &QwenSftFieldMap,
+    regex_plan: &QwenSftRegexPlan,
+    row: usize,
+) -> Result<QwenSftRecord> {
+    let mut record = QwenSftRecord {
+        system: String::new(),
+        instruction: qwen_arrow_string_value(batch.column(instruction_index).as_ref(), row)
+            .with_context(|| format!("failed to read Arrow instruction row {row}"))?,
+        input: qwen_arrow_string_value(batch.column(input_index).as_ref(), row)
+            .with_context(|| format!("failed to read Arrow input row {row}"))?,
+        response: qwen_arrow_string_value(batch.column(response_index).as_ref(), row)
+            .with_context(|| format!("failed to read Arrow response row {row}"))?,
+    };
+    record.instruction = qwen_normalize_jsonl_field(record.instruction, field_map);
+    record.input = qwen_normalize_jsonl_field(record.input, field_map);
+    record.response = qwen_normalize_jsonl_field(record.response, field_map);
+    qwen_apply_field_defaults(&mut record, &field_map.field_defaults);
+    qwen_apply_field_replacements(&mut record, &field_map.field_replacements);
+    qwen_apply_field_regex_replacements(&mut record, &regex_plan.replacements);
+    qwen_apply_field_case_transforms(&mut record, &field_map.field_case_transforms);
+    qwen_apply_field_affixes(&mut record, &field_map.field_affixes);
+    qwen_apply_field_strips(&mut record, &field_map.field_strips);
+    qwen_apply_field_splits(&mut record, &field_map.field_splits);
+    qwen_apply_field_truncations(&mut record, &field_map.field_truncations);
+    if field_map.normalize_whitespace {
+        qwen_normalize_record_whitespace(&mut record);
+    }
+    Ok(record)
 }
 
 fn qwen_arrow_string_value(array: &dyn Array, row: usize) -> Result<String> {
@@ -14868,14 +15249,18 @@ fn qwen_sft_dataset_fingerprint(
     let mut hash = 0xcbf2_9ce4_8422_2325_u64;
     qwen_sft_hash_field_map(&mut hash, field_map);
     for file in source_files {
-        qwen_sft_hash_bytes(&mut hash, b"path");
-        qwen_sft_hash_bytes(&mut hash, file.as_bytes());
-        qwen_sft_hash_bytes(&mut hash, b"\0");
+        qwen_sft_hash_source_file(&mut hash, file);
     }
     for example in examples {
         qwen_sft_hash_example(&mut hash, example, field_map.has_system_source());
     }
     format!("{hash:016x}")
+}
+
+fn qwen_sft_hash_source_file(hash: &mut u64, file: &str) {
+    qwen_sft_hash_bytes(hash, b"path");
+    qwen_sft_hash_bytes(hash, file.as_bytes());
+    qwen_sft_hash_bytes(hash, b"\0");
 }
 
 fn qwen_sft_hash_field_map(hash: &mut u64, field_map: &QwenSftFieldMap) {
@@ -20977,6 +21362,100 @@ response_field = "output"
             vec!["keep-one", "keep-two"]
         );
         assert_eq!(raw_window.raw_samples_read, 2);
+    }
+
+    #[test]
+    fn qwen_sft_arrow_source_scan_streaming_fingerprint_matches_index_readback() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let arrow = temp.path().join("train.arrow");
+        write_test_sft_arrow(
+            &arrow,
+            &[
+                ("drop", "", "skip"),
+                ("keep-one", "", "alpha"),
+                ("keep-two", "", "beta"),
+                ("keep-three", "", "gamma"),
+            ],
+        );
+        let field_map = QwenSftFieldMap {
+            response: "output".to_string(),
+            response_contains_any: vec!["alpha".to_string(), "beta".to_string()],
+            ..QwenSftFieldMap::default()
+        };
+
+        let scan = qwen_sft_arrow_source_scan(&[arrow], Some(2), &field_map)
+            .expect("Arrow source scan should build row index");
+        let readback_fingerprint = qwen_sft_arrow_fingerprint_from_index(
+            &scan.index,
+            &scan.summary.source_files,
+            &field_map,
+        )
+        .expect("explicit index readback should hash");
+
+        assert_eq!(
+            scan.index
+                .samples
+                .iter()
+                .map(|sample| sample.row_index)
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        assert_eq!(scan.summary.fingerprint, readback_fingerprint);
+    }
+
+    #[test]
+    fn qwen_sft_arrow_source_scan_streaming_fingerprint_accounts_for_weights() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let arrow = temp.path().join("train.arrow");
+        write_test_sft_arrow(&arrow, &[("first", "", "alpha"), ("second", "", "beta")]);
+        let field_map = QwenSftFieldMap {
+            response: "output".to_string(),
+            source_weights: vec![2],
+            ..QwenSftFieldMap::default()
+        };
+
+        let scan = qwen_sft_arrow_source_scan(&[arrow], Some(4), &field_map)
+            .expect("weighted Arrow source scan should build row index");
+        let raw_window = qwen_sft_arrow_examples_by_raw_indices(&scan.index.samples, &field_map)
+            .expect("weighted row index should read back");
+        let expected_fingerprint = qwen_sft_dataset_fingerprint(
+            &scan.summary.source_files,
+            &raw_window.examples,
+            &field_map,
+        );
+
+        assert_eq!(
+            scan.index
+                .samples
+                .iter()
+                .map(|sample| sample.row_index)
+                .collect::<Vec<_>>(),
+            vec![0, 0, 1, 1]
+        );
+        assert_eq!(scan.summary.source_sample_counts[0].samples, 4);
+        assert_eq!(scan.summary.fingerprint, expected_fingerprint);
+    }
+
+    #[test]
+    fn qwen_sft_arrow_source_scan_streaming_fingerprint_omits_unused_paths() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let first = temp.path().join("first.arrow");
+        let second = temp.path().join("second.arrow");
+        write_test_sft_arrow(&first, &[("first", "", "alpha")]);
+        write_test_sft_arrow(&second, &[("second", "", "beta")]);
+        let field_map = QwenSftFieldMap {
+            response: "output".to_string(),
+            ..QwenSftFieldMap::default()
+        };
+
+        let scan =
+            qwen_sft_arrow_source_scan(&[first.clone(), second.clone()], Some(1), &field_map)
+                .expect("limited Arrow source scan should stop after first source");
+        let materialized = qwen_sft_arrow_examples_from_ipc(&first, Some(1), &field_map)
+            .expect("first Arrow source should materialize");
+
+        assert_eq!(scan.summary.source_files, vec![first.display().to_string()]);
+        assert_eq!(scan.summary.fingerprint, materialized.fingerprint);
     }
 
     fn write_test_sft_arrow(path: &Path, rows: &[(&str, &str, &str)]) {
