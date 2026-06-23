@@ -1,0 +1,20 @@
+[package]
+name = "rustrain-moe"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow.workspace = true
+ndarray.workspace = true
+rand.workspace = true
+rand_distr.workspace = true
+safetensors.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tch.workspace = true
+tracing.workspace = true
+rustrain-core = { path = "../rustrain-core" }
+rustrain-train = { path = "../rustrain-train" }
+rustrain-parallel = { path = "../rustrain-parallel" }
+rustrain-nccl = { path = "../rustrain-nccl" }
+rustrain-checkpoint = { path = "../rustrain-checkpoint" }

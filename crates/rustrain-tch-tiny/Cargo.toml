@@ -1,0 +1,15 @@
+[package]
+name = "rustrain-tch-tiny"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+rustrain-core = { path = "../rustrain-core", features = ["tch"] }
+rustrain-train = { path = "../rustrain-train" }
+rustrain-nccl = { path = "../rustrain-nccl" }
+anyhow.workspace = true
+safetensors.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tch.workspace = true
+tracing.workspace = true

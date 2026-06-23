@@ -11,7 +11,7 @@ use ndarray::{Array2, Axis, array, concatenate, s};
 use serde::{Deserialize, Serialize};
 use tch::{Device, Kind, Tensor};
 
-use crate::nccl_smoke;
+use rustrain_nccl::nccl_smoke;
 
 const DP_WEIGHT: [f64; 2] = [0.2, -0.1];
 const DP_DATASET: [([f64; 2], f64); 4] = [

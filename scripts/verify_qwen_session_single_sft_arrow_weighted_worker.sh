@@ -11,13 +11,13 @@ BATCH_PLAN_OUTPUT="$(mktemp)"
 BASE_OUTPUT="$(mktemp)"
 RESUME_OUTPUT="$(mktemp)"
 
-cargo run -- qwen-sft-streaming-data-plan \
+cargo run -- qwen sft-streaming-data-plan \
   --config "${CONFIG}" \
   --world-size 1 \
   --data-cursor-start 0 \
   | tee "${DATA_PLAN_OUTPUT}"
 
-cargo run -- qwen-sft-streaming-batch-plan \
+cargo run -- qwen sft-streaming-batch-plan \
   --config "${CONFIG}" \
   --world-size 1 \
   --data-cursor-start 0 \

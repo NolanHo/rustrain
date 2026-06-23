@@ -9,7 +9,7 @@ OUTPUT_DIR="${RUSTRAIN_EP_SPARSE_OUTPUT_DIR:-/tmp/rustrain-runs/ep-sparse-verify
 cargo run -- launch \
   --nproc-per-node 2 \
   --output-dir "${OUTPUT_DIR}" \
-  parallel-ep-sparse-rank-smoke \
+  moe parallel-ep-sparse-rank-smoke \
   --output-dir "${OUTPUT_DIR}/ranks"
 
 python - "${OUTPUT_DIR}" <<'PY'

@@ -10,7 +10,7 @@ MODEL_PATH="${RUSTRAIN_QWEN_TP_MLP_NCCL_MODEL_PATH:-/vePFS-Mindverse/share/huggi
 cargo run -- launch \
   --nproc-per-node 2 \
   --output-dir "${OUTPUT_DIR}" \
-  qwen-tp-mlp-nccl-rank-smoke \
+  qwen tp-mlp-nccl-rank-smoke \
   --model-path "${MODEL_PATH}" \
   --output-dir "${OUTPUT_DIR}/ranks"
 

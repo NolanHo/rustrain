@@ -96,26 +96,26 @@ CACHE_FIRST_OUTPUT="${WORK_DIR}/batch-plan-cache-first.out"
 CACHE_SECOND_OUTPUT="${WORK_DIR}/batch-plan-cache-second.out"
 CACHE_PATH="${WORK_DIR}/offset-index.json"
 
-cargo run -- qwen-sft-streaming-data-plan \
+cargo run -- qwen sft-streaming-data-plan \
   --config "${CONFIG}" \
   --world-size 2 \
   --data-cursor-start 158 \
   | tee "${DATA_OUTPUT}"
 
-cargo run -- qwen-sft-streaming-batch-plan \
+cargo run -- qwen sft-streaming-batch-plan \
   --config "${CONFIG}" \
   --world-size 2 \
   --data-cursor-start 158 \
   | tee "${BATCH_OUTPUT}"
 
-cargo run -- qwen-sft-streaming-batch-plan \
+cargo run -- qwen sft-streaming-batch-plan \
   --config "${CONFIG}" \
   --world-size 2 \
   --data-cursor-start 158 \
   --index-cache "${CACHE_PATH}" \
   | tee "${CACHE_FIRST_OUTPUT}"
 
-cargo run -- qwen-sft-streaming-batch-plan \
+cargo run -- qwen sft-streaming-batch-plan \
   --config "${CONFIG}" \
   --world-size 2 \
   --data-cursor-start 158 \

@@ -9,7 +9,7 @@ EXPECTED_DTYPE="${RUSTRAIN_EXPECTED_QWEN_COMPUTE_KIND:-${DTYPE}}"
 DELTA_OUTPUT="${RUSTRAIN_QWEN_FULL_TRAIN_DELTA_OUTPUT:-/tmp/rustrain-qwen-full-train-delta-${DTYPE}.safetensors}"
 OUTPUT="$(mktemp)"
 
-cargo run -- qwen-full-train-smoke --dtype "${DTYPE}" --delta-output "${DELTA_OUTPUT}" \
+cargo run -- qwen full-train-smoke --dtype "${DTYPE}" --delta-output "${DELTA_OUTPUT}" \
   | tee "${OUTPUT}"
 
 python - "${OUTPUT}" "${EXPECTED_DTYPE}" <<'PY'
@@ -25,7 +25,7 @@ expected_dtype = sys.argv[2]
 start = text.find("{")
 end = text.rfind("}")
 if start < 0 or end < start:
-    raise SystemExit("qwen-full-train-smoke did not print a JSON summary")
+    raise SystemExit("qwen full-train-smoke did not print a JSON summary")
 summary = json.loads(text[start : end + 1])
 
 required_fields = [
@@ -78,7 +78,7 @@ for key in ["delta_output", "optimizer_output", "manifest_output"]:
     if not path.exists() or path.stat().st_size == 0:
         raise SystemExit(f"{key} missing or empty: {path}")
 
-resolved_model_path = require_complete_qwen_model_path(summary["model_path"], "qwen-full-train-smoke summary")
+resolved_model_path = require_complete_qwen_model_path(summary["model_path"], "qwen full-train-smoke summary")
 manifest_path = pathlib.Path(summary["manifest_output"])
 manifest = json.loads(manifest_path.read_text())
 manifest_model_path = require_complete_qwen_base_model_path(manifest, manifest_path)

@@ -12,20 +12,20 @@ CACHE_PATH="$(mktemp -u /tmp/rustrain-qwen-sft-offset-index-XXXXXX.json)"
 CACHED_OUTPUT_FIRST="$(mktemp)"
 CACHED_OUTPUT_SECOND="$(mktemp)"
 
-cargo run -- qwen-sft-streaming-batch-plan \
+cargo run -- qwen sft-streaming-batch-plan \
   --config "${CONFIG}" \
   --world-size 2 \
   --data-cursor-start 2 \
   | tee "${OUTPUT}"
 
-cargo run -- qwen-sft-streaming-batch-plan \
+cargo run -- qwen sft-streaming-batch-plan \
   --config "${CONFIG}" \
   --world-size 2 \
   --data-cursor-start 2 \
   --index-cache "${CACHE_PATH}" \
   | tee "${CACHED_OUTPUT_FIRST}"
 
-cargo run -- qwen-sft-streaming-batch-plan \
+cargo run -- qwen sft-streaming-batch-plan \
   --config "${CONFIG}" \
   --world-size 2 \
   --data-cursor-start 2 \

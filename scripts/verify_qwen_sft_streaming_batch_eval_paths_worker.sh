@@ -7,7 +7,7 @@ source "${SCRIPT_DIR}/require_gpu_worker.sh"
 CONFIG="${RUSTRAIN_QWEN_SFT_STREAMING_BATCH_EVAL_PATHS_CONFIG:-configs/qwen_session_dp2_sft_eval_paths.toml}"
 OUTPUT="$(mktemp)"
 
-cargo run -- qwen-sft-streaming-batch-plan \
+cargo run -- qwen sft-streaming-batch-plan \
   --config "${CONFIG}" \
   --world-size 2 \
   --data-cursor-start 4 \

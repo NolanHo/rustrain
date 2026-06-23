@@ -9,7 +9,7 @@ EXPECTED_TOTAL="${RUSTRAIN_EXPECTED_MAX_SAMPLES:-4}"
 EXPECTED_SOURCE="${RUSTRAIN_EXPECTED_MAX_SAMPLES_SOURCE:-data/sft_toy/instructions.jsonl}"
 OUTPUT="$(mktemp)"
 
-cargo run -- qwen-session-dp-data-plan --config "${CONFIG}" --world-size 2 \
+cargo run -- qwen session-dp-data-plan --config "${CONFIG}" --world-size 2 \
   | tee "${OUTPUT}"
 
 python - "${OUTPUT}" "${EXPECTED_TOTAL}" "${EXPECTED_SOURCE}" <<'PY'

@@ -10,7 +10,7 @@ MODEL_PATH="${RUSTRAIN_QWEN_TP_LINEAR_MODEL_PATH:-/vePFS-Mindverse/share/hugging
 cargo run -- launch \
   --nproc-per-node 2 \
   --output-dir "${OUTPUT_DIR}" \
-  qwen-tp-linear-rank-smoke \
+  qwen tp-linear-rank-smoke \
   --model-path "${MODEL_PATH}" \
   --output-dir "${OUTPUT_DIR}/ranks"
 

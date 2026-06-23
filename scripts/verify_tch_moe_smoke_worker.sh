@@ -6,7 +6,7 @@ source "${SCRIPT_DIR}/require_gpu_worker.sh"
 
 OUTPUT="$(mktemp)"
 
-cargo run -- tch-moe-smoke | tee "${OUTPUT}"
+cargo run -- moe tch-smoke | tee "${OUTPUT}"
 
 python - "${OUTPUT}" <<'PY'
 import json
@@ -17,7 +17,7 @@ text = pathlib.Path(sys.argv[1]).read_text()
 start = text.find("{")
 end = text.rfind("}")
 if start < 0 or end < start:
-    raise SystemExit("tch-moe-smoke did not print a JSON summary")
+    raise SystemExit("moe tch-smoke did not print a JSON summary")
 summary = json.loads(text[start : end + 1])
 
 required = [

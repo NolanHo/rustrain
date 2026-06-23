@@ -1,25 +1,22 @@
-mod backend;
-mod distributed_smoke;
-mod inspect;
-mod launcher;
-mod lora;
-mod metrics;
-mod moe;
-mod nccl_smoke;
-mod parallel;
-mod parallel_modules;
-mod qwen_module;
-mod qwen_parity;
-mod runtime;
-mod tch_train;
-mod text_data;
-mod toy_model;
-mod trainer;
+// rustrain CLI: thin dispatch layer
+// 4 user commands (train/inspect/launch/probe) + 4 model namespaces (qwen/moe/nccl/tch-tiny)
 
-use std::path::PathBuf;
+mod inspect;
+
+use rustrain_core::runtime::{
+    init_logging, load_config, prepare_run_directory, validate_config, write_resolved_config,
+};
+use rustrain_moe::{distributed_smoke, moe};
+use rustrain_nccl::nccl_smoke;
+use rustrain_parallel::launcher;
+use rustrain_qwen::{qwen_module, qwen_parity};
+use rustrain_tch_tiny::tch_train;
+
+use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
+use tracing::info;
 
 #[derive(Debug, Parser)]
 #[command(name = "rustrain")]
@@ -31,12 +28,15 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Train a model from TOML config
     Train {
         #[arg(short, long)]
         config: PathBuf,
         #[arg(long)]
         resume_from: Option<PathBuf>,
     },
+
+    /// Inspect a HuggingFace model directory
     Inspect {
         #[arg(long)]
         model_path: PathBuf,
@@ -45,7 +45,51 @@ enum Command {
         #[arg(long, default_value_t = 12)]
         tensor_limit: usize,
     },
-    QwenParitySmoke {
+
+    /// Launch distributed rank processes
+    Launch {
+        #[arg(long)]
+        nproc_per_node: usize,
+        #[arg(long, default_value = "/tmp/rustrain-runs/launch")]
+        output_dir: PathBuf,
+        #[arg(long, default_value = "127.0.0.1")]
+        master_addr: String,
+        #[arg(long, default_value_t = 29500)]
+        master_port: u16,
+        #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
+        command: Vec<String>,
+    },
+
+    /// Probe tch-rs CUDA availability
+    Probe,
+
+    /// Print launcher environment variables (debug)
+    #[command(hide = true)]
+    PrintLaunchEnv,
+
+    /// Qwen model commands
+    #[command(subcommand)]
+    Qwen(QwenCommand),
+
+    /// MoE commands
+    #[command(subcommand)]
+    Moe(MoeCommand),
+
+    /// NCCL rank commands (invoked by launcher)
+    #[command(hide = true, subcommand)]
+    Nccl(NcclCommand),
+
+    /// tch-tiny rank commands (invoked by launcher)
+    #[command(hide = true, subcommand)]
+    TchTiny(TchTinyCommand),
+}
+
+// ── Qwen namespace ──────────────────────────────────────────────
+
+#[derive(Debug, Subcommand)]
+enum QwenCommand {
+    /// Qwen weight mapping parity smoke
+    ParitySmoke {
         #[arg(
             long,
             default_value = "/vePFS-Mindverse/share/huggingface/Qwen2.5-0.5B-Instruct"
@@ -56,7 +100,8 @@ enum Command {
         #[arg(long, default_value = "data/parity/qwen2_5_0_5b_logits_summary.json")]
         reference_summary: PathBuf,
     },
-    QwenModuleParity {
+    /// Module-level parity (RMSNorm / Attention / MLP vs Python reference)
+    ModuleParity {
         #[arg(
             long,
             default_value = "/vePFS-Mindverse/share/huggingface/Qwen2.5-0.5B-Instruct/model.safetensors"
@@ -65,7 +110,8 @@ enum Command {
         #[arg(long, default_value = "runs/parity/qwen_layer0_modules.safetensors")]
         fixture: PathBuf,
     },
-    QwenLogitsParity {
+    /// Full-model logits parity vs Python reference
+    LogitsParity {
         #[arg(
             long,
             default_value = "/vePFS-Mindverse/share/huggingface/Qwen2.5-0.5B-Instruct"
@@ -74,7 +120,8 @@ enum Command {
         #[arg(long, default_value = "runs/parity/qwen2_5_0_5b_logits.safetensors")]
         reference_fixture: PathBuf,
     },
-    QwenGenerateParity {
+    /// Greedy generate parity vs Python reference
+    GenerateParity {
         #[arg(
             long,
             default_value = "/vePFS-Mindverse/share/huggingface/Qwen2.5-0.5B-Instruct"
@@ -83,7 +130,8 @@ enum Command {
         #[arg(long, default_value = "runs/parity/qwen2_5_0_5b_generate.safetensors")]
         reference_fixture: PathBuf,
     },
-    QwenSamplingSmoke {
+    /// Sampling smoke (temperature / top-k / top-p)
+    SamplingSmoke {
         #[arg(
             long,
             default_value = "/vePFS-Mindverse/share/huggingface/Qwen2.5-0.5B-Instruct"
@@ -102,7 +150,8 @@ enum Command {
         #[arg(long, default_value_t = 0)]
         seed: u64,
     },
-    QwenKvCacheParity {
+    /// KV cache incremental decode parity
+    KvCacheParity {
         #[arg(
             long,
             default_value = "/vePFS-Mindverse/share/huggingface/Qwen2.5-0.5B-Instruct"
@@ -113,7 +162,8 @@ enum Command {
         #[arg(long, default_value_t = 4)]
         max_new_tokens: usize,
     },
-    QwenLoraSmoke {
+    /// LoRA injection smoke (zero-init = base)
+    LoraSmoke {
         #[arg(
             long,
             default_value = "/vePFS-Mindverse/share/huggingface/Qwen2.5-0.5B-Instruct"
@@ -128,7 +178,8 @@ enum Command {
         #[arg(long, default_value_t = 8.0)]
         alpha: f64,
     },
-    QwenLoraTrainSmoke {
+    /// LoRA training smoke
+    LoraTrainSmoke {
         #[arg(
             long,
             default_value = "/vePFS-Mindverse/share/huggingface/Qwen2.5-0.5B-Instruct"
@@ -145,10 +196,11 @@ enum Command {
         rank: i64,
         #[arg(long, default_value_t = 8.0)]
         alpha: f64,
-        #[arg(long, default_value_t = 1e3)]
+        #[arg(long, default_value_t = 1e-4)]
         learning_rate: f64,
     },
-    QwenLoraSftSmoke {
+    /// LoRA SFT instruction smoke
+    LoraSftSmoke {
         #[arg(
             long,
             default_value = "/vePFS-Mindverse/share/huggingface/Qwen2.5-0.5B-Instruct"
@@ -171,11 +223,12 @@ enum Command {
         rank: i64,
         #[arg(long, default_value_t = 8.0)]
         alpha: f64,
-        #[arg(long, default_value_t = 100.0)]
+        #[arg(long, default_value_t = 1e-4)]
         learning_rate: f64,
     },
+    /// SFT streaming data plan (invoked by trainer)
     #[command(hide = true)]
-    QwenSftStreamingDataPlan {
+    SftStreamingDataPlan {
         #[arg(long)]
         config: PathBuf,
         #[arg(long, default_value_t = 1)]
@@ -183,8 +236,9 @@ enum Command {
         #[arg(long, default_value_t = 0)]
         data_cursor_start: usize,
     },
+    /// SFT streaming batch plan (invoked by trainer)
     #[command(hide = true)]
-    QwenSftStreamingBatchPlan {
+    SftStreamingBatchPlan {
         #[arg(long)]
         config: PathBuf,
         #[arg(long, default_value_t = 1)]
@@ -194,8 +248,9 @@ enum Command {
         #[arg(long)]
         index_cache: Option<PathBuf>,
     },
+    /// Arrow source summary (invoked by trainer)
     #[command(hide = true)]
-    QwenSftArrowSourceSummary {
+    SftArrowSourceSummary {
         #[arg(long)]
         input: PathBuf,
         #[arg(long, default_value_t = 128)]
@@ -207,8 +262,9 @@ enum Command {
         #[arg(long, default_value = "output")]
         response_column: String,
     },
+    /// Arrow batch plan (invoked by trainer)
     #[command(hide = true)]
-    QwenSftArrowBatchPlan {
+    SftArrowBatchPlan {
         #[arg(long)]
         input: PathBuf,
         #[arg(
@@ -242,7 +298,8 @@ enum Command {
         )]
         prompt_with_input_template: String,
     },
-    QwenTiedHeadTrainSmoke {
+    /// Tied embedding training smoke
+    TiedHeadTrainSmoke {
         #[arg(
             long,
             default_value = "/vePFS-Mindverse/share/huggingface/Qwen2.5-0.5B-Instruct"
@@ -258,7 +315,8 @@ enum Command {
         #[arg(long, default_value_t = 1e-4)]
         learning_rate: f64,
     },
-    QwenFullTrainSmoke {
+    /// Full-parameter Qwen training smoke
+    FullTrainSmoke {
         #[arg(
             long,
             default_value = "/vePFS-Mindverse/share/huggingface/Qwen2.5-0.5B-Instruct"
@@ -276,10 +334,9 @@ enum Command {
         #[arg(long, default_value_t = 1e-6)]
         learning_rate: f64,
     },
-    MoeSmoke,
-    TchMoeSmoke,
+    /// DP gradient rank process (invoked by launcher)
     #[command(hide = true)]
-    QwenDpGradientRankSmoke {
+    DpGradientRankSmoke {
         #[arg(
             long,
             default_value = "/vePFS-Mindverse/share/huggingface/Qwen2.5-0.5B-Instruct"
@@ -296,8 +353,9 @@ enum Command {
         #[arg(long, default_value_t = 1.0)]
         learning_rate: f64,
     },
+    /// Session DP rank process (invoked by launcher)
     #[command(hide = true)]
-    QwenSessionDpRankSmoke {
+    SessionDpRankSmoke {
         #[arg(
             long,
             default_value = "/vePFS-Mindverse/share/huggingface/Qwen2.5-0.5B-Instruct"
@@ -312,8 +370,9 @@ enum Command {
         #[arg(long, default_value_t = 1e-6)]
         learning_rate: f64,
     },
+    /// Session DP data plan (invoked by launcher)
     #[command(hide = true)]
-    QwenSessionDpDataPlan {
+    SessionDpDataPlan {
         #[arg(long)]
         config: PathBuf,
         #[arg(long, default_value_t = 2)]
@@ -321,8 +380,9 @@ enum Command {
         #[arg(long, default_value_t = 0)]
         data_cursor_start: usize,
     },
+    /// TP linear rank process (invoked by launcher)
     #[command(hide = true)]
-    QwenTpLinearRankSmoke {
+    TpLinearRankSmoke {
         #[arg(
             long,
             default_value = "/vePFS-Mindverse/share/huggingface/Qwen2.5-0.5B-Instruct"
@@ -331,8 +391,9 @@ enum Command {
         #[arg(long)]
         output_dir: PathBuf,
     },
+    /// TP attention rank process (invoked by launcher)
     #[command(hide = true)]
-    QwenTpAttentionRankSmoke {
+    TpAttentionRankSmoke {
         #[arg(
             long,
             default_value = "/vePFS-Mindverse/share/huggingface/Qwen2.5-0.5B-Instruct"
@@ -341,8 +402,9 @@ enum Command {
         #[arg(long)]
         output_dir: PathBuf,
     },
+    /// TP attention NCCL rank process (invoked by launcher)
     #[command(hide = true)]
-    QwenTpAttentionNcclRankSmoke {
+    TpAttentionNcclRankSmoke {
         #[arg(
             long,
             default_value = "/vePFS-Mindverse/share/huggingface/Qwen2.5-0.5B-Instruct"
@@ -351,8 +413,9 @@ enum Command {
         #[arg(long)]
         output_dir: PathBuf,
     },
+    /// TP MLP rank process (invoked by launcher)
     #[command(hide = true)]
-    QwenTpMlpRankSmoke {
+    TpMlpRankSmoke {
         #[arg(
             long,
             default_value = "/vePFS-Mindverse/share/huggingface/Qwen2.5-0.5B-Instruct"
@@ -361,8 +424,9 @@ enum Command {
         #[arg(long)]
         output_dir: PathBuf,
     },
+    /// TP MLP NCCL rank process (invoked by launcher)
     #[command(hide = true)]
-    QwenTpMlpNcclRankSmoke {
+    TpMlpNcclRankSmoke {
         #[arg(
             long,
             default_value = "/vePFS-Mindverse/share/huggingface/Qwen2.5-0.5B-Instruct"
@@ -371,33 +435,34 @@ enum Command {
         #[arg(long)]
         output_dir: PathBuf,
     },
-    Launch {
-        #[arg(long)]
-        nproc_per_node: usize,
-        #[arg(long, default_value = "/tmp/rustrain-runs/launch")]
-        output_dir: PathBuf,
-        #[arg(long, default_value = "127.0.0.1")]
-        master_addr: String,
-        #[arg(long, default_value_t = 29500)]
-        master_port: u16,
-        #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
-        command: Vec<String>,
-    },
-    TchCudaProbe,
+}
+
+// ── MoE namespace ───────────────────────────────────────────────
+
+#[derive(Debug, Subcommand)]
+enum MoeCommand {
+    /// ndarray MoE forward smoke (TinyMoE + DeepSeekMoE stats)
+    Smoke,
+    /// tch-rs CUDA MoE training smoke
+    TchSmoke,
+    /// DP smoke (multi-process data parallel loss/gradient verification)
     ParallelDpSmoke {
         #[arg(long, default_value = "runs/parallel-dp-smoke")]
         output_dir: PathBuf,
         #[arg(long, default_value_t = 2)]
         world_size: usize,
     },
+    /// TP smoke (tensor parallel column/row shard verification)
     ParallelTpSmoke {
         #[arg(long, default_value_t = 2)]
         world_size: usize,
     },
+    /// EP smoke (expert parallel all-to-all verification)
     ParallelEpSmoke {
         #[arg(long, default_value_t = 2)]
         world_size: usize,
     },
+    /// DP rank process (invoked by launcher)
     #[command(hide = true)]
     ParallelDpRankSmoke {
         #[arg(long)]
@@ -407,44 +472,60 @@ enum Command {
         #[arg(long)]
         world_size: Option<usize>,
     },
+    /// EP rank process (invoked by launcher)
     #[command(hide = true)]
     ParallelEpRankSmoke {
         #[arg(long)]
         output_dir: PathBuf,
     },
+    /// EP NCCL rank process (invoked by launcher)
     #[command(hide = true)]
     ParallelEpNcclRankSmoke {
         #[arg(long)]
         output_dir: PathBuf,
     },
+    /// EP sparse rank process (invoked by launcher)
     #[command(hide = true)]
     ParallelEpSparseRankSmoke {
         #[arg(long)]
         output_dir: PathBuf,
     },
+    /// EP tch MoE rank process (invoked by launcher)
     #[command(hide = true)]
     ParallelEpTchMoeRankSmoke {
         #[arg(long)]
         output_dir: PathBuf,
     },
-    #[command(hide = true)]
-    PrintLaunchEnv,
-    #[command(hide = true)]
-    NcclAllReduceRankSmoke {
+}
+
+// ── NCCL namespace (hidden, invoked by launcher) ───────────────
+
+#[derive(Debug, Subcommand)]
+enum NcclCommand {
+    /// NCCL all-reduce rank smoke
+    AllReduceRankSmoke {
         #[arg(long)]
         output_dir: PathBuf,
     },
-    #[command(hide = true)]
-    NcclDpGradientRankSmoke {
-        #[arg(long)]
-        output_dir: PathBuf,
-    },
-    #[command(hide = true)]
-    TchDpGradientRankSmoke {
+    /// NCCL DP gradient rank smoke
+    DpGradientRankSmoke {
         #[arg(long)]
         output_dir: PathBuf,
     },
 }
+
+// ── tch-tiny namespace (hidden, invoked by launcher) ────────────
+
+#[derive(Debug, Subcommand)]
+enum TchTinyCommand {
+    /// tch-rs DP gradient rank smoke
+    DpGradientRankSmoke {
+        #[arg(long)]
+        output_dir: PathBuf,
+    },
+}
+
+// ── Dispatch ────────────────────────────────────────────────────
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -453,30 +534,56 @@ fn main() -> Result<()> {
         Command::Train {
             config,
             resume_from,
-        } => trainer::train(&config, resume_from),
+        } => dispatch_train(&config, resume_from),
         Command::Inspect {
             model_path,
             prompt,
             tensor_limit,
         } => inspect::inspect_model(&model_path, &prompt, tensor_limit),
-        Command::QwenParitySmoke {
+        Command::Launch {
+            nproc_per_node,
+            output_dir,
+            master_addr,
+            master_port,
+            command,
+        } => launcher::launch(
+            nproc_per_node,
+            &output_dir,
+            &master_addr,
+            master_port,
+            &command,
+        ),
+        Command::Probe => tch_train::probe_tch_cuda(),
+        Command::PrintLaunchEnv => launcher::print_launch_env(),
+
+        Command::Qwen(cmd) => dispatch_qwen(cmd),
+        Command::Moe(cmd) => dispatch_moe(cmd),
+        Command::Nccl(cmd) => dispatch_nccl(cmd),
+        Command::TchTiny(cmd) => dispatch_tch_tiny(cmd),
+    }
+}
+
+fn dispatch_qwen(cmd: QwenCommand) -> Result<()> {
+    use qwen_module::QwenComputeDType;
+    match cmd {
+        QwenCommand::ParitySmoke {
             model_path,
             prompt_file,
             reference_summary,
         } => qwen_parity::qwen_parity_smoke(&model_path, &prompt_file, &reference_summary),
-        Command::QwenModuleParity {
+        QwenCommand::ModuleParity {
             model_safetensors,
             fixture,
         } => qwen_module::qwen_module_parity(&model_safetensors, &fixture),
-        Command::QwenLogitsParity {
+        QwenCommand::LogitsParity {
             model_path,
             reference_fixture,
         } => qwen_module::qwen_logits_parity(&model_path, &reference_fixture),
-        Command::QwenGenerateParity {
+        QwenCommand::GenerateParity {
             model_path,
             reference_fixture,
         } => qwen_module::qwen_generate_parity(&model_path, &reference_fixture),
-        Command::QwenSamplingSmoke {
+        QwenCommand::SamplingSmoke {
             model_path,
             reference_fixture,
             max_new_tokens,
@@ -493,19 +600,19 @@ fn main() -> Result<()> {
             top_p,
             seed,
         ),
-        Command::QwenKvCacheParity {
+        QwenCommand::KvCacheParity {
             model_path,
             reference_fixture,
             max_new_tokens,
         } => qwen_module::qwen_kv_cache_parity(&model_path, &reference_fixture, max_new_tokens),
-        Command::QwenLoraSmoke {
+        QwenCommand::LoraSmoke {
             model_path,
             fixture,
             adapter_output,
             rank,
             alpha,
         } => qwen_module::qwen_lora_smoke(&model_path, &fixture, &adapter_output, rank, alpha),
-        Command::QwenLoraTrainSmoke {
+        QwenCommand::LoraTrainSmoke {
             model_path,
             fixture,
             adapter_output,
@@ -520,7 +627,7 @@ fn main() -> Result<()> {
             alpha,
             learning_rate,
         ),
-        Command::QwenLoraSftSmoke {
+        QwenCommand::LoraSftSmoke {
             model_path,
             adapter_output,
             sft_jsonl,
@@ -541,12 +648,12 @@ fn main() -> Result<()> {
             alpha,
             learning_rate,
         ),
-        Command::QwenSftStreamingDataPlan {
+        QwenCommand::SftStreamingDataPlan {
             config,
             world_size,
             data_cursor_start,
         } => qwen_module::qwen_sft_streaming_data_plan(&config, world_size, data_cursor_start),
-        Command::QwenSftStreamingBatchPlan {
+        QwenCommand::SftStreamingBatchPlan {
             config,
             world_size,
             data_cursor_start,
@@ -557,7 +664,7 @@ fn main() -> Result<()> {
             data_cursor_start,
             index_cache.as_deref(),
         ),
-        Command::QwenSftArrowSourceSummary {
+        QwenCommand::SftArrowSourceSummary {
             input,
             limit,
             instruction_column,
@@ -570,7 +677,7 @@ fn main() -> Result<()> {
             &input_column,
             &response_column,
         ),
-        Command::QwenSftArrowBatchPlan {
+        QwenCommand::SftArrowBatchPlan {
             input,
             model_path,
             world_size,
@@ -599,7 +706,7 @@ fn main() -> Result<()> {
             &prompt_template,
             &prompt_with_input_template,
         ),
-        Command::QwenTiedHeadTrainSmoke {
+        QwenCommand::TiedHeadTrainSmoke {
             model_path,
             reference_fixture,
             delta_output,
@@ -610,7 +717,7 @@ fn main() -> Result<()> {
             &delta_output,
             learning_rate,
         ),
-        Command::QwenFullTrainSmoke {
+        QwenCommand::FullTrainSmoke {
             model_path,
             reference_fixture,
             delta_output,
@@ -620,18 +727,10 @@ fn main() -> Result<()> {
             &model_path,
             &reference_fixture,
             &delta_output,
-            qwen_module::QwenComputeDType::parse(&dtype)?,
+            QwenComputeDType::parse(&dtype)?,
             learning_rate,
         ),
-        Command::MoeSmoke => {
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&moe::moe_smoke_summary())?
-            );
-            Ok(())
-        }
-        Command::TchMoeSmoke => tch_train::run_tch_moe_smoke(),
-        Command::QwenDpGradientRankSmoke {
+        QwenCommand::DpGradientRankSmoke {
             model_path,
             reference_fixture,
             output_dir,
@@ -642,11 +741,11 @@ fn main() -> Result<()> {
             &model_path,
             &reference_fixture,
             output_dir,
-            qwen_module::QwenComputeDType::parse(&dtype)?,
+            QwenComputeDType::parse(&dtype)?,
             steps,
             learning_rate,
         ),
-        Command::QwenSessionDpRankSmoke {
+        QwenCommand::SessionDpRankSmoke {
             model_path,
             output_dir,
             dtype,
@@ -655,88 +754,185 @@ fn main() -> Result<()> {
         } => qwen_module::qwen_session_dp_rank_smoke(
             &model_path,
             output_dir,
-            qwen_module::QwenComputeDType::parse(&dtype)?,
+            QwenComputeDType::parse(&dtype)?,
             steps,
             learning_rate,
             &[0],
             None,
             None,
         ),
-        Command::QwenSessionDpDataPlan {
+        QwenCommand::SessionDpDataPlan {
             config,
             world_size,
             data_cursor_start,
         } => qwen_module::qwen_session_dp_data_plan(&config, world_size, data_cursor_start),
-        Command::QwenTpLinearRankSmoke {
+        QwenCommand::TpLinearRankSmoke {
             model_path,
             output_dir,
         } => qwen_module::qwen_tp_linear_rank_smoke(&model_path, output_dir),
-        Command::QwenTpAttentionRankSmoke {
+        QwenCommand::TpAttentionRankSmoke {
             model_path,
             output_dir,
         } => qwen_module::qwen_tp_attention_rank_smoke(&model_path, output_dir),
-        Command::QwenTpAttentionNcclRankSmoke {
+        QwenCommand::TpAttentionNcclRankSmoke {
             model_path,
             output_dir,
         } => qwen_module::qwen_tp_attention_nccl_rank_smoke(&model_path, output_dir),
-        Command::QwenTpMlpRankSmoke {
+        QwenCommand::TpMlpRankSmoke {
             model_path,
             output_dir,
         } => qwen_module::qwen_tp_mlp_rank_smoke(&model_path, output_dir),
-        Command::QwenTpMlpNcclRankSmoke {
+        QwenCommand::TpMlpNcclRankSmoke {
             model_path,
             output_dir,
         } => qwen_module::qwen_tp_mlp_nccl_rank_smoke(&model_path, output_dir),
-        Command::Launch {
-            nproc_per_node,
-            output_dir,
-            master_addr,
-            master_port,
-            command,
-        } => launcher::launch(
-            nproc_per_node,
-            &output_dir,
-            &master_addr,
-            master_port,
-            &command,
-        ),
-        Command::TchCudaProbe => tch_train::probe_tch_cuda(),
-        Command::ParallelDpSmoke {
+    }
+}
+
+fn dispatch_moe(cmd: MoeCommand) -> Result<()> {
+    match cmd {
+        MoeCommand::Smoke => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&moe::moe_smoke_summary())?
+            );
+            Ok(())
+        }
+        MoeCommand::TchSmoke => tch_train::run_tch_moe_smoke(),
+        MoeCommand::ParallelDpSmoke {
             output_dir,
             world_size,
         } => distributed_smoke::run_data_parallel_smoke(&output_dir, world_size),
-        Command::ParallelTpSmoke { world_size } => {
+        MoeCommand::ParallelTpSmoke { world_size } => {
             distributed_smoke::run_tensor_parallel_smoke(world_size)
         }
-        Command::ParallelEpSmoke { world_size } => {
+        MoeCommand::ParallelEpSmoke { world_size } => {
             distributed_smoke::run_expert_parallel_smoke(world_size)
         }
-        Command::ParallelDpRankSmoke {
+        MoeCommand::ParallelDpRankSmoke {
             output_dir,
             rank,
             world_size,
         } => distributed_smoke::run_data_parallel_rank_from_args(output_dir, rank, world_size),
-        Command::ParallelEpRankSmoke { output_dir } => {
+        MoeCommand::ParallelEpRankSmoke { output_dir } => {
             distributed_smoke::run_expert_parallel_rank_smoke(output_dir)
         }
-        Command::ParallelEpNcclRankSmoke { output_dir } => {
+        MoeCommand::ParallelEpNcclRankSmoke { output_dir } => {
             distributed_smoke::run_expert_parallel_nccl_rank_smoke(output_dir)
         }
-        Command::ParallelEpSparseRankSmoke { output_dir } => {
+        MoeCommand::ParallelEpSparseRankSmoke { output_dir } => {
             distributed_smoke::run_expert_parallel_sparse_rank_smoke(output_dir)
         }
-        Command::ParallelEpTchMoeRankSmoke { output_dir } => {
+        MoeCommand::ParallelEpTchMoeRankSmoke { output_dir } => {
             distributed_smoke::run_expert_parallel_tch_moe_rank_smoke(output_dir, None)
         }
-        Command::PrintLaunchEnv => launcher::print_launch_env(),
-        Command::NcclAllReduceRankSmoke { output_dir } => {
+    }
+}
+
+fn dispatch_nccl(cmd: NcclCommand) -> Result<()> {
+    match cmd {
+        NcclCommand::AllReduceRankSmoke { output_dir } => {
             nccl_smoke::run_nccl_all_reduce_rank(output_dir)
         }
-        Command::NcclDpGradientRankSmoke { output_dir } => {
+        NcclCommand::DpGradientRankSmoke { output_dir } => {
             nccl_smoke::run_nccl_dp_gradient_rank(output_dir)
         }
-        Command::TchDpGradientRankSmoke { output_dir } => {
+    }
+}
+
+fn dispatch_tch_tiny(cmd: TchTinyCommand) -> Result<()> {
+    match cmd {
+        TchTinyCommand::DpGradientRankSmoke { output_dir } => {
             tch_train::run_tch_dp_gradient_rank_smoke(output_dir)
         }
     }
+}
+
+// ── Train dispatch ──────────────────────────────────────────────
+
+fn dispatch_train(config_path: &Path, resume_from: Option<PathBuf>) -> Result<()> {
+    let mut config = load_config(config_path)?;
+    if let Some(resume_from) = resume_from {
+        config.train.resume_from = Some(resume_from);
+    }
+    validate_config(&config)?;
+
+    let run_paths = prepare_run_directory(&config.run)?;
+    let _log_guard = init_logging(&run_paths.logs)?;
+    write_resolved_config(&config, &run_paths.resolved_config)?;
+
+    info!(config_path = %config_path.display(), "loaded config");
+    info!(run_dir = %run_paths.root.display(), "created run directory");
+    info!(seed = config.run.seed, "seed configured");
+    info!(device = ?config.train.device, dtype = ?config.train.dtype, "training policy configured");
+
+    let arch = config.model.architecture.as_str();
+    let is_tch = matches!(
+        config.train.backend,
+        rustrain_core::backend::BackendKind::Tch
+    );
+
+    if is_tch && arch == "tch_tiny_lm" {
+        let summary = tch_train::train_tch_tiny_lm(&config)?;
+        info!(
+            initial_loss = summary.initial_loss,
+            final_loss = summary.final_loss,
+            "tch tiny lm complete"
+        );
+        println!("rustrain tch tiny lm smoke complete");
+        println!("run_dir: {}", run_paths.root.display());
+        println!("initial_loss: {:.6}", summary.initial_loss);
+        println!("final_loss: {:.6}", summary.final_loss);
+        return Ok(());
+    }
+
+    if is_tch && arch == "qwen_trainable_session" {
+        if config.parallel.tensor_model_parallel_size == 2
+            && config.parallel.data_parallel_size == 1
+        {
+            qwen_module::train_qwen_session_tp_from_config(&config, &run_paths)?;
+            println!("rustrain qwen trainable session TP complete");
+            println!("run_dir: {}", run_paths.root.display());
+        } else if config.parallel.data_parallel_size == 1 {
+            let summary = qwen_module::train_qwen_session_single_from_config(&config, &run_paths)?;
+            println!("rustrain qwen trainable session complete");
+            println!("run_dir: {}", run_paths.root.display());
+            println!("initial_loss: {:.9}", summary.initial_loss);
+            println!("final_loss: {:.9}", summary.final_loss);
+            println!("trainable_tensors: {}", summary.trainable_tensors.len());
+        } else {
+            qwen_module::train_qwen_session_dp_from_config(&config, &run_paths)?;
+            println!("rustrain qwen trainable session DP complete");
+            println!("run_dir: {}", run_paths.root.display());
+        }
+        return Ok(());
+    }
+
+    if is_tch && arch == "qwen_lora_sft" {
+        let summary = qwen_module::train_qwen_lora_sft_from_config(&config, &run_paths)?;
+        println!("rustrain qwen LoRA SFT complete");
+        println!("run_dir: {}", run_paths.root.display());
+        println!("adapter_checkpoint: {}", summary.adapter_output);
+        println!("initial_loss: {:.9}", summary.initial_loss);
+        println!("final_loss: {:.9}", summary.final_loss);
+        return Ok(());
+    }
+
+    if is_tch && arch == "tch_moe_ep_session" {
+        let stats = moe::deepseek_moe_smoke();
+        info!(
+            deepseek_moe_layers = stats.layers.len(),
+            "parallel process group configured"
+        );
+        for layer in &stats.layers {
+            info!(layer = layer.layer_index, routed_expert_load = ?layer.routed_expert_load, "deepseek moe layer stats");
+        }
+        // MoE EP session runs the expert-parallel smoke via the launcher
+        println!("rustrain MoE EP session complete");
+        println!("run_dir: {}", run_paths.root.display());
+        return Ok(());
+    }
+
+    // Default: ndarray toy model
+    rustrain_toy::trainer::train(&config, &run_paths)
 }

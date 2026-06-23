@@ -19,7 +19,7 @@ evidence, or final acceptance.
 Run one command on a Ray GPU worker:
 
 ```sh
-scripts/gpu_run.sh cargo run -- tch-cuda-probe
+scripts/gpu_run.sh cargo run -- probe
 ```
 
 By default `scripts/gpu_run.sh` stages the current working tree into a
@@ -88,7 +88,7 @@ scripts/verify_gpu.sh
 ```
 
 The A800 config writes runs to `/tmp/rustrain-runs` because the shared project
-checkout may be read-only from the worker. If `tch-cuda-probe` reports
+checkout may be read-only from the worker. If `probe` reports
 `device_count: 0`, the SSH target has not exposed GPU devices and milestone
 acceptance is blocked until the runtime is fixed.
 
@@ -98,14 +98,14 @@ The current real-model path targets the Qwen2.5 checkpoint under
 `/vePFS-Mindverse/share/huggingface` on the GPU host:
 
 ```sh
-scripts/gpu_run.sh cargo run -- qwen-logits-parity
+scripts/gpu_run.sh cargo run -- qwen logits-parity
 ```
 
 The full-train smoke command is present, but GPU execution must be used for the
 real checkpoint:
 
 ```sh
-scripts/gpu_run.sh cargo run -- qwen-full-train-smoke
+scripts/gpu_run.sh cargo run -- qwen full-train-smoke
 ```
 
 ## Distributed Launch
@@ -115,14 +115,14 @@ process management:
 
 ```sh
 scripts/gpu_run.sh cargo run -- launch --nproc-per-node 2 print-launch-env
-scripts/gpu_run.sh cargo run -- launch --nproc-per-node 2 parallel-dp-rank-smoke --output-dir /tmp/rustrain-runs/launch-dp-rank-smoke/dp
-RUSTRAIN_RAY_NUM_GPUS=2 scripts/gpu_run.sh cargo run -- launch --nproc-per-node 2 --output-dir /tmp/rustrain-runs/nccl-all-reduce-smoke nccl-all-reduce-rank-smoke --output-dir /tmp/rustrain-runs/nccl-all-reduce-smoke/ranks
-RUSTRAIN_RAY_NUM_GPUS=2 scripts/gpu_run.sh cargo run -- launch --nproc-per-node 2 --output-dir /tmp/rustrain-runs/nccl-dp-gradient-smoke nccl-dp-gradient-rank-smoke --output-dir /tmp/rustrain-runs/nccl-dp-gradient-smoke/ranks
-RUSTRAIN_RAY_NUM_GPUS=2 scripts/gpu_run.sh cargo run -- launch --nproc-per-node 2 --output-dir /tmp/rustrain-runs/tch-dp-gradient-smoke tch-dp-gradient-rank-smoke --output-dir /tmp/rustrain-runs/tch-dp-gradient-smoke/ranks
+scripts/gpu_run.sh cargo run -- launch --nproc-per-node 2 moe parallel-dp-rank-smoke --output-dir /tmp/rustrain-runs/launch-dp-rank-smoke/dp
+RUSTRAIN_RAY_NUM_GPUS=2 scripts/gpu_run.sh cargo run -- launch --nproc-per-node 2 --output-dir /tmp/rustrain-runs/nccl-all-reduce-smoke nccl all-reduce-rank-smoke --output-dir /tmp/rustrain-runs/nccl-all-reduce-smoke/ranks
+RUSTRAIN_RAY_NUM_GPUS=2 scripts/gpu_run.sh cargo run -- launch --nproc-per-node 2 --output-dir /tmp/rustrain-runs/nccl-dp-gradient-smoke nccl dp-gradient-rank-smoke --output-dir /tmp/rustrain-runs/nccl-dp-gradient-smoke/ranks
+RUSTRAIN_RAY_NUM_GPUS=2 scripts/gpu_run.sh cargo run -- launch --nproc-per-node 2 --output-dir /tmp/rustrain-runs/tch-dp-gradient-smoke tch-tiny dp-gradient-rank-smoke --output-dir /tmp/rustrain-runs/tch-dp-gradient-smoke/ranks
 RUSTRAIN_RAY_NUM_GPUS=2 scripts/gpu_run.sh cargo run -- launch --nproc-per-node 2 --output-dir /tmp/rustrain-runs/tch-trainer-dp2-launch train --config configs/tch_smoke_cuda_dp2.toml
-RUSTRAIN_RAY_NUM_GPUS=2 scripts/gpu_run.sh env RUSTRAIN_LAUNCH_TIMEOUT_SECS=300 cargo run -- launch --nproc-per-node 2 --output-dir /tmp/rustrain-runs/qwen-dp-gradient-smoke-fp32 qwen-dp-gradient-rank-smoke --dtype fp32 --output-dir /tmp/rustrain-runs/qwen-dp-gradient-smoke-fp32/ranks
-RUSTRAIN_RAY_NUM_GPUS=2 scripts/gpu_run.sh env RUSTRAIN_LAUNCH_TIMEOUT_SECS=300 cargo run -- launch --nproc-per-node 2 --output-dir /tmp/rustrain-runs/qwen-dp-gradient-smoke-steps3 qwen-dp-gradient-rank-smoke --dtype fp32 --steps 3 --learning-rate 1.0 --output-dir /tmp/rustrain-runs/qwen-dp-gradient-smoke-steps3/ranks
-RUSTRAIN_RAY_NUM_GPUS=2 scripts/gpu_run.sh env RUSTRAIN_LAUNCH_TIMEOUT_SECS=600 cargo run -- launch --nproc-per-node 2 --output-dir /tmp/rustrain-runs/qwen-session-dp-adamw-smoke qwen-session-dp-rank-smoke --dtype fp32 --steps 2 --learning-rate 0.000001 --output-dir /tmp/rustrain-runs/qwen-session-dp-adamw-smoke/ranks
+RUSTRAIN_RAY_NUM_GPUS=2 scripts/gpu_run.sh env RUSTRAIN_LAUNCH_TIMEOUT_SECS=300 cargo run -- launch --nproc-per-node 2 --output-dir /tmp/rustrain-runs/qwen-dp-gradient-smoke-fp32 qwen dp-gradient-rank-smoke --dtype fp32 --output-dir /tmp/rustrain-runs/qwen-dp-gradient-smoke-fp32/ranks
+RUSTRAIN_RAY_NUM_GPUS=2 scripts/gpu_run.sh env RUSTRAIN_LAUNCH_TIMEOUT_SECS=300 cargo run -- launch --nproc-per-node 2 --output-dir /tmp/rustrain-runs/qwen-dp-gradient-smoke-steps3 qwen dp-gradient-rank-smoke --dtype fp32 --steps 3 --learning-rate 1.0 --output-dir /tmp/rustrain-runs/qwen-dp-gradient-smoke-steps3/ranks
+RUSTRAIN_RAY_NUM_GPUS=2 scripts/gpu_run.sh env RUSTRAIN_LAUNCH_TIMEOUT_SECS=600 cargo run -- launch --nproc-per-node 2 --output-dir /tmp/rustrain-runs/qwen-session-dp-adamw-smoke qwen session-dp-rank-smoke --dtype fp32 --steps 2 --learning-rate 0.000001 --output-dir /tmp/rustrain-runs/qwen-session-dp-adamw-smoke/ranks
 RUSTRAIN_RAY_NUM_GPUS=2 scripts/gpu_run.sh env RUSTRAIN_LAUNCH_TIMEOUT_SECS=600 cargo run -- launch --nproc-per-node 2 --output-dir /tmp/rustrain-runs/qwen-session-trainer-dp2 train --config configs/qwen_session_dp2.toml
 RUSTRAIN_RAY_NUM_GPUS=2 scripts/gpu_run.sh env RUSTRAIN_LAUNCH_TIMEOUT_SECS=900 bash scripts/verify_qwen_session_dp2_layers01_worker.sh
 RUSTRAIN_RAY_NUM_GPUS=2 scripts/gpu_run.sh env RUSTRAIN_LAUNCH_TIMEOUT_SECS=900 RUSTRAIN_QWEN_SESSION_DP_LAYERS_CONFIG=configs/qwen_session_dp2_layers01_bf16.toml RUSTRAIN_EXPECTED_QWEN_COMPUTE_KIND=bf16 bash scripts/verify_qwen_session_dp2_layers01_worker.sh
@@ -144,8 +144,8 @@ RUSTRAIN_RAY_NUM_GPUS=2 scripts/gpu_run.sh env RUSTRAIN_LAUNCH_TIMEOUT_SECS=900 
 RUSTRAIN_RAY_NUM_GPUS=2 scripts/gpu_run.sh env RUSTRAIN_LAUNCH_TIMEOUT_SECS=900 RUSTRAIN_DISTRIBUTED_BASE_OUTPUT_DIR=/tmp/rustrain-runs/qwen-session-dp2-layers03-sft-bf16-resume-base RUSTRAIN_DISTRIBUTED_RESUME_OUTPUT_DIR=/tmp/rustrain-runs/qwen-session-dp2-layers03-sft-bf16-resume-continue RUSTRAIN_QWEN_SESSION_DP_CONFIG=configs/qwen_session_dp2_layers03_sft_bf16.toml RUSTRAIN_EXPECTED_QWEN_COMPUTE_KIND=bf16 RUSTRAIN_EXPECTED_DATASET_ORDER_SEED=777 RUSTRAIN_EXPECTED_QWEN_DP_TRAINABLE_TENSORS=49 RUSTRAIN_EXPECTED_QWEN_DP_TRAINABLE_NAMES=model.layers.0.self_attn.q_proj.weight,model.layers.0.mlp.down_proj.weight,model.layers.3.self_attn.q_proj.weight,model.layers.3.mlp.down_proj.weight,model.norm.weight bash scripts/verify_qwen_session_dp2_resume_worker.sh
 RUSTRAIN_RAY_NUM_GPUS=2 scripts/gpu_run.sh env RUSTRAIN_LAUNCH_TIMEOUT_SECS=900 RUSTRAIN_DISTRIBUTED_BASE_OUTPUT_DIR=/tmp/rustrain-runs/qwen-session-dp2-layers07-sft-bf16-resume-base RUSTRAIN_DISTRIBUTED_RESUME_OUTPUT_DIR=/tmp/rustrain-runs/qwen-session-dp2-layers07-sft-bf16-resume-continue RUSTRAIN_QWEN_SESSION_DP_CONFIG=configs/qwen_session_dp2_layers07_sft_bf16.toml RUSTRAIN_EXPECTED_QWEN_COMPUTE_KIND=bf16 RUSTRAIN_EXPECTED_DATASET_ORDER_SEED=777 RUSTRAIN_EXPECTED_QWEN_DP_TRAINABLE_TENSORS=97 RUSTRAIN_EXPECTED_QWEN_DP_TRAINABLE_NAMES=model.layers.0.self_attn.q_proj.weight,model.layers.0.mlp.down_proj.weight,model.layers.7.self_attn.q_proj.weight,model.layers.7.mlp.down_proj.weight,model.norm.weight bash scripts/verify_qwen_session_dp2_resume_worker.sh
 RUSTRAIN_RAY_NUM_GPUS=2 scripts/gpu_run.sh cargo run -- launch --nproc-per-node 2 --output-dir /tmp/rustrain-runs/qwen-session-trainer-tp2 train --config configs/qwen_session_tp2.toml
-RUSTRAIN_RAY_NUM_GPUS=2 scripts/gpu_run.sh cargo run -- launch --nproc-per-node 2 --output-dir /tmp/rustrain-runs/ep-rank-local-smoke parallel-ep-rank-smoke --output-dir /tmp/rustrain-runs/ep-rank-local-smoke/ranks
-RUSTRAIN_RAY_NUM_GPUS=2 scripts/gpu_run.sh cargo run -- launch --nproc-per-node 2 --output-dir /tmp/rustrain-runs/ep-nccl-smoke parallel-ep-nccl-rank-smoke --output-dir /tmp/rustrain-runs/ep-nccl-smoke/ranks
+RUSTRAIN_RAY_NUM_GPUS=2 scripts/gpu_run.sh cargo run -- launch --nproc-per-node 2 --output-dir /tmp/rustrain-runs/ep-rank-local-smoke moe parallel-ep-rank-smoke --output-dir /tmp/rustrain-runs/ep-rank-local-smoke/ranks
+RUSTRAIN_RAY_NUM_GPUS=2 scripts/gpu_run.sh cargo run -- launch --nproc-per-node 2 --output-dir /tmp/rustrain-runs/ep-nccl-smoke moe parallel-ep-nccl-rank-smoke --output-dir /tmp/rustrain-runs/ep-nccl-smoke/ranks
 scripts/verify_gpu_distributed.sh
 ```
 
@@ -295,24 +295,24 @@ tensors, layer0-layer3 paths expect 49 trainable tensors, and the
 layer0-layer7 paths expect 97 trainable tensors; all still exclude the tied
 embedding by design.
 Toy MoE has an explicit single-rank smoke command and verifier:
-`cargo run -- moe-smoke` prints a JSON summary for TinyMoe and DeepSeek-style
+`cargo run -- moe smoke` prints a JSON summary for TinyMoe and DeepSeek-style
 toy MoE stats, and `scripts/verify_moe_smoke_worker.sh` asserts expert load,
 load-balance loss, activated/total parameter counts, and output summaries on a
 Ray GPU worker. A CUDA `tch-rs` autograd MoE smoke is also available through
-`cargo run -- tch-moe-smoke`; `scripts/verify_tch_moe_smoke_worker.sh` checks
+`cargo run -- moe tch-smoke`; `scripts/verify_tch_moe_smoke_worker.sh` checks
 that router and expert tensors receive gradients, the task loss decreases,
 activated parameters remain below total parameters, and model plus AdamW
 optimizer safetensors reload reproduces the next train step on a Ray GPU worker.
 It also writes a `rustrain.tch_moe.v1` manifest covering model tensor shapes,
 AdamW slot names, checkpoint paths, and completed step metadata.
 Expert-parallel coverage is still toy-sized, but it now has three real
-launcher-backed two-rank paths: `parallel-ep-rank-smoke` verifies rank-local
-expert ownership and token coverage, `parallel-ep-nccl-rank-smoke` builds
+launcher-backed two-rank paths: `moe parallel-ep-rank-smoke` verifies rank-local
+expert ownership and token coverage, `moe parallel-ep-nccl-rank-smoke` builds
 rank-local expert output tensors on CUDA, combines dense contributions with
 NCCL all-reduce, verifies an explicit gradient-bridge AdamW update lowers a
 tiny MSE target, writes rank-owned expert scale and optimizer safetensors under
 `rustrain.ep_sharded.v1`, and verifies reload plus next-step parity from those
-rank-owned expert checkpoints. `parallel-ep-sparse-rank-smoke` verifies a
+rank-owned expert checkpoints. `moe parallel-ep-sparse-rank-smoke` verifies a
 toy sparse NCCL send/recv dispatch and combine path: source ranks dispatch
 routed token payloads to expert-owner ranks, owner ranks compute local expert
 outputs, and outputs are sent back to source ranks for parity with the
@@ -327,7 +327,7 @@ parity, and checks the next sparse update from reloaded state matches the
 continuous next update. The sparse verifier checks the rank-owned manifest
 contract, safetensors paths, optimizer slot names, shard shapes, dtype, and
 expert-model-parallel partition metadata. A focused two-rank CUDA
-`parallel-ep-tch-moe-rank-smoke` now uses the same sparse send/recv plan with
+`moe parallel-ep-tch-moe-rank-smoke` now uses the same sparse send/recv plan with
 rank-owned `tch-rs` expert up/down MLP weights, bridges returned output
 gradients through real autograd, verifies positive expert gradients and
 loss-reducing AdamW updates, then writes two rank-owned expert shards under
@@ -428,7 +428,7 @@ production-grade sharded checkpoint ownership remain open.
   absent, restores adapter weights, and writes a fresh manifest without claiming
   saved data-cursor continuity. The adapter manifest records the same resolved
   complete Qwen `base_model_path` contract as delta checkpoints.
-  `cargo run -- qwen-sft-streaming-data-plan --config ...` provides a
+  `cargo run -- qwen sft-streaming-data-plan --config ...` provides a
   tokenizer-free streaming JSONL scan for SFT provenance, source sample counts,
   split sizes, explicit `data.eval_paths`, fingerprints, and cursor/epoch
   windows without materializing tokenized samples.
@@ -541,7 +541,7 @@ production-grade sharded checkpoint ownership remain open.
   metadata; Qwen JSONL SFT includes their paths and contents in dataset
   fingerprints and offset-index cache identity so an exported JSONL subset keeps
   provenance for the external source it came from.
-  `cargo run -- qwen-sft-streaming-batch-plan --config ...` resolves the next
+  `cargo run -- qwen sft-streaming-batch-plan --config ...` resolves the next
   cursor window to raw JSONL source indices, reads and tokenizes only those
   window records, then verifies the padded `input_ids` plus response masks match
   the current materialized dataset path. The LoRA SFT trainer plus single-GPU
@@ -585,15 +585,15 @@ production-grade sharded checkpoint ownership remain open.
   metadata through `data.external_metadata_paths`, and runs the same
   tokenizer-free plan, tokenizer-backed batch parity, cursor wrap, and
   offset-index cache write/hit checks. The same verifier also runs the hidden
-  `qwen-sft-arrow-source-summary` command, which scans the Arrow IPC source
+  `qwen sft-arrow-source-summary` command, which scans the Arrow IPC source
   directly in Rust and reports source rows, mapped columns, sample count, and
   fingerprint without writing JSONL or tokenizing samples. It also runs hidden
-  `qwen-sft-arrow-batch-plan`, which reads the same Arrow IPC source directly,
+  `qwen sft-arrow-batch-plan`, which reads the same Arrow IPC source directly,
   applies the configured SFT field map and prompt templates, tokenizes only the
   bounded cursor window, and checks cursor windows, sequence lengths,
   response-mask counts, padding counts, and token fingerprints against the
-  JSONL streaming batch plan. The same `qwen-sft-streaming-data-plan` and
-  `qwen-sft-streaming-batch-plan` commands now also accept
+  JSONL streaming batch plan. The same `qwen sft-streaming-data-plan` and
+  `qwen sft-streaming-batch-plan` commands now also accept
   `data.kind = "instruction_arrow"` for a single Arrow IPC train file with
   `data.max_samples`, mapped instruction/input/response columns, and prompt
   templates. `configs/qwen_session_single_sft_arrow.toml`,

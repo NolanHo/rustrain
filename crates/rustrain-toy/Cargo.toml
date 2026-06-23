@@ -1,0 +1,19 @@
+[package]
+name = "rustrain-toy"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+rustrain-core = { path = "../rustrain-core" }
+rustrain-train = { path = "../rustrain-train" }
+rustrain-data = { path = "../rustrain-data" }
+anyhow.workspace = true
+ndarray.workspace = true
+rand.workspace = true
+rand_distr.workspace = true
+serde.workspace = true
+toml.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

@@ -9,13 +9,13 @@ OUTPUT_DIR="${RUSTRAIN_DISTRIBUTED_VERIFY_OUTPUT_DIR:-/tmp/rustrain-runs/qwen-se
 DATA_PLAN_OUTPUT="$(mktemp)"
 BATCH_PLAN_OUTPUT="$(mktemp)"
 
-cargo run -- qwen-sft-streaming-data-plan \
+cargo run -- qwen sft-streaming-data-plan \
   --config "${CONFIG}" \
   --world-size 2 \
   --data-cursor-start 0 \
   | tee "${DATA_PLAN_OUTPUT}"
 
-cargo run -- qwen-sft-streaming-batch-plan \
+cargo run -- qwen sft-streaming-batch-plan \
   --config "${CONFIG}" \
   --world-size 2 \
   --data-cursor-start 0 \

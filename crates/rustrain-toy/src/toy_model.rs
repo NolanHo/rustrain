@@ -3,7 +3,7 @@ use rand::{SeedableRng, rngs::StdRng};
 use rand_distr::{Distribution, Normal};
 use serde::{Deserialize, Serialize};
 
-use crate::runtime::ModelConfig;
+use rustrain_core::runtime::ModelConfig;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QwenLikeModel {

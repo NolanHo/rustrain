@@ -20,14 +20,14 @@ python scripts/export_instruction_arrow_jsonl.py \
   --metadata-output "${DATA_DIR}/export_metadata.json"
 
 ARROW_SUMMARY_OUTPUT="${WORK_DIR}/arrow-source-summary.out"
-cargo run -- qwen-sft-arrow-source-summary \
+cargo run -- qwen sft-arrow-source-summary \
   --input "${HF_ARROW}" \
   --limit 128 \
   --response-column output \
   | tee "${ARROW_SUMMARY_OUTPUT}"
 
 ARROW_BATCH_OUTPUT="${WORK_DIR}/arrow-batch-plan.out"
-cargo run -- qwen-sft-arrow-batch-plan \
+cargo run -- qwen sft-arrow-batch-plan \
   --input "${HF_ARROW}" \
   --model-path "/vePFS-Mindverse/share/huggingface/Qwen2.5-0.5B-Instruct" \
   --world-size 2 \
@@ -175,39 +175,39 @@ ARROW_DATA_OUTPUT="${WORK_DIR}/arrow-config-data-plan.out"
 ARROW_CONFIG_BATCH_OUTPUT="${WORK_DIR}/arrow-config-batch-plan.out"
 CACHE_PATH="${WORK_DIR}/offset-index.json"
 
-cargo run -- qwen-sft-streaming-data-plan \
+cargo run -- qwen sft-streaming-data-plan \
   --config "${CONFIG}" \
   --world-size 2 \
   --data-cursor-start 94 \
   | tee "${DATA_OUTPUT}"
 
-cargo run -- qwen-sft-streaming-batch-plan \
+cargo run -- qwen sft-streaming-batch-plan \
   --config "${CONFIG}" \
   --world-size 2 \
   --data-cursor-start 94 \
   | tee "${BATCH_OUTPUT}"
 
-cargo run -- qwen-sft-streaming-batch-plan \
+cargo run -- qwen sft-streaming-batch-plan \
   --config "${CONFIG}" \
   --world-size 2 \
   --data-cursor-start 94 \
   --index-cache "${CACHE_PATH}" \
   | tee "${CACHE_FIRST_OUTPUT}"
 
-cargo run -- qwen-sft-streaming-batch-plan \
+cargo run -- qwen sft-streaming-batch-plan \
   --config "${CONFIG}" \
   --world-size 2 \
   --data-cursor-start 94 \
   --index-cache "${CACHE_PATH}" \
   | tee "${CACHE_SECOND_OUTPUT}"
 
-cargo run -- qwen-sft-streaming-data-plan \
+cargo run -- qwen sft-streaming-data-plan \
   --config "${ARROW_CONFIG}" \
   --world-size 2 \
   --data-cursor-start 94 \
   | tee "${ARROW_DATA_OUTPUT}"
 
-cargo run -- qwen-sft-streaming-batch-plan \
+cargo run -- qwen sft-streaming-batch-plan \
   --config "${ARROW_CONFIG}" \
   --world-size 2 \
   --data-cursor-start 94 \

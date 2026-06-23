@@ -10,7 +10,7 @@ MODEL_PATH="${RUSTRAIN_QWEN_TP_ATTENTION_MODEL_PATH:-/vePFS-Mindverse/share/hugg
 cargo run -- launch \
   --nproc-per-node 2 \
   --output-dir "${OUTPUT_DIR}" \
-  qwen-tp-attention-rank-smoke \
+  qwen tp-attention-rank-smoke \
   --model-path "${MODEL_PATH}" \
   --output-dir "${OUTPUT_DIR}/ranks"
 

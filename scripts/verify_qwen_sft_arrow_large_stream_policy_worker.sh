@@ -114,7 +114,7 @@ text = text.replace(
 config.write_text(text)
 PY
 
-if cargo run -- qwen-sft-streaming-data-plan \
+if cargo run -- qwen sft-streaming-data-plan \
   --config "${UNBOUNDED_CONFIG}" \
   --world-size 1 \
   --data-cursor-start 0 >"${ERROR_OUTPUT}" 2>&1; then
@@ -127,12 +127,12 @@ if ! grep -q "requires data.max_samples, data.source_max_samples, or an index ca
   exit 1
 fi
 
-cargo run -- qwen-sft-streaming-data-plan \
+cargo run -- qwen sft-streaming-data-plan \
   --config "${CACHED_CONFIG}" \
   --world-size 1 \
   --data-cursor-start 0 \
   | tee "${FIRST_PLAN_OUTPUT}"
-cargo run -- qwen-sft-streaming-data-plan \
+cargo run -- qwen sft-streaming-data-plan \
   --config "${CACHED_CONFIG}" \
   --world-size 1 \
   --data-cursor-start 0 \

@@ -33,6 +33,7 @@ impl Backend for NdArrayBackend {
     }
 }
 
+#[cfg(feature = "tch")]
 impl Backend for TchBackend {
     fn kind(&self) -> BackendKind {
         BackendKind::Tch
@@ -47,6 +48,7 @@ impl Backend for TchBackend {
     }
 }
 
+#[cfg(feature = "tch")]
 pub fn tch_cpu_autograd_smoke() -> bool {
     let weight = tch::Tensor::from_slice(&[1.0_f32, -2.0, 0.5, 3.0])
         .reshape([2, 2])
@@ -74,6 +76,7 @@ mod tests {
         assert!(!backend.supports_cuda());
     }
 
+    #[cfg(feature = "tch")]
     #[test]
     fn tch_backend_reports_autograd_and_runs_cpu_backward() {
         let backend = TchBackend;

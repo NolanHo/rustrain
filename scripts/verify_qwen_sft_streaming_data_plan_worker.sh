@@ -16,7 +16,7 @@ UNCACHED_OUTPUT="${WORK_DIR}/uncached.out"
 CACHE_FIRST_OUTPUT="${WORK_DIR}/cache-first.out"
 CACHE_SECOND_OUTPUT="${WORK_DIR}/cache-second.out"
 
-cargo run -- qwen-sft-streaming-data-plan \
+cargo run -- qwen sft-streaming-data-plan \
   --config "${CONFIG}" \
   --world-size 2 \
   --data-cursor-start 2 \
@@ -36,13 +36,13 @@ if needle not in text:
 target.write_text(text.replace(needle, needle + f'index_cache = "{cache}"\n', 1), encoding="utf-8")
 PY
 
-cargo run -- qwen-sft-streaming-data-plan \
+cargo run -- qwen sft-streaming-data-plan \
   --config "${CONFIG_WITH_CACHE}" \
   --world-size 2 \
   --data-cursor-start 2 \
   | tee "${CACHE_FIRST_OUTPUT}"
 
-cargo run -- qwen-sft-streaming-data-plan \
+cargo run -- qwen sft-streaming-data-plan \
   --config "${CONFIG_WITH_CACHE}" \
   --world-size 2 \
   --data-cursor-start 2 \

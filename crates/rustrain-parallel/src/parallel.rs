@@ -1,6 +1,6 @@
 use ndarray::Array2;
 
-use crate::runtime::ParallelConfig;
+use rustrain_core::runtime::ParallelConfig;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RankInfo {
@@ -56,7 +56,7 @@ mod tests {
     use ndarray::array;
 
     use super::*;
-    use crate::runtime::ParallelConfig;
+    use rustrain_core::runtime::ParallelConfig;
 
     fn single_rank_config() -> ParallelConfig {
         ParallelConfig {

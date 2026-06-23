@@ -19,14 +19,21 @@ use tch::{Device, IndexOp, Kind, Reduction, Tensor, no_grad};
 use tokenizers::Tokenizer;
 use tracing::info;
 
-use crate::nccl_smoke;
-use crate::runtime::{
+use rustrain_checkpoint::io::{
+    delta_manifest_path, optimizer_state_path, qwen_lora_sft_adapter_manifest_path,
+    read_qwen_lora_sft_resume_manifest, write_qwen_delta_manifest,
+    write_qwen_lora_sft_adapter_manifest,
+};
+use rustrain_checkpoint::manifest::*;
+use rustrain_checkpoint::safetensors::{read_safetensors_map, tensor};
+use rustrain_core::runtime::{
     Config, DataConfig as RuntimeDataConfig, DataKind as RuntimeDataKind, Device as RuntimeDevice,
     FieldAffix, FieldCaseTransform, FieldCaseTransformKind, FieldDefault, FieldDefaultTarget,
     FieldRegexFilter, FieldRegexReplacement, FieldReplacement, FieldReplacementTarget, FieldSplit,
     FieldSplitSide, FieldStrip, FieldTransform, FieldTransformOp, FieldTruncation,
     LoraConfig as RuntimeLoraConfig, LrScheduler, RunPaths, load_config,
 };
+use rustrain_nccl::nccl_smoke;
 
 #[derive(Debug, Serialize)]
 pub struct DiffStats {
@@ -425,129 +432,86 @@ struct QwenLoraTrainSmokeSummary {
 }
 
 #[derive(Debug, Serialize)]
-pub(crate) struct QwenLoraSftTrainSummary {
-    pub(crate) model_path: String,
-    pub(crate) adapter_output: String,
-    pub(crate) adapter_manifest_output: String,
-    pub(crate) compute_kind: String,
-    pub(crate) step_adapter_checkpoints: Vec<String>,
-    pub(crate) resume_from: Option<String>,
-    pub(crate) resumed_adapter: bool,
-    pub(crate) target_layers: Vec<usize>,
-    pub(crate) target_modules: Vec<String>,
-    pub(crate) train_samples: usize,
-    pub(crate) eval_samples: usize,
-    pub(crate) dataset_total_samples: usize,
-    pub(crate) dataset_total_tokens: usize,
-    pub(crate) dataset_response_tokens: usize,
-    pub(crate) dataset_masked_positions: usize,
-    pub(crate) dataset_max_sequence_tokens: usize,
-    pub(crate) dataset_source_files: Vec<String>,
-    pub(crate) dataset_source_sample_counts: Vec<QwenSftSourceSampleCount>,
-    pub(crate) dataset_fingerprint: String,
-    pub(crate) dataset_order_seed: u64,
-    pub(crate) dataset_shuffle: bool,
-    pub(crate) streaming_train_batches: bool,
-    pub(crate) streaming_index_cache_path: Option<String>,
-    pub(crate) streaming_index_cache_hit: bool,
-    pub(crate) streaming_index_cache_written: bool,
-    pub(crate) data_cursor_start: usize,
-    pub(crate) data_cursor_end: usize,
-    pub(crate) data_cursor_next: usize,
-    pub(crate) data_epoch_start: usize,
-    pub(crate) data_epoch_end: usize,
-    pub(crate) data_epoch_next: usize,
-    pub(crate) data_sample_offset_start: usize,
-    pub(crate) data_sample_offset_end: usize,
-    pub(crate) data_sample_offset_next: usize,
-    pub(crate) batch_size: usize,
-    pub(crate) global_batch_size: usize,
-    pub(crate) gradient_accumulation_steps: usize,
-    pub(crate) eval_batch_size: usize,
-    pub(crate) prompt_tokens: Vec<usize>,
-    pub(crate) response_tokens: Vec<usize>,
-    pub(crate) sequence_tokens: usize,
-    pub(crate) response_masked_positions: usize,
-    pub(crate) padding_tokens: usize,
-    pub(crate) rank: i64,
-    pub(crate) alpha: f64,
-    pub(crate) learning_rate: f64,
-    pub(crate) final_learning_rate: f64,
-    pub(crate) steps: usize,
-    pub(crate) initial_loss: f64,
-    pub(crate) final_loss: f64,
-    pub(crate) initial_eval_loss: f64,
-    pub(crate) eval_history: Vec<QwenLoraSftEvalStep>,
-    pub(crate) final_eval_loss: f64,
-    pub(crate) reloaded_eval_loss: f64,
-    pub(crate) eval_reload_delta: f64,
-    pub(crate) reloaded_loss: f64,
-    pub(crate) reload_delta: f64,
-    pub(crate) full_forward_adapter_delta: f64,
-    pub(crate) full_forward_reload_delta: f64,
-    pub(crate) full_forward_merge_delta: f64,
-    pub(crate) full_forward_unmerge_delta: f64,
-    pub(crate) full_generate_reload_match: bool,
-    pub(crate) full_generate_merge_match: bool,
-    pub(crate) full_generate_new_token_ids: Vec<i64>,
-    pub(crate) base_requires_grad: bool,
-    pub(crate) first_step_grad_norm: f64,
-    pub(crate) final_step_grad_norm: f64,
-    pub(crate) final_step_clipped_grad_norm: f64,
-    pub(crate) tokens_per_second: f64,
-    pub(crate) samples_per_second: f64,
-    pub(crate) memory_rss_mb: Option<f64>,
-    pub(crate) gpu_memory_allocated_mb: Option<f64>,
-    pub(crate) trainable_tensors: Vec<TrainableTensorSummary>,
+pub struct QwenLoraSftTrainSummary {
+    pub model_path: String,
+    pub adapter_output: String,
+    pub adapter_manifest_output: String,
+    pub compute_kind: String,
+    pub step_adapter_checkpoints: Vec<String>,
+    pub resume_from: Option<String>,
+    pub resumed_adapter: bool,
+    pub target_layers: Vec<usize>,
+    pub target_modules: Vec<String>,
+    pub train_samples: usize,
+    pub eval_samples: usize,
+    pub dataset_total_samples: usize,
+    pub dataset_total_tokens: usize,
+    pub dataset_response_tokens: usize,
+    pub dataset_masked_positions: usize,
+    pub dataset_max_sequence_tokens: usize,
+    pub dataset_source_files: Vec<String>,
+    pub dataset_source_sample_counts: Vec<QwenSftSourceSampleCount>,
+    pub dataset_fingerprint: String,
+    pub dataset_order_seed: u64,
+    pub dataset_shuffle: bool,
+    pub streaming_train_batches: bool,
+    pub streaming_index_cache_path: Option<String>,
+    pub streaming_index_cache_hit: bool,
+    pub streaming_index_cache_written: bool,
+    pub data_cursor_start: usize,
+    pub data_cursor_end: usize,
+    pub data_cursor_next: usize,
+    pub data_epoch_start: usize,
+    pub data_epoch_end: usize,
+    pub data_epoch_next: usize,
+    pub data_sample_offset_start: usize,
+    pub data_sample_offset_end: usize,
+    pub data_sample_offset_next: usize,
+    pub batch_size: usize,
+    pub global_batch_size: usize,
+    pub gradient_accumulation_steps: usize,
+    pub eval_batch_size: usize,
+    pub prompt_tokens: Vec<usize>,
+    pub response_tokens: Vec<usize>,
+    pub sequence_tokens: usize,
+    pub response_masked_positions: usize,
+    pub padding_tokens: usize,
+    pub rank: i64,
+    pub alpha: f64,
+    pub learning_rate: f64,
+    pub final_learning_rate: f64,
+    pub steps: usize,
+    pub initial_loss: f64,
+    pub final_loss: f64,
+    pub initial_eval_loss: f64,
+    pub eval_history: Vec<QwenLoraSftEvalStep>,
+    pub final_eval_loss: f64,
+    pub reloaded_eval_loss: f64,
+    pub eval_reload_delta: f64,
+    pub reloaded_loss: f64,
+    pub reload_delta: f64,
+    pub full_forward_adapter_delta: f64,
+    pub full_forward_reload_delta: f64,
+    pub full_forward_merge_delta: f64,
+    pub full_forward_unmerge_delta: f64,
+    pub full_generate_reload_match: bool,
+    pub full_generate_merge_match: bool,
+    pub full_generate_new_token_ids: Vec<i64>,
+    pub base_requires_grad: bool,
+    pub first_step_grad_norm: f64,
+    pub final_step_grad_norm: f64,
+    pub final_step_clipped_grad_norm: f64,
+    pub tokens_per_second: f64,
+    pub samples_per_second: f64,
+    pub memory_rss_mb: Option<f64>,
+    pub gpu_memory_allocated_mb: Option<f64>,
+    pub trainable_tensors: Vec<TrainableTensorSummary>,
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub(crate) struct QwenLoraSftEvalStep {
-    pub(crate) step: usize,
-    pub(crate) eval_loss: f64,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct QwenLoraSftAdapterManifest {
-    format: String,
-    base_model_path: String,
-    adapter_safetensors: String,
-    compute_kind: String,
-    steps: usize,
-    train_step: u64,
-    data_cursor_start: usize,
-    data_cursor_end: usize,
-    data_cursor_next: usize,
-    #[serde(default)]
-    data_epoch_start: usize,
-    #[serde(default)]
-    data_epoch_end: usize,
-    #[serde(default)]
-    data_epoch_next: usize,
-    #[serde(default)]
-    data_sample_offset_start: usize,
-    #[serde(default)]
-    data_sample_offset_end: usize,
-    #[serde(default)]
-    data_sample_offset_next: usize,
-    #[serde(default)]
-    dataset_source_files: Vec<String>,
-    #[serde(default)]
-    dataset_source_sample_counts: Vec<QwenSftSourceSampleCount>,
-    #[serde(default)]
-    dataset_fingerprint: String,
-    dataset_order_seed: u64,
-    #[serde(default = "qwen_manifest_default_dataset_shuffle")]
-    dataset_shuffle: bool,
-    #[serde(default)]
-    streaming_train_batches: bool,
-    dataset_total_samples: usize,
-    dataset_train_samples: usize,
-    dataset_eval_samples: usize,
-    batch_size: usize,
-    gradient_accumulation_steps: usize,
-    target_layers: Vec<usize>,
-    target_modules: Vec<String>,
+pub struct QwenLoraSftEvalStep {
+    pub step: usize,
+    pub eval_loss: f64,
 }
 
 #[derive(Debug, Serialize)]
@@ -566,65 +530,65 @@ struct QwenTiedHeadTrainSummary {
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub(crate) struct TrainableTensorSummary {
-    pub(crate) name: String,
-    pub(crate) grad_defined: bool,
-    pub(crate) grad_norm: f64,
-    pub(crate) delta_norm: f64,
+pub struct TrainableTensorSummary {
+    pub name: String,
+    pub grad_defined: bool,
+    pub grad_norm: f64,
+    pub delta_norm: f64,
 }
 
 #[derive(Debug, Serialize)]
-pub(crate) struct QwenFullTrainSmokeSummary {
-    pub(crate) model_path: String,
-    pub(crate) reference_fixture: String,
-    pub(crate) delta_output: String,
-    pub(crate) optimizer_output: String,
-    pub(crate) manifest_output: String,
-    pub(crate) compute_kind: String,
-    pub(crate) resume_from: Option<String>,
-    pub(crate) resumed_checkpoint: bool,
-    pub(crate) train_steps: usize,
-    pub(crate) learning_rate: f64,
-    pub(crate) step_losses: Vec<f64>,
-    pub(crate) first_step_grad_norm: f64,
-    pub(crate) final_step_grad_norm: f64,
-    pub(crate) tokens_per_second: f64,
-    pub(crate) samples_per_second: f64,
-    pub(crate) memory_rss_mb: Option<f64>,
-    pub(crate) gpu_memory_allocated_mb: Option<f64>,
-    pub(crate) dataset_total_samples: Option<usize>,
-    pub(crate) dataset_total_tokens: Option<usize>,
-    pub(crate) dataset_train_samples: Option<usize>,
-    pub(crate) dataset_eval_samples: Option<usize>,
-    pub(crate) dataset_source_files: Option<Vec<String>>,
-    pub(crate) dataset_source_sample_counts: Option<Vec<QwenSftSourceSampleCount>>,
-    pub(crate) dataset_fingerprint: Option<String>,
-    pub(crate) dataset_order_seed: Option<u64>,
-    pub(crate) dataset_shuffle: Option<bool>,
-    pub(crate) streaming_train_batches: Option<bool>,
-    pub(crate) streaming_index_cache_path: Option<String>,
-    pub(crate) streaming_index_cache_hit: Option<bool>,
-    pub(crate) streaming_index_cache_written: Option<bool>,
-    pub(crate) data_cursor_start: Option<usize>,
-    pub(crate) data_cursor_end: Option<usize>,
-    pub(crate) data_cursor_next: Option<usize>,
-    pub(crate) data_epoch_start: Option<usize>,
-    pub(crate) data_epoch_end: Option<usize>,
-    pub(crate) data_epoch_next: Option<usize>,
-    pub(crate) data_sample_offset_start: Option<usize>,
-    pub(crate) data_sample_offset_end: Option<usize>,
-    pub(crate) data_sample_offset_next: Option<usize>,
-    pub(crate) batch_size: usize,
-    pub(crate) sequence_tokens: usize,
-    pub(crate) initial_loss: f64,
-    pub(crate) final_loss: f64,
-    pub(crate) reloaded_loss: f64,
-    pub(crate) reload_delta: f64,
-    pub(crate) resume_loss: f64,
-    pub(crate) continuous_second_loss: f64,
-    pub(crate) resumed_second_loss: f64,
-    pub(crate) second_step_delta: f64,
-    pub(crate) trainable_tensors: Vec<TrainableTensorSummary>,
+pub struct QwenFullTrainSmokeSummary {
+    pub model_path: String,
+    pub reference_fixture: String,
+    pub delta_output: String,
+    pub optimizer_output: String,
+    pub manifest_output: String,
+    pub compute_kind: String,
+    pub resume_from: Option<String>,
+    pub resumed_checkpoint: bool,
+    pub train_steps: usize,
+    pub learning_rate: f64,
+    pub step_losses: Vec<f64>,
+    pub first_step_grad_norm: f64,
+    pub final_step_grad_norm: f64,
+    pub tokens_per_second: f64,
+    pub samples_per_second: f64,
+    pub memory_rss_mb: Option<f64>,
+    pub gpu_memory_allocated_mb: Option<f64>,
+    pub dataset_total_samples: Option<usize>,
+    pub dataset_total_tokens: Option<usize>,
+    pub dataset_train_samples: Option<usize>,
+    pub dataset_eval_samples: Option<usize>,
+    pub dataset_source_files: Option<Vec<String>>,
+    pub dataset_source_sample_counts: Option<Vec<QwenSftSourceSampleCount>>,
+    pub dataset_fingerprint: Option<String>,
+    pub dataset_order_seed: Option<u64>,
+    pub dataset_shuffle: Option<bool>,
+    pub streaming_train_batches: Option<bool>,
+    pub streaming_index_cache_path: Option<String>,
+    pub streaming_index_cache_hit: Option<bool>,
+    pub streaming_index_cache_written: Option<bool>,
+    pub data_cursor_start: Option<usize>,
+    pub data_cursor_end: Option<usize>,
+    pub data_cursor_next: Option<usize>,
+    pub data_epoch_start: Option<usize>,
+    pub data_epoch_end: Option<usize>,
+    pub data_epoch_next: Option<usize>,
+    pub data_sample_offset_start: Option<usize>,
+    pub data_sample_offset_end: Option<usize>,
+    pub data_sample_offset_next: Option<usize>,
+    pub batch_size: usize,
+    pub sequence_tokens: usize,
+    pub initial_loss: f64,
+    pub final_loss: f64,
+    pub reloaded_loss: f64,
+    pub reload_delta: f64,
+    pub resume_loss: f64,
+    pub continuous_second_loss: f64,
+    pub resumed_second_loss: f64,
+    pub second_step_delta: f64,
+    pub trainable_tensors: Vec<TrainableTensorSummary>,
 }
 
 #[derive(Debug, Serialize)]
@@ -746,683 +710,11 @@ struct QwenSessionDpDataPlanSummary {
     streaming_train_batches: bool,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-struct QwenSessionDpCheckpointManifest {
-    format: String,
-    base_model_path: String,
-    writer_rank: usize,
-    world_size: usize,
-    tensor_count: usize,
-    max_grad_delta: f32,
-    expected_loss: f64,
-    dtype: String,
-    steps: usize,
-    train_step: u64,
-    #[serde(default)]
-    data_cursor_start: Option<usize>,
-    #[serde(default)]
-    data_cursor_end: Option<usize>,
-    #[serde(default)]
-    data_cursor_next: Option<usize>,
-    #[serde(default)]
-    data_epoch_start: Option<usize>,
-    #[serde(default)]
-    data_epoch_end: Option<usize>,
-    #[serde(default)]
-    data_epoch_next: Option<usize>,
-    #[serde(default)]
-    data_sample_offset_start: Option<usize>,
-    #[serde(default)]
-    data_sample_offset_end: Option<usize>,
-    #[serde(default)]
-    data_sample_offset_next: Option<usize>,
-    #[serde(default)]
-    dataset_source_files: Vec<String>,
-    #[serde(default)]
-    dataset_source_sample_counts: Vec<QwenSftSourceSampleCount>,
-    #[serde(default)]
-    dataset_fingerprint: String,
-    #[serde(default = "qwen_manifest_default_dataset_shuffle")]
-    dataset_shuffle: bool,
-    #[serde(default)]
-    streaming_train_batches: Option<bool>,
-    learning_rate: f64,
-    delta_safetensors: String,
-    optimizer_safetensors: String,
-    post_update_loss: f64,
-    global_post_update_loss: f64,
-    global_step_losses: Vec<f64>,
-    trainable_tensors: Vec<String>,
-    tensors: Vec<QwenDeltaTensorManifestEntry>,
-}
-
-impl QwenSessionDpCheckpointManifest {
-    fn to_delta_manifest(&self) -> Result<QwenDeltaCheckpointManifest> {
-        if self.format != "rustrain.qwen_session_dp_rank0.v1" {
-            bail!(
-                "unsupported Qwen session DP checkpoint format {}",
-                self.format
-            );
-        }
-        Ok(QwenDeltaCheckpointManifest {
-            format: "rustrain.qwen_delta.v1".to_string(),
-            base_model_path: self.base_model_path.clone(),
-            reference_fixture: "qwen_session_dp_global_input".to_string(),
-            delta_safetensors: self.delta_safetensors.clone(),
-            optimizer_safetensors: Some(self.optimizer_safetensors.clone()),
-            train_step: self.train_step,
-            data_cursor_start: self.data_cursor_start,
-            data_cursor_end: self.data_cursor_end,
-            data_cursor_next: self.data_cursor_next,
-            data_epoch_start: self.data_epoch_start,
-            data_epoch_end: self.data_epoch_end,
-            data_epoch_next: self.data_epoch_next,
-            data_sample_offset_start: self.data_sample_offset_start,
-            data_sample_offset_end: self.data_sample_offset_end,
-            data_sample_offset_next: self.data_sample_offset_next,
-            dataset_source_files: self.dataset_source_files.clone(),
-            dataset_source_sample_counts: self.dataset_source_sample_counts.clone(),
-            dataset_fingerprint: self.dataset_fingerprint.clone(),
-            dataset_shuffle: self.dataset_shuffle,
-            streaming_train_batches: self.streaming_train_batches,
-            learning_rate: self.learning_rate,
-            initial_loss: self.expected_loss,
-            final_loss: self.global_post_update_loss,
-            tensors: self.tensors.clone(),
-        })
-    }
-}
-
-#[allow(dead_code)]
-impl QwenShardedCheckpointManifest {
-    fn validate(&self) -> Result<()> {
-        if self.format != "rustrain.qwen_sharded.v1" {
-            bail!("unsupported Qwen sharded checkpoint format {}", self.format);
-        }
-        if self.base_model_path.is_empty() {
-            bail!("Qwen sharded checkpoint requires base_model_path");
-        }
-        if self.tokenizer_path.is_empty() {
-            bail!("Qwen sharded checkpoint requires tokenizer_path");
-        }
-        if self.dtype.is_empty() {
-            bail!("Qwen sharded checkpoint requires dtype");
-        }
-        if self.optimizer.is_empty() {
-            bail!("Qwen sharded checkpoint requires optimizer");
-        }
-        if self.scheduler.is_empty() {
-            bail!("Qwen sharded checkpoint requires scheduler");
-        }
-        if self.global_step == 0 {
-            bail!("Qwen sharded checkpoint global_step must be positive");
-        }
-        if self.consumed_samples == 0 {
-            bail!("Qwen sharded checkpoint consumed_samples must be positive");
-        }
-        if self.consumed_tokens == 0 {
-            bail!("Qwen sharded checkpoint consumed_tokens must be positive");
-        }
-        if !self.dataset_fingerprint.is_empty() {
-            if self.dataset_source_files.is_empty() {
-                bail!("Qwen sharded checkpoint dataset_fingerprint requires dataset_source_files");
-            }
-            if self
-                .dataset_source_files
-                .iter()
-                .any(|source| !source.ends_with(".jsonl") && !source.ends_with(".arrow"))
-            {
-                bail!(
-                    "Qwen sharded checkpoint dataset_source_files must only contain JSONL or Arrow paths"
-                );
-            }
-            if !self.dataset_source_sample_counts.is_empty() {
-                let count_paths = self
-                    .dataset_source_sample_counts
-                    .iter()
-                    .map(|entry| entry.path.clone())
-                    .collect::<Vec<_>>();
-                if count_paths != self.dataset_source_files {
-                    bail!(
-                        "Qwen sharded checkpoint dataset_source_sample_counts must match dataset_source_files"
-                    );
-                }
-                if self
-                    .dataset_source_sample_counts
-                    .iter()
-                    .any(|entry| entry.samples == 0)
-                {
-                    bail!("Qwen sharded checkpoint dataset_source_sample_counts must be positive");
-                }
-            }
-        } else if !self.dataset_source_files.is_empty() {
-            bail!("Qwen sharded checkpoint dataset_source_files require dataset_fingerprint");
-        } else if !self.dataset_source_sample_counts.is_empty() {
-            bail!(
-                "Qwen sharded checkpoint dataset_source_sample_counts require dataset_fingerprint"
-            );
-        }
-        if let Some(data_cursor_next) = self.data_cursor_next {
-            if data_cursor_next != self.consumed_samples {
-                bail!(
-                    "Qwen sharded checkpoint data_cursor_next {data_cursor_next} must match consumed_samples {}",
-                    self.consumed_samples
-                );
-            }
-        }
-        if let Some(data_train_samples) = self.data_train_samples {
-            if data_train_samples == 0 {
-                bail!("Qwen sharded checkpoint data_train_samples must be positive");
-            }
-            if let Some(data_epoch_next) = self.data_epoch_next {
-                let expected_epoch = self.consumed_samples / data_train_samples;
-                if data_epoch_next != expected_epoch {
-                    bail!(
-                        "Qwen sharded checkpoint data_epoch_next {data_epoch_next} must match consumed_samples/data_train_samples {expected_epoch}"
-                    );
-                }
-            }
-            if let Some(data_sample_offset_next) = self.data_sample_offset_next {
-                let expected_offset = self.consumed_samples % data_train_samples;
-                if data_sample_offset_next != expected_offset {
-                    bail!(
-                        "Qwen sharded checkpoint data_sample_offset_next {data_sample_offset_next} must match consumed_samples%data_train_samples {expected_offset}"
-                    );
-                }
-            }
-        }
-        let expected_world_size = self.parallel.world_size()?;
-        if self.ranks.len() != expected_world_size {
-            bail!(
-                "Qwen sharded checkpoint rank manifest count {} does not match world size {expected_world_size}",
-                self.ranks.len()
-            );
-        }
-
-        let mut seen_ranks = BTreeSet::new();
-        let mut seen_rank_axes = BTreeSet::new();
-        for rank in &self.ranks {
-            if !seen_ranks.insert(rank.rank) {
-                bail!(
-                    "Qwen sharded checkpoint contains duplicate rank {}",
-                    rank.rank
-                );
-            }
-            if rank.rank >= expected_world_size {
-                bail!(
-                    "Qwen sharded checkpoint rank {} exceeds world size {expected_world_size}",
-                    rank.rank
-                );
-            }
-            self.parallel.validate_rank(rank)?;
-            let rank_axes = (
-                rank.data_parallel_rank,
-                rank.tensor_model_parallel_rank,
-                rank.pipeline_model_parallel_rank,
-                rank.expert_model_parallel_rank,
-                rank.context_parallel_rank,
-            );
-            if !seen_rank_axes.insert(rank_axes) {
-                bail!(
-                    "Qwen sharded checkpoint contains duplicate parallel rank axes {:?}",
-                    rank_axes
-                );
-            }
-            let expected_linear_rank = self.parallel.linear_rank(rank);
-            if rank.rank != expected_linear_rank {
-                bail!(
-                    "Qwen sharded checkpoint rank {} does not match linear parallel rank {}",
-                    rank.rank,
-                    expected_linear_rank
-                );
-            }
-            if rank.model_safetensors.is_empty() {
-                bail!(
-                    "Qwen sharded checkpoint rank {} is missing model_safetensors",
-                    rank.rank
-                );
-            }
-            if rank.optimizer_safetensors.is_empty() {
-                bail!(
-                    "Qwen sharded checkpoint rank {} is missing optimizer_safetensors",
-                    rank.rank
-                );
-            }
-            if rank.shards.is_empty() {
-                bail!(
-                    "Qwen sharded checkpoint rank {} must own at least one tensor shard",
-                    rank.rank
-                );
-            }
-            let mut seen_tensor_names = BTreeSet::new();
-            let mut seen_model_shards = BTreeSet::new();
-            let mut seen_optimizer_slots = BTreeSet::new();
-            for shard in &rank.shards {
-                shard.validate(rank.rank)?;
-                if !seen_tensor_names.insert(shard.name.as_str()) {
-                    bail!(
-                        "Qwen sharded checkpoint rank {} contains duplicate tensor shard {}",
-                        rank.rank,
-                        shard.name
-                    );
-                }
-                if !seen_model_shards.insert(shard.shard_name.as_str()) {
-                    bail!(
-                        "Qwen sharded checkpoint rank {} contains duplicate shard_name {}",
-                        rank.rank,
-                        shard.shard_name
-                    );
-                }
-                for slot in [&shard.optimizer_m_name, &shard.optimizer_v_name] {
-                    if !seen_optimizer_slots.insert(slot.as_str()) {
-                        bail!(
-                            "Qwen sharded checkpoint rank {} contains duplicate optimizer slot {}",
-                            rank.rank,
-                            slot
-                        );
-                    }
-                    if slot == &shard.shard_name {
-                        bail!(
-                            "Qwen sharded checkpoint rank {} tensor {} optimizer slot {} collides with shard_name",
-                            rank.rank,
-                            shard.name,
-                            slot
-                        );
-                    }
-                }
-            }
-        }
-        for expected_rank in 0..expected_world_size {
-            if !seen_ranks.contains(&expected_rank) {
-                bail!("Qwen sharded checkpoint is missing rank {expected_rank}");
-            }
-        }
-        Ok(())
-    }
-
-    fn validate_artifacts(&self) -> Result<()> {
-        self.validate()?;
-        for rank in &self.ranks {
-            let model_tensors = read_safetensors_map(Path::new(&rank.model_safetensors))
-                .with_context(|| {
-                    format!(
-                        "failed to validate Qwen sharded checkpoint rank {} model artifacts",
-                        rank.rank
-                    )
-                })?;
-            let optimizer_tensors = read_safetensors_map(Path::new(&rank.optimizer_safetensors))
-                .with_context(|| {
-                    format!(
-                        "failed to validate Qwen sharded checkpoint rank {} optimizer artifacts",
-                        rank.rank
-                    )
-                })?;
-            for shard in &rank.shards {
-                let model_tensor =
-                    tensor(&model_tensors, &shard.shard_name).with_context(|| {
-                        format!(
-                            "Qwen sharded checkpoint rank {} missing model shard {} for {}",
-                            rank.rank, shard.shard_name, shard.name
-                        )
-                    })?;
-                if model_tensor.size() != shard.shard_shape {
-                    bail!(
-                        "Qwen sharded checkpoint rank {} model shard {} shape {:?} does not match manifest shard_shape {:?}",
-                        rank.rank,
-                        shard.shard_name,
-                        model_tensor.size(),
-                        shard.shard_shape
-                    );
-                }
-                let optimizer_m = tensor(&optimizer_tensors, &shard.optimizer_m_name)
-                    .with_context(|| {
-                        format!(
-                            "Qwen sharded checkpoint rank {} missing optimizer m slot {} for {}",
-                            rank.rank, shard.optimizer_m_name, shard.name
-                        )
-                    })?;
-                let optimizer_v = tensor(&optimizer_tensors, &shard.optimizer_v_name)
-                    .with_context(|| {
-                        format!(
-                            "Qwen sharded checkpoint rank {} missing optimizer v slot {} for {}",
-                            rank.rank, shard.optimizer_v_name, shard.name
-                        )
-                    })?;
-                if optimizer_m.size() != shard.shard_shape {
-                    bail!(
-                        "Qwen sharded checkpoint rank {} optimizer m slot {} shape {:?} does not match manifest shard_shape {:?}",
-                        rank.rank,
-                        shard.optimizer_m_name,
-                        optimizer_m.size(),
-                        shard.shard_shape
-                    );
-                }
-                if optimizer_v.size() != shard.shard_shape {
-                    bail!(
-                        "Qwen sharded checkpoint rank {} optimizer v slot {} shape {:?} does not match manifest shard_shape {:?}",
-                        rank.rank,
-                        shard.optimizer_v_name,
-                        optimizer_v.size(),
-                        shard.shard_shape
-                    );
-                }
-            }
-        }
-        Ok(())
-    }
-}
-
-#[allow(dead_code)]
-impl QwenShardedParallelManifest {
-    fn world_size(&self) -> Result<usize> {
-        let sizes = [
-            self.data_parallel_size,
-            self.tensor_model_parallel_size,
-            self.pipeline_model_parallel_size,
-            self.expert_model_parallel_size,
-            self.context_parallel_size,
-        ];
-        if sizes.iter().any(|size| *size == 0) {
-            bail!("Qwen sharded checkpoint parallel sizes must be positive");
-        }
-        sizes.into_iter().try_fold(1usize, |world_size, size| {
-            world_size
-                .checked_mul(size)
-                .ok_or_else(|| anyhow!("Qwen sharded checkpoint parallel world size overflowed"))
-        })
-    }
-
-    fn validate_rank(&self, rank: &QwenRankShardManifest) -> Result<()> {
-        if rank.data_parallel_rank >= self.data_parallel_size {
-            bail!(
-                "Qwen sharded checkpoint rank {} has data_parallel_rank {} outside size {}",
-                rank.rank,
-                rank.data_parallel_rank,
-                self.data_parallel_size
-            );
-        }
-        if rank.tensor_model_parallel_rank >= self.tensor_model_parallel_size {
-            bail!(
-                "Qwen sharded checkpoint rank {} has tensor_model_parallel_rank {} outside size {}",
-                rank.rank,
-                rank.tensor_model_parallel_rank,
-                self.tensor_model_parallel_size
-            );
-        }
-        if rank.pipeline_model_parallel_rank >= self.pipeline_model_parallel_size {
-            bail!(
-                "Qwen sharded checkpoint rank {} has pipeline_model_parallel_rank {} outside size {}",
-                rank.rank,
-                rank.pipeline_model_parallel_rank,
-                self.pipeline_model_parallel_size
-            );
-        }
-        if rank.expert_model_parallel_rank >= self.expert_model_parallel_size {
-            bail!(
-                "Qwen sharded checkpoint rank {} has expert_model_parallel_rank {} outside size {}",
-                rank.rank,
-                rank.expert_model_parallel_rank,
-                self.expert_model_parallel_size
-            );
-        }
-        if rank.context_parallel_rank >= self.context_parallel_size {
-            bail!(
-                "Qwen sharded checkpoint rank {} has context_parallel_rank {} outside size {}",
-                rank.rank,
-                rank.context_parallel_rank,
-                self.context_parallel_size
-            );
-        }
-        Ok(())
-    }
-
-    fn linear_rank(&self, rank: &QwenRankShardManifest) -> usize {
-        (((rank.data_parallel_rank * self.tensor_model_parallel_size
-            + rank.tensor_model_parallel_rank)
-            * self.pipeline_model_parallel_size
-            + rank.pipeline_model_parallel_rank)
-            * self.expert_model_parallel_size
-            + rank.expert_model_parallel_rank)
-            * self.context_parallel_size
-            + rank.context_parallel_rank
-    }
-}
-
-#[allow(dead_code)]
-impl QwenTensorShardManifestEntry {
-    fn validate(&self, rank: usize) -> Result<()> {
-        if self.name.is_empty() {
-            bail!("Qwen sharded checkpoint rank {rank} has a shard without a tensor name");
-        }
-        if self.shard_name.is_empty() {
-            bail!(
-                "Qwen sharded checkpoint rank {rank} tensor {} is missing shard_name",
-                self.name
-            );
-        }
-        if self.optimizer_m_name.is_empty() || self.optimizer_v_name.is_empty() {
-            bail!(
-                "Qwen sharded checkpoint rank {rank} tensor {} is missing optimizer slots",
-                self.name
-            );
-        }
-        if self.global_shape.is_empty() || self.shard_shape.is_empty() {
-            bail!(
-                "Qwen sharded checkpoint rank {rank} tensor {} is missing shape metadata",
-                self.name
-            );
-        }
-        if self.global_shape.len() != self.shard_shape.len() {
-            bail!(
-                "Qwen sharded checkpoint rank {rank} tensor {} global_shape rank {} does not match shard_shape rank {}",
-                self.name,
-                self.global_shape.len(),
-                self.shard_shape.len()
-            );
-        }
-        for (dim_index, (&global_dim, &shard_dim)) in self
-            .global_shape
-            .iter()
-            .zip(self.shard_shape.iter())
-            .enumerate()
-        {
-            if global_dim <= 0 || shard_dim <= 0 {
-                bail!(
-                    "Qwen sharded checkpoint rank {rank} tensor {} shape dim {dim_index} must be positive",
-                    self.name
-                );
-            }
-            if shard_dim > global_dim {
-                bail!(
-                    "Qwen sharded checkpoint rank {rank} tensor {} shard_shape dim {dim_index} exceeds global_shape",
-                    self.name
-                );
-            }
-        }
-        if self.dtype.is_empty() {
-            bail!(
-                "Qwen sharded checkpoint rank {rank} tensor {} is missing dtype",
-                self.name
-            );
-        }
-        if !matches!(self.dtype.as_str(), "float32" | "fp32" | "bf16") {
-            bail!(
-                "Qwen sharded checkpoint rank {rank} tensor {} has unsupported dtype {}",
-                self.name,
-                self.dtype
-            );
-        }
-        if self.partition.is_empty() {
-            bail!(
-                "Qwen sharded checkpoint rank {rank} tensor {} is missing partition policy",
-                self.name
-            );
-        }
-        if !matches!(
-            self.partition.as_str(),
-            "replicated_dp" | "replicated_norm_smoke" | "tp_row" | "tp_col"
-        ) {
-            bail!(
-                "Qwen sharded checkpoint rank {rank} tensor {} has unsupported partition policy {}",
-                self.name,
-                self.partition
-            );
-        }
-        Ok(())
-    }
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct QwenGradSignature {
     name: String,
     shape: Vec<i64>,
     samples: Vec<f32>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct QwenDpCheckpointManifest {
-    format: String,
-    writer_rank: usize,
-    world_size: usize,
-    tensor_count: usize,
-    max_grad_delta: f32,
-    expected_loss: f64,
-    dtype: String,
-    steps: usize,
-    learning_rate: f64,
-    post_update_loss: f64,
-    global_post_update_loss: f64,
-    global_step_losses: Vec<f64>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct QwenDeltaCheckpointManifest {
-    format: String,
-    base_model_path: String,
-    reference_fixture: String,
-    delta_safetensors: String,
-    #[serde(default)]
-    optimizer_safetensors: Option<String>,
-    train_step: u64,
-    #[serde(default)]
-    data_cursor_start: Option<usize>,
-    #[serde(default)]
-    data_cursor_end: Option<usize>,
-    #[serde(default)]
-    data_cursor_next: Option<usize>,
-    #[serde(default)]
-    data_epoch_start: Option<usize>,
-    #[serde(default)]
-    data_epoch_end: Option<usize>,
-    #[serde(default)]
-    data_epoch_next: Option<usize>,
-    #[serde(default)]
-    data_sample_offset_start: Option<usize>,
-    #[serde(default)]
-    data_sample_offset_end: Option<usize>,
-    #[serde(default)]
-    data_sample_offset_next: Option<usize>,
-    #[serde(default)]
-    dataset_source_files: Vec<String>,
-    #[serde(default)]
-    dataset_source_sample_counts: Vec<QwenSftSourceSampleCount>,
-    #[serde(default)]
-    dataset_fingerprint: String,
-    #[serde(default = "qwen_manifest_default_dataset_shuffle")]
-    dataset_shuffle: bool,
-    #[serde(default)]
-    streaming_train_batches: Option<bool>,
-    learning_rate: f64,
-    initial_loss: f64,
-    final_loss: f64,
-    tensors: Vec<QwenDeltaTensorManifestEntry>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct QwenDeltaTensorManifestEntry {
-    name: String,
-    delta_name: String,
-    #[serde(default)]
-    adam_m_name: Option<String>,
-    #[serde(default)]
-    adam_v_name: Option<String>,
-    shape: Vec<i64>,
-    dtype: String,
-    grad_norm: f64,
-    delta_norm: f64,
-}
-
-#[allow(dead_code)]
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct QwenShardedCheckpointManifest {
-    format: String,
-    base_model_path: String,
-    tokenizer_path: String,
-    global_step: u64,
-    consumed_samples: u64,
-    consumed_tokens: u64,
-    #[serde(default)]
-    data_cursor_next: Option<u64>,
-    #[serde(default)]
-    data_epoch_next: Option<u64>,
-    #[serde(default)]
-    data_sample_offset_next: Option<u64>,
-    #[serde(default)]
-    data_train_samples: Option<u64>,
-    #[serde(default)]
-    dataset_source_files: Vec<String>,
-    #[serde(default)]
-    dataset_source_sample_counts: Vec<QwenSftSourceSampleCount>,
-    #[serde(default)]
-    dataset_fingerprint: String,
-    #[serde(default = "qwen_manifest_default_dataset_shuffle")]
-    dataset_shuffle: bool,
-    #[serde(default)]
-    streaming_train_batches: Option<bool>,
-    seed: u64,
-    dtype: String,
-    optimizer: String,
-    scheduler: String,
-    parallel: QwenShardedParallelManifest,
-    ranks: Vec<QwenRankShardManifest>,
-}
-
-#[allow(dead_code)]
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct QwenShardedParallelManifest {
-    data_parallel_size: usize,
-    tensor_model_parallel_size: usize,
-    pipeline_model_parallel_size: usize,
-    expert_model_parallel_size: usize,
-    context_parallel_size: usize,
-}
-
-#[allow(dead_code)]
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct QwenRankShardManifest {
-    rank: usize,
-    data_parallel_rank: usize,
-    tensor_model_parallel_rank: usize,
-    pipeline_model_parallel_rank: usize,
-    expert_model_parallel_rank: usize,
-    context_parallel_rank: usize,
-    model_safetensors: String,
-    optimizer_safetensors: String,
-    shards: Vec<QwenTensorShardManifestEntry>,
-}
-
-#[allow(dead_code)]
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct QwenTensorShardManifestEntry {
-    name: String,
-    shard_name: String,
-    optimizer_m_name: String,
-    optimizer_v_name: String,
-    global_shape: Vec<i64>,
-    shard_shape: Vec<i64>,
-    dtype: String,
-    partition: String,
-    tied_group: Option<String>,
 }
 
 struct AdamSlotNames {
@@ -2688,12 +1980,6 @@ struct QwenSftArrowColumnMap {
     response: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct QwenSftSourceSampleCount {
-    pub(crate) path: String,
-    pub(crate) samples: usize,
-}
-
 #[derive(Clone)]
 struct QwenLoraSftTrainPolicy {
     lr_scheduler: LrScheduler,
@@ -2724,50 +2010,6 @@ impl QwenLoraSftTrainPolicy {
             dataset_shuffle: true,
         }
     }
-}
-
-fn qwen_manifest_default_dataset_shuffle() -> bool {
-    true
-}
-
-fn qwen_lora_sft_adapter_manifest_path(adapter_output: &Path) -> PathBuf {
-    PathBuf::from(format!("{}.json", adapter_output.display()))
-}
-
-fn read_qwen_lora_sft_resume_manifest(
-    resume_from: &Path,
-) -> Result<Option<QwenLoraSftAdapterManifest>> {
-    if resume_from.extension().and_then(|value| value.to_str()) != Some("json") {
-        return Ok(None);
-    }
-    let text = fs::read_to_string(resume_from)
-        .with_context(|| format!("failed to read {}", resume_from.display()))?;
-    let manifest: QwenLoraSftAdapterManifest = serde_json::from_str(&text)
-        .with_context(|| format!("failed to parse {}", resume_from.display()))?;
-    if manifest.format != "rustrain.qwen_lora_sft_adapter.v1" {
-        bail!(
-            "unsupported Qwen LoRA SFT adapter manifest format {}",
-            manifest.format
-        );
-    }
-    Ok(Some(manifest))
-}
-
-fn write_qwen_lora_sft_adapter_manifest(
-    manifest_output: &Path,
-    manifest: &QwenLoraSftAdapterManifest,
-) -> Result<()> {
-    if let Some(parent) = manifest_output.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create {}", parent.display()))?;
-    }
-    fs::write(
-        manifest_output,
-        serde_json::to_string_pretty(manifest)
-            .context("failed to serialize Qwen LoRA SFT adapter manifest")?
-            + "\n",
-    )
-    .with_context(|| format!("failed to write {}", manifest_output.display()))
 }
 
 fn qwen_validate_lora_resume_config(
@@ -3476,9 +2718,9 @@ pub fn train_qwen_lora_sft_from_config(
             .ok_or_else(|| anyhow!("qwen_lora_sft requires [lora] config"))?,
     )?;
     let dtype = match config.train.dtype {
-        crate::runtime::DType::Fp32 => QwenComputeDType::Fp32,
-        crate::runtime::DType::Bf16 => QwenComputeDType::Bf16,
-        crate::runtime::DType::Fp16 => {
+        rustrain_core::runtime::DType::Fp32 => QwenComputeDType::Fp32,
+        rustrain_core::runtime::DType::Bf16 => QwenComputeDType::Bf16,
+        rustrain_core::runtime::DType::Fp16 => {
             bail!("qwen LoRA SFT trainer does not support fp16 yet; use fp32 or bf16")
         }
     };
@@ -4104,8 +3346,8 @@ fn qwen_lora_sft_train(
         final_step_clipped_grad_norm,
         tokens_per_second,
         samples_per_second,
-        memory_rss_mb: crate::metrics::memory_rss_mb(),
-        gpu_memory_allocated_mb: crate::metrics::gpu_memory_allocated_mb(),
+        memory_rss_mb: rustrain_train::metrics::memory_rss_mb(),
+        gpu_memory_allocated_mb: rustrain_train::metrics::gpu_memory_allocated_mb(),
         trainable_tensors: tensor_summaries,
     };
     Ok(summary)
@@ -4373,8 +3615,8 @@ fn qwen_full_train_summary(
             .sqrt(),
         tokens_per_second: 0.0,
         samples_per_second: 0.0,
-        memory_rss_mb: crate::metrics::memory_rss_mb(),
-        gpu_memory_allocated_mb: crate::metrics::gpu_memory_allocated_mb(),
+        memory_rss_mb: rustrain_train::metrics::memory_rss_mb(),
+        gpu_memory_allocated_mb: rustrain_train::metrics::gpu_memory_allocated_mb(),
         dataset_total_samples: None,
         dataset_total_tokens: None,
         dataset_train_samples: None,
@@ -4664,8 +3906,8 @@ fn qwen_session_single_summary(
         final_step_grad_norm,
         tokens_per_second,
         samples_per_second,
-        memory_rss_mb: crate::metrics::memory_rss_mb(),
-        gpu_memory_allocated_mb: crate::metrics::gpu_memory_allocated_mb(),
+        memory_rss_mb: rustrain_train::metrics::memory_rss_mb(),
+        gpu_memory_allocated_mb: rustrain_train::metrics::gpu_memory_allocated_mb(),
         dataset_total_samples: batch_plan.dataset_total_samples,
         dataset_total_tokens: batch_plan.dataset_total_tokens,
         dataset_train_samples: batch_plan.dataset_train_samples,
@@ -6193,8 +5435,8 @@ pub fn qwen_session_dp_rank_smoke(
         learning_rate,
         tokens_per_second,
         samples_per_second,
-        memory_rss_mb: crate::metrics::memory_rss_mb(),
-        gpu_memory_allocated_mb: crate::metrics::gpu_memory_allocated_mb(),
+        memory_rss_mb: rustrain_train::metrics::memory_rss_mb(),
+        gpu_memory_allocated_mb: rustrain_train::metrics::gpu_memory_allocated_mb(),
         max_grad_delta,
         loss_delta,
         local_loss,
@@ -7595,9 +6837,9 @@ pub fn train_qwen_session_dp_from_config(config: &Config, _run_paths: &RunPaths)
         })
         .join("qwen-session-dp-ranks");
     let dtype = match config.train.dtype {
-        crate::runtime::DType::Fp32 => QwenComputeDType::Fp32,
-        crate::runtime::DType::Bf16 => QwenComputeDType::Bf16,
-        crate::runtime::DType::Fp16 => {
+        rustrain_core::runtime::DType::Fp32 => QwenComputeDType::Fp32,
+        rustrain_core::runtime::DType::Bf16 => QwenComputeDType::Bf16,
+        rustrain_core::runtime::DType::Fp16 => {
             bail!("qwen session trainer does not support fp16 yet; use fp32 or bf16")
         }
     };
@@ -9585,7 +8827,7 @@ fn qwen_session_tp_attention_global_mse_loss_and_grad(
     Ok((loss.double_value(&[]), output_grad))
 }
 
-pub(crate) fn train_qwen_session_single_from_config(
+pub fn train_qwen_session_single_from_config(
     config: &Config,
     run_paths: &RunPaths,
 ) -> Result<QwenFullTrainSmokeSummary> {
@@ -9608,9 +8850,9 @@ pub(crate) fn train_qwen_session_single_from_config(
         .context("qwen session trainer requires model.model_path")?;
     let model_path = resolve_qwen_model_path(model_path)?;
     let dtype = match config.train.dtype {
-        crate::runtime::DType::Fp32 => QwenComputeDType::Fp32,
-        crate::runtime::DType::Bf16 => QwenComputeDType::Bf16,
-        crate::runtime::DType::Fp16 => {
+        rustrain_core::runtime::DType::Fp32 => QwenComputeDType::Fp32,
+        rustrain_core::runtime::DType::Bf16 => QwenComputeDType::Bf16,
+        rustrain_core::runtime::DType::Fp16 => {
             bail!("qwen session trainer does not support fp16 yet; use fp32 or bf16")
         }
     };
@@ -9648,18 +8890,6 @@ fn qwen_tp_artifact_dir(output_dir: &Path) -> Result<PathBuf> {
     let port = std::env::var("MASTER_PORT")
         .context("MASTER_PORT is not set; run through rustrain launch")?;
     Ok(output_dir.join(format!("launch-{port}")))
-}
-
-fn delta_manifest_path(delta_output: &Path) -> std::path::PathBuf {
-    let mut path = delta_output.as_os_str().to_os_string();
-    path.push(".json");
-    path.into()
-}
-
-fn optimizer_state_path(delta_output: &Path) -> std::path::PathBuf {
-    let mut path = delta_output.as_os_str().to_os_string();
-    path.push(".optimizer.safetensors");
-    path.into()
 }
 
 fn adam_slot_names(name: &str) -> AdamSlotNames {
@@ -10456,21 +9686,6 @@ fn adamw_update(
     (m_hat / v_hat.sqrt().g_add_scalar(eps)) * learning_rate
 }
 
-fn write_qwen_delta_manifest(
-    manifest_output: &Path,
-    manifest: &QwenDeltaCheckpointManifest,
-) -> Result<()> {
-    if let Some(parent) = manifest_output.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create {}", parent.display()))?;
-    }
-    fs::write(
-        manifest_output,
-        serde_json::to_string_pretty(manifest).context("failed to serialize manifest")? + "\n",
-    )
-    .with_context(|| format!("failed to write {}", manifest_output.display()))
-}
-
 fn representative_trainable_qwen_tensors() -> Vec<String> {
     qwen_trainable_tensors_for_layers(&[0], true)
 }
@@ -11065,7 +10280,7 @@ fn read_runtime_config(path: &Path) -> Result<QwenRuntimeConfig> {
     })
 }
 
-pub(crate) fn resolve_qwen_model_path(model_path: &Path) -> Result<PathBuf> {
+pub fn resolve_qwen_model_path(model_path: &Path) -> Result<PathBuf> {
     if qwen_model_path_is_complete(model_path) {
         return Ok(model_path.to_path_buf());
     }
@@ -11130,22 +10345,10 @@ pub(crate) fn resolve_qwen_model_path(model_path: &Path) -> Result<PathBuf> {
         })
 }
 
-pub(crate) fn qwen_model_path_is_complete(model_path: &Path) -> bool {
+pub fn qwen_model_path_is_complete(model_path: &Path) -> bool {
     model_path.join("config.json").exists()
         && model_path.join("tokenizer.json").exists()
         && model_path.join("model.safetensors").exists()
-}
-
-pub fn read_safetensors_map(path: &Path) -> Result<BTreeMap<String, Tensor>> {
-    let tensors = Tensor::read_safetensors(path)
-        .with_context(|| format!("failed to read {}", path.display()))?;
-    Ok(tensors.into_iter().collect())
-}
-
-pub fn tensor<'a>(tensors: &'a BTreeMap<String, Tensor>, name: &str) -> Result<&'a Tensor> {
-    tensors
-        .get(name)
-        .ok_or_else(|| anyhow!("missing tensor {name}"))
 }
 
 pub fn rms_norm(input: &Tensor, weight: &Tensor, eps: f64) -> Tensor {

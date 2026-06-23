@@ -7,7 +7,7 @@ source "${SCRIPT_DIR}/require_gpu_worker.sh"
 CONFIG="${RUSTRAIN_QWEN_SESSION_DP2_SFT_EVAL_PATHS_CONFIG:-configs/qwen_session_dp2_sft_eval_paths.toml}"
 OUTPUT="$(mktemp)"
 
-cargo run -- qwen-session-dp-data-plan --config "${CONFIG}" --world-size 2 \
+cargo run -- qwen session-dp-data-plan --config "${CONFIG}" --world-size 2 \
   | tee "${OUTPUT}"
 
 python - "${OUTPUT}" <<'PY'

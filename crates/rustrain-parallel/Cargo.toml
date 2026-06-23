@@ -1,0 +1,20 @@
+[package]
+name = "rustrain-parallel"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+rustrain-core = { path = "../rustrain-core" }
+anyhow.workspace = true
+ndarray.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+
+[dependencies.rustrain-nccl]
+path = "../rustrain-nccl"
+optional = true
+
+[features]
+default = []
+nccl = ["dep:rustrain-nccl"]

@@ -9,7 +9,7 @@ OUTPUT_DIR="${RUSTRAIN_EP_RANK_LOCAL_OUTPUT_DIR:-/tmp/rustrain-runs/ep-rank-loca
 cargo run -- launch \
   --nproc-per-node 2 \
   --output-dir "${OUTPUT_DIR}" \
-  parallel-ep-rank-smoke \
+  moe parallel-ep-rank-smoke \
   --output-dir "${OUTPUT_DIR}/ranks"
 
 python - "${OUTPUT_DIR}" <<'PY'

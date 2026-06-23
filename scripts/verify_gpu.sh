@@ -17,7 +17,7 @@ remote_run() {
     "${SCRIPT_DIR}/gpu_run.sh" "$@"
 }
 
-remote_run cargo run -- tch-cuda-probe
+remote_run cargo run -- probe
 remote_run cargo fmt --check
 remote_run cargo check
 remote_run bash scripts/verify_moe_smoke_worker.sh
@@ -29,9 +29,9 @@ remote_run cargo test tch_tiny_lm_trains_all_parameter_groups
 remote_run cargo test tch_dtype_policy_maps_runtime_dtype_to_compute_kind
 remote_run cargo run -- train --config configs/tch_smoke_cuda.toml
 remote_run cargo run -- train --config configs/tch_smoke_cuda_bf16.toml
-remote_run cargo run -- qwen-sampling-smoke
+remote_run cargo run -- qwen sampling-smoke
 remote_run bash scripts/verify_qwen_kv_cache_worker.sh
-remote_run cargo run -- qwen-lora-sft-smoke
+remote_run cargo run -- qwen lora-sft-smoke
 remote_run cargo run -- train --config configs/qwen_lora_sft.toml
 remote_run bash scripts/verify_qwen_lora_sft_resume.sh
 remote_run bash scripts/verify_qwen_lora_sft_max_samples_worker.sh

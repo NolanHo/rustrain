@@ -4,6 +4,38 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+# Workspace crates
+rustrain-core = { path = "crates/rustrain-core", features = ["tch"] }
+rustrain-data = { path = "crates/rustrain-data" }
+rustrain-nccl = { path = "crates/rustrain-nccl" }
+rustrain-parallel = { path = "crates/rustrain-parallel", features = ["nccl"] }
+rustrain-train = { path = "crates/rustrain-train" }
+rustrain-toy = { path = "crates/rustrain-toy" }
+rustrain-tch-tiny = { path = "crates/rustrain-tch-tiny" }
+rustrain-qwen = { path = "crates/rustrain-qwen" }
+rustrain-moe = { path = "crates/rustrain-moe" }
+
+# Direct dependencies (used by main.rs, inspect.rs, trainer.rs)
+anyhow.workspace = true
+clap.workspace = true
+ndarray.workspace = true
+rand.workspace = true
+rand_distr.workspace = true
+safetensors.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tch.workspace = true
+toml.workspace = true
+tokenizers.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[workspace]
+members = ["crates/*"]
+
+[workspace.dependencies]
 anyhow = "1.0.98"
 arrow = { version = "57.0.0", default-features = false, features = ["ipc"] }
 chrono = { version = "0.4.41", default-features = false, features = ["clock"] }
@@ -21,6 +53,4 @@ toml = "0.8.23"
 tracing = "0.1.41"
 tracing-appender = "0.2.3"
 tracing-subscriber = { version = "0.3.19", features = ["env-filter", "fmt"] }
-
-[dev-dependencies]
 tempfile = "3.20.0"

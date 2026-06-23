@@ -30,14 +30,14 @@ for line in text.splitlines():
 pathlib.Path(sys.argv[2]).write_text("\n".join(lines) + "\n")
 PY
 
-cargo run -- qwen-sft-streaming-data-plan --config "${CONFIG}" --world-size 1 --data-cursor-start 0 \
+cargo run -- qwen sft-streaming-data-plan --config "${CONFIG}" --world-size 1 --data-cursor-start 0 \
   | tee "${FIRST_PLAN_OUTPUT}"
-cargo run -- qwen-sft-streaming-data-plan --config "${CONFIG}" --world-size 1 --data-cursor-start 0 \
+cargo run -- qwen sft-streaming-data-plan --config "${CONFIG}" --world-size 1 --data-cursor-start 0 \
   | tee "${SECOND_PLAN_OUTPUT}"
 
-cargo run -- qwen-sft-streaming-batch-plan --config "${CONFIG}" --world-size 1 --data-cursor-start 0 --index-cache "${CACHE_PATH}" \
+cargo run -- qwen sft-streaming-batch-plan --config "${CONFIG}" --world-size 1 --data-cursor-start 0 --index-cache "${CACHE_PATH}" \
   | tee "${FIRST_BATCH_OUTPUT}"
-cargo run -- qwen-sft-streaming-batch-plan --config "${CONFIG}" --world-size 1 --data-cursor-start 0 --index-cache "${CACHE_PATH}" \
+cargo run -- qwen sft-streaming-batch-plan --config "${CONFIG}" --world-size 1 --data-cursor-start 0 --index-cache "${CACHE_PATH}" \
   | tee "${SECOND_BATCH_OUTPUT}"
 
 rm -f "${CACHE_PATH}"

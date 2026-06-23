@@ -8,7 +8,7 @@ use anyhow::{Context, Result, anyhow};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 
-use crate::runtime::{
+use rustrain_core::runtime::{
     DataConfig, FieldAffix, FieldCaseTransform, FieldCaseTransformKind, FieldDefault,
     FieldDefaultTarget, FieldRegexFilter, FieldRegexReplacement, FieldReplacement,
     FieldReplacementTarget, FieldSplit, FieldSplitSide, FieldStrip, FieldTransform,
@@ -1491,7 +1491,7 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
-    use crate::runtime::{
+    use rustrain_core::runtime::{
         DataConfig, DataKind, FieldRegexReplacement, FieldReplacement, FieldReplacementTarget,
     };
 

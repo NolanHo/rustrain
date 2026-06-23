@@ -14,7 +14,7 @@ python scripts/python_reference/qwen_generate.py \
   --output "${FIXTURE}" \
   --summary-output "${SUMMARY}"
 
-cargo run -- qwen-kv-cache-parity \
+cargo run -- qwen kv-cache-parity \
   --reference-fixture "${FIXTURE}" \
   --max-new-tokens "${MAX_NEW_TOKENS}" | tee "${OUTPUT}"
 
@@ -28,7 +28,7 @@ expected_new_tokens = int(sys.argv[2])
 start = text.find("{")
 end = text.rfind("}")
 if start < 0 or end < start:
-    raise SystemExit("qwen-kv-cache-parity did not print a JSON summary")
+    raise SystemExit("qwen kv-cache-parity did not print a JSON summary")
 summary = json.loads(text[start : end + 1])
 
 required = [

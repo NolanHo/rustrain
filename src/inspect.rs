@@ -8,7 +8,7 @@ use safetensors::SafeTensors;
 use serde::Deserialize;
 use tokenizers::Tokenizer;
 
-use crate::qwen_module::resolve_qwen_model_path;
+use rustrain_qwen::qwen_module::resolve_qwen_model_path;
 
 #[derive(Debug, Deserialize)]
 struct HfConfig {

@@ -1575,13 +1575,19 @@ name = "rustrain"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "arrow",
- "chrono",
  "clap",
  "ndarray",
  "rand 0.8.6",
  "rand_distr",
- "regex",
+ "rustrain-core",
+ "rustrain-data",
+ "rustrain-moe",
+ "rustrain-nccl",
+ "rustrain-parallel",
+ "rustrain-qwen",
+ "rustrain-tch-tiny",
+ "rustrain-toy",
+ "rustrain-train",
  "safetensors 0.8.0",
  "serde",
  "serde_json",
@@ -1590,8 +1596,160 @@ dependencies = [
  "tokenizers",
  "toml",
  "tracing",
+]
+
+[[package]]
+name = "rustrain-checkpoint"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "serde",
+ "serde_json",
+ "tch",
+]
+
+[[package]]
+name = "rustrain-core"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "regex",
+ "serde",
+ "serde_json",
+ "tch",
+ "toml",
+ "tracing",
  "tracing-appender",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "rustrain-data"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "arrow",
+ "regex",
+ "rustrain-core",
+ "safetensors 0.8.0",
+ "serde",
+ "serde_json",
+ "tokenizers",
+ "toml",
+ "tracing",
+]
+
+[[package]]
+name = "rustrain-moe"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "ndarray",
+ "rand 0.8.6",
+ "rand_distr",
+ "rustrain-checkpoint",
+ "rustrain-core",
+ "rustrain-nccl",
+ "rustrain-parallel",
+ "rustrain-train",
+ "safetensors 0.8.0",
+ "serde",
+ "serde_json",
+ "tch",
+ "tracing",
+]
+
+[[package]]
+name = "rustrain-nccl"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "serde",
+ "serde_json",
+ "tch",
+ "tracing",
+]
+
+[[package]]
+name = "rustrain-parallel"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "ndarray",
+ "rustrain-core",
+ "rustrain-nccl",
+ "serde",
+ "serde_json",
+ "tracing",
+]
+
+[[package]]
+name = "rustrain-qwen"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "arrow",
+ "chrono",
+ "clap",
+ "ndarray",
+ "rand 0.8.6",
+ "rand_distr",
+ "regex",
+ "rustrain-checkpoint",
+ "rustrain-core",
+ "rustrain-data",
+ "rustrain-nccl",
+ "rustrain-parallel",
+ "rustrain-train",
+ "safetensors 0.8.0",
+ "serde",
+ "serde_json",
+ "tch",
+ "tokenizers",
+ "toml",
+ "tracing",
+]
+
+[[package]]
+name = "rustrain-tch-tiny"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "rustrain-core",
+ "rustrain-nccl",
+ "rustrain-train",
+ "safetensors 0.8.0",
+ "serde",
+ "serde_json",
+ "tch",
+ "tracing",
+]
+
+[[package]]
+name = "rustrain-toy"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "ndarray",
+ "rand 0.8.6",
+ "rand_distr",
+ "rustrain-core",
+ "rustrain-data",
+ "rustrain-train",
+ "serde",
+ "tempfile",
+ "toml",
+ "tracing",
+]
+
+[[package]]
+name = "rustrain-train"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "serde",
+ "tracing",
 ]
 
 [[package]]
