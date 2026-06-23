@@ -40,7 +40,6 @@ for path in rank_summaries:
         "local_batch_size",
         "sequence_tokens",
         "dataset_total_samples",
-        "dataset_total_tokens",
         "dataset_train_samples",
         "dataset_eval_samples",
         "dataset_source_files",
@@ -69,6 +68,11 @@ for path in rank_summaries:
     missing = [key for key in required if data.get(key) is None]
     if missing:
         raise SystemExit(f"{path} is missing fields: {missing}")
+    if data.get("dataset_total_tokens") is not None:
+        raise SystemExit(
+            f"{path} instruction_arrow trainer runtime must not report dataset_total_tokens; "
+            "full token totals are reserved for materialized batch-plan parity"
+        )
     if int(data["world_size"]) != 2:
         raise SystemExit(f"{path} expected world_size 2, got {data['world_size']}")
     if data["dtype"] != "fp32":
@@ -97,12 +101,25 @@ for path in rank_summaries:
         raise SystemExit(f"{path} expected dataset_shuffle false, got {data['dataset_shuffle']}")
     if data["streaming_train_batches"] is not True:
         raise SystemExit(f"{path} expected streaming_train_batches true, got {data['streaming_train_batches']}")
-    if data["streaming_index_cache_hit"] is not False or data["streaming_index_cache_written"] is not False:
+    cache_path = data.get("streaming_index_cache_path")
+    if cache_path:
+        expected_suffix = f".rank-{data['rank']}.json"
+        expected_dir = f"rank-{data['rank']}-cache"
+        cache_parts = pathlib.Path(cache_path).parts
+        if not str(cache_path).endswith(expected_suffix) and expected_dir not in cache_parts:
+            raise SystemExit(
+                f"{path} expected rank-local Arrow cache ending {expected_suffix} "
+                f"or under {expected_dir}/, got {cache_path}"
+            )
+        if data["streaming_index_cache_hit"] is not False:
+            raise SystemExit(f"{path} first Arrow DP cache read must be miss")
+        if data["streaming_index_cache_written"] is not True:
+            raise SystemExit(f"{path} first Arrow DP cache run must write the rank-local cache")
+    elif data["streaming_index_cache_hit"] is not False or data["streaming_index_cache_written"] is not False:
         raise SystemExit(
-            f"{path} Arrow DP path must not use index cache, got hit={data['streaming_index_cache_hit']} written={data['streaming_index_cache_written']}"
+            f"{path} Arrow DP cache fields are inconsistent without cache path: "
+            f"hit={data['streaming_index_cache_hit']} written={data['streaming_index_cache_written']}"
         )
-    if data.get("streaming_index_cache_path"):
-        raise SystemExit(f"{path} Arrow DP path must not report index cache path")
     expected_cursor_end = int(data["steps"]) * int(data["local_batch_size"]) * int(data["world_size"])
     if int(data["data_cursor_start"]) != 0:
         raise SystemExit(f"{path} expected data_cursor_start 0, got {data['data_cursor_start']}")
@@ -166,6 +183,8 @@ for path in rank_summaries:
             "reload_delta": data["reload_delta"],
             "sharded_reload_delta": data["sharded_reload_delta"],
             "sharded_next_step_delta": data["sharded_next_step_delta"],
+            "streaming_index_cache_path": cache_path,
+            "streaming_index_cache_written": data["streaming_index_cache_written"],
         }
     )
 

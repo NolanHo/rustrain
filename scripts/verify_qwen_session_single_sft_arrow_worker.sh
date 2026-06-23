@@ -68,7 +68,6 @@ required = [
     "tokens_per_second",
     "samples_per_second",
     "dataset_total_samples",
-    "dataset_total_tokens",
     "dataset_train_samples",
     "dataset_eval_samples",
     "dataset_source_files",
@@ -102,6 +101,11 @@ if values["compute_kind"] != expected_compute_kind:
     raise SystemExit(f"expected compute_kind {expected_compute_kind}, got {values['compute_kind']}")
 if values["streaming_train_batches"] != "true":
     raise SystemExit(f"expected streaming_train_batches true, got {values['streaming_train_batches']}")
+if "dataset_total_tokens" in values:
+    raise SystemExit(
+        "instruction_arrow trainer runtime must not report dataset_total_tokens; "
+        "full token totals are reserved for materialized batch-plan parity"
+    )
 if values.get("streaming_index_cache_path"):
     raise SystemExit("instruction_arrow trainer path must not report streaming_index_cache_path")
 if int(values["train_steps"]) != 2:
@@ -125,7 +129,6 @@ for key in [
         raise SystemExit(f"{key} must be positive, got {values[key]}")
 for key in [
     "dataset_total_samples",
-    "dataset_total_tokens",
     "dataset_train_samples",
     "dataset_eval_samples",
     "batch_size",

@@ -1872,6 +1872,28 @@ struct QwenSftArrowPlanData {
     eval_dataset: QwenSftDataset,
 }
 
+struct QwenSftStreamingDatasetPlan {
+    dataset_total_samples: usize,
+    dataset_train_samples: usize,
+    dataset_eval_samples: usize,
+    dataset_source_files: Vec<String>,
+    dataset_source_sample_counts: Vec<QwenSftSourceSampleCount>,
+    dataset_fingerprint: String,
+    dataset_shuffle: bool,
+    local_batch_size: usize,
+    data_epoch_start: usize,
+    data_epoch_end: usize,
+    data_epoch_next: usize,
+    data_sample_offset_start: usize,
+    data_sample_offset_end: usize,
+    data_sample_offset_next: usize,
+    train_batches: Vec<Tensor>,
+    initial_input_ids: Tensor,
+    sequence_tokens: usize,
+    streaming_index_cache_hit: bool,
+    streaming_index_cache_written: bool,
+}
+
 impl QwenSftFieldMap {
     fn from_runtime_data(data: &RuntimeDataConfig) -> Result<Self> {
         let map = Self {
@@ -10379,6 +10401,47 @@ fn qwen_session_batch_plan_from_config(
     let tokenizer = Tokenizer::from_file(model_path.join("tokenizer.json"))
         .map_err(|error| anyhow!("failed to load tokenizer: {error}"))?;
     let field_map = QwenSftFieldMap::from_runtime_data(data_config)?;
+    if data_config.kind == RuntimeDataKind::InstructionArrow {
+        let streaming_plan = qwen_sft_arrow_streaming_dataset_plan(
+            &tokenizer,
+            data_config,
+            runtime_config.run.seed,
+            data_cursor_start,
+            train_steps,
+            runtime_config.train.micro_batch_size,
+            1,
+            streaming_index_cache,
+            &field_map,
+        )?;
+        return Ok(QwenSessionBatchPlan {
+            sequence_tokens: streaming_plan.sequence_tokens,
+            initial_input_ids: streaming_plan.initial_input_ids,
+            train_batches: streaming_plan.train_batches,
+            reference_fixture: "qwen_session_single_arrow_streaming".to_string(),
+            dataset_total_samples: Some(streaming_plan.dataset_total_samples),
+            dataset_total_tokens: None,
+            dataset_train_samples: Some(streaming_plan.dataset_train_samples),
+            dataset_eval_samples: Some(streaming_plan.dataset_eval_samples),
+            dataset_source_files: Some(streaming_plan.dataset_source_files),
+            dataset_source_sample_counts: Some(streaming_plan.dataset_source_sample_counts),
+            dataset_fingerprint: Some(streaming_plan.dataset_fingerprint),
+            dataset_order_seed: Some(runtime_config.run.seed),
+            dataset_shuffle: Some(streaming_plan.dataset_shuffle),
+            streaming_train_batches: Some(true),
+            streaming_index_cache_path: streaming_index_cache
+                .map(|path| path.display().to_string()),
+            streaming_index_cache_hit: Some(streaming_plan.streaming_index_cache_hit),
+            streaming_index_cache_written: Some(streaming_plan.streaming_index_cache_written),
+            train_sample_count: Some(streaming_plan.dataset_train_samples),
+            data_epoch_start: Some(streaming_plan.data_epoch_start),
+            data_epoch_end: Some(streaming_plan.data_epoch_end),
+            data_epoch_next: Some(streaming_plan.data_epoch_next),
+            data_sample_offset_start: Some(streaming_plan.data_sample_offset_start),
+            data_sample_offset_end: Some(streaming_plan.data_sample_offset_end),
+            data_sample_offset_next: Some(streaming_plan.data_sample_offset_next),
+            batch_size: streaming_plan.local_batch_size,
+        });
+    }
     let datasets = qwen_session_single_sft_datasets_from_config(
         &tokenizer,
         data_config,
@@ -10612,6 +10675,52 @@ fn qwen_session_dp_batch_plan_from_config(
     let tokenizer = Tokenizer::from_file(model_path.join("tokenizer.json"))
         .map_err(|error| anyhow!("failed to load tokenizer: {error}"))?;
     let field_map = QwenSftFieldMap::from_runtime_data(data_config)?;
+    if data_config.kind == RuntimeDataKind::InstructionArrow {
+        let streaming_plan = qwen_sft_arrow_streaming_dataset_plan(
+            &tokenizer,
+            data_config,
+            runtime_config.run.seed,
+            data_cursor_start,
+            train_steps,
+            runtime_config.train.micro_batch_size,
+            world_size,
+            streaming_index_cache,
+            &field_map,
+        )?;
+        let global_train_batches = streaming_plan
+            .train_batches
+            .into_iter()
+            .map(|batch| batch.to_device(device))
+            .collect::<Vec<_>>();
+        return Ok(QwenSessionDpBatchPlan {
+            sequence_tokens: streaming_plan.sequence_tokens,
+            global_initial_input_ids: streaming_plan.initial_input_ids.to_device(device),
+            global_train_batches,
+            data_kind: Some("instruction_arrow".to_string()),
+            dataset_total_samples: Some(streaming_plan.dataset_total_samples),
+            dataset_total_tokens: None,
+            dataset_train_samples: Some(streaming_plan.dataset_train_samples),
+            dataset_eval_samples: Some(streaming_plan.dataset_eval_samples),
+            dataset_source_files: Some(streaming_plan.dataset_source_files),
+            dataset_source_sample_counts: Some(streaming_plan.dataset_source_sample_counts),
+            dataset_fingerprint: Some(streaming_plan.dataset_fingerprint),
+            dataset_order_seed: Some(runtime_config.run.seed),
+            dataset_shuffle: Some(streaming_plan.dataset_shuffle),
+            streaming_train_batches: Some(true),
+            streaming_index_cache_path: streaming_index_cache
+                .map(|path| path.display().to_string()),
+            streaming_index_cache_hit: Some(streaming_plan.streaming_index_cache_hit),
+            streaming_index_cache_written: Some(streaming_plan.streaming_index_cache_written),
+            train_sample_count: Some(streaming_plan.dataset_train_samples),
+            data_epoch_start: Some(streaming_plan.data_epoch_start),
+            data_epoch_end: Some(streaming_plan.data_epoch_end),
+            data_epoch_next: Some(streaming_plan.data_epoch_next),
+            data_sample_offset_start: Some(streaming_plan.data_sample_offset_start),
+            data_sample_offset_end: Some(streaming_plan.data_sample_offset_end),
+            data_sample_offset_next: Some(streaming_plan.data_sample_offset_next),
+            local_batch_size: streaming_plan.local_batch_size,
+        });
+    }
     let datasets = qwen_session_single_sft_datasets_from_config(
         &tokenizer,
         data_config,
@@ -13409,6 +13518,169 @@ fn qwen_sft_arrow_streaming_token_window(
         raw_samples_read: raw_window.raw_samples_read,
         source_index_cache_hit: source_index_load.cache_hit,
         source_index_cache_written: source_index_load.cache_written,
+    })
+}
+
+fn qwen_sft_arrow_streaming_dataset_plan(
+    tokenizer: &Tokenizer,
+    data_config: &RuntimeDataConfig,
+    seed: u64,
+    data_cursor_start: usize,
+    train_steps: usize,
+    local_batch_size_config: usize,
+    world_size: usize,
+    index_cache: Option<&Path>,
+    field_map: &QwenSftFieldMap,
+) -> Result<QwenSftStreamingDatasetPlan> {
+    qwen_sft_arrow_validate_config_scope(
+        data_config,
+        "qwen trainable session instruction_arrow streaming runtime",
+    )?;
+    if local_batch_size_config == 0 {
+        bail!("qwen trainable session micro_batch_size must be greater than zero");
+    }
+    if world_size == 0 {
+        bail!("qwen trainable session world_size must be greater than zero");
+    }
+    if train_steps == 0 {
+        bail!("qwen trainable session max_steps must be greater than zero");
+    }
+
+    let train_summary = qwen_sft_arrow_source_summary_from_paths(
+        &data_config.paths,
+        data_config.max_samples,
+        field_map,
+    )?;
+
+    let train_source_files = train_summary.source_files.clone();
+    let train_source_sample_counts = train_summary.source_sample_counts.clone();
+    let (
+        dataset_total_samples,
+        dataset_train_samples,
+        dataset_eval_samples,
+        dataset_source_files,
+        dataset_source_sample_counts,
+        dataset_fingerprint,
+    ) = if let Some(eval_input) = data_config.eval_paths.first() {
+        let eval_field_map = qwen_sft_eval_field_map(field_map);
+        let eval_summary = qwen_sft_arrow_source_summary_from_paths(
+            std::slice::from_ref(eval_input),
+            data_config.max_eval_samples,
+            &eval_field_map,
+        )?;
+        let eval_source_files = eval_summary.source_files.clone();
+        let eval_source_sample_counts = eval_summary.source_sample_counts.clone();
+        let combined_source_files =
+            qwen_merge_sft_source_files(&train_source_files, &eval_source_files);
+        let combined_source_sample_counts = qwen_merge_sft_source_sample_counts(
+            &train_source_sample_counts,
+            &eval_source_sample_counts,
+        );
+        let combined_fingerprint = qwen_combine_sft_fingerprints(
+            &combined_source_files,
+            &train_summary.fingerprint,
+            &eval_summary.fingerprint,
+        );
+        (
+            train_summary.samples + eval_summary.samples,
+            train_summary.samples,
+            eval_summary.samples,
+            combined_source_files,
+            combined_source_sample_counts,
+            combined_fingerprint,
+        )
+    } else {
+        let (train_samples, eval_samples) =
+            qwen_sft_train_eval_sample_counts(train_summary.samples, data_config.train_split)?;
+        (
+            train_summary.samples,
+            train_samples,
+            eval_samples,
+            train_source_files,
+            train_source_sample_counts,
+            train_summary.fingerprint,
+        )
+    };
+    if dataset_train_samples == 0 {
+        bail!("qwen trainable session Arrow streaming runtime requires training samples");
+    }
+
+    let local_batch_size = local_batch_size_config.min(dataset_train_samples).max(1);
+    let global_batch_size = local_batch_size * world_size;
+    let required_batches = train_steps * global_batch_size + 1;
+    let required_window_samples = required_batches + global_batch_size - 1;
+    let data_cursor_end = data_cursor_start + train_steps * global_batch_size;
+    let data_cursor_next = data_cursor_end;
+    let (data_epoch_start, data_sample_offset_start) =
+        qwen_data_epoch_and_offset(data_cursor_start, dataset_train_samples)?;
+    let (data_epoch_end, data_sample_offset_end) =
+        qwen_data_epoch_and_offset(data_cursor_end, dataset_train_samples)?;
+    let (data_epoch_next, data_sample_offset_next) =
+        qwen_data_epoch_and_offset(data_cursor_next, dataset_train_samples)?;
+    let _train_window_sample_cursors = qwen_sft_streaming_cursor_window(
+        data_cursor_start,
+        required_batches,
+        global_batch_size,
+        dataset_train_samples,
+    )?;
+
+    let streaming_window = qwen_sft_arrow_streaming_token_window(
+        tokenizer,
+        &data_config.paths,
+        &data_config.eval_paths,
+        data_config.max_samples,
+        data_config.train_split,
+        data_config.shuffle,
+        seed,
+        data_cursor_start,
+        required_window_samples,
+        index_cache,
+        field_map,
+    )?;
+    if streaming_window.samples.len() != required_window_samples {
+        bail!(
+            "qwen trainable session Arrow streaming window produced {} samples, expected {}",
+            streaming_window.samples.len(),
+            required_window_samples
+        );
+    }
+    let pad_token_id = qwen_pad_token_id(tokenizer);
+    let train_batches = (0..required_batches)
+        .map(|relative_cursor| {
+            let end = relative_cursor + global_batch_size;
+            qwen_sft_padded_batch(
+                &streaming_window.samples[relative_cursor..end],
+                pad_token_id,
+            )
+            .map(|batch| batch.input_ids)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let initial_input_ids = train_batches
+        .first()
+        .ok_or_else(|| anyhow!("qwen trainable session Arrow streaming plan produced no batches"))?
+        .shallow_clone();
+    let sequence_tokens = initial_input_ids.size()[1] as usize;
+
+    Ok(QwenSftStreamingDatasetPlan {
+        dataset_total_samples,
+        dataset_train_samples,
+        dataset_eval_samples,
+        dataset_source_files,
+        dataset_source_sample_counts,
+        dataset_fingerprint,
+        dataset_shuffle: data_config.shuffle,
+        local_batch_size,
+        data_epoch_start,
+        data_epoch_end,
+        data_epoch_next,
+        data_sample_offset_start,
+        data_sample_offset_end,
+        data_sample_offset_next,
+        train_batches,
+        initial_input_ids,
+        sequence_tokens,
+        streaming_index_cache_hit: streaming_window.source_index_cache_hit,
+        streaming_index_cache_written: streaming_window.source_index_cache_written,
     })
 }
 

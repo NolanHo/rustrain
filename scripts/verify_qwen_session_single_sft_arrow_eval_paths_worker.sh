@@ -178,6 +178,11 @@ if resume_values["compute_kind"] != "fp32":
     raise SystemExit(f"expected fp32 compute, got {resume_values['compute_kind']}")
 if resume_values["streaming_train_batches"] != "true":
     raise SystemExit(f"expected streaming_train_batches true, got {resume_values['streaming_train_batches']}")
+if "dataset_total_tokens" in resume_values:
+    raise SystemExit(
+        "instruction_arrow trainer runtime must not report dataset_total_tokens; "
+        "full token totals are reserved for materialized batch-plan parity"
+    )
 if int(resume_values["train_steps"]) != 2:
     raise SystemExit(f"expected train_steps 2, got {resume_values['train_steps']}")
 if int(resume_values["trainable_tensors"]) != expected_trainable_tensors:
