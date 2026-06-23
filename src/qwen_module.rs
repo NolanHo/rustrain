@@ -24,8 +24,8 @@ use crate::runtime::{
     Config, DataConfig as RuntimeDataConfig, DataKind as RuntimeDataKind, Device as RuntimeDevice,
     FieldAffix, FieldCaseTransform, FieldCaseTransformKind, FieldDefault, FieldDefaultTarget,
     FieldRegexFilter, FieldRegexReplacement, FieldReplacement, FieldReplacementTarget, FieldSplit,
-    FieldSplitSide, FieldStrip, FieldTruncation, LoraConfig as RuntimeLoraConfig, LrScheduler,
-    RunPaths, load_config,
+    FieldSplitSide, FieldStrip, FieldTransform, FieldTransformOp, FieldTruncation,
+    LoraConfig as RuntimeLoraConfig, LrScheduler, RunPaths, load_config,
 };
 
 #[derive(Debug, Serialize)]
@@ -1730,6 +1730,13 @@ struct QwenCompiledRegexReplacement {
     replacement: String,
 }
 
+struct QwenCompiledRegexFieldTransform {
+    index: usize,
+    field: FieldReplacementTarget,
+    regex: regex::Regex,
+    replacement: String,
+}
+
 struct QwenCompiledRegexFilter {
     field: FieldReplacementTarget,
     regex: regex::Regex,
@@ -1737,6 +1744,7 @@ struct QwenCompiledRegexFilter {
 
 struct QwenSftRegexPlan {
     replacements: Vec<QwenCompiledRegexReplacement>,
+    transform_regex_replacements: Vec<QwenCompiledRegexFieldTransform>,
     contains_any: Vec<QwenCompiledRegexFilter>,
     excludes_any: Vec<QwenCompiledRegexFilter>,
 }
@@ -1760,10 +1768,31 @@ impl QwenSftRegexPlan {
                 })
             })
             .collect::<Result<Vec<_>>>()?;
+        let transform_regex_replacements = field_map
+            .field_transforms
+            .iter()
+            .enumerate()
+            .filter(|(_, transform)| matches!(transform.op, FieldTransformOp::RegexReplace))
+            .map(|(index, transform)| {
+                let regex = regex::Regex::new(&transform.pattern).with_context(|| {
+                    format!(
+                        "invalid data.field_transforms regex_replace pattern {:?}",
+                        transform.pattern
+                    )
+                })?;
+                Ok(QwenCompiledRegexFieldTransform {
+                    index,
+                    field: transform.field.clone(),
+                    regex,
+                    replacement: transform.replacement.clone(),
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
         let contains_any = qwen_compile_regex_filters(&field_map.field_regex_contains_any)?;
         let excludes_any = qwen_compile_regex_filters(&field_map.field_regex_excludes_any)?;
         Ok(Self {
             replacements,
+            transform_regex_replacements,
             contains_any,
             excludes_any,
         })
@@ -1865,6 +1894,8 @@ struct QwenSftFieldMap {
     field_splits: Vec<FieldSplit>,
     #[serde(default)]
     field_truncations: Vec<FieldTruncation>,
+    #[serde(default)]
+    field_transforms: Vec<FieldTransform>,
     source_weights: Vec<usize>,
     #[serde(default)]
     source_max_samples: Vec<usize>,
@@ -1968,6 +1999,7 @@ impl QwenSftFieldMap {
             field_strips: data.field_strips.clone(),
             field_splits: data.field_splits.clone(),
             field_truncations: data.field_truncations.clone(),
+            field_transforms: data.field_transforms.clone(),
             source_weights: data.source_weights.clone(),
             source_max_samples: data.source_max_samples.clone(),
             source_instruction_fields: data.source_instruction_fields.clone(),
@@ -2305,6 +2337,69 @@ impl QwenSftFieldMap {
                 );
             }
         }
+        for transform in &self.field_transforms {
+            match transform.op {
+                FieldTransformOp::Default => {
+                    if matches!(transform.field, FieldReplacementTarget::All) {
+                        bail!("data.field_transforms default op cannot target all");
+                    }
+                    if transform.value.is_empty() {
+                        bail!("data.field_transforms default op requires non-empty value");
+                    }
+                }
+                FieldTransformOp::Replace => {
+                    if transform.pattern.is_empty() {
+                        bail!("data.field_transforms replace op requires non-empty pattern");
+                    }
+                }
+                FieldTransformOp::RegexReplace => {
+                    if transform.pattern.is_empty() {
+                        bail!("data.field_transforms regex_replace op requires non-empty pattern");
+                    }
+                    regex::Regex::new(&transform.pattern).map_err(|error| {
+                        anyhow!(
+                            "data.field_transforms invalid regex_replace pattern {:?}: {error}",
+                            transform.pattern
+                        )
+                    })?;
+                }
+                FieldTransformOp::Case => {
+                    if transform.case.is_none() {
+                        bail!("data.field_transforms case op requires case");
+                    }
+                }
+                FieldTransformOp::Affix => {
+                    if transform.prefix.is_empty() && transform.suffix.is_empty() {
+                        bail!("data.field_transforms affix op requires prefix, suffix, or both");
+                    }
+                }
+                FieldTransformOp::Strip => {
+                    if transform.prefix.is_empty() && transform.suffix.is_empty() {
+                        bail!("data.field_transforms strip op requires prefix, suffix, or both");
+                    }
+                }
+                FieldTransformOp::Split => {
+                    if transform.delimiter.is_empty() {
+                        bail!("data.field_transforms split op requires non-empty delimiter");
+                    }
+                    if transform.side.is_none() {
+                        bail!("data.field_transforms split op requires side");
+                    }
+                }
+                FieldTransformOp::Truncate => {
+                    if transform.max_chars.is_none_or(|max_chars| max_chars == 0) {
+                        bail!(
+                            "data.field_transforms truncate op requires max_chars greater than zero"
+                        );
+                    }
+                }
+            }
+            if matches!(transform.field, FieldReplacementTarget::System) && !has_system_source {
+                bail!(
+                    "data.field_transforms targeting system requires data.system_field, data.chat_messages_field, or a system field_default/field_transform default to be set"
+                );
+            }
+        }
         Ok(())
     }
 
@@ -2315,6 +2410,10 @@ impl QwenSftFieldMap {
                 .field_defaults
                 .iter()
                 .any(|default| matches!(default.field, FieldDefaultTarget::System))
+            || self.field_transforms.iter().any(|transform| {
+                matches!(transform.field, FieldReplacementTarget::System)
+                    && matches!(transform.op, FieldTransformOp::Default)
+            })
     }
 }
 
@@ -2362,6 +2461,7 @@ impl Default for QwenSftFieldMap {
             field_strips: Vec::new(),
             field_splits: Vec::new(),
             field_truncations: Vec::new(),
+            field_transforms: Vec::new(),
             source_weights: Vec::new(),
             source_max_samples: Vec::new(),
             source_instruction_fields: Vec::new(),
@@ -14571,6 +14671,7 @@ fn qwen_sft_arrow_record_from_batch(
     qwen_apply_field_strips(&mut record, &field_map.field_strips);
     qwen_apply_field_splits(&mut record, &field_map.field_splits);
     qwen_apply_field_truncations(&mut record, &field_map.field_truncations);
+    qwen_apply_field_transforms(&mut record, &field_map.field_transforms, regex_plan);
     if field_map.normalize_whitespace {
         qwen_normalize_record_whitespace(&mut record);
     }
@@ -14807,6 +14908,7 @@ fn qwen_sft_record_from_jsonl_line(
         qwen_apply_field_strips(&mut record, &field_map.field_strips);
         qwen_apply_field_splits(&mut record, &field_map.field_splits);
         qwen_apply_field_truncations(&mut record, &field_map.field_truncations);
+        qwen_apply_field_transforms(&mut record, &field_map.field_transforms, regex_plan);
         if field_map.normalize_whitespace {
             qwen_normalize_record_whitespace(&mut record);
         }
@@ -14852,6 +14954,7 @@ fn qwen_sft_record_from_jsonl_line(
     qwen_apply_field_strips(&mut record, &field_map.field_strips);
     qwen_apply_field_splits(&mut record, &field_map.field_splits);
     qwen_apply_field_truncations(&mut record, &field_map.field_truncations);
+    qwen_apply_field_transforms(&mut record, &field_map.field_transforms, regex_plan);
     if field_map.normalize_whitespace {
         qwen_normalize_record_whitespace(&mut record);
     }
@@ -15248,6 +15351,131 @@ fn qwen_truncate_chars(value: &str, max_chars: usize) -> String {
     value.chars().take(max_chars).collect()
 }
 
+fn qwen_apply_field_transforms(
+    record: &mut QwenSftRecord,
+    transforms: &[FieldTransform],
+    regex_plan: &QwenSftRegexPlan,
+) {
+    let mut regex_replacements = regex_plan.transform_regex_replacements.iter();
+    for (index, transform) in transforms.iter().enumerate() {
+        match transform.op {
+            FieldTransformOp::Default => {
+                qwen_apply_field_transform_targets(record, transform.field, |value| {
+                    if value.trim().is_empty() {
+                        transform.value.clone()
+                    } else {
+                        value.to_string()
+                    }
+                });
+            }
+            FieldTransformOp::Replace => {
+                qwen_apply_field_transform_targets(record, transform.field, |value| {
+                    value.replace(&transform.pattern, &transform.replacement)
+                });
+            }
+            FieldTransformOp::RegexReplace => {
+                let Some(compiled) = regex_replacements.next() else {
+                    continue;
+                };
+                debug_assert_eq!(compiled.index, index);
+                qwen_apply_field_transform_targets(record, compiled.field, |value| {
+                    compiled
+                        .regex
+                        .replace_all(value, compiled.replacement.as_str())
+                        .into_owned()
+                });
+            }
+            FieldTransformOp::Case => {
+                let Some(case) = transform.case else {
+                    continue;
+                };
+                qwen_apply_field_transform_targets(record, transform.field, |value| {
+                    qwen_apply_field_case_transform(value, case)
+                });
+            }
+            FieldTransformOp::Affix => {
+                qwen_apply_field_transform_targets(record, transform.field, |value| {
+                    let mut transformed = String::with_capacity(
+                        transform.prefix.len() + value.len() + transform.suffix.len(),
+                    );
+                    transformed.push_str(&transform.prefix);
+                    transformed.push_str(value);
+                    transformed.push_str(&transform.suffix);
+                    transformed
+                });
+            }
+            FieldTransformOp::Strip => {
+                qwen_apply_field_transform_targets(record, transform.field, |value| {
+                    let without_prefix = value
+                        .strip_prefix(&transform.prefix)
+                        .filter(|_| !transform.prefix.is_empty())
+                        .unwrap_or(value);
+                    without_prefix
+                        .strip_suffix(&transform.suffix)
+                        .filter(|_| !transform.suffix.is_empty())
+                        .unwrap_or(without_prefix)
+                        .to_string()
+                });
+            }
+            FieldTransformOp::Split => {
+                let Some(side) = transform.side else {
+                    continue;
+                };
+                qwen_apply_field_transform_targets(record, transform.field, |value| {
+                    match value.split_once(&transform.delimiter) {
+                        Some((before, after)) => match side {
+                            FieldSplitSide::Before => before.to_string(),
+                            FieldSplitSide::After => after.to_string(),
+                        },
+                        None => value.to_string(),
+                    }
+                });
+            }
+            FieldTransformOp::Truncate => {
+                let Some(max_chars) = transform.max_chars else {
+                    continue;
+                };
+                qwen_apply_field_transform_targets(record, transform.field, |value| {
+                    qwen_truncate_chars(value, max_chars)
+                });
+            }
+        }
+    }
+}
+
+fn qwen_apply_field_transform_targets<F>(
+    record: &mut QwenSftRecord,
+    field: FieldReplacementTarget,
+    mut transform: F,
+) where
+    F: FnMut(&str) -> String,
+{
+    if matches!(
+        field,
+        FieldReplacementTarget::System | FieldReplacementTarget::All
+    ) {
+        record.system = transform(&record.system);
+    }
+    if matches!(
+        field,
+        FieldReplacementTarget::Instruction | FieldReplacementTarget::All
+    ) {
+        record.instruction = transform(&record.instruction);
+    }
+    if matches!(
+        field,
+        FieldReplacementTarget::Input | FieldReplacementTarget::All
+    ) {
+        record.input = transform(&record.input);
+    }
+    if matches!(
+        field,
+        FieldReplacementTarget::Response | FieldReplacementTarget::All
+    ) {
+        record.response = transform(&record.response);
+    }
+}
+
 fn qwen_field_default_value(defaults: &[FieldDefault], field: FieldDefaultTarget) -> Option<&str> {
     defaults
         .iter()
@@ -15610,6 +15838,54 @@ fn qwen_sft_hash_field_map(hash: &mut u64, field_map: &QwenSftFieldMap) {
             qwen_sft_hash_bytes(hash, format!("{:?}", truncation.field).as_bytes());
             qwen_sft_hash_bytes(hash, b"\0");
             qwen_sft_hash_bytes(hash, truncation.max_chars.to_string().as_bytes());
+            qwen_sft_hash_bytes(hash, b"\0");
+        }
+    }
+    if !field_map.field_transforms.is_empty() {
+        qwen_sft_hash_bytes(hash, b"field_transforms");
+        for transform in &field_map.field_transforms {
+            qwen_sft_hash_bytes(hash, format!("{:?}", transform.field).as_bytes());
+            qwen_sft_hash_bytes(hash, b"\0");
+            qwen_sft_hash_bytes(hash, format!("{:?}", transform.op).as_bytes());
+            qwen_sft_hash_bytes(hash, b"\0");
+            qwen_sft_hash_bytes(hash, transform.value.as_bytes());
+            qwen_sft_hash_bytes(hash, b"\0");
+            qwen_sft_hash_bytes(hash, transform.pattern.as_bytes());
+            qwen_sft_hash_bytes(hash, b"\0");
+            qwen_sft_hash_bytes(hash, transform.replacement.as_bytes());
+            qwen_sft_hash_bytes(hash, b"\0");
+            qwen_sft_hash_bytes(hash, transform.prefix.as_bytes());
+            qwen_sft_hash_bytes(hash, b"\0");
+            qwen_sft_hash_bytes(hash, transform.suffix.as_bytes());
+            qwen_sft_hash_bytes(hash, b"\0");
+            qwen_sft_hash_bytes(hash, transform.delimiter.as_bytes());
+            qwen_sft_hash_bytes(hash, b"\0");
+            qwen_sft_hash_bytes(
+                hash,
+                transform
+                    .side
+                    .map(|side| format!("{side:?}"))
+                    .unwrap_or_default()
+                    .as_bytes(),
+            );
+            qwen_sft_hash_bytes(hash, b"\0");
+            qwen_sft_hash_bytes(
+                hash,
+                transform
+                    .max_chars
+                    .map(|max_chars| max_chars.to_string())
+                    .unwrap_or_default()
+                    .as_bytes(),
+            );
+            qwen_sft_hash_bytes(hash, b"\0");
+            qwen_sft_hash_bytes(
+                hash,
+                transform
+                    .case
+                    .map(|case| format!("{case:?}"))
+                    .unwrap_or_default()
+                    .as_bytes(),
+            );
             qwen_sft_hash_bytes(hash, b"\0");
         }
     }
@@ -18743,6 +19019,107 @@ mod tests {
     }
 
     #[test]
+    fn qwen_sft_applies_field_transform_dsl_before_filters_and_fingerprint() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let jsonl = temp.path().join("samples.jsonl");
+        let cache_path = temp.path().join("cache").join("offset-index.json");
+        fs::write(
+            &jsonl,
+            r#"{"instruction":"Keep PROJECT-123::tail","input":"gpu context","response":"APPROVED:42 extra"}
+{"instruction":"Drop PROJECT-456::tail","input":"cpu context","response":"DENIED:99 extra"}
+"#,
+        )
+        .expect("jsonl should write");
+        let paths = vec![jsonl.clone()];
+        let field_map = QwenSftFieldMap {
+            instruction_contains_any: vec!["task Keep project-id".to_string()],
+            input_contains_any: vec!["GPU".to_string()],
+            response_contains_any: vec!["approved id".to_string()],
+            min_response_chars: 11,
+            max_response_chars: Some(11),
+            field_transforms: vec![
+                FieldTransform {
+                    field: FieldReplacementTarget::Instruction,
+                    op: FieldTransformOp::RegexReplace,
+                    pattern: r"PROJECT-\d+".to_string(),
+                    replacement: "project-id".to_string(),
+                    ..FieldTransform::default()
+                },
+                FieldTransform {
+                    field: FieldReplacementTarget::Instruction,
+                    op: FieldTransformOp::Split,
+                    delimiter: "::".to_string(),
+                    side: Some(FieldSplitSide::Before),
+                    ..FieldTransform::default()
+                },
+                FieldTransform {
+                    field: FieldReplacementTarget::Instruction,
+                    op: FieldTransformOp::Affix,
+                    prefix: "task ".to_string(),
+                    ..FieldTransform::default()
+                },
+                FieldTransform {
+                    field: FieldReplacementTarget::Input,
+                    op: FieldTransformOp::Case,
+                    case: Some(FieldCaseTransformKind::Uppercase),
+                    ..FieldTransform::default()
+                },
+                FieldTransform {
+                    field: FieldReplacementTarget::Response,
+                    op: FieldTransformOp::RegexReplace,
+                    pattern: r"APPROVED:\d+".to_string(),
+                    replacement: "approved id".to_string(),
+                    ..FieldTransform::default()
+                },
+                FieldTransform {
+                    field: FieldReplacementTarget::Response,
+                    op: FieldTransformOp::Truncate,
+                    max_chars: Some(11),
+                    ..FieldTransform::default()
+                },
+            ],
+            ..QwenSftFieldMap::default()
+        };
+
+        let loaded = qwen_sft_examples_from_jsonl_paths_with_limit(&paths, None, &field_map)
+            .expect("dsl-transformed examples should load");
+        let streamed = qwen_sft_streaming_source_summary(&paths, None, &field_map)
+            .expect("dsl-transformed streaming summary should scan");
+        let source_index = qwen_sft_streaming_source_index(&paths, None, &field_map)
+            .expect("dsl-transformed source index should build");
+        let raw_window = qwen_sft_examples_by_raw_indices(&source_index.samples, &field_map)
+            .expect("dsl-transformed raw window should read");
+        let first_cache =
+            qwen_sft_streaming_source_index_with_cache(&paths, None, Some(&cache_path), &field_map)
+                .expect("dsl-transformed cache should write");
+        let raw_map = QwenSftFieldMap {
+            field_transforms: Vec::new(),
+            input_contains_any: Vec::new(),
+            response_contains_any: Vec::new(),
+            max_response_chars: None,
+            ..field_map.clone()
+        };
+        let raw_fingerprint =
+            qwen_sft_streaming_fingerprint(&paths, None, &loaded.source_files, &raw_map)
+                .expect("raw fingerprint should compute");
+        let cache_mismatch =
+            qwen_sft_streaming_source_index_with_cache(&paths, None, Some(&cache_path), &raw_map)
+                .expect_err("cache should reject changed DSL transforms")
+                .to_string();
+
+        assert_eq!(loaded.examples.len(), 1);
+        assert_eq!(loaded.examples[0].instruction, "task Keep project-id");
+        assert_eq!(loaded.examples[0].input, "GPU CONTEXT");
+        assert_eq!(loaded.examples[0].response, "approved id");
+        assert_eq!(raw_window.examples, loaded.examples);
+        assert_eq!(streamed.samples, loaded.examples.len());
+        assert_eq!(streamed.fingerprint, loaded.fingerprint);
+        assert_ne!(loaded.fingerprint, raw_fingerprint);
+        assert!(first_cache.cache_written);
+        assert!(cache_mismatch.contains("field_map"));
+    }
+
+    #[test]
     fn qwen_sft_filters_fields_by_regex_before_limit_and_streaming_index() {
         let temp = tempfile::tempdir().expect("temp dir should be created");
         let jsonl = temp.path().join("samples.jsonl");
@@ -19227,6 +19604,7 @@ mod tests {
                 .expect("truncated cache should write");
         let raw_truncation_map = QwenSftFieldMap {
             field_truncations: Vec::new(),
+            field_transforms: Vec::new(),
             input_contains_any: Vec::new(),
             response_contains_any: Vec::new(),
             max_response_chars: None,

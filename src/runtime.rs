@@ -180,6 +180,8 @@ pub struct DataConfig {
     #[serde(default)]
     pub field_truncations: Vec<FieldTruncation>,
     #[serde(default)]
+    pub field_transforms: Vec<FieldTransform>,
+    #[serde(default)]
     pub source_weights: Vec<usize>,
     #[serde(default)]
     pub source_max_samples: Vec<usize>,
@@ -209,7 +211,7 @@ pub struct FieldRegexFilter {
     pub pattern: String,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum FieldReplacementTarget {
     System,
@@ -283,6 +285,61 @@ pub struct FieldSplit {
 pub enum FieldSplitSide {
     Before,
     After,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct FieldTransform {
+    pub field: FieldReplacementTarget,
+    pub op: FieldTransformOp,
+    #[serde(default)]
+    pub value: String,
+    #[serde(default)]
+    pub pattern: String,
+    #[serde(default)]
+    pub replacement: String,
+    #[serde(default)]
+    pub prefix: String,
+    #[serde(default)]
+    pub suffix: String,
+    #[serde(default)]
+    pub delimiter: String,
+    #[serde(default)]
+    pub side: Option<FieldSplitSide>,
+    #[serde(default)]
+    pub max_chars: Option<usize>,
+    #[serde(default)]
+    pub case: Option<FieldCaseTransformKind>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum FieldTransformOp {
+    Default,
+    Replace,
+    RegexReplace,
+    Case,
+    Affix,
+    Strip,
+    Split,
+    Truncate,
+}
+
+impl Default for FieldTransform {
+    fn default() -> Self {
+        Self {
+            field: FieldReplacementTarget::Instruction,
+            op: FieldTransformOp::Replace,
+            value: String::new(),
+            pattern: String::new(),
+            replacement: String::new(),
+            prefix: String::new(),
+            suffix: String::new(),
+            delimiter: String::new(),
+            side: None,
+            max_chars: None,
+            case: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -703,7 +760,11 @@ pub fn validate_config(config: &Config) -> Result<()> {
             || data
                 .field_defaults
                 .iter()
-                .any(|default| matches!(default.field, FieldDefaultTarget::System));
+                .any(|default| matches!(default.field, FieldDefaultTarget::System))
+            || data.field_transforms.iter().any(|transform| {
+                matches!(transform.field, FieldReplacementTarget::System)
+                    && matches!(transform.op, FieldTransformOp::Default)
+            });
         if !data.system_contains_any.is_empty() && !has_system_source {
             return Err(anyhow!(
                 "data.system_contains_any requires data.system_field or data.chat_messages_field to be set"
@@ -975,6 +1036,83 @@ pub fn validate_config(config: &Config) -> Result<()> {
                 ));
             }
         }
+        for transform in &data.field_transforms {
+            match transform.op {
+                FieldTransformOp::Default => {
+                    if matches!(transform.field, FieldReplacementTarget::All) {
+                        return Err(anyhow!(
+                            "data.field_transforms default op cannot target all"
+                        ));
+                    }
+                    if transform.value.is_empty() {
+                        return Err(anyhow!(
+                            "data.field_transforms default op requires non-empty value"
+                        ));
+                    }
+                }
+                FieldTransformOp::Replace => {
+                    if transform.pattern.is_empty() {
+                        return Err(anyhow!(
+                            "data.field_transforms replace op requires non-empty pattern"
+                        ));
+                    }
+                }
+                FieldTransformOp::RegexReplace => {
+                    if transform.pattern.is_empty() {
+                        return Err(anyhow!(
+                            "data.field_transforms regex_replace op requires non-empty pattern"
+                        ));
+                    }
+                    Regex::new(&transform.pattern).map_err(|error| {
+                        anyhow!(
+                            "data.field_transforms invalid regex_replace pattern {:?}: {error}",
+                            transform.pattern
+                        )
+                    })?;
+                }
+                FieldTransformOp::Case => {
+                    if transform.case.is_none() {
+                        return Err(anyhow!("data.field_transforms case op requires case"));
+                    }
+                }
+                FieldTransformOp::Affix => {
+                    if transform.prefix.is_empty() && transform.suffix.is_empty() {
+                        return Err(anyhow!(
+                            "data.field_transforms affix op requires prefix, suffix, or both"
+                        ));
+                    }
+                }
+                FieldTransformOp::Strip => {
+                    if transform.prefix.is_empty() && transform.suffix.is_empty() {
+                        return Err(anyhow!(
+                            "data.field_transforms strip op requires prefix, suffix, or both"
+                        ));
+                    }
+                }
+                FieldTransformOp::Split => {
+                    if transform.delimiter.is_empty() {
+                        return Err(anyhow!(
+                            "data.field_transforms split op requires non-empty delimiter"
+                        ));
+                    }
+                    if transform.side.is_none() {
+                        return Err(anyhow!("data.field_transforms split op requires side"));
+                    }
+                }
+                FieldTransformOp::Truncate => {
+                    if transform.max_chars.is_none_or(|max_chars| max_chars == 0) {
+                        return Err(anyhow!(
+                            "data.field_transforms truncate op requires max_chars greater than zero"
+                        ));
+                    }
+                }
+            }
+            if matches!(transform.field, FieldReplacementTarget::System) && !has_system_source {
+                return Err(anyhow!(
+                    "data.field_transforms targeting system requires data.system_field, data.chat_messages_field, or a system field_default/field_transform default to be set"
+                ));
+            }
+        }
         for path in &data.external_metadata_paths {
             if path.as_os_str().is_empty() {
                 return Err(anyhow!(
@@ -1144,6 +1282,30 @@ mod tests {
     }
 
     #[test]
+    fn data_field_transforms_must_be_valid() {
+        let mut config = qwen_lora_sft_config();
+        config
+            .data
+            .as_mut()
+            .unwrap()
+            .field_transforms
+            .push(FieldTransform {
+                field: FieldReplacementTarget::Instruction,
+                op: FieldTransformOp::RegexReplace,
+                pattern: "[".to_string(),
+                ..FieldTransform::default()
+            });
+
+        let error = validate_config(&config).expect_err("invalid regex should fail");
+
+        assert!(
+            error
+                .to_string()
+                .contains("data.field_transforms invalid regex_replace pattern")
+        );
+    }
+
+    #[test]
     fn data_field_regex_filters_must_be_valid_regexes() {
         let mut config = qwen_lora_sft_config();
         config
@@ -1260,6 +1422,7 @@ mod tests {
                 field_strips: Vec::new(),
                 field_splits: Vec::new(),
                 field_truncations: Vec::new(),
+                field_transforms: Vec::new(),
                 source_weights: Vec::new(),
                 source_max_samples: Vec::new(),
                 skip_invalid_records: false,

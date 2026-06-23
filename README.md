@@ -511,6 +511,15 @@ production-grade sharded checkpoint ownership remain open.
   must set at least one of `prefix` or `suffix`, split delimiters must be
   non-empty, and each `max_chars` entry must be greater than zero. Default
   empty lists preserve existing fingerprints.
+  `data.field_transforms` is the ordered transform DSL for the same SFT fields.
+  Each entry has `field` plus `op`, where `op` is one of `default`, `replace`,
+  `regex_replace`, `case`, `affix`, `strip`, `split`, or `truncate`; the entry
+  then uses the same operation-specific keys as the legacy lists (`value`,
+  `pattern`, `replacement`, `case`, `prefix`, `suffix`, `delimiter`, `side`,
+  or `max_chars`). The DSL runs after the legacy `field_*` transform lists and
+  before whitespace normalization, filtering, deduplication, splitting, and
+  streaming indexing. It is included in Qwen SFT fingerprints and offset-index
+  cache identity, so changing the ordered transform DSL rejects stale caches.
   These transforms run before train/eval splitting, `max_samples`, and
   streaming offset-index construction.
   `data.max_eval_samples` can optionally cap explicit held-out

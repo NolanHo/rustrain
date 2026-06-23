@@ -11,7 +11,8 @@ use serde::{Deserialize, Serialize};
 use crate::runtime::{
     DataConfig, FieldAffix, FieldCaseTransform, FieldCaseTransformKind, FieldDefault,
     FieldDefaultTarget, FieldRegexFilter, FieldRegexReplacement, FieldReplacement,
-    FieldReplacementTarget, FieldSplit, FieldSplitSide, FieldStrip, FieldTruncation,
+    FieldReplacementTarget, FieldSplit, FieldSplitSide, FieldStrip, FieldTransform,
+    FieldTransformOp, FieldTruncation,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -93,6 +94,7 @@ struct SftCache {
     field_strips: Vec<FieldStrip>,
     field_splits: Vec<FieldSplit>,
     field_truncations: Vec<FieldTruncation>,
+    field_transforms: Vec<FieldTransform>,
     max_eval_samples: Option<usize>,
     min_system_chars: Option<usize>,
     max_system_chars: Option<usize>,
@@ -285,6 +287,7 @@ pub fn load_sft_dataset(
         &data.field_strips,
         &data.field_splits,
         &data.field_truncations,
+        &data.field_transforms,
         data.max_eval_samples,
         data.min_system_chars,
         data.max_system_chars,
@@ -533,6 +536,7 @@ fn instruction_record_from_jsonl_line(data: &DataConfig, line: &str) -> Result<I
         apply_field_strips(&mut record, &data.field_strips);
         apply_field_splits(&mut record, &data.field_splits);
         apply_field_truncations(&mut record, &data.field_truncations);
+        apply_field_transforms(&mut record, &data.field_transforms)?;
         if data.normalize_whitespace {
             normalize_record_whitespace(&mut record);
         }
@@ -576,6 +580,7 @@ fn instruction_record_from_jsonl_line(data: &DataConfig, line: &str) -> Result<I
     apply_field_strips(&mut record, &data.field_strips);
     apply_field_splits(&mut record, &data.field_splits);
     apply_field_truncations(&mut record, &data.field_truncations);
+    apply_field_transforms(&mut record, &data.field_transforms)?;
     if data.normalize_whitespace {
         normalize_record_whitespace(&mut record);
     }
@@ -1094,6 +1099,131 @@ fn truncate_chars(value: &str, max_chars: usize) -> String {
     value.chars().take(max_chars).collect()
 }
 
+fn apply_field_transforms(
+    record: &mut InstructionRecord,
+    transforms: &[FieldTransform],
+) -> Result<()> {
+    for transform in transforms {
+        match transform.op {
+            FieldTransformOp::Default => {
+                apply_field_transform_targets(record, transform.field, |value| {
+                    if value.trim().is_empty() {
+                        transform.value.clone()
+                    } else {
+                        value.to_string()
+                    }
+                });
+            }
+            FieldTransformOp::Replace => {
+                apply_field_transform_targets(record, transform.field, |value| {
+                    value.replace(&transform.pattern, &transform.replacement)
+                });
+            }
+            FieldTransformOp::RegexReplace => {
+                let regex = Regex::new(&transform.pattern).with_context(|| {
+                    format!(
+                        "invalid data.field_transforms regex_replace pattern {:?}",
+                        transform.pattern
+                    )
+                })?;
+                apply_field_transform_targets(record, transform.field, |value| {
+                    regex
+                        .replace_all(value, transform.replacement.as_str())
+                        .into_owned()
+                });
+            }
+            FieldTransformOp::Case => {
+                let Some(case) = transform.case else {
+                    continue;
+                };
+                apply_field_transform_targets(record, transform.field, |value| {
+                    apply_field_case_transform(value, case)
+                });
+            }
+            FieldTransformOp::Affix => {
+                apply_field_transform_targets(record, transform.field, |value| {
+                    let mut transformed = String::with_capacity(
+                        transform.prefix.len() + value.len() + transform.suffix.len(),
+                    );
+                    transformed.push_str(&transform.prefix);
+                    transformed.push_str(value);
+                    transformed.push_str(&transform.suffix);
+                    transformed
+                });
+            }
+            FieldTransformOp::Strip => {
+                apply_field_transform_targets(record, transform.field, |value| {
+                    let without_prefix = value
+                        .strip_prefix(&transform.prefix)
+                        .filter(|_| !transform.prefix.is_empty())
+                        .unwrap_or(value);
+                    without_prefix
+                        .strip_suffix(&transform.suffix)
+                        .filter(|_| !transform.suffix.is_empty())
+                        .unwrap_or(without_prefix)
+                        .to_string()
+                });
+            }
+            FieldTransformOp::Split => {
+                let Some(side) = transform.side else {
+                    continue;
+                };
+                apply_field_transform_targets(record, transform.field, |value| {
+                    match value.split_once(&transform.delimiter) {
+                        Some((before, after)) => match side {
+                            FieldSplitSide::Before => before.to_string(),
+                            FieldSplitSide::After => after.to_string(),
+                        },
+                        None => value.to_string(),
+                    }
+                });
+            }
+            FieldTransformOp::Truncate => {
+                let Some(max_chars) = transform.max_chars else {
+                    continue;
+                };
+                apply_field_transform_targets(record, transform.field, |value| {
+                    truncate_chars(value, max_chars)
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+fn apply_field_transform_targets<F>(
+    record: &mut InstructionRecord,
+    field: FieldReplacementTarget,
+    mut transform: F,
+) where
+    F: FnMut(&str) -> String,
+{
+    if matches!(
+        field,
+        FieldReplacementTarget::System | FieldReplacementTarget::All
+    ) {
+        record.system = transform(&record.system);
+    }
+    if matches!(
+        field,
+        FieldReplacementTarget::Instruction | FieldReplacementTarget::All
+    ) {
+        record.instruction = transform(&record.instruction);
+    }
+    if matches!(
+        field,
+        FieldReplacementTarget::Input | FieldReplacementTarget::All
+    ) {
+        record.input = transform(&record.input);
+    }
+    if matches!(
+        field,
+        FieldReplacementTarget::Response | FieldReplacementTarget::All
+    ) {
+        record.response = transform(&record.response);
+    }
+}
+
 fn field_default_value(defaults: &[FieldDefault], field: FieldDefaultTarget) -> Option<&str> {
     defaults
         .iter()
@@ -1271,6 +1401,7 @@ fn write_sft_cache(
     field_strips: &[FieldStrip],
     field_splits: &[FieldSplit],
     field_truncations: &[FieldTruncation],
+    field_transforms: &[FieldTransform],
     max_eval_samples: Option<usize>,
     min_system_chars: Option<usize>,
     max_system_chars: Option<usize>,
@@ -1323,6 +1454,7 @@ fn write_sft_cache(
         field_strips: field_strips.to_vec(),
         field_splits: field_splits.to_vec(),
         field_truncations: field_truncations.to_vec(),
+        field_transforms: field_transforms.to_vec(),
         max_eval_samples,
         min_system_chars,
         max_system_chars,
@@ -1430,6 +1562,7 @@ mod tests {
             field_strips: Vec::new(),
             field_splits: Vec::new(),
             field_truncations: Vec::new(),
+            field_transforms: Vec::new(),
             source_weights: Vec::new(),
             source_max_samples: Vec::new(),
             skip_invalid_records: false,
@@ -1513,6 +1646,7 @@ mod tests {
             field_strips: Vec::new(),
             field_splits: Vec::new(),
             field_truncations: Vec::new(),
+            field_transforms: Vec::new(),
             source_weights: Vec::new(),
             source_max_samples: Vec::new(),
             skip_invalid_records: false,
@@ -1602,6 +1736,7 @@ mod tests {
             field_strips: Vec::new(),
             field_splits: Vec::new(),
             field_truncations: Vec::new(),
+            field_transforms: Vec::new(),
             source_weights: Vec::new(),
             source_max_samples: Vec::new(),
             skip_invalid_records: false,
@@ -1698,6 +1833,7 @@ mod tests {
             field_strips: Vec::new(),
             field_splits: Vec::new(),
             field_truncations: Vec::new(),
+            field_transforms: Vec::new(),
             source_weights: Vec::new(),
             source_max_samples: Vec::new(),
             skip_invalid_records: false,
@@ -1793,6 +1929,7 @@ mod tests {
             field_strips: Vec::new(),
             field_splits: Vec::new(),
             field_truncations: Vec::new(),
+            field_transforms: Vec::new(),
             source_weights: Vec::new(),
             source_max_samples: Vec::new(),
             skip_invalid_records: false,
@@ -1878,6 +2015,7 @@ mod tests {
             field_strips: Vec::new(),
             field_splits: Vec::new(),
             field_truncations: Vec::new(),
+            field_transforms: Vec::new(),
             source_weights: Vec::new(),
             source_max_samples: Vec::new(),
             skip_invalid_records: false,
@@ -1965,6 +2103,7 @@ mod tests {
             field_strips: Vec::new(),
             field_splits: Vec::new(),
             field_truncations: Vec::new(),
+            field_transforms: Vec::new(),
             source_weights: Vec::new(),
             source_max_samples: Vec::new(),
             skip_invalid_records: false,
@@ -2055,6 +2194,7 @@ mod tests {
             field_strips: Vec::new(),
             field_splits: Vec::new(),
             field_truncations: Vec::new(),
+            field_transforms: Vec::new(),
             source_weights: Vec::new(),
             source_max_samples: Vec::new(),
             skip_invalid_records: false,
@@ -2139,6 +2279,7 @@ mod tests {
             field_strips: Vec::new(),
             field_splits: Vec::new(),
             field_truncations: Vec::new(),
+            field_transforms: Vec::new(),
             source_weights: Vec::new(),
             source_max_samples: Vec::new(),
             skip_invalid_records: false,
@@ -2256,6 +2397,7 @@ mod tests {
             field_strips: Vec::new(),
             field_splits: Vec::new(),
             field_truncations: Vec::new(),
+            field_transforms: Vec::new(),
             source_weights: Vec::new(),
             source_max_samples: Vec::new(),
             skip_invalid_records: false,
@@ -2342,6 +2484,7 @@ mod tests {
             field_strips: Vec::new(),
             field_splits: Vec::new(),
             field_truncations: Vec::new(),
+            field_transforms: Vec::new(),
             source_weights: Vec::new(),
             source_max_samples: Vec::new(),
             skip_invalid_records: false,
@@ -2429,6 +2572,7 @@ mod tests {
             field_strips: Vec::new(),
             field_splits: Vec::new(),
             field_truncations: Vec::new(),
+            field_transforms: Vec::new(),
             source_weights: Vec::new(),
             source_max_samples: Vec::new(),
             skip_invalid_records: false,
@@ -2517,6 +2661,7 @@ mod tests {
             field_strips: Vec::new(),
             field_splits: Vec::new(),
             field_truncations: Vec::new(),
+            field_transforms: Vec::new(),
             source_weights: Vec::new(),
             source_max_samples: Vec::new(),
             skip_invalid_records: false,
@@ -2606,6 +2751,7 @@ mod tests {
             field_strips: Vec::new(),
             field_splits: Vec::new(),
             field_truncations: Vec::new(),
+            field_transforms: Vec::new(),
             source_weights: Vec::new(),
             source_max_samples: Vec::new(),
             skip_invalid_records: false,
@@ -2696,6 +2842,7 @@ mod tests {
             field_strips: Vec::new(),
             field_splits: Vec::new(),
             field_truncations: Vec::new(),
+            field_transforms: Vec::new(),
             source_weights: Vec::new(),
             source_max_samples: Vec::new(),
             skip_invalid_records: false,
@@ -2786,6 +2933,7 @@ mod tests {
             field_strips: Vec::new(),
             field_splits: Vec::new(),
             field_truncations: Vec::new(),
+            field_transforms: Vec::new(),
             source_weights: Vec::new(),
             source_max_samples: Vec::new(),
             skip_invalid_records: false,
@@ -2876,6 +3024,7 @@ mod tests {
             field_strips: Vec::new(),
             field_splits: Vec::new(),
             field_truncations: Vec::new(),
+            field_transforms: Vec::new(),
             source_weights: Vec::new(),
             source_max_samples: Vec::new(),
             skip_invalid_records: false,
@@ -2964,6 +3113,7 @@ mod tests {
             field_strips: Vec::new(),
             field_splits: Vec::new(),
             field_truncations: Vec::new(),
+            field_transforms: Vec::new(),
             source_weights: Vec::new(),
             source_max_samples: Vec::new(),
             skip_invalid_records: false,
@@ -3054,6 +3204,7 @@ mod tests {
             field_strips: Vec::new(),
             field_splits: Vec::new(),
             field_truncations: Vec::new(),
+            field_transforms: Vec::new(),
             source_weights: Vec::new(),
             source_max_samples: Vec::new(),
             skip_invalid_records: false,
@@ -3146,6 +3297,7 @@ mod tests {
             field_strips: Vec::new(),
             field_splits: Vec::new(),
             field_truncations: Vec::new(),
+            field_transforms: Vec::new(),
             source_weights: Vec::new(),
             source_max_samples: Vec::new(),
             skip_invalid_records: false,
@@ -3240,6 +3392,7 @@ mod tests {
             field_strips: Vec::new(),
             field_splits: Vec::new(),
             field_truncations: Vec::new(),
+            field_transforms: Vec::new(),
             source_weights: Vec::new(),
             source_max_samples: Vec::new(),
             skip_invalid_records: false,
@@ -3333,6 +3486,7 @@ mod tests {
             field_strips: Vec::new(),
             field_splits: Vec::new(),
             field_truncations: Vec::new(),
+            field_transforms: Vec::new(),
             source_weights: Vec::new(),
             source_max_samples: Vec::new(),
             skip_invalid_records: false,
@@ -3423,6 +3577,7 @@ mod tests {
             field_strips: Vec::new(),
             field_splits: Vec::new(),
             field_truncations: Vec::new(),
+            field_transforms: Vec::new(),
             source_weights: Vec::new(),
             source_max_samples: Vec::new(),
             skip_invalid_records: false,
@@ -3522,6 +3677,7 @@ mod tests {
             field_strips: Vec::new(),
             field_splits: Vec::new(),
             field_truncations: Vec::new(),
+            field_transforms: Vec::new(),
             source_weights: vec![2, 2],
             source_max_samples: Vec::new(),
             skip_invalid_records: false,
@@ -3616,6 +3772,7 @@ mod tests {
             field_strips: Vec::new(),
             field_splits: Vec::new(),
             field_truncations: Vec::new(),
+            field_transforms: Vec::new(),
             source_weights: vec![2, 2],
             source_max_samples: vec![1, 2],
             skip_invalid_records: false,
@@ -3706,6 +3863,7 @@ mod tests {
             field_strips: Vec::new(),
             field_splits: Vec::new(),
             field_truncations: Vec::new(),
+            field_transforms: Vec::new(),
             source_weights: Vec::new(),
             source_max_samples: Vec::new(),
             skip_invalid_records: false,
@@ -3794,6 +3952,7 @@ mod tests {
             field_strips: Vec::new(),
             field_splits: Vec::new(),
             field_truncations: Vec::new(),
+            field_transforms: Vec::new(),
             source_weights: Vec::new(),
             source_max_samples: Vec::new(),
             skip_invalid_records: false,
@@ -3889,6 +4048,7 @@ mod tests {
             field_strips: Vec::new(),
             field_splits: Vec::new(),
             field_truncations: Vec::new(),
+            field_transforms: Vec::new(),
             source_weights: Vec::new(),
             source_max_samples: Vec::new(),
             skip_invalid_records: true,
@@ -3984,6 +4144,7 @@ mod tests {
             field_strips: Vec::new(),
             field_splits: Vec::new(),
             field_truncations: Vec::new(),
+            field_transforms: Vec::new(),
             source_weights: Vec::new(),
             source_max_samples: Vec::new(),
             skip_invalid_records: false,
@@ -4090,6 +4251,7 @@ mod tests {
             field_strips: Vec::new(),
             field_splits: Vec::new(),
             field_truncations: Vec::new(),
+            field_transforms: Vec::new(),
             source_weights: Vec::new(),
             source_max_samples: Vec::new(),
             skip_invalid_records: false,
@@ -4193,6 +4355,7 @@ mod tests {
             field_strips: Vec::new(),
             field_splits: Vec::new(),
             field_truncations: Vec::new(),
+            field_transforms: Vec::new(),
             source_weights: Vec::new(),
             source_max_samples: Vec::new(),
             skip_invalid_records: false,
@@ -4290,6 +4453,7 @@ mod tests {
             field_strips: Vec::new(),
             field_splits: Vec::new(),
             field_truncations: Vec::new(),
+            field_transforms: Vec::new(),
             source_weights: Vec::new(),
             source_max_samples: Vec::new(),
             skip_invalid_records: false,
@@ -4404,6 +4568,7 @@ mod tests {
             field_strips: Vec::new(),
             field_splits: Vec::new(),
             field_truncations: Vec::new(),
+            field_transforms: Vec::new(),
             source_weights: Vec::new(),
             source_max_samples: Vec::new(),
             skip_invalid_records: false,
@@ -4502,6 +4667,7 @@ mod tests {
             field_strips: Vec::new(),
             field_splits: Vec::new(),
             field_truncations: Vec::new(),
+            field_transforms: Vec::new(),
             source_weights: Vec::new(),
             source_max_samples: Vec::new(),
             skip_invalid_records: false,
@@ -4526,6 +4692,141 @@ mod tests {
         assert!(!decoded.contains("rust   train"));
         assert!(!decoded.contains("approved   answer"));
         assert!(cache_text.contains("normalize_whitespace = true"));
+    }
+
+    #[test]
+    fn sft_dataset_applies_field_transform_dsl_before_filters_and_cache() {
+        let dir = tempdir().expect("temp dir should be created");
+        let data_dir = dir.path().join("sft");
+        let cache_dir = dir.path().join("cache");
+        fs::create_dir_all(&data_dir).expect("sft dir should be created");
+        fs::create_dir_all(&cache_dir).expect("cache dir should be created");
+        fs::write(
+            data_dir.join("sample.jsonl"),
+            "{\"instruction\":\"Keep PROJECT-123::tail\",\"input\":\"gpu context\",\"response\":\"APPROVED:42 extra\"}\n{\"instruction\":\"Keep PROJECT-456::tail\",\"input\":\"gpu eval\",\"response\":\"APPROVED:99 extra\"}\n{\"instruction\":\"Drop PROJECT-789::tail\",\"input\":\"cpu context\",\"response\":\"DENIED:99 extra\"}\n",
+        )
+        .expect("jsonl should write");
+
+        let data = DataConfig {
+            kind: DataKind::InstructionJsonl,
+            paths: vec![data_dir],
+            eval_paths: Vec::new(),
+            train_split: 0.5,
+            max_samples: None,
+            max_eval_samples: None,
+            shuffle: false,
+            index_cache: None,
+            instruction_field: "instruction".to_string(),
+            input_field: "input".to_string(),
+            response_field: "response".to_string(),
+            source_instruction_fields: Vec::new(),
+            source_input_fields: Vec::new(),
+            source_response_fields: Vec::new(),
+            system_field: None,
+            chat_messages_field: None,
+            min_system_chars: None,
+            max_system_chars: None,
+            system_contains_any: Vec::new(),
+            system_excludes_any: Vec::new(),
+            prompt_template: "Instruction:\n{instruction}\n\nResponse:\n".to_string(),
+            prompt_with_input_template:
+                "Instruction:\n{instruction}\n\nInput:\n{input}\n\nResponse:\n".to_string(),
+            trim_fields: true,
+            min_response_chars: 11,
+            max_response_chars: Some(11),
+            instruction_contains_any: vec!["task Keep project-id".to_string()],
+            instruction_excludes_any: Vec::new(),
+            response_contains_any: vec!["approved id".to_string()],
+            response_excludes_any: Vec::new(),
+            input_contains_any: vec!["GPU".to_string()],
+            input_excludes_any: Vec::new(),
+            field_regex_contains_any: Vec::new(),
+            field_regex_excludes_any: Vec::new(),
+            min_instruction_chars: None,
+            max_instruction_chars: None,
+            min_input_chars: None,
+            max_input_chars: None,
+            min_prompt_chars: None,
+            max_prompt_chars: None,
+            min_sample_chars: None,
+            max_sample_chars: None,
+            dedupe_samples: false,
+            field_replacements: Vec::new(),
+            field_regex_replacements: Vec::new(),
+            normalize_whitespace: false,
+            field_defaults: Vec::new(),
+            field_case_transforms: Vec::new(),
+            field_affixes: Vec::new(),
+            field_strips: Vec::new(),
+            field_splits: Vec::new(),
+            field_truncations: Vec::new(),
+            field_transforms: vec![
+                FieldTransform {
+                    field: FieldReplacementTarget::Instruction,
+                    op: FieldTransformOp::RegexReplace,
+                    pattern: r"PROJECT-\d+".to_string(),
+                    replacement: "project-id".to_string(),
+                    ..FieldTransform::default()
+                },
+                FieldTransform {
+                    field: FieldReplacementTarget::Instruction,
+                    op: FieldTransformOp::Split,
+                    delimiter: "::".to_string(),
+                    side: Some(FieldSplitSide::Before),
+                    ..FieldTransform::default()
+                },
+                FieldTransform {
+                    field: FieldReplacementTarget::Instruction,
+                    op: FieldTransformOp::Affix,
+                    prefix: "task ".to_string(),
+                    ..FieldTransform::default()
+                },
+                FieldTransform {
+                    field: FieldReplacementTarget::Input,
+                    op: FieldTransformOp::Case,
+                    case: Some(FieldCaseTransformKind::Uppercase),
+                    ..FieldTransform::default()
+                },
+                FieldTransform {
+                    field: FieldReplacementTarget::Response,
+                    op: FieldTransformOp::RegexReplace,
+                    pattern: r"APPROVED:\d+".to_string(),
+                    replacement: "approved id".to_string(),
+                    ..FieldTransform::default()
+                },
+                FieldTransform {
+                    field: FieldReplacementTarget::Response,
+                    op: FieldTransformOp::Truncate,
+                    max_chars: Some(11),
+                    ..FieldTransform::default()
+                },
+            ],
+            source_weights: Vec::new(),
+            source_max_samples: Vec::new(),
+            skip_invalid_records: false,
+            external_metadata_paths: Vec::new(),
+        };
+        let dataset =
+            load_sft_dataset(&data, 128, 96, &cache_dir).expect("SFT dataset should load");
+        let decoded = dataset
+            .train_samples
+            .iter()
+            .chain(dataset.eval_samples.iter())
+            .map(|sample| dataset.tokenizer.decode_lossy(&sample.tokens))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let cache_text =
+            fs::read_to_string(cache_dir.join("sft_tokenized.toml")).expect("cache should read");
+
+        assert_eq!(dataset.train_samples.len(), 1);
+        assert_eq!(dataset.eval_samples.len(), 1);
+        assert!(decoded.contains("task Keep project-id"));
+        assert!(decoded.contains("GPU CONTEXT"));
+        assert!(decoded.contains("approved id"));
+        assert!(!decoded.contains("tail"));
+        assert!(!decoded.contains("extra"));
+        assert!(cache_text.contains("field_transforms"));
+        assert!(cache_text.contains("regex_replace"));
     }
 
     #[test]
@@ -4611,6 +4912,7 @@ mod tests {
             field_strips: Vec::new(),
             field_splits: Vec::new(),
             field_truncations: Vec::new(),
+            field_transforms: Vec::new(),
             source_weights: Vec::new(),
             source_max_samples: Vec::new(),
             skip_invalid_records: false,
@@ -4729,6 +5031,7 @@ mod tests {
             field_strips: Vec::new(),
             field_splits: Vec::new(),
             field_truncations: Vec::new(),
+            field_transforms: Vec::new(),
             source_weights: Vec::new(),
             source_max_samples: Vec::new(),
             skip_invalid_records: false,
@@ -4837,6 +5140,7 @@ mod tests {
             ],
             field_splits: Vec::new(),
             field_truncations: Vec::new(),
+            field_transforms: Vec::new(),
             source_weights: Vec::new(),
             source_max_samples: Vec::new(),
             skip_invalid_records: false,
@@ -4944,6 +5248,7 @@ mod tests {
                     max_chars: 17,
                 },
             ],
+            field_transforms: Vec::new(),
             source_weights: Vec::new(),
             source_max_samples: Vec::new(),
             skip_invalid_records: false,
@@ -5053,6 +5358,7 @@ mod tests {
                 },
             ],
             field_truncations: Vec::new(),
+            field_transforms: Vec::new(),
             source_weights: Vec::new(),
             source_max_samples: Vec::new(),
             skip_invalid_records: false,
@@ -5152,6 +5458,7 @@ mod tests {
             field_strips: Vec::new(),
             field_splits: Vec::new(),
             field_truncations: Vec::new(),
+            field_transforms: Vec::new(),
             source_weights: Vec::new(),
             source_max_samples: Vec::new(),
             skip_invalid_records: false,

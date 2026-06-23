@@ -185,6 +185,7 @@ Acceptance:
   `data.field_affixes`, optional `data.field_strips`, optional
   `data.field_splits`, optional
   `data.field_truncations`, optional `data.normalize_whitespace`,
+  optional ordered `data.field_transforms` DSL entries,
   optional `data.field_regex_contains_any`, optional
   `data.field_regex_excludes_any`,
   `data.min_response_chars`, optional
