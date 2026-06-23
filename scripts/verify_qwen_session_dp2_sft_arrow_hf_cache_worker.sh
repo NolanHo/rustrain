@@ -7,6 +7,8 @@ source "${SCRIPT_DIR}/require_gpu_worker.sh"
 BASE_CONFIG="${RUSTRAIN_QWEN_SESSION_DP2_SFT_ARROW_HF_CONFIG:-configs/qwen_session_dp2_sft_arrow.toml}"
 HF_ARROW="${RUSTRAIN_HF_SFT_ARROW:-/vePFS-Mindverse/share/huggingface/datasets/iamtarun___code_instructions_120k_alpaca/default/0.0.0/31f725b2d714c1b4f038e80fbaa6b977870a50b7/code_instructions_120k_alpaca-train.arrow}"
 MIN_SAMPLES="${RUSTRAIN_HF_SFT_ARROW_MIN_SAMPLES:-100000}"
+TRAIN_STEPS="${RUSTRAIN_HF_SFT_ARROW_TRAIN_STEPS:-1}"
+TRAINABLE_LAYERS="${RUSTRAIN_HF_SFT_ARROW_TRAINABLE_LAYERS:-0}"
 RUN_DIR="$(mktemp -d /tmp/rustrain-dp2-arrow-hf-cache-XXXXXX)"
 CONFIG="${RUN_DIR}/config.toml"
 FIRST_OUTPUT_DIR="${RUN_DIR}/first"
@@ -19,7 +21,7 @@ if [ ! -f "${HF_ARROW}" ]; then
   exit 1
 fi
 
-python - "${BASE_CONFIG}" "${CONFIG}" "${HF_ARROW}" "${CACHE_PATH}" <<'PY'
+python - "${BASE_CONFIG}" "${CONFIG}" "${HF_ARROW}" "${CACHE_PATH}" "${TRAIN_STEPS}" "${TRAINABLE_LAYERS}" <<'PY'
 import pathlib
 import sys
 
@@ -27,16 +29,46 @@ source = pathlib.Path(sys.argv[1])
 target = pathlib.Path(sys.argv[2])
 arrow_path = pathlib.Path(sys.argv[3]).as_posix()
 cache_path = pathlib.Path(sys.argv[4]).as_posix()
+train_steps = int(sys.argv[5])
+trainable_layers = [
+    int(value.strip())
+    for value in sys.argv[6].split(",")
+    if value.strip()
+]
 lines = []
 in_data = False
+in_train = False
+in_model = False
 for line in source.read_text().splitlines():
     stripped = line.strip()
-    if stripped == "[data]":
-        in_data = True
-        lines.append(line)
-        continue
     if line.startswith("[") and stripped != "[data]":
         in_data = False
+    if stripped == "[train]":
+        in_train = True
+        in_model = False
+        lines.append(line)
+        continue
+    if stripped == "[model]":
+        in_model = True
+        in_train = False
+        lines.append(line)
+        continue
+    if stripped == "[data]":
+        in_data = True
+        in_train = False
+        in_model = False
+        lines.append(line)
+        continue
+    if line.startswith("["):
+        in_train = False
+        in_model = False
+    if in_train and line.startswith("max_steps = "):
+        lines.append(f"max_steps = {train_steps}")
+        continue
+    if in_model and line.startswith("trainable_layers = "):
+        layers = ", ".join(str(layer) for layer in trainable_layers)
+        lines.append(f"trainable_layers = [{layers}]")
+        continue
     if in_data and line.startswith("max_samples = "):
         continue
     if in_data and line.startswith("paths = "):
@@ -69,6 +101,8 @@ python - \
   "${CACHE_PATH}" \
   "${HF_ARROW}" \
   "${MIN_SAMPLES}" \
+  "${TRAIN_STEPS}" \
+  "${TRAINABLE_LAYERS}" \
   "${FIRST_ELAPSED}" \
   "${SECOND_ELAPSED}" <<'PY'
 import json
@@ -86,8 +120,14 @@ second_dir = pathlib.Path(sys.argv[2])
 cache_base = pathlib.Path(sys.argv[3])
 expected_arrow = pathlib.Path(sys.argv[4]).as_posix()
 min_samples = int(sys.argv[5])
-first_elapsed_secs = int(sys.argv[6])
-second_elapsed_secs = int(sys.argv[7])
+expected_steps = int(sys.argv[6])
+expected_trainable_layers = [
+    int(value.strip())
+    for value in sys.argv[7].split(",")
+    if value.strip()
+]
+first_elapsed_secs = int(sys.argv[8])
+second_elapsed_secs = int(sys.argv[9])
 
 
 def rank_cache(rank: int) -> pathlib.Path:
@@ -171,8 +211,14 @@ for rank in [0, 1]:
             raise SystemExit(f"{path} expected instruction_arrow, got {data['data_kind']}")
         if int(data["world_size"]) != 2:
             raise SystemExit(f"{path} expected world_size 2, got {data['world_size']}")
-        if int(data["steps"]) != 1 or int(data["local_batch_size"]) != 1:
-            raise SystemExit(f"{path} expected one DP step with local batch 1, got steps={data['steps']} local={data['local_batch_size']}")
+        if int(data["steps"]) != expected_steps or int(data["local_batch_size"]) != 1:
+            raise SystemExit(f"{path} expected {expected_steps} DP step(s) with local batch 1, got steps={data['steps']} local={data['local_batch_size']}")
+        trainable_tensors = data.get("trainable_tensors") or []
+        for layer in expected_trainable_layers:
+            for suffix in ["self_attn.q_proj.weight", "mlp.down_proj.weight"]:
+                expected_name = f"model.layers.{layer}.{suffix}"
+                if expected_name not in trainable_tensors:
+                    raise SystemExit(f"{path} missing trainable tensor {expected_name}: {trainable_tensors}")
         if int(data["sequence_tokens"]) <= 0:
             raise SystemExit(f"{path} expected positive sequence_tokens, got {data['sequence_tokens']}")
         if float(data["tokens_per_second"]) <= 0.0:
@@ -232,7 +278,7 @@ for rank in [0, 1]:
         if len(cache.get("samples", [])) != total_samples:
             raise SystemExit(f"{path} expected {total_samples} cached row indices, got {len(cache.get('samples', []))}")
 
-        expected_cursor_end = int(data["steps"]) * int(data["local_batch_size"]) * int(data["world_size"])
+        expected_cursor_end = expected_steps * int(data["local_batch_size"]) * int(data["world_size"])
         if int(data["data_cursor_start"]) != 0:
             raise SystemExit(f"{path} expected data_cursor_start 0, got {data['data_cursor_start']}")
         if int(data["data_cursor_end"]) != expected_cursor_end:
