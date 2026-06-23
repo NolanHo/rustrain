@@ -683,6 +683,10 @@ struct QwenSessionDpRankSummary {
     tensor_count: usize,
     steps: usize,
     learning_rate: f64,
+    tokens_per_second: f64,
+    samples_per_second: f64,
+    memory_rss_mb: Option<f64>,
+    gpu_memory_allocated_mb: Option<f64>,
     max_grad_delta: f32,
     loss_delta: f64,
     local_loss: f64,
@@ -5631,6 +5635,7 @@ pub fn qwen_session_dp_rank_smoke(
     let mut trainable_summaries = Vec::new();
     let mut last_artifacts: Option<QwenTrainStepArtifacts> = None;
     let global_batch_size = batch_plan.local_batch_size * world_size;
+    let train_started = Instant::now();
     for step in 0..steps {
         let batch_index = if batch_plan.train_sample_count.is_some() {
             step * global_batch_size
@@ -5678,6 +5683,11 @@ pub fn qwen_session_dp_rank_smoke(
         )?[0];
         global_step_losses.push(reduced_post_update_loss as f64 / world_size as f64);
     }
+    let train_elapsed_secs = train_started.elapsed().as_secs_f64().max(1e-9);
+    let trained_samples = batch_plan.local_batch_size * steps;
+    let trained_tokens = trained_samples * batch_plan.sequence_tokens;
+    let samples_per_second = trained_samples as f64 / train_elapsed_secs;
+    let tokens_per_second = trained_tokens as f64 / train_elapsed_secs;
     let global_post_update_loss = *global_step_losses
         .last()
         .ok_or_else(|| anyhow!("missing Qwen session DP post-update loss"))?;
@@ -6038,6 +6048,10 @@ pub fn qwen_session_dp_rank_smoke(
         tensor_count: local_grads.len(),
         steps,
         learning_rate,
+        tokens_per_second,
+        samples_per_second,
+        memory_rss_mb: crate::metrics::memory_rss_mb(),
+        gpu_memory_allocated_mb: crate::metrics::gpu_memory_allocated_mb(),
         max_grad_delta,
         loss_delta,
         local_loss,

@@ -53,6 +53,9 @@ remote_run_2gpu env \
   RUSTRAIN_LAUNCH_TIMEOUT_SECS=900 \
   bash scripts/verify_qwen_session_dp2_sft_arrow_unbounded_cache_worker.sh
 remote_run_2gpu env \
+  RUSTRAIN_LAUNCH_TIMEOUT_SECS=1200 \
+  bash scripts/verify_qwen_session_dp2_sft_arrow_hf_cache_worker.sh
+remote_run_2gpu env \
   RUSTRAIN_LAUNCH_TIMEOUT_SECS=900 \
   bash scripts/verify_qwen_session_dp2_sft_arrow_index_cache_worker.sh
 remote_run_2gpu env \
