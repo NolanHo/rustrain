@@ -100,6 +100,12 @@ pub struct DataConfig {
     #[serde(default = "default_response_field")]
     pub response_field: String,
     #[serde(default)]
+    pub source_instruction_fields: Vec<String>,
+    #[serde(default)]
+    pub source_input_fields: Vec<String>,
+    #[serde(default)]
+    pub source_response_fields: Vec<String>,
+    #[serde(default)]
     pub system_field: Option<String>,
     #[serde(default)]
     pub chat_messages_field: Option<String>,
@@ -607,6 +613,28 @@ pub fn validate_config(config: &Config) -> Result<()> {
             return Err(anyhow!(
                 "data.source_max_samples entries must be greater than zero"
             ));
+        }
+        for (name, values, required) in [
+            (
+                "data.source_instruction_fields",
+                &data.source_instruction_fields,
+                true,
+            ),
+            ("data.source_input_fields", &data.source_input_fields, false),
+            (
+                "data.source_response_fields",
+                &data.source_response_fields,
+                true,
+            ),
+        ] {
+            if !(values.is_empty() || values.len() == 1 || values.len() == data.paths.len()) {
+                return Err(anyhow!(
+                    "{name} must be empty, length 1, or match data.paths length"
+                ));
+            }
+            if required && values.iter().any(|field| field.trim().is_empty()) {
+                return Err(anyhow!("{name} entries must not be empty"));
+            }
         }
         if let Some(max_response_chars) = data.max_response_chars {
             if max_response_chars == 0 {
@@ -1192,6 +1220,9 @@ mod tests {
                 instruction_field: default_instruction_field(),
                 input_field: default_input_field(),
                 response_field: default_response_field(),
+                source_instruction_fields: Vec::new(),
+                source_input_fields: Vec::new(),
+                source_response_fields: Vec::new(),
                 system_field: None,
                 chat_messages_field: None,
                 min_system_chars: None,

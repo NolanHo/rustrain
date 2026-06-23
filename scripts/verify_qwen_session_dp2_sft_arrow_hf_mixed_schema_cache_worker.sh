@@ -81,6 +81,9 @@ for line in source.read_text().splitlines():
     if in_data and line.startswith("paths = "):
         lines.append(f'paths = ["{alpaca_path}", "{qa_path}"]')
         lines.append(f'index_cache = "{cache_path}"')
+        lines.append('source_instruction_fields = ["instruction", "question"]')
+        lines.append('source_input_fields = ["input", ""]')
+        lines.append('source_response_fields = ["output", "answer"]')
         continue
     lines.append(line)
 target.write_text("\n".join(lines) + "\n")
@@ -291,6 +294,12 @@ for rank in [0, 1]:
             raise SystemExit(f"{path} unbounded Arrow cache should record max_samples null, got {cache.get('max_samples')}")
         if cache.get("field_map", {}).get("input") != "input":
             raise SystemExit(f"{path} cache field_map input should stay default for mixed Arrow: {cache.get('field_map')}")
+        if cache.get("field_map", {}).get("source_instruction_fields") != ["instruction", "question"]:
+            raise SystemExit(f"{path} cache source_instruction_fields mismatch: {cache.get('field_map')}")
+        if cache.get("field_map", {}).get("source_input_fields") != ["input", ""]:
+            raise SystemExit(f"{path} cache source_input_fields mismatch: {cache.get('field_map')}")
+        if cache.get("field_map", {}).get("source_response_fields") != ["output", "answer"]:
+            raise SystemExit(f"{path} cache source_response_fields mismatch: {cache.get('field_map')}")
         if cache.get("summary", {}).get("samples") != total_samples:
             raise SystemExit(f"{path} cache summary samples mismatch: {cache.get('summary')}")
         if cache.get("summary", {}).get("fingerprint") != data["dataset_fingerprint"]:

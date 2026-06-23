@@ -1599,6 +1599,8 @@ struct QwenSftRawSampleIndex {
     index_in_file: usize,
     global_index: usize,
     byte_offset: u64,
+    #[serde(default)]
+    field_map: QwenSftSourceFieldMap,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1606,6 +1608,8 @@ struct QwenSftArrowRawSampleIndex {
     path: String,
     row_index: usize,
     global_index: usize,
+    #[serde(default)]
+    field_map: QwenSftSourceFieldMap,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1705,6 +1709,13 @@ struct QwenSftRecord {
     instruction: String,
     input: String,
     response: String,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+struct QwenSftSourceFieldMap {
+    instruction: Option<String>,
+    input: Option<String>,
+    response: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1858,6 +1869,12 @@ struct QwenSftFieldMap {
     #[serde(default)]
     source_max_samples: Vec<usize>,
     #[serde(default)]
+    source_instruction_fields: Vec<String>,
+    #[serde(default)]
+    source_input_fields: Vec<String>,
+    #[serde(default)]
+    source_response_fields: Vec<String>,
+    #[serde(default)]
     skip_invalid_records: bool,
     #[serde(default)]
     external_metadata: Vec<QwenSftExternalMetadata>,
@@ -1953,6 +1970,9 @@ impl QwenSftFieldMap {
             field_truncations: data.field_truncations.clone(),
             source_weights: data.source_weights.clone(),
             source_max_samples: data.source_max_samples.clone(),
+            source_instruction_fields: data.source_instruction_fields.clone(),
+            source_input_fields: data.source_input_fields.clone(),
+            source_response_fields: data.source_response_fields.clone(),
             skip_invalid_records: data.skip_invalid_records,
             external_metadata: qwen_sft_external_metadata_from_paths(
                 &data.external_metadata_paths,
@@ -2015,6 +2035,23 @@ impl QwenSftFieldMap {
         }
         if self.source_max_samples.iter().any(|limit| *limit == 0) {
             bail!("data.source_max_samples entries must be greater than zero");
+        }
+        for (name, values, required) in [
+            (
+                "data.source_instruction_fields",
+                &self.source_instruction_fields,
+                true,
+            ),
+            ("data.source_input_fields", &self.source_input_fields, false),
+            (
+                "data.source_response_fields",
+                &self.source_response_fields,
+                true,
+            ),
+        ] {
+            if required && values.iter().any(|field| field.trim().is_empty()) {
+                bail!("{name} entries must not be empty");
+            }
         }
         if let Some(max_response_chars) = self.max_response_chars {
             if max_response_chars == 0 {
@@ -2327,6 +2364,9 @@ impl Default for QwenSftFieldMap {
             field_truncations: Vec::new(),
             source_weights: Vec::new(),
             source_max_samples: Vec::new(),
+            source_instruction_fields: Vec::new(),
+            source_input_fields: Vec::new(),
+            source_response_fields: Vec::new(),
             skip_invalid_records: false,
             external_metadata: Vec::new(),
         }
@@ -12578,6 +12618,9 @@ fn qwen_sft_eval_field_map(field_map: &QwenSftFieldMap) -> QwenSftFieldMap {
     let mut eval_field_map = field_map.clone();
     eval_field_map.source_weights.clear();
     eval_field_map.source_max_samples.clear();
+    eval_field_map.source_instruction_fields.clear();
+    eval_field_map.source_input_fields.clear();
+    eval_field_map.source_response_fields.clear();
     eval_field_map
 }
 
@@ -12649,27 +12692,30 @@ fn qwen_sft_examples_from_jsonl_paths_with_limit(
     }
     let source_weights = qwen_sft_source_weights(paths.len(), field_map)?;
     let source_max_samples = qwen_sft_source_max_samples(paths.len(), field_map)?;
-    let regex_plan = QwenSftRegexPlan::compile(field_map)?;
+    let source_field_maps = qwen_sft_source_field_maps(paths.len(), field_map)?;
     let mut examples = Vec::new();
     let mut source_files = BTreeSet::new();
     let mut source_sample_counts = BTreeMap::new();
     let mut seen_records = field_map.dedupe_samples.then(HashSet::new);
-    for ((path, source_weight), source_limit) in paths
+    for (((path, source_weight), source_limit), source_field_map) in paths
         .iter()
         .zip(source_weights.iter().copied())
         .zip(source_max_samples.iter().copied())
+        .zip(source_field_maps.iter())
     {
         if max_samples.is_some_and(|limit| examples.len() >= limit) {
             break;
         }
         let global_remaining = max_samples.map(|limit| limit.saturating_sub(examples.len()));
+        let local_field_map = qwen_sft_field_map_for_source(field_map, source_field_map);
+        let local_regex_plan = QwenSftRegexPlan::compile(&local_field_map)?;
         let example_set = qwen_sft_examples_from_jsonl_path_with_limit(
             path,
             global_remaining,
             source_limit,
             source_weight,
-            field_map,
-            &regex_plan,
+            &local_field_map,
+            &local_regex_plan,
             &mut seen_records,
         )?;
         examples.extend(example_set.examples);
@@ -12717,20 +12763,23 @@ fn qwen_sft_streaming_source_scan(
     }
     let source_weights = qwen_sft_source_weights(paths.len(), field_map)?;
     let source_max_samples = qwen_sft_source_max_samples(paths.len(), field_map)?;
-    let regex_plan = QwenSftRegexPlan::compile(field_map)?;
+    let source_field_maps = qwen_sft_source_field_maps(paths.len(), field_map)?;
     let mut samples = Vec::new();
     let mut source_files = BTreeSet::new();
     let mut source_sample_counts = BTreeMap::new();
     let mut seen_records = field_map.dedupe_samples.then(HashSet::new);
 
-    for ((path, source_weight), source_limit) in paths
+    for (((path, source_weight), source_limit), source_field_map) in paths
         .iter()
         .zip(source_weights.iter().copied())
         .zip(source_max_samples.iter().copied())
+        .zip(source_field_maps.iter())
     {
         if max_samples.is_some_and(|limit| samples.len() >= limit) {
             break;
         }
+        let local_field_map = qwen_sft_field_map_for_source(field_map, source_field_map);
+        let local_regex_plan = QwenSftRegexPlan::compile(&local_field_map)?;
         let mut source_samples = 0usize;
         for file in qwen_sft_jsonl_files(path)? {
             if max_samples.is_some_and(|limit| samples.len() >= limit)
@@ -12771,8 +12820,8 @@ fn qwen_sft_streaming_source_scan(
                 }
                 let Some(record) = maybe_qwen_sft_record_from_jsonl_line(
                     &line,
-                    field_map,
-                    &regex_plan,
+                    &local_field_map,
+                    &local_regex_plan,
                     &file,
                     line_index + 1,
                 )?
@@ -12780,7 +12829,7 @@ fn qwen_sft_streaming_source_scan(
                     line_index += 1;
                     continue;
                 };
-                if !qwen_sft_record_passes_filters(&record, field_map, &regex_plan) {
+                if !qwen_sft_record_passes_filters(&record, &local_field_map, &local_regex_plan) {
                     line_index += 1;
                     continue;
                 }
@@ -12800,6 +12849,7 @@ fn qwen_sft_streaming_source_scan(
                         index_in_file: line_index,
                         global_index: samples.len(),
                         byte_offset,
+                        field_map: source_field_map.clone(),
                     });
                     *source_sample_counts.entry(file_path.clone()).or_insert(0) += 1;
                 }
@@ -12996,12 +13046,12 @@ fn qwen_sft_examples_by_raw_indices_with_regex_plan(
     if raw_indices.is_empty() {
         bail!("SFT streaming raw index read requires at least one sample");
     }
-    let mut by_path: BTreeMap<String, BTreeSet<usize>> = BTreeMap::new();
+    let mut by_path: BTreeMap<String, Vec<&QwenSftRawSampleIndex>> = BTreeMap::new();
     for raw_index in raw_indices {
         by_path
             .entry(raw_index.path.clone())
             .or_default()
-            .insert(raw_index.index_in_file);
+            .push(raw_index);
     }
 
     let mut loaded = BTreeMap::new();
@@ -13011,11 +13061,16 @@ fn qwen_sft_examples_by_raw_indices_with_regex_plan(
             .entry((raw_index.path.clone(), raw_index.index_in_file))
             .or_insert(raw_index.byte_offset);
     }
-    for (path, wanted_indices) in &by_path {
+    for (path, wanted_raw_indices) in &by_path {
+        let wanted_indices = wanted_raw_indices
+            .iter()
+            .map(|raw_index| raw_index.index_in_file)
+            .collect::<BTreeSet<_>>();
         let mut file = fs::File::open(path).with_context(|| format!("failed to read {path}"))?;
-        for index_in_file in wanted_indices {
+        for raw_index in wanted_raw_indices {
+            let index_in_file = raw_index.index_in_file;
             let byte_offset = *offsets_by_sample
-                .get(&(path.clone(), *index_in_file))
+                .get(&(path.clone(), index_in_file))
                 .ok_or_else(|| {
                     anyhow!(
                         "SFT streaming raw sample offset not found: {}:{}",
@@ -13023,7 +13078,7 @@ fn qwen_sft_examples_by_raw_indices_with_regex_plan(
                         index_in_file + 1
                     )
                 })?;
-            if !wanted_indices.contains(index_in_file) {
+            if !wanted_indices.contains(&index_in_file) {
                 continue;
             }
             file.seek(SeekFrom::Start(byte_offset)).with_context(|| {
@@ -13045,16 +13100,26 @@ fn qwen_sft_examples_by_raw_indices_with_regex_plan(
             if line.trim().is_empty() {
                 continue;
             }
-            let record = qwen_sft_record_from_jsonl_line(&line, field_map, regex_plan)
-                .with_context(|| {
-                    format!(
-                        "failed to parse SFT JSONL record {path}:{} at byte offset {}",
-                        index_in_file + 1,
-                        byte_offset
-                    )
-                })?;
+            let local_field_map = qwen_sft_field_map_for_source(field_map, &raw_index.field_map);
+            let local_regex_plan = if raw_index.field_map == QwenSftSourceFieldMap::default() {
+                None
+            } else {
+                Some(QwenSftRegexPlan::compile(&local_field_map)?)
+            };
+            let record = qwen_sft_record_from_jsonl_line(
+                &line,
+                &local_field_map,
+                local_regex_plan.as_ref().unwrap_or(regex_plan),
+            )
+            .with_context(|| {
+                format!(
+                    "failed to parse SFT JSONL record {path}:{} at byte offset {}",
+                    index_in_file + 1,
+                    byte_offset
+                )
+            })?;
             loaded.insert(
-                (path.clone(), *index_in_file),
+                (path.clone(), index_in_file),
                 QwenSftExample {
                     system: record.system,
                     instruction: record.instruction,
@@ -13268,15 +13333,17 @@ fn qwen_sft_arrow_source_scan(
     }
     let source_weights = qwen_sft_source_weights(paths.len(), field_map)?;
     let source_max_samples = qwen_sft_source_max_samples(paths.len(), field_map)?;
+    let source_field_maps = qwen_sft_source_field_maps(paths.len(), field_map)?;
     let mut samples = Vec::new();
     let mut source_files = BTreeSet::new();
     let mut source_sample_counts = BTreeMap::new();
     let mut seen_examples = field_map.dedupe_samples.then(HashSet::new);
 
-    for ((path, source_weight), source_limit) in paths
+    for (((path, source_weight), source_limit), source_field_map) in paths
         .iter()
         .zip(source_weights.iter().copied())
         .zip(source_max_samples.iter().copied())
+        .zip(source_field_maps.iter())
     {
         if max_samples.is_some_and(|limit| samples.len() >= limit) {
             break;
@@ -13298,11 +13365,12 @@ fn qwen_sft_arrow_source_scan(
         if source_remaining == Some(0) {
             continue;
         }
+        let local_field_map = qwen_sft_field_map_for_source(field_map, source_field_map);
         let source_file = path.display().to_string();
         let source_scan = qwen_sft_arrow_scan_indices_from_ipc(
             path,
             source_remaining,
-            field_map,
+            &local_field_map,
             &mut seen_examples,
         )?;
         for row_index in source_scan.row_indices {
@@ -13318,6 +13386,7 @@ fn qwen_sft_arrow_source_scan(
                     path: source_file.clone(),
                     row_index,
                     global_index: samples.len(),
+                    field_map: source_field_map.clone(),
                 });
                 *source_sample_counts.entry(source_file.clone()).or_insert(0) += 1;
             }
@@ -13759,25 +13828,29 @@ fn qwen_sft_arrow_examples_by_raw_indices(
     if raw_indices.is_empty() {
         bail!("SFT Arrow raw index read requires at least one sample");
     }
-    let mut max_row_by_path: BTreeMap<String, usize> = BTreeMap::new();
+    let mut max_row_by_path: BTreeMap<String, (&QwenSftSourceFieldMap, usize)> = BTreeMap::new();
     let wanted = raw_indices
         .iter()
         .map(|index| {
             max_row_by_path
                 .entry(index.path.clone())
-                .and_modify(|max_row| *max_row = (*max_row).max(index.row_index))
-                .or_insert(index.row_index);
+                .and_modify(|(field_map, max_row)| {
+                    debug_assert_eq!(*field_map, &index.field_map);
+                    *max_row = (*max_row).max(index.row_index);
+                })
+                .or_insert((&index.field_map, index.row_index));
             (index.path.clone(), index.row_index)
         })
         .collect::<BTreeSet<_>>();
     let mut loaded = BTreeMap::new();
-    for (path, max_row_index) in max_row_by_path {
+    for (path, (source_field_map, max_row_index)) in max_row_by_path {
         let path_buf = PathBuf::from(&path);
+        let local_field_map = qwen_sft_field_map_for_source(field_map, source_field_map);
         let arrow = qwen_sft_arrow_examples_from_ipc_with_limit_policy(
             &path_buf,
             Some(max_row_index + 1),
             false,
-            field_map,
+            &local_field_map,
         )?;
         for (row_index, example) in arrow.row_indices.into_iter().zip(arrow.examples) {
             if wanted.contains(&(path.clone(), row_index)) {
@@ -13825,10 +13898,18 @@ fn qwen_sft_arrow_streaming_fingerprint_from_index(
             .position(|sample| sample.path != path)
             .map(|relative| offset + relative)
             .unwrap_or(index.samples.len());
+        if index.samples[offset..end]
+            .iter()
+            .any(|sample| sample.field_map != index.samples[offset].field_map)
+        {
+            bail!("SFT Arrow raw samples for {path} used multiple source field maps");
+        }
+        let local_field_map =
+            qwen_sft_field_map_for_source(field_map, &index.samples[offset].field_map);
         qwen_sft_arrow_hash_index_segment_from_ipc(
             Path::new(&path),
             &index.samples[offset..end],
-            field_map,
+            &local_field_map,
             &mut hash,
         )?;
         offset = end;
@@ -14564,6 +14645,81 @@ fn qwen_sft_source_max_samples(
         bail!("data.source_max_samples entries must be greater than zero");
     }
     Ok(limits)
+}
+
+fn qwen_sft_source_field_maps(
+    path_count: usize,
+    field_map: &QwenSftFieldMap,
+) -> Result<Vec<QwenSftSourceFieldMap>> {
+    let instructions = qwen_sft_source_string_overrides(
+        path_count,
+        &field_map.source_instruction_fields,
+        "data.source_instruction_fields",
+        true,
+    )?;
+    let inputs = qwen_sft_source_string_overrides(
+        path_count,
+        &field_map.source_input_fields,
+        "data.source_input_fields",
+        false,
+    )?;
+    let responses = qwen_sft_source_string_overrides(
+        path_count,
+        &field_map.source_response_fields,
+        "data.source_response_fields",
+        true,
+    )?;
+    Ok((0..path_count)
+        .map(|index| QwenSftSourceFieldMap {
+            instruction: instructions[index].clone(),
+            input: inputs[index].clone(),
+            response: responses[index].clone(),
+        })
+        .collect())
+}
+
+fn qwen_sft_source_string_overrides(
+    path_count: usize,
+    values: &[String],
+    name: &str,
+    required: bool,
+) -> Result<Vec<Option<String>>> {
+    if values.is_empty() {
+        return Ok(vec![None; path_count]);
+    }
+    let expanded = if values.len() == 1 {
+        vec![values[0].clone(); path_count]
+    } else if values.len() == path_count {
+        values.to_vec()
+    } else {
+        bail!("{name} must be empty, length 1, or match data.paths length");
+    };
+    if required && expanded.iter().any(|field| field.trim().is_empty()) {
+        bail!("{name} entries must not be empty");
+    }
+    Ok(expanded.into_iter().map(Some).collect())
+}
+
+fn qwen_sft_field_map_for_source(
+    field_map: &QwenSftFieldMap,
+    source_field_map: &QwenSftSourceFieldMap,
+) -> QwenSftFieldMap {
+    let mut local = field_map.clone();
+    if let Some(instruction) = &source_field_map.instruction {
+        local.instruction = instruction.clone();
+    }
+    if let Some(input) = &source_field_map.input {
+        local.input = input.clone();
+    }
+    if let Some(response) = &source_field_map.response {
+        local.response = response.clone();
+    }
+    local.source_weights.clear();
+    local.source_max_samples.clear();
+    local.source_instruction_fields.clear();
+    local.source_input_fields.clear();
+    local.source_response_fields.clear();
+    local
 }
 
 #[cfg(test)]
@@ -15613,6 +15769,21 @@ fn qwen_sft_hash_field_map(hash: &mut u64, field_map: &QwenSftFieldMap) {
         }
         qwen_sft_hash_bytes(hash, b"\0");
     }
+    qwen_sft_hash_source_field_overrides(
+        hash,
+        b"source_instruction_fields",
+        &field_map.source_instruction_fields,
+    );
+    qwen_sft_hash_source_field_overrides(
+        hash,
+        b"source_input_fields",
+        &field_map.source_input_fields,
+    );
+    qwen_sft_hash_source_field_overrides(
+        hash,
+        b"source_response_fields",
+        &field_map.source_response_fields,
+    );
     if !field_map.external_metadata.is_empty() {
         qwen_sft_hash_bytes(hash, b"external_metadata");
         for metadata in &field_map.external_metadata {
@@ -15621,6 +15792,17 @@ fn qwen_sft_hash_field_map(hash: &mut u64, field_map: &QwenSftFieldMap) {
             qwen_sft_hash_bytes(hash, metadata.contents.as_bytes());
             qwen_sft_hash_bytes(hash, b"\0");
         }
+    }
+}
+
+fn qwen_sft_hash_source_field_overrides(hash: &mut u64, label: &[u8], values: &[String]) {
+    if values.is_empty() {
+        return;
+    }
+    qwen_sft_hash_bytes(hash, label);
+    for value in values {
+        qwen_sft_hash_bytes(hash, value.as_bytes());
+        qwen_sft_hash_bytes(hash, b"\0");
     }
 }
 
@@ -21093,6 +21275,97 @@ mod tests {
     }
 
     #[test]
+    fn qwen_sft_applies_per_source_jsonl_field_maps_to_streaming_cache() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let first = temp.path().join("first.jsonl");
+        let second = temp.path().join("second.jsonl");
+        let cache_path = temp.path().join("cache").join("offset-index.json");
+        fs::write(
+            &first,
+            r#"{"instruction":"alpha prompt","input":"alpha context","response":"alpha answer"}
+"#,
+        )
+        .expect("first jsonl should write");
+        fs::write(
+            &second,
+            r#"{"question":"beta prompt","answer":"beta answer"}
+"#,
+        )
+        .expect("second jsonl should write");
+        let paths = vec![first.clone(), second.clone()];
+        let field_map = QwenSftFieldMap {
+            source_instruction_fields: vec!["instruction".to_string(), "question".to_string()],
+            source_input_fields: vec!["input".to_string(), String::new()],
+            source_response_fields: vec!["response".to_string(), "answer".to_string()],
+            ..QwenSftFieldMap::default()
+        };
+
+        let loaded = qwen_sft_examples_from_jsonl_paths_with_limit(&paths, Some(2), &field_map)
+            .expect("per-source JSONL examples should load");
+        let streamed = qwen_sft_streaming_source_summary(&paths, Some(2), &field_map)
+            .expect("per-source streaming summary should scan");
+        let source_index = qwen_sft_streaming_source_index(&paths, Some(2), &field_map)
+            .expect("per-source streaming index should build");
+        let raw_window = qwen_sft_examples_by_raw_indices(&source_index.samples, &field_map)
+            .expect("per-source raw window should read");
+        let cache = qwen_sft_streaming_source_index_with_cache(
+            &paths,
+            Some(2),
+            Some(&cache_path),
+            &field_map,
+        )
+        .expect("per-source cache should write");
+        let cached = qwen_sft_streaming_source_index_with_cache(
+            &paths,
+            Some(2),
+            Some(&cache_path),
+            &field_map,
+        )
+        .expect("per-source cache should hit");
+        let changed_map = QwenSftFieldMap {
+            source_instruction_fields: vec!["instruction".to_string(), "prompt".to_string()],
+            source_input_fields: vec!["input".to_string(), String::new()],
+            source_response_fields: vec!["response".to_string(), "answer".to_string()],
+            ..QwenSftFieldMap::default()
+        };
+        let cache_mismatch = qwen_sft_streaming_source_index_with_cache(
+            &paths,
+            Some(2),
+            Some(&cache_path),
+            &changed_map,
+        )
+        .expect_err("changed per-source field map should reject cache")
+        .to_string();
+
+        assert_eq!(
+            loaded.examples,
+            vec![
+                QwenSftExample {
+                    system: String::new(),
+                    instruction: "alpha prompt".to_string(),
+                    input: "alpha context".to_string(),
+                    response: "alpha answer".to_string(),
+                },
+                QwenSftExample {
+                    system: String::new(),
+                    instruction: "beta prompt".to_string(),
+                    input: String::new(),
+                    response: "beta answer".to_string(),
+                },
+            ]
+        );
+        assert_eq!(streamed.samples, loaded.examples.len());
+        assert_eq!(streamed.source_files, loaded.source_files);
+        assert_eq!(streamed.source_sample_counts, loaded.source_sample_counts);
+        assert_eq!(streamed.fingerprint, loaded.fingerprint);
+        assert_eq!(raw_window.examples, loaded.examples);
+        assert!(cache.cache_written);
+        assert!(cached.cache_hit);
+        assert_eq!(cached.index.samples, source_index.samples);
+        assert!(cache_mismatch.contains("field_map"));
+    }
+
+    #[test]
     fn qwen_sft_applies_source_max_samples_before_weighting_and_streaming_index() {
         let temp = tempfile::tempdir().expect("temp dir should be created");
         let first = temp.path().join("first.jsonl");
@@ -21576,6 +21849,78 @@ response_field = "output"
         assert_eq!(scan.summary.fingerprint, loaded.fingerprint);
     }
 
+    #[test]
+    fn qwen_sft_arrow_applies_per_source_field_maps_to_cache_and_readback() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let first = temp.path().join("first.arrow");
+        let second = temp.path().join("second.arrow");
+        let cache_path = temp.path().join("cache").join("arrow-row-index.json");
+        write_test_sft_arrow(&first, &[("alpha prompt", "alpha context", "alpha answer")]);
+        write_test_custom_sft_arrow(
+            &second,
+            ("prompt", "context", "completion"),
+            &[("beta prompt", "", "beta answer")],
+        );
+        let paths = vec![first.clone(), second.clone()];
+        let field_map = QwenSftFieldMap {
+            response: "output".to_string(),
+            source_instruction_fields: vec!["instruction".to_string(), "prompt".to_string()],
+            source_input_fields: vec!["input".to_string(), "context".to_string()],
+            source_response_fields: vec!["output".to_string(), "completion".to_string()],
+            ..QwenSftFieldMap::default()
+        };
+
+        let loaded = qwen_sft_arrow_examples_from_paths_with_limit(&paths, Some(2), &field_map)
+            .expect("per-source Arrow examples should load");
+        let scan = qwen_sft_arrow_source_scan(&paths, Some(2), &field_map)
+            .expect("per-source Arrow scan should build");
+        let raw_window = qwen_sft_arrow_examples_by_raw_indices(&scan.index.samples, &field_map)
+            .expect("per-source Arrow raw rows should read back");
+        let cached =
+            qwen_sft_arrow_source_index_with_cache(&paths, Some(2), Some(&cache_path), &field_map)
+                .expect("per-source Arrow cache should write");
+        let cache_hit =
+            qwen_sft_arrow_source_index_with_cache(&paths, Some(2), Some(&cache_path), &field_map)
+                .expect("per-source Arrow cache should hit");
+        let changed_map = QwenSftFieldMap {
+            response: "output".to_string(),
+            source_instruction_fields: vec!["instruction".to_string(), "question".to_string()],
+            source_input_fields: vec!["input".to_string(), "context".to_string()],
+            source_response_fields: vec!["output".to_string(), "completion".to_string()],
+            ..QwenSftFieldMap::default()
+        };
+        let cache_mismatch = qwen_sft_arrow_source_index_with_cache(
+            &paths,
+            Some(2),
+            Some(&cache_path),
+            &changed_map,
+        )
+        .expect_err("changed per-source Arrow field map should reject cache")
+        .to_string();
+
+        assert_eq!(
+            loaded
+                .examples
+                .iter()
+                .map(|example| (
+                    example.instruction.as_str(),
+                    example.input.as_str(),
+                    example.response.as_str()
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                ("alpha prompt", "alpha context", "alpha answer"),
+                ("beta prompt", "", "beta answer"),
+            ]
+        );
+        assert_eq!(raw_window.examples, loaded.examples);
+        assert_eq!(scan.summary.fingerprint, loaded.fingerprint);
+        assert!(cached.cache_written);
+        assert!(cache_hit.cache_hit);
+        assert_eq!(cache_hit.index.samples, scan.index.samples);
+        assert!(cache_mismatch.contains("field_map"));
+    }
+
     fn write_test_sft_arrow(path: &Path, rows: &[(&str, &str, &str)]) {
         let schema = Arc::new(Schema::new(vec![
             Field::new("instruction", DataType::Utf8, false),
@@ -21605,6 +21950,45 @@ response_field = "output"
         let mut writer = StreamWriter::try_new(file, &schema).expect("test Arrow writer");
         writer.write(&batch).expect("test Arrow batch should write");
         writer.finish().expect("test Arrow stream should finish");
+    }
+
+    fn write_test_custom_sft_arrow(
+        path: &Path,
+        fields: (&str, &str, &str),
+        rows: &[(&str, &str, &str)],
+    ) {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(fields.0, DataType::Utf8, false),
+            Field::new(fields.1, DataType::Utf8, false),
+            Field::new(fields.2, DataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(
+                    rows.iter()
+                        .map(|(instruction, _, _)| *instruction)
+                        .collect::<Vec<_>>(),
+                )),
+                Arc::new(StringArray::from(
+                    rows.iter().map(|(_, input, _)| *input).collect::<Vec<_>>(),
+                )),
+                Arc::new(StringArray::from(
+                    rows.iter()
+                        .map(|(_, _, response)| *response)
+                        .collect::<Vec<_>>(),
+                )),
+            ],
+        )
+        .expect("test custom Arrow batch should build");
+        let file = fs::File::create(path).expect("test custom Arrow file should create");
+        let mut writer = StreamWriter::try_new(file, &schema).expect("test custom Arrow writer");
+        writer
+            .write(&batch)
+            .expect("test custom Arrow batch should write");
+        writer
+            .finish()
+            .expect("test custom Arrow stream should finish");
     }
 
     fn write_test_qa_arrow(path: &Path, rows: &[(&str, &str)]) {
