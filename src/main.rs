@@ -185,6 +185,41 @@ fn dispatch_train(config_path: &Path, resume_from: Option<PathBuf>) -> Result<()
         return Ok(());
     }
 
+    if is_tch && arch == "qwen3_trainable_session" {
+        if config.parallel.tensor_model_parallel_size == 2
+            && config.parallel.data_parallel_size == 1
+        {
+            rustrain_qwen3::qwen3_module::train_qwen3_session_tp_from_config(&config, &run_paths)?;
+            println!("rustrain qwen3 trainable session TP complete");
+            println!("run_dir: {}", run_paths.root.display());
+        } else if config.parallel.data_parallel_size == 1 {
+            let summary = rustrain_qwen3::qwen3_module::train_qwen3_session_single_from_config(
+                &config, &run_paths,
+            )?;
+            println!("rustrain qwen3 trainable session complete");
+            println!("run_dir: {}", run_paths.root.display());
+            println!("initial_loss: {:.9}", summary.initial_loss);
+            println!("final_loss: {:.9}", summary.final_loss);
+            println!("trainable_tensors: {}", summary.trainable_tensors.len());
+        } else {
+            rustrain_qwen3::qwen3_module::train_qwen3_session_dp_from_config(&config, &run_paths)?;
+            println!("rustrain qwen3 trainable session DP complete");
+            println!("run_dir: {}", run_paths.root.display());
+        }
+        return Ok(());
+    }
+
+    if is_tch && arch == "qwen3_lora_sft" {
+        let summary =
+            rustrain_qwen3::qwen3_module::train_qwen3_lora_sft_from_config(&config, &run_paths)?;
+        println!("rustrain qwen3 LoRA SFT complete");
+        println!("run_dir: {}", run_paths.root.display());
+        println!("adapter_checkpoint: {}", summary.adapter_output);
+        println!("initial_loss: {:.9}", summary.initial_loss);
+        println!("final_loss: {:.9}", summary.final_loss);
+        return Ok(());
+    }
+
     // Default: ndarray toy model
     rustrain_toy::trainer::train(&config, &run_paths)
 }
