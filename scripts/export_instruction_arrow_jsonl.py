@@ -13,7 +13,7 @@ import pyarrow.ipc as ipc
 
 
 DEFAULT_ARROW = Path(
-    "/vePFS-Mindverse/share/huggingface/datasets/"
+    "/path/to/huggingface/datasets/"
     "iamtarun___code_instructions_120k_alpaca/default/0.0.0/"
     "31f725b2d714c1b4f038e80fbaa6b977870a50b7/"
     "code_instructions_120k_alpaca-train.arrow"

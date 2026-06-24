@@ -7,12 +7,12 @@ if [ "$#" -eq 0 ]; then
   exit 2
 fi
 
-REMOTE_HOST="${RUSTRAIN_REMOTE_HOST:-root@192.168.42.106}"
+REMOTE_HOST="${RUSTRAIN_REMOTE_HOST:-${RUSTRAIN_REMOTE_USER:-root}@${RUSTRAIN_REMOTE_HOST:-127.0.0.1}}"
 REMOTE_PORT="${RUSTRAIN_REMOTE_PORT:-2222}"
-REMOTE_DIR="${RUSTRAIN_REMOTE_DIR:-/vePFS-Mindverse/user/nolanho/code/rustrain}"
+REMOTE_DIR="${RUSTRAIN_REMOTE_DIR:-${RUSTRAIN_REMOTE_DIR:-/root/rustrain}}"
 REMOTE_FALLBACK_DIR="${RUSTRAIN_REMOTE_FALLBACK_DIR:-/root/rustrain}"
 REMOTE_PYTHON="${RUSTRAIN_REMOTE_PYTHON:-/opt/venv/bin/python}"
-RAY_HEAD_FILE="${RUSTRAIN_RAY_HEAD_FILE:-/vePFS-Mindverse/share/mint/dev/ray/head-address/ray_head_ip.txt}"
+RAY_HEAD_FILE="${RUSTRAIN_RAY_HEAD_FILE:-${RUSTRAIN_RAY_HEAD_FILE:-/tmp/ray_head_ip.txt}}"
 RAY_ADDRESS="${RUSTRAIN_RAY_ADDRESS:-}"
 RAY_NUM_GPUS="${RUSTRAIN_RAY_NUM_GPUS:-1}"
 SYNC_TO_WORKER="${RUSTRAIN_SYNC_TO_WORKER:-1}"
@@ -77,7 +77,7 @@ if ray_address == "__RUSTRAIN_AUTO_RAY_ADDRESS__":
         with open(ray_head_file, "r", encoding="utf-8") as address_file:
             ray_head = address_file.read().strip()
     except FileNotFoundError:
-        ray_head = "192.168.42.141"
+        ray_head = "${RUSTRAIN_RAY_ADDRESS_FALLBACK:-127.0.0.1}"
     ray_address = f"{ray_head}:6379"
 
 try:

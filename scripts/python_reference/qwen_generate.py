@@ -14,7 +14,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from qwen_model_path import resolve_qwen_model_path
 
 
-DEFAULT_MODEL = Path("/vePFS-Mindverse/share/huggingface/Qwen2.5-0.5B-Instruct")
+DEFAULT_MODEL = Path("/path/to/huggingface/Qwen2.5-0.5B-Instruct")
 DEFAULT_PROMPT = Path("data/parity/qwen_prompt.txt")
 
 

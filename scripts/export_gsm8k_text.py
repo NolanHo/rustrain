@@ -10,7 +10,7 @@ from datasets import Dataset
 
 
 DEFAULT_ARROW = Path(
-    "/vePFS-Mindverse/share/huggingface/datasets/gsm8k/main/0.0.0/"
+    "/path/to/huggingface/datasets/gsm8k/main/0.0.0/"
     "e53f048856ff4f594e959d75785d2c2d37b678ee/gsm8k-train.arrow"
 )
 
