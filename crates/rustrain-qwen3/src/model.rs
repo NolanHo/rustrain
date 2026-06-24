@@ -285,15 +285,14 @@ pub(crate) fn qwen3_moe_mlp(
     for k in 0..num_experts_per_tok {
         let expert_indices = topk_indices.select(-1, k as i64); // [batch, seq]
         let expert_weights = topk_weights.select(-1, k as i64); // [batch, seq]
+        let weights_kind = expert_weights.kind();
 
         for (expert_idx, (gate, up, down)) in experts.iter().enumerate() {
-            let mask = expert_indices
-                .eq(expert_idx as i64)
-                .to_kind(expert_weights.kind());
+            let mask = expert_indices.eq(expert_idx as i64).to_kind(weights_kind);
             // Only compute if any token selected this expert
             if mask.sum(Kind::Float).double_value(&[]) > 0.0 {
                 let expert_out = qwen3_mlp(input, gate, up, down);
-                let weight = (expert_weights * &mask).unsqueeze(-1);
+                let weight = (&expert_weights * &mask).unsqueeze(-1);
                 output = output + (expert_out * weight);
             }
         }

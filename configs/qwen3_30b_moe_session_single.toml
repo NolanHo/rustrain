@@ -6,7 +6,7 @@ seed = 42
 [model]
 name = "qwen3_30b_a3b_moe"
 architecture = "qwen3_trainable_session"
-model_path = "/vePFS-Mindverse/share/huggingface/hub/models--Qwen--Qwen3-30B-A3B/snapshots"
+model_path = "/vePFS-Mindverse/share/huggingface/hub/models--Qwen--Qwen3-30B-A3B/snapshots/ad44e777bcd18fa416d9da3bd8f70d33ebb85d39"
 vocab_size = 151936
 hidden_size = 2048
 num_layers = 48
@@ -31,7 +31,7 @@ weight_decay = 0.0
 adam_beta1 = 0.9
 adam_beta2 = 0.999
 adam_eps = 0.00000001
-dtype = "bf16"
+dtype = "fp32"
 device = "cuda"
 checkpoint_every = 0
 

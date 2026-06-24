@@ -962,16 +962,14 @@ impl QwenTrainableRegistry {
             }
             let grad = grad.to_device(parameter.tensor.device());
             let grad_norm = grad.norm().double_value(&[]);
-            if grad_norm <= 0.0 {
-                bail!("averaged gradient for {} has zero norm", parameter.name);
-            }
-            let grad_defined = true;
-
             let adam_state = adamw_next_state(parameter.adam.as_ref(), &grad, 0.9, 0.999);
-            let update = adamw_update(&adam_state, learning_rate, 0.9, 0.999, step, 1e-8);
-            let _ = no_grad(|| parameter.tensor.f_sub_(&update))?;
+            // MoE experts that receive no tokens have zero-norm gradients.
+            // Skip the optimizer update for these, but still record manifest entries.
+            if grad_norm > 0.0 {
+                let update = adamw_update(&adam_state, learning_rate, 0.9, 0.999, step, 1e-8);
+                let _ = no_grad(|| parameter.tensor.f_sub_(&update))?;
+            }
             weights.insert(parameter.name.clone(), parameter.tensor.shallow_clone());
-
             let delta = &parameter.tensor - &parameter.base;
             let delta_norm = delta.norm().double_value(&[]);
             let delta_name = format!("{}.delta", parameter.name);
@@ -991,7 +989,7 @@ impl QwenTrainableRegistry {
             optimizer_entries.push((adam_names.v, adam_state.v.shallow_clone()));
             tensor_summaries.push(TrainableTensorSummary {
                 name: parameter.name.clone(),
-                grad_defined,
+                grad_defined: true,
                 grad_norm,
                 delta_norm,
             });
@@ -1016,13 +1014,14 @@ impl QwenTrainableRegistry {
         let mut entries = Vec::with_capacity(self.parameters.len());
         for parameter in &self.parameters {
             let grad = parameter.tensor.grad();
-            if !grad.defined() {
-                bail!(
-                    "trainable tensor {} did not receive a gradient",
-                    parameter.name
-                );
-            }
-            entries.push((parameter.name.clone(), grad.to_kind(Kind::Float)));
+            let grad = if grad.defined() {
+                grad.to_kind(Kind::Float)
+            } else {
+                // MoE experts that receive no tokens have undefined gradients.
+                // Use zero gradients instead of failing.
+                Tensor::zeros_like(&parameter.tensor)
+            };
+            entries.push((parameter.name.clone(), grad));
         }
         Ok(entries)
     }
@@ -1417,11 +1416,13 @@ impl QwenAttentionDpSession {
         world_size: usize,
     ) -> Result<Vec<Tensor>> {
         let mut averaged = Vec::new();
-        for (index, (name, parameter)) in self.parameters().iter().enumerate() {
+        for (index, (_name, parameter)) in self.parameters().iter().enumerate() {
             let grad = parameter.grad();
-            if !grad.defined() {
-                bail!("trainable tensor {name} did not receive a gradient");
-            }
+            let grad = if grad.defined() {
+                grad
+            } else {
+                Tensor::zeros_like(parameter)
+            };
             let reduced = nccl_smoke::all_reduce_tensor_f32_for_launch(
                 &output_dir.join(format!("grad-{index}")),
                 &grad,
@@ -1455,10 +1456,12 @@ impl QwenAttentionDpSession {
         let mut entries = Vec::new();
         for (name, parameter) in self.parameters() {
             let grad = parameter.grad();
-            if !grad.defined() {
-                bail!("trainable tensor {name} did not receive a gradient");
-            }
-            entries.push((name.to_string(), grad.to_kind(Kind::Float)));
+            let grad = if grad.defined() {
+                grad.to_kind(Kind::Float)
+            } else {
+                Tensor::zeros_like(parameter)
+            };
+            entries.push((name.to_string(), grad));
         }
         Ok(entries)
     }

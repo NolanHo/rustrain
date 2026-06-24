@@ -70,14 +70,14 @@ if ray_address == "__RUSTRAIN_AUTO_RAY_ADDRESS__":
         with open(ray_head_file, "r", encoding="utf-8") as address_file:
             ray_head = address_file.read().strip()
     except Exception:
-        ray_head = "192.168.42.141"
+        ray_head = "192.168.42.174"
     ray_address = f"{ray_head}:6379"
 
 if ":" not in ray_address:
     ray_address = f"{ray_address}:6379"
 
 try:
-    ray.init(address=ray_address, log_to_driver=False)
+    ray.init(address=ray_address, log_to_driver=False, ignore_reinit_error=True)
 except Exception as error:
     raise RuntimeError(
         f"Ray head is not reachable from the SSH submission host; refusing to fall back to local/plain-SSH execution. "
@@ -132,14 +132,16 @@ def run_on_gpu_worker(
             "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --no-modify-path",
             shell=True, capture_output=True, text=True, timeout=120,
         )
-    subprocess_env["PATH"] = f"/root/.cargo/bin:{subprocess_env.get('PATH', '')}"
+    subprocess_env["PATH"] = f"/vePFS-Mindverse/share/nolan/rustrain/deps/cargo/bin:/vePFS-Mindverse/share/nolan/rustrain/deps/venv/bin:{subprocess_env.get('PATH', '')}"
+    subprocess_env["CARGO_HOME"] = "/vePFS-Mindverse/share/nolan/rustrain/deps/cargo"
+    subprocess_env["RUSTUP_HOME"] = "/vePFS-Mindverse/share/nolan/rustrain/deps/rustup"
     subprocess_env["LIBTORCH_USE_PYTORCH"] = "1"
     subprocess_env["LIBTORCH_BYPASS_VERSION_CHECK"] = "1"
     subprocess_env["CARGO_TARGET_DIR"] = "/tmp/rustrain-target-a800"
 
     torch_site = os.environ.get(
         "RUSTRAIN_TORCH_SITE",
-        "/usr/local/lib/python3.12/dist-packages",
+        "/vePFS-Mindverse/share/nolan/rustrain/deps/venv/lib/python3.12/site-packages",
     )
     torch_lib = f"{torch_site}/torch/lib"
     nvidia = f"{torch_site}/nvidia"
