@@ -1135,13 +1135,17 @@ impl QwenTrainableSession {
         compute_kind: Kind,
         trainable_layers: &[usize],
     ) -> Result<Self> {
-        Self::from_names(
-            config,
-            weights,
-            input_ids,
-            compute_kind,
-            qwen_trainable_tensors_for_layers(trainable_layers, true, !config.tie_word_embeddings),
-        )
+        let names = if config.is_moe {
+            qwen3_moe_trainable_tensors_for_layers(
+                trainable_layers,
+                config.num_experts,
+                true,
+                !config.tie_word_embeddings,
+            )
+        } else {
+            qwen_trainable_tensors_for_layers(trainable_layers, true, !config.tie_word_embeddings)
+        };
+        Self::from_names(config, weights, input_ids, compute_kind, names)
     }
 
     pub(crate) fn from_names(
@@ -1197,18 +1201,21 @@ impl QwenTrainableSession {
         include_embed_tokens: bool,
         device: Device,
     ) -> Result<Self> {
-        Self::from_names_on_device(
-            config,
-            weights,
-            input_ids,
-            compute_kind,
+        let names = if config.is_moe {
+            qwen3_moe_trainable_tensors_for_layers(
+                trainable_layers,
+                config.num_experts,
+                include_embed_tokens,
+                config.tie_word_embeddings,
+            )
+        } else {
             qwen_trainable_tensors_for_layers(
                 trainable_layers,
                 include_embed_tokens,
                 config.tie_word_embeddings,
-            ),
-            device,
-        )
+            )
+        };
+        Self::from_names_on_device(config, weights, input_ids, compute_kind, names, device)
     }
 
     pub(crate) fn from_manifest(
@@ -1713,6 +1720,44 @@ pub(crate) fn qwen_trainable_tensors_for_layers(
             format!("{prefix}.mlp.up_proj.weight"),
             format!("{prefix}.mlp.down_proj.weight"),
         ]);
+    }
+    names.push("model.norm.weight".to_string());
+    names
+}
+
+pub(crate) fn qwen3_moe_trainable_tensors_for_layers(
+    trainable_layers: &[usize],
+    num_experts: usize,
+    include_embed_tokens: bool,
+    include_lm_head: bool,
+) -> Vec<String> {
+    let mut names = Vec::new();
+    if include_embed_tokens {
+        names.push("model.embed_tokens.weight".to_string());
+    }
+    if include_lm_head {
+        names.push("lm_head.weight".to_string());
+    }
+    for layer in trainable_layers {
+        let prefix = format!("model.layers.{layer}");
+        names.extend([
+            format!("{prefix}.input_layernorm.weight"),
+            format!("{prefix}.self_attn.q_proj.weight"),
+            format!("{prefix}.self_attn.q_norm.weight"),
+            format!("{prefix}.self_attn.k_proj.weight"),
+            format!("{prefix}.self_attn.k_norm.weight"),
+            format!("{prefix}.self_attn.v_proj.weight"),
+            format!("{prefix}.self_attn.o_proj.weight"),
+            format!("{prefix}.post_attention_layernorm.weight"),
+            format!("{prefix}.mlp.gate.weight"), // router
+        ]);
+        for expert_idx in 0..num_experts {
+            names.extend([
+                format!("{prefix}.mlp.experts.{expert_idx}.gate_proj.weight"),
+                format!("{prefix}.mlp.experts.{expert_idx}.up_proj.weight"),
+                format!("{prefix}.mlp.experts.{expert_idx}.down_proj.weight"),
+            ]);
+        }
     }
     names.push("model.norm.weight".to_string());
     names
@@ -2267,6 +2312,11 @@ mod tests {
             head_dim: 2,
             rms_norm_eps: 1e-6,
             rope_theta: 10_000.0,
+            is_moe: false,
+            num_experts: 0,
+            num_experts_per_tok: 0,
+            moe_intermediate_size: 0,
+            norm_topk_prob: true,
         };
         let mut weights = tiny_qwen_weights();
         let input_ids = Tensor::from_slice(&[0_i64, 1, 2, 3]).reshape([1, 4]);
@@ -2347,6 +2397,11 @@ mod tests {
             head_dim: 2,
             rms_norm_eps: 1e-6,
             rope_theta: 10_000.0,
+            is_moe: false,
+            num_experts: 0,
+            num_experts_per_tok: 0,
+            moe_intermediate_size: 0,
+            norm_topk_prob: true,
         };
         let input_ids = Tensor::from_slice(&[0_i64, 1, 2, 3]).reshape([1, 4]);
         let mut session = QwenTrainableSession::from_trainable_layers(
@@ -2967,6 +3022,11 @@ mod tests {
             head_dim: 2,
             rms_norm_eps: 1e-6,
             rope_theta: 10_000.0,
+            is_moe: false,
+            num_experts: 0,
+            num_experts_per_tok: 0,
+            moe_intermediate_size: 0,
+            norm_topk_prob: true,
         };
         let input_ids = Tensor::from_slice(&[0_i64, 1, 2, 3]).reshape([1, 4]);
         let learning_rate = 1e-2;
@@ -3092,6 +3152,11 @@ mod tests {
             head_dim: 2,
             rms_norm_eps: 1e-6,
             rope_theta: 10_000.0,
+            is_moe: false,
+            num_experts: 0,
+            num_experts_per_tok: 0,
+            moe_intermediate_size: 0,
+            norm_topk_prob: true,
         };
         let input_ids = Tensor::from_slice(&[0_i64, 1, 2, 3]).reshape([1, 4]);
         let learning_rate = 1e-2;

@@ -273,6 +273,11 @@ mod tests {
             head_dim: 2,
             rms_norm_eps: 1e-6,
             rope_theta: 10_000.0,
+            is_moe: false,
+            num_experts: 0,
+            num_experts_per_tok: 0,
+            moe_intermediate_size: 0,
+            norm_topk_prob: true,
         };
         let weights = tiny_qwen_weights();
         let input_ids = Tensor::from_slice(&[0_i64, 1, 2]).reshape([1, 3]);

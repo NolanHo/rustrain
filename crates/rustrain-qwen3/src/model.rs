@@ -58,6 +58,11 @@ pub struct QwenRuntimeConfig {
     pub rms_norm_eps: f64,
     pub rope_theta: f64,
     pub tie_word_embeddings: bool,
+    pub is_moe: bool,
+    pub num_experts: usize,
+    pub num_experts_per_tok: usize,
+    pub moe_intermediate_size: usize,
+    pub norm_topk_prob: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -70,6 +75,16 @@ pub(crate) struct QwenModelConfig {
     pub(crate) rope_theta: f64,
     #[serde(default = "default_true")]
     pub(crate) tie_word_embeddings: bool,
+    #[serde(default)]
+    pub(crate) model_type: Option<String>,
+    #[serde(default)]
+    pub(crate) num_experts: Option<usize>,
+    #[serde(default)]
+    pub(crate) num_experts_per_tok: Option<usize>,
+    #[serde(default)]
+    pub(crate) moe_intermediate_size: Option<usize>,
+    #[serde(default = "default_true")]
+    pub(crate) norm_topk_prob: bool,
 }
 
 fn default_true() -> bool {
@@ -130,6 +145,7 @@ pub(crate) fn read_qwen3_runtime_config(path: &Path) -> Result<QwenRuntimeConfig
         fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
     let config: QwenModelConfig = serde_json::from_str(&contents)
         .with_context(|| format!("failed to parse {}", path.display()))?;
+    let is_moe = config.model_type.as_deref() == Some("qwen3_moe");
     Ok(QwenRuntimeConfig {
         num_hidden_layers: config.num_hidden_layers,
         num_attention_heads: config.num_attention_heads,
@@ -138,6 +154,11 @@ pub(crate) fn read_qwen3_runtime_config(path: &Path) -> Result<QwenRuntimeConfig
         rms_norm_eps: config.rms_norm_eps,
         rope_theta: config.rope_theta,
         tie_word_embeddings: config.tie_word_embeddings,
+        is_moe,
+        num_experts: config.num_experts.unwrap_or(0),
+        num_experts_per_tok: config.num_experts_per_tok.unwrap_or(0),
+        moe_intermediate_size: config.moe_intermediate_size.unwrap_or(0),
+        norm_topk_prob: config.norm_topk_prob,
     })
 }
 
@@ -231,6 +252,56 @@ pub fn qwen3_mlp(
     (gate.silu() * up).linear::<&Tensor>(down_proj, None)
 }
 
+pub(crate) fn qwen3_moe_mlp(
+    input: &Tensor,
+    gate_weight: &Tensor,
+    experts: &[(Tensor, Tensor, Tensor)],
+    num_experts_per_tok: usize,
+    norm_topk_prob: bool,
+) -> Tensor {
+    // Router logits: [batch, seq, num_experts]
+    let router_logits = input.linear::<&Tensor>(gate_weight, None);
+
+    // Routing weights: softmax over experts
+    let routing_weights = router_logits.softmax(-1, Kind::Float);
+
+    // Top-k selection: [batch, seq, top_k]
+    let (topk_weights, topk_indices) =
+        routing_weights.topk(num_experts_per_tok as i64, -1, true, true);
+
+    // Optionally normalize top-k weights
+    let topk_weights = if norm_topk_prob {
+        let denom = topk_weights
+            .sum_dim_intlist([-1].as_slice(), true, Kind::Float)
+            .clamp_min(1e-9);
+        &topk_weights / &denom
+    } else {
+        topk_weights
+    };
+
+    // Accumulate expert outputs
+    let mut output = Tensor::zeros(input.size(), (input.kind(), input.device()));
+
+    for k in 0..num_experts_per_tok {
+        let expert_indices = topk_indices.select(-1, k as i64); // [batch, seq]
+        let expert_weights = topk_weights.select(-1, k as i64); // [batch, seq]
+
+        for (expert_idx, (gate, up, down)) in experts.iter().enumerate() {
+            let mask = expert_indices
+                .eq(expert_idx as i64)
+                .to_kind(expert_weights.kind());
+            // Only compute if any token selected this expert
+            if mask.sum(Kind::Float).double_value(&[]) > 0.0 {
+                let expert_out = qwen3_mlp(input, gate, up, down);
+                let weight = (expert_weights * &mask).unsqueeze(-1);
+                output = output + (expert_out * weight);
+            }
+        }
+    }
+
+    output
+}
+
 pub struct QwenLayerWeights {
     pub(crate) input_norm: Tensor,
     pub(crate) q_proj: Tensor,
@@ -293,6 +364,77 @@ impl QwenLayerWeights {
     }
 }
 
+pub struct Qwen3MoeLayerWeights {
+    pub(crate) input_norm: Tensor,
+    pub(crate) q_proj: Tensor,
+    pub(crate) q_norm: Tensor,
+    pub(crate) k_proj: Tensor,
+    pub(crate) k_norm: Tensor,
+    pub(crate) v_proj: Tensor,
+    pub(crate) o_proj: Tensor,
+    pub(crate) post_attention_norm: Tensor,
+    pub(crate) gate_weight: Tensor, // router: [num_experts, hidden_size]
+    pub(crate) experts: Vec<(Tensor, Tensor, Tensor)>, // [(gate_proj, up_proj, down_proj)]
+}
+
+impl Qwen3MoeLayerWeights {
+    pub fn load(
+        weights: &BTreeMap<String, Tensor>,
+        layer_index: usize,
+        num_experts: usize,
+    ) -> Result<Self> {
+        Self::load_with_kind(weights, layer_index, num_experts, Kind::Float)
+    }
+
+    pub(crate) fn load_with_kind(
+        weights: &BTreeMap<String, Tensor>,
+        layer_index: usize,
+        num_experts: usize,
+        kind: Kind,
+    ) -> Result<Self> {
+        let prefix = format!("model.layers.{layer_index}");
+        let input_norm =
+            tensor(weights, &format!("{prefix}.input_layernorm.weight"))?.to_kind(kind);
+        let q_proj = tensor(weights, &format!("{prefix}.self_attn.q_proj.weight"))?.to_kind(kind);
+        let q_norm = tensor(weights, &format!("{prefix}.self_attn.q_norm.weight"))?.to_kind(kind);
+        let k_proj = tensor(weights, &format!("{prefix}.self_attn.k_proj.weight"))?.to_kind(kind);
+        let k_norm = tensor(weights, &format!("{prefix}.self_attn.k_norm.weight"))?.to_kind(kind);
+        let v_proj = tensor(weights, &format!("{prefix}.self_attn.v_proj.weight"))?.to_kind(kind);
+        let o_proj = tensor(weights, &format!("{prefix}.self_attn.o_proj.weight"))?.to_kind(kind);
+        let post_attention_norm = tensor(
+            weights,
+            &format!("{prefix}.post_attention_layernorm.weight"),
+        )?
+        .to_kind(kind);
+        let gate_weight = tensor(weights, &format!("{prefix}.mlp.gate.weight"))?.to_kind(kind);
+
+        let mut experts = Vec::with_capacity(num_experts);
+        for expert_idx in 0..num_experts {
+            let expert_prefix = format!("{prefix}.mlp.experts.{expert_idx}");
+            let gate_proj =
+                tensor(weights, &format!("{expert_prefix}.gate_proj.weight"))?.to_kind(kind);
+            let up_proj =
+                tensor(weights, &format!("{expert_prefix}.up_proj.weight"))?.to_kind(kind);
+            let down_proj =
+                tensor(weights, &format!("{expert_prefix}.down_proj.weight"))?.to_kind(kind);
+            experts.push((gate_proj, up_proj, down_proj));
+        }
+
+        Ok(Self {
+            input_norm,
+            q_proj,
+            q_norm,
+            k_proj,
+            k_norm,
+            v_proj,
+            o_proj,
+            post_attention_norm,
+            gate_weight,
+            experts,
+        })
+    }
+}
+
 pub fn qwen3_layer(
     input: &Tensor,
     weights: &QwenLayerWeights,
@@ -328,6 +470,42 @@ pub fn qwen3_layer(
     (after_attention + mlp_output).to_kind(compute_kind)
 }
 
+pub fn qwen3_moe_layer(
+    input: &Tensor,
+    weights: &Qwen3MoeLayerWeights,
+    config: &QwenRuntimeConfig,
+) -> Tensor {
+    let compute_kind = weights.q_proj.kind();
+    let input = input.to_kind(compute_kind);
+    let attention_input =
+        rms_norm(&input, &weights.input_norm, config.rms_norm_eps).to_kind(compute_kind);
+    let attention_output = qwen3_attention(
+        &attention_input,
+        &weights.q_proj,
+        &weights.q_norm,
+        &weights.k_proj,
+        &weights.k_norm,
+        &weights.v_proj,
+        &weights.o_proj,
+        config,
+    );
+    let after_attention = input + attention_output;
+    let mlp_input = rms_norm(
+        &after_attention,
+        &weights.post_attention_norm,
+        config.rms_norm_eps,
+    )
+    .to_kind(compute_kind);
+    let mlp_output = qwen3_moe_mlp(
+        &mlp_input,
+        &weights.gate_weight,
+        &weights.experts,
+        config.num_experts_per_tok,
+        config.norm_topk_prob,
+    );
+    (after_attention + mlp_output).to_kind(compute_kind)
+}
+
 pub fn qwen3_forward_from_ids(
     input_ids: &Tensor,
     weights: &BTreeMap<String, Tensor>,
@@ -346,8 +524,18 @@ pub(crate) fn qwen3_forward_from_ids_with_kind(
     let final_norm = tensor(weights, "model.norm.weight")?.to_kind(compute_kind);
     let mut hidden = Tensor::embedding(&embed_tokens, input_ids, -1, false, false);
     for layer_index in 0..config.num_hidden_layers {
-        let layer = QwenLayerWeights::load_with_kind(weights, layer_index, compute_kind)?;
-        hidden = qwen3_layer(&hidden, &layer, config);
+        if config.is_moe {
+            let layer = Qwen3MoeLayerWeights::load_with_kind(
+                weights,
+                layer_index,
+                config.num_experts,
+                compute_kind,
+            )?;
+            hidden = qwen3_moe_layer(&hidden, &layer, config);
+        } else {
+            let layer = QwenLayerWeights::load_with_kind(weights, layer_index, compute_kind)?;
+            hidden = qwen3_layer(&hidden, &layer, config);
+        }
     }
     let hidden = rms_norm(&hidden, &final_norm, config.rms_norm_eps).to_kind(compute_kind);
     let lm_head = if config.tie_word_embeddings {
@@ -369,12 +557,27 @@ pub(crate) fn qwen3_forward_from_ids_with_lora(
     let final_norm = tensor(weights, "model.norm.weight")?.to_kind(compute_kind);
     let mut hidden = Tensor::embedding(&embed_tokens, input_ids, -1, false, false);
     for layer_index in 0..config.num_hidden_layers {
-        let layer = QwenLayerWeights::load_with_kind(weights, layer_index, compute_kind)?;
-        hidden = if let Some(adapter) = registry.adapter_for_layer(layer_index) {
-            qwen3_layer_with_lora(&hidden, &layer, adapter, config)
+        if config.is_moe {
+            // MoE layers: LoRA applies to attention projections only; experts use base weights.
+            let layer = Qwen3MoeLayerWeights::load_with_kind(
+                weights,
+                layer_index,
+                config.num_experts,
+                compute_kind,
+            )?;
+            hidden = if let Some(adapter) = registry.adapter_for_layer(layer_index) {
+                qwen3_moe_layer_with_lora(&hidden, &layer, adapter, config)
+            } else {
+                qwen3_moe_layer(&hidden, &layer, config)
+            };
         } else {
-            qwen3_layer(&hidden, &layer, config)
-        };
+            let layer = QwenLayerWeights::load_with_kind(weights, layer_index, compute_kind)?;
+            hidden = if let Some(adapter) = registry.adapter_for_layer(layer_index) {
+                qwen3_layer_with_lora(&hidden, &layer, adapter, config)
+            } else {
+                qwen3_layer(&hidden, &layer, config)
+            };
+        }
     }
     let hidden = rms_norm(&hidden, &final_norm, config.rms_norm_eps).to_kind(compute_kind);
     let lm_head = if config.tie_word_embeddings {
@@ -403,10 +606,15 @@ pub(crate) fn qwen3_forward_with_cache(
     let mut hidden = Tensor::embedding(&embed_tokens, input_ids, -1, false, false);
 
     for layer_index in 0..config.num_hidden_layers {
-        let layer = QwenLayerWeights::load(weights, layer_index)?;
-        let past_layer_cache = past_cache.as_mut().and_then(|cache| cache.next());
-        let (layer_hidden, layer_cache) =
-            qwen3_layer_with_cache(&hidden, &layer, config, past_layer_cache, position_offset);
+        let (layer_hidden, layer_cache) = if config.is_moe {
+            let layer = Qwen3MoeLayerWeights::load(weights, layer_index, config.num_experts)?;
+            let past_layer_cache = past_cache.as_mut().and_then(|cache| cache.next());
+            qwen3_moe_layer_with_cache(&hidden, &layer, config, past_layer_cache, position_offset)
+        } else {
+            let layer = QwenLayerWeights::load(weights, layer_index)?;
+            let past_layer_cache = past_cache.as_mut().and_then(|cache| cache.next());
+            qwen3_layer_with_cache(&hidden, &layer, config, past_layer_cache, position_offset)
+        };
         hidden = layer_hidden;
         next_cache.push(layer_cache);
     }
@@ -454,7 +662,102 @@ pub(crate) fn qwen3_layer_with_cache(
     (after_attention + mlp_output, cache)
 }
 
-pub(crate) fn qwen3_causal_lm_loss(
+pub(crate) fn qwen3_moe_layer_with_cache(
+    input: &Tensor,
+    weights: &Qwen3MoeLayerWeights,
+    config: &QwenRuntimeConfig,
+    past_cache: Option<QwenLayerCache>,
+    position_offset: i64,
+) -> (Tensor, QwenLayerCache) {
+    let attention_input = rms_norm(input, &weights.input_norm, config.rms_norm_eps);
+    let (attention_output, cache) = qwen3_attention_with_cache(
+        &attention_input,
+        &weights.q_proj,
+        &weights.q_norm,
+        &weights.k_proj,
+        &weights.k_norm,
+        &weights.v_proj,
+        &weights.o_proj,
+        config,
+        past_cache,
+        position_offset,
+    );
+    let after_attention = input + attention_output;
+    let mlp_input = rms_norm(
+        &after_attention,
+        &weights.post_attention_norm,
+        config.rms_norm_eps,
+    );
+    let mlp_output = qwen3_moe_mlp(
+        &mlp_input,
+        &weights.gate_weight,
+        &weights.experts,
+        config.num_experts_per_tok,
+        config.norm_topk_prob,
+    );
+    (after_attention + mlp_output, cache)
+}
+
+pub(crate) fn qwen3_moe_layer_with_lora(
+    input: &Tensor,
+    weights: &Qwen3MoeLayerWeights,
+    adapter: &QwenAttentionLoraAdapter,
+    config: &QwenRuntimeConfig,
+) -> Tensor {
+    let compute_kind = weights.q_proj.kind();
+    let input = input.to_kind(compute_kind);
+    let device = input.device();
+    let attention_input =
+        rms_norm(&input, &weights.input_norm, config.rms_norm_eps).to_kind(compute_kind);
+    // MoE LoRA applies to attention projections only; experts use base weights.
+    let attention_output = qwen3_attention(
+        &attention_input,
+        &lora_weight_or_base(
+            adapter,
+            QwenLoraTargetModule::QProj,
+            &weights.q_proj,
+            device,
+        ),
+        &weights.q_norm,
+        &lora_weight_or_base(
+            adapter,
+            QwenLoraTargetModule::KProj,
+            &weights.k_proj,
+            device,
+        ),
+        &weights.k_norm,
+        &lora_weight_or_base(
+            adapter,
+            QwenLoraTargetModule::VProj,
+            &weights.v_proj,
+            device,
+        ),
+        &lora_weight_or_base(
+            adapter,
+            QwenLoraTargetModule::OProj,
+            &weights.o_proj,
+            device,
+        ),
+        config,
+    );
+    let after_attention = input + attention_output;
+    let mlp_input = rms_norm(
+        &after_attention,
+        &weights.post_attention_norm,
+        config.rms_norm_eps,
+    )
+    .to_kind(compute_kind);
+    let mlp_output = qwen3_moe_mlp(
+        &mlp_input,
+        &weights.gate_weight,
+        &weights.experts,
+        config.num_experts_per_tok,
+        config.norm_topk_prob,
+    );
+    (after_attention + mlp_output).to_kind(compute_kind)
+}
+
+pub fn qwen3_causal_lm_loss(
     input_ids: &Tensor,
     weights: &BTreeMap<String, Tensor>,
     config: &QwenRuntimeConfig,
@@ -862,6 +1165,11 @@ mod tests {
             head_dim: 2,
             rms_norm_eps: 1e-6,
             rope_theta: 10_000.0,
+            is_moe: false,
+            num_experts: 0,
+            num_experts_per_tok: 0,
+            moe_intermediate_size: 0,
+            norm_topk_prob: true,
         };
         let weights = tiny_qwen_weights();
         let input_ids = Tensor::from_slice(&[0_i64, 1, 2, 3]).reshape([1, 4]);

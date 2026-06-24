@@ -1585,6 +1585,7 @@ dependencies = [
  "rustrain-nccl",
  "rustrain-parallel",
  "rustrain-qwen",
+ "rustrain-qwen3",
  "rustrain-tch-tiny",
  "rustrain-toy",
  "rustrain-train",
@@ -1606,6 +1607,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tch",
+ "tempfile",
 ]
 
 [[package]]
