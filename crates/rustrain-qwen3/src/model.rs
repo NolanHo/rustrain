@@ -57,6 +57,7 @@ pub struct QwenRuntimeConfig {
     pub head_dim: i64,
     pub rms_norm_eps: f64,
     pub rope_theta: f64,
+    pub tie_word_embeddings: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -67,6 +68,12 @@ pub(crate) struct QwenModelConfig {
     pub(crate) head_dim: i64,
     pub(crate) rms_norm_eps: f64,
     pub(crate) rope_theta: f64,
+    #[serde(default = "default_true")]
+    pub(crate) tie_word_embeddings: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Debug, Serialize)]
@@ -130,6 +137,7 @@ pub(crate) fn read_qwen3_runtime_config(path: &Path) -> Result<QwenRuntimeConfig
         head_dim: config.head_dim,
         rms_norm_eps: config.rms_norm_eps,
         rope_theta: config.rope_theta,
+        tie_word_embeddings: config.tie_word_embeddings,
     })
 }
 
@@ -201,7 +209,8 @@ pub fn resolve_qwen3_model_path(model_path: &Path) -> Result<PathBuf> {
 pub fn qwen3_model_path_is_complete(model_path: &Path) -> bool {
     model_path.join("config.json").exists()
         && model_path.join("tokenizer.json").exists()
-        && model_path.join("model.safetensors").exists()
+        && (model_path.join("model.safetensors").exists()
+            || model_path.join("model.safetensors.index.json").exists())
 }
 
 pub fn rms_norm(input: &Tensor, weight: &Tensor, eps: f64) -> Tensor {
@@ -341,7 +350,12 @@ pub(crate) fn qwen3_forward_from_ids_with_kind(
         hidden = qwen3_layer(&hidden, &layer, config);
     }
     let hidden = rms_norm(&hidden, &final_norm, config.rms_norm_eps).to_kind(compute_kind);
-    Ok(hidden.linear::<&Tensor>(&embed_tokens, None))
+    let lm_head = if config.tie_word_embeddings {
+        embed_tokens.shallow_clone()
+    } else {
+        tensor(weights, "lm_head.weight")?.to_kind(compute_kind)
+    };
+    Ok(hidden.linear::<&Tensor>(&lm_head, None))
 }
 
 pub(crate) fn qwen3_forward_from_ids_with_lora(
@@ -363,7 +377,12 @@ pub(crate) fn qwen3_forward_from_ids_with_lora(
         };
     }
     let hidden = rms_norm(&hidden, &final_norm, config.rms_norm_eps).to_kind(compute_kind);
-    Ok(hidden.linear::<&Tensor>(&embed_tokens, None))
+    let lm_head = if config.tie_word_embeddings {
+        embed_tokens.shallow_clone()
+    } else {
+        tensor(weights, "lm_head.weight")?.to_kind(compute_kind)
+    };
+    Ok(hidden.linear::<&Tensor>(&lm_head, None))
 }
 
 pub(crate) fn qwen3_forward_with_cache(
@@ -392,7 +411,12 @@ pub(crate) fn qwen3_forward_with_cache(
         next_cache.push(layer_cache);
     }
     let hidden = rms_norm(&hidden, &final_norm, config.rms_norm_eps);
-    Ok((hidden.linear::<&Tensor>(&embed_tokens, None), next_cache))
+    let lm_head = if config.tie_word_embeddings {
+        embed_tokens.shallow_clone()
+    } else {
+        tensor(weights, "lm_head.weight")?.to_kind(Kind::Float)
+    };
+    Ok((hidden.linear::<&Tensor>(&lm_head, None), next_cache))
 }
 
 pub(crate) fn qwen3_layer_with_cache(
@@ -850,7 +874,7 @@ mod tests {
 
     #[test]
     fn trainable_tensor_names_expand_over_configured_layers() {
-        let names = qwen_trainable_tensors_for_layers(&[0, 1], true);
+        let names = qwen_trainable_tensors_for_layers(&[0, 1], true, false);
 
         assert!(names.contains(&"model.embed_tokens.weight".to_string()));
         assert!(names.contains(&"model.norm.weight".to_string()));
@@ -859,7 +883,7 @@ mod tests {
         assert!(names.contains(&"model.layers.1.mlp.down_proj.weight".to_string()));
         assert_eq!(names.len(), 24);
 
-        let dp_names = qwen_trainable_tensors_for_layers(&[0, 1], false);
+        let dp_names = qwen_trainable_tensors_for_layers(&[0, 1], false, false);
         assert!(!dp_names.contains(&"model.embed_tokens.weight".to_string()));
         assert_eq!(dp_names.len(), 23);
     }

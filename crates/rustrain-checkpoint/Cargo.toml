@@ -15,3 +15,6 @@ optional = true
 [features]
 default = []
 tch = ["dep:tch"]
+
+[dev-dependencies]
+tempfile.workspace = true

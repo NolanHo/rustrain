@@ -27,7 +27,7 @@ use rustrain_checkpoint::io::{
     write_qwen_lora_sft_adapter_manifest,
 };
 use rustrain_checkpoint::manifest::*;
-use rustrain_checkpoint::safetensors::{read_safetensors_map, tensor};
+use rustrain_checkpoint::safetensors::{read_safetensors_dir, read_safetensors_map, tensor};
 use rustrain_core::runtime::{
     Config, DataConfig as RuntimeDataConfig, DataKind as RuntimeDataKind, Device as RuntimeDevice,
     FieldAffix, FieldCaseTransform, FieldCaseTransformKind, FieldDefault, FieldDefaultTarget,
@@ -422,7 +422,7 @@ pub fn qwen_tp_linear_rank(model_path: &Path, output_dir: PathBuf) -> Result<()>
     fs::create_dir_all(&output_dir)
         .with_context(|| format!("failed to create {}", output_dir.display()))?;
 
-    let weights = read_safetensors_map(&model_path.join("model.safetensors"))?;
+    let weights = read_safetensors_dir(&model_path)?;
     let q_weight = tensor(&weights, "model.layers.0.self_attn.q_proj.weight")?
         .to_kind(Kind::Float)
         .to_device(device);
@@ -711,7 +711,7 @@ pub(crate) fn qwen_tp_attention_contribution(
     if config.num_key_value_heads % world_size as i64 != 0 {
         bail!("{context} requires KV heads divisible by WORLD_SIZE");
     }
-    let weights = read_safetensors_map(&model_path.join("model.safetensors"))?;
+    let weights = read_safetensors_dir(&model_path)?;
     let q_proj = tensor(&weights, "model.layers.0.self_attn.q_proj.weight")?
         .to_kind(Kind::Float)
         .to_device(device);
@@ -860,7 +860,7 @@ pub fn qwen_tp_mlp_rank(model_path: &Path, output_dir: PathBuf) -> Result<()> {
     fs::create_dir_all(&output_dir)
         .with_context(|| format!("failed to create {}", output_dir.display()))?;
 
-    let weights = read_safetensors_map(&model_path.join("model.safetensors"))?;
+    let weights = read_safetensors_dir(&model_path)?;
     let gate_proj = tensor(&weights, "model.layers.0.mlp.gate_proj.weight")?
         .to_kind(Kind::Float)
         .to_device(device);
@@ -975,7 +975,7 @@ pub fn qwen_tp_mlp_nccl_rank(model_path: &Path, output_dir: PathBuf) -> Result<(
     fs::create_dir_all(&output_dir)
         .with_context(|| format!("failed to create {}", output_dir.display()))?;
 
-    let weights = read_safetensors_map(&model_path.join("model.safetensors"))?;
+    let weights = read_safetensors_dir(&model_path)?;
     let gate_proj = tensor(&weights, "model.layers.0.mlp.gate_proj.weight")?
         .to_kind(Kind::Float)
         .to_device(device);
@@ -1083,7 +1083,7 @@ pub fn qwen_session_dp_rank(
         .with_context(|| format!("failed to create {}", output_dir.display()))?;
 
     let config = read_qwen3_runtime_config(&model_path.join("config.json"))?;
-    let weights = read_safetensors_map(&model_path.join("model.safetensors"))?;
+    let weights = read_safetensors_dir(&model_path)?;
     let loaded_manifest = resume_from
         .map(|resume_from| {
             let manifest_text = fs::read_to_string(resume_from)
@@ -1186,7 +1186,7 @@ pub fn qwen_session_dp_rank(
         let mut expected_session = if let Some(manifest) = loaded_manifest.as_ref() {
             QwenTrainableSession::from_manifest_on_device(
                 config,
-                read_safetensors_map(&model_path.join("model.safetensors"))?,
+                read_safetensors_dir(&model_path)?,
                 batch_plan.global_initial_input_ids.shallow_clone(),
                 dtype.kind(),
                 &manifest.to_delta_manifest()?,
@@ -1195,7 +1195,7 @@ pub fn qwen_session_dp_rank(
         } else {
             QwenTrainableSession::from_trainable_layers_on_device(
                 config,
-                read_safetensors_map(&model_path.join("model.safetensors"))?,
+                read_safetensors_dir(&model_path)?,
                 batch_plan.global_initial_input_ids.shallow_clone(),
                 dtype.kind(),
                 trainable_layers,
@@ -1423,7 +1423,7 @@ pub fn qwen_session_dp_rank(
     delta_manifest.optimizer_safetensors = Some(optimizer_output.display().to_string());
     let mut resumed_session = QwenTrainableSession::from_manifest_on_device(
         config,
-        read_safetensors_map(&model_path.join("model.safetensors"))?,
+        read_safetensors_dir(&model_path)?,
         local_input.shallow_clone(),
         dtype.kind(),
         &delta_manifest,
@@ -1588,7 +1588,7 @@ pub fn qwen_session_dp_rank(
     )?;
     let sharded_resumed_session = QwenTrainableSession::from_manifest_on_device(
         config,
-        read_safetensors_map(&model_path.join("model.safetensors"))?,
+        read_safetensors_dir(&model_path)?,
         local_input.shallow_clone(),
         dtype.kind(),
         &sharded_delta_manifest,
@@ -1605,7 +1605,7 @@ pub fn qwen_session_dp_rank(
     }
     let mut sharded_continuous_session = QwenTrainableSession::from_manifest_on_device(
         config,
-        read_safetensors_map(&model_path.join("model.safetensors"))?,
+        read_safetensors_dir(&model_path)?,
         local_input.shallow_clone(),
         dtype.kind(),
         &delta_manifest,
@@ -1996,7 +1996,7 @@ pub(crate) fn qwen_session_tp_rank(
     }
 
     let runtime_config = read_qwen3_runtime_config(&model_path.join("config.json"))?;
-    let weights = read_safetensors_map(&model_path.join("model.safetensors"))?;
+    let weights = read_safetensors_dir(&model_path)?;
     let q_proj_full = tensor(&weights, "model.layers.0.self_attn.q_proj.weight")?
         .to_kind(Kind::Float)
         .to_device(device);

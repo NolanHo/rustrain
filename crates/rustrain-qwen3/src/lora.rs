@@ -27,7 +27,7 @@ use rustrain_checkpoint::io::{
     write_qwen_lora_sft_adapter_manifest,
 };
 use rustrain_checkpoint::manifest::*;
-use rustrain_checkpoint::safetensors::{read_safetensors_map, tensor};
+use rustrain_checkpoint::safetensors::{read_safetensors_dir, read_safetensors_map, tensor};
 use rustrain_core::runtime::{
     Config, DataConfig as RuntimeDataConfig, DataKind as RuntimeDataKind, Device as RuntimeDevice,
     FieldAffix, FieldCaseTransform, FieldCaseTransformKind, FieldDefault, FieldDefaultTarget,
@@ -405,7 +405,7 @@ pub(crate) fn qwen3_lora_sft_train(
         .unwrap_or(0);
     let initial_batch = train_dataset.padded_batch(data_cursor_start, train_batch_size)?;
     let eval_batch = eval_dataset.padded_batch(0, eval_batch_size)?;
-    let weights = read_safetensors_map(&model_path.join("model.safetensors"))?;
+    let weights = read_safetensors_dir(&model_path)?;
     let config = read_qwen3_runtime_config(&model_path.join("config.json"))?;
     let resume_adapter_path = resume_manifest
         .as_ref()

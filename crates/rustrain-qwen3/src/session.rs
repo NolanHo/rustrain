@@ -27,7 +27,7 @@ use rustrain_checkpoint::io::{
     write_qwen_lora_sft_adapter_manifest,
 };
 use rustrain_checkpoint::manifest::*;
-use rustrain_checkpoint::safetensors::{read_safetensors_map, tensor};
+use rustrain_checkpoint::safetensors::{read_safetensors_dir, read_safetensors_map, tensor};
 use rustrain_core::runtime::{
     Config, DataConfig as RuntimeDataConfig, DataKind as RuntimeDataKind, Device as RuntimeDevice,
     FieldAffix, FieldCaseTransform, FieldCaseTransformKind, FieldDefault, FieldDefaultTarget,
@@ -263,7 +263,7 @@ pub(crate) fn qwen_full_train_summary(
 
     let model_path = resolve_qwen3_model_path(model_path)?;
     let config = read_qwen3_runtime_config(&model_path.join("config.json"))?;
-    let weights = read_safetensors_map(&model_path.join("model.safetensors"))?;
+    let weights = read_safetensors_dir(&model_path)?;
     let reference = read_safetensors_map(reference_fixture)?;
     let input_ids = tensor(&reference, "input_ids")?.to_kind(Kind::Int64);
 
@@ -329,7 +329,7 @@ pub(crate) fn qwen_full_train_summary(
 
     let mut resumed_session = QwenTrainableSession::from_manifest(
         session.config,
-        read_safetensors_map(&model_path.join("model.safetensors"))?,
+        read_safetensors_dir(&model_path)?,
         session.input_ids.shallow_clone(),
         dtype.kind(),
         &manifest,
@@ -441,7 +441,7 @@ pub(crate) fn qwen_session_single_summary(
 
     let model_path = resolve_qwen3_model_path(model_path)?;
     let config = read_qwen3_runtime_config(&model_path.join("config.json"))?;
-    let weights = read_safetensors_map(&model_path.join("model.safetensors"))?;
+    let weights = read_safetensors_dir(&model_path)?;
     let loaded_manifest = resume_from
         .map(|resume_from| {
             let manifest_text = fs::read_to_string(resume_from)
@@ -621,7 +621,7 @@ pub(crate) fn qwen_session_single_summary(
 
     let mut resumed_session = QwenTrainableSession::from_manifest(
         session.config,
-        read_safetensors_map(&model_path.join("model.safetensors"))?,
+        read_safetensors_dir(&model_path)?,
         session.input_ids.shallow_clone(),
         dtype.kind(),
         &manifest,
@@ -1140,7 +1140,7 @@ impl QwenTrainableSession {
             weights,
             input_ids,
             compute_kind,
-            qwen_trainable_tensors_for_layers(trainable_layers, true),
+            qwen_trainable_tensors_for_layers(trainable_layers, true, !config.tie_word_embeddings),
         )
     }
 
@@ -1202,7 +1202,11 @@ impl QwenTrainableSession {
             weights,
             input_ids,
             compute_kind,
-            qwen_trainable_tensors_for_layers(trainable_layers, include_embed_tokens),
+            qwen_trainable_tensors_for_layers(
+                trainable_layers,
+                include_embed_tokens,
+                config.tie_word_embeddings,
+            ),
             device,
         )
     }
@@ -1667,7 +1671,7 @@ pub(crate) fn adamw_update(
 }
 
 pub(crate) fn representative_trainable_qwen_tensors() -> Vec<String> {
-    qwen_trainable_tensors_for_layers(&[0], true)
+    qwen_trainable_tensors_for_layers(&[0], true, false)
 }
 
 pub(crate) fn qwen_session_default_trainable_layers() -> Vec<usize> {
@@ -1685,10 +1689,14 @@ pub(crate) fn qwen_session_trainable_layers_from_config(config: &Config) -> Vec<
 pub(crate) fn qwen_trainable_tensors_for_layers(
     trainable_layers: &[usize],
     include_embed_tokens: bool,
+    include_lm_head: bool,
 ) -> Vec<String> {
     let mut names = Vec::new();
     if include_embed_tokens {
         names.push("model.embed_tokens.weight".to_string());
+    }
+    if include_lm_head {
+        names.push("lm_head.weight".to_string());
     }
     for layer in trainable_layers {
         let prefix = format!("model.layers.{layer}");
