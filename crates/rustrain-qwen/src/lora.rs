@@ -1863,3 +1863,639 @@ pub(crate) fn lora_train_target(base_output: &Tensor) -> Tensor {
         / 10_000.0;
     base_output + values
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::qwen_module::test_utils::*;
+
+    #[test]
+    fn qwen_attention_lora_adapter_roundtrips_mismatched_q_v_shapes() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let adapter_output = temp.path().join("adapter.safetensors");
+        let adapter = QwenAttentionLoraAdapter::deterministic(
+            &[
+                (QwenLoraTargetModule::QProj, 4, 6),
+                (QwenLoraTargetModule::VProj, 4, 2),
+            ],
+            2,
+            8.0,
+        );
+
+        assert_eq!(
+            adapter
+                .delta(QwenLoraTargetModule::QProj, Device::Cpu)
+                .expect("q delta")
+                .size(),
+            vec![6, 4]
+        );
+        assert_eq!(
+            adapter
+                .delta(QwenLoraTargetModule::VProj, Device::Cpu)
+                .expect("v delta")
+                .size(),
+            vec![2, 4]
+        );
+
+        adapter.save(&adapter_output).expect("adapter should write");
+        let reloaded =
+            QwenAttentionLoraAdapter::load(&adapter_output).expect("adapter should reload");
+
+        assert_eq!(
+            reloaded
+                .delta(QwenLoraTargetModule::QProj, Device::Cpu)
+                .expect("q delta")
+                .size(),
+            vec![6, 4]
+        );
+        assert_eq!(
+            reloaded
+                .delta(QwenLoraTargetModule::VProj, Device::Cpu)
+                .expect("v delta")
+                .size(),
+            vec![2, 4]
+        );
+        assert!(
+            diff_stats(
+                &reloaded
+                    .delta(QwenLoraTargetModule::QProj, Device::Cpu)
+                    .expect("reloaded q delta"),
+                &adapter
+                    .delta(QwenLoraTargetModule::QProj, Device::Cpu)
+                    .expect("q delta")
+            )
+            .expect("q delta diff should compute")
+            .max_abs
+                < 1e-8
+        );
+        assert!(
+            diff_stats(
+                &reloaded
+                    .delta(QwenLoraTargetModule::VProj, Device::Cpu)
+                    .expect("reloaded v delta"),
+                &adapter
+                    .delta(QwenLoraTargetModule::VProj, Device::Cpu)
+                    .expect("v delta")
+            )
+            .expect("v delta diff should compute")
+            .max_abs
+                < 1e-8
+        );
+    }
+
+    #[test]
+    fn qwen_attention_lora_train_step_reduces_tiny_mse_and_reloads() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let adapter_output = temp.path().join("adapter.safetensors");
+        let config = QwenRuntimeConfig {
+            num_hidden_layers: 1,
+            num_attention_heads: 2,
+            num_key_value_heads: 1,
+            rms_norm_eps: 1e-6,
+            rope_theta: 10_000.0,
+        };
+        let weights = tiny_qwen_weights();
+        let layer = QwenLayerWeights::load(&weights, 0).expect("layer should load");
+        let input = Tensor::arange(12, (Kind::Float, Device::Cpu)).reshape([1, 3, 4]) / 12.0;
+        let target = qwen_attention(
+            &input,
+            &layer.q_proj,
+            &layer.q_bias,
+            &layer.k_proj,
+            &layer.k_bias,
+            &layer.v_proj,
+            &layer.v_bias,
+            &layer.o_proj,
+            &config,
+        ) + Tensor::ones([1, 3, 4], (Kind::Float, Device::Cpu)) * 0.01;
+        let adapter = QwenAttentionLoraAdapter::deterministic_trainable(
+            &[
+                (QwenLoraTargetModule::QProj, 4, 4),
+                (QwenLoraTargetModule::VProj, 4, 2),
+            ],
+            2,
+            8.0,
+        );
+
+        let initial_loss = qwen_attention_lora_mse_loss(&input, &target, &layer, &adapter, &config)
+            .double_value(&[]);
+        let loss = qwen_attention_lora_mse_loss(&input, &target, &layer, &adapter, &config);
+        loss.backward();
+        for (_, mut tensor) in adapter.trainable_tensors(0) {
+            let grad = tensor.grad();
+            assert!(grad.defined());
+            let _ = no_grad(|| tensor.f_sub_(&(&grad * 1.0))).expect("update should apply");
+        }
+        let final_loss = qwen_attention_lora_mse_loss(&input, &target, &layer, &adapter, &config)
+            .double_value(&[]);
+        assert!(final_loss < initial_loss);
+
+        adapter.save(&adapter_output).expect("adapter should save");
+        let reloaded =
+            QwenAttentionLoraAdapter::load(&adapter_output).expect("adapter should reload");
+        let reloaded_loss =
+            qwen_attention_lora_mse_loss(&input, &target, &layer, &reloaded, &config)
+                .double_value(&[]);
+        assert!((final_loss - reloaded_loss).abs() < 1e-8);
+    }
+
+    #[test]
+    fn qwen_lora_registry_roundtrips_configured_layer_targets() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let adapter_output = temp.path().join("adapter.safetensors");
+        let weights = tiny_qwen_weights();
+        let runtime_config = RuntimeLoraConfig {
+            rank: 2,
+            alpha: 8.0,
+            target_layers: vec![0],
+            target_modules: vec![
+                "q_proj".to_string(),
+                "k_proj".to_string(),
+                "v_proj".to_string(),
+                "o_proj".to_string(),
+                "gate_proj".to_string(),
+                "up_proj".to_string(),
+                "down_proj".to_string(),
+            ],
+        };
+        let config = QwenLoraConfig::from_runtime(&runtime_config).expect("config should build");
+        let registry = QwenLoraRegistry::deterministic(&weights, &config, true)
+            .expect("registry should build");
+
+        assert_eq!(registry.config.target_layers, vec![0]);
+        assert_eq!(
+            registry.config.target_modules,
+            vec![
+                QwenLoraTargetModule::QProj,
+                QwenLoraTargetModule::KProj,
+                QwenLoraTargetModule::VProj,
+                QwenLoraTargetModule::OProj,
+                QwenLoraTargetModule::GateProj,
+                QwenLoraTargetModule::UpProj,
+                QwenLoraTargetModule::DownProj,
+            ]
+        );
+        assert_eq!(
+            registry.trainable_tensor_names(),
+            vec![
+                "model.layers.0.self_attn.q_proj.lora_a".to_string(),
+                "model.layers.0.self_attn.q_proj.lora_b".to_string(),
+                "model.layers.0.self_attn.k_proj.lora_a".to_string(),
+                "model.layers.0.self_attn.k_proj.lora_b".to_string(),
+                "model.layers.0.self_attn.v_proj.lora_a".to_string(),
+                "model.layers.0.self_attn.v_proj.lora_b".to_string(),
+                "model.layers.0.self_attn.o_proj.lora_a".to_string(),
+                "model.layers.0.self_attn.o_proj.lora_b".to_string(),
+                "model.layers.0.mlp.gate_proj.lora_a".to_string(),
+                "model.layers.0.mlp.gate_proj.lora_b".to_string(),
+                "model.layers.0.mlp.up_proj.lora_a".to_string(),
+                "model.layers.0.mlp.up_proj.lora_b".to_string(),
+                "model.layers.0.mlp.down_proj.lora_a".to_string(),
+                "model.layers.0.mlp.down_proj.lora_b".to_string(),
+            ]
+        );
+
+        registry
+            .save(&adapter_output)
+            .expect("registry should save");
+        let reloaded = QwenLoraRegistry::load(&adapter_output).expect("registry should reload");
+
+        assert_eq!(reloaded.config, config);
+        for (name, tensor) in reloaded.trainable_tensors() {
+            assert!(
+                tensor.requires_grad(),
+                "{name} should remain trainable after reload"
+            );
+        }
+        assert!(
+            diff_stats(
+                &reloaded
+                    .layer_adapter(0)
+                    .expect("layer adapter")
+                    .delta(QwenLoraTargetModule::QProj, Device::Cpu)
+                    .expect("reloaded q delta"),
+                &registry
+                    .layer_adapter(0)
+                    .expect("layer adapter")
+                    .delta(QwenLoraTargetModule::QProj, Device::Cpu)
+                    .expect("q delta"),
+            )
+            .expect("q delta diff should compute")
+            .max_abs
+                < 1e-8
+        );
+        assert!(
+            diff_stats(
+                &reloaded
+                    .layer_adapter(0)
+                    .expect("layer adapter")
+                    .delta(QwenLoraTargetModule::VProj, Device::Cpu)
+                    .expect("reloaded v delta"),
+                &registry
+                    .layer_adapter(0)
+                    .expect("layer adapter")
+                    .delta(QwenLoraTargetModule::VProj, Device::Cpu)
+                    .expect("v delta"),
+            )
+            .expect("v delta diff should compute")
+            .max_abs
+                < 1e-8
+        );
+        assert_eq!(
+            reloaded
+                .layer_adapter(0)
+                .expect("layer adapter")
+                .delta(QwenLoraTargetModule::KProj, Device::Cpu)
+                .expect("k delta")
+                .size(),
+            vec![2, 4]
+        );
+        assert_eq!(
+            reloaded
+                .layer_adapter(0)
+                .expect("layer adapter")
+                .delta(QwenLoraTargetModule::OProj, Device::Cpu)
+                .expect("o delta")
+                .size(),
+            vec![4, 4]
+        );
+        assert_eq!(
+            reloaded
+                .layer_adapter(0)
+                .expect("layer adapter")
+                .delta(QwenLoraTargetModule::GateProj, Device::Cpu)
+                .expect("gate delta")
+                .size(),
+            vec![8, 4]
+        );
+        assert_eq!(
+            reloaded
+                .layer_adapter(0)
+                .expect("layer adapter")
+                .delta(QwenLoraTargetModule::DownProj, Device::Cpu)
+                .expect("down delta")
+                .size(),
+            vec![4, 8]
+        );
+    }
+
+    #[test]
+    fn qwen_lora_registry_applies_all_projection_targets_to_layer() {
+        let weights = tiny_qwen_weights();
+        let config = QwenRuntimeConfig {
+            num_hidden_layers: 1,
+            num_attention_heads: 2,
+            num_key_value_heads: 1,
+            rms_norm_eps: 1e-6,
+            rope_theta: 10_000.0,
+        };
+        let lora_config = QwenLoraConfig::new(
+            vec![0],
+            vec![
+                QwenLoraTargetModule::QProj,
+                QwenLoraTargetModule::KProj,
+                QwenLoraTargetModule::VProj,
+                QwenLoraTargetModule::OProj,
+                QwenLoraTargetModule::GateProj,
+                QwenLoraTargetModule::UpProj,
+                QwenLoraTargetModule::DownProj,
+            ],
+            2,
+            8.0,
+        )
+        .expect("LoRA config should build");
+        let zero_registry =
+            QwenLoraRegistry::zeros(&weights, &lora_config).expect("zero registry should build");
+        let registry = QwenLoraRegistry::deterministic(&weights, &lora_config, false)
+            .expect("registry should build");
+        let input = Tensor::arange(12, (Kind::Float, Device::Cpu)).reshape([1, 3, 4]) / 12.0;
+        let base_layer = QwenLayerWeights::load(&weights, 0).expect("base layer should load");
+        let base_output = qwen_layer(&input, &base_layer, &config);
+        let zero_output = qwen_layer_with_lora(
+            &input,
+            &base_layer,
+            zero_registry.layer_adapter(0).expect("zero adapter"),
+            &config,
+        );
+        let adapted_output = qwen_layer_with_lora(
+            &input,
+            &base_layer,
+            registry.layer_adapter(0).expect("adapter"),
+            &config,
+        );
+        assert!(
+            diff_stats(&base_output, &zero_output)
+                .expect("zero diff should compute")
+                .max_abs
+                < 1e-8
+        );
+        assert!(
+            diff_stats(&base_output, &adapted_output)
+                .expect("adapted diff should compute")
+                .max_abs
+                > 0.0
+        );
+
+        let merged_weights = registry
+            .merge_into_weights(&weights)
+            .expect("registry should merge all targets");
+        let merged_layer =
+            QwenLayerWeights::load(&merged_weights, 0).expect("merged layer should load");
+        let merged_output = qwen_layer(&input, &merged_layer, &config);
+        assert!(
+            diff_stats(&adapted_output, &merged_output)
+                .expect("merged diff should compute")
+                .max_abs
+                < 1e-6
+        );
+
+        let unmerged_weights = registry
+            .unmerge_from_weights(&merged_weights)
+            .expect("registry should unmerge all targets");
+        let unmerged_layer =
+            QwenLayerWeights::load(&unmerged_weights, 0).expect("unmerged layer should load");
+        let unmerged_output = qwen_layer(&input, &unmerged_layer, &config);
+        assert!(
+            diff_stats(&base_output, &unmerged_output)
+                .expect("unmerged diff should compute")
+                .max_abs
+                < 1e-6
+        );
+    }
+
+    #[test]
+    fn qwen_lora_sft_resume_config_validation_checks_manifest_and_adapter() {
+        let current = QwenLoraConfig::new(
+            vec![0, 1],
+            vec![
+                QwenLoraTargetModule::QProj,
+                QwenLoraTargetModule::VProj,
+                QwenLoraTargetModule::DownProj,
+            ],
+            4,
+            8.0,
+        )
+        .expect("current config should build");
+        let mut manifest = QwenLoraSftAdapterManifest {
+            format: "rustrain.qwen_lora_sft_adapter.v1".to_string(),
+            base_model_path: "/models/qwen".to_string(),
+            adapter_safetensors: "/tmp/adapter.safetensors".to_string(),
+            compute_kind: "fp32".to_string(),
+            steps: 2,
+            train_step: 4,
+            data_cursor_start: 0,
+            data_cursor_end: 4,
+            data_cursor_next: 4,
+            data_epoch_start: 0,
+            data_epoch_end: 0,
+            data_epoch_next: 0,
+            data_sample_offset_start: 0,
+            data_sample_offset_end: 4,
+            data_sample_offset_next: 4,
+            dataset_source_files: vec!["data/train.jsonl".to_string()],
+            dataset_source_sample_counts: vec![QwenSftSourceSampleCount {
+                path: "data/train.jsonl".to_string(),
+                samples: 4,
+            }],
+            dataset_fingerprint: "abc123".to_string(),
+            dataset_order_seed: 777,
+            dataset_shuffle: true,
+            streaming_train_batches: true,
+            dataset_total_samples: 4,
+            dataset_train_samples: 3,
+            dataset_eval_samples: 1,
+            batch_size: 1,
+            gradient_accumulation_steps: 1,
+            target_layers: current.target_layers.clone(),
+            target_modules: current.target_module_names(),
+        };
+
+        qwen_validate_lora_resume_config(Some(&manifest), &current, &current, "fp32")
+            .expect("matching manifest and adapter config should pass");
+        qwen_validate_lora_resume_config(None, &current, &current, "bf16")
+            .expect("direct adapter resume should pass without manifest metadata");
+
+        let compute_kind_error =
+            qwen_validate_lora_resume_config(Some(&manifest), &current, &current, "bf16")
+                .expect_err("manifest compute kind mismatch should fail")
+                .to_string();
+        assert!(compute_kind_error.contains("resume manifest compute_kind"));
+
+        let adapter_mismatch = QwenLoraConfig::new(
+            vec![0, 1],
+            vec![QwenLoraTargetModule::QProj, QwenLoraTargetModule::VProj],
+            4,
+            8.0,
+        )
+        .expect("adapter mismatch config should build");
+        let adapter_error =
+            qwen_validate_lora_resume_config(Some(&manifest), &adapter_mismatch, &current, "fp32")
+                .expect_err("adapter config mismatch should fail")
+                .to_string();
+        assert!(adapter_error.contains("resume adapter config does not match"));
+
+        manifest.target_modules = vec!["q_proj".to_string(), "v_proj".to_string()];
+        let manifest_module_error =
+            qwen_validate_lora_resume_config(Some(&manifest), &current, &current, "fp32")
+                .expect_err("manifest module mismatch should fail")
+                .to_string();
+        assert!(manifest_module_error.contains("resume manifest target_modules"));
+
+        manifest.target_modules = current.target_module_names();
+        manifest.target_layers = vec![0];
+        let manifest_layer_error =
+            qwen_validate_lora_resume_config(Some(&manifest), &current, &current, "fp32")
+                .expect_err("manifest layer mismatch should fail")
+                .to_string();
+        assert!(manifest_layer_error.contains("resume manifest target_layers"));
+    }
+
+    #[test]
+    fn qwen_lora_config_rejects_unsupported_target_module() {
+        let runtime_config = RuntimeLoraConfig {
+            rank: 2,
+            alpha: 8.0,
+            target_layers: vec![0],
+            target_modules: vec!["score_proj".to_string()],
+        };
+        let error = QwenLoraConfig::from_runtime(&runtime_config)
+            .expect_err("unsupported target should fail");
+
+        assert!(
+            error
+                .to_string()
+                .contains("unsupported Qwen LoRA target module score_proj")
+        );
+    }
+
+    #[test]
+    fn qwen_lora_full_forward_and_generate_reload_parity() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let adapter_output = temp.path().join("adapter.safetensors");
+        let config = QwenRuntimeConfig {
+            num_hidden_layers: 1,
+            num_attention_heads: 2,
+            num_key_value_heads: 1,
+            rms_norm_eps: 1e-6,
+            rope_theta: 10_000.0,
+        };
+        let weights = tiny_qwen_weights();
+        let lora_config = QwenLoraConfig::layer0_qv(2, 8.0).expect("config should build");
+        let registry = QwenLoraRegistry::deterministic(&weights, &lora_config, false)
+            .expect("registry should build");
+        let input_ids = Tensor::from_slice(&[0_i64, 1, 2]).reshape([1, 3]);
+
+        let base_logits =
+            qwen_forward_from_ids(&input_ids, &weights, &config).expect("base forward should run");
+        let adapted_logits =
+            qwen_forward_from_ids_with_lora(&input_ids, &weights, &config, &registry, Kind::Float)
+                .expect("LoRA forward should run");
+        assert!(
+            diff_stats(&adapted_logits, &base_logits)
+                .expect("adapter diff should compute")
+                .max_abs
+                > 0.0
+        );
+
+        registry
+            .save(&adapter_output)
+            .expect("registry should save");
+        let reloaded = QwenLoraRegistry::load(&adapter_output).expect("registry should reload");
+        let reloaded_logits =
+            qwen_forward_from_ids_with_lora(&input_ids, &weights, &config, &reloaded, Kind::Float)
+                .expect("reloaded LoRA forward should run");
+        assert!(
+            diff_stats(&reloaded_logits, &adapted_logits)
+                .expect("reload diff should compute")
+                .max_abs
+                < 1e-8
+        );
+        let merged_weights = reloaded
+            .merge_into_weights(&weights)
+            .expect("LoRA weights should merge");
+        let merged_logits = qwen_forward_from_ids(&input_ids, &merged_weights, &config)
+            .expect("merged forward should run");
+        assert!(
+            diff_stats(&merged_logits, &adapted_logits)
+                .expect("merge diff should compute")
+                .max_abs
+                < 1e-8
+        );
+        let unmerged_weights = reloaded
+            .unmerge_from_weights(&merged_weights)
+            .expect("LoRA weights should unmerge");
+        let unmerged_logits = qwen_forward_from_ids(&input_ids, &unmerged_weights, &config)
+            .expect("unmerged forward should run");
+        assert!(
+            diff_stats(&unmerged_logits, &base_logits)
+                .expect("unmerge diff should compute")
+                .max_abs
+                < 1e-8
+        );
+
+        let generated = qwen_greedy_generate_with_lora(
+            &input_ids,
+            &weights,
+            &config,
+            &registry,
+            2,
+            Kind::Float,
+        )
+        .expect("LoRA generate should run");
+        let reloaded_generated = qwen_greedy_generate_with_lora(
+            &input_ids,
+            &weights,
+            &config,
+            &reloaded,
+            2,
+            Kind::Float,
+        )
+        .expect("reloaded LoRA generate should run");
+        let merged_generated = qwen_greedy_generate(&input_ids, &merged_weights, &config, 2)
+            .expect("merged LoRA generate should run");
+        let generated_ids: Vec<i64> = Vec::<i64>::try_from(generated.reshape([-1])).unwrap();
+        let reloaded_generated_ids: Vec<i64> =
+            Vec::<i64>::try_from(reloaded_generated.reshape([-1])).unwrap();
+        let merged_generated_ids: Vec<i64> =
+            Vec::<i64>::try_from(merged_generated.reshape([-1])).unwrap();
+        assert_eq!(reloaded_generated_ids, generated_ids);
+        assert_eq!(merged_generated_ids, generated_ids);
+    }
+
+    #[test]
+    fn qwen_lora_full_layer_targets_affect_forward_and_merge() {
+        let config = QwenRuntimeConfig {
+            num_hidden_layers: 1,
+            num_attention_heads: 2,
+            num_key_value_heads: 1,
+            rms_norm_eps: 1e-6,
+            rope_theta: 10_000.0,
+        };
+        let weights = tiny_qwen_weights();
+        let lora_config = QwenLoraConfig::new(
+            vec![0],
+            vec![
+                QwenLoraTargetModule::QProj,
+                QwenLoraTargetModule::KProj,
+                QwenLoraTargetModule::VProj,
+                QwenLoraTargetModule::OProj,
+                QwenLoraTargetModule::GateProj,
+                QwenLoraTargetModule::UpProj,
+                QwenLoraTargetModule::DownProj,
+            ],
+            2,
+            8.0,
+        )
+        .expect("config should build");
+        let registry = QwenLoraRegistry::deterministic(&weights, &lora_config, false)
+            .expect("registry should build");
+        let input_ids = Tensor::from_slice(&[0_i64, 1, 2]).reshape([1, 3]);
+
+        for module in &lora_config.target_modules {
+            let weight =
+                tensor(&weights, &module.weight_name(0)).expect("base weight should exist");
+            assert_eq!(
+                registry
+                    .layer_adapter(0)
+                    .expect("layer adapter should exist")
+                    .delta(*module, Device::Cpu)
+                    .expect("delta should build")
+                    .size(),
+                weight.size()
+            );
+        }
+
+        let base_logits =
+            qwen_forward_from_ids(&input_ids, &weights, &config).expect("base forward should run");
+        let adapted_logits =
+            qwen_forward_from_ids_with_lora(&input_ids, &weights, &config, &registry, Kind::Float)
+                .expect("LoRA forward should run");
+        assert!(
+            diff_stats(&adapted_logits, &base_logits)
+                .expect("adapter diff should compute")
+                .max_abs
+                > 0.0
+        );
+
+        let merged_weights = registry
+            .merge_into_weights(&weights)
+            .expect("LoRA weights should merge");
+        let merged_logits = qwen_forward_from_ids(&input_ids, &merged_weights, &config)
+            .expect("merged forward should run");
+        assert!(
+            diff_stats(&merged_logits, &adapted_logits)
+                .expect("merge diff should compute")
+                .max_abs
+                < 1e-8
+        );
+    }
+
+    #[test]
+    fn qwen_lora_sft_eval_every_selects_periodic_steps() {
+        assert!(!qwen_lora_sft_should_eval_step(1, 0));
+        assert!(qwen_lora_sft_should_eval_step(1, 1));
+        assert!(!qwen_lora_sft_should_eval_step(1, 2));
+        assert!(qwen_lora_sft_should_eval_step(2, 2));
+        assert!(qwen_lora_sft_should_eval_step(4, 2));
+    }
+}

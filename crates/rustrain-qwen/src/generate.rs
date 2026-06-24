@@ -248,3 +248,42 @@ pub(crate) fn sample_token_from_logits(
 
     bail!("sampling draw did not select a token")
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::qwen_module::test_utils::*;
+
+    #[test]
+    fn sampling_respects_top_k_and_top_p_filters() {
+        let logits = Tensor::from_slice(&[0.0_f32, 1.0, 2.0, 3.0]);
+        let mut rng = StdRng::seed_from_u64(7);
+
+        let token =
+            sample_token_from_logits(&logits, 0.8, 1, 0.5, &mut rng).expect("sample should run");
+
+        assert_eq!(token.int64_value(&[0]), 3);
+    }
+
+    #[test]
+    fn cached_greedy_matches_full_context_greedy_for_tiny_weights() {
+        let config = QwenRuntimeConfig {
+            num_hidden_layers: 1,
+            num_attention_heads: 2,
+            num_key_value_heads: 1,
+            rms_norm_eps: 1e-6,
+            rope_theta: 10_000.0,
+        };
+        let weights = tiny_qwen_weights();
+        let input_ids = Tensor::from_slice(&[0_i64, 1, 2]).reshape([1, 3]);
+
+        let full = qwen_greedy_generate(&input_ids, &weights, &config, 3)
+            .expect("full-context generate should run");
+        let cached = qwen_greedy_generate_with_cache(&input_ids, &weights, &config, 3)
+            .expect("cached generate should run");
+        let full_ids: Vec<i64> = Vec::<i64>::try_from(full.reshape([-1])).unwrap();
+        let cached_ids: Vec<i64> = Vec::<i64>::try_from(cached.reshape([-1])).unwrap();
+
+        assert_eq!(cached_ids, full_ids);
+    }
+}

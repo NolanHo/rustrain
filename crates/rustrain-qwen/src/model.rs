@@ -804,3 +804,163 @@ pub fn diff_stats(actual: &Tensor, expected: &Tensor) -> Result<DiffStats> {
         mean_abs: diff.mean(Kind::Float).double_value(&[]),
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::qwen_module::test_utils::*;
+
+    #[test]
+    fn rms_norm_matches_manual_formula() {
+        let input = Tensor::from_slice(&[1.0_f32, 2.0, 3.0, 4.0]).reshape([1, 2, 2]);
+        let weight = Tensor::from_slice(&[0.5_f32, 2.0]);
+        let output = rms_norm(&input, &weight, 1e-6);
+
+        assert_eq!(output.size(), vec![1, 2, 2]);
+        assert!(output.isfinite().all().int64_value(&[]) == 1);
+    }
+
+    #[test]
+    fn rotate_half_splits_head_dimension_in_halves() {
+        let input = Tensor::from_slice(&[1.0_f32, 2.0, 3.0, 4.0]).reshape([1, 1, 1, 4]);
+        let output = rotate_half(&input);
+
+        let values: Vec<f32> = Vec::<f32>::try_from(output.reshape([4])).unwrap();
+        assert_eq!(values, vec![-3.0, -4.0, 1.0, 2.0]);
+    }
+
+    #[test]
+    fn qwen_causal_lm_loss_is_finite_for_tiny_weights() {
+        let config = QwenRuntimeConfig {
+            num_hidden_layers: 1,
+            num_attention_heads: 2,
+            num_key_value_heads: 1,
+            rms_norm_eps: 1e-6,
+            rope_theta: 10_000.0,
+        };
+        let weights = tiny_qwen_weights();
+        let input_ids = Tensor::from_slice(&[0_i64, 1, 2, 3]).reshape([1, 4]);
+
+        let loss = qwen_causal_lm_loss(&input_ids, &weights, &config).expect("loss should run");
+
+        assert_eq!(loss.size(), Vec::<i64>::new());
+        assert!(loss.isfinite().int64_value(&[]) == 1);
+    }
+
+    #[test]
+    fn trainable_tensor_names_expand_over_configured_layers() {
+        let names = qwen_trainable_tensors_for_layers(&[0, 1], true);
+
+        assert!(names.contains(&"model.embed_tokens.weight".to_string()));
+        assert!(names.contains(&"model.norm.weight".to_string()));
+        assert!(names.contains(&"model.layers.0.self_attn.q_proj.weight".to_string()));
+        assert!(names.contains(&"model.layers.1.self_attn.q_proj.weight".to_string()));
+        assert!(names.contains(&"model.layers.1.mlp.down_proj.weight".to_string()));
+        assert_eq!(names.len(), 26);
+
+        let dp_names = qwen_trainable_tensors_for_layers(&[0, 1], false);
+        assert!(!dp_names.contains(&"model.embed_tokens.weight".to_string()));
+        assert_eq!(dp_names.len(), 25);
+    }
+
+    #[test]
+    fn qwen_data_epoch_metadata_tracks_wrapping_cursor() {
+        assert_eq!(qwen_data_epoch_and_offset(0, 6).unwrap(), (0, 0));
+        assert_eq!(qwen_data_epoch_and_offset(5, 6).unwrap(), (0, 5));
+        assert_eq!(qwen_data_epoch_and_offset(6, 6).unwrap(), (1, 0));
+        assert_eq!(qwen_data_epoch_and_offset(16, 6).unwrap(), (2, 4));
+        assert!(qwen_data_epoch_and_offset(0, 0).is_err());
+    }
+
+    #[test]
+    fn qwen_model_path_resolves_hf_hub_snapshot_when_legacy_dir_is_missing() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let legacy = temp.path().join("Qwen2.5-0.5B-Instruct");
+        let incomplete_snapshot = temp
+            .path()
+            .join("hub")
+            .join("models--Qwen--Qwen2.5-0.5B-Instruct")
+            .join("snapshots")
+            .join("111");
+        let complete_snapshot = temp
+            .path()
+            .join("hub")
+            .join("models--Qwen--Qwen2.5-0.5B-Instruct")
+            .join("snapshots")
+            .join("222");
+        fs::create_dir_all(&incomplete_snapshot).expect("incomplete snapshot dir should write");
+        fs::create_dir_all(&complete_snapshot).expect("complete snapshot dir should write");
+        fs::write(incomplete_snapshot.join("config.json"), "{}").expect("config should write");
+        fs::write(complete_snapshot.join("config.json"), "{}").expect("config should write");
+        fs::write(complete_snapshot.join("tokenizer.json"), "{}").expect("tokenizer should write");
+        fs::write(complete_snapshot.join("model.safetensors"), "")
+            .expect("safetensors marker should write");
+
+        let resolved =
+            resolve_qwen_model_path(&legacy).expect("legacy path should resolve through HF hub");
+
+        assert_eq!(resolved, complete_snapshot);
+    }
+
+    #[test]
+    fn qwen_model_path_keeps_complete_configured_directory() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let model_path = temp.path().join("Qwen2.5-0.5B-Instruct");
+        fs::create_dir_all(&model_path).expect("model dir should write");
+        fs::write(model_path.join("config.json"), "{}").expect("config should write");
+        fs::write(model_path.join("tokenizer.json"), "{}").expect("tokenizer should write");
+        fs::write(model_path.join("model.safetensors"), "")
+            .expect("safetensors marker should write");
+
+        let resolved =
+            resolve_qwen_model_path(&model_path).expect("complete path should not be rewritten");
+
+        assert_eq!(resolved, model_path);
+    }
+
+    #[test]
+    fn qwen_model_path_reports_missing_hf_snapshot() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let legacy = temp.path().join("Qwen2.5-0.5B-Instruct");
+        let incomplete_snapshot = temp
+            .path()
+            .join("hub")
+            .join("models--Qwen--Qwen2.5-0.5B-Instruct")
+            .join("snapshots")
+            .join("111");
+        fs::create_dir_all(&incomplete_snapshot).expect("incomplete snapshot dir should write");
+        fs::write(incomplete_snapshot.join("config.json"), "{}").expect("config should write");
+
+        let error = match resolve_qwen_model_path(&legacy) {
+            Ok(path) => panic!("incomplete cache should fail, resolved {}", path.display()),
+            Err(error) => error.to_string(),
+        };
+
+        assert!(error.contains("no complete HF hub snapshot"));
+    }
+
+    #[test]
+    fn qwen_model_safetensors_path_resolves_with_hf_hub_snapshot() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let legacy_safetensors = temp
+            .path()
+            .join("Qwen2.5-0.5B-Instruct")
+            .join("model.safetensors");
+        let complete_snapshot = temp
+            .path()
+            .join("hub")
+            .join("models--Qwen--Qwen2.5-0.5B-Instruct")
+            .join("snapshots")
+            .join("222");
+        fs::create_dir_all(&complete_snapshot).expect("complete snapshot dir should write");
+        fs::write(complete_snapshot.join("config.json"), "{}").expect("config should write");
+        fs::write(complete_snapshot.join("tokenizer.json"), "{}").expect("tokenizer should write");
+        fs::write(complete_snapshot.join("model.safetensors"), "")
+            .expect("safetensors marker should write");
+
+        let resolved = resolve_qwen_model_safetensors_path(&legacy_safetensors)
+            .expect("legacy safetensors path should resolve through HF hub");
+
+        assert_eq!(resolved, complete_snapshot.join("model.safetensors"));
+    }
+}

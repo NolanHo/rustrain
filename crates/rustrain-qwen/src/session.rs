@@ -2371,3 +2371,946 @@ pub(crate) fn qwen_session_dp_batch_plan_from_config(
         local_batch_size,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::qwen_module::test_utils::*;
+
+    #[test]
+    fn representative_full_train_tensors_get_gradients_and_reload() {
+        let config = QwenRuntimeConfig {
+            num_hidden_layers: 1,
+            num_attention_heads: 2,
+            num_key_value_heads: 1,
+            rms_norm_eps: 1e-6,
+            rope_theta: 10_000.0,
+        };
+        let mut weights = tiny_qwen_weights();
+        let input_ids = Tensor::from_slice(&[0_i64, 1, 2, 3]).reshape([1, 4]);
+        let mut registry =
+            QwenTrainableRegistry::representative(&mut weights).expect("registry should build");
+        assert_eq!(
+            registry.parameter_names(),
+            representative_trainable_qwen_tensors()
+        );
+
+        let initial_loss = qwen_causal_lm_loss(&input_ids, &weights, &config)
+            .expect("loss should run")
+            .double_value(&[]);
+        let loss = qwen_causal_lm_loss(&input_ids, &weights, &config).expect("loss should run");
+        loss.backward();
+        let artifacts = registry
+            .adamw_step(&mut weights, 1e-2, 1)
+            .expect("optimizer step should apply");
+        assert_eq!(
+            artifacts.tensor_summaries.len(),
+            representative_trainable_qwen_tensors().len()
+        );
+        assert_eq!(
+            artifacts.manifest_tensors.len(),
+            representative_trainable_qwen_tensors().len()
+        );
+        assert_eq!(
+            artifacts.optimizer_entries.len(),
+            representative_trainable_qwen_tensors().len() * 2
+        );
+        for summary in &artifacts.tensor_summaries {
+            assert!(
+                summary.grad_defined,
+                "{} should receive a gradient",
+                summary.name
+            );
+            assert!(
+                summary.grad_norm > 0.0,
+                "{} grad should be non-zero",
+                summary.name
+            );
+            assert!(
+                summary.delta_norm > 0.0,
+                "{} delta should be non-zero",
+                summary.name
+            );
+        }
+
+        let final_loss = qwen_causal_lm_loss(&input_ids, &weights, &config)
+            .expect("loss should run")
+            .double_value(&[]);
+        assert!(final_loss < initial_loss);
+
+        let mut reloaded_weights = tiny_qwen_weights();
+        let delta_tensors: BTreeMap<String, Tensor> = artifacts
+            .delta_entries
+            .into_iter()
+            .map(|(name, tensor)| (name, tensor))
+            .collect();
+        QwenTrainableRegistry::apply_delta_checkpoint(
+            &mut reloaded_weights,
+            &delta_tensors,
+            &artifacts.manifest_tensors,
+        )
+        .expect("delta reload should apply");
+        let reloaded_loss = qwen_causal_lm_loss(&input_ids, &reloaded_weights, &config)
+            .expect("loss should run")
+            .double_value(&[]);
+        assert!((final_loss - reloaded_loss).abs() < 1e-6);
+    }
+
+    #[test]
+    fn qwen_trainable_session_can_train_multiple_layers() {
+        let config = QwenRuntimeConfig {
+            num_hidden_layers: 2,
+            num_attention_heads: 2,
+            num_key_value_heads: 1,
+            rms_norm_eps: 1e-6,
+            rope_theta: 10_000.0,
+        };
+        let input_ids = Tensor::from_slice(&[0_i64, 1, 2, 3]).reshape([1, 4]);
+        let mut session = QwenTrainableSession::from_trainable_layers(
+            config,
+            two_layer_tiny_qwen_weights(),
+            input_ids,
+            Kind::Float,
+            &[0, 1],
+        )
+        .expect("multi-layer session should build");
+
+        let step = session
+            .train_step(1e-2, 1)
+            .expect("multi-layer session should train");
+
+        assert!(step.loss_after < step.loss_before);
+        assert_eq!(step.artifacts.tensor_summaries.len(), 26);
+        assert!(step.artifacts.tensor_summaries.iter().any(|summary| {
+            summary.name == "model.layers.1.self_attn.q_proj.weight" && summary.grad_norm > 0.0
+        }));
+        assert!(step.artifacts.tensor_summaries.iter().any(|summary| {
+            summary.name == "model.layers.1.mlp.down_proj.weight" && summary.grad_norm > 0.0
+        }));
+    }
+
+    #[test]
+    fn qwen_delta_manifest_roundtrips() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let delta_output = temp.path().join("delta.safetensors");
+        let manifest_output = delta_manifest_path(&delta_output);
+        let manifest = QwenDeltaCheckpointManifest {
+            format: "rustrain.qwen_delta.v1".to_string(),
+            base_model_path: "/models/qwen".to_string(),
+            reference_fixture: "fixture.safetensors".to_string(),
+            delta_safetensors: delta_output.display().to_string(),
+            optimizer_safetensors: Some(optimizer_state_path(&delta_output).display().to_string()),
+            train_step: 1,
+            data_cursor_start: None,
+            data_cursor_end: None,
+            data_cursor_next: None,
+            data_epoch_start: None,
+            data_epoch_end: None,
+            data_epoch_next: None,
+            data_sample_offset_start: None,
+            data_sample_offset_end: None,
+            data_sample_offset_next: None,
+            dataset_source_files: Vec::new(),
+            dataset_source_sample_counts: Vec::new(),
+            dataset_fingerprint: String::new(),
+            dataset_shuffle: true,
+            streaming_train_batches: None,
+            learning_rate: 1e-6,
+            initial_loss: 2.0,
+            final_loss: 1.5,
+            tensors: vec![QwenDeltaTensorManifestEntry {
+                name: "model.layers.0.self_attn.q_proj.weight".to_string(),
+                delta_name: "model.layers.0.self_attn.q_proj.weight.delta".to_string(),
+                adam_m_name: Some("model.layers.0.self_attn.q_proj.weight.adam_m".to_string()),
+                adam_v_name: Some("model.layers.0.self_attn.q_proj.weight.adam_v".to_string()),
+                shape: vec![4, 4],
+                dtype: "float32".to_string(),
+                grad_norm: 3.0,
+                delta_norm: 0.1,
+            }],
+        };
+
+        write_qwen_delta_manifest(&manifest_output, &manifest).expect("manifest should write");
+        let reloaded: QwenDeltaCheckpointManifest = serde_json::from_str(
+            &fs::read_to_string(&manifest_output).expect("manifest should read"),
+        )
+        .expect("manifest should parse");
+
+        assert_eq!(manifest_output, temp.path().join("delta.safetensors.json"));
+        assert_eq!(
+            optimizer_state_path(&delta_output),
+            temp.path().join("delta.safetensors.optimizer.safetensors")
+        );
+        assert_eq!(reloaded.format, "rustrain.qwen_delta.v1");
+        assert_eq!(
+            reloaded.optimizer_safetensors,
+            manifest.optimizer_safetensors
+        );
+        assert_eq!(
+            reloaded.tensors[0].delta_name,
+            manifest.tensors[0].delta_name
+        );
+        assert_eq!(
+            reloaded.tensors[0].adam_m_name,
+            manifest.tensors[0].adam_m_name
+        );
+    }
+
+    #[test]
+    fn qwen_sharded_checkpoint_manifest_validates_rank_owned_shards() {
+        let mut manifest = tiny_qwen_sharded_manifest();
+        let mut replicated_norm_shard = manifest.ranks[0].shards[0].clone();
+        replicated_norm_shard.name = "model.layers.0.input_layernorm.weight".to_string();
+        replicated_norm_shard.shard_name = "rank0.input_layernorm".to_string();
+        replicated_norm_shard.optimizer_m_name = "rank0.input_layernorm.m".to_string();
+        replicated_norm_shard.optimizer_v_name = "rank0.input_layernorm.v".to_string();
+        replicated_norm_shard.global_shape = vec![4];
+        replicated_norm_shard.shard_shape = vec![4];
+        replicated_norm_shard.partition = "replicated_norm_smoke".to_string();
+        manifest.ranks[0].shards.push(replicated_norm_shard);
+        let encoded = serde_json::to_string_pretty(&manifest).expect("manifest should serialize");
+        let decoded: QwenShardedCheckpointManifest =
+            serde_json::from_str(&encoded).expect("manifest should deserialize");
+
+        decoded.validate().expect("manifest should validate");
+        assert_eq!(decoded.format, "rustrain.qwen_sharded.v1");
+        assert_eq!(decoded.parallel.world_size().unwrap(), 2);
+        assert_eq!(
+            decoded.ranks[0].shards[0].optimizer_m_name,
+            "rank0.q_proj.m"
+        );
+        assert_eq!(
+            decoded.ranks[1].shards[0].optimizer_v_name,
+            "rank1.q_proj.v"
+        );
+    }
+
+    #[test]
+    fn qwen_sharded_checkpoint_manifest_rejects_missing_rank() {
+        let mut manifest = tiny_qwen_sharded_manifest();
+        manifest.ranks.pop();
+
+        let error = manifest.validate().expect_err("missing rank should fail");
+
+        assert!(
+            error
+                .to_string()
+                .contains("rank manifest count 1 does not match world size 2")
+        );
+    }
+
+    #[test]
+    fn qwen_sharded_checkpoint_manifest_rejects_missing_optimizer_slots() {
+        let mut manifest = tiny_qwen_sharded_manifest();
+        manifest.ranks[0].shards[0].optimizer_m_name.clear();
+
+        let error = manifest
+            .validate()
+            .expect_err("missing optimizer slots should fail");
+
+        assert!(error.to_string().contains("missing optimizer slots"));
+    }
+
+    #[test]
+    fn qwen_sharded_checkpoint_manifest_rejects_invalid_global_metadata() {
+        let mut missing_scheduler = tiny_qwen_sharded_manifest();
+        missing_scheduler.scheduler.clear();
+        let missing_scheduler_error = missing_scheduler
+            .validate()
+            .expect_err("missing scheduler should fail")
+            .to_string();
+        assert!(missing_scheduler_error.contains("requires scheduler"));
+
+        let mut zero_step = tiny_qwen_sharded_manifest();
+        zero_step.global_step = 0;
+        let zero_step_error = zero_step
+            .validate()
+            .expect_err("zero global_step should fail")
+            .to_string();
+        assert!(zero_step_error.contains("global_step must be positive"));
+    }
+
+    #[test]
+    fn qwen_sharded_checkpoint_manifest_rejects_invalid_parallel_rank_axes() {
+        let mut duplicate_axes = tiny_qwen_sharded_manifest();
+        duplicate_axes.ranks[1].data_parallel_rank = 0;
+        duplicate_axes.ranks[1].rank = 1;
+        let duplicate_axes_error = duplicate_axes
+            .validate()
+            .expect_err("duplicate parallel rank axes should fail")
+            .to_string();
+        assert!(duplicate_axes_error.contains("duplicate parallel rank axes"));
+
+        let mut wrong_linear_rank = tiny_qwen_sharded_manifest();
+        wrong_linear_rank.ranks.swap(0, 1);
+        wrong_linear_rank.ranks[0].rank = 0;
+        wrong_linear_rank.ranks[1].rank = 1;
+        let wrong_linear_rank_error = wrong_linear_rank
+            .validate()
+            .expect_err("rank id that disagrees with axes should fail")
+            .to_string();
+        assert!(wrong_linear_rank_error.contains("does not match linear parallel rank"));
+    }
+
+    #[test]
+    fn qwen_sharded_checkpoint_manifest_rejects_invalid_shard_shapes() {
+        let mut rank_mismatch = tiny_qwen_sharded_manifest();
+        rank_mismatch.ranks[0].shards[0].shard_shape = vec![4, 4, 1];
+        let rank_mismatch_error = rank_mismatch
+            .validate()
+            .expect_err("shape rank mismatch should fail")
+            .to_string();
+        assert!(rank_mismatch_error.contains("global_shape rank"));
+
+        let mut oversized_shard = tiny_qwen_sharded_manifest();
+        oversized_shard.ranks[0].shards[0].shard_shape = vec![5, 4];
+        let oversized_shard_error = oversized_shard
+            .validate()
+            .expect_err("oversized shard shape should fail")
+            .to_string();
+        assert!(oversized_shard_error.contains("exceeds global_shape"));
+
+        let mut zero_dim = tiny_qwen_sharded_manifest();
+        zero_dim.ranks[0].shards[0].global_shape = vec![4, 0];
+        let zero_dim_error = zero_dim
+            .validate()
+            .expect_err("zero shape dim should fail")
+            .to_string();
+        assert!(zero_dim_error.contains("shape dim 1 must be positive"));
+    }
+
+    #[test]
+    fn qwen_sharded_checkpoint_manifest_rejects_invalid_shard_contract_fields() {
+        let mut unsupported_dtype = tiny_qwen_sharded_manifest();
+        unsupported_dtype.ranks[0].shards[0].dtype = "int8".to_string();
+        let unsupported_dtype_error = unsupported_dtype
+            .validate()
+            .expect_err("unsupported dtype should fail")
+            .to_string();
+        assert!(unsupported_dtype_error.contains("unsupported dtype int8"));
+
+        let mut unsupported_partition = tiny_qwen_sharded_manifest();
+        unsupported_partition.ranks[0].shards[0].partition = "rank0_delta".to_string();
+        let unsupported_partition_error = unsupported_partition
+            .validate()
+            .expect_err("unsupported partition should fail")
+            .to_string();
+        assert!(unsupported_partition_error.contains("unsupported partition policy"));
+
+        let mut duplicate_tensor = tiny_qwen_sharded_manifest();
+        let repeated_shard = duplicate_tensor.ranks[0].shards[0].clone();
+        duplicate_tensor.ranks[0].shards.push(repeated_shard);
+        let duplicate_tensor_error = duplicate_tensor
+            .validate()
+            .expect_err("duplicate tensor shard should fail")
+            .to_string();
+        assert!(duplicate_tensor_error.contains("duplicate tensor shard"));
+
+        let mut duplicate_slot = tiny_qwen_sharded_manifest();
+        let mut second_shard = duplicate_slot.ranks[0].shards[0].clone();
+        second_shard.name = "model.layers.0.self_attn.k_proj.weight".to_string();
+        second_shard.shard_name = "rank0.k_proj".to_string();
+        second_shard.optimizer_m_name = "rank0.q_proj.v".to_string();
+        second_shard.optimizer_v_name = "rank0.k_proj.v".to_string();
+        duplicate_slot.ranks[0].shards.push(second_shard);
+        let duplicate_slot_error = duplicate_slot
+            .validate()
+            .expect_err("duplicate optimizer slot should fail")
+            .to_string();
+        assert!(duplicate_slot_error.contains("duplicate optimizer slot"));
+
+        let mut slot_collision = tiny_qwen_sharded_manifest();
+        slot_collision.ranks[0].shards[0].optimizer_m_name = "rank0.q_proj".to_string();
+        let slot_collision_error = slot_collision
+            .validate()
+            .expect_err("optimizer slot colliding with shard_name should fail")
+            .to_string();
+        assert!(slot_collision_error.contains("collides with shard_name"));
+    }
+
+    #[test]
+    fn qwen_sharded_checkpoint_manifest_validates_rank_owned_artifacts() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let manifest =
+            tiny_qwen_sharded_manifest_with_artifacts(temp.path()).expect("artifacts should write");
+
+        manifest
+            .validate_artifacts()
+            .expect("rank-owned artifacts should validate");
+    }
+
+    #[test]
+    fn qwen_sharded_checkpoint_manifest_rejects_missing_model_artifact_tensor() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let mut manifest =
+            tiny_qwen_sharded_manifest_with_artifacts(temp.path()).expect("artifacts should write");
+        manifest.ranks[0].shards[0].shard_name = "rank0.missing_q_proj".to_string();
+
+        let error = manifest
+            .validate_artifacts()
+            .expect_err("missing model shard should fail")
+            .to_string();
+
+        assert!(error.contains("missing model shard rank0.missing_q_proj"));
+    }
+
+    #[test]
+    fn qwen_sharded_checkpoint_manifest_rejects_missing_optimizer_artifact_tensor() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let mut manifest =
+            tiny_qwen_sharded_manifest_with_artifacts(temp.path()).expect("artifacts should write");
+        manifest.ranks[0].shards[0].optimizer_m_name = "rank0.q_proj.missing_m".to_string();
+
+        let error = manifest
+            .validate_artifacts()
+            .expect_err("missing optimizer slot should fail")
+            .to_string();
+
+        assert!(error.contains("missing optimizer m slot rank0.q_proj.missing_m"));
+    }
+
+    #[test]
+    fn qwen_sharded_checkpoint_manifest_rejects_artifact_shape_mismatch() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let mut manifest =
+            tiny_qwen_sharded_manifest_with_artifacts(temp.path()).expect("artifacts should write");
+        manifest.ranks[0].shards[0].shard_shape = vec![4, 2];
+
+        let error = manifest
+            .validate_artifacts()
+            .expect_err("artifact shape mismatch should fail")
+            .to_string();
+
+        assert!(error.contains("shape [4, 4] does not match manifest shard_shape [4, 2]"));
+    }
+
+    #[test]
+    fn qwen_session_dp_global_sharded_manifest_writes_schema_root() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let manifest =
+            tiny_qwen_sharded_manifest_with_artifacts(temp.path()).expect("artifacts should write");
+        for rank in &manifest.ranks {
+            fs::write(
+                temp.path()
+                    .join(format!("qwen-session-dp-sharded-rank-{}.json", rank.rank)),
+                serde_json::to_string_pretty(rank).expect("rank manifest should serialize"),
+            )
+            .expect("rank manifest should write");
+        }
+        let output = temp.path().join("global.json");
+
+        write_qwen_session_dp_global_sharded_manifest(
+            temp.path(),
+            Path::new("/models/qwen"),
+            2,
+            3,
+            QwenComputeDType::Fp32,
+            Some(12),
+            Some(60),
+            Some(2),
+            Some(2),
+            Some(5),
+            &manifest.dataset_source_files,
+            &manifest.dataset_source_sample_counts,
+            &manifest.dataset_fingerprint,
+            manifest.dataset_shuffle,
+            manifest.streaming_train_batches,
+            &output,
+        )
+        .expect("global manifest should write");
+        let decoded: QwenShardedCheckpointManifest = serde_json::from_str(
+            &fs::read_to_string(&output).expect("global manifest should read"),
+        )
+        .expect("global manifest should parse");
+
+        decoded.validate().expect("global manifest should validate");
+        assert_eq!(decoded.format, "rustrain.qwen_sharded.v1");
+        assert_eq!(decoded.global_step, 3);
+        assert_eq!(decoded.consumed_samples, 12);
+        assert_eq!(decoded.consumed_tokens, 60);
+        assert_eq!(decoded.data_cursor_next, Some(12));
+        assert_eq!(decoded.data_epoch_next, Some(2));
+        assert_eq!(decoded.data_sample_offset_next, Some(2));
+        assert_eq!(decoded.data_train_samples, Some(5));
+        assert_eq!(decoded.dataset_source_files, manifest.dataset_source_files);
+        assert_eq!(
+            decoded.dataset_source_sample_counts,
+            manifest.dataset_source_sample_counts
+        );
+        assert_eq!(decoded.dataset_fingerprint, manifest.dataset_fingerprint);
+        assert_eq!(decoded.ranks.len(), 2);
+    }
+
+    #[test]
+    fn qwen_sharded_checkpoint_manifest_rejects_inconsistent_data_progress() {
+        let mut manifest = tiny_qwen_sharded_manifest();
+        manifest.data_sample_offset_next = Some(5);
+
+        let error = manifest
+            .validate()
+            .expect_err("inconsistent data progress should fail");
+
+        assert!(
+            error
+                .to_string()
+                .contains("data_sample_offset_next 5 must match")
+        );
+    }
+
+    #[test]
+    fn qwen_sharded_checkpoint_manifest_validates_dataset_provenance_shape() {
+        let mut legacy_manifest = tiny_qwen_sharded_manifest();
+        legacy_manifest.dataset_source_files.clear();
+        legacy_manifest.dataset_source_sample_counts.clear();
+        legacy_manifest.dataset_fingerprint.clear();
+        legacy_manifest
+            .validate()
+            .expect("legacy sharded manifest without provenance should validate");
+
+        let mut missing_sources = tiny_qwen_sharded_manifest();
+        missing_sources.dataset_source_files.clear();
+        let missing_sources_error = missing_sources
+            .validate()
+            .expect_err("fingerprint without source files should fail")
+            .to_string();
+        assert!(missing_sources_error.contains("requires dataset_source_files"));
+
+        let mut missing_fingerprint = tiny_qwen_sharded_manifest();
+        missing_fingerprint.dataset_fingerprint.clear();
+        let missing_fingerprint_error = missing_fingerprint
+            .validate()
+            .expect_err("source files without fingerprint should fail")
+            .to_string();
+        assert!(missing_fingerprint_error.contains("require dataset_fingerprint"));
+
+        let mut non_jsonl_source = tiny_qwen_sharded_manifest();
+        non_jsonl_source.dataset_source_files = vec!["data/README.md".to_string()];
+        let non_jsonl_source_error = non_jsonl_source
+            .validate()
+            .expect_err("non-jsonl source file should fail")
+            .to_string();
+        assert!(non_jsonl_source_error.contains("must only contain JSONL paths"));
+
+        let mut mismatched_counts = tiny_qwen_sharded_manifest();
+        mismatched_counts.dataset_source_sample_counts = vec![QwenSftSourceSampleCount {
+            path: "data/other.jsonl".to_string(),
+            samples: 5,
+        }];
+        let mismatched_counts_error = mismatched_counts
+            .validate()
+            .expect_err("mismatched source sample count paths should fail")
+            .to_string();
+        assert!(mismatched_counts_error.contains("dataset_source_sample_counts must match"));
+
+        let mut zero_count = tiny_qwen_sharded_manifest();
+        zero_count.dataset_source_sample_counts[0].samples = 0;
+        let zero_count_error = zero_count
+            .validate()
+            .expect_err("zero source sample count should fail")
+            .to_string();
+        assert!(zero_count_error.contains("dataset_source_sample_counts must be positive"));
+    }
+
+    #[test]
+    fn qwen_sharded_checkpoint_resume_dataset_validation_rejects_changed_data() {
+        let manifest = tiny_qwen_sharded_manifest();
+        let summary = QwenSftDatasetSummary {
+            samples: 5,
+            total_tokens: 40,
+            response_tokens: 10,
+            masked_positions: 10,
+            max_sequence_tokens: 8,
+            source_files: manifest.dataset_source_files.clone(),
+            source_sample_counts: manifest.dataset_source_sample_counts.clone(),
+            fingerprint: manifest.dataset_fingerprint.clone(),
+            shuffle: manifest.dataset_shuffle,
+        };
+
+        qwen_validate_sft_resume_dataset(
+            &manifest.dataset_source_files,
+            &manifest.dataset_source_sample_counts,
+            &manifest.dataset_fingerprint,
+            manifest.dataset_shuffle,
+            &summary,
+            "sharded resume",
+        )
+        .expect("matching sharded provenance should pass");
+        qwen_validate_sft_resume_dataset(&[], &[], "", true, &summary, "legacy sharded resume")
+            .expect("legacy sharded manifests without provenance should pass");
+
+        let fingerprint_error = qwen_validate_sft_resume_dataset(
+            &manifest.dataset_source_files,
+            &manifest.dataset_source_sample_counts,
+            "changed-fingerprint",
+            manifest.dataset_shuffle,
+            &summary,
+            "sharded resume",
+        )
+        .expect_err("changed sharded fingerprint should fail")
+        .to_string();
+        assert!(fingerprint_error.contains("dataset fingerprint mismatch"));
+
+        let source_error = qwen_validate_sft_resume_dataset(
+            &["data/changed.jsonl".to_string()],
+            &manifest.dataset_source_sample_counts,
+            &manifest.dataset_fingerprint,
+            manifest.dataset_shuffle,
+            &summary,
+            "sharded resume",
+        )
+        .expect_err("changed sharded source files should fail")
+        .to_string();
+        assert!(source_error.contains("dataset source files mismatch"));
+
+        let shuffle_error = qwen_validate_sft_resume_dataset(
+            &manifest.dataset_source_files,
+            &manifest.dataset_source_sample_counts,
+            &manifest.dataset_fingerprint,
+            !manifest.dataset_shuffle,
+            &summary,
+            "sharded resume",
+        )
+        .expect_err("changed sharded shuffle policy should fail")
+        .to_string();
+        assert!(shuffle_error.contains("dataset shuffle mismatch"));
+    }
+
+    #[test]
+    fn qwen_sharded_rank_manifest_converts_to_delta_manifest() {
+        let manifest = tiny_qwen_sharded_manifest();
+
+        let delta = qwen_sharded_rank_to_delta_manifest(&manifest, 1, 2.0, 1.5, 1e-6)
+            .expect("rank should convert");
+
+        assert_eq!(delta.format, "rustrain.qwen_delta.v1");
+        assert_eq!(delta.reference_fixture, "qwen_sharded_rank_1");
+        assert_eq!(delta.delta_safetensors, "rank1/model.safetensors");
+        assert_eq!(
+            delta.optimizer_safetensors,
+            Some("rank1/optimizer.safetensors".to_string())
+        );
+        assert_eq!(
+            delta.tensors[0].name,
+            "model.layers.0.self_attn.q_proj.weight"
+        );
+        assert_eq!(delta.tensors[0].delta_name, "rank1.q_proj");
+        assert_eq!(
+            delta.tensors[0].adam_m_name,
+            Some("rank1.q_proj.m".to_string())
+        );
+    }
+
+    #[test]
+    fn qwen_optimizer_slots_reload_reproduces_next_adam_step() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let optimizer_output = temp.path().join("optimizer.safetensors");
+        let tensor_name = "model.layers.0.self_attn.q_proj.weight";
+        let slot_names = adam_slot_names(tensor_name);
+        let first_grad = Tensor::from_slice(&[0.5_f32, -0.25, 0.125, -0.75]).reshape([2, 2]);
+        let second_grad = Tensor::from_slice(&[-0.2_f32, 0.4, -0.6, 0.8]).reshape([2, 2]);
+        let base_weight = Tensor::from_slice(&[1.0_f32, 2.0, 3.0, 4.0]).reshape([2, 2]);
+        let learning_rate = 1e-3;
+        let beta1 = 0.9;
+        let beta2 = 0.999;
+        let eps = 1e-8;
+
+        let first_state = adamw_next_state(None, &first_grad, beta1, beta2);
+        let first_update = adamw_update(&first_state, learning_rate, beta1, beta2, 1, eps);
+        let after_first = &base_weight - first_update;
+        Tensor::write_safetensors(
+            &[
+                (slot_names.m.as_str(), &first_state.m),
+                (slot_names.v.as_str(), &first_state.v),
+            ],
+            &optimizer_output,
+        )
+        .expect("optimizer slots should write");
+
+        let reloaded_slots = read_safetensors_map(&optimizer_output).expect("slots should reload");
+        let reloaded_state = AdamState {
+            m: tensor(&reloaded_slots, &slot_names.m)
+                .expect("m slot should exist")
+                .to_kind(Kind::Float),
+            v: tensor(&reloaded_slots, &slot_names.v)
+                .expect("v slot should exist")
+                .to_kind(Kind::Float),
+        };
+        let continuous_second_state =
+            adamw_next_state(Some(&first_state), &second_grad, beta1, beta2);
+        let reloaded_second_state =
+            adamw_next_state(Some(&reloaded_state), &second_grad, beta1, beta2);
+        let continuous_after_second = &after_first
+            - adamw_update(
+                &continuous_second_state,
+                learning_rate,
+                beta1,
+                beta2,
+                2,
+                eps,
+            );
+        let reloaded_after_second = &after_first
+            - adamw_update(&reloaded_second_state, learning_rate, beta1, beta2, 2, eps);
+
+        assert!(
+            diff_stats(&continuous_second_state.m, &reloaded_second_state.m)
+                .expect("m state diff should compute")
+                .max_abs
+                < 1e-8
+        );
+        assert!(
+            diff_stats(&continuous_second_state.v, &reloaded_second_state.v)
+                .expect("v state diff should compute")
+                .max_abs
+                < 1e-8
+        );
+        assert!(
+            diff_stats(&continuous_after_second, &reloaded_after_second)
+                .expect("weight diff should compute")
+                .max_abs
+                < 1e-8
+        );
+    }
+
+    #[test]
+    fn qwen_manifest_resume_reproduces_second_full_train_step() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let delta_output = temp.path().join("delta.safetensors");
+        let optimizer_output = optimizer_state_path(&delta_output);
+        let manifest_output = delta_manifest_path(&delta_output);
+        let config = QwenRuntimeConfig {
+            num_hidden_layers: 1,
+            num_attention_heads: 2,
+            num_key_value_heads: 1,
+            rms_norm_eps: 1e-6,
+            rope_theta: 10_000.0,
+        };
+        let input_ids = Tensor::from_slice(&[0_i64, 1, 2, 3]).reshape([1, 4]);
+        let learning_rate = 1e-2;
+
+        let mut continuous_weights = tiny_qwen_weights();
+        let mut continuous_registry =
+            QwenTrainableRegistry::representative(&mut continuous_weights)
+                .expect("registry should build");
+        let initial_loss = qwen_causal_lm_loss(&input_ids, &continuous_weights, &config)
+            .expect("loss should run")
+            .double_value(&[]);
+        let first_loss =
+            qwen_causal_lm_loss(&input_ids, &continuous_weights, &config).expect("loss should run");
+        first_loss.backward();
+        let first_artifacts = continuous_registry
+            .adamw_step(&mut continuous_weights, learning_rate, 1)
+            .expect("first optimizer step should apply");
+        let final_loss = qwen_causal_lm_loss(&input_ids, &continuous_weights, &config)
+            .expect("loss should run")
+            .double_value(&[]);
+
+        let delta_refs: Vec<(&str, &Tensor)> = first_artifacts
+            .delta_entries
+            .iter()
+            .map(|(name, tensor)| (name.as_str(), tensor))
+            .collect();
+        Tensor::write_safetensors(&delta_refs, &delta_output).expect("delta should write");
+        let optimizer_refs: Vec<(&str, &Tensor)> = first_artifacts
+            .optimizer_entries
+            .iter()
+            .map(|(name, tensor)| (name.as_str(), tensor))
+            .collect();
+        Tensor::write_safetensors(&optimizer_refs, &optimizer_output)
+            .expect("optimizer should write");
+        let manifest = QwenDeltaCheckpointManifest {
+            format: "rustrain.qwen_delta.v1".to_string(),
+            base_model_path: "tiny-qwen".to_string(),
+            reference_fixture: "inline".to_string(),
+            delta_safetensors: delta_output.display().to_string(),
+            optimizer_safetensors: Some(optimizer_output.display().to_string()),
+            train_step: 1,
+            data_cursor_start: None,
+            data_cursor_end: None,
+            data_cursor_next: None,
+            data_epoch_start: None,
+            data_epoch_end: None,
+            data_epoch_next: None,
+            data_sample_offset_start: None,
+            data_sample_offset_end: None,
+            data_sample_offset_next: None,
+            dataset_source_files: Vec::new(),
+            dataset_source_sample_counts: Vec::new(),
+            dataset_fingerprint: String::new(),
+            dataset_shuffle: true,
+            streaming_train_batches: None,
+            learning_rate,
+            initial_loss,
+            final_loss,
+            tensors: first_artifacts.manifest_tensors,
+        };
+        write_qwen_delta_manifest(&manifest_output, &manifest).expect("manifest should write");
+        let reloaded_manifest: QwenDeltaCheckpointManifest = serde_json::from_str(
+            &fs::read_to_string(&manifest_output).expect("manifest should read"),
+        )
+        .expect("manifest should parse");
+
+        let mut resumed_weights = tiny_qwen_weights();
+        let mut resumed_registry =
+            QwenTrainableRegistry::load_from_manifest(&mut resumed_weights, &reloaded_manifest)
+                .expect("registry should load from manifest");
+        let resumed_loss = qwen_causal_lm_loss(&input_ids, &resumed_weights, &config)
+            .expect("loss should run")
+            .double_value(&[]);
+        assert!((final_loss - resumed_loss).abs() < 1e-6);
+
+        continuous_registry.zero_grad();
+        let continuous_second_loss =
+            qwen_causal_lm_loss(&input_ids, &continuous_weights, &config).expect("loss should run");
+        continuous_second_loss.backward();
+        continuous_registry
+            .adamw_step(&mut continuous_weights, learning_rate, 2)
+            .expect("continuous second step should apply");
+
+        let resumed_second_loss =
+            qwen_causal_lm_loss(&input_ids, &resumed_weights, &config).expect("loss should run");
+        resumed_second_loss.backward();
+        resumed_registry
+            .adamw_step(&mut resumed_weights, learning_rate, 2)
+            .expect("resumed second step should apply");
+
+        let continuous_after_second = qwen_causal_lm_loss(&input_ids, &continuous_weights, &config)
+            .expect("loss should run")
+            .double_value(&[]);
+        let resumed_after_second = qwen_causal_lm_loss(&input_ids, &resumed_weights, &config)
+            .expect("loss should run")
+            .double_value(&[]);
+        assert!((continuous_after_second - resumed_after_second).abs() < 1e-6);
+
+        for name in representative_trainable_qwen_tensors() {
+            let diff = diff_stats(
+                tensor(&continuous_weights, &name).expect("continuous tensor should exist"),
+                tensor(&resumed_weights, &name).expect("resumed tensor should exist"),
+            )
+            .expect("diff should compute");
+            assert!(
+                diff.max_abs < 1e-6,
+                "{name} should match after manifest-resumed second step, max_abs={}",
+                diff.max_abs
+            );
+        }
+    }
+
+    #[test]
+    fn qwen_trainable_session_trains_and_resumes_from_manifest() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let delta_output = temp.path().join("session-delta.safetensors");
+        let optimizer_output = optimizer_state_path(&delta_output);
+        let config = QwenRuntimeConfig {
+            num_hidden_layers: 1,
+            num_attention_heads: 2,
+            num_key_value_heads: 1,
+            rms_norm_eps: 1e-6,
+            rope_theta: 10_000.0,
+        };
+        let input_ids = Tensor::from_slice(&[0_i64, 1, 2, 3]).reshape([1, 4]);
+        let learning_rate = 1e-2;
+
+        let mut continuous_session = QwenTrainableSession::from_weights(
+            config,
+            tiny_qwen_weights(),
+            input_ids.shallow_clone(),
+            Kind::Float,
+        )
+        .expect("session should build");
+        let first_step = continuous_session
+            .train_step(learning_rate, 1)
+            .expect("first step should train");
+        assert!(first_step.loss_after < first_step.loss_before);
+
+        let delta_refs: Vec<(&str, &Tensor)> = first_step
+            .artifacts
+            .delta_entries
+            .iter()
+            .map(|(name, tensor)| (name.as_str(), tensor))
+            .collect();
+        Tensor::write_safetensors(&delta_refs, &delta_output).expect("delta should write");
+        let optimizer_refs: Vec<(&str, &Tensor)> = first_step
+            .artifacts
+            .optimizer_entries
+            .iter()
+            .map(|(name, tensor)| (name.as_str(), tensor))
+            .collect();
+        Tensor::write_safetensors(&optimizer_refs, &optimizer_output)
+            .expect("optimizer should write");
+        let manifest = QwenDeltaCheckpointManifest {
+            format: "rustrain.qwen_delta.v1".to_string(),
+            base_model_path: "tiny-qwen".to_string(),
+            reference_fixture: "inline".to_string(),
+            delta_safetensors: delta_output.display().to_string(),
+            optimizer_safetensors: Some(optimizer_output.display().to_string()),
+            train_step: 1,
+            data_cursor_start: None,
+            data_cursor_end: None,
+            data_cursor_next: None,
+            data_epoch_start: None,
+            data_epoch_end: None,
+            data_epoch_next: None,
+            data_sample_offset_start: None,
+            data_sample_offset_end: None,
+            data_sample_offset_next: None,
+            dataset_source_files: Vec::new(),
+            dataset_source_sample_counts: Vec::new(),
+            dataset_fingerprint: String::new(),
+            dataset_shuffle: true,
+            streaming_train_batches: None,
+            learning_rate,
+            initial_loss: first_step.loss_before,
+            final_loss: first_step.loss_after,
+            tensors: first_step.artifacts.manifest_tensors,
+        };
+        let mut resumed_session = QwenTrainableSession::from_manifest(
+            config,
+            tiny_qwen_weights(),
+            input_ids,
+            Kind::Float,
+            &manifest,
+        )
+        .expect("session should resume");
+        assert!((first_step.loss_after - resumed_session.loss_value().unwrap()).abs() < 1e-6);
+
+        let continuous_second = continuous_session
+            .train_step(learning_rate, 2)
+            .expect("continuous second step should train");
+        let resumed_second = resumed_session
+            .train_step(learning_rate, 2)
+            .expect("resumed second step should train");
+        assert!((continuous_second.loss_after - resumed_second.loss_after).abs() < 1e-6);
+    }
+
+    #[test]
+    fn qwen_session_fixed_batch_plan_reports_fixture_metadata() {
+        let mut weights = tiny_qwen_weights();
+        weights.insert(
+            "model.embed_tokens.weight".to_string(),
+            Tensor::zeros([2048, 4], (Kind::Float, Device::Cpu)),
+        );
+
+        let plan = qwen_session_fixed_batch_plan(&weights, 0, 2).expect("fixed plan should build");
+
+        assert_eq!(plan.reference_fixture, "qwen_session_single_fixed_tokens");
+        assert_eq!(plan.batch_size, 1);
+        assert_eq!(plan.sequence_tokens, 5);
+        assert_eq!(plan.train_batches.len(), 3);
+        assert!(plan.dataset_total_samples.is_none());
+    }
+
+    #[test]
+    fn qwen_session_fixed_batch_plan_keeps_resume_cursor_window() {
+        let mut weights = tiny_qwen_weights();
+        weights.insert(
+            "model.embed_tokens.weight".to_string(),
+            Tensor::zeros([2048, 4], (Kind::Float, Device::Cpu)),
+        );
+
+        let plan = qwen_session_fixed_batch_plan(&weights, 2, 2).expect("fixed plan should build");
+
+        assert_eq!(plan.train_batches.len(), 5);
+        assert!(plan.train_batches.get(2).is_some());
+        assert!(plan.train_batches.get(4).is_some());
+    }
+}

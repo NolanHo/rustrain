@@ -6318,3 +6318,4439 @@ pub(crate) fn qwen_sft_padded_batch(
         padding_tokens,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::qwen_module::test_utils::*;
+
+    #[test]
+    fn qwen_sft_padded_batch_masks_padding_targets() {
+        let samples = vec![
+            QwenSftTokenSample {
+                prompt_tokens: 2,
+                response_tokens: 2,
+                masked_positions: 2,
+                token_ids: vec![10, 11, 12, 13],
+                mask_values: vec![0.0, 1.0, 1.0],
+            },
+            QwenSftTokenSample {
+                prompt_tokens: 1,
+                response_tokens: 1,
+                masked_positions: 1,
+                token_ids: vec![20, 21],
+                mask_values: vec![1.0],
+            },
+        ];
+
+        let batch = qwen_sft_padded_batch(&samples, 0).expect("batch should build");
+        let input_values: Vec<i64> = Vec::<i64>::try_from(batch.input_ids.reshape([-1])).unwrap();
+        let mask_values: Vec<f32> = Vec::<f32>::try_from(batch.target_mask.reshape([-1])).unwrap();
+
+        assert_eq!(batch.input_ids.size(), vec![2, 4]);
+        assert_eq!(batch.target_mask.size(), vec![2, 3, 1]);
+        assert_eq!(input_values, vec![10, 11, 12, 13, 20, 21, 0, 0]);
+        assert_eq!(mask_values, vec![0.0, 1.0, 1.0, 1.0, 0.0, 0.0]);
+        assert_eq!(batch.masked_positions, 3);
+        assert_eq!(batch.padding_tokens, 2);
+    }
+
+    #[test]
+    fn qwen_sft_dataset_builds_wrapping_padded_batches() {
+        let dataset = QwenSftDataset {
+            samples: vec![
+                QwenSftTokenSample {
+                    prompt_tokens: 2,
+                    response_tokens: 1,
+                    masked_positions: 1,
+                    token_ids: vec![1, 2, 3],
+                    mask_values: vec![0.0, 1.0],
+                },
+                QwenSftTokenSample {
+                    prompt_tokens: 1,
+                    response_tokens: 2,
+                    masked_positions: 2,
+                    token_ids: vec![4, 5, 6],
+                    mask_values: vec![1.0, 1.0],
+                },
+            ],
+            pad_token_id: 0,
+            epoch_shuffle_seed: None,
+            source_files: Vec::new(),
+            source_sample_counts: Vec::new(),
+            fingerprint: String::new(),
+        };
+
+        let batch = dataset
+            .padded_batch(1, 3)
+            .expect("wrapping batch should build");
+        let input_values: Vec<i64> = Vec::<i64>::try_from(batch.input_ids.reshape([-1])).unwrap();
+        let mask_values: Vec<f32> = Vec::<f32>::try_from(batch.target_mask.reshape([-1])).unwrap();
+
+        assert_eq!(dataset.len(), 2);
+        assert_eq!(batch.input_ids.size(), vec![3, 3]);
+        assert_eq!(input_values, vec![4, 5, 6, 1, 2, 3, 4, 5, 6]);
+        assert_eq!(mask_values, vec![1.0, 1.0, 0.0, 1.0, 1.0, 1.0]);
+        assert_eq!(batch.masked_positions, 5);
+        assert_eq!(batch.padding_tokens, 0);
+    }
+
+    #[test]
+    fn qwen_sft_dataset_split_keeps_train_and_eval_batches() {
+        let dataset = QwenSftDataset {
+            samples: (0..5)
+                .map(|index| QwenSftTokenSample {
+                    prompt_tokens: 1,
+                    response_tokens: 1,
+                    masked_positions: 1,
+                    token_ids: vec![index, index + 10],
+                    mask_values: vec![1.0],
+                })
+                .collect(),
+            pad_token_id: 0,
+            epoch_shuffle_seed: None,
+            source_files: Vec::new(),
+            source_sample_counts: Vec::new(),
+            fingerprint: String::new(),
+        };
+
+        let (train, eval) = dataset
+            .train_eval_split(0.6)
+            .expect("split should keep both sides");
+        let train_batch = train
+            .padded_batch(2, 3)
+            .expect("train wrapping batch should build");
+        let eval_batch = eval.padded_batch(0, 2).expect("eval batch should build");
+        let train_values: Vec<i64> =
+            Vec::<i64>::try_from(train_batch.input_ids.reshape([-1])).unwrap();
+        let eval_values: Vec<i64> =
+            Vec::<i64>::try_from(eval_batch.input_ids.reshape([-1])).unwrap();
+
+        assert_eq!(train.len(), 3);
+        assert_eq!(eval.len(), 2);
+        assert_eq!(train_values, vec![2, 12, 0, 10, 1, 11]);
+        assert_eq!(eval_values, vec![3, 13, 4, 14]);
+    }
+
+    #[test]
+    fn qwen_sft_dataset_shuffle_is_seeded_and_summarized() {
+        let dataset = QwenSftDataset {
+            samples: (0..5)
+                .map(|index| QwenSftTokenSample {
+                    prompt_tokens: 1,
+                    response_tokens: (index + 1) as usize,
+                    masked_positions: (index + 1) as usize,
+                    token_ids: vec![index, index + 10, index + 20],
+                    mask_values: vec![0.0, 1.0],
+                })
+                .collect(),
+            pad_token_id: 0,
+            epoch_shuffle_seed: None,
+            source_files: Vec::new(),
+            source_sample_counts: Vec::new(),
+            fingerprint: String::new(),
+        };
+
+        let summary = dataset.summary();
+        let shuffled_a = dataset.clone().shuffle_by_seed(17);
+        let shuffled_b = dataset.clone().shuffle_by_seed(17);
+        let shuffled_c = dataset.shuffle_by_seed(18);
+        let order_a = shuffled_a
+            .samples
+            .iter()
+            .map(|sample| sample.token_ids[0])
+            .collect::<Vec<_>>();
+        let order_b = shuffled_b
+            .samples
+            .iter()
+            .map(|sample| sample.token_ids[0])
+            .collect::<Vec<_>>();
+        let order_c = shuffled_c
+            .samples
+            .iter()
+            .map(|sample| sample.token_ids[0])
+            .collect::<Vec<_>>();
+
+        assert_eq!(summary.samples, 5);
+        assert_eq!(summary.total_tokens, 15);
+        assert_eq!(summary.response_tokens, 15);
+        assert_eq!(summary.masked_positions, 15);
+        assert_eq!(summary.max_sequence_tokens, 3);
+        assert!(!summary.shuffle);
+        assert!(shuffled_a.summary().shuffle);
+        assert_eq!(order_a, order_b);
+        assert_ne!(order_a, order_c);
+    }
+
+    #[test]
+    fn qwen_sft_dataset_shuffle_can_be_disabled() {
+        let dataset = QwenSftDataset {
+            samples: (0..5)
+                .map(|index| QwenSftTokenSample {
+                    prompt_tokens: 1,
+                    response_tokens: 1,
+                    masked_positions: 1,
+                    token_ids: vec![index, index + 10],
+                    mask_values: vec![1.0],
+                })
+                .collect(),
+            pad_token_id: 0,
+            epoch_shuffle_seed: None,
+            source_files: Vec::new(),
+            source_sample_counts: Vec::new(),
+            fingerprint: String::new(),
+        };
+
+        let unshuffled = qwen_apply_sft_shuffle(dataset.clone(), false, 777);
+        let shuffled = qwen_apply_sft_shuffle(dataset, true, 777);
+        let unshuffled_order = (0..unshuffled.len())
+            .map(|cursor| unshuffled.sample_at_cursor(cursor).unwrap().token_ids[0])
+            .collect::<Vec<_>>();
+        let shuffled_order = (0..shuffled.len())
+            .map(|cursor| shuffled.sample_at_cursor(cursor).unwrap().token_ids[0])
+            .collect::<Vec<_>>();
+
+        assert_eq!(unshuffled_order, vec![0, 1, 2, 3, 4]);
+        assert!(!unshuffled.summary().shuffle);
+        assert!(shuffled.summary().shuffle);
+        assert_ne!(unshuffled_order, shuffled_order);
+    }
+
+    #[test]
+    fn qwen_sft_dataset_epoch_shuffle_is_cursor_stable() {
+        let dataset = QwenSftDataset {
+            samples: (0..6)
+                .map(|index| QwenSftTokenSample {
+                    prompt_tokens: 1,
+                    response_tokens: 1,
+                    masked_positions: 1,
+                    token_ids: vec![index, index + 10],
+                    mask_values: vec![1.0],
+                })
+                .collect(),
+            pad_token_id: 0,
+            epoch_shuffle_seed: None,
+            source_files: Vec::new(),
+            source_sample_counts: Vec::new(),
+            fingerprint: String::new(),
+        }
+        .shuffle_by_seed(777);
+
+        let epoch0_a = (0..dataset.len())
+            .map(|cursor| dataset.sample_at_cursor(cursor).unwrap().token_ids[0])
+            .collect::<Vec<_>>();
+        let epoch0_b = (0..dataset.len())
+            .map(|cursor| dataset.sample_at_cursor(cursor).unwrap().token_ids[0])
+            .collect::<Vec<_>>();
+        let epoch1 = (dataset.len()..dataset.len() * 2)
+            .map(|cursor| dataset.sample_at_cursor(cursor).unwrap().token_ids[0])
+            .collect::<Vec<_>>();
+        let epoch2 = (dataset.len() * 2..dataset.len() * 3)
+            .map(|cursor| dataset.sample_at_cursor(cursor).unwrap().token_ids[0])
+            .collect::<Vec<_>>();
+
+        assert_eq!(epoch0_a, epoch0_b);
+        assert!(epoch0_a != epoch1 || epoch0_a != epoch2);
+
+        let wrapped_batch = dataset
+            .padded_batch(dataset.len() - 1, 3)
+            .expect("epoch-crossing batch should build");
+        let wrapped_values: Vec<i64> =
+            Vec::<i64>::try_from(wrapped_batch.input_ids.reshape([-1])).unwrap();
+        assert_eq!(
+            wrapped_values,
+            vec![
+                epoch0_a[dataset.len() - 1],
+                epoch0_a[dataset.len() - 1] + 10,
+                epoch1[0],
+                epoch1[0] + 10,
+                epoch1[1],
+                epoch1[1] + 10,
+            ]
+        );
+    }
+
+    #[test]
+    fn qwen_sft_jsonl_reader_loads_instruction_input_response_records() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let jsonl = temp.path().join("samples.jsonl");
+        fs::write(
+            &jsonl,
+            r#"{"instruction":"Reply with the project name.","response":"rustrain"}
+{"instruction":"Name the language.","input":"rustrain implementation","response":"Rust"}
+"#,
+        )
+        .expect("jsonl should write");
+
+        let field_map = QwenSftFieldMap::default();
+        let regex_plan = QwenSftRegexPlan::compile(&field_map).expect("regex plan should compile");
+        let example_set = qwen_sft_examples_from_jsonl_path_with_limit(
+            &jsonl,
+            None,
+            None,
+            1,
+            &field_map,
+            &regex_plan,
+            &mut None,
+        )
+        .expect("examples should load from jsonl");
+        let examples = &example_set.examples;
+
+        assert_eq!(examples.len(), 2);
+        assert_eq!(example_set.source_files, vec![jsonl.display().to_string()]);
+        assert_eq!(
+            example_set.source_sample_counts,
+            vec![QwenSftSourceSampleCount {
+                path: jsonl.display().to_string(),
+                samples: 2,
+            }]
+        );
+        assert!(!example_set.fingerprint.is_empty());
+        assert_eq!(examples[0].instruction, "Reply with the project name.");
+        assert_eq!(examples[0].input, "");
+        assert_eq!(examples[0].response, "rustrain");
+        assert_eq!(examples[1].instruction, "Name the language.");
+        assert_eq!(examples[1].input, "rustrain implementation");
+        assert_eq!(examples[1].response, "Rust");
+    }
+
+    #[test]
+    fn qwen_sft_jsonl_reader_supports_configurable_field_names() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let jsonl = temp.path().join("samples.jsonl");
+        let cache_path = temp.path().join("cache").join("offset-index.json");
+        fs::write(
+            &jsonl,
+            r#"{"sys":"Be concise.","prompt":"Summarize the project.","context":"Rust training code","answer":"rustrain"}
+{"sys":"Use one word.","prompt":"Name the language.","answer":"Rust"}
+"#,
+        )
+        .expect("jsonl should write");
+        let paths = vec![jsonl.clone()];
+        let field_map = QwenSftFieldMap {
+            instruction: "prompt".to_string(),
+            input: "context".to_string(),
+            response: "answer".to_string(),
+            system: Some("sys".to_string()),
+            prompt_template: "System: {system}\nQ: {instruction}\nA: ".to_string(),
+            prompt_with_input_template: "System: {system}\nQ: {instruction}\nI: {input}\nA: "
+                .to_string(),
+            ..QwenSftFieldMap::default()
+        };
+
+        let loaded = qwen_sft_examples_from_jsonl_paths_with_limit(&paths, None, &field_map)
+            .expect("custom field examples should load");
+        let streamed = qwen_sft_streaming_source_summary(&paths, None, &field_map)
+            .expect("custom field streaming summary should scan");
+        let source_index = qwen_sft_streaming_source_index(&paths, None, &field_map)
+            .expect("source index should build");
+        let raw_window = qwen_sft_examples_by_raw_indices(&source_index.samples, &field_map)
+            .expect("custom field raw window should read");
+        let first_cache =
+            qwen_sft_streaming_source_index_with_cache(&paths, None, Some(&cache_path), &field_map)
+                .expect("custom field cache should write");
+        let mismatched_field_map = QwenSftFieldMap {
+            response: "completion".to_string(),
+            ..field_map.clone()
+        };
+        let mismatched_system_map = QwenSftFieldMap {
+            system: Some("system_prompt".to_string()),
+            ..field_map.clone()
+        };
+        let mismatch = qwen_sft_streaming_source_index_with_cache(
+            &paths,
+            None,
+            Some(&cache_path),
+            &mismatched_field_map,
+        )
+        .expect_err("cache should reject different field maps")
+        .to_string();
+        let system_mismatch = qwen_sft_streaming_source_index_with_cache(
+            &paths,
+            None,
+            Some(&cache_path),
+            &mismatched_system_map,
+        )
+        .expect_err("cache should reject different system fields")
+        .to_string();
+
+        assert_eq!(loaded.examples.len(), 2);
+        assert_eq!(loaded.examples[0].system, "Be concise.");
+        assert_eq!(loaded.examples[0].instruction, "Summarize the project.");
+        assert_eq!(loaded.examples[0].input, "Rust training code");
+        assert_eq!(loaded.examples[0].response, "rustrain");
+        assert_eq!(loaded.examples[1].system, "Use one word.");
+        assert_eq!(loaded.examples[1].input, "");
+        assert_eq!(streamed.samples, loaded.examples.len());
+        assert_eq!(streamed.fingerprint, loaded.fingerprint);
+        assert_eq!(raw_window.examples[0].response, "rustrain");
+        assert!(first_cache.cache_written);
+        assert!(mismatch.contains("field_map"));
+        assert!(system_mismatch.contains("field_map"));
+        assert!(
+            qwen_render_sft_prompt(&loaded.examples[0], &field_map)
+                .expect("system prompt should render")
+                .contains("System: Be concise.")
+        );
+    }
+
+    #[test]
+    fn qwen_sft_jsonl_reader_supports_dotted_field_paths() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let jsonl = temp.path().join("nested.jsonl");
+        let cache_path = temp.path().join("cache").join("offset-index.json");
+        fs::write(
+            &jsonl,
+            r#"{"meta":{"system":"Be exact."},"payload":{"prompt":"Name the project.","context":"Rust trainer","answer":"rustrain"}}
+{"meta":{"system":"Use one word."},"payload":{"prompt":"Name the language.","answer":"Rust"}}
+"#,
+        )
+        .expect("jsonl should write");
+        let paths = vec![jsonl.clone()];
+        let field_map = QwenSftFieldMap {
+            instruction: "payload.prompt".to_string(),
+            input: "payload.context".to_string(),
+            response: "payload.answer".to_string(),
+            system: Some("meta.system".to_string()),
+            prompt_template: "System: {system}\nQ: {instruction}\nA: ".to_string(),
+            prompt_with_input_template: "System: {system}\nQ: {instruction}\nI: {input}\nA: "
+                .to_string(),
+            ..QwenSftFieldMap::default()
+        };
+
+        let loaded = qwen_sft_examples_from_jsonl_paths_with_limit(&paths, None, &field_map)
+            .expect("nested field examples should load");
+        let streamed = qwen_sft_streaming_source_summary(&paths, None, &field_map)
+            .expect("nested field streaming summary should scan");
+        let source_index = qwen_sft_streaming_source_index(&paths, None, &field_map)
+            .expect("nested field source index should build");
+        let raw_window = qwen_sft_examples_by_raw_indices(&source_index.samples, &field_map)
+            .expect("nested field raw window should read");
+        let first_cache =
+            qwen_sft_streaming_source_index_with_cache(&paths, None, Some(&cache_path), &field_map)
+                .expect("nested field cache should write");
+        let changed_field_map = QwenSftFieldMap {
+            instruction: "payload.question".to_string(),
+            ..field_map.clone()
+        };
+        let cache_mismatch = qwen_sft_streaming_source_index_with_cache(
+            &paths,
+            None,
+            Some(&cache_path),
+            &changed_field_map,
+        )
+        .expect_err("cache should reject changed dotted field paths")
+        .to_string();
+
+        assert_eq!(loaded.examples.len(), 2);
+        assert_eq!(loaded.examples[0].system, "Be exact.");
+        assert_eq!(loaded.examples[0].instruction, "Name the project.");
+        assert_eq!(loaded.examples[0].input, "Rust trainer");
+        assert_eq!(loaded.examples[0].response, "rustrain");
+        assert_eq!(loaded.examples[1].system, "Use one word.");
+        assert_eq!(loaded.examples[1].input, "");
+        assert_eq!(loaded.examples[1].response, "Rust");
+        assert_eq!(streamed.samples, loaded.examples.len());
+        assert_eq!(streamed.fingerprint, loaded.fingerprint);
+        assert_eq!(raw_window.examples, loaded.examples);
+        assert!(first_cache.cache_written);
+        assert!(cache_mismatch.contains("field_map"));
+        assert!(
+            qwen_render_sft_prompt(&loaded.examples[0], &field_map)
+                .expect("nested field prompt should render")
+                .contains("I: Rust trainer")
+        );
+    }
+
+    #[test]
+    fn qwen_sft_jsonl_reader_supports_chat_messages_records() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let jsonl = temp.path().join("chat.jsonl");
+        let cache_path = temp.path().join("cache").join("offset-index.json");
+        fs::write(
+            &jsonl,
+            r#"{"messages":[{"role":"system","content":"Be concise."},{"role":"user","content":"Name the project."},{"role":"assistant","content":"rustrain"}]}
+{"messages":[{"role":"human","content":"Name the language."},{"role":"gpt","content":"Rust"}]}
+{"messages":[{"role":"assistant","content":"missing user"}]}
+"#,
+        )
+        .expect("jsonl should write");
+        let paths = vec![jsonl.clone()];
+        let field_map = QwenSftFieldMap {
+            chat_messages: Some("messages".to_string()),
+            system_contains_any: vec!["concise".to_string()],
+            skip_invalid_records: true,
+            ..QwenSftFieldMap::default()
+        };
+
+        let loaded = qwen_sft_examples_from_jsonl_paths_with_limit(&paths, None, &field_map)
+            .expect("chat examples should load");
+        let streamed = qwen_sft_streaming_source_summary(&paths, None, &field_map)
+            .expect("chat streaming summary should scan");
+        let source_index =
+            qwen_sft_streaming_source_index(&paths, None, &field_map).expect("index should build");
+        let raw_window = qwen_sft_examples_by_raw_indices(&source_index.samples, &field_map)
+            .expect("chat raw window should replay");
+        let first_cache =
+            qwen_sft_streaming_source_index_with_cache(&paths, None, Some(&cache_path), &field_map)
+                .expect("chat cache should write");
+        let cache_hit =
+            qwen_sft_streaming_source_index_with_cache(&paths, None, Some(&cache_path), &field_map)
+                .expect("chat cache should hit");
+        let default_parse_error = qwen_sft_examples_from_jsonl_paths_with_limit(
+            &paths,
+            None,
+            &QwenSftFieldMap::default(),
+        )
+        .expect_err("default field map cannot parse chat rows")
+        .to_string();
+        let changed_chat_field = QwenSftFieldMap {
+            chat_messages: Some("conversations".to_string()),
+            ..field_map.clone()
+        };
+        let cache_mismatch = qwen_sft_streaming_source_index_with_cache(
+            &paths,
+            None,
+            Some(&cache_path),
+            &changed_chat_field,
+        )
+        .expect_err("cache should reject changed chat messages field")
+        .to_string();
+
+        assert_eq!(loaded.examples.len(), 1);
+        assert_eq!(loaded.examples[0].system, "Be concise.");
+        assert_eq!(loaded.examples[0].instruction, "Name the project.");
+        assert_eq!(loaded.examples[0].input, "");
+        assert_eq!(loaded.examples[0].response, "rustrain");
+        assert_eq!(streamed.samples, loaded.examples.len());
+        assert_eq!(streamed.fingerprint, loaded.fingerprint);
+        assert_eq!(raw_window.examples, loaded.examples);
+        assert_eq!(source_index.samples.len(), 1);
+        assert_eq!(source_index.samples[0].index_in_file, 0);
+        assert!(first_cache.cache_written);
+        assert!(cache_hit.cache_hit);
+        assert_eq!(cache_hit.index.samples, source_index.samples);
+        assert!(default_parse_error.contains("failed to parse SFT JSONL record"));
+        assert!(cache_mismatch.contains("field_map"));
+    }
+
+    #[test]
+    fn qwen_sft_field_defaults_fill_empty_fields_before_filters_and_fingerprint() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let jsonl = temp.path().join("samples.jsonl");
+        let cache_path = temp.path().join("cache").join("offset-index.json");
+        fs::write(
+            &jsonl,
+            r#"{"instruction":"","response":"","input":""}
+{"response":"kept"}
+"#,
+        )
+        .expect("jsonl should write");
+        let paths = vec![jsonl.clone()];
+        let field_map = QwenSftFieldMap {
+            system_contains_any: vec!["assistant".to_string()],
+            instruction_contains_any: vec!["default instruction".to_string()],
+            input_contains_any: vec!["default input".to_string()],
+            response_contains_any: vec!["default response".to_string()],
+            min_response_chars: 10,
+            field_defaults: vec![
+                FieldDefault {
+                    field: FieldDefaultTarget::System,
+                    value: "system assistant".to_string(),
+                },
+                FieldDefault {
+                    field: FieldDefaultTarget::Instruction,
+                    value: "default instruction".to_string(),
+                },
+                FieldDefault {
+                    field: FieldDefaultTarget::Input,
+                    value: "default input".to_string(),
+                },
+                FieldDefault {
+                    field: FieldDefaultTarget::Response,
+                    value: "default response".to_string(),
+                },
+            ],
+            ..QwenSftFieldMap::default()
+        };
+
+        let loaded = qwen_sft_examples_from_jsonl_paths_with_limit(&paths, None, &field_map)
+            .expect("defaulted examples should load");
+        let streamed = qwen_sft_streaming_source_summary(&paths, None, &field_map)
+            .expect("defaulted streaming summary should scan");
+        let source_index = qwen_sft_streaming_source_index(&paths, None, &field_map)
+            .expect("defaulted source index should build");
+        let raw_window = qwen_sft_examples_by_raw_indices(&source_index.samples, &field_map)
+            .expect("defaulted raw window should read");
+        let first_cache =
+            qwen_sft_streaming_source_index_with_cache(&paths, None, Some(&cache_path), &field_map)
+                .expect("defaulted cache should write");
+        let defaults_without_filters = QwenSftFieldMap {
+            system_contains_any: Vec::new(),
+            instruction_contains_any: Vec::new(),
+            input_contains_any: Vec::new(),
+            response_contains_any: Vec::new(),
+            min_response_chars: 1,
+            ..field_map.clone()
+        };
+        let unfiltered_default_fingerprint = qwen_sft_streaming_fingerprint(
+            &paths,
+            None,
+            &loaded.source_files,
+            &defaults_without_filters,
+        )
+        .expect("defaulted field map fingerprint should compute");
+        let changed_defaults = QwenSftFieldMap {
+            field_defaults: vec![FieldDefault {
+                field: FieldDefaultTarget::Instruction,
+                value: "other instruction".to_string(),
+            }],
+            ..field_map.clone()
+        };
+        let cache_mismatch = qwen_sft_streaming_source_index_with_cache(
+            &paths,
+            None,
+            Some(&cache_path),
+            &changed_defaults,
+        )
+        .expect_err("cache should reject changed defaults")
+        .to_string();
+
+        assert_eq!(loaded.examples.len(), 1);
+        assert_eq!(loaded.examples[0].system, "system assistant");
+        assert_eq!(loaded.examples[0].instruction, "default instruction");
+        assert_eq!(loaded.examples[0].input, "default input");
+        assert_eq!(loaded.examples[0].response, "default response");
+        assert_eq!(streamed.samples, loaded.examples.len());
+        assert_eq!(streamed.fingerprint, loaded.fingerprint);
+        assert_eq!(raw_window.examples, loaded.examples);
+        assert!(first_cache.cache_written);
+        assert_ne!(loaded.fingerprint, unfiltered_default_fingerprint);
+        assert!(cache_mismatch.contains("field_map"));
+    }
+
+    #[test]
+    fn qwen_sft_field_replacements_apply_before_filters_and_fingerprint() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let jsonl = temp.path().join("samples.jsonl");
+        let cache_path = temp.path().join("cache").join("offset-index.json");
+        fs::write(
+            &jsonl,
+            r#"{"instruction":"Keep PROJECT_TOKEN","response":"APPROVED_TOKEN"}
+{"instruction":"Drop PROJECT_TOKEN","response":"DENIED_TOKEN"}
+"#,
+        )
+        .expect("jsonl should write");
+        let paths = vec![jsonl.clone()];
+        let field_map = QwenSftFieldMap {
+            instruction_contains_any: vec!["rustrain".to_string()],
+            response_contains_any: vec!["approved".to_string()],
+            min_response_chars: 8,
+            field_replacements: vec![
+                FieldReplacement {
+                    field: FieldReplacementTarget::Instruction,
+                    pattern: "PROJECT_TOKEN".to_string(),
+                    replacement: "rustrain".to_string(),
+                },
+                FieldReplacement {
+                    field: FieldReplacementTarget::Response,
+                    pattern: "APPROVED_TOKEN".to_string(),
+                    replacement: "approved".to_string(),
+                },
+            ],
+            ..QwenSftFieldMap::default()
+        };
+        let loaded = qwen_sft_examples_from_jsonl_paths_with_limit(&paths, None, &field_map)
+            .expect("replacement examples should load");
+        let streamed = qwen_sft_streaming_source_summary(&paths, None, &field_map)
+            .expect("replacement streaming summary should scan");
+        let source_index = qwen_sft_streaming_source_index(&paths, None, &field_map)
+            .expect("replacement source index should build");
+        let raw_window = qwen_sft_examples_by_raw_indices(&source_index.samples, &field_map)
+            .expect("replacement raw window should read");
+        let first_cache =
+            qwen_sft_streaming_source_index_with_cache(&paths, None, Some(&cache_path), &field_map)
+                .expect("replacement cache should write");
+        let default_fingerprint = qwen_sft_streaming_fingerprint(
+            &paths,
+            None,
+            &loaded.source_files,
+            &QwenSftFieldMap::default(),
+        )
+        .expect("default fingerprint should compute");
+        let replacement_mismatch = QwenSftFieldMap {
+            field_replacements: vec![FieldReplacement {
+                field: FieldReplacementTarget::Instruction,
+                pattern: "PROJECT_TOKEN".to_string(),
+                replacement: "other".to_string(),
+            }],
+            ..field_map.clone()
+        };
+        let cache_mismatch = qwen_sft_streaming_source_index_with_cache(
+            &paths,
+            None,
+            Some(&cache_path),
+            &replacement_mismatch,
+        )
+        .expect_err("cache should reject changed replacements")
+        .to_string();
+
+        assert_eq!(loaded.examples.len(), 1);
+        assert_eq!(loaded.examples[0].instruction, "Keep rustrain");
+        assert_eq!(loaded.examples[0].response, "approved");
+        assert_eq!(raw_window.examples.len(), loaded.examples.len());
+        assert_eq!(
+            raw_window.examples[0].instruction,
+            loaded.examples[0].instruction
+        );
+        assert_eq!(raw_window.examples[0].response, loaded.examples[0].response);
+        assert_eq!(streamed.samples, loaded.examples.len());
+        assert_eq!(streamed.fingerprint, loaded.fingerprint);
+        assert_ne!(loaded.fingerprint, default_fingerprint);
+        assert!(first_cache.cache_written);
+        assert!(cache_mismatch.contains("field_map"));
+    }
+
+    #[test]
+    fn qwen_sft_regex_replacements_apply_before_filters_and_fingerprint() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let jsonl = temp.path().join("samples.jsonl");
+        let cache_path = temp.path().join("cache").join("offset-index.json");
+        fs::write(
+            &jsonl,
+            r#"{"instruction":"Keep project-123 token","response":"APPROVED:42"}
+{"instruction":"Drop project-456 token","response":"DENIED:99"}
+"#,
+        )
+        .expect("jsonl should write");
+        let paths = vec![jsonl.clone()];
+        let field_map = QwenSftFieldMap {
+            instruction_contains_any: vec!["project-id token".to_string()],
+            response_contains_any: vec!["approved id".to_string()],
+            min_response_chars: 8,
+            field_regex_replacements: vec![
+                FieldRegexReplacement {
+                    field: FieldReplacementTarget::Instruction,
+                    pattern: r"project-\d+".to_string(),
+                    replacement: "project-id".to_string(),
+                },
+                FieldRegexReplacement {
+                    field: FieldReplacementTarget::Response,
+                    pattern: r"APPROVED:\d+".to_string(),
+                    replacement: "approved id".to_string(),
+                },
+            ],
+            ..QwenSftFieldMap::default()
+        };
+        let loaded = qwen_sft_examples_from_jsonl_paths_with_limit(&paths, None, &field_map)
+            .expect("regex replacement examples should load");
+        let streamed = qwen_sft_streaming_source_summary(&paths, None, &field_map)
+            .expect("regex replacement streaming summary should scan");
+        let source_index = qwen_sft_streaming_source_index(&paths, None, &field_map)
+            .expect("regex replacement source index should build");
+        let raw_window = qwen_sft_examples_by_raw_indices(&source_index.samples, &field_map)
+            .expect("regex replacement raw window should read");
+        let first_cache =
+            qwen_sft_streaming_source_index_with_cache(&paths, None, Some(&cache_path), &field_map)
+                .expect("regex replacement cache should write");
+        let default_fingerprint = qwen_sft_streaming_fingerprint(
+            &paths,
+            None,
+            &loaded.source_files,
+            &QwenSftFieldMap::default(),
+        )
+        .expect("default fingerprint should compute");
+        let regex_mismatch = QwenSftFieldMap {
+            field_regex_replacements: vec![FieldRegexReplacement {
+                field: FieldReplacementTarget::Instruction,
+                pattern: r"project-\d+".to_string(),
+                replacement: "other".to_string(),
+            }],
+            ..field_map.clone()
+        };
+        let cache_mismatch = qwen_sft_streaming_source_index_with_cache(
+            &paths,
+            None,
+            Some(&cache_path),
+            &regex_mismatch,
+        )
+        .expect_err("cache should reject changed regex replacements")
+        .to_string();
+
+        assert_eq!(loaded.examples.len(), 1);
+        assert_eq!(loaded.examples[0].instruction, "Keep project-id token");
+        assert_eq!(loaded.examples[0].response, "approved id");
+        assert_eq!(raw_window.examples, loaded.examples);
+        assert_eq!(streamed.samples, loaded.examples.len());
+        assert_eq!(streamed.fingerprint, loaded.fingerprint);
+        assert_ne!(loaded.fingerprint, default_fingerprint);
+        assert!(first_cache.cache_written);
+        assert!(cache_mismatch.contains("field_map"));
+    }
+
+    #[test]
+    fn qwen_sft_applies_field_transform_dsl_before_filters_and_fingerprint() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let jsonl = temp.path().join("samples.jsonl");
+        let cache_path = temp.path().join("cache").join("offset-index.json");
+        fs::write(
+            &jsonl,
+            r#"{"instruction":"Keep PROJECT-123::tail","input":"gpu context","response":"APPROVED:42 extra"}
+{"instruction":"Drop PROJECT-456::tail","input":"cpu context","response":"DENIED:99 extra"}
+"#,
+        )
+        .expect("jsonl should write");
+        let paths = vec![jsonl.clone()];
+        let field_map = QwenSftFieldMap {
+            instruction_contains_any: vec!["task Keep project-id".to_string()],
+            input_contains_any: vec!["GPU".to_string()],
+            response_contains_any: vec!["approved id".to_string()],
+            min_response_chars: 11,
+            max_response_chars: Some(11),
+            field_transforms: vec![
+                FieldTransform {
+                    field: FieldReplacementTarget::Instruction,
+                    op: FieldTransformOp::RegexReplace,
+                    pattern: r"PROJECT-\d+".to_string(),
+                    replacement: "project-id".to_string(),
+                    ..FieldTransform::default()
+                },
+                FieldTransform {
+                    field: FieldReplacementTarget::Instruction,
+                    op: FieldTransformOp::Split,
+                    delimiter: "::".to_string(),
+                    side: Some(FieldSplitSide::Before),
+                    ..FieldTransform::default()
+                },
+                FieldTransform {
+                    field: FieldReplacementTarget::Instruction,
+                    op: FieldTransformOp::Affix,
+                    prefix: "task ".to_string(),
+                    ..FieldTransform::default()
+                },
+                FieldTransform {
+                    field: FieldReplacementTarget::Input,
+                    op: FieldTransformOp::Case,
+                    case: Some(FieldCaseTransformKind::Uppercase),
+                    ..FieldTransform::default()
+                },
+                FieldTransform {
+                    field: FieldReplacementTarget::Response,
+                    op: FieldTransformOp::RegexReplace,
+                    pattern: r"APPROVED:\d+".to_string(),
+                    replacement: "approved id".to_string(),
+                    ..FieldTransform::default()
+                },
+                FieldTransform {
+                    field: FieldReplacementTarget::Response,
+                    op: FieldTransformOp::Truncate,
+                    max_chars: Some(11),
+                    ..FieldTransform::default()
+                },
+            ],
+            ..QwenSftFieldMap::default()
+        };
+
+        let loaded = qwen_sft_examples_from_jsonl_paths_with_limit(&paths, None, &field_map)
+            .expect("dsl-transformed examples should load");
+        let streamed = qwen_sft_streaming_source_summary(&paths, None, &field_map)
+            .expect("dsl-transformed streaming summary should scan");
+        let source_index = qwen_sft_streaming_source_index(&paths, None, &field_map)
+            .expect("dsl-transformed source index should build");
+        let raw_window = qwen_sft_examples_by_raw_indices(&source_index.samples, &field_map)
+            .expect("dsl-transformed raw window should read");
+        let first_cache =
+            qwen_sft_streaming_source_index_with_cache(&paths, None, Some(&cache_path), &field_map)
+                .expect("dsl-transformed cache should write");
+        let raw_map = QwenSftFieldMap {
+            field_transforms: Vec::new(),
+            input_contains_any: Vec::new(),
+            response_contains_any: Vec::new(),
+            max_response_chars: None,
+            ..field_map.clone()
+        };
+        let raw_fingerprint =
+            qwen_sft_streaming_fingerprint(&paths, None, &loaded.source_files, &raw_map)
+                .expect("raw fingerprint should compute");
+        let cache_mismatch =
+            qwen_sft_streaming_source_index_with_cache(&paths, None, Some(&cache_path), &raw_map)
+                .expect_err("cache should reject changed DSL transforms")
+                .to_string();
+
+        assert_eq!(loaded.examples.len(), 1);
+        assert_eq!(loaded.examples[0].instruction, "task Keep project-id");
+        assert_eq!(loaded.examples[0].input, "GPU CONTEXT");
+        assert_eq!(loaded.examples[0].response, "approved id");
+        assert_eq!(raw_window.examples, loaded.examples);
+        assert_eq!(streamed.samples, loaded.examples.len());
+        assert_eq!(streamed.fingerprint, loaded.fingerprint);
+        assert_ne!(loaded.fingerprint, raw_fingerprint);
+        assert!(first_cache.cache_written);
+        assert!(cache_mismatch.contains("field_map"));
+    }
+
+    #[test]
+    fn qwen_sft_filters_fields_by_regex_before_limit_and_streaming_index() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let jsonl = temp.path().join("samples.jsonl");
+        let cache_path = temp.path().join("cache").join("offset-index.json");
+        fs::write(
+            &jsonl,
+            r#"{"instruction":"Keep project-123 token","input":"GPU context","response":"approved answer"}
+{"instruction":"Drop project-456 token","input":"GPU context","response":"DENIED answer"}
+{"instruction":"Skip project-abc token","input":"GPU context","response":"approved answer"}
+"#,
+        )
+        .expect("jsonl should write");
+        let paths = vec![jsonl.clone()];
+        let field_map = QwenSftFieldMap {
+            field_regex_contains_any: vec![FieldRegexFilter {
+                field: FieldReplacementTarget::Instruction,
+                pattern: r"project-\d+".to_string(),
+            }],
+            field_regex_excludes_any: vec![FieldRegexFilter {
+                field: FieldReplacementTarget::Response,
+                pattern: r"DENIED|blocked".to_string(),
+            }],
+            ..QwenSftFieldMap::default()
+        };
+        let loaded = qwen_sft_examples_from_jsonl_paths_with_limit(&paths, None, &field_map)
+            .expect("regex-filtered examples should load");
+        let streamed = qwen_sft_streaming_source_summary(&paths, None, &field_map)
+            .expect("regex-filtered streaming summary should scan");
+        let source_index = qwen_sft_streaming_source_index(&paths, None, &field_map)
+            .expect("regex-filtered source index should build");
+        let raw_window = qwen_sft_examples_by_raw_indices(&source_index.samples, &field_map)
+            .expect("regex-filtered raw window should read");
+        let first_cache =
+            qwen_sft_streaming_source_index_with_cache(&paths, None, Some(&cache_path), &field_map)
+                .expect("regex-filtered cache should write");
+        let default_fingerprint = qwen_sft_streaming_fingerprint(
+            &paths,
+            None,
+            &loaded.source_files,
+            &QwenSftFieldMap::default(),
+        )
+        .expect("default fingerprint should compute");
+        let filter_mismatch = QwenSftFieldMap {
+            field_regex_contains_any: vec![FieldRegexFilter {
+                field: FieldReplacementTarget::Instruction,
+                pattern: r"project-[a-z]+".to_string(),
+            }],
+            ..field_map.clone()
+        };
+        let cache_mismatch = qwen_sft_streaming_source_index_with_cache(
+            &paths,
+            None,
+            Some(&cache_path),
+            &filter_mismatch,
+        )
+        .expect_err("cache should reject changed regex filters")
+        .to_string();
+
+        assert_eq!(loaded.examples.len(), 1);
+        assert_eq!(loaded.examples[0].instruction, "Keep project-123 token");
+        assert_eq!(loaded.examples[0].response, "approved answer");
+        assert_eq!(raw_window.examples, loaded.examples);
+        assert_eq!(streamed.samples, loaded.examples.len());
+        assert_eq!(streamed.source_files, loaded.source_files);
+        assert_eq!(streamed.source_sample_counts, loaded.source_sample_counts);
+        assert_eq!(streamed.fingerprint, loaded.fingerprint);
+        assert_eq!(source_index.samples.len(), 1);
+        assert_eq!(source_index.samples[0].index_in_file, 0);
+        assert_ne!(loaded.fingerprint, default_fingerprint);
+        assert!(first_cache.cache_written);
+        assert!(cache_mismatch.contains("field_map"));
+    }
+
+    #[test]
+    fn qwen_sft_reuses_compiled_regex_plan_across_records() {
+        let field_map = QwenSftFieldMap {
+            response_contains_any: vec!["approved id".to_string()],
+            field_regex_replacements: vec![FieldRegexReplacement {
+                field: FieldReplacementTarget::Response,
+                pattern: r"APPROVED:\d+".to_string(),
+                replacement: "approved id".to_string(),
+            }],
+            field_regex_contains_any: vec![FieldRegexFilter {
+                field: FieldReplacementTarget::Instruction,
+                pattern: r"project-\d+".to_string(),
+            }],
+            field_regex_excludes_any: vec![FieldRegexFilter {
+                field: FieldReplacementTarget::Input,
+                pattern: r"blocked".to_string(),
+            }],
+            ..QwenSftFieldMap::default()
+        };
+        let regex_plan = QwenSftRegexPlan::compile(&field_map).expect("regex plan should compile");
+        let first = qwen_sft_record_from_jsonl_line(
+            r#"{"instruction":"Keep project-123","input":"GPU context","response":"APPROVED:42"}"#,
+            &field_map,
+            &regex_plan,
+        )
+        .expect("first record should parse");
+        let second = qwen_sft_record_from_jsonl_line(
+            r#"{"instruction":"Drop project-456","input":"blocked context","response":"APPROVED:99"}"#,
+            &field_map,
+            &regex_plan,
+        )
+        .expect("second record should parse");
+
+        assert_eq!(first.response, "approved id");
+        assert!(qwen_sft_record_passes_filters(
+            &first,
+            &field_map,
+            &regex_plan
+        ));
+        assert_eq!(second.response, "approved id");
+        assert!(!qwen_sft_record_passes_filters(
+            &second,
+            &field_map,
+            &regex_plan
+        ));
+        assert_eq!(regex_plan.replacements.len(), 1);
+        assert_eq!(regex_plan.contains_any.len(), 1);
+        assert_eq!(regex_plan.excludes_any.len(), 1);
+    }
+
+    #[test]
+    fn qwen_sft_normalizes_whitespace_after_replacements_before_filters_and_fingerprint() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let jsonl = temp.path().join("samples.jsonl");
+        let cache_path = temp.path().join("cache").join("offset-index.json");
+        fs::write(
+            &jsonl,
+            r#"{"instruction":"Keep PROJECT_TOKEN","response":"approved\t\tanswer"}
+{"instruction":"Also PROJECT_TOKEN","response":"approved   answer"}
+{"instruction":"Drop PROJECT_TOKEN","response":"denied   answer"}
+"#,
+        )
+        .expect("jsonl should write");
+        let paths = vec![jsonl.clone()];
+        let field_map = QwenSftFieldMap {
+            instruction_contains_any: vec!["rust train".to_string()],
+            response_contains_any: vec!["approved answer".to_string()],
+            field_replacements: vec![FieldReplacement {
+                field: FieldReplacementTarget::Instruction,
+                pattern: "PROJECT_TOKEN".to_string(),
+                replacement: "rust   train".to_string(),
+            }],
+            field_regex_replacements: Vec::new(),
+            normalize_whitespace: true,
+            ..QwenSftFieldMap::default()
+        };
+        let loaded = qwen_sft_examples_from_jsonl_paths_with_limit(&paths, None, &field_map)
+            .expect("normalized examples should load");
+        let streamed = qwen_sft_streaming_source_summary(&paths, None, &field_map)
+            .expect("normalized streaming summary should scan");
+        let source_index = qwen_sft_streaming_source_index(&paths, None, &field_map)
+            .expect("normalized source index should build");
+        let raw_window = qwen_sft_examples_by_raw_indices(&source_index.samples, &field_map)
+            .expect("normalized raw window should read");
+        let first_cache =
+            qwen_sft_streaming_source_index_with_cache(&paths, None, Some(&cache_path), &field_map)
+                .expect("normalized cache should write");
+        let raw_map = QwenSftFieldMap {
+            normalize_whitespace: false,
+            ..field_map.clone()
+        };
+        let cache_mismatch =
+            qwen_sft_streaming_source_index_with_cache(&paths, None, Some(&cache_path), &raw_map)
+                .expect_err("cache should reject changed whitespace normalization")
+                .to_string();
+        let raw_fingerprint =
+            qwen_sft_streaming_fingerprint(&paths, None, &loaded.source_files, &raw_map)
+                .expect("raw fingerprint should compute");
+
+        assert_eq!(loaded.examples.len(), 2);
+        assert_eq!(loaded.examples[0].instruction, "Keep rust train");
+        assert_eq!(loaded.examples[0].response, "approved answer");
+        assert_eq!(raw_window.examples.len(), loaded.examples.len());
+        assert_eq!(raw_window.examples[1].instruction, "Also rust train");
+        assert_eq!(raw_window.examples[1].response, "approved answer");
+        assert_eq!(streamed.samples, loaded.examples.len());
+        assert_eq!(streamed.fingerprint, loaded.fingerprint);
+        assert_ne!(loaded.fingerprint, raw_fingerprint);
+        assert!(first_cache.cache_written);
+        assert!(cache_mismatch.contains("field_map"));
+    }
+
+    #[test]
+    fn qwen_sft_applies_case_transforms_before_filters_and_fingerprint() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let jsonl = temp.path().join("samples.jsonl");
+        let cache_path = temp.path().join("cache").join("offset-index.json");
+        fs::write(
+            &jsonl,
+            r#"{"instruction":"Keep PROJECT_TOKEN","input":"GPU CONTEXT","response":"APPROVED ANSWER"}
+{"instruction":"Drop PROJECT_TOKEN","input":"GPU CONTEXT","response":"DENIED ANSWER"}
+"#,
+        )
+        .expect("jsonl should write");
+        let paths = vec![jsonl.clone()];
+        let field_map = QwenSftFieldMap {
+            instruction_contains_any: vec!["rustrain".to_string()],
+            input_contains_any: vec!["gpu context".to_string()],
+            response_contains_any: vec!["approved answer".to_string()],
+            field_replacements: vec![FieldReplacement {
+                field: FieldReplacementTarget::Instruction,
+                pattern: "PROJECT_TOKEN".to_string(),
+                replacement: "RUSTRain".to_string(),
+            }],
+            field_case_transforms: vec![
+                FieldCaseTransform {
+                    field: FieldReplacementTarget::Instruction,
+                    case: FieldCaseTransformKind::Lowercase,
+                },
+                FieldCaseTransform {
+                    field: FieldReplacementTarget::Input,
+                    case: FieldCaseTransformKind::Lowercase,
+                },
+                FieldCaseTransform {
+                    field: FieldReplacementTarget::Response,
+                    case: FieldCaseTransformKind::Lowercase,
+                },
+            ],
+            ..QwenSftFieldMap::default()
+        };
+
+        let loaded = qwen_sft_examples_from_jsonl_paths_with_limit(&paths, None, &field_map)
+            .expect("case-transformed examples should load");
+        let streamed = qwen_sft_streaming_source_summary(&paths, None, &field_map)
+            .expect("case-transformed streaming summary should scan");
+        let source_index = qwen_sft_streaming_source_index(&paths, None, &field_map)
+            .expect("case-transformed source index should build");
+        let raw_window = qwen_sft_examples_by_raw_indices(&source_index.samples, &field_map)
+            .expect("case-transformed raw window should read");
+        let first_cache =
+            qwen_sft_streaming_source_index_with_cache(&paths, None, Some(&cache_path), &field_map)
+                .expect("case-transformed cache should write");
+        let raw_case_map = QwenSftFieldMap {
+            field_case_transforms: Vec::new(),
+            ..field_map.clone()
+        };
+        let raw_case_fingerprint =
+            qwen_sft_streaming_fingerprint(&paths, None, &loaded.source_files, &raw_case_map)
+                .expect("raw-case fingerprint should compute");
+        let cache_mismatch = qwen_sft_streaming_source_index_with_cache(
+            &paths,
+            None,
+            Some(&cache_path),
+            &raw_case_map,
+        )
+        .expect_err("cache should reject changed case transforms")
+        .to_string();
+
+        assert_eq!(loaded.examples.len(), 1);
+        assert_eq!(loaded.examples[0].instruction, "keep rustrain");
+        assert_eq!(loaded.examples[0].input, "gpu context");
+        assert_eq!(loaded.examples[0].response, "approved answer");
+        assert_eq!(raw_window.examples, loaded.examples);
+        assert_eq!(streamed.samples, loaded.examples.len());
+        assert_eq!(streamed.fingerprint, loaded.fingerprint);
+        assert_ne!(loaded.fingerprint, raw_case_fingerprint);
+        assert!(first_cache.cache_written);
+        assert!(cache_mismatch.contains("field_map"));
+    }
+
+    #[test]
+    fn qwen_sft_applies_field_affixes_before_filters_and_fingerprint() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let jsonl = temp.path().join("samples.jsonl");
+        let cache_path = temp.path().join("cache").join("offset-index.json");
+        fs::write(
+            &jsonl,
+            r#"{"instruction":"Name the project","input":"GPU","response":"rustrain"}
+{"instruction":"Name the language","input":"GPU","response":"Rust"}
+"#,
+        )
+        .expect("jsonl should write");
+        let paths = vec![jsonl.clone()];
+        let field_map = QwenSftFieldMap {
+            system_contains_any: vec!["system:".to_string()],
+            instruction_contains_any: vec!["Q: Name".to_string()],
+            input_contains_any: vec!["ctx=GPU".to_string()],
+            response_contains_any: vec!["</answer>".to_string()],
+            field_defaults: vec![FieldDefault {
+                field: FieldDefaultTarget::System,
+                value: "concise".to_string(),
+            }],
+            field_affixes: vec![
+                FieldAffix {
+                    field: FieldReplacementTarget::System,
+                    prefix: "system: ".to_string(),
+                    suffix: String::new(),
+                },
+                FieldAffix {
+                    field: FieldReplacementTarget::Instruction,
+                    prefix: "Q: ".to_string(),
+                    suffix: "?".to_string(),
+                },
+                FieldAffix {
+                    field: FieldReplacementTarget::Input,
+                    prefix: "ctx=".to_string(),
+                    suffix: String::new(),
+                },
+                FieldAffix {
+                    field: FieldReplacementTarget::Response,
+                    prefix: String::new(),
+                    suffix: "</answer>".to_string(),
+                },
+            ],
+            ..QwenSftFieldMap::default()
+        };
+
+        let loaded = qwen_sft_examples_from_jsonl_paths_with_limit(&paths, None, &field_map)
+            .expect("affixed examples should load");
+        let streamed = qwen_sft_streaming_source_summary(&paths, None, &field_map)
+            .expect("affixed streaming summary should scan");
+        let source_index = qwen_sft_streaming_source_index(&paths, None, &field_map)
+            .expect("affixed source index should build");
+        let raw_window = qwen_sft_examples_by_raw_indices(&source_index.samples, &field_map)
+            .expect("affixed raw window should read");
+        let first_cache =
+            qwen_sft_streaming_source_index_with_cache(&paths, None, Some(&cache_path), &field_map)
+                .expect("affixed cache should write");
+        let raw_affix_map = QwenSftFieldMap {
+            field_affixes: Vec::new(),
+            system_contains_any: Vec::new(),
+            instruction_contains_any: Vec::new(),
+            input_contains_any: Vec::new(),
+            response_contains_any: Vec::new(),
+            ..field_map.clone()
+        };
+        let raw_affix_fingerprint =
+            qwen_sft_streaming_fingerprint(&paths, None, &loaded.source_files, &raw_affix_map)
+                .expect("raw-affix fingerprint should compute");
+        let cache_mismatch = qwen_sft_streaming_source_index_with_cache(
+            &paths,
+            None,
+            Some(&cache_path),
+            &raw_affix_map,
+        )
+        .expect_err("cache should reject changed affixes")
+        .to_string();
+
+        assert_eq!(loaded.examples.len(), 2);
+        assert_eq!(loaded.examples[0].system, "system: concise");
+        assert_eq!(loaded.examples[0].instruction, "Q: Name the project?");
+        assert_eq!(loaded.examples[0].input, "ctx=GPU");
+        assert_eq!(loaded.examples[0].response, "rustrain</answer>");
+        assert_eq!(raw_window.examples, loaded.examples);
+        assert_eq!(streamed.samples, loaded.examples.len());
+        assert_eq!(streamed.fingerprint, loaded.fingerprint);
+        assert_ne!(loaded.fingerprint, raw_affix_fingerprint);
+        assert!(first_cache.cache_written);
+        assert!(cache_mismatch.contains("field_map"));
+    }
+
+    #[test]
+    fn qwen_sft_applies_field_strips_before_filters_and_fingerprint() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let jsonl = temp.path().join("samples.jsonl");
+        let cache_path = temp.path().join("cache").join("offset-index.json");
+        fs::write(
+            &jsonl,
+            r#"{"instruction":"PROMPT: Keep GPU prompt","input":"ctx=GPU context","response":"<answer>approved answer</answer>"}
+{"instruction":"PROMPT: Drop CPU prompt","input":"ctx=CPU context","response":"<answer>denied answer</answer>"}
+"#,
+        )
+        .expect("jsonl should write");
+        let paths = vec![jsonl.clone()];
+        let field_map = QwenSftFieldMap {
+            instruction_contains_any: vec!["Keep GPU".to_string()],
+            input_contains_any: vec!["GPU context".to_string()],
+            response_contains_any: vec!["approved answer".to_string()],
+            response_excludes_any: vec!["</answer>".to_string()],
+            field_strips: vec![
+                FieldStrip {
+                    field: FieldReplacementTarget::Instruction,
+                    prefix: "PROMPT: ".to_string(),
+                    suffix: String::new(),
+                },
+                FieldStrip {
+                    field: FieldReplacementTarget::Input,
+                    prefix: "ctx=".to_string(),
+                    suffix: String::new(),
+                },
+                FieldStrip {
+                    field: FieldReplacementTarget::Response,
+                    prefix: "<answer>".to_string(),
+                    suffix: "</answer>".to_string(),
+                },
+            ],
+            ..QwenSftFieldMap::default()
+        };
+
+        let loaded = qwen_sft_examples_from_jsonl_paths_with_limit(&paths, None, &field_map)
+            .expect("stripped examples should load");
+        let streamed = qwen_sft_streaming_source_summary(&paths, None, &field_map)
+            .expect("stripped streaming summary should scan");
+        let source_index = qwen_sft_streaming_source_index(&paths, None, &field_map)
+            .expect("stripped source index should build");
+        let raw_window = qwen_sft_examples_by_raw_indices(&source_index.samples, &field_map)
+            .expect("stripped raw window should read");
+        let first_cache =
+            qwen_sft_streaming_source_index_with_cache(&paths, None, Some(&cache_path), &field_map)
+                .expect("stripped cache should write");
+        let raw_strip_map = QwenSftFieldMap {
+            field_strips: Vec::new(),
+            instruction_contains_any: Vec::new(),
+            input_contains_any: Vec::new(),
+            response_contains_any: Vec::new(),
+            response_excludes_any: Vec::new(),
+            ..field_map.clone()
+        };
+        let raw_strip_fingerprint =
+            qwen_sft_streaming_fingerprint(&paths, None, &loaded.source_files, &raw_strip_map)
+                .expect("raw-strip fingerprint should compute");
+        let cache_mismatch = qwen_sft_streaming_source_index_with_cache(
+            &paths,
+            None,
+            Some(&cache_path),
+            &raw_strip_map,
+        )
+        .expect_err("cache should reject changed strips")
+        .to_string();
+
+        assert_eq!(loaded.examples.len(), 1);
+        assert_eq!(loaded.examples[0].instruction, "Keep GPU prompt");
+        assert_eq!(loaded.examples[0].input, "GPU context");
+        assert_eq!(loaded.examples[0].response, "approved answer");
+        assert_eq!(raw_window.examples, loaded.examples);
+        assert_eq!(streamed.samples, loaded.examples.len());
+        assert_eq!(streamed.fingerprint, loaded.fingerprint);
+        assert_ne!(loaded.fingerprint, raw_strip_fingerprint);
+        assert!(first_cache.cache_written);
+        assert!(cache_mismatch.contains("field_map"));
+    }
+
+    #[test]
+    fn qwen_sft_applies_field_truncations_before_filters_and_fingerprint() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let jsonl = temp.path().join("samples.jsonl");
+        let cache_path = temp.path().join("cache").join("offset-index.json");
+        fs::write(
+            &jsonl,
+            r#"{"instruction":"Name the rustrain project precisely","input":"GPU worker context","response":"approved response with trailing text"}
+{"instruction":"Name the rustrain project precisely","input":"CPU worker context","response":"denied response with trailing text"}
+"#,
+        )
+        .expect("jsonl should write");
+        let paths = vec![jsonl.clone()];
+        let field_map = QwenSftFieldMap {
+            instruction_contains_any: vec!["Name the rustrain".to_string()],
+            input_contains_any: vec!["GPU".to_string()],
+            response_contains_any: vec!["approved response".to_string()],
+            min_response_chars: 17,
+            max_response_chars: Some(17),
+            field_truncations: vec![
+                FieldTruncation {
+                    field: FieldReplacementTarget::Instruction,
+                    max_chars: 17,
+                },
+                FieldTruncation {
+                    field: FieldReplacementTarget::Input,
+                    max_chars: 3,
+                },
+                FieldTruncation {
+                    field: FieldReplacementTarget::Response,
+                    max_chars: 17,
+                },
+            ],
+            ..QwenSftFieldMap::default()
+        };
+
+        let loaded = qwen_sft_examples_from_jsonl_paths_with_limit(&paths, None, &field_map)
+            .expect("truncated examples should load");
+        let streamed = qwen_sft_streaming_source_summary(&paths, None, &field_map)
+            .expect("truncated streaming summary should scan");
+        let source_index = qwen_sft_streaming_source_index(&paths, None, &field_map)
+            .expect("truncated source index should build");
+        let raw_window = qwen_sft_examples_by_raw_indices(&source_index.samples, &field_map)
+            .expect("truncated raw window should read");
+        let first_cache =
+            qwen_sft_streaming_source_index_with_cache(&paths, None, Some(&cache_path), &field_map)
+                .expect("truncated cache should write");
+        let raw_truncation_map = QwenSftFieldMap {
+            field_truncations: Vec::new(),
+            field_transforms: Vec::new(),
+            input_contains_any: Vec::new(),
+            response_contains_any: Vec::new(),
+            max_response_chars: None,
+            ..field_map.clone()
+        };
+        let raw_truncation_fingerprint =
+            qwen_sft_streaming_fingerprint(&paths, None, &loaded.source_files, &raw_truncation_map)
+                .expect("raw-truncation fingerprint should compute");
+        let cache_mismatch = qwen_sft_streaming_source_index_with_cache(
+            &paths,
+            None,
+            Some(&cache_path),
+            &raw_truncation_map,
+        )
+        .expect_err("cache should reject changed truncations")
+        .to_string();
+
+        assert_eq!(loaded.examples.len(), 1);
+        assert_eq!(loaded.examples[0].instruction, "Name the rustrain");
+        assert_eq!(loaded.examples[0].input, "GPU");
+        assert_eq!(loaded.examples[0].response, "approved response");
+        assert_eq!(raw_window.examples, loaded.examples);
+        assert_eq!(streamed.samples, loaded.examples.len());
+        assert_eq!(streamed.fingerprint, loaded.fingerprint);
+        assert_ne!(loaded.fingerprint, raw_truncation_fingerprint);
+        assert!(first_cache.cache_written);
+        assert!(cache_mismatch.contains("field_map"));
+    }
+
+    #[test]
+    fn qwen_sft_applies_field_splits_before_filters_and_fingerprint() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let jsonl = temp.path().join("samples.jsonl");
+        let cache_path = temp.path().join("cache").join("offset-index.json");
+        fs::write(
+            &jsonl,
+            r#"{"instruction":"metadata :: Keep GPU prompt","input":"GPU context || discard","response":"draft -> approved answer"}
+{"instruction":"metadata :: Drop CPU prompt","input":"CPU context || discard","response":"draft -> denied answer"}
+"#,
+        )
+        .expect("jsonl should write");
+        let paths = vec![jsonl.clone()];
+        let field_map = QwenSftFieldMap {
+            instruction_contains_any: vec!["Keep GPU".to_string()],
+            input_contains_any: vec!["GPU context".to_string()],
+            response_contains_any: vec!["approved answer".to_string()],
+            field_splits: vec![
+                FieldSplit {
+                    field: FieldReplacementTarget::Instruction,
+                    delimiter: " :: ".to_string(),
+                    side: FieldSplitSide::After,
+                },
+                FieldSplit {
+                    field: FieldReplacementTarget::Input,
+                    delimiter: " || ".to_string(),
+                    side: FieldSplitSide::Before,
+                },
+                FieldSplit {
+                    field: FieldReplacementTarget::Response,
+                    delimiter: " -> ".to_string(),
+                    side: FieldSplitSide::After,
+                },
+            ],
+            ..QwenSftFieldMap::default()
+        };
+
+        let loaded = qwen_sft_examples_from_jsonl_paths_with_limit(&paths, None, &field_map)
+            .expect("split examples should load");
+        let streamed = qwen_sft_streaming_source_summary(&paths, None, &field_map)
+            .expect("split streaming summary should scan");
+        let source_index = qwen_sft_streaming_source_index(&paths, None, &field_map)
+            .expect("split source index should build");
+        let raw_window = qwen_sft_examples_by_raw_indices(&source_index.samples, &field_map)
+            .expect("split raw window should read");
+        let first_cache =
+            qwen_sft_streaming_source_index_with_cache(&paths, None, Some(&cache_path), &field_map)
+                .expect("split cache should write");
+        let raw_split_map = QwenSftFieldMap {
+            field_splits: Vec::new(),
+            instruction_contains_any: Vec::new(),
+            input_contains_any: Vec::new(),
+            response_contains_any: Vec::new(),
+            ..field_map.clone()
+        };
+        let raw_split_fingerprint =
+            qwen_sft_streaming_fingerprint(&paths, None, &loaded.source_files, &raw_split_map)
+                .expect("raw-split fingerprint should compute");
+        let cache_mismatch = qwen_sft_streaming_source_index_with_cache(
+            &paths,
+            None,
+            Some(&cache_path),
+            &raw_split_map,
+        )
+        .expect_err("cache should reject changed splits")
+        .to_string();
+
+        assert_eq!(loaded.examples.len(), 1);
+        assert_eq!(loaded.examples[0].instruction, "Keep GPU prompt");
+        assert_eq!(loaded.examples[0].input, "GPU context");
+        assert_eq!(loaded.examples[0].response, "approved answer");
+        assert_eq!(raw_window.examples, loaded.examples);
+        assert_eq!(streamed.samples, loaded.examples.len());
+        assert_eq!(streamed.fingerprint, loaded.fingerprint);
+        assert_ne!(loaded.fingerprint, raw_split_fingerprint);
+        assert!(first_cache.cache_written);
+        assert!(cache_mismatch.contains("field_map"));
+    }
+
+    #[test]
+    fn qwen_sft_prompt_template_changes_tokenized_prompt_and_fingerprint() {
+        let example = QwenSftExample {
+            system: String::new(),
+            instruction: "Name the project.".to_string(),
+            input: "Rust trainer".to_string(),
+            response: "rustrain".to_string(),
+        };
+        let default_map = QwenSftFieldMap::default();
+        let custom_map = QwenSftFieldMap {
+            prompt_template: "### User\n{instruction}\n### Assistant\n".to_string(),
+            prompt_with_input_template:
+                "### User\n{instruction}\nContext: {input}\n### Assistant\n".to_string(),
+            ..QwenSftFieldMap::default()
+        };
+        let default_prompt =
+            qwen_render_sft_prompt(&example, &default_map).expect("default prompt should render");
+        let custom_prompt =
+            qwen_render_sft_prompt(&example, &custom_map).expect("custom prompt should render");
+        let default_fingerprint = qwen_sft_dataset_fingerprint(
+            &["data/train.jsonl".to_string()],
+            std::slice::from_ref(&example),
+            &default_map,
+        );
+        let custom_fingerprint = qwen_sft_dataset_fingerprint(
+            &["data/train.jsonl".to_string()],
+            std::slice::from_ref(&example),
+            &custom_map,
+        );
+
+        assert_eq!(
+            default_prompt,
+            "Instruction:\nName the project.\n\nInput:\nRust trainer\n\nResponse:\n"
+        );
+        assert_eq!(
+            custom_prompt,
+            "### User\nName the project.\nContext: Rust trainer\n### Assistant\n"
+        );
+        assert_ne!(default_fingerprint, custom_fingerprint);
+    }
+
+    #[test]
+    fn qwen_sft_cli_template_escapes_match_config_templates() {
+        let example = QwenSftExample {
+            system: String::new(),
+            instruction: "Name the project.".to_string(),
+            input: "Rust trainer".to_string(),
+            response: "rustrain".to_string(),
+        };
+        let field_map = QwenSftFieldMap {
+            prompt_template: qwen_decode_cli_template_escapes(
+                "Instruction: {instruction}\\nResponse: ",
+            ),
+            prompt_with_input_template: qwen_decode_cli_template_escapes(
+                "Instruction: {instruction}\\nInput: {input}\\nResponse: ",
+            ),
+            ..QwenSftFieldMap::default()
+        };
+
+        let prompt =
+            qwen_render_sft_prompt(&example, &field_map).expect("CLI prompt should render");
+
+        assert_eq!(
+            prompt,
+            "Instruction: Name the project.\nInput: Rust trainer\nResponse: "
+        );
+        assert_eq!(qwen_decode_cli_template_escapes(r"one\ttwo"), "one\ttwo");
+        assert_eq!(qwen_decode_cli_template_escapes(r"one\\two"), r"one\two");
+        assert_eq!(qwen_decode_cli_template_escapes(r#"one\"two"#), "one\"two");
+    }
+
+    #[test]
+    fn qwen_sft_trim_fields_controls_record_normalization_and_fingerprint() {
+        let line = r#"{"instruction":"  Name the project.  ","input":"  Rust trainer  ","response":"  rustrain  "}"#;
+        let trim_map = QwenSftFieldMap::default();
+        let raw_map = QwenSftFieldMap {
+            trim_fields: false,
+            ..QwenSftFieldMap::default()
+        };
+        let trim_regex_plan =
+            QwenSftRegexPlan::compile(&trim_map).expect("trim regex plan should compile");
+        let raw_regex_plan =
+            QwenSftRegexPlan::compile(&raw_map).expect("raw regex plan should compile");
+        let trimmed = qwen_sft_record_from_jsonl_line(line, &trim_map, &trim_regex_plan)
+            .expect("trimmed record should parse");
+        let raw = qwen_sft_record_from_jsonl_line(line, &raw_map, &raw_regex_plan)
+            .expect("raw record should parse");
+        let trimmed_example = QwenSftExample {
+            system: trimmed.system.clone(),
+            instruction: trimmed.instruction.clone(),
+            input: trimmed.input.clone(),
+            response: trimmed.response.clone(),
+        };
+        let raw_example = QwenSftExample {
+            system: raw.system.clone(),
+            instruction: raw.instruction.clone(),
+            input: raw.input.clone(),
+            response: raw.response.clone(),
+        };
+
+        assert_eq!(trimmed.instruction, "Name the project.");
+        assert_eq!(trimmed.input, "Rust trainer");
+        assert_eq!(trimmed.response, "rustrain");
+        assert_eq!(raw.instruction, "  Name the project.  ");
+        assert_eq!(raw.input, "  Rust trainer  ");
+        assert_eq!(raw.response, "  rustrain  ");
+        assert_ne!(
+            qwen_sft_dataset_fingerprint(&[], &[trimmed_example], &trim_map),
+            qwen_sft_dataset_fingerprint(&[], &[raw_example], &raw_map)
+        );
+    }
+
+    #[test]
+    fn qwen_sft_explicit_eval_metadata_combines_train_and_eval_sources() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let train_jsonl = temp.path().join("train.jsonl");
+        let eval_jsonl = temp.path().join("eval.jsonl");
+        let train_file = train_jsonl.display().to_string();
+        let eval_file = eval_jsonl.display().to_string();
+        let source_files = qwen_merge_sft_source_files(
+            std::slice::from_ref(&train_file),
+            std::slice::from_ref(&eval_file),
+        );
+        let source_counts = qwen_merge_sft_source_sample_counts(
+            &[QwenSftSourceSampleCount {
+                path: train_file.clone(),
+                samples: 3,
+            }],
+            &[QwenSftSourceSampleCount {
+                path: eval_file.clone(),
+                samples: 2,
+            }],
+        );
+        let fingerprint =
+            qwen_combine_sft_fingerprints(&source_files, "train-fingerprint", "eval-fingerprint");
+
+        assert_eq!(source_files, vec![eval_file.clone(), train_file.clone()]);
+        assert_eq!(
+            source_counts,
+            vec![
+                QwenSftSourceSampleCount {
+                    path: eval_file,
+                    samples: 2,
+                },
+                QwenSftSourceSampleCount {
+                    path: train_file,
+                    samples: 3,
+                },
+            ]
+        );
+        assert!(!fingerprint.is_empty());
+        assert_ne!(
+            fingerprint,
+            qwen_combine_sft_fingerprints(&source_files, "train-fingerprint", "other-eval")
+        );
+    }
+
+    #[test]
+    fn qwen_sft_limits_explicit_eval_paths() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let train_jsonl = temp.path().join("train.jsonl");
+        let eval_jsonl = temp.path().join("eval.jsonl");
+        fs::write(
+            &train_jsonl,
+            "{\"instruction\":\"train one\",\"response\":\"alpha\"}\n{\"instruction\":\"train two\",\"response\":\"beta\"}\n",
+        )
+        .expect("train jsonl should write");
+        fs::write(
+            &eval_jsonl,
+            "{\"instruction\":\"eval one\",\"response\":\"gamma\"}\n{\"instruction\":\"eval two\",\"response\":\"delta\"}\n{\"instruction\":\"eval three\",\"response\":\"epsilon\"}\n",
+        )
+        .expect("eval jsonl should write");
+        let train_paths = vec![train_jsonl.clone()];
+        let eval_paths = vec![eval_jsonl.clone()];
+        let field_map = QwenSftFieldMap::default();
+        let eval_field_map = qwen_sft_eval_field_map(&field_map);
+
+        let train_set =
+            qwen_sft_examples_from_jsonl_paths_with_limit(&train_paths, None, &field_map)
+                .expect("train examples should load");
+        let limited_eval_set =
+            qwen_sft_examples_from_jsonl_paths_with_limit(&eval_paths, Some(2), &eval_field_map)
+                .expect("limited eval examples should load");
+        let streaming_eval_summary =
+            qwen_sft_streaming_source_summary(&eval_paths, Some(2), &eval_field_map)
+                .expect("limited eval streaming summary should scan");
+
+        assert_eq!(train_set.examples.len(), 2);
+        assert_eq!(limited_eval_set.examples.len(), 2);
+        assert_eq!(
+            limited_eval_set
+                .examples
+                .iter()
+                .map(|example| example.instruction.as_str())
+                .collect::<Vec<_>>(),
+            vec!["eval one", "eval two"]
+        );
+        assert_eq!(
+            streaming_eval_summary.samples,
+            limited_eval_set.examples.len()
+        );
+        assert_eq!(
+            streaming_eval_summary.source_sample_counts,
+            limited_eval_set.source_sample_counts
+        );
+        assert_eq!(
+            streaming_eval_summary.fingerprint,
+            limited_eval_set.fingerprint
+        );
+
+        let combined_source_files =
+            qwen_merge_sft_source_files(&train_set.source_files, &limited_eval_set.source_files);
+        let combined_source_sample_counts = qwen_merge_sft_source_sample_counts(
+            &train_set.source_sample_counts,
+            &limited_eval_set.source_sample_counts,
+        );
+        assert_eq!(
+            combined_source_sample_counts,
+            vec![
+                QwenSftSourceSampleCount {
+                    path: eval_jsonl.display().to_string(),
+                    samples: 2,
+                },
+                QwenSftSourceSampleCount {
+                    path: train_jsonl.display().to_string(),
+                    samples: 2,
+                },
+            ]
+        );
+        assert_ne!(
+            qwen_combine_sft_fingerprints(
+                &combined_source_files,
+                &train_set.fingerprint,
+                &limited_eval_set.fingerprint,
+            ),
+            qwen_combine_sft_fingerprints(
+                &combined_source_files,
+                &train_set.fingerprint,
+                "unlimited-eval-fingerprint",
+            )
+        );
+    }
+
+    #[test]
+    fn qwen_sft_resume_dataset_validation_rejects_changed_data() {
+        let summary = QwenSftDatasetSummary {
+            samples: 2,
+            total_tokens: 8,
+            response_tokens: 2,
+            masked_positions: 2,
+            max_sequence_tokens: 4,
+            source_files: vec!["data/train.jsonl".to_string()],
+            source_sample_counts: vec![QwenSftSourceSampleCount {
+                path: "data/train.jsonl".to_string(),
+                samples: 2,
+            }],
+            fingerprint: "fingerprint-a".to_string(),
+            shuffle: true,
+        };
+
+        qwen_validate_sft_resume_dataset(
+            &summary.source_files,
+            &summary.source_sample_counts,
+            &summary.fingerprint,
+            true,
+            &summary,
+            "test resume",
+        )
+        .expect("matching provenance should pass");
+        qwen_validate_sft_resume_dataset(&[], &[], "", true, &summary, "legacy resume")
+            .expect("legacy manifests without provenance should pass");
+
+        let fingerprint_error = qwen_validate_sft_resume_dataset(
+            &summary.source_files,
+            &summary.source_sample_counts,
+            "fingerprint-b",
+            true,
+            &summary,
+            "test resume",
+        )
+        .expect_err("changed content fingerprint should fail")
+        .to_string();
+        assert!(fingerprint_error.contains("dataset fingerprint mismatch"));
+
+        let source_error = qwen_validate_sft_resume_dataset(
+            &["data/other.jsonl".to_string()],
+            &summary.source_sample_counts,
+            &summary.fingerprint,
+            true,
+            &summary,
+            "test resume",
+        )
+        .expect_err("changed source files should fail")
+        .to_string();
+        assert!(source_error.contains("dataset source files mismatch"));
+
+        let count_error = qwen_validate_sft_resume_dataset(
+            &summary.source_files,
+            &[QwenSftSourceSampleCount {
+                path: "data/train.jsonl".to_string(),
+                samples: 3,
+            }],
+            &summary.fingerprint,
+            true,
+            &summary,
+            "test resume",
+        )
+        .expect_err("changed source sample counts should fail")
+        .to_string();
+        assert!(count_error.contains("dataset source sample counts mismatch"));
+
+        let shuffle_error = qwen_validate_sft_resume_dataset(
+            &summary.source_files,
+            &summary.source_sample_counts,
+            &summary.fingerprint,
+            false,
+            &summary,
+            "test resume",
+        )
+        .expect_err("changed shuffle policy should fail")
+        .to_string();
+        assert!(shuffle_error.contains("dataset shuffle mismatch"));
+    }
+
+    #[test]
+    fn qwen_sft_jsonl_reader_aggregates_multiple_paths_and_directories() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let first = temp.path().join("first.jsonl");
+        let dir = temp.path().join("shard_dir");
+        fs::create_dir(&dir).expect("shard dir should be created");
+        let second = dir.join("b.jsonl");
+        let third = dir.join("a.jsonl");
+        let ignored = dir.join("ignored.txt");
+        fs::write(
+            &first,
+            r#"{"instruction":"first","response":"one"}
+"#,
+        )
+        .expect("first jsonl should write");
+        fs::write(
+            &second,
+            r#"{"instruction":"third","response":"three"}
+"#,
+        )
+        .expect("second jsonl should write");
+        fs::write(
+            &third,
+            r#"{"instruction":"second","response":"two"}
+"#,
+        )
+        .expect("third jsonl should write");
+        fs::write(
+            &ignored,
+            r#"{"instruction":"ignored","response":"ignored"}
+"#,
+        )
+        .expect("ignored file should write");
+
+        let example_set = qwen_sft_examples_from_jsonl_paths_with_limit(
+            &[first.clone(), dir.clone()],
+            None,
+            &QwenSftFieldMap::default(),
+        )
+        .expect("examples should aggregate from multiple paths");
+        let examples = &example_set.examples;
+
+        assert_eq!(examples.len(), 3);
+        assert_eq!(example_set.source_files.len(), 3);
+        assert_eq!(
+            example_set.source_sample_counts,
+            vec![
+                QwenSftSourceSampleCount {
+                    path: first.display().to_string(),
+                    samples: 1,
+                },
+                QwenSftSourceSampleCount {
+                    path: third.display().to_string(),
+                    samples: 1,
+                },
+                QwenSftSourceSampleCount {
+                    path: second.display().to_string(),
+                    samples: 1,
+                },
+            ]
+        );
+        assert!(
+            example_set
+                .source_files
+                .iter()
+                .all(|path| path.ends_with(".jsonl"))
+        );
+        assert!(!example_set.fingerprint.is_empty());
+        assert_eq!(examples[0].instruction, "first");
+        assert_eq!(examples[1].instruction, "second");
+        assert_eq!(examples[2].instruction, "third");
+    }
+
+    #[test]
+    fn qwen_sft_jsonl_limit_stops_before_unneeded_files() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let first = temp.path().join("first.jsonl");
+        let second = temp.path().join("second.jsonl");
+        let third = temp.path().join("third.jsonl");
+        fs::write(
+            &first,
+            r#"{"instruction":"one","response":"a"}
+{"instruction":"two","response":"b"}
+"#,
+        )
+        .expect("first jsonl should write");
+        fs::write(
+            &second,
+            r#"{"instruction":"three","response":"c"}
+{"instruction":"four","response":"d"}
+"#,
+        )
+        .expect("second jsonl should write");
+        fs::write(
+            &third,
+            r#"{"instruction":"five","response":"e"}
+"#,
+        )
+        .expect("third jsonl should write");
+
+        let limited = qwen_sft_examples_from_jsonl_paths_with_limit(
+            &[first.clone(), second.clone(), third],
+            Some(3),
+            &QwenSftFieldMap::default(),
+        )
+        .expect("limited examples should load");
+
+        assert_eq!(limited.examples.len(), 3);
+        assert_eq!(
+            limited.source_files,
+            vec![first.display().to_string(), second.display().to_string()]
+        );
+        assert_eq!(
+            limited.source_sample_counts,
+            vec![
+                QwenSftSourceSampleCount {
+                    path: first.display().to_string(),
+                    samples: 2,
+                },
+                QwenSftSourceSampleCount {
+                    path: second.display().to_string(),
+                    samples: 1,
+                },
+            ]
+        );
+        assert_eq!(limited.examples[0].instruction, "one");
+        assert_eq!(limited.examples[2].instruction, "three");
+        assert_eq!(
+            limited.fingerprint,
+            qwen_sft_dataset_fingerprint(
+                &limited.source_files,
+                &limited.examples,
+                &QwenSftFieldMap::default()
+            )
+        );
+    }
+
+    #[test]
+    fn qwen_sft_streaming_summary_matches_jsonl_reader_without_materializing_tokens() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let first = temp.path().join("first.jsonl");
+        let second = temp.path().join("second.jsonl");
+        let third = temp.path().join("third.jsonl");
+        fs::write(
+            &first,
+            r#"{"instruction":"one","response":"a"}
+{"instruction":"two","input":"input","response":"b"}
+"#,
+        )
+        .expect("first jsonl should write");
+        fs::write(
+            &second,
+            r#"{"instruction":"three","response":"c"}
+{"instruction":"four","response":"d"}
+"#,
+        )
+        .expect("second jsonl should write");
+        fs::write(
+            &third,
+            r#"{"instruction":"five","response":"e"}
+"#,
+        )
+        .expect("third jsonl should write");
+
+        let paths = vec![first.clone(), second.clone(), third];
+        let loaded = qwen_sft_examples_from_jsonl_paths_with_limit(
+            &paths,
+            Some(3),
+            &QwenSftFieldMap::default(),
+        )
+        .expect("limited examples should load");
+        let streamed =
+            qwen_sft_streaming_source_summary(&paths, Some(3), &QwenSftFieldMap::default())
+                .expect("streaming summary should scan");
+
+        assert_eq!(streamed.samples, loaded.examples.len());
+        assert_eq!(streamed.source_files, loaded.source_files);
+        assert_eq!(streamed.source_sample_counts, loaded.source_sample_counts);
+        assert_eq!(streamed.fingerprint, loaded.fingerprint);
+    }
+
+    #[test]
+    fn qwen_sft_filters_short_responses_before_limit_and_streaming_index() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let jsonl = temp.path().join("samples.jsonl");
+        fs::write(
+            &jsonl,
+            r#"{"instruction":"empty","response":""}
+{"instruction":"short","response":"ok"}
+{"instruction":"first","response":"valid"}
+{"instruction":"second","response":"works"}
+{"instruction":"third","response":"later"}
+"#,
+        )
+        .expect("jsonl should write");
+        let paths = vec![jsonl.clone()];
+        let field_map = QwenSftFieldMap {
+            min_response_chars: 5,
+            ..QwenSftFieldMap::default()
+        };
+
+        let loaded = qwen_sft_examples_from_jsonl_paths_with_limit(&paths, Some(2), &field_map)
+            .expect("filtered examples should load");
+        let streamed = qwen_sft_streaming_source_summary(&paths, Some(2), &field_map)
+            .expect("filtered streaming summary should scan");
+        let source_index = qwen_sft_streaming_source_index(&paths, Some(2), &field_map)
+            .expect("filtered source index should build");
+        let raw_window = qwen_sft_examples_by_raw_indices(&source_index.samples, &field_map)
+            .expect("filtered raw window should read");
+
+        assert_eq!(
+            loaded
+                .examples
+                .iter()
+                .map(|example| example.instruction.as_str())
+                .collect::<Vec<_>>(),
+            vec!["first", "second"]
+        );
+        assert_eq!(streamed.samples, loaded.examples.len());
+        assert_eq!(streamed.source_files, loaded.source_files);
+        assert_eq!(streamed.source_sample_counts, loaded.source_sample_counts);
+        assert_eq!(streamed.fingerprint, loaded.fingerprint);
+        assert_eq!(
+            raw_window
+                .examples
+                .iter()
+                .map(|example| example.instruction.as_str())
+                .collect::<Vec<_>>(),
+            vec!["first", "second"]
+        );
+        assert_eq!(
+            source_index
+                .samples
+                .iter()
+                .map(|sample| sample.index_in_file)
+                .collect::<Vec<_>>(),
+            vec![2, 3]
+        );
+    }
+
+    #[test]
+    fn qwen_sft_filters_responses_by_substring_before_limit_and_streaming_index() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let jsonl = temp.path().join("samples.jsonl");
+        let cache_path = temp.path().join("cache").join("offset-index.json");
+        fs::write(
+            &jsonl,
+            r#"{"instruction":"first","response":"approved answer"}
+{"instruction":"skip","response":"ordinary reply"}
+{"instruction":"second","response":"contains verified marker"}
+{"instruction":"third","response":"approved final"}
+"#,
+        )
+        .expect("jsonl should write");
+        let paths = vec![jsonl.clone()];
+        let field_map = QwenSftFieldMap {
+            response_contains_any: vec!["approved".to_string(), "verified".to_string()],
+            ..QwenSftFieldMap::default()
+        };
+
+        let loaded = qwen_sft_examples_from_jsonl_paths_with_limit(&paths, Some(3), &field_map)
+            .expect("filtered examples should load");
+        let streamed = qwen_sft_streaming_source_summary(&paths, Some(3), &field_map)
+            .expect("filtered streaming summary should scan");
+        let source_index = qwen_sft_streaming_source_index(&paths, Some(3), &field_map)
+            .expect("filtered source index should build");
+        let raw_window = qwen_sft_examples_by_raw_indices(&source_index.samples, &field_map)
+            .expect("filtered raw window should read");
+        let cache = qwen_sft_streaming_source_index_with_cache(
+            &paths,
+            Some(3),
+            Some(&cache_path),
+            &field_map,
+        )
+        .expect("filtered cache should write");
+        let cache_mismatch = qwen_sft_streaming_source_index_with_cache(
+            &paths,
+            Some(3),
+            Some(&cache_path),
+            &QwenSftFieldMap::default(),
+        )
+        .expect_err("response substring drift should reject cache")
+        .to_string();
+
+        assert_eq!(
+            loaded
+                .examples
+                .iter()
+                .map(|example| example.instruction.as_str())
+                .collect::<Vec<_>>(),
+            vec!["first", "second", "third"]
+        );
+        assert_eq!(streamed.samples, loaded.examples.len());
+        assert_eq!(streamed.source_files, loaded.source_files);
+        assert_eq!(streamed.source_sample_counts, loaded.source_sample_counts);
+        assert_eq!(streamed.fingerprint, loaded.fingerprint);
+        assert_eq!(cache.index.samples, source_index.samples);
+        assert!(cache_mismatch.contains("field_map"));
+        assert_ne!(
+            loaded.fingerprint,
+            qwen_sft_streaming_fingerprint(
+                &paths,
+                Some(3),
+                &loaded.source_files,
+                &QwenSftFieldMap::default()
+            )
+            .expect("default fingerprint should compute")
+        );
+        assert_eq!(
+            raw_window
+                .examples
+                .iter()
+                .map(|example| example.instruction.as_str())
+                .collect::<Vec<_>>(),
+            vec!["first", "second", "third"]
+        );
+        assert_eq!(
+            source_index
+                .samples
+                .iter()
+                .map(|sample| sample.index_in_file)
+                .collect::<Vec<_>>(),
+            vec![0, 2, 3]
+        );
+    }
+
+    #[test]
+    fn qwen_sft_filters_instructions_by_substring_before_limit_and_streaming_index() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let jsonl = temp.path().join("samples.jsonl");
+        let cache_path = temp.path().join("cache").join("offset-index.json");
+        fs::write(
+            &jsonl,
+            r#"{"instruction":"keep first task","response":"answer one"}
+{"instruction":"skip ordinary","response":"answer skip"}
+{"instruction":"second task","response":"answer two"}
+{"instruction":"keep third","response":"answer three"}
+"#,
+        )
+        .expect("jsonl should write");
+        let paths = vec![jsonl.clone()];
+        let field_map = QwenSftFieldMap {
+            instruction_contains_any: vec!["task".to_string(), "keep".to_string()],
+            ..QwenSftFieldMap::default()
+        };
+
+        let loaded = qwen_sft_examples_from_jsonl_paths_with_limit(&paths, Some(3), &field_map)
+            .expect("filtered examples should load");
+        let streamed = qwen_sft_streaming_source_summary(&paths, Some(3), &field_map)
+            .expect("filtered streaming summary should scan");
+        let source_index = qwen_sft_streaming_source_index(&paths, Some(3), &field_map)
+            .expect("filtered source index should build");
+        let raw_window = qwen_sft_examples_by_raw_indices(&source_index.samples, &field_map)
+            .expect("filtered raw window should read");
+        let cache = qwen_sft_streaming_source_index_with_cache(
+            &paths,
+            Some(3),
+            Some(&cache_path),
+            &field_map,
+        )
+        .expect("filtered cache should write");
+        let cache_mismatch = qwen_sft_streaming_source_index_with_cache(
+            &paths,
+            Some(3),
+            Some(&cache_path),
+            &QwenSftFieldMap::default(),
+        )
+        .expect_err("instruction substring drift should reject cache")
+        .to_string();
+
+        assert_eq!(
+            loaded
+                .examples
+                .iter()
+                .map(|example| example.instruction.as_str())
+                .collect::<Vec<_>>(),
+            vec!["keep first task", "second task", "keep third"]
+        );
+        assert_eq!(streamed.samples, loaded.examples.len());
+        assert_eq!(streamed.source_files, loaded.source_files);
+        assert_eq!(streamed.source_sample_counts, loaded.source_sample_counts);
+        assert_eq!(streamed.fingerprint, loaded.fingerprint);
+        assert_eq!(cache.index.samples, source_index.samples);
+        assert!(cache.cache_written);
+        assert!(cache_mismatch.contains("field_map"));
+        assert_ne!(
+            loaded.fingerprint,
+            qwen_sft_streaming_fingerprint(
+                &paths,
+                Some(3),
+                &loaded.source_files,
+                &QwenSftFieldMap::default()
+            )
+            .expect("default fingerprint should compute")
+        );
+        assert_eq!(
+            raw_window
+                .examples
+                .iter()
+                .map(|example| example.instruction.as_str())
+                .collect::<Vec<_>>(),
+            vec!["keep first task", "second task", "keep third"]
+        );
+        assert_eq!(
+            source_index
+                .samples
+                .iter()
+                .map(|sample| sample.index_in_file)
+                .collect::<Vec<_>>(),
+            vec![0, 2, 3]
+        );
+    }
+
+    #[test]
+    fn qwen_sft_filters_instructions_by_exclude_substring_before_limit_and_streaming_index() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let jsonl = temp.path().join("samples.jsonl");
+        let cache_path = temp.path().join("cache").join("offset-index.json");
+        fs::write(
+            &jsonl,
+            r#"{"instruction":"first clean task","response":"answer one"}
+{"instruction":"skip banned task","response":"answer skip"}
+{"instruction":"second safe task","response":"answer two"}
+{"instruction":"third clean task","response":"answer three"}
+"#,
+        )
+        .expect("jsonl should write");
+        let paths = vec![jsonl.clone()];
+        let field_map = QwenSftFieldMap {
+            instruction_excludes_any: vec!["banned".to_string()],
+            ..QwenSftFieldMap::default()
+        };
+
+        let loaded = qwen_sft_examples_from_jsonl_paths_with_limit(&paths, Some(3), &field_map)
+            .expect("filtered examples should load");
+        let streamed = qwen_sft_streaming_source_summary(&paths, Some(3), &field_map)
+            .expect("filtered streaming summary should scan");
+        let source_index = qwen_sft_streaming_source_index(&paths, Some(3), &field_map)
+            .expect("filtered source index should build");
+        let raw_window = qwen_sft_examples_by_raw_indices(&source_index.samples, &field_map)
+            .expect("filtered raw window should read");
+        let cache = qwen_sft_streaming_source_index_with_cache(
+            &paths,
+            Some(3),
+            Some(&cache_path),
+            &field_map,
+        )
+        .expect("filtered cache should write");
+        let cache_mismatch = qwen_sft_streaming_source_index_with_cache(
+            &paths,
+            Some(3),
+            Some(&cache_path),
+            &QwenSftFieldMap::default(),
+        )
+        .expect_err("instruction exclude substring drift should reject cache")
+        .to_string();
+
+        assert_eq!(
+            loaded
+                .examples
+                .iter()
+                .map(|example| example.instruction.as_str())
+                .collect::<Vec<_>>(),
+            vec!["first clean task", "second safe task", "third clean task"]
+        );
+        assert_eq!(streamed.samples, loaded.examples.len());
+        assert_eq!(streamed.source_files, loaded.source_files);
+        assert_eq!(streamed.source_sample_counts, loaded.source_sample_counts);
+        assert_eq!(streamed.fingerprint, loaded.fingerprint);
+        assert_eq!(cache.index.samples, source_index.samples);
+        assert!(cache.cache_written);
+        assert!(cache_mismatch.contains("field_map"));
+        assert_ne!(
+            loaded.fingerprint,
+            qwen_sft_streaming_fingerprint(
+                &paths,
+                Some(3),
+                &loaded.source_files,
+                &QwenSftFieldMap::default()
+            )
+            .expect("default fingerprint should compute")
+        );
+        assert_eq!(
+            raw_window
+                .examples
+                .iter()
+                .map(|example| example.instruction.as_str())
+                .collect::<Vec<_>>(),
+            vec!["first clean task", "second safe task", "third clean task"]
+        );
+        assert_eq!(
+            source_index
+                .samples
+                .iter()
+                .map(|sample| sample.index_in_file)
+                .collect::<Vec<_>>(),
+            vec![0, 2, 3]
+        );
+    }
+
+    #[test]
+    fn qwen_sft_filters_responses_by_exclude_substring_before_limit_and_streaming_index() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let jsonl = temp.path().join("samples.jsonl");
+        let cache_path = temp.path().join("cache").join("offset-index.json");
+        fs::write(
+            &jsonl,
+            r#"{"instruction":"first","response":"clean answer"}
+{"instruction":"skip","response":"contains banned marker"}
+{"instruction":"second","response":"safe reply"}
+{"instruction":"third","response":"clean final"}
+"#,
+        )
+        .expect("jsonl should write");
+        let paths = vec![jsonl.clone()];
+        let field_map = QwenSftFieldMap {
+            response_excludes_any: vec!["banned".to_string()],
+            ..QwenSftFieldMap::default()
+        };
+
+        let loaded = qwen_sft_examples_from_jsonl_paths_with_limit(&paths, Some(3), &field_map)
+            .expect("filtered examples should load");
+        let streamed = qwen_sft_streaming_source_summary(&paths, Some(3), &field_map)
+            .expect("filtered streaming summary should scan");
+        let source_index = qwen_sft_streaming_source_index(&paths, Some(3), &field_map)
+            .expect("filtered source index should build");
+        let raw_window = qwen_sft_examples_by_raw_indices(&source_index.samples, &field_map)
+            .expect("filtered raw window should read");
+        let cache = qwen_sft_streaming_source_index_with_cache(
+            &paths,
+            Some(3),
+            Some(&cache_path),
+            &field_map,
+        )
+        .expect("filtered cache should write");
+        let cache_mismatch = qwen_sft_streaming_source_index_with_cache(
+            &paths,
+            Some(3),
+            Some(&cache_path),
+            &QwenSftFieldMap::default(),
+        )
+        .expect_err("response exclude substring drift should reject cache")
+        .to_string();
+
+        assert_eq!(
+            loaded
+                .examples
+                .iter()
+                .map(|example| example.instruction.as_str())
+                .collect::<Vec<_>>(),
+            vec!["first", "second", "third"]
+        );
+        assert_eq!(streamed.samples, loaded.examples.len());
+        assert_eq!(streamed.source_files, loaded.source_files);
+        assert_eq!(streamed.source_sample_counts, loaded.source_sample_counts);
+        assert_eq!(streamed.fingerprint, loaded.fingerprint);
+        assert_eq!(cache.index.samples, source_index.samples);
+        assert!(cache.cache_written);
+        assert!(cache_mismatch.contains("field_map"));
+        assert_ne!(
+            loaded.fingerprint,
+            qwen_sft_streaming_fingerprint(
+                &paths,
+                Some(3),
+                &loaded.source_files,
+                &QwenSftFieldMap::default()
+            )
+            .expect("default fingerprint should compute")
+        );
+        assert_eq!(
+            raw_window
+                .examples
+                .iter()
+                .map(|example| example.instruction.as_str())
+                .collect::<Vec<_>>(),
+            vec!["first", "second", "third"]
+        );
+        assert_eq!(
+            source_index
+                .samples
+                .iter()
+                .map(|sample| sample.index_in_file)
+                .collect::<Vec<_>>(),
+            vec![0, 2, 3]
+        );
+    }
+
+    #[test]
+    fn qwen_sft_filters_long_responses_before_limit_and_streaming_index() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let jsonl = temp.path().join("samples.jsonl");
+        let cache_path = temp.path().join("cache").join("offset-index.json");
+        fs::write(
+            &jsonl,
+            r#"{"instruction":"first","response":"valid"}
+{"instruction":"too long","response":"toolong"}
+{"instruction":"second","response":"works"}
+{"instruction":"third","response":"later"}
+"#,
+        )
+        .expect("jsonl should write");
+        let paths = vec![jsonl.clone()];
+        let field_map = QwenSftFieldMap {
+            max_response_chars: Some(5),
+            ..QwenSftFieldMap::default()
+        };
+
+        let loaded = qwen_sft_examples_from_jsonl_paths_with_limit(&paths, Some(2), &field_map)
+            .expect("filtered examples should load");
+        let streamed = qwen_sft_streaming_source_summary(&paths, Some(2), &field_map)
+            .expect("filtered streaming summary should scan");
+        let source_index = qwen_sft_streaming_source_index(&paths, Some(2), &field_map)
+            .expect("filtered source index should build");
+        let raw_window = qwen_sft_examples_by_raw_indices(&source_index.samples, &field_map)
+            .expect("filtered raw window should read");
+        let cache = qwen_sft_streaming_source_index_with_cache(
+            &paths,
+            Some(2),
+            Some(&cache_path),
+            &field_map,
+        )
+        .expect("filtered cache should write");
+        let cache_mismatch = qwen_sft_streaming_source_index_with_cache(
+            &paths,
+            Some(2),
+            Some(&cache_path),
+            &QwenSftFieldMap::default(),
+        )
+        .expect_err("max response drift should reject cache")
+        .to_string();
+
+        assert_eq!(
+            loaded
+                .examples
+                .iter()
+                .map(|example| example.instruction.as_str())
+                .collect::<Vec<_>>(),
+            vec!["first", "second"]
+        );
+        assert_eq!(streamed.samples, loaded.examples.len());
+        assert_eq!(streamed.source_files, loaded.source_files);
+        assert_eq!(streamed.source_sample_counts, loaded.source_sample_counts);
+        assert_eq!(streamed.fingerprint, loaded.fingerprint);
+        assert_eq!(cache.index.samples, source_index.samples);
+        assert!(cache.cache_written);
+        assert!(cache_mismatch.contains("field_map"));
+        assert_eq!(
+            raw_window
+                .examples
+                .iter()
+                .map(|example| example.instruction.as_str())
+                .collect::<Vec<_>>(),
+            vec!["first", "second"]
+        );
+        assert_eq!(
+            source_index
+                .samples
+                .iter()
+                .map(|sample| sample.index_in_file)
+                .collect::<Vec<_>>(),
+            vec![0, 2]
+        );
+    }
+
+    #[test]
+    fn qwen_sft_filters_instruction_lengths_before_limit_and_streaming_index() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let jsonl = temp.path().join("samples.jsonl");
+        let cache_path = temp.path().join("cache").join("offset-index.json");
+        fs::write(
+            &jsonl,
+            r#"{"instruction":"a","response":"skip"}
+{"instruction":"first","response":"valid"}
+{"instruction":"too long","response":"skip"}
+{"instruction":"second","response":"works"}
+{"instruction":"third","response":"later"}
+"#,
+        )
+        .expect("jsonl should write");
+        let paths = vec![jsonl.clone()];
+        let field_map = QwenSftFieldMap {
+            min_instruction_chars: Some(3),
+            max_instruction_chars: Some(6),
+            ..QwenSftFieldMap::default()
+        };
+
+        let loaded = qwen_sft_examples_from_jsonl_paths_with_limit(&paths, Some(2), &field_map)
+            .expect("filtered examples should load");
+        let streamed = qwen_sft_streaming_source_summary(&paths, Some(2), &field_map)
+            .expect("filtered streaming summary should scan");
+        let source_index = qwen_sft_streaming_source_index(&paths, Some(2), &field_map)
+            .expect("filtered source index should build");
+        let raw_window = qwen_sft_examples_by_raw_indices(&source_index.samples, &field_map)
+            .expect("filtered raw window should read");
+        let cache = qwen_sft_streaming_source_index_with_cache(
+            &paths,
+            Some(2),
+            Some(&cache_path),
+            &field_map,
+        )
+        .expect("filtered cache should write");
+        let cache_mismatch = qwen_sft_streaming_source_index_with_cache(
+            &paths,
+            Some(2),
+            Some(&cache_path),
+            &QwenSftFieldMap::default(),
+        )
+        .expect_err("instruction filter drift should reject cache")
+        .to_string();
+
+        assert_eq!(
+            loaded
+                .examples
+                .iter()
+                .map(|example| example.instruction.as_str())
+                .collect::<Vec<_>>(),
+            vec!["first", "second"]
+        );
+        assert_eq!(streamed.samples, loaded.examples.len());
+        assert_eq!(streamed.source_files, loaded.source_files);
+        assert_eq!(streamed.source_sample_counts, loaded.source_sample_counts);
+        assert_eq!(streamed.fingerprint, loaded.fingerprint);
+        assert_eq!(cache.index.samples, source_index.samples);
+        assert!(cache.cache_written);
+        assert!(cache_mismatch.contains("field_map"));
+        assert_eq!(
+            raw_window
+                .examples
+                .iter()
+                .map(|example| example.instruction.as_str())
+                .collect::<Vec<_>>(),
+            vec!["first", "second"]
+        );
+        assert_eq!(
+            source_index
+                .samples
+                .iter()
+                .map(|sample| sample.index_in_file)
+                .collect::<Vec<_>>(),
+            vec![1, 3]
+        );
+    }
+
+    #[test]
+    fn qwen_sft_filters_input_lengths_before_limit_and_streaming_index() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let jsonl = temp.path().join("samples.jsonl");
+        let cache_path = temp.path().join("cache").join("offset-index.json");
+        fs::write(
+            &jsonl,
+            r#"{"instruction":"skip short","input":"x","response":"short"}
+{"instruction":"first","input":"ok","response":"valid"}
+{"instruction":"skip long","input":"toolong","response":"long"}
+{"instruction":"second","input":"mid","response":"works"}
+{"instruction":"third","input":"fit","response":"later"}
+"#,
+        )
+        .expect("jsonl should write");
+        let paths = vec![jsonl.clone()];
+        let field_map = QwenSftFieldMap {
+            min_input_chars: Some(2),
+            max_input_chars: Some(3),
+            ..QwenSftFieldMap::default()
+        };
+
+        let loaded = qwen_sft_examples_from_jsonl_paths_with_limit(&paths, Some(2), &field_map)
+            .expect("filtered examples should load");
+        let streamed = qwen_sft_streaming_source_summary(&paths, Some(2), &field_map)
+            .expect("filtered streaming summary should scan");
+        let source_index = qwen_sft_streaming_source_index(&paths, Some(2), &field_map)
+            .expect("filtered source index should build");
+        let raw_window = qwen_sft_examples_by_raw_indices(&source_index.samples, &field_map)
+            .expect("filtered raw window should read");
+        let cache = qwen_sft_streaming_source_index_with_cache(
+            &paths,
+            Some(2),
+            Some(&cache_path),
+            &field_map,
+        )
+        .expect("filtered cache should write");
+        let cache_mismatch = qwen_sft_streaming_source_index_with_cache(
+            &paths,
+            Some(2),
+            Some(&cache_path),
+            &QwenSftFieldMap::default(),
+        )
+        .expect_err("input filter drift should reject cache")
+        .to_string();
+
+        assert_eq!(
+            loaded
+                .examples
+                .iter()
+                .map(|example| (example.instruction.as_str(), example.input.as_str()))
+                .collect::<Vec<_>>(),
+            vec![("first", "ok"), ("second", "mid")]
+        );
+        assert_eq!(streamed.samples, loaded.examples.len());
+        assert_eq!(streamed.source_files, loaded.source_files);
+        assert_eq!(streamed.source_sample_counts, loaded.source_sample_counts);
+        assert_eq!(streamed.fingerprint, loaded.fingerprint);
+        assert_eq!(cache.index.samples, source_index.samples);
+        assert!(cache.cache_written);
+        assert!(cache_mismatch.contains("field_map"));
+        assert_eq!(
+            raw_window
+                .examples
+                .iter()
+                .map(|example| (example.instruction.as_str(), example.input.as_str()))
+                .collect::<Vec<_>>(),
+            vec![("first", "ok"), ("second", "mid")]
+        );
+        assert_eq!(
+            source_index
+                .samples
+                .iter()
+                .map(|sample| sample.index_in_file)
+                .collect::<Vec<_>>(),
+            vec![1, 3]
+        );
+    }
+
+    #[test]
+    fn qwen_sft_filters_inputs_by_substring_before_limit_and_streaming_index() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let jsonl = temp.path().join("samples.jsonl");
+        let cache_path = temp.path().join("cache").join("offset-index.json");
+        fs::write(
+            &jsonl,
+            r#"{"instruction":"first","input":"keep context","response":"answer one"}
+{"instruction":"skip","input":"ordinary context","response":"answer skip"}
+{"instruction":"second","input":"selected context","response":"answer two"}
+{"instruction":"third","input":"keep extra","response":"answer three"}
+"#,
+        )
+        .expect("jsonl should write");
+        let paths = vec![jsonl.clone()];
+        let field_map = QwenSftFieldMap {
+            input_contains_any: vec!["keep".to_string(), "selected".to_string()],
+            ..QwenSftFieldMap::default()
+        };
+
+        let loaded = qwen_sft_examples_from_jsonl_paths_with_limit(&paths, Some(3), &field_map)
+            .expect("filtered examples should load");
+        let streamed = qwen_sft_streaming_source_summary(&paths, Some(3), &field_map)
+            .expect("filtered streaming summary should scan");
+        let source_index = qwen_sft_streaming_source_index(&paths, Some(3), &field_map)
+            .expect("filtered source index should build");
+        let raw_window = qwen_sft_examples_by_raw_indices(&source_index.samples, &field_map)
+            .expect("filtered raw window should read");
+        let cache = qwen_sft_streaming_source_index_with_cache(
+            &paths,
+            Some(3),
+            Some(&cache_path),
+            &field_map,
+        )
+        .expect("filtered cache should write");
+        let cache_mismatch = qwen_sft_streaming_source_index_with_cache(
+            &paths,
+            Some(3),
+            Some(&cache_path),
+            &QwenSftFieldMap::default(),
+        )
+        .expect_err("input substring drift should reject cache")
+        .to_string();
+
+        assert_eq!(
+            loaded
+                .examples
+                .iter()
+                .map(|example| example.instruction.as_str())
+                .collect::<Vec<_>>(),
+            vec!["first", "second", "third"]
+        );
+        assert_eq!(streamed.samples, loaded.examples.len());
+        assert_eq!(streamed.source_files, loaded.source_files);
+        assert_eq!(streamed.source_sample_counts, loaded.source_sample_counts);
+        assert_eq!(streamed.fingerprint, loaded.fingerprint);
+        assert_eq!(cache.index.samples, source_index.samples);
+        assert!(cache.cache_written);
+        assert!(cache_mismatch.contains("field_map"));
+        assert_ne!(
+            loaded.fingerprint,
+            qwen_sft_streaming_fingerprint(
+                &paths,
+                Some(3),
+                &loaded.source_files,
+                &QwenSftFieldMap::default()
+            )
+            .expect("default fingerprint should compute")
+        );
+        assert_eq!(
+            raw_window
+                .examples
+                .iter()
+                .map(|example| example.input.as_str())
+                .collect::<Vec<_>>(),
+            vec!["keep context", "selected context", "keep extra"]
+        );
+        assert_eq!(
+            source_index
+                .samples
+                .iter()
+                .map(|sample| sample.index_in_file)
+                .collect::<Vec<_>>(),
+            vec![0, 2, 3]
+        );
+    }
+
+    #[test]
+    fn qwen_sft_filters_inputs_by_exclude_substring_before_limit_and_streaming_index() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let jsonl = temp.path().join("samples.jsonl");
+        let cache_path = temp.path().join("cache").join("offset-index.json");
+        fs::write(
+            &jsonl,
+            r#"{"instruction":"first","input":"clean context","response":"answer one"}
+{"instruction":"skip","input":"contains banned context","response":"answer skip"}
+{"instruction":"second","input":"safe context","response":"answer two"}
+{"instruction":"third","input":"clean extra","response":"answer three"}
+"#,
+        )
+        .expect("jsonl should write");
+        let paths = vec![jsonl.clone()];
+        let field_map = QwenSftFieldMap {
+            input_excludes_any: vec!["banned".to_string()],
+            ..QwenSftFieldMap::default()
+        };
+
+        let loaded = qwen_sft_examples_from_jsonl_paths_with_limit(&paths, Some(3), &field_map)
+            .expect("filtered examples should load");
+        let streamed = qwen_sft_streaming_source_summary(&paths, Some(3), &field_map)
+            .expect("filtered streaming summary should scan");
+        let source_index = qwen_sft_streaming_source_index(&paths, Some(3), &field_map)
+            .expect("filtered source index should build");
+        let raw_window = qwen_sft_examples_by_raw_indices(&source_index.samples, &field_map)
+            .expect("filtered raw window should read");
+        let cache = qwen_sft_streaming_source_index_with_cache(
+            &paths,
+            Some(3),
+            Some(&cache_path),
+            &field_map,
+        )
+        .expect("filtered cache should write");
+        let cache_mismatch = qwen_sft_streaming_source_index_with_cache(
+            &paths,
+            Some(3),
+            Some(&cache_path),
+            &QwenSftFieldMap::default(),
+        )
+        .expect_err("input exclude substring drift should reject cache")
+        .to_string();
+
+        assert_eq!(
+            loaded
+                .examples
+                .iter()
+                .map(|example| example.instruction.as_str())
+                .collect::<Vec<_>>(),
+            vec!["first", "second", "third"]
+        );
+        assert_eq!(streamed.samples, loaded.examples.len());
+        assert_eq!(streamed.source_files, loaded.source_files);
+        assert_eq!(streamed.source_sample_counts, loaded.source_sample_counts);
+        assert_eq!(streamed.fingerprint, loaded.fingerprint);
+        assert_eq!(cache.index.samples, source_index.samples);
+        assert!(cache.cache_written);
+        assert!(cache_mismatch.contains("field_map"));
+        assert_ne!(
+            loaded.fingerprint,
+            qwen_sft_streaming_fingerprint(
+                &paths,
+                Some(3),
+                &loaded.source_files,
+                &QwenSftFieldMap::default()
+            )
+            .expect("default fingerprint should compute")
+        );
+        assert_eq!(
+            raw_window
+                .examples
+                .iter()
+                .map(|example| example.input.as_str())
+                .collect::<Vec<_>>(),
+            vec!["clean context", "safe context", "clean extra"]
+        );
+        assert_eq!(
+            source_index
+                .samples
+                .iter()
+                .map(|sample| sample.index_in_file)
+                .collect::<Vec<_>>(),
+            vec![0, 2, 3]
+        );
+    }
+
+    #[test]
+    fn qwen_sft_filters_system_lengths_before_limit_and_streaming_index() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let jsonl = temp.path().join("samples.jsonl");
+        let cache_path = temp.path().join("cache").join("offset-index.json");
+        fs::write(
+            &jsonl,
+            r#"{"system":"ai","instruction":"skip short","response":"short"}
+{"system":"brief","instruction":"first","response":"valid"}
+{"system":"this system prompt is too long","instruction":"skip long","response":"long"}
+{"system":"concise","instruction":"second","response":"works"}
+{"system":"direct","instruction":"third","response":"later"}
+"#,
+        )
+        .expect("jsonl should write");
+        let paths = vec![jsonl.clone()];
+        let field_map = QwenSftFieldMap {
+            system: Some("system".to_string()),
+            min_system_chars: Some(4),
+            max_system_chars: Some(8),
+            prompt_template: "System: {system}\nQ: {instruction}\nA: ".to_string(),
+            prompt_with_input_template: "System: {system}\nQ: {instruction}\nI: {input}\nA: "
+                .to_string(),
+            ..QwenSftFieldMap::default()
+        };
+
+        let loaded = qwen_sft_examples_from_jsonl_paths_with_limit(&paths, Some(2), &field_map)
+            .expect("filtered examples should load");
+        let streamed = qwen_sft_streaming_source_summary(&paths, Some(2), &field_map)
+            .expect("filtered streaming summary should scan");
+        let source_index = qwen_sft_streaming_source_index(&paths, Some(2), &field_map)
+            .expect("filtered source index should build");
+        let raw_window = qwen_sft_examples_by_raw_indices(&source_index.samples, &field_map)
+            .expect("filtered raw window should read");
+        let cache = qwen_sft_streaming_source_index_with_cache(
+            &paths,
+            Some(2),
+            Some(&cache_path),
+            &field_map,
+        )
+        .expect("filtered cache should write");
+        let cache_mismatch = qwen_sft_streaming_source_index_with_cache(
+            &paths,
+            Some(2),
+            Some(&cache_path),
+            &QwenSftFieldMap {
+                system: Some("system".to_string()),
+                ..QwenSftFieldMap::default()
+            },
+        )
+        .expect_err("system filter drift should reject cache")
+        .to_string();
+
+        assert_eq!(
+            loaded
+                .examples
+                .iter()
+                .map(|example| (example.system.as_str(), example.instruction.as_str()))
+                .collect::<Vec<_>>(),
+            vec![("brief", "first"), ("concise", "second")]
+        );
+        assert_eq!(streamed.samples, loaded.examples.len());
+        assert_eq!(streamed.source_files, loaded.source_files);
+        assert_eq!(streamed.source_sample_counts, loaded.source_sample_counts);
+        assert_eq!(streamed.fingerprint, loaded.fingerprint);
+        assert_eq!(cache.index.samples, source_index.samples);
+        assert!(cache.cache_written);
+        assert!(cache_mismatch.contains("field_map"));
+        assert_eq!(
+            raw_window
+                .examples
+                .iter()
+                .map(|example| (example.system.as_str(), example.instruction.as_str()))
+                .collect::<Vec<_>>(),
+            vec![("brief", "first"), ("concise", "second")]
+        );
+        assert_eq!(
+            source_index
+                .samples
+                .iter()
+                .map(|sample| sample.index_in_file)
+                .collect::<Vec<_>>(),
+            vec![1, 3]
+        );
+    }
+
+    #[test]
+    fn qwen_sft_filters_systems_by_substring_before_limit_and_streaming_index() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let jsonl = temp.path().join("samples.jsonl");
+        let cache_path = temp.path().join("cache").join("offset-index.json");
+        fs::write(
+            &jsonl,
+            r#"{"system":"keep system","instruction":"first","response":"answer one"}
+{"system":"ordinary system","instruction":"skip","response":"answer skip"}
+{"system":"selected system","instruction":"second","response":"answer two"}
+{"system":"keep extra","instruction":"third","response":"answer three"}
+"#,
+        )
+        .expect("jsonl should write");
+        let paths = vec![jsonl.clone()];
+        let field_map = QwenSftFieldMap {
+            system: Some("system".to_string()),
+            system_contains_any: vec!["keep".to_string(), "selected".to_string()],
+            prompt_template: "System: {system}\nQ: {instruction}\nA: ".to_string(),
+            prompt_with_input_template: "System: {system}\nQ: {instruction}\nI: {input}\nA: "
+                .to_string(),
+            ..QwenSftFieldMap::default()
+        };
+
+        let loaded = qwen_sft_examples_from_jsonl_paths_with_limit(&paths, Some(3), &field_map)
+            .expect("filtered examples should load");
+        let streamed = qwen_sft_streaming_source_summary(&paths, Some(3), &field_map)
+            .expect("filtered streaming summary should scan");
+        let source_index = qwen_sft_streaming_source_index(&paths, Some(3), &field_map)
+            .expect("filtered source index should build");
+        let raw_window = qwen_sft_examples_by_raw_indices(&source_index.samples, &field_map)
+            .expect("filtered raw window should read");
+        let cache = qwen_sft_streaming_source_index_with_cache(
+            &paths,
+            Some(3),
+            Some(&cache_path),
+            &field_map,
+        )
+        .expect("filtered cache should write");
+        let cache_mismatch = qwen_sft_streaming_source_index_with_cache(
+            &paths,
+            Some(3),
+            Some(&cache_path),
+            &QwenSftFieldMap {
+                system: Some("system".to_string()),
+                ..QwenSftFieldMap::default()
+            },
+        )
+        .expect_err("system substring drift should reject cache")
+        .to_string();
+
+        assert_eq!(
+            loaded
+                .examples
+                .iter()
+                .map(|example| example.instruction.as_str())
+                .collect::<Vec<_>>(),
+            vec!["first", "second", "third"]
+        );
+        assert_eq!(streamed.samples, loaded.examples.len());
+        assert_eq!(streamed.source_files, loaded.source_files);
+        assert_eq!(streamed.source_sample_counts, loaded.source_sample_counts);
+        assert_eq!(streamed.fingerprint, loaded.fingerprint);
+        assert_eq!(cache.index.samples, source_index.samples);
+        assert!(cache.cache_written);
+        assert!(cache_mismatch.contains("field_map"));
+        assert_ne!(
+            loaded.fingerprint,
+            qwen_sft_streaming_fingerprint(
+                &paths,
+                Some(3),
+                &loaded.source_files,
+                &QwenSftFieldMap {
+                    system: Some("system".to_string()),
+                    ..QwenSftFieldMap::default()
+                },
+            )
+            .expect("default system fingerprint should compute")
+        );
+        assert_eq!(
+            raw_window
+                .examples
+                .iter()
+                .map(|example| example.system.as_str())
+                .collect::<Vec<_>>(),
+            vec!["keep system", "selected system", "keep extra"]
+        );
+        assert_eq!(
+            source_index
+                .samples
+                .iter()
+                .map(|sample| sample.index_in_file)
+                .collect::<Vec<_>>(),
+            vec![0, 2, 3]
+        );
+    }
+
+    #[test]
+    fn qwen_sft_filters_systems_by_exclude_substring_before_limit_and_streaming_index() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let jsonl = temp.path().join("samples.jsonl");
+        let cache_path = temp.path().join("cache").join("offset-index.json");
+        fs::write(
+            &jsonl,
+            r#"{"system":"keep system","instruction":"first","response":"answer one"}
+{"system":"banned system","instruction":"skip","response":"answer skip"}
+{"system":"selected system","instruction":"second","response":"answer two"}
+{"system":"keep extra","instruction":"third","response":"answer three"}
+"#,
+        )
+        .expect("jsonl should write");
+        let paths = vec![jsonl.clone()];
+        let field_map = QwenSftFieldMap {
+            system: Some("system".to_string()),
+            system_excludes_any: vec!["banned".to_string()],
+            prompt_template: "System: {system}\nQ: {instruction}\nA: ".to_string(),
+            prompt_with_input_template: "System: {system}\nQ: {instruction}\nI: {input}\nA: "
+                .to_string(),
+            ..QwenSftFieldMap::default()
+        };
+
+        let loaded = qwen_sft_examples_from_jsonl_paths_with_limit(&paths, Some(3), &field_map)
+            .expect("filtered examples should load");
+        let streamed = qwen_sft_streaming_source_summary(&paths, Some(3), &field_map)
+            .expect("filtered streaming summary should scan");
+        let source_index = qwen_sft_streaming_source_index(&paths, Some(3), &field_map)
+            .expect("filtered source index should build");
+        let raw_window = qwen_sft_examples_by_raw_indices(&source_index.samples, &field_map)
+            .expect("filtered raw window should read");
+        let cache = qwen_sft_streaming_source_index_with_cache(
+            &paths,
+            Some(3),
+            Some(&cache_path),
+            &field_map,
+        )
+        .expect("filtered cache should write");
+        let cache_mismatch = qwen_sft_streaming_source_index_with_cache(
+            &paths,
+            Some(3),
+            Some(&cache_path),
+            &QwenSftFieldMap {
+                system: Some("system".to_string()),
+                ..QwenSftFieldMap::default()
+            },
+        )
+        .expect_err("system exclude substring drift should reject cache")
+        .to_string();
+
+        assert_eq!(
+            loaded
+                .examples
+                .iter()
+                .map(|example| example.instruction.as_str())
+                .collect::<Vec<_>>(),
+            vec!["first", "second", "third"]
+        );
+        assert_eq!(streamed.samples, loaded.examples.len());
+        assert_eq!(streamed.source_files, loaded.source_files);
+        assert_eq!(streamed.source_sample_counts, loaded.source_sample_counts);
+        assert_eq!(streamed.fingerprint, loaded.fingerprint);
+        assert_eq!(cache.index.samples, source_index.samples);
+        assert!(cache.cache_written);
+        assert!(cache_mismatch.contains("field_map"));
+        assert_ne!(
+            loaded.fingerprint,
+            qwen_sft_streaming_fingerprint(
+                &paths,
+                Some(3),
+                &loaded.source_files,
+                &QwenSftFieldMap {
+                    system: Some("system".to_string()),
+                    ..QwenSftFieldMap::default()
+                },
+            )
+            .expect("default system fingerprint should compute")
+        );
+        assert_eq!(
+            raw_window
+                .examples
+                .iter()
+                .map(|example| example.system.as_str())
+                .collect::<Vec<_>>(),
+            vec!["keep system", "selected system", "keep extra"]
+        );
+        assert_eq!(
+            source_index
+                .samples
+                .iter()
+                .map(|sample| sample.index_in_file)
+                .collect::<Vec<_>>(),
+            vec![0, 2, 3]
+        );
+    }
+
+    #[test]
+    fn qwen_sft_filters_prompt_lengths_before_limit_and_streaming_index() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let jsonl = temp.path().join("samples.jsonl");
+        let cache_path = temp.path().join("cache").join("offset-index.json");
+        fs::write(
+            &jsonl,
+            r#"{"instruction":"a","response":"skip"}
+{"instruction":"first","input":"ok","response":"valid"}
+{"instruction":"this prompt is too long","response":"skip"}
+{"instruction":"second","response":"works"}
+{"instruction":"third","response":"later"}
+"#,
+        )
+        .expect("jsonl should write");
+        let paths = vec![jsonl.clone()];
+        let field_map = QwenSftFieldMap {
+            prompt_template: "Q:{instruction}\nA:".to_string(),
+            prompt_with_input_template: "Q:{instruction}\nI:{input}\nA:".to_string(),
+            min_prompt_chars: Some(11),
+            max_prompt_chars: Some(15),
+            ..QwenSftFieldMap::default()
+        };
+
+        let loaded = qwen_sft_examples_from_jsonl_paths_with_limit(&paths, Some(2), &field_map)
+            .expect("filtered examples should load");
+        let streamed = qwen_sft_streaming_source_summary(&paths, Some(2), &field_map)
+            .expect("filtered streaming summary should scan");
+        let source_index = qwen_sft_streaming_source_index(&paths, Some(2), &field_map)
+            .expect("filtered source index should build");
+        let raw_window = qwen_sft_examples_by_raw_indices(&source_index.samples, &field_map)
+            .expect("filtered raw window should read");
+        let cache = qwen_sft_streaming_source_index_with_cache(
+            &paths,
+            Some(2),
+            Some(&cache_path),
+            &field_map,
+        )
+        .expect("filtered cache should write");
+        let cache_mismatch = qwen_sft_streaming_source_index_with_cache(
+            &paths,
+            Some(2),
+            Some(&cache_path),
+            &QwenSftFieldMap::default(),
+        )
+        .expect_err("prompt filter drift should reject cache")
+        .to_string();
+
+        assert_eq!(
+            loaded
+                .examples
+                .iter()
+                .map(|example| (example.instruction.as_str(), example.input.as_str()))
+                .collect::<Vec<_>>(),
+            vec![("first", "ok"), ("second", "")]
+        );
+        assert_eq!(streamed.samples, loaded.examples.len());
+        assert_eq!(streamed.source_files, loaded.source_files);
+        assert_eq!(streamed.source_sample_counts, loaded.source_sample_counts);
+        assert_eq!(streamed.fingerprint, loaded.fingerprint);
+        assert_eq!(cache.index.samples, source_index.samples);
+        assert!(cache.cache_written);
+        assert!(cache_mismatch.contains("field_map"));
+        assert_eq!(
+            raw_window
+                .examples
+                .iter()
+                .map(|example| (example.instruction.as_str(), example.input.as_str()))
+                .collect::<Vec<_>>(),
+            vec![("first", "ok"), ("second", "")]
+        );
+        assert_eq!(
+            source_index
+                .samples
+                .iter()
+                .map(|sample| sample.index_in_file)
+                .collect::<Vec<_>>(),
+            vec![1, 3]
+        );
+    }
+
+    #[test]
+    fn qwen_sft_filters_sample_lengths_before_limit_and_streaming_index() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let jsonl = temp.path().join("samples.jsonl");
+        let cache_path = temp.path().join("cache").join("offset-index.json");
+        fs::write(
+            &jsonl,
+            r#"{"instruction":"a","response":"x"}
+{"instruction":"first","input":"ok","response":"valid"}
+{"instruction":"too long","response":"this response is too long"}
+{"instruction":"second","response":"works"}
+{"instruction":"tiny","response":"z"}
+"#,
+        )
+        .expect("jsonl should write");
+        let paths = vec![jsonl.clone()];
+        let field_map = QwenSftFieldMap {
+            prompt_template: "Q:{instruction}\nA:".to_string(),
+            prompt_with_input_template: "Q:{instruction}\nI:{input}\nA:".to_string(),
+            min_sample_chars: Some(16),
+            max_sample_chars: Some(22),
+            ..QwenSftFieldMap::default()
+        };
+
+        let loaded = qwen_sft_examples_from_jsonl_paths_with_limit(&paths, Some(2), &field_map)
+            .expect("filtered examples should load");
+        let streamed = qwen_sft_streaming_source_summary(&paths, Some(2), &field_map)
+            .expect("filtered streaming summary should scan");
+        let source_index = qwen_sft_streaming_source_index(&paths, Some(2), &field_map)
+            .expect("filtered source index should build");
+        let raw_window = qwen_sft_examples_by_raw_indices(&source_index.samples, &field_map)
+            .expect("filtered raw window should read");
+        let cache = qwen_sft_streaming_source_index_with_cache(
+            &paths,
+            Some(2),
+            Some(&cache_path),
+            &field_map,
+        )
+        .expect("filtered cache should write");
+        let cache_mismatch = qwen_sft_streaming_source_index_with_cache(
+            &paths,
+            Some(2),
+            Some(&cache_path),
+            &QwenSftFieldMap::default(),
+        )
+        .expect_err("sample filter drift should reject cache")
+        .to_string();
+
+        assert_eq!(
+            loaded
+                .examples
+                .iter()
+                .map(|example| (example.instruction.as_str(), example.response.as_str()))
+                .collect::<Vec<_>>(),
+            vec![("first", "valid"), ("second", "works")]
+        );
+        assert_eq!(streamed.samples, loaded.examples.len());
+        assert_eq!(streamed.source_files, loaded.source_files);
+        assert_eq!(streamed.source_sample_counts, loaded.source_sample_counts);
+        assert_eq!(streamed.fingerprint, loaded.fingerprint);
+        assert_eq!(cache.index.samples, source_index.samples);
+        assert!(cache.cache_written);
+        assert!(cache_mismatch.contains("field_map"));
+        assert_eq!(
+            raw_window
+                .examples
+                .iter()
+                .map(|example| (example.instruction.as_str(), example.response.as_str()))
+                .collect::<Vec<_>>(),
+            vec![("first", "valid"), ("second", "works")]
+        );
+        assert_eq!(
+            source_index
+                .samples
+                .iter()
+                .map(|sample| sample.index_in_file)
+                .collect::<Vec<_>>(),
+            vec![1, 3]
+        );
+    }
+
+    #[test]
+    fn qwen_sft_dedupes_samples_before_limit_and_streaming_index() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let jsonl = temp.path().join("samples.jsonl");
+        let cache_path = temp.path().join("cache").join("offset-index.json");
+        fs::write(
+            &jsonl,
+            r#"{"instruction":"first","response":"valid"}
+{"instruction":"first","response":"valid"}
+{"instruction":"second","response":"works"}
+{"instruction":"second","response":"works"}
+{"instruction":"third","response":"later"}
+"#,
+        )
+        .expect("jsonl should write");
+        let paths = vec![jsonl.clone()];
+        let field_map = QwenSftFieldMap {
+            dedupe_samples: true,
+            ..QwenSftFieldMap::default()
+        };
+
+        let loaded = qwen_sft_examples_from_jsonl_paths_with_limit(&paths, Some(2), &field_map)
+            .expect("deduped examples should load");
+        let streamed = qwen_sft_streaming_source_summary(&paths, Some(2), &field_map)
+            .expect("deduped streaming summary should scan");
+        let source_index = qwen_sft_streaming_source_index(&paths, Some(2), &field_map)
+            .expect("deduped source index should build");
+        let raw_window = qwen_sft_examples_by_raw_indices(&source_index.samples, &field_map)
+            .expect("deduped raw window should read");
+        let cache = qwen_sft_streaming_source_index_with_cache(
+            &paths,
+            Some(2),
+            Some(&cache_path),
+            &field_map,
+        )
+        .expect("deduped cache should write");
+        let cache_mismatch = qwen_sft_streaming_source_index_with_cache(
+            &paths,
+            Some(2),
+            Some(&cache_path),
+            &QwenSftFieldMap::default(),
+        )
+        .expect_err("dedupe drift should reject cache")
+        .to_string();
+
+        assert_eq!(
+            loaded
+                .examples
+                .iter()
+                .map(|example| example.instruction.as_str())
+                .collect::<Vec<_>>(),
+            vec!["first", "second"]
+        );
+        assert_eq!(streamed.samples, loaded.examples.len());
+        assert_eq!(streamed.source_files, loaded.source_files);
+        assert_eq!(streamed.source_sample_counts, loaded.source_sample_counts);
+        assert_eq!(streamed.fingerprint, loaded.fingerprint);
+        assert_eq!(cache.index.samples, source_index.samples);
+        assert!(cache.cache_written);
+        assert!(cache_mismatch.contains("field_map"));
+        assert_eq!(
+            raw_window
+                .examples
+                .iter()
+                .map(|example| example.instruction.as_str())
+                .collect::<Vec<_>>(),
+            vec!["first", "second"]
+        );
+        assert_eq!(
+            source_index
+                .samples
+                .iter()
+                .map(|sample| sample.index_in_file)
+                .collect::<Vec<_>>(),
+            vec![0, 2]
+        );
+    }
+
+    #[test]
+    fn qwen_sft_applies_source_weights_before_limit_and_streaming_index() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let first = temp.path().join("first.jsonl");
+        let second = temp.path().join("second.jsonl");
+        let cache_path = temp.path().join("cache").join("offset-index.json");
+        fs::write(
+            &first,
+            r#"{"instruction":"first","response":"alpha"}
+"#,
+        )
+        .expect("first jsonl should write");
+        fs::write(
+            &second,
+            r#"{"instruction":"second","response":"beta"}
+"#,
+        )
+        .expect("second jsonl should write");
+        let paths = vec![first.clone(), second.clone()];
+        let field_map = QwenSftFieldMap {
+            source_weights: vec![2, 1],
+            ..QwenSftFieldMap::default()
+        };
+
+        let loaded = qwen_sft_examples_from_jsonl_paths_with_limit(&paths, Some(3), &field_map)
+            .expect("weighted examples should load");
+        let streamed = qwen_sft_streaming_source_summary(&paths, Some(3), &field_map)
+            .expect("weighted streaming summary should scan");
+        let source_index = qwen_sft_streaming_source_index(&paths, Some(3), &field_map)
+            .expect("weighted source index should build");
+        let raw_window = qwen_sft_examples_by_raw_indices(&source_index.samples, &field_map)
+            .expect("weighted raw window should read");
+        let cache = qwen_sft_streaming_source_index_with_cache(
+            &paths,
+            Some(3),
+            Some(&cache_path),
+            &field_map,
+        )
+        .expect("weighted cache should write");
+        let unweighted_map = QwenSftFieldMap::default();
+        let cache_mismatch = qwen_sft_streaming_source_index_with_cache(
+            &paths,
+            Some(3),
+            Some(&cache_path),
+            &unweighted_map,
+        )
+        .expect_err("source weight drift should reject cache")
+        .to_string();
+
+        assert_eq!(
+            loaded
+                .examples
+                .iter()
+                .map(|example| example.instruction.as_str())
+                .collect::<Vec<_>>(),
+            vec!["first", "first", "second"]
+        );
+        assert_eq!(
+            loaded.source_sample_counts,
+            vec![
+                QwenSftSourceSampleCount {
+                    path: first.display().to_string(),
+                    samples: 2,
+                },
+                QwenSftSourceSampleCount {
+                    path: second.display().to_string(),
+                    samples: 1,
+                },
+            ]
+        );
+        assert_eq!(streamed.samples, loaded.examples.len());
+        assert_eq!(streamed.source_files, loaded.source_files);
+        assert_eq!(streamed.source_sample_counts, loaded.source_sample_counts);
+        assert_eq!(streamed.fingerprint, loaded.fingerprint);
+        assert_eq!(
+            raw_window
+                .examples
+                .iter()
+                .map(|example| example.instruction.as_str())
+                .collect::<Vec<_>>(),
+            vec!["first", "first", "second"]
+        );
+        assert_eq!(
+            source_index
+                .samples
+                .iter()
+                .map(|sample| sample.index_in_file)
+                .collect::<Vec<_>>(),
+            vec![0, 0, 0]
+        );
+        assert!(cache.cache_written);
+        assert!(cache_mismatch.contains("field_map"));
+        assert_ne!(
+            loaded.fingerprint,
+            qwen_sft_streaming_fingerprint(&paths, Some(3), &loaded.source_files, &unweighted_map)
+                .expect("unweighted fingerprint should compute")
+        );
+    }
+
+    #[test]
+    fn qwen_sft_applies_per_source_jsonl_field_maps_to_streaming_cache() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let first = temp.path().join("first.jsonl");
+        let second = temp.path().join("second.jsonl");
+        let cache_path = temp.path().join("cache").join("offset-index.json");
+        fs::write(
+            &first,
+            r#"{"instruction":"alpha prompt","input":"alpha context","response":"alpha answer"}
+"#,
+        )
+        .expect("first jsonl should write");
+        fs::write(
+            &second,
+            r#"{"question":"beta prompt","answer":"beta answer"}
+"#,
+        )
+        .expect("second jsonl should write");
+        let paths = vec![first.clone(), second.clone()];
+        let field_map = QwenSftFieldMap {
+            source_instruction_fields: vec!["instruction".to_string(), "question".to_string()],
+            source_input_fields: vec!["input".to_string(), String::new()],
+            source_response_fields: vec!["response".to_string(), "answer".to_string()],
+            ..QwenSftFieldMap::default()
+        };
+
+        let loaded = qwen_sft_examples_from_jsonl_paths_with_limit(&paths, Some(2), &field_map)
+            .expect("per-source JSONL examples should load");
+        let streamed = qwen_sft_streaming_source_summary(&paths, Some(2), &field_map)
+            .expect("per-source streaming summary should scan");
+        let source_index = qwen_sft_streaming_source_index(&paths, Some(2), &field_map)
+            .expect("per-source streaming index should build");
+        let raw_window = qwen_sft_examples_by_raw_indices(&source_index.samples, &field_map)
+            .expect("per-source raw window should read");
+        let cache = qwen_sft_streaming_source_index_with_cache(
+            &paths,
+            Some(2),
+            Some(&cache_path),
+            &field_map,
+        )
+        .expect("per-source cache should write");
+        let cached = qwen_sft_streaming_source_index_with_cache(
+            &paths,
+            Some(2),
+            Some(&cache_path),
+            &field_map,
+        )
+        .expect("per-source cache should hit");
+        let changed_map = QwenSftFieldMap {
+            source_instruction_fields: vec!["instruction".to_string(), "prompt".to_string()],
+            source_input_fields: vec!["input".to_string(), String::new()],
+            source_response_fields: vec!["response".to_string(), "answer".to_string()],
+            ..QwenSftFieldMap::default()
+        };
+        let cache_mismatch = qwen_sft_streaming_source_index_with_cache(
+            &paths,
+            Some(2),
+            Some(&cache_path),
+            &changed_map,
+        )
+        .expect_err("changed per-source field map should reject cache")
+        .to_string();
+
+        assert_eq!(
+            loaded.examples,
+            vec![
+                QwenSftExample {
+                    system: String::new(),
+                    instruction: "alpha prompt".to_string(),
+                    input: "alpha context".to_string(),
+                    response: "alpha answer".to_string(),
+                },
+                QwenSftExample {
+                    system: String::new(),
+                    instruction: "beta prompt".to_string(),
+                    input: String::new(),
+                    response: "beta answer".to_string(),
+                },
+            ]
+        );
+        assert_eq!(streamed.samples, loaded.examples.len());
+        assert_eq!(streamed.source_files, loaded.source_files);
+        assert_eq!(streamed.source_sample_counts, loaded.source_sample_counts);
+        assert_eq!(streamed.fingerprint, loaded.fingerprint);
+        assert_eq!(raw_window.examples, loaded.examples);
+        assert!(cache.cache_written);
+        assert!(cached.cache_hit);
+        assert_eq!(cached.index.samples, source_index.samples);
+        assert!(cache_mismatch.contains("field_map"));
+    }
+
+    #[test]
+    fn qwen_sft_applies_source_max_samples_before_weighting_and_streaming_index() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let first = temp.path().join("first.jsonl");
+        let second = temp.path().join("second.jsonl");
+        let cache_path = temp.path().join("cache").join("offset-index.json");
+        fs::write(
+            &first,
+            r#"{"instruction":"first-a","response":"alpha"}
+{"instruction":"first-b","response":"skip"}
+"#,
+        )
+        .expect("first jsonl should write");
+        fs::write(
+            &second,
+            r#"{"instruction":"second-a","response":"beta"}
+{"instruction":"second-b","response":"gamma"}
+{"instruction":"second-c","response":"skip"}
+"#,
+        )
+        .expect("second jsonl should write");
+        let paths = vec![first.clone(), second.clone()];
+        let field_map = QwenSftFieldMap {
+            source_weights: vec![2, 2],
+            source_max_samples: vec![1, 2],
+            ..QwenSftFieldMap::default()
+        };
+
+        let loaded = qwen_sft_examples_from_jsonl_paths_with_limit(&paths, Some(6), &field_map)
+            .expect("source-limited examples should load");
+        let streamed = qwen_sft_streaming_source_summary(&paths, Some(6), &field_map)
+            .expect("source-limited streaming summary should scan");
+        let source_index = qwen_sft_streaming_source_index(&paths, Some(6), &field_map)
+            .expect("source-limited source index should build");
+        let raw_window = qwen_sft_examples_by_raw_indices(&source_index.samples, &field_map)
+            .expect("source-limited raw window should read");
+        let cache = qwen_sft_streaming_source_index_with_cache(
+            &paths,
+            Some(6),
+            Some(&cache_path),
+            &field_map,
+        )
+        .expect("source-limited cache should write");
+        let cache_mismatch = qwen_sft_streaming_source_index_with_cache(
+            &paths,
+            Some(6),
+            Some(&cache_path),
+            &QwenSftFieldMap {
+                source_weights: vec![2, 2],
+                ..QwenSftFieldMap::default()
+            },
+        )
+        .expect_err("source max-samples drift should reject cache")
+        .to_string();
+
+        assert_eq!(
+            loaded
+                .examples
+                .iter()
+                .map(|example| example.instruction.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "first-a", "first-a", "second-a", "second-a", "second-b", "second-b"
+            ]
+        );
+        assert_eq!(
+            loaded.source_sample_counts,
+            vec![
+                QwenSftSourceSampleCount {
+                    path: first.display().to_string(),
+                    samples: 2,
+                },
+                QwenSftSourceSampleCount {
+                    path: second.display().to_string(),
+                    samples: 4,
+                },
+            ]
+        );
+        assert_eq!(streamed.samples, loaded.examples.len());
+        assert_eq!(streamed.source_files, loaded.source_files);
+        assert_eq!(streamed.source_sample_counts, loaded.source_sample_counts);
+        assert_eq!(streamed.fingerprint, loaded.fingerprint);
+        assert_eq!(cache.index.samples, source_index.samples);
+        assert!(cache.cache_written);
+        assert!(cache_mismatch.contains("field_map"));
+        assert_eq!(
+            raw_window
+                .examples
+                .iter()
+                .map(|example| example.instruction.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "first-a", "first-a", "second-a", "second-a", "second-b", "second-b"
+            ]
+        );
+        assert_eq!(
+            source_index
+                .samples
+                .iter()
+                .map(|sample| (sample.path.clone(), sample.index_in_file))
+                .collect::<Vec<_>>(),
+            vec![
+                (first.display().to_string(), 0),
+                (first.display().to_string(), 0),
+                (second.display().to_string(), 0),
+                (second.display().to_string(), 0),
+                (second.display().to_string(), 1),
+                (second.display().to_string(), 1),
+            ]
+        );
+    }
+
+    #[test]
+    fn qwen_sft_arrow_applies_source_limits_and_weights_before_global_limit() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let first = temp.path().join("first.arrow");
+        let second = temp.path().join("second.arrow");
+        write_test_sft_arrow(
+            &first,
+            &[
+                ("first-a", "", "alpha"),
+                ("first-b", "", "beta"),
+                ("first-c", "", "gamma"),
+            ],
+        );
+        write_test_sft_arrow(
+            &second,
+            &[
+                ("second-a", "", "delta"),
+                ("second-b", "", "epsilon"),
+                ("second-c", "", "zeta"),
+            ],
+        );
+        let paths = vec![first.clone(), second.clone()];
+        let field_map = QwenSftFieldMap {
+            response: "output".to_string(),
+            source_weights: vec![2, 1],
+            source_max_samples: vec![1, 2],
+            ..QwenSftFieldMap::default()
+        };
+
+        let loaded = qwen_sft_arrow_examples_from_paths_with_limit(&paths, Some(4), &field_map)
+            .expect("weighted Arrow examples should load");
+        let unweighted = qwen_sft_arrow_examples_from_paths_with_limit(
+            &paths,
+            Some(4),
+            &QwenSftFieldMap {
+                response: "output".to_string(),
+                ..QwenSftFieldMap::default()
+            },
+        )
+        .expect("unweighted Arrow examples should load");
+
+        assert_eq!(
+            loaded
+                .examples
+                .iter()
+                .map(|example| example.instruction.as_str())
+                .collect::<Vec<_>>(),
+            vec!["first-a", "first-a", "second-a", "second-b"]
+        );
+        assert_eq!(
+            loaded.source_files,
+            vec![first.display().to_string(), second.display().to_string()]
+        );
+        assert_eq!(
+            loaded.source_sample_counts,
+            vec![
+                QwenSftSourceSampleCount {
+                    path: first.display().to_string(),
+                    samples: 2,
+                },
+                QwenSftSourceSampleCount {
+                    path: second.display().to_string(),
+                    samples: 2,
+                },
+            ]
+        );
+        assert_ne!(loaded.fingerprint, unweighted.fingerprint);
+    }
+
+    #[test]
+    fn qwen_sft_arrow_index_cache_writes_reuses_and_rejects_drift() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let arrow = temp.path().join("train.arrow");
+        let cache_path = temp.path().join("cache").join("arrow-row-index.json");
+        write_test_sft_arrow(
+            &arrow,
+            &[
+                ("first", "", "alpha"),
+                ("second", "", "beta"),
+                ("third", "", "gamma"),
+            ],
+        );
+        let paths = vec![arrow.clone()];
+        let field_map = QwenSftFieldMap {
+            response: "output".to_string(),
+            ..QwenSftFieldMap::default()
+        };
+
+        let first =
+            qwen_sft_arrow_source_index_with_cache(&paths, Some(2), Some(&cache_path), &field_map)
+                .expect("first Arrow cache load should build row index");
+        assert!(!first.cache_hit);
+        assert!(first.cache_written);
+        assert_eq!(first.index.samples.len(), 2);
+        assert_eq!(
+            first
+                .index
+                .samples
+                .iter()
+                .map(|sample| sample.row_index)
+                .collect::<Vec<_>>(),
+            vec![0, 1]
+        );
+
+        let second =
+            qwen_sft_arrow_source_index_with_cache(&paths, Some(2), Some(&cache_path), &field_map)
+                .expect("second Arrow cache load should hit");
+        assert!(second.cache_hit);
+        assert!(!second.cache_written);
+        assert_eq!(second.index.samples, first.index.samples);
+
+        let max_samples_mismatch =
+            qwen_sft_arrow_source_index_with_cache(&paths, Some(3), Some(&cache_path), &field_map)
+                .expect_err("changed max_samples should reject Arrow cache")
+                .to_string();
+        assert!(max_samples_mismatch.contains("max_samples"));
+
+        let field_mismatch = qwen_sft_arrow_source_index_with_cache(
+            &paths,
+            Some(2),
+            Some(&cache_path),
+            &QwenSftFieldMap::default(),
+        )
+        .expect_err("changed field map should reject Arrow cache")
+        .to_string();
+        assert!(field_mismatch.contains("field_map"));
+
+        write_test_sft_arrow(
+            &arrow,
+            &[
+                ("first", "", "alpha"),
+                ("second", "", "beta"),
+                ("third", "", "gamma"),
+                ("fourth", "", "delta"),
+            ],
+        );
+        let source_mismatch =
+            qwen_sft_arrow_source_index_with_cache(&paths, Some(2), Some(&cache_path), &field_map)
+                .expect_err("changed Arrow source metadata should reject cache")
+                .to_string();
+        assert!(source_mismatch.contains("source_files"));
+    }
+
+    #[test]
+    fn qwen_sft_arrow_streaming_policy_requires_cache_or_bounds() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let arrow = temp.path().join("train.arrow");
+        let cache_path = temp.path().join("cache").join("arrow-row-index.json");
+        write_test_sft_arrow(
+            &arrow,
+            &[
+                ("first", "", "alpha"),
+                ("second", "", "beta"),
+                ("third", "", "gamma"),
+            ],
+        );
+        let mut data_config: RuntimeDataConfig = toml::from_str(
+            r#"
+kind = "instruction_arrow"
+paths = ["placeholder.arrow"]
+response_field = "output"
+"#,
+        )
+        .expect("test data config should parse");
+        data_config.paths = vec![arrow];
+
+        qwen_sft_arrow_validate_config_scope(&data_config, "test")
+            .expect("test Arrow config scope should validate");
+        let unbounded = qwen_sft_arrow_require_cache_or_bounds(&data_config, None, "test")
+            .expect_err("unbounded Arrow streaming config should require cache or bounds")
+            .to_string();
+        assert!(unbounded.contains("requires data.max_samples, data.source_max_samples"));
+
+        data_config.max_samples = Some(2);
+        qwen_sft_arrow_require_cache_or_bounds(&data_config, None, "test")
+            .expect("global max_samples should bound Arrow streaming");
+        data_config.max_samples = None;
+
+        data_config.source_max_samples = vec![2];
+        qwen_sft_arrow_require_cache_or_bounds(&data_config, None, "test")
+            .expect("source_max_samples should bound Arrow streaming");
+        data_config.source_max_samples.clear();
+
+        qwen_sft_arrow_require_cache_or_bounds(&data_config, Some(&cache_path), "test")
+            .expect("index cache should allow unbounded Arrow streaming");
+    }
+
+    #[test]
+    fn qwen_sft_arrow_raw_index_read_uses_original_row_indices_after_filters() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let arrow = temp.path().join("train.arrow");
+        write_test_sft_arrow(
+            &arrow,
+            &[
+                ("drop", "", "skip"),
+                ("keep-one", "", "alpha"),
+                ("keep-two", "", "beta"),
+            ],
+        );
+        let field_map = QwenSftFieldMap {
+            response: "output".to_string(),
+            response_contains_any: vec!["alpha".to_string(), "beta".to_string()],
+            ..QwenSftFieldMap::default()
+        };
+        let scan = qwen_sft_arrow_source_scan(&[arrow.clone()], Some(2), &field_map)
+            .expect("filtered Arrow source should scan");
+
+        assert_eq!(
+            scan.index
+                .samples
+                .iter()
+                .map(|sample| sample.row_index)
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        let raw_window = qwen_sft_arrow_examples_by_raw_indices(&scan.index.samples, &field_map)
+            .expect("filtered original rows should read");
+        assert_eq!(
+            raw_window
+                .examples
+                .iter()
+                .map(|example| example.instruction.as_str())
+                .collect::<Vec<_>>(),
+            vec!["keep-one", "keep-two"]
+        );
+        assert_eq!(raw_window.raw_samples_read, 2);
+    }
+
+    #[test]
+    fn qwen_sft_arrow_source_scan_streaming_fingerprint_matches_index_readback() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let arrow = temp.path().join("train.arrow");
+        write_test_sft_arrow(
+            &arrow,
+            &[
+                ("drop", "", "skip"),
+                ("keep-one", "", "alpha"),
+                ("keep-two", "", "beta"),
+                ("keep-three", "", "gamma"),
+            ],
+        );
+        let field_map = QwenSftFieldMap {
+            response: "output".to_string(),
+            response_contains_any: vec!["alpha".to_string(), "beta".to_string()],
+            ..QwenSftFieldMap::default()
+        };
+
+        let scan = qwen_sft_arrow_source_scan(&[arrow], Some(2), &field_map)
+            .expect("Arrow source scan should build row index");
+        let readback_fingerprint = qwen_sft_arrow_fingerprint_from_index(
+            &scan.index,
+            &scan.summary.source_files,
+            &field_map,
+        )
+        .expect("explicit index readback should hash");
+
+        assert_eq!(
+            scan.index
+                .samples
+                .iter()
+                .map(|sample| sample.row_index)
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        assert_eq!(scan.summary.fingerprint, readback_fingerprint);
+    }
+
+    #[test]
+    fn qwen_sft_arrow_source_scan_streaming_fingerprint_accounts_for_weights() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let arrow = temp.path().join("train.arrow");
+        write_test_sft_arrow(&arrow, &[("first", "", "alpha"), ("second", "", "beta")]);
+        let field_map = QwenSftFieldMap {
+            response: "output".to_string(),
+            source_weights: vec![2],
+            ..QwenSftFieldMap::default()
+        };
+
+        let scan = qwen_sft_arrow_source_scan(&[arrow], Some(4), &field_map)
+            .expect("weighted Arrow source scan should build row index");
+        let raw_window = qwen_sft_arrow_examples_by_raw_indices(&scan.index.samples, &field_map)
+            .expect("weighted row index should read back");
+        let expected_fingerprint = qwen_sft_dataset_fingerprint(
+            &scan.summary.source_files,
+            &raw_window.examples,
+            &field_map,
+        );
+
+        assert_eq!(
+            scan.index
+                .samples
+                .iter()
+                .map(|sample| sample.row_index)
+                .collect::<Vec<_>>(),
+            vec![0, 0, 1, 1]
+        );
+        assert_eq!(scan.summary.source_sample_counts[0].samples, 4);
+        assert_eq!(scan.summary.fingerprint, expected_fingerprint);
+    }
+
+    #[test]
+    fn qwen_sft_arrow_source_scan_streaming_fingerprint_omits_unused_paths() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let first = temp.path().join("first.arrow");
+        let second = temp.path().join("second.arrow");
+        write_test_sft_arrow(&first, &[("first", "", "alpha")]);
+        write_test_sft_arrow(&second, &[("second", "", "beta")]);
+        let field_map = QwenSftFieldMap {
+            response: "output".to_string(),
+            ..QwenSftFieldMap::default()
+        };
+
+        let scan =
+            qwen_sft_arrow_source_scan(&[first.clone(), second.clone()], Some(1), &field_map)
+                .expect("limited Arrow source scan should stop after first source");
+        let materialized = qwen_sft_arrow_examples_from_ipc(&first, Some(1), &field_map)
+            .expect("first Arrow source should materialize");
+
+        assert_eq!(scan.summary.source_files, vec![first.display().to_string()]);
+        assert_eq!(scan.summary.fingerprint, materialized.fingerprint);
+    }
+
+    #[test]
+    fn qwen_sft_arrow_reads_question_answer_without_input_column() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let arrow = temp.path().join("qa.arrow");
+        write_test_qa_arrow(
+            &arrow,
+            &[
+                ("What is Rust?", "A systems programming language."),
+                ("What is CUDA?", "A GPU programming platform."),
+            ],
+        );
+        let field_map = QwenSftFieldMap {
+            input: String::new(),
+            ..QwenSftFieldMap::default()
+        };
+
+        let loaded = qwen_sft_arrow_examples_from_ipc(&arrow, Some(2), &field_map)
+            .expect("question/answer Arrow should materialize");
+        let scan = qwen_sft_arrow_source_scan(&[arrow.clone()], Some(2), &field_map)
+            .expect("question/answer Arrow source should scan");
+        let raw_window = qwen_sft_arrow_examples_by_raw_indices(&scan.index.samples, &field_map)
+            .expect("question/answer raw rows should read back");
+
+        assert_eq!(
+            loaded
+                .examples
+                .iter()
+                .map(|example| (
+                    example.instruction.as_str(),
+                    example.input.as_str(),
+                    example.response.as_str()
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                ("What is Rust?", "", "A systems programming language."),
+                ("What is CUDA?", "", "A GPU programming platform."),
+            ]
+        );
+        assert_eq!(loaded.examples, raw_window.examples);
+        assert_eq!(
+            scan.index
+                .samples
+                .iter()
+                .map(|sample| sample.row_index)
+                .collect::<Vec<_>>(),
+            vec![0, 1]
+        );
+        assert_eq!(scan.summary.fingerprint, loaded.fingerprint);
+    }
+
+    #[test]
+    fn qwen_sft_arrow_applies_per_source_field_maps_to_cache_and_readback() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let first = temp.path().join("first.arrow");
+        let second = temp.path().join("second.arrow");
+        let cache_path = temp.path().join("cache").join("arrow-row-index.json");
+        write_test_sft_arrow(&first, &[("alpha prompt", "alpha context", "alpha answer")]);
+        write_test_custom_sft_arrow(
+            &second,
+            ("prompt", "context", "completion"),
+            &[("beta prompt", "", "beta answer")],
+        );
+        let paths = vec![first.clone(), second.clone()];
+        let field_map = QwenSftFieldMap {
+            response: "output".to_string(),
+            source_instruction_fields: vec!["instruction".to_string(), "prompt".to_string()],
+            source_input_fields: vec!["input".to_string(), "context".to_string()],
+            source_response_fields: vec!["output".to_string(), "completion".to_string()],
+            ..QwenSftFieldMap::default()
+        };
+
+        let loaded = qwen_sft_arrow_examples_from_paths_with_limit(&paths, Some(2), &field_map)
+            .expect("per-source Arrow examples should load");
+        let scan = qwen_sft_arrow_source_scan(&paths, Some(2), &field_map)
+            .expect("per-source Arrow scan should build");
+        let raw_window = qwen_sft_arrow_examples_by_raw_indices(&scan.index.samples, &field_map)
+            .expect("per-source Arrow raw rows should read back");
+        let cached =
+            qwen_sft_arrow_source_index_with_cache(&paths, Some(2), Some(&cache_path), &field_map)
+                .expect("per-source Arrow cache should write");
+        let cache_hit =
+            qwen_sft_arrow_source_index_with_cache(&paths, Some(2), Some(&cache_path), &field_map)
+                .expect("per-source Arrow cache should hit");
+        let changed_map = QwenSftFieldMap {
+            response: "output".to_string(),
+            source_instruction_fields: vec!["instruction".to_string(), "question".to_string()],
+            source_input_fields: vec!["input".to_string(), "context".to_string()],
+            source_response_fields: vec!["output".to_string(), "completion".to_string()],
+            ..QwenSftFieldMap::default()
+        };
+        let cache_mismatch = qwen_sft_arrow_source_index_with_cache(
+            &paths,
+            Some(2),
+            Some(&cache_path),
+            &changed_map,
+        )
+        .expect_err("changed per-source Arrow field map should reject cache")
+        .to_string();
+
+        assert_eq!(
+            loaded
+                .examples
+                .iter()
+                .map(|example| (
+                    example.instruction.as_str(),
+                    example.input.as_str(),
+                    example.response.as_str()
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                ("alpha prompt", "alpha context", "alpha answer"),
+                ("beta prompt", "", "beta answer"),
+            ]
+        );
+        assert_eq!(raw_window.examples, loaded.examples);
+        assert_eq!(scan.summary.fingerprint, loaded.fingerprint);
+        assert!(cached.cache_written);
+        assert!(cache_hit.cache_hit);
+        assert_eq!(cache_hit.index.samples, scan.index.samples);
+        assert!(cache_mismatch.contains("field_map"));
+    }
+
+    #[test]
+    fn qwen_sft_streaming_window_uses_train_split_sample_count() {
+        let (train_samples, eval_samples) =
+            qwen_sft_train_eval_sample_counts(4, 0.75).expect("split should compute");
+        let world_size = 2usize;
+        let local_batch_size = 1usize;
+        let global_batch_size = local_batch_size * world_size;
+        let train_steps = 1usize;
+        let data_cursor_start = 2usize;
+        let data_cursor_end = data_cursor_start + train_steps * global_batch_size;
+        let (epoch_start, offset_start) =
+            qwen_data_epoch_and_offset(data_cursor_start, train_samples)
+                .expect("start cursor should map");
+        let (epoch_next, offset_next) = qwen_data_epoch_and_offset(data_cursor_end, train_samples)
+            .expect("next cursor should map");
+
+        assert_eq!(train_samples, 3);
+        assert_eq!(eval_samples, 1);
+        assert_eq!(data_cursor_end, 4);
+        assert_eq!((epoch_start, offset_start), (0, 2));
+        assert_eq!((epoch_next, offset_next), (1, 1));
+    }
+
+    #[test]
+    fn qwen_sft_streaming_cursor_window_covers_next_batch_overlap() {
+        let cursors =
+            qwen_sft_streaming_cursor_window(2, 3, 2, 3).expect("cursor window should build");
+        let compact = cursors
+            .iter()
+            .map(|entry| (entry.cursor, entry.epoch, entry.sample_offset))
+            .collect::<Vec<_>>();
+
+        assert_eq!(compact, vec![(2, 0, 2), (3, 1, 0), (4, 1, 1), (5, 1, 2)]);
+    }
+
+    #[test]
+    fn qwen_sft_streaming_raw_index_reads_only_cursor_window() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let jsonl = temp.path().join("train.jsonl");
+        fs::write(
+            &jsonl,
+            r#"{"instruction":"zero","response":"zero"}
+{"instruction":"one","response":"one"}
+{"instruction":"two","response":"two"}
+{"instruction":"three","response":"three"}
+"#,
+        )
+        .expect("jsonl should write");
+        let paths = vec![jsonl.clone()];
+        let source_index =
+            qwen_sft_streaming_source_index(&paths, None, &QwenSftFieldMap::default())
+                .expect("source index should build");
+        let (train_samples, _) =
+            qwen_sft_train_eval_sample_counts(source_index.samples.len(), 0.75)
+                .expect("split should compute");
+        let mut train_indices = source_index.samples;
+        let mut rng = StdRng::seed_from_u64(777);
+        train_indices.shuffle(&mut rng);
+        train_indices.truncate(train_samples);
+        let raw_indices = (0..4)
+            .map(|relative| {
+                let cursor = 2 + relative;
+                let epoch = cursor / train_indices.len();
+                let offset = cursor % train_indices.len();
+                let index = qwen_epoch_permutation_index(train_indices.len(), 777, epoch, offset);
+                train_indices[index].clone()
+            })
+            .collect::<Vec<_>>();
+        let raw_window =
+            qwen_sft_examples_by_raw_indices(&raw_indices, &QwenSftFieldMap::default())
+                .expect("raw examples should read");
+
+        assert_eq!(raw_window.examples.len(), 4);
+        assert_eq!(raw_window.raw_samples_read, 3);
+        assert_eq!(
+            raw_window
+                .examples
+                .iter()
+                .map(|example| example.instruction.as_str())
+                .collect::<Vec<_>>(),
+            vec!["three", "three", "two", "one"]
+        );
+        assert_eq!(
+            raw_indices
+                .iter()
+                .map(|index| index.index_in_file)
+                .collect::<Vec<_>>(),
+            vec![3, 3, 2, 1]
+        );
+        assert_eq!(
+            raw_indices
+                .iter()
+                .map(|index| index.byte_offset)
+                .collect::<Vec<_>>(),
+            vec![119, 119, 80, 41]
+        );
+        assert_eq!(
+            raw_indices
+                .iter()
+                .map(|index| index.path.clone())
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([jsonl.display().to_string()])
+        );
+    }
+
+    #[test]
+    fn qwen_sft_streaming_source_index_parses_records_before_indexing_offsets() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let jsonl = temp.path().join("train.jsonl");
+        fs::write(
+            &jsonl,
+            r#"{"instruction":"zero","response":"zero"}
+not-json
+{"instruction":"two","response":"two"}
+"#,
+        )
+        .expect("jsonl should write");
+        let paths = vec![jsonl.clone()];
+        let error = match qwen_sft_streaming_source_index(&paths, None, &QwenSftFieldMap::default())
+        {
+            Ok(_) => panic!("malformed JSONL row should fail while building the offset index"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("failed to parse SFT JSONL record"));
+    }
+
+    #[test]
+    fn qwen_sft_skip_invalid_records_keeps_valid_rows_across_paths() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let jsonl = temp.path().join("train.jsonl");
+        let cache_path = temp.path().join("cache").join("offset-index.json");
+        fs::write(
+            &jsonl,
+            r#"{"instruction":"zero","response":"zero"}
+not-json
+{"instruction":"missing-response"}
+{"instruction":"three","response":"three"}
+{"instruction":"four","response":"four"}
+"#,
+        )
+        .expect("jsonl should write");
+        let paths = vec![jsonl.clone()];
+        let strict_error = match qwen_sft_examples_from_jsonl_paths_with_limit(
+            &paths,
+            None,
+            &QwenSftFieldMap::default(),
+        ) {
+            Ok(_) => panic!("strict materialized read should reject invalid rows"),
+            Err(error) => error.to_string(),
+        };
+        assert!(strict_error.contains("failed to parse SFT JSONL record"));
+
+        let skip_map = QwenSftFieldMap {
+            skip_invalid_records: true,
+            ..QwenSftFieldMap::default()
+        };
+        let loaded = qwen_sft_examples_from_jsonl_paths_with_limit(&paths, Some(2), &skip_map)
+            .expect("materialized read should skip invalid rows");
+        let streamed = qwen_sft_streaming_source_summary(&paths, Some(2), &skip_map)
+            .expect("streaming summary should skip invalid rows");
+        let source_index = qwen_sft_streaming_source_index(&paths, Some(2), &skip_map)
+            .expect("source index should skip invalid rows");
+        let raw_window = qwen_sft_examples_by_raw_indices(&source_index.samples, &skip_map)
+            .expect("raw indexed window should read valid rows");
+        let cache = qwen_sft_streaming_source_index_with_cache(
+            &paths,
+            Some(2),
+            Some(&cache_path),
+            &skip_map,
+        )
+        .expect("skip-invalid cache should write");
+        let default_cache_mismatch = qwen_sft_streaming_source_index_with_cache(
+            &paths,
+            Some(2),
+            Some(&cache_path),
+            &QwenSftFieldMap::default(),
+        )
+        .expect_err("cache should reject skip-invalid policy drift")
+        .to_string();
+        let default_fingerprint = qwen_sft_dataset_fingerprint(
+            &loaded.source_files,
+            &loaded.examples,
+            &QwenSftFieldMap::default(),
+        );
+
+        assert_eq!(
+            loaded
+                .examples
+                .iter()
+                .map(|example| example.instruction.as_str())
+                .collect::<Vec<_>>(),
+            vec!["zero", "three"]
+        );
+        assert_eq!(streamed.samples, 2);
+        assert_eq!(streamed.fingerprint, loaded.fingerprint);
+        assert_eq!(source_index.samples.len(), 2);
+        assert_eq!(
+            source_index
+                .samples
+                .iter()
+                .map(|sample| sample.index_in_file)
+                .collect::<Vec<_>>(),
+            vec![0, 3]
+        );
+        assert_eq!(
+            raw_window
+                .examples
+                .iter()
+                .map(|example| example.response.as_str())
+                .collect::<Vec<_>>(),
+            vec!["zero", "three"]
+        );
+        assert!(cache.cache_written);
+        assert!(default_cache_mismatch.contains("field_map"));
+        assert_ne!(loaded.fingerprint, default_fingerprint);
+    }
+
+    #[test]
+    fn qwen_sft_streaming_source_index_cache_writes_and_reuses_offsets() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let jsonl = temp.path().join("train.jsonl");
+        let cache_path = temp.path().join("cache").join("offset-index.json");
+        fs::write(
+            &jsonl,
+            r#"{"instruction":"zero","response":"zero"}
+{"instruction":"one","response":"one"}
+{"instruction":"two","response":"two"}
+"#,
+        )
+        .expect("jsonl should write");
+        let paths = vec![jsonl.clone()];
+
+        let first = qwen_sft_streaming_source_index_with_cache(
+            &paths,
+            Some(2),
+            Some(&cache_path),
+            &QwenSftFieldMap::default(),
+        )
+        .expect("first cache load should build index");
+        assert!(!first.cache_hit);
+        assert!(first.cache_written);
+        assert_eq!(first.index.samples.len(), 2);
+        assert!(cache_path.exists());
+
+        let second = qwen_sft_streaming_source_index_with_cache(
+            &paths,
+            Some(2),
+            Some(&cache_path),
+            &QwenSftFieldMap::default(),
+        )
+        .expect("second cache load should hit cache");
+        assert!(second.cache_hit);
+        assert!(!second.cache_written);
+        assert_eq!(second.index.samples, first.index.samples);
+
+        let mismatch = match qwen_sft_streaming_source_index_with_cache(
+            &paths,
+            Some(3),
+            Some(&cache_path),
+            &QwenSftFieldMap::default(),
+        ) {
+            Ok(_) => panic!("mismatched max_samples should reject cache"),
+            Err(error) => error.to_string(),
+        };
+        assert!(mismatch.contains("max_samples"));
+
+        let min_response_mismatch_map = QwenSftFieldMap {
+            min_response_chars: 2,
+            ..QwenSftFieldMap::default()
+        };
+        let min_response_mismatch = match qwen_sft_streaming_source_index_with_cache(
+            &paths,
+            Some(2),
+            Some(&cache_path),
+            &min_response_mismatch_map,
+        ) {
+            Ok(_) => panic!("mismatched min_response_chars should reject cache"),
+            Err(error) => error.to_string(),
+        };
+        assert!(min_response_mismatch.contains("field_map"));
+
+        fs::write(
+            &jsonl,
+            r#"{"instruction":"zero","response":"zero"}
+{"instruction":"one","response":"one"}
+{"instruction":"two","response":"two"}
+{"instruction":"three","response":"three"}
+"#,
+        )
+        .expect("jsonl rewrite should update source metadata");
+        let source_metadata_mismatch = match qwen_sft_streaming_source_index_with_cache(
+            &paths,
+            Some(2),
+            Some(&cache_path),
+            &QwenSftFieldMap::default(),
+        ) {
+            Ok(_) => panic!("changed source file metadata should reject cache"),
+            Err(error) => error.to_string(),
+        };
+        assert!(source_metadata_mismatch.contains("source_files"));
+    }
+
+    #[test]
+    fn qwen_sft_external_metadata_participates_in_fingerprint_and_cache() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let jsonl = temp.path().join("train.jsonl");
+        let metadata_path = temp.path().join("arrow-export.json");
+        let cache_path = temp.path().join("cache").join("offset-index.json");
+        fs::write(
+            &jsonl,
+            r#"{"instruction":"zero","response":"zero"}
+{"instruction":"one","response":"one"}
+"#,
+        )
+        .expect("jsonl should write");
+        fs::write(
+            &metadata_path,
+            r#"{"source_arrow":"/datasets/source.arrow","exported_rows":2}"#,
+        )
+        .expect("metadata should write");
+        let paths = vec![jsonl.clone()];
+        let metadata = qwen_sft_external_metadata_from_paths(std::slice::from_ref(&metadata_path))
+            .expect("metadata should load");
+        let field_map = QwenSftFieldMap {
+            external_metadata: metadata.clone(),
+            ..QwenSftFieldMap::default()
+        };
+        let no_metadata_map = QwenSftFieldMap::default();
+        let loaded = qwen_sft_examples_from_jsonl_paths_with_limit(&paths, None, &field_map)
+            .expect("examples should load");
+        let without_metadata =
+            qwen_sft_examples_from_jsonl_paths_with_limit(&paths, None, &no_metadata_map)
+                .expect("examples should load without metadata");
+
+        assert_ne!(loaded.fingerprint, without_metadata.fingerprint);
+
+        let first =
+            qwen_sft_streaming_source_index_with_cache(&paths, None, Some(&cache_path), &field_map)
+                .expect("first cache load should build index");
+        assert!(first.cache_written);
+
+        let cache_mismatch = match qwen_sft_streaming_source_index_with_cache(
+            &paths,
+            None,
+            Some(&cache_path),
+            &no_metadata_map,
+        ) {
+            Ok(_) => panic!("missing external metadata should reject cache"),
+            Err(error) => error.to_string(),
+        };
+        assert!(cache_mismatch.contains("field_map"));
+
+        fs::write(
+            &metadata_path,
+            r#"{"source_arrow":"/datasets/changed.arrow","exported_rows":2}"#,
+        )
+        .expect("metadata rewrite should update provenance");
+        let changed_metadata =
+            qwen_sft_external_metadata_from_paths(std::slice::from_ref(&metadata_path))
+                .expect("changed metadata should load");
+        let changed_map = QwenSftFieldMap {
+            external_metadata: changed_metadata,
+            ..QwenSftFieldMap::default()
+        };
+        let changed = qwen_sft_examples_from_jsonl_paths_with_limit(&paths, None, &changed_map)
+            .expect("examples should load with changed metadata");
+
+        assert_ne!(loaded.fingerprint, changed.fingerprint);
+    }
+
+    #[test]
+    fn qwen_sft_rank_index_cache_path_keeps_extension() {
+        let path = PathBuf::from("/tmp/rustrain/cache/offset-index.json");
+        assert_eq!(
+            qwen_sft_rank_index_cache_path(&path, 1),
+            PathBuf::from("/tmp/rustrain/cache/offset-index.rank-1.json")
+        );
+
+        let no_extension = PathBuf::from("/tmp/rustrain/cache/offset-index");
+        assert_eq!(
+            qwen_sft_rank_index_cache_path(&no_extension, 2),
+            PathBuf::from("/tmp/rustrain/cache/offset-index.rank-2")
+        );
+    }
+}
