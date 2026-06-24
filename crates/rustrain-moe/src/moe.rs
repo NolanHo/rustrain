@@ -250,16 +250,6 @@ impl Expert {
         hidden.dot(&self.down)
     }
 }
-
-pub fn moe_smoke() -> usize {
-    let router = Array2::ones((2, 2));
-    let expert = (Array2::eye(2), Array2::eye(2));
-    let moe = TinyMoe::new(router, vec![expert.clone(), expert], 1);
-    let input = Array2::ones((1, 2));
-    let output = moe.forward(&input);
-    output.stats.activated_params + output.hidden.nrows()
-}
-
 pub fn deepseek_moe_smoke() -> DeepSeekMoeStats {
     let router = Array2::ones((2, 2));
     let shared = vec![(Array2::eye(2), Array2::eye(2))];
@@ -279,43 +269,6 @@ pub fn deepseek_moe_smoke() -> DeepSeekMoeStats {
     debug_assert_eq!(output.hidden.nrows(), 2);
     output.stats
 }
-
-pub fn moe_smoke_summary() -> MoeSmokeSummary {
-    let tiny_router = Array2::ones((2, 2));
-    let tiny_expert = (Array2::eye(2), Array2::eye(2));
-    let tiny_moe = TinyMoe::new(tiny_router, vec![tiny_expert.clone(), tiny_expert], 1);
-    let tiny_input = Array2::ones((1, 2));
-    let tiny_output = tiny_moe.forward(&tiny_input);
-
-    let deepseek_router = Array2::ones((2, 2));
-    let shared = vec![(Array2::eye(2), Array2::eye(2))];
-    let routed = vec![
-        (Array2::eye(2), Array2::eye(2)),
-        (
-            Array2::from_diag(&Array1::from_vec(vec![0.5, 0.5])),
-            Array2::eye(2),
-        ),
-    ];
-    let deepseek_moe = DeepSeekMoe::new(vec![
-        (shared.clone(), deepseek_router.clone(), routed.clone(), 1),
-        (shared, deepseek_router, routed, 1),
-    ]);
-    let deepseek_input = Array2::ones((2, 2));
-    let deepseek_output = deepseek_moe.forward(&deepseek_input);
-
-    MoeSmokeSummary {
-        tiny_hidden_shape: [tiny_output.hidden.nrows(), tiny_output.hidden.ncols()],
-        tiny_hidden_sum: tiny_output.hidden.sum(),
-        tiny: tiny_output.stats,
-        deepseek_hidden_shape: [
-            deepseek_output.hidden.nrows(),
-            deepseek_output.hidden.ncols(),
-        ],
-        deepseek_hidden_sum: deepseek_output.hidden.sum(),
-        deepseek: deepseek_output.stats,
-    }
-}
-
 fn top_k_indices(scores: &[f32], top_k: usize) -> Vec<usize> {
     let mut indices = (0..scores.len()).collect::<Vec<_>>();
     indices.sort_by(|left, right| {

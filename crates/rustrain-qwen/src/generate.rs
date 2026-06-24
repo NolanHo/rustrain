@@ -39,7 +39,6 @@ use rustrain_nccl::nccl_smoke;
 
 use crate::lora::*;
 use crate::model::*;
-use crate::parity::*;
 use crate::rank_smoke::*;
 use crate::session::*;
 use crate::sft::*;

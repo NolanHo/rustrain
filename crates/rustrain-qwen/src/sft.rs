@@ -40,7 +40,6 @@ use rustrain_nccl::nccl_smoke;
 use crate::generate::*;
 use crate::lora::*;
 use crate::model::*;
-use crate::parity::*;
 use crate::rank_smoke::*;
 use crate::session::*;
 

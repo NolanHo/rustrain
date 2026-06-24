@@ -11,16 +11,6 @@ use serde::{Deserialize, Serialize};
 use tch::{Device, Kind, Tensor};
 
 use rustrain_nccl::nccl_smoke;
-
-#[derive(Debug, Serialize)]
-struct ExpertParallelSmokeSummary {
-    world_size: usize,
-    expert_count: usize,
-    output_max_delta: f64,
-    expert_load: Vec<usize>,
-    rank_token_counts: Vec<usize>,
-}
-
 #[derive(Debug, Serialize, Deserialize)]
 struct ExpertParallelRankSummary {
     rank: usize,
@@ -654,53 +644,6 @@ struct ExpertParallelTchMoeCheckpointRead {
     expert_down: Tensor,
     state: ExpertParallelTchMoeAdamState,
 }
-
-pub fn run_expert_parallel_smoke(world_size: usize) -> Result<()> {
-    if world_size != 2 {
-        bail!("M17 EP smoke currently expects world_size = 2");
-    }
-
-    let tokens = ep_tokens();
-    let router = ep_router();
-    let expert_scales = ep_expert_scales();
-
-    let assignments = route_top1(&tokens, &router);
-    let reference = expert_outputs(&tokens, &assignments, &expert_scales);
-    let mut expert_load = vec![0usize; expert_scales.len()];
-    let mut rank_buckets = vec![Vec::<usize>::new(); world_size];
-    for (token_index, expert_index) in assignments.iter().copied().enumerate() {
-        expert_load[expert_index] += 1;
-        rank_buckets[expert_index / (expert_scales.len() / world_size)].push(token_index);
-    }
-
-    let mut gathered = Array2::<f64>::zeros(tokens.dim());
-    for bucket in &rank_buckets {
-        for &token_index in bucket {
-            let expert_index = assignments[token_index];
-            for hidden_index in 0..tokens.ncols() {
-                gathered[[token_index, hidden_index]] =
-                    tokens[[token_index, hidden_index]] * expert_scales[expert_index][hidden_index];
-            }
-        }
-    }
-
-    let output_max_delta = max_abs_diff(&gathered, &reference);
-    if output_max_delta > 1e-12 {
-        bail!("EP=2 all-to-all parity failed: output_max_delta={output_max_delta}");
-    }
-
-    let summary = ExpertParallelSmokeSummary {
-        world_size,
-        expert_count: expert_scales.len(),
-        output_max_delta,
-        expert_load,
-        rank_token_counts: rank_buckets.iter().map(Vec::len).collect(),
-    };
-    println!("{}", serde_json::to_string_pretty(&summary)?);
-
-    Ok(())
-}
-
 pub fn run_expert_parallel_rank_smoke(output_dir: PathBuf) -> Result<()> {
     let rank = parse_launcher_usize_env("RANK")?;
     let local_rank = parse_launcher_usize_env("LOCAL_RANK")?;
@@ -3271,15 +3214,6 @@ fn parse_launcher_usize_env(name: &str) -> Result<usize> {
         .parse::<usize>()
         .with_context(|| format!("{name} must be a usize"))
 }
-
-fn max_abs_diff(actual: &Array2<f64>, expected: &Array2<f64>) -> f64 {
-    actual
-        .iter()
-        .zip(expected.iter())
-        .map(|(actual, expected)| (actual - expected).abs())
-        .fold(0.0_f64, f64::max)
-}
-
 fn route_top1(tokens: &Array2<f64>, router: &Array2<f64>) -> Vec<usize> {
     tokens
         .dot(router)
@@ -3295,22 +3229,6 @@ fn route_top1(tokens: &Array2<f64>, router: &Array2<f64>) -> Vec<usize> {
         })
         .collect()
 }
-
-fn expert_outputs(
-    tokens: &Array2<f64>,
-    assignments: &[usize],
-    expert_scales: &[[f64; 3]],
-) -> Array2<f64> {
-    let mut output = Array2::<f64>::zeros(tokens.dim());
-    for (token_index, expert_index) in assignments.iter().copied().enumerate() {
-        for hidden_index in 0..tokens.ncols() {
-            output[[token_index, hidden_index]] =
-                tokens[[token_index, hidden_index]] * expert_scales[expert_index][hidden_index];
-        }
-    }
-    output
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
