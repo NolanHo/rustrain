@@ -35,12 +35,12 @@ use rustrain_core::runtime::{
     FieldSplitSide, FieldStrip, FieldTransform, FieldTransformOp, FieldTruncation,
     LoraConfig as RuntimeLoraConfig, LrScheduler, RunPaths, load_config,
 };
-use rustrain_nccl::nccl_smoke;
+use rustrain_nccl::nccl as nccl_smoke;
 
 use crate::generate::*;
 use crate::lora::*;
 use crate::model::*;
-use crate::rank_smoke::*;
+use crate::rank::*;
 use crate::sft::*;
 #[derive(Debug, Clone, Serialize)]
 pub struct TrainableTensorSummary {
@@ -232,7 +232,7 @@ pub(crate) fn qwen_data_epoch_and_offset(
     }
     Ok((cursor / sample_count, cursor % sample_count))
 }
-pub fn qwen_full_train_smoke(
+pub fn qwen_full_train(
     model_path: &Path,
     reference_fixture: &Path,
     delta_output: &Path,
@@ -274,7 +274,7 @@ pub(crate) fn qwen_full_train_summary(
     let final_loss = first_step.loss_after;
     if final_loss >= initial_loss {
         bail!(
-            "Qwen full train smoke failed to reduce loss: initial_loss={initial_loss}, final_loss={final_loss}"
+            "Qwen full train failed to reduce loss: initial_loss={initial_loss}, final_loss={final_loss}"
         );
     }
 
@@ -758,7 +758,7 @@ pub fn train_qwen_session_dp_from_config(config: &Config, _run_paths: &RunPaths)
             bail!("qwen session trainer does not support fp16 yet; use fp32 or bf16")
         }
     };
-    qwen_session_dp_rank_smoke(
+    qwen_session_dp_rank(
         &model_path,
         output_dir,
         dtype,
@@ -802,7 +802,7 @@ pub fn train_qwen_session_tp_from_config(config: &Config, _run_paths: &RunPaths)
                 .join(&config.run.name)
         })
         .join("qwen-session-tp-ranks");
-    qwen_session_tp_rank_smoke(&model_path, output_dir, config)
+    qwen_session_tp_rank(&model_path, output_dir, config)
 }
 
 pub fn train_qwen_session_single_from_config(
@@ -1726,7 +1726,7 @@ pub(crate) fn qwen_session_dp_global_input(
 ) -> Result<Tensor> {
     let vocab_size = tensor(weights, "model.embed_tokens.weight")?.size()[0];
     if vocab_size < 2048 {
-        bail!("Qwen session DP smoke expects vocab_size >= 2048, got {vocab_size}");
+        bail!("Qwen session DP expects vocab_size >= 2048, got {vocab_size}");
     }
     Ok(
         Tensor::from_slice(&[101_i64, 872, 198, 3838, 645, 211, 777, 198, 1339, 899])

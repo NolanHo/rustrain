@@ -1,1 +1,1 @@
-pub mod nccl_smoke;
+pub mod nccl;

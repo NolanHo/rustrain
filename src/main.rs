@@ -125,7 +125,7 @@ fn dispatch_train(config_path: &Path, resume_from: Option<PathBuf>) -> Result<()
             final_loss = summary.final_loss,
             "tch tiny lm complete"
         );
-        println!("rustrain tch tiny lm smoke complete");
+        println!("rustrain tch tiny lm complete");
         println!("run_dir: {}", run_paths.root.display());
         println!("initial_loss: {:.6}", summary.initial_loss);
         println!("final_loss: {:.6}", summary.final_loss);
@@ -168,7 +168,7 @@ fn dispatch_train(config_path: &Path, resume_from: Option<PathBuf>) -> Result<()
     }
 
     if is_tch && arch == "tch_moe_ep_session" {
-        let stats = rustrain_moe::moe::deepseek_moe_smoke();
+        let stats = rustrain_moe::moe::deepseek_moe_stats();
         info!(
             deepseek_moe_layers = stats.layers.len(),
             "parallel process group configured"

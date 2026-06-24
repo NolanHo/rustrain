@@ -61,7 +61,7 @@ impl ParallelLMHead {
     }
 }
 
-pub fn tp1_module_smoke() -> f32 {
+pub fn tp1_module_check() -> f32 {
     let input = Array2::ones((1, 2));
     let linear_weight = Array2::eye(2);
     let column = ColumnParallelLinear::new_tp1(linear_weight.clone());

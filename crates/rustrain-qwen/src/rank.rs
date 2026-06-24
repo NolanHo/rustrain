@@ -35,7 +35,7 @@ use rustrain_core::runtime::{
     FieldSplitSide, FieldStrip, FieldTransform, FieldTransformOp, FieldTruncation,
     LoraConfig as RuntimeLoraConfig, LrScheduler, RunPaths, load_config,
 };
-use rustrain_nccl::nccl_smoke;
+use rustrain_nccl::nccl as nccl_smoke;
 
 use crate::generate::*;
 use crate::lora::*;
@@ -408,13 +408,13 @@ pub(crate) struct QwenSessionDpDataPlanSummary {
     pub(crate) dataset_shuffle: bool,
     pub(crate) streaming_train_batches: bool,
 }
-pub fn qwen_tp_linear_rank_smoke(model_path: &Path, output_dir: PathBuf) -> Result<()> {
+pub fn qwen_tp_linear_rank(model_path: &Path, output_dir: PathBuf) -> Result<()> {
     let model_path = resolve_qwen_model_path(model_path)?;
     let rank = parse_env_usize("RANK")?;
     let local_rank = parse_env_usize("LOCAL_RANK")?;
     let world_size = parse_env_usize("WORLD_SIZE")?;
     if world_size != 2 {
-        bail!("Qwen TP linear rank smoke expects WORLD_SIZE=2");
+        bail!("Qwen TP linear rank expects WORLD_SIZE=2");
     }
     if rank >= world_size {
         bail!("rank {rank} must be smaller than world_size {world_size}");
@@ -460,7 +460,7 @@ pub fn qwen_tp_linear_rank_smoke(model_path: &Path, output_dir: PathBuf) -> Resu
             .to_device(device);
         let output_size = weight.size()[0];
         if output_size % world_size as i64 != 0 {
-            bail!("Qwen TP linear rank smoke requires {name} output size divisible by WORLD_SIZE");
+            bail!("Qwen TP linear rank requires {name} output size divisible by WORLD_SIZE");
         }
         let shard_size = output_size / world_size as i64;
         let shard_start = rank as i64 * shard_size;
@@ -557,13 +557,13 @@ pub fn qwen_tp_linear_rank_smoke(model_path: &Path, output_dir: PathBuf) -> Resu
     Ok(())
 }
 
-pub fn qwen_tp_attention_rank_smoke(model_path: &Path, output_dir: PathBuf) -> Result<()> {
+pub fn qwen_tp_attention_rank(model_path: &Path, output_dir: PathBuf) -> Result<()> {
     let model_path = resolve_qwen_model_path(model_path)?;
     let rank = parse_env_usize("RANK")?;
     let local_rank = parse_env_usize("LOCAL_RANK")?;
     let world_size = parse_env_usize("WORLD_SIZE")?;
     if world_size != 2 {
-        bail!("Qwen TP attention rank smoke expects WORLD_SIZE=2");
+        bail!("Qwen TP attention rank expects WORLD_SIZE=2");
     }
     if rank >= world_size {
         bail!("rank {rank} must be smaller than world_size {world_size}");
@@ -641,13 +641,13 @@ pub fn qwen_tp_attention_rank_smoke(model_path: &Path, output_dir: PathBuf) -> R
     Ok(())
 }
 
-pub fn qwen_tp_attention_nccl_rank_smoke(model_path: &Path, output_dir: PathBuf) -> Result<()> {
+pub fn qwen_tp_attention_nccl_rank(model_path: &Path, output_dir: PathBuf) -> Result<()> {
     let model_path = resolve_qwen_model_path(model_path)?;
     let rank = parse_env_usize("RANK")?;
     let local_rank = parse_env_usize("LOCAL_RANK")?;
     let world_size = parse_env_usize("WORLD_SIZE")?;
     if world_size != 2 {
-        bail!("Qwen TP attention NCCL rank smoke expects WORLD_SIZE=2");
+        bail!("Qwen TP attention NCCL rank expects WORLD_SIZE=2");
     }
     if rank >= world_size {
         bail!("rank {rank} must be smaller than world_size {world_size}");
@@ -711,10 +711,10 @@ pub(crate) fn qwen_tp_attention_contribution(
 ) -> Result<QwenTpAttentionContribution> {
     let config = read_runtime_config(&model_path.join("config.json"))?;
     if config.num_attention_heads % world_size as i64 != 0 {
-        bail!("{context} smoke requires attention heads divisible by WORLD_SIZE");
+        bail!("{context} requires attention heads divisible by WORLD_SIZE");
     }
     if config.num_key_value_heads % world_size as i64 != 0 {
-        bail!("{context} smoke requires KV heads divisible by WORLD_SIZE");
+        bail!("{context} requires KV heads divisible by WORLD_SIZE");
     }
     let weights = read_safetensors_map(&model_path.join("model.safetensors"))?;
     let q_proj = tensor(&weights, "model.layers.0.self_attn.q_proj.weight")?
@@ -852,13 +852,13 @@ pub(crate) fn qwen_tp_attention_shard_contribution(
     (context_shard, output_contribution)
 }
 
-pub fn qwen_tp_mlp_rank_smoke(model_path: &Path, output_dir: PathBuf) -> Result<()> {
+pub fn qwen_tp_mlp_rank(model_path: &Path, output_dir: PathBuf) -> Result<()> {
     let model_path = resolve_qwen_model_path(model_path)?;
     let rank = parse_env_usize("RANK")?;
     let local_rank = parse_env_usize("LOCAL_RANK")?;
     let world_size = parse_env_usize("WORLD_SIZE")?;
     if world_size != 2 {
-        bail!("Qwen TP MLP rank smoke expects WORLD_SIZE=2");
+        bail!("Qwen TP MLP rank expects WORLD_SIZE=2");
     }
     if rank >= world_size {
         bail!("rank {rank} must be smaller than world_size {world_size}");
@@ -880,7 +880,7 @@ pub fn qwen_tp_mlp_rank_smoke(model_path: &Path, output_dir: PathBuf) -> Result<
     let hidden_size = gate_proj.size()[1];
     let intermediate_size = gate_proj.size()[0];
     if intermediate_size % world_size as i64 != 0 {
-        bail!("Qwen TP MLP smoke requires intermediate size divisible by WORLD_SIZE");
+        bail!("Qwen TP MLP requires intermediate size divisible by WORLD_SIZE");
     }
     let intermediate_shard_size = intermediate_size / world_size as i64;
     let intermediate_start = rank as i64 * intermediate_shard_size;
@@ -967,13 +967,13 @@ pub fn qwen_tp_mlp_rank_smoke(model_path: &Path, output_dir: PathBuf) -> Result<
     Ok(())
 }
 
-pub fn qwen_tp_mlp_nccl_rank_smoke(model_path: &Path, output_dir: PathBuf) -> Result<()> {
+pub fn qwen_tp_mlp_nccl_rank(model_path: &Path, output_dir: PathBuf) -> Result<()> {
     let model_path = resolve_qwen_model_path(model_path)?;
     let rank = parse_env_usize("RANK")?;
     let local_rank = parse_env_usize("LOCAL_RANK")?;
     let world_size = parse_env_usize("WORLD_SIZE")?;
     if world_size != 2 {
-        bail!("Qwen TP MLP NCCL rank smoke expects WORLD_SIZE=2");
+        bail!("Qwen TP MLP NCCL rank expects WORLD_SIZE=2");
     }
     if rank >= world_size {
         bail!("rank {rank} must be smaller than world_size {world_size}");
@@ -995,7 +995,7 @@ pub fn qwen_tp_mlp_nccl_rank_smoke(model_path: &Path, output_dir: PathBuf) -> Re
     let hidden_size = gate_proj.size()[1];
     let intermediate_size = gate_proj.size()[0];
     if intermediate_size % world_size as i64 != 0 {
-        bail!("Qwen TP MLP NCCL smoke requires intermediate size divisible by WORLD_SIZE");
+        bail!("Qwen TP MLP NCCL requires intermediate size divisible by WORLD_SIZE");
     }
     let intermediate_shard_size = intermediate_size / world_size as i64;
     let intermediate_start = rank as i64 * intermediate_shard_size;
@@ -1055,7 +1055,7 @@ pub fn qwen_tp_mlp_nccl_rank_smoke(model_path: &Path, output_dir: PathBuf) -> Re
     Ok(())
 }
 
-pub fn qwen_session_dp_rank_smoke(
+pub fn qwen_session_dp_rank(
     model_path: &Path,
     output_dir: PathBuf,
     dtype: QwenComputeDType,
@@ -1069,16 +1069,16 @@ pub fn qwen_session_dp_rank_smoke(
     let local_rank = parse_env_usize("LOCAL_RANK")?;
     let world_size = parse_env_usize("WORLD_SIZE")?;
     if world_size != 2 {
-        bail!("Qwen session DP smoke expects WORLD_SIZE=2");
+        bail!("Qwen session DP expects WORLD_SIZE=2");
     }
     if rank >= world_size {
         bail!("rank {rank} must be smaller than world_size {world_size}");
     }
     if steps == 0 {
-        bail!("Qwen session DP smoke requires at least one step");
+        bail!("Qwen session DP requires at least one step");
     }
     if !learning_rate.is_finite() || learning_rate <= 0.0 {
-        bail!("Qwen session DP smoke requires a positive finite learning rate");
+        bail!("Qwen session DP requires a positive finite learning rate");
     }
 
     let model_path = resolve_qwen_model_path(model_path)?;
@@ -1800,8 +1800,8 @@ pub(crate) fn write_qwen_session_dp_rank_sharded_manifest(
     )
     .with_context(|| format!("failed to write {}", rank_manifest_output.display()))?;
 
-    let smoke_metadata = serde_json::json!({
-        "format": "rustrain.qwen_session_dp_shard_smoke.v1",
+    let metadata = serde_json::json!({
+        "format": "rustrain.qwen_session_dp_shard.v1",
         "base_model_path": model_path.display().to_string(),
         "rank": rank,
         "world_size": world_size,
@@ -1812,10 +1812,10 @@ pub(crate) fn write_qwen_session_dp_rank_sharded_manifest(
         "dtype": dtype.label(),
     });
     fs::write(
-        rank_dir.join("smoke-metadata.json"),
-        serde_json::to_string_pretty(&smoke_metadata)? + "\n",
+        rank_dir.join("metadata.json"),
+        serde_json::to_string_pretty(&metadata)? + "\n",
     )
-    .with_context(|| format!("failed to write sharded smoke metadata for rank {rank}"))?;
+    .with_context(|| format!("failed to write sharded metadata for rank {rank}"))?;
 
     Ok(rank_manifest_output)
 }
@@ -1954,7 +1954,7 @@ pub(crate) fn qwen_sharded_rank_to_delta_manifest(
     })
 }
 
-pub(crate) fn qwen_session_tp_rank_smoke(
+pub(crate) fn qwen_session_tp_rank(
     model_path: &Path,
     output_dir: PathBuf,
     config: &Config,
@@ -1969,7 +1969,7 @@ pub(crate) fn qwen_session_tp_rank_smoke(
         );
     }
     if world_size != 2 {
-        bail!("Qwen session TP smoke expects WORLD_SIZE=2");
+        bail!("Qwen session TP expects WORLD_SIZE=2");
     }
     if rank >= world_size {
         bail!("rank {rank} must be smaller than world_size {world_size}");
@@ -2102,7 +2102,7 @@ pub(crate) fn qwen_session_tp_rank_smoke(
     let v_grad = train_v.grad();
     let o_grad = train_o.grad();
     if !q_grad.defined() || !k_grad.defined() || !v_grad.defined() || !o_grad.defined() {
-        bail!("Qwen session TP attention train smoke expected all shard gradients to be defined");
+        bail!("Qwen session TP attention train expected all shard gradients to be defined");
     }
     let attention_q_grad_norm = q_grad.norm().double_value(&[]);
     let attention_k_grad_norm = k_grad.norm().double_value(&[]);
@@ -2114,12 +2114,12 @@ pub(crate) fn qwen_session_tp_rank_smoke(
         || attention_o_grad_norm <= 0.0
     {
         bail!(
-            "Qwen session TP attention train smoke expected positive grad norms: q={attention_q_grad_norm}, k={attention_k_grad_norm}, v={attention_v_grad_norm}, o={attention_o_grad_norm}"
+            "Qwen session TP attention train expected positive grad norms: q={attention_q_grad_norm}, k={attention_k_grad_norm}, v={attention_v_grad_norm}, o={attention_o_grad_norm}"
         );
     }
     let config_learning_rate = config.train.learning_rate as f64;
     if !config_learning_rate.is_finite() || config_learning_rate <= 0.0 {
-        bail!("Qwen session TP train smoke requires positive finite learning_rate");
+        bail!("Qwen session TP train requires positive finite learning_rate");
     }
     let mut attention_train_final_loss = attention_train_initial_loss;
     let mut attention_train_learning_rate = config_learning_rate;
@@ -2178,7 +2178,7 @@ pub(crate) fn qwen_session_tp_rank_smoke(
     }
     if attention_train_final_loss >= attention_train_initial_loss {
         bail!(
-            "Qwen session TP attention train smoke did not reduce loss: initial={attention_train_initial_loss}, final={attention_train_final_loss}"
+            "Qwen session TP attention train did not reduce loss: initial={attention_train_initial_loss}, final={attention_train_final_loss}"
         );
     }
 
@@ -2194,7 +2194,7 @@ pub(crate) fn qwen_session_tp_rank_smoke(
     let hidden_size = gate_proj_full.size()[1];
     let intermediate_size = gate_proj_full.size()[0];
     if intermediate_size % world_size as i64 != 0 {
-        bail!("Qwen session TP MLP smoke requires intermediate size divisible by WORLD_SIZE");
+        bail!("Qwen session TP MLP requires intermediate size divisible by WORLD_SIZE");
     }
     let intermediate_shard_size = intermediate_size / world_size as i64;
     let intermediate_start = rank as i64 * intermediate_shard_size;
@@ -2256,14 +2256,14 @@ pub(crate) fn qwen_session_tp_rank_smoke(
     let up_grad = train_up.grad();
     let down_grad = train_down.grad();
     if !gate_grad.defined() || !up_grad.defined() || !down_grad.defined() {
-        bail!("Qwen session TP MLP train smoke expected all shard gradients to be defined");
+        bail!("Qwen session TP MLP train expected all shard gradients to be defined");
     }
     let gate_grad_norm = gate_grad.norm().double_value(&[]);
     let up_grad_norm = up_grad.norm().double_value(&[]);
     let down_grad_norm = down_grad.norm().double_value(&[]);
     if gate_grad_norm <= 0.0 || up_grad_norm <= 0.0 || down_grad_norm <= 0.0 {
         bail!(
-            "Qwen session TP MLP train smoke expected positive grad norms: gate={gate_grad_norm}, up={up_grad_norm}, down={down_grad_norm}"
+            "Qwen session TP MLP train expected positive grad norms: gate={gate_grad_norm}, up={up_grad_norm}, down={down_grad_norm}"
         );
     }
     let mut train_final_loss = train_initial_loss;
@@ -2310,7 +2310,7 @@ pub(crate) fn qwen_session_tp_rank_smoke(
     }
     if train_final_loss >= train_initial_loss {
         bail!(
-            "Qwen session TP MLP train smoke did not reduce loss: initial={train_initial_loss}, final={train_final_loss}"
+            "Qwen session TP MLP train did not reduce loss: initial={train_initial_loss}, final={train_final_loss}"
         );
     }
 
@@ -2399,7 +2399,7 @@ pub(crate) fn qwen_session_tp_rank_smoke(
     )?;
     if layer0_update.final_loss >= layer0_update.initial_loss {
         bail!(
-            "Qwen session TP layer0 train smoke did not reduce loss: initial={}, final={}",
+            "Qwen session TP layer0 train did not reduce loss: initial={}, final={}",
             layer0_update.initial_loss,
             layer0_update.final_loss
         );
@@ -2970,7 +2970,7 @@ pub(crate) fn write_qwen_session_tp_focused_sharded_manifest(
             streaming_train_batches: None,
             seed: config.run.seed,
             dtype: "fp32".to_string(),
-            optimizer: "adamw_first_step_slots_smoke".to_string(),
+            optimizer: "adamw_first_step_slots".to_string(),
             scheduler: "constant".to_string(),
             parallel: QwenShardedParallelManifest {
                 data_parallel_size: 1,
@@ -3369,7 +3369,7 @@ pub(crate) fn qwen_session_tp_layer0_sgd_update(
     ];
     for (name, grad) in layer0_grads {
         if !grad.defined() || grad.norm().double_value(&[]) <= 0.0 {
-            bail!("Qwen session TP layer0 train smoke expected positive {name} grad norm");
+            bail!("Qwen session TP layer0 train expected positive {name} grad norm");
         }
     }
     let mut candidate_q = train_q.detach().shallow_clone();
@@ -3523,7 +3523,7 @@ pub(crate) fn qwen_session_tp_causal_lm_loss_and_output_grad(
         .next()
         .ok_or_else(|| anyhow!("Qwen session TP focused causal LM loss returned no output grad"))?;
     if !output_grad.defined() || output_grad.norm().double_value(&[]) <= 0.0 {
-        bail!("Qwen session TP focused causal LM train smoke expected positive layer0 output grad");
+        bail!("Qwen session TP focused causal LM train expected positive layer0 output grad");
     }
     Ok((loss_value, output_grad.detach()))
 }
@@ -3664,9 +3664,7 @@ pub(crate) fn qwen_session_tp_causal_lm_sgd_update(
     ];
     for (name, grad) in causal_grads {
         if !grad.defined() || grad.norm().double_value(&[]) <= 0.0 {
-            bail!(
-                "Qwen session TP focused causal LM train smoke expected positive {name} grad norm"
-            );
+            bail!("Qwen session TP focused causal LM train expected positive {name} grad norm");
         }
     }
     let mut best_loss = initial_loss;
@@ -3731,7 +3729,7 @@ pub(crate) fn qwen_session_tp_causal_lm_sgd_update(
     }
     if best_loss >= initial_loss {
         bail!(
-            "Qwen session TP focused causal LM train smoke did not reduce loss: initial={initial_loss}, final={best_loss}"
+            "Qwen session TP focused causal LM train did not reduce loss: initial={initial_loss}, final={best_loss}"
         );
     }
     Ok(QwenSessionTpCausalLmSgdUpdate {

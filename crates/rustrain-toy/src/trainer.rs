@@ -110,7 +110,7 @@ fn train_fixed_batch(config: &Config, run_paths: &rustrain_core::runtime::RunPat
         gpu_memory_allocated_mb = gpu_memory_allocated_mb(),
         "checkpoint reload parity"
     );
-    info!(?generated, "generate smoke test");
+    info!(?generated, "generate test");
 
     println!("rustrain M1 complete");
     println!("run_dir: {}", run_paths.root.display());

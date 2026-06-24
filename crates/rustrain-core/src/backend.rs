@@ -49,7 +49,7 @@ impl Backend for TchBackend {
 }
 
 #[cfg(feature = "tch")]
-pub fn tch_cpu_autograd_smoke() -> bool {
+pub fn tch_cpu_autograd_check() -> bool {
     let weight = tch::Tensor::from_slice(&[1.0_f32, -2.0, 0.5, 3.0])
         .reshape([2, 2])
         .set_requires_grad(true);
@@ -83,6 +83,6 @@ mod tests {
 
         assert_eq!(backend.kind(), BackendKind::Tch);
         assert!(backend.supports_autograd());
-        assert!(tch_cpu_autograd_smoke());
+        assert!(tch_cpu_autograd_check());
     }
 }

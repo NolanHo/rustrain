@@ -35,11 +35,11 @@ use rustrain_core::runtime::{
     FieldSplitSide, FieldStrip, FieldTransform, FieldTransformOp, FieldTruncation,
     LoraConfig as RuntimeLoraConfig, LrScheduler, RunPaths, load_config,
 };
-use rustrain_nccl::nccl_smoke;
+use rustrain_nccl::nccl as nccl_smoke;
 
 use crate::generate::*;
 use crate::lora::*;
-use crate::rank_smoke::*;
+use crate::rank::*;
 use crate::session::*;
 use crate::sft::*;
 

@@ -250,7 +250,7 @@ impl Expert {
         hidden.dot(&self.down)
     }
 }
-pub fn deepseek_moe_smoke() -> DeepSeekMoeStats {
+pub fn deepseek_moe_stats() -> DeepSeekMoeStats {
     let router = Array2::ones((2, 2));
     let shared = vec![(Array2::eye(2), Array2::eye(2))];
     let routed = vec![

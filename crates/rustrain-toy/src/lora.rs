@@ -148,21 +148,19 @@ impl LoraLinear {
     }
 }
 
-pub fn lora_smoke() -> usize {
+pub fn lora_trainable_params_check() -> usize {
     let base = array![[1.0, 0.0], [0.0, 1.0]];
     let input = array![[1.0, 2.0]];
     let lora_a = array![[0.25], [0.5]];
     let lora_b = array![[1.0, -1.0]];
     let layer = LoraLinear::with_adapter(base.clone(), lora_a, lora_b, 1.0);
     let _ = layer.forward(&input);
-    let params = layer.trainable_params("smoke");
-    let adapter = layer
-        .adapter_toml()
-        .expect("adapter smoke should serialize");
+    let params = layer.trainable_params("check");
+    let adapter = layer.adapter_toml().expect("adapter should serialize");
     let mut layer = LoraLinear::zero_init(base, 1, 1.0);
     layer
         .load_adapter_toml(&adapter)
-        .expect("adapter smoke should load");
+        .expect("adapter should load");
     layer.merge();
     layer.unmerge();
     params.len()

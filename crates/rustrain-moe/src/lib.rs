@@ -1,2 +1,2 @@
-pub mod distributed_smoke;
+pub mod ep_rank;
 pub mod moe;

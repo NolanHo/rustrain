@@ -9,7 +9,7 @@ use tch::{
 use tracing::info;
 
 use rustrain_core::runtime::{Config, DType, Device as RuntimeDevice};
-use rustrain_nccl::nccl_smoke;
+use rustrain_nccl::nccl as nccl_smoke;
 use rustrain_train::metrics::memory_rss_mb;
 
 #[derive(Debug, Clone)]
@@ -170,7 +170,7 @@ pub fn train_tch_tiny_lm(config: &Config) -> Result<TchTrainSmokeSummary> {
 
 fn train_tch_tiny_lm_data_parallel(config: &Config) -> Result<TchTrainSmokeSummary> {
     if config.parallel.data_parallel_size != 2 {
-        bail!("tch_tiny_lm data-parallel smoke currently expects data_parallel_size=2");
+        bail!("tch_tiny_lm data-parallel currently expects data_parallel_size=2");
     }
     let rank = parse_env_usize("RANK")?;
     let local_rank = parse_env_usize("LOCAL_RANK")?;
@@ -187,7 +187,7 @@ fn train_tch_tiny_lm_data_parallel(config: &Config) -> Result<TchTrainSmokeSumma
 
     let device = match config.train.device {
         RuntimeDevice::Cuda => Device::Cuda(local_rank),
-        RuntimeDevice::Cpu => bail!("tch_tiny_lm data-parallel smoke requires device=cuda"),
+        RuntimeDevice::Cpu => bail!("tch_tiny_lm data-parallel requires device=cuda"),
     };
     let local = tch_dp_gradient_for_rank(rank, world_size, device)?;
     let reduce_dir = std::env::var("RUSTRAIN_LAUNCH_OUTPUT_DIR")
@@ -243,12 +243,12 @@ fn train_tch_tiny_lm_data_parallel(config: &Config) -> Result<TchTrainSmokeSumma
     })
 }
 
-pub fn run_tch_dp_gradient_rank_smoke(output_dir: PathBuf) -> Result<()> {
+pub fn run_tch_dp_gradient_rank(output_dir: PathBuf) -> Result<()> {
     let rank = parse_env_usize("RANK")?;
     let local_rank = parse_env_usize("LOCAL_RANK")?;
     let world_size = parse_env_usize("WORLD_SIZE")?;
     if world_size != 2 {
-        bail!("tch DP gradient smoke expects WORLD_SIZE=2");
+        bail!("tch DP gradient expects WORLD_SIZE=2");
     }
     if rank >= world_size {
         bail!("rank {rank} must be smaller than world_size {world_size}");
@@ -325,7 +325,7 @@ fn tch_dp_gradient_for_rank(
                 .to_device(device),
         )
     })
-    .context("failed to initialize DP smoke weight")?;
+    .context("failed to initialize DP weight")?;
 
     let (input, target) = tch_dp_batch_for_rank(rank, world_size, device)?;
     let logits = input.matmul(&weight);
@@ -334,7 +334,7 @@ fn tch_dp_gradient_for_rank(
     loss.backward();
     let grad = weight.grad();
     if !grad.defined() {
-        bail!("tch DP smoke weight gradient is not defined");
+        bail!("tch DP weight gradient is not defined");
     }
     let grad = tensor_to_f32_vec(&grad)?;
 

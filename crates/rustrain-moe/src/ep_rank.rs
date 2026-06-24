@@ -10,7 +10,7 @@ use ndarray::{Array2, array};
 use serde::{Deserialize, Serialize};
 use tch::{Device, Kind, Tensor};
 
-use rustrain_nccl::nccl_smoke;
+use rustrain_nccl::nccl as nccl_smoke;
 #[derive(Debug, Serialize, Deserialize)]
 struct ExpertParallelRankSummary {
     rank: usize,
@@ -644,12 +644,12 @@ struct ExpertParallelTchMoeCheckpointRead {
     expert_down: Tensor,
     state: ExpertParallelTchMoeAdamState,
 }
-pub fn run_expert_parallel_rank_smoke(output_dir: PathBuf) -> Result<()> {
+pub fn run_expert_parallel_rank(output_dir: PathBuf) -> Result<()> {
     let rank = parse_launcher_usize_env("RANK")?;
     let local_rank = parse_launcher_usize_env("LOCAL_RANK")?;
     let world_size = parse_launcher_usize_env("WORLD_SIZE")?;
     if world_size != 2 {
-        bail!("EP rank-local smoke currently expects WORLD_SIZE=2");
+        bail!("EP rank-local currently expects WORLD_SIZE=2");
     }
     if rank >= world_size {
         bail!("rank {rank} must be smaller than world_size {world_size}");
@@ -706,12 +706,12 @@ pub fn run_expert_parallel_rank_smoke(output_dir: PathBuf) -> Result<()> {
     Ok(())
 }
 
-pub fn run_expert_parallel_nccl_rank_smoke(output_dir: PathBuf) -> Result<()> {
+pub fn run_expert_parallel_nccl_rank(output_dir: PathBuf) -> Result<()> {
     let rank = parse_launcher_usize_env("RANK")?;
     let local_rank = parse_launcher_usize_env("LOCAL_RANK")?;
     let world_size = parse_launcher_usize_env("WORLD_SIZE")?;
     if world_size != 2 {
-        bail!("EP NCCL rank smoke currently expects WORLD_SIZE=2");
+        bail!("EP NCCL rank currently expects WORLD_SIZE=2");
     }
     if rank >= world_size {
         bail!("rank {rank} must be smaller than world_size {world_size}");
@@ -774,7 +774,7 @@ pub fn run_expert_parallel_nccl_rank_smoke(output_dir: PathBuf) -> Result<()> {
     }
 
     if first_step.grad_norm <= 0.0 {
-        bail!("EP NCCL smoke local expert scale gradient is missing or zero on rank {rank}");
+        bail!("EP NCCL local expert scale gradient is missing or zero on rank {rank}");
     }
 
     let final_loss = first_step
@@ -783,7 +783,7 @@ pub fn run_expert_parallel_nccl_rank_smoke(output_dir: PathBuf) -> Result<()> {
     let train_loss_improved = final_loss < first_step.pre_loss;
     if !train_loss_improved {
         bail!(
-            "EP NCCL train smoke did not lower loss on rank {rank}: initial={}, final={final_loss}",
+            "EP NCCL train did not lower loss on rank {rank}: initial={}, final={final_loss}",
             first_step.pre_loss
         );
     }
@@ -902,12 +902,12 @@ pub fn run_expert_parallel_nccl_rank_smoke(output_dir: PathBuf) -> Result<()> {
     Ok(())
 }
 
-pub fn run_expert_parallel_sparse_rank_smoke(output_dir: PathBuf) -> Result<()> {
+pub fn run_expert_parallel_sparse_rank(output_dir: PathBuf) -> Result<()> {
     let rank = parse_launcher_usize_env("RANK")?;
     let local_rank = parse_launcher_usize_env("LOCAL_RANK")?;
     let world_size = parse_launcher_usize_env("WORLD_SIZE")?;
     if world_size != 2 {
-        bail!("EP sparse rank smoke currently expects WORLD_SIZE=2");
+        bail!("EP sparse rank currently expects WORLD_SIZE=2");
     }
     if rank >= world_size {
         bail!("rank {rank} must be smaller than world_size {world_size}");
@@ -973,7 +973,7 @@ pub fn run_expert_parallel_sparse_rank_smoke(output_dir: PathBuf) -> Result<()> 
     let train_loss_improved = train_final_loss < first_step.initial_loss;
     if !train_loss_improved {
         bail!(
-            "EP sparse train smoke did not lower loss on rank {rank}: initial={}, final={train_final_loss}",
+            "EP sparse train did not lower loss on rank {rank}: initial={}, final={train_final_loss}",
             first_step.initial_loss
         );
     }
@@ -1136,7 +1136,7 @@ pub fn run_expert_parallel_sparse_rank_smoke(output_dir: PathBuf) -> Result<()> 
     Ok(())
 }
 
-pub fn run_expert_parallel_tch_moe_rank_smoke(
+pub fn run_expert_parallel_tch_moe_rank(
     output_dir: PathBuf,
     resume_from: Option<&Path>,
 ) -> Result<()> {
@@ -1144,7 +1144,7 @@ pub fn run_expert_parallel_tch_moe_rank_smoke(
     let local_rank = parse_launcher_usize_env("LOCAL_RANK")?;
     let world_size = parse_launcher_usize_env("WORLD_SIZE")?;
     if world_size != 2 {
-        bail!("EP tch MoE rank smoke currently expects WORLD_SIZE=2");
+        bail!("EP tch MoE rank currently expects WORLD_SIZE=2");
     }
     if rank >= world_size {
         bail!("rank {rank} must be smaller than world_size {world_size}");
@@ -1225,7 +1225,7 @@ pub fn run_expert_parallel_tch_moe_rank_smoke(
     let train_loss_improved = train_final_loss < first_step.initial_loss;
     if !train_loss_improved {
         bail!(
-            "EP tch MoE train smoke did not lower loss on rank {rank}: initial={}, final={train_final_loss}",
+            "EP tch MoE train did not lower loss on rank {rank}: initial={}, final={train_final_loss}",
             first_step.initial_loss
         );
     }
@@ -2228,7 +2228,7 @@ fn ep_sparse_sgd_step(
     )?;
     let grad_norm = scale_grad.norm().double_value(&[]);
     if grad_norm <= 0.0 {
-        bail!("EP sparse train smoke expected positive local expert scale grad norm");
+        bail!("EP sparse train expected positive local expert scale grad norm");
     }
     let updated_scales = (local_scales - &(&scale_grad * 0.25)).detach();
     let next_step = state.step + 1;
@@ -2345,7 +2345,7 @@ fn ep_tch_moe_adam_step(
     let down_grad_norm = down_grad.norm().double_value(&[]);
     if !up_grad.defined() || !down_grad.defined() || up_grad_norm <= 0.0 || down_grad_norm <= 0.0 {
         bail!(
-            "EP tch MoE train smoke expected positive expert gradients: up={up_grad_norm}, down={down_grad_norm}"
+            "EP tch MoE train expected positive expert gradients: up={up_grad_norm}, down={down_grad_norm}"
         );
     }
 
@@ -3234,10 +3234,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn expert_parallel_smoke_runs_ep2_all_to_all_parity() {
-        run_expert_parallel_smoke(2).expect("EP=2 parity should pass");
-    }
-
     #[test]
     fn ep_global_checkpoint_manifest_validates_rank_owned_shards() {
         let manifest = tiny_ep_global_manifest();

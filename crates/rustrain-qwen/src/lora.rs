@@ -35,11 +35,11 @@ use rustrain_core::runtime::{
     FieldSplitSide, FieldStrip, FieldTransform, FieldTransformOp, FieldTruncation,
     LoraConfig as RuntimeLoraConfig, LrScheduler, RunPaths, load_config,
 };
-use rustrain_nccl::nccl_smoke;
+use rustrain_nccl::nccl as nccl_smoke;
 
 use crate::generate::*;
 use crate::model::*;
-use crate::rank_smoke::*;
+use crate::rank::*;
 use crate::session::*;
 use crate::sft::*;
 pub struct QwenLoraSftTrainSummary {
@@ -650,7 +650,7 @@ pub(crate) fn qwen_lora_sft_train(
     .double_value(&[]);
     if final_loss >= initial_loss {
         bail!(
-            "Qwen LoRA SFT smoke failed to reduce response-only loss: initial_loss={initial_loss}, final_loss={final_loss}"
+            "Qwen LoRA SFT failed to reduce response-only loss: initial_loss={initial_loss}, final_loss={final_loss}"
         );
     }
 
