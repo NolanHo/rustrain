@@ -257,7 +257,7 @@ pub fn rope_cos_sin(seq_len: usize, head_dim: i64, theta: f64, device: Device) -
     (cos, sin)
 }
 
-fn apply_rotary(x: &Tensor, cos: &Tensor, sin: &Tensor) -> Tensor {
+pub(crate) fn apply_rotary(x: &Tensor, cos: &Tensor, sin: &Tensor) -> Tensor {
     // x: [batch, heads, seq, head_dim]
     let seq_len = x.size()[2];
     let cos = cos.narrow(0, 0, seq_len).unsqueeze(0).unsqueeze(0); // [1, 1, seq, head_dim]

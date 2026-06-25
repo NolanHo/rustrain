@@ -142,7 +142,7 @@ pub fn train_deepseek_session_single_from_config(
     Ok(())
 }
 
-fn load_deepseek_weights(
+pub fn load_deepseek_weights(
     model_dir: &Path,
     needed: &HashSet<String>,
 ) -> Result<BTreeMap<String, Tensor>> {

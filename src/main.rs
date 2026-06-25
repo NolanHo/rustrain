@@ -10,7 +10,7 @@ use rustrain_tch_tiny::tch_train;
 
 use std::path::{Path, PathBuf};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use tracing::info;
 
@@ -226,6 +226,52 @@ fn dispatch_train(config_path: &Path, resume_from: Option<PathBuf>) -> Result<()
         )?;
         println!("rustrain DeepSeek-V3 session complete");
         println!("run_dir: {}", run_paths.root.display());
+        return Ok(());
+    }
+
+    if is_tch && arch == "deepseek_tp_rank" {
+        let model_path = config
+            .model
+            .model_path
+            .as_ref()
+            .context("DeepSeek TP requires model.model_path")?;
+        let model_path =
+            rustrain_deepseek::deepseek_module::resolve_deepseek_model_path(model_path)?;
+        let runtime_config = rustrain_deepseek::deepseek_module::read_deepseek_config(
+            &model_path.join("config.json"),
+        )?;
+        let kind = match config.train.dtype {
+            rustrain_core::runtime::DType::Fp32 => tch::Kind::Float,
+            rustrain_core::runtime::DType::Bf16 => tch::Kind::BFloat16,
+            _ => tch::Kind::Float,
+        };
+        let output_dir = std::env::var("RUSTRAIN_LAUNCH_OUTPUT_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| config.run.base_dir.join("deepseek-tp"));
+        rustrain_deepseek::tp::deepseek_tp_rank(&model_path, &output_dir, &runtime_config, kind)?;
+        return Ok(());
+    }
+
+    if is_tch && arch == "deepseek_ep_rank" {
+        let model_path = config
+            .model
+            .model_path
+            .as_ref()
+            .context("DeepSeek EP requires model.model_path")?;
+        let model_path =
+            rustrain_deepseek::deepseek_module::resolve_deepseek_model_path(model_path)?;
+        let runtime_config = rustrain_deepseek::deepseek_module::read_deepseek_config(
+            &model_path.join("config.json"),
+        )?;
+        let kind = match config.train.dtype {
+            rustrain_core::runtime::DType::Fp32 => tch::Kind::Float,
+            rustrain_core::runtime::DType::Bf16 => tch::Kind::BFloat16,
+            _ => tch::Kind::Float,
+        };
+        let output_dir = std::env::var("RUSTRAIN_LAUNCH_OUTPUT_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| config.run.base_dir.join("deepseek-ep"));
+        rustrain_deepseek::ep::deepseek_ep_rank(&model_path, &output_dir, &runtime_config, kind)?;
         return Ok(());
     }
 
