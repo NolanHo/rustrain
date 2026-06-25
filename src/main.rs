@@ -284,6 +284,62 @@ fn dispatch_train(config_path: &Path, resume_from: Option<PathBuf>) -> Result<()
         return Ok(());
     }
 
+    if is_tch && arch == "deepseek_v4_tp_rank" {
+        let model_path = config
+            .model
+            .model_path
+            .as_ref()
+            .context("V4 TP requires model.model_path")?;
+        let model_path =
+            rustrain_deepseek_v4::deepseek_v4_module::resolve_v4_model_path(model_path)?;
+        let runtime_config = rustrain_deepseek_v4::deepseek_v4_module::read_v4_config(
+            &model_path.join("config.json"),
+        )?;
+        let kind = match config.train.dtype {
+            rustrain_core::runtime::DType::Fp32 => tch::Kind::Float,
+            rustrain_core::runtime::DType::Bf16 => tch::Kind::BFloat16,
+            _ => tch::Kind::Float,
+        };
+        let output_dir = std::env::var("RUSTRAIN_LAUNCH_OUTPUT_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| config.run.base_dir.join("deepseek-v4-tp"));
+        rustrain_deepseek_v4::tp::deepseek_v4_tp_rank(
+            &model_path,
+            &output_dir,
+            &runtime_config,
+            kind,
+        )?;
+        return Ok(());
+    }
+
+    if is_tch && arch == "deepseek_v4_ep_rank" {
+        let model_path = config
+            .model
+            .model_path
+            .as_ref()
+            .context("V4 EP requires model.model_path")?;
+        let model_path =
+            rustrain_deepseek_v4::deepseek_v4_module::resolve_v4_model_path(model_path)?;
+        let runtime_config = rustrain_deepseek_v4::deepseek_v4_module::read_v4_config(
+            &model_path.join("config.json"),
+        )?;
+        let kind = match config.train.dtype {
+            rustrain_core::runtime::DType::Fp32 => tch::Kind::Float,
+            rustrain_core::runtime::DType::Bf16 => tch::Kind::BFloat16,
+            _ => tch::Kind::Float,
+        };
+        let output_dir = std::env::var("RUSTRAIN_LAUNCH_OUTPUT_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| config.run.base_dir.join("deepseek-v4-ep"));
+        rustrain_deepseek_v4::ep::deepseek_v4_ep_rank(
+            &model_path,
+            &output_dir,
+            &runtime_config,
+            kind,
+        )?;
+        return Ok(());
+    }
+
     if is_tch && arch == "deepseek_v4_lora_sft" {
         let summary = rustrain_deepseek_v4::deepseek_v4_module::train_v4_lora_sft_from_config(
             &config, &run_paths,

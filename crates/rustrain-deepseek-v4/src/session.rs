@@ -31,7 +31,8 @@ pub fn train_v4_session_single_from_config(config: &Config, _run_paths: &RunPath
 
     let mut needed: HashSet<String> = HashSet::new();
     needed.insert("embed.weight".to_string());
-    // norm.weight skipped (in last shard, not needed for layer 0 verification)
+    needed.insert("norm.weight".to_string());
+    needed.insert("head.weight".to_string());
     if !runtime_config.tie_word_embeddings {
         // lm_head.weight skipped (V4 uses tied embeddings)
     }
@@ -165,7 +166,8 @@ pub fn train_v4_lora_sft_from_config(
 
     let mut needed: HashSet<String> = HashSet::new();
     needed.insert("embed.weight".to_string());
-    // norm.weight skipped (in last shard, not needed for layer 0 verification)
+    needed.insert("norm.weight".to_string());
+    needed.insert("head.weight".to_string());
     if !runtime_config.tie_word_embeddings {
         // lm_head.weight skipped (V4 uses tied embeddings)
     }

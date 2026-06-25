@@ -274,11 +274,11 @@ pub fn v4_attention(input: &Tensor, attn: &V4AttentionWeights, config: &V4Runtim
     let batch = shape[0];
     let seq = shape[1];
     let num_heads = config.num_attention_heads;
-    let head_dim = 512_i64; // inferred: wq_b output 32768 / 64 heads = 512
-    let kv_dim = 512_i64; // wkv output dim
+    let head_dim = 512_i64;
+    let qk_rope = config.qk_rope_head_dim; // 64
+    let qk_nope = head_dim - qk_rope; // 448
     let o_groups = config.o_groups;
-    let hidden = config.hidden_size;
-    let kv_lora = config.kv_lora_rank;
+    let kv_dim = config.kv_lora_rank; // 512
 
     // Q path: wq_a → q_norm → wq_b → reshape
     let q_a = input.linear::<&Tensor>(&attn.wq_a, None); // [batch, seq, 1024]
@@ -287,18 +287,39 @@ pub fn v4_attention(input: &Tensor, attn: &V4AttentionWeights, config: &V4Runtim
     let q = q_b
         .reshape([batch, seq, num_heads, head_dim])
         .transpose(1, 2); // [batch, heads, seq, 512]
+    let q_nope = q.narrow(-1, 0, qk_nope); // [batch, heads, seq, 448]
+    let q_rope = q.narrow(-1, qk_nope, qk_rope); // [batch, heads, seq, 64]
 
     // KV path: wkv → kv_norm (MQA, shared across heads)
     let wkv_out = input.linear::<&Tensor>(&attn.wkv, None); // [batch, seq, 512]
     let kv = rms_norm(&wkv_out, &attn.kv_norm, config.rms_norm_eps);
-    let k = kv
-        .reshape([batch, 1, seq, kv_dim])
-        .expand([batch, num_heads, seq, kv_dim], false);
-    let v = k.shallow_clone(); // V = K for simplicity (will fix with proper split)
+    // K and V are both derived from the 512-dim latent KV
+    let k_nope = kv
+        .narrow(-1, 0, qk_nope)
+        .reshape([batch, 1, seq, qk_nope])
+        .expand([batch, num_heads, seq, qk_nope], false);
+    let k_rope = kv
+        .narrow(-1, qk_nope, qk_rope)
+        .reshape([batch, 1, seq, qk_rope])
+        .expand([batch, num_heads, seq, qk_rope], false);
+    let v = kv
+        .reshape([batch, 1, seq, head_dim])
+        .expand([batch, num_heads, seq, head_dim], false);
+
+    // Apply RoPE to the rope portions
+    let (cos, sin) = rope_cos_sin(seq as usize, qk_rope, config.rope_theta, input.device());
+    let cos = cos.to_kind(input.kind());
+    let sin = sin.to_kind(input.kind());
+    let q_rope_rotated = apply_rotary(&q_rope, &cos, &sin);
+    let k_rope_rotated = apply_rotary(&k_rope, &cos, &sin);
+
+    // Concatenate nope + rope
+    let q_full = Tensor::cat(&[&q_nope, &q_rope_rotated], -1); // [batch, heads, seq, 512]
+    let k_full = Tensor::cat(&[&k_nope, &k_rope_rotated], -1); // [batch, heads, seq, 512]
 
     // Attention with sink
     let scale = 1.0 / (head_dim as f64).sqrt();
-    let attn_scores = q.matmul(&k.transpose(-2, -1)) * scale;
+    let attn_scores = q_full.matmul(&k_full.transpose(-2, -1)) * scale;
     let sink = attn
         .attn_sink
         .reshape([1, num_heads, 1, 1])
@@ -310,12 +331,10 @@ pub fn v4_attention(input: &Tensor, attn: &V4AttentionWeights, config: &V4Runtim
     let context = probs.matmul(&v); // [batch, heads, seq, 512]
 
     // Group reduction: [batch, heads, seq, 512] → [batch, o_groups, seq, hidden/o_groups]
-    // heads=64, o_groups=8 → 8 heads per group
-    // Sum heads within each group: [batch, 8, seq, 512] → [batch, seq, 4096]
     let heads_per_group = num_heads / o_groups;
     let context = context
         .reshape([batch, o_groups, heads_per_group, seq, head_dim])
-        .sum_dim_intlist([2].as_slice(), false, Kind::Float); // [batch, o_groups, seq, head_dim]
+        .sum_dim_intlist([2].as_slice(), false, Kind::Float);
     let context = context.reshape([batch, seq, o_groups * head_dim]); // [batch, seq, 4096]
 
     // Output: wo_a → wo_b (LoRA-style two-layer projection)
@@ -466,7 +485,7 @@ pub fn v4_forward_selective(
     // Apply final norm + lm_head if available, otherwise use tied embeddings
     if let Ok(final_norm) = tensor(weights, "norm.weight") {
         let hidden = rms_norm(&hidden, &final_norm, config.rms_norm_eps);
-        let lm_head = if let Ok(lh) = tensor(weights, "lm_head.weight") {
+        let lm_head = if let Ok(lh) = tensor(weights, "head.weight") {
             lh.shallow_clone()
         } else {
             embed_tokens.shallow_clone() // tied
@@ -534,7 +553,7 @@ pub fn v4_trainable_tensors(
     }
     names.push("norm.weight".to_string());
     if include_lm_head {
-        names.push("lm_head.weight".to_string());
+        names.push("head.weight".to_string());
     }
     names
 }
@@ -654,16 +673,25 @@ pub fn v4_forward_lora(
     }
 
     // Apply final norm + lm_head if available, otherwise use tied embeddings
+    // V4 uses "head.weight" as lm_head (not tied)
     if let Ok(final_norm) = tensor(weights, "norm.weight") {
         let hidden = rms_norm(&hidden, &final_norm, config.rms_norm_eps);
-        let lm_head = if let Ok(lh) = tensor(weights, "lm_head.weight") {
+        let lm_head = if let Ok(lh) = tensor(weights, "head.weight") {
             lh.shallow_clone()
         } else {
             embed_tokens.shallow_clone()
         };
         Ok(hidden.linear::<&Tensor>(&lm_head, None))
     } else {
-        Ok(hidden.linear::<&Tensor>(&embed_tokens, None))
+        // No norm.weight available — use identity norm (ones)
+        let ones = Tensor::ones([config.hidden_size], (Kind::Float, hidden.device()));
+        let hidden = rms_norm(&hidden, &ones, config.rms_norm_eps);
+        let lm_head = if let Ok(lh) = tensor(weights, "head.weight") {
+            lh.shallow_clone()
+        } else {
+            embed_tokens.shallow_clone()
+        };
+        Ok(hidden.linear::<&Tensor>(&lm_head, None))
     }
 }
 
