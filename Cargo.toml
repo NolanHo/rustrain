@@ -14,6 +14,7 @@ rustrain-toy = { path = "crates/rustrain-toy" }
 rustrain-tch-tiny = { path = "crates/rustrain-tch-tiny" }
 rustrain-qwen = { path = "crates/rustrain-qwen" }
 rustrain-qwen3 = { path = "crates/rustrain-qwen3" }
+rustrain-deepseek = { path = "crates/rustrain-deepseek" }
 rustrain-moe = { path = "crates/rustrain-moe" }
 
 # Direct dependencies (used by main.rs, inspect.rs, trainer.rs)

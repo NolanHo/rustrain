@@ -220,6 +220,15 @@ fn dispatch_train(config_path: &Path, resume_from: Option<PathBuf>) -> Result<()
         return Ok(());
     }
 
+    if is_tch && arch == "deepseek_trainable_session" {
+        rustrain_deepseek::deepseek_module::train_deepseek_session_single_from_config(
+            &config, &run_paths,
+        )?;
+        println!("rustrain DeepSeek-V3 session complete");
+        println!("run_dir: {}", run_paths.root.display());
+        return Ok(());
+    }
+
     // Default: ndarray toy model
     rustrain_toy::trainer::train(&config, &run_paths)
 }

@@ -132,16 +132,27 @@ def run_on_gpu_worker(
             "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --no-modify-path",
             shell=True, capture_output=True, text=True, timeout=120,
         )
-    subprocess_env["PATH"] = f"/vePFS-Mindverse/share/nolan/rustrain/deps/cargo/bin:/vePFS-Mindverse/share/nolan/rustrain/deps/venv/bin:{subprocess_env.get('PATH', '')}"
-    subprocess_env["CARGO_HOME"] = "/vePFS-Mindverse/share/nolan/rustrain/deps/cargo"
-    subprocess_env["RUSTUP_HOME"] = "/vePFS-Mindverse/share/nolan/rustrain/deps/rustup"
+    subprocess_env["PATH"] = f"/vePFS-Mindverse/share/huggingface/rustrain-deps/cargo/bin:/vePFS-Mindverse/share/huggingface/rustrain-deps/venv/bin:{subprocess_env.get('PATH', '')}"
+    subprocess_env["CARGO_HOME"] = "/vePFS-Mindverse/share/huggingface/rustrain-deps/cargo"
+    subprocess_env["RUSTUP_HOME"] = "/vePFS-Mindverse/share/huggingface/rustrain-deps/rustup"
+    subprocess_env["PYTHONPATH"] = "/usr/local/lib/python3.13/dist-packages"
+    # Ensure torch is available for tch-rs build
+    torch_check = subprocess.run(
+        "python3 -c \"import torch\"",
+        shell=True, capture_output=True, text=True,
+    )
+    if torch_check.returncode != 0:
+        subprocess.run(
+            "pip3 install --break-system-packages --no-index --find-links /vePFS-Mindverse/share/huggingface/torch-wheels-py313 torch numpy safetensors",
+            shell=True, capture_output=True, text=True, timeout=300,
+        )
     subprocess_env["LIBTORCH_USE_PYTORCH"] = "1"
     subprocess_env["LIBTORCH_BYPASS_VERSION_CHECK"] = "1"
     subprocess_env["CARGO_TARGET_DIR"] = "/tmp/rustrain-target-a800"
 
     torch_site = os.environ.get(
         "RUSTRAIN_TORCH_SITE",
-        "/vePFS-Mindverse/share/nolan/rustrain/deps/venv/lib/python3.12/site-packages",
+        "/usr/local/lib/python3.13/dist-packages",
     )
     torch_lib = f"{torch_site}/torch/lib"
     nvidia = f"{torch_site}/nvidia"
