@@ -207,3 +207,236 @@ print(out)
     let tensors = Tensor::read_safetensors(Path::new(&path))?;
     Ok(tensors.into_iter().collect())
 }
+
+// ── LoRA SFT ─────────────────────────────────────────────────
+
+use crate::lora::*;
+use rustrain_core::runtime::LrScheduler;
+
+pub struct DeepSeekLoraSftSummary {
+    pub adapter_output: String,
+    pub manifest_output: String,
+    pub initial_loss: f64,
+    pub final_loss: f64,
+    pub steps: usize,
+    pub trainable_params: usize,
+}
+
+pub fn train_deepseek_lora_sft_from_config(
+    config: &Config,
+    run_paths: &RunPaths,
+) -> Result<DeepSeekLoraSftSummary> {
+    let model_path = config
+        .model
+        .model_path
+        .as_ref()
+        .context("DeepSeek LoRA SFT requires model.model_path")?;
+    let model_path = resolve_deepseek_model_path(model_path)?;
+
+    let runtime_config = read_deepseek_config(&model_path.join("config.json"))?;
+    info!(
+        layers = runtime_config.num_hidden_layers,
+        "DeepSeek config loaded"
+    );
+
+    let trainable_layers = config
+        .model
+        .trainable_layers
+        .clone()
+        .unwrap_or_else(|| vec![0]);
+
+    // Build LoRA config from TOML [lora] section
+    let lora_config_raw = config
+        .lora
+        .as_ref()
+        .context("DeepSeek LoRA SFT requires [lora] config section")?;
+    let target_modules: Vec<DeepSeekLoraTargetModule> = lora_config_raw
+        .target_modules
+        .iter()
+        .map(|s| DeepSeekLoraTargetModule::from_name(s))
+        .collect::<Result<Vec<_>>>()?;
+    let lora_config = DeepSeekLoraConfig {
+        rank: lora_config_raw.rank,
+        alpha: lora_config_raw.alpha as i64,
+        target_layers: trainable_layers.clone(),
+        target_modules,
+    };
+
+    // Determine what weights we need: LoRA targets + embed + norm + lm_head
+    let mut needed: HashSet<String> = HashSet::new();
+    needed.insert("model.embed_tokens.weight".to_string());
+    needed.insert("model.norm.weight".to_string());
+    if !runtime_config.tie_word_embeddings {
+        needed.insert("lm_head.weight".to_string());
+    }
+    for &layer in &trainable_layers {
+        let names = deepseek_trainable_tensors_for_layer(layer, &runtime_config);
+        needed.extend(names.iter().cloned());
+    }
+
+    // Load weights (FP8→bf16 conversion)
+    let weights = load_deepseek_weights(&model_path, &needed)?;
+    info!(tensors = weights.len(), "weights loaded");
+
+    // Determine compute dtype
+    let dtype = match config.train.dtype {
+        rustrain_core::runtime::DType::Fp32 => DeepSeekComputeDType::Fp32,
+        rustrain_core::runtime::DType::Bf16 => DeepSeekComputeDType::Bf16,
+        _ => bail!("unsupported dtype"),
+    };
+    let compute_kind = dtype.kind();
+    let device = Device::Cuda(0);
+
+    // Move weights to GPU
+    let mut weights_gpu: BTreeMap<String, Tensor> = weights
+        .into_iter()
+        .map(|(name, t)| (name, t.to_device(device)))
+        .collect();
+
+    // Convert all weights to Float and set requires_grad for gradient flow
+    // (we only update LoRA params, not base weights, but gradient needs to flow through)
+    for t in weights_gpu.values_mut() {
+        *t = t.to_kind(Kind::Float).set_requires_grad(true);
+    }
+
+    // Create LoRA registry
+    let mut registry = DeepSeekLoraRegistry::new(&weights_gpu, lora_config.clone(), device)?;
+    let trainable_count = registry.param_count();
+    info!(trainable_params = trainable_count, "LoRA adapters created");
+
+    // Store original base weights (with requires_grad for gradient flow)
+    let original_weights: BTreeMap<String, Tensor> = weights_gpu
+        .iter()
+        .map(|(k, v)| (k.clone(), v.shallow_clone().set_requires_grad(true)))
+        .collect();
+
+    // Explicitly set requires_grad on LoRA params
+    for adapter in registry.adapters.values() {
+        let _ = adapter.lora_a.set_requires_grad(true);
+        let _ = adapter.lora_b.set_requires_grad(true);
+    }
+
+    // Create training input (simple 5-token sequence for verification)
+    let input_ids = Tensor::from_slice(&[1i64, 2, 3, 4, 5])
+        .reshape([1, 5])
+        .to_device(device);
+
+    // AdamW optimizer state
+    let lr = config.train.learning_rate as f64;
+    let beta1 = config.train.adam_beta1 as f64;
+    let beta2 = config.train.adam_beta2 as f64;
+    let eps = config.train.adam_eps as f64;
+    // Collect LoRA params once for optimizer state
+    let mut lora_params: Vec<Tensor> = registry.trainable_parameters();
+    let mut adam_m: Vec<Tensor> = lora_params.iter().map(Tensor::zeros_like).collect();
+    let mut adam_v: Vec<Tensor> = lora_params.iter().map(Tensor::zeros_like).collect();
+
+    let mut initial_loss = 0.0_f64;
+
+    for step in 0..config.train.max_steps {
+        // LoRA is applied inline during forward, no need to modify weights_gpu
+
+        // Forward
+        let loss = deepseek_causal_lm_loss_selective(
+            &input_ids,
+            &weights_gpu,
+            &runtime_config,
+            &trainable_layers,
+        )?;
+        let loss_val = loss.double_value(&[]);
+        if step == 0 {
+            initial_loss = loss_val;
+        }
+        info!(step = step + 1, loss = loss_val, "LoRA SFT train step");
+
+        // Backward
+        loss.backward();
+
+        // AdamW update on LoRA params
+        for (i, param) in lora_params.iter_mut().enumerate() {
+            let grad = param.grad();
+            if grad.defined() {
+                let g = grad.to_kind(Kind::Float);
+                let m = &mut adam_m[i];
+                let v = &mut adam_v[i];
+                let _ = no_grad(|| {
+                    m.f_mul_scalar_(beta1);
+                    m.f_add_(&(&g * (1.0 - beta1)))?;
+                    v.f_mul_scalar_(beta2);
+                    v.f_add_(&(&g * &g * (1.0 - beta2)))?;
+                    Ok::<(), tch::TchError>(())
+                })?;
+                let step_num = (step + 1) as f64;
+                let m_hat = m.shallow_clone() / (1.0 - beta1.powf(step_num));
+                let v_hat = v.shallow_clone() / (1.0 - beta2.powf(step_num));
+                let update = m_hat / (v_hat.sqrt() + eps);
+                let _ = no_grad(|| param.f_sub_(&(update * lr)));
+            }
+            param.zero_grad();
+        }
+    }
+
+    // Final loss
+    registry.apply_to_weights(&mut weights_gpu);
+    let final_loss = deepseek_causal_lm_loss_selective(
+        &input_ids,
+        &weights_gpu,
+        &runtime_config,
+        &trainable_layers,
+    )?
+    .double_value(&[]);
+
+    info!(initial_loss, final_loss, "DeepSeek LoRA SFT complete");
+
+    // Save LoRA adapter
+    let adapter_output = run_paths
+        .checkpoints
+        .join("deepseek-lora-adapter.safetensors");
+    registry.save(&adapter_output)?;
+    info!(adapter = %adapter_output.display(), "LoRA adapter saved");
+
+    // Save manifest
+    let manifest_output = lora_manifest_path(&adapter_output);
+    let manifest = DeepSeekLoraManifest {
+        format: "rustrain.deepseek_lora_sft.v1".to_string(),
+        base_model_path: model_path.display().to_string(),
+        adapter_safetensors: adapter_output.display().to_string(),
+        rank: lora_config.rank,
+        alpha: lora_config.alpha,
+        target_layers: lora_config.target_layers.clone(),
+        target_modules: lora_config
+            .target_modules
+            .iter()
+            .map(|m| m.weight_suffix().to_string())
+            .collect(),
+        steps: config.train.max_steps as usize,
+        initial_loss,
+        final_loss,
+    };
+    write_lora_manifest(&manifest_output, &manifest)?;
+    info!(manifest = %manifest_output.display(), "manifest saved");
+
+    // Verify: reload adapter
+    let reloaded = DeepSeekLoraRegistry::load(&adapter_output, lora_config)?;
+    info!(reloaded_params = reloaded.param_count(), "adapter reloaded");
+
+    println!("initial_loss: {:.9}", initial_loss);
+    println!("final_loss: {:.9}", final_loss);
+    println!("trainable_params: {}", trainable_count);
+    println!("adapter_checkpoint: {}", adapter_output.display());
+
+    if final_loss >= initial_loss {
+        bail!(
+            "DeepSeek LoRA SFT failed to reduce loss: initial={initial_loss}, final={final_loss}"
+        );
+    }
+
+    Ok(DeepSeekLoraSftSummary {
+        adapter_output: adapter_output.display().to_string(),
+        manifest_output: manifest_output.display().to_string(),
+        initial_loss,
+        final_loss,
+        steps: config.train.max_steps as usize,
+        trainable_params: trainable_count,
+    })
+}

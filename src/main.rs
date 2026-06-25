@@ -229,6 +229,18 @@ fn dispatch_train(config_path: &Path, resume_from: Option<PathBuf>) -> Result<()
         return Ok(());
     }
 
+    if is_tch && arch == "deepseek_lora_sft" {
+        let summary = rustrain_deepseek::deepseek_module::train_deepseek_lora_sft_from_config(
+            &config, &run_paths,
+        )?;
+        println!("rustrain DeepSeek LoRA SFT complete");
+        println!("run_dir: {}", run_paths.root.display());
+        println!("adapter_checkpoint: {}", summary.adapter_output);
+        println!("initial_loss: {:.9}", summary.initial_loss);
+        println!("final_loss: {:.9}", summary.final_loss);
+        return Ok(());
+    }
+
     // Default: ndarray toy model
     rustrain_toy::trainer::train(&config, &run_paths)
 }

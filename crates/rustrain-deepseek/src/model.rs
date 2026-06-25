@@ -334,6 +334,27 @@ impl DeepSeekAttentionWeights {
     }
 }
 
+impl DeepSeekAttentionWeights {
+    pub fn load_raw(weights: &BTreeMap<String, Tensor>, layer: usize) -> Result<Self> {
+        let p = format!("model.layers.{layer}.self_attn");
+        Ok(Self {
+            q_a_proj: tensor(weights, &format!("{p}.q_a_proj.weight"))?.shallow_clone(),
+            q_a_layernorm: tensor(weights, &format!("{p}.q_a_layernorm.weight"))?.shallow_clone(),
+            q_b_proj: tensor(weights, &format!("{p}.q_b_proj.weight"))?.shallow_clone(),
+            kv_a_proj_with_mqa: tensor(weights, &format!("{p}.kv_a_proj_with_mqa.weight"))?
+                .shallow_clone(),
+            kv_a_layernorm: tensor(weights, &format!("{p}.kv_a_layernorm.weight"))?.shallow_clone(),
+            kv_b_proj: tensor(weights, &format!("{p}.kv_b_proj.weight"))?.shallow_clone(),
+            o_proj: tensor(weights, &format!("{p}.o_proj.weight"))?.shallow_clone(),
+            indexer_k_norm_weight: None,
+            indexer_k_norm_bias: None,
+            indexer_weights_proj: None,
+            indexer_wk: None,
+            indexer_wq_b: None,
+        })
+    }
+}
+
 pub fn deepseek_mla_attention(
     input: &Tensor,
     attn: &DeepSeekAttentionWeights,
@@ -399,6 +420,98 @@ pub fn deepseek_mla_attention(
     context.linear::<&Tensor>(&attn.o_proj, None)
 }
 
+pub fn deepseek_mla_attention_lora(
+    input: &Tensor,
+    attn: &DeepSeekAttentionWeights,
+    config: &DeepSeekRuntimeConfig,
+    layer: usize,
+    registry: &crate::lora::DeepSeekLoraRegistry,
+) -> Tensor {
+    let shape = input.size();
+    let batch = shape[0];
+    let seq = shape[1];
+    let num_heads = config.num_attention_heads;
+    let qk_nope = config.qk_nope_head_dim;
+    let qk_rope = config.qk_rope_head_dim;
+    let v_head = config.v_head_dim;
+    let kv_lora = config.kv_lora_rank;
+
+    // Q path with LoRA
+    let q_a = lora_linear(
+        input,
+        &attn.q_a_proj,
+        layer,
+        crate::lora::DeepSeekLoraTargetModule::QAProj,
+        registry,
+    );
+    let q_a = rms_norm(&q_a, &attn.q_a_layernorm, config.rms_norm_eps);
+    let q_b = lora_linear(
+        &q_a,
+        &attn.q_b_proj,
+        layer,
+        crate::lora::DeepSeekLoraTargetModule::QBProj,
+        registry,
+    );
+    let q = q_b
+        .reshape([batch, seq, num_heads, qk_nope + qk_rope])
+        .transpose(1, 2);
+    let q_nope = q.narrow(-1, 0, qk_nope);
+    let q_rope = q.narrow(-1, qk_nope, qk_rope);
+
+    // KV path with LoRA
+    let kv_a = lora_linear(
+        input,
+        &attn.kv_a_proj_with_mqa,
+        layer,
+        crate::lora::DeepSeekLoraTargetModule::KVAProj,
+        registry,
+    );
+    let kv_lora_part = kv_a.narrow(-1, 0, kv_lora);
+    let k_rope = kv_a.narrow(-1, kv_lora, qk_rope);
+    let kv_lora_normed = rms_norm(&kv_lora_part, &attn.kv_a_layernorm, config.rms_norm_eps);
+    let kv_b = lora_linear(
+        &kv_lora_normed,
+        &attn.kv_b_proj,
+        layer,
+        crate::lora::DeepSeekLoraTargetModule::KVBProj,
+        registry,
+    );
+    let kv_b = kv_b.reshape([batch, seq, num_heads, qk_nope + v_head]);
+    let k_nope = kv_b.narrow(-1, 0, qk_nope).transpose(1, 2);
+    let v = kv_b.narrow(-1, qk_nope, v_head).transpose(1, 2);
+
+    // RoPE
+    let k_rope_expanded = k_rope
+        .unsqueeze(2)
+        .transpose(1, 2)
+        .expand([batch, num_heads, seq, qk_rope], false);
+    let (cos, sin) = rope_cos_sin(seq as usize, qk_rope, config.rope_theta, input.device());
+    let cos = cos.to_kind(input.kind());
+    let sin = sin.to_kind(input.kind());
+    let q_rope_rotated = apply_rotary(&q_rope, &cos, &sin);
+    let k_rope_rotated = apply_rotary(&k_rope_expanded, &cos, &sin);
+
+    // Attention
+    let q_full = Tensor::cat(&[&q_nope, &q_rope_rotated], -1);
+    let k_full = Tensor::cat(&[&k_nope, &k_rope_rotated], -1);
+    let scores = q_full.matmul(&k_full.transpose(-2, -1)) / ((qk_nope + qk_rope) as f64).sqrt();
+    let causal_mask = Tensor::ones([seq as i64, seq as i64], (Kind::Bool, input.device())).triu(1);
+    let scores = scores.masked_fill(&causal_mask, f64::NEG_INFINITY);
+    let probs = scores.softmax(-1, Kind::Float).to_kind(v.kind());
+    let context = probs.matmul(&v);
+    let context = context
+        .transpose(1, 2)
+        .reshape([batch, seq, num_heads * v_head]);
+
+    // Output projection with LoRA
+    lora_linear(
+        &context,
+        &attn.o_proj,
+        layer,
+        crate::lora::DeepSeekLoraTargetModule::OProj,
+        registry,
+    )
+}
 // ── Dense Layer ───────────────────────────────────────────────
 
 pub struct DeepSeekDenseLayerWeights {
@@ -425,6 +538,21 @@ impl DeepSeekDenseLayerWeights {
             gate_proj: tensor(weights, &format!("{p}.mlp.gate_proj.weight"))?.to_kind(kind),
             up_proj: tensor(weights, &format!("{p}.mlp.up_proj.weight"))?.to_kind(kind),
             down_proj: tensor(weights, &format!("{p}.mlp.down_proj.weight"))?.to_kind(kind),
+        })
+    }
+}
+
+impl DeepSeekDenseLayerWeights {
+    pub fn load_raw(weights: &BTreeMap<String, Tensor>, layer: usize) -> Result<Self> {
+        let p = format!("model.layers.{layer}");
+        Ok(Self {
+            input_norm: tensor(weights, &format!("{p}.input_layernorm.weight"))?.shallow_clone(),
+            attn: DeepSeekAttentionWeights::load_raw(weights, layer)?,
+            post_attention_norm: tensor(weights, &format!("{p}.post_attention_layernorm.weight"))?
+                .shallow_clone(),
+            gate_proj: tensor(weights, &format!("{p}.mlp.gate_proj.weight"))?.shallow_clone(),
+            up_proj: tensor(weights, &format!("{p}.mlp.up_proj.weight"))?.shallow_clone(),
+            down_proj: tensor(weights, &format!("{p}.mlp.down_proj.weight"))?.shallow_clone(),
         })
     }
 }
@@ -489,6 +617,40 @@ impl DeepSeekMoeLayerWeights {
                 .to_kind(kind),
             shared_down_proj: tensor(weights, &format!("{shared_prefix}.down_proj.weight"))?
                 .to_kind(kind),
+            experts,
+        })
+    }
+}
+
+impl DeepSeekMoeLayerWeights {
+    pub fn load_raw(
+        weights: &BTreeMap<String, Tensor>,
+        layer: usize,
+        n_experts: usize,
+    ) -> Result<Self> {
+        let p = format!("model.layers.{layer}");
+        let shared_prefix = format!("{p}.mlp.shared_experts");
+        let mut experts = Vec::with_capacity(n_experts);
+        for e in 0..n_experts {
+            let ep = format!("{p}.mlp.experts.{e}");
+            experts.push((
+                tensor(weights, &format!("{ep}.gate_proj.weight"))?.shallow_clone(),
+                tensor(weights, &format!("{ep}.up_proj.weight"))?.shallow_clone(),
+                tensor(weights, &format!("{ep}.down_proj.weight"))?.shallow_clone(),
+            ));
+        }
+        Ok(Self {
+            input_norm: tensor(weights, &format!("{p}.input_layernorm.weight"))?.shallow_clone(),
+            attn: DeepSeekAttentionWeights::load_raw(weights, layer)?,
+            post_attention_norm: tensor(weights, &format!("{p}.post_attention_layernorm.weight"))?
+                .shallow_clone(),
+            gate: tensor(weights, &format!("{p}.mlp.gate.weight"))?.shallow_clone(),
+            shared_gate_proj: tensor(weights, &format!("{shared_prefix}.gate_proj.weight"))?
+                .shallow_clone(),
+            shared_up_proj: tensor(weights, &format!("{shared_prefix}.up_proj.weight"))?
+                .shallow_clone(),
+            shared_down_proj: tensor(weights, &format!("{shared_prefix}.down_proj.weight"))?
+                .shallow_clone(),
             experts,
         })
     }
@@ -826,6 +988,211 @@ pub fn deepseek_causal_lm_loss_selective(
     trainable_layers: &[usize],
 ) -> Result<Tensor> {
     let logits = deepseek_forward_selective(input_ids, weights, config, trainable_layers)?;
+    let shifted = logits.narrow(1, 0, logits.size()[1] - 1);
+    let targets = input_ids.narrow(1, 1, input_ids.size()[1] - 1);
+    Ok(shifted
+        .reshape([-1, config.vocab_size])
+        .log_softmax(-1, Kind::Float)
+        .g_nll_loss::<&Tensor>(&targets.reshape([-1]), None, Reduction::Mean, -100))
+}
+
+/// Forward for LoRA training: uses weights as-is from BTreeMap (no to_kind conversion).
+/// This preserves the gradient connection from lora_a/lora_b through the delta_weight.
+pub fn deepseek_forward_lora(
+    input_ids: &Tensor,
+    weights: &BTreeMap<String, Tensor>,
+    config: &DeepSeekRuntimeConfig,
+    trainable_layers: &[usize],
+    lora_registry: &crate::lora::DeepSeekLoraRegistry,
+) -> Result<Tensor> {
+    let embed_tokens = tensor(weights, "model.embed_tokens.weight")?;
+    let final_norm = tensor(weights, "model.norm.weight")?;
+    let mut hidden = Tensor::embedding(&embed_tokens, input_ids, -1, false, false);
+
+    for layer in 0..config.num_hidden_layers {
+        if !trainable_layers.contains(&layer) {
+            continue;
+        }
+        if config.is_moe_layer(layer) {
+            let lw = DeepSeekMoeLayerWeights::load_raw(weights, layer, config.n_routed_experts)?;
+            let hidden_norm = rms_norm(&hidden, &lw.input_norm, config.rms_norm_eps);
+            let attn_out =
+                deepseek_mla_attention_lora(&hidden_norm, &lw.attn, config, layer, lora_registry);
+            let residual = &hidden + &attn_out;
+            let mlp_input = rms_norm(&residual, &lw.post_attention_norm, config.rms_norm_eps);
+            let mlp = deepseek_moe_mlp(
+                &mlp_input,
+                &lw.gate,
+                &lw.shared_gate_proj,
+                &lw.shared_up_proj,
+                &lw.shared_down_proj,
+                &lw.experts,
+                config.num_experts_per_tok,
+                &config.scoring_func,
+                config.n_group,
+                config.topk_group,
+                config.routed_scaling_factor,
+            );
+            hidden = residual + mlp;
+        } else {
+            let lw = DeepSeekDenseLayerWeights::load_raw(weights, layer)?;
+            let attn = apply_lora_to_attention(&lw.attn, layer, lora_registry);
+            let (gate, up, down) = apply_lora_to_mlp(
+                &lw.gate_proj,
+                &lw.up_proj,
+                &lw.down_proj,
+                layer,
+                lora_registry,
+            );
+            let hidden_norm = rms_norm(&hidden, &lw.input_norm, config.rms_norm_eps);
+            let attn_out = deepseek_mla_attention(&hidden_norm, &attn, config);
+            let residual = &hidden + &attn_out;
+            let mlp_input = rms_norm(&residual, &lw.post_attention_norm, config.rms_norm_eps);
+            let mlp = deepseek_mlp(&mlp_input, &gate, &up, &down);
+            hidden = residual + mlp;
+        }
+    }
+
+    let hidden = rms_norm(&hidden, &final_norm, config.rms_norm_eps);
+    let lm_head = if config.tie_word_embeddings {
+        embed_tokens.shallow_clone()
+    } else {
+        tensor(weights, "lm_head.weight")?.shallow_clone()
+    };
+    Ok(hidden.linear::<&Tensor>(&lm_head, None))
+}
+
+fn apply_lora_to_attention(
+    attn: &DeepSeekAttentionWeights,
+    layer: usize,
+    registry: &crate::lora::DeepSeekLoraRegistry,
+) -> DeepSeekAttentionWeights {
+    let s = registry.config.alpha as f64 / registry.config.rank as f64;
+    DeepSeekAttentionWeights {
+        q_a_proj: apply_lora_delta(
+            &attn.q_a_proj,
+            layer,
+            crate::lora::DeepSeekLoraTargetModule::QAProj,
+            registry,
+            s,
+        ),
+        q_a_layernorm: attn.q_a_layernorm.shallow_clone(),
+        q_b_proj: apply_lora_delta(
+            &attn.q_b_proj,
+            layer,
+            crate::lora::DeepSeekLoraTargetModule::QBProj,
+            registry,
+            s,
+        ),
+        kv_a_proj_with_mqa: apply_lora_delta(
+            &attn.kv_a_proj_with_mqa,
+            layer,
+            crate::lora::DeepSeekLoraTargetModule::KVAProj,
+            registry,
+            s,
+        ),
+        kv_a_layernorm: attn.kv_a_layernorm.shallow_clone(),
+        kv_b_proj: apply_lora_delta(
+            &attn.kv_b_proj,
+            layer,
+            crate::lora::DeepSeekLoraTargetModule::KVBProj,
+            registry,
+            s,
+        ),
+        o_proj: apply_lora_delta(
+            &attn.o_proj,
+            layer,
+            crate::lora::DeepSeekLoraTargetModule::OProj,
+            registry,
+            s,
+        ),
+        indexer_k_norm_weight: None,
+        indexer_k_norm_bias: None,
+        indexer_weights_proj: None,
+        indexer_wk: None,
+        indexer_wq_b: None,
+    }
+}
+
+fn apply_lora_to_mlp(
+    gate: &Tensor,
+    up: &Tensor,
+    down: &Tensor,
+    layer: usize,
+    registry: &crate::lora::DeepSeekLoraRegistry,
+) -> (Tensor, Tensor, Tensor) {
+    let s = registry.config.alpha as f64 / registry.config.rank as f64;
+    (
+        apply_lora_delta(
+            gate,
+            layer,
+            crate::lora::DeepSeekLoraTargetModule::GateProj,
+            registry,
+            s,
+        ),
+        apply_lora_delta(
+            up,
+            layer,
+            crate::lora::DeepSeekLoraTargetModule::UpProj,
+            registry,
+            s,
+        ),
+        apply_lora_delta(
+            down,
+            layer,
+            crate::lora::DeepSeekLoraTargetModule::DownProj,
+            registry,
+            s,
+        ),
+    )
+}
+
+fn apply_lora_delta(
+    base: &Tensor,
+    layer: usize,
+    module: crate::lora::DeepSeekLoraTargetModule,
+    registry: &crate::lora::DeepSeekLoraRegistry,
+    scale: f64,
+) -> Tensor {
+    if let Some(adapter) = registry.adapters.get(&(layer, module)) {
+        // Compute delta = (B @ A) * scale, then add to base
+        let delta = (adapter.lora_b.matmul(&adapter.lora_a)) * scale;
+        base.shallow_clone() + delta
+    } else {
+        base.shallow_clone()
+    }
+}
+
+/// Apply LoRA to a linear layer: output = input @ W.T + input @ A.T @ B.T * scale
+/// This computes the LoRA path separately to preserve gradient flow.
+fn lora_linear(
+    input: &Tensor,
+    base_weight: &Tensor,
+    layer: usize,
+    module: crate::lora::DeepSeekLoraTargetModule,
+    registry: &crate::lora::DeepSeekLoraRegistry,
+) -> Tensor {
+    let base_out = input.linear::<&Tensor>(base_weight, None);
+    if let Some(adapter) = registry.adapters.get(&(layer, module)) {
+        let scale = registry.config.alpha as f64 / registry.config.rank as f64;
+        // LoRA path: input -> A -> B (preserves gradient to lora_a and lora_b)
+        let lora_down = input.linear::<&Tensor>(&adapter.lora_a, None); // [batch, seq, rank]
+        let lora_up = lora_down.linear::<&Tensor>(&adapter.lora_b, None); // [batch, seq, out]
+        base_out + (lora_up * scale)
+    } else {
+        base_out
+    }
+}
+
+pub fn deepseek_causal_lm_loss_lora(
+    input_ids: &Tensor,
+    weights: &BTreeMap<String, Tensor>,
+    config: &DeepSeekRuntimeConfig,
+    trainable_layers: &[usize],
+    lora_registry: &crate::lora::DeepSeekLoraRegistry,
+) -> Result<Tensor> {
+    let logits =
+        deepseek_forward_lora(input_ids, weights, config, trainable_layers, lora_registry)?;
     let shifted = logits.narrow(1, 0, logits.size()[1] - 1);
     let targets = input_ids.narrow(1, 1, input_ids.size()[1] - 1);
     Ok(shifted
