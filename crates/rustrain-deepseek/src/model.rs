@@ -38,6 +38,11 @@ pub struct DeepSeekRuntimeConfig {
     pub moe_intermediate_size: usize,
     pub intermediate_size: usize,
     pub vocab_size: i64,
+    pub scoring_func: String,
+    pub n_group: usize,
+    pub topk_group: usize,
+    pub routed_scaling_factor: f64,
+    pub is_v32: bool,
 }
 
 impl DeepSeekRuntimeConfig {
@@ -81,6 +86,14 @@ struct DeepSeekModelConfig {
     moe_intermediate_size: Option<usize>,
     #[serde(default)]
     intermediate_size: Option<usize>,
+    #[serde(default)]
+    scoring_func: Option<String>,
+    #[serde(default)]
+    n_group: Option<usize>,
+    #[serde(default)]
+    topk_group: Option<usize>,
+    #[serde(default)]
+    routed_scaling_factor: Option<f64>,
 }
 
 pub fn read_deepseek_config(path: &Path) -> Result<DeepSeekRuntimeConfig> {
@@ -107,6 +120,11 @@ pub fn read_deepseek_config(path: &Path) -> Result<DeepSeekRuntimeConfig> {
         moe_intermediate_size: c.moe_intermediate_size.unwrap_or(0),
         intermediate_size: c.intermediate_size.unwrap_or(18432),
         vocab_size: c.vocab_size,
+        scoring_func: c.scoring_func.unwrap_or_else(|| "softmax".to_string()),
+        n_group: c.n_group.unwrap_or(1),
+        topk_group: c.topk_group.unwrap_or(1),
+        routed_scaling_factor: c.routed_scaling_factor.unwrap_or(1.0),
+        is_v32: c.model_type == "deepseek_v32",
     })
 }
 
@@ -264,6 +282,12 @@ pub struct DeepSeekAttentionWeights {
     pub kv_a_layernorm: Tensor,
     pub kv_b_proj: Tensor,
     pub o_proj: Tensor,
+    // V3.2 indexer (optional, loaded if present)
+    pub indexer_k_norm_weight: Option<Tensor>,
+    pub indexer_k_norm_bias: Option<Tensor>,
+    pub indexer_weights_proj: Option<Tensor>,
+    pub indexer_wk: Option<Tensor>,
+    pub indexer_wq_b: Option<Tensor>,
 }
 
 impl DeepSeekAttentionWeights {
@@ -277,6 +301,21 @@ impl DeepSeekAttentionWeights {
         kind: Kind,
     ) -> Result<Self> {
         let p = format!("model.layers.{layer}.self_attn");
+        let indexer_k_norm_weight = weights
+            .get(&format!("{p}.self_attn.indexer.k_norm.weight"))
+            .map(|t| t.to_kind(kind));
+        let indexer_k_norm_bias = weights
+            .get(&format!("{p}.self_attn.indexer.k_norm.bias"))
+            .map(|t| t.to_kind(kind));
+        let indexer_weights_proj = weights
+            .get(&format!("{p}.self_attn.indexer.weights_proj.weight"))
+            .map(|t| t.to_kind(kind));
+        let indexer_wk = weights
+            .get(&format!("{p}.self_attn.indexer.wk.weight"))
+            .map(|t| t.to_kind(kind));
+        let indexer_wq_b = weights
+            .get(&format!("{p}.self_attn.indexer.wq_b.weight"))
+            .map(|t| t.to_kind(kind));
         Ok(Self {
             q_a_proj: tensor(weights, &format!("{p}.q_a_proj.weight"))?.to_kind(kind),
             q_a_layernorm: tensor(weights, &format!("{p}.q_a_layernorm.weight"))?.to_kind(kind),
@@ -286,6 +325,11 @@ impl DeepSeekAttentionWeights {
             kv_a_layernorm: tensor(weights, &format!("{p}.kv_a_layernorm.weight"))?.to_kind(kind),
             kv_b_proj: tensor(weights, &format!("{p}.kv_b_proj.weight"))?.to_kind(kind),
             o_proj: tensor(weights, &format!("{p}.o_proj.weight"))?.to_kind(kind),
+            indexer_k_norm_weight,
+            indexer_k_norm_bias,
+            indexer_weights_proj,
+            indexer_wk,
+            indexer_wq_b,
         })
     }
 }
@@ -458,39 +502,69 @@ pub fn deepseek_moe_mlp(
     shared_down: &Tensor,
     experts: &[(Tensor, Tensor, Tensor)],
     num_experts_per_tok: usize,
+    scoring_func: &str,
+    n_group: usize,
+    topk_group: usize,
+    routed_scaling_factor: f64,
 ) -> Tensor {
-    // Shared expert (always computed)
     let shared_output = deepseek_mlp(input, shared_gate, shared_up, shared_down);
-
-    // Router logits
-    let router_logits = input.linear::<&Tensor>(gate, None); // [batch, seq, n_experts]
+    let router_logits = input.linear::<&Tensor>(gate, None);
     let n_experts = experts.len() as i64;
 
-    // Top-k selection with softmax over selected experts
-    let (topk_weights, topk_indices) =
-        router_logits.topk(num_experts_per_tok as i64, -1, true, true);
-    // Softmax over selected
-    let topk_weights = topk_weights.softmax(-1, Kind::Float);
+    let (topk_weights, topk_indices) = if scoring_func == "sigmoid" {
+        let scores = router_logits.sigmoid();
+        if n_group > 1 {
+            let epg = n_experts / n_group as i64;
+            let group_scores = scores
+                .reshape([-1, n_group as i64, epg])
+                .sum_dim_intlist([-1].as_slice(), true, Kind::Float)
+                .squeeze_dim(-1);
+            let (_, group_idx) = group_scores.topk(topk_group as i64, -1, true, true);
+            let mut group_mask = Tensor::zeros(
+                [group_scores.size()[0], n_group as i64],
+                (scores.kind(), scores.device()),
+            );
+            let _ = group_mask.scatter_(
+                -1,
+                &group_idx,
+                &Tensor::scalar_tensor(1.0, (scores.kind(), scores.device())),
+            );
+            let group_mask = group_mask
+                .unsqueeze(-1)
+                .expand([-1, -1, epg], false)
+                .reshape([-1, n_experts]);
+            let masked = scores.reshape([-1, n_experts]) * &group_mask;
+            let (tw, ti) = masked.topk(num_experts_per_tok as i64, -1, true, true);
+            let denom = tw
+                .sum_dim_intlist([-1].as_slice(), true, Kind::Float)
+                .clamp_min(1e-9);
+            (tw / &denom * routed_scaling_factor, ti)
+        } else {
+            let (tw, ti) = scores.topk(num_experts_per_tok as i64, -1, true, true);
+            let denom = tw
+                .sum_dim_intlist([-1].as_slice(), true, Kind::Float)
+                .clamp_min(1e-9);
+            (tw / &denom * routed_scaling_factor, ti)
+        }
+    } else {
+        let (tw, ti) = router_logits.topk(num_experts_per_tok as i64, -1, true, true);
+        (tw.softmax(-1, Kind::Float), ti)
+    };
 
-    // Accumulate expert outputs
     let mut output = shared_output;
-
     for k in 0..num_experts_per_tok {
-        let expert_indices = topk_indices.select(-1, k as i64); // [batch, seq]
-        let expert_weights = topk_weights.select(-1, k as i64); // [batch, seq]
-        let weights_kind = expert_weights.kind();
-
-        for (expert_idx, (gate_p, up_p, down_p)) in experts.iter().enumerate() {
-            let mask = expert_indices.eq(expert_idx as i64).to_kind(weights_kind);
-            let mask_sum = mask.sum(Kind::Float).double_value(&[]);
-            if mask_sum > 0.0 {
-                let expert_out = deepseek_mlp(input, gate_p, up_p, down_p);
-                let weight = (&expert_weights * &mask).unsqueeze(-1);
-                output = output + (expert_out * weight);
+        let expert_indices = topk_indices.select(-1, k as i64);
+        let expert_weights = topk_weights.select(-1, k as i64);
+        let wk = expert_weights.kind();
+        for (ei, (gp, up, dp)) in experts.iter().enumerate() {
+            let mask = expert_indices.eq(ei as i64).to_kind(wk);
+            if mask.sum(Kind::Float).double_value(&[]) > 0.0 {
+                let eo = deepseek_mlp(input, gp, up, dp);
+                let w = (&expert_weights * &mask).unsqueeze(-1);
+                output = output + (eo * w);
             }
         }
     }
-
     output
 }
 
@@ -511,6 +585,10 @@ pub fn deepseek_moe_layer(
         &weights.shared_down_proj,
         &weights.experts,
         config.num_experts_per_tok,
+        &config.scoring_func,
+        config.n_group,
+        config.topk_group,
+        config.routed_scaling_factor,
     );
     residual + mlp
 }
@@ -599,6 +677,14 @@ pub fn deepseek_trainable_tensors_for_layer(
         format!("{p}.self_attn.o_proj.weight"),
         format!("{p}.post_attention_layernorm.weight"),
     ];
+    // V3.2 indexer weights
+    if config.is_v32 {
+        names.push(format!("{p}.self_attn.indexer.k_norm.weight"));
+        names.push(format!("{p}.self_attn.indexer.k_norm.bias"));
+        names.push(format!("{p}.self_attn.indexer.weights_proj.weight"));
+        names.push(format!("{p}.self_attn.indexer.wk.weight"));
+        names.push(format!("{p}.self_attn.indexer.wq_b.weight"));
+    }
     if config.is_moe_layer(layer) {
         names.push(format!("{p}.mlp.gate.weight"));
         names.push(format!("{p}.mlp.shared_experts.gate_proj.weight"));
