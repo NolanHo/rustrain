@@ -227,7 +227,8 @@ pub fn rms_norm(input: &Tensor, weight: &Tensor, eps: f64) -> Tensor {
     let variance = input
         .pow_tensor_scalar(2.0)
         .mean_dim([-1].as_slice(), true, Kind::Float);
-    input * (variance + eps).rsqrt() * weight
+    let result = input * (variance + eps).rsqrt() * weight;
+    result.to_kind(input.kind())
 }
 
 pub fn deepseek_mlp(
@@ -1052,7 +1053,7 @@ fn lora_weight(
     if let Some((lora_a, lora_b)) = registry.adapters.get(&(layer, module)) {
         let scale = registry.config.alpha as f64 / lora_a.size()[0] as f64;
         let delta = lora_b.matmul(lora_a) * scale;
-        base.shallow_clone() + delta
+        base.shallow_clone() + delta.to_device(base.device()).to_kind(base.kind())
     } else {
         base.shallow_clone()
     }

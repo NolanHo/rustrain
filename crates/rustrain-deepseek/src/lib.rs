@@ -3,6 +3,7 @@
 
 pub mod deepseek_module;
 pub mod ep;
+pub mod generate;
 pub mod lora;
 pub mod model;
 pub mod session;

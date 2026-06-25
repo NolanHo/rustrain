@@ -294,13 +294,19 @@ pub fn train_deepseek_lora_sft_from_config(
         .map(|(name, t)| (name, t.to_device(device)))
         .collect();
 
-    // Convert all weights to Float (no requires_grad on base)
+    // Convert all weights to compute dtype
     for t in weights_gpu.values_mut() {
-        *t = t.to_kind(Kind::Float);
+        *t = t.to_kind(compute_kind);
     }
 
-    // Create LoRA registry
-    let mut registry = DeepSeekLoraRegistry::new(&weights_gpu, lora_config.clone(), device)?;
+    // Create LoRA registry (or load from checkpoint if resume_from is set)
+    let mut registry = if let Some(resume_path) = config.train.resume_from.as_ref() {
+        info!(resume_from = %resume_path.display(), "resuming LoRA SFT from checkpoint");
+        // resume_path is the adapter safetensors file
+        DeepSeekLoraRegistry::load(resume_path, lora_config.clone())?
+    } else {
+        DeepSeekLoraRegistry::new(&weights_gpu, lora_config.clone(), device)?
+    };
     let trainable_count = registry.var_store.trainable_variables().len();
     info!(trainable_params = trainable_count, "LoRA adapters created");
 
@@ -351,7 +357,7 @@ pub fn train_deepseek_lora_sft_from_config(
         for (i, var) in current_vars.iter_mut().enumerate() {
             let grad = var.grad();
             if grad.defined() {
-                let g = grad.to_kind(Kind::Float);
+                let g = grad.to_kind(Kind::Float); // always compute AdamW in fp32
                 let m = &mut adam_m[i];
                 let v = &mut adam_v[i];
                 *m = m.shallow_clone() * beta1 + &(&g * (1.0 - beta1));
