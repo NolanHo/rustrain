@@ -211,6 +211,7 @@ print(out)
 // ── LoRA SFT ─────────────────────────────────────────────────
 
 use crate::lora::*;
+use crate::sft::*;
 use rustrain_core::runtime::LrScheduler;
 
 pub struct DeepSeekLoraSftSummary {

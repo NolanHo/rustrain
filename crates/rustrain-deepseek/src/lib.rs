@@ -5,3 +5,4 @@ pub mod deepseek_module;
 pub mod lora;
 pub mod model;
 pub mod session;
+pub mod sft;
