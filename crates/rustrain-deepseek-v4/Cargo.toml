@@ -1,0 +1,29 @@
+[package]
+name = "rustrain-deepseek-v4"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+rustrain-core = { path = "../rustrain-core", features = ["tch"] }
+rustrain-data = { path = "../rustrain-data" }
+rustrain-checkpoint = { path = "../rustrain-checkpoint", features = ["tch"] }
+rustrain-train = { path = "../rustrain-train" }
+rustrain-parallel = { path = "../rustrain-parallel", features = ["nccl"] }
+rustrain-nccl = { path = "../rustrain-nccl" }
+anyhow.workspace = true
+chrono.workspace = true
+clap.workspace = true
+ndarray.workspace = true
+rand.workspace = true
+rand_distr.workspace = true
+regex.workspace = true
+safetensors.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tch.workspace = true
+tokenizers.workspace = true
+toml.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
