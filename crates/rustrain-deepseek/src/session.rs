@@ -293,55 +293,48 @@ pub fn train_deepseek_lora_sft_from_config(
         .map(|(name, t)| (name, t.to_device(device)))
         .collect();
 
-    // Convert all weights to Float and set requires_grad for gradient flow
-    // (we only update LoRA params, not base weights, but gradient needs to flow through)
+    // Convert all weights to Float (no requires_grad on base)
     for t in weights_gpu.values_mut() {
-        *t = t.to_kind(Kind::Float).set_requires_grad(true);
+        *t = t.to_kind(Kind::Float);
     }
 
     // Create LoRA registry
     let mut registry = DeepSeekLoraRegistry::new(&weights_gpu, lora_config.clone(), device)?;
-    let trainable_count = registry.param_count();
+    let trainable_count = registry.var_store.trainable_variables().len();
     info!(trainable_params = trainable_count, "LoRA adapters created");
 
-    // Store original base weights (with requires_grad for gradient flow)
+    // Store original base weights (no requires_grad)
     let original_weights: BTreeMap<String, Tensor> = weights_gpu
         .iter()
-        .map(|(k, v)| (k.clone(), v.shallow_clone().set_requires_grad(true)))
+        .map(|(k, v)| (k.clone(), v.shallow_clone()))
         .collect();
 
     // Explicitly set requires_grad on LoRA params
-    for adapter in registry.adapters.values() {
-        let _ = adapter.lora_a.set_requires_grad(true);
-        let _ = adapter.lora_b.set_requires_grad(true);
-    }
 
     // Create training input (simple 5-token sequence for verification)
     let input_ids = Tensor::from_slice(&[1i64, 2, 3, 4, 5])
         .reshape([1, 5])
         .to_device(device);
 
-    // AdamW optimizer state
+    // AdamW optimizer (manual, same as Qwen3)
     let lr = config.train.learning_rate as f64;
     let beta1 = config.train.adam_beta1 as f64;
     let beta2 = config.train.adam_beta2 as f64;
     let eps = config.train.adam_eps as f64;
-    // Collect LoRA params once for optimizer state
-    let mut lora_params: Vec<Tensor> = registry.trainable_parameters();
-    let mut adam_m: Vec<Tensor> = lora_params.iter().map(Tensor::zeros_like).collect();
-    let mut adam_v: Vec<Tensor> = lora_params.iter().map(Tensor::zeros_like).collect();
+    let trainable_vars = registry.var_store.trainable_variables();
+    let mut adam_m: Vec<Tensor> = trainable_vars.iter().map(Tensor::zeros_like).collect();
+    let mut adam_v: Vec<Tensor> = trainable_vars.iter().map(Tensor::zeros_like).collect();
 
     let mut initial_loss = 0.0_f64;
 
     for step in 0..config.train.max_steps {
-        // LoRA is applied inline during forward, no need to modify weights_gpu
-
-        // Forward
-        let loss = deepseek_causal_lm_loss_selective(
+        // Forward (LoRA applied inline via lora_weight)
+        let loss = deepseek_causal_lm_loss_lora(
             &input_ids,
-            &weights_gpu,
+            &original_weights,
             &runtime_config,
             &trainable_layers,
+            &registry,
         )?;
         let loss_val = loss.double_value(&[]);
         if step == 0 {
@@ -352,37 +345,33 @@ pub fn train_deepseek_lora_sft_from_config(
         // Backward
         loss.backward();
 
-        // AdamW update on LoRA params
-        for (i, param) in lora_params.iter_mut().enumerate() {
-            let grad = param.grad();
+        // AdamW update on VarStore trainable variables
+        let mut current_vars = registry.var_store.trainable_variables();
+        for (i, var) in current_vars.iter_mut().enumerate() {
+            let grad = var.grad();
             if grad.defined() {
                 let g = grad.to_kind(Kind::Float);
                 let m = &mut adam_m[i];
                 let v = &mut adam_v[i];
-                let _ = no_grad(|| {
-                    m.f_mul_scalar_(beta1);
-                    m.f_add_(&(&g * (1.0 - beta1)))?;
-                    v.f_mul_scalar_(beta2);
-                    v.f_add_(&(&g * &g * (1.0 - beta2)))?;
-                    Ok::<(), tch::TchError>(())
-                })?;
-                let step_num = (step + 1) as f64;
-                let m_hat = m.shallow_clone() / (1.0 - beta1.powf(step_num));
-                let v_hat = v.shallow_clone() / (1.0 - beta2.powf(step_num));
-                let update = m_hat / (v_hat.sqrt() + eps);
-                let _ = no_grad(|| param.f_sub_(&(update * lr)));
+                *m = m.shallow_clone() * beta1 + &(&g * (1.0 - beta1));
+                *v = v.shallow_clone() * beta2 + &(&g * &g * (1.0 - beta2));
+                let sn = (step + 1) as f64;
+                let mh = m.shallow_clone() / (1.0 - beta1.powf(sn));
+                let vh = v.shallow_clone() / (1.0 - beta2.powf(sn));
+                let update = &mh / (vh.sqrt() + eps);
+                let _ = no_grad(|| var.f_add_(&(update * (-lr))));
             }
-            param.zero_grad();
+            var.zero_grad();
         }
     }
 
     // Final loss
-    registry.apply_to_weights(&mut weights_gpu);
-    let final_loss = deepseek_causal_lm_loss_selective(
+    let final_loss = deepseek_causal_lm_loss_lora(
         &input_ids,
-        &weights_gpu,
+        &original_weights,
         &runtime_config,
         &trainable_layers,
+        &registry,
     )?
     .double_value(&[]);
 
