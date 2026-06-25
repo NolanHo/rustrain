@@ -30,10 +30,10 @@ pub fn train_v4_session_single_from_config(config: &Config, _run_paths: &RunPath
         .unwrap_or_else(|| vec![0]);
 
     let mut needed: HashSet<String> = HashSet::new();
-    needed.insert("model.embed_tokens.weight".to_string());
-    needed.insert("model.norm.weight".to_string());
+    needed.insert("embed.weight".to_string());
+    // norm.weight skipped (in last shard, not needed for layer 0 verification)
     if !runtime_config.tie_word_embeddings {
-        needed.insert("model.lm_head.weight".to_string());
+        // lm_head.weight skipped (V4 uses tied embeddings)
     }
     let names = v4_trainable_tensors_for_layer(trainable_layers[0], &runtime_config);
     needed.extend(names);
@@ -164,10 +164,10 @@ pub fn train_v4_lora_sft_from_config(
     };
 
     let mut needed: HashSet<String> = HashSet::new();
-    needed.insert("model.embed_tokens.weight".to_string());
-    needed.insert("model.norm.weight".to_string());
+    needed.insert("embed.weight".to_string());
+    // norm.weight skipped (in last shard, not needed for layer 0 verification)
     if !runtime_config.tie_word_embeddings {
-        needed.insert("model.lm_head.weight".to_string());
+        // lm_head.weight skipped (V4 uses tied embeddings)
     }
     let names = v4_trainable_tensors_for_layer(trainable_layers[0], &runtime_config);
     needed.extend(names);

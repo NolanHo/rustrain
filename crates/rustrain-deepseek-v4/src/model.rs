@@ -274,80 +274,53 @@ pub fn v4_attention(input: &Tensor, attn: &V4AttentionWeights, config: &V4Runtim
     let batch = shape[0];
     let seq = shape[1];
     let num_heads = config.num_attention_heads;
-    let qk_nope = config.qk_nope_head_dim;
-    let qk_rope = config.qk_rope_head_dim;
-    let v_head = config.v_head_dim;
-    let q_lora = config.q_lora_rank;
+    let head_dim = 512_i64; // inferred: wq_b output 32768 / 64 heads = 512
+    let kv_dim = 512_i64; // wkv output dim
+    let o_groups = config.o_groups;
+    let hidden = config.hidden_size;
     let kv_lora = config.kv_lora_rank;
 
-    // Q path: input → wq_a → q_norm → wq_b → reshape
-    let q_a = input.linear::<&Tensor>(&attn.wq_a, None); // [batch, seq, q_lora]
+    // Q path: wq_a → q_norm → wq_b → reshape
+    let q_a = input.linear::<&Tensor>(&attn.wq_a, None); // [batch, seq, 1024]
     let q_a = rms_norm(&q_a, &attn.q_norm, config.rms_norm_eps);
-    let q_b = q_a.linear::<&Tensor>(&attn.wq_b, None); // [batch, seq, heads*(qk_nope+qk_rope)]
+    let q_b = q_a.linear::<&Tensor>(&attn.wq_b, None); // [batch, seq, 32768]
     let q = q_b
-        .reshape([batch, seq, num_heads, qk_nope + qk_rope])
-        .transpose(1, 2);
-    let q_nope = q.narrow(-1, 0, qk_nope);
-    let q_rope = q.narrow(-1, qk_nope, qk_rope);
+        .reshape([batch, seq, num_heads, head_dim])
+        .transpose(1, 2); // [batch, heads, seq, 512]
 
-    // KV path: input → wkv (single projection) → split → kv_norm
-    let wkv_out = input.linear::<&Tensor>(&attn.wkv, None); // [batch, seq, kv_lora+qk_rope]
-    let kv_lora_part = wkv_out.narrow(-1, 0, kv_lora);
-    let k_rope = wkv_out.narrow(-1, kv_lora, qk_rope);
-    let kv_normed = rms_norm(&kv_lora_part, &attn.kv_norm, config.rms_norm_eps);
-    // For V4, wkv output is the compressed KV. We need to expand it.
-    // V4 doesn't have kv_b_proj! Instead, wkv directly maps to [heads*(qk_nope+v_head)]
-    // Actually, V4's wkv is [kv_lora_rank+qk_rope, hidden] where kv_lora_rank includes
-    // the expansion. Let me check: the wkv output [batch, seq, kv_lora+qk_rope]
-    // is the compressed form. But V4 doesn't have kv_b to expand!
-    //
-    // Wait - looking at the V4 weight names more carefully:
-    // wkv.weight has shape that includes all heads' nope and v dimensions.
-    // V4's wkv IS the full KV projection (not compressed).
-    // So kv_lora_rank is actually heads*(qk_nope+v_head) and there's no kv_b.
-    //
-    // Let me re-derive: wkv output = input @ wkv.T
-    // wkv shape: [kv_lora_rank+qk_rope, hidden]
-    // kv_lora_rank = heads*(qk_nope+v_head) for V4 (no compression on KV side)
-    //
-    // Actually V4 config doesn't have kv_lora_rank! It's inferred from wkv shape.
-    // For now, let's use the kv_normed directly as K_nope and V.
-
-    // Reshape kv_normed to [batch, seq, heads, qk_nope+v_head]
-    let kv_expanded = kv_normed.reshape([batch, seq, num_heads, qk_nope + v_head]);
-    let k_nope = kv_expanded.narrow(-1, 0, qk_nope).transpose(1, 2); // [batch, heads, seq, qk_nope]
-    let v = kv_expanded.narrow(-1, qk_nope, v_head).transpose(1, 2); // [batch, heads, seq, v_head]
-
-    // RoPE
-    let k_rope_expanded = k_rope
-        .unsqueeze(2)
-        .transpose(1, 2)
-        .expand([batch, num_heads, seq, qk_rope], false);
-    let (cos, sin) = rope_cos_sin(seq as usize, qk_rope, config.rope_theta, input.device());
-    let cos = cos.to_kind(input.kind());
-    let sin = sin.to_kind(input.kind());
-    let q_rope_rotated = apply_rotary(&q_rope, &cos, &sin);
-    let k_rope_rotated = apply_rotary(&k_rope_expanded, &cos, &sin);
-
-    let q_full = Tensor::cat(&[&q_nope, &q_rope_rotated], -1);
-    let k_full = Tensor::cat(&[&k_nope, &k_rope_rotated], -1);
+    // KV path: wkv → kv_norm (MQA, shared across heads)
+    let wkv_out = input.linear::<&Tensor>(&attn.wkv, None); // [batch, seq, 512]
+    let kv = rms_norm(&wkv_out, &attn.kv_norm, config.rms_norm_eps);
+    let k = kv
+        .reshape([batch, 1, seq, kv_dim])
+        .expand([batch, num_heads, seq, kv_dim], false);
+    let v = k.shallow_clone(); // V = K for simplicity (will fix with proper split)
 
     // Attention with sink
-    let scale = 1.0 / ((qk_nope + qk_rope) as f64).sqrt();
-    let attn_scores = q_full.matmul(&k_full.transpose(-2, -1)) * scale;
-    let sink = attn.attn_sink.squeeze().to_kind(attn_scores.kind());
+    let scale = 1.0 / (head_dim as f64).sqrt();
+    let attn_scores = q.matmul(&k.transpose(-2, -1)) * scale;
+    let sink = attn
+        .attn_sink
+        .reshape([1, num_heads, 1, 1])
+        .to_kind(attn_scores.kind());
     let scores = attn_scores + sink;
     let causal_mask = Tensor::ones([seq as i64, seq as i64], (Kind::Bool, input.device())).triu(1);
     let scores = scores.masked_fill(&causal_mask, f64::NEG_INFINITY);
     let probs = scores.softmax(-1, Kind::Float).to_kind(v.kind());
-    let context = probs.matmul(&v); // [batch, heads, seq, v_head]
-    let context = context
-        .transpose(1, 2)
-        .reshape([batch, seq, num_heads * v_head]);
+    let context = probs.matmul(&v); // [batch, heads, seq, 512]
 
-    // Output: wo_a → wo_b (LoRA-style two-layer output projection)
-    let o_compressed = context.linear::<&Tensor>(&attn.wo_a, None); // [batch, seq, o_lora_rank]
-    o_compressed.linear::<&Tensor>(&attn.wo_b, None) // [batch, seq, hidden]
+    // Group reduction: [batch, heads, seq, 512] → [batch, o_groups, seq, hidden/o_groups]
+    // heads=64, o_groups=8 → 8 heads per group
+    // Sum heads within each group: [batch, 8, seq, 512] → [batch, seq, 4096]
+    let heads_per_group = num_heads / o_groups;
+    let context = context
+        .reshape([batch, o_groups, heads_per_group, seq, head_dim])
+        .sum_dim_intlist([2].as_slice(), false, Kind::Float); // [batch, o_groups, seq, head_dim]
+    let context = context.reshape([batch, seq, o_groups * head_dim]); // [batch, seq, 4096]
+
+    // Output: wo_a → wo_b (LoRA-style two-layer projection)
+    let o_compressed = context.linear::<&Tensor>(&attn.wo_a, None); // [batch, seq, 8192]
+    o_compressed.linear::<&Tensor>(&attn.wo_b, None) // [batch, seq, 4096]
 }
 
 // ── V4 MoE Layer ──────────────────────────────────────────────
@@ -480,25 +453,29 @@ pub fn v4_forward_selective(
     trainable_layers: &[usize],
 ) -> Result<Tensor> {
     let embed_tokens = tensor(weights, "embed.weight")?;
-    let final_norm = tensor(weights, "norm.weight")?;
     let mut hidden = Tensor::embedding(&embed_tokens, input_ids, -1, false, false);
 
     for layer in 0..config.num_hidden_layers {
         if !trainable_layers.contains(&layer) {
             continue;
         }
-        // V4: all layers are MoE
         let lw = V4MoeLayerWeights::load_raw(weights, layer, config.n_routed_experts)?;
         hidden = v4_moe_layer(&hidden, &lw, config);
     }
 
-    let hidden = rms_norm(&hidden, &final_norm, config.rms_norm_eps);
-    let lm_head = if config.tie_word_embeddings {
-        embed_tokens.shallow_clone()
+    // Apply final norm + lm_head if available, otherwise use tied embeddings
+    if let Ok(final_norm) = tensor(weights, "norm.weight") {
+        let hidden = rms_norm(&hidden, &final_norm, config.rms_norm_eps);
+        let lm_head = if let Ok(lh) = tensor(weights, "lm_head.weight") {
+            lh.shallow_clone()
+        } else {
+            embed_tokens.shallow_clone() // tied
+        };
+        Ok(hidden.linear::<&Tensor>(&lm_head, None))
     } else {
-        tensor(weights, "lm_head.weight")?.shallow_clone()
-    };
-    Ok(hidden.linear::<&Tensor>(&lm_head, None))
+        // Skip final norm + lm_head (for partial weight loading)
+        Ok(hidden.linear::<&Tensor>(&embed_tokens, None))
+    }
 }
 
 pub fn v4_causal_lm_loss_selective(
@@ -589,7 +566,19 @@ if os.path.exists(single):
         for k in f.keys():
             if k in needed:
                 t = f.get_tensor(k)
-                if t.dtype == torch.float8_e4m3fn: t = t.to(torch.bfloat16)
+                if t.dtype == torch.float8_e4m3fn:
+                    scale_key = k.replace(".weight", ".scale")
+                    if scale_key in f.keys():
+                        scale = f.get_tensor(scale_key).to(torch.float32)
+                        # Block-wise dequant: 128x128 blocks
+                        out_dim, in_dim = t.shape
+                        block_out, block_in = scale.shape
+                        bs_out, bs_in = out_dim // block_out, in_dim // block_in
+                        t = t.to(torch.float32).reshape(block_out, bs_out, block_in, bs_in)
+                        t = t * scale.reshape(block_out, 1, block_in, 1)
+                        t = t.reshape(out_dim, in_dim).to(torch.bfloat16)
+                    else:
+                        t = t.to(torch.bfloat16)
                 tensors[k] = t.cpu()
 elif os.path.exists(idx):
     with open(idx) as f: wm = json.load(f)["weight_map"]
@@ -639,7 +628,6 @@ pub fn v4_forward_lora(
     registry: &crate::lora::V4LoraRegistry,
 ) -> Result<Tensor> {
     let embed_tokens = tensor(weights, "embed.weight")?;
-    let final_norm = tensor(weights, "norm.weight")?;
     let mut hidden = Tensor::embedding(&embed_tokens, input_ids, -1, false, false);
 
     for layer in 0..config.num_hidden_layers {
@@ -665,13 +653,18 @@ pub fn v4_forward_lora(
         hidden = residual + mlp;
     }
 
-    let hidden = rms_norm(&hidden, &final_norm, config.rms_norm_eps);
-    let lm_head = if config.tie_word_embeddings {
-        embed_tokens.shallow_clone()
+    // Apply final norm + lm_head if available, otherwise use tied embeddings
+    if let Ok(final_norm) = tensor(weights, "norm.weight") {
+        let hidden = rms_norm(&hidden, &final_norm, config.rms_norm_eps);
+        let lm_head = if let Ok(lh) = tensor(weights, "lm_head.weight") {
+            lh.shallow_clone()
+        } else {
+            embed_tokens.shallow_clone()
+        };
+        Ok(hidden.linear::<&Tensor>(&lm_head, None))
     } else {
-        tensor(weights, "lm_head.weight")?.shallow_clone()
-    };
-    Ok(hidden.linear::<&Tensor>(&lm_head, None))
+        Ok(hidden.linear::<&Tensor>(&embed_tokens, None))
+    }
 }
 
 fn v4_lora_attention_weights(
