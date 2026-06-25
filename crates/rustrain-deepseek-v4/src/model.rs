@@ -38,6 +38,13 @@ pub struct V4RuntimeConfig {
     pub o_lora_rank: i64,
     pub o_groups: i64,
     pub expert_dtype: String,
+    pub sliding_window: usize,
+    pub compress_ratios: Vec<usize>,
+    pub hc_sinkhorn_iters: usize,
+    pub hc_mult: usize,
+    pub hc_eps: f64,
+    pub topk_method: String,
+    pub num_nextn_predict_layers: usize,
 }
 
 #[derive(Debug, Deserialize)]
@@ -77,6 +84,20 @@ struct V4ModelConfig {
     o_groups: Option<i64>,
     #[serde(default)]
     expert_dtype: Option<String>,
+    #[serde(default)]
+    sliding_window: Option<usize>,
+    #[serde(default)]
+    compress_ratios: Option<Vec<usize>>,
+    #[serde(default)]
+    hc_sinkhorn_iters: Option<usize>,
+    #[serde(default)]
+    hc_mult: Option<usize>,
+    #[serde(default)]
+    hc_eps: Option<f64>,
+    #[serde(default)]
+    topk_method: Option<String>,
+    #[serde(default)]
+    num_nextn_predict_layers: Option<usize>,
 }
 
 pub fn read_v4_config(path: &Path) -> Result<V4RuntimeConfig> {
@@ -107,6 +128,13 @@ pub fn read_v4_config(path: &Path) -> Result<V4RuntimeConfig> {
         o_lora_rank: c.o_lora_rank.unwrap_or(1024),
         o_groups: c.o_groups.unwrap_or(8),
         expert_dtype: c.expert_dtype.unwrap_or_else(|| "fp8".to_string()),
+        sliding_window: c.sliding_window.unwrap_or(0),
+        compress_ratios: c.compress_ratios.unwrap_or_default(),
+        hc_sinkhorn_iters: c.hc_sinkhorn_iters.unwrap_or(20),
+        hc_mult: c.hc_mult.unwrap_or(4),
+        hc_eps: c.hc_eps.unwrap_or(1e-6),
+        topk_method: c.topk_method.unwrap_or_else(|| "noaux_tc".to_string()),
+        num_nextn_predict_layers: c.num_nextn_predict_layers.unwrap_or(0),
     })
 }
 
@@ -240,6 +268,46 @@ pub(crate) fn apply_rotary(x: &Tensor, cos: &Tensor, sin: &Tensor) -> Tensor {
     x * cos + rotated * sin
 }
 
+/// Compress sequence by pooling adjacent tokens.
+/// ratio=0: no change. ratio=N: pool every N tokens into 1.
+pub fn compress_seq(hidden: &Tensor, ratio: usize) -> Tensor {
+    if ratio <= 1 {
+        return hidden.shallow_clone();
+    }
+    let seq = hidden.size()[1];
+    let new_seq = seq / ratio as i64;
+    if new_seq == 0 {
+        return hidden.shallow_clone();
+    }
+    // Truncate to multiple of ratio, then reshape and mean
+    let truncated = hidden.narrow(1, 0, new_seq * ratio as i64);
+    let shape = truncated.size();
+    let batch = shape[0];
+    let dim = shape[2];
+    truncated
+        .reshape([batch, new_seq, ratio as i64, dim])
+        .mean_dim([2].as_slice(), false, Kind::Float)
+}
+
+/// Decompress sequence by repeating tokens.
+pub fn decompress_seq(hidden: &Tensor, ratio: usize, target_seq: i64) -> Tensor {
+    if ratio <= 1 {
+        return hidden.shallow_clone();
+    }
+    let seq = hidden.size()[1];
+    if seq >= target_seq {
+        return hidden.narrow(1, 0, target_seq).shallow_clone();
+    }
+    // Repeat each token `ratio` times
+    let batch = hidden.size()[0];
+    let dim = hidden.size()[2];
+    hidden
+        .reshape([batch, seq, 1, dim])
+        .expand([batch, seq, ratio as i64, dim], false)
+        .reshape([batch, seq * ratio as i64, dim])
+        .narrow(1, 0, target_seq)
+}
+
 // ── V4 Attention (MLA variant) ────────────────────────────────
 
 pub struct V4AttentionWeights {
@@ -325,8 +393,19 @@ pub fn v4_attention(input: &Tensor, attn: &V4AttentionWeights, config: &V4Runtim
         .reshape([1, num_heads, 1, 1])
         .to_kind(attn_scores.kind());
     let scores = attn_scores + sink;
-    let causal_mask = Tensor::ones([seq as i64, seq as i64], (Kind::Bool, input.device())).triu(1);
-    let scores = scores.masked_fill(&causal_mask, f64::NEG_INFINITY);
+    // Causal mask with optional sliding window
+    let mask: Tensor = if config.sliding_window > 0 && seq as i64 > config.sliding_window as i64 {
+        let sw = config.sliding_window as i64;
+        let pos = Tensor::arange(seq, (Kind::Float, input.device()));
+        let diff = pos.unsqueeze(0) - pos.unsqueeze(1);
+        (diff.ge(0.0) * diff.lt(sw as f64)).to_kind(Kind::Bool)
+    } else {
+        let pos = Tensor::arange(seq, (Kind::Float, input.device()));
+        let diff = pos.unsqueeze(0) - pos.unsqueeze(1);
+        diff.ge(0.0).to_kind(Kind::Bool)
+    };
+    let cannot_attend = mask.eq(0).to_kind(Kind::Bool);
+    let scores = scores.masked_fill(&cannot_attend, f64::NEG_INFINITY);
     let probs = scores.softmax(-1, Kind::Float).to_kind(v.kind());
     let context = probs.matmul(&v); // [batch, heads, seq, 512]
 
@@ -340,6 +419,25 @@ pub fn v4_attention(input: &Tensor, attn: &V4AttentionWeights, config: &V4Runtim
     // Output: wo_a → wo_b (LoRA-style two-layer projection)
     let o_compressed = context.linear::<&Tensor>(&attn.wo_a, None); // [batch, seq, 8192]
     o_compressed.linear::<&Tensor>(&attn.wo_b, None) // [batch, seq, 4096]
+}
+
+/// Apply Sinkhorn normalization for load-balanced routing.
+/// Alternates row (token) and column (expert) normalization.
+pub fn sinkhorn_normalize(scores: &Tensor, iters: usize, eps: f64) -> Tensor {
+    let mut s = scores.shallow_clone();
+    for _ in 0..iters {
+        // Row normalization (per token): sum over experts = 1
+        let row_sum = s
+            .sum_dim_intlist([-1].as_slice(), true, Kind::Float)
+            .clamp_min(eps);
+        s = s / &row_sum;
+        // Column normalization (per expert): sum over tokens = 1
+        let col_sum = s
+            .sum_dim_intlist([0].as_slice(), true, Kind::Float)
+            .clamp_min(eps);
+        s = s / &col_sum;
+    }
+    s
 }
 
 // ── V4 MoE Layer ──────────────────────────────────────────────
@@ -478,9 +576,19 @@ pub fn v4_forward_selective(
         if !trainable_layers.contains(&layer) {
             continue;
         }
+        // Apply compression before this layer
+        let ratio = if layer < config.compress_ratios.len() {
+            config.compress_ratios[layer]
+        } else {
+            0
+        };
+        if ratio > 1 {
+            hidden = compress_seq(&hidden, ratio);
+        }
         let lw = V4MoeLayerWeights::load_raw(weights, layer, config.n_routed_experts)?;
         hidden = v4_moe_layer(&hidden, &lw, config);
     }
+    // No decompression needed — loss uses the final compressed hidden state
 
     // Apply final norm + lm_head if available, otherwise use tied embeddings
     if let Ok(final_norm) = tensor(weights, "norm.weight") {
@@ -751,4 +859,50 @@ pub fn v4_causal_lm_loss_lora(
         .reshape([-1, config.vocab_size])
         .log_softmax(-1, Kind::Float)
         .g_nll_loss::<&Tensor>(&targets.reshape([-1]), None, tch::Reduction::Mean, -100))
+}
+
+// ── MTP (Multi-Token Prediction) ──────────────────────────────
+
+/// MTP head weights
+pub struct MtpHeadWeights {
+    pub norm: Tensor,     // mtp.0.norm.weight
+    pub hnorm: Tensor,    // mtp.0.hnorm.weight
+    pub head: Tensor,     // mtp.0.head.weight — output projection to vocab
+    pub ffn_norm: Tensor, // mtp.0.ffn_norm (if exists)
+    pub ffn_shared_w1: Tensor,
+    pub ffn_shared_w2: Tensor,
+    pub ffn_shared_w3: Tensor,
+}
+
+/// Forward through MTP head.
+/// Takes the main model's hidden state + next token embedding, produces logits.
+pub fn v4_mtp_forward(
+    hidden: &Tensor,
+    next_token_embed: &Tensor,
+    mtp: &MtpHeadWeights,
+    config: &V4RuntimeConfig,
+) -> Tensor {
+    // Concatenate hidden state with next token embedding
+    // hidden: [batch, seq, hidden], next_token_embed: [batch, seq, hidden]
+    let combined = (hidden + next_token_embed) / 2.0;
+    let normed = rms_norm(&combined, &mtp.norm, config.rms_norm_eps);
+
+    // FFN (shared expert style)
+    let ffn_out = v4_swiglu(
+        &normed,
+        &mtp.ffn_shared_w1,
+        &mtp.ffn_shared_w2,
+        &mtp.ffn_shared_w3,
+        config.swiglu_limit,
+    );
+    let after_ffn = &normed + &ffn_out;
+    let final_hidden = rms_norm(&after_ffn, &mtp.hnorm, config.rms_norm_eps);
+
+    // Output projection to vocab
+    final_hidden.linear::<&Tensor>(&mtp.head, None)
+}
+
+/// Check if MTP weights are available in the weight map.
+pub fn has_mtp_weights(weights: &BTreeMap<String, Tensor>) -> bool {
+    weights.contains_key("mtp.0.head.weight")
 }

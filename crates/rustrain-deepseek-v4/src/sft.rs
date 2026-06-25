@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use std::collections::BTreeMap;
 use tch::{Device, Kind, Tensor};
 use tracing::info;
@@ -128,4 +128,95 @@ pub fn v4_lora_sft_loss(
     let masked_loss = &per_token_loss * &shifted_mask;
     let total_mask = shifted_mask.sum(Kind::Float);
     Ok(masked_loss.sum(Kind::Float) / total_mask.clamp_min(1.0))
+}
+
+impl V4SftDataset {
+    pub fn from_jsonl(
+        tokenizer: &tokenizers::Tokenizer,
+        paths: &[std::path::PathBuf],
+        instruction_field: &str,
+        input_field: &str,
+        response_field: &str,
+        max_samples: Option<usize>,
+        train_split: f32,
+    ) -> Result<(Self, Self)> {
+        use std::io::BufRead;
+        let mut records = Vec::new();
+        for path in paths {
+            let file = std::fs::File::open(path)
+                .with_context(|| format!("failed to open {}", path.display()))?;
+            for line in std::io::BufReader::new(file).lines() {
+                let line = line?;
+                if line.trim().is_empty() {
+                    continue;
+                }
+                let v: serde_json::Value = serde_json::from_str(&line)?;
+                let instruction = v
+                    .get(instruction_field)
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let input = v
+                    .get(input_field)
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let response = v
+                    .get(response_field)
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                records.push((instruction, input, response));
+            }
+        }
+        if let Some(max) = max_samples {
+            records.truncate(max);
+        }
+        info!(records = records.len(), "loaded V4 SFT records");
+
+        let mut samples = Vec::with_capacity(records.len());
+        for (instruction, input, response) in &records {
+            let prompt = if input.is_empty() {
+                format!("Instruction: {instruction}\nResponse: ")
+            } else {
+                format!("Instruction: {instruction}\nInput: {input}\nResponse: ")
+            };
+            let prompt_ids = tokenizer
+                .encode(&prompt[..], true)
+                .map_err(|e| anyhow::anyhow!("tokenizer failed: {e}"))?
+                .get_ids()
+                .iter()
+                .map(|&id| id as i64)
+                .collect::<Vec<_>>();
+            let response_ids = tokenizer
+                .encode(&response[..], false)
+                .map_err(|e| anyhow::anyhow!("tokenizer failed: {e}"))?
+                .get_ids()
+                .iter()
+                .map(|&id| id as i64)
+                .collect::<Vec<_>>();
+            let mut tokens = prompt_ids.clone();
+            tokens.extend(&response_ids);
+            let mut target_mask = vec![false; prompt_ids.len()];
+            target_mask.extend(vec![true; response_ids.len()]);
+            samples.push(V4SftSample {
+                tokens,
+                target_mask,
+            });
+        }
+
+        let split = ((records.len() as f32) * train_split).ceil() as usize;
+        let split = split.max(1).min(samples.len().saturating_sub(1));
+        let pad_token_id = tokenizer.token_to_id("<pad>").unwrap_or(0) as i64;
+        Ok((
+            Self {
+                samples: samples[..split].to_vec(),
+                pad_token_id,
+            },
+            Self {
+                samples: samples[split..].to_vec(),
+                pad_token_id,
+            },
+        ))
+    }
 }
