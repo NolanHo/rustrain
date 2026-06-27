@@ -43,6 +43,18 @@ pub struct DeepSeekRuntimeConfig {
     pub topk_group: usize,
     pub routed_scaling_factor: f64,
     pub is_v32: bool,
+    // V3.2 DSA indexer
+    pub index_head_dim: i64,
+    pub index_n_heads: i64,
+    pub index_topk: i64,
+    // RoPE
+    pub rope_interleave: bool,
+    // YaRN
+    pub rope_scaling_type: Option<String>,
+    pub rope_scaling_factor: f64,
+    pub rope_beta_fast: f64,
+    pub rope_beta_slow: f64,
+    pub rope_original_max_pos: i64,
 }
 
 impl DeepSeekRuntimeConfig {
@@ -94,6 +106,32 @@ struct DeepSeekModelConfig {
     topk_group: Option<usize>,
     #[serde(default)]
     routed_scaling_factor: Option<f64>,
+    // V3.2 DSA indexer
+    #[serde(default)]
+    index_head_dim: Option<i64>,
+    #[serde(default)]
+    index_n_heads: Option<i64>,
+    #[serde(default)]
+    index_topk: Option<i64>,
+    // RoPE
+    #[serde(default)]
+    rope_interleave: Option<bool>,
+    #[serde(default)]
+    rope_scaling: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RopeScalingConfig {
+    #[serde(rename = "type")]
+    scaling_type: Option<String>,
+    #[serde(default)]
+    factor: Option<f64>,
+    #[serde(default)]
+    beta_fast: Option<f64>,
+    #[serde(default)]
+    beta_slow: Option<f64>,
+    #[serde(default)]
+    original_max_position_embeddings: Option<i64>,
 }
 
 pub fn read_deepseek_config(path: &Path) -> Result<DeepSeekRuntimeConfig> {
@@ -125,6 +163,24 @@ pub fn read_deepseek_config(path: &Path) -> Result<DeepSeekRuntimeConfig> {
         topk_group: c.topk_group.unwrap_or(1),
         routed_scaling_factor: c.routed_scaling_factor.unwrap_or(1.0),
         is_v32: c.model_type == "deepseek_v32",
+        // V3.2 DSA indexer
+        index_head_dim: c.index_head_dim.unwrap_or(128),
+        index_n_heads: c.index_n_heads.unwrap_or(64),
+        index_topk: c.index_topk.unwrap_or(2048),
+        // RoPE
+        rope_interleave: c.rope_interleave.unwrap_or(false),
+        // YaRN
+        rope_scaling_type: c.rope_scaling.as_ref().and_then(|v| {
+            if v.is_object() {
+                v.get("type").and_then(|t| t.as_str()).map(|s| s.to_string())
+            } else {
+                None
+            }
+        }),
+        rope_scaling_factor: c.rope_scaling.as_ref().and_then(|v| v.get("factor")).and_then(|f| f.as_f64()).unwrap_or(1.0),
+        rope_beta_fast: c.rope_scaling.as_ref().and_then(|v| v.get("beta_fast")).and_then(|f| f.as_f64()).unwrap_or(32.0),
+        rope_beta_slow: c.rope_scaling.as_ref().and_then(|v| v.get("beta_slow")).and_then(|f| f.as_f64()).unwrap_or(1.0),
+        rope_original_max_pos: c.rope_scaling.as_ref().and_then(|v| v.get("original_max_position_embeddings")).and_then(|f| f.as_i64()).unwrap_or(4096),
     })
 }
 
@@ -261,16 +317,43 @@ pub fn rope_cos_sin(seq_len: usize, head_dim: i64, theta: f64, device: Device) -
 pub(crate) fn apply_rotary(x: &Tensor, cos: &Tensor, sin: &Tensor) -> Tensor {
     // x: [batch, heads, seq, head_dim]
     let seq_len = x.size()[2];
-    let cos = cos.narrow(0, 0, seq_len).unsqueeze(0).unsqueeze(0); // [1, 1, seq, head_dim]
+    let cos = cos.narrow(0, 0, seq_len).unsqueeze(0).unsqueeze(0);
     let sin = sin.narrow(0, 0, seq_len).unsqueeze(0).unsqueeze(0);
-    let x1 = x.narrow(-1, 0, x.size()[x.size().len() - 1] / 2);
-    let x2 = x.narrow(
-        -1,
-        x.size()[x.size().len() - 1] / 2,
-        x.size()[x.size().len() - 1] / 2,
-    );
+    let half = x.size()[x.size().len() - 1] / 2;
+    let x1 = x.narrow(-1, 0, half);
+    let x2 = x.narrow(-1, half, half);
     let rotated = Tensor::cat(&[&x2.neg(), &x1], -1);
     x * cos + rotated * sin
+}
+
+/// Interleaved RoPE rotation: pairs are (d0, d_{half}), (d1, d_{half+1}), ...
+/// Standard RoPE pairs adjacent dims: (d0, d1), (d2, d3), ...
+/// Interleave RoPE pairs distant dims: (d0, d_{n/2}), (d1, d_{n/2+1}), ...
+pub(crate) fn apply_rotary_interleave(x: &Tensor, cos: &Tensor, sin: &Tensor) -> Tensor {
+    // x: [batch, heads, seq, head_dim]
+    let seq_len = x.size()[2];
+    let half = x.size()[x.size().len() - 1] / 2;
+    let cos = cos.narrow(0, 0, seq_len).unsqueeze(0).unsqueeze(0);
+    let sin = sin.narrow(0, 0, seq_len).unsqueeze(0).unsqueeze(0);
+    // Interleave: x_even = x[..., 0::2], x_odd = x[..., 1::2]
+    let x_even = x.slice(-1, 0, None, 2); // [batch, heads, seq, half]
+    let x_odd = x.slice(-1, 1, None, 2);
+    let rotated = Tensor::cat(&[&x_odd.neg(), &x_even], -1);
+    x * cos + rotated * sin
+}
+
+/// Dispatch rotary embedding: standard or interleaved.
+pub(crate) fn apply_rotary_dispatch(
+    x: &Tensor,
+    cos: &Tensor,
+    sin: &Tensor,
+    interleave: bool,
+) -> Tensor {
+    if interleave {
+        apply_rotary_interleave(x, cos, sin)
+    } else {
+        apply_rotary(x, cos, sin)
+    }
 }
 
 // ── MLA Attention ─────────────────────────────────────────────
@@ -303,16 +386,16 @@ impl DeepSeekAttentionWeights {
     ) -> Result<Self> {
         let p = format!("model.layers.{layer}.self_attn");
         let indexer_k_norm_weight = weights
-            .get(&format!("{p}.self_attn.indexer.k_norm.weight"))
+            .get(&format!("{p}.indexer.k_norm.weight"))
             .map(|t| t.to_kind(kind));
         let indexer_k_norm_bias = weights
-            .get(&format!("{p}.self_attn.indexer.k_norm.bias"))
+            .get(&format!("{p}.indexer.k_norm.bias"))
             .map(|t| t.to_kind(kind));
         let indexer_weights_proj = weights
-            .get(&format!("{p}.self_attn.indexer.weights_proj.weight"))
+            .get(&format!("{p}.indexer.weights_proj.weight"))
             .map(|t| t.to_kind(kind));
         let indexer_wk = weights
-            .get(&format!("{p}.self_attn.indexer.wk.weight"))
+            .get(&format!("{p}.indexer.wk.weight"))
             .map(|t| t.to_kind(kind));
         let indexer_wq_b = weights
             .get(&format!("{p}.self_attn.indexer.wq_b.weight"))
@@ -401,8 +484,8 @@ pub fn deepseek_mla_attention(
     let (cos, sin) = rope_cos_sin(seq as usize, qk_rope, config.rope_theta, input.device());
     let cos = cos.to_kind(input.kind());
     let sin = sin.to_kind(input.kind());
-    let q_rope_rotated = apply_rotary(&q_rope, &cos, &sin);
-    let k_rope_rotated = apply_rotary(&k_rope_expanded, &cos, &sin);
+    let q_rope_rotated = apply_rotary_dispatch(&q_rope, &cos, &sin, config.rope_interleave);
+    let k_rope_rotated = apply_rotary_dispatch(&k_rope_expanded, &cos, &sin, config.rope_interleave);
 
     // Concat nope + rope
     let q_full = Tensor::cat(&[&q_nope, &q_rope_rotated], -1); // [batch, heads, seq, qk_nope+qk_rope]
@@ -419,6 +502,191 @@ pub fn deepseek_mla_attention(
         .reshape([batch, seq, num_heads * v_head]);
 
     context.linear::<&Tensor>(&attn.o_proj, None)
+}
+
+// ── DSA (DeepSeek Sparse Attention) Indexer ──────────────────────────────────
+//
+// V3.2's sparse attention: instead of full O(seq²) attention, a learned indexer
+// selects the top-k most relevant KV positions for each query, then attention
+// is only computed on those positions.
+//
+// Indexer weights (per layer, all Optional):
+//   - wq_b: [num_heads * index_head_dim, q_lora_rank]  (Q projection from q_lora space)
+//   - wk:   [index_n_heads * index_head_dim, kv_lora]  (K projection from KV space)
+//   - k_norm.weight: [index_n_heads * index_head_dim]  (K RMSNorm weight)
+//   - k_norm.bias:   [index_n_heads * index_head_dim]  (K RMSNorm bias)
+//   - weights_proj:  [num_heads * index_head_dim, index_n_heads * index_head_dim]  (project back to attention)
+//
+// Algorithm:
+// 1. Compute Q_index from q_a (before q_b): q_a @ wq_b → [batch, seq, n_heads * idx_head_dim]
+// 2. Compute K_index from KV: kv_norm @ wk → k_norm → [batch, seq, idx_n_heads * idx_head_dim]
+// 3. Reshape Q_index → [batch, seq, n_heads, idx_head_dim]
+//    Reshape K_index → [batch, seq, idx_n_heads, idx_head_dim]
+// 4. Compute attention scores: Q_index @ K_index^T (per-head)
+//    For n_heads != idx_n_heads, broadcast K_index across heads
+// 5. Select top-k KV positions per query → sparse mask
+// 6. Apply sparse mask to standard MLA attention scores
+// 7. weights_proj: project indexer output as additive bias to attention
+
+/// DSA sparse attention: standard MLA attention with learned sparse KV selection.
+///
+/// Returns the attention output, same shape as standard attention.
+pub fn deepseek_dsa_attention(
+    input: &Tensor,
+    attn: &DeepSeekAttentionWeights,
+    config: &DeepSeekRuntimeConfig,
+) -> Tensor {
+    let batch = input.size()[0];
+    let seq = input.size()[1];
+    let num_heads = config.num_attention_heads;
+    let qk_nope = config.qk_nope_head_dim;
+    let qk_rope = config.qk_rope_head_dim;
+    let v_head = config.v_head_dim;
+    let kv_lora = config.kv_lora_rank;
+    let idx_head_dim = config.index_head_dim;
+    let idx_n_heads = config.index_n_heads;
+    let idx_topk = config.index_topk;
+
+    // ── Standard MLA Q/K/V projections ──
+    let q_a = input.linear::<&Tensor>(&attn.q_a_proj, None);
+    let q_a_normed = rms_norm(&q_a, &attn.q_a_layernorm, config.rms_norm_eps);
+    let q_b = q_a_normed.linear::<&Tensor>(&attn.q_b_proj, None);
+    let q = q_b
+        .reshape([batch, seq, num_heads, qk_nope + qk_rope])
+        .transpose(1, 2);
+    let q_nope = q.narrow(-1, 0, qk_nope);
+    let q_rope = q.narrow(-1, qk_nope, qk_rope);
+
+    let kv_a = input.linear::<&Tensor>(&attn.kv_a_proj_with_mqa, None);
+    let kv_a_normed = rms_norm(&kv_a, &attn.kv_a_layernorm, config.rms_norm_eps);
+    // Split KV: first kv_lora dims for KV, last qk_rope dims for RoPE key
+    let kv_lora_part = kv_a_normed.narrow(-1, 0, kv_lora);
+    let k_rope = kv_a_normed.narrow(-1, kv_lora, qk_rope);
+    let kv_b = kv_lora_part.linear::<&Tensor>(&attn.kv_b_proj, None);
+    let kv_b = kv_b.reshape([batch, seq, num_heads, qk_nope + v_head]);
+    let k_nope = kv_b.narrow(-1, 0, qk_nope).transpose(1, 2);
+    let v = kv_b.narrow(-1, qk_nope, v_head).transpose(1, 2);
+
+    let k_rope_expanded = k_rope
+        .unsqueeze(2)
+        .transpose(1, 2)
+        .expand([batch, num_heads, seq, qk_rope], false);
+    let (cos, sin) = rope_cos_sin(seq as usize, qk_rope, config.rope_theta, input.device());
+    let cos = cos.to_kind(input.kind());
+    let sin = sin.to_kind(input.kind());
+    let q_rope_rotated =
+        apply_rotary_dispatch(&q_rope, &cos, &sin, config.rope_interleave);
+    let k_rope_rotated =
+        apply_rotary_dispatch(&k_rope_expanded, &cos, &sin, config.rope_interleave);
+
+    let q_full = Tensor::cat(&[&q_nope, &q_rope_rotated], -1);
+    let k_full = Tensor::cat(&[&k_nope, &k_rope_rotated], -1);
+
+    // ── Standard attention scores ──
+    let scale = 1.0 / ((qk_nope + qk_rope) as f64).sqrt();
+    let mut scores = q_full.matmul(&k_full.transpose(-2, -1)) * scale;
+
+    // ── DSA Indexer: compute sparse attention mask ──
+    if let (Some(wq_b), Some(wk), Some(k_norm_w), Some(k_norm_b), Some(weights_proj)) = (
+        &attn.indexer_wq_b,
+        &attn.indexer_wk,
+        &attn.indexer_k_norm_weight,
+        &attn.indexer_k_norm_bias,
+        &attn.indexer_weights_proj,
+    ) {
+        // 1. Indexer Q: from q_a (before q_b) → wq_b → [batch, seq, n_heads * idx_head_dim]
+        let idx_q = q_a.linear::<&Tensor>(wq_b, None); // [batch, seq, n_heads * idx_head_dim]
+        let idx_q = idx_q.reshape([batch, seq, num_heads, idx_head_dim]).transpose(1, 2);
+
+        // 2. Indexer K: from kv_lora_normed → wk → k_norm → [batch, seq, idx_n_heads * idx_head_dim]
+        let idx_k_raw = kv_lora_part.linear::<&Tensor>(wk, None);
+        let idx_k_normed = rms_norm_with_bias(
+            &idx_k_raw,
+            k_norm_w,
+            k_norm_b,
+            config.rms_norm_eps,
+        );
+        let idx_k = idx_k_normed
+            .reshape([batch, seq, idx_n_heads, idx_head_dim])
+            .transpose(1, 2);
+
+        // 3. Compute indexer attention scores: [batch, n_heads, seq, seq]
+        // Broadcast K across heads if idx_n_heads != num_heads
+        let idx_k_expanded = if idx_n_heads != num_heads {
+            idx_k
+                .mean_dim([1].as_slice(), true, Kind::Float) // average across idx_n_heads
+                .expand([batch, num_heads, seq, idx_head_dim], false)
+        } else {
+            idx_k
+        };
+
+        let idx_scale = 1.0 / (idx_head_dim as f64).sqrt();
+        let idx_scores = idx_q.matmul(&idx_k_expanded.transpose(-2, -1)) * idx_scale;
+        // [batch, n_heads, seq, seq]
+
+        // 4. Top-k KV selection: each query selects top idx_topk KV positions
+        let actual_topk = idx_topk.min(seq as i64);
+        let (_, topk_indices) = idx_scores.topk(actual_topk, -1, true, true);
+
+        // 5. Create sparse mask from top-k indices
+        let sparse_mask = {
+            let ones = Tensor::ones(
+                [batch, num_heads, seq, actual_topk],
+                (Kind::Float, input.device()),
+            );
+            let mut mask = Tensor::zeros(
+                [batch as i64, num_heads, seq as i64, seq as i64],
+                (Kind::Float, input.device()),
+            );
+            mask.scatter_(-1, &topk_indices, &ones);
+            mask
+        };
+
+        // 6. Apply sparse mask to attention scores
+        // Only attend to top-k positions (plus causal mask)
+        let causal_mask =
+            Tensor::ones([seq as i64, seq as i64], (Kind::Bool, input.device())).triu(1);
+        let combined_mask = sparse_mask
+            * causal_mask
+                .unsqueeze(0)
+                .unsqueeze(0)
+                .expand([batch as i64, num_heads, seq as i64, seq as i64], false)
+                .to_kind(Kind::Float);
+        let valid = combined_mask.gt(0.0).to_kind(Kind::Bool);
+        scores = scores.masked_fill(&valid.logical_not(), f64::NEG_INFINITY);
+
+        // 7. Indexer bias: project indexer K output back to attention space
+        let idx_k_proj = idx_k_normed.linear::<&Tensor>(weights_proj, None);
+        let idx_k_proj = idx_k_proj
+            .reshape([batch, seq, num_heads, idx_head_dim])
+            .transpose(1, 2); // [batch, n_heads, seq, idx_head_dim]
+        // Use indexer Q @ projected K as additive bias
+        let idx_bias = idx_q.matmul(&idx_k_proj.transpose(-2, -1)) * idx_scale;
+        scores = scores + idx_bias;
+    } else {
+        // No indexer weights — fall back to full causal attention
+        let causal_mask =
+            Tensor::ones([seq as i64, seq as i64], (Kind::Bool, input.device())).triu(1);
+        scores = scores.masked_fill(&causal_mask, f64::NEG_INFINITY);
+    }
+
+    let probs = scores.softmax(-1, Kind::Float).to_kind(v.kind());
+    let context = probs.matmul(&v);
+    let context = context
+        .transpose(1, 2)
+        .reshape([batch, seq, num_heads * v_head]);
+
+    context.linear::<&Tensor>(&attn.o_proj, None)
+}
+
+/// RMSNorm with bias (V3.2 indexer uses weight + bias, unlike standard RMSNorm)
+fn rms_norm_with_bias(input: &Tensor, weight: &Tensor, bias: &Tensor, eps: f64) -> Tensor {
+    let dtype = input.kind();
+    let variance = input
+        .pow_tensor_scalar(2.0)
+        .mean_dim([-1].as_slice(), true, Kind::Float);
+    let result = input * (variance + eps).rsqrt().to_kind(dtype) * weight + bias;
+    result.to_kind(dtype)
 }
 
 // ── Dense Layer ───────────────────────────────────────────────
@@ -472,7 +740,11 @@ pub fn deepseek_layer(
     config: &DeepSeekRuntimeConfig,
 ) -> Tensor {
     let hidden = rms_norm(input, &weights.input_norm, config.rms_norm_eps);
-    let attn = deepseek_mla_attention(&hidden, &weights.attn, config);
+    let attn = if config.is_v32 && weights.attn.indexer_wq_b.is_some() {
+        deepseek_dsa_attention(&hidden, &weights.attn, config)
+    } else {
+        deepseek_mla_attention(&hidden, &weights.attn, config)
+    };
     let residual = input + &attn;
     let mlp_input = rms_norm(&residual, &weights.post_attention_norm, config.rms_norm_eps);
     let mlp = deepseek_mlp(
@@ -645,7 +917,11 @@ pub fn deepseek_moe_layer(
     config: &DeepSeekRuntimeConfig,
 ) -> Tensor {
     let hidden = rms_norm(input, &weights.input_norm, config.rms_norm_eps);
-    let attn = deepseek_mla_attention(&hidden, &weights.attn, config);
+    let attn = if config.is_v32 && weights.attn.indexer_wq_b.is_some() {
+        deepseek_dsa_attention(&hidden, &weights.attn, config)
+    } else {
+        deepseek_mla_attention(&hidden, &weights.attn, config)
+    };
     let residual = input + &attn;
     let mlp_input = rms_norm(&residual, &weights.post_attention_norm, config.rms_norm_eps);
     let mlp = deepseek_moe_mlp(
@@ -942,7 +1218,11 @@ pub fn deepseek_forward_lora(
             let lw = DeepSeekMoeLayerWeights::load_raw(weights, layer, config.n_routed_experts)?;
             let hidden_norm = rms_norm(&hidden, &lw.input_norm, config.rms_norm_eps);
             let attn = lora_attention_weights(&lw.attn, layer, lora_registry);
-            let attn_out = deepseek_mla_attention(&hidden_norm, &attn, config);
+            let attn_out = if config.is_v32 && lw.attn.indexer_wq_b.is_some() {
+                deepseek_dsa_attention(&hidden_norm, &attn, config)
+            } else {
+                deepseek_mla_attention(&hidden_norm, &attn, config)
+            };
             let residual = &hidden + &attn_out;
             let mlp_input = rms_norm(&residual, &lw.post_attention_norm, config.rms_norm_eps);
             let mlp = deepseek_moe_mlp(
@@ -963,7 +1243,11 @@ pub fn deepseek_forward_lora(
             let lw = DeepSeekDenseLayerWeights::load_raw(weights, layer)?;
             let hidden_norm = rms_norm(&hidden, &lw.input_norm, config.rms_norm_eps);
             let attn = lora_attention_weights(&lw.attn, layer, lora_registry);
-            let attn_out = deepseek_mla_attention(&hidden_norm, &attn, config);
+            let attn_out = if config.is_v32 && lw.attn.indexer_wq_b.is_some() {
+                deepseek_dsa_attention(&hidden_norm, &attn, config)
+            } else {
+                deepseek_mla_attention(&hidden_norm, &attn, config)
+            };
             let residual = &hidden + &attn_out;
             let mlp_input = rms_norm(&residual, &lw.post_attention_norm, config.rms_norm_eps);
             let gate = lora_weight(

@@ -502,6 +502,17 @@ fn dispatch_train(config_path: &Path, resume_from: Option<PathBuf>) -> Result<()
         return Ok(());
     }
 
+    if is_tch && arch == "glm5_lora_sft_ep" {
+        let summary = rustrain_glm5::session_ep::train_glm5_lora_sft_ep(&config, &run_paths)?;
+        println!("rustrain GLM-5.2 LoRA SFT EP complete");
+        println!("run_dir: {}", run_paths.root.display());
+        println!("adapter_checkpoint: {}", summary.adapter_output);
+        println!("initial_loss: {:.9}", summary.initial_loss);
+        println!("final_loss: {:.9}", summary.final_loss);
+        println!("trainable_params: {}", summary.trainable_params);
+        return Ok(());
+    }
+
     // Default: ndarray toy model
     rustrain_toy::trainer::train(&config, &run_paths)
 }

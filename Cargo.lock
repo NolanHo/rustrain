@@ -1171,6 +1171,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "88904434abc2901f197fe8cc55f0445e7ded921dba5911dad2e2b39b48e663c4"
 
 [[package]]
+name = "memmap2"
+version = "0.9.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d1219ed1b7f229ee7104d281dd01d6802fe28bb6e95d292942c4daacdeb798c0"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "minimal-lexical"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1713,6 +1722,7 @@ dependencies = [
  "rustrain-data",
  "rustrain-deepseek",
  "rustrain-deepseek-v4",
+ "rustrain-glm5",
  "rustrain-moe",
  "rustrain-nccl",
  "rustrain-parallel",
@@ -1808,6 +1818,7 @@ dependencies = [
  "anyhow",
  "chrono",
  "clap",
+ "memmap2",
  "ndarray",
  "rand 0.8.6",
  "rand_distr",
@@ -1815,6 +1826,35 @@ dependencies = [
  "rustrain-checkpoint",
  "rustrain-core",
  "rustrain-data",
+ "rustrain-nccl",
+ "rustrain-parallel",
+ "rustrain-train",
+ "safetensors 0.8.0",
+ "serde",
+ "serde_json",
+ "tch",
+ "tempfile",
+ "tokenizers",
+ "toml",
+ "tracing",
+]
+
+[[package]]
+name = "rustrain-glm5"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "clap",
+ "memmap2",
+ "ndarray",
+ "rand 0.8.6",
+ "rand_distr",
+ "regex",
+ "rustrain-checkpoint",
+ "rustrain-core",
+ "rustrain-data",
+ "rustrain-deepseek-v4",
  "rustrain-nccl",
  "rustrain-parallel",
  "rustrain-train",
