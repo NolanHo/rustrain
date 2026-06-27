@@ -6,7 +6,7 @@ seed = 42
 [model]
 name = "deepseek_v4_flash_ep2"
 architecture = "deepseek_v4_ep_rank"
-model_path = "/vePFS-Mindverse/share/huggingface/hub/models--deepseek-ai--DeepSeek-V4-Flash-Base"
+model_path = "/vePFS-mindverse/user/nolanho/models/DeepSeek-V4-Flash-Base"
 vocab_size = 129280
 hidden_size = 4096
 num_layers = 43
@@ -35,8 +35,8 @@ device = "cuda"
 checkpoint_every = 0
 
 [parallel]
-tensor_model_parallel_size = 2
+tensor_model_parallel_size = 1
 pipeline_model_parallel_size = 1
 data_parallel_size = 1
-expert_model_parallel_size = 1
+expert_model_parallel_size = 2
 context_parallel_size = 1

@@ -1,5 +1,5 @@
 use anyhow::Result;
-use rand::{SeedableRng, rngs::StdRng};
+use rand::{rngs::StdRng, SeedableRng};
 use rand_distr::Distribution;
 use std::collections::BTreeMap;
 use tch::{Kind, Tensor};
@@ -61,7 +61,7 @@ pub fn v4_sample_generate(
     top_p: f64,
     seed: u64,
 ) -> Result<Tensor> {
-    use rand::{SeedableRng, rngs::StdRng};
+    use rand::{rngs::StdRng, SeedableRng};
     let mut generated = input_ids.shallow_clone();
     let mut rng = StdRng::seed_from_u64(seed);
     for _ in 0..max_new_tokens {

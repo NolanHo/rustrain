@@ -2,7 +2,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-source "${SCRIPT_DIR}/require_gpu_worker.sh"
+source "${SCRIPT_DIR}/ray/require_gpu_worker.sh"
 
 BASE_OUTPUT="$(mktemp)"
 RESUME_OUTPUT="$(mktemp)"

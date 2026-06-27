@@ -2,6 +2,8 @@
 // 4 user commands: train / inspect / launch / probe
 
 mod inspect;
+#[cfg(feature = "ray")]
+mod ray_gpu;
 
 use rustrain_core::runtime::{
     init_logging, load_config, prepare_run_directory, validate_config, write_resolved_config,
@@ -58,9 +60,43 @@ enum Command {
 
     /// Probe tch-rs CUDA availability
     Probe,
+
+    /// Run a command on a Ray GPU worker (via rayrust native SDK)
+    #[cfg(feature = "ray")]
+    RayGpu {
+        #[arg(long, default_value = "1")]
+        num_gpus: usize,
+        #[arg(long)]
+        ray_address: Option<String>,
+        #[arg(long, default_value = "/vePFS-Mindverse/user/nolanho/code")]
+        runner_path: String,
+        #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
+        command: Vec<String>,
+    },
 }
 
 fn main() -> Result<()> {
+    // ── CUDA_VISIBLE_DEVICES fix for Ray workers ──────────────────────────
+    // Ray strips CUDA_VISIBLE_DEVICES from child processes at the Python
+    // _posixsubprocess level. When rustrain is launched via Ray, the env var
+    // is empty even though GPUs are available.
+    // Fix: if RUSTRAIN_FORCE_CUDA_VISIBLE_DEVICES is set, force-set
+    // CUDA_VISIBLE_DEVICES before any CUDA initialization.
+    // See docs/ray-gpu-env-injection.md for details.
+    if let Ok(force_gpus) = std::env::var("RUSTRAIN_FORCE_CUDA_VISIBLE_DEVICES") {
+        if !force_gpus.is_empty() {
+            // SAFETY: Setting CUDA_VISIBLE_DEVICES before any CUDA initialization.
+            // This is safe because no other threads are accessing the environment.
+            unsafe {
+                std::env::set_var("CUDA_VISIBLE_DEVICES", &force_gpus);
+            }
+            eprintln!(
+                "rustrain: forced CUDA_VISIBLE_DEVICES={force_gpus} \
+                 (from RUSTRAIN_FORCE_CUDA_VISIBLE_DEVICES)"
+            );
+        }
+    }
+
     let cli = Cli::parse();
 
     match cli.command {
@@ -87,6 +123,13 @@ fn main() -> Result<()> {
             &command,
         ),
         Command::Probe => tch_train::probe_tch_cuda(),
+        #[cfg(feature = "ray")]
+        Command::RayGpu {
+            num_gpus,
+            ray_address,
+            runner_path,
+            command,
+        } => crate::ray_gpu::run(num_gpus, ray_address, &runner_path, &command),
     }
 }
 
@@ -312,6 +355,34 @@ fn dispatch_train(config_path: &Path, resume_from: Option<PathBuf>) -> Result<()
         return Ok(());
     }
 
+    if is_tch && arch == "deepseek_v4_tp_train" {
+        let model_path = config
+            .model
+            .model_path
+            .as_ref()
+            .context("V4 TP train requires model.model_path")?;
+        let model_path =
+            rustrain_deepseek_v4::deepseek_v4_module::resolve_v4_model_path(model_path)?;
+        let runtime_config = rustrain_deepseek_v4::deepseek_v4_module::read_v4_config(
+            &model_path.join("config.json"),
+        )?;
+        let kind = match config.train.dtype {
+            rustrain_core::runtime::DType::Fp32 => tch::Kind::Float,
+            rustrain_core::runtime::DType::Bf16 => tch::Kind::BFloat16,
+            _ => tch::Kind::Float,
+        };
+        let output_dir = std::env::var("RUSTRAIN_LAUNCH_OUTPUT_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| config.run.base_dir.join("deepseek-v4-tp-train"));
+        rustrain_deepseek_v4::tp::deepseek_v4_tp_train(
+            &model_path,
+            &output_dir,
+            &runtime_config,
+            kind,
+        )?;
+        return Ok(());
+    }
+
     if is_tch && arch == "deepseek_v4_ep_rank" {
         let model_path = config
             .model
@@ -340,6 +411,62 @@ fn dispatch_train(config_path: &Path, resume_from: Option<PathBuf>) -> Result<()
         return Ok(());
     }
 
+    if is_tch && arch == "deepseek_v4_ep_train" {
+        let model_path = config
+            .model
+            .model_path
+            .as_ref()
+            .context("V4 EP train requires model.model_path")?;
+        let model_path =
+            rustrain_deepseek_v4::deepseek_v4_module::resolve_v4_model_path(model_path)?;
+        let runtime_config = rustrain_deepseek_v4::deepseek_v4_module::read_v4_config(
+            &model_path.join("config.json"),
+        )?;
+        let kind = match config.train.dtype {
+            rustrain_core::runtime::DType::Fp32 => tch::Kind::Float,
+            rustrain_core::runtime::DType::Bf16 => tch::Kind::BFloat16,
+            _ => tch::Kind::Float,
+        };
+        let output_dir = std::env::var("RUSTRAIN_LAUNCH_OUTPUT_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| config.run.base_dir.join("deepseek-v4-ep-train"));
+        rustrain_deepseek_v4::ep::deepseek_v4_ep_train(
+            &model_path,
+            &output_dir,
+            &runtime_config,
+            kind,
+        )?;
+        return Ok(());
+    }
+
+    if is_tch && arch == "deepseek_v4_tp_ep_train" {
+        let model_path = config
+            .model
+            .model_path
+            .as_ref()
+            .context("V4 TP+EP train requires model.model_path")?;
+        let model_path =
+            rustrain_deepseek_v4::deepseek_v4_module::resolve_v4_model_path(model_path)?;
+        let runtime_config = rustrain_deepseek_v4::deepseek_v4_module::read_v4_config(
+            &model_path.join("config.json"),
+        )?;
+        let kind = match config.train.dtype {
+            rustrain_core::runtime::DType::Fp32 => tch::Kind::Float,
+            rustrain_core::runtime::DType::Bf16 => tch::Kind::BFloat16,
+            _ => tch::Kind::Float,
+        };
+        let output_dir = std::env::var("RUSTRAIN_LAUNCH_OUTPUT_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| config.run.base_dir.join("deepseek-v4-tp-ep"));
+        rustrain_deepseek_v4::tp::deepseek_v4_tp_ep_train(
+            &model_path,
+            &output_dir,
+            &runtime_config,
+            kind,
+        )?;
+        return Ok(());
+    }
+
     if is_tch && arch == "deepseek_v4_lora_sft" {
         let summary = rustrain_deepseek_v4::deepseek_v4_module::train_v4_lora_sft_from_config(
             &config, &run_paths,
@@ -349,6 +476,17 @@ fn dispatch_train(config_path: &Path, resume_from: Option<PathBuf>) -> Result<()
         println!("adapter_checkpoint: {}", summary.adapter_output);
         println!("initial_loss: {:.9}", summary.initial_loss);
         println!("final_loss: {:.9}", summary.final_loss);
+        return Ok(());
+    }
+
+    if is_tch && arch == "deepseek_v4_lora_sft_ep" {
+        let summary = rustrain_deepseek_v4::session_ep::train_v4_lora_sft_ep(&config, &run_paths)?;
+        println!("rustrain DeepSeek V4 LoRA SFT EP complete");
+        println!("run_dir: {}", run_paths.root.display());
+        println!("adapter_checkpoint: {}", summary.adapter_output);
+        println!("initial_loss: {:.9}", summary.initial_loss);
+        println!("final_loss: {:.9}", summary.final_loss);
+        println!("trainable_params: {}", summary.trainable_params);
         return Ok(());
     }
 

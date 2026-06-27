@@ -13,6 +13,7 @@ rustrain-nccl = { path = "../rustrain-nccl" }
 anyhow.workspace = true
 chrono.workspace = true
 clap.workspace = true
+memmap2 = "0.9"
 ndarray.workspace = true
 rand.workspace = true
 rand_distr.workspace = true
