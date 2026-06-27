@@ -292,20 +292,23 @@ impl Glm5ComputeDType {
 
 pub fn rms_norm(input: &Tensor, weight: &Tensor, eps: f64) -> Tensor {
     let dtype = input.kind();
+    let weight = weight.to_kind(dtype);
     let variance = input
         .pow_tensor_scalar(2.0)
         .mean_dim([-1].as_slice(), true, Kind::Float);
-    let result = input * (variance + eps).rsqrt().to_kind(dtype) * weight;
+    let result = input * (variance + eps).rsqrt().to_kind(dtype) * &weight;
     result.to_kind(dtype)
 }
 
 /// RMSNorm with bias (indexer k_norm uses weight + bias)
 fn rms_norm_with_bias(input: &Tensor, weight: &Tensor, bias: &Tensor, eps: f64) -> Tensor {
     let dtype = input.kind();
+    let weight = weight.to_kind(dtype);
+    let bias = bias.to_kind(dtype);
     let variance = input
         .pow_tensor_scalar(2.0)
         .mean_dim([-1].as_slice(), true, Kind::Float);
-    let result = input * (variance + eps).rsqrt().to_kind(dtype) * weight + bias;
+    let result = input * (variance + eps).rsqrt().to_kind(dtype) * &weight + &bias;
     result.to_kind(dtype)
 }
 
@@ -447,10 +450,10 @@ pub struct IndexShareState {
 }
 
 impl IndexShareState {
-    pub fn empty(batch: i64, num_heads: i64, seq: i64, device: Device) -> Self {
+    pub fn empty(batch: i64, num_heads: i64, seq: i64, device: Device, kind: Kind) -> Self {
         Self {
-            sparse_mask: Tensor::zeros([batch, num_heads, seq, seq], (Kind::Float, device)),
-            idx_bias: Tensor::zeros([batch, num_heads, seq, seq], (Kind::Float, device)),
+            sparse_mask: Tensor::zeros([batch, num_heads, seq, seq], (kind, device)),
+            idx_bias: Tensor::zeros([batch, num_heads, seq, seq], (kind, device)),
             source_layer: 0,
         }
     }
@@ -471,6 +474,8 @@ pub fn glm5_dsa_attention(
     index_share_state: &mut Option<IndexShareState>,
     layer: usize,
 ) -> Tensor {
+    // Ensure input is in a consistent dtype for all matmul operations
+    let compute_kind = input.kind();
     let batch = input.size()[0];
     let seq = input.size()[1];
     let num_heads = config.num_attention_heads;
@@ -483,20 +488,22 @@ pub fn glm5_dsa_attention(
     let idx_topk = config.index_topk;
 
     // ── Standard MLA Q/K/V projections ──
-    let q_a = input.linear::<&Tensor>(&attn.q_a_proj, None);
-    let q_a_normed = rms_norm(&q_a, &attn.q_a_layernorm, config.rms_norm_eps);
-    let q_b = q_a_normed.linear::<&Tensor>(&attn.q_b_proj, None);
+    // Convert all attention weights to input dtype to avoid bf16/fp32 mismatch
+    let q_a = input.linear::<&Tensor>(&attn.q_a_proj.to_kind(compute_kind), None);
+    let q_a_normed = rms_norm(&q_a, &attn.q_a_layernorm.to_kind(compute_kind), config.rms_norm_eps);
+    let q_b = q_a_normed.linear::<&Tensor>(&attn.q_b_proj.to_kind(compute_kind), None);
     let q = q_b
         .reshape([batch, seq, num_heads, qk_nope + qk_rope])
         .transpose(1, 2);
     let q_nope = q.narrow(-1, 0, qk_nope);
     let q_rope = q.narrow(-1, qk_nope, qk_rope);
 
-    let kv_a = input.linear::<&Tensor>(&attn.kv_a_proj_with_mqa, None);
-    let kv_a_normed = rms_norm(&kv_a, &attn.kv_a_layernorm, config.rms_norm_eps);
-    let kv_lora_part = kv_a_normed.narrow(-1, 0, kv_lora);
-    let k_rope = kv_a_normed.narrow(-1, kv_lora, qk_rope);
-    let kv_b = kv_lora_part.linear::<&Tensor>(&attn.kv_b_proj, None);
+    let kv_a = input.linear::<&Tensor>(&attn.kv_a_proj_with_mqa.to_kind(compute_kind), None);
+    // Split first: kv_lora part gets RMSNorm, RoPE part does not
+    let kv_lora_raw = kv_a.narrow(-1, 0, kv_lora);
+    let k_rope = kv_a.narrow(-1, kv_lora, qk_rope);
+    let kv_lora_part = rms_norm(&kv_lora_raw, &attn.kv_a_layernorm.to_kind(compute_kind), config.rms_norm_eps);
+    let kv_b = kv_lora_part.linear::<&Tensor>(&attn.kv_b_proj.to_kind(compute_kind), None);
     let kv_b = kv_b.reshape([batch, seq, num_heads, qk_nope + v_head]);
     let k_nope = kv_b.narrow(-1, 0, qk_nope).transpose(1, 2);
     let v = kv_b.narrow(-1, qk_nope, v_head).transpose(1, 2);
@@ -530,14 +537,14 @@ pub fn glm5_dsa_attention(
     ) {
         if should_compute_topk {
             // 1. Indexer Q: from q_a → wq_b → [batch, seq, n_heads * idx_head_dim]
-            let idx_q = q_a.linear::<&Tensor>(wq_b, None);
+            let idx_q = q_a.linear::<&Tensor>(&wq_b.to_kind(compute_kind), None);
             let idx_q = idx_q
                 .reshape([batch, seq, num_heads, idx_head_dim])
                 .transpose(1, 2);
 
             // 2. Indexer K: from kv_lora_normed → wk → k_norm → [batch, seq, idx_n_heads * idx_head_dim]
-            let idx_k_raw = kv_lora_part.linear::<&Tensor>(wk, None);
-            let idx_k_normed = rms_norm_with_bias(&idx_k_raw, k_norm_w, k_norm_b, config.rms_norm_eps);
+            let idx_k_raw = kv_lora_part.linear::<&Tensor>(&wk.to_kind(compute_kind), None);
+            let idx_k_normed = rms_norm_with_bias(&idx_k_raw, &k_norm_w.to_kind(compute_kind), &k_norm_b.to_kind(compute_kind), config.rms_norm_eps);
             let idx_k = idx_k_normed
                 .reshape([batch, seq, idx_n_heads, idx_head_dim])
                 .transpose(1, 2);
@@ -545,7 +552,7 @@ pub fn glm5_dsa_attention(
             // 3. Indexer attention scores
             let idx_k_expanded = if idx_n_heads != num_heads {
                 idx_k
-                    .mean_dim([1].as_slice(), true, Kind::Float)
+                    .mean_dim([1].as_slice(), true, input.kind())
                     .expand([batch, num_heads, seq, idx_head_dim], false)
             } else {
                 idx_k
@@ -574,26 +581,28 @@ pub fn glm5_dsa_attention(
             let sparse_mask = {
                 let ones = Tensor::ones(
                     [batch, num_heads, seq, actual_topk],
-                    (Kind::Float, input.device()),
+                    (input.kind(), input.device()),
                 );
                 let mut mask = Tensor::zeros(
                     [batch as i64, num_heads, seq as i64, seq as i64],
-                    (Kind::Float, input.device()),
+                    (input.kind(), input.device()),
                 );
                 let _ = mask.scatter_(-1, &topk_indices, &ones);
+                // Note: topk_indices must be int64 for scatter_, don't convert to float
                 mask
             };
 
             // 6. Indexer bias
             let idx_k_proj = idx_k_normed
-                .linear::<&Tensor>(weights_proj, None)
+                .linear::<&Tensor>(&weights_proj.to_kind(compute_kind), None)
                 .reshape([batch, seq, num_heads, idx_head_dim])
                 .transpose(1, 2);
             let idx_bias = idx_q.matmul(&idx_k_proj.transpose(-2, -1)) * idx_scale;
+            let idx_bias = idx_bias.to_kind(input.kind());
 
             // Save state for IndexShare
             *index_share_state = Some(IndexShareState {
-                sparse_mask,
+                sparse_mask: sparse_mask.to_kind(input.kind()),
                 idx_bias,
                 source_layer: layer,
             });
@@ -611,11 +620,12 @@ pub fn glm5_dsa_attention(
             .unsqueeze(0)
             .unsqueeze(0)
             .expand([batch as i64, num_heads, seq as i64, seq as i64], false)
-            .to_kind(Kind::Float);
+            .to_kind(input.kind());
         let combined = &state.sparse_mask * &causal_f;
         let valid = combined.gt(0.0).to_kind(Kind::Bool);
         scores = scores.masked_fill(&valid.logical_not(), f64::NEG_INFINITY);
-        scores = scores + &state.idx_bias;
+        let scores_kind = scores.kind();
+        scores = scores + &state.idx_bias.to_kind(scores_kind);
     } else {
         let causal_mask =
             Tensor::ones([seq as i64, seq as i64], (Kind::Bool, input.device())).triu(1);
@@ -628,16 +638,17 @@ pub fn glm5_dsa_attention(
         .transpose(1, 2)
         .reshape([batch, seq, num_heads * v_head]);
 
-    context.linear::<&Tensor>(&attn.o_proj, None)
+    context.linear::<&Tensor>(&attn.o_proj.to_kind(compute_kind), None)
 }
 
 // ── MLP ─────────────────────────────────────────────────────────
 
 pub fn glm5_mlp(input: &Tensor, gate: &Tensor, up: &Tensor, down: &Tensor) -> Tensor {
-    let gate_out = input.linear::<&Tensor>(gate, None);
-    let up_out = input.linear::<&Tensor>(up, None);
+    let k = input.kind();
+    let gate_out = input.linear::<&Tensor>(&gate.to_kind(k), None);
+    let up_out = input.linear::<&Tensor>(&up.to_kind(k), None);
     let activated = gate_out.silu() * up_out;
-    activated.linear::<&Tensor>(down, None)
+    activated.linear::<&Tensor>(&down.to_kind(k), None)
 }
 
 /// FP8-aware MLP: uses V4's fp8_linear for GEMM when weights are FP8 tensors.
@@ -676,7 +687,7 @@ pub fn glm5_moe_mlp(
     routed_scaling_factor: f64,
 ) -> Tensor {
     let shared_output = glm5_mlp(input, shared_gate, shared_up, shared_down);
-    let router_logits = input.linear::<&Tensor>(gate, None);
+    let router_logits = input.linear::<&Tensor>(&gate.to_kind(input.kind()), None);
     let n_experts = experts.len() as i64;
 
     let (topk_weights, topk_indices) = if scoring_func == "sigmoid" {
@@ -685,7 +696,7 @@ pub fn glm5_moe_mlp(
             let epg = n_experts / n_group as i64;
             let group_scores = scores
                 .reshape([-1, n_group as i64, epg])
-                .sum_dim_intlist([-1].as_slice(), true, Kind::Float)
+                .sum_dim_intlist([-1].as_slice(), true, scores.kind())
                 .squeeze_dim(-1);
             let (_, group_idx) = group_scores.topk(topk_group as i64, -1, true, true);
             let mut group_mask = Tensor::zeros(
@@ -709,13 +720,17 @@ pub fn glm5_moe_mlp(
         }
     } else {
         // softmax (sqrtsoftplus variant)
-        let logits = router_logits.softmax(-1, Kind::Float);
+        let logits = router_logits.softmax(-1, Kind::Float).to_kind(input.kind());
         logits.topk(num_experts_per_tok as i64, -1, true, true)
     };
 
     // Normalize weights
-    let denom = topk_weights.sum_dim_intlist([-1].as_slice(), true, Kind::Float);
+    let denom = topk_weights.sum_dim_intlist([-1].as_slice(), true, topk_weights.kind());
     let topk_weights = (topk_weights / denom) * routed_scaling_factor;
+
+    // Flatten topk to [batch*seq, num_experts_per_tok] for per-token expert dispatch
+    let topk_weights = topk_weights.reshape([-1, num_experts_per_tok as i64]);
+    let topk_indices = topk_indices.reshape([-1, num_experts_per_tok as i64]);
 
     let batch = input.size()[0];
     let seq = input.size()[1];
@@ -728,14 +743,16 @@ pub fn glm5_moe_mlp(
 
     for e in 0..n_experts as usize {
         let mask = topk_indices.eq(e as i64).to_kind(input.kind());
-        let count = mask.sum(Kind::Float).double_value(&[]) as i64;
+        // mask is [batch*seq, k] — sum over k to get [batch*seq]
+        let mask_flat = mask.sum_dim_intlist([-1].as_slice(), false, Kind::Float).to_kind(input.kind());
+        let count = mask_flat.sum(Kind::Float).double_value(&[]) as i64;
         if count == 0 {
             continue;
         }
         let (gate_w, up_w, down_w) = &experts[e];
         let expert_out = glm5_mlp(&flat_input, gate_w, up_w, down_w);
         let weight = topk_weights.narrow(-1, e as i64, 1).unsqueeze(-1);
-        let mask_expanded = mask.unsqueeze(-1).expand([-1, expert_out.size()[1]], false);
+        let mask_expanded = mask_flat.unsqueeze(-1).expand([-1, expert_out.size()[1]], false);
         let contribution = expert_out * &mask_expanded * weight;
         output = output + contribution;
     }

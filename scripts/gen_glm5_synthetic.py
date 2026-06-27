@@ -135,6 +135,7 @@ tokenizer = {
         {"id": 0, "content": "<pad>", "single_word": False, "lstrip": False, "rstrip": False, "normalized": False, "special": True},
         {"id": 1, "content": "<s>", "single_word": False, "lstrip": False, "rstrip": False, "normalized": False, "special": True},
         {"id": 2, "content": "</s>", "single_word": False, "lstrip": False, "rstrip": False, "normalized": False, "special": True},
+        {"id": 3, "content": "[UNK]", "single_word": False, "lstrip": False, "rstrip": False, "normalized": False, "special": True},
     ],
     "normalizer": None,
     "pre_tokenizer": {"type": "Whitespace"},
@@ -142,8 +143,8 @@ tokenizer = {
     "decoder": None,
     "model": {
         "type": "WordLevel",
-        "vocab": {f"tok{i}": i for i in range(VOCAB)},
-        "unk_token": "<pad>"
+        "vocab": {"[UNK]": 3, "<pad>": 0, "<s>": 1, "</s>": 2, **{f"tok{i}": i for i in range(4, VOCAB)}},
+        "unk_token": "[UNK]"
     }
 }
 

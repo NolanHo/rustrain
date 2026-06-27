@@ -130,10 +130,10 @@ pub fn train_glm5_lora_sft_ep(
     if rank > 0 {
         info!(
             rank,
-            delay_secs = rank * 40,
+            delay_secs = rank * 5,
             "waiting before weight loading (staggered)"
         );
-        std::thread::sleep(std::time::Duration::from_secs((rank * 40) as u64));
+        std::thread::sleep(std::time::Duration::from_secs((rank * 5) as u64));
     }
 
     // ── Build needed weight set ──
