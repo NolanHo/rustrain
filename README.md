@@ -33,7 +33,7 @@ cargo run -- train --config configs/tch_smoke_cuda.toml
 # LoRA SFT on Qwen2.5-0.5B
 cargo run -- train --config configs/qwen_lora_sft.toml
 
-# Distributed EP=8 training (8 GPUs, direct SSH)
+# Distributed EP=8 training (8 GPUs)
 cargo run --release -- launch --nproc-per-node 8 \
   --output-dir /tmp/runs/v4-ep8 \
   train --config configs/deepseek_v4_flash_lora_sft_ep8.toml
@@ -60,7 +60,6 @@ rustrain probe
 | TinyMoE / DeepSeekMoE | tch-rs (CUDA) | EP=2 | ✅ Verified |
 | DeepSeek V4 Flash | tch-rs + C++ FP8 | EP=8 | ✅ Verified (8× H20-3e) |
 | DeepSeek V4 Flash LoRA SFT | tch-rs + C++ FP8 | EP=8 | ✅ Verified (20 steps) |
-| DeepSeek V4 Pro | tch-rs + C++ FP8 | — | ❌ Needs 13+ GPUs |
 
 ### V4 Flash Architecture
 
@@ -129,7 +128,6 @@ rustrain/
 │       │   └── generate.rs       # Greedy / sampling generation
 │       └── build.rs              # g++ compilation of C++ kernel
 ├── configs/                      # TOML training configs
-├── scripts/                      # SSH-based GPU execution + verification
 └── src/
     ├── main.rs                   # CLI dispatch
     └── inspect.rs                # HuggingFace model inspector
@@ -166,20 +164,6 @@ optional features, so crates that don't need them compile without libtorch.
 | Logging | `tracing` |
 | Distributed | NCCL FFI (direct `unsafe extern "C"`, persistent communicator) |
 | Data | `arrow` IPC, `serde_json` |
-
-## GPU Execution
-
-Training runs directly on GPU servers via SSH — no Ray, no Kubernetes.
-
-```sh
-# Run on a remote GPU server
-scripts/gpu_run_ssh.sh cargo run -- train --config configs/deepseek_v4_flash_lora_sft_ep8.toml
-
-# 8-GPU distributed verification
-scripts/verify_gpu_distributed_ssh.sh
-
-# Ray-based execution (deprecated, in scripts/ray/)
-```
 
 ## License
 
