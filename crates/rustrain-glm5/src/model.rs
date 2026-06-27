@@ -55,13 +55,28 @@ pub struct Glm5RuntimeConfig {
     pub rope_beta_fast: f64,
     pub rope_beta_slow: f64,
     pub rope_original_max_pos: i64,
+    // Indexer RoPE (separate from main attention RoPE)
+    pub indexer_rope_interleave: bool,
+    // MLP layer types: "dense" or "sparse" per layer
+    pub mlp_layer_types: Vec<String>,
+    // Top-k method: "noaux_tc" or "groupwise"
+    pub topk_method: String,
+    // RoPE type: "default" or "yarn"
+    pub rope_type: String,
+    // MTP
+    pub num_nextn_predict_layers: usize,
     // FP8
     pub expert_dtype: String, // "fp8" or "bf16"
 }
 
 impl Glm5RuntimeConfig {
     pub fn is_moe_layer(&self, layer: usize) -> bool {
-        layer >= self.first_k_dense_replace
+        // Prefer mlp_layer_types if available, fall back to first_k_dense_replace
+        if layer < self.mlp_layer_types.len() {
+            self.mlp_layer_types[layer] == "sparse"
+        } else {
+            layer >= self.first_k_dense_replace
+        }
     }
 
     /// Returns the layer index whose indexer weights this layer should use.
@@ -158,6 +173,16 @@ struct Glm5ModelConfig {
     max_position_embeddings: Option<i64>,
     #[serde(default)]
     expert_dtype: Option<String>,
+    #[serde(default)]
+    indexer_rope_interleave: Option<bool>,
+    #[serde(default)]
+    mlp_layer_types: Option<Vec<String>>,
+    #[serde(default)]
+    topk_method: Option<String>,
+    #[serde(default)]
+    num_nextn_predict_layers: Option<usize>,
+    #[serde(default)]
+    rope_parameters: Option<serde_json::Value>,
 }
 
 pub fn read_glm5_config(path: &Path) -> Result<Glm5RuntimeConfig> {
@@ -168,9 +193,27 @@ pub fn read_glm5_config(path: &Path) -> Result<Glm5RuntimeConfig> {
 
     let n_layers = c.num_hidden_layers;
     let indexer_types = c.indexer_types.unwrap_or_else(|| {
-        // Default: all "full"
         vec!["full".to_string(); n_layers]
     });
+    let mlp_layer_types = c.mlp_layer_types.unwrap_or_else(|| {
+        // Default: first_k_dense_replace layers are "dense", rest are "sparse"
+        let mut v = vec!["dense".to_string(); n_layers];
+        for i in c.first_k_dense_replace.unwrap_or(3)..n_layers {
+            v[i] = "sparse".to_string();
+        }
+        v
+    });
+
+    // Parse rope_parameters: { "rope_theta": ..., "rope_type": "default"|"yarn" }
+    let rope_type = c.rope_parameters.as_ref()
+        .and_then(|v| v.get("rope_type"))
+        .and_then(|t| t.as_str())
+        .unwrap_or("default")
+        .to_string();
+    let rope_theta = c.rope_parameters.as_ref()
+        .and_then(|v| v.get("rope_theta"))
+        .and_then(|t| t.as_f64())
+        .unwrap_or(c.rope_theta.unwrap_or(8000000.0));
 
     Ok(Glm5RuntimeConfig {
         num_hidden_layers: n_layers,
@@ -181,7 +224,7 @@ pub fn read_glm5_config(path: &Path) -> Result<Glm5RuntimeConfig> {
         qk_nope_head_dim: c.qk_nope_head_dim.unwrap_or(128),
         qk_rope_head_dim: c.qk_rope_head_dim.unwrap_or(64),
         v_head_dim: c.v_head_dim.unwrap_or(256),
-        rope_theta: c.rope_theta.unwrap_or(8000000.0),
+        rope_theta,
         rms_norm_eps: c.rms_norm_eps.unwrap_or(1e-6),
         tie_word_embeddings: c.tie_word_embeddings,
         first_k_dense_replace: c.first_k_dense_replace.unwrap_or(3),
@@ -213,6 +256,17 @@ pub fn read_glm5_config(path: &Path) -> Result<Glm5RuntimeConfig> {
         rope_beta_fast: c.rope_scaling.as_ref().and_then(|v| v.get("beta_fast")).and_then(|f| f.as_f64()).unwrap_or(32.0),
         rope_beta_slow: c.rope_scaling.as_ref().and_then(|v| v.get("beta_slow")).and_then(|f| f.as_f64()).unwrap_or(1.0),
         rope_original_max_pos: c.rope_scaling.as_ref().and_then(|v| v.get("original_max_position_embeddings")).and_then(|f| f.as_i64()).unwrap_or(4096),
+        // Indexer RoPE (separate from main attention RoPE)
+        indexer_rope_interleave: c.indexer_rope_interleave.unwrap_or(true),
+        // MLP layer types
+        mlp_layer_types,
+        // Top-k method
+        topk_method: c.topk_method.unwrap_or_else(|| "noaux_tc".to_string()),
+        // RoPE type
+        rope_type,
+        // MTP
+        num_nextn_predict_layers: c.num_nextn_predict_layers.unwrap_or(0),
+        // FP8
         expert_dtype: c.expert_dtype.unwrap_or_else(|| "bf16".to_string()),
     })
 }
@@ -496,8 +550,21 @@ pub fn glm5_dsa_attention(
             } else {
                 idx_k
             };
+
+            // Apply indexer RoPE if configured (indexer_rope_interleave is separate from main rope_interleave)
+            let (idx_q_rotated, idx_k_rotated) = if config.indexer_rope_interleave {
+                let (cos_i, sin_i) = rope_cos_sin(seq as usize, idx_head_dim, config.rope_theta, input.device());
+                let cos_i = cos_i.to_kind(input.kind());
+                let sin_i = sin_i.to_kind(input.kind());
+                let q_r = apply_rotary_interleave(&idx_q, &cos_i, &sin_i);
+                let k_r = apply_rotary_interleave(&idx_k_expanded, &cos_i, &sin_i);
+                (q_r, k_r)
+            } else {
+                (idx_q.shallow_clone(), idx_k_expanded.shallow_clone())
+            };
+
             let idx_scale = 1.0 / (idx_head_dim as f64).sqrt();
-            let idx_scores = idx_q.matmul(&idx_k_expanded.transpose(-2, -1)) * idx_scale;
+            let idx_scores = idx_q_rotated.matmul(&idx_k_rotated.transpose(-2, -1)) * idx_scale;
 
             // 4. Top-k selection
             let actual_topk = idx_topk.min(seq as i64);
@@ -513,7 +580,7 @@ pub fn glm5_dsa_attention(
                     [batch as i64, num_heads, seq as i64, seq as i64],
                     (Kind::Float, input.device()),
                 );
-                mask.scatter_(-1, &topk_indices, &ones);
+                let _ = mask.scatter_(-1, &topk_indices, &ones);
                 mask
             };
 

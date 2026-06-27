@@ -18,7 +18,7 @@ set -euo pipefail
 #   RUSTRAIN_REMOTE_ENV_FILE          Source this file on remote before running (optional)
 #   RUSTRAIN_REMOTE_CARGO_HOME        Remote cargo home (default: $HOME/.cargo)
 #   RUSTRAIN_REMOTE_RUSTUP_HOME       Remote rustup home (default: $HOME/.rustup)
-#   RUSTRAIN_REMOTE_PYTHON            Remote python binary (default: python3)
+#   RUSTRAIN_REMOTE_PYTHON            Remote python binary (default: /vePFS-Mindverse/user/nolanho/hackathon-env/venv/bin/python3)
 #   RUSTRAIN_REMOTE_CUDA_PREFIX       CUDA install prefix (default: /usr/local/cuda)
 #   RUSTRAIN_REMOTE_CARGO_TARGET_DIR  Remote cargo target dir (default: $REMOTE_DIR/target)
 #   RUSTRAIN_SSH_OPTS                Extra SSH options
@@ -39,7 +39,7 @@ NUM_GPUS="${RUSTRAIN_NUM_GPUS:-1}"
 REMOTE_ENV_FILE="${RUSTRAIN_REMOTE_ENV_FILE:-}"
 REMOTE_CARGO_HOME="${RUSTRAIN_REMOTE_CARGO_HOME:-}"
 REMOTE_RUSTUP_HOME="${RUSTRAIN_REMOTE_RUSTUP_HOME:-}"
-REMOTE_PYTHON="${RUSTRAIN_REMOTE_PYTHON:-python3}"
+REMOTE_PYTHON="${RUSTRAIN_REMOTE_PYTHON:-/vePFS-Mindverse/user/nolanho/hackathon-env/venv/bin/python3}"
 REMOTE_CUDA_PREFIX="${RUSTRAIN_REMOTE_CUDA_PREFIX:-/usr/local/cuda}"
 REMOTE_CARGO_TARGET_DIR="${RUSTRAIN_REMOTE_CARGO_TARGET_DIR:-}"
 SSH_OPTS="${RUSTRAIN_SSH_OPTS:--o StrictHostKeyChecking=no -o UserKnownHostsFile=/tmp/rustrain_ssh_known_hosts}"
@@ -99,7 +99,8 @@ fi
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES}"
 
 # ── tch-rs / PyTorch integration ──
-export LIBTORCH_USE_PYTORCH=1
+# Use LIBTORCH directly (pointing to persistent venv) instead of python auto-detect
+export LIBTORCH_USE_PYTORCH=0
 export LIBTORCH_BYPASS_VERSION_CHECK=1
 
 # ── Rust toolchain ──
@@ -124,8 +125,10 @@ export PATH="\$REMOTE_CARGO_HOME/bin:\$PATH"
 TORCH_SITE="\$(${REMOTE_PYTHON} -c 'import torch, os; print(os.path.dirname(os.path.dirname(torch.__file__)))' 2>/dev/null || echo '')"
 if [ -z "\$TORCH_SITE" ]; then
   echo "[gpu_run_ssh] WARNING: torch not found via ${REMOTE_PYTHON}; tch-rs build may fail." >&2
-  TORCH_SITE="/usr/local/lib/python3.13/dist-packages"
+  TORCH_SITE="/vePFS-Mindverse/user/nolanho/hackathon-env/venv/lib/python3.12/site-packages"
 fi
+# Set LIBTORCH for tch-rs build script (so -L points to the right torch lib)
+export LIBTORCH="\$TORCH_SITE/torch"
 TORCH_LIB="\$TORCH_SITE/torch/lib"
 NVIDIA_LIB="\$TORCH_SITE/nvidia"
 echo "[gpu_run_ssh] torch_site=\$TORCH_SITE"

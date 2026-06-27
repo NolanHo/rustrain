@@ -138,7 +138,7 @@ pub fn train_glm5_lora_sft_ep(
 
     // ── Build needed weight set ──
     let n_layers = runtime_config.num_hidden_layers;
-    let n_experts = runtime_config.n_routed_experts;
+    let _n_experts = runtime_config.n_routed_experts;
     let mut needed: HashSet<String> = HashSet::new();
     needed.insert("model.embed_tokens.weight".to_string());
     needed.insert("model.norm.weight".to_string());
@@ -214,7 +214,7 @@ pub fn train_glm5_lora_sft_ep(
     info!(rank, tensors_on_gpu = weights_gpu.len(), "weights on GPU");
 
     // ── Create LoRA registry ──
-    let mut registry = Glm5LoraRegistry::new(&weights_gpu, lora_config, device)?;
+    let registry = Glm5LoraRegistry::new(&weights_gpu, lora_config, device)?;
     let trainable_count = registry.var_store.trainable_variables().len();
     info!(
         rank,

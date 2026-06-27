@@ -11,6 +11,7 @@ fn main() {
     let torch_include = std::env::var("TORCH_INCLUDE_PATH")
         .or_else(|_| {
             let candidates = [
+                "/vePFS-Mindverse/user/nolanho/hackathon-env/venv/lib/python3.12/site-packages/torch/include",
                 "/vePFS-mindverse/user/nolanho/venv/lib/python3.12/site-packages/torch/include",
                 "/usr/local/lib/python3.13/dist-packages/torch/include",
                 "/usr/local/lib/python3.12/dist-packages/torch/include",
@@ -34,6 +35,7 @@ fn main() {
     let torch_lib = std::env::var("TORCH_LIB_PATH")
         .or_else(|_| {
             let candidates = [
+                "/vePFS-Mindverse/user/nolanho/hackathon-env/venv/lib/python3.12/site-packages/torch/lib",
                 "/vePFS-mindverse/user/nolanho/venv/lib/python3.12/site-packages/torch/lib",
                 "/usr/local/lib/python3.13/dist-packages/torch/lib",
                 "/usr/local/lib/python3.12/dist-packages/torch/lib",
@@ -93,8 +95,13 @@ fn main() {
 
     match status {
         Ok(s) if s.success() => {
+            println!("cargo:rustc-link-search=native={torch_lib}");
             println!("cargo:rustc-link-search=native={out_dir}");
             println!("cargo:rustc-link-lib=dylib=fp8_gemm");
+            println!("cargo:rustc-link-lib=dylib=c10");
+            println!("cargo:rustc-link-lib=dylib=torch");
+            println!("cargo:rustc-link-lib=dylib=torch_cpu");
+            println!("cargo:rustc-link-lib=dylib=torch_cuda");
             println!("cargo:rerun-if-changed=kernels/fp8_gemm.cpp");
             println!("cargo:rerun-if-changed=build.rs");
         }
