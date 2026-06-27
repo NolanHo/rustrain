@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, HashSet};
 
-use anyhow::{Context, Result, bail};
-use tch::{Device, Kind, Tensor, no_grad};
+use anyhow::{bail, Context, Result};
+use tch::{no_grad, Device, Kind, Tensor};
 use tracing::info;
 
 use rustrain_core::runtime::{Config, RunPaths};
@@ -39,10 +39,24 @@ pub fn train_v4_session_single_from_config(config: &Config, _run_paths: &RunPath
     let names = v4_trainable_tensors_for_layer(trainable_layers[0], &runtime_config);
     needed.extend(names);
 
+    // Load MTP head weights if the model has multi-token prediction layers
+    if runtime_config.num_nextn_predict_layers > 0 {
+        for mtp_layer in 0..runtime_config.num_nextn_predict_layers {
+            needed.extend(MtpHeadWeights::weight_names(mtp_layer));
+        }
+        info!(
+            mtp_layers = runtime_config.num_nextn_predict_layers,
+            "MTP weights requested for training"
+        );
+    }
+
     let weights = load_v4_weights(&model_path, &needed)?;
     info!(tensors = weights.len(), "weights loaded");
 
-    let compute_kind = Kind::Float;
+    let compute_kind = match config.train.dtype {
+        rustrain_core::runtime::DType::Bf16 => Kind::BFloat16,
+        _ => Kind::Float,
+    };
     let device = Device::Cuda(0);
 
     let mut weights_gpu: BTreeMap<String, Tensor> = weights
@@ -76,7 +90,7 @@ pub fn train_v4_session_single_from_config(config: &Config, _run_paths: &RunPath
     let mut initial_loss = 0.0_f64;
 
     for step in 0..config.train.max_steps {
-        let loss = v4_causal_lm_loss_selective(
+        let loss = v4_causal_lm_loss_with_mtp(
             &input_ids,
             &weights_gpu,
             &runtime_config,
@@ -105,7 +119,7 @@ pub fn train_v4_session_single_from_config(config: &Config, _run_paths: &RunPath
     }
 
     let final_loss =
-        v4_causal_lm_loss_selective(&input_ids, &weights_gpu, &runtime_config, &trainable_layers)?
+        v4_causal_lm_loss_with_mtp(&input_ids, &weights_gpu, &runtime_config, &trainable_layers)?
             .double_value(&[]);
 
     info!(initial_loss, final_loss, "V4 training complete");
@@ -174,10 +188,20 @@ pub fn train_v4_lora_sft_from_config(
     let names = v4_trainable_tensors_for_layer(trainable_layers[0], &runtime_config);
     needed.extend(names);
 
+    // Load MTP head weights if the model has multi-token prediction layers
+    if runtime_config.num_nextn_predict_layers > 0 {
+        for mtp_layer in 0..runtime_config.num_nextn_predict_layers {
+            needed.extend(MtpHeadWeights::weight_names(mtp_layer));
+        }
+    }
+
     let weights = load_v4_weights(&model_path, &needed)?;
     info!(tensors = weights.len(), "weights loaded");
 
-    let compute_kind = Kind::Float;
+    let compute_kind = match config.train.dtype {
+        rustrain_core::runtime::DType::Bf16 => Kind::BFloat16,
+        _ => Kind::Float,
+    };
     let device = Device::Cuda(0);
 
     let weights_gpu: BTreeMap<String, Tensor> = weights

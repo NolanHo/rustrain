@@ -2,7 +2,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-source "${SCRIPT_DIR}/require_gpu_worker.sh"
+source "${SCRIPT_DIR}/ray/require_gpu_worker.sh"
 
 BASE_CONFIG="${RUSTRAIN_QWEN_SESSION_DP2_TRAINER_INDEX_CACHE_CONFIG:-configs/qwen_session_dp2_sft_max_samples.toml}"
 RUN_DIR="$(mktemp -d)"

@@ -1,5 +1,5 @@
 use std::{
-    ffi::{CStr, c_char, c_int, c_void},
+    ffi::{c_char, c_int, c_void, CStr},
     fs,
     path::{Path, PathBuf},
     ptr,
@@ -7,7 +7,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use tch::{Kind, Tensor};
 
@@ -307,7 +307,10 @@ fn wait_for_unique_id(path: &Path, timeout: Duration) -> Result<NcclUniqueId> {
         if path.exists() {
             let bytes =
                 fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
-            return unique_id_from_bytes(&bytes);
+            if bytes.len() == NCCL_UNIQUE_ID_BYTES {
+                return unique_id_from_bytes(&bytes);
+            }
+            // File exists but not fully written yet (0 bytes on network FS) — keep waiting
         }
         sleep(Duration::from_millis(50));
     }
@@ -662,3 +665,121 @@ mod tests {
         }
     }
 }
+
+// ── Persistent NCCL Communicator ─────────────────────────────────────────────
+//
+// Creates a single NCCL communicator that is reused across all all-reduce calls
+// in a training loop. This avoids the overhead of creating/destroying a
+// communicator (which involves file-system unique ID exchange) for every layer.
+
+pub struct NcclPersistentComm {
+    comm: NcclComm,
+    rank: usize,
+    world_size: usize,
+    local_rank: usize,
+}
+
+impl NcclPersistentComm {
+    /// Create a persistent NCCL communicator.
+    /// Rank 0 generates the unique ID and writes it to a file; other ranks read it.
+    pub fn new(output_dir: &Path) -> Result<Self> {
+        let rank = parse_env_usize("RANK")?;
+        let local_rank = parse_env_usize("LOCAL_RANK")?;
+        let world_size = parse_env_usize("WORLD_SIZE")?;
+        if rank >= world_size {
+            bail!("rank {rank} must be smaller than world_size {world_size}");
+        }
+        fs::create_dir_all(output_dir)
+            .with_context(|| format!("failed to create {}", output_dir.display()))?;
+
+        // Exchange unique ID via file system (only once)
+        let id_path = output_dir.join("nccl-persistent-id.bin");
+        let unique_id = if rank == 0 {
+            let id = nccl_unique_id()?;
+            // Write and fsync to ensure visibility on network FS
+            let f = std::fs::File::create(&id_path)?;
+            use std::io::Write;
+            let mut f = f;
+            f.write_all(&unique_id_to_bytes(&id))?;
+            f.sync_all()?;
+            id
+        } else {
+            // Wait for rank 0 to write the ID file
+            let deadline = Instant::now() + Duration::from_secs(60);
+            loop {
+                if id_path.exists() {
+                    let bytes = fs::read(&id_path)
+                        .with_context(|| format!("failed to read {}", id_path.display()))?;
+                    if bytes.len() == NCCL_UNIQUE_ID_BYTES {
+                        break unique_id_from_bytes(&bytes)?;
+                    }
+                }
+                if Instant::now() > deadline {
+                    bail!(
+                        "timed out waiting for NCCL unique ID at {}",
+                        id_path.display()
+                    );
+                }
+                sleep(Duration::from_millis(50));
+            }
+        };
+
+        // Initialize communicator once
+        check_cuda(
+            unsafe { cudaSetDevice(local_rank as c_int) },
+            "cudaSetDevice",
+        )?;
+        let mut comm: NcclComm = ptr::null_mut();
+        check_nccl(
+            unsafe { ncclCommInitRank(&mut comm, world_size as c_int, unique_id, rank as c_int) },
+            "ncclCommInitRank",
+        )?;
+
+        Ok(Self {
+            comm,
+            rank,
+            world_size,
+            local_rank,
+        })
+    }
+
+    /// All-reduce a tensor (sum) using the persistent communicator.
+    /// Returns the reduced tensor (sum across all ranks).
+    pub fn all_reduce(&self, tensor: &Tensor) -> Result<Tensor> {
+        let tensor = tensor.to_kind(Kind::Float).contiguous();
+        if tensor.numel() == 0 {
+            bail!("NCCL all-reduce input must not be empty");
+        }
+        check_cuda(
+            unsafe { cudaSetDevice(self.local_rank as c_int) },
+            "cudaSetDevice",
+        )?;
+        let output = tensor.zeros_like();
+        check_nccl(
+            unsafe {
+                ncclAllReduce(
+                    tensor.data_ptr().cast_const(),
+                    output.data_ptr(),
+                    tensor.numel(),
+                    NCCL_FLOAT32,
+                    NCCL_SUM,
+                    self.comm,
+                    ptr::null_mut(),
+                )
+            },
+            "ncclAllReduce",
+        )?;
+        check_cuda(unsafe { cudaDeviceSynchronize() }, "cudaDeviceSynchronize")?;
+        Ok(output)
+    }
+}
+
+impl Drop for NcclPersistentComm {
+    fn drop(&mut self) {
+        if !self.comm.is_null() {
+            unsafe { ncclCommDestroy(self.comm) };
+        }
+    }
+}
+
+unsafe impl Send for NcclPersistentComm {}

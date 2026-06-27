@@ -2,7 +2,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-source "${SCRIPT_DIR}/require_gpu_worker.sh"
+source "${SCRIPT_DIR}/ray/require_gpu_worker.sh"
 
 CONFIG="${RUSTRAIN_QWEN_LORA_SFT_EVAL_PATHS_CONFIG:-configs/qwen_lora_sft_eval_paths.toml}"
 OUTPUT="$(mktemp)"

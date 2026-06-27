@@ -99,7 +99,9 @@ def run_on_gpu_worker(
 ) -> str:
     accelerator_ids = ray.get_runtime_context().get_accelerator_ids().get("GPU", [])
     subprocess_env = os.environ.copy()
-    if accelerator_ids and not subprocess_env.get("CUDA_VISIBLE_DEVICES"):
+    # ALWAYS override CUDA_VISIBLE_DEVICES from accelerator_ids —
+    # Ray sets it to "" (empty) in workers, which would hide all GPUs.
+    if accelerator_ids:
         subprocess_env["CUDA_VISIBLE_DEVICES"] = ",".join(str(gpu_id) for gpu_id in accelerator_ids)
     work_dir = remote_dir
     staged = archive_bytes is not None
@@ -149,6 +151,7 @@ def run_on_gpu_worker(
     subprocess_env["LIBTORCH_USE_PYTORCH"] = "1"
     subprocess_env["LIBTORCH_BYPASS_VERSION_CHECK"] = "1"
     subprocess_env["CARGO_TARGET_DIR"] = "/tmp/rustrain-target-a800"
+    subprocess_env["RAY_CPP_DIR"] = "/usr/local/lib/python3.13/dist-packages/ray/cpp"
 
     torch_site = os.environ.get(
         "RUSTRAIN_TORCH_SITE",
@@ -157,6 +160,8 @@ def run_on_gpu_worker(
     torch_lib = f"{torch_site}/torch/lib"
     nvidia = f"{torch_site}/nvidia"
     ld_library = ":".join([
+        "/usr/local/lib/python3.13/dist-packages/ray/cpp/lib",
+        "/usr/local/cuda-13.0/compat",
         torch_lib,
         f"{nvidia}/cuda_runtime/lib",
         f"{nvidia}/cuda_cupti/lib",
@@ -173,51 +178,113 @@ def run_on_gpu_worker(
         f"{nvidia}/nvshmem/lib",
         f"{nvidia}/nvtx/lib",
         "/usr/local/cuda/lib64",
+        "/usr/local/nvidia/lib",
+        "/usr/local/nvidia/lib64",
     ])
     if "LD_LIBRARY_PATH" in subprocess_env:
         ld_library = f"{ld_library}:{subprocess_env['LD_LIBRARY_PATH']}"
     subprocess_env["LD_LIBRARY_PATH"] = ld_library
 
+    # tch-rs needs libtorch_cuda.so preloaded for CUDA ops
     ld_preload = f"{torch_lib}/libtorch_cuda.so"
-    if "LD_PRELOAD" in subprocess_env:
-        ld_preload = f"{ld_preload}:{subprocess_env['LD_PRELOAD']}"
     subprocess_env["LD_PRELOAD"] = ld_preload
 
+    # Ray intercepts execve() via LD_PRELOAD and strips CUDA_VISIBLE_DEVICES
+    # specifically for "bash"/"sh" targets. "python3" and other binaries
+    # are NOT stripped (proven by test_cuda.py).
+    # Solution: C wrapper sets env vars via setenv(), then directly execvp()
+    # the command's first token (e.g., "cargo") — NOT bash.
+    # The setup (mkdir, tar, cd) is already done by the staging code above.
+    import shlex, re, json, ctypes
+    valid_name = re.compile(r'^[A-Za-z_][A-Za-z0-9_]*$')
+
+    # Collect ONLY critical env vars
+    critical_keys = {
+        "CUDA_VISIBLE_DEVICES", "LD_LIBRARY_PATH", "LD_PRELOAD",
+        "PATH", "RUSTUP_HOME", "CARGO_HOME", "CARGO_TARGET_DIR",
+        "LIBTORCH_USE_PYTORCH", "LIBTORCH_BYPASS_VERSION_CHECK",
+        "PYTHONPATH", "HOME", "RAY_CPP_DIR",
+    }
+    env_vars = {}
+    for k, v in subprocess_env.items():
+        if k in critical_keys and v:
+            env_vars[k] = str(v)
+
+    # Tokenize the command — we'll execvp the first token directly
+    tokens = shlex.split(command)
+
+    # Write env vars and command tokens to JSON files
+    pid = os.getpid()
+    env_file = f"/dev/shm/rustrain_env_{pid}.json"
+    cmd_file = f"/dev/shm/rustrain_cmd_{pid}.json"
+    with open(env_file, "w") as f:
+        json.dump(env_vars, f)
+    with open(cmd_file, "w") as f:
+        json.dump({"tokens": tokens, "work_dir": work_dir}, f)
+
+    # Write a simple runner script that generates + compiles + runs C wrapper
+    runner_path = f"/dev/shm/rustrain_runner_{pid}.py"
+    with open(runner_path, "w") as f:
+        f.write("import ctypes, json, sys, os\n")
+        f.write("env_vars = json.load(open(sys.argv[1]))\n")
+        f.write("cmd = json.load(open(sys.argv[2]))\n")
+        f.write("tokens = cmd['tokens']\n")
+        f.write("work_dir = cmd['work_dir']\n")
+        f.write("print('RUNNER: %d env vars, exec=%s' % (len(env_vars), tokens[0] if tokens else 'NONE'))\n")
+        # Generate C source
+        f.write("lines = ['#include <stdlib.h>', '#include <unistd.h>', '#include <stdio.h>', 'int main() {']\n")
+        f.write("for k in sorted(env_vars):\n")
+        f.write("    v_json = json.dumps(str(env_vars[k]))\n")
+        f.write("    lines.append('    setenv(\"%s\", %s, 1);' % (k, v_json))\n")
+        # chdir
+        f.write("wd_json = json.dumps(work_dir)\n")
+        f.write("lines.append('    chdir(%s);' % wd_json)\n")
+        # Build argv array from tokens — execvp(tokens[0], {tokens[0], ..., NULL})
+        f.write("argv_items = ', '.join([json.dumps(t) for t in tokens])\n")
+        f.write("lines.append('    char *a[] = {%s, 0};' % argv_items)\n")
+        f.write("lines.append('    execvp(\"%s\", a);' % tokens[0])\n")
+        f.write("lines.append('    perror(\"execvp %s\");' % tokens[0])\n")
+        f.write("lines.append('    return 1;')\n")
+        f.write("lines.append('}')\n")
+        f.write("open('/dev/shm/rustrain_wrapper.c', 'w').write(chr(10).join(lines) + chr(10))\n")
+        # Compile and run
+        f.write("libc = ctypes.CDLL('libc.so.6')\n")
+        f.write("libc.system(b'cc -o /dev/shm/rustrain_wrapper /dev/shm/rustrain_wrapper.c 2>&1')\n")
+        f.write("sys.exit(libc.system(b'/dev/shm/rustrain_wrapper 2>&1'))\n")
+
+    # Call runner via libc.system()
+    output_file = f"/dev/shm/rustrain_out_{pid}.txt"
+    redirect_cmd = f"python3 {runner_path} {env_file} {cmd_file} > {output_file} 2>&1"
+
+    libc = ctypes.CDLL("libc.so.6")
+    ret = libc.system(redirect_cmd.encode("utf-8"))
+
+    # Read output
     try:
-        result = subprocess.run(
-            command,
-            cwd=work_dir,
-            shell=True,
-            env=subprocess_env,
-            capture_output=True,
-            text=True,
-            timeout=3600,
-        )
-        output = result.stdout
-        if result.stderr:
-            output += "\n" + result.stderr
-        if result.returncode != 0:
-            raise RuntimeError(
-                f"Ray worker host={os.uname().nodename} accelerator_ids={accelerator_ids} "
-                f"CUDA_VISIBLE_DEVICES={subprocess_env.get('CUDA_VISIBLE_DEVICES', 'unset')} "
-                f"work_dir={work_dir} staged={staged} command={' '.join(command)}\n"
-                f"Ray CUDA worker ready: device_count={__import__('torch').cuda.device_count()}\n"
-                f"{output}"
-            )
-        return (
+        with open(output_file) as f:
+            output = f.read()
+    except IOError:
+        output = ""
+    try:
+        os.unlink(output_file)
+    except OSError:
+        pass
+
+    if ret != 0:
+        raise RuntimeError(
             f"Ray worker host={os.uname().nodename} accelerator_ids={accelerator_ids} "
             f"CUDA_VISIBLE_DEVICES={subprocess_env.get('CUDA_VISIBLE_DEVICES', 'unset')} "
             f"work_dir={work_dir} staged={staged} command={' '.join(command)}\n"
             f"Ray CUDA worker ready: device_count={__import__('torch').cuda.device_count()}\n"
             f"{output}"
         )
-    except subprocess.TimeoutExpired as e:
-        output = e.stdout or ""
-        if e.stderr:
-            output += "\n" + e.stderr
-        raise RuntimeError(
-            f"Ray worker timed out after {e.timeout}s: command={' '.join(command)}\n{output}"
-        )
+    return (
+        f"Ray worker host={os.uname().nodename} accelerator_ids={accelerator_ids} "
+        f"CUDA_VISIBLE_DEVICES={subprocess_env.get('CUDA_VISIBLE_DEVICES', 'unset')} "
+        f"work_dir={work_dir} staged={staged} command={' '.join(command)}\n"
+        f"Ray CUDA worker ready: device_count={__import__('torch').cuda.device_count()}\n"
+        f"{output}"
+    )
 
 
 try:

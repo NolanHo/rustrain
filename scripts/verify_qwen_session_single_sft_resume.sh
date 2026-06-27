@@ -2,7 +2,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-source "${SCRIPT_DIR}/require_gpu_worker.sh"
+source "${SCRIPT_DIR}/ray/require_gpu_worker.sh"
 
 CONFIG="${RUSTRAIN_QWEN_SESSION_SINGLE_SFT_CONFIG:-configs/qwen_session_single_sft.toml}"
 EXPECTED_TRAINABLE_TENSORS="${RUSTRAIN_EXPECTED_QWEN_TRAINABLE_TENSORS:-}"

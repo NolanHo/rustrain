@@ -3,11 +3,11 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{anyhow, Context, Result};
 use chrono::Local;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
-use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt};
+use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
 use crate::backend::BackendKind;
 
@@ -495,6 +495,22 @@ pub fn validate_config(config: &Config) -> Result<()> {
         && config.model.architecture == "qwen_lora_sft";
     let is_tch_moe_ep_session = matches!(config.train.backend, BackendKind::Tch)
         && config.model.architecture == "tch_moe_ep_session";
+    let is_v4_tp_rank = matches!(config.train.backend, BackendKind::Tch)
+        && config.model.architecture == "deepseek_v4_tp_rank";
+    let is_v4_tp_train = matches!(config.train.backend, BackendKind::Tch)
+        && config.model.architecture == "deepseek_v4_tp_train";
+    let is_v4_ep_rank = matches!(config.train.backend, BackendKind::Tch)
+        && config.model.architecture == "deepseek_v4_ep_rank";
+    let is_v4_ep_train = matches!(config.train.backend, BackendKind::Tch)
+        && config.model.architecture == "deepseek_v4_ep_train";
+    let is_v4_lora_sft_ep = matches!(config.train.backend, BackendKind::Tch)
+        && config.model.architecture == "deepseek_v4_lora_sft_ep";
+    let is_v4_tp_ep_train = matches!(config.train.backend, BackendKind::Tch)
+        && config.model.architecture == "deepseek_v4_tp_ep_train";
+    let is_v3_tp_rank = matches!(config.train.backend, BackendKind::Tch)
+        && config.model.architecture == "deepseek_tp_rank";
+    let is_v3_ep_rank = matches!(config.train.backend, BackendKind::Tch)
+        && config.model.architecture == "deepseek_ep_rank";
     for (name, value) in parallel_sizes {
         if value == 0 {
             return Err(anyhow!("{name} must be greater than zero"));
@@ -511,6 +527,16 @@ pub fn validate_config(config: &Config) -> Result<()> {
                 && name == "expert_model_parallel_size"
                 && value == 2
                 && parallel.tensor_model_parallel_size == 1
+                && parallel.data_parallel_size == 1)
+            && !((is_v4_tp_rank || is_v3_tp_rank || is_v4_tp_train)
+                && name == "tensor_model_parallel_size"
+                && parallel.data_parallel_size == 1)
+            && !((is_v4_ep_rank || is_v3_ep_rank || is_v4_ep_train || is_v4_lora_sft_ep)
+                && name == "expert_model_parallel_size"
+                && parallel.tensor_model_parallel_size == 1
+                && parallel.data_parallel_size == 1)
+            && !(is_v4_tp_ep_train
+                && (name == "tensor_model_parallel_size" || name == "expert_model_parallel_size")
                 && parallel.data_parallel_size == 1)
         {
             return Err(anyhow!("M1 toy backend requires {name} = 1"));
@@ -1251,11 +1277,9 @@ mod tests {
 
         let error = validate_config(&config).expect_err("zero max_samples should fail");
 
-        assert!(
-            error
-                .to_string()
-                .contains("data.max_samples must be greater than zero")
-        );
+        assert!(error
+            .to_string()
+            .contains("data.max_samples must be greater than zero"));
     }
 
     #[test]
@@ -1274,11 +1298,9 @@ mod tests {
 
         let error = validate_config(&config).expect_err("invalid regex should fail");
 
-        assert!(
-            error
-                .to_string()
-                .contains("data.field_regex_replacements invalid regex pattern")
-        );
+        assert!(error
+            .to_string()
+            .contains("data.field_regex_replacements invalid regex pattern"));
     }
 
     #[test]
@@ -1298,11 +1320,9 @@ mod tests {
 
         let error = validate_config(&config).expect_err("invalid regex should fail");
 
-        assert!(
-            error
-                .to_string()
-                .contains("data.field_transforms invalid regex_replace pattern")
-        );
+        assert!(error
+            .to_string()
+            .contains("data.field_transforms invalid regex_replace pattern"));
     }
 
     #[test]
@@ -1320,11 +1340,9 @@ mod tests {
 
         let error = validate_config(&config).expect_err("invalid regex should fail");
 
-        assert!(
-            error
-                .to_string()
-                .contains("data field regex filter invalid regex pattern")
-        );
+        assert!(error
+            .to_string()
+            .contains("data field regex filter invalid regex pattern"));
     }
 
     fn qwen_lora_sft_config() -> Config {

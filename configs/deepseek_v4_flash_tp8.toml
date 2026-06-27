@@ -1,11 +1,11 @@
 [run]
-name = "deepseek_v4_flash_session"
+name = "deepseek_v4_flash_tp8"
 base_dir = "/tmp/rustrain-runs"
 seed = 42
 
 [model]
-name = "deepseek_v4_flash"
-architecture = "deepseek_v4_session"
+name = "deepseek_v4_flash_tp8"
+architecture = "deepseek_v4_tp_rank"
 model_path = "/vePFS-mindverse/user/nolanho/models/DeepSeek-V4-Flash-Base"
 vocab_size = 129280
 hidden_size = 4096
@@ -18,7 +18,6 @@ norm = "rmsnorm"
 activation = "swiglu"
 rope = true
 rms_norm_eps = 0.000001
-trainable_layers = [0]
 
 [train]
 micro_batch_size = 1
@@ -29,14 +28,14 @@ weight_decay = 0.0
 adam_beta1 = 0.9
 adam_beta2 = 0.999
 adam_eps = 0.00000001
-max_steps = 2
+max_steps = 1
 backend = "tch"
-dtype = "bf16"
+dtype = "fp32"
 device = "cuda"
 checkpoint_every = 0
 
 [parallel]
-tensor_model_parallel_size = 1
+tensor_model_parallel_size = 8
 pipeline_model_parallel_size = 1
 data_parallel_size = 1
 expert_model_parallel_size = 1

@@ -6,7 +6,7 @@ seed = 42
 [model]
 name = "deepseek_v4_flash_tp1"
 architecture = "deepseek_v4_tp_rank"
-model_path = "/vePFS-Mindverse/share/huggingface/hub/models--deepseek-ai--DeepSeek-V4-Flash-Base"
+model_path = "/vePFS-mindverse/user/nolanho/models/DeepSeek-V4-Flash-Base"
 vocab_size = 129280
 hidden_size = 4096
 num_layers = 43

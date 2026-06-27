@@ -1,11 +1,11 @@
 [run]
-name = "deepseek_v4_flash_session"
+name = "deepseek_v4_flash_lora_sft_ep8"
 base_dir = "/tmp/rustrain-runs"
 seed = 42
 
 [model]
-name = "deepseek_v4_flash"
-architecture = "deepseek_v4_session"
+name = "deepseek_v4_flash_lora_sft_ep8"
+architecture = "deepseek_v4_lora_sft_ep"
 model_path = "/vePFS-mindverse/user/nolanho/models/DeepSeek-V4-Flash-Base"
 vocab_size = 129280
 hidden_size = 4096
@@ -13,12 +13,11 @@ num_layers = 43
 num_attention_heads = 64
 num_key_value_heads = 64
 intermediate_size = 18432
-seq_len = 5
+seq_len = 512
 norm = "rmsnorm"
 activation = "swiglu"
 rope = true
 rms_norm_eps = 0.000001
-trainable_layers = [0]
 
 [train]
 micro_batch_size = 1
@@ -29,15 +28,21 @@ weight_decay = 0.0
 adam_beta1 = 0.9
 adam_beta2 = 0.999
 adam_eps = 0.00000001
-max_steps = 2
+max_steps = 20
 backend = "tch"
 dtype = "bf16"
 device = "cuda"
 checkpoint_every = 0
 
+[lora]
+target_layers = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42]
+rank = 16
+alpha = 32
+target_modules = ["wq_a", "wq_b", "wkv", "wo_a", "wo_b"]
+
 [parallel]
 tensor_model_parallel_size = 1
 pipeline_model_parallel_size = 1
 data_parallel_size = 1
-expert_model_parallel_size = 1
+expert_model_parallel_size = 8
 context_parallel_size = 1

@@ -3,7 +3,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{anyhow, Context, Result};
 use safetensors::SafeTensors;
 use serde::Deserialize;
 use tokenizers::Tokenizer;

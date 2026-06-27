@@ -1,9 +1,9 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 use serde::Serialize;
-use tch::{Device, Kind, Tensor, nn};
+use tch::{nn, Device, Kind, Tensor};
 
 use crate::model::*;
 
