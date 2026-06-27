@@ -362,7 +362,7 @@ pub fn train_glm5_lora_sft_ep(
             let mlp_input = rms_norm(&residual, &post_norm, runtime_config.rms_norm_eps);
 
             if runtime_config.is_moe_layer(layer) {
-                // MoE with EP
+                // MoE with EP — inline implementation (not glm5_moe_mlp which assumes all experts local)
                 let gate = tensor(&weights_gpu, &format!("{p}.mlp.gate.weight"))?
                     .to_kind(compute_kind);
                 let shared_gate = tensor(&weights_gpu, &format!("{p}.mlp.shared_experts.gate_proj.weight"))?
@@ -372,38 +372,58 @@ pub fn train_glm5_lora_sft_ep(
                 let shared_down = tensor(&weights_gpu, &format!("{p}.mlp.shared_experts.down_proj.weight"))?
                     .to_kind(compute_kind);
 
-                // Load local experts
-                let local_experts: Vec<(Tensor, Tensor, Tensor)> = ep_shard
-                    .local_expert_indices
-                    .iter()
-                    .map(|&e| {
-                        let gate = tensor(&weights_gpu, &format!("{p}.mlp.experts.{e}.gate_proj.weight"))
-                            .unwrap()
-                            .to_kind(compute_kind);
-                        let up = tensor(&weights_gpu, &format!("{p}.mlp.experts.{e}.up_proj.weight"))
-                            .unwrap()
-                            .to_kind(compute_kind);
-                        let down = tensor(&weights_gpu, &format!("{p}.mlp.experts.{e}.down_proj.weight"))
-                            .unwrap()
-                            .to_kind(compute_kind);
-                        (gate, up, down)
-                    })
-                    .collect();
+                // Shared expert (replicated across all ranks)
+                let shared_output = glm5_mlp(&mlp_input, &shared_gate, &shared_up, &shared_down);
 
-                // EP MoE: shared (replicated) + local experts → partial output
-                let partial_mlp = glm5_moe_mlp(
-                    &mlp_input,
-                    &gate,
-                    &shared_gate,
-                    &shared_up,
-                    &shared_down,
-                    &local_experts,
-                    runtime_config.num_experts_per_tok,
-                    &runtime_config.scoring_func,
-                    runtime_config.n_group,
-                    runtime_config.topk_group,
-                    runtime_config.routed_scaling_factor,
+                // Router logits — computed over ALL experts
+                let router_logits = mlp_input.linear::<&Tensor>(&gate, None);
+                let n_experts = runtime_config.n_routed_experts as i64;
+                let k = runtime_config.num_experts_per_tok as i64;
+
+                // Sigmoid scoring + top-k
+                let scores = router_logits.sigmoid();
+                let (topk_weights, topk_indices) = scores.topk(k, -1, true, true);
+                // Normalize
+                let denom = topk_weights.sum_dim_intlist([-1].as_slice(), true, topk_weights.kind());
+                let topk_weights = (topk_weights / denom) * runtime_config.routed_scaling_factor;
+
+                // Flatten for per-token dispatch
+                let flat_input = mlp_input.reshape([-1, mlp_input.size()[2]]);
+                let tk_indices = topk_indices.reshape([-1, k]);
+                let tk_weights = topk_weights.reshape([-1, k]);
+
+                // Only apply LOCAL experts (EP sharded)
+                let mut partial_output = Tensor::zeros(
+                    flat_input.size(),
+                    (compute_kind, flat_input.device()),
                 );
+
+                for (local_idx, &global_e) in ep_shard.local_expert_indices.iter().enumerate() {
+                    // Check which tokens selected this expert
+                    let mask = tk_indices.eq(global_e as i64).to_kind(compute_kind);
+                    let mask_flat = mask.sum_dim_intlist([-1].as_slice(), false, compute_kind).to_kind(compute_kind);
+                    let count = mask_flat.sum(compute_kind).double_value(&[]) as i64;
+                    if count == 0 {
+                        continue;
+                    }
+                    let eg = format!("{p}.mlp.experts.{global_e}");
+                    let gate_w = tensor(&weights_gpu, &format!("{eg}.gate_proj.weight"))?.to_kind(compute_kind);
+                    let up_w = tensor(&weights_gpu, &format!("{eg}.up_proj.weight"))?.to_kind(compute_kind);
+                    let down_w = tensor(&weights_gpu, &format!("{eg}.down_proj.weight"))?.to_kind(compute_kind);
+                    let expert_out = glm5_mlp(&flat_input, &gate_w, &up_w, &down_w);
+                    // Find which position (0..k) this expert was selected at, and use that weight
+                    // For simplicity, sum contributions from all k positions
+                    let weight = tk_weights.narrow(-1, 0, 1).unsqueeze(-1); // simplified: use first position
+                    // Actually need to find the weight corresponding to where global_e appears in topk_indices
+                    // Use mask & tk_weights summed over k
+                    let weighted_mask = (mask * &tk_weights).sum_dim_intlist([-1].as_slice(), false, compute_kind).to_kind(compute_kind);
+                    let mask_expanded = weighted_mask.unsqueeze(-1).expand([-1, expert_out.size()[1]], false);
+                    let contribution = expert_out * &mask_expanded;
+                    partial_output = partial_output + contribution;
+                }
+
+                // partial_output = local experts only. Add shared (replicated).
+                let partial_mlp = partial_output.reshape([1, -1, mlp_input.size()[2]]) + &shared_output;
 
                 // All-reduce MoE output (shared expert counted world_size times → divide)
                 let mlp_kind = partial_mlp.kind();
