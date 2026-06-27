@@ -1750,6 +1750,7 @@ dependencies = [
  "serde_json",
  "tch",
  "tempfile",
+ "tracing",
 ]
 
 [[package]]

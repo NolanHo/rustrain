@@ -9,7 +9,7 @@ use crate::lora::*;
 use crate::model::*;
 use crate::model::{rms_norm, glm5_mlp};
 use crate::sft::*;
-use rustrain_checkpoint::safetensors::{read_safetensors_dir, tensor};
+use rustrain_checkpoint::safetensors::{read_safetensors_dir, read_safetensors_dir_filtered, tensor};
 use rustrain_nccl::nccl::{self as nccl_smoke, NcclPersistentComm};
 
 fn parse_env_usize(name: &str) -> Result<usize> {
@@ -568,7 +568,7 @@ fn load_glm5_weights(
     model_path: &std::path::Path,
     needed: &HashSet<String>,
 ) -> Result<BTreeMap<String, Tensor>> {
-    let weights = read_safetensors_dir(model_path)
+    let weights = read_safetensors_dir_filtered(model_path, needed)
         .with_context(|| format!("failed to read safetensors from {}", model_path.display()))?;
 
     // Filter to only needed tensors

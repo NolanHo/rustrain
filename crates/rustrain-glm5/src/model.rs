@@ -960,3 +960,110 @@ pub fn glm5_cross_entropy_loss(
         .log_softmax(-1, Kind::Float)
         .g_nll_loss::<&Tensor>(&targets.reshape([-1]), None, Reduction::Mean, -100))
 }
+
+// ── MTP (Multi-Token Prediction) ─────────────────────────────────
+
+pub struct Glm5MtpHeadWeights {
+    pub norm: Tensor,
+    pub hnorm: Tensor,
+    pub head: Tensor,
+    pub ffn_norm: Tensor,
+    pub ffn_shared_gate: Tensor,
+    pub ffn_shared_up: Tensor,
+    pub ffn_shared_down: Tensor,
+}
+
+impl Glm5MtpHeadWeights {
+    pub fn load_raw(weights: &BTreeMap<String, Tensor>, mtp_layer: usize) -> Result<Self> {
+        let p = format!("mtp.{mtp_layer}");
+        Ok(Self {
+            norm: tensor(weights, &format!("{p}.norm.weight"))?.shallow_clone(),
+            hnorm: tensor(weights, &format!("{p}.hnorm.weight"))?.shallow_clone(),
+            head: tensor(weights, &format!("{p}.head.weight"))?.shallow_clone(),
+            ffn_norm: tensor(weights, &format!("{p}.ffn_norm.weight"))
+                .or_else(|_| tensor(weights, &format!("{p}.ffn.weight")))?
+                .shallow_clone(),
+            ffn_shared_gate: tensor(weights, &format!("{p}.ffn.shared_experts.gate_proj.weight"))?.shallow_clone(),
+            ffn_shared_up: tensor(weights, &format!("{p}.ffn.shared_experts.up_proj.weight"))?.shallow_clone(),
+            ffn_shared_down: tensor(weights, &format!("{p}.ffn.shared_experts.down_proj.weight"))?.shallow_clone(),
+        })
+    }
+
+    pub fn weight_names(mtp_layer: usize) -> Vec<String> {
+        let p = format!("mtp.{mtp_layer}");
+        vec![
+            format!("{p}.norm.weight"),
+            format!("{p}.hnorm.weight"),
+            format!("{p}.head.weight"),
+            format!("{p}.ffn_norm.weight"),
+            format!("{p}.ffn.shared_experts.gate_proj.weight"),
+            format!("{p}.ffn.shared_experts.up_proj.weight"),
+            format!("{p}.ffn.shared_experts.down_proj.weight"),
+        ]
+    }
+}
+
+pub fn has_mtp_weights(weights: &BTreeMap<String, Tensor>) -> bool {
+    weights.contains_key("mtp.0.head.weight")
+}
+
+/// MTP forward: combine hidden + next_token_embed → norm → FFN → hnorm → head → logits
+/// With index_share_for_mtp_iteration, the MTP layer reuses the last full indexer's top-k mask.
+pub fn glm5_mtp_forward(
+    hidden: &Tensor,
+    next_token_embed: &Tensor,
+    mtp: &Glm5MtpHeadWeights,
+    config: &Glm5RuntimeConfig,
+) -> (Tensor, Tensor) {
+    let combined = (hidden + next_token_embed) / 2.0;
+    let k = combined.kind();
+    let normed = rms_norm(&combined, &mtp.norm.to_kind(k), config.rms_norm_eps);
+    let ffn_out = glm5_mlp(&normed, &mtp.ffn_shared_gate, &mtp.ffn_shared_up, &mtp.ffn_shared_down);
+    let after_ffn = &normed + &ffn_out;
+    let final_hidden = rms_norm(&after_ffn, &mtp.hnorm.to_kind(k), config.rms_norm_eps);
+    let logits = final_hidden.linear::<&Tensor>(&mtp.head.to_kind(k), None);
+    (logits, final_hidden)
+}
+
+/// MTP loss: cross-entropy on predicted next-next token
+pub fn glm5_mtp_loss(
+    hidden: &Tensor,
+    input_ids: &Tensor,
+    mtp: &Glm5MtpHeadWeights,
+    config: &Glm5RuntimeConfig,
+    weights: &BTreeMap<String, Tensor>,
+) -> Tensor {
+    if !has_mtp_weights(weights) || config.num_nextn_predict_layers == 0 {
+        return Tensor::scalar_tensor(0.0, (Kind::Float, hidden.device()));
+    }
+    // next_token_embed: embed of token at position t+1
+    let embed = tensor(weights, "model.embed_tokens.weight")
+        .unwrap_or(&hidden.shallow_clone())
+        .shallow_clone();
+    let seq_len = input_ids.size()[1];
+    if seq_len < 2 {
+        return Tensor::scalar_tensor(0.0, (Kind::Float, hidden.device()));
+    }
+    let next_token_ids = input_ids.narrow(1, 1, seq_len - 1);
+    let hidden_shifted = hidden.narrow(1, 0, seq_len - 1);
+    let next_token_embed = Tensor::embedding(&embed, &next_token_ids, -1, false, false);
+    if next_token_embed.kind() != hidden_shifted.kind() {
+        let _ = next_token_embed.to_kind(hidden_shifted.kind());
+    }
+    let (mtp_logits, _) = glm5_mtp_forward(
+        &hidden_shifted,
+        &next_token_embed,
+        mtp,
+        config,
+    );
+    // Target: token at position t+2
+    if seq_len < 3 {
+        return Tensor::scalar_tensor(0.0, (Kind::Float, hidden.device()));
+    }
+    let targets = input_ids.narrow(1, 2, seq_len - 2);
+    let mtp_logits = mtp_logits.narrow(1, 0, seq_len - 2);
+    mtp_logits
+        .reshape([-1, config.vocab_size])
+        .log_softmax(-1, Kind::Float)
+        .g_nll_loss::<&Tensor>(&targets.reshape([-1]), None, Reduction::Mean, -100)
+}
