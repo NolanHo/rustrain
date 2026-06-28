@@ -3,13 +3,13 @@ use std::collections::{BTreeMap, HashSet};
 use anyhow::{bail, Context, Result};
 use serde::Serialize;
 use tch::{no_grad, Device, Kind, Reduction, Tensor};
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::lora::*;
 use crate::model::*;
 use crate::model::{rms_norm, glm5_mlp};
 use crate::sft::*;
-use rustrain_checkpoint::safetensors::{read_safetensors_dir, read_safetensors_dir_filtered, tensor};
+use rustrain_checkpoint::safetensors::tensor;
 use rustrain_nccl::nccl::{self as nccl_smoke, NcclPersistentComm};
 
 fn parse_env_usize(name: &str) -> Result<usize> {
@@ -106,7 +106,11 @@ pub fn train_glm5_lora_sft_ep(
         .lora
         .as_ref()
         .context("GLM-5 LoRA SFT EP requires [lora] config section")?;
-    let all_layers: Vec<usize> = (0..runtime_config.num_hidden_layers).collect();
+    let trainable_layer_indices: Vec<usize> = lora_config_raw
+        .target_layers
+        .iter()
+        .map(|l| *l as usize)
+        .collect();
     let target_modules: Vec<Glm5LoraTargetModule> = lora_config_raw
         .target_modules
         .iter()
@@ -115,7 +119,7 @@ pub fn train_glm5_lora_sft_ep(
     let lora_config = Glm5LoraConfig {
         rank: lora_config_raw.rank,
         alpha: lora_config_raw.alpha as i64,
-        target_layers: all_layers.clone(),
+        target_layers: trainable_layer_indices.clone(),
         target_modules,
     };
 
@@ -137,8 +141,15 @@ pub fn train_glm5_lora_sft_ep(
     }
 
     // ── Build needed weight set ──
+    // Only load weights for target_layers (trainable) + embed/head/norm.
+    // Non-target layers are skipped in forward (hidden passes through unchanged).
     let n_layers = runtime_config.num_hidden_layers;
     let _n_experts = runtime_config.n_routed_experts;
+    let trainable_layers: HashSet<usize> = lora_config_raw
+        .target_layers
+        .iter()
+        .map(|l| *l as usize)
+        .collect();
     let mut needed: HashSet<String> = HashSet::new();
     needed.insert("model.embed_tokens.weight".to_string());
     needed.insert("model.norm.weight".to_string());
@@ -147,20 +158,26 @@ pub fn train_glm5_lora_sft_ep(
     }
 
     for layer in 0..n_layers {
+        // Skip non-trainable layers entirely — they won't be loaded to GPU
+        if !trainable_layers.contains(&layer) {
+            continue;
+        }
         let p = format!("model.layers.{layer}");
         // Attention (all layers, replicated)
         needed.insert(format!("{p}.input_layernorm.weight"));
         needed.insert(format!("{p}.post_attention_layernorm.weight"));
         for suffix in &[
-            "wq_a.weight",
-            "wq_a_layernorm.weight",
-            "wq_b.weight",
-            "wkv.weight",
-            "wkv_a_layernorm.weight",
-            "wkv_b.weight",
-            "wo.weight",
+            "q_a_proj.weight",
+            "q_a_layernorm.weight",
+            "q_b_proj.weight",
+            "kv_a_proj_with_mqa.weight",
+            "kv_a_layernorm.weight",
+            "kv_b_proj.weight",
+            "o_proj.weight",
         ] {
             needed.insert(format!("{p}.self_attn.{suffix}"));
+            // FP8: also load scale_inv companion
+            needed.insert(format!("{p}.self_attn.{suffix}_scale_inv"));
         }
         // Indexer weights (only for "full" layers)
         let indexer_type = runtime_config
@@ -174,20 +191,28 @@ pub fn train_glm5_lora_sft_ep(
                 "k_norm.bias",
                 "weights_proj.weight",
                 "wk.weight",
-                "wq_b.weight",
+                "q_b_proj.weight",
             ] {
                 needed.insert(format!("{p}.self_attn.indexer.{suffix}"));
+                // FP8 scale for indexer wk and wq_b
+                if suffix == &"wk.weight" || suffix == &"q_b_proj.weight" {
+                    needed.insert(format!("{p}.self_attn.indexer.{suffix}_scale_inv"));
+                }
             }
         }
         // Gate + shared experts (all layers, replicated)
         needed.insert(format!("{p}.mlp.gate.weight"));
         for suffix in &["gate_proj.weight", "up_proj.weight", "down_proj.weight"] {
             needed.insert(format!("{p}.mlp.shared_experts.{suffix}"));
+            // FP8 scale
+            needed.insert(format!("{p}.mlp.shared_experts.{suffix}_scale_inv"));
         }
         // Only LOCAL experts (EP sharded)
         for &e in &ep_shard.local_expert_indices {
             for suffix in &["gate_proj.weight", "up_proj.weight", "down_proj.weight"] {
                 needed.insert(format!("{p}.mlp.experts.{e}.{suffix}"));
+                // FP8 scale
+                needed.insert(format!("{p}.mlp.experts.{e}.{suffix}_scale_inv"));
             }
         }
         // Dense layers: gate_proj, up_proj, down_proj (not under shared_experts)
@@ -224,6 +249,9 @@ pub fn train_glm5_lora_sft_ep(
 
     // ── Barrier: wait for all ranks to finish loading ──
     let barrier_dir = run_paths.root.join("barrier");
+    // Use a fixed barrier path derived from output_dir (same for all ranks)
+    // instead of timestamped run_paths.root which can differ by 1 second per rank
+    let barrier_dir = config.run.base_dir.join(&config.run.name).join("barrier");
     std::fs::create_dir_all(&barrier_dir)?;
     let ready_file = barrier_dir.join(format!("rank_{rank}.ready"));
     std::fs::write(&ready_file, b"ready")?;
@@ -303,9 +331,12 @@ pub fn train_glm5_lora_sft_ep(
 
     let mut initial_loss = 0.0_f64;
 
-    // Pre-load indexer weights for all "full" layers (for IndexShare)
+    // Pre-load indexer weights for all "full" TRAINABLE layers (for IndexShare)
     let mut indexer_weights_map: BTreeMap<usize, Glm5AttentionWeights> = BTreeMap::new();
     for layer in 0..n_layers {
+        if !trainable_layers.contains(&layer) {
+            continue;
+        }
         let indexer_type = runtime_config
             .indexer_types
             .get(layer)
@@ -329,6 +360,10 @@ pub fn train_glm5_lora_sft_ep(
         let mut index_share_state: Option<IndexShareState> = None;
 
         for layer in 0..n_layers {
+            // Skip non-trainable layers — hidden passes through unchanged
+            if !trainable_layers.contains(&layer) {
+                continue;
+            }
             let p = format!("model.layers.{layer}");
 
             // ── Attention ──
@@ -563,22 +598,83 @@ pub fn train_glm5_lora_sft_ep(
     })
 }
 
-/// Load GLM-5.2 weights from safetensors directory (mmap)
+/// Load GLM-5.2 weights from safetensors directory using mmap (V4 native parser)
+/// Only reads needed tensors from each shard — much faster than Tensor::read_safetensors
 fn load_glm5_weights(
     model_path: &std::path::Path,
     needed: &HashSet<String>,
 ) -> Result<BTreeMap<String, Tensor>> {
-    let weights = read_safetensors_dir_filtered(model_path, needed)
-        .with_context(|| format!("failed to read safetensors from {}", model_path.display()))?;
+    // First, read the index to find which shards contain needed tensors
+    let index_path = model_path.join("model.safetensors.index.json");
+    let single = model_path.join("model.safetensors");
 
-    // Filter to only needed tensors
-    let filtered: BTreeMap<String, Tensor> = weights
-        .into_iter()
-        .filter(|(k, _)| {
-            needed.contains(k.as_str())
-                || needed.iter().any(|n| k.starts_with(n))
-        })
-        .collect();
+    // If single file, use V4's native loader directly
+    if single.exists() {
+        return rustrain_deepseek_v4::fp8_kernel::load_safetensors_native(
+            &single,
+            needed,
+            -1, // CPU
+        )
+        .with_context(|| format!("failed to load {}", single.display()));
+    }
 
-    Ok(filtered)
+    if !index_path.exists() {
+        anyhow::bail!("no model.safetensors or index file in {}", model_path.display());
+    }
+
+    // Parse index to group needed tensors by shard
+    let index_text = std::fs::read_to_string(&index_path)?;
+    #[derive(serde::Deserialize)]
+    struct SafetensorsIndex {
+        weight_map: std::collections::HashMap<String, String>,
+    }
+    let index: SafetensorsIndex = serde_json::from_str(&index_text)?;
+
+    let mut shard_to_tensors: std::collections::HashMap<String, Vec<String>> =
+        std::collections::HashMap::new();
+    for name in needed {
+        if let Some(shard) = index.weight_map.get(name) {
+            shard_to_tensors
+                .entry(shard.clone())
+                .or_default()
+                .push(name.clone());
+        }
+    }
+
+    info!(
+        shards_needed = shard_to_tensors.len(),
+        total_shards = index.weight_map.values().collect::<std::collections::HashSet<_>>().len(),
+        tensors_needed = needed.len(),
+        "loading weights via mmap (V4 native parser)"
+    );
+
+    let mut weights = BTreeMap::new();
+    for (shard_file, tensor_names) in &shard_to_tensors {
+        let shard_path = model_path.join(shard_file);
+        let shard_needed: HashSet<String> = tensor_names.iter().cloned().collect();
+        match rustrain_deepseek_v4::fp8_kernel::load_safetensors_native(
+            &shard_path,
+            &shard_needed,
+            -1, // CPU first, will move to GPU later
+        ) {
+            Ok(shard_weights) => {
+                for (name, t) in shard_weights {
+                    weights.insert(name, t);
+                }
+            }
+            Err(e) => {
+                // V4 native parser may not support all dtypes — fall back to tch-rs
+                tracing::warn!(shard = %shard_file, error = %e, "V4 native loader failed, falling back to tch-rs");
+                let shard_tensors = Tensor::read_safetensors(&shard_path)?;
+                let shard_map: BTreeMap<String, Tensor> = shard_tensors.into_iter().collect();
+                for name in tensor_names {
+                    if let Some(t) = shard_map.get(name) {
+                        weights.insert(name.clone(), t.shallow_clone());
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(weights)
 }

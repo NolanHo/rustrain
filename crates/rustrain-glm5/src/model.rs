@@ -387,13 +387,13 @@ impl Glm5AttentionWeights {
         kind: Kind,
     ) -> Result<Self> {
         let p = format!("model.layers.{layer}.self_attn");
-        let q_a_proj = tensor(weights, &format!("{p}.wq_a.weight"))?.to_kind(kind);
-        let q_a_layernorm = tensor(weights, &format!("{p}.wq_a_layernorm.weight"))?.to_kind(kind);
-        let q_b_proj = tensor(weights, &format!("{p}.wq_b.weight"))?.to_kind(kind);
-        let kv_a = tensor(weights, &format!("{p}.wkv.weight"))?.to_kind(kind);
-        let kv_a_ln = tensor(weights, &format!("{p}.wkv_a_layernorm.weight"))?.to_kind(kind);
-        let kv_b = tensor(weights, &format!("{p}.wkv_b.weight"))?.to_kind(kind);
-        let o_proj = tensor(weights, &format!("{p}.wo.weight"))?.to_kind(kind);
+        let q_a_proj = tensor(weights, &format!("{p}.q_a_proj.weight"))?.to_kind(kind);
+        let q_a_layernorm = tensor(weights, &format!("{p}.q_a_layernorm.weight"))?.to_kind(kind);
+        let q_b_proj = tensor(weights, &format!("{p}.q_b_proj.weight"))?.to_kind(kind);
+        let kv_a = tensor(weights, &format!("{p}.kv_a_proj_with_mqa.weight"))?.to_kind(kind);
+        let kv_a_ln = tensor(weights, &format!("{p}.kv_a_layernorm.weight"))?.to_kind(kind);
+        let kv_b = tensor(weights, &format!("{p}.kv_b_proj.weight"))?.to_kind(kind);
+        let o_proj = tensor(weights, &format!("{p}.o_proj.weight"))?.to_kind(kind);
 
         // Indexer weights — may not exist for "shared" layers
         let indexer_k_norm_weight = weights

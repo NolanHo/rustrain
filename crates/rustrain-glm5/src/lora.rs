@@ -18,20 +18,20 @@ pub enum Glm5LoraTargetModule {
 impl Glm5LoraTargetModule {
     pub fn from_name(name: &str) -> Result<Self> {
         match name {
-            "wq_a" => Ok(Self::WqA),
-            "wq_b" => Ok(Self::WqB),
-            "wkv" => Ok(Self::Wkv),
-            "wo" => Ok(Self::Wo),
+            "q_a_proj" => Ok(Self::WqA),
+            "q_b_proj" => Ok(Self::WqB),
+            "kv_a_proj_with_mqa" => Ok(Self::Wkv),
+            "o_proj" => Ok(Self::Wo),
             other => bail!("unknown GLM-5 LoRA target module: {other}"),
         }
     }
 
     pub fn weight_suffix(&self) -> &'static str {
         match self {
-            Self::WqA => "attn.wq_a",
-            Self::WqB => "attn.wq_b",
-            Self::Wkv => "attn.wkv",
-            Self::Wo => "attn.wo",
+            Self::WqA => "attn.q_a_proj",
+            Self::WqB => "attn.q_b_proj",
+            Self::Wkv => "attn.kv_a_proj_with_mqa",
+            Self::Wo => "attn.o_proj",
         }
     }
 }
@@ -63,10 +63,10 @@ impl Glm5LoraRegistry {
         for &layer in &config.target_layers {
             for &module in &config.target_modules {
                 let suffix = match module {
-                    Glm5LoraTargetModule::WqA => "wq_a",
-                    Glm5LoraTargetModule::WqB => "wq_b",
-                    Glm5LoraTargetModule::Wkv => "wkv",
-                    Glm5LoraTargetModule::Wo => "wo",
+                    Glm5LoraTargetModule::WqA => "q_a_proj",
+                    Glm5LoraTargetModule::WqB => "q_b_proj",
+                    Glm5LoraTargetModule::Wkv => "kv_a_proj_with_mqa",
+                    Glm5LoraTargetModule::Wo => "o_proj",
                 };
                 let name = format!("model.layers.{layer}.self_attn.{suffix}.weight");
                 let weight = weights

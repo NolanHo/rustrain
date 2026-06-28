@@ -38,7 +38,7 @@ checkpoint_every = 0
 target_layers = [0, 1, 2, 3]
 rank = 16
 alpha = 32
-target_modules = ["wq_a", "wq_b", "wkv", "wo"]
+target_modules = ["q_a_proj", "q_b_proj", "kv_a_proj_with_mqa", "o_proj"]
 
 [parallel]
 tensor_model_parallel_size = 1
