@@ -297,7 +297,13 @@ fn shared_unique_id(output_dir: &Path, rank: usize) -> Result<NcclUniqueId> {
             .with_context(|| format!("failed to write {}", id_path.display()))?;
         Ok(id)
     } else {
-        wait_for_unique_id(&id_path, Duration::from_secs(30))
+        // Multi-node: increase timeout to 300s for cross-node vePFS access
+        let timeout = if std::env::var("NNODES").unwrap_or("1".to_string()).parse::<usize>().unwrap_or(1) > 1 {
+            Duration::from_secs(300)
+        } else {
+            Duration::from_secs(30)
+        };
+        wait_for_unique_id(&id_path, timeout)
     }
 }
 

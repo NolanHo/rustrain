@@ -49,6 +49,18 @@ pub fn launch(
     master_port: u16,
     command: &[String],
 ) -> Result<()> {
+    launch_multi(nproc_per_node, 1, 0, output_dir, master_addr, master_port, command)
+}
+
+pub fn launch_multi(
+    nproc_per_node: usize,
+    nnodes: usize,
+    node_rank: usize,
+    output_dir: &Path,
+    master_addr: &str,
+    master_port: u16,
+    command: &[String],
+) -> Result<()> {
     if nproc_per_node == 0 {
         bail!("--nproc-per-node must be greater than zero");
     }
@@ -57,7 +69,14 @@ pub fn launch(
             "launch requires a child command, for example: launch --nproc-per-node 2 tch-cuda-probe"
         );
     }
+    if nnodes == 0 {
+        bail!("--nnodes must be greater than zero");
+    }
+    if node_rank >= nnodes {
+        bail!("--node-rank ({node_rank}) must be less than --nnodes ({nnodes})");
+    }
 
+    let world_size = nproc_per_node * nnodes;
     fs::create_dir_all(output_dir)
         .with_context(|| format!("failed to create {}", output_dir.display()))?;
     let current_exe = std::env::current_exe().context("failed to locate current executable")?;
@@ -67,8 +86,9 @@ pub fn launch(
     validate_visible_cuda_devices(nproc_per_node, visible_cuda_devices.as_deref())?;
 
     let mut children = Vec::with_capacity(nproc_per_node);
-    for rank in 0..nproc_per_node {
-        let log_path = output_dir.join(format!("rank-{rank}.log"));
+    for local_rank in 0..nproc_per_node {
+        let global_rank = node_rank * nproc_per_node + local_rank;
+        let log_path = output_dir.join(format!("rank-{global_rank}.log"));
         let log_file = fs::File::create(&log_path)
             .with_context(|| format!("failed to create {}", log_path.display()))?;
         let err_file = log_file
@@ -78,28 +98,30 @@ pub fn launch(
         let mut child = Command::new(&current_exe);
         child
             .args(command)
-            .env("RANK", rank.to_string())
-            .env("LOCAL_RANK", rank.to_string())
-            .env("WORLD_SIZE", nproc_per_node.to_string())
+            .env("RANK", global_rank.to_string())
+            .env("LOCAL_RANK", local_rank.to_string())
+            .env("WORLD_SIZE", world_size.to_string())
             .env("LOCAL_WORLD_SIZE", nproc_per_node.to_string())
             .env("MASTER_ADDR", master_addr)
             .env("MASTER_PORT", master_port.to_string())
             .env("RUSTRAIN_LAUNCH_OUTPUT_DIR", output_dir)
+            .env("NNODES", nnodes.to_string())
+            .env("NODE_RANK", node_rank.to_string())
             .stdout(Stdio::from(log_file))
             .stderr(Stdio::from(err_file));
         if let Some(assigned_device) = visible_cuda_devices
             .as_ref()
-            .and_then(|devices| devices.get(rank))
+            .and_then(|devices| devices.get(local_rank))
         {
             child
                 .env("RUSTRAIN_ASSIGNED_CUDA_VISIBLE_DEVICE", assigned_device)
-                .env("RUSTRAIN_ASSIGNED_CUDA_DEVICE_ORDINAL", rank.to_string());
+                .env("RUSTRAIN_ASSIGNED_CUDA_DEVICE_ORDINAL", local_rank.to_string());
         }
         children.push((
-            rank,
+            global_rank,
             log_path,
             child.spawn().with_context(|| {
-                format!("failed to spawn rank {rank} for command {:?}", command)
+                format!("failed to spawn rank {global_rank} for command {:?}", command)
             })?,
         ));
     }

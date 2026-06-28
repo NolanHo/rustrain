@@ -48,6 +48,10 @@ enum Command {
     Launch {
         #[arg(long)]
         nproc_per_node: usize,
+        #[arg(long, default_value = "1")]
+        nnodes: usize,
+        #[arg(long, default_value = "0")]
+        node_rank: usize,
         #[arg(long, default_value = "/tmp/rustrain-runs/launch")]
         output_dir: PathBuf,
         #[arg(long, default_value = "127.0.0.1")]
@@ -111,12 +115,16 @@ fn main() -> Result<()> {
         } => inspect::inspect_model(&model_path, &prompt, tensor_limit),
         Command::Launch {
             nproc_per_node,
+            nnodes,
+            node_rank,
             output_dir,
             master_addr,
             master_port,
             command,
-        } => rustrain_parallel::launcher::launch(
+        } => rustrain_parallel::launcher::launch_multi(
             nproc_per_node,
+            nnodes,
+            node_rank,
             &output_dir,
             &master_addr,
             master_port,
