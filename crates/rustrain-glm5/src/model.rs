@@ -577,8 +577,8 @@ pub fn glm5_dsa_attention(
     let q_full = Tensor::cat(&[&q_nope, &q_rope_rotated], -1);
     let k_full = Tensor::cat(&[&k_nope, &k_rope_rotated], -1);
 
-    let scale = 1.0 / ((qk_nope + qk_rope) as f64).sqrt();
-    let mut scores = q_full.matmul(&k_full.transpose(-2, -1)) * scale;
+    let attn_scale = 1.0 / ((qk_nope + qk_rope) as f64).sqrt();
+    // Note: scores matrix is NOT materialized — SDPA handles attention internally
 
     // ── DSA Indexer ──
     let should_compute_topk = !config.should_skip_topk(layer)
@@ -673,8 +673,9 @@ pub fn glm5_dsa_attention(
         *index_share_state = None;
     }
 
-    // Apply sparse mask
-    if let Some(state) = index_share_state {
+    // ── Flash Attention via SDPA (no S×S materialization) ──
+    let context = if let Some(state) = index_share_state {
+        // Sparse DSA: build additive bias from precomputed sparse mask + idx_bias
         let causal_mask =
             Tensor::ones([seq as i64, seq as i64], (Kind::Bool, input.device())).triu(1);
         let causal_f = causal_mask
@@ -683,18 +684,42 @@ pub fn glm5_dsa_attention(
             .expand([batch as i64, num_heads, seq as i64, seq as i64], false)
             .to_kind(input.kind());
         let combined = &state.sparse_mask * &causal_f;
-        let valid = combined.gt(0.0).to_kind(Kind::Bool);
-        scores = scores.masked_fill(&valid.logical_not(), f64::NEG_INFINITY);
-        let scores_kind = scores.kind();
-        scores = scores + &state.idx_bias.to_kind(scores_kind);
-    } else {
-        let causal_mask =
-            Tensor::ones([seq as i64, seq as i64], (Kind::Bool, input.device())).triu(1);
-        scores = scores.masked_fill(&causal_mask, f64::NEG_INFINITY);
-    }
 
-    let probs = scores.softmax(-1, Kind::Float).to_kind(v.kind());
-    let context = probs.matmul(&v);
+        // Expand idx_bias to num_heads if index_n_heads != num_heads
+        let idx_bias = if state.idx_bias.size()[1] != num_heads as i64 {
+            state.idx_bias
+                .mean_dim([1].as_slice(), true, input.kind())
+                .expand([batch as i64, num_heads, seq as i64, seq as i64], false)
+        } else {
+            state.idx_bias.shallow_clone()
+        }
+        .to_kind(input.kind());
+
+        // Additive bias: idx_bias where valid, -inf where masked out
+        // combined > 0 → bias = idx_bias + 0
+        // combined = 0 → bias = idx_bias + (-inf) = -inf (masked)
+        let bias = &idx_bias + (&combined - 1.0) * f64::NEG_INFINITY;
+
+        Tensor::scaled_dot_product_attention(
+            &q_full, &k_full, &v,
+            Some(&bias),
+            0.0,           // dropout
+            false,         // is_causal (already in bias)
+            Some(attn_scale),
+            false,         // enable_gqa (K/V already expanded)
+        )
+    } else {
+        // Full causal: SDPA's built-in causal mask — fastest path
+        Tensor::scaled_dot_product_attention::<&Tensor>(
+            &q_full, &k_full, &v,
+            None,
+            0.0,           // dropout
+            true,          // is_causal
+            Some(attn_scale),
+            false,         // enable_gqa
+        )
+    };
+
     let context = context
         .transpose(1, 2)
         .reshape([batch, seq, num_heads * v_head]);

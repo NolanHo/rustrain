@@ -32,14 +32,24 @@ unsafe extern "C" {
 
     fn v4_dequant_fp8_raw(tensor_ptr: *mut std::ffi::c_void) -> *mut std::ffi::c_void;
 
-    /// Tiled FP8 block-wise matmul: input[BF16,M,K] × weight[FP8,N,K] → output[BF16,M,N]
-    /// Dequants 128 rows at a time on CPU, does BF16 GEMM on GPU via cublas.
-    /// Peak temp memory: ~4.5MB (vs ~75MB for full dequant).
     fn v4_fp8_tiled_matmul(
         input_ptr: *mut std::ffi::c_void,
         weight_ptr: *mut std::ffi::c_void,
         scale_ptr: *mut std::ffi::c_void,
     ) -> *mut std::ffi::c_void;
+
+    /// Gradient checkpointing via torch::autograd::Function.
+    /// Takes a callback function pointer + input tensor + user context.
+    /// Forward: runs callback in no_grad, saves only input.
+    /// Backward: recomputes forward with grad, backpropagates.
+    fn v4_checkpoint(
+        fn_ptr: *mut std::ffi::c_void,
+        input_ptr: *mut std::ffi::c_void,
+        user_ctx: *mut std::ffi::c_void,
+    ) -> *mut std::ffi::c_void;
+
+    /// Helper: create at::Tensor* from raw TensorImpl* (increments refcount)
+    fn v4_make_at_tensor(impl_ptr: *mut std::ffi::c_void) -> *mut std::ffi::c_void;
 }
 
 pub fn is_fp8_kernel_available() -> bool {
@@ -370,4 +380,82 @@ pub fn fp8_linear_bias(
         Some(b) => Ok(out + b),
         None => Ok(out),
     }
+}
+
+// ── Gradient Checkpointing ──
+
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Mutex, OnceLock};
+
+type ForwardFn = Box<dyn Fn(&Tensor) -> Tensor + Send + Sync>;
+
+static CHECKPOINT_REGISTRY: OnceLock<Mutex<HashMap<usize, ForwardFn>>> = OnceLock::new();
+static CHECKPOINT_COUNTER: AtomicUsize = AtomicUsize::new(1);
+
+fn registry() -> &'static Mutex<HashMap<usize, ForwardFn>> {
+    CHECKPOINT_REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// C callback invoked by C++ CheckpointFunction (both forward and backward).
+/// Receives a raw TensorImpl* and returns an at::Tensor* (via v4_make_at_tensor).
+extern "C" fn checkpoint_callback(
+    impl_ptr: *mut std::ffi::c_void,
+    user_ctx: *mut std::ffi::c_void,
+) -> *mut std::ffi::c_void {
+    let key = user_ctx as usize;
+
+    // Clone the tensor from C++ (clone_from_ptr calls at_clone, increments refcount)
+    let input = unsafe { Tensor::clone_from_ptr(impl_ptr as *mut _) };
+
+    // Run the forward function from registry
+    let output = {
+        let reg = registry().lock().unwrap();
+        match reg.get(&key) {
+            Some(forward) => forward(&input),
+            None => {
+                eprintln!("[checkpoint_callback] forward function not found for key {key}");
+                return std::ptr::null_mut();
+            }
+        }
+    };
+
+    // Return a new at::Tensor* to C++ (v4_make_at_tensor copy constructor increments refcount)
+    unsafe { v4_make_at_tensor(output.as_ptr() as *mut std::ffi::c_void) }
+}
+
+/// Wrap a forward function with gradient checkpointing.
+/// Forward: runs `forward(input)` in no_grad, saves only the input.
+/// Backward: recomputes `forward(input)` with grad, backpropagates.
+///
+/// The forward closure must be deterministic (same input → same output).
+/// It will be called TWICE: once during forward, once during backward.
+pub fn checkpoint<F>(input: &Tensor, forward: F) -> Tensor
+where
+    F: Fn(&Tensor) -> Tensor + Send + Sync + 'static,
+{
+    let key = CHECKPOINT_COUNTER.fetch_add(1, Ordering::SeqCst);
+    registry().lock().unwrap().insert(key, Box::new(forward));
+
+    let result_ptr = unsafe {
+        v4_checkpoint(
+            checkpoint_callback as *mut std::ffi::c_void,
+            input.as_ptr() as *mut std::ffi::c_void,
+            key as *mut std::ffi::c_void,
+        )
+    };
+
+    if result_ptr.is_null() {
+        registry().lock().unwrap().remove(&key);
+        panic!("C++ v4_checkpoint returned null");
+    }
+
+    let result = unsafe { Tensor::clone_from_ptr(result_ptr as *mut _) };
+    unsafe { v4_fp8_free_tensor(result_ptr) };
+
+    // Note: registry entry is kept for backward pass.
+    // It should be cleaned up after backward completes.
+    // For simplicity, entries persist until the process exits.
+
+    result
 }

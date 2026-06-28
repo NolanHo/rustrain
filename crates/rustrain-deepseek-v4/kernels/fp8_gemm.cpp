@@ -8,6 +8,8 @@
 
 #include <ATen/ATen.h>
 #include <c10/cuda/CUDAStream.h>
+#include <torch/csrc/autograd/grad_mode.h>
+#include <torch/csrc/autograd/custom_function.h>
 #include <cstdio>
 #include <cstring>
 #include <cmath>
@@ -217,6 +219,84 @@ void* v4_fp8_tiled_matmul(
         fprintf(stderr, "[v4_fp8_tiled_matmul] FAILED: %s\n", e.what());
         return nullptr;
     }
+}
+
+// ── Gradient Checkpointing via torch::autograd::Function ──
+//
+// Saves activation memory by NOT storing intermediate tensors during forward,
+// then recomputing them during backward. Only the layer input is saved.
+//
+// Uses a C callback to call back into Rust for the forward computation.
+// The callback receives the input tensor pointer and user context, returns
+// a new tensor pointer (ownership transferred to C++).
+
+#include <torch/csrc/autograd/custom_function.h>
+
+typedef void* (*CheckpointFn)(void* input_ptr, void* user_ctx);
+
+struct CheckpointFunction : public torch::autograd::Function<CheckpointFunction> {
+    static at::Tensor forward(
+        torch::autograd::AutogradContext* ctx,
+        at::Tensor input,
+        int64_t fn_val,
+        int64_t user_ctx_val
+    ) {
+        ctx->saved_data["fn"] = fn_val;
+        ctx->saved_data["user_ctx"] = user_ctx_val;
+        ctx->save_for_backward({input});
+
+        // Run forward WITHOUT grad — no intermediate activations stored
+        at::AutoGradMode guard(false);
+        auto fn = reinterpret_cast<CheckpointFn>(fn_val);
+        void* out = fn(reinterpret_cast<void*>(&input), reinterpret_cast<void*>(user_ctx_val));
+        auto* t = reinterpret_cast<at::Tensor*>(out);
+        at::Tensor result = std::move(*t);
+        delete t;
+        return result;
+    }
+
+    static std::vector<at::Tensor> backward(
+        torch::autograd::AutogradContext* ctx,
+        std::vector<at::Tensor> grad_output
+    ) {
+        auto saved = ctx->get_saved_variables();
+        at::Tensor input = saved[0];
+
+        auto fn = reinterpret_cast<CheckpointFn>(ctx->saved_data["fn"].toInt());
+        auto user_ctx = reinterpret_cast<void*>(ctx->saved_data["user_ctx"].toInt());
+
+        // Recompute forward WITH grad enabled
+        input.set_requires_grad(true);
+        void* out = fn(reinterpret_cast<void*>(&input), user_ctx);
+        auto* t = reinterpret_cast<at::Tensor*>(out);
+        at::Tensor output = std::move(*t);
+        delete t;
+
+        // Backprop through recomputed graph — gradients accumulate into weights
+        output.backward(grad_output[0]);
+        return {input.grad()};
+    }
+};
+
+// C FFI entry point: call from Rust to wrap a forward function with checkpointing
+void* v4_checkpoint(void* fn_ptr, void* input_ptr, void* user_ctx) {
+    auto& input = *reinterpret_cast<at::Tensor*>(input_ptr);
+    auto fn = reinterpret_cast<CheckpointFn>(fn_ptr);
+
+    at::Tensor result = CheckpointFunction::apply(
+        input,
+        (int64_t)(uintptr_t)fn_ptr,
+        (int64_t)(uintptr_t)user_ctx
+    );
+
+    return new at::Tensor(std::move(result));
+}
+
+// Helper: create a new at::Tensor* from another at::Tensor* (copy constructor increments refcount)
+// Used by Rust callbacks to return a tensor to C++.
+void* v4_make_at_tensor(void* tensor_ptr) {
+    auto* t = reinterpret_cast<at::Tensor*>(tensor_ptr);
+    return new at::Tensor(*t);  // copy constructor increments refcount
 }
 
 } // extern "C"
