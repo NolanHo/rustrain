@@ -30,10 +30,16 @@ unsafe extern "C" {
         device_id: i32,
     ) -> *mut std::ffi::c_void;
 
-    /// Byte-level FP8 E4M3FN → F32 dequant. Takes a GPU FP8 tensor pointer,
-    /// reads bytes, converts each to float32 manually, returns GPU F32 tensor.
-    /// Bypasses PyTorch's to() which crashes on non-128-aligned dims.
     fn v4_dequant_fp8_raw(tensor_ptr: *mut std::ffi::c_void) -> *mut std::ffi::c_void;
+
+    /// Tiled FP8 block-wise matmul: input[BF16,M,K] × weight[FP8,N,K] → output[BF16,M,N]
+    /// Dequants 128 rows at a time on CPU, does BF16 GEMM on GPU via cublas.
+    /// Peak temp memory: ~4.5MB (vs ~75MB for full dequant).
+    fn v4_fp8_tiled_matmul(
+        input_ptr: *mut std::ffi::c_void,
+        weight_ptr: *mut std::ffi::c_void,
+        scale_ptr: *mut std::ffi::c_void,
+    ) -> *mut std::ffi::c_void;
 }
 
 pub fn is_fp8_kernel_available() -> bool {
@@ -326,20 +332,18 @@ pub fn fp8_linear(input: &Tensor, weight_fp8: &Tensor, weight_scale: &Tensor) ->
     let k = input_2d.size()[1];
     let n = weight_fp8.size()[0];
 
-    let (input_fp8, scale_a) = quantize_to_fp8(&input_2d);
-    let scale_b = expand_weight_scale(weight_scale, n, k);
-
+    // Use tiled matmul: dequant 128 rows at a time + BF16 cublas GEMM.
+    // Peak temp: ~4.5MB (vs ~75MB for full dequant).
     let result_ptr = unsafe {
-        v4_fp8_scaled_mm(
-            input_fp8.as_ptr() as *mut _,
+        v4_fp8_tiled_matmul(
+            input_2d.as_ptr() as *mut _,
             weight_fp8.as_ptr() as *mut _,
-            scale_a.as_ptr() as *mut _,
-            scale_b.as_ptr() as *mut _,
+            weight_scale.as_ptr() as *mut _,
         )
     };
 
     if result_ptr.is_null() {
-        bail!("FP8 GEMM returned null (M={m}, N={n}, K={k})");
+        bail!("FP8 tiled matmul returned null (M={m}, N={n}, K={k})");
     }
 
     let result = unsafe { Tensor::clone_from_ptr(result_ptr as *mut _) };

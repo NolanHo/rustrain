@@ -130,6 +130,7 @@ fn main() {
         .args([
             &format!("-L{torch_lib}"),
             &format!("-Wl,-rpath,{torch_lib}"),
+            "-Wl,--no-as-needed",  // Force all libs into NEEDED list
             "-ltorch",
             "-ltorch_cuda",
             "-ltorch_cpu",
@@ -146,6 +147,8 @@ fn main() {
             println!("cargo:rustc-link-lib=dylib=torch");
             println!("cargo:rustc-link-lib=dylib=torch_cpu");
             println!("cargo:rustc-link-lib=dylib=torch_cuda");
+            // Force all libs into NEEDED list (rust-lld drops unused ones)
+            println!("cargo:rustc-link-arg=-Wl,--no-as-needed");
             // Allow unresolved shared lib symbols (libfp8_gemm.so depends
             // on libc10.so/torch libs which are found at runtime via LD_LIBRARY_PATH)
             println!("cargo:rustc-link-arg=-Wl,--allow-shlib-undefined");

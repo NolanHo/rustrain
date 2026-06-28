@@ -182,7 +182,15 @@ pub fn glm5_lora_weight(
     if let Some((lora_a, lora_b)) = registry.adapters.get(&(layer, module)) {
         let scale = registry.config.alpha as f64 / lora_a.size()[0] as f64;
         let delta = lora_b.matmul(lora_a) * scale;
-        base.shallow_clone() + delta.to_device(base.device()).to_kind(base.kind())
+        // If base is FP8, convert to BF16 for LoRA addition (FP8 + BF16 not supported)
+        let base_kind = base.kind();
+        let base_bf16 = if base_kind == Kind::Float8e4m3fn {
+            base.to_kind(Kind::BFloat16)
+        } else {
+            base.shallow_clone()
+        };
+        let result = &base_bf16 + &delta.to_device(base_bf16.device()).to_kind(base_bf16.kind());
+        result
     } else {
         base.shallow_clone()
     }

@@ -12,6 +12,15 @@ use crate::sft::*;
 use rustrain_checkpoint::safetensors::tensor;
 use rustrain_nccl::nccl::{self as nccl_smoke, NcclPersistentComm};
 
+/// Keep FP8 weights as-is; only convert non-FP8 tensors to `kind`.
+fn keep_fp8(t: &Tensor, kind: Kind) -> Tensor {
+    if t.kind() == Kind::Float8e4m3fn {
+        t.shallow_clone()
+    } else {
+        t.to_kind(kind)
+    }
+}
+
 fn parse_env_usize(name: &str) -> Result<usize> {
     std::env::var(name)
         .with_context(|| format!("{name} is not set"))?
@@ -412,12 +421,9 @@ pub fn train_glm5_lora_sft_ep(
                 // MoE with EP — inline implementation (not glm5_moe_mlp which assumes all experts local)
                 let gate = tensor(&weights_gpu, &format!("{p}.mlp.gate.weight"))?
                     .to_kind(compute_kind);
-                let shared_gate = tensor(&weights_gpu, &format!("{p}.mlp.shared_experts.gate_proj.weight"))?
-                    .to_kind(compute_kind);
-                let shared_up = tensor(&weights_gpu, &format!("{p}.mlp.shared_experts.up_proj.weight"))?
-                    .to_kind(compute_kind);
-                let shared_down = tensor(&weights_gpu, &format!("{p}.mlp.shared_experts.down_proj.weight"))?
-                    .to_kind(compute_kind);
+                let shared_gate = keep_fp8(tensor(&weights_gpu, &format!("{p}.mlp.shared_experts.gate_proj.weight"))?, compute_kind);
+                let shared_up = keep_fp8(tensor(&weights_gpu, &format!("{p}.mlp.shared_experts.up_proj.weight"))?, compute_kind);
+                let shared_down = keep_fp8(tensor(&weights_gpu, &format!("{p}.mlp.shared_experts.down_proj.weight"))?, compute_kind);
 
             // Shared expert (replicated across all ranks)
             let shared_gate_scale = weights_gpu.get(&format!("{p}.mlp.shared_experts.gate_proj.weight_scale_inv"));
@@ -460,9 +466,9 @@ pub fn train_glm5_lora_sft_ep(
                         continue;
                     }
                     let eg = format!("{p}.mlp.experts.{global_e}");
-                    let gate_w = tensor(&weights_gpu, &format!("{eg}.gate_proj.weight"))?.to_kind(compute_kind);
-                    let up_w = tensor(&weights_gpu, &format!("{eg}.up_proj.weight"))?.to_kind(compute_kind);
-                    let down_w = tensor(&weights_gpu, &format!("{eg}.down_proj.weight"))?.to_kind(compute_kind);
+                    let gate_w = keep_fp8(tensor(&weights_gpu, &format!("{eg}.gate_proj.weight"))?, compute_kind);
+                    let up_w = keep_fp8(tensor(&weights_gpu, &format!("{eg}.up_proj.weight"))?, compute_kind);
+                    let down_w = keep_fp8(tensor(&weights_gpu, &format!("{eg}.down_proj.weight"))?, compute_kind);
                     let gate_w_scale = weights_gpu.get(&format!("{eg}.gate_proj.weight_scale_inv"));
                     let up_w_scale = weights_gpu.get(&format!("{eg}.up_proj.weight_scale_inv"));
                     let down_w_scale = weights_gpu.get(&format!("{eg}.down_proj.weight_scale_inv"));
@@ -498,12 +504,9 @@ pub fn train_glm5_lora_sft_ep(
                 hidden = &residual + &full_mlp;
             } else {
                 // Dense MLP
-                let gate = tensor(&weights_gpu, &format!("{p}.mlp.gate_proj.weight"))?
-                    .to_kind(compute_kind);
-                let up = tensor(&weights_gpu, &format!("{p}.mlp.up_proj.weight"))?
-                    .to_kind(compute_kind);
-                let down = tensor(&weights_gpu, &format!("{p}.mlp.down_proj.weight"))?
-                    .to_kind(compute_kind);
+                let gate = keep_fp8(tensor(&weights_gpu, &format!("{p}.mlp.gate_proj.weight"))?, compute_kind);
+                let up = keep_fp8(tensor(&weights_gpu, &format!("{p}.mlp.up_proj.weight"))?, compute_kind);
+                let down = keep_fp8(tensor(&weights_gpu, &format!("{p}.mlp.down_proj.weight"))?, compute_kind);
                 let gate_scale = weights_gpu.get(&format!("{p}.mlp.gate_proj.weight_scale_inv"));
                 let up_scale = weights_gpu.get(&format!("{p}.mlp.up_proj.weight_scale_inv"));
                 let down_scale = weights_gpu.get(&format!("{p}.mlp.down_proj.weight_scale_inv"));

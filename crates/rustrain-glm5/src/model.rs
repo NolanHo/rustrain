@@ -12,6 +12,23 @@ use tracing::info;
 use rustrain_checkpoint::safetensors::{read_safetensors_dir, tensor};
 use rustrain_core::runtime::{Config, RunPaths};
 
+/// Keep FP8 tensors as-is; convert other dtypes to `kind`.
+/// This prevents `.to_kind(BFloat16)` from destroying FP8 weights
+/// that need to stay FP8 for `_scaled_mm`.
+trait KeepIfFp8 {
+    fn keep_if_fp8(&self, kind: Kind) -> Tensor;
+}
+
+impl KeepIfFp8 for Tensor {
+    fn keep_if_fp8(&self, kind: Kind) -> Tensor {
+        if self.kind() == Kind::Float8e4m3fn {
+            self.shallow_clone()
+        } else {
+            self.to_kind(kind)
+        }
+    }
+}
+
 // ── GLM-5.2 Config ──────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
@@ -395,13 +412,14 @@ impl Glm5AttentionWeights {
         kind: Kind,
     ) -> Result<Self> {
         let p = format!("model.layers.{layer}.self_attn");
-        let q_a_proj = tensor(weights, &format!("{p}.q_a_proj.weight"))?.to_kind(kind);
+        // Keep FP8 weights as-is (forward uses _scaled_mm); only convert non-FP8 to compute kind.
+        let q_a_proj = tensor(weights, &format!("{p}.q_a_proj.weight"))?.keep_if_fp8(kind);
         let q_a_layernorm = tensor(weights, &format!("{p}.q_a_layernorm.weight"))?.to_kind(kind);
-        let q_b_proj = tensor(weights, &format!("{p}.q_b_proj.weight"))?.to_kind(kind);
-        let kv_a = tensor(weights, &format!("{p}.kv_a_proj_with_mqa.weight"))?.to_kind(kind);
+        let q_b_proj = tensor(weights, &format!("{p}.q_b_proj.weight"))?.keep_if_fp8(kind);
+        let kv_a = tensor(weights, &format!("{p}.kv_a_proj_with_mqa.weight"))?.keep_if_fp8(kind);
         let kv_a_ln = tensor(weights, &format!("{p}.kv_a_layernorm.weight"))?.to_kind(kind);
-        let kv_b = tensor(weights, &format!("{p}.kv_b_proj.weight"))?.to_kind(kind);
-        let o_proj = tensor(weights, &format!("{p}.o_proj.weight"))?.to_kind(kind);
+        let kv_b = tensor(weights, &format!("{p}.kv_b_proj.weight"))?.keep_if_fp8(kind);
+        let o_proj = tensor(weights, &format!("{p}.o_proj.weight"))?.keep_if_fp8(kind);
 
         // Indexer weights — may not exist for "shared" layers
         let indexer_k_norm_weight = weights
@@ -415,10 +433,10 @@ impl Glm5AttentionWeights {
             .map(|t| t.to_kind(kind));
         let indexer_wk = weights
             .get(&format!("{p}.indexer.wk.weight"))
-            .map(|t| t.to_kind(kind));
+            .map(|t| t.keep_if_fp8(kind));
         let indexer_wq_b = weights
             .get(&format!("{p}.indexer.wq_b.weight"))
-            .map(|t| t.to_kind(kind));
+            .map(|t| t.keep_if_fp8(kind));
 
         // FP8 scales
         let q_a_proj_scale = weights
