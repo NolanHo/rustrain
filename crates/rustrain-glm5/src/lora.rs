@@ -207,5 +207,12 @@ pub fn lora_attention_weights(
         indexer_weights_proj: base.indexer_weights_proj.as_ref().map(|t| t.shallow_clone()),
         indexer_wk: base.indexer_wk.as_ref().map(|t| t.shallow_clone()),
         indexer_wq_b: base.indexer_wq_b.as_ref().map(|t| t.shallow_clone()),
+        q_a_proj_scale: base.q_a_proj_scale.as_ref().map(|t| t.shallow_clone()),
+        q_b_proj_scale: base.q_b_proj_scale.as_ref().map(|t| t.shallow_clone()),
+        kv_a_proj_scale: base.kv_a_proj_scale.as_ref().map(|t| t.shallow_clone()),
+        kv_b_proj_scale: base.kv_b_proj_scale.as_ref().map(|t| t.shallow_clone()),
+        o_proj_scale: base.o_proj_scale.as_ref().map(|t| t.shallow_clone()),
+        indexer_wk_scale: base.indexer_wk_scale.as_ref().map(|t| t.shallow_clone()),
+        indexer_wq_b_scale: base.indexer_wq_b_scale.as_ref().map(|t| t.shallow_clone()),
     }
 }

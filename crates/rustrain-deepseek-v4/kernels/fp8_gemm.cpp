@@ -110,4 +110,69 @@ void* v4_create_tensor(
     }
 }
 
+// ── FP8 E4M3FN byte-level dequant ──
+//
+// PyTorch's to(kFloat) on FP8 tensors triggers an internal block-wise view
+// optimization that crashes on non-128-aligned dimensions (e.g. [576, 6144]).
+// This function bypasses PyTorch's FP8 type handling entirely by reading
+// raw FP8 bytes and converting each to float32 using bit manipulation.
+//
+// The output is a plain F32 tensor — safe for any downstream operation.
+
+static inline float fp8_e4m3fn_to_f32(uint8_t b) {
+    uint32_t sign = (b >> 7) & 1;
+    uint32_t exp   = (b >> 3) & 0x0F;
+    uint32_t mant  =  b        & 0x07;
+
+    float val;
+    if (exp == 0 && mant == 0) {
+        val = 0.0f;
+    } else if (exp == 0) {
+        // Subnormal: (mant / 8) * 2^(-6)
+        val = (static_cast<float>(mant) / 8.0f) * 0.015625f;  // 2^-6
+    } else {
+        // Normal: (1 + mant/8) * 2^(exp - 7)
+        val = (1.0f + static_cast<float>(mant) / 8.0f) *
+              std::ldexp(1.0f, static_cast<int>(exp) - 7);
+    }
+    return sign ? -val : val;
+}
+
+// v4_dequant_fp8_raw — byte-level FP8→F32 conversion (no PyTorch FP8 ops)
+// Takes a GPU FP8 tensor pointer and returns a GPU F32 tensor.
+// Completely bypasses PyTorch's to() / copy_() which trigger view bugs.
+void* v4_dequant_fp8_raw(void* tensor_ptr) {
+    try {
+        at::Tensor& fp8 = *reinterpret_cast<at::Tensor*>(tensor_ptr);
+
+        // Get shape and total elements
+        auto sizes = fp8.sizes();
+        int64_t numel = fp8.numel();
+
+        // Read FP8 bytes from GPU to CPU
+        at::Tensor fp8_cpu = fp8.to(at::kCPU).contiguous();
+        const uint8_t* bytes = reinterpret_cast<const uint8_t*>(fp8_cpu.data_ptr());
+
+        // Convert each FP8 byte to float32
+        std::vector<float> f32_data(numel);
+        for (int64_t i = 0; i < numel; i++) {
+            f32_data[i] = fp8_e4m3fn_to_f32(bytes[i]);
+        }
+
+        // Create F32 tensor from converted data
+        at::Tensor f32_cpu = at::from_blob(
+            f32_data.data(),
+            sizes,
+            at::TensorOptions().dtype(at::kFloat)
+        ).clone();
+
+        // Move to same device as input
+        at::Tensor f32_gpu = f32_cpu.to(fp8.device());
+
+        return new at::Tensor(std::move(f32_gpu));
+    } catch (const std::exception& e) {
+        return nullptr;
+    }
+}
+
 } // extern "C"

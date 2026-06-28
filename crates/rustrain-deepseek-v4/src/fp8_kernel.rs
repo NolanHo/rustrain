@@ -29,11 +29,68 @@ unsafe extern "C" {
         dtype_code: i32,
         device_id: i32,
     ) -> *mut std::ffi::c_void;
+
+    /// Byte-level FP8 E4M3FN → F32 dequant. Takes a GPU FP8 tensor pointer,
+    /// reads bytes, converts each to float32 manually, returns GPU F32 tensor.
+    /// Bypasses PyTorch's to() which crashes on non-128-aligned dims.
+    fn v4_dequant_fp8_raw(tensor_ptr: *mut std::ffi::c_void) -> *mut std::ffi::c_void;
 }
 
 pub fn is_fp8_kernel_available() -> bool {
     let ptr = v4_fp8_scaled_mm as *const ();
     !ptr.is_null()
+}
+
+/// Byte-level FP8 → F32 dequant via C++ (bypasses PyTorch's view bug).
+/// Takes a GPU FP8 tensor, returns GPU F32 tensor. Scale NOT applied.
+pub fn dequant_fp8_raw(fp8_tensor: &Tensor) -> Result<Tensor> {
+    let tensor_ptr = unsafe { v4_dequant_fp8_raw(fp8_tensor.as_ptr() as *mut _) };
+
+    if tensor_ptr.is_null() {
+        bail!("C++ v4_dequant_fp8_raw returned null");
+    }
+
+    let tensor = unsafe { Tensor::clone_from_ptr(tensor_ptr as *mut _) };
+    unsafe { v4_fp8_free_tensor(tensor_ptr) };
+    Ok(tensor)
+}
+
+/// Dequant FP8 weight to BF16 with block-wise scale applied.
+/// Uses byte-level C++ dequant (no PyTorch FP8 ops) then applies scale in Rust.
+///
+/// - `fp8_weight`: [N, K] FP8 tensor on GPU
+/// - `scale`: [ceil(N/128), ceil(K/128)] F32 tensor on GPU
+/// Returns: [N, K] BF16 tensor on GPU
+pub fn dequant_fp8_weight(fp8_weight: &Tensor, scale: &Tensor) -> Result<Tensor> {
+    let n = fp8_weight.size()[0];
+    let k = fp8_weight.size()[1];
+
+    // Step 1: byte-level FP8 → F32 (no PyTorch view bug)
+    let f32_weight = dequant_fp8_raw(fp8_weight)?;
+
+    // Step 2: expand scale from [n_blocks, k_blocks] to [N, K] and multiply
+    let n_blocks = (n + 127) / 128;
+    let k_blocks = (k + 127) / 128;
+    let scale_expanded = if scale.size() == [n_blocks, k_blocks] {
+        // Expand scale to [n_blocks*128, k_blocks*128] then crop to [N, K]
+        let n_padded = n_blocks * 128;
+        let k_padded = k_blocks * 128;
+        let expanded = scale
+            .unsqueeze(-1)                         // [n_blocks, k_blocks, 1]
+            .unsqueeze(-1)                         // [n_blocks, k_blocks, 1, 1]
+            .expand([n_blocks, k_blocks, 128, 128], false)
+            .reshape([n_padded, k_padded])
+            .contiguous();
+        // Crop to actual [N, K]
+        expanded.narrow(0, 0, n).narrow(1, 0, k)
+    } else {
+        // Scale already has matching shape
+        scale.shallow_clone()
+    };
+
+    // Step 3: apply scale and convert to BF16
+    let result = (&f32_weight * &scale_expanded).to_kind(Kind::BFloat16);
+    Ok(result)
 }
 
 pub fn ue8m0_to_float_scale(scale_u8: &Tensor) -> Tensor {
@@ -200,10 +257,22 @@ pub fn quantize_to_fp8(input: &Tensor) -> (Tensor, Tensor) {
     let shape = input.size();
     let m = shape[0];
     let k = shape[1];
-    let m_blocks = m / 128;
+
+    // Pad M to 128 multiple (required by _scaled_mm block-wise path)
+    let m_padded = ((m + 127) / 128) * 128;
+    let m_blocks = m_padded / 128;
     let k_blocks = k / 128;
 
-    let reshaped = input
+    let input_padded = if m_padded != m {
+        let pad = Tensor::zeros([m_padded - m, k], (input.kind(), input.device()));
+        let input_clone = input.shallow_clone();
+        let tensors: Vec<&Tensor> = [&input_clone, &pad].to_vec();
+        Tensor::cat(&tensors, 0)
+    } else {
+        input.shallow_clone()
+    };
+
+    let reshaped = input_padded
         .to_kind(Kind::Float)
         .reshape([m_blocks, 128, k_blocks, 128]);
 
@@ -215,7 +284,14 @@ pub fn quantize_to_fp8(input: &Tensor) -> (Tensor, Tensor) {
     let scale_expanded = scale
         .reshape([m_blocks, 1, k_blocks, 1])
         .expand([m_blocks, 128, k_blocks, 128], false);
-    let quantized = (reshaped / &scale_expanded).reshape([m, k]);
+    let quantized = (reshaped / &scale_expanded).reshape([m_padded, k]);
+
+    // Crop back to original M
+    let quantized = if m_padded != m {
+        quantized.narrow(0, 0, m)
+    } else {
+        quantized
+    };
 
     (quantized.to_kind(Kind::Float), scale_2d)
 }
@@ -237,11 +313,20 @@ pub fn fp8_linear(input: &Tensor, weight_fp8: &Tensor, weight_scale: &Tensor) ->
         bail!("FP8 GEMM requires CUDA tensors");
     }
 
-    let m = input.size()[0];
-    let k = input.size()[1];
+    // Flatten 3D+ input to 2D [M, K]
+    let original_shape = input.size();
+    let input_2d = if input.dim() > 2 {
+        let batch: i64 = original_shape[..original_shape.len() - 1].iter().product();
+        input.reshape([batch, original_shape[original_shape.len() - 1]])
+    } else {
+        input.shallow_clone()
+    };
+
+    let m = input_2d.size()[0];
+    let k = input_2d.size()[1];
     let n = weight_fp8.size()[0];
 
-    let (input_fp8, scale_a) = quantize_to_fp8(input);
+    let (input_fp8, scale_a) = quantize_to_fp8(&input_2d);
     let scale_b = expand_weight_scale(weight_scale, n, k);
 
     let result_ptr = unsafe {
@@ -260,7 +345,14 @@ pub fn fp8_linear(input: &Tensor, weight_fp8: &Tensor, weight_scale: &Tensor) ->
     let result = unsafe { Tensor::clone_from_ptr(result_ptr as *mut _) };
     unsafe { v4_fp8_free_tensor(result_ptr) };
 
-    Ok(result)
+    // Reshape back to original dimensions if input was 3D+
+    if input.dim() > 2 {
+        let mut out_shape: Vec<i64> = original_shape[..original_shape.len() - 1].to_vec();
+        out_shape.push(n);
+        Ok(result.reshape(out_shape))
+    } else {
+        Ok(result)
+    }
 }
 
 pub fn fp8_linear_bias(

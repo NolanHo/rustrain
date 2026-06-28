@@ -378,6 +378,14 @@ pub struct Glm5AttentionWeights {
     pub indexer_weights_proj: Option<Tensor>,
     pub indexer_wk: Option<Tensor>,
     pub indexer_wq_b: Option<Tensor>,
+    // FP8 scales (optional, present when weights are F8_E4M3)
+    pub q_a_proj_scale: Option<Tensor>,
+    pub q_b_proj_scale: Option<Tensor>,
+    pub kv_a_proj_scale: Option<Tensor>,
+    pub kv_b_proj_scale: Option<Tensor>,
+    pub o_proj_scale: Option<Tensor>,
+    pub indexer_wk_scale: Option<Tensor>,
+    pub indexer_wq_b_scale: Option<Tensor>,
 }
 
 impl Glm5AttentionWeights {
@@ -412,6 +420,29 @@ impl Glm5AttentionWeights {
             .get(&format!("{p}.indexer.wq_b.weight"))
             .map(|t| t.to_kind(kind));
 
+        // FP8 scales
+        let q_a_proj_scale = weights
+            .get(&format!("{p}.q_a_proj.weight_scale_inv"))
+            .map(|t| t.shallow_clone());
+        let q_b_proj_scale = weights
+            .get(&format!("{p}.q_b_proj.weight_scale_inv"))
+            .map(|t| t.shallow_clone());
+        let kv_a_proj_scale = weights
+            .get(&format!("{p}.kv_a_proj_with_mqa.weight_scale_inv"))
+            .map(|t| t.shallow_clone());
+        let kv_b_proj_scale = weights
+            .get(&format!("{p}.kv_b_proj.weight_scale_inv"))
+            .map(|t| t.shallow_clone());
+        let o_proj_scale = weights
+            .get(&format!("{p}.o_proj.weight_scale_inv"))
+            .map(|t| t.shallow_clone());
+        let indexer_wk_scale = weights
+            .get(&format!("{p}.indexer.wk.weight_scale_inv"))
+            .map(|t| t.shallow_clone());
+        let indexer_wq_b_scale = weights
+            .get(&format!("{p}.indexer.wq_b.weight_scale_inv"))
+            .map(|t| t.shallow_clone());
+
         Ok(Self {
             q_a_proj,
             q_a_layernorm,
@@ -425,6 +456,13 @@ impl Glm5AttentionWeights {
             indexer_weights_proj,
             indexer_wk,
             indexer_wq_b,
+            q_a_proj_scale,
+            q_b_proj_scale,
+            kv_a_proj_scale,
+            kv_b_proj_scale,
+            o_proj_scale,
+            indexer_wk_scale,
+            indexer_wq_b_scale,
         })
     }
 
@@ -488,22 +526,22 @@ pub fn glm5_dsa_attention(
     let idx_topk = config.index_topk;
 
     // ── Standard MLA Q/K/V projections ──
-    // Convert all attention weights to input dtype to avoid bf16/fp32 mismatch
-    let q_a = input.linear::<&Tensor>(&attn.q_a_proj.to_kind(compute_kind), None);
+    // Use glm5_safe_linear for FP8 dispatch when scale is available
+    let q_a = glm5_safe_linear(input, &attn.q_a_proj, attn.q_a_proj_scale.as_ref());
     let q_a_normed = rms_norm(&q_a, &attn.q_a_layernorm.to_kind(compute_kind), config.rms_norm_eps);
-    let q_b = q_a_normed.linear::<&Tensor>(&attn.q_b_proj.to_kind(compute_kind), None);
+    let q_b = glm5_safe_linear(&q_a_normed, &attn.q_b_proj, attn.q_b_proj_scale.as_ref());
     let q = q_b
         .reshape([batch, seq, num_heads, qk_nope + qk_rope])
         .transpose(1, 2);
     let q_nope = q.narrow(-1, 0, qk_nope);
     let q_rope = q.narrow(-1, qk_nope, qk_rope);
 
-    let kv_a = input.linear::<&Tensor>(&attn.kv_a_proj_with_mqa.to_kind(compute_kind), None);
+    let kv_a = glm5_safe_linear(input, &attn.kv_a_proj_with_mqa, attn.kv_a_proj_scale.as_ref());
     // Split first: kv_lora part gets RMSNorm, RoPE part does not
     let kv_lora_raw = kv_a.narrow(-1, 0, kv_lora);
     let k_rope = kv_a.narrow(-1, kv_lora, qk_rope);
     let kv_lora_part = rms_norm(&kv_lora_raw, &attn.kv_a_layernorm.to_kind(compute_kind), config.rms_norm_eps);
-    let kv_b = kv_lora_part.linear::<&Tensor>(&attn.kv_b_proj.to_kind(compute_kind), None);
+    let kv_b = glm5_safe_linear(&kv_lora_part, &attn.kv_b_proj, attn.kv_b_proj_scale.as_ref());
     let kv_b = kv_b.reshape([batch, seq, num_heads, qk_nope + v_head]);
     let k_nope = kv_b.narrow(-1, 0, qk_nope).transpose(1, 2);
     let v = kv_b.narrow(-1, qk_nope, v_head).transpose(1, 2);
@@ -536,29 +574,23 @@ pub fn glm5_dsa_attention(
         &indexer_weights.indexer_weights_proj,
     ) {
         if should_compute_topk {
-            // 1. Indexer Q: from q_a → wq_b → [batch, seq, n_heads * idx_head_dim]
-            let idx_q = q_a.linear::<&Tensor>(&wq_b.to_kind(compute_kind), None);
+            // 1. Indexer Q: from q_a → wq_b → [batch, seq, idx_n_heads * idx_head_dim]
+            let idx_q = glm5_safe_linear(&q_a, wq_b, indexer_weights.indexer_wq_b_scale.as_ref());
+            // Reshape to [batch, idx_n_heads, seq, idx_head_dim]
             let idx_q = idx_q
-                .reshape([batch, seq, num_heads, idx_head_dim])
-                .transpose(1, 2);
-
-            // 2. Indexer K: from kv_lora_normed → wk → k_norm → [batch, seq, idx_n_heads * idx_head_dim]
-            let idx_k_raw = kv_lora_part.linear::<&Tensor>(&wk.to_kind(compute_kind), None);
-            let idx_k_normed = rms_norm_with_bias(&idx_k_raw, &k_norm_w.to_kind(compute_kind), &k_norm_b.to_kind(compute_kind), config.rms_norm_eps);
-            let idx_k = idx_k_normed
                 .reshape([batch, seq, idx_n_heads, idx_head_dim])
                 .transpose(1, 2);
 
-            // 3. Indexer attention scores
-            let idx_k_expanded = if idx_n_heads != num_heads {
-                idx_k
-                    .mean_dim([1].as_slice(), true, input.kind())
-                    .expand([batch, num_heads, seq, idx_head_dim], false)
-            } else {
-                idx_k
-            };
+            // 2. Indexer K: from HIDDEN (not kv_lora) → wk → k_norm → [batch, seq, idx_head_dim]
+            //    wk: [idx_head_dim, hidden_size] — single-head key, NO idx_n_heads dimension
+            let idx_k_raw = glm5_safe_linear(input, &indexer_weights.indexer_wk.as_ref().unwrap(), indexer_weights.indexer_wk_scale.as_ref());
+            let idx_k = rms_norm_with_bias(&idx_k_raw, &k_norm_w.to_kind(compute_kind), &k_norm_b.to_kind(compute_kind), config.rms_norm_eps);
+            // idx_k: [batch, seq, idx_head_dim] — broadcast across idx_n_heads heads
+            let idx_k_expanded = idx_k
+                .unsqueeze(1)  // [b, 1, seq, dim]
+                .expand([batch, idx_n_heads, seq, idx_head_dim], false);
 
-            // Apply indexer RoPE if configured (indexer_rope_interleave is separate from main rope_interleave)
+            // 3. Apply indexer RoPE
             let (idx_q_rotated, idx_k_rotated) = if config.indexer_rope_interleave {
                 let (cos_i, sin_i) = rope_cos_sin(seq as usize, idx_head_dim, config.rope_theta, input.device());
                 let cos_i = cos_i.to_kind(input.kind());
@@ -572,10 +604,19 @@ pub fn glm5_dsa_attention(
 
             let idx_scale = 1.0 / (idx_head_dim as f64).sqrt();
             let idx_scores = idx_q_rotated.matmul(&idx_k_rotated.transpose(-2, -1)) * idx_scale;
+            // idx_scores: [batch, idx_n_heads, seq, seq]
 
-            // 4. Top-k selection
+            // 4. Expand to num_heads if needed, then top-k selection
+            let idx_scores_expanded = if idx_n_heads != num_heads {
+                idx_scores
+                    .mean_dim([1].as_slice(), true, compute_kind)
+                    .expand([batch, num_heads, seq, seq], false)
+            } else {
+                idx_scores
+            };
+
             let actual_topk = idx_topk.min(seq as i64);
-            let (_, topk_indices) = idx_scores.topk(actual_topk, -1, true, true);
+            let (_, topk_indices) = idx_scores_expanded.topk(actual_topk, -1, true, true);
 
             // 5. Sparse mask
             let sparse_mask = {
@@ -592,12 +633,14 @@ pub fn glm5_dsa_attention(
                 mask
             };
 
-            // 6. Indexer bias
-            let idx_k_proj = idx_k_normed
-                .linear::<&Tensor>(&weights_proj.to_kind(compute_kind), None)
-                .reshape([batch, seq, num_heads, idx_head_dim])
-                .transpose(1, 2);
-            let idx_bias = idx_q.matmul(&idx_k_proj.transpose(-2, -1)) * idx_scale;
+            // 6. Indexer bias: weights_proj [idx_n_heads, hidden] → per-head key bias
+            //    hidden @ weights_proj^T → [batch, seq, idx_n_heads] → [batch, idx_n_heads, 1, seq]
+            let idx_bias = glm5_safe_linear(input, &weights_proj, None);
+            let idx_bias = idx_bias
+                .reshape([batch, seq, idx_n_heads])
+                .transpose(1, 2)  // [batch, idx_n_heads, seq]
+                .unsqueeze(2)     // [batch, idx_n_heads, 1, seq]
+                .expand([batch, idx_n_heads, seq, seq], false);
             let idx_bias = idx_bias.to_kind(input.kind());
 
             // Save state for IndexShare
@@ -638,7 +681,7 @@ pub fn glm5_dsa_attention(
         .transpose(1, 2)
         .reshape([batch, seq, num_heads * v_head]);
 
-    context.linear::<&Tensor>(&attn.o_proj.to_kind(compute_kind), None)
+    glm5_safe_linear(&context, &attn.o_proj, attn.o_proj_scale.as_ref())
 }
 
 // ── MLP ─────────────────────────────────────────────────────────
@@ -649,6 +692,50 @@ pub fn glm5_mlp(input: &Tensor, gate: &Tensor, up: &Tensor, down: &Tensor) -> Te
     let up_out = input.linear::<&Tensor>(&up.to_kind(k), None);
     let activated = gate_out.silu() * up_out;
     activated.linear::<&Tensor>(&down.to_kind(k), None)
+}
+
+/// Safe FP8 linear dispatch: uses V4's fp8_linear (_scaled_mm) when scale is available
+/// and dimensions are 128-aligned. For non-128-aligned FP8 weights (e.g. kv_a_proj [576, 6144]),
+/// uses byte-level C++ dequant (dequant_fp8_weight) to bypass PyTorch's view bug.
+/// Falls back to standard linear when no scale.
+pub fn glm5_safe_linear(input: &Tensor, weight: &Tensor, scale: Option<&Tensor>) -> Tensor {
+    if let Some(s) = scale {
+        let n = weight.size()[0];
+        let k = weight.size()[1];
+
+        // V4 path: fp8_linear (_scaled_mm) for 128-aligned weights
+        if n % 128 == 0 && k % 128 == 0
+            && matches!(input.kind(), Kind::BFloat16 | Kind::Float)
+            && matches!(input.device(), tch::Device::Cuda(_))
+        {
+            match rustrain_deepseek_v4::fp8_kernel::fp8_linear(input, weight, s) {
+                Ok(out) => return out,
+                Err(e) => {
+                    tracing::warn!("fp8_linear failed ({e:?}), falling back to dequant");
+                }
+            }
+        }
+
+        // Fallback for non-128-aligned FP8 weights: byte-level dequant + scale + linear
+        match rustrain_deepseek_v4::fp8_kernel::dequant_fp8_weight(weight, s) {
+            Ok(w_bf16) => {
+                let compute_kind = input.kind();
+                return input.linear::<&Tensor>(&w_bf16.to_kind(compute_kind), None);
+            }
+            Err(e) => {
+                tracing::warn!("dequant_fp8_weight failed ({e:?}), trying to_kind");
+            }
+        }
+
+        // Last resort: try to_kind (may crash on some FP8 tensors)
+        let compute_kind = input.kind();
+        let w_bf16 = weight.to_kind(compute_kind);
+        input.linear::<&Tensor>(&w_bf16, None)
+    } else {
+        // No scale: standard bf16 linear
+        let k = input.kind();
+        input.linear::<&Tensor>(&weight.to_kind(k), None)
+    }
 }
 
 /// FP8-aware MLP: uses V4's fp8_linear for GEMM when FP8 weights + scales are provided.
@@ -667,13 +754,27 @@ pub fn glm5_mlp_fp8(
         && matches!(input.device(), tch::Device::Cuda(_));
 
     if use_fp8 {
+        // fp8_linear now handles 3D input internally (flattens to 2D, reshapes back)
         let gate_out = rustrain_deepseek_v4::fp8_kernel::fp8_linear(input, gate, gate_scale.unwrap())
-            .unwrap_or_else(|_| input.linear::<&Tensor>(gate, None));
+            .unwrap_or_else(|_| {
+                // Fallback: dequant weight to bf16 + regular linear
+                let g = rustrain_deepseek_v4::fp8_kernel::dequant_fp8_weight(gate, gate_scale.unwrap())
+                    .unwrap_or_else(|_| gate.to_kind(input.kind()));
+                input.linear::<&Tensor>(&g, None)
+            });
         let up_out = rustrain_deepseek_v4::fp8_kernel::fp8_linear(input, up, up_scale.unwrap())
-            .unwrap_or_else(|_| input.linear::<&Tensor>(up, None));
+            .unwrap_or_else(|_| {
+                let u = rustrain_deepseek_v4::fp8_kernel::dequant_fp8_weight(up, up_scale.unwrap())
+                    .unwrap_or_else(|_| up.to_kind(input.kind()));
+                input.linear::<&Tensor>(&u, None)
+            });
         let activated = gate_out.silu() * up_out;
         rustrain_deepseek_v4::fp8_kernel::fp8_linear(&activated, down, down_scale.unwrap())
-            .unwrap_or_else(|_| activated.linear::<&Tensor>(down, None))
+            .unwrap_or_else(|_| {
+                let d = rustrain_deepseek_v4::fp8_kernel::dequant_fp8_weight(down, down_scale.unwrap())
+                    .unwrap_or_else(|_| down.to_kind(activated.kind()));
+                activated.linear::<&Tensor>(&d, None)
+            })
     } else {
         glm5_mlp(input, gate, up, down)
     }

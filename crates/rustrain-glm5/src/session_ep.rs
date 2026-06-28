@@ -229,10 +229,22 @@ pub fn train_glm5_lora_sft_ep(
     let weights = load_glm5_weights(&model_path, &needed)?;
     info!(rank, tensors = weights.len(), "weights loaded");
 
+    // V4 approach: keep FP8 weights as FP8 on GPU (no dequant during loading).
+    // Forward pass uses fp8_linear (_scaled_mm) for 128-aligned weights.
+    // Non-128-aligned weights are dequanted on-the-fly via dequant_fp8_weight.
     let weights_gpu: BTreeMap<String, Tensor> = weights
         .into_iter()
         .map(|(name, t)| {
-            let t = t.to_device(device).to_kind(compute_kind);
+            let t = if t.kind() == Kind::Float8e4m3fn {
+                // Keep FP8 — move to GPU as-is (forward uses _scaled_mm)
+                t.to_device(device)
+            } else if t.kind() == Kind::Float {
+                // Scales (weight_scale_inv) stay F32 on GPU
+                t.to_device(device)
+            } else {
+                // BF16 and other weights
+                t.to_device(device).to_kind(compute_kind)
+            };
             (name, t)
         })
         .collect();
@@ -277,7 +289,7 @@ pub fn train_glm5_lora_sft_ep(
 
     // ── Create persistent NCCL communicator ──
     let nccl_comm = if world_size > 1 {
-        let comm_dir = run_paths.root.join("nccl-comm");
+        let comm_dir = config.run.base_dir.join(&config.run.name).join("nccl-comm");
         let comm = NcclPersistentComm::new(&comm_dir)?;
         info!(rank, "persistent NCCL communicator created");
         Some(comm)
