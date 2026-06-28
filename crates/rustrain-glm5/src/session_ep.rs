@@ -407,8 +407,14 @@ pub fn train_glm5_lora_sft_ep(
                 let shared_down = tensor(&weights_gpu, &format!("{p}.mlp.shared_experts.down_proj.weight"))?
                     .to_kind(compute_kind);
 
-                // Shared expert (replicated across all ranks)
-                let shared_output = glm5_mlp(&mlp_input, &shared_gate, &shared_up, &shared_down);
+            // Shared expert (replicated across all ranks)
+            let shared_gate_scale = weights_gpu.get(&format!("{p}.mlp.shared_experts.gate_proj.weight_scale_inv"));
+            let shared_up_scale = weights_gpu.get(&format!("{p}.mlp.shared_experts.up_proj.weight_scale_inv"));
+            let shared_down_scale = weights_gpu.get(&format!("{p}.mlp.shared_experts.down_proj.weight_scale_inv"));
+            let shared_output = glm5_mlp_fp8(
+                &mlp_input, &shared_gate, &shared_up, &shared_down,
+                shared_gate_scale, shared_up_scale, shared_down_scale,
+            );
 
                 // Router logits — computed over ALL experts
                 let router_logits = mlp_input.linear::<&Tensor>(&gate, None);
@@ -445,7 +451,13 @@ pub fn train_glm5_lora_sft_ep(
                     let gate_w = tensor(&weights_gpu, &format!("{eg}.gate_proj.weight"))?.to_kind(compute_kind);
                     let up_w = tensor(&weights_gpu, &format!("{eg}.up_proj.weight"))?.to_kind(compute_kind);
                     let down_w = tensor(&weights_gpu, &format!("{eg}.down_proj.weight"))?.to_kind(compute_kind);
-                    let expert_out = glm5_mlp(&flat_input, &gate_w, &up_w, &down_w);
+                    let gate_w_scale = weights_gpu.get(&format!("{eg}.gate_proj.weight_scale_inv"));
+                    let up_w_scale = weights_gpu.get(&format!("{eg}.up_proj.weight_scale_inv"));
+                    let down_w_scale = weights_gpu.get(&format!("{eg}.down_proj.weight_scale_inv"));
+                    let expert_out = glm5_mlp_fp8(
+                        &flat_input, &gate_w, &up_w, &down_w,
+                        gate_w_scale, up_w_scale, down_w_scale,
+                    );
                     // Find which position (0..k) this expert was selected at, and use that weight
                     // For simplicity, sum contributions from all k positions
                     let weight = tk_weights.narrow(-1, 0, 1).unsqueeze(-1); // simplified: use first position
@@ -480,7 +492,10 @@ pub fn train_glm5_lora_sft_ep(
                     .to_kind(compute_kind);
                 let down = tensor(&weights_gpu, &format!("{p}.mlp.down_proj.weight"))?
                     .to_kind(compute_kind);
-                let mlp = glm5_mlp(&mlp_input, &gate, &up, &down);
+                let gate_scale = weights_gpu.get(&format!("{p}.mlp.gate_proj.weight_scale_inv"));
+                let up_scale = weights_gpu.get(&format!("{p}.mlp.up_proj.weight_scale_inv"));
+                let down_scale = weights_gpu.get(&format!("{p}.mlp.down_proj.weight_scale_inv"));
+                let mlp = glm5_mlp_fp8(&mlp_input, &gate, &up, &down, gate_scale, up_scale, down_scale);
                 hidden = &residual + &mlp;
             }
 
