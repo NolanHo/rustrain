@@ -3,7 +3,7 @@
 A high-performance LLM training engine in Rust. Built on tch-rs (PyTorch C++ bindings)
 with native FP8 GEMM, expert parallelism, and multi-GPU distributed training.
 
-> **Status:** Active development. DeepSeek V4 Flash EP=8 LoRA SFT verified on 8× H20-3e.
+> **Status:** Active development. DeepSeek V4 Flash + GLM-5.2 FP8 EP=8 LoRA SFT verified on 8× H20-3e.
 
 ## Highlights
 
@@ -13,10 +13,13 @@ with native FP8 GEMM, expert parallelism, and multi-GPU distributed training.
   persistent communicator (single init, reused across all layers)
 - **DeepSeek V4 Flash** — full architecture: MLA attention, MoE with noaux_tc
   Sinkhorn routing, compress/decompress, HC sparse attention, YaRN RoPE, MTP loss
+- **GLM-5.2** — DSA sparse attention, IndexShare, FP8 full 78-layer training,
+  ~10s/step on 8× H20-3e (seq_len=256, 624 LoRA params, 16134 FP8 tensors)
 - **LoRA SFT** — instruction fine-tuning with JSONL data, response-only loss,
   Adam optimizer, gradient sync, adapter save/load
 - **Pure Rust + C++** — no Python runtime dependency for training; safetensors
-  parsed via mmap, FP8 tensors created via `at::from_blob`
+  parsed via mmap, FP8 tensors created via `at::from_blob`, FP8→BF16 dequant
+  via C++ `at::to(kBFloat16)` (bypasses tch-rs `to_kind()` view bug)
 
 ## Quick Start
 
@@ -37,6 +40,11 @@ cargo run -- train --config configs/qwen_lora_sft.toml
 cargo run --release -- launch --nproc-per-node 8 \
   --output-dir /tmp/runs/v4-ep8 \
   train --config configs/deepseek_v4_flash_lora_sft_ep8.toml
+
+# GLM-5.2 FP8 full 78-layer LoRA SFT (8 GPUs)
+cargo run --release -- launch --nproc-per-node 8 \
+  --output-dir /tmp/runs/glm5-fp8 \
+  train --config configs/glm5_fp8_lora_sft_ep8.toml
 
 # Inspect a HuggingFace model directory
 cargo run -- inspect --model-path /path/to/model
@@ -60,6 +68,8 @@ rustrain probe
 | TinyMoE / DeepSeekMoE | tch-rs (CUDA) | EP=2 | ✅ Verified |
 | DeepSeek V4 Flash | tch-rs + C++ FP8 | EP=8 | ✅ Verified (8× H20-3e) |
 | DeepSeek V4 Flash LoRA SFT | tch-rs + C++ FP8 | EP=8 | ✅ Verified (20 steps) |
+| GLM-5.2 FP8 | tch-rs + C++ FP8 | EP=8 | ✅ Verified (78 layers, 16134 tensors) |
+| GLM-5.2 FP8 LoRA SFT | tch-rs + C++ FP8 | EP=8 | ✅ Verified (5 steps, 624 params) |
 
 ### V4 Flash Architecture
 
@@ -114,19 +124,26 @@ rustrain/
 │   ├── rustrain-tch-tiny/        # tch-rs tiny LM training
 │   ├── rustrain-qwen/            # Real Qwen: model, session, LoRA, SFT
 │   ├── rustrain-moe/             # TinyMoE, DeepSeekMoE, EP rank processes
-│   └── rustrain-deepseek-v4/     # V4 Flash: FP8 GEMM, HC attention, EP LoRA SFT
-│       ├── kernels/fp8_gemm.cpp  # C++ shim: at::_scaled_mm + at::from_blob
-│       ├── src/
-│       │   ├── model.rs          # Config, MLA, MoE, compress, MTP, forward
-│       │   ├── fp8_kernel.rs     # FFI binding + mmap safetensors parser
-│       │   ├── session_ep.rs     # EP=8 LoRA SFT training loop
-│       │   ├── hc.rs             # Hash/Content sparse attention
-│       │   ├── tp.rs             # TP sharding + training + TP×EP hybrid
-│       │   ├── ep.rs             # EP sharding + training
-│       │   ├── lora.rs           # LoRA adapter registry
-│       │   ├── sft.rs            # SFT dataset (synthetic + JSONL)
-│       │   └── generate.rs       # Greedy / sampling generation
-│       └── build.rs              # g++ compilation of C++ kernel
+│   ├── rustrain-deepseek-v4/     # V4 Flash: FP8 GEMM, HC attention, EP LoRA SFT
+│   │   ├── kernels/fp8_gemm.cpp  # C++ shim: at::_scaled_mm + at::from_blob + dequant
+│   │   ├── src/
+│   │   │   ├── model.rs          # Config, MLA, MoE, compress, MTP, forward
+│   │   │   ├── fp8_kernel.rs     # FFI binding + mmap safetensors parser
+│   │   │   ├── session_ep.rs     # EP=8 LoRA SFT training loop
+│   │   │   ├── hc.rs             # Hash/Content sparse attention
+│   │   │   ├── tp.rs             # TP sharding + training + TP×EP hybrid
+│   │   │   ├── ep.rs             # EP sharding + training
+│   │   │   ├── lora.rs           # LoRA adapter registry
+│   │   │   ├── sft.rs            # SFT dataset (synthetic + JSONL)
+│   │   │   └── generate.rs       # Greedy / sampling generation
+│   │   └── build.rs              # g++ compilation of C++ kernel
+│   ├── rustrain-glm5/            # GLM-5.2: DSA attention, IndexShare, FP8 EP LoRA SFT
+│   │   └── src/
+│   │       ├── model.rs          # Config, DSA sparse attention, IndexShare, MoE, MTP
+│   │       ├── session_ep.rs     # EP=8 LoRA SFT training (FP8 full 78 layers)
+│   │       ├── lora.rs           # LoRA registry (FP8 scale fields)
+│   │       └── sft.rs            # SFT dataset
+│   └── rustrain-deepseek/        # DeepSeek V3.2 DSA indexer forward
 ├── configs/                      # TOML training configs
 └── src/
     ├── main.rs                   # CLI dispatch
@@ -164,6 +181,7 @@ optional features, so crates that don't need them compile without libtorch.
 | Logging | `tracing` |
 | Distributed | NCCL FFI (direct `unsafe extern "C"`, persistent communicator) |
 | Data | `arrow` IPC, `serde_json` |
+| Python env | `uv` (pip/venv management, preferred) |
 
 ## License
 
