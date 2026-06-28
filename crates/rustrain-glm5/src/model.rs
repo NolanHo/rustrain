@@ -651,21 +651,29 @@ pub fn glm5_mlp(input: &Tensor, gate: &Tensor, up: &Tensor, down: &Tensor) -> Te
     activated.linear::<&Tensor>(&down.to_kind(k), None)
 }
 
-/// FP8-aware MLP: uses V4's fp8_linear for GEMM when weights are FP8 tensors.
+/// FP8-aware MLP: uses V4's fp8_linear for GEMM when FP8 weights + scales are provided.
 /// Falls back to standard bf16 linear otherwise.
 pub fn glm5_mlp_fp8(
     input: &Tensor,
     gate: &Tensor,
     up: &Tensor,
     down: &Tensor,
-    use_fp8: bool,
+    gate_scale: Option<&Tensor>,
+    up_scale: Option<&Tensor>,
+    down_scale: Option<&Tensor>,
 ) -> Tensor {
-    if use_fp8 && rustrain_deepseek_v4::fp8_kernel::is_fp8_kernel_available() {
-        // FP8 weights have .scale_f companion tensors.
-        // For now, fall back to standard linear — FP8 weight loading
-        // is handled in session_ep.rs where scale tensors are loaded.
-        // This will be activated when GLM-5.2 FP8 weights are available.
-        glm5_mlp(input, gate, up, down)
+    let use_fp8 = gate_scale.is_some() && up_scale.is_some() && down_scale.is_some()
+        && rustrain_deepseek_v4::fp8_kernel::is_fp8_kernel_available()
+        && matches!(input.device(), tch::Device::Cuda(_));
+
+    if use_fp8 {
+        let gate_out = rustrain_deepseek_v4::fp8_kernel::fp8_linear(input, gate, gate_scale.unwrap())
+            .unwrap_or_else(|_| input.linear::<&Tensor>(gate, None));
+        let up_out = rustrain_deepseek_v4::fp8_kernel::fp8_linear(input, up, up_scale.unwrap())
+            .unwrap_or_else(|_| input.linear::<&Tensor>(up, None));
+        let activated = gate_out.silu() * up_out;
+        rustrain_deepseek_v4::fp8_kernel::fp8_linear(&activated, down, down_scale.unwrap())
+            .unwrap_or_else(|_| activated.linear::<&Tensor>(down, None))
     } else {
         glm5_mlp(input, gate, up, down)
     }
