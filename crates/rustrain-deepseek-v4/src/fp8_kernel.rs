@@ -453,9 +453,15 @@ where
     let result = unsafe { Tensor::clone_from_ptr(result_ptr as *mut _) };
     unsafe { v4_fp8_free_tensor(result_ptr) };
 
-    // Note: registry entry is kept for backward pass.
-    // It should be cleaned up after backward completes.
-    // For simplicity, entries persist until the process exits.
+    // Registry entry is kept for backward pass.
+    // It will be cleaned up via clear_checkpoint_registry() after each training step.
 
     result
+}
+
+/// Clear all checkpoint registry entries. Call after each training step
+/// to prevent GPU memory leak (closures hold tensor references).
+pub fn clear_checkpoint_registry() {
+    registry().lock().unwrap().clear();
+    CHECKPOINT_COUNTER.store(1, Ordering::SeqCst);
 }

@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, HashSet};
+use std::sync::{Arc, Mutex};
 
 use anyhow::{bail, Context, Result};
 use serde::Serialize;
@@ -409,21 +410,30 @@ pub fn train_glm5_lora_sft_ep(
             let is_full_layer = !runtime_config.should_skip_topk(layer)
                 && (index_share_state.is_none() || layer % (runtime_config.index_topk_freq as usize) == 0);
 
-            // Checkpoint attention for "shared" layers (pure function, no state mutation).
-            // "Full" layers mutate index_share_state — cannot checkpoint.
-            let attn_out = if use_checkpointing && !is_full_layer && index_share_state.is_some() {
-                // Shared layer: clone state + weights into closure (tch Tensors are ref-counted, clone is cheap)
-                let state_clone = index_share_state.as_ref().unwrap().clone();
+            // Checkpoint ALL layers (including "full") via Arc<Mutex> interior mutability.
+            // The Mutex lets the Fn closure mutate index_share_state safely.
+            // Forward runs in no_grad → computes state. Backward recomputes (idempotent).
+            let attn_out = if use_checkpointing {
+                let state_mutex = Arc::new(Mutex::new(index_share_state.take()));
+                let state_for_closure = state_mutex.clone();
                 let attn_clone = lora_attn.clone();
                 let indexer_clone = indexer_weights.clone();
                 let runtime_clone = runtime_config.clone();
                 let layer_copy = layer;
-                rustrain_deepseek_v4::fp8_kernel::checkpoint(&hidden_norm, move |input| {
-                    let mut local_state = Some(state_clone.clone());
-                    glm5_dsa_attention(input, &attn_clone, &indexer_clone, &runtime_clone, &mut local_state, layer_copy)
-                })
+                let full_layer = is_full_layer;
+                let result = rustrain_deepseek_v4::fp8_kernel::checkpoint(&hidden_norm, move |input| {
+                    let mut guard = state_for_closure.lock().unwrap();
+                    let mut local_state = guard.take();
+                    if full_layer {
+                        local_state = None;
+                    }
+                    let output = glm5_dsa_attention(input, &attn_clone, &indexer_clone, &runtime_clone, &mut local_state, layer_copy);
+                    *guard = local_state;
+                    output
+                });
+                index_share_state = state_mutex.lock().unwrap().take();
+                result
             } else {
-                // Full layer or no checkpointing — run normally (may mutate index_share_state)
                 glm5_dsa_attention(
                     &hidden_norm,
                     &lora_attn,
@@ -610,6 +620,9 @@ pub fn train_glm5_lora_sft_ep(
 
         // ── Backward ──
         loss.backward();
+
+        // Free checkpoint closures (they hold GPU tensor references)
+        rustrain_deepseek_v4::fp8_kernel::clear_checkpoint_registry();
 
         // ── LoRA gradient all-reduce ──
         let synced_grads: Vec<Tensor> = if world_size > 1 {
