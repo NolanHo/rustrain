@@ -405,14 +405,34 @@ pub fn train_glm5_lora_sft_ep(
             let source = runtime_config.indexer_source_layer(layer);
             let indexer_weights = indexer_weights_map.get(&source).unwrap_or(&lora_attn);
 
-            let attn_out = glm5_dsa_attention(
-                &hidden_norm,
-                &lora_attn,
-                indexer_weights,
-                &runtime_config,
-                &mut index_share_state,
-                layer,
-            )
+            // Determine if this is a "full" layer (computes indexer state) or "shared" (reuses)
+            let is_full_layer = !runtime_config.should_skip_topk(layer)
+                && (index_share_state.is_none() || layer % (runtime_config.index_topk_freq as usize) == 0);
+
+            // Checkpoint attention for "shared" layers (pure function, no state mutation).
+            // "Full" layers mutate index_share_state — cannot checkpoint.
+            let attn_out = if use_checkpointing && !is_full_layer && index_share_state.is_some() {
+                // Shared layer: clone state + weights into closure (tch Tensors are ref-counted, clone is cheap)
+                let state_clone = index_share_state.as_ref().unwrap().clone();
+                let attn_clone = lora_attn.clone();
+                let indexer_clone = indexer_weights.clone();
+                let runtime_clone = runtime_config.clone();
+                let layer_copy = layer;
+                rustrain_deepseek_v4::fp8_kernel::checkpoint(&hidden_norm, move |input| {
+                    let mut local_state = Some(state_clone.clone());
+                    glm5_dsa_attention(input, &attn_clone, &indexer_clone, &runtime_clone, &mut local_state, layer_copy)
+                })
+            } else {
+                // Full layer or no checkpointing — run normally (may mutate index_share_state)
+                glm5_dsa_attention(
+                    &hidden_norm,
+                    &lora_attn,
+                    indexer_weights,
+                    &runtime_config,
+                    &mut index_share_state,
+                    layer,
+                )
+            }
             .to_kind(compute_kind);
 
             let residual = &hidden + &attn_out;

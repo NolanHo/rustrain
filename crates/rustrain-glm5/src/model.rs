@@ -405,6 +405,32 @@ pub struct Glm5AttentionWeights {
     pub indexer_wq_b_scale: Option<Tensor>,
 }
 
+impl Clone for Glm5AttentionWeights {
+    fn clone(&self) -> Self {
+        Self {
+            q_a_proj: self.q_a_proj.shallow_clone(),
+            q_a_layernorm: self.q_a_layernorm.shallow_clone(),
+            q_b_proj: self.q_b_proj.shallow_clone(),
+            kv_a_proj_with_mqa: self.kv_a_proj_with_mqa.shallow_clone(),
+            kv_a_layernorm: self.kv_a_layernorm.shallow_clone(),
+            kv_b_proj: self.kv_b_proj.shallow_clone(),
+            o_proj: self.o_proj.shallow_clone(),
+            indexer_k_norm_weight: self.indexer_k_norm_weight.as_ref().map(|t| t.shallow_clone()),
+            indexer_k_norm_bias: self.indexer_k_norm_bias.as_ref().map(|t| t.shallow_clone()),
+            indexer_weights_proj: self.indexer_weights_proj.as_ref().map(|t| t.shallow_clone()),
+            indexer_wk: self.indexer_wk.as_ref().map(|t| t.shallow_clone()),
+            indexer_wq_b: self.indexer_wq_b.as_ref().map(|t| t.shallow_clone()),
+            q_a_proj_scale: self.q_a_proj_scale.as_ref().map(|t| t.shallow_clone()),
+            q_b_proj_scale: self.q_b_proj_scale.as_ref().map(|t| t.shallow_clone()),
+            kv_a_proj_scale: self.kv_a_proj_scale.as_ref().map(|t| t.shallow_clone()),
+            kv_b_proj_scale: self.kv_b_proj_scale.as_ref().map(|t| t.shallow_clone()),
+            o_proj_scale: self.o_proj_scale.as_ref().map(|t| t.shallow_clone()),
+            indexer_wk_scale: self.indexer_wk_scale.as_ref().map(|t| t.shallow_clone()),
+            indexer_wq_b_scale: self.indexer_wq_b_scale.as_ref().map(|t| t.shallow_clone()),
+        }
+    }
+}
+
 impl Glm5AttentionWeights {
     pub fn load_with_kind(
         weights: &BTreeMap<String, Tensor>,
@@ -494,8 +520,6 @@ impl Glm5AttentionWeights {
 
 // ── DSA Indexer State (for IndexShare) ───────────────────────────
 
-/// Holds the top-k selection result from a "full" indexer layer.
-/// "shared" layers reuse this instead of recomputing.
 pub struct IndexShareState {
     /// Sparse mask: [batch, num_heads, seq, seq] — which KV positions to attend to
     pub sparse_mask: Tensor,
@@ -503,6 +527,16 @@ pub struct IndexShareState {
     pub idx_bias: Tensor,
     /// Which layer produced this state
     pub source_layer: usize,
+}
+
+impl Clone for IndexShareState {
+    fn clone(&self) -> Self {
+        Self {
+            sparse_mask: self.sparse_mask.shallow_clone(),
+            idx_bias: self.idx_bias.shallow_clone(),
+            source_layer: self.source_layer,
+        }
+    }
 }
 
 impl IndexShareState {
