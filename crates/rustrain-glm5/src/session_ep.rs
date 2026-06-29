@@ -369,6 +369,11 @@ pub fn train_glm5_lora_sft_ep(
         }
     }
 
+    // Gradient checkpointing: saves MLP intermediate activations by recomputing during backward.
+    // MLP is pure (no index_share_state mutation), so it's safe to checkpoint.
+    // Attention uses SDPA (O(S) memory), so no checkpointing needed there.
+    let use_checkpointing = true;
+
     // ── Training loop ──
     for step in 0..config.train.max_steps {
         // ── Forward ──
@@ -429,10 +434,23 @@ pub fn train_glm5_lora_sft_ep(
             let shared_gate_scale = weights_gpu.get(&format!("{p}.mlp.shared_experts.gate_proj.weight_scale_inv"));
             let shared_up_scale = weights_gpu.get(&format!("{p}.mlp.shared_experts.up_proj.weight_scale_inv"));
             let shared_down_scale = weights_gpu.get(&format!("{p}.mlp.shared_experts.down_proj.weight_scale_inv"));
-            let shared_output = glm5_mlp_fp8(
-                &mlp_input, &shared_gate, &shared_up, &shared_down,
-                shared_gate_scale, shared_up_scale, shared_down_scale,
-            );
+            // Shared expert (replicated across all ranks) — checkpointed
+            let shared_output = if use_checkpointing {
+                let sg = shared_gate.shallow_clone();
+                let su = shared_up.shallow_clone();
+                let sd = shared_down.shallow_clone();
+                let sgs = shared_gate_scale.map(|t| t.shallow_clone());
+                let sus = shared_up_scale.map(|t| t.shallow_clone());
+                let sds = shared_down_scale.map(|t| t.shallow_clone());
+                rustrain_deepseek_v4::fp8_kernel::checkpoint(&mlp_input, move |input| {
+                    glm5_mlp_fp8(input, &sg, &su, &sd, sgs.as_ref(), sus.as_ref(), sds.as_ref())
+                })
+            } else {
+                glm5_mlp_fp8(
+                    &mlp_input, &shared_gate, &shared_up, &shared_down,
+                    shared_gate_scale, shared_up_scale, shared_down_scale,
+                )
+            };
 
                 // Router logits — computed over ALL experts
                 let router_logits = mlp_input.linear::<&Tensor>(&gate, None);
@@ -503,14 +521,21 @@ pub fn train_glm5_lora_sft_ep(
 
                 hidden = &residual + &full_mlp;
             } else {
-                // Dense MLP
+                // Dense MLP — checkpointed to save intermediate activations
                 let gate = keep_fp8(tensor(&weights_gpu, &format!("{p}.mlp.gate_proj.weight"))?, compute_kind);
                 let up = keep_fp8(tensor(&weights_gpu, &format!("{p}.mlp.up_proj.weight"))?, compute_kind);
                 let down = keep_fp8(tensor(&weights_gpu, &format!("{p}.mlp.down_proj.weight"))?, compute_kind);
-                let gate_scale = weights_gpu.get(&format!("{p}.mlp.gate_proj.weight_scale_inv"));
-                let up_scale = weights_gpu.get(&format!("{p}.mlp.up_proj.weight_scale_inv"));
-                let down_scale = weights_gpu.get(&format!("{p}.mlp.down_proj.weight_scale_inv"));
-                let mlp = glm5_mlp_fp8(&mlp_input, &gate, &up, &down, gate_scale, up_scale, down_scale);
+                let gate_scale = weights_gpu.get(&format!("{p}.mlp.gate_proj.weight_scale_inv")).map(|t| t.shallow_clone());
+                let up_scale = weights_gpu.get(&format!("{p}.mlp.up_proj.weight_scale_inv")).map(|t| t.shallow_clone());
+                let down_scale = weights_gpu.get(&format!("{p}.mlp.down_proj.weight_scale_inv")).map(|t| t.shallow_clone());
+
+                let mlp = if use_checkpointing {
+                    rustrain_deepseek_v4::fp8_kernel::checkpoint(&mlp_input, move |input| {
+                        glm5_mlp_fp8(input, &gate, &up, &down, gate_scale.as_ref(), up_scale.as_ref(), down_scale.as_ref())
+                    })
+                } else {
+                    glm5_mlp_fp8(&mlp_input, &gate, &up, &down, gate_scale.as_ref(), up_scale.as_ref(), down_scale.as_ref())
+                };
                 hidden = &residual + &mlp;
             }
 

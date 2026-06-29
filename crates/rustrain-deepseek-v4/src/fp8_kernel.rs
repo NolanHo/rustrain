@@ -388,7 +388,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 
-type ForwardFn = Box<dyn Fn(&Tensor) -> Tensor + Send + Sync>;
+type ForwardFn = Box<dyn Fn(&Tensor) -> Tensor + Send>;
 
 static CHECKPOINT_REGISTRY: OnceLock<Mutex<HashMap<usize, ForwardFn>>> = OnceLock::new();
 static CHECKPOINT_COUNTER: AtomicUsize = AtomicUsize::new(1);
@@ -432,7 +432,7 @@ extern "C" fn checkpoint_callback(
 /// It will be called TWICE: once during forward, once during backward.
 pub fn checkpoint<F>(input: &Tensor, forward: F) -> Tensor
 where
-    F: Fn(&Tensor) -> Tensor + Send + Sync + 'static,
+    F: Fn(&Tensor) -> Tensor + Send + 'static,
 {
     let key = CHECKPOINT_COUNTER.fetch_add(1, Ordering::SeqCst);
     registry().lock().unwrap().insert(key, Box::new(forward));

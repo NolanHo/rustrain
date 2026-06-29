@@ -265,16 +265,22 @@ struct CheckpointFunction : public torch::autograd::Function<CheckpointFunction>
         auto fn = reinterpret_cast<CheckpointFn>(ctx->saved_data["fn"].toInt());
         auto user_ctx = reinterpret_cast<void*>(ctx->saved_data["user_ctx"].toInt());
 
-        // Recompute forward WITH grad enabled
+        // Enable grad — autograd engine runs backward with grad disabled,
+        // but we need grad to build the recomputed graph
+        at::AutoGradMode guard(true);
         input.set_requires_grad(true);
+
         void* out = fn(reinterpret_cast<void*>(&input), user_ctx);
         auto* t = reinterpret_cast<at::Tensor*>(out);
         at::Tensor output = std::move(*t);
         delete t;
 
-        // Backprop through recomputed graph — gradients accumulate into weights
-        output.backward(grad_output[0]);
-        return {input.grad()};
+        // Backprop through recomputed graph with retain_graph=True
+        // (autograd engine may need to traverse the graph multiple times)
+        output.backward(grad_output[0], /*retain_graph=*/true, /*create_graph=*/false);
+        // Return gradients for all 3 forward args (input, fn_val, user_ctx)
+        // fn_val and user_ctx are int64_t (non-tensor) — return undefined tensors
+        return {input.grad(), at::Tensor(), at::Tensor()};
     }
 };
 
@@ -283,6 +289,12 @@ void* v4_checkpoint(void* fn_ptr, void* input_ptr, void* user_ctx) {
     auto& input = *reinterpret_cast<at::Tensor*>(input_ptr);
     auto fn = reinterpret_cast<CheckpointFn>(fn_ptr);
 
+    // Ensure input requires grad — checkpoint needs it to set up backward
+    if (!input.requires_grad()) {
+        input.set_requires_grad(true);
+    }
+
+    // apply() returns at::Tensor in this PyTorch version
     at::Tensor result = CheckpointFunction::apply(
         input,
         (int64_t)(uintptr_t)fn_ptr,
