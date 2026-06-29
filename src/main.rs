@@ -521,6 +521,28 @@ fn dispatch_train(config_path: &Path, resume_from: Option<PathBuf>) -> Result<()
         return Ok(());
     }
 
+    if is_tch && arch == "qwen3_6_lora_sft" {
+        let summary = rustrain_qwen3_6::session::train_qwen3_6_lora_sft(&config, &run_paths)?;
+        println!("rustrain Qwen3.6 LoRA SFT complete");
+        println!("run_dir: {}", run_paths.root.display());
+        println!("adapter_checkpoint: {}", summary.adapter_output);
+        println!("initial_loss: {:.9}", summary.initial_loss);
+        println!("final_loss: {:.9}", summary.final_loss);
+        println!("trainable_params: {}", summary.trainable_params);
+        return Ok(());
+    }
+
+    if is_tch && arch == "qwen3_6_lora_sft_ep" {
+        let summary = rustrain_qwen3_6::session::train_qwen3_6_lora_sft_ep(&config, &run_paths)?;
+        println!("rustrain Qwen3.6 LoRA SFT EP complete");
+        println!("run_dir: {}", run_paths.root.display());
+        println!("adapter_checkpoint: {}", summary.adapter_output);
+        println!("initial_loss: {:.9}", summary.initial_loss);
+        println!("final_loss: {:.9}", summary.final_loss);
+        println!("trainable_params: {}", summary.trainable_params);
+        return Ok(());
+    }
+
     // Default: ndarray toy model
     rustrain_toy::trainer::train(&config, &run_paths)
 }
