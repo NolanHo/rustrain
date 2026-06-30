@@ -8,6 +8,7 @@
 
 #include <ATen/ATen.h>
 #include <c10/cuda/CUDAStream.h>
+#include <c10/cuda/CUDACachingAllocator.h>
 #include <torch/csrc/autograd/grad_mode.h>
 #include <torch/csrc/autograd/custom_function.h>
 #include <cstdio>
@@ -307,6 +308,28 @@ void* v4_checkpoint(void* fn_ptr, void* input_ptr, void* user_ctx) {
 void* v4_make_at_tensor(void* tensor_ptr) {
     auto* t = reinterpret_cast<at::Tensor*>(tensor_ptr);
     return new at::Tensor(*t);  // copy constructor increments refcount
+}
+
+// ── Caching allocator controls ──
+
+/// Set the fraction of GPU memory the caching allocator is allowed to use.
+/// Call early (before any training allocations) to pre-expand the pool.
+void v4_set_memory_fraction(double fraction, int device_id) {
+    try {
+        c10::cuda::CUDACachingAllocator::setMemoryFraction(fraction, device_id);
+    } catch (const std::exception& e) {
+        fprintf(stderr, "[v4_set_memory_fraction] FAILED: %s\n", e.what());
+    }
+}
+
+/// Empty the caching allocator's free pool (release cached blocks back to CUDA).
+/// Call after warmup pass so that step 0 starts with a clean but pre-warmed pool.
+void v4_empty_cache() {
+    try {
+        c10::cuda::CUDACachingAllocator::emptyCache();
+    } catch (const std::exception& e) {
+        fprintf(stderr, "[v4_empty_cache] FAILED: %s\n", e.what());
+    }
 }
 
 } // extern "C"

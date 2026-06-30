@@ -1,5 +1,5 @@
 use std::{
-    ffi::{c_char, c_int, c_void, CStr},
+    ffi::{c_char, c_int, c_uint, c_void, CStr},
     fs,
     path::{Path, PathBuf},
     ptr,
@@ -27,9 +27,12 @@ type NcclDataType = c_int;
 type NcclRedOp = c_int;
 type CudaError = c_int;
 type CudaStream = *mut c_void;
+type CudaEvent = *mut c_void;
 
 const NCCL_FLOAT32: NcclDataType = 7;
+const NCCL_BF16: NcclDataType = 9;
 const NCCL_SUM: NcclRedOp = 0;
+const CUDA_EVENT_DISABLE_TIMING: c_uint = 0x2;
 
 #[link(name = "nccl")]
 unsafe extern "C" {
@@ -79,6 +82,14 @@ unsafe extern "C" {
     fn cudaDeviceSynchronize() -> CudaError;
     fn cudaFree(dev_ptr: *mut c_void) -> CudaError;
     fn cudaGetErrorString(error: CudaError) -> *const c_char;
+    fn cudaStreamCreate(stream: *mut CudaStream) -> CudaError;
+    fn cudaStreamSynchronize(stream: CudaStream) -> CudaError;
+    fn cudaStreamDestroy(stream: CudaStream) -> CudaError;
+    fn cudaEventCreate(event: *mut CudaEvent) -> CudaError;
+    fn cudaEventCreateWithFlags(event: *mut CudaEvent, flags: c_uint) -> CudaError;
+    fn cudaEventRecord(event: CudaEvent, stream: CudaStream) -> CudaError;
+    fn cudaStreamWaitEvent(stream: CudaStream, event: CudaEvent, flags: c_uint) -> CudaError;
+    fn cudaEventDestroy(event: CudaEvent) -> CudaError;
 }
 
 const DP_WEIGHT: [f32; 2] = [0.2, -0.1];
@@ -683,6 +694,19 @@ pub struct NcclPersistentComm {
     rank: usize,
     world_size: usize,
     local_rank: usize,
+    /// Dedicated NCCL stream — separate from compute stream for overlap.
+    comm_stream: CudaStream,
+}
+
+/// CUDA event for stream synchronization without global blocking.
+pub struct CudaEventHandle(CudaEvent);
+
+impl Drop for CudaEventHandle {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            unsafe { cudaEventDestroy(self.0) };
+        }
+    }
 }
 
 impl NcclPersistentComm {
@@ -741,16 +765,25 @@ impl NcclPersistentComm {
             "ncclCommInitRank",
         )?;
 
+        // Create dedicated NCCL stream (separate from compute stream for overlap)
+        let mut comm_stream: CudaStream = ptr::null_mut();
+        check_cuda(
+            unsafe { cudaStreamCreate(&mut comm_stream) },
+            "cudaStreamCreate",
+        )?;
+
         Ok(Self {
             comm,
             rank,
             world_size,
             local_rank,
+            comm_stream,
         })
     }
 
     /// All-reduce a tensor (sum) using the persistent communicator.
     /// Returns the reduced tensor (sum across all ranks).
+    /// Uses comm_stream — does NOT block CPU. Call `comm_sync()` to wait.
     pub fn all_reduce(&self, tensor: &Tensor) -> Result<Tensor> {
         let tensor = tensor.to_kind(Kind::Float).contiguous();
         if tensor.numel() == 0 {
@@ -770,13 +803,130 @@ impl NcclPersistentComm {
                     NCCL_FLOAT32,
                     NCCL_SUM,
                     self.comm,
-                    ptr::null_mut(),
+                    self.comm_stream,
                 )
             },
             "ncclAllReduce",
         )?;
-        check_cuda(unsafe { cudaDeviceSynchronize() }, "cudaDeviceSynchronize")?;
+        // Sync only comm_stream (not global device sync)
+        check_cuda(
+            unsafe { cudaStreamSynchronize(self.comm_stream) },
+            "cudaStreamSynchronize",
+        )?;
         Ok(output)
+    }
+
+    /// Async all-reduce: launches on comm_stream, returns (output, event).
+    /// Does NOT block CPU. Caller should `cudaStreamWaitEvent(compute_stream, event)`
+    /// before using the output tensor.
+    pub fn all_reduce_async(&self, tensor: &Tensor) -> Result<(Tensor, CudaEventHandle)> {
+        let tensor = tensor.to_kind(Kind::Float).contiguous();
+        if tensor.numel() == 0 {
+            bail!("NCCL all-reduce input must not be empty");
+        }
+        check_cuda(
+            unsafe { cudaSetDevice(self.local_rank as c_int) },
+            "cudaSetDevice",
+        )?;
+        let output = tensor.zeros_like();
+        check_nccl(
+            unsafe {
+                ncclAllReduce(
+                    tensor.data_ptr().cast_const(),
+                    output.data_ptr(),
+                    tensor.numel(),
+                    NCCL_FLOAT32,
+                    NCCL_SUM,
+                    self.comm,
+                    self.comm_stream,
+                )
+            },
+            "ncclAllReduce",
+        )?;
+        // Record event on comm_stream — caller waits on this before using output
+        let mut event: CudaEvent = ptr::null_mut();
+        check_cuda(
+            unsafe { cudaEventCreateWithFlags(&mut event, CUDA_EVENT_DISABLE_TIMING) },
+            "cudaEventCreateWithFlags",
+        )?;
+        check_cuda(
+            unsafe { cudaEventRecord(event, self.comm_stream) },
+            "cudaEventRecord",
+        )?;
+        Ok((output, CudaEventHandle(event)))
+    }
+
+    /// Ring send/recv: send our tensor to `send_peer`, receive from `recv_peer`.
+    /// Returns the received tensor. Both tensors must have the same shape/dtype.
+    /// Uses ncclGroupStart/End for atomic exchange (no deadlock risk in ring).
+    pub fn ring_send_recv(
+        &self,
+        send_tensor: &Tensor,
+        send_peer: usize,
+        recv_peer: usize,
+    ) -> Result<Tensor> {
+        let send_tensor = send_tensor.contiguous();
+        if send_tensor.numel() == 0 {
+            bail!("NCCL ring_send_recv: empty tensor");
+        }
+        check_cuda(
+            unsafe { cudaSetDevice(self.local_rank as c_int) },
+            "cudaSetDevice",
+        )?;
+
+        let recv_tensor = send_tensor.zeros_like();
+        let count = send_tensor.numel();
+
+        // Use BF16 directly for ring exchange — avoids F32 upcast overhead.
+        // NCCL supports BF16 natively on H20 (sm90+).
+        let dtype = match send_tensor.kind() {
+            Kind::BFloat16 => NCCL_BF16,
+            Kind::Float => NCCL_FLOAT32,
+            _ => NCCL_FLOAT32, // fallback (convert to F32)
+        };
+
+        let send_ptr = if dtype == NCCL_FLOAT32 && send_tensor.kind() != Kind::Float {
+            let f32_tensor = send_tensor.to_kind(Kind::Float);
+            f32_tensor.data_ptr().cast_const()
+        } else {
+            send_tensor.data_ptr().cast_const()
+        };
+
+        // Group Start → Send + Recv → Group End (atomic exchange on comm_stream)
+        check_nccl(unsafe { ncclGroupStart() }, "ncclGroupStart")?;
+        check_nccl(
+            unsafe {
+                ncclSend(
+                    send_ptr,
+                    count,
+                    dtype,
+                    send_peer as c_int,
+                    self.comm,
+                    self.comm_stream,
+                )
+            },
+            "ncclSend",
+        )?;
+        check_nccl(
+            unsafe {
+                ncclRecv(
+                    recv_tensor.data_ptr(),
+                    count,
+                    dtype,
+                    recv_peer as c_int,
+                    self.comm,
+                    self.comm_stream,
+                )
+            },
+            "ncclRecv",
+        )?;
+        check_nccl(unsafe { ncclGroupEnd() }, "ncclGroupEnd")?;
+        check_cuda(
+            unsafe { cudaStreamSynchronize(self.comm_stream) },
+            "cudaStreamSynchronize",
+        )?;
+
+        Ok(recv_tensor)
     }
 }
 
@@ -784,6 +934,9 @@ impl Drop for NcclPersistentComm {
     fn drop(&mut self) {
         if !self.comm.is_null() {
             unsafe { ncclCommDestroy(self.comm) };
+        }
+        if !self.comm_stream.is_null() {
+            unsafe { cudaStreamDestroy(self.comm_stream) };
         }
     }
 }

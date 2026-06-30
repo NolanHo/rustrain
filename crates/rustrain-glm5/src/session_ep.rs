@@ -239,12 +239,16 @@ pub fn train_glm5_lora_sft_ep(
     let weights = load_glm5_weights(&model_path, &needed)?;
     info!(rank, tensors = weights.len(), "weights loaded");
 
-    // V4 approach: keep FP8 weights as FP8 on GPU (no dequant during loading).
-    // Forward pass uses fp8_linear (_scaled_mm) for 128-aligned weights.
-    // Non-128-aligned weights are dequanted on-the-fly via dequant_fp8_weight.
-    let weights_gpu: BTreeMap<String, Tensor> = weights
-        .into_iter()
-        .map(|(name, t)| {
+    // Expert offloading: keep routed expert weights on CPU, prefetch to GPU on demand.
+    // This saves ~87GB GPU memory (32 experts/rank × ~2.8GB → 0, only ~1-3 experts on GPU at a time).
+    // Experts are frozen (LoRA targets attention only), so no gradient/autograd complexity.
+    let mut weights_gpu: BTreeMap<String, Tensor> = BTreeMap::new();
+    let mut expert_weights_cpu: BTreeMap<String, Tensor> = BTreeMap::new();
+    for (name, t) in weights {
+        if name.contains(".mlp.experts.") {
+            // Expert weights stay on CPU — will be prefetched to GPU on demand
+            expert_weights_cpu.insert(name, t);
+        } else {
             let t = if t.kind() == Kind::Float8e4m3fn {
                 // Keep FP8 — move to GPU as-is (forward uses _scaled_mm)
                 t.to_device(device)
@@ -255,10 +259,16 @@ pub fn train_glm5_lora_sft_ep(
                 // BF16 and other weights
                 t.to_device(device).to_kind(compute_kind)
             };
-            (name, t)
-        })
-        .collect();
-    info!(rank, tensors_on_gpu = weights_gpu.len(), "weights on GPU");
+            weights_gpu.insert(name, t);
+        }
+    }
+    let expert_cpu_count = expert_weights_cpu.len();
+    info!(
+        rank,
+        tensors_on_gpu = weights_gpu.len(),
+        expert_tensors_on_cpu = expert_cpu_count,
+        "weights loaded (experts offloaded to CPU)"
+    );
 
     // ── Create LoRA registry ──
     let registry = Glm5LoraRegistry::new(&weights_gpu, lora_config, device)?;
@@ -375,6 +385,23 @@ pub fn train_glm5_lora_sft_ep(
     // Attention uses SDPA (O(S) memory), so no checkpointing needed there.
     let use_checkpointing = true;
 
+    // ── C++ kernel availability ──
+    let use_cpp_attention = rustrain_deepseek_v4::fp8_kernel::is_glm5_attention_available();
+    if use_cpp_attention {
+        info!(rank, "C++ GLM5 attention kernel available — using coarse-grained C++ path");
+    } else {
+        info!(rank, "C++ GLM5 attention kernel not available — using Rust tch-rs path");
+    }
+    let use_cpp_mlp = use_cpp_attention; // same .so provides MLP
+    let use_cpp_loss = use_cpp_attention; // same .so provides loss
+    let use_cpp_optimizer = use_cpp_attention; // same .so provides optimizer
+
+    // ── Pre-expand caching allocator ──
+    // Tell PyTorch's caching allocator it can use 95% of GPU memory.
+    // This causes it to pre-allocate large segments upfront instead of growing incrementally.
+    rustrain_deepseek_v4::fp8_kernel::set_memory_fraction(0.95, local_rank as i32);
+    info!(rank, "set caching allocator memory fraction to 0.95");
+
     // ── Training loop ──
     for step in 0..config.train.max_steps {
         // ── Forward ──
@@ -385,6 +412,8 @@ pub fn train_glm5_lora_sft_ep(
         }
 
         let mut index_share_state: Option<IndexShareState> = None;
+        // C++ IndexShare state for layer_forward path (separate from Rust path)
+        let mut cpp_layer_state = rustrain_deepseek_v4::fp8_kernel::Glm5IndexState::default();
 
         for layer in 0..n_layers {
             // Skip non-trainable layers — hidden passes through unchanged
@@ -393,10 +422,165 @@ pub fn train_glm5_lora_sft_ep(
             }
             let p = format!("model.layers.{layer}");
 
+            if use_cpp_attention {
+                // ── C++ unified layer forward: 1 FFI call for entire layer ──
+                // Combines: RMSNorm → attention → residual → RMSNorm → MoE/dense → residual
+                let attn_norm = tensor(&weights_gpu, &format!("{p}.input_layernorm.weight"))?.to_kind(compute_kind);
+                let post_norm = tensor(&weights_gpu, &format!("{p}.post_attention_layernorm.weight"))?.to_kind(compute_kind);
+
+                // Load attention weights (with LoRA applied)
+                let attn_weights = Glm5AttentionWeights::load_with_kind(&weights_gpu, layer, compute_kind)?;
+                let lora_attn = lora_attention_weights(&attn_weights, layer, &registry);
+
+                // Get indexer weights
+                let source = runtime_config.indexer_source_layer(layer);
+                let indexer_weights = indexer_weights_map.get(&source).unwrap_or(&lora_attn);
+
+                let is_full_layer = !runtime_config.should_skip_topk(layer)
+                    && (cpp_layer_state.is_none() || layer % (runtime_config.index_topk_freq as usize) == 0);
+
+                let is_moe = runtime_config.is_moe_layer(layer);
+
+                if is_moe {
+                    // ── MoE layer ──
+                    let gate = tensor(&weights_gpu, &format!("{p}.mlp.gate.weight"))?.to_kind(compute_kind);
+                    let shared_gate = keep_fp8(tensor(&weights_gpu, &format!("{p}.mlp.shared_experts.gate_proj.weight"))?, compute_kind);
+                    let shared_up = keep_fp8(tensor(&weights_gpu, &format!("{p}.mlp.shared_experts.up_proj.weight"))?, compute_kind);
+                    let shared_down = keep_fp8(tensor(&weights_gpu, &format!("{p}.mlp.shared_experts.down_proj.weight"))?, compute_kind);
+                    let shared_gate_scale = weights_gpu.get(&format!("{p}.mlp.shared_experts.gate_proj.weight_scale_inv"));
+                    let shared_up_scale = weights_gpu.get(&format!("{p}.mlp.shared_experts.up_proj.weight_scale_inv"));
+                    let shared_down_scale = weights_gpu.get(&format!("{p}.mlp.shared_experts.down_proj.weight_scale_inv"));
+
+                    // Build expert weight arrays from CPU-offloaded weights
+                    let p_str = format!("{p}.mlp.experts.");
+                    let mut egw: Vec<&Tensor> = Vec::new();
+                    let mut euw: Vec<&Tensor> = Vec::new();
+                    let mut edw: Vec<&Tensor> = Vec::new();
+                    let mut egs: Vec<Option<&Tensor>> = Vec::new();
+                    let mut eus: Vec<Option<&Tensor>> = Vec::new();
+                    let mut eds: Vec<Option<&Tensor>> = Vec::new();
+                    for &global_e in &ep_shard.local_expert_indices {
+                        let eg = format!("{p_str}{global_e}");
+                        egw.push(expert_weights_cpu.get(&format!("{eg}.gate_proj.weight")).unwrap());
+                        euw.push(expert_weights_cpu.get(&format!("{eg}.up_proj.weight")).unwrap());
+                        edw.push(expert_weights_cpu.get(&format!("{eg}.down_proj.weight")).unwrap());
+                        egs.push(expert_weights_cpu.get(&format!("{eg}.gate_proj.weight_scale_inv")));
+                        eus.push(expert_weights_cpu.get(&format!("{eg}.up_proj.weight_scale_inv")));
+                        eds.push(expert_weights_cpu.get(&format!("{eg}.down_proj.weight_scale_inv")));
+                    }
+
+                    let partial_mlp = rustrain_deepseek_v4::fp8_kernel::glm5_layer_forward_cpp(
+                        &hidden,
+                        &attn_norm, &post_norm,
+                        &lora_attn.q_a_proj, &lora_attn.q_a_layernorm, &lora_attn.q_b_proj,
+                        &lora_attn.kv_a_proj_with_mqa, &lora_attn.kv_a_layernorm, &lora_attn.kv_b_proj,
+                        &lora_attn.o_proj,
+                        lora_attn.q_a_proj_scale.as_ref(), lora_attn.q_b_proj_scale.as_ref(),
+                        lora_attn.kv_a_proj_scale.as_ref(), lora_attn.kv_b_proj_scale.as_ref(),
+                        lora_attn.o_proj_scale.as_ref(),
+                        lora_attn.indexer_wq_b.as_ref(), lora_attn.indexer_wk.as_ref(),
+                        lora_attn.indexer_k_norm_weight.as_ref(), lora_attn.indexer_k_norm_bias.as_ref(),
+                        lora_attn.indexer_weights_proj.as_ref(),
+                        lora_attn.indexer_wq_b_scale.as_ref(), lora_attn.indexer_wk_scale.as_ref(),
+                        Some(&gate),
+                        Some(&shared_gate), Some(&shared_up), Some(&shared_down),
+                        shared_gate_scale, shared_up_scale, shared_down_scale,
+                        None, None, None, None, None, None, // dense weights (MoE)
+                        &egw, &euw, &edw, &egs, &eus, &eds,
+                        &ep_shard.local_expert_indices,
+                        hidden.size()[0] as i32, hidden.size()[1] as i32,
+                        runtime_config.num_attention_heads as i32,
+                        runtime_config.qk_nope_head_dim as i32,
+                        runtime_config.qk_rope_head_dim as i32,
+                        runtime_config.v_head_dim as i32,
+                        runtime_config.kv_lora_rank as i32,
+                        runtime_config.index_head_dim as i32,
+                        runtime_config.index_n_heads as i32,
+                        runtime_config.index_topk as i32,
+                        layer as i32, is_full_layer, true,
+                        runtime_config.n_routed_experts as i32,
+                        runtime_config.num_experts_per_tok as i32,
+                        runtime_config.rms_norm_eps,
+                        runtime_config.rope_theta,
+                        runtime_config.rope_interleave,
+                        runtime_config.routed_scaling_factor,
+                        local_rank as i32,
+                        &mut cpp_layer_state,
+                    )?;
+
+                    // All-reduce MoE output
+                    let mlp_kind = partial_mlp.kind();
+                    hidden = if world_size > 1 {
+                        let pd = no_grad(|| partial_mlp.shallow_clone()).detach();
+                        let reduced = nccl_comm.as_ref().unwrap().all_reduce(&pd)?;
+                        let full = no_grad(|| (&reduced / (world_size as f64)).to_kind(mlp_kind)).detach();
+                        full.set_requires_grad(true)
+                    } else {
+                        partial_mlp.shallow_clone()
+                    };
+                } else {
+                    // ── Dense layer ──
+                    let gate_w = keep_fp8(tensor(&weights_gpu, &format!("{p}.mlp.gate_proj.weight"))?, compute_kind);
+                    let up_w = keep_fp8(tensor(&weights_gpu, &format!("{p}.mlp.up_proj.weight"))?, compute_kind);
+                    let down_w = keep_fp8(tensor(&weights_gpu, &format!("{p}.mlp.down_proj.weight"))?, compute_kind);
+                    let gate_scale = weights_gpu.get(&format!("{p}.mlp.gate_proj.weight_scale_inv"));
+                    let up_scale = weights_gpu.get(&format!("{p}.mlp.up_proj.weight_scale_inv"));
+                    let down_scale = weights_gpu.get(&format!("{p}.mlp.down_proj.weight_scale_inv"));
+
+                    hidden = rustrain_deepseek_v4::fp8_kernel::glm5_layer_forward_cpp(
+                        &hidden,
+                        &attn_norm, &post_norm,
+                        &lora_attn.q_a_proj, &lora_attn.q_a_layernorm, &lora_attn.q_b_proj,
+                        &lora_attn.kv_a_proj_with_mqa, &lora_attn.kv_a_layernorm, &lora_attn.kv_b_proj,
+                        &lora_attn.o_proj,
+                        lora_attn.q_a_proj_scale.as_ref(), lora_attn.q_b_proj_scale.as_ref(),
+                        lora_attn.kv_a_proj_scale.as_ref(), lora_attn.kv_b_proj_scale.as_ref(),
+                        lora_attn.o_proj_scale.as_ref(),
+                        lora_attn.indexer_wq_b.as_ref(), lora_attn.indexer_wk.as_ref(),
+                        lora_attn.indexer_k_norm_weight.as_ref(), lora_attn.indexer_k_norm_bias.as_ref(),
+                        lora_attn.indexer_weights_proj.as_ref(),
+                        lora_attn.indexer_wq_b_scale.as_ref(), lora_attn.indexer_wk_scale.as_ref(),
+                        None, None, None, None, None, None, None, // MoE weights (none for dense)
+                        Some(&gate_w), Some(&up_w), Some(&down_w),
+                        gate_scale, up_scale, down_scale,
+                        &[], &[], &[], &[], &[], &[], // expert weights (none)
+                        &[],
+                        hidden.size()[0] as i32, hidden.size()[1] as i32,
+                        runtime_config.num_attention_heads as i32,
+                        runtime_config.qk_nope_head_dim as i32,
+                        runtime_config.qk_rope_head_dim as i32,
+                        runtime_config.v_head_dim as i32,
+                        runtime_config.kv_lora_rank as i32,
+                        runtime_config.index_head_dim as i32,
+                        runtime_config.index_n_heads as i32,
+                        runtime_config.index_topk as i32,
+                        layer as i32, is_full_layer, false,
+                        runtime_config.n_routed_experts as i32,
+                        runtime_config.num_experts_per_tok as i32,
+                        runtime_config.rms_norm_eps,
+                        runtime_config.rope_theta,
+                        runtime_config.rope_interleave,
+                        runtime_config.routed_scaling_factor,
+                        local_rank as i32,
+                        &mut cpp_layer_state,
+                    )?;
+                }
+
+                if hidden.kind() != compute_kind {
+                    hidden = hidden.to_kind(compute_kind);
+                }
+                continue; // Skip the old Rust path below
+            }
+
+            // ── Rust fallback path (when C++ kernel not available) ──
             // ── Attention ──
             let attn_norm = tensor(&weights_gpu, &format!("{p}.input_layernorm.weight"))?
                 .to_kind(compute_kind);
-            let hidden_norm = rms_norm(&hidden, &attn_norm, runtime_config.rms_norm_eps);
+            let hidden_norm = if use_cpp_attention {
+                rustrain_deepseek_v4::fp8_kernel::glm5_rms_norm_cpp(&hidden, &attn_norm, runtime_config.rms_norm_eps)?
+            } else {
+                rms_norm(&hidden, &attn_norm, runtime_config.rms_norm_eps)
+            };
 
             // Load attention weights
             let attn_weights = Glm5AttentionWeights::load_with_kind(&weights_gpu, layer, compute_kind)?;
@@ -410,10 +594,52 @@ pub fn train_glm5_lora_sft_ep(
             let is_full_layer = !runtime_config.should_skip_topk(layer)
                 && (index_share_state.is_none() || layer % (runtime_config.index_topk_freq as usize) == 0);
 
-            // Checkpoint ALL layers (including "full") via Arc<Mutex> interior mutability.
-            // The Mutex lets the Fn closure mutate index_share_state safely.
-            // Forward runs in no_grad → computes state. Backward recomputes (idempotent).
-            let attn_out = if use_checkpointing {
+            // ── C++ attention path: coarse-grained, one FFI call per layer ──
+            // Rust path: fine-grained, ~30 tch-rs calls per layer (with checkpoint)
+            let attn_out = if use_cpp_attention {
+                // C++ path — no checkpointing needed (C++ manages intermediates on stack)
+                // Convert Rust IndexShareState to C++ Glm5IndexState
+                let mut cpp_state = rustrain_deepseek_v4::fp8_kernel::Glm5IndexState::default();
+                if let Some(ref s) = index_share_state {
+                    // Rust state → C++ state: pass topk_indices/idx_bias_keys as at::Tensor*
+                    // For now, C++ recomputes — we pass null state and let C++ compute fresh
+                    // TODO: share state between Rust and C++ (needs at::Tensor* ↔ tch::Tensor conversion)
+                }
+                let result = rustrain_deepseek_v4::fp8_kernel::glm5_dsa_attention_cpp(
+                    &hidden_norm,
+                    &lora_attn.q_a_proj, &lora_attn.q_a_layernorm, &lora_attn.q_b_proj,
+                    &lora_attn.kv_a_proj_with_mqa, &lora_attn.kv_a_layernorm, &lora_attn.kv_b_proj,
+                    &lora_attn.o_proj,
+                    lora_attn.q_a_proj_scale.as_ref(), lora_attn.q_b_proj_scale.as_ref(),
+                    lora_attn.kv_a_proj_scale.as_ref(), lora_attn.kv_b_proj_scale.as_ref(),
+                    lora_attn.o_proj_scale.as_ref(),
+                    lora_attn.indexer_wq_b.as_ref(), lora_attn.indexer_wk.as_ref(),
+                    lora_attn.indexer_k_norm_weight.as_ref(), lora_attn.indexer_k_norm_bias.as_ref(),
+                    lora_attn.indexer_weights_proj.as_ref(),
+                    lora_attn.indexer_wq_b_scale.as_ref(), lora_attn.indexer_wk_scale.as_ref(),
+                    hidden.size()[0] as i32, hidden.size()[1] as i32,
+                    runtime_config.num_attention_heads as i32,
+                    runtime_config.qk_nope_head_dim as i32,
+                    runtime_config.qk_rope_head_dim as i32,
+                    runtime_config.v_head_dim as i32,
+                    runtime_config.kv_lora_rank as i32,
+                    runtime_config.index_head_dim as i32,
+                    runtime_config.index_n_heads as i32,
+                    runtime_config.index_topk as i32,
+                    layer as i32, is_full_layer,
+                    runtime_config.rms_norm_eps,
+                    runtime_config.rope_theta,
+                    runtime_config.rope_interleave,
+                    local_rank as i32,
+                    &mut cpp_state,
+                )?;
+                // C++ state is internal — for now, reset Rust state (C++ recomputes each full layer)
+                if is_full_layer {
+                    index_share_state = None;
+                }
+                result
+            } else if use_checkpointing {
+                // Rust path with checkpointing
                 let state_mutex = Arc::new(Mutex::new(index_share_state.take()));
                 let state_for_closure = state_mutex.clone();
                 let attn_clone = lora_attn.clone();
@@ -450,37 +676,84 @@ pub fn train_glm5_lora_sft_ep(
             // ── MoE / Dense MLP ──
             let post_norm = tensor(&weights_gpu, &format!("{p}.post_attention_layernorm.weight"))?
                 .to_kind(compute_kind);
-            let mlp_input = rms_norm(&residual, &post_norm, runtime_config.rms_norm_eps);
+            let mlp_input = if use_cpp_attention {
+                rustrain_deepseek_v4::fp8_kernel::glm5_rms_norm_cpp(&residual, &post_norm, runtime_config.rms_norm_eps)?
+            } else {
+                rms_norm(&residual, &post_norm, runtime_config.rms_norm_eps)
+            };
 
             if runtime_config.is_moe_layer(layer) {
-                // MoE with EP — inline implementation (not glm5_moe_mlp which assumes all experts local)
-                let gate = tensor(&weights_gpu, &format!("{p}.mlp.gate.weight"))?
-                    .to_kind(compute_kind);
+                // MoE with EP
+                let gate = tensor(&weights_gpu, &format!("{p}.mlp.gate.weight"))?.to_kind(compute_kind);
                 let shared_gate = keep_fp8(tensor(&weights_gpu, &format!("{p}.mlp.shared_experts.gate_proj.weight"))?, compute_kind);
                 let shared_up = keep_fp8(tensor(&weights_gpu, &format!("{p}.mlp.shared_experts.up_proj.weight"))?, compute_kind);
                 let shared_down = keep_fp8(tensor(&weights_gpu, &format!("{p}.mlp.shared_experts.down_proj.weight"))?, compute_kind);
+                let shared_gate_scale = weights_gpu.get(&format!("{p}.mlp.shared_experts.gate_proj.weight_scale_inv"));
+                let shared_up_scale = weights_gpu.get(&format!("{p}.mlp.shared_experts.up_proj.weight_scale_inv"));
+                let shared_down_scale = weights_gpu.get(&format!("{p}.mlp.shared_experts.down_proj.weight_scale_inv"));
 
-            // Shared expert (replicated across all ranks)
-            let shared_gate_scale = weights_gpu.get(&format!("{p}.mlp.shared_experts.gate_proj.weight_scale_inv"));
-            let shared_up_scale = weights_gpu.get(&format!("{p}.mlp.shared_experts.up_proj.weight_scale_inv"));
-            let shared_down_scale = weights_gpu.get(&format!("{p}.mlp.shared_experts.down_proj.weight_scale_inv"));
-            // Shared expert (replicated across all ranks) — checkpointed
-            let shared_output = if use_checkpointing {
-                let sg = shared_gate.shallow_clone();
-                let su = shared_up.shallow_clone();
-                let sd = shared_down.shallow_clone();
-                let sgs = shared_gate_scale.map(|t| t.shallow_clone());
-                let sus = shared_up_scale.map(|t| t.shallow_clone());
-                let sds = shared_down_scale.map(|t| t.shallow_clone());
-                rustrain_deepseek_v4::fp8_kernel::checkpoint(&mlp_input, move |input| {
-                    glm5_mlp_fp8(input, &sg, &su, &sd, sgs.as_ref(), sus.as_ref(), sds.as_ref())
-                })
-            } else {
-                glm5_mlp_fp8(
-                    &mlp_input, &shared_gate, &shared_up, &shared_down,
-                    shared_gate_scale, shared_up_scale, shared_down_scale,
-                )
-            };
+                if use_cpp_mlp {
+                    // ── C++ MoE: one FFI call for routing + dispatch + shared + combine ──
+                    // Build expert weight arrays from CPU-offloaded weights
+                    let p_str = format!("{p}.mlp.experts.");
+                    let mut egw: Vec<&Tensor> = Vec::new();
+                    let mut euw: Vec<&Tensor> = Vec::new();
+                    let mut edw: Vec<&Tensor> = Vec::new();
+                    let mut egs: Vec<Option<&Tensor>> = Vec::new();
+                    let mut eus: Vec<Option<&Tensor>> = Vec::new();
+                    let mut eds: Vec<Option<&Tensor>> = Vec::new();
+                    for &global_e in &ep_shard.local_expert_indices {
+                        let eg = format!("{p_str}{global_e}");
+                        egw.push(expert_weights_cpu.get(&format!("{eg}.gate_proj.weight")).unwrap());
+                        euw.push(expert_weights_cpu.get(&format!("{eg}.up_proj.weight")).unwrap());
+                        edw.push(expert_weights_cpu.get(&format!("{eg}.down_proj.weight")).unwrap());
+                        egs.push(expert_weights_cpu.get(&format!("{eg}.gate_proj.weight_scale_inv")));
+                        eus.push(expert_weights_cpu.get(&format!("{eg}.up_proj.weight_scale_inv")));
+                        eds.push(expert_weights_cpu.get(&format!("{eg}.down_proj.weight_scale_inv")));
+                    }
+                    let partial_mlp = rustrain_deepseek_v4::fp8_kernel::glm5_moe_layer_cpp(
+                        &mlp_input,
+                        &shared_gate, &shared_up, &shared_down,
+                        shared_gate_scale, shared_up_scale, shared_down_scale,
+                        &gate,
+                        &egw, &euw, &edw,
+                        &egs, &eus, &eds,
+                        &ep_shard.local_expert_indices,
+                        runtime_config.n_routed_experts as i32,
+                        runtime_config.num_experts_per_tok as i32,
+                        runtime_config.routed_scaling_factor,
+                        local_rank as i32,
+                    )?;
+
+                    // All-reduce MoE output (shared expert counted world_size times → divide)
+                    let mlp_kind = partial_mlp.kind();
+                    let full_mlp = if world_size > 1 {
+                        let pd = no_grad(|| partial_mlp.shallow_clone()).detach();
+                        let reduced = nccl_comm.as_ref().unwrap().all_reduce(&pd)?;
+                        let full = no_grad(|| (&reduced / (world_size as f64)).to_kind(mlp_kind)).detach();
+                        full.set_requires_grad(true)
+                    } else {
+                        partial_mlp.shallow_clone()
+                    };
+                    hidden = &residual + &full_mlp;
+                } else {
+                // ── Rust MoE path (fallback) ──
+                let shared_output = if use_checkpointing {
+                    let sg = shared_gate.shallow_clone();
+                    let su = shared_up.shallow_clone();
+                    let sd = shared_down.shallow_clone();
+                    let sgs = shared_gate_scale.map(|t| t.shallow_clone());
+                    let sus = shared_up_scale.map(|t| t.shallow_clone());
+                    let sds = shared_down_scale.map(|t| t.shallow_clone());
+                    rustrain_deepseek_v4::fp8_kernel::checkpoint(&mlp_input, move |input| {
+                        glm5_mlp_fp8(input, &sg, &su, &sd, sgs.as_ref(), sus.as_ref(), sds.as_ref())
+                    })
+                } else {
+                    glm5_mlp_fp8(
+                        &mlp_input, &shared_gate, &shared_up, &shared_down,
+                        shared_gate_scale, shared_up_scale, shared_down_scale,
+                    )
+                };
 
                 // Router logits — computed over ALL experts
                 let router_logits = mlp_input.linear::<&Tensor>(&gate, None);
@@ -514,16 +787,46 @@ pub fn train_glm5_lora_sft_ep(
                         continue;
                     }
                     let eg = format!("{p}.mlp.experts.{global_e}");
-                    let gate_w = keep_fp8(tensor(&weights_gpu, &format!("{eg}.gate_proj.weight"))?, compute_kind);
-                    let up_w = keep_fp8(tensor(&weights_gpu, &format!("{eg}.up_proj.weight"))?, compute_kind);
-                    let down_w = keep_fp8(tensor(&weights_gpu, &format!("{eg}.down_proj.weight"))?, compute_kind);
-                    let gate_w_scale = weights_gpu.get(&format!("{eg}.gate_proj.weight_scale_inv"));
-                    let up_w_scale = weights_gpu.get(&format!("{eg}.up_proj.weight_scale_inv"));
-                    let down_w_scale = weights_gpu.get(&format!("{eg}.down_proj.weight_scale_inv"));
-                    let expert_out = glm5_mlp_fp8(
-                        &flat_input, &gate_w, &up_w, &down_w,
-                        gate_w_scale, up_w_scale, down_w_scale,
-                    );
+                    // Expert offloading: prefetch weights from CPU to GPU on demand.
+                    // Only ~1-3 experts needed per layer; rest stay on CPU (saves ~87 GB).
+                    let gate_w_cpu = expert_weights_cpu
+                        .get(&format!("{eg}.gate_proj.weight"))
+                        .with_context(|| format!("expert weight not found: {eg}.gate_proj.weight"))?;
+                    let gate_w_gpu = gate_w_cpu.to_device(device);
+                    let gate_w = keep_fp8(&gate_w_gpu, compute_kind);
+
+                    let up_w_cpu = expert_weights_cpu
+                        .get(&format!("{eg}.up_proj.weight"))
+                        .with_context(|| format!("expert weight not found: {eg}.up_proj.weight"))?;
+                    let up_w_gpu = up_w_cpu.to_device(device);
+                    let up_w = keep_fp8(&up_w_gpu, compute_kind);
+
+                    let down_w_cpu = expert_weights_cpu
+                        .get(&format!("{eg}.down_proj.weight"))
+                        .with_context(|| format!("expert weight not found: {eg}.down_proj.weight"))?;
+                    let down_w_gpu = down_w_cpu.to_device(device);
+                    let down_w = keep_fp8(&down_w_gpu, compute_kind);
+
+                    let gate_w_scale = expert_weights_cpu
+                        .get(&format!("{eg}.gate_proj.weight_scale_inv"))
+                        .map(|t| t.to_device(device));
+                    let up_w_scale = expert_weights_cpu
+                        .get(&format!("{eg}.up_proj.weight_scale_inv"))
+                        .map(|t| t.to_device(device));
+                    let down_w_scale = expert_weights_cpu
+                        .get(&format!("{eg}.down_proj.weight_scale_inv"))
+                        .map(|t| t.to_device(device));
+                    let expert_out = if use_cpp_mlp {
+                        rustrain_deepseek_v4::fp8_kernel::glm5_mlp_fp8_cpp(
+                            &flat_input, &gate_w, &up_w, &down_w,
+                            gate_w_scale.as_ref(), up_w_scale.as_ref(), down_w_scale.as_ref(),
+                        )?
+                    } else {
+                        glm5_mlp_fp8(
+                            &flat_input, &gate_w, &up_w, &down_w,
+                            gate_w_scale.as_ref(), up_w_scale.as_ref(), down_w_scale.as_ref(),
+                        )
+                    };
                     // Find which position (0..k) this expert was selected at, and use that weight
                     // For simplicity, sum contributions from all k positions
                     let weight = tk_weights.narrow(-1, 0, 1).unsqueeze(-1); // simplified: use first position
@@ -550,6 +853,7 @@ pub fn train_glm5_lora_sft_ep(
                 };
 
                 hidden = &residual + &full_mlp;
+                } // end Rust MoE fallback
             } else {
                 // Dense MLP — checkpointed to save intermediate activations
                 let gate = keep_fp8(tensor(&weights_gpu, &format!("{p}.mlp.gate_proj.weight"))?, compute_kind);
@@ -559,7 +863,12 @@ pub fn train_glm5_lora_sft_ep(
                 let up_scale = weights_gpu.get(&format!("{p}.mlp.up_proj.weight_scale_inv")).map(|t| t.shallow_clone());
                 let down_scale = weights_gpu.get(&format!("{p}.mlp.down_proj.weight_scale_inv")).map(|t| t.shallow_clone());
 
-                let mlp = if use_checkpointing {
+                let mlp = if use_cpp_mlp {
+                    rustrain_deepseek_v4::fp8_kernel::glm5_mlp_fp8_cpp(
+                        &mlp_input, &gate, &up, &down,
+                        gate_scale.as_ref(), up_scale.as_ref(), down_scale.as_ref(),
+                    )?
+                } else if use_checkpointing {
                     rustrain_deepseek_v4::fp8_kernel::checkpoint(&mlp_input, move |input| {
                         glm5_mlp_fp8(input, &gate, &up, &down, gate_scale.as_ref(), up_scale.as_ref(), down_scale.as_ref())
                     })
@@ -576,35 +885,50 @@ pub fn train_glm5_lora_sft_ep(
 
         // ── Final norm + lm_head ──
         let final_norm = tensor(&weights_gpu, "model.norm.weight")?.to_kind(compute_kind);
-        let normed = rms_norm(&hidden, &final_norm, runtime_config.rms_norm_eps);
+        let normed = if use_cpp_attention {
+            rustrain_deepseek_v4::fp8_kernel::glm5_rms_norm_cpp(&hidden, &final_norm, runtime_config.rms_norm_eps)?
+        } else {
+            rms_norm(&hidden, &final_norm, runtime_config.rms_norm_eps)
+        };
         let lm_head = if runtime_config.tie_word_embeddings {
             embed.shallow_clone()
         } else {
             tensor(&weights_gpu, "lm_head.weight")?.to_kind(compute_kind)
         };
-        let logits = normed.linear::<&Tensor>(&lm_head, None);
 
-        // ── SFT Loss ──
-        let shifted_logits = logits.narrow(1, 0, logits.size()[1] - 1);
-        let shifted_targets = train_batch
-            .input_ids
-            .narrow(1, 1, train_batch.input_ids.size()[1] - 1);
-        let shifted_mask = train_batch
-            .target_mask
-            .narrow(1, 1, train_batch.target_mask.size()[1] - 1)
-            .to_kind(Kind::Float);
-        let batch_size = shifted_logits.size()[0];
-        let seq_len = shifted_logits.size()[1];
+        // ── Chunked SFT Loss ──
+        let seq_len = train_batch.input_ids.size()[1];
+        let vocab = runtime_config.vocab_size;
 
-        let log_probs = shifted_logits
-            .reshape([-1, runtime_config.vocab_size])
-            .log_softmax(-1, Kind::Float);
-        let per_token_loss = log_probs
-            .g_nll_loss::<&Tensor>(&shifted_targets.reshape([-1]), None, Reduction::None, -100)
-            .reshape([batch_size, seq_len]);
-        let masked_loss = &per_token_loss * &shifted_mask;
-        let total_mask = shifted_mask.sum(Kind::Float);
-        let loss = masked_loss.sum(Kind::Float) / total_mask.clamp_min(1.0);
+        let loss = if use_cpp_loss {
+            // C++ cross-entropy loss (single call, chunked internally)
+            rustrain_deepseek_v4::fp8_kernel::glm5_cross_entropy_loss_cpp(
+                &normed, &lm_head, &train_batch.input_ids, &train_batch.target_mask,
+                seq_len as i32, vocab as i32, 256, local_rank as i32,
+            )?
+        } else {
+            // Rust chunked cross-entropy loss
+            let shifted_targets = train_batch.input_ids.narrow(1, 1, seq_len - 1);
+            let shifted_mask = train_batch.target_mask.narrow(1, 1, seq_len - 1).to_kind(Kind::Float);
+            let total_mask = shifted_mask.sum(Kind::Float);
+            let ce_chunk_size = 256;
+            let mut loss_acc = Tensor::zeros([], (Kind::Float, device));
+            for start in (0..seq_len - 1).step_by(ce_chunk_size as usize) {
+                let end = (start + ce_chunk_size as i64).min(seq_len - 1);
+                let chunk_len = end - start;
+                let normed_chunk = normed.narrow(1, start, chunk_len);
+                let logits_chunk = normed_chunk.linear::<&Tensor>(&lm_head, None);
+                let log_probs = logits_chunk.reshape([-1, vocab]).log_softmax(-1, Kind::Float);
+                let targets_chunk = shifted_targets.narrow(1, start, chunk_len).reshape([-1]);
+                let mask_chunk = shifted_mask.narrow(1, start, chunk_len);
+                let per_token_loss = log_probs
+                    .g_nll_loss::<&Tensor>(&targets_chunk, None, Reduction::None, -100)
+                    .reshape([1, chunk_len]);
+                let masked = &per_token_loss * &mask_chunk;
+                loss_acc = loss_acc + masked.sum(Kind::Float);
+            }
+            loss_acc / total_mask.clamp_min(1.0)
+        };
 
         let loss_val = loss.double_value(&[]);
         if step == 0 {
@@ -623,6 +947,15 @@ pub fn train_glm5_lora_sft_ep(
 
         // Free checkpoint closures (they hold GPU tensor references)
         rustrain_deepseek_v4::fp8_kernel::clear_checkpoint_registry();
+
+        // ── Warmup: empty cache after first step ──
+        // Step 0 populates the caching allocator's pool. Emptying the free pool
+        // here releases intermediate tensors while keeping the cached blocks.
+        // Steps 1+ will reuse these pre-warmed blocks → no cudaMalloc overhead.
+        if step == 0 {
+            rustrain_deepseek_v4::fp8_kernel::empty_cache();
+            info!(rank, "cache warmed up after step 0, emptied free pool");
+        }
 
         // ── LoRA gradient all-reduce ──
         let synced_grads: Vec<Tensor> = if world_size > 1 {
@@ -648,25 +981,44 @@ pub fn train_glm5_lora_sft_ep(
 
         // ── Adam optimizer step ──
         let mut current_vars = registry.var_store.trainable_variables();
-        for (i, var) in current_vars.iter_mut().enumerate() {
-            let grad = if world_size > 1 {
-                synced_grads[i].shallow_clone()
-            } else {
-                var.grad()
-            };
-            if grad.defined() {
-                let g = grad.to_kind(Kind::Float);
-                let m = &mut adam_m[i];
-                let v = &mut adam_v[i];
-                *m = m.shallow_clone() * beta1 + &(&g * (1.0 - beta1));
-                *v = v.shallow_clone() * beta2 + &(&g * &g * (1.0 - beta2));
-                let sn = (step + 1) as f64;
-                let mh = m.shallow_clone() / (1.0 - beta1.powf(sn));
-                let vh = v.shallow_clone() / (1.0 - beta2.powf(sn));
-                let update = &mh / (vh.sqrt() + eps);
-                let _ = no_grad(|| var.f_add_(&(update * (-lr))));
+        if use_cpp_optimizer {
+            // C++ Adam: build grad array, call v4_adam_step
+            let grads: Vec<Tensor> = current_vars.iter().enumerate().map(|(i, _var)| {
+                if world_size > 1 {
+                    synced_grads[i].shallow_clone()
+                } else {
+                    current_vars[i].grad()
+                }
+            }).collect();
+            rustrain_deepseek_v4::fp8_kernel::adam_step_cpp(
+                &mut current_vars, &grads, &mut adam_m, &mut adam_v,
+                lr, beta1, beta2, eps, step as i32,
+            );
+            for var in current_vars.iter_mut() {
+                var.zero_grad();
             }
-            var.zero_grad();
+        } else {
+            // Rust Adam
+            for (i, var) in current_vars.iter_mut().enumerate() {
+                let grad = if world_size > 1 {
+                    synced_grads[i].shallow_clone()
+                } else {
+                    var.grad()
+                };
+                if grad.defined() {
+                    let g = grad.to_kind(Kind::Float);
+                    let m = &mut adam_m[i];
+                    let v = &mut adam_v[i];
+                    *m = m.shallow_clone() * beta1 + &(&g * (1.0 - beta1));
+                    *v = v.shallow_clone() * beta2 + &(&g * &g * (1.0 - beta2));
+                    let sn = (step + 1) as f64;
+                    let mh = m.shallow_clone() / (1.0 - beta1.powf(sn));
+                    let vh = v.shallow_clone() / (1.0 - beta2.powf(sn));
+                    let update = &mh / (vh.sqrt() + eps);
+                    let _ = no_grad(|| var.f_add_(&(update * (-lr))));
+                }
+                var.zero_grad();
+            }
         }
     }
 

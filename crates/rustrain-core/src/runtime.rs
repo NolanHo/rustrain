@@ -535,7 +535,9 @@ pub fn validate_config(config: &Config) -> Result<()> {
                 && parallel.data_parallel_size == 1)
             && !((is_v4_ep_rank || is_v3_ep_rank || is_v4_ep_train || is_v4_lora_sft_ep || is_glm5_lora_sft_ep)
                 && name == "expert_model_parallel_size"
-                && parallel.tensor_model_parallel_size == 1
+                && parallel.data_parallel_size == 1)
+            && !(is_glm5_lora_sft_ep
+                && (name == "tensor_model_parallel_size" || name == "context_parallel_size")
                 && parallel.data_parallel_size == 1)
             && !(is_v4_tp_ep_train
                 && (name == "tensor_model_parallel_size" || name == "expert_model_parallel_size")

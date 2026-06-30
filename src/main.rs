@@ -511,6 +511,19 @@ fn dispatch_train(config_path: &Path, resume_from: Option<PathBuf>) -> Result<()
     }
 
     if is_tch && arch == "glm5_lora_sft_ep" {
+        // Check if TP or CP is requested
+        let tp_size = config.parallel.tensor_model_parallel_size;
+        let cp_size = config.parallel.context_parallel_size;
+        if tp_size > 1 || cp_size > 1 {
+            let summary = rustrain_glm5::session_tp_cp::train_glm5_lora_sft_tp_cp_ep(&config, &run_paths)?;
+            println!("rustrain GLM-5.2 LoRA SFT TP+CP+EP complete");
+            println!("run_dir: {}", run_paths.root.display());
+            println!("adapter_checkpoint: {}", summary.adapter_output);
+            println!("initial_loss: {:.9}", summary.initial_loss);
+            println!("final_loss: {:.9}", summary.final_loss);
+            println!("trainable_params: {}", summary.trainable_params);
+            return Ok(());
+        }
         let summary = rustrain_glm5::session_ep::train_glm5_lora_sft_ep(&config, &run_paths)?;
         println!("rustrain GLM-5.2 LoRA SFT EP complete");
         println!("run_dir: {}", run_paths.root.display());

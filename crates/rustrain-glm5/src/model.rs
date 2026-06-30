@@ -15,7 +15,7 @@ use rustrain_core::runtime::{Config, RunPaths};
 /// Keep FP8 tensors as-is; convert other dtypes to `kind`.
 /// This prevents `.to_kind(BFloat16)` from destroying FP8 weights
 /// that need to stay FP8 for `_scaled_mm`.
-trait KeepIfFp8 {
+pub trait KeepIfFp8 {
     fn keep_if_fp8(&self, kind: Kind) -> Tensor;
 }
 
@@ -318,7 +318,7 @@ pub fn rms_norm(input: &Tensor, weight: &Tensor, eps: f64) -> Tensor {
 }
 
 /// RMSNorm with bias (indexer k_norm uses weight + bias)
-fn rms_norm_with_bias(input: &Tensor, weight: &Tensor, bias: &Tensor, eps: f64) -> Tensor {
+pub fn rms_norm_with_bias(input: &Tensor, weight: &Tensor, bias: &Tensor, eps: f64) -> Tensor {
     let dtype = input.kind();
     let weight = weight.to_kind(dtype);
     let bias = bias.to_kind(dtype);
@@ -521,10 +521,12 @@ impl Glm5AttentionWeights {
 // ── DSA Indexer State (for IndexShare) ───────────────────────────
 
 pub struct IndexShareState {
-    /// Sparse mask: [batch, num_heads, seq, seq] — which KV positions to attend to
-    pub sparse_mask: Tensor,
-    /// Indexer bias: [batch, num_heads, seq, seq] — additive bias to attention scores
-    pub idx_bias: Tensor,
+    /// Top-k indices: [batch, num_heads, seq, topk] int64 — which KV positions to attend to.
+    /// Compact representation: O(S × topk) instead of O(S²) for sparse_mask.
+    pub topk_indices: Tensor,
+    /// Per-key bias: [batch, idx_n_heads, seq] — NOT expanded to S×S (saves O(S²) memory).
+    /// Expanded lazily during attention bias construction.
+    pub idx_bias_keys: Tensor,
     /// Which layer produced this state
     pub source_layer: usize,
 }
@@ -532,19 +534,9 @@ pub struct IndexShareState {
 impl Clone for IndexShareState {
     fn clone(&self) -> Self {
         Self {
-            sparse_mask: self.sparse_mask.shallow_clone(),
-            idx_bias: self.idx_bias.shallow_clone(),
+            topk_indices: self.topk_indices.shallow_clone(),
+            idx_bias_keys: self.idx_bias_keys.shallow_clone(),
             source_layer: self.source_layer,
-        }
-    }
-}
-
-impl IndexShareState {
-    pub fn empty(batch: i64, num_heads: i64, seq: i64, device: Device, kind: Kind) -> Self {
-        Self {
-            sparse_mask: Tensor::zeros([batch, num_heads, seq, seq], (kind, device)),
-            idx_bias: Tensor::zeros([batch, num_heads, seq, seq], (kind, device)),
-            source_layer: 0,
         }
     }
 }
@@ -655,50 +647,86 @@ pub fn glm5_dsa_attention(
             };
 
             let idx_scale = 1.0 / (idx_head_dim as f64).sqrt();
-            let idx_scores = idx_q_rotated.matmul(&idx_k_rotated.transpose(-2, -1)) * idx_scale;
-            // idx_scores: [batch, idx_n_heads, seq, seq]
-
-            // 4. Expand to num_heads if needed, then top-k selection
-            let idx_scores_expanded = if idx_n_heads != num_heads {
-                idx_scores
-                    .mean_dim([1].as_slice(), true, compute_kind)
-                    .expand([batch, num_heads, seq, seq], false)
-            } else {
-                idx_scores
-            };
-
             let actual_topk = idx_topk.min(seq as i64);
-            let (_, topk_indices) = idx_scores_expanded.topk(actual_topk, -1, true, true);
 
-            // 5. Sparse mask
-            let sparse_mask = {
-                let ones = Tensor::ones(
-                    [batch, num_heads, seq, actual_topk],
-                    (input.kind(), input.device()),
-                );
-                let mut mask = Tensor::zeros(
-                    [batch as i64, num_heads, seq as i64, seq as i64],
-                    (input.kind(), input.device()),
-                );
-                let _ = mask.scatter_(-1, &topk_indices, &ones);
-                // Note: topk_indices must be int64 for scatter_, don't convert to float
-                mask
+            // Chunked score computation: avoid materializing full [batch, heads, S, S] scores.
+            // Process K dimension in blocks, do local topk per block, merge to global topk.
+            // Memory: O(S × chunk_size) per block instead of O(S²).
+            let score_chunk = 512_i64;
+
+            let topk_indices = if seq <= score_chunk {
+                // Small seq: compute full scores directly (no chunking overhead)
+                let idx_scores = idx_q_rotated.matmul(&idx_k_rotated.transpose(-2, -1)) * idx_scale;
+                let idx_scores_expanded = if idx_n_heads != num_heads {
+                    idx_scores
+                        .mean_dim([1].as_slice(), true, compute_kind)
+                        .expand([batch, num_heads, seq, seq], false)
+                } else {
+                    idx_scores
+                };
+                let (_, indices) = idx_scores_expanded.topk(actual_topk, -1, true, true);
+                indices
+            } else {
+                // Chunked: process K dimension in blocks, iterative topk merge
+                let mut best_scores: Option<Tensor> = None;
+                let mut best_indices: Option<Tensor> = None;
+
+                for k_start in (0..seq).step_by(score_chunk as usize) {
+                    let k_end = (k_start + score_chunk).min(seq as i64);
+                    let k_len = k_end - k_start;
+
+                    let idx_k_chunk = idx_k_rotated.narrow(-2, k_start, k_len);
+                    let scores_chunk =
+                        idx_q_rotated.matmul(&idx_k_chunk.transpose(-2, -1)) * idx_scale;
+                    // scores_chunk: [batch, idx_n_heads, S, k_len]
+
+                    let scores_chunk = if idx_n_heads != num_heads {
+                        scores_chunk
+                            .mean_dim([1].as_slice(), true, compute_kind)
+                            .expand([batch, num_heads, seq, k_len], false)
+                    } else {
+                        scores_chunk
+                    };
+
+                    let local_topk = actual_topk.min(k_len);
+                    let (local_scores, local_indices) =
+                        scores_chunk.topk(local_topk, -1, true, true);
+                    // Offset indices by k_start
+                    let offset = Tensor::full(
+                        local_indices.size(),
+                        k_start as f64,
+                        (local_indices.kind(), local_indices.device()),
+                    );
+                    let local_indices = &local_indices.to_kind(Kind::Float) + &offset;
+
+                    match (&best_scores, &best_indices) {
+                        (Some(bs), Some(bi)) => {
+                            let merged = Tensor::cat(&[bs, &local_scores], -1);
+                            let merged_idx = Tensor::cat(&[bi, &local_indices.to_kind(Kind::Int64)], -1);
+                            let (s, pos) = merged.topk(actual_topk, -1, true, true);
+                            best_scores = Some(s);
+                            best_indices = Some(merged_idx.gather(-1, &pos, false));
+                        }
+                        _ => {
+                            best_scores = Some(local_scores);
+                            best_indices = Some(local_indices.to_kind(Kind::Int64));
+                        }
+                    }
+                }
+                best_indices.unwrap()
             };
 
-            // 6. Indexer bias: weights_proj [idx_n_heads, hidden] → per-head key bias
-            //    hidden @ weights_proj^T → [batch, seq, idx_n_heads] → [batch, idx_n_heads, 1, seq]
-            let idx_bias = glm5_safe_linear(input, &weights_proj, None);
-            let idx_bias = idx_bias
+            // Indexer bias: weights_proj [idx_n_heads, hidden] → per-head key bias.
+            // Store as [batch, idx_n_heads, seq] — NOT expanded to S×S (saves O(S²) persistent memory).
+            let idx_bias_keys = glm5_safe_linear(input, &weights_proj, None);
+            let idx_bias_keys = idx_bias_keys
                 .reshape([batch, seq, idx_n_heads])
-                .transpose(1, 2)  // [batch, idx_n_heads, seq]
-                .unsqueeze(2)     // [batch, idx_n_heads, 1, seq]
-                .expand([batch, idx_n_heads, seq, seq], false);
-            let idx_bias = idx_bias.to_kind(input.kind());
+                .transpose(1, 2); // [batch, idx_n_heads, seq]
 
-            // Save state for IndexShare
+            // Save compact state for IndexShare (topk_indices + idx_bias_keys, no S×S tensors)
             *index_share_state = Some(IndexShareState {
-                sparse_mask: sparse_mask.to_kind(input.kind()),
-                idx_bias,
+                topk_indices,
+                idx_bias_keys,
                 source_layer: layer,
             });
         }
@@ -707,41 +735,147 @@ pub fn glm5_dsa_attention(
         *index_share_state = None;
     }
 
-    // ── Flash Attention via SDPA (no S×S materialization) ──
+    // ── Flash Attention via SDPA ──
     let context = if let Some(state) = index_share_state {
-        // Sparse DSA: build additive bias from precomputed sparse mask + idx_bias
-        let causal_mask =
-            Tensor::ones([seq as i64, seq as i64], (Kind::Bool, input.device())).triu(1);
-        let causal_f = causal_mask
-            .unsqueeze(0)
-            .unsqueeze(0)
-            .expand([batch as i64, num_heads, seq as i64, seq as i64], false)
-            .to_kind(input.kind());
-        let combined = &state.sparse_mask * &causal_f;
+        // DSA sparse attention with chunked bias construction.
+        // Two optimizations vs. original:
+        // 1. drop() early release — frees O(S²) intermediates immediately after use,
+        //    reducing peak from 5 simultaneous tensors to 2.
+        // 2. Query-dim chunking — for large seq, builds [B,H,C,S] bias per chunk
+        //    instead of [B,H,S,S]. Peak: O(C×S) instead of O(S²).
+        //
+        // Combined effect at S=8192, C=512:
+        //   Old: 5 × 64 × 8192² × 2B = 40 GB  →  New: 2 × 64 × 512 × 8192 × 2B = 1 GB
 
-        // Expand idx_bias to num_heads if index_n_heads != num_heads
-        let idx_bias = if state.idx_bias.size()[1] != num_heads as i64 {
-            state.idx_bias
+        let actual_topk = state.topk_indices.size()[state.topk_indices.size().len() - 1];
+
+        // Pre-compute per-key bias [B, num_heads, S] (shared across all query positions).
+        // This is O(S) and reused for every chunk — NOT expanded to S×S.
+        let bias_per_key = if idx_n_heads != num_heads {
+            state
+                .idx_bias_keys
                 .mean_dim([1].as_slice(), true, input.kind())
-                .expand([batch as i64, num_heads, seq as i64, seq as i64], false)
+                .expand([batch as i64, num_heads, seq as i64], false)
         } else {
-            state.idx_bias.shallow_clone()
+            state.idx_bias_keys.shallow_clone()
+        };
+
+        // Chunk size: 512 query positions per chunk.
+        // At S=8192: 16 chunks × [B,H,512,S] = 16 × 1 GB, but only 2 simultaneous.
+        let attn_chunk: i64 = if seq > 2048 { 512 } else { seq as i64 };
+
+        if attn_chunk >= seq as i64 {
+            // ── Small seq (≤2048): single pass with early drop ──
+            let sparse_mask = {
+                let mut m = Tensor::zeros(
+                    [batch as i64, num_heads, seq as i64, seq as i64],
+                    (input.kind(), input.device()),
+                );
+                let ones = Tensor::ones(
+                    [batch as i64, num_heads, seq as i64, actual_topk],
+                    (input.kind(), input.device()),
+                );
+                let _ = m.scatter_(-1, &state.topk_indices, &ones);
+                m
+            };
+            let causal_f = {
+                let cm = Tensor::ones(
+                    [seq as i64, seq as i64],
+                    (Kind::Bool, input.device()),
+                )
+                .triu(1);
+                cm.unsqueeze(0)
+                    .unsqueeze(0)
+                    .expand([batch as i64, num_heads, seq as i64, seq as i64], false)
+                    .to_kind(input.kind())
+            };
+
+            // Combine sparse + causal, then free intermediates (5→3→2)
+            let combined = &sparse_mask * (1.0 - &causal_f);
+            drop(sparse_mask);
+            drop(causal_f);
+
+            let bias = bias_per_key
+                .unsqueeze(2) // [B, H, 1, S]
+                .expand([batch as i64, num_heads, seq as i64, seq as i64], false)
+                .to_kind(input.kind());
+            let bias = &bias + (&combined - 1.0) * f64::NEG_INFINITY;
+            drop(combined);
+
+            Tensor::scaled_dot_product_attention(
+                &q_full, &k_full, &v,
+                Some(&bias),
+                0.0, false, Some(attn_scale), false,
+            )
+        } else {
+            // ── Large seq (>2048): chunked attention ──
+            // Process query dim in chunks of C=512. Each chunk builds [B,H,C,S]
+            // bias instead of [B,H,S,S]. Peak: 2×B×H×C×S×2B.
+            let n_chunks = (seq as i64 + attn_chunk - 1) / attn_chunk;
+            let mut outputs: Vec<Tensor> = Vec::with_capacity(n_chunks as usize);
+
+            for q_start in (0..seq as i64).step_by(attn_chunk as usize) {
+                let q_end = (q_start + attn_chunk).min(seq as i64);
+                let q_len = q_end - q_start;
+                let q_chunk = q_full.narrow(2, q_start, q_len);
+
+                // 1. Sparse mask for this chunk: [B, H, q_len, S]
+                let sparse_mask = {
+                    let chunk_topk = state.topk_indices.narrow(2, q_start, q_len);
+                    let mut m = Tensor::zeros(
+                        [batch as i64, num_heads, q_len, seq as i64],
+                        (input.kind(), input.device()),
+                    );
+                    let ones = Tensor::ones(
+                        [batch as i64, num_heads, q_len, actual_topk],
+                        (input.kind(), input.device()),
+                    );
+                    let _ = m.scatter_(-1, &chunk_topk, &ones);
+                    m
+                };
+
+                // 2. Causal mask: key j is masked if j > q_start + i (query pos)
+                let causal_f = {
+                    let q_pos =
+                        (Tensor::arange(q_len, (Kind::Int64, input.device())) + q_start)
+                            .to_kind(input.kind());
+                    let k_pos = Tensor::arange(seq as i64, (Kind::Int64, input.device()))
+                        .to_kind(input.kind());
+                    // cm[i, j] = true if j > q_start + i (causal: mask future keys)
+                    let diff = k_pos.unsqueeze(0) - q_pos.unsqueeze(1); // [q_len, S]
+                    let cm = diff.gt(0.0); // bool tensor
+                    cm.unsqueeze(0)
+                        .unsqueeze(0)
+                        .expand([batch as i64, num_heads, q_len, seq as i64], false)
+                        .to_kind(input.kind())
+                };
+
+                // 3. Combine, then drop intermediates (3→2→1)
+                let combined = &sparse_mask * (1.0 - &causal_f);
+                drop(sparse_mask);
+                drop(causal_f);
+
+                // 4. Bias = idx_bias where valid, -inf where masked
+                let bias = bias_per_key
+                    .unsqueeze(2) // [B, H, 1, S]
+                    .expand([batch as i64, num_heads, q_len, seq as i64], false)
+                    .to_kind(input.kind());
+                let bias = &bias + (&combined - 1.0) * f64::NEG_INFINITY;
+                drop(combined);
+
+                // 5. SDPA for this chunk: Q[C,d] × K[S,d] → out[C,d]
+                let chunk_out = Tensor::scaled_dot_product_attention(
+                    &q_chunk, &k_full, &v,
+                    Some(&bias),
+                    0.0, false, Some(attn_scale), false,
+                );
+                drop(bias);
+                outputs.push(chunk_out);
+            }
+
+            let refs: Vec<&Tensor> = outputs.iter().collect();
+            Tensor::cat(&refs, 2)
         }
-        .to_kind(input.kind());
-
-        // Additive bias: idx_bias where valid, -inf where masked out
-        // combined > 0 → bias = idx_bias + 0
-        // combined = 0 → bias = idx_bias + (-inf) = -inf (masked)
-        let bias = &idx_bias + (&combined - 1.0) * f64::NEG_INFINITY;
-
-        Tensor::scaled_dot_product_attention(
-            &q_full, &k_full, &v,
-            Some(&bias),
-            0.0,           // dropout
-            false,         // is_causal (already in bias)
-            Some(attn_scale),
-            false,         // enable_gqa (K/V already expanded)
-        )
     } else {
         // Full causal: SDPA's built-in causal mask — fastest path
         Tensor::scaled_dot_product_attention::<&Tensor>(

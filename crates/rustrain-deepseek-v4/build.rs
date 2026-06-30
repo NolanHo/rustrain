@@ -11,6 +11,7 @@ fn main() {
     println!("cargo:rerun-if-env-changed=TORCH_INCLUDE_PATH");
     println!("cargo:rerun-if-env-changed=TORCH_LIB_PATH");
     println!("cargo:rerun-if-changed=kernels/fp8_gemm.cpp");
+    println!("cargo:rerun-if-changed=kernels/glm5_attention.cpp");
     println!("cargo:rerun-if-changed=build.rs");
 
     // Skip on non-CUDA builds or when torch isn't available
@@ -67,8 +68,10 @@ fn main() {
     };
 
     let out_dir = std::env::var("OUT_DIR").unwrap_or_else(|_| "target/debug".to_string());
-    let kernel_src = "kernels/fp8_gemm.cpp";
-    let output_lib = format!("{out_dir}/libfp8_gemm.so");
+
+    // ── Compile FP8 GEMM kernel ──
+    let fp8_src = "kernels/fp8_gemm.cpp";
+    let fp8_lib = format!("{out_dir}/libfp8_gemm.so");
 
     println!("cargo:warning=Compiling FP8 GEMM kernel: include={torch_include} lib={torch_lib}");
 
@@ -114,8 +117,8 @@ fn main() {
             "-O2",
             cxx11_abi,
             "-o",
-            &output_lib,
-            kernel_src,
+            &fp8_lib,
+            fp8_src,
             &format!("-I{torch_include}"),
             &format!("-I{torch_include}/ATen"),
             &format!("-I{torch_include}/c10"),
@@ -135,6 +138,7 @@ fn main() {
             "-ltorch_cuda",
             "-ltorch_cpu",
             "-lc10",
+            "-lc10_cuda",
         ])
         .status();
 
@@ -144,6 +148,7 @@ fn main() {
             println!("cargo:rustc-link-search=native={out_dir}");
             println!("cargo:rustc-link-lib=dylib=fp8_gemm");
             println!("cargo:rustc-link-lib=dylib=c10");
+            println!("cargo:rustc-link-lib=dylib=c10_cuda");
             println!("cargo:rustc-link-lib=dylib=torch");
             println!("cargo:rustc-link-lib=dylib=torch_cpu");
             println!("cargo:rustc-link-lib=dylib=torch_cuda");
@@ -155,6 +160,43 @@ fn main() {
         }
         _ => {
             println!("cargo:warning=Failed to compile FP8 GEMM kernel, FP8 path disabled");
+        }
+    }
+
+    // ── Compile GLM5 attention kernel ──
+    let glm5_src = "kernels/glm5_attention.cpp";
+    let glm5_lib = format!("{out_dir}/libglm5_attention.so");
+
+    println!("cargo:warning=Compiling GLM5 attention kernel: src={glm5_src}");
+
+    let rpath_arg = format!("-Wl,-rpath,{torch_lib}");
+    let l_arg = format!("-L{torch_lib}");
+    let inc_aten = format!("-I{torch_include}/ATen");
+    let inc_c10 = format!("-I{torch_include}/c10");
+    let inc_caffe2 = format!("-I{torch_include}/caffe2");
+    let inc_torch = format!("-I{torch_include}");
+    let inc_cuda = format!("-I{cuda_inc}");
+
+    let glm5_status = Command::new("g++")
+        .args([
+            "-shared", "-fPIC", "-std=c++17", "-O2",
+            cxx11_abi,
+            "-o", &glm5_lib,
+            glm5_src,
+            &inc_torch, &inc_aten, &inc_c10, &inc_caffe2, &inc_cuda,
+            &l_arg, &rpath_arg,
+            "-Wl,--no-as-needed",
+            "-ltorch", "-ltorch_cuda", "-ltorch_cpu", "-lc10", "-lc10_cuda",
+        ])
+        .args(if cuda_inc2.is_empty() { vec![] } else { vec![format!("-I{cuda_inc2}")] })
+        .status();
+
+    match glm5_status {
+        Ok(s) if s.success() => {
+            println!("cargo:rustc-link-lib=dylib=glm5_attention");
+        }
+        _ => {
+            println!("cargo:warning=Failed to compile GLM5 attention kernel, C++ attention disabled");
         }
     }
 }

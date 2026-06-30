@@ -50,6 +50,207 @@ unsafe extern "C" {
 
     /// Helper: create at::Tensor* from raw TensorImpl* (increments refcount)
     fn v4_make_at_tensor(impl_ptr: *mut std::ffi::c_void) -> *mut std::ffi::c_void;
+
+    /// Set the fraction of GPU memory the caching allocator may use.
+    fn v4_set_memory_fraction(fraction: f64, device_id: i32);
+
+    /// Empty the caching allocator's free pool (release cached blocks to CUDA).
+    fn v4_empty_cache();
+}
+
+// ── GLM5 attention kernel (libglm5_attention.so) ──
+
+unsafe extern "C" {
+    /// Full DSA attention in one C++ call. See glm5_attention.cpp.
+    /// Returns at::Tensor* (owned by caller, free with v4_glm5_free_at_tensor).
+    fn v4_glm5_dsa_attention(
+        input_ptr: *mut std::ffi::c_void,
+        q_a_proj: *mut std::ffi::c_void,
+        q_a_layernorm: *mut std::ffi::c_void,
+        q_b_proj: *mut std::ffi::c_void,
+        kv_a_proj: *mut std::ffi::c_void,
+        kv_a_layernorm: *mut std::ffi::c_void,
+        kv_b_proj: *mut std::ffi::c_void,
+        o_proj: *mut std::ffi::c_void,
+        // FP8 scales (nullable)
+        q_a_scale: *mut std::ffi::c_void,
+        q_b_scale: *mut std::ffi::c_void,
+        kv_a_scale: *mut std::ffi::c_void,
+        kv_b_scale: *mut std::ffi::c_void,
+        o_scale: *mut std::ffi::c_void,
+        // Indexer weights (nullable)
+        idx_wq_b: *mut std::ffi::c_void,
+        idx_wk: *mut std::ffi::c_void,
+        idx_k_norm_w: *mut std::ffi::c_void,
+        idx_k_norm_b: *mut std::ffi::c_void,
+        idx_weights_proj: *mut std::ffi::c_void,
+        idx_wq_b_scale: *mut std::ffi::c_void,
+        idx_wk_scale: *mut std::ffi::c_void,
+        // Config
+        batch_i: std::ffi::c_int,
+        seq_i: std::ffi::c_int,
+        num_heads_i: std::ffi::c_int,
+        qk_nope_i: std::ffi::c_int,
+        qk_rope_i: std::ffi::c_int,
+        v_head_i: std::ffi::c_int,
+        kv_lora_i: std::ffi::c_int,
+        idx_head_dim_i: std::ffi::c_int,
+        idx_n_heads_i: std::ffi::c_int,
+        idx_topk_i: std::ffi::c_int,
+        layer_i: std::ffi::c_int,
+        is_full_layer: std::ffi::c_int,
+        rms_eps: f64,
+        rope_theta: f64,
+        rope_interleave: std::ffi::c_int,
+        device_id: std::ffi::c_int,
+        // IndexShare state (in/out)
+        topk_indices_ptr: *mut *mut std::ffi::c_void,
+        idx_bias_keys_ptr: *mut *mut std::ffi::c_void,
+        source_layer: *mut std::ffi::c_int,
+    ) -> *mut std::ffi::c_void;
+
+    fn v4_glm5_free_at_tensor(tensor_ptr: *mut std::ffi::c_void);
+
+    fn v4_glm5_mlp_fp8(
+        input_ptr: *mut std::ffi::c_void,
+        gate_ptr: *mut std::ffi::c_void,
+        up_ptr: *mut std::ffi::c_void,
+        down_ptr: *mut std::ffi::c_void,
+        gate_scale_ptr: *mut std::ffi::c_void,
+        up_scale_ptr: *mut std::ffi::c_void,
+        down_scale_ptr: *mut std::ffi::c_void,
+    ) -> *mut std::ffi::c_void;
+
+    fn v4_glm5_rms_norm(
+        input_ptr: *mut std::ffi::c_void,
+        weight_ptr: *mut std::ffi::c_void,
+        eps: f64,
+    ) -> *mut std::ffi::c_void;
+
+    fn v4_glm5_cross_entropy_loss(
+        hidden_ptr: *mut std::ffi::c_void,
+        lm_head_ptr: *mut std::ffi::c_void,
+        targets_ptr: *mut std::ffi::c_void,
+        mask_ptr: *mut std::ffi::c_void,
+        seq_len: std::ffi::c_int,
+        vocab: std::ffi::c_int,
+        chunk_size: std::ffi::c_int,
+        device_id: std::ffi::c_int,
+    ) -> *mut std::ffi::c_void;
+
+    fn v4_adam_step(
+        params: *mut *mut std::ffi::c_void,
+        grads: *mut *mut std::ffi::c_void,
+        m_state: *mut *mut std::ffi::c_void,
+        v_state: *mut *mut std::ffi::c_void,
+        n_params: std::ffi::c_int,
+        lr: f64,
+        beta1: f64,
+        beta2: f64,
+        eps: f64,
+        step: std::ffi::c_int,
+    );
+
+    fn v4_glm5_moe_layer(
+        mlp_input_ptr: *mut std::ffi::c_void,
+        shared_gate: *mut std::ffi::c_void,
+        shared_up: *mut std::ffi::c_void,
+        shared_down: *mut std::ffi::c_void,
+        shared_gate_scale: *mut std::ffi::c_void,
+        shared_up_scale: *mut std::ffi::c_void,
+        shared_down_scale: *mut std::ffi::c_void,
+        gate_weight: *mut std::ffi::c_void,
+        expert_gate_weights: *mut *mut std::ffi::c_void,
+        expert_up_weights: *mut *mut std::ffi::c_void,
+        expert_down_weights: *mut *mut std::ffi::c_void,
+        expert_gate_scales: *mut *mut std::ffi::c_void,
+        expert_up_scales: *mut *mut std::ffi::c_void,
+        expert_down_scales: *mut *mut std::ffi::c_void,
+        n_local_experts: std::ffi::c_int,
+        local_expert_indices: *const std::ffi::c_int,
+        n_routed_experts: std::ffi::c_int,
+        topk: std::ffi::c_int,
+        routed_scaling_factor: f64,
+        device_id: std::ffi::c_int,
+    ) -> *mut std::ffi::c_void;
+
+    fn v4_glm5_embedding(
+        embed_weight_ptr: *mut std::ffi::c_void,
+        input_ids_ptr: *mut std::ffi::c_void,
+        device_id: std::ffi::c_int,
+    ) -> *mut std::ffi::c_void;
+
+    fn v4_glm5_layer_forward(
+        hidden_ptr: *mut std::ffi::c_void,
+        input_norm_weight: *mut std::ffi::c_void,
+        post_norm_weight: *mut std::ffi::c_void,
+        // Attention weights
+        q_a_proj: *mut std::ffi::c_void,
+        q_a_layernorm: *mut std::ffi::c_void,
+        q_b_proj: *mut std::ffi::c_void,
+        kv_a_proj: *mut std::ffi::c_void,
+        kv_a_layernorm: *mut std::ffi::c_void,
+        kv_b_proj: *mut std::ffi::c_void,
+        o_proj: *mut std::ffi::c_void,
+        q_a_scale: *mut std::ffi::c_void,
+        q_b_scale: *mut std::ffi::c_void,
+        kv_a_scale: *mut std::ffi::c_void,
+        kv_b_scale: *mut std::ffi::c_void,
+        o_scale: *mut std::ffi::c_void,
+        idx_wq_b: *mut std::ffi::c_void,
+        idx_wk: *mut std::ffi::c_void,
+        idx_k_norm_w: *mut std::ffi::c_void,
+        idx_k_norm_b: *mut std::ffi::c_void,
+        idx_weights_proj: *mut std::ffi::c_void,
+        idx_wq_b_scale: *mut std::ffi::c_void,
+        idx_wk_scale: *mut std::ffi::c_void,
+        // MLP/MoE
+        gate_weight: *mut std::ffi::c_void,
+        shared_gate: *mut std::ffi::c_void,
+        shared_up: *mut std::ffi::c_void,
+        shared_down: *mut std::ffi::c_void,
+        shared_gate_scale: *mut std::ffi::c_void,
+        shared_up_scale: *mut std::ffi::c_void,
+        shared_down_scale: *mut std::ffi::c_void,
+        dense_gate: *mut std::ffi::c_void,
+        dense_up: *mut std::ffi::c_void,
+        dense_down: *mut std::ffi::c_void,
+        dense_gate_scale: *mut std::ffi::c_void,
+        dense_up_scale: *mut std::ffi::c_void,
+        dense_down_scale: *mut std::ffi::c_void,
+        expert_gate_weights: *mut *mut std::ffi::c_void,
+        expert_up_weights: *mut *mut std::ffi::c_void,
+        expert_down_weights: *mut *mut std::ffi::c_void,
+        expert_gate_scales: *mut *mut std::ffi::c_void,
+        expert_up_scales: *mut *mut std::ffi::c_void,
+        expert_down_scales: *mut *mut std::ffi::c_void,
+        n_local_experts: std::ffi::c_int,
+        local_expert_indices: *const std::ffi::c_int,
+        // Config
+        batch: std::ffi::c_int,
+        seq: std::ffi::c_int,
+        num_heads: std::ffi::c_int,
+        qk_nope: std::ffi::c_int,
+        qk_rope: std::ffi::c_int,
+        v_head: std::ffi::c_int,
+        kv_lora: std::ffi::c_int,
+        idx_head_dim: std::ffi::c_int,
+        idx_n_heads: std::ffi::c_int,
+        idx_topk: std::ffi::c_int,
+        layer: std::ffi::c_int,
+        is_full_layer: std::ffi::c_int,
+        is_moe_layer: std::ffi::c_int,
+        n_routed_experts: std::ffi::c_int,
+        topk: std::ffi::c_int,
+        rms_eps: f64,
+        rope_theta: f64,
+        rope_interleave: std::ffi::c_int,
+        routed_scaling_factor: f64,
+        device_id: std::ffi::c_int,
+        topk_indices_ptr: *mut *mut std::ffi::c_void,
+        idx_bias_keys_ptr: *mut *mut std::ffi::c_void,
+        source_layer: *mut std::ffi::c_int,
+    ) -> *mut std::ffi::c_void;
 }
 
 pub fn is_fp8_kernel_available() -> bool {
@@ -464,4 +665,336 @@ where
 pub fn clear_checkpoint_registry() {
     registry().lock().unwrap().clear();
     CHECKPOINT_COUNTER.store(1, Ordering::SeqCst);
+}
+
+/// Set the fraction of GPU memory the caching allocator is allowed to use.
+/// Call early (before any training allocations) to pre-expand the pool.
+pub fn set_memory_fraction(fraction: f64, device_id: i32) {
+    unsafe { v4_set_memory_fraction(fraction, device_id) };
+}
+
+/// Empty the caching allocator's free pool (release cached blocks back to CUDA).
+/// Call after warmup pass so that step 0 starts with a clean but pre-warmed pool.
+pub fn empty_cache() {
+    unsafe { v4_empty_cache() };
+}
+
+// ── GLM5 attention C++ kernel wrapper ──
+
+/// Check if the C++ GLM5 attention kernel is available.
+pub fn is_glm5_attention_available() -> bool {
+    // If libglm5_attention.so was linked, v4_glm5_dsa_attention is non-null.
+    let ptr = v4_glm5_dsa_attention as *const ();
+    !ptr.is_null()
+}
+
+/// C++ IndexShare state — raw pointers to at::Tensor*, managed by C++.
+/// Must be freed via `drop_glm5_index_state()` before going out of scope.
+#[derive(Default)]
+pub struct Glm5IndexState {
+    pub topk_indices: *mut std::ffi::c_void,  // at::Tensor* or null
+    pub idx_bias_keys: *mut std::ffi::c_void, // at::Tensor* or null
+    pub source_layer: i32,
+}
+
+impl Glm5IndexState {
+    pub fn is_none(&self) -> bool {
+        self.topk_indices.is_null()
+    }
+}
+
+impl Drop for Glm5IndexState {
+    fn drop(&mut self) {
+        // Free at::Tensor* created by C++ to prevent memory leak
+        if !self.topk_indices.is_null() {
+            unsafe { v4_glm5_free_at_tensor(self.topk_indices) };
+            self.topk_indices = std::ptr::null_mut();
+        }
+        if !self.idx_bias_keys.is_null() {
+            unsafe { v4_glm5_free_at_tensor(self.idx_bias_keys) };
+            self.idx_bias_keys = std::ptr::null_mut();
+        }
+    }
+}
+
+/// Call the C++ GLM5 DSA attention kernel.
+///
+/// Returns the attention output tensor. The `index_state` is updated in-place
+/// (C++ writes new topk_indices/idx_bias_keys into it when `is_full_layer` is true).
+///
+/// All weight tensors are passed as `&Tensor` — their raw `at::Tensor*` pointers
+/// are extracted via `as_ptr()` and passed directly to C++.
+pub fn glm5_dsa_attention_cpp(
+    input: &Tensor,
+    // Attention weights
+    q_a_proj: &Tensor, q_a_layernorm: &Tensor, q_b_proj: &Tensor,
+    kv_a_proj: &Tensor, kv_a_layernorm: &Tensor, kv_b_proj: &Tensor,
+    o_proj: &Tensor,
+    // FP8 scales (optional — pass empty tensor if not used)
+    q_a_scale: Option<&Tensor>, q_b_scale: Option<&Tensor>,
+    kv_a_scale: Option<&Tensor>, kv_b_scale: Option<&Tensor>, o_scale: Option<&Tensor>,
+    // Indexer weights (optional)
+    idx_wq_b: Option<&Tensor>, idx_wk: Option<&Tensor>,
+    idx_k_norm_w: Option<&Tensor>, idx_k_norm_b: Option<&Tensor>,
+    idx_weights_proj: Option<&Tensor>,
+    idx_wq_b_scale: Option<&Tensor>, idx_wk_scale: Option<&Tensor>,
+    // Config
+    batch: i32, seq: i32, num_heads: i32, qk_nope: i32, qk_rope: i32,
+    v_head: i32, kv_lora: i32, idx_head_dim: i32, idx_n_heads: i32,
+    idx_topk: i32, layer: i32, is_full_layer: bool,
+    rms_eps: f64, rope_theta: f64, rope_interleave: bool,
+    device_id: i32,
+    // IndexShare state (in/out)
+    index_state: &mut Glm5IndexState,
+) -> Result<Tensor> {
+    fn opt_ptr(t: Option<&Tensor>) -> *mut std::ffi::c_void {
+        match t {
+            Some(t) if t.numel() > 0 => t.as_ptr() as *mut _,
+            _ => std::ptr::null_mut(),
+        }
+    }
+
+    let result_ptr = unsafe {
+        v4_glm5_dsa_attention(
+            input.as_ptr() as *mut _,
+            q_a_proj.as_ptr() as *mut _,
+            q_a_layernorm.as_ptr() as *mut _,
+            q_b_proj.as_ptr() as *mut _,
+            kv_a_proj.as_ptr() as *mut _,
+            kv_a_layernorm.as_ptr() as *mut _,
+            kv_b_proj.as_ptr() as *mut _,
+            o_proj.as_ptr() as *mut _,
+            opt_ptr(q_a_scale), opt_ptr(q_b_scale),
+            opt_ptr(kv_a_scale), opt_ptr(kv_b_scale), opt_ptr(o_scale),
+            opt_ptr(idx_wq_b), opt_ptr(idx_wk),
+            opt_ptr(idx_k_norm_w), opt_ptr(idx_k_norm_b),
+            opt_ptr(idx_weights_proj),
+            opt_ptr(idx_wq_b_scale), opt_ptr(idx_wk_scale),
+            batch, seq, num_heads, qk_nope, qk_rope,
+            v_head, kv_lora, idx_head_dim, idx_n_heads,
+            idx_topk, layer, if is_full_layer { 1 } else { 0 },
+            rms_eps, rope_theta, if rope_interleave { 1 } else { 0 },
+            device_id,
+            &mut index_state.topk_indices,
+            &mut index_state.idx_bias_keys,
+            &mut index_state.source_layer,
+        )
+    };
+
+    if result_ptr.is_null() {
+        bail!("C++ v4_glm5_dsa_attention returned null");
+    }
+
+    let tensor = unsafe { Tensor::clone_from_ptr(result_ptr as *mut _) };
+    unsafe { v4_glm5_free_at_tensor(result_ptr) };
+    Ok(tensor)
+}
+
+/// Call the C++ GLM5 MLP kernel (SwiGLU: silu(gate(x)) * up(x) → down).
+pub fn glm5_mlp_fp8_cpp(
+    input: &Tensor,
+    gate: &Tensor, up: &Tensor, down: &Tensor,
+    gate_scale: Option<&Tensor>, up_scale: Option<&Tensor>, down_scale: Option<&Tensor>,
+) -> Result<Tensor> {
+    fn opt_ptr(t: Option<&Tensor>) -> *mut std::ffi::c_void {
+        match t {
+            Some(t) if t.numel() > 0 => t.as_ptr() as *mut _,
+            _ => std::ptr::null_mut(),
+        }
+    }
+    let result_ptr = unsafe {
+        v4_glm5_mlp_fp8(
+            input.as_ptr() as *mut _,
+            gate.as_ptr() as *mut _,
+            up.as_ptr() as *mut _,
+            down.as_ptr() as *mut _,
+            opt_ptr(gate_scale), opt_ptr(up_scale), opt_ptr(down_scale),
+        )
+    };
+    if result_ptr.is_null() { bail!("C++ v4_glm5_mlp_fp8 returned null"); }
+    let tensor = unsafe { Tensor::clone_from_ptr(result_ptr as *mut _) };
+    unsafe { v4_glm5_free_at_tensor(result_ptr) };
+    Ok(tensor)
+}
+
+/// Call the C++ RMSNorm kernel.
+pub fn glm5_rms_norm_cpp(input: &Tensor, weight: &Tensor, eps: f64) -> Result<Tensor> {
+    let result_ptr = unsafe {
+        v4_glm5_rms_norm(input.as_ptr() as *mut _, weight.as_ptr() as *mut _, eps)
+    };
+    if result_ptr.is_null() { bail!("C++ v4_glm5_rms_norm returned null"); }
+    let tensor = unsafe { Tensor::clone_from_ptr(result_ptr as *mut _) };
+    unsafe { v4_glm5_free_at_tensor(result_ptr) };
+    Ok(tensor)
+}
+
+/// Call the C++ chunked cross-entropy loss kernel.
+pub fn glm5_cross_entropy_loss_cpp(
+    hidden: &Tensor, lm_head: &Tensor, targets: &Tensor, mask: &Tensor,
+    seq_len: i32, vocab: i32, chunk_size: i32, device_id: i32,
+) -> Result<Tensor> {
+    let result_ptr = unsafe {
+        v4_glm5_cross_entropy_loss(
+            hidden.as_ptr() as *mut _, lm_head.as_ptr() as *mut _,
+            targets.as_ptr() as *mut _, mask.as_ptr() as *mut _,
+            seq_len, vocab, chunk_size, device_id,
+        )
+    };
+    if result_ptr.is_null() { bail!("C++ v4_glm5_cross_entropy_loss returned null"); }
+    let tensor = unsafe { Tensor::clone_from_ptr(result_ptr as *mut _) };
+    unsafe { v4_glm5_free_at_tensor(result_ptr) };
+    Ok(tensor)
+}
+
+/// Call the C++ Adam optimizer step. Updates params, m, v in-place.
+pub fn adam_step_cpp(
+    params: &mut [Tensor], grads: &[Tensor], m: &mut [Tensor], v: &mut [Tensor],
+    lr: f64, beta1: f64, beta2: f64, eps: f64, step: i32,
+) {
+    let n = params.len() as std::ffi::c_int;
+    // Build raw pointer arrays
+    let mut param_ptrs: Vec<*mut std::ffi::c_void> = params.iter().map(|t| t.as_ptr() as *mut _).collect();
+    let mut grad_ptrs: Vec<*mut std::ffi::c_void> = grads.iter().map(|t| t.as_ptr() as *mut _).collect();
+    let mut m_ptrs: Vec<*mut std::ffi::c_void> = m.iter().map(|t| t.as_ptr() as *mut _).collect();
+    let mut v_ptrs: Vec<*mut std::ffi::c_void> = v.iter().map(|t| t.as_ptr() as *mut _).collect();
+    unsafe {
+        v4_adam_step(
+            param_ptrs.as_mut_ptr(), grad_ptrs.as_mut_ptr(),
+            m_ptrs.as_mut_ptr(), v_ptrs.as_mut_ptr(),
+            n, lr, beta1, beta2, eps, step,
+        );
+    }
+}
+
+/// Call the C++ MoE layer kernel (routing + expert dispatch + shared expert + combine).
+/// Expert weights are CPU tensors — C++ does to_device internally.
+pub fn glm5_moe_layer_cpp(
+    mlp_input: &Tensor,
+    shared_gate: &Tensor, shared_up: &Tensor, shared_down: &Tensor,
+    shared_gate_scale: Option<&Tensor>, shared_up_scale: Option<&Tensor>, shared_down_scale: Option<&Tensor>,
+    gate_weight: &Tensor,
+    // Expert weights (CPU)
+    expert_gate_weights: &[&Tensor], expert_up_weights: &[&Tensor], expert_down_weights: &[&Tensor],
+    expert_gate_scales: &[Option<&Tensor>], expert_up_scales: &[Option<&Tensor>], expert_down_scales: &[Option<&Tensor>],
+    local_expert_indices: &[usize],
+    n_routed_experts: i32, topk: i32, routed_scaling_factor: f64,
+    device_id: i32,
+) -> Result<Tensor> {
+    fn opt_ptr(t: Option<&Tensor>) -> *mut std::ffi::c_void {
+        match t { Some(t) if t.numel() > 0 => t.as_ptr() as *mut _, _ => std::ptr::null_mut() }
+    }
+    let n = expert_gate_weights.len() as std::ffi::c_int;
+    let mut gate_ptrs: Vec<*mut std::ffi::c_void> = expert_gate_weights.iter().map(|t| t.as_ptr() as *mut _).collect();
+    let mut up_ptrs: Vec<*mut std::ffi::c_void> = expert_up_weights.iter().map(|t| t.as_ptr() as *mut _).collect();
+    let mut down_ptrs: Vec<*mut std::ffi::c_void> = expert_down_weights.iter().map(|t| t.as_ptr() as *mut _).collect();
+    let mut gs_ptrs: Vec<*mut std::ffi::c_void> = expert_gate_scales.iter().map(|t| opt_ptr(*t)).collect();
+    let mut us_ptrs: Vec<*mut std::ffi::c_void> = expert_up_scales.iter().map(|t| opt_ptr(*t)).collect();
+    let mut ds_ptrs: Vec<*mut std::ffi::c_void> = expert_down_scales.iter().map(|t| opt_ptr(*t)).collect();
+    let indices: Vec<std::ffi::c_int> = local_expert_indices.iter().map(|&i| i as std::ffi::c_int).collect();
+
+    let result_ptr = unsafe {
+        v4_glm5_moe_layer(
+            mlp_input.as_ptr() as *mut _,
+            shared_gate.as_ptr() as *mut _, shared_up.as_ptr() as *mut _, shared_down.as_ptr() as *mut _,
+            opt_ptr(shared_gate_scale), opt_ptr(shared_up_scale), opt_ptr(shared_down_scale),
+            gate_weight.as_ptr() as *mut _,
+            gate_ptrs.as_mut_ptr(), up_ptrs.as_mut_ptr(), down_ptrs.as_mut_ptr(),
+            gs_ptrs.as_mut_ptr(), us_ptrs.as_mut_ptr(), ds_ptrs.as_mut_ptr(),
+            n, indices.as_ptr(),
+            n_routed_experts, topk, routed_scaling_factor, device_id,
+        )
+    };
+    if result_ptr.is_null() { bail!("C++ v4_glm5_moe_layer returned null"); }
+    let tensor = unsafe { Tensor::clone_from_ptr(result_ptr as *mut _) };
+    unsafe { v4_glm5_free_at_tensor(result_ptr) };
+    Ok(tensor)
+}
+
+/// Call the C++ embedding lookup kernel.
+pub fn glm5_embedding_cpp(embed_weight: &Tensor, input_ids: &Tensor, device_id: i32) -> Result<Tensor> {
+    let result_ptr = unsafe {
+        v4_glm5_embedding(embed_weight.as_ptr() as *mut _, input_ids.as_ptr() as *mut _, device_id)
+    };
+    if result_ptr.is_null() { bail!("C++ v4_glm5_embedding returned null"); }
+    let tensor = unsafe { Tensor::clone_from_ptr(result_ptr as *mut _) };
+    unsafe { v4_glm5_free_at_tensor(result_ptr) };
+    Ok(tensor)
+}
+
+/// Call the C++ full layer forward kernel (RMSNorm + attention + residual + RMSNorm + MoE + residual).
+/// One FFI call per layer — all intermediates stay on C++ stack.
+pub fn glm5_layer_forward_cpp(
+    hidden: &Tensor,
+    input_norm_weight: &Tensor,
+    post_norm_weight: &Tensor,
+    // Attention weights
+    q_a_proj: &Tensor, q_a_layernorm: &Tensor, q_b_proj: &Tensor,
+    kv_a_proj: &Tensor, kv_a_layernorm: &Tensor, kv_b_proj: &Tensor, o_proj: &Tensor,
+    // FP8 scales
+    q_a_scale: Option<&Tensor>, q_b_scale: Option<&Tensor>,
+    kv_a_scale: Option<&Tensor>, kv_b_scale: Option<&Tensor>, o_scale: Option<&Tensor>,
+    // Indexer
+    idx_wq_b: Option<&Tensor>, idx_wk: Option<&Tensor>,
+    idx_k_norm_w: Option<&Tensor>, idx_k_norm_b: Option<&Tensor>,
+    idx_weights_proj: Option<&Tensor>,
+    idx_wq_b_scale: Option<&Tensor>, idx_wk_scale: Option<&Tensor>,
+    // MLP/MoE
+    gate_weight: Option<&Tensor>,
+    shared_gate: Option<&Tensor>, shared_up: Option<&Tensor>, shared_down: Option<&Tensor>,
+    shared_gate_scale: Option<&Tensor>, shared_up_scale: Option<&Tensor>, shared_down_scale: Option<&Tensor>,
+    dense_gate: Option<&Tensor>, dense_up: Option<&Tensor>, dense_down: Option<&Tensor>,
+    dense_gate_scale: Option<&Tensor>, dense_up_scale: Option<&Tensor>, dense_down_scale: Option<&Tensor>,
+    // Expert weights (CPU)
+    expert_gate_weights: &[&Tensor], expert_up_weights: &[&Tensor], expert_down_weights: &[&Tensor],
+    expert_gate_scales: &[Option<&Tensor>], expert_up_scales: &[Option<&Tensor>], expert_down_scales: &[Option<&Tensor>],
+    local_expert_indices: &[usize],
+    // Config
+    batch: i32, seq: i32, num_heads: i32, qk_nope: i32, qk_rope: i32,
+    v_head: i32, kv_lora: i32, idx_head_dim: i32, idx_n_heads: i32, idx_topk: i32,
+    layer: i32, is_full_layer: bool, is_moe_layer: bool, n_routed_experts: i32, topk: i32,
+    rms_eps: f64, rope_theta: f64, rope_interleave: bool, routed_scaling_factor: f64,
+    device_id: i32,
+    // IndexShare state
+    index_state: &mut Glm5IndexState,
+) -> Result<Tensor> {
+    fn opt_ptr(t: Option<&Tensor>) -> *mut std::ffi::c_void {
+        match t { Some(t) if t.numel() > 0 => t.as_ptr() as *mut _, _ => std::ptr::null_mut() }
+    }
+    let n = expert_gate_weights.len() as std::ffi::c_int;
+    let mut gate_ptrs: Vec<*mut std::ffi::c_void> = expert_gate_weights.iter().map(|t| t.as_ptr() as *mut _).collect();
+    let mut up_ptrs: Vec<*mut std::ffi::c_void> = expert_up_weights.iter().map(|t| t.as_ptr() as *mut _).collect();
+    let mut down_ptrs: Vec<*mut std::ffi::c_void> = expert_down_weights.iter().map(|t| t.as_ptr() as *mut _).collect();
+    let mut gs_ptrs: Vec<*mut std::ffi::c_void> = expert_gate_scales.iter().map(|t| opt_ptr(*t)).collect();
+    let mut us_ptrs: Vec<*mut std::ffi::c_void> = expert_up_scales.iter().map(|t| opt_ptr(*t)).collect();
+    let mut ds_ptrs: Vec<*mut std::ffi::c_void> = expert_down_scales.iter().map(|t| opt_ptr(*t)).collect();
+    let indices: Vec<std::ffi::c_int> = local_expert_indices.iter().map(|&i| i as std::ffi::c_int).collect();
+
+    let result_ptr = unsafe {
+        v4_glm5_layer_forward(
+            hidden.as_ptr() as *mut _,
+            input_norm_weight.as_ptr() as *mut _,
+            post_norm_weight.as_ptr() as *mut _,
+            q_a_proj.as_ptr() as *mut _, q_a_layernorm.as_ptr() as *mut _, q_b_proj.as_ptr() as *mut _,
+            kv_a_proj.as_ptr() as *mut _, kv_a_layernorm.as_ptr() as *mut _, kv_b_proj.as_ptr() as *mut _,
+            o_proj.as_ptr() as *mut _,
+            opt_ptr(q_a_scale), opt_ptr(q_b_scale), opt_ptr(kv_a_scale), opt_ptr(kv_b_scale), opt_ptr(o_scale),
+            opt_ptr(idx_wq_b), opt_ptr(idx_wk), opt_ptr(idx_k_norm_w), opt_ptr(idx_k_norm_b),
+            opt_ptr(idx_weights_proj), opt_ptr(idx_wq_b_scale), opt_ptr(idx_wk_scale),
+            opt_ptr(gate_weight), opt_ptr(shared_gate), opt_ptr(shared_up), opt_ptr(shared_down),
+            opt_ptr(shared_gate_scale), opt_ptr(shared_up_scale), opt_ptr(shared_down_scale),
+            opt_ptr(dense_gate), opt_ptr(dense_up), opt_ptr(dense_down),
+            opt_ptr(dense_gate_scale), opt_ptr(dense_up_scale), opt_ptr(dense_down_scale),
+            gate_ptrs.as_mut_ptr(), up_ptrs.as_mut_ptr(), down_ptrs.as_mut_ptr(),
+            gs_ptrs.as_mut_ptr(), us_ptrs.as_mut_ptr(), ds_ptrs.as_mut_ptr(),
+            n, indices.as_ptr(),
+            batch, seq, num_heads, qk_nope, qk_rope, v_head, kv_lora, idx_head_dim, idx_n_heads, idx_topk,
+            layer, if is_full_layer { 1 } else { 0 }, if is_moe_layer { 1 } else { 0 }, n_routed_experts, topk,
+            rms_eps, rope_theta, if rope_interleave { 1 } else { 0 }, routed_scaling_factor, device_id,
+            &mut index_state.topk_indices, &mut index_state.idx_bias_keys, &mut index_state.source_layer,
+        )
+    };
+    if result_ptr.is_null() { bail!("C++ v4_glm5_layer_forward returned null"); }
+    let tensor = unsafe { Tensor::clone_from_ptr(result_ptr as *mut _) };
+    unsafe { v4_glm5_free_at_tensor(result_ptr) };
+    Ok(tensor)
 }

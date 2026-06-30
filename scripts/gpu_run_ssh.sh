@@ -166,6 +166,9 @@ if [ -f "\$TORCH_LIB/libtorch_cuda.so" ]; then
   export LD_PRELOAD="\$TORCH_LIB/libtorch_cuda.so"
 fi
 
+# ── Caching allocator config (expandable segments reduce fragmentation) ──
+export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True,max_split_size_mb:512"
+
 # ── PYTHONPATH (for tch-rs build script) ──
 export PYTHONPATH="\$TORCH_SITE"
 

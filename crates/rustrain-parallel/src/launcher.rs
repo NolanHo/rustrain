@@ -107,6 +107,10 @@ pub fn launch_multi(
             .env("RUSTRAIN_LAUNCH_OUTPUT_DIR", output_dir)
             .env("NNODES", nnodes.to_string())
             .env("NODE_RANK", node_rank.to_string())
+            .env(
+                "PYTORCH_CUDA_ALLOC_CONF",
+                "expandable_segments:True,max_split_size_mb:512",
+            )
             .stdout(Stdio::from(log_file))
             .stderr(Stdio::from(err_file));
         if let Some(assigned_device) = visible_cuda_devices
