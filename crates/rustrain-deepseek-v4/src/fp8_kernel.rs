@@ -251,6 +251,8 @@ unsafe extern "C" {
         idx_bias_keys_ptr: *mut *mut std::ffi::c_void,
         source_layer: *mut std::ffi::c_int,
     ) -> *mut std::ffi::c_void;
+
+    fn v4_stream_wait_event(device_id: std::ffi::c_int, event_ptr: *mut std::ffi::c_void);
 }
 
 pub fn is_fp8_kernel_available() -> bool {
@@ -997,4 +999,12 @@ pub fn glm5_layer_forward_cpp(
     let tensor = unsafe { Tensor::clone_from_ptr(result_ptr as *mut _) };
     unsafe { v4_glm5_free_at_tensor(result_ptr) };
     Ok(tensor)
+}
+
+/// Make PyTorch's current CUDA stream wait for a CUDA event.
+/// This is GPU-side dependency — CPU is NOT blocked.
+/// Used for async pipeline: after all_reduce_async returns (output, event),
+/// call this before using the output tensor in the next compute.
+pub fn stream_wait_event(device_id: i32, event: &rustrain_nccl::nccl::CudaEventHandle) {
+    unsafe { v4_stream_wait_event(device_id, event.0) };
 }

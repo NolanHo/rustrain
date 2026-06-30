@@ -989,4 +989,19 @@ void* v4_glm5_layer_forward(
     }
 }
 
+// ══════════════════════════════════════════════════════════════════════
+// v4_stream_wait_event — make PyTorch's current CUDA stream wait for an event
+// This is the key for async overlap: CPU doesn't block, GPU handles the dependency.
+// ══════════════════════════════════════════════════════════════════════
+void v4_stream_wait_event(int device_id, void* event_ptr) {
+    try {
+        cudaSetDevice(device_id);
+        auto stream = c10::cuda::getCurrentCUDAStream(c10::cuda::current_device());
+        cudaEvent_t event = reinterpret_cast<cudaEvent_t>(event_ptr);
+        cudaStreamWaitEvent(stream.stream(), event, 0);
+    } catch (const std::exception& e) {
+        fprintf(stderr, "[v4_stream_wait_event] FAILED: %s\n", e.what());
+    }
+}
+
 } // extern "C"

@@ -415,6 +415,10 @@ pub fn train_glm5_lora_sft_ep(
         // C++ IndexShare state for layer_forward path (separate from Rust path)
         let mut cpp_layer_state = rustrain_deepseek_v4::fp8_kernel::Glm5IndexState::default();
 
+        // Async pipeline: (output_tensor, cuda_event) from previous layer's all-reduce.
+        // Next layer waits on event (GPU-side, no CPU block) before using output.
+        let mut pending_allreduce: Option<(Tensor, rustrain_nccl::nccl::CudaEventHandle)> = None;
+
         for layer in 0..n_layers {
             // Skip non-trainable layers — hidden passes through unchanged
             if !trainable_layers.contains(&layer) {
@@ -440,6 +444,12 @@ pub fn train_glm5_lora_sft_ep(
                     && (cpp_layer_state.is_none() || layer % (runtime_config.index_topk_freq as usize) == 0);
 
                 let is_moe = runtime_config.is_moe_layer(layer);
+
+                // ── Wait for previous layer's async all-reduce to complete (GPU-side, no CPU block) ──
+                if let Some((prev_output, prev_event)) = pending_allreduce.take() {
+                    rustrain_deepseek_v4::fp8_kernel::stream_wait_event(local_rank as i32, &prev_event);
+                    hidden = prev_output;
+                }
 
                 if is_moe {
                     // ── MoE layer ──
@@ -508,16 +518,19 @@ pub fn train_glm5_lora_sft_ep(
                         &mut cpp_layer_state,
                     )?;
 
-                    // All-reduce MoE output
+                    // All-reduce MoE output — ASYNC: launch on comm_stream, don't block CPU
                     let mlp_kind = partial_mlp.kind();
-                    hidden = if world_size > 1 {
+                    if world_size > 1 {
                         let pd = no_grad(|| partial_mlp.shallow_clone()).detach();
-                        let reduced = nccl_comm.as_ref().unwrap().all_reduce(&pd)?;
+                        let (reduced, event) = nccl_comm.as_ref().unwrap().all_reduce_async(&pd)?;
                         let full = no_grad(|| (&reduced / (world_size as f64)).to_kind(mlp_kind)).detach();
-                        full.set_requires_grad(true)
+                        let output = full.set_requires_grad(true);
+                        // Store (output, event) — next layer waits on event before using output.
+                        // hidden will be set from pending_allreduce at the start of next iteration.
+                        pending_allreduce = Some((output, event));
                     } else {
-                        partial_mlp.shallow_clone()
-                    };
+                        hidden = partial_mlp.shallow_clone();
+                    }
                 } else {
                     // ── Dense layer ──
                     let gate_w = keep_fp8(tensor(&weights_gpu, &format!("{p}.mlp.gate_proj.weight"))?, compute_kind);
@@ -881,6 +894,12 @@ pub fn train_glm5_lora_sft_ep(
             if hidden.kind() != compute_kind {
                 hidden = hidden.to_kind(compute_kind);
             }
+        }
+
+        // ── Drain pending async all-reduce before loss computation ──
+        if let Some((final_output, event)) = pending_allreduce.take() {
+            rustrain_deepseek_v4::fp8_kernel::stream_wait_event(local_rank as i32, &event);
+            hidden = final_output;
         }
 
         // ── Final norm + lm_head ──

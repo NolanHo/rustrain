@@ -699,7 +699,7 @@ pub struct NcclPersistentComm {
 }
 
 /// CUDA event for stream synchronization without global blocking.
-pub struct CudaEventHandle(CudaEvent);
+pub struct CudaEventHandle(pub CudaEvent);
 
 impl Drop for CudaEventHandle {
     fn drop(&mut self) {
