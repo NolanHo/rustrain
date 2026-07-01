@@ -390,7 +390,7 @@ pub fn train_glm5_lora_sft_ep(
     let use_checkpointing = true;
 
     // ── C++ kernel availability ──
-    let use_cpp_attention = rustrain_deepseek_v4::fp8_kernel::is_glm5_attention_available();
+    let use_cpp_attention = false; // Temporarily disabled to test Rust path with chat format
     if use_cpp_attention {
         info!(rank, "C++ GLM5 attention kernel available — using coarse-grained C++ path");
     } else {

@@ -27,9 +27,12 @@ pub struct Glm5SftDataset {
 
 impl Glm5SftDataset {
     pub fn synthetic(tokenizer: &tokenizers::Tokenizer) -> Result<Self> {
-        // Use GLM chat format for synthetic data too
+        // Use GLM-5.2 chat format
         let tok_user = 154827i64;
         let tok_assistant = 154828i64;
+        let reasoning_prefix_ids = tokenizer.encode("Reasoning Effort: Max\n", false)
+            .map_err(|e| anyhow::anyhow!("tokenizer failed: {e}"))?
+            .get_ids().iter().map(|&id| id as i64).collect::<Vec<_>>();
         let newline_ids = tokenizer.encode("\n", false)
             .map_err(|e| anyhow::anyhow!("tokenizer failed: {e}"))?
             .get_ids().iter().map(|&id| id as i64).collect::<Vec<_>>();
@@ -41,7 +44,9 @@ impl Glm5SftDataset {
             .get_ids().iter().map(|&id| id as i64).collect::<Vec<_>>();
         response_ids.push(154840); //  end token
 
-        let mut prompt_ids = vec![tok_user];
+        let mut prompt_ids = Vec::new();
+        prompt_ids.extend(&reasoning_prefix_ids);
+        prompt_ids.push(tok_user);
         prompt_ids.extend(&newline_ids);
         prompt_ids.extend(&user_ids);
         prompt_ids.extend(&newline_ids);
@@ -110,12 +115,18 @@ impl Glm5SftDataset {
                 (user_content, response)
             };
 
-            // Tokenize:  + \n + user_content + \n +  + \n
-            let mut prompt_ids: Vec<i64> = vec![tok_user];
-            // \n token
+            // Tokenize: "Reasoning Effort: Max\n" +  + \n + user_content + \n +  + \n
+            // GLM-5.2 chat template starts with "Reasoning Effort: Max" text.
+            let reasoning_prefix_ids = tokenizer.encode("Reasoning Effort: Max\n", false)
+                .map_err(|e| anyhow::anyhow!("tokenizer failed: {e}"))?
+                .get_ids().iter().map(|&id| id as i64).collect::<Vec<_>>();
             let newline_ids = tokenizer.encode("\n", false)
                 .map_err(|e| anyhow::anyhow!("tokenizer failed: {e}"))?
                 .get_ids().iter().map(|&id| id as i64).collect::<Vec<_>>();
+
+            let mut prompt_ids = Vec::new();
+            prompt_ids.extend(&reasoning_prefix_ids);
+            prompt_ids.push(tok_user);
             prompt_ids.extend(&newline_ids);
             let user_ids = tokenizer.encode(user_content.as_str(), false)
                 .map_err(|e| anyhow::anyhow!("tokenizer failed: {e}"))?
