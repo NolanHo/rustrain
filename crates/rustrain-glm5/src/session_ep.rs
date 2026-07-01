@@ -320,10 +320,14 @@ pub fn train_glm5_lora_sft_ep(
     // ── SFT data ──
     let tokenizer = tokenizers::Tokenizer::from_file(model_path.join("tokenizer.json"))
         .map_err(|e| anyhow::anyhow!("failed to load tokenizer: {e}"))?;
-    let sft_jsonl = std::path::Path::new("data/sft/deepseek_test.jsonl");
+    let sft_jsonl = {
+        let p = std::path::Path::new("/vePFS-Mindverse/user/nolanho/bin/glm5/sft_data.jsonl");
+        if p.exists() { p.to_path_buf() }
+        else { std::path::PathBuf::from("data/sft/deepseek_test.jsonl") }
+    };
     let train_dataset = if sft_jsonl.exists() {
         info!(rank, path = %sft_jsonl.display(), "loading real SFT data");
-        Glm5SftDataset::from_jsonl_simple(sft_jsonl, &tokenizer)?
+        Glm5SftDataset::from_jsonl_simple(&sft_jsonl, &tokenizer)?
     } else {
         info!(rank, "no SFT JSONL found, using synthetic data");
         Glm5SftDataset::synthetic(&tokenizer)?

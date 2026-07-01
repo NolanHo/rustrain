@@ -27,9 +27,37 @@ pub struct Glm5SftDataset {
 
 impl Glm5SftDataset {
     pub fn synthetic(tokenizer: &tokenizers::Tokenizer) -> Result<Self> {
-        let prompt: String = "Instruction: Reply with the project name.\nResponse: ".to_string();
-        let response: String = "rustrain".to_string();
-        Self::build_from_samples(vec![(prompt, response)], tokenizer)
+        // Use GLM chat format for synthetic data too
+        let tok_user = 154827i64;
+        let tok_assistant = 154828i64;
+        let newline_ids = tokenizer.encode("\n", false)
+            .map_err(|e| anyhow::anyhow!("tokenizer failed: {e}"))?
+            .get_ids().iter().map(|&id| id as i64).collect::<Vec<_>>();
+        let user_ids = tokenizer.encode("Reply with the project name.", false)
+            .map_err(|e| anyhow::anyhow!("tokenizer failed: {e}"))?
+            .get_ids().iter().map(|&id| id as i64).collect::<Vec<_>>();
+        let mut response_ids = tokenizer.encode("rustrain", false)
+            .map_err(|e| anyhow::anyhow!("tokenizer failed: {e}"))?
+            .get_ids().iter().map(|&id| id as i64).collect::<Vec<_>>();
+        response_ids.push(154840); //  end token
+
+        let mut prompt_ids = vec![tok_user];
+        prompt_ids.extend(&newline_ids);
+        prompt_ids.extend(&user_ids);
+        prompt_ids.extend(&newline_ids);
+        prompt_ids.push(tok_assistant);
+        prompt_ids.extend(&newline_ids);
+
+        let mut tokens = prompt_ids.clone();
+        tokens.extend(&response_ids);
+        let mut target_mask = vec![false; prompt_ids.len()];
+        target_mask.extend(vec![true; response_ids.len()]);
+
+        let pad_token_id = tokenizer.token_to_id("<pad>").unwrap_or(0) as i64;
+        Ok(Self {
+            samples: vec![Glm5SftSample { tokens, target_mask }],
+            pad_token_id,
+        })
     }
 
     /// Load SFT data from a JSONL file.
@@ -41,55 +69,84 @@ impl Glm5SftDataset {
         let content = std::fs::read_to_string(path)
             .with_context(|| format!("failed to read {}", path.display()))?;
         let mut samples = Vec::new();
+        // GLM-5.2 special tokens (from tokenizer.json)
+        let tok_user = 154827i64;      // 
+        let tok_assistant = 154828i64;  // 
         for line in content.lines() {
             if line.trim().is_empty() {
                 continue;
             }
             let obj: serde_json::Value = serde_json::from_str(line)
                 .with_context(|| format!("failed to parse JSONL line: {line}"))?;
-            let instruction = obj["instruction"].as_str().unwrap_or("");
-            let input = obj["input"].as_str().unwrap_or("");
-            let response = obj["response"].as_str().unwrap_or("");
-            let prompt = if input.is_empty() {
-                format!("Instruction: {instruction}\nResponse: ")
-            } else {
-                format!("Instruction: {instruction}\nInput: {input}\nResponse: ")
-            };
-            samples.push((prompt, response.to_string()));
-        }
-        info!(samples = samples.len(), path = %path.display(), "loaded SFT JSONL");
-        Self::build_from_samples(samples, tokenizer)
-    }
 
-    fn build_from_samples(
-        samples: Vec<(String, String)>,
-        tokenizer: &tokenizers::Tokenizer,
-    ) -> Result<Self> {
-        let mut sft_samples = Vec::new();
-        for (prompt, response) in &samples {
-            let prompt_ids = tokenizer
-                .encode(prompt.as_str(), true)
+            // Build prompt token IDs using GLM-5.2 chat format:
+            //    user\n{user_content}\nassistant\n
+            // The \n and content are tokenized as regular tokens, but
+            //  and  must be inserted as special token IDs.
+            let (user_content, response) = if obj.get("messages").is_some() {
+                let messages = obj["messages"].as_array()
+                    .with_context(|| "messages must be an array")?;
+                let mut last_user = String::new();
+                let mut last_assistant = String::new();
+                for msg in messages {
+                    let role = msg["role"].as_str().unwrap_or("");
+                    let c = msg["content"].as_str().unwrap_or("");
+                    if role == "user" {
+                        last_user = c.to_string();
+                    } else if role == "assistant" && !c.is_empty() {
+                        last_assistant = c.to_string();
+                    }
+                }
+                (last_user, last_assistant)
+            } else {
+                let instruction = obj["instruction"].as_str().unwrap_or("");
+                let input = obj["input"].as_str().unwrap_or("");
+                let user_content = if input.is_empty() {
+                    instruction.to_string()
+                } else {
+                    format!("{instruction}\n{input}")
+                };
+                let response = obj["response"].as_str().unwrap_or("").to_string();
+                (user_content, response)
+            };
+
+            // Tokenize:  + \n + user_content + \n +  + \n
+            let mut prompt_ids: Vec<i64> = vec![tok_user];
+            // \n token
+            let newline_ids = tokenizer.encode("\n", false)
                 .map_err(|e| anyhow::anyhow!("tokenizer failed: {e}"))?
-                .get_ids()
-                .iter()
-                .map(|&id| id as i64)
-                .collect::<Vec<_>>();
-            let response_ids = tokenizer
-                .encode(response.as_str(), false)
+                .get_ids().iter().map(|&id| id as i64).collect::<Vec<_>>();
+            prompt_ids.extend(&newline_ids);
+            let user_ids = tokenizer.encode(user_content.as_str(), false)
                 .map_err(|e| anyhow::anyhow!("tokenizer failed: {e}"))?
-                .get_ids()
-                .iter()
-                .map(|&id| id as i64)
-                .collect::<Vec<_>>();
+                .get_ids().iter().map(|&id| id as i64).collect::<Vec<_>>();
+            prompt_ids.extend(&user_ids);
+            prompt_ids.extend(&newline_ids);
+            prompt_ids.push(tok_assistant);
+            prompt_ids.extend(&newline_ids);
+
+            let mut response_ids = tokenizer.encode(response.as_str(), false)
+                .map_err(|e| anyhow::anyhow!("tokenizer failed: {e}"))?
+                .get_ids().iter().map(|&id| id as i64).collect::<Vec<_>>();
+            response_ids.push(154840); //  end token
+
             let mut tokens = prompt_ids.clone();
             tokens.extend(&response_ids);
             let mut target_mask = vec![false; prompt_ids.len()];
             target_mask.extend(vec![true; response_ids.len()]);
-            sft_samples.push(Glm5SftSample { tokens, target_mask });
+            samples.push(Glm5SftSample { tokens, target_mask });
         }
+        info!(samples = samples.len(), path = %path.display(), "loaded SFT JSONL");
+        Self::build_from_tokens(samples, tokenizer)
+    }
+
+    fn build_from_tokens(
+        samples: Vec<Glm5SftSample>,
+        tokenizer: &tokenizers::Tokenizer,
+    ) -> Result<Self> {
         let pad_token_id = tokenizer.token_to_id("<pad>").unwrap_or(0) as i64;
         Ok(Self {
-            samples: sft_samples,
+            samples,
             pad_token_id,
         })
     }
