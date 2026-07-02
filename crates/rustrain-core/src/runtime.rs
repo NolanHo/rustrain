@@ -507,6 +507,8 @@ pub fn validate_config(config: &Config) -> Result<()> {
         && config.model.architecture == "deepseek_v4_lora_sft_ep";
     let is_glm5_lora_sft_ep = matches!(config.train.backend, BackendKind::Tch)
         && config.model.architecture == "glm5_lora_sft_ep";
+    let is_qwen3_6_lora_sft_ep = matches!(config.train.backend, BackendKind::Tch)
+        && config.model.architecture == "qwen3_6_lora_sft_ep";
     let is_v4_tp_ep_train = matches!(config.train.backend, BackendKind::Tch)
         && config.model.architecture == "deepseek_v4_tp_ep_train";
     let is_v3_tp_rank = matches!(config.train.backend, BackendKind::Tch)
@@ -533,7 +535,7 @@ pub fn validate_config(config: &Config) -> Result<()> {
             && !((is_v4_tp_rank || is_v3_tp_rank || is_v4_tp_train)
                 && name == "tensor_model_parallel_size"
                 && parallel.data_parallel_size == 1)
-            && !((is_v4_ep_rank || is_v3_ep_rank || is_v4_ep_train || is_v4_lora_sft_ep || is_glm5_lora_sft_ep)
+            && !((is_v4_ep_rank || is_v3_ep_rank || is_v4_ep_train || is_v4_lora_sft_ep || is_glm5_lora_sft_ep || is_qwen3_6_lora_sft_ep)
                 && name == "expert_model_parallel_size"
                 && parallel.data_parallel_size == 1)
             && !(is_glm5_lora_sft_ep

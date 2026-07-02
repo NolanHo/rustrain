@@ -18,6 +18,7 @@ rustrain-deepseek = { path = "crates/rustrain-deepseek" }
 rustrain-deepseek-v4 = { path = "crates/rustrain-deepseek-v4" }
 rustrain-glm5 = { path = "crates/rustrain-glm5" }
 rustrain-moe = { path = "crates/rustrain-moe" }
+rustrain-qwen3-6 = { path = "crates/rustrain-qwen3-6" }
 
 # Ray distributed computing (native Rust SDK) — optional, only needed for Ray mode
 rayrust = { version = "0.1.0", optional = true }

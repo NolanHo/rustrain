@@ -1728,6 +1728,7 @@ dependencies = [
  "rustrain-parallel",
  "rustrain-qwen",
  "rustrain-qwen3",
+ "rustrain-qwen3-6",
  "rustrain-tch-tiny",
  "rustrain-toy",
  "rustrain-train",
@@ -1945,6 +1946,34 @@ dependencies = [
 
 [[package]]
 name = "rustrain-qwen3"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "arrow",
+ "chrono",
+ "clap",
+ "ndarray",
+ "rand 0.8.6",
+ "rand_distr",
+ "regex",
+ "rustrain-checkpoint",
+ "rustrain-core",
+ "rustrain-data",
+ "rustrain-nccl",
+ "rustrain-parallel",
+ "rustrain-train",
+ "safetensors 0.8.0",
+ "serde",
+ "serde_json",
+ "tch",
+ "tempfile",
+ "tokenizers",
+ "toml",
+ "tracing",
+]
+
+[[package]]
+name = "rustrain-qwen3-6"
 version = "0.1.0"
 dependencies = [
  "anyhow",
