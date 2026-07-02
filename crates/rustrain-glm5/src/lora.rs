@@ -173,23 +173,35 @@ pub fn write_lora_manifest(path: &Path, manifest: &Glm5LoraManifest) -> Result<(
 }
 
 /// Compute W' = W + (B @ A) * scale for GLM-5 LoRA
+/// Uses C++ dequant_fp8 for FP8 weights to avoid the tch-rs view bug.
 pub fn glm5_lora_weight(
     base: &Tensor,
+    weight_scale: Option<&Tensor>,
     layer: usize,
     module: Glm5LoraTargetModule,
     registry: &Glm5LoraRegistry,
 ) -> Tensor {
     if let Some((lora_a, lora_b)) = registry.adapters.get(&(layer, module)) {
-        let scale = registry.config.alpha as f64 / lora_a.size()[0] as f64;
-        let delta = lora_b.matmul(lora_a) * scale;
-        // If base is FP8, convert to BF16 for LoRA addition (FP8 + BF16 not supported)
-        let base_kind = base.kind();
-        let base_bf16 = if base_kind == Kind::Float8e4m3fn {
-            base.to_kind(Kind::BFloat16)
+        let lora_scale = registry.config.alpha as f64 / lora_a.size()[0] as f64;
+        let delta = lora_b.matmul(lora_a) * lora_scale;
+        // Dequant FP8 weights using C++ kernel (applies block-wise scale correctly)
+        let base_dequant = if base.kind() == Kind::Float8e4m3fn {
+            if let Some(s) = weight_scale {
+                match rustrain_deepseek_v4::fp8_kernel::dequant_fp8_weight(base, s) {
+                    Ok(w) => w,
+                    Err(e) => {
+                        tracing::warn!("dequant_fp8_weight failed in lora ({e:?}), falling back to to_kind");
+                        base.to_kind(Kind::BFloat16)
+                    }
+                }
+            } else {
+                tracing::warn!("FP8 weight without scale in lora, using raw to_kind (may be incorrect)");
+                base.to_kind(Kind::BFloat16)
+            }
         } else {
             base.shallow_clone()
         };
-        let result = &base_bf16 + &delta.to_device(base_bf16.device()).to_kind(base_bf16.kind());
+        let result = &base_dequant + &delta.to_device(base_dequant.device()).to_kind(base_dequant.kind());
         result
     } else {
         base.shallow_clone()
@@ -203,23 +215,25 @@ pub fn lora_attention_weights(
     registry: &Glm5LoraRegistry,
 ) -> Glm5AttentionWeights {
     Glm5AttentionWeights {
-        q_a_proj: glm5_lora_weight(&base.q_a_proj, layer, Glm5LoraTargetModule::WqA, registry),
+        q_a_proj: glm5_lora_weight(&base.q_a_proj, base.q_a_proj_scale.as_ref(), layer, Glm5LoraTargetModule::WqA, registry),
         q_a_layernorm: base.q_a_layernorm.shallow_clone(),
-        q_b_proj: glm5_lora_weight(&base.q_b_proj, layer, Glm5LoraTargetModule::WqB, registry),
-        kv_a_proj_with_mqa: glm5_lora_weight(&base.kv_a_proj_with_mqa, layer, Glm5LoraTargetModule::Wkv, registry),
+        q_b_proj: glm5_lora_weight(&base.q_b_proj, base.q_b_proj_scale.as_ref(), layer, Glm5LoraTargetModule::WqB, registry),
+        kv_a_proj_with_mqa: glm5_lora_weight(&base.kv_a_proj_with_mqa, base.kv_a_proj_scale.as_ref(), layer, Glm5LoraTargetModule::Wkv, registry),
         kv_a_layernorm: base.kv_a_layernorm.shallow_clone(),
         kv_b_proj: base.kv_b_proj.shallow_clone(),
-        o_proj: glm5_lora_weight(&base.o_proj, layer, Glm5LoraTargetModule::Wo, registry),
+        o_proj: glm5_lora_weight(&base.o_proj, base.o_proj_scale.as_ref(), layer, Glm5LoraTargetModule::Wo, registry),
         indexer_k_norm_weight: base.indexer_k_norm_weight.as_ref().map(|t| t.shallow_clone()),
         indexer_k_norm_bias: base.indexer_k_norm_bias.as_ref().map(|t| t.shallow_clone()),
         indexer_weights_proj: base.indexer_weights_proj.as_ref().map(|t| t.shallow_clone()),
         indexer_wk: base.indexer_wk.as_ref().map(|t| t.shallow_clone()),
         indexer_wq_b: base.indexer_wq_b.as_ref().map(|t| t.shallow_clone()),
-        q_a_proj_scale: base.q_a_proj_scale.as_ref().map(|t| t.shallow_clone()),
-        q_b_proj_scale: base.q_b_proj_scale.as_ref().map(|t| t.shallow_clone()),
-        kv_a_proj_scale: base.kv_a_proj_scale.as_ref().map(|t| t.shallow_clone()),
+        // Scales set to None for LoRA-modified weights (already dequanted to BFloat16)
+        q_a_proj_scale: None,
+        q_b_proj_scale: None,
+        kv_a_proj_scale: None,
+        // kv_b_proj is NOT a LoRA target — keep its scale
         kv_b_proj_scale: base.kv_b_proj_scale.as_ref().map(|t| t.shallow_clone()),
-        o_proj_scale: base.o_proj_scale.as_ref().map(|t| t.shallow_clone()),
+        o_proj_scale: None,
         indexer_wk_scale: base.indexer_wk_scale.as_ref().map(|t| t.shallow_clone()),
         indexer_wq_b_scale: base.indexer_wq_b_scale.as_ref().map(|t| t.shallow_clone()),
     }

@@ -28,8 +28,10 @@ pub struct Glm5SftDataset {
 impl Glm5SftDataset {
     pub fn synthetic(tokenizer: &tokenizers::Tokenizer) -> Result<Self> {
         // Use GLM-5.2 chat format
-        let tok_user = 154827i64;
-        let tok_assistant = 154828i64;
+        let tok_gmask = 154822i64;     // [gmask]
+        let tok_sop = 154824i64;       // [sop] (start of prompt)
+        let tok_user = 154827i64;      // user tag
+        let tok_assistant = 154828i64; // assistant tag
         let reasoning_prefix_ids = tokenizer.encode("Reasoning Effort: Max\n", false)
             .map_err(|e| anyhow::anyhow!("tokenizer failed: {e}"))?
             .get_ids().iter().map(|&id| id as i64).collect::<Vec<_>>();
@@ -42,9 +44,11 @@ impl Glm5SftDataset {
         let mut response_ids = tokenizer.encode("rustrain", false)
             .map_err(|e| anyhow::anyhow!("tokenizer failed: {e}"))?
             .get_ids().iter().map(|&id| id as i64).collect::<Vec<_>>();
-        response_ids.push(154840); //  end token
+        response_ids.push(154842); //  end token
 
         let mut prompt_ids = Vec::new();
+        prompt_ids.push(tok_gmask);
+        prompt_ids.push(tok_sop);
         prompt_ids.extend(&reasoning_prefix_ids);
         prompt_ids.push(tok_user);
         prompt_ids.extend(&newline_ids);
@@ -75,8 +79,10 @@ impl Glm5SftDataset {
             .with_context(|| format!("failed to read {}", path.display()))?;
         let mut samples = Vec::new();
         // GLM-5.2 special tokens (from tokenizer.json)
-        let tok_user = 154827i64;      // 
-        let tok_assistant = 154828i64;  // 
+        let tok_gmask = 154822i64;      // [gmask]
+        let tok_sop = 154824i64;        // [sop] (start of prompt)
+        let tok_user = 154827i64;       // user tag
+        let tok_assistant = 154828i64;  // assistant tag
         for line in content.lines() {
             if line.trim().is_empty() {
                 continue;
@@ -125,6 +131,8 @@ impl Glm5SftDataset {
                 .get_ids().iter().map(|&id| id as i64).collect::<Vec<_>>();
 
             let mut prompt_ids = Vec::new();
+            prompt_ids.push(tok_gmask);
+            prompt_ids.push(tok_sop);
             prompt_ids.extend(&reasoning_prefix_ids);
             prompt_ids.push(tok_user);
             prompt_ids.extend(&newline_ids);
@@ -139,7 +147,7 @@ impl Glm5SftDataset {
             let mut response_ids = tokenizer.encode(response.as_str(), false)
                 .map_err(|e| anyhow::anyhow!("tokenizer failed: {e}"))?
                 .get_ids().iter().map(|&id| id as i64).collect::<Vec<_>>();
-            response_ids.push(154840); //  end token
+            response_ids.push(154842); //  end token
 
             let mut tokens = prompt_ids.clone();
             tokens.extend(&response_ids);
@@ -177,12 +185,13 @@ impl Glm5SftDataset {
         let mut num_masked = 0;
 
         for (i, sample) in batch_samples.iter().enumerate() {
+            let pad_count = max_len - sample.tokens.len();
             for (j, &token) in sample.tokens.iter().enumerate() {
-                input_ids[i * max_len + j] = token;
+                input_ids[i * max_len + j + pad_count] = token;
             }
             for (j, &mask) in sample.target_mask.iter().enumerate() {
                 if mask {
-                    target_mask[i * max_len + j] = 1;
+                    target_mask[i * max_len + j + pad_count] = 1;
                     num_masked += 1;
                 }
             }
