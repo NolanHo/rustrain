@@ -12,36 +12,50 @@ use rustrain_checkpoint::safetensors::tensor;
 // RMS Norm
 // ──────────────────────────────────────────────────────────────────────
 
-/// RMSNorm — Megatron mixed-precision: compute variance in FP32, return in input dtype.
-/// `variance = mean(input.float()^2)` in FP32 → `rsqrt` in FP32 → multiply with BF16 input.
-/// Result is cast to input.kind() so downstream ops see consistent dtype.
+/// RMSNorm — HF Qwen3.5-MoE uses `1.0 + weight` (not raw weight).
+/// `output = (x * rsqrt(var+eps)) * (1.0 + weight)` in FP32, then cast back.
 pub fn rms_norm(input: &Tensor, weight: &Tensor, eps: f64) -> Tensor {
     let input_f32 = input.to_kind(Kind::Float);
     let variance = input_f32
         .pow_tensor_scalar(2.0)
         .mean_dim([-1].as_slice(), true, Kind::Float);
     let inv_rms = (variance + eps).rsqrt();  // FP32
-    // Multiply: BF16 input * FP32 inv_rms → FP32, then * BF16 weight → FP32
-    // Cast back to input dtype for downstream consistency
-    (input.to_kind(Kind::Float) * inv_rms * weight.to_kind(Kind::Float)).to_kind(input.kind())
+    // HF: output * (1.0 + self.weight.float())
+    let normed = input.to_kind(Kind::Float) * inv_rms;
+    let weight_adjusted = 1.0_f64 + weight.to_kind(Kind::Float);
+    (normed * &weight_adjusted).to_kind(input.kind())
 }
 
-/// Gated RMSNorm — same Megatron precision pattern.
+/// Gated RMSNorm — HF Qwen3_5MoeRMSNormGated uses raw weight (NOT 1+weight).
+/// HF: hidden = weight * (hidden * rsqrt(var+eps)).to(dtype) * F.silu(gate.float())
 pub fn rms_norm_gated(input: &Tensor, weight: &Tensor, gate: &Tensor, eps: f64) -> Tensor {
     let input_f32 = input.to_kind(Kind::Float);
     let variance = input_f32
         .pow_tensor_scalar(2.0)
         .mean_dim([-1].as_slice(), true, Kind::Float);
     let inv_rms = (variance + eps).rsqrt();
-    let normed = (input_f32 * inv_rms * weight.to_kind(Kind::Float)).to_kind(input.kind());
-    normed * gate
+    let normed = input_f32 * inv_rms;
+    // HF gated norm uses raw weight (not 1+weight)
+    let normed = (normed * weight.to_kind(Kind::Float)).to_kind(input.kind());
+    // HF applies SiLU to gate
+    let gate_silu = gate.to_kind(Kind::Float).silu().to_kind(input.kind());
+    normed * gate_silu
 }
 
 // ──────────────────────────────────────────────────────────────────────
-// RoPE (partial rotary, interleaved)
+// RoPE (partial rotary, split-half — matching HF Qwen3.5-MoE)
 // ──────────────────────────────────────────────────────────────────────
 
-/// Apply partial rotary RoPE.
+/// Split-half rotate: x = [a, b] → [-b, a]
+fn rotate_half(x: &Tensor) -> Tensor {
+    let last_dim = x.size()[x.dim() - 1];
+    let half = last_dim / 2;
+    let x1 = x.narrow(-1, 0, half);
+    let x2 = x.narrow(-1, half, half);
+    Tensor::cat(&[&x2.neg(), &x1], -1)
+}
+
+/// Apply partial rotary RoPE (split-half, matching HF).
 ///
 /// `q` / `k`: [batch, num_heads, seq, head_dim]
 /// `position_ids`: [batch, seq] (text-only: 0..seq)
@@ -58,28 +72,25 @@ pub fn apply_rope(
     let pos = position_ids.to_kind(Kind::Float); // [batch, seq]
     let half = rotary_dim / 2;
 
-    // inv_freq: [half]
+    // inv_freq: [half]  — HF: 1 / (theta ^ (arange(0, half, 2) / half))
+    // Actually HF computes: base = theta, dim = rotary_dim, inv_freq = 1 / (base ** (arange(0, dim, 2) / dim))
+    // But cos/sin shape = [batch, seq, rotary_dim] (not [batch, seq, half])
+    // HF: freqs = inv_freq @ position_ids → [batch, seq, half]
+    //     emb = cat(freqs, freqs, dim=-1) → [batch, seq, rotary_dim]
+    //     cos, sin = emb.cos(), emb.sin()
     let inv_freq = {
-        let exponents = Tensor::arange(half, (Kind::Float, device)) * (2.0 / rotary_dim as f64);
-        // theta^exponents = exp(exponents * ln(theta)), NOT exponents^theta
+        let all = Tensor::arange_start(0, rotary_dim, (Kind::Float, device));
+        let exponents = all.slice(0, 0, rotary_dim, 2) / (rotary_dim as f64);
         (exponents * theta.ln()).exp().reciprocal()
     };
 
     // freqs: [batch, seq, half]
     let freqs = pos.unsqueeze(-1) * inv_freq.unsqueeze(0);
-    let cos = freqs.cos();
-    let sin = freqs.sin();
 
-    // Expand for heads: [batch, 1, seq, half]
-    let cos = cos.unsqueeze(1);
-    let sin = sin.unsqueeze(1);
-
-    // Interleaved: rotate pairs (2i, 2i+1)
-    // Build full cos/sin: [batch, 1, seq, rotary_dim]
-    let cos_full = Tensor::stack(&[&cos, &cos], -1).flatten(-2, -1);
-    let sin_full = Tensor::stack(&[&sin, &sin], -1).flatten(-2, -1);
-    let cos_full = cos_full.narrow(-1, 0, rotary_dim).to_kind(q.kind());
-    let sin_full = sin_full.narrow(-1, 0, rotary_dim).to_kind(q.kind());
+    // HF: emb = cat(freqs, freqs, dim=-1) → [batch, seq, rotary_dim]
+    let emb = Tensor::cat(&[&freqs, &freqs], -1);
+    let cos = emb.cos().unsqueeze(1).to_kind(q.kind()); // [batch, 1, seq, rotary_dim]
+    let sin = emb.sin().unsqueeze(1).to_kind(q.kind());
 
     let q_parts = q.split(rotary_dim, -1);
     let k_parts = k.split(rotary_dim, -1);
@@ -88,9 +99,9 @@ pub fn apply_rope(
     let q_pass = q.narrow(-1, rotary_dim, head_dim - rotary_dim);
     let k_pass = k.narrow(-1, rotary_dim, head_dim - rotary_dim);
 
-    // Interleaved rotate_half: pairs → (-x[1], x[0])
-    let q_rotated = q_rot * &cos_full + rotate_half_interleaved(q_rot) * &sin_full;
-    let k_rotated = k_rot * &cos_full + rotate_half_interleaved(k_rot) * &sin_full;
+    // Split-half rotate: q_embed = q_rot * cos + rotate_half(q_rot) * sin
+    let q_rotated = q_rot * &cos + &rotate_half(q_rot) * &sin;
+    let k_rotated = k_rot * &cos + &rotate_half(k_rot) * &sin;
 
     let q_out = if head_dim > rotary_dim {
         Tensor::cat(&[&q_rotated, &q_pass], -1)
@@ -103,22 +114,6 @@ pub fn apply_rope(
         k_rotated
     };
     (q_out, k_out)
-}
-
-/// Interleaved rotate_half: for each pair (a, b) → (-b, a)
-/// Preserves leading dimensions.
-fn rotate_half_interleaved(x: &Tensor) -> Tensor {
-    let n = x.size()[x.dim() - 1];
-    let half = n / 2;
-    // Reshape preserving leading dims: [..., half, 2]
-    let mut shape: Vec<i64> = x.size();
-    shape.pop();
-    shape.push(half);
-    shape.push(2);
-    let x_pairs = x.reshape(shape.as_slice());
-    // [..., half, 2]
-    let rotated = Tensor::stack(&[x_pairs.select(-1, 1).neg(), x_pairs.select(-1, 0)], -1);
-    rotated.flatten(-2, -1)
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -160,22 +155,24 @@ pub fn full_attention(
     let qkv_dim = num_heads * head_dim;
     let device = hidden.device();
 
-    // Q projection → [batch, seq, 2*qkv_dim] → split Q and output_gate
+    // Q projection → [batch, seq, num_heads, head_dim*2] → chunk into Q and gate (per-head!)
+    // HF: q_proj(hidden).view(B, S, -1, head_dim*2) → chunk(2, dim=-1) → Q[B,S,H,D], gate[B,S,H,D]
     let q_out = hidden.linear::<&Tensor>(&w.q_proj, None);
-    let parts = q_out.split_sizes(&[qkv_dim, qkv_dim], -1);
-    let q = parts[0].shallow_clone();
-    let gate = parts[1].shallow_clone();
+    let q_out = q_out.view([batch, seq_len, num_heads, head_dim * 2]);
+    let parts = q_out.chunk(2, -1);
+    let q = parts[0].shallow_clone();   // [batch, seq, num_heads, head_dim]
+    let gate = parts[1].shallow_clone(); // [batch, seq, num_heads, head_dim]
 
-    let q = q.reshape([batch, seq_len, num_heads, head_dim]).transpose(1, 2);
-    let gate = gate.reshape([batch, seq_len, num_heads, head_dim]).transpose(1, 2);
+    let q = q.transpose(1, 2);   // [batch, heads, seq, head_dim]
+    let gate = gate.transpose(1, 2);
 
     let k = hidden
         .linear::<&Tensor>(&w.k_proj, None)
-        .reshape([batch, seq_len, num_kv_heads, head_dim])
+        .view([batch, seq_len, num_kv_heads, head_dim])
         .transpose(1, 2);
     let v = hidden
         .linear::<&Tensor>(&w.v_proj, None)
-        .reshape([batch, seq_len, num_kv_heads, head_dim])
+        .view([batch, seq_len, num_kv_heads, head_dim])
         .transpose(1, 2);
 
     let q = rms_norm(&q, &w.q_norm, config.rms_norm_eps);
@@ -196,25 +193,9 @@ pub fn full_attention(
     let k = k.repeat_interleave_self_int(n_rep, 1, None);
     let v = v.repeat_interleave_self_int(n_rep, 1, None);
 
-    // Scaled dot-product attention — use C++ SDPA (flash attention) if available
+    // Scaled dot-product attention (eager — C++ handles internally in train_step)
     let scale = 1.0 / (head_dim as f64).sqrt();
-    let attn_output = if crate::kernel::kernels_available() {
-        match crate::kernel::native_sdpa(&q, &k, &v, true, scale) {
-            Ok(out) => out,
-            Err(e) => {
-                tracing::warn!("C++ SDPA failed ({e}), falling back to eager");
-                let attn_weights = (&q * scale).matmul(&k.transpose(-1, -2));
-                let causal_mask = Tensor::ones([seq_len, seq_len], (Kind::Bool, device))
-                    .triu(1)
-                    .eq(1);
-                let attn_weights = attn_weights.masked_fill(
-                    &causal_mask.unsqueeze(0).unsqueeze(0),
-                    f64::NEG_INFINITY,
-                );
-                attn_weights.softmax(-1, compute_kind).matmul(&v)
-            }
-        }
-    } else {
+    let attn_output = {
         let attn_weights = (&q * scale).matmul(&k.transpose(-1, -2));
         let causal_mask = Tensor::ones([seq_len, seq_len], (Kind::Bool, device))
             .triu(1)
@@ -334,82 +315,87 @@ pub fn linear_attention(
     let q = q.repeat_interleave_self_int(n_rep, 2, None);
     let k = k.repeat_interleave_self_int(n_rep, 2, None);
 
-    // L2 normalize Q, K
+    // L2 normalize Q, K (HF uses use_qk_l2norm_in_kernel=True)
     let q_norm = q.pow_tensor_scalar(2.0).sum_dim_intlist([-1].as_slice(), true, compute_kind).sqrt().clamp_min(1e-6);
     let k_norm = k.pow_tensor_scalar(2.0).sum_dim_intlist([-1].as_slice(), true, compute_kind).sqrt().clamp_min(1e-6);
-    let q = (&q / &q_norm).to_kind(compute_kind);
-    let k = (&k / &k_norm).to_kind(compute_kind);
+    let q = (&q / &q_norm).to_kind(Kind::Float);
+    let k = (&k / &k_norm).to_kind(Kind::Float);
 
-    // Core Gated Delta Rule
-    // Core Gated Delta Rule — matrix formulation (no C++ fallback needed, all in C++ forward)
-    let core_out = gated_delta_rule(&q, &k, &v, &g, &beta, compute_kind);
+    // Scale Q by 1/sqrt(key_dim) — matching HF: scale = 1 / (query.shape[-1] ** 0.5)
+    let scale = 1.0 / (key_dim as f64).sqrt();
+    let q = (&q * scale).to_kind(Kind::Float);
+    let v = v.to_kind(Kind::Float);
+    let beta = beta.to_kind(Kind::Float);
+    let g = g.to_kind(Kind::Float);
+
+    // Core Gated Delta Rule — recurrent formulation (matching HF torch_recurrent_gated_delta_rule)
+    // Transpose from [B, S, H, D] → [B, H, S, D] for recurrent loop
+    let q_t = q.transpose(1, 2);
+    let k_t = k.transpose(1, 2);
+    let v_t = v.transpose(1, 2);
+    let g_t = g.transpose(1, 2);  // [B, H, S]
+    let beta_t = beta.transpose(1, 2);
+    let core_out = gated_delta_rule_recurrent(&q_t, &k_t, &v_t, &g_t, &beta_t);
+    // core_out is [B, H, S, D_v] → transpose back to [B, S, H, D_v]
+    let core_out = core_out.transpose(1, 2).to_kind(compute_kind);
 
     // Gated RMSNorm
     let core_flat = core_out.reshape([-1, val_dim]);
-    let z_flat = z.reshape([-1, val_dim]);
+    let z_flat = z.reshape([-1, val_dim]).to_kind(compute_kind);
     let normed = rms_norm_gated(&core_flat, &w.norm, &z_flat, config.rms_norm_eps);
     let normed = normed.reshape([batch, seq_len, num_v_heads * val_dim]);
 
-    normed.linear::<&Tensor>(&w.out_proj, None)
+    let result = normed.linear::<&Tensor>(&w.out_proj, None);
+    result
 }
 
-fn gated_delta_rule(
-    q: &Tensor,
-    k: &Tensor,
-    v: &Tensor,
-    g: &Tensor,
-    beta: &Tensor,
-    compute_kind: Kind,
+/// Gated Delta Rule — recurrent formulation matching HF torch_recurrent_gated_delta_rule.
+///
+/// All inputs are FP32, shapes: q,k: [B, H, S, D_k], v: [B, H, S, D_v], g,beta: [B, H, S]
+/// Returns [B, H, S, D_v] in FP32.
+fn gated_delta_rule_recurrent(
+    q: &Tensor, k: &Tensor, v: &Tensor, g: &Tensor, beta: &Tensor,
 ) -> Tensor {
-    // q, k: [batch, seq, num_heads, key_dim]
-    // v: [batch, seq, num_heads, val_dim]
-    // g, beta: [batch, seq, num_heads]
-    let (batch, seq_len, num_heads, key_dim) = q.size4().unwrap();
+    // All inputs already FP32, transposed to [B, H, S, dim]
+    let (batch, num_heads, seq_len, key_dim) = q.size4().unwrap();
     let val_dim = v.size()[3];
     let device = q.device();
 
-    // Transpose to [batch, heads, seq, dim]
-    let q = q.transpose(1, 2); // [batch, heads, seq, key_dim]
-    let k = k.transpose(1, 2);
-    let v = v.transpose(1, 2);
-    let g = g.transpose(1, 2); // [batch, heads, seq]
-    let beta = beta.transpose(1, 2);
+    // HF: g_t = g.exp() → decay factor
+    let g_exp = g.exp(); // [B, H, S]
 
-    // QK matrix: [batch, heads, seq, seq]
-    let qk = q.matmul(&k.transpose(-1, -2));
+    // State S: [B, H, D_k, D_v] — recurrent state (key_dim × val_dim per head)
+    let mut state = Tensor::zeros([batch, num_heads, key_dim, val_dim], (Kind::Float, device));
 
-    // Compute cumulative decay ratio using log-space to avoid overflow.
-    // g can be negative (from -exp(A_log) * softplus(...)).
-    // cum_g[i] = prod_{t=0}^{i} g[t] → log|cum_g| = sum(log|g|), sign = prod(sign(g))
-    let g_abs = g.abs().clamp_min(1e-20);
-    let log_g_abs = g_abs.log(); // [batch, heads, seq]
-    let cum_log_g = log_g_abs.cumsum(2, Kind::Float); // [batch, heads, seq]
+    // Output: [B, H, S, D_v]
+    let mut outputs: Vec<Tensor> = Vec::with_capacity(seq_len as usize);
 
-    // Sign: cum_sign[i] = prod(sign(g[0..i]))
-    let g_sign = g.sign();
-    let cum_sign = g_sign.cumprod(2, Kind::Float); // [batch, heads, seq]
+    for i in 0..seq_len {
+        let q_i = q.select(2, i);           // [B, H, D_k]
+        let k_i = k.select(2, i);           // [B, H, D_k]
+        let v_i = v.select(2, i);           // [B, H, D_v]
+        let g_i = g_exp.select(2, i).unsqueeze(-1).unsqueeze(-1); // [B, H, 1, 1]
+        let beta_i = beta.select(2, i).unsqueeze(-1);            // [B, H, 1]
 
-    // ratio[i,j] = cum_g[i] / cum_g[j] = sign[i]*sign[j] * exp(cum_log_g[i] - cum_log_g[j])
-    let cum_log_g_i = cum_log_g.unsqueeze(-1); // [batch, heads, seq, 1]
-    let cum_log_g_j = cum_log_g.unsqueeze(-2); // [batch, heads, 1, seq]
-    let log_ratio = (cum_log_g_i - cum_log_g_j).clamp_max(50.0); // prevent exp overflow
-    let abs_ratio = log_ratio.exp();
-    let sign_ratio = cum_sign.unsqueeze(-1) * cum_sign.unsqueeze(-2); // [batch, heads, seq, seq]
-    let ratio = abs_ratio * sign_ratio;
+        // S = S * g_t  (decay)
+        state = &state * &g_i;
 
-    // Lower triangular mask (j <= i)
-    let mask = Tensor::ones([seq_len, seq_len], (Kind::Bool, device)).tril(0);
+        // kv_mem = sum(S * k, dim=-2) → [B, H, D_v]
+        let kv_mem = (&state * k_i.unsqueeze(-1)).sum_dim_intlist([-2].as_slice(), false, Kind::Float);
 
-    // A[i,j] = ratio[i,j] * beta[j] * QK[i,j] for j <= i
-    // Compute in FP32 for numerical stability (cumsum precision), then cast to BF16 for matmul
-    let attn = (ratio * beta.unsqueeze(-2).to_kind(Kind::Float) * qk.to_kind(Kind::Float)) * mask;
-    let attn = attn.to_kind(q.kind());  // cast back to BF16 for value matmul
+        // delta = (v - kv_mem) * beta
+        let delta = (&v_i - &kv_mem) * &beta_i;  // [B, H, D_v]
 
-    // output = A @ V → [batch, heads, seq, val_dim]
-    let output = attn.matmul(&v);
+        // S += k ⊗ delta  (update)
+        state = &state + k_i.unsqueeze(-1) * delta.unsqueeze(-2);  // [B, H, D_k, D_v]
 
-    // Transpose back to [batch, seq, heads, val_dim]
-    output.transpose(1, 2)
+        // output[i] = sum(S * q, dim=-2) → [B, H, D_v]
+        let out_i = (&state * q_i.unsqueeze(-1)).sum_dim_intlist([-2].as_slice(), false, Kind::Float);
+        outputs.push(out_i);
+    }
+
+    // Stack outputs: [B, H, S, D_v]
+    Tensor::stack(&outputs.iter().collect::<Vec<_>>(), 2)
 }
 
 // ──────────────────────────────────────────────────────────────────────

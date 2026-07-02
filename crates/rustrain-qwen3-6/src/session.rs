@@ -2,28 +2,16 @@
 
 use std::collections::{BTreeMap, HashSet};
 use std::env;
-use std::path::Path;
 
 use anyhow::{Context, Result, anyhow, bail};
-use tch::{nn, Kind, Reduction, Tensor, no_grad};
+use tch::{Kind, Tensor};
 use tracing::info;
 
 use crate::config::{read_qwen36_runtime_config, resolve_qwen36_model_path, Qwen36RuntimeConfig, LayerType};
-use crate::lora::{Qwen36LoraConfig, Qwen36LoraRegistry, Qwen36LoraTargetModule};
-use crate::model;
+use crate::lora::{Qwen36LoraConfig, Qwen36LoraTargetModule};
 use crate::sft::SftDataset;
-use rustrain_core::runtime::{Config, RunPaths, LoraConfig};
+use rustrain_core::runtime::{Config, RunPaths};
 use rustrain_checkpoint::safetensors::{read_safetensors_dir_filtered};
-
-// Global weight storage for checkpoint closures — uses thread_local to avoid Send+Sync requirements
-// (PyTorch autograd::Function::backward runs on the same thread as forward)
-use std::cell::RefCell;
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
-
-thread_local! {
-    static CHECKPOINT_FNS: RefCell<HashMap<usize, Box<dyn Fn(&Tensor) -> Tensor>>> = RefCell::new(HashMap::new());
-}
 
 // ──────────────────────────────────────────────────────────────────────
 // EP Shard
@@ -163,480 +151,6 @@ fn build_needed_weights(
 }
 
 // ──────────────────────────────────────────────────────────────────────
-// Forward with LoRA
-// ──────────────────────────────────────────────────────────────────────
-
-/// Apply LoRA delta to a weight tensor: `W_new = W + scaling * B @ A`
-/// 
-/// Megatron mixed-precision pattern:
-/// - LoRA A/B are FP32 master weights (VarStore default, for optimizer precision)
-/// - Forward casts A/B to model dtype (BF16) for computation
-/// - Backward: autograd flows gradient through the cast back to FP32 leaf
-/// - Result: W + scaling * (B_bf16 @ A_bf16), all in BF16
-fn lora_weight_delta(
-    base_weight: &Tensor,
-    lora_a: &Tensor,
-    lora_b: &Tensor,
-    scaling: f64,
-) -> Tensor {
-    let kind = base_weight.kind();
-    // Cast FP32 master weights to compute dtype (BF16) for forward
-    let a = lora_a.to_kind(kind);  // [rank, in_features] — BF16
-    let b = lora_b.to_kind(kind);  // [out_features, rank] — BF16
-    let delta = b.matmul(&a);       // [out_features, in_features] — BF16
-    // Scalar multiply: keep BF16 (don't let it promote to FP32)
-    let scaled_delta = (delta * scaling).to_kind(kind);
-    base_weight + scaled_delta  // BF16 + BF16 = BF16
-}
-
-/// Forward pass with LoRA adapters applied to attention + shared expert.
-/// Returns (logits, pre_lm_head_hidden) — hidden needed for MTP loss.
-fn forward_with_lora(
-    input_ids: &Tensor,
-    weights: &BTreeMap<String, Tensor>,
-    config: &Qwen36RuntimeConfig,
-    registry: &Qwen36LoraRegistry,
-    ep_shard: Option<&EpShard>,
-    compute_kind: Kind,
-) -> (Tensor, Tensor) {
-    let embed_prefix = format!("{}embed_tokens.weight", config.weight_prefix);
-    let embed_tokens = weights.get(&embed_prefix).unwrap().to_kind(compute_kind);
-    let final_norm = weights.get(&format!("{}norm.weight", config.weight_prefix)).unwrap().to_kind(compute_kind);
-
-    let mut hidden = Tensor::embedding(&embed_tokens, &input_ids, -1, false, false);
-    // Set requires_grad so C++ autograd::Function builds a graph through checkpoint groups
-    hidden = hidden.detach().set_requires_grad(true);
-    let scaling = registry.scaling();
-
-    for layer_index in 0..config.num_hidden_layers {
-        let is_target = registry.config.target_layers.contains(&layer_index);
-        let prefix = format!("{}layers.{layer_index}", config.weight_prefix);
-
-        // Norms
-        let input_norm = weights.get(&format!("{prefix}.input_layernorm.weight")).unwrap().to_kind(compute_kind);
-        let post_norm = weights.get(&format!("{prefix}.post_attention_layernorm.weight")).unwrap().to_kind(compute_kind);
-
-        // Attention input
-        let attn_input = model::rms_norm(&hidden, &input_norm, config.rms_norm_eps).to_kind(compute_kind);
-
-        // Attention with LoRA
-        let attn_output = match config.layer_types[layer_index] {
-            LayerType::FullAttention => {
-                let mut w = model::FullAttnWeights {
-                    q_proj: weights.get(&format!("{prefix}.self_attn.q_proj.weight")).unwrap().to_kind(compute_kind),
-                    q_norm: weights.get(&format!("{prefix}.self_attn.q_norm.weight")).unwrap().to_kind(compute_kind),
-                    k_proj: weights.get(&format!("{prefix}.self_attn.k_proj.weight")).unwrap().to_kind(compute_kind),
-                    k_norm: weights.get(&format!("{prefix}.self_attn.k_norm.weight")).unwrap().to_kind(compute_kind),
-                    v_proj: weights.get(&format!("{prefix}.self_attn.v_proj.weight")).unwrap().to_kind(compute_kind),
-                    o_proj: weights.get(&format!("{prefix}.self_attn.o_proj.weight")).unwrap().to_kind(compute_kind),
-                };
-
-                if is_target {
-                    // Apply LoRA to all target modules (q_proj, k_proj, v_proj, o_proj)
-                    for &module in &registry.config.target_modules {
-                        let base = match module {
-                            Qwen36LoraTargetModule::QProj => &w.q_proj,
-                            Qwen36LoraTargetModule::KProj => &w.k_proj,
-                            Qwen36LoraTargetModule::VProj => &w.v_proj,
-                            Qwen36LoraTargetModule::OProj => &w.o_proj,
-                            _ => continue, // non-full-attn modules handled below
-                        };
-                        let base_owned = base.shallow_clone();
-                        if let Some((a, b)) = registry.adapter_ref(layer_index, module) {
-                            let w_delta = lora_weight_delta(&base_owned, &a, &b, scaling);
-                            match module {
-                                Qwen36LoraTargetModule::QProj => w.q_proj = w_delta,
-                                Qwen36LoraTargetModule::KProj => w.k_proj = w_delta,
-                                Qwen36LoraTargetModule::VProj => w.v_proj = w_delta,
-                                Qwen36LoraTargetModule::OProj => w.o_proj = w_delta,
-                                _ => {}
-                            }
-                        }
-                    }
-                }
-
-                model::full_attention(&attn_input, &w, config, compute_kind)
-            }
-            LayerType::LinearAttention => {
-                let mut w = model::LinearAttnWeights {
-                    in_proj_qkv: weights.get(&format!("{prefix}.linear_attn.in_proj_qkv.weight")).unwrap().to_kind(compute_kind),
-                    in_proj_z: weights.get(&format!("{prefix}.linear_attn.in_proj_z.weight")).unwrap().to_kind(compute_kind),
-                    in_proj_a: weights.get(&format!("{prefix}.linear_attn.in_proj_a.weight")).unwrap().to_kind(compute_kind),
-                    in_proj_b: weights.get(&format!("{prefix}.linear_attn.in_proj_b.weight")).unwrap().to_kind(compute_kind),
-                    a_log: weights.get(&format!("{prefix}.linear_attn.A_log")).unwrap().to_kind(compute_kind),
-                    dt_bias: weights.get(&format!("{prefix}.linear_attn.dt_bias")).unwrap().to_kind(compute_kind),
-                    conv1d_weight: weights.get(&format!("{prefix}.linear_attn.conv1d.weight")).unwrap().to_kind(compute_kind),
-                    norm: weights.get(&format!("{prefix}.linear_attn.norm.weight")).unwrap().to_kind(compute_kind),
-                    out_proj: weights.get(&format!("{prefix}.linear_attn.out_proj.weight")).unwrap().to_kind(compute_kind),
-                };
-
-                if is_target {
-                    // Apply LoRA to linear attention projections
-                    for &module in &registry.config.target_modules {
-                        let base = match module {
-                            Qwen36LoraTargetModule::InProjQkv => &w.in_proj_qkv,
-                            Qwen36LoraTargetModule::InProjZ => &w.in_proj_z,
-                            Qwen36LoraTargetModule::OutProj => &w.out_proj,
-                            _ => continue,
-                        };
-                        let base_owned = base.shallow_clone();
-                        if let Some((a, b)) = registry.adapter_ref(layer_index, module) {
-                            let w_delta = lora_weight_delta(&base_owned, &a, &b, scaling);
-                            match module {
-                                Qwen36LoraTargetModule::InProjQkv => w.in_proj_qkv = w_delta,
-                                Qwen36LoraTargetModule::InProjZ => w.in_proj_z = w_delta,
-                                Qwen36LoraTargetModule::OutProj => w.out_proj = w_delta,
-                                _ => {}
-                            }
-                        }
-                    }
-                }
-
-                model::linear_attention(&attn_input, &w, config, compute_kind)
-            }
-        };
-
-        let after_attention = &hidden + &attn_output;
-
-        // MoE with optional EP sharding
-        let moe_input = model::rms_norm(&after_attention, &post_norm, config.rms_norm_eps).to_kind(compute_kind);
-
-        let moe_output = if let Some(shard) = ep_shard {
-            // EP mode: load sharded experts, compute routed-only + shared, caller all-reduces routed
-            let moe = model::MoeWeights::load_ep(weights, &prefix, compute_kind, shard.expert_start, shard.experts_per_rank).unwrap();
-            let routed = model::moe_routed_only_ep(&moe_input, &moe, config, compute_kind);
-            let shared = model::moe_shared_only(&moe_input, &moe, compute_kind);
-            &routed + &shared
-        } else {
-            let moe = model::MoeWeights::load(weights, &prefix, compute_kind).unwrap();
-            model::moe_forward(&moe_input, &moe, config, compute_kind)
-        };
-
-        hidden = (&after_attention + &moe_output).to_kind(compute_kind);
-    }
-
-    let hidden_raw = hidden.shallow_clone();  // pre-norm hidden for MTP
-    let hidden_normed = model::rms_norm(&hidden, &final_norm, config.rms_norm_eps).to_kind(compute_kind);
-    let lm_head = if config.tie_word_embeddings {
-        embed_tokens.shallow_clone()
-    } else {
-        weights.get("lm_head.weight").unwrap().to_kind(compute_kind)
-    };
-
-    let logits = hidden_normed.linear::<&Tensor>(&lm_head, None);
-    (logits, hidden_raw)  // MTP needs pre-norm hidden
-}
-
-/// Forward with gradient checkpointing via C++ autograd::Function.
-fn forward_with_lora_checkpointed(
-    input_ids: &Tensor,
-    weights: &BTreeMap<String, Tensor>,
-    config: &Qwen36RuntimeConfig,
-    registry: &Qwen36LoraRegistry,
-    ep_shard: Option<&EpShard>,
-    compute_kind: Kind,
-    group_size: usize,
-) -> (Tensor, Tensor) {
-    let embed_prefix = format!("{}embed_tokens.weight", config.weight_prefix);
-    let embed_tokens = weights.get(&embed_prefix).unwrap().to_kind(compute_kind);
-    let final_norm = weights.get(&format!("{}norm.weight", config.weight_prefix)).unwrap().to_kind(compute_kind);
-
-    let mut hidden = Tensor::embedding(&embed_tokens, &input_ids, -1, false, false);
-    // Set requires_grad so C++ autograd::Function builds a graph through checkpoint groups
-    hidden = hidden.detach().set_requires_grad(true);
-
-    let ep_count = ep_shard.map(|s| s.experts_per_rank).unwrap_or(256);
-    let scaling = registry.scaling();
-
-    let adapter_map: BTreeMap<(usize, Qwen36LoraTargetModule), (Tensor, Tensor)> = registry
-        .adapters.iter().map(|(k, v)| (*k, (v.0.shallow_clone(), v.1.shallow_clone()))).collect();
-
-    for group_start in (0..config.num_hidden_layers).step_by(group_size) {
-        let group_end = (group_start + group_size).min(config.num_hidden_layers);
-        // Clone weights — Tensor doesn't impl Clone, so we manually shallow_clone each entry
-        let w: BTreeMap<String, Tensor> = weights.iter().map(|(k, v)| (k.clone(), v.shallow_clone())).collect();
-        let a: BTreeMap<(usize, Qwen36LoraTargetModule), (Tensor, Tensor)> = adapter_map.iter().map(|(k, v)| (*k, (v.0.shallow_clone(), v.1.shallow_clone()))).collect();
-        let c = config.clone();
-        let lc = registry.config.clone();
-        let gs = group_start;
-        let ge = group_end;
-        let ek = compute_kind;
-        let ep = ep_count;
-        let sc = scaling;
-
-        let checkpoint_fn = move |input: &Tensor| -> Tensor {
-            let weights = &w;
-            let adapters = &a;
-            let cfg = &c;
-            let lcfg = &lc;
-            let mut h = input.shallow_clone();
-            for layer_index in gs..ge {
-                let is_target = lcfg.target_layers.contains(&layer_index);
-                let prefix = format!("{}layers.{layer_index}", cfg.weight_prefix);
-                let input_norm = weights.get(&format!("{prefix}.input_layernorm.weight")).unwrap().to_kind(ek);
-                let post_norm = weights.get(&format!("{prefix}.post_attention_layernorm.weight")).unwrap().to_kind(ek);
-                let attn_input = model::rms_norm(&h, &input_norm, cfg.rms_norm_eps).to_kind(ek);
-
-                let attn_output = match cfg.layer_types[layer_index] {
-                    LayerType::FullAttention => {
-                        let mut fw = model::FullAttnWeights {
-                            q_proj: weights.get(&format!("{prefix}.self_attn.q_proj.weight")).unwrap().to_kind(ek),
-                            q_norm: weights.get(&format!("{prefix}.self_attn.q_norm.weight")).unwrap().to_kind(ek),
-                            k_proj: weights.get(&format!("{prefix}.self_attn.k_proj.weight")).unwrap().to_kind(ek),
-                            k_norm: weights.get(&format!("{prefix}.self_attn.k_norm.weight")).unwrap().to_kind(ek),
-                            v_proj: weights.get(&format!("{prefix}.self_attn.v_proj.weight")).unwrap().to_kind(ek),
-                            o_proj: weights.get(&format!("{prefix}.self_attn.o_proj.weight")).unwrap().to_kind(ek),
-                        };
-                        if is_target {
-                            for &module in &lcfg.target_modules {
-                                let base = match module {
-                                    Qwen36LoraTargetModule::QProj => &fw.q_proj,
-                                    Qwen36LoraTargetModule::KProj => &fw.k_proj,
-                                    Qwen36LoraTargetModule::VProj => &fw.v_proj,
-                                    Qwen36LoraTargetModule::OProj => &fw.o_proj,
-                                    _ => continue,
-                                };
-                                let base_owned = base.shallow_clone();
-                                if let Some((la, lb)) = adapters.get(&(layer_index, module)) {
-                                    let delta = lb.to_kind(base_owned.kind()).matmul(&la.to_kind(base_owned.kind()));
-                                    let w_new = &base_owned + (delta * sc).to_kind(base_owned.kind());
-                                    match module {
-                                        Qwen36LoraTargetModule::QProj => fw.q_proj = w_new,
-                                        Qwen36LoraTargetModule::KProj => fw.k_proj = w_new,
-                                        Qwen36LoraTargetModule::VProj => fw.v_proj = w_new,
-                                        Qwen36LoraTargetModule::OProj => fw.o_proj = w_new,
-                                        _ => {}
-                                    }
-                                }
-                            }
-                        }
-                        model::full_attention(&attn_input, &fw, cfg, ek)
-                    }
-                    LayerType::LinearAttention => {
-                        let lw = model::LinearAttnWeights {
-                            in_proj_qkv: weights.get(&format!("{prefix}.linear_attn.in_proj_qkv.weight")).unwrap().to_kind(ek),
-                            in_proj_z: weights.get(&format!("{prefix}.linear_attn.in_proj_z.weight")).unwrap().to_kind(ek),
-                            in_proj_a: weights.get(&format!("{prefix}.linear_attn.in_proj_a.weight")).unwrap().to_kind(ek),
-                            in_proj_b: weights.get(&format!("{prefix}.linear_attn.in_proj_b.weight")).unwrap().to_kind(ek),
-                            a_log: weights.get(&format!("{prefix}.linear_attn.A_log")).unwrap().to_kind(ek),
-                            dt_bias: weights.get(&format!("{prefix}.linear_attn.dt_bias")).unwrap().to_kind(ek),
-                            conv1d_weight: weights.get(&format!("{prefix}.linear_attn.conv1d.weight")).unwrap().to_kind(ek),
-                            norm: weights.get(&format!("{prefix}.linear_attn.norm.weight")).unwrap().to_kind(ek),
-                            out_proj: weights.get(&format!("{prefix}.linear_attn.out_proj.weight")).unwrap().to_kind(ek),
-                        };
-                        model::linear_attention(&attn_input, &lw, cfg, ek)
-                    }
-                };
-
-                let after_attention = &h + &attn_output;
-                let moe_input = model::rms_norm(&after_attention, &post_norm, cfg.rms_norm_eps).to_kind(ek);
-                let moe_output = if ep < 256 {
-                    let moe = model::MoeWeights::load_ep(weights, &prefix, ek, 0, ep).unwrap();
-                    &model::moe_routed_only_ep(&moe_input, &moe, cfg, ek) + &model::moe_shared_only(&moe_input, &moe, ek)
-                } else {
-                    let moe = model::MoeWeights::load(weights, &prefix, ek).unwrap();
-                    model::moe_forward(&moe_input, &moe, cfg, ek)
-                };
-                h = (&after_attention + &moe_output).to_kind(ek);
-            }
-            h
-        };
-
-        // Use C++ checkpoint forward for this group, fallback to eager
-        hidden = crate::kernel::checkpoint_forward(
-            &hidden, &(group_start..group_end).collect::<Vec<_>>(),
-            weights, config, registry,
-            ep_shard.map(|s| s.expert_start).unwrap_or(0),
-            ep_shard.map(|s| s.experts_per_rank).unwrap_or(256),
-            compute_kind,
-        ).unwrap_or_else(|e| {
-            tracing::warn!("C++ checkpoint failed ({e}), using eager forward");
-            let mut h = hidden.shallow_clone();
-            for layer_index in group_start..group_end {
-                h = forward_single_layer(&h, weights, config, registry, ep_shard, compute_kind, layer_index);
-            }
-            h
-        });
-    }
-
-    let hidden_normed = model::rms_norm(&hidden, &final_norm, config.rms_norm_eps).to_kind(compute_kind);
-    let lm_head = if config.tie_word_embeddings { embed_tokens.shallow_clone() }
-        else { weights.get("lm_head.weight").unwrap().to_kind(compute_kind) };
-    (hidden_normed.linear::<&Tensor>(&lm_head, None), hidden_normed)
-}
-
-/// Forward a single layer (used by checkpointed forward, both in no_grad and with grad).
-fn forward_single_layer(
-    hidden: &Tensor,
-    weights: &BTreeMap<String, Tensor>,
-    config: &Qwen36RuntimeConfig,
-    registry: &Qwen36LoraRegistry,
-    ep_shard: Option<&EpShard>,
-    compute_kind: Kind,
-    layer_index: usize,
-) -> Tensor {
-    let is_target = registry.config.target_layers.contains(&layer_index);
-    let prefix = format!("{}layers.{layer_index}", config.weight_prefix);
-    let scaling = registry.scaling();
-
-    let input_norm = weights.get(&format!("{prefix}.input_layernorm.weight")).unwrap().to_kind(compute_kind);
-    let post_norm = weights.get(&format!("{prefix}.post_attention_layernorm.weight")).unwrap().to_kind(compute_kind);
-
-    let attn_input = model::rms_norm(hidden, &input_norm, config.rms_norm_eps).to_kind(compute_kind);
-
-    let attn_output = match config.layer_types[layer_index] {
-        LayerType::FullAttention => {
-            let mut w = model::FullAttnWeights {
-                q_proj: weights.get(&format!("{prefix}.self_attn.q_proj.weight")).unwrap().to_kind(compute_kind),
-                q_norm: weights.get(&format!("{prefix}.self_attn.q_norm.weight")).unwrap().to_kind(compute_kind),
-                k_proj: weights.get(&format!("{prefix}.self_attn.k_proj.weight")).unwrap().to_kind(compute_kind),
-                k_norm: weights.get(&format!("{prefix}.self_attn.k_norm.weight")).unwrap().to_kind(compute_kind),
-                v_proj: weights.get(&format!("{prefix}.self_attn.v_proj.weight")).unwrap().to_kind(compute_kind),
-                o_proj: weights.get(&format!("{prefix}.self_attn.o_proj.weight")).unwrap().to_kind(compute_kind),
-            };
-
-            if is_target {
-                for &module in &registry.config.target_modules {
-                    let base = match module {
-                        Qwen36LoraTargetModule::QProj => &w.q_proj,
-                        Qwen36LoraTargetModule::KProj => &w.k_proj,
-                        Qwen36LoraTargetModule::VProj => &w.v_proj,
-                        Qwen36LoraTargetModule::OProj => &w.o_proj,
-                        _ => continue,
-                    };
-                    let base_owned = base.shallow_clone();
-                    if let Some((a, b)) = registry.adapter_ref(layer_index, module) {
-                        let w_delta = lora_weight_delta(&base_owned, &a, &b, scaling);
-                        match module {
-                            Qwen36LoraTargetModule::QProj => w.q_proj = w_delta,
-                            Qwen36LoraTargetModule::KProj => w.k_proj = w_delta,
-                            Qwen36LoraTargetModule::VProj => w.v_proj = w_delta,
-                            Qwen36LoraTargetModule::OProj => w.o_proj = w_delta,
-                            _ => {}
-                        }
-                    }
-                }
-            }
-
-            model::full_attention(&attn_input, &w, config, compute_kind)
-        }
-        LayerType::LinearAttention => {
-            let mut w = model::LinearAttnWeights {
-                in_proj_qkv: weights.get(&format!("{prefix}.linear_attn.in_proj_qkv.weight")).unwrap().to_kind(compute_kind),
-                in_proj_z: weights.get(&format!("{prefix}.linear_attn.in_proj_z.weight")).unwrap().to_kind(compute_kind),
-                in_proj_a: weights.get(&format!("{prefix}.linear_attn.in_proj_a.weight")).unwrap().to_kind(compute_kind),
-                in_proj_b: weights.get(&format!("{prefix}.linear_attn.in_proj_b.weight")).unwrap().to_kind(compute_kind),
-                a_log: weights.get(&format!("{prefix}.linear_attn.A_log")).unwrap().to_kind(compute_kind),
-                dt_bias: weights.get(&format!("{prefix}.linear_attn.dt_bias")).unwrap().to_kind(compute_kind),
-                conv1d_weight: weights.get(&format!("{prefix}.linear_attn.conv1d.weight")).unwrap().to_kind(compute_kind),
-                norm: weights.get(&format!("{prefix}.linear_attn.norm.weight")).unwrap().to_kind(compute_kind),
-                out_proj: weights.get(&format!("{prefix}.linear_attn.out_proj.weight")).unwrap().to_kind(compute_kind),
-            };
-
-            if is_target {
-                for &module in &registry.config.target_modules {
-                    let base = match module {
-                        Qwen36LoraTargetModule::InProjQkv => &w.in_proj_qkv,
-                        Qwen36LoraTargetModule::InProjZ => &w.in_proj_z,
-                        Qwen36LoraTargetModule::OutProj => &w.out_proj,
-                        _ => continue,
-                    };
-                    let base_owned = base.shallow_clone();
-                    if let Some((a, b)) = registry.adapter_ref(layer_index, module) {
-                        let w_delta = lora_weight_delta(&base_owned, &a, &b, scaling);
-                        match module {
-                            Qwen36LoraTargetModule::InProjQkv => w.in_proj_qkv = w_delta,
-                            Qwen36LoraTargetModule::InProjZ => w.in_proj_z = w_delta,
-                            Qwen36LoraTargetModule::OutProj => w.out_proj = w_delta,
-                            _ => {}
-                        }
-                    }
-                }
-            }
-
-            model::linear_attention(&attn_input, &w, config, compute_kind)
-        }
-    };
-
-    let after_attention = hidden + &attn_output;
-
-    let moe_input = model::rms_norm(&after_attention, &post_norm, config.rms_norm_eps).to_kind(compute_kind);
-
-    let moe_output = if let Some(shard) = ep_shard {
-        // EP mode: tensors already narrowed in BTreeMap, use expert_start=0
-        let moe = model::MoeWeights::load_ep(weights, &prefix, compute_kind, 0, shard.experts_per_rank).unwrap();
-        let routed = model::moe_routed_only_ep(&moe_input, &moe, config, compute_kind);
-        let shared = model::moe_shared_only(&moe_input, &moe, compute_kind);
-        &routed + &shared
-    } else {
-        let moe = model::MoeWeights::load(weights, &prefix, compute_kind).unwrap();
-        model::moe_forward(&moe_input, &moe, config, compute_kind)
-    };
-
-    (after_attention + moe_output).to_kind(compute_kind)
-}
-
-/// Manual backward through checkpointed layer groups.
-/// Recomputes each group's forward WITH grad, backprops, accumulates into LoRA params.
-fn manual_backward_checkpointed(
-    grad_output: &Tensor,
-    group_inputs: &mut [Tensor],
-    weights: &BTreeMap<String, Tensor>,
-    config: &Qwen36RuntimeConfig,
-    registry: &Qwen36LoraRegistry,
-    ep_shard: Option<&EpShard>,
-    compute_kind: Kind,
-    group_size: usize,
-) {
-    let mut grad = grad_output.shallow_clone();
-
-    for (group_idx, group_input) in group_inputs.iter_mut().enumerate().rev() {
-        let group_start = group_idx * group_size;
-        let group_end = (group_start + group_size).min(config.num_hidden_layers);
-
-        // Recompute group forward WITH grad (builds graph for LoRA params)
-        let group_output = {
-            let mut h = group_input.shallow_clone();
-            for layer_index in group_start..group_end {
-                h = forward_single_layer(&h, weights, config, registry, ep_shard, compute_kind, layer_index);
-            }
-            h
-        };
-
-        // Backprop through this group (non-scalar: multiply by grad, sum, backward)
-        let loss = (group_output * &grad).sum(Kind::Float);
-        loss.backward();
-
-        // Get gradient w.r.t. group input for the next group
-        grad = group_input.grad();
-        group_input.zero_grad();
-    }
-}
-
-// ──────────────────────────────────────────────────────────────────────
-// Cross-entropy loss
-// ──────────────────────────────────────────────────────────────────────
-
-fn cross_entropy_loss(
-    logits: &Tensor,
-    target_ids: &Tensor,
-    target_mask: &Tensor,
-    vocab_size: i64,
-) -> Tensor {
-    let seq_len = logits.size()[1];
-    let shifted_logits = logits.narrow(1, 0, seq_len - 1).reshape([-1, vocab_size]);
-    let shifted_targets = target_ids.narrow(1, 1, seq_len - 1).reshape([-1]);
-    let shifted_mask = target_mask.narrow(1, 1, seq_len - 1).reshape([-1]);
-
-    let log_probs = shifted_logits.log_softmax(-1, Kind::Float);
-    let per_token_loss = log_probs.g_nll_loss::<&Tensor>(&shifted_targets, None, Reduction::None, -100);
-    let masked_loss = &per_token_loss * &shifted_mask;
-    let total = masked_loss.sum(Kind::Float);
-    let count = shifted_mask.sum(Kind::Float).clamp_min(1.0);
-    total / count
-}
-
-// ──────────────────────────────────────────────────────────────────────
 // Entry point: single-GPU LoRA SFT
 // ──────────────────────────────────────────────────────────────────────
 
@@ -734,11 +248,7 @@ fn train_impl(
         }
     }
 
-    // Create LoRA registry
-    let registry = Qwen36LoraRegistry::new(&weights_gpu, &runtime_config, lora_config, device)?;
-    let mut trainable_vars = registry.trainable_variables();
-    let trainable_params = registry.trainable_param_count();
-    info!("LoRA: {} trainable tensors, {} params", trainable_vars.len(), trainable_params);
+    info!("LoRA config: rank={}, alpha={}", lora_config.rank, lora_config.alpha);
 
     // Load SFT data
     let tokenizer_path = model_path.join("tokenizer.json");
@@ -749,8 +259,8 @@ fn train_impl(
         bail!("[data] section required for SFT training");
     };
 
-    // Load MTP weights if available
-    let mtp_weights = if runtime_config.mtp_num_hidden_layers > 0 {
+    // Load MTP weights into weights_gpu if available (C++ uses them via set_mtp_weights)
+    if runtime_config.mtp_num_hidden_layers > 0 {
         let mtp_names = crate::mtp::MtpWeights::weight_names(&runtime_config);
         let mtp_needed: HashSet<String> = mtp_names.into_iter().collect();
         let mtp_tensors = read_safetensors_dir_filtered(&model_path, &mtp_needed)?;
@@ -758,45 +268,48 @@ fn train_impl(
         for (name, tensor) in &mtp_tensors {
             mtp_gpu.insert(name.clone(), tensor.to_device(device).to_kind(compute_kind));
         }
-        // Merge MTP weights into the main weight map
         for (name, tensor) in mtp_gpu {
             weights_gpu.insert(name, tensor);
         }
-        Some(crate::mtp::MtpWeights::load(&weights_gpu, &runtime_config, compute_kind)?)
-    } else {
-        None
-    };
+    }
 
-    // Get embed_tokens and lm_head for MTP
-    let embed_tokens_ref = weights_gpu.get(&format!("{}embed_tokens.weight", runtime_config.weight_prefix))
-        .map(|t| t.to_kind(compute_kind))
-        .unwrap_or_else(|| Tensor::zeros([1, 1], (compute_kind, device)));
-    let lm_head_ref = if runtime_config.tie_word_embeddings {
-        embed_tokens_ref.shallow_clone()
-    } else {
-        weights_gpu.get("lm_head.weight").map(|t| t.to_kind(compute_kind)).unwrap_or_else(|| Tensor::zeros([1, 1], (compute_kind, device)))
-    };
-
-    // Adam optimizer state
-    let lr = config.train.learning_rate as f64;
-    let beta1 = config.train.adam_beta1 as f64;
-    let beta2 = config.train.adam_beta2 as f64;
-    let eps = config.train.adam_eps as f64;
-    let mut adam_m: Vec<Tensor> = trainable_vars.iter().map(|v| Tensor::zeros_like(v)).collect();
-    let mut adam_v: Vec<Tensor> = trainable_vars.iter().map(|v| Tensor::zeros_like(v)).collect();
-
-    // NCCL init for EP
-    let nccl_comm = if is_ep {
-        let comm_dir = run_paths.root.join("nccl_comm");
-        std::fs::create_dir_all(&comm_dir)?;
-        Some(rustrain_nccl::nccl::NcclPersistentComm::new(&comm_dir)?)
-    } else {
-        None
-    };
-
-    let vocab_size = runtime_config.vocab_size;
     let batch_size = config.train.micro_batch_size;
     let max_steps = config.train.max_steps as usize;
+
+    // ── C++ all-in-C++ training path (required) ──
+    // LoRA A/B, Adam optimizer, forward, loss, backward all in C++.
+    if !crate::kernel::kernels_available() {
+        bail!("C++ kernels (libqwen36_kernels.so) not found — required for training. Ensure the .so is in LD_LIBRARY_PATH.");
+    }
+
+    let ctx = crate::kernel::CppTrainingContext::new(
+        &weights_gpu, &runtime_config, compute_kind,
+        config.train.learning_rate as f64,
+        config.train.adam_beta1 as f64,
+        config.train.adam_beta2 as f64,
+        config.train.adam_eps as f64,
+        16.0 / 8.0,  // lora scaling = alpha / rank
+        shard_ref.map(|s| s.expert_start).unwrap_or(0),
+        shard_ref.map(|s| s.experts_per_rank).unwrap_or(256),
+    )?;
+    info!("C++ TrainingContext: {} LoRA params", ctx.lora_count());
+
+    // Set MTP weights if available
+    if runtime_config.mtp_num_hidden_layers > 0 {
+        ctx.set_mtp_weights(
+            &weights_gpu, &runtime_config,
+            shard_ref.map(|s| s.expert_start).unwrap_or(0),
+            shard_ref.map(|s| s.experts_per_rank).unwrap_or(256),
+        )?;
+        info!("C++ TrainingContext: MTP weights set ({} layers)", runtime_config.mtp_num_hidden_layers);
+    }
+
+    // Enable gradient checkpointing if env var set
+    if let Ok(gs) = std::env::var("QWEN36_CHECKPOINT_GROUP") {
+        let group_size: i64 = gs.parse().unwrap_or(4);
+        ctx.set_checkpoint(true, group_size);
+        info!("C++ TrainingContext: gradient checkpointing ON (group_size={group_size})");
+    }
 
     // Training loop
     let mut initial_loss = 0.0_f64;
@@ -807,108 +320,51 @@ fn train_impl(
         let sft_batch = data.batch(data_start, batch_size);
         let (input_ids, target_mask) = sft_batch.to_tensors(device, compute_kind);
 
-        // Forward — use Rust eager by default (verified working), C++ checkpoint optional
-        // C++ checkpoint saves memory but has a gradient propagation issue to fix.
-        // To enable: set use_checkpoint=true in config.
-        let use_checkpoint = std::env::var("QWEN36_CHECKPOINT").is_ok();
-        let (logits, hidden) = if use_checkpoint && crate::kernel::kernels_available() {
-            let group_size = 4;
-            // C++ checkpointed forward: groups of 4 layers, recompute during backward
-            let embed_prefix = format!("{}embed_tokens.weight", runtime_config.weight_prefix);
-            let embed_tokens = weights_gpu.get(&embed_prefix).unwrap().to_kind(compute_kind);
-            let final_norm = weights_gpu.get(&format!("{}norm.weight", runtime_config.weight_prefix)).unwrap().to_kind(compute_kind);
-
-            let mut hidden = Tensor::embedding(&embed_tokens, &input_ids, -1, false, false);
-            hidden = hidden.detach().set_requires_grad(true);
-
-            let ep_start = shard_ref.map(|s| s.expert_start).unwrap_or(0);
-            let ep_count = shard_ref.map(|s| s.experts_per_rank).unwrap_or(256);
-
-            for group_start in (0..runtime_config.num_hidden_layers).step_by(group_size) {
-                let group_end = (group_start + group_size).min(runtime_config.num_hidden_layers);
-                let layer_indices: Vec<usize> = (group_start..group_end).collect();
-                hidden = crate::kernel::checkpoint_forward(
-                    &hidden, &layer_indices, &weights_gpu, &runtime_config,
-                    &registry, ep_start, ep_count, compute_kind,
-                ).unwrap_or_else(|e| {
-                    tracing::warn!("C++ checkpoint failed ({e}), using eager");
-                    let mut h = hidden.shallow_clone();
-                    for &li in &layer_indices {
-                        h = forward_single_layer(&h, &weights_gpu, &runtime_config, &registry, shard_ref, compute_kind, li);
-                    }
-                    h
-                });
-            }
-
-            let hidden_raw = hidden.shallow_clone();  // pre-norm hidden for MTP
-            let hidden_normed = model::rms_norm(&hidden, &final_norm, runtime_config.rms_norm_eps).to_kind(compute_kind);
-            let lm_head = if runtime_config.tie_word_embeddings { embed_tokens.shallow_clone() }
-                else { weights_gpu.get("lm_head.weight").unwrap().to_kind(compute_kind) };
-            let logits = hidden_normed.linear::<&Tensor>(&lm_head, None);
-            (logits, hidden_raw)  // MTP needs pre-norm hidden
-        } else {
-            // Fallback: Rust eager forward (no checkpointing)
-            forward_with_lora(&input_ids, &weights_gpu, &runtime_config, &registry, shard_ref, compute_kind)
-        };
-
-        // Loss: cross-entropy + optional MTP loss
-        let lm_loss = cross_entropy_loss(&logits, &input_ids, &target_mask, vocab_size);
-        let loss = if let Some(ref mtp_w) = mtp_weights {
-            let mtp_aux = crate::mtp::mtp_loss(
-                &logits, &hidden, &input_ids, &target_mask,
-                mtp_w, &embed_tokens_ref, &lm_head_ref,
-                &runtime_config, compute_kind,
-            );
-            &lm_loss + &mtp_aux
-        } else {
-            lm_loss
-        };
-
-        let loss_value = loss.double_value(&[]);
-        if step == 0 {
-            initial_loss = loss_value;
-        }
+        // C++ all-in-C++ path: single call does forward + loss + backward + Adam
+        let loss_value = ctx.train_step(&input_ids, &target_mask)?;
+        if step == 0 { initial_loss = loss_value; }
         final_loss = loss_value;
         if step % 10 == 0 || step == max_steps - 1 {
             info!("step {step}/{max_steps} loss={loss_value:.6}");
         }
-
-        // Backward — C++ autograd::Function handles recomputation automatically
-        loss.backward();
-
-        // Adam optimizer step (must be in no_grad context for in-place ops)
-        tch::no_grad(|| {
-            for (i, var) in trainable_vars.iter_mut().enumerate() {
-                let grad = var.grad();
-                if grad.defined() {
-                    let g_synced = if let Some(ref comm) = nccl_comm {
-                        comm.all_reduce(&grad).unwrap_or_else(|_| grad.shallow_clone())
-                    } else {
-                        grad.shallow_clone()
-                    };
-                    let g = if is_ep { &g_synced / world_size as f64 } else { g_synced };
-                    adam_m[i] = &adam_m[i] * beta1 + &g * (1.0 - beta1);
-                    adam_v[i] = &adam_v[i] * beta2 + (&g * &g) * (1.0 - beta2);
-
-                    let step_f = (step + 1) as f64;
-                    let mh = &adam_m[i] / (1.0 - beta1.powf(step_f));
-                    let vh = &adam_v[i] / (1.0 - beta2.powf(step_f));
-                    let update = &mh / (&vh.sqrt() + eps);
-                    *var -= &(update * lr);
-                    var.zero_grad();
-                }
-            }
-        });
     }
 
-    // Save adapter
+    // Save adapter — export LoRA A/B from C++ to safetensors
     let adapter_path = run_paths.root.join("adapter.safetensors");
-    registry.save(&adapter_path)?;
+    {
+        let mut named_tensors: BTreeMap<String, Tensor> = BTreeMap::new();
+        for i in 0..ctx.lora_count() {
+            if let (Some(a), Some(b)) = (ctx.get_lora_a(i), ctx.get_lora_b(i)) {
+                named_tensors.insert(format!("lora_a_{i}"), a.to_kind(Kind::Float).to_device(tch::Device::Cpu));
+                named_tensors.insert(format!("lora_b_{i}"), b.to_kind(Kind::Float).to_device(tch::Device::Cpu));
+            }
+        }
+        use std::io::Write;
+        let mut tensors_data = Vec::new();
+        let mut header = serde_json::Map::new();
+        let mut offset = 0u64;
+        for (name, tensor) in &named_tensors {
+            let t = tensor.contiguous().to_kind(Kind::Float);
+            let shape: Vec<i64> = t.size().iter().copied().collect();
+            let data: Vec<f32> = Vec::<f32>::try_from(&t.reshape([-1]))?;
+            let bytes: Vec<u8> = data.iter().flat_map(|f| f.to_le_bytes()).collect();
+            header.insert(name.clone(), serde_json::json!({"dtype":"F32","shape":shape,"data_offsets":[offset,offset+bytes.len() as u64]}));
+            offset += bytes.len() as u64;
+            tensors_data.push(bytes);
+        }
+        let header_str = serde_json::to_string(&serde_json::Value::Object(header))?;
+        let file = std::fs::File::create(&adapter_path).with_context(|| format!("create {}", adapter_path.display()))?;
+        let mut writer = std::io::BufWriter::new(file);
+        writer.write_all(&(header_str.len() as u64).to_le_bytes())?;
+        writer.write_all(header_str.as_bytes())?;
+        for data in &tensors_data { writer.write_all(data)?; }
+        info!("saved adapter to {}", adapter_path.display());
+    }
 
     Ok(Qwen36LoraSftSummary {
         adapter_output: adapter_path.to_string_lossy().to_string(),
         initial_loss,
         final_loss,
-        trainable_params,
+        trainable_params: ctx.lora_count() as usize * 2,
     })
 }
