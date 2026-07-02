@@ -13,9 +13,9 @@ num_layers = 40
 num_attention_heads = 16
 num_key_value_heads = 2
 intermediate_size = 512
-seq_len = 32
+seq_len = 256
 norm = "rmsnorm"
-activation = "silu"
+activation = "swiglu"
 rope = true
 rms_norm_eps = 0.000001
 trainable_layers = [0, 1, 2, 3]
@@ -48,3 +48,7 @@ rank = 8
 alpha = 16
 target_layers = [0, 1, 2, 3]
 target_modules = ["q_proj", "k_proj", "v_proj", "o_proj"]
+
+[data]
+kind = "instruction_jsonl"
+paths = ["/tmp/qwen3_6_test.jsonl"]

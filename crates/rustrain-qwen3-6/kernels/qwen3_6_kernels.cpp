@@ -564,17 +564,17 @@ static at::Tensor mtp_forward(
 
     int64_t seq_len = hidden.size(1);
 
-    // Shift: hidden[t] predicts token t+1
+    // hidden[t] + embed[t] → predict token t+1
     auto hidden_shifted = hidden.narrow(1, 0, seq_len - 1);  // [batch, seq-1, hidden]
-    auto embed_next = at::embedding(embed, input_ids.narrow(1, 1, seq_len - 1));  // [batch, seq-1, hidden]
+    auto embed_cur = at::embedding(embed, input_ids.narrow(1, 0, seq_len - 1));  // [batch, seq-1, hidden]
 
     // RMSNorm both
     auto h_normed = rms_norm(hidden_shifted, *ctx->mtp_pre_fc_norm_hidden, ctx->rms_eps).to(kind);
-    auto e_normed = rms_norm(embed_next, *ctx->mtp_pre_fc_norm_emb, ctx->rms_eps).to(kind);
+    auto e_normed = rms_norm(embed_cur, *ctx->mtp_pre_fc_norm_emb, ctx->rms_eps).to(kind);
 
-    // Combine: [batch, seq-1, 2*hidden] → fc → [batch, seq-1, hidden]
-    auto combined = at::cat({h_normed, e_normed}, /*dim=*/-1);
-    auto projected = at::matmul(combined, ctx->mtp_fc->t());  // fc: [hidden, 2*hidden], fc.t(): [2*hidden, hidden]
+    // Combine: embed first, then hidden → fc projection
+    auto combined = at::cat({e_normed, h_normed}, /*dim=*/-1);
+    auto projected = at::matmul(combined, ctx->mtp_fc->t());  // fc: [hidden, 2*hidden]
 
     // MTP layers (full attention + MoE, no LoRA)
     at::Tensor h = projected;
@@ -593,7 +593,7 @@ static at::Tensor mtp_forward(
 }
 
 // MTP loss: cross-entropy on shifted tokens, weighted by 0.5
-// MTP logits[t] predicts token t+1 (same shift as main model, but from MTP forward)
+// MTP logits[t] (from hidden[t] + embed[t]) predicts token t+1
 static at::Tensor mtp_compute_loss(
     TrainingContext* ctx,
     const at::Tensor& mtp_logits,

@@ -8,11 +8,11 @@
 //! - mtp.layers.{N}: full attention + MoE (same architecture as main layers)
 //!
 //! Forward:
-//!   combined = pre_fc_norm_hidden(hidden[t]) + pre_fc_norm_embedding(embed[t+1])
+//!   combined = cat(pre_fc_norm_embedding(embed[t]), pre_fc_norm_hidden(hidden[t]))
 //!   projected = fc(combined)  → [hidden]
-//!   normed = norm(projected)
-//!   layer_output = mtp_layer(normed)  → full attention + MoE
+//!   layer_output = mtp_layer(projected)  → full attention + MoE
 //!   logits = lm_head(layer_output)
+//!   MTP predicts token t+1 from hidden[t] + embed[t]
 //!
 //! Loss: cross-entropy on shifted tokens, weight = 0.5
 
@@ -139,16 +139,15 @@ pub fn mtp_forward(
     let (batch, seq_len, _hidden) = hidden.size3().unwrap();
     let eps = config.rms_norm_eps;
 
-    // Shift: hidden[t] predicts token t+1
-    // MTP input = pre_fc_norm_hidden(hidden[t]) + pre_fc_norm_embedding(embed[t+1])
+    // hidden[t] + embed[t] → predict token t+1
     let hidden_shifted = hidden.narrow(1, 0, seq_len - 1);  // [batch, seq-1, hidden]
-    let embed_next = Tensor::embedding(embed_tokens, &input_ids.narrow(1, 1, seq_len - 1), -1, false, false);
+    let embed_cur = Tensor::embedding(embed_tokens, &input_ids.narrow(1, 0, seq_len - 1), -1, false, false);
 
     let h_normed = rms_norm(&hidden_shifted, &mtp_weights.pre_fc_norm_hidden, eps).to_kind(compute_kind);
-    let e_normed = rms_norm(&embed_next, &mtp_weights.pre_fc_norm_embedding, eps).to_kind(compute_kind);
+    let e_normed = rms_norm(&embed_cur, &mtp_weights.pre_fc_norm_embedding, eps).to_kind(compute_kind);
 
-    // Combine: [batch, seq-1, 2*hidden] → fc → [batch, seq-1, hidden]
-    let combined = Tensor::cat(&[&h_normed, &e_normed], -1);
+    // Combine: embed first, then hidden → fc projection
+    let combined = Tensor::cat(&[&e_normed, &h_normed], -1);
     let projected = combined.linear::<&Tensor>(&mtp_weights.fc, None);
 
     // MTP layers
