@@ -12,6 +12,7 @@ fn main() {
     println!("cargo:rerun-if-env-changed=TORCH_LIB_PATH");
     println!("cargo:rerun-if-changed=kernels/fp8_gemm.cpp");
     println!("cargo:rerun-if-changed=kernels/glm5_attention.cpp");
+    println!("cargo:rerun-if-changed=kernels/v4_flash_kernels.cpp");
     println!("cargo:rerun-if-changed=build.rs");
 
     // Skip on non-CUDA builds or when torch isn't available
@@ -197,6 +198,35 @@ fn main() {
         }
         _ => {
             println!("cargo:warning=Failed to compile GLM5 attention kernel, C++ attention disabled");
+        }
+    }
+
+    // ── Compile V4 Flash kernel ──
+    let v4_src = "kernels/v4_flash_kernels.cpp";
+    let v4_lib = format!("{out_dir}/libv4_flash_kernels.so");
+
+    println!("cargo:warning=Compiling V4 Flash kernel: src={v4_src}");
+
+    let v4_status = Command::new("g++")
+        .args([
+            "-shared", "-fPIC", "-std=c++17", "-O2",
+            cxx11_abi,
+            "-o", &v4_lib,
+            v4_src,
+            &inc_torch, &inc_aten, &inc_c10, &inc_caffe2, &inc_cuda,
+            &l_arg, &rpath_arg,
+            "-Wl,--no-as-needed",
+            "-ltorch", "-ltorch_cuda", "-ltorch_cpu", "-lc10", "-lc10_cuda",
+        ])
+        .args(if cuda_inc2.is_empty() { vec![] } else { vec![format!("-I{cuda_inc2}")] })
+        .status();
+
+    match v4_status {
+        Ok(s) if s.success() => {
+            println!("cargo:rustc-link-lib=dylib=v4_flash_kernels");
+        }
+        _ => {
+            println!("cargo:warning=Failed to compile V4 Flash kernel, V4 C++ path disabled");
         }
     }
 }
