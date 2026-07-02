@@ -88,14 +88,24 @@ impl MtpWeights {
                 format!("{p}.self_attn.k_norm.weight"),
                 format!("{p}.self_attn.v_proj.weight"),
                 format!("{p}.self_attn.o_proj.weight"),
-                format!("{p}.mlp.gate.weight"),
-                format!("{p}.mlp.shared_expert_gate.weight"),
-                format!("{p}.mlp.shared_expert.gate_proj.weight"),
-                format!("{p}.mlp.shared_expert.up_proj.weight"),
-                format!("{p}.mlp.shared_expert.down_proj.weight"),
-                format!("{p}.mlp.experts.gate_up_proj"),
-                format!("{p}.mlp.experts.down_proj"),
             ]);
+            if config.is_moe {
+                names.extend([
+                    format!("{p}.mlp.gate.weight"),
+                    format!("{p}.mlp.shared_expert_gate.weight"),
+                    format!("{p}.mlp.shared_expert.gate_proj.weight"),
+                    format!("{p}.mlp.shared_expert.up_proj.weight"),
+                    format!("{p}.mlp.shared_expert.down_proj.weight"),
+                    format!("{p}.mlp.experts.gate_up_proj"),
+                    format!("{p}.mlp.experts.down_proj"),
+                ]);
+            } else {
+                names.extend([
+                    format!("{p}.mlp.gate_proj.weight"),
+                    format!("{p}.mlp.up_proj.weight"),
+                    format!("{p}.mlp.down_proj.weight"),
+                ]);
+            }
         }
         names
     }

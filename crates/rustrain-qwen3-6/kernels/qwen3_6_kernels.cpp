@@ -216,6 +216,23 @@ static at::Tensor linear_attention(
 }
 
 // ──────────────────────────────────────────────────────────────────────
+// Dense MLP (SwiGLU) — for non-MoE models (Qwen3.5 dense)
+// ──────────────────────────────────────────────────────────────────────
+
+static at::Tensor dense_mlp_forward(
+    const at::Tensor& hidden,
+    const at::Tensor& gate_proj, const at::Tensor& up_proj, const at::Tensor& down_proj,
+    at::ScalarType compute_type
+) {
+    int64_t batch = hidden.size(0), seq = hidden.size(1), hidden_dim = hidden.size(2);
+    auto flat = hidden.reshape({batch * seq, hidden_dim});
+    auto gate_out = at::matmul(flat, gate_proj.t());
+    auto up_out = at::matmul(flat, up_proj.t());
+    auto activated = at::silu(gate_out) * up_out;
+    return at::matmul(activated, down_proj.t()).reshape({batch, seq, hidden_dim});
+}
+
+// ──────────────────────────────────────────────────────────────────────
 // MoE
 // ──────────────────────────────────────────────────────────────────────
 
@@ -274,11 +291,21 @@ static at::Tensor moe_forward(
 // Layer config + forward
 // ──────────────────────────────────────────────────────────────────────
 
+// Weight count per layer: dense has 3 MLP weights, MoE has 7 MoE weights.
+// Full attention: 2 norm + 6 attn + (3 dense | 7 moe) = 11 | 15
+// Linear attention: 2 norm + 9 linear_attn + (3 dense | 7 moe) = 14 | 18
+static inline int64_t weight_count_for_layer(const LayerConfig& cfg) {
+    int64_t attn_w = (cfg.layer_type == 0) ? 6 : 9;
+    int64_t mlp_w = (cfg.num_experts > 0) ? 7 : 3;
+    return 2 + attn_w + mlp_w;
+}
+
 struct LayerConfig {
     int64_t layer_type, num_heads, num_kv_heads, head_dim;
     int64_t num_k_heads, key_dim, num_v_heads, val_dim, conv_kernel;
     double partial_rotary_factor, rope_theta, rms_eps;
     int64_t num_experts, top_k, moe_intermediate, expert_start, expert_count;
+    int64_t intermediate_size;  // dense MLP intermediate size (0 for MoE)
     int32_t norm_topk_prob;
 };
 
@@ -290,9 +317,11 @@ static at::Tensor forward_single_layer(
     auto input_norm = *w[0];
     auto post_norm = *w[1];
     auto attn_input = rms_norm(hidden, input_norm, cfg->rms_eps);
+    bool is_moe = (cfg->num_experts > 0);
 
     at::Tensor attn_output;
     if (cfg->layer_type == 0) {
+        // Full attention
         auto q_proj = *w[2], q_norm = *w[3], k_proj = *w[4], k_norm = *w[5], v_proj = *w[6], o_proj = *w[7];
         if (la && la[0] && lb && lb[0]) {
             if (la[0] && lb[0]) q_proj = lora_delta(q_proj, *la[0], *lb[0], lora_scaling);
@@ -303,12 +332,19 @@ static at::Tensor forward_single_layer(
         attn_output = full_attention(attn_input, q_proj, q_norm, k_proj, k_norm, v_proj, o_proj,
             cfg->num_heads, cfg->num_kv_heads, cfg->head_dim,
             cfg->partial_rotary_factor, cfg->rope_theta, cfg->rms_eps, kind);
-        auto moe_out = moe_forward(rms_norm(hidden + attn_output, post_norm, cfg->rms_eps),
-            *w[8], *w[9], *w[10], *w[11], *w[12], *w[13], *w[14],
-            cfg->num_experts, cfg->top_k, cfg->moe_intermediate,
-            cfg->norm_topk_prob != 0, cfg->expert_start, cfg->expert_count, kind);
-        return hidden + attn_output + moe_out;
+        auto post_attn = rms_norm(hidden + attn_output, post_norm, cfg->rms_eps);
+        if (is_moe) {
+            auto mlp_out = moe_forward(post_attn,
+                *w[8], *w[9], *w[10], *w[11], *w[12], *w[13], *w[14],
+                cfg->num_experts, cfg->top_k, cfg->moe_intermediate,
+                cfg->norm_topk_prob != 0, cfg->expert_start, cfg->expert_count, kind);
+            return hidden + attn_output + mlp_out;
+        } else {
+            auto mlp_out = dense_mlp_forward(post_attn, *w[8], *w[9], *w[10], kind);
+            return hidden + attn_output + mlp_out;
+        }
     } else {
+        // Linear attention
         auto in_proj_qkv = *w[2], in_proj_z = *w[3], in_proj_a = *w[4], in_proj_b = *w[5];
         auto a_log = *w[6], dt_bias = *w[7], conv1d_w = *w[8], norm_w = *w[9], out_proj = *w[10];
         if (la && la[0] && lb && lb[0]) {
@@ -320,11 +356,17 @@ static at::Tensor forward_single_layer(
             a_log, dt_bias, conv1d_w, norm_w, out_proj,
             cfg->num_k_heads, cfg->key_dim, cfg->num_v_heads, cfg->val_dim,
             cfg->conv_kernel, cfg->rms_eps, kind);
-        auto moe_out = moe_forward(rms_norm(hidden + attn_output, post_norm, cfg->rms_eps),
-            *w[11], *w[12], *w[13], *w[14], *w[15], *w[16], *w[17],
-            cfg->num_experts, cfg->top_k, cfg->moe_intermediate,
-            cfg->norm_topk_prob != 0, cfg->expert_start, cfg->expert_count, kind);
-        return hidden + attn_output + moe_out;
+        auto post_attn = rms_norm(hidden + attn_output, post_norm, cfg->rms_eps);
+        if (is_moe) {
+            auto mlp_out = moe_forward(post_attn,
+                *w[11], *w[12], *w[13], *w[14], *w[15], *w[16], *w[17],
+                cfg->num_experts, cfg->top_k, cfg->moe_intermediate,
+                cfg->norm_topk_prob != 0, cfg->expert_start, cfg->expert_count, kind);
+            return hidden + attn_output + mlp_out;
+        } else {
+            auto mlp_out = dense_mlp_forward(post_attn, *w[11], *w[12], *w[13], kind);
+            return hidden + attn_output + mlp_out;
+        }
     }
 }
 
@@ -386,8 +428,8 @@ static at::Tensor forward_full(
         // Get weight pointers for this layer
         int64_t w_offset = 0;
         for (int64_t j = 0; j < i; j++)
-            w_offset += (ctx->layer_configs[j].layer_type == 0) ? 15 : 18;
-        int64_t w_count = (ctx->layer_configs[i].layer_type == 0) ? 15 : 18;
+            w_offset += weight_count_for_layer(ctx->layer_configs[j]);
+        int64_t w_count = weight_count_for_layer(ctx->layer_configs[i]);
         std::vector<at::Tensor*> layer_w(ctx->weight_ptrs.begin() + w_offset,
                                          ctx->weight_ptrs.begin() + w_offset + w_count);
 
@@ -424,8 +466,8 @@ static at::Tensor forward_layer_group(
     for (int64_t i = start_layer; i < end_layer; i++) {
         int64_t w_offset = 0;
         for (int64_t j = 0; j < i; j++)
-            w_offset += (ctx->layer_configs[j].layer_type == 0) ? 15 : 18;
-        int64_t w_count = (ctx->layer_configs[i].layer_type == 0) ? 15 : 18;
+            w_offset += weight_count_for_layer(ctx->layer_configs[j]);
+        int64_t w_count = weight_count_for_layer(ctx->layer_configs[i]);
         std::vector<at::Tensor*> layer_w(ctx->weight_ptrs.begin() + w_offset,
                                          ctx->weight_ptrs.begin() + w_offset + w_count);
 
@@ -576,13 +618,16 @@ static at::Tensor mtp_forward(
     auto combined = at::cat({h_normed, e_normed}, /*dim=*/-1);
     auto projected = at::matmul(combined, ctx->mtp_fc->t());  // fc: [hidden, 2*hidden], fc.t(): [2*hidden, hidden]
 
-    // MTP layers (full attention + MoE, no LoRA)
+    // MTP layers (full attention + MoE/dense, no LoRA)
     at::Tensor h = projected;
     int64_t num_mtp_layers = (int64_t)ctx->mtp_layer_configs.size();
     for (int64_t i = 0; i < num_mtp_layers; i++) {
-        int64_t w_offset = i * 15;
+        int64_t w_offset = 0;
+        for (int64_t j = 0; j < i; j++)
+            w_offset += weight_count_for_layer(ctx->mtp_layer_configs[j]);
+        int64_t w_count = weight_count_for_layer(ctx->mtp_layer_configs[i]);
         std::vector<at::Tensor*> layer_w(ctx->mtp_layer_weights.begin() + w_offset,
-                                         ctx->mtp_layer_weights.begin() + w_offset + 15);
+                                         ctx->mtp_layer_weights.begin() + w_offset + w_count);
         h = forward_single_layer(h, layer_w.data(), &ctx->mtp_layer_configs[i],
             kind, ctx->lora_scaling, nullptr, nullptr);
     }
@@ -661,18 +706,17 @@ void* qwen36_create_training_context(
             ctx->lora_layer_offset.push_back(offset);
 
             // Get base weight shapes from the weight pointers
+            int64_t w_offset = 0;
+            for (int64_t j = 0; j < i; j++)
+                w_offset += weight_count_for_layer(ctx->layer_configs[j]);
+
             if (ctx->layer_configs[i].layer_type == 0) {
                 // Full attention: q_proj, k_proj, v_proj, o_proj
-                int64_t w_offset = 0;
-                for (int64_t j = 0; j < i; j++)
-                    w_offset += (ctx->layer_configs[j].layer_type == 0) ? 15 : 18;
                 int64_t proj_indices[] = {2, 4, 6, 7};  // q, k, v, o
                 for (int k = 0; k < 4; k++) {
                     auto* base = ctx->weight_ptrs[w_offset + proj_indices[k]];
                     int64_t out_f = base->size(0), in_f = base->size(1);
                     int64_t rank = 8;
-                    // LoRA A: [rank, in_features], LoRA B: [out_features, rank]
-                    // Created as FP32 (master weights), requires_grad=true
                     auto a = at::randn({rank, in_f}, at::TensorOptions().dtype(at::kFloat).device(base->device())) * 0.01;
                     auto b = at::zeros({out_f, rank}, at::TensorOptions().dtype(at::kFloat).device(base->device()));
                     a.set_requires_grad(true);
@@ -684,9 +728,6 @@ void* qwen36_create_training_context(
                 }
             } else {
                 // Linear attention: in_proj_qkv, in_proj_z, out_proj
-                int64_t w_offset = 0;
-                for (int64_t j = 0; j < i; j++)
-                    w_offset += (ctx->layer_configs[j].layer_type == 0) ? 15 : 18;
                 int64_t proj_indices[] = {2, 3, 10};  // qkv, z, out
                 for (int k = 0; k < 3; k++) {
                     auto* base = ctx->weight_ptrs[w_offset + proj_indices[k]];

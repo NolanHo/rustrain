@@ -69,13 +69,16 @@ pub struct Qwen36RuntimeConfig {
     pub linear_conv_kernel_dim: i64,
     pub mamba_ssm_dtype: String,
 
-    // --- MoE ---
+    // --- MoE (zero for dense models) ---
+    pub is_moe: bool,
     pub num_experts: usize,
     pub num_experts_per_tok: usize,
     pub moe_intermediate_size: i64,
     pub shared_expert_intermediate_size: i64,
     pub norm_topk_prob: bool,
     pub router_aux_loss_coef: f64,
+    // --- Dense MLP (used when is_moe=false) ---
+    pub intermediate_size: i64,
 
     // --- MTP ---
     pub mtp_num_hidden_layers: usize,
@@ -125,6 +128,8 @@ struct RopeParameters {
 
 #[derive(Debug, Deserialize)]
 struct TextConfig {
+    #[serde(default)]
+    model_type: Option<String>,
     num_hidden_layers: usize,
     hidden_size: i64,
     vocab_size: i64,
@@ -178,6 +183,8 @@ struct TextConfig {
     norm_topk_prob: bool,
     #[serde(default = "default_router_aux")]
     router_aux_loss_coef: f64,
+    #[serde(default)]
+    intermediate_size: i64,
 
     #[serde(default)]
     mtp_num_hidden_layers: usize,
@@ -301,8 +308,10 @@ pub fn read_qwen36_runtime_config(model_path: &Path) -> Result<Qwen36RuntimeConf
         num_experts_per_tok: tc.num_experts_per_tok,
         moe_intermediate_size: tc.moe_intermediate_size,
         shared_expert_intermediate_size: tc.shared_expert_intermediate_size,
+        is_moe: tc.model_type.as_deref() == Some("qwen3_5_moe") || tc.model_type.as_deref() == Some("qwen3_5_moe_text") || tc.num_experts > 0,
         norm_topk_prob: tc.norm_topk_prob,
         router_aux_loss_coef: tc.router_aux_loss_coef,
+        intermediate_size: tc.intermediate_size,
         mtp_num_hidden_layers: tc.mtp_num_hidden_layers,
         mtp_use_dedicated_embeddings: tc.mtp_use_dedicated_embeddings,
         has_vision,

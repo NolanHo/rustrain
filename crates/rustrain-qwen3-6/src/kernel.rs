@@ -53,6 +53,7 @@ pub struct CppLayerConfig {
     pub moe_intermediate: i64,
     pub expert_start: i64,
     pub expert_count: i64,
+    pub intermediate_size: i64,
     pub norm_topk_prob: i32,
 }
 
@@ -159,13 +160,19 @@ pub fn build_weight_ptrs(
                 ptrs.push(get_ptr(weights, &format!("{lp}.linear_attn.out_proj.weight")));
             }
         }
-        ptrs.push(get_ptr(weights, &format!("{lp}.mlp.gate.weight")));
-        ptrs.push(get_ptr(weights, &format!("{lp}.mlp.shared_expert_gate.weight")));
-        ptrs.push(get_ptr(weights, &format!("{lp}.mlp.shared_expert.gate_proj.weight")));
-        ptrs.push(get_ptr(weights, &format!("{lp}.mlp.shared_expert.up_proj.weight")));
-        ptrs.push(get_ptr(weights, &format!("{lp}.mlp.shared_expert.down_proj.weight")));
-        ptrs.push(get_ptr(weights, &format!("{lp}.mlp.experts.gate_up_proj")));
-        ptrs.push(get_ptr(weights, &format!("{lp}.mlp.experts.down_proj")));
+        if config.is_moe {
+            ptrs.push(get_ptr(weights, &format!("{lp}.mlp.gate.weight")));
+            ptrs.push(get_ptr(weights, &format!("{lp}.mlp.shared_expert_gate.weight")));
+            ptrs.push(get_ptr(weights, &format!("{lp}.mlp.shared_expert.gate_proj.weight")));
+            ptrs.push(get_ptr(weights, &format!("{lp}.mlp.shared_expert.up_proj.weight")));
+            ptrs.push(get_ptr(weights, &format!("{lp}.mlp.shared_expert.down_proj.weight")));
+            ptrs.push(get_ptr(weights, &format!("{lp}.mlp.experts.gate_up_proj")));
+            ptrs.push(get_ptr(weights, &format!("{lp}.mlp.experts.down_proj")));
+        } else {
+            ptrs.push(get_ptr(weights, &format!("{lp}.mlp.gate_proj.weight")));
+            ptrs.push(get_ptr(weights, &format!("{lp}.mlp.up_proj.weight")));
+            ptrs.push(get_ptr(weights, &format!("{lp}.mlp.down_proj.weight")));
+        }
     }
     ptrs
 }
@@ -196,6 +203,7 @@ pub fn build_layer_configs(
             norm_topk_prob: if config.norm_topk_prob { 1 } else { 0 },
             expert_start: expert_start as i64,
             expert_count: expert_count as i64,
+            intermediate_size: config.intermediate_size,
         }
     }).collect()
 }
@@ -252,6 +260,7 @@ pub fn build_mtp_layer_configs(
             norm_topk_prob: if config.norm_topk_prob { 1 } else { 0 },
             expert_start: expert_start as i64,
             expert_count: expert_count as i64,
+            intermediate_size: config.intermediate_size,
         }
     }).collect()
 }

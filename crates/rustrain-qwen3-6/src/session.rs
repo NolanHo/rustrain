@@ -120,23 +120,21 @@ fn build_needed_weights(
             }
         }
 
-        // MoE weights
-        needed.insert(format!("{lp}.mlp.gate.weight"));
-        needed.insert(format!("{lp}.mlp.shared_expert_gate.weight"));
-        needed.insert(format!("{lp}.mlp.shared_expert.gate_proj.weight"));
-        needed.insert(format!("{lp}.mlp.shared_expert.up_proj.weight"));
-        needed.insert(format!("{lp}.mlp.shared_expert.down_proj.weight"));
-
-        // Routed experts — all for single-GPU, local slice for EP
-        if let Some(shard) = ep_shard {
+        // MLP weights — dense vs MoE
+        if config.is_moe {
+            needed.insert(format!("{lp}.mlp.gate.weight"));
+            needed.insert(format!("{lp}.mlp.shared_expert_gate.weight"));
+            needed.insert(format!("{lp}.mlp.shared_expert.gate_proj.weight"));
+            needed.insert(format!("{lp}.mlp.shared_expert.up_proj.weight"));
+            needed.insert(format!("{lp}.mlp.shared_expert.down_proj.weight"));
             // Fused expert tensors are 3D [num_experts, ...], loaded as a whole
-            // In EP mode we still need the full tensor, then select local experts
-            // (safetensors stores them as single fused tensor, can't shard at load time)
             needed.insert(format!("{lp}.mlp.experts.gate_up_proj"));
             needed.insert(format!("{lp}.mlp.experts.down_proj"));
         } else {
-            needed.insert(format!("{lp}.mlp.experts.gate_up_proj"));
-            needed.insert(format!("{lp}.mlp.experts.down_proj"));
+            // Dense MLP: standard SwiGLU (gate_proj, up_proj, down_proj)
+            needed.insert(format!("{lp}.mlp.gate_proj.weight"));
+            needed.insert(format!("{lp}.mlp.up_proj.weight"));
+            needed.insert(format!("{lp}.mlp.down_proj.weight"));
         }
     }
 
@@ -171,7 +169,16 @@ pub fn train_qwen3_6_lora_sft_ep(
 ) -> Result<Qwen36LoraSftSummary> {
     let rank = parse_env_usize("RANK")?;
     let world_size = parse_env_usize("WORLD_SIZE")?;
-    let ep_shard = Some(EpShard::new(rank, world_size, 256));
+    // For MoE models, shard experts. For dense models, EP is a no-op (no experts to shard).
+    let model_path = config.model.model_path.as_ref()
+        .ok_or_else(|| anyhow!("model.model_path required"))?;
+    let model_path = resolve_qwen36_model_path(model_path)?;
+    let runtime_config = read_qwen36_runtime_config(&model_path)?;
+    let ep_shard = if runtime_config.is_moe {
+        Some(EpShard::new(rank, world_size, runtime_config.num_experts))
+    } else {
+        None
+    };
     train_impl(config, run_paths, ep_shard)
 }
 
@@ -288,9 +295,9 @@ fn train_impl(
         config.train.adam_beta1 as f64,
         config.train.adam_beta2 as f64,
         config.train.adam_eps as f64,
-        16.0 / 8.0,  // lora scaling = alpha / rank
+        lora_config.alpha as f64 / lora_config.rank as f64,  // lora scaling = alpha / rank
         shard_ref.map(|s| s.expert_start).unwrap_or(0),
-        shard_ref.map(|s| s.experts_per_rank).unwrap_or(256),
+        shard_ref.map(|s| s.experts_per_rank).unwrap_or(0),
     )?;
     info!("C++ TrainingContext: {} LoRA params", ctx.lora_count());
 
@@ -299,7 +306,7 @@ fn train_impl(
         ctx.set_mtp_weights(
             &weights_gpu, &runtime_config,
             shard_ref.map(|s| s.expert_start).unwrap_or(0),
-            shard_ref.map(|s| s.experts_per_rank).unwrap_or(256),
+            shard_ref.map(|s| s.experts_per_rank).unwrap_or(0),
         )?;
         info!("C++ TrainingContext: MTP weights set ({} layers)", runtime_config.mtp_num_hidden_layers);
     }
