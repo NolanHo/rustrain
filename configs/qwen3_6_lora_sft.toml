@@ -13,9 +13,9 @@ num_layers = 40
 num_attention_heads = 16
 num_key_value_heads = 2
 intermediate_size = 512
-seq_len = 512
+seq_len = 256
 norm = "rmsnorm"
-activation = "silu"
+activation = "swiglu"
 rope = true
 rms_norm_eps = 0.000001
 
@@ -45,5 +45,9 @@ context_parallel_size = 1
 [lora]
 rank = 8
 alpha = 16
-target_layers = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39]
-target_modules = ["q_proj", "k_proj", "v_proj", "o_proj", "in_proj_qkv", "in_proj_z", "out_proj"]
+target_layers = [0, 1, 2, 3]
+target_modules = ["q_proj", "k_proj", "v_proj", "o_proj"]
+
+[data]
+kind = "instruction_jsonl"
+paths = ["/tmp/qwen3_6_test.jsonl"]
