@@ -94,7 +94,9 @@ fn build_needed_weights(
     // Embed, norm, lm_head
     needed.insert(format!("{p}embed_tokens.weight"));
     needed.insert(format!("{p}norm.weight"));
-    needed.insert("lm_head.weight".to_string());
+    if !config.tie_word_embeddings {
+        needed.insert("lm_head.weight".to_string());
+    }
 
     // Per-layer weights for ALL layers (not just LoRA targets)
     for layer in 0..config.num_hidden_layers {

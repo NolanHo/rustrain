@@ -300,7 +300,12 @@ impl CppTrainingContext {
 
         let embed_ptr = get_ptr(weights, &format!("{}embed_tokens.weight", config.weight_prefix));
         let final_norm_ptr = get_ptr(weights, &format!("{}norm.weight", config.weight_prefix));
-        let lm_head_ptr = get_ptr(weights, "lm_head.weight");
+        let lm_head_ptr = if config.tie_word_embeddings {
+            // Tied embeddings: use embed_tokens as lm_head
+            embed_ptr
+        } else {
+            get_ptr(weights, "lm_head.weight")
+        };
 
         let compute_type = compute_kind as i32;
 
