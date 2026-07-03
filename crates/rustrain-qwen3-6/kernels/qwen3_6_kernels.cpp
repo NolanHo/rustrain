@@ -524,9 +524,10 @@ struct GroupCheckpointFunction : public torch::autograd::Function<GroupCheckpoin
         ctx->saved_data["end"] = end_layer;
         ctx->save_for_backward({input});
 
-        // Run forward WITH grad — the Function will only save the input (not intermediate activations).
-        // The key is that save_for_backward only stores the input tensor.
-        // We don't use no-grad here because the LoRA params need to build a graph for backward.
+        // Run forward in NO-GRAD mode — intermediate activations are NOT stored.
+        // This is the key to gradient checkpointing: saves memory by not building
+        // the autograd graph during forward. Backward will recompute.
+        at::AutoGradMode guard(false);
         auto* tc = reinterpret_cast<TrainingContext*>(tc_val);
         return forward_layer_group(tc, input, start_layer, end_layer);
     }
@@ -542,15 +543,15 @@ struct GroupCheckpointFunction : public torch::autograd::Function<GroupCheckpoin
         int64_t start_layer = ctx->saved_data["start"].toInt();
         int64_t end_layer = ctx->saved_data["end"].toInt();
 
-        // Recompute forward WITH grad enabled, backprop through recomputed graph.
-        // Must explicitly enable autograd since backward runs in no-grad context.
+        // Recompute forward WITH grad enabled — builds autograd graph for LoRA params.
+        // This re-materializes the intermediate activations (trading memory for compute).
         at::AutoGradMode guard(true);
         input.set_requires_grad(true);
         auto output = forward_layer_group(tc, input, start_layer, end_layer);
 
         // Backprop through recomputed graph — gradients accumulate into LoRA params.
-        // Use backward with retain_graph to avoid freeing graph that other checkpoint
-        // groups' backward functions still need.
+        // retain_graph=true because other checkpoint groups' backward may reference
+        // shared tensors in the autograd graph.
         torch::autograd::backward({output}, {grad_output[0]},
             /*retain_graph=*/true, /*create_graph=*/false);
         return {input.grad(), at::Tensor(), at::Tensor(), at::Tensor()};
