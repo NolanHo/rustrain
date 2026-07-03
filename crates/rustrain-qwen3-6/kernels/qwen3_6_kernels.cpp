@@ -15,6 +15,7 @@
 #include <cstring>
 #include <memory>
 #include <unordered_map>
+#include <set>
 
 // ──────────────────────────────────────────────────────────────────────
 // Helpers
@@ -291,15 +292,6 @@ static at::Tensor moe_forward(
 // Layer config + forward
 // ──────────────────────────────────────────────────────────────────────
 
-// Weight count per layer: dense has 3 MLP weights, MoE has 7 MoE weights.
-// Full attention: 2 norm + 6 attn + (3 dense | 7 moe) = 11 | 15
-// Linear attention: 2 norm + 9 linear_attn + (3 dense | 7 moe) = 14 | 18
-static inline int64_t weight_count_for_layer(const LayerConfig& cfg) {
-    int64_t attn_w = (cfg.layer_type == 0) ? 6 : 9;
-    int64_t mlp_w = (cfg.num_experts > 0) ? 7 : 3;
-    return 2 + attn_w + mlp_w;
-}
-
 struct LayerConfig {
     int64_t layer_type, num_heads, num_kv_heads, head_dim;
     int64_t num_k_heads, key_dim, num_v_heads, val_dim, conv_kernel;
@@ -308,6 +300,15 @@ struct LayerConfig {
     int64_t intermediate_size;  // dense MLP intermediate size (0 for MoE)
     int32_t norm_topk_prob;
 };
+
+// Weight count per layer: dense has 3 MLP weights, MoE has 7 MoE weights.
+// Full attention: 2 norm + 6 attn + (3 dense | 7 moe) = 11 | 15
+// Linear attention: 2 norm + 9 linear_attn + (3 dense | 7 moe) = 14 | 18
+static inline int64_t weight_count_for_layer(const LayerConfig& cfg) {
+    int64_t attn_w = (cfg.layer_type == 0) ? 6 : 9;
+    int64_t mlp_w = (cfg.num_experts > 0) ? 7 : 3;
+    return 2 + attn_w + mlp_w;
+}
 
 static at::Tensor forward_single_layer(
     const at::Tensor& hidden, at::Tensor** w, const LayerConfig* cfg,
@@ -433,13 +434,17 @@ static at::Tensor forward_full(
         std::vector<at::Tensor*> layer_w(ctx->weight_ptrs.begin() + w_offset,
                                          ctx->weight_ptrs.begin() + w_offset + w_count);
 
-        // Get LoRA pointers for this layer
+        // Get LoRA pointers for this layer (nullptr if no LoRA for this layer)
         int64_t lora_count = (ctx->layer_configs[i].layer_type == 0) ? 4 : 3;
         int64_t la_offset = ctx->lora_layer_offset[i];
-        std::vector<at::Tensor*> la_ptrs(lora_count), lb_ptrs(lora_count);
-        for (int64_t k = 0; k < lora_count; k++) {
-            la_ptrs[k] = &ctx->lora_a[la_offset + k];
-            lb_ptrs[k] = &ctx->lora_b[la_offset + k];
+        // Check if this layer has LoRA params (la_offset < lora_a.size())
+        bool has_lora = (la_offset + lora_count) <= (int64_t)ctx->lora_a.size();
+        std::vector<at::Tensor*> la_ptrs(lora_count, nullptr), lb_ptrs(lora_count, nullptr);
+        if (has_lora) {
+            for (int64_t k = 0; k < lora_count; k++) {
+                la_ptrs[k] = &ctx->lora_a[la_offset + k];
+                lb_ptrs[k] = &ctx->lora_b[la_offset + k];
+            }
         }
 
         hidden = forward_single_layer(hidden, layer_w.data(), &ctx->layer_configs[i],
@@ -473,10 +478,13 @@ static at::Tensor forward_layer_group(
 
         int64_t lora_count = (ctx->layer_configs[i].layer_type == 0) ? 4 : 3;
         int64_t la_offset = ctx->lora_layer_offset[i];
-        std::vector<at::Tensor*> la_ptrs(lora_count), lb_ptrs(lora_count);
-        for (int64_t k = 0; k < lora_count; k++) {
-            la_ptrs[k] = &ctx->lora_a[la_offset + k];
-            lb_ptrs[k] = &ctx->lora_b[la_offset + k];
+        bool has_lora = (la_offset + lora_count) <= (int64_t)ctx->lora_a.size();
+        std::vector<at::Tensor*> la_ptrs(lora_count, nullptr), lb_ptrs(lora_count, nullptr);
+        if (has_lora) {
+            for (int64_t k = 0; k < lora_count; k++) {
+                la_ptrs[k] = &ctx->lora_a[la_offset + k];
+                lb_ptrs[k] = &ctx->lora_b[la_offset + k];
+            }
         }
 
         hidden = forward_single_layer(hidden, layer_w.data(), &ctx->layer_configs[i],
@@ -666,13 +674,18 @@ static at::Tensor mtp_compute_loss(
 extern "C" {
 
 // Create training context — called once at startup
+// lora_rank: LoRA rank (from config)
+// target_layers: array of layer indices to apply LoRA (nullptr = all layers)
+// num_target_layers: length of target_layers array
 void* qwen36_create_training_context(
     void** weight_ptrs, int64_t num_weight_ptrs,
     void* embed_ptr, void* final_norm_ptr, void* lm_head_ptr,
     void* layer_configs_ptr, int64_t num_layers,
     int32_t compute_type,
     double lora_scaling, double lr, double beta1, double beta2, double eps,
-    int64_t vocab_size, double rms_eps
+    int64_t vocab_size, double rms_eps,
+    int64_t lora_rank,
+    const int64_t* target_layers, int64_t num_target_layers
 ) {
     try {
         auto* ctx = new TrainingContext();
@@ -698,12 +711,24 @@ void* qwen36_create_training_context(
             ctx->layer_configs.push_back(lcfgs[i]);
         }
 
-        // Create LoRA parameters for target layers (all layers for now)
+        // Build target layer set
+        std::set<int64_t> target_set;
+        if (target_layers && num_target_layers > 0) {
+            for (int64_t j = 0; j < num_target_layers; j++)
+                target_set.insert(target_layers[j]);
+        }
+
+        // Create LoRA parameters for target layers only
         int64_t offset = 0;
         auto kind = ctx->compute_type;
         for (int64_t i = 0; i < num_layers; i++) {
             int64_t lora_count = (ctx->layer_configs[i].layer_type == 0) ? 4 : 3;
             ctx->lora_layer_offset.push_back(offset);
+
+            if (target_set.find(i) == target_set.end()) {
+                // Not a target layer — no LoRA params, offset stays same
+                continue;
+            }
 
             // Get base weight shapes from the weight pointers
             int64_t w_offset = 0;
@@ -716,9 +741,8 @@ void* qwen36_create_training_context(
                 for (int k = 0; k < 4; k++) {
                     auto* base = ctx->weight_ptrs[w_offset + proj_indices[k]];
                     int64_t out_f = base->size(0), in_f = base->size(1);
-                    int64_t rank = 8;
-                    auto a = at::randn({rank, in_f}, at::TensorOptions().dtype(at::kFloat).device(base->device())) * 0.01;
-                    auto b = at::zeros({out_f, rank}, at::TensorOptions().dtype(at::kFloat).device(base->device()));
+                    auto a = at::randn({lora_rank, in_f}, at::TensorOptions().dtype(at::kFloat).device(base->device())) * 0.01;
+                    auto b = at::zeros({out_f, lora_rank}, at::TensorOptions().dtype(at::kFloat).device(base->device()));
                     a.set_requires_grad(true);
                     b.set_requires_grad(true);
                     ctx->lora_a.push_back(std::move(a));
@@ -732,9 +756,8 @@ void* qwen36_create_training_context(
                 for (int k = 0; k < 3; k++) {
                     auto* base = ctx->weight_ptrs[w_offset + proj_indices[k]];
                     int64_t out_f = base->size(0), in_f = base->size(1);
-                    int64_t rank = 8;
-                    auto a = at::randn({rank, in_f}, at::TensorOptions().dtype(at::kFloat).device(base->device())) * 0.01;
-                    auto b = at::zeros({out_f, rank}, at::TensorOptions().dtype(at::kFloat).device(base->device()));
+                    auto a = at::randn({lora_rank, in_f}, at::TensorOptions().dtype(at::kFloat).device(base->device())) * 0.01;
+                    auto b = at::zeros({out_f, lora_rank}, at::TensorOptions().dtype(at::kFloat).device(base->device()));
                     a.set_requires_grad(true);
                     b.set_requires_grad(true);
                     ctx->lora_a.push_back(std::move(a));
@@ -815,8 +838,8 @@ double qwen36_train_step(
         // Main loss (cross-entropy on shifted tokens)
         auto loss = compute_loss(ctx, hidden, input_ids, target_mask, ctx->vocab_size);
 
-        // MTP loss (if enabled)
-        if (ctx->has_mtp) {
+        // MTP loss (if enabled and not disabled by env)
+        if (ctx->has_mtp && !getenv("QWEN36_DISABLE_MTP")) {
             auto mtp_logits = mtp_forward(ctx, hidden, input_ids);
             auto mtp_loss = mtp_compute_loss(ctx, mtp_logits, input_ids, target_mask);
             // Print both losses for debugging

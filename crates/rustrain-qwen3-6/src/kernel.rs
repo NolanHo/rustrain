@@ -13,6 +13,7 @@ use anyhow::{Result, bail};
 type FnCreateCtx = unsafe extern "C" fn(
     *mut *mut c_void, i64, *mut c_void, *mut c_void, *mut c_void,
     *mut c_void, i64, i32, f64, f64, f64, f64, f64, i64, f64,
+    i64, *const i64, i64,
 ) -> *mut c_void;
 type FnTrainStep = unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void) -> f64;
 type FnGetLoraCount = unsafe extern "C" fn(*mut c_void) -> i64;
@@ -288,6 +289,8 @@ impl CppTrainingContext {
         compute_kind: Kind,
         lr: f64, beta1: f64, beta2: f64, eps: f64,
         lora_scaling: f64,
+        lora_rank: i64,
+        target_layers: &[usize],
         expert_start: usize,
         expert_count: usize,
     ) -> Result<Self> {
@@ -308,6 +311,17 @@ impl CppTrainingContext {
         let lc_ptr = layer_configs.as_ptr() as *mut c_void;
         std::mem::forget(layer_configs);
 
+        // Convert target_layers to i64 array (leaked to keep alive)
+        let target_i64: Vec<i64> = target_layers.iter().map(|&x| x as i64).collect();
+        let tl_ptr = if target_i64.is_empty() {
+            std::ptr::null()
+        } else {
+            let p = target_i64.as_ptr();
+            std::mem::forget(target_i64);
+            p
+        };
+        let tl_len = target_layers.len() as i64;
+
         let ptr = unsafe {
             (kh.create_ctx)(
                 wp_ptr, wp_len as i64,
@@ -316,6 +330,7 @@ impl CppTrainingContext {
                 compute_type, lora_scaling,
                 lr, beta1, beta2, eps,
                 config.vocab_size, config.rms_norm_eps,
+                lora_rank, tl_ptr, tl_len,
             )
         };
         if ptr.is_null() {

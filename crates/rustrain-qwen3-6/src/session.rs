@@ -296,6 +296,8 @@ fn train_impl(
         config.train.adam_beta2 as f64,
         config.train.adam_eps as f64,
         lora_config.alpha as f64 / lora_config.rank as f64,  // lora scaling = alpha / rank
+        lora_config.rank as i64,
+        &lora_config.target_layers,
         shard_ref.map(|s| s.expert_start).unwrap_or(0),
         shard_ref.map(|s| s.experts_per_rank).unwrap_or(0),
     )?;
