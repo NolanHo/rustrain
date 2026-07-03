@@ -579,6 +579,7 @@ static at::Tensor forward_full_checkpoint(
 }
 
 // Cross-entropy loss with response-only masking — chunked to avoid full logits in memory
+// Uses at::cross_entropy_loss (fused log_softmax + nll_loss) for efficiency
 static at::Tensor compute_loss(
     TrainingContext* ctx,
     const at::Tensor& hidden,
@@ -599,13 +600,13 @@ static at::Tensor compute_loss(
     auto shifted_mask = target_mask.narrow(1, 1, seq_len - 1).reshape({-1});
 
     // Chunked cross-entropy: process tokens in chunks to limit peak memory
-    // Each chunk: [chunk_size, vocab] logits → log_softmax → gather → loss
     int64_t total_tokens = shifted_targets.size(0);
-    int64_t chunk_size = 512;  // tokens per chunk
+    int64_t chunk_size = 512;
     int64_t num_chunks = (total_tokens + chunk_size - 1) / chunk_size;
 
     auto total_loss = at::zeros({1}, at::TensorOptions().dtype(at::kFloat).device(hidden_normed.device()));
     auto total_count = shifted_mask.sum().clamp_min(1.0);
+    auto hidden_flat = shifted_hidden.reshape({-1, hidden_normed.size(2)});
 
     for (int64_t c = 0; c < num_chunks; c++) {
         int64_t start = c * chunk_size;
@@ -613,15 +614,18 @@ static at::Tensor compute_loss(
         int64_t n = end - start;
 
         // Compute logits for this chunk only: [n, vocab]
-        auto chunk_hidden = shifted_hidden.reshape({-1, hidden_normed.size(2)}).narrow(0, start, n);
+        auto chunk_hidden = hidden_flat.narrow(0, start, n);
         auto chunk_logits = at::matmul(chunk_hidden, lm_head.t());  // [n, vocab]
 
         auto chunk_targets = shifted_targets.narrow(0, start, n);
         auto chunk_mask = shifted_mask.narrow(0, start, n);
 
-        // FP32 log_softmax for numerical stability
-        auto log_probs = chunk_logits.log_softmax(-1, at::kFloat);
-        auto per_token_loss = log_probs.gather(1, chunk_targets.unsqueeze(1)).squeeze(1).neg();
+        // Fused cross-entropy (log_softmax + nll_loss in one kernel)
+        auto per_token_loss = at::cross_entropy_loss(
+            chunk_logits.to(at::kFloat), chunk_targets,
+            /*weight=*/at::Tensor(), /*reduction=*/at::Reduction::None,
+            /*ignore_index=*/-100, /*label_smoothing=*/0.0
+        );
         auto masked_loss = per_token_loss * chunk_mask.to(at::kFloat);
         total_loss += masked_loss.sum();
     }
@@ -695,7 +699,7 @@ static at::Tensor mtp_compute_loss(
     auto shifted_targets = input_ids.narrow(1, 2, n_tokens).reshape({-1});
     auto shifted_mask = target_mask.narrow(1, 2, n_tokens).reshape({-1});
 
-    // Chunked cross-entropy
+    // Chunked cross-entropy with fused cross_entropy_loss
     int64_t total_tokens = shifted_targets.size(0);
     int64_t chunk_size = 512;
     int64_t num_chunks = (total_tokens + chunk_size - 1) / chunk_size;
@@ -712,8 +716,11 @@ static at::Tensor mtp_compute_loss(
         auto chunk_targets = shifted_targets.narrow(0, start, n);
         auto chunk_mask = shifted_mask.narrow(0, start, n);
 
-        auto log_probs = chunk_logits.log_softmax(-1, at::kFloat);
-        auto per_token_loss = log_probs.gather(1, chunk_targets.unsqueeze(1)).squeeze(1).neg();
+        auto per_token_loss = at::cross_entropy_loss(
+            chunk_logits.to(at::kFloat), chunk_targets,
+            /*weight=*/at::Tensor(), /*reduction=*/at::Reduction::None,
+            /*ignore_index=*/-100, /*label_smoothing=*/0.0
+        );
         auto masked_loss = per_token_loss * chunk_mask.to(at::kFloat);
         total_loss += masked_loss.sum();
     }
