@@ -522,11 +522,23 @@ struct GroupCheckpointFunction : public torch::autograd::Function<GroupCheckpoin
         ctx->saved_data["tc"] = tc_val;
         ctx->saved_data["start"] = start_layer;
         ctx->saved_data["end"] = end_layer;
-        ctx->save_for_backward({input});
+
+        // Check if activation offload is enabled
+        bool offload = getenv("QWEN36_OFFLOAD_ACTIVATIONS");
+
+        if (offload) {
+            // Save input to CPU — frees GPU memory between groups
+            // We store the CPU copy in saved_data (not save_for_backward,
+            // because save_for_backward would keep it on GPU)
+            auto input_cpu = input.detach().to(at::TensorOptions().dtype(input.scalar_type()).device(at::kCPU).pinned_memory(true));
+            ctx->saved_data["input_cpu"] = input_cpu;
+            // Also store device for restoring later
+            ctx->saved_data["device"] = input.device();
+        } else {
+            ctx->save_for_backward({input});
+        }
 
         // Run forward in NO-GRAD mode — intermediate activations are NOT stored.
-        // This is the key to gradient checkpointing: saves memory by not building
-        // the autograd graph during forward. Backward will recompute.
         at::AutoGradMode guard(false);
         auto* tc = reinterpret_cast<TrainingContext*>(tc_val);
         return forward_layer_group(tc, input, start_layer, end_layer);
@@ -536,8 +548,18 @@ struct GroupCheckpointFunction : public torch::autograd::Function<GroupCheckpoin
         torch::autograd::AutogradContext* ctx,
         std::vector<at::Tensor> grad_output
     ) {
-        auto saved = ctx->get_saved_variables();
-        at::Tensor input = saved[0];
+        bool offload = ctx->saved_data.count("input_cpu") > 0;
+
+        at::Tensor input;
+        if (offload) {
+            // Restore input from CPU → GPU
+            auto input_cpu = ctx->saved_data["input_cpu"].toTensor();
+            auto device = ctx->saved_data["device"].toDevice();
+            input = input_cpu.to(device);
+        } else {
+            auto saved = ctx->get_saved_variables();
+            input = saved[0];
+        }
 
         auto tc = reinterpret_cast<TrainingContext*>(ctx->saved_data["tc"].toInt());
         int64_t start_layer = ctx->saved_data["start"].toInt();
@@ -549,11 +571,6 @@ struct GroupCheckpointFunction : public torch::autograd::Function<GroupCheckpoin
         auto output = forward_layer_group(tc, input, start_layer, end_layer);
 
         // Backprop through recomputed graph.
-        // retain_graph=true is required because LoRA params are shared across
-        // checkpoint groups — PyTorch's autograd engine calls each group's
-        // backward in sequence, and the LoRA leaf nodes' accumulators need
-        // to remain accessible across groups.
-        // The graph is freed when the autograd engine finishes all groups.
         torch::autograd::backward({output}, {grad_output[0]},
             /*retain_graph=*/true, /*create_graph=*/false);
         return {input.grad(), at::Tensor(), at::Tensor(), at::Tensor()};
