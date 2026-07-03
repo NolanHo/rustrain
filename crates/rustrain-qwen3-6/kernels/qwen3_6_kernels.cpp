@@ -544,14 +544,16 @@ struct GroupCheckpointFunction : public torch::autograd::Function<GroupCheckpoin
         int64_t end_layer = ctx->saved_data["end"].toInt();
 
         // Recompute forward WITH grad enabled — builds autograd graph for LoRA params.
-        // This re-materializes the intermediate activations (trading memory for compute).
         at::AutoGradMode guard(true);
         input.set_requires_grad(true);
         auto output = forward_layer_group(tc, input, start_layer, end_layer);
 
-        // Backprop through recomputed graph — gradients accumulate into LoRA params.
-        // retain_graph=true because other checkpoint groups' backward may reference
-        // shared tensors in the autograd graph.
+        // Backprop through recomputed graph.
+        // retain_graph=true is required because LoRA params are shared across
+        // checkpoint groups — PyTorch's autograd engine calls each group's
+        // backward in sequence, and the LoRA leaf nodes' accumulators need
+        // to remain accessible across groups.
+        // The graph is freed when the autograd engine finishes all groups.
         torch::autograd::backward({output}, {grad_output[0]},
             /*retain_graph=*/true, /*create_graph=*/false);
         return {input.grad(), at::Tensor(), at::Tensor(), at::Tensor()};
