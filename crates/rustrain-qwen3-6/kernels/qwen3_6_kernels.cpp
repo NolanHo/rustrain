@@ -135,62 +135,130 @@ static at::Tensor full_attention(
             k_c = k_c.repeat_interleave(n_rep, 1);
             v_c = v_c.repeat_interleave(n_rep, 1);
 
-            // Gather all K/V to attend to (processed tokens + current chunk)
-            at::Tensor k_all, v_all;
-            if (processed > 0) {
-                // Load previous K/V from cache
-                at::Tensor k_prev, v_prev;
-                if (kv_offload) {
-                    // Load from CPU
-                    k_prev = ctx_kv_k_cache.to(device).narrow(2, 0, processed);
-                    v_prev = ctx_kv_v_cache.to(device).narrow(2, 0, processed);
+            // Iterative cross-chunk attention — avoid loading all K/V at once
+            // For each Q chunk, compute attention against K/V in sub-chunks
+            // using online softmax to merge results.
+            // This keeps peak GPU memory = 1 sub-chunk of K/V, not full history.
+            //
+            // Online softmax: for each Q row, track max_score and weighted_sum
+            //   out = weighted_sum / exp(max_score - running_max) ... 
+            // Simplified: since Q chunk is small (32K), we can compute
+            // Q @ K_chunk^T for each K chunk, accumulate with stable softmax.
+
+            int64_t sub_chunk = seq_chunk;  // K/V sub-chunk size = same as Q chunk
+            int64_t kv_total = q_end;  // total K/V length = q_end (causal)
+
+            // We compute attention incrementally:
+            // For K/V positions [0, sub_chunk): Q @ K^T → softmax → @ V
+            // For K/V positions [sub_chunk, 2*sub_chunk): same, merge with online softmax
+            // ...
+            // Plus current chunk's causal part.
+
+            // For simplicity and correctness, build the full K/V list by
+            // concatenating cached + current, but in sub-chunks to limit peak memory.
+            // Actually, the issue is that cat({k_prev, k_c}) creates a full copy.
+            // Instead, we process each cached sub-chunk + current chunk separately.
+
+            // Build causal mask for this Q chunk
+            // Q position i (absolute = q_start + i) can attend to K position j where j <= q_start + i
+            // For the current chunk (positions q_start..q_end), mask is lower-triangular within chunk
+            // For previous chunks (positions 0..q_start), all Q positions can attend (no mask needed)
+
+            // Process: iterate over K/V sub-chunks, compute partial attention scores
+            at::Tensor attn_out;
+            at::Tensor running_max, running_sum;  // for online softmax
+
+            for (int64_t kv_start = 0; kv_start < kv_total; kv_start += sub_chunk) {
+                int64_t kv_end_ = std::min(kv_start + sub_chunk, kv_total);
+                int64_t kv_len_chunk = kv_end_ - kv_start;
+
+                at::Tensor k_sub, v_sub;
+                if (kv_start >= q_start) {
+                    // Current chunk K/V (already on GPU)
+                    int64_t offset_in_chunk = kv_start - q_start;
+                    k_sub = k_c.narrow(2, offset_in_chunk, kv_len_chunk);
+                    v_sub = v_c.narrow(2, offset_in_chunk, kv_len_chunk);
+                } else if (kv_end_ <= q_start) {
+                    // Fully cached chunk — load from cache
+                    if (kv_offload) {
+                        k_sub = ctx_kv_k_cache.narrow(2, kv_start, kv_len_chunk).to(device);
+                        v_sub = ctx_kv_v_cache.narrow(2, kv_start, kv_len_chunk).to(device);
+                    } else {
+                        k_sub = kv_k_cache.narrow(2, kv_start, kv_len_chunk);
+                        v_sub = kv_v_cache.narrow(2, kv_start, kv_len_chunk);
+                    }
                 } else {
-                    k_prev = kv_k_cache.narrow(2, 0, processed);
-                    v_prev = kv_v_cache.narrow(2, 0, processed);
+                    // Spans cached + current
+                    int64_t cached_len = q_start - kv_start;
+                    int64_t current_len = kv_end_ - q_start;
+                    at::Tensor k_cached, v_cached;
+                    if (kv_offload) {
+                        k_cached = ctx_kv_k_cache.narrow(2, kv_start, cached_len).to(device);
+                        v_cached = ctx_kv_v_cache.narrow(2, kv_start, cached_len).to(device);
+                    } else {
+                        k_cached = kv_k_cache.narrow(2, kv_start, cached_len);
+                        v_cached = kv_v_cache.narrow(2, kv_start, cached_len);
+                    }
+                    k_sub = at::cat({k_cached, k_c.narrow(2, 0, current_len)}, 2);
+                    v_sub = at::cat({v_cached, v_c.narrow(2, 0, current_len)}, 2);
                 }
-                k_all = at::cat({k_prev, k_c}, 2);
-                v_all = at::cat({v_prev, v_c}, 2);
-            } else {
-                k_all = k_c;
-                v_all = v_c;
+
+                // Compute attention scores: Q @ K_sub^T * scale
+                auto scores = at::matmul(q * scale, k_sub.transpose(-1, -2));  // [B, H, q_len, kv_len_chunk]
+
+                // Apply causal mask for this sub-chunk
+                // Q position i (abs = q_start + i) attends to K position j (abs = kv_start + j)
+                // Valid if j <= q_start + i → kv_start + j <= q_start + i → j <= q_start + i - kv_start
+                auto mask = at::ones({q_len, kv_len_chunk}, at::TensorOptions().dtype(at::kBool).device(device));
+                for (int64_t i = 0; i < q_len; i++) {
+                    int64_t max_j = q_start + i - kv_start;  // max K position in this sub-chunk
+                    if (max_j + 1 < kv_len_chunk) {
+                        mask[i].narrow(0, max_j + 1, kv_len_chunk - max_j - 1).fill_(false);
+                    }
+                }
+                scores = scores.masked_fill(~mask.unsqueeze(0).unsqueeze(0), -std::numeric_limits<float>::infinity());
+
+                // Online softmax merge
+                auto sub_max = std::get<0>(scores.max(-1, true));  // [B, H, q_len, 1]
+                auto sub_exp = (scores - sub_max).exp();
+                auto sub_sum = sub_exp.sum(-1, true);  // [B, H, q_len, 1]
+                auto sub_out = at::matmul(sub_exp, v_sub);  // [B, H, q_len, head_dim]
+
+                if (kv_start == 0) {
+                    running_max = sub_max;
+                    running_sum = sub_sum;
+                    attn_out = sub_out;
+                } else {
+                    // Merge: new_max = max(running_max, sub_max)
+                    auto new_max = at::max(running_max, sub_max);
+                    // Rescale running
+                    auto running_scale = (running_max - new_max).exp();
+                    auto sub_scale = (sub_max - new_max).exp();
+                    attn_out = attn_out * running_scale + sub_out * sub_scale;
+                    running_sum = running_sum * running_scale + sub_sum * sub_scale;
+                    running_max = new_max;
+                }
             }
 
-            // Build causal mask: Q positions [q_start..q_end] attend to K positions [0..q_end]
-            int64_t kv_len = q_end;  // total K/V length = q_end
-            // SDPA with explicit causal mask
-            auto attn_mask = at::ones({q_len, kv_len}, at::TensorOptions().dtype(at::kBool).device(device));
-            // Q position i (absolute = q_start + i) can attend to K position j where j <= q_start + i
-            for (int64_t i = 0; i < q_len; i++) {
-                int64_t abs_pos = q_start + i;
-                // Mask out positions > abs_pos
-                if (abs_pos + 1 < kv_len) {
-                    attn_mask[i].narrow(0, abs_pos + 1, kv_len - abs_pos - 1).fill_(false);
-                }
-            }
-            // Q^T @ K^T / sqrt(d) — use SDPA with explicit mask
-            auto attn_out = at::scaled_dot_product_attention(
-                q, k_all, v_all,
-                attn_mask.unsqueeze(0).unsqueeze(0),  // [1, 1, q_len, kv_len]
-                0.0, true  // dropout, is_causal=false (we provide explicit mask)
-            );
+            // Normalize by running sum
+            attn_out = attn_out / running_sum.clamp_min(1e-6);
             attn_out = attn_out * at::sigmoid(gate).to(attn_out.scalar_type());
             auto result = attn_out.transpose(1, 2).reshape({batch, q_len, qkv_dim}).matmul(o_proj.t());
             chunk_outputs.push_back(result);
 
-            // Update KV cache
+            // Update KV cache — store current chunk's K/V (before repeat_interleave)
             if (kv_offload) {
-                // Store current chunk K/V to CPU
                 if (q_start == 0) {
-                    ctx_kv_k_cache = k_all.to(at::TensorOptions().device(at::kCPU).pinned_memory(true));
-                    ctx_kv_v_cache = v_all.to(at::TensorOptions().device(at::kCPU).pinned_memory(true));
+                    ctx_kv_k_cache = k_c.to(at::TensorOptions().device(at::kCPU).pinned_memory(true));
+                    ctx_kv_v_cache = v_c.to(at::TensorOptions().device(at::kCPU).pinned_memory(true));
                 } else {
                     ctx_kv_k_cache = at::cat({ctx_kv_k_cache, k_c.to(at::kCPU)}, 2);
                     ctx_kv_v_cache = at::cat({ctx_kv_v_cache, v_c.to(at::kCPU)}, 2);
                 }
             } else {
                 if (q_start == 0) {
-                    kv_k_cache = k_all;
-                    kv_v_cache = v_all;
+                    kv_k_cache = k_c.clone();
+                    kv_v_cache = v_c.clone();
                 } else {
                     kv_k_cache = at::cat({kv_k_cache, k_c}, 2);
                     kv_v_cache = at::cat({kv_v_cache, v_c}, 2);
