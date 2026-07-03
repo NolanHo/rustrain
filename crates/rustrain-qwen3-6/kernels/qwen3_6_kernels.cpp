@@ -387,8 +387,6 @@ static at::Tensor forward_single_layer(
 }
 
 // ──────────────────────────────────────────────────────────────────────
-// Training Context — all state lives in C++
-// ──────────────────────────────────────────────────────────────────────
 
 struct TrainingContext {
     // Model weights (frozen, no grad) — pointers to external tensors
@@ -426,7 +424,138 @@ struct TrainingContext {
     // Gradient checkpointing
     bool use_checkpoint;
     int64_t group_size;
+// ──────────────────────────────────────────────────────────────────────
 };
+// Forward declarations for sub-layer checkpointing
+// Sub-layer checkpointing: split each layer into attn + mlp segments
+// Enabled by QWEN36_SUBCKPT=1 env var. Reduces peak memory by ~2x
+// at the cost of 2x extra recomputation per layer during backward.
+// ──────────────────────────────────────────────────────────────────────
+
+// Compute attention output from hidden
+at::Tensor compute_attn_only(
+    TrainingContext* ctx, const at::Tensor& hidden, int64_t layer_idx, at::ScalarType kind
+) {
+    const auto& cfg = ctx->layer_configs[layer_idx];
+    int64_t w_offset = 0;
+    for (int64_t j = 0; j < layer_idx; j++)
+        w_offset += weight_count_for_layer(ctx->layer_configs[j]);
+    auto attn_input = rms_norm(hidden, *ctx->weight_ptrs[w_offset + 0], cfg.rms_eps);
+    int64_t lora_count = (cfg.layer_type == 0) ? 4 : 3;
+    int64_t la_offset = ctx->lora_layer_offset[layer_idx];
+    bool has_lora = (la_offset + lora_count) <= (int64_t)ctx->lora_a.size();
+    std::vector<at::Tensor*> la(lora_count, nullptr), lb(lora_count, nullptr);
+    if (has_lora) for (int64_t k = 0; k < lora_count; k++) { la[k] = &ctx->lora_a[la_offset + k]; lb[k] = &ctx->lora_b[la_offset + k]; }
+
+    if (cfg.layer_type == 0) {
+        auto qp = *ctx->weight_ptrs[w_offset+2], qn = *ctx->weight_ptrs[w_offset+3];
+        auto kp = *ctx->weight_ptrs[w_offset+4], kn = *ctx->weight_ptrs[w_offset+5];
+        auto vp = *ctx->weight_ptrs[w_offset+6], op = *ctx->weight_ptrs[w_offset+7];
+        if (has_lora) {
+            if (la[0]) qp = lora_delta(qp, *la[0], *lb[0], ctx->lora_scaling);
+            if (la[1]) kp = lora_delta(kp, *la[1], *lb[1], ctx->lora_scaling);
+            if (la[2]) vp = lora_delta(vp, *la[2], *lb[2], ctx->lora_scaling);
+            if (la[3]) op = lora_delta(op, *la[3], *lb[3], ctx->lora_scaling);
+        }
+        return full_attention(attn_input, qp, qn, kp, kn, vp, op,
+            cfg.num_heads, cfg.num_kv_heads, cfg.head_dim,
+            cfg.partial_rotary_factor, cfg.rope_theta, cfg.rms_eps, kind);
+    } else {
+        auto qkv = *ctx->weight_ptrs[w_offset+2], z = *ctx->weight_ptrs[w_offset+3];
+        auto a = *ctx->weight_ptrs[w_offset+4], b = *ctx->weight_ptrs[w_offset+5];
+        auto al = *ctx->weight_ptrs[w_offset+6], db = *ctx->weight_ptrs[w_offset+7];
+        auto cw = *ctx->weight_ptrs[w_offset+8], nw = *ctx->weight_ptrs[w_offset+9];
+        auto op = *ctx->weight_ptrs[w_offset+10];
+        if (has_lora) {
+            if (la[0]) qkv = lora_delta(qkv, *la[0], *lb[0], ctx->lora_scaling);
+            if (la[1]) z = lora_delta(z, *la[1], *lb[1], ctx->lora_scaling);
+            if (la[2]) op = lora_delta(op, *la[2], *lb[2], ctx->lora_scaling);
+        }
+        return linear_attention(attn_input, qkv, z, a, b, al, db, cw, nw, op,
+            cfg.num_k_heads, cfg.key_dim, cfg.num_v_heads, cfg.val_dim,
+            cfg.conv_kernel, cfg.rms_eps, kind);
+    }
+}
+
+// Compute MLP output from residual (hidden + attn_output)
+at::Tensor compute_mlp_only(
+    TrainingContext* ctx, const at::Tensor& residual, int64_t layer_idx, at::ScalarType kind
+) {
+    const auto& cfg = ctx->layer_configs[layer_idx];
+    int64_t w_offset = 0;
+    for (int64_t j = 0; j < layer_idx; j++)
+        w_offset += weight_count_for_layer(ctx->layer_configs[j]);
+    int64_t mlp_start = (cfg.layer_type == 0) ? 8 : 11;
+    auto post_attn = rms_norm(residual, *ctx->weight_ptrs[w_offset + 1], cfg.rms_eps);
+    if (cfg.num_experts > 0) {
+        return moe_forward(post_attn,
+            *ctx->weight_ptrs[w_offset+mlp_start], *ctx->weight_ptrs[w_offset+mlp_start+1],
+            *ctx->weight_ptrs[w_offset+mlp_start+2], *ctx->weight_ptrs[w_offset+mlp_start+3],
+            *ctx->weight_ptrs[w_offset+mlp_start+4], *ctx->weight_ptrs[w_offset+mlp_start+5],
+            *ctx->weight_ptrs[w_offset+mlp_start+6],
+            cfg.num_experts, cfg.top_k, cfg.moe_intermediate,
+            cfg.norm_topk_prob != 0, cfg.expert_start, cfg.expert_count, kind);
+    } else {
+        return dense_mlp_forward(post_attn,
+            *ctx->weight_ptrs[w_offset+mlp_start], *ctx->weight_ptrs[w_offset+mlp_start+1],
+            *ctx->weight_ptrs[w_offset+mlp_start+2], kind);
+    }
+}
+
+// Sub-layer checkpoint: wraps a function call with no-grad forward + recompute on backward
+struct SubLayerCkpt : public torch::autograd::Function<SubLayerCkpt> {
+    static at::Tensor forward(
+        torch::autograd::AutogradContext* ctx,
+        at::Tensor input, int64_t tc_val, int64_t layer_idx, bool is_attn
+    ) {
+        ctx->saved_data["tc"] = tc_val;
+        ctx->saved_data["layer"] = layer_idx;
+        ctx->saved_data["is_attn"] = is_attn;
+        bool offload = getenv("QWEN36_OFFLOAD_ACTIVATIONS");
+        if (offload) {
+            ctx->saved_data["input_cpu"] = input.detach().to(
+                at::TensorOptions().dtype(input.scalar_type()).device(at::kCPU).pinned_memory(true));
+            ctx->saved_data["device"] = input.device();
+        } else {
+            ctx->save_for_backward({input});
+        }
+        at::AutoGradMode guard(false);
+        auto* tc = reinterpret_cast<TrainingContext*>(tc_val);
+        if (is_attn) return compute_attn_only(tc, input, layer_idx, tc->compute_type);
+        else return compute_mlp_only(tc, input, layer_idx, tc->compute_type);
+    }
+    static std::vector<at::Tensor> backward(
+        torch::autograd::AutogradContext* ctx, std::vector<at::Tensor> grad_output
+    ) {
+        at::Tensor input;
+        if (ctx->saved_data.count("input_cpu") > 0) {
+            input = ctx->saved_data["input_cpu"].toTensor().to(ctx->saved_data["device"].toDevice());
+        } else {
+            input = ctx->get_saved_variables()[0];
+        }
+        auto* tc = reinterpret_cast<TrainingContext*>(ctx->saved_data["tc"].toInt());
+        int64_t layer = ctx->saved_data["layer"].toInt();
+        bool is_attn = ctx->saved_data["is_attn"].toBool();
+        at::AutoGradMode guard(true);
+        input.set_requires_grad(true);
+        auto output = is_attn ? compute_attn_only(tc, input, layer, tc->compute_type)
+                              : compute_mlp_only(tc, input, layer, tc->compute_type);
+        torch::autograd::backward({output}, {grad_output[0]}, true, false);
+        return {input.grad(), at::Tensor(), at::Tensor(), at::Tensor()};
+    }
+};
+
+// Forward a single layer with sub-layer checkpointing
+at::Tensor forward_single_layer_subckpt(
+    TrainingContext* ctx, const at::Tensor& hidden, int64_t layer_idx
+) {
+    auto attn_out = SubLayerCkpt::apply(
+        hidden, (int64_t)(uintptr_t)ctx, layer_idx, true);
+    auto residual = hidden + attn_out;
+    auto mlp_out = SubLayerCkpt::apply(
+        residual, (int64_t)(uintptr_t)ctx, layer_idx, false);
+    return residual + mlp_out;
+}
 
 // Forward pass (no checkpointing)
 static at::Tensor forward_full(
@@ -483,6 +612,15 @@ static at::Tensor forward_layer_group(
     auto kind = ctx->compute_type;
     at::Tensor hidden = input;
 
+    // Sub-layer checkpointing: each layer's attn and mlp are independently checkpointed
+    if (getenv("QWEN36_SUBCKPT")) {
+        for (int64_t i = start_layer; i < end_layer; i++) {
+            hidden = forward_single_layer_subckpt(ctx, hidden, i);
+        }
+        return hidden;
+    }
+
+    // Normal path: full layer forward (no sub-layer checkpointing)
     for (int64_t i = start_layer; i < end_layer; i++) {
         int64_t w_offset = 0;
         for (int64_t j = 0; j < i; j++)
