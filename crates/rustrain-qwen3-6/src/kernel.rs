@@ -208,7 +208,9 @@ pub fn build_layer_configs(
     }).collect()
 }
 
-/// Build weight pointers for MTP layers (full attention layers, 15 weights each).
+/// Build weight pointers for MTP layers (full attention layers).
+/// MoE: 15 weights per layer (2 norm + 6 attn + 7 MoE)
+/// Dense: 11 weights per layer (2 norm + 6 attn + 3 dense MLP)
 pub fn build_mtp_weight_ptrs(
     weights: &std::collections::BTreeMap<String, Tensor>,
     config: &crate::config::Qwen36RuntimeConfig,
@@ -222,14 +224,21 @@ pub fn build_mtp_weight_ptrs(
         for w in &["q_proj", "q_norm", "k_proj", "k_norm", "v_proj", "o_proj"] {
             ptrs.push(get_ptr(weights, &format!("{lp}.self_attn.{w}.weight")));
         }
-        // MoE: gate, shared_expert_gate, shared_gate_proj, shared_up_proj, shared_down_proj, experts_gate_up, experts_down
-        ptrs.push(get_ptr(weights, &format!("{lp}.mlp.gate.weight")));
-        ptrs.push(get_ptr(weights, &format!("{lp}.mlp.shared_expert_gate.weight")));
-        ptrs.push(get_ptr(weights, &format!("{lp}.mlp.shared_expert.gate_proj.weight")));
-        ptrs.push(get_ptr(weights, &format!("{lp}.mlp.shared_expert.up_proj.weight")));
-        ptrs.push(get_ptr(weights, &format!("{lp}.mlp.shared_expert.down_proj.weight")));
-        ptrs.push(get_ptr(weights, &format!("{lp}.mlp.experts.gate_up_proj")));
-        ptrs.push(get_ptr(weights, &format!("{lp}.mlp.experts.down_proj")));
+        if config.is_moe {
+            // MoE: gate, shared_expert_gate, shared_gate_proj, shared_up_proj, shared_down_proj, experts_gate_up, experts_down
+            ptrs.push(get_ptr(weights, &format!("{lp}.mlp.gate.weight")));
+            ptrs.push(get_ptr(weights, &format!("{lp}.mlp.shared_expert_gate.weight")));
+            ptrs.push(get_ptr(weights, &format!("{lp}.mlp.shared_expert.gate_proj.weight")));
+            ptrs.push(get_ptr(weights, &format!("{lp}.mlp.shared_expert.up_proj.weight")));
+            ptrs.push(get_ptr(weights, &format!("{lp}.mlp.shared_expert.down_proj.weight")));
+            ptrs.push(get_ptr(weights, &format!("{lp}.mlp.experts.gate_up_proj")));
+            ptrs.push(get_ptr(weights, &format!("{lp}.mlp.experts.down_proj")));
+        } else {
+            // Dense MLP: gate_proj, up_proj, down_proj
+            ptrs.push(get_ptr(weights, &format!("{lp}.mlp.gate_proj.weight")));
+            ptrs.push(get_ptr(weights, &format!("{lp}.mlp.up_proj.weight")));
+            ptrs.push(get_ptr(weights, &format!("{lp}.mlp.down_proj.weight")));
+        }
     }
     ptrs
 }
