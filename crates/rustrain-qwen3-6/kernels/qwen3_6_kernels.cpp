@@ -36,6 +36,13 @@ static at::Tensor lora_delta(const at::Tensor& base, const at::Tensor& a, const 
     return base + (delta * scaling).to(kind);
 }
 
+// KV cache for chunked full attention (per-layer, per-call)
+// Stored on GPU if QWEN36_KV_OFFLOAD not set, CPU if set
+static thread_local at::Tensor kv_k_cache;
+static thread_local at::Tensor kv_v_cache;
+static thread_local at::Tensor ctx_kv_k_cache;  // CPU copy
+static thread_local at::Tensor ctx_kv_v_cache;  // CPU copy
+
 // ──────────────────────────────────────────────────────────────────────
 // Full attention
 // ──────────────────────────────────────────────────────────────────────
@@ -63,6 +70,146 @@ static at::Tensor full_attention(
     int64_t qkv_dim = num_heads * head_dim;
     int64_t rotary_dim = (int64_t)(head_dim * partial_rotary_factor);
 
+    // Check if sequence chunking is enabled
+    const char* chunk_env = getenv("QWEN36_SEQ_CHUNK");
+    int64_t seq_chunk = 0;
+    if (chunk_env) seq_chunk = atoll(chunk_env);
+    bool kv_offload = getenv("QWEN36_KV_OFFLOAD");
+
+    if (seq_chunk > 0 && seq > seq_chunk) {
+        // Chunked full attention with KV cache
+        // For each Q chunk, attend to all K/V chunks (from cache + current)
+        // KV cache: stored on CPU if QWEN36_KV_OFFLOAD=1, else on GPU
+        // Mathematically equivalent to full causal attention
+
+        int64_t n_rep = num_heads / num_kv_heads;
+        double scale = 1.0 / std::sqrt((double)head_dim);
+
+        // Precompute RoPE cos/sin for full sequence
+        at::Tensor cos_full, sin_full;
+        if (rotary_dim > 0) {
+            auto pos = at::arange(seq, at::TensorOptions().dtype(at::kFloat).device(device)).unsqueeze(0);
+            auto exponents = at::arange(0, rotary_dim, 2, at::TensorOptions().dtype(at::kFloat).device(device)) / (double)rotary_dim;
+            auto inv_freq = (exponents * std::log(rope_theta)).exp().reciprocal();
+            auto freqs = pos.unsqueeze(-1) * inv_freq.unsqueeze(0);
+            auto emb = at::cat({freqs, freqs}, -1);
+            cos_full = emb.cos().unsqueeze(1).to(compute_type);
+            sin_full = emb.sin().unsqueeze(1).to(compute_type);
+        }
+
+        std::vector<at::Tensor> chunk_outputs;
+        int64_t processed = 0;  // number of K/V tokens processed so far
+
+        for (int64_t q_start = 0; q_start < seq; q_start += seq_chunk) {
+            int64_t q_end = std::min(q_start + seq_chunk, seq);
+            int64_t q_len = q_end - q_start;
+
+            // Q for this chunk
+            auto hidden_q = hidden.narrow(1, q_start, q_len);
+            auto q_out = at::matmul(hidden_q, q_proj.t()).view({batch, q_len, num_heads, head_dim * 2});
+            auto qk_chunk = q_out.chunk(2, -1);
+            auto q = qk_chunk[0].transpose(1, 2);
+            auto gate = qk_chunk[1].transpose(1, 2);
+
+            // K, V for this chunk
+            auto k_c = at::matmul(hidden_q, k_proj.t()).view({batch, q_len, num_kv_heads, head_dim}).transpose(1, 2);
+            auto v_c = at::matmul(hidden_q, v_proj.t()).view({batch, q_len, num_kv_heads, head_dim}).transpose(1, 2);
+
+            q = rms_norm(q, q_norm, rms_eps);
+            k_c = rms_norm(k_c, k_norm, rms_eps);
+
+            // Apply RoPE (positions q_start..q_end)
+            if (rotary_dim > 0) {
+                auto cos_c = cos_full.narrow(2, q_start, q_len);
+                auto sin_c = sin_full.narrow(2, q_start, q_len);
+                auto q_rot = q.narrow(-1, 0, rotary_dim);
+                auto k_rot = k_c.narrow(-1, 0, rotary_dim);
+                auto q_pass = q.narrow(-1, rotary_dim, head_dim - rotary_dim);
+                auto k_pass = k_c.narrow(-1, rotary_dim, head_dim - rotary_dim);
+                auto q_rotated = q_rot * cos_c + rotate_half(q_rot) * sin_c;
+                auto k_rotated = k_rot * cos_c + rotate_half(k_rot) * sin_c;
+                q = (head_dim > rotary_dim) ? at::cat({q_rotated, q_pass}, -1) : q_rotated;
+                k_c = (head_dim > rotary_dim) ? at::cat({k_rotated, k_pass}, -1) : k_rotated;
+            }
+
+            k_c = k_c.repeat_interleave(n_rep, 1);
+            v_c = v_c.repeat_interleave(n_rep, 1);
+
+            // Gather all K/V to attend to (processed tokens + current chunk)
+            at::Tensor k_all, v_all;
+            if (processed > 0) {
+                // Load previous K/V from cache
+                at::Tensor k_prev, v_prev;
+                if (kv_offload) {
+                    // Load from CPU
+                    k_prev = ctx_kv_k_cache.to(device).narrow(2, 0, processed);
+                    v_prev = ctx_kv_v_cache.to(device).narrow(2, 0, processed);
+                } else {
+                    k_prev = kv_k_cache.narrow(2, 0, processed);
+                    v_prev = kv_v_cache.narrow(2, 0, processed);
+                }
+                k_all = at::cat({k_prev, k_c}, 2);
+                v_all = at::cat({v_prev, v_c}, 2);
+            } else {
+                k_all = k_c;
+                v_all = v_c;
+            }
+
+            // Build causal mask: Q positions [q_start..q_end] attend to K positions [0..q_end]
+            int64_t kv_len = q_end;  // total K/V length = q_end
+            // SDPA with explicit causal mask
+            auto attn_mask = at::ones({q_len, kv_len}, at::TensorOptions().dtype(at::kBool).device(device));
+            // Q position i (absolute = q_start + i) can attend to K position j where j <= q_start + i
+            for (int64_t i = 0; i < q_len; i++) {
+                int64_t abs_pos = q_start + i;
+                // Mask out positions > abs_pos
+                if (abs_pos + 1 < kv_len) {
+                    attn_mask[i].narrow(0, abs_pos + 1, kv_len - abs_pos - 1).fill_(false);
+                }
+            }
+            // Q^T @ K^T / sqrt(d) — use SDPA with explicit mask
+            auto attn_out = at::scaled_dot_product_attention(
+                q, k_all, v_all,
+                attn_mask.unsqueeze(0).unsqueeze(0),  // [1, 1, q_len, kv_len]
+                0.0, true  // dropout, is_causal=false (we provide explicit mask)
+            );
+            attn_out = attn_out * at::sigmoid(gate).to(attn_out.scalar_type());
+            auto result = attn_out.transpose(1, 2).reshape({batch, q_len, qkv_dim}).matmul(o_proj.t());
+            chunk_outputs.push_back(result);
+
+            // Update KV cache
+            if (kv_offload) {
+                // Store current chunk K/V to CPU
+                if (q_start == 0) {
+                    ctx_kv_k_cache = k_all.to(at::TensorOptions().device(at::kCPU).pinned_memory(true));
+                    ctx_kv_v_cache = v_all.to(at::TensorOptions().device(at::kCPU).pinned_memory(true));
+                } else {
+                    ctx_kv_k_cache = at::cat({ctx_kv_k_cache, k_c.to(at::kCPU)}, 2);
+                    ctx_kv_v_cache = at::cat({ctx_kv_v_cache, v_c.to(at::kCPU)}, 2);
+                }
+            } else {
+                if (q_start == 0) {
+                    kv_k_cache = k_all;
+                    kv_v_cache = v_all;
+                } else {
+                    kv_k_cache = at::cat({kv_k_cache, k_c}, 2);
+                    kv_v_cache = at::cat({kv_v_cache, v_c}, 2);
+                }
+            }
+
+            processed = q_end;
+        }
+
+        // Clean up KV cache
+        kv_k_cache = at::Tensor();
+        kv_v_cache = at::Tensor();
+        ctx_kv_k_cache = at::Tensor();
+        ctx_kv_v_cache = at::Tensor();
+
+        return at::cat(chunk_outputs, 1);
+    }
+
+    // Non-chunked path (original code)
     auto q_out = at::matmul(hidden, q_proj.t()).view({batch, seq, num_heads, head_dim * 2});
     auto qk_chunk = q_out.chunk(2, -1);
     auto q = qk_chunk[0].transpose(1, 2);   // [batch, heads, seq, head_dim]
@@ -147,6 +294,122 @@ static at::Tensor linear_attention(
     int64_t v_size = num_v_heads * val_dim;
     int64_t qkv_dim = q_size * 2 + v_size;
 
+    // Check if sequence chunking is enabled
+    const char* chunk_env = getenv("QWEN36_SEQ_CHUNK");
+    int64_t seq_chunk = 0;
+    if (chunk_env) seq_chunk = atoll(chunk_env);
+
+    if (seq_chunk > 0 && seq > seq_chunk) {
+        // Chunked linear attention — mathematically equivalent to full sequence
+        // Process in chunks, passing the delta rule state between chunks.
+        // This avoids creating [batch, seq, qkv_dim] intermediate tensors.
+        int64_t BH = batch * num_v_heads;
+        auto state = at::zeros({BH, key_dim, val_dim},
+            at::TensorOptions().dtype(at::kFloat).device(device));
+
+        std::vector<at::Tensor> chunk_outputs;
+        int64_t offset = 0;
+        while (offset < seq) {
+            int64_t end = std::min(offset + seq_chunk, seq);
+            int64_t chunk_len = end - offset;
+
+            // Slice hidden for this chunk
+            auto hidden_chunk = hidden.narrow(1, offset, chunk_len);
+
+            // Process this chunk (same as non-chunked but on subset)
+            auto qkv = at::matmul(hidden_chunk, in_proj_qkv.t());
+            auto qkv_t = qkv.transpose(1, 2);
+
+            // Conv1d: need overlap from previous chunk (conv_kernel - 1 tokens)
+            int64_t pad = conv_kernel - 1;
+            at::Tensor padding;
+            if (offset == 0) {
+                // First chunk: zero padding
+                padding = at::zeros({batch, qkv_dim, pad}, qkv.options());
+            } else {
+                // Need previous chunk's last (pad) tokens for causal conv
+                // Recompute qkv for the overlap region
+                auto prev_qkv = at::matmul(
+                    hidden.narrow(1, offset - pad, pad), in_proj_qkv.t()).transpose(1, 2);
+                padding = prev_qkv;
+            }
+            auto padded = at::cat({padding, qkv_t}, 2);
+            auto conv_out = at::conv1d(padded, conv1d_weight, {},
+                at::IntArrayRef({1}), at::IntArrayRef({0}), at::IntArrayRef({1}), qkv_dim);
+            conv_out = at::silu(conv_out.narrow(2, 0, chunk_len));
+            auto qkv_conv = conv_out.transpose(1, 2);
+
+            auto q = qkv_conv.narrow(-1, 0, q_size).view({batch, chunk_len, num_k_heads, key_dim});
+            auto k = qkv_conv.narrow(-1, q_size, q_size).view({batch, chunk_len, num_k_heads, key_dim});
+            auto v = qkv_conv.narrow(-1, q_size * 2, v_size).view({batch, chunk_len, num_v_heads, val_dim});
+
+            auto a = at::matmul(hidden_chunk, in_proj_a.t());
+            auto b = at::matmul(hidden_chunk, in_proj_b.t());
+            auto z = at::matmul(hidden_chunk, in_proj_z.t()).view({batch, chunk_len, num_v_heads, val_dim});
+
+            auto a_log_f = a_log.to(at::kFloat);
+            auto dt_bias_f = dt_bias.to(at::kFloat);
+            auto a_f = a.to(at::kFloat);
+            auto g = a_log_f.unsqueeze(0).unsqueeze(0).exp().neg() *
+                     at::softplus(a_f + dt_bias_f.unsqueeze(0).unsqueeze(0));
+            auto beta = at::sigmoid(b);
+
+            int64_t n_rep = num_v_heads / num_k_heads;
+            q = q.repeat_interleave(n_rep, 2);
+            k = k.repeat_interleave(n_rep, 2);
+
+            q = (q.to(at::kFloat) / q.to(at::kFloat).norm(2, -1, true).clamp_min(1e-6));
+            k = (k.to(at::kFloat) / k.to(at::kFloat).norm(2, -1, true).clamp_min(1e-6));
+            q = q * (1.0 / std::sqrt((double)key_dim));
+
+            auto q_t = q.transpose(1, 2).contiguous();
+            auto k_t = k.transpose(1, 2).contiguous();
+            auto v_t = v.to(at::kFloat).transpose(1, 2).contiguous();
+            auto g_t = g.transpose(1, 2).contiguous();
+            auto beta_t = beta.to(at::kFloat).transpose(1, 2).contiguous();
+
+            auto g_exp = g_t.exp();
+            auto q_contig = q_t.reshape({BH, chunk_len, key_dim}).contiguous().to(at::kFloat);
+            auto k_contig = k_t.reshape({BH, chunk_len, key_dim}).contiguous().to(at::kFloat);
+            auto v_contig = v_t.reshape({BH, chunk_len, val_dim}).contiguous().to(at::kFloat);
+            auto g_contig = g_exp.reshape({BH, chunk_len}).contiguous().to(at::kFloat);
+            auto beta_contig = beta_t.reshape({BH, chunk_len}).contiguous().to(at::kFloat);
+            auto state_contig = state.contiguous();
+            auto outs = at::empty({BH, chunk_len, val_dim}, q_t.options());
+
+            // CUDA kernel — state is passed in and updated in-place
+            cuda_gated_delta_rule(
+                q_contig.data_ptr<float>(),
+                k_contig.data_ptr<float>(),
+                v_contig.data_ptr<float>(),
+                g_contig.data_ptr<float>(),
+                beta_contig.data_ptr<float>(),
+                state_contig.data_ptr<float>(),
+                outs.data_ptr<float>(),
+                (int)BH, (int)chunk_len, (int)key_dim, (int)val_dim
+            );
+            state = state_contig;  // updated state for next chunk
+
+            auto core_out = outs.reshape({batch, num_v_heads, chunk_len, val_dim})
+                                 .transpose(1, 2).to(compute_type);
+
+            auto core_flat = core_out.reshape({-1, val_dim});
+            auto z_flat = z.reshape({-1, val_dim});
+            auto variance = core_flat.to(at::kFloat).pow(2).mean(-1, true);
+            auto normed = (core_flat.to(at::kFloat) * (variance + rms_eps).rsqrt() *
+                           norm_w.to(at::kFloat)).to(core_flat.scalar_type());
+            auto gated = (normed * at::silu(z_flat.to(at::kFloat)).to(normed.scalar_type()))
+                         .view({batch, chunk_len, num_v_heads * val_dim});
+            auto result = at::matmul(gated, out_proj.t());
+            chunk_outputs.push_back(result);
+
+            offset = end;
+        }
+
+        return at::cat(chunk_outputs, 1);  // [batch, seq, hidden]
+    }
+
+    // Non-chunked path (original code)
     auto qkv = at::matmul(hidden, in_proj_qkv.t());
     auto qkv_t = qkv.transpose(1, 2);
     int64_t pad = conv_kernel - 1;
