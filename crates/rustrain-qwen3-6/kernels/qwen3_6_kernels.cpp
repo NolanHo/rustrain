@@ -540,8 +540,51 @@ struct SubLayerCkpt : public torch::autograd::Function<SubLayerCkpt> {
         input.set_requires_grad(true);
         auto output = is_attn ? compute_attn_only(tc, input, layer, tc->compute_type)
                               : compute_mlp_only(tc, input, layer, tc->compute_type);
-        torch::autograd::backward({output}, {grad_output[0]}, true, false);
-        return {input.grad(), at::Tensor(), at::Tensor(), at::Tensor()};
+
+        // Collect all tensors to compute gradients for: input + LoRA params for this layer
+        // This way grad() accumulates gradients into LoRA params (leaf nodes) too.
+        int64_t lora_count = (tc->layer_configs[layer].layer_type == 0) ? 4 : 3;
+        int64_t la_offset = tc->lora_layer_offset[layer];
+        bool has_lora = (la_offset + lora_count) <= (int64_t)tc->lora_a.size();
+
+        std::vector<at::Tensor> grad_inputs = {input};
+        if (has_lora) {
+            for (int64_t k = 0; k < lora_count; k++) {
+                grad_inputs.push_back(tc->lora_a[la_offset + k]);
+                grad_inputs.push_back(tc->lora_b[la_offset + k]);
+            }
+        }
+
+        auto grads = torch::autograd::grad(
+            {output}, grad_inputs, {grad_output[0]},
+            /*retain_graph=*/false, /*create_graph=*/false,
+            /*allow_unused=*/true
+        );
+
+        // Manually accumulate LoRA param gradients
+        if (has_lora) {
+            int64_t gi = 1;  // skip input grad (index 0)
+            for (int64_t k = 0; k < lora_count; k++) {
+                if (grads[gi].defined()) {
+                    auto& param_a = tc->lora_a[la_offset + k];
+                    if (param_a.grad().defined())
+                        param_a.grad().add_(grads[gi]);
+                    else
+                        param_a.mutable_grad() = grads[gi].clone();
+                }
+                gi++;
+                if (grads[gi].defined()) {
+                    auto& param_b = tc->lora_b[la_offset + k];
+                    if (param_b.grad().defined())
+                        param_b.grad().add_(grads[gi]);
+                    else
+                        param_b.mutable_grad() = grads[gi].clone();
+                }
+                gi++;
+            }
+        }
+
+        return {grads[0], at::Tensor(), at::Tensor(), at::Tensor()};
     }
 };
 
@@ -612,15 +655,8 @@ static at::Tensor forward_layer_group(
     auto kind = ctx->compute_type;
     at::Tensor hidden = input;
 
-    // Sub-layer checkpointing: each layer's attn and mlp are independently checkpointed
-    if (getenv("QWEN36_SUBCKPT")) {
-        for (int64_t i = start_layer; i < end_layer; i++) {
-            hidden = forward_single_layer_subckpt(ctx, hidden, i);
-        }
-        return hidden;
-    }
-
-    // Normal path: full layer forward (no sub-layer checkpointing)
+    // Normal path: full layer forward (sub-layer checkpointing is handled
+    // in forward_full_checkpoint, not here)
     for (int64_t i = start_layer; i < end_layer; i++) {
         int64_t w_offset = 0;
         for (int64_t j = 0; j < i; j++)
@@ -726,6 +762,19 @@ static at::Tensor forward_full_checkpoint(
     // Detach and set requires_grad so autograd::Function can track the graph
     hidden = hidden.detach().set_requires_grad(true);
 
+    bool use_subckpt = getenv("QWEN36_SUBCKPT");
+
+    if (use_subckpt) {
+        // Sub-layer checkpointing: each layer's attn and mlp are independently
+        // checkpointed via SubLayerCkpt. No GroupCheckpointFunction — avoids
+        // nested autograd::Function which causes backward deadlock.
+        for (int64_t i = 0; i < ctx->num_layers; i++) {
+            hidden = forward_single_layer_subckpt(ctx, hidden, i);
+        }
+        return hidden;
+    }
+
+    // Group-level checkpointing (default)
     int64_t gs = ctx->group_size;
     if (gs < 1) gs = 1;
 
