@@ -121,6 +121,14 @@ static at::Tensor full_attention(
 // Linear attention (Gated Delta Rule — matrix formulation)
 // ──────────────────────────────────────────────────────────────────────
 
+// Forward declaration for CUDA kernel (defined in delta_rule.cu)
+extern "C" void cuda_gated_delta_rule(
+    const float* q, const float* k, const float* v,
+    const float* g_exp, const float* beta,
+    float* state, float* out,
+    int BH, int seq_len, int key_dim, int val_dim
+);
+
 static at::Tensor linear_attention(
     const at::Tensor& hidden,
     const at::Tensor& in_proj_qkv, const at::Tensor& in_proj_z,
@@ -183,53 +191,32 @@ static at::Tensor linear_attention(
     auto g_t = g.transpose(1, 2).contiguous();  // [B, H, S]
     auto beta_t = beta.to(at::kFloat).transpose(1, 2).contiguous();
 
-    // Optimized Gated Delta Rule — reduce kernel launches via bmm
-    // The recurrence is inherently sequential (state update depends on previous token),
-    // but we minimize per-token overhead by using bmm for the matrix operations
-    // instead of select + elementwise mul + sum.
-    //
-    // Key optimization: pre-reshape to [B*H, S, D] format so each per-token
-    // operation is a single bmm call rather than multiple select/mul/sum.
+    // CUDA kernel for gated delta rule — eliminates per-token kernel launch overhead
+    // All computation runs in a single kernel launch using shared memory for state
     auto g_exp = g_t.exp();  // [B, H, S]
     int64_t BH = batch * num_v_heads;
     auto state = at::zeros({BH, key_dim, val_dim}, q_t.options());  // [B*H, D_k, D_v]
 
-    // Pre-reshape to [B*H, S, D] for efficient indexing
-    auto q_bh = q_t.reshape({BH, seq, key_dim});     // [B*H, S, D_k]
-    auto k_bh = k_t.reshape({BH, seq, key_dim});     // [B*H, S, D_k]
-    auto v_bh = v_t.reshape({BH, seq, val_dim});     // [B*H, S, D_v]
-    auto g_bh = g_exp.reshape({BH, seq});             // [B*H, S]
-    auto beta_bh = beta_t.reshape({BH, seq});        // [B*H, S]
-
+    // Prepare contiguous FP32 tensors for CUDA kernel
+    auto q_contig = q_t.reshape({BH, seq, key_dim}).contiguous().to(at::kFloat);
+    auto k_contig = k_t.reshape({BH, seq, key_dim}).contiguous().to(at::kFloat);
+    auto v_contig = v_t.reshape({BH, seq, val_dim}).contiguous().to(at::kFloat);
+    auto g_contig = g_exp.reshape({BH, seq}).contiguous().to(at::kFloat);
+    auto beta_contig = beta_t.reshape({BH, seq}).contiguous().to(at::kFloat);
+    auto state_contig = state.contiguous();
     auto outs = at::empty({BH, seq, val_dim}, q_t.options());  // [B*H, S, D_v]
 
-    for (int64_t i = 0; i < seq; i++) {
-        // k_i: [B*H, 1, D_k], v_i: [B*H, 1, D_v], q_i: [B*H, 1, D_k]
-        auto k_i = k_bh.select(1, i).unsqueeze(1);  // [B*H, 1, D_k]
-        auto v_i = v_bh.select(1, i).unsqueeze(1);  // [B*H, 1, D_v]
-        auto q_i = q_bh.select(1, i).unsqueeze(1);  // [B*H, 1, D_k]
-        auto g_i = g_bh.select(1, i).reshape({BH, 1, 1});  // [B*H, 1, 1]
-        auto beta_i = beta_bh.select(1, i).reshape({BH, 1, 1});  // [B*H, 1, 1]
-
-        // S = S * g_i (decay) — elementwise, [B*H, D_k, D_v]
-        state = state * g_i;
-
-        // kv_mem = bmm(k_i, S) → [B*H, 1, D_v]
-        auto kv_mem = at::bmm(k_i, state);  // [B*H, 1, D_v]
-
-        // delta = (v_i - kv_mem) * beta_i
-        auto delta = (v_i - kv_mem) * beta_i;  // [B*H, 1, D_v]
-
-        // S += k_i^T @ delta → outer product via bmm
-        // k_i^T: [B*H, D_k, 1], delta: [B*H, 1, D_v] → [B*H, D_k, D_v]
-        state = state + at::bmm(k_i.transpose(1, 2), delta);
-
-        // out_i = bmm(q_i, S) → [B*H, 1, D_v]
-        auto out_i = at::bmm(q_i, state);  // [B*H, 1, D_v]
-
-        // Store output
-        outs.select(1, i).copy_(out_i.squeeze(1));
-    }
+    // Launch CUDA kernel — single launch replaces seq×3 bmm calls
+    cuda_gated_delta_rule(
+        q_contig.data_ptr<float>(),
+        k_contig.data_ptr<float>(),
+        v_contig.data_ptr<float>(),
+        g_contig.data_ptr<float>(),
+        beta_contig.data_ptr<float>(),
+        state_contig.data_ptr<float>(),
+        outs.data_ptr<float>(),
+        (int)BH, (int)seq, (int)key_dim, (int)val_dim
+    );
 
     // Reshape: [B*H, S, D_v] → [B, H, S, D_v] → [B, S, H, D_v]
     auto core_out = outs.reshape({batch, num_v_heads, seq, val_dim})
