@@ -149,12 +149,12 @@ pub fn mtp_forward(
     let (batch, seq_len, _hidden) = hidden.size3().unwrap();
     let eps = config.rms_norm_eps;
 
-    // hidden[t] + embed[t] → predict token t+1
+    // hidden[t] + embed[t+1] → predict token t+2 (Megatron convention)
     let hidden_shifted = hidden.narrow(1, 0, seq_len - 1);  // [batch, seq-1, hidden]
-    let embed_cur = Tensor::embedding(embed_tokens, &input_ids.narrow(1, 0, seq_len - 1), -1, false, false);
+    let embed_next = Tensor::embedding(embed_tokens, &input_ids.narrow(1, 1, seq_len - 1), -1, false, false);
 
     let h_normed = rms_norm(&hidden_shifted, &mtp_weights.pre_fc_norm_hidden, eps).to_kind(compute_kind);
-    let e_normed = rms_norm(&embed_cur, &mtp_weights.pre_fc_norm_embedding, eps).to_kind(compute_kind);
+    let e_normed = rms_norm(&embed_next, &mtp_weights.pre_fc_norm_embedding, eps).to_kind(compute_kind);
 
     // Combine: embed first, then hidden → fc projection
     let combined = Tensor::cat(&[&e_normed, &h_normed], -1);
@@ -195,12 +195,12 @@ pub fn mtp_loss(
     // MTP logits: [batch, seq-1, vocab]
     let mtp_logits = mtp_forward(hidden, input_ids, mtp_weights, embed_tokens, lm_head, config, compute_kind);
 
-    // MTP predicts token t+1 from hidden[t], so targets are input_ids[1..seq]
-    let mtp_targets = input_ids.narrow(1, 1, seq_len - 1).reshape([-1]);
-    let mtp_mask = target_mask.narrow(1, 1, seq_len - 1).reshape([-1]);
+    // MTP predicts token t+2 from hidden[t] + embed[t+1] (Megatron convention)
+    let mtp_targets = input_ids.narrow(1, 2, seq_len - 2).reshape([-1]);
+    let mtp_mask = target_mask.narrow(1, 2, seq_len - 2).reshape([-1]);
 
-    // Reshape to 2D for g_nll_loss: [batch*(seq-1), vocab]
-    let log_probs = mtp_logits.reshape([-1, vocab_size]).log_softmax(-1, Kind::Float);
+    // Reshape to 2D for g_nll_loss: [batch*(seq-2), vocab]
+    let log_probs = mtp_logits.narrow(1, 0, seq_len - 2).reshape([-1, vocab_size]).log_softmax(-1, Kind::Float);
     let per_token_loss = log_probs.g_nll_loss::<&Tensor>(&mtp_targets, None, Reduction::None, -100);
     let masked_loss = &per_token_loss * &mtp_mask;
     let total = masked_loss.sum(Kind::Float);

@@ -614,13 +614,13 @@ static at::Tensor mtp_forward(
 
     int64_t seq_len = hidden.size(1);
 
-    // hidden[t] + embed[t] → predict token t+1
+    // hidden[t] + embed[t+1] → predict token t+2 (Megatron convention)
     auto hidden_shifted = hidden.narrow(1, 0, seq_len - 1);  // [batch, seq-1, hidden]
-    auto embed_cur = at::embedding(embed, input_ids.narrow(1, 0, seq_len - 1));  // [batch, seq-1, hidden]
+    auto embed_next = at::embedding(embed, input_ids.narrow(1, 1, seq_len - 1));  // [batch, seq-1, hidden]
 
     // RMSNorm both
     auto h_normed = rms_norm(hidden_shifted, *ctx->mtp_pre_fc_norm_hidden, ctx->rms_eps).to(kind);
-    auto e_normed = rms_norm(embed_cur, *ctx->mtp_pre_fc_norm_emb, ctx->rms_eps).to(kind);
+    auto e_normed = rms_norm(embed_next, *ctx->mtp_pre_fc_norm_emb, ctx->rms_eps).to(kind);
 
     // Combine: embed first, then hidden → fc projection
     auto combined = at::cat({e_normed, h_normed}, /*dim=*/-1);
@@ -646,7 +646,7 @@ static at::Tensor mtp_forward(
 }
 
 // MTP loss: cross-entropy on shifted tokens, weighted by 0.5
-// MTP logits[t] (from hidden[t] + embed[t]) predicts token t+1
+// MTP logits[t] (from hidden[t] + embed[t+1]) predicts token t+2 (Megatron convention)
 static at::Tensor mtp_compute_loss(
     TrainingContext* ctx,
     const at::Tensor& mtp_logits,
@@ -656,10 +656,10 @@ static at::Tensor mtp_compute_loss(
     int64_t vocab_size = ctx->vocab_size;
     int64_t seq_len = input_ids.size(1);
 
-    // MTP logits: [batch, seq-1, vocab], targets: input_ids[1:seq]
-    auto shifted_logits = mtp_logits.reshape({-1, vocab_size});
-    auto shifted_targets = input_ids.narrow(1, 1, seq_len - 1).reshape({-1});
-    auto shifted_mask = target_mask.narrow(1, 1, seq_len - 1).reshape({-1});
+    // MTP logits: [batch, seq-1, vocab], drop last → predict t+2
+    auto shifted_logits = mtp_logits.narrow(1, 0, seq_len - 2).reshape({-1, vocab_size});
+    auto shifted_targets = input_ids.narrow(1, 2, seq_len - 2).reshape({-1});
+    auto shifted_mask = target_mask.narrow(1, 2, seq_len - 2).reshape({-1});
 
     auto log_probs = shifted_logits.log_softmax(-1, at::kFloat);
     auto per_token_loss = log_probs.gather(1, shifted_targets.unsqueeze(1)).squeeze(1).neg();
