@@ -183,38 +183,57 @@ static at::Tensor linear_attention(
     auto g_t = g.transpose(1, 2).contiguous();  // [B, H, S]
     auto beta_t = beta.to(at::kFloat).transpose(1, 2).contiguous();
 
-    // Recurrent Gated Delta Rule (matching HF torch_recurrent_gated_delta_rule)
+    // Optimized Gated Delta Rule — reduce kernel launches via bmm
+    // The recurrence is inherently sequential (state update depends on previous token),
+    // but we minimize per-token overhead by using bmm for the matrix operations
+    // instead of select + elementwise mul + sum.
+    //
+    // Key optimization: pre-reshape to [B*H, S, D] format so each per-token
+    // operation is a single bmm call rather than multiple select/mul/sum.
     auto g_exp = g_t.exp();  // [B, H, S]
-    auto state = at::zeros({batch, num_v_heads, key_dim, val_dim}, q_t.options());
+    int64_t BH = batch * num_v_heads;
+    auto state = at::zeros({BH, key_dim, val_dim}, q_t.options());  // [B*H, D_k, D_v]
 
-    std::vector<at::Tensor> outs;
-    outs.reserve(seq);
+    // Pre-reshape to [B*H, S, D] for efficient indexing
+    auto q_bh = q_t.reshape({BH, seq, key_dim});     // [B*H, S, D_k]
+    auto k_bh = k_t.reshape({BH, seq, key_dim});     // [B*H, S, D_k]
+    auto v_bh = v_t.reshape({BH, seq, val_dim});     // [B*H, S, D_v]
+    auto g_bh = g_exp.reshape({BH, seq});             // [B*H, S]
+    auto beta_bh = beta_t.reshape({BH, seq});        // [B*H, S]
+
+    auto outs = at::empty({BH, seq, val_dim}, q_t.options());  // [B*H, S, D_v]
+
     for (int64_t i = 0; i < seq; i++) {
-        auto q_i = q_t.select(2, i);      // [B, H, D_k]
-        auto k_i = k_t.select(2, i);      // [B, H, D_k]
-        auto v_i = v_t.select(2, i);      // [B, H, D_v]
-        auto g_i = g_exp.select(2, i).unsqueeze(-1).unsqueeze(-1);  // [B, H, 1, 1]
-        auto beta_i = beta_t.select(2, i).unsqueeze(-1);           // [B, H, 1]
+        // k_i: [B*H, 1, D_k], v_i: [B*H, 1, D_v], q_i: [B*H, 1, D_k]
+        auto k_i = k_bh.select(1, i).unsqueeze(1);  // [B*H, 1, D_k]
+        auto v_i = v_bh.select(1, i).unsqueeze(1);  // [B*H, 1, D_v]
+        auto q_i = q_bh.select(1, i).unsqueeze(1);  // [B*H, 1, D_k]
+        auto g_i = g_bh.select(1, i).reshape({BH, 1, 1});  // [B*H, 1, 1]
+        auto beta_i = beta_bh.select(1, i).reshape({BH, 1, 1});  // [B*H, 1, 1]
 
-        // S = S * g_t (decay)
+        // S = S * g_i (decay) — elementwise, [B*H, D_k, D_v]
         state = state * g_i;
 
-        // kv_mem = sum(S * k, dim=-2) → [B, H, D_v]
-        auto kv_mem = (state * k_i.unsqueeze(-1)).sum(-2, false);
+        // kv_mem = bmm(k_i, S) → [B*H, 1, D_v]
+        auto kv_mem = at::bmm(k_i, state);  // [B*H, 1, D_v]
 
-        // delta = (v - kv_mem) * beta
-        auto delta = (v_i - kv_mem) * beta_i;
+        // delta = (v_i - kv_mem) * beta_i
+        auto delta = (v_i - kv_mem) * beta_i;  // [B*H, 1, D_v]
 
-        // S += k ⊗ delta (update)
-        state = state + k_i.unsqueeze(-1) * delta.unsqueeze(-2);
+        // S += k_i^T @ delta → outer product via bmm
+        // k_i^T: [B*H, D_k, 1], delta: [B*H, 1, D_v] → [B*H, D_k, D_v]
+        state = state + at::bmm(k_i.transpose(1, 2), delta);
 
-        // output[i] = sum(S * q, dim=-2) → [B, H, D_v]
-        auto out_i = (state * q_i.unsqueeze(-1)).sum(-2, false);
-        outs.push_back(out_i);
+        // out_i = bmm(q_i, S) → [B*H, 1, D_v]
+        auto out_i = at::bmm(q_i, state);  // [B*H, 1, D_v]
+
+        // Store output
+        outs.select(1, i).copy_(out_i.squeeze(1));
     }
 
-    // Stack: [B, H, S, D_v] → transpose to [B, S, H, D_v] → cast to compute_type
-    auto core_out = at::stack(outs, 2).transpose(1, 2).to(compute_type);
+    // Reshape: [B*H, S, D_v] → [B, H, S, D_v] → [B, S, H, D_v]
+    auto core_out = outs.reshape({batch, num_v_heads, seq, val_dim})
+                         .transpose(1, 2).to(compute_type);
 
     auto core_flat = core_out.reshape({-1, val_dim});
     auto z_flat = z.reshape({-1, val_dim});
@@ -637,9 +656,9 @@ static at::Tensor compute_loss(
 // MTP (Multi-Token Prediction) forward + loss
 // ──────────────────────────────────────────────────────────────────────
 
-// MTP forward: produce logits for next-token prediction.
+// MTP forward: produce hidden states (not logits) for chunked loss computation.
 // hidden: [batch, seq, hidden] — pre-norm hidden from main model
-// Returns: [batch, seq-1, vocab] — MTP logits
+// Returns: [batch, seq-1, hidden] — MTP hidden (after final norm, before lm_head)
 static at::Tensor mtp_forward(
     TrainingContext* ctx,
     const at::Tensor& hidden,
@@ -647,7 +666,6 @@ static at::Tensor mtp_forward(
 ) {
     auto kind = ctx->compute_type;
     auto embed = *ctx->embed_ptr[0];
-    auto lm_head = *ctx->lm_head_ptr[0];
 
     int64_t seq_len = hidden.size(1);
 
@@ -677,34 +695,35 @@ static at::Tensor mtp_forward(
             kind, ctx->lora_scaling, nullptr, nullptr);
     }
 
-    // Final norm + logits
-    h = rms_norm(h, *ctx->mtp_norm, ctx->rms_eps).to(kind);
-    return at::matmul(h, lm_head.t());  // [batch, seq-1, vocab]
+    // Final norm only — return hidden, not logits
+    return rms_norm(h, *ctx->mtp_norm, ctx->rms_eps).to(kind);
 }
 
-// MTP loss: chunked cross-entropy, weighted by 0.5
-// MTP logits[t] (from hidden[t] + embed[t+1]) predicts token t+2 (Megatron convention)
+// MTP loss: chunked matmul + cross-entropy, weighted by 0.5
+// mtp_hidden[t] (from hidden[t] + embed[t+1]) predicts token t+2 (Megatron convention)
+// No full logits tensor — chunked matmul + fused CE
 static at::Tensor mtp_compute_loss(
     TrainingContext* ctx,
-    const at::Tensor& mtp_logits,
+    const at::Tensor& mtp_hidden,
     const at::Tensor& input_ids,
     const at::Tensor& target_mask
 ) {
     int64_t vocab_size = ctx->vocab_size;
     int64_t seq_len = input_ids.size(1);
+    auto lm_head = *ctx->lm_head_ptr[0];
 
-    // MTP logits: [batch, seq-1, vocab], drop last → predict t+2
+    // MTP hidden: [batch, seq-1, hidden], drop last → predict t+2
     int64_t n_tokens = seq_len - 2;
-    auto shifted_logits_flat = mtp_logits.narrow(1, 0, n_tokens).reshape({-1, vocab_size});
+    auto hidden_flat = mtp_hidden.narrow(1, 0, n_tokens).reshape({-1, mtp_hidden.size(2)});
     auto shifted_targets = input_ids.narrow(1, 2, n_tokens).reshape({-1});
     auto shifted_mask = target_mask.narrow(1, 2, n_tokens).reshape({-1});
 
-    // Chunked cross-entropy with fused cross_entropy_loss
+    // Chunked matmul + cross-entropy
     int64_t total_tokens = shifted_targets.size(0);
     int64_t chunk_size = 512;
     int64_t num_chunks = (total_tokens + chunk_size - 1) / chunk_size;
 
-    auto total_loss = at::zeros({1}, at::TensorOptions().dtype(at::kFloat).device(mtp_logits.device()));
+    auto total_loss = at::zeros({1}, at::TensorOptions().dtype(at::kFloat).device(mtp_hidden.device()));
     auto total_count = shifted_mask.sum().clamp_min(1.0);
 
     for (int64_t c = 0; c < num_chunks; c++) {
@@ -712,7 +731,8 @@ static at::Tensor mtp_compute_loss(
         int64_t end = std::min(start + chunk_size, total_tokens);
         int64_t n = end - start;
 
-        auto chunk_logits = shifted_logits_flat.narrow(0, start, n);
+        auto chunk_hidden = hidden_flat.narrow(0, start, n);
+        auto chunk_logits = at::matmul(chunk_hidden, lm_head.t());  // [n, vocab]
         auto chunk_targets = shifted_targets.narrow(0, start, n);
         auto chunk_mask = shifted_mask.narrow(0, start, n);
 
@@ -901,8 +921,8 @@ double qwen36_train_step(
 
         // MTP loss (if enabled and not disabled by env)
         if (ctx->has_mtp && !getenv("QWEN36_DISABLE_MTP")) {
-            auto mtp_logits = mtp_forward(ctx, hidden, input_ids);
-            auto mtp_loss = mtp_compute_loss(ctx, mtp_logits, input_ids, target_mask);
+            auto mtp_hidden = mtp_forward(ctx, hidden, input_ids);
+            auto mtp_loss = mtp_compute_loss(ctx, mtp_hidden, input_ids, target_mask);
             // Print both losses for debugging
             if (ctx->step_count == 0) {
                 fprintf(stderr, "[mtp_debug] main_loss=%.4f mtp_loss=%.4f (x0.5=%.4f) total=%.4f\n",
