@@ -6,6 +6,7 @@
 
 #include <ATen/ATen.h>
 #include <c10/cuda/CUDAStream.h>
+#include <c10/cuda/CUDACachingAllocator.h>
 #include <torch/csrc/autograd/grad_mode.h>
 #include <torch/csrc/autograd/custom_function.h>
 #include <torch/csrc/autograd/autograd.h>
@@ -934,6 +935,16 @@ static at::Tensor forward_full_checkpoint(
         }
 
         hidden = forward_layer_group(ctx, hidden, start, end);
+
+        // Debug: GPU memory after each group
+        {
+            // Force release cached memory from no-grad intermediates
+            c10::cuda::CUDACachingAllocator::emptyCache();
+            size_t free, total;
+            cudaMemGetInfo(&free, &total);
+            fprintf(stderr, "[mem_debug] after group %ld/%ld: used=%.1f GB, free=%.1f GB\n",
+                (long)g, (long)num_groups, (total - free) / 1e9, free / 1e9);
+        }
     }
 
     // Return hidden on GPU with requires_grad for CE backward
@@ -967,6 +978,9 @@ static void manual_group_backward(
 
         // Backprop through this group — frees graph immediately (retain_graph=false)
         torch::autograd::backward({output}, {grad}, false, false);
+
+        // Force release cached intermediates from this group's recompute+backward
+        c10::cuda::CUDACachingAllocator::emptyCache();
 
         // Gradient for this group's input = gradient for next group's output
         grad = input.grad();
@@ -1032,6 +1046,9 @@ static at::Tensor compute_loss(
         // retain_graph=true: needed because all chunks share hidden_normed graph
         torch::autograd::backward({chunk_loss}, {},
             /*retain_graph=*/true, /*create_graph=*/false);
+
+        // Force release cached intermediates from this chunk's backward
+        c10::cuda::CUDACachingAllocator::emptyCache();
 
         total_loss_val += chunk_loss.item<double>();
     }
