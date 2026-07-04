@@ -1002,7 +1002,7 @@ static at::Tensor compute_loss(
     auto shifted_mask = target_mask.narrow(1, 1, seq_len - 1).reshape({-1});
 
     int64_t total_tokens = shifted_targets.size(0);
-    int64_t chunk_size = 4096;
+    int64_t chunk_size = 16384;  // larger chunks = fewer backward passes
     int64_t num_chunks = (total_tokens + chunk_size - 1) / chunk_size;
 
     auto total_count = shifted_mask.sum().clamp_min(1.0);
@@ -1119,7 +1119,7 @@ static at::Tensor mtp_compute_loss(
 
     // Chunked matmul + cross-entropy
     int64_t total_tokens = shifted_targets.size(0);
-    int64_t chunk_size = 4096;  // larger chunks = fewer backward passes
+    int64_t chunk_size = 16384;  // larger chunks = fewer backward passes  // larger chunks = fewer backward passes
     int64_t num_chunks = (total_tokens + chunk_size - 1) / chunk_size;
 
     auto total_loss = at::zeros({1}, at::TensorOptions().dtype(at::kFloat).device(mtp_hidden.device()));
