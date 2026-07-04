@@ -875,8 +875,11 @@ struct GroupCheckpointFunction : public torch::autograd::Function<GroupCheckpoin
         auto output = forward_layer_group(tc, input, start_layer, end_layer);
 
         // Backprop through recomputed graph.
+        // retain_graph=false: each group's recomputed graph is independent.
+        // LoRA param gradients accumulate via autograd's accumulator (leaf nodes).
+        // The graph is freed immediately after backward — critical for memory.
         torch::autograd::backward({output}, {grad_output[0]},
-            /*retain_graph=*/true, /*create_graph=*/false);
+            /*retain_graph=*/false, /*create_graph=*/false);
         return {input.grad(), at::Tensor(), at::Tensor(), at::Tensor()};
     }
 };
@@ -921,8 +924,10 @@ static at::Tensor forward_full_checkpoint(
     return hidden;
 }
 
-// Cross-entropy loss with response-only masking — chunked to avoid full logits in memory
-// Uses at::cross_entropy_loss (fused log_softmax + nll_loss) for efficiency
+// Cross-entropy loss with response-only masking — chunked with detach to
+// avoid accumulating all chunk logits in autograd graph.
+// Each chunk's logits are detached, and hidden gradient is computed via
+// torch::autograd::grad per chunk (accumulates into hidden.grad).
 static at::Tensor compute_loss(
     TrainingContext* ctx,
     const at::Tensor& hidden,
@@ -930,50 +935,61 @@ static at::Tensor compute_loss(
     const at::Tensor& target_mask,
     int64_t vocab_size
 ) {
-    auto kind = ctx->compute_type;
     auto final_norm = *ctx->final_norm_ptr[0];
     auto lm_head = *ctx->lm_head_ptr[0];
+
+    // hidden needs grad — it's the output of forward_full_checkpoint
+    auto hidden_requires_grad = hidden.requires_grad();
+    hidden.set_requires_grad(true);
 
     auto hidden_normed = rms_norm(hidden, final_norm, ctx->rms_eps);
 
     int64_t seq_len = hidden_normed.size(1);
-    // Shift: logits[t] predicts token t+1
-    auto shifted_hidden = hidden_normed.narrow(1, 0, seq_len - 1);  // [batch, seq-1, hidden]
+    auto shifted_hidden = hidden_normed.narrow(1, 0, seq_len - 1);
     auto shifted_targets = input_ids.narrow(1, 1, seq_len - 1).reshape({-1});
     auto shifted_mask = target_mask.narrow(1, 1, seq_len - 1).reshape({-1});
 
-    // Chunked cross-entropy: process tokens in chunks to limit peak memory
     int64_t total_tokens = shifted_targets.size(0);
     int64_t chunk_size = 512;
     int64_t num_chunks = (total_tokens + chunk_size - 1) / chunk_size;
 
-    auto total_loss = at::zeros({1}, at::TensorOptions().dtype(at::kFloat).device(hidden_normed.device()));
     auto total_count = shifted_mask.sum().clamp_min(1.0);
     auto hidden_flat = shifted_hidden.reshape({-1, hidden_normed.size(2)});
+
+    double total_loss_val = 0.0;
+    auto total_count_val = total_count.item<double>();
 
     for (int64_t c = 0; c < num_chunks; c++) {
         int64_t start = c * chunk_size;
         int64_t end = std::min(start + chunk_size, total_tokens);
         int64_t n = end - start;
 
-        // Compute logits for this chunk only: [n, vocab]
+        // chunk_hidden needs grad (connected to hidden via hidden_normed)
         auto chunk_hidden = hidden_flat.narrow(0, start, n);
-        auto chunk_logits = at::matmul(chunk_hidden, lm_head.t());  // [n, vocab]
-
+        auto chunk_logits = at::matmul(chunk_hidden, lm_head.t());
         auto chunk_targets = shifted_targets.narrow(0, start, n);
         auto chunk_mask = shifted_mask.narrow(0, start, n);
 
-        // Fused cross-entropy (log_softmax + nll_loss in one kernel)
         auto per_token_loss = at::cross_entropy_loss(
             chunk_logits.to(at::kFloat), chunk_targets,
-            /*weight=*/at::Tensor(), /*reduction=*/at::Reduction::None,
-            /*ignore_index=*/-100, /*label_smoothing=*/0.0
+            at::Tensor(), at::Reduction::None, -100, 0.0
         );
         auto masked_loss = per_token_loss * chunk_mask.to(at::kFloat);
-        total_loss += masked_loss.sum();
+        auto chunk_loss = masked_loss.sum();
+
+        // Immediately backward this chunk with retain_graph —
+        // retain_graph keeps hidden's graph (GroupCheckpointFunction chain)
+        // but frees this chunk's logits (cross_entropy intermediates).
+        torch::autograd::backward({chunk_loss}, /*inputs=*/{},
+            /*retain_graph=*/true, /*create_graph=*/false);
+
+        total_loss_val += chunk_loss.item<double>();
     }
 
-    return total_loss / total_count;
+    if (!hidden_requires_grad) hidden.set_requires_grad(false);
+
+    return at::tensor({total_loss_val / total_count_val},
+        at::TensorOptions().dtype(at::kFloat).device(hidden.device()));
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -1240,16 +1256,29 @@ double qwen36_train_step(
             ? forward_full_checkpoint(ctx, input_ids)
             : forward_full(ctx, input_ids);
 
-        // Main loss (cross-entropy on shifted tokens)
+        // Debug: GPU memory after forward
+        {
+            size_t free, total;
+            cudaMemGetInfo(&free, &total);
+            fprintf(stderr, "[mem_debug] after forward: used=%.1f GB, free=%.1f GB\n",
+                (total - free) / 1e9, free / 1e9);
+        }
+
+        // Main loss — compute_loss does chunked CE with immediate backward per chunk.
+        // This avoids accumulating 250 chunks of [512, vocab] logits in autograd graph.
         auto loss = compute_loss(ctx, hidden, input_ids, target_mask, ctx->vocab_size);
 
-        // Backward main loss FIRST — this frees the main model's autograd graph
-        // (SubLayerCkpt recomputations), releasing ~100GB of intermediate tensors.
-        // Then MTP backward runs on freed GPU memory.
+        // compute_loss already backwarded through main model (via chunk loop).
+        // No need for separate loss.backward().
         double loss_val = loss.item<double>();
 
-        // Backward — gradients accumulate into LoRA A/B (requires_grad=true)
-        loss.backward();
+        // Debug: GPU memory after main loss
+        {
+            size_t free, total;
+            cudaMemGetInfo(&free, &total);
+            fprintf(stderr, "[mem_debug] after main loss: used=%.1f GB, free=%.1f GB\n",
+                (total - free) / 1e9, free / 1e9);
+        }
 
         // MTP loss (if enabled) — run AFTER main backward to reuse freed GPU memory
         if (ctx->has_mtp && !getenv("QWEN36_DISABLE_MTP")) {
