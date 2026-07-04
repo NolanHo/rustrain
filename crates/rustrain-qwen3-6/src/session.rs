@@ -235,22 +235,28 @@ fn train_impl(
     let mut weights_gpu = BTreeMap::new();
     if let Some(shard) = shard_ref {
         // EP mode: narrow expert tensors on CPU before transferring to GPU
+        let num_experts = runtime_config.num_experts as i64;
         for (name, tensor) in &weights {
             // Check if this is an expert tensor that needs narrowing
             let needs_narrow = name.contains(".mlp.experts.gate_up_proj")
                 || name.contains(".mlp.experts.down_proj");
-            if needs_narrow && tensor.size()[0] == 256 {
+            if needs_narrow && tensor.size()[0] == num_experts {
+                // Narrow to local shard: [rank * experts_per_rank, ...]
                 let narrowed = tensor
                     .narrow(0, shard.expert_start as i64, shard.experts_per_rank as i64)
                     .contiguous()
                     .to_device(device)
                     .to_kind(compute_kind);
                 weights_gpu.insert(name.clone(), narrowed);
+            } else if needs_narrow && tensor.size()[0] != num_experts {
+                // Already narrowed (e.g., MTP layer experts) — load as-is
+                weights_gpu.insert(name.clone(), tensor.to_device(device).to_kind(compute_kind));
             } else {
+                // Non-expert weights: replicate on all GPUs
                 weights_gpu.insert(name.clone(), tensor.to_device(device).to_kind(compute_kind));
             }
         }
-        info!("EP{}: narrowed expert tensors to {} experts per rank (on CPU before GPU transfer)", world_size, shard.experts_per_rank);
+        info!("EP{}: narrowed expert tensors to {} experts per rank", world_size, shard.experts_per_rank);
     } else {
         for (name, tensor) in &weights {
             weights_gpu.insert(name.clone(), tensor.to_device(device).to_kind(compute_kind));
