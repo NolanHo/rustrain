@@ -546,6 +546,9 @@ struct TrainingContext {
     // Gradient checkpointing
     bool use_checkpoint;
     int64_t group_size;
+    // Group checkpoint storage for manual sequential backward
+    std::vector<at::Tensor> group_inputs;
+    std::vector<at::Tensor> group_outputs;
 // ──────────────────────────────────────────────────────────────────────
 };
 // Forward declarations for sub-layer checkpointing
@@ -884,7 +887,9 @@ struct GroupCheckpointFunction : public torch::autograd::Function<GroupCheckpoin
     }
 };
 
-// Forward pass with gradient checkpointing
+// Forward pass with gradient checkpointing — manual checkpoint (no autograd::Function)
+// Forward: no-grad, save group inputs (offloaded to CPU). Backward: manual recompute per group.
+// This avoids autograd engine retaining all group outputs simultaneously.
 static at::Tensor forward_full_checkpoint(
     TrainingContext* ctx,
     const at::Tensor& input_ids
@@ -892,36 +897,83 @@ static at::Tensor forward_full_checkpoint(
     auto embed = *ctx->embed_ptr[0];
     at::Tensor hidden = at::embedding(embed, input_ids);
 
-    // Detach and set requires_grad so autograd::Function can track the graph
-    hidden = hidden.detach().set_requires_grad(true);
-
     bool use_subckpt = getenv("QWEN36_SUBCKPT");
 
     if (use_subckpt) {
-        // Sub-layer checkpointing: each layer's attn and mlp are independently
-        // checkpointed via SubLayerCkpt. No GroupCheckpointFunction — avoids
-        // nested autograd::Function which causes backward deadlock.
+        at::AutoGradMode restore(true);
+        hidden = hidden.detach().set_requires_grad(true);
         for (int64_t i = 0; i < ctx->num_layers; i++) {
             hidden = forward_single_layer_subckpt(ctx, hidden, i);
         }
         return hidden;
     }
 
-    // Group-level checkpointing (default)
+    // Group-level manual checkpointing — no autograd::Function, no graph edges
     int64_t gs = ctx->group_size;
     if (gs < 1) gs = 1;
 
-    for (int64_t start = 0; start < ctx->num_layers; start += gs) {
+    // Forward in no-grad mode
+    at::AutoGradMode no_grad(false);
+    hidden = hidden.detach();
+
+    ctx->group_inputs.clear();
+    bool offload = getenv("QWEN36_OFFLOAD_ACTIVATIONS");
+    int64_t num_groups = (ctx->num_layers + gs - 1) / gs;
+
+    for (int64_t g = 0; g < num_groups; g++) {
+        int64_t start = g * gs;
         int64_t end = std::min(start + gs, ctx->num_layers);
-        hidden = GroupCheckpointFunction::apply(
-            hidden,
-            (int64_t)(uintptr_t)ctx,
-            start,
-            end
-        );
+
+        // Save this group's input (offload to CPU if enabled)
+        if (offload && g < num_groups - 1) {
+            ctx->group_inputs.push_back(
+                hidden.to(at::TensorOptions().dtype(hidden.scalar_type()).device(at::kCPU).pinned_memory(true))
+            );
+        } else {
+            ctx->group_inputs.push_back(hidden.clone());
+        }
+
+        hidden = forward_layer_group(ctx, hidden, start, end);
     }
 
+    // Return hidden on GPU with requires_grad for CE backward
+    at::AutoGradMode restore(true);
+    hidden = hidden.set_requires_grad(true);
     return hidden;
+}
+
+// Manual sequential backward — recompute each group with grad, backprop, free.
+// Only 1 group's intermediate tensors exist at any time.
+static void manual_group_backward(
+    TrainingContext* ctx,
+    const at::Tensor& hidden_grad
+) {
+    int64_t gs = ctx->group_size;
+    if (gs < 1) gs = 1;
+
+    int64_t num_groups = (ctx->num_layers + gs - 1) / gs;
+    at::Tensor grad = hidden_grad;
+    at::AutoGradMode grad_mode(true);
+
+    for (int64_t g = num_groups - 1; g >= 0; g--) {
+        int64_t start = g * gs;
+        int64_t end = std::min(start + gs, ctx->num_layers);
+
+        // Restore input from saved (CPU if offloaded)
+        auto input = ctx->group_inputs[g].to(hidden_grad.device()).detach().set_requires_grad(true);
+
+        // Recompute forward with grad for this group only
+        auto output = forward_layer_group(ctx, input, start, end);
+
+        // Backprop through this group — frees graph immediately (retain_graph=false)
+        torch::autograd::backward({output}, {grad}, false, false);
+
+        // Gradient for this group's input = gradient for next group's output
+        grad = input.grad();
+
+        // Free saved input to release memory
+        ctx->group_inputs[g] = at::Tensor();
+    }
 }
 
 // Cross-entropy loss with response-only masking — chunked with detach.
@@ -1288,8 +1340,14 @@ double qwen36_train_step(
                 (total - free) / 1e9, free / 1e9);
         }
 
-        // Trigger main model backward using the gradient from CE
-        if (hidden.grad().defined()) {
+        // Trigger main model backward using manual sequential approach.
+        // manual_group_backward processes groups from last to first,
+        // recomputing each with grad and freeing immediately after.
+        // Only 1 group's intermediate tensors exist at any time.
+        if (hidden.grad().defined() && !ctx->group_inputs.empty() && !getenv("QWEN36_SUBCKPT")) {
+            manual_group_backward(ctx, hidden.grad());
+        } else if (hidden.grad().defined()) {
+            // SUBCKPT path uses autograd::Function, do normal backward
             hidden.backward(hidden.grad());
         }
 
