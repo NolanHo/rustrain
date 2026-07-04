@@ -924,10 +924,9 @@ static at::Tensor forward_full_checkpoint(
     return hidden;
 }
 
-// Cross-entropy loss with response-only masking — chunked with detach to
-// avoid accumulating all chunk logits in autograd graph.
-// Each chunk's logits are detached, and hidden gradient is computed via
-// torch::autograd::grad per chunk (accumulates into hidden.grad).
+// Cross-entropy loss with response-only masking — chunked with detach.
+// Detach hidden_normed so CE backward doesn't traverse main model graph.
+// Accumulate hidden_normed gradient, then backprop to hidden separately.
 static at::Tensor compute_loss(
     TrainingContext* ctx,
     const at::Tensor& hidden,
@@ -938,11 +937,12 @@ static at::Tensor compute_loss(
     auto final_norm = *ctx->final_norm_ptr[0];
     auto lm_head = *ctx->lm_head_ptr[0];
 
-    // hidden needs grad — it's the output of forward_full_checkpoint
-    auto hidden_requires_grad = hidden.requires_grad();
-    hidden.set_requires_grad(true);
+    // Detach hidden for CE computation — CE backward won't touch main model graph.
+    // We accumulate gradient into hidden_detached, then manually backprop to hidden.
+    auto hidden_detached = hidden.detach();
+    hidden_detached.set_requires_grad(true);
 
-    auto hidden_normed = rms_norm(hidden, final_norm, ctx->rms_eps);
+    auto hidden_normed = rms_norm(hidden_detached, final_norm, ctx->rms_eps);
 
     int64_t seq_len = hidden_normed.size(1);
     auto shifted_hidden = hidden_normed.narrow(1, 0, seq_len - 1);
@@ -950,7 +950,7 @@ static at::Tensor compute_loss(
     auto shifted_mask = target_mask.narrow(1, 1, seq_len - 1).reshape({-1});
 
     int64_t total_tokens = shifted_targets.size(0);
-    int64_t chunk_size = 4096;  // larger chunks = fewer backward passes
+    int64_t chunk_size = 4096;
     int64_t num_chunks = (total_tokens + chunk_size - 1) / chunk_size;
 
     auto total_count = shifted_mask.sum().clamp_min(1.0);
@@ -964,7 +964,6 @@ static at::Tensor compute_loss(
         int64_t end = std::min(start + chunk_size, total_tokens);
         int64_t n = end - start;
 
-        // chunk_hidden needs grad (connected to hidden via hidden_normed)
         auto chunk_hidden = hidden_flat.narrow(0, start, n);
         auto chunk_logits = at::matmul(chunk_hidden, lm_head.t());
         auto chunk_targets = shifted_targets.narrow(0, start, n);
@@ -977,16 +976,24 @@ static at::Tensor compute_loss(
         auto masked_loss = per_token_loss * chunk_mask.to(at::kFloat);
         auto chunk_loss = masked_loss.sum();
 
-        // Immediately backward this chunk with retain_graph —
-        // retain_graph keeps hidden's graph (GroupCheckpointFunction chain)
-        // but frees this chunk's logits (cross_entropy intermediates).
-        torch::autograd::backward({chunk_loss}, /*inputs=*/{},
+        // Backward this chunk — only traverses CE graph (detached from main model)
+        // retain_graph=true: needed because all chunks share hidden_normed graph
+        torch::autograd::backward({chunk_loss}, {},
             /*retain_graph=*/true, /*create_graph=*/false);
 
         total_loss_val += chunk_loss.item<double>();
     }
 
-    if (!hidden_requires_grad) hidden.set_requires_grad(false);
+    // Backprop hidden_detached gradient to hidden (single pass through rms_norm)
+    if (hidden_detached.grad().defined()) {
+        // hidden_detached = hidden.detach(), so grad(hidden_detached) = grad(hidden)
+        // Just copy the gradient directly
+        if (hidden.grad().defined()) {
+            hidden.grad().add_(hidden_detached.grad());
+        } else {
+            hidden.mutable_grad() = hidden_detached.grad().clone();
+        }
+    }
 
     return at::tensor({total_loss_val / total_count_val},
         at::TensorOptions().dtype(at::kFloat).device(hidden.device()));
@@ -1268,16 +1275,22 @@ double qwen36_train_step(
         // This avoids accumulating 250 chunks of [512, vocab] logits in autograd graph.
         auto loss = compute_loss(ctx, hidden, input_ids, target_mask, ctx->vocab_size);
 
-        // compute_loss already backwarded through main model (via chunk loop).
-        // No need for separate loss.backward().
+        // compute_loss did chunked CE backward on detached hidden,
+        // accumulated gradient into hidden.grad().
+        // Now trigger main model backward using hidden's gradient.
         double loss_val = loss.item<double>();
 
-        // Debug: GPU memory after main loss
+        // Debug: GPU memory after CE backward
         {
             size_t free, total;
             cudaMemGetInfo(&free, &total);
-            fprintf(stderr, "[mem_debug] after main loss: used=%.1f GB, free=%.1f GB\n",
+            fprintf(stderr, "[mem_debug] after CE backward: used=%.1f GB, free=%.1f GB\n",
                 (total - free) / 1e9, free / 1e9);
+        }
+
+        // Trigger main model backward using the gradient from CE
+        if (hidden.grad().defined()) {
+            hidden.backward(hidden.grad());
         }
 
         // MTP loss (if enabled) — run AFTER main backward to reuse freed GPU memory
