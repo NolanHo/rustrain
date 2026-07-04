@@ -643,8 +643,13 @@ struct SubLayerCkpt : public torch::autograd::Function<SubLayerCkpt> {
         }
         at::AutoGradMode guard(false);
         auto* tc = reinterpret_cast<TrainingContext*>(tc_val);
-        if (is_attn) return compute_attn_only(tc, input, layer_idx, tc->compute_type);
-        else return compute_mlp_only(tc, input, layer_idx, tc->compute_type);
+        if (is_attn) {
+            // Attn segment: returns hidden + attn_output (residual connection)
+            return input + compute_attn_only(tc, input, layer_idx, tc->compute_type);
+        } else {
+            // MLP segment: returns residual + mlp_out (full layer output)
+            return input + compute_mlp_only(tc, input, layer_idx, tc->compute_type);
+        }
     }
     static std::vector<at::Tensor> backward(
         torch::autograd::AutogradContext* ctx, std::vector<at::Tensor> grad_output
@@ -711,15 +716,18 @@ struct SubLayerCkpt : public torch::autograd::Function<SubLayerCkpt> {
 };
 
 // Forward a single layer with sub-layer checkpointing
+// attn segment returns (hidden + attn_output) to avoid extra GPU tensor
+// mlp segment returns (residual + mlp_out) = full layer output
 at::Tensor forward_single_layer_subckpt(
     TrainingContext* ctx, const at::Tensor& hidden, int64_t layer_idx
 ) {
-    auto attn_out = SubLayerCkpt::apply(
+    // attn segment: computes attn_output, returns hidden + attn_output
+    auto residual = SubLayerCkpt::apply(
         hidden, (int64_t)(uintptr_t)ctx, layer_idx, true);
-    auto residual = hidden + attn_out;
-    auto mlp_out = SubLayerCkpt::apply(
+    // mlp segment: computes mlp_out from residual, returns residual + mlp_out
+    auto result = SubLayerCkpt::apply(
         residual, (int64_t)(uintptr_t)ctx, layer_idx, false);
-    return residual + mlp_out;
+    return result;
 }
 
 // Forward pass (no checkpointing)
