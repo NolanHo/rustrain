@@ -1235,23 +1235,36 @@ double qwen36_train_step(
         // Main loss (cross-entropy on shifted tokens)
         auto loss = compute_loss(ctx, hidden, input_ids, target_mask, ctx->vocab_size);
 
-        // MTP loss (if enabled and not disabled by env)
-        if (ctx->has_mtp && !getenv("QWEN36_DISABLE_MTP")) {
-            auto mtp_hidden = mtp_forward(ctx, hidden, input_ids);
-            auto mtp_loss = mtp_compute_loss(ctx, mtp_hidden, input_ids, target_mask);
-            // Print both losses for debugging
-            if (ctx->step_count == 0) {
-                fprintf(stderr, "[mtp_debug] main_loss=%.4f mtp_loss=%.4f (x0.5=%.4f) total=%.4f\n",
-                    loss.item<double>(), mtp_loss.item<double>() / 0.5, mtp_loss.item<double>(),
-                    (loss + mtp_loss).item<double>());
-            }
-            loss = loss + mtp_loss;
-        }
-
+        // Backward main loss FIRST — this frees the main model's autograd graph
+        // (SubLayerCkpt recomputations), releasing ~100GB of intermediate tensors.
+        // Then MTP backward runs on freed GPU memory.
         double loss_val = loss.item<double>();
 
         // Backward — gradients accumulate into LoRA A/B (requires_grad=true)
         loss.backward();
+
+        // MTP loss (if enabled) — run AFTER main backward to reuse freed GPU memory
+        if (ctx->has_mtp && !getenv("QWEN36_DISABLE_MTP")) {
+            // Detach hidden so MTP forward doesn't rebuild main model graph
+            auto hidden_detached = hidden.detach().set_requires_grad(true);
+            auto mtp_hidden = mtp_forward(ctx, hidden_detached, input_ids);
+            auto mtp_loss = mtp_compute_loss(ctx, mtp_hidden, input_ids, target_mask);
+            if (ctx->step_count == 0) {
+                fprintf(stderr, "[mtp_debug] main_loss=%.4f mtp_loss=%.4f (x0.5=%.4f) total=%.4f\n",
+                    loss_val, mtp_loss.item<double>() / 0.5, mtp_loss.item<double>(),
+                    (loss_val + mtp_loss.item<double>()));
+            }
+            // Backward MTP loss — frees MTP intermediate tensors immediately
+            mtp_loss.backward();
+            // Add MTP gradient to hidden's gradient (already populated by main backward)
+            if (hidden_detached.grad().defined()) {
+                if (hidden.grad().defined()) {
+                    hidden.grad().add_(hidden_detached.grad());
+                } else {
+                    hidden.mutable_grad() = hidden_detached.grad().clone();
+                }
+            }
+        }
 
         // Adam optimizer step (no grad)
         at::AutoGradMode guard(false);
