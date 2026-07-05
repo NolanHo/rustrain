@@ -770,6 +770,12 @@ static at::Tensor forward_full(
 
         hidden = forward_single_layer(hidden, layer_w.data(), &ctx->layer_configs[i],
             kind, ctx->lora_scaling, la_ptrs.data(), lb_ptrs.data());
+
+        // Sync + release CUDA allocator cache after each layer in no-grad forward.
+        // Without sync, pending CUDA ops hold references to intermediates,
+        // preventing emptyCache from freeing them.
+        cudaDeviceSynchronize();
+        c10::cuda::CUDACachingAllocator::emptyCache();
     }
 
     return hidden;  // pre-norm hidden (for MTP)
@@ -1049,11 +1055,17 @@ static at::Tensor compute_loss(
     auto lm_head = *ctx->lm_head_ptr[0];
 
     // Detach hidden for CE computation — CE backward won't touch main model graph.
-    // We accumulate gradient into hidden_detached, then manually backprop to hidden.
+    // We accumulate gradient into hidden_normed, then manually backprop to hidden.
     auto hidden_detached = hidden.detach();
-    hidden_detached.set_requires_grad(true);
 
+    // Compute hidden_normed in no-grad, then set requires_grad on it.
+    // This way CE backward only builds a tiny graph (hidden_normed → logits → loss),
+    // not connected to hidden_detached at all.
+    at::AutoGradMode no_grad_mode(false);
     auto hidden_normed = rms_norm(hidden_detached, final_norm, ctx->rms_eps);
+    no_grad_mode.~AutoGradMode();  // restore grad mode
+
+    hidden_normed.set_requires_grad(true);
 
     int64_t seq_len = hidden_normed.size(1);
     auto shifted_hidden = hidden_normed.narrow(1, 0, seq_len - 1);
@@ -1061,7 +1073,7 @@ static at::Tensor compute_loss(
     auto shifted_mask = target_mask.narrow(1, 1, seq_len - 1).reshape({-1});
 
     int64_t total_tokens = shifted_targets.size(0);
-    int64_t chunk_size = 16384;  // balance: [16384, vocab] = 15GB per chunk
+    int64_t chunk_size = 32768;  // [32768, vocab] = 30GB per chunk, fewer iterations
     int64_t num_chunks = (total_tokens + chunk_size - 1) / chunk_size;
 
     auto total_count = shifted_mask.sum().clamp_min(1.0);
@@ -1089,21 +1101,27 @@ static at::Tensor compute_loss(
 
         // Backward this chunk — only traverses CE graph (detached from main model)
         // retain_graph=true: needed because all chunks share hidden_normed graph
+        // (but graph is tiny — just matmul + CE, not connected to main model)
         torch::autograd::backward({chunk_loss}, {},
             /*retain_graph=*/true, /*create_graph=*/false);
 
         total_loss_val += chunk_loss.item<double>();
+
+        // Periodically release CUDA allocator cache to prevent accumulation
+        // of freed chunk intermediates (logits, log_softmax, etc.)
+        if ((c + 1) % 8 == 0) {
+            c10::cuda::CUDACachingAllocator::emptyCache();
+        }
     }
 
-    // Backprop hidden_detached gradient to hidden (single pass through rms_norm)
-    if (hidden_detached.grad().defined()) {
-        // hidden_detached = hidden.detach(), so grad(hidden_detached) = grad(hidden)
-        // Just copy the gradient directly
-        if (hidden.grad().defined()) {
-            hidden.grad().add_(hidden_detached.grad());
-        } else {
-            hidden.mutable_grad() = hidden_detached.grad().clone();
-        }
+    // Backprop hidden_normed gradient to hidden via rms_norm.
+    // hidden_normed was computed in no-grad mode (detached from hidden_detached).
+    // Recompute rms_norm with grad tracking to get hidden's gradient.
+    if (hidden_normed.grad().defined()) {
+        hidden.set_requires_grad(true);
+        auto hidden_normed_recompute = rms_norm(hidden, final_norm, ctx->rms_eps);
+        hidden_normed_recompute.backward(hidden_normed.grad());
+        // hidden.grad() now has the CE gradient contribution
     }
 
     // Release all CE intermediate tensors at once
@@ -1181,7 +1199,7 @@ static at::Tensor mtp_compute_loss(
 
     // Chunked matmul + cross-entropy
     int64_t total_tokens = shifted_targets.size(0);
-    int64_t chunk_size = 16384;  // balance: [16384, vocab] = 15GB per chunk  // larger chunks = fewer backward passes
+    int64_t chunk_size = 32768;  // [32768, vocab] = 30GB per chunk, fewer iterations  // larger chunks = fewer backward passes
     int64_t num_chunks = (total_tokens + chunk_size - 1) / chunk_size;
 
     auto total_loss = at::zeros({1}, at::TensorOptions().dtype(at::kFloat).device(mtp_hidden.device()));
