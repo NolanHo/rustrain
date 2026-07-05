@@ -1402,6 +1402,20 @@ double qwen36_train_step(
                 (total - free) / 1e9, free / 1e9);
         }
 
+        // Release CE's retained graph (hidden_normed etc.) before backward.
+        // CE gradient is already accumulated into hidden.grad().
+        // hidden.detach() breaks the autograd graph from CE.
+        hidden = hidden.detach();
+        c10::cuda::CUDACachingAllocator::emptyCache();
+
+        // Debug: after releasing CE graph
+        {
+            size_t free, total;
+            cudaMemGetInfo(&free, &total);
+            fprintf(stderr, "[mem_debug] before manual backward: used=%.1f GB, free=%.1f GB\n",
+                (total - free) / 1e9, free / 1e9);
+        }
+
         // Trigger main model backward using manual sequential approach.
         // manual_group_backward processes groups from last to first,
         // recomputing each with grad and freeing immediately after.
