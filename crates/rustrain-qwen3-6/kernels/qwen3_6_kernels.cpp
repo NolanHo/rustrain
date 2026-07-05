@@ -976,14 +976,59 @@ static void manual_group_backward(
         // Recompute forward with grad for this group only
         auto output = forward_layer_group(ctx, input, start, end);
 
-        // Backprop through this group — frees graph immediately (retain_graph=false)
-        torch::autograd::backward({output}, {grad}, false, false);
+        // Backprop through this group using grad() instead of backward().
+        // grad() only computes gradients for specified inputs — faster than
+        // backward() which traverses all leaf nodes.
+        // LoRA params are shared across groups, so we accumulate their gradients.
+        std::vector<at::Tensor> grad_inputs = {input};
+        // Add LoRA params for this group's layers
+        for (int64_t l = start; l < end; l++) {
+            int64_t lora_count = (ctx->layer_configs[l].layer_type == 0) ? 4 : 3;
+            int64_t la_offset = ctx->lora_layer_offset[l];
+            bool has_lora = (la_offset + lora_count) <= (int64_t)ctx->lora_a.size();
+            if (has_lora) {
+                for (int64_t k = 0; k < lora_count; k++) {
+                    grad_inputs.push_back(ctx->lora_a[la_offset + k]);
+                    grad_inputs.push_back(ctx->lora_b[la_offset + k]);
+                }
+            }
+        }
+
+        auto grads = torch::autograd::grad(
+            {output}, grad_inputs, {grad},
+            /*retain_graph=*/false, /*create_graph=*/false,
+            /*allow_unused=*/true
+        );
+
+        // Manually accumulate LoRA param gradients
+        int64_t gi = 1;  // skip input grad (index 0)
+        for (int64_t l = start; l < end; l++) {
+            int64_t lora_count = (ctx->layer_configs[l].layer_type == 0) ? 4 : 3;
+            int64_t la_offset = ctx->lora_layer_offset[l];
+            bool has_lora = (la_offset + lora_count) <= (int64_t)ctx->lora_a.size();
+            if (has_lora) {
+                for (int64_t k = 0; k < lora_count; k++) {
+                    if (grads[gi].defined()) {
+                        auto& pa = ctx->lora_a[la_offset + k];
+                        if (pa.grad().defined()) pa.grad().add_(grads[gi]);
+                        else pa.mutable_grad() = grads[gi].clone();
+                    }
+                    gi++;
+                    if (grads[gi].defined()) {
+                        auto& pb = ctx->lora_b[la_offset + k];
+                        if (pb.grad().defined()) pb.grad().add_(grads[gi]);
+                        else pb.mutable_grad() = grads[gi].clone();
+                    }
+                    gi++;
+                }
+            }
+        }
 
         // Force release cached intermediates from this group's recompute+backward
         c10::cuda::CUDACachingAllocator::emptyCache();
 
         // Gradient for this group's input = gradient for next group's output
-        grad = input.grad();
+        grad = grads[0];
 
         // Free saved input to release memory
         ctx->group_inputs[g] = at::Tensor();
