@@ -50,7 +50,7 @@ inline RMSNormBackward rms_norm_backward(
     // grad_weight = sum(grad_out * normed, dim=0..S-1) → [H]
     auto grad_weight = (grad_out * normed).sum(at::IntArrayRef({0, 1}));
 
-    return {grad_input, grad_weight};
+    return RMSNormBackward{grad_input, grad_weight};
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -60,7 +60,7 @@ inline RMSNormBackward rms_norm_backward(
 //          = grad_out * sigmoid(x) * (1 + x * (1 - sigmoid(x)))
 // ──────────────────────────────────────────────────────────────────────
 
-inline at::Tensor silu_backward(const at::Tensor& x, const at::Tensor& grad_out) {
+inline at::Tensor mk_silu_backward(const at::Tensor& x, const at::Tensor& grad_out) {
     auto sig = at::sigmoid(x);
     return grad_out * sig * (1.0 + x * (1.0 - sig));
 }
@@ -96,7 +96,7 @@ struct MatmulBackward {
     at::Tensor grad_weight;
 };
 
-inline MatmulBackward matmul_backward(
+inline MatmulBackward mk_matmul_backward(
     const at::Tensor& x,          // [..., H_in]
     const at::Tensor& weight,     // [H_out, H_in]
     const at::Tensor& grad_y      // [..., H_out]
@@ -107,7 +107,7 @@ inline MatmulBackward matmul_backward(
     auto grad_x = at::matmul(grad_y_2d, weight).reshape(x.sizes());
     auto grad_w = at::matmul(grad_y_2d.t(), x_2d);
 
-    return {grad_x, grad_w};
+    return MatmulBackward{grad_x, grad_w};
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -194,7 +194,7 @@ inline GatedNormBackward gated_norm_backward(
     auto grad_normed_raw = grad_gated * silu_z;
 
     // grad_z = grad_gated * normed * silu'(z)
-    auto grad_z = grad_gated * normed * silu_backward(z_flat, at::ones_like(z_flat));
+    auto grad_z = grad_gated * normed * mk_silu_backward(z_flat, at::ones_like(z_flat));
 
     // grad_core = rms_norm_backward
     auto grad_normed_scaled = grad_normed_raw * norm_w;  // undo weight scaling
@@ -204,6 +204,6 @@ inline GatedNormBackward gated_norm_backward(
     // grad_norm_w = sum(grad_normed_raw * (core_flat * inv_rms))
     auto grad_norm_w = (grad_normed_raw * (core_flat * inv_rms)).sum(at::IntArrayRef({0}));
 
-    // grad_out_proj computed by caller (matmul_backward)
-    return {grad_core, grad_z, at::Tensor(), grad_norm_w};
+    // grad_out_proj computed by caller (mk_matmul_backward)
+    return GatedNormBackward{grad_core, grad_z, at::Tensor(), grad_norm_w};
 }
