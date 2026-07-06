@@ -216,7 +216,7 @@ static at::Tensor full_attention(
 extern "C" void cuda_gated_delta_rule(
     const float* q, const float* k, const float* v,
     const float* g_exp, const float* beta,
-    float* state, float* out,
+    float* state, float* out, float* delta_buf,
     int BH, int seq_len, int key_dim, int val_dim
 );
 
@@ -320,6 +320,7 @@ static at::Tensor linear_attention(
             auto beta_contig = beta_t.reshape({BH, chunk_len}).contiguous().to(at::kFloat);
             auto state_contig = state.contiguous();
             auto outs = at::empty({BH, chunk_len, val_dim}, q_t.options());
+            auto delta_buf = at::empty({BH, chunk_len, val_dim}, q_t.options());
 
             // CUDA kernel — state is passed in and updated in-place
             cuda_gated_delta_rule(
@@ -330,6 +331,7 @@ static at::Tensor linear_attention(
                 beta_contig.data_ptr<float>(),
                 state_contig.data_ptr<float>(),
                 outs.data_ptr<float>(),
+                delta_buf.data_ptr<float>(),
                 (int)BH, (int)chunk_len, (int)key_dim, (int)val_dim
             );
             state = state_contig;  // updated state for next chunk
@@ -411,7 +413,8 @@ static at::Tensor linear_attention(
     auto g_contig = g_exp.reshape({BH, seq}).contiguous().to(at::kFloat);
     auto beta_contig = beta_t.reshape({BH, seq}).contiguous().to(at::kFloat);
     auto state_contig = state.contiguous();
-    auto outs = at::empty({BH, seq, val_dim}, q_t.options());  // [B*H, S, D_v]
+    auto outs = at::empty({BH, seq, val_dim}, q_t.options());
+    auto delta_buf = at::empty({BH, seq, val_dim}, q_t.options());
 
     // Launch CUDA kernel — single launch replaces seq×3 bmm calls
     cuda_gated_delta_rule(
@@ -422,6 +425,7 @@ static at::Tensor linear_attention(
         beta_contig.data_ptr<float>(),
         state_contig.data_ptr<float>(),
         outs.data_ptr<float>(),
+        delta_buf.data_ptr<float>(),
         (int)BH, (int)seq, (int)key_dim, (int)val_dim
     );
 
