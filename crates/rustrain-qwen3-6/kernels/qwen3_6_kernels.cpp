@@ -12,6 +12,7 @@
 #include <torch/csrc/autograd/autograd.h>
 #include <torch/csrc/autograd/variable.h>
 #include "backward.h"
+#include "fused_backward.h"
 #include <cstdio>
 #include <cmath>
 #include <vector>
@@ -487,9 +488,10 @@ static at::Tensor moe_forward(
     int64_t batch = hidden.size(0), seq = hidden.size(1), hidden_dim = hidden.size(2);
     auto device = hidden.device();
     auto flat = hidden.reshape({batch * seq, hidden_dim});
+    int64_t N = flat.size(0);
 
     auto router_logits = at::matmul(flat, gate_w.t());
-    auto routing_weights = router_logits.softmax(-1, at::kFloat);  // FP32 for precision (matches Rust)
+    auto routing_weights = router_logits.softmax(-1, at::kFloat);
     auto [topk_weights, topk_indices] = routing_weights.topk(top_k, -1, true, true);
     if (norm_topk_prob) {
         auto denom = topk_weights.sum(-1, true).clamp_min(1e-9);
@@ -503,23 +505,24 @@ static at::Tensor moe_forward(
         auto expert_weights = topk_weights.select(-1, kk);
         for (int64_t e_local = 0; e_local < expert_count; e_local++) {
             int64_t e_global = expert_start + e_local;
-            auto mask = expert_indices.eq(e_global).to(compute_type);
-            if (mask.sum().item<double>() > 0.0) {
-                auto token_indices = mask.nonzero().squeeze(-1);
-                if (token_indices.size(0) == 0) continue;
-                auto selected = flat.index_select(0, token_indices);
-                auto egu = experts_gate_up.select(0, e_local);
-                auto ed = experts_down.select(0, e_local);
-                auto gu = at::matmul(selected, egu.t());
-                auto gate_part = gu.narrow(-1, 0, intermediate);
-                auto up_part = gu.narrow(-1, intermediate, intermediate);
-                auto expert_out = at::matmul(at::silu(gate_part) * up_part, ed.t());
-                auto weights = expert_weights.index_select(0, token_indices).unsqueeze(-1);
-                routed_output = routed_output.index_add_(0, token_indices, expert_out * weights);
-            }
+            auto mask = expert_indices.eq(e_global);
+            // Use nonzero().size(0) instead of mask.sum().item<double>()
+            // This avoids GPU→CPU synchronization — size(0) is metadata only
+            auto token_indices = mask.nonzero().squeeze(-1);
+            if (token_indices.size(0) == 0) continue;
+            auto selected = flat.index_select(0, token_indices);
+            auto egu = experts_gate_up.select(0, e_local);
+            auto ed = experts_down.select(0, e_local);
+            auto gu = at::matmul(selected, egu.t());
+            auto gate_part = gu.narrow(-1, 0, intermediate);
+            auto up_part = gu.narrow(-1, intermediate, intermediate);
+            auto expert_out = at::matmul(at::silu(gate_part) * up_part, ed.t());
+            auto weights = expert_weights.index_select(0, token_indices).unsqueeze(-1);
+            routed_output = routed_output.index_add_(0, token_indices, expert_out * weights);
         }
     }
 
+    // Shared expert (same as before)
     auto shared_out = at::matmul(at::silu(at::matmul(flat, shared_gate_proj.t())) * at::matmul(flat, shared_up_proj.t()), shared_down_proj.t());
     auto seg = at::sigmoid(at::matmul(flat, shared_expert_gate_w.t())).to(compute_type);
     shared_out = (shared_out * seg).to(compute_type);
@@ -1157,15 +1160,15 @@ static at::Tensor backward_full_attn_dense_mlp(
     // 1. MLP backward: result = matmul(activated, down_proj.t())
     auto grad_activated = at::matmul(grad_flat, down_proj_w);
     // 2. activated = silu(gate_out) * up_out
-    auto grad_gate_out = grad_activated * up_out * mk_silu_backward(gate_out, at::ones_like(gate_out));
+    auto grad_gate_out = grad_activated * up_out * fused_silu_backward(gate_out, at::ones_like(gate_out));
     auto grad_up_out = grad_activated * silu_gate;
     // 3. gate_out, up_out = matmul(flat, *_proj.t())
     auto grad_post_attn = (at::matmul(grad_gate_out, gate_proj_w) + at::matmul(grad_up_out, up_proj_w)).reshape({B, S, H});
 
     // 4. post_attn = rms_norm(hidden + attn_output, post_norm)
     auto residual = hidden + attn_output;
-    auto pb = rms_norm_backward(residual, post_norm, grad_post_attn, eps);
-    auto grad_residual = pb.grad_input;  // grad w.r.t. (hidden + attn_output)
+    auto pb = fused_rms_norm_backward(residual, post_norm, grad_post_attn, eps);
+    auto grad_residual = std::get<0>(pb);  // grad w.r.t. (hidden + attn_output)
 
     // 5. Attention backward
     auto grad_attn_output = grad_output + grad_residual;  // residual + from MLP
@@ -1177,9 +1180,8 @@ static at::Tensor backward_full_attn_dense_mlp(
     if (la && la[3]) accum_lora(grad_o_proj, *la[3], *lb[3], *la[3], *lb[3], lora_scaling);
 
     auto grad_attn_out = grad_attn_out_flat.view({B, nh, S, hd});
-    // attn_out = sdpa_out * sigmoid(gate)
-    auto grad_sdpa = grad_attn_out * sig_gate;
-    auto grad_gate = grad_attn_out * sig_gate * (1.0 - sig_gate);
+    // attn_out = sdpa_out * sigmoid(gate) — fused gate backward
+    auto [grad_sdpa, grad_gate] = fused_gate_backward(gate, grad_attn_out);
 
     // SDPA backward (mini-graph)
     at::Tensor grad_q, grad_k_exp, grad_v_exp;
@@ -1220,18 +1222,18 @@ static at::Tensor backward_full_attn_dense_mlp(
     }
 
     // 7. rms_norm backward for q, k
-    auto q_nb = rms_norm_backward(q_pre_norm, q_norm, grad_q_normed, eps);
-    auto k_nb = rms_norm_backward(k_pre_norm, k_norm, grad_k_normed, eps);
+    auto q_nb = fused_rms_norm_backward(q_pre_norm, q_norm, grad_q_normed, eps);
+    auto k_nb = fused_rms_norm_backward(k_pre_norm, k_norm, grad_k_normed, eps);
 
     // 8. matmul backward for q_proj (produces q + gate), k_proj, v_proj
-    auto grad_q_pre_2d = q_nb.grad_input.transpose(1, 2).contiguous().view({B, S, nh * hd});
+    auto grad_q_pre_2d = std::get<0>(q_nb).transpose(1, 2).contiguous().view({B, S, nh * hd});
     auto grad_gate_2d = grad_gate.transpose(1, 2).contiguous().view({B, S, nh * hd});
     auto grad_q_proj_out = at::cat({grad_q_pre_2d, grad_gate_2d}, -1);  // [B, S, nh*hd*2]
     auto q_mb = mk_matmul_backward(attn_input, q_proj, grad_q_proj_out);
     if (la && la[0]) accum_lora(q_mb.grad_weight, *la[0], *lb[0], *la[0], *lb[0], lora_scaling);
 
     auto k_mb = mk_matmul_backward(attn_input, k_proj,
-        k_nb.grad_input.transpose(1, 2).contiguous().view({B, S, nkv * hd}));
+        std::get<0>(k_nb).transpose(1, 2).contiguous().view({B, S, nkv * hd}));
     if (la && la[1]) accum_lora(k_mb.grad_weight, *la[1], *lb[1], *la[1], *lb[1], lora_scaling);
 
     auto v_mb = mk_matmul_backward(attn_input, v_proj,
@@ -1241,10 +1243,10 @@ static at::Tensor backward_full_attn_dense_mlp(
     auto grad_attn_input = q_mb.grad_input + k_mb.grad_input + v_mb.grad_input;
 
     // 9. input rms_norm backward
-    auto in_nb = rms_norm_backward(hidden, input_norm, grad_attn_input, eps);
+    auto in_nb = fused_rms_norm_backward(hidden, input_norm, grad_attn_input, eps);
 
     // 10. Total: grad_hidden = residual + from_mlp + from_attn
-    return grad_output + grad_residual + in_nb.grad_input;
+    return grad_output + grad_residual + std::get<0>(in_nb);
 }
 
 // ── Single layer backward (linear attention + MoE/dense MLP) ─────────
@@ -1371,9 +1373,9 @@ static at::Tensor backward_linear_attn_mlp(
         auto grad_post_attn = post_attn_g.grad();
 
         // post_attn = rms_norm(hidden + attn_output, post_norm)
-        auto pb = rms_norm_backward(hidden + attn_output, post_norm, grad_post_attn, eps);
-        grad_residual = grad_residual + pb.grad_input;
-        grad_attn_output = grad_attn_output + pb.grad_input;
+        auto pb = fused_rms_norm_backward(hidden + attn_output, post_norm, grad_post_attn, eps);
+        grad_residual = grad_residual + std::get<0>(pb);
+        grad_attn_output = grad_attn_output + std::get<0>(pb);
     }
 
     // Attention backward
@@ -1384,7 +1386,7 @@ static at::Tensor backward_linear_attn_mlp(
 
     auto grad_gated_f = grad_gated.view({B*S, vdim}).to(at::kFloat);
     auto grad_normed = grad_gated_f * silu_z;
-    auto grad_z = (grad_gated_f * normed * mk_silu_backward(z_flat.to(at::kFloat), at::ones_like(z_flat.to(at::kFloat)))).view({B, S, v_size}).to(kind);
+    auto grad_z = (grad_gated_f * normed * fused_silu_backward(z_flat.to(at::kFloat), at::ones_like(z_flat.to(at::kFloat)))).view({B, S, v_size}).to(kind);
 
     auto grad_normed_scaled = grad_normed * norm_w.to(at::kFloat);
     auto dot = (grad_normed_scaled * normed_core).mean(-1, true);
@@ -1405,11 +1407,28 @@ static at::Tensor backward_linear_attn_mlp(
         grad_g.data_ptr<float>(), grad_beta.data_ptr<float>(),
         (int)BH, (int)S, (int)kdim, (int)vdim);
 
+    // Release large delta rule intermediates (48GB+) — no longer needed
+    q_c = at::Tensor(); k_c = at::Tensor(); v_c = at::Tensor();
+    g_c = at::Tensor(); beta_c = at::Tensor(); state = at::Tensor();
+    outs = at::Tensor(); delta_buf = at::Tensor(); grad_core_fp32 = at::Tensor();
+    core_flat = at::Tensor(); z_flat = at::Tensor(); variance = at::Tensor();
+    inv_rms = at::Tensor(); normed_core = at::Tensor(); normed = at::Tensor();
+    silu_z = at::Tensor(); gated = at::Tensor(); attn_output = at::Tensor();
+    c10::cuda::CUDACachingAllocator::emptyCache();
+
     // L2 norm backward
     auto gq4 = grad_q.reshape({B, nvh, S, kdim});
     auto gk4 = grad_k.reshape({B, nvh, S, kdim});
-    auto grad_q_rep = l2norm_backward(q_f.reshape({B, nvh, S, kdim}), q_normed.reshape({B, nvh, S, kdim}), gq4) * scale;
+    auto grad_q_rep = fused_l2norm_backward(q_f.reshape({B, nvh, S, kdim}), q_normed.reshape({B, nvh, S, kdim}), gq4, (float)scale);
     auto grad_k_rep = l2norm_backward(k_f.reshape({B, nvh, S, kdim}), k_normed.reshape({B, nvh, S, kdim}), gk4);
+
+    // Release L2 norm intermediates
+    q_f = at::Tensor(); k_f = at::Tensor();
+    q_normed = at::Tensor(); k_normed = at::Tensor();
+    q_t = at::Tensor(); k_t = at::Tensor(); v_t = at::Tensor();
+    g_t = at::Tensor(); beta_t = at::Tensor(); g_exp = at::Tensor();
+    grad_q = at::Tensor(); grad_k = at::Tensor(); grad_v = at::Tensor();
+    c10::cuda::CUDACachingAllocator::emptyCache();
 
     // Undo repeat_interleave
     auto grad_q_pre = grad_q_rep.reshape({B, nkh, n_rep, S, kdim}).sum(2);
@@ -1425,24 +1444,29 @@ static at::Tensor backward_linear_attn_mlp(
 
     // silu + conv1d backward
     auto grad_conv_out = grad_qkv_conv.transpose(1, 2).contiguous();
-    auto grad_conv_pre = grad_conv_out * mk_silu_backward(conv_pre, at::ones_like(conv_pre));
+    grad_qkv_conv = at::Tensor();
+    auto grad_conv_pre = grad_conv_out * fused_silu_backward(conv_pre, at::ones_like(conv_pre));
+    grad_conv_out = at::Tensor(); conv_out = at::Tensor(); conv_pre = at::Tensor();
     auto grad_padded = at::conv1d(grad_conv_pre, conv1d_w.flip(2), at::Tensor(), at::IntArrayRef({1}), at::IntArrayRef({(long)pad}), at::IntArrayRef({1}), qkv_dim);
+    grad_conv_pre = at::Tensor();
     auto grad_qkv = grad_padded.narrow(2, pad, S).transpose(1, 2).contiguous();
+    grad_padded = at::Tensor(); padded = at::Tensor(); padding = at::Tensor();
+    c10::cuda::CUDACachingAllocator::emptyCache();
 
     // matmul backward for qkv
     auto qkv_mb = mk_matmul_backward(attn_input, in_proj_qkv, grad_qkv);
+    grad_qkv = at::Tensor(); qkv = at::Tensor(); qkv_t = at::Tensor(); qkv_conv = at::Tensor();
     if (la && la[0]) accum_lora(qkv_mb.grad_weight, *la[0], *lb[0], *la[0], *lb[0], lora_scaling);
     auto grad_attn_input = qkv_mb.grad_input;
 
-    // g = -exp(A_log) * softplus(a + dt_bias)
-    auto grad_g_4d = grad_g.reshape({B, nvh, S});
-    auto grad_a = grad_g_4d.transpose(1, 2).contiguous() * neg_exp * at::sigmoid(a_f + dt_bias_f.unsqueeze(0).unsqueeze(0));
+    // g = -exp(A_log) * softplus(a + dt_bias) — fused backward
+    auto grad_g_2d = grad_g.reshape({B*S, nvh}).transpose(0, 1).contiguous().transpose(0, 1);  // [B*S, nvh]
+    auto grad_a = fused_g_backward(a, a_log, dt_bias, grad_g.reshape({B*S, nvh}));
     auto a_mb = mk_matmul_backward(attn_input, in_proj_a, grad_a);
     grad_attn_input = grad_attn_input + a_mb.grad_input;
 
-    // beta = sigmoid(b)
-    auto grad_beta_4d = grad_beta.reshape({B, nvh, S});
-    auto grad_b = grad_beta_4d.transpose(1, 2).contiguous() * beta.to(at::kFloat) * (1.0 - beta.to(at::kFloat));
+    // beta = sigmoid(b) — fused backward
+    auto grad_b = fused_beta_backward(b, grad_beta.reshape({B*S, nvh}));
     auto b_mb = mk_matmul_backward(attn_input, in_proj_b, grad_b);
     grad_attn_input = grad_attn_input + b_mb.grad_input;
 
@@ -1452,9 +1476,9 @@ static at::Tensor backward_linear_attn_mlp(
     if (la && la[1]) accum_lora(z_mb.grad_weight, *la[1], *lb[1], *la[1], *lb[1], lora_scaling);
 
     // input rms_norm backward
-    auto in_nb = rms_norm_backward(hidden, input_norm, grad_attn_input.to(hidden.scalar_type()), eps);
+    auto in_nb = fused_rms_norm_backward(hidden, input_norm, grad_attn_input.to(hidden.scalar_type()), eps);
 
-    return grad_residual + in_nb.grad_input;
+    return grad_residual + std::get<0>(in_nb);
 }
 
 // ── Dispatch: backward for any layer type ───────────────────────────
