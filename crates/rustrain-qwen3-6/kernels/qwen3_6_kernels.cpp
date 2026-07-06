@@ -68,59 +68,142 @@ static at::Tensor full_attention(
     int64_t rotary_dim = (int64_t)(head_dim * partial_rotary_factor);
 
     // Full attention always uses SDPA (Flash Attention) — O(seq) memory.
-    // No chunking: SDPA handles long sequences efficiently.
     // QWEN36_SEQ_CHUNK only affects linear_attention (delta rule state passing).
-    auto q_out = at::matmul(hidden, q_proj.t()).view({batch, seq, num_heads, head_dim * 2});
-    auto qk_chunk = q_out.chunk(2, -1);
-    auto q = qk_chunk[0].transpose(1, 2);   // [batch, heads, seq, head_dim]
-    auto gate = qk_chunk[1].transpose(1, 2); // [batch, heads, seq, head_dim]
+    // For large sequences, chunk the q/k/v projections to avoid OOM on single matmul.
+    const char* proj_chunk_env = getenv("QWEN36_PROJ_CHUNK");
+    int64_t proj_chunk = proj_chunk_env ? atoll(proj_chunk_env) : 0;
 
-    auto k = at::matmul(hidden, k_proj.t()).view({batch, seq, num_kv_heads, head_dim}).transpose(1, 2);
-    auto v = at::matmul(hidden, v_proj.t()).view({batch, seq, num_kv_heads, head_dim}).transpose(1, 2);
+    // Debug: confirm proj_chunk is read
+    if (proj_chunk > 0 && seq > proj_chunk) {
+        fprintf(stderr, "[proj_debug] full_attention: seq=%ld proj_chunk=%ld (chunked)\n", (long)seq, (long)proj_chunk);
+    }
+
+    at::Tensor q, gate, k, v;
+
+    if (proj_chunk > 0 && seq > proj_chunk) {
+        // Pre-allocate output tensors, fill in chunks to avoid storing all parts
+        q = at::empty({batch, num_heads, seq, head_dim}, hidden.options());
+        gate = at::empty({batch, num_heads, seq, head_dim}, hidden.options());
+        k = at::empty({batch, num_kv_heads, seq, head_dim}, hidden.options());
+        v = at::empty({batch, num_kv_heads, seq, head_dim}, hidden.options());
+
+        for (int64_t s = 0; s < seq; s += proj_chunk) {
+            int64_t e = std::min(s + proj_chunk, seq);
+            int64_t clen = e - s;
+            auto h_chunk = hidden.narrow(1, s, clen);
+
+            // qkv projection
+            auto qo = at::matmul(h_chunk, q_proj.t()).view({batch, clen, num_heads, head_dim * 2});
+            auto qkc = qo.chunk(2, -1);
+            // Write directly into pre-allocated tensors (transpose = view, then copy)
+            q.narrow(2, s, clen).copy_(qkc[0].transpose(1, 2));
+            gate.narrow(2, s, clen).copy_(qkc[1].transpose(1, 2));
+            qo = at::Tensor();
+
+            k.narrow(2, s, clen).copy_(
+                at::matmul(h_chunk, k_proj.t()).view({batch, clen, num_kv_heads, head_dim}).transpose(1, 2));
+            v.narrow(2, s, clen).copy_(
+                at::matmul(h_chunk, v_proj.t()).view({batch, clen, num_kv_heads, head_dim}).transpose(1, 2));
+
+            cudaDeviceSynchronize();
+            c10::cuda::CUDACachingAllocator::emptyCache();
+        }
+    } else {
+        auto q_out = at::matmul(hidden, q_proj.t()).view({batch, seq, num_heads, head_dim * 2});
+        auto qk_chunk = q_out.chunk(2, -1);
+        q = qk_chunk[0].transpose(1, 2);
+        gate = qk_chunk[1].transpose(1, 2);
+        k = at::matmul(hidden, k_proj.t()).view({batch, seq, num_kv_heads, head_dim}).transpose(1, 2);
+        v = at::matmul(hidden, v_proj.t()).view({batch, seq, num_kv_heads, head_dim}).transpose(1, 2);
+    }
 
     q = rms_norm(q, q_norm, rms_eps);
     k = rms_norm(k, k_norm, rms_eps);
 
+    // Debug: memory after rms_norm
+    {
+        size_t free2, total2;
+        cudaMemGetInfo(&free2, &total2);
+        fprintf(stderr, "[mem_debug] after rms_norm: used=%.1f GB, free=%.1f GB\n",
+            (total2 - free2) / 1e9, free2 / 1e9);
+    }
+
+    // Release gate before RoPE to save 16GB
+    auto gate_saved = gate;
+    gate = at::Tensor();
+    cudaDeviceSynchronize();
+    c10::cuda::CUDACachingAllocator::emptyCache();
+
+    // Debug: memory after gate release
+    {
+        size_t free2, total2;
+        cudaMemGetInfo(&free2, &total2);
+        fprintf(stderr, "[mem_debug] after gate release: used=%.1f GB, free=%.1f GB\n",
+            (total2 - free2) / 1e9, free2 / 1e9);
+    }
+
     if (rotary_dim > 0) {
-        // HF: inv_freq = 1 / (theta ^ (arange(0, dim, 2) / dim))
         auto pos = at::arange(seq, at::TensorOptions().dtype(at::kFloat).device(device)).unsqueeze(0);
         auto exponents = at::arange(0, rotary_dim, 2, at::TensorOptions().dtype(at::kFloat).device(device)) / (double)rotary_dim;
         auto inv_freq = (exponents * std::log(rope_theta)).exp().reciprocal();
         auto freqs = pos.unsqueeze(-1) * inv_freq.unsqueeze(0);
-        // HF: emb = cat(freqs, freqs, dim=-1) → cos, sin of [batch, seq, rotary_dim]
         auto emb = at::cat({freqs, freqs}, -1);
         auto cos = emb.cos().unsqueeze(1).to(q.scalar_type());
         auto sin = emb.sin().unsqueeze(1).to(q.scalar_type());
 
+        // In-place RoPE to avoid creating additional 16GB tensors
         auto q_rot = q.narrow(-1, 0, rotary_dim);
         auto k_rot = k.narrow(-1, 0, rotary_dim);
-        auto q_pass = q.narrow(-1, rotary_dim, head_dim - rotary_dim);
-        auto k_pass = k.narrow(-1, rotary_dim, head_dim - rotary_dim);
-        auto q_rotated = q_rot * cos + rotate_half(q_rot) * sin;
-        auto k_rotated = k_rot * cos + rotate_half(k_rot) * sin;
-        q = (head_dim > rotary_dim) ? at::cat({q_rotated, q_pass}, -1) : q_rotated;
-        k = (head_dim > rotary_dim) ? at::cat({k_rotated, k_pass}, -1) : k_rotated;
+        auto rotate_half_q = at::cat({-q_rot.narrow(-1, rotary_dim/2, rotary_dim/2), q_rot.narrow(-1, 0, rotary_dim/2)}, -1);
+        auto rotate_half_k = at::cat({-k_rot.narrow(-1, rotary_dim/2, rotary_dim/2), k_rot.narrow(-1, 0, rotary_dim/2)}, -1);
+        // q_rotated = q_rot * cos + rotate_half(q_rot) * sin — in-place
+        q_rot.mul_(cos).add_(rotate_half_q * sin);
+        k_rot.mul_(cos).add_(rotate_half_k * sin);
+        // q and k are now modified in-place (RoPE applied to rotary_dim part)
+        rotate_half_q = at::Tensor();
+        rotate_half_k = at::Tensor();
+        cos = at::Tensor();
+        sin = at::Tensor();
+        cudaDeviceSynchronize();
+        c10::cuda::CUDACachingAllocator::emptyCache();
     }
 
+    // Restore gate after RoPE
+    gate = gate_saved;
+
     int64_t n_rep = num_heads / num_kv_heads;
-    k = k.repeat_interleave(n_rep, 1);
-    v = v.repeat_interleave(n_rep, 1);
+    auto k_expanded = k.repeat_interleave(n_rep, 1);
+    k = at::Tensor();  // release old small K
+    cudaDeviceSynchronize();
+    c10::cuda::CUDACachingAllocator::emptyCache();
+    auto v_expanded = v.repeat_interleave(n_rep, 1);
+    v = at::Tensor();  // release old small V
+
+    // Release intermediate tensors before SDPA
+    cudaDeviceSynchronize();
+    c10::cuda::CUDACachingAllocator::emptyCache();
 
     double scale = 1.0 / std::sqrt((double)head_dim);
 
     // Use SDPA (Flash Attention) — O(seq) memory instead of O(seq²)
-    // Pass is_causal=true, no explicit attn_mask needed
     auto attn_out = at::scaled_dot_product_attention(
-        q, k, v,
-        /*attn_mask=*/c10::nullopt,  // no explicit mask
-        0.0,  // dropout_p
-        true   // is_causal
+        q, k_expanded, v_expanded,
+        /*attn_mask=*/c10::nullopt,
+        0.0,
+        true
     );
-    // Apply scale manually since SDPA uses 1/sqrt(head_dim) by default
-    // Actually SDPA already applies 1/sqrt(E) scaling, but our scale matches
-    // since head_dim == E. So no extra scaling needed.
+
+    // Release Q/K/V before gate multiplication
+    q = at::Tensor();
+    k_expanded = at::Tensor();
+    v_expanded = at::Tensor();
+    cudaDeviceSynchronize();
+    c10::cuda::CUDACachingAllocator::emptyCache();
 
     attn_out = attn_out * at::sigmoid(gate).to(attn_out.scalar_type());
+    gate = at::Tensor();
+    cudaDeviceSynchronize();
+    c10::cuda::CUDACachingAllocator::emptyCache();
     return attn_out.transpose(1, 2).reshape({batch, seq, qkv_dim}).matmul(o_proj.t());
 }
 
