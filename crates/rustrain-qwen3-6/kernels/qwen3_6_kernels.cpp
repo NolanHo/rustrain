@@ -1033,6 +1033,98 @@ struct FusedLayerFunction : public torch::autograd::Function<FusedLayerFunction>
     }
 };
 
+// MegakernelLayer: per-layer autograd::Function, forward with grad, backward via autograd
+// No recompute — PyTorch traverses only this layer's graph.
+struct MegakernelLayer : public torch::autograd::Function<MegakernelLayer> {
+    static at::Tensor forward(
+        torch::autograd::AutogradContext* ctx,
+        at::Tensor hidden,
+        int64_t tc_val,
+        int64_t layer_idx
+    ) {
+        auto* tc = reinterpret_cast<TrainingContext*>(tc_val);
+        auto kind = tc->compute_type;
+        const auto& cfg = tc->layer_configs[layer_idx];
+
+        ctx->saved_data["tc"] = tc_val;
+        ctx->saved_data["layer"] = layer_idx;
+
+        // Ensure hidden requires grad for autograd graph
+        if (!hidden.requires_grad()) {
+            hidden = hidden.detach().set_requires_grad(true);
+        }
+
+        // Run forward WITH grad mode enabled — autograd::Function::forward
+        // may run in no-grad context, so we explicitly enable it.
+        at::AutoGradMode grad_mode(true);
+
+        int64_t w_offset = 0;
+        for (int64_t j = 0; j < layer_idx; j++)
+            w_offset += weight_count_for_layer(tc->layer_configs[j]);
+        int64_t w_count = weight_count_for_layer(tc->layer_configs[layer_idx]);
+        std::vector<at::Tensor*> layer_w(tc->weight_ptrs.begin() + w_offset,
+                                         tc->weight_ptrs.begin() + w_offset + w_count);
+
+        int64_t lora_count = (cfg.layer_type == 0) ? 4 : 3;
+        int64_t la_offset = tc->lora_layer_offset[layer_idx];
+        bool has_lora = (la_offset + lora_count) <= (int64_t)tc->lora_a.size();
+        std::vector<at::Tensor*> la(lora_count, nullptr), lb(lora_count, nullptr);
+        if (has_lora) for (int64_t k = 0; k < lora_count; k++) {
+            la[k] = &tc->lora_a[la_offset + k]; lb[k] = &tc->lora_b[la_offset + k];
+        }
+
+        auto layer_output = forward_single_layer(hidden, layer_w.data(), &cfg,
+            kind, tc->lora_scaling, la.data(), lb.data());
+
+        ctx->save_for_backward({hidden, layer_output});
+        return hidden + layer_output;  // residual — has grad_fn from both hidden and layer_output
+    }
+
+    static std::vector<at::Tensor> backward(
+        torch::autograd::AutogradContext* ctx,
+        std::vector<at::Tensor> grad_output
+    ) {
+        auto saved = ctx->get_saved_variables();
+        auto hidden = saved[0];
+        auto layer_output = saved[1];
+
+        // Backward through this single layer's graph (no recompute)
+        // retain_graph=true because LoRA params are shared across layers
+        torch::autograd::backward({layer_output}, {grad_output[0]},
+            /*retain_graph=*/true, /*create_graph=*/false);
+
+        // grad_hidden = residual + layer gradient
+        auto grad_hidden = grad_output[0];  // residual
+        if (hidden.grad().defined()) {
+            grad_hidden = grad_hidden + hidden.grad();
+        }
+        hidden.mutable_grad() = at::Tensor();
+
+        return {grad_hidden, at::Tensor(), at::Tensor()};
+    }
+};
+
+// Forward using megakernel — each layer is a MegakernelLayer::apply
+static at::Tensor forward_full_megakernel(
+    TrainingContext* ctx,
+    const at::Tensor& input_ids
+) {
+    auto embed = *ctx->embed_ptr[0];
+    at::Tensor hidden = at::embedding(embed, input_ids);
+    hidden = hidden.detach().set_requires_grad(true);
+
+    for (int64_t i = 0; i < ctx->num_layers; i++) {
+        hidden = MegakernelLayer::apply(
+            hidden,
+            (int64_t)(uintptr_t)ctx,
+            i
+        );
+        c10::cuda::CUDACachingAllocator::emptyCache();
+    }
+
+    return hidden;
+}
+
 // Forward pass with fused layer (no checkpoint, no recompute).
 // Uses FusedLayerFunction per layer — PyTorch autograd handles backward.
 // QWEN36_FUSED_LAYER=1 enables this path.
@@ -1553,13 +1645,16 @@ double qwen36_train_step(
         auto& input_ids = *reinterpret_cast<at::Tensor*>(input_ids_ptr);
         auto& target_mask = *reinterpret_cast<at::Tensor*>(target_mask_ptr);
 
-        // Forward (with or without checkpointing or fused layer)
+        // Forward (with or without checkpointing, fused layer, or megakernel)
+        bool use_megakernel = getenv("QWEN36_MEGAKERNEL");
         bool use_fused = getenv("QWEN36_FUSED_LAYER");
-        auto hidden = use_fused
-            ? forward_full_fused(ctx, input_ids)
-            : ctx->use_checkpoint
-                ? forward_full_checkpoint(ctx, input_ids)
-                : forward_full(ctx, input_ids);
+        auto hidden = use_megakernel
+            ? forward_full_megakernel(ctx, input_ids)
+            : use_fused
+                ? forward_full_fused(ctx, input_ids)
+                : ctx->use_checkpoint
+                    ? forward_full_checkpoint(ctx, input_ids)
+                    : forward_full(ctx, input_ids);
 
         // Debug: GPU memory after forward
         {
@@ -1601,10 +1696,12 @@ double qwen36_train_step(
         }
 
         // Trigger main model backward.
-        // FusedLayer path: autograd handles backward through graph, no recompute.
+        // Megakernel/FusedLayer path: autograd handles backward per layer, no recompute.
         // Checkpoint path: manual_group_backward recomputes each group.
-        if (use_fused && hidden.grad().defined()) {
-            hidden.backward(hidden.grad());
+        if (use_megakernel || use_fused) {
+            if (hidden.grad().defined()) {
+                hidden.backward(hidden.grad());
+            }
         } else if (hidden.grad().defined() && !ctx->group_inputs.empty() && !getenv("QWEN36_SUBCKPT")) {
             manual_group_backward(ctx, hidden.grad());
         } else if (hidden.grad().defined()) {

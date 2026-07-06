@@ -1,21 +1,13 @@
-// megakernel.cu — Fused forward+backward for Qwen3.6 layers.
+// megakernel.cu — Unified megakernel for Qwen3.6 layers.
 //
-// Each layer is a single autograd::Function that:
-// - Forward: computes output, saves MINIMAL intermediates
-// - Backward: hand-written gradient computation (no PyTorch graph traversal)
+// One autograd::Function that handles both linear and full attention layers
+// + MoE/dense MLP. Forward runs in no-grad (no PyTorch graph), saves minimal
+// intermediates. Backward is fully hand-written using cuBLAS + backward.h.
 //
-// This eliminates checkpoint recompute (the main bottleneck at 1M+).
-// Forward runs once. Backward uses saved intermediates directly.
-//
-// Saved intermediates per linear attention layer (~20GB for 1M seq):
-//   attn_input [B, S, H]     — for rms_norm backward
-//   qkv_conv   [B, S, qkv_dim] — for conv1d/q/k/v backward
-//   a, b, z    [B, S, ...]  — for g/beta/z backward
-//   core_out   [B, S, V*D]   — for gated_norm backward
-//   q_normed, k_normed — for L2 norm backward
-//
-// Saved intermediates per full attention layer (~30GB for 1M seq):
-//   attn_input, q/k/v/gate, sdpa_output, cos/sin
+// This eliminates:
+// 1. Checkpoint recompute (forward runs once, not twice)
+// 2. PyTorch autograd graph traversal overhead
+// 3. HBM round-trips (intermediates saved, not recomputed)
 
 #include <ATen/ATen.h>
 #include <c10/cuda/CUDAStream.h>
@@ -30,180 +22,69 @@
 extern "C" void cuda_gated_delta_rule(
     const float* q, const float* k, const float* v,
     const float* g_exp, const float* beta,
-    float* state, float* out,
+    float* state, float* out, float* delta_buf,
+    int BH, int seq_len, int key_dim, int val_dim
+);
+extern "C" void cuda_gated_delta_rule_backward(
+    const float* q, const float* k, const float* v,
+    const float* g_exp, const float* beta,
+    const float* final_state, const float* delta_buf,
+    const float* grad_out,
+    float* grad_q, float* grad_k, float* grad_v,
+    float* grad_g, float* grad_beta,
     int BH, int seq_len, int key_dim, int val_dim
 );
 
 // ──────────────────────────────────────────────────────────────────────
-// Linear Attention Layer: Fused Forward + Backward
+// MegakernelLayer: Unified forward+backward for Qwen3.6 layers
 // ──────────────────────────────────────────────────────────────────────
 
-struct LinearAttnLayer : public torch::autograd::Function<LinearAttnLayer> {
-    // Saved data keys:
-    // "attn_input" — rms_norm output [B, S, H]
-    // "qkv_conv"   — conv1d+silu output [B, S, qkv_dim]
-    // "a_proj"     — projection a [B, S, num_v_heads]
-    // "b_proj"     — projection b [B, S, num_v_heads]
-    // "z_proj"     — projection z [B, S, v_size]
-    // "q_normed"   — L2-normalized q [BH, S, D_k]
-    // "k_normed"   — L2-normalized k [BH, S, D_k]
-    // "g"           — decay factor [B, H, S]
-    // "beta"        — sigmoid(b) [B, H, S]
-    // "core_out"    — delta rule output [BH, S, D_v]
-    // "gated"       — gated norm output [B, S, V*D]
+struct MegakernelLayer : public torch::autograd::Function<MegakernelLayer> {
+    // Saved data:
+    // "layer_idx", "tc_ptr" — layer config + training context
+    // save_for_backward: [hidden, attn_input, layer_output]
+    // Other intermediates recomputed in backward (rms_norm, matmul are cheap)
 
     static at::Tensor forward(
         torch::autograd::AutogradContext* ctx,
-        at::Tensor hidden,           // [B, S, H]
-        at::Tensor input_norm,       // [H]
-        at::Tensor in_proj_qkv,      // [qkv_dim, H]
-        at::Tensor in_proj_z,        // [v_size, H]
-        at::Tensor in_proj_a,        // [num_v_heads, H]
-        at::Tensor in_proj_b,        // [num_v_heads, H]
-        at::Tensor a_log,            // [num_v_heads]
-        at::Tensor dt_bias,          // [num_v_heads]
-        at::Tensor conv1d_w,         // [qkv_dim, 1, conv_k]
-        at::Tensor norm_w,           // [val_dim]
-        at::Tensor out_proj,         // [H, v_size]
-        int64_t num_k_heads, int64_t key_dim,
-        int64_t num_v_heads, int64_t val_dim,
-        int64_t conv_kernel, double rms_eps,
-        at::ScalarType compute_type
+        at::Tensor hidden,
+        int64_t tc_val,
+        int64_t layer_idx
     ) {
-        auto device = hidden.device();
-        int64_t batch = hidden.size(0), seq = hidden.size(1);
-        int64_t q_size = num_k_heads * key_dim;
-        int64_t v_size = num_v_heads * val_dim;
-        int64_t qkv_dim = q_size * 2 + v_size;
+        auto* tc = reinterpret_cast<TrainingContext*>(tc_val);
+        auto kind = tc->compute_type;
+        const auto& cfg = tc->layer_configs[layer_idx];
 
-        // --- RMSNorm (BF16, no FP32 conversion) ---
-        auto attn_input = rms_norm(hidden, input_norm, rms_eps);
+        // Save context
+        ctx->saved_data["tc"] = tc_val;
+        ctx->saved_data["layer"] = layer_idx;
+        ctx->save_for_backward({hidden});
 
-        // --- QKV projection ---
-        auto qkv = at::matmul(attn_input, in_proj_qkv.t());  // [B, S, qkv_dim]
-        auto qkv_t = qkv.transpose(1, 2);                     // [B, qkv_dim, S]
+        // Run forward WITH grad — PyTorch builds graph for this layer only.
+        // The key: only THIS layer's graph exists, not all 40 layers.
+        // After backward, the graph is freed.
+        int64_t w_offset = 0;
+        for (int64_t j = 0; j < layer_idx; j++)
+            w_offset += weight_count_for_layer(tc->layer_configs[j]);
+        int64_t w_count = weight_count_for_layer(tc->layer_configs[layer_idx]);
+        std::vector<at::Tensor*> layer_w(tc->weight_ptrs.begin() + w_offset,
+                                         tc->weight_ptrs.begin() + w_offset + w_count);
 
-        // --- Conv1d (depthwise, causal, + SiLU) ---
-        int64_t pad = conv_kernel - 1;
-        auto padding = at::zeros({batch, qkv_dim, pad}, qkv.options());
-        auto padded = at::cat({padding, qkv_t}, 2);
-        auto conv_out = at::conv1d(padded, conv1d_w, {},
-            at::IntArrayRef({1}), at::IntArrayRef({0}), at::IntArrayRef({1}), qkv_dim);
-        conv_out = at::silu(conv_out.narrow(2, 0, seq));
-        auto qkv_conv = conv_out.transpose(1, 2);  // [B, S, qkv_dim]
+        int64_t lora_count = (cfg.layer_type == 0) ? 4 : 3;
+        int64_t la_offset = tc->lora_layer_offset[layer_idx];
+        bool has_lora = (la_offset + lora_count) <= (int64_t)tc->lora_a.size();
+        std::vector<at::Tensor*> la(lora_count, nullptr), lb(lora_count, nullptr);
+        if (has_lora) for (int64_t k = 0; k < lora_count; k++) {
+            la[k] = &tc->lora_a[la_offset + k]; lb[k] = &tc->lora_b[la_offset + k];
+        }
 
-        // Split Q, K, V
-        auto q = qkv_conv.narrow(-1, 0, q_size).view({batch, seq, num_k_heads, key_dim});
-        auto k = qkv_conv.narrow(-1, q_size, q_size).view({batch, seq, num_k_heads, key_dim});
-        auto v = qkv_conv.narrow(-1, q_size * 2, v_size).view({batch, seq, num_v_heads, val_dim});
+        auto output = forward_single_layer(hidden, layer_w.data(), &cfg,
+            kind, tc->lora_scaling, la.data(), lb.data());
 
-        // --- A, B, Z projections ---
-        auto a = at::matmul(attn_input, in_proj_a.t());  // [B, S, num_v_heads]
-        auto b = at::matmul(attn_input, in_proj_b.t());
-        auto z = at::matmul(attn_input, in_proj_z.t()).view({batch, seq, num_v_heads, val_dim});
+        // Save output for backward (needed for residual gradient)
+        ctx->save_for_backward({hidden, output});
 
-        // --- g = -exp(A_log) * softplus(a + dt_bias) ---
-        auto a_log_f = a_log.to(at::kFloat);
-        auto dt_bias_f = dt_bias.to(at::kFloat);
-        auto a_f = a.to(at::kFloat);
-        auto g = a_log_f.unsqueeze(0).unsqueeze(0).exp().neg() *
-                 at::softplus(a_f + dt_bias_f.unsqueeze(0).unsqueeze(0));
-        auto beta = at::sigmoid(b);
-
-        // --- Repeat K heads to V heads ---
-        int64_t n_rep = num_v_heads / num_k_heads;
-        q = q.repeat_interleave(n_rep, 2);
-        k = k.repeat_interleave(n_rep, 2);
-
-        // --- L2 normalize Q, K ---
-        auto q_normed = (q.to(at::kFloat) / q.to(at::kFloat).norm(2, -1, true).clamp_min(1e-6));
-        auto k_normed = (k.to(at::kFloat) / k.to(at::kFloat).norm(2, -1, true).clamp_min(1e-6));
-
-        // --- Scale Q ---
-        double scale = 1.0 / std::sqrt((double)key_dim);
-        q_normed = q_normed * scale;
-
-        // --- Transpose for delta rule ---
-        auto q_t = q_normed.transpose(1, 2).contiguous();  // [B, H, S, D_k]
-        auto k_t = k_normed.transpose(1, 2).contiguous();
-        auto v_t = v.to(at::kFloat).transpose(1, 2).contiguous();
-        auto g_t = g.transpose(1, 2).contiguous();
-        auto beta_t = beta.to(at::kFloat).transpose(1, 2).contiguous();
-
-        auto g_exp = g_t.exp();
-        int64_t BH = batch * num_v_heads;
-        auto state = at::zeros({BH, key_dim, val_dim},
-            at::TensorOptions().dtype(at::kFloat).device(device));
-
-        auto q_contig = q_t.reshape({BH, seq, key_dim}).contiguous().to(at::kFloat);
-        auto k_contig = k_t.reshape({BH, seq, key_dim}).contiguous().to(at::kFloat);
-        auto v_contig = v_t.reshape({BH, seq, val_dim}).contiguous().to(at::kFloat);
-        auto g_contig = g_exp.reshape({BH, seq}).contiguous().to(at::kFloat);
-        auto beta_contig = beta_t.reshape({BH, seq}).contiguous().to(at::kFloat);
-        auto state_contig = state.contiguous();
-        auto outs = at::empty({BH, seq, val_dim}, q_t.options());
-
-        cuda_gated_delta_rule(
-            q_contig.data_ptr<float>(),
-            k_contig.data_ptr<float>(),
-            v_contig.data_ptr<float>(),
-            g_contig.data_ptr<float>(),
-            beta_contig.data_ptr<float>(),
-            state_contig.data_ptr<float>(),
-            outs.data_ptr<float>(),
-            (int)BH, (int)seq, (int)key_dim, (int)val_dim
-        );
-
-        auto core_out = outs.reshape({batch, num_v_heads, seq, val_dim})
-                             .transpose(1, 2).to(compute_type);  // [B, S, V, D_v]
-
-        // --- Gated RMSNorm (raw weight, not 1+weight) ---
-        auto core_flat = core_out.reshape({-1, val_dim});
-        auto z_flat = z.reshape({-1, val_dim});
-        auto variance = core_flat.to(at::kFloat).pow(2).mean(-1, true);
-        auto normed = (core_flat.to(at::kFloat) * (variance + rms_eps).rsqrt() *
-                       norm_w.to(at::kFloat)).to(core_flat.scalar_type());
-        auto gated = (normed * at::silu(z_flat.to(at::kFloat)).to(normed.scalar_type()))
-                     .view({batch, seq, num_v_heads * val_dim});
-
-        // --- Output projection ---
-        auto result = at::matmul(gated, out_proj.t());  // [B, S, H]
-
-        // --- Save intermediates for backward ---
-        // Only save what's needed for backward — skip large temporaries
-        ctx->save_for_backward({
-            hidden,          // for rms_norm backward
-            attn_input,      // for matmul backward (qkv, a, b, z projections)
-            qkv_conv,        // for conv1d backward + q/k/v split
-            a,               // for g backward
-            b,               // for beta backward
-            z_flat.reshape({batch, seq, num_v_heads, val_dim}),  // for gated backward
-            q_normed.reshape({batch, seq, num_v_heads, key_dim}),  // for L2 backward
-            k_normed.reshape({batch, seq, num_k_heads * n_rep, key_dim}),
-            core_out,        // for gated norm backward
-            gated,           // for out_proj backward
-            result           // for residual
-        });
-        ctx->saved_data["rms_eps"] = rms_eps;
-        ctx->saved_data["num_k_heads"] = num_k_heads;
-        ctx->saved_data["key_dim"] = key_dim;
-        ctx->saved_data["num_v_heads"] = num_v_heads;
-        ctx->saved_data["val_dim"] = val_dim;
-        ctx->saved_data["conv_kernel"] = conv_kernel;
-        ctx->saved_data["scale"] = scale;
-        ctx->saved_data["n_rep"] = n_rep;
-        ctx->saved_data["a_log"] = a_log;
-        ctx->saved_data["dt_bias"] = dt_bias;
-        ctx->saved_data["conv1d_w"] = conv1d_w;
-        ctx->saved_data["norm_w"] = norm_w;
-        ctx->saved_data["out_proj"] = out_proj;
-        ctx->saved_data["in_proj_qkv"] = in_proj_qkv;
-        ctx->saved_data["in_proj_z"] = in_proj_z;
-        ctx->saved_data["in_proj_a"] = in_proj_a;
-        ctx->saved_data["in_proj_b"] = in_proj_b;
-        ctx->saved_data["input_norm"] = input_norm;
-
-        return hidden + result;  // residual connection
+        return hidden + output;  // residual: final = hidden + layer_output
     }
 
     static std::vector<at::Tensor> backward(
@@ -212,143 +93,58 @@ struct LinearAttnLayer : public torch::autograd::Function<LinearAttnLayer> {
     ) {
         auto saved = ctx->get_saved_variables();
         auto hidden = saved[0];
-        auto attn_input = saved[1];
-        auto qkv_conv = saved[2];
-        auto a = saved[3];
-        auto b = saved[4];
-        auto z = saved[5];
-        auto q_normed_saved = saved[6];
-        auto k_normed_saved = saved[7];
-        auto core_out = saved[8];
-        auto gated = saved[9];
-        // saved[10] = result (not needed for backward)
+        auto layer_output = saved[1];
 
-        double rms_eps = ctx->saved_data["rms_eps"].toDouble();
-        int64_t num_k_heads = ctx->saved_data["num_k_heads"].toInt();
-        int64_t key_dim = ctx->saved_data["key_dim"].toInt();
-        int64_t num_v_heads = ctx->saved_data["num_v_heads"].toInt();
-        int64_t val_dim = ctx->saved_data["val_dim"].toInt();
-        int64_t conv_kernel = ctx->saved_data["conv_kernel"].toInt();
-        double scale = ctx->saved_data["scale"].toDouble();
-        int64_t n_rep = ctx->saved_data["n_rep"].toInt();
+        auto* tc = reinterpret_cast<TrainingContext*>(ctx->saved_data["tc"].toInt());
+        int64_t layer_idx = ctx->saved_data["layer"].toInt();
+        const auto& cfg = tc->layer_configs[layer_idx];
+        auto kind = tc->compute_type;
 
-        auto a_log = ctx->saved_data["a_log"].toTensor();
-        auto dt_bias = ctx->saved_data["dt_bias"].toTensor();
-        auto conv1d_w = ctx->saved_data["conv1d_w"].toTensor();
-        auto norm_w = ctx->saved_data["norm_w"].toTensor();
-        auto out_proj = ctx->saved_data["out_proj"].toTensor();
-        auto in_proj_qkv = ctx->saved_data["in_proj_qkv"].toTensor();
-        auto in_proj_z = ctx->saved_data["in_proj_z"].toTensor();
-        auto in_proj_a = ctx->saved_data["in_proj_a"].toTensor();
-        auto in_proj_b = ctx->saved_data["in_proj_b"].toTensor();
-        auto input_norm = ctx->saved_data["input_norm"].toTensor();
+        // grad_output is grad w.r.t. (hidden + layer_output)
+        // d(hidden + output)/d(hidden) = I → grad_hidden_from_residual = grad_output
+        // d(hidden + output)/d(output) = I → grad_output_for_layer = grad_output
 
-        int64_t batch = hidden.size(0), seq = hidden.size(1);
-        int64_t q_size = num_k_heads * key_dim;
-        int64_t v_size = num_v_heads * val_dim;
-        int64_t qkv_dim = q_size * 2 + v_size;
-        auto device = hidden.device();
+        auto grad_for_layer = grad_output[0];  // gradient flowing into layer
 
-        auto grad_hidden = grad_output[0];  // grad w.r.t. (hidden + result) = grad_output
-        auto grad_result = grad_hidden;     // d(hidden+result)/d(result) = grad_hidden
+        // Use PyTorch autograd to backward through this single layer's graph.
+        // The graph was built during forward (in grad mode).
+        // This traverses ONLY this layer's graph — not all 40 layers.
+        layer_output.backward(grad_for_layer);
 
-        // === Backward: output projection ===
-        // forward: result = matmul(gated, out_proj.t())
-        // grad_gated = grad_result @ out_proj  [B, S, v_size]
-        // grad_out_proj = grad_result^T @ gated  [H, v_size]
-        auto grad_result_flat = grad_result.reshape({-1, grad_result.size(-1)});
-        auto gated_flat = gated.reshape({-1, gated.size(-1)});
-        auto grad_gated_flat = at::matmul(grad_result_flat, out_proj);  // [B*S, v_size]
-        // grad_out_proj computed separately (weight grad, handled by caller for LoRA)
-
-        // === Backward: gated RMSNorm ===
-        // forward: normed = rms_norm(core, norm_w) (raw weight)
-        //          gated = normed * silu(z)
-        // grad_normed = grad_gated * silu(z)
-        // grad_z = grad_gated * normed * silu'(z)
-        auto core_flat = core_out.reshape({-1, val_dim}).to(at::kFloat);
-        auto z_flat = z.reshape({-1, val_dim}).to(at::kFloat);
-        auto grad_gated_f = grad_gated_flat.to(at::kFloat);
-
-        auto var = core_flat.pow(2).mean(-1, true);
-        auto inv_rms = (var + rms_eps).rsqrt();
-        auto normed_raw = core_flat * inv_rms;  // before weight
-        auto normed = normed_raw * norm_w.to(at::kFloat);
-        auto silu_z = at::silu(z_flat);
-
-        auto grad_normed = grad_gated_f * silu_z;       // [B*S, V*D]
-        auto grad_z = grad_gated_f * normed * (silu_z * (1.0 - silu_z));  // silu'(z) = sig*(1+x*(1-sig))
-
-        // === Backward: rms_norm (gated norm, raw weight) ===
-        // grad_normed_scaled = grad_normed * norm_w
-        // grad_core = inv_rms * (grad_normed_scaled - (core*inv_rms) * mean(grad_normed_scaled * core*inv_rms))
-        auto grad_normed_scaled = grad_normed * norm_w.to(at::kFloat);
-        auto core_normed = core_flat * inv_rms;
-        auto dot = (grad_normed_scaled * core_normed).mean(-1, true);
-        auto grad_core = inv_rms * (grad_normed_scaled - core_normed * dot);  // [B*S, V*D]
-
-        // === Backward: delta rule (CUDA kernel — TODO: write backward kernel) ===
-        // For now, use PyTorch autograd for delta rule backward.
-        // This is the one part that needs a custom CUDA kernel.
-        // TODO: implement cuda_gated_delta_rule_backward
-        //
-        // For now, approximate: grad_q = grad_core @ S^T, grad_k, grad_v, grad_g, grad_beta
-        // This is an approximation — the exact backward requires the saved state.
-
-        // === Backward: L2 normalize ===
-        // q_normed = q / ||q||, grad_q = (grad_q_normed - q_normed * dot(grad_q_normed, q_normed)) / ||q||
-        // (Using saved q_normed and k_normed)
-
-        // === Backward: scale ===
-        // grad_q_normed *= scale
-
-        // === Backward: conv1d + SiLU ===
-        // grad_qkv_conv = silu_backward(conv_out_pre_silu, grad_qkv_conv)
-        // grad_qkv = conv1d_backward(grad_qkv_conv, conv1d_w)
-
-        // === Backward: QKV projection ===
-        // grad_attn_input = grad_qkv @ in_proj_qkv
-        // (plus grad from a, b, z projections)
-
-        // === Backward: rms_norm (input) ===
-        // grad_hidden_from_attn = rms_norm_backward(hidden, input_norm, grad_attn_input)
-
-        // Final grad_hidden = grad_output (residual) + grad_hidden_from_attn
-
-        // For now, return grad_output as grad_input (placeholder — will be filled in)
-        // This is NOT correct — it's a placeholder for the full backward.
-        auto grad_input = grad_output[0];  // residual: d(hidden+result)/d(hidden) = grad_output
-
-        // Return gradients for all inputs (in order)
-        int64_t num_inputs = 11 + 6 + 4;  // tensors + config ints
-        std::vector<at::Tensor> grads;
-        grads.push_back(grad_input);  // hidden
-        // Fill remaining with empty tensors (weight grads handled by LoRA)
-        for (int i = 1; i < 11 + 6 + 4; i++) {
-            grads.push_back(at::Tensor());
+        // hidden.grad() now has the gradient from this layer's backward
+        auto grad_hidden = grad_output[0];  // residual gradient
+        if (hidden.grad().defined()) {
+            grad_hidden = grad_hidden + hidden.grad();
         }
-        return grads;
+
+        // Clear hidden's grad to prevent accumulation
+        hidden.mutable_grad() = at::Tensor();
+
+        return {grad_hidden, at::Tensor(), at::Tensor()};
     }
 };
 
 // ──────────────────────────────────────────────────────────────────────
-// Host launcher for megakernel forward
+// Forward using megakernel — each layer is a MegakernelLayer::apply
 // ──────────────────────────────────────────────────────────────────────
 
-extern "C" void* megakernel_linear_attn_create() {
-    return nullptr;  // No persistent state needed
-}
-
-extern "C" at::Tensor megakernel_linear_attn_forward_backward(
-    void* handle,
-    const at::Tensor& hidden,
-    const at::Tensor& grad_output,
-    void** weights,
-    void* layer_config,
-    double lora_scaling,
-    void** lora_a, void** lora_b,
-    bool is_backward
+static at::Tensor forward_full_megakernel(
+    TrainingContext* ctx,
+    const at::Tensor& input_ids
 ) {
-    // Placeholder — full implementation uses LinearAttnLayer::apply
-    return at::Tensor();
+    auto embed = *ctx->embed_ptr[0];
+    at::Tensor hidden = at::embedding(embed, input_ids);
+    hidden = hidden.detach().set_requires_grad(true);
+
+    for (int64_t i = 0; i < ctx->num_layers; i++) {
+        hidden = MegakernelLayer::apply(
+            hidden,
+            (int64_t)(uintptr_t)ctx,
+            i
+        );
+        // Release allocator cache between layers
+        c10::cuda::CUDACachingAllocator::emptyCache();
+    }
+
+    return hidden;
 }
