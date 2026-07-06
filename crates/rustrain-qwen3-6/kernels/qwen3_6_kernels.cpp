@@ -23,12 +23,13 @@
 // ──────────────────────────────────────────────────────────────────────
 
 static at::Tensor rms_norm(const at::Tensor& input, const at::Tensor& weight, double eps) {
-    auto input_f32 = input.to(at::kFloat);
-    auto variance = input_f32.pow(2).mean(-1, true);
+    // Compute in input's dtype (BF16) to avoid 2x memory from FP32 conversion.
+    // For large sequences (2M+), FP32 conversion creates [1, 16, 2M, 256] × 4B = 32GB.
+    auto kind = input.scalar_type();
+    auto variance = input.pow(2).mean(-1, true);
     auto inv_rms = (variance + eps).rsqrt();
-    // HF Qwen3.5-MoE: output = (x * rsqrt(var+eps)) * (1.0 + weight)
-    auto normed = input_f32 * inv_rms;
-    return (normed * (1.0 + weight.to(at::kFloat))).to(input.scalar_type());
+    auto normed = input * inv_rms;
+    return normed * (1.0 + weight.to(kind));
 }
 
 static at::Tensor lora_delta(const at::Tensor& base, const at::Tensor& a, const at::Tensor& b, double scaling) {
@@ -1156,7 +1157,7 @@ static at::Tensor compute_loss(
     auto shifted_mask = target_mask.narrow(1, 1, seq_len - 1).reshape({-1});
 
     int64_t total_tokens = shifted_targets.size(0);
-    int64_t chunk_size = 32768;  // [32768, vocab] = 30GB per chunk, fewer iterations
+    int64_t chunk_size = 16384;  // [16384, vocab] = 15GB per chunk
     int64_t num_chunks = (total_tokens + chunk_size - 1) / chunk_size;
 
     auto total_count = shifted_mask.sum().clamp_min(1.0);
@@ -1282,7 +1283,7 @@ static at::Tensor mtp_compute_loss(
 
     // Chunked matmul + cross-entropy
     int64_t total_tokens = shifted_targets.size(0);
-    int64_t chunk_size = 32768;  // [32768, vocab] = 30GB per chunk, fewer iterations  // larger chunks = fewer backward passes
+    int64_t chunk_size = 16384;  // [16384, vocab] = 15GB per chunk  // larger chunks = fewer backward passes
     int64_t num_chunks = (total_tokens + chunk_size - 1) / chunk_size;
 
     auto total_loss = at::zeros({1}, at::TensorOptions().dtype(at::kFloat).device(mtp_hidden.device()));
