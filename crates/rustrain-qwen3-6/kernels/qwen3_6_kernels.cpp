@@ -634,7 +634,6 @@ struct TrainingContext {
     // Group checkpoint storage for manual sequential backward
     std::vector<at::Tensor> group_inputs;
     std::vector<at::Tensor> group_outputs;
-    std::vector<int64_t> group_layer_starts;  // which layer each checkpoint covers
 // ──────────────────────────────────────────────────────────────────────
 };
 // Forward declarations for sub-layer checkpointing
@@ -979,132 +978,185 @@ struct GroupCheckpointFunction : public torch::autograd::Function<GroupCheckpoin
     }
 };
 
-// Forward pass with selective checkpointing — only full attention layers are checkpointed.
-// Linear attention layers run with grad enabled (intermediate tensors are small —
-// CUDA kernel state is in shared memory, not HBM).
-// This reduces recompute from 40 layers to ~10 full attention layers.
+// ──────────────────────────────────────────────────────────────────────
+// FusedLayerFunction: autograd::Function for single layer forward+backward.
+// Forward: run WITH grad (PyTorch saves intermediates in graph).
+// Backward: PyTorch autograd traverses graph — NO recompute needed.
+// This eliminates checkpoint recompute (the main bottleneck).
+// Controlled by QWEN36_FUSED_LAYER=1 env var.
+// ──────────────────────────────────────────────────────────────────────
+
+struct FusedLayerFunction : public torch::autograd::Function<FusedLayerFunction> {
+    static at::Tensor forward(
+        torch::autograd::AutogradContext* ctx,
+        at::Tensor input,
+        int64_t tc_val,
+        int64_t layer_idx
+    ) {
+        ctx->saved_data["tc"] = tc_val;
+        ctx->saved_data["layer"] = layer_idx;
+        // No save_for_backward — PyTorch autograd graph handles it.
+        // Forward runs WITH grad — all intermediates saved in graph.
+        auto* tc = reinterpret_cast<TrainingContext*>(tc_val);
+        auto kind = tc->compute_type;
+
+        int64_t w_offset = 0;
+        for (int64_t j = 0; j < layer_idx; j++)
+            w_offset += weight_count_for_layer(tc->layer_configs[j]);
+        int64_t w_count = weight_count_for_layer(tc->layer_configs[layer_idx]);
+        std::vector<at::Tensor*> layer_w(tc->weight_ptrs.begin() + w_offset,
+                                         tc->weight_ptrs.begin() + w_offset + w_count);
+        int64_t lora_count = (tc->layer_configs[layer_idx].layer_type == 0) ? 4 : 3;
+        int64_t la_offset = tc->lora_layer_offset[layer_idx];
+        bool has_lora = (la_offset + lora_count) <= (int64_t)tc->lora_a.size();
+        std::vector<at::Tensor*> la(lora_count, nullptr), lb(lora_count, nullptr);
+        if (has_lora) for (int64_t k = 0; k < lora_count; k++) {
+            la[k] = &tc->lora_a[la_offset + k]; lb[k] = &tc->lora_b[la_offset + k];
+        }
+        return forward_single_layer(input, layer_w.data(), &tc->layer_configs[layer_idx],
+            kind, tc->lora_scaling, la.data(), lb.data());
+    }
+
+    static std::vector<at::Tensor> backward(
+        torch::autograd::AutogradContext* ctx,
+        std::vector<at::Tensor> grad_output
+    ) {
+        // PyTorch autograd handles backward through the graph built during forward.
+        // No recompute needed — just return grad_output as grad_input.
+        // The actual backward computation happens via PyTorch's autograd engine
+        // traversing the graph nodes (matmul backward, SDPA backward, etc.).
+        return {grad_output[0], at::Tensor(), at::Tensor()};
+    }
+};
+
+// Forward pass with fused layer (no checkpoint, no recompute).
+// Uses FusedLayerFunction per layer — PyTorch autograd handles backward.
+// QWEN36_FUSED_LAYER=1 enables this path.
+static at::Tensor forward_full_fused(
+    TrainingContext* ctx,
+    const at::Tensor& input_ids
+) {
+    auto embed = *ctx->embed_ptr[0];
+    at::Tensor hidden = at::embedding(embed, input_ids);
+    hidden = hidden.detach().set_requires_grad(true);
+
+    for (int64_t i = 0; i < ctx->num_layers; i++) {
+        hidden = FusedLayerFunction::apply(
+            hidden,
+            (int64_t)(uintptr_t)ctx,
+            i
+        );
+        // Release allocator cache between layers to prevent accumulation
+        c10::cuda::CUDACachingAllocator::emptyCache();
+    }
+
+    return hidden;
+}
+
+// Forward pass with gradient checkpointing — manual checkpoint (no autograd::Function)
+// Forward: no-grad, save group inputs (offloaded to CPU). Backward: manual recompute per group.
+// This avoids autograd engine retaining all group outputs simultaneously.
 static at::Tensor forward_full_checkpoint(
     TrainingContext* ctx,
     const at::Tensor& input_ids
 ) {
     auto embed = *ctx->embed_ptr[0];
-    at::Tensor hidden = at::embedding(embed, input_ids).detach();
+    at::Tensor hidden = at::embedding(embed, input_ids);
 
     bool use_subckpt = getenv("QWEN36_SUBCKPT");
+
     if (use_subckpt) {
         at::AutoGradMode restore(true);
-        hidden = hidden.set_requires_grad(true);
+        hidden = hidden.detach().set_requires_grad(true);
         for (int64_t i = 0; i < ctx->num_layers; i++) {
             hidden = forward_single_layer_subckpt(ctx, hidden, i);
         }
         return hidden;
     }
 
-    bool offload = getenv("QWEN36_OFFLOAD_ACTIVATIONS");
+    // Group-level manual checkpointing — no autograd::Function, no graph edges
+    int64_t gs = ctx->group_size;
+    if (gs < 1) gs = 1;
+
+    // Forward in no-grad mode
+    at::AutoGradMode no_grad(false);
+    hidden = hidden.detach();
+
     ctx->group_inputs.clear();
-    ctx->group_layer_starts.clear();
+    bool offload = getenv("QWEN36_OFFLOAD_ACTIVATIONS");
+    int64_t num_groups = (ctx->num_layers + gs - 1) / gs;
 
-    // Forward: alternate between grad-mode (linear) and no-grad (full attn)
-    bool in_grad_mode = false;
+    for (int64_t g = 0; g < num_groups; g++) {
+        int64_t start = g * gs;
+        int64_t end = std::min(start + gs, ctx->num_layers);
 
-    for (int64_t i = 0; i < ctx->num_layers; i++) {
-        bool is_full_attn = (ctx->layer_configs[i].layer_type == 0);
-        auto kind = ctx->compute_type;
-
-        int64_t w_offset = 0;
-        for (int64_t j = 0; j < i; j++)
-            w_offset += weight_count_for_layer(ctx->layer_configs[j]);
-        int64_t w_count = weight_count_for_layer(ctx->layer_configs[i]);
-        std::vector<at::Tensor*> layer_w(ctx->weight_ptrs.begin() + w_offset,
-                                         ctx->weight_ptrs.begin() + w_offset + w_count);
-        int64_t lora_count = is_full_attn ? 4 : 3;
-        int64_t la_offset = ctx->lora_layer_offset[i];
-        bool has_lora = (la_offset + lora_count) <= (int64_t)ctx->lora_a.size();
-        std::vector<at::Tensor*> la(lora_count, nullptr), lb(lora_count, nullptr);
-        if (has_lora) for (int64_t k = 0; k < lora_count; k++) {
-            la[k] = &ctx->lora_a[la_offset + k]; lb[k] = &ctx->lora_b[la_offset + k];
-        }
-
-        if (is_full_attn) {
-            // Full attention: checkpoint — no-grad forward, save input
-            at::AutoGradMode no_grad(false);
-            hidden = hidden.detach();
-
-            if (offload) {
-                ctx->group_inputs.push_back(
-                    hidden.to(at::TensorOptions().dtype(hidden.scalar_type()).device(at::kCPU).pinned_memory(true))
-                );
-            } else {
-                ctx->group_inputs.push_back(hidden.clone());
-            }
-            ctx->group_layer_starts.push_back(i);
-
-            hidden = forward_single_layer(hidden, layer_w.data(), &ctx->layer_configs[i],
-                kind, ctx->lora_scaling, la.data(), lb.data());
-
-            cudaDeviceSynchronize();
-            c10::cuda::CUDACachingAllocator::emptyCache();
-            in_grad_mode = false;
+        // Save this group's input (offload to CPU if enabled)
+        if (offload && g < num_groups - 1) {
+            ctx->group_inputs.push_back(
+                hidden.to(at::TensorOptions().dtype(hidden.scalar_type()).device(at::kCPU).pinned_memory(true))
+            );
         } else {
-            // Linear attention: grad-mode forward (keep graph for backward)
-            at::AutoGradMode grad_mode(true);
-            if (!in_grad_mode) {
-                // Reconnect to autograd graph
-                hidden = hidden.set_requires_grad(true);
-                in_grad_mode = true;
-            }
-            hidden = forward_single_layer(hidden, layer_w.data(), &ctx->layer_configs[i],
-                kind, ctx->lora_scaling, la.data(), lb.data());
+            ctx->group_inputs.push_back(hidden.clone());
+        }
+
+        hidden = forward_layer_group(ctx, hidden, start, end);
+
+        // Debug: GPU memory after each group
+        {
+            // Force release cached memory from no-grad intermediates
+            c10::cuda::CUDACachingAllocator::emptyCache();
+            size_t free, total;
+            cudaMemGetInfo(&free, &total);
+            fprintf(stderr, "[mem_debug] after group %ld/%ld: used=%.1f GB, free=%.1f GB\n",
+                (long)g, (long)num_groups, (total - free) / 1e9, free / 1e9);
         }
     }
 
-    // Ensure hidden has requires_grad for CE backward
-    if (!in_grad_mode) {
-        at::AutoGradMode restore(true);
-        hidden = hidden.set_requires_grad(true);
-    }
+    // Return hidden on GPU with requires_grad for CE backward
+    at::AutoGradMode restore(true);
+    hidden = hidden.set_requires_grad(true);
     return hidden;
 }
 
-// Manual sequential backward — selective checkpoint.
-// Full attention layers: recompute + backprop.
-// Linear attention layers: graph already exists from forward, backprop through it.
+// Manual sequential backward — recompute each group with grad, backprop, free.
+// Only 1 group's intermediate tensors exist at any time.
 static void manual_group_backward(
     TrainingContext* ctx,
     const at::Tensor& hidden_grad
 ) {
-    at::AutoGradMode grad_mode(true);
-    at::Tensor grad = hidden_grad;
+    int64_t gs = ctx->group_size;
+    if (gs < 1) gs = 1;
 
-    for (int64_t g = (int64_t)ctx->group_layer_starts.size() - 1; g >= 0; g--) {
-        int64_t layer_idx = ctx->group_layer_starts[g];
+    int64_t num_groups = (ctx->num_layers + gs - 1) / gs;
+    at::Tensor grad = hidden_grad;
+    at::AutoGradMode grad_mode(true);
+
+    for (int64_t g = num_groups - 1; g >= 0; g--) {
+        int64_t start = g * gs;
+        int64_t end = std::min(start + gs, ctx->num_layers);
 
         // Restore input from saved (CPU if offloaded)
         auto input = ctx->group_inputs[g].to(hidden_grad.device()).detach().set_requires_grad(true);
 
-        // Recompute full attention layer with grad
-        auto kind = ctx->compute_type;
-        int64_t w_offset = 0;
-        for (int64_t j = 0; j < layer_idx; j++)
-            w_offset += weight_count_for_layer(ctx->layer_configs[j]);
-        int64_t w_count = weight_count_for_layer(ctx->layer_configs[layer_idx]);
-        std::vector<at::Tensor*> layer_w(ctx->weight_ptrs.begin() + w_offset,
-                                         ctx->weight_ptrs.begin() + w_offset + w_count);
-        int64_t lora_count = 4;
-        int64_t la_offset = ctx->lora_layer_offset[layer_idx];
-        bool has_lora = (la_offset + lora_count) <= (int64_t)ctx->lora_a.size();
-        std::vector<at::Tensor*> la(lora_count, nullptr), lb(lora_count, nullptr);
-        if (has_lora) for (int64_t k = 0; k < lora_count; k++) {
-            la[k] = &ctx->lora_a[la_offset + k]; lb[k] = &ctx->lora_b[la_offset + k];
-        }
-        auto output = forward_single_layer(input, layer_w.data(), &ctx->layer_configs[layer_idx],
-            kind, ctx->lora_scaling, la.data(), lb.data());
+        // Recompute forward with grad for this group only
+        auto output = forward_layer_group(ctx, input, start, end);
 
-        // Collect LoRA params for grad computation
+        // Backprop through this group using grad() instead of backward().
+        // grad() only computes gradients for specified inputs — faster than
+        // backward() which traverses all leaf nodes.
+        // LoRA params are shared across groups, so we accumulate their gradients.
         std::vector<at::Tensor> grad_inputs = {input};
-        if (has_lora) for (int64_t k = 0; k < lora_count; k++) {
-            grad_inputs.push_back(ctx->lora_a[la_offset + k]);
-            grad_inputs.push_back(ctx->lora_b[la_offset + k]);
+        // Add LoRA params for this group's layers
+        for (int64_t l = start; l < end; l++) {
+            int64_t lora_count = (ctx->layer_configs[l].layer_type == 0) ? 4 : 3;
+            int64_t la_offset = ctx->lora_layer_offset[l];
+            bool has_lora = (la_offset + lora_count) <= (int64_t)ctx->lora_a.size();
+            if (has_lora) {
+                for (int64_t k = 0; k < lora_count; k++) {
+                    grad_inputs.push_back(ctx->lora_a[la_offset + k]);
+                    grad_inputs.push_back(ctx->lora_b[la_offset + k]);
+                }
+            }
         }
 
         auto grads = torch::autograd::grad(
@@ -1113,28 +1165,41 @@ static void manual_group_backward(
             /*allow_unused=*/true
         );
 
-        // Accumulate LoRA param gradients
-        int64_t gi = 1;
-        if (has_lora) for (int64_t k = 0; k < lora_count; k++) {
-            if (grads[gi].defined()) {
-                auto& pa = ctx->lora_a[la_offset + k];
-                if (pa.grad().defined()) pa.grad().add_(grads[gi]);
-                else pa.mutable_grad() = grads[gi].clone();
+        // Manually accumulate LoRA param gradients
+        int64_t gi = 1;  // skip input grad (index 0)
+        for (int64_t l = start; l < end; l++) {
+            int64_t lora_count = (ctx->layer_configs[l].layer_type == 0) ? 4 : 3;
+            int64_t la_offset = ctx->lora_layer_offset[l];
+            bool has_lora = (la_offset + lora_count) <= (int64_t)ctx->lora_a.size();
+            if (has_lora) {
+                for (int64_t k = 0; k < lora_count; k++) {
+                    if (grads[gi].defined()) {
+                        auto& pa = ctx->lora_a[la_offset + k];
+                        if (pa.grad().defined()) pa.grad().add_(grads[gi]);
+                        else pa.mutable_grad() = grads[gi].clone();
+                    }
+                    gi++;
+                    if (grads[gi].defined()) {
+                        auto& pb = ctx->lora_b[la_offset + k];
+                        if (pb.grad().defined()) pb.grad().add_(grads[gi]);
+                        else pb.mutable_grad() = grads[gi].clone();
+                    }
+                    gi++;
+                }
             }
-            gi++;
-            if (grads[gi].defined()) {
-                auto& pb = ctx->lora_b[la_offset + k];
-                if (pb.grad().defined()) pb.grad().add_(grads[gi]);
-                else pb.mutable_grad() = grads[gi].clone();
-            }
-            gi++;
         }
 
+        // Force release cached intermediates from this group's recompute+backward
         c10::cuda::CUDACachingAllocator::emptyCache();
+
+        // Gradient for this group's input = gradient for next group's output
         grad = grads[0];
+
+        // Free saved input to release memory
         ctx->group_inputs[g] = at::Tensor();
     }
 }
+
 // Cross-entropy loss with response-only masking — chunked with detach.
 // Detach hidden_normed so CE backward doesn't traverse main model graph.
 // Accumulate hidden_normed gradient, then backprop to hidden separately.
@@ -1484,10 +1549,13 @@ double qwen36_train_step(
         auto& input_ids = *reinterpret_cast<at::Tensor*>(input_ids_ptr);
         auto& target_mask = *reinterpret_cast<at::Tensor*>(target_mask_ptr);
 
-        // Forward (with or without checkpointing)
-        auto hidden = ctx->use_checkpoint
-            ? forward_full_checkpoint(ctx, input_ids)
-            : forward_full(ctx, input_ids);
+        // Forward (with or without checkpointing or fused layer)
+        bool use_fused = getenv("QWEN36_FUSED_LAYER");
+        auto hidden = use_fused
+            ? forward_full_fused(ctx, input_ids)
+            : ctx->use_checkpoint
+                ? forward_full_checkpoint(ctx, input_ids)
+                : forward_full(ctx, input_ids);
 
         // Debug: GPU memory after forward
         {
@@ -1528,11 +1596,12 @@ double qwen36_train_step(
                 (total - free) / 1e9, free / 1e9);
         }
 
-        // Trigger main model backward using manual sequential approach.
-        // manual_group_backward processes groups from last to first,
-        // recomputing each with grad and freeing immediately after.
-        // Only 1 group's intermediate tensors exist at any time.
-        if (hidden.grad().defined() && !ctx->group_inputs.empty() && !getenv("QWEN36_SUBCKPT")) {
+        // Trigger main model backward.
+        // FusedLayer path: autograd handles backward through graph, no recompute.
+        // Checkpoint path: manual_group_backward recomputes each group.
+        if (use_fused && hidden.grad().defined()) {
+            hidden.backward(hidden.grad());
+        } else if (hidden.grad().defined() && !ctx->group_inputs.empty() && !getenv("QWEN36_SUBCKPT")) {
             manual_group_backward(ctx, hidden.grad());
         } else if (hidden.grad().defined()) {
             // SUBCKPT path uses autograd::Function, do normal backward
