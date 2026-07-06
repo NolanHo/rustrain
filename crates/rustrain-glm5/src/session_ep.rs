@@ -406,6 +406,24 @@ pub fn train_glm5_lora_sft_ep(
     rustrain_deepseek_v4::fp8_kernel::set_memory_fraction(0.95, local_rank as i32);
     info!(rank, "set caching allocator memory fraction to 0.95");
 
+    // ── Cache expert weights on GPU (eliminates per-layer CPU→GPU transfer) ──
+    // Expert weights are frozen (LoRA targets attention only), so they can be
+    // loaded once and reused every step. This eliminates ~87GB/layer PCIe transfer.
+    info!(rank, "caching expert weights on GPU...");
+    let mut expert_weights_gpu: BTreeMap<String, Tensor> = BTreeMap::new();
+    for (name, t) in &expert_weights_cpu {
+        let gpu_t = if t.kind() == Kind::Float8e4m3fn {
+            t.to_device(device)
+        } else if t.kind() == Kind::Float {
+            t.to_device(device)
+        } else {
+            t.to_device(device).to_kind(compute_kind)
+        };
+        expert_weights_gpu.insert(name.clone(), gpu_t);
+    }
+    let expert_gpu_count = expert_weights_gpu.len();
+    info!(rank, expert_tensors_on_gpu = expert_gpu_count, "expert weights cached on GPU");
+
     // ── Training loop ──
     for step in 0..config.train.max_steps {
         // ── Forward ──
@@ -465,7 +483,7 @@ pub fn train_glm5_lora_sft_ep(
                     let shared_up_scale = weights_gpu.get(&format!("{p}.mlp.shared_experts.up_proj.weight_scale_inv"));
                     let shared_down_scale = weights_gpu.get(&format!("{p}.mlp.shared_experts.down_proj.weight_scale_inv"));
 
-                    // Build expert weight arrays from CPU-offloaded weights
+                    // Build expert weight arrays from GPU-cached weights
                     let p_str = format!("{p}.mlp.experts.");
                     let mut egw: Vec<&Tensor> = Vec::new();
                     let mut euw: Vec<&Tensor> = Vec::new();
@@ -475,12 +493,12 @@ pub fn train_glm5_lora_sft_ep(
                     let mut eds: Vec<Option<&Tensor>> = Vec::new();
                     for &global_e in &ep_shard.local_expert_indices {
                         let eg = format!("{p_str}{global_e}");
-                        egw.push(expert_weights_cpu.get(&format!("{eg}.gate_proj.weight")).unwrap());
-                        euw.push(expert_weights_cpu.get(&format!("{eg}.up_proj.weight")).unwrap());
-                        edw.push(expert_weights_cpu.get(&format!("{eg}.down_proj.weight")).unwrap());
-                        egs.push(expert_weights_cpu.get(&format!("{eg}.gate_proj.weight_scale_inv")));
-                        eus.push(expert_weights_cpu.get(&format!("{eg}.up_proj.weight_scale_inv")));
-                        eds.push(expert_weights_cpu.get(&format!("{eg}.down_proj.weight_scale_inv")));
+                        egw.push(expert_weights_gpu.get(&format!("{eg}.gate_proj.weight")).unwrap());
+                        euw.push(expert_weights_gpu.get(&format!("{eg}.up_proj.weight")).unwrap());
+                        edw.push(expert_weights_gpu.get(&format!("{eg}.down_proj.weight")).unwrap());
+                        egs.push(expert_weights_gpu.get(&format!("{eg}.gate_proj.weight_scale_inv")));
+                        eus.push(expert_weights_gpu.get(&format!("{eg}.up_proj.weight_scale_inv")));
+                        eds.push(expert_weights_gpu.get(&format!("{eg}.down_proj.weight_scale_inv")));
                     }
 
                     let partial_mlp = rustrain_deepseek_v4::fp8_kernel::glm5_layer_forward_cpp(
@@ -721,12 +739,12 @@ pub fn train_glm5_lora_sft_ep(
                     let mut eds: Vec<Option<&Tensor>> = Vec::new();
                     for &global_e in &ep_shard.local_expert_indices {
                         let eg = format!("{p_str}{global_e}");
-                        egw.push(expert_weights_cpu.get(&format!("{eg}.gate_proj.weight")).unwrap());
-                        euw.push(expert_weights_cpu.get(&format!("{eg}.up_proj.weight")).unwrap());
-                        edw.push(expert_weights_cpu.get(&format!("{eg}.down_proj.weight")).unwrap());
-                        egs.push(expert_weights_cpu.get(&format!("{eg}.gate_proj.weight_scale_inv")));
-                        eus.push(expert_weights_cpu.get(&format!("{eg}.up_proj.weight_scale_inv")));
-                        eds.push(expert_weights_cpu.get(&format!("{eg}.down_proj.weight_scale_inv")));
+                        egw.push(expert_weights_gpu.get(&format!("{eg}.gate_proj.weight")).unwrap());
+                        euw.push(expert_weights_gpu.get(&format!("{eg}.up_proj.weight")).unwrap());
+                        edw.push(expert_weights_gpu.get(&format!("{eg}.down_proj.weight")).unwrap());
+                        egs.push(expert_weights_gpu.get(&format!("{eg}.gate_proj.weight_scale_inv")));
+                        eus.push(expert_weights_gpu.get(&format!("{eg}.up_proj.weight_scale_inv")));
+                        eds.push(expert_weights_gpu.get(&format!("{eg}.down_proj.weight_scale_inv")));
                     }
                     let partial_mlp = rustrain_deepseek_v4::fp8_kernel::glm5_moe_layer_cpp(
                         &mlp_input,
@@ -804,44 +822,25 @@ pub fn train_glm5_lora_sft_ep(
                         continue;
                     }
                     let eg = format!("{p}.mlp.experts.{global_e}");
-                    // Expert offloading: prefetch weights from CPU to GPU on demand.
-                    // Only ~1-3 experts needed per layer; rest stay on CPU (saves ~87 GB).
-                    let gate_w_cpu = expert_weights_cpu
-                        .get(&format!("{eg}.gate_proj.weight"))
+                    // Expert weights from GPU cache (no CPU→GPU transfer)
+                    let gate_w = expert_weights_gpu.get(&format!("{eg}.gate_proj.weight"))
                         .with_context(|| format!("expert weight not found: {eg}.gate_proj.weight"))?;
-                    let gate_w_gpu = gate_w_cpu.to_device(device);
-                    let gate_w = keep_fp8(&gate_w_gpu, compute_kind);
-
-                    let up_w_cpu = expert_weights_cpu
-                        .get(&format!("{eg}.up_proj.weight"))
+                    let up_w = expert_weights_gpu.get(&format!("{eg}.up_proj.weight"))
                         .with_context(|| format!("expert weight not found: {eg}.up_proj.weight"))?;
-                    let up_w_gpu = up_w_cpu.to_device(device);
-                    let up_w = keep_fp8(&up_w_gpu, compute_kind);
-
-                    let down_w_cpu = expert_weights_cpu
-                        .get(&format!("{eg}.down_proj.weight"))
+                    let down_w = expert_weights_gpu.get(&format!("{eg}.down_proj.weight"))
                         .with_context(|| format!("expert weight not found: {eg}.down_proj.weight"))?;
-                    let down_w_gpu = down_w_cpu.to_device(device);
-                    let down_w = keep_fp8(&down_w_gpu, compute_kind);
-
-                    let gate_w_scale = expert_weights_cpu
-                        .get(&format!("{eg}.gate_proj.weight_scale_inv"))
-                        .map(|t| t.to_device(device));
-                    let up_w_scale = expert_weights_cpu
-                        .get(&format!("{eg}.up_proj.weight_scale_inv"))
-                        .map(|t| t.to_device(device));
-                    let down_w_scale = expert_weights_cpu
-                        .get(&format!("{eg}.down_proj.weight_scale_inv"))
-                        .map(|t| t.to_device(device));
+                    let gate_w_scale = expert_weights_gpu.get(&format!("{eg}.gate_proj.weight_scale_inv"));
+                    let up_w_scale = expert_weights_gpu.get(&format!("{eg}.up_proj.weight_scale_inv"));
+                    let down_w_scale = expert_weights_gpu.get(&format!("{eg}.down_proj.weight_scale_inv"));
                     let expert_out = if use_cpp_mlp {
                         rustrain_deepseek_v4::fp8_kernel::glm5_mlp_fp8_cpp(
-                            &flat_input, &gate_w, &up_w, &down_w,
-                            gate_w_scale.as_ref(), up_w_scale.as_ref(), down_w_scale.as_ref(),
+                            &flat_input, gate_w, up_w, down_w,
+                            gate_w_scale, up_w_scale, down_w_scale,
                         )?
                     } else {
                         glm5_mlp_fp8(
-                            &flat_input, &gate_w, &up_w, &down_w,
-                            gate_w_scale.as_ref(), up_w_scale.as_ref(), down_w_scale.as_ref(),
+                            &flat_input, gate_w, up_w, down_w,
+                            gate_w_scale, up_w_scale, down_w_scale,
                         )
                     };
                     // Find which position (0..k) this expert was selected at, and use that weight
@@ -972,15 +971,16 @@ pub fn train_glm5_lora_sft_ep(
         rustrain_deepseek_v4::fp8_kernel::clear_checkpoint_registry();
 
         // ── Warmup: empty cache after first step ──
-        // Step 0 populates the caching allocator's pool. Emptying the free pool
-        // here releases intermediate tensors while keeping the cached blocks.
-        // Steps 1+ will reuse these pre-warmed blocks → no cudaMalloc overhead.
-        if step == 0 {
-            rustrain_deepseek_v4::fp8_kernel::empty_cache();
-            info!(rank, "cache warmed up after step 0, emptied free pool");
-        }
+        // Empty cache every step to release intermediate tensors and prevent fragmentation.
+        // (Previously only done on step 0 — this caused memory pressure on later steps.)
+        rustrain_deepseek_v4::fp8_kernel::empty_cache();
 
         // ── LoRA gradient all-reduce ──
+        // Note: all_reduce_async was attempted but caused undefined tensor issues
+        // because the output tensor on comm_stream isn't visible to compute stream
+        // without proper synchronization. Using sync all_reduce for correctness.
+        // The MoE output all-reduce (line 547) uses async because it's on the
+        // critical path of the layer loop; gradient sync is off the critical path.
         let synced_grads: Vec<Tensor> = if world_size > 1 {
             let vars = registry.var_store.trainable_variables();
             vars.iter()
