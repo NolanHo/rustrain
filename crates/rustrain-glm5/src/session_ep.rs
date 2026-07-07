@@ -420,11 +420,20 @@ pub fn train_glm5_lora_sft_ep(
     let expert_gpu_count = expert_weights_gpu.len();
     info!(rank, expert_tensors_on_gpu = expert_gpu_count, "expert weights cached on GPU (FP8 pre-dequanted)");
 
+    // ── Pre-extract constant tensors (avoid per-step BTreeMap lookups) ──
+    let embed_weight = tensor(&weights_gpu, "model.embed_tokens.weight")?.to_kind(compute_kind);
+    let final_norm_weight = tensor(&weights_gpu, "model.norm.weight")?.to_kind(compute_kind);
+    let lm_head_weight = if runtime_config.tie_word_embeddings {
+        embed_weight.shallow_clone()
+    } else {
+        tensor(&weights_gpu, "lm_head.weight")?.to_kind(compute_kind)
+    };
+
     // ── Training loop ──
     for step in 0..config.train.max_steps {
         // ── Forward ──
-        let embed = tensor(&weights_gpu, "model.embed_tokens.weight")?.to_kind(compute_kind);
-        let mut hidden = Tensor::embedding(&embed, &train_batch.input_ids, -1, false, false);
+        let embed = &embed_weight;
+        let mut hidden = Tensor::embedding(embed, &train_batch.input_ids, -1, false, false);
         if hidden.kind() != compute_kind {
             hidden = hidden.to_kind(compute_kind);
         }
@@ -903,17 +912,12 @@ pub fn train_glm5_lora_sft_ep(
         }
 
         // ── Final norm + lm_head ──
-        let final_norm = tensor(&weights_gpu, "model.norm.weight")?.to_kind(compute_kind);
         let normed = if use_cpp_attention {
-            rustrain_deepseek_v4::fp8_kernel::glm5_rms_norm_cpp(&hidden, &final_norm, runtime_config.rms_norm_eps)?
+            rustrain_deepseek_v4::fp8_kernel::glm5_rms_norm_cpp(&hidden, &final_norm_weight, runtime_config.rms_norm_eps)?
         } else {
-            rms_norm(&hidden, &final_norm, runtime_config.rms_norm_eps)
+            rms_norm(&hidden, &final_norm_weight, runtime_config.rms_norm_eps)
         };
-        let lm_head = if runtime_config.tie_word_embeddings {
-            embed.shallow_clone()
-        } else {
-            tensor(&weights_gpu, "lm_head.weight")?.to_kind(compute_kind)
-        };
+        let lm_head = &lm_head_weight;
 
         // ── Chunked SFT Loss ──
         let seq_len = train_batch.input_ids.size()[1];
@@ -922,21 +926,21 @@ pub fn train_glm5_lora_sft_ep(
         let loss = if use_cpp_loss {
             // C++ cross-entropy loss (single call, chunked internally)
             rustrain_deepseek_v4::fp8_kernel::glm5_cross_entropy_loss_cpp(
-                &normed, &lm_head, &train_batch.input_ids, &train_batch.target_mask,
-                seq_len as i32, vocab as i32, 256, local_rank as i32,
+                &normed, lm_head, &train_batch.input_ids, &train_batch.target_mask,
+                seq_len as i32, vocab as i32, 4096, local_rank as i32,
             )?
         } else {
             // Rust chunked cross-entropy loss
             let shifted_targets = train_batch.input_ids.narrow(1, 1, seq_len - 1);
             let shifted_mask = train_batch.target_mask.narrow(1, 1, seq_len - 1).to_kind(Kind::Float);
             let total_mask = shifted_mask.sum(Kind::Float);
-            let ce_chunk_size = 256;
+            let ce_chunk_size = 4096;
             let mut loss_acc = Tensor::zeros([], (Kind::Float, device));
             for start in (0..seq_len - 1).step_by(ce_chunk_size as usize) {
                 let end = (start + ce_chunk_size as i64).min(seq_len - 1);
                 let chunk_len = end - start;
                 let normed_chunk = normed.narrow(1, start, chunk_len);
-                let logits_chunk = normed_chunk.linear::<&Tensor>(&lm_head, None);
+                let logits_chunk = normed_chunk.linear::<&Tensor>(lm_head, None);
                 let log_probs = logits_chunk.reshape([-1, vocab]).log_softmax(-1, Kind::Float);
                 let targets_chunk = shifted_targets.narrow(1, start, chunk_len).reshape([-1]);
                 let mask_chunk = shifted_mask.narrow(1, start, chunk_len);
