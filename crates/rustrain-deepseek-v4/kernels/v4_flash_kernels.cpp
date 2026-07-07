@@ -12,6 +12,7 @@
 #include <torch/csrc/autograd/custom_function.h>
 #include <torch/csrc/autograd/autograd.h>
 #include <cuda_runtime_api.h>
+#include <dlfcn.h>
 #include <cstdio>
 #include <cmath>
 #include <vector>
@@ -35,6 +36,86 @@ extern "C" {
 }
 
 // ──────────────────────────────────────────────────────────────────────
+// Forward declarations
+// ──────────────────────────────────────────────────────────────────────
+
+static at::Tensor rms_norm(const at::Tensor& input, const at::Tensor& weight, double eps);
+
+// ──────────────────────────────────────────────────────────────────────
+// Tilelang fused kernel loading (dlopen)
+// ──────────────────────────────────────────────────────────────────────
+
+// Tilelang compiles Python DSL → .so with C entry points.
+// We dlopen at runtime; if not found, fall back to ATen ops.
+
+struct TilelangKernels {
+    // fused_rmsnorm_matmul(X [M,K], W_norm [K], W_matmul [N,K], Y [M,N], M, N, K, eps)
+    void (*fused_rmsnorm_matmul)(void*, void*, void*, void*, int64_t, int64_t, int64_t, double);
+    // fused_swiglu(gate [M,I], up [M,I], out [M,I], M, I, limit)
+    void (*fused_swiglu)(void*, void*, void*, int64_t, int64_t, double);
+};
+
+static TilelangKernels* g_tilelang = nullptr;
+
+static void load_tilelang_kernels() {
+    if (g_tilelang) return;
+    void* handle = dlopen("libtilelang_fused.so", RTLD_LAZY | RTLD_NOLOAD);
+    if (!handle) handle = dlopen("libtilelang_fused.so", RTLD_LAZY);
+    if (!handle) return;
+
+    auto* k = new TilelangKernels{};
+    auto load_sym = [&](const char* name, auto* fn_ptr) {
+        void* p = dlsym(handle, name);
+        if (p) *(void**)fn_ptr = p;
+    };
+    load_sym("tilelang_fused_rmsnorm_matmul", &k->fused_rmsnorm_matmul);
+    load_sym("tilelang_fused_swiglu", &k->fused_swiglu);
+    g_tilelang = k;
+    fprintf(stderr, "[v4_tilelang] loaded: rmsnorm_matmul=%s swiglu=%s\n",
+        k->fused_rmsnorm_matmul ? "yes" : "no",
+        k->fused_swiglu ? "yes" : "no");
+}
+
+/// Fused RMSNorm + Matmul via Tilelang (falls back to ATen if not available)
+static at::Tensor fused_rmsnorm_matmul(
+    const at::Tensor& input, const at::Tensor& norm_w, const at::Tensor& matmul_w,
+    double eps)
+{
+    if (g_tilelang && g_tilelang->fused_rmsnorm_matmul) {
+        int64_t M = input.size(0);
+        int64_t K = input.size(1);
+        int64_t N = matmul_w.size(0);
+        auto output = at::zeros({M, N}, input.options());
+        g_tilelang->fused_rmsnorm_matmul(
+            input.data_ptr(), norm_w.data_ptr(), matmul_w.data_ptr(),
+            output.data_ptr(), M, N, K, eps);
+        return output;
+    }
+    // Fallback: ATen
+    auto normed = rms_norm(input, norm_w, eps);
+    return at::linear(normed, matmul_w);
+}
+
+/// Fused SwiGLU via Tilelang (falls back to ATen if not available)
+static at::Tensor fused_swiglu_op(
+    const at::Tensor& gate_out, const at::Tensor& up_out, double limit)
+{
+    if (g_tilelang && g_tilelang->fused_swiglu) {
+        int64_t M = gate_out.size(0);
+        int64_t I = gate_out.size(1);
+        auto output = at::zeros({M, I}, gate_out.options());
+        g_tilelang->fused_swiglu(
+            gate_out.data_ptr(), up_out.data_ptr(), output.data_ptr(),
+            M, I, limit);
+        return output;
+    }
+    // Fallback: ATen
+    auto inter = at::silu(gate_out) * up_out;
+    if (limit > 0.0) inter = inter.clamp(-limit, limit);
+    return inter;
+}
+
+// ──────────────────────────────────────────────────────────────────────
 // Helpers
 // ──────────────────────────────────────────────────────────────────────
 
@@ -53,10 +134,10 @@ static at::Tensor lora_delta(const at::Tensor& base, const at::Tensor& a, const 
 
 static at::Tensor v4_swiglu(const at::Tensor& input, const at::Tensor& w1, const at::Tensor& w2,
                             const at::Tensor& w3, double limit) {
-    auto gate = at::silu(at::matmul(input, w1.t()));
+    auto gate = at::matmul(input, w1.t());
     auto up = at::matmul(input, w3.t());
-    auto inter = gate * up;
-    if (limit > 0.0) inter = inter.clamp(-limit, limit);
+    // Fused silu * clamp via Tilelang (falls back to ATen)
+    auto inter = fused_swiglu_op(gate, up, limit);
     return at::matmul(inter, w2.t());
 }
 
@@ -547,16 +628,22 @@ static std::pair<at::Tensor, at::Tensor> forward_single_layer_split(
         h = compress_seq(hidden, cfg.compress_ratio);
     }
 
-    auto attn_input = rms_norm(h, *w[0], cfg.rms_eps);
+    // Fused RMSNorm + Q projection (Tilelang if available, else ATen fallback)
+    auto attn_input = fused_rmsnorm_matmul(h, *w[0], *w[2], cfg.rms_eps);
 
-    auto wq_a = *w[2], wq_b = *w[3], wkv = *w[4], wo_a = *w[5], wo_b = *w[6];
+    auto wq_a = *w[2];
+    auto wq_b = *w[3], wkv = *w[4], wo_a = *w[5], wo_b = *w[6];
     if (cfg.has_lora) {
+        // LoRA modifies the projection weights — can't use fused path for LoRA layers
+        // Re-do with separate rms_norm + lora_delta + safe_linear
+        attn_input = rms_norm(h, *w[0], cfg.rms_eps);
         int64_t la_off = ctx->lora_layer_offset[layer_idx];
-        wq_a = lora_delta(wq_a, ctx->lora_a[la_off], ctx->lora_b[la_off], ctx->lora_scaling);
-        wq_b = lora_delta(wq_b, ctx->lora_a[la_off+1], ctx->lora_b[la_off+1], ctx->lora_scaling);
-        wkv = lora_delta(wkv, ctx->lora_a[la_off+2], ctx->lora_b[la_off+2], ctx->lora_scaling);
-        wo_a = lora_delta(wo_a, ctx->lora_a[la_off+3], ctx->lora_b[la_off+3], ctx->lora_scaling);
-        wo_b = lora_delta(wo_b, ctx->lora_a[la_off+4], ctx->lora_b[la_off+4], ctx->lora_scaling);
+        wq_a = lora_delta(*w[2], ctx->lora_a[la_off], ctx->lora_b[la_off], ctx->lora_scaling);
+        wq_b = lora_delta(*w[3], ctx->lora_a[la_off+1], ctx->lora_b[la_off+1], ctx->lora_scaling);
+        wkv = lora_delta(*w[4], ctx->lora_a[la_off+2], ctx->lora_b[la_off+2], ctx->lora_scaling);
+        wo_a = lora_delta(*w[5], ctx->lora_a[la_off+3], ctx->lora_b[la_off+3], ctx->lora_scaling);
+        wo_b = lora_delta(*w[6], ctx->lora_a[la_off+4], ctx->lora_b[la_off+4], ctx->lora_scaling);
+        attn_input = safe_linear(attn_input, wq_a, std::nullopt);
     }
 
     at::Tensor** hc_ptr = nullptr;
@@ -719,6 +806,7 @@ void* v4_create_training_context(
     void* embed_for_mtp_ptr
 ) {
     try {
+        load_tilelang_kernels();  // Load Tilelang fused kernels if available
         auto* ctx = new TrainingContext();
         ctx->compute_type = static_cast<at::ScalarType>(compute_type);
         ctx->lr = lr; ctx->beta1 = beta1; ctx->beta2 = beta2; ctx->eps = eps;

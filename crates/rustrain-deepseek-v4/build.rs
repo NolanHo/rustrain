@@ -270,4 +270,24 @@ fn main() {
             println!("cargo:warning=Failed to compile V4 Flash kernel, V4 C++ path disabled");
         }
     }
+
+    // ── Compile Tilelang fused kernels (requires nvcc + Python tilelang) ──
+    // This step is optional: if nvcc is not available, the C++ code falls back to ATen ops.
+    let tilelang_script = "../../scripts/tilelang_fused_kernels.py";
+    if std::path::Path::new(tilelang_script).exists() {
+        let tilelang_status = Command::new("python3")
+            .arg(tilelang_script)
+            .arg(&out_dir)
+            .status();
+        match tilelang_status {
+            Ok(s) if s.success() => {
+                println!("cargo:rustc-link-search=native={out_dir}");
+                println!("cargo:rustc-link-lib=dylib=tilelang_fused");
+                println!("cargo:warning=Tilelang fused kernels compiled");
+            }
+            _ => {
+                println!("cargo:warning=Tilelang compilation failed (nvcc not available?), using ATen fallback");
+            }
+        }
+    }
 }
