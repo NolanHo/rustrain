@@ -554,16 +554,17 @@ pub fn train_glm5_lora_sft_ep(
                         &mut cpp_layer_state,
                     )?;
 
-                    // All-reduce MoE output — ASYNC: launch on comm_stream, don't block CPU
+                    // All-reduce MoE output — preserve autograd graph for LoRA backward
+                    // Trick: hidden = partial_mlp + (reduced - partial_mlp).detach()
+                    // Forward value = reduced (correct), backward gradient flows to partial_mlp (coef 1)
+                    // LoRA gradient all-reduce later averages across ranks (÷ world_size)
                     let mlp_kind = partial_mlp.kind();
                     if world_size > 1 {
-                        let pd = no_grad(|| partial_mlp.shallow_clone()).detach();
-                        let (reduced, event) = nccl_comm.as_ref().unwrap().all_reduce_async(&pd)?;
-                        let full = no_grad(|| (&reduced / (world_size as f64)).to_kind(mlp_kind)).detach();
-                        let output = full.set_requires_grad(true);
-                        // Store (output, event) — next layer waits on event before using output.
-                        // hidden will be set from pending_allreduce at the start of next iteration.
-                        pending_allreduce = Some((output, event));
+                        let reduced = nccl_comm.as_ref().unwrap().all_reduce(&partial_mlp)
+                            .unwrap_or_else(|_| partial_mlp.shallow_clone());
+                        let full = (&reduced / (world_size as f64)).to_kind(mlp_kind);
+                        // identity trick: forward = full, backward grad → partial_mlp (coef 1)
+                        hidden = &partial_mlp + &(&full - &partial_mlp).detach();
                     } else {
                         hidden = partial_mlp.shallow_clone();
                     }
@@ -1018,8 +1019,10 @@ pub fn train_glm5_lora_sft_ep(
 
         // ── Adam optimizer step ──
         let mut current_vars = registry.var_store.trainable_variables();
+        // Disable requires_grad during optimizer step (C++ uses in-place ops which
+        // fail on leaf Variables with requires_grad=true)
+        for v in &current_vars { v.set_requires_grad(false); }
         if use_cpp_optimizer {
-            // C++ Adam: build grad array, call v4_adam_step
             let grads: Vec<Tensor> = current_vars.iter().enumerate().map(|(i, _var)| {
                 if world_size > 1 {
                     synced_grads[i].shallow_clone()
@@ -1057,6 +1060,8 @@ pub fn train_glm5_lora_sft_ep(
                 var.zero_grad();
             }
         }
+        // Re-enable requires_grad for next forward pass
+        for v in &current_vars { v.set_requires_grad(true); }
     }
 
     // ── Save LoRA adapter ──
