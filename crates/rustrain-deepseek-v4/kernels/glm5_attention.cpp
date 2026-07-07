@@ -71,8 +71,18 @@ static at::Tensor rms_norm_with_bias(const at::Tensor& input, const at::Tensor& 
 }
 
 // ── Helper: RoPE cos/sin ──
+// ── RoPE cache: avoid recomputing cos/sin every layer (78 layers × 2 calls/layer = 156×/step) ──
+#include <map>
+#include <tuple>
+static std::map<std::tuple<int64_t, int64_t, double, int>, std::pair<at::Tensor, at::Tensor>> g_rope_cache;
+
 static std::pair<at::Tensor, at::Tensor> rope_cos_sin(int64_t seq_len, int64_t head_dim,
                                                        double theta, int device_id) {
+    auto key = std::make_tuple(seq_len, head_dim, theta, device_id);
+    auto it = g_rope_cache.find(key);
+    if (it != g_rope_cache.end()) {
+        return it->second;
+    }
     auto device = at::Device(at::Device::Type::CUDA, device_id);
     auto positions = at::arange(seq_len, at::TensorOptions().dtype(at::kFloat).device(device));
     auto dim_indices = at::arange(head_dim / 2, at::TensorOptions().dtype(at::kFloat).device(device));
@@ -83,7 +93,9 @@ static std::pair<at::Tensor, at::Tensor> rope_cos_sin(int64_t seq_len, int64_t h
     auto sin = at::sin(freqs);
     cos = at::cat({cos, cos}, -1);
     sin = at::cat({sin, sin}, -1);
-    return {cos, sin};
+    auto result = std::make_pair(cos, sin);
+    g_rope_cache[key] = result;
+    return result;
 }
 
 // ── Helper: apply rotary interleave ──
@@ -391,25 +403,34 @@ void* v4_glm5_dsa_attention(
 
             int64_t attn_chunk = (seq > 2048) ? 512 : seq;
             if (attn_chunk >= seq) {
-                // Small seq: single pass
+                // Small seq: single pass — optimized bias construction
+                // Start with bias_per_key broadcast to [B, nh, S, S]
+                auto bias = bias_per_key.unsqueeze(2)
+                            .expand({batch, nh, seq, seq}, /*implicit=*/false)
+                            .to(compute_dtype).clone();
+
+                // Mask out positions not in topk OR future positions (causal)
+                // Build mask: 1 where attended, 0 where masked
                 auto sparse_mask = at::zeros({batch, nh, seq, seq},
                     at::TensorOptions().dtype(compute_dtype).device(device));
                 auto ones = at::ones({batch, nh, seq, actual_topk},
                     at::TensorOptions().dtype(compute_dtype).device(device));
                 sparse_mask.scatter_(-1, topk_indices, ones);
 
+                // Causal: position j > i is masked (future)
+                // Combined: attend only if (in topk) AND (not future)
                 auto causal_mask = at::ones({seq, seq},
                     at::TensorOptions().dtype(at::kBool).device(device)).triu(1);
                 auto causal_f = causal_mask.unsqueeze(0).unsqueeze(0)
                                 .expand({batch, nh, seq, seq}, /*implicit=*/false)
                                 .to(compute_dtype);
                 auto combined = sparse_mask * (1.0 - causal_f);
-                auto bias = bias_per_key.unsqueeze(2)
-                            .expand({batch, nh, seq, seq}, /*implicit=*/false)
-                            .to(compute_dtype);
-                // Use masked_fill to avoid 0 * -inf = NaN
-                auto mask_bool = combined.eq(0.0);
-                bias = bias.masked_fill(mask_bool, -std::numeric_limits<double>::infinity());
+                // Set -inf where combined == 0 (not attended)
+                bias.masked_fill_(combined.eq(0.0), -std::numeric_limits<double>::infinity());
+
+                // Free intermediates
+                sparse_mask = at::Tensor(); causal_f = at::Tensor(); combined = at::Tensor();
+                c10::cuda::CUDACachingAllocator::emptyCache();
 
                 context = at::scaled_dot_product_attention(
                     q_full, k_full, v, bias, 0.0, false, attn_scale);
@@ -635,17 +656,32 @@ void* v4_glm5_moe_layer(
         int64_t k = topk;
         int64_t n_experts = n_routed_experts;
 
-        // ── Shared expert ──
+        // ── Shared expert: merge gate+up into single matmul ──
         auto& sg = *reinterpret_cast<at::Tensor*>(shared_gate);
         auto& su = *reinterpret_cast<at::Tensor*>(shared_up);
         auto& sd = *reinterpret_cast<at::Tensor*>(shared_down);
         auto sg_scale = shared_gate_scale ? std::optional<at::Tensor>(*reinterpret_cast<at::Tensor*>(shared_gate_scale)) : std::nullopt;
         auto su_scale = shared_up_scale ? std::optional<at::Tensor>(*reinterpret_cast<at::Tensor*>(shared_up_scale)) : std::nullopt;
         auto sd_scale = shared_down_scale ? std::optional<at::Tensor>(*reinterpret_cast<at::Tensor*>(shared_down_scale)) : std::nullopt;
-        auto gate_out = safe_linear(mlp_input, sg, sg_scale);
-        auto up_out = safe_linear(mlp_input, su, su_scale);
-        auto activated = at::silu(gate_out) * up_out;
-        auto shared_output = safe_linear(activated, sd, sd_scale);
+        // If both gate and up have same shape and no FP8, concatenate weights for single matmul
+        int64_t inter_dim = sg.size(0);
+        auto shared_output = [&]() -> at::Tensor {
+            if (sg_scale.has_value() || su_scale.has_value()) {
+                // FP8 path: can't concatenate FP8 weights, use separate calls
+                auto gate_out = safe_linear(mlp_input, sg, sg_scale);
+                auto up_out = safe_linear(mlp_input, su, su_scale);
+                auto activated = at::silu(gate_out) * up_out;
+                return safe_linear(activated, sd, sd_scale);
+            } else {
+                // BF16 path: merge gate+up weights → single matmul
+                auto gate_up_w = at::cat({sg, su}, 0);  // [2*inter, hidden]
+                auto gu = at::linear(mlp_input, gate_up_w);  // [B, S, 2*inter]
+                auto gate_part = gu.narrow(-1, 0, inter_dim);
+                auto up_part = gu.narrow(-1, inter_dim, inter_dim);
+                auto activated = at::silu(gate_part) * up_part;
+                return safe_linear(activated, sd, sd_scale);
+            }
+        }();
 
         // ── Router: sigmoid + topk ──
         auto& gate_w = *reinterpret_cast<at::Tensor*>(gate_weight);
@@ -941,10 +977,20 @@ void* v4_glm5_layer_forward(
             auto sg_scale = shared_gate_scale ? std::optional<at::Tensor>(*reinterpret_cast<at::Tensor*>(shared_gate_scale)) : std::nullopt;
             auto su_scale = shared_up_scale ? std::optional<at::Tensor>(*reinterpret_cast<at::Tensor*>(shared_up_scale)) : std::nullopt;
             auto sd_scale = shared_down_scale ? std::optional<at::Tensor>(*reinterpret_cast<at::Tensor*>(shared_down_scale)) : std::nullopt;
-            auto sgo = safe_linear(mlp_input, sg, sg_scale);
-            auto suo = safe_linear(mlp_input, su, su_scale);
-            auto sa = at::silu(sgo) * suo;
-            auto shared_out = safe_linear(sa, sd, sd_scale);
+            // Shared expert: merge gate+up for BF16 path
+            int64_t s_inter = sg.size(0);
+            auto shared_out = [&]() -> at::Tensor {
+                if (sg_scale.has_value() || su_scale.has_value()) {
+                    auto sgo = safe_linear(mlp_input, sg, sg_scale);
+                    auto suo = safe_linear(mlp_input, su, su_scale);
+                    return safe_linear(at::silu(sgo) * suo, sd, sd_scale);
+                } else {
+                    auto gate_up_w = at::cat({sg, su}, 0);
+                    auto gu = at::linear(mlp_input, gate_up_w);
+                    auto activated = at::silu(gu.narrow(-1, 0, s_inter)) * gu.narrow(-1, s_inter, s_inter);
+                    return safe_linear(activated, sd, sd_scale);
+                }
+            }();
 
             auto router_logits = at::linear(mlp_input, gate_w.to(dtype));
             auto scores = at::sigmoid(router_logits);

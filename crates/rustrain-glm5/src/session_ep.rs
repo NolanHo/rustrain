@@ -271,7 +271,7 @@ pub fn train_glm5_lora_sft_ep(
     );
 
     // ── Create LoRA registry ──
-    let registry = Glm5LoraRegistry::new(&weights_gpu, lora_config, device)?;
+    let mut registry = Glm5LoraRegistry::new(&weights_gpu, lora_config, device)?;
     let trainable_count = registry.var_store.trainable_variables().len();
     info!(
         rank,
@@ -279,35 +279,7 @@ pub fn train_glm5_lora_sft_ep(
         "LoRA adapters created"
     );
 
-    // ── Barrier: wait for all ranks to finish loading ──
-    let barrier_dir = run_paths.root.join("barrier");
-    // Use a fixed barrier path derived from output_dir (same for all ranks)
-    // instead of timestamped run_paths.root which can differ by 1 second per rank
-    let barrier_dir = config.run.base_dir.join(&config.run.name).join("barrier");
-    std::fs::create_dir_all(&barrier_dir)?;
-    let ready_file = barrier_dir.join(format!("rank_{rank}.ready"));
-    std::fs::write(&ready_file, b"ready")?;
-    info!(rank, "waiting at barrier for all ranks to load weights");
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(600);
-    loop {
-        let ready_count = std::fs::read_dir(&barrier_dir)
-            .map(|d| {
-                d.filter_map(|e| e.ok())
-                    .filter(|e| e.file_name().to_string_lossy().starts_with("rank_"))
-                    .count()
-            })
-            .unwrap_or(0);
-        if ready_count >= world_size {
-            break;
-        }
-        if std::time::Instant::now() > deadline {
-            bail!("barrier timeout: only {ready_count}/{world_size} ranks ready");
-        }
-        std::thread::sleep(std::time::Duration::from_secs(1));
-    }
-    info!(rank, "all ranks ready, starting training");
-
-    // ── Create persistent NCCL communicator ──
+    // ── Create persistent NCCL communicator FIRST (before barrier) ──
     let nccl_comm = if world_size > 1 {
         let comm_dir = config.run.base_dir.join(&config.run.name).join("nccl-comm");
         let comm = NcclPersistentComm::new(&comm_dir)?;
@@ -316,6 +288,16 @@ pub fn train_glm5_lora_sft_ep(
     } else {
         None
     };
+
+    // ── Barrier: NCCL all-reduce (fast, no file system polling) ──
+    if world_size > 1 {
+        info!(rank, "NCCL barrier: waiting for all ranks");
+        let barrier_tensor = Tensor::zeros([], (Kind::Float, device));
+        let _ = nccl_comm.as_ref().unwrap().all_reduce(&barrier_tensor);
+        info!(rank, "all ranks ready (NCCL barrier passed)");
+    } else {
+        info!(rank, "single rank, no barrier needed");
+    }
 
     // ── SFT data ──
     let tokenizer = tokenizers::Tokenizer::from_file(model_path.join("tokenizer.json"))
@@ -470,7 +452,7 @@ pub fn train_glm5_lora_sft_ep(
 
                 // Load attention weights (with LoRA applied)
                 let attn_weights = Glm5AttentionWeights::load_with_kind(&weights_gpu, layer, compute_kind)?;
-                let lora_attn = lora_attention_weights(&attn_weights, layer, &registry);
+                let lora_attn = lora_attention_weights(&attn_weights, layer, &mut registry);
 
                 // Get indexer weights
                 let source = runtime_config.indexer_source_layer(layer);
@@ -634,7 +616,7 @@ pub fn train_glm5_lora_sft_ep(
 
             // Load attention weights
             let attn_weights = Glm5AttentionWeights::load_with_kind(&weights_gpu, layer, compute_kind)?;
-            let lora_attn = lora_attention_weights(&attn_weights, layer, &registry);
+            let lora_attn = lora_attention_weights(&attn_weights, layer, &mut registry);
 
             // Get indexer weights (from source layer for IndexShare)
             let source = runtime_config.indexer_source_layer(layer);
@@ -1062,6 +1044,8 @@ pub fn train_glm5_lora_sft_ep(
         }
         // Re-enable requires_grad for next forward pass
         for v in &current_vars { v.set_requires_grad(true); }
+        // Invalidate LoRA delta cache (params changed)
+        registry.invalidate_delta_cache();
     }
 
     // ── Save LoRA adapter ──

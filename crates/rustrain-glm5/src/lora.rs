@@ -48,6 +48,11 @@ pub struct Glm5LoraRegistry {
     pub adapters: BTreeMap<(usize, Glm5LoraTargetModule), (Tensor, Tensor)>,
     pub config: Glm5LoraConfig,
     pub var_store: nn::VarStore,
+    /// Cached LoRA deltas: (layer, module) → delta tensor (B@A * scale)
+    /// Invalidated after Adam step, recomputed on next lora_attention_weights call.
+    pub delta_cache: BTreeMap<(usize, Glm5LoraTargetModule), Option<Tensor>>,
+    /// Cached dequanted base weights (frozen, computed once)
+    pub base_cache: BTreeMap<(usize, Glm5LoraTargetModule), Option<Tensor>>,
 }
 
 impl Glm5LoraRegistry {
@@ -91,6 +96,8 @@ impl Glm5LoraRegistry {
             adapters,
             config,
             var_store: vs,
+            delta_cache: BTreeMap::new(),
+            base_cache: BTreeMap::new(),
         })
     }
 
@@ -142,10 +149,16 @@ impl Glm5LoraRegistry {
             adapters,
             config,
             var_store: vs,
+            delta_cache: BTreeMap::new(),
+            base_cache: BTreeMap::new(),
         })
     }
-}
 
+    /// Invalidate delta cache (call after Adam step updates LoRA params)
+    pub fn invalidate_delta_cache(&mut self) {
+        self.delta_cache.clear();
+    }
+}
 #[derive(Debug, Serialize)]
 pub struct Glm5LoraManifest {
     pub format: String,
@@ -179,30 +192,41 @@ pub fn glm5_lora_weight(
     weight_scale: Option<&Tensor>,
     layer: usize,
     module: Glm5LoraTargetModule,
-    registry: &Glm5LoraRegistry,
+    registry: &mut Glm5LoraRegistry,
 ) -> Tensor {
     if let Some((lora_a, lora_b)) = registry.adapters.get(&(layer, module)) {
         let lora_scale = registry.config.alpha as f64 / lora_a.size()[0] as f64;
-        let delta = lora_b.matmul(lora_a) * lora_scale;
-        // Dequant FP8 weights using C++ kernel (applies block-wise scale correctly)
-        let base_dequant = if base.kind() == Kind::Float8e4m3fn {
-            if let Some(s) = weight_scale {
-                match rustrain_deepseek_v4::fp8_kernel::dequant_fp8_weight(base, s) {
-                    Ok(w) => w,
-                    Err(e) => {
-                        tracing::warn!("dequant_fp8_weight failed in lora ({e:?}), falling back to to_kind");
-                        base.to_kind(Kind::BFloat16)
+
+        // Use cached delta (B@A * scale) if available, recompute otherwise
+        let delta = if let Some(Some(cached)) = registry.delta_cache.get(&(layer, module)) {
+            cached.shallow_clone()
+        } else {
+            let d = lora_b.matmul(lora_a) * lora_scale;
+            registry.delta_cache.insert((layer, module), Some(d.shallow_clone()));
+            d
+        };
+
+        // Use cached dequanted base weight if available
+        let base_dequant = if let Some(Some(cached)) = registry.base_cache.get(&(layer, module)) {
+            cached.shallow_clone()
+        } else {
+            let bd = if base.kind() == Kind::Float8e4m3fn {
+                if let Some(s) = weight_scale {
+                    match rustrain_deepseek_v4::fp8_kernel::dequant_fp8_weight(base, s) {
+                        Ok(w) => w,
+                        Err(_) => base.to_kind(Kind::BFloat16)
                     }
+                } else {
+                    base.to_kind(Kind::BFloat16)
                 }
             } else {
-                tracing::warn!("FP8 weight without scale in lora, using raw to_kind (may be incorrect)");
-                base.to_kind(Kind::BFloat16)
-            }
-        } else {
-            base.shallow_clone()
+                base.shallow_clone()
+            };
+            registry.base_cache.insert((layer, module), Some(bd.shallow_clone()));
+            bd
         };
-        let result = &base_dequant + &delta.to_device(base_dequant.device()).to_kind(base_dequant.kind());
-        result
+
+        &base_dequant + &delta
     } else {
         base.shallow_clone()
     }
@@ -212,7 +236,7 @@ pub fn glm5_lora_weight(
 pub fn lora_attention_weights(
     base: &Glm5AttentionWeights,
     layer: usize,
-    registry: &Glm5LoraRegistry,
+    registry: &mut Glm5LoraRegistry,
 ) -> Glm5AttentionWeights {
     Glm5AttentionWeights {
         q_a_proj: glm5_lora_weight(&base.q_a_proj, base.q_a_proj_scale.as_ref(), layer, Glm5LoraTargetModule::WqA, registry),

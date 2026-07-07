@@ -220,9 +220,9 @@ pub fn glm5_lora_sft_loss(
     weights: &BTreeMap<String, Tensor>,
     config: &Glm5RuntimeConfig,
     trainable_layers: &[usize],
-    registry: &Glm5LoraRegistry,
+    registry: &mut Glm5LoraRegistry,
 ) -> Result<Tensor> {
-    let logits = glm5_forward_lora(input_ids, weights, config, trainable_layers, registry)?;
+    let logits = glm5_forward_lora(input_ids, weights, config, trainable_layers, &mut *registry)?;
     let shifted_logits = logits.narrow(1, 0, logits.size()[1] - 1);
     let shifted_targets = input_ids.narrow(1, 1, input_ids.size()[1] - 1);
     let shifted_mask = target_mask
@@ -254,7 +254,7 @@ pub fn glm5_forward_lora(
     weights: &BTreeMap<String, Tensor>,
     config: &Glm5RuntimeConfig,
     trainable_layers: &[usize],
-    registry: &Glm5LoraRegistry,
+    registry: &mut Glm5LoraRegistry,
 ) -> Result<Tensor> {
     let embed_tokens = tensor(weights, "model.embed_tokens.weight")?;
     let final_norm = tensor(weights, "model.norm.weight")?;
