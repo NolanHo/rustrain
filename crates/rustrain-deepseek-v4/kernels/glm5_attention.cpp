@@ -655,24 +655,29 @@ void* v4_glm5_moe_layer(
         auto partial_output = at::zeros(flat_input.sizes(),
             at::TensorOptions().dtype(dtype).device(device));
 
-        // ── Expert dispatch (local experts only) ──
+        // ── Expert dispatch (local experts only) — gather/scatter optimization ──
+        // Instead of computing MLP on ALL tokens then masking, we gather only
+        // the tokens routed to each expert, compute MLP on the subset, then
+        // scatter-add back. This reduces compute by ~num_experts/top_k factor.
         for (int e = 0; e < n_local_experts; e++) {
             int global_e = local_expert_indices[e];
-            // Mask: which tokens selected this expert
-            auto mask = tk_indices.eq(global_e).to(dtype);
-            auto mask_flat = mask.sum(-1, /*keepdim=*/false).to(dtype);
-            // Quick check: skip if no tokens routed here
-            // (Can't easily do scalar check in C++ without sync — just compute, mask handles it)
-            auto weighted_mask = (mask * tk_weights).sum(-1, /*keepdim=*/false).to(dtype);
-            auto mask_expanded = weighted_mask.unsqueeze(-1).expand({-1, partial_output.size(1)}, /*implicit=*/false);
 
-            // Prefetch expert weights from CPU to GPU
-            auto& gate_cpu = *reinterpret_cast<at::Tensor*>(expert_gate_weights[e]);
-            auto& up_cpu = *reinterpret_cast<at::Tensor*>(expert_up_weights[e]);
-            auto& down_cpu = *reinterpret_cast<at::Tensor*>(expert_down_weights[e]);
-            auto gate_gpu = gate_cpu.to(device);
-            auto up_gpu = up_cpu.to(device);
-            auto down_gpu = down_cpu.to(device);
+            // Build mask: [N, k] → [N] (1 if this expert is selected in any slot)
+            auto mask = tk_indices.eq(global_e).any(-1);  // [N] bool
+            auto token_indices = mask.nonzero().squeeze(-1);  // [num_routed] — metadata, no extra sync
+            if (token_indices.size(0) == 0) continue;  // skip empty experts — no sync needed
+
+            // Gather only routed tokens
+            auto selected = flat_input.index_select(0, token_indices);  // [num_routed, hidden]
+
+            // Compute routing weights for these tokens
+            auto token_weights = (mask.to(dtype).unsqueeze(-1) * tk_weights).sum(-1);  // [N]
+            auto sel_weights = token_weights.index_select(0, token_indices).unsqueeze(-1);  // [num_routed, 1]
+
+            // Expert weights (already on GPU from Rust-side cache)
+            auto& gate_w = *reinterpret_cast<at::Tensor*>(expert_gate_weights[e]);
+            auto& up_w = *reinterpret_cast<at::Tensor*>(expert_up_weights[e]);
+            auto& down_w = *reinterpret_cast<at::Tensor*>(expert_down_weights[e]);
 
             // Expert scales (if FP8)
             auto g_scale = expert_gate_scales && expert_gate_scales[e]
@@ -682,14 +687,14 @@ void* v4_glm5_moe_layer(
             auto d_scale = expert_down_scales && expert_down_scales[e]
                 ? std::optional<at::Tensor>(*reinterpret_cast<at::Tensor*>(expert_down_scales[e])) : std::nullopt;
 
-            // Expert MLP: silu(gate(x)) * up(x) → down
-            auto eg = safe_linear(flat_input, gate_gpu, g_scale);
-            auto eu = safe_linear(flat_input, up_gpu, u_scale);
+            // Expert MLP on subset only: silu(gate(x)) * up(x) → down
+            auto eg = safe_linear(selected, gate_w, g_scale);   // [num_routed, intermediate]
+            auto eu = safe_linear(selected, up_w, u_scale);
             auto ea = at::silu(eg) * eu;
-            auto expert_out = safe_linear(ea, down_gpu, d_scale);
+            auto expert_out = safe_linear(ea, down_w, d_scale);  // [num_routed, hidden]
 
-            // Weighted contribution
-            partial_output = partial_output + expert_out * mask_expanded;
+            // Scatter-add back: partial_output[token_indices] += expert_out * weights
+            partial_output.index_add_(0, token_indices, expert_out * sel_weights);
         }
 
         // Combine: partial + shared
@@ -946,24 +951,28 @@ void* v4_glm5_layer_forward(
 
             for (int e = 0; e < n_local_experts; e++) {
                 int ge = local_expert_indices[e];
-                auto mask = tk_indices.eq(ge).to(dtype);
-                auto wm = (mask * tk_weights).sum(-1, /*keepdim=*/false).to(dtype);
-                auto me = wm.unsqueeze(-1).expand({-1, partial.size(1)}, /*implicit=*/false);
-                auto& gcpu = *reinterpret_cast<at::Tensor*>(expert_gate_weights[e]);
-                auto& ucpu = *reinterpret_cast<at::Tensor*>(expert_up_weights[e]);
-                auto& dcpu = *reinterpret_cast<at::Tensor*>(expert_down_weights[e]);
-                auto gg = gcpu.to(device), uu = ucpu.to(device), dd = dcpu.to(device);
+                // Gather only routed tokens (not all tokens)
+                auto mask = tk_indices.eq(ge).any(-1);  // [N] bool
+                auto token_indices = mask.nonzero().squeeze(-1);
+                if (token_indices.size(0) == 0) continue;
+                auto selected = flat_input.index_select(0, token_indices);
+                auto token_weights = (mask.to(dtype).unsqueeze(-1) * tk_weights).sum(-1);
+                auto sel_weights = token_weights.index_select(0, token_indices).unsqueeze(-1);
+
+                auto& gate_w = *reinterpret_cast<at::Tensor*>(expert_gate_weights[e]);
+                auto& up_w = *reinterpret_cast<at::Tensor*>(expert_up_weights[e]);
+                auto& down_w = *reinterpret_cast<at::Tensor*>(expert_down_weights[e]);
                 auto g_scale = expert_gate_scales && expert_gate_scales[e]
                     ? std::optional<at::Tensor>(*reinterpret_cast<at::Tensor*>(expert_gate_scales[e])) : std::nullopt;
                 auto u_scale = expert_up_scales && expert_up_scales[e]
                     ? std::optional<at::Tensor>(*reinterpret_cast<at::Tensor*>(expert_up_scales[e])) : std::nullopt;
                 auto d_scale = expert_down_scales && expert_down_scales[e]
                     ? std::optional<at::Tensor>(*reinterpret_cast<at::Tensor*>(expert_down_scales[e])) : std::nullopt;
-                auto eg = safe_linear(flat_input, gg, g_scale);
-                auto eu = safe_linear(flat_input, uu, u_scale);
+                auto eg = safe_linear(selected, gate_w, g_scale);
+                auto eu = safe_linear(selected, up_w, u_scale);
                 auto ea = at::silu(eg) * eu;
-                auto eo = safe_linear(ea, dd, d_scale);
-                partial = partial + eo * me;
+                auto eo = safe_linear(ea, down_w, d_scale);
+                partial.index_add_(0, token_indices, eo * sel_weights);
             }
             mlp_output = partial.reshape({1, -1, hidden_dim}) + shared_out;
         } else {
