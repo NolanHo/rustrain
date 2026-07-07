@@ -409,20 +409,34 @@ pub fn train_glm5_lora_sft_ep(
     // ── Cache expert weights on GPU (eliminates per-layer CPU→GPU transfer) ──
     // Expert weights are frozen (LoRA targets attention only), so they can be
     // loaded once and reused every step. This eliminates ~87GB/layer PCIe transfer.
-    info!(rank, "caching expert weights on GPU...");
+    info!(rank, "caching expert weights on GPU (with FP8 pre-dequant)...");
     let mut expert_weights_gpu: BTreeMap<String, Tensor> = BTreeMap::new();
+    // First pass: load all to GPU
     for (name, t) in &expert_weights_cpu {
-        let gpu_t = if t.kind() == Kind::Float8e4m3fn {
-            t.to_device(device)
-        } else if t.kind() == Kind::Float {
-            t.to_device(device)
-        } else {
-            t.to_device(device).to_kind(compute_kind)
-        };
+        let gpu_t = t.to_device(device);
         expert_weights_gpu.insert(name.clone(), gpu_t);
     }
+    // Second pass: pre-dequant FP8 weights to BF16 (saves per-step dequant in safe_linear)
+    let expert_weight_names: Vec<String> = expert_weights_gpu.keys().cloned().collect();
+    for name in &expert_weight_names {
+        if let Some(t) = expert_weights_gpu.get(name) {
+            if t.kind() == Kind::Float8e4m3fn {
+                let scale_name = name.replace(".weight", ".weight_scale_inv");
+                if let Some(scale) = expert_weights_gpu.get(&scale_name) {
+                    match rustrain_deepseek_v4::fp8_kernel::dequant_fp8_weight(t, scale) {
+                        Ok(bf16) => {
+                            expert_weights_gpu.insert(name.clone(), bf16.to_kind(compute_kind));
+                        }
+                        Err(e) => {
+                            tracing::warn!(rank, "pre-dequant failed for {}: {:?}, keeping FP8", name, e);
+                        }
+                    }
+                }
+            }
+        }
+    }
     let expert_gpu_count = expert_weights_gpu.len();
-    info!(rank, expert_tensors_on_gpu = expert_gpu_count, "expert weights cached on GPU");
+    info!(rank, expert_tensors_on_gpu = expert_gpu_count, "expert weights cached on GPU (FP8 pre-dequanted)");
 
     // ── Training loop ──
     for step in 0..config.train.max_steps {

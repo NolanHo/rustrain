@@ -8,6 +8,7 @@
 // All intermediate tensors live on C++ stack — zero FFI crossings per operation.
 
 #include <ATen/ATen.h>
+#include <c10/cuda/CUDACachingAllocator.h>
 #include <ATen/ops/matmul.h>
 #include <ATen/ops/linear.h>
 #include <ATen/ops/topk.h>
@@ -699,6 +700,7 @@ void* v4_glm5_moe_layer(
 
         // Combine: partial + shared
         auto partial_mlp = partial_output.reshape({1, -1, hidden}) + shared_output;
+        c10::cuda::CUDACachingAllocator::emptyCache();
         return new at::Tensor(std::move(partial_mlp));
     } catch (const std::exception& e) {
         fprintf(stderr, "[v4_glm5_moe_layer] FAILED: %s\n", e.what());
@@ -991,6 +993,8 @@ void* v4_glm5_layer_forward(
 
         // ── 6. Residual ──
         auto new_hidden = residual + mlp_output;
+        // Release intermediate tensors from this layer to prevent memory accumulation
+        c10::cuda::CUDACachingAllocator::emptyCache();
         return new at::Tensor(std::move(new_hidden));
     } catch (const std::exception& e) {
         fprintf(stderr, "[v4_glm5_layer_forward] FAILED: %s\n", e.what());
