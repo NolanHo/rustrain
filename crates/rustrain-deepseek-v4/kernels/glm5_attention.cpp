@@ -171,8 +171,9 @@ static at::Tensor chunked_topk(const at::Tensor& idx_q, const at::Tensor& idx_k,
                                 int64_t num_heads, int64_t idx_n_heads,
                                 int64_t batch, int64_t seq, at::ScalarType compute_dtype,
                                 int device_id) {
-    int64_t score_chunk = 512;
-    if (seq <= score_chunk) {
+    // For seq <= 4096, compute full scores in one matmul (fast, no chunking overhead)
+    // [B, idx_n_heads, S, S] * 2B (BF16) = 32MB at 4K, 128MB at 8K — fits in GPU memory
+    if (seq <= 4096) {
         auto scores = at::matmul(idx_q, idx_k.transpose(-2, -1)) * idx_scale;
         if (idx_n_heads != num_heads) {
             scores = scores.mean(1, /*keepdim=*/true)
@@ -182,6 +183,9 @@ static at::Tensor chunked_topk(const at::Tensor& idx_q, const at::Tensor& idx_k,
         return indices;
     }
 
+    // For seq > 4096, use chunked approach but with larger chunks (2048)
+    // to reduce kernel launch overhead
+    int64_t score_chunk = 2048;
     at::Tensor best_scores, best_indices;
     bool has_best = false;
     for (int64_t k_start = 0; k_start < seq; k_start += score_chunk) {
@@ -209,6 +213,9 @@ static at::Tensor chunked_topk(const at::Tensor& idx_q, const at::Tensor& idx_k,
             best_indices = li_offset.to(at::kLong);
             has_best = true;
         }
+        // Free chunk intermediates
+        scores_chunk = at::Tensor();
+        c10::cuda::CUDACachingAllocator::emptyCache();
     }
     return best_indices;
 }
