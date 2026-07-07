@@ -9,6 +9,7 @@
 
 #include <ATen/ATen.h>
 #include <c10/cuda/CUDACachingAllocator.h>
+#include <c10/cuda/CUDAStream.h>
 #include <ATen/ops/matmul.h>
 #include <ATen/ops/linear.h>
 #include <ATen/ops/topk.h>
@@ -700,33 +701,42 @@ void* v4_glm5_moe_layer(
             at::TensorOptions().dtype(dtype).device(device));
 
         // ── Expert dispatch — batched matmul (Megatron-style GroupedLinear) ──
-        // 1. Sort tokens by expert assignment
-        // 2. Gather into padded [n_experts, max_tokens, hidden] tensor
-        // 3. Single bmm for gate/up, single bmm for down
-        // 4. Scatter-add back
-
-        // Stack expert weights: [n_experts, out, in]
-        auto gate_weights_stack = at::stack(
-            std::vector<at::Tensor>([&]{
-                std::vector<at::Tensor> v;
-                for (int e = 0; e < n_local_experts; e++)
-                    v.push_back(*reinterpret_cast<at::Tensor*>(expert_gate_weights[e]));
-                return v;
-            }()), 0);
-        auto up_weights_stack = at::stack(
-            std::vector<at::Tensor>([&]{
-                std::vector<at::Tensor> v;
-                for (int e = 0; e < n_local_experts; e++)
-                    v.push_back(*reinterpret_cast<at::Tensor*>(expert_up_weights[e]));
-                return v;
-            }()), 0);
-        auto down_weights_stack = at::stack(
-            std::vector<at::Tensor>([&]{
-                std::vector<at::Tensor> v;
-                for (int e = 0; e < n_local_experts; e++)
-                    v.push_back(*reinterpret_cast<at::Tensor*>(expert_down_weights[e]));
-                return v;
-            }()), 0);
+        // Pre-stacked expert weights: cached per (layer, n_local_experts) to avoid
+        // redundant at::stack calls (64 tensors × 3 = 192 copies per layer per step)
+        static std::map<std::pair<int, int>, std::tuple<at::Tensor, at::Tensor, at::Tensor>> s_expert_weight_cache;
+        auto cache_key = std::make_pair((int)mlp_input.size(1), n_local_experts);  // seq + n_experts as key
+        at::Tensor gate_weights_stack, up_weights_stack, down_weights_stack;
+        auto cache_it = s_expert_weight_cache.find(cache_key);
+        if (cache_it != s_expert_weight_cache.end()) {
+            auto& [gw, uw, dw] = cache_it->second;
+            gate_weights_stack = gw;
+            up_weights_stack = uw;
+            down_weights_stack = dw;
+        } else {
+            // Stack expert weights: [n_experts, out, in]
+            gate_weights_stack = at::stack(
+                std::vector<at::Tensor>([&]{
+                    std::vector<at::Tensor> v;
+                    for (int e = 0; e < n_local_experts; e++)
+                        v.push_back(*reinterpret_cast<at::Tensor*>(expert_gate_weights[e]));
+                    return v;
+                }()), 0);
+            up_weights_stack = at::stack(
+                std::vector<at::Tensor>([&]{
+                    std::vector<at::Tensor> v;
+                    for (int e = 0; e < n_local_experts; e++)
+                        v.push_back(*reinterpret_cast<at::Tensor*>(expert_up_weights[e]));
+                    return v;
+                }()), 0);
+            down_weights_stack = at::stack(
+                std::vector<at::Tensor>([&]{
+                    std::vector<at::Tensor> v;
+                    for (int e = 0; e < n_local_experts; e++)
+                        v.push_back(*reinterpret_cast<at::Tensor*>(expert_down_weights[e]));
+                    return v;
+                }()), 0);
+            s_expert_weight_cache[cache_key] = std::make_tuple(gate_weights_stack, up_weights_stack, down_weights_stack);
+        }
 
         // Determine token assignment per expert
         int64_t N = flat_input.size(0);
@@ -825,8 +835,7 @@ void* v4_glm5_moe_layer(
             }
         }
 
-        // Free batched intermediates
-        gate_weights_stack = at::Tensor(); up_weights_stack = at::Tensor(); down_weights_stack = at::Tensor();
+        // Free batched intermediates (but not stacked weights — they're cached)
         gathered = at::Tensor(); gate_out = at::Tensor(); up_out = at::Tensor();
         activated = at::Tensor(); expert_outputs = at::Tensor();
         c10::cuda::CUDACachingAllocator::emptyCache();
@@ -903,6 +912,8 @@ void* v4_glm5_layer_forward(
         int64_t batch = batch_i, seq = seq_i;
         int64_t nh = num_heads_i;
         auto device = at::Device(at::Device::Type::CUDA, device_id);
+
+
 
         // ── 1. Attention RMSNorm ──
         auto& attn_norm_w = *reinterpret_cast<at::Tensor*>(input_norm_weight);
@@ -1096,24 +1107,35 @@ void* v4_glm5_layer_forward(
 
             // Batched MoE: stack expert weights → bmm (Megatron GroupedLinear style)
             {
-                auto gw_stack = at::stack(std::vector<at::Tensor>([&]{
-                    std::vector<at::Tensor> v;
-                    for (int e = 0; e < n_local_experts; e++)
-                        v.push_back(*reinterpret_cast<at::Tensor*>(expert_gate_weights[e]));
-                    return v;
-                }()), 0);
-                auto uw_stack = at::stack(std::vector<at::Tensor>([&]{
-                    std::vector<at::Tensor> v;
-                    for (int e = 0; e < n_local_experts; e++)
-                        v.push_back(*reinterpret_cast<at::Tensor*>(expert_up_weights[e]));
-                    return v;
-                }()), 0);
-                auto dw_stack = at::stack(std::vector<at::Tensor>([&]{
-                    std::vector<at::Tensor> v;
-                    for (int e = 0; e < n_local_experts; e++)
-                        v.push_back(*reinterpret_cast<at::Tensor*>(expert_down_weights[e]));
-                    return v;
-                }()), 0);
+                // Use cached stacked weights (avoid per-step at::stack overhead)
+                auto cache_key = std::make_pair((int)mlp_input.size(1), n_local_experts);
+                static std::map<std::pair<int, int>, std::tuple<at::Tensor, at::Tensor, at::Tensor>> s_inline_cache;
+                at::Tensor gw_stack, uw_stack, dw_stack;
+                auto cit = s_inline_cache.find(cache_key);
+                if (cit != s_inline_cache.end()) {
+                    auto& [a, b, c] = cit->second;
+                    gw_stack = a; uw_stack = b; dw_stack = c;
+                } else {
+                    gw_stack = at::stack(std::vector<at::Tensor>([&]{
+                        std::vector<at::Tensor> v;
+                        for (int e = 0; e < n_local_experts; e++)
+                            v.push_back(*reinterpret_cast<at::Tensor*>(expert_gate_weights[e]));
+                        return v;
+                    }()), 0);
+                    uw_stack = at::stack(std::vector<at::Tensor>([&]{
+                        std::vector<at::Tensor> v;
+                        for (int e = 0; e < n_local_experts; e++)
+                            v.push_back(*reinterpret_cast<at::Tensor*>(expert_up_weights[e]));
+                        return v;
+                    }()), 0);
+                    dw_stack = at::stack(std::vector<at::Tensor>([&]{
+                        std::vector<at::Tensor> v;
+                        for (int e = 0; e < n_local_experts; e++)
+                            v.push_back(*reinterpret_cast<at::Tensor*>(expert_down_weights[e]));
+                        return v;
+                    }()), 0);
+                    s_inline_cache[cache_key] = std::make_tuple(gw_stack, uw_stack, dw_stack);
+                }
 
                 int64_t N = flat_input.size(0);
                 // Assign each token to its first local expert
@@ -1170,7 +1192,6 @@ void* v4_glm5_layer_forward(
                     partial.index_add_(0, vt2, out_flat);
                 }
 
-                gw_stack = at::Tensor(); uw_stack = at::Tensor(); dw_stack = at::Tensor();
                 gathered = at::Tensor(); go = at::Tensor(); uo = at::Tensor(); act = at::Tensor();
                 c10::cuda::CUDACachingAllocator::emptyCache();
             }
