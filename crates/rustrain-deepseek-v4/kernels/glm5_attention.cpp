@@ -699,47 +699,137 @@ void* v4_glm5_moe_layer(
         auto partial_output = at::zeros(flat_input.sizes(),
             at::TensorOptions().dtype(dtype).device(device));
 
-        // ── Expert dispatch (local experts only) — gather/scatter optimization ──
-        // Instead of computing MLP on ALL tokens then masking, we gather only
-        // the tokens routed to each expert, compute MLP on the subset, then
-        // scatter-add back. This reduces compute by ~num_experts/top_k factor.
+        // ── Expert dispatch — batched matmul (Megatron-style GroupedLinear) ──
+        // 1. Sort tokens by expert assignment
+        // 2. Gather into padded [n_experts, max_tokens, hidden] tensor
+        // 3. Single bmm for gate/up, single bmm for down
+        // 4. Scatter-add back
+
+        // Stack expert weights: [n_experts, out, in]
+        auto gate_weights_stack = at::stack(
+            std::vector<at::Tensor>([&]{
+                std::vector<at::Tensor> v;
+                for (int e = 0; e < n_local_experts; e++)
+                    v.push_back(*reinterpret_cast<at::Tensor*>(expert_gate_weights[e]));
+                return v;
+            }()), 0);
+        auto up_weights_stack = at::stack(
+            std::vector<at::Tensor>([&]{
+                std::vector<at::Tensor> v;
+                for (int e = 0; e < n_local_experts; e++)
+                    v.push_back(*reinterpret_cast<at::Tensor*>(expert_up_weights[e]));
+                return v;
+            }()), 0);
+        auto down_weights_stack = at::stack(
+            std::vector<at::Tensor>([&]{
+                std::vector<at::Tensor> v;
+                for (int e = 0; e < n_local_experts; e++)
+                    v.push_back(*reinterpret_cast<at::Tensor*>(expert_down_weights[e]));
+                return v;
+            }()), 0);
+
+        // Determine token assignment per expert
+        int64_t N = flat_input.size(0);
+        // For each token, find which local expert slot it goes to
+        // tk_indices: [N, k] with global expert IDs
+        // Build local expert index: [N, k] → local index or -1
+        auto local_idx = at::full({N, k}, -1.0, at::TensorOptions().dtype(at::kFloat).device(device));
         for (int e = 0; e < n_local_experts; e++) {
             int global_e = local_expert_indices[e];
-
-            // Build mask: [N, k] → [N] (1 if this expert is selected in any slot)
-            auto mask = tk_indices.eq(global_e).any(-1);  // [N] bool
-            auto token_indices = mask.nonzero().squeeze(-1);  // [num_routed] — metadata, no extra sync
-            if (token_indices.size(0) == 0) continue;  // skip empty experts — no sync needed
-
-            // Gather only routed tokens
-            auto selected = flat_input.index_select(0, token_indices);  // [num_routed, hidden]
-
-            // Compute routing weights for these tokens
-            auto token_weights = (mask.to(dtype).unsqueeze(-1) * tk_weights).sum(-1);  // [N]
-            auto sel_weights = token_weights.index_select(0, token_indices).unsqueeze(-1);  // [num_routed, 1]
-
-            // Expert weights (already on GPU from Rust-side cache)
-            auto& gate_w = *reinterpret_cast<at::Tensor*>(expert_gate_weights[e]);
-            auto& up_w = *reinterpret_cast<at::Tensor*>(expert_up_weights[e]);
-            auto& down_w = *reinterpret_cast<at::Tensor*>(expert_down_weights[e]);
-
-            // Expert scales (if FP8)
-            auto g_scale = expert_gate_scales && expert_gate_scales[e]
-                ? std::optional<at::Tensor>(*reinterpret_cast<at::Tensor*>(expert_gate_scales[e])) : std::nullopt;
-            auto u_scale = expert_up_scales && expert_up_scales[e]
-                ? std::optional<at::Tensor>(*reinterpret_cast<at::Tensor*>(expert_up_scales[e])) : std::nullopt;
-            auto d_scale = expert_down_scales && expert_down_scales[e]
-                ? std::optional<at::Tensor>(*reinterpret_cast<at::Tensor*>(expert_down_scales[e])) : std::nullopt;
-
-            // Expert MLP on subset only: silu(gate(x)) * up(x) → down
-            auto eg = safe_linear(selected, gate_w, g_scale);   // [num_routed, intermediate]
-            auto eu = safe_linear(selected, up_w, u_scale);
-            auto ea = at::silu(eg) * eu;
-            auto expert_out = safe_linear(ea, down_w, d_scale);  // [num_routed, hidden]
-
-            // Scatter-add back: partial_output[token_indices] += expert_out * weights
-            partial_output.index_add_(0, token_indices, expert_out * sel_weights);
+            auto mask = tk_indices.eq(global_e);
+            local_idx = local_idx.masked_fill(mask, (float)e);
         }
+        // For each token, pick the first matching local expert (if any)
+        auto has_expert = local_idx.ge(0).any(-1);  // [N] bool
+        auto assigned_expert = local_idx.clamp_min(0).to(at::kLong).narrow(-1, 0, 1).squeeze(-1);  // [N]
+
+        // Sort by expert to group tokens
+        auto [sorted_experts, sort_order] = assigned_expert.sort(0);
+        auto sorted_tokens = flat_input.index_select(0, sort_order);
+        auto sorted_weights = tk_weights.gather(0, sort_order.narrow(1, 0, 1).expand({-1, k}));
+
+        // Count per-expert (avoid .item() sync — use a fixed max)
+        int64_t max_per_expert = (N + n_local_experts - 1) / n_local_experts + 16;
+
+        // Pad to [n_local_experts, max_per_expert, hidden]
+        auto gathered = at::zeros({n_local_experts, max_per_expert, hidden},
+            at::TensorOptions().dtype(dtype).device(device));
+        auto gather_valid = at::zeros({n_local_experts, max_per_expert},
+            at::TensorOptions().dtype(at::kBool).device(device));
+        auto weight_gathered = at::zeros({n_local_experts, max_per_expert, 1},
+            at::TensorOptions().dtype(dtype).device(device));
+
+        // Fill using per-expert offsets
+        {
+            auto expert_offsets = at::cumsum(
+                at::cat(std::vector<at::Tensor>({
+                    at::zeros({1}, at::TensorOptions().dtype(at::kLong).device(device)),
+                    at::histc(sorted_experts.to(at::kFloat), n_local_experts, 0, n_local_experts - 1).to(at::kLong)
+                        .narrow(0, 0, n_local_experts - 1)
+                })), 0);
+            auto arange_idx = at::arange(N, at::TensorOptions().dtype(at::kLong).device(device));
+            auto group_starts = expert_offsets.index_select(0, sorted_experts.clamp_max(n_local_experts - 1));
+            auto local_pos = arange_idx - group_starts;
+            auto valid = local_pos.lt(max_per_expert);
+            auto valid_idx = valid.nonzero().squeeze(-1);
+
+            if (valid_idx.size(0) > 0) {
+                auto v_expert = sorted_experts.index_select(0, valid_idx);
+                auto v_pos = local_pos.index_select(0, valid_idx);
+                auto v_tokens = sorted_tokens.index_select(0, valid_idx);
+                auto v_weights = sorted_weights.index_select(0, valid_idx)
+                    .sum(-1, true).to(dtype);  // [valid, 1]
+
+                // Scatter into batched tensor
+                gathered.index_put_({v_expert, v_pos}, v_tokens);
+                gather_valid.index_put_({v_expert, v_pos}, true);
+                weight_gathered.index_put_({v_expert, v_pos}, v_weights);
+            }
+        }
+
+        // Batched gate+up matmul: [E, max_tok, hidden] @ [E, hidden, inter]^T → [E, max_tok, inter]
+        auto gate_out = at::bmm(gathered, gate_weights_stack.transpose(-1, -2));
+        auto up_out = at::bmm(gathered, up_weights_stack.transpose(-1, -2));
+        auto activated = at::silu(gate_out) * up_out;
+
+        // Batched down matmul: [E, max_tok, inter] @ [E, inter, hidden]^T → [E, max_tok, hidden]
+        auto expert_outputs = at::bmm(activated, down_weights_stack.transpose(-1, -2));
+
+        // Zero invalid positions and apply weights
+        expert_outputs = expert_outputs * gather_valid.unsqueeze(-1).to(dtype);
+        expert_outputs = expert_outputs * weight_gathered;
+
+        // Scatter-add back to original token positions
+        {
+            auto expert_offsets = at::cumsum(
+                at::cat(std::vector<at::Tensor>({
+                    at::zeros({1}, at::TensorOptions().dtype(at::kLong).device(device)),
+                    at::histc(sorted_experts.to(at::kFloat), n_local_experts, 0, n_local_experts - 1).to(at::kLong)
+                        .narrow(0, 0, n_local_experts - 1)
+                })), 0);
+            auto arange_idx = at::arange(N, at::TensorOptions().dtype(at::kLong).device(device));
+            auto group_starts = expert_offsets.index_select(0, sorted_experts.clamp_max(n_local_experts - 1));
+            auto local_pos = arange_idx - group_starts;
+            auto valid = local_pos.lt(max_per_expert);
+            auto valid_idx = valid.nonzero().squeeze(-1);
+
+            if (valid_idx.size(0) > 0) {
+                auto v_expert = sorted_experts.index_select(0, valid_idx);
+                auto v_pos = local_pos.index_select(0, valid_idx);
+                auto v_token_ids = sort_order.index_select(0, valid_idx).squeeze(-1);
+
+                // Gather expert outputs for valid positions
+                auto out_flat = expert_outputs.index_select(0, v_expert)
+                    .index_select(1, v_pos);  // [valid, hidden]
+                partial_output.index_add_(0, v_token_ids, out_flat);
+            }
+        }
+
+        // Free batched intermediates
+        gate_weights_stack = at::Tensor(); up_weights_stack = at::Tensor(); down_weights_stack = at::Tensor();
+        gathered = at::Tensor(); gate_out = at::Tensor(); up_out = at::Tensor();
+        activated = at::Tensor(); expert_outputs = at::Tensor();
+        c10::cuda::CUDACachingAllocator::emptyCache();
 
         // Combine: partial + shared
         auto partial_mlp = partial_output.reshape({1, -1, hidden}) + shared_output;
@@ -1004,30 +1094,85 @@ void* v4_glm5_layer_forward(
             auto tk_weights = tw.reshape({-1, topk});
             auto partial = at::zeros(flat_input.sizes(), at::TensorOptions().dtype(dtype).device(device));
 
-            for (int e = 0; e < n_local_experts; e++) {
-                int ge = local_expert_indices[e];
-                // Gather only routed tokens (not all tokens)
-                auto mask = tk_indices.eq(ge).any(-1);  // [N] bool
-                auto token_indices = mask.nonzero().squeeze(-1);
-                if (token_indices.size(0) == 0) continue;
-                auto selected = flat_input.index_select(0, token_indices);
-                auto token_weights = (mask.to(dtype).unsqueeze(-1) * tk_weights).sum(-1);
-                auto sel_weights = token_weights.index_select(0, token_indices).unsqueeze(-1);
+            // Batched MoE: stack expert weights → bmm (Megatron GroupedLinear style)
+            {
+                auto gw_stack = at::stack(std::vector<at::Tensor>([&]{
+                    std::vector<at::Tensor> v;
+                    for (int e = 0; e < n_local_experts; e++)
+                        v.push_back(*reinterpret_cast<at::Tensor*>(expert_gate_weights[e]));
+                    return v;
+                }()), 0);
+                auto uw_stack = at::stack(std::vector<at::Tensor>([&]{
+                    std::vector<at::Tensor> v;
+                    for (int e = 0; e < n_local_experts; e++)
+                        v.push_back(*reinterpret_cast<at::Tensor*>(expert_up_weights[e]));
+                    return v;
+                }()), 0);
+                auto dw_stack = at::stack(std::vector<at::Tensor>([&]{
+                    std::vector<at::Tensor> v;
+                    for (int e = 0; e < n_local_experts; e++)
+                        v.push_back(*reinterpret_cast<at::Tensor*>(expert_down_weights[e]));
+                    return v;
+                }()), 0);
 
-                auto& gate_w = *reinterpret_cast<at::Tensor*>(expert_gate_weights[e]);
-                auto& up_w = *reinterpret_cast<at::Tensor*>(expert_up_weights[e]);
-                auto& down_w = *reinterpret_cast<at::Tensor*>(expert_down_weights[e]);
-                auto g_scale = expert_gate_scales && expert_gate_scales[e]
-                    ? std::optional<at::Tensor>(*reinterpret_cast<at::Tensor*>(expert_gate_scales[e])) : std::nullopt;
-                auto u_scale = expert_up_scales && expert_up_scales[e]
-                    ? std::optional<at::Tensor>(*reinterpret_cast<at::Tensor*>(expert_up_scales[e])) : std::nullopt;
-                auto d_scale = expert_down_scales && expert_down_scales[e]
-                    ? std::optional<at::Tensor>(*reinterpret_cast<at::Tensor*>(expert_down_scales[e])) : std::nullopt;
-                auto eg = safe_linear(selected, gate_w, g_scale);
-                auto eu = safe_linear(selected, up_w, u_scale);
-                auto ea = at::silu(eg) * eu;
-                auto eo = safe_linear(ea, down_w, d_scale);
-                partial.index_add_(0, token_indices, eo * sel_weights);
+                int64_t N = flat_input.size(0);
+                // Assign each token to its first local expert
+                auto local_idx = at::full({N, topk}, -1.0, at::TensorOptions().dtype(at::kFloat).device(device));
+                for (int e = 0; e < n_local_experts; e++) {
+                    auto mask = tk_indices.eq(local_expert_indices[e]);
+                    local_idx = local_idx.masked_fill(mask, (float)e);
+                }
+                auto assigned = local_idx.clamp_min(0).to(at::kLong).narrow(-1, 0, 1).squeeze(-1);
+                auto [sorted_e, sort_order] = assigned.sort(0);
+                auto sorted_tokens = flat_input.index_select(0, sort_order);
+                auto sorted_w = tk_weights.gather(0, sort_order.narrow(1, 0, 1).expand({-1, topk}));
+
+                int64_t max_per = (N + n_local_experts - 1) / n_local_experts + 16;
+                auto gathered = at::zeros({n_local_experts, max_per, hidden_dim},
+                    at::TensorOptions().dtype(dtype).device(device));
+                auto valid_mask = at::zeros({n_local_experts, max_per},
+                    at::TensorOptions().dtype(at::kBool).device(device));
+                auto w_gathered = at::zeros({n_local_experts, max_per, 1},
+                    at::TensorOptions().dtype(dtype).device(device));
+
+                auto offsets = at::cumsum(at::cat(std::vector<at::Tensor>({
+                    at::zeros({1}, at::TensorOptions().dtype(at::kLong).device(device)),
+                    at::histc(sorted_e.to(at::kFloat), n_local_experts, 0, n_local_experts - 1).to(at::kLong)
+                        .narrow(0, 0, n_local_experts - 1)
+                })), 0);
+                auto arange = at::arange(N, at::TensorOptions().dtype(at::kLong).device(device));
+                auto starts = offsets.index_select(0, sorted_e.clamp_max(n_local_experts - 1));
+                auto pos = arange - starts;
+                auto valid = pos.lt(max_per);
+                auto vidx = valid.nonzero().squeeze(-1);
+
+                if (vidx.size(0) > 0) {
+                    auto ve = sorted_e.index_select(0, vidx);
+                    auto vp = pos.index_select(0, vidx);
+                    auto vt = sorted_tokens.index_select(0, vidx);
+                    auto vw = sorted_w.index_select(0, vidx).sum(-1, true).to(dtype);
+                    gathered.index_put_({ve, vp}, vt);
+                    valid_mask.index_put_({ve, vp}, true);
+                    w_gathered.index_put_({ve, vp}, vw);
+                }
+
+                auto go = at::bmm(gathered, gw_stack.transpose(-1, -2));
+                auto uo = at::bmm(gathered, uw_stack.transpose(-1, -2));
+                auto act = at::silu(go) * uo;
+                auto outs = at::bmm(act, dw_stack.transpose(-1, -2));
+                outs = outs * valid_mask.unsqueeze(-1).to(dtype) * w_gathered;
+
+                if (vidx.size(0) > 0) {
+                    auto ve2 = sorted_e.index_select(0, vidx);
+                    auto vp2 = pos.index_select(0, vidx);
+                    auto vt2 = sort_order.index_select(0, vidx).squeeze(-1);
+                    auto out_flat = outs.index_select(0, ve2).index_select(1, vp2);
+                    partial.index_add_(0, vt2, out_flat);
+                }
+
+                gw_stack = at::Tensor(); uw_stack = at::Tensor(); dw_stack = at::Tensor();
+                gathered = at::Tensor(); go = at::Tensor(); uo = at::Tensor(); act = at::Tensor();
+                c10::cuda::CUDACachingAllocator::emptyCache();
             }
             mlp_output = partial.reshape({1, -1, hidden_dim}) + shared_out;
         } else {
