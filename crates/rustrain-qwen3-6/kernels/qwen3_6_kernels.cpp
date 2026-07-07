@@ -13,6 +13,7 @@
 #include <torch/csrc/autograd/variable.h>
 #include "backward.h"
 #include "fused_backward.h"
+#include <dlfcn.h>
 #include <cstdio>
 #include <cmath>
 #include <vector>
@@ -22,7 +23,90 @@
 #include <set>
 
 // ──────────────────────────────────────────────────────────────────────
+// Forward declarations
+// ──────────────────────────────────────────────────────────────────────
+
+static at::Tensor rms_norm(const at::Tensor& input, const at::Tensor& weight, double eps);
+
+// ──────────────────────────────────────────────────────────────────────
+// Tilelang fused kernel loading (dlopen)
+// ──────────────────────────────────────────────────────────────────────
+
+struct TilelangKernels {
+    // fused_rmsnorm_matmul (V4: weight only): X [M,K], W_norm [K], W_matmul [N,K] → Y [M,N]
+    void (*fused_rmsnorm_matmul)(void*, void*, void*, void*, int64_t, int64_t, int64_t, double);
+    // fused_rmsnorm_matmul_one_plus (Qwen3.6: 1+weight): same signature
+    void (*fused_rmsnorm_matmul_one_plus)(void*, void*, void*, void*, int64_t, int64_t, int64_t, double);
+    // fused_swiglu: gate [M,I], up [M,I] → out [M,I]
+    void (*fused_swiglu)(void*, void*, void*, int64_t, int64_t, double);
+};
+
+static TilelangKernels* g_tilelang = nullptr;
+
+static void load_tilelang_kernels() {
+    if (g_tilelang) return;
+    void* handle = dlopen("libtilelang_fused.so", RTLD_LAZY | RTLD_NOLOAD);
+    if (!handle) handle = dlopen("libtilelang_fused.so", RTLD_LAZY);
+    if (!handle) return;
+
+    auto* k = new TilelangKernels{};
+    auto load_sym = [&](const char* name, auto* fn_ptr) {
+        void* p = dlsym(handle, name);
+        if (p) *(void**)fn_ptr = p;
+    };
+    load_sym("tilelang_fused_rmsnorm_matmul", &k->fused_rmsnorm_matmul);
+    load_sym("tilelang_fused_rmsnorm_matmul_one_plus", &k->fused_rmsnorm_matmul_one_plus);
+    load_sym("tilelang_fused_swiglu", &k->fused_swiglu);
+    g_tilelang = k;
+    fprintf(stderr, "[q36_tilelang] loaded: rmsnorm_matmul=%s rmsnorm_matmul_one_plus=%s swiglu=%s\n",
+        k->fused_rmsnorm_matmul ? "yes" : "no",
+        k->fused_rmsnorm_matmul_one_plus ? "yes" : "no",
+        k->fused_swiglu ? "yes" : "no");
+}
+
+/// Fused RMSNorm + Matmul via Tilelang (Qwen3.6 variant: 1+weight)
+/// Falls back to ATen rms_norm + at::linear if Tilelang not available.
+static at::Tensor fused_rmsnorm_matmul_q36(
+    const at::Tensor& input, const at::Tensor& norm_w, const at::Tensor& matmul_w,
+    double eps)
+{
+    if (g_tilelang && g_tilelang->fused_rmsnorm_matmul_one_plus) {
+        int64_t M = input.size(0);
+        int64_t K = input.size(1);
+        int64_t N = matmul_w.size(0);
+        auto output = at::zeros({M, N}, input.options());
+        g_tilelang->fused_rmsnorm_matmul_one_plus(
+            input.data_ptr(), norm_w.data_ptr(), matmul_w.data_ptr(),
+            output.data_ptr(), M, N, K, eps);
+        return output;
+    }
+    // Fallback: ATen
+    auto normed = rms_norm(input, norm_w, eps);
+    return at::linear(normed, matmul_w);
+}
+
+/// Fused SwiGLU via Tilelang (falls back to ATen if not available)
+static at::Tensor fused_swiglu_op(
+    const at::Tensor& gate_out, const at::Tensor& up_out, double limit)
+{
+    if (g_tilelang && g_tilelang->fused_swiglu) {
+        int64_t M = gate_out.size(0);
+        int64_t I = gate_out.size(1);
+        auto output = at::zeros({M, I}, gate_out.options());
+        g_tilelang->fused_swiglu(
+            gate_out.data_ptr(), up_out.data_ptr(), output.data_ptr(),
+            M, I, limit);
+        return output;
+    }
+    // Fallback: ATen
+    auto inter = at::silu(gate_out) * up_out;
+    if (limit > 0.0) inter = inter.clamp(-limit, limit);
+    return inter;
+}
+
+// ──────────────────────────────────────────────────────────────────────
 // Helpers
+// ──────────────────────────────────────────────────────────────────────
 // ──────────────────────────────────────────────────────────────────────
 
 static at::Tensor rms_norm(const at::Tensor& input, const at::Tensor& weight, double eps) {
@@ -468,7 +552,8 @@ static at::Tensor dense_mlp_forward(
     auto flat = hidden.reshape({batch * seq, hidden_dim});
     auto gate_out = at::matmul(flat, gate_proj.t());
     auto up_out = at::matmul(flat, up_proj.t());
-    auto activated = at::silu(gate_out) * up_out;
+    // Fused silu * up via Tilelang (falls back to ATen)
+    auto activated = fused_swiglu_op(gate_out, up_out, 0.0);  // Qwen3.6 dense MLP has no clamp
     return at::matmul(activated, down_proj.t()).reshape({batch, seq, hidden_dim});
 }
 
@@ -516,14 +601,16 @@ static at::Tensor moe_forward(
             auto gu = at::matmul(selected, egu.t());
             auto gate_part = gu.narrow(-1, 0, intermediate);
             auto up_part = gu.narrow(-1, intermediate, intermediate);
-            auto expert_out = at::matmul(at::silu(gate_part) * up_part, ed.t());
+            auto expert_out = at::matmul(fused_swiglu_op(gate_part, up_part, 0.0), ed.t());
             auto weights = expert_weights.index_select(0, token_indices).unsqueeze(-1);
             routed_output = routed_output.index_add_(0, token_indices, expert_out * weights);
         }
     }
 
-    // Shared expert (same as before)
-    auto shared_out = at::matmul(at::silu(at::matmul(flat, shared_gate_proj.t())) * at::matmul(flat, shared_up_proj.t()), shared_down_proj.t());
+    // Shared expert (same as before, with fused SwiGLU)
+    auto shared_gate = at::matmul(flat, shared_gate_proj.t());
+    auto shared_up = at::matmul(flat, shared_up_proj.t());
+    auto shared_out = at::matmul(fused_swiglu_op(shared_gate, shared_up, 0.0), shared_down_proj.t());
     auto seg = at::sigmoid(at::matmul(flat, shared_expert_gate_w.t())).to(compute_type);
     shared_out = (shared_out * seg).to(compute_type);
     return (routed_output + shared_out).reshape({batch, seq, hidden_dim});
@@ -1920,6 +2007,7 @@ void* qwen36_create_training_context(
     const int64_t* target_layers, int64_t num_target_layers
 ) {
     try {
+        load_tilelang_kernels();  // Load Tilelang fused kernels if available
         auto* ctx = new TrainingContext();
         ctx->compute_type = static_cast<at::ScalarType>(compute_type);
         ctx->lr = lr; ctx->beta1 = beta1; ctx->beta2 = beta2; ctx->eps = eps;
