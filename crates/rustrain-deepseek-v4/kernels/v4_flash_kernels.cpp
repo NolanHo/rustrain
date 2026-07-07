@@ -3,17 +3,36 @@
 // All compute in C++: forward + loss + backward + Adam optimizer.
 // LoRA A/B created in C++ as at::Tensor (requires_grad=true).
 // No tch-rs VarStore — gradients flow entirely within C++ autograd.
+// Async NCCL: MoE output all_reduce overlapped with next layer's compute.
 
 #include <ATen/ATen.h>
 #include <c10/cuda/CUDAStream.h>
+#include <c10/cuda/CUDACachingAllocator.h>
 #include <torch/csrc/autograd/grad_mode.h>
 #include <torch/csrc/autograd/custom_function.h>
 #include <torch/csrc/autograd/autograd.h>
+#include <cuda_runtime_api.h>
 #include <cstdio>
 #include <cmath>
 #include <vector>
 #include <cstring>
 #include <memory>
+
+// ── NCCL forward declarations (avoid #include <nccl.h> which pulls in cuda_fp16.h → nv/target) ──
+typedef void* ncclComm_t;
+typedef int ncclResult_t;
+typedef enum { ncclSum = 0 } ncclRedOp_t;
+// ncclDataType_t: we only need BFloat16 and Float
+typedef enum {
+    ncclInt8 = 0, ncclChar = 0,
+    ncclUint8 = 1, ncclInt32 = 2, ncclInt = 2, ncclFloat32 = 3, ncclFloat = 3,
+    ncclBfloat16 = 9,
+} ncclDataType_t;
+extern "C" {
+    ncclResult_t ncclAllReduce(const void* sendbuff, void* recvbuff, size_t count,
+                                ncclDataType_t datatype, ncclRedOp_t op,
+                                ncclComm_t comm, void* stream);
+}
 
 // ──────────────────────────────────────────────────────────────────────
 // Helpers
@@ -420,6 +439,45 @@ static at::Tensor mtp_compute_loss(
 }
 
 // ──────────────────────────────────────────────────────────────────────
+// NCCL helpers (async all_reduce with CUDA events)
+// ──────────────────────────────────────────────────────────────────────
+
+// Launch async all_reduce on comm_stream, return output + event for later sync.
+// Does NOT block the compute stream — caller must cudaStreamWaitEvent before using output.
+static void async_all_reduce(
+    ncclComm_t comm, cudaStream_t comm_stream,
+    const at::Tensor& input, at::Tensor& output, cudaEvent_t& event)
+{
+    int64_t count = input.numel();
+    ncclDataType_t dtype;
+    switch (input.scalar_type()) {
+        case at::kBFloat16: dtype = ncclBfloat16; break;
+        case at::kFloat:    dtype = ncclFloat;    break;
+        default:            dtype = ncclFloat;    break;
+    }
+    ncclAllReduce(input.data_ptr(), output.data_ptr(), count, dtype, ncclSum, comm, comm_stream);
+    cudaEventCreateWithFlags(&event, cudaEventDisableTiming);
+    cudaEventRecord(event, comm_stream);
+}
+
+// Blocking all_reduce (for LoRA gradients before Adam).
+static void sync_all_reduce(
+    ncclComm_t comm, cudaStream_t comm_stream, at::Tensor& tensor)
+{
+    int64_t count = tensor.numel();
+    auto buf = at::zeros_like(tensor);
+    ncclDataType_t dtype;
+    switch (tensor.scalar_type()) {
+        case at::kBFloat16: dtype = ncclBfloat16; break;
+        case at::kFloat:    dtype = ncclFloat;    break;
+        default:            dtype = ncclFloat;    break;
+    }
+    ncclAllReduce(tensor.data_ptr(), buf.data_ptr(), count, dtype, ncclSum, comm, comm_stream);
+    cudaStreamSynchronize(comm_stream);
+    tensor.copy_(buf);
+}
+
+// ──────────────────────────────────────────────────────────────────────
 // Training Context
 // ──────────────────────────────────────────────────────────────────────
 
@@ -458,6 +516,12 @@ struct TrainingContext {
     // Checkpointing
     bool use_checkpoint;
     int64_t group_size;
+
+    // NCCL (for EP gradient sync)
+    ncclComm_t nccl_comm;
+    cudaStream_t comm_stream;
+    int world_size;
+    int rank;
 };
 
 // Weight count per layer: 14 base + 3*n_local_experts + (6 if HC else 0)
@@ -465,8 +529,9 @@ static int64_t weight_count_for_layer(const V4LayerConfig& cfg) {
     return 14 + 3 * cfg.expert_count + (cfg.num_hash_layers > 0 ? 6 : 0);
 }
 
-// Forward pass for a single layer
-static at::Tensor forward_single_layer(
+// Forward pass for a single layer — returns (residual, mlp_output) separately
+// so the caller can all_reduce the MoE output for EP.
+static std::pair<at::Tensor, at::Tensor> forward_single_layer_split(
     TrainingContext* ctx, const at::Tensor& hidden, int64_t layer_idx)
 {
     auto& cfg = ctx->layer_configs[layer_idx];
@@ -477,7 +542,6 @@ static at::Tensor forward_single_layer(
     auto** w = ctx->weight_ptrs.data() + w_offset;
     auto kind = ctx->compute_type;
 
-    // Compress
     auto h = hidden;
     if (cfg.compress_ratio > 1) {
         h = compress_seq(hidden, cfg.compress_ratio);
@@ -485,7 +549,6 @@ static at::Tensor forward_single_layer(
 
     auto attn_input = rms_norm(h, *w[0], cfg.rms_eps);
 
-    // LoRA on attention weights (wq_a=w[2], wq_b=w[3], wkv=w[4], wo_a=w[5], wo_b=w[6])
     auto wq_a = *w[2], wq_b = *w[3], wkv = *w[4], wo_a = *w[5], wo_b = *w[6];
     if (cfg.has_lora) {
         int64_t la_off = ctx->lora_layer_offset[layer_idx];
@@ -496,10 +559,9 @@ static at::Tensor forward_single_layer(
         wo_b = lora_delta(wo_b, ctx->lora_a[la_off+4], ctx->lora_b[la_off+4], ctx->lora_scaling);
     }
 
-    // Attention (with optional HC)
     at::Tensor** hc_ptr = nullptr;
     if (cfg.num_hash_layers > 0) {
-        hc_ptr = w + 14 + 3 * cfg.expert_count;  // 6 HC weights
+        hc_ptr = w + 14 + 3 * cfg.expert_count;
     }
     auto attn_out = v4_attention(attn_input, wq_a, wq_b, wkv, wo_a, wo_b,
         *w[7], *w[8], *w[9], hc_ptr, &cfg, kind);
@@ -507,7 +569,6 @@ static at::Tensor forward_single_layer(
     auto residual = h + attn_out;
     auto mlp_input = rms_norm(residual, *w[1], cfg.rms_eps);
 
-    // MoE
     auto mlp_out = v4_moe_mlp(mlp_input, *w[10],
         *w[11], *w[12], *w[13],
         w + 14, w + 14 + cfg.expert_count, w + 14 + 2*cfg.expert_count,
@@ -516,16 +577,49 @@ static at::Tensor forward_single_layer(
         cfg.hc_sinkhorn_iters, cfg.hc_mult, cfg.hc_eps,
         cfg.n_experts, cfg.expert_start, kind);
 
-    return residual + mlp_out;
+    return {residual, mlp_out};
 }
 
-// Full forward (no checkpointing)
+// Full forward with async NCCL pipeline (no checkpointing)
 static at::Tensor forward_full(TrainingContext* ctx, const at::Tensor& input_ids) {
     at::AutoGradMode guard(true);
     auto hidden = at::embedding(*ctx->embed_ptr, input_ids);
 
+    // Async pipeline: (pending_output, pending_event) from previous layer's all_reduce.
+    at::Tensor pending_output;
+    cudaEvent_t pending_event = nullptr;
+
     for (int64_t i = 0; i < ctx->num_layers; i++) {
-        hidden = forward_single_layer(ctx, hidden, i);
+        // Wait for previous layer's async all_reduce to complete (GPU-side, no CPU block)
+        if (pending_event) {
+            auto compute_stream = at::cuda::getCurrentCUDAStream();
+            cudaStreamWaitEvent(compute_stream, pending_event);
+            cudaEventDestroy(pending_event);
+            pending_event = nullptr;
+            hidden = pending_output;
+        }
+
+        auto [residual, mlp_out] = forward_single_layer_split(ctx, hidden, i);
+
+        if (ctx->world_size > 1) {
+            // Async all_reduce on MoE output (shared expert is replicated → divide by world_size)
+            auto pd = mlp_out.detach();
+            auto reduced = at::zeros_like(pd);
+            async_all_reduce(ctx->nccl_comm, ctx->comm_stream, pd, reduced, pending_event);
+            auto full = (reduced / (double)ctx->world_size).to(ctx->compute_type);
+            full.set_requires_grad(true);
+            hidden = residual + full;
+            pending_output = hidden;
+        } else {
+            hidden = residual + mlp_out;
+        }
+    }
+
+    // Wait for final all_reduce
+    if (pending_event) {
+        auto compute_stream = at::cuda::getCurrentCUDAStream();
+        cudaStreamWaitEvent(compute_stream, pending_event);
+        cudaEventDestroy(pending_event);
     }
 
     // Decompress
@@ -541,12 +635,23 @@ static at::Tensor forward_full(TrainingContext* ctx, const at::Tensor& input_ids
     return hidden;
 }
 
-// Gradient checkpointing
+// Gradient checkpointing — uses the non-split forward (no per-layer all_reduce).
+// For EP + checkpointing, all_reduce is done after backward on LoRA grads.
 static at::Tensor forward_layer_group(TrainingContext* ctx, const at::Tensor& input,
                                        int64_t start, int64_t end) {
     at::Tensor h = input;
     for (int64_t i = start; i < end; i++) {
-        h = forward_single_layer(ctx, h, i);
+        auto [residual, mlp_out] = forward_single_layer_split(ctx, h, i);
+        if (ctx->world_size > 1) {
+            // Synchronous all_reduce within checkpoint groups (simpler, no async overlap)
+            auto pd = mlp_out.detach();
+            sync_all_reduce(ctx->nccl_comm, ctx->comm_stream, pd);
+            auto full = (pd / (double)ctx->world_size).to(ctx->compute_type);
+            full.set_requires_grad(true);
+            h = residual + full;
+        } else {
+            h = residual + mlp_out;
+        }
     }
     return h;
 }
@@ -716,8 +821,24 @@ double v4_train_step(void* ctx_ptr, void* input_ids_ptr, void* target_mask_ptr) 
         double loss_val = loss.item<double>();
         loss.backward();
 
-        // Adam
+        // Sync LoRA gradients across ranks (EP mode: attention is replicated)
         at::AutoGradMode guard(false);
+        if (ctx->world_size > 1) {
+            for (size_t i = 0; i < ctx->lora_a.size(); i++) {
+                auto& ga = ctx->lora_a[i].mutable_grad();
+                if (ga.defined() && ga.numel() > 0) {
+                    sync_all_reduce(ctx->nccl_comm, ctx->comm_stream, ga);
+                    ga.div_((double)ctx->world_size);
+                }
+                auto& gb = ctx->lora_b[i].mutable_grad();
+                if (gb.defined() && gb.numel() > 0) {
+                    sync_all_reduce(ctx->nccl_comm, ctx->comm_stream, gb);
+                    gb.div_((double)ctx->world_size);
+                }
+            }
+        }
+
+        // Adam
         ctx->step_count++;
         double sf = (double)ctx->step_count;
         double bc1 = 1.0 - std::pow(ctx->beta1, sf);
@@ -779,6 +900,15 @@ void v4_set_checkpoint(void* ctx_ptr, int32_t enable, int64_t group_size) {
     auto* ctx = reinterpret_cast<TrainingContext*>(ctx_ptr);
     ctx->use_checkpoint = (enable != 0);
     ctx->group_size = (group_size > 0) ? group_size : 4;
+}
+
+void v4_set_nccl_comm(void* ctx_ptr, void* comm, void* stream, int32_t rank, int32_t world_size) {
+    auto* ctx = reinterpret_cast<TrainingContext*>(ctx_ptr);
+    ctx->nccl_comm = reinterpret_cast<ncclComm_t>(comm);
+    ctx->comm_stream = reinterpret_cast<cudaStream_t>(stream);
+    ctx->rank = rank;
+    ctx->world_size = world_size;
+    fprintf(stderr, "[v4_ctx] NCCL set: rank=%d world_size=%d\n", rank, world_size);
 }
 
 }  // extern "C"

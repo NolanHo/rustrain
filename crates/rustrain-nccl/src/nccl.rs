@@ -781,6 +781,22 @@ impl NcclPersistentComm {
         })
     }
 
+    /// Get raw NCCL communicator pointer (for passing to C++ kernels).
+    pub fn raw_comm_ptr(&self) -> *mut c_void {
+        self.comm as *mut c_void
+    }
+
+    /// Get raw CUDA stream pointer (for passing to C++ kernels).
+    pub fn raw_stream_ptr(&self) -> *mut c_void {
+        self.comm_stream as *mut c_void
+    }
+
+    /// Get rank.
+    pub fn rank(&self) -> usize { self.rank }
+
+    /// Get world size.
+    pub fn world_size(&self) -> usize { self.world_size }
+
     /// All-reduce a tensor (sum) using the persistent communicator.
     /// Returns the reduced tensor (sum across all ranks).
     /// Uses comm_stream — does NOT block CPU. Call `comm_sync()` to wait.

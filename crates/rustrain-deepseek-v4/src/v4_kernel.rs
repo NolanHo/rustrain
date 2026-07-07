@@ -22,6 +22,7 @@ type FnGetLoraA = unsafe extern "C" fn(*mut c_void, i64) -> *mut c_void;
 type FnGetLoraB = unsafe extern "C" fn(*mut c_void, i64) -> *mut c_void;
 type FnFreeCtx = unsafe extern "C" fn(*mut c_void);
 type FnSetCheckpoint = unsafe extern "C" fn(*mut c_void, i32, i64);
+type FnSetNcclComm = unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void, i32, i32);
 
 #[repr(C)]
 pub struct V4LayerConfig {
@@ -68,6 +69,7 @@ struct KernelHandles {
     get_lora_b: FnGetLoraB,
     free_ctx: FnFreeCtx,
     set_checkpoint: FnSetCheckpoint,
+    set_nccl_comm: FnSetNcclComm,
 }
 
 static KERNELS: OnceLock<Option<KernelHandles>> = OnceLock::new();
@@ -109,6 +111,7 @@ unsafe fn load_kernels() -> Option<KernelHandles> {
         get_lora_b: sym!("v4_get_lora_b"),
         free_ctx: sym!("v4_free_training_context"),
         set_checkpoint: sym!("v4_set_checkpoint"),
+        set_nccl_comm: sym!("v4_set_nccl_comm"),
     })
 }
 
@@ -376,6 +379,13 @@ impl V4CppTrainingContext {
     pub fn set_checkpoint(&self, enable: bool, group_size: i64) {
         if let Some(kh) = get_kernels() {
             unsafe { (kh.set_checkpoint)(self.ptr, if enable { 1 } else { 0 }, group_size) };
+        }
+    }
+
+    /// Set NCCL communicator for EP gradient sync. Must be called after `new()` for EP mode.
+    pub fn set_nccl_comm(&self, comm: *mut c_void, stream: *mut c_void, rank: i32, world_size: i32) {
+        if let Some(kh) = get_kernels() {
+            unsafe { (kh.set_nccl_comm)(self.ptr, comm, stream, rank, world_size) };
         }
     }
 }

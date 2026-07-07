@@ -205,25 +205,66 @@ fn main() {
     let v4_src = "kernels/v4_flash_kernels.cpp";
     let v4_lib = format!("{out_dir}/libv4_flash_kernels.so");
 
-    println!("cargo:warning=Compiling V4 Flash kernel: src={v4_src}");
+    // Find NCCL include + lib paths
+    let nccl_inc = std::env::var("NCCL_INCLUDE_PATH")
+        .unwrap_or_else(|_| {
+            let candidates = [
+                "/share/code/nolanho/mint-runtime-py31213/host-venv/lib/python3.12/site-packages/nvidia/nccl/include",
+            ];
+            for c in &candidates {
+                if std::path::Path::new(&format!("{c}/nccl.h")).exists() {
+                    return c.to_string();
+                }
+            }
+            String::new()
+        });
+    let nccl_lib_dir = std::env::var("NCCL_LIB_PATH")
+        .unwrap_or_else(|_| {
+            let candidates = [
+                "/share/code/nolanho/mint-runtime-py31213/host-venv/lib/python3.12/site-packages/nvidia/nccl/lib",
+            ];
+            for c in &candidates {
+                if std::path::Path::new(&format!("{c}/libnccl.so")).exists() {
+                    return c.to_string();
+                }
+            }
+            String::new()
+        });
+
+    let nccl_inc_arg = if nccl_inc.is_empty() { String::new() } else { format!("-I{nccl_inc}") };
+    let nccl_lib_args: Vec<String> = if nccl_lib_dir.is_empty() {
+        vec![]
+    } else {
+        vec![format!("-L{nccl_lib_dir}"), format!("-Wl,-rpath,{nccl_lib_dir}"), "-lnccl".to_string()]
+    };
+
+    println!("cargo:warning=Compiling V4 Flash kernel: src={v4_src} nccl_inc={nccl_inc} nccl_lib={nccl_lib_dir}");
+
+    let mut v4_args: Vec<String> = vec![
+        "-shared", "-fPIC", "-std=c++17", "-O2",
+        cxx11_abi,
+        "-o", &v4_lib,
+        v4_src,
+        &inc_torch, &inc_aten, &inc_c10, &inc_caffe2, &inc_cuda,
+        &l_arg, &rpath_arg,
+        "-Wl,--no-as-needed",
+        "-ltorch", "-ltorch_cuda", "-ltorch_cpu", "-lc10", "-lc10_cuda",
+    ].into_iter().map(String::from).collect();
+    if !nccl_inc_arg.is_empty() { v4_args.push(nccl_inc_arg); }
+    if !cuda_inc2.is_empty() { v4_args.push(format!("-I{cuda_inc2}")); }
+    v4_args.extend(nccl_lib_args.iter().cloned());
 
     let v4_status = Command::new("g++")
-        .args([
-            "-shared", "-fPIC", "-std=c++17", "-O2",
-            cxx11_abi,
-            "-o", &v4_lib,
-            v4_src,
-            &inc_torch, &inc_aten, &inc_c10, &inc_caffe2, &inc_cuda,
-            &l_arg, &rpath_arg,
-            "-Wl,--no-as-needed",
-            "-ltorch", "-ltorch_cuda", "-ltorch_cpu", "-lc10", "-lc10_cuda",
-        ])
-        .args(if cuda_inc2.is_empty() { vec![] } else { vec![format!("-I{cuda_inc2}")] })
+        .args(&v4_args)
         .status();
 
     match v4_status {
         Ok(s) if s.success() => {
             println!("cargo:rustc-link-lib=dylib=v4_flash_kernels");
+            if !nccl_lib_dir.is_empty() {
+                println!("cargo:rustc-link-search=native={nccl_lib_dir}");
+                println!("cargo:rustc-link-lib=dylib=nccl");
+            }
         }
         _ => {
             println!("cargo:warning=Failed to compile V4 Flash kernel, V4 C++ path disabled");

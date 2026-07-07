@@ -191,6 +191,16 @@ pub fn train_v4_lora_sft_ep(
         bail!("C++ kernels (libv4_flash_kernels.so) not found — required for training");
     }
 
+    // ── Create persistent NCCL communicator (for EP gradient sync) ──
+    let nccl_comm = if world_size > 1 {
+        let comm_dir = run_paths.root.join("nccl-comm");
+        let comm = NcclPersistentComm::new(&comm_dir)?;
+        info!(rank, "persistent NCCL communicator created");
+        Some(comm)
+    } else {
+        None
+    };
+
     let lora_scaling = lora_config.alpha as f64 / lora_config.rank as f64;
     let ctx = V4CppTrainingContext::new(
         &weights_gpu, &runtime_config, compute_kind,
@@ -203,6 +213,17 @@ pub fn train_v4_lora_sft_ep(
         true,  // has_lora
     )?;
     info!(rank, lora_params = ctx.lora_count(), "C++ TrainingContext created");
+
+    // Pass NCCL communicator to C++ (for async all_reduce in forward + LoRA grad sync)
+    if let Some(ref comm) = nccl_comm {
+        ctx.set_nccl_comm(
+            comm.raw_comm_ptr(),
+            comm.raw_stream_ptr(),
+            rank as i32,
+            world_size as i32,
+        );
+        info!(rank, "NCCL comm passed to C++ context");
+    }
 
     // Gradient checkpointing
     if let Ok(gs) = std::env::var("V4_CHECKPOINT_GROUP") {
