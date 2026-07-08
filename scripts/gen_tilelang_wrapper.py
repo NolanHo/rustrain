@@ -75,7 +75,7 @@ def main():
     # Compile with nvcc
     import subprocess
     result = subprocess.run([
-        "nvcc", "-shared", "-fPIC", "-O2", "-std=c++17",
+        "nvcc", "-shared", "-Xcompiler", "-fPIC", "-O2", "-std=c++17",
         "-o", so_path,
         wrapper_path,
         "-lcudart"
