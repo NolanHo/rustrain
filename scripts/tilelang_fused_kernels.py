@@ -20,7 +20,7 @@ import os
 # 1. Fused RMSNorm + Matmul (V4 Flash variant: weight only)
 # ──────────────────────────────────────────────────────────────────────
 
-@tilelang.jit(out_idx=[3], execution_backend="tvm_ffi")
+@tilelang.jit(out_idx=[3], execution_backend="tvm_ffi", target="cuda")
 def fused_rmsnorm_matmul(
     M: int, N: int, K: int,
     eps: float = 1e-6,
@@ -70,7 +70,7 @@ def fused_rmsnorm_matmul(
 # 1b. Fused RMSNorm + Matmul (Qwen3.6 variant: 1 + weight)
 # ──────────────────────────────────────────────────────────────────────
 
-@tilelang.jit(out_idx=[3], execution_backend="tvm_ffi")
+@tilelang.jit(out_idx=[3], execution_backend="tvm_ffi", target="cuda")
 def fused_rmsnorm_matmul_one_plus(
     M: int, N: int, K: int,
     eps: float = 1e-6,
@@ -121,7 +121,7 @@ def fused_rmsnorm_matmul_one_plus(
 # 2. Fused SwiGLU (silu(gate) * up, with optional clamp)
 # ──────────────────────────────────────────────────────────────────────
 
-@tilelang.jit(out_idx=[2], execution_backend="tvm_ffi")
+@tilelang.jit(out_idx=[2], execution_backend="tvm_ffi", target="cuda")
 def fused_swiglu(
     M: int, I: int,
     limit: float = 10.0,
