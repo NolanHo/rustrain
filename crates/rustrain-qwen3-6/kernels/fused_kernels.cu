@@ -33,7 +33,8 @@ __global__ void fused_rmsnorm_kernel(
     __nv_bfloat16* out_row = output + row * K;
 
     // Phase 1: compute sum of squares (reduction within block)
-    extern __shared__ float smem[];
+    extern __shared__ __nv_bfloat16 smem_rms[];
+    float* smem = (float*)smem_rms;
     float local_sum = 0.0f;
     for (int k = threadIdx.x; k < K; k += blockDim.x) {
         float v = __bfloat162float(in_row[k]);
