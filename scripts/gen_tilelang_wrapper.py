@@ -88,7 +88,6 @@ def main():
         f"-I{tl_include}",
         f"-I{cutlass_include}",
         "-diag-suppress", "20012",
-        "-diag-suppress", "177-D",
         "--expt-relaxed-constexpr",
         "-o", obj_path,
         wrapper_path,
