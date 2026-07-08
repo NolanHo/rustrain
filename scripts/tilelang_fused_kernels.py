@@ -151,11 +151,11 @@ def fused_swiglu(
                     for j in T.serial(64):
                         g = T.cast(gate_shared[i, j], "float32")
                         u = T.cast(up_shared[i, j], "float32")
-                        val = T.cast(1.0, "float32") / (T.cast(1.0, "float32") + T.exp(-g)) * u
+                        v = T.cast(1.0, "float32") / (T.cast(1.0, "float32") + T.exp(-g)) * u
                         if limit > 0.0:
-                            val = T.max(val, T.cast(-limit, "float32"))
-                            val = T.min(val, T.cast(limit, "float32"))
-                        out_local[i, j] = T.cast(val, "bfloat16")
+                            v = T.max(v, T.cast(-limit, "float32"))
+                            v = T.min(v, T.cast(limit, "float32"))
+                        out_local[i, j] = T.cast(v, "bfloat16")
 
                 T.copy(out_local, activated[bx * block_m:(bx + 1) * block_m, ki * 64:(ki + 1) * 64])
 
