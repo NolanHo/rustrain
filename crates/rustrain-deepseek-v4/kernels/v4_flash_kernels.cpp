@@ -67,16 +67,37 @@ static at::Tensor fused_rmsnorm_op(
     return output;
 }
 
-/// Fused SwiGLU: silu(gate) * up + clamp — single CUDA kernel
+/// Fused SwiGLU with autograd: forward uses CUDA kernel, backward uses ATen ops
+struct FusedSwiGLUFunction : public torch::autograd::Function<FusedSwiGLUFunction> {
+    static at::Tensor forward(torch::autograd::AutogradContext* ctx,
+        at::Tensor gate, at::Tensor up, double limit) {
+        ctx->saved_data["limit"] = limit;
+        ctx->save_for_backward({gate, up});
+        auto output = at::empty_like(gate);
+        int N = gate.numel();
+        auto stream = c10::cuda::getCurrentCUDAStream().stream();
+        launch_fused_swiglu(gate.data_ptr(), up.data_ptr(), output.data_ptr(),
+            N, (float)limit, stream);
+        return output;
+    }
+    static std::vector<at::Tensor> backward(torch::autograd::AutogradContext* ctx,
+        std::vector<at::Tensor> grad_out) {
+        auto saved = ctx->get_saved_variables();
+        auto gate = saved[0];
+        auto up = saved[1];
+        auto grad = grad_out[0];
+        auto sig = at::sigmoid(gate);
+        auto silu_grad = sig * (1.0 + gate * (1.0 - sig));
+        auto grad_gate = grad * silu_grad * up;
+        auto grad_up = grad * (gate * sig);
+        return {grad_gate, grad_up, at::Tensor()};
+    }
+};
+
 static at::Tensor fused_swiglu_op(
     const at::Tensor& gate_out, const at::Tensor& up_out, double limit
 ) {
-    auto output = at::empty_like(gate_out);
-    int N = gate_out.numel();
-    auto stream = c10::cuda::getCurrentCUDAStream().stream();
-    launch_fused_swiglu(gate_out.data_ptr(), up_out.data_ptr(), output.data_ptr(),
-        N, (float)limit, stream);
-    return output;
+    return FusedSwiGLUFunction::apply(gate_out, up_out, limit);
 }
 
 /// Fused RMSNorm + Matmul — single CUDA kernel
