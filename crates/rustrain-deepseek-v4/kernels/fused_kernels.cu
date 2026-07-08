@@ -84,15 +84,21 @@ __global__ void fused_swiglu_kernel(
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= N) return;
 
-    float g = __bfloat162float(gate[idx]);
-    float u = __bfloat162float(up[idx]);
-    // silu(g) = g * sigmoid(g) = g / (1 + exp(-g))
-    float silu_g = g / (1.0f + expf(-g));
-    float v = silu_g * u;
+    __nv_bfloat16 g = gate[idx];
+    __nv_bfloat16 u = up[idx];
+    // silu(g) = g * sigmoid(g) — all in BF16
+    __nv_bfloat16 sigmoid_g = __hdiv(
+        __float2bfloat16(1.0f),
+        __hadd(__float2bfloat16(1.0f), hexp(__hneg(g)))
+    );
+    __nv_bfloat16 silu_g = __hmul(g, sigmoid_g);
+    __nv_bfloat16 v = __hmul(silu_g, u);
     if (limit > 0.0f) {
-        v = fmaxf(fminf(v, limit), -limit);
+        __nv_bfloat16 lim = __float2bfloat16(limit);
+        __nv_bfloat16 neg_lim = __float2bfloat16(-limit);
+        v = __hmax(__hmin(v, lim), neg_lim);
     }
-    out[idx] = __float2bfloat16_rn(v);
+    out[idx] = v;
 }
 
 // ──────────────────────────────────────────────────────────────────────
