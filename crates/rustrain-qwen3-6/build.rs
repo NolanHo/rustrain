@@ -103,17 +103,26 @@ fn main() {
         .status();
 
     // ── Compile CUDA kernels (.cu files) with nvcc ──
-    let nvcc = std::env::var("CUDA_HOME")
-        .map(|h| format!("{h}/bin/nvcc"))
-        .unwrap_or_else(|_| "nvcc".to_string());
-    let nvcc_path = which(&nvcc).unwrap_or_else(|| {
-        // Try PATH
-        if std::process::Command::new("nvcc").arg("--version").output().is_ok() {
-            "nvcc".to_string()
-        } else {
-            String::new()
+    let nvcc_path = {
+        let candidates = [
+            std::env::var("CUDA_HOME").ok().map(|h| format!("{h}/bin/nvcc")),
+            Some("nvcc".to_string()),
+        ];
+        let mut found = String::new();
+        for c in &candidates {
+            if let Some(c) = c {
+                if std::path::Path::new(c).exists() {
+                    found = c.clone();
+                    break;
+                }
+                if std::process::Command::new(c).arg("--version").output().is_ok() {
+                    found = c.clone();
+                    break;
+                }
+            }
         }
-    });
+        found
+    };
 
     if !nvcc_path.is_empty() {
         // delta_rule.cu includes delta_rule.cuh which has __global__ kernels — needs nvcc
