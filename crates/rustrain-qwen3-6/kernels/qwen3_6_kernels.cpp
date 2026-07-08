@@ -594,7 +594,7 @@ static at::Tensor moe_forward(
 
     auto routed_output = at::zeros(flat.sizes(), flat.options());
 
-    // Debug: dump MoE routing and weight stats for last layer
+    // Debug: dump MoE routing and weight stats
     if (getenv("QWEN36_DUMP_MOE")) {
         auto rl_f = router_logits.to(at::kFloat);
         auto rw_f = topk_weights.to(at::kFloat);
@@ -610,25 +610,6 @@ static at::Tensor moe_forward(
         fprintf(stderr, "  [moe] shared_down: mean=%.6f std=%.6f max=%.6f\n", sd_f.mean().item<float>(), sd_f.std().item<float>(), sd_f.abs().max().item<float>());
         auto seg_f = at::sigmoid(at::matmul(flat, shared_expert_gate_w.t())).to(at::kFloat);
         fprintf(stderr, "  [moe] shared_gate_sig: mean=%.6f std=%.6f max=%.6f\n", seg_f.mean().item<float>(), seg_f.std().item<float>(), seg_f.abs().max().item<float>());
-        // Check topk indices
-        auto ti = topk_indices.to(at::kCPU);
-        fprintf(stderr, "  [moe] topk_indices[0]: %ld %ld %ld %ld %ld %ld %ld %ld\n",
-            (long)ti[0][0].item<int64_t>(), (long)ti[0][1].item<int64_t>(),
-            (long)ti[0][2].item<int64_t>(), (long)ti[0][3].item<int64_t>(),
-            (long)ti[0][4].item<int64_t>(), (long)ti[0][5].item<int64_t>(),
-            (long)ti[0][6].item<int64_t>(), (long)ti[0][7].item<int64_t>());
-        fprintf(stderr, "  [moe] topk_indices dtype: %d\n", (int)topk_indices.scalar_type());
-        fprintf(stderr, "  [moe] expert_start=%ld expert_count=%ld top_k=%ld\n",
-            (long)expert_start, (long)expert_count, (long)top_k);
-        // Check if expert 132 matches for kk=0
-        {
-            auto ei = topk_indices.select(-1, 0);  // [N] first expert per token
-            auto mask132 = ei.eq((int64_t)132);
-            int64_t m132 = mask132.sum().item<int64_t>();
-            fprintf(stderr, "  [moe] tokens matching expert 132 (kk=0): %ld\n", (long)m132);
-        }
-        auto ro_f = routed_output.to(at::kFloat);
-        fprintf(stderr, "  [moe] routed_output: mean=%.6f std=%.6f max=%.6f\n", ro_f.mean().item<float>(), ro_f.std().item<float>(), ro_f.abs().max().item<float>());
     }
 
     for (int64_t kk = 0; kk < top_k; kk++) {
@@ -659,6 +640,15 @@ static at::Tensor moe_forward(
     auto shared_out = at::matmul(fused_swiglu_op(shared_gate, shared_up, 0.0), shared_down_proj.t());
     auto seg = at::sigmoid(at::matmul(flat, shared_expert_gate_w.t())).to(compute_type);
     shared_out = (shared_out * seg).to(compute_type);
+
+    // Debug: dump routed_output AFTER loop
+    if (getenv("QWEN36_DUMP_MOE")) {
+        auto ro_f = routed_output.to(at::kFloat);
+        auto so_f = shared_out.to(at::kFloat);
+        fprintf(stderr, "  [moe] routed_output (after loop): mean=%.6f std=%.6f max=%.6f\n", ro_f.mean().item<float>(), ro_f.std().item<float>(), ro_f.abs().max().item<float>());
+        fprintf(stderr, "  [moe] shared_out: mean=%.6f std=%.6f max=%.6f\n", so_f.mean().item<float>(), so_f.std().item<float>(), so_f.abs().max().item<float>());
+    }
+
     return (routed_output + shared_out).reshape({batch, seq, hidden_dim});
 }
 
