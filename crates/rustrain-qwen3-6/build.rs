@@ -118,8 +118,9 @@ fn main() {
     if !nvcc_path.is_empty() {
         // fused_backward.cu has __global__ kernels — needs nvcc
         let cu_files_needing_nvcc = ["kernels/fused_backward.cu"];
-        // delta_rule.cu and megakernel.cu are pure C++ (no __global__), compile with g++
-        let cu_files_gpp = ["kernels/delta_rule.cu", "kernels/megakernel.cu"];
+        // delta_rule.cu is pure C++ (no __global__), compile with g++
+        // megakernel.cu is #included into qwen3_6_kernels.cpp
+        let cu_files_gpp = ["kernels/delta_rule.cu"];
 
         let mut obj_files = vec![];
 
