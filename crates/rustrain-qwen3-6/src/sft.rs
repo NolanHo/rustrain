@@ -107,6 +107,9 @@ impl SftDataset {
         let answer_id = self.tokenizer.token_to_id("").map(|t| t as i64).unwrap_or(248069);
         let newline_id = self.tokenizer.token_to_id("\n\n").map(|t| t as i64).unwrap_or(271);
 
+        eprintln!("[SFT_DEBUG] prompt_ids={:?} think={} answer={} nl={}", 
+            prompt_ids.iter().take(5).copied().collect::<Vec<_>>(), think_id, answer_id, newline_id);
+
         // Response tokens
         let response_encoding = self.tokenizer.encode(example.response.as_str(), true)
             .map_err(|e| anyhow::anyhow!("tokenizer error: {e}"))
