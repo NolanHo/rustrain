@@ -944,6 +944,13 @@ static at::Tensor forward_full(
     at::AutoGradMode guard(true);
     at::Tensor hidden = at::embedding(embed, input_ids);
 
+    // Debug: dump embedding output stats
+    if (getenv("QWEN36_DUMP_LAYERS")) {
+        auto h_f = hidden.to(at::kFloat);
+        fprintf(stderr, "Layer  0 (embed): mean=%.6f std=%.6f max_abs=%.6f\n",
+            h_f.mean().item<float>(), h_f.std().item<float>(), h_f.abs().max().item<float>());
+    }
+
     for (int64_t i = 0; i < ctx->num_layers; i++) {
         // Get weight pointers for this layer
         int64_t w_offset = 0;
@@ -968,6 +975,13 @@ static at::Tensor forward_full(
 
         hidden = forward_single_layer(hidden, layer_w.data(), &ctx->layer_configs[i],
             kind, ctx->lora_scaling, la_ptrs.data(), lb_ptrs.data());
+
+        // Debug: dump per-layer hidden state stats (matching HF output_hidden_states)
+        if (getenv("QWEN36_DUMP_LAYERS")) {
+            auto h_f = hidden.to(at::kFloat);
+            fprintf(stderr, "Layer %2ld: mean=%.6f std=%.6f max_abs=%.6f\n",
+                i, h_f.mean().item<float>(), h_f.std().item<float>(), h_f.abs().max().item<float>());
+        }
 
         // Sync + release CUDA allocator cache after each layer in no-grad forward.
         // Without sync, pending CUDA ops hold references to intermediates,
