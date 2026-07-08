@@ -167,13 +167,7 @@ static at::Tensor full_attention(
     // Full attention always uses SDPA (Flash Attention) — O(seq) memory.
     // QWEN36_SEQ_CHUNK only affects linear_attention (delta rule state passing).
     // For large sequences, chunk the q/k/v projections to avoid OOM on single matmul.
-    const char* proj_chunk_env = getenv("QWEN36_PROJ_CHUNK");
-    int64_t proj_chunk = proj_chunk_env ? atoll(proj_chunk_env) : 0;
-
-    // Debug: confirm proj_chunk is read
-    if (proj_chunk > 0 && seq > proj_chunk) {
-        fprintf(stderr, "[proj_debug] full_attention: seq=%ld proj_chunk=%ld (chunked)\n", (long)seq, (long)proj_chunk);
-    }
+        }
 
     at::Tensor q, gate, k, v;
 
@@ -218,52 +212,6 @@ static at::Tensor full_attention(
     k = rms_norm(k, k_norm, rms_eps);
 
     // Debug: memory after rms_norm
-    {
-        size_t free2, total2;
-        cudaMemGetInfo(&free2, &total2);
-        fprintf(stderr, "[mem_debug] after rms_norm: used=%.1f GB, free=%.1f GB\n",
-            (total2 - free2) / 1e9, free2 / 1e9);
-    }
-
-    // Release gate before RoPE to save 16GB
-    auto gate_saved = gate;
-    gate = at::Tensor();
-    cudaDeviceSynchronize();
-    c10::cuda::CUDACachingAllocator::emptyCache();
-
-    // Debug: memory after gate release
-    {
-        size_t free2, total2;
-        cudaMemGetInfo(&free2, &total2);
-        fprintf(stderr, "[mem_debug] after gate release: used=%.1f GB, free=%.1f GB\n",
-            (total2 - free2) / 1e9, free2 / 1e9);
-    }
-
-    if (rotary_dim > 0) {
-        auto pos = at::arange(seq, at::TensorOptions().dtype(at::kFloat).device(device)).unsqueeze(0);
-        auto exponents = at::arange(0, rotary_dim, 2, at::TensorOptions().dtype(at::kFloat).device(device)) / (double)rotary_dim;
-        auto inv_freq = (exponents * std::log(rope_theta)).exp().reciprocal();
-        auto freqs = pos.unsqueeze(-1) * inv_freq.unsqueeze(0);
-        auto emb = at::cat({freqs, freqs}, -1);
-        auto cos = emb.cos().unsqueeze(1).to(q.scalar_type());
-        auto sin = emb.sin().unsqueeze(1).to(q.scalar_type());
-
-        // In-place RoPE to avoid creating additional 16GB tensors
-        auto q_rot = q.narrow(-1, 0, rotary_dim);
-        auto k_rot = k.narrow(-1, 0, rotary_dim);
-        auto rotate_half_q = at::cat({-q_rot.narrow(-1, rotary_dim/2, rotary_dim/2), q_rot.narrow(-1, 0, rotary_dim/2)}, -1);
-        auto rotate_half_k = at::cat({-k_rot.narrow(-1, rotary_dim/2, rotary_dim/2), k_rot.narrow(-1, 0, rotary_dim/2)}, -1);
-        // q_rotated = q_rot * cos + rotate_half(q_rot) * sin — in-place
-        q_rot.mul_(cos).add_(rotate_half_q * sin);
-        k_rot.mul_(cos).add_(rotate_half_k * sin);
-        // q and k are now modified in-place (RoPE applied to rotary_dim part)
-        rotate_half_q = at::Tensor();
-        rotate_half_k = at::Tensor();
-        cos = at::Tensor();
-        sin = at::Tensor();
-        cudaDeviceSynchronize();
-        c10::cuda::CUDACachingAllocator::emptyCache();
-    }
 
     // Restore gate after RoPE
     gate = gate_saved;
@@ -616,22 +564,7 @@ static at::Tensor moe_forward(
     auto routed_output = at::zeros(flat.sizes(), flat.options());
 
     // Debug: dump MoE routing and weight stats
-    if (getenv("QWEN36_DUMP_MOE")) {
-        auto rl_f = router_logits.to(at::kFloat);
-        auto rw_f = topk_weights.to(at::kFloat);
-        auto egu_f = experts_gate_up.select(0, 0).to(at::kFloat);
-        auto ed_f = experts_down.select(0, 0).to(at::kFloat);
-        fprintf(stderr, "  [moe] router_logits: mean=%.6f std=%.6f max=%.6f\n", rl_f.mean().item<float>(), rl_f.std().item<float>(), rl_f.abs().max().item<float>());
-        fprintf(stderr, "  [moe] topk_weights: mean=%.6f std=%.6f max=%.6f\n", rw_f.mean().item<float>(), rw_f.std().item<float>(), rw_f.abs().max().item<float>());
-        fprintf(stderr, "  [moe] experts_gate_up[0]: mean=%.6f std=%.6f max=%.6f\n", egu_f.mean().item<float>(), egu_f.std().item<float>(), egu_f.abs().max().item<float>());
-        fprintf(stderr, "  [moe] experts_down[0]: mean=%.6f std=%.6f max=%.6f\n", ed_f.mean().item<float>(), ed_f.std().item<float>(), ed_f.abs().max().item<float>());
-        auto sg_f = shared_gate_proj.to(at::kFloat);
-        auto sd_f = shared_down_proj.to(at::kFloat);
-        fprintf(stderr, "  [moe] shared_gate: mean=%.6f std=%.6f max=%.6f\n", sg_f.mean().item<float>(), sg_f.std().item<float>(), sg_f.abs().max().item<float>());
-        fprintf(stderr, "  [moe] shared_down: mean=%.6f std=%.6f max=%.6f\n", sd_f.mean().item<float>(), sd_f.std().item<float>(), sd_f.abs().max().item<float>());
-        auto seg_f = at::sigmoid(at::matmul(flat, shared_expert_gate_w.t())).to(at::kFloat);
-        fprintf(stderr, "  [moe] shared_gate_sig: mean=%.6f std=%.6f max=%.6f\n", seg_f.mean().item<float>(), seg_f.std().item<float>(), seg_f.abs().max().item<float>());
-    }
+    
 
     for (int64_t kk = 0; kk < top_k; kk++) {
         auto expert_indices = topk_indices.select(-1, kk);
@@ -663,12 +596,7 @@ static at::Tensor moe_forward(
     shared_out = (shared_out * seg).to(compute_type);
 
     // Debug: dump routed_output AFTER loop
-    if (getenv("QWEN36_DUMP_MOE")) {
-        auto ro_f = routed_output.to(at::kFloat);
-        auto so_f = shared_out.to(at::kFloat);
-        fprintf(stderr, "  [moe] routed_output (after loop): mean=%.6f std=%.6f max=%.6f\n", ro_f.mean().item<float>(), ro_f.std().item<float>(), ro_f.abs().max().item<float>());
-        fprintf(stderr, "  [moe] shared_out: mean=%.6f std=%.6f max=%.6f\n", so_f.mean().item<float>(), so_f.std().item<float>(), so_f.abs().max().item<float>());
-    }
+    
 
     return (routed_output + shared_out).reshape({batch, seq, hidden_dim});
 }
@@ -727,22 +655,7 @@ static at::Tensor forward_single_layer(
                 cfg->num_experts, cfg->top_k, cfg->moe_intermediate,
                 cfg->norm_topk_prob != 0, cfg->expert_start, cfg->expert_count, kind);
             // Debug: dump sub-component stats for last layer
-            if (getenv("QWEN36_DUMP_LAST_LAYER")) {
-                auto af = attn_output.to(at::kFloat);
-                auto mf = mlp_out.to(at::kFloat);
-                auto pf = post_attn.to(at::kFloat);
-                auto hf = hidden.to(at::kFloat);
-                fprintf(stderr, "  [last_layer] hidden_in:  mean=%.6f std=%.6f max=%.6f\n", hf.mean().item<float>(), hf.std().item<float>(), hf.abs().max().item<float>());
-                fprintf(stderr, "  [last_layer] attn_out:   mean=%.6f std=%.6f max=%.6f\n", af.mean().item<float>(), af.std().item<float>(), af.abs().max().item<float>());
-                fprintf(stderr, "  [last_layer] post_attn:   mean=%.6f std=%.6f max=%.6f\n", pf.mean().item<float>(), pf.std().item<float>(), pf.abs().max().item<float>());
-                fprintf(stderr, "  [last_layer] mlp_out:     mean=%.6f std=%.6f max=%.6f\n", mf.mean().item<float>(), mf.std().item<float>(), mf.abs().max().item<float>());
-            }
-            return hidden + attn_output + mlp_out;
-        } else {
-            auto mlp_out = dense_mlp_forward(post_attn, *w[8], *w[9], *w[10], kind);
-            return hidden + attn_output + mlp_out;
-        }
-    } else {
+             else {
         // Linear attention
         auto in_proj_qkv = *w[2], in_proj_z = *w[3], in_proj_a = *w[4], in_proj_b = *w[5];
         auto a_log = *w[6], dt_bias = *w[7], conv1d_w = *w[8], norm_w = *w[9], out_proj = *w[10];
@@ -1010,11 +923,7 @@ static at::Tensor forward_full(
     at::Tensor hidden = at::embedding(embed, input_ids);
 
     // Debug: dump embedding output stats
-    if (getenv("QWEN36_DUMP_LAYERS")) {
-        auto h_f = hidden.to(at::kFloat);
-        fprintf(stderr, "Layer  0 (embed): mean=%.6f std=%.6f max_abs=%.6f\n",
-            h_f.mean().item<float>(), h_f.std().item<float>(), h_f.abs().max().item<float>());
-    }
+    
 
     for (int64_t i = 0; i < ctx->num_layers; i++) {
         // Get weight pointers for this layer
@@ -1043,18 +952,7 @@ static at::Tensor forward_full(
             ctx->attention_mask);
 
         // Debug: dump per-layer hidden state stats (matching HF output_hidden_states)
-        if (getenv("QWEN36_DUMP_LAYERS")) {
-            auto h_f = hidden.to(at::kFloat);
-            fprintf(stderr, "Layer %2ld: mean=%.6f std=%.6f max_abs=%.6f\n",
-                i, h_f.mean().item<float>(), h_f.std().item<float>(), h_f.abs().max().item<float>());
-        }
-
-        // Sync + release CUDA allocator cache after each layer in no-grad forward.
-        // Without sync, pending CUDA ops hold references to intermediates,
-        // preventing emptyCache from freeing them.
-        cudaDeviceSynchronize();
-        c10::cuda::CUDACachingAllocator::emptyCache();
-    }
+        
 
     return hidden;  // pre-norm hidden (for MTP)
 }
@@ -1916,13 +1814,6 @@ void qwen36_set_checkpoint(void* ctx_ptr, int32_t enable, int64_t group_size) {
         ctx->use_checkpoint ? "ON" : "OFF", (long)ctx->group_size);
 }
 
-// Set attention mask for padding tokens
-__attribute__((visibility("default"), used))
-void qwen36_set_attention_mask(void* ctx_ptr, void* mask_ptr) {
-    auto* ctx = reinterpret_cast<TrainingContext*>(ctx_ptr);
-    if (mask_ptr) {
-        ctx->attention_mask = *reinterpret_cast<at::Tensor*>(mask_ptr);
-    }
 }
 
 // Utility functions (kept for compatibility)
