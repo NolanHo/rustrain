@@ -2,6 +2,17 @@
 use std::path::PathBuf;
 use std::process::Command;
 
+fn which(cmd: &str) -> Option<String> {
+    std::process::Command::new("which")
+        .arg(cmd)
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
 fn main() {
     println!("cargo:rerun-if-env-changed=TORCH_INCLUDE_PATH");
     println!("cargo:rerun-if-env-changed=TORCH_LIB_PATH");
@@ -90,6 +101,60 @@ fn main() {
             "-ltorch", "-ltorch_cuda", "-ltorch_cpu", "-lc10",
         ])
         .status();
+
+    // ── Compile CUDA kernels (.cu files) with nvcc ──
+    let nvcc = std::env::var("CUDA_HOME")
+        .map(|h| format!("{h}/bin/nvcc"))
+        .unwrap_or_else(|_| "nvcc".to_string());
+    let nvcc_path = which(&nvcc).unwrap_or_else(|| {
+        // Try PATH
+        if std::process::Command::new("nvcc").arg("--version").output().is_ok() {
+            "nvcc".to_string()
+        } else {
+            String::new()
+        }
+    });
+
+    if !nvcc_path.is_empty() {
+        for cu_file in &["kernels/delta_rule.cu", "kernels/megakernel.cu", "kernels/fused_backward.cu"] {
+            if !std::path::Path::new(cu_file).exists() { continue; }
+            let obj_file = format!("{out_dir}/{}.o",
+                cu_file.replace("kernels/", "").replace(".cu", ""));
+            let cu_status = Command::new(&nvcc_path)
+                .args([
+                    "-c", cu_file, "-o", &obj_file,
+                    "-O2", "-std=c++17",
+                    "-D_GLIBCXX_USE_CXX11_ABI=1",
+                    &format!("-I{torch_include}"),
+                    &format!("-I{torch_include}/ATen"),
+                    &format!("-I{torch_include}/c10"),
+                    &format!("-I{torch_include}/caffe2"),
+                    &format!("-I{cuda_inc}"),
+                    "-Xcompiler", "-fPIC",
+                ])
+                .status();
+            if cu_status.map(|s| s.success()).unwrap_or(false) {
+                // Re-link the .so with the .o files
+                let _ = Command::new("g++")
+                    .args([
+                        "-shared", "-fPIC", "-std=c++17", "-O2",
+                        "-D_GLIBCXX_USE_CXX11_ABI=1",
+                        "-o", &output_lib, kernel_src, &obj_file,
+                        &format!("-I{torch_include}"),
+                        &format!("-I{torch_include}/ATen"),
+                        &format!("-I{torch_include}/c10"),
+                        &format!("-I{torch_include}/caffe2"),
+                        &format!("-I{cuda_inc}"),
+                        &format!("-L{torch_lib}"),
+                        &format!("-Wl,-rpath,{torch_lib}"),
+                        "-Wl,--no-as-needed",
+                        "-ltorch", "-ltorch_cuda", "-ltorch_cpu", "-lc10",
+                        "-lcudart",
+                    ])
+                    .status();
+            }
+        }
+    }
 
     match status {
         Ok(s) if s.success() => {
