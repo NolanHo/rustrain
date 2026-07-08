@@ -617,18 +617,16 @@ static at::Tensor moe_forward(
             (long)ti[0][2].item<int64_t>(), (long)ti[0][3].item<int64_t>(),
             (long)ti[0][4].item<int64_t>(), (long)ti[0][5].item<int64_t>(),
             (long)ti[0][6].item<int64_t>(), (long)ti[0][7].item<int64_t>());
+        fprintf(stderr, "  [moe] topk_indices dtype: %d\n", (int)topk_indices.scalar_type());
         fprintf(stderr, "  [moe] expert_start=%ld expert_count=%ld top_k=%ld\n",
             (long)expert_start, (long)expert_count, (long)top_k);
-        // Count matches
-        int64_t matched = 0;
-        for (int64_t kk = 0; kk < std::min(top_k, (int64_t)1); kk++) {
-            auto ei = topk_indices.select(-1, kk);
-            for (int64_t e = 0; e < std::min(expert_count, (int64_t)5); e++) {
-                int64_t eg = expert_start + e;
-                matched += ei.eq(eg).sum().item<int64_t>();
-            }
+        // Check if expert 132 matches for kk=0
+        {
+            auto ei = topk_indices.select(-1, 0);  // [N] first expert per token
+            auto mask132 = ei.eq((int64_t)132);
+            int64_t m132 = mask132.sum().item<int64_t>();
+            fprintf(stderr, "  [moe] tokens matching expert 132 (kk=0): %ld\n", (long)m132);
         }
-        fprintf(stderr, "  [moe] matched (first 5 experts, kk=0): %ld\n", (long)matched);
         auto ro_f = routed_output.to(at::kFloat);
         fprintf(stderr, "  [moe] routed_output: mean=%.6f std=%.6f max=%.6f\n", ro_f.mean().item<float>(), ro_f.std().item<float>(), ro_f.abs().max().item<float>());
     }
