@@ -146,14 +146,14 @@ fn main() {
             }
         }
 
-        // Compile C++ files that happen to have .cu extension with g++
+        // Compile C++ files that happen to have .cu extension with g++ (use -x c++ to override)
         for cu_file in &cu_files_gpp {
             if !std::path::Path::new(cu_file).exists() { continue; }
             let obj_file = format!("{out_dir}/{}.o",
                 cu_file.replace("kernels/", "").replace(".cu", ""));
             let cu_status = Command::new("g++")
                 .args([
-                    "-c", cu_file, "-o", &obj_file,
+                    "-c", "-x", "c++", cu_file, "-o", &obj_file,
                     "-O2", "-std=c++17",
                     "-D_GLIBCXX_USE_CXX11_ABI=1",
                     &format!("-I{torch_include}"),
