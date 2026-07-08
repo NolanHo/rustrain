@@ -82,36 +82,65 @@ impl SftDataset {
         self.examples.len()
     }
 
-    /// Encode a single example: system + instruction + response → token IDs + target mask.
+    /// Encode a single example using Qwen3.6 chat template format.
+    /// Format: <|im_start|>user\n{instruction}<|im_end|>\n<|im_start|>assistant\n\n\n{response}<|im_end|>\n
     pub fn encode(&self, example: &SftExample) -> (Vec<i64>, Vec<f32>) {
-        let prompt = match &example.system {
-            Some(sys) => format!("{sys}\n\n{instruction}\n{input}", instruction = example.instruction, input = example.input),
-            None => format!("{}\n{}", example.instruction, example.input),
+        // Build prompt: <|im_start|>user\n{instruction}<|im_end|>\n<|im_start|>assistant\n
+        let prompt_text = match &example.system {
+            Some(sys) => format!(
+                "<|im_start|>system\n{sys}<|im_end|>\n<|im_start|>user\n{instruction} {input}<|im_end|>\n<|im_start|>assistant\n",
+                instruction = example.instruction, input = example.input
+            ),
+            None => format!(
+                "<|im_start|>user\n{instruction} {input}<|im_end|>\n<|im_start|>assistant\n",
+                instruction = example.instruction, input = example.input
+            ),
         };
 
-        let prompt_encoding = self.tokenizer.encode(prompt.as_str(), true)
+        let prompt_encoding = self.tokenizer.encode(prompt_text.as_str(), true)
             .map_err(|e| anyhow::anyhow!("tokenizer error: {e}"))
             .unwrap();
+        let prompt_ids = prompt_encoding.get_ids();
+
+        // Qwen3.6 chat template inserts think + \n\n + answer + \n\n before response
+        let think_id = self.tokenizer.token_to_id("").map(|t| t as i64).unwrap_or(248068);
+        let answer_id = self.tokenizer.token_to_id("").map(|t| t as i64).unwrap_or(248069);
+        let newline_id = self.tokenizer.token_to_id("\n\n").map(|t| t as i64).unwrap_or(271);
+
+        // Response tokens
         let response_encoding = self.tokenizer.encode(example.response.as_str(), true)
             .map_err(|e| anyhow::anyhow!("tokenizer error: {e}"))
             .unwrap();
-
-        let prompt_ids = prompt_encoding.get_ids();
         let response_ids = response_encoding.get_ids();
 
-        // Concatenate: prompt (mask=0) + response (mask=1) + EOS (mask=1)
-        let mut token_ids = Vec::with_capacity(prompt_ids.len() + response_ids.len() + 1);
+        let eos_id = self.tokenizer.token_to_id("<|im_end|>")
+            .unwrap_or(0) as i64;
+
+        // Build full sequence: prompt (mask=0) + think + \n\n + answer + \n\n + response (mask=1) + eos (mask=1)
+        let mut token_ids = Vec::with_capacity(prompt_ids.len() + 4 + response_ids.len() + 1);
         let mut mask = Vec::with_capacity(token_ids.capacity());
 
+        // Prompt (no loss)
         token_ids.extend(prompt_ids.iter().map(|&id| id as i64));
         mask.extend(std::iter::repeat(0.0_f32).take(prompt_ids.len()));
 
+        // think + \n\n (no loss — part of template)
+        token_ids.push(think_id);
+        mask.push(0.0);
+        token_ids.push(newline_id);
+        mask.push(0.0);
+
+        // answer + \n\n (loss starts here — model should predict answer token)
+        token_ids.push(answer_id);
+        mask.push(1.0);
+        token_ids.push(newline_id);
+        mask.push(1.0);
+
+        // Response content (loss)
         token_ids.extend(response_ids.iter().map(|&id| id as i64));
         mask.extend(std::iter::repeat(1.0_f32).take(response_ids.len()));
 
-        // Add EOS token
-        let eos_id = self.tokenizer.token_to_id("<|im_end|>")
-            .unwrap_or(prompt_ids.last().copied().unwrap_or(0)) as i64;
+        // EOS (loss)
         token_ids.push(eos_id);
         mask.push(1.0);
 
