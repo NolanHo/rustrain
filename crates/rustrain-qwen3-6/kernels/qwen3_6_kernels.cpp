@@ -610,6 +610,25 @@ static at::Tensor moe_forward(
         fprintf(stderr, "  [moe] shared_down: mean=%.6f std=%.6f max=%.6f\n", sd_f.mean().item<float>(), sd_f.std().item<float>(), sd_f.abs().max().item<float>());
         auto seg_f = at::sigmoid(at::matmul(flat, shared_expert_gate_w.t())).to(at::kFloat);
         fprintf(stderr, "  [moe] shared_gate_sig: mean=%.6f std=%.6f max=%.6f\n", seg_f.mean().item<float>(), seg_f.std().item<float>(), seg_f.abs().max().item<float>());
+        // Check topk indices
+        auto ti = topk_indices.to(at::kCPU);
+        fprintf(stderr, "  [moe] topk_indices[0]: %ld %ld %ld %ld %ld %ld %ld %ld\n",
+            (long)ti[0][0].item<int64_t>(), (long)ti[0][1].item<int64_t>(),
+            (long)ti[0][2].item<int64_t>(), (long)ti[0][3].item<int64_t>(),
+            (long)ti[0][4].item<int64_t>(), (long)ti[0][5].item<int64_t>(),
+            (long)ti[0][6].item<int64_t>(), (long)ti[0][7].item<int64_t>());
+        fprintf(stderr, "  [moe] expert_start=%ld expert_count=%ld top_k=%ld\n",
+            (long)expert_start, (long)expert_count, (long)top_k);
+        // Count matches
+        int64_t matched = 0;
+        for (int64_t kk = 0; kk < std::min(top_k, (int64_t)1); kk++) {
+            auto ei = topk_indices.select(-1, kk);
+            for (int64_t e = 0; e < std::min(expert_count, (int64_t)5); e++) {
+                int64_t eg = expert_start + e;
+                matched += ei.eq(eg).sum().item<int64_t>();
+            }
+        }
+        fprintf(stderr, "  [moe] matched (first 5 experts, kk=0): %ld\n", (long)matched);
         auto ro_f = routed_output.to(at::kFloat);
         fprintf(stderr, "  [moe] routed_output: mean=%.6f std=%.6f max=%.6f\n", ro_f.mean().item<float>(), ro_f.std().item<float>(), ro_f.abs().max().item<float>());
     }
