@@ -116,7 +116,15 @@ fn main() {
     });
 
     if !nvcc_path.is_empty() {
-        for cu_file in &["kernels/delta_rule.cu", "kernels/megakernel.cu", "kernels/fused_backward.cu"] {
+        // fused_backward.cu has __global__ kernels — needs nvcc
+        let cu_files_needing_nvcc = ["kernels/fused_backward.cu"];
+        // delta_rule.cu and megakernel.cu are pure C++ (no __global__), compile with g++
+        let cu_files_gpp = ["kernels/delta_rule.cu", "kernels/megakernel.cu"];
+
+        let mut obj_files = vec![];
+
+        // Compile CUDA kernels with nvcc
+        for cu_file in &cu_files_needing_nvcc {
             if !std::path::Path::new(cu_file).exists() { continue; }
             let obj_file = format!("{out_dir}/{}.o",
                 cu_file.replace("kernels/", "").replace(".cu", ""));
@@ -134,25 +142,54 @@ fn main() {
                 ])
                 .status();
             if cu_status.map(|s| s.success()).unwrap_or(false) {
-                // Re-link the .so with the .o files
-                let _ = Command::new("g++")
-                    .args([
-                        "-shared", "-fPIC", "-std=c++17", "-O2",
-                        "-D_GLIBCXX_USE_CXX11_ABI=1",
-                        "-o", &output_lib, kernel_src, &obj_file,
-                        &format!("-I{torch_include}"),
-                        &format!("-I{torch_include}/ATen"),
-                        &format!("-I{torch_include}/c10"),
-                        &format!("-I{torch_include}/caffe2"),
-                        &format!("-I{cuda_inc}"),
-                        &format!("-L{torch_lib}"),
-                        &format!("-Wl,-rpath,{torch_lib}"),
-                        "-Wl,--no-as-needed",
-                        "-ltorch", "-ltorch_cuda", "-ltorch_cpu", "-lc10",
-                        "-lcudart",
-                    ])
-                    .status();
+                obj_files.push(obj_file);
             }
+        }
+
+        // Compile C++ files that happen to have .cu extension with g++
+        for cu_file in &cu_files_gpp {
+            if !std::path::Path::new(cu_file).exists() { continue; }
+            let obj_file = format!("{out_dir}/{}.o",
+                cu_file.replace("kernels/", "").replace(".cu", ""));
+            let cu_status = Command::new("g++")
+                .args([
+                    "-c", cu_file, "-o", &obj_file,
+                    "-O2", "-std=c++17",
+                    "-D_GLIBCXX_USE_CXX11_ABI=1",
+                    &format!("-I{torch_include}"),
+                    &format!("-I{torch_include}/ATen"),
+                    &format!("-I{torch_include}/c10"),
+                    &format!("-I{torch_include}/caffe2"),
+                    &format!("-I{cuda_inc}"),
+                    "-fPIC",
+                ])
+                .status();
+            if cu_status.map(|s| s.success()).unwrap_or(false) {
+                obj_files.push(obj_file);
+            }
+        }
+
+        // Re-link the .so with all .o files
+        if !obj_files.is_empty() {
+            let mut link_args = vec![
+                "-shared".to_string(), "-fPIC".to_string(), "-std=c++17".to_string(), "-O2".to_string(),
+                "-D_GLIBCXX_USE_CXX11_ABI=1".to_string(),
+                "-o".to_string(), output_lib.clone(), kernel_src.to_string(),
+                format!("-I{torch_include}"),
+                format!("-I{torch_include}/ATen"),
+                format!("-I{torch_include}/c10"),
+                format!("-I{torch_include}/caffe2"),
+                format!("-I{cuda_inc}"),
+                format!("-L{torch_lib}"),
+                format!("-Wl,-rpath,{torch_lib}"),
+                "-Wl,--no-as-needed".to_string(),
+                "-ltorch".to_string(), "-ltorch_cuda".to_string(), "-ltorch_cpu".to_string(),
+                "-lc10".to_string(), "-lcudart".to_string(),
+            ];
+            for obj in &obj_files {
+                link_args.push(obj.clone());
+            }
+            let _ = Command::new("g++").args(&link_args).status();
         }
     }
 
