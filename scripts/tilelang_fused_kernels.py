@@ -237,6 +237,7 @@ def compile_to_so():
 
     # Try k1 and k2 (rmsnorm_matmul variants) — these may fail on export
     # Try k3 (swiglu) — this is known to work
+    exported = False
     for k, name in [(k3, "swiglu"), (k2, "rmsnorm_matmul_one_plus"), (k1, "rmsnorm_matmul")]:
         try:
             if name == "swiglu":
