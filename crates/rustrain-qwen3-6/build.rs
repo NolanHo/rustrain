@@ -197,43 +197,33 @@ fn main() {
     }
 
     // ── Compile Tilelang fused kernels (requires nvcc + Python tilelang) ──
-    // Optional: if nvcc/tilelang not available, C++ falls back to ATen ops.
+    // Optional: if tilelang not available, C++ falls back to ATen ops.
     let tilelang_script = "../../scripts/tilelang_fused_kernels.py";
     if std::path::Path::new(tilelang_script).exists() {
-        // Try venv python first (has tilelang installed), then system python3
-        let py_candidates = [
-            std::env::var("TILELANG_PYTHON").ok(),
-            Some("/mnt/workspace/rustrain-env/bin/python3".to_string()),
-            Some("python3".to_string()),
-        ];
-        let mut py_cmd = String::new();
-        for c in &py_candidates {
-            if let Some(c) = c {
-                if std::process::Command::new(c).arg("-c").arg("import tilelang").output().is_ok() {
-                    py_cmd = c.clone();
-                    break;
-                }
-            }
-        }
-        if !py_cmd.is_empty() {
-            let tilelang_status = Command::new(&py_cmd)
-                .arg(tilelang_script)
-                .arg(&out_dir)
-                .env("CUDA_HOME", &std::env::var("CUDA_HOME").unwrap_or_else(|_| "/usr/local/cuda".to_string()))
-                .env("PATH", &std::env::var("PATH").unwrap_or_default())
-                .status();
-            match tilelang_status {
-                Ok(s) if s.success() => {
-                    println!("cargo:rustc-link-search=native={out_dir}");
-                    println!("cargo:rustc-link-lib=dylib=tilelang_fused");
-                    println!("cargo:warning=Tilelang fused kernels compiled");
-                }
-                _ => {
-                    println!("cargo:warning=Tilelang compilation failed, using ATen fallback");
-                }
-            }
+        // Use venv python that has tilelang installed
+        let venv_py = "/mnt/workspace/rustrain-env/bin/python3";
+        let py_cmd = if std::path::Path::new(venv_py).exists() {
+            venv_py.to_string()
         } else {
-            println!("cargo:warning=Tilelang not installed, using ATen fallback");
+            "python3".to_string()
+        };
+        let tilelang_status = Command::new(&py_cmd)
+            .arg(tilelang_script)
+            .arg(&out_dir)
+            .env("CUDA_HOME", &std::env::var("CUDA_HOME").unwrap_or_else(|_| "/usr/local/cuda".to_string()))
+            .env("PATH", &format!("{}:{}", 
+                std::env::var("CUDA_HOME").map(|h| format!("{h}/bin")).unwrap_or_default(),
+                std::env::var("PATH").unwrap_or_default()))
+            .status();
+        match tilelang_status {
+            Ok(s) if s.success() => {
+                println!("cargo:rustc-link-search=native={out_dir}");
+                println!("cargo:rustc-link-lib=dylib=tilelang_fused");
+                println!("cargo:warning=Tilelang fused kernels compiled");
+            }
+            _ => {
+                println!("cargo:warning=Tilelang compilation failed, using ATen fallback");
+            }
         }
     }
 }
