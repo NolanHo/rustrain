@@ -64,9 +64,9 @@ def main():
         f.write('    dim3 block(128);\n')
         f.write('    int shared_mem = 2 * 16 * 64 * 2; // 2 tensors, 16x64, bfloat16\n')
         f.write('    main_kernel<<<grid, block, shared_mem>>>(\n')
-        f.write('        (__nv_bfloat16*)out,        // activated (output)\n')
-        f.write('        (const __nv_bfloat16*)gate,  // gate_out\n')
-        f.write('        (const __nv_bfloat16*)up     // up_out\n')
+        f.write('        (bfloat16_t*)out,\n')
+        f.write('        (const bfloat16_t*)gate,\n')
+        f.write('        (const bfloat16_t*)up\n')
         f.write('    );\n')
         f.write('}\n')
     
