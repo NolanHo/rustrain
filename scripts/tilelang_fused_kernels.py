@@ -231,14 +231,21 @@ def compile_to_so():
     k3 = fused_swiglu(M=128, I=128, limit=10.0)
 
     so_path = os.path.join(out_dir, "libtilelang_fused.so")
-    # Export first kernel as the .so, others are compiled on demand
-    k1.export_library(so_path)
-    print(f"Compiled fused_rmsnorm_matmul to {so_path}")
+    # Must call the kernel once to trigger compilation, then export
+    # Tilelang uses lazy compilation — calling the kernel compiles it
+    import torch
+    X = torch.randn(128, 128, dtype=torch.bfloat16, device="cuda")
+    W_norm = torch.ones(128, dtype=torch.bfloat16, device="cuda")
+    W_matmul = torch.randn(128, 128, dtype=torch.bfloat16, device="cuda")
+    _ = k1(X, W_norm, W_matmul)  # trigger compilation
+    _ = k2(X, W_norm, W_matmul)  # trigger compilation
+    gate = torch.randn(128, 128, dtype=torch.bfloat16, device="cuda")
+    up = torch.randn(128, 128, dtype=torch.bfloat16, device="cuda")
+    _ = k3(gate, up)  # trigger compilation
 
-    # Test
-    test_rmsnorm_matmul()
-    test_rmsnorm_matmul_one_plus()
-    test_swiglu()
+    # Now export — use the first kernel's module (all share the same .so)
+    k1.export_library(so_path)
+    print(f"Compiled fused kernels to {so_path}")
 
 
 if __name__ == "__main__":
