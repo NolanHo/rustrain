@@ -34,6 +34,7 @@ type FnSetMtpWeights = unsafe extern "C" fn(
     i64,               // num_mtp_layers
 );
 type FnSetCheckpoint = unsafe extern "C" fn(*mut c_void, i32, i64);
+type FnSetAttentionMask = unsafe extern "C" fn(*mut c_void, *mut c_void);
 
 #[repr(C)]
 pub struct CppLayerConfig {
@@ -69,6 +70,7 @@ struct KernelHandles {
     free_tensor: FnFreeTensor,
     set_mtp_weights: FnSetMtpWeights,
     set_checkpoint: FnSetCheckpoint,
+    set_attention_mask: FnSetAttentionMask,
 }
 
 static KERNELS: OnceLock<Option<KernelHandles>> = OnceLock::new();
@@ -113,6 +115,7 @@ unsafe fn load_kernels() -> Option<KernelHandles> {
         free_tensor: sym!("qwen36_free_tensor"),
         set_mtp_weights: sym!("qwen36_set_mtp_weights"),
         set_checkpoint: sym!("qwen36_set_checkpoint"),
+        set_attention_mask: sym!("qwen36_set_attention_mask"),
     })
 }
 
@@ -430,6 +433,14 @@ impl CppTrainingContext {
         let kh = get_kernels().expect("kernels not loaded");
         unsafe {
             (kh.set_checkpoint)(self.ptr, if enable { 1 } else { 0 }, group_size);
+        }
+    }
+
+    /// Set attention mask [batch, seq] — 1 for real tokens, 0 for padding.
+    pub fn set_attention_mask(&self, mask: &Tensor) {
+        let kh = get_kernels().expect("kernels not loaded");
+        unsafe {
+            (kh.set_attention_mask)(self.ptr, mask.as_ptr() as *mut c_void);
         }
     }
 }

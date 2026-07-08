@@ -337,6 +337,23 @@ fn train_impl(
         let sft_batch = data.batch(data_start, batch_size);
         let (input_ids, target_mask) = sft_batch.to_tensors(device, compute_kind);
 
+        // Build attention mask: 1 for real tokens, 0 for padding
+        // target_mask > 0 means the token is either response (loss) or prompt (no loss but attend)
+        // We need: 1 for all non-padding tokens, 0 for padding tokens
+        // The SFT batch's target_mask is: 0=prompt, 1=response, but padding has mask=0 too.
+        // We need attention_mask = (target_mask >= 0).to(float) but that's all 1s.
+        // Actually: padding tokens have target_mask=0 AND are after EOS.
+        // The SftBatch already has padding at the end with mask=0.
+        // We need: attention_mask = 1 where token is NOT padding.
+        // Since prompt tokens have mask=0 and response tokens have mask=1,
+        // but padding also has mask=0, we can't distinguish prompt from padding using mask alone.
+        // Solution: use the pad_token_id to build attention mask from input_ids.
+        let pad_id = data.pad_token_id();
+        let attention_mask = input_ids.ne(pad_id).to_kind(Kind::Float).unsqueeze(0);  // [1, seq]
+
+        // Set attention mask before train_step
+        ctx.set_attention_mask(&attention_mask);
+
         // C++ all-in-C++ path: single call does forward + loss + backward + Adam
         let loss_value = ctx.train_step(&input_ids, &target_mask)?;
         if step == 0 { initial_loss = loss_value; }

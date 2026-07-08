@@ -156,7 +156,8 @@ static at::Tensor full_attention(
     const at::Tensor& v_proj, const at::Tensor& o_proj,
     int64_t num_heads, int64_t num_kv_heads, int64_t head_dim,
     double partial_rotary_factor, double rope_theta,
-    double rms_eps, at::ScalarType compute_type
+    double rms_eps, at::ScalarType compute_type,
+    const at::Tensor& attention_mask  // [batch, seq] — 1 for real tokens, 0 for padding
 ) {
     auto device = hidden.device();
     int64_t batch = hidden.size(0), seq = hidden.size(1);
@@ -282,12 +283,32 @@ static at::Tensor full_attention(
     double scale = 1.0 / std::sqrt((double)head_dim);
 
     // Use SDPA (Flash Attention) — O(seq) memory instead of O(seq²)
-    auto attn_out = at::scaled_dot_product_attention(
-        q, k_expanded, v_expanded,
-        /*attn_mask=*/c10::nullopt,
-        0.0,
-        true
-    );
+    // Build attention mask: causal + padding
+    // SDPA accepts is_causal=true for causal, but we also need padding mask.
+    // Combine: use a 2D bias [batch*num_heads, seq, seq] = causal_mask & key_padding_mask
+    at::Tensor attn_mask;
+    if (attention_mask.defined() && attention_mask.numel() > 0) {
+        // key_padding_mask: [batch, seq] → [batch, 1, 1, seq]
+        // Expand to [batch, num_heads, seq, seq] via broadcasting
+        // mask=1 means "attend", mask=0 means "ignore"
+        auto kpm = attention_mask.to(at::kBool).unsqueeze(1).unsqueeze(1);  // [B, 1, 1, S]
+        // For SDPA, attn_mask should be additive bias: 0 for attend, -inf for ignore
+        auto additive_mask = at::zeros({batch, 1, 1, seq}, hidden.options().dtype(at::kFloat));
+        additive_mask = additive_mask.masked_fill(kpm.logical_not(), -std::numeric_limits<float>::infinity());
+        attn_out = at::scaled_dot_product_attention(
+            q, k_expanded, v_expanded,
+            additive_mask,
+            0.0,
+            true  // is_causal=true (SDPA combines causal + additive mask)
+        );
+    } else {
+        attn_out = at::scaled_dot_product_attention(
+            q, k_expanded, v_expanded,
+            c10::nullopt,
+            0.0,
+            true
+        );
+    }
 
     // Release Q/K/V before gate multiplication
     q = at::Tensor();
@@ -677,7 +698,8 @@ static inline int64_t weight_count_for_layer(const LayerConfig& cfg) {
 static at::Tensor forward_single_layer(
     const at::Tensor& hidden, at::Tensor** w, const LayerConfig* cfg,
     at::ScalarType kind, double lora_scaling,
-    at::Tensor** la, at::Tensor** lb
+    at::Tensor** la, at::Tensor** lb,
+    const at::Tensor& attention_mask
 ) {
     auto input_norm = *w[0];
     auto post_norm = *w[1];
@@ -696,7 +718,8 @@ static at::Tensor forward_single_layer(
         }
         attn_output = full_attention(attn_input, q_proj, q_norm, k_proj, k_norm, v_proj, o_proj,
             cfg->num_heads, cfg->num_kv_heads, cfg->head_dim,
-            cfg->partial_rotary_factor, cfg->rope_theta, cfg->rms_eps, kind);
+            cfg->partial_rotary_factor, cfg->rope_theta, cfg->rms_eps, kind,
+            attention_mask);
         auto post_attn = rms_norm(hidden + attn_output, post_norm, cfg->rms_eps);
         if (is_moe) {
             auto mlp_out = moe_forward(post_attn,
@@ -756,6 +779,9 @@ struct TrainingContext {
     std::vector<at::Tensor*> lm_head_ptr;
     std::vector<LayerConfig> layer_configs;
     int64_t num_layers;
+
+    // Attention mask [batch, seq] — 1 for real tokens, 0 for padding
+    at::Tensor attention_mask;
 
     // LoRA parameters (owned in C++, requires_grad=true)
     std::vector<at::Tensor> lora_a;  // one per (layer, module)
@@ -1013,7 +1039,8 @@ static at::Tensor forward_full(
         }
 
         hidden = forward_single_layer(hidden, layer_w.data(), &ctx->layer_configs[i],
-            kind, ctx->lora_scaling, la_ptrs.data(), lb_ptrs.data());
+            kind, ctx->lora_scaling, la_ptrs.data(), lb_ptrs.data(),
+            ctx->attention_mask);
 
         // Debug: dump per-layer hidden state stats (matching HF output_hidden_states)
         if (getenv("QWEN36_DUMP_LAYERS")) {
@@ -1068,7 +1095,8 @@ static at::Tensor forward_layer_group(
         }
 
         hidden = forward_single_layer(hidden, layer_w.data(), &ctx->layer_configs[i],
-            kind, ctx->lora_scaling, la_ptrs.data(), lb_ptrs.data());
+            kind, ctx->lora_scaling, la_ptrs.data(), lb_ptrs.data(),
+            ctx->attention_mask);
     }
     return hidden;
 }
@@ -1181,7 +1209,8 @@ struct FusedLayerFunction : public torch::autograd::Function<FusedLayerFunction>
             la[k] = &tc->lora_a[la_offset + k]; lb[k] = &tc->lora_b[la_offset + k];
         }
         return forward_single_layer(input, layer_w.data(), &tc->layer_configs[layer_idx],
-            kind, tc->lora_scaling, la.data(), lb.data());
+            kind, tc->lora_scaling, la.data(), lb.data(),
+            tc->attention_mask);
     }
 
     static std::vector<at::Tensor> backward(
@@ -1498,7 +1527,8 @@ static at::Tensor mtp_forward(
         std::vector<at::Tensor*> layer_w(ctx->mtp_layer_weights.begin() + w_offset,
                                          ctx->mtp_layer_weights.begin() + w_offset + w_count);
         h = forward_single_layer(h, layer_w.data(), &ctx->mtp_layer_configs[i],
-            kind, ctx->lora_scaling, nullptr, nullptr);
+            kind, ctx->lora_scaling, nullptr, nullptr,
+            ctx->attention_mask);
     }
 
     // Final norm only — return hidden, not logits
@@ -1880,6 +1910,14 @@ void qwen36_set_checkpoint(void* ctx_ptr, int32_t enable, int64_t group_size) {
     ctx->group_size = (group_size > 0) ? group_size : 4;
     fprintf(stderr, "[q36_ctx] checkpoint: %s, group_size=%ld\n",
         ctx->use_checkpoint ? "ON" : "OFF", (long)ctx->group_size);
+}
+
+// Set attention mask for padding tokens
+void qwen36_set_attention_mask(void* ctx_ptr, void* mask_ptr) {
+    auto* ctx = reinterpret_cast<TrainingContext*>(ctx_ptr);
+    if (mask_ptr) {
+        ctx->attention_mask = *reinterpret_cast<at::Tensor*>(mask_ptr);
+    }
 }
 
 // Utility functions (kept for compatibility)

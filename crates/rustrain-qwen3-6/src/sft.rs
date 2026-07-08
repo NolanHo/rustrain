@@ -82,6 +82,12 @@ impl SftDataset {
         self.examples.len()
     }
 
+    /// Get the pad token ID used for padding.
+    pub fn pad_token_id(&self) -> i64 {
+        self.tokenizer.token_to_id("")
+            .unwrap_or(0) as i64
+    }
+
     /// Encode a single example using Qwen3.6 chat template format.
     /// Format: <|im_start|>user\n{instruction}<|im_end|>\n<|im_start|>assistant\n\n\n{response}<|im_end|>\n
     pub fn encode(&self, example: &SftExample) -> (Vec<i64>, Vec<f32>) {
