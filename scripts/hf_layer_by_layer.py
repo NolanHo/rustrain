@@ -26,6 +26,12 @@ def main():
     prompt_text = f"<|im_start|>user\n{instruction} <|im_end|>\n<|im_start|>assistant\n"
     prompt_ids = tokenizer.encode(prompt_text, add_special_tokens=False)
     token_ids = prompt_ids + [248068, 271, 248069, 271] + tokenizer.encode(response, add_special_tokens=False) + [248046]
+    # Pad to 512 tokens (same as rustrain)
+    pad_id = 248044  # 
+    target_mask = [0.0] * len(prompt_ids) + [0.0, 0.0, 1.0, 1.0] + [1.0] * len(tokenizer.encode(response, add_special_tokens=False)) + [1.0]
+    pad_count = 512 - len(token_ids)
+    token_ids = token_ids + [pad_id] * pad_count
+    target_mask = target_mask + [0.0] * pad_count
     input_ids = torch.tensor([token_ids], dtype=torch.long, device="cuda:0")
     
     print(f"Token sequence ({len(token_ids)} tokens): {token_ids}")

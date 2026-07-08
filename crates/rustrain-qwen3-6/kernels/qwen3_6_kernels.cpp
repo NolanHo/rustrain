@@ -675,6 +675,17 @@ static at::Tensor forward_single_layer(
                 *w[8], *w[9], *w[10], *w[11], *w[12], *w[13], *w[14],
                 cfg->num_experts, cfg->top_k, cfg->moe_intermediate,
                 cfg->norm_topk_prob != 0, cfg->expert_start, cfg->expert_count, kind);
+            // Debug: dump sub-component stats for last layer
+            if (getenv("QWEN36_DUMP_LAST_LAYER")) {
+                auto af = attn_output.to(at::kFloat);
+                auto mf = mlp_out.to(at::kFloat);
+                auto pf = post_attn.to(at::kFloat);
+                auto hf = hidden.to(at::kFloat);
+                fprintf(stderr, "  [last_layer] hidden_in:  mean=%.6f std=%.6f max=%.6f\n", hf.mean().item<float>(), hf.std().item<float>(), hf.abs().max().item<float>());
+                fprintf(stderr, "  [last_layer] attn_out:   mean=%.6f std=%.6f max=%.6f\n", af.mean().item<float>(), af.std().item<float>(), af.abs().max().item<float>());
+                fprintf(stderr, "  [last_layer] post_attn:   mean=%.6f std=%.6f max=%.6f\n", pf.mean().item<float>(), pf.std().item<float>(), pf.abs().max().item<float>());
+                fprintf(stderr, "  [last_layer] mlp_out:     mean=%.6f std=%.6f max=%.6f\n", mf.mean().item<float>(), mf.std().item<float>(), mf.abs().max().item<float>());
+            }
             return hidden + attn_output + mlp_out;
         } else {
             auto mlp_out = dense_mlp_forward(post_attn, *w[8], *w[9], *w[10], kind);
