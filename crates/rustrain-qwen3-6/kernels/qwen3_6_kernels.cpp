@@ -2339,6 +2339,3 @@ void qwen36_free_tensor(void* tensor_ptr) {
 }
 
 }  // extern "C"
-
-// Include megakernel.cu (pure C++, references TrainingContext etc.)
-#include "megakernel.cu"
