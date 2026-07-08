@@ -11,7 +11,6 @@
 #include <torch/csrc/autograd/custom_function.h>
 #include <torch/csrc/autograd/autograd.h>
 #include <torch/csrc/autograd/variable.h>
-#include <dlfcn.h>
 #include <cstdio>
 #include <cmath>
 #include <vector>
@@ -27,79 +26,64 @@
 static at::Tensor rms_norm(const at::Tensor& input, const at::Tensor& weight, double eps);
 
 // ──────────────────────────────────────────────────────────────────────
-// Tilelang fused kernel loading (dlopen)
+// Hand-written CUDA fused kernels (compiled from fused_kernels.cu)
 // ──────────────────────────────────────────────────────────────────────
 
-struct TilelangKernels {
-    // fused_rmsnorm_matmul (V4: weight only): X [M,K], W_norm [K], W_matmul [N,K] → Y [M,N]
-    void (*fused_rmsnorm_matmul)(void*, void*, void*, void*, int64_t, int64_t, int64_t, double);
-    // fused_rmsnorm_matmul_one_plus (Qwen3.6: 1+weight): same signature
-    void (*fused_rmsnorm_matmul_one_plus)(void*, void*, void*, void*, int64_t, int64_t, int64_t, double);
-    // fused_swiglu: gate [M,I], up [M,I] → out [M,I]
-    void (*fused_swiglu)(void*, void*, void*, int64_t, int64_t, double);
-};
-
-static TilelangKernels* g_tilelang = nullptr;
-
-static void load_tilelang_kernels() {
-    if (g_tilelang) return;
-    void* handle = dlopen("libtilelang_fused.so", RTLD_LAZY | RTLD_NOLOAD);
-    if (!handle) handle = dlopen("libtilelang_fused.so", RTLD_LAZY);
-    if (!handle) return;
-
-    auto* k = new TilelangKernels{};
-    auto load_sym = [&](const char* name, auto* fn_ptr) {
-        void* p = dlsym(handle, name);
-        if (p) *(void**)fn_ptr = p;
-    };
-    load_sym("tilelang_fused_rmsnorm_matmul", &k->fused_rmsnorm_matmul);
-    load_sym("tilelang_fused_rmsnorm_matmul_one_plus", &k->fused_rmsnorm_matmul_one_plus);
-    load_sym("tilelang_fused_swiglu", &k->fused_swiglu);
-    g_tilelang = k;
-    fprintf(stderr, "[q36_tilelang] loaded: rmsnorm_matmul=%s rmsnorm_matmul_one_plus=%s swiglu=%s\n",
-        k->fused_rmsnorm_matmul ? "yes" : "no",
-        k->fused_rmsnorm_matmul_one_plus ? "yes" : "no",
-        k->fused_swiglu ? "yes" : "no");
+extern "C" {
+    void launch_fused_rmsnorm(const void* input, const void* weight, void* output,
+        int M, int K, float eps, int scale_mode, void* stream);
+    void launch_fused_swiglu(const void* gate, const void* up, void* output,
+        int N, float limit, void* stream);
+    void launch_fused_rmsnorm_matmul(const void* input, const void* weight, const void* matmul_w, void* output,
+        int M, int N, int K, float eps, int scale_mode, void* stream);
 }
 
-/// Fused RMSNorm + Matmul via Tilelang (Qwen3.6 variant: 1+weight)
-/// Falls back to ATen rms_norm + at::linear if Tilelang not available.
-static at::Tensor fused_rmsnorm_matmul_q36(
-    const at::Tensor& input, const at::Tensor& norm_w, const at::Tensor& matmul_w,
-    double eps)
-{
-    if (g_tilelang && g_tilelang->fused_rmsnorm_matmul_one_plus) {
-        int64_t M = input.size(0);
-        int64_t K = input.size(1);
-        int64_t N = matmul_w.size(0);
-        auto output = at::zeros({M, N}, input.options());
-        g_tilelang->fused_rmsnorm_matmul_one_plus(
-            input.data_ptr(), norm_w.data_ptr(), matmul_w.data_ptr(),
-            output.data_ptr(), M, N, K, eps);
-        return output;
-    }
-    // Fallback: ATen
-    auto normed = rms_norm(input, norm_w, eps);
-    return at::linear(normed, matmul_w);
+/// Fused RMSNorm — single CUDA kernel (replaces 3 ATen ops)
+/// scale_mode: 0 = weight only (V4), 1 = 1+weight (Qwen3.6)
+static at::Tensor fused_rmsnorm_op(
+    const at::Tensor& input, const at::Tensor& weight, double eps, int scale_mode
+) {
+    auto output = at::empty_like(input);
+    int M = input.size(0);
+    int K = input.size(1);
+    auto stream = c10::cuda::getCurrentCUDAStream().stream();
+    launch_fused_rmsnorm(
+        input.data_ptr(), weight.data_ptr(), output.data_ptr(),
+        M, K, (float)eps, scale_mode, stream
+    );
+    return output;
 }
 
-/// Fused SwiGLU via Tilelang (falls back to ATen if not available)
+/// Fused SwiGLU: silu(gate) * up + clamp — single CUDA kernel (replaces 3 ATen ops)
 static at::Tensor fused_swiglu_op(
-    const at::Tensor& gate_out, const at::Tensor& up_out, double limit)
-{
-    if (g_tilelang && g_tilelang->fused_swiglu) {
-        int64_t M = gate_out.size(0);
-        int64_t I = gate_out.size(1);
-        auto output = at::zeros({M, I}, gate_out.options());
-        g_tilelang->fused_swiglu(
-            gate_out.data_ptr(), up_out.data_ptr(), output.data_ptr(),
-            M, I, limit);
-        return output;
-    }
-    // Fallback: ATen
-    auto inter = at::silu(gate_out) * up_out;
-    if (limit > 0.0) inter = inter.clamp(-limit, limit);
-    return inter;
+    const at::Tensor& gate_out, const at::Tensor& up_out, double limit
+) {
+    auto output = at::empty_like(gate_out);
+    int N = gate_out.numel();
+    auto stream = c10::cuda::getCurrentCUDAStream().stream();
+    launch_fused_swiglu(
+        gate_out.data_ptr(), up_out.data_ptr(), output.data_ptr(),
+        N, (float)limit, stream
+    );
+    return output;
+}
+
+/// Fused RMSNorm + Matmul — single CUDA kernel (normed values stay in SRAM)
+/// scale_mode: 0 = weight only (V4), 1 = 1+weight (Qwen3.6)
+static at::Tensor fused_rmsnorm_matmul_op(
+    const at::Tensor& input, const at::Tensor& norm_w, const at::Tensor& matmul_w,
+    double eps, int scale_mode
+) {
+    int64_t M = input.size(0);
+    int64_t K = input.size(1);
+    int64_t N = matmul_w.size(0);
+    auto output = at::zeros({M, N}, input.options());
+    auto stream = c10::cuda::getCurrentCUDAStream().stream();
+    launch_fused_rmsnorm_matmul(
+        input.data_ptr(), norm_w.data_ptr(), matmul_w.data_ptr(), output.data_ptr(),
+        (int)M, (int)N, (int)K, (float)eps, scale_mode, stream
+    );
+    return output;
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -1512,7 +1496,6 @@ void* qwen36_create_training_context(
     const int64_t* target_layers, int64_t num_target_layers
 ) {
     try {
-        load_tilelang_kernels();  // Load Tilelang fused kernels if available
         auto* ctx = new TrainingContext();
         ctx->compute_type = static_cast<at::ScalarType>(compute_type);
         ctx->lr = lr; ctx->beta1 = beta1; ctx->beta2 = beta2; ctx->eps = eps;

@@ -271,22 +271,60 @@ fn main() {
         }
     }
 
-    // ── Compile Tilelang fused kernels (requires nvcc + Python tilelang) ──
-    // This step is optional: if nvcc is not available, the C++ code falls back to ATen ops.
-    let tilelang_script = "../../scripts/tilelang_fused_kernels.py";
-    if std::path::Path::new(tilelang_script).exists() {
-        let tilelang_status = Command::new("python3")
-            .arg(tilelang_script)
-            .arg(&out_dir)
-            .status();
-        match tilelang_status {
-            Ok(s) if s.success() => {
-                println!("cargo:rustc-link-search=native={out_dir}");
-                println!("cargo:rustc-link-lib=dylib=tilelang_fused");
-                println!("cargo:warning=Tilelang fused kernels compiled");
+    // ── Compile fused_kernels.cu with nvcc ──
+    let nvcc_path = {
+        let candidates = [
+            std::env::var("CUDA_HOME").ok().map(|h| format!("{h}/bin/nvcc")),
+            Some("nvcc".to_string()),
+        ];
+        let mut found = String::new();
+        for c in &candidates {
+            if let Some(c) = c {
+                if std::path::Path::new(c).exists() {
+                    found = c.clone();
+                    break;
+                }
+                if std::process::Command::new(c).arg("--version").output().is_ok() {
+                    found = c.clone();
+                    break;
+                }
             }
-            _ => {
-                println!("cargo:warning=Tilelang compilation failed (nvcc not available?), using ATen fallback");
+        }
+        found
+    };
+
+    if !nvcc_path.is_empty() {
+        let fused_cu = "kernels/fused_kernels.cu";
+        if std::path::Path::new(fused_cu).exists() {
+            let fused_obj = format!("{out_dir}/fused_kernels.o");
+            let fused_status = Command::new(&nvcc_path)
+                .args([
+                    "-c", fused_cu, "-o", &fused_obj,
+                    "-O2", "-std=c++17",
+                    "-D_GLIBCXX_USE_CXX11_ABI=1",
+                    &format!("-I{inc_torch}"),
+                    &format!("-I{inc_aten}"),
+                    &format!("-I{inc_c10}"),
+                    &format!("-I{inc_caffe2}"),
+                    &format!("-I{inc_cuda}"),
+                    "-Xcompiler", "-fPIC",
+                ])
+                .status();
+            if fused_status.map(|s| s.success()).unwrap_or(false) {
+                // Re-link v4_flash_kernels.so with fused_kernels.o
+                let mut relink_args = vec![
+                    "-shared".to_string(), "-fPIC".to_string(), "-std=c++17".to_string(), "-O2".to_string(),
+                    cxx11_abi.to_string(),
+                    "-o".to_string(), v4_lib.clone(), v4_src.to_string(), fused_obj.clone(),
+                    inc_torch.clone(), inc_aten.clone(), inc_c10.clone(), inc_caffe2.clone(), inc_cuda.clone(),
+                    l_arg.clone(), rpath_arg.clone(),
+                    "-Wl,--no-as-needed".to_string(),
+                    "-ltorch".to_string(), "-ltorch_cuda".to_string(), "-ltorch_cpu".to_string(),
+                    "-lc10".to_string(), "-lc10_cuda".to_string(),
+                ];
+                relink_args.extend(nccl_lib_args.iter().cloned());
+                let _ = Command::new("g++").args(&relink_args).status();
+                println!("cargo:warning=Fused CUDA kernels compiled and linked into v4_flash_kernels.so");
             }
         }
     }

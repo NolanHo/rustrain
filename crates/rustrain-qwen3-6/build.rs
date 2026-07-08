@@ -125,8 +125,8 @@ fn main() {
     };
 
     if !nvcc_path.is_empty() {
-        // delta_rule.cu includes delta_rule.cuh which has __global__ kernels — needs nvcc
-        let cu_files_nvcc = ["kernels/delta_rule.cu"];
+        // CUDA files needing nvcc: delta_rule.cu (has __global__) + fused_kernels.cu (hand-written CUDA)
+        let cu_files_nvcc = ["kernels/delta_rule.cu", "kernels/fused_kernels.cu"];
 
         let mut obj_files = vec![];
 
@@ -193,37 +193,6 @@ fn main() {
         }
         _ => {
             println!("cargo:warning=Failed to compile Qwen3.6 kernels, C++ path disabled");
-        }
-    }
-
-    // ── Compile Tilelang fused kernels (requires nvcc + Python tilelang) ──
-    // Optional: if tilelang not available, C++ falls back to ATen ops.
-    let tilelang_script = "../../scripts/tilelang_fused_kernels.py";
-    if std::path::Path::new(tilelang_script).exists() {
-        // Use venv python that has tilelang installed
-        let venv_py = "/mnt/workspace/rustrain-env/bin/python3";
-        let py_cmd = if std::path::Path::new(venv_py).exists() {
-            venv_py.to_string()
-        } else {
-            "python3".to_string()
-        };
-        let tilelang_status = Command::new(&py_cmd)
-            .arg(tilelang_script)
-            .arg(&out_dir)
-            .env("CUDA_HOME", &std::env::var("CUDA_HOME").unwrap_or_else(|_| "/usr/local/cuda".to_string()))
-            .env("PATH", &format!("{}:{}", 
-                std::env::var("CUDA_HOME").map(|h| format!("{h}/bin")).unwrap_or_default(),
-                std::env::var("PATH").unwrap_or_default()))
-            .status();
-        match tilelang_status {
-            Ok(s) if s.success() => {
-                println!("cargo:rustc-link-search=native={out_dir}");
-                println!("cargo:rustc-link-lib=dylib=tilelang_fused");
-                println!("cargo:warning=Tilelang fused kernels compiled");
-            }
-            _ => {
-                println!("cargo:warning=Tilelang compilation failed, using ATen fallback");
-            }
         }
     }
 }
