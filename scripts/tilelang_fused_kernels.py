@@ -232,16 +232,17 @@ def compile_to_so():
     X = torch.randn(128, 128, dtype=torch.bfloat16, device="cuda")
     W_norm = torch.ones(128, dtype=torch.bfloat16, device="cuda")
     W_matmul = torch.randn(128, 128, dtype=torch.bfloat16, device="cuda")
-    _ = k1(X, W_norm, W_matmul)  # trigger compilation
-    _ = k2(X, W_norm, W_matmul)  # trigger compilation
     gate = torch.randn(128, 128, dtype=torch.bfloat16, device="cuda")
     up = torch.randn(128, 128, dtype=torch.bfloat16, device="cuda")
-    _ = k3(gate, up)  # trigger compilation
 
-    # Export — try each kernel until one succeeds
-    exported = False
-    for k, name in [(k1, "rmsnorm_matmul"), (k2, "rmsnorm_matmul_one_plus"), (k3, "swiglu")]:
+    # Try k1 and k2 (rmsnorm_matmul variants) — these may fail on export
+    # Try k3 (swiglu) — this is known to work
+    for k, name in [(k3, "swiglu"), (k2, "rmsnorm_matmul_one_plus"), (k1, "rmsnorm_matmul")]:
         try:
+            if name == "swiglu":
+                _ = k(gate, up)  # trigger compilation
+            else:
+                _ = k(X, W_norm, W_matmul)  # trigger compilation
             k.export_library(so_path)
             print(f"Exported via {name} to {so_path}")
             exported = True
