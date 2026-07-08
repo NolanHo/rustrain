@@ -80,13 +80,25 @@ def main():
     tl_include = os.path.join(tl_path, "src")
     cutlass_include = os.path.join(tl_path, "3rdparty", "cutlass", "include")
     
+    # Compile device code with nvcc, host wrapper with g++
+    # Step 1: nvcc compiles the .cu to .o
+    obj_path = so_path + ".o"
     result = subprocess.run([
-        "nvcc", "-shared", "-Xcompiler", "-fPIC", "-O2", "-std=c++17",
+        "nvcc", "-c", "-Xcompiler", "-fPIC", "-O2", "-std=c++17",
         f"-I{tl_include}",
         f"-I{cutlass_include}",
-        "-o", so_path,
+        "-o", obj_path,
         wrapper_path,
-        "-lcudart"
+    ], capture_output=True, text=True)
+    if result.returncode != 0:
+        print(f"nvcc failed: {result.stderr[:500]}")
+        return
+    
+    # Step 2: g++ links .o into .so with -lcudart
+    result = subprocess.run([
+        "g++", "-shared", "-fPIC", "-o", so_path,
+        obj_path,
+        "-L/usr/local/cuda/lib64", "-lcudart",
     ], capture_output=True, text=True)
     if result.returncode == 0:
         print(f"Compiled to {so_path}")
