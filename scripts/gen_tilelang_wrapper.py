@@ -74,14 +74,16 @@ def main():
     
     # Compile with nvcc
     import subprocess
-    # Find tilelang include path
+    # Find tilelang include paths
     import tilelang as _tl
     tl_path = os.path.dirname(_tl.__file__)
     tl_include = os.path.join(tl_path, "src")
+    cutlass_include = os.path.join(tl_path, "3rdparty", "cutlass", "include")
     
     result = subprocess.run([
         "nvcc", "-shared", "-Xcompiler", "-fPIC", "-O2", "-std=c++17",
         f"-I{tl_include}",
+        f"-I{cutlass_include}",
         "-o", so_path,
         wrapper_path,
         "-lcudart"
