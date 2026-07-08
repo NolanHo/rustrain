@@ -231,8 +231,7 @@ def compile_to_so():
     k3 = fused_swiglu(M=128, I=128, limit=10.0)
 
     so_path = os.path.join(out_dir, "libtilelang_fused.so")
-    # Must call the kernel once to trigger compilation, then export
-    # Tilelang uses lazy compilation — calling the kernel compiles it
+    # Must call each kernel to trigger compilation, then export
     import torch
     X = torch.randn(128, 128, dtype=torch.bfloat16, device="cuda")
     W_norm = torch.ones(128, dtype=torch.bfloat16, device="cuda")
@@ -243,9 +242,18 @@ def compile_to_so():
     up = torch.randn(128, 128, dtype=torch.bfloat16, device="cuda")
     _ = k3(gate, up)  # trigger compilation
 
-    # Now export — use the first kernel's module (all share the same .so)
-    k1.export_library(so_path)
-    print(f"Compiled fused kernels to {so_path}")
+    # Export — try each kernel until one succeeds
+    exported = False
+    for k, name in [(k1, "rmsnorm_matmul"), (k2, "rmsnorm_matmul_one_plus"), (k3, "swiglu")]:
+        try:
+            k.export_library(so_path)
+            print(f"Exported via {name} to {so_path}")
+            exported = True
+            break
+        except Exception as e:
+            print(f"Export via {name} failed: {e}")
+    if not exported:
+        print("WARNING: All exports failed, Tilelang not available")
 
 
 if __name__ == "__main__":
