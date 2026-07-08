@@ -351,11 +351,8 @@ fn train_impl(
         let pad_id = data.pad_token_id();
         let attention_mask = input_ids.ne(pad_id).to_kind(Kind::Float).unsqueeze(0);  // [1, seq]
 
-        // Set attention mask before train_step
-        ctx.set_attention_mask(&attention_mask);
-
         // C++ all-in-C++ path: single call does forward + loss + backward + Adam
-        let loss_value = ctx.train_step(&input_ids, &target_mask)?;
+        let loss_value = ctx.train_step(&input_ids, &target_mask, &attention_mask)?;
         if step == 0 { initial_loss = loss_value; }
         final_loss = loss_value;
         if step % 10 == 0 || step == max_steps - 1 {

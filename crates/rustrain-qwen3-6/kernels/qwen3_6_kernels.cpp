@@ -1740,12 +1740,16 @@ void qwen36_set_mtp_weights(
 double qwen36_train_step(
     void* ctx_ptr,
     void* input_ids_ptr,
-    void* target_mask_ptr
+    void* target_mask_ptr,
+    void* attention_mask_ptr
 ) {
     try {
         auto* ctx = reinterpret_cast<TrainingContext*>(ctx_ptr);
         auto& input_ids = *reinterpret_cast<at::Tensor*>(input_ids_ptr);
         auto& target_mask = *reinterpret_cast<at::Tensor*>(target_mask_ptr);
+        if (attention_mask_ptr) {
+            ctx->attention_mask = *reinterpret_cast<at::Tensor*>(attention_mask_ptr);
+        }
 
         // Forward: checkpoint (default) or fused layer (QWEN36_FUSED_LAYER=1)
         bool use_fused = getenv("QWEN36_FUSED_LAYER");

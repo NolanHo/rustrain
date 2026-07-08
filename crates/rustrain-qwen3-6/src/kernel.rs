@@ -15,7 +15,7 @@ type FnCreateCtx = unsafe extern "C" fn(
     *mut c_void, i64, i32, f64, f64, f64, f64, f64, i64, f64,
     i64, *const i64, i64,
 ) -> *mut c_void;
-type FnTrainStep = unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void) -> f64;
+type FnTrainStep = unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void, *mut c_void) -> f64;
 type FnGetLoraCount = unsafe extern "C" fn(*mut c_void) -> i64;
 type FnGetLoraA = unsafe extern "C" fn(*mut c_void, i64) -> *mut c_void;
 type FnGetLoraB = unsafe extern "C" fn(*mut c_void, i64) -> *mut c_void;
@@ -34,7 +34,6 @@ type FnSetMtpWeights = unsafe extern "C" fn(
     i64,               // num_mtp_layers
 );
 type FnSetCheckpoint = unsafe extern "C" fn(*mut c_void, i32, i64);
-type FnSetAttentionMask = unsafe extern "C" fn(*mut c_void, *mut c_void);
 
 #[repr(C)]
 pub struct CppLayerConfig {
@@ -70,7 +69,6 @@ struct KernelHandles {
     free_tensor: FnFreeTensor,
     set_mtp_weights: FnSetMtpWeights,
     set_checkpoint: FnSetCheckpoint,
-    set_attention_mask: FnSetAttentionMask,
 }
 
 static KERNELS: OnceLock<Option<KernelHandles>> = OnceLock::new();
@@ -115,7 +113,6 @@ unsafe fn load_kernels() -> Option<KernelHandles> {
         free_tensor: sym!("qwen36_free_tensor"),
         set_mtp_weights: sym!("qwen36_set_mtp_weights"),
         set_checkpoint: sym!("qwen36_set_checkpoint"),
-        set_attention_mask: sym!("qwen36_set_attention_mask"),
     })
 }
 
@@ -350,13 +347,14 @@ impl CppTrainingContext {
 
     /// Run one training step: forward + loss + backward + Adam update.
     /// Returns loss value.
-    pub fn train_step(&self, input_ids: &Tensor, target_mask: &Tensor) -> Result<f64> {
+    pub fn train_step(&self, input_ids: &Tensor, target_mask: &Tensor, attention_mask: &Tensor) -> Result<f64> {
         let kh = get_kernels().ok_or_else(|| anyhow::anyhow!("kernels not loaded"))?;
         let loss = unsafe {
             (kh.train_step)(
                 self.ptr,
                 input_ids.as_ptr() as *mut _,
                 target_mask.as_ptr() as *mut _,
+                attention_mask.as_ptr() as *mut _,
             )
         };
         if loss < 0.0 {
@@ -433,14 +431,6 @@ impl CppTrainingContext {
         let kh = get_kernels().expect("kernels not loaded");
         unsafe {
             (kh.set_checkpoint)(self.ptr, if enable { 1 } else { 0 }, group_size);
-        }
-    }
-
-    /// Set attention mask [batch, seq] — 1 for real tokens, 0 for padding.
-    pub fn set_attention_mask(&self, mask: &Tensor) {
-        let kh = get_kernels().expect("kernels not loaded");
-        unsafe {
-            (kh.set_attention_mask)(self.ptr, mask.as_ptr() as *mut c_void);
         }
     }
 }
