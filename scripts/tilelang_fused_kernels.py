@@ -38,14 +38,12 @@ def fused_rmsnorm_matmul(
         with T.Kernel(T.ceildiv(M, block_m), T.ceildiv(N, block_n), threads=threads) as (bx, by):
             X_shared = T.alloc_shared((block_m, K), "bfloat16")
             W_shared = T.alloc_shared((block_n, K), "bfloat16")
-            Wn_shared = T.alloc_shared((K,), "bfloat16")
             Y_local = T.alloc_fragment((block_m, block_n), "float32")
             rms_val = T.alloc_fragment((block_m,), "float32")
             sum_sq = T.alloc_fragment((block_m,), "float32")
 
             T.copy(X[bx * block_m:(bx + 1) * block_m, :], X_shared)
             T.copy(W_matmul[by * block_n:(by + 1) * block_n, :], W_shared)
-            T.copy(W_norm[:], Wn_shared)
 
             T.clear(sum_sq)
             for k in T.serial(K):
@@ -57,7 +55,7 @@ def fused_rmsnorm_matmul(
 
             T.clear(Y_local)
             for k in T.serial(K):
-                wn = T.cast(Wn_shared[k], "float32")
+                wn = T.cast(W_norm[k], "float32")
                 for i in T.serial(block_m):
                     xv = T.cast(X_shared[i, k], "float32") * rms_val[i] * wn
                     for j in T.serial(block_n):
@@ -90,14 +88,12 @@ def fused_rmsnorm_matmul_one_plus(
         with T.Kernel(T.ceildiv(M, block_m), T.ceildiv(N, block_n), threads=threads) as (bx, by):
             X_shared = T.alloc_shared((block_m, K), "bfloat16")
             W_shared = T.alloc_shared((block_n, K), "bfloat16")
-            Wn_shared = T.alloc_shared((K,), "bfloat16")
             Y_local = T.alloc_fragment((block_m, block_n), "float32")
             rms_val = T.alloc_fragment((block_m,), "float32")
             sum_sq = T.alloc_fragment((block_m,), "float32")
 
             T.copy(X[bx * block_m:(bx + 1) * block_m, :], X_shared)
             T.copy(W_matmul[by * block_n:(by + 1) * block_n, :], W_shared)
-            T.copy(W_norm[:], Wn_shared)
 
             T.clear(sum_sq)
             for k in T.serial(K):
@@ -110,7 +106,7 @@ def fused_rmsnorm_matmul_one_plus(
             # Qwen3.6: normed = x * inv_rms * (1 + weight)
             T.clear(Y_local)
             for k in T.serial(K):
-                wn = T.cast(Wn_shared[k], "float32") + T.cast(1.0, "float32")
+                wn = T.cast(W_norm[k], "float32") + T.cast(1.0, "float32")
                 for i in T.serial(block_m):
                     xv = T.cast(X_shared[i, k], "float32") * rms_val[i] * wn
                     for j in T.serial(block_n):
