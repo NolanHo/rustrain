@@ -1913,6 +1913,7 @@ void qwen36_set_checkpoint(void* ctx_ptr, int32_t enable, int64_t group_size) {
 }
 
 // Set attention mask for padding tokens
+__attribute__((visibility("default")))
 void qwen36_set_attention_mask(void* ctx_ptr, void* mask_ptr) {
     auto* ctx = reinterpret_cast<TrainingContext*>(ctx_ptr);
     if (mask_ptr) {
