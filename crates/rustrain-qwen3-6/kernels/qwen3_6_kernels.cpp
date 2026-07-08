@@ -88,7 +88,10 @@ struct FusedSwiGLUFunction : public torch::autograd::Function<FusedSwiGLUFunctio
 static at::Tensor fused_swiglu_op(
     const at::Tensor& gate_out, const at::Tensor& up_out, double limit
 ) {
-    return FusedSwiGLUFunction::apply(gate_out, up_out, limit);
+    // ATen ops (keeps autograd graph) — TODO: re-enable CUDA kernel with autograd
+    auto inter = at::silu(gate_out) * up_out;
+    if (limit > 0.0) inter = inter.clamp(-limit, limit);
+    return inter;
 }
 
 /// Fused RMSNorm + Matmul — single CUDA kernel (normed values stay in SRAM)
