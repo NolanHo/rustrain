@@ -116,36 +116,10 @@ fn main() {
     });
 
     if !nvcc_path.is_empty() {
-        // fused_backward.cu has __global__ kernels — needs nvcc
-        let cu_files_needing_nvcc = ["kernels/fused_backward.cu"];
         // delta_rule.cu is pure C++ (no __global__), compile with g++
-        // megakernel.cu is #included into qwen3_6_kernels.cpp
         let cu_files_gpp = ["kernels/delta_rule.cu"];
 
         let mut obj_files = vec![];
-
-        // Compile CUDA kernels with nvcc
-        for cu_file in &cu_files_needing_nvcc {
-            if !std::path::Path::new(cu_file).exists() { continue; }
-            let obj_file = format!("{out_dir}/{}.o",
-                cu_file.replace("kernels/", "").replace(".cu", ""));
-            let cu_status = Command::new(&nvcc_path)
-                .args([
-                    "-c", cu_file, "-o", &obj_file,
-                    "-O2", "-std=c++17",
-                    "-D_GLIBCXX_USE_CXX11_ABI=1",
-                    &format!("-I{torch_include}"),
-                    &format!("-I{torch_include}/ATen"),
-                    &format!("-I{torch_include}/c10"),
-                    &format!("-I{torch_include}/caffe2"),
-                    &format!("-I{cuda_inc}"),
-                    "-Xcompiler", "-fPIC",
-                ])
-                .status();
-            if cu_status.map(|s| s.success()).unwrap_or(false) {
-                obj_files.push(obj_file);
-            }
-        }
 
         // Compile C++ files that happen to have .cu extension with g++ (use -x c++ to override)
         for cu_file in &cu_files_gpp {
