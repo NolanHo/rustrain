@@ -86,7 +86,8 @@ __global__ void fused_swiglu_kernel(
 
     float g = __bfloat162float(gate[idx]);
     float u = __bfloat162float(up[idx]);
-    float silu_g = 1.0f / (1.0f + expf(-g));
+    // silu(g) = g * sigmoid(g) = g / (1 + exp(-g))
+    float silu_g = g / (1.0f + expf(-g));
     float v = silu_g * u;
     if (limit > 0.0f) {
         v = fmaxf(fminf(v, limit), -limit);
