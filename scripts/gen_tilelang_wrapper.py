@@ -93,6 +93,7 @@ def main():
     if result.returncode != 0:
         print(f"nvcc failed: {result.stderr[:500]}")
         return
+    print(f"nvcc compiled to {obj_path}")
     
     # Step 2: g++ links .o into .so with -lcudart
     result = subprocess.run([
