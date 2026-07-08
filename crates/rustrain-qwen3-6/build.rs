@@ -166,6 +166,8 @@ fn main() {
                 format!("-I{cuda_inc}"),
                 format!("-L{torch_lib}"),
                 format!("-Wl,-rpath,{torch_lib}"),
+                format!("-L{cuda_inc}/../lib64"),
+                format!("-Wl,-rpath,{cuda_inc}/../lib64"),
                 "-Wl,--no-as-needed".to_string(),
                 "-ltorch".to_string(), "-ltorch_cuda".to_string(), "-ltorch_cpu".to_string(),
                 "-lc10".to_string(), "-lcudart".to_string(),
