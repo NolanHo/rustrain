@@ -593,6 +593,27 @@ static at::Tensor moe_forward(
     topk_weights = topk_weights.to(compute_type);
 
     auto routed_output = at::zeros(flat.sizes(), flat.options());
+
+    // Debug: dump MoE routing and weight stats for last layer
+    if (getenv("QWEN36_DUMP_MOE")) {
+        auto rl_f = router_logits.to(at::kFloat);
+        auto rw_f = topk_weights.to(at::kFloat);
+        auto egu_f = experts_gate_up.select(0, 0).to(at::kFloat);
+        auto ed_f = experts_down.select(0, 0).to(at::kFloat);
+        fprintf(stderr, "  [moe] router_logits: mean=%.6f std=%.6f max=%.6f\n", rl_f.mean().item<float>(), rl_f.std().item<float>(), rl_f.abs().max().item<float>());
+        fprintf(stderr, "  [moe] topk_weights: mean=%.6f std=%.6f max=%.6f\n", rw_f.mean().item<float>(), rw_f.std().item<float>(), rw_f.abs().max().item<float>());
+        fprintf(stderr, "  [moe] experts_gate_up[0]: mean=%.6f std=%.6f max=%.6f\n", egu_f.mean().item<float>(), egu_f.std().item<float>(), egu_f.abs().max().item<float>());
+        fprintf(stderr, "  [moe] experts_down[0]: mean=%.6f std=%.6f max=%.6f\n", ed_f.mean().item<float>(), ed_f.std().item<float>(), ed_f.abs().max().item<float>());
+        auto sg_f = shared_gate_proj.to(at::kFloat);
+        auto sd_f = shared_down_proj.to(at::kFloat);
+        fprintf(stderr, "  [moe] shared_gate: mean=%.6f std=%.6f max=%.6f\n", sg_f.mean().item<float>(), sg_f.std().item<float>(), sg_f.abs().max().item<float>());
+        fprintf(stderr, "  [moe] shared_down: mean=%.6f std=%.6f max=%.6f\n", sd_f.mean().item<float>(), sd_f.std().item<float>(), sd_f.abs().max().item<float>());
+        auto seg_f = at::sigmoid(at::matmul(flat, shared_expert_gate_w.t())).to(at::kFloat);
+        fprintf(stderr, "  [moe] shared_gate_sig: mean=%.6f std=%.6f max=%.6f\n", seg_f.mean().item<float>(), seg_f.std().item<float>(), seg_f.abs().max().item<float>());
+        auto ro_f = routed_output.to(at::kFloat);
+        fprintf(stderr, "  [moe] routed_output: mean=%.6f std=%.6f max=%.6f\n", ro_f.mean().item<float>(), ro_f.std().item<float>(), ro_f.abs().max().item<float>());
+    }
+
     for (int64_t kk = 0; kk < top_k; kk++) {
         auto expert_indices = topk_indices.select(-1, kk);
         auto expert_weights = topk_weights.select(-1, kk);
