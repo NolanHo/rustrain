@@ -87,6 +87,9 @@ def main():
         "nvcc", "-c", "-Xcompiler", "-fPIC", "-O2", "-std=c++17",
         f"-I{tl_include}",
         f"-I{cutlass_include}",
+        "-diag-suppress", "20012",
+        "-diag-suppress", "177-D",
+        "--expt-relaxed-constexpr",
         "-o", obj_path,
         wrapper_path,
     ], capture_output=True, text=True)
