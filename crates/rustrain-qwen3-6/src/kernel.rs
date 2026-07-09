@@ -16,9 +16,13 @@ type FnCreateCtx = unsafe extern "C" fn(
     i64, *const i64, i64,
 ) -> *mut c_void;
 type FnTrainStep = unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void, *mut c_void) -> f64;
+type FnEvalStep = unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void, *mut c_void) -> f64;
 type FnGetLoraCount = unsafe extern "C" fn(*mut c_void) -> i64;
 type FnGetLoraA = unsafe extern "C" fn(*mut c_void, i64) -> *mut c_void;
 type FnGetLoraB = unsafe extern "C" fn(*mut c_void, i64) -> *mut c_void;
+type FnGetStepCount = unsafe extern "C" fn(*mut c_void) -> i64;
+type FnExportOptimizer = unsafe extern "C" fn(*mut c_void, *mut *mut c_void, *mut *mut c_void, i64) -> i64;
+type FnImportOptimizer = unsafe extern "C" fn(*mut c_void, *mut *mut c_void, *mut *mut c_void, i64) -> i64;
 type FnFreeCtx = unsafe extern "C" fn(*mut c_void);
 type FnGemm = unsafe extern "C" fn(*mut c_void, *mut c_void, i32) -> *mut c_void;
 type FnFreeTensor = unsafe extern "C" fn(*mut c_void);
@@ -61,9 +65,13 @@ pub struct CppLayerConfig {
 struct KernelHandles {
     create_ctx: FnCreateCtx,
     train_step: FnTrainStep,
+    eval_step: FnEvalStep,
     get_lora_count: FnGetLoraCount,
     get_lora_a: FnGetLoraA,
     get_lora_b: FnGetLoraB,
+    get_step_count: FnGetStepCount,
+    export_optimizer: FnExportOptimizer,
+    import_optimizer: FnImportOptimizer,
     free_ctx: FnFreeCtx,
     gemm: FnGemm,
     free_tensor: FnFreeTensor,
@@ -105,9 +113,13 @@ unsafe fn load_kernels() -> Option<KernelHandles> {
     Some(KernelHandles {
         create_ctx: sym!("qwen36_create_training_context"),
         train_step: sym!("qwen36_train_step"),
+        eval_step: sym!("qwen36_eval_step"),
         get_lora_count: sym!("qwen36_get_lora_count"),
         get_lora_a: sym!("qwen36_get_lora_a"),
         get_lora_b: sym!("qwen36_get_lora_b"),
+        get_step_count: sym!("qwen36_get_step_count"),
+        export_optimizer: sym!("qwen36_export_optimizer_state"),
+        import_optimizer: sym!("qwen36_import_optimizer_state"),
         free_ctx: sym!("qwen36_free_training_context"),
         gemm: sym!("qwen36_gemm"),
         free_tensor: sym!("qwen36_free_tensor"),
@@ -432,6 +444,74 @@ impl CppTrainingContext {
         unsafe {
             (kh.set_checkpoint)(self.ptr, if enable { 1 } else { 0 }, group_size);
         }
+    }
+
+    /// Eval step: forward + loss, no backward, no Adam update.
+    pub fn eval_step(&self, input_ids: &Tensor, target_mask: &Tensor, attention_mask: &Tensor) -> Result<f64> {
+        let kh = get_kernels().ok_or_else(|| anyhow::anyhow!("kernels not loaded"))?;
+        let loss = unsafe {
+            (kh.eval_step)(
+                self.ptr,
+                input_ids.as_ptr() as *mut _,
+                target_mask.as_ptr() as *mut _,
+                attention_mask.as_ptr() as *mut _,
+            )
+        };
+        if loss < 0.0 {
+            bail!("C++ eval_step failed");
+        }
+        Ok(loss)
+    }
+
+    /// Get current training step count.
+    pub fn get_step_count(&self) -> i64 {
+        let kh = match get_kernels() { Some(k) => k, None => return 0 };
+        unsafe { (kh.get_step_count)(self.ptr) }
+    }
+
+    /// Export Adam optimizer state (m and v vectors).
+    /// Returns (m_tensors, v_tensors) — owned copies on CPU.
+    pub fn export_optimizer_state(&self) -> Result<(Vec<Tensor>, Vec<Tensor>)> {
+        let kh = get_kernels().ok_or_else(|| anyhow::anyhow!("kernels not loaded"))?;
+        let count = self.lora_count * 2;  // m and v per LoRA param (a+b)
+        let mut m_ptrs: Vec<*mut c_void> = vec![std::ptr::null_mut(); count as usize];
+        let mut v_ptrs: Vec<*mut c_void> = vec![std::ptr::null_mut(); count as usize];
+        let actual = unsafe {
+            (kh.export_optimizer)(
+                self.ptr,
+                m_ptrs.as_mut_ptr(),
+                v_ptrs.as_mut_ptr(),
+                count,
+            )
+        };
+        let mut m_tensors = Vec::new();
+        let mut v_tensors = Vec::new();
+        for i in 0..actual as usize {
+            if !m_ptrs[i].is_null() {
+                m_tensors.push(unsafe { Tensor::clone_from_ptr(m_ptrs[i] as *mut _) });
+            }
+            if !v_ptrs[i].is_null() {
+                v_tensors.push(unsafe { Tensor::clone_from_ptr(v_ptrs[i] as *mut _) });
+            }
+        }
+        Ok((m_tensors, v_tensors))
+    }
+
+    /// Import Adam optimizer state (m and v vectors).
+    pub fn import_optimizer_state(&self, m_tensors: &[Tensor], v_tensors: &[Tensor]) -> Result<i64> {
+        let kh = get_kernels().ok_or_else(|| anyhow::anyhow!("kernels not loaded"))?;
+        let count = m_tensors.len().min(v_tensors.len());
+        let m_ptrs: Vec<*mut c_void> = m_tensors.iter().map(|t| t.as_ptr() as *mut c_void).collect();
+        let v_ptrs: Vec<*mut c_void> = v_tensors.iter().map(|t| t.as_ptr() as *mut c_void).collect();
+        let imported = unsafe {
+            (kh.import_optimizer)(
+                self.ptr,
+                m_ptrs.as_ptr() as *mut *mut c_void,
+                v_ptrs.as_ptr() as *mut *mut c_void,
+                count as i64,
+            )
+        };
+        Ok(imported)
     }
 }
 

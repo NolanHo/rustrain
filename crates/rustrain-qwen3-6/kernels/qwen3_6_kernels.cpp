@@ -1814,6 +1814,74 @@ void qwen36_set_checkpoint(void* ctx_ptr, int32_t enable, int64_t group_size) {
         ctx->use_checkpoint ? "ON" : "OFF", (long)ctx->group_size);
 }
 
+// Eval step: forward + loss, no backward, no Adam update
+double qwen36_eval_step(void* ctx_ptr, void* input_ids_ptr, void* target_mask_ptr, void* attention_mask_ptr) {
+    try {
+        auto* ctx = reinterpret_cast<TrainingContext*>(ctx_ptr);
+        auto& input_ids = *reinterpret_cast<at::Tensor*>(input_ids_ptr);
+        auto& target_mask = *reinterpret_cast<at::Tensor*>(target_mask_ptr);
+        if (attention_mask_ptr) {
+            ctx->attention_mask = *reinterpret_cast<at::Tensor*>(attention_mask_ptr);
+        }
+
+        // Forward (no grad)
+        at::AutoGradMode no_grad(false);
+        auto hidden = ctx->use_checkpoint
+            ? forward_full_checkpoint(ctx, input_ids)
+            : forward_full(ctx, input_ids);
+
+        auto loss = compute_loss(hidden, input_ids, target_mask,
+            *ctx->final_norm_ptr, *ctx->lm_head_ptr, ctx->rms_eps, ctx->vocab_size);
+
+        // MTP loss
+        if (ctx->has_mtp) {
+            auto mtp_logits = mtp_forward(hidden, input_ids, ctx->embed_for_mtp, ctx->mtp, ctx->rms_eps);
+            auto mlp_loss = mtp_compute_loss(mtp_logits, input_ids, target_mask, ctx->vocab_size);
+            loss = loss + mlp_loss;
+        }
+
+        return loss.item<double>();
+    } catch (const std::exception& e) {
+        fprintf(stderr, "[q36_eval_step] FAILED: %s\n", e.what());
+        return -1.0;
+    }
+}
+
+// Get current step count
+int64_t qwen36_get_step_count(void* ctx_ptr) {
+    auto* ctx = reinterpret_cast<TrainingContext*>(ctx_ptr);
+    return (int64_t)ctx->step_count;
+}
+
+// Export optimizer state: returns count, fills arrays
+// Caller passes arrays of at::Tensor* pointers, filled with m and v tensors
+int64_t qwen36_export_optimizer_state(void* ctx_ptr, void** m_ptrs, void** v_ptrs, int64_t max_count) {
+    auto* ctx = reinterpret_cast<TrainingContext*>(ctx_ptr);
+    int64_t count = (int64_t)ctx->adam_m.size();
+    if (count > max_count) count = max_count;
+    for (int64_t i = 0; i < count; i++) {
+        m_ptrs[i] = &ctx->adam_m[i];
+        v_ptrs[i] = &ctx->adam_v[i];
+    }
+    return count;
+}
+
+// Import optimizer state: copy m/v from provided tensors
+int64_t qwen36_import_optimizer_state(void* ctx_ptr, void** m_ptrs, void** v_ptrs, int64_t count) {
+    auto* ctx = reinterpret_cast<TrainingContext*>(ctx_ptr);
+    int64_t imported = 0;
+    for (int64_t i = 0; i < count && i < (int64_t)ctx->adam_m.size(); i++) {
+        auto* src_m = reinterpret_cast<at::Tensor*>(m_ptrs[i]);
+        auto* src_v = reinterpret_cast<at::Tensor*>(v_ptrs[i]);
+        if (src_m && src_v) {
+            ctx->adam_m[i] = src_m->clone();
+            ctx->adam_v[i] = src_v->clone();
+            imported++;
+        }
+    }
+    return imported;
+}
+
 }
 
 // Utility functions (kept for compatibility)

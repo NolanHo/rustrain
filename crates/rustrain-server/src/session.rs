@@ -326,14 +326,12 @@ impl TrainingSession for Qwen36Session {
     }
 
     fn eval_step(&self, input: TrainInput) -> Result<EvalOutput> {
-        // TODO: implement C++ eval_step (forward without backward/Adam)
-        // For now, run train_step without Adam update — requires C++ FFI change
-        let _ctx = self
+        let ctx = self
             .ctx
             .as_ref()
             .ok_or_else(|| anyhow!("LoRA not initialized"))?;
-        let _ = input;
-        Err(anyhow!("eval_step not yet implemented (requires C++ FFI)"))
+        let loss = ctx.eval_step(&input.input_ids, &input.target_mask, &input.attention_mask)?;
+        Ok(EvalOutput { loss })
     }
 
     fn save_checkpoint(&self, path: &str) -> Result<(u64, f64)> {
@@ -352,9 +350,8 @@ impl TrainingSession for Qwen36Session {
             }
         }
 
-        // TODO: export Adam m/v from C++ (requires C++ FFI)
-        let adam_m: Vec<Tensor> = Vec::new();
-        let adam_v: Vec<Tensor> = Vec::new();
+        // Export Adam optimizer state
+        let (adam_m, adam_v) = ctx.export_optimizer_state()?;
 
         checkpoint::save_checkpoint(
             std::path::Path::new(path),
@@ -374,7 +371,16 @@ impl TrainingSession for Qwen36Session {
 
     fn load_checkpoint(&mut self, path: &str) -> Result<(u64, f64)> {
         let data = checkpoint::load_checkpoint(std::path::Path::new(path))?;
-        // TODO: import Adam m/v into C++ context (requires C++ FFI)
+        // Import Adam optimizer state into C++ context
+        if let Some(ctx) = &self.ctx {
+            if !data.adam_m.is_empty() && !data.adam_v.is_empty() {
+                ctx.import_optimizer_state(&data.adam_m, &data.adam_v)?;
+                tracing::info!(
+                    imported = data.adam_m.len(),
+                    "optimizer state imported"
+                );
+            }
+        }
         self.step = data.manifest.step;
         self.last_loss = data.manifest.loss;
         Ok((data.manifest.step, data.manifest.loss))
