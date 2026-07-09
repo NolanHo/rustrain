@@ -1,0 +1,119 @@
+syntax = "proto3";
+package rustrain.train.v1;
+
+service TrainService {
+  rpc LoadModel(LoadModelRequest) returns (LoadModelResponse);
+  rpc LoadDataset(LoadDatasetRequest) returns (LoadDatasetResponse);
+  rpc InitLoRA(InitLoRARequest) returns (InitLoRAResponse);
+  rpc TrainStep(TrainStepRequest) returns (TrainStepResponse);
+  rpc EvalStep(EvalStepRequest) returns (EvalStepResponse);
+  rpc SaveCheckpoint(SaveCheckpointRequest) returns (CheckpointInfo);
+  rpc LoadCheckpoint(LoadCheckpointRequest) returns (CheckpointInfo);
+  rpc ExportAdapter(ExportAdapterRequest) returns (AdapterInfo);
+  rpc StreamMetrics(StreamMetricsRequest) returns (stream StepMetric);
+  rpc GetStatus(GetStatusRequest) returns (SessionStatus);
+}
+
+message TensorData {
+  bytes data = 1;
+  repeated int64 shape = 2;
+  string dtype = 3;
+}
+
+message LoadModelRequest {
+  string session_id = 1;
+  string model_path = 2;
+  string config_toml = 3;
+}
+message LoadModelResponse {
+  string model_id = 1;
+}
+
+message LoadDatasetRequest {
+  string session_id = 1;
+  string jsonl_path = 2;
+  int64 seq_len = 3;
+}
+message LoadDatasetResponse {
+  int64 num_examples = 1;
+}
+
+message InitLoRARequest {
+  string session_id = 1;
+  int64 rank = 2;
+  double alpha = 3;
+  repeated int64 target_layers = 4;
+  repeated string target_modules = 5;
+  double lr = 6;
+  double beta1 = 7;
+  double beta2 = 8;
+  double eps = 9;
+}
+message InitLoRAResponse {
+  int64 lora_param_count = 1;
+}
+
+message TrainStepRequest {
+  string session_id = 1;
+  TensorData input_ids = 2;
+  TensorData target_mask = 3;
+  TensorData attention_mask = 4;
+}
+message TrainStepResponse {
+  double loss = 1;
+  int64 step = 2;
+}
+
+message EvalStepRequest {
+  string session_id = 1;
+  TensorData input_ids = 2;
+  TensorData target_mask = 3;
+  TensorData attention_mask = 4;
+}
+message EvalStepResponse {
+  double loss = 1;
+}
+
+message SaveCheckpointRequest {
+  string session_id = 1;
+  string path = 2;
+}
+message LoadCheckpointRequest {
+  string session_id = 1;
+  string path = 2;
+}
+message CheckpointInfo {
+  int64 step = 1;
+  double loss = 2;
+  string path = 3;
+}
+
+message ExportAdapterRequest {
+  string session_id = 1;
+  string path = 2;
+}
+message AdapterInfo {
+  string path = 1;
+  int64 param_count = 2;
+}
+
+message StreamMetricsRequest {
+  string session_id = 1;
+}
+message StepMetric {
+  int64 step = 1;
+  double loss = 2;
+  double lr = 3;
+  double mem_gb = 4;
+  int64 timestamp_unix = 5;
+}
+
+message GetStatusRequest {
+  string session_id = 1;
+}
+message SessionStatus {
+  string state = 1;
+  int64 step = 2;
+  double last_loss = 3;
+  string model_path = 4;
+}

@@ -19,6 +19,17 @@ rustrain-deepseek-v4 = { path = "crates/rustrain-deepseek-v4" }
 rustrain-glm5 = { path = "crates/rustrain-glm5" }
 rustrain-moe = { path = "crates/rustrain-moe" }
 rustrain-qwen3-6 = { path = "crates/rustrain-qwen3-6" }
+rustrain-server = { path = "crates/rustrain-server" }
+
+# Server deps
+axum.workspace = true
+tokio.workspace = true
+tonic.workspace = true
+prost.workspace = true
+tower.workspace = true
+base64 = "0.22"
+futures = "0.3"
+tokio-stream = "0.1"
 
 # Ray distributed computing (native Rust SDK) — optional, only needed for Ray mode
 rayrust = { version = "0.1.0", optional = true }
@@ -50,9 +61,11 @@ members = ["crates/*"]
 [workspace.dependencies]
 anyhow = "1.0.98"
 arrow = { version = "57.0.0", default-features = false, features = ["ipc"] }
+axum = "0.8"
 chrono = { version = "0.4.41", default-features = false, features = ["clock"] }
 clap = { version = "4.5.40", features = ["derive"] }
 ndarray = { version = "0.16.1", features = ["serde"] }
+prost = "0.13"
 rand = "0.8.5"
 rand_distr = "0.4.3"
 regex = "1.11.3"
@@ -60,8 +73,12 @@ safetensors = "0.8.0"
 serde = { version = "1.0.219", features = ["derive"] }
 serde_json = "1.0.145"
 tch = "0.20.0"
+tokio = { version = "1", features = ["full"] }
 tokenizers = "0.23.1"
 toml = "0.8.23"
+tonic = "0.12"
+tonic-build = "0.12"
+tower = { version = "0.5", features = ["util"] }
 tracing = "0.1.41"
 tracing-appender = "0.2.3"
 tracing-subscriber = { version = "0.3.19", features = ["env-filter", "fmt"] }

@@ -65,6 +65,16 @@ enum Command {
     /// Probe tch-rs CUDA availability
     Probe,
 
+    /// Start training server (HTTP + gRPC)
+    Server {
+        #[arg(long, default_value_t = 8080)]
+        http_port: u16,
+        #[arg(long, default_value_t = 50051)]
+        grpc_port: u16,
+        #[arg(long, default_value = "/tmp/rustrain-server")]
+        metrics_dir: PathBuf,
+    },
+
     /// Run a command on a Ray GPU worker (via rayrust native SDK)
     #[cfg(feature = "ray")]
     RayGpu {
@@ -131,6 +141,11 @@ fn main() -> Result<()> {
             &command,
         ),
         Command::Probe => tch_train::probe_tch_cuda(),
+        Command::Server {
+            http_port,
+            grpc_port,
+            metrics_dir,
+        } => run_server(http_port, grpc_port, metrics_dir),
         #[cfg(feature = "ray")]
         Command::RayGpu {
             num_gpus,
@@ -558,4 +573,41 @@ fn dispatch_train(config_path: &Path, resume_from: Option<PathBuf>) -> Result<()
 
     // Default: ndarray toy model
     rustrain_toy::trainer::train(&config, &run_paths)
+}
+
+fn run_server(http_port: u16, grpc_port: u16, metrics_dir: PathBuf) -> Result<()> {
+    use rustrain_server::{api, grpc, state::SessionManager};
+    use rustrain_server::grpc::train::train_service_server::TrainServiceServer;
+
+    std::fs::create_dir_all(&metrics_dir)?;
+    let manager = std::sync::Arc::new(SessionManager::new(metrics_dir.clone()));
+
+    let http_addr = format!("0.0.0.0:{http_port}");
+    let grpc_addr = format!("0.0.0.0:{grpc_port}").parse()?;
+    info!("HTTP server will listen on {http_addr}");
+    info!("gRPC server will listen on 0.0.0.0:{grpc_port}");
+
+    let rt = tokio::runtime::Runtime::new()?;
+    rt.block_on(async {
+        // HTTP (axum)
+        let app_state = std::sync::Arc::new(api::AppState {
+            manager: manager.clone(),
+        });
+        let http_router = api::router(app_state);
+        let http_listener = tokio::net::TcpListener::bind(&http_addr)
+            .await
+            .unwrap_or_else(|e| panic!("bind {http_addr}: {e}"));
+
+        // gRPC (tonic)
+        let grpc_svc = TrainServiceServer::new(grpc::TrainServiceImpl {
+            manager: manager.clone(),
+        });
+
+        tokio::select! {
+            r = axum::serve(http_listener, http_router) => { if let Err(e) = r { tracing::error!("HTTP server error: {e}"); } }
+            r = tonic::transport::Server::builder().add_service(grpc_svc).serve(grpc_addr) => { if let Err(e) = r { tracing::error!("gRPC server error: {e}"); } }
+        }
+    });
+
+    Ok(())
 }

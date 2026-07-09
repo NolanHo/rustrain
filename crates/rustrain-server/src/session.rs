@@ -1,0 +1,456 @@
+//! Training session trait + Qwen3.6 implementation.
+
+use anyhow::{anyhow, Context, Result};
+use std::path::PathBuf;
+use std::sync::Arc;
+use tch::{Device, Kind, Tensor};
+use tokio::sync::Mutex;
+
+use crate::checkpoint;
+use crate::metrics::{FileMetricsSink, MetricsSink, StepMetric};
+
+/// Session states.
+#[derive(Debug, Clone)]
+pub enum SessionState {
+    Unloaded,
+    Loaded { model_path: String },
+    Ready { model_path: String },
+    Training { step: u64 },
+    Paused { step: u64 },
+    Error(String),
+}
+
+/// Request types (prefixed with Sess to avoid clash with gRPC generated types).
+#[derive(Debug)]
+pub struct SessLoadModelRequest {
+    pub model_path: String,
+    pub config_toml: String,
+}
+
+#[derive(Debug)]
+pub struct SessLoadDatasetRequest {
+    pub jsonl_path: String,
+    pub seq_len: usize,
+}
+
+#[derive(Debug)]
+pub struct InitLoRARequest {
+    pub rank: i64,
+    pub alpha: i64,
+    pub target_layers: Vec<usize>,
+    pub target_modules: Vec<String>,
+    pub lr: f64,
+    pub beta1: f64,
+    pub beta2: f64,
+    pub eps: f64,
+}
+
+#[derive(Debug)]
+pub struct TrainInput {
+    pub input_ids: Tensor,
+    pub target_mask: Tensor,
+    pub attention_mask: Tensor,
+}
+
+#[derive(Debug)]
+pub struct TrainOutput {
+    pub loss: f64,
+    pub step: u64,
+}
+
+#[derive(Debug)]
+pub struct EvalOutput {
+    pub loss: f64,
+}
+
+#[derive(Debug)]
+pub struct SessionStatus {
+    pub state: String,
+    pub step: u64,
+    pub last_loss: f64,
+    pub model_path: String,
+}
+
+/// Training session trait — each model implements this.
+pub trait TrainingSession: Send {
+    fn load_model(&mut self, req: SessLoadModelRequest) -> Result<()>;
+    fn load_dataset(&mut self, req: SessLoadDatasetRequest) -> Result<usize>;
+    fn init_lora(&mut self, req: InitLoRARequest) -> Result<usize>;
+    fn train_step(&mut self, input: TrainInput) -> Result<TrainOutput>;
+    fn eval_step(&self, input: TrainInput) -> Result<EvalOutput>;
+    fn save_checkpoint(&self, path: &str) -> Result<(u64, f64)>;
+    fn load_checkpoint(&mut self, path: &str) -> Result<(u64, f64)>;
+    fn export_adapter(&self, path: &str) -> Result<usize>;
+    fn status(&self) -> SessionStatus;
+    fn get_metrics(&self) -> Vec<StepMetric>;
+}
+
+/// Qwen3.6 training session — wraps CppTrainingContext.
+pub struct Qwen36Session {
+    state: SessionState,
+    model_path: Option<String>,
+    config_toml: Option<String>,
+    device: Device,
+    compute_kind: Kind,
+    ctx: Option<rustrain_qwen3_6::kernel::CppTrainingContext>,
+    dataset: Option<rustrain_qwen3_6::sft::SftDataset>,
+    lora_rank: i64,
+    lora_alpha: i64,
+    lr: f64,
+    metrics: Option<Arc<FileMetricsSink>>,
+    last_loss: f64,
+    step: u64,
+}
+
+// SAFETY: CppTrainingContext holds a raw pointer to C++ TrainingContext.
+// The C++ context is only accessed from the thread that owns Qwen36Session.
+// The Mutex in SessionManager ensures single-threaded access.
+unsafe impl Send for Qwen36Session {}
+
+impl Qwen36Session {
+    pub fn new(device: Device, compute_kind: Kind, metrics_path: PathBuf) -> Self {
+        Self {
+            state: SessionState::Unloaded,
+            model_path: None,
+            config_toml: None,
+            device,
+            compute_kind,
+            ctx: None,
+            dataset: None,
+            lora_rank: 0,
+            lora_alpha: 0,
+            lr: 1e-4,
+            metrics: Some(Arc::new(FileMetricsSink::new(metrics_path))),
+            last_loss: 0.0,
+            step: 0,
+        }
+    }
+}
+
+impl TrainingSession for Qwen36Session {
+    fn load_model(&mut self, req: SessLoadModelRequest) -> Result<()> {
+        let model_path = std::path::Path::new(&req.model_path);
+        if !model_path.exists() {
+            return Err(anyhow!("model path not found: {}", req.model_path));
+        }
+        if !rustrain_qwen3_6::kernel::kernels_available() {
+            return Err(anyhow!("C++ kernels (libqwen36_kernels.so) not found"));
+        }
+        self.model_path = Some(req.model_path.clone());
+        self.config_toml = Some(req.config_toml);
+        self.state = SessionState::Loaded {
+            model_path: req.model_path,
+        };
+        tracing::info!("model loaded");
+        Ok(())
+    }
+
+    fn load_dataset(&mut self, req: SessLoadDatasetRequest) -> Result<usize> {
+        if self.model_path.is_none() {
+            return Err(anyhow!("model not loaded"));
+        }
+        let model_path = std::path::Path::new(self.model_path.as_ref().unwrap());
+        let tokenizer_path = model_path.join("tokenizer.json");
+        let dataset = rustrain_qwen3_6::sft::SftDataset::from_jsonl(
+            std::path::Path::new(&req.jsonl_path),
+            &tokenizer_path,
+            req.seq_len,
+        )?;
+        let n = dataset.len();
+        self.dataset = Some(dataset);
+        tracing::info!(examples = n, "dataset loaded");
+        Ok(n)
+    }
+
+    fn init_lora(&mut self, req: InitLoRARequest) -> Result<usize> {
+        let model_path = self
+            .model_path
+            .as_ref()
+            .ok_or_else(|| anyhow!("model not loaded"))?;
+        let config_toml = self
+            .config_toml
+            .as_ref()
+            .ok_or_else(|| anyhow!("config not set"))?;
+
+        // Parse config
+        let config: rustrain_core::runtime::Config =
+            toml::from_str(config_toml).context("parse config_toml")?;
+
+        // Load runtime config from model
+        let model_path_obj = std::path::Path::new(model_path);
+        let runtime_config =
+            rustrain_qwen3_6::config::read_qwen36_runtime_config(
+                model_path_obj,
+            )?;
+
+        // Build needed weight set
+        let n_layers = runtime_config.num_hidden_layers;
+        let mut needed: std::collections::HashSet<String> = std::collections::HashSet::new();
+        needed.insert("embed_tokens.weight".to_string());
+        needed.insert("norm.weight".to_string());
+        if !runtime_config.tie_word_embeddings {
+            needed.insert("head.weight".to_string());
+        }
+        for layer in 0..n_layers {
+            let p = format!("layers.{layer}");
+            needed.insert(format!("{p}.input_layernorm.weight"));
+            needed.insert(format!("{p}.post_attention_layernorm.weight"));
+            match runtime_config.layer_types[layer] {
+                rustrain_qwen3_6::config::LayerType::FullAttention => {
+                    for w in &["q_proj", "q_norm", "k_proj", "k_norm", "v_proj", "o_proj"] {
+                        needed.insert(format!("{p}.self_attn.{w}.weight"));
+                    }
+                }
+                rustrain_qwen3_6::config::LayerType::LinearAttention => {
+                    needed.insert(format!("{p}.linear_attn.in_proj_qkv.weight"));
+                    needed.insert(format!("{p}.linear_attn.in_proj_z.weight"));
+                    needed.insert(format!("{p}.linear_attn.in_proj_a.weight"));
+                    needed.insert(format!("{p}.linear_attn.in_proj_b.weight"));
+                    needed.insert(format!("{p}.linear_attn.A_log"));
+                    needed.insert(format!("{p}.linear_attn.dt_bias"));
+                    needed.insert(format!("{p}.linear_attn.conv1d.weight"));
+                    needed.insert(format!("{p}.linear_attn.norm.weight"));
+                    needed.insert(format!("{p}.linear_attn.out_proj.weight"));
+                }
+            }
+            if runtime_config.is_moe {
+                needed.insert(format!("{p}.mlp.gate.weight"));
+                needed.insert(format!("{p}.mlp.shared_expert_gate.weight"));
+                needed.insert(format!("{p}.mlp.shared_expert.gate_proj.weight"));
+                needed.insert(format!("{p}.mlp.shared_expert.up_proj.weight"));
+                needed.insert(format!("{p}.mlp.shared_expert.down_proj.weight"));
+                needed.insert(format!("{p}.mlp.experts.gate_up_proj"));
+                needed.insert(format!("{p}.mlp.experts.down_proj"));
+            } else {
+                needed.insert(format!("{p}.mlp.gate_proj.weight"));
+                needed.insert(format!("{p}.mlp.up_proj.weight"));
+                needed.insert(format!("{p}.mlp.down_proj.weight"));
+            }
+        }
+        // MTP weights
+        if runtime_config.mtp_num_hidden_layers > 0 {
+            for i in 0..runtime_config.mtp_num_hidden_layers {
+                let p = format!("mtp.layers.{i}");
+                needed.insert(format!("{p}.input_layernorm.weight"));
+                needed.insert(format!("{p}.post_attention_layernorm.weight"));
+                for w in &["q_proj", "q_norm", "k_proj", "k_norm", "v_proj", "o_proj"] {
+                    needed.insert(format!("{p}.self_attn.{w}.weight"));
+                }
+                if runtime_config.is_moe {
+                    needed.insert(format!("{p}.mlp.gate.weight"));
+                    needed.insert(format!("{p}.mlp.shared_expert_gate.weight"));
+                    needed.insert(format!("{p}.mlp.shared_expert.gate_proj.weight"));
+                    needed.insert(format!("{p}.mlp.shared_expert.up_proj.weight"));
+                    needed.insert(format!("{p}.mlp.shared_expert.down_proj.weight"));
+                    needed.insert(format!("{p}.mlp.experts.gate_up_proj"));
+                    needed.insert(format!("{p}.mlp.experts.down_proj"));
+                } else {
+                    needed.insert(format!("{p}.mlp.gate_proj.weight"));
+                    needed.insert(format!("{p}.mlp.up_proj.weight"));
+                    needed.insert(format!("{p}.mlp.down_proj.weight"));
+                }
+            }
+            needed.insert("mtp.fc.weight".to_string());
+            needed.insert("mtp.pre_fc_norm_embedding.weight".to_string());
+            needed.insert("mtp.pre_fc_norm_hidden.weight".to_string());
+            needed.insert("mtp.norm.weight".to_string());
+        }
+
+        // Load weights via safetensors
+        let weight_prefix = &runtime_config.weight_prefix;
+        let raw_weights = rustrain_checkpoint::safetensors::read_safetensors_dir_filtered(
+            model_path_obj,
+            &needed,
+        )?;
+        let mut weights: std::collections::BTreeMap<String, Tensor> = std::collections::BTreeMap::new();
+        for (name, tensor) in raw_weights {
+            let full_name = if name.starts_with("model.") { name } else { format!("{weight_prefix}{name}") };
+            let t = tensor.to_device(self.device);
+            let processed = t.to_kind(self.compute_kind);
+            weights.insert(full_name, processed);
+        }
+
+        // Create C++ training context
+        let lora_scaling = req.alpha as f64 / req.rank as f64;
+        let ctx = rustrain_qwen3_6::kernel::CppTrainingContext::new(
+            &weights,
+            &runtime_config,
+            self.compute_kind,
+            req.lr,
+            req.beta1,
+            req.beta2,
+            req.eps,
+            lora_scaling,
+            req.rank,
+            &req.target_layers,
+            0,
+            runtime_config.num_experts,
+        )?;
+
+        let count = ctx.lora_count() as usize;
+        self.ctx = Some(ctx);
+        self.lora_rank = req.rank;
+        self.lora_alpha = req.alpha;
+        self.lr = req.lr;
+        self.state = SessionState::Ready {
+            model_path: model_path.clone(),
+        };
+        tracing::info!(lora_params = count, "LoRA initialized");
+        Ok(count)
+    }
+
+    fn train_step(&mut self, input: TrainInput) -> Result<TrainOutput> {
+        let ctx = self
+            .ctx
+            .as_ref()
+            .ok_or_else(|| anyhow!("LoRA not initialized"))?;
+
+        let loss = ctx.train_step(&input.input_ids, &input.target_mask, &input.attention_mask)?;
+        self.step += 1;
+        self.last_loss = loss;
+        self.state = SessionState::Training { step: self.step };
+
+        // Record metric
+        if let Some(ref metrics) = self.metrics {
+            let mem_gb = rustrain_train::metrics::gpu_memory_allocated_mb().map(|m| m / 1024.0).unwrap_or(0.0);
+            metrics.record_step(StepMetric {
+                step: self.step,
+                loss,
+                lr: self.lr,
+                mem_gb,
+                timestamp_unix: chrono::Utc::now().timestamp(),
+            });
+        }
+
+        Ok(TrainOutput { loss, step: self.step })
+    }
+
+    fn eval_step(&self, input: TrainInput) -> Result<EvalOutput> {
+        // TODO: implement C++ eval_step (forward without backward/Adam)
+        // For now, run train_step without Adam update — requires C++ FFI change
+        let _ctx = self
+            .ctx
+            .as_ref()
+            .ok_or_else(|| anyhow!("LoRA not initialized"))?;
+        let _ = input;
+        Err(anyhow!("eval_step not yet implemented (requires C++ FFI)"))
+    }
+
+    fn save_checkpoint(&self, path: &str) -> Result<(u64, f64)> {
+        let ctx = self
+            .ctx
+            .as_ref()
+            .ok_or_else(|| anyhow!("LoRA not initialized"))?;
+
+        let lora_count = ctx.lora_count();
+        let mut lora_a = Vec::new();
+        let mut lora_b = Vec::new();
+        for i in 0..lora_count {
+            if let (Some(a), Some(b)) = (ctx.get_lora_a(i as i64), ctx.get_lora_b(i as i64)) {
+                lora_a.push(a);
+                lora_b.push(b);
+            }
+        }
+
+        // TODO: export Adam m/v from C++ (requires C++ FFI)
+        let adam_m: Vec<Tensor> = Vec::new();
+        let adam_v: Vec<Tensor> = Vec::new();
+
+        checkpoint::save_checkpoint(
+            std::path::Path::new(path),
+            self.step,
+            self.last_loss,
+            self.model_path.as_deref().unwrap_or(""),
+            self.lora_rank,
+            self.lora_alpha,
+            &lora_a,
+            &lora_b,
+            &adam_m,
+            &adam_v,
+        )?;
+
+        Ok((self.step, self.last_loss))
+    }
+
+    fn load_checkpoint(&mut self, path: &str) -> Result<(u64, f64)> {
+        let data = checkpoint::load_checkpoint(std::path::Path::new(path))?;
+        // TODO: import Adam m/v into C++ context (requires C++ FFI)
+        self.step = data.manifest.step;
+        self.last_loss = data.manifest.loss;
+        Ok((data.manifest.step, data.manifest.loss))
+    }
+
+    fn export_adapter(&self, path: &str) -> Result<usize> {
+        let ctx = self
+            .ctx
+            .as_ref()
+            .ok_or_else(|| anyhow!("LoRA not initialized"))?;
+
+        let count = ctx.lora_count() as usize;
+        let mut named_tensors: std::collections::BTreeMap<String, Tensor> =
+            std::collections::BTreeMap::new();
+        for i in 0..count {
+            if let (Some(a), Some(b)) = (ctx.get_lora_a(i as i64), ctx.get_lora_b(i as i64)) {
+                named_tensors.insert(
+                    format!("lora_a_{i}"),
+                    a.to_kind(Kind::Float).to_device(tch::Device::Cpu),
+                );
+                named_tensors.insert(
+                    format!("lora_b_{i}"),
+                    b.to_kind(Kind::Float).to_device(tch::Device::Cpu),
+                );
+            }
+        }
+
+        // Write safetensors
+        use std::io::Write;
+        let mut header = serde_json::Map::new();
+        let mut offset = 0u64;
+        let mut all_bytes: Vec<u8> = Vec::new();
+        for (name, t) in &named_tensors {
+            let t = t.contiguous().to_kind(Kind::Float);
+            let shape: Vec<i64> = t.size().iter().copied().collect();
+            let data: Vec<f32> = Vec::<f32>::try_from(&t.reshape([-1]))?;
+            let bytes: Vec<u8> = data.iter().flat_map(|f| f.to_le_bytes()).collect();
+            header.insert(
+                name.clone(),
+                serde_json::json!({"dtype":"F32","shape":shape,"data_offsets":[offset, offset + bytes.len() as u64]}),
+            );
+            offset += bytes.len() as u64;
+            all_bytes.extend_from_slice(&bytes);
+        }
+        let header_str = serde_json::to_string(&serde_json::Value::Object(header))?;
+        let file = std::fs::File::create(path)?;
+        let mut writer = std::io::BufWriter::new(file);
+        writer.write_all(&(header_str.len() as u64).to_le_bytes())?;
+        writer.write_all(header_str.as_bytes())?;
+        writer.write_all(&all_bytes)?;
+
+        tracing::info!(params = count, path, "adapter exported");
+        Ok(count)
+    }
+
+    fn status(&self) -> SessionStatus {
+        let state = match &self.state {
+            SessionState::Unloaded => "unloaded",
+            SessionState::Loaded { .. } => "loaded",
+            SessionState::Ready { .. } => "ready",
+            SessionState::Training { .. } => "training",
+            SessionState::Paused { .. } => "paused",
+            SessionState::Error(_) => "error",
+        };
+        SessionStatus {
+            state: state.to_string(),
+            step: self.step,
+            last_loss: self.last_loss,
+            model_path: self.model_path.clone().unwrap_or_default(),
+        }
+    }
+
+    fn get_metrics(&self) -> Vec<StepMetric> {
+        self.metrics
+            .as_ref()
+            .map(|m| m.read_metrics())
+            .unwrap_or_default()
+    }
+}
