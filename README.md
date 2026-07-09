@@ -6,6 +6,9 @@ and multi-GPU distributed training.
 
 > **Status:** Active development. Supports DeepSeek V4 Flash, GLM-5.2 FP8, Qwen3.5/3.6
 > full series (0.8B–35B), Qwen3, and Qwen2.5. Verified on 8× H20-3e (143GB).
+>
+> **Verification:** [Qwen3.5/3.6 training results](docs/qwen3-verification.md) — all 6 models
+> verified, HF precision alignment within 2%.
 
 ## Highlights
 
@@ -100,11 +103,13 @@ cargo run -- inspect --model-path /path/to/model
 | Qwen2.5-0.5B LoRA SFT | `qwen_lora_sft` | tch-rs | DP, single | ✅ Verified |
 | Qwen3-0.6B / 8B / 30B-A3B | `qwen3_trainable_session` | tch-rs | DP, TP, single | ✅ Verified |
 | Qwen3-0.6B LoRA SFT | `qwen3_lora_sft` | tch-rs | single | ✅ Verified |
-| Qwen3.5-0.8B LoRA SFT | `qwen3_6_lora_sft` | tch-rs + C++ | single | ✅ Verified (loss 3.54→0.0004) |
-| Qwen3.5-2B / 4B / 9B LoRA SFT | `qwen3_6_lora_sft` | tch-rs + C++ | single | ✅ Code ready (dense MLP) |
-| Qwen3.6-27B LoRA SFT | `qwen3_6_lora_sft` | tch-rs + C++ | single | ✅ Code ready (dense MLP) |
-| Qwen3.6-35B-A3B LoRA SFT | `qwen3_6_lora_sft` | tch-rs + C++ | single | ✅ Verified (loss 2.37, matches HF 2.35) |
-| Qwen3.6-35B-A3B LoRA SFT | `qwen3_6_lora_sft_ep` | tch-rs + C++ | EP8 | ✅ Verified (1M context, 15min/step) |
+| Qwen3.5-0.8B LoRA SFT | `qwen3_6_lora_sft` | tch-rs + C++ | single | ✅ Verified (loss 2.37→1.35) |
+| Qwen3.5-2B LoRA SFT | `qwen3_6_lora_sft` | tch-rs + C++ | single | ✅ Verified (loss 1.17→0.0001) |
+| Qwen3.5-4B LoRA SFT | `qwen3_6_lora_sft` | tch-rs + C++ | single | ✅ Verified (loss 1.28→0.0009) |
+| Qwen3.5-9B LoRA SFT | `qwen3_6_lora_sft` | tch-rs + C++ | single | ✅ Verified (loss 1.44→0.0001) |
+| Qwen3.6-27B LoRA SFT | `qwen3_6_lora_sft` | tch-rs + C++ | single | ✅ Verified (loss 1.61→0.0004) |
+| Qwen3.6-35B-A3B LoRA SFT | `qwen3_6_lora_sft` | tch-rs + C++ | single | ✅ Verified (loss 1.65→0.001, HF=1.68) |
+| Qwen3.6-35B-A3B LoRA SFT | `qwen3_6_lora_sft_ep` | tch-rs + C++ | EP4 | ✅ Verified |
 | TinyMoE / DeepSeekMoE | `tch_moe_ep_session` | tch-rs | EP=2 | ✅ Verified |
 | DeepSeek V4 Flash | `deepseek_v4_*` | tch-rs + C++ FP8 | EP=8, TP, TP+EP | ✅ Verified (8× H20-3e) |
 | DeepSeek V4 Flash LoRA SFT | `deepseek_v4_lora_sft_ep` | tch-rs + C++ FP8 | EP=8 | ✅ Verified (20 steps) |
