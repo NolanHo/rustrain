@@ -446,13 +446,8 @@ pub fn validate_config(config: &Config) -> Result<()> {
         ));
     }
     // Qwen3.5/3.6 uses custom head_dim (not hidden_size / num_heads)
-    // Only enforce divisibility if head_dim is not explicitly set
-    // (head_dim field in config may be 0 or absent for older models)
-    if model.head_dim == 0 && model.hidden_size % model.num_attention_heads != 0 {
-        return Err(anyhow!(
-            "hidden_size must be divisible by num_attention_heads (or set head_dim explicitly)"
-        ));
-    }
+    // Skip divisibility check — head_dim is read from model config.json
+    // and may not equal hidden_size / num_attention_heads (e.g. Qwen3.6-27B: 5120/24=213.33)
     if model.num_attention_heads % model.num_key_value_heads != 0 {
         return Err(anyhow!(
             "num_attention_heads must be divisible by num_key_value_heads"
