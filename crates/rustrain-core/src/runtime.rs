@@ -453,10 +453,8 @@ pub fn validate_config(config: &Config) -> Result<()> {
             "num_attention_heads must be divisible by num_key_value_heads"
         ));
     }
-    let head_dim = model.hidden_size / model.num_attention_heads;
-    if head_dim % 2 != 0 {
-        return Err(anyhow!("head_dim must be even for RoPE"));
-    }
+    // Qwen3.5/3.6 uses custom head_dim from config.json, not hidden_size/num_heads
+    // Skip head_dim parity check here — actual head_dim is read in C++ kernel
     if model.norm != "rmsnorm" {
         return Err(anyhow!("M1 expects norm = \"rmsnorm\""));
     }
