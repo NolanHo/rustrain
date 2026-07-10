@@ -2248,13 +2248,13 @@ int64_t qwen36_import_optimizer_state(void* ctx_ptr, void** m_ptrs, void** v_ptr
 }
 
 // Utility functions (kept for compatibility)
-void* qwen36_gemm(void* a_ptr, void* b_ptr, int transpose_b) {
+extern "C" void* qwen36_gemm(void* a_ptr, void* b_ptr, int transpose_b) {
     auto& a = *reinterpret_cast<at::Tensor*>(a_ptr);
     auto& b = *reinterpret_cast<at::Tensor*>(b_ptr);
     if (transpose_b) return new at::Tensor(at::matmul(a, b.t()));
     return new at::Tensor(at::matmul(a, b));
 }
 
-void qwen36_free_tensor(void* tensor_ptr) {
+extern "C" void qwen36_free_tensor(void* tensor_ptr) {
     if (tensor_ptr) delete reinterpret_cast<at::Tensor*>(tensor_ptr);
 }
