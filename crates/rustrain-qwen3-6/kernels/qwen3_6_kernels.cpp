@@ -12,6 +12,7 @@
 #include <torch/csrc/autograd/autograd.h>
 #include <torch/csrc/autograd/variable.h>
 #include <cstdio>
+struct TrainingContext;  // forward declaration (defined later)
 #include <cmath>
 #include <vector>
 #include <cstring>
