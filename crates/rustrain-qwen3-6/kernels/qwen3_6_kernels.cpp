@@ -1846,7 +1846,7 @@ void qwen36_set_mtp_weights(
 
 // Single training step: forward + loss + backward + Adam update
 // Returns loss value, or -1 on error.
-double qwen36_train_step(
+__attribute__((visibility("default"))) double qwen36_train_step(
     void* ctx_ptr,
     void* input_ids_ptr,
     void* target_mask_ptr,
@@ -2026,13 +2026,13 @@ double qwen36_train_step(
 }
 
 // Get LoRA A tensor pointer by index (legacy — for backward compat with create_training_context path)
-void* qwen36_get_lora_a(void* ctx_ptr, int64_t index) {
+__attribute__((visibility("default"))) void* qwen36_get_lora_a(void* ctx_ptr, int64_t index) {
     auto* ctx = reinterpret_cast<TrainingContext*>(ctx_ptr);
     return &ctx->lora_a[index];
 }
 
 // Get LoRA B tensor pointer by index
-void* qwen36_get_lora_b(void* ctx_ptr, int64_t index) {
+__attribute__((visibility("default"))) void* qwen36_get_lora_b(void* ctx_ptr, int64_t index) {
     auto* ctx = reinterpret_cast<TrainingContext*>(ctx_ptr);
     return &ctx->lora_b[index];
 }
@@ -2045,7 +2045,7 @@ void qwen36_free_training_context(void* ctx_ptr) {
 }
 
 // Enable/disable gradient checkpointing
-void qwen36_set_checkpoint(void* ctx_ptr, int32_t enable, int64_t group_size) {
+__attribute__((visibility("default"))) void qwen36_set_checkpoint(void* ctx_ptr, int32_t enable, int64_t group_size) {
     auto* ctx = reinterpret_cast<TrainingContext*>(ctx_ptr);
     ctx->use_checkpoint = (enable != 0);
     ctx->group_size = (group_size > 0) ? group_size : 4;
@@ -2059,7 +2059,7 @@ void qwen36_set_checkpoint(void* ctx_ptr, int32_t enable, int64_t group_size) {
 // target_layers: array of layer indices (nullptr = all layers)
 // target_modules: comma-separated module names (nullptr = all modules)
 // Returns adapter ID (> 0) on success, -1 on failure.
-__attribute__((used)) int64_t qwen36_add_lora(
+__attribute__((visibility("default"))) int64_t qwen36_add_lora(
     void* ctx_ptr,
     int64_t rank, double alpha,
     const int64_t* target_layers, int64_t num_target_layers,
@@ -2145,7 +2145,7 @@ __attribute__((used)) int64_t qwen36_add_lora(
 }
 
 // Remove a LoRA adapter by ID.
-__attribute__((used)) int32_t qwen36_remove_lora(void* ctx_ptr, int64_t adapter_id) {
+__attribute__((visibility("default"))) int32_t qwen36_remove_lora(void* ctx_ptr, int64_t adapter_id) {
     auto* ctx = reinterpret_cast<TrainingContext*>(ctx_ptr);
     for (auto it = ctx->adapters.begin(); it != ctx->adapters.end(); ++it) {
         if (it->id == adapter_id) {
@@ -2158,7 +2158,7 @@ __attribute__((used)) int32_t qwen36_remove_lora(void* ctx_ptr, int64_t adapter_
 }
 
 // List all active adapter IDs. Fills the array and returns count.
-__attribute__((used)) int64_t qwen36_list_lora(void* ctx_ptr, int64_t* out_ids, int64_t max_count) {
+__attribute__((visibility("default"))) int64_t qwen36_list_lora(void* ctx_ptr, int64_t* out_ids, int64_t max_count) {
     auto* ctx = reinterpret_cast<TrainingContext*>(ctx_ptr);
     int64_t count = (int64_t)ctx->adapters.size();
     if (count > max_count) count = max_count;
@@ -2169,7 +2169,7 @@ __attribute__((used)) int64_t qwen36_list_lora(void* ctx_ptr, int64_t* out_ids, 
 }
 
 // Get total LoRA param count across all adapters.
-int64_t qwen36_get_lora_count(void* ctx_ptr) {
+__attribute__((visibility("default"))) int64_t qwen36_get_lora_count(void* ctx_ptr) {
     auto* ctx = reinterpret_cast<TrainingContext*>(ctx_ptr);
     int64_t total = (int64_t)ctx->lora_a.size();  // legacy
     for (auto& adapter : ctx->adapters) {
@@ -2181,7 +2181,7 @@ int64_t qwen36_get_lora_count(void* ctx_ptr) {
 }
 
 // Eval step: forward + loss, no backward, no Adam update
-__attribute__((used)) double qwen36_eval_step(void* ctx_ptr, void* input_ids_ptr, void* target_mask_ptr, void* attention_mask_ptr) {
+__attribute__((visibility("default"))) double qwen36_eval_step(void* ctx_ptr, void* input_ids_ptr, void* target_mask_ptr, void* attention_mask_ptr) {
     try {
         auto* ctx = reinterpret_cast<TrainingContext*>(ctx_ptr);
         auto& input_ids = *reinterpret_cast<at::Tensor*>(input_ids_ptr);
@@ -2214,14 +2214,14 @@ __attribute__((used)) double qwen36_eval_step(void* ctx_ptr, void* input_ids_ptr
 }
 
 // Get current step count
-__attribute__((used)) int64_t qwen36_get_step_count(void* ctx_ptr) {
+__attribute__((visibility("default"))) int64_t qwen36_get_step_count(void* ctx_ptr) {
     auto* ctx = reinterpret_cast<TrainingContext*>(ctx_ptr);
     return (int64_t)ctx->step_count;
 }
 
 // Export optimizer state: returns count, fills arrays
 // Caller passes arrays of at::Tensor* pointers, filled with m and v tensors
-__attribute__((used)) int64_t qwen36_export_optimizer_state(void* ctx_ptr, void** m_ptrs, void** v_ptrs, int64_t max_count) {
+__attribute__((visibility("default"))) int64_t qwen36_export_optimizer_state(void* ctx_ptr, void** m_ptrs, void** v_ptrs, int64_t max_count) {
     auto* ctx = reinterpret_cast<TrainingContext*>(ctx_ptr);
     int64_t count = (int64_t)ctx->adam_m.size();
     if (count > max_count) count = max_count;
@@ -2233,7 +2233,7 @@ __attribute__((used)) int64_t qwen36_export_optimizer_state(void* ctx_ptr, void*
 }
 
 // Import optimizer state: copy m/v from provided tensors
-__attribute__((used)) int64_t qwen36_import_optimizer_state(void* ctx_ptr, void** m_ptrs, void** v_ptrs, int64_t count) {
+__attribute__((visibility("default"))) int64_t qwen36_import_optimizer_state(void* ctx_ptr, void** m_ptrs, void** v_ptrs, int64_t count) {
     auto* ctx = reinterpret_cast<TrainingContext*>(ctx_ptr);
     int64_t imported = 0;
     for (int64_t i = 0; i < count && i < (int64_t)ctx->adam_m.size(); i++) {
