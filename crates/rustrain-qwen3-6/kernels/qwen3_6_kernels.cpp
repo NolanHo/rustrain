@@ -52,6 +52,7 @@ static at::Tensor apply_lora_adapters(
 }
 
 // Helper: apply LoRA delta for a specific adapter and pair index
+// — legacy single-adapter path (used when only 1 adapter targets this layer/module)
 static inline at::Tensor apply_adapter_delta(
     TrainingContext* ctx, int64_t layer_idx, int64_t pair_idx,
     const at::Tensor& base_weight
@@ -67,7 +68,67 @@ static inline at::Tensor apply_adapter_delta(
         double scaling = adapter.alpha / (double)adapter.rank;
         w = lora_delta(w, a, b, scaling);
     }
+    // Legacy: also apply flat arrays
+    if (!ctx->lora_a.empty()) {
+        int64_t lora_count = (ctx->layer_configs[layer_idx].layer_type == 0) ? 4 : 3;
+        int64_t la_offset = layer_idx < (int64_t)ctx->lora_layer_offset.size() ? ctx->lora_layer_offset[layer_idx] : 0;
+        if (la_offset + pair_idx < (int64_t)ctx->lora_a.size()) {
+            w = lora_delta(w, ctx->lora_a[la_offset + pair_idx], ctx->lora_b[la_offset + pair_idx], ctx->lora_scaling);
+        }
+    }
     return w;
+}
+
+// ── Batched multi-LoRA: concat all adapters' A/B, 2x GEMM instead of 2N× ──
+// For a given layer + module (pair_idx), collect all adapters that target it,
+// concatenate their A (by rows) and B (by columns, pre-scaled),
+// then compute delta = (input @ A_concat.T) @ B_concat.T  in 2 cuBLAS GEMMs.
+//
+// This replaces N×(2 matmul) with 2 matmul regardless of adapter count.
+static inline at::Tensor apply_multi_lora(
+    TrainingContext* ctx, int64_t layer_idx, int64_t pair_idx,
+    const at::Tensor& base_weight  // [out, in]
+) {
+    // Collect adapters that target this layer + pair_idx
+    std::vector<at::Tensor> a_list, b_list;
+    for (auto& adapter : ctx->adapters) {
+        if (!adapter.target_layers.empty() && adapter.target_layers.find(layer_idx) == adapter.target_layers.end())
+            continue;
+        auto it = adapter.params.find(layer_idx);
+        if (it == adapter.params.end()) continue;
+        if (pair_idx >= (int64_t)it->second.size()) continue;
+        auto& [a, b] = it->second[pair_idx];
+        double scaling = adapter.alpha / (double)adapter.rank;
+        // Pre-scale B: b_scaled = b * scaling
+        b_list.push_back(b * scaling);
+        a_list.push_back(a);
+    }
+    // Legacy flat arrays
+    if (!ctx->lora_a.empty()) {
+        int64_t la_offset = layer_idx < (int64_t)ctx->lora_layer_offset.size() ? ctx->lora_layer_offset[layer_idx] : 0;
+        if (la_offset + pair_idx < (int64_t)ctx->lora_a.size()) {
+            b_list.push_back(ctx->lora_b[la_offset + pair_idx] * ctx->lora_scaling);
+            a_list.push_back(ctx->lora_a[la_offset + pair_idx]);
+        }
+    }
+
+    if (a_list.empty()) {
+        return base_weight;  // no LoRA for this module
+    }
+    if (a_list.size() == 1) {
+        // Single adapter — use direct lora_delta (avoids cat overhead)
+        return lora_delta(base_weight, a_list[0], b_list[0], 1.0);  // scaling already in b_list
+    }
+
+    // Multiple adapters — concat and do 2x GEMM
+    // A_concat: [sum_ranks, in]  (cat by rows)
+    // B_concat: [out, sum_ranks] (cat by columns, already scaled)
+    auto a_concat = at::cat(a_list, 0);  // [sum_ranks, in]
+    auto b_concat = at::cat(b_list, 1);  // [out, sum_ranks]
+
+    // delta = B_concat @ A_concat  → [out, in]
+    auto delta = at::matmul(b_concat, a_concat);
+    return base_weight + delta;
 }
 // Forward declarations
 // ──────────────────────────────────────────────────────────────────────
@@ -690,12 +751,12 @@ static at::Tensor forward_single_layer(
     at::Tensor attn_output;
     if (cfg->layer_type == 0) {
         // Full attention: apply multi-LoRA to q,k,v,o (pair indices 0,1,2,3)
-        auto q_proj = apply_adapter_delta(ctx, layer_idx, 0, *w[2]);
+        auto q_proj = apply_multi_lora(ctx, layer_idx, 0, *w[2]);
         auto q_norm = *w[3];
-        auto k_proj = apply_adapter_delta(ctx, layer_idx, 1, *w[4]);
+        auto k_proj = apply_multi_lora(ctx, layer_idx, 1, *w[4]);
         auto k_norm = *w[5];
-        auto v_proj = apply_adapter_delta(ctx, layer_idx, 2, *w[6]);
-        auto o_proj = apply_adapter_delta(ctx, layer_idx, 3, *w[7]);
+        auto v_proj = apply_multi_lora(ctx, layer_idx, 2, *w[6]);
+        auto o_proj = apply_multi_lora(ctx, layer_idx, 3, *w[7]);
         attn_output = full_attention(attn_input, q_proj, q_norm, k_proj, k_norm, v_proj, o_proj,
             cfg->num_heads, cfg->num_kv_heads, cfg->head_dim,
             cfg->partial_rotary_factor, cfg->rope_theta, cfg->rms_eps, kind,
@@ -713,11 +774,11 @@ static at::Tensor forward_single_layer(
         }
     } else {
         // Linear attention: apply multi-LoRA to qkv,z,out (pair indices 0,1,2)
-        auto in_proj_qkv = apply_adapter_delta(ctx, layer_idx, 0, *w[2]);
-        auto in_proj_z = apply_adapter_delta(ctx, layer_idx, 1, *w[3]);
+        auto in_proj_qkv = apply_multi_lora(ctx, layer_idx, 0, *w[2]);
+        auto in_proj_z = apply_multi_lora(ctx, layer_idx, 1, *w[3]);
         auto in_proj_a = *w[4], in_proj_b = *w[5];
         auto a_log = *w[6], dt_bias = *w[7], conv1d_w = *w[8], norm_w = *w[9];
-        auto out_proj = apply_adapter_delta(ctx, layer_idx, 2, *w[10]);
+        auto out_proj = apply_multi_lora(ctx, layer_idx, 2, *w[10]);
         attn_output = linear_attention(attn_input, in_proj_qkv, in_proj_z, in_proj_a, in_proj_b,
             a_log, dt_bias, conv1d_w, norm_w, out_proj,
             cfg->num_k_heads, cfg->key_dim, cfg->num_v_heads, cfg->val_dim,
@@ -815,23 +876,23 @@ at::Tensor compute_attn_only(
     auto attn_input = rms_norm(hidden, *ctx->weight_ptrs[w_offset + 0], cfg.rms_eps);
 
     if (cfg.layer_type == 0) {
-        auto qp = apply_adapter_delta(ctx, layer_idx, 0, *ctx->weight_ptrs[w_offset+2]);
+        auto qp = apply_multi_lora(ctx, layer_idx, 0, *ctx->weight_ptrs[w_offset+2]);
         auto qn = *ctx->weight_ptrs[w_offset+3];
-        auto kp = apply_adapter_delta(ctx, layer_idx, 1, *ctx->weight_ptrs[w_offset+4]);
+        auto kp = apply_multi_lora(ctx, layer_idx, 1, *ctx->weight_ptrs[w_offset+4]);
         auto kn = *ctx->weight_ptrs[w_offset+5];
-        auto vp = apply_adapter_delta(ctx, layer_idx, 2, *ctx->weight_ptrs[w_offset+6]);
-        auto op = apply_adapter_delta(ctx, layer_idx, 3, *ctx->weight_ptrs[w_offset+7]);
+        auto vp = apply_multi_lora(ctx, layer_idx, 2, *ctx->weight_ptrs[w_offset+6]);
+        auto op = apply_multi_lora(ctx, layer_idx, 3, *ctx->weight_ptrs[w_offset+7]);
         return full_attention(attn_input, qp, qn, kp, kn, vp, op,
             cfg.num_heads, cfg.num_kv_heads, cfg.head_dim,
             cfg.partial_rotary_factor, cfg.rope_theta, cfg.rms_eps, kind,
             ctx->attention_mask);
     } else {
-        auto qkv = apply_adapter_delta(ctx, layer_idx, 0, *ctx->weight_ptrs[w_offset+2]);
-        auto z = apply_adapter_delta(ctx, layer_idx, 1, *ctx->weight_ptrs[w_offset+3]);
+        auto qkv = apply_multi_lora(ctx, layer_idx, 0, *ctx->weight_ptrs[w_offset+2]);
+        auto z = apply_multi_lora(ctx, layer_idx, 1, *ctx->weight_ptrs[w_offset+3]);
         auto a = *ctx->weight_ptrs[w_offset+4], b = *ctx->weight_ptrs[w_offset+5];
         auto al = *ctx->weight_ptrs[w_offset+6], db = *ctx->weight_ptrs[w_offset+7];
         auto cw = *ctx->weight_ptrs[w_offset+8], nw = *ctx->weight_ptrs[w_offset+9];
-        auto op = apply_adapter_delta(ctx, layer_idx, 2, *ctx->weight_ptrs[w_offset+10]);
+        auto op = apply_multi_lora(ctx, layer_idx, 2, *ctx->weight_ptrs[w_offset+10]);
         return linear_attention(attn_input, qkv, z, a, b, al, db, cw, nw, op,
             cfg.num_k_heads, cfg.key_dim, cfg.num_v_heads, cfg.val_dim,
             cfg.conv_kernel, cfg.rms_eps, kind);
