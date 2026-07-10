@@ -52,112 +52,9 @@ static at::Tensor apply_lora_adapters(
     return w;
 }
 
-// Helper: apply LoRA delta for a specific adapter and pair index
-// — legacy single-adapter path (used when only 1 adapter targets this layer/module)
-static inline at::Tensor apply_adapter_delta(
-    TrainingContext* ctx, int64_t layer_idx, int64_t pair_idx,
-    const at::Tensor& base_weight
-) {
-    at::Tensor w = base_weight;
-    for (auto& adapter : ctx->adapters) {
-        if (!adapter.target_layers.empty() && adapter.target_layers.find(layer_idx) == adapter.target_layers.end())
-            continue;
-        auto it = adapter.params.find(layer_idx);
-        if (it == adapter.params.end()) continue;
-        if (pair_idx >= (int64_t)it->second.size()) continue;
-        auto& [a, b] = it->second[pair_idx];
-        double scaling = adapter.alpha / (double)adapter.rank;
-        w = lora_delta(w, a, b, scaling);
-    }
-    // Legacy: also apply flat arrays
-    if (!ctx->lora_a.empty()) {
-        int64_t lora_count = (ctx->layer_configs[layer_idx].layer_type == 0) ? 4 : 3;
-        int64_t la_offset = layer_idx < (int64_t)ctx->lora_layer_offset.size() ? ctx->lora_layer_offset[layer_idx] : 0;
-        if (la_offset + pair_idx < (int64_t)ctx->lora_a.size()) {
-            w = lora_delta(w, ctx->lora_a[la_offset + pair_idx], ctx->lora_b[la_offset + pair_idx], ctx->lora_scaling);
-        }
-    }
-    return w;
-}
-
-// ── Fused LoRA Linear: y = x @ W.T + (x @ A_concat.T) @ B_concat.T * s ──
-// Custom autograd::Function that avoids materializing B@A delta.
-// Forward: 2 GEMM (base + lora), saves only [batch, rank] intermediate (small)
-// Backward: 2 GEMM (grad_A, grad_B), skips grad_W (frozen)
-// Replaces: W' = W + B@A; y = x @ W'.T  (which materializes [out, in] delta)
-
-struct FusedLoRALinearFunction : public torch::autograd::Function<FusedLoRALinearFunction> {
-    static at::Tensor forward(torch::autograd::AutogradContext* ctx,
-        at::Tensor input,       // [batch, in]
-        at::Tensor base_weight, // [out, in] (frozen, no grad)
-        at::Tensor a_concat,   // [sum_ranks, in]
-        at::Tensor b_concat    // [out, sum_ranks] (pre-scaled: B * scaling)
-    ) {
-        // y_base = input @ base_weight.T  -> [batch, out]
-        auto y_base = at::linear(input, base_weight);
-        // inter = input @ a_concat.T  -> [batch, sum_ranks]  (SMALL!)
-        auto inter = at::linear(input, a_concat);
-        // y_lora = inter @ b_concat.T  -> [batch, out]
-        auto y_lora = at::linear(inter, b_concat);
-        // y = y_base + y_lora
-        ctx->save_for_backward({input, a_concat, b_concat, inter});
-        return y_base + y_lora;
-    }
-
-    static std::vector<at::Tensor> backward(torch::autograd::AutogradContext* ctx,
-        std::vector<at::Tensor> grad_outputs
-    ) {
-        auto saved = ctx->get_saved_variables();
-        auto input = saved[0];       // [batch, in]
-        auto a_concat = saved[1];    // [sum_ranks, in]
-        auto b_concat = saved[2];    // [out, sum_ranks]
-        auto inter = saved[3];      // [batch, sum_ranks]
-        auto grad_y = grad_outputs[0];  // [batch, out]
-
-        // grad_b_concat = grad_y.T @ inter  -> [out, sum_ranks]
-        auto grad_b = at::matmul(grad_y.t(), inter);
-        // grad_inter = grad_y @ b_concat  -> [batch, sum_ranks]
-        auto grad_inter = at::linear(grad_y, b_concat);  // [batch, sum_ranks]
-        // grad_a_concat = grad_inter.T @ input  -> [sum_ranks, in]
-        auto grad_a = at::matmul(grad_inter.t(), input);
-
-        // grad_input = grad_y @ base_weight (not needed - input has its own grad path)
-        // grad_base_weight = frozen (return empty)
-        return {at::Tensor(), at::Tensor(), grad_a, grad_b};
-    }
-};
 
 
-// Legacy: apply multi-LoRA to weight (materializes delta, for backward compat with attention functions)
-static inline at::Tensor apply_multi_lora(
-    TrainingContext* ctx, int64_t layer_idx, int64_t pair_idx,
-    const at::Tensor& base_weight  // [out, in]
-) {
-    std::vector<at::Tensor> a_list, b_list;
-    for (auto& adapter : ctx->adapters) {
-        if (!adapter.target_layers.empty() && adapter.target_layers.find(layer_idx) == adapter.target_layers.end())
-            continue;
-        auto it = adapter.params.find(layer_idx);
-        if (it == adapter.params.end()) continue;
-        if (pair_idx >= (int64_t)it->second.size()) continue;
-        auto& [a, b] = it->second[pair_idx];
-        double scaling = adapter.alpha / (double)adapter.rank;
-        b_list.push_back(b * scaling);
-        a_list.push_back(a);
-    }
-    if (!ctx->lora_a.empty()) {
-        int64_t la_offset = layer_idx < (int64_t)ctx->lora_layer_offset.size() ? ctx->lora_layer_offset[layer_idx] : 0;
-        if (la_offset + pair_idx < (int64_t)ctx->lora_a.size()) {
-            b_list.push_back(ctx->lora_b[la_offset + pair_idx] * ctx->lora_scaling);
-            a_list.push_back(ctx->lora_a[la_offset + pair_idx]);
-        }
-    }
-    if (a_list.empty()) return base_weight;
-    if (a_list.size() == 1) return lora_delta(base_weight, a_list[0], b_list[0], 1.0);
-    auto a_concat = at::cat(a_list, 0);
-    auto b_concat = at::cat(b_list, 1);
-    return base_weight + at::matmul(b_concat, a_concat);
-}
+
 
 /// Apply fused LoRA linear: y = input @ W.T + (input @ A.T) @ B.T * s
 /// If no LoRA adapters target this module, falls back to plain at::linear.
@@ -934,6 +831,112 @@ struct TrainingContext {
     std::vector<at::Tensor> group_outputs;
 // ──────────────────────────────────────────────────────────────────────
 };
+// Helper: apply LoRA delta for a specific adapter and pair index
+// — legacy single-adapter path (used when only 1 adapter targets this layer/module)
+static inline at::Tensor apply_adapter_delta(
+    TrainingContext* ctx, int64_t layer_idx, int64_t pair_idx,
+    const at::Tensor& base_weight
+) {
+    at::Tensor w = base_weight;
+    for (auto& adapter : ctx->adapters) {
+        if (!adapter.target_layers.empty() && adapter.target_layers.find(layer_idx) == adapter.target_layers.end())
+            continue;
+        auto it = adapter.params.find(layer_idx);
+        if (it == adapter.params.end()) continue;
+        if (pair_idx >= (int64_t)it->second.size()) continue;
+        auto& [a, b] = it->second[pair_idx];
+        double scaling = adapter.alpha / (double)adapter.rank;
+        w = lora_delta(w, a, b, scaling);
+    }
+    // Legacy: also apply flat arrays
+    if (!ctx->lora_a.empty()) {
+        int64_t lora_count = (ctx->layer_configs[layer_idx].layer_type == 0) ? 4 : 3;
+        int64_t la_offset = layer_idx < (int64_t)ctx->lora_layer_offset.size() ? ctx->lora_layer_offset[layer_idx] : 0;
+        if (la_offset + pair_idx < (int64_t)ctx->lora_a.size()) {
+            w = lora_delta(w, ctx->lora_a[la_offset + pair_idx], ctx->lora_b[la_offset + pair_idx], ctx->lora_scaling);
+        }
+    }
+    return w;
+}
+
+// ── Fused LoRA Linear: y = x @ W.T + (x @ A_concat.T) @ B_concat.T * s ──
+// Custom autograd::Function that avoids materializing B@A delta.
+// Forward: 2 GEMM (base + lora), saves only [batch, rank] intermediate (small)
+// Backward: 2 GEMM (grad_A, grad_B), skips grad_W (frozen)
+// Replaces: W' = W + B@A; y = x @ W'.T  (which materializes [out, in] delta)
+
+struct FusedLoRALinearFunction : public torch::autograd::Function<FusedLoRALinearFunction> {
+    static at::Tensor forward(torch::autograd::AutogradContext* ctx,
+        at::Tensor input,       // [batch, in]
+        at::Tensor base_weight, // [out, in] (frozen, no grad)
+        at::Tensor a_concat,   // [sum_ranks, in]
+        at::Tensor b_concat    // [out, sum_ranks] (pre-scaled: B * scaling)
+    ) {
+        // y_base = input @ base_weight.T  -> [batch, out]
+        auto y_base = at::linear(input, base_weight);
+        // inter = input @ a_concat.T  -> [batch, sum_ranks]  (SMALL!)
+        auto inter = at::linear(input, a_concat);
+        // y_lora = inter @ b_concat.T  -> [batch, out]
+        auto y_lora = at::linear(inter, b_concat);
+        // y = y_base + y_lora
+        ctx->save_for_backward({input, a_concat, b_concat, inter});
+        return y_base + y_lora;
+    }
+
+    static std::vector<at::Tensor> backward(torch::autograd::AutogradContext* ctx,
+        std::vector<at::Tensor> grad_outputs
+    ) {
+        auto saved = ctx->get_saved_variables();
+        auto input = saved[0];       // [batch, in]
+        auto a_concat = saved[1];    // [sum_ranks, in]
+        auto b_concat = saved[2];    // [out, sum_ranks]
+        auto inter = saved[3];      // [batch, sum_ranks]
+        auto grad_y = grad_outputs[0];  // [batch, out]
+
+        // grad_b_concat = grad_y.T @ inter  -> [out, sum_ranks]
+        auto grad_b = at::matmul(grad_y.t(), inter);
+        // grad_inter = grad_y @ b_concat  -> [batch, sum_ranks]
+        auto grad_inter = at::linear(grad_y, b_concat);  // [batch, sum_ranks]
+        // grad_a_concat = grad_inter.T @ input  -> [sum_ranks, in]
+        auto grad_a = at::matmul(grad_inter.t(), input);
+
+        // grad_input = grad_y @ base_weight (not needed - input has its own grad path)
+        // grad_base_weight = frozen (return empty)
+        return {at::Tensor(), at::Tensor(), grad_a, grad_b};
+    }
+};
+
+// Legacy: apply multi-LoRA to weight (materializes delta, for backward compat with attention functions)
+static inline at::Tensor apply_multi_lora(
+    TrainingContext* ctx, int64_t layer_idx, int64_t pair_idx,
+    const at::Tensor& base_weight  // [out, in]
+) {
+    std::vector<at::Tensor> a_list, b_list;
+    for (auto& adapter : ctx->adapters) {
+        if (!adapter.target_layers.empty() && adapter.target_layers.find(layer_idx) == adapter.target_layers.end())
+            continue;
+        auto it = adapter.params.find(layer_idx);
+        if (it == adapter.params.end()) continue;
+        if (pair_idx >= (int64_t)it->second.size()) continue;
+        auto& [a, b] = it->second[pair_idx];
+        double scaling = adapter.alpha / (double)adapter.rank;
+        b_list.push_back(b * scaling);
+        a_list.push_back(a);
+    }
+    if (!ctx->lora_a.empty()) {
+        int64_t la_offset = layer_idx < (int64_t)ctx->lora_layer_offset.size() ? ctx->lora_layer_offset[layer_idx] : 0;
+        if (la_offset + pair_idx < (int64_t)ctx->lora_a.size()) {
+            b_list.push_back(ctx->lora_b[la_offset + pair_idx] * ctx->lora_scaling);
+            a_list.push_back(ctx->lora_a[la_offset + pair_idx]);
+        }
+    }
+    if (a_list.empty()) return base_weight;
+    if (a_list.size() == 1) return lora_delta(base_weight, a_list[0], b_list[0], 1.0);
+    auto a_concat = at::cat(a_list, 0);
+    auto b_concat = at::cat(b_list, 1);
+    return base_weight + at::matmul(b_concat, a_concat);
+}
+
 // Forward declarations for sub-layer checkpointing
 // Sub-layer checkpointing: split each layer into attn + mlp segments
 // Enabled by QWEN36_SUBCKPT=1 env var. Reduces peak memory by ~2x
