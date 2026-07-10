@@ -2247,8 +2247,6 @@ int64_t qwen36_import_optimizer_state(void* ctx_ptr, void** m_ptrs, void** v_ptr
     return imported;
 }
 
-}
-
 // Utility functions (kept for compatibility)
 void* qwen36_gemm(void* a_ptr, void* b_ptr, int transpose_b) {
     auto& a = *reinterpret_cast<at::Tensor*>(a_ptr);
@@ -2260,5 +2258,3 @@ void* qwen36_gemm(void* a_ptr, void* b_ptr, int transpose_b) {
 void qwen36_free_tensor(void* tensor_ptr) {
     if (tensor_ptr) delete reinterpret_cast<at::Tensor*>(tensor_ptr);
 }
-
-}  // extern "C"
