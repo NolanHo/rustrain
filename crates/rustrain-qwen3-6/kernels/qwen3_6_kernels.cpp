@@ -798,7 +798,7 @@ struct TrainingContext {
     };
 
 // ── Multi-LoRA: concat all adapters' A/B, 2x GEMM ──
-inline at::Tensor apply_multi_lora(
+at::Tensor apply_multi_lora(
     TrainingContext* ctx, int64_t layer_idx, int64_t pair_idx,
     const at::Tensor& base_weight
 ) {
