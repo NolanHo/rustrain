@@ -98,6 +98,8 @@ fn main() {
             &format!("-L{torch_lib}"),
             &format!("-Wl,-rpath,{torch_lib}"),
             "-Wl,--no-as-needed",
+            "-Wl,--export-dynamic",
+            "-fvisibility=default",
             "-ltorch", "-ltorch_cuda", "-ltorch_cpu", "-lc10",
         ])
         .status();
