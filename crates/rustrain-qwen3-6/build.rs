@@ -87,6 +87,7 @@ fn main() {
         .args([
             "-shared", "-fPIC", "-std=c++17", "-O2",
             "-D_GLIBCXX_USE_CXX11_ABI=1",
+            "-fvisibility=default",
             "-o", &output_lib, kernel_src,
             &format!("-I{torch_include}"),
             &format!("-I{torch_include}/ATen"),
