@@ -2058,7 +2058,7 @@ void qwen36_set_checkpoint(void* ctx_ptr, int32_t enable, int64_t group_size) {
 // target_layers: array of layer indices (nullptr = all layers)
 // target_modules: comma-separated module names (nullptr = all modules)
 // Returns adapter ID (> 0) on success, -1 on failure.
-int64_t qwen36_add_lora(
+__attribute__((used)) int64_t qwen36_add_lora(
     void* ctx_ptr,
     int64_t rank, double alpha,
     const int64_t* target_layers, int64_t num_target_layers,
@@ -2144,7 +2144,7 @@ int64_t qwen36_add_lora(
 }
 
 // Remove a LoRA adapter by ID.
-int32_t qwen36_remove_lora(void* ctx_ptr, int64_t adapter_id) {
+__attribute__((used)) int32_t qwen36_remove_lora(void* ctx_ptr, int64_t adapter_id) {
     auto* ctx = reinterpret_cast<TrainingContext*>(ctx_ptr);
     for (auto it = ctx->adapters.begin(); it != ctx->adapters.end(); ++it) {
         if (it->id == adapter_id) {
@@ -2157,7 +2157,7 @@ int32_t qwen36_remove_lora(void* ctx_ptr, int64_t adapter_id) {
 }
 
 // List all active adapter IDs. Fills the array and returns count.
-int64_t qwen36_list_lora(void* ctx_ptr, int64_t* out_ids, int64_t max_count) {
+__attribute__((used)) int64_t qwen36_list_lora(void* ctx_ptr, int64_t* out_ids, int64_t max_count) {
     auto* ctx = reinterpret_cast<TrainingContext*>(ctx_ptr);
     int64_t count = (int64_t)ctx->adapters.size();
     if (count > max_count) count = max_count;
@@ -2180,7 +2180,7 @@ int64_t qwen36_get_lora_count(void* ctx_ptr) {
 }
 
 // Eval step: forward + loss, no backward, no Adam update
-double qwen36_eval_step(void* ctx_ptr, void* input_ids_ptr, void* target_mask_ptr, void* attention_mask_ptr) {
+__attribute__((used)) double qwen36_eval_step(void* ctx_ptr, void* input_ids_ptr, void* target_mask_ptr, void* attention_mask_ptr) {
     try {
         auto* ctx = reinterpret_cast<TrainingContext*>(ctx_ptr);
         auto& input_ids = *reinterpret_cast<at::Tensor*>(input_ids_ptr);
@@ -2213,14 +2213,14 @@ double qwen36_eval_step(void* ctx_ptr, void* input_ids_ptr, void* target_mask_pt
 }
 
 // Get current step count
-int64_t qwen36_get_step_count(void* ctx_ptr) {
+__attribute__((used)) int64_t qwen36_get_step_count(void* ctx_ptr) {
     auto* ctx = reinterpret_cast<TrainingContext*>(ctx_ptr);
     return (int64_t)ctx->step_count;
 }
 
 // Export optimizer state: returns count, fills arrays
 // Caller passes arrays of at::Tensor* pointers, filled with m and v tensors
-int64_t qwen36_export_optimizer_state(void* ctx_ptr, void** m_ptrs, void** v_ptrs, int64_t max_count) {
+__attribute__((used)) int64_t qwen36_export_optimizer_state(void* ctx_ptr, void** m_ptrs, void** v_ptrs, int64_t max_count) {
     auto* ctx = reinterpret_cast<TrainingContext*>(ctx_ptr);
     int64_t count = (int64_t)ctx->adam_m.size();
     if (count > max_count) count = max_count;
@@ -2232,7 +2232,7 @@ int64_t qwen36_export_optimizer_state(void* ctx_ptr, void** m_ptrs, void** v_ptr
 }
 
 // Import optimizer state: copy m/v from provided tensors
-int64_t qwen36_import_optimizer_state(void* ctx_ptr, void** m_ptrs, void** v_ptrs, int64_t count) {
+__attribute__((used)) int64_t qwen36_import_optimizer_state(void* ctx_ptr, void** m_ptrs, void** v_ptrs, int64_t count) {
     auto* ctx = reinterpret_cast<TrainingContext*>(ctx_ptr);
     int64_t imported = 0;
     for (int64_t i = 0; i < count && i < (int64_t)ctx->adam_m.size(); i++) {
