@@ -18,192 +18,17 @@
 #include <memory>
 #include <unordered_map>
 #include <set>
+#include <array>
+#include <map>
+#include <sstream>
 
-// Helper: apply all active LoRA adapters to a base weight for a given module name
-static at::Tensor apply_lora_adapters(
-    TrainingContext* ctx, int64_t layer_idx,
-    const at::Tensor& base_weight, const std::string& module_name
-) {
-    at::Tensor w = base_weight;
-    for (auto& adapter : ctx->adapters) {
-        // Check if this adapter targets this layer
-        if (!adapter.target_layers.empty() && adapter.target_layers.find(layer_idx) == adapter.target_layers.end())
-            continue;
-        // Check if this adapter targets this module
-        if (!adapter.target_modules.empty() && adapter.target_modules.find(module_name) == adapter.target_modules.end())
-            continue;
-        // Find the param pair for this layer
-        auto it = adapter.params.find(layer_idx);
-        if (it == adapter.params.end()) continue;
-        // Find the pair for this module (by index)
-        // Module index mapping: full_attn: 0=q,1=k,2=v,3=o; linear_attn: 0=qkv,1=z,2=out
-        // The pairs are stored in the order they were created — matching proj_indices order
-        // We need a way to map module_name → pair index
-        // For simplicity, we use the order: the pair index matches the order in which
-        // modules were specified when the adapter was created.
-        // This is handled in qwen36_add_lora — the pairs are stored in the same order
-        // as the standard proj_indices for that layer type.
-        // So we need to know which index this module_name corresponds to.
-        // This is a bit fragile but works for the standard Qwen3.6 module set.
-        // For now: just return w — the actual delta application happens in forward_single_layer
-        // where we know the exact pair index.
-    }
-    return w;
-}
+struct TrainingContext;  // forward declaration (defined below)
+struct LayerConfig;
 
-// Helper: apply LoRA delta for a specific adapter and pair index
-// — legacy single-adapter path (used when only 1 adapter targets this layer/module)
-static inline at::Tensor apply_adapter_delta(
-    TrainingContext* ctx, int64_t layer_idx, int64_t pair_idx,
-    const at::Tensor& base_weight
-) {
-    at::Tensor w = base_weight;
-    for (auto& adapter : ctx->adapters) {
-        if (!adapter.target_layers.empty() && adapter.target_layers.find(layer_idx) == adapter.target_layers.end())
-            continue;
-        auto it = adapter.params.find(layer_idx);
-        if (it == adapter.params.end()) continue;
-        if (pair_idx >= (int64_t)it->second.size()) continue;
-        auto& [a, b] = it->second[pair_idx];
-        double scaling = adapter.alpha / (double)adapter.rank;
-        w = lora_delta(w, a, b, scaling);
-    }
-    // Legacy: also apply flat arrays
-    if (!ctx->lora_a.empty()) {
-        int64_t lora_count = (ctx->layer_configs[layer_idx].layer_type == 0) ? 4 : 3;
-        int64_t la_offset = layer_idx < (int64_t)ctx->lora_layer_offset.size() ? ctx->lora_layer_offset[layer_idx] : 0;
-        if (la_offset + pair_idx < (int64_t)ctx->lora_a.size()) {
-            w = lora_delta(w, ctx->lora_a[la_offset + pair_idx], ctx->lora_b[la_offset + pair_idx], ctx->lora_scaling);
-        }
-    }
-    return w;
-}
+// Forward declarations for functions defined after TrainingContext
+static at::Tensor apply_multi_lora(TrainingContext* ctx, int64_t layer_idx, int64_t pair_idx, const at::Tensor& base_weight);
 
-// ── Fused LoRA Linear: y = x @ W.T + (x @ A_concat.T) @ B_concat.T * s ──
-// Custom autograd::Function that avoids materializing B@A delta.
-// Forward: 2 GEMM (base + lora), saves only [batch, rank] intermediate (small)
-// Backward: 2 GEMM (grad_A, grad_B), skips grad_W (frozen)
-// Replaces: W' = W + B@A; y = x @ W'.T  (which materializes [out, in] delta)
-
-struct FusedLoRALinearFunction : public torch::autograd::Function<FusedLoRALinearFunction> {
-    static at::Tensor forward(torch::autograd::AutogradContext* ctx,
-        at::Tensor input,       // [batch, in]
-        at::Tensor base_weight, // [out, in] (frozen, no grad)
-        at::Tensor a_concat,   // [sum_ranks, in]
-        at::Tensor b_concat    // [out, sum_ranks] (pre-scaled: B * scaling)
-    ) {
-        // y_base = input @ base_weight.T  -> [batch, out]
-        auto y_base = at::linear(input, base_weight);
-        // inter = input @ a_concat.T  -> [batch, sum_ranks]  (SMALL!)
-        auto inter = at::linear(input, a_concat);
-        // y_lora = inter @ b_concat.T  -> [batch, out]
-        auto y_lora = at::linear(inter, b_concat);
-        // y = y_base + y_lora
-        ctx->save_for_backward({input, a_concat, b_concat, inter});
-        return y_base + y_lora;
-    }
-
-    static std::vector<at::Tensor> backward(torch::autograd::AutogradContext* ctx,
-        std::vector<at::Tensor> grad_outputs
-    ) {
-        auto saved = ctx->get_saved_variables();
-        auto input = saved[0];       // [batch, in]
-        auto a_concat = saved[1];    // [sum_ranks, in]
-        auto b_concat = saved[2];    // [out, sum_ranks]
-        auto inter = saved[3];      // [batch, sum_ranks]
-        auto grad_y = grad_outputs[0];  // [batch, out]
-
-        // grad_b_concat = grad_y.T @ inter  -> [out, sum_ranks]
-        auto grad_b = at::matmul(grad_y.t(), inter);
-        // grad_inter = grad_y @ b_concat  -> [batch, sum_ranks]
-        auto grad_inter = at::linear(grad_y, b_concat);  // [batch, sum_ranks]
-        // grad_a_concat = grad_inter.T @ input  -> [sum_ranks, in]
-        auto grad_a = at::matmul(grad_inter.t(), input);
-
-        // grad_input = grad_y @ base_weight (not needed - input has its own grad path)
-        // grad_base_weight = frozen (return empty)
-        return {at::Tensor(), at::Tensor(), grad_a, grad_b};
-    }
-};
-
-
-// Legacy: apply multi-LoRA to weight (materializes delta, for backward compat with attention functions)
-static inline at::Tensor apply_multi_lora(
-    TrainingContext* ctx, int64_t layer_idx, int64_t pair_idx,
-    const at::Tensor& base_weight  // [out, in]
-) {
-    std::vector<at::Tensor> a_list, b_list;
-    for (auto& adapter : ctx->adapters) {
-        if (!adapter.target_layers.empty() && adapter.target_layers.find(layer_idx) == adapter.target_layers.end())
-            continue;
-        auto it = adapter.params.find(layer_idx);
-        if (it == adapter.params.end()) continue;
-        if (pair_idx >= (int64_t)it->second.size()) continue;
-        auto& [a, b] = it->second[pair_idx];
-        double scaling = adapter.alpha / (double)adapter.rank;
-        b_list.push_back(b * scaling);
-        a_list.push_back(a);
-    }
-    if (!ctx->lora_a.empty()) {
-        int64_t la_offset = layer_idx < (int64_t)ctx->lora_layer_offset.size() ? ctx->lora_layer_offset[layer_idx] : 0;
-        if (la_offset + pair_idx < (int64_t)ctx->lora_a.size()) {
-            b_list.push_back(ctx->lora_b[la_offset + pair_idx] * ctx->lora_scaling);
-            a_list.push_back(ctx->lora_a[la_offset + pair_idx]);
-        }
-    }
-    if (a_list.empty()) return base_weight;
-    if (a_list.size() == 1) return lora_delta(base_weight, a_list[0], b_list[0], 1.0);
-    auto a_concat = at::cat(a_list, 0);
-    auto b_concat = at::cat(b_list, 1);
-    return base_weight + at::matmul(b_concat, a_concat);
-}
-
-/// Apply fused LoRA linear: y = input @ W.T + (input @ A.T) @ B.T * s
-/// If no LoRA adapters target this module, falls back to plain at::linear.
-static inline at::Tensor fused_lora_linear(
-    TrainingContext* ctx, int64_t layer_idx, int64_t pair_idx,
-    const at::Tensor& input,       // [batch, in]
-    const at::Tensor& base_weight  // [out, in]
-) {
-    // Collect adapters that target this layer + pair_idx
-    std::vector<at::Tensor> a_list, b_list;
-    for (auto& adapter : ctx->adapters) {
-        if (!adapter.target_layers.empty() && adapter.target_layers.find(layer_idx) == adapter.target_layers.end())
-            continue;
-        auto it = adapter.params.find(layer_idx);
-        if (it == adapter.params.end()) continue;
-        if (pair_idx >= (int64_t)it->second.size()) continue;
-        auto& [a, b] = it->second[pair_idx];
-        double scaling = adapter.alpha / (double)adapter.rank;
-        b_list.push_back(b * scaling);  // pre-scale
-        a_list.push_back(a);
-    }
-    // Legacy flat arrays
-    if (!ctx->lora_a.empty()) {
-        int64_t la_offset = layer_idx < (int64_t)ctx->lora_layer_offset.size() ? ctx->lora_layer_offset[layer_idx] : 0;
-        if (la_offset + pair_idx < (int64_t)ctx->lora_a.size()) {
-            b_list.push_back(ctx->lora_b[la_offset + pair_idx] * ctx->lora_scaling);
-            a_list.push_back(ctx->lora_a[la_offset + pair_idx]);
-        }
-    }
-
-    if (a_list.empty()) {
-        // No LoRA - plain linear
-        return at::linear(input, base_weight);
-    }
-
-    // Concat A (by rows) and B (by columns, pre-scaled)
-    at::Tensor a_concat, b_concat;
-    if (a_list.size() == 1) {
-        a_concat = a_list[0];
-        b_concat = b_list[0];
-    } else {
-        a_concat = at::cat(a_list, 0);  // [sum_ranks, in]
-        b_concat = at::cat(b_list, 1);  // [out, sum_ranks]
-    }
-
-    return FusedLoRALinearFunction::apply(input, base_weight, a_concat, b_concat);
-}
+// ──────────────────────────────────────────────────────────────────────
 // Forward declarations
 // ──────────────────────────────────────────────────────────────────────
 
@@ -351,7 +176,13 @@ static at::Tensor full_attention(
     // Full attention always uses SDPA (Flash Attention) — O(seq) memory.
     // QWEN36_SEQ_CHUNK only affects linear_attention (delta rule state passing).
     // For large sequences, chunk the q/k/v projections to avoid OOM on single matmul.
-        }
+    const char* proj_chunk_env = getenv("QWEN36_PROJ_CHUNK");
+    int64_t proj_chunk = proj_chunk_env ? atoll(proj_chunk_env) : 0;
+
+    // Debug: confirm proj_chunk is read
+    if (proj_chunk > 0 && seq > proj_chunk) {
+        fprintf(stderr, "[proj_debug] full_attention: seq=%ld proj_chunk=%ld (chunked)\n", (long)seq, (long)proj_chunk);
+    }
 
     at::Tensor q, gate, k, v;
 
@@ -396,6 +227,52 @@ static at::Tensor full_attention(
     k = rms_norm(k, k_norm, rms_eps);
 
     // Debug: memory after rms_norm
+    {
+        size_t free2, total2;
+        cudaMemGetInfo(&free2, &total2);
+        fprintf(stderr, "[mem_debug] after rms_norm: used=%.1f GB, free=%.1f GB\n",
+            (total2 - free2) / 1e9, free2 / 1e9);
+    }
+
+    // Release gate before RoPE to save 16GB
+    auto gate_saved = gate;
+    gate = at::Tensor();
+    cudaDeviceSynchronize();
+    c10::cuda::CUDACachingAllocator::emptyCache();
+
+    // Debug: memory after gate release
+    {
+        size_t free2, total2;
+        cudaMemGetInfo(&free2, &total2);
+        fprintf(stderr, "[mem_debug] after gate release: used=%.1f GB, free=%.1f GB\n",
+            (total2 - free2) / 1e9, free2 / 1e9);
+    }
+
+    if (rotary_dim > 0) {
+        auto pos = at::arange(seq, at::TensorOptions().dtype(at::kFloat).device(device)).unsqueeze(0);
+        auto exponents = at::arange(0, rotary_dim, 2, at::TensorOptions().dtype(at::kFloat).device(device)) / (double)rotary_dim;
+        auto inv_freq = (exponents * std::log(rope_theta)).exp().reciprocal();
+        auto freqs = pos.unsqueeze(-1) * inv_freq.unsqueeze(0);
+        auto emb = at::cat({freqs, freqs}, -1);
+        auto cos = emb.cos().unsqueeze(1).to(q.scalar_type());
+        auto sin = emb.sin().unsqueeze(1).to(q.scalar_type());
+
+        // In-place RoPE to avoid creating additional 16GB tensors
+        auto q_rot = q.narrow(-1, 0, rotary_dim);
+        auto k_rot = k.narrow(-1, 0, rotary_dim);
+        auto rotate_half_q = at::cat({-q_rot.narrow(-1, rotary_dim/2, rotary_dim/2), q_rot.narrow(-1, 0, rotary_dim/2)}, -1);
+        auto rotate_half_k = at::cat({-k_rot.narrow(-1, rotary_dim/2, rotary_dim/2), k_rot.narrow(-1, 0, rotary_dim/2)}, -1);
+        // q_rotated = q_rot * cos + rotate_half(q_rot) * sin — in-place
+        q_rot.mul_(cos).add_(rotate_half_q * sin);
+        k_rot.mul_(cos).add_(rotate_half_k * sin);
+        // q and k are now modified in-place (RoPE applied to rotary_dim part)
+        rotate_half_q = at::Tensor();
+        rotate_half_k = at::Tensor();
+        cos = at::Tensor();
+        sin = at::Tensor();
+        cudaDeviceSynchronize();
+        c10::cuda::CUDACachingAllocator::emptyCache();
+    }
 
     // Restore gate after RoPE
     gate = gate_saved;
@@ -427,33 +304,31 @@ static at::Tensor full_attention(
         // For SDPA, attn_mask should be additive bias: 0 for attend, -inf for ignore
         auto additive_mask = at::zeros({batch, 1, 1, seq}, hidden.options().dtype(at::kFloat));
         additive_mask = additive_mask.masked_fill(kpm.logical_not(), -std::numeric_limits<float>::infinity());
-        attn_out = at::scaled_dot_product_attention(
+        auto attn_out = at::scaled_dot_product_attention(
             q, k_expanded, v_expanded,
             additive_mask,
             0.0,
-            true  // is_causal=true (SDPA combines causal + additive mask)
+            true
         );
+        return attn_out.transpose(1, 2).reshape({batch, seq, qkv_dim}).matmul(o_proj.t());
     } else {
-        attn_out = at::scaled_dot_product_attention(
+        auto attn_out = at::scaled_dot_product_attention(
             q, k_expanded, v_expanded,
             c10::nullopt,
             0.0,
             true
         );
+        auto result = attn_out.transpose(1, 2).reshape({batch, seq, qkv_dim}).matmul(o_proj.t());
+        k_expanded = at::Tensor();
+        v_expanded = at::Tensor();
+        cudaDeviceSynchronize();
+        c10::cuda::CUDACachingAllocator::emptyCache();
+        result = result * at::sigmoid(gate).to(result.scalar_type());
+        gate = at::Tensor();
+        cudaDeviceSynchronize();
+        c10::cuda::CUDACachingAllocator::emptyCache();
+        return result;
     }
-
-    // Release Q/K/V before gate multiplication
-    q = at::Tensor();
-    k_expanded = at::Tensor();
-    v_expanded = at::Tensor();
-    cudaDeviceSynchronize();
-    c10::cuda::CUDACachingAllocator::emptyCache();
-
-    attn_out = attn_out * at::sigmoid(gate).to(attn_out.scalar_type());
-    gate = at::Tensor();
-    cudaDeviceSynchronize();
-    c10::cuda::CUDACachingAllocator::emptyCache();
-    return attn_out.transpose(1, 2).reshape({batch, seq, qkv_dim}).matmul(o_proj.t());
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -748,7 +623,22 @@ static at::Tensor moe_forward(
     auto routed_output = at::zeros(flat.sizes(), flat.options());
 
     // Debug: dump MoE routing and weight stats
-    
+    if (getenv("QWEN36_DUMP_MOE")) {
+        auto rl_f = router_logits.to(at::kFloat);
+        auto rw_f = topk_weights.to(at::kFloat);
+        auto egu_f = experts_gate_up.select(0, 0).to(at::kFloat);
+        auto ed_f = experts_down.select(0, 0).to(at::kFloat);
+        fprintf(stderr, "  [moe] router_logits: mean=%.6f std=%.6f max=%.6f\n", rl_f.mean().item<float>(), rl_f.std().item<float>(), rl_f.abs().max().item<float>());
+        fprintf(stderr, "  [moe] topk_weights: mean=%.6f std=%.6f max=%.6f\n", rw_f.mean().item<float>(), rw_f.std().item<float>(), rw_f.abs().max().item<float>());
+        fprintf(stderr, "  [moe] experts_gate_up[0]: mean=%.6f std=%.6f max=%.6f\n", egu_f.mean().item<float>(), egu_f.std().item<float>(), egu_f.abs().max().item<float>());
+        fprintf(stderr, "  [moe] experts_down[0]: mean=%.6f std=%.6f max=%.6f\n", ed_f.mean().item<float>(), ed_f.std().item<float>(), ed_f.abs().max().item<float>());
+        auto sg_f = shared_gate_proj.to(at::kFloat);
+        auto sd_f = shared_down_proj.to(at::kFloat);
+        fprintf(stderr, "  [moe] shared_gate: mean=%.6f std=%.6f max=%.6f\n", sg_f.mean().item<float>(), sg_f.std().item<float>(), sg_f.abs().max().item<float>());
+        fprintf(stderr, "  [moe] shared_down: mean=%.6f std=%.6f max=%.6f\n", sd_f.mean().item<float>(), sd_f.std().item<float>(), sd_f.abs().max().item<float>());
+        auto seg_f = at::sigmoid(at::matmul(flat, shared_expert_gate_w.t())).to(at::kFloat);
+        fprintf(stderr, "  [moe] shared_gate_sig: mean=%.6f std=%.6f max=%.6f\n", seg_f.mean().item<float>(), seg_f.std().item<float>(), seg_f.abs().max().item<float>());
+    }
 
     for (int64_t kk = 0; kk < top_k; kk++) {
         auto expert_indices = topk_indices.select(-1, kk);
@@ -780,7 +670,12 @@ static at::Tensor moe_forward(
     shared_out = (shared_out * seg).to(compute_type);
 
     // Debug: dump routed_output AFTER loop
-    
+    if (getenv("QWEN36_DUMP_MOE")) {
+        auto ro_f = routed_output.to(at::kFloat);
+        auto so_f = shared_out.to(at::kFloat);
+        fprintf(stderr, "  [moe] routed_output (after loop): mean=%.6f std=%.6f max=%.6f\n", ro_f.mean().item<float>(), ro_f.std().item<float>(), ro_f.abs().max().item<float>());
+        fprintf(stderr, "  [moe] shared_out: mean=%.6f std=%.6f max=%.6f\n", so_f.mean().item<float>(), so_f.std().item<float>(), so_f.abs().max().item<float>());
+    }
 
     return (routed_output + shared_out).reshape({batch, seq, hidden_dim});
 }
@@ -808,15 +703,10 @@ static inline int64_t weight_count_for_layer(const LayerConfig& cfg) {
 }
 
 static at::Tensor forward_single_layer(
-    TrainingContext* ctx, const at::Tensor& hidden, int64_t layer_idx,
-    at::ScalarType kind, const at::Tensor& attention_mask
+    TrainingContext* ctx, const at::Tensor& hidden, at::Tensor** w, const LayerConfig* cfg,
+    int64_t layer_idx, at::ScalarType kind,
+    const at::Tensor& attention_mask
 ) {
-    auto& cfg = ctx->layer_configs[layer_idx];
-    int64_t w_offset = 0;
-    for (int64_t j = 0; j < layer_idx; j++)
-        w_offset += weight_count_for_layer(ctx->layer_configs[j]);
-
-    auto** w = ctx->weight_ptrs.data() + w_offset;
     auto input_norm = *w[0];
     auto post_norm = *w[1];
     auto attn_input = rms_norm(hidden, input_norm, cfg->rms_eps);
@@ -824,13 +714,13 @@ static at::Tensor forward_single_layer(
 
     at::Tensor attn_output;
     if (cfg->layer_type == 0) {
-        // Full attention: apply multi-LoRA to q,k,v,o (pair indices 0,1,2,3)
-        auto q_proj = apply_multi_lora(ctx, layer_idx, 0, *w[2]);
-        auto q_norm = *w[3];
-        auto k_proj = apply_multi_lora(ctx, layer_idx, 1, *w[4]);
-        auto k_norm = *w[5];
-        auto v_proj = apply_multi_lora(ctx, layer_idx, 2, *w[6]);
-        auto o_proj = apply_multi_lora(ctx, layer_idx, 3, *w[7]);
+        // Full attention
+        auto q_proj = *w[2], q_norm = *w[3], k_proj = *w[4], k_norm = *w[5], v_proj = *w[6], o_proj = *w[7];
+        // Apply multi-LoRA (handles both adapters and legacy arrays)
+        q_proj = apply_multi_lora(ctx, layer_idx, 0, q_proj);
+        k_proj = apply_multi_lora(ctx, layer_idx, 1, k_proj);
+        v_proj = apply_multi_lora(ctx, layer_idx, 2, v_proj);
+        o_proj = apply_multi_lora(ctx, layer_idx, 3, o_proj);
         attn_output = full_attention(attn_input, q_proj, q_norm, k_proj, k_norm, v_proj, o_proj,
             cfg->num_heads, cfg->num_kv_heads, cfg->head_dim,
             cfg->partial_rotary_factor, cfg->rope_theta, cfg->rms_eps, kind,
@@ -841,18 +731,29 @@ static at::Tensor forward_single_layer(
                 *w[8], *w[9], *w[10], *w[11], *w[12], *w[13], *w[14],
                 cfg->num_experts, cfg->top_k, cfg->moe_intermediate,
                 cfg->norm_topk_prob != 0, cfg->expert_start, cfg->expert_count, kind);
+            // Debug: dump sub-component stats for last layer
+            if (getenv("QWEN36_DUMP_LAST_LAYER")) {
+                auto af = attn_output.to(at::kFloat);
+                auto mf = mlp_out.to(at::kFloat);
+                auto pf = post_attn.to(at::kFloat);
+                auto hf = hidden.to(at::kFloat);
+                fprintf(stderr, "  [last_layer] hidden_in:  mean=%.6f std=%.6f max=%.6f\n", hf.mean().item<float>(), hf.std().item<float>(), hf.abs().max().item<float>());
+                fprintf(stderr, "  [last_layer] attn_out:   mean=%.6f std=%.6f max=%.6f\n", af.mean().item<float>(), af.std().item<float>(), af.abs().max().item<float>());
+                fprintf(stderr, "  [last_layer] post_attn:   mean=%.6f std=%.6f max=%.6f\n", pf.mean().item<float>(), pf.std().item<float>(), pf.abs().max().item<float>());
+                fprintf(stderr, "  [last_layer] mlp_out:     mean=%.6f std=%.6f max=%.6f\n", mf.mean().item<float>(), mf.std().item<float>(), mf.abs().max().item<float>());
+            }
             return hidden + attn_output + mlp_out;
         } else {
             auto mlp_out = dense_mlp_forward(post_attn, *w[8], *w[9], *w[10], kind);
             return hidden + attn_output + mlp_out;
         }
     } else {
-        // Linear attention: apply multi-LoRA to qkv,z,out (pair indices 0,1,2)
-        auto in_proj_qkv = apply_multi_lora(ctx, layer_idx, 0, *w[2]);
-        auto in_proj_z = apply_multi_lora(ctx, layer_idx, 1, *w[3]);
-        auto in_proj_a = *w[4], in_proj_b = *w[5];
-        auto a_log = *w[6], dt_bias = *w[7], conv1d_w = *w[8], norm_w = *w[9];
-        auto out_proj = apply_multi_lora(ctx, layer_idx, 2, *w[10]);
+        // Linear attention
+        auto in_proj_qkv = *w[2], in_proj_z = *w[3], in_proj_a = *w[4], in_proj_b = *w[5];
+        auto a_log = *w[6], dt_bias = *w[7], conv1d_w = *w[8], norm_w = *w[9], out_proj = *w[10];
+        in_proj_qkv = apply_multi_lora(ctx, layer_idx, 0, in_proj_qkv);
+        in_proj_z = apply_multi_lora(ctx, layer_idx, 1, in_proj_z);
+        out_proj = apply_multi_lora(ctx, layer_idx, 2, out_proj);
         attn_output = linear_attention(attn_input, in_proj_qkv, in_proj_z, in_proj_a, in_proj_b,
             a_log, dt_bias, conv1d_w, norm_w, out_proj,
             cfg->num_k_heads, cfg->key_dim, cfg->num_v_heads, cfg->val_dim,
@@ -886,29 +787,56 @@ struct TrainingContext {
     at::Tensor attention_mask;
 
     // ── Multi-LoRA adapter registry ──
-    // Each adapter has independent rank, alpha, target layers, and target modules.
     struct LoRAAdapter {
         int64_t id;
         int64_t rank;
-        double alpha;  // scaling = alpha / rank
-        std::set<int64_t> target_layers;  // empty = all layers
-        std::set<std::string> target_modules;  // empty = all modules
-        // Per-layer LoRA params: layer_idx → vector of (a, b) pairs
+        double alpha;
+        std::set<int64_t> target_layers;
+        std::set<std::string> target_modules;
         std::map<int64_t, std::vector<std::pair<at::Tensor, at::Tensor>>> params;
-        // Adam state per param pair: m_a, v_a, m_b, v_b
         std::map<int64_t, std::vector<std::array<at::Tensor, 4>>> adam_state;
     };
-    std::vector<LoRAAdapter> adapters;  // active adapters
-    int64_t next_adapter_id;
-    // Legacy: single LoRA scaling for backward compat with create_training_context
-    double lora_scaling;
-    // Legacy: flat arrays for backward compat with get_lora_a/b/count
+
+// ── Multi-LoRA: concat all adapters' A/B, 2x GEMM ──
+static inline at::Tensor apply_multi_lora(
+    TrainingContext* ctx, int64_t layer_idx, int64_t pair_idx,
+    const at::Tensor& base_weight
+) {
+    std::vector<at::Tensor> a_list, b_list;
+    for (auto& adapter : ctx->adapters) {
+        if (!adapter.target_layers.empty() && adapter.target_layers.find(layer_idx) == adapter.target_layers.end())
+            continue;
+        auto it = adapter.params.find(layer_idx);
+        if (it == adapter.params.end()) continue;
+        if (pair_idx >= (int64_t)it->second.size()) continue;
+        auto& [a, b] = it->second[pair_idx];
+        double scaling = adapter.alpha / (double)adapter.rank;
+        b_list.push_back(b * scaling);
+        a_list.push_back(a);
+    }
+    if (!ctx->lora_a.empty()) {
+        int64_t la_offset = layer_idx < (int64_t)ctx->lora_layer_offset.size() ? ctx->lora_layer_offset[layer_idx] : 0;
+        if (la_offset + pair_idx < (int64_t)ctx->lora_a.size()) {
+            b_list.push_back(ctx->lora_b[la_offset + pair_idx] * ctx->lora_scaling);
+            a_list.push_back(ctx->lora_a[la_offset + pair_idx]);
+        }
+    }
+    if (a_list.empty()) return base_weight;
+    if (a_list.size() == 1) return lora_delta(base_weight, a_list[0], b_list[0], 1.0);
+    auto a_concat = at::cat(a_list, 0);
+    auto b_concat = at::cat(b_list, 1);
+    return base_weight + at::matmul(b_concat, a_concat);
+}
+    std::vector<LoRAAdapter> adapters;
+    int64_t next_adapter_id = 0;
+    // Legacy single-LoRA (backward compat)
     std::vector<at::Tensor> lora_a;
     std::vector<at::Tensor> lora_b;
     std::vector<int64_t> lora_layer_offset;
+    double lora_scaling;
     std::vector<std::string> lora_names;
 
-    // Adam optimizer state (legacy flat arrays — used by create_training_context path)
+    // Adam optimizer state
     std::vector<at::Tensor> adam_m;
     std::vector<at::Tensor> adam_v;
     double lr, beta1, beta2, eps;
@@ -939,7 +867,7 @@ struct TrainingContext {
 // at the cost of 2x extra recomputation per layer during backward.
 // ──────────────────────────────────────────────────────────────────────
 
-// Compute attention output from hidden (uses multi-LoRA via apply_adapter_delta)
+// Compute attention output from hidden
 at::Tensor compute_attn_only(
     TrainingContext* ctx, const at::Tensor& hidden, int64_t layer_idx, at::ScalarType kind
 ) {
@@ -948,25 +876,37 @@ at::Tensor compute_attn_only(
     for (int64_t j = 0; j < layer_idx; j++)
         w_offset += weight_count_for_layer(ctx->layer_configs[j]);
     auto attn_input = rms_norm(hidden, *ctx->weight_ptrs[w_offset + 0], cfg.rms_eps);
+    int64_t lora_count = (cfg.layer_type == 0) ? 4 : 3;
+    int64_t la_offset = ctx->lora_layer_offset[layer_idx];
+    bool has_lora = (la_offset + lora_count) <= (int64_t)ctx->lora_a.size();
+    std::vector<at::Tensor*> la(lora_count, nullptr), lb(lora_count, nullptr);
+    if (has_lora) for (int64_t k = 0; k < lora_count; k++) { la[k] = &ctx->lora_a[la_offset + k]; lb[k] = &ctx->lora_b[la_offset + k]; }
 
     if (cfg.layer_type == 0) {
-        auto qp = apply_multi_lora(ctx, layer_idx, 0, *ctx->weight_ptrs[w_offset+2]);
-        auto qn = *ctx->weight_ptrs[w_offset+3];
-        auto kp = apply_multi_lora(ctx, layer_idx, 1, *ctx->weight_ptrs[w_offset+4]);
-        auto kn = *ctx->weight_ptrs[w_offset+5];
-        auto vp = apply_multi_lora(ctx, layer_idx, 2, *ctx->weight_ptrs[w_offset+6]);
-        auto op = apply_multi_lora(ctx, layer_idx, 3, *ctx->weight_ptrs[w_offset+7]);
+        auto qp = *ctx->weight_ptrs[w_offset+2], qn = *ctx->weight_ptrs[w_offset+3];
+        auto kp = *ctx->weight_ptrs[w_offset+4], kn = *ctx->weight_ptrs[w_offset+5];
+        auto vp = *ctx->weight_ptrs[w_offset+6], op = *ctx->weight_ptrs[w_offset+7];
+        if (has_lora) {
+            if (la[0]) qp = lora_delta(qp, *la[0], *lb[0], ctx->lora_scaling);
+            if (la[1]) kp = lora_delta(kp, *la[1], *lb[1], ctx->lora_scaling);
+            if (la[2]) vp = lora_delta(vp, *la[2], *lb[2], ctx->lora_scaling);
+            if (la[3]) op = lora_delta(op, *la[3], *lb[3], ctx->lora_scaling);
+        }
         return full_attention(attn_input, qp, qn, kp, kn, vp, op,
             cfg.num_heads, cfg.num_kv_heads, cfg.head_dim,
             cfg.partial_rotary_factor, cfg.rope_theta, cfg.rms_eps, kind,
             ctx->attention_mask);
     } else {
-        auto qkv = apply_multi_lora(ctx, layer_idx, 0, *ctx->weight_ptrs[w_offset+2]);
-        auto z = apply_multi_lora(ctx, layer_idx, 1, *ctx->weight_ptrs[w_offset+3]);
+        auto qkv = *ctx->weight_ptrs[w_offset+2], z = *ctx->weight_ptrs[w_offset+3];
         auto a = *ctx->weight_ptrs[w_offset+4], b = *ctx->weight_ptrs[w_offset+5];
         auto al = *ctx->weight_ptrs[w_offset+6], db = *ctx->weight_ptrs[w_offset+7];
         auto cw = *ctx->weight_ptrs[w_offset+8], nw = *ctx->weight_ptrs[w_offset+9];
-        auto op = apply_multi_lora(ctx, layer_idx, 2, *ctx->weight_ptrs[w_offset+10]);
+        auto op = *ctx->weight_ptrs[w_offset+10];
+        if (has_lora) {
+            if (la[0]) qkv = lora_delta(qkv, *la[0], *lb[0], ctx->lora_scaling);
+            if (la[1]) z = lora_delta(z, *la[1], *lb[1], ctx->lora_scaling);
+            if (la[2]) op = lora_delta(op, *la[2], *lb[2], ctx->lora_scaling);
+        }
         return linear_attention(attn_input, qkv, z, a, b, al, db, cw, nw, op,
             cfg.num_k_heads, cfg.key_dim, cfg.num_v_heads, cfg.val_dim,
             cfg.conv_kernel, cfg.rms_eps, kind);
@@ -1117,7 +1057,11 @@ static at::Tensor forward_full(
     at::Tensor hidden = at::embedding(embed, input_ids);
 
     // Debug: dump embedding output stats
-    
+    if (getenv("QWEN36_DUMP_LAYERS")) {
+        auto h_f = hidden.to(at::kFloat);
+        fprintf(stderr, "Layer  0 (embed): mean=%.6f std=%.6f max_abs=%.6f\n",
+            h_f.mean().item<float>(), h_f.std().item<float>(), h_f.abs().max().item<float>());
+    }
 
     for (int64_t i = 0; i < ctx->num_layers; i++) {
         // Get weight pointers for this layer
@@ -1141,11 +1085,22 @@ static at::Tensor forward_full(
             }
         }
 
-        hidden = forward_single_layer(ctx, hidden, i, kind,
-            ctx->attention_mask);
+        hidden = forward_single_layer(ctx, hidden, layer_w.data(), &ctx->layer_configs[i], i,
+            kind, ctx->attention_mask);
 
         // Debug: dump per-layer hidden state stats (matching HF output_hidden_states)
-        
+        if (getenv("QWEN36_DUMP_LAYERS")) {
+            auto h_f = hidden.to(at::kFloat);
+            fprintf(stderr, "Layer %2ld: mean=%.6f std=%.6f max_abs=%.6f\n",
+                i, h_f.mean().item<float>(), h_f.std().item<float>(), h_f.abs().max().item<float>());
+        }
+
+        // Sync + release CUDA allocator cache after each layer in no-grad forward.
+        // Without sync, pending CUDA ops hold references to intermediates,
+        // preventing emptyCache from freeing them.
+        cudaDeviceSynchronize();
+        c10::cuda::CUDACachingAllocator::emptyCache();
+    }
 
     return hidden;  // pre-norm hidden (for MTP)
 }
@@ -1185,8 +1140,8 @@ static at::Tensor forward_layer_group(
             }
         }
 
-        hidden = forward_single_layer(ctx, hidden, i, kind,
-            ctx->attention_mask);
+        hidden = forward_single_layer(ctx, hidden, layer_w.data(), &ctx->layer_configs[i], i,
+            kind, ctx->attention_mask);
     }
     return hidden;
 }
@@ -1298,8 +1253,8 @@ struct FusedLayerFunction : public torch::autograd::Function<FusedLayerFunction>
         if (has_lora) for (int64_t k = 0; k < lora_count; k++) {
             la[k] = &tc->lora_a[la_offset + k]; lb[k] = &tc->lora_b[la_offset + k];
         }
-        return forward_single_layer(tc, input, layer_idx, kind,
-            tc->attention_mask);
+        return forward_single_layer(tc, input, layer_w.data(), &tc->layer_configs[layer_idx],
+            layer_idx, kind, tc->attention_mask);
     }
 
     static std::vector<at::Tensor> backward(
@@ -1615,28 +1570,8 @@ static at::Tensor mtp_forward(
         int64_t w_count = weight_count_for_layer(ctx->mtp_layer_configs[i]);
         std::vector<at::Tensor*> layer_w(ctx->mtp_layer_weights.begin() + w_offset,
                                          ctx->mtp_layer_weights.begin() + w_offset + w_count);
-        // MTP layers: no LoRA, use mtp_layer_configs and mtp_layer_weights
-        auto& cfg = ctx->mtp_layer_configs[i];
-        int64_t w_offset = 0;
-        for (int64_t j = 0; j < i; j++)
-            w_offset += weight_count_for_layer(ctx->mtp_layer_configs[j]);
-        auto** w = ctx->mtp_layer_weights.data() + w_offset;
-        auto attn_input = rms_norm(h, *w[0], cfg.rms_eps);
-        auto attn_out = full_attention(attn_input, *w[2], *w[3], *w[4], *w[5], *w[6], *w[7],
-            cfg.num_heads, cfg.num_kv_heads, cfg.head_dim,
-            cfg.partial_rotary_factor, cfg.rope_theta, cfg.rms_eps, kind,
-            ctx->attention_mask);
-        auto post_attn = rms_norm(h + attn_out, *w[1], cfg.rms_eps);
-        at::Tensor mlp_out;
-        if (cfg.num_experts > 0) {
-            mlp_out = moe_forward(post_attn,
-                *w[8], *w[9], *w[10], *w[11], *w[12], *w[13], *w[14],
-                cfg.num_experts, cfg.top_k, cfg.moe_intermediate,
-                cfg.norm_topk_prob != 0, cfg.expert_start, cfg.expert_count, kind);
-        } else {
-            mlp_out = dense_mlp_forward(post_attn, *w[8], *w[9], *w[10], kind);
-        }
-        h = h + attn_out + mlp_out;
+        h = forward_single_layer(ctx, h, layer_w.data(), &ctx->mtp_layer_configs[i],
+            ctx->num_layers + i, kind, ctx->attention_mask);
     }
 
     // Final norm only — return hidden, not logits
@@ -1702,7 +1637,7 @@ extern "C" {
 // lora_rank: LoRA rank (from config)
 // target_layers: array of layer indices to apply LoRA (nullptr = all layers)
 // num_target_layers: length of target_layers array
-void* qwen36_create_training_context(
+__attribute__((visibility("default"))) void* qwen36_create_training_context(
     void** weight_ptrs, int64_t num_weight_ptrs,
     void* embed_ptr, void* final_norm_ptr, void* lm_head_ptr,
     void* layer_configs_ptr, int64_t num_layers,
@@ -1813,7 +1748,7 @@ void* qwen36_create_training_context(
 
 // Set MTP weights on an existing training context.
 // Called after create_training_context if MTP is enabled.
-void qwen36_set_mtp_weights(
+__attribute__((visibility("default"))) void qwen36_set_mtp_weights(
     void* ctx_ptr,
     void* mtp_fc_ptr,
     void* mtp_pre_fc_norm_emb_ptr,
@@ -1845,7 +1780,7 @@ void qwen36_set_mtp_weights(
 
 // Single training step: forward + loss + backward + Adam update
 // Returns loss value, or -1 on error.
-double qwen36_train_step(
+__attribute__((visibility("default"))) double qwen36_train_step(
     void* ctx_ptr,
     void* input_ids_ptr,
     void* target_mask_ptr,
@@ -1940,81 +1875,76 @@ double qwen36_train_step(
             }
         }
 
-        // Adam optimizer step (no grad) — iterate over all adapters
+        // Adam optimizer step (no grad)
         at::AutoGradMode guard(false);
         ctx->step_count++;
         double step_f = (double)ctx->step_count;
         double bias_correction1 = 1.0 - std::pow(ctx->beta1, step_f);
         double bias_correction2 = 1.0 - std::pow(ctx->beta2, step_f);
 
+        // Multi-LoRA adapter Adam update
         for (auto& adapter : ctx->adapters) {
             for (auto& [layer_idx, pairs] : adapter.params) {
                 auto& adam_states = adapter.adam_state[layer_idx];
                 for (size_t i = 0; i < pairs.size(); i++) {
                     auto& [a, b] = pairs[i];
                     auto& [m_a, v_a, m_b, v_b] = adam_states[i];
-                    // Update A
                     {
                         auto& grad = a.grad();
                         if (grad.defined()) {
                             m_a = m_a * ctx->beta1 + grad * (1.0 - ctx->beta1);
                             v_a = v_a * ctx->beta2 + grad * grad * (1.0 - ctx->beta2);
-                            auto mh = m_a / bias_correction1;
-                            auto vh = v_a / bias_correction2;
-                            a.add_((mh / (vh.sqrt() + ctx->eps)) * -ctx->lr);
+                            a.add_((m_a / bias_correction1) / ((v_a / bias_correction2).sqrt() + ctx->eps) * (-ctx->lr));
                             a.grad().zero_();
                         }
                     }
-                    // Update B
                     {
                         auto& grad = b.grad();
                         if (grad.defined()) {
                             m_b = m_b * ctx->beta1 + grad * (1.0 - ctx->beta1);
                             v_b = v_b * ctx->beta2 + grad * grad * (1.0 - ctx->beta2);
-                            auto mh = m_b / bias_correction1;
-                            auto vh = v_b / bias_correction2;
-                            b.add_((mh / (vh.sqrt() + ctx->eps)) * -ctx->lr);
+                            b.add_((m_b / bias_correction1) / ((v_b / bias_correction2).sqrt() + ctx->eps) * (-ctx->lr));
                             b.grad().zero_();
                         }
                     }
                 }
             }
         }
-        // Legacy: also update flat arrays if they exist (backward compat with create_training_context)
-        {
-            size_t adam_idx = 0;
-            for (size_t i = 0; i < ctx->lora_a.size(); i++) {
-                {
-                    auto& param = ctx->lora_a[i];
-                    auto& grad = param.grad();
-                    if (grad.defined()) {
-                        auto& m = ctx->adam_m[adam_idx];
-                        auto& v = ctx->adam_v[adam_idx];
-                        m = m * ctx->beta1 + grad * (1.0 - ctx->beta1);
-                        v = v * ctx->beta2 + grad * grad * (1.0 - ctx->beta2);
-                        auto mh = m / bias_correction1;
-                        auto vh = v / bias_correction2;
-                        param.add_((mh / (vh.sqrt() + ctx->eps)) * -ctx->lr);
-                        param.grad().zero_();
-                    }
+        // Legacy single-LoRA Adam update
+        size_t adam_idx = 0;
+        for (size_t i = 0; i < ctx->lora_a.size(); i++) {
+            // Update LoRA A
+            {
+                auto& param = ctx->lora_a[i];
+                auto& grad = param.grad();
+                if (grad.defined()) {
+                    auto& m = ctx->adam_m[adam_idx];
+                    auto& v = ctx->adam_v[adam_idx];
+                    m = m * ctx->beta1 + grad * (1.0 - ctx->beta1);
+                    v = v * ctx->beta2 + grad * grad * (1.0 - ctx->beta2);
+                    auto mh = m / bias_correction1;
+                    auto vh = v / bias_correction2;
+                    param.add_((mh / (vh.sqrt() + ctx->eps)) * -ctx->lr);
+                    param.grad().zero_();
                 }
-                adam_idx++;
-                {
-                    auto& param = ctx->lora_b[i];
-                    auto& grad = param.grad();
-                    if (grad.defined()) {
-                        auto& m = ctx->adam_m[adam_idx];
-                        auto& v = ctx->adam_v[adam_idx];
-                        m = m * ctx->beta1 + grad * (1.0 - ctx->beta1);
-                        v = v * ctx->beta2 + grad * grad * (1.0 - ctx->beta2);
-                        auto mh = m / bias_correction1;
-                        auto vh = v / bias_correction2;
-                        param.add_((mh / (vh.sqrt() + ctx->eps)) * -ctx->lr);
-                        param.grad().zero_();
-                    }
-                }
-                adam_idx++;
             }
+            adam_idx++;
+            // Update LoRA B
+            {
+                auto& param = ctx->lora_b[i];
+                auto& grad = param.grad();
+                if (grad.defined()) {
+                    auto& m = ctx->adam_m[adam_idx];
+                    auto& v = ctx->adam_v[adam_idx];
+                    m = m * ctx->beta1 + grad * (1.0 - ctx->beta1);
+                    v = v * ctx->beta2 + grad * grad * (1.0 - ctx->beta2);
+                    auto mh = m / bias_correction1;
+                    auto vh = v / bias_correction2;
+                    param.add_((mh / (vh.sqrt() + ctx->eps)) * -ctx->lr);
+                    param.grad().zero_();
+                }
+            }
+            adam_idx++;
         }
 
         return loss_val;
@@ -2024,27 +1954,27 @@ double qwen36_train_step(
     }
 }
 
-// Get LoRA A tensor pointer by index (legacy — for backward compat with create_training_context path)
-void* qwen36_get_lora_a(void* ctx_ptr, int64_t index) {
+// Get LoRA A tensor pointer by index
+__attribute__((visibility("default"))) void* qwen36_get_lora_a(void* ctx_ptr, int64_t index) {
     auto* ctx = reinterpret_cast<TrainingContext*>(ctx_ptr);
     return &ctx->lora_a[index];
 }
 
 // Get LoRA B tensor pointer by index
-void* qwen36_get_lora_b(void* ctx_ptr, int64_t index) {
+__attribute__((visibility("default"))) void* qwen36_get_lora_b(void* ctx_ptr, int64_t index) {
     auto* ctx = reinterpret_cast<TrainingContext*>(ctx_ptr);
     return &ctx->lora_b[index];
 }
 
 // Free training context
-void qwen36_free_training_context(void* ctx_ptr) {
+__attribute__((visibility("default"))) void qwen36_free_training_context(void* ctx_ptr) {
     if (ctx_ptr) {
         delete reinterpret_cast<TrainingContext*>(ctx_ptr);
     }
 }
 
 // Enable/disable gradient checkpointing
-void qwen36_set_checkpoint(void* ctx_ptr, int32_t enable, int64_t group_size) {
+__attribute__((visibility("default"))) void qwen36_set_checkpoint(void* ctx_ptr, int32_t enable, int64_t group_size) {
     auto* ctx = reinterpret_cast<TrainingContext*>(ctx_ptr);
     ctx->use_checkpoint = (enable != 0);
     ctx->group_size = (group_size > 0) ? group_size : 4;
@@ -2052,52 +1982,59 @@ void qwen36_set_checkpoint(void* ctx_ptr, int32_t enable, int64_t group_size) {
         ctx->use_checkpoint ? "ON" : "OFF", (long)ctx->group_size);
 }
 
+// Set attention mask for padding tokens
+__attribute__((visibility("default"), used))
+void qwen36_set_attention_mask(void* ctx_ptr, void* mask_ptr) {
+    auto* ctx = reinterpret_cast<TrainingContext*>(ctx_ptr);
+    if (mask_ptr) {
+        ctx->attention_mask = *reinterpret_cast<at::Tensor*>(mask_ptr);
+    }
+}
+
+// Utility functions (kept for compatibility)
+__attribute__((visibility("default"))) void* qwen36_gemm(void* a_ptr, void* b_ptr, int transpose_b) {
+    auto& a = *reinterpret_cast<at::Tensor*>(a_ptr);
+    auto& b = *reinterpret_cast<at::Tensor*>(b_ptr);
+    if (transpose_b) return new at::Tensor(at::matmul(a, b.t()));
+    return new at::Tensor(at::matmul(a, b));
+}
+
+__attribute__((visibility("default"))) void qwen36_free_tensor(void* tensor_ptr) {
+    if (tensor_ptr) delete reinterpret_cast<at::Tensor*>(tensor_ptr);
+}
+
 // ── Multi-LoRA adapter management ──
 
-// Add a new LoRA adapter to the training context.
-// target_layers: array of layer indices (nullptr = all layers)
-// target_modules: comma-separated module names (nullptr = all modules)
-// Returns adapter ID (> 0) on success, -1 on failure.
+__attribute__((visibility("default")))
 int64_t qwen36_add_lora(
     void* ctx_ptr,
     int64_t rank, double alpha,
     const int64_t* target_layers, int64_t num_target_layers,
-    const char* target_modules_str  // "q_proj,k_proj,v_proj,o_proj" or nullptr for all
+    const char* target_modules_str
 ) {
     try {
         auto* ctx = reinterpret_cast<TrainingContext*>(ctx_ptr);
-        auto& kind = ctx->compute_type;
-
         TrainingContext::LoRAAdapter adapter;
         adapter.id = ++ctx->next_adapter_id;
         adapter.rank = rank;
         adapter.alpha = alpha;
-
-        // Build target layer set
         if (target_layers && num_target_layers > 0) {
             for (int64_t i = 0; i < num_target_layers; i++)
                 adapter.target_layers.insert(target_layers[i]);
         }
-
-        // Build target module set
         if (target_modules_str) {
             std::string s(target_modules_str);
             std::stringstream ss(s);
             std::string item;
-            while (std::getline(ss, item, ',')) {
+            while (std::getline(ss, item, ','))
                 adapter.target_modules.insert(item);
-            }
         }
-
-        // Create LoRA params for each target layer
         for (int64_t i = 0; i < ctx->num_layers; i++) {
             if (!adapter.target_layers.empty() && adapter.target_layers.find(i) == adapter.target_layers.end())
                 continue;
-
             int64_t w_offset = 0;
             for (int64_t j = 0; j < i; j++)
                 w_offset += weight_count_for_layer(ctx->layer_configs[j]);
-
             int64_t num_pairs;
             const int64_t* proj_indices;
             if (ctx->layer_configs[i].layer_type == 0) {
@@ -2109,7 +2046,6 @@ int64_t qwen36_add_lora(
                 proj_indices = linear_indices;
                 num_pairs = 3;
             }
-
             std::vector<std::pair<at::Tensor, at::Tensor>> pairs;
             std::vector<std::array<at::Tensor, 4>> adam_states;
             for (int k = 0; k < num_pairs; k++) {
@@ -2119,23 +2055,15 @@ int64_t qwen36_add_lora(
                 auto b = at::zeros({out_f, rank}, at::TensorOptions().dtype(at::kFloat).device(base->device()));
                 a.set_requires_grad(true);
                 b.set_requires_grad(true);
-                // Adam state: m_a, v_a, m_b, v_b
-                adam_states.push_back({
-                    at::zeros_like(a), at::zeros_like(a),
-                    at::zeros_like(b), at::zeros_like(b)
-                });
+                adam_states.push_back({at::zeros_like(a), at::zeros_like(a), at::zeros_like(b), at::zeros_like(b)});
                 pairs.emplace_back(std::move(a), std::move(b));
             }
             adapter.params[i] = std::move(pairs);
             adapter.adam_state[i] = std::move(adam_states);
         }
-
         int64_t id = adapter.id;
         ctx->adapters.push_back(std::move(adapter));
-        fprintf(stderr, "[q36_lora] added adapter %ld: rank=%ld alpha=%.1f layers=%s modules=%s\n",
-            (long)id, (long)rank, alpha,
-            adapter.target_layers.empty() ? "all" : "selected",
-            target_modules_str ? target_modules_str : "all");
+        fprintf(stderr, "[q36_lora] added adapter %ld: rank=%ld alpha=%.1f\n", (long)id, (long)rank, alpha);
         return id;
     } catch (const std::exception& e) {
         fprintf(stderr, "[q36_add_lora] FAILED: %s\n", e.what());
@@ -2143,68 +2071,49 @@ int64_t qwen36_add_lora(
     }
 }
 
-// Remove a LoRA adapter by ID.
+__attribute__((visibility("default")))
 int32_t qwen36_remove_lora(void* ctx_ptr, int64_t adapter_id) {
     auto* ctx = reinterpret_cast<TrainingContext*>(ctx_ptr);
     for (auto it = ctx->adapters.begin(); it != ctx->adapters.end(); ++it) {
         if (it->id == adapter_id) {
             ctx->adapters.erase(it);
-            fprintf(stderr, "[q36_lora] removed adapter %ld\n", (long)adapter_id);
             return 1;
         }
     }
     return 0;
 }
 
-// List all active adapter IDs. Fills the array and returns count.
+__attribute__((visibility("default")))
 int64_t qwen36_list_lora(void* ctx_ptr, int64_t* out_ids, int64_t max_count) {
     auto* ctx = reinterpret_cast<TrainingContext*>(ctx_ptr);
     int64_t count = (int64_t)ctx->adapters.size();
     if (count > max_count) count = max_count;
-    for (int64_t i = 0; i < count; i++) {
+    for (int64_t i = 0; i < count; i++)
         out_ids[i] = ctx->adapters[i].id;
-    }
     return count;
 }
 
-// Get total LoRA param count across all adapters.
+__attribute__((visibility("default")))
 int64_t qwen36_get_lora_count(void* ctx_ptr) {
     auto* ctx = reinterpret_cast<TrainingContext*>(ctx_ptr);
-    int64_t total = (int64_t)ctx->lora_a.size();  // legacy
-    for (auto& adapter : ctx->adapters) {
-        for (auto& [layer_idx, pairs] : adapter.params) {
-            total += (int64_t)pairs.size() * 2;  // a + b
-        }
-    }
+    int64_t total = (int64_t)ctx->lora_a.size();
+    for (auto& adapter : ctx->adapters)
+        for (auto& [layer_idx, pairs] : adapter.params)
+            total += (int64_t)pairs.size() * 2;
     return total;
 }
 
-// Eval step: forward + loss, no backward, no Adam update
+__attribute__((visibility("default")))
 double qwen36_eval_step(void* ctx_ptr, void* input_ids_ptr, void* target_mask_ptr, void* attention_mask_ptr) {
     try {
         auto* ctx = reinterpret_cast<TrainingContext*>(ctx_ptr);
         auto& input_ids = *reinterpret_cast<at::Tensor*>(input_ids_ptr);
         auto& target_mask = *reinterpret_cast<at::Tensor*>(target_mask_ptr);
-        if (attention_mask_ptr) {
+        if (attention_mask_ptr)
             ctx->attention_mask = *reinterpret_cast<at::Tensor*>(attention_mask_ptr);
-        }
-
-        // Forward (no grad)
         at::AutoGradMode no_grad(false);
-        auto hidden = ctx->use_checkpoint
-            ? forward_full_checkpoint(ctx, input_ids)
-            : forward_full(ctx, input_ids);
-
-        auto loss = compute_loss(hidden, input_ids, target_mask,
-            *ctx->final_norm_ptr, *ctx->lm_head_ptr, ctx->rms_eps, ctx->vocab_size);
-
-        // MTP loss
-        if (ctx->has_mtp) {
-            auto mtp_logits = mtp_forward(hidden, input_ids, ctx->embed_for_mtp, ctx->mtp, ctx->rms_eps);
-            auto mlp_loss = mtp_compute_loss(mtp_logits, input_ids, target_mask, ctx->vocab_size);
-            loss = loss + mlp_loss;
-        }
-
+        auto hidden = ctx->use_checkpoint ? forward_full_checkpoint(ctx, input_ids) : forward_full(ctx, input_ids);
+        auto loss = compute_loss(ctx, hidden, input_ids, target_mask, ctx->vocab_size);
         return loss.item<double>();
     } catch (const std::exception& e) {
         fprintf(stderr, "[q36_eval_step] FAILED: %s\n", e.what());
@@ -2212,14 +2121,12 @@ double qwen36_eval_step(void* ctx_ptr, void* input_ids_ptr, void* target_mask_pt
     }
 }
 
-// Get current step count
+__attribute__((visibility("default")))
 int64_t qwen36_get_step_count(void* ctx_ptr) {
-    auto* ctx = reinterpret_cast<TrainingContext*>(ctx_ptr);
-    return (int64_t)ctx->step_count;
+    return (int64_t)reinterpret_cast<TrainingContext*>(ctx_ptr)->step_count;
 }
 
-// Export optimizer state: returns count, fills arrays
-// Caller passes arrays of at::Tensor* pointers, filled with m and v tensors
+__attribute__((visibility("default")))
 int64_t qwen36_export_optimizer_state(void* ctx_ptr, void** m_ptrs, void** v_ptrs, int64_t max_count) {
     auto* ctx = reinterpret_cast<TrainingContext*>(ctx_ptr);
     int64_t count = (int64_t)ctx->adam_m.size();
@@ -2231,7 +2138,7 @@ int64_t qwen36_export_optimizer_state(void* ctx_ptr, void** m_ptrs, void** v_ptr
     return count;
 }
 
-// Import optimizer state: copy m/v from provided tensors
+__attribute__((visibility("default")))
 int64_t qwen36_import_optimizer_state(void* ctx_ptr, void** m_ptrs, void** v_ptrs, int64_t count) {
     auto* ctx = reinterpret_cast<TrainingContext*>(ctx_ptr);
     int64_t imported = 0;
@@ -2247,18 +2154,5 @@ int64_t qwen36_import_optimizer_state(void* ctx_ptr, void** m_ptrs, void** v_ptr
     return imported;
 }
 
-}
-
-// Utility functions (kept for compatibility)
-void* qwen36_gemm(void* a_ptr, void* b_ptr, int transpose_b) {
-    auto& a = *reinterpret_cast<at::Tensor*>(a_ptr);
-    auto& b = *reinterpret_cast<at::Tensor*>(b_ptr);
-    if (transpose_b) return new at::Tensor(at::matmul(a, b.t()));
-    return new at::Tensor(at::matmul(a, b));
-}
-
-void qwen36_free_tensor(void* tensor_ptr) {
-    if (tensor_ptr) delete reinterpret_cast<at::Tensor*>(tensor_ptr);
-}
 
 }  // extern "C"
