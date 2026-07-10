@@ -33,6 +33,9 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/v1/sessions/:id/save_checkpoint", post(save_checkpoint))
         .route("/v1/sessions/:id/load_checkpoint", post(load_checkpoint))
         .route("/v1/sessions/:id/export_adapter", post(export_adapter))
+        .route("/v1/sessions/:id/add_lora", post(add_lora))
+        .route("/v1/sessions/:id/remove_lora", post(remove_lora))
+        .route("/v1/sessions/:id/list_lora", get(list_lora))
         .route("/v1/sessions/:id/metrics", get(stream_metrics))
         .route("/v1/sessions/:id/status", get(get_status))
         .with_state(state)
@@ -386,6 +389,79 @@ async fn get_status(
         last_loss: status.last_loss,
         model_path: status.model_path,
     }))
+}
+
+#[derive(Deserialize)]
+struct AddLoRAHttp {
+    rank: i64,
+    alpha: f64,
+    target_layers: Vec<i64>,
+    target_modules: String,
+}
+#[derive(Serialize)]
+struct AddLoRAResponse {
+    adapter_id: i64,
+}
+
+async fn add_lora(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(req): Json<AddLoRAHttp>,
+) -> Result<Json<AddLoRAResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let session = state
+        .manager
+        .get_session(&id)
+        .await
+        .ok_or_else(|| err_resp("session not found"))?;
+    let mut s = session.lock().await;
+    let adapter_id = s
+        .add_lora(crate::session::AddLoRARequest {
+            rank: req.rank,
+            alpha: req.alpha,
+            target_layers: req.target_layers,
+            target_modules: req.target_modules,
+        })
+        .map_err(|e| err_resp(&e.to_string()))?;
+    Ok(Json(AddLoRAResponse { adapter_id }))
+}
+
+#[derive(Deserialize)]
+struct RemoveLoRAHttp {
+    adapter_id: i64,
+}
+#[derive(Serialize)]
+struct RemoveLoRAResponse {
+    removed: bool,
+}
+
+async fn remove_lora(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(req): Json<RemoveLoRAHttp>,
+) -> Result<Json<RemoveLoRAResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let session = state
+        .manager
+        .get_session(&id)
+        .await
+        .ok_or_else(|| err_resp("session not found"))?;
+    let mut s = session.lock().await;
+    let removed = s
+        .remove_lora(req.adapter_id)
+        .map_err(|e| err_resp(&e.to_string()))?;
+    Ok(Json(RemoveLoRAResponse { removed }))
+}
+
+async fn list_lora(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<Json<Vec<i64>>, (StatusCode, Json<ErrorResponse>)> {
+    let session = state
+        .manager
+        .get_session(&id)
+        .await
+        .ok_or_else(|| err_resp("session not found"))?;
+    let s = session.lock().await;
+    Ok(Json(s.list_lora()))
 }
 
 #[derive(Serialize)]

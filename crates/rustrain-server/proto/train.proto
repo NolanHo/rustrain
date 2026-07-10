@@ -12,6 +12,9 @@ service TrainService {
   rpc ExportAdapter(ExportAdapterRequest) returns (AdapterInfo);
   rpc StreamMetrics(StreamMetricsRequest) returns (stream StepMetric);
   rpc GetStatus(GetStatusRequest) returns (SessionStatus);
+  rpc AddLoRA(AddLoRARequest) returns (AddLoRAResponse);
+  rpc RemoveLoRA(RemoveLoRARequest) returns (RemoveLoRAResponse);
+  rpc ListLoRA(ListLoRARequest) returns (ListLoRAResponse);
 }
 
 message TensorData {
@@ -116,4 +119,30 @@ message SessionStatus {
   int64 step = 2;
   double last_loss = 3;
   string model_path = 4;
+}
+
+message AddLoRARequest {
+  string session_id = 1;
+  int64 rank = 2;
+  double alpha = 3;
+  repeated int64 target_layers = 4;
+  string target_modules = 5;  // comma-separated, empty = all
+}
+message AddLoRAResponse {
+  int64 adapter_id = 1;
+}
+
+message RemoveLoRARequest {
+  string session_id = 1;
+  int64 adapter_id = 2;
+}
+message RemoveLoRAResponse {
+  bool removed = 1;
+}
+
+message ListLoRARequest {
+  string session_id = 1;
+}
+message ListLoRAResponse {
+  repeated int64 adapter_ids = 1;
 }

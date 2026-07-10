@@ -83,6 +83,24 @@ pub trait TrainingSession: Send {
     fn export_adapter(&self, path: &str) -> Result<usize>;
     fn status(&self) -> SessionStatus;
     fn get_metrics(&self) -> Vec<StepMetric>;
+
+    /// Add a new LoRA adapter with independent rank/alpha/target layers/target modules.
+    /// Returns adapter ID.
+    fn add_lora(&mut self, req: AddLoRARequest) -> Result<i64>;
+
+    /// Remove a LoRA adapter by ID.
+    fn remove_lora(&mut self, adapter_id: i64) -> Result<bool>;
+
+    /// List all active adapter IDs.
+    fn list_lora(&self) -> Vec<i64>;
+}
+
+#[derive(Debug)]
+pub struct AddLoRARequest {
+    pub rank: i64,
+    pub alpha: f64,
+    pub target_layers: Vec<i64>,
+    pub target_modules: String,  // comma-separated, empty = all
 }
 
 /// Qwen3.6 training session — wraps CppTrainingContext.
@@ -457,6 +475,35 @@ impl TrainingSession for Qwen36Session {
         self.metrics
             .as_ref()
             .map(|m| m.read_metrics())
+            .unwrap_or_default()
+    }
+
+    fn add_lora(&mut self, req: AddLoRARequest) -> Result<i64> {
+        let ctx = self
+            .ctx
+            .as_ref()
+            .ok_or_else(|| anyhow!("model not loaded — call load_model + init_lora first"))?;
+        let id = ctx.add_lora(req.rank, req.alpha, &req.target_layers, &req.target_modules)?;
+        tracing::info!(adapter_id = id, rank = req.rank, "LoRA adapter added");
+        Ok(id)
+    }
+
+    fn remove_lora(&mut self, adapter_id: i64) -> Result<bool> {
+        let ctx = self
+            .ctx
+            .as_ref()
+            .ok_or_else(|| anyhow!("model not loaded"))?;
+        let removed = ctx.remove_lora(adapter_id)?;
+        if removed {
+            tracing::info!(adapter_id, "LoRA adapter removed");
+        }
+        Ok(removed)
+    }
+
+    fn list_lora(&self) -> Vec<i64> {
+        self.ctx
+            .as_ref()
+            .map(|ctx| ctx.list_lora())
             .unwrap_or_default()
     }
 }

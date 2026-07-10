@@ -256,6 +256,61 @@ impl TrainService for TrainServiceImpl {
             model_path: status.model_path,
         }))
     }
+
+    async fn add_lo_ra(
+        &self,
+        request: Request<train::AddLoRaRequest>,
+    ) -> Result<Response<train::AddLoRaResponse>, Status> {
+        let req = request.into_inner();
+        let session = self
+            .manager
+            .get_session(&req.session_id)
+            .await
+            .ok_or_else(|| Status::not_found("session not found"))?;
+        let mut s = session.lock().await;
+        let id = s
+            .add_lora(crate::session::AddLoRARequest {
+                rank: req.rank,
+                alpha: req.alpha,
+                target_layers: req.target_layers,
+                target_modules: req.target_modules,
+            })
+            .map_err(|e| Status::internal(e.to_string()))?;
+        Ok(Response::new(train::AddLoRaResponse { adapter_id: id }))
+    }
+
+    async fn remove_lo_ra(
+        &self,
+        request: Request<train::RemoveLoRaRequest>,
+    ) -> Result<Response<train::RemoveLoRaResponse>, Status> {
+        let req = request.into_inner();
+        let session = self
+            .manager
+            .get_session(&req.session_id)
+            .await
+            .ok_or_else(|| Status::not_found("session not found"))?;
+        let mut s = session.lock().await;
+        let removed = s
+            .remove_lora(req.adapter_id)
+            .map_err(|e| Status::internal(e.to_string()))?;
+        Ok(Response::new(train::RemoveLoRaResponse { removed }))
+    }
+
+    async fn list_lo_ra(
+        &self,
+        request: Request<train::ListLoRaRequest>,
+    ) -> Result<Response<train::ListLoRaResponse>, Status> {
+        let req = request.into_inner();
+        let session = self
+            .manager
+            .get_session(&req.session_id)
+            .await
+            .ok_or_else(|| Status::not_found("session not found"))?;
+        let s = session.lock().await;
+        Ok(Response::new(train::ListLoRaResponse {
+            adapter_ids: s.list_lora(),
+        }))
+    }
 }
 
 fn decode_tensor_data(td: &Option<TensorData>) -> Result<tch::Tensor, Status> {

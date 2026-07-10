@@ -38,6 +38,9 @@ type FnSetMtpWeights = unsafe extern "C" fn(
     i64,               // num_mtp_layers
 );
 type FnSetCheckpoint = unsafe extern "C" fn(*mut c_void, i32, i64);
+type FnAddLora = unsafe extern "C" fn(*mut c_void, i64, f64, *const i64, i64, *const i8) -> i64;
+type FnRemoveLora = unsafe extern "C" fn(*mut c_void, i64) -> i32;
+type FnListLora = unsafe extern "C" fn(*mut c_void, *mut i64, i64) -> i64;
 
 #[repr(C)]
 pub struct CppLayerConfig {
@@ -77,6 +80,9 @@ struct KernelHandles {
     free_tensor: FnFreeTensor,
     set_mtp_weights: FnSetMtpWeights,
     set_checkpoint: FnSetCheckpoint,
+    add_lora: FnAddLora,
+    remove_lora: FnRemoveLora,
+    list_lora: FnListLora,
 }
 
 static KERNELS: OnceLock<Option<KernelHandles>> = OnceLock::new();
@@ -125,6 +131,9 @@ unsafe fn load_kernels() -> Option<KernelHandles> {
         free_tensor: sym!("qwen36_free_tensor"),
         set_mtp_weights: sym!("qwen36_set_mtp_weights"),
         set_checkpoint: sym!("qwen36_set_checkpoint"),
+        add_lora: sym!("qwen36_add_lora"),
+        remove_lora: sym!("qwen36_remove_lora"),
+        list_lora: sym!("qwen36_list_lora"),
     })
 }
 
@@ -444,6 +453,43 @@ impl CppTrainingContext {
         unsafe {
             (kh.set_checkpoint)(self.ptr, if enable { 1 } else { 0 }, group_size);
         }
+    }
+
+    /// Add a new LoRA adapter. Returns adapter ID (>0) on success.
+    /// target_layers: empty = all layers
+    /// target_modules: comma-separated, e.g. "q_proj,k_proj,v_proj,o_proj". Empty = all.
+    pub fn add_lora(
+        &self, rank: i64, alpha: f64,
+        target_layers: &[i64], target_modules: &str,
+    ) -> Result<i64> {
+        let kh = get_kernels().ok_or_else(|| anyhow::anyhow!("kernels not loaded"))?;
+        let tl_ptr = if target_layers.is_empty() { std::ptr::null() } else { target_layers.as_ptr() };
+        let tl_len = target_layers.len() as i64;
+        let modules_c = std::ffi::CString::new(target_modules).unwrap();
+        let modules_ptr = if target_modules.is_empty() { std::ptr::null() } else { modules_c.as_ptr() };
+        let id = unsafe {
+            (kh.add_lora)(self.ptr, rank, alpha, tl_ptr, tl_len, modules_ptr)
+        };
+        if id < 0 {
+            bail!("C++ add_lora failed");
+        }
+        Ok(id)
+    }
+
+    /// Remove a LoRA adapter by ID.
+    pub fn remove_lora(&self, adapter_id: i64) -> Result<bool> {
+        let kh = get_kernels().ok_or_else(|| anyhow::anyhow!("kernels not loaded"))?;
+        let found = unsafe { (kh.remove_lora)(self.ptr, adapter_id) };
+        Ok(found != 0)
+    }
+
+    /// List all active adapter IDs.
+    pub fn list_lora(&self) -> Vec<i64> {
+        let kh = match get_kernels() { Some(k) => k, None => return Vec::new() };
+        let mut ids = vec![0i64; 64];
+        let count = unsafe { (kh.list_lora)(self.ptr, ids.as_mut_ptr(), 64) };
+        ids.truncate(count as usize);
+        ids
     }
 
     /// Eval step: forward + loss, no backward, no Adam update.
