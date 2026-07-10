@@ -26,7 +26,7 @@ struct TrainingContext;  // forward declaration (defined below)
 struct LayerConfig;
 
 // Forward declarations for functions defined after TrainingContext
-static at::Tensor apply_multi_lora(TrainingContext* ctx, int64_t layer_idx, int64_t pair_idx, const at::Tensor& base_weight);
+at::Tensor apply_multi_lora(TrainingContext* ctx, int64_t layer_idx, int64_t pair_idx, const at::Tensor& base_weight);
 
 // ──────────────────────────────────────────────────────────────────────
 // Forward declarations
@@ -798,7 +798,7 @@ struct TrainingContext {
     };
 
 // ── Multi-LoRA: concat all adapters' A/B, 2x GEMM ──
-static inline at::Tensor apply_multi_lora(
+inline at::Tensor apply_multi_lora(
     TrainingContext* ctx, int64_t layer_idx, int64_t pair_idx,
     const at::Tensor& base_weight
 ) {
