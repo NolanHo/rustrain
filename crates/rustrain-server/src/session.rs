@@ -203,7 +203,8 @@ impl TrainingSession for Qwen36Session {
         needed.insert(format!("{wp}embed_tokens.weight"));
         needed.insert(format!("{wp}norm.weight"));
         if !runtime_config.tie_word_embeddings {
-            needed.insert(format!("{wp}head.weight"));
+            // lm_head.weight is always at top level (no model prefix), even for multimodal models
+            needed.insert("lm_head.weight".to_string());
         }
         for layer in 0..n_layers {
             let p = format!("{wp}layers.{layer}");
