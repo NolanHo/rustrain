@@ -681,8 +681,31 @@ static at::Tensor moe_forward(
     // Each rank only has contributions from its local experts.
     // The non-local expert tokens are still zero — after all-reduce, every
     // rank gets the complete routed_output.
-    // EP all-reduce: temporarily disabled for debugging
-    if (false && nccl_comm_v) {
+    // EP all-reduce: sum routed_output across all EP ranks
+    if (nccl_comm_v) {
+        auto nccl_comm = reinterpret_cast<ncclComm_t>(nccl_comm_v);
+        auto stream = c10::cuda::getCurrentCUDAStream().stream();
+        // Ensure routed_output is contiguous and on current device
+        auto ro = routed_output.contiguous();
+        fprintf(stderr, "[ep_debug] ncclAllReduce: numel=%ld stream=%p comm=%p\n",
+                (long)ro.numel(), stream, (void*)nccl_comm);
+        ncclResult_t nccl_err = ncclAllReduce(
+            ro.data_ptr(),
+            ro.data_ptr(),
+            ro.numel(),
+            ncclBfloat16,
+            ncclSum,
+            nccl_comm,
+            stream
+        );
+        if (nccl_err != ncclSuccess) {
+            fprintf(stderr, "[ep_debug] ncclAllReduce FAILED: %d (%s)\n", nccl_err, ncclGetErrorString(nccl_err));
+        }
+        // Copy back if we made a contiguous copy
+        if (!ro.is_same(routed_output)) {
+            routed_output.copy_(ro);
+        }
+    }
         auto nccl_comm = reinterpret_cast<ncclComm_t>(nccl_comm_v);
         // Use compute stream directly for NCCL — avoids cross-device stream/event issues
         auto stream = c10::cuda::getCurrentCUDAStream().stream();
