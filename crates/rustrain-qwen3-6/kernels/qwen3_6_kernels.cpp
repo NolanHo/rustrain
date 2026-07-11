@@ -802,6 +802,11 @@ struct TrainingContext {
 
     std::vector<LoRAAdapter> adapters;
     int64_t next_adapter_id = 0;
+
+    // LoRA cache: pre-concatenated A/B per (layer, module) pair
+    // Invalidated when adapters change or after Adam update
+    bool lora_cache_valid = false;
+    std::map<int64_t, std::pair<at::Tensor, at::Tensor>> lora_cache;
     // Legacy single-LoRA (backward compat)
     std::vector<at::Tensor> lora_a;
     std::vector<at::Tensor> lora_b;
@@ -836,37 +841,69 @@ struct TrainingContext {
 };
 
 // ── Multi-LoRA: concat all adapters' A/B, 2x GEMM ──
+// Pre-build cache of concatenated A/B per (layer, module) pair.
+// Called once at start of forward; reused across all layers.
+
+static void precompute_lora_cache(TrainingContext* ctx) {
+    if (ctx->lora_cache_valid) return;
+    ctx->lora_cache.clear();
+
+    for (int64_t layer_idx = 0; layer_idx < ctx->num_layers; layer_idx++) {
+        int64_t num_pairs = (ctx->layer_configs[layer_idx].layer_type == 0) ? 4 : 3;
+        for (int64_t pair_idx = 0; pair_idx < num_pairs; pair_idx++) {
+            std::vector<at::Tensor> a_list, b_list;
+            for (auto& adapter : ctx->adapters) {
+                if (!adapter.target_layers.empty() && adapter.target_layers.find(layer_idx) == adapter.target_layers.end())
+                    continue;
+                auto it = adapter.params.find(layer_idx);
+                if (it == adapter.params.end()) continue;
+                if (pair_idx >= (int64_t)it->second.size()) continue;
+                auto& [a, b] = it->second[pair_idx];
+                double scaling = adapter.alpha / (double)adapter.rank;
+                b_list.push_back(b * scaling);
+                a_list.push_back(a);
+            }
+            if (a_list.empty()) {
+                if (!ctx->lora_a.empty() && layer_idx < (int64_t)ctx->lora_layer_offset.size()) {
+                    int64_t la_offset = ctx->lora_layer_offset[layer_idx];
+                    if (la_offset + pair_idx < (int64_t)ctx->lora_a.size()) {
+                        b_list.push_back(ctx->lora_b[la_offset + pair_idx] * ctx->lora_scaling);
+                        a_list.push_back(ctx->lora_a[la_offset + pair_idx]);
+                    }
+                }
+            }
+            if (!a_list.empty()) {
+                at::Tensor a_concat, b_concat;
+                if (a_list.size() == 1) {
+                    a_concat = a_list[0];
+                    b_concat = b_list[0];
+                } else {
+                    a_concat = at::cat(a_list, 0);
+                    b_concat = at::cat(b_list, 1);
+                }
+                ctx->lora_cache[layer_idx * 10 + pair_idx] = {a_concat, b_concat};
+            }
+        }
+    }
+    ctx->lora_cache_valid = true;
+}
+
 __attribute__((noinline, visibility("default")))
 at::Tensor apply_multi_lora(
     TrainingContext* ctx, int64_t layer_idx, int64_t pair_idx,
     const at::Tensor& base_weight
 ) {
-    std::vector<at::Tensor> a_list, b_list;
-    for (auto& adapter : ctx->adapters) {
-        if (!adapter.target_layers.empty() && adapter.target_layers.find(layer_idx) == adapter.target_layers.end())
-            continue;
-        auto it = adapter.params.find(layer_idx);
-        if (it == adapter.params.end()) continue;
-        if (pair_idx >= (int64_t)it->second.size()) continue;
-        auto& [a, b] = it->second[pair_idx];
-        double scaling = adapter.alpha / (double)adapter.rank;
-        b_list.push_back(b * scaling);
-        a_list.push_back(a);
+    auto it = ctx->lora_cache.find(layer_idx * 10 + pair_idx);
+    if (it == ctx->lora_cache.end()) return base_weight;
+
+    auto& [a_concat, b_concat] = it->second;
+    // Single adapter: use lora_delta (converts to base dtype internally)
+    // Multiple adapters: matmul then convert to base dtype
+    int64_t a_rows = a_concat.size(0);
+    if (a_rows == a_concat.size(0) && ctx->adapters.size() <= 1 && ctx->lora_a.empty()) {
+        // Single adapter path — direct lora_delta
+        return lora_delta(base_weight, a_concat, b_concat, 1.0);
     }
-    if (a_list.empty()) {
-        // No adapters — try legacy LoRA (only for layers that have it)
-        if (!ctx->lora_a.empty() && layer_idx < (int64_t)ctx->lora_layer_offset.size()) {
-            int64_t la_offset = ctx->lora_layer_offset[layer_idx];
-            if (la_offset + pair_idx < (int64_t)ctx->lora_a.size()) {
-                b_list.push_back(ctx->lora_b[la_offset + pair_idx] * ctx->lora_scaling);
-                a_list.push_back(ctx->lora_a[la_offset + pair_idx]);
-            }
-        }
-    }
-    if (a_list.empty()) return base_weight;
-    if (a_list.size() == 1) return lora_delta(base_weight, a_list[0], b_list[0], 1.0);
-    auto a_concat = at::cat(a_list, 0);
-    auto b_concat = at::cat(b_list, 1);
     auto delta = at::matmul(b_concat, a_concat);
     return base_weight + delta.to(base_weight.scalar_type());
 }
@@ -1059,6 +1096,7 @@ static at::Tensor forward_full(
     TrainingContext* ctx,
     const at::Tensor& input_ids
 ) {
+    precompute_lora_cache(ctx);
     auto kind = ctx->compute_type;
     auto embed = *ctx->embed_ptr[0];
     auto final_norm = *ctx->final_norm_ptr[0];
@@ -1310,6 +1348,7 @@ static at::Tensor forward_full_checkpoint(
     TrainingContext* ctx,
     const at::Tensor& input_ids
 ) {
+    precompute_lora_cache(ctx);
     auto embed = *ctx->embed_ptr[0];
     at::Tensor hidden = at::embedding(embed, input_ids);
 
@@ -1892,6 +1931,7 @@ __attribute__((visibility("default"))) double qwen36_train_step(
         // Adam optimizer step (no grad)
         at::AutoGradMode guard(false);
         ctx->step_count++;
+        ctx->lora_cache_valid = false;  // invalidate cache after Adam update
         double step_f = (double)ctx->step_count;
         double bias_correction1 = 1.0 - std::pow(ctx->beta1, step_f);
         double bias_correction2 = 1.0 - std::pow(ctx->beta2, step_f);
@@ -2077,6 +2117,7 @@ int64_t qwen36_add_lora(
         }
         int64_t id = adapter.id;
         ctx->adapters.push_back(std::move(adapter));
+        ctx->lora_cache_valid = false;
         fprintf(stderr, "[q36_lora] added adapter %ld: rank=%ld alpha=%.1f\n", (long)id, (long)rank, alpha);
         return id;
     } catch (const std::exception& e) {
@@ -2091,6 +2132,7 @@ int32_t qwen36_remove_lora(void* ctx_ptr, int64_t adapter_id) {
     for (auto it = ctx->adapters.begin(); it != ctx->adapters.end(); ++it) {
         if (it->id == adapter_id) {
             ctx->adapters.erase(it);
+            ctx->lora_cache_valid = false;
             return 1;
         }
     }
