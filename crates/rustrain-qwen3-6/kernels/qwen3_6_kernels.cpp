@@ -953,26 +953,27 @@ static void precompute_lora_cache(TrainingContext* ctx) {
         }
     }
 
-    // Phase 3: for each group, stack and bmm
+    // Phase 3: for each group, stack and bmm in BF16 (2x faster tensor cores)
+    // LoRA params are FP32 for gradient stability; cast to BF16 for matmul only.
+    // Autograd handles the cast backward (grad → FP32 automatically).
+    auto bf16 = at::kBFloat16;
     for (auto& g : groups) {
         int n = (int)g.indices.size();
         if (n == 1) {
-            // Single entry — direct matmul (no stack overhead)
             auto& e = entries[g.indices[0]];
-            ctx->lora_cache[e.key] = at::matmul(e.b_concat, e.a_concat);
+            auto delta = at::matmul(e.b_concat.to(bf16), e.a_concat.to(bf16));
+            ctx->lora_cache[e.key] = delta;  // already BF16
         } else {
-            // Stack into [N, out, sum_ranks] and [N, sum_ranks, in], then bmm
             std::vector<at::Tensor> b_stack_vec, a_stack_vec;
             b_stack_vec.reserve(n);
             a_stack_vec.reserve(n);
             for (auto idx : g.indices) {
-                b_stack_vec.push_back(entries[idx].b_concat);
-                a_stack_vec.push_back(entries[idx].a_concat);
+                b_stack_vec.push_back(entries[idx].b_concat.to(bf16));
+                a_stack_vec.push_back(entries[idx].a_concat.to(bf16));
             }
-            auto b_stack = at::stack(b_stack_vec, 0);  // [N, out, sum_ranks]
-            auto a_stack = at::stack(a_stack_vec, 0);  // [N, sum_ranks, in]
-            auto deltas = at::bmm(b_stack, a_stack);   // [N, out, in]
-            // Unstack and store
+            auto b_stack = at::stack(b_stack_vec, 0);  // [N, out, sum_ranks] BF16
+            auto a_stack = at::stack(a_stack_vec, 0);  // [N, sum_ranks, in] BF16
+            auto deltas = at::bmm(b_stack, a_stack);   // [N, out, in] BF16
             for (int i = 0; i < n; i++) {
                 ctx->lora_cache[entries[g.indices[i]].key] = deltas[i];
             }
@@ -990,9 +991,9 @@ at::Tensor apply_multi_lora(
     auto it = ctx->lora_cache.find(layer_idx * 10 + pair_idx);
     if (it == ctx->lora_cache.end()) return base_weight;
 
-    // Cached delta_weight = b_concat @ a_concat (precomputed in batched bmm)
+    // Cached delta_weight = b_concat @ a_concat (BF16, precomputed in batched bmm)
     auto& delta = it->second;
-    return base_weight + delta.to(base_weight.scalar_type());
+    return base_weight + delta;  // both BF16, no conversion needed
 }
 
 // Forward declarations for sub-layer checkpointing
