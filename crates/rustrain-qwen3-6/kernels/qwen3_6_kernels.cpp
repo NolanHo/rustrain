@@ -683,14 +683,8 @@ static at::Tensor moe_forward(
     // rank gets the complete routed_output.
     if (nccl_comm_v) {
         auto nccl_comm = reinterpret_cast<ncclComm_t>(nccl_comm_v);
-        auto nccl_stream = reinterpret_cast<cudaStream_t>(nccl_stream_v);
+        // Use compute stream directly for NCCL — avoids cross-device stream/event issues
         auto stream = c10::cuda::getCurrentCUDAStream().stream();
-        // Wait for compute stream to finish writing routed_output
-        cudaEvent_t ev;
-        cudaEventCreate(&ev);
-        cudaEventRecord(ev, stream);
-        cudaStreamWaitEvent(nccl_stream, ev, 0);
-        // All-reduce on nccl_stream
         ncclAllReduce(
             routed_output.data_ptr(),
             routed_output.data_ptr(),
@@ -698,15 +692,8 @@ static at::Tensor moe_forward(
             ncclBfloat16,
             ncclSum,
             nccl_comm,
-            nccl_stream
+            stream
         );
-        // Wait for nccl to finish before compute stream uses result
-        cudaEvent_t ev2;
-        cudaEventCreate(&ev2);
-        cudaEventRecord(ev2, nccl_stream);
-        cudaStreamWaitEvent(stream, ev2, 0);
-        cudaEventDestroy(ev);
-        cudaEventDestroy(ev2);
     }
 
     // Shared expert (same as before, with fused SwiGLU)
