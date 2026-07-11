@@ -323,18 +323,6 @@ impl TrainingSession for Qwen36Session {
             }
         }
 
-        // Create NCCL communicator for EP — directly in C++ (avoids Rust wrapper issues)
-        let nccl_comm = if is_ep {
-            let ret = ctx.init_nccl();
-            if ret != 0 {
-                return Err(anyhow!("C++ NCCL init failed (code {})", ret));
-            }
-            tracing::info!(ep_rank, ep_world_size, "NCCL communicator created in C++ for EP");
-            Some(())  // marker, comm stored in C++ TrainingContext
-        } else {
-            None
-        };
-
         // Create C++ training context
         // If target_layers is empty, it means "all layers"
         let all_layers: Vec<usize> = if req.target_layers.is_empty() {
@@ -358,13 +346,22 @@ impl TrainingSession for Qwen36Session {
             expert_count,
         )?;
 
-        // Set NCCL communicator on C++ context for EP all-reduce
-        // (already done by init_nccl above)
+        // Initialize NCCL communicator for EP — directly in C++
+        let nccl_ep = if is_ep {
+            let ret = ctx.init_nccl();
+            if ret != 0 {
+                return Err(anyhow!("C++ NCCL init failed (code {})", ret));
+            }
+            tracing::info!(ep_rank, ep_world_size, "NCCL communicator created in C++ for EP");
+            true
+        } else {
+            false
+        };
 
         let count = ctx.lora_count() as usize;
         self.ctx = Some(ctx);
         self.weights = Some(weights);  // Keep alive — C++ holds raw pointers
-        self._nccl_ep = nccl_comm.is_some();
+        self._nccl_ep = nccl_ep;
         self.lora_rank = req.rank;
         self.lora_alpha = req.alpha;
         self.lr = req.lr;
