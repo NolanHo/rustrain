@@ -2032,7 +2032,11 @@ __attribute__((visibility("default"))) double qwen36_train_step(
         }
 
         int n_params = (int)h_params.size();
-        if (n_params > 0) {
+        // Hybrid: use CUDA multi-tensor kernel for large param counts (saves launch overhead).
+        // For small counts (< 500 params ≈ 2 adapters), ATen in-place ops have less setup overhead.
+        constexpr int CUDA_ADAM_THRESHOLD = 500;
+        if (n_params > CUDA_ADAM_THRESHOLD) {
+            // ── CUDA multi-tensor fused Adam: 1 launch for all params ──
             // Ensure device buffers are large enough
             ctx->adam_dev_bufs.ensure(n_params, ctx->lora_a.empty()
                 ? ctx->adapters[0].params.begin()->second[0].first
@@ -2066,6 +2070,64 @@ __attribute__((visibility("default"))) double qwen36_train_step(
                 one_minus_b1, one_minus_b2,
                 (void*)stream
             );
+        } else {
+            // ── ATen in-place fallback for small param counts ──
+            // Multi-LoRA adapters
+            for (auto& adapter : ctx->adapters) {
+                for (auto& [layer_idx, pairs] : adapter.params) {
+                    auto& adam_states = adapter.adam_state[layer_idx];
+                    for (size_t i = 0; i < pairs.size(); i++) {
+                        auto& [a, b] = pairs[i];
+                        auto& [m_a, v_a, m_b, v_b] = adam_states[i];
+                        if (a.grad().defined()) {
+                            m_a.mul_(ctx->beta1).add_(a.grad(), 1.0 - ctx->beta1);
+                            v_a.mul_(ctx->beta2).addcmul_(a.grad(), a.grad(), 1.0 - ctx->beta2);
+                            auto denom = v_a.sqrt().add_(ctx->eps);
+                            a.addcdiv_(m_a, denom, -lr_scaled);
+                            a.grad().zero_();
+                        }
+                        if (b.grad().defined()) {
+                            m_b.mul_(ctx->beta1).add_(b.grad(), 1.0 - ctx->beta1);
+                            v_b.mul_(ctx->beta2).addcmul_(b.grad(), b.grad(), 1.0 - ctx->beta2);
+                            auto denom = v_b.sqrt().add_(ctx->eps);
+                            b.addcdiv_(m_b, denom, -lr_scaled);
+                            b.grad().zero_();
+                        }
+                    }
+                }
+            }
+            // Legacy single-LoRA
+            size_t legacy_idx = 0;
+            for (size_t i = 0; i < ctx->lora_a.size(); i++) {
+                {
+                    auto& param = ctx->lora_a[i];
+                    auto& grad = param.grad();
+                    if (grad.defined()) {
+                        auto& m = ctx->adam_m[legacy_idx];
+                        auto& v = ctx->adam_v[legacy_idx];
+                        m.mul_(ctx->beta1).add_(grad, 1.0 - ctx->beta1);
+                        v.mul_(ctx->beta2).addcmul_(grad, grad, 1.0 - ctx->beta2);
+                        auto denom = v.sqrt().add_(ctx->eps);
+                        param.addcdiv_(m, denom, -lr_scaled);
+                        param.grad().zero_();
+                    }
+                }
+                legacy_idx++;
+                {
+                    auto& param = ctx->lora_b[i];
+                    auto& grad = param.grad();
+                    if (grad.defined()) {
+                        auto& m = ctx->adam_m[legacy_idx];
+                        auto& v = ctx->adam_v[legacy_idx];
+                        m.mul_(ctx->beta1).add_(grad, 1.0 - ctx->beta1);
+                        v.mul_(ctx->beta2).addcmul_(grad, grad, 1.0 - ctx->beta2);
+                        auto denom = v.sqrt().add_(ctx->eps);
+                        param.addcdiv_(m, denom, -lr_scaled);
+                        param.grad().zero_();
+                    }
+                }
+                legacy_idx++;
+            }
         }
 
         return loss_val;
