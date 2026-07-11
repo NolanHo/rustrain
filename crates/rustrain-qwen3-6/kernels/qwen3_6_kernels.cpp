@@ -612,7 +612,7 @@ static at::Tensor dense_mlp_forward(
 // ──────────────────────────────────────────────────────────────────────
 
 static at::Tensor moe_forward(
-    ncclComm_t nccl_comm, cudaStream_t nccl_stream,
+    void* nccl_comm_v, void* nccl_stream_v,
     const at::Tensor& hidden,
     const at::Tensor& gate_w, const at::Tensor& shared_expert_gate_w,
     const at::Tensor& shared_gate_proj, const at::Tensor& shared_up_proj, const at::Tensor& shared_down_proj,
@@ -681,7 +681,9 @@ static at::Tensor moe_forward(
     // Each rank only has contributions from its local experts.
     // The non-local expert tokens are still zero — after all-reduce, every
     // rank gets the complete routed_output.
-    if (nccl_comm) {
+    if (nccl_comm_v) {
+        auto nccl_comm = reinterpret_cast<ncclComm_t>(nccl_comm_v);
+        auto nccl_stream = reinterpret_cast<cudaStream_t>(nccl_stream_v);
         auto stream = c10::cuda::getCurrentCUDAStream().stream();
         // Wait for compute stream to finish writing routed_output
         cudaEvent_t ev;
@@ -736,6 +738,11 @@ struct LayerConfig {
     int64_t num_experts, top_k, moe_intermediate, expert_start, expert_count;
     int64_t intermediate_size;  // dense MLP intermediate size (0 for MoE)
     int32_t norm_topk_prob;
+    // NCCL handles for EP all-reduce (set per-layer from TrainingContext)
+    // nullptr when single-GPU. Stored here so moe_forward can access them
+    // without needing the full TrainingContext definition.
+    void* nccl_comm = nullptr;
+    void* nccl_stream = nullptr;
 };
 
 // Weight count per layer: dense has 3 MLP weights, MoE has 7 MoE weights.
@@ -772,7 +779,7 @@ static at::Tensor forward_single_layer(
             attention_mask);
         auto post_attn = rms_norm(hidden + attn_output, post_norm, cfg->rms_eps);
         if (is_moe) {
-            auto mlp_out = moe_forward(ctx->nccl_comm, ctx->nccl_stream, post_attn,
+            auto mlp_out = moe_forward(cfg->nccl_comm, cfg->nccl_stream, post_attn,
                 *w[8], *w[9], *w[10], *w[11], *w[12], *w[13], *w[14],
                 cfg->num_experts, cfg->top_k, cfg->moe_intermediate,
                 cfg->norm_topk_prob != 0, cfg->expert_start, cfg->expert_count, kind);
@@ -805,7 +812,7 @@ static at::Tensor forward_single_layer(
             cfg->conv_kernel, cfg->rms_eps, kind);
         auto post_attn = rms_norm(hidden + attn_output, post_norm, cfg->rms_eps);
         if (is_moe) {
-            auto mlp_out = moe_forward(ctx->nccl_comm, ctx->nccl_stream, post_attn,
+            auto mlp_out = moe_forward(cfg->nccl_comm, cfg->nccl_stream, post_attn,
                 *w[11], *w[12], *w[13], *w[14], *w[15], *w[16], *w[17],
                 cfg->num_experts, cfg->top_k, cfg->moe_intermediate,
                 cfg->norm_topk_prob != 0, cfg->expert_start, cfg->expert_count, kind);
@@ -1099,7 +1106,7 @@ at::Tensor compute_mlp_only(
     int64_t mlp_start = (cfg.layer_type == 0) ? 8 : 11;
     auto post_attn = rms_norm(residual, *ctx->weight_ptrs[w_offset + 1], cfg.rms_eps);
     if (cfg.num_experts > 0) {
-        return moe_forward(ctx->nccl_comm, ctx->nccl_stream, post_attn,
+        return moe_forward(cfg.nccl_comm, cfg.nccl_stream, post_attn,
             *ctx->weight_ptrs[w_offset+mlp_start], *ctx->weight_ptrs[w_offset+mlp_start+1],
             *ctx->weight_ptrs[w_offset+mlp_start+2], *ctx->weight_ptrs[w_offset+mlp_start+3],
             *ctx->weight_ptrs[w_offset+mlp_start+4], *ctx->weight_ptrs[w_offset+mlp_start+5],
@@ -2206,6 +2213,15 @@ __attribute__((visibility("default"))) void qwen36_set_nccl_comm(
     ctx->nccl_stream = reinterpret_cast<cudaStream_t>(stream_ptr);
     ctx->ep_rank = ep_rank;
     ctx->ep_world_size = ep_world_size;
+    // Propagate NCCL handles to all layer configs so moe_forward can access them
+    for (auto& lc : ctx->layer_configs) {
+        lc.nccl_comm = comm_ptr;
+        lc.nccl_stream = stream_ptr;
+    }
+    for (auto& lc : ctx->mtp_layer_configs) {
+        lc.nccl_comm = comm_ptr;
+        lc.nccl_stream = stream_ptr;
+    }
 }
 
 // Enable/disable gradient checkpointing
