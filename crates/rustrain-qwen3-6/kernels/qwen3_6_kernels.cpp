@@ -706,19 +706,6 @@ static at::Tensor moe_forward(
             routed_output.copy_(ro);
         }
     }
-        auto nccl_comm = reinterpret_cast<ncclComm_t>(nccl_comm_v);
-        // Use compute stream directly for NCCL — avoids cross-device stream/event issues
-        auto stream = c10::cuda::getCurrentCUDAStream().stream();
-        ncclAllReduce(
-            routed_output.data_ptr(),
-            routed_output.data_ptr(),
-            routed_output.numel(),
-            ncclBfloat16,
-            ncclSum,
-            nccl_comm,
-            stream
-        );
-    }
 
     // Shared expert (same as before, with fused SwiGLU)
     auto shared_gate = at::matmul(flat, shared_gate_proj.t());
