@@ -21,6 +21,8 @@
 #include <array>
 #include <map>
 #include <sstream>
+#include <sys/stat.h>
+#include <unistd.h>
 
 // NCCL for Expert Parallel all-reduce
 #include <nccl.h>
