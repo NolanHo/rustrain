@@ -120,8 +120,8 @@ pub struct Qwen36Session {
     metrics: Option<Arc<FileMetricsSink>>,
     last_loss: f64,
     step: u64,
-    // NCCL communicator for EP (kept alive to prevent drop)
-    _nccl_comm: Option<rustrain_nccl::nccl::NcclPersistentComm>,
+    // NCCL marker for EP (comm stored in C++ TrainingContext)
+    _nccl_ep: bool,
 }
 
 // SAFETY: CppTrainingContext holds a raw pointer to C++ TrainingContext.
@@ -146,7 +146,7 @@ impl Qwen36Session {
             metrics: Some(Arc::new(FileMetricsSink::new(metrics_path))),
             last_loss: 0.0,
             step: 0,
-            _nccl_comm: None,
+            _nccl_ep: false,
         }
     }
 }
@@ -323,13 +323,14 @@ impl TrainingSession for Qwen36Session {
             }
         }
 
-        // Create NCCL communicator for EP
+        // Create NCCL communicator for EP — directly in C++ (avoids Rust wrapper issues)
         let nccl_comm = if is_ep {
-            let comm_dir = std::path::Path::new("/tmp/rustrain-nccl");
-            let comm = rustrain_nccl::nccl::NcclPersistentComm::new(comm_dir)
-                .map_err(|e| anyhow!("NCCL comm init failed: {}", e))?;
-            tracing::info!(ep_rank, ep_world_size, "NCCL communicator created for EP");
-            Some(comm)
+            let ret = ctx.init_nccl();
+            if ret != 0 {
+                return Err(anyhow!("C++ NCCL init failed (code {})", ret));
+            }
+            tracing::info!(ep_rank, ep_world_size, "NCCL communicator created in C++ for EP");
+            Some(())  // marker, comm stored in C++ TrainingContext
         } else {
             None
         };
@@ -358,19 +359,12 @@ impl TrainingSession for Qwen36Session {
         )?;
 
         // Set NCCL communicator on C++ context for EP all-reduce
-        if let Some(ref comm) = nccl_comm {
-            ctx.set_nccl_comm(
-                comm.raw_comm_ptr(),
-                comm.raw_stream_ptr(),
-                ep_rank as i32,
-                ep_world_size as i32,
-            );
-        }
+        // (already done by init_nccl above)
 
         let count = ctx.lora_count() as usize;
         self.ctx = Some(ctx);
         self.weights = Some(weights);  // Keep alive — C++ holds raw pointers
-        self._nccl_comm = nccl_comm;
+        self._nccl_ep = nccl_comm.is_some();
         self.lora_rank = req.rank;
         self.lora_alpha = req.alpha;
         self.lr = req.lr;

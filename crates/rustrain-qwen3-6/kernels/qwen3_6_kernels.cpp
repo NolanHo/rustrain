@@ -684,27 +684,23 @@ static at::Tensor moe_forward(
     // EP all-reduce: sum routed_output across all EP ranks
     if (nccl_comm_v) {
         auto nccl_comm = reinterpret_cast<ncclComm_t>(nccl_comm_v);
-        auto stream = c10::cuda::getCurrentCUDAStream().stream();
-        auto ro = routed_output.contiguous();
-        // Synchronize before NCCL — ensure all prior ops on this stream are done
-        cudaStreamSynchronize(stream);
+        auto nccl_stream = reinterpret_cast<cudaStream_t>(nccl_stream_v);
+        auto compute_stream = c10::cuda::getCurrentCUDAStream().stream();
+        // Sync compute stream, then run NCCL on dedicated NCCL stream
+        cudaStreamSynchronize(compute_stream);
         ncclResult_t nccl_err = ncclAllReduce(
-            ro.data_ptr(),
-            ro.data_ptr(),
-            ro.numel(),
+            routed_output.data_ptr(),
+            routed_output.data_ptr(),
+            routed_output.numel(),
             ncclBfloat16,
             ncclSum,
             nccl_comm,
-            stream
+            nccl_stream
         );
         if (nccl_err != ncclSuccess) {
             fprintf(stderr, "[ep_debug] ncclAllReduce FAILED: %d (%s)\n", nccl_err, ncclGetErrorString(nccl_err));
         }
-        // Synchronize after NCCL — ensure all-reduce is done before continuing
-        cudaStreamSynchronize(stream);
-        if (!ro.is_same(routed_output)) {
-            routed_output.copy_(ro);
-        }
+        cudaStreamSynchronize(nccl_stream);
     }
 
     // Shared expert (same as before, with fused SwiGLU)
@@ -2203,9 +2199,83 @@ __attribute__((visibility("default"))) void qwen36_free_training_context(void* c
 }
 
 // Set NCCL communicator for Expert Parallel all-reduce
-// comm_ptr: ncclComm_t* (raw pointer from Rust NcclPersistentComm)
-// stream_ptr: cudaStream_t* (raw pointer from Rust NcclPersistentComm)
-// ep_rank, ep_world_size: EP topology
+// Creates NCCL communicator directly in C++ using env vars RANK/WORLD_SIZE.
+// Rank 0 generates unique ID and writes to /tmp/rustrain-nccl/nccl-id.bin
+// Other ranks read it. All ranks call ncclCommInitRank.
+// Returns 0 on success, -1 on failure.
+__attribute__((visibility("default"))) int32_t qwen36_init_nccl(
+    void* ctx_ptr
+) {
+    auto* ctx = reinterpret_cast<TrainingContext*>(ctx_ptr);
+
+    const char* rank_str = getenv("RANK");
+    const char* world_str = getenv("WORLD_SIZE");
+    if (!rank_str || !world_str) return -1;
+    int rank = atoi(rank_str);
+    int world_size = atoi(world_str);
+    if (world_size <= 1) return 0;  // no EP needed
+
+    // Set CUDA device
+    const char* local_rank_str = getenv("LOCAL_RANK");
+    int local_rank = local_rank_str ? atoi(local_rank_str) : rank;
+    cudaSetDevice(local_rank);
+
+    // Exchange unique ID via file
+    const char* id_path = "/tmp/rustrain-nccl/nccl-id.bin";
+    ncclUniqueId unique_id;
+    if (rank == 0) {
+        mkdir("/tmp/rustrain-nccl", 0777);
+        ncclGetUniqueId(&unique_id);
+        FILE* f = fopen(id_path, "wb");
+        fwrite(&unique_id, sizeof(unique_id), 1, f);
+        fclose(f);
+    } else {
+        // Wait for rank 0 to write the ID file
+        for (int i = 0; i < 600; i++) {  // 60 second timeout
+            FILE* f = fopen(id_path, "rb");
+            if (f) {
+                if (fread(&unique_id, sizeof(unique_id), 1, f) == 1) {
+                    fclose(f);
+                    break;
+                }
+                fclose(f);
+            }
+            usleep(100000);  // 100ms
+        }
+    }
+
+    // Initialize communicator
+    ncclComm_t comm;
+    ncclResult_t err = ncclCommInitRank(&comm, world_size, unique_id, rank);
+    if (err != ncclSuccess) {
+        fprintf(stderr, "[ep_nccl] ncclCommInitRank failed: %d (%s)\n", err, ncclGetErrorString(err));
+        return -1;
+    }
+
+    // Create dedicated NCCL stream on current device
+    cudaStream_t nccl_stream;
+    cudaStreamCreate(&nccl_stream);
+
+    ctx->nccl_comm = comm;
+    ctx->nccl_stream = nccl_stream;
+    ctx->ep_rank = rank;
+    ctx->ep_world_size = world_size;
+
+    // Propagate to layer configs
+    for (auto& lc : ctx->layer_configs) {
+        lc.nccl_comm = (void*)comm;
+        lc.nccl_stream = (void*)nccl_stream;
+    }
+    for (auto& lc : ctx->mtp_layer_configs) {
+        lc.nccl_comm = (void*)comm;
+        lc.nccl_stream = (void*)nccl_stream;
+    }
+
+    fprintf(stderr, "[ep_nccl] rank=%d world=%d comm=%p stream=%p\n", rank, world_size, (void*)comm, (void*)nccl_stream);
+    return 0;
+}
+
+// Set NCCL communicator for Expert Parallel all-reduce (legacy, from Rust)
 __attribute__((visibility("default"))) void qwen36_set_nccl_comm(
     void* ctx_ptr, void* comm_ptr, void* stream_ptr,
     int32_t ep_rank, int32_t ep_world_size

@@ -39,6 +39,7 @@ type FnSetMtpWeights = unsafe extern "C" fn(
 );
 type FnSetCheckpoint = unsafe extern "C" fn(*mut c_void, i32, i64);
 type FnSetNcclComm = unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void, i32, i32);
+type FnInitNccl = unsafe extern "C" fn(*mut c_void) -> i32;
 type FnAddLora = unsafe extern "C" fn(*mut c_void, i64, f64, *const i64, i64, *const i8) -> i64;
 type FnRemoveLora = unsafe extern "C" fn(*mut c_void, i64) -> i32;
 type FnListLora = unsafe extern "C" fn(*mut c_void, *mut i64, i64) -> i64;
@@ -85,6 +86,7 @@ struct KernelHandles {
     set_mtp_weights: FnSetMtpWeights,
     set_checkpoint: FnSetCheckpoint,
     set_nccl_comm: FnSetNcclComm,
+    init_nccl: FnInitNccl,
     add_lora: FnAddLora,
     remove_lora: FnRemoveLora,
     list_lora: FnListLora,
@@ -137,6 +139,7 @@ unsafe fn load_kernels() -> Option<KernelHandles> {
         set_mtp_weights: sym!("qwen36_set_mtp_weights"),
         set_checkpoint: sym!("qwen36_set_checkpoint"),
         set_nccl_comm: sym!("qwen36_set_nccl_comm"),
+        init_nccl: sym!("qwen36_init_nccl"),
         add_lora: sym!("qwen36_add_lora"),
         remove_lora: sym!("qwen36_remove_lora"),
         list_lora: sym!("qwen36_list_lora"),
@@ -473,6 +476,14 @@ impl CppTrainingContext {
         unsafe {
             (kh.set_nccl_comm)(self.ptr, comm_ptr, stream_ptr, ep_rank, ep_world_size);
         }
+    }
+
+    /// Initialize NCCL communicator directly in C++ (preferred over set_nccl_comm).
+    /// Reads RANK/WORLD_SIZE/LOCAL_RANK from env vars.
+    /// Returns 0 on success, -1 on failure.
+    pub fn init_nccl(&self) -> i32 {
+        let kh = get_kernels().expect("kernels not loaded");
+        unsafe { (kh.init_nccl)(self.ptr) }
     }
 
     /// Add a new LoRA adapter. Returns adapter ID (>0) on success.
