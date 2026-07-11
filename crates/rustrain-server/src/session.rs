@@ -185,16 +185,8 @@ impl TrainingSession for Qwen36Session {
             .model_path
             .as_ref()
             .ok_or_else(|| anyhow!("model not loaded"))?;
-        let config_toml = self
-            .config_toml
-            .as_ref()
-            .ok_or_else(|| anyhow!("config not set"))?;
 
-        // Parse config
-        let config: rustrain_core::runtime::Config =
-            toml::from_str(config_toml).context("parse config_toml")?;
-
-        // Load runtime config from model
+        // Load runtime config from model's config.json (no need to parse full TOML)
         let model_path_obj = std::path::Path::new(model_path);
         let runtime_config =
             rustrain_qwen3_6::config::read_qwen36_runtime_config(
