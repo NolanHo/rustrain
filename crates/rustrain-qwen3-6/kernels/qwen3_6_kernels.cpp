@@ -797,37 +797,6 @@ struct TrainingContext {
         std::map<int64_t, std::vector<std::array<at::Tensor, 4>>> adam_state;
     };
 
-// ── Multi-LoRA: concat all adapters' A/B, 2x GEMM ──
-extern "C" __attribute__((visibility("default"), noinline))
-at::Tensor apply_multi_lora(
-    TrainingContext* ctx, int64_t layer_idx, int64_t pair_idx,
-    const at::Tensor& base_weight
-) {
-    std::vector<at::Tensor> a_list, b_list;
-    for (auto& adapter : ctx->adapters) {
-        if (!adapter.target_layers.empty() && adapter.target_layers.find(layer_idx) == adapter.target_layers.end())
-            continue;
-        auto it = adapter.params.find(layer_idx);
-        if (it == adapter.params.end()) continue;
-        if (pair_idx >= (int64_t)it->second.size()) continue;
-        auto& [a, b] = it->second[pair_idx];
-        double scaling = adapter.alpha / (double)adapter.rank;
-        b_list.push_back(b * scaling);
-        a_list.push_back(a);
-    }
-    if (!ctx->lora_a.empty()) {
-        int64_t la_offset = layer_idx < (int64_t)ctx->lora_layer_offset.size() ? ctx->lora_layer_offset[layer_idx] : 0;
-        if (la_offset + pair_idx < (int64_t)ctx->lora_a.size()) {
-            b_list.push_back(ctx->lora_b[la_offset + pair_idx] * ctx->lora_scaling);
-            a_list.push_back(ctx->lora_a[la_offset + pair_idx]);
-        }
-    }
-    if (a_list.empty()) return base_weight;
-    if (a_list.size() == 1) return lora_delta(base_weight, a_list[0], b_list[0], 1.0);
-    auto a_concat = at::cat(a_list, 0);
-    auto b_concat = at::cat(b_list, 1);
-    return base_weight + at::matmul(b_concat, a_concat);
-}
     std::vector<LoRAAdapter> adapters;
     int64_t next_adapter_id = 0;
     // Legacy single-LoRA (backward compat)
@@ -862,6 +831,39 @@ at::Tensor apply_multi_lora(
     std::vector<at::Tensor> group_outputs;
 // ──────────────────────────────────────────────────────────────────────
 };
+
+// ── Multi-LoRA: concat all adapters' A/B, 2x GEMM ──
+__attribute__((noinline, visibility("default")))
+at::Tensor apply_multi_lora(
+    TrainingContext* ctx, int64_t layer_idx, int64_t pair_idx,
+    const at::Tensor& base_weight
+) {
+    std::vector<at::Tensor> a_list, b_list;
+    for (auto& adapter : ctx->adapters) {
+        if (!adapter.target_layers.empty() && adapter.target_layers.find(layer_idx) == adapter.target_layers.end())
+            continue;
+        auto it = adapter.params.find(layer_idx);
+        if (it == adapter.params.end()) continue;
+        if (pair_idx >= (int64_t)it->second.size()) continue;
+        auto& [a, b] = it->second[pair_idx];
+        double scaling = adapter.alpha / (double)adapter.rank;
+        b_list.push_back(b * scaling);
+        a_list.push_back(a);
+    }
+    if (!ctx->lora_a.empty()) {
+        int64_t la_offset = layer_idx < (int64_t)ctx->lora_layer_offset.size() ? ctx->lora_layer_offset[layer_idx] : 0;
+        if (la_offset + pair_idx < (int64_t)ctx->lora_a.size()) {
+            b_list.push_back(ctx->lora_b[la_offset + pair_idx] * ctx->lora_scaling);
+            a_list.push_back(ctx->lora_a[la_offset + pair_idx]);
+        }
+    }
+    if (a_list.empty()) return base_weight;
+    if (a_list.size() == 1) return lora_delta(base_weight, a_list[0], b_list[0], 1.0);
+    auto a_concat = at::cat(a_list, 0);
+    auto b_concat = at::cat(b_list, 1);
+    return base_weight + at::matmul(b_concat, a_concat);
+}
+
 // Forward declarations for sub-layer checkpointing
 // Sub-layer checkpointing: split each layer into attn + mlp segments
 // Enabled by QWEN36_SUBCKPT=1 env var. Reduces peak memory by ~2x
