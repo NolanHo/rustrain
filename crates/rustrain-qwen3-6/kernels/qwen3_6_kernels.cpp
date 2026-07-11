@@ -972,11 +972,13 @@ static void precompute_lora_cache(TrainingContext* ctx) {
     // Phase 3: for each group, stack and bmm → delta tensors
     // Then batch-add all (base_weight + delta) using _foreach_add
     std::vector<at::Tensor> all_bases, all_deltas;
+    std::vector<size_t> all_entry_indices;  // tracks which entry each result corresponds to
     for (auto& g : groups) {
         int n = (int)g.indices.size();
         if (n == 1) {
             auto& e = entries[g.indices[0]];
             auto delta = at::matmul(e.b_concat, e.a_concat);
+            all_entry_indices.push_back(g.indices[0]);
             all_bases.push_back(e.base_weight);
             all_deltas.push_back(delta.to(e.base_weight.scalar_type()));
         } else {
@@ -992,6 +994,7 @@ static void precompute_lora_cache(TrainingContext* ctx) {
             auto deltas = at::bmm(b_stack, a_stack);   // [N, out, in]
             for (int i = 0; i < n; i++) {
                 auto idx = g.indices[i];
+                all_entry_indices.push_back(idx);
                 all_bases.push_back(entries[idx].base_weight);
                 all_deltas.push_back(deltas[i].to(entries[idx].base_weight.scalar_type()));
             }
@@ -1002,8 +1005,8 @@ static void precompute_lora_cache(TrainingContext* ctx) {
     // Single _foreach_add call replaces N individual at::add calls
     if (!all_bases.empty()) {
         auto modified = at::_foreach_add(all_bases, all_deltas);
-        for (size_t i = 0; i < entries.size(); i++) {
-            ctx->lora_cache[entries[i].key] = modified[i];
+        for (size_t i = 0; i < all_entry_indices.size(); i++) {
+            ctx->lora_cache[entries[all_entry_indices[i]].key] = modified[i];
         }
     }
 
