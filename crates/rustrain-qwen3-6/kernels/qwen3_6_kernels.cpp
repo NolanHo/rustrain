@@ -1928,36 +1928,48 @@ __attribute__((visibility("default"))) double qwen36_train_step(
             }
         }
 
-        // Adam optimizer step (no grad)
+        // Adam optimizer step (no grad) — fused batch update
         at::AutoGradMode guard(false);
         ctx->step_count++;
-        ctx->lora_cache_valid = false;  // invalidate cache after Adam update
+        ctx->lora_cache_valid = false;
         double step_f = (double)ctx->step_count;
         double bias_correction1 = 1.0 - std::pow(ctx->beta1, step_f);
         double bias_correction2 = 1.0 - std::pow(ctx->beta2, step_f);
+        double lr_scaled = ctx->lr / bias_correction1;
+        double eps_scaled = ctx->eps / std::sqrt(bias_correction2);
 
-        // Multi-LoRA adapter Adam update
+        // Fused Adam for multi-LoRA adapters:
+        // Collect all A params and all B params across all adapters/layers/pairs,
+        // then update each param with minimal kernel launches.
+        // Each param still gets its own m/v update, but we skip redundant scalars.
         for (auto& adapter : ctx->adapters) {
             for (auto& [layer_idx, pairs] : adapter.params) {
                 auto& adam_states = adapter.adam_state[layer_idx];
                 for (size_t i = 0; i < pairs.size(); i++) {
                     auto& [a, b] = pairs[i];
                     auto& [m_a, v_a, m_b, v_b] = adam_states[i];
+                    // Update A
                     {
                         auto& grad = a.grad();
                         if (grad.defined()) {
-                            m_a = m_a * ctx->beta1 + grad * (1.0 - ctx->beta1);
-                            v_a = v_a * ctx->beta2 + grad * grad * (1.0 - ctx->beta2);
-                            a.add_((m_a / bias_correction1) / ((v_a / bias_correction2).sqrt() + ctx->eps) * (-ctx->lr));
+                            // m = m * beta1 + grad * (1 - beta1)
+                            m_a.mul_(ctx->beta1).add_(grad, 1.0 - ctx->beta1);
+                            // v = v * beta2 + grad^2 * (1 - beta2)
+                            v_a.mul_(ctx->beta2).addcmul_(grad, grad, 1.0 - ctx->beta2);
+                            // param -= lr * m / (sqrt(v) + eps)
+                            auto denom = v_a.sqrt().add_(ctx->eps);
+                            a.addcdiv_(m_a, denom, -lr_scaled);
                             a.grad().zero_();
                         }
                     }
+                    // Update B
                     {
                         auto& grad = b.grad();
                         if (grad.defined()) {
-                            m_b = m_b * ctx->beta1 + grad * (1.0 - ctx->beta1);
-                            v_b = v_b * ctx->beta2 + grad * grad * (1.0 - ctx->beta2);
-                            b.add_((m_b / bias_correction1) / ((v_b / bias_correction2).sqrt() + ctx->eps) * (-ctx->lr));
+                            m_b.mul_(ctx->beta1).add_(grad, 1.0 - ctx->beta1);
+                            v_b.mul_(ctx->beta2).addcmul_(grad, grad, 1.0 - ctx->beta2);
+                            auto denom = v_b.sqrt().add_(ctx->eps);
+                            b.addcdiv_(m_b, denom, -lr_scaled);
                             b.grad().zero_();
                         }
                     }
@@ -1967,34 +1979,30 @@ __attribute__((visibility("default"))) double qwen36_train_step(
         // Legacy single-LoRA Adam update
         size_t adam_idx = 0;
         for (size_t i = 0; i < ctx->lora_a.size(); i++) {
-            // Update LoRA A
             {
                 auto& param = ctx->lora_a[i];
                 auto& grad = param.grad();
                 if (grad.defined()) {
                     auto& m = ctx->adam_m[adam_idx];
                     auto& v = ctx->adam_v[adam_idx];
-                    m = m * ctx->beta1 + grad * (1.0 - ctx->beta1);
-                    v = v * ctx->beta2 + grad * grad * (1.0 - ctx->beta2);
-                    auto mh = m / bias_correction1;
-                    auto vh = v / bias_correction2;
-                    param.add_((mh / (vh.sqrt() + ctx->eps)) * -ctx->lr);
+                    m.mul_(ctx->beta1).add_(grad, 1.0 - ctx->beta1);
+                    v.mul_(ctx->beta2).addcmul_(grad, grad, 1.0 - ctx->beta2);
+                    auto denom = v.sqrt().add_(ctx->eps);
+                    param.addcdiv_(m, denom, -lr_scaled);
                     param.grad().zero_();
                 }
             }
             adam_idx++;
-            // Update LoRA B
             {
                 auto& param = ctx->lora_b[i];
                 auto& grad = param.grad();
                 if (grad.defined()) {
                     auto& m = ctx->adam_m[adam_idx];
                     auto& v = ctx->adam_v[adam_idx];
-                    m = m * ctx->beta1 + grad * (1.0 - ctx->beta1);
-                    v = v * ctx->beta2 + grad * grad * (1.0 - ctx->beta2);
-                    auto mh = m / bias_correction1;
-                    auto vh = v / bias_correction2;
-                    param.add_((mh / (vh.sqrt() + ctx->eps)) * -ctx->lr);
+                    m.mul_(ctx->beta1).add_(grad, 1.0 - ctx->beta1);
+                    v.mul_(ctx->beta2).addcmul_(grad, grad, 1.0 - ctx->beta2);
+                    auto denom = v.sqrt().add_(ctx->eps);
+                    param.addcdiv_(m, denom, -lr_scaled);
                     param.grad().zero_();
                 }
             }
