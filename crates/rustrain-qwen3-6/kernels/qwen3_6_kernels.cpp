@@ -687,7 +687,7 @@ static at::Tensor moe_forward(
         cudaEvent_t ev;
         cudaEventCreate(&ev);
         cudaEventRecord(ev, stream);
-        cudaStreamWaitEvent(ctx->nccl_stream, ev, 0);
+        cudaStreamWaitEvent(nccl_stream, ev, 0);
         // All-reduce on nccl_stream
         ncclAllReduce(
             routed_output.data_ptr(),
