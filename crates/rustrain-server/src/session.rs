@@ -111,6 +111,8 @@ pub struct Qwen36Session {
     device: Device,
     compute_kind: Kind,
     ctx: Option<rustrain_qwen3_6::kernel::CppTrainingContext>,
+    // Keep weights alive — C++ holds raw pointers to these tensors
+    weights: Option<std::collections::BTreeMap<String, Tensor>>,
     dataset: Option<rustrain_qwen3_6::sft::SftDataset>,
     lora_rank: i64,
     lora_alpha: i64,
@@ -134,6 +136,7 @@ impl Qwen36Session {
             device,
             compute_kind,
             ctx: None,
+            weights: None,
             dataset: None,
             lora_rank: 0,
             lora_alpha: 0,
@@ -299,6 +302,7 @@ impl TrainingSession for Qwen36Session {
 
         let count = ctx.lora_count() as usize;
         self.ctx = Some(ctx);
+        self.weights = Some(weights);  // Keep alive — C++ holds raw pointers
         self.lora_rank = req.rank;
         self.lora_alpha = req.alpha;
         self.lr = req.lr;
