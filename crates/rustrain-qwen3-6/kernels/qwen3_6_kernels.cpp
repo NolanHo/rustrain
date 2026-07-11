@@ -612,7 +612,7 @@ static at::Tensor dense_mlp_forward(
 // ──────────────────────────────────────────────────────────────────────
 
 static at::Tensor moe_forward(
-    TrainingContext* ctx,
+    ncclComm_t nccl_comm, cudaStream_t nccl_stream,
     const at::Tensor& hidden,
     const at::Tensor& gate_w, const at::Tensor& shared_expert_gate_w,
     const at::Tensor& shared_gate_proj, const at::Tensor& shared_up_proj, const at::Tensor& shared_down_proj,
@@ -681,7 +681,7 @@ static at::Tensor moe_forward(
     // Each rank only has contributions from its local experts.
     // The non-local expert tokens are still zero — after all-reduce, every
     // rank gets the complete routed_output.
-    if (ctx && ctx->nccl_comm) {
+    if (nccl_comm) {
         auto stream = c10::cuda::getCurrentCUDAStream().stream();
         // Wait for compute stream to finish writing routed_output
         cudaEvent_t ev;
@@ -695,13 +695,13 @@ static at::Tensor moe_forward(
             routed_output.numel(),
             ncclBfloat16,
             ncclSum,
-            ctx->nccl_comm,
-            ctx->nccl_stream
+            nccl_comm,
+            nccl_stream
         );
         // Wait for nccl to finish before compute stream uses result
         cudaEvent_t ev2;
         cudaEventCreate(&ev2);
-        cudaEventRecord(ev2, ctx->nccl_stream);
+        cudaEventRecord(ev2, nccl_stream);
         cudaStreamWaitEvent(stream, ev2, 0);
         cudaEventDestroy(ev);
         cudaEventDestroy(ev2);
@@ -772,7 +772,7 @@ static at::Tensor forward_single_layer(
             attention_mask);
         auto post_attn = rms_norm(hidden + attn_output, post_norm, cfg->rms_eps);
         if (is_moe) {
-            auto mlp_out = moe_forward(ctx, post_attn,
+            auto mlp_out = moe_forward(ctx->nccl_comm, ctx->nccl_stream, post_attn,
                 *w[8], *w[9], *w[10], *w[11], *w[12], *w[13], *w[14],
                 cfg->num_experts, cfg->top_k, cfg->moe_intermediate,
                 cfg->norm_topk_prob != 0, cfg->expert_start, cfg->expert_count, kind);
@@ -805,7 +805,7 @@ static at::Tensor forward_single_layer(
             cfg->conv_kernel, cfg->rms_eps, kind);
         auto post_attn = rms_norm(hidden + attn_output, post_norm, cfg->rms_eps);
         if (is_moe) {
-            auto mlp_out = moe_forward(ctx, post_attn,
+            auto mlp_out = moe_forward(ctx->nccl_comm, ctx->nccl_stream, post_attn,
                 *w[11], *w[12], *w[13], *w[14], *w[15], *w[16], *w[17],
                 cfg->num_experts, cfg->top_k, cfg->moe_intermediate,
                 cfg->norm_topk_prob != 0, cfg->expert_start, cfg->expert_count, kind);
@@ -1099,7 +1099,7 @@ at::Tensor compute_mlp_only(
     int64_t mlp_start = (cfg.layer_type == 0) ? 8 : 11;
     auto post_attn = rms_norm(residual, *ctx->weight_ptrs[w_offset + 1], cfg.rms_eps);
     if (cfg.num_experts > 0) {
-        return moe_forward(ctx, post_attn,
+        return moe_forward(ctx->nccl_comm, ctx->nccl_stream, post_attn,
             *ctx->weight_ptrs[w_offset+mlp_start], *ctx->weight_ptrs[w_offset+mlp_start+1],
             *ctx->weight_ptrs[w_offset+mlp_start+2], *ctx->weight_ptrs[w_offset+mlp_start+3],
             *ctx->weight_ptrs[w_offset+mlp_start+4], *ctx->weight_ptrs[w_offset+mlp_start+5],
