@@ -836,7 +836,7 @@ struct TrainingContext {
     // LoRA cache: pre-concatenated A/B per (layer, module) pair
     // Invalidated when adapters change or after Adam update
     bool lora_cache_valid = false;
-    std::map<int64_t, std::pair<at::Tensor, at::Tensor>> lora_cache;
+    std::map<int64_t, at::Tensor> lora_cache;  // cached delta_weight per (layer*10+pair)
     // Legacy single-LoRA (backward compat)
     std::vector<at::Tensor> lora_a;
     std::vector<at::Tensor> lora_b;
@@ -881,6 +881,14 @@ static void precompute_lora_cache(TrainingContext* ctx) {
     if (ctx->lora_cache_valid) return;
     ctx->lora_cache.clear();
 
+    // Phase 1: collect all (cache_key, a_concat, b_concat) tuples
+    struct LoraEntry {
+        int64_t key;
+        at::Tensor a_concat;  // [sum_ranks, in]
+        at::Tensor b_concat;  // [out, sum_ranks]
+    };
+    std::vector<LoraEntry> entries;
+
     for (int64_t layer_idx = 0; layer_idx < ctx->num_layers; layer_idx++) {
         int64_t num_pairs = (ctx->layer_configs[layer_idx].layer_type == 0) ? 4 : 3;
         for (int64_t pair_idx = 0; pair_idx < num_pairs; pair_idx++) {
@@ -911,13 +919,66 @@ static void precompute_lora_cache(TrainingContext* ctx) {
                     a_concat = a_list[0];
                     b_concat = b_list[0];
                 } else {
-                    a_concat = at::cat(a_list, 0);
-                    b_concat = at::cat(b_list, 1);
+                    a_concat = at::cat(a_list, 0);  // [sum_ranks, in]
+                    b_concat = at::cat(b_list, 1);  // [out, sum_ranks]
                 }
-                ctx->lora_cache[layer_idx * 10 + pair_idx] = {a_concat, b_concat};
+                entries.push_back({layer_idx * 10 + pair_idx, a_concat, b_concat});
             }
         }
     }
+
+    // Phase 2: group by (out_dim, in_dim, sum_ranks) and batch matmul
+    // delta = b_concat @ a_concat  → [out, in]
+    // Group entries with identical shapes to use at::bmm
+    struct ShapeGroup {
+        int64_t out_dim, in_dim, sum_ranks;
+        std::vector<size_t> indices;
+    };
+    std::vector<ShapeGroup> groups;
+    for (size_t i = 0; i < entries.size(); i++) {
+        auto& e = entries[i];
+        int64_t out_dim = e.b_concat.size(0);
+        int64_t sum_ranks = e.b_concat.size(1);
+        int64_t in_dim = e.a_concat.size(1);
+        bool found = false;
+        for (auto& g : groups) {
+            if (g.out_dim == out_dim && g.in_dim == in_dim && g.sum_ranks == sum_ranks) {
+                g.indices.push_back(i);
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+            groups.push_back({out_dim, in_dim, sum_ranks, {i}});
+        }
+    }
+
+    // Phase 3: for each group, stack and bmm
+    for (auto& g : groups) {
+        int n = (int)g.indices.size();
+        if (n == 1) {
+            // Single entry — direct matmul (no stack overhead)
+            auto& e = entries[g.indices[0]];
+            ctx->lora_cache[e.key] = at::matmul(e.b_concat, e.a_concat);
+        } else {
+            // Stack into [N, out, sum_ranks] and [N, sum_ranks, in], then bmm
+            std::vector<at::Tensor> b_stack_vec, a_stack_vec;
+            b_stack_vec.reserve(n);
+            a_stack_vec.reserve(n);
+            for (auto idx : g.indices) {
+                b_stack_vec.push_back(entries[idx].b_concat);
+                a_stack_vec.push_back(entries[idx].a_concat);
+            }
+            auto b_stack = at::stack(b_stack_vec, 0);  // [N, out, sum_ranks]
+            auto a_stack = at::stack(a_stack_vec, 0);  // [N, sum_ranks, in]
+            auto deltas = at::bmm(b_stack, a_stack);   // [N, out, in]
+            // Unstack and store
+            for (int i = 0; i < n; i++) {
+                ctx->lora_cache[entries[g.indices[i]].key] = deltas[i];
+            }
+        }
+    }
+
     ctx->lora_cache_valid = true;
 }
 
@@ -929,15 +990,8 @@ at::Tensor apply_multi_lora(
     auto it = ctx->lora_cache.find(layer_idx * 10 + pair_idx);
     if (it == ctx->lora_cache.end()) return base_weight;
 
-    auto& [a_concat, b_concat] = it->second;
-    // Single adapter: use lora_delta (converts to base dtype internally)
-    // Multiple adapters: matmul then convert to base dtype
-    int64_t a_rows = a_concat.size(0);
-    if (a_rows == a_concat.size(0) && ctx->adapters.size() <= 1 && ctx->lora_a.empty()) {
-        // Single adapter path — direct lora_delta
-        return lora_delta(base_weight, a_concat, b_concat, 1.0);
-    }
-    auto delta = at::matmul(b_concat, a_concat);
+    // Cached delta_weight = b_concat @ a_concat (precomputed in batched bmm)
+    auto& delta = it->second;
     return base_weight + delta.to(base_weight.scalar_type());
 }
 
