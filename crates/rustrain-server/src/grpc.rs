@@ -342,5 +342,6 @@ fn decode_tensor_data(td: &Option<TensorData>) -> Result<tch::Tensor, Status> {
         }
         _ => return Err(Status::invalid_argument("only int64 and float32 supported")),
     };
-    Ok(tensor.reshape(&td.shape).to_device(tch::Device::Cuda(0)))
+    let local_rank = std::env::var("LOCAL_RANK").ok().and_then(|s| s.parse::<usize>().ok()).unwrap_or(0);
+    Ok(tensor.reshape(&td.shape).to_device(tch::Device::Cuda(local_rank)))
 }

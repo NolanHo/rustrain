@@ -258,7 +258,8 @@ fn decode_tensor(t: &TensorHttp) -> Result<tch::Tensor, String> {
         }
         _ => return Err("only int64 and float32 supported via HTTP".into()),
     };
-    Ok(tensor.reshape(&t.shape).to_device(tch::Device::Cuda(0)))
+    let local_rank = std::env::var("LOCAL_RANK").ok().and_then(|s| s.parse::<usize>().ok()).unwrap_or(0);
+    Ok(tensor.reshape(&t.shape).to_device(tch::Device::Cuda(local_rank)))
 }
 
 async fn eval_step(
