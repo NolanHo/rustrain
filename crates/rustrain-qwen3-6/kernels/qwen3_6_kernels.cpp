@@ -841,6 +841,9 @@ at::Tensor apply_multi_lora(
     TrainingContext* ctx, int64_t layer_idx, int64_t pair_idx,
     const at::Tensor& base_weight
 ) {
+    fprintf(stderr, "[lora_debug] layer=%ld pair=%ld base=[", (long)layer_idx, (long)pair_idx);
+    for (int i = 0; i < base_weight.dim(); i++) fprintf(stderr, "%ld,", (long)base_weight.size(i));
+    fprintf(stderr, "]\n");
     std::vector<at::Tensor> a_list, b_list;
     for (auto& adapter : ctx->adapters) {
         if (!adapter.target_layers.empty() && adapter.target_layers.find(layer_idx) == adapter.target_layers.end())
