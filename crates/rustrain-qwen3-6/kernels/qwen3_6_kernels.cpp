@@ -853,11 +853,14 @@ at::Tensor apply_multi_lora(
         b_list.push_back(b * scaling);
         a_list.push_back(a);
     }
-    if (!ctx->lora_a.empty()) {
-        int64_t la_offset = layer_idx < (int64_t)ctx->lora_layer_offset.size() ? ctx->lora_layer_offset[layer_idx] : 0;
-        if (la_offset + pair_idx < (int64_t)ctx->lora_a.size()) {
-            b_list.push_back(ctx->lora_b[la_offset + pair_idx] * ctx->lora_scaling);
-            a_list.push_back(ctx->lora_a[la_offset + pair_idx]);
+    if (a_list.empty()) {
+        // No adapters — try legacy LoRA
+        if (!ctx->lora_a.empty()) {
+            int64_t la_offset = layer_idx < (int64_t)ctx->lora_layer_offset.size() ? ctx->lora_layer_offset[layer_idx] : 0;
+            if (la_offset + pair_idx < (int64_t)ctx->lora_a.size()) {
+                b_list.push_back(ctx->lora_b[la_offset + pair_idx] * ctx->lora_scaling);
+                a_list.push_back(ctx->lora_a[la_offset + pair_idx]);
+            }
         }
     }
     if (a_list.empty()) return base_weight;
