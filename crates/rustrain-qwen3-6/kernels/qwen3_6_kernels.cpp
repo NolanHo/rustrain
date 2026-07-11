@@ -305,7 +305,7 @@ static at::Tensor full_attention(
         while (kpm.dim() > 2) kpm = kpm.squeeze(0);
         kpm = kpm.unsqueeze(1).unsqueeze(1);  // [B, 1, 1, S]
         // For SDPA, attn_mask should be additive bias: 0 for attend, -inf for ignore
-        auto additive_mask = at::zeros({batch, 1, 1, seq}, hidden.options().dtype(at::kFloat));
+        auto additive_mask = at::zeros({batch, 1, 1, seq}, at::TensorOptions().dtype(q.scalar_type()).device(q.device()));
         additive_mask = additive_mask.masked_fill(kpm.logical_not(), -std::numeric_limits<float>::infinity());
         auto attn_out = at::scaled_dot_product_attention(
             q, k_expanded, v_expanded,
