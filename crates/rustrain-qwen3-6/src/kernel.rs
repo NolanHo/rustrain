@@ -64,6 +64,9 @@ pub struct CppLayerConfig {
     pub expert_count: i64,
     pub intermediate_size: i64,
     pub norm_topk_prob: i32,
+    // NCCL handles for EP all-reduce (must match C++ LayerConfig layout)
+    pub nccl_comm: *mut c_void,
+    pub nccl_stream: *mut c_void,
 }
 
 struct KernelHandles {
@@ -229,6 +232,8 @@ pub fn build_layer_configs(
             expert_start: expert_start as i64,
             expert_count: expert_count as i64,
             intermediate_size: config.intermediate_size,
+            nccl_comm: std::ptr::null_mut(),
+            nccl_stream: std::ptr::null_mut(),
         }
     }).collect()
 }
