@@ -685,10 +685,9 @@ static at::Tensor moe_forward(
     if (nccl_comm_v) {
         auto nccl_comm = reinterpret_cast<ncclComm_t>(nccl_comm_v);
         auto stream = c10::cuda::getCurrentCUDAStream().stream();
-        // Ensure routed_output is contiguous and on current device
         auto ro = routed_output.contiguous();
-        fprintf(stderr, "[ep_debug] ncclAllReduce: numel=%ld stream=%p comm=%p\n",
-                (long)ro.numel(), stream, (void*)nccl_comm);
+        // Synchronize before NCCL — ensure all prior ops on this stream are done
+        cudaStreamSynchronize(stream);
         ncclResult_t nccl_err = ncclAllReduce(
             ro.data_ptr(),
             ro.data_ptr(),
@@ -701,7 +700,8 @@ static at::Tensor moe_forward(
         if (nccl_err != ncclSuccess) {
             fprintf(stderr, "[ep_debug] ncclAllReduce FAILED: %d (%s)\n", nccl_err, ncclGetErrorString(nccl_err));
         }
-        // Copy back if we made a contiguous copy
+        // Synchronize after NCCL — ensure all-reduce is done before continuing
+        cudaStreamSynchronize(stream);
         if (!ro.is_same(routed_output)) {
             routed_output.copy_(ro);
         }
