@@ -867,7 +867,8 @@ at::Tensor apply_multi_lora(
     if (a_list.size() == 1) return lora_delta(base_weight, a_list[0], b_list[0], 1.0);
     auto a_concat = at::cat(a_list, 0);
     auto b_concat = at::cat(b_list, 1);
-    return base_weight + at::matmul(b_concat, a_concat);
+    auto delta = at::matmul(b_concat, a_concat);
+    return base_weight + delta.to(base_weight.scalar_type());
 }
 
 // Forward declarations for sub-layer checkpointing
