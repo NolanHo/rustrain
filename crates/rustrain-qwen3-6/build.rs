@@ -102,6 +102,7 @@ fn main() {
             "-Wl,--export-dynamic",
             "-fvisibility=default",
             "-ltorch", "-ltorch_cuda", "-ltorch_cpu", "-lc10",
+            "-lnccl",
         ])
         .status();
 
@@ -173,7 +174,7 @@ fn main() {
                 format!("-Wl,-rpath,{cuda_inc}/../lib64"),
                 "-Wl,--no-as-needed".to_string(),
                 "-ltorch".to_string(), "-ltorch_cuda".to_string(), "-ltorch_cpu".to_string(),
-                "-lc10".to_string(), "-lcudart".to_string(),
+                "-lc10".to_string(), "-lcudart".to_string(), "-lnccl".to_string(),
             ];
             for obj in &obj_files {
                 link_args.push(obj.clone());

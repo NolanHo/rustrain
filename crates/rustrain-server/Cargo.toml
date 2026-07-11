@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 rustrain-core = { path = "../rustrain-core", features = ["tch"] }
 rustrain-qwen3-6 = { path = "../rustrain-qwen3-6" }
+rustrain-nccl = { path = "../rustrain-nccl" }
 rustrain-checkpoint = { path = "../rustrain-checkpoint" }
 rustrain-train = { path = "../rustrain-train" }
 anyhow.workspace = true

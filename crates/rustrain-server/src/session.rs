@@ -120,6 +120,8 @@ pub struct Qwen36Session {
     metrics: Option<Arc<FileMetricsSink>>,
     last_loss: f64,
     step: u64,
+    // NCCL communicator for EP (kept alive to prevent drop)
+    _nccl_comm: Option<rustrain_nccl::nccl::NcclPersistentComm>,
 }
 
 // SAFETY: CppTrainingContext holds a raw pointer to C++ TrainingContext.
@@ -144,6 +146,7 @@ impl Qwen36Session {
             metrics: Some(Arc::new(FileMetricsSink::new(metrics_path))),
             last_loss: 0.0,
             step: 0,
+            _nccl_comm: None,
         }
     }
 }
@@ -277,13 +280,59 @@ impl TrainingSession for Qwen36Session {
             model_path_obj,
             &needed,
         )?;
+
+        // ── Expert Parallel support ──
+        // Read EP params from env vars (set by launcher script)
+        let ep_rank = std::env::var("RANK").ok().and_then(|s| s.parse::<usize>().ok()).unwrap_or(0);
+        let ep_world_size = std::env::var("WORLD_SIZE").ok().and_then(|s| s.parse::<usize>().ok()).unwrap_or(1);
+        let local_rank = std::env::var("LOCAL_RANK").ok().and_then(|s| s.parse::<usize>().ok()).unwrap_or(0);
+        let is_ep = ep_world_size > 1 && runtime_config.is_moe;
+
+        // Compute expert shard
+        let (expert_start, expert_count) = if is_ep {
+            assert!(runtime_config.num_experts % ep_world_size == 0,
+                "num_experts {} not divisible by ep_world_size {}", runtime_config.num_experts, ep_world_size);
+            let epr = runtime_config.num_experts / ep_world_size;
+            (ep_rank * epr, epr)
+        } else {
+            (0, runtime_config.num_experts)
+        };
+
+        // Set CUDA device for EP
+        if is_ep {
+            self.device = tch::Device::Cuda(local_rank);
+        }
+
+        // Move to device — for EP, narrow expert tensors before GPU transfer
+        let num_experts = runtime_config.num_experts as i64;
         let mut weights: std::collections::BTreeMap<String, Tensor> = std::collections::BTreeMap::new();
         for (name, tensor) in raw_weights {
-            // Keys from safetensors already have full prefix, use as-is
-            let t = tensor.to_device(self.device);
-            let processed = t.to_kind(self.compute_kind);
-            weights.insert(name, processed);
+            let needs_narrow = is_ep
+                && (name.contains(".mlp.experts.gate_up_proj") || name.contains(".mlp.experts.down_proj"));
+            if needs_narrow && tensor.size()[0] == num_experts {
+                let narrowed = tensor
+                    .narrow(0, expert_start as i64, expert_count as i64)
+                    .contiguous()
+                    .to_device(self.device)
+                    .to_kind(self.compute_kind);
+                weights.insert(name, narrowed);
+            } else {
+                let t = tensor.to_device(self.device);
+                let processed = t.to_kind(self.compute_kind);
+                weights.insert(name, processed);
+            }
         }
+
+        // Create NCCL communicator for EP
+        let nccl_comm = if is_ep {
+            let comm_dir = std::path::Path::new("/tmp/rustrain-nccl");
+            let comm = rustrain_nccl::nccl::NcclPersistentComm::new(comm_dir)
+                .map_err(|e| anyhow!("NCCL comm init failed: {}", e))?;
+            tracing::info!(ep_rank, ep_world_size, "NCCL communicator created for EP");
+            Some(comm)
+        } else {
+            None
+        };
 
         // Create C++ training context
         // If target_layers is empty, it means "all layers"
@@ -304,13 +353,24 @@ impl TrainingSession for Qwen36Session {
             lora_scaling,
             req.rank,
             &all_layers,
-            0,
-            runtime_config.num_experts,
+            expert_start,
+            expert_count,
         )?;
+
+        // Set NCCL communicator on C++ context for EP all-reduce
+        if let Some(ref comm) = nccl_comm {
+            ctx.set_nccl_comm(
+                comm.raw_comm_ptr(),
+                comm.raw_stream_ptr(),
+                ep_rank as i32,
+                ep_world_size as i32,
+            );
+        }
 
         let count = ctx.lora_count() as usize;
         self.ctx = Some(ctx);
         self.weights = Some(weights);  // Keep alive — C++ holds raw pointers
+        self._nccl_comm = nccl_comm;
         self.lora_rank = req.rank;
         self.lora_alpha = req.alpha;
         self.lr = req.lr;

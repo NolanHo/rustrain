@@ -27,7 +27,12 @@ impl SessionManager {
             return Err(format!("session {session_id} already exists"));
         }
         let metrics_path = self.metrics_dir.join(format!("{session_id}_metrics.jsonl"));
-        let session = Qwen36Session::new(Device::Cuda(0), Kind::BFloat16, metrics_path);
+        // For EP: use LOCAL_RANK to select GPU; default to GPU 0
+        let local_rank = std::env::var("LOCAL_RANK")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(0);
+        let session = Qwen36Session::new(Device::Cuda(local_rank), Kind::BFloat16, metrics_path);
         sessions.insert(session_id, Arc::new(Mutex::new(Box::new(session))));
         Ok(())
     }
