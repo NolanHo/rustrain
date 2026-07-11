@@ -1582,9 +1582,9 @@ static at::Tensor mtp_forward(
         int64_t w_count = weight_count_for_layer(ctx->mtp_layer_configs[i]);
         std::vector<at::Tensor*> layer_w(ctx->mtp_layer_weights.begin() + w_offset,
                                          ctx->mtp_layer_weights.begin() + w_offset + w_count);
-        // MTP processes seq-1 tokens — slice attention mask to match
+        // MTP processes seq-1 tokens — slice attention mask's last dim to match
         auto mtp_mask = ctx->attention_mask.defined()
-            ? ctx->attention_mask.narrow(1, 0, h.size(1))
+            ? ctx->attention_mask.narrow(-1, 0, h.size(1))
             : at::Tensor();
         h = forward_single_layer(ctx, h, layer_w.data(), &ctx->mtp_layer_configs[i],
             ctx->num_layers + i, kind, mtp_mask);
