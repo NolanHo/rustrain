@@ -184,6 +184,51 @@ __global__ void fused_rmsnorm_matmul_kernel(
 }
 
 // ──────────────────────────────────────────────────────────────────────
+// 4. Multi-tensor Fused Adam
+// ──────────────────────────────────────────────────────────────────────
+// One block per param tensor. Each thread processes multiple elements.
+// Handles BF16 params/grads with FP32 m/v.
+//
+// Replaces 7 ATen ops per param with 1 kernel launch for ALL params:
+//   m = m * beta1 + grad * (1 - beta1)
+//   v = v * beta2 + grad^2 * (1 - beta2)
+//   param -= lr_scaled * m / (sqrt(v) + eps_scaled)
+//   grad = 0
+
+__global__ void fused_adam_multi_kernel(
+    void** __restrict__ param_ptrs,   // [n_params] BF16
+    void** __restrict__ grad_ptrs,    // [n_params] BF16
+    float** __restrict__ m_ptrs,      // [n_params] FP32
+    float** __restrict__ v_ptrs,      // [n_params] FP32
+    const int* __restrict__ sizes,   // [n_params]
+    int n_params,
+    float beta1, float beta2,
+    float lr_scaled, float eps_scaled,
+    float one_minus_beta1, float one_minus_beta2
+) {
+    int pidx = blockIdx.x;
+    if (pidx >= n_params) return;
+
+    int size = sizes[pidx];
+    __nv_bfloat16* param = (__nv_bfloat16*)param_ptrs[pidx];
+    __nv_bfloat16* grad  = (__nv_bfloat16*)grad_ptrs[pidx];
+    float* m = m_ptrs[pidx];
+    float* v = v_ptrs[pidx];
+
+    for (int i = threadIdx.x; i < size; i += blockDim.x) {
+        float g = __bfloat162float(grad[i]);
+        float m_new = m[i] * beta1 + g * one_minus_beta1;
+        float v_new = v[i] * beta2 + g * g * one_minus_beta2;
+        m[i] = m_new;
+        v[i] = v_new;
+        float p = __bfloat162float(param[i]);
+        p -= lr_scaled * m_new / (sqrtf(v_new) + eps_scaled);
+        param[i] = __float2bfloat16_rn(p);
+        grad[i] = __float2bfloat16_rn(0.0f);
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────
 // C wrapper functions (called from C++ via extern "C")
 // ──────────────────────────────────────────────────────────────────────
 
@@ -225,6 +270,26 @@ void launch_fused_rmsnorm_matmul(
         (const __nv_bfloat16*)input, (const __nv_bfloat16*)weight,
         (const __nv_bfloat16*)matmul_w, (__nv_bfloat16*)output,
         M, N, K, eps, (float)scale_mode
+    );
+}
+
+void launch_fused_adam_multi(
+    void** d_param_ptrs, void** d_grad_ptrs,
+    float** d_m_ptrs, float** d_v_ptrs,
+    int* d_sizes, int n_params,
+    float beta1, float beta2,
+    float lr_scaled, float eps_scaled,
+    float one_minus_beta1, float one_minus_beta2,
+    cudaStream_t stream
+) {
+    if (n_params <= 0) return;
+    int threads = 256;
+    int blocks = n_params;
+    fused_adam_multi_kernel<<<blocks, threads, 0, stream>>>(
+        d_param_ptrs, d_grad_ptrs, d_m_ptrs, d_v_ptrs,
+        d_sizes, n_params,
+        beta1, beta2, lr_scaled, eps_scaled,
+        one_minus_beta1, one_minus_beta2
     );
 }
 

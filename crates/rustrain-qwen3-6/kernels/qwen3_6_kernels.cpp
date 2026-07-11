@@ -45,6 +45,14 @@ extern "C" {
         int N, float limit, void* stream);
     void launch_fused_rmsnorm_matmul(const void* input, const void* weight, const void* matmul_w, void* output,
         int M, int N, int K, float eps, int scale_mode, void* stream);
+    void launch_fused_adam_multi(
+        void** d_param_ptrs, void** d_grad_ptrs,
+        float** d_m_ptrs, float** d_v_ptrs,
+        int* d_sizes, int n_params,
+        float beta1, float beta2,
+        float lr_scaled, float eps_scaled,
+        float one_minus_beta1, float one_minus_beta2,
+        void* stream);
 }
 
 /// Fused RMSNorm — single CUDA kernel (replaces 3 ATen ops)
@@ -777,6 +785,28 @@ static at::Tensor forward_single_layer(
 
 // ──────────────────────────────────────────────────────────────────────
 
+// Device-side pointer buffer cache for multi-tensor fused Adam.
+// Uses at::Tensor (PyTorch caching allocator) — no cudaMalloc/cudaFree needed.
+struct AdamDevBuffers {
+    at::Tensor params_buf;   // [max_n] kLong — void* stored as int64_t
+    at::Tensor grads_buf;    // [max_n] kLong
+    at::Tensor m_buf;        // [max_n] kLong — float* stored as int64_t
+    at::Tensor v_buf;        // [max_n] kLong
+    at::Tensor sizes_buf;    // [max_n] kInt
+    int capacity = 0;
+
+    void ensure(int n, const at::Tensor& ref) {
+        if (n <= capacity) return;
+        auto dev = ref.device();
+        params_buf = at::empty({n}, at::TensorOptions().dtype(at::kLong).device(dev));
+        grads_buf  = at::empty({n}, at::TensorOptions().dtype(at::kLong).device(dev));
+        m_buf      = at::empty({n}, at::TensorOptions().dtype(at::kLong).device(dev));
+        v_buf      = at::empty({n}, at::TensorOptions().dtype(at::kLong).device(dev));
+        sizes_buf  = at::empty({n}, at::TensorOptions().dtype(at::kInt).device(dev));
+        capacity = n;
+    }
+};
+
 struct TrainingContext {
     // Model weights (frozen, no grad) — pointers to external tensors
     std::vector<at::Tensor*> weight_ptrs;  // flat array, 15 or 18 per layer
@@ -819,6 +849,9 @@ struct TrainingContext {
     std::vector<at::Tensor> adam_v;
     double lr, beta1, beta2, eps;
     int64_t step_count;
+
+    // Device buffer cache for multi-tensor fused Adam
+    AdamDevBuffers adam_dev_bufs;
 
     // Config
     at::ScalarType compute_type;
@@ -1928,85 +1961,111 @@ __attribute__((visibility("default"))) double qwen36_train_step(
             }
         }
 
-        // Adam optimizer step (no grad) — fused batch update
+        // ── Adam optimizer step — CUDA multi-tensor fused kernel ──
         at::AutoGradMode guard(false);
         ctx->step_count++;
         ctx->lora_cache_valid = false;
         double step_f = (double)ctx->step_count;
         double bias_correction1 = 1.0 - std::pow(ctx->beta1, step_f);
         double bias_correction2 = 1.0 - std::pow(ctx->beta2, step_f);
-        double lr_scaled = ctx->lr / bias_correction1;
-        double eps_scaled = ctx->eps / std::sqrt(bias_correction2);
+        float lr_scaled = (float)(ctx->lr / bias_correction1);
+        float eps_scaled = (float)(ctx->eps / std::sqrt(bias_correction2));
+        float one_minus_b1 = (float)(1.0 - ctx->beta1);
+        float one_minus_b2 = (float)(1.0 - ctx->beta2);
 
-        // Fused Adam for multi-LoRA adapters:
-        // Collect all A params and all B params across all adapters/layers/pairs,
-        // then update each param with minimal kernel launches.
-        // Each param still gets its own m/v update, but we skip redundant scalars.
+        // Collect all (param, grad, m, v, size) tuples from multi-LoRA + legacy
+        std::vector<void*> h_params, h_grads;
+        std::vector<float*> h_m, h_v;
+        std::vector<int> h_sizes;
+
+        // Multi-LoRA adapters
         for (auto& adapter : ctx->adapters) {
             for (auto& [layer_idx, pairs] : adapter.params) {
                 auto& adam_states = adapter.adam_state[layer_idx];
                 for (size_t i = 0; i < pairs.size(); i++) {
                     auto& [a, b] = pairs[i];
                     auto& [m_a, v_a, m_b, v_b] = adam_states[i];
-                    // Update A
-                    {
-                        auto& grad = a.grad();
-                        if (grad.defined()) {
-                            // m = m * beta1 + grad * (1 - beta1)
-                            m_a.mul_(ctx->beta1).add_(grad, 1.0 - ctx->beta1);
-                            // v = v * beta2 + grad^2 * (1 - beta2)
-                            v_a.mul_(ctx->beta2).addcmul_(grad, grad, 1.0 - ctx->beta2);
-                            // param -= lr * m / (sqrt(v) + eps)
-                            auto denom = v_a.sqrt().add_(ctx->eps);
-                            a.addcdiv_(m_a, denom, -lr_scaled);
-                            a.grad().zero_();
-                        }
+                    if (a.grad().defined() && a.scalar_type() == at::kBFloat16) {
+                        h_params.push_back(a.data_ptr());
+                        h_grads.push_back(a.grad().data_ptr());
+                        h_m.push_back((float*)m_a.data_ptr());
+                        h_v.push_back((float*)v_a.data_ptr());
+                        h_sizes.push_back((int)a.numel());
                     }
-                    // Update B
-                    {
-                        auto& grad = b.grad();
-                        if (grad.defined()) {
-                            m_b.mul_(ctx->beta1).add_(grad, 1.0 - ctx->beta1);
-                            v_b.mul_(ctx->beta2).addcmul_(grad, grad, 1.0 - ctx->beta2);
-                            auto denom = v_b.sqrt().add_(ctx->eps);
-                            b.addcdiv_(m_b, denom, -lr_scaled);
-                            b.grad().zero_();
-                        }
+                    if (b.grad().defined() && b.scalar_type() == at::kBFloat16) {
+                        h_params.push_back(b.data_ptr());
+                        h_grads.push_back(b.grad().data_ptr());
+                        h_m.push_back((float*)m_b.data_ptr());
+                        h_v.push_back((float*)v_b.data_ptr());
+                        h_sizes.push_back((int)b.numel());
                     }
                 }
             }
         }
-        // Legacy single-LoRA Adam update
+        // Legacy single-LoRA
         size_t adam_idx = 0;
         for (size_t i = 0; i < ctx->lora_a.size(); i++) {
             {
                 auto& param = ctx->lora_a[i];
                 auto& grad = param.grad();
-                if (grad.defined()) {
-                    auto& m = ctx->adam_m[adam_idx];
-                    auto& v = ctx->adam_v[adam_idx];
-                    m.mul_(ctx->beta1).add_(grad, 1.0 - ctx->beta1);
-                    v.mul_(ctx->beta2).addcmul_(grad, grad, 1.0 - ctx->beta2);
-                    auto denom = v.sqrt().add_(ctx->eps);
-                    param.addcdiv_(m, denom, -lr_scaled);
-                    param.grad().zero_();
+                if (grad.defined() && param.scalar_type() == at::kBFloat16) {
+                    h_params.push_back(param.data_ptr());
+                    h_grads.push_back(grad.data_ptr());
+                    h_m.push_back((float*)ctx->adam_m[adam_idx].data_ptr());
+                    h_v.push_back((float*)ctx->adam_v[adam_idx].data_ptr());
+                    h_sizes.push_back((int)param.numel());
                 }
             }
             adam_idx++;
             {
                 auto& param = ctx->lora_b[i];
                 auto& grad = param.grad();
-                if (grad.defined()) {
-                    auto& m = ctx->adam_m[adam_idx];
-                    auto& v = ctx->adam_v[adam_idx];
-                    m.mul_(ctx->beta1).add_(grad, 1.0 - ctx->beta1);
-                    v.mul_(ctx->beta2).addcmul_(grad, grad, 1.0 - ctx->beta2);
-                    auto denom = v.sqrt().add_(ctx->eps);
-                    param.addcdiv_(m, denom, -lr_scaled);
-                    param.grad().zero_();
+                if (grad.defined() && param.scalar_type() == at::kBFloat16) {
+                    h_params.push_back(param.data_ptr());
+                    h_grads.push_back(grad.data_ptr());
+                    h_m.push_back((float*)ctx->adam_m[adam_idx].data_ptr());
+                    h_v.push_back((float*)ctx->adam_v[adam_idx].data_ptr());
+                    h_sizes.push_back((int)param.numel());
                 }
             }
             adam_idx++;
+        }
+
+        int n_params = (int)h_params.size();
+        if (n_params > 0) {
+            // Ensure device buffers are large enough
+            ctx->adam_dev_bufs.ensure(n_params, ctx->lora_a.empty()
+                ? ctx->adapters[0].params.begin()->second[0].first
+                : ctx->lora_a[0]);
+
+            // Copy pointer arrays to device
+            auto opts_cpu_long = at::TensorOptions().dtype(at::kLong).device(at::kCPU);
+            auto opts_cpu_int  = at::TensorOptions().dtype(at::kInt).device(at::kCPU);
+            auto params_cpu = at::from_blob(h_params.data(), {n_params}, opts_cpu_long);
+            auto grads_cpu  = at::from_blob(h_grads.data(),  {n_params}, opts_cpu_long);
+            auto m_cpu      = at::from_blob(h_m.data(),      {n_params}, opts_cpu_long);
+            auto v_cpu      = at::from_blob(h_v.data(),      {n_params}, opts_cpu_long);
+            auto sizes_cpu  = at::from_blob(h_sizes.data(),  {n_params}, opts_cpu_int);
+            ctx->adam_dev_bufs.params_buf.copy_(params_cpu);
+            ctx->adam_dev_bufs.grads_buf.copy_(grads_cpu);
+            ctx->adam_dev_bufs.m_buf.copy_(m_cpu);
+            ctx->adam_dev_bufs.v_buf.copy_(v_cpu);
+            ctx->adam_dev_bufs.sizes_buf.copy_(sizes_cpu);
+
+            // Single kernel launch for ALL params
+            auto stream = c10::cuda::getCurrentCUDAStream().stream();
+            launch_fused_adam_multi(
+                (void**)ctx->adam_dev_bufs.params_buf.data_ptr(),
+                (void**)ctx->adam_dev_bufs.grads_buf.data_ptr(),
+                (float**)ctx->adam_dev_bufs.m_buf.data_ptr(),
+                (float**)ctx->adam_dev_bufs.v_buf.data_ptr(),
+                (int*)ctx->adam_dev_bufs.sizes_buf.data_ptr(),
+                n_params,
+                (float)ctx->beta1, (float)ctx->beta2,
+                lr_scaled, eps_scaled,
+                one_minus_b1, one_minus_b2,
+                (void*)stream
+            );
         }
 
         return loss_val;
