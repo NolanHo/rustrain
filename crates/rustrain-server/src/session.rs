@@ -196,16 +196,17 @@ impl TrainingSession for Qwen36Session {
                 model_path_obj,
             )?;
 
-        // Build needed weight set
+        // Build needed weight set — keys must match safetensors (with model prefix)
         let n_layers = runtime_config.num_hidden_layers;
+        let wp = &runtime_config.weight_prefix;
         let mut needed: std::collections::HashSet<String> = std::collections::HashSet::new();
-        needed.insert("embed_tokens.weight".to_string());
-        needed.insert("norm.weight".to_string());
+        needed.insert(format!("{wp}embed_tokens.weight"));
+        needed.insert(format!("{wp}norm.weight"));
         if !runtime_config.tie_word_embeddings {
-            needed.insert("head.weight".to_string());
+            needed.insert(format!("{wp}head.weight"));
         }
         for layer in 0..n_layers {
-            let p = format!("layers.{layer}");
+            let p = format!("{wp}layers.{layer}");
             needed.insert(format!("{p}.input_layernorm.weight"));
             needed.insert(format!("{p}.post_attention_layernorm.weight"));
             match runtime_config.layer_types[layer] {
@@ -243,7 +244,7 @@ impl TrainingSession for Qwen36Session {
         // MTP weights
         if runtime_config.mtp_num_hidden_layers > 0 {
             for i in 0..runtime_config.mtp_num_hidden_layers {
-                let p = format!("mtp.layers.{i}");
+                let p = format!("{wp}mtp.layers.{i}");
                 needed.insert(format!("{p}.input_layernorm.weight"));
                 needed.insert(format!("{p}.post_attention_layernorm.weight"));
                 for w in &["q_proj", "q_norm", "k_proj", "k_norm", "v_proj", "o_proj"] {
@@ -263,24 +264,24 @@ impl TrainingSession for Qwen36Session {
                     needed.insert(format!("{p}.mlp.down_proj.weight"));
                 }
             }
-            needed.insert("mtp.fc.weight".to_string());
-            needed.insert("mtp.pre_fc_norm_embedding.weight".to_string());
-            needed.insert("mtp.pre_fc_norm_hidden.weight".to_string());
-            needed.insert("mtp.norm.weight".to_string());
+            needed.insert(format!("{wp}mtp.fc.weight"));
+            needed.insert(format!("{wp}mtp.pre_fc_norm_embedding.weight"));
+            needed.insert(format!("{wp}mtp.pre_fc_norm_hidden.weight"));
+            needed.insert(format!("{wp}mtp.norm.weight"));
         }
 
-        // Load weights via safetensors
-        let weight_prefix = &runtime_config.weight_prefix;
+        // The safetensors keys already include the prefix (e.g. "model.language_model.layers.0...")
+        // So we should NOT add the prefix again. Use the keys as-is.
         let raw_weights = rustrain_checkpoint::safetensors::read_safetensors_dir_filtered(
             model_path_obj,
             &needed,
         )?;
         let mut weights: std::collections::BTreeMap<String, Tensor> = std::collections::BTreeMap::new();
         for (name, tensor) in raw_weights {
-            let full_name = if name.starts_with("model.") { name } else { format!("{weight_prefix}{name}") };
+            // Keys from safetensors already have full prefix, use as-is
             let t = tensor.to_device(self.device);
             let processed = t.to_kind(self.compute_kind);
-            weights.insert(full_name, processed);
+            weights.insert(name, processed);
         }
 
         // Create C++ training context
