@@ -284,6 +284,12 @@ impl TrainingSession for Qwen36Session {
         }
 
         // Create C++ training context
+        // If target_layers is empty, it means "all layers"
+        let all_layers: Vec<usize> = if req.target_layers.is_empty() {
+            (0..runtime_config.num_hidden_layers).collect()
+        } else {
+            req.target_layers.clone()
+        };
         let lora_scaling = req.alpha as f64 / req.rank as f64;
         let ctx = rustrain_qwen3_6::kernel::CppTrainingContext::new(
             &weights,
@@ -295,7 +301,7 @@ impl TrainingSession for Qwen36Session {
             req.eps,
             lora_scaling,
             req.rank,
-            &req.target_layers,
+            &all_layers,
             0,
             runtime_config.num_experts,
         )?;
