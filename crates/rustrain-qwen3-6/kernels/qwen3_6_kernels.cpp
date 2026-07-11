@@ -681,7 +681,8 @@ static at::Tensor moe_forward(
     // Each rank only has contributions from its local experts.
     // The non-local expert tokens are still zero — after all-reduce, every
     // rank gets the complete routed_output.
-    if (nccl_comm_v) {
+    // EP all-reduce: temporarily disabled for debugging
+    if (false && nccl_comm_v) {
         auto nccl_comm = reinterpret_cast<ncclComm_t>(nccl_comm_v);
         // Use compute stream directly for NCCL — avoids cross-device stream/event issues
         auto stream = c10::cuda::getCurrentCUDAStream().stream();
