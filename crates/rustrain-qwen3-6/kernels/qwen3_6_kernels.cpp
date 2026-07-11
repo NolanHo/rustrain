@@ -1976,6 +1976,10 @@ __attribute__((visibility("default"))) double qwen36_train_step(
 ) {
     try {
         auto* ctx = reinterpret_cast<TrainingContext*>(ctx_ptr);
+        // Set CUDA device for EP — tensors and NCCL comm are on local_rank's GPU
+        if (ctx->nccl_comm) {
+            cudaSetDevice(ctx->ep_rank);
+        }
         auto& input_ids = *reinterpret_cast<at::Tensor*>(input_ids_ptr);
         auto& target_mask = *reinterpret_cast<at::Tensor*>(target_mask_ptr);
         if (attention_mask_ptr) {
