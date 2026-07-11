@@ -881,16 +881,31 @@ static void precompute_lora_cache(TrainingContext* ctx) {
     if (ctx->lora_cache_valid) return;
     ctx->lora_cache.clear();
 
-    // Phase 1: collect all (cache_key, a_concat, b_concat) tuples
+    // Phase 1: collect all (cache_key, a_concat, b_concat, base_weight) tuples
     struct LoraEntry {
         int64_t key;
         at::Tensor a_concat;  // [sum_ranks, in]
         at::Tensor b_concat;  // [out, sum_ranks]
+        at::Tensor base_weight;  // frozen base weight
     };
     std::vector<LoraEntry> entries;
 
+    int64_t w_offset = 0;
     for (int64_t layer_idx = 0; layer_idx < ctx->num_layers; layer_idx++) {
-        int64_t num_pairs = (ctx->layer_configs[layer_idx].layer_type == 0) ? 4 : 3;
+        const auto& cfg = ctx->layer_configs[layer_idx];
+        // Weight offset mapping: pair_idx → weight_ptrs offset
+        static const int64_t full_indices[] = {2, 4, 6, 7};
+        static const int64_t linear_indices[] = {2, 3, 10};
+        int64_t num_pairs;
+        const int64_t* proj_indices;
+        if (cfg.layer_type == 0) {
+            proj_indices = full_indices;
+            num_pairs = 4;
+        } else {
+            proj_indices = linear_indices;
+            num_pairs = 3;
+        }
+
         for (int64_t pair_idx = 0; pair_idx < num_pairs; pair_idx++) {
             std::vector<at::Tensor> a_list, b_list;
             for (auto& adapter : ctx->adapters) {
@@ -922,14 +937,15 @@ static void precompute_lora_cache(TrainingContext* ctx) {
                     a_concat = at::cat(a_list, 0);  // [sum_ranks, in]
                     b_concat = at::cat(b_list, 1);  // [out, sum_ranks]
                 }
-                entries.push_back({layer_idx * 10 + pair_idx, a_concat, b_concat});
+                auto& base_weight = *ctx->weight_ptrs[w_offset + proj_indices[pair_idx]];
+                entries.push_back({layer_idx * 10 + pair_idx, a_concat, b_concat, base_weight});
             }
         }
+        w_offset += weight_count_for_layer(cfg);
     }
 
     // Phase 2: group by (out_dim, in_dim, sum_ranks) and batch matmul
     // delta = b_concat @ a_concat  → [out, in]
-    // Group entries with identical shapes to use at::bmm
     struct ShapeGroup {
         int64_t out_dim, in_dim, sum_ranks;
         std::vector<size_t> indices;
@@ -953,15 +969,17 @@ static void precompute_lora_cache(TrainingContext* ctx) {
         }
     }
 
-    // Phase 3: for each group, stack and bmm
+    // Phase 3: for each group, stack and bmm → delta tensors
+    // Then batch-add all (base_weight + delta) using _foreach_add
+    std::vector<at::Tensor> all_bases, all_deltas;
     for (auto& g : groups) {
         int n = (int)g.indices.size();
         if (n == 1) {
-            // Single entry — direct matmul (no stack overhead)
             auto& e = entries[g.indices[0]];
-            ctx->lora_cache[e.key] = at::matmul(e.b_concat, e.a_concat);
+            auto delta = at::matmul(e.b_concat, e.a_concat);
+            all_bases.push_back(e.base_weight);
+            all_deltas.push_back(delta.to(e.base_weight.scalar_type()));
         } else {
-            // Stack into [N, out, sum_ranks] and [N, sum_ranks, in], then bmm
             std::vector<at::Tensor> b_stack_vec, a_stack_vec;
             b_stack_vec.reserve(n);
             a_stack_vec.reserve(n);
@@ -969,13 +987,23 @@ static void precompute_lora_cache(TrainingContext* ctx) {
                 b_stack_vec.push_back(entries[idx].b_concat);
                 a_stack_vec.push_back(entries[idx].a_concat);
             }
-            auto b_stack = at::stack(b_stack_vec, 0);  // [N, out, sum_ranks]
-            auto a_stack = at::stack(a_stack_vec, 0);  // [N, sum_ranks, in]
+            auto b_stack = at::stack(b_stack_vec, 0);
+            auto a_stack = at::stack(a_stack_vec, 0);
             auto deltas = at::bmm(b_stack, a_stack);   // [N, out, in]
-            // Unstack and store
             for (int i = 0; i < n; i++) {
-                ctx->lora_cache[entries[g.indices[i]].key] = deltas[i];
+                auto idx = g.indices[i];
+                all_bases.push_back(entries[idx].base_weight);
+                all_deltas.push_back(deltas[i].to(entries[idx].base_weight.scalar_type()));
             }
+        }
+    }
+
+    // Phase 4: batch add — modified_weight = base_weight + delta
+    // Single _foreach_add call replaces N individual at::add calls
+    if (!all_bases.empty()) {
+        auto modified = at::_foreach_add(all_bases, all_deltas);
+        for (size_t i = 0; i < entries.size(); i++) {
+            ctx->lora_cache[entries[i].key] = modified[i];
         }
     }
 
@@ -987,12 +1015,11 @@ at::Tensor apply_multi_lora(
     TrainingContext* ctx, int64_t layer_idx, int64_t pair_idx,
     const at::Tensor& base_weight
 ) {
+    // Cache stores modified_weight = base_weight + delta (precomputed)
+    // Just return it directly — zero computation during forward
     auto it = ctx->lora_cache.find(layer_idx * 10 + pair_idx);
     if (it == ctx->lora_cache.end()) return base_weight;
-
-    // Cached delta_weight = b_concat @ a_concat (precomputed in batched bmm)
-    auto& delta = it->second;
-    return base_weight + delta.to(base_weight.scalar_type());
+    return it->second;
 }
 
 // Forward declarations for sub-layer checkpointing
