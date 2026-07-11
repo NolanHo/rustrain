@@ -688,6 +688,10 @@ static at::Tensor moe_forward(
         auto nccl_comm = reinterpret_cast<ncclComm_t>(nccl_comm_v);
         auto nccl_stream = reinterpret_cast<cudaStream_t>(nccl_stream_v);
         auto compute_stream = c10::cuda::getCurrentCUDAStream().stream();
+        // Debug: check tensor device and dtype
+        fprintf(stderr, "[ep_debug] routed_output: device=%ld dtype=%d numel=%ld contiguous=%d\n",
+                (long)routed_output.device().index(), (int)routed_output.scalar_type(),
+                (long)routed_output.numel(), routed_output.is_contiguous());
         // Sync compute stream, then run NCCL on dedicated NCCL stream
         cudaStreamSynchronize(compute_stream);
         ncclResult_t nccl_err = ncclAllReduce(
