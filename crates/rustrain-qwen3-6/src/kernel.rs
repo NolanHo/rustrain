@@ -300,6 +300,8 @@ pub fn build_mtp_layer_configs(
             expert_start: expert_start as i64,
             expert_count: expert_count as i64,
             intermediate_size: config.intermediate_size,
+            nccl_comm: std::ptr::null_mut(),
+            nccl_stream: std::ptr::null_mut(),
         }
     }).collect()
 }
