@@ -80,6 +80,43 @@ static at::Tensor fused_rmsnorm_op(
 /// silu(g) * u, backward:
 ///   d/dg = sigmoid(g) * (1 + g * (1 - sigmoid(g))) * u
 ///   d/du = silu(g) = g * sigmoid(g)
+struct NcclAllReduceFunction : public torch::autograd::Function<NcclAllReduceFunction> {
+    static at::Tensor forward(torch::autograd::AutogradContext* ctx,
+        at::Tensor input, int64_t comm_ptr) {
+        ctx->saved_data["comm"] = comm_ptr;
+        auto nccl_comm = reinterpret_cast<ncclComm_t>(comm_ptr);
+        int dev = input.device().index();
+        cudaSetDevice(dev);
+        auto compute_stream = c10::cuda::getCurrentCUDAStream(dev).stream();
+        auto output = at::empty_like(input);
+        ncclResult_t err = ncclAllReduce(
+            input.data_ptr(), output.data_ptr(),
+            input.numel(), ncclBfloat16, ncclSum,
+            nccl_comm, compute_stream);
+        if (err != ncclSuccess) {
+            fprintf(stderr, "[ep_debug] ncclAllReduce fwd FAILED: %d (%s)\n", err, ncclGetErrorString(err));
+        }
+        return output;
+    }
+    static std::vector<at::Tensor> backward(torch::autograd::AutogradContext* ctx,
+        std::vector<at::Tensor> grad_output) {
+        auto comm_ptr = ctx->saved_data["comm"].toInt();
+        auto nccl_comm = reinterpret_cast<ncclComm_t>(comm_ptr);
+        int dev = grad_output[0].device().index();
+        cudaSetDevice(dev);
+        auto compute_stream = c10::cuda::getCurrentCUDAStream(dev).stream();
+        auto grad_input = at::empty_like(grad_output[0]);
+        ncclResult_t err = ncclAllReduce(
+            grad_output[0].data_ptr(), grad_input.data_ptr(),
+            grad_output[0].numel(), ncclBfloat16, ncclSum,
+            nccl_comm, compute_stream);
+        if (err != ncclSuccess) {
+            fprintf(stderr, "[ep_debug] ncclAllReduce bwd FAILED: %d (%s)\n", err, ncclGetErrorString(err));
+        }
+        return {grad_input, at::Tensor()};
+    }
+};
+
 struct FusedSwiGLUFunction : public torch::autograd::Function<FusedSwiGLUFunction> {
     static at::Tensor forward(torch::autograd::AutogradContext* ctx,
         at::Tensor gate, at::Tensor up, double limit) {
@@ -688,31 +725,17 @@ static at::Tensor moe_forward(
     // In-place NCCL (ptr, ptr) modifies autograd-tracked tensor via raw CUDA call,
     // bypassing PyTorch's version counter. During backward, autograd accesses
     // corrupted saved tensors → cudaErrorIllegalAddress.
+    // EP all-reduce via custom autograd Function
+    // Properly integrates NCCL with PyTorch autograd:
+    // - Forward: NCCL all-reduce, output is new tensor (autograd-connected)
+    // - Backward: NCCL all-reduce on gradient (correct for EP)
+    // - PyTorch manages tensor lifecycle (no premature freeing)
     if (nccl_comm_v) {
         auto nccl_comm = reinterpret_cast<ncclComm_t>(nccl_comm_v);
         int dev = routed_output.device().index();
         cudaSetDevice(dev);
-        auto compute_stream = c10::cuda::getCurrentCUDAStream(dev).stream();
-        auto ro = routed_output.is_contiguous() ? routed_output : routed_output.contiguous();
-        // Use ncclGroupStart/End to ensure the collective completes
-        // before any subsequent operations. ncclGroupEnd blocks until
-        // all NCCL operations in the group complete on all ranks.
-        auto reduced = ro.clone();
-        ncclGroupStart();
-        ncclResult_t nccl_err = ncclAllReduce(
-            reduced.data_ptr(),
-            reduced.data_ptr(),
-            reduced.numel(),
-            ncclBfloat16,
-            ncclSum,
-            nccl_comm,
-            compute_stream
-        );
-        ncclGroupEnd();
-        if (nccl_err != ncclSuccess) {
-            fprintf(stderr, "[ep_debug] ncclAllReduce FAILED: %d (%s)\n", nccl_err, ncclGetErrorString(nccl_err));
-        }
-        routed_output = reduced;
+        // Use NcclAllReduceFunction — autograd handles forward + backward
+        routed_output = NcclAllReduceFunction::apply(routed_output, (int64_t)nccl_comm);
     }
 
     // Shared expert (same as before, with fused SwiGLU)
