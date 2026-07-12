@@ -2029,12 +2029,43 @@ __attribute__((visibility("default"))) double qwen36_train_step(
         // Set CUDA device for EP — tensors and NCCL comm are on local_rank's GPU
         if (ctx->nccl_comm) {
             cudaSetDevice(ctx->ep_rank);
-            // EP barrier: wait for all ranks to arrive before starting forward.
-            // Without this, HTTP parallel requests arrive at different times,
-            // causing NCCL collective deadlock (40 sync points per step in backward).
-            // Uses a simple file-based barrier: each rank creates a file,
-            // then waits for all files to appear before continuing.
             ep_barrier(ctx->ep_rank, ctx->ep_world_size);
+            // Recreate NCCL communicator each step to avoid internal state corruption.
+            // NCCL communicator's internal buffer registration gets corrupted when
+            // PyTorch's caching allocator frees and reallocates memory between steps.
+            // Destroy old communicator and create new one.
+            ncclCommDestroy(ctx->nccl_comm);
+            ncclUniqueId unique_id;
+            // Rank 0 generates and writes ID, others read it
+            const char* id_path = "/tmp/rustrain-nccl/nccl-step-id.bin";
+            if (ctx->ep_rank == 0) {
+                ncclGetUniqueId(&unique_id);
+                FILE* f = fopen(id_path, "wb");
+                fwrite(&unique_id, sizeof(unique_id), 1, f);
+                fclose(f);
+            } else {
+                for (int i = 0; i < 600; i++) {
+                    FILE* f = fopen(id_path, "rb");
+                    if (f) {
+                        if (fread(&unique_id, sizeof(unique_id), 1, f) == 1) {
+                            fclose(f);
+                            break;
+                        }
+                        fclose(f);
+                    }
+                    usleep(1000);
+                }
+            }
+            // All ranks must reach ncclCommInitRank simultaneously
+            ep_barrier(ctx->ep_rank, ctx->ep_world_size);
+            ncclCommInitRank(&ctx->nccl_comm, ctx->ep_world_size, unique_id, ctx->ep_rank);
+            // Update layer configs with new communicator
+            for (auto& lc : ctx->layer_configs) {
+                lc.nccl_comm = (void*)ctx->nccl_comm;
+            }
+            for (auto& lc : ctx->mtp_layer_configs) {
+                lc.nccl_comm = (void*)ctx->nccl_comm;
+            }
         }
         auto& input_ids = *reinterpret_cast<at::Tensor*>(input_ids_ptr);
         auto& target_mask = *reinterpret_cast<at::Tensor*>(target_mask_ptr);
