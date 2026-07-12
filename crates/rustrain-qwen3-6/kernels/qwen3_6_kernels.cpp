@@ -2050,10 +2050,6 @@ __attribute__((visibility("default"))) double qwen36_train_step(
             auto hidden_detached = hidden.detach().set_requires_grad(true);
             auto mtp_hidden = mtp_forward(ctx, hidden_detached, input_ids);
             auto mtp_loss = mtp_compute_loss(ctx, mtp_hidden, input_ids, target_mask);
-            if (ctx->step_count == 0) {
-                    loss_val, mtp_loss.item<double>() / 0.5, mtp_loss.item<double>(),
-                    (loss_val + mtp_loss.item<double>()));
-            }
             // Backward MTP loss — frees MTP intermediate tensors immediately
             mtp_loss.backward();
             // Add MTP gradient to hidden's gradient (already populated by main backward)
