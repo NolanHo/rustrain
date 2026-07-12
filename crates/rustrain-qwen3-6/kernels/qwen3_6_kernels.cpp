@@ -2196,8 +2196,11 @@ __attribute__((visibility("default"))) void* qwen36_get_lora_b(void* ctx_ptr, in
 __attribute__((visibility("default"))) void qwen36_free_training_context(void* ctx_ptr) {
     if (ctx_ptr) {
         auto* ctx = reinterpret_cast<TrainingContext*>(ctx_ptr);
-        if (ctx->nccl_comm) ncclCommDestroy(ctx->nccl_comm);
-        if (ctx->nccl_stream) cudaStreamDestroy(ctx->nccl_stream);
+        // Don't destroy NCCL communicator — it's a process-level singleton
+        // (g_nccl_comm). It must survive context destruction so the next
+        // session can reuse it. Destroying it would break NCCL for all
+        // subsequent sessions in the same worker process.
+        // ncclCommDestroy is called only on process exit (via atexit or Drop).
         delete ctx;
     }
 }
