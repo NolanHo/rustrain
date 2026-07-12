@@ -707,15 +707,23 @@ static at::Tensor moe_forward(
         auto nccl_comm = reinterpret_cast<ncclComm_t>(nccl_comm_v);
         int dev = routed_output.device().index();
         cudaSetDevice(dev);
-        auto compute_stream = c10::cuda::getCurrentCUDAStream(dev).stream();
+        // Use the NCCL stream that was created with the communicator.
+        // This is stored in nccl_stream_v (from LayerConfig).
+        auto nccl_stream = reinterpret_cast<cudaStream_t>(nccl_stream_v);
+        if (!nccl_stream) {
+            // Fallback: use compute stream if nccl_stream not set
+            nccl_stream = c10::cuda::getCurrentCUDAStream(dev).stream();
+        }
         auto reduced = at::empty_like(routed_output);
         ncclResult_t err = ncclAllReduce(
             routed_output.data_ptr(), reduced.data_ptr(),
             routed_output.numel(), ncclBfloat16, ncclSum,
-            nccl_comm, compute_stream);
+            nccl_comm, nccl_stream);
         if (err != ncclSuccess) {
-            fprintf(stderr, "[ep] ncclAllReduce fwd FAILED: %d (%s)\n", err, ncclGetErrorString(err));
+            fprintf(stderr, "[ep] ncclAllReduce fwd FAILED: %d (%s) dev=%d\n", err, ncclGetErrorString(err), dev);
         }
+        // Sync NCCL stream before using result on compute stream
+        cudaStreamSynchronize(nccl_stream);
         routed_output = reduced;
     }
     no_grad.~AutoGradMode();  // Restore autograd before shared expert
