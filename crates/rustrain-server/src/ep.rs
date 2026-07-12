@@ -55,9 +55,7 @@ impl EpCoordinator {
                 .env("RANK", rank.to_string())
                 .env("WORLD_SIZE", world_size.to_string())
                 .env("LOCAL_RANK", rank.to_string())
-                // Clear CUDA_VISIBLE_DEVICES — parent set it to "" to prevent
-                // CUDA init in parent. Workers need full GPU access.
-                .env_remove("CUDA_VISIBLE_DEVICES")
+                .env("CUDA_VISIBLE_DEVICES", rank.to_string())
                 .stdout(std::process::Stdio::inherit())
                 .stderr(std::process::Stdio::inherit())
                 .spawn()
@@ -113,9 +111,8 @@ pub fn worker_main(
     // Attach to shared memory
     let worker = EpWorker::attach(shm_name, rank, world_size)?;
 
-    // Set CUDA device — worker process has its own CUDA context (exec, not fork).
-    // cudaSetDevice(rank) selects the correct GPU.
-    let device = Device::Cuda(rank);
+    // With CUDA_VISIBLE_DEVICES=rank, only one GPU is visible as device 0.
+    let device = Device::Cuda(0);
     let compute_kind = Kind::BFloat16;
 
     // Create session (same as non-EP, but with LOCAL_RANK env for EP)
