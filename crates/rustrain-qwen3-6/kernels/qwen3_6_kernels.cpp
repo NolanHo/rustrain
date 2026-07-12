@@ -94,7 +94,7 @@ struct NcclAllReduceFunction : public torch::autograd::Function<NcclAllReduceFun
             input.numel(), ncclBfloat16, ncclSum,
             nccl_comm, compute_stream);
         if (err != ncclSuccess) {
-            fprintf(stderr, "[ep_debug] ncclAllReduce fwd FAILED: %d (%s)\n", err, ncclGetErrorString(err));
+            fprintf(stderr, "[ep] ncclAllReduce fwd FAILED: %d (%s)\n", err, ncclGetErrorString(err));
         }
         return output;
     }
@@ -111,7 +111,7 @@ struct NcclAllReduceFunction : public torch::autograd::Function<NcclAllReduceFun
             grad_output[0].numel(), ncclBfloat16, ncclSum,
             nccl_comm, compute_stream);
         if (err != ncclSuccess) {
-            fprintf(stderr, "[ep_debug] ncclAllReduce bwd FAILED: %d (%s)\n", err, ncclGetErrorString(err));
+            fprintf(stderr, "[ep] ncclAllReduce bwd FAILED: %d (%s)\n", err, ncclGetErrorString(err));
         }
         return {grad_input, at::Tensor()};
     }
@@ -231,7 +231,6 @@ static at::Tensor full_attention(
 
     // Debug: confirm proj_chunk is read
     if (proj_chunk > 0 && seq > proj_chunk) {
-        fprintf(stderr, "[proj_debug] full_attention: seq=%ld proj_chunk=%ld (chunked)\n", (long)seq, (long)proj_chunk);
     }
 
     at::Tensor q, gate, k, v;
@@ -280,7 +279,6 @@ static at::Tensor full_attention(
     {
         size_t free2, total2;
         cudaMemGetInfo(&free2, &total2);
-        fprintf(stderr, "[mem_debug] after rms_norm: used=%.1f GB, free=%.1f GB\n",
             (total2 - free2) / 1e9, free2 / 1e9);
     }
 
@@ -294,7 +292,6 @@ static at::Tensor full_attention(
     {
         size_t free2, total2;
         cudaMemGetInfo(&free2, &total2);
-        fprintf(stderr, "[mem_debug] after gate release: used=%.1f GB, free=%.1f GB\n",
             (total2 - free2) / 1e9, free2 / 1e9);
     }
 
@@ -682,16 +679,9 @@ static at::Tensor moe_forward(
         auto rw_f = topk_weights.to(at::kFloat);
         auto egu_f = experts_gate_up.select(0, 0).to(at::kFloat);
         auto ed_f = experts_down.select(0, 0).to(at::kFloat);
-        fprintf(stderr, "  [moe] router_logits: mean=%.6f std=%.6f max=%.6f\n", rl_f.mean().item<float>(), rl_f.std().item<float>(), rl_f.abs().max().item<float>());
-        fprintf(stderr, "  [moe] topk_weights: mean=%.6f std=%.6f max=%.6f\n", rw_f.mean().item<float>(), rw_f.std().item<float>(), rw_f.abs().max().item<float>());
-        fprintf(stderr, "  [moe] experts_gate_up[0]: mean=%.6f std=%.6f max=%.6f\n", egu_f.mean().item<float>(), egu_f.std().item<float>(), egu_f.abs().max().item<float>());
-        fprintf(stderr, "  [moe] experts_down[0]: mean=%.6f std=%.6f max=%.6f\n", ed_f.mean().item<float>(), ed_f.std().item<float>(), ed_f.abs().max().item<float>());
         auto sg_f = shared_gate_proj.to(at::kFloat);
         auto sd_f = shared_down_proj.to(at::kFloat);
-        fprintf(stderr, "  [moe] shared_gate: mean=%.6f std=%.6f max=%.6f\n", sg_f.mean().item<float>(), sg_f.std().item<float>(), sg_f.abs().max().item<float>());
-        fprintf(stderr, "  [moe] shared_down: mean=%.6f std=%.6f max=%.6f\n", sd_f.mean().item<float>(), sd_f.std().item<float>(), sd_f.abs().max().item<float>());
         auto seg_f = at::sigmoid(at::matmul(flat, shared_expert_gate_w.t())).to(at::kFloat);
-        fprintf(stderr, "  [moe] shared_gate_sig: mean=%.6f std=%.6f max=%.6f\n", seg_f.mean().item<float>(), seg_f.std().item<float>(), seg_f.abs().max().item<float>());
     }
 
     for (int64_t kk = 0; kk < top_k; kk++) {
@@ -749,8 +739,6 @@ static at::Tensor moe_forward(
     if (getenv("QWEN36_DUMP_MOE")) {
         auto ro_f = routed_output.to(at::kFloat);
         auto so_f = shared_out.to(at::kFloat);
-        fprintf(stderr, "  [moe] routed_output (after loop): mean=%.6f std=%.6f max=%.6f\n", ro_f.mean().item<float>(), ro_f.std().item<float>(), ro_f.abs().max().item<float>());
-        fprintf(stderr, "  [moe] shared_out: mean=%.6f std=%.6f max=%.6f\n", so_f.mean().item<float>(), so_f.std().item<float>(), so_f.abs().max().item<float>());
     }
 
     return (routed_output + shared_out).reshape({batch, seq, hidden_dim});
@@ -818,10 +806,6 @@ static at::Tensor forward_single_layer(
                 auto mf = mlp_out.to(at::kFloat);
                 auto pf = post_attn.to(at::kFloat);
                 auto hf = hidden.to(at::kFloat);
-                fprintf(stderr, "  [last_layer] hidden_in:  mean=%.6f std=%.6f max=%.6f\n", hf.mean().item<float>(), hf.std().item<float>(), hf.abs().max().item<float>());
-                fprintf(stderr, "  [last_layer] attn_out:   mean=%.6f std=%.6f max=%.6f\n", af.mean().item<float>(), af.std().item<float>(), af.abs().max().item<float>());
-                fprintf(stderr, "  [last_layer] post_attn:   mean=%.6f std=%.6f max=%.6f\n", pf.mean().item<float>(), pf.std().item<float>(), pf.abs().max().item<float>());
-                fprintf(stderr, "  [last_layer] mlp_out:     mean=%.6f std=%.6f max=%.6f\n", mf.mean().item<float>(), mf.std().item<float>(), mf.abs().max().item<float>());
             }
             return hidden + attn_output + mlp_out;
         } else {
@@ -1271,7 +1255,6 @@ static at::Tensor forward_full(
     // Debug: dump embedding output stats
     if (getenv("QWEN36_DUMP_LAYERS")) {
         auto h_f = hidden.to(at::kFloat);
-        fprintf(stderr, "Layer  0 (embed): mean=%.6f std=%.6f max_abs=%.6f\n",
             h_f.mean().item<float>(), h_f.std().item<float>(), h_f.abs().max().item<float>());
     }
 
@@ -1303,7 +1286,6 @@ static at::Tensor forward_full(
         // Debug: dump per-layer hidden state stats (matching HF output_hidden_states)
         if (getenv("QWEN36_DUMP_LAYERS")) {
             auto h_f = hidden.to(at::kFloat);
-            fprintf(stderr, "Layer %2ld: mean=%.6f std=%.6f max_abs=%.6f\n",
                 i, h_f.mean().item<float>(), h_f.std().item<float>(), h_f.abs().max().item<float>());
         }
 
@@ -1560,7 +1542,6 @@ static at::Tensor forward_full_checkpoint(
             c10::cuda::CUDACachingAllocator::emptyCache();
             size_t free, total;
             cudaMemGetInfo(&free, &total);
-            fprintf(stderr, "[mem_debug] after group %ld/%ld: used=%.1f GB, free=%.1f GB\n",
                 (long)g, (long)num_groups, (total - free) / 1e9, free / 1e9);
         }
     }
@@ -1959,7 +1940,7 @@ __attribute__((visibility("default"))) void* qwen36_create_training_context(
             (long)num_layers, (long)ctx->lora_a.size(), (long)ctx->adam_m.size());
         return ctx;
     } catch (const std::exception& e) {
-        fprintf(stderr, "[q36_create_ctx] FAILED: %s\n", e.what());
+        fprintf(stderr, "[q36] create FAILED: %s\n", e.what());
         return nullptr;
     }
 }
@@ -2028,7 +2009,6 @@ __attribute__((visibility("default"))) double qwen36_train_step(
         {
             size_t free, total;
             cudaMemGetInfo(&free, &total);
-            fprintf(stderr, "[mem_debug] after forward: used=%.1f GB, free=%.1f GB\n",
                 (total - free) / 1e9, free / 1e9);
         }
 
@@ -2045,7 +2025,6 @@ __attribute__((visibility("default"))) double qwen36_train_step(
         {
             size_t free, total;
             cudaMemGetInfo(&free, &total);
-            fprintf(stderr, "[mem_debug] after CE backward: used=%.1f GB, free=%.1f GB\n",
                 (total - free) / 1e9, free / 1e9);
         }
 
@@ -2059,7 +2038,6 @@ __attribute__((visibility("default"))) double qwen36_train_step(
         {
             size_t free, total;
             cudaMemGetInfo(&free, &total);
-            fprintf(stderr, "[mem_debug] before manual backward: used=%.1f GB, free=%.1f GB\n",
                 (total - free) / 1e9, free / 1e9);
         }
 
@@ -2081,7 +2059,6 @@ __attribute__((visibility("default"))) double qwen36_train_step(
             auto mtp_hidden = mtp_forward(ctx, hidden_detached, input_ids);
             auto mtp_loss = mtp_compute_loss(ctx, mtp_hidden, input_ids, target_mask);
             if (ctx->step_count == 0) {
-                fprintf(stderr, "[mtp_debug] main_loss=%.4f mtp_loss=%.4f (x0.5=%.4f) total=%.4f\n",
                     loss_val, mtp_loss.item<double>() / 0.5, mtp_loss.item<double>(),
                     (loss_val + mtp_loss.item<double>()));
             }
@@ -2213,7 +2190,7 @@ __attribute__((visibility("default"))) double qwen36_train_step(
 
         return loss_val;
     } catch (const std::exception& e) {
-        fprintf(stderr, "[q36_train_step] FAILED: %s\n", e.what());
+        fprintf(stderr, "[q36] train_step FAILED: %s\n", e.what());
         return -1.0;
     }
 }
@@ -2313,7 +2290,6 @@ __attribute__((visibility("default"))) int32_t qwen36_init_nccl(
         lc.nccl_stream = (void*)nccl_stream;
     }
 
-    fprintf(stderr, "[ep_nccl] rank=%d world=%d comm=%p stream=%p\n", rank, world_size, (void*)comm, (void*)nccl_stream);
     return 0;
 }
 
@@ -2437,7 +2413,7 @@ int64_t qwen36_add_lora(
         fprintf(stderr, "[q36_lora] added adapter %ld: rank=%ld alpha=%.1f\n", (long)id, (long)rank, alpha);
         return id;
     } catch (const std::exception& e) {
-        fprintf(stderr, "[q36_add_lora] FAILED: %s\n", e.what());
+        fprintf(stderr, "[q36] add_lora FAILED: %s\n", e.what());
         return -1;
     }
 }
@@ -2488,7 +2464,7 @@ double qwen36_eval_step(void* ctx_ptr, void* input_ids_ptr, void* target_mask_pt
         auto loss = compute_loss(ctx, hidden, input_ids, target_mask, ctx->vocab_size);
         return loss.item<double>();
     } catch (const std::exception& e) {
-        fprintf(stderr, "[q36_eval_step] FAILED: %s\n", e.what());
+        fprintf(stderr, "[q36] eval_step FAILED: %s\n", e.what());
         return -1.0;
     }
 }
