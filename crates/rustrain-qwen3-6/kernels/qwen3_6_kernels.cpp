@@ -89,6 +89,9 @@ struct NcclAllReduceFunction : public torch::autograd::Function<NcclAllReduceFun
         int dev = input.device().index();
         cudaSetDevice(dev);
         auto compute_stream = c10::cuda::getCurrentCUDAStream(dev).stream();
+        // Don't save input for backward — we don't need it (expert weights frozen).
+        // This prevents autograd from keeping input alive and causing memory issues.
+        ctx->save_for_backward({});
         auto output = at::empty_like(input);
         ncclResult_t err = ncclAllReduce(
             input.data_ptr(), output.data_ptr(),
