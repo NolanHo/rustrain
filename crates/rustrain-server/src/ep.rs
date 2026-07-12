@@ -28,9 +28,10 @@ pub struct EpCoordinator {
 }
 
 impl EpCoordinator {
-    /// Create coordinator by forking `world_size` worker processes.
+    /// Create coordinator by spawning `world_size` worker processes.
     /// Each worker is pinned to GPU `rank`.
-    /// Returns coordinator in parent process. Child processes never return (they enter worker loop).
+    /// Uses exec (not fork) because CUDA + fork is incompatible — forked children
+    /// inherit parent's CUDA context but can't use it.
     pub fn launch(
         world_size: usize,
         metrics_dir: PathBuf,
@@ -39,28 +40,34 @@ impl EpCoordinator {
         let shm_name = channel.shm_name().to_string();
         let channel = Arc::new(channel);
 
+        let exe = std::env::current_exe()
+            .map_err(|e| io::Error::other(format!("current_exe: {e}")))?;
         let mut worker_pids = Vec::with_capacity(world_size);
 
         for rank in 0..world_size {
-            let pid = unsafe { libc::fork() };
-            if pid < 0 {
-                return Err(io::Error::last_os_error());
-            }
-            if pid == 0 {
-                // Child process — enter worker loop (never returns)
-                let metrics_path = metrics_dir.join(format!("ep_rank{}_metrics.jsonl", rank));
-                if let Err(e) = worker_main(&shm_name, rank, world_size, metrics_path) {
-                    eprintln!("[ep-worker-{}] fatal: {}", rank, e);
-                    std::process::exit(1);
-                }
-                std::process::exit(0);
-            }
-            // Parent — record child PID
-            worker_pids.push(pid as u32);
+            let metrics_path = metrics_dir.join(format!("ep_rank{}_metrics.jsonl", rank));
+            let child = std::process::Command::new(&exe)
+                .arg("ep-worker")
+                .arg("--shm-name").arg(&shm_name)
+                .arg("--rank").arg(rank.to_string())
+                .arg("--world-size").arg(world_size.to_string())
+                .arg("--metrics-path").arg(&metrics_path)
+                .env("RANK", rank.to_string())
+                .env("WORLD_SIZE", world_size.to_string())
+                .env("LOCAL_RANK", rank.to_string())
+                .stdout(std::process::Stdio::inherit())
+                .stderr(std::process::Stdio::inherit())
+                .spawn()
+                .map_err(|e| io::Error::other(format!("spawn worker {rank}: {e}")))?;
+            let pid = child.id();
+            // Keep child handle alive — store in a static to prevent early drop
+            // (drop would kill the child)
+            std::mem::forget(child);
+            worker_pids.push(pid);
             tracing::info!("Launched EP worker rank {} (PID {})", rank, pid);
         }
 
-        // Wait for workers to initialize NCCL
+        // Wait for workers to initialize
         std::thread::sleep(std::time::Duration::from_secs(2));
 
         Ok(Self { channel, worker_pids })

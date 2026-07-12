@@ -87,6 +87,18 @@ enum Command {
         world_size: usize,
     },
 
+    /// EP worker process (launched by ep-server, not for direct use)
+    EpWorker {
+        #[arg(long)]
+        shm_name: String,
+        #[arg(long)]
+        rank: usize,
+        #[arg(long)]
+        world_size: usize,
+        #[arg(long)]
+        metrics_path: PathBuf,
+    },
+
     /// Run a command on a Ray GPU worker (via rayrust native SDK)
     #[cfg(feature = "ray")]
     RayGpu {
@@ -164,6 +176,17 @@ fn main() -> Result<()> {
             metrics_dir,
             world_size,
         } => run_ep_server(http_port, grpc_port, metrics_dir, world_size),
+        Command::EpWorker {
+            shm_name,
+            rank,
+            world_size,
+            metrics_path,
+        } => {
+            use rustrain_server::ep::worker_main;
+            worker_main(&shm_name, rank, world_size, metrics_path)
+                .map_err(|e| anyhow!("EP worker error: {}", e))?;
+            Ok(())
+        }
         #[cfg(feature = "ray")]
         Command::RayGpu {
             num_gpus,
