@@ -677,14 +677,18 @@ static at::Tensor moe_forward(
         auto seg_f = at::sigmoid(at::matmul(flat, shared_expert_gate_w.t())).to(at::kFloat);
     }
 
+    // Expert loop + NCCL all-reduce — all outside autograd graph.
+    // Expert weights are FROZEN, so no gradients needed for expert ops.
+    // Putting the entire expert loop inside AutoGradMode(false) prevents
+    // autograd from saving intermediate tensors that would be freed during
+    // backward, causing cudaErrorIllegalAddress on the next step.
+    at::AutoGradMode no_grad(false);
     for (int64_t kk = 0; kk < top_k; kk++) {
         auto expert_indices = topk_indices.select(-1, kk);
         auto expert_weights = topk_weights.select(-1, kk);
         for (int64_t e_local = 0; e_local < expert_count; e_local++) {
             int64_t e_global = expert_start + e_local;
             auto mask = expert_indices.eq(e_global);
-            // Use nonzero().size(0) instead of mask.sum().item<double>()
-            // This avoids GPU→CPU synchronization — size(0) is metadata only
             auto token_indices = mask.nonzero().squeeze(-1);
             if (token_indices.size(0) == 0) continue;
             auto selected = flat.index_select(0, token_indices);
@@ -700,26 +704,7 @@ static at::Tensor moe_forward(
     }
 
     // EP all-reduce: sum routed_output across all EP ranks
-    // Each rank only has contributions from its local experts.
-    // The non-local expert tokens are still zero — after all-reduce, every
-    // rank gets the complete routed_output.
-    // EP all-reduce: sum routed_output across all EP ranks
-    // CRITICAL: must use out-of-place NCCL (separate input/output buffers).
-    // In-place NCCL (ptr, ptr) modifies autograd-tracked tensor via raw CUDA call,
-    // bypassing PyTorch's version counter. During backward, autograd accesses
-    // corrupted saved tensors → cudaErrorIllegalAddress.
-    // EP all-reduce via custom autograd Function
-    // Properly integrates NCCL with PyTorch autograd:
-    // - Forward: NCCL all-reduce, output is new tensor (autograd-connected)
-    // - Backward: NCCL all-reduce on gradient (correct for EP)
-    // - PyTorch manages tensor lifecycle (no premature freeing)
     if (nccl_comm_v) {
-        // NCCL all-reduce OUTSIDE autograd graph.
-        // AutoGradMode(false) ensures the result tensor is NOT tracked by autograd,
-        // so autograd won't save it or its input for backward. This avoids all
-        // memory lifecycle issues between NCCL and PyTorch's caching allocator.
-        // Expert weights are frozen — gradients flow through residual connection.
-        at::AutoGradMode guard(false);
         auto nccl_comm = reinterpret_cast<ncclComm_t>(nccl_comm_v);
         int dev = routed_output.device().index();
         cudaSetDevice(dev);
@@ -734,6 +719,7 @@ static at::Tensor moe_forward(
         }
         routed_output = reduced;
     }
+    no_grad.~AutoGradMode();  // Restore autograd before shared expert
 
     // Shared expert (same as before, with fused SwiGLU)
     auto shared_gate = at::matmul(flat, shared_gate_proj.t());
