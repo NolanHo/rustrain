@@ -2218,7 +2218,11 @@ __attribute__((visibility("default"))) int32_t qwen36_init_nccl(
     cudaSetDevice(local_rank);
 
     // Exchange unique ID via file
+    // Rank 0 generates ID, writes to file, then writes "ready" sentinel.
+    // Other ranks wait for "ready" file, then read ID.
+    // This ensures rank 0's write is visible before others read.
     const char* id_path = "/tmp/rustrain-nccl/nccl-id.bin";
+    const char* ready_path = "/tmp/rustrain-nccl/nccl-ready.txt";
     ncclUniqueId unique_id;
     if (rank == 0) {
         mkdir("/tmp/rustrain-nccl", 0777);
@@ -2226,19 +2230,25 @@ __attribute__((visibility("default"))) int32_t qwen36_init_nccl(
         FILE* f = fopen(id_path, "wb");
         fwrite(&unique_id, sizeof(unique_id), 1, f);
         fclose(f);
+        // Write ready sentinel AFTER id file
+        FILE* rf = fopen(ready_path, "w");
+        fprintf(rf, "ready\n");
+        fclose(rf);
     } else {
-        // Wait for rank 0 to write the ID file
-        for (int i = 0; i < 600; i++) {  // 60 second timeout
-            FILE* f = fopen(id_path, "rb");
-            if (f) {
-                if (fread(&unique_id, sizeof(unique_id), 1, f) == 1) {
-                    fclose(f);
-                    break;
-                }
-                fclose(f);
-            }
-            usleep(100000);  // 100ms
+        // Wait for ready sentinel
+        for (int i = 0; i < 600; i++) {
+            FILE* rf = fopen(ready_path, "r");
+            if (rf) { fclose(rf); break; }
+            usleep(10000);  // 10ms
         }
+        // Now read ID file
+        FILE* f = fopen(id_path, "rb");
+        if (!f || fread(&unique_id, sizeof(unique_id), 1, f) != 1) {
+            fprintf(stderr, "[ep_nccl] rank %d: failed to read ID file\n", rank);
+            if (f) fclose(f);
+            return -1;
+        }
+        fclose(f);
     }
 
     // Initialize communicator

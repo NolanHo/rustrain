@@ -118,6 +118,11 @@ pub fn worker_main(
 
     let mut session = Qwen36Session::new(device, compute_kind, metrics_path);
 
+    // Pre-create NCCL communicator — all workers reach this point simultaneously
+    // because EpCoordinator::launch forks all workers before they enter the loop.
+    // NCCL communicator init is a collective operation requiring all ranks.
+    // We use a CreateSession broadcast to synchronize all workers for NCCL init.
+    // (The first CreateSession command triggers qwen36_init_nccl inside init_lora)
     tracing::info!("EP worker {} ready, entering command loop", rank);
 
     loop {
