@@ -55,7 +55,9 @@ impl EpCoordinator {
                 .env("RANK", rank.to_string())
                 .env("WORLD_SIZE", world_size.to_string())
                 .env("LOCAL_RANK", rank.to_string())
-                .env("CUDA_VISIBLE_DEVICES", rank.to_string())
+                // Don't set CUDA_VISIBLE_DEVICES — NCCL needs to see all GPUs
+                // for cross-GPU communication. cudaSetDevice(rank) in C++ handles
+                // device selection within the process.
                 .stdout(std::process::Stdio::inherit())
                 .stderr(std::process::Stdio::inherit())
                 .spawn()
@@ -111,9 +113,9 @@ pub fn worker_main(
     // Attach to shared memory
     let worker = EpWorker::attach(shm_name, rank, world_size)?;
 
-    // Set CUDA device — with CUDA_VISIBLE_DEVICES=rank, only one GPU is visible.
-    // So device is always Cuda(0) inside the worker.
-    let device = Device::Cuda(0);
+    // Set CUDA device — worker process has its own CUDA context (exec, not fork).
+    // cudaSetDevice(rank) selects the correct GPU.
+    let device = Device::Cuda(rank);
     let compute_kind = Kind::BFloat16;
 
     // Create session (same as non-EP, but with LOCAL_RANK env for EP)

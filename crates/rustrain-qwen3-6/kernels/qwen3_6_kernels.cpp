@@ -2222,9 +2222,8 @@ __attribute__((visibility("default"))) int32_t qwen36_init_nccl(
     // NCCL communicator binds to the current CUDA context. If PyTorch hasn't
     // initialized CUDA on this device yet, NCCL gets a wrong context → "invalid argument".
     // Creating a dummy tensor forces PyTorch to initialize its CUDA context.
-    // With CUDA_VISIBLE_DEVICES=rank, only one GPU is visible as device 0.
-    // So local_rank is always 0 inside the worker.
-    int local_rank = 0;
+    const char* local_rank_str = getenv("LOCAL_RANK");
+    int local_rank = local_rank_str ? atoi(local_rank_str) : rank;
     cudaSetDevice(local_rank);
     {
         // Force PyTorch CUDA context initialization on this device
