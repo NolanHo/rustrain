@@ -159,6 +159,10 @@ pub fn worker_main(
 
 /// Execute a command on the local session, return result.
 fn execute_command(session: &mut Qwen36Session, cmd: &EpCommand) -> EpResult {
+    // For EP mode: ensure CUDA device is set correctly before any tensor op.
+    // This is needed because PyTorch's current device may not match session.device()
+    // after exec (new process, CUDA lazy init).
+    let _ = tch::Tensor::zeros(&[1], (tch::Kind::Float, session.device()));
     match cmd {
         EpCommand::CreateSession { session_id: _ } => {
             // Session already created in worker_main; just acknowledge
