@@ -676,12 +676,10 @@ static at::Tensor moe_forward(
         auto seg_f = at::sigmoid(at::matmul(flat, shared_expert_gate_w.t())).to(at::kFloat);
     }
 
-    // Expert loop + NCCL all-reduce — all outside autograd graph.
-    // Expert weights are FROZEN, so no gradients needed for expert ops.
-    // Putting the entire expert loop inside AutoGradMode(false) prevents
-    // autograd from saving intermediate tensors that would be freed during
-    // backward, causing cudaErrorIllegalAddress on the next step.
-    at::AutoGradMode no_grad(false);
+    // Expert loop — NOT inside AutoGradMode(false).
+    // NcclAllReduceFunction handles autograd integration for NCCL all-reduce.
+    // Expert weights are frozen (no grad), but intermediate tensors need autograd
+    // for gradient flow through the residual connection.
     for (int64_t kk = 0; kk < top_k; kk++) {
         auto expert_indices = topk_indices.select(-1, kk);
         auto expert_weights = topk_weights.select(-1, kk);
@@ -702,30 +700,14 @@ static at::Tensor moe_forward(
         }
     }
 
-    // EP all-reduce: sum routed_output across all EP ranks
+    // EP all-reduce via NcclAllReduceFunction — custom autograd Function.
+    // This was verified to work for 2h+ in the old architecture.
+    // AutoGradMode(false) alone crashes on step 1; autograd Function properly
+    // manages tensor lifecycle for NCCL's internal buffer registration.
     if (nccl_comm_v) {
         auto nccl_comm = reinterpret_cast<ncclComm_t>(nccl_comm_v);
-        int dev = routed_output.device().index();
-        cudaSetDevice(dev);
-        // Use NCCL stream if available, otherwise compute stream.
-        // nullptr means use default stream (same as PyTorch compute stream).
-        auto nccl_stream = reinterpret_cast<cudaStream_t>(nccl_stream_v);
-        if (!nccl_stream) {
-            nccl_stream = c10::cuda::getCurrentCUDAStream(dev).stream();
-        }
-        auto reduced = at::empty_like(routed_output);
-        ncclResult_t err = ncclAllReduce(
-            routed_output.data_ptr(), reduced.data_ptr(),
-            routed_output.numel(), ncclBfloat16, ncclSum,
-            nccl_comm, nccl_stream);
-        if (err != ncclSuccess) {
-            fprintf(stderr, "[ep] ncclAllReduce fwd FAILED: %d (%s) dev=%d\n", err, ncclGetErrorString(err), dev);
-        }
-        // Sync NCCL stream before using result on compute stream
-        cudaStreamSynchronize(nccl_stream);
-        routed_output = reduced;
+        routed_output = NcclAllReduceFunction::apply(routed_output, (int64_t)nccl_comm);
     }
-    no_grad.~AutoGradMode();  // Restore autograd before shared expert
 
     // Shared expert (same as before, with fused SwiGLU)
     auto shared_gate = at::matmul(flat, shared_gate_proj.t());
