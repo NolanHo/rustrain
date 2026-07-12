@@ -213,9 +213,10 @@ fn execute_command(session: &mut Qwen36Session, cmd: &EpCommand) -> EpResult {
             EpResult::AdapterIds(session.list_lora())
         }
         EpCommand::TrainStep { input_ids, target_mask, attention_mask, seq_len, .. } => {
-            let input_ids_tensor = tch::Tensor::from_slice(input_ids).reshape(&[1, *seq_len as i64]).to_device(session.device());
-            let target_mask_tensor = tch::Tensor::from_slice(target_mask).reshape(&[1, *seq_len as i64]).to_device(session.device());
-            let attention_mask_tensor = tch::Tensor::from_slice(attention_mask).reshape(&[1, *seq_len as i64]).to_device(session.device());
+            let sl = *seq_len as i64;
+            let input_ids_tensor = tch::Tensor::from_slice(input_ids).reshape(&[1, sl]).to_device(session.device());
+            let target_mask_tensor = tch::Tensor::from_slice(target_mask).reshape(&[1, sl]).to_device(session.device());
+            let attention_mask_tensor = tch::Tensor::from_slice(attention_mask).reshape(&[1, sl]).to_device(session.device());
 
             match session.train_step(TrainInput {
                 input_ids: input_ids_tensor,
@@ -227,9 +228,10 @@ fn execute_command(session: &mut Qwen36Session, cmd: &EpCommand) -> EpResult {
             }
         }
         EpCommand::EvalStep { input_ids, target_mask, attention_mask, seq_len, .. } => {
-            let input_ids_tensor = tch::Tensor::from_slice(input_ids).reshape(&[1, *seq_len as i64]).to_device(session.device());
-            let target_mask_tensor = tch::Tensor::from_slice(target_mask).reshape(&[1, *seq_len as i64]).to_device(session.device());
-            let attention_mask_tensor = tch::Tensor::from_slice(attention_mask).reshape(&[1, *seq_len as i64]).to_device(session.device());
+            let sl = *seq_len as i64;
+            let input_ids_tensor = tch::Tensor::from_slice(input_ids).reshape(&[1, sl]).to_device(session.device());
+            let target_mask_tensor = tch::Tensor::from_slice(target_mask).reshape(&[1, sl]).to_device(session.device());
+            let attention_mask_tensor = tch::Tensor::from_slice(attention_mask).reshape(&[1, sl]).to_device(session.device());
 
             match session.eval_step(TrainInput {
                 input_ids: input_ids_tensor,

@@ -649,7 +649,7 @@ async fn ep_train_step(
     let input_ids = decode_int64_vec(&req.input_ids).map_err(|e| err_resp(&e))?;
     let target_mask = decode_int64_vec(&req.target_mask).map_err(|e| err_resp(&e))?;
     let attention_mask = decode_int64_vec(&req.attention_mask).map_err(|e| err_resp(&e))?;
-    let seq_len = req.input_ids.shape[0].max(1) as usize;
+    let seq_len = input_ids.len();
 
     let cmd = rustrain_ipc::EpCommand::TrainStep {
         session_id: id,
@@ -673,7 +673,7 @@ async fn ep_eval_step(
     let input_ids = decode_int64_vec(&req.input_ids).map_err(|e| err_resp(&e))?;
     let target_mask = decode_int64_vec(&req.target_mask).map_err(|e| err_resp(&e))?;
     let attention_mask = decode_int64_vec(&req.attention_mask).map_err(|e| err_resp(&e))?;
-    let seq_len = req.input_ids.shape[0].max(1) as usize;
+    let seq_len = input_ids.len();
 
     let cmd = rustrain_ipc::EpCommand::EvalStep {
         session_id: id,
