@@ -108,9 +108,13 @@ pub fn worker_main(
     let compute_kind = Kind::BFloat16;
 
     // Create session (same as non-EP, but with LOCAL_RANK env for EP)
-    std::env::set_var("RANK", rank.to_string());
-    std::env::set_var("WORLD_SIZE", world_size.to_string());
-    std::env::set_var("LOCAL_RANK", rank.to_string());
+    // SAFETY: set_var is unsafe in Rust 2024 edition. We're in a forked child process
+    // before any other threads exist, so this is safe.
+    unsafe {
+        std::env::set_var("RANK", rank.to_string());
+        std::env::set_var("WORLD_SIZE", world_size.to_string());
+        std::env::set_var("LOCAL_RANK", rank.to_string());
+    }
 
     let mut session = Qwen36Session::new(device, compute_kind, metrics_path);
 

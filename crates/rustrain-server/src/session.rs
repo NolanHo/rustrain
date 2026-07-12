@@ -139,6 +139,7 @@ impl Qwen36Session {
             compute_kind,
             ctx: None,
             weights: None,
+            dataset: None,
             lora_rank: 0,
             lora_alpha: 0,
             lr: 1e-4,

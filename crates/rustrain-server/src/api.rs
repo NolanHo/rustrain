@@ -659,7 +659,7 @@ async fn ep_train_step(
         seq_len,
     };
     match state.coordinator.dispatch(&cmd) {
-        rustrain_ipc::EpResult::Loss(loss) => Ok(Json(TrainStepResponse { loss })),
+        rustrain_ipc::EpResult::Loss(loss) => Ok(Json(TrainStepResponse { loss, step: 0 })),
         rustrain_ipc::EpResult::Error(e) => Err(err_resp(&e)),
         _ => Err(err_resp("unexpected result")),
     }
