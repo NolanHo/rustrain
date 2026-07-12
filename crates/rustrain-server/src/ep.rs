@@ -55,6 +55,7 @@ impl EpCoordinator {
                 .env("RANK", rank.to_string())
                 .env("WORLD_SIZE", world_size.to_string())
                 .env("LOCAL_RANK", rank.to_string())
+                .env("CUDA_VISIBLE_DEVICES", rank.to_string())
                 .stdout(std::process::Stdio::inherit())
                 .stderr(std::process::Stdio::inherit())
                 .spawn()
@@ -110,8 +111,9 @@ pub fn worker_main(
     // Attach to shared memory
     let worker = EpWorker::attach(shm_name, rank, world_size)?;
 
-    // Set CUDA device
-    let device = Device::Cuda(rank);
+    // Set CUDA device — with CUDA_VISIBLE_DEVICES=rank, only one GPU is visible.
+    // So device is always Cuda(0) inside the worker.
+    let device = Device::Cuda(0);
     let compute_kind = Kind::BFloat16;
 
     // Create session (same as non-EP, but with LOCAL_RANK env for EP)
