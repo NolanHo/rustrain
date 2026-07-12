@@ -279,7 +279,6 @@ static at::Tensor full_attention(
     {
         size_t free2, total2;
         cudaMemGetInfo(&free2, &total2);
-            (total2 - free2) / 1e9, free2 / 1e9);
     }
 
     // Release gate before RoPE to save 16GB
@@ -292,7 +291,6 @@ static at::Tensor full_attention(
     {
         size_t free2, total2;
         cudaMemGetInfo(&free2, &total2);
-            (total2 - free2) / 1e9, free2 / 1e9);
     }
 
     if (rotary_dim > 0) {
@@ -1255,7 +1253,6 @@ static at::Tensor forward_full(
     // Debug: dump embedding output stats
     if (getenv("QWEN36_DUMP_LAYERS")) {
         auto h_f = hidden.to(at::kFloat);
-            h_f.mean().item<float>(), h_f.std().item<float>(), h_f.abs().max().item<float>());
     }
 
     for (int64_t i = 0; i < ctx->num_layers; i++) {
@@ -1286,7 +1283,6 @@ static at::Tensor forward_full(
         // Debug: dump per-layer hidden state stats (matching HF output_hidden_states)
         if (getenv("QWEN36_DUMP_LAYERS")) {
             auto h_f = hidden.to(at::kFloat);
-                i, h_f.mean().item<float>(), h_f.std().item<float>(), h_f.abs().max().item<float>());
         }
 
         // Sync + release CUDA allocator cache after each layer in no-grad forward.
@@ -1542,7 +1538,6 @@ static at::Tensor forward_full_checkpoint(
             c10::cuda::CUDACachingAllocator::emptyCache();
             size_t free, total;
             cudaMemGetInfo(&free, &total);
-                (long)g, (long)num_groups, (total - free) / 1e9, free / 1e9);
         }
     }
 
@@ -2009,7 +2004,6 @@ __attribute__((visibility("default"))) double qwen36_train_step(
         {
             size_t free, total;
             cudaMemGetInfo(&free, &total);
-                (total - free) / 1e9, free / 1e9);
         }
 
         // Main loss — compute_loss does chunked CE with immediate backward per chunk.
@@ -2025,7 +2019,6 @@ __attribute__((visibility("default"))) double qwen36_train_step(
         {
             size_t free, total;
             cudaMemGetInfo(&free, &total);
-                (total - free) / 1e9, free / 1e9);
         }
 
         // Release CE's retained graph (hidden_normed etc.) before backward.
@@ -2038,7 +2031,6 @@ __attribute__((visibility("default"))) double qwen36_train_step(
         {
             size_t free, total;
             cudaMemGetInfo(&free, &total);
-                (total - free) / 1e9, free / 1e9);
         }
 
         // Trigger main model backward.
