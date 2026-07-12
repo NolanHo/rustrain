@@ -2268,6 +2268,26 @@ __attribute__((visibility("default"))) int32_t qwen36_init_nccl(
         fclose(f);
     }
 
+    // Barrier: ensure all ranks reach ncclCommInitRank simultaneously.
+    // Without this, rank 0 (fast load_model) reaches ncclCommInitRank before
+    // rank 3 (slow load_model) → NCCL timeout.
+    {
+        const char* barrier_dir = "/tmp/rustrain-nccl";
+        char bpath[256];
+        snprintf(bpath, sizeof(bpath), "%s/barrier_%d", barrier_dir, rank);
+        FILE* bf = fopen(bpath, "w"); fprintf(bf, "1\n"); fclose(bf);
+        // Wait for all ranks
+        for (int i = 0; i < world_size; i++) {
+            char p[256];
+            snprintf(p, sizeof(p), "%s/barrier_%d", barrier_dir, i);
+            for (int w = 0; w < 6000; w++) {  // 60s timeout
+                FILE* f2 = fopen(p, "r");
+                if (f2) { fclose(f2); break; }
+                usleep(10000);
+            }
+        }
+    }
+
     // Initialize communicator — only once per process
     ncclComm_t comm;
     ncclResult_t err = ncclCommInitRank(&comm, world_size, unique_id, rank);
