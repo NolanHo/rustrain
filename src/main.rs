@@ -663,6 +663,11 @@ fn run_ep_server(
 ) -> Result<()> {
     use rustrain_server::{api, ep::EpCoordinator};
 
+    // Prevent parent process from initializing CUDA — it must not touch GPU.
+    // Workers (spawned via exec) get full GPU access.
+    // This env var is inherited by children, so we must clear it for them.
+    std::env::set_var("CUDA_VISIBLE_DEVICES", "");
+
     std::fs::create_dir_all(&metrics_dir)?;
 
     info!("Starting EP server: world_size={world_size}, HTTP port={http_port}");

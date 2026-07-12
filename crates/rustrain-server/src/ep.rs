@@ -55,9 +55,9 @@ impl EpCoordinator {
                 .env("RANK", rank.to_string())
                 .env("WORLD_SIZE", world_size.to_string())
                 .env("LOCAL_RANK", rank.to_string())
-                // Don't set CUDA_VISIBLE_DEVICES — NCCL needs to see all GPUs
-                // for cross-GPU communication. cudaSetDevice(rank) in C++ handles
-                // device selection within the process.
+                // Clear CUDA_VISIBLE_DEVICES — parent set it to "" to prevent
+                // CUDA init in parent. Workers need full GPU access.
+                .env_remove("CUDA_VISIBLE_DEVICES")
                 .stdout(std::process::Stdio::inherit())
                 .stderr(std::process::Stdio::inherit())
                 .spawn()
