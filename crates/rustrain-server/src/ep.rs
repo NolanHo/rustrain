@@ -116,6 +116,13 @@ pub fn worker_main(
         std::env::set_var("LOCAL_RANK", rank.to_string());
     }
 
+    // Force PyTorch CUDA context initialization on this device.
+    // Without this, load_model's tensor.to_device(Cuda(rank)) can crash with
+    // cudaErrorIllegalAddress because PyTorch hasn't initialized CUDA on this device.
+    {
+        let _dummy = tch::Tensor::ones(&[1], (tch::Kind::Float, device));
+    }
+
     let mut session = Qwen36Session::new(device, compute_kind, metrics_path);
 
     // Pre-create NCCL communicator — all workers reach this point simultaneously
