@@ -2226,6 +2226,8 @@ __attribute__((visibility("default"))) int32_t qwen36_init_nccl(
     ncclUniqueId unique_id;
     if (rank == 0) {
         mkdir("/tmp/rustrain-nccl", 0777);
+        // Clean up old files first
+        remove("/tmp/rustrain-nccl/nccl-ready.txt");
         ncclGetUniqueId(&unique_id);
         FILE* f = fopen(id_path, "wb");
         fwrite(&unique_id, sizeof(unique_id), 1, f);
