@@ -2210,6 +2210,7 @@ __attribute__((visibility("default"))) void qwen36_free_training_context(void* c
 // Returns 0 on success, -1 on failure.
 // Process-level NCCL singleton — created once, reused across sessions.
 static ncclComm_t g_nccl_comm = nullptr;
+static cudaStream_t g_nccl_stream = nullptr;
 static bool g_nccl_initialized = false;
 
 __attribute__((visibility("default"))) int32_t qwen36_init_nccl(
@@ -2220,8 +2221,9 @@ __attribute__((visibility("default"))) int32_t qwen36_init_nccl(
     // If already initialized, just set the pointer on this context
     if (g_nccl_initialized) {
         ctx->nccl_comm = g_nccl_comm;
-        for (auto& lc : ctx->layer_configs) { lc.nccl_comm = (void*)g_nccl_comm; }
-        for (auto& lc : ctx->mtp_layer_configs) { lc.nccl_comm = (void*)g_nccl_comm; }
+        ctx->nccl_stream = g_nccl_stream;
+        for (auto& lc : ctx->layer_configs) { lc.nccl_comm = (void*)g_nccl_comm; lc.nccl_stream = (void*)g_nccl_stream; }
+        for (auto& lc : ctx->mtp_layer_configs) { lc.nccl_comm = (void*)g_nccl_comm; lc.nccl_stream = (void*)g_nccl_stream; }
         return 0;
     }
 
@@ -2287,6 +2289,7 @@ __attribute__((visibility("default"))) int32_t qwen36_init_nccl(
 
     // Store as process-level singleton
     g_nccl_comm = comm;
+    g_nccl_stream = nccl_stream;
     g_nccl_initialized = true;
 
     ctx->nccl_comm = comm;
