@@ -686,17 +686,17 @@ static at::Tensor moe_forward(
     // EP all-reduce: sum routed_output across all EP ranks
     if (nccl_comm_v) {
         auto nccl_comm = reinterpret_cast<ncclComm_t>(nccl_comm_v);
-        // Use compute stream directly — NCCL on compute stream is ordered
-        // with all other ops on that stream. No cross-stream sync needed.
-        // NCCL collective is a synchronization point: all ranks block here
-        // until everyone calls ncclAllReduce. The server being async (HTTP)
-        // doesn't matter — the GPU-side NCCL call is the barrier.
         int dev = routed_output.device().index();
+        // Ensure CUDA device matches — cudaSetDevice doesn't update PyTorch's
+        // internal device tracking, so we must use device-specific APIs
+        cudaSetDevice(dev);
         auto compute_stream = c10::cuda::getCurrentCUDAStream(dev).stream();
+        // Ensure routed_output is contiguous for NCCL
+        auto ro = routed_output.is_contiguous() ? routed_output : routed_output.contiguous();
         ncclResult_t nccl_err = ncclAllReduce(
-            routed_output.data_ptr(),
-            routed_output.data_ptr(),
-            routed_output.numel(),
+            ro.data_ptr(),
+            ro.data_ptr(),
+            ro.numel(),
             ncclBfloat16,
             ncclSum,
             nccl_comm,
@@ -704,6 +704,9 @@ static at::Tensor moe_forward(
         );
         if (nccl_err != ncclSuccess) {
             fprintf(stderr, "[ep_debug] ncclAllReduce FAILED: %d (%s)\n", nccl_err, ncclGetErrorString(nccl_err));
+        }
+        if (!ro.is_same(routed_output)) {
+            routed_output.copy_(ro);
         }
     }
 
