@@ -8,11 +8,13 @@ rustrain-core = { path = "../rustrain-core", features = ["tch"] }
 rustrain-qwen3-6 = { path = "../rustrain-qwen3-6" }
 rustrain-checkpoint = { path = "../rustrain-checkpoint" }
 rustrain-train = { path = "../rustrain-train" }
+rustrain-ipc = { path = "../rustrain-ipc" }
 anyhow.workspace = true
 axum.workspace = true
 base64 = "0.22"
 chrono.workspace = true
 futures = "0.3"
+libc = "0.2"
 prost.workspace = true
 safetensors.workspace = true
 serde.workspace = true

@@ -139,7 +139,6 @@ impl Qwen36Session {
             compute_kind,
             ctx: None,
             weights: None,
-            dataset: None,
             lora_rank: 0,
             lora_alpha: 0,
             lr: 1e-4,
@@ -148,6 +147,11 @@ impl Qwen36Session {
             step: 0,
             _nccl_ep: false,
         }
+    }
+
+    /// Get the device this session is bound to.
+    pub fn device(&self) -> Device {
+        self.device
     }
 }
 

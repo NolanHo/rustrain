@@ -21,6 +21,11 @@ pub struct AppState {
     pub manager: Arc<SessionManager>,
 }
 
+/// EP mode: HTTP server dispatches to workers via IPC coordinator.
+pub struct EpAppState {
+    pub coordinator: Arc<crate::ep::EpCoordinator>,
+}
+
 pub fn router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/v1/sessions", post(create_session))
@@ -236,6 +241,18 @@ struct TrainStepHttp {
 struct TrainStepResponse {
     loss: f64,
     step: u64,
+}
+
+/// Decode a base64-encoded int64 tensor to Vec<i64> (for EP IPC).
+fn decode_int64_vec(t: &TensorHttp) -> Result<Vec<i64>, String> {
+    use base64::{engine::general_purpose, Engine};
+    let bytes = general_purpose::STANDARD
+        .decode(&t.data)
+        .map_err(|e| format!("base64 decode: {e}"))?;
+    Ok(bytes
+        .chunks_exact(8)
+        .map(|c| i64::from_le_bytes([c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]]))
+        .collect())
 }
 
 fn decode_tensor(t: &TensorHttp) -> Result<tch::Tensor, String> {
@@ -515,4 +532,230 @@ struct StepMetricJson {
     lr: f64,
     mem_gb: f64,
     timestamp_unix: i64,
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// EP Mode: HTTP handlers that dispatch to workers via IPC
+// ──────────────────────────────────────────────────────────────────────
+
+pub fn ep_router(state: Arc<EpAppState>) -> Router {
+    Router::new()
+        .route("/v1/sessions", post(ep_create_session))
+        .route("/v1/sessions/{id}", axum::routing::delete(ep_delete_session))
+        .route("/v1/sessions/{id}/load_model", post(ep_load_model))
+        .route("/v1/sessions/{id}/load_dataset", post(ep_load_dataset))
+        .route("/v1/sessions/{id}/init_lora", post(ep_init_lora))
+        .route("/v1/sessions/{id}/train_step", post(ep_train_step))
+        .route("/v1/sessions/{id}/eval_step", post(ep_eval_step))
+        .route("/v1/sessions/{id}/add_lora", post(ep_add_lora))
+        .route("/v1/sessions/{id}/remove_lora", post(ep_remove_lora))
+        .route("/v1/sessions/{id}/list_lora", get(ep_list_lora))
+        .route("/v1/sessions/{id}/export_adapter", post(ep_export_adapter))
+        .route("/v1/sessions/{id}/status", get(ep_get_status))
+        .route("/v1/health", get(ep_health))
+        .with_state(state)
+}
+
+async fn ep_health() -> Json<serde_json::Value> {
+    Json(serde_json::json!({"status": "ok", "mode": "ep"}))
+}
+
+async fn ep_create_session(
+    State(state): State<Arc<EpAppState>>,
+    Json(req): Json<CreateSessionRequest>,
+) -> Result<Json<CreateSessionResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let cmd = rustrain_ipc::EpCommand::CreateSession { session_id: req.session_id.clone() };
+    match state.coordinator.dispatch(&cmd) {
+        rustrain_ipc::EpResult::Ok => Ok(Json(CreateSessionResponse { session_id: req.session_id })),
+        rustrain_ipc::EpResult::Error(e) => Err(err_resp(&e)),
+        _ => Err(err_resp("unexpected result")),
+    }
+}
+
+async fn ep_delete_session(
+    State(state): State<Arc<EpAppState>>,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    let cmd = rustrain_ipc::EpCommand::DeleteSession { session_id: id.clone() };
+    match state.coordinator.dispatch(&cmd) {
+        rustrain_ipc::EpResult::Ok => Ok(Json(serde_json::json!({"deleted": id}))),
+        rustrain_ipc::EpResult::Error(e) => Err(err_resp(&e)),
+        _ => Err(err_resp("unexpected result")),
+    }
+}
+
+async fn ep_load_model(
+    State(state): State<Arc<EpAppState>>,
+    Path(id): Path<String>,
+    Json(req): Json<LoadModelHttp>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    let cmd = rustrain_ipc::EpCommand::LoadModel {
+        session_id: id,
+        model_path: req.model_path,
+        config_toml: req.config_toml,
+    };
+    match state.coordinator.dispatch(&cmd) {
+        rustrain_ipc::EpResult::Ok => Ok(Json(serde_json::json!({"loaded": true}))),
+        rustrain_ipc::EpResult::Error(e) => Err(err_resp(&e)),
+        _ => Err(err_resp("unexpected result")),
+    }
+}
+
+async fn ep_load_dataset(
+    State(state): State<Arc<EpAppState>>,
+    Path(id): Path<String>,
+    Json(req): Json<LoadDatasetHttp>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    let cmd = rustrain_ipc::EpCommand::LoadDataset {
+        session_id: id,
+        jsonl_path: req.jsonl_path,
+        seq_len: req.seq_len,
+    };
+    match state.coordinator.dispatch(&cmd) {
+        rustrain_ipc::EpResult::Count(n) => Ok(Json(serde_json::json!({"samples": n}))),
+        rustrain_ipc::EpResult::Error(e) => Err(err_resp(&e)),
+        _ => Err(err_resp("unexpected result")),
+    }
+}
+
+async fn ep_init_lora(
+    State(state): State<Arc<EpAppState>>,
+    Path(id): Path<String>,
+    Json(req): Json<InitLoRAHttp>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    let cmd = rustrain_ipc::EpCommand::InitLora {
+        session_id: id,
+        rank: req.rank,
+        alpha: req.alpha,
+        target_layers: req.target_layers,
+        target_modules: req.target_modules,
+        lr: req.lr,
+        beta1: req.beta1,
+        beta2: req.beta2,
+        eps: req.eps,
+    };
+    match state.coordinator.dispatch(&cmd) {
+        rustrain_ipc::EpResult::Count(n) => Ok(Json(serde_json::json!({"lora_count": n}))),
+        rustrain_ipc::EpResult::Error(e) => Err(err_resp(&e)),
+        _ => Err(err_resp("unexpected result")),
+    }
+}
+
+async fn ep_train_step(
+    State(state): State<Arc<EpAppState>>,
+    Path(id): Path<String>,
+    Json(req): Json<TrainStepHttp>,
+) -> Result<Json<TrainStepResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let input_ids = decode_int64_vec(&req.input_ids).map_err(|e| err_resp(&e))?;
+    let target_mask = decode_int64_vec(&req.target_mask).map_err(|e| err_resp(&e))?;
+    let attention_mask = decode_int64_vec(&req.attention_mask).map_err(|e| err_resp(&e))?;
+    let seq_len = req.input_ids.shape[0].max(1) as usize;
+
+    let cmd = rustrain_ipc::EpCommand::TrainStep {
+        session_id: id,
+        input_ids,
+        target_mask,
+        attention_mask,
+        seq_len,
+    };
+    match state.coordinator.dispatch(&cmd) {
+        rustrain_ipc::EpResult::Loss(loss) => Ok(Json(TrainStepResponse { loss })),
+        rustrain_ipc::EpResult::Error(e) => Err(err_resp(&e)),
+        _ => Err(err_resp("unexpected result")),
+    }
+}
+
+async fn ep_eval_step(
+    State(state): State<Arc<EpAppState>>,
+    Path(id): Path<String>,
+    Json(req): Json<TrainStepHttp>,
+) -> Result<Json<EvalStepResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let input_ids = decode_int64_vec(&req.input_ids).map_err(|e| err_resp(&e))?;
+    let target_mask = decode_int64_vec(&req.target_mask).map_err(|e| err_resp(&e))?;
+    let attention_mask = decode_int64_vec(&req.attention_mask).map_err(|e| err_resp(&e))?;
+    let seq_len = req.input_ids.shape[0].max(1) as usize;
+
+    let cmd = rustrain_ipc::EpCommand::EvalStep {
+        session_id: id,
+        input_ids,
+        target_mask,
+        attention_mask,
+        seq_len,
+    };
+    match state.coordinator.dispatch(&cmd) {
+        rustrain_ipc::EpResult::Loss(loss) => Ok(Json(EvalStepResponse { loss })),
+        rustrain_ipc::EpResult::Error(e) => Err(err_resp(&e)),
+        _ => Err(err_resp("unexpected result")),
+    }
+}
+
+async fn ep_add_lora(
+    State(state): State<Arc<EpAppState>>,
+    Path(id): Path<String>,
+    Json(req): Json<AddLoRAHttp>,
+) -> Result<Json<AddLoRAResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let cmd = rustrain_ipc::EpCommand::AddLora {
+        session_id: id,
+        rank: req.rank,
+        alpha: req.alpha,
+        target_layers: req.target_layers,
+        target_modules: req.target_modules,
+    };
+    match state.coordinator.dispatch(&cmd) {
+        rustrain_ipc::EpResult::AdapterId(id) => Ok(Json(AddLoRAResponse { adapter_id: id })),
+        rustrain_ipc::EpResult::Error(e) => Err(err_resp(&e)),
+        _ => Err(err_resp("unexpected result")),
+    }
+}
+
+async fn ep_remove_lora(
+    State(state): State<Arc<EpAppState>>,
+    Path(id): Path<String>,
+    Json(req): Json<RemoveLoRAHttp>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    let cmd = rustrain_ipc::EpCommand::RemoveLora { session_id: id, adapter_id: req.adapter_id };
+    match state.coordinator.dispatch(&cmd) {
+        rustrain_ipc::EpResult::Ok => Ok(Json(serde_json::json!({"removed": true}))),
+        rustrain_ipc::EpResult::Error(e) => Err(err_resp(&e)),
+        _ => Err(err_resp("unexpected result")),
+    }
+}
+
+async fn ep_list_lora(
+    State(state): State<Arc<EpAppState>>,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    let cmd = rustrain_ipc::EpCommand::ListLora { session_id: id };
+    match state.coordinator.dispatch(&cmd) {
+        rustrain_ipc::EpResult::AdapterIds(ids) => Ok(Json(serde_json::json!({"adapters": ids}))),
+        rustrain_ipc::EpResult::Error(e) => Err(err_resp(&e)),
+        _ => Err(err_resp("unexpected result")),
+    }
+}
+
+async fn ep_export_adapter(
+    State(state): State<Arc<EpAppState>>,
+    Path(id): Path<String>,
+    Json(req): Json<ExportHttp>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    let cmd = rustrain_ipc::EpCommand::ExportAdapter { session_id: id, path: req.path };
+    match state.coordinator.dispatch(&cmd) {
+        rustrain_ipc::EpResult::Count(n) => Ok(Json(serde_json::json!({"exported": n}))),
+        rustrain_ipc::EpResult::Error(e) => Err(err_resp(&e)),
+        _ => Err(err_resp("unexpected result")),
+    }
+}
+
+async fn ep_get_status(
+    State(state): State<Arc<EpAppState>>,
+    Path(id): Path<String>,
+) -> Result<Json<StatusResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let cmd = rustrain_ipc::EpCommand::Status { session_id: id };
+    match state.coordinator.dispatch(&cmd) {
+        rustrain_ipc::EpResult::Status { state, step, last_loss, model_path } => {
+            Ok(Json(StatusResponse { state, step, last_loss, model_path }))
+        }
+        rustrain_ipc::EpResult::Error(e) => Err(err_resp(&e)),
+        _ => Err(err_resp("unexpected result")),
+    }
 }

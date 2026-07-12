@@ -16,7 +16,6 @@
 #include <vector>
 #include <cstring>
 #include <memory>
-#include <atomic>
 #include <unordered_map>
 #include <set>
 #include <array>
@@ -1967,41 +1966,6 @@ __attribute__((visibility("default"))) void qwen36_set_mtp_weights(
         (long)num_mtp_layers, (long)num_mtp_layer_weights);
 }
 
-// EP barrier: file-based synchronization ensuring all ranks start train_step together.
-// Each rank writes its step number to a file, then waits for all ranks to reach
-// the same step. This prevents NCCL deadlock from staggered HTTP request arrival.
-static std::atomic<int64_t> ep_step_counter{0};
-static void ep_barrier(int rank, int world_size) {
-    int64_t step = ep_step_counter.fetch_add(1) + 1;
-    // Use a shared directory for barrier files
-    const char* barrier_dir = "/tmp/rustrain-ep-barrier";
-    mkdir(barrier_dir, 0777);
-    // Write this rank's step to its file
-    char path[256];
-    snprintf(path, sizeof(path), "%s/rank_%d", barrier_dir, rank);
-    FILE* f = fopen(path, "w");
-    fprintf(f, "%ld\n", (long)step);
-    fclose(f);
-    // Wait for all ranks to reach this step
-    for (int i = 0; i < world_size; i++) {
-        char p[256];
-        snprintf(p, sizeof(p), "%s/rank_%d", barrier_dir, i);
-        // Spin until file exists and contains the expected step number
-        for (;;) {
-            FILE* f2 = fopen(p, "r");
-            if (f2) {
-                long val = 0;
-                if (fscanf(f2, "%ld", &val) == 1 && val >= step) {
-                    fclose(f2);
-                    break;
-                }
-                fclose(f2);
-            }
-            usleep(1000);  // 1ms poll
-        }
-    }
-}
-
 // Single training step: forward + loss + backward + Adam update
 // Returns loss value, or -1 on error.
 __attribute__((visibility("default"))) double qwen36_train_step(
@@ -2012,46 +1976,11 @@ __attribute__((visibility("default"))) double qwen36_train_step(
 ) {
     try {
         auto* ctx = reinterpret_cast<TrainingContext*>(ctx_ptr);
-        // Set CUDA device for EP — tensors and NCCL comm are on local_rank's GPU
+        // Set CUDA device for EP — IPC coordinator ensures all ranks start simultaneously.
+        // No barrier or communicator recreation needed — workers are synchronized via
+        // shared memory semaphores in the parent process before train_step is called.
         if (ctx->nccl_comm) {
             cudaSetDevice(ctx->ep_rank);
-            ep_barrier(ctx->ep_rank, ctx->ep_world_size);
-            // Recreate NCCL communicator each step to avoid internal state corruption.
-            // NCCL communicator's internal buffer registration gets corrupted when
-            // PyTorch's caching allocator frees and reallocates memory between steps.
-            // Destroy old communicator and create new one.
-            ncclCommDestroy(ctx->nccl_comm);
-            ncclUniqueId unique_id;
-            // Rank 0 generates and writes ID, others read it
-            const char* id_path = "/tmp/rustrain-nccl/nccl-step-id.bin";
-            if (ctx->ep_rank == 0) {
-                ncclGetUniqueId(&unique_id);
-                FILE* f = fopen(id_path, "wb");
-                fwrite(&unique_id, sizeof(unique_id), 1, f);
-                fclose(f);
-            } else {
-                for (int i = 0; i < 600; i++) {
-                    FILE* f = fopen(id_path, "rb");
-                    if (f) {
-                        if (fread(&unique_id, sizeof(unique_id), 1, f) == 1) {
-                            fclose(f);
-                            break;
-                        }
-                        fclose(f);
-                    }
-                    usleep(1000);
-                }
-            }
-            // All ranks must reach ncclCommInitRank simultaneously
-            ep_barrier(ctx->ep_rank, ctx->ep_world_size);
-            ncclCommInitRank(&ctx->nccl_comm, ctx->ep_world_size, unique_id, ctx->ep_rank);
-            // Update layer configs with new communicator
-            for (auto& lc : ctx->layer_configs) {
-                lc.nccl_comm = (void*)ctx->nccl_comm;
-            }
-            for (auto& lc : ctx->mtp_layer_configs) {
-                lc.nccl_comm = (void*)ctx->nccl_comm;
-            }
         }
         auto& input_ids = *reinterpret_cast<at::Tensor*>(input_ids_ptr);
         auto& target_mask = *reinterpret_cast<at::Tensor*>(target_mask_ptr);

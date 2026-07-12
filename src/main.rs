@@ -75,6 +75,18 @@ enum Command {
         metrics_dir: PathBuf,
     },
 
+    /// Start EP server (HTTP server forks N GPU workers)
+    EpServer {
+        #[arg(long, default_value_t = 8080)]
+        http_port: u16,
+        #[arg(long, default_value_t = 50051)]
+        grpc_port: u16,
+        #[arg(long, default_value = "/tmp/rustrain-ep")]
+        metrics_dir: PathBuf,
+        #[arg(long, default_value_t = 1)]
+        world_size: usize,
+    },
+
     /// Run a command on a Ray GPU worker (via rayrust native SDK)
     #[cfg(feature = "ray")]
     RayGpu {
@@ -146,6 +158,12 @@ fn main() -> Result<()> {
             grpc_port,
             metrics_dir,
         } => run_server(http_port, grpc_port, metrics_dir),
+        Command::EpServer {
+            http_port,
+            grpc_port,
+            metrics_dir,
+            world_size,
+        } => run_ep_server(http_port, grpc_port, metrics_dir, world_size),
         #[cfg(feature = "ray")]
         Command::RayGpu {
             num_gpus,
@@ -609,5 +627,50 @@ fn run_server(http_port: u16, grpc_port: u16, metrics_dir: PathBuf) -> Result<()
         }
     });
 
+    Ok(())
+}
+
+/// Start EP server: fork N GPU workers, then run HTTP server in parent.
+/// HTTP server dispatches commands to workers via shared memory IPC.
+fn run_ep_server(
+    http_port: u16,
+    grpc_port: u16,
+    metrics_dir: PathBuf,
+    world_size: usize,
+) -> Result<()> {
+    use rustrain_server::{api, ep::EpCoordinator};
+
+    std::fs::create_dir_all(&metrics_dir)?;
+
+    info!("Starting EP server: world_size={world_size}, HTTP port={http_port}");
+
+    // Fork worker processes — children never return
+    let coordinator = EpCoordinator::launch(world_size, metrics_dir.clone())
+        .map_err(|e| anyhow!("Failed to launch EP workers: {}", e))?;
+
+    let coordinator = std::sync::Arc::new(coordinator);
+
+    let http_addr = format!("0.0.0.0:{http_port}");
+    info!("EP HTTP server will listen on {http_addr}");
+
+    let rt = tokio::runtime::Runtime::new()?;
+    rt.block_on(async move {
+        let app_state = std::sync::Arc::new(api::EpAppState {
+            coordinator: coordinator.clone(),
+        });
+        let http_router = api::ep_router(app_state);
+        let http_listener = tokio::net::TcpListener::bind(&http_addr)
+            .await
+            .unwrap_or_else(|e| panic!("bind {http_addr}: {e}"));
+
+        info!("EP HTTP server listening on {http_addr}");
+
+        if let Err(e) = axum::serve(http_listener, http_router).await {
+            tracing::error!("HTTP server error: {e}");
+        }
+    });
+
+    // Workers are killed when coordinator is dropped
+    info!("EP server shutting down");
     Ok(())
 }

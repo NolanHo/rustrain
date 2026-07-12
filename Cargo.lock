@@ -2344,6 +2344,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustrain-ipc"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "serde",
+ "serde_json",
+ "tracing",
+]
+
+[[package]]
 name = "rustrain-moe"
 version = "0.1.0"
 dependencies = [
@@ -2482,9 +2492,11 @@ dependencies = [
  "base64 0.22.1",
  "chrono",
  "futures",
+ "libc",
  "prost",
  "rustrain-checkpoint",
  "rustrain-core",
+ "rustrain-ipc",
  "rustrain-qwen3-6",
  "rustrain-train",
  "safetensors 0.8.0",
