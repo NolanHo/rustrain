@@ -2200,10 +2200,22 @@ __attribute__((visibility("default"))) void qwen36_free_training_context(void* c
 // Rank 0 generates unique ID and writes to /tmp/rustrain-nccl/nccl-id.bin
 // Other ranks read it. All ranks call ncclCommInitRank.
 // Returns 0 on success, -1 on failure.
+// Process-level NCCL singleton — created once, reused across sessions.
+static ncclComm_t g_nccl_comm = nullptr;
+static bool g_nccl_initialized = false;
+
 __attribute__((visibility("default"))) int32_t qwen36_init_nccl(
     void* ctx_ptr
 ) {
     auto* ctx = reinterpret_cast<TrainingContext*>(ctx_ptr);
+
+    // If already initialized, just set the pointer on this context
+    if (g_nccl_initialized) {
+        ctx->nccl_comm = g_nccl_comm;
+        for (auto& lc : ctx->layer_configs) { lc.nccl_comm = (void*)g_nccl_comm; }
+        for (auto& lc : ctx->mtp_layer_configs) { lc.nccl_comm = (void*)g_nccl_comm; }
+        return 0;
+    }
 
     const char* rank_str = getenv("RANK");
     const char* world_str = getenv("WORLD_SIZE");
@@ -2253,7 +2265,7 @@ __attribute__((visibility("default"))) int32_t qwen36_init_nccl(
         fclose(f);
     }
 
-    // Initialize communicator
+    // Initialize communicator — only once per process
     ncclComm_t comm;
     ncclResult_t err = ncclCommInitRank(&comm, world_size, unique_id, rank);
     if (err != ncclSuccess) {
@@ -2264,6 +2276,10 @@ __attribute__((visibility("default"))) int32_t qwen36_init_nccl(
     // Create dedicated NCCL stream on current device
     cudaStream_t nccl_stream;
     cudaStreamCreate(&nccl_stream);
+
+    // Store as process-level singleton
+    g_nccl_comm = comm;
+    g_nccl_initialized = true;
 
     ctx->nccl_comm = comm;
     ctx->nccl_stream = nccl_stream;
