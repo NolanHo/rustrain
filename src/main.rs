@@ -12,7 +12,7 @@ use rustrain_tch_tiny::tch_train;
 
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand};
 use tracing::info;
 
