@@ -663,9 +663,10 @@ fn run_ep_server(
 ) -> Result<()> {
     use rustrain_server::{api, ep::EpCoordinator};
 
-    // Prevent parent process from initializing CUDA — it must not touch GPU.
-    // Workers (spawned via exec) get full GPU access.
-    unsafe { std::env::set_var("CUDA_VISIBLE_DEVICES", ""); }
+    // Note: parent process must NOT call any CUDA functions.
+    // tch library is linked but CUDA context is only initialized on first
+    // CUDA call (lazy init). Parent only does HTTP + IPC, no GPU ops.
+    // Workers (spawned via exec) have their own fresh CUDA context.
 
     std::fs::create_dir_all(&metrics_dir)?;
 
