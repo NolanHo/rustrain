@@ -693,13 +693,16 @@ static at::Tensor moe_forward(
         int dev = routed_output.device().index();
         cudaSetDevice(dev);
         auto compute_stream = c10::cuda::getCurrentCUDAStream(dev).stream();
+        // Clone routed_output — creates separate storage not tracked by autograd.
+        // In-place NCCL on the clone doesn't corrupt autograd's saved tensors
+        // (which reference the original). Only one buffer to manage — no
+        // premature free issue with separate input/output buffers.
         auto ro = routed_output.is_contiguous() ? routed_output : routed_output.contiguous();
-        // Allocate separate output buffer — NOT connected to autograd graph
-        auto reduced = at::empty_like(ro);
+        auto reduced = ro.clone();  // separate storage, same data
         ncclResult_t nccl_err = ncclAllReduce(
-            ro.data_ptr(),
-            reduced.data_ptr(),   // output: separate buffer
-            ro.numel(),
+            reduced.data_ptr(),
+            reduced.data_ptr(),   // in-place on clone
+            reduced.numel(),
             ncclBfloat16,
             ncclSum,
             nccl_comm,
@@ -708,13 +711,8 @@ static at::Tensor moe_forward(
         if (nccl_err != ncclSuccess) {
             fprintf(stderr, "[ep_debug] ncclAllReduce FAILED: %d (%s)\n", nccl_err, ncclGetErrorString(nccl_err));
         }
-        // CRITICAL: sync before ro goes out of scope.
-        // NCCL is async on compute stream. If ro (input buffer) is freed by
-        // PyTorch's caching allocator when routed_output = reduced replaces it,
-        // NCCL may still be reading from ro's memory → cudaErrorIllegalAddress.
-        // This sync only blocks until NCCL completes, not the entire stream.
-        cudaStreamSynchronize(compute_stream);
-        // Replace routed_output with reduced version.
+        // Replace routed_output with reduced clone.
+        // reduced is kept alive by routed_output (used in subsequent ops).
         routed_output = reduced;
     }
 
