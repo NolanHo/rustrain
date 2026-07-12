@@ -54,7 +54,7 @@ impl EpCoordinator {
                 .arg("--metrics-path").arg(&metrics_path)
                 .env("RANK", rank.to_string())
                 .env("WORLD_SIZE", world_size.to_string())
-                .env("LOCAL_RANK", rank.to_string())
+                .env("LOCAL_RANK", "0")  // Always 0 — CUDA_VISIBLE_DEVICES limits to one GPU
                 .env("CUDA_VISIBLE_DEVICES", rank.to_string())
                 .stdout(std::process::Stdio::inherit())
                 .stderr(std::process::Stdio::inherit())
