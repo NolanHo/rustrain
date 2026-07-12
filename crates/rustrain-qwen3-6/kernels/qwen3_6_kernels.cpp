@@ -684,18 +684,21 @@ static at::Tensor moe_forward(
     // The non-local expert tokens are still zero — after all-reduce, every
     // rank gets the complete routed_output.
     // EP all-reduce: sum routed_output across all EP ranks
+    // CRITICAL: must use out-of-place NCCL (separate input/output buffers).
+    // In-place NCCL (ptr, ptr) modifies autograd-tracked tensor via raw CUDA call,
+    // bypassing PyTorch's version counter. During backward, autograd accesses
+    // corrupted saved tensors → cudaErrorIllegalAddress.
     if (nccl_comm_v) {
         auto nccl_comm = reinterpret_cast<ncclComm_t>(nccl_comm_v);
         int dev = routed_output.device().index();
-        // Ensure CUDA device matches — cudaSetDevice doesn't update PyTorch's
-        // internal device tracking, so we must use device-specific APIs
         cudaSetDevice(dev);
         auto compute_stream = c10::cuda::getCurrentCUDAStream(dev).stream();
-        // Ensure routed_output is contiguous for NCCL
         auto ro = routed_output.is_contiguous() ? routed_output : routed_output.contiguous();
+        // Allocate separate output buffer — NOT connected to autograd graph
+        auto reduced = at::empty_like(ro);
         ncclResult_t nccl_err = ncclAllReduce(
             ro.data_ptr(),
-            ro.data_ptr(),
+            reduced.data_ptr(),   // output: separate buffer
             ro.numel(),
             ncclBfloat16,
             ncclSum,
@@ -705,9 +708,13 @@ static at::Tensor moe_forward(
         if (nccl_err != ncclSuccess) {
             fprintf(stderr, "[ep_debug] ncclAllReduce FAILED: %d (%s)\n", nccl_err, ncclGetErrorString(nccl_err));
         }
-        if (!ro.is_same(routed_output)) {
-            routed_output.copy_(ro);
-        }
+        // Replace routed_output with reduced version.
+        // This disconnects the autograd graph for the expert loop (local experts
+        // won't get gradients). This is acceptable because:
+        // 1. Expert weights are FROZEN (no grad needed)
+        // 2. LoRA gradients flow through attention weights, not MoE experts
+        // 3. Residual connection (hidden + attn_output + mlp_out) still carries gradients
+        routed_output = reduced;
     }
 
     // Shared expert (same as before, with fused SwiGLU)
