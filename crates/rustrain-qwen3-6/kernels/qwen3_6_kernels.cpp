@@ -16,6 +16,7 @@
 #include <vector>
 #include <cstring>
 #include <memory>
+#include <atomic>
 #include <unordered_map>
 #include <set>
 #include <array>
@@ -1972,6 +1973,41 @@ __attribute__((visibility("default"))) void qwen36_set_mtp_weights(
         (long)num_mtp_layers, (long)num_mtp_layer_weights);
 }
 
+// EP barrier: file-based synchronization ensuring all ranks start train_step together.
+// Each rank writes its step number to a file, then waits for all ranks to reach
+// the same step. This prevents NCCL deadlock from staggered HTTP request arrival.
+static std::atomic<int64_t> ep_step_counter{0};
+static void ep_barrier(int rank, int world_size) {
+    int64_t step = ep_step_counter.fetch_add(1) + 1;
+    // Use a shared directory for barrier files
+    const char* barrier_dir = "/tmp/rustrain-ep-barrier";
+    mkdir(barrier_dir, 0777);
+    // Write this rank's step to its file
+    char path[256];
+    snprintf(path, sizeof(path), "%s/rank_%d", barrier_dir, rank);
+    FILE* f = fopen(path, "w");
+    fprintf(f, "%ld\n", (long)step);
+    fclose(f);
+    // Wait for all ranks to reach this step
+    for (int i = 0; i < world_size; i++) {
+        char p[256];
+        snprintf(p, sizeof(p), "%s/rank_%d", barrier_dir, i);
+        // Spin until file exists and contains the expected step number
+        for (;;) {
+            FILE* f2 = fopen(p, "r");
+            if (f2) {
+                long val = 0;
+                if (fscanf(f2, "%ld", &val) == 1 && val >= step) {
+                    fclose(f2);
+                    break;
+                }
+                fclose(f2);
+            }
+            usleep(1000);  // 1ms poll
+        }
+    }
+}
+
 // Single training step: forward + loss + backward + Adam update
 // Returns loss value, or -1 on error.
 __attribute__((visibility("default"))) double qwen36_train_step(
@@ -1985,6 +2021,12 @@ __attribute__((visibility("default"))) double qwen36_train_step(
         // Set CUDA device for EP — tensors and NCCL comm are on local_rank's GPU
         if (ctx->nccl_comm) {
             cudaSetDevice(ctx->ep_rank);
+            // EP barrier: wait for all ranks to arrive before starting forward.
+            // Without this, HTTP parallel requests arrive at different times,
+            // causing NCCL collective deadlock (40 sync points per step in backward).
+            // Uses a simple file-based barrier: each rank creates a file,
+            // then waits for all files to appear before continuing.
+            ep_barrier(ctx->ep_rank, ctx->ep_world_size);
         }
         auto& input_ids = *reinterpret_cast<at::Tensor*>(input_ids_ptr);
         auto& target_mask = *reinterpret_cast<at::Tensor*>(target_mask_ptr);
