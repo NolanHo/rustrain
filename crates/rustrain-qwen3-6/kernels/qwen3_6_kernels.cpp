@@ -707,11 +707,10 @@ static at::Tensor moe_forward(
         auto nccl_comm = reinterpret_cast<ncclComm_t>(nccl_comm_v);
         int dev = routed_output.device().index();
         cudaSetDevice(dev);
-        // Use the NCCL stream that was created with the communicator.
-        // This is stored in nccl_stream_v (from LayerConfig).
+        // Use NCCL stream if available, otherwise compute stream.
+        // nullptr means use default stream (same as PyTorch compute stream).
         auto nccl_stream = reinterpret_cast<cudaStream_t>(nccl_stream_v);
         if (!nccl_stream) {
-            // Fallback: use compute stream if nccl_stream not set
             nccl_stream = c10::cuda::getCurrentCUDAStream(dev).stream();
         }
         auto reduced = at::empty_like(routed_output);
@@ -2283,9 +2282,12 @@ __attribute__((visibility("default"))) int32_t qwen36_init_nccl(
         return -1;
     }
 
-    // Create dedicated NCCL stream on current device
-    cudaStream_t nccl_stream;
-    cudaStreamCreate(&nccl_stream);
+    // Use PyTorch's compute stream for NCCL — NOT a separate stream.
+    // Separate stream causes "invalid argument" because NCCL communicator
+    // is bound to a CUDA context, and PyTorch's caching allocator stream
+    // may be on a different context. Using the same stream ensures same context.
+    // We store nullptr for stream — moe_forward will use getCurrentCUDAStream(dev).
+    cudaStream_t nccl_stream = nullptr;  // nullptr = use default stream
 
     // Store as process-level singleton
     g_nccl_comm = comm;
