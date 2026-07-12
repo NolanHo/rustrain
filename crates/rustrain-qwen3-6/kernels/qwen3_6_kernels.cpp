@@ -2170,12 +2170,6 @@ __attribute__((visibility("default"))) double qwen36_train_step(
             );
         }
 
-        // Sync all CUDA operations before returning — ensures no async errors
-        // leak into the next train_step (critical for EP with NCCL)
-        if (ctx->nccl_comm) {
-            cudaDeviceSynchronize();
-        }
-
         return loss_val;
     } catch (const std::exception& e) {
         fprintf(stderr, "[q36] train_step FAILED: %s\n", e.what());
