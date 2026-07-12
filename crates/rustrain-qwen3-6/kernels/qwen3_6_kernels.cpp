@@ -2233,10 +2233,19 @@ __attribute__((visibility("default"))) int32_t qwen36_init_nccl(
     int world_size = atoi(world_str);
     if (world_size <= 1) return 0;  // no EP needed
 
-    // Set CUDA device
+    // Set CUDA device and initialize PyTorch CUDA context on this device.
+    // NCCL communicator binds to the current CUDA context. If PyTorch hasn't
+    // initialized CUDA on this device yet, NCCL gets a wrong context → "invalid argument".
+    // Creating a dummy tensor forces PyTorch to initialize its CUDA context.
     const char* local_rank_str = getenv("LOCAL_RANK");
     int local_rank = local_rank_str ? atoi(local_rank_str) : rank;
     cudaSetDevice(local_rank);
+    {
+        // Force PyTorch CUDA context initialization on this device
+        auto opts = at::TensorOptions().dtype(at::kFloat).device(at::kCUDA, local_rank);
+        auto dummy = at::empty({1}, opts);
+        dummy.sizes();  // touch to ensure materialization
+    }
 
     // Exchange unique ID via file
     // Rank 0 generates ID, writes to file, then writes "ready" sentinel.
