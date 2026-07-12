@@ -708,12 +708,13 @@ static at::Tensor moe_forward(
         if (nccl_err != ncclSuccess) {
             fprintf(stderr, "[ep_debug] ncclAllReduce FAILED: %d (%s)\n", nccl_err, ncclGetErrorString(nccl_err));
         }
+        // CRITICAL: sync before ro goes out of scope.
+        // NCCL is async on compute stream. If ro (input buffer) is freed by
+        // PyTorch's caching allocator when routed_output = reduced replaces it,
+        // NCCL may still be reading from ro's memory → cudaErrorIllegalAddress.
+        // This sync only blocks until NCCL completes, not the entire stream.
+        cudaStreamSynchronize(compute_stream);
         // Replace routed_output with reduced version.
-        // This disconnects the autograd graph for the expert loop (local experts
-        // won't get gradients). This is acceptable because:
-        // 1. Expert weights are FROZEN (no grad needed)
-        // 2. LoRA gradients flow through attention weights, not MoE experts
-        // 3. Residual connection (hidden + attn_output + mlp_out) still carries gradients
         routed_output = reduced;
     }
 
