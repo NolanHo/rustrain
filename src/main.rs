@@ -665,8 +665,7 @@ fn run_ep_server(
 
     // Prevent parent process from initializing CUDA — it must not touch GPU.
     // Workers (spawned via exec) get full GPU access.
-    // This env var is inherited by children, so we must clear it for them.
-    std::env::set_var("CUDA_VISIBLE_DEVICES", "");
+    unsafe { std::env::set_var("CUDA_VISIBLE_DEVICES", ""); }
 
     std::fs::create_dir_all(&metrics_dir)?;
 
