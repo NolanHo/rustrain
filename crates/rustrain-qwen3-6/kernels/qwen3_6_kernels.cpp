@@ -1006,15 +1006,15 @@ static void precompute_lora_cache(TrainingContext* ctx) {
         int n = (int)g.indices.size();
         if (n == 1) {
             auto& e = entries[g.indices[0]];
-            auto delta = at::matmul(e.b_concat.to(bf16), e.a_concat.to(bf16));
+            auto delta = at::matmul(e.b_concat, e.a_concat);
             ctx->lora_cache[e.key] = delta;  // already BF16
         } else {
             std::vector<at::Tensor> b_stack_vec, a_stack_vec;
             b_stack_vec.reserve(n);
             a_stack_vec.reserve(n);
             for (auto idx : g.indices) {
-                b_stack_vec.push_back(entries[idx].b_concat.to(bf16));
-                a_stack_vec.push_back(entries[idx].a_concat.to(bf16));
+                b_stack_vec.push_back(entries[idx].b_concat);
+                a_stack_vec.push_back(entries[idx].a_concat);
             }
             auto b_stack = at::stack(b_stack_vec, 0);  // [N, out, sum_ranks] BF16
             auto a_stack = at::stack(a_stack_vec, 0);  // [N, sum_ranks, in] BF16
@@ -1887,8 +1887,8 @@ __attribute__((visibility("default"))) void* qwen36_create_training_context(
                 for (int k = 0; k < 4; k++) {
                     auto* base = ctx->weight_ptrs[w_offset + proj_indices[k]];
                     int64_t out_f = base->size(0), in_f = base->size(1);
-                    auto a = at::randn({lora_rank, in_f}, at::TensorOptions().dtype(at::kFloat).device(base->device())) * 0.01;
-                    auto b = at::zeros({out_f, lora_rank}, at::TensorOptions().dtype(at::kFloat).device(base->device()));
+                    auto a = at::randn({lora_rank, in_f}, at::TensorOptions().dtype(ctx->compute_type).device(base->device())) * 0.01;
+                    auto b = at::zeros({out_f, lora_rank}, at::TensorOptions().dtype(ctx->compute_type).device(base->device()));
                     a.set_requires_grad(true);
                     b.set_requires_grad(true);
                     ctx->lora_a.push_back(std::move(a));
@@ -1902,8 +1902,8 @@ __attribute__((visibility("default"))) void* qwen36_create_training_context(
                 for (int k = 0; k < 3; k++) {
                     auto* base = ctx->weight_ptrs[w_offset + proj_indices[k]];
                     int64_t out_f = base->size(0), in_f = base->size(1);
-                    auto a = at::randn({lora_rank, in_f}, at::TensorOptions().dtype(at::kFloat).device(base->device())) * 0.01;
-                    auto b = at::zeros({out_f, lora_rank}, at::TensorOptions().dtype(at::kFloat).device(base->device()));
+                    auto a = at::randn({lora_rank, in_f}, at::TensorOptions().dtype(ctx->compute_type).device(base->device())) * 0.01;
+                    auto b = at::zeros({out_f, lora_rank}, at::TensorOptions().dtype(ctx->compute_type).device(base->device()));
                     a.set_requires_grad(true);
                     b.set_requires_grad(true);
                     ctx->lora_a.push_back(std::move(a));
@@ -1915,12 +1915,13 @@ __attribute__((visibility("default"))) void* qwen36_create_training_context(
             offset += lora_count;
         }
 
-        // Initialize Adam state (zeros for each LoRA param)
+        // Initialize Adam state (FP32 for numerical stability, even if params are BF16)
         for (size_t i = 0; i < ctx->lora_a.size(); i++) {
-            ctx->adam_m.push_back(at::zeros_like(ctx->lora_a[i]));
-            ctx->adam_m.push_back(at::zeros_like(ctx->lora_b[i]));
-            ctx->adam_v.push_back(at::zeros_like(ctx->lora_a[i]));
-            ctx->adam_v.push_back(at::zeros_like(ctx->lora_b[i]));
+            auto opts_f32 = at::TensorOptions().dtype(at::kFloat).device(ctx->lora_a[i].device());
+            ctx->adam_m.push_back(at::zeros(ctx->lora_a[i].sizes(), opts_f32));
+            ctx->adam_m.push_back(at::zeros(ctx->lora_b[i].sizes(), opts_f32));
+            ctx->adam_v.push_back(at::zeros(ctx->lora_a[i].sizes(), opts_f32));
+            ctx->adam_v.push_back(at::zeros(ctx->lora_b[i].sizes(), opts_f32));
         }
 
         fprintf(stderr, "[q36_ctx] created: %ld layers, %ld LoRA params, %ld Adam states\n",
@@ -2378,11 +2379,16 @@ int64_t qwen36_add_lora(
             for (int k = 0; k < num_pairs; k++) {
                 auto* base = ctx->weight_ptrs[w_offset + proj_indices[k]];
                 int64_t out_f = base->size(0), in_f = base->size(1);
-                auto a = at::randn({rank, in_f}, at::TensorOptions().dtype(at::kFloat).device(base->device())) * 0.01;
-                auto b = at::zeros({out_f, rank}, at::TensorOptions().dtype(at::kFloat).device(base->device()));
+                auto a = at::randn({rank, in_f}, at::TensorOptions().dtype(ctx->compute_type).device(base->device())) * 0.01;
+                auto b = at::zeros({out_f, rank}, at::TensorOptions().dtype(ctx->compute_type).device(base->device()));
                 a.set_requires_grad(true);
                 b.set_requires_grad(true);
-                adam_states.push_back({at::zeros_like(a), at::zeros_like(a), at::zeros_like(b), at::zeros_like(b)});
+                // Adam state: FP32 for numerical stability
+                auto opts_f32 = at::TensorOptions().dtype(at::kFloat).device(base->device());
+                adam_states.push_back({
+                    at::zeros(a.sizes(), opts_f32), at::zeros(a.sizes(), opts_f32),
+                    at::zeros(b.sizes(), opts_f32), at::zeros(b.sizes(), opts_f32)
+                });
                 pairs.emplace_back(std::move(a), std::move(b));
             }
             adapter.params[i] = std::move(pairs);

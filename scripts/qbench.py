@@ -85,6 +85,9 @@ def bench(n_adp, rank, n_steps):
         return avg
     return None
 
+def cleanup(sid):
+    requests.delete(SERVER + "/v1/sessions/" + sid)
+
 results = {}
 for n in [1, 2, 4, 8, 16, 32]:
     t = bench(n, 16, 5)
@@ -92,7 +95,7 @@ for n in [1, 2, 4, 8, 16, 32]:
         results[n] = t
     else:
         print("Stopping at %d adapters" % n)
-        break
+    cleanup("z%d" % n)  # Free GPU memory after each test
 
 if results:
     print("\n=== Summary (rank=16, Qwen3.5-0.8B, seq=512, H20-3e) ===")

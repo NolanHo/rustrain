@@ -25,6 +25,7 @@ pub fn router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/v1/sessions", post(create_session))
         .route("/v1/sessions", get(list_sessions))
+        .route("/v1/sessions/{id}", axum::routing::delete(delete_session))
         .route("/v1/sessions/{id}/load_model", post(load_model))
         .route("/v1/sessions/{id}/load_dataset", post(load_dataset))
         .route("/v1/sessions/{id}/init_lora", post(init_lora))
@@ -64,6 +65,14 @@ async fn create_session(
         .await
         .map_err(|e| err_resp(&e))?;
     Ok(Json(CreateSessionResponse { session_id }))
+}
+
+async fn delete_session(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    state.manager.delete_session(&id).await.map_err(|e| err_resp(&e))?;
+    Ok(Json(serde_json::json!({"deleted": id})))
 }
 
 #[derive(Deserialize)]

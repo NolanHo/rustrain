@@ -135,6 +135,13 @@ def bench(n_adp, rank, n_steps):
         return avg
     return None
 
+def cleanup(sid):
+    """Delete session on all servers to free GPU memory."""
+    def fetch(i):
+        return requests.delete(SERVERS[i] + f"/v1/sessions/{sid}")
+    with ThreadPoolExecutor(max_workers=WORLD_SIZE) as pool:
+        list(pool.map(fetch, range(WORLD_SIZE)))
+
 results = {}
 for n in [1, 2, 4, 8, 16, 32]:
     t = bench(n, 16, 5)
@@ -142,7 +149,7 @@ for n in [1, 2, 4, 8, 16, 32]:
         results[n] = t
     else:
         print(f"Stopping at {n} adapters")
-        break
+    cleanup(f"ep_{n}")  # Free GPU memory after each test
 
 if results:
     print(f"\n=== Summary (rank=16, Qwen3.6-35B-A3B, EP=4, seq={SEQ}, H20-3e) ===")

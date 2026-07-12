@@ -37,6 +37,16 @@ impl SessionManager {
         Ok(())
     }
 
+    pub async fn delete_session(&self, session_id: &str) -> Result<(), String> {
+        let mut sessions = self.sessions.lock().await;
+        if sessions.remove(session_id).is_some() {
+            // Drop the session — this frees GPU memory (weights, LoRA params, Adam state)
+            Ok(())
+        } else {
+            Err(format!("session {session_id} not found"))
+        }
+    }
+
     pub async fn get_session(
         &self,
         session_id: &str,
