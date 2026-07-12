@@ -693,26 +693,25 @@ static at::Tensor moe_forward(
         int dev = routed_output.device().index();
         cudaSetDevice(dev);
         auto compute_stream = c10::cuda::getCurrentCUDAStream(dev).stream();
-        // Clone routed_output — creates separate storage not tracked by autograd.
-        // In-place NCCL on the clone doesn't corrupt autograd's saved tensors
-        // (which reference the original). Only one buffer to manage — no
-        // premature free issue with separate input/output buffers.
         auto ro = routed_output.is_contiguous() ? routed_output : routed_output.contiguous();
-        auto reduced = ro.clone();  // separate storage, same data
+        // Use ncclGroupStart/End to ensure the collective completes
+        // before any subsequent operations. ncclGroupEnd blocks until
+        // all NCCL operations in the group complete on all ranks.
+        auto reduced = ro.clone();
+        ncclGroupStart();
         ncclResult_t nccl_err = ncclAllReduce(
             reduced.data_ptr(),
-            reduced.data_ptr(),   // in-place on clone
+            reduced.data_ptr(),
             reduced.numel(),
             ncclBfloat16,
             ncclSum,
             nccl_comm,
             compute_stream
         );
+        ncclGroupEnd();
         if (nccl_err != ncclSuccess) {
             fprintf(stderr, "[ep_debug] ncclAllReduce FAILED: %d (%s)\n", nccl_err, ncclGetErrorString(nccl_err));
         }
-        // Replace routed_output with reduced clone.
-        // reduced is kept alive by routed_output (used in subsequent ops).
         routed_output = reduced;
     }
 
