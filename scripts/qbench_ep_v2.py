@@ -102,7 +102,7 @@ def bench(n_adp, rank, n_steps):
     return None
 
 results = {}
-for n in [1, 2, 4, 8]:
+for n in [1, 2, 4, 8, 16, 32]:
     t = bench(n, 16, 5)
     if t:
         results[n] = t
