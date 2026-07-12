@@ -686,12 +686,13 @@ static at::Tensor moe_forward(
     // EP all-reduce: sum routed_output across all EP ranks
     if (nccl_comm_v) {
         auto nccl_comm = reinterpret_cast<ncclComm_t>(nccl_comm_v);
-        auto nccl_stream = reinterpret_cast<cudaStream_t>(nccl_stream_v);
-        // Use device-specific stream — PyTorch tracks current device separately from cudaSetDevice
+        // Use compute stream directly — NCCL on compute stream is ordered
+        // with all other ops on that stream. No cross-stream sync needed.
+        // NCCL collective is a synchronization point: all ranks block here
+        // until everyone calls ncclAllReduce. The server being async (HTTP)
+        // doesn't matter — the GPU-side NCCL call is the barrier.
         int dev = routed_output.device().index();
         auto compute_stream = c10::cuda::getCurrentCUDAStream(dev).stream();
-        // Sync compute stream, then run NCCL on dedicated NCCL stream
-        cudaStreamSynchronize(compute_stream);
         ncclResult_t nccl_err = ncclAllReduce(
             routed_output.data_ptr(),
             routed_output.data_ptr(),
@@ -699,12 +700,11 @@ static at::Tensor moe_forward(
             ncclBfloat16,
             ncclSum,
             nccl_comm,
-            nccl_stream
+            compute_stream
         );
         if (nccl_err != ncclSuccess) {
             fprintf(stderr, "[ep_debug] ncclAllReduce FAILED: %d (%s)\n", nccl_err, ncclGetErrorString(nccl_err));
         }
-        cudaStreamSynchronize(nccl_stream);
     }
 
     // Shared expert (same as before, with fused SwiGLU)
