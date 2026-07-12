@@ -714,11 +714,25 @@ static at::Tensor moe_forward(
     // - Backward: NCCL all-reduce on gradient (correct for EP)
     // - PyTorch manages tensor lifecycle (no premature freeing)
     if (nccl_comm_v) {
+        // NCCL all-reduce OUTSIDE autograd graph.
+        // AutoGradMode(false) ensures the result tensor is NOT tracked by autograd,
+        // so autograd won't save it or its input for backward. This avoids all
+        // memory lifecycle issues between NCCL and PyTorch's caching allocator.
+        // Expert weights are frozen — gradients flow through residual connection.
+        at::AutoGradMode guard(false);
         auto nccl_comm = reinterpret_cast<ncclComm_t>(nccl_comm_v);
         int dev = routed_output.device().index();
         cudaSetDevice(dev);
-        // Use NcclAllReduceFunction — autograd handles forward + backward
-        routed_output = NcclAllReduceFunction::apply(routed_output, (int64_t)nccl_comm);
+        auto compute_stream = c10::cuda::getCurrentCUDAStream(dev).stream();
+        auto reduced = at::empty_like(routed_output);
+        ncclResult_t err = ncclAllReduce(
+            routed_output.data_ptr(), reduced.data_ptr(),
+            routed_output.numel(), ncclBfloat16, ncclSum,
+            nccl_comm, compute_stream);
+        if (err != ncclSuccess) {
+            fprintf(stderr, "[ep] ncclAllReduce fwd FAILED: %d (%s)\n", err, ncclGetErrorString(err));
+        }
+        routed_output = reduced;
     }
 
     // Shared expert (same as before, with fused SwiGLU)
