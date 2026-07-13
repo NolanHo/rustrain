@@ -110,7 +110,11 @@ pub fn worker_main(
     // Attach to shared memory
     let worker = EpWorker::attach(shm_name, rank, world_size)?;
 
-    // With all GPUs visible (no CUDA_VISIBLE_DEVICES), worker uses Device::Cuda(rank).
+    // CRITICAL: Set CUDA device BEFORE any PyTorch operation.
+    // exec'd worker processes have no CUDA context — must initialize on
+    // the correct device before load_model's to_device() call.
+    rustrain_qwen3_6::kernel::CppTrainingContext::set_cuda_device(rank as i32);
+
     let device = Device::Cuda(rank);
     let compute_kind = Kind::BFloat16;
 
@@ -159,10 +163,6 @@ pub fn worker_main(
 
 /// Execute a command on the local session, return result.
 fn execute_command(session: &mut Qwen36Session, cmd: &EpCommand) -> EpResult {
-    // For EP mode: ensure CUDA device is set correctly before any tensor op.
-    // This is needed because PyTorch's current device may not match session.device()
-    // after exec (new process, CUDA lazy init).
-    let _ = tch::Tensor::zeros(&[1], (tch::Kind::Float, session.device()));
     match cmd {
         EpCommand::CreateSession { session_id: _ } => {
             // Session already created in worker_main; just acknowledge

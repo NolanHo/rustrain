@@ -701,7 +701,7 @@ static at::Tensor moe_forward(
     }
 
     // EP all-reduce via NcclAllReduceFunction — custom autograd Function.
-    if (false && nccl_comm_v) {
+    if (nccl_comm_v) {
         auto nccl_comm = reinterpret_cast<ncclComm_t>(nccl_comm_v);
         routed_output = NcclAllReduceFunction::apply(routed_output, (int64_t)nccl_comm);
     }
@@ -2193,6 +2193,16 @@ __attribute__((visibility("default"))) void qwen36_free_training_context(void* c
 static ncclComm_t g_nccl_comm = nullptr;
 static cudaStream_t g_nccl_stream = nullptr;
 static bool g_nccl_initialized = false;
+
+// Set CUDA device — called from Rust worker before any GPU operation.
+// Ensures PyTorch initializes CUDA context on the correct device.
+__attribute__((visibility("default"))) void qwen36_set_cuda_device(int32_t device) {
+    cudaSetDevice(device);
+    // Force PyTorch to create CUDA context on this device
+    auto opts = at::TensorOptions().dtype(at::kFloat).device(at::kCUDA, device);
+    auto dummy = at::empty({1}, opts);
+    dummy.sizes();  // touch to ensure materialization
+}
 
 __attribute__((visibility("default"))) int32_t qwen36_init_nccl(
     void* ctx_ptr
