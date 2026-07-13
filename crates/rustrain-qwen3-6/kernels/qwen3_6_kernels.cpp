@@ -320,31 +320,29 @@ static at::Tensor full_attention(
 
     double scale = 1.0 / std::sqrt((double)head_dim);
 
-    // Use SDPA (Flash Attention) — O(seq) memory instead of O(seq²)
-    at::Tensor attn_mask;
+    // Use SDPA with GQA (enable_gqa=true, PT 2.5+).
+    // When attn_mask is provided, is_causal must be False (PT constraint).
+    // We combine causal + padding into one additive mask.
     if (attention_mask.defined() && attention_mask.numel() > 0) {
         auto kpm = attention_mask.to(at::kBool);
         while (kpm.dim() > 2) kpm = kpm.squeeze(0);
         kpm = kpm.unsqueeze(1).unsqueeze(1);  // [B, 1, 1, S]
-        auto additive_mask = at::zeros({batch, 1, 1, seq}, at::TensorOptions().dtype(q.scalar_type()).device(q.device()));
-        additive_mask = additive_mask.masked_fill(kpm.logical_not(), -std::numeric_limits<float>::infinity());
+        // Build combined mask: causal + padding
+        // causal: upper triangular = -inf
+        auto causal = at::triu(at::ones({seq, seq}, at::TensorOptions().dtype(at::kBool).device(q.device())), 1);
+        causal = causal.unsqueeze(0).unsqueeze(0);  // [1, 1, S, S]
+        // padding: [B, 1, 1, S] → broadcast to [B, 1, S, S]
+        auto pad_mask = kpm.logical_not();  // [B, 1, 1, S] — True = ignore
+        auto combined = causal.logical_or(pad_mask);
+        auto additive_mask = at::zeros({batch, 1, seq, seq}, at::TensorOptions().dtype(q.scalar_type()).device(q.device()));
+        additive_mask = additive_mask.masked_fill(combined, -std::numeric_limits<float>::infinity());
         auto attn_out = at::scaled_dot_product_attention(
-            q, k, v,
-            additive_mask,
-            0.0,
-            true,
-            c10::nullopt,
-            true  // enable_gqa
+            q, k, v, additive_mask, 0.0, false, c10::nullopt, true  // is_causal=false, enable_gqa=true
         );
         return attn_out.transpose(1, 2).reshape({batch, seq, qkv_dim}).matmul(o_proj.t());
     } else {
         auto attn_out = at::scaled_dot_product_attention(
-            q, k, v,
-            c10::nullopt,
-            0.0,
-            true,
-            c10::nullopt,
-            true  // enable_gqa
+            q, k, v, c10::nullopt, 0.0, true, c10::nullopt, true  // is_causal=true, enable_gqa=true
         );
         auto result = attn_out.transpose(1, 2).reshape({batch, seq, qkv_dim}).matmul(o_proj.t());
         result = result * at::sigmoid(gate).to(result.scalar_type());
@@ -1407,9 +1405,14 @@ static at::Tensor full_attention_batched(
         } else {
             kpm = kpm.unsqueeze(1).unsqueeze(1);
         }
-        auto additive_mask = at::zeros({batch, 1, 1, seq}, at::TensorOptions().dtype(q_out.scalar_type()).device(q_out.device()));
-        additive_mask = additive_mask.masked_fill(kpm.logical_not(), -std::numeric_limits<float>::infinity());
-        attn_out = at::scaled_dot_product_attention(q_out, k, v, additive_mask, 0.0, true, c10::nullopt, true);
+        // Combined causal + padding mask
+        auto causal = at::triu(at::ones({seq, seq}, at::TensorOptions().dtype(at::kBool).device(q_out.device())), 1);
+        causal = causal.unsqueeze(0).unsqueeze(0);  // [1, 1, S, S]
+        auto pad_mask = kpm.logical_not();  // [B, 1, 1, S]
+        auto combined = causal.logical_or(pad_mask);
+        auto additive_mask = at::zeros({batch, 1, seq, seq}, at::TensorOptions().dtype(q_out.scalar_type()).device(q_out.device()));
+        additive_mask = additive_mask.masked_fill(combined, -std::numeric_limits<float>::infinity());
+        attn_out = at::scaled_dot_product_attention(q_out, k, v, additive_mask, 0.0, false, c10::nullopt, true);
     } else {
         attn_out = at::scaled_dot_product_attention(q_out, k, v, c10::nullopt, 0.0, true, c10::nullopt, true);
     }
