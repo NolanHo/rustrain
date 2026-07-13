@@ -614,245 +614,6 @@ static at::Tensor linear_attention(
     return result;
 }
 
-// ── Batched attention variants (activation-level LoRA) ──
-// These wrap the base attention functions, applying LoRA delta as
-// B@(A@x) * scaling on the projected outputs instead of modifying weights.
-
-static at::Tensor full_attention_batched(
-    TrainingContext* ctx, const at::Tensor& hidden, int64_t layer_idx,
-    const at::Tensor& q_proj, const at::Tensor& q_norm,
-    const at::Tensor& k_proj, const at::Tensor& k_norm,
-    const at::Tensor& v_proj, const at::Tensor& o_proj,
-    int64_t num_heads, int64_t num_kv_heads, int64_t head_dim,
-    double partial_rotary_factor, double rope_theta,
-    double rms_eps, at::ScalarType kind,
-    const at::Tensor& attention_mask
-) {
-    // Compute Q/K/V with base weight, then add LoRA delta if present
-    int64_t batch = hidden.size(0), seq = hidden.size(1);
-    int64_t qkv_dim = num_heads * head_dim;
-
-    auto q = at::matmul(hidden, q_proj.t());
-    auto k = at::matmul(hidden, k_proj.t());
-    auto v = at::matmul(hidden, v_proj.t());
-
-    // Apply activation-level LoRA: q += B@(A@hidden) * scaling
-    auto it_q = ctx->lora_batch_cache.find(layer_idx * 10 + 0);
-    if (it_q != ctx->lora_batch_cache.end()) {
-        q = q + lora_activation_delta(hidden, it_q->second.a_stack, it_q->second.b_stack, it_q->second.scaling);
-    }
-    auto it_k = ctx->lora_batch_cache.find(layer_idx * 10 + 1);
-    if (it_k != ctx->lora_batch_cache.end()) {
-        k = k + lora_activation_delta(hidden, it_k->second.a_stack, it_k->second.b_stack, it_k->second.scaling);
-    }
-    auto it_v = ctx->lora_batch_cache.find(layer_idx * 10 + 2);
-    if (it_v != ctx->lora_batch_cache.end()) {
-        v = v + lora_activation_delta(hidden, it_v->second.a_stack, it_v->second.b_stack, it_v->second.scaling);
-    }
-
-    // Reshape Q: [batch, seq, num_heads, head_dim*2] → split into q and gate
-    q = q.view({batch, seq, num_heads, head_dim * 2});
-    auto qk = q.chunk(2, -1);
-    auto q_out = qk[0].transpose(1, 2);   // [batch, heads, seq, head_dim]
-    auto gate = qk[1].transpose(1, 2);
-
-    k = k.view({batch, seq, num_kv_heads, head_dim}).transpose(1, 2);
-    v = v.view({batch, seq, num_kv_heads, head_dim}).transpose(1, 2);
-
-    q_out = rms_norm(q_out, q_norm, rms_eps);
-    k = rms_norm(k, k_norm, rms_eps);
-
-    // Release gate before RoPE
-    gate = at::Tensor();
-    cudaDeviceSynchronize();
-    c10::cuda::CUDACachingAllocator::emptyCache();
-
-    // RoPE
-    int64_t rotary_dim = (int64_t)(head_dim * partial_rotary_factor);
-    if (rotary_dim > 0) {
-        auto device = hidden.device();
-        auto pos = at::arange(seq, at::TensorOptions().dtype(at::kFloat).device(device)).unsqueeze(0);
-        auto exponents = at::arange(0, rotary_dim, 2, at::TensorOptions().dtype(at::kFloat).device(device)) / (double)rotary_dim;
-        auto inv_freq = (exponents * std::log(rope_theta)).exp().reciprocal();
-        auto freqs = pos.unsqueeze(-1) * inv_freq.unsqueeze(0);
-        auto emb = at::cat({freqs, freqs}, -1);
-        auto cos = emb.cos().unsqueeze(1).to(q_out.scalar_type());
-        auto sin = emb.sin().unsqueeze(1).to(q_out.scalar_type());
-        auto q_rot = q_out.narrow(-1, 0, rotary_dim);
-        auto k_rot = k.narrow(-1, 0, rotary_dim);
-        auto rotate_half_q = at::cat({-q_rot.narrow(-1, rotary_dim/2, rotary_dim/2), q_rot.narrow(-1, 0, rotary_dim/2)}, -1);
-        auto rotate_half_k = at::cat({-k_rot.narrow(-1, rotary_dim/2, rotary_dim/2), k_rot.narrow(-1, 0, rotary_dim/2)}, -1);
-        q_rot.mul_(cos).add_(rotate_half_q * sin);
-        k_rot.mul_(cos).add_(rotate_half_k * sin);
-        cos = at::Tensor(); sin = at::Tensor();
-        cudaDeviceSynchronize();
-        c10::cuda::CUDACachingAllocator::emptyCache();
-    }
-
-    // K/V expansion
-    int64_t n_rep = num_heads / num_kv_heads;
-    auto k_expanded = k.repeat_interleave(n_rep, 1);
-    k = at::Tensor();
-    cudaDeviceSynchronize();
-    c10::cuda::CUDACachingAllocator::emptyCache();
-    auto v_expanded = v.repeat_interleave(n_rep, 1);
-    v = at::Tensor();
-    cudaDeviceSynchronize();
-    c10::cuda::CUDACachingAllocator::emptyCache();
-
-    double scale = 1.0 / std::sqrt((double)head_dim);
-
-    // SDPA
-    at::Tensor attn_out;
-    if (attention_mask.defined() && attention_mask.numel() > 0) {
-        auto kpm = attention_mask.to(at::kBool);
-        while (kpm.dim() > 2) kpm = kpm.squeeze(0);
-        if (kpm.size(0) == 1) {
-            // Broadcast [1, seq] → [batch, 1, 1, seq]
-            kpm = kpm.unsqueeze(1).unsqueeze(1).expand({batch, 1, 1, seq});
-        } else {
-            kpm = kpm.unsqueeze(1).unsqueeze(1);
-        }
-        auto additive_mask = at::zeros({batch, 1, 1, seq}, at::TensorOptions().dtype(q_out.scalar_type()).device(q_out.device()));
-        additive_mask = additive_mask.masked_fill(kpm.logical_not(), -std::numeric_limits<float>::infinity());
-        attn_out = at::scaled_dot_product_attention(q_out, k_expanded, v_expanded, additive_mask, 0.0, true);
-    } else {
-        attn_out = at::scaled_dot_product_attention(q_out, k_expanded, v_expanded, c10::nullopt, 0.0, true);
-    }
-    k_expanded = at::Tensor(); v_expanded = at::Tensor();
-    cudaDeviceSynchronize();
-    c10::cuda::CUDACachingAllocator::emptyCache();
-
-    auto result = attn_out.transpose(1, 2).reshape({batch, seq, qkv_dim}).matmul(o_proj.t());
-
-    // Apply LoRA delta on o_proj output
-    auto it_o = ctx->lora_batch_cache.find(layer_idx * 10 + 3);
-    if (it_o != ctx->lora_batch_cache.end()) {
-        result = result + lora_activation_delta(attn_out.transpose(1, 2).reshape({batch, seq, qkv_dim}),
-            it_o->second.a_stack, it_o->second.b_stack, it_o->second.scaling);
-    }
-    return result;
-}
-
-static at::Tensor linear_attention_batched(
-    TrainingContext* ctx, const at::Tensor& hidden, int64_t layer_idx,
-    const at::Tensor& in_proj_qkv, const at::Tensor& in_proj_z,
-    const at::Tensor& in_proj_a, const at::Tensor& in_proj_b,
-    const at::Tensor& a_log, const at::Tensor& dt_bias,
-    const at::Tensor& conv1d_w, const at::Tensor& norm_w, const at::Tensor& out_proj,
-    int64_t num_k_heads, int64_t key_dim, int64_t num_v_heads, int64_t val_dim,
-    int64_t conv_kernel, double rms_eps, at::ScalarType compute_type
-) {
-    int64_t batch = hidden.size(0), seq = hidden.size(1);
-
-    // QKV projection + LoRA delta
-    auto qkv = at::matmul(hidden, in_proj_qkv.t());
-    auto it_qkv = ctx->lora_batch_cache.find(layer_idx * 10 + 0);
-    if (it_qkv != ctx->lora_batch_cache.end()) {
-        qkv = qkv + lora_activation_delta(hidden, it_qkv->second.a_stack, it_qkv->second.b_stack, it_qkv->second.scaling);
-    }
-
-    // Z projection + LoRA delta
-    auto z = at::matmul(hidden, in_proj_z.t());
-    auto it_z = ctx->lora_batch_cache.find(layer_idx * 10 + 1);
-    if (it_z != ctx->lora_batch_cache.end()) {
-        z = z + lora_activation_delta(hidden, it_z->second.a_stack, it_z->second.b_stack, it_z->second.scaling);
-    }
-
-    // Rest of linear attention is identical to the base function
-    int64_t qkv_dim = qkv.size(-1);
-    auto qkv_t = qkv.transpose(1, 2);
-    int64_t pad = conv_kernel - 1;
-    auto padding = at::zeros({batch, qkv_dim, pad}, qkv.options());
-    auto padded = at::cat({padding, qkv_t}, 2);
-    auto conv_out = at::conv1d(padded, conv1d_w, {}, {1}, {0}, 1, qkv_dim);
-    conv_out = at::silu(conv_out.narrow(2, 0, seq));
-    auto qkv_conv = conv_out.transpose(1, 2);
-
-    int64_t q_size = num_k_heads * key_dim;
-    int64_t v_size = num_v_heads * val_dim;
-    auto q = qkv_conv.narrow(-1, 0, q_size).view({batch, seq, num_k_heads, key_dim});
-    auto k = qkv_conv.narrow(-1, q_size, q_size).view({batch, seq, num_k_heads, key_dim});
-    auto v = qkv_conv.narrow(-1, q_size * 2, v_size).view({batch, seq, num_v_heads, val_dim});
-
-    auto a = at::matmul(hidden, in_proj_a.t());
-    auto b = at::matmul(hidden, in_proj_b.t());
-    z = z.view({batch, seq, num_v_heads, val_dim});
-
-    // g = -exp(A_log) * softplus(a + dt_bias)
-    auto g = (-a_log.exp()) * at::softplus(a + dt_bias);
-    auto beta = a.clamp_min(-10.0).exp().unsqueeze(-1);
-
-    // L2 normalize Q, K
-    q = (q.to(at::kFloat) / q.to(at::kFloat).norm(2, -1, true).clamp_min(1e-6));
-    k = (k.to(at::kFloat) / k.to(at::kFloat).norm(2, -1, true).clamp_min(1e-6));
-
-    double scale = 1.0 / std::sqrt((double)key_dim);
-    q = q * scale;
-
-    auto q_t = q.transpose(1, 2).contiguous();
-    auto k_t = k.transpose(1, 2).contiguous();
-    auto v_t = v.to(at::kFloat).transpose(1, 2).contiguous();
-    auto g_t = g.transpose(1, 2).contiguous();
-    auto beta_t = beta.to(at::kFloat).transpose(1, 2).contiguous();
-
-    auto g_exp = g_t.exp();
-    int64_t BH = batch * num_v_heads;
-    auto state = at::zeros({BH, key_dim, val_dim}, q_t.options());
-
-    // Chunked delta rule — process in chunks of 128
-    int64_t chunk_len = 128;
-    std::vector<at::Tensor> chunk_outputs;
-    int64_t offset = 0;
-    while (offset < seq) {
-        int64_t end = std::min(offset + chunk_len, seq);
-        int64_t clen = end - offset;
-        auto q_c = q_t.narrow(2, offset, clen).reshape({BH, clen, key_dim}).contiguous().to(at::kFloat);
-        auto k_c = k_t.narrow(2, offset, clen).reshape({BH, clen, key_dim}).contiguous().to(at::kFloat);
-        auto v_c = v_t.narrow(2, offset, clen).reshape({BH, clen, val_dim}).contiguous().to(at::kFloat);
-        auto g_c = g_exp.narrow(2, offset, clen).reshape({BH, clen}).contiguous().to(at::kFloat);
-        auto beta_c = beta_t.narrow(2, offset, clen).reshape({BH, clen}).contiguous().to(at::kFloat);
-
-        // Fused delta rule kernel
-        auto outs = at::empty({BH, clen, val_dim}, q_t.options());
-        auto delta_buf = at::empty({BH, clen, val_dim}, q_t.options());
-        state = at::zeros({BH, key_dim, val_dim}, q_t.options()); // simplified: reset per chunk for now
-
-        auto core_out = outs.reshape({batch, num_v_heads, clen, val_dim})
-                             .transpose(1, 2).to(compute_type);
-        auto core_flat = core_out.reshape({-1, val_dim});
-        auto z_flat = z.narrow(1, offset, clen).reshape({-1, val_dim});
-        auto variance = core_flat.to(at::kFloat).pow(2).mean(-1, true);
-        auto normed = (core_flat.to(at::kFloat) * (variance + rms_eps).rsqrt() * norm_w.to(at::kFloat)).to(core_flat.scalar_type());
-        auto gated = (normed * at::silu(z_flat.to(at::kFloat)).to(normed.scalar_type())).view({batch, clen, num_v_heads * val_dim});
-        auto result = at::matmul(gated, out_proj.t());
-
-        // LoRA delta on out_proj
-        auto it_op = ctx->lora_batch_cache.find(layer_idx * 10 + 2);
-        if (it_op != ctx->lora_batch_cache.end()) {
-            result = result + lora_activation_delta(gated, it_op->second.a_stack, it_op->second.b_stack, it_op->second.scaling);
-        }
-        chunk_outputs.push_back(result);
-        offset = end;
-    }
-    return at::cat(chunk_outputs, 1);
-}
-// ──────────────────────────────────────────────────────────────────────
-
-static at::Tensor dense_mlp_forward(
-    const at::Tensor& hidden,
-    const at::Tensor& gate_proj, const at::Tensor& up_proj, const at::Tensor& down_proj,
-    at::ScalarType compute_type
-) {
-    int64_t batch = hidden.size(0), seq = hidden.size(1), hidden_dim = hidden.size(2);
-    auto flat = hidden.reshape({batch * seq, hidden_dim});
-    auto gate_out = at::matmul(flat, gate_proj.t());
-    auto up_out = at::matmul(flat, up_proj.t());
-    // Fused silu * up via Tilelang (falls back to ATen)
-    auto activated = fused_swiglu_op(gate_out, up_out, 0.0);  // Qwen3.6 dense MLP has no clamp
-    return at::matmul(activated, down_proj.t()).reshape({batch, seq, hidden_dim});
-}
-
 // ──────────────────────────────────────────────────────────────────────
 // MoE
 // ──────────────────────────────────────────────────────────────────────
@@ -1551,6 +1312,245 @@ at::Tensor forward_single_layer_subckpt(
     auto result = SubLayerCkpt::apply(
         residual, (int64_t)(uintptr_t)ctx, layer_idx, false);
     return result;
+}
+
+// ── Batched attention variants (activation-level LoRA) ──
+// These wrap the base attention functions, applying LoRA delta as
+// B@(A@x) * scaling on the projected outputs instead of modifying weights.
+
+static at::Tensor full_attention_batched(
+    TrainingContext* ctx, const at::Tensor& hidden, int64_t layer_idx,
+    const at::Tensor& q_proj, const at::Tensor& q_norm,
+    const at::Tensor& k_proj, const at::Tensor& k_norm,
+    const at::Tensor& v_proj, const at::Tensor& o_proj,
+    int64_t num_heads, int64_t num_kv_heads, int64_t head_dim,
+    double partial_rotary_factor, double rope_theta,
+    double rms_eps, at::ScalarType kind,
+    const at::Tensor& attention_mask
+) {
+    // Compute Q/K/V with base weight, then add LoRA delta if present
+    int64_t batch = hidden.size(0), seq = hidden.size(1);
+    int64_t qkv_dim = num_heads * head_dim;
+
+    auto q = at::matmul(hidden, q_proj.t());
+    auto k = at::matmul(hidden, k_proj.t());
+    auto v = at::matmul(hidden, v_proj.t());
+
+    // Apply activation-level LoRA: q += B@(A@hidden) * scaling
+    auto it_q = ctx->lora_batch_cache.find(layer_idx * 10 + 0);
+    if (it_q != ctx->lora_batch_cache.end()) {
+        q = q + lora_activation_delta(hidden, it_q->second.a_stack, it_q->second.b_stack, it_q->second.scaling);
+    }
+    auto it_k = ctx->lora_batch_cache.find(layer_idx * 10 + 1);
+    if (it_k != ctx->lora_batch_cache.end()) {
+        k = k + lora_activation_delta(hidden, it_k->second.a_stack, it_k->second.b_stack, it_k->second.scaling);
+    }
+    auto it_v = ctx->lora_batch_cache.find(layer_idx * 10 + 2);
+    if (it_v != ctx->lora_batch_cache.end()) {
+        v = v + lora_activation_delta(hidden, it_v->second.a_stack, it_v->second.b_stack, it_v->second.scaling);
+    }
+
+    // Reshape Q: [batch, seq, num_heads, head_dim*2] → split into q and gate
+    q = q.view({batch, seq, num_heads, head_dim * 2});
+    auto qk = q.chunk(2, -1);
+    auto q_out = qk[0].transpose(1, 2);   // [batch, heads, seq, head_dim]
+    auto gate = qk[1].transpose(1, 2);
+
+    k = k.view({batch, seq, num_kv_heads, head_dim}).transpose(1, 2);
+    v = v.view({batch, seq, num_kv_heads, head_dim}).transpose(1, 2);
+
+    q_out = rms_norm(q_out, q_norm, rms_eps);
+    k = rms_norm(k, k_norm, rms_eps);
+
+    // Release gate before RoPE
+    gate = at::Tensor();
+    cudaDeviceSynchronize();
+    c10::cuda::CUDACachingAllocator::emptyCache();
+
+    // RoPE
+    int64_t rotary_dim = (int64_t)(head_dim * partial_rotary_factor);
+    if (rotary_dim > 0) {
+        auto device = hidden.device();
+        auto pos = at::arange(seq, at::TensorOptions().dtype(at::kFloat).device(device)).unsqueeze(0);
+        auto exponents = at::arange(0, rotary_dim, 2, at::TensorOptions().dtype(at::kFloat).device(device)) / (double)rotary_dim;
+        auto inv_freq = (exponents * std::log(rope_theta)).exp().reciprocal();
+        auto freqs = pos.unsqueeze(-1) * inv_freq.unsqueeze(0);
+        auto emb = at::cat({freqs, freqs}, -1);
+        auto cos = emb.cos().unsqueeze(1).to(q_out.scalar_type());
+        auto sin = emb.sin().unsqueeze(1).to(q_out.scalar_type());
+        auto q_rot = q_out.narrow(-1, 0, rotary_dim);
+        auto k_rot = k.narrow(-1, 0, rotary_dim);
+        auto rotate_half_q = at::cat({-q_rot.narrow(-1, rotary_dim/2, rotary_dim/2), q_rot.narrow(-1, 0, rotary_dim/2)}, -1);
+        auto rotate_half_k = at::cat({-k_rot.narrow(-1, rotary_dim/2, rotary_dim/2), k_rot.narrow(-1, 0, rotary_dim/2)}, -1);
+        q_rot.mul_(cos).add_(rotate_half_q * sin);
+        k_rot.mul_(cos).add_(rotate_half_k * sin);
+        cos = at::Tensor(); sin = at::Tensor();
+        cudaDeviceSynchronize();
+        c10::cuda::CUDACachingAllocator::emptyCache();
+    }
+
+    // K/V expansion
+    int64_t n_rep = num_heads / num_kv_heads;
+    auto k_expanded = k.repeat_interleave(n_rep, 1);
+    k = at::Tensor();
+    cudaDeviceSynchronize();
+    c10::cuda::CUDACachingAllocator::emptyCache();
+    auto v_expanded = v.repeat_interleave(n_rep, 1);
+    v = at::Tensor();
+    cudaDeviceSynchronize();
+    c10::cuda::CUDACachingAllocator::emptyCache();
+
+    double scale = 1.0 / std::sqrt((double)head_dim);
+
+    // SDPA
+    at::Tensor attn_out;
+    if (attention_mask.defined() && attention_mask.numel() > 0) {
+        auto kpm = attention_mask.to(at::kBool);
+        while (kpm.dim() > 2) kpm = kpm.squeeze(0);
+        if (kpm.size(0) == 1) {
+            // Broadcast [1, seq] → [batch, 1, 1, seq]
+            kpm = kpm.unsqueeze(1).unsqueeze(1).expand({batch, 1, 1, seq});
+        } else {
+            kpm = kpm.unsqueeze(1).unsqueeze(1);
+        }
+        auto additive_mask = at::zeros({batch, 1, 1, seq}, at::TensorOptions().dtype(q_out.scalar_type()).device(q_out.device()));
+        additive_mask = additive_mask.masked_fill(kpm.logical_not(), -std::numeric_limits<float>::infinity());
+        attn_out = at::scaled_dot_product_attention(q_out, k_expanded, v_expanded, additive_mask, 0.0, true);
+    } else {
+        attn_out = at::scaled_dot_product_attention(q_out, k_expanded, v_expanded, c10::nullopt, 0.0, true);
+    }
+    k_expanded = at::Tensor(); v_expanded = at::Tensor();
+    cudaDeviceSynchronize();
+    c10::cuda::CUDACachingAllocator::emptyCache();
+
+    auto result = attn_out.transpose(1, 2).reshape({batch, seq, qkv_dim}).matmul(o_proj.t());
+
+    // Apply LoRA delta on o_proj output
+    auto it_o = ctx->lora_batch_cache.find(layer_idx * 10 + 3);
+    if (it_o != ctx->lora_batch_cache.end()) {
+        result = result + lora_activation_delta(attn_out.transpose(1, 2).reshape({batch, seq, qkv_dim}),
+            it_o->second.a_stack, it_o->second.b_stack, it_o->second.scaling);
+    }
+    return result;
+}
+
+static at::Tensor linear_attention_batched(
+    TrainingContext* ctx, const at::Tensor& hidden, int64_t layer_idx,
+    const at::Tensor& in_proj_qkv, const at::Tensor& in_proj_z,
+    const at::Tensor& in_proj_a, const at::Tensor& in_proj_b,
+    const at::Tensor& a_log, const at::Tensor& dt_bias,
+    const at::Tensor& conv1d_w, const at::Tensor& norm_w, const at::Tensor& out_proj,
+    int64_t num_k_heads, int64_t key_dim, int64_t num_v_heads, int64_t val_dim,
+    int64_t conv_kernel, double rms_eps, at::ScalarType compute_type
+) {
+    int64_t batch = hidden.size(0), seq = hidden.size(1);
+
+    // QKV projection + LoRA delta
+    auto qkv = at::matmul(hidden, in_proj_qkv.t());
+    auto it_qkv = ctx->lora_batch_cache.find(layer_idx * 10 + 0);
+    if (it_qkv != ctx->lora_batch_cache.end()) {
+        qkv = qkv + lora_activation_delta(hidden, it_qkv->second.a_stack, it_qkv->second.b_stack, it_qkv->second.scaling);
+    }
+
+    // Z projection + LoRA delta
+    auto z = at::matmul(hidden, in_proj_z.t());
+    auto it_z = ctx->lora_batch_cache.find(layer_idx * 10 + 1);
+    if (it_z != ctx->lora_batch_cache.end()) {
+        z = z + lora_activation_delta(hidden, it_z->second.a_stack, it_z->second.b_stack, it_z->second.scaling);
+    }
+
+    // Rest of linear attention is identical to the base function
+    int64_t qkv_dim = qkv.size(-1);
+    auto qkv_t = qkv.transpose(1, 2);
+    int64_t pad = conv_kernel - 1;
+    auto padding = at::zeros({batch, qkv_dim, pad}, qkv.options());
+    auto padded = at::cat({padding, qkv_t}, 2);
+    auto conv_out = at::conv1d(padded, conv1d_w, {}, {1}, {0}, 1, qkv_dim);
+    conv_out = at::silu(conv_out.narrow(2, 0, seq));
+    auto qkv_conv = conv_out.transpose(1, 2);
+
+    int64_t q_size = num_k_heads * key_dim;
+    int64_t v_size = num_v_heads * val_dim;
+    auto q = qkv_conv.narrow(-1, 0, q_size).view({batch, seq, num_k_heads, key_dim});
+    auto k = qkv_conv.narrow(-1, q_size, q_size).view({batch, seq, num_k_heads, key_dim});
+    auto v = qkv_conv.narrow(-1, q_size * 2, v_size).view({batch, seq, num_v_heads, val_dim});
+
+    auto a = at::matmul(hidden, in_proj_a.t());
+    auto b = at::matmul(hidden, in_proj_b.t());
+    z = z.view({batch, seq, num_v_heads, val_dim});
+
+    // g = -exp(A_log) * softplus(a + dt_bias)
+    auto g = (-a_log.exp()) * at::softplus(a + dt_bias);
+    auto beta = a.clamp_min(-10.0).exp().unsqueeze(-1);
+
+    // L2 normalize Q, K
+    q = (q.to(at::kFloat) / q.to(at::kFloat).norm(2, -1, true).clamp_min(1e-6));
+    k = (k.to(at::kFloat) / k.to(at::kFloat).norm(2, -1, true).clamp_min(1e-6));
+
+    double scale = 1.0 / std::sqrt((double)key_dim);
+    q = q * scale;
+
+    auto q_t = q.transpose(1, 2).contiguous();
+    auto k_t = k.transpose(1, 2).contiguous();
+    auto v_t = v.to(at::kFloat).transpose(1, 2).contiguous();
+    auto g_t = g.transpose(1, 2).contiguous();
+    auto beta_t = beta.to(at::kFloat).transpose(1, 2).contiguous();
+
+    auto g_exp = g_t.exp();
+    int64_t BH = batch * num_v_heads;
+    auto state = at::zeros({BH, key_dim, val_dim}, q_t.options());
+
+    // Chunked delta rule — process in chunks of 128
+    int64_t chunk_len = 128;
+    std::vector<at::Tensor> chunk_outputs;
+    int64_t offset = 0;
+    while (offset < seq) {
+        int64_t end = std::min(offset + chunk_len, seq);
+        int64_t clen = end - offset;
+        auto q_c = q_t.narrow(2, offset, clen).reshape({BH, clen, key_dim}).contiguous().to(at::kFloat);
+        auto k_c = k_t.narrow(2, offset, clen).reshape({BH, clen, key_dim}).contiguous().to(at::kFloat);
+        auto v_c = v_t.narrow(2, offset, clen).reshape({BH, clen, val_dim}).contiguous().to(at::kFloat);
+        auto g_c = g_exp.narrow(2, offset, clen).reshape({BH, clen}).contiguous().to(at::kFloat);
+        auto beta_c = beta_t.narrow(2, offset, clen).reshape({BH, clen}).contiguous().to(at::kFloat);
+
+        // Fused delta rule kernel
+        auto outs = at::empty({BH, clen, val_dim}, q_t.options());
+        auto delta_buf = at::empty({BH, clen, val_dim}, q_t.options());
+        state = at::zeros({BH, key_dim, val_dim}, q_t.options()); // simplified: reset per chunk for now
+
+        auto core_out = outs.reshape({batch, num_v_heads, clen, val_dim})
+                             .transpose(1, 2).to(compute_type);
+        auto core_flat = core_out.reshape({-1, val_dim});
+        auto z_flat = z.narrow(1, offset, clen).reshape({-1, val_dim});
+        auto variance = core_flat.to(at::kFloat).pow(2).mean(-1, true);
+        auto normed = (core_flat.to(at::kFloat) * (variance + rms_eps).rsqrt() * norm_w.to(at::kFloat)).to(core_flat.scalar_type());
+        auto gated = (normed * at::silu(z_flat.to(at::kFloat)).to(normed.scalar_type())).view({batch, clen, num_v_heads * val_dim});
+        auto result = at::matmul(gated, out_proj.t());
+
+        // LoRA delta on out_proj
+        auto it_op = ctx->lora_batch_cache.find(layer_idx * 10 + 2);
+        if (it_op != ctx->lora_batch_cache.end()) {
+            result = result + lora_activation_delta(gated, it_op->second.a_stack, it_op->second.b_stack, it_op->second.scaling);
+        }
+        chunk_outputs.push_back(result);
+        offset = end;
+    }
+    return at::cat(chunk_outputs, 1);
+}
+// ──────────────────────────────────────────────────────────────────────
+
+static at::Tensor dense_mlp_forward(
+    const at::Tensor& hidden,
+    const at::Tensor& gate_proj, const at::Tensor& up_proj, const at::Tensor& down_proj,
+    at::ScalarType compute_type
+) {
+    int64_t batch = hidden.size(0), seq = hidden.size(1), hidden_dim = hidden.size(2);
+    auto flat = hidden.reshape({batch * seq, hidden_dim});
+    auto gate_out = at::matmul(flat, gate_proj.t());
+    auto up_out = at::matmul(flat, up_proj.t());
+    // Fused silu * up via Tilelang (falls back to ATen)
+    auto activated = fused_swiglu_op(gate_out, up_out, 0.0);  // Qwen3.6 dense MLP has no clamp
+    return at::matmul(activated, down_proj.t()).reshape({batch, seq, hidden_dim});
 }
 
 // Forward pass (no checkpointing)
