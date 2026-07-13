@@ -128,11 +128,13 @@ def bench_multi(n_adp, lora_rank, n_steps=5):
     return {"n": n_adp, "rank": lora_rank, "avg": avg, "min": min(times), "max": max(times),
             "losses": losses, "per_adp": avg/n_adp}
 
-def bench_serial(n_adp, lora_rank, n_steps=3):
-    """Serial: N separate train_step calls (baseline)."""
-    sid = f"ep_serial_{n_adp}_{lora_rank}"
-    print(f"\n  [serial baseline] {n_adp} adapters, rank={lora_rank}")
-    if not setup(sid, n_adp, lora_rank):
+def bench_serial_single(lora_rank=8, n_steps=5):
+    """Serial baseline: measure single train_step time, extrapolate for N.
+    Serial time is linear: total = single_step * N.
+    """
+    sid = f"ep_serial_{lora_rank}"
+    print(f"\n  [serial baseline] rank={lora_rank}")
+    if not setup(sid, 1, lora_rank):
         return None
     ids = [1]*SEQ
     mask = [0]*20 + [1]*(SEQ-20)
@@ -158,9 +160,8 @@ def bench_serial(n_adp, lora_rank, n_steps=3):
     requests.delete(f"{SERVER}/v1/sessions/{sid}")
     if times:
         avg = sum(times)/len(times)
-        serial_total = avg * n_adp
-        print(f"  serial: {avg:.0f}ms/step × {n_adp} = {serial_total:.0f}ms total")
-        return serial_total
+        print(f"  serial single: avg={avg:.0f}ms/step (extrapolate ×N for serial total)")
+        return avg
     return None
 
 # ─── Main ───
@@ -173,18 +174,19 @@ for n in [2, 8, 32]:
         else:
             print(f"  {n} adapters rank={rank} FAILED")
 
-# Serial baseline (1 adapter only, then extrapolate)
-serial_1 = bench_serial(1, 8, n_steps=3)
+# Serial baseline: measure single train_step, extrapolate ×N
+serial_single = bench_serial_single(lora_rank=8, n_steps=5)
 
 if results:
     print(f"\n{'='*60}")
     print(f"  FINAL COMPARISON")
     print(f"{'='*60}")
-    if serial_1:
-        print(f"  Serial (1 adp, rank=8): {serial_1:.0f}ms extrapolated for N adapters")
+    if serial_single:
+        print(f"  Serial baseline: {serial_single:.0f}ms/step × N = serial total")
     for key, r in sorted(results.items()):
         n, rank = key.split("_")
-        speedup_vs_serial = serial_1 / r["avg"] * int(n) if serial_1 else 0
+        serial_total = serial_single * int(n) if serial_single else 0
+        speedup = serial_total / r["avg"] if serial_total else 0
         print(f"  {r['n']:3d} adp rank={r['rank']:2d}: avg={r['avg']:.0f}ms per-adp={r['per_adp']:.1f}ms"
-              f"  loss={r['losses'][0]:.4f}->{r['losses'][-1]:.6f}"
-              f"  {'speedup=' + f'{speedup_vs_serial:.1f}x' if serial_1 else ''}")
+              f"  serial={serial_total:.0f}ms  speedup={speedup:.1f}x"
+              f"  loss={r['losses'][0]:.4f}->{r['losses'][-1]:.6f}")
