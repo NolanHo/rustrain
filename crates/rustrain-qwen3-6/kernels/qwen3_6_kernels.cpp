@@ -2663,8 +2663,8 @@ __attribute__((visibility("default"))) double qwen36_train_multi_lora(
             ctx->lora_batch_valid = true;  // triggers prepare_lora_batch in forward
 
             // Expand input_ids from [1, seq] to [N, seq]
-            auto ids_expanded = input_ids.expand({n, input_ids.size(-1)});
-            auto mask_expanded = target_mask.expand({n, target_mask.size(-1)});
+            auto ids_expanded = input_ids.repeat({n, 1});
+            auto mask_expanded = target_mask.repeat({n, 1});
 
             // Run train_step (reuses existing forward + loss + backward + Adam)
             // But we need to pass the expanded tensors
