@@ -1970,19 +1970,6 @@ __attribute__((visibility("default"))) double qwen36_train_step(
             ctx->attention_mask = *reinterpret_cast<at::Tensor*>(attention_mask_ptr);
         }
 
-        // Debug: verify tensor devices and weight devices
-        {
-            int dev = -1; cudaGetDevice(&dev);
-            fprintf(stderr, "[train_step] rank=%d cur_dev=%d input_ids.dev=%d target_mask.dev=%d\n",
-                    ctx->ep_rank, dev, (int)input_ids.device().index(), (int)target_mask.device().index());
-            // Check first layer's weight device
-            if (!ctx->weight_ptrs.empty() && ctx->weight_ptrs[0]) {
-                fprintf(stderr, "[train_step] rank=%d w[0].dev=%d w[0].sizes[0]=%ld\n",
-                        ctx->ep_rank, (int)ctx->weight_ptrs[0]->device().index(),
-                        (long)(ctx->weight_ptrs[0]->sizes().size() > 0 ? ctx->weight_ptrs[0]->size(0) : -1));
-            }
-        }
-
         // Forward: checkpoint (default) or fused layer (QWEN36_FUSED_LAYER=1)
         bool use_fused = getenv("QWEN36_FUSED_LAYER");
         auto hidden = use_fused
@@ -2206,20 +2193,15 @@ static bool g_nccl_initialized = false;
 // Set CUDA device — called from Rust worker before any GPU operation.
 // Ensures PyTorch initializes CUDA context on the correct device.
 __attribute__((visibility("default"))) void qwen36_set_cuda_device(int32_t device) {
-    fprintf(stderr, "[set_cuda_device] setting device=%d\n", device);
     // Use PyTorch's device API — this updates both cudaSetDevice AND
     // PyTorch's internal device tracking (c10::cuda::current_device).
+    // Must be called before any GPU operation in exec'd worker processes.
     c10::cuda::set_device(device);
-    cudaSetDevice(device);
     cudaSetDevice(device);
     // Force PyTorch to create CUDA context on this device
     auto opts = at::TensorOptions().dtype(at::kFloat).device(at::kCUDA, device);
     auto dummy = at::empty({1}, opts);
     dummy.sizes();  // touch to ensure materialization
-    // Verify device was set
-    int cur_dev = -1;
-    cudaGetDevice(&cur_dev);
-    fprintf(stderr, "[set_cuda_device] device=%d verified cur_dev=%d\n", device, cur_dev);
 }
 
 __attribute__((visibility("default"))) int32_t qwen36_init_nccl(
