@@ -1959,16 +1959,28 @@ __attribute__((visibility("default"))) double qwen36_train_step(
 ) {
     try {
         auto* ctx = reinterpret_cast<TrainingContext*>(ctx_ptr);
-        // Set CUDA device for EP — IPC coordinator ensures all ranks start simultaneously.
-        // No barrier or communicator recreation needed — workers are synchronized via
-        // shared memory semaphores in the parent process before train_step is called.
+        // Set CUDA device for EP
         if (ctx->nccl_comm) {
+            c10::cuda::set_device(ctx->ep_rank);
             cudaSetDevice(ctx->ep_rank);
         }
         auto& input_ids = *reinterpret_cast<at::Tensor*>(input_ids_ptr);
         auto& target_mask = *reinterpret_cast<at::Tensor*>(target_mask_ptr);
         if (attention_mask_ptr) {
             ctx->attention_mask = *reinterpret_cast<at::Tensor*>(attention_mask_ptr);
+        }
+
+        // Debug: verify tensor devices and weight devices
+        {
+            int dev = -1; cudaGetDevice(&dev);
+            fprintf(stderr, "[train_step] rank=%d cur_dev=%d input_ids.dev=%d target_mask.dev=%d\n",
+                    ctx->ep_rank, dev, (int)input_ids.device().index(), (int)target_mask.device().index());
+            // Check first layer's weights
+            if (!ctx->layer_configs.empty()) {
+                auto& lc = ctx->layer_configs[0];
+                fprintf(stderr, "[train_step] rank=%d wq.dev=%d wk.dev=%d\n",
+                        ctx->ep_rank, (int)lc.wq.device().index(), (int)lc.wk.device().index());
+            }
         }
 
         // Forward: checkpoint (default) or fused layer (QWEN36_FUSED_LAYER=1)
