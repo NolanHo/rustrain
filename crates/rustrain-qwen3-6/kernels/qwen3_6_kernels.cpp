@@ -698,7 +698,7 @@ static at::Tensor moe_forward(
     }
 
     // EP all-reduce via NcclAllReduceFunction — custom autograd Function.
-    if (false && nccl_comm_v) {
+    if (nccl_comm_v) {
         auto nccl_comm = reinterpret_cast<ncclComm_t>(nccl_comm_v);
         routed_output = NcclAllReduceFunction::apply(routed_output, (int64_t)nccl_comm);
     }
