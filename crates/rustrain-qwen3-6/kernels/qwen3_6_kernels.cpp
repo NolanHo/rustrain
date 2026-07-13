@@ -1981,6 +1981,29 @@ static void manual_group_backward(
             /*allow_unused=*/true
         );
 
+        // Debug: check if LoRA grads are defined
+        if (g == (int64_t)num_groups - 1) {
+            int64_t dbg_gi = 1;
+            int64_t dbg_defined = 0, dbg_total = 0;
+            for (int64_t l = start; l < end; l++) {
+                int64_t lora_count = (ctx->layer_configs[l].layer_type == 0) ? 4 : 3;
+                for (auto& adapter : ctx->adapters) {
+                    auto it = adapter.params.find(l);
+                    if (it == adapter.params.end()) continue;
+                    for (int64_t k = 0; k < lora_count && k < (int64_t)it->second.size(); k++) {
+                        dbg_total += 2;
+                        if (dbg_gi < (int64_t)grads.size() && grads[dbg_gi].defined()) dbg_defined++;
+                        dbg_gi++;
+                        if (dbg_gi < (int64_t)grads.size() && grads[dbg_gi].defined()) dbg_defined++;
+                        dbg_gi++;
+                    }
+                }
+            }
+            fprintf(stderr, "[grad_debug] group %ld: grads defined %ld/%ld, input_grad=%s\n",
+                    (long)g, (long)dbg_defined, (long)dbg_total,
+                    grads[0].defined() ? "YES" : "NO");
+        }
+
         // Manually accumulate LoRA param gradients
         if (ctx->lora_batch_valid) {
             // Multi-LoRA: accumulate into ctx->adapters
