@@ -1465,7 +1465,8 @@ static at::Tensor linear_attention_batched(
     int64_t pad = conv_kernel - 1;
     auto padding = at::zeros({batch, qkv_dim, pad}, qkv.options());
     auto padded = at::cat({padding, qkv_t}, 2);
-    auto conv_out = at::conv1d(padded, conv1d_w, {}, {1}, {0}, 1, qkv_dim);
+    auto conv_out = at::conv1d(padded, conv1d_w, {},
+        at::IntArrayRef({1}), at::IntArrayRef({0}), at::IntArrayRef({1}), qkv_dim);
     conv_out = at::silu(conv_out.narrow(2, 0, seq));
     auto qkv_conv = conv_out.transpose(1, 2);
 
