@@ -1930,6 +1930,14 @@ static void manual_group_backward(
     at::Tensor grad = hidden_grad;
     at::AutoGradMode grad_mode(true);
 
+    ctx->lora_batch_valid = false;
+    ctx->lora_cache_valid = false;
+    // Rebuild lora_batch_cache under AutoGradMode(true) — this is critical:
+    // forward pass built it in no-grad mode, so a_stack/b_stack didn't track
+    // gradients. Here we rebuild so at::stack(A_i) creates a differentiable
+    // graph: grad → bmm → stack → A_i (leaf). Without this, grads are undefined.
+    prepare_lora_batch(ctx);
+
     for (int64_t g = num_groups - 1; g >= 0; g--) {
         int64_t start = groups[g].first;
         int64_t end = groups[g].second;
