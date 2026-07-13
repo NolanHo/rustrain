@@ -237,6 +237,15 @@ struct TrainStepHttp {
     target_mask: TensorHttp,
     attention_mask: TensorHttp,
 }
+
+#[derive(Deserialize)]
+struct TrainMultiLoraHttp {
+    input_ids: TensorHttp,
+    target_mask: TensorHttp,
+    attention_mask: TensorHttp,
+    n_total: i32,
+    lora_rank: i32,
+}
 #[derive(Serialize)]
 struct TrainStepResponse {
     loss: f64,
@@ -693,16 +702,12 @@ async fn ep_eval_step(
 async fn ep_train_multi_lora(
     State(state): State<Arc<EpAppState>>,
     Path(id): Path<String>,
-    Json(req): Json<TrainStepHttp>,
+    Json(req): Json<TrainMultiLoraHttp>,
 ) -> Result<Json<TrainStepResponse>, (StatusCode, Json<ErrorResponse>)> {
     let input_ids = decode_int64_vec(&req.input_ids).map_err(|e| err_resp(&e))?;
     let target_mask = decode_int64_vec(&req.target_mask).map_err(|e| err_resp(&e))?;
     let attention_mask = decode_int64_vec(&req.attention_mask).map_err(|e| err_resp(&e))?;
     let seq_len = input_ids.len();
-
-    // n_total and lora_rank come from query params or default
-    let n_total = 1i32;
-    let lora_rank = 8i32;
 
     let cmd = rustrain_ipc::EpCommand::TrainMultiLora {
         session_id: id,
@@ -710,8 +715,8 @@ async fn ep_train_multi_lora(
         target_mask,
         attention_mask,
         seq_len,
-        n_total,
-        lora_rank,
+        n_total: req.n_total,
+        lora_rank: req.lora_rank,
     };
     match state.coordinator.dispatch(&cmd) {
         rustrain_ipc::EpResult::Loss(loss) => Ok(Json(TrainStepResponse { loss, step: 0 })),

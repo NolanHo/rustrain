@@ -87,6 +87,8 @@ def bench_multi(n_adp, lora_rank, n_steps=5):
         "input_ids": tensor(ids),
         "target_mask": tensor(mask),
         "attention_mask": tensor([1]*SEQ),
+        "n_total": n_adp,
+        "lora_rank": lora_rank,
     }
 
     # Warmup

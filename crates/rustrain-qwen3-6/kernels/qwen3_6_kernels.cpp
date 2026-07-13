@@ -1461,76 +1461,56 @@ static at::Tensor linear_attention_batched(
     int64_t num_k_heads, int64_t key_dim, int64_t num_v_heads, int64_t val_dim,
     int64_t conv_kernel, double rms_eps, at::ScalarType compute_type
 ) {
-    // Strategy: apply activation-level LoRA delta on QKV and Z projections,
-    // then pass modified QKV/Z to the original linear_attention function.
-    // out_proj LoRA delta is applied on the output.
-    // This avoids reimplementing the complex delta rule logic.
+    // Full reimplementation of linear_attention non-chunked path with
+    // activation-level LoRA delta on QKV, Z, and out_proj.
+    auto device = hidden.device();
+    int64_t batch = hidden.size(0), seq = hidden.size(1);
+    int64_t q_size = num_k_heads * key_dim;
+    int64_t v_size = num_v_heads * val_dim;
+    int64_t qkv_dim = q_size * 2 + v_size;
 
-    // Modified QKV: base matmul + LoRA delta
+    // QKV projection + LoRA delta
     auto qkv = at::matmul(hidden, in_proj_qkv.t());
     auto it_qkv = ctx->lora_batch_cache.find(layer_idx * 10 + 0);
     if (it_qkv != ctx->lora_batch_cache.end()) {
         qkv = qkv + lora_activation_delta(hidden, it_qkv->second.a_stack, it_qkv->second.b_stack, it_qkv->second.scaling);
     }
 
-    // Modified Z: base matmul + LoRA delta
-    auto z = at::matmul(hidden, in_proj_z.t());
-    auto it_z = ctx->lora_batch_cache.find(layer_idx * 10 + 1);
-    if (it_z != ctx->lora_batch_cache.end()) {
-        z = z + lora_activation_delta(hidden, it_z->second.a_stack, it_z->second.b_stack, it_z->second.scaling);
-    }
-
-    // Build modified weight matrices: W' = W + delta^T
-    // Since linear_attention expects weight matrices, we reconstruct them:
-    // W_qkv' = W_qkv + (delta_qkv)^T  where delta_qkv = B@(A@hidden)
-    // But we can't modify weights per-adapter in batch mode.
-    // Instead, we pass the modified QKV/Z as "fake weights" by adding the
-    // delta contribution directly to the projection output.
-    //
-    // Actually simpler: compute the full QKV/Z including LoRA, then
-    // reconstruct what the weight matrix *would* be, and pass that to
-    // linear_attention. This is weight-level but per-adapter.
-    //
-    // BUT: in batched mode, different adapters have different deltas.
-    // We can't use a single modified weight matrix.
-    //
-    // Best approach: call linear_attention with base weights, then add
-    // the out_proj LoRA delta. For QKV/Z, the delta is already in qkv/z.
-    // We need to "inject" these modified projections.
-    //
-    // Simplest correct approach: use the original linear_attention but
-    // with modified weight = base + per-adapter delta. For batch mode,
-    // we need to handle this differently.
-    //
-    // For now: just add the delta to the projections and run the rest
-    // of linear_attention logic inline (copy from original).
-
-    int64_t batch = hidden.size(0), seq = hidden.size(1);
-
-    // Rest of linear attention — same as original linear_attention but
-    // using the modified qkv/z
-    int64_t qkv_dim = qkv.size(-1);
     auto qkv_t = qkv.transpose(1, 2);
     int64_t pad = conv_kernel - 1;
     auto padding = at::zeros({batch, qkv_dim, pad}, qkv.options());
     auto padded = at::cat({padding, qkv_t}, 2);
-    auto conv_out = at::conv1d(padded, conv1d_w, {},
+    auto conv_out = at::conv1d(padded, conv1d_w, /*bias=*/{},
         at::IntArrayRef({1}), at::IntArrayRef({0}), at::IntArrayRef({1}), qkv_dim);
     conv_out = at::silu(conv_out.narrow(2, 0, seq));
     auto qkv_conv = conv_out.transpose(1, 2);
 
-    int64_t q_size = num_k_heads * key_dim;
-    int64_t v_size = num_v_heads * val_dim;
     auto q = qkv_conv.narrow(-1, 0, q_size).view({batch, seq, num_k_heads, key_dim});
     auto k = qkv_conv.narrow(-1, q_size, q_size).view({batch, seq, num_k_heads, key_dim});
     auto v = qkv_conv.narrow(-1, q_size * 2, v_size).view({batch, seq, num_v_heads, val_dim});
 
     auto a = at::matmul(hidden, in_proj_a.t());
     auto b = at::matmul(hidden, in_proj_b.t());
+
+    // Z projection + LoRA delta
+    auto z = at::matmul(hidden, in_proj_z.t());
+    auto it_z = ctx->lora_batch_cache.find(layer_idx * 10 + 1);
+    if (it_z != ctx->lora_batch_cache.end()) {
+        z = z + lora_activation_delta(hidden, it_z->second.a_stack, it_z->second.b_stack, it_z->second.scaling);
+    }
     z = z.view({batch, seq, num_v_heads, val_dim});
 
-    auto g = (-a_log.exp()) * at::softplus(a + dt_bias);
-    auto beta = a.clamp_min(-10.0).exp().unsqueeze(-1);
+    // g = -exp(A_log) * softplus(a + dt_bias)
+    auto a_log_f = a_log.to(at::kFloat);
+    auto dt_bias_f = dt_bias.to(at::kFloat);
+    auto a_f = a.to(at::kFloat);
+    auto g = a_log_f.unsqueeze(0).unsqueeze(0).exp().neg() * at::softplus(a_f + dt_bias_f.unsqueeze(0).unsqueeze(0));
+    auto beta = at::sigmoid(b);
+
+    // Expand Q/K to num_v_heads
+    int64_t n_rep = num_v_heads / num_k_heads;
+    q = q.repeat_interleave(n_rep, 2);
+    k = k.repeat_interleave(n_rep, 2);
 
     // L2 normalize Q, K
     q = (q.to(at::kFloat) / q.to(at::kFloat).norm(2, -1, true).clamp_min(1e-6));
@@ -1546,59 +1526,43 @@ static at::Tensor linear_attention_batched(
     auto beta_t = beta.to(at::kFloat).transpose(1, 2).contiguous();
 
     auto g_exp = g_t.exp();
-
-    // Chunked delta rule — use num_k_heads for Q/K (not num_v_heads!)
-    // V uses num_v_heads. The original code uses BH = batch * num_v_heads
-    // because V is what the delta rule outputs.
     int64_t BH = batch * num_v_heads;
-    auto state = at::zeros({BH, key_dim, val_dim}, q_t.options().dtype(at::kFloat));
+    auto state = at::zeros({BH, key_dim, val_dim}, q_t.options());
 
-    int64_t chunk_len = 128;
-    std::vector<at::Tensor> chunk_outputs;
-    int64_t offset = 0;
-    while (offset < seq) {
-        int64_t end = std::min(offset + chunk_len, seq);
-        int64_t clen = end - offset;
+    auto q_contig = q_t.reshape({BH, seq, key_dim}).contiguous().to(at::kFloat);
+    auto k_contig = k_t.reshape({BH, seq, key_dim}).contiguous().to(at::kFloat);
+    auto v_contig = v_t.reshape({BH, seq, val_dim}).contiguous().to(at::kFloat);
+    auto g_contig = g_exp.reshape({BH, seq}).contiguous().to(at::kFloat);
+    auto beta_contig = beta_t.reshape({BH, seq}).contiguous().to(at::kFloat);
+    auto state_contig = state.contiguous();
+    auto outs = at::empty({BH, seq, val_dim}, q_t.options());
+    auto delta_buf = at::empty({BH, seq, val_dim}, q_t.options());
 
-        // Q/K use num_k_heads, V uses num_v_heads
-        // q_t: [batch, num_k_heads, seq, key_dim] → [batch*num_k_heads, clen, key_dim]
-        // But delta rule kernel expects [BH, clen, key_dim] where BH=batch*num_v_heads
-        // num_k_heads may differ from num_v_heads!
-        // Original code uses q_t.reshape({BH, ...}) which is wrong if num_k_heads != num_v_heads
-        // but works because in this model num_k_heads=16, num_v_heads=32, and Q is broadcast.
-        // Actually looking at the original more carefully:
-        // q_t is [batch, num_k_heads, seq, key_dim], reshaped to [BH, clen, key_dim]
-        // This requires batch*num_k_heads == BH, i.e. num_k_heads == num_v_heads.
-        // This model has num_k_heads=16, num_v_heads=32, so this would be wrong!
-        // BUT the original code works at batch=1 because it uses the non-chunked path.
-        // The chunked path (QWEN36_SEQ_CHUNK) is only used for long sequences.
-        // For seq=512, the non-chunked path is used.
+    cuda_gated_delta_rule(
+        q_contig.data_ptr<float>(),
+        k_contig.data_ptr<float>(),
+        v_contig.data_ptr<float>(),
+        g_contig.data_ptr<float>(),
+        beta_contig.data_ptr<float>(),
+        state_contig.data_ptr<float>(),
+        outs.data_ptr<float>(),
+        delta_buf.data_ptr<float>(),
+        (int)BH, (int)seq, (int)key_dim, (int)val_dim
+    );
 
-        // Use non-chunked path for simplicity
-        break;
-    }
+    auto core_out = outs.reshape({batch, num_v_heads, seq, val_dim})
+                         .transpose(1, 2).to(compute_type);
+    auto core_flat = core_out.reshape({-1, val_dim});
+    auto z_flat = z.reshape({-1, val_dim});
+    auto variance = core_flat.to(at::kFloat).pow(2).mean(-1, true);
+    auto normed = (core_flat.to(at::kFloat) * (variance + rms_eps).rsqrt() * norm_w.to(at::kFloat)).to(core_flat.scalar_type());
+    auto gated = (normed * at::silu(z_flat.to(at::kFloat)).to(normed.scalar_type())).view({batch, seq, num_v_heads * val_dim});
+    auto result = at::matmul(gated, out_proj.t());
 
-    // Non-chunked delta rule (original path for short sequences)
-    // Recurrent computation per (batch, head) pair
-    // For batch mode, we need to handle BH = batch * num_v_heads correctly
-    // The original code computes this with a CUDA kernel.
-
-    // For now, just use the original linear_attention with base weights
-    // and add LoRA delta on output only. QKV/Z LoRA delta is lost.
-    // TODO: properly integrate batched LoRA into delta rule.
-
-    auto result = linear_attention(hidden, in_proj_qkv, in_proj_z, in_proj_a, in_proj_b,
-        a_log, dt_bias, conv1d_w, norm_w, out_proj,
-        num_k_heads, key_dim, num_v_heads, val_dim,
-        conv_kernel, rms_eps, compute_type);
-
-    // Add out_proj LoRA delta
+    // out_proj LoRA delta: result += B@(A@gated) * scaling
     auto it_op = ctx->lora_batch_cache.find(layer_idx * 10 + 2);
     if (it_op != ctx->lora_batch_cache.end()) {
-        // delta on out_proj: output += B@(A@gated) * scaling
-        // But we don't have `gated` here (it's internal to linear_attention).
-        // For now, skip out_proj LoRA in batched mode.
-        // This is a known limitation — will be fixed in Phase 2.
+        result = result + lora_activation_delta(gated, it_op->second.a_stack, it_op->second.b_stack, it_op->second.scaling);
     }
 
     return result;
@@ -2708,9 +2672,21 @@ __attribute__((visibility("default"))) double qwen36_train_multi_lora(
                     ? forward_full_checkpoint(ctx, input_ref)
                     : forward_full(ctx, input_ref);
 
-            // Loss
-            auto loss = compute_loss(ctx, hidden, input_ref, mask_ref, ctx->vocab_size);
-            double loss_val = loss.item<double>();
+            // Per-adapter CE: each adapter gets independent loss from its hidden slice.
+            // Gradients accumulate into hidden.grad() independently per adapter.
+            double loss_val = 0.0;
+            {
+                at::AutoGradMode grad_enable(true);
+                at::Tensor total_loss = at::zeros({1}, at::TensorOptions().dtype(at::kFloat).device(hidden.device()));
+                for (int64_t i = 0; i < n; i++) {
+                    auto h_i = hidden.select(0, i);          // [seq, hidden]
+                    auto t_i = input_ref.select(0, i);       // [seq]
+                    auto m_i = mask_ref.select(0, i);         // [seq]
+                    auto loss_i = compute_loss(ctx, h_i.unsqueeze(0), t_i.unsqueeze(0), m_i.unsqueeze(0), ctx->vocab_size);
+                    total_loss = total_loss + loss_i;
+                }
+                loss_val = (total_loss / n).item<double>();
+            }
 
             // Backward
             hidden = hidden.detach();
