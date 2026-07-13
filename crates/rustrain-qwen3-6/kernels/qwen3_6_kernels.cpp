@@ -1975,11 +1975,11 @@ __attribute__((visibility("default"))) double qwen36_train_step(
             int dev = -1; cudaGetDevice(&dev);
             fprintf(stderr, "[train_step] rank=%d cur_dev=%d input_ids.dev=%d target_mask.dev=%d\n",
                     ctx->ep_rank, dev, (int)input_ids.device().index(), (int)target_mask.device().index());
-            // Check first layer's weights
-            if (!ctx->layer_configs.empty()) {
-                auto& lc = ctx->layer_configs[0];
-                fprintf(stderr, "[train_step] rank=%d wq.dev=%d wk.dev=%d\n",
-                        ctx->ep_rank, (int)lc.wq.device().index(), (int)lc.wk.device().index());
+            // Check first layer's weight device
+            if (!ctx->weight_ptrs.empty() && ctx->weight_ptrs[0]) {
+                fprintf(stderr, "[train_step] rank=%d w[0].dev=%d w[0].sizes[0]=%ld\n",
+                        ctx->ep_rank, (int)ctx->weight_ptrs[0]->device().index(),
+                        (long)(ctx->weight_ptrs[0]->sizes().size() > 0 ? ctx->weight_ptrs[0]->size(0) : -1));
             }
         }
 
