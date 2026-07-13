@@ -88,10 +88,8 @@ struct NcclAllReduceFunction : public torch::autograd::Function<NcclAllReduceFun
         int dev = input.device().index();
         cudaSetDevice(dev);
         auto compute_stream = c10::cuda::getCurrentCUDAStream(dev).stream();
-        ctx->save_for_backward({});
+        ctx->save_for_backward({input});
         auto output = at::empty_like(input);
-        fprintf(stderr, "[ep_nccl] fwd: dev=%d stream=%p comm=%p numel=%ld dtype=%d\n",
-                dev, compute_stream, (void*)nccl_comm, (long)input.numel(), (int)input.scalar_type());
         ncclResult_t err = ncclAllReduce(
             input.data_ptr(), output.data_ptr(),
             input.numel(), ncclBfloat16, ncclSum,
@@ -99,16 +97,12 @@ struct NcclAllReduceFunction : public torch::autograd::Function<NcclAllReduceFun
         if (err != ncclSuccess) {
             fprintf(stderr, "[ep] ncclAllReduce fwd FAILED: %d (%s) dev=%d\n", err, ncclGetErrorString(err), dev);
         }
-        // Sync to catch async NCCL errors before they corrupt subsequent ops
-        cudaStreamSynchronize(compute_stream);
         return output;
     }
     static std::vector<at::Tensor> backward(torch::autograd::AutogradContext* ctx,
         std::vector<at::Tensor> grad_output) {
-        // Expert weights are FROZEN — no gradient needed for expert params.
-        // Gradient flows through residual connection + attention (LoRA params).
-        // NCCL all-reduce in backward would add 40 sync points per step → deadlock.
-        // Just pass gradient through without all-reduce.
+        // Expert weights frozen — gradient flows through residual connection.
+        // Save input in forward so autograd keeps it alive until backward.
         return {grad_output[0], at::Tensor()};
     }
 };
