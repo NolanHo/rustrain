@@ -1539,17 +1539,26 @@ static at::Tensor linear_attention_batched(
     for (int64_t sb = 0; sb < batch; sb += sub_batch) {
         int64_t n = std::min(sub_batch, batch - sb);
         int64_t BH = n * num_v_heads;
-        int64_t bh_start = sb * num_v_heads;
 
         auto state = at::zeros({BH, key_dim, val_dim}, q_t.options());
 
-        auto q_contig = q_t.narrow(0, bh_start, BH).reshape({BH, seq, key_dim}).contiguous().to(at::kFloat);
-        auto k_contig = k_t.narrow(0, bh_start, BH).reshape({BH, seq, key_dim}).contiguous().to(at::kFloat);
-        auto v_contig = v_t.narrow(0, bh_start, BH).reshape({BH, seq, val_dim}).contiguous().to(at::kFloat);
-        auto g_contig = g_exp.narrow(0, bh_start, BH).reshape({BH, seq}).contiguous().to(at::kFloat);
-        auto beta_contig = beta_t.narrow(0, bh_start, BH).reshape({BH, seq}).contiguous().to(at::kFloat);
+        // Narrow on dim 0 (batch/adapter dimension), then reshape to [BH, seq, dim]
+        auto q_sub = q_t.narrow(0, sb, n);
+        auto k_sub = k_t.narrow(0, sb, n);
+        auto v_sub = v_t.narrow(0, sb, n);
+        auto g_sub = g_exp.narrow(0, sb, n);
+        auto beta_sub = beta_t.narrow(0, sb, n);
+
+        auto q_contig = q_sub.reshape({BH, seq, key_dim}).contiguous().to(at::kFloat);
+        auto k_contig = k_sub.reshape({BH, seq, key_dim}).contiguous().to(at::kFloat);
+        auto v_contig = v_sub.reshape({BH, seq, val_dim}).contiguous().to(at::kFloat);
+        auto g_contig = g_sub.reshape({BH, seq}).contiguous().to(at::kFloat);
+        auto beta_contig = beta_sub.reshape({BH, seq}).contiguous().to(at::kFloat);
         auto state_contig = state.contiguous();
 
+        // Output slices: [BH, seq, val_dim] → need to narrow on dim 0 too
+        // outs is [BH_total, seq, val_dim], so bh_start = sb * num_v_heads
+        int64_t bh_start = sb * num_v_heads;
         cuda_gated_delta_rule(
             q_contig.data_ptr<float>(),
             k_contig.data_ptr<float>(),
