@@ -674,7 +674,7 @@ static at::Tensor moe_forward(
         // sort_order: original token positions in sorted order
 
         // Find expert boundaries via bincount + cumsum
-        auto counts = at::bincount(sorted_indices, /*maxbin=*/expert_start + expert_count);
+        auto counts = at::bincount(sorted_indices, c10::nullopt, expert_start + expert_count);
         // counts[e_global] = number of tokens assigned to expert e
 
         // Gather tokens in sorted order (contiguous per expert)
@@ -685,7 +685,7 @@ static at::Tensor moe_forward(
         int64_t offset = 0;
         for (int64_t e_local = 0; e_local < expert_count; e_local++) {
             int64_t e_global = expert_start + e_local;
-            int64_t n_tokens = counts[e_global].item<int64_t>();
+            int64_t n_tokens = counts.index({e_global}).item<int64_t>();
             if (n_tokens == 0) continue;
 
             auto selected = gathered.narrow(0, offset, n_tokens);  // zero-copy view!
