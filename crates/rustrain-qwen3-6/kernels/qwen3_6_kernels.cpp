@@ -750,13 +750,12 @@ static inline int64_t weight_count_for_layer(const LayerConfig& cfg) {
 static at::Tensor forward_single_layer(
     TrainingContext* ctx, const at::Tensor& hidden, at::Tensor** w, const LayerConfig* cfg,
     int64_t layer_idx, at::ScalarType kind,
-    const at::Tensor& attention_mask
+    const at::Tensor& attention_mask, bool use_batched = false
 ) {
     auto input_norm = *w[0];
     auto post_norm = *w[1];
     auto attn_input = rms_norm(hidden, input_norm, cfg->rms_eps);
     bool is_moe = (cfg->num_experts > 0);
-    bool use_batched = ctx->lora_batch_valid;
 
     at::Tensor attn_output;
     if (cfg->layer_type == 0) {
@@ -1615,7 +1614,7 @@ static at::Tensor forward_full(
         }
 
         hidden = forward_single_layer(ctx, hidden, layer_w.data(), &ctx->layer_configs[i], i,
-            kind, ctx->attention_mask);
+            kind, ctx->attention_mask, ctx->lora_batch_valid);
 
         // Debug: dump per-layer hidden state stats (matching HF output_hidden_states)
         if (getenv("QWEN36_DUMP_LAYERS")) {
@@ -1668,7 +1667,7 @@ static at::Tensor forward_layer_group(
         }
 
         hidden = forward_single_layer(ctx, hidden, layer_w.data(), &ctx->layer_configs[i], i,
-            kind, ctx->attention_mask);
+            kind, ctx->attention_mask, ctx->lora_batch_valid);
     }
     return hidden;
 }
@@ -1781,7 +1780,7 @@ struct FusedLayerFunction : public torch::autograd::Function<FusedLayerFunction>
             la[k] = &tc->lora_a[la_offset + k]; lb[k] = &tc->lora_b[la_offset + k];
         }
         return forward_single_layer(tc, input, layer_w.data(), &tc->layer_configs[layer_idx],
-            layer_idx, kind, tc->attention_mask);
+            layer_idx, kind, tc->attention_mask, tc->lora_batch_valid);
     }
 
     static std::vector<at::Tensor> backward(
