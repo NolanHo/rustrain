@@ -313,55 +313,40 @@ static at::Tensor full_attention(
     // Restore gate after RoPE
     gate = gate_saved;
 
-    int64_t n_rep = num_heads / num_kv_heads;
-    auto k_expanded = k.repeat_interleave(n_rep, 1);
-    k = at::Tensor();  // release old small K
-    cudaDeviceSynchronize();
-    c10::cuda::CUDACachingAllocator::emptyCache();
-    auto v_expanded = v.repeat_interleave(n_rep, 1);
-    v = at::Tensor();  // release old small V
-
-    // Release intermediate tensors before SDPA
-    cudaDeviceSynchronize();
-    c10::cuda::CUDACachingAllocator::emptyCache();
+    // GQA: use enable_gqa=true — no K/V expansion needed (PT 2.5+)
+    // K/V stay [batch, num_kv_heads, seq, head_dim], SDPA handles broadcasting.
+    // This saves (n_rep-1) × num_kv_heads × seq × head_dim × BF16 per layer.
+    // For N=864, num_kv_heads=2, head_dim=256: saves ~7.2 GB/layer peak.
 
     double scale = 1.0 / std::sqrt((double)head_dim);
 
     // Use SDPA (Flash Attention) — O(seq) memory instead of O(seq²)
-    // Build attention mask: causal + padding
-    // SDPA accepts is_causal=true for causal, but we also need padding mask.
-    // Combine: use a 2D bias [batch*num_heads, seq, seq] = causal_mask & key_padding_mask
     at::Tensor attn_mask;
     if (attention_mask.defined() && attention_mask.numel() > 0) {
-        // key_padding_mask: [batch, seq] → [batch, 1, 1, seq]
-        // Expand to [batch, num_heads, seq, seq] via broadcasting
-        // mask=1 means "attend", mask=0 means "ignore"
         auto kpm = attention_mask.to(at::kBool);
-        // Ensure kpm is [batch, seq] (squeeze extra dims from Rust side)
         while (kpm.dim() > 2) kpm = kpm.squeeze(0);
         kpm = kpm.unsqueeze(1).unsqueeze(1);  // [B, 1, 1, S]
-        // For SDPA, attn_mask should be additive bias: 0 for attend, -inf for ignore
         auto additive_mask = at::zeros({batch, 1, 1, seq}, at::TensorOptions().dtype(q.scalar_type()).device(q.device()));
         additive_mask = additive_mask.masked_fill(kpm.logical_not(), -std::numeric_limits<float>::infinity());
         auto attn_out = at::scaled_dot_product_attention(
-            q, k_expanded, v_expanded,
+            q, k, v,
             additive_mask,
             0.0,
-            true
+            true,
+            c10::nullopt,
+            true  // enable_gqa
         );
         return attn_out.transpose(1, 2).reshape({batch, seq, qkv_dim}).matmul(o_proj.t());
     } else {
         auto attn_out = at::scaled_dot_product_attention(
-            q, k_expanded, v_expanded,
+            q, k, v,
             c10::nullopt,
             0.0,
-            true
+            true,
+            c10::nullopt,
+            true  // enable_gqa
         );
         auto result = attn_out.transpose(1, 2).reshape({batch, seq, qkv_dim}).matmul(o_proj.t());
-        k_expanded = at::Tensor();
-        v_expanded = at::Tensor();
-        cudaDeviceSynchronize();
-        c10::cuda::CUDACachingAllocator::emptyCache();
         result = result * at::sigmoid(gate).to(result.scalar_type());
         gate = at::Tensor();
         cudaDeviceSynchronize();
@@ -924,6 +909,8 @@ struct TrainingContext {
     // Group checkpoint storage for manual sequential backward
     std::vector<at::Tensor> group_inputs;
     std::vector<at::Tensor> group_outputs;
+    // Variable-size group ranges for selective checkpointing
+    std::vector<std::pair<int64_t, int64_t>> group_ranges;
 
     // NCCL for Expert Parallel all-reduce (nullptr if single-GPU)
     ncclComm_t nccl_comm = nullptr;
@@ -1407,37 +1394,25 @@ static at::Tensor full_attention_batched(
         c10::cuda::CUDACachingAllocator::emptyCache();
     }
 
-    // K/V expansion
-    int64_t n_rep = num_heads / num_kv_heads;
-    auto k_expanded = k.repeat_interleave(n_rep, 1);
-    k = at::Tensor();
-    cudaDeviceSynchronize();
-    c10::cuda::CUDACachingAllocator::emptyCache();
-    auto v_expanded = v.repeat_interleave(n_rep, 1);
-    v = at::Tensor();
-    cudaDeviceSynchronize();
-    c10::cuda::CUDACachingAllocator::emptyCache();
-
+    // GQA: no K/V expansion needed (PT 2.5+ enable_gqa=true)
     double scale = 1.0 / std::sqrt((double)head_dim);
 
-    // SDPA
+    // SDPA with GQA
     at::Tensor attn_out;
     if (attention_mask.defined() && attention_mask.numel() > 0) {
         auto kpm = attention_mask.to(at::kBool);
         while (kpm.dim() > 2) kpm = kpm.squeeze(0);
         if (kpm.size(0) == 1) {
-            // Broadcast [1, seq] → [batch, 1, 1, seq]
             kpm = kpm.unsqueeze(1).unsqueeze(1).expand({batch, 1, 1, seq});
         } else {
             kpm = kpm.unsqueeze(1).unsqueeze(1);
         }
         auto additive_mask = at::zeros({batch, 1, 1, seq}, at::TensorOptions().dtype(q_out.scalar_type()).device(q_out.device()));
         additive_mask = additive_mask.masked_fill(kpm.logical_not(), -std::numeric_limits<float>::infinity());
-        attn_out = at::scaled_dot_product_attention(q_out, k_expanded, v_expanded, additive_mask, 0.0, true);
+        attn_out = at::scaled_dot_product_attention(q_out, k, v, additive_mask, 0.0, true, c10::nullopt, true);
     } else {
-        attn_out = at::scaled_dot_product_attention(q_out, k_expanded, v_expanded, c10::nullopt, 0.0, true);
+        attn_out = at::scaled_dot_product_attention(q_out, k, v, c10::nullopt, 0.0, true, c10::nullopt, true);
     }
-    k_expanded = at::Tensor(); v_expanded = at::Tensor();
     cudaDeviceSynchronize();
     c10::cuda::CUDACachingAllocator::emptyCache();
 
@@ -1859,24 +1834,37 @@ static at::Tensor forward_full_checkpoint(
         return hidden;
     }
 
-    // Group-level manual checkpointing — no autograd::Function, no graph edges
-    int64_t gs = ctx->group_size;
-    if (gs < 1) gs = 1;
-
-    // Forward in no-grad mode
+    // Group-level manual checkpointing with variable group size:
+    // Full attn layers (layer_type=0, every 4th): gs=1 (reduce peak)
+    // Linear attn layers: gs=4 (reduce group input storage)
     at::AutoGradMode no_grad(false);
     hidden = hidden.detach();
 
     ctx->group_inputs.clear();
     bool offload = getenv("QWEN36_OFFLOAD_ACTIVATIONS");
-    int64_t num_groups = (ctx->num_layers + gs - 1) / gs;
 
-    for (int64_t g = 0; g < num_groups; g++) {
-        int64_t start = g * gs;
-        int64_t end = std::min(start + gs, ctx->num_layers);
+    // Build group list: [(start, end), ...]
+    std::vector<std::pair<int64_t, int64_t>> groups;
+    int64_t li = 0;
+    while (li < ctx->num_layers) {
+        if (ctx->layer_configs[li].layer_type == 0) {
+            // Full attn: group size 1
+            groups.push_back({li, li + 1});
+            li += 1;
+        } else {
+            // Linear attn: group size up to 4, don't cross into full attn
+            int64_t end = std::min(li + 4, ctx->num_layers);
+            while (end > li + 1 && ctx->layer_configs[end - 1].layer_type == 0) end--;
+            groups.push_back({li, end});
+            li = end;
+        }
+    }
 
-        // Save this group's input (offload to CPU if enabled)
-        if (offload && g < num_groups - 1) {
+    // Save groups for backward
+    ctx->group_ranges = groups;
+
+    for (auto& [start, end] : groups) {
+        if (offload && start < groups.back().first) {
             ctx->group_inputs.push_back(
                 hidden.to(at::TensorOptions().dtype(hidden.scalar_type()).device(at::kCPU).pinned_memory(true))
             );
@@ -1886,13 +1874,7 @@ static at::Tensor forward_full_checkpoint(
 
         hidden = forward_layer_group(ctx, hidden, start, end);
 
-        // Debug: GPU memory after each group
-        {
-            // Force release cached memory from no-grad intermediates
-            c10::cuda::CUDACachingAllocator::emptyCache();
-            size_t free, total;
-            cudaMemGetInfo(&free, &total);
-        }
+        c10::cuda::CUDACachingAllocator::emptyCache();
     }
 
     // Return hidden on GPU with requires_grad for CE backward
@@ -1907,16 +1889,14 @@ static void manual_group_backward(
     TrainingContext* ctx,
     const at::Tensor& hidden_grad
 ) {
-    int64_t gs = ctx->group_size;
-    if (gs < 1) gs = 1;
-
-    int64_t num_groups = (ctx->num_layers + gs - 1) / gs;
+    auto& groups = ctx->group_ranges;
+    int64_t num_groups = (int64_t)groups.size();
     at::Tensor grad = hidden_grad;
     at::AutoGradMode grad_mode(true);
 
     for (int64_t g = num_groups - 1; g >= 0; g--) {
-        int64_t start = g * gs;
-        int64_t end = std::min(start + gs, ctx->num_layers);
+        int64_t start = groups[g].first;
+        int64_t end = groups[g].second;
 
         // Restore input from saved (CPU if offloaded)
         auto input = ctx->group_inputs[g].to(hidden_grad.device()).detach().set_requires_grad(true);
@@ -2672,20 +2652,15 @@ __attribute__((visibility("default"))) double qwen36_train_multi_lora(
                     ? forward_full_checkpoint(ctx, input_ref)
                     : forward_full(ctx, input_ref);
 
-            // Per-adapter CE: each adapter gets independent loss from its hidden slice.
-            // Gradients accumulate into hidden.grad() independently per adapter.
-            double loss_val = 0.0;
+            // Batched CE: single compute_loss on [N, seq, hidden] flattened to [N*seq, hidden].
+            // Gradients are block-diagonal — each adapter's grad only touches its rows.
+            // This eliminates N GPU syncs and N small GEMMs.
+            double loss_val;
             {
                 at::AutoGradMode grad_enable(true);
-                at::Tensor total_loss = at::zeros({1}, at::TensorOptions().dtype(at::kFloat).device(hidden.device()));
-                for (int64_t i = 0; i < n; i++) {
-                    auto h_i = hidden.select(0, i);          // [seq, hidden]
-                    auto t_i = input_ref.select(0, i);       // [seq]
-                    auto m_i = mask_ref.select(0, i);         // [seq]
-                    auto loss_i = compute_loss(ctx, h_i.unsqueeze(0), t_i.unsqueeze(0), m_i.unsqueeze(0), ctx->vocab_size);
-                    total_loss = total_loss + loss_i;
-                }
-                loss_val = (total_loss / n).item<double>();
+                // Reshape hidden [N, seq, hidden] → [N, seq, hidden] (keep batch dim for CE shifting)
+                auto loss = compute_loss(ctx, hidden, input_ref, mask_ref, ctx->vocab_size);
+                loss_val = loss.item<double>();
             }
 
             // Backward
