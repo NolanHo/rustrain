@@ -1945,15 +1945,32 @@ static void manual_group_backward(
         // backward() which traverses all leaf nodes.
         // LoRA params are shared across groups, so we accumulate their gradients.
         std::vector<at::Tensor> grad_inputs = {input};
-        // Add LoRA params for this group's layers
-        for (int64_t l = start; l < end; l++) {
-            int64_t lora_count = (ctx->layer_configs[l].layer_type == 0) ? 4 : 3;
-            int64_t la_offset = ctx->lora_layer_offset[l];
-            bool has_lora = (la_offset + lora_count) <= (int64_t)ctx->lora_a.size();
-            if (has_lora) {
-                for (int64_t k = 0; k < lora_count; k++) {
-                    grad_inputs.push_back(ctx->lora_a[la_offset + k]);
-                    grad_inputs.push_back(ctx->lora_b[la_offset + k]);
+
+        if (ctx->lora_batch_valid) {
+            // Multi-LoRA: collect A/B from ctx->adapters
+            for (int64_t l = start; l < end; l++) {
+                int64_t lora_count = (ctx->layer_configs[l].layer_type == 0) ? 4 : 3;
+                for (auto& adapter : ctx->adapters) {
+                    auto it = adapter.params.find(l);
+                    if (it == adapter.params.end()) continue;
+                    for (int64_t k = 0; k < lora_count && k < (int64_t)it->second.size(); k++) {
+                        auto& [a, b] = it->second[k];
+                        grad_inputs.push_back(a);
+                        grad_inputs.push_back(b);
+                    }
+                }
+            }
+        } else {
+            // Legacy single-LoRA
+            for (int64_t l = start; l < end; l++) {
+                int64_t lora_count = (ctx->layer_configs[l].layer_type == 0) ? 4 : 3;
+                int64_t la_offset = ctx->lora_layer_offset[l];
+                bool has_lora = (la_offset + lora_count) <= (int64_t)ctx->lora_a.size();
+                if (has_lora) {
+                    for (int64_t k = 0; k < lora_count; k++) {
+                        grad_inputs.push_back(ctx->lora_a[la_offset + k]);
+                        grad_inputs.push_back(ctx->lora_b[la_offset + k]);
+                    }
                 }
             }
         }
@@ -1965,25 +1982,51 @@ static void manual_group_backward(
         );
 
         // Manually accumulate LoRA param gradients
-        int64_t gi = 1;  // skip input grad (index 0)
-        for (int64_t l = start; l < end; l++) {
-            int64_t lora_count = (ctx->layer_configs[l].layer_type == 0) ? 4 : 3;
-            int64_t la_offset = ctx->lora_layer_offset[l];
-            bool has_lora = (la_offset + lora_count) <= (int64_t)ctx->lora_a.size();
-            if (has_lora) {
-                for (int64_t k = 0; k < lora_count; k++) {
-                    if (grads[gi].defined()) {
-                        auto& pa = ctx->lora_a[la_offset + k];
-                        if (pa.grad().defined()) pa.grad().add_(grads[gi]);
-                        else pa.mutable_grad() = grads[gi].clone();
+        if (ctx->lora_batch_valid) {
+            // Multi-LoRA: accumulate into ctx->adapters
+            int64_t gi = 1;  // skip input grad (index 0)
+            for (int64_t l = start; l < end; l++) {
+                int64_t lora_count = (ctx->layer_configs[l].layer_type == 0) ? 4 : 3;
+                for (auto& adapter : ctx->adapters) {
+                    auto it = adapter.params.find(l);
+                    if (it == adapter.params.end()) continue;
+                    for (int64_t k = 0; k < lora_count && k < (int64_t)it->second.size(); k++) {
+                        auto& [a, b] = it->second[k];
+                        if (gi < (int64_t)grads.size() && grads[gi].defined()) {
+                            if (a.grad().defined()) a.grad().add_(grads[gi]);
+                            else a.mutable_grad() = grads[gi].clone();
+                        }
+                        gi++;
+                        if (gi < (int64_t)grads.size() && grads[gi].defined()) {
+                            if (b.grad().defined()) b.grad().add_(grads[gi]);
+                            else b.mutable_grad() = grads[gi].clone();
+                        }
+                        gi++;
                     }
-                    gi++;
-                    if (grads[gi].defined()) {
-                        auto& pb = ctx->lora_b[la_offset + k];
-                        if (pb.grad().defined()) pb.grad().add_(grads[gi]);
-                        else pb.mutable_grad() = grads[gi].clone();
+                }
+            }
+        } else {
+            // Legacy single-LoRA
+            int64_t gi = 1;  // skip input grad (index 0)
+            for (int64_t l = start; l < end; l++) {
+                int64_t lora_count = (ctx->layer_configs[l].layer_type == 0) ? 4 : 3;
+                int64_t la_offset = ctx->lora_layer_offset[l];
+                bool has_lora = (la_offset + lora_count) <= (int64_t)ctx->lora_a.size();
+                if (has_lora) {
+                    for (int64_t k = 0; k < lora_count; k++) {
+                        if (grads[gi].defined()) {
+                            auto& pa = ctx->lora_a[la_offset + k];
+                            if (pa.grad().defined()) pa.grad().add_(grads[gi]);
+                            else pa.mutable_grad() = grads[gi].clone();
+                        }
+                        gi++;
+                        if (grads[gi].defined()) {
+                            auto& pb = ctx->lora_b[la_offset + k];
+                            if (pb.grad().defined()) pb.grad().add_(grads[gi]);
+                            else pb.mutable_grad() = grads[gi].clone();
+                        }
+                        gi++;
                     }
-                    gi++;
                 }
             }
         }
