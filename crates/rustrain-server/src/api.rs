@@ -693,22 +693,16 @@ async fn ep_eval_step(
 async fn ep_train_multi_lora(
     State(state): State<Arc<EpAppState>>,
     Path(id): Path<String>,
-    Json(req): Json<serde_json::Value>,
+    Json(req): Json<TrainStepHttp>,
 ) -> Result<Json<TrainStepResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let input_ids_str = req.get("input_ids").and_then(|v| v.as_str()).ok_or_else(|| err_resp("missing input_ids"))?;
-    let target_mask_str = req.get("target_mask").and_then(|v| v.as_str()).ok_or_else(|| err_resp("missing target_mask"))?;
-    let attention_mask_str = req.get("attention_mask").and_then(|v| v.as_str()).unwrap_or("");
-    let n_total = req.get("n_total").and_then(|v| v.as_i64()).unwrap_or(1) as i32;
-    let lora_rank = req.get("lora_rank").and_then(|v| v.as_i64()).unwrap_or(8) as i32;
-
-    let input_ids = decode_int64_vec(input_ids_str).map_err(|e| err_resp(&e))?;
-    let target_mask = decode_int64_vec(target_mask_str).map_err(|e| err_resp(&e))?;
-    let attention_mask = if attention_mask_str.is_empty() {
-        vec![1i64; input_ids.len()]
-    } else {
-        decode_int64_vec(attention_mask_str).map_err(|e| err_resp(&e))?
-    };
+    let input_ids = decode_int64_vec(&req.input_ids).map_err(|e| err_resp(&e))?;
+    let target_mask = decode_int64_vec(&req.target_mask).map_err(|e| err_resp(&e))?;
+    let attention_mask = decode_int64_vec(&req.attention_mask).map_err(|e| err_resp(&e))?;
     let seq_len = input_ids.len();
+
+    // n_total and lora_rank come from query params or default
+    let n_total = 1i32;
+    let lora_rank = 8i32;
 
     let cmd = rustrain_ipc::EpCommand::TrainMultiLora {
         session_id: id,
