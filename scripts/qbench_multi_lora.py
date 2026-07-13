@@ -166,8 +166,8 @@ def bench_serial_single(lora_rank=8, n_steps=5):
 
 # ─── Main ───
 results = {}
-for n in [2, 8, 32]:
-    for rank in [1, 8]:
+for n in [2, 8, 16, 24, 32]:
+    for rank in [1]:
         r = bench_multi(n, rank, n_steps=5)
         if r:
             results[f"{n}_{rank}"] = r
