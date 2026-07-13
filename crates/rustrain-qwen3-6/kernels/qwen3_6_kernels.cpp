@@ -614,6 +614,25 @@ static at::Tensor linear_attention(
     return result;
 }
 
+// Forward declarations for functions defined below
+static at::Tensor dense_mlp_forward(const at::Tensor& hidden,
+    const at::Tensor& gate_proj, const at::Tensor& up_proj, const at::Tensor& down_proj,
+    at::ScalarType compute_type);
+static at::Tensor full_attention_batched(TrainingContext* ctx, const at::Tensor& hidden,
+    int64_t layer_idx, const at::Tensor& q_proj, const at::Tensor& q_norm,
+    const at::Tensor& k_proj, const at::Tensor& k_norm,
+    const at::Tensor& v_proj, const at::Tensor& o_proj,
+    int64_t num_heads, int64_t num_kv_heads, int64_t head_dim,
+    double partial_rotary_factor, double rope_theta,
+    double rms_eps, at::ScalarType kind, const at::Tensor& attention_mask);
+static at::Tensor linear_attention_batched(TrainingContext* ctx, const at::Tensor& hidden,
+    int64_t layer_idx, const at::Tensor& in_proj_qkv, const at::Tensor& in_proj_z,
+    const at::Tensor& in_proj_a, const at::Tensor& in_proj_b,
+    const at::Tensor& a_log, const at::Tensor& dt_bias,
+    const at::Tensor& conv1d_w, const at::Tensor& norm_w, const at::Tensor& out_proj,
+    int64_t num_k_heads, int64_t key_dim, int64_t num_v_heads, int64_t val_dim,
+    int64_t conv_kernel, double rms_eps, at::ScalarType compute_type);
+
 // ──────────────────────────────────────────────────────────────────────
 // MoE
 // ──────────────────────────────────────────────────────────────────────
@@ -1026,25 +1045,6 @@ static void precompute_lora_cache(TrainingContext* ctx) {
 }
 
 // ── Batched Multi-LoRA: activation-level B@(A@x) ──
-
-// Forward declaration — defined below
-static at::Tensor dense_mlp_forward(const at::Tensor& hidden,
-    const at::Tensor& gate_proj, const at::Tensor& up_proj, const at::Tensor& down_proj,
-    at::ScalarType compute_type);
-static at::Tensor full_attention_batched(TrainingContext* ctx, const at::Tensor& hidden,
-    int64_t layer_idx, const at::Tensor& q_proj, const at::Tensor& q_norm,
-    const at::Tensor& k_proj, const at::Tensor& k_norm,
-    const at::Tensor& v_proj, const at::Tensor& o_proj,
-    int64_t num_heads, int64_t num_kv_heads, int64_t head_dim,
-    double partial_rotary_factor, double rope_theta,
-    double rms_eps, at::ScalarType kind, const at::Tensor& attention_mask);
-static at::Tensor linear_attention_batched(TrainingContext* ctx, const at::Tensor& hidden,
-    int64_t layer_idx, const at::Tensor& in_proj_qkv, const at::Tensor& in_proj_z,
-    const at::Tensor& in_proj_a, const at::Tensor& in_proj_b,
-    const at::Tensor& a_log, const at::Tensor& dt_bias,
-    const at::Tensor& conv1d_w, const at::Tensor& norm_w, const at::Tensor& out_proj,
-    int64_t num_k_heads, int64_t key_dim, int64_t num_v_heads, int64_t val_dim,
-    int64_t conv_kernel, double rms_eps, at::ScalarType compute_type);
 
 /// Prepare stacked A/B tensors for all adapters per (layer, module).
 /// Stores in ctx->lora_batch_cache. Called once before forward.
