@@ -88,16 +88,16 @@ struct NcclAllReduceFunction : public torch::autograd::Function<NcclAllReduceFun
         int dev = input.device().index();
         cudaSetDevice(dev);
         auto compute_stream = c10::cuda::getCurrentCUDAStream(dev).stream();
-        // Don't save input for backward — we don't need it (expert weights frozen).
-        // This prevents autograd from keeping input alive and causing memory issues.
         ctx->save_for_backward({});
         auto output = at::empty_like(input);
+        fprintf(stderr, "[ep_nccl] fwd: dev=%d stream=%p comm=%p numel=%ld dtype=%d\n",
+                dev, compute_stream, (void*)nccl_comm, (long)input.numel(), (int)input.scalar_type());
         ncclResult_t err = ncclAllReduce(
             input.data_ptr(), output.data_ptr(),
             input.numel(), ncclBfloat16, ncclSum,
             nccl_comm, compute_stream);
         if (err != ncclSuccess) {
-            fprintf(stderr, "[ep] ncclAllReduce fwd FAILED: %d (%s)\n", err, ncclGetErrorString(err));
+            fprintf(stderr, "[ep] ncclAllReduce fwd FAILED: %d (%s) dev=%d\n", err, ncclGetErrorString(err), dev);
         }
         return output;
     }
