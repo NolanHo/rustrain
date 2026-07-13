@@ -2231,6 +2231,13 @@ __attribute__((visibility("default"))) int32_t qwen36_init_nccl(
     if (g_nccl_initialized) {
         ctx->nccl_comm = g_nccl_comm;
         ctx->nccl_stream = g_nccl_stream;
+        // CRITICAL: also set ep_rank/ep_world_size — needed for new TrainingContext
+        // created by subsequent CreateSession commands. The fast path previously
+        // skipped this, leaving ep_rank=0 → cudaSetDevice(0) on all ranks → crash.
+        const char* rank_str2 = getenv("RANK");
+        const char* world_str2 = getenv("WORLD_SIZE");
+        if (rank_str2) ctx->ep_rank = atoi(rank_str2);
+        if (world_str2) ctx->ep_world_size = atoi(world_str2);
         for (auto& lc : ctx->layer_configs) { lc.nccl_comm = (void*)g_nccl_comm; lc.nccl_stream = (void*)g_nccl_stream; }
         for (auto& lc : ctx->mtp_layer_configs) { lc.nccl_comm = (void*)g_nccl_comm; lc.nccl_stream = (void*)g_nccl_stream; }
         return 0;
