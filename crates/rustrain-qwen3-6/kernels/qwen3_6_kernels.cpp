@@ -1027,6 +1027,11 @@ static void precompute_lora_cache(TrainingContext* ctx) {
 
 // ── Batched Multi-LoRA: activation-level B@(A@x) ──
 
+// Forward declaration — defined below
+static at::Tensor dense_mlp_forward(const at::Tensor& hidden,
+    const at::Tensor& gate_proj, const at::Tensor& up_proj, const at::Tensor& down_proj,
+    at::ScalarType compute_type);
+
 /// Prepare stacked A/B tensors for all adapters per (layer, module).
 /// Stores in ctx->lora_batch_cache. Called once before forward.
 /// Replaces precompute_lora_cache when N > 1.
