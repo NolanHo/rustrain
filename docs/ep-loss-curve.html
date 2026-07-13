@@ -1,0 +1,271 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>EP=4 Loss Curve — Qwen3.6-35B-A3B LoRA</title>
+<style>
+:root {
+  --bg: #0d1117;
+  --bg-card: #161b22;
+  --bg-hover: #1c2330;
+  --border: #30363d;
+  --text: #e6edf3;
+  --text-dim: #8b949e;
+  --text-muted: #6e7681;
+  --accent: #58a6ff;
+  --accent-dim: #1f6feb;
+  --green: #3fb950;
+  --orange: #d29922;
+  --red: #f85149;
+  --purple: #bc8cff;
+  --font-sans: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif;
+  --font-mono: 'SF Mono', 'Fira Code', 'Cascadia Code', Consolas, monospace;
+}
+html.light {
+  --bg: #ffffff;
+  --bg-card: #f6f8fa;
+  --bg-hover: #eaeef2;
+  --border: #d0d7de;
+  --text: #1f2328;
+  --text-dim: #59636e;
+  --text-muted: #818b98;
+  --accent: #0969da;
+  --accent-dim: #218bff;
+  --green: #1a7f37;
+  --orange: #9a6700;
+  --red: #cf222e;
+  --purple: #8250df;
+}
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--font-sans);
+  line-height: 1.5;
+  padding: 24px;
+}
+.theme-toggle {
+  position: fixed; top: 16px; right: 16px;
+  background: var(--bg-card); border: 1px solid var(--border);
+  color: var(--text); border-radius: 6px; padding: 6px 12px;
+  cursor: pointer; font-size: 13px; z-index: 100;
+}
+h1 { font-size: 20px; font-weight: 600; margin-bottom: 4px; }
+.subtitle { color: var(--text-dim); font-size: 13px; margin-bottom: 24px; }
+.chart-container {
+  background: var(--bg-card); border: 1px solid var(--border);
+  border-radius: 12px; padding: 24px; margin-bottom: 24px;
+}
+.legend { display: flex; gap: 24px; margin-bottom: 16px; flex-wrap: wrap; }
+.legend-item { display: flex; align-items: center; gap: 8px; font-size: 13px; color: var(--text-dim); }
+.legend-dot { width: 12px; height: 3px; border-radius: 2px; }
+svg { width: 100%; height: auto; display: block; }
+.stats-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; }
+.stat-card {
+  background: var(--bg-card); border: 1px solid var(--border);
+  border-radius: 10px; padding: 20px;
+}
+.stat-title { font-size: 13px; color: var(--text-dim); margin-bottom: 8px; }
+.stat-row { display: flex; justify-content: space-between; font-size: 13px; padding: 4px 0; }
+.stat-row .label { color: var(--text-muted); }
+.stat-row .value { font-family: var(--font-mono); color: var(--text); }
+.stat-header { display: flex; align-items: center; gap: 8px; margin-bottom: 12px; }
+.stat-color-dot { width: 10px; height: 10px; border-radius: 50%; }
+.stat-title-text { font-size: 15px; font-weight: 600; }
+@media (max-width: 768px) {
+  .stats-grid { grid-template-columns: 1fr; }
+}
+</style>
+</head>
+<body class="dark">
+<script>
+const theme = localStorage.getItem('theme') || (matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');
+document.documentElement.className = theme;
+</script>
+<button class="theme-toggle" onclick="const t = document.documentElement.className === 'dark' ? 'light' : 'dark'; document.documentElement.className = t; localStorage.setItem('theme', t);">🌙 / ☀️</button>
+
+<h1>EP=4 Loss Curve</h1>
+<p class="subtitle">Qwen3.6-35B-A3B · BF16 LoRA rank=16 · seq=512 · 4× H20-3e · single-sample overfit test</p>
+
+<div class="chart-container">
+  <div class="legend">
+    <div class="legend-item"><div class="legend-dot" style="background:var(--accent)"></div>1 adapter</div>
+    <div class="legend-item"><div class="legend-dot" style="background:var(--green)"></div>8 adapters</div>
+    <div class="legend-item"><div class="legend-dot" style="background:var(--orange)"></div>32 adapters</div>
+  </div>
+  <svg viewBox="0 0 900 400" id="chart"></svg>
+</div>
+
+<div class="stats-grid">
+  <div class="stat-card">
+    <div class="stat-header">
+      <div class="stat-color-dot" style="background:var(--accent)"></div>
+      <div class="stat-title-text">1 adapter</div>
+    </div>
+    <div class="stat-row"><span class="label">warmup loss</span><span class="value">15.7479</span></div>
+    <div class="stat-row"><span class="label">step 0</span><span class="value">1.2155</span></div>
+    <div class="stat-row"><span class="label">step 5</span><span class="value">0.0000</span></div>
+    <div class="stat-row"><span class="label">converged</span><span class="value">~5 steps</span></div>
+    <div class="stat-row"><span class="label">avg ms/step</span><span class="value">1520</span></div>
+    <div class="stat-row"><span class="label">p50 / p95</span><span class="value">1513 / 1629</span></div>
+  </div>
+  <div class="stat-card">
+    <div class="stat-header">
+      <div class="stat-color-dot" style="background:var(--green)"></div>
+      <div class="stat-title-text">8 adapters</div>
+    </div>
+    <div class="stat-row"><span class="label">warmup loss</span><span class="value">15.7479</span></div>
+    <div class="stat-row"><span class="label">step 0</span><span class="value">0.0020</span></div>
+    <div class="stat-row"><span class="label">step 5 spike</span><span class="value">0.9475</span></div>
+    <div class="stat-row"><span class="label">converged</span><span class="value">~10 steps</span></div>
+    <div class="stat-row"><span class="label">avg ms/step</span><span class="value">1601</span></div>
+    <div class="stat-row"><span class="label">p50 / p95</span><span class="value">1607 / 1689</span></div>
+  </div>
+  <div class="stat-card">
+    <div class="stat-header">
+      <div class="stat-color-dot" style="background:var(--orange)"></div>
+      <div class="stat-title-text">32 adapters</div>
+    </div>
+    <div class="stat-row"><span class="label">warmup loss</span><span class="value">15.7479</span></div>
+    <div class="stat-row"><span class="label">step 0</span><span class="value">0.0000</span></div>
+    <div class="stat-row"><span class="label">step 5 spike</span><span class="value">87.2150</span></div>
+    <div class="stat-row"><span class="label">converged</span><span class="value">~25 steps</span></div>
+    <div class="stat-row"><span class="label">avg ms/step</span><span class="value">1625</span></div>
+    <div class="stat-row"><span class="label">p50 / p95</span><span class="value">1616 / 1717</span></div>
+  </div>
+</div>
+
+<script>
+const data = {
+  // [step, loss] — from benchmark output
+  // warmup loss=15.7479 for all three
+  one: [
+    [0, 1.215485], [5, 0.0], [10, 0.0], [15, 0.0], [20, 0.0],
+    [25, 0.0], [30, 0.0], [35, 0.0], [40, 0.0], [45, 0.0], [49, 0.0]
+  ],
+  eight: [
+    [0, 0.001971], [5, 0.947460], [10, 0.0], [15, 0.0], [20, 0.0],
+    [25, 0.0], [30, 0.0], [35, 0.0], [40, 0.0], [45, 0.0], [49, 0.0]
+  ],
+  thirtytwo: [
+    [0, 0.000039], [5, 87.215019], [10, 0.000170], [15, 0.034449], [20, 0.004482],
+    [25, 0.000840], [30, 0.000301], [35, 0.000211], [40, 0.000176], [45, 0.000165], [49, 0.000163]
+  ]
+};
+
+// Interpolate between known data points for smooth curves
+function interpolate(points, maxStep) {
+  const result = [];
+  for (let s = 0; s <= maxStep; s++) {
+    // Find bracketing points
+    let lo = points[0], hi = points[points.length - 1];
+    for (let i = 0; i < points.length - 1; i++) {
+      if (points[i][0] <= s && points[i+1][0] >= s) {
+        lo = points[i]; hi = points[i+1]; break;
+      }
+    }
+    if (lo[0] === hi[0]) {
+      result.push([s, lo[1]]);
+    } else {
+      const t = (s - lo[0]) / (hi[0] - lo[0]);
+      // Use log scale interpolation for smoother curves
+      const loV = Math.max(lo[1], 0.0001);
+      const hiV = Math.max(hi[1], 0.0001);
+      const val = Math.pow(loV, 1-t) * Math.pow(hiV, t);
+      result.push([s, val]);
+    }
+  }
+  return result;
+}
+
+const maxStep = 49;
+const W = 900, H = 400;
+const margin = { top: 30, right: 40, bottom: 50, left: 70 };
+const plotW = W - margin.left - margin.right;
+const plotH = H - margin.top - margin.bottom;
+
+// Y axis: log scale from 0.0001 to 100
+const yMin = 0.0001, yMax = 100;
+const yLogMin = Math.log10(yMin), yLogMax = Math.log10(yMax);
+
+function xScale(s) { return margin.left + (s / maxStep) * plotW; }
+function yScale(v) {
+  const lv = Math.log10(Math.max(v, yMin));
+  const clamped = Math.max(yLogMin, Math.min(yLogMax, lv));
+  return margin.top + (1 - (clamped - yLogMin) / (yLogMax - yLogMin)) * plotH;
+}
+
+function pathFromPoints(pts) {
+  return pts.map((p, i) => `${i === 0 ? 'M' : 'L'} ${xScale(p[0]).toFixed(1)} ${yScale(p[1]).toFixed(1)}`).join(' ');
+}
+
+const series = [
+  { key: 'one',       color: 'var(--accent)', label: '1 adapter' },
+  { key: 'eight',     color: 'var(--green)',  label: '8 adapters' },
+  { key: 'thirtytwo', color: 'var(--orange)', label: '32 adapters' }
+];
+
+let svgContent = '';
+
+// Grid lines (horizontal)
+const yTicks = [0.0001, 0.001, 0.01, 0.1, 1, 10, 100];
+yTicks.forEach(v => {
+  const y = yScale(v);
+  svgContent += `<line x1="${margin.left}" y1="${y}" x2="${W - margin.right}" y2="${y}" stroke="var(--border)" stroke-width="0.5" stroke-dasharray="2,4"/>`;
+  svgContent += `<text x="${margin.left - 8}" y="${y + 4}" text-anchor="end" fill="var(--text-muted)" font-size="11" font-family="var(--font-mono)">${v < 1 ? v.toExponential(0) : v}</text>`;
+});
+
+// X axis ticks
+for (let s = 0; s <= 50; s += 10) {
+  const x = xScale(s);
+  svgContent += `<line x1="${x}" y1="${H - margin.bottom}" x2="${x}" y2="${H - margin.bottom + 5}" stroke="var(--text-muted)" stroke-width="1"/>`;
+  svgContent += `<text x="${x}" y="${H - margin.bottom + 20}" text-anchor="middle" fill="var(--text-muted)" font-size="11" font-family="var(--font-mono)">${s}</text>`;
+}
+
+// Axis labels
+svgContent += `<text x="${W/2}" y="${H - 8}" text-anchor="middle" fill="var(--text-dim)" font-size="12">Training Step</text>`;
+svgContent += `<text x="20" y="${H/2}" text-anchor="middle" fill="var(--text-dim)" font-size="12" transform="rotate(-90 20 ${H/2})">Loss (log scale)</text>`;
+
+// Warmup reference line
+const warmupY = yScale(15.7479);
+svgContent += `<line x1="${margin.left}" y1="${warmupY}" x2="${W - margin.right}" y2="${warmupY}" stroke="var(--red)" stroke-width="1" stroke-dasharray="3,3" opacity="0.4"/>`;
+svgContent += `<text x="${W - margin.right - 4}" y="${warmupY - 6}" text-anchor="end" fill="var(--red)" font-size="10" opacity="0.7">warmup=15.75</text>`;
+
+// Draw series
+series.forEach(s => {
+  const pts = interpolate(data[s.key], maxStep);
+  const path = pathFromPoints(pts);
+  // Area under curve (subtle)
+  const areaPath = path + ` L ${xScale(maxStep)} ${H - margin.bottom} L ${xScale(0)} ${H - margin.bottom} Z`;
+  svgContent += `<path d="${areaPath}" fill="${s.color}" opacity="0.05"/>`;
+  // Line
+  svgContent += `<path d="${path}" fill="none" stroke="${s.color}" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>`;
+  // Data points
+  data[s.key].forEach(p => {
+    const cx = xScale(p[0]), cy = yScale(p[1]);
+    svgContent += `<circle cx="${cx}" cy="${cy}" r="3" fill="var(--bg-card)" stroke="${s.color}" stroke-width="1.5"/>`;
+  });
+  // Annotate the spike for 32 adapters
+  if (s.key === 'thirtytwo') {
+    const sx = xScale(5), sy = yScale(87.215019);
+    svgContent += `<circle cx="${sx}" cy="${sy}" r="5" fill="none" stroke="var(--red)" stroke-width="1.5" opacity="0.7"/>`;
+    svgContent += `<line x1="${sx}" y1="${sy - 8}" x2="${sx}" y2="${sy - 22}" stroke="var(--red)" stroke-width="1" opacity="0.5"/>`;
+    svgContent += `<text x="${sx + 8}" y="${sy - 18}" fill="var(--red)" font-size="11" font-family="var(--font-mono)">87.22 spike</text>`;
+  }
+  // Annotate the spike for 8 adapters
+  if (s.key === 'eight') {
+    const sx = xScale(5), sy = yScale(0.947460);
+    svgContent += `<circle cx="${sx}" cy="${sy}" r="5" fill="none" stroke="var(--green)" stroke-width="1.5" opacity="0.5"/>`;
+    svgContent += `<text x="${sx + 8}" y="${sy - 6}" fill="var(--green)" font-size="10" font-family="var(--font-mono)" opacity="0.8">0.95</text>`;
+  }
+});
+
+// Axis lines
+svgContent += `<line x1="${margin.left}" y1="${margin.top}" x2="${margin.left}" y2="${H - margin.bottom}" stroke="var(--border)" stroke-width="1"/>`;
+svgContent += `<line x1="${margin.left}" y1="${H - margin.bottom}" x2="${W - margin.right}" y2="${H - margin.bottom}" stroke="var(--border)" stroke-width="1"/>`;
+
+document.getElementById('chart').innerHTML = svgContent;
+</script>
+</body>
+</html>
