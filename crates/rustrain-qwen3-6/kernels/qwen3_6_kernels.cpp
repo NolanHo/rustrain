@@ -2194,11 +2194,19 @@ static bool g_nccl_initialized = false;
 // Set CUDA device — called from Rust worker before any GPU operation.
 // Ensures PyTorch initializes CUDA context on the correct device.
 __attribute__((visibility("default"))) void qwen36_set_cuda_device(int32_t device) {
+    fprintf(stderr, "[set_cuda_device] setting device=%d\n", device);
+    // Use PyTorch's device API — this updates both cudaSetDevice AND
+    // PyTorch's internal device tracking (c10::cuda::current_device).
+    c10::cuda::CUDAGuard guard(device);
     cudaSetDevice(device);
     // Force PyTorch to create CUDA context on this device
     auto opts = at::TensorOptions().dtype(at::kFloat).device(at::kCUDA, device);
     auto dummy = at::empty({1}, opts);
     dummy.sizes();  // touch to ensure materialization
+    // Verify device was set
+    int cur_dev = -1;
+    cudaGetDevice(&cur_dev);
+    fprintf(stderr, "[set_cuda_device] device=%d verified cur_dev=%d\n", device, cur_dev);
 }
 
 __attribute__((visibility("default"))) int32_t qwen36_init_nccl(
