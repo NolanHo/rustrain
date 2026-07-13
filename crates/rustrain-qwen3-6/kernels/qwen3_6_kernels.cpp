@@ -657,27 +657,48 @@ static at::Tensor moe_forward(
         auto seg_f = at::sigmoid(at::matmul(flat, shared_expert_gate_w.t())).to(at::kFloat);
     }
 
-    // Expert loop — NOT inside AutoGradMode(false).
-    // NcclAllReduceFunction handles autograd integration for NCCL all-reduce.
-    // Expert weights are frozen (no grad), but intermediate tensors need autograd
-    // for gradient flow through the residual connection.
+    // Sort-based expert dispatch — eliminates eq/nonzero/index_select per expert.
+    // At large N (1000+), the old for-loop with eq+nonzero per expert was O(experts × tokens)
+    // with high kernel launch overhead. This approach pre-sorts tokens by expert assignment.
+    //
+    // Autograd note: routing indices/weights are computed in no-grad forward (detached).
+    // Only matmul inputs/outputs participate in autograd. sort/index_select/index_add
+    // gradients are handled by PyTorch automatically.
     for (int64_t kk = 0; kk < top_k; kk++) {
-        auto expert_indices = topk_indices.select(-1, kk);
-        auto expert_weights = topk_weights.select(-1, kk);
+        auto expert_indices = topk_indices.select(-1, kk);   // [N*seq]
+        auto expert_weights = topk_weights.select(-1, kk);   // [N*seq]
+
+        // Sort tokens by expert index → contiguous groups per expert
+        auto [sorted_indices, sort_order] = expert_indices.sort(0);
+        // sorted_indices: expert IDs in ascending order
+        // sort_order: original token positions in sorted order
+
+        // Find expert boundaries via bincount + cumsum
+        auto counts = at::bincount(sorted_indices, /*maxbin=*/expert_start + expert_count);
+        // counts[e_global] = number of tokens assigned to expert e
+
+        // Gather tokens in sorted order (contiguous per expert)
+        auto gathered = flat.index_select(0, sort_order);
+        auto gathered_weights = expert_weights.index_select(0, sort_order).unsqueeze(-1);
+
+        // Process each expert's contiguous token slice
+        int64_t offset = 0;
         for (int64_t e_local = 0; e_local < expert_count; e_local++) {
             int64_t e_global = expert_start + e_local;
-            auto mask = expert_indices.eq(e_global);
-            auto token_indices = mask.nonzero().squeeze(-1);
-            if (token_indices.size(0) == 0) continue;
-            auto selected = flat.index_select(0, token_indices);
+            int64_t n_tokens = counts[e_global].item<int64_t>();
+            if (n_tokens == 0) continue;
+
+            auto selected = gathered.narrow(0, offset, n_tokens);  // zero-copy view!
             auto egu = experts_gate_up.select(0, e_local);
             auto ed = experts_down.select(0, e_local);
             auto gu = at::matmul(selected, egu.t());
             auto gate_part = gu.narrow(-1, 0, intermediate);
             auto up_part = gu.narrow(-1, intermediate, intermediate);
             auto expert_out = at::matmul(fused_swiglu_op(gate_part, up_part, 0.0), ed.t());
-            auto weights = expert_weights.index_select(0, token_indices).unsqueeze(-1);
+            auto weights = gathered_weights.narrow(0, offset, n_tokens);
+            auto token_indices = sort_order.narrow(0, offset, n_tokens);
             routed_output = routed_output.index_add_(0, token_indices, expert_out * weights);
+            offset += n_tokens;
         }
     }
 
@@ -1504,29 +1525,43 @@ static at::Tensor linear_attention_batched(
     auto beta_t = beta.to(at::kFloat).transpose(1, 2).contiguous();
 
     auto g_exp = g_t.exp();
-    int64_t BH = batch * num_v_heads;
-    auto state = at::zeros({BH, key_dim, val_dim}, q_t.options());
 
-    auto q_contig = q_t.reshape({BH, seq, key_dim}).contiguous().to(at::kFloat);
-    auto k_contig = k_t.reshape({BH, seq, key_dim}).contiguous().to(at::kFloat);
-    auto v_contig = v_t.reshape({BH, seq, val_dim}).contiguous().to(at::kFloat);
-    auto g_contig = g_exp.reshape({BH, seq}).contiguous().to(at::kFloat);
-    auto beta_contig = beta_t.reshape({BH, seq}).contiguous().to(at::kFloat);
-    auto state_contig = state.contiguous();
-    auto outs = at::empty({BH, seq, val_dim}, q_t.options());
-    auto delta_buf = at::empty({BH, seq, val_dim}, q_t.options());
+    // N-aware sub-batching: process N adapters in groups of 256 to limit
+    // state tensor size and improve SM occupancy.
+    // State is independent per adapter — safe to split by N dimension.
+    int64_t BH_total = batch * num_v_heads;
+    int64_t sub_batch = (BH_total > 8192) ? 256 : batch;  // 256 adapters or all if small
+    sub_batch = std::min(sub_batch, batch);
 
-    cuda_gated_delta_rule(
-        q_contig.data_ptr<float>(),
-        k_contig.data_ptr<float>(),
-        v_contig.data_ptr<float>(),
-        g_contig.data_ptr<float>(),
-        beta_contig.data_ptr<float>(),
-        state_contig.data_ptr<float>(),
-        outs.data_ptr<float>(),
-        delta_buf.data_ptr<float>(),
-        (int)BH, (int)seq, (int)key_dim, (int)val_dim
-    );
+    auto outs = at::empty({BH_total, seq, val_dim}, q_t.options());
+    auto delta_buf = at::empty({BH_total, seq, val_dim}, q_t.options());
+
+    for (int64_t sb = 0; sb < batch; sb += sub_batch) {
+        int64_t n = std::min(sub_batch, batch - sb);
+        int64_t BH = n * num_v_heads;
+        int64_t bh_start = sb * num_v_heads;
+
+        auto state = at::zeros({BH, key_dim, val_dim}, q_t.options());
+
+        auto q_contig = q_t.narrow(0, bh_start, BH).reshape({BH, seq, key_dim}).contiguous().to(at::kFloat);
+        auto k_contig = k_t.narrow(0, bh_start, BH).reshape({BH, seq, key_dim}).contiguous().to(at::kFloat);
+        auto v_contig = v_t.narrow(0, bh_start, BH).reshape({BH, seq, val_dim}).contiguous().to(at::kFloat);
+        auto g_contig = g_exp.narrow(0, bh_start, BH).reshape({BH, seq}).contiguous().to(at::kFloat);
+        auto beta_contig = beta_t.narrow(0, bh_start, BH).reshape({BH, seq}).contiguous().to(at::kFloat);
+        auto state_contig = state.contiguous();
+
+        cuda_gated_delta_rule(
+            q_contig.data_ptr<float>(),
+            k_contig.data_ptr<float>(),
+            v_contig.data_ptr<float>(),
+            g_contig.data_ptr<float>(),
+            beta_contig.data_ptr<float>(),
+            state_contig.data_ptr<float>(),
+            outs.narrow(0, bh_start, BH).data_ptr<float>(),
+            delta_buf.narrow(0, bh_start, BH).data_ptr<float>(),
+            (int)BH, (int)seq, (int)key_dim, (int)val_dim
+        );
+    }
 
     auto core_out = outs.reshape({batch, num_v_heads, seq, val_dim})
                          .transpose(1, 2).to(compute_type);
@@ -1846,21 +1881,10 @@ static at::Tensor forward_full_checkpoint(
     ctx->group_inputs.clear();
     bool offload = getenv("QWEN36_OFFLOAD_ACTIVATIONS");
 
-    // Build group list: [(start, end), ...]
+    // Build group list: gs=1 for all layers (minimizes peak memory)
     std::vector<std::pair<int64_t, int64_t>> groups;
-    int64_t li = 0;
-    while (li < ctx->num_layers) {
-        if (ctx->layer_configs[li].layer_type == 0) {
-            // Full attn: group size 1
-            groups.push_back({li, li + 1});
-            li += 1;
-        } else {
-            // Linear attn: group size up to 4, don't cross into full attn
-            int64_t end = std::min(li + 4, ctx->num_layers);
-            while (end > li + 1 && ctx->layer_configs[end - 1].layer_type == 0) end--;
-            groups.push_back({li, end});
-            li = end;
-        }
+    for (int64_t i = 0; i < ctx->num_layers; i++) {
+        groups.push_back({i, i + 1});
     }
 
     // Save groups for backward
