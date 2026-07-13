@@ -2197,7 +2197,8 @@ __attribute__((visibility("default"))) void qwen36_set_cuda_device(int32_t devic
     fprintf(stderr, "[set_cuda_device] setting device=%d\n", device);
     // Use PyTorch's device API — this updates both cudaSetDevice AND
     // PyTorch's internal device tracking (c10::cuda::current_device).
-    c10::cuda::CUDAStreamGuard guard(c10::cuda::getCurrentCUDAStream(device));
+    c10::cuda::set_device(device);
+    cudaSetDevice(device);
     cudaSetDevice(device);
     // Force PyTorch to create CUDA context on this device
     auto opts = at::TensorOptions().dtype(at::kFloat).device(at::kCUDA, device);
