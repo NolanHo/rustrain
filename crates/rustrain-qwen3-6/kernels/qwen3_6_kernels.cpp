@@ -99,6 +99,8 @@ struct NcclAllReduceFunction : public torch::autograd::Function<NcclAllReduceFun
         if (err != ncclSuccess) {
             fprintf(stderr, "[ep] ncclAllReduce fwd FAILED: %d (%s) dev=%d\n", err, ncclGetErrorString(err), dev);
         }
+        // Sync to catch async NCCL errors before they corrupt subsequent ops
+        cudaStreamSynchronize(compute_stream);
         return output;
     }
     static std::vector<at::Tensor> backward(torch::autograd::AutogradContext* ctx,
