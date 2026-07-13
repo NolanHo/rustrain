@@ -16,6 +16,7 @@ type FnCreateCtx = unsafe extern "C" fn(
     i64, *const i64, i64,
 ) -> *mut c_void;
 type FnTrainStep = unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void, *mut c_void) -> f64;
+type FnTrainMultiLora = unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void, *mut c_void, i32, i32) -> f64;
 type FnEvalStep = unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void, *mut c_void) -> f64;
 type FnGetLoraCount = unsafe extern "C" fn(*mut c_void) -> i64;
 type FnGetLoraA = unsafe extern "C" fn(*mut c_void, i64) -> *mut c_void;
@@ -74,6 +75,7 @@ pub struct CppLayerConfig {
 struct KernelHandles {
     create_ctx: FnCreateCtx,
     train_step: FnTrainStep,
+    train_multi_lora: FnTrainMultiLora,
     eval_step: FnEvalStep,
     get_lora_count: FnGetLoraCount,
     get_lora_a: FnGetLoraA,
@@ -128,6 +130,7 @@ unsafe fn load_kernels() -> Option<KernelHandles> {
     Some(KernelHandles {
         create_ctx: sym!("qwen36_create_training_context"),
         train_step: sym!("qwen36_train_step"),
+        train_multi_lora: sym!("qwen36_train_multi_lora"),
         eval_step: sym!("qwen36_eval_step"),
         get_lora_count: sym!("qwen36_get_lora_count"),
         get_lora_a: sym!("qwen36_get_lora_a"),
@@ -396,6 +399,31 @@ impl CppTrainingContext {
         };
         if loss < 0.0 {
             bail!("C++ train_step failed");
+        }
+        Ok(loss)
+    }
+
+    /// Train all adapters in batched chunks. Each chunk runs independent
+    /// forward → loss → backward → Adam. Input is expanded to [N, seq].
+    /// n_total: total number of adapters. lora_rank: LoRA rank for N_max calc.
+    /// Returns average loss across chunks.
+    pub fn train_multi_lora(
+        &self, input_ids: &Tensor, target_mask: &Tensor, attention_mask: &Tensor,
+        n_total: i32, lora_rank: i32,
+    ) -> Result<f64> {
+        let kh = get_kernels().ok_or_else(|| anyhow::anyhow!("kernels not loaded"))?;
+        let loss = unsafe {
+            (kh.train_multi_lora)(
+                self.ptr,
+                input_ids.as_ptr() as *mut _,
+                target_mask.as_ptr() as *mut _,
+                attention_mask.as_ptr() as *mut _,
+                n_total,
+                lora_rank,
+            )
+        };
+        if loss < 0.0 {
+            bail!("C++ train_multi_lora failed");
         }
         Ok(loss)
     }

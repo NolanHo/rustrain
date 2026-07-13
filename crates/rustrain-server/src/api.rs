@@ -546,6 +546,7 @@ pub fn ep_router(state: Arc<EpAppState>) -> Router {
         .route("/v1/sessions/{id}/load_dataset", post(ep_load_dataset))
         .route("/v1/sessions/{id}/init_lora", post(ep_init_lora))
         .route("/v1/sessions/{id}/train_step", post(ep_train_step))
+        .route("/v1/sessions/{id}/train_multi", post(ep_train_multi_lora))
         .route("/v1/sessions/{id}/eval_step", post(ep_eval_step))
         .route("/v1/sessions/{id}/add_lora", post(ep_add_lora))
         .route("/v1/sessions/{id}/remove_lora", post(ep_remove_lora))
@@ -684,6 +685,42 @@ async fn ep_eval_step(
     };
     match state.coordinator.dispatch(&cmd) {
         rustrain_ipc::EpResult::Loss(loss) => Ok(Json(EvalStepResponse { loss })),
+        rustrain_ipc::EpResult::Error(e) => Err(err_resp(&e)),
+        _ => Err(err_resp("unexpected result")),
+    }
+}
+
+async fn ep_train_multi_lora(
+    State(state): State<Arc<EpAppState>>,
+    Path(id): Path<String>,
+    Json(req): Json<serde_json::Value>,
+) -> Result<Json<TrainStepResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let input_ids_str = req.get("input_ids").and_then(|v| v.as_str()).ok_or_else(|| err_resp("missing input_ids"))?;
+    let target_mask_str = req.get("target_mask").and_then(|v| v.as_str()).ok_or_else(|| err_resp("missing target_mask"))?;
+    let attention_mask_str = req.get("attention_mask").and_then(|v| v.as_str()).unwrap_or("");
+    let n_total = req.get("n_total").and_then(|v| v.as_i64()).unwrap_or(1) as i32;
+    let lora_rank = req.get("lora_rank").and_then(|v| v.as_i64()).unwrap_or(8) as i32;
+
+    let input_ids = decode_int64_vec(input_ids_str).map_err(|e| err_resp(&e))?;
+    let target_mask = decode_int64_vec(target_mask_str).map_err(|e| err_resp(&e))?;
+    let attention_mask = if attention_mask_str.is_empty() {
+        vec![1i64; input_ids.len()]
+    } else {
+        decode_int64_vec(attention_mask_str).map_err(|e| err_resp(&e))?
+    };
+    let seq_len = input_ids.len();
+
+    let cmd = rustrain_ipc::EpCommand::TrainMultiLora {
+        session_id: id,
+        input_ids,
+        target_mask,
+        attention_mask,
+        seq_len,
+        n_total,
+        lora_rank,
+    };
+    match state.coordinator.dispatch(&cmd) {
+        rustrain_ipc::EpResult::Loss(loss) => Ok(Json(TrainStepResponse { loss, step: 0 })),
         rustrain_ipc::EpResult::Error(e) => Err(err_resp(&e)),
         _ => Err(err_resp("unexpected result")),
     }

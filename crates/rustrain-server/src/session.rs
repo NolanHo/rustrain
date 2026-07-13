@@ -77,6 +77,7 @@ pub trait TrainingSession: Send {
     fn load_dataset(&mut self, req: SessLoadDatasetRequest) -> Result<usize>;
     fn init_lora(&mut self, req: InitLoRARequest) -> Result<usize>;
     fn train_step(&mut self, input: TrainInput) -> Result<TrainOutput>;
+    fn train_multi_lora(&mut self, input: TrainInput, n_total: i32, rank: i32) -> Result<TrainOutput>;
     fn eval_step(&self, input: TrainInput) -> Result<EvalOutput>;
     fn save_checkpoint(&self, path: &str) -> Result<(u64, f64)>;
     fn load_checkpoint(&mut self, path: &str) -> Result<(u64, f64)>;
@@ -399,6 +400,20 @@ impl TrainingSession for Qwen36Session {
                 timestamp_unix: chrono::Utc::now().timestamp(),
             });
         }
+
+        Ok(TrainOutput { loss, step: self.step })
+    }
+
+    fn train_multi_lora(&mut self, input: TrainInput, n_total: i32, rank: i32) -> Result<TrainOutput> {
+        let ctx = self
+            .ctx
+            .as_ref()
+            .ok_or_else(|| anyhow!("LoRA not initialized"))?;
+
+        let loss = ctx.train_multi_lora(&input.input_ids, &input.target_mask, &input.attention_mask, n_total, rank)?;
+        self.step += 1;
+        self.last_loss = loss;
+        self.state = SessionState::Training { step: self.step };
 
         Ok(TrainOutput { loss, step: self.step })
     }
