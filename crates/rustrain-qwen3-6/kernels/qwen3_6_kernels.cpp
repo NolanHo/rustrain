@@ -2867,7 +2867,7 @@ static int64_t compute_n_max(
     int64_t per_adapter = group_input_mem + peak_mem + lora_mem;
     // Empirical multiplier: attention Q/K/V, attn_weights, MoE intermediates
     // not captured above. Measured: ~200MB/adapter at seq=512, hidden=2048.
-    per_adapter = per_adapter * 5;  // 96MB → 480MB (conservative, prevents peer GPU OOM)
+    per_adapter = per_adapter * 3;  // 96MB → 288MB (empirical, with chunk-boundary emptyCache)
     if (per_adapter <= 0) return 1;
 
     // Reserve 15% for fragmentation + overhead, minus CE peak (constant overhead)
