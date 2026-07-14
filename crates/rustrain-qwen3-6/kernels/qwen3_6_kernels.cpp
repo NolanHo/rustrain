@@ -1902,8 +1902,8 @@ static at::Tensor forward_full_checkpoint(
         }
 
         hidden = forward_layer_group(ctx, hidden, start, end);
-        // No emptyCache — let GPU pipeline run asynchronously across groups.
-        // GPU memory at N=100 is ~20GB/141GB, no cleanup needed.
+        // emptyCache() releases freed allocator blocks — does NOT sync GPU.
+        c10::cuda::CUDACachingAllocator::emptyCache();
     }
 
     // Return hidden on GPU with requires_grad for CE backward
@@ -2033,7 +2033,8 @@ static void manual_group_backward(
             }
         }
 
-        // No emptyCache between backward groups — GPU pipeline runs async.
+        // emptyCache releases freed intermediates — does NOT sync GPU.
+        c10::cuda::CUDACachingAllocator::emptyCache();
 
         // Gradient for this group's input = gradient for next group's output
         grad = grads[0];
@@ -2327,7 +2328,8 @@ static at::Tensor compute_loss(
 
         total_loss_val += chunk_loss.item<double>();
 
-        // No emptyCache — CE chunks are small, GPU pipeline runs async.
+        // emptyCache releases freed chunk intermediates — does NOT sync GPU.
+        c10::cuda::CUDACachingAllocator::emptyCache();
     }
 
     // Backprop hidden_normed gradient to hidden via rms_norm.
@@ -2340,7 +2342,8 @@ static at::Tensor compute_loss(
         // hidden.grad() now has the CE gradient contribution
     }
 
-    // No emptyCache — CE intermediates freed by autograd, GPU pipeline async.
+    // emptyCache releases CE intermediates — does NOT sync GPU.
+    c10::cuda::CUDACachingAllocator::emptyCache();
 
     return at::tensor({total_loss_val / total_count_val},
         at::TensorOptions().dtype(at::kFloat).device(hidden.device()));
@@ -2652,7 +2655,8 @@ __attribute__((visibility("default"))) double qwen36_train_step(
         // CE gradient is already accumulated into hidden.grad().
         // hidden.detach() breaks the autograd graph from CE.
         hidden = hidden.detach();
-        // No emptyCache — GPU pipeline runs async across train_step phases.
+        // emptyCache releases CE graph — does NOT sync GPU.
+        c10::cuda::CUDACachingAllocator::emptyCache();
 
         // Debug: after releasing CE graph
         {
@@ -3005,7 +3009,8 @@ __attribute__((visibility("default"))) double qwen36_train_multi_lora(
             auto t_bwd_start = std::chrono::steady_clock::now();
             auto hidden_grad = hidden.grad();
             hidden = hidden.detach();
-            // No emptyCache — GPU pipeline runs async.
+            // emptyCache releases CE graph — does NOT sync GPU.
+            c10::cuda::CUDACachingAllocator::emptyCache();
 
             if (use_fused && hidden_grad.defined()) {
                 hidden.backward(hidden_grad);
@@ -3120,9 +3125,7 @@ __attribute__((visibility("default"))) double qwen36_train_multi_lora(
             ctx->adapters.swap(temp);
 
             total_loss += loss_val;
-            // Single emptyCache at end of chunk — releases all intermediate
-            // tensors before next chunk starts. This is the ONLY sync point
-            // per chunk (was 27 before optimization).
+            // emptyCache at chunk boundary — does NOT sync GPU.
             c10::cuda::CUDACachingAllocator::emptyCache();
 
             fprintf(stderr, "[train_multi] chunk %ld/%ld: n=%ld loss=%.6f\n",
