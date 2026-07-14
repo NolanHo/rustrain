@@ -2775,8 +2775,10 @@ __attribute__((visibility("default"))) double qwen36_train_multi_lora(
             }
 
             // Backward
-            // hidden.grad() now has the CE gradient contribution
+            // hidden.grad() now has the CE gradient contribution from compute_loss
             auto hidden_grad = hidden.grad();
+            fprintf(stderr, "[train_multi] hidden_grad defined=%s, group_inputs=%zu\n",
+                    hidden_grad.defined() ? "YES" : "NO", ctx->group_inputs.size());
             hidden = hidden.detach();
             c10::cuda::CUDACachingAllocator::emptyCache();
 
