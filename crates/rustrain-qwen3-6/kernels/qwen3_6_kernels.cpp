@@ -2855,6 +2855,9 @@ static int64_t compute_n_max(
     int64_t ce_peak = ce_chunk_tokens * 248320 * 12;  // ~5GB per chunk (constant, not per-adapter)
 
     int64_t per_adapter = group_input_mem + peak_mem + lora_mem;
+    // Empirical multiplier: attention Q/K/V, attn_weights, MoE intermediates
+    // not captured above. Measured: ~200MB/adapter at seq=512, hidden=2048.
+    per_adapter = per_adapter * 3;  // 96MB → 288MB (conservative)
     if (per_adapter <= 0) return 1;
 
     // Reserve 15% for fragmentation + overhead, minus CE peak (constant overhead)
