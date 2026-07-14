@@ -2774,14 +2774,16 @@ __attribute__((visibility("default"))) double qwen36_train_multi_lora(
             }
 
             // Backward
+            // CRITICAL: save grad before detach — detach() returns a new tensor with empty grad.
+            auto hidden_grad = hidden.grad();
             hidden = hidden.detach();
             c10::cuda::CUDACachingAllocator::emptyCache();
 
-            if (use_fused && hidden.grad().defined()) {
-                hidden.backward(hidden.grad());
-            } else if (hidden.grad().defined() && !ctx->group_inputs.empty() && !getenv("QWEN36_SUBCKPT")) {
-                manual_group_backward(ctx, hidden.grad());
-            } else if (hidden.grad().defined()) {
+            if (use_fused && hidden_grad.defined()) {
+                hidden.backward(hidden_grad);
+            } else if (hidden_grad.defined() && !ctx->group_inputs.empty() && !getenv("QWEN36_SUBCKPT")) {
+                manual_group_backward(ctx, hidden_grad);
+            } else if (hidden_grad.defined()) {
                 hidden.backward(hidden.grad());
             }
 
