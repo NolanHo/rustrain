@@ -2856,13 +2856,10 @@ static int64_t compute_n_max(
     int64_t num_modules = 280;
     int64_t lora_mem = num_modules * rank * hidden * 12;  // conservative
 
-    // CE loss peak memory: chunk_size=16384 tokens × vocab × 4 bytes (FP32)
-    // Plus logits BF16, grad_logits, log_softmax intermediates ≈ 3× chunk
-    // Per adapter: seq-1 tokens. Per-token CE peak: ~3 × vocab × 4 bytes
-    int64_t ce_per_token = 3 * hidden * 4 * (248320 / hidden);  // vocab/hidden ratio ~121
-    // Simplified: CE peak ≈ chunk_size × vocab × 12 bytes (BF16 logits + FP32 CE + grad)
-    int64_t ce_chunk_tokens = 16384;
-    int64_t ce_peak = ce_chunk_tokens * 248320 * 12;  // ~5GB per chunk (constant, not per-adapter)
+    // CE peak: one chunk of [16384, vocab] logits at a time.
+    // BF16 logits (8GB) + FP32 CE loss (16GB) + grad (~8GB) ≈ 16GB.
+    // But backward releases immediately, so effective peak is lower.
+    int64_t ce_peak = 16384 * 248320 * 4;  // ~16GB (FP32 logits only, others freed by autograd)
 
     int64_t per_adapter = group_input_mem + peak_mem + lora_mem;
     // Empirical multiplier: attention Q/K/V, attn_weights, MoE intermediates
