@@ -22,6 +22,7 @@
 #include <array>
 #include <map>
 #include <sstream>
+#include <chrono>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -2735,14 +2736,17 @@ __attribute__((visibility("default"))) double qwen36_train_multi_lora(
             // Forward — force checkpoint for multi-LoRA (needed for group_inputs)
             bool use_fused = getenv("QWEN36_FUSED_LAYER");
             ctx->use_checkpoint = true;  // force checkpoint for manual_group_backward
+
+            auto t_fwd_start = std::chrono::steady_clock::now();
             auto hidden = use_fused
                 ? forward_full_fused(ctx, input_ref)
                 : forward_full_checkpoint(ctx, input_ref);
+            auto t_fwd_end = std::chrono::steady_clock::now();
+            double fwd_ms = std::chrono::duration<double, std::milli>(t_fwd_end - t_fwd_start).count();
 
             // Batched CE: compute loss with autograd enabled.
-            // hidden from forward_full_checkpoint is detached (no grad_fn).
-            // We need to re-attach it to autograd graph for CE backward.
             double loss_val;
+            auto t_loss_start = std::chrono::steady_clock::now();
             {
                 at::AutoGradMode grad_enable(true);
                 // Re-attach hidden to autograd graph
@@ -2750,8 +2754,11 @@ __attribute__((visibility("default"))) double qwen36_train_multi_lora(
                 auto loss = compute_loss(ctx, hidden, input_ref, mask_ref, ctx->vocab_size);
                 loss_val = loss.item<double>();
             }
+            auto t_loss_end = std::chrono::steady_clock::now();
+            double loss_ms = std::chrono::duration<double, std::milli>(t_loss_end - t_loss_start).count();
 
             // Backward
+            auto t_bwd_start = std::chrono::steady_clock::now();
             auto hidden_grad = hidden.grad();
             hidden = hidden.detach();
             c10::cuda::CUDACachingAllocator::emptyCache();
@@ -2763,6 +2770,12 @@ __attribute__((visibility("default"))) double qwen36_train_multi_lora(
             } else if (hidden_grad.defined()) {
                 hidden.backward(hidden.grad());
             }
+            cudaDeviceSynchronize();
+            auto t_bwd_end = std::chrono::steady_clock::now();
+            double bwd_ms = std::chrono::duration<double, std::milli>(t_bwd_end - t_bwd_start).count();
+
+            fprintf(stderr, "[train_multi] chunk %ld/%ld: n=%ld loss=%f  fwd=%.0fms loss=%.0fms bwd=%.0fms\n",
+                    (long)(chunk+1), (long)num_chunks, (long)n, loss_val, fwd_ms, loss_ms, bwd_ms);
 
             // MTP (if enabled)
             if (ctx->has_mtp && !getenv("QWEN36_DISABLE_MTP")) {
