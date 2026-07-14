@@ -1903,7 +1903,7 @@ static at::Tensor forward_full_checkpoint(
 
         hidden = forward_layer_group(ctx, hidden, start, end);
 
-        c10::cuda::CUDACachingAllocator::emptyCache();
+        maybe_emptyCache(hidden.device());
     }
 
     // Return hidden on GPU with requires_grad for CE backward
@@ -2034,7 +2034,7 @@ static void manual_group_backward(
         }
 
         // Force release cached intermediates from this group's recompute+backward
-        c10::cuda::CUDACachingAllocator::emptyCache();
+        maybe_emptyCache(hidden_grad.device());
 
         // Gradient for this group's input = gradient for next group's output
         grad = grads[0];
@@ -2248,6 +2248,19 @@ static at::Tensor compute_loss_fused(
         at::TensorOptions().dtype(at::kFloat).device(hidden.device()));
 }
 
+// ──────────────────────────────────────────────────────────────────────
+// Conditional emptyCache — only syncs when GPU memory is running low.
+// This avoids the ~2s/step of GPU idle time caused by 24 unconditional
+// emptyCache calls (10 fwd groups + 10 bwd groups + 4 CE chunks).
+// ──────────────────────────────────────────────────────────────────────
+static void maybe_emptyCache(at::Device device, int64_t threshold_gb = 20) {
+    size_t free_mem, total_mem;
+    cudaMemGetInfo(&free_mem, &total_mem);
+    if ((int64_t)free_mem < threshold_gb * 1024 * 1024 * 1024) {
+        c10::cuda::CUDACachingAllocator::emptyCache();
+    }
+}
+
 // Cross-entropy loss with response-only masking — chunked with detach.
 // Detach hidden_normed so CE backward doesn't traverse main model graph.
 // Accumulate hidden_normed gradient, then backprop to hidden separately.
@@ -2316,7 +2329,7 @@ static at::Tensor compute_loss(
         total_loss_val += chunk_loss.item<double>();
 
         // Release freed chunk intermediates (logits, log_softmax, etc.)
-        c10::cuda::CUDACachingAllocator::emptyCache();
+        maybe_emptyCache(hidden_normed.device());
     }
 
     // Backprop hidden_normed gradient to hidden via rms_norm.
@@ -2330,7 +2343,7 @@ static at::Tensor compute_loss(
     }
 
     // Release all CE intermediate tensors at once
-    c10::cuda::CUDACachingAllocator::emptyCache();
+    maybe_emptyCache(hidden_normed.device());
 
     return at::tensor({total_loss_val / total_count_val},
         at::TensorOptions().dtype(at::kFloat).device(hidden.device()));
@@ -2642,7 +2655,7 @@ __attribute__((visibility("default"))) double qwen36_train_step(
         // CE gradient is already accumulated into hidden.grad().
         // hidden.detach() breaks the autograd graph from CE.
         hidden = hidden.detach();
-        c10::cuda::CUDACachingAllocator::emptyCache();
+        maybe_emptyCache(hidden.device());
 
         // Debug: after releasing CE graph
         {
@@ -2998,7 +3011,7 @@ __attribute__((visibility("default"))) double qwen36_train_multi_lora(
             auto t_bwd_start = std::chrono::steady_clock::now();
             auto hidden_grad = hidden.grad();
             hidden = hidden.detach();
-            c10::cuda::CUDACachingAllocator::emptyCache();
+            maybe_emptyCache(hidden_grad.device());
 
             if (use_fused && hidden_grad.defined()) {
                 hidden.backward(hidden_grad);
@@ -3007,7 +3020,9 @@ __attribute__((visibility("default"))) double qwen36_train_multi_lora(
             } else if (hidden_grad.defined()) {
                 hidden.backward(hidden.grad());
             }
-            cudaDeviceSynchronize();
+            // No cudaDeviceSynchronize — let GPU pipeline run asynchronously.
+            // The next chunk's CPU prep (LoRA batch, input expand) will overlap
+            // with the tail of this chunk's GPU backward.
             auto t_bwd_end = std::chrono::steady_clock::now();
             double bwd_ms = std::chrono::duration<double, std::milli>(t_bwd_end - t_bwd_start).count();
 
@@ -3111,7 +3126,7 @@ __attribute__((visibility("default"))) double qwen36_train_multi_lora(
             ctx->adapters.swap(temp);
 
             total_loss += loss_val;
-            c10::cuda::CUDACachingAllocator::emptyCache();
+            maybe_emptyCache(ctx->adapters[0].params.begin()->second[0].first.device());
 
             fprintf(stderr, "[train_multi] chunk %ld/%ld: n=%ld loss=%.6f\n",
                     (long)(chunk + 1), (long)num_chunks, (long)n, loss_val);
