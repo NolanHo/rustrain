@@ -230,7 +230,7 @@ fn execute_command(session: &mut Qwen36Session, cmd: &EpCommand) -> EpResult {
                     Err(e) => { return EpResult::Error(e.to_string()); }
                 }
             }
-            EpResult::Count(ids.len() as i64)
+            EpResult::Count(ids.len() as usize)
         }
         EpCommand::RemoveLora { adapter_id, .. } => {
             match session.remove_lora(*adapter_id) {
