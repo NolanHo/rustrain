@@ -141,7 +141,7 @@ fn main() {
             "-fPIC",
             "-std=c++17",
             "-O2",
-            cxx11_abi,
+            cxx11_abi.as_str(),
             "-o",
             &fp8_lib,
             fp8_src,
@@ -206,7 +206,7 @@ fn main() {
     let glm5_status = Command::new("g++")
         .args([
             "-shared", "-fPIC", "-std=c++17", "-O2",
-            cxx11_abi,
+            cxx11_abi.as_str(),
             "-o", &glm5_lib,
             glm5_src,
             &inc_torch, &inc_aten, &inc_c10, &inc_caffe2, &inc_cuda,
@@ -267,7 +267,7 @@ fn main() {
 
     let mut v4_args: Vec<String> = vec![
         "-shared", "-fPIC", "-std=c++17", "-O2",
-        cxx11_abi,
+        cxx11_abi.clone(),
         "-o", &v4_lib,
         v4_src,
         &inc_torch, &inc_aten, &inc_c10, &inc_caffe2, &inc_cuda,
