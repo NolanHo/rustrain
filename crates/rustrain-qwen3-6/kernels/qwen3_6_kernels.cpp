@@ -3123,7 +3123,10 @@ __attribute__((visibility("default"))) double qwen36_train_multi_lora(
             ctx->adapters.swap(temp);
 
             total_loss += loss_val;
-            // Only clean cache after Adam step (end of chunk), not between phases.
+            // Single emptyCache at end of chunk — releases all intermediate
+            // tensors before next chunk starts. This is the ONLY sync point
+            // per chunk (was 27 before optimization).
+            c10::cuda::CUDACachingAllocator::emptyCache();
 
             fprintf(stderr, "[train_multi] chunk %ld/%ld: n=%ld loss=%.6f\n",
                     (long)(chunk + 1), (long)num_chunks, (long)n, loss_val);
