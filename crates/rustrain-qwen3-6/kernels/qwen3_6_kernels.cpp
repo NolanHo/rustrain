@@ -1990,7 +1990,7 @@ static void manual_group_backward(
         );
 
         // Debug: check if LoRA grads are defined
-        if (g == (int64_t)num_groups - 1) {
+        if (g == (int64_t)num_groups - 1 || g == 0) {
             int64_t dbg_gi = 1;
             int64_t dbg_defined = 0, dbg_total = 0;
             for (int64_t l = start; l < end; l++) {
