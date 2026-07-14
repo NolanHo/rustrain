@@ -2762,19 +2762,20 @@ __attribute__((visibility("default"))) double qwen36_train_multi_lora(
                     ? forward_full_checkpoint(ctx, input_ref)
                     : forward_full(ctx, input_ref);
 
-            // Batched CE: single compute_loss on [N, seq, hidden] flattened to [N*seq, hidden].
-            // Gradients are block-diagonal — each adapter's grad only touches its rows.
-            // This eliminates N GPU syncs and N small GEMMs.
+            // Batched CE: compute loss with autograd enabled.
+            // hidden from forward_full_checkpoint is detached (no grad_fn).
+            // We need to re-attach it to autograd graph for CE backward.
             double loss_val;
             {
                 at::AutoGradMode grad_enable(true);
-                // Reshape hidden [N, seq, hidden] → [N, seq, hidden] (keep batch dim for CE shifting)
+                // Re-attach hidden to autograd graph
+                hidden = hidden.detach().set_requires_grad(true);
                 auto loss = compute_loss(ctx, hidden, input_ref, mask_ref, ctx->vocab_size);
                 loss_val = loss.item<double>();
             }
 
             // Backward
-            // CRITICAL: save grad before detach — detach() returns a new tensor with empty grad.
+            // hidden.grad() now has the CE gradient contribution
             auto hidden_grad = hidden.grad();
             hidden = hidden.detach();
             c10::cuda::CUDACachingAllocator::emptyCache();
