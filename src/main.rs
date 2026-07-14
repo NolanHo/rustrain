@@ -888,7 +888,7 @@ paths=["/tmp/qwen3_6_test.jsonl"]
     if duration == 0 {
         // Single step only
         eprintln!("[bench] single step done");
-        let _ = coordinator.dispatch(&EpCommand::DestroySession { session_id: sid.to_string() });
+        let _ = coordinator.dispatch(&EpCommand::DeleteSession { session_id: sid.to_string() });
         return Ok(());
     }
 
