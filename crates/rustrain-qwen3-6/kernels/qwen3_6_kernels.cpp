@@ -1885,19 +1885,28 @@ static at::Tensor forward_full_checkpoint(
         return hidden;
     }
 
-    // Group-level manual checkpointing with variable group size:
-    // Full attn layers (layer_type=0, every 4th): gs=1 (reduce peak)
-    // Linear attn layers: gs=4 (reduce group input storage)
+    // Group-level manual checkpointing with variable group size.
+    // Larger group_size = fewer recomputations in backward (faster) but more
+    // peak memory. Default gs=4 (from ctx->group_size), overridable via env.
     at::AutoGradMode no_grad(false);
     hidden = hidden.detach();
 
     ctx->group_inputs.clear();
     bool offload = getenv("QWEN36_OFFLOAD_ACTIVATIONS");
 
-    // Build group list: gs=1 for all layers (minimizes peak memory)
+    // Build group list using ctx->group_size (default 4).
+    // Env override: QWEN36_GROUP_SIZE=10 sets gs=10.
+    int64_t gs = ctx->group_size;
+    if (gs < 1) gs = 1;
+    const char* gs_env = getenv("QWEN36_GROUP_SIZE");
+    if (gs_env) { gs = atol(gs_env); if (gs < 1) gs = 1; }
+    fprintf(stderr, "[checkpoint] group_size=%ld (num_layers=%ld → %ld groups)\n",
+            (long)gs, (long)ctx->num_layers,
+            (long)((ctx->num_layers + gs - 1) / gs));
+
     std::vector<std::pair<int64_t, int64_t>> groups;
-    for (int64_t i = 0; i < ctx->num_layers; i++) {
-        groups.push_back({i, i + 1});
+    for (int64_t i = 0; i < ctx->num_layers; i += gs) {
+        groups.push_back({i, std::min(i + gs, ctx->num_layers)});
     }
 
     // Save groups for backward
