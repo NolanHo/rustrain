@@ -2874,7 +2874,11 @@ static int64_t compute_n_max(
 
     int64_t per_adapter = group_input_mem + peak_mem + lora_mem + attn_mem;
     // Empirical multiplier: residual add, MoE routing, LoRA delta, etc.
-    per_adapter = per_adapter * 3;  // with seq>4096 emptyCache, 3x is sufficient
+    // Multiplier scales with seq: small seq needs less (CPU dispatch dominant),
+    // large seq needs more (attention/MoE intermediates dominate).
+    // seq=512: 3x → n_max=100. seq=16K: 8x → n_max≈8 (auto-chunks N=20+).
+    int64_t mult = (seq > 4096) ? 8 : 3;
+    per_adapter = per_adapter * mult;
     if (per_adapter <= 0) return 1;
 
     // Reserve 15% for fragmentation + overhead, minus CE peak (constant overhead)
