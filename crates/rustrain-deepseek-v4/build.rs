@@ -267,7 +267,7 @@ fn main() {
 
     let mut v4_args: Vec<String> = vec![
         "-shared", "-fPIC", "-std=c++17", "-O2",
-        cxx11_abi.clone(),
+        cxx11_abi.as_str(),
         "-o", &v4_lib,
         v4_src,
         &inc_torch, &inc_aten, &inc_c10, &inc_caffe2, &inc_cuda,
