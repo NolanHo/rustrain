@@ -1902,8 +1902,8 @@ static at::Tensor forward_full_checkpoint(
         }
 
         hidden = forward_layer_group(ctx, hidden, start, end);
-
-        maybe_emptyCache(hidden.device());
+        // No emptyCache — let GPU pipeline run asynchronously across groups.
+        // GPU memory at N=100 is ~20GB/141GB, no cleanup needed.
     }
 
     // Return hidden on GPU with requires_grad for CE backward
@@ -2033,8 +2033,7 @@ static void manual_group_backward(
             }
         }
 
-        // Force release cached intermediates from this group's recompute+backward
-        maybe_emptyCache(hidden_grad.device());
+        // No emptyCache between backward groups — GPU pipeline runs async.
 
         // Gradient for this group's input = gradient for next group's output
         grad = grads[0];
@@ -2328,8 +2327,7 @@ static at::Tensor compute_loss(
 
         total_loss_val += chunk_loss.item<double>();
 
-        // Release freed chunk intermediates (logits, log_softmax, etc.)
-        maybe_emptyCache(hidden_normed.device());
+        // No emptyCache — CE chunks are small, GPU pipeline runs async.
     }
 
     // Backprop hidden_normed gradient to hidden via rms_norm.
@@ -2342,8 +2340,7 @@ static at::Tensor compute_loss(
         // hidden.grad() now has the CE gradient contribution
     }
 
-    // Release all CE intermediate tensors at once
-    maybe_emptyCache(hidden_normed.device());
+    // No emptyCache — CE intermediates freed by autograd, GPU pipeline async.
 
     return at::tensor({total_loss_val / total_count_val},
         at::TensorOptions().dtype(at::kFloat).device(hidden.device()));
@@ -2655,7 +2652,7 @@ __attribute__((visibility("default"))) double qwen36_train_step(
         // CE gradient is already accumulated into hidden.grad().
         // hidden.detach() breaks the autograd graph from CE.
         hidden = hidden.detach();
-        maybe_emptyCache(hidden.device());
+        // No emptyCache — GPU pipeline runs async across train_step phases.
 
         // Debug: after releasing CE graph
         {
@@ -3011,7 +3008,7 @@ __attribute__((visibility("default"))) double qwen36_train_multi_lora(
             auto t_bwd_start = std::chrono::steady_clock::now();
             auto hidden_grad = hidden.grad();
             hidden = hidden.detach();
-            maybe_emptyCache(hidden_grad.device());
+            // No emptyCache — GPU pipeline runs async.
 
             if (use_fused && hidden_grad.defined()) {
                 hidden.backward(hidden_grad);
@@ -3126,7 +3123,7 @@ __attribute__((visibility("default"))) double qwen36_train_multi_lora(
             ctx->adapters.swap(temp);
 
             total_loss += loss_val;
-            maybe_emptyCache(ctx->adapters[0].params.begin()->second[0].first.device());
+            // Only clean cache after Adam step (end of chunk), not between phases.
 
             fprintf(stderr, "[train_multi] chunk %ld/%ld: n=%ld loss=%.6f\n",
                     (long)(chunk + 1), (long)num_chunks, (long)n, loss_val);
