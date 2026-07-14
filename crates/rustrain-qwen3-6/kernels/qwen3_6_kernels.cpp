@@ -1902,7 +1902,9 @@ static at::Tensor forward_full_checkpoint(
         }
 
         hidden = forward_layer_group(ctx, hidden, start, end);
-        // No emptyCache — GPU pipeline runs async. compute_n_max limits N.
+        // emptyCache: needed for seq>4096 (memory pressure), skip for small seq (async benefit).
+        // At seq=16K: 10 syncs × ~20ms = 200ms overhead / 22s forward = <1% impact.
+        if (hidden.size(1) > 4096) c10::cuda::CUDACachingAllocator::emptyCache();
     }
 
     // Return hidden on GPU with requires_grad for CE backward
@@ -2032,7 +2034,8 @@ static void manual_group_backward(
             }
         }
 
-        // No emptyCache — GPU pipeline runs async.
+        // emptyCache for backward groups when seq>4096.
+        if (hidden_grad.size(1) > 4096) c10::cuda::CUDACachingAllocator::emptyCache();
 
         // Gradient for this group's input = gradient for next group's output
         grad = grads[0];
@@ -2328,7 +2331,7 @@ static at::Tensor compute_loss(
 
         total_loss_val += chunk_loss.item<double>();
 
-        // No emptyCache — CE chunks are small (4GB), GPU pipeline runs async.
+        if (hidden_normed.size(1) > 4096) c10::cuda::CUDACachingAllocator::emptyCache();
     }
 
     // Backprop hidden_normed gradient to hidden via rms_norm.
@@ -2341,7 +2344,8 @@ static at::Tensor compute_loss(
         // hidden.grad() now has the CE gradient contribution
     }
 
-    // No emptyCache — CE intermediates freed by autograd, GPU pipeline async.
+    // emptyCache for CE intermediates when seq>4096.
+    if (hidden_normed.size(1) > 4096) c10::cuda::CUDACachingAllocator::emptyCache();
 
     return at::tensor({total_loss_val / total_count_val},
         at::TensorOptions().dtype(at::kFloat).device(hidden.device()));
@@ -2653,7 +2657,7 @@ __attribute__((visibility("default"))) double qwen36_train_step(
         // CE gradient is already accumulated into hidden.grad().
         // hidden.detach() breaks the autograd graph from CE.
         hidden = hidden.detach();
-        // No emptyCache — GPU pipeline runs async.
+        if (hidden.size(1) > 4096) c10::cuda::CUDACachingAllocator::emptyCache();
 
         // Debug: after releasing CE graph
         {
@@ -2870,7 +2874,7 @@ static int64_t compute_n_max(
 
     int64_t per_adapter = group_input_mem + peak_mem + lora_mem + attn_mem;
     // Empirical multiplier: residual add, MoE routing, LoRA delta, etc.
-    per_adapter = per_adapter * 5;  // conservative: prevents OOM at seq=16K
+    per_adapter = per_adapter * 3;  // with seq>4096 emptyCache, 3x is sufficient
     if (per_adapter <= 0) return 1;
 
     // Reserve 15% for fragmentation + overhead, minus CE peak (constant overhead)
@@ -3011,8 +3015,7 @@ __attribute__((visibility("default"))) double qwen36_train_multi_lora(
             auto t_bwd_start = std::chrono::steady_clock::now();
             auto hidden_grad = hidden.grad();
             hidden = hidden.detach();
-            // Conditional emptyCache for large seq.
-            // No emptyCache — GPU pipeline runs async.
+            if (hidden.size(1) > 4096) c10::cuda::CUDACachingAllocator::emptyCache();
 
             if (use_fused && hidden_grad.defined()) {
                 hidden.backward(hidden_grad);
