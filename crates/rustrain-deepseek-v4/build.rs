@@ -6,6 +6,29 @@
 use std::path::PathBuf;
 use std::process::Command;
 
+/// Detect PyTorch's _GLIBCXX_USE_CXX11_ABI setting by running Python.
+fn detect_cxx11_abi() -> String {
+    if let Ok(v) = std::env::var("GLIBCXX_USE_CXX11_ABI") {
+        return v;
+    }
+    for py in &["python3", "python"] {
+        if let Ok(out) = std::process::Command::new(py)
+            .args(["-c", "import torch; print(int(torch._C._GLIBCXX_USE_CXX11_ABI))"])
+            .output()
+        {
+            if out.status.success() {
+                if let Ok(s) = String::from_utf8(out.stdout) {
+                    let s = s.trim();
+                    if s == "0" || s == "1" {
+                        return s.to_string();
+                    }
+                }
+            }
+        }
+    }
+    "1".to_string()
+}
+
 fn main() {
     // Always re-run when env vars change
     println!("cargo:rerun-if-env-changed=TORCH_INCLUDE_PATH");
@@ -77,7 +100,9 @@ fn main() {
     println!("cargo:warning=Compiling FP8 GEMM kernel: include={torch_include} lib={torch_lib}");
 
     // Detect CXX11 ABI from PyTorch
-    let cxx11_abi = "-D_GLIBCXX_USE_CXX11_ABI=1";
+    let cxx11_abi_val = detect_cxx11_abi();
+    let cxx11_abi = format!("-D_GLIBCXX_USE_CXX11_ABI={cxx11_abi_val}");
+    println!("cargo:warning=CXX11 ABI detected: {cxx11_abi_val}");
 
     // Find CUDA include path
     let cuda_inc = std::env::var("CUDA_INCLUDE_PATH")
@@ -301,7 +326,7 @@ fn main() {
                 .args([
                     "-c", fused_cu, "-o", &fused_obj,
                     "-O2", "-std=c++17",
-                    "-D_GLIBCXX_USE_CXX11_ABI=1",
+                    &cxx11_abi,
                     &format!("-I{inc_torch}"),
                     &format!("-I{inc_aten}"),
                     &format!("-I{inc_c10}"),

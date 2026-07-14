@@ -13,11 +13,41 @@ fn which(cmd: &str) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
+/// Detect PyTorch's _GLIBCXX_USE_CXX11_ABI setting by running Python.
+/// Returns "1" or "0". Defaults to "1" if detection fails.
+fn detect_cxx11_abi() -> String {
+    // Check environment override first
+    if let Ok(v) = std::env::var("GLIBCXX_USE_CXX11_ABI") {
+        return v;
+    }
+    // Try python3 -c 'import torch; print(int(torch._C._GLIBCXX_USE_CXX11_ABI))'
+    for py in &["python3", "python"] {
+        if let Ok(out) = std::process::Command::new(py)
+            .args(["-c", "import torch; print(int(torch._C._GLIBCXX_USE_CXX11_ABI))"])
+            .output()
+        {
+            if out.status.success() {
+                if let Ok(s) = String::from_utf8(out.stdout) {
+                    let s = s.trim();
+                    if s == "0" || s == "1" {
+                        return s.to_string();
+                    }
+                }
+            }
+        }
+    }
+    "1".to_string()
+}
+
 fn main() {
     println!("cargo:rerun-if-env-changed=TORCH_INCLUDE_PATH");
     println!("cargo:rerun-if-env-changed=TORCH_LIB_PATH");
     println!("cargo:rerun-if-changed=kernels/qwen3_6_kernels.cpp");
     println!("cargo:rerun-if-changed=build.rs");
+
+    let cxx11_abi = detect_cxx11_abi();
+    let cxx11_flag = format!("-D_GLIBCXX_USE_CXX11_ABI={cxx11_abi}");
+    println!("cargo:warning=CXX11 ABI detected: {cxx11_abi}");
 
     let torch_include = std::env::var("TORCH_INCLUDE_PATH").or_else(|_| {
         let candidates = [
@@ -86,7 +116,7 @@ fn main() {
     let status = Command::new("g++")
         .args([
             "-shared", "-fPIC", "-std=c++17", "-O2",
-            "-D_GLIBCXX_USE_CXX11_ABI=1",
+            &cxx11_flag,
             "-fvisibility=default",
             "-o", &output_lib, kernel_src,
             &format!("-I{torch_include}"),
@@ -143,7 +173,7 @@ fn main() {
                 .args([
                     "-c", cu_file, "-o", &obj_file,
                     "-O2", "-std=c++17",
-                    "-D_GLIBCXX_USE_CXX11_ABI=1",
+                    &cxx11_flag,
                     &format!("-I{torch_include}"),
                     &format!("-I{torch_include}/ATen"),
                     &format!("-I{torch_include}/c10"),
@@ -161,7 +191,7 @@ fn main() {
         if !obj_files.is_empty() {
             let mut link_args = vec![
                 "-shared".to_string(), "-fPIC".to_string(), "-std=c++17".to_string(), "-O2".to_string(),
-                "-D_GLIBCXX_USE_CXX11_ABI=1".to_string(),
+                cxx11_flag.clone(),
                 "-o".to_string(), output_lib.clone(), kernel_src.to_string(),
                 format!("-I{torch_include}"),
                 format!("-I{torch_include}/ATen"),
