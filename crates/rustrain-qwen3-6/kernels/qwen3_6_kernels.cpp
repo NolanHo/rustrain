@@ -2064,6 +2064,200 @@ static void manual_group_backward(
     }
 }
 
+// ──────────────────────────────────────────────────────────────────────
+// Fused Cross-Entropy Loss with online softmax (FlashAttention-style).
+//
+// Instead of materializing [n_tokens, vocab] logits (8+ GB), we tile over
+// the vocabulary dimension:
+//   1. Forward: iterate vocab tiles, compute partial logits, accumulate
+//      global max + sum_exp via online softmax → loss
+//   2. Backward: iterate vocab tiles again, compute softmax = exp(logit-max)/sum_exp,
+//      subtract one_hot for target tokens → accumulate grad into hidden_normed
+//
+// Peak memory: [n_tokens, tile_size] instead of [n_tokens, vocab].
+// For N=100, seq=512: n_tokens=51200, vocab=248320, tile=8192
+//   Old: [51200, 248320] × 4 bytes = 49 GB per chunk
+//   New: [51200, 8192]  × 4 bytes = 1.6 GB per tile
+//
+// Returns: scalar loss tensor (with autograd graph for hidden_normed)
+// ──────────────────────────────────────────────────────────────────────
+static at::Tensor compute_loss_fused(
+    TrainingContext* ctx,
+    const at::Tensor& hidden,       // [batch, seq, hidden] (requires_grad)
+    const at::Tensor& input_ids,    // [batch, seq]
+    const at::Tensor& target_mask,  // [batch, seq]
+    int64_t vocab_size
+) {
+    auto final_norm = *ctx->final_norm_ptr[0];
+    auto lm_head = *ctx->lm_head_ptr[0];  // [vocab, hidden]
+
+    // Compute hidden_normed in no-grad, then set requires_grad.
+    auto hidden_detached = hidden.detach();
+    at::Tensor hidden_normed;
+    {
+        at::AutoGradMode no_grad_mode(false);
+        hidden_normed = rms_norm(hidden_detached, final_norm, ctx->rms_eps);
+    }
+    hidden_normed.set_requires_grad(true);
+
+    int64_t seq_len = hidden_normed.size(1);
+    int64_t hidden_dim = hidden_normed.size(2);
+
+    auto shifted_hidden = hidden_normed.narrow(1, 0, seq_len - 1);
+    auto shifted_targets = input_ids.narrow(1, 1, seq_len - 1).reshape({-1});
+    auto shifted_mask = target_mask.narrow(1, 1, seq_len - 1).reshape({-1});
+
+    int64_t total_tokens = shifted_targets.size(0);
+    auto hidden_flat = shifted_hidden.reshape({-1, hidden_dim});
+
+    // Ensure hidden_flat is contiguous for narrow + matmul
+    hidden_flat = hidden_flat.contiguous();
+
+    auto mask_f = shifted_mask.to(at::kFloat);
+
+    // ── Tile configuration ──
+    // tile_size controls vocab granularity. Larger = fewer iterations but more memory.
+    // [total_tokens, tile] × 4 bytes (FP32). 8192 → ~1.6 GB for 51200 tokens.
+    int64_t tile_size = 8192;
+    const char* ts_env = getenv("QWEN36_CE_TILE");
+    if (ts_env) { tile_size = atol(ts_env); if (tile_size < 1) tile_size = 8192; }
+    int64_t num_tiles = (vocab_size + tile_size - 1) / tile_size;
+
+    // lm_head transpose: we need [hidden, vocab] for matmul
+    // lm_head is [vocab, hidden], so lm_head.t() is [hidden, vocab]
+    // We narrow on dim 0 of lm_head (vocab dim), then transpose.
+    // lm_head_w: [tile, hidden] → .t() → [hidden, tile]
+    // hidden_flat: [total_tokens, hidden] × [hidden, tile] → [total_tokens, tile]
+
+    // ── Forward pass: compute loss via online softmax ──
+    // For each token i: loss_i = log(sum_v exp(logit_iv)) - logit_i,target_i
+    // We compute in two phases:
+    //   Phase 1: find global max and sum_exp across all vocab tiles
+    //   Phase 2: compute loss = log(sum_exp) - target_logit (for masked tokens)
+
+    // Running max and sum_exp per token
+    auto logit_max = at::full({total_tokens, 1}, -std::numeric_limits<float>::infinity(),
+        at::TensorOptions().dtype(at::kFloat).device(hidden_flat.device()));
+    auto sum_exp = at::zeros({total_tokens, 1},
+        at::TensorOptions().dtype(at::kFloat).device(hidden_flat.device()));
+
+    // Phase 1: accumulate max and sum_exp
+    for (int64_t t = 0; t < num_tiles; t++) {
+        int64_t v_start = t * tile_size;
+        int64_t v_end = std::min(v_start + tile_size, vocab_size);
+        int64_t v_n = v_end - v_start;
+
+        auto lm_head_tile = lm_head.narrow(0, v_start, v_n);  // [v_n, hidden]
+        // [total_tokens, hidden] × [hidden, v_n] → [total_tokens, v_n]
+        auto logits_tile = at::matmul(hidden_flat, lm_head_tile.t()).to(at::kFloat);
+
+        // Online softmax update: new_max = max(old_max, tile_max)
+        auto tile_max = std::get<0>(at::max(logits_tile, /*dim=*/1, /*keepdim=*/true));
+        auto new_max = at::max(logit_max, tile_max);
+
+        // Adjust sum_exp: exp(old - new_max) * old_sum + exp(tile - new_max) * tile_sum
+        auto old_exp = at::exp(logit_max - new_max);
+        auto tile_exp = at::exp(logits_tile - new_max);
+        sum_exp = old_exp * sum_exp + tile_exp.sum(/*dim=*/1, /*keepdim=*/true);
+        logit_max = new_max;
+
+        c10::cuda::CUDACachingAllocator::emptyCache();
+    }
+
+    // Phase 2: compute target logit for each token
+    // We need logits[target] — gather the target position's logit.
+    // Do a second pass to find target logit.
+    auto target_logit = at::zeros({total_tokens, 1},
+        at::TensorOptions().dtype(at::kFloat).device(hidden_flat.device()));
+
+    for (int64_t t = 0; t < num_tiles; t++) {
+        int64_t v_start = t * tile_size;
+        int64_t v_end = std::min(v_start + tile_size, vocab_size);
+        int64_t v_n = v_end - v_start;
+
+        // Check if any target falls in this tile's vocab range
+        auto in_range = (shifted_targets >= v_start) & (shifted_targets < v_end);
+        if (!in_range.any().item<bool>()) continue;
+
+        auto lm_head_tile = lm_head.narrow(0, v_start, v_n);
+        auto logits_tile = at::matmul(hidden_flat, lm_head_tile.t()).to(at::kFloat);
+
+        // Gather target logits: subtract v_start to get local index
+        auto local_targets = (shifted_targets - v_start).clamp_min(0);
+        // Gather: logits_tile[i, local_targets[i]] for tokens in range
+        auto gathered = at::gather(logits_tile, /*dim=*/1, local_targets.reshape({-1, 1}));
+        // Only keep tokens that are actually in range
+        gathered = gathered * in_range.to(at::kFloat).reshape({-1, 1});
+        target_logit = at::max(target_logit, gathered);
+
+        c10::cuda::CUDACachingAllocator::emptyCache();
+    }
+
+    // Loss per token: log(sum_exp) - target_logit  (= -log(softmax[target]))
+    auto log_sum_exp = at::log(sum_exp) + logit_max;  // log(sum(exp(x-max))) + max = logsumexp
+    auto per_token_loss = log_sum_exp - target_logit;  // [total_tokens, 1]
+    auto masked_loss = per_token_loss.squeeze(1) * mask_f;
+    auto total_count = mask_f.sum().clamp_min(1.0);
+    double loss_val = (masked_loss.sum().item<double>()) / total_count.item<double>();
+
+    // ── Backward pass: compute grad_hidden_normed manually ──
+    // dL/dhidden_normed = (softmax - one_hot) / count * mask
+    // softmax = exp(logit - logit_max) / sum_exp
+    // We iterate tiles again, accumulate grad = softmax_tile @ lm_head_tile + target_grad
+    auto grad_hidden = at::zeros_like(hidden_flat);
+    auto grad_scale = mask_f / total_count;  // [total_tokens]
+
+    for (int64_t t = 0; t < num_tiles; t++) {
+        int64_t v_start = t * tile_size;
+        int64_t v_end = std::min(v_start + tile_size, vocab_size);
+        int64_t v_n = v_end - v_start;
+
+        auto lm_head_tile = lm_head.narrow(0, v_start, v_n);  // [v_n, hidden]
+        auto logits_tile = at::matmul(hidden_flat, lm_head_tile.t()).to(at::kFloat);
+
+        // softmax_tile = exp(logits - max) / sum_exp  (reuse from forward)
+        auto softmax_tile = at::exp(logits_tile - logit_max) / sum_exp;  // [total_tokens, v_n]
+
+        // Subtract one_hot for target tokens in this tile
+        auto in_range = (shifted_targets >= v_start) & (shifted_targets < v_end);
+        if (in_range.any().item<bool>()) {
+            auto local_targets = (shifted_targets - v_start).clamp_min(0);
+            // scatter -1 at target positions
+            auto one_hot = at::zeros({total_tokens, v_n},
+                at::TensorOptions().dtype(at::kFloat).device(hidden_flat.device()));
+            one_hot.scatter_(1, local_targets.reshape({-1, 1}), 1.0);
+            one_hot = one_hot * in_range.to(at::kFloat).reshape({-1, 1});
+            softmax_tile = softmax_tile - one_hot;
+        }
+
+        // grad_hidden += grad_scale * softmax_tile @ lm_head_tile
+        // softmax_tile: [total_tokens, v_n], lm_head_tile: [v_n, hidden]
+        // → [total_tokens, hidden]
+        auto grad_tile = at::matmul(
+            (softmax_tile * grad_scale.reshape({-1, 1})),
+            lm_head_tile
+        );
+        grad_hidden.add_(grad_tile);
+
+        c10::cuda::CUDACachingAllocator::emptyCache();
+    }
+
+    // Set gradient on hidden_normed (leaf tensor)
+    hidden_normed.mutable_grad() = grad_hidden.reshape_as(shifted_hidden);
+
+    // Backprop hidden_normed gradient to hidden via rms_norm recompute.
+    if (hidden_normed.grad().defined()) {
+        hidden.set_requires_grad(true);
+        auto hidden_normed_recompute = rms_norm(hidden, final_norm, ctx->rms_eps);
+        hidden_normed_recompute.backward(hidden_normed.grad());
+    }
+
+    c10::cuda::CUDACachingAllocator::emptyCache();
+
+    return at::tensor({loss_val},
+        at::TensorOptions().dtype(at::kFloat).device(hidden.device()));
+}
+
 // Cross-entropy loss with response-only masking — chunked with detach.
 // Detach hidden_normed so CE backward doesn't traverse main model graph.
 // Accumulate hidden_normed gradient, then backprop to hidden separately.
@@ -2760,8 +2954,13 @@ __attribute__((visibility("default"))) double qwen36_train_multi_lora(
                 at::AutoGradMode grad_enable(true);
                 // Re-attach hidden to autograd graph
                 hidden = hidden.detach().set_requires_grad(true);
-                auto loss = compute_loss(ctx, hidden, input_ref, mask_ref, ctx->vocab_size);
-                loss_val = loss.item<double>();
+                if (getenv("QWEN36_FUSED_CE")) {
+                    auto loss = compute_loss_fused(ctx, hidden, input_ref, mask_ref, ctx->vocab_size);
+                    loss_val = loss.item<double>();
+                } else {
+                    auto loss = compute_loss(ctx, hidden, input_ref, mask_ref, ctx->vocab_size);
+                    loss_val = loss.item<double>();
+                }
             }
             auto t_loss_end = std::chrono::steady_clock::now();
             double loss_ms = std::chrono::duration<double, std::milli>(t_loss_end - t_loss_start).count();
