@@ -2893,11 +2893,26 @@ __attribute__((visibility("default"))) double qwen36_train_multi_lora(
         int64_t total_adapters = (int64_t)ctx->adapters.size();
         if (total_adapters == 0) return -1.0;
 
-        // Compute N_max from available GPU memory
+        // Compute N_max from available GPU memory.
+        // CRITICAL: all workers must agree on n_max to keep NCCL all-reduce in sync.
+        // Use NCCL all-reduce(min) on free_mem so all ranks use the same value.
         size_t free_mem, total_mem;
         cudaMemGetInfo(&free_mem, &total_mem);
+        int64_t local_free = (int64_t)free_mem;
+        int64_t shared_free = local_free;
+        if (ctx->nccl_comm && ctx->ep_world_size > 1) {
+            // All-reduce min: all workers use the smallest free_mem across ranks
+            ncclResult_t err = ncclAllReduce(
+                &local_free, &shared_free, 1, ncclInt64, ncclMin,
+                ctx->nccl_comm, nullptr
+            );
+            if (err != ncclSuccess) {
+                fprintf(stderr, "[train_multi] NCCL all-reduce for free_mem failed: %d\n", err);
+                shared_free = local_free;  // fallback to local
+            }
+        }
         int64_t n_max = compute_n_max(
-            (int64_t)free_mem, lora_rank,
+            shared_free, lora_rank,
             input_ids.size(-1), 2048,  // hidden=2048
             ctx->group_size, ctx->num_layers
         );
