@@ -1082,10 +1082,13 @@ static void prepare_lora_batch(TrainingContext* ctx) {
 
             auto a_stack = at::stack(a_list, 0);  // [N, rank, in]
             auto b_stack = at::stack(b_list, 0);  // [N, out, rank]
-            auto scaling = at::from_blob(
-                scalings.data(), {n, 1, 1},
-                at::TensorOptions().dtype(at::kDouble).device(a_stack.device())
-            ).to(at::kBFloat16);  // [N, 1, 1]
+            // Create scaling tensor on GPU — from_blob only wraps CPU pointer,
+            // so we must explicitly move it to the right device.
+            auto scaling_cpu = at::from_blob(
+                scalings.data(), {(int64_t)n, 1, 1},
+                at::TensorOptions().dtype(at::kDouble)
+            );
+            auto scaling = scaling_cpu.to(a_stack.device()).to(at::kBFloat16);  // [N, 1, 1]
 
             ctx->lora_batch_cache[layer_idx * 10 + pair_idx] = {
                 a_stack, b_stack, scaling
