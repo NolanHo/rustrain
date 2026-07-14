@@ -33,6 +33,14 @@ pub enum EpCommand {
         target_layers: Vec<i64>,
         target_modules: String,
     },
+    BatchAddLora {
+        session_id: String,
+        count: i32,
+        rank: i64,
+        alpha: f64,
+        target_layers: Vec<i64>,
+        target_modules: String,
+    },
     RemoveLora {
         session_id: String,
         adapter_id: i64,

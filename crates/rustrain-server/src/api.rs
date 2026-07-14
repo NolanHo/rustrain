@@ -558,6 +558,7 @@ pub fn ep_router(state: Arc<EpAppState>) -> Router {
         .route("/v1/sessions/{id}/train_multi", post(ep_train_multi_lora))
         .route("/v1/sessions/{id}/eval_step", post(ep_eval_step))
         .route("/v1/sessions/{id}/add_lora", post(ep_add_lora))
+        .route("/v1/sessions/{id}/batch_add_lora", post(ep_batch_add_lora))
         .route("/v1/sessions/{id}/remove_lora", post(ep_remove_lora))
         .route("/v1/sessions/{id}/list_lora", get(ep_list_lora))
         .route("/v1/sessions/{id}/export_adapter", post(ep_export_adapter))
@@ -739,6 +740,35 @@ async fn ep_add_lora(
     };
     match state.coordinator.dispatch(&cmd) {
         rustrain_ipc::EpResult::AdapterId(id) => Ok(Json(AddLoRAResponse { adapter_id: id })),
+        rustrain_ipc::EpResult::Error(e) => Err(err_resp(&e)),
+        _ => Err(err_resp("unexpected result")),
+    }
+}
+
+#[derive(Deserialize)]
+struct BatchAddLoRAHttp {
+    count: i32,
+    rank: i64,
+    alpha: f64,
+    target_layers: Vec<i64>,
+    target_modules: String,
+}
+
+async fn ep_batch_add_lora(
+    State(state): State<Arc<EpAppState>>,
+    Path(id): Path<String>,
+    Json(req): Json<BatchAddLoRAHttp>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    let cmd = rustrain_ipc::EpCommand::BatchAddLora {
+        session_id: id,
+        count: req.count,
+        rank: req.rank,
+        alpha: req.alpha,
+        target_layers: req.target_layers,
+        target_modules: req.target_modules,
+    };
+    match state.coordinator.dispatch(&cmd) {
+        rustrain_ipc::EpResult::Count(n) => Ok(Json(serde_json::json!({"count": n}))),
         rustrain_ipc::EpResult::Error(e) => Err(err_resp(&e)),
         _ => Err(err_resp("unexpected result")),
     }

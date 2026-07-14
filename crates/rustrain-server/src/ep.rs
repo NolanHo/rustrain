@@ -217,6 +217,21 @@ fn execute_command(session: &mut Qwen36Session, cmd: &EpCommand) -> EpResult {
                 Err(e) => EpResult::Error(e.to_string()),
             }
         }
+        EpCommand::BatchAddLora { count, rank, alpha, target_layers, target_modules, .. } => {
+            let mut ids = Vec::with_capacity(*count as usize);
+            for _ in 0..*count {
+                match session.add_lora(AddLoRARequest {
+                    rank: *rank,
+                    alpha: *alpha,
+                    target_layers: target_layers.clone(),
+                    target_modules: target_modules.clone(),
+                }) {
+                    Ok(id) => ids.push(id),
+                    Err(e) => { return EpResult::Error(e.to_string()); }
+                }
+            }
+            EpResult::Count(ids.len() as i64)
+        }
         EpCommand::RemoveLora { adapter_id, .. } => {
             match session.remove_lora(*adapter_id) {
                 Ok(b) => {

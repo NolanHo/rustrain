@@ -65,13 +65,13 @@ def setup(sid, n_adp, lora_rank=1):
     if r.status_code != 200:
         print(f"  init_lora FAIL: {r.text[:300]}")
         return False
-    for i in range(n_adp):
-        r = requests.post(f"{SERVER}/v1/sessions/{sid}/add_lora",
-                          json={"rank": lora_rank, "alpha": lora_rank*2,
-                                "target_layers": [], "target_modules": ""})
-        if r.status_code != 200:
-            print(f"  add_lora {i} FAIL: {r.text[:300]}")
-            return False
+    # Batch add all adapters in one request
+    r = requests.post(f"{SERVER}/v1/sessions/{sid}/batch_add_lora",
+                      json={"count": n_adp, "rank": lora_rank, "alpha": lora_rank*2,
+                            "target_layers": [], "target_modules": ""})
+    if r.status_code != 200:
+        print(f"  batch_add_lora FAIL: {r.text[:300]}")
+        return False
     return True
 
 def main():
