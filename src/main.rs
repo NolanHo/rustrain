@@ -842,7 +842,7 @@ paths=["/tmp/qwen3_6_test.jsonl"]
         beta2: 0.999,
         eps: 0.00000001,
     }) {
-        EpResult::Ok => {},
+        EpResult::Count(_) => {},
         EpResult::Error(e) => bail!("init_lora failed: {}", e),
         _ => bail!("init_lora unexpected result"),
     }
