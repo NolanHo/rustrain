@@ -20,6 +20,7 @@ rustrain-glm5 = { path = "crates/rustrain-glm5" }
 rustrain-moe = { path = "crates/rustrain-moe" }
 rustrain-qwen3-6 = { path = "crates/rustrain-qwen3-6" }
 rustrain-server = { path = "crates/rustrain-server" }
+rustrain-ipc = { path = "crates/rustrain-ipc" }
 
 # Server deps
 axum.workspace = true
