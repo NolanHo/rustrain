@@ -6,7 +6,7 @@ use crate::command::{EpCommand, EpResult};
 
 /// Each slot: 4 bytes len + up to SLOT_DATA bytes JSON
 const SLOT_HEADER: usize = 4;
-const SLOT_DATA: usize = 64 * 1024; // 64KB per slot
+const SLOT_DATA: usize = 256 * 1024; // 256KB per slot (supports seq_len up to ~32K)
 const SLOT_SIZE: usize = SLOT_HEADER + SLOT_DATA;
 
 /// Shared memory layout:
