@@ -252,8 +252,6 @@ static at::Tensor full_attention(
             v.narrow(2, s, clen).copy_(
                 at::matmul(h_chunk, v_proj.t()).view({batch, clen, num_kv_heads, head_dim}).transpose(1, 2));
 
-            cudaDeviceSynchronize();
-            c10::cuda::CUDACachingAllocator::emptyCache();
         }
     } else {
         auto q_out = at::matmul(hidden, q_proj.t()).view({batch, seq, num_heads, head_dim * 2});
@@ -276,8 +274,6 @@ static at::Tensor full_attention(
     // Release gate before RoPE to save 16GB
     auto gate_saved = gate;
     gate = at::Tensor();
-    cudaDeviceSynchronize();
-    c10::cuda::CUDACachingAllocator::emptyCache();
 
     // Debug: memory after gate release
     {
@@ -307,8 +303,6 @@ static at::Tensor full_attention(
         rotate_half_k = at::Tensor();
         cos = at::Tensor();
         sin = at::Tensor();
-        cudaDeviceSynchronize();
-        c10::cuda::CUDACachingAllocator::emptyCache();
     }
 
     // Restore gate after RoPE
@@ -348,8 +342,6 @@ static at::Tensor full_attention(
         auto result = attn_out.transpose(1, 2).reshape({batch, seq, qkv_dim}).matmul(o_proj.t());
         result = result * at::sigmoid(gate).to(result.scalar_type());
         gate = at::Tensor();
-        cudaDeviceSynchronize();
-        c10::cuda::CUDACachingAllocator::emptyCache();
         return result;
     }
 }
@@ -1392,8 +1384,6 @@ static at::Tensor full_attention_batched(
 
     // Release gate before RoPE
     gate = at::Tensor();
-    cudaDeviceSynchronize();
-    c10::cuda::CUDACachingAllocator::emptyCache();
 
     // RoPE
     int64_t rotary_dim = (int64_t)(head_dim * partial_rotary_factor);
@@ -1413,8 +1403,6 @@ static at::Tensor full_attention_batched(
         q_rot.mul_(cos).add_(rotate_half_q * sin);
         k_rot.mul_(cos).add_(rotate_half_k * sin);
         cos = at::Tensor(); sin = at::Tensor();
-        cudaDeviceSynchronize();
-        c10::cuda::CUDACachingAllocator::emptyCache();
     }
 
     // GQA: no K/V expansion needed (PT 2.5+ enable_gqa=true)
@@ -1441,9 +1429,6 @@ static at::Tensor full_attention_batched(
     } else {
         attn_out = at::scaled_dot_product_attention(q_out, k, v, c10::nullopt, 0.0, true, c10::nullopt, true);
     }
-    cudaDeviceSynchronize();
-    c10::cuda::CUDACachingAllocator::emptyCache();
-
     auto result = attn_out.transpose(1, 2).reshape({batch, seq, qkv_dim}).matmul(o_proj.t());
 
     // Apply LoRA delta on o_proj output
@@ -1658,11 +1643,8 @@ static at::Tensor forward_full(
             auto h_f = hidden.to(at::kFloat);
         }
 
-        // Sync + release CUDA allocator cache after each layer in no-grad forward.
-        // Without sync, pending CUDA ops hold references to intermediates,
-        // preventing emptyCache from freeing them.
-        cudaDeviceSynchronize();
-        c10::cuda::CUDACachingAllocator::emptyCache();
+        // No per-layer sync — let CUDA pipeline run asynchronously.
+        // emptyCache() here was the #1 cause of GPU underutilization (6% util).
     }
 
     return hidden;  // pre-norm hidden (for MTP)
@@ -1851,8 +1833,6 @@ static at::Tensor forward_full_fused(
             (int64_t)(uintptr_t)ctx,
             i
         );
-        // Release allocator cache between layers to prevent accumulation
-        c10::cuda::CUDACachingAllocator::emptyCache();
     }
 
     return hidden;
