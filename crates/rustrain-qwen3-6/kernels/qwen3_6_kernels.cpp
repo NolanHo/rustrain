@@ -2243,8 +2243,17 @@ static at::Tensor compute_loss_fused(
         c10::cuda::CUDACachingAllocator::emptyCache();
     }
 
-    // Set gradient on hidden_normed (leaf tensor) — match its dtype
-    hidden_normed.mutable_grad() = grad_hidden.to(hidden_normed.scalar_type()).reshape_as(shifted_hidden);
+    // Set gradient on hidden_normed (leaf tensor).
+    // grad_hidden covers [batch, seq-1, hidden] (shifted tokens).
+    // hidden_normed is [batch, seq, hidden] — pad first token with zeros.
+    auto grad_reshaped = grad_hidden.to(hidden_normed.scalar_type())
+        .reshape({hidden_normed.size(0), seq_len - 1, hidden_dim});
+    auto grad_full = at::cat({
+        at::zeros({hidden_normed.size(0), 1, hidden_dim},
+            at::TensorOptions().dtype(hidden_normed.scalar_type()).device(hidden_normed.device())),
+        grad_reshaped
+    }, /*dim=*/1);  // [batch, seq, hidden]
+    hidden_normed.mutable_grad() = grad_full;
 
     // Backprop hidden_normed gradient to hidden via rms_norm recompute.
     if (hidden_normed.grad().defined()) {
