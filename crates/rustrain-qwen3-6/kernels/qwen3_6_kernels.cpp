@@ -2204,7 +2204,8 @@ static at::Tensor compute_loss_fused(
     // dL/dhidden_normed = (softmax - one_hot) / count * mask
     // softmax = exp(logit - logit_max) / sum_exp
     // We iterate tiles again, accumulate grad = softmax_tile @ lm_head_tile + target_grad
-    auto grad_hidden = at::zeros_like(hidden_flat);
+    auto grad_hidden = at::zeros({total_tokens, hidden_dim},
+        at::TensorOptions().dtype(at::kFloat).device(hidden_flat.device()));
     auto grad_scale = mask_f / total_count;  // [total_tokens]
 
     for (int64_t t = 0; t < num_tiles; t++) {
@@ -2231,19 +2232,19 @@ static at::Tensor compute_loss_fused(
         }
 
         // grad_hidden += grad_scale * softmax_tile @ lm_head_tile
-        // softmax_tile: [total_tokens, v_n], lm_head_tile: [v_n, hidden]
-        // → [total_tokens, hidden]
+        // softmax_tile: [total_tokens, v_n] (Float), lm_head_tile: [v_n, hidden] (BF16)
+        // → [total_tokens, hidden] (Float)
         auto grad_tile = at::matmul(
             (softmax_tile * grad_scale.reshape({-1, 1})),
-            lm_head_tile
+            lm_head_tile.to(at::kFloat)
         );
         grad_hidden.add_(grad_tile);
 
         c10::cuda::CUDACachingAllocator::emptyCache();
     }
 
-    // Set gradient on hidden_normed (leaf tensor)
-    hidden_normed.mutable_grad() = grad_hidden.reshape_as(shifted_hidden);
+    // Set gradient on hidden_normed (leaf tensor) — match its dtype
+    hidden_normed.mutable_grad() = grad_hidden.to(hidden_normed.scalar_type()).reshape_as(shifted_hidden);
 
     // Backprop hidden_normed gradient to hidden via rms_norm recompute.
     if (hidden_normed.grad().defined()) {
