@@ -2113,19 +2113,16 @@ static at::Tensor compute_loss(
         auto masked_loss = per_token_loss * chunk_mask.to(at::kFloat);
         auto chunk_loss = masked_loss.sum();
 
-        // Backward this chunk — only traverses CE graph (detached from main model)
-        // retain_graph=true: needed because all chunks share hidden_normed graph
-        // (but graph is tiny — just matmul + CE, not connected to main model)
+        // Backward this chunk — each chunk creates an independent CE subgraph
+        // because hidden_normed is a leaf tensor. retain_graph=false is safe
+        // and much faster than retain_graph=true (which accumulates graph).
         torch::autograd::backward({chunk_loss}, {},
-            /*retain_graph=*/true, /*create_graph=*/false);
+            /*retain_graph=*/false, /*create_graph=*/false);
 
         total_loss_val += chunk_loss.item<double>();
 
-        // Periodically release CUDA allocator cache to prevent accumulation
-        // of freed chunk intermediates (logits, log_softmax, etc.)
-        if ((c + 1) % 8 == 0) {
-            c10::cuda::CUDACachingAllocator::emptyCache();
-        }
+        // Release freed chunk intermediates (logits, log_softmax, etc.)
+        c10::cuda::CUDACachingAllocator::emptyCache();
     }
 
     // Backprop hidden_normed gradient to hidden via rms_norm.
