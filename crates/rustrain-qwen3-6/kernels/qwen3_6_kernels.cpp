@@ -2754,13 +2754,12 @@ __attribute__((visibility("default"))) double qwen36_train_multi_lora(
             auto& input_ref = ids_expanded;
             auto& mask_ref = mask_expanded;
 
-            // Forward
+            // Forward — force checkpoint for multi-LoRA (needed for group_inputs)
             bool use_fused = getenv("QWEN36_FUSED_LAYER");
+            ctx->use_checkpoint = true;  // force checkpoint for manual_group_backward
             auto hidden = use_fused
                 ? forward_full_fused(ctx, input_ref)
-                : ctx->use_checkpoint
-                    ? forward_full_checkpoint(ctx, input_ref)
-                    : forward_full(ctx, input_ref);
+                : forward_full_checkpoint(ctx, input_ref);
 
             // Batched CE: compute loss with autograd enabled.
             // hidden from forward_full_checkpoint is detached (no grad_fn).
