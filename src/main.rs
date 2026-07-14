@@ -87,6 +87,22 @@ enum Command {
         world_size: usize,
     },
 
+    /// EP benchmark — no HTTP, direct IPC dispatch in-process
+    EpBench {
+        #[arg(long, default_value = "/tmp/rustrain-ep")]
+        metrics_dir: PathBuf,
+        #[arg(long, default_value_t = 8)]
+        world_size: usize,
+        #[arg(long, default_value_t = 100)]
+        n_adapters: i32,
+        #[arg(long, default_value_t = 1)]
+        lora_rank: i32,
+        #[arg(long, default_value_t = 60)]
+        duration: u64,  // seconds, 0 = single step
+        #[arg(long, default_value = "512")]
+        seq_len: usize,
+    },
+
     /// EP worker process (launched by ep-server, not for direct use)
     EpWorker {
         #[arg(long)]
@@ -176,6 +192,14 @@ fn main() -> Result<()> {
             metrics_dir,
             world_size,
         } => run_ep_server(http_port, grpc_port, metrics_dir, world_size),
+        Command::EpBench {
+            metrics_dir,
+            world_size,
+            n_adapters,
+            lora_rank,
+            duration,
+            seq_len,
+        } => run_ep_bench(metrics_dir, world_size, n_adapters, lora_rank, duration, seq_len),
         Command::EpWorker {
             shm_name,
             rank,
@@ -700,5 +724,227 @@ fn run_ep_server(
 
     // Workers are killed when coordinator is dropped
     info!("EP server shutting down");
+    Ok(())
+}
+
+fn run_ep_bench(
+    metrics_dir: PathBuf,
+    world_size: usize,
+    n_adapters: i32,
+    lora_rank: i32,
+    duration: u64,
+    seq_len: usize,
+) -> Result<()> {
+    use rustrain_ipc::{EpCommand, EpResult};
+    use rustrain_server::ep::EpCoordinator;
+
+    std::fs::create_dir_all(&metrics_dir)?;
+
+    info!("EP bench: world_size={}, n_adapters={}, rank={}, duration={}s, seq={}",
+          world_size, n_adapters, lora_rank, duration, seq_len);
+
+    let coordinator = EpCoordinator::launch(world_size, metrics_dir.clone())
+        .map_err(|e| anyhow!("Failed to launch EP workers: {}", e))?;
+
+    // Session setup
+    let sid = "bench";
+    let model_path = "/mnt/workspace/huggingface/hub/models--Qwen--Qwen3.6-35B-A3B/snapshots/995ad96eacd98c81ed38be0c5b274b04031597b0";
+    let lt = "[\"linear_attention\",\"linear_attention\",\"linear_attention\",\"full_attention\"]";
+    let lt_full = std::iter::repeat(lt).take(10).collect::<Vec<_>>().join(",");
+    let config_toml = format!(r#"
+[run]
+name="bench"
+seed=42
+[model]
+name="bench"
+architecture="qwen3_6_lora_sft"
+model_path="{model_path}"
+vocab_size=248320
+hidden_size=2048
+num_layers=40
+num_attention_heads=16
+num_key_value_heads=2
+head_dim=256
+seq_len={seq_len}
+norm="rmsnorm"
+activation="swiglu"
+rope=true
+rms_norm_eps=0.000001
+partial_rotary_factor=0.25
+layer_types={lt_full}
+linear_num_key_heads=16
+linear_key_head_dim=128
+linear_num_value_heads=32
+linear_value_head_dim=128
+linear_conv_kernel_dim=4
+num_experts=256
+num_experts_per_tok=8
+moe_intermediate_size=512
+[train]
+max_steps=100000
+backend="tch"
+micro_batch_size=1
+global_batch_size=1
+gradient_accumulation_steps=1
+learning_rate=0.0001
+dtype="bf16"
+device="cuda"
+checkpoint_every=0
+eval_every=0
+[parallel]
+tensor_model_parallel_size=1
+pipeline_model_parallel_size=1
+data_parallel_size=1
+expert_model_parallel_size=1
+context_parallel_size=1
+[lora]
+rank=8
+alpha=16
+target_layers=[]
+target_modules=["q_proj","k_proj","v_proj","o_proj","in_proj_qkv","in_proj_z","out_proj"]
+[data]
+kind="instruction_jsonl"
+paths=["/tmp/qwen3_6_test.jsonl"]
+"#);
+
+    eprintln!("[bench] create session...");
+    let _ = coordinator.dispatch(&EpCommand::CreateSession { session_id: sid.to_string() });
+
+    eprintln!("[bench] load_model...");
+    match coordinator.dispatch(&EpCommand::LoadModel {
+        session_id: sid.to_string(),
+        model_path: model_path.to_string(),
+        config_toml: config_toml.clone(),
+    }) {
+        EpResult::Ok => {},
+        EpResult::Error(e) => bail!("load_model failed: {}", e),
+        _ => bail!("load_model unexpected result"),
+    }
+
+    eprintln!("[bench] load_dataset...");
+    let _ = coordinator.dispatch(&EpCommand::LoadDataset {
+        session_id: sid.to_string(),
+        jsonl_path: "/tmp/qwen3_6_test.jsonl".to_string(),
+        seq_len,
+    });
+
+    eprintln!("[bench] init_lora...");
+    match coordinator.dispatch(&EpCommand::InitLora {
+        session_id: sid.to_string(),
+        rank: 8,
+        alpha: 16,
+        target_layers: vec![],
+        target_modules: vec!["q_proj".to_string(),"k_proj".to_string(),"v_proj".to_string(),
+                             "o_proj".to_string(),"in_proj_qkv".to_string(),
+                             "in_proj_z".to_string(),"out_proj".to_string()],
+        lr: 0.0001,
+        beta1: 0.9,
+        beta2: 0.999,
+        eps: 0.00000001,
+    }) {
+        EpResult::Ok => {},
+        EpResult::Error(e) => bail!("init_lora failed: {}", e),
+        _ => bail!("init_lora unexpected result"),
+    }
+
+    eprintln!("[bench] batch_add_lora ({} adapters, rank={})...", n_adapters, lora_rank);
+    match coordinator.dispatch(&EpCommand::BatchAddLora {
+        session_id: sid.to_string(),
+        count: n_adapters,
+        rank: lora_rank as i64,
+        alpha: (lora_rank * 2) as f64,
+        target_layers: vec![],
+        target_modules: "".to_string(),
+    }) {
+        EpResult::Count(n) => eprintln!("[bench] added {} adapters", n),
+        EpResult::Error(e) => bail!("batch_add_lora failed: {}", e),
+        _ => bail!("batch_add_lora unexpected result"),
+    }
+
+    // Build input tensors
+    let ids: Vec<i64> = vec![1; seq_len];
+    let mask: Vec<i64> = { let mut m = vec![0i64; 20]; m.extend(vec![1i64; seq_len - 20]); m };
+    let attn: Vec<i64> = vec![1; seq_len];
+
+    // Warmup
+    eprintln!("[bench] warmup...");
+    let t0 = std::time::Instant::now();
+    let warmup_loss = match coordinator.dispatch(&EpCommand::TrainMultiLora {
+        session_id: sid.to_string(),
+        input_ids: ids.clone(),
+        target_mask: mask.clone(),
+        attention_mask: attn.clone(),
+        seq_len,
+        n_total: n_adapters,
+        lora_rank,
+    }) {
+        EpResult::Loss(l) => l,
+        EpResult::Error(e) => { bail!("warmup failed: {}", e); }
+        _ => bail!("warmup unexpected result"),
+    };
+    let warmup_ms = t0.elapsed().as_millis();
+    eprintln!("[bench] warmup: loss={:.6} time={}ms", warmup_loss, warmup_ms);
+
+    if duration == 0 {
+        // Single step only
+        eprintln!("[bench] single step done");
+        let _ = coordinator.dispatch(&EpCommand::DestroySession { session_id: sid.to_string() });
+        return Ok(());
+    }
+
+    // Throughput measurement
+    eprintln!("[bench] measuring throughput for {}s...", duration);
+    let mut total_adapters = 0i64;
+    let mut total_steps = 0i64;
+    let mut losses = Vec::new();
+    let start = std::time::Instant::now();
+
+    while start.elapsed().as_secs() < duration {
+        let t0 = std::time::Instant::now();
+        match coordinator.dispatch(&EpCommand::TrainMultiLora {
+            session_id: sid.to_string(),
+            input_ids: ids.clone(),
+            target_mask: mask.clone(),
+            attention_mask: attn.clone(),
+            seq_len,
+            n_total: n_adapters,
+            lora_rank,
+        }) {
+            EpResult::Loss(l) => {
+                losses.push(l);
+                total_adapters += n_adapters as i64;
+                total_steps += 1;
+                let elapsed = start.elapsed().as_secs_f64();
+                if total_steps % 5 == 0 || total_steps == 1 {
+                    let rate = total_adapters as f64 / elapsed;
+                    eprintln!("  step {}: loss={:.6} time={}ms total={} adp in {:.0}s = {:.1} adp/s",
+                              total_steps, l, t0.elapsed().as_millis(), total_adapters, elapsed, rate);
+                }
+            }
+            EpResult::Error(e) => {
+                eprintln!("[bench] step {} FAILED: {}", total_steps, e);
+                break;
+            }
+            _ => break,
+        }
+    }
+
+    let elapsed = start.elapsed().as_secs_f64();
+    let rate = total_adapters as f64 / elapsed;
+
+    eprintln!();
+    eprintln!("============================================================");
+    eprintln!("  RESULTS: {} adapters, rank={}, EP={}", n_adapters, lora_rank, world_size);
+    eprintln!("============================================================");
+    eprintln!("  Duration: {:.0}s ({:.1} min)", elapsed, elapsed / 60.0);
+    eprintln!("  Steps: {}", total_steps);
+    eprintln!("  Total adapters processed: {}", total_adapters);
+    eprintln!("  Throughput: {:.2} adapters/s ({:.0} adapters/min)", rate, rate * 60.0);
+    if !losses.is_empty() {
+        eprintln!("  Loss: {:.6} -> {:.6}", losses[0], losses[losses.len()-1]);
+    }
+    eprintln!("  Failures: {}", total_steps - losses.len() as i64);
+
+    let _ = coordinator.dispatch(&EpCommand::DeleteSession { session_id: sid.to_string() });
     Ok(())
 }
