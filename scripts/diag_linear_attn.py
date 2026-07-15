@@ -32,8 +32,8 @@ def main():
     print(f"linear_conv_kernel_dim: {text_config.linear_conv_kernel_dim}")
     print(f"hidden_size: {text_config.hidden_size}")
 
-    device = "cuda:0"
-    dtype = torch.bfloat16
+    device = "cpu"
+    dtype = torch.float32  # CPU only, use float32 for precision
 
     # Load model
     model = AutoModelForCausalLM.from_pretrained(
