@@ -1487,7 +1487,7 @@ static at::Tensor linear_attention_batched(
     auto k = qkv_reshaped.narrow(-1, head_k_dim, head_k_dim);               // [b, s, nk, hk]
     auto v = qkv_reshaped.narrow(-1, head_k_dim * 2, head_v_dim * v_per_k); // [b, s, nk, hv*v/k]
     // Reshape v to [b, s, num_v_heads, head_v_dim]
-    v = v.view({batch, seq, num_v_heads, head_v_dim});
+    v = v.reshape({batch, seq, num_v_heads, head_v_dim});
     // q, k stay as [b, s, num_k_heads, head_k_dim] — will be expanded to v_heads later
 
     auto a = at::matmul(hidden, in_proj_a.t());
@@ -1499,7 +1499,7 @@ static at::Tensor linear_attention_batched(
     if (it_z != ctx->lora_batch_cache.end()) {
         z = z + lora_activation_delta(hidden, it_z->second.a_stack, it_z->second.b_stack, it_z->second.scaling);
     }
-    z = z.view({batch, seq, num_v_heads, head_v_dim});
+    z = z.reshape({batch, seq, num_v_heads, head_v_dim});
 
     // g = -exp(A_log) * softplus(a + dt_bias)
     auto a_log_f = a_log.to(at::kFloat);
@@ -1580,7 +1580,7 @@ static at::Tensor linear_attention_batched(
     auto z_flat = z.reshape({-1, head_v_dim});
     auto variance = core_flat.to(at::kFloat).pow(2).mean(-1, true);
     auto normed = (core_flat.to(at::kFloat) * (variance + rms_eps).rsqrt() * norm_w.to(at::kFloat)).to(core_flat.scalar_type());
-    auto gated = (normed * at::silu(z_flat.to(at::kFloat)).to(normed.scalar_type())).view({batch, seq, num_v_heads * head_v_dim});
+    auto gated = (normed * at::silu(z_flat.to(at::kFloat)).to(normed.scalar_type())).reshape({batch, seq, num_v_heads * head_v_dim});
     auto result = at::matmul(gated, out_proj.t());
 
     // out_proj LoRA delta: result += B@(A@gated) * scaling
