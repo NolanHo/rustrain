@@ -1473,9 +1473,20 @@ static at::Tensor linear_attention_batched(
     conv_out = at::silu(conv_out.narrow(2, 0, seq));
     auto qkv_conv = conv_out.transpose(1, 2);
 
-    auto q = qkv_conv.narrow(-1, 0, q_size).view({batch, seq, num_k_heads, key_dim});
-    auto k = qkv_conv.narrow(-1, q_size, q_size).view({batch, seq, num_k_heads, key_dim});
-    auto v = qkv_conv.narrow(-1, q_size * 2, v_size).view({batch, seq, num_v_heads, val_dim});
+    // Per-head QKV split (matches transformers fix_query_key_value_ordering)
+    // in_proj_qkv output layout: [head0: Q(hk) K(hk) V(hv*v/k) | head1: ... | ... × num_k_heads]
+    int64_t head_k_dim = key_dim / num_k_heads;   // 256
+    int64_t head_v_dim = val_dim / num_v_heads;   // 256
+    int64_t v_per_k = num_v_heads / num_k_heads;  // 2
+    int64_t per_head = head_k_dim + head_k_dim + head_v_dim * v_per_k;  // 1024
+    // Reshape: [batch, seq, num_k_heads, per_head]
+    auto qkv_reshaped = qkv_conv.view({batch, seq, num_k_heads, per_head});
+    auto q = qkv_reshaped.narrow(-1, 0, head_k_dim);                        // [b, s, nk, hk]
+    auto k = qkv_reshaped.narrow(-1, head_k_dim, head_k_dim);               // [b, s, nk, hk]
+    auto v = qkv_reshaped.narrow(-1, head_k_dim * 2, head_v_dim * v_per_k); // [b, s, nk, hv*v/k]
+    // Reshape v to [b, s, num_v_heads, head_v_dim]
+    v = v.view({batch, seq, num_v_heads, head_v_dim});
+    // q, k stay as [b, s, num_k_heads, head_k_dim] — will be expanded to v_heads later
 
     auto a = at::matmul(hidden, in_proj_a.t());
     auto b = at::matmul(hidden, in_proj_b.t());
@@ -1486,7 +1497,7 @@ static at::Tensor linear_attention_batched(
     if (it_z != ctx->lora_batch_cache.end()) {
         z = z + lora_activation_delta(hidden, it_z->second.a_stack, it_z->second.b_stack, it_z->second.scaling);
     }
-    z = z.view({batch, seq, num_v_heads, val_dim});
+    z = z.view({batch, seq, num_v_heads, head_v_dim});
 
     // g = -exp(A_log) * softplus(a + dt_bias)
     auto a_log_f = a_log.to(at::kFloat);
@@ -1500,11 +1511,11 @@ static at::Tensor linear_attention_batched(
     q = q.repeat_interleave(n_rep, 2);
     k = k.repeat_interleave(n_rep, 2);
 
-    // L2 normalize Q, K
+    // L2 normalize Q, K (per-head, matching HF)
     q = (q.to(at::kFloat) / q.to(at::kFloat).norm(2, -1, true).clamp_min(1e-6));
     k = (k.to(at::kFloat) / k.to(at::kFloat).norm(2, -1, true).clamp_min(1e-6));
 
-    double scale = 1.0 / std::sqrt((double)key_dim);
+    double scale = 1.0 / std::sqrt((double)head_k_dim);
     q = q * scale;
 
     auto q_t = q.transpose(1, 2).contiguous();
@@ -1522,14 +1533,14 @@ static at::Tensor linear_attention_batched(
     int64_t sub_batch = (BH_total > 8192) ? 256 : batch;  // 256 adapters or all if small
     sub_batch = std::min(sub_batch, batch);
 
-    auto outs = at::empty({BH_total, seq, val_dim}, q_t.options());
-    auto delta_buf = at::empty({BH_total, seq, val_dim}, q_t.options());
+    auto outs = at::empty({BH_total, seq, head_v_dim}, q_t.options());
+    auto delta_buf = at::empty({BH_total, seq, head_v_dim}, q_t.options());
 
     for (int64_t sb = 0; sb < batch; sb += sub_batch) {
         int64_t n = std::min(sub_batch, batch - sb);
         int64_t BH = n * num_v_heads;
 
-        auto state = at::zeros({BH, key_dim, val_dim}, q_t.options());
+        auto state = at::zeros({BH, head_k_dim, head_v_dim}, q_t.options());
 
         // Narrow on dim 0 (batch/adapter dimension), then reshape to [BH, seq, dim]
         auto q_sub = q_t.narrow(0, sb, n);
@@ -1538,9 +1549,9 @@ static at::Tensor linear_attention_batched(
         auto g_sub = g_exp.narrow(0, sb, n);
         auto beta_sub = beta_t.narrow(0, sb, n);
 
-        auto q_contig = q_sub.reshape({BH, seq, key_dim}).contiguous().to(at::kFloat);
-        auto k_contig = k_sub.reshape({BH, seq, key_dim}).contiguous().to(at::kFloat);
-        auto v_contig = v_sub.reshape({BH, seq, val_dim}).contiguous().to(at::kFloat);
+        auto q_contig = q_sub.reshape({BH, seq, head_k_dim}).contiguous().to(at::kFloat);
+        auto k_contig = k_sub.reshape({BH, seq, head_k_dim}).contiguous().to(at::kFloat);
+        auto v_contig = v_sub.reshape({BH, seq, head_v_dim}).contiguous().to(at::kFloat);
         auto g_contig = g_sub.reshape({BH, seq}).contiguous().to(at::kFloat);
         auto beta_contig = beta_sub.reshape({BH, seq}).contiguous().to(at::kFloat);
         auto state_contig = state.contiguous();
@@ -1557,17 +1568,17 @@ static at::Tensor linear_attention_batched(
             state_contig.data_ptr<float>(),
             outs.narrow(0, bh_start, BH).data_ptr<float>(),
             delta_buf.narrow(0, bh_start, BH).data_ptr<float>(),
-            (int)BH, (int)seq, (int)key_dim, (int)val_dim
+            (int)BH, (int)seq, (int)head_k_dim, (int)head_v_dim
         );
     }
 
-    auto core_out = outs.reshape({batch, num_v_heads, seq, val_dim})
+    auto core_out = outs.reshape({batch, num_v_heads, seq, head_v_dim})
                          .transpose(1, 2).to(compute_type);
-    auto core_flat = core_out.reshape({-1, val_dim});
-    auto z_flat = z.reshape({-1, val_dim});
+    auto core_flat = core_out.reshape({-1, head_v_dim});
+    auto z_flat = z.reshape({-1, head_v_dim});
     auto variance = core_flat.to(at::kFloat).pow(2).mean(-1, true);
     auto normed = (core_flat.to(at::kFloat) * (variance + rms_eps).rsqrt() * norm_w.to(at::kFloat)).to(core_flat.scalar_type());
-    auto gated = (normed * at::silu(z_flat.to(at::kFloat)).to(normed.scalar_type())).view({batch, seq, num_v_heads * val_dim});
+    auto gated = (normed * at::silu(z_flat.to(at::kFloat)).to(normed.scalar_type())).view({batch, seq, num_v_heads * head_v_dim});
     auto result = at::matmul(gated, out_proj.t());
 
     // out_proj LoRA delta: result += B@(A@gated) * scaling
