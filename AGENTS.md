@@ -107,3 +107,15 @@ C++:   所有计算（attention, MLP, MoE, loss, optimizer, embedding）
 
 `Cargo.toml` 中 `rustrain-glm5` 最终去掉 `tch` 依赖。
 Rust 侧 `Tensor` 类型最终替换为自定义薄包装（`*mut c_void` + shape/kind）。
+
+## GOTCHAS
+
+- **QKV split layout**: Qwen3.5/3.6 `in_proj_qkv` outputs **flat** layout `[Q_all | K_all | V_all]`, NOT per-head interleaved. Use `torch.split(qkv, [q_size, k_size, v_size])` / `qkv.narrow(-1, offset, size)`. See `docs/agent/linear-attention.md`.
+- **emptyCache() = hidden sync**: `CUDACachingAllocator::emptyCache()` calls `cudaDeviceSynchronize()`. Remove from training loop. Only call for seq>4096.
+- **ABI mismatch**: System PyTorch 2.5.1 (ABI=0) vs rustrain binary (ABI=1). Use `/mnt/workspace/rustrain-env/` PyTorch 2.12.1 (ABI=1).
+- **GLIBC on remote**: Binary compiled with GLIBC 2.39 won't run on Ubuntu 20.04 (GLIBC 2.35). Need matching build environment.
+
+## Knowledge Files
+
+- `docs/agent/linear-attention.md` — Linear attention architecture, QKV split layout, delta rule, diagnostic dumps
+- `docs/plans/qwen3.6-support.md` — Qwen3.6 model architecture, weight map, config details
