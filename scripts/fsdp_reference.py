@@ -60,7 +60,7 @@ def create_lora_params(model, rank, num_adapters, device, layer_types):
     
     return lora_params
 
-def apply_lora_forward(model, lora_params, input_ids, adapter_idx):
+def apply_lora_forward(model, lora_params, input_ids, adapter_idx, output_hidden_states=False):
     """Forward with LoRA delta: output += B @ (A @ x) * scaling"""
     params_A, params_B = lora_params[adapter_idx]
     hooks = []
@@ -81,7 +81,7 @@ def apply_lora_forward(model, lora_params, input_ids, adapter_idx):
     
     # attention_mask: all 1s (same as rustrain ep-bench)
     attn_mask = torch.ones(1, 1, input_ids.size(1), input_ids.size(1), dtype=torch.bool, device=input_ids.device)
-    output = model(input_ids, attention_mask=attn_mask)
+    output = model(input_ids, attention_mask=attn_mask, output_hidden_states=output_hidden_states)
     for h in hooks:
         h.remove()
     return output
@@ -162,10 +162,22 @@ def main():
     
     # Process each adapter with its own LoRA
     total_loss = 0.0
+    dump_layers = os.environ.get("QWEN36_DUMP_LAYERS")
     for i in range(args.n_adapters):
         # Forward: base model frozen, LoRA hooks add delta with grad tracking
         with torch.enable_grad():
-            output = apply_lora_forward(model, lora_params, input_ids[i:i+1], i)
+            if dump_layers and i == 0:
+                output = apply_lora_forward(model, lora_params, input_ids[i:i+1], i, output_hidden_states=True)
+                # Embedding output
+                emb = output.hidden_states[0]  # [1, seq, hidden]
+                print(f"[dump] embedding: mean={emb.float().mean().item():.6f} std={emb.float().std().item():.6f} "
+                      f"[0,0,:3]={emb[0,0,0].float().item():.6f},{emb[0,0,1].float().item():.6f},{emb[0,0,2].float().item():.6f}")
+                # Per-layer hidden states
+                for li, hs in enumerate(output.hidden_states[1:]):
+                    print(f"[dump] layer {li}: mean={hs.float().mean().item():.6f} std={hs.float().std().item():.6f} "
+                          f"[0,0,:3]={hs[0,0,0].float().item():.6f},{hs[0,0,1].float().item():.6f},{hs[0,0,2].float().item():.6f}")
+            else:
+                output = apply_lora_forward(model, lora_params, input_ids[i:i+1], i)
         logits = output.logits[:, :-1, :]  # [1, seq-1, vocab]
         targets = input_ids[i:i+1, 1:]     # [1, seq-1]
         mask = target_mask[i:i+1, 1:].float()

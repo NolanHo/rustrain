@@ -1611,6 +1611,9 @@ static at::Tensor forward_full(
     // Debug: dump embedding output stats
     if (getenv("QWEN36_DUMP_LAYERS")) {
         auto h_f = hidden.to(at::kFloat);
+        fprintf(stderr, "[dump] embedding: mean=%.6f std=%.6f [0,:3]=%.6f,%.6f,%.6f\n",
+                h_f.mean().item<float>(), h_f.std().item<float>(),
+                h_f[0][0][0].item<float>(), h_f[0][0][1].item<float>(), h_f[0][0][2].item<float>());
     }
 
     for (int64_t i = 0; i < ctx->num_layers; i++) {
@@ -1638,9 +1641,12 @@ static at::Tensor forward_full(
         hidden = forward_single_layer(ctx, hidden, layer_w.data(), &ctx->layer_configs[i], i,
             kind, ctx->attention_mask, ctx->lora_batch_valid);
 
-        // Debug: dump per-layer hidden state stats (matching HF output_hidden_states)
+        // Debug: dump per-layer hidden state stats
         if (getenv("QWEN36_DUMP_LAYERS")) {
             auto h_f = hidden.to(at::kFloat);
+            fprintf(stderr, "[dump] layer %ld: mean=%.6f std=%.6f [0,0,:3]=%.6f,%.6f,%.6f\n",
+                    (long)i, h_f.mean().item<float>(), h_f.std().item<float>(),
+                    h_f[0][0][0].item<float>(), h_f[0][0][1].item<float>(), h_f[0][0][2].item<float>());
         }
 
         // No per-layer sync — let CUDA pipeline run asynchronously.
@@ -1854,6 +1860,13 @@ static at::Tensor forward_full_checkpoint(
     auto embed = *ctx->embed_ptr[0];
     at::Tensor hidden = at::embedding(embed, input_ids);
 
+    if (getenv("QWEN36_DUMP_LAYERS")) {
+        auto h_f = hidden.to(at::kFloat);
+        fprintf(stderr, "[dump] ckpt embedding: mean=%.6f std=%.6f [0,0,:3]=%.6f,%.6f,%.6f\n",
+                h_f.mean().item<float>(), h_f.std().item<float>(),
+                h_f[0][0][0].item<float>(), h_f[0][0][1].item<float>(), h_f[0][0][2].item<float>());
+    }
+
     bool use_subckpt = getenv("QWEN36_SUBCKPT");
 
     if (use_subckpt) {
@@ -1903,8 +1916,14 @@ static at::Tensor forward_full_checkpoint(
 
         hidden = forward_layer_group(ctx, hidden, start, end);
         // emptyCache: needed for seq>4096 (memory pressure), skip for small seq (async benefit).
-        // At seq=16K: 10 syncs × ~20ms = 200ms overhead / 22s forward = <1% impact.
         if (hidden.size(1) > 4096) c10::cuda::CUDACachingAllocator::emptyCache();
+
+        if (getenv("QWEN36_DUMP_LAYERS")) {
+            auto h_f = hidden.to(at::kFloat);
+            fprintf(stderr, "[dump] ckpt group [%ld,%ld): mean=%.6f std=%.6f [0,0,:3]=%.6f,%.6f,%.6f\n",
+                    (long)start, (long)end, h_f.mean().item<float>(), h_f.std().item<float>(),
+                    h_f[0][0][0].item<float>(), h_f[0][0][1].item<float>(), h_f[0][0][2].item<float>());
+        }
     }
 
     // Return hidden on GPU with requires_grad for CE backward
