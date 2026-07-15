@@ -1480,8 +1480,9 @@ static at::Tensor linear_attention_batched(
     int64_t head_v_dim = val_dim;                        // 128 (already per-head)
     int64_t v_per_k = num_v_heads / num_k_heads;          // 2
     int64_t per_head = head_k_dim + head_k_dim + head_v_dim * v_per_k;  // 128+128+256 = 512
-    // Reshape: [batch, seq, num_k_heads, per_head]
-    auto qkv_reshaped = qkv_conv.view({batch, seq, num_k_heads, per_head});
+    // Reshape: [batch, seq, num_k_heads, per_head] — use reshape (not view) because
+    // qkv_conv comes from transpose(1,2) which may not be contiguous.
+    auto qkv_reshaped = qkv_conv.reshape({batch, seq, num_k_heads, per_head});
     auto q = qkv_reshaped.narrow(-1, 0, head_k_dim);                        // [b, s, nk, hk]
     auto k = qkv_reshaped.narrow(-1, head_k_dim, head_k_dim);               // [b, s, nk, hk]
     auto v = qkv_reshaped.narrow(-1, head_k_dim * 2, head_v_dim * v_per_k); // [b, s, nk, hv*v/k]
