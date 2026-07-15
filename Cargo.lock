@@ -2191,6 +2191,7 @@ dependencies = [
  "rustrain-deepseek",
  "rustrain-deepseek-v4",
  "rustrain-glm5",
+ "rustrain-ipc",
  "rustrain-moe",
  "rustrain-nccl",
  "rustrain-parallel",

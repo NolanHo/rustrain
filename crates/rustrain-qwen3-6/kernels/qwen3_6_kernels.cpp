@@ -1464,6 +1464,25 @@ static at::Tensor linear_attention_batched(
         qkv = qkv + lora_activation_delta(hidden, it_qkv->second.a_stack, it_qkv->second.b_stack, it_qkv->second.scaling);
     }
 
+    // DIAG: dump after QKV projection
+    if (getenv("QWEN36_DUMP_LAYERS") && layer_idx == 0) {
+        auto qkv_f = qkv.to(at::kFloat);
+        fprintf(stderr, "[diag-la] layer %ld qkv_proj: shape=[%ld,%ld,%ld] mean=%.6f std=%.6f [0,0,:5]=%.6f,%.6f,%.6f,%.6f,%.6f\n",
+                (long)layer_idx, (long)qkv_f.size(0), (long)qkv_f.size(1), (long)qkv_f.size(2),
+                qkv_f.mean().item<float>(), qkv_f.std().item<float>(),
+                qkv_f[0][0][0].item<float>(), qkv_f[0][0][1].item<float>(),
+                qkv_f[0][0][2].item<float>(), qkv_f[0][0][3].item<float>(),
+                qkv_f[0][0][4].item<float>());
+        // Dump weight layout info
+        auto w_f = in_proj_qkv.to(at::kFloat);
+        fprintf(stderr, "[diag-la] in_proj_qkv weight: shape=[%ld,%ld] mean=%.6f std=%.6f\n",
+                (long)w_f.size(0), (long)w_f.size(1), w_f.mean().item<float>(), w_f.std().item<float>());
+        auto conv_w_f = conv1d_w.to(at::kFloat);
+        fprintf(stderr, "[diag-la] conv1d weight: shape=[%ld,%ld,%ld] mean=%.6f std=%.6f\n",
+                (long)conv_w_f.size(0), (long)conv_w_f.size(1), (long)conv_w_f.size(2),
+                conv_w_f.mean().item<float>(), conv_w_f.std().item<float>());
+    }
+
     auto qkv_t = qkv.transpose(1, 2);
     int64_t pad = conv_kernel - 1;
     auto padding = at::zeros({batch, qkv_dim, pad}, qkv.options());
@@ -1473,22 +1492,42 @@ static at::Tensor linear_attention_batched(
     conv_out = at::silu(conv_out.narrow(2, 0, seq));
     auto qkv_conv = conv_out.transpose(1, 2);
 
-    // Per-head QKV split (matches transformers fix_query_key_value_ordering)
-    // key_dim and val_dim are ALREADY per-head (128 each), not total.
-    // Total: q_total = num_k_heads * key_dim = 2048, v_total = num_v_heads * val_dim = 4096
+    // DIAG: dump after conv1d
+    if (getenv("QWEN36_DUMP_LAYERS") && layer_idx == 0) {
+        auto qc_f = qkv_conv.to(at::kFloat);
+        fprintf(stderr, "[diag-la] layer %ld after_conv1d: mean=%.6f std=%.6f [0,0,:5]=%.6f,%.6f,%.6f,%.6f,%.6f\n",
+                (long)layer_idx, qc_f.mean().item<float>(), qc_f.std().item<float>(),
+                qc_f[0][0][0].item<float>(), qc_f[0][0][1].item<float>(),
+                qc_f[0][0][2].item<float>(), qc_f[0][0][3].item<float>(),
+                qc_f[0][0][4].item<float>());
+    }
+
+    // Flat QKV split (matches transformers Qwen3_5GatedDeltaNet.forward)
+    // in_proj_qkv outputs flat layout: [Q_all(2048) | K_all(2048) | V_all(4096)]
+    // NOT per-head interleaved. This matches the non-batched path (line ~517).
     int64_t head_k_dim = key_dim;                        // 128 (already per-head)
     int64_t head_v_dim = val_dim;                        // 128 (already per-head)
-    int64_t v_per_k = num_v_heads / num_k_heads;          // 2
-    int64_t per_head = head_k_dim + head_k_dim + head_v_dim * v_per_k;  // 128+128+256 = 512
-    // Reshape: [batch, seq, num_k_heads, per_head] — use reshape (not view) because
-    // qkv_conv comes from transpose(1,2) which may not be contiguous.
-    auto qkv_reshaped = qkv_conv.reshape({batch, seq, num_k_heads, per_head});
-    auto q = qkv_reshaped.narrow(-1, 0, head_k_dim);                        // [b, s, nk, hk]
-    auto k = qkv_reshaped.narrow(-1, head_k_dim, head_k_dim);               // [b, s, nk, hk]
-    auto v = qkv_reshaped.narrow(-1, head_k_dim * 2, head_v_dim * v_per_k); // [b, s, nk, hv*v/k]
-    // Reshape v to [b, s, num_v_heads, head_v_dim]
-    v = v.reshape({batch, seq, num_v_heads, head_v_dim});
-    // q, k stay as [b, s, num_k_heads, head_k_dim] — will be expanded to v_heads later
+    int64_t q_total = num_k_heads * head_k_dim;          // 2048
+    int64_t v_total = num_v_heads * head_v_dim;          // 4096
+    auto q = qkv_conv.narrow(-1, 0, q_total).reshape({batch, seq, num_k_heads, head_k_dim});
+    auto k = qkv_conv.narrow(-1, q_total, q_total).reshape({batch, seq, num_k_heads, head_k_dim});
+    auto v = qkv_conv.narrow(-1, q_total * 2, v_total).reshape({batch, seq, num_v_heads, head_v_dim});
+
+    // DIAG: dump Q/K/V after per-head split
+    if (getenv("QWEN36_DUMP_LAYERS") && layer_idx == 0) {
+        auto q_f = q.to(at::kFloat);
+        auto k_f = k.to(at::kFloat);
+        auto v_f = v.to(at::kFloat);
+        fprintf(stderr, "[diag-la] after_split q: mean=%.6f std=%.6f [0,0,0,:3]=%.6f,%.6f,%.6f\n",
+                q_f.mean().item<float>(), q_f.std().item<float>(),
+                q_f[0][0][0][0].item<float>(), q_f[0][0][0][1].item<float>(), q_f[0][0][0][2].item<float>());
+        fprintf(stderr, "[diag-la] after_split k: mean=%.6f std=%.6f [0,0,0,:3]=%.6f,%.6f,%.6f\n",
+                k_f.mean().item<float>(), k_f.std().item<float>(),
+                k_f[0][0][0][0].item<float>(), k_f[0][0][0][1].item<float>(), k_f[0][0][0][2].item<float>());
+        fprintf(stderr, "[diag-la] after_split v: mean=%.6f std=%.6f [0,0,0,:3]=%.6f,%.6f,%.6f\n",
+                v_f.mean().item<float>(), v_f.std().item<float>(),
+                v_f[0][0][0][0].item<float>(), v_f[0][0][0][1].item<float>(), v_f[0][0][0][2].item<float>());
+    }
 
     auto a = at::matmul(hidden, in_proj_a.t());
     auto b = at::matmul(hidden, in_proj_b.t());
@@ -1516,6 +1555,26 @@ static at::Tensor linear_attention_batched(
     // L2 normalize Q, K (per-head, matching HF)
     q = (q.to(at::kFloat) / q.to(at::kFloat).norm(2, -1, true).clamp_min(1e-6));
     k = (k.to(at::kFloat) / k.to(at::kFloat).norm(2, -1, true).clamp_min(1e-6));
+
+    // DIAG: dump after L2 norm
+    if (getenv("QWEN36_DUMP_LAYERS") && layer_idx == 0) {
+        auto q_f = q.to(at::kFloat);
+        auto k_f = k.to(at::kFloat);
+        fprintf(stderr, "[diag-la] after_l2norm q: mean=%.6f std=%.6f [0,0,0,:3]=%.6f,%.6f,%.6f\n",
+                q_f.mean().item<float>(), q_f.std().item<float>(),
+                q_f[0][0][0][0].item<float>(), q_f[0][0][0][1].item<float>(), q_f[0][0][0][2].item<float>());
+        fprintf(stderr, "[diag-la] after_l2norm k: mean=%.6f std=%.6f [0,0,0,:3]=%.6f,%.6f,%.6f\n",
+                k_f.mean().item<float>(), k_f.std().item<float>(),
+                k_f[0][0][0][0].item<float>(), k_f[0][0][0][1].item<float>(), k_f[0][0][0][2].item<float>());
+        auto g_f = g.to(at::kFloat);
+        fprintf(stderr, "[diag-la] g: mean=%.6f std=%.6f [0,0,:3]=%.6f,%.6f,%.6f\n",
+                g_f.mean().item<float>(), g_f.std().item<float>(),
+                g_f[0][0][0].item<float>(), g_f[0][0][1].item<float>(), g_f[0][0][2].item<float>());
+        auto beta_f = beta.to(at::kFloat);
+        fprintf(stderr, "[diag-la] beta: mean=%.6f std=%.6f [0,0,:3]=%.6f,%.6f,%.6f\n",
+                beta_f.mean().item<float>(), beta_f.std().item<float>(),
+                beta_f[0][0][0].item<float>(), beta_f[0][0][1].item<float>(), beta_f[0][0][2].item<float>());
+    }
 
     double scale = 1.0 / std::sqrt((double)head_k_dim);
     q = q * scale;
@@ -1576,12 +1635,29 @@ static at::Tensor linear_attention_batched(
 
     auto core_out = outs.reshape({batch, num_v_heads, seq, head_v_dim})
                          .transpose(1, 2).to(compute_type);
+
+    // DIAG: dump after delta rule
+    if (getenv("QWEN36_DUMP_LAYERS") && layer_idx == 0) {
+        auto co_f = core_out.to(at::kFloat);
+        fprintf(stderr, "[diag-la] after_delta_rule: mean=%.6f std=%.6f [0,0,0,:3]=%.6f,%.6f,%.6f\n",
+                co_f.mean().item<float>(), co_f.std().item<float>(),
+                co_f[0][0][0][0].item<float>(), co_f[0][0][0][1].item<float>(), co_f[0][0][0][2].item<float>());
+    }
+
     auto core_flat = core_out.reshape({-1, head_v_dim});
     auto z_flat = z.reshape({-1, head_v_dim});
     auto variance = core_flat.to(at::kFloat).pow(2).mean(-1, true);
     auto normed = (core_flat.to(at::kFloat) * (variance + rms_eps).rsqrt() * norm_w.to(at::kFloat)).to(core_flat.scalar_type());
     auto gated = (normed * at::silu(z_flat.to(at::kFloat)).to(normed.scalar_type())).reshape({batch, seq, num_v_heads * head_v_dim});
     auto result = at::matmul(gated, out_proj.t());
+
+    // DIAG: dump after norm+gate+out_proj
+    if (getenv("QWEN36_DUMP_LAYERS") && layer_idx == 0) {
+        auto r_f = result.to(at::kFloat);
+        fprintf(stderr, "[diag-la] after_out_proj: mean=%.6f std=%.6f [0,0,:3]=%.6f,%.6f,%.6f\n",
+                r_f.mean().item<float>(), r_f.std().item<float>(),
+                r_f[0][0][0].item<float>(), r_f[0][0][1].item<float>(), r_f[0][0][2].item<float>());
+    }
 
     // out_proj LoRA delta: result += B@(A@gated) * scaling
     auto it_op = ctx->lora_batch_cache.find(layer_idx * 10 + 2);
