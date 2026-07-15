@@ -2316,6 +2316,24 @@ static at::Tensor compute_loss(
         auto chunk_targets = shifted_targets.narrow(0, start, n);
         auto chunk_mask = shifted_mask.narrow(0, start, n);
 
+        // Diagnostic: print logits stats for first chunk, first token
+        if (c == 0 && getenv("QWEN36_LOSS_DIAG")) {
+            auto logits_f = chunk_logits[0].to(at::kFloat);
+            auto lsm = at::log_softmax(logits_f, -1);
+            int64_t tgt = chunk_targets[0].item<int64_t>();
+            fprintf(stderr, "[diag] logits shape: [%ld, %ld]\n", (long)n, (long)chunk_logits.size(1));
+            fprintf(stderr, "[diag] logits[0,:5]: %.6f %.6f %.6f %.6f %.6f\n",
+                    logits_f[0].item<float>(), logits_f[1].item<float>(),
+                    logits_f[2].item<float>(), logits_f[3].item<float>(),
+                    logits_f[4].item<float>());
+            fprintf(stderr, "[diag] logits mean: %.6f, std: %.6f\n",
+                    logits_f.mean().item<float>(), logits_f.std().item<float>());
+            fprintf(stderr, "[diag] target token: %ld\n", (long)tgt);
+            fprintf(stderr, "[diag] target logit: %.6f\n", logits_f[tgt].item<float>());
+            fprintf(stderr, "[diag] log_softmax[target]: %.6f\n", lsm[tgt].item<float>());
+            fprintf(stderr, "[diag] -log_softmax[target] (per-token loss): %.6f\n", -lsm[tgt].item<float>());
+        }
+
         auto per_token_loss = at::cross_entropy_loss(
             chunk_logits.to(at::kFloat), chunk_targets,
             at::Tensor(), at::Reduction::None, -100, 0.0
