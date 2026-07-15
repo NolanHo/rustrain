@@ -1474,11 +1474,12 @@ static at::Tensor linear_attention_batched(
     auto qkv_conv = conv_out.transpose(1, 2);
 
     // Per-head QKV split (matches transformers fix_query_key_value_ordering)
-    // in_proj_qkv output layout: [head0: Q(hk) K(hk) V(hv*v/k) | head1: ... | ... × num_k_heads]
-    int64_t head_k_dim = key_dim / num_k_heads;   // 256
-    int64_t head_v_dim = val_dim / num_v_heads;   // 256
-    int64_t v_per_k = num_v_heads / num_k_heads;  // 2
-    int64_t per_head = head_k_dim + head_k_dim + head_v_dim * v_per_k;  // 1024
+    // key_dim and val_dim are ALREADY per-head (128 each), not total.
+    // Total: q_total = num_k_heads * key_dim = 2048, v_total = num_v_heads * val_dim = 4096
+    int64_t head_k_dim = key_dim;                        // 128 (already per-head)
+    int64_t head_v_dim = val_dim;                        // 128 (already per-head)
+    int64_t v_per_k = num_v_heads / num_k_heads;          // 2
+    int64_t per_head = head_k_dim + head_k_dim + head_v_dim * v_per_k;  // 128+128+256 = 512
     // Reshape: [batch, seq, num_k_heads, per_head]
     auto qkv_reshaped = qkv_conv.view({batch, seq, num_k_heads, per_head});
     auto q = qkv_reshaped.narrow(-1, 0, head_k_dim);                        // [b, s, nk, hk]
