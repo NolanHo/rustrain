@@ -111,12 +111,16 @@ int main() {
         std::getenv("LOCAL_RANK") ? std::getenv("LOCAL_RANK") : "0");
     const int a2a = std::getenv("QWEN36_EP_A2A") &&
         std::strcmp(std::getenv("QWEN36_EP_A2A"), "0") != 0;
-    // Variable-split A2A receives replicated source rows in rank order. The
-    // resulting BF16 GEMM/accumulation order is not bit-identical to the
-    // single-rank full-expert reference, while the Adam update oracle remains
-    // exact. Keep the legacy parity threshold strict and bound A2A drift.
-    const double param_tol = a2a ? 2e-4 : 1e-5;
-    const double m_tol = a2a ? 5e-3 : 1e-5;
+    const int sharded = a2a && std::getenv("QWEN36_EP_A2A_SHARDED") &&
+        std::strcmp(std::getenv("QWEN36_EP_A2A_SHARDED"), "0") != 0;
+    // Replicated A2A receives duplicate source rows in rank order, so its BF16
+    // accumulation is not bit-identical to the full-expert reference. Sharded
+    // A2A uses distinct rows; its optimizer state matches closely, while a
+    // near-boundary update can land in the adjacent BF16 parameter bin. Keep
+    // the legacy threshold strict, bound each BF16 case separately, and retain
+    // the exact standard-Adam oracle below for all modes.
+    const double param_tol = sharded ? 2e-3 : (a2a ? 2e-4 : 1e-5);
+    const double m_tol = sharded ? 5e-4 : (a2a ? 5e-3 : 1e-5);
     const double v_tol = a2a ? 1e-5 : 1e-6;
     assert(world == 2 && rank >= 0 && rank < world);
     assert(!std::getenv("TP_SIZE") || std::atoi(std::getenv("TP_SIZE")) == 1);
@@ -268,17 +272,47 @@ int main() {
     // qwen36_init_nccl mutates only the distributed context's copied configs.
     assert(qwen36_init_nccl(distributed_ctx) == 0);
 
-    auto input_ids = at::tensor({1, 2, 3},
-        at::TensorOptions().device(at::kCUDA).dtype(at::kLong)).reshape({1, 3});
-    auto target_mask = at::ones({1, 3},
-        at::TensorOptions().device(at::kCUDA).dtype(at::kFloat));
-    auto attention_mask = at::ones({1, 3},
-        at::TensorOptions().device(at::kCUDA).dtype(at::kBool));
+    at::Tensor input_ids;
+    at::Tensor target_mask;
+    at::Tensor attention_mask;
+    at::Tensor reference_input_ids;
+    at::Tensor reference_target_mask;
+    at::Tensor reference_attention_mask;
+    auto long_opts = at::TensorOptions().device(at::kCUDA).dtype(at::kLong);
+    auto float_opts = at::TensorOptions().device(at::kCUDA).dtype(at::kFloat);
+    auto bool_opts = at::TensorOptions().device(at::kCUDA).dtype(at::kBool);
+    if (sharded) {
+        // Deliberately unequal supervised-token counts: rank 0 contributes one
+        // response token, rank 1 contributes three. The reference evaluates
+        // the deterministic global batch on a no-NCCL full-expert context.
+        input_ids = rank == 0
+            ? at::tensor({1, 2, 3, 4}, long_opts).reshape({1, 4})
+            : at::tensor({4, 5, 6, 7}, long_opts).reshape({1, 4});
+        target_mask = rank == 0
+            ? at::tensor({0, 1, 0, 0}, float_opts).reshape({1, 4})
+            : at::tensor({0, 1, 1, 1}, float_opts).reshape({1, 4});
+        attention_mask = at::ones({1, 4}, bool_opts);
+        reference_input_ids = at::cat({
+            at::tensor({1, 2, 3, 4}, long_opts).reshape({1, 4}),
+            at::tensor({4, 5, 6, 7}, long_opts).reshape({1, 4})}, 0);
+        reference_target_mask = at::cat({
+            at::tensor({0, 1, 0, 0}, float_opts).reshape({1, 4}),
+            at::tensor({0, 1, 1, 1}, float_opts).reshape({1, 4})}, 0);
+        reference_attention_mask = at::ones({2, 4}, bool_opts);
+    } else {
+        input_ids = at::tensor({1, 2, 3}, long_opts).reshape({1, 3});
+        target_mask = at::ones({1, 3}, float_opts);
+        attention_mask = at::ones({1, 3}, bool_opts);
+        reference_input_ids = input_ids;
+        reference_target_mask = target_mask;
+        reference_attention_mask = attention_mask;
+    }
 
     const double distributed_loss = qwen36_train_step(
         distributed_ctx, &input_ids, &target_mask, &attention_mask);
     const double reference_loss = qwen36_train_step(
-        reference_ctx, &input_ids, &target_mask, &attention_mask);
+        reference_ctx, &reference_input_ids, &reference_target_mask,
+        &reference_attention_mask);
     c10::cuda::device_synchronize();
     assert(distributed_loss > 0.0 && std::isfinite(distributed_loss));
     assert(reference_loss > 0.0 && std::isfinite(reference_loss));
@@ -294,7 +328,11 @@ int main() {
         *distributed_lora.down_a, reference_slice(*reference_lora.down_a));
     const double down_b_diff = max_abs_diff(
         *distributed_lora.down_b, reference_slice(*reference_lora.down_b));
-    const double loss_diff = std::abs(distributed_loss - reference_loss);
+    // qwen36_train_step returns each rank's local mean in sharded mode; the
+    // global weighted scalar is intentionally compared through parameter/state
+    // parity below rather than against the full-batch reference scalar.
+    const double loss_diff = sharded ? -1.0 :
+        std::abs(distributed_loss - reference_loss);
 
     const double gate_up_a_update = update_norm(
         *distributed_lora.gate_up_a, gate_up_a_before);
@@ -345,14 +383,17 @@ int main() {
         *reinterpret_cast<at::Tensor*>(distributed_v[17]));
 
     std::printf(
-        "native_qwen36_ep_parity rank=%d world=%d top_k=2 a2a=%d "
+        "native_qwen36_ep_parity rank=%d world=%d top_k=2 a2a=%d sharded=%d "
+        "loss_compare=%s local_tokens=%d "
         "distributed_loss=%0.8f reference_loss=%0.8f loss_diff=%0.8e "
         "gate_up_a_diff=%0.8e gate_up_b_diff=%0.8e "
         "down_a_diff=%0.8e down_b_diff=%0.8e "
         "adam_m_diff=%0.8e adam_v_diff=%0.8e "
         "adam_step_diffs=[%0.8e,%0.8e,%0.8e,%0.8e] "
         "updates=[%0.8e,%0.8e,%0.8e,%0.8e]\n",
-        rank, world, a2a, distributed_loss, reference_loss, loss_diff,
+        rank, world, a2a, sharded, sharded ? "skipped" : "direct",
+        sharded ? (rank == 0 ? 1 : 3) : 2,
+        distributed_loss, reference_loss, loss_diff,
         gate_up_a_diff, gate_up_b_diff, down_a_diff, down_b_diff,
         optimizer_m_diff, optimizer_v_diff,
         gate_up_a_adam_diff, gate_up_b_adam_diff,
@@ -364,7 +405,7 @@ int main() {
     assert(gate_up_b_update > 0.0);
     assert(down_a_update > 0.0);
     assert(down_b_update > 0.0);
-    assert(loss_diff <= 2e-2);
+    assert(sharded || loss_diff <= 2e-2);
     assert(gate_up_a_diff <= param_tol);
     assert(gate_up_b_diff <= param_tol);
     assert(down_a_diff <= param_tol);

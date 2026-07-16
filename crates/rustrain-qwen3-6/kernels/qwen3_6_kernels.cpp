@@ -1301,6 +1301,11 @@ static at::Tensor moe_forward(
     topk_weights = topk_weights.to(compute_type);
 
     auto routed_output = at::zeros(flat.sizes(), flat.options());
+    if (env_enabled("QWEN36_EP_A2A_SHARDED") && expert_count < num_experts) {
+        TORCH_CHECK(nccl_comm_v && env_enabled("QWEN36_EP_A2A"),
+            "QWEN36_EP_A2A_SHARDED=1 requires an initialized EP communicator "
+            "and QWEN36_EP_A2A=1");
+    }
     bool use_a2a = false;
     if (nccl_comm_v && env_enabled("QWEN36_EP_A2A") &&
         !expert_gate_up_lora && !expert_down_lora) {
@@ -2212,19 +2217,28 @@ static void reduce_lora_accumulator_weighted(
     accumulator.copy_(reduced);
 }
 
-// Every rank evaluates the complete loss. Average replicated LoRA gradients
-// across DP ranks with token-count weighting so their Adam update matches a
-// single global batch. Pure DP keeps the complete routed-expert tensors
-// replicated, so those accumulators reduce too; EP ranks receive the complete
-// routed activation in forward and keep their sharded expert gradients local.
+// Fixed-LoRA gradients are accumulated as token-weighted numerators. Replicated
+// DP sums all replicated parameters and divides by the global token count;
+// legacy EP keeps its replicated batch/local expert semantics. Sharded A2A
+// sums non-expert parameters across source ranks, while expert parameters have
+// already received all source numerators through the inverse A2A and therefore
+// only divide by the global token count.
 static void synchronize_lora_gradients(
     TrainingContext* ctx, const at::Tensor& target_mask,
     double accumulated_token_weight = 0.0,
     const at::Tensor* per_adapter_token_counts = nullptr
 ) {
-    const bool allreduce = ctx->nccl_comm && ctx->data_parallel;
+    const bool sharded_a2a = ctx->nccl_comm && !ctx->data_parallel &&
+        env_enabled("QWEN36_EP_A2A_SHARDED");
+    TORCH_CHECK(!sharded_a2a || env_enabled("QWEN36_EP_A2A"),
+        "QWEN36_EP_A2A_SHARDED=1 requires QWEN36_EP_A2A=1");
+    const bool dp_allreduce = ctx->nccl_comm && ctx->data_parallel;
+    const bool normalization_allreduce = dp_allreduce || sharded_a2a;
     const bool per_adapter_weighting = per_adapter_token_counts &&
         per_adapter_token_counts->defined();
+    TORCH_CHECK(!sharded_a2a || !per_adapter_weighting,
+        "dynamic multi-LoRA is not supported with sharded EP A2A; "
+        "source tenant metadata is not implemented");
     at::Tensor local_adapter_weights;
     at::Tensor global_adapter_weights;
     double scale = 1.0;
@@ -2239,7 +2253,7 @@ static void synchronize_lora_gradients(
             "dynamic LoRA token counts must be finite");
         TORCH_CHECK((local_adapter_weights >= 0).all().item<bool>(),
             "dynamic LoRA token counts must be non-negative");
-        if (allreduce) {
+        if (dp_allreduce) {
             global_adapter_weights = at::empty_like(local_adapter_weights);
             auto stream = c10::cuda::getCurrentCUDAStream(
                 local_adapter_weights.device().index()).stream();
@@ -2258,7 +2272,7 @@ static void synchronize_lora_gradients(
             "every dynamic LoRA adapter must have at least one global target token");
     } else if (accumulated_token_weight > 0.0) {
         double global_weight = accumulated_token_weight;
-        if (allreduce) {
+        if (normalization_allreduce) {
             auto local = at::full({1}, accumulated_token_weight,
                 at::TensorOptions().dtype(at::kFloat).device(target_mask.device()));
             auto global = at::empty_like(local);
@@ -2277,7 +2291,7 @@ static void synchronize_lora_gradients(
         // Dynamic multi-LoRA currently contributes one independently-normalized
         // row per tenant. Preserve that contract while weighting replicated DP
         // ranks by the selected batch's token count.
-        if (!allreduce) return;
+        if (!dp_allreduce) return;
         auto shifted_mask = target_mask.narrow(1, 1, target_mask.size(1) - 1)
             .to(at::kFloat).sum().reshape({1});
         auto global_mask = at::empty_like(shifted_mask);
@@ -2309,10 +2323,10 @@ static void synchronize_lora_gradients(
                         {static_cast<int64_t>(adapter_index)});
                     reduce_lora_accumulator_weighted(
                         ctx, accum_it->second[pair][0], local_weight,
-                        global_weight, allreduce);
+                        global_weight, dp_allreduce);
                     reduce_lora_accumulator_weighted(
                         ctx, accum_it->second[pair][1], local_weight,
-                        global_weight, allreduce);
+                        global_weight, dp_allreduce);
                     continue;
                 }
                 // Routed-expert tensors are sharded only in EP. Pure DP has
@@ -2322,16 +2336,16 @@ static void synchronize_lora_gradients(
                 if (table.entries[pair].grouped_expert) {
                     if (accumulated_token_weight > 0.0) {
                         reduce_lora_accumulator(
-                            ctx, accum_it->second[pair][0], scale, allreduce);
+                            ctx, accum_it->second[pair][0], scale, dp_allreduce);
                         reduce_lora_accumulator(
-                            ctx, accum_it->second[pair][1], scale, allreduce);
+                            ctx, accum_it->second[pair][1], scale, dp_allreduce);
                     }
                     continue;
                 }
                 reduce_lora_accumulator(
-                    ctx, accum_it->second[pair][0], scale, allreduce);
+                    ctx, accum_it->second[pair][0], scale, dp_allreduce);
                 reduce_lora_accumulator(
-                    ctx, accum_it->second[pair][1], scale, allreduce);
+                    ctx, accum_it->second[pair][1], scale, dp_allreduce);
             }
         }
     }
@@ -2344,8 +2358,8 @@ static void synchronize_lora_gradients(
     // shards will require global-token weighting before this gate can become
     // the default dispatcher.
     const double replicated_a2a_expert_scale =
-        env_enabled("QWEN36_EP_A2A") && !ctx->data_parallel &&
-            ctx->ep_world_size > 1
+        ctx->nccl_comm && env_enabled("QWEN36_EP_A2A") && !sharded_a2a &&
+            !ctx->data_parallel && ctx->ep_world_size > 1
         ? 1.0 / static_cast<double>(ctx->ep_world_size)
         : 1.0;
     for (int64_t layer = 0; layer < ctx->num_layers; ++layer) {
@@ -2358,17 +2372,19 @@ static void synchronize_lora_gradients(
                 if (accumulated_token_weight > 0.0) {
                     reduce_lora_accumulator(
                         ctx, ctx->grad_accum_a[offset + pair],
-                        scale * replicated_a2a_expert_scale, allreduce);
+                        scale * replicated_a2a_expert_scale, dp_allreduce);
                     reduce_lora_accumulator(
                         ctx, ctx->grad_accum_b[offset + pair],
-                        scale * replicated_a2a_expert_scale, allreduce);
+                        scale * replicated_a2a_expert_scale, dp_allreduce);
                 }
                 continue;
             }
             reduce_lora_accumulator(
-                ctx, ctx->grad_accum_a[offset + pair], scale, allreduce);
+                ctx, ctx->grad_accum_a[offset + pair], scale,
+                dp_allreduce || sharded_a2a);
             reduce_lora_accumulator(
-                ctx, ctx->grad_accum_b[offset + pair], scale, allreduce);
+                ctx, ctx->grad_accum_b[offset + pair], scale,
+                dp_allreduce || sharded_a2a);
         }
     }
 }
@@ -4852,6 +4868,9 @@ __attribute__((visibility("default"))) double qwen36_train_multi_lora(
         auto* ctx = reinterpret_cast<TrainingContext*>(ctx_ptr);
         TORCH_CHECK(!ctx->topology_invalid,
             "native Qwen context rejected an incompatible TP/DP/EP topology");
+        TORCH_CHECK(!env_enabled("QWEN36_EP_A2A_SHARDED"),
+            "dynamic multi-LoRA is not supported with sharded EP A2A; "
+            "source tenant metadata is not implemented");
         GradientAccumulationFailureGuard accumulation_guard{ctx};
         if (ctx->nccl_comm) {
             c10::cuda::set_device(ctx->cuda_device);

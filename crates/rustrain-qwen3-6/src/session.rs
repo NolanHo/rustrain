@@ -249,6 +249,19 @@ fn train_impl(
 
     let shard_ref = ep_shard.as_ref();
     let is_ep = shard_ref.is_some();
+    let env_enabled = |name: &str| {
+        std::env::var(name)
+            .map(|value| !value.is_empty() && value != "0")
+            .unwrap_or(false)
+    };
+    let ep_a2a = env_enabled("QWEN36_EP_A2A");
+    let ep_a2a_sharded = env_enabled("QWEN36_EP_A2A_SHARDED");
+    if ep_a2a_sharded && !is_ep {
+        bail!("QWEN36_EP_A2A_SHARDED=1 requires expert-parallel training");
+    }
+    if ep_a2a_sharded && !ep_a2a {
+        bail!("QWEN36_EP_A2A_SHARDED=1 requires QWEN36_EP_A2A=1");
+    }
     // Non-EP Qwen sessions may run replicated-weight LoRA data parallelism.
     // The launcher supplies the standard torchrun environment; EP keeps its
     // explicit shard metadata as the source of truth.
@@ -472,7 +485,7 @@ fn train_impl(
         let mut loss_value = 0.0;
         for accumulation_index in 0..gradient_accumulation_steps {
             let micro_step = step * gradient_accumulation_steps + accumulation_index;
-            let data_start = if is_data_parallel {
+            let data_start = if is_data_parallel || ep_a2a_sharded {
                 (micro_step * batch_size * world_size + rank * batch_size) % data.len()
             } else {
                 (micro_step * batch_size) % data.len()
