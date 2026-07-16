@@ -1527,6 +1527,7 @@ struct TrainingContext {
     cudaStream_t nccl_stream = nullptr;
     int ep_world_size = 1;
     int ep_rank = 0;
+    bool data_parallel = false;
     int cuda_device = 0;
 // ──────────────────────────────────────────────────────────────────────
 };
@@ -1581,10 +1582,15 @@ static ncclDataType_t nccl_dtype_for(const at::Tensor& tensor) {
     }
 }
 
-static void allreduce_lora_grad(TrainingContext* ctx, at::Tensor& param) {
+static void allreduce_lora_grad(
+    TrainingContext* ctx, at::Tensor& param, double local_token_scale
+) {
     auto grad = param.grad();
     if (!ctx->nccl_comm || !grad.defined()) return;
     auto contiguous = grad.contiguous();
+    if (local_token_scale != 1.0) {
+        contiguous = contiguous * local_token_scale;
+    }
     auto reduced = at::empty_like(contiguous);
     int dev = contiguous.device().index();
     cudaSetDevice(dev);
@@ -1597,11 +1603,28 @@ static void allreduce_lora_grad(TrainingContext* ctx, at::Tensor& param) {
     param.mutable_grad() = reduced;
 }
 
-// EP's routed expert output is summed across ranks in forward. The resulting
-// upstream gradient must likewise be summed before replicated LoRA Adam steps;
-// otherwise each rank updates attention/linear adapters from only its shard.
-static void synchronize_lora_gradients(TrainingContext* ctx) {
-    if (!ctx->nccl_comm) return;
+// Every rank evaluates the complete loss. Average replicated LoRA gradients
+// across DP ranks with token-count weighting so their Adam update matches a
+// single global batch. EP ranks already receive the complete routed activation
+// in forward and keep replicated gradients local; routed expert adapters remain
+// local because their parameter tensors are sharded.
+static void synchronize_lora_gradients(
+    TrainingContext* ctx, const at::Tensor& target_mask
+) {
+    if (!ctx->nccl_comm || !ctx->data_parallel) return;
+    auto shifted_mask = target_mask.narrow(1, 1, target_mask.size(1) - 1)
+        .to(at::kFloat).sum().reshape({1});
+    auto global_mask = at::empty_like(shifted_mask);
+    auto stream = c10::cuda::getCurrentCUDAStream(
+        shifted_mask.device().index()).stream();
+    auto err = ncclAllReduce(
+        shifted_mask.data_ptr(), global_mask.data_ptr(), 1,
+        ncclFloat, ncclSum, ctx->nccl_comm, stream);
+    TORCH_CHECK(err == ncclSuccess, "NCCL token-count all-reduce failed: ",
+                ncclGetErrorString(err));
+    const double local_tokens = shifted_mask.item<double>();
+    const double global_tokens = global_mask.item<double>();
+    const double token_scale = local_tokens / std::max(global_tokens, 1.0);
     for (auto& adapter : ctx->adapters) {
         for (auto& [layer_idx, pairs] : adapter.params) {
             auto table = lora_projection_table(ctx->layer_configs[layer_idx]);
@@ -1610,8 +1633,8 @@ static void synchronize_lora_gradients(TrainingContext* ctx) {
                 // base experts; only replicated adapter tensors are reduced.
                 if (table.entries[pair].grouped_expert) continue;
                 auto& [a, b] = pairs[pair];
-                allreduce_lora_grad(ctx, a);
-                allreduce_lora_grad(ctx, b);
+                allreduce_lora_grad(ctx, a, token_scale);
+                allreduce_lora_grad(ctx, b, token_scale);
             }
         }
     }
@@ -1623,8 +1646,8 @@ static void synchronize_lora_gradients(TrainingContext* ctx) {
             // local gradients belong only to this EP rank and must not be
             // summed with a different expert shard on another rank.
             if (table.entries[pair].grouped_expert) continue;
-            allreduce_lora_grad(ctx, ctx->lora_a[offset + pair]);
-            allreduce_lora_grad(ctx, ctx->lora_b[offset + pair]);
+            allreduce_lora_grad(ctx, ctx->lora_a[offset + pair], token_scale);
+            allreduce_lora_grad(ctx, ctx->lora_b[offset + pair], token_scale);
         }
     }
 }
@@ -3205,7 +3228,8 @@ static LossResult compute_loss(
     const at::Tensor& hidden,
     const at::Tensor& input_ids,
     const at::Tensor& target_mask,
-    int64_t vocab_size
+    int64_t vocab_size,
+    bool independent_samples = false
 ) {
     auto final_norm = *ctx->final_norm_ptr[0];
     auto lm_head = *ctx->lm_head_ptr[0];
@@ -3236,6 +3260,13 @@ static LossResult compute_loss(
     int64_t num_chunks = (total_tokens + chunk_size - 1) / chunk_size;
 
     auto total_count = shifted_mask.sum().clamp_min(1.0);
+    at::Tensor token_denominators;
+    if (independent_samples) {
+        auto per_sample_count = target_mask.narrow(1, 1, seq_len - 1)
+            .sum(1, true).clamp_min(1.0);
+        token_denominators = per_sample_count
+            .expand({target_mask.size(0), seq_len - 1}).reshape({-1});
+    }
     auto hidden_flat = shifted_hidden.reshape({-1, hidden_normed.size(2)});
 
     double total_loss_val = 0.0;
@@ -3276,7 +3307,9 @@ static LossResult compute_loss(
         // Normalize every chunk by the global response-token count. Backward
         // must match the mean returned to the caller, independent of sequence
         // length or chunk boundaries.
-        auto chunk_loss = masked_loss.sum() / total_count;
+        auto chunk_loss = independent_samples
+            ? (masked_loss / token_denominators.narrow(0, start, n)).sum()
+            : masked_loss.sum() / total_count;
 
         // Backward this chunk — each chunk creates an independent CE subgraph
         // because hidden_normed is a leaf tensor. retain_graph=false is safe
@@ -3361,7 +3394,8 @@ static at::Tensor mtp_compute_loss(
     TrainingContext* ctx,
     const at::Tensor& mtp_hidden,
     const at::Tensor& input_ids,
-    const at::Tensor& target_mask
+    const at::Tensor& target_mask,
+    bool independent_samples = false
 ) {
     int64_t vocab_size = ctx->vocab_size;
     int64_t seq_len = input_ids.size(1);
@@ -3380,6 +3414,13 @@ static at::Tensor mtp_compute_loss(
 
     auto total_loss = at::zeros({1}, at::TensorOptions().dtype(at::kFloat).device(mtp_hidden.device()));
     auto total_count = shifted_mask.sum().clamp_min(1.0);
+    at::Tensor token_denominators;
+    if (independent_samples) {
+        auto per_sample_count = target_mask.narrow(1, 2, n_tokens)
+            .sum(1, true).clamp_min(1.0);
+        token_denominators = per_sample_count
+            .expand({target_mask.size(0), n_tokens}).reshape({-1});
+    }
 
     for (int64_t c = 0; c < num_chunks; c++) {
         int64_t start = c * chunk_size;
@@ -3399,10 +3440,13 @@ static at::Tensor mtp_compute_loss(
         auto masked_loss = per_token_loss * chunk_mask.to(at::kFloat);
         // Avoid in-place accumulation into a non-grad leaf: out-of-place add
         // keeps the MTP loss connected to the frozen-head input graph.
-        total_loss = total_loss + masked_loss.sum();
+        total_loss = total_loss + (independent_samples
+            ? (masked_loss / token_denominators.narrow(0, start, n)).sum()
+            : masked_loss.sum());
     }
 
-    return (total_loss / total_count) * ctx->mtp_loss_scale;
+    if (!independent_samples) total_loss = total_loss / total_count;
+    return total_loss * ctx->mtp_loss_scale;
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -3412,7 +3456,7 @@ static at::Tensor mtp_compute_loss(
 extern "C" {
 
 __attribute__((visibility("default"))) int64_t qwen36_kernel_abi_version() {
-    return 6;
+    return 7;
 }
 
 // Create training context — called once at startup
@@ -3612,16 +3656,20 @@ __attribute__((visibility("default"))) void qwen36_set_mtp_weights(
         (long)num_mtp_layers, (long)num_mtp_layer_weights);
 }
 
-// Single training step: forward + loss + backward + Adam update
-// Returns loss value, or -1 on error.
-__attribute__((visibility("default"))) double qwen36_train_step(
+// One training micro-step. Non-final micro-steps accumulate scaled leaf
+// gradients; only the final micro-step synchronizes and updates parameters.
+__attribute__((visibility("default"))) double qwen36_train_micro_step(
     void* ctx_ptr,
     void* input_ids_ptr,
     void* target_mask_ptr,
-    void* attention_mask_ptr
+    void* attention_mask_ptr,
+    double gradient_scale,
+    int32_t apply_optimizer
 ) {
     try {
         auto* ctx = reinterpret_cast<TrainingContext*>(ctx_ptr);
+        TORCH_CHECK(gradient_scale > 0.0 && std::isfinite(gradient_scale),
+            "gradient_scale must be finite and positive");
         // Set CUDA device for EP
         if (ctx->nccl_comm) {
             c10::cuda::set_device(ctx->cuda_device);
@@ -3669,6 +3717,10 @@ __attribute__((visibility("default"))) double qwen36_train_step(
             loss_val += mtp_loss.item<double>();
         }
 
+        if (gradient_scale != 1.0) {
+            total_hidden_grad.mul_(gradient_scale);
+        }
+
         // Trigger exactly one main-model backward with the combined hidden
         // gradient. Manual groups are the non-autograd checkpoint fallback;
         // normal and sub-checkpoint paths use the real graph.
@@ -3678,9 +3730,13 @@ __attribute__((visibility("default"))) double qwen36_train_step(
             hidden.backward(total_hidden_grad);
         }
 
+        if (!apply_optimizer) {
+            return loss_val;
+        }
+
         // EP produces a summed routed output, so synchronize replicated LoRA
         // gradients before every rank performs its local Adam update.
-        synchronize_lora_gradients(ctx);
+        synchronize_lora_gradients(ctx, target_mask);
 
         // ── Adam optimizer step — CUDA multi-tensor fused kernel ──
         at::AutoGradMode guard(false);
@@ -3796,6 +3852,17 @@ __attribute__((visibility("default"))) double qwen36_train_step(
         fprintf(stderr, "[q36] train_step FAILED: %s\n", e.what());
         return -1.0;
     }
+}
+
+// Backward-compatible complete optimizer step.
+__attribute__((visibility("default"))) double qwen36_train_step(
+    void* ctx_ptr,
+    void* input_ids_ptr,
+    void* target_mask_ptr,
+    void* attention_mask_ptr
+) {
+    return qwen36_train_micro_step(
+        ctx_ptr, input_ids_ptr, target_mask_ptr, attention_mask_ptr, 1.0, 1);
 }
 
 // Get LoRA A tensor pointer by index
@@ -3997,6 +4064,16 @@ __attribute__((visibility("default"))) double qwen36_train_multi_lora(
 
         double total_loss = 0.0;
         int64_t num_chunks = (total_adapters + n_max - 1) / n_max;
+        // Chunking is a memory scheduling detail, not an optimizer step. All
+        // adapters in this call must use the same Adam bias correction.
+        ctx->step_count++;
+        const double logical_step = (double)ctx->step_count;
+        const double bias_correction1 = 1.0 - std::pow(ctx->beta1, logical_step);
+        const double bias_correction2 = 1.0 - std::pow(ctx->beta2, logical_step);
+        const float lr_scaled = (float)(ctx->lr / bias_correction1);
+        const float eps_scaled = (float)(ctx->eps / std::sqrt(bias_correction2));
+        const float one_minus_b1 = (float)(1.0 - ctx->beta1);
+        const float one_minus_b2 = (float)(1.0 - ctx->beta2);
 
         for (int64_t chunk = 0; chunk < num_chunks; chunk++) {
             int64_t start = chunk * n_max;
@@ -4062,7 +4139,9 @@ __attribute__((visibility("default"))) double qwen36_train_multi_lora(
                 hidden = hidden.detach().set_requires_grad(true);
                 TORCH_CHECK(!env_enabled("QWEN36_FUSED_CE"),
                     "QWEN36_FUSED_CE is disabled until its tile gather and gradient normalization are validated");
-                auto loss = compute_loss(ctx, hidden, input_ref, mask_ref, ctx->vocab_size);
+                auto loss = compute_loss(
+                    ctx, hidden, input_ref, mask_ref, ctx->vocab_size,
+                    /*independent_samples=*/true);
                 loss_val = loss.value.item<double>();
                 hidden_grad = loss.hidden_grad;
             }
@@ -4074,7 +4153,9 @@ __attribute__((visibility("default"))) double qwen36_train_multi_lora(
             if (ctx->has_mtp && !env_enabled("QWEN36_DISABLE_MTP")) {
                 auto mtp_input = hidden.detach().set_requires_grad(true);
                 auto mtp_hidden = mtp_forward(ctx, mtp_input, input_ref);
-                auto mtp_loss = mtp_compute_loss(ctx, mtp_hidden, input_ref, mask_ref);
+                auto mtp_loss = mtp_compute_loss(
+                    ctx, mtp_hidden, input_ref, mask_ref,
+                    /*independent_samples=*/true);
                 mtp_loss.backward();
                 TORCH_CHECK(mtp_input.grad().defined(), "MTP did not produce a hidden gradient");
                 hidden_grad.add_(mtp_input.grad());
@@ -4095,87 +4176,80 @@ __attribute__((visibility("default"))) double qwen36_train_multi_lora(
             fprintf(stderr, "[train_multi] chunk %ld/%ld: n=%ld loss=%f  fwd=%.0fms loss=%.0fms bwd=%.0fms\n",
                     (long)(chunk+1), (long)num_chunks, (long)n, loss_val, fwd_ms, loss_ms, bwd_ms);
 
-            // EP gradient synchronization must happen before this chunk's
-            // replicated adapter parameters are updated.
-            synchronize_lora_gradients(ctx);
+            // Restore the complete registry before the next chunk. Gradients
+            // remain attached to the intrusive tensor handles, so all chunks
+            // can accumulate and the optimizer runs exactly once below.
+            ctx->adapters.swap(all_adapters);
 
-            // Adam step
-            at::AutoGradMode guard(false);
-            ctx->step_count++;
-            ctx->lora_cache_valid = false;
-            ctx->lora_batch_valid = false;
+            if (chunk == num_chunks - 1) {
+                // DP gradient synchronization and Adam belong to the logical
+                // multi-tenant step, never to an activation-memory chunk.
+                synchronize_lora_gradients(ctx, target_mask);
 
-            double step_f = (double)ctx->step_count;
-            double bias_correction1 = 1.0 - std::pow(ctx->beta1, step_f);
-            double bias_correction2 = 1.0 - std::pow(ctx->beta2, step_f);
-            float lr_scaled = (float)(ctx->lr / bias_correction1);
-            float eps_scaled = (float)(ctx->eps / std::sqrt(bias_correction2));
-            float one_minus_b1 = (float)(1.0 - ctx->beta1);
-            float one_minus_b2 = (float)(1.0 - ctx->beta2);
+                // Adam step
+                at::AutoGradMode guard(false);
+                ctx->lora_cache_valid = false;
+                ctx->lora_batch_valid = false;
 
-            std::vector<void*> h_params, h_grads;
-            std::vector<float*> h_m, h_v;
-            std::vector<int> h_sizes;
+                std::vector<void*> h_params, h_grads;
+                std::vector<float*> h_m, h_v;
+                std::vector<int> h_sizes;
 
-            for (auto& adapter : ctx->adapters) {
-                for (auto& [layer_idx, pairs] : adapter.params) {
-                    auto& adam_states = adapter.adam_state[layer_idx];
-                    for (size_t i = 0; i < pairs.size(); i++) {
-                        auto& [a, b] = pairs[i];
-                        auto& [m_a, v_a, m_b, v_b] = adam_states[i];
-                        if (a.grad().defined() && a.scalar_type() == at::kBFloat16) {
-                            h_params.push_back(a.data_ptr());
-                            h_grads.push_back(a.grad().data_ptr());
-                            h_m.push_back((float*)m_a.data_ptr());
-                            h_v.push_back((float*)v_a.data_ptr());
-                            h_sizes.push_back((int)a.numel());
-                        }
-                        if (b.grad().defined() && b.scalar_type() == at::kBFloat16) {
-                            h_params.push_back(b.data_ptr());
-                            h_grads.push_back(b.grad().data_ptr());
-                            h_m.push_back((float*)m_b.data_ptr());
-                            h_v.push_back((float*)v_b.data_ptr());
-                            h_sizes.push_back((int)b.numel());
+                for (auto& adapter : ctx->adapters) {
+                    for (auto& [layer_idx, pairs] : adapter.params) {
+                        auto& adam_states = adapter.adam_state[layer_idx];
+                        for (size_t i = 0; i < pairs.size(); i++) {
+                            auto& [a, b] = pairs[i];
+                            auto& [m_a, v_a, m_b, v_b] = adam_states[i];
+                            if (a.grad().defined() && a.scalar_type() == at::kBFloat16) {
+                                h_params.push_back(a.data_ptr());
+                                h_grads.push_back(a.grad().data_ptr());
+                                h_m.push_back((float*)m_a.data_ptr());
+                                h_v.push_back((float*)v_a.data_ptr());
+                                h_sizes.push_back((int)a.numel());
+                            }
+                            if (b.grad().defined() && b.scalar_type() == at::kBFloat16) {
+                                h_params.push_back(b.data_ptr());
+                                h_grads.push_back(b.grad().data_ptr());
+                                h_m.push_back((float*)m_b.data_ptr());
+                                h_v.push_back((float*)v_b.data_ptr());
+                                h_sizes.push_back((int)b.numel());
+                            }
                         }
                     }
                 }
+
+                if (!h_params.empty()) {
+                    int n_params = (int)h_params.size();
+                    auto opts_cpu_long = at::TensorOptions().dtype(at::kLong).device(at::kCPU);
+                    auto opts_cpu_int  = at::TensorOptions().dtype(at::kInt).device(at::kCPU);
+                    auto params_cpu = at::from_blob(h_params.data(), {n_params}, opts_cpu_long);
+                    auto grads_cpu  = at::from_blob(h_grads.data(),  {n_params}, opts_cpu_long);
+                    auto m_cpu      = at::from_blob(h_m.data(),      {n_params}, opts_cpu_long);
+                    auto v_cpu      = at::from_blob(h_v.data(),      {n_params}, opts_cpu_long);
+                    auto sizes_cpu  = at::from_blob(h_sizes.data(),  {n_params}, opts_cpu_int);
+                    ctx->adam_dev_bufs.ensure(n_params, ctx->adapters[0].params.begin()->second[0].first);
+                    ctx->adam_dev_bufs.params_buf.narrow(0, 0, n_params).copy_(params_cpu);
+                    ctx->adam_dev_bufs.grads_buf.narrow(0, 0, n_params).copy_(grads_cpu);
+                    ctx->adam_dev_bufs.m_buf.narrow(0, 0, n_params).copy_(m_cpu);
+                    ctx->adam_dev_bufs.v_buf.narrow(0, 0, n_params).copy_(v_cpu);
+                    ctx->adam_dev_bufs.sizes_buf.narrow(0, 0, n_params).copy_(sizes_cpu);
+
+                    auto stream = c10::cuda::getCurrentCUDAStream().stream();
+                    launch_fused_adam_multi(
+                        (void**)ctx->adam_dev_bufs.params_buf.data_ptr(),
+                        (void**)ctx->adam_dev_bufs.grads_buf.data_ptr(),
+                        (float**)ctx->adam_dev_bufs.m_buf.data_ptr(),
+                        (float**)ctx->adam_dev_bufs.v_buf.data_ptr(),
+                        (int*)ctx->adam_dev_bufs.sizes_buf.data_ptr(),
+                        n_params,
+                        (float)ctx->beta1, (float)ctx->beta2,
+                        lr_scaled, eps_scaled,
+                        one_minus_b1, one_minus_b2,
+                        (void*)stream
+                    );
+                }
             }
-
-            if (!h_params.empty()) {
-                int n_params = (int)h_params.size();
-                auto opts_cpu_long = at::TensorOptions().dtype(at::kLong).device(at::kCPU);
-                auto opts_cpu_int  = at::TensorOptions().dtype(at::kInt).device(at::kCPU);
-                auto params_cpu = at::from_blob(h_params.data(), {n_params}, opts_cpu_long);
-                auto grads_cpu  = at::from_blob(h_grads.data(),  {n_params}, opts_cpu_long);
-                auto m_cpu      = at::from_blob(h_m.data(),      {n_params}, opts_cpu_long);
-                auto v_cpu      = at::from_blob(h_v.data(),      {n_params}, opts_cpu_long);
-                auto sizes_cpu  = at::from_blob(h_sizes.data(),  {n_params}, opts_cpu_int);
-                ctx->adam_dev_bufs.ensure(n_params, ctx->adapters[0].params.begin()->second[0].first);
-                ctx->adam_dev_bufs.params_buf.narrow(0, 0, n_params).copy_(params_cpu);
-                ctx->adam_dev_bufs.grads_buf.narrow(0, 0, n_params).copy_(grads_cpu);
-                ctx->adam_dev_bufs.m_buf.narrow(0, 0, n_params).copy_(m_cpu);
-                ctx->adam_dev_bufs.v_buf.narrow(0, 0, n_params).copy_(v_cpu);
-                ctx->adam_dev_bufs.sizes_buf.narrow(0, 0, n_params).copy_(sizes_cpu);
-
-                auto stream = c10::cuda::getCurrentCUDAStream().stream();
-                launch_fused_adam_multi(
-                    (void**)ctx->adam_dev_bufs.params_buf.data_ptr(),
-                    (void**)ctx->adam_dev_bufs.grads_buf.data_ptr(),
-                    (float**)ctx->adam_dev_bufs.m_buf.data_ptr(),
-                    (float**)ctx->adam_dev_bufs.v_buf.data_ptr(),
-                    (int*)ctx->adam_dev_bufs.sizes_buf.data_ptr(),
-                    n_params,
-                    (float)ctx->beta1, (float)ctx->beta2,
-                    lr_scaled, eps_scaled,
-                    one_minus_b1, one_minus_b2,
-                    (void*)stream
-                );
-            }
-
-            // Restore the complete registry. Adapter parameter and Adam-state
-            // tensors are intrusive handles, so the chunk copies above share
-            // the updated storage with all_adapters; no value merge is needed.
-            ctx->adapters.swap(all_adapters);
 
             total_loss += loss_val;
 
@@ -4184,7 +4258,7 @@ __attribute__((visibility("default"))) double qwen36_train_multi_lora(
         }
 
         ctx->attention_mask = saved_attention_mask;
-        return total_loss / num_chunks;
+        return total_loss / total_adapters;
     } catch (const std::exception& e) {
         fprintf(stderr, "[train_multi] FAILED: %s\n", e.what());
         return -1.0;
@@ -4229,6 +4303,7 @@ __attribute__((visibility("default"))) int32_t qwen36_init_nccl(
     if (g_nccl_initialized) {
         ctx->nccl_comm = g_nccl_comm;
         ctx->nccl_stream = g_nccl_stream;
+        ctx->data_parallel = env_enabled("RUSTRAIN_DATA_PARALLEL");
         // CRITICAL: also set ep_rank/ep_world_size — needed for new TrainingContext
         // created by subsequent CreateSession commands. The fast path previously
         // skipped this, leaving ep_rank=0 → cudaSetDevice(0) on all ranks → crash.
@@ -4352,6 +4427,7 @@ __attribute__((visibility("default"))) int32_t qwen36_init_nccl(
     ctx->nccl_stream = nccl_stream;
     ctx->ep_rank = rank;
     ctx->ep_world_size = world_size;
+    ctx->data_parallel = env_enabled("RUSTRAIN_DATA_PARALLEL");
 
     // Propagate to layer configs
     for (auto& lc : ctx->layer_configs) {
@@ -4376,6 +4452,7 @@ __attribute__((visibility("default"))) void qwen36_set_nccl_comm(
     ctx->nccl_stream = reinterpret_cast<cudaStream_t>(stream_ptr);
     ctx->ep_rank = ep_rank;
     ctx->ep_world_size = ep_world_size;
+    ctx->data_parallel = env_enabled("RUSTRAIN_DATA_PARALLEL");
     int current_device = g_cuda_device;
     cudaGetDevice(&current_device);
     ctx->cuda_device = current_device;

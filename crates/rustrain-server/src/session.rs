@@ -399,6 +399,12 @@ impl TrainingSession for Qwen36Session {
         // Initialize NCCL directly in C++. The same communicator handles EP
         // output collectives and replicated-weight LoRA gradient all-reduce.
         let nccl_ep = if is_ep || is_data_parallel {
+            unsafe {
+                std::env::set_var(
+                    "RUSTRAIN_DATA_PARALLEL",
+                    if is_data_parallel { "1" } else { "0" },
+                );
+            }
             let ret = ctx.init_nccl();
             if ret != 0 {
                 return Err(anyhow!("C++ NCCL init failed (code {})", ret));

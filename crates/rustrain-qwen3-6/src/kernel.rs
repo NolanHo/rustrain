@@ -4,7 +4,7 @@
 //! Rust only handles: weight loading, data loading, training loop orchestration.
 
 use crate::lora::Qwen36LoraTargetModule;
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use std::ffi::c_void;
 use std::sync::OnceLock;
 use tch::{Kind, Tensor};
@@ -34,6 +34,8 @@ type FnCreateCtx = unsafe extern "C" fn(
 ) -> *mut c_void;
 type FnKernelAbiVersion = unsafe extern "C" fn() -> i64;
 type FnTrainStep = unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void, *mut c_void) -> f64;
+type FnTrainMicroStep =
+    unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void, *mut c_void, f64, i32) -> f64;
 type FnTrainMultiLora =
     unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void, *mut c_void, i32, i32) -> f64;
 type FnEvalStep = unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void, *mut c_void) -> f64;
@@ -106,6 +108,7 @@ pub struct CppLayerConfig {
 struct KernelHandles {
     create_ctx: FnCreateCtx,
     train_step: FnTrainStep,
+    train_micro_step: FnTrainMicroStep,
     train_multi_lora: FnTrainMultiLora,
     eval_step: FnEvalStep,
     get_lora_count: FnGetLoraCount,
@@ -171,12 +174,13 @@ unsafe fn load_kernels() -> Option<KernelHandles> {
         }};
     }
     let abi_version: FnKernelAbiVersion = sym!("qwen36_kernel_abi_version");
-    if abi_version() != 6 {
+    if abi_version() != 7 {
         return None;
     }
     Some(KernelHandles {
         create_ctx: sym!("qwen36_create_training_context"),
         train_step: sym!("qwen36_train_step"),
+        train_micro_step: sym!("qwen36_train_micro_step"),
         train_multi_lora: sym!("qwen36_train_multi_lora"),
         eval_step: sym!("qwen36_eval_step"),
         get_lora_count: sym!("qwen36_get_lora_count"),
@@ -541,6 +545,32 @@ impl CppTrainingContext {
         };
         if loss < 0.0 {
             bail!("C++ train_step failed");
+        }
+        Ok(loss)
+    }
+
+    /// Run one micro-batch and optionally apply the synchronized Adam update.
+    pub fn train_micro_step(
+        &self,
+        input_ids: &Tensor,
+        target_mask: &Tensor,
+        attention_mask: &Tensor,
+        gradient_scale: f64,
+        apply_optimizer: bool,
+    ) -> Result<f64> {
+        let kh = get_kernels().ok_or_else(|| anyhow::anyhow!("kernels not loaded"))?;
+        let loss = unsafe {
+            (kh.train_micro_step)(
+                self.ptr,
+                input_ids.as_ptr() as *mut _,
+                target_mask.as_ptr() as *mut _,
+                attention_mask.as_ptr() as *mut _,
+                gradient_scale,
+                i32::from(apply_optimizer),
+            )
+        };
+        if loss < 0.0 {
+            bail!("C++ train_micro_step failed");
         }
         Ok(loss)
     }

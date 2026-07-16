@@ -264,7 +264,9 @@ fn train_impl(
     let rank = shard_ref.map(|s| s.rank).unwrap_or(env_rank);
     let is_data_parallel = !is_ep && world_size > 1;
     if is_data_parallel && runtime_config.is_moe {
-        bail!("replicated Qwen data parallelism is only supported for dense/linear-attention models; use *_ep for MoE");
+        bail!(
+            "replicated Qwen data parallelism is only supported for dense/linear-attention models; use *_ep for MoE"
+        );
     }
     if is_data_parallel {
         crate::kernel::CppTrainingContext::set_cuda_device(
@@ -355,6 +357,7 @@ fn train_impl(
 
     let batch_size = config.train.micro_batch_size;
     let max_steps = config.train.max_steps as usize;
+    let gradient_accumulation_steps = config.train.gradient_accumulation_steps;
 
     // ── C++ all-in-C++ training path (required) ──
     // LoRA A/B, Adam optimizer, forward, loss, backward all in C++.
@@ -381,11 +384,23 @@ fn train_impl(
     )?;
 
     if world_size > 1 {
+        // Tell the native reducer whether this communicator is replicated DP
+        // or expert-parallel. EP already all-reduces routed activations and
+        // must not average replicated LoRA gradients a second time.
+        unsafe {
+            std::env::set_var(
+                "RUSTRAIN_DATA_PARALLEL",
+                if is_data_parallel { "1" } else { "0" },
+            );
+        }
         let ret = ctx.init_nccl();
         if ret != 0 {
             bail!("C++ NCCL init failed (code {})", ret);
         }
-        info!(rank, world_size, is_ep, "NCCL communicator created for Qwen LoRA parallel training");
+        info!(
+            rank,
+            world_size, is_ep, "NCCL communicator created for Qwen LoRA parallel training"
+        );
     }
     info!("C++ TrainingContext: {} LoRA params", ctx.lora_count());
 
@@ -415,30 +430,39 @@ fn train_impl(
     let mut final_loss = 0.0_f64;
 
     for step in 0..max_steps {
-        let data_start = if is_data_parallel {
-            (step * batch_size * world_size + rank * batch_size) % data.len()
-        } else {
-            (step * batch_size) % data.len()
-        };
-        let sft_batch = data.batch(data_start, batch_size);
-        let (input_ids, target_mask) = sft_batch.to_tensors(device, compute_kind);
+        let mut loss_value = 0.0;
+        for accumulation_index in 0..gradient_accumulation_steps {
+            let micro_step = step * gradient_accumulation_steps + accumulation_index;
+            let data_start = if is_data_parallel {
+                (micro_step * batch_size * world_size + rank * batch_size) % data.len()
+            } else {
+                (micro_step * batch_size) % data.len()
+            };
+            let sft_batch = data.batch(data_start, batch_size);
+            let (input_ids, target_mask) = sft_batch.to_tensors(device, compute_kind);
 
-        // Build attention mask: 1 for real tokens, 0 for padding
-        // target_mask > 0 means the token is either response (loss) or prompt (no loss but attend)
-        // We need: 1 for all non-padding tokens, 0 for padding tokens
-        // The SFT batch's target_mask is: 0=prompt, 1=response, but padding has mask=0 too.
-        // We need attention_mask = (target_mask >= 0).to(float) but that's all 1s.
-        // Actually: padding tokens have target_mask=0 AND are after EOS.
-        // The SftBatch already has padding at the end with mask=0.
-        // We need: attention_mask = 1 where token is NOT padding.
-        // Since prompt tokens have mask=0 and response tokens have mask=1,
-        // but padding also has mask=0, we can't distinguish prompt from padding using mask alone.
-        // Solution: use the pad_token_id to build attention mask from input_ids.
-        let pad_id = data.pad_token_id();
-        let attention_mask = input_ids.ne(pad_id).to_kind(Kind::Float).unsqueeze(0); // [1, seq]
+            // Build attention mask: 1 for real tokens, 0 for padding
+            // target_mask > 0 means the token is either response (loss) or prompt (no loss but attend)
+            // We need: 1 for all non-padding tokens, 0 for padding tokens
+            // The SFT batch's target_mask is: 0=prompt, 1=response, but padding has mask=0 too.
+            // We need attention_mask = (target_mask >= 0).to(float) but that's all 1s.
+            // Actually: padding tokens have target_mask=0 AND are after EOS.
+            // The SftBatch already has padding at the end with mask=0.
+            // We need: attention_mask = 1 where token is NOT padding.
+            // Since prompt tokens have mask=0 and response tokens have mask=1,
+            // but padding also has mask=0, we can't distinguish prompt from padding using mask alone.
+            // Solution: use the pad_token_id to build attention mask from input_ids.
+            let pad_id = data.pad_token_id();
+            let attention_mask = input_ids.ne(pad_id).to_kind(Kind::Float).unsqueeze(0); // [1, seq]
 
-        // C++ all-in-C++ path: single call does forward + loss + backward + Adam
-        let loss_value = ctx.train_step(&input_ids, &target_mask, &attention_mask)?;
+            loss_value += ctx.train_micro_step(
+                &input_ids,
+                &target_mask,
+                &attention_mask,
+                1.0 / gradient_accumulation_steps as f64,
+                accumulation_index + 1 == gradient_accumulation_steps,
+            )? / gradient_accumulation_steps as f64;
+        }
         if step == 0 {
             initial_loss = loss_value;
         }
