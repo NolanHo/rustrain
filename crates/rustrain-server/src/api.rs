@@ -247,6 +247,8 @@ struct TrainMultiLoraHttp {
     attention_mask: TensorHttp,
     n_total: i32,
     lora_rank: i32,
+    #[serde(default)]
+    adapter_ids: Vec<i64>,
 }
 #[derive(Serialize)]
 struct TrainStepResponse {
@@ -817,6 +819,18 @@ async fn ep_train_multi_lora(
         req.n_total,
     )
     .map_err(|e| err_resp(&e))?;
+    if !req.adapter_ids.is_empty() {
+        if req.adapter_ids.len() != req.n_total as usize {
+            return Err(err_resp(&format!(
+                "adapter_ids length {} must match n_total={}",
+                req.adapter_ids.len(),
+                req.n_total
+            )));
+        }
+        if req.adapter_ids.iter().any(|id| *id <= 0) {
+            return Err(err_resp("adapter_ids must contain only positive IDs"));
+        }
+    }
 
     let cmd = rustrain_ipc::EpCommand::TrainMultiLora {
         session_id: id,
@@ -826,6 +840,7 @@ async fn ep_train_multi_lora(
         seq_len,
         n_total: req.n_total,
         lora_rank: req.lora_rank,
+        adapter_ids: req.adapter_ids,
     };
     match state.coordinator.dispatch(&cmd) {
         rustrain_ipc::EpResult::Loss(loss) => Ok(Json(TrainStepResponse { loss, step: 0 })),

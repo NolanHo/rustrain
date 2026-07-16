@@ -23,6 +23,7 @@ extern "C" void* qwen36_create_training_context(
     void**, int64_t, void*, void*, void*, void*, int64_t, int32_t,
     double, double, double, double, double, int64_t, double, int64_t,
     const int64_t*, int64_t, const char*);
+extern "C" int64_t qwen36_kernel_abi_version();
 extern "C" int32_t qwen36_init_nccl(void*);
 extern "C" int64_t qwen36_get_lora_count(void*);
 extern "C" void* qwen36_get_lora_a(void*, int64_t);
@@ -33,9 +34,13 @@ extern "C" double qwen36_train_micro_step(
     void*, void*, void*, void*, double, int32_t);
 extern "C" int64_t qwen36_get_step_count(void*);
 extern "C" int32_t qwen36_set_step_count(void*, int64_t);
+extern "C" int64_t qwen36_get_adapter_step_count(void*, int64_t);
+extern "C" int32_t qwen36_set_adapter_step_count(void*, int64_t, int64_t);
 extern "C" double qwen36_eval_step(void*, void*, void*, void*);
 extern "C" double qwen36_train_multi_lora(
     void*, void*, void*, void*, int32_t, int32_t);
+extern "C" double qwen36_train_multi_lora_selected(
+    void*, void*, void*, void*, const int64_t*, int32_t, int32_t);
 extern "C" int64_t qwen36_add_lora(
     void*, int64_t, double, const int64_t*, int64_t, const char*);
 extern "C" void* qwen36_get_adapter_lora_tensor(
@@ -49,6 +54,7 @@ static at::Tensor cuda_rand(std::initializer_list<int64_t> shape) {
 }
 
 int main() {
+    assert(qwen36_kernel_abi_version() == 9);
     const int world = std::atoi(std::getenv("WORLD_SIZE") ? std::getenv("WORLD_SIZE") : "1");
     const int process_rank = std::atoi(std::getenv("RANK") ? std::getenv("RANK") : "0");
     const int local_rank = std::atoi(std::getenv("LOCAL_RANK") ? std::getenv("LOCAL_RANK") : "0");
@@ -195,6 +201,12 @@ int main() {
     const int64_t adapter_two = qwen36_add_lora(
         ctx, rank, 1.0, &target_layer, 1, shared_targets);
     assert(adapter_one > 0 && adapter_two > adapter_one);
+    assert(qwen36_get_adapter_step_count(ctx, adapter_one) == 0);
+    assert(qwen36_get_adapter_step_count(ctx, adapter_two) == 0);
+    assert(qwen36_set_adapter_step_count(ctx, adapter_one, -1) != 0);
+    assert(qwen36_set_adapter_step_count(ctx, adapter_one, 4) == 0);
+    assert(qwen36_get_adapter_step_count(ctx, adapter_one) == 4);
+    assert(qwen36_set_adapter_step_count(ctx, adapter_one, 0) == 0);
     auto* dynamic_b = reinterpret_cast<at::Tensor*>(
         qwen36_get_adapter_lora_tensor(
             ctx, adapter_one, 0, "shared_gate_proj", 1));
@@ -225,6 +237,8 @@ int main() {
     const double multi_loss = qwen36_train_multi_lora(
         ctx, &multi_input_ids, &multi_target_mask, &multi_attention_mask, 2, rank);
     c10::cuda::device_synchronize();
+    assert(qwen36_get_adapter_step_count(ctx, adapter_one) == 1);
+    assert(qwen36_get_adapter_step_count(ctx, adapter_two) == 1);
     dynamic_b = reinterpret_cast<at::Tensor*>(
         qwen36_get_adapter_lora_tensor(
             ctx, adapter_one, 0, "shared_gate_proj", 1));
@@ -251,6 +265,48 @@ int main() {
     assert(dynamic_update > 0.0);
     assert(dynamic_expert_update > 0.0);
     assert(dynamic_two_update > 0.0);
+
+    auto adapter_one_before_selected = dynamic_b->clone();
+    auto adapter_two_before_selected = dynamic_b_two->clone();
+    auto selected_input_ids = multi_input_ids.narrow(0, 0, 1).contiguous();
+    auto selected_target_mask = multi_target_mask.narrow(0, 0, 1).contiguous();
+    auto selected_attention_mask = multi_attention_mask.narrow(0, 0, 1).contiguous();
+    const int64_t selected_adapter_ids[] = {adapter_one};
+    const double selected_loss = qwen36_train_multi_lora_selected(
+        ctx, &selected_input_ids, &selected_target_mask,
+        &selected_attention_mask, selected_adapter_ids, 1, rank);
+    c10::cuda::device_synchronize();
+    assert(selected_loss == selected_loss && selected_loss > 0.0);
+    assert(qwen36_get_adapter_step_count(ctx, adapter_one) == 2);
+    assert(qwen36_get_adapter_step_count(ctx, adapter_two) == 1);
+    dynamic_b = reinterpret_cast<at::Tensor*>(
+        qwen36_get_adapter_lora_tensor(
+            ctx, adapter_one, 0, "shared_gate_proj", 1));
+    dynamic_b_two = reinterpret_cast<at::Tensor*>(
+        qwen36_get_adapter_lora_tensor(
+            ctx, adapter_two, 0, "shared_gate_proj", 1));
+    assert(dynamic_b && dynamic_b_two);
+    const double selected_update =
+        (*dynamic_b - adapter_one_before_selected).abs().sum().item<double>();
+    const double unselected_update =
+        (*dynamic_b_two - adapter_two_before_selected).abs().sum().item<double>();
+    std::printf(
+        "native_qwen36_selected_multi_lora_smoke loss=%0.8f "
+        "selected_update=%0.8e unselected_update=%0.8e\n",
+        selected_loss, selected_update, unselected_update);
+    assert(selected_update > 0.0);
+    assert(unselected_update == 0.0);
+
+    const int64_t unknown_adapter_ids[] = {adapter_two + 1000};
+    assert(qwen36_train_multi_lora_selected(
+        ctx, &selected_input_ids, &selected_target_mask,
+        &selected_attention_mask, unknown_adapter_ids, 1, rank) < 0.0);
+    assert(qwen36_get_adapter_step_count(ctx, adapter_one) == 2);
+    assert(qwen36_get_adapter_step_count(ctx, adapter_two) == 1);
+    assert(qwen36_get_adapter_lora_tensor(
+        ctx, adapter_one, 0, "shared_gate_proj", 1) != nullptr);
+    assert(qwen36_get_adapter_lora_tensor(
+        ctx, adapter_two, 0, "shared_gate_proj", 1) != nullptr);
     qwen36_free_training_context(ctx);
 
     // Dense Qwen3.5 variants use the same per-sample activation path for

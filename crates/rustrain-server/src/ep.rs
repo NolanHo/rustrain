@@ -262,7 +262,16 @@ fn execute_command(session: &mut Qwen36Session, cmd: &EpCommand) -> EpResult {
                 Err(e) => EpResult::Error(e.to_string()),
             }
         }
-        EpCommand::TrainMultiLora { input_ids, target_mask, attention_mask, seq_len, n_total, lora_rank, .. } => {
+        EpCommand::TrainMultiLora {
+            input_ids,
+            target_mask,
+            attention_mask,
+            seq_len,
+            n_total,
+            lora_rank,
+            adapter_ids,
+            ..
+        } => {
             let sl = *seq_len as i64;
             let batch = if *n_total > 0
                 && input_ids.len() == (*n_total as usize).saturating_mul(*seq_len)
@@ -293,7 +302,7 @@ fn execute_command(session: &mut Qwen36Session, cmd: &EpCommand) -> EpResult {
                 input_ids: input_ids_tensor,
                 target_mask: target_mask_tensor,
                 attention_mask: attention_mask_tensor,
-            }, *n_total, *lora_rank) {
+            }, *n_total, *lora_rank, adapter_ids) {
                 Ok(TrainOutput { loss, .. }) => EpResult::Loss(loss),
                 Err(e) => EpResult::Error(e.to_string()),
             }

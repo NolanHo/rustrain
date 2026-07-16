@@ -22,6 +22,7 @@
 #include <cstdlib>
 #include <cstdint>
 #include <cmath>
+#include <algorithm>
 #include <vector>
 #include <cstring>
 #include <memory>
@@ -1463,6 +1464,9 @@ struct TrainingContext {
     struct LoRAAdapter {
         int64_t id;
         int64_t rank;
+        // Each tenant owns an independent Adam bias-correction clock. The
+        // session-wide step_count remains a transport/metric clock only.
+        int64_t optimizer_step = 0;
         double alpha;
         std::set<int64_t> target_layers;
         std::set<std::string> target_modules;
@@ -3456,7 +3460,7 @@ static at::Tensor mtp_compute_loss(
 extern "C" {
 
 __attribute__((visibility("default"))) int64_t qwen36_kernel_abi_version() {
-    return 8;
+    return 9;
 }
 
 // Create training context — called once at startup
@@ -4028,6 +4032,40 @@ __attribute__((visibility("default"))) double qwen36_train_multi_lora(
                 "attention_mask must match input_ids shape");
         }
         const at::Tensor saved_attention_mask = ctx->attention_mask;
+        struct AttentionMaskGuard {
+            TrainingContext* ctx;
+            at::Tensor saved;
+            ~AttentionMaskGuard() { ctx->attention_mask = saved; }
+        } attention_mask_guard{ctx, saved_attention_mask};
+
+        struct AdapterRegistryChunkGuard {
+            TrainingContext* ctx;
+            std::vector<TrainingContext::LoRAAdapter> all;
+            bool active = false;
+
+            AdapterRegistryChunkGuard(
+                TrainingContext* context, int64_t start, int64_t end)
+                : ctx(context) {
+                all.swap(ctx->adapters);
+                try {
+                    ctx->adapters.assign(all.begin() + start, all.begin() + end);
+                    active = true;
+                } catch (...) {
+                    ctx->adapters.clear();
+                    ctx->adapters.swap(all);
+                    throw;
+                }
+            }
+
+            void restore() {
+                if (!active) return;
+                ctx->adapters.clear();
+                ctx->adapters.swap(all);
+                active = false;
+            }
+
+            ~AdapterRegistryChunkGuard() { restore(); }
+        };
 
         // Compute N_max from available GPU memory.
         // CRITICAL: all workers must agree on n_max to keep NCCL all-reduce in sync.
@@ -4070,16 +4108,10 @@ __attribute__((visibility("default"))) double qwen36_train_multi_lora(
 
         double total_loss = 0.0;
         int64_t num_chunks = (total_adapters + n_max - 1) / n_max;
-        // Chunking is a memory scheduling detail, not an optimizer step. All
-        // adapters in this call must use the same Adam bias correction.
+        // Chunking is a memory scheduling detail, not an optimizer step. The
+        // session clock is kept for backwards-compatible status reporting;
+        // Adam bias correction below uses each adapter's own clock.
         ctx->step_count++;
-        const double logical_step = (double)ctx->step_count;
-        const double bias_correction1 = 1.0 - std::pow(ctx->beta1, logical_step);
-        const double bias_correction2 = 1.0 - std::pow(ctx->beta2, logical_step);
-        const float lr_scaled = (float)(ctx->lr / bias_correction1);
-        const float eps_scaled = (float)(ctx->eps / std::sqrt(bias_correction2));
-        const float one_minus_b1 = (float)(1.0 - ctx->beta1);
-        const float one_minus_b2 = (float)(1.0 - ctx->beta2);
 
         for (int64_t chunk = 0; chunk < num_chunks; chunk++) {
             int64_t start = chunk * n_max;
@@ -4090,13 +4122,9 @@ __attribute__((visibility("default"))) double qwen36_train_multi_lora(
             ctx->lora_batch_valid = false;
             ctx->lora_cache_valid = false;
 
-            // Temporarily set lora_batch_valid so prepare_lora_batch runs
-            // We need to select only adapters[start:end]
-            // HACK: move non-chunk adapters to a temp vector, run, then restore
-            std::vector<TrainingContext::LoRAAdapter> all_adapters;
-            all_adapters.swap(ctx->adapters);
-            ctx->adapters.assign(
-                all_adapters.begin() + start, all_adapters.begin() + end);
+            // Scope the registry to this activation-memory chunk. The guard
+            // restores the full registry even if forward/backward fails.
+            AdapterRegistryChunkGuard registry_guard(ctx, start, end);
 
             // Mark batched mode active
             ctx->lora_batch_valid = true;  // triggers prepare_lora_batch in forward
@@ -4185,47 +4213,58 @@ __attribute__((visibility("default"))) double qwen36_train_multi_lora(
             // Restore the complete registry before the next chunk. Gradients
             // remain attached to the intrusive tensor handles, so all chunks
             // can accumulate and the optimizer runs exactly once below.
-            ctx->adapters.swap(all_adapters);
+            registry_guard.restore();
 
             if (chunk == num_chunks - 1) {
                 // DP gradient synchronization and Adam belong to the logical
                 // multi-tenant step, never to an activation-memory chunk.
                 synchronize_lora_gradients(ctx, target_mask);
 
-                // Adam step
+                // Adam step. Group tenants by their own logical clock so
+                // newly-added or resumed tenants do not inherit another
+                // tenant's bias correction. Adapters with the same clock
+                // still share one fused multi-tensor launch.
                 at::AutoGradMode guard(false);
                 ctx->lora_cache_valid = false;
                 ctx->lora_batch_valid = false;
-
-                std::vector<void*> h_params, h_grads;
-                std::vector<float*> h_m, h_v;
-                std::vector<int> h_sizes;
-
+                for (auto& adapter : ctx->adapters) adapter.optimizer_step++;
+                std::map<int64_t, std::vector<TrainingContext::LoRAAdapter*>> groups;
                 for (auto& adapter : ctx->adapters) {
-                    for (auto& [layer_idx, pairs] : adapter.params) {
-                        auto& adam_states = adapter.adam_state[layer_idx];
-                        for (size_t i = 0; i < pairs.size(); i++) {
-                            auto& [a, b] = pairs[i];
-                            auto& [m_a, v_a, m_b, v_b] = adam_states[i];
-                            if (a.grad().defined() && a.scalar_type() == at::kBFloat16) {
-                                h_params.push_back(a.data_ptr());
-                                h_grads.push_back(a.grad().data_ptr());
-                                h_m.push_back((float*)m_a.data_ptr());
-                                h_v.push_back((float*)v_a.data_ptr());
-                                h_sizes.push_back((int)a.numel());
-                            }
-                            if (b.grad().defined() && b.scalar_type() == at::kBFloat16) {
-                                h_params.push_back(b.data_ptr());
-                                h_grads.push_back(b.grad().data_ptr());
-                                h_m.push_back((float*)m_b.data_ptr());
-                                h_v.push_back((float*)v_b.data_ptr());
-                                h_sizes.push_back((int)b.numel());
+                    groups[adapter.optimizer_step].push_back(&adapter);
+                }
+                for (auto& [logical_step, adapters] : groups) {
+                    std::vector<void*> h_params, h_grads;
+                    std::vector<float*> h_m, h_v;
+                    std::vector<int> h_sizes;
+                    for (auto* adapter : adapters) {
+                        for (auto& [layer_idx, pairs] : adapter->params) {
+                            auto& adam_states = adapter->adam_state[layer_idx];
+                            for (size_t i = 0; i < pairs.size(); i++) {
+                                auto& [a, b] = pairs[i];
+                                auto& [m_a, v_a, m_b, v_b] = adam_states[i];
+                                if (a.grad().defined() && a.scalar_type() == at::kBFloat16) {
+                                    h_params.push_back(a.data_ptr());
+                                    h_grads.push_back(a.grad().data_ptr());
+                                    h_m.push_back((float*)m_a.data_ptr());
+                                    h_v.push_back((float*)v_a.data_ptr());
+                                    h_sizes.push_back((int)a.numel());
+                                }
+                                if (b.grad().defined() && b.scalar_type() == at::kBFloat16) {
+                                    h_params.push_back(b.data_ptr());
+                                    h_grads.push_back(b.grad().data_ptr());
+                                    h_m.push_back((float*)m_b.data_ptr());
+                                    h_v.push_back((float*)v_b.data_ptr());
+                                    h_sizes.push_back((int)b.numel());
+                                }
                             }
                         }
                     }
-                }
-
-                if (!h_params.empty()) {
+                    if (h_params.empty()) continue;
+                    const double step_f = (double)logical_step;
+                    const float lr_scaled = (float)(ctx->lr / (1.0 - std::pow(ctx->beta1, step_f)));
+                    const float eps_scaled = (float)(ctx->eps / std::sqrt(1.0 - std::pow(ctx->beta2, step_f)));
+                    const float one_minus_b1 = (float)(1.0 - ctx->beta1);
+                    const float one_minus_b2 = (float)(1.0 - ctx->beta2);
                     int n_params = (int)h_params.size();
                     auto opts_cpu_long = at::TensorOptions().dtype(at::kLong).device(at::kCPU);
                     auto opts_cpu_int  = at::TensorOptions().dtype(at::kInt).device(at::kCPU);
@@ -4234,13 +4273,12 @@ __attribute__((visibility("default"))) double qwen36_train_multi_lora(
                     auto m_cpu      = at::from_blob(h_m.data(),      {n_params}, opts_cpu_long);
                     auto v_cpu      = at::from_blob(h_v.data(),      {n_params}, opts_cpu_long);
                     auto sizes_cpu  = at::from_blob(h_sizes.data(),  {n_params}, opts_cpu_int);
-                    ctx->adam_dev_bufs.ensure(n_params, ctx->adapters[0].params.begin()->second[0].first);
+                    ctx->adam_dev_bufs.ensure(n_params, adapters[0]->params.begin()->second[0].first);
                     ctx->adam_dev_bufs.params_buf.narrow(0, 0, n_params).copy_(params_cpu);
                     ctx->adam_dev_bufs.grads_buf.narrow(0, 0, n_params).copy_(grads_cpu);
                     ctx->adam_dev_bufs.m_buf.narrow(0, 0, n_params).copy_(m_cpu);
                     ctx->adam_dev_bufs.v_buf.narrow(0, 0, n_params).copy_(v_cpu);
                     ctx->adam_dev_bufs.sizes_buf.narrow(0, 0, n_params).copy_(sizes_cpu);
-
                     auto stream = c10::cuda::getCurrentCUDAStream().stream();
                     launch_fused_adam_multi(
                         (void**)ctx->adam_dev_bufs.params_buf.data_ptr(),
@@ -4248,12 +4286,9 @@ __attribute__((visibility("default"))) double qwen36_train_multi_lora(
                         (float**)ctx->adam_dev_bufs.m_buf.data_ptr(),
                         (float**)ctx->adam_dev_bufs.v_buf.data_ptr(),
                         (int*)ctx->adam_dev_bufs.sizes_buf.data_ptr(),
-                        n_params,
-                        (float)ctx->beta1, (float)ctx->beta2,
-                        lr_scaled, eps_scaled,
-                        one_minus_b1, one_minus_b2,
-                        (void*)stream
-                    );
+                        n_params, (float)ctx->beta1, (float)ctx->beta2,
+                        lr_scaled, eps_scaled, one_minus_b1, one_minus_b2,
+                        (void*)stream);
                 }
             }
 
@@ -4263,13 +4298,95 @@ __attribute__((visibility("default"))) double qwen36_train_multi_lora(
                     (long)(chunk + 1), (long)num_chunks, (long)n, loss_val);
         }
 
-        ctx->attention_mask = saved_attention_mask;
         return total_loss / total_adapters;
     } catch (const std::exception& e) {
         fprintf(stderr, "[train_multi] FAILED: %s\n", e.what());
         return -1.0;
     } catch (...) {
         fprintf(stderr, "[train_multi] FAILED: unknown exception\n");
+        return -1.0;
+    }
+}
+
+// Train only the requested dynamic tenants. The existing train_multi_lora
+// implementation already batches activation-level LoRA projections and owns
+// the logical Adam boundary; this wrapper scopes its adapter registry to the
+// selected IDs and restores the original order on every exit.
+__attribute__((visibility("default"))) double qwen36_train_multi_lora_selected(
+    void* ctx_ptr,
+    void* input_ids_ptr,
+    void* target_mask_ptr,
+    void* attention_mask_ptr,
+    const int64_t* adapter_ids,
+    int32_t n_adapters,
+    int32_t lora_rank
+) {
+    auto* ctx = reinterpret_cast<TrainingContext*>(ctx_ptr);
+    std::vector<TrainingContext::LoRAAdapter> original;
+    std::vector<TrainingContext::LoRAAdapter> selected;
+    std::vector<TrainingContext::LoRAAdapter> merged;
+    std::vector<size_t> selected_indexes;
+    std::vector<uint8_t> moved;
+    bool registry_detached = false;
+    bool selected_installed = false;
+    auto restore_registry = [&]() {
+        if (!ctx || !registry_detached) return;
+        if (selected_installed) {
+            selected.swap(ctx->adapters);
+            selected_installed = false;
+        }
+        for (size_t i = 0; i < original.size(); ++i) {
+            if (!moved[i]) {
+                merged.push_back(std::move(original[i]));
+                continue;
+            }
+            auto selected_it = std::find(
+                selected_indexes.begin(), selected_indexes.end(), i);
+            TORCH_CHECK(selected_it != selected_indexes.end(),
+                "selected adapter index disappeared: ", i);
+            const auto selected_index = static_cast<size_t>(
+                selected_it - selected_indexes.begin());
+            merged.push_back(std::move(selected[selected_index]));
+        }
+        ctx->adapters.swap(merged);
+        registry_detached = false;
+    };
+    try {
+        TORCH_CHECK(ctx && adapter_ids && n_adapters > 0,
+            "selected multi-LoRA requires at least one adapter ID");
+        const auto original_count = ctx->adapters.size();
+        original.reserve(original_count);
+        selected.reserve(n_adapters);
+        merged.reserve(original_count);
+        selected_indexes.reserve(n_adapters);
+        moved.resize(original_count, 0);
+        original.swap(ctx->adapters);
+        registry_detached = true;
+        for (int32_t i = 0; i < n_adapters; ++i) {
+            TORCH_CHECK(adapter_ids[i] > 0, "selected adapter IDs must be positive");
+            auto it = std::find_if(original.begin(), original.end(),
+                [&](const auto& adapter) { return adapter.id == adapter_ids[i]; });
+            TORCH_CHECK(it != original.end(), "unknown selected adapter ID: ", adapter_ids[i]);
+            const auto index = static_cast<size_t>(it - original.begin());
+            TORCH_CHECK(!moved[index], "duplicate selected adapter ID: ", adapter_ids[i]);
+            moved[index] = 1;
+            selected_indexes.push_back(index);
+            selected.push_back(std::move(*it));
+        }
+        ctx->adapters.swap(selected);
+        selected_installed = true;
+        const double loss = qwen36_train_multi_lora(
+            ctx_ptr, input_ids_ptr, target_mask_ptr, attention_mask_ptr,
+            n_adapters, lora_rank);
+        restore_registry();
+        return loss;
+    } catch (const std::exception& e) {
+        try { restore_registry(); } catch (...) {}
+        fprintf(stderr, "[train_multi_selected] FAILED: %s\n", e.what());
+        return -1.0;
+    } catch (...) {
+        try { restore_registry(); } catch (...) {}
+        fprintf(stderr, "[train_multi_selected] FAILED: unknown exception\n");
         return -1.0;
     }
 }
@@ -4794,6 +4911,31 @@ int32_t qwen36_set_adapter_optimizer_tensor(
         fprintf(stderr, "[q36] set_adapter_optimizer_tensor FAILED: %s\n", e.what());
         return -1;
     }
+}
+
+__attribute__((visibility("default")))
+int64_t qwen36_get_adapter_step_count(void* ctx_ptr, int64_t adapter_id) {
+    auto* ctx = reinterpret_cast<TrainingContext*>(ctx_ptr);
+    if (!ctx || adapter_id <= 0) return -1;
+    for (const auto& adapter : ctx->adapters) {
+        if (adapter.id == adapter_id) return adapter.optimizer_step;
+    }
+    return -1;
+}
+
+__attribute__((visibility("default")))
+int32_t qwen36_set_adapter_step_count(
+    void* ctx_ptr, int64_t adapter_id, int64_t step_count
+) {
+    auto* ctx = reinterpret_cast<TrainingContext*>(ctx_ptr);
+    if (!ctx || adapter_id <= 0 || step_count < 0) return -1;
+    for (auto& adapter : ctx->adapters) {
+        if (adapter.id == adapter_id) {
+            adapter.optimizer_step = step_count;
+            return 0;
+        }
+    }
+    return -1;
 }
 
 __attribute__((visibility("default")))

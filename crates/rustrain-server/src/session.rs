@@ -83,6 +83,7 @@ pub trait TrainingSession: Send {
         input: TrainInput,
         n_total: i32,
         rank: i32,
+        adapter_ids: &[i64],
     ) -> Result<TrainOutput>;
     fn eval_step(&self, input: TrainInput) -> Result<EvalOutput>;
     fn save_checkpoint(&self, path: &str) -> Result<(u64, f64)>;
@@ -472,19 +473,44 @@ impl TrainingSession for Qwen36Session {
         input: TrainInput,
         n_total: i32,
         rank: i32,
+        adapter_ids: &[i64],
     ) -> Result<TrainOutput> {
         let ctx = self
             .ctx
             .as_ref()
             .ok_or_else(|| anyhow!("LoRA not initialized"))?;
 
-        let loss = ctx.train_multi_lora(
-            &input.input_ids,
-            &input.target_mask,
-            &input.attention_mask,
-            n_total,
-            rank,
-        )?;
+        if n_total <= 0 {
+            return Err(anyhow!("n_total must be positive, got {n_total}"));
+        }
+        if !adapter_ids.is_empty() {
+            if adapter_ids.len() != n_total as usize {
+                return Err(anyhow!(
+                    "selected adapter count {} does not match n_total={n_total}",
+                    adapter_ids.len()
+                ));
+            }
+            if adapter_ids.iter().any(|id| *id <= 0) {
+                return Err(anyhow!("selected adapter IDs must be positive"));
+            }
+        }
+        let loss = if adapter_ids.is_empty() {
+            ctx.train_multi_lora(
+                &input.input_ids,
+                &input.target_mask,
+                &input.attention_mask,
+                n_total,
+                rank,
+            )?
+        } else {
+            ctx.train_multi_lora_selected(
+                &input.input_ids,
+                &input.target_mask,
+                &input.attention_mask,
+                adapter_ids,
+                rank,
+            )?
+        };
         self.step += 1;
         self.last_loss = loss;
         self.state = SessionState::Training { step: self.step };
@@ -630,11 +656,14 @@ impl TrainingSession for Qwen36Session {
                         })?,
                     );
                 }
+                let optimizer_step = u64::try_from(ctx.get_adapter_step_count(adapter_id)?)
+                    .context("native dynamic adapter optimizer step is negative")?;
                 dynamic_adapters.push(checkpoint::DynamicAdapterCheckpoint {
                     manifest: checkpoint::DynamicAdapterManifest {
                         id: adapter_id,
                         rank: lora_config.rank,
                         alpha: lora_config.alpha,
+                        optimizer_step,
                         target_layers: lora_config.target_layers.clone(),
                         target_modules: lora_config
                             .target_modules
@@ -794,6 +823,12 @@ impl TrainingSession for Qwen36Session {
                     Ok(())
                 })();
                 if let Err(error) = load_result {
+                    let _ = ctx.remove_lora(adapter_id);
+                    return Err(error);
+                }
+                let optimizer_step = i64::try_from(dynamic.manifest.optimizer_step)
+                    .context("dynamic adapter optimizer step exceeds native range")?;
+                if let Err(error) = ctx.set_adapter_step_count(adapter_id, optimizer_step) {
                     let _ = ctx.remove_lora(adapter_id);
                     return Err(error);
                 }

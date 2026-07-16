@@ -38,6 +38,15 @@ type FnTrainMicroStep =
     unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void, *mut c_void, f64, i32) -> f64;
 type FnTrainMultiLora =
     unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void, *mut c_void, i32, i32) -> f64;
+type FnTrainMultiLoraSelected = unsafe extern "C" fn(
+    *mut c_void,
+    *mut c_void,
+    *mut c_void,
+    *mut c_void,
+    *const i64,
+    i32,
+    i32,
+) -> f64;
 type FnEvalStep = unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void, *mut c_void) -> f64;
 type FnGetLoraCount = unsafe extern "C" fn(*mut c_void) -> i64;
 type FnGetLoraA = unsafe extern "C" fn(*mut c_void, i64) -> *mut c_void;
@@ -79,6 +88,8 @@ type FnGetAdapterOptimizerTensor =
     unsafe extern "C" fn(*mut c_void, i64, i64, *const i8, i32, i32) -> *mut c_void;
 type FnSetAdapterOptimizerTensor =
     unsafe extern "C" fn(*mut c_void, i64, i64, *const i8, i32, i32, *mut c_void) -> i32;
+type FnGetAdapterStepCount = unsafe extern "C" fn(*mut c_void, i64) -> i64;
+type FnSetAdapterStepCount = unsafe extern "C" fn(*mut c_void, i64, i64) -> i32;
 
 #[repr(C)]
 pub struct CppLayerConfig {
@@ -111,6 +122,7 @@ struct KernelHandles {
     train_step: FnTrainStep,
     train_micro_step: FnTrainMicroStep,
     train_multi_lora: FnTrainMultiLora,
+    train_multi_lora_selected: FnTrainMultiLoraSelected,
     eval_step: FnEvalStep,
     get_lora_count: FnGetLoraCount,
     get_lora_a: FnGetLoraA,
@@ -136,6 +148,8 @@ struct KernelHandles {
     set_adapter_id: FnSetAdapterId,
     get_adapter_optimizer_tensor: FnGetAdapterOptimizerTensor,
     set_adapter_optimizer_tensor: FnSetAdapterOptimizerTensor,
+    get_adapter_step_count: FnGetAdapterStepCount,
+    set_adapter_step_count: FnSetAdapterStepCount,
 }
 
 static KERNELS: OnceLock<Option<KernelHandles>> = OnceLock::new();
@@ -176,7 +190,7 @@ unsafe fn load_kernels() -> Option<KernelHandles> {
         }};
     }
     let abi_version: FnKernelAbiVersion = sym!("qwen36_kernel_abi_version");
-    if abi_version() != 8 {
+    if abi_version() != 9 {
         return None;
     }
     Some(KernelHandles {
@@ -184,6 +198,7 @@ unsafe fn load_kernels() -> Option<KernelHandles> {
         train_step: sym!("qwen36_train_step"),
         train_micro_step: sym!("qwen36_train_micro_step"),
         train_multi_lora: sym!("qwen36_train_multi_lora"),
+        train_multi_lora_selected: sym!("qwen36_train_multi_lora_selected"),
         eval_step: sym!("qwen36_eval_step"),
         get_lora_count: sym!("qwen36_get_lora_count"),
         get_lora_a: sym!("qwen36_get_lora_a"),
@@ -209,6 +224,8 @@ unsafe fn load_kernels() -> Option<KernelHandles> {
         set_adapter_id: sym!("qwen36_set_adapter_id"),
         get_adapter_optimizer_tensor: sym!("qwen36_get_adapter_optimizer_tensor"),
         set_adapter_optimizer_tensor: sym!("qwen36_set_adapter_optimizer_tensor"),
+        get_adapter_step_count: sym!("qwen36_get_adapter_step_count"),
+        set_adapter_step_count: sym!("qwen36_set_adapter_step_count"),
     })
 }
 
@@ -607,6 +624,38 @@ impl CppTrainingContext {
         Ok(loss)
     }
 
+    /// Train only the requested dynamic adapters. The native wrapper scopes
+    /// its registry to these IDs so unselected tenants keep their parameters,
+    /// gradients, and optimizer clocks untouched.
+    pub fn train_multi_lora_selected(
+        &self,
+        input_ids: &Tensor,
+        target_mask: &Tensor,
+        attention_mask: &Tensor,
+        adapter_ids: &[i64],
+        lora_rank: i32,
+    ) -> Result<f64> {
+        if adapter_ids.is_empty() {
+            bail!("selected multi-LoRA requires at least one adapter ID");
+        }
+        let kh = get_kernels().ok_or_else(|| anyhow::anyhow!("kernels not loaded"))?;
+        let loss = unsafe {
+            (kh.train_multi_lora_selected)(
+                self.ptr,
+                input_ids.as_ptr() as *mut _,
+                target_mask.as_ptr() as *mut _,
+                attention_mask.as_ptr() as *mut _,
+                adapter_ids.as_ptr(),
+                adapter_ids.len() as i32,
+                lora_rank,
+            )
+        };
+        if loss < 0.0 {
+            bail!("C++ train_multi_lora_selected failed");
+        }
+        Ok(loss)
+    }
+
     /// Get LoRA A tensor by index (for saving).
     pub fn get_lora_a(&self, index: i64) -> Option<Tensor> {
         let kh = get_kernels()?;
@@ -900,6 +949,26 @@ impl CppTrainingContext {
             bail!(
                 "C++ set_adapter_optimizer_tensor failed for adapter {adapter_id}, layer {layer}, module {module:?}"
             );
+        }
+        Ok(())
+    }
+
+    /// Return the independent Adam bias-correction clock for a dynamic tenant.
+    pub fn get_adapter_step_count(&self, adapter_id: i64) -> Result<i64> {
+        let kh = get_kernels().ok_or_else(|| anyhow::anyhow!("kernels not loaded"))?;
+        let step = unsafe { (kh.get_adapter_step_count)(self.ptr, adapter_id) };
+        if step < 0 {
+            bail!("C++ get_adapter_step_count failed for adapter {adapter_id}");
+        }
+        Ok(step)
+    }
+
+    /// Restore a dynamic tenant's Adam bias-correction clock.
+    pub fn set_adapter_step_count(&self, adapter_id: i64, step_count: i64) -> Result<()> {
+        let kh = get_kernels().ok_or_else(|| anyhow::anyhow!("kernels not loaded"))?;
+        let status = unsafe { (kh.set_adapter_step_count)(self.ptr, adapter_id, step_count) };
+        if status != 0 {
+            bail!("C++ set_adapter_step_count failed for adapter {adapter_id}");
         }
         Ok(())
     }

@@ -23,6 +23,11 @@ pub struct DynamicAdapterManifest {
     pub id: i64,
     pub rank: i64,
     pub alpha: f64,
+    /// Adam bias-correction clock for this tenant. It is independent from
+    /// the session-wide `CheckpointManifest::step` and other adapters.
+    /// Missing values in older v2 manifests default to zero.
+    #[serde(default)]
+    pub optimizer_step: u64,
     pub target_layers: Vec<usize>,
     pub target_modules: Vec<String>,
     pub parameter_count: usize,
@@ -321,6 +326,7 @@ mod tests {
                 id: 7,
                 rank: 3,
                 alpha: 6.0,
+                optimizer_step: 19,
                 target_layers: vec![1, 3],
                 target_modules: vec!["q_proj".into(), "down_proj".into()],
                 parameter_count: 2,
@@ -359,6 +365,7 @@ mod tests {
         let loaded_dynamic = &loaded.dynamic_adapters[0];
         assert_eq!(loaded_dynamic.manifest.id, 7);
         assert_eq!(loaded_dynamic.manifest.rank, 3);
+        assert_eq!(loaded_dynamic.manifest.optimizer_step, 19);
         assert_eq!(loaded_dynamic.manifest.target_layers, vec![1, 3]);
         assert_eq!(loaded_dynamic.lora_a.len(), 2);
         assert_eq!(loaded_dynamic.adam_m.len(), 4);
@@ -368,5 +375,20 @@ mod tests {
             1e-6,
             false
         ));
+    }
+
+    #[test]
+    fn old_dynamic_manifest_defaults_optimizer_step_to_zero() {
+        let json = r#"{
+            "id": 7,
+            "rank": 3,
+            "alpha": 6.0,
+            "target_layers": [1],
+            "target_modules": ["q_proj"],
+            "parameter_count": 1,
+            "optimizer_count": 2
+        }"#;
+        let manifest: DynamicAdapterManifest = serde_json::from_str(json).unwrap();
+        assert_eq!(manifest.optimizer_step, 0);
     }
 }

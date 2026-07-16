@@ -67,6 +67,8 @@ pub enum EpCommand {
         seq_len: usize,
         n_total: i32,
         lora_rank: i32,
+        #[serde(default)]
+        adapter_ids: Vec<i64>,
     },
     EvalStep {
         session_id: String,
