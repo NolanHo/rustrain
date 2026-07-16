@@ -3412,7 +3412,7 @@ static at::Tensor mtp_compute_loss(
 extern "C" {
 
 __attribute__((visibility("default"))) int64_t qwen36_kernel_abi_version() {
-    return 4;
+    return 6;
 }
 
 // Create training context — called once at startup
@@ -4558,6 +4558,35 @@ int64_t qwen36_add_lora(
     }
 }
 
+// Restore a dynamic adapter's externally visible ID during checkpoint load.
+// IDs are positive and unique; the monotonic allocator is advanced so future
+// additions cannot collide with a restored tenant.
+__attribute__((visibility("default")))
+int32_t qwen36_set_adapter_id(void* ctx_ptr, int64_t current_id, int64_t requested_id) {
+    try {
+        auto* ctx = reinterpret_cast<TrainingContext*>(ctx_ptr);
+        TORCH_CHECK(ctx && current_id > 0 && requested_id > 0,
+            "dynamic adapter IDs must be positive");
+        for (const auto& adapter : ctx->adapters) {
+            TORCH_CHECK(adapter.id != requested_id || adapter.id == current_id,
+                "dynamic adapter ID already exists: ", requested_id);
+        }
+        for (auto& adapter : ctx->adapters) {
+            if (adapter.id == current_id) {
+                adapter.id = requested_id;
+                ctx->next_adapter_id = std::max(ctx->next_adapter_id, requested_id);
+                ctx->lora_cache_valid = false;
+                ctx->lora_batch_valid = false;
+                return 0;
+            }
+        }
+        TORCH_CHECK(false, "dynamic adapter not found: ", current_id);
+    } catch (const std::exception& e) {
+        fprintf(stderr, "[q36] set_adapter_id FAILED: %s\n", e.what());
+        return -1;
+    }
+}
+
 __attribute__((visibility("default")))
 int32_t qwen36_remove_lora(void* ctx_ptr, int64_t adapter_id) {
     auto* ctx = reinterpret_cast<TrainingContext*>(ctx_ptr);
@@ -4631,6 +4660,55 @@ int32_t qwen36_set_adapter_lora_tensor(
         return 0;
     } catch (const std::exception& e) {
         fprintf(stderr, "[q36] set_adapter_lora_tensor FAILED: %s\n", e.what());
+        return -1;
+    }
+}
+
+// Access one dynamic adapter's Adam state. The per-layer state is stored as
+// {m_a, v_a, m_b, v_b}; `is_b` selects A/B and `is_v` selects m/v.
+__attribute__((visibility("default")))
+void* qwen36_get_adapter_optimizer_tensor(
+    void* ctx_ptr, int64_t adapter_id, int64_t layer_idx,
+    const char* module_name, int32_t is_b, int32_t is_v
+) {
+    auto* ctx = reinterpret_cast<TrainingContext*>(ctx_ptr);
+    if (!ctx || !module_name || layer_idx < 0 || layer_idx >= ctx->num_layers)
+        return nullptr;
+    const int64_t pair_idx = lora_pair_index(
+        ctx->layer_configs[layer_idx], module_name);
+    if (pair_idx < 0) return nullptr;
+    for (auto& adapter : ctx->adapters) {
+        if (adapter.id != adapter_id) continue;
+        auto state_it = adapter.adam_state.find(layer_idx);
+        if (state_it == adapter.adam_state.end() ||
+            pair_idx >= static_cast<int64_t>(state_it->second.size()))
+            return nullptr;
+        // array order: m_a, v_a, m_b, v_b
+        const int index = (is_b ? 2 : 0) + (is_v ? 1 : 0);
+        return &state_it->second[pair_idx][index];
+    }
+    return nullptr;
+}
+
+__attribute__((visibility("default")))
+int32_t qwen36_set_adapter_optimizer_tensor(
+    void* ctx_ptr, int64_t adapter_id, int64_t layer_idx,
+    const char* module_name, int32_t is_b, int32_t is_v, void* tensor_ptr
+) {
+    try {
+        auto* target = reinterpret_cast<at::Tensor*>(
+            qwen36_get_adapter_optimizer_tensor(
+                ctx_ptr, adapter_id, layer_idx, module_name, is_b, is_v));
+        TORCH_CHECK(target && tensor_ptr, "dynamic optimizer tensor not found");
+        auto& source = *reinterpret_cast<at::Tensor*>(tensor_ptr);
+        TORCH_CHECK(source.sizes() == target->sizes(),
+            "dynamic optimizer tensor shape mismatch: expected ", target->sizes(),
+            " got ", source.sizes());
+        at::NoGradGuard guard;
+        target->copy_(source.to(target->device()).to(target->scalar_type()));
+        return 0;
+    } catch (const std::exception& e) {
+        fprintf(stderr, "[q36] set_adapter_optimizer_tensor FAILED: %s\n", e.what());
         return -1;
     }
 }

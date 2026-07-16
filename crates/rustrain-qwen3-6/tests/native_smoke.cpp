@@ -23,6 +23,7 @@ extern "C" void* qwen36_create_training_context(
     void**, int64_t, void*, void*, void*, void*, int64_t, int32_t,
     double, double, double, double, double, int64_t, double, int64_t,
     const int64_t*, int64_t, const char*);
+extern "C" int32_t qwen36_init_nccl(void*);
 extern "C" int64_t qwen36_get_lora_count(void*);
 extern "C" void* qwen36_get_lora_a(void*, int64_t);
 extern "C" void* qwen36_get_lora_b(void*, int64_t);
@@ -44,7 +45,11 @@ static at::Tensor cuda_rand(std::initializer_list<int64_t> shape) {
 }
 
 int main() {
-    c10::cuda::CUDAGuard guard(0);
+    const int world = std::atoi(std::getenv("WORLD_SIZE") ? std::getenv("WORLD_SIZE") : "1");
+    const int process_rank = std::atoi(std::getenv("RANK") ? std::getenv("RANK") : "0");
+    const int local_rank = std::atoi(std::getenv("LOCAL_RANK") ? std::getenv("LOCAL_RANK") : "0");
+    assert(world == 1 || (world == 2 && process_rank >= 0 && process_rank < world));
+    c10::cuda::CUDAGuard guard(local_rank);
     at::manual_seed(7);
 
     constexpr int64_t hidden = 16;
@@ -265,6 +270,9 @@ int main() {
         1.0, 1e-3, 0.9, 0.999, 1e-8, vocab, 1e-5, rank,
         &target_layer, 1, "q_proj");
     assert(ctx);
+    if (world > 1) {
+        assert(qwen36_init_nccl(ctx) == 0);
+    }
     const char* dense_targets = "gate_proj,up_proj,down_proj";
     const int64_t dense_one = qwen36_add_lora(
         ctx, rank, 1.0, &target_layer, 1, dense_targets);

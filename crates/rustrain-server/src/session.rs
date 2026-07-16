@@ -314,6 +314,7 @@ impl TrainingSession for Qwen36Session {
             .and_then(|s| s.parse::<usize>().ok())
             .unwrap_or(0);
         let is_ep = ep_world_size > 1 && runtime_config.is_moe;
+        let is_data_parallel = ep_world_size > 1 && !runtime_config.is_moe;
 
         // Compute expert shard
         let (expert_start, expert_count) = if is_ep {
@@ -329,8 +330,9 @@ impl TrainingSession for Qwen36Session {
             (0, runtime_config.num_experts)
         };
 
-        // Set CUDA device for EP
-        if is_ep {
+        // Set CUDA device for any torchrun worker. Dense Qwen workers use
+        // replicated weights and NCCL gradient all-reduce (LoRA-only DP).
+        if is_ep || is_data_parallel {
             self.device = tch::Device::Cuda(local_rank);
         }
 
@@ -394,8 +396,9 @@ impl TrainingSession for Qwen36Session {
             expert_count,
         )?;
 
-        // Initialize NCCL communicator for EP — directly in C++
-        let nccl_ep = if is_ep {
+        // Initialize NCCL directly in C++. The same communicator handles EP
+        // output collectives and replicated-weight LoRA gradient all-reduce.
+        let nccl_ep = if is_ep || is_data_parallel {
             let ret = ctx.init_nccl();
             if ret != 0 {
                 return Err(anyhow!("C++ NCCL init failed (code {})", ret));
@@ -403,6 +406,7 @@ impl TrainingSession for Qwen36Session {
             tracing::info!(
                 ep_rank,
                 ep_world_size,
+                data_parallel = is_data_parallel,
                 "NCCL communicator created in C++ for EP"
             );
             true
@@ -499,11 +503,6 @@ impl TrainingSession for Qwen36Session {
             .ctx
             .as_ref()
             .ok_or_else(|| anyhow!("LoRA not initialized"))?;
-        if !self.dynamic_lora_configs.is_empty() {
-            bail!(
-                "checkpoint-v1 stores only the fixed adapter; export dynamic adapters individually before checkpointing"
-            );
-        }
 
         let lora_count = ctx.lora_count();
         let mut lora_a = Vec::new();
@@ -518,7 +517,136 @@ impl TrainingSession for Qwen36Session {
         // Export Adam optimizer state
         let (adam_m, adam_v) = ctx.export_optimizer_state()?;
 
-        checkpoint::save_checkpoint(
+        let mut dynamic_adapters = Vec::new();
+        if !self.dynamic_lora_configs.is_empty() {
+            let model_path = self
+                .model_path
+                .as_ref()
+                .ok_or_else(|| anyhow!("model path unavailable for dynamic LoRA checkpoint"))?;
+            let runtime_config = rustrain_qwen3_6::config::read_qwen36_runtime_config(
+                std::path::Path::new(model_path),
+            )?;
+            for (&adapter_id, lora_config) in &self.dynamic_lora_configs {
+                let slots = rustrain_qwen3_6::lora::native_lora_slots(&runtime_config, lora_config);
+                let mut dynamic_a = Vec::new();
+                let mut dynamic_b = Vec::new();
+                let mut dynamic_m = Vec::new();
+                let mut dynamic_v = Vec::new();
+                for slot in slots.iter().filter(|slot| slot.active) {
+                    let module = slot.module.cpp_name();
+                    dynamic_a.push(
+                        ctx.get_adapter_lora_tensor(
+                            adapter_id,
+                            slot.layer as i64,
+                            module,
+                            false,
+                        )
+                        .with_context(|| {
+                            format!(
+                                "dynamic LoRA A is missing: adapter={adapter_id} layer={} module={module}",
+                                slot.layer
+                            )
+                        })?,
+                    );
+                    dynamic_b.push(
+                        ctx.get_adapter_lora_tensor(
+                            adapter_id,
+                            slot.layer as i64,
+                            module,
+                            true,
+                        )
+                        .with_context(|| {
+                            format!(
+                                "dynamic LoRA B is missing: adapter={adapter_id} layer={} module={module}",
+                                slot.layer
+                            )
+                        })?,
+                    );
+                    // Keep one m/v entry for each A and B tensor, in slot order.
+                    dynamic_m.push(
+                        ctx.get_adapter_optimizer_tensor(
+                            adapter_id,
+                            slot.layer as i64,
+                            module,
+                            false,
+                            false,
+                        )
+                        .with_context(|| {
+                            format!(
+                                "dynamic LoRA m_a is missing: adapter={adapter_id} layer={} module={module}",
+                                slot.layer
+                            )
+                        })?,
+                    );
+                    dynamic_m.push(
+                        ctx.get_adapter_optimizer_tensor(
+                            adapter_id,
+                            slot.layer as i64,
+                            module,
+                            true,
+                            false,
+                        )
+                        .with_context(|| {
+                            format!(
+                                "dynamic LoRA m_b is missing: adapter={adapter_id} layer={} module={module}",
+                                slot.layer
+                            )
+                        })?,
+                    );
+                    dynamic_v.push(
+                        ctx.get_adapter_optimizer_tensor(
+                            adapter_id,
+                            slot.layer as i64,
+                            module,
+                            false,
+                            true,
+                        )
+                        .with_context(|| {
+                            format!(
+                                "dynamic LoRA v_a is missing: adapter={adapter_id} layer={} module={module}",
+                                slot.layer
+                            )
+                        })?,
+                    );
+                    dynamic_v.push(
+                        ctx.get_adapter_optimizer_tensor(
+                            adapter_id,
+                            slot.layer as i64,
+                            module,
+                            true,
+                            true,
+                        )
+                        .with_context(|| {
+                            format!(
+                                "dynamic LoRA v_b is missing: adapter={adapter_id} layer={} module={module}",
+                                slot.layer
+                            )
+                        })?,
+                    );
+                }
+                dynamic_adapters.push(checkpoint::DynamicAdapterCheckpoint {
+                    manifest: checkpoint::DynamicAdapterManifest {
+                        id: adapter_id,
+                        rank: lora_config.rank,
+                        alpha: lora_config.alpha,
+                        target_layers: lora_config.target_layers.clone(),
+                        target_modules: lora_config
+                            .target_modules
+                            .iter()
+                            .map(|module| module.cpp_name().to_string())
+                            .collect(),
+                        parameter_count: dynamic_a.len(),
+                        optimizer_count: dynamic_m.len(),
+                    },
+                    lora_a: dynamic_a,
+                    lora_b: dynamic_b,
+                    adam_m: dynamic_m,
+                    adam_v: dynamic_v,
+                });
+            }
+        }
+
+        checkpoint::save_checkpoint_with_dynamic(
             std::path::Path::new(path),
             self.step,
             self.last_loss,
@@ -529,6 +657,7 @@ impl TrainingSession for Qwen36Session {
             &lora_b,
             &adam_m,
             &adam_v,
+            &dynamic_adapters,
         )?;
 
         Ok((self.step, self.last_loss))
@@ -536,6 +665,135 @@ impl TrainingSession for Qwen36Session {
 
     fn load_checkpoint(&mut self, path: &str) -> Result<(u64, f64)> {
         let data = checkpoint::load_checkpoint(std::path::Path::new(path))?;
+        if !data.dynamic_adapters.is_empty() {
+            let model_path = self
+                .model_path
+                .as_ref()
+                .ok_or_else(|| anyhow!("model path unavailable for dynamic LoRA checkpoint"))?;
+            let runtime_config = rustrain_qwen3_6::config::read_qwen36_runtime_config(
+                std::path::Path::new(model_path),
+            )?;
+            if !self.dynamic_lora_configs.is_empty() {
+                bail!("cannot load dynamic LoRA checkpoint into a session with active adapters");
+            }
+            let ctx = self
+                .ctx
+                .as_ref()
+                .ok_or_else(|| anyhow!("LoRA not initialized"))?;
+            for dynamic in &data.dynamic_adapters {
+                let target_modules = dynamic
+                    .manifest
+                    .target_modules
+                    .iter()
+                    .map(|name| Qwen36LoraTargetModule::parse(name))
+                    .collect::<Result<Vec<_>>>()?;
+                let lora_config = Qwen36LoraConfig {
+                    rank: dynamic.manifest.rank,
+                    alpha: dynamic.manifest.alpha,
+                    target_layers: dynamic.manifest.target_layers.clone(),
+                    target_modules,
+                };
+                rustrain_qwen3_6::lora::validate_lora_targets(&runtime_config, &lora_config)?;
+                let layer_ids = lora_config
+                    .target_layers
+                    .iter()
+                    .map(|&layer| layer as i64)
+                    .collect::<Vec<_>>();
+                let module_csv = lora_config
+                    .target_modules
+                    .iter()
+                    .map(Qwen36LoraTargetModule::cpp_name)
+                    .collect::<Vec<_>>()
+                    .join(",");
+                let allocated_id =
+                    ctx.add_lora(lora_config.rank, lora_config.alpha, &layer_ids, &module_csv)?;
+                if allocated_id != dynamic.manifest.id {
+                    if let Err(error) = ctx.set_adapter_id(allocated_id, dynamic.manifest.id) {
+                        let _ = ctx.remove_lora(allocated_id);
+                        return Err(error);
+                    }
+                }
+                let adapter_id = dynamic.manifest.id;
+                let load_result = (|| -> Result<()> {
+                    let slots =
+                        rustrain_qwen3_6::lora::native_lora_slots(&runtime_config, &lora_config);
+                    let mut optimizer_index = 0usize;
+                    for (slot_index, slot) in slots.iter().filter(|slot| slot.active).enumerate() {
+                        let module = slot.module.cpp_name();
+                        if slot_index >= dynamic.lora_a.len()
+                            || slot_index >= dynamic.lora_b.len()
+                            || optimizer_index + 1 >= dynamic.adam_m.len()
+                            || optimizer_index + 1 >= dynamic.adam_v.len()
+                        {
+                            bail!(
+                                "dynamic adapter {} tensor count mismatch",
+                                dynamic.manifest.id
+                            );
+                        }
+                        // A/B vectors are ordered exactly like active native slots.
+                        ctx.set_adapter_lora_tensor(
+                            adapter_id,
+                            slot.layer as i64,
+                            module,
+                            false,
+                            &dynamic.lora_a[slot_index],
+                        )?;
+                        ctx.set_adapter_lora_tensor(
+                            adapter_id,
+                            slot.layer as i64,
+                            module,
+                            true,
+                            &dynamic.lora_b[slot_index],
+                        )?;
+                        ctx.set_adapter_optimizer_tensor(
+                            adapter_id,
+                            slot.layer as i64,
+                            module,
+                            false,
+                            false,
+                            &dynamic.adam_m[optimizer_index],
+                        )?;
+                        ctx.set_adapter_optimizer_tensor(
+                            adapter_id,
+                            slot.layer as i64,
+                            module,
+                            true,
+                            false,
+                            &dynamic.adam_m[optimizer_index + 1],
+                        )?;
+                        ctx.set_adapter_optimizer_tensor(
+                            adapter_id,
+                            slot.layer as i64,
+                            module,
+                            false,
+                            true,
+                            &dynamic.adam_v[optimizer_index],
+                        )?;
+                        ctx.set_adapter_optimizer_tensor(
+                            adapter_id,
+                            slot.layer as i64,
+                            module,
+                            true,
+                            true,
+                            &dynamic.adam_v[optimizer_index + 1],
+                        )?;
+                        optimizer_index += 2;
+                    }
+                    if optimizer_index != dynamic.manifest.optimizer_count {
+                        bail!(
+                            "dynamic adapter {} optimizer count mismatch",
+                            dynamic.manifest.id
+                        );
+                    }
+                    Ok(())
+                })();
+                if let Err(error) = load_result {
+                    let _ = ctx.remove_lora(adapter_id);
+                    return Err(error);
+                }
+                self.dynamic_lora_configs.insert(adapter_id, lora_config);
+            }
+        }
         // Import Adam optimizer state into C++ context
         if let Some(ctx) = &self.ctx {
             if data.lora_a.len() != data.lora_b.len()

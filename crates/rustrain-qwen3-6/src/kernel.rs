@@ -4,7 +4,7 @@
 //! Rust only handles: weight loading, data loading, training loop orchestration.
 
 use crate::lora::Qwen36LoraTargetModule;
-use anyhow::{Result, bail};
+use anyhow::{bail, Result};
 use std::ffi::c_void;
 use std::sync::OnceLock;
 use tch::{Kind, Tensor};
@@ -71,6 +71,11 @@ type FnGetAdapterLoraTensor =
     unsafe extern "C" fn(*mut c_void, i64, i64, *const i8, i32) -> *mut c_void;
 type FnSetAdapterLoraTensor =
     unsafe extern "C" fn(*mut c_void, i64, i64, *const i8, i32, *mut c_void) -> i32;
+type FnSetAdapterId = unsafe extern "C" fn(*mut c_void, i64, i64) -> i32;
+type FnGetAdapterOptimizerTensor =
+    unsafe extern "C" fn(*mut c_void, i64, i64, *const i8, i32, i32) -> *mut c_void;
+type FnSetAdapterOptimizerTensor =
+    unsafe extern "C" fn(*mut c_void, i64, i64, *const i8, i32, i32, *mut c_void) -> i32;
 
 #[repr(C)]
 pub struct CppLayerConfig {
@@ -123,6 +128,9 @@ struct KernelHandles {
     list_lora: FnListLora,
     get_adapter_lora_tensor: FnGetAdapterLoraTensor,
     set_adapter_lora_tensor: FnSetAdapterLoraTensor,
+    set_adapter_id: FnSetAdapterId,
+    get_adapter_optimizer_tensor: FnGetAdapterOptimizerTensor,
+    set_adapter_optimizer_tensor: FnSetAdapterOptimizerTensor,
 }
 
 static KERNELS: OnceLock<Option<KernelHandles>> = OnceLock::new();
@@ -163,7 +171,7 @@ unsafe fn load_kernels() -> Option<KernelHandles> {
         }};
     }
     let abi_version: FnKernelAbiVersion = sym!("qwen36_kernel_abi_version");
-    if abi_version() != 4 {
+    if abi_version() != 6 {
         return None;
     }
     Some(KernelHandles {
@@ -191,6 +199,9 @@ unsafe fn load_kernels() -> Option<KernelHandles> {
         list_lora: sym!("qwen36_list_lora"),
         get_adapter_lora_tensor: sym!("qwen36_get_adapter_lora_tensor"),
         set_adapter_lora_tensor: sym!("qwen36_set_adapter_lora_tensor"),
+        set_adapter_id: sym!("qwen36_set_adapter_id"),
+        get_adapter_optimizer_tensor: sym!("qwen36_get_adapter_optimizer_tensor"),
+        set_adapter_optimizer_tensor: sym!("qwen36_set_adapter_optimizer_tensor"),
     })
 }
 
@@ -725,6 +736,16 @@ impl CppTrainingContext {
         Ok(found != 0)
     }
 
+    /// Restore a dynamic adapter's stable external ID from a checkpoint.
+    pub fn set_adapter_id(&self, current_id: i64, requested_id: i64) -> Result<()> {
+        let kh = get_kernels().ok_or_else(|| anyhow::anyhow!("kernels not loaded"))?;
+        let status = unsafe { (kh.set_adapter_id)(self.ptr, current_id, requested_id) };
+        if status != 0 {
+            bail!("C++ set_adapter_id failed: {current_id} -> {requested_id}");
+        }
+        Ok(())
+    }
+
     /// List all active adapter IDs.
     pub fn list_lora(&self) -> Vec<i64> {
         let kh = match get_kernels() {
@@ -789,6 +810,62 @@ impl CppTrainingContext {
         if status != 0 {
             bail!(
                 "C++ set_adapter_lora_tensor failed for adapter {adapter_id}, layer {layer}, module {module:?}"
+            );
+        }
+        Ok(())
+    }
+
+    pub fn get_adapter_optimizer_tensor(
+        &self,
+        adapter_id: i64,
+        layer: i64,
+        module: &str,
+        is_b: bool,
+        is_v: bool,
+    ) -> Option<Tensor> {
+        let kh = get_kernels()?;
+        let module = std::ffi::CString::new(module).ok()?;
+        let ptr = unsafe {
+            (kh.get_adapter_optimizer_tensor)(
+                self.ptr,
+                adapter_id,
+                layer,
+                module.as_ptr(),
+                if is_b { 1 } else { 0 },
+                if is_v { 1 } else { 0 },
+            )
+        };
+        if ptr.is_null() {
+            return None;
+        }
+        Some(unsafe { Tensor::clone_from_ptr(ptr as *mut _) })
+    }
+
+    pub fn set_adapter_optimizer_tensor(
+        &self,
+        adapter_id: i64,
+        layer: i64,
+        module: &str,
+        is_b: bool,
+        is_v: bool,
+        tensor: &Tensor,
+    ) -> Result<()> {
+        let kh = get_kernels().ok_or_else(|| anyhow::anyhow!("kernels not loaded"))?;
+        let module = std::ffi::CString::new(module)?;
+        let status = unsafe {
+            (kh.set_adapter_optimizer_tensor)(
+                self.ptr,
+                adapter_id,
+                layer,
+                module.as_ptr(),
+                if is_b { 1 } else { 0 },
+                if is_v { 1 } else { 0 },
+                tensor.as_ptr() as *mut c_void,
+            )
+        };
+        if status != 0 {
+            bail!(
+                "C++ set_adapter_optimizer_tensor failed for adapter {adapter_id}, layer {layer}, module {module:?}"
             );
         }
         Ok(())

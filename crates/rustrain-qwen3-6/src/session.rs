@@ -249,8 +249,31 @@ fn train_impl(
 
     let shard_ref = ep_shard.as_ref();
     let is_ep = shard_ref.is_some();
-    let world_size = shard_ref.map(|s| s.world_size).unwrap_or(1);
-    let rank = shard_ref.map(|s| s.rank).unwrap_or(0);
+    // Non-EP Qwen sessions may run replicated-weight LoRA data parallelism.
+    // The launcher supplies the standard torchrun environment; EP keeps its
+    // explicit shard metadata as the source of truth.
+    let env_world_size = std::env::var("WORLD_SIZE")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(1);
+    let env_rank = std::env::var("RANK")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(0);
+    let world_size = shard_ref.map(|s| s.world_size).unwrap_or(env_world_size);
+    let rank = shard_ref.map(|s| s.rank).unwrap_or(env_rank);
+    let is_data_parallel = !is_ep && world_size > 1;
+    if is_data_parallel && runtime_config.is_moe {
+        bail!("replicated Qwen data parallelism is only supported for dense/linear-attention models; use *_ep for MoE");
+    }
+    if is_data_parallel {
+        crate::kernel::CppTrainingContext::set_cuda_device(
+            std::env::var("LOCAL_RANK")
+                .ok()
+                .and_then(|s| s.parse::<i32>().ok())
+                .unwrap_or(0),
+        );
+    }
 
     // Build needed weight set
     let needed = build_needed_weights(&runtime_config, &lora_config, shard_ref);
@@ -356,6 +379,14 @@ fn train_impl(
         shard_ref.map(|s| s.expert_start).unwrap_or(0),
         shard_ref.map(|s| s.experts_per_rank).unwrap_or(0),
     )?;
+
+    if world_size > 1 {
+        let ret = ctx.init_nccl();
+        if ret != 0 {
+            bail!("C++ NCCL init failed (code {})", ret);
+        }
+        info!(rank, world_size, is_ep, "NCCL communicator created for Qwen LoRA parallel training");
+    }
     info!("C++ TrainingContext: {} LoRA params", ctx.lora_count());
 
     // Set MTP weights if available
@@ -384,7 +415,11 @@ fn train_impl(
     let mut final_loss = 0.0_f64;
 
     for step in 0..max_steps {
-        let data_start = (step * batch_size) % data.len();
+        let data_start = if is_data_parallel {
+            (step * batch_size * world_size + rank * batch_size) % data.len()
+        } else {
+            (step * batch_size) % data.len()
+        };
         let sft_batch = data.batch(data_start, batch_size);
         let (input_ids, target_mask) = sft_batch.to_tensors(device, compute_kind);
 

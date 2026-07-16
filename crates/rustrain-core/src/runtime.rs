@@ -494,6 +494,11 @@ pub fn validate_config(config: &Config) -> Result<()> {
             config.model.architecture.as_str(),
             "qwen3_5_lora_sft" | "qwen3_5_lora_sft_ep" | "qwen3_6_lora_sft" | "qwen3_6_lora_sft_ep"
         );
+    let is_qwen3_hybrid_lora_sft_dp = matches!(config.train.backend, BackendKind::Tch)
+        && matches!(
+            config.model.architecture.as_str(),
+            "qwen3_5_lora_sft" | "qwen3_6_lora_sft"
+        );
     let is_tch_moe_ep_session = matches!(config.train.backend, BackendKind::Tch)
         && config.model.architecture == "tch_moe_ep_session";
     let is_v4_tp_rank = matches!(config.train.backend, BackendKind::Tch)
@@ -527,6 +532,13 @@ pub fn validate_config(config: &Config) -> Result<()> {
             && !((is_tch_tiny_lm || is_qwen_trainable_session)
                 && name == "data_parallel_size"
                 && value == 2)
+            && !(is_qwen3_hybrid_lora_sft_dp
+                && name == "data_parallel_size"
+                && value >= 2
+                && parallel.tensor_model_parallel_size == 1
+                && parallel.pipeline_model_parallel_size == 1
+                && parallel.expert_model_parallel_size == 1
+                && parallel.context_parallel_size == 1)
             && !(is_qwen_trainable_session
                 && name == "tensor_model_parallel_size"
                 && value == 2
@@ -677,9 +689,21 @@ pub fn validate_config(config: &Config) -> Result<()> {
                 config.model.architecture
             ));
         }
-        let expected_global_batch_size =
-            config.train.micro_batch_size * config.train.gradient_accumulation_steps;
+        let data_parallel_factor = if is_qwen3_hybrid_lora_sft_dp {
+            config.parallel.data_parallel_size
+        } else {
+            1
+        };
+        let expected_global_batch_size = config.train.micro_batch_size
+            * config.train.gradient_accumulation_steps
+            * data_parallel_factor;
         if config.train.global_batch_size != expected_global_batch_size {
+            if data_parallel_factor > 1 {
+                return Err(anyhow!(
+                    "{} requires global_batch_size = micro_batch_size * gradient_accumulation_steps * data_parallel_size",
+                    config.model.architecture
+                ));
+            }
             return Err(anyhow!(
                 "{} requires global_batch_size = micro_batch_size * gradient_accumulation_steps",
                 config.model.architecture
@@ -1329,6 +1353,24 @@ mod tests {
         validate_config(&config).expect("native Qwen3.6 LoRA targets should validate");
         config.model.architecture = "qwen3_5_lora_sft".to_string();
         validate_config(&config).expect("native Qwen3.5 LoRA targets should validate");
+    }
+
+    #[test]
+    fn qwen_hybrid_lora_sft_accepts_replicated_data_parallelism() {
+        let mut config = qwen_lora_sft_config();
+        config.model.architecture = "qwen3_6_lora_sft".to_string();
+        config.parallel.data_parallel_size = 2;
+        config.train.global_batch_size = config.train.micro_batch_size
+            * config.train.gradient_accumulation_steps
+            * config.parallel.data_parallel_size;
+        validate_config(&config).expect("Qwen3.6 LoRA DP should validate");
+
+        config.model.architecture = "qwen3_5_lora_sft".to_string();
+        validate_config(&config).expect("Qwen3.5 LoRA DP should validate");
+
+        config.train.global_batch_size /= 2;
+        let error = validate_config(&config).expect_err("DP global batch mismatch should fail");
+        assert!(error.to_string().contains("data_parallel_size"));
     }
 
     #[test]
