@@ -262,13 +262,48 @@ fn train_impl(
         .unwrap_or(0);
     let world_size = shard_ref.map(|s| s.world_size).unwrap_or(env_world_size);
     let rank = shard_ref.map(|s| s.rank).unwrap_or(env_rank);
-    let is_data_parallel = !is_ep && world_size > 1;
+    let tp_size = config.parallel.tensor_model_parallel_size;
+    let env_tp_size = std::env::var("TP_SIZE")
+        .or_else(|_| std::env::var("RUSTRAIN_TP_SIZE"))
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(1);
+    if env_tp_size > 1 && env_tp_size != tp_size {
+        bail!(
+            "TP_SIZE environment ({env_tp_size}) does not match config tensor_model_parallel_size ({tp_size})"
+        );
+    }
+    if tp_size > 1 {
+        if world_size != tp_size
+            || config.parallel.pipeline_model_parallel_size != 1
+            || config.parallel.data_parallel_size != 1
+            || config.parallel.expert_model_parallel_size != 1
+            || config.parallel.context_parallel_size != 1
+        {
+            bail!(
+                "native Qwen LoRA currently supports TP-only topology: TP={} WORLD_SIZE={} PP={} DP={} EP={} CP={}",
+                tp_size,
+                world_size,
+                config.parallel.pipeline_model_parallel_size,
+                config.parallel.data_parallel_size,
+                config.parallel.expert_model_parallel_size,
+                config.parallel.context_parallel_size
+            );
+        }
+        if lora_config.rank % tp_size as i64 != 0 {
+            bail!("LoRA rank {} must be divisible by TP_SIZE={tp_size}", lora_config.rank);
+        }
+        unsafe {
+            std::env::set_var("TP_SIZE", tp_size.to_string());
+        }
+    }
+    let is_data_parallel = !is_ep && world_size > 1 && tp_size == 1;
     if is_data_parallel && runtime_config.is_moe {
         bail!(
             "replicated Qwen data parallelism is only supported for dense/linear-attention models; use *_ep for MoE"
         );
     }
-    if is_data_parallel {
+    if is_data_parallel || tp_size > 1 {
         crate::kernel::CppTrainingContext::set_cuda_device(
             std::env::var("LOCAL_RANK")
                 .ok()
@@ -367,6 +402,10 @@ fn train_impl(
         );
     }
 
+    let expert_start = shard_ref.map(|s| s.expert_start).unwrap_or(0);
+    let expert_count = shard_ref
+        .map(|s| s.experts_per_rank)
+        .unwrap_or(runtime_config.num_experts);
     let ctx = crate::kernel::CppTrainingContext::new(
         &weights_gpu,
         &runtime_config,
@@ -379,8 +418,8 @@ fn train_impl(
         lora_config.rank as i64,
         &lora_config.target_layers,
         &lora_config.target_modules,
-        shard_ref.map(|s| s.expert_start).unwrap_or(0),
-        shard_ref.map(|s| s.experts_per_rank).unwrap_or(0),
+        expert_start,
+        expert_count,
     )?;
 
     if world_size > 1 {
@@ -409,8 +448,8 @@ fn train_impl(
         ctx.set_mtp_weights(
             &weights_gpu,
             &runtime_config,
-            shard_ref.map(|s| s.expert_start).unwrap_or(0),
-            shard_ref.map(|s| s.experts_per_rank).unwrap_or(0),
+            expert_start,
+            expert_count,
         )?;
         info!(
             "C++ TrainingContext: MTP weights set ({} layers)",

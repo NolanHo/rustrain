@@ -967,9 +967,17 @@ mod tests {
                 "k_proj",
                 "v_proj",
                 "o_proj",
+                "gate_proj",
+                "up_proj",
+                "down_proj",
                 "in_proj_qkv",
                 "in_proj_z",
-                "out_proj"
+                "in_proj_a",
+                "in_proj_b",
+                "out_proj",
+                "gate_proj",
+                "up_proj",
+                "down_proj"
             ]
         );
     }

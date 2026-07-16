@@ -314,8 +314,26 @@ impl TrainingSession for Qwen36Session {
             .ok()
             .and_then(|s| s.parse::<usize>().ok())
             .unwrap_or(0);
-        let is_ep = ep_world_size > 1 && runtime_config.is_moe;
-        let is_data_parallel = ep_world_size > 1 && !runtime_config.is_moe;
+        let tp_size = std::env::var("TP_SIZE")
+            .or_else(|_| std::env::var("RUSTRAIN_TP_SIZE"))
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(1);
+        if tp_size > 1 {
+            if ep_world_size != tp_size || req.rank < 0 || req.rank as usize >= ep_world_size {
+                return Err(anyhow!(
+                    "native Qwen server TP-only mode requires WORLD_SIZE=TP_SIZE and a valid global rank (world={}, tp={}, rank={})",
+                    ep_world_size,
+                    tp_size,
+                    req.rank
+                ));
+            }
+            unsafe {
+                std::env::set_var("TP_SIZE", tp_size.to_string());
+            }
+        }
+        let is_ep = ep_world_size > 1 && runtime_config.is_moe && tp_size == 1;
+        let is_data_parallel = ep_world_size > 1 && !runtime_config.is_moe && tp_size == 1;
 
         // Compute expert shard
         let (expert_start, expert_count) = if is_ep {
@@ -333,7 +351,7 @@ impl TrainingSession for Qwen36Session {
 
         // Set CUDA device for any torchrun worker. Dense Qwen workers use
         // replicated weights and NCCL gradient all-reduce (LoRA-only DP).
-        if is_ep || is_data_parallel {
+        if is_ep || is_data_parallel || tp_size > 1 {
             self.device = tch::Device::Cuda(local_rank);
         }
 
@@ -397,9 +415,9 @@ impl TrainingSession for Qwen36Session {
             expert_count,
         )?;
 
-        // Initialize NCCL directly in C++. The same communicator handles EP
-        // output collectives and replicated-weight LoRA gradient all-reduce.
-        let nccl_ep = if is_ep || is_data_parallel {
+        // Initialize NCCL directly in C++. The parent communicator handles
+        // EP/DP, while TP-only LoRA uses a split communicator for deltas.
+        let nccl_ep = if ep_world_size > 1 {
             unsafe {
                 std::env::set_var(
                     "RUSTRAIN_DATA_PARALLEL",
@@ -414,7 +432,8 @@ impl TrainingSession for Qwen36Session {
                 ep_rank,
                 ep_world_size,
                 data_parallel = is_data_parallel,
-                "NCCL communicator created in C++ for EP"
+                tp_size,
+                "NCCL communicator created in C++ for Qwen parallel training"
             );
             true
         } else {

@@ -54,11 +54,13 @@ static at::Tensor cuda_rand(std::initializer_list<int64_t> shape) {
 }
 
 int main() {
-    assert(qwen36_kernel_abi_version() == 9);
+    assert(qwen36_kernel_abi_version() == 10);
     const int world = std::atoi(std::getenv("WORLD_SIZE") ? std::getenv("WORLD_SIZE") : "1");
     const int process_rank = std::atoi(std::getenv("RANK") ? std::getenv("RANK") : "0");
     const int local_rank = std::atoi(std::getenv("LOCAL_RANK") ? std::getenv("LOCAL_RANK") : "0");
     assert(world == 1 || (world == 2 && process_rank >= 0 && process_rank < world));
+    const int tp_size = std::atoi(std::getenv("TP_SIZE") ? std::getenv("TP_SIZE") : "1");
+    assert(tp_size == 1 || (tp_size == world && tp_size == 2));
     c10::cuda::CUDAGuard guard(local_rank);
     at::manual_seed(7);
 
@@ -68,6 +70,7 @@ int main() {
     constexpr int64_t head_dim = 8;
     constexpr int64_t intermediate = 8;
     constexpr int64_t rank = 8;
+    const int64_t local_lora_rank = rank / tp_size;
 
     // One full-attention MoE layer. Shapes intentionally match the native
     // weight order used by build_weight_ptrs/kernel.cpp.
@@ -130,6 +133,7 @@ int main() {
         1.0, 1e-3, 0.9, 0.999, 1e-8, vocab, 1e-5, rank,
         &target_layer, 1, "experts_gate_up_proj,experts_down_proj");
     if (!ctx) return 2;
+    if (world > 1) assert(qwen36_init_nccl(ctx) == 0);
 
     const int64_t count = qwen36_get_lora_count(ctx);
     assert(count == 9);
@@ -138,10 +142,10 @@ int main() {
     auto* down_a = reinterpret_cast<at::Tensor*>(qwen36_get_lora_a(ctx, 8));
     auto* down_b = reinterpret_cast<at::Tensor*>(qwen36_get_lora_b(ctx, 8));
     assert(expert_a && expert_b && down_a && down_b);
-    assert(expert_a->sizes() == at::IntArrayRef({experts, rank, hidden}));
-    assert(expert_b->sizes() == at::IntArrayRef({experts, 2 * intermediate, rank}));
-    assert(down_a->sizes() == at::IntArrayRef({experts, rank, intermediate}));
-    assert(down_b->sizes() == at::IntArrayRef({experts, hidden, rank}));
+    assert(expert_a->sizes() == at::IntArrayRef({experts, local_lora_rank, hidden}));
+    assert(expert_b->sizes() == at::IntArrayRef({experts, 2 * intermediate, local_lora_rank}));
+    assert(down_a->sizes() == at::IntArrayRef({experts, local_lora_rank, intermediate}));
+    assert(down_b->sizes() == at::IntArrayRef({experts, hidden, local_lora_rank}));
 
     // Make both B tensors nonzero so the step exercises the LoRA branches.
     auto expert_b_value = at::ones(expert_b->sizes(), expert_b->options());
@@ -210,7 +214,7 @@ int main() {
     auto* dynamic_b = reinterpret_cast<at::Tensor*>(
         qwen36_get_adapter_lora_tensor(
             ctx, adapter_one, 0, "shared_gate_proj", 1));
-    assert(dynamic_b && dynamic_b->sizes() == at::IntArrayRef({intermediate, rank}));
+    assert(dynamic_b && dynamic_b->sizes() == at::IntArrayRef({intermediate, local_lora_rank}));
     auto dynamic_b_value = at::ones(dynamic_b->sizes(), dynamic_b->options());
     assert(qwen36_set_adapter_lora_tensor(
         ctx, adapter_one, 0, "shared_gate_proj", 1, &dynamic_b_value) == 0);
@@ -227,7 +231,7 @@ int main() {
         qwen36_get_adapter_lora_tensor(
             ctx, adapter_one, 0, "experts_gate_up_proj", 1));
     assert(dynamic_expert_b && dynamic_expert_b->sizes() ==
-        at::IntArrayRef({experts, 2 * intermediate, rank}));
+        at::IntArrayRef({experts, 2 * intermediate, local_lora_rank}));
     auto dynamic_expert_b_value = at::ones(
         dynamic_expert_b->sizes(), dynamic_expert_b->options());
     assert(qwen36_set_adapter_lora_tensor(
@@ -330,9 +334,7 @@ int main() {
         1.0, 1e-3, 0.9, 0.999, 1e-8, vocab, 1e-5, rank,
         &target_layer, 1, "q_proj");
     assert(ctx);
-    if (world > 1) {
-        assert(qwen36_init_nccl(ctx) == 0);
-    }
+    if (world > 1) assert(qwen36_init_nccl(ctx) == 0);
     const char* dense_targets = "gate_proj,up_proj,down_proj";
     const int64_t dense_one = qwen36_add_lora(
         ctx, rank, 1.0, &target_layer, 1, dense_targets);
@@ -341,7 +343,7 @@ int main() {
     assert(dense_one > 0 && dense_two > dense_one);
     auto* dense_b = reinterpret_cast<at::Tensor*>(
         qwen36_get_adapter_lora_tensor(ctx, dense_one, 0, "gate_proj", 1));
-    assert(dense_b && dense_b->sizes() == at::IntArrayRef({intermediate, rank}));
+    assert(dense_b && dense_b->sizes() == at::IntArrayRef({intermediate, local_lora_rank}));
     auto dense_b_value = at::ones(dense_b->sizes(), dense_b->options());
     assert(qwen36_set_adapter_lora_tensor(
         ctx, dense_one, 0, "gate_proj", 1, &dense_b_value) == 0);
@@ -403,12 +405,13 @@ int main() {
         &target_layer, 1,
         "in_proj_qkv,in_proj_z,in_proj_a,in_proj_b,out_proj");
     assert(ctx);
+    if (world > 1) assert(qwen36_init_nccl(ctx) == 0);
     assert(qwen36_get_lora_count(ctx) == 8);
     auto* linear_a = reinterpret_cast<at::Tensor*>(qwen36_get_lora_a(ctx, 0));
     auto* linear_b = reinterpret_cast<at::Tensor*>(qwen36_get_lora_b(ctx, 0));
     assert(linear_a && linear_b);
-    assert(linear_a->sizes() == at::IntArrayRef({rank, hidden}));
-    assert(linear_b->sizes() == at::IntArrayRef({linear_qkv, rank}));
+    assert(linear_a->sizes() == at::IntArrayRef({local_lora_rank, hidden}));
+    assert(linear_b->sizes() == at::IntArrayRef({linear_qkv, local_lora_rank}));
     auto linear_b_value = at::ones(linear_b->sizes(), linear_b->options());
     assert(qwen36_set_lora_tensor(ctx, 0, 1, &linear_b_value) == 0);
     auto linear_a_before = linear_a->clone();
@@ -451,7 +454,7 @@ int main() {
         qwen36_get_adapter_lora_tensor(
             ctx, linear_adapter_one, 0, "in_proj_qkv", 1));
     assert(dynamic_linear_b && dynamic_linear_b->sizes() ==
-        at::IntArrayRef({linear_qkv, rank}));
+        at::IntArrayRef({linear_qkv, local_lora_rank}));
     auto dynamic_linear_b_value = at::ones(
         dynamic_linear_b->sizes(), dynamic_linear_b->options());
     assert(qwen36_set_adapter_lora_tensor(

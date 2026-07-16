@@ -190,7 +190,7 @@ unsafe fn load_kernels() -> Option<KernelHandles> {
         }};
     }
     let abi_version: FnKernelAbiVersion = sym!("qwen36_kernel_abi_version");
-    if abi_version() != 9 {
+    if abi_version() != 10 {
         return None;
     }
     Some(KernelHandles {
