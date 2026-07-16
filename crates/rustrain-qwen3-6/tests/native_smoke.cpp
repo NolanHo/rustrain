@@ -29,6 +29,9 @@ extern "C" void* qwen36_get_lora_a(void*, int64_t);
 extern "C" void* qwen36_get_lora_b(void*, int64_t);
 extern "C" int32_t qwen36_set_lora_tensor(void*, int64_t, int32_t, void*);
 extern "C" double qwen36_train_step(void*, void*, void*, void*);
+extern "C" double qwen36_train_micro_step(
+    void*, void*, void*, void*, double, int32_t);
+extern "C" int64_t qwen36_get_step_count(void*);
 extern "C" double qwen36_eval_step(void*, void*, void*, void*);
 extern "C" double qwen36_train_multi_lora(
     void*, void*, void*, void*, int32_t, int32_t);
@@ -352,6 +355,20 @@ int main() {
     auto linear_b_value = at::ones(linear_b->sizes(), linear_b->options());
     assert(qwen36_set_lora_tensor(ctx, 0, 1, &linear_b_value) == 0);
     auto linear_a_before = linear_a->clone();
+    assert(qwen36_get_step_count(ctx) == 0);
+    const double accum_loss_0 = qwen36_train_micro_step(
+        ctx, &input_ids, &target_mask, &attention_mask, 0.5, 0);
+    c10::cuda::device_synchronize();
+    assert(accum_loss_0 == accum_loss_0);
+    assert(qwen36_get_step_count(ctx) == 0);
+    assert((*linear_a - linear_a_before).abs().sum().item<double>() == 0.0);
+    const double accum_loss_1 = qwen36_train_micro_step(
+        ctx, &input_ids, &target_mask, &attention_mask, 0.5, 1);
+    c10::cuda::device_synchronize();
+    assert(accum_loss_1 == accum_loss_1);
+    assert(qwen36_get_step_count(ctx) == 1);
+    assert((*linear_a - linear_a_before).abs().sum().item<double>() > 0.0);
+    linear_a_before = linear_a->clone();
     const double linear_loss = qwen36_train_step(
         ctx, &input_ids, &target_mask, &attention_mask);
     c10::cuda::device_synchronize();
