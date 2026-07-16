@@ -505,6 +505,17 @@ static at::Tensor linear_attention(
 
     // Non-chunked path (original code)
     auto qkv = at::matmul(hidden, in_proj_qkv.t());
+
+    // DIAG: dump after QKV projection
+    if (getenv("QWEN36_DUMP_LAYERS")) {
+        auto qkv_f = qkv.to(at::kFloat);
+        fprintf(stderr, "[diag-na] qkv_proj: mean=%.6f std=%.6f [0,0,:5]=%.6f,%.6f,%.6f,%.6f,%.6f\n",
+                qkv_f.mean().item<float>(), qkv_f.std().item<float>(),
+                qkv_f[0][0][0].item<float>(), qkv_f[0][0][1].item<float>(),
+                qkv_f[0][0][2].item<float>(), qkv_f[0][0][3].item<float>(),
+                qkv_f[0][0][4].item<float>());
+    }
+
     auto qkv_t = qkv.transpose(1, 2);
     int64_t pad = conv_kernel - 1;
     auto padding = at::zeros({batch, qkv_dim, pad}, qkv.options());
@@ -581,12 +592,29 @@ static at::Tensor linear_attention(
     auto core_out = outs.reshape({batch, num_v_heads, seq, val_dim})
                          .transpose(1, 2).to(compute_type);
 
+    // DIAG: dump after delta rule
+    if (getenv("QWEN36_DUMP_LAYERS")) {
+        auto co_f = core_out.to(at::kFloat);
+        fprintf(stderr, "[diag-na] after_delta: mean=%.6f std=%.6f [0,0,0,:3]=%.6f,%.6f,%.6f\n",
+                co_f.mean().item<float>(), co_f.std().item<float>(),
+                co_f[0][0][0][0].item<float>(), co_f[0][0][0][1].item<float>(), co_f[0][0][0][2].item<float>());
+    }
+
     auto core_flat = core_out.reshape({-1, val_dim});
     auto z_flat = z.reshape({-1, val_dim});
     auto variance = core_flat.to(at::kFloat).pow(2).mean(-1, true);
     auto normed = (core_flat.to(at::kFloat) * (variance + rms_eps).rsqrt() * norm_w.to(at::kFloat)).to(core_flat.scalar_type());
     auto gated = (normed * at::silu(z_flat.to(at::kFloat)).to(normed.scalar_type())).view({batch, seq, num_v_heads * val_dim});
     auto result = at::matmul(gated, out_proj.t());
+
+    // DIAG: dump after norm+gate+out_proj
+    if (getenv("QWEN36_DUMP_LAYERS")) {
+        auto r_f = result.to(at::kFloat);
+        fprintf(stderr, "[diag-na] after_out_proj: mean=%.6f std=%.6f [0,0,:3]=%.6f,%.6f,%.6f\n",
+                r_f.mean().item<float>(), r_f.std().item<float>(),
+                r_f[0][0][0].item<float>(), r_f[0][0][1].item<float>(), r_f[0][0][2].item<float>());
+    }
+
     return result;
 }
 
@@ -1782,6 +1810,14 @@ static at::Tensor forward_layer_group(
 
         hidden = forward_single_layer(ctx, hidden, layer_w.data(), &ctx->layer_configs[i], i,
             kind, ctx->attention_mask, ctx->lora_batch_valid);
+
+        // Debug: dump per-layer hidden state stats (also in checkpoint recompute path)
+        if (getenv("QWEN36_DUMP_LAYERS")) {
+            auto h_f = hidden.to(at::kFloat);
+            fprintf(stderr, "[dump] layer %ld: mean=%.6f std=%.6f [0,0,:3]=%.6f,%.6f,%.6f\n",
+                    (long)i, h_f.mean().item<float>(), h_f.std().item<float>(),
+                    h_f[0][0][0].item<float>(), h_f[0][0][1].item<float>(), h_f[0][0][2].item<float>());
+        }
     }
     return hidden;
 }

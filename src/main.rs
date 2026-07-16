@@ -748,9 +748,10 @@ fn run_ep_bench(
 
     // Session setup
     let sid = "bench";
-    let model_path = "/mnt/workspace/huggingface/hub/models--Qwen--Qwen3.6-35B-A3B/snapshots/995ad96eacd98c81ed38be0c5b274b04031597b0";
+    let model_path = std::env::var("RUSTRAIN_MODEL_PATH")
+        .unwrap_or_else(|_| "/mnt/workspace/huggingface/hub/models--Qwen--Qwen3.6-35B-A3B/snapshots/995ad96eacd98c81ed38be0c5b274b04031597b0".to_string());
     let lt = "[\"linear_attention\",\"linear_attention\",\"linear_attention\",\"full_attention\"]";
-    let lt_full = std::iter::repeat(lt).take(10).collect::<Vec<_>>().join(",");
+    let lt_full = std::iter::repeat(lt).take(8).collect::<Vec<_>>().join(",");
     let config_toml = format!(r#"
 [run]
 name="bench"
@@ -760,10 +761,10 @@ name="bench"
 architecture="qwen3_6_lora_sft"
 model_path="{model_path}"
 vocab_size=248320
-hidden_size=2048
-num_layers=40
+hidden_size=4096
+num_layers=32
 num_attention_heads=16
-num_key_value_heads=2
+num_key_value_heads=4
 head_dim=256
 seq_len={seq_len}
 norm="rmsnorm"
@@ -777,9 +778,9 @@ linear_key_head_dim=128
 linear_num_value_heads=32
 linear_value_head_dim=128
 linear_conv_kernel_dim=4
-num_experts=256
-num_experts_per_tok=8
-moe_intermediate_size=512
+num_experts=0
+num_experts_per_tok=0
+moe_intermediate_size=0
 [train]
 max_steps=100000
 backend="tch"
