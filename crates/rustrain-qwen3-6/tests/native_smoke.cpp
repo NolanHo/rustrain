@@ -25,6 +25,7 @@ extern "C" void* qwen36_create_training_context(
     const int64_t*, int64_t, const char*);
 extern "C" int64_t qwen36_kernel_abi_version();
 extern "C" int32_t qwen36_init_nccl(void*);
+extern "C" void qwen36_set_nccl_comm(void*, void*, void*, int32_t, int32_t);
 extern "C" int64_t qwen36_get_lora_count(void*);
 extern "C" void* qwen36_get_lora_a(void*, int64_t);
 extern "C" void* qwen36_get_lora_b(void*, int64_t);
@@ -128,6 +129,22 @@ int main() {
     config.nccl_stream = nullptr;
 
     const int64_t target_layer = 0;
+    // Native C++ must reject a mixed TP/DP/EP topology even when Rust-side
+    // validation is bypassed. The smoke process is single-rank, so simulate
+    // an invalid world before creating the real context.
+    if (world == 1 && tp_size == 1) {
+        setenv("TP_SIZE", "2", 1);
+        setenv("WORLD_SIZE", "4", 1);
+        void* invalid_topology_ctx = qwen36_create_training_context(
+            weight_ptrs.data(), static_cast<int64_t>(weight_ptrs.size()),
+            &embed, &final_norm, &lm_head, &config, 1,
+            static_cast<int32_t>(at::kBFloat16),
+            1.0, 1e-3, 0.9, 0.999, 1e-8, vocab, 1e-5, rank,
+            &target_layer, 1, "experts_gate_up_proj,experts_down_proj");
+        assert(invalid_topology_ctx == nullptr);
+        setenv("TP_SIZE", "1", 1);
+        setenv("WORLD_SIZE", "1", 1);
+    }
     void* ctx = qwen36_create_training_context(
         weight_ptrs.data(), static_cast<int64_t>(weight_ptrs.size()),
         &embed, &final_norm, &lm_head, &config, 1,
@@ -313,6 +330,18 @@ int main() {
         ctx, adapter_one, 0, "shared_gate_proj", 1) != nullptr);
     assert(qwen36_get_adapter_lora_tensor(
         ctx, adapter_two, 0, "shared_gate_proj", 1) != nullptr);
+    // Different tenant rows can have different token counts. The current
+    // native DP path only has one aggregate count, so reject batch=n_total
+    // instead of silently applying the wrong cross-rank weighting.
+    setenv("RUSTRAIN_DATA_PARALLEL", "1", 1);
+    qwen36_set_nccl_comm(ctx, nullptr, nullptr, 0, 2);
+    assert(qwen36_train_multi_lora(
+        ctx, &multi_input_ids, &multi_target_mask, &multi_attention_mask,
+        2, rank) < 0.0);
+    assert(qwen36_get_adapter_step_count(ctx, adapter_one) == 2);
+    assert(qwen36_get_adapter_step_count(ctx, adapter_two) == 1);
+    unsetenv("RUSTRAIN_DATA_PARALLEL");
+    qwen36_set_nccl_comm(ctx, nullptr, nullptr, 0, 1);
     qwen36_free_training_context(ctx);
 
     // Dense Qwen3.5 variants use the same per-sample activation path for

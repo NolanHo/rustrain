@@ -1584,6 +1584,9 @@ struct TrainingContext {
     cudaStream_t tp_stream = nullptr;
     int tp_world_size = 1;
     int tp_rank = 0;
+    // Set when a legacy NCCL setter supplies an incompatible mixed topology.
+    // Training entry points reject the context before touching parameters.
+    bool topology_invalid = false;
     int cuda_device = 0;
 // ──────────────────────────────────────────────────────────────────────
 };
@@ -3779,6 +3782,19 @@ __attribute__((visibility("default"))) void* qwen36_create_training_context(
         if (!tp_size_env) tp_size_env = getenv("RUSTRAIN_TP_SIZE");
         ctx->tp_world_size = tp_size_env ? atoi(tp_size_env) : 1;
         TORCH_CHECK(ctx->tp_world_size > 0, "TP_SIZE must be positive");
+        const char* world_size_env = getenv("WORLD_SIZE");
+        const int configured_world_size = world_size_env ? atoi(world_size_env) : 1;
+        TORCH_CHECK(configured_world_size > 0, "WORLD_SIZE must be positive");
+        const bool data_parallel_requested = env_enabled("RUSTRAIN_DATA_PARALLEL");
+        TORCH_CHECK(
+            ctx->tp_world_size <= 1 ||
+                (!data_parallel_requested && configured_world_size == ctx->tp_world_size),
+            "native Qwen LoRA supports TP-only topology when TP_SIZE>1; "
+            "TP_SIZE=", ctx->tp_world_size, " WORLD_SIZE=", configured_world_size,
+            " DATA_PARALLEL=", data_parallel_requested ? 1 : 0,
+            " is an incompatible mixed TP/DP/EP topology");
+        ctx->ep_world_size = configured_world_size;
+        ctx->data_parallel = data_parallel_requested;
         const char* rank_env = getenv("RANK");
         const int global_rank = rank_env ? atoi(rank_env) : 0;
         ctx->tp_rank = global_rank % ctx->tp_world_size;
@@ -3977,6 +3993,8 @@ __attribute__((visibility("default"))) double qwen36_train_micro_step(
 ) {
     try {
         auto* ctx = reinterpret_cast<TrainingContext*>(ctx_ptr);
+        TORCH_CHECK(!ctx->topology_invalid,
+            "native Qwen context rejected an incompatible TP/DP/EP topology");
         GradientAccumulationFailureGuard accumulation_guard{ctx};
         TORCH_CHECK(gradient_scale > 0.0 && std::isfinite(gradient_scale),
             "gradient_scale must be finite and positive");
@@ -4356,6 +4374,8 @@ __attribute__((visibility("default"))) double qwen36_train_multi_lora(
 ) {
     try {
         auto* ctx = reinterpret_cast<TrainingContext*>(ctx_ptr);
+        TORCH_CHECK(!ctx->topology_invalid,
+            "native Qwen context rejected an incompatible TP/DP/EP topology");
         GradientAccumulationFailureGuard accumulation_guard{ctx};
         if (ctx->nccl_comm) {
             c10::cuda::set_device(ctx->cuda_device);
@@ -4376,6 +4396,10 @@ __attribute__((visibility("default"))) double qwen36_train_multi_lora(
         TORCH_CHECK(input_batch == 1 || input_batch == n_total,
             "multi-LoRA input batch must be 1 or n_total (batch=", input_batch,
             ", n_total=", n_total, ")");
+        TORCH_CHECK(
+            !(input_batch == n_total && ctx->data_parallel && ctx->ep_world_size > 1),
+            "dynamic multi-LoRA DP requires shared batch-1/equal tenant masks; "
+            "per-tenant batch with DP unsupported");
         TORCH_CHECK(target_mask.size(0) == input_batch &&
                     target_mask.size(1) == input_ids.size(1),
             "target_mask must match input_ids shape");
@@ -4824,6 +4848,16 @@ __attribute__((visibility("default"))) int32_t qwen36_init_nccl(
         ctx->tp_world_size = tp_size_str2 ? atoi(tp_size_str2) : 1;
         ctx->tp_rank = ctx->tp_world_size > 0
             ? ctx->ep_rank % ctx->tp_world_size : 0;
+        if (ctx->tp_world_size <= 0 ||
+            (ctx->tp_world_size > 1 &&
+                (ctx->data_parallel || ctx->ep_world_size != ctx->tp_world_size))) {
+            ctx->topology_invalid = true;
+            fprintf(stderr,
+                "[tp_nccl] reject mixed topology: TP_SIZE=%d WORLD_SIZE=%d DATA_PARALLEL=%d\n",
+                ctx->tp_world_size, ctx->ep_world_size, ctx->data_parallel ? 1 : 0);
+            return -1;
+        }
+        ctx->topology_invalid = false;
         ctx->tp_comm = ctx->tp_world_size > 1 ? g_tp_comm : nullptr;
         ctx->tp_stream = ctx->tp_world_size > 1 ? g_tp_stream : nullptr;
         // In TP-only mode the parent communicator is reserved for the TP
@@ -4846,6 +4880,19 @@ __attribute__((visibility("default"))) int32_t qwen36_init_nccl(
     if (!rank_str || !world_str) return -1;
     int rank = atoi(rank_str);
     int world_size = atoi(world_str);
+    const char* tp_size_str = getenv("TP_SIZE");
+    if (!tp_size_str) tp_size_str = getenv("RUSTRAIN_TP_SIZE");
+    const int configured_tp_size = tp_size_str ? atoi(tp_size_str) : 1;
+    const bool data_parallel_requested = env_enabled("RUSTRAIN_DATA_PARALLEL");
+    if (configured_tp_size <= 0 ||
+        (configured_tp_size > 1 &&
+            (data_parallel_requested || world_size != configured_tp_size))) {
+        ctx->topology_invalid = true;
+        fprintf(stderr,
+            "[tp_nccl] reject mixed topology: TP_SIZE=%d WORLD_SIZE=%d DATA_PARALLEL=%d\n",
+            configured_tp_size, world_size, data_parallel_requested ? 1 : 0);
+        return -1;
+    }
     if (world_size <= 1) return 0;  // no EP needed
 
     // Set CUDA device and initialize PyTorch CUDA context on this device.
@@ -4944,8 +4991,6 @@ __attribute__((visibility("default"))) int32_t qwen36_init_nccl(
     // Store as process-level singleton
     g_nccl_comm = comm;
     g_nccl_stream = nccl_stream;
-    const char* tp_size_str = getenv("TP_SIZE");
-    if (!tp_size_str) tp_size_str = getenv("RUSTRAIN_TP_SIZE");
     const int tp_size = tp_size_str ? atoi(tp_size_str) : 1;
     if (tp_size <= 0 || world_size % tp_size != 0) {
         fprintf(stderr, "[tp_nccl] invalid TP_SIZE=%d for WORLD_SIZE=%d\n",
@@ -5003,6 +5048,16 @@ __attribute__((visibility("default"))) void qwen36_set_nccl_comm(
     ctx->ep_rank = ep_rank;
     ctx->ep_world_size = ep_world_size;
     ctx->data_parallel = env_enabled("RUSTRAIN_DATA_PARALLEL");
+    if (ctx->tp_world_size <= 0 ||
+        (ctx->tp_world_size > 1 &&
+            (ctx->data_parallel || ep_world_size != ctx->tp_world_size))) {
+        ctx->topology_invalid = true;
+        fprintf(stderr,
+            "[tp_nccl] reject mixed topology: TP_SIZE=%d WORLD_SIZE=%d DATA_PARALLEL=%d\n",
+            ctx->tp_world_size, ep_world_size, ctx->data_parallel ? 1 : 0);
+        return;
+    }
+    ctx->topology_invalid = false;
     int current_device = g_cuda_device;
     cudaGetDevice(&current_device);
     ctx->cuda_device = current_device;
