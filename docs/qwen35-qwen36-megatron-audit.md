@@ -44,6 +44,8 @@ Megatron 的 TP 会按 head、hidden/intermediate 和 vocab 维度切分权重�
 
 当前粗粒度 C++ FFI、grouped MoE 和 activation checkpoint/offload 是有效优化，但尚无 Megatron/Transformer Engine 级别的端到端数据：没有完整模型在同一 GPU、序列长度、microbatch、精度和通信配置下的 tokens/s、显存、扩展效率对照，也没有 FP8/FP4 参数与 fused attention/DeepEP 的 Qwen 路径。
 
+本次 native benchmark 没有证明 gated A2A 的端到端 step-time 优势：在该小型 workload 上 sharded A2A 的中位 step 反而比 legacy 高约 `23%`。它没有实现 DeepEP 的 fused permutation、GPU-only split planning 或通信计算 overlap，也没有覆盖 H=`2048`/E=`256` 的完整 Qwen3.6 workload。legacy 模式复制输入 batch，因此必须同时报告唯一样本吞吐，不能只看所有 rank 的 processed tokens/s。
+
 目标 H20 的 ABI1 环境有 PyTorch 2.12.1、Triton 和 NumPy，但没有 Megatron、Transformer Engine、DeepEP、flash-attn、Apex 或缓存的兼容 prebuilt wheel。本地 Megatron 的 Qwen3.5 35B-A3B 入口强制 TE/flash-attn，且是 full-parameter SFT，不提供 trainable LoRA wrapper；其 `moe_perf` 也固定 TE grouped MLP 和 H100 条件。因此当前不能诚实地产出 matched Megatron-LoRA benchmark，且本工作没有通过 JIT 或自构建依赖绕过该限制。
 
 ## 验证边界
@@ -57,3 +59,29 @@ Megatron 的 TP 会按 head、hidden/intermediate 和 vocab 维度切分权重�
 3. 将 EP dispatch/combine 替换为 fused/异步路径，并测量通信与计算重叠。
 4. 为 LoRA 增加 FP32 accumulation、每 adapter optimizer step、可恢复的 accumulation 状态和 rank-sharded checkpoint。
 5. 在固定硬件和 workload 上，与 Megatron-LM 记录 tokens/s、step time、峰值显存、通信占比和 loss 曲线。
+
+## Native EP Benchmark Artifact
+
+`crates/rustrain-qwen3-6/tests/native_ep_bench.cpp` is a dependency-free
+synthetic baseline for the native Qwen C ABI. It times complete
+`qwen36_train_step` calls (forward, backward, and Adam) with CUDA events and
+accepts `BENCH_SEQ`, `BENCH_HIDDEN`, `BENCH_EXPERTS`, `BENCH_INTERMEDIATE`,
+`BENCH_WARMUP`, and `BENCH_ITERS`. It reports processed and unique tokens/s,
+per-rank step statistics, and free memory. This is not a Megatron-LM
+comparison and does not claim DeepEP or Transformer Engine parity.
+
+Fresh H20 ABI0 run (`seq=128, hidden=256, experts=8, intermediate=256,
+warmup=2, iters=10`, two ranks):
+
+| Mode | Rank | Median step | Mean step | Processed tokens/s | Unique tokens/s | Status |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Legacy EP (`QWEN36_EP_A2A=0`) | 0 | 5.4752 ms | 5.4902 ms | 46,391 | 23,196 | 0 |
+| Legacy EP (`QWEN36_EP_A2A=0`) | 1 | 5.4672 ms | 5.4591 ms | 46,459 | 23,230 | 0 |
+| Sharded A2A (`QWEN36_EP_A2A=1`, `QWEN36_EP_A2A_SHARDED=1`) | 0 | 6.7192 ms | 6.7459 ms | 37,802 | 37,802 | 0 |
+| Sharded A2A (`QWEN36_EP_A2A=1`, `QWEN36_EP_A2A_SHARDED=1`) | 1 | 6.7261 ms | 6.7458 ms | 37,763 | 37,763 | 0 |
+
+Each rank processed 127 local tokens and 254 processed tokens per step. In
+replicated legacy EP, unique tokens/s is 127 tokens divided by step time;
+sharded A2A has 254 unique global tokens per step. These are synthetic native
+measurements only; workload, precision, packing, and communication semantics
+are not matched to Megatron-LM.

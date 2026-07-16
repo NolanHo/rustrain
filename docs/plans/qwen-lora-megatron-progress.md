@@ -37,6 +37,7 @@ Not yet verified or implemented: Megatron-style frozen base-weight TP, multi-axi
 - H20 `123.57.26.97:28004`: ABI11 EP2 full-expert parity smoke passed with distinct rank-local base and LoRA expert slices; loss, A/B updates, m/v, and standard Adam first-step oracle all matched the rank-local full-expert reference (`rank_statuses=0,0`).
 - H20 `123.57.26.97:28004`: gated A2A EP2 smoke passed in legacy, replicated-source, and sharded-source modes (`rank_statuses=0,0`). Sharded mode used token counts `[1,3]`; weighted global loss differed from the full-batch reference by `9.6e-7`, expert m/v maxima were `1.22e-5` / `3.92e-9`, and every standard Adam oracle was zero. One distributed BF16 parameter landed in the adjacent rounding bin (`9.61e-4`), bounded separately by the smoke.
 - Target runtime probe: PyTorch 2.5.1+cu121, ABI0; Transformer Engine, flash-attn, DeepEP, Triton, and DeepSpeed are not importable.
+- H20 `123.57.26.97:28004`: `native_ep_bench.cpp` fresh ABI0 benchmark (`seq=128, hidden=256, experts=8, intermediate=256, warmup=2, iters=10`) passed legacy and sharded A2A with `rank_statuses=0,0`. Legacy median was about `5.47 ms` / `46.4k processed tokens/s` (`23.2k unique tokens/s`), while sharded A2A was about `6.72 ms` / `37.8k processed and unique tokens/s`. This is a synthetic native baseline, not Megatron-LM parity.
 
 # Decisions During Execution
 
