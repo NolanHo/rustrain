@@ -3731,6 +3731,11 @@ __attribute__((visibility("default"))) double qwen36_train_micro_step(
         }
 
         if (!apply_optimizer) {
+            // The forward graph has been consumed, but parameters remain
+            // live for the next micro-batch. Never reuse cached LoRA deltas
+            // whose autograd nodes were freed by this backward.
+            ctx->lora_cache_valid = false;
+            ctx->lora_batch_valid = false;
             return loss_val;
         }
 
