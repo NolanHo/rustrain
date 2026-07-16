@@ -32,6 +32,7 @@ extern "C" double qwen36_train_step(void*, void*, void*, void*);
 extern "C" double qwen36_train_micro_step(
     void*, void*, void*, void*, double, int32_t);
 extern "C" int64_t qwen36_get_step_count(void*);
+extern "C" int32_t qwen36_set_step_count(void*, int64_t);
 extern "C" double qwen36_eval_step(void*, void*, void*, void*);
 extern "C" double qwen36_train_multi_lora(
     void*, void*, void*, void*, int32_t, int32_t);
@@ -356,6 +357,11 @@ int main() {
     assert(qwen36_set_lora_tensor(ctx, 0, 1, &linear_b_value) == 0);
     auto linear_a_before = linear_a->clone();
     assert(qwen36_get_step_count(ctx) == 0);
+    assert(qwen36_set_step_count(ctx, -1) != 0);
+    assert(qwen36_get_step_count(ctx) == 0);
+    assert(qwen36_set_step_count(ctx, 7) == 0);
+    assert(qwen36_get_step_count(ctx) == 7);
+    assert(qwen36_set_step_count(ctx, 0) == 0);
     const double accum_loss_0 = qwen36_train_micro_step(
         ctx, &input_ids, &target_mask, &attention_mask, 0.5, 0);
     c10::cuda::device_synchronize();

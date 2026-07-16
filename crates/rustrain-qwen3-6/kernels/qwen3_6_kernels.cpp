@@ -3456,7 +3456,7 @@ static at::Tensor mtp_compute_loss(
 extern "C" {
 
 __attribute__((visibility("default"))) int64_t qwen36_kernel_abi_version() {
-    return 7;
+    return 8;
 }
 
 // Create training context — called once at startup
@@ -4827,6 +4827,16 @@ double qwen36_eval_step(void* ctx_ptr, void* input_ids_ptr, void* target_mask_pt
 __attribute__((visibility("default")))
 int64_t qwen36_get_step_count(void* ctx_ptr) {
     return (int64_t)reinterpret_cast<TrainingContext*>(ctx_ptr)->step_count;
+}
+
+// Restore the Adam bias-correction clock independently from tensor state.
+// Checkpoint loading imports m/v through a separate ABI, so omitting this
+// value would resume the next update as step 1 even for a mature optimizer.
+__attribute__((visibility("default")))
+int32_t qwen36_set_step_count(void* ctx_ptr, int64_t step_count) {
+    if (!ctx_ptr || step_count < 0) return -1;
+    reinterpret_cast<TrainingContext*>(ctx_ptr)->step_count = step_count;
+    return 0;
 }
 
 __attribute__((visibility("default")))

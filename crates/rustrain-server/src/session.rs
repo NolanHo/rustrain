@@ -1,6 +1,6 @@
 //! Training session trait + Qwen3.6 implementation.
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tch::{Device, Kind, Tensor};
@@ -820,6 +820,9 @@ impl TrainingSession for Qwen36Session {
                 ctx.import_optimizer_state(&data.adam_m, &data.adam_v)?;
                 tracing::info!(imported = data.adam_m.len(), "optimizer state imported");
             }
+            let native_step = i64::try_from(data.manifest.step)
+                .context("checkpoint step exceeds the native optimizer range")?;
+            ctx.set_step_count(native_step)?;
         }
         self.step = data.manifest.step;
         self.last_loss = data.manifest.loss;

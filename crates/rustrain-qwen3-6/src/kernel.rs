@@ -44,6 +44,7 @@ type FnGetLoraA = unsafe extern "C" fn(*mut c_void, i64) -> *mut c_void;
 type FnGetLoraB = unsafe extern "C" fn(*mut c_void, i64) -> *mut c_void;
 type FnSetLoraTensor = unsafe extern "C" fn(*mut c_void, i64, i32, *mut c_void) -> i32;
 type FnGetStepCount = unsafe extern "C" fn(*mut c_void) -> i64;
+type FnSetStepCount = unsafe extern "C" fn(*mut c_void, i64) -> i32;
 type FnExportOptimizer =
     unsafe extern "C" fn(*mut c_void, *mut *mut c_void, *mut *mut c_void, i64) -> i64;
 type FnImportOptimizer =
@@ -116,6 +117,7 @@ struct KernelHandles {
     get_lora_b: FnGetLoraB,
     set_lora_tensor: FnSetLoraTensor,
     get_step_count: FnGetStepCount,
+    set_step_count: FnSetStepCount,
     export_optimizer: FnExportOptimizer,
     import_optimizer: FnImportOptimizer,
     free_ctx: FnFreeCtx,
@@ -174,7 +176,7 @@ unsafe fn load_kernels() -> Option<KernelHandles> {
         }};
     }
     let abi_version: FnKernelAbiVersion = sym!("qwen36_kernel_abi_version");
-    if abi_version() != 7 {
+    if abi_version() != 8 {
         return None;
     }
     Some(KernelHandles {
@@ -188,6 +190,7 @@ unsafe fn load_kernels() -> Option<KernelHandles> {
         get_lora_b: sym!("qwen36_get_lora_b"),
         set_lora_tensor: sym!("qwen36_set_lora_tensor"),
         get_step_count: sym!("qwen36_get_step_count"),
+        set_step_count: sym!("qwen36_set_step_count"),
         export_optimizer: sym!("qwen36_export_optimizer_state"),
         import_optimizer: sym!("qwen36_import_optimizer_state"),
         free_ctx: sym!("qwen36_free_training_context"),
@@ -930,6 +933,16 @@ impl CppTrainingContext {
             None => return 0,
         };
         unsafe { (kh.get_step_count)(self.ptr) }
+    }
+
+    /// Restore the native Adam bias-correction step from a checkpoint.
+    pub fn set_step_count(&self, step_count: i64) -> Result<()> {
+        let kh = get_kernels().ok_or_else(|| anyhow::anyhow!("kernels not loaded"))?;
+        let status = unsafe { (kh.set_step_count)(self.ptr, step_count) };
+        if status != 0 {
+            bail!("C++ set_step_count failed for step {step_count}");
+        }
+        Ok(())
     }
 
     /// Export Adam optimizer state (m and v vectors).
