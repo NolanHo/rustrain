@@ -6,6 +6,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <vector>
 
 struct LayerConfig {
@@ -108,6 +109,15 @@ int main() {
     const int world = std::atoi(std::getenv("WORLD_SIZE") ? std::getenv("WORLD_SIZE") : "1");
     const int local_rank = std::atoi(
         std::getenv("LOCAL_RANK") ? std::getenv("LOCAL_RANK") : "0");
+    const int a2a = std::getenv("QWEN36_EP_A2A") &&
+        std::strcmp(std::getenv("QWEN36_EP_A2A"), "0") != 0;
+    // Variable-split A2A receives replicated source rows in rank order. The
+    // resulting BF16 GEMM/accumulation order is not bit-identical to the
+    // single-rank full-expert reference, while the Adam update oracle remains
+    // exact. Keep the legacy parity threshold strict and bound A2A drift.
+    const double param_tol = a2a ? 2e-4 : 1e-5;
+    const double m_tol = a2a ? 5e-3 : 1e-5;
+    const double v_tol = a2a ? 1e-5 : 1e-6;
     assert(world == 2 && rank >= 0 && rank < world);
     assert(!std::getenv("TP_SIZE") || std::atoi(std::getenv("TP_SIZE")) == 1);
     c10::cuda::CUDAGuard guard(local_rank);
@@ -335,14 +345,14 @@ int main() {
         *reinterpret_cast<at::Tensor*>(distributed_v[17]));
 
     std::printf(
-        "native_qwen36_ep_parity rank=%d world=%d top_k=2 "
+        "native_qwen36_ep_parity rank=%d world=%d top_k=2 a2a=%d "
         "distributed_loss=%0.8f reference_loss=%0.8f loss_diff=%0.8e "
         "gate_up_a_diff=%0.8e gate_up_b_diff=%0.8e "
         "down_a_diff=%0.8e down_b_diff=%0.8e "
         "adam_m_diff=%0.8e adam_v_diff=%0.8e "
         "adam_step_diffs=[%0.8e,%0.8e,%0.8e,%0.8e] "
         "updates=[%0.8e,%0.8e,%0.8e,%0.8e]\n",
-        rank, world, distributed_loss, reference_loss, loss_diff,
+        rank, world, a2a, distributed_loss, reference_loss, loss_diff,
         gate_up_a_diff, gate_up_b_diff, down_a_diff, down_b_diff,
         optimizer_m_diff, optimizer_v_diff,
         gate_up_a_adam_diff, gate_up_b_adam_diff,
@@ -355,12 +365,12 @@ int main() {
     assert(down_a_update > 0.0);
     assert(down_b_update > 0.0);
     assert(loss_diff <= 2e-2);
-    assert(gate_up_a_diff <= 1e-5);
-    assert(gate_up_b_diff <= 1e-5);
-    assert(down_a_diff <= 1e-5);
-    assert(down_b_diff <= 1e-5);
-    assert(optimizer_m_diff <= 1e-5);
-    assert(optimizer_v_diff <= 1e-6);
+    assert(gate_up_a_diff <= param_tol);
+    assert(gate_up_b_diff <= param_tol);
+    assert(down_a_diff <= param_tol);
+    assert(down_b_diff <= param_tol);
+    assert(optimizer_m_diff <= m_tol);
+    assert(optimizer_v_diff <= v_tol);
     assert(gate_up_a_adam_diff <= 1e-5);
     assert(gate_up_b_adam_diff <= 1e-5);
     assert(down_a_adam_diff <= 1e-5);

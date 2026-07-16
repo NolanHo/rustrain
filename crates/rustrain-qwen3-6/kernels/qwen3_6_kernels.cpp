@@ -845,6 +845,239 @@ static at::Tensor linear_attention_batched(TrainingContext* ctx, const at::Tenso
 // MoE
 // ──────────────────────────────────────────────────────────────────────
 
+static ncclDataType_t qwen36_nccl_dtype(at::ScalarType type) {
+    switch (type) {
+        case at::kFloat: return ncclFloat32;
+        case at::kHalf: return ncclFloat16;
+        case at::kBFloat16: return ncclBfloat16;
+        case at::kInt: return ncclInt;
+        case at::kLong: return ncclInt64;
+        default:
+            TORCH_CHECK(false, "unsupported NCCL dtype: ", type);
+    }
+}
+
+static std::vector<int32_t> qwen36_a2a_counts(
+    const at::Tensor& local_counts, ncclComm_t comm, cudaStream_t stream
+) {
+    const int world = static_cast<int>(local_counts.numel());
+    auto all_counts = at::empty({world, world}, local_counts.options());
+    auto err = ncclAllGather(
+        local_counts.data_ptr(), all_counts.data_ptr(), world,
+        ncclInt, comm, stream);
+    TORCH_CHECK(err == ncclSuccess, "EP A2A count all-gather failed: ",
+        ncclGetErrorString(err));
+    auto host = all_counts.to(at::TensorOptions().device(at::kCPU));
+    std::vector<int32_t> recv_counts(world);
+    auto ptr = host.data_ptr<int32_t>();
+    int rank = 0;
+    err = ncclCommUserRank(comm, &rank);
+    TORCH_CHECK(err == ncclSuccess, "ncclCommUserRank failed: ",
+        ncclGetErrorString(err));
+    for (int src = 0; src < world; ++src) {
+        recv_counts[src] = ptr[src * world + rank];
+        TORCH_CHECK(recv_counts[src] >= 0, "negative EP A2A receive count");
+    }
+    return recv_counts;
+}
+
+// Variable-split token dispatch. Metadata is deliberately non-differentiable;
+// only the hidden activation participates in the custom backward exchange.
+struct Qwen36A2ADispatchFunction : public torch::autograd::Function<Qwen36A2ADispatchFunction> {
+    static std::vector<at::Tensor> forward(
+        torch::autograd::AutogradContext* ctx,
+        at::Tensor input, at::Tensor expert_indices, at::Tensor token_indices,
+        int64_t expert_count, int64_t comm_ptr
+    ) {
+        auto comm = reinterpret_cast<ncclComm_t>(comm_ptr);
+        TORCH_CHECK(comm, "EP A2A requires an NCCL communicator");
+        int world = 1, rank = 0;
+        TORCH_CHECK(ncclCommCount(comm, &world) == ncclSuccess,
+            "ncclCommCount failed");
+        TORCH_CHECK(ncclCommUserRank(comm, &rank) == ncclSuccess,
+            "ncclCommUserRank failed");
+        TORCH_CHECK(expert_count > 0 && expert_indices.scalar_type() == at::kLong,
+            "invalid EP A2A expert metadata");
+        auto stream = c10::cuda::getCurrentCUDAStream(input.device().index()).stream();
+        const int64_t hidden = input.size(1);
+        std::vector<at::Tensor> indices(world);
+        std::vector<int32_t> send_counts(world, 0);
+        for (int dst = 0; dst < world; ++dst) {
+            auto mask = (expert_indices >= dst * expert_count) &
+                (expert_indices < (dst + 1) * expert_count);
+            indices[dst] = at::nonzero(mask).reshape({-1});
+            send_counts[dst] = static_cast<int32_t>(indices[dst].numel());
+        }
+        auto count_opts = at::TensorOptions().device(input.device()).dtype(at::kInt);
+        auto local_counts = at::empty({world}, count_opts);
+        auto host_counts = at::empty({world}, at::TensorOptions().device(at::kCPU).dtype(at::kInt));
+        std::memcpy(host_counts.data_ptr<int32_t>(), send_counts.data(), sizeof(int32_t) * world);
+        local_counts.copy_(host_counts);
+        auto recv_counts = qwen36_a2a_counts(local_counts, comm, stream);
+        std::vector<int64_t> send_offsets(world + 1, 0), recv_offsets(world + 1, 0);
+        for (int i = 0; i < world; ++i) {
+            send_offsets[i + 1] = send_offsets[i] + send_counts[i];
+            recv_offsets[i + 1] = recv_offsets[i] + recv_counts[i];
+        }
+        auto send_index = at::cat(indices, 0);
+        auto send_hidden = input.index_select(0, send_index).contiguous();
+        auto send_token = token_indices.index_select(0, send_index).contiguous();
+        auto send_expert = expert_indices.index_select(0, send_index).contiguous();
+        auto recv_hidden = at::empty({recv_offsets.back(), hidden}, input.options());
+        auto recv_token = at::empty({recv_offsets.back()}, token_indices.options());
+        auto recv_expert = at::empty({recv_offsets.back()}, expert_indices.options());
+        auto send_ptr = [&](at::Tensor& t, int64_t row, int64_t width) -> const void* {
+            return static_cast<const char*>(t.data_ptr()) +
+                row * width * t.element_size();
+        };
+        auto recv_ptr = [&](at::Tensor& t, int64_t row, int64_t width) -> void* {
+            return static_cast<char*>(t.data_ptr()) +
+                row * width * t.element_size();
+        };
+        TORCH_CHECK(ncclGroupStart() == ncclSuccess, "ncclGroupStart failed");
+        for (int peer = 0; peer < world; ++peer) {
+            const int64_t rows = send_counts[peer];
+            if (rows) {
+                auto err = ncclSend(send_ptr(send_hidden, send_offsets[peer], hidden),
+                    rows * hidden, qwen36_nccl_dtype(input.scalar_type()), peer, comm, stream);
+                TORCH_CHECK(err == ncclSuccess, "A2A hidden send failed: ", ncclGetErrorString(err));
+                err = ncclSend(send_ptr(send_token, send_offsets[peer], 1), rows,
+                    ncclInt64, peer, comm, stream);
+                TORCH_CHECK(err == ncclSuccess, "A2A token send failed: ", ncclGetErrorString(err));
+                err = ncclSend(send_ptr(send_expert, send_offsets[peer], 1), rows,
+                    ncclInt64, peer, comm, stream);
+                TORCH_CHECK(err == ncclSuccess, "A2A expert send failed: ", ncclGetErrorString(err));
+            }
+        }
+        for (int peer = 0; peer < world; ++peer) {
+            const int64_t rows = recv_counts[peer];
+            if (rows) {
+                auto err = ncclRecv(recv_ptr(recv_hidden, recv_offsets[peer], hidden),
+                    rows * hidden, qwen36_nccl_dtype(input.scalar_type()), peer, comm, stream);
+                TORCH_CHECK(err == ncclSuccess, "A2A hidden recv failed: ", ncclGetErrorString(err));
+                err = ncclRecv(recv_ptr(recv_token, recv_offsets[peer], 1), rows,
+                    ncclInt64, peer, comm, stream);
+                TORCH_CHECK(err == ncclSuccess, "A2A token recv failed: ", ncclGetErrorString(err));
+                err = ncclRecv(recv_ptr(recv_expert, recv_offsets[peer], 1), rows,
+                    ncclInt64, peer, comm, stream);
+                TORCH_CHECK(err == ncclSuccess, "A2A expert recv failed: ", ncclGetErrorString(err));
+            }
+        }
+        TORCH_CHECK(ncclGroupEnd() == ncclSuccess, "A2A dispatch group failed");
+        auto recv_local = recv_expert - rank * expert_count;
+        auto send_counts_tensor = at::empty({world}, count_opts);
+        auto recv_counts_tensor = at::empty({world}, count_opts);
+        std::memcpy(host_counts.data_ptr<int32_t>(), send_counts.data(), sizeof(int32_t) * world);
+        send_counts_tensor.copy_(host_counts);
+        std::memcpy(host_counts.data_ptr<int32_t>(), recv_counts.data(), sizeof(int32_t) * world);
+        recv_counts_tensor.copy_(host_counts);
+        ctx->save_for_backward({input, send_index, send_counts_tensor, recv_counts_tensor});
+        ctx->saved_data["comm"] = comm_ptr;
+        ctx->saved_data["expert_count"] = expert_count;
+        return {recv_hidden, recv_token, recv_local, send_index, send_counts_tensor, recv_counts_tensor};
+    }
+
+    static std::vector<at::Tensor> backward(
+        torch::autograd::AutogradContext* ctx, std::vector<at::Tensor> grad_output
+    ) {
+        auto saved = ctx->get_saved_variables();
+        auto input = saved[0];
+        auto send_index = saved[1];
+        auto send_counts = saved[2].to(at::TensorOptions().device(at::kCPU));
+        auto recv_counts = saved[3].to(at::TensorOptions().device(at::kCPU));
+        const int world = send_counts.numel();
+        auto comm = reinterpret_cast<ncclComm_t>(ctx->saved_data["comm"].toInt());
+        auto stream = c10::cuda::getCurrentCUDAStream(input.device().index()).stream();
+        std::vector<int32_t> sc(world), rc(world);
+        std::memcpy(sc.data(), send_counts.data_ptr<int32_t>(), sizeof(int32_t) * world);
+        std::memcpy(rc.data(), recv_counts.data_ptr<int32_t>(), sizeof(int32_t) * world);
+        std::vector<int64_t> so(world + 1, 0), ro(world + 1, 0);
+        for (int i = 0; i < world; ++i) { so[i + 1] = so[i] + sc[i]; ro[i + 1] = ro[i] + rc[i]; }
+        auto grad_input = at::zeros_like(input);
+        auto returned = at::empty({so.back(), input.size(1)}, input.options());
+        const size_t elem_bytes = input.element_size();
+        TORCH_CHECK(ncclGroupStart() == ncclSuccess, "ncclGroupStart failed");
+        for (int peer = 0; peer < world; ++peer) if (sc[peer]) {
+            auto err = ncclRecv(static_cast<char*>(returned.data_ptr()) + so[peer] * input.size(1) * elem_bytes,
+                sc[peer] * input.size(1), qwen36_nccl_dtype(input.scalar_type()), peer, comm, stream);
+            TORCH_CHECK(err == ncclSuccess, "A2A backward recv failed: ", ncclGetErrorString(err));
+        }
+        for (int peer = 0; peer < world; ++peer) if (rc[peer]) {
+            auto err = ncclSend(static_cast<const char*>(grad_output[0].data_ptr()) + ro[peer] * input.size(1) * elem_bytes,
+                rc[peer] * input.size(1), qwen36_nccl_dtype(input.scalar_type()), peer, comm, stream);
+            TORCH_CHECK(err == ncclSuccess, "A2A backward send failed: ", ncclGetErrorString(err));
+        }
+        TORCH_CHECK(ncclGroupEnd() == ncclSuccess, "A2A dispatch backward group failed");
+        grad_input.index_add_(0, send_index, returned);
+        return {grad_input, at::Tensor(), at::Tensor(), at::Tensor(), at::Tensor()};
+    }
+};
+
+struct Qwen36A2ACombineFunction : public torch::autograd::Function<Qwen36A2ACombineFunction> {
+    static at::Tensor forward(torch::autograd::AutogradContext* ctx,
+        at::Tensor local_output, at::Tensor send_counts,
+        at::Tensor recv_counts, int64_t comm_ptr) {
+        auto comm = reinterpret_cast<ncclComm_t>(comm_ptr);
+        const int world = send_counts.numel();
+        auto sc_cpu = send_counts.to(at::TensorOptions().device(at::kCPU));
+        auto rc_cpu = recv_counts.to(at::TensorOptions().device(at::kCPU));
+        std::vector<int32_t> sc(world), rc(world);
+        std::memcpy(sc.data(), sc_cpu.data_ptr<int32_t>(), sizeof(int32_t) * world);
+        std::memcpy(rc.data(), rc_cpu.data_ptr<int32_t>(), sizeof(int32_t) * world);
+        std::vector<int64_t> so(world + 1, 0), ro(world + 1, 0);
+        for (int i = 0; i < world; ++i) { so[i + 1] = so[i] + sc[i]; ro[i + 1] = ro[i] + rc[i]; }
+        auto stream = c10::cuda::getCurrentCUDAStream(local_output.device().index()).stream();
+        auto returned = at::empty({so.back(), local_output.size(1)}, local_output.options());
+        const size_t elem_bytes = local_output.element_size();
+        TORCH_CHECK(ncclGroupStart() == ncclSuccess, "ncclGroupStart failed");
+        for (int peer = 0; peer < world; ++peer) if (rc[peer]) {
+            auto err = ncclSend(static_cast<const char*>(local_output.data_ptr()) + ro[peer] * local_output.size(1) * elem_bytes,
+                rc[peer] * local_output.size(1), qwen36_nccl_dtype(local_output.scalar_type()), peer, comm, stream);
+            TORCH_CHECK(err == ncclSuccess, "A2A combine send failed: ", ncclGetErrorString(err));
+        }
+        for (int peer = 0; peer < world; ++peer) if (sc[peer]) {
+            auto err = ncclRecv(static_cast<char*>(returned.data_ptr()) + so[peer] * local_output.size(1) * elem_bytes,
+                sc[peer] * local_output.size(1), qwen36_nccl_dtype(local_output.scalar_type()), peer, comm, stream);
+            TORCH_CHECK(err == ncclSuccess, "A2A combine recv failed: ", ncclGetErrorString(err));
+        }
+        TORCH_CHECK(ncclGroupEnd() == ncclSuccess, "A2A combine group failed");
+        ctx->save_for_backward({send_counts, recv_counts});
+        ctx->saved_data["comm"] = comm_ptr;
+        return returned;
+    }
+
+    static std::vector<at::Tensor> backward(torch::autograd::AutogradContext* ctx,
+        std::vector<at::Tensor> grad_output) {
+        auto saved = ctx->get_saved_variables();
+        auto sc_cpu = saved[0].to(at::TensorOptions().device(at::kCPU));
+        auto rc_cpu = saved[1].to(at::TensorOptions().device(at::kCPU));
+        const int world = sc_cpu.numel();
+        std::vector<int32_t> sc(world), rc(world);
+        std::memcpy(sc.data(), sc_cpu.data_ptr<int32_t>(), sizeof(int32_t) * world);
+        std::memcpy(rc.data(), rc_cpu.data_ptr<int32_t>(), sizeof(int32_t) * world);
+        std::vector<int64_t> so(world + 1, 0), ro(world + 1, 0);
+        for (int i = 0; i < world; ++i) { so[i + 1] = so[i] + sc[i]; ro[i + 1] = ro[i] + rc[i]; }
+        auto comm = reinterpret_cast<ncclComm_t>(ctx->saved_data["comm"].toInt());
+        auto stream = c10::cuda::getCurrentCUDAStream(grad_output[0].device().index()).stream();
+        auto packed = grad_output[0].contiguous();
+        auto grad_local = at::empty({ro.back(), grad_output[0].size(1)}, grad_output[0].options());
+        const size_t elem_bytes = grad_output[0].element_size();
+        TORCH_CHECK(ncclGroupStart() == ncclSuccess, "ncclGroupStart failed");
+        for (int peer = 0; peer < world; ++peer) if (sc[peer]) {
+            auto err = ncclSend(static_cast<const char*>(packed.data_ptr()) + so[peer] * grad_output[0].size(1) * elem_bytes,
+                sc[peer] * grad_output[0].size(1), qwen36_nccl_dtype(grad_output[0].scalar_type()), peer, comm, stream);
+            TORCH_CHECK(err == ncclSuccess, "A2A combine backward send failed: ", ncclGetErrorString(err));
+        }
+        for (int peer = 0; peer < world; ++peer) if (rc[peer]) {
+            auto err = ncclRecv(static_cast<char*>(grad_local.data_ptr()) + ro[peer] * grad_output[0].size(1) * elem_bytes,
+                rc[peer] * grad_output[0].size(1), qwen36_nccl_dtype(grad_output[0].scalar_type()), peer, comm, stream);
+            TORCH_CHECK(err == ncclSuccess, "A2A combine backward recv failed: ", ncclGetErrorString(err));
+        }
+        TORCH_CHECK(ncclGroupEnd() == ncclSuccess, "A2A combine backward group failed");
+        return {grad_local, at::Tensor(), at::Tensor(), at::Tensor()};
+    }
+};
+
 struct RoutedExpertLora {
     const at::Tensor* gate_up_a = nullptr;  // [local_experts, rank, hidden]
     const at::Tensor* gate_up_b = nullptr;  // [local_experts, 2*intermediate, rank]
@@ -927,6 +1160,115 @@ static at::Tensor dynamic_expert_lora_delta(
     return tp_allreduce_lora_delta(ctx, delta * scaling);
 }
 
+static at::Tensor moe_routed_a2a(
+    TrainingContext* training_ctx, ncclComm_t comm,
+    const at::Tensor& flat, const at::Tensor& topk_weights,
+    const at::Tensor& topk_indices,
+    const at::Tensor& experts_gate_up, const at::Tensor& experts_down,
+    const RoutedExpertLora& expert_lora,
+    int64_t top_k, int64_t intermediate, int64_t expert_count,
+    int64_t batch, int64_t seq,
+    const LoraBatchEntry* expert_gate_up_lora,
+    const LoraBatchEntry* expert_down_lora
+) {
+    const int64_t hidden_dim = flat.size(1);
+    auto routed_output = at::zeros_like(flat);
+    auto token_indices = at::arange(
+        flat.size(0), at::TensorOptions().device(flat.device()).dtype(at::kLong));
+    for (int64_t kk = 0; kk < top_k; ++kk) {
+        auto expert_indices = topk_indices.select(-1, kk).contiguous();
+        auto dispatched = Qwen36A2ADispatchFunction::apply(
+            flat, expert_indices, token_indices, expert_count,
+            static_cast<int64_t>(reinterpret_cast<uintptr_t>(comm)));
+        auto received = dispatched[0];
+        auto received_tokens = dispatched[1];
+        auto received_experts = dispatched[2];
+        auto send_index = dispatched[3];
+        auto send_counts = dispatched[4];
+        auto recv_counts = dispatched[5];
+        auto local_output = at::zeros_like(received);
+        for (int64_t e_local = 0; e_local < expert_count; ++e_local) {
+            auto rows = at::nonzero(received_experts == e_local).reshape({-1});
+            if (rows.numel() == 0) continue;
+            auto selected = received.index_select(0, rows);
+            auto selected_tokens = received_tokens.index_select(0, rows);
+            auto selected_experts = received_experts.index_select(0, rows);
+            auto gu = at::matmul(selected, experts_gate_up.select(0, e_local).t());
+            if (expert_lora.gate_up_a && expert_lora.gate_up_b) {
+                auto a = expert_lora.gate_up_a->select(0, e_local);
+                auto b = expert_lora.gate_up_b->select(0, e_local);
+                auto delta = at::matmul(at::matmul(selected, a.t()), b.t()) *
+                    expert_lora.scaling;
+                gu = gu + tp_allreduce_lora_delta(training_ctx, delta);
+            }
+            if (expert_gate_up_lora) {
+                gu = gu + dynamic_expert_lora_delta(
+                    training_ctx, selected, selected_tokens, selected_experts,
+                    batch, seq, expert_gate_up_lora);
+            }
+            auto activated = fused_swiglu_op(
+                gu.narrow(-1, 0, intermediate),
+                gu.narrow(-1, intermediate, intermediate), 0.0);
+            auto expert_out = at::matmul(
+                activated, experts_down.select(0, e_local).t());
+            if (expert_lora.down_a && expert_lora.down_b) {
+                auto a = expert_lora.down_a->select(0, e_local);
+                auto b = expert_lora.down_b->select(0, e_local);
+                auto delta = at::matmul(at::matmul(activated, a.t()), b.t()) *
+                    expert_lora.scaling;
+                expert_out = expert_out +
+                    tp_allreduce_lora_delta(training_ctx, delta);
+            }
+            if (expert_down_lora) {
+                expert_out = expert_out + dynamic_expert_lora_delta(
+                    training_ctx, activated, selected_tokens, selected_experts,
+                    batch, seq, expert_down_lora);
+            }
+            local_output = local_output.index_add(0, rows, expert_out);
+        }
+
+        // Preserve a zero-valued dependency on every local expert LoRA when a
+        // rank receives no tokens. This keeps optimizer collective order equal
+        // across ranks without changing the output.
+        if (!local_output.requires_grad()) {
+            // Even without routed-expert LoRA, an empty destination must keep
+            // the dispatch activation edge alive. Its zero gradient is sent
+            // back to the source in the inverse dispatch backward.
+            at::Tensor anchor = received.sum().to(local_output.scalar_type());
+            auto include = [&](const at::Tensor* tensor) {
+                if (!tensor || !tensor->defined() || !tensor->requires_grad()) return;
+                auto value = tensor->sum().to(local_output.scalar_type());
+                anchor = anchor + value;
+            };
+            include(expert_lora.gate_up_a);
+            include(expert_lora.gate_up_b);
+            include(expert_lora.down_a);
+            include(expert_lora.down_b);
+            if (expert_gate_up_lora) {
+                include(&expert_gate_up_lora->a_stack);
+                include(&expert_gate_up_lora->b_stack);
+            }
+            if (expert_down_lora) {
+                include(&expert_down_lora->a_stack);
+                include(&expert_down_lora->b_stack);
+            }
+            local_output = local_output + anchor * 0.0;
+        }
+
+        // Expert results return in the source's packed dispatch order. Apply
+        // routing weights on the source rank, then restore source token order;
+        // this keeps router/hidden gradients on the correct source graph.
+        auto returned = Qwen36A2ACombineFunction::apply(
+            local_output, send_counts, recv_counts,
+            static_cast<int64_t>(reinterpret_cast<uintptr_t>(comm)));
+        auto source_weights = topk_weights.select(-1, kk)
+            .index_select(0, send_index).unsqueeze(-1);
+        routed_output = routed_output.index_add(
+            0, send_index, returned * source_weights);
+    }
+    return routed_output;
+}
+
 static at::Tensor moe_forward(
     TrainingContext* training_ctx,
     void* nccl_comm_v, void* nccl_stream_v,
@@ -959,6 +1301,32 @@ static at::Tensor moe_forward(
     topk_weights = topk_weights.to(compute_type);
 
     auto routed_output = at::zeros(flat.sizes(), flat.options());
+    bool use_a2a = false;
+    if (nccl_comm_v && env_enabled("QWEN36_EP_A2A") &&
+        !expert_gate_up_lora && !expert_down_lora) {
+        auto comm = reinterpret_cast<ncclComm_t>(nccl_comm_v);
+        int world = 1, rank = 0;
+        auto err = ncclCommCount(comm, &world);
+        TORCH_CHECK(err == ncclSuccess, "ncclCommCount failed: ",
+            ncclGetErrorString(err));
+        err = ncclCommUserRank(comm, &rank);
+        TORCH_CHECK(err == ncclSuccess, "ncclCommUserRank failed: ",
+            ncclGetErrorString(err));
+        TORCH_CHECK(world * expert_count == num_experts,
+            "EP A2A requires equal contiguous expert partitions: world=", world,
+            " local_experts=", expert_count, " global_experts=", num_experts);
+        TORCH_CHECK(expert_start == rank * expert_count,
+            "EP A2A requires rank-contiguous expert ownership: rank=", rank,
+            " expert_start=", expert_start, " local_experts=", expert_count);
+        use_a2a = world > 1;
+        if (use_a2a) {
+            routed_output = moe_routed_a2a(
+                training_ctx, comm, flat, topk_weights, topk_indices,
+                experts_gate_up, experts_down, expert_lora,
+                top_k, intermediate, expert_count, batch, seq,
+                expert_gate_up_lora, expert_down_lora);
+        }
+    }
 
     // Debug: dump MoE routing and weight stats
     if (getenv("QWEN36_DUMP_MOE")) {
@@ -978,7 +1346,7 @@ static at::Tensor moe_forward(
     // Autograd note: routing indices/weights are computed in no-grad forward (detached).
     // Only matmul inputs/outputs participate in autograd. sort/index_select/index_add
     // gradients are handled by PyTorch automatically.
-    for (int64_t kk = 0; kk < top_k; kk++) {
+    if (!use_a2a) for (int64_t kk = 0; kk < top_k; kk++) {
         auto expert_indices = topk_indices.select(-1, kk);   // [N*seq]
         auto expert_weights = topk_weights.select(-1, kk);   // [N*seq]
 
@@ -1147,7 +1515,7 @@ static at::Tensor moe_forward(
     // zero-valued dependency on routed-expert LoRA tensors so autograd still
     // produces defined zero gradients and every rank reaches the same NCCL
     // collectives. This changes only the graph, not the routed output values.
-    if (!routed_output.requires_grad()) {
+    if (!use_a2a && !routed_output.requires_grad()) {
         at::Tensor graph_anchor;
         auto include_anchor = [&](const at::Tensor* tensor) {
             if (!tensor || !tensor->defined() || !tensor->requires_grad()) return;
@@ -1174,7 +1542,7 @@ static at::Tensor moe_forward(
     }
 
     // EP all-reduce via NcclAllReduceFunction — custom autograd Function.
-    if (nccl_comm_v) {
+    if (nccl_comm_v && !use_a2a) {
         auto nccl_comm = reinterpret_cast<ncclComm_t>(nccl_comm_v);
         routed_output = NcclAllReduceFunction::apply(
             routed_output, (int64_t)nccl_comm,
@@ -1968,6 +2336,18 @@ static void synchronize_lora_gradients(
         }
     }
     if (per_adapter_weighting) return;
+    // The gated A2A prototype currently runs on the repository's replicated
+    // EP batch layout. Every source rank therefore sends an identical token
+    // batch to the owning expert. Average only the sharded expert parameter
+    // gradients here; scaling the combine backward would also under-scale the
+    // activation gradient returned to each source graph. Unequal source-token
+    // shards will require global-token weighting before this gate can become
+    // the default dispatcher.
+    const double replicated_a2a_expert_scale =
+        env_enabled("QWEN36_EP_A2A") && !ctx->data_parallel &&
+            ctx->ep_world_size > 1
+        ? 1.0 / static_cast<double>(ctx->ep_world_size)
+        : 1.0;
     for (int64_t layer = 0; layer < ctx->num_layers; ++layer) {
         auto table = lora_projection_table(ctx->layer_configs[layer]);
         int64_t offset = ctx->lora_layer_offset[layer];
@@ -1977,9 +2357,11 @@ static void synchronize_lora_gradients(
             if (table.entries[pair].grouped_expert) {
                 if (accumulated_token_weight > 0.0) {
                     reduce_lora_accumulator(
-                        ctx, ctx->grad_accum_a[offset + pair], scale, allreduce);
+                        ctx, ctx->grad_accum_a[offset + pair],
+                        scale * replicated_a2a_expert_scale, allreduce);
                     reduce_lora_accumulator(
-                        ctx, ctx->grad_accum_b[offset + pair], scale, allreduce);
+                        ctx, ctx->grad_accum_b[offset + pair],
+                        scale * replicated_a2a_expert_scale, allreduce);
                 }
                 continue;
             }
