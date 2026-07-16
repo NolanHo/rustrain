@@ -145,6 +145,17 @@ int main() {
         setenv("TP_SIZE", "1", 1);
         setenv("WORLD_SIZE", "1", 1);
     }
+    if (world == 1 && tp_size == 1) {
+        setenv("PP_SIZE", "2", 1);
+        void* invalid_pp_ctx = qwen36_create_training_context(
+            weight_ptrs.data(), static_cast<int64_t>(weight_ptrs.size()),
+            &embed, &final_norm, &lm_head, &config, 1,
+            static_cast<int32_t>(at::kBFloat16),
+            1.0, 1e-3, 0.9, 0.999, 1e-8, vocab, 1e-5, rank,
+            &target_layer, 1, "experts_gate_up_proj,experts_down_proj");
+        assert(invalid_pp_ctx == nullptr);
+        unsetenv("PP_SIZE");
+    }
     void* ctx = qwen36_create_training_context(
         weight_ptrs.data(), static_cast<int64_t>(weight_ptrs.size()),
         &embed, &final_norm, &lm_head, &config, 1,

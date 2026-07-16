@@ -3786,6 +3786,17 @@ __attribute__((visibility("default"))) void* qwen36_create_training_context(
         const int configured_world_size = world_size_env ? atoi(world_size_env) : 1;
         TORCH_CHECK(configured_world_size > 0, "WORLD_SIZE must be positive");
         const bool data_parallel_requested = env_enabled("RUSTRAIN_DATA_PARALLEL");
+        const char* pp_size_env = getenv("PP_SIZE");
+        if (!pp_size_env) pp_size_env = getenv("RUSTRAIN_PP_SIZE");
+        const char* cp_size_env = getenv("CP_SIZE");
+        if (!cp_size_env) cp_size_env = getenv("RUSTRAIN_CP_SIZE");
+        const int configured_pp_size = pp_size_env ? atoi(pp_size_env) : 1;
+        const int configured_cp_size = cp_size_env ? atoi(cp_size_env) : 1;
+        TORCH_CHECK(configured_pp_size > 0 && configured_cp_size > 0,
+            "PP_SIZE and CP_SIZE must be positive");
+        TORCH_CHECK(configured_pp_size == 1 && configured_cp_size == 1,
+            "native Qwen LoRA does not implement PP/CP yet; ",
+            "PP_SIZE=", configured_pp_size, " CP_SIZE=", configured_cp_size);
         TORCH_CHECK(
             ctx->tp_world_size <= 1 ||
                 (!data_parallel_requested && configured_world_size == ctx->tp_world_size),
