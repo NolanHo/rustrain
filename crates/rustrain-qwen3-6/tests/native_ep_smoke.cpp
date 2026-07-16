@@ -1,7 +1,9 @@
 #include <ATen/ATen.h>
 #include <c10/cuda/CUDAGuard.h>
 
+#include <algorithm>
 #include <cassert>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <vector>
@@ -22,8 +24,11 @@ extern "C" void* qwen36_create_training_context(
     double, double, double, double, double, int64_t, double, int64_t,
     const int64_t*, int64_t, const char*);
 extern "C" int32_t qwen36_init_nccl(void*);
+extern "C" int64_t qwen36_get_lora_count(void*);
+extern "C" void* qwen36_get_lora_a(void*, int64_t);
 extern "C" void* qwen36_get_lora_b(void*, int64_t);
 extern "C" int32_t qwen36_set_lora_tensor(void*, int64_t, int32_t, void*);
+extern "C" int64_t qwen36_export_optimizer_state(void*, void**, void**, int64_t);
 extern "C" double qwen36_train_step(void*, void*, void*, void*);
 extern "C" void qwen36_free_training_context(void*);
 
@@ -31,39 +36,123 @@ static at::Tensor cuda_rand(std::initializer_list<int64_t> shape) {
     return at::randn(shape, at::TensorOptions().device(at::kCUDA).dtype(at::kBFloat16));
 }
 
+static std::vector<void*> tensor_ptrs(std::vector<at::Tensor>& tensors) {
+    std::vector<void*> ptrs;
+    ptrs.reserve(tensors.size());
+    for (auto& tensor : tensors) ptrs.push_back(&tensor);
+    return ptrs;
+}
+
+static double max_abs_diff(const at::Tensor& actual, const at::Tensor& expected) {
+    assert(actual.sizes() == expected.sizes());
+    return (actual.to(at::kFloat) - expected.to(at::kFloat))
+        .abs().max().item<double>();
+}
+
+static double update_norm(const at::Tensor& after, const at::Tensor& before) {
+    return (after.to(at::kFloat) - before.to(at::kFloat))
+        .abs().sum().item<double>();
+}
+
+static double first_adam_step_diff(
+    const at::Tensor& actual,
+    const at::Tensor& before,
+    const at::Tensor& first_m,
+    const at::Tensor& first_v
+) {
+    constexpr double lr = 1e-3;
+    constexpr double beta1 = 0.9;
+    constexpr double beta2 = 0.999;
+    constexpr double eps = 1e-8;
+    auto m_hat = first_m.to(at::kFloat) / (1.0 - beta1);
+    auto v_hat = first_v.to(at::kFloat) / (1.0 - beta2);
+    auto expected = (before.to(at::kFloat) -
+        lr * m_hat / (v_hat.sqrt() + eps)).to(actual.scalar_type());
+    return max_abs_diff(actual, expected);
+}
+
+struct ExpertLora {
+    at::Tensor* gate_up_a;
+    at::Tensor* gate_up_b;
+    at::Tensor* down_a;
+    at::Tensor* down_b;
+};
+
+static ExpertLora get_expert_lora(void* ctx) {
+    assert(qwen36_get_lora_count(ctx) == 9);
+    ExpertLora lora{
+        reinterpret_cast<at::Tensor*>(qwen36_get_lora_a(ctx, 7)),
+        reinterpret_cast<at::Tensor*>(qwen36_get_lora_b(ctx, 7)),
+        reinterpret_cast<at::Tensor*>(qwen36_get_lora_a(ctx, 8)),
+        reinterpret_cast<at::Tensor*>(qwen36_get_lora_b(ctx, 8)),
+    };
+    assert(lora.gate_up_a && lora.gate_up_b && lora.down_a && lora.down_b);
+    return lora;
+}
+
+static void set_expert_lora(
+    void* ctx,
+    at::Tensor& gate_up_a,
+    at::Tensor& gate_up_b,
+    at::Tensor& down_a,
+    at::Tensor& down_b
+) {
+    assert(qwen36_set_lora_tensor(ctx, 7, 0, &gate_up_a) == 0);
+    assert(qwen36_set_lora_tensor(ctx, 7, 1, &gate_up_b) == 0);
+    assert(qwen36_set_lora_tensor(ctx, 8, 0, &down_a) == 0);
+    assert(qwen36_set_lora_tensor(ctx, 8, 1, &down_b) == 0);
+}
+
 int main() {
     const int rank = std::atoi(std::getenv("RANK") ? std::getenv("RANK") : "0");
     const int world = std::atoi(std::getenv("WORLD_SIZE") ? std::getenv("WORLD_SIZE") : "1");
-    const int local_rank = std::atoi(std::getenv("LOCAL_RANK") ? std::getenv("LOCAL_RANK") : "0");
+    const int local_rank = std::atoi(
+        std::getenv("LOCAL_RANK") ? std::getenv("LOCAL_RANK") : "0");
     assert(world == 2 && rank >= 0 && rank < world);
+    assert(!std::getenv("TP_SIZE") || std::atoi(std::getenv("TP_SIZE")) == 1);
     c10::cuda::CUDAGuard guard(local_rank);
-    // Replicated weights must be identical across EP ranks.
-    at::manual_seed(100);
 
+    // Every process deterministically creates the same global model. The EP
+    // context receives a distinct contiguous expert slice from that model.
+    at::manual_seed(100);
     constexpr int64_t hidden = 16;
     constexpr int64_t vocab = 8;
     constexpr int64_t experts = 2;
     constexpr int64_t head_dim = 8;
     constexpr int64_t intermediate = 8;
-    constexpr int64_t rank_lora = 4;
-    std::vector<at::Tensor> weights;
-    weights.push_back(cuda_rand({hidden}));
-    weights.push_back(cuda_rand({hidden}));
-    weights.push_back(cuda_rand({2 * head_dim, hidden}));
-    weights.push_back(cuda_rand({head_dim}));
-    weights.push_back(cuda_rand({head_dim, hidden}));
-    weights.push_back(cuda_rand({head_dim}));
-    weights.push_back(cuda_rand({head_dim, hidden}));
-    weights.push_back(cuda_rand({hidden, head_dim}));
-    weights.push_back(cuda_rand({experts, hidden}));
-    weights.push_back(cuda_rand({1, hidden}));
-    weights.push_back(cuda_rand({intermediate, hidden}));
-    weights.push_back(cuda_rand({intermediate, hidden}));
-    weights.push_back(cuda_rand({hidden, intermediate}));
-    // Each process owns exactly one expert row.
-    weights.push_back(cuda_rand({1, 2 * intermediate, hidden}));
-    weights.push_back(cuda_rand({1, hidden, intermediate}));
-    for (auto& weight : weights) weight.set_requires_grad(false);
+    constexpr int64_t lora_rank = 4;
+
+    std::vector<at::Tensor> global_weights;
+    global_weights.push_back(cuda_rand({hidden}));
+    global_weights.push_back(cuda_rand({hidden}));
+    global_weights.push_back(cuda_rand({2 * head_dim, hidden}));
+    global_weights.push_back(cuda_rand({head_dim}));
+    global_weights.push_back(cuda_rand({head_dim, hidden}));
+    global_weights.push_back(cuda_rand({head_dim}));
+    global_weights.push_back(cuda_rand({head_dim, hidden}));
+    global_weights.push_back(cuda_rand({hidden, head_dim}));
+    global_weights.push_back(cuda_rand({experts, hidden}));
+    global_weights.push_back(cuda_rand({1, hidden}));
+    global_weights.push_back(cuda_rand({intermediate, hidden}));
+    global_weights.push_back(cuda_rand({intermediate, hidden}));
+    global_weights.push_back(cuda_rand({hidden, intermediate}));
+    global_weights.push_back(cuda_rand({experts, 2 * intermediate, hidden}));
+    global_weights.push_back(cuda_rand({experts, hidden, intermediate}));
+    for (auto& weight : global_weights) weight.set_requires_grad(false);
+
+    assert(max_abs_diff(
+        global_weights[13].narrow(0, 0, 1),
+        global_weights[13].narrow(0, 1, 1)) > 0.0);
+    assert(max_abs_diff(
+        global_weights[14].narrow(0, 0, 1),
+        global_weights[14].narrow(0, 1, 1)) > 0.0);
+
+    std::vector<at::Tensor> distributed_weights = global_weights;
+    distributed_weights[13] = global_weights[13].narrow(0, rank, 1).contiguous();
+    distributed_weights[14] = global_weights[14].narrow(0, rank, 1).contiguous();
+    auto distributed_weight_ptrs = tensor_ptrs(distributed_weights);
+    auto reference_weight_ptrs = tensor_ptrs(global_weights);
+
     auto embed = cuda_rand({vocab, hidden});
     auto final_norm = cuda_rand({hidden});
     auto lm_head = cuda_rand({vocab, hidden});
@@ -71,53 +160,213 @@ int main() {
     final_norm.set_requires_grad(false);
     lm_head.set_requires_grad(false);
 
-    std::vector<void*> weight_ptrs;
-    for (auto& weight : weights) weight_ptrs.push_back(&weight);
-    LayerConfig config{};
-    config.layer_type = 0;
-    config.num_heads = 1;
-    config.num_kv_heads = 1;
-    config.head_dim = head_dim;
-    config.partial_rotary_factor = 1.0;
-    config.rope_theta = 10000.0;
-    config.rms_eps = 1e-5;
-    config.num_experts = experts;
-    // Route every token to both experts so both local shards exercise their
-    // expert LoRA optimizer path in this two-rank smoke.
-    config.top_k = 2;
-    config.moe_intermediate = intermediate;
-    config.expert_start = rank;
-    config.expert_count = 1;
-    config.norm_topk_prob = 1;
+    LayerConfig distributed_config{};
+    distributed_config.layer_type = 0;
+    distributed_config.num_heads = 1;
+    distributed_config.num_kv_heads = 1;
+    distributed_config.head_dim = head_dim;
+    distributed_config.partial_rotary_factor = 1.0;
+    distributed_config.rope_theta = 10000.0;
+    distributed_config.rms_eps = 1e-5;
+    distributed_config.num_experts = experts;
+    // With two experts, top_k=2 guarantees every token exercises both EP
+    // shards and both corresponding expert LoRA optimizer paths.
+    distributed_config.top_k = 2;
+    distributed_config.moe_intermediate = intermediate;
+    distributed_config.expert_start = rank;
+    distributed_config.expert_count = 1;
+    distributed_config.norm_topk_prob = 1;
+    distributed_config.nccl_comm = nullptr;
+    distributed_config.nccl_stream = nullptr;
+
+    LayerConfig reference_config = distributed_config;
+    reference_config.expert_start = 0;
+    reference_config.expert_count = experts;
 
     const int64_t target_layer = 0;
-    void* ctx = qwen36_create_training_context(
-        weight_ptrs.data(), static_cast<int64_t>(weight_ptrs.size()),
-        &embed, &final_norm, &lm_head, &config, 1,
+    const char* targets = "experts_gate_up_proj,experts_down_proj";
+    void* distributed_ctx = qwen36_create_training_context(
+        distributed_weight_ptrs.data(),
+        static_cast<int64_t>(distributed_weight_ptrs.size()),
+        &embed, &final_norm, &lm_head, &distributed_config, 1,
         static_cast<int32_t>(at::kBFloat16),
-        1.0, 1e-3, 0.9, 0.999, 1e-8, vocab, 1e-5, rank_lora,
-        &target_layer, 1, "experts_gate_up_proj,experts_down_proj");
-    assert(ctx);
-    assert(qwen36_init_nccl(ctx) == 0);
-    auto* lora_b = reinterpret_cast<at::Tensor*>(qwen36_get_lora_b(ctx, 7));
-    assert(lora_b);
-    auto lora_b_value = at::ones(lora_b->sizes(), lora_b->options());
-    assert(qwen36_set_lora_tensor(ctx, 7, 1, &lora_b_value) == 0);
-    auto before = lora_b->clone();
+        1.0, 1e-3, 0.9, 0.999, 1e-8, vocab, 1e-5, lora_rank,
+        &target_layer, 1, targets);
+    assert(distributed_ctx);
 
-    auto input_ids = at::tensor({1, 2},
-        at::TensorOptions().device(at::kCUDA).dtype(at::kLong)).reshape({1, 2});
-    auto target_mask = at::ones({1, 2},
+    // The reference owns all experts and deliberately never initializes NCCL.
+    // Its copied LayerConfig therefore retains null communication handles even
+    // though WORLD_SIZE remains two for the distributed process.
+    void* reference_ctx = qwen36_create_training_context(
+        reference_weight_ptrs.data(),
+        static_cast<int64_t>(reference_weight_ptrs.size()),
+        &embed, &final_norm, &lm_head, &reference_config, 1,
+        static_cast<int32_t>(at::kBFloat16),
+        1.0, 1e-3, 0.9, 0.999, 1e-8, vocab, 1e-5, lora_rank,
+        &target_layer, 1, targets);
+    assert(reference_ctx);
+
+    auto opts = at::TensorOptions().device(at::kCUDA).dtype(at::kFloat);
+    auto global_gate_up_a =
+        ((at::arange(experts * lora_rank * hidden, opts) + 1.0) * 1e-4)
+            .reshape({experts, lora_rank, hidden}).to(at::kBFloat16);
+    auto global_gate_up_b =
+        ((at::arange(experts * 2 * intermediate * lora_rank, opts) + 3.0) * 5e-5)
+            .reshape({experts, 2 * intermediate, lora_rank}).to(at::kBFloat16);
+    auto global_down_a =
+        ((at::arange(experts * lora_rank * intermediate, opts) + 5.0) * 8e-5)
+            .reshape({experts, lora_rank, intermediate}).to(at::kBFloat16);
+    auto global_down_b =
+        ((at::arange(experts * hidden * lora_rank, opts) + 7.0) * 6e-5)
+            .reshape({experts, hidden, lora_rank}).to(at::kBFloat16);
+
+    assert(max_abs_diff(
+        global_gate_up_a.narrow(0, 0, 1),
+        global_gate_up_a.narrow(0, 1, 1)) > 0.0);
+    assert(max_abs_diff(
+        global_down_b.narrow(0, 0, 1),
+        global_down_b.narrow(0, 1, 1)) > 0.0);
+
+    auto local_gate_up_a = global_gate_up_a.narrow(0, rank, 1).contiguous();
+    auto local_gate_up_b = global_gate_up_b.narrow(0, rank, 1).contiguous();
+    auto local_down_a = global_down_a.narrow(0, rank, 1).contiguous();
+    auto local_down_b = global_down_b.narrow(0, rank, 1).contiguous();
+    set_expert_lora(distributed_ctx,
+        local_gate_up_a, local_gate_up_b, local_down_a, local_down_b);
+    set_expert_lora(reference_ctx,
+        global_gate_up_a, global_gate_up_b, global_down_a, global_down_b);
+
+    auto distributed_lora = get_expert_lora(distributed_ctx);
+    auto reference_lora = get_expert_lora(reference_ctx);
+    assert(distributed_lora.gate_up_a->sizes() ==
+        at::IntArrayRef({1, lora_rank, hidden}));
+    assert(reference_lora.gate_up_a->sizes() ==
+        at::IntArrayRef({experts, lora_rank, hidden}));
+    assert(distributed_lora.gate_up_b->sizes() ==
+        at::IntArrayRef({1, 2 * intermediate, lora_rank}));
+    assert(distributed_lora.down_a->sizes() ==
+        at::IntArrayRef({1, lora_rank, intermediate}));
+    assert(distributed_lora.down_b->sizes() ==
+        at::IntArrayRef({1, hidden, lora_rank}));
+
+    auto gate_up_a_before = distributed_lora.gate_up_a->clone();
+    auto gate_up_b_before = distributed_lora.gate_up_b->clone();
+    auto down_a_before = distributed_lora.down_a->clone();
+    auto down_b_before = distributed_lora.down_b->clone();
+
+    // Initialize NCCL only after the reference context is fully constructed.
+    // qwen36_init_nccl mutates only the distributed context's copied configs.
+    assert(qwen36_init_nccl(distributed_ctx) == 0);
+
+    auto input_ids = at::tensor({1, 2, 3},
+        at::TensorOptions().device(at::kCUDA).dtype(at::kLong)).reshape({1, 3});
+    auto target_mask = at::ones({1, 3},
         at::TensorOptions().device(at::kCUDA).dtype(at::kFloat));
-    auto attention_mask = at::ones({1, 2},
+    auto attention_mask = at::ones({1, 3},
         at::TensorOptions().device(at::kCUDA).dtype(at::kBool));
-    const double loss = qwen36_train_step(ctx, &input_ids, &target_mask, &attention_mask);
+
+    const double distributed_loss = qwen36_train_step(
+        distributed_ctx, &input_ids, &target_mask, &attention_mask);
+    const double reference_loss = qwen36_train_step(
+        reference_ctx, &input_ids, &target_mask, &attention_mask);
     c10::cuda::device_synchronize();
-    const double update = (*lora_b - before).abs().sum().item<double>();
-    std::printf("native_qwen36_ep_smoke rank=%d world=%d loss=%0.8f lora_b_update=%0.8e\n",
-        rank, world, loss, update);
-    assert(loss == loss && loss > 0.0);
-    assert(update > 0.0);
-    qwen36_free_training_context(ctx);
+    assert(distributed_loss > 0.0 && std::isfinite(distributed_loss));
+    assert(reference_loss > 0.0 && std::isfinite(reference_loss));
+
+    const auto reference_slice = [rank](const at::Tensor& tensor) {
+        return tensor.narrow(0, rank, 1);
+    };
+    const double gate_up_a_diff = max_abs_diff(
+        *distributed_lora.gate_up_a, reference_slice(*reference_lora.gate_up_a));
+    const double gate_up_b_diff = max_abs_diff(
+        *distributed_lora.gate_up_b, reference_slice(*reference_lora.gate_up_b));
+    const double down_a_diff = max_abs_diff(
+        *distributed_lora.down_a, reference_slice(*reference_lora.down_a));
+    const double down_b_diff = max_abs_diff(
+        *distributed_lora.down_b, reference_slice(*reference_lora.down_b));
+    const double loss_diff = std::abs(distributed_loss - reference_loss);
+
+    const double gate_up_a_update = update_norm(
+        *distributed_lora.gate_up_a, gate_up_a_before);
+    const double gate_up_b_update = update_norm(
+        *distributed_lora.gate_up_b, gate_up_b_before);
+    const double down_a_update = update_norm(
+        *distributed_lora.down_a, down_a_before);
+    const double down_b_update = update_norm(
+        *distributed_lora.down_b, down_b_before);
+
+    constexpr int64_t optimizer_slots = 18;
+    std::vector<void*> distributed_m(optimizer_slots), distributed_v(optimizer_slots);
+    std::vector<void*> reference_m(optimizer_slots), reference_v(optimizer_slots);
+    assert(qwen36_export_optimizer_state(distributed_ctx,
+        distributed_m.data(), distributed_v.data(), optimizer_slots) == optimizer_slots);
+    assert(qwen36_export_optimizer_state(reference_ctx,
+        reference_m.data(), reference_v.data(), optimizer_slots) == optimizer_slots);
+
+    double optimizer_m_diff = 0.0;
+    double optimizer_v_diff = 0.0;
+    for (int64_t state_idx = 14; state_idx < optimizer_slots; ++state_idx) {
+        auto* local_m = reinterpret_cast<at::Tensor*>(distributed_m[state_idx]);
+        auto* local_v = reinterpret_cast<at::Tensor*>(distributed_v[state_idx]);
+        auto* full_m = reinterpret_cast<at::Tensor*>(reference_m[state_idx]);
+        auto* full_v = reinterpret_cast<at::Tensor*>(reference_v[state_idx]);
+        assert(local_m && local_v && full_m && full_v);
+        optimizer_m_diff = std::max(
+            optimizer_m_diff, max_abs_diff(*local_m, reference_slice(*full_m)));
+        optimizer_v_diff = std::max(
+            optimizer_v_diff, max_abs_diff(*local_v, reference_slice(*full_v)));
+    }
+
+    const double gate_up_a_adam_diff = first_adam_step_diff(
+        *distributed_lora.gate_up_a, gate_up_a_before,
+        *reinterpret_cast<at::Tensor*>(distributed_m[14]),
+        *reinterpret_cast<at::Tensor*>(distributed_v[14]));
+    const double gate_up_b_adam_diff = first_adam_step_diff(
+        *distributed_lora.gate_up_b, gate_up_b_before,
+        *reinterpret_cast<at::Tensor*>(distributed_m[15]),
+        *reinterpret_cast<at::Tensor*>(distributed_v[15]));
+    const double down_a_adam_diff = first_adam_step_diff(
+        *distributed_lora.down_a, down_a_before,
+        *reinterpret_cast<at::Tensor*>(distributed_m[16]),
+        *reinterpret_cast<at::Tensor*>(distributed_v[16]));
+    const double down_b_adam_diff = first_adam_step_diff(
+        *distributed_lora.down_b, down_b_before,
+        *reinterpret_cast<at::Tensor*>(distributed_m[17]),
+        *reinterpret_cast<at::Tensor*>(distributed_v[17]));
+
+    std::printf(
+        "native_qwen36_ep_parity rank=%d world=%d top_k=2 "
+        "distributed_loss=%0.8f reference_loss=%0.8f loss_diff=%0.8e "
+        "gate_up_a_diff=%0.8e gate_up_b_diff=%0.8e "
+        "down_a_diff=%0.8e down_b_diff=%0.8e "
+        "adam_m_diff=%0.8e adam_v_diff=%0.8e "
+        "adam_step_diffs=[%0.8e,%0.8e,%0.8e,%0.8e] "
+        "updates=[%0.8e,%0.8e,%0.8e,%0.8e]\n",
+        rank, world, distributed_loss, reference_loss, loss_diff,
+        gate_up_a_diff, gate_up_b_diff, down_a_diff, down_b_diff,
+        optimizer_m_diff, optimizer_v_diff,
+        gate_up_a_adam_diff, gate_up_b_adam_diff,
+        down_a_adam_diff, down_b_adam_diff,
+        gate_up_a_update, gate_up_b_update, down_a_update, down_b_update);
+    std::fflush(stdout);
+
+    assert(gate_up_a_update > 0.0);
+    assert(gate_up_b_update > 0.0);
+    assert(down_a_update > 0.0);
+    assert(down_b_update > 0.0);
+    assert(loss_diff <= 2e-2);
+    assert(gate_up_a_diff <= 1e-5);
+    assert(gate_up_b_diff <= 1e-5);
+    assert(down_a_diff <= 1e-5);
+    assert(down_b_diff <= 1e-5);
+    assert(optimizer_m_diff <= 1e-5);
+    assert(optimizer_v_diff <= 1e-6);
+    assert(gate_up_a_adam_diff <= 1e-5);
+    assert(gate_up_b_adam_diff <= 1e-5);
+    assert(down_a_adam_diff <= 1e-5);
+    assert(down_b_adam_diff <= 1e-5);
+
+    qwen36_free_training_context(reference_ctx);
+    qwen36_free_training_context(distributed_ctx);
     return 0;
 }

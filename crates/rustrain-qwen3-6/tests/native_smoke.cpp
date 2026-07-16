@@ -2,10 +2,15 @@
 #include <c10/cuda/CUDAGuard.h>
 
 #include <cassert>
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
+#include <string>
+#include <sys/stat.h>
+#include <unistd.h>
 #include <vector>
 
 struct LayerConfig {
@@ -37,6 +42,8 @@ extern "C" double qwen36_train_micro_step(
     void*, void*, void*, void*, double, int32_t);
 extern "C" int64_t qwen36_get_step_count(void*);
 extern "C" int32_t qwen36_set_step_count(void*, int64_t);
+extern "C" int64_t qwen36_export_optimizer_state(
+    void*, void**, void**, int64_t);
 extern "C" int64_t qwen36_get_adapter_step_count(void*, int64_t);
 extern "C" int32_t qwen36_set_adapter_step_count(void*, int64_t, int64_t);
 extern "C" double qwen36_eval_step(void*, void*, void*, void*);
@@ -50,10 +57,312 @@ extern "C" void* qwen36_get_adapter_lora_tensor(
     void*, int64_t, int64_t, const char*, int32_t);
 extern "C" int32_t qwen36_set_adapter_lora_tensor(
     void*, int64_t, int64_t, const char*, int32_t, void*);
+extern "C" void* qwen36_get_adapter_optimizer_tensor(
+    void*, int64_t, int64_t, const char*, int32_t, int32_t);
 extern "C" void qwen36_free_training_context(void*);
 
 static at::Tensor cuda_rand(std::initializer_list<int64_t> shape) {
     return at::randn(shape, at::TensorOptions().device(at::kCUDA).dtype(at::kBFloat16));
+}
+
+static std::string dp_smoke_sync_dir() {
+    const char* run_id = std::getenv("RUSTRAIN_NCCL_RUN_ID");
+    std::string sanitized = run_id && run_id[0] ? run_id : "native-dp-smoke";
+    for (char& ch : sanitized) {
+        if (!((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') ||
+              (ch >= '0' && ch <= '9') || ch == '-' || ch == '_')) {
+            ch = '_';
+        }
+    }
+    mkdir("/tmp/rustrain-nccl", 0777);
+    std::string path = "/tmp/rustrain-nccl/" + sanitized;
+    mkdir(path.c_str(), 0777);
+    return path;
+}
+
+static void write_tensor_file(const std::string& path, const at::Tensor& tensor) {
+    auto cpu = tensor.to(at::kCPU).to(at::kFloat).contiguous();
+    const std::string temporary_path = path + ".tmp." +
+        std::to_string(static_cast<long long>(getpid()));
+    FILE* file = std::fopen(temporary_path.c_str(), "wb");
+    assert(file);
+    const int64_t rows = cpu.size(0);
+    const int64_t cols = cpu.size(1);
+    assert(std::fwrite(&rows, sizeof(rows), 1, file) == 1);
+    assert(std::fwrite(&cols, sizeof(cols), 1, file) == 1);
+    assert(std::fwrite(cpu.data_ptr<float>(), sizeof(float), cpu.numel(), file) ==
+        static_cast<size_t>(cpu.numel()));
+    std::fclose(file);
+    assert(std::rename(temporary_path.c_str(), path.c_str()) == 0);
+}
+
+static at::Tensor read_tensor_file(const std::string& path) {
+    FILE* file = nullptr;
+    for (int attempt = 0; attempt < 6000 && !file; ++attempt) {
+        file = std::fopen(path.c_str(), "rb");
+        if (!file) usleep(10000);
+    }
+    assert(file);
+    int64_t rows = 0;
+    int64_t cols = 0;
+    assert(std::fread(&rows, sizeof(rows), 1, file) == 1);
+    assert(std::fread(&cols, sizeof(cols), 1, file) == 1);
+    auto result = at::empty({rows, cols}, at::TensorOptions().dtype(at::kFloat));
+    assert(std::fread(result.data_ptr<float>(), sizeof(float), result.numel(), file) ==
+        static_cast<size_t>(result.numel()));
+    std::fclose(file);
+    return result;
+}
+
+struct DpAdapterInitial {
+    at::Tensor shared_a;
+    at::Tensor shared_b;
+    at::Tensor expert_a;
+    at::Tensor expert_b;
+};
+
+static DpAdapterInitial capture_dp_adapter(void* ctx, int64_t adapter_id) {
+    auto* shared_a = reinterpret_cast<at::Tensor*>(
+        qwen36_get_adapter_lora_tensor(
+            ctx, adapter_id, 0, "shared_gate_proj", 0));
+    auto* shared_b = reinterpret_cast<at::Tensor*>(
+        qwen36_get_adapter_lora_tensor(
+            ctx, adapter_id, 0, "shared_gate_proj", 1));
+    auto* expert_a = reinterpret_cast<at::Tensor*>(
+        qwen36_get_adapter_lora_tensor(
+            ctx, adapter_id, 0, "experts_gate_up_proj", 0));
+    auto* expert_b = reinterpret_cast<at::Tensor*>(
+        qwen36_get_adapter_lora_tensor(
+            ctx, adapter_id, 0, "experts_gate_up_proj", 1));
+    assert(shared_a && shared_b && expert_a && expert_b);
+    return {
+        shared_a->clone(), shared_b->clone(),
+        expert_a->clone(), expert_b->clone()
+    };
+}
+
+static void restore_dp_adapter(
+    void* ctx, int64_t adapter_id, const DpAdapterInitial& initial
+) {
+    auto shared_a = initial.shared_a;
+    auto shared_b = initial.shared_b;
+    auto expert_a = initial.expert_a;
+    auto expert_b = initial.expert_b;
+    assert(qwen36_set_adapter_lora_tensor(
+        ctx, adapter_id, 0, "shared_gate_proj", 0, &shared_a) == 0);
+    assert(qwen36_set_adapter_lora_tensor(
+        ctx, adapter_id, 0, "shared_gate_proj", 1, &shared_b) == 0);
+    assert(qwen36_set_adapter_lora_tensor(
+        ctx, adapter_id, 0, "experts_gate_up_proj", 0, &expert_a) == 0);
+    assert(qwen36_set_adapter_lora_tensor(
+        ctx, adapter_id, 0, "experts_gate_up_proj", 1, &expert_b) == 0);
+}
+
+static at::Tensor dp_adapter_b_delta(
+    void* ctx, int64_t adapter_id, const DpAdapterInitial& initial
+) {
+    auto* shared_b = reinterpret_cast<at::Tensor*>(
+        qwen36_get_adapter_lora_tensor(
+            ctx, adapter_id, 0, "shared_gate_proj", 1));
+    auto* expert_b = reinterpret_cast<at::Tensor*>(
+        qwen36_get_adapter_lora_tensor(
+            ctx, adapter_id, 0, "experts_gate_up_proj", 1));
+    assert(shared_b && expert_b);
+    return at::cat({
+        (*shared_b - initial.shared_b).to(at::kFloat).reshape({-1}),
+        (*expert_b - initial.expert_b).to(at::kFloat).reshape({-1})
+    });
+}
+
+static at::Tensor dp_adapter_b_optimizer(
+    void* ctx, int64_t adapter_id, bool is_v
+) {
+    auto* shared_state = reinterpret_cast<at::Tensor*>(
+        qwen36_get_adapter_optimizer_tensor(
+            ctx, adapter_id, 0, "shared_gate_proj", 1, is_v ? 1 : 0));
+    auto* expert_state = reinterpret_cast<at::Tensor*>(
+        qwen36_get_adapter_optimizer_tensor(
+            ctx, adapter_id, 0, "experts_gate_up_proj", 1, is_v ? 1 : 0));
+    assert(shared_state && expert_state);
+    assert(shared_state->scalar_type() == at::kFloat);
+    assert(expert_state->scalar_type() == at::kFloat);
+    return at::cat({
+        shared_state->reshape({-1}), expert_state->reshape({-1})});
+}
+
+static at::Tensor dp_adapter_initial_b(const DpAdapterInitial& initial) {
+    return at::cat({
+        initial.shared_b.to(at::kFloat).reshape({-1}),
+        initial.expert_b.to(at::kFloat).reshape({-1})
+    });
+}
+
+static int run_dynamic_dp_smoke(
+    std::vector<void*>& weight_ptrs,
+    at::Tensor& embed, at::Tensor& final_norm, at::Tensor& lm_head,
+    LayerConfig& config, int process_rank, int64_t lora_rank,
+    int64_t vocab, int64_t intermediate, int64_t experts
+) {
+    constexpr double learning_rate = 1e-3;
+    constexpr double adam_eps = 1e-8;
+    constexpr double beta1 = 0.9;
+    constexpr double beta2 = 0.999;
+    const int64_t target_layer = 0;
+    const char* targets = "shared_gate_proj,experts_gate_up_proj";
+    auto create_context = [&]() {
+        return qwen36_create_training_context(
+            weight_ptrs.data(), static_cast<int64_t>(weight_ptrs.size()),
+            &embed, &final_norm, &lm_head, &config, 1,
+            static_cast<int32_t>(at::kBFloat16),
+            1.0, learning_rate, beta1, beta2, adam_eps,
+            vocab, 1e-5, lora_rank, &target_layer, 1, targets);
+    };
+    auto add_adapters = [&](void* ctx) {
+        std::vector<int64_t> ids;
+        ids.push_back(qwen36_add_lora(
+            ctx, lora_rank, 1.0, &target_layer, 1, targets));
+        ids.push_back(qwen36_add_lora(
+            ctx, lora_rank, 1.0, &target_layer, 1, targets));
+        assert(ids[0] > 0 && ids[1] > ids[0]);
+        return ids;
+    };
+
+    auto input_ids = process_rank == 0
+        ? at::tensor({1, 2, 3, 4, 4, 3, 2, 1},
+            at::TensorOptions().device(at::kCUDA).dtype(at::kLong))
+        : at::tensor({2, 4, 1, 3, 3, 1, 4, 2},
+            at::TensorOptions().device(at::kCUDA).dtype(at::kLong));
+    input_ids = input_ids.reshape({2, 4});
+    auto target_mask = process_rank == 0
+        ? at::tensor({1.0, 1.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0},
+            at::TensorOptions().device(at::kCUDA).dtype(at::kFloat))
+        : at::tensor({1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.0, 0.0},
+            at::TensorOptions().device(at::kCUDA).dtype(at::kFloat));
+    target_mask = target_mask.reshape({2, 4});
+    auto attention_mask = at::ones({2, 4},
+        at::TensorOptions().device(at::kCUDA).dtype(at::kBool));
+
+    // First obtain each rank's independently-normalized local first moment.
+    // At the first step m=(1-beta1)*g, so token weighting remains linear and
+    // can be checked without inferring gradients from BF16 parameter deltas.
+    void* local_ctx = create_context();
+    assert(local_ctx);
+    auto local_ids = add_adapters(local_ctx);
+    std::vector<DpAdapterInitial> initial;
+    initial.push_back(capture_dp_adapter(local_ctx, local_ids[0]));
+    initial.push_back(capture_dp_adapter(local_ctx, local_ids[1]));
+    const double local_loss = qwen36_train_multi_lora(
+        local_ctx, &input_ids, &target_mask, &attention_mask, 2, lora_rank);
+    assert(local_loss == local_loss && local_loss > 0.0);
+    c10::cuda::device_synchronize();
+    auto local_gradients = at::stack({
+        dp_adapter_b_optimizer(local_ctx, local_ids[0], false),
+        dp_adapter_b_optimizer(local_ctx, local_ids[1], false)
+    }).to(at::kCPU);
+    qwen36_free_training_context(local_ctx);
+
+    const std::string sync_dir = dp_smoke_sync_dir();
+    const std::string local_path = sync_dir + "/dp-local-" +
+        std::to_string(process_rank) + ".bin";
+    const std::string peer_path = sync_dir + "/dp-local-" +
+        std::to_string(1 - process_rank) + ".bin";
+    std::remove(local_path.c_str());
+    write_tensor_file(local_path, local_gradients);
+    auto peer_gradients = read_tensor_file(peer_path);
+    assert(peer_gradients.sizes() == local_gradients.sizes());
+
+    void* distributed_ctx = create_context();
+    assert(distributed_ctx);
+    assert(qwen36_init_nccl(distributed_ctx) == 0);
+    auto distributed_ids = add_adapters(distributed_ctx);
+    restore_dp_adapter(distributed_ctx, distributed_ids[0], initial[0]);
+    restore_dp_adapter(distributed_ctx, distributed_ids[1], initial[1]);
+    const double distributed_loss = qwen36_train_multi_lora(
+        distributed_ctx, &input_ids, &target_mask, &attention_mask,
+        2, lora_rank);
+    assert(distributed_loss == distributed_loss && distributed_loss > 0.0);
+    c10::cuda::device_synchronize();
+    auto distributed_deltas = at::stack({
+        dp_adapter_b_delta(
+            distributed_ctx, distributed_ids[0], initial[0]),
+        dp_adapter_b_delta(
+            distributed_ctx, distributed_ids[1], initial[1])
+    }).to(at::kCPU);
+    auto distributed_gradients = at::stack({
+        dp_adapter_b_optimizer(distributed_ctx, distributed_ids[0], false),
+        dp_adapter_b_optimizer(distributed_ctx, distributed_ids[1], false)
+    }).to(at::kCPU);
+    auto distributed_v = at::stack({
+        dp_adapter_b_optimizer(distributed_ctx, distributed_ids[0], true),
+        dp_adapter_b_optimizer(distributed_ctx, distributed_ids[1], true)
+    }).to(at::kCPU);
+    auto initial_b = at::stack({
+        dp_adapter_initial_b(initial[0]), dp_adapter_initial_b(initial[1])
+    }).to(at::kCPU);
+
+    const std::string distributed_path = sync_dir + "/dp-global-" +
+        std::to_string(process_rank) + ".bin";
+    const std::string peer_distributed_path = sync_dir + "/dp-global-" +
+        std::to_string(1 - process_rank) + ".bin";
+    std::remove(distributed_path.c_str());
+    write_tensor_file(distributed_path, distributed_gradients);
+    auto peer_distributed_gradients = read_tensor_file(peer_distributed_path);
+    assert(at::allclose(
+        distributed_gradients, peer_distributed_gradients, 0.0, 0.0));
+
+    auto gradient0 = process_rank == 0 ? local_gradients : peer_gradients;
+    auto gradient1 = process_rank == 0 ? peer_gradients : local_gradients;
+    auto counts0 = at::tensor(
+        {1.0, 3.0}, at::TensorOptions().dtype(at::kFloat)).reshape({2, 1});
+    auto counts1 = at::tensor(
+        {3.0, 1.0}, at::TensorOptions().dtype(at::kFloat)).reshape({2, 1});
+    auto expected_gradient =
+        (gradient0 * counts0 + gradient1 * counts1) / (counts0 + counts1);
+    auto aggregate_count_gradient = (gradient0 + gradient1) * 0.5;
+
+    auto relative_error = [&](const at::Tensor& actual,
+                              const at::Tensor& expected) {
+        return (actual - expected).abs().sum().item<double>() /
+            std::max(expected.abs().sum().item<double>(), 1e-12);
+    };
+    const int64_t shared_numel = intermediate * lora_rank;
+    const int64_t expert_numel = experts * 2 * intermediate * lora_rank;
+    assert(distributed_gradients.size(1) == shared_numel + expert_numel);
+    const double all_error = relative_error(
+        distributed_gradients, expected_gradient);
+    const double grouped_error = relative_error(
+        distributed_gradients.narrow(1, shared_numel, expert_numel),
+        expected_gradient.narrow(1, shared_numel, expert_numel));
+    const double old_formula_gap =
+        (expected_gradient - aggregate_count_gradient).abs().sum().item<double>();
+    auto expected_v = distributed_gradients.square() *
+        ((1.0 - beta2) / ((1.0 - beta1) * (1.0 - beta1)));
+    const double v_error = relative_error(distributed_v, expected_v);
+    auto expected_parameter = (
+        initial_b - learning_rate *
+            (distributed_gradients / (1.0 - beta1)) /
+            ((distributed_v / (1.0 - beta2)).sqrt() + adam_eps))
+        .to(at::kBFloat16).to(at::kFloat);
+    auto expected_parameter_delta = expected_parameter - initial_b;
+    const double adam_delta_max_error =
+        (distributed_deltas - expected_parameter_delta)
+            .abs().max().item<double>();
+    const double grouped_update = distributed_deltas
+        .narrow(1, shared_numel, expert_numel).abs().sum().item<double>();
+    std::printf(
+        "native_qwen36_dynamic_dp_weighting rank=%d loss=%0.8f "
+        "relative_error=%0.6e grouped_error=%0.6e old_formula_gap=%0.6e "
+        "v_error=%0.6e adam_delta_max_error=%0.6e grouped_update=%0.6e\n",
+        process_rank, distributed_loss, all_error, grouped_error,
+        old_formula_gap, v_error, adam_delta_max_error, grouped_update);
+    assert(old_formula_gap > 1e-8);
+    assert(grouped_update > 0.0);
+    assert(all_error < 2e-5);
+    assert(grouped_error < 2e-5);
+    assert(v_error < 2e-5);
+    assert(adam_delta_max_error < 2e-5);
+    qwen36_free_training_context(distributed_ctx);
+    return 0;
 }
 
 int main() {
@@ -127,6 +436,14 @@ int main() {
     config.norm_topk_prob = 1;
     config.nccl_comm = nullptr;
     config.nccl_stream = nullptr;
+
+    const bool data_parallel = std::getenv("RUSTRAIN_DATA_PARALLEL") &&
+        std::strcmp(std::getenv("RUSTRAIN_DATA_PARALLEL"), "0") != 0;
+    if (world == 2 && tp_size == 1 && data_parallel) {
+        return run_dynamic_dp_smoke(
+            weight_ptrs, embed, final_norm, lm_head, config,
+            process_rank, rank, vocab, intermediate, experts);
+    }
 
     const int64_t target_layer = 0;
     // Native C++ must reject a mixed TP/DP/EP topology even when Rust-side
@@ -221,9 +538,27 @@ int main() {
     assert(loss > 0.0);
     const double update_norm = (*expert_a - expert_a_before).abs().sum().item<double>();
     const double b_update_norm = (*expert_b - expert_b_before).abs().sum().item<double>();
+    std::vector<void*> fixed_m(2 * count);
+    std::vector<void*> fixed_v(2 * count);
+    assert(qwen36_export_optimizer_state(
+        ctx, fixed_m.data(), fixed_v.data(), 2 * count) == 2 * count);
+    auto* expert_b_m = reinterpret_cast<at::Tensor*>(fixed_m[2 * 7 + 1]);
+    auto* expert_b_v = reinterpret_cast<at::Tensor*>(fixed_v[2 * 7 + 1]);
+    assert(expert_b_m && expert_b_v);
+    auto expected_expert_b = (
+        expert_b_before.to(at::kFloat) - 1e-3 *
+            (expert_b_m->to(at::kFloat) / (1.0 - 0.9)) /
+            ((expert_b_v->to(at::kFloat) / (1.0 - 0.999)).sqrt() + 1e-8))
+        .to(at::kBFloat16);
+    const double fixed_adam_max_error =
+        (*expert_b - expected_expert_b).abs().max().item<double>();
     std::printf("native_qwen36_moe_lora_smoke expert_a_update=%0.8e expert_b_update=%0.8e\n",
                 update_norm, b_update_norm);
     assert(update_norm > 0.0 || b_update_norm > 0.0);
+    std::printf(
+        "native_qwen36_fixed_adam_oracle max_error=%0.8e\n",
+        fixed_adam_max_error);
+    assert(fixed_adam_max_error == 0.0);
 
     // Dynamic multi-adapter batches must apply shared-expert MLP LoRA per
     // sample and preserve the parameter updates after chunk registry restore.
@@ -245,7 +580,8 @@ int main() {
         qwen36_get_adapter_lora_tensor(
             ctx, adapter_one, 0, "shared_gate_proj", 1));
     assert(dynamic_b && dynamic_b->sizes() == at::IntArrayRef({intermediate, local_lora_rank}));
-    auto dynamic_b_value = at::ones(dynamic_b->sizes(), dynamic_b->options());
+    auto dynamic_b_value = at::full(
+        dynamic_b->sizes(), 0.01, dynamic_b->options());
     assert(qwen36_set_adapter_lora_tensor(
         ctx, adapter_one, 0, "shared_gate_proj", 1, &dynamic_b_value) == 0);
     auto dynamic_b_before = dynamic_b->clone();
@@ -253,7 +589,8 @@ int main() {
         qwen36_get_adapter_lora_tensor(
             ctx, adapter_two, 0, "shared_gate_proj", 1));
     assert(dynamic_b_two && dynamic_b_two->sizes() == dynamic_b->sizes());
-    auto dynamic_b_two_value = at::full(dynamic_b_two->sizes(), -1.0, dynamic_b_two->options());
+    auto dynamic_b_two_value = at::full(
+        dynamic_b_two->sizes(), -0.01, dynamic_b_two->options());
     assert(qwen36_set_adapter_lora_tensor(
         ctx, adapter_two, 0, "shared_gate_proj", 1, &dynamic_b_two_value) == 0);
     auto dynamic_b_two_before = dynamic_b_two->clone();
@@ -262,8 +599,8 @@ int main() {
             ctx, adapter_one, 0, "experts_gate_up_proj", 1));
     assert(dynamic_expert_b && dynamic_expert_b->sizes() ==
         at::IntArrayRef({experts, 2 * intermediate, local_lora_rank}));
-    auto dynamic_expert_b_value = at::ones(
-        dynamic_expert_b->sizes(), dynamic_expert_b->options());
+    auto dynamic_expert_b_value = at::full(
+        dynamic_expert_b->sizes(), 0.01, dynamic_expert_b->options());
     assert(qwen36_set_adapter_lora_tensor(
         ctx, adapter_one, 0, "experts_gate_up_proj", 1,
         &dynamic_expert_b_value) == 0);
@@ -341,18 +678,16 @@ int main() {
         ctx, adapter_one, 0, "shared_gate_proj", 1) != nullptr);
     assert(qwen36_get_adapter_lora_tensor(
         ctx, adapter_two, 0, "shared_gate_proj", 1) != nullptr);
-    // Different tenant rows can have different token counts. The current
-    // native DP path only has one aggregate count, so reject batch=n_total
-    // instead of silently applying the wrong cross-rank weighting.
-    setenv("RUSTRAIN_DATA_PARALLEL", "1", 1);
-    qwen36_set_nccl_comm(ctx, nullptr, nullptr, 0, 2);
+    // A tenant may be empty on one DP rank, but it must have at least one
+    // target token globally. In this single-rank check the second tenant is
+    // globally empty, so reject the step without advancing either clock.
+    auto invalid_multi_target_mask = multi_target_mask.clone();
+    invalid_multi_target_mask.select(0, 1).zero_();
     assert(qwen36_train_multi_lora(
-        ctx, &multi_input_ids, &multi_target_mask, &multi_attention_mask,
+        ctx, &multi_input_ids, &invalid_multi_target_mask, &multi_attention_mask,
         2, rank) < 0.0);
     assert(qwen36_get_adapter_step_count(ctx, adapter_one) == 2);
     assert(qwen36_get_adapter_step_count(ctx, adapter_two) == 1);
-    unsetenv("RUSTRAIN_DATA_PARALLEL");
-    qwen36_set_nccl_comm(ctx, nullptr, nullptr, 0, 1);
     qwen36_free_training_context(ctx);
 
     // Dense Qwen3.5 variants use the same per-sample activation path for
@@ -386,7 +721,8 @@ int main() {
     auto* dense_b = reinterpret_cast<at::Tensor*>(
         qwen36_get_adapter_lora_tensor(ctx, dense_one, 0, "gate_proj", 1));
     assert(dense_b && dense_b->sizes() == at::IntArrayRef({intermediate, local_lora_rank}));
-    auto dense_b_value = at::ones(dense_b->sizes(), dense_b->options());
+    auto dense_b_value = at::full(
+        dense_b->sizes(), 0.01, dense_b->options());
     assert(qwen36_set_adapter_lora_tensor(
         ctx, dense_one, 0, "gate_proj", 1, &dense_b_value) == 0);
     auto dense_b_before = dense_b->clone();
@@ -536,8 +872,8 @@ int main() {
             ctx, linear_adapter_one, 0, "in_proj_qkv", 1));
     assert(dynamic_linear_b && dynamic_linear_b->sizes() ==
         at::IntArrayRef({linear_qkv, local_lora_rank}));
-    auto dynamic_linear_b_value = at::ones(
-        dynamic_linear_b->sizes(), dynamic_linear_b->options());
+    auto dynamic_linear_b_value = at::full(
+        dynamic_linear_b->sizes(), 0.01, dynamic_linear_b->options());
     assert(qwen36_set_adapter_lora_tensor(
         ctx, linear_adapter_one, 0, "in_proj_qkv", 1,
         &dynamic_linear_b_value) == 0);

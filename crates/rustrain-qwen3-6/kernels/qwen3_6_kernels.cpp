@@ -1511,6 +1511,7 @@ struct TrainingContext {
 
     std::vector<LoRAAdapter> adapters;
     int64_t next_adapter_id = 0;
+    int64_t multi_lora_invocation = 0;
 
     // LoRA cache: pre-concatenated A/B per (layer, module) pair
     // Invalidated when adapters change or after Adam update
@@ -1810,18 +1811,84 @@ static void reduce_lora_accumulator(
     accumulator.copy_(reduced);
 }
 
+static void reduce_lora_accumulator_weighted(
+    TrainingContext* ctx, at::Tensor& accumulator,
+    const at::Tensor& local_weight, const at::Tensor& global_weight,
+    bool allreduce
+) {
+    if (!accumulator.defined()) return;
+    TORCH_CHECK(accumulator.scalar_type() == at::kFloat,
+        "LoRA DP gradient accumulator must be FP32");
+    TORCH_CHECK(local_weight.numel() == 1 && global_weight.numel() == 1,
+        "per-adapter LoRA token weights must be scalar");
+    auto weighted = accumulator.contiguous() * local_weight;
+    at::Tensor reduced;
+    if (allreduce) {
+        TORCH_CHECK(ctx->nccl_comm,
+            "LoRA gradient all-reduce has no communicator");
+        reduced = at::empty_like(weighted);
+        int dev = weighted.device().index();
+        cudaSetDevice(dev);
+        auto stream = c10::cuda::getCurrentCUDAStream(dev).stream();
+        auto err = ncclAllReduce(
+            weighted.data_ptr(), reduced.data_ptr(), weighted.numel(),
+            nccl_dtype_for(weighted), ncclSum, ctx->nccl_comm, stream);
+        TORCH_CHECK(err == ncclSuccess,
+            "NCCL weighted LoRA gradient all-reduce failed: ",
+            ncclGetErrorString(err));
+    } else {
+        reduced = weighted;
+    }
+    reduced = reduced / global_weight.clamp_min(1.0);
+    at::NoGradGuard guard;
+    accumulator.copy_(reduced);
+}
+
 // Every rank evaluates the complete loss. Average replicated LoRA gradients
 // across DP ranks with token-count weighting so their Adam update matches a
-// single global batch. EP ranks already receive the complete routed activation
-// in forward and keep replicated gradients local; routed expert adapters remain
-// local because their parameter tensors are sharded.
+// single global batch. Pure DP keeps the complete routed-expert tensors
+// replicated, so those accumulators reduce too; EP ranks receive the complete
+// routed activation in forward and keep their sharded expert gradients local.
 static void synchronize_lora_gradients(
     TrainingContext* ctx, const at::Tensor& target_mask,
-    double accumulated_token_weight = 0.0
+    double accumulated_token_weight = 0.0,
+    const at::Tensor* per_adapter_token_counts = nullptr
 ) {
     const bool allreduce = ctx->nccl_comm && ctx->data_parallel;
+    const bool per_adapter_weighting = per_adapter_token_counts &&
+        per_adapter_token_counts->defined();
+    at::Tensor local_adapter_weights;
+    at::Tensor global_adapter_weights;
     double scale = 1.0;
-    if (accumulated_token_weight > 0.0) {
+    if (per_adapter_weighting) {
+        TORCH_CHECK(per_adapter_token_counts->dim() == 1 &&
+                    per_adapter_token_counts->size(0) ==
+                        static_cast<int64_t>(ctx->adapters.size()),
+            "dynamic LoRA token-count vector must match adapter registry");
+        local_adapter_weights = per_adapter_token_counts->to(at::kFloat)
+            .contiguous();
+        TORCH_CHECK(at::isfinite(local_adapter_weights).all().item<bool>(),
+            "dynamic LoRA token counts must be finite");
+        TORCH_CHECK((local_adapter_weights >= 0).all().item<bool>(),
+            "dynamic LoRA token counts must be non-negative");
+        if (allreduce) {
+            global_adapter_weights = at::empty_like(local_adapter_weights);
+            auto stream = c10::cuda::getCurrentCUDAStream(
+                local_adapter_weights.device().index()).stream();
+            auto err = ncclAllReduce(
+                local_adapter_weights.data_ptr(),
+                global_adapter_weights.data_ptr(),
+                local_adapter_weights.numel(), ncclFloat, ncclSum,
+                ctx->nccl_comm, stream);
+            TORCH_CHECK(err == ncclSuccess,
+                "NCCL per-adapter token-count all-reduce failed: ",
+                ncclGetErrorString(err));
+        } else {
+            global_adapter_weights = local_adapter_weights;
+        }
+        TORCH_CHECK((global_adapter_weights > 0).all().item<bool>(),
+            "every dynamic LoRA adapter must have at least one global target token");
+    } else if (accumulated_token_weight > 0.0) {
         double global_weight = accumulated_token_weight;
         if (allreduce) {
             auto local = at::full({1}, accumulated_token_weight,
@@ -1857,7 +1924,9 @@ static void synchronize_lora_gradients(
         const double global_tokens = global_mask.item<double>();
         scale = local_tokens / std::max(global_tokens, 1.0);
     }
-    for (auto& adapter : ctx->adapters) {
+    for (size_t adapter_index = 0;
+         adapter_index < ctx->adapters.size(); ++adapter_index) {
+        auto& adapter = ctx->adapters[adapter_index];
         for (auto& [layer_idx, pairs] : adapter.params) {
             auto table = lora_projection_table(ctx->layer_configs[layer_idx]);
             for (int64_t pair = 0; pair < (int64_t)pairs.size(); ++pair) {
@@ -1865,17 +1934,29 @@ static void synchronize_lora_gradients(
                 TORCH_CHECK(accum_it != adapter.grad_accum.end() &&
                             pair < (int64_t)accum_it->second.size(),
                     "dynamic LoRA gradient accumulator layout mismatch");
-                // Dynamic routed-expert tensors are sharded exactly like the
-                // base experts. In a fixed accumulation window they still
-                // need local token normalization, but must never be reduced
-                // across EP ranks; the legacy per-row path leaves them
-                // untouched to preserve its independent-sample contract.
+                if (per_adapter_weighting) {
+                    auto local_weight = local_adapter_weights.index(
+                        {static_cast<int64_t>(adapter_index)});
+                    auto global_weight = global_adapter_weights.index(
+                        {static_cast<int64_t>(adapter_index)});
+                    reduce_lora_accumulator_weighted(
+                        ctx, accum_it->second[pair][0], local_weight,
+                        global_weight, allreduce);
+                    reduce_lora_accumulator_weighted(
+                        ctx, accum_it->second[pair][1], local_weight,
+                        global_weight, allreduce);
+                    continue;
+                }
+                // Routed-expert tensors are sharded only in EP. Pure DP has
+                // replicated experts and therefore uses the same reduction as
+                // shared projections; the legacy accumulation path preserves
+                // local normalization when no DP communicator is present.
                 if (table.entries[pair].grouped_expert) {
                     if (accumulated_token_weight > 0.0) {
                         reduce_lora_accumulator(
-                            ctx, accum_it->second[pair][0], scale, false);
+                            ctx, accum_it->second[pair][0], scale, allreduce);
                         reduce_lora_accumulator(
-                            ctx, accum_it->second[pair][1], scale, false);
+                            ctx, accum_it->second[pair][1], scale, allreduce);
                     }
                     continue;
                 }
@@ -1886,19 +1967,19 @@ static void synchronize_lora_gradients(
             }
         }
     }
+    if (per_adapter_weighting) return;
     for (int64_t layer = 0; layer < ctx->num_layers; ++layer) {
         auto table = lora_projection_table(ctx->layer_configs[layer]);
         int64_t offset = ctx->lora_layer_offset[layer];
         for (int64_t pair = 0; pair < table.count; ++pair) {
-            // Routed expert LoRA is sharded with the base expert weights. Its
-            // local gradients belong only to this EP rank and must not be
-            // summed with a different expert shard on another rank.
+            // Routed expert LoRA is local-only for EP, while pure DP owns the
+            // complete replicated expert tensor and must all-reduce it.
             if (table.entries[pair].grouped_expert) {
                 if (accumulated_token_weight > 0.0) {
                     reduce_lora_accumulator(
-                        ctx, ctx->grad_accum_a[offset + pair], scale, false);
+                        ctx, ctx->grad_accum_a[offset + pair], scale, allreduce);
                     reduce_lora_accumulator(
-                        ctx, ctx->grad_accum_b[offset + pair], scale, false);
+                        ctx, ctx->grad_accum_b[offset + pair], scale, allreduce);
                 }
                 continue;
             }
@@ -4104,8 +4185,10 @@ __attribute__((visibility("default"))) double qwen36_train_micro_step(
         double step_f = (double)next_step;
         double bias_correction1 = 1.0 - std::pow(ctx->beta1, step_f);
         double bias_correction2 = 1.0 - std::pow(ctx->beta2, step_f);
-        float lr_scaled = (float)(ctx->lr / bias_correction1);
-        float eps_scaled = (float)(ctx->eps / std::sqrt(bias_correction2));
+        double sqrt_bias_correction2 = std::sqrt(bias_correction2);
+        float lr_scaled = (float)(
+            ctx->lr * sqrt_bias_correction2 / bias_correction1);
+        float eps_scaled = (float)(ctx->eps * sqrt_bias_correction2);
         float one_minus_b1 = (float)(1.0 - ctx->beta1);
         float one_minus_b2 = (float)(1.0 - ctx->beta2);
 
@@ -4407,13 +4490,16 @@ __attribute__((visibility("default"))) double qwen36_train_multi_lora(
         TORCH_CHECK(input_batch == 1 || input_batch == n_total,
             "multi-LoRA input batch must be 1 or n_total (batch=", input_batch,
             ", n_total=", n_total, ")");
-        TORCH_CHECK(
-            !(input_batch == n_total && ctx->data_parallel && ctx->ep_world_size > 1),
-            "dynamic multi-LoRA DP requires shared batch-1/equal tenant masks; "
-            "per-tenant batch with DP unsupported");
         TORCH_CHECK(target_mask.size(0) == input_batch &&
                     target_mask.size(1) == input_ids.size(1),
             "target_mask must match input_ids shape");
+        auto input_row_token_counts = target_mask
+            .narrow(1, 1, target_mask.size(1) - 1)
+            .to(at::kFloat).sum(1);
+        auto adapter_token_counts = input_batch == 1
+            ? input_row_token_counts.repeat({total_adapters})
+            : input_row_token_counts;
+        const int64_t multi_lora_invocation = ++ctx->multi_lora_invocation;
 
         // Keep the caller's mask intact. Each chunk receives either the
         // corresponding rows or a repeated batch-1 mask; this also prevents
@@ -4469,10 +4555,11 @@ __attribute__((visibility("default"))) double qwen36_train_multi_lora(
         // Use file-based barrier: rank 0 computes n_max, writes to file, others read.
         size_t free_mem, total_mem;
         cudaMemGetInfo(&free_mem, &total_mem);
-        int64_t n_max;
+        int64_t n_max = 0;
         if (ctx->nccl_comm && ctx->ep_world_size > 1) {
             const std::string sync_path = nccl_sync_dir() + "/nmax_sync_" +
-                std::to_string(ctx->context_sequence) + ".txt";
+                std::to_string(ctx->context_sequence) + "_" +
+                std::to_string(multi_lora_invocation) + ".txt";
             if (ctx->ep_rank == 0) {
                 n_max = compute_n_max(
                     (int64_t)free_mem, lora_rank,
@@ -4481,15 +4568,32 @@ __attribute__((visibility("default"))) double qwen36_train_multi_lora(
                 );
                 n_max = std::min(n_max, total_adapters);
                 if (n_max < 1) n_max = 1;
-                FILE* f = fopen(sync_path.c_str(), "w");
-                fprintf(f, "%ld\n", (long)n_max);
+                const std::string temporary_path = sync_path + ".tmp." +
+                    std::to_string(static_cast<long long>(getpid()));
+                FILE* f = fopen(temporary_path.c_str(), "w");
+                TORCH_CHECK(f, "failed to create n_max rendezvous file: ",
+                    temporary_path);
+                TORCH_CHECK(fprintf(f, "%ld\n", (long)n_max) > 0,
+                    "failed to write n_max rendezvous file: ", temporary_path);
                 fclose(f);
+                TORCH_CHECK(rename(temporary_path.c_str(), sync_path.c_str()) == 0,
+                    "failed to publish n_max rendezvous file: ", sync_path);
             } else {
+                bool loaded = false;
                 for (int i = 0; i < 600; i++) {
                     FILE* f = fopen(sync_path.c_str(), "r");
-                    if (f) { fscanf(f, "%ld", (long*)&n_max); fclose(f); break; }
+                    if (f) {
+                        const int parsed = fscanf(f, "%ld", (long*)&n_max);
+                        fclose(f);
+                        TORCH_CHECK(parsed == 1,
+                            "invalid n_max rendezvous file: ", sync_path);
+                        loaded = true;
+                        break;
+                    }
                     usleep(10000);
                 }
+                TORCH_CHECK(loaded,
+                    "timed out waiting for n_max rendezvous file: ", sync_path);
             }
         } else {
             n_max = compute_n_max(
@@ -4620,7 +4724,8 @@ __attribute__((visibility("default"))) double qwen36_train_multi_lora(
             if (chunk == num_chunks - 1) {
                 // DP gradient synchronization and Adam belong to the logical
                 // multi-tenant step, never to an activation-memory chunk.
-                synchronize_lora_gradients(ctx, target_mask);
+                synchronize_lora_gradients(
+                    ctx, target_mask, 0.0, &adapter_token_counts);
 
                 // Adam step. Group tenants by their own logical clock so
                 // newly-added or resumed tenants do not inherit another
@@ -4666,8 +4771,16 @@ __attribute__((visibility("default"))) double qwen36_train_multi_lora(
                     }
                     if (h_params.empty()) continue;
                     const double step_f = (double)logical_step;
-                    const float lr_scaled = (float)(ctx->lr / (1.0 - std::pow(ctx->beta1, step_f)));
-                    const float eps_scaled = (float)(ctx->eps / std::sqrt(1.0 - std::pow(ctx->beta2, step_f)));
+                    const double bias_correction1 =
+                        1.0 - std::pow(ctx->beta1, step_f);
+                    const double bias_correction2 =
+                        1.0 - std::pow(ctx->beta2, step_f);
+                    const double sqrt_bias_correction2 =
+                        std::sqrt(bias_correction2);
+                    const float lr_scaled = (float)(
+                        ctx->lr * sqrt_bias_correction2 / bias_correction1);
+                    const float eps_scaled = (float)(
+                        ctx->eps * sqrt_bias_correction2);
                     const float one_minus_b1 = (float)(1.0 - ctx->beta1);
                     const float one_minus_b2 = (float)(1.0 - ctx->beta2);
                     int n_params = (int)h_params.size();
@@ -4874,13 +4987,17 @@ __attribute__((visibility("default"))) int32_t qwen36_init_nccl(
         // In TP-only mode the parent communicator is reserved for the TP
         // split; EP layer collectives must remain disabled on replicated MoE.
         if (ctx->tp_world_size <= 1) {
+            void* layer_comm = ctx->data_parallel
+                ? nullptr : (void*)g_nccl_comm;
+            void* layer_stream = ctx->data_parallel
+                ? nullptr : (void*)g_nccl_stream;
             for (auto& lc : ctx->layer_configs) {
-                lc.nccl_comm = (void*)g_nccl_comm;
-                lc.nccl_stream = (void*)g_nccl_stream;
+                lc.nccl_comm = layer_comm;
+                lc.nccl_stream = layer_stream;
             }
             for (auto& lc : ctx->mtp_layer_configs) {
-                lc.nccl_comm = (void*)g_nccl_comm;
-                lc.nccl_stream = (void*)g_nccl_stream;
+                lc.nccl_comm = layer_comm;
+                lc.nccl_stream = layer_stream;
             }
         }
         return 0;
@@ -5035,13 +5152,16 @@ __attribute__((visibility("default"))) int32_t qwen36_init_nccl(
 
     // Propagate to layer configs
     if (tp_size <= 1) {
+        void* layer_comm = ctx->data_parallel ? nullptr : (void*)comm;
+        void* layer_stream = ctx->data_parallel
+            ? nullptr : (void*)nccl_stream;
         for (auto& lc : ctx->layer_configs) {
-            lc.nccl_comm = (void*)comm;
-            lc.nccl_stream = (void*)nccl_stream;
+            lc.nccl_comm = layer_comm;
+            lc.nccl_stream = layer_stream;
         }
         for (auto& lc : ctx->mtp_layer_configs) {
-            lc.nccl_comm = (void*)comm;
-            lc.nccl_stream = (void*)nccl_stream;
+            lc.nccl_comm = layer_comm;
+            lc.nccl_stream = layer_stream;
         }
     }
 
@@ -5072,14 +5192,18 @@ __attribute__((visibility("default"))) void qwen36_set_nccl_comm(
     int current_device = g_cuda_device;
     cudaGetDevice(&current_device);
     ctx->cuda_device = current_device;
-    // Propagate NCCL handles to all layer configs so moe_forward can access them
+    // Only EP owns routed-output collectives. In pure replicated DP the world
+    // communicator belongs exclusively to LoRA gradient synchronization;
+    // exposing it to moe_forward would mix activations from unrelated samples.
+    void* layer_comm = ctx->data_parallel ? nullptr : comm_ptr;
+    void* layer_stream = ctx->data_parallel ? nullptr : stream_ptr;
     for (auto& lc : ctx->layer_configs) {
-        lc.nccl_comm = comm_ptr;
-        lc.nccl_stream = stream_ptr;
+        lc.nccl_comm = layer_comm;
+        lc.nccl_stream = layer_stream;
     }
     for (auto& lc : ctx->mtp_layer_configs) {
-        lc.nccl_comm = comm_ptr;
-        lc.nccl_stream = stream_ptr;
+        lc.nccl_comm = layer_comm;
+        lc.nccl_stream = layer_stream;
     }
 }
 
