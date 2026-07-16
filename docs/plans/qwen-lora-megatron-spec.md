@@ -8,7 +8,7 @@ timestamp: 2026-07-17T00:00:00Z
 
 # Problem
 
-The native Qwen3.5/3.6 path has correct and tested single-rank, EP, and dense-DP slices, but it is not yet a Megatron-LM-level LoRA runtime. In particular, Qwen native TP/PP/CP are not implemented, dynamic tenants share optimizer state semantics, and the MoE path lacks fused asynchronous token dispatch.
+The native Qwen3.5/3.6 path has correct and tested single-rank, EP, and dense-DP slices, but it is not yet a Megatron-LM-level LoRA runtime. In particular, Qwen native TP/PP/CP are not implemented, and the MoE path lacks fused asynchronous token dispatch.
 
 # Target Outcome
 
