@@ -8,11 +8,13 @@
 
 use std::collections::{BTreeMap, HashSet};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use tch::{Kind, Tensor};
 use tracing::info;
 
 unsafe extern "C" {
+    fn v4_glm5_last_error() -> *const std::ffi::c_char;
+
     fn v4_fp8_scaled_mm(
         a_ptr: *mut std::ffi::c_void,
         b_ptr: *mut std::ffi::c_void,
@@ -87,29 +89,47 @@ unsafe extern "C" {
         idx_wq_b_scale: *mut std::ffi::c_void,
         idx_wk_scale: *mut std::ffi::c_void,
         // Config
-        batch_i: std::ffi::c_int,
-        seq_i: std::ffi::c_int,
-        num_heads_i: std::ffi::c_int,
-        qk_nope_i: std::ffi::c_int,
-        qk_rope_i: std::ffi::c_int,
-        v_head_i: std::ffi::c_int,
-        kv_lora_i: std::ffi::c_int,
-        idx_head_dim_i: std::ffi::c_int,
-        idx_n_heads_i: std::ffi::c_int,
-        idx_topk_i: std::ffi::c_int,
-        layer_i: std::ffi::c_int,
-        is_full_layer: std::ffi::c_int,
+        batch_i: i32,
+        seq_i: i32,
+        num_heads_i: i32,
+        qk_nope_i: i32,
+        qk_rope_i: i32,
+        v_head_i: i32,
+        kv_lora_i: i32,
+        idx_head_dim_i: i32,
+        idx_n_heads_i: i32,
+        idx_topk_i: i32,
+        index_topk_freq_i: i32,
+        layer_i: i32,
+        is_full_layer: i32,
         rms_eps: f64,
         rope_theta: f64,
-        rope_interleave: std::ffi::c_int,
-        device_id: std::ffi::c_int,
+        rope_interleave: i32,
+        device_id: i32,
         // IndexShare state (in/out)
         topk_indices_ptr: *mut *mut std::ffi::c_void,
         idx_bias_keys_ptr: *mut *mut std::ffi::c_void,
-        source_layer: *mut std::ffi::c_int,
+        source_layer: *mut i32,
     ) -> *mut std::ffi::c_void;
 
     fn v4_glm5_free_at_tensor(tensor_ptr: *mut std::ffi::c_void);
+
+    fn v4_glm5_nccl_ring_autograd(
+        input_ptr: *mut std::ffi::c_void,
+        comm_ptr: *mut std::ffi::c_void,
+        send_peer: i64,
+        recv_peer: i64,
+    ) -> *mut std::ffi::c_void;
+
+    fn v4_glm5_nccl_kv_ring_autograd(
+        key_ptr: *mut std::ffi::c_void,
+        value_ptr: *mut std::ffi::c_void,
+        comm_ptr: *mut std::ffi::c_void,
+        send_peer: i64,
+        recv_peer: i64,
+        key_out_ptr: *mut *mut std::ffi::c_void,
+        value_out_ptr: *mut *mut std::ffi::c_void,
+    );
 
     fn v4_glm5_mlp_fp8(
         input_ptr: *mut std::ffi::c_void,
@@ -132,10 +152,54 @@ unsafe extern "C" {
         lm_head_ptr: *mut std::ffi::c_void,
         targets_ptr: *mut std::ffi::c_void,
         mask_ptr: *mut std::ffi::c_void,
-        seq_len: std::ffi::c_int,
-        vocab: std::ffi::c_int,
-        chunk_size: std::ffi::c_int,
-        device_id: std::ffi::c_int,
+        seq_len: i32,
+        vocab: i32,
+        chunk_size: i32,
+        device_id: i32,
+    ) -> *mut std::ffi::c_void;
+
+    fn v4_glm5_mtp_prepare(
+        hidden_ptr: *mut std::ffi::c_void,
+        input_ids_ptr: *mut std::ffi::c_void,
+        embed_ptr: *mut std::ffi::c_void,
+        enorm_ptr: *mut std::ffi::c_void,
+        hnorm_ptr: *mut std::ffi::c_void,
+        eh_proj_ptr: *mut std::ffi::c_void,
+        eh_proj_scale_ptr: *mut std::ffi::c_void,
+        eps: f64,
+        token_offset: i32,
+        vocab_start: i64,
+        global_vocab_size: i64,
+        tp_comm: *mut std::ffi::c_void,
+        tp_rank: i32,
+        tp_size: i32,
+    ) -> *mut std::ffi::c_void;
+
+    fn v4_glm5_mtp_cross_entropy_loss(
+        block_raw_ptr: *mut std::ffi::c_void,
+        shared_head_norm_ptr: *mut std::ffi::c_void,
+        lm_head_ptr: *mut std::ffi::c_void,
+        lm_head_scale_ptr: *mut std::ffi::c_void,
+        input_ids_ptr: *mut std::ffi::c_void,
+        target_mask_ptr: *mut std::ffi::c_void,
+        eps: f64,
+        start_offset: i32,
+        chunk_size: i32,
+        vocab_start: i64,
+        global_vocab_size: i64,
+        tp_comm: *mut std::ffi::c_void,
+        tp_size: i32,
+        normalized_out_ptr: *mut *mut std::ffi::c_void,
+        loss_sum_out_ptr: *mut *mut std::ffi::c_void,
+        token_count_out_ptr: *mut *mut std::ffi::c_void,
+    ) -> *mut std::ffi::c_void;
+
+    fn v4_glm5_combine_losses(
+        lm_loss_ptr: *mut std::ffi::c_void,
+        mtp_loss_ptrs: *mut *mut std::ffi::c_void,
+        n_mtp_losses: i32,
+        mtp_weight: f64,
+        mtp_mean_out_ptr: *mut *mut std::ffi::c_void,
     ) -> *mut std::ffi::c_void;
 
     fn v4_adam_step(
@@ -160,24 +224,33 @@ unsafe extern "C" {
         shared_up_scale: *mut std::ffi::c_void,
         shared_down_scale: *mut std::ffi::c_void,
         gate_weight: *mut std::ffi::c_void,
+        correction_bias: *mut std::ffi::c_void,
         expert_gate_weights: *mut *mut std::ffi::c_void,
         expert_up_weights: *mut *mut std::ffi::c_void,
         expert_down_weights: *mut *mut std::ffi::c_void,
         expert_gate_scales: *mut *mut std::ffi::c_void,
         expert_up_scales: *mut *mut std::ffi::c_void,
         expert_down_scales: *mut *mut std::ffi::c_void,
-        n_local_experts: std::ffi::c_int,
-        local_expert_indices: *const std::ffi::c_int,
-        n_routed_experts: std::ffi::c_int,
-        topk: std::ffi::c_int,
+        n_local_experts: i32,
+        local_expert_indices: *const i32,
+        n_routed_experts: i32,
+        topk: i32,
+        n_group: i32,
+        topk_group: i32,
+        scoring_func: i32,
+        topk_method: i32,
+        norm_topk_prob: i32,
         routed_scaling_factor: f64,
-        device_id: std::ffi::c_int,
+        ep_comm: *mut std::ffi::c_void,
+        ep_rank: i32,
+        ep_size: i32,
+        device_id: i32,
     ) -> *mut std::ffi::c_void;
 
     fn v4_glm5_embedding(
         embed_weight_ptr: *mut std::ffi::c_void,
         input_ids_ptr: *mut std::ffi::c_void,
-        device_id: std::ffi::c_int,
+        device_id: i32,
     ) -> *mut std::ffi::c_void;
 
     fn v4_glm5_layer_forward(
@@ -224,35 +297,139 @@ unsafe extern "C" {
         expert_gate_scales: *mut *mut std::ffi::c_void,
         expert_up_scales: *mut *mut std::ffi::c_void,
         expert_down_scales: *mut *mut std::ffi::c_void,
-        n_local_experts: std::ffi::c_int,
-        local_expert_indices: *const std::ffi::c_int,
+        n_local_experts: i32,
+        local_expert_indices: *const i32,
         // Config
-        batch: std::ffi::c_int,
-        seq: std::ffi::c_int,
-        num_heads: std::ffi::c_int,
-        qk_nope: std::ffi::c_int,
-        qk_rope: std::ffi::c_int,
-        v_head: std::ffi::c_int,
-        kv_lora: std::ffi::c_int,
-        idx_head_dim: std::ffi::c_int,
-        idx_n_heads: std::ffi::c_int,
-        idx_topk: std::ffi::c_int,
-        layer: std::ffi::c_int,
-        is_full_layer: std::ffi::c_int,
-        is_moe_layer: std::ffi::c_int,
-        n_routed_experts: std::ffi::c_int,
-        topk: std::ffi::c_int,
+        batch: i32,
+        seq: i32,
+        num_heads: i32,
+        qk_nope: i32,
+        qk_rope: i32,
+        v_head: i32,
+        kv_lora: i32,
+        idx_head_dim: i32,
+        idx_n_heads: i32,
+        idx_topk: i32,
+        index_topk_freq: i32,
+        layer: i32,
+        is_full_layer: i32,
+        is_moe_layer: i32,
+        n_routed_experts: i32,
+        topk: i32,
         rms_eps: f64,
         rope_theta: f64,
-        rope_interleave: std::ffi::c_int,
+        rope_interleave: i32,
         routed_scaling_factor: f64,
-        device_id: std::ffi::c_int,
+        device_id: i32,
         topk_indices_ptr: *mut *mut std::ffi::c_void,
         idx_bias_keys_ptr: *mut *mut std::ffi::c_void,
-        source_layer: *mut std::ffi::c_int,
+        source_layer: *mut i32,
     ) -> *mut std::ffi::c_void;
 
-    fn v4_stream_wait_event(device_id: std::ffi::c_int, event_ptr: *mut std::ffi::c_void);
+    fn v4_glm5_mtp_decoder_layer(
+        descriptor: *const Glm5MtpDecoderDescriptor,
+    ) -> *mut std::ffi::c_void;
+
+    fn v4_stream_wait_event(device_id: i32, event_ptr: *mut std::ffi::c_void);
+}
+
+/// Stable descriptor for one complete native GLM5 MTP decoder layer. Tensor
+/// fields are borrowed `at::Tensor*` pointers and remain owned by Rust for the
+/// duration of the call. Null pointers represent optional scales/weights.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct Glm5MtpDecoderDescriptor {
+    pub hidden: *mut std::ffi::c_void,
+    pub input_norm_weight: *mut std::ffi::c_void,
+    pub post_norm_weight: *mut std::ffi::c_void,
+    pub q_a_proj: *mut std::ffi::c_void,
+    pub q_a_layernorm: *mut std::ffi::c_void,
+    pub q_b_proj: *mut std::ffi::c_void,
+    pub kv_a_proj: *mut std::ffi::c_void,
+    pub kv_a_layernorm: *mut std::ffi::c_void,
+    pub kv_b_proj: *mut std::ffi::c_void,
+    pub o_proj: *mut std::ffi::c_void,
+    pub q_a_scale: *mut std::ffi::c_void,
+    pub q_b_scale: *mut std::ffi::c_void,
+    pub kv_a_scale: *mut std::ffi::c_void,
+    pub kv_b_scale: *mut std::ffi::c_void,
+    pub o_scale: *mut std::ffi::c_void,
+    pub idx_wq_b: *mut std::ffi::c_void,
+    pub idx_wk: *mut std::ffi::c_void,
+    pub idx_k_norm_w: *mut std::ffi::c_void,
+    pub idx_k_norm_b: *mut std::ffi::c_void,
+    pub idx_weights_proj: *mut std::ffi::c_void,
+    pub idx_wq_b_scale: *mut std::ffi::c_void,
+    pub idx_wk_scale: *mut std::ffi::c_void,
+    pub gate_weight: *mut std::ffi::c_void,
+    pub correction_bias: *mut std::ffi::c_void,
+    pub shared_gate: *mut std::ffi::c_void,
+    pub shared_up: *mut std::ffi::c_void,
+    pub shared_down: *mut std::ffi::c_void,
+    pub shared_gate_scale: *mut std::ffi::c_void,
+    pub shared_up_scale: *mut std::ffi::c_void,
+    pub shared_down_scale: *mut std::ffi::c_void,
+    pub dense_gate: *mut std::ffi::c_void,
+    pub dense_up: *mut std::ffi::c_void,
+    pub dense_down: *mut std::ffi::c_void,
+    pub dense_gate_scale: *mut std::ffi::c_void,
+    pub dense_up_scale: *mut std::ffi::c_void,
+    pub dense_down_scale: *mut std::ffi::c_void,
+    pub expert_gate_weights: *mut *mut std::ffi::c_void,
+    pub expert_up_weights: *mut *mut std::ffi::c_void,
+    pub expert_down_weights: *mut *mut std::ffi::c_void,
+    pub expert_gate_scales: *mut *mut std::ffi::c_void,
+    pub expert_up_scales: *mut *mut std::ffi::c_void,
+    pub expert_down_scales: *mut *mut std::ffi::c_void,
+    pub local_expert_indices: *const i32,
+    pub tp_comm: *mut std::ffi::c_void,
+    pub cp_comm: *mut std::ffi::c_void,
+    pub ep_comm: *mut std::ffi::c_void,
+    pub tp_size: i32,
+    pub cp_rank: i32,
+    pub cp_size: i32,
+    pub ep_rank: i32,
+    pub ep_size: i32,
+    pub n_local_experts: i32,
+    pub n_routed_experts: i32,
+    pub topk: i32,
+    pub n_group: i32,
+    pub topk_group: i32,
+    pub scoring_func: i32,
+    pub topk_method: i32,
+    pub norm_topk_prob: i32,
+    pub is_moe_layer: i32,
+    pub num_heads: i32,
+    pub qk_nope: i32,
+    pub qk_rope: i32,
+    pub v_head: i32,
+    pub kv_lora: i32,
+    pub idx_head_dim: i32,
+    pub idx_n_heads: i32,
+    pub idx_n_heads_global: i32,
+    pub idx_topk: i32,
+    pub rope_interleave: i32,
+    pub indexer_rope_interleave: i32,
+    pub rms_eps: f64,
+    pub rope_theta: f64,
+    pub routed_scaling_factor: f64,
+    pub rope_scaling_factor: f64,
+    pub rope_beta_fast: f64,
+    pub rope_beta_slow: f64,
+    pub rope_attention_factor: f64,
+    pub rope_original_max_pos: i64,
+    pub rope_is_yarn: i32,
+}
+
+impl Default for Glm5MtpDecoderDescriptor {
+    fn default() -> Self {
+        // Pointer fields are intentionally null. Keep neutral RoPE scalar
+        // defaults so small local descriptor tests do not zero the rotation.
+        let mut descriptor: Self = unsafe { std::mem::zeroed() };
+        descriptor.rope_scaling_factor = 1.0;
+        descriptor.rope_attention_factor = 1.0;
+        descriptor
+    }
 }
 
 pub fn is_fp8_kernel_available() -> bool {
@@ -292,14 +469,9 @@ pub fn dequant_fp8_weight(fp8_weight: &Tensor, scale: &Tensor) -> Result<Tensor>
     let k_blocks = (k + 127) / 128;
     let scale_expanded = if scale.size() == [n_blocks, k_blocks] {
         // Expand scale to [n_blocks*128, k_blocks*128] then crop to [N, K]
-        let n_padded = n_blocks * 128;
-        let k_padded = k_blocks * 128;
         let expanded = scale
-            .unsqueeze(-1)                         // [n_blocks, k_blocks, 1]
-            .unsqueeze(-1)                         // [n_blocks, k_blocks, 1, 1]
-            .expand([n_blocks, k_blocks, 128, 128], false)
-            .reshape([n_padded, k_padded])
-            .contiguous();
+            .repeat_interleave_self_int(128, 0, None)
+            .repeat_interleave_self_int(128, 1, None);
         // Crop to actual [N, K]
         expanded.narrow(0, 0, n).narrow(1, 0, k)
     } else {
@@ -692,11 +864,20 @@ pub fn is_glm5_attention_available() -> bool {
 
 /// C++ IndexShare state — raw pointers to at::Tensor*, managed by C++.
 /// Must be freed via `drop_glm5_index_state()` before going out of scope.
-#[derive(Default)]
 pub struct Glm5IndexState {
-    pub topk_indices: *mut std::ffi::c_void,  // at::Tensor* or null
+    pub topk_indices: *mut std::ffi::c_void, // at::Tensor* or null
     pub idx_bias_keys: *mut std::ffi::c_void, // at::Tensor* or null
     pub source_layer: i32,
+}
+
+impl Default for Glm5IndexState {
+    fn default() -> Self {
+        Self {
+            topk_indices: std::ptr::null_mut(),
+            idx_bias_keys: std::ptr::null_mut(),
+            source_layer: -1,
+        }
+    }
 }
 
 impl Glm5IndexState {
@@ -719,6 +900,24 @@ impl Drop for Glm5IndexState {
     }
 }
 
+fn glm5_ffi_error(operation: &str) -> anyhow::Error {
+    let detail = unsafe {
+        let ptr = v4_glm5_last_error();
+        if ptr.is_null() {
+            None
+        } else {
+            let message = std::ffi::CStr::from_ptr(ptr).to_string_lossy();
+            (!message.is_empty()).then(|| message.into_owned())
+        }
+    };
+    anyhow::anyhow!(
+        "C++ {operation} failed{}",
+        detail
+            .map(|message| format!(": {message}"))
+            .unwrap_or_default()
+    )
+}
+
 /// Call the C++ GLM5 DSA attention kernel.
 ///
 /// Returns the attention output tensor. The `index_state` is updated in-place
@@ -729,22 +928,44 @@ impl Drop for Glm5IndexState {
 pub fn glm5_dsa_attention_cpp(
     input: &Tensor,
     // Attention weights
-    q_a_proj: &Tensor, q_a_layernorm: &Tensor, q_b_proj: &Tensor,
-    kv_a_proj: &Tensor, kv_a_layernorm: &Tensor, kv_b_proj: &Tensor,
+    q_a_proj: &Tensor,
+    q_a_layernorm: &Tensor,
+    q_b_proj: &Tensor,
+    kv_a_proj: &Tensor,
+    kv_a_layernorm: &Tensor,
+    kv_b_proj: &Tensor,
     o_proj: &Tensor,
     // FP8 scales (optional — pass empty tensor if not used)
-    q_a_scale: Option<&Tensor>, q_b_scale: Option<&Tensor>,
-    kv_a_scale: Option<&Tensor>, kv_b_scale: Option<&Tensor>, o_scale: Option<&Tensor>,
+    q_a_scale: Option<&Tensor>,
+    q_b_scale: Option<&Tensor>,
+    kv_a_scale: Option<&Tensor>,
+    kv_b_scale: Option<&Tensor>,
+    o_scale: Option<&Tensor>,
     // Indexer weights (optional)
-    idx_wq_b: Option<&Tensor>, idx_wk: Option<&Tensor>,
-    idx_k_norm_w: Option<&Tensor>, idx_k_norm_b: Option<&Tensor>,
+    idx_wq_b: Option<&Tensor>,
+    idx_wk: Option<&Tensor>,
+    idx_k_norm_w: Option<&Tensor>,
+    idx_k_norm_b: Option<&Tensor>,
     idx_weights_proj: Option<&Tensor>,
-    idx_wq_b_scale: Option<&Tensor>, idx_wk_scale: Option<&Tensor>,
+    idx_wq_b_scale: Option<&Tensor>,
+    idx_wk_scale: Option<&Tensor>,
     // Config
-    batch: i32, seq: i32, num_heads: i32, qk_nope: i32, qk_rope: i32,
-    v_head: i32, kv_lora: i32, idx_head_dim: i32, idx_n_heads: i32,
-    idx_topk: i32, layer: i32, is_full_layer: bool,
-    rms_eps: f64, rope_theta: f64, rope_interleave: bool,
+    batch: i32,
+    seq: i32,
+    num_heads: i32,
+    qk_nope: i32,
+    qk_rope: i32,
+    v_head: i32,
+    kv_lora: i32,
+    idx_head_dim: i32,
+    idx_n_heads: i32,
+    idx_topk: i32,
+    index_topk_freq: i32,
+    layer: i32,
+    is_full_layer: bool,
+    rms_eps: f64,
+    rope_theta: f64,
+    rope_interleave: bool,
     device_id: i32,
     // IndexShare state (in/out)
     index_state: &mut Glm5IndexState,
@@ -766,16 +987,34 @@ pub fn glm5_dsa_attention_cpp(
             kv_a_layernorm.as_ptr() as *mut _,
             kv_b_proj.as_ptr() as *mut _,
             o_proj.as_ptr() as *mut _,
-            opt_ptr(q_a_scale), opt_ptr(q_b_scale),
-            opt_ptr(kv_a_scale), opt_ptr(kv_b_scale), opt_ptr(o_scale),
-            opt_ptr(idx_wq_b), opt_ptr(idx_wk),
-            opt_ptr(idx_k_norm_w), opt_ptr(idx_k_norm_b),
+            opt_ptr(q_a_scale),
+            opt_ptr(q_b_scale),
+            opt_ptr(kv_a_scale),
+            opt_ptr(kv_b_scale),
+            opt_ptr(o_scale),
+            opt_ptr(idx_wq_b),
+            opt_ptr(idx_wk),
+            opt_ptr(idx_k_norm_w),
+            opt_ptr(idx_k_norm_b),
             opt_ptr(idx_weights_proj),
-            opt_ptr(idx_wq_b_scale), opt_ptr(idx_wk_scale),
-            batch, seq, num_heads, qk_nope, qk_rope,
-            v_head, kv_lora, idx_head_dim, idx_n_heads,
-            idx_topk, layer, if is_full_layer { 1 } else { 0 },
-            rms_eps, rope_theta, if rope_interleave { 1 } else { 0 },
+            opt_ptr(idx_wq_b_scale),
+            opt_ptr(idx_wk_scale),
+            batch,
+            seq,
+            num_heads,
+            qk_nope,
+            qk_rope,
+            v_head,
+            kv_lora,
+            idx_head_dim,
+            idx_n_heads,
+            idx_topk,
+            index_topk_freq,
+            layer,
+            if is_full_layer { 1 } else { 0 },
+            rms_eps,
+            rope_theta,
+            if rope_interleave { 1 } else { 0 },
             device_id,
             &mut index_state.topk_indices,
             &mut index_state.idx_bias_keys,
@@ -784,7 +1023,7 @@ pub fn glm5_dsa_attention_cpp(
     };
 
     if result_ptr.is_null() {
-        bail!("C++ v4_glm5_dsa_attention returned null");
+        return Err(glm5_ffi_error("v4_glm5_dsa_attention"));
     }
 
     let tensor = unsafe { Tensor::clone_from_ptr(result_ptr as *mut _) };
@@ -795,8 +1034,12 @@ pub fn glm5_dsa_attention_cpp(
 /// Call the C++ GLM5 MLP kernel (SwiGLU: silu(gate(x)) * up(x) → down).
 pub fn glm5_mlp_fp8_cpp(
     input: &Tensor,
-    gate: &Tensor, up: &Tensor, down: &Tensor,
-    gate_scale: Option<&Tensor>, up_scale: Option<&Tensor>, down_scale: Option<&Tensor>,
+    gate: &Tensor,
+    up: &Tensor,
+    down: &Tensor,
+    gate_scale: Option<&Tensor>,
+    up_scale: Option<&Tensor>,
+    down_scale: Option<&Tensor>,
 ) -> Result<Tensor> {
     fn opt_ptr(t: Option<&Tensor>) -> *mut std::ffi::c_void {
         match t {
@@ -810,10 +1053,14 @@ pub fn glm5_mlp_fp8_cpp(
             gate.as_ptr() as *mut _,
             up.as_ptr() as *mut _,
             down.as_ptr() as *mut _,
-            opt_ptr(gate_scale), opt_ptr(up_scale), opt_ptr(down_scale),
+            opt_ptr(gate_scale),
+            opt_ptr(up_scale),
+            opt_ptr(down_scale),
         )
     };
-    if result_ptr.is_null() { bail!("C++ v4_glm5_mlp_fp8 returned null"); }
+    if result_ptr.is_null() {
+        return Err(glm5_ffi_error("v4_glm5_mlp_fp8"));
+    }
     let tensor = unsafe { Tensor::clone_from_ptr(result_ptr as *mut _) };
     unsafe { v4_glm5_free_at_tensor(result_ptr) };
     Ok(tensor)
@@ -821,10 +1068,11 @@ pub fn glm5_mlp_fp8_cpp(
 
 /// Call the C++ RMSNorm kernel.
 pub fn glm5_rms_norm_cpp(input: &Tensor, weight: &Tensor, eps: f64) -> Result<Tensor> {
-    let result_ptr = unsafe {
-        v4_glm5_rms_norm(input.as_ptr() as *mut _, weight.as_ptr() as *mut _, eps)
-    };
-    if result_ptr.is_null() { bail!("C++ v4_glm5_rms_norm returned null"); }
+    let result_ptr =
+        unsafe { v4_glm5_rms_norm(input.as_ptr() as *mut _, weight.as_ptr() as *mut _, eps) };
+    if result_ptr.is_null() {
+        return Err(glm5_ffi_error("v4_glm5_rms_norm"));
+    }
     let tensor = unsafe { Tensor::clone_from_ptr(result_ptr as *mut _) };
     unsafe { v4_glm5_free_at_tensor(result_ptr) };
     Ok(tensor)
@@ -832,92 +1080,591 @@ pub fn glm5_rms_norm_cpp(input: &Tensor, weight: &Tensor, eps: f64) -> Result<Te
 
 /// Call the C++ chunked cross-entropy loss kernel.
 pub fn glm5_cross_entropy_loss_cpp(
-    hidden: &Tensor, lm_head: &Tensor, targets: &Tensor, mask: &Tensor,
-    seq_len: i32, vocab: i32, chunk_size: i32, device_id: i32,
+    hidden: &Tensor,
+    lm_head: &Tensor,
+    targets: &Tensor,
+    mask: &Tensor,
+    seq_len: i32,
+    vocab: i32,
+    chunk_size: i32,
+    device_id: i32,
 ) -> Result<Tensor> {
     let result_ptr = unsafe {
         v4_glm5_cross_entropy_loss(
-            hidden.as_ptr() as *mut _, lm_head.as_ptr() as *mut _,
-            targets.as_ptr() as *mut _, mask.as_ptr() as *mut _,
-            seq_len, vocab, chunk_size, device_id,
+            hidden.as_ptr() as *mut _,
+            lm_head.as_ptr() as *mut _,
+            targets.as_ptr() as *mut _,
+            mask.as_ptr() as *mut _,
+            seq_len,
+            vocab,
+            chunk_size,
+            device_id,
         )
     };
-    if result_ptr.is_null() { bail!("C++ v4_glm5_cross_entropy_loss returned null"); }
+    if result_ptr.is_null() {
+        return Err(glm5_ffi_error("v4_glm5_cross_entropy_loss"));
+    }
     let tensor = unsafe { Tensor::clone_from_ptr(result_ptr as *mut _) };
     unsafe { v4_glm5_free_at_tensor(result_ptr) };
     Ok(tensor)
 }
 
+/// Exchange one CP ring block while preserving autograd across ranks.
+///
+/// Forward sends `input` to `send_peer` and receives from `recv_peer`.
+/// Backward reverses those edges so the received activation gradient reaches
+/// the rank that produced the corresponding forward block.
+pub fn glm5_nccl_ring_autograd_cpp(
+    input: &Tensor,
+    comm_ptr: *mut std::ffi::c_void,
+    send_peer: usize,
+    recv_peer: usize,
+) -> Result<Tensor> {
+    let result_ptr = unsafe {
+        v4_glm5_nccl_ring_autograd(
+            input.as_ptr() as *mut _,
+            comm_ptr,
+            send_peer as i64,
+            recv_peer as i64,
+        )
+    };
+    if result_ptr.is_null() {
+        return Err(glm5_ffi_error("v4_glm5_nccl_ring_autograd"));
+    }
+    let tensor = unsafe { Tensor::clone_from_ptr(result_ptr as *mut _) };
+    unsafe { v4_glm5_free_at_tensor(result_ptr) };
+    Ok(tensor)
+}
+
+pub fn glm5_nccl_kv_ring_autograd_cpp(
+    key: &Tensor,
+    value: &Tensor,
+    comm_ptr: *mut std::ffi::c_void,
+    send_peer: usize,
+    recv_peer: usize,
+) -> Result<(Tensor, Tensor)> {
+    let mut key_ptr = std::ptr::null_mut();
+    let mut value_ptr = std::ptr::null_mut();
+    unsafe {
+        v4_glm5_nccl_kv_ring_autograd(
+            key.as_ptr() as *mut _,
+            value.as_ptr() as *mut _,
+            comm_ptr,
+            send_peer as i64,
+            recv_peer as i64,
+            &mut key_ptr,
+            &mut value_ptr,
+        );
+    }
+    if key_ptr.is_null() || value_ptr.is_null() {
+        for ptr in [key_ptr, value_ptr] {
+            if !ptr.is_null() {
+                unsafe { v4_glm5_free_at_tensor(ptr) };
+            }
+        }
+        return Err(glm5_ffi_error("v4_glm5_nccl_kv_ring_autograd"));
+    }
+    let key_out = unsafe { Tensor::clone_from_ptr(key_ptr as *mut _) };
+    let value_out = unsafe { Tensor::clone_from_ptr(value_ptr as *mut _) };
+    unsafe {
+        v4_glm5_free_at_tensor(key_ptr);
+        v4_glm5_free_at_tensor(value_ptr);
+    }
+    Ok((key_out, value_out))
+}
+
+/// Prepare a GLM5 MTP teacher-forcing block.
+///
+/// At position `t`, this computes
+/// `eh_proj(cat(enorm(embed(input_ids[t + token_offset])), hnorm(hidden[t])))`.
+/// Its length is `min(hidden_len, input_len - token_offset - 1)` and position
+/// `t` is aligned with target `input_ids[t + token_offset + 1]`.
+pub fn glm5_mtp_prepare_cpp(
+    hidden_post_norm: &Tensor,
+    input_ids: &Tensor,
+    embed: &Tensor,
+    enorm: &Tensor,
+    hnorm: &Tensor,
+    eh_proj: &Tensor,
+    eh_proj_scale: Option<&Tensor>,
+    eps: f64,
+    token_offset: i32,
+) -> Result<Tensor> {
+    glm5_mtp_prepare_tp_cpp(
+        hidden_post_norm,
+        input_ids,
+        embed,
+        enorm,
+        hnorm,
+        eh_proj,
+        eh_proj_scale,
+        eps,
+        token_offset,
+        0,
+        embed.size()[0],
+        std::ptr::null_mut(),
+        0,
+        1,
+    )
+}
+
+/// TP-aware MTP teacher-forcing projection.
+///
+/// `eh_proj` is `[H / tp_size, 2H]`. Multi-rank execution gathers the local
+/// projection along the hidden dimension in forward, splits it in backward,
+/// and sums the replicated projection-input gradient across TP ranks.
+#[allow(clippy::too_many_arguments)]
+pub fn glm5_mtp_prepare_tp_cpp(
+    hidden_post_norm: &Tensor,
+    input_ids: &Tensor,
+    embed: &Tensor,
+    enorm: &Tensor,
+    hnorm: &Tensor,
+    eh_proj: &Tensor,
+    eh_proj_scale: Option<&Tensor>,
+    eps: f64,
+    token_offset: i32,
+    vocab_start: i64,
+    global_vocab_size: i64,
+    tp_comm: *mut std::ffi::c_void,
+    tp_rank: i32,
+    tp_size: i32,
+) -> Result<Tensor> {
+    let scale_ptr = eh_proj_scale
+        .filter(|scale| scale.numel() > 0)
+        .map_or(std::ptr::null_mut(), |scale| scale.as_ptr() as *mut _);
+    let result_ptr = unsafe {
+        v4_glm5_mtp_prepare(
+            hidden_post_norm.as_ptr() as *mut _,
+            input_ids.as_ptr() as *mut _,
+            embed.as_ptr() as *mut _,
+            enorm.as_ptr() as *mut _,
+            hnorm.as_ptr() as *mut _,
+            eh_proj.as_ptr() as *mut _,
+            scale_ptr,
+            eps,
+            token_offset,
+            vocab_start,
+            global_vocab_size,
+            tp_comm,
+            tp_rank,
+            tp_size,
+        )
+    };
+    if result_ptr.is_null() {
+        return Err(glm5_ffi_error("v4_glm5_mtp_prepare"));
+    }
+    let tensor = unsafe { Tensor::clone_from_ptr(result_ptr as *mut _) };
+    unsafe { v4_glm5_free_at_tensor(result_ptr) };
+    Ok(tensor)
+}
+
+/// Normalize one MTP block and compute masked chunked next-token CE in one FFI.
+///
+/// `block_raw[:, j]` predicts `input_ids[:, start_offset + j + 2]`.
+/// The result retains the normalized chain state, numerator, token count, and
+/// mask-normalized loss; no MTP loss weight is applied here.
+pub struct Glm5MtpPostprocessOutput {
+    pub normalized: Tensor,
+    pub loss: Tensor,
+    pub loss_sum: Tensor,
+    pub token_count: Tensor,
+}
+
+pub fn glm5_mtp_postprocess_loss_cpp(
+    block_raw: &Tensor,
+    shared_head_norm: &Tensor,
+    lm_head: &Tensor,
+    lm_head_scale: Option<&Tensor>,
+    input_ids: &Tensor,
+    target_mask: &Tensor,
+    eps: f64,
+    start_offset: i32,
+    chunk_size: i32,
+) -> Result<Glm5MtpPostprocessOutput> {
+    glm5_mtp_postprocess_loss_vocab_parallel_cpp(
+        block_raw,
+        shared_head_norm,
+        lm_head,
+        lm_head_scale,
+        input_ids,
+        target_mask,
+        eps,
+        start_offset,
+        chunk_size,
+        0,
+        lm_head.size()[0],
+        std::ptr::null_mut(),
+        1,
+    )
+}
+
+/// Megatron-compatible vocabulary-parallel MTP CE. `lm_head` contains only
+/// the local vocab shard `[vocab_start, vocab_start + local_vocab)`. The NCCL
+/// communicator is required only when `tp_size > 1`; the kernel performs the
+/// global MAX/SUM reductions and keeps the input gradient all-reduced.
+pub fn glm5_mtp_postprocess_loss_vocab_parallel_cpp(
+    block_raw: &Tensor,
+    shared_head_norm: &Tensor,
+    lm_head: &Tensor,
+    lm_head_scale: Option<&Tensor>,
+    input_ids: &Tensor,
+    target_mask: &Tensor,
+    eps: f64,
+    start_offset: i32,
+    chunk_size: i32,
+    vocab_start: i64,
+    global_vocab_size: i64,
+    tp_comm: *mut std::ffi::c_void,
+    tp_size: i32,
+) -> Result<Glm5MtpPostprocessOutput> {
+    let scale_ptr = lm_head_scale
+        .filter(|scale| scale.numel() > 0)
+        .map_or(std::ptr::null_mut(), |scale| scale.as_ptr() as *mut _);
+    let mut normalized_ptr = std::ptr::null_mut();
+    let mut loss_sum_ptr = std::ptr::null_mut();
+    let mut token_count_ptr = std::ptr::null_mut();
+    let result_ptr = unsafe {
+        v4_glm5_mtp_cross_entropy_loss(
+            block_raw.as_ptr() as *mut _,
+            shared_head_norm.as_ptr() as *mut _,
+            lm_head.as_ptr() as *mut _,
+            scale_ptr,
+            input_ids.as_ptr() as *mut _,
+            target_mask.as_ptr() as *mut _,
+            eps,
+            start_offset,
+            chunk_size,
+            vocab_start,
+            global_vocab_size,
+            tp_comm,
+            tp_size,
+            &mut normalized_ptr,
+            &mut loss_sum_ptr,
+            &mut token_count_ptr,
+        )
+    };
+    if result_ptr.is_null()
+        || normalized_ptr.is_null()
+        || loss_sum_ptr.is_null()
+        || token_count_ptr.is_null()
+    {
+        for ptr in [result_ptr, normalized_ptr, loss_sum_ptr, token_count_ptr] {
+            if !ptr.is_null() {
+                unsafe { v4_glm5_free_at_tensor(ptr) };
+            }
+        }
+        return Err(glm5_ffi_error("v4_glm5_mtp_cross_entropy_loss"));
+    }
+    let normalized = unsafe { Tensor::clone_from_ptr(normalized_ptr as *mut _) };
+    let loss = unsafe { Tensor::clone_from_ptr(result_ptr as *mut _) };
+    let loss_sum = unsafe { Tensor::clone_from_ptr(loss_sum_ptr as *mut _) };
+    let token_count = unsafe { Tensor::clone_from_ptr(token_count_ptr as *mut _) };
+    unsafe {
+        v4_glm5_free_at_tensor(normalized_ptr);
+        v4_glm5_free_at_tensor(result_ptr);
+        v4_glm5_free_at_tensor(loss_sum_ptr);
+        v4_glm5_free_at_tensor(token_count_ptr);
+    }
+    Ok(Glm5MtpPostprocessOutput {
+        normalized,
+        loss,
+        loss_sum,
+        token_count,
+    })
+}
+
+pub fn glm5_mtp_cross_entropy_loss_cpp(
+    block_raw: &Tensor,
+    shared_head_norm: &Tensor,
+    lm_head: &Tensor,
+    lm_head_scale: Option<&Tensor>,
+    input_ids: &Tensor,
+    target_mask: &Tensor,
+    eps: f64,
+    start_offset: i32,
+    chunk_size: i32,
+) -> Result<Tensor> {
+    glm5_mtp_postprocess_loss_cpp(
+        block_raw,
+        shared_head_norm,
+        lm_head,
+        lm_head_scale,
+        input_ids,
+        target_mask,
+        eps,
+        start_offset,
+        chunk_size,
+    )
+    .map(|output| output.loss)
+}
+
+pub struct Glm5CombinedLossOutput {
+    pub total: Tensor,
+    pub mtp_mean: Tensor,
+}
+
+pub fn glm5_combine_losses_cpp(
+    lm_loss: &Tensor,
+    mtp_losses: &[Tensor],
+    mtp_weight: f64,
+) -> Result<Glm5CombinedLossOutput> {
+    if mtp_losses.is_empty() {
+        anyhow::bail!("GLM5 loss combine requires at least one MTP loss");
+    }
+    let mut loss_ptrs: Vec<*mut std::ffi::c_void> = mtp_losses
+        .iter()
+        .map(|loss| loss.as_ptr() as *mut _)
+        .collect();
+    let mut mean_ptr = std::ptr::null_mut();
+    let total_ptr = unsafe {
+        v4_glm5_combine_losses(
+            lm_loss.as_ptr() as *mut _,
+            loss_ptrs.as_mut_ptr(),
+            loss_ptrs.len() as i32,
+            mtp_weight,
+            &mut mean_ptr,
+        )
+    };
+    if total_ptr.is_null() || mean_ptr.is_null() {
+        for ptr in [total_ptr, mean_ptr] {
+            if !ptr.is_null() {
+                unsafe { v4_glm5_free_at_tensor(ptr) };
+            }
+        }
+        return Err(glm5_ffi_error("v4_glm5_combine_losses"));
+    }
+    let total = unsafe { Tensor::clone_from_ptr(total_ptr as *mut _) };
+    let mtp_mean = unsafe { Tensor::clone_from_ptr(mean_ptr as *mut _) };
+    unsafe {
+        v4_glm5_free_at_tensor(total_ptr);
+        v4_glm5_free_at_tensor(mean_ptr);
+    }
+    Ok(Glm5CombinedLossOutput { total, mtp_mean })
+}
+
 /// Call the C++ Adam optimizer step. Updates params, m, v in-place.
 pub fn adam_step_cpp(
-    params: &mut [Tensor], grads: &[Tensor], m: &mut [Tensor], v: &mut [Tensor],
-    lr: f64, beta1: f64, beta2: f64, eps: f64, step: i32,
+    params: &mut [Tensor],
+    grads: &[Tensor],
+    m: &mut [Tensor],
+    v: &mut [Tensor],
+    lr: f64,
+    beta1: f64,
+    beta2: f64,
+    eps: f64,
+    step: i32,
 ) {
     let n = params.len() as std::ffi::c_int;
     // Build raw pointer arrays
-    let mut param_ptrs: Vec<*mut std::ffi::c_void> = params.iter().map(|t| t.as_ptr() as *mut _).collect();
-    let mut grad_ptrs: Vec<*mut std::ffi::c_void> = grads.iter().map(|t| t.as_ptr() as *mut _).collect();
+    let mut param_ptrs: Vec<*mut std::ffi::c_void> =
+        params.iter().map(|t| t.as_ptr() as *mut _).collect();
+    let mut grad_ptrs: Vec<*mut std::ffi::c_void> =
+        grads.iter().map(|t| t.as_ptr() as *mut _).collect();
     let mut m_ptrs: Vec<*mut std::ffi::c_void> = m.iter().map(|t| t.as_ptr() as *mut _).collect();
     let mut v_ptrs: Vec<*mut std::ffi::c_void> = v.iter().map(|t| t.as_ptr() as *mut _).collect();
     unsafe {
         v4_adam_step(
-            param_ptrs.as_mut_ptr(), grad_ptrs.as_mut_ptr(),
-            m_ptrs.as_mut_ptr(), v_ptrs.as_mut_ptr(),
-            n, lr, beta1, beta2, eps, step,
+            param_ptrs.as_mut_ptr(),
+            grad_ptrs.as_mut_ptr(),
+            m_ptrs.as_mut_ptr(),
+            v_ptrs.as_mut_ptr(),
+            n,
+            lr,
+            beta1,
+            beta2,
+            eps,
+            step,
         );
     }
 }
 
 /// Call the C++ MoE layer kernel (routing + expert dispatch + shared expert + combine).
 /// Expert weights are CPU tensors — C++ does to_device internally.
-pub fn glm5_moe_layer_cpp(
+pub fn glm5_moe_layer_ep_cpp(
     mlp_input: &Tensor,
-    shared_gate: &Tensor, shared_up: &Tensor, shared_down: &Tensor,
-    shared_gate_scale: Option<&Tensor>, shared_up_scale: Option<&Tensor>, shared_down_scale: Option<&Tensor>,
+    shared_gate: &Tensor,
+    shared_up: &Tensor,
+    shared_down: &Tensor,
+    shared_gate_scale: Option<&Tensor>,
+    shared_up_scale: Option<&Tensor>,
+    shared_down_scale: Option<&Tensor>,
     gate_weight: &Tensor,
+    correction_bias: Option<&Tensor>,
     // Expert weights (CPU)
-    expert_gate_weights: &[&Tensor], expert_up_weights: &[&Tensor], expert_down_weights: &[&Tensor],
-    expert_gate_scales: &[Option<&Tensor>], expert_up_scales: &[Option<&Tensor>], expert_down_scales: &[Option<&Tensor>],
+    expert_gate_weights: &[&Tensor],
+    expert_up_weights: &[&Tensor],
+    expert_down_weights: &[&Tensor],
+    expert_gate_scales: &[Option<&Tensor>],
+    expert_up_scales: &[Option<&Tensor>],
+    expert_down_scales: &[Option<&Tensor>],
     local_expert_indices: &[usize],
-    n_routed_experts: i32, topk: i32, routed_scaling_factor: f64,
+    n_routed_experts: i32,
+    topk: i32,
+    n_group: i32,
+    topk_group: i32,
+    scoring_func: i32,
+    topk_method: i32,
+    norm_topk_prob: bool,
+    routed_scaling_factor: f64,
+    ep_comm: *mut std::ffi::c_void,
+    ep_rank: i32,
+    ep_size: i32,
     device_id: i32,
 ) -> Result<Tensor> {
     fn opt_ptr(t: Option<&Tensor>) -> *mut std::ffi::c_void {
-        match t { Some(t) if t.numel() > 0 => t.as_ptr() as *mut _, _ => std::ptr::null_mut() }
+        match t {
+            Some(t) if t.numel() > 0 => t.as_ptr() as *mut _,
+            _ => std::ptr::null_mut(),
+        }
     }
-    let n = expert_gate_weights.len() as std::ffi::c_int;
-    let mut gate_ptrs: Vec<*mut std::ffi::c_void> = expert_gate_weights.iter().map(|t| t.as_ptr() as *mut _).collect();
-    let mut up_ptrs: Vec<*mut std::ffi::c_void> = expert_up_weights.iter().map(|t| t.as_ptr() as *mut _).collect();
-    let mut down_ptrs: Vec<*mut std::ffi::c_void> = expert_down_weights.iter().map(|t| t.as_ptr() as *mut _).collect();
-    let mut gs_ptrs: Vec<*mut std::ffi::c_void> = expert_gate_scales.iter().map(|t| opt_ptr(*t)).collect();
-    let mut us_ptrs: Vec<*mut std::ffi::c_void> = expert_up_scales.iter().map(|t| opt_ptr(*t)).collect();
-    let mut ds_ptrs: Vec<*mut std::ffi::c_void> = expert_down_scales.iter().map(|t| opt_ptr(*t)).collect();
-    let indices: Vec<std::ffi::c_int> = local_expert_indices.iter().map(|&i| i as std::ffi::c_int).collect();
+    let n_usize = expert_gate_weights.len();
+    if expert_up_weights.len() != n_usize
+        || expert_down_weights.len() != n_usize
+        || expert_gate_scales.len() != n_usize
+        || expert_up_scales.len() != n_usize
+        || expert_down_scales.len() != n_usize
+        || local_expert_indices.len() != n_usize
+    {
+        bail!("GLM5 MoE expert weight/scale/index slices must have equal length");
+    }
+    let n = i32::try_from(n_usize).context("too many local experts for GLM5 ABI")?;
+    let mut gate_ptrs: Vec<*mut std::ffi::c_void> = expert_gate_weights
+        .iter()
+        .map(|t| t.as_ptr() as *mut _)
+        .collect();
+    let mut up_ptrs: Vec<*mut std::ffi::c_void> = expert_up_weights
+        .iter()
+        .map(|t| t.as_ptr() as *mut _)
+        .collect();
+    let mut down_ptrs: Vec<*mut std::ffi::c_void> = expert_down_weights
+        .iter()
+        .map(|t| t.as_ptr() as *mut _)
+        .collect();
+    let mut gs_ptrs: Vec<*mut std::ffi::c_void> =
+        expert_gate_scales.iter().map(|t| opt_ptr(*t)).collect();
+    let mut us_ptrs: Vec<*mut std::ffi::c_void> =
+        expert_up_scales.iter().map(|t| opt_ptr(*t)).collect();
+    let mut ds_ptrs: Vec<*mut std::ffi::c_void> =
+        expert_down_scales.iter().map(|t| opt_ptr(*t)).collect();
+    let indices: Vec<i32> = local_expert_indices
+        .iter()
+        .map(|&i| i32::try_from(i).context("local expert index exceeds GLM5 ABI"))
+        .collect::<Result<_>>()?;
 
     let result_ptr = unsafe {
         v4_glm5_moe_layer(
             mlp_input.as_ptr() as *mut _,
-            shared_gate.as_ptr() as *mut _, shared_up.as_ptr() as *mut _, shared_down.as_ptr() as *mut _,
-            opt_ptr(shared_gate_scale), opt_ptr(shared_up_scale), opt_ptr(shared_down_scale),
+            shared_gate.as_ptr() as *mut _,
+            shared_up.as_ptr() as *mut _,
+            shared_down.as_ptr() as *mut _,
+            opt_ptr(shared_gate_scale),
+            opt_ptr(shared_up_scale),
+            opt_ptr(shared_down_scale),
             gate_weight.as_ptr() as *mut _,
-            gate_ptrs.as_mut_ptr(), up_ptrs.as_mut_ptr(), down_ptrs.as_mut_ptr(),
-            gs_ptrs.as_mut_ptr(), us_ptrs.as_mut_ptr(), ds_ptrs.as_mut_ptr(),
-            n, indices.as_ptr(),
-            n_routed_experts, topk, routed_scaling_factor, device_id,
+            opt_ptr(correction_bias),
+            gate_ptrs.as_mut_ptr(),
+            up_ptrs.as_mut_ptr(),
+            down_ptrs.as_mut_ptr(),
+            gs_ptrs.as_mut_ptr(),
+            us_ptrs.as_mut_ptr(),
+            ds_ptrs.as_mut_ptr(),
+            n,
+            indices.as_ptr(),
+            n_routed_experts,
+            topk,
+            n_group,
+            topk_group,
+            scoring_func,
+            topk_method,
+            i32::from(norm_topk_prob),
+            routed_scaling_factor,
+            ep_comm,
+            ep_rank,
+            ep_size,
+            device_id,
         )
     };
-    if result_ptr.is_null() { bail!("C++ v4_glm5_moe_layer returned null"); }
+    if result_ptr.is_null() {
+        return Err(glm5_ffi_error("v4_glm5_moe_layer"));
+    }
     let tensor = unsafe { Tensor::clone_from_ptr(result_ptr as *mut _) };
     unsafe { v4_glm5_free_at_tensor(result_ptr) };
     Ok(tensor)
 }
 
+/// Single-rank compatibility wrapper for callers that do not need expert
+/// dispatch. The distributed session uses [`glm5_moe_layer_ep_cpp`] directly
+/// with the checkpoint's complete router configuration.
+pub fn glm5_moe_layer_cpp(
+    mlp_input: &Tensor,
+    shared_gate: &Tensor,
+    shared_up: &Tensor,
+    shared_down: &Tensor,
+    shared_gate_scale: Option<&Tensor>,
+    shared_up_scale: Option<&Tensor>,
+    shared_down_scale: Option<&Tensor>,
+    gate_weight: &Tensor,
+    expert_gate_weights: &[&Tensor],
+    expert_up_weights: &[&Tensor],
+    expert_down_weights: &[&Tensor],
+    expert_gate_scales: &[Option<&Tensor>],
+    expert_up_scales: &[Option<&Tensor>],
+    expert_down_scales: &[Option<&Tensor>],
+    local_expert_indices: &[usize],
+    n_routed_experts: i32,
+    topk: i32,
+    routed_scaling_factor: f64,
+    device_id: i32,
+) -> Result<Tensor> {
+    glm5_moe_layer_ep_cpp(
+        mlp_input,
+        shared_gate,
+        shared_up,
+        shared_down,
+        shared_gate_scale,
+        shared_up_scale,
+        shared_down_scale,
+        gate_weight,
+        None,
+        expert_gate_weights,
+        expert_up_weights,
+        expert_down_weights,
+        expert_gate_scales,
+        expert_up_scales,
+        expert_down_scales,
+        local_expert_indices,
+        n_routed_experts,
+        topk,
+        1,
+        1,
+        0,
+        0,
+        true,
+        routed_scaling_factor,
+        std::ptr::null_mut(),
+        0,
+        1,
+        device_id,
+    )
+}
+
 /// Call the C++ embedding lookup kernel.
-pub fn glm5_embedding_cpp(embed_weight: &Tensor, input_ids: &Tensor, device_id: i32) -> Result<Tensor> {
+pub fn glm5_embedding_cpp(
+    embed_weight: &Tensor,
+    input_ids: &Tensor,
+    device_id: i32,
+) -> Result<Tensor> {
     let result_ptr = unsafe {
-        v4_glm5_embedding(embed_weight.as_ptr() as *mut _, input_ids.as_ptr() as *mut _, device_id)
+        v4_glm5_embedding(
+            embed_weight.as_ptr() as *mut _,
+            input_ids.as_ptr() as *mut _,
+            device_id,
+        )
     };
-    if result_ptr.is_null() { bail!("C++ v4_glm5_embedding returned null"); }
+    if result_ptr.is_null() {
+        return Err(glm5_ffi_error("v4_glm5_embedding"));
+    }
     let tensor = unsafe { Tensor::clone_from_ptr(result_ptr as *mut _) };
     unsafe { v4_glm5_free_at_tensor(result_ptr) };
     Ok(tensor)
@@ -930,72 +1677,202 @@ pub fn glm5_layer_forward_cpp(
     input_norm_weight: &Tensor,
     post_norm_weight: &Tensor,
     // Attention weights
-    q_a_proj: &Tensor, q_a_layernorm: &Tensor, q_b_proj: &Tensor,
-    kv_a_proj: &Tensor, kv_a_layernorm: &Tensor, kv_b_proj: &Tensor, o_proj: &Tensor,
+    q_a_proj: &Tensor,
+    q_a_layernorm: &Tensor,
+    q_b_proj: &Tensor,
+    kv_a_proj: &Tensor,
+    kv_a_layernorm: &Tensor,
+    kv_b_proj: &Tensor,
+    o_proj: &Tensor,
     // FP8 scales
-    q_a_scale: Option<&Tensor>, q_b_scale: Option<&Tensor>,
-    kv_a_scale: Option<&Tensor>, kv_b_scale: Option<&Tensor>, o_scale: Option<&Tensor>,
+    q_a_scale: Option<&Tensor>,
+    q_b_scale: Option<&Tensor>,
+    kv_a_scale: Option<&Tensor>,
+    kv_b_scale: Option<&Tensor>,
+    o_scale: Option<&Tensor>,
     // Indexer
-    idx_wq_b: Option<&Tensor>, idx_wk: Option<&Tensor>,
-    idx_k_norm_w: Option<&Tensor>, idx_k_norm_b: Option<&Tensor>,
+    idx_wq_b: Option<&Tensor>,
+    idx_wk: Option<&Tensor>,
+    idx_k_norm_w: Option<&Tensor>,
+    idx_k_norm_b: Option<&Tensor>,
     idx_weights_proj: Option<&Tensor>,
-    idx_wq_b_scale: Option<&Tensor>, idx_wk_scale: Option<&Tensor>,
+    idx_wq_b_scale: Option<&Tensor>,
+    idx_wk_scale: Option<&Tensor>,
     // MLP/MoE
     gate_weight: Option<&Tensor>,
-    shared_gate: Option<&Tensor>, shared_up: Option<&Tensor>, shared_down: Option<&Tensor>,
-    shared_gate_scale: Option<&Tensor>, shared_up_scale: Option<&Tensor>, shared_down_scale: Option<&Tensor>,
-    dense_gate: Option<&Tensor>, dense_up: Option<&Tensor>, dense_down: Option<&Tensor>,
-    dense_gate_scale: Option<&Tensor>, dense_up_scale: Option<&Tensor>, dense_down_scale: Option<&Tensor>,
+    shared_gate: Option<&Tensor>,
+    shared_up: Option<&Tensor>,
+    shared_down: Option<&Tensor>,
+    shared_gate_scale: Option<&Tensor>,
+    shared_up_scale: Option<&Tensor>,
+    shared_down_scale: Option<&Tensor>,
+    dense_gate: Option<&Tensor>,
+    dense_up: Option<&Tensor>,
+    dense_down: Option<&Tensor>,
+    dense_gate_scale: Option<&Tensor>,
+    dense_up_scale: Option<&Tensor>,
+    dense_down_scale: Option<&Tensor>,
     // Expert weights (CPU)
-    expert_gate_weights: &[&Tensor], expert_up_weights: &[&Tensor], expert_down_weights: &[&Tensor],
-    expert_gate_scales: &[Option<&Tensor>], expert_up_scales: &[Option<&Tensor>], expert_down_scales: &[Option<&Tensor>],
+    expert_gate_weights: &[&Tensor],
+    expert_up_weights: &[&Tensor],
+    expert_down_weights: &[&Tensor],
+    expert_gate_scales: &[Option<&Tensor>],
+    expert_up_scales: &[Option<&Tensor>],
+    expert_down_scales: &[Option<&Tensor>],
     local_expert_indices: &[usize],
     // Config
-    batch: i32, seq: i32, num_heads: i32, qk_nope: i32, qk_rope: i32,
-    v_head: i32, kv_lora: i32, idx_head_dim: i32, idx_n_heads: i32, idx_topk: i32,
-    layer: i32, is_full_layer: bool, is_moe_layer: bool, n_routed_experts: i32, topk: i32,
-    rms_eps: f64, rope_theta: f64, rope_interleave: bool, routed_scaling_factor: f64,
+    batch: i32,
+    seq: i32,
+    num_heads: i32,
+    qk_nope: i32,
+    qk_rope: i32,
+    v_head: i32,
+    kv_lora: i32,
+    idx_head_dim: i32,
+    idx_n_heads: i32,
+    idx_topk: i32,
+    index_topk_freq: i32,
+    layer: i32,
+    is_full_layer: bool,
+    is_moe_layer: bool,
+    n_routed_experts: i32,
+    topk: i32,
+    rms_eps: f64,
+    rope_theta: f64,
+    rope_interleave: bool,
+    routed_scaling_factor: f64,
     device_id: i32,
     // IndexShare state
     index_state: &mut Glm5IndexState,
 ) -> Result<Tensor> {
     fn opt_ptr(t: Option<&Tensor>) -> *mut std::ffi::c_void {
-        match t { Some(t) if t.numel() > 0 => t.as_ptr() as *mut _, _ => std::ptr::null_mut() }
+        match t {
+            Some(t) if t.numel() > 0 => t.as_ptr() as *mut _,
+            _ => std::ptr::null_mut(),
+        }
     }
-    let n = expert_gate_weights.len() as std::ffi::c_int;
-    let mut gate_ptrs: Vec<*mut std::ffi::c_void> = expert_gate_weights.iter().map(|t| t.as_ptr() as *mut _).collect();
-    let mut up_ptrs: Vec<*mut std::ffi::c_void> = expert_up_weights.iter().map(|t| t.as_ptr() as *mut _).collect();
-    let mut down_ptrs: Vec<*mut std::ffi::c_void> = expert_down_weights.iter().map(|t| t.as_ptr() as *mut _).collect();
-    let mut gs_ptrs: Vec<*mut std::ffi::c_void> = expert_gate_scales.iter().map(|t| opt_ptr(*t)).collect();
-    let mut us_ptrs: Vec<*mut std::ffi::c_void> = expert_up_scales.iter().map(|t| opt_ptr(*t)).collect();
-    let mut ds_ptrs: Vec<*mut std::ffi::c_void> = expert_down_scales.iter().map(|t| opt_ptr(*t)).collect();
-    let indices: Vec<std::ffi::c_int> = local_expert_indices.iter().map(|&i| i as std::ffi::c_int).collect();
+    let n_usize = expert_gate_weights.len();
+    if expert_up_weights.len() != n_usize
+        || expert_down_weights.len() != n_usize
+        || expert_gate_scales.len() != n_usize
+        || expert_up_scales.len() != n_usize
+        || expert_down_scales.len() != n_usize
+        || local_expert_indices.len() != n_usize
+    {
+        bail!("GLM5 layer expert weight/scale/index slices must have equal length");
+    }
+    let n = i32::try_from(n_usize).context("too many local experts for GLM5 ABI")?;
+    let mut gate_ptrs: Vec<*mut std::ffi::c_void> = expert_gate_weights
+        .iter()
+        .map(|t| t.as_ptr() as *mut _)
+        .collect();
+    let mut up_ptrs: Vec<*mut std::ffi::c_void> = expert_up_weights
+        .iter()
+        .map(|t| t.as_ptr() as *mut _)
+        .collect();
+    let mut down_ptrs: Vec<*mut std::ffi::c_void> = expert_down_weights
+        .iter()
+        .map(|t| t.as_ptr() as *mut _)
+        .collect();
+    let mut gs_ptrs: Vec<*mut std::ffi::c_void> =
+        expert_gate_scales.iter().map(|t| opt_ptr(*t)).collect();
+    let mut us_ptrs: Vec<*mut std::ffi::c_void> =
+        expert_up_scales.iter().map(|t| opt_ptr(*t)).collect();
+    let mut ds_ptrs: Vec<*mut std::ffi::c_void> =
+        expert_down_scales.iter().map(|t| opt_ptr(*t)).collect();
+    let indices: Vec<i32> = local_expert_indices
+        .iter()
+        .map(|&i| i32::try_from(i).context("local expert index exceeds GLM5 ABI"))
+        .collect::<Result<_>>()?;
 
     let result_ptr = unsafe {
         v4_glm5_layer_forward(
             hidden.as_ptr() as *mut _,
             input_norm_weight.as_ptr() as *mut _,
             post_norm_weight.as_ptr() as *mut _,
-            q_a_proj.as_ptr() as *mut _, q_a_layernorm.as_ptr() as *mut _, q_b_proj.as_ptr() as *mut _,
-            kv_a_proj.as_ptr() as *mut _, kv_a_layernorm.as_ptr() as *mut _, kv_b_proj.as_ptr() as *mut _,
+            q_a_proj.as_ptr() as *mut _,
+            q_a_layernorm.as_ptr() as *mut _,
+            q_b_proj.as_ptr() as *mut _,
+            kv_a_proj.as_ptr() as *mut _,
+            kv_a_layernorm.as_ptr() as *mut _,
+            kv_b_proj.as_ptr() as *mut _,
             o_proj.as_ptr() as *mut _,
-            opt_ptr(q_a_scale), opt_ptr(q_b_scale), opt_ptr(kv_a_scale), opt_ptr(kv_b_scale), opt_ptr(o_scale),
-            opt_ptr(idx_wq_b), opt_ptr(idx_wk), opt_ptr(idx_k_norm_w), opt_ptr(idx_k_norm_b),
-            opt_ptr(idx_weights_proj), opt_ptr(idx_wq_b_scale), opt_ptr(idx_wk_scale),
-            opt_ptr(gate_weight), opt_ptr(shared_gate), opt_ptr(shared_up), opt_ptr(shared_down),
-            opt_ptr(shared_gate_scale), opt_ptr(shared_up_scale), opt_ptr(shared_down_scale),
-            opt_ptr(dense_gate), opt_ptr(dense_up), opt_ptr(dense_down),
-            opt_ptr(dense_gate_scale), opt_ptr(dense_up_scale), opt_ptr(dense_down_scale),
-            gate_ptrs.as_mut_ptr(), up_ptrs.as_mut_ptr(), down_ptrs.as_mut_ptr(),
-            gs_ptrs.as_mut_ptr(), us_ptrs.as_mut_ptr(), ds_ptrs.as_mut_ptr(),
-            n, indices.as_ptr(),
-            batch, seq, num_heads, qk_nope, qk_rope, v_head, kv_lora, idx_head_dim, idx_n_heads, idx_topk,
-            layer, if is_full_layer { 1 } else { 0 }, if is_moe_layer { 1 } else { 0 }, n_routed_experts, topk,
-            rms_eps, rope_theta, if rope_interleave { 1 } else { 0 }, routed_scaling_factor, device_id,
-            &mut index_state.topk_indices, &mut index_state.idx_bias_keys, &mut index_state.source_layer,
+            opt_ptr(q_a_scale),
+            opt_ptr(q_b_scale),
+            opt_ptr(kv_a_scale),
+            opt_ptr(kv_b_scale),
+            opt_ptr(o_scale),
+            opt_ptr(idx_wq_b),
+            opt_ptr(idx_wk),
+            opt_ptr(idx_k_norm_w),
+            opt_ptr(idx_k_norm_b),
+            opt_ptr(idx_weights_proj),
+            opt_ptr(idx_wq_b_scale),
+            opt_ptr(idx_wk_scale),
+            opt_ptr(gate_weight),
+            opt_ptr(shared_gate),
+            opt_ptr(shared_up),
+            opt_ptr(shared_down),
+            opt_ptr(shared_gate_scale),
+            opt_ptr(shared_up_scale),
+            opt_ptr(shared_down_scale),
+            opt_ptr(dense_gate),
+            opt_ptr(dense_up),
+            opt_ptr(dense_down),
+            opt_ptr(dense_gate_scale),
+            opt_ptr(dense_up_scale),
+            opt_ptr(dense_down_scale),
+            gate_ptrs.as_mut_ptr(),
+            up_ptrs.as_mut_ptr(),
+            down_ptrs.as_mut_ptr(),
+            gs_ptrs.as_mut_ptr(),
+            us_ptrs.as_mut_ptr(),
+            ds_ptrs.as_mut_ptr(),
+            n,
+            indices.as_ptr(),
+            batch,
+            seq,
+            num_heads,
+            qk_nope,
+            qk_rope,
+            v_head,
+            kv_lora,
+            idx_head_dim,
+            idx_n_heads,
+            idx_topk,
+            index_topk_freq,
+            layer,
+            if is_full_layer { 1 } else { 0 },
+            if is_moe_layer { 1 } else { 0 },
+            n_routed_experts,
+            topk,
+            rms_eps,
+            rope_theta,
+            if rope_interleave { 1 } else { 0 },
+            routed_scaling_factor,
+            device_id,
+            &mut index_state.topk_indices,
+            &mut index_state.idx_bias_keys,
+            &mut index_state.source_layer,
         )
     };
-    if result_ptr.is_null() { bail!("C++ v4_glm5_layer_forward returned null"); }
+    if result_ptr.is_null() {
+        return Err(glm5_ffi_error("v4_glm5_layer_forward"));
+    }
+    let tensor = unsafe { Tensor::clone_from_ptr(result_ptr as *mut _) };
+    unsafe { v4_glm5_free_at_tensor(result_ptr) };
+    Ok(tensor)
+}
+
+/// Execute one complete native GLM5 MTP decoder layer in one Rust -> C++ FFI
+/// call. The descriptor owns no tensors; all pointers are borrowed for this
+/// call. TP/EP use SUM-forward/identity-backward collectives and CP uses the
+/// autograd-aware K/V ring implemented in the C++ kernel.
+pub fn glm5_mtp_decoder_layer_cpp(descriptor: &Glm5MtpDecoderDescriptor) -> Result<Tensor> {
+    let result_ptr = unsafe { v4_glm5_mtp_decoder_layer(descriptor) };
+    if result_ptr.is_null() {
+        return Err(glm5_ffi_error("v4_glm5_mtp_decoder_layer"));
+    }
     let tensor = unsafe { Tensor::clone_from_ptr(result_ptr as *mut _) };
     unsafe { v4_glm5_free_at_tensor(result_ptr) };
     Ok(tensor)
@@ -1007,4 +1884,326 @@ pub fn glm5_layer_forward_cpp(
 /// call this before using the output tensor in the next compute.
 pub fn stream_wait_event(device_id: i32, event: &rustrain_nccl::nccl::CudaEventHandle) {
     unsafe { v4_stream_wait_event(device_id, event.0) };
+}
+
+#[cfg(test)]
+mod mtp_tests {
+    use super::*;
+    use tch::{Device, Kind};
+
+    #[test]
+    fn mtp_prepare_aligns_next_token_embedding() {
+        let hidden = Tensor::zeros([1, 4, 4], (Kind::Float, Device::Cpu));
+        let input_ids = Tensor::from_slice(&[0_i64, 1, 2, 3]).reshape([1, 4]);
+        let embed = Tensor::eye(4, (Kind::Float, Device::Cpu));
+        let norm = Tensor::ones([4], (Kind::Float, Device::Cpu));
+        let eh_proj = Tensor::cat(
+            &[
+                &Tensor::eye(4, (Kind::Float, Device::Cpu)),
+                &Tensor::zeros([4, 4], (Kind::Float, Device::Cpu)),
+            ],
+            1,
+        );
+
+        let projected = glm5_mtp_prepare_cpp(
+            &hidden, &input_ids, &embed, &norm, &norm, &eh_proj, None, 1e-6, 1,
+        )
+        .unwrap();
+
+        assert_eq!(projected.size(), vec![1, 2, 4]);
+        let selected: Vec<i64> =
+            Vec::<i64>::try_from(&projected.argmax(-1, false).reshape([-1])).unwrap();
+        assert_eq!(selected, vec![1, 2]);
+    }
+
+    #[test]
+    fn mtp_prepare_preserves_autograd_inputs() {
+        let hidden = Tensor::zeros([1, 4, 4], (Kind::Float, Device::Cpu));
+        let _ = hidden.set_requires_grad(true);
+        let input_ids = Tensor::from_slice(&[0_i64, 1, 2, 3]).reshape([1, 4]);
+        let embed = Tensor::eye(4, (Kind::Float, Device::Cpu));
+        let norm = Tensor::ones([4], (Kind::Float, Device::Cpu));
+        let mut eh_proj = Tensor::eye(4, (Kind::Float, Device::Cpu));
+        eh_proj = Tensor::cat(
+            &[&eh_proj, &Tensor::zeros([4, 4], (Kind::Float, Device::Cpu))],
+            1,
+        );
+        let _ = eh_proj.set_requires_grad(true);
+
+        let projected = glm5_mtp_prepare_cpp(
+            &hidden, &input_ids, &embed, &norm, &norm, &eh_proj, None, 1e-6, 1,
+        )
+        .unwrap();
+        projected.sum(Kind::Float).backward();
+
+        assert!(hidden.grad().defined(), "hidden gradient was not retained");
+        assert!(
+            eh_proj.grad().defined(),
+            "eh_proj gradient was not retained"
+        );
+    }
+
+    #[test]
+    fn mtp_prepare_supports_deeper_token_offsets() {
+        let hidden = Tensor::zeros([1, 3, 4], (Kind::Float, Device::Cpu));
+        let input_ids = Tensor::from_slice(&[0_i64, 1, 2, 3, 0]).reshape([1, 5]);
+        let embed = Tensor::eye(4, (Kind::Float, Device::Cpu));
+        let norm = Tensor::ones([4], (Kind::Float, Device::Cpu));
+        let eh_proj = Tensor::cat(
+            &[
+                &Tensor::eye(4, (Kind::Float, Device::Cpu)),
+                &Tensor::zeros([4, 4], (Kind::Float, Device::Cpu)),
+            ],
+            1,
+        );
+
+        let projected = glm5_mtp_prepare_cpp(
+            &hidden, &input_ids, &embed, &norm, &norm, &eh_proj, None, 1e-6, 2,
+        )
+        .unwrap();
+
+        assert_eq!(projected.size(), vec![1, 2, 4]);
+        let selected: Vec<i64> =
+            Vec::<i64>::try_from(&projected.argmax(-1, false).reshape([-1])).unwrap();
+        assert_eq!(selected, vec![2, 3]);
+    }
+
+    #[test]
+    fn mtp_loss_uses_next_next_token_targets() {
+        let input_ids = Tensor::from_slice(&[0_i64, 1, 2, 3]).reshape([1, 4]);
+        let mask = Tensor::ones([1, 4], (Kind::Float, Device::Cpu));
+        let norm = Tensor::ones([4], (Kind::Float, Device::Cpu));
+        let lm_head = Tensor::eye(4, (Kind::Float, Device::Cpu)) * 10.0;
+        let aligned = Tensor::from_slice(&[
+            0.0_f32, 0.0, 1.0, 0.0, // predicts token 2
+            0.0, 0.0, 0.0, 1.0, // predicts token 3
+        ])
+        .reshape([1, 2, 4]);
+        let misaligned =
+            Tensor::from_slice(&[0.0_f32, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0]).reshape([1, 2, 4]);
+
+        let aligned_loss = glm5_mtp_cross_entropy_loss_cpp(
+            &aligned, &norm, &lm_head, None, &input_ids, &mask, 1e-6, 0, 16,
+        )
+        .unwrap()
+        .double_value(&[]);
+        let misaligned_loss = glm5_mtp_cross_entropy_loss_cpp(
+            &misaligned,
+            &norm,
+            &lm_head,
+            None,
+            &input_ids,
+            &mask,
+            1e-6,
+            0,
+            16,
+        )
+        .unwrap()
+        .double_value(&[]);
+
+        assert!(aligned_loss < 0.01, "aligned loss was {aligned_loss}");
+        assert!(
+            misaligned_loss > 5.0,
+            "misaligned loss was {misaligned_loss}"
+        );
+    }
+
+    #[test]
+    fn two_layer_mtp_chain_preserves_offsets_and_autograd() {
+        let hidden = Tensor::randn([1, 5, 4], (Kind::Float, Device::Cpu));
+        let _ = hidden.set_requires_grad(true);
+        let input_ids = Tensor::from_slice(&[0_i64, 1, 2, 3, 0]).reshape([1, 5]);
+        let mask = Tensor::ones([1, 5], (Kind::Float, Device::Cpu));
+        let embed = Tensor::eye(4, (Kind::Float, Device::Cpu));
+        let norm = Tensor::ones([4], (Kind::Float, Device::Cpu));
+        let lm_head = Tensor::eye(4, (Kind::Float, Device::Cpu));
+        let projection = Tensor::cat(
+            &[
+                &Tensor::zeros([4, 4], (Kind::Float, Device::Cpu)),
+                &Tensor::eye(4, (Kind::Float, Device::Cpu)),
+            ],
+            1,
+        );
+        let _ = projection.set_requires_grad(true);
+
+        let layer0 = glm5_mtp_prepare_cpp(
+            &hidden,
+            &input_ids,
+            &embed,
+            &norm,
+            &norm,
+            &projection,
+            None,
+            1e-6,
+            1,
+        )
+        .unwrap();
+        let output0 = glm5_mtp_postprocess_loss_cpp(
+            &layer0, &norm, &lm_head, None, &input_ids, &mask, 1e-6, 0, 16,
+        )
+        .unwrap();
+        assert_eq!(output0.normalized.size(), vec![1, 3, 4]);
+
+        let layer1 = glm5_mtp_prepare_cpp(
+            &output0.normalized,
+            &input_ids,
+            &embed,
+            &norm,
+            &norm,
+            &projection,
+            None,
+            1e-6,
+            2,
+        )
+        .unwrap();
+        let output1 = glm5_mtp_postprocess_loss_cpp(
+            &layer1, &norm, &lm_head, None, &input_ids, &mask, 1e-6, 1, 16,
+        )
+        .unwrap();
+        assert_eq!(output1.normalized.size(), vec![1, 2, 4]);
+        assert_eq!(output0.token_count.double_value(&[]), 3.0);
+        assert_eq!(output1.token_count.double_value(&[]), 2.0);
+
+        let lm_loss = Tensor::from(1.0_f32);
+        let combined =
+            glm5_combine_losses_cpp(&lm_loss, &[output0.loss, output1.loss], 0.5).unwrap();
+        assert!(
+            (combined.total.double_value(&[]) - (1.0 + 0.5 * combined.mtp_mean.double_value(&[])))
+                .abs()
+                < 1e-6
+        );
+        combined.total.backward();
+        assert!(hidden.grad().defined(), "trunk hidden gradient is missing");
+        assert!(
+            projection.grad().defined(),
+            "MTP projection gradient is missing"
+        );
+    }
+
+    #[test]
+    fn kv_ring_rejects_non_cuda_inputs_without_returning_partial_outputs() {
+        let key = Tensor::zeros([1, 2, 3, 5], (Kind::Float, Device::Cpu));
+        let value = Tensor::zeros([1, 2, 3, 7], (Kind::Float, Device::Cpu));
+        let result =
+            glm5_nccl_kv_ring_autograd_cpp(&key, &value, 1_usize as *mut std::ffi::c_void, 0, 0);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn mtp_decoder_local_dense_forward_and_autograd() {
+        let hidden = Tensor::randn([1, 2, 4], (Kind::Float, Device::Cpu));
+        let _ = hidden.set_requires_grad(true);
+        let norm = Tensor::ones([4], (Kind::Float, Device::Cpu));
+        let q_a = Tensor::randn([4, 4], (Kind::Float, Device::Cpu));
+        let q_b = Tensor::randn([4, 4], (Kind::Float, Device::Cpu));
+        let kv_a = Tensor::randn([4, 4], (Kind::Float, Device::Cpu));
+        let kv_b = Tensor::randn([4, 2], (Kind::Float, Device::Cpu));
+        let q_ln = Tensor::ones([4], (Kind::Float, Device::Cpu));
+        let kv_ln = Tensor::ones([2], (Kind::Float, Device::Cpu));
+        let o_proj = Tensor::randn([4, 2], (Kind::Float, Device::Cpu));
+        let dense_gate = Tensor::randn([8, 4], (Kind::Float, Device::Cpu));
+        let dense_up = Tensor::randn([8, 4], (Kind::Float, Device::Cpu));
+        let dense_down = Tensor::randn([4, 8], (Kind::Float, Device::Cpu));
+        let mut d = Glm5MtpDecoderDescriptor::default();
+        let ptr = |t: &Tensor| t.as_ptr() as *mut std::ffi::c_void;
+        d.hidden = ptr(&hidden);
+        d.input_norm_weight = ptr(&norm);
+        d.post_norm_weight = ptr(&norm);
+        d.q_a_proj = ptr(&q_a);
+        d.q_a_layernorm = ptr(&q_ln);
+        d.q_b_proj = ptr(&q_b);
+        d.kv_a_proj = ptr(&kv_a);
+        d.kv_a_layernorm = ptr(&kv_ln);
+        d.kv_b_proj = ptr(&kv_b);
+        d.o_proj = ptr(&o_proj);
+        d.dense_gate = ptr(&dense_gate);
+        d.dense_up = ptr(&dense_up);
+        d.dense_down = ptr(&dense_down);
+        d.tp_size = 1;
+        d.cp_size = 1;
+        d.ep_size = 1;
+        d.num_heads = 1;
+        d.qk_nope = 2;
+        d.qk_rope = 2;
+        d.v_head = 2;
+        d.kv_lora = 2;
+        d.rms_eps = 1e-6;
+        d.rope_theta = 10_000.0;
+        let output = glm5_mtp_decoder_layer_cpp(&d).unwrap();
+        assert_eq!(output.size(), vec![1, 2, 4]);
+        output.sum(Kind::Float).backward();
+        assert!(
+            hidden.grad().defined(),
+            "MTP decoder detached hidden autograd"
+        );
+    }
+
+    #[test]
+    fn mtp_decoder_distributed_requires_cuda_and_comm() {
+        let hidden = Tensor::zeros([1, 1, 4], (Kind::Float, Device::Cpu));
+        let norm = Tensor::ones([4], (Kind::Float, Device::Cpu));
+        let q_a = Tensor::randn([4, 4], (Kind::Float, Device::Cpu));
+        let q_b = Tensor::randn([4, 4], (Kind::Float, Device::Cpu));
+        let kv_a = Tensor::randn([4, 4], (Kind::Float, Device::Cpu));
+        let kv_b = Tensor::randn([4, 2], (Kind::Float, Device::Cpu));
+        let q_ln = Tensor::ones([4], (Kind::Float, Device::Cpu));
+        let kv_ln = Tensor::ones([2], (Kind::Float, Device::Cpu));
+        let o_proj = Tensor::randn([4, 2], (Kind::Float, Device::Cpu));
+        let dense_gate = Tensor::randn([8, 4], (Kind::Float, Device::Cpu));
+        let dense_up = Tensor::randn([8, 4], (Kind::Float, Device::Cpu));
+        let dense_down = Tensor::randn([4, 8], (Kind::Float, Device::Cpu));
+        let mut d = Glm5MtpDecoderDescriptor::default();
+        let ptr = |t: &Tensor| t.as_ptr() as *mut std::ffi::c_void;
+        d.hidden = ptr(&hidden);
+        d.input_norm_weight = ptr(&norm);
+        d.post_norm_weight = ptr(&norm);
+        d.q_a_proj = ptr(&q_a);
+        d.q_a_layernorm = ptr(&q_ln);
+        d.q_b_proj = ptr(&q_b);
+        d.kv_a_proj = ptr(&kv_a);
+        d.kv_a_layernorm = ptr(&kv_ln);
+        d.kv_b_proj = ptr(&kv_b);
+        d.o_proj = ptr(&o_proj);
+        d.dense_gate = ptr(&dense_gate);
+        d.dense_up = ptr(&dense_up);
+        d.dense_down = ptr(&dense_down);
+        d.tp_comm = 1_usize as *mut std::ffi::c_void;
+        d.tp_size = 2;
+        d.cp_size = 1;
+        d.ep_size = 1;
+        d.num_heads = 1;
+        d.qk_nope = 2;
+        d.qk_rope = 2;
+        d.v_head = 2;
+        d.kv_lora = 2;
+        d.rms_eps = 1e-6;
+        d.rope_theta = 10_000.0;
+        let error = glm5_mtp_decoder_layer_cpp(&d).unwrap_err().to_string();
+        assert!(error.contains("TP collective requires CUDA input"));
+    }
+
+    #[test]
+    fn cross_entropy_cpu_supports_batch_and_chunking() {
+        let hidden = Tensor::arange(24, (Kind::Float, Device::Cpu))
+            .reshape([2, 4, 3])
+            .set_requires_grad(true);
+        let lm_head = Tensor::arange(15, (Kind::Float, Device::Cpu)).reshape([5, 3]);
+        let targets = Tensor::from_slice(&[0_i64, 1, 2, 3, 4, 3, 2, 1]).reshape([2, 4]);
+        let mask =
+            Tensor::from_slice(&[1.0_f32, 1.0, 0.0, 1.0, 1.0, 0.0, 1.0, 1.0]).reshape([2, 4]);
+        let loss = glm5_cross_entropy_loss_cpp(&hidden, &lm_head, &targets, &mask, 4, 5, 1, 0)
+            .expect("CPU CE should support batch > 1");
+        let shifted_hidden = hidden.narrow(1, 0, 3).reshape([-1, 3]);
+        let shifted_targets = targets.narrow(1, 1, 3).reshape([-1]);
+        let shifted_mask = mask.narrow(1, 1, 3).reshape([-1]);
+        let reference = shifted_hidden
+            .linear::<&Tensor>(&lm_head, None)
+            .log_softmax(-1, Kind::Float)
+            .g_nll_loss::<&Tensor>(&shifted_targets, None, tch::Reduction::None, -100);
+        let reference = (reference * &shifted_mask).sum(Kind::Float)
+            / shifted_mask.sum(Kind::Float).clamp_min(1.0);
+        assert!((loss.double_value(&[]) - reference.double_value(&[])).abs() < 1e-5);
+        loss.backward();
+        assert!(hidden.grad().defined());
+    }
 }

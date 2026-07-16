@@ -1,9 +1,9 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use serde::Serialize;
-use tch::{nn, Device, Kind, Tensor};
+use tch::{Device, Kind, Tensor, nn};
 
 use crate::model::*;
 
@@ -61,6 +61,17 @@ impl Glm5LoraRegistry {
         config: Glm5LoraConfig,
         device: Device,
     ) -> Result<Self> {
+        if config.rank <= 0 || config.alpha <= 0 {
+            bail!("GLM-5 LoRA rank and alpha must be positive");
+        }
+        let mut targets = std::collections::BTreeSet::new();
+        for &layer in &config.target_layers {
+            for &module in &config.target_modules {
+                if !targets.insert((layer, module)) {
+                    bail!("duplicate GLM-5 LoRA target: layer {layer}, {module:?}");
+                }
+            }
+        }
         let vs = nn::VarStore::new(device);
         let p = vs.root();
         let mut adapters = BTreeMap::new();
@@ -102,7 +113,10 @@ impl Glm5LoraRegistry {
     }
 
     pub fn param_count(&self) -> usize {
-        self.adapters.len() * 2
+        self.adapters
+            .values()
+            .map(|(lora_a, lora_b)| lora_a.numel() + lora_b.numel())
+            .sum()
     }
 
     pub fn save(&self, path: &Path) -> Result<()> {
@@ -193,7 +207,7 @@ pub fn glm5_lora_weight(
     layer: usize,
     module: Glm5LoraTargetModule,
     registry: &mut Glm5LoraRegistry,
-) -> Tensor {
+) -> Result<Tensor> {
     if let Some((lora_a, lora_b)) = registry.adapters.get(&(layer, module)) {
         let lora_scale = registry.config.alpha as f64 / lora_a.size()[0] as f64;
 
@@ -202,7 +216,9 @@ pub fn glm5_lora_weight(
             cached.shallow_clone()
         } else {
             let d = lora_b.matmul(lora_a) * lora_scale;
-            registry.delta_cache.insert((layer, module), Some(d.shallow_clone()));
+            registry
+                .delta_cache
+                .insert((layer, module), Some(d.shallow_clone()));
             d
         };
 
@@ -212,23 +228,26 @@ pub fn glm5_lora_weight(
         } else {
             let bd = if base.kind() == Kind::Float8e4m3fn {
                 if let Some(s) = weight_scale {
-                    match rustrain_deepseek_v4::fp8_kernel::dequant_fp8_weight(base, s) {
-                        Ok(w) => w,
-                        Err(_) => base.to_kind(Kind::BFloat16)
-                    }
+                    rustrain_deepseek_v4::fp8_kernel::dequant_fp8_weight(base, s)
+                        .context("failed to dequantize FP8 GLM-5 base weight for LoRA")?
                 } else {
-                    base.to_kind(Kind::BFloat16)
+                    bail!("FP8 GLM-5 LoRA base weight is missing weight_scale_inv")
                 }
             } else {
                 base.shallow_clone()
             };
-            registry.base_cache.insert((layer, module), Some(bd.shallow_clone()));
+            registry
+                .base_cache
+                .insert((layer, module), Some(bd.shallow_clone()));
             bd
         };
 
-        &base_dequant + &delta
+        Ok(&base_dequant
+            + &delta
+                .to_device(base_dequant.device())
+                .to_kind(base_dequant.kind()))
     } else {
-        base.shallow_clone()
+        Ok(base.shallow_clone())
     }
 }
 
@@ -237,18 +256,48 @@ pub fn lora_attention_weights(
     base: &Glm5AttentionWeights,
     layer: usize,
     registry: &mut Glm5LoraRegistry,
-) -> Glm5AttentionWeights {
-    Glm5AttentionWeights {
-        q_a_proj: glm5_lora_weight(&base.q_a_proj, base.q_a_proj_scale.as_ref(), layer, Glm5LoraTargetModule::WqA, registry),
+) -> Result<Glm5AttentionWeights> {
+    Ok(Glm5AttentionWeights {
+        q_a_proj: glm5_lora_weight(
+            &base.q_a_proj,
+            base.q_a_proj_scale.as_ref(),
+            layer,
+            Glm5LoraTargetModule::WqA,
+            registry,
+        )?,
         q_a_layernorm: base.q_a_layernorm.shallow_clone(),
-        q_b_proj: glm5_lora_weight(&base.q_b_proj, base.q_b_proj_scale.as_ref(), layer, Glm5LoraTargetModule::WqB, registry),
-        kv_a_proj_with_mqa: glm5_lora_weight(&base.kv_a_proj_with_mqa, base.kv_a_proj_scale.as_ref(), layer, Glm5LoraTargetModule::Wkv, registry),
+        q_b_proj: glm5_lora_weight(
+            &base.q_b_proj,
+            base.q_b_proj_scale.as_ref(),
+            layer,
+            Glm5LoraTargetModule::WqB,
+            registry,
+        )?,
+        kv_a_proj_with_mqa: glm5_lora_weight(
+            &base.kv_a_proj_with_mqa,
+            base.kv_a_proj_scale.as_ref(),
+            layer,
+            Glm5LoraTargetModule::Wkv,
+            registry,
+        )?,
         kv_a_layernorm: base.kv_a_layernorm.shallow_clone(),
         kv_b_proj: base.kv_b_proj.shallow_clone(),
-        o_proj: glm5_lora_weight(&base.o_proj, base.o_proj_scale.as_ref(), layer, Glm5LoraTargetModule::Wo, registry),
-        indexer_k_norm_weight: base.indexer_k_norm_weight.as_ref().map(|t| t.shallow_clone()),
+        o_proj: glm5_lora_weight(
+            &base.o_proj,
+            base.o_proj_scale.as_ref(),
+            layer,
+            Glm5LoraTargetModule::Wo,
+            registry,
+        )?,
+        indexer_k_norm_weight: base
+            .indexer_k_norm_weight
+            .as_ref()
+            .map(|t| t.shallow_clone()),
         indexer_k_norm_bias: base.indexer_k_norm_bias.as_ref().map(|t| t.shallow_clone()),
-        indexer_weights_proj: base.indexer_weights_proj.as_ref().map(|t| t.shallow_clone()),
+        indexer_weights_proj: base
+            .indexer_weights_proj
+            .as_ref()
+            .map(|t| t.shallow_clone()),
         indexer_wk: base.indexer_wk.as_ref().map(|t| t.shallow_clone()),
         indexer_wq_b: base.indexer_wq_b.as_ref().map(|t| t.shallow_clone()),
         // Scales set to None for LoRA-modified weights (already dequanted to BFloat16)
@@ -260,5 +309,5 @@ pub fn lora_attention_weights(
         o_proj_scale: None,
         indexer_wk_scale: base.indexer_wk_scale.as_ref().map(|t| t.shallow_clone()),
         indexer_wq_b_scale: base.indexer_wq_b_scale.as_ref().map(|t| t.shallow_clone()),
-    }
+    })
 }

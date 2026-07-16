@@ -1,10 +1,10 @@
 [run]
-name = "glm5_lora_sft_ep8"
+name = "glm5_lora_sft_tp2_cp2_ep2"
 base_dir = "/tmp/rustrain-runs"
 seed = 42
 
 [model]
-name = "glm5_lora_sft_ep8"
+name = "glm5_lora_sft_tp2_cp2_ep2"
 architecture = "glm5_lora_sft_ep"
 model_path = "/vePFS-Mindverse/share/huggingface/hub/models--zai-org--GLM-5.2/snapshots/f6142f127a14b58dc602592e996cd7d8ff139351"
 vocab_size = 154880
@@ -13,7 +13,7 @@ num_layers = 78
 num_attention_heads = 64
 num_key_value_heads = 64
 intermediate_size = 12288
-seq_len = 512
+seq_len = 1024
 norm = "rmsnorm"
 activation = "swiglu"
 rope = true
@@ -24,7 +24,6 @@ micro_batch_size = 1
 global_batch_size = 1
 gradient_accumulation_steps = 1
 learning_rate = 0.000001
-mtp_loss_scaling_factor = 0.1
 weight_decay = 0.0
 adam_beta1 = 0.9
 adam_beta2 = 0.999
@@ -42,8 +41,8 @@ alpha = 32
 target_modules = ["q_a_proj", "q_b_proj", "kv_a_proj_with_mqa", "o_proj"]
 
 [parallel]
-tensor_model_parallel_size = 1
+tensor_model_parallel_size = 2
 pipeline_model_parallel_size = 1
 data_parallel_size = 1
-expert_model_parallel_size = 8
-context_parallel_size = 1
+expert_model_parallel_size = 2
+context_parallel_size = 2

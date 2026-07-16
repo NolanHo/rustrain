@@ -5,8 +5,8 @@ use tracing::info;
 
 use crate::lora::*;
 use crate::model::*;
+use crate::model::{glm5_mlp, rms_norm};
 use rustrain_checkpoint::safetensors::tensor;
-use crate::model::{rms_norm, glm5_mlp};
 
 #[derive(Clone, Debug)]
 pub struct Glm5SftSample {
@@ -28,22 +28,38 @@ pub struct Glm5SftDataset {
 impl Glm5SftDataset {
     pub fn synthetic(tokenizer: &tokenizers::Tokenizer) -> Result<Self> {
         // Use GLM-5.2 chat format
-        let tok_gmask = 154822i64;     // [gmask]
-        let tok_sop = 154824i64;       // [sop] (start of prompt)
-        let tok_user = 154827i64;      // user tag
+        let tok_gmask = 154822i64; // [gmask]
+        let tok_sop = 154824i64; // [sop] (start of prompt)
+        let tok_user = 154827i64; // user tag
         let tok_assistant = 154828i64; // assistant tag
-        let reasoning_prefix_ids = tokenizer.encode("Reasoning Effort: Max\n", false)
+        let reasoning_prefix_ids = tokenizer
+            .encode("Reasoning Effort: Max\n", false)
             .map_err(|e| anyhow::anyhow!("tokenizer failed: {e}"))?
-            .get_ids().iter().map(|&id| id as i64).collect::<Vec<_>>();
-        let newline_ids = tokenizer.encode("\n", false)
+            .get_ids()
+            .iter()
+            .map(|&id| id as i64)
+            .collect::<Vec<_>>();
+        let newline_ids = tokenizer
+            .encode("\n", false)
             .map_err(|e| anyhow::anyhow!("tokenizer failed: {e}"))?
-            .get_ids().iter().map(|&id| id as i64).collect::<Vec<_>>();
-        let user_ids = tokenizer.encode("Reply with the project name.", false)
+            .get_ids()
+            .iter()
+            .map(|&id| id as i64)
+            .collect::<Vec<_>>();
+        let user_ids = tokenizer
+            .encode("Reply with the project name.", false)
             .map_err(|e| anyhow::anyhow!("tokenizer failed: {e}"))?
-            .get_ids().iter().map(|&id| id as i64).collect::<Vec<_>>();
-        let mut response_ids = tokenizer.encode("rustrain", false)
+            .get_ids()
+            .iter()
+            .map(|&id| id as i64)
+            .collect::<Vec<_>>();
+        let mut response_ids = tokenizer
+            .encode("rustrain", false)
             .map_err(|e| anyhow::anyhow!("tokenizer failed: {e}"))?
-            .get_ids().iter().map(|&id| id as i64).collect::<Vec<_>>();
+            .get_ids()
+            .iter()
+            .map(|&id| id as i64)
+            .collect::<Vec<_>>();
         response_ids.push(154842); //  end token
 
         let mut prompt_ids = Vec::new();
@@ -64,7 +80,10 @@ impl Glm5SftDataset {
 
         let pad_token_id = tokenizer.token_to_id("<pad>").unwrap_or(0) as i64;
         Ok(Self {
-            samples: vec![Glm5SftSample { tokens, target_mask }],
+            samples: vec![Glm5SftSample {
+                tokens,
+                target_mask,
+            }],
             pad_token_id,
         })
     }
@@ -79,10 +98,10 @@ impl Glm5SftDataset {
             .with_context(|| format!("failed to read {}", path.display()))?;
         let mut samples = Vec::new();
         // GLM-5.2 special tokens (from tokenizer.json)
-        let tok_gmask = 154822i64;      // [gmask]
-        let tok_sop = 154824i64;        // [sop] (start of prompt)
-        let tok_user = 154827i64;       // user tag
-        let tok_assistant = 154828i64;  // assistant tag
+        let tok_gmask = 154822i64; // [gmask]
+        let tok_sop = 154824i64; // [sop] (start of prompt)
+        let tok_user = 154827i64; // user tag
+        let tok_assistant = 154828i64; // assistant tag
         for line in content.lines() {
             if line.trim().is_empty() {
                 continue;
@@ -95,7 +114,8 @@ impl Glm5SftDataset {
             // The \n and content are tokenized as regular tokens, but
             //  and  must be inserted as special token IDs.
             let (user_content, response) = if obj.get("messages").is_some() {
-                let messages = obj["messages"].as_array()
+                let messages = obj["messages"]
+                    .as_array()
                     .with_context(|| "messages must be an array")?;
                 let mut last_user = String::new();
                 let mut last_assistant = String::new();
@@ -123,12 +143,20 @@ impl Glm5SftDataset {
 
             // Tokenize: "Reasoning Effort: Max\n" +  + \n + user_content + \n +  + \n
             // GLM-5.2 chat template starts with "Reasoning Effort: Max" text.
-            let reasoning_prefix_ids = tokenizer.encode("Reasoning Effort: Max\n", false)
+            let reasoning_prefix_ids = tokenizer
+                .encode("Reasoning Effort: Max\n", false)
                 .map_err(|e| anyhow::anyhow!("tokenizer failed: {e}"))?
-                .get_ids().iter().map(|&id| id as i64).collect::<Vec<_>>();
-            let newline_ids = tokenizer.encode("\n", false)
+                .get_ids()
+                .iter()
+                .map(|&id| id as i64)
+                .collect::<Vec<_>>();
+            let newline_ids = tokenizer
+                .encode("\n", false)
                 .map_err(|e| anyhow::anyhow!("tokenizer failed: {e}"))?
-                .get_ids().iter().map(|&id| id as i64).collect::<Vec<_>>();
+                .get_ids()
+                .iter()
+                .map(|&id| id as i64)
+                .collect::<Vec<_>>();
 
             let mut prompt_ids = Vec::new();
             prompt_ids.push(tok_gmask);
@@ -136,24 +164,35 @@ impl Glm5SftDataset {
             prompt_ids.extend(&reasoning_prefix_ids);
             prompt_ids.push(tok_user);
             prompt_ids.extend(&newline_ids);
-            let user_ids = tokenizer.encode(user_content.as_str(), false)
+            let user_ids = tokenizer
+                .encode(user_content.as_str(), false)
                 .map_err(|e| anyhow::anyhow!("tokenizer failed: {e}"))?
-                .get_ids().iter().map(|&id| id as i64).collect::<Vec<_>>();
+                .get_ids()
+                .iter()
+                .map(|&id| id as i64)
+                .collect::<Vec<_>>();
             prompt_ids.extend(&user_ids);
             prompt_ids.extend(&newline_ids);
             prompt_ids.push(tok_assistant);
             prompt_ids.extend(&newline_ids);
 
-            let mut response_ids = tokenizer.encode(response.as_str(), false)
+            let mut response_ids = tokenizer
+                .encode(response.as_str(), false)
                 .map_err(|e| anyhow::anyhow!("tokenizer failed: {e}"))?
-                .get_ids().iter().map(|&id| id as i64).collect::<Vec<_>>();
+                .get_ids()
+                .iter()
+                .map(|&id| id as i64)
+                .collect::<Vec<_>>();
             response_ids.push(154842); //  end token
 
             let mut tokens = prompt_ids.clone();
             tokens.extend(&response_ids);
             let mut target_mask = vec![false; prompt_ids.len()];
             target_mask.extend(vec![true; response_ids.len()]);
-            samples.push(Glm5SftSample { tokens, target_mask });
+            samples.push(Glm5SftSample {
+                tokens,
+                target_mask,
+            });
         }
         info!(samples = samples.len(), path = %path.display(), "loaded SFT JSONL");
         Self::build_from_tokens(samples, tokenizer)
@@ -253,7 +292,7 @@ pub fn glm5_forward_lora(
     input_ids: &Tensor,
     weights: &BTreeMap<String, Tensor>,
     config: &Glm5RuntimeConfig,
-    trainable_layers: &[usize],
+    _trainable_layers: &[usize],
     registry: &mut Glm5LoraRegistry,
 ) -> Result<Tensor> {
     let embed_tokens = tensor(weights, "model.embed_tokens.weight")?;
@@ -272,13 +311,13 @@ pub fn glm5_forward_lora(
     }
 
     for layer in 0..config.num_hidden_layers {
-        if !trainable_layers.contains(&layer) {
-            continue;
-        }
+        // Every transformer layer participates in the base forward pass.
+        // The LoRA registry selectively applies adapters to target layers;
+        // skipping frozen layers would remove their residual computation.
         if config.is_moe_layer(layer) {
             let lw = Glm5MoeLayerWeights::load_raw(weights, layer, config.n_routed_experts)?;
             let hidden_norm = rms_norm(&hidden, &lw.input_norm, config.rms_norm_eps);
-            let attn = lora_attention_weights(&lw.attn, layer, registry);
+            let attn = lora_attention_weights(&lw.attn, layer, registry)?;
             let source = config.indexer_source_layer(layer);
             let indexer_weights = indexer_weights_map.get(&source).unwrap_or(&attn);
             let attn_out = glm5_dsa_attention(
@@ -291,24 +330,27 @@ pub fn glm5_forward_lora(
             );
             let residual = &hidden + &attn_out;
             let mlp_input = rms_norm(&residual, &lw.post_attention_norm, config.rms_norm_eps);
-            let mlp = glm5_moe_mlp(
+            let mlp = glm5_moe_mlp_with_router(
                 &mlp_input,
                 &lw.gate,
+                lw.gate_correction_bias.as_ref(),
                 &lw.shared_gate_proj,
                 &lw.shared_up_proj,
                 &lw.shared_down_proj,
                 &lw.experts,
                 config.num_experts_per_tok,
                 &config.scoring_func,
+                &config.topk_method,
                 config.n_group,
                 config.topk_group,
+                config.norm_topk_prob,
                 config.routed_scaling_factor,
             );
             hidden = residual + mlp;
         } else {
             let lw = Glm5DenseLayerWeights::load_raw(weights, layer)?;
             let hidden_norm = rms_norm(&hidden, &lw.input_norm, config.rms_norm_eps);
-            let attn = lora_attention_weights(&lw.attn, layer, registry);
+            let attn = lora_attention_weights(&lw.attn, layer, registry)?;
             let source = config.indexer_source_layer(layer);
             let indexer_weights = indexer_weights_map.get(&source).unwrap_or(&attn);
             let attn_out = glm5_dsa_attention(
