@@ -3304,9 +3304,9 @@ static LossResult compute_loss(
             at::Tensor(), at::Reduction::None, -100, 0.0
         );
         auto masked_loss = per_token_loss * chunk_mask.to(at::kFloat);
-        // Normalize every chunk by the global response-token count. Backward
-        // must match the mean returned to the caller, independent of sequence
-        // length or chunk boundaries.
+        // Single-sample training uses the global response-token mean. Batched
+        // multi-LoRA instead divides each row by its own response-token count
+        // so tenant gradients do not depend on neighboring rows.
         auto chunk_loss = independent_samples
             ? (masked_loss / token_denominators.narrow(0, start, n)).sum()
             : masked_loss.sum() / total_count;
@@ -3739,8 +3739,9 @@ __attribute__((visibility("default"))) double qwen36_train_micro_step(
             return loss_val;
         }
 
-        // EP produces a summed routed output, so synchronize replicated LoRA
-        // gradients before every rank performs its local Adam update.
+        // Replicated DP gradients are synchronized before the local Adam
+        // update. EP keeps replicated gradients local because its forward
+        // routed activation already contains the cross-rank sum.
         synchronize_lora_gradients(ctx, target_mask);
 
         // ── Adam optimizer step — CUDA multi-tensor fused kernel ──
