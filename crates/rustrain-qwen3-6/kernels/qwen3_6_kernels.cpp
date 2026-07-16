@@ -5,6 +5,12 @@
 // No tch-rs VarStore involved — gradients flow entirely within C++ autograd.
 
 #include <ATen/ATen.h>
+#if __has_include(<ATen/ops/_grouped_mm.h>)
+#include <ATen/ops/_grouped_mm.h>
+#define RUSTRAIN_HAS_ATEN_GROUPED_MM 1
+#else
+#define RUSTRAIN_HAS_ATEN_GROUPED_MM 0
+#endif
 #include <c10/cuda/CUDAStream.h>
 #include <c10/cuda/CUDACachingAllocator.h>
 #include <cuda_runtime.h>
@@ -13,6 +19,8 @@
 #include <torch/csrc/autograd/autograd.h>
 #include <torch/csrc/autograd/variable.h>
 #include <cstdio>
+#include <cstdlib>
+#include <cstdint>
 #include <cmath>
 #include <vector>
 #include <cstring>
@@ -40,6 +48,30 @@ at::Tensor apply_multi_lora(TrainingContext* ctx, int64_t layer_idx, int64_t pai
 // ──────────────────────────────────────────────────────────────────────
 
 static at::Tensor rms_norm(const at::Tensor& input, const at::Tensor& weight, double eps);
+
+static bool env_enabled(const char* name) {
+    const char* value = std::getenv(name);
+    return value && value[0] != '\0' && std::strcmp(value, "0") != 0;
+}
+
+static std::string nccl_sync_dir() {
+    const char* run_id = std::getenv("RUSTRAIN_NCCL_RUN_ID");
+    if (!run_id || run_id[0] == '\0') return "/tmp/rustrain-nccl";
+    std::string sanitized;
+    for (const unsigned char ch : std::string(run_id)) {
+        if ((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') ||
+            (ch >= '0' && ch <= '9') || ch == '-' || ch == '_') {
+            sanitized.push_back(static_cast<char>(ch));
+        } else {
+            sanitized.push_back('_');
+        }
+    }
+    if (sanitized.empty()) sanitized = "default";
+    mkdir("/tmp/rustrain-nccl", 0777);
+    std::string path = "/tmp/rustrain-nccl/" + sanitized;
+    mkdir(path.c_str(), 0777);
+    return path;
+}
 
 // ──────────────────────────────────────────────────────────────────────
 // Hand-written CUDA fused kernels (compiled from fused_kernels.cu)
@@ -83,29 +115,78 @@ static at::Tensor fused_rmsnorm_op(
 ///   d/dg = sigmoid(g) * (1 + g * (1 - sigmoid(g))) * u
 ///   d/du = silu(g) = g * sigmoid(g)
 struct NcclAllReduceFunction : public torch::autograd::Function<NcclAllReduceFunction> {
-    static at::Tensor forward(torch::autograd::AutogradContext* ctx,
-        at::Tensor input, int64_t comm_ptr) {
-        ctx->saved_data["comm"] = comm_ptr;
-        auto nccl_comm = reinterpret_cast<ncclComm_t>(comm_ptr);
-        int dev = input.device().index();
+    static ncclDataType_t dtype_for(at::ScalarType type) {
+        switch (type) {
+            case at::kBFloat16: return ncclBfloat16;
+            case at::kFloat: return ncclFloat;
+            case at::kHalf: return ncclFloat16;
+            default:
+                TORCH_CHECK(false, "unsupported NCCL all-reduce dtype: ", type);
+        }
+    }
+
+    // NCCL is normally issued on PyTorch's current stream. When an external
+    // NCCL stream is supplied by the EP runtime, fence both sides so the
+    // collective observes the producer and its result is visible to the
+    // current compute stream. This keeps the operation asynchronous without
+    // relying on a device-wide synchronize.
+    static at::Tensor allreduce(
+        const at::Tensor& input, ncclComm_t comm, cudaStream_t requested_stream
+    ) {
+        TORCH_CHECK(input.is_cuda(), "NCCL all-reduce requires a CUDA tensor");
+        const int dev = input.device().index();
         cudaSetDevice(dev);
-        auto compute_stream = c10::cuda::getCurrentCUDAStream(dev).stream();
-        ctx->save_for_backward({input});
-        auto output = at::empty_like(input);
-        ncclResult_t err = ncclAllReduce(
-            input.data_ptr(), output.data_ptr(),
-            input.numel(), ncclBfloat16, ncclSum,
-            nccl_comm, compute_stream);
-        if (err != ncclSuccess) {
-            fprintf(stderr, "[ep] ncclAllReduce fwd FAILED: %d (%s) dev=%d\n", err, ncclGetErrorString(err), dev);
+        const auto current_stream = c10::cuda::getCurrentCUDAStream(dev).stream();
+        const auto comm_stream = requested_stream ? requested_stream : current_stream;
+        auto contiguous = input.contiguous();
+        auto output = at::empty_like(contiguous);
+
+        cudaEvent_t before = nullptr;
+        cudaEvent_t after = nullptr;
+        const bool cross_stream = comm_stream != current_stream;
+        if (cross_stream) {
+            TORCH_CHECK(cudaEventCreateWithFlags(&before, cudaEventDisableTiming) == cudaSuccess,
+                "failed to create NCCL producer event");
+            TORCH_CHECK(cudaEventCreateWithFlags(&after, cudaEventDisableTiming) == cudaSuccess,
+                "failed to create NCCL consumer event");
+            TORCH_CHECK(cudaEventRecord(before, current_stream) == cudaSuccess,
+                "failed to record NCCL producer event");
+            TORCH_CHECK(cudaStreamWaitEvent(comm_stream, before, 0) == cudaSuccess,
+                "failed to wait for NCCL producer event");
+        }
+
+        auto err = ncclAllReduce(
+            contiguous.data_ptr(), output.data_ptr(), contiguous.numel(),
+            dtype_for(contiguous.scalar_type()), ncclSum, comm, comm_stream);
+        TORCH_CHECK(err == ncclSuccess, "ncclAllReduce failed: ", ncclGetErrorString(err));
+
+        if (cross_stream) {
+            TORCH_CHECK(cudaEventRecord(after, comm_stream) == cudaSuccess,
+                "failed to record NCCL consumer event");
+            TORCH_CHECK(cudaStreamWaitEvent(current_stream, after, 0) == cudaSuccess,
+                "failed to wait for NCCL consumer event");
+            // Destruction is asynchronous-safe after the wait has been
+            // enqueued on the current stream.
+            cudaEventDestroy(before);
+            cudaEventDestroy(after);
         }
         return output;
+    }
+
+    static at::Tensor forward(torch::autograd::AutogradContext* ctx,
+        at::Tensor input, int64_t comm_ptr, int64_t stream_ptr) {
+        ctx->saved_data["comm"] = comm_ptr;
+        ctx->saved_data["stream"] = stream_ptr;
+        auto nccl_comm = reinterpret_cast<ncclComm_t>(comm_ptr);
+        ctx->save_for_backward({input});
+        return allreduce(input, nccl_comm,
+            reinterpret_cast<cudaStream_t>(stream_ptr));
     }
     static std::vector<at::Tensor> backward(torch::autograd::AutogradContext* ctx,
         std::vector<at::Tensor> grad_output) {
         // Expert weights frozen — gradient flows through residual connection.
         // Save input in forward so autograd keeps it alive until backward.
-        return {grad_output[0], at::Tensor()};
+        return {grad_output[0], at::Tensor(), at::Tensor()};
     }
 };
 
@@ -139,7 +220,8 @@ struct FusedSwiGLUFunction : public torch::autograd::Function<FusedSwiGLUFunctio
 static at::Tensor fused_swiglu_op(
     const at::Tensor& gate_out, const at::Tensor& up_out, double limit
 ) {
-    // ATen ops (keeps autograd graph) — TODO: re-enable CUDA kernel with autograd
+    // Keep the ATen path here because its backward is already part of the
+    // autograd graph; the surrounding matmuls remain fused by the layer path.
     auto inter = at::silu(gate_out) * up_out;
     if (limit > 0.0) inter = inter.clamp(-limit, limit);
     return inter;
@@ -334,13 +416,16 @@ static at::Tensor full_attention(
         auto attn_out = at::scaled_dot_product_attention(
             q, k, v, additive_mask, 0.0, false, c10::nullopt, true  // is_causal=false, enable_gqa=true
         );
-        return attn_out.transpose(1, 2).reshape({batch, seq, qkv_dim}).matmul(o_proj.t());
+        // Qwen3.5/3.6 full attention gates the attention value before o_proj.
+        // Applying the gate after o_proj is not equivalent when o_proj mixes features.
+        auto gated_attn = attn_out * at::sigmoid(gate).to(attn_out.scalar_type());
+        return gated_attn.transpose(1, 2).reshape({batch, seq, qkv_dim}).matmul(o_proj.t());
     } else {
         auto attn_out = at::scaled_dot_product_attention(
             q, k, v, c10::nullopt, 0.0, true, c10::nullopt, true  // is_causal=true, enable_gqa=true
         );
-        auto result = attn_out.transpose(1, 2).reshape({batch, seq, qkv_dim}).matmul(o_proj.t());
-        result = result * at::sigmoid(gate).to(result.scalar_type());
+        auto gated_attn = attn_out * at::sigmoid(gate).to(attn_out.scalar_type());
+        auto result = gated_attn.transpose(1, 2).reshape({batch, seq, qkv_dim}).matmul(o_proj.t());
         gate = at::Tensor();
         return result;
     }
@@ -351,22 +436,147 @@ static at::Tensor full_attention(
 // ──────────────────────────────────────────────────────────────────────
 
 // Forward declaration for CUDA kernel (defined in delta_rule.cu)
-extern "C" void cuda_gated_delta_rule(
+extern "C" int cuda_gated_delta_rule(
     const float* q, const float* k, const float* v,
     const float* g_exp, const float* beta,
     float* state, float* out, float* delta_buf,
-    int BH, int seq_len, int key_dim, int val_dim
+    int BH, int seq_len, int key_dim, int val_dim, void* stream
 );
 
-extern "C" void cuda_gated_delta_rule_backward(
+extern "C" int cuda_gated_delta_rule_backward(
     const float* q, const float* k, const float* v,
     const float* g_exp, const float* beta,
     const float* final_state, const float* delta_buf,
     const float* grad_out,
     float* grad_q, float* grad_k, float* grad_v,
     float* grad_g, float* grad_beta,
-    int BH, int seq_len, int key_dim, int val_dim
+    int BH, int seq_len, int key_dim, int val_dim, void* stream
 );
+
+// Correctness reference for the gated delta rule. This deliberately uses
+// ATen batched operations inside C++, so it remains outside the Rust hot path
+// while providing a complete autograd oracle for the custom CUDA forward.
+static at::Tensor gated_delta_rule_reference(
+    const at::Tensor& q, const at::Tensor& k, const at::Tensor& v,
+    const at::Tensor& g_exp, const at::Tensor& beta
+) {
+    TORCH_CHECK(q.dim() == 3 && k.dim() == 3 && v.dim() == 3,
+        "gated_delta_rule_reference expects [BH, S, D] tensors");
+    const int64_t bh = q.size(0);
+    const int64_t seq = q.size(1);
+    const int64_t key_dim = q.size(2);
+    const int64_t val_dim = v.size(2);
+    TORCH_CHECK(k.size(0) == bh && k.size(1) == seq && k.size(2) == key_dim,
+        "q/k shape mismatch");
+    TORCH_CHECK(v.size(0) == bh && v.size(1) == seq,
+        "v shape mismatch");
+    TORCH_CHECK(g_exp.size(0) == bh && g_exp.size(1) == seq &&
+                beta.size(0) == bh && beta.size(1) == seq,
+        "g/beta shape mismatch");
+
+    auto state = at::zeros({bh, key_dim, val_dim},
+        q.options().dtype(at::kFloat));
+    auto qf = q.to(at::kFloat);
+    auto kf = k.to(at::kFloat);
+    auto vf = v.to(at::kFloat);
+    auto gf = g_exp.to(at::kFloat);
+    auto bf = beta.to(at::kFloat);
+    std::vector<at::Tensor> outputs;
+    outputs.reserve(seq);
+    for (int64_t t = 0; t < seq; ++t) {
+        auto gt = gf.select(1, t).view({bh, 1, 1});
+        auto kt = kf.select(1, t);
+        auto vt = vf.select(1, t);
+        auto qt = qf.select(1, t);
+        auto bt = bf.select(1, t).view({bh, 1});
+        state = state * gt;
+        auto kv = at::bmm(kt.unsqueeze(1), state).squeeze(1);
+        auto delta = (vt - kv) * bt;
+        state = state + kt.unsqueeze(2) * delta.unsqueeze(1);
+        outputs.push_back(at::bmm(qt.unsqueeze(1), state).squeeze(1));
+    }
+    return at::stack(outputs, 1);
+}
+
+// The forward and backward CUDA kernels are wrapped in one autograd Function.
+// Set QWEN36_DELTA_REFERENCE_BWD=1 to run the ATen recurrence oracle for parity
+// debugging; production training uses the current-stream fused backward.
+struct GatedDeltaRuleFunction : public torch::autograd::Function<GatedDeltaRuleFunction> {
+    static at::Tensor forward(
+        torch::autograd::AutogradContext* ctx,
+        at::Tensor q, at::Tensor k, at::Tensor v,
+        at::Tensor g_exp, at::Tensor beta
+    ) {
+        TORCH_CHECK(q.is_cuda() && k.is_cuda() && v.is_cuda(),
+            "gated delta CUDA path requires CUDA tensors");
+        TORCH_CHECK(q.scalar_type() == at::kFloat && k.scalar_type() == at::kFloat &&
+                    v.scalar_type() == at::kFloat && g_exp.scalar_type() == at::kFloat &&
+                    beta.scalar_type() == at::kFloat,
+            "gated delta CUDA path expects FP32 working tensors");
+        const int64_t bh = q.size(0), seq = q.size(1);
+        const int64_t key_dim = q.size(2), val_dim = v.size(2);
+        auto state = at::zeros({bh, key_dim, val_dim}, q.options());
+        auto out = at::empty({bh, seq, val_dim}, q.options());
+        auto delta_buf = at::empty({bh, seq, val_dim}, q.options());
+        auto stream = c10::cuda::getCurrentCUDAStream(q.device().index()).stream();
+        int status = cuda_gated_delta_rule(
+            q.data_ptr<float>(), k.data_ptr<float>(), v.data_ptr<float>(),
+            g_exp.data_ptr<float>(), beta.data_ptr<float>(),
+            state.data_ptr<float>(), out.data_ptr<float>(), delta_buf.data_ptr<float>(),
+            (int)bh, (int)seq, (int)key_dim, (int)val_dim,
+            reinterpret_cast<void*>(stream));
+        TORCH_CHECK(status == 0, "gated delta CUDA launch failed: ", status);
+        ctx->save_for_backward({q, k, v, g_exp, beta, state, delta_buf});
+        return out;
+    }
+
+    static std::vector<at::Tensor> backward(
+        torch::autograd::AutogradContext* ctx,
+        std::vector<at::Tensor> grad_output
+    ) {
+        auto saved = ctx->get_saved_variables();
+        auto q = saved[0];
+        auto k = saved[1];
+        auto v = saved[2];
+        auto g = saved[3];
+        auto beta = saved[4];
+        if (env_enabled("QWEN36_DELTA_REFERENCE_BWD")) {
+            auto q_ref = q.detach().set_requires_grad(true);
+            auto k_ref = k.detach().set_requires_grad(true);
+            auto v_ref = v.detach().set_requires_grad(true);
+            auto g_ref = g.detach().set_requires_grad(true);
+            auto beta_ref = beta.detach().set_requires_grad(true);
+            at::AutoGradMode guard(true);
+            auto reference = gated_delta_rule_reference(q_ref, k_ref, v_ref, g_ref, beta_ref);
+            auto grads = torch::autograd::grad(
+                {reference}, {q_ref, k_ref, v_ref, g_ref, beta_ref},
+                {grad_output[0]}, /*retain_graph=*/false,
+                /*create_graph=*/false, /*allow_unused=*/false);
+            return {grads[0], grads[1], grads[2], grads[3], grads[4]};
+        }
+
+        const int64_t bh = q.size(0), seq = q.size(1);
+        const int64_t key_dim = q.size(2), val_dim = v.size(2);
+        auto grad_out = grad_output[0].contiguous();
+        auto grad_q = at::empty_like(q);
+        auto grad_k = at::empty_like(k);
+        auto grad_v = at::empty_like(v);
+        auto grad_g = at::empty_like(g);
+        auto grad_beta = at::empty_like(beta);
+        auto stream = c10::cuda::getCurrentCUDAStream(q.device().index()).stream();
+        int status = cuda_gated_delta_rule_backward(
+            q.data_ptr<float>(), k.data_ptr<float>(), v.data_ptr<float>(),
+            g.data_ptr<float>(), beta.data_ptr<float>(),
+            saved[5].data_ptr<float>(), saved[6].data_ptr<float>(),
+            grad_out.data_ptr<float>(), grad_q.data_ptr<float>(),
+            grad_k.data_ptr<float>(), grad_v.data_ptr<float>(),
+            grad_g.data_ptr<float>(), grad_beta.data_ptr<float>(),
+            (int)bh, (int)seq, (int)key_dim, (int)val_dim,
+            reinterpret_cast<void*>(stream));
+        TORCH_CHECK(status == 0, "gated delta backward launch failed: ", status);
+        return {grad_q, grad_k, grad_v, grad_g, grad_beta};
+    }
+};
 
 static at::Tensor linear_attention(
     const at::Tensor& hidden,
@@ -391,7 +601,10 @@ static at::Tensor linear_attention(
     int64_t seq_chunk = 0;
     if (chunk_env) seq_chunk = atoll(chunk_env);
 
-    if (seq_chunk > 0 && seq > seq_chunk) {
+    // Stateful chunking currently has no autograd state input/output contract.
+    // Keep it for inference/eval only; training uses the autograd-wrapped full
+    // sequence path below until chunk state gradients are implemented.
+    if (seq_chunk > 0 && seq > seq_chunk && !at::GradMode::is_enabled()) {
         // Chunked linear attention — mathematically equivalent to full sequence
         // Process in chunks, passing the delta rule state between chunks.
         // This avoids creating [batch, seq, qkv_dim] intermediate tensors.
@@ -471,7 +684,8 @@ static at::Tensor linear_attention(
             auto delta_buf = at::empty({BH, chunk_len, val_dim}, q_t.options());
 
             // CUDA kernel — state is passed in and updated in-place
-            cuda_gated_delta_rule(
+            auto stream = c10::cuda::getCurrentCUDAStream(device.index()).stream();
+            int status = cuda_gated_delta_rule(
                 q_contig.data_ptr<float>(),
                 k_contig.data_ptr<float>(),
                 v_contig.data_ptr<float>(),
@@ -480,8 +694,10 @@ static at::Tensor linear_attention(
                 state_contig.data_ptr<float>(),
                 outs.data_ptr<float>(),
                 delta_buf.data_ptr<float>(),
-                (int)BH, (int)chunk_len, (int)key_dim, (int)val_dim
+                (int)BH, (int)chunk_len, (int)key_dim, (int)val_dim,
+                reinterpret_cast<void*>(stream)
             );
+            TORCH_CHECK(status == 0, "gated delta CUDA launch failed: ", status);
             state = state_contig;  // updated state for next chunk
 
             auto core_out = outs.reshape({batch, num_v_heads, chunk_len, val_dim})
@@ -563,30 +779,14 @@ static at::Tensor linear_attention(
     // All computation runs in a single kernel launch using shared memory for state
     auto g_exp = g_t.exp();  // [B, H, S]
     int64_t BH = batch * num_v_heads;
-    auto state = at::zeros({BH, key_dim, val_dim}, q_t.options());  // [B*H, D_k, D_v]
-
-    // Prepare contiguous FP32 tensors for CUDA kernel
+    // Prepare contiguous FP32 tensors for the CUDA forward/autograd wrapper.
     auto q_contig = q_t.reshape({BH, seq, key_dim}).contiguous().to(at::kFloat);
     auto k_contig = k_t.reshape({BH, seq, key_dim}).contiguous().to(at::kFloat);
     auto v_contig = v_t.reshape({BH, seq, val_dim}).contiguous().to(at::kFloat);
     auto g_contig = g_exp.reshape({BH, seq}).contiguous().to(at::kFloat);
     auto beta_contig = beta_t.reshape({BH, seq}).contiguous().to(at::kFloat);
-    auto state_contig = state.contiguous();
-    auto outs = at::empty({BH, seq, val_dim}, q_t.options());
-    auto delta_buf = at::empty({BH, seq, val_dim}, q_t.options());
-
-    // Launch CUDA kernel — single launch replaces seq×3 bmm calls
-    cuda_gated_delta_rule(
-        q_contig.data_ptr<float>(),
-        k_contig.data_ptr<float>(),
-        v_contig.data_ptr<float>(),
-        g_contig.data_ptr<float>(),
-        beta_contig.data_ptr<float>(),
-        state_contig.data_ptr<float>(),
-        outs.data_ptr<float>(),
-        delta_buf.data_ptr<float>(),
-        (int)BH, (int)seq, (int)key_dim, (int)val_dim
-    );
+    auto outs = GatedDeltaRuleFunction::apply(
+        q_contig, k_contig, v_contig, g_contig, beta_contig);
 
     // Reshape: [B*H, S, D_v] → [B, H, S, D_v] → [B, S, H, D_v]
     auto core_out = outs.reshape({batch, num_v_heads, seq, val_dim})
@@ -641,15 +841,88 @@ static at::Tensor linear_attention_batched(TrainingContext* ctx, const at::Tenso
 // MoE
 // ──────────────────────────────────────────────────────────────────────
 
+struct RoutedExpertLora {
+    const at::Tensor* gate_up_a = nullptr;  // [local_experts, rank, hidden]
+    const at::Tensor* gate_up_b = nullptr;  // [local_experts, 2*intermediate, rank]
+    const at::Tensor* down_a = nullptr;     // [local_experts, rank, intermediate]
+    const at::Tensor* down_b = nullptr;     // [local_experts, hidden, rank]
+    double scaling = 0.0;
+};
+
+// Per-sample adapter projection used by the batched multi-LoRA path.  This is
+// intentionally separate from RoutedExpertLora: routed experts carry one
+// A/B pair per local expert, while dense/shared projections carry one pair per
+// adapter sample.
+struct LoraBatchEntry {
+    at::Tensor a_stack;    // [N, rank, in]
+    at::Tensor b_stack;    // [N, out, rank]
+    at::Tensor scaling;     // [N, 1, 1]
+};
+
+static const LoraBatchEntry* lora_batch_entry(
+    TrainingContext* ctx, int64_t layer_idx, int64_t pair_idx);
+static at::Tensor dense_mlp_forward_batched(
+    TrainingContext* ctx, int64_t layer_idx, const at::Tensor& hidden,
+    const at::Tensor& gate_proj, const at::Tensor& up_proj,
+    const at::Tensor& down_proj, at::ScalarType compute_type);
+
+static at::Tensor lora_activation_delta(
+    const at::Tensor& x, const at::Tensor& A, const at::Tensor& B,
+    const at::Tensor& scaling);
+
+static at::Tensor add_batched_lora(
+    const at::Tensor& base, const at::Tensor& input,
+    const LoraBatchEntry* entry
+) {
+    if (!entry) return base;
+    return base + lora_activation_delta(
+        input, entry->a_stack, entry->b_stack, entry->scaling);
+}
+
+// Per-token routed-expert LoRA. Dynamic adapters add a leading sample axis to
+// the expert-local tensors: A [batch, experts, rank, in],
+// B [batch, experts, out, rank]. Flattening (sample, expert) lets one pair of
+// index_select + bmm operations select the correct adapter and expert without
+// materializing a full-rank delta weight.
+static at::Tensor dynamic_expert_lora_delta(
+    const at::Tensor& input,
+    const at::Tensor& token_indices,
+    const at::Tensor& local_expert_indices,
+    int64_t seq,
+    const LoraBatchEntry* entry
+) {
+    if (!entry) return at::zeros({0}, input.options());
+    TORCH_CHECK(entry->a_stack.dim() == 4 && entry->b_stack.dim() == 4,
+        "dynamic routed-expert LoRA expects rank-4 stacked A/B tensors");
+    const int64_t local_experts = entry->a_stack.size(1);
+    auto sample_indices = at::floor_divide(token_indices, seq);
+    auto pair_indices = sample_indices * local_experts + local_expert_indices;
+    auto a = entry->a_stack.flatten(0, 1)
+        .index_select(0, pair_indices).to(input.scalar_type());
+    auto b = entry->b_stack.flatten(0, 1)
+        .index_select(0, pair_indices).to(input.scalar_type());
+    auto low_rank = at::bmm(a, input.unsqueeze(-1)).squeeze(-1);
+    auto delta = at::bmm(b, low_rank.unsqueeze(-1)).squeeze(-1);
+    auto scaling = entry->scaling.index_select(0, sample_indices)
+        .reshape({-1, 1}).to(input.scalar_type());
+    return delta * scaling;
+}
+
 static at::Tensor moe_forward(
     void* nccl_comm_v, void* nccl_stream_v,
     const at::Tensor& hidden,
     const at::Tensor& gate_w, const at::Tensor& shared_expert_gate_w,
     const at::Tensor& shared_gate_proj, const at::Tensor& shared_up_proj, const at::Tensor& shared_down_proj,
     const at::Tensor& experts_gate_up, const at::Tensor& experts_down,
+    const RoutedExpertLora& expert_lora,
     int64_t num_experts, int64_t top_k, int64_t intermediate,
     bool norm_topk_prob, int64_t expert_start, int64_t expert_count,
-    at::ScalarType compute_type
+    at::ScalarType compute_type,
+    const LoraBatchEntry* shared_gate_lora = nullptr,
+    const LoraBatchEntry* shared_up_lora = nullptr,
+    const LoraBatchEntry* shared_down_lora = nullptr,
+    const LoraBatchEntry* expert_gate_up_lora = nullptr,
+    const LoraBatchEntry* expert_down_lora = nullptr
 ) {
     int64_t batch = hidden.size(0), seq = hidden.size(1), hidden_dim = hidden.size(2);
     auto device = hidden.device();
@@ -697,42 +970,213 @@ static at::Tensor moe_forward(
         // Find expert boundaries via bincount + cumsum
         auto counts = at::bincount(sorted_indices, c10::nullopt, expert_start + expert_count);
         // counts[e_global] = number of tokens assigned to expert e
-
         // Gather tokens in sorted order (contiguous per expert)
         auto gathered = flat.index_select(0, sort_order);
         auto gathered_weights = expert_weights.index_select(0, sort_order).unsqueeze(-1);
 
-        // Process each expert's contiguous token slice
-        int64_t offset = 0;
+        // The grouped single-rank path knows that every sorted row is local
+        // and therefore needs no host-visible expert counts. Materialize the
+        // CPU copy lazily only for EP slicing or the legacy per-expert loop.
+        at::Tensor counts_cpu;
+        auto get_counts_cpu = [&]() -> const at::Tensor& {
+            if (!counts_cpu.defined()) {
+                counts_cpu = counts.to(at::TensorOptions().device(at::kCPU));
+            }
+            return counts_cpu;
+        };
+
+#if RUSTRAIN_HAS_ATEN_GROUPED_MM
+        // PyTorch 2.12+ exposes the same CUTLASS grouped-GEMM primitive used
+        // by its native MoE path. It consumes sorted token rows plus cumulative
+        // expert offsets, eliminating one GEMM launch per local expert. Older
+        // libtorch builds compile the fallback loop below.
+        bool grouped_lora_compatible = true;
+        if (expert_lora.gate_up_a) {
+            grouped_lora_compatible = expert_lora.gate_up_a->size(1) % 8 == 0;
+        }
+        if (expert_lora.down_a) {
+            grouped_lora_compatible = grouped_lora_compatible &&
+                expert_lora.down_a->size(1) % 8 == 0;
+        }
+        const bool use_grouped_mm = !env_enabled("QWEN36_DISABLE_GROUPED_MM") &&
+            compute_type == at::kBFloat16 && grouped_lora_compatible &&
+            hidden_dim % 8 == 0 && intermediate % 8 == 0;
+        if (use_grouped_mm) {
+            const bool owns_all_experts = expert_start == 0 &&
+                expert_count == counts.size(0);
+            const int64_t local_start = owns_all_experts || expert_start == 0
+                ? 0
+                : get_counts_cpu().narrow(0, 0, expert_start).sum().item<int64_t>();
+            const int64_t local_tokens = owns_all_experts
+                ? gathered.size(0)
+                : get_counts_cpu()
+                    .narrow(0, expert_start, expert_count).sum().item<int64_t>();
+            if (local_tokens > 0) {
+                if (env_enabled("QWEN36_REPORT_GROUPED_MM")) {
+                    std::fprintf(
+                        stderr,
+                        "[q36_moe] grouped_mm experts=%ld tokens=%ld hidden=%ld intermediate=%ld\n",
+                        static_cast<long>(expert_count),
+                        static_cast<long>(local_tokens),
+                        static_cast<long>(hidden_dim),
+                        static_cast<long>(intermediate));
+                }
+                auto selected = gathered.narrow(0, local_start, local_tokens);
+                auto token_indices = sort_order.narrow(
+                    0, local_start, local_tokens);
+                auto local_expert_indices = sorted_indices.narrow(
+                    0, local_start, local_tokens) - expert_start;
+                auto offsets = counts.narrow(0, expert_start, expert_count)
+                    .cumsum(0).to(at::kInt);
+                auto gu = at::_grouped_mm(
+                    selected, experts_gate_up.transpose(1, 2), offsets);
+                if (expert_lora.gate_up_a && expert_lora.gate_up_b) {
+                    auto low_rank = at::_grouped_mm(
+                        selected, expert_lora.gate_up_a->transpose(1, 2), offsets);
+                    auto delta = at::_grouped_mm(
+                        low_rank, expert_lora.gate_up_b->transpose(1, 2), offsets);
+                    gu = gu + delta * expert_lora.scaling;
+                }
+                if (expert_gate_up_lora) {
+                    gu = gu + dynamic_expert_lora_delta(
+                        selected, token_indices, local_expert_indices,
+                        seq, expert_gate_up_lora);
+                }
+                auto activated = fused_swiglu_op(
+                    gu.narrow(-1, 0, intermediate),
+                    gu.narrow(-1, intermediate, intermediate), 0.0);
+                auto expert_out = at::_grouped_mm(
+                    activated, experts_down.transpose(1, 2), offsets);
+                if (expert_lora.down_a && expert_lora.down_b) {
+                    auto low_rank = at::_grouped_mm(
+                        activated, expert_lora.down_a->transpose(1, 2), offsets);
+                    auto delta = at::_grouped_mm(
+                        low_rank, expert_lora.down_b->transpose(1, 2), offsets);
+                    expert_out = expert_out + delta * expert_lora.scaling;
+                }
+                if (expert_down_lora) {
+                    expert_out = expert_out + dynamic_expert_lora_delta(
+                        activated, token_indices, local_expert_indices,
+                        seq, expert_down_lora);
+                }
+                auto weights = gathered_weights.narrow(
+                    0, local_start, local_tokens);
+                routed_output = routed_output.index_add_(
+                    0, token_indices, expert_out * weights);
+            }
+            continue;
+        }
+#endif
+
+        // Process each expert's contiguous token slice. `gathered` contains
+        // all global experts in sorted order, so rank>0 must skip tokens for
+        // experts owned by lower ranks before taking its local range.
+        int64_t offset = expert_start > 0
+            ? get_counts_cpu().narrow(0, 0, expert_start).sum().item<int64_t>()
+            : 0;
         for (int64_t e_local = 0; e_local < expert_count; e_local++) {
             int64_t e_global = expert_start + e_local;
-            int64_t n_tokens = counts.index({e_global}).item<int64_t>();
-            if (n_tokens == 0) continue;
-
-            auto selected = gathered.narrow(0, offset, n_tokens);  // zero-copy view!
-            auto egu = experts_gate_up.select(0, e_local);
-            auto ed = experts_down.select(0, e_local);
-            auto gu = at::matmul(selected, egu.t());
-            auto gate_part = gu.narrow(-1, 0, intermediate);
-            auto up_part = gu.narrow(-1, intermediate, intermediate);
-            auto expert_out = at::matmul(fused_swiglu_op(gate_part, up_part, 0.0), ed.t());
-            auto weights = gathered_weights.narrow(0, offset, n_tokens);
-            auto token_indices = sort_order.narrow(0, offset, n_tokens);
-            routed_output = routed_output.index_add_(0, token_indices, expert_out * weights);
+            int64_t n_tokens = get_counts_cpu().index({e_global}).item<int64_t>();
+            if (n_tokens > 0) {
+                auto selected = gathered.narrow(0, offset, n_tokens);  // zero-copy view!
+                auto token_indices = sort_order.narrow(0, offset, n_tokens);
+                auto local_expert_indices = sorted_indices.narrow(0, offset, n_tokens)
+                    - expert_start;
+                auto egu = experts_gate_up.select(0, e_local);
+                auto ed = experts_down.select(0, e_local);
+                auto gu = at::matmul(selected, egu.t());
+                if (expert_lora.gate_up_a && expert_lora.gate_up_b) {
+                    auto a = expert_lora.gate_up_a->select(0, e_local);
+                    auto b = expert_lora.gate_up_b->select(0, e_local);
+                    gu = gu + at::matmul(at::matmul(selected, a.t()), b.t()) * expert_lora.scaling;
+                }
+                if (expert_gate_up_lora) {
+                    gu = gu + dynamic_expert_lora_delta(
+                        selected, token_indices, local_expert_indices,
+                        seq, expert_gate_up_lora);
+                }
+                auto gate_part = gu.narrow(-1, 0, intermediate);
+                auto up_part = gu.narrow(-1, intermediate, intermediate);
+                auto activated = fused_swiglu_op(gate_part, up_part, 0.0);
+                auto expert_out = at::matmul(activated, ed.t());
+                if (expert_lora.down_a && expert_lora.down_b) {
+                    auto a = expert_lora.down_a->select(0, e_local);
+                    auto b = expert_lora.down_b->select(0, e_local);
+                    expert_out = expert_out
+                        + at::matmul(at::matmul(activated, a.t()), b.t()) * expert_lora.scaling;
+                }
+                if (expert_down_lora) {
+                    expert_out = expert_out + dynamic_expert_lora_delta(
+                        activated, token_indices, local_expert_indices,
+                        seq, expert_down_lora);
+                }
+                auto weights = gathered_weights.narrow(0, offset, n_tokens);
+                routed_output = routed_output.index_add_(0, token_indices, expert_out * weights);
+            }
             offset += n_tokens;
+        }
+    }
+
+    // A rank can receive no tokens for any of its local experts. Keep a
+    // zero-valued dependency on routed-expert LoRA tensors so autograd still
+    // produces defined zero gradients and every rank reaches the same NCCL
+    // collectives. This changes only the graph, not the routed output values.
+    if (!routed_output.requires_grad()) {
+        at::Tensor graph_anchor;
+        auto include_anchor = [&](const at::Tensor* tensor) {
+            if (!tensor || !tensor->defined() || !tensor->requires_grad()) return;
+            auto contribution = tensor->sum().to(routed_output.scalar_type());
+            graph_anchor = graph_anchor.defined()
+                ? graph_anchor + contribution
+                : contribution;
+        };
+        include_anchor(expert_lora.gate_up_a);
+        include_anchor(expert_lora.gate_up_b);
+        include_anchor(expert_lora.down_a);
+        include_anchor(expert_lora.down_b);
+        if (expert_gate_up_lora) {
+            include_anchor(&expert_gate_up_lora->a_stack);
+            include_anchor(&expert_gate_up_lora->b_stack);
+        }
+        if (expert_down_lora) {
+            include_anchor(&expert_down_lora->a_stack);
+            include_anchor(&expert_down_lora->b_stack);
+        }
+        if (graph_anchor.defined()) {
+            routed_output = routed_output + graph_anchor * 0.0;
         }
     }
 
     // EP all-reduce via NcclAllReduceFunction — custom autograd Function.
     if (nccl_comm_v) {
         auto nccl_comm = reinterpret_cast<ncclComm_t>(nccl_comm_v);
-        routed_output = NcclAllReduceFunction::apply(routed_output, (int64_t)nccl_comm);
+        routed_output = NcclAllReduceFunction::apply(
+            routed_output, (int64_t)nccl_comm,
+            (int64_t)reinterpret_cast<uintptr_t>(nccl_stream_v));
     }
 
     // Shared expert (same as before, with fused SwiGLU)
     auto shared_gate = at::matmul(flat, shared_gate_proj.t());
     auto shared_up = at::matmul(flat, shared_up_proj.t());
-    auto shared_out = at::matmul(fused_swiglu_op(shared_gate, shared_up, 0.0), shared_down_proj.t());
+    if (shared_gate_lora) {
+        shared_gate = add_batched_lora(
+            shared_gate.reshape({batch, seq, -1}), hidden, shared_gate_lora)
+            .reshape({batch * seq, -1});
+    }
+    if (shared_up_lora) {
+        shared_up = add_batched_lora(
+            shared_up.reshape({batch, seq, -1}), hidden, shared_up_lora)
+            .reshape({batch * seq, -1});
+    }
+    auto shared_hidden = fused_swiglu_op(
+        shared_gate.reshape({batch, seq, -1}),
+        shared_up.reshape({batch, seq, -1}), 0.0);
+    auto shared_out = at::matmul(shared_hidden.reshape({batch * seq, -1}), shared_down_proj.t());
+    if (shared_down_lora) {
+        shared_out = add_batched_lora(
+            shared_out.reshape({batch, seq, -1}), shared_hidden, shared_down_lora)
+            .reshape({batch * seq, -1});
+    }
     auto seg = at::sigmoid(at::matmul(flat, shared_expert_gate_w.t())).to(compute_type);
     shared_out = (shared_out * seg).to(compute_type);
 
@@ -772,6 +1216,75 @@ static inline int64_t weight_count_for_layer(const LayerConfig& cfg) {
     return 2 + attn_w + mlp_w;
 }
 
+enum class LoraSegment : uint8_t { Attention, Mlp };
+
+struct LoraProjectionSpec {
+    const char* name;
+    int64_t weight_index;
+    LoraSegment segment;
+    bool grouped_expert;
+};
+
+struct LoraProjectionTable {
+    std::array<LoraProjectionSpec, 10> entries;
+    int64_t count = 0;
+
+    void add(const char* name, int64_t weight_index, LoraSegment segment) {
+        TORCH_CHECK(count < (int64_t)entries.size(), "too many LoRA projections in layer");
+        entries[count++] = {name, weight_index, segment, false};
+    }
+
+    void add_grouped_expert(const char* name, int64_t weight_index) {
+        TORCH_CHECK(count < (int64_t)entries.size(), "too many LoRA projections in layer");
+        entries[count++] = {name, weight_index, LoraSegment::Mlp, true};
+    }
+};
+
+static LoraProjectionTable lora_projection_table(const LayerConfig& cfg) {
+    LoraProjectionTable table;
+    if (cfg.layer_type == 0) {
+        table.add("q_proj", 2, LoraSegment::Attention);
+        table.add("k_proj", 4, LoraSegment::Attention);
+        table.add("v_proj", 6, LoraSegment::Attention);
+        table.add("o_proj", 7, LoraSegment::Attention);
+    } else {
+        table.add("in_proj_qkv", 2, LoraSegment::Attention);
+        table.add("in_proj_z", 3, LoraSegment::Attention);
+        table.add("in_proj_a", 4, LoraSegment::Attention);
+        table.add("in_proj_b", 5, LoraSegment::Attention);
+        table.add("out_proj", 10, LoraSegment::Attention);
+    }
+
+    const int64_t mlp_start = cfg.layer_type == 0 ? 8 : 11;
+    if (cfg.num_experts > 0) {
+        table.add("shared_gate_proj", mlp_start + 2, LoraSegment::Mlp);
+        table.add("shared_up_proj", mlp_start + 3, LoraSegment::Mlp);
+        table.add("shared_down_proj", mlp_start + 4, LoraSegment::Mlp);
+        table.add_grouped_expert("experts_gate_up_proj", mlp_start + 5);
+        table.add_grouped_expert("experts_down_proj", mlp_start + 6);
+    } else {
+        table.add("gate_proj", mlp_start, LoraSegment::Mlp);
+        table.add("up_proj", mlp_start + 1, LoraSegment::Mlp);
+        table.add("down_proj", mlp_start + 2, LoraSegment::Mlp);
+    }
+    return table;
+}
+
+static inline int64_t lora_pair_count(const LayerConfig& cfg) {
+    return lora_projection_table(cfg).count;
+}
+
+static int64_t lora_pair_index(const LayerConfig& cfg, const char* name) {
+    auto table = lora_projection_table(cfg);
+    for (int64_t i = 0; i < table.count; ++i) {
+        if (std::strcmp(table.entries[i].name, name) == 0) return i;
+    }
+    return -1;
+}
+
+static RoutedExpertLora routed_expert_lora(
+    TrainingContext* ctx, int64_t layer_idx, const LayerConfig& cfg);
+
 static at::Tensor forward_single_layer(
     TrainingContext* ctx, const at::Tensor& hidden, at::Tensor** w, const LayerConfig* cfg,
     int64_t layer_idx, at::ScalarType kind,
@@ -807,13 +1320,42 @@ static at::Tensor forward_single_layer(
         }
         auto post_attn = rms_norm(hidden + attn_output, post_norm, cfg->rms_eps);
         if (is_moe) {
+            const int64_t shared_gate_pair = lora_pair_index(*cfg, "shared_gate_proj");
+            const int64_t shared_up_pair = lora_pair_index(*cfg, "shared_up_proj");
+            const int64_t shared_down_pair = lora_pair_index(*cfg, "shared_down_proj");
+            const int64_t expert_gate_up_pair = lora_pair_index(*cfg, "experts_gate_up_proj");
+            const int64_t expert_down_pair = lora_pair_index(*cfg, "experts_down_proj");
+            auto shared_gate = use_batched ? *w[10]
+                : apply_multi_lora(ctx, layer_idx, shared_gate_pair, *w[10]);
+            auto shared_up = use_batched ? *w[11]
+                : apply_multi_lora(ctx, layer_idx, shared_up_pair, *w[11]);
+            auto shared_down = use_batched ? *w[12]
+                : apply_multi_lora(ctx, layer_idx, shared_down_pair, *w[12]);
+            auto expert_lora = routed_expert_lora(ctx, layer_idx, *cfg);
             auto mlp_out = moe_forward(cfg->nccl_comm, cfg->nccl_stream, post_attn,
-                *w[8], *w[9], *w[10], *w[11], *w[12], *w[13], *w[14],
+                *w[8], *w[9], shared_gate, shared_up, shared_down, *w[13], *w[14],
+                expert_lora,
                 cfg->num_experts, cfg->top_k, cfg->moe_intermediate,
-                cfg->norm_topk_prob != 0, cfg->expert_start, cfg->expert_count, kind);
+                cfg->norm_topk_prob != 0, cfg->expert_start, cfg->expert_count, kind,
+                use_batched ? lora_batch_entry(ctx, layer_idx, shared_gate_pair) : nullptr,
+                use_batched ? lora_batch_entry(ctx, layer_idx, shared_up_pair) : nullptr,
+                use_batched ? lora_batch_entry(ctx, layer_idx, shared_down_pair) : nullptr,
+                use_batched ? lora_batch_entry(ctx, layer_idx, expert_gate_up_pair) : nullptr,
+                use_batched ? lora_batch_entry(ctx, layer_idx, expert_down_pair) : nullptr);
             return hidden + attn_output + mlp_out;
         } else {
-            auto mlp_out = dense_mlp_forward(post_attn, *w[8], *w[9], *w[10], kind);
+            if (use_batched) {
+                auto mlp_out = dense_mlp_forward_batched(
+                    ctx, layer_idx, post_attn, *w[8], *w[9], *w[10], kind);
+                return hidden + attn_output + mlp_out;
+            }
+            auto gate = apply_multi_lora(ctx, layer_idx,
+                lora_pair_index(*cfg, "gate_proj"), *w[8]);
+            auto up = apply_multi_lora(ctx, layer_idx,
+                lora_pair_index(*cfg, "up_proj"), *w[9]);
+            auto down = apply_multi_lora(ctx, layer_idx,
+                lora_pair_index(*cfg, "down_proj"), *w[10]);
+            auto mlp_out = dense_mlp_forward(post_attn, gate, up, down, kind);
             return hidden + attn_output + mlp_out;
         }
     } else {
@@ -830,7 +1372,9 @@ static at::Tensor forward_single_layer(
         } else {
             in_proj_qkv = apply_multi_lora(ctx, layer_idx, 0, in_proj_qkv);
             in_proj_z = apply_multi_lora(ctx, layer_idx, 1, in_proj_z);
-            out_proj = apply_multi_lora(ctx, layer_idx, 2, out_proj);
+            in_proj_a = apply_multi_lora(ctx, layer_idx, 2, in_proj_a);
+            in_proj_b = apply_multi_lora(ctx, layer_idx, 3, in_proj_b);
+            out_proj = apply_multi_lora(ctx, layer_idx, 4, out_proj);
             attn_output = linear_attention(attn_input, in_proj_qkv, in_proj_z, in_proj_a, in_proj_b,
                 a_log, dt_bias, conv1d_w, norm_w, out_proj,
                 cfg->num_k_heads, cfg->key_dim, cfg->num_v_heads, cfg->val_dim,
@@ -838,13 +1382,42 @@ static at::Tensor forward_single_layer(
         }
         auto post_attn = rms_norm(hidden + attn_output, post_norm, cfg->rms_eps);
         if (is_moe) {
+            const int64_t shared_gate_pair = lora_pair_index(*cfg, "shared_gate_proj");
+            const int64_t shared_up_pair = lora_pair_index(*cfg, "shared_up_proj");
+            const int64_t shared_down_pair = lora_pair_index(*cfg, "shared_down_proj");
+            const int64_t expert_gate_up_pair = lora_pair_index(*cfg, "experts_gate_up_proj");
+            const int64_t expert_down_pair = lora_pair_index(*cfg, "experts_down_proj");
+            auto shared_gate = use_batched ? *w[13]
+                : apply_multi_lora(ctx, layer_idx, shared_gate_pair, *w[13]);
+            auto shared_up = use_batched ? *w[14]
+                : apply_multi_lora(ctx, layer_idx, shared_up_pair, *w[14]);
+            auto shared_down = use_batched ? *w[15]
+                : apply_multi_lora(ctx, layer_idx, shared_down_pair, *w[15]);
+            auto expert_lora = routed_expert_lora(ctx, layer_idx, *cfg);
             auto mlp_out = moe_forward(cfg->nccl_comm, cfg->nccl_stream, post_attn,
-                *w[11], *w[12], *w[13], *w[14], *w[15], *w[16], *w[17],
+                *w[11], *w[12], shared_gate, shared_up, shared_down, *w[16], *w[17],
+                expert_lora,
                 cfg->num_experts, cfg->top_k, cfg->moe_intermediate,
-                cfg->norm_topk_prob != 0, cfg->expert_start, cfg->expert_count, kind);
+                cfg->norm_topk_prob != 0, cfg->expert_start, cfg->expert_count, kind,
+                use_batched ? lora_batch_entry(ctx, layer_idx, shared_gate_pair) : nullptr,
+                use_batched ? lora_batch_entry(ctx, layer_idx, shared_up_pair) : nullptr,
+                use_batched ? lora_batch_entry(ctx, layer_idx, shared_down_pair) : nullptr,
+                use_batched ? lora_batch_entry(ctx, layer_idx, expert_gate_up_pair) : nullptr,
+                use_batched ? lora_batch_entry(ctx, layer_idx, expert_down_pair) : nullptr);
             return hidden + attn_output + mlp_out;
         } else {
-            auto mlp_out = dense_mlp_forward(post_attn, *w[11], *w[12], *w[13], kind);
+            if (use_batched) {
+                auto mlp_out = dense_mlp_forward_batched(
+                    ctx, layer_idx, post_attn, *w[11], *w[12], *w[13], kind);
+                return hidden + attn_output + mlp_out;
+            }
+            auto gate = apply_multi_lora(ctx, layer_idx,
+                lora_pair_index(*cfg, "gate_proj"), *w[11]);
+            auto up = apply_multi_lora(ctx, layer_idx,
+                lora_pair_index(*cfg, "up_proj"), *w[12]);
+            auto down = apply_multi_lora(ctx, layer_idx,
+                lora_pair_index(*cfg, "down_proj"), *w[13]);
+            auto mlp_out = dense_mlp_forward(post_attn, gate, up, down, kind);
             return hidden + attn_output + mlp_out;
         }
     }
@@ -908,17 +1481,13 @@ struct TrainingContext {
     // ── Batched Multi-LoRA (activation-level) ──
     // When active, replaces the weight-level lora_cache.
     // Stores per-(layer, module) stacked A/B tensors for batched B@(A@x) computation.
-    struct LoraBatchEntry {
-        at::Tensor a_stack;    // [N, rank, in]
-        at::Tensor b_stack;    // [N, out, rank]
-        at::Tensor scaling;    // [N, 1, 1] — per-adapter alpha/rank
-    };
     bool lora_batch_valid = false;
     int64_t lora_batch_n = 0;  // number of adapters in current batch
     std::map<int64_t, LoraBatchEntry> lora_batch_cache;
     // Legacy single-LoRA (backward compat)
     std::vector<at::Tensor> lora_a;
     std::vector<at::Tensor> lora_b;
+    std::vector<uint8_t> lora_active;
     std::vector<int64_t> lora_layer_offset;
     double lora_scaling;
     std::vector<std::string> lora_names;
@@ -939,6 +1508,7 @@ struct TrainingContext {
 
     // MTP weights (optional)
     bool has_mtp;
+    double mtp_loss_scale = 0.1;  // NVIDIA Megatron default
     at::Tensor *mtp_fc, *mtp_pre_fc_norm_emb, *mtp_pre_fc_norm_hidden, *mtp_norm;
     std::vector<at::Tensor*> mtp_layer_weights;
     std::vector<LayerConfig> mtp_layer_configs;
@@ -957,8 +1527,117 @@ struct TrainingContext {
     cudaStream_t nccl_stream = nullptr;
     int ep_world_size = 1;
     int ep_rank = 0;
+    int cuda_device = 0;
 // ──────────────────────────────────────────────────────────────────────
 };
+
+static const char* lora_pair_name(const LayerConfig& cfg, int64_t pair_idx) {
+    auto table = lora_projection_table(cfg);
+    TORCH_CHECK(pair_idx >= 0 && pair_idx < table.count, "invalid LoRA projection index");
+    return table.entries[pair_idx].name;
+}
+
+static constexpr int64_t LORA_CACHE_STRIDE = 32;
+
+static inline int64_t lora_cache_key(int64_t layer_idx, int64_t pair_idx) {
+    return layer_idx * LORA_CACHE_STRIDE + pair_idx;
+}
+
+static inline bool legacy_lora_slot_active(const TrainingContext* ctx, int64_t slot) {
+    return slot >= 0 && slot < (int64_t)ctx->lora_active.size() && ctx->lora_active[slot] != 0;
+}
+
+static RoutedExpertLora routed_expert_lora(
+    TrainingContext* ctx, int64_t layer_idx, const LayerConfig& cfg
+) {
+    RoutedExpertLora result;
+    // Dynamic multi-LoRA supplies per-sample activation-level tensors. Do not
+    // mix the fixed adapter's expert tensors into those batches.
+    if (!ctx->adapters.empty() || cfg.num_experts <= 0) return result;
+
+    const int64_t offset = ctx->lora_layer_offset[layer_idx];
+    const int64_t gate_up_pair = lora_pair_index(cfg, "experts_gate_up_proj");
+    const int64_t down_pair = lora_pair_index(cfg, "experts_down_proj");
+    if (gate_up_pair >= 0 && legacy_lora_slot_active(ctx, offset + gate_up_pair)) {
+        result.gate_up_a = &ctx->lora_a[offset + gate_up_pair];
+        result.gate_up_b = &ctx->lora_b[offset + gate_up_pair];
+    }
+    if (down_pair >= 0 && legacy_lora_slot_active(ctx, offset + down_pair)) {
+        result.down_a = &ctx->lora_a[offset + down_pair];
+        result.down_b = &ctx->lora_b[offset + down_pair];
+    }
+    result.scaling = ctx->lora_scaling;
+    return result;
+}
+
+static ncclDataType_t nccl_dtype_for(const at::Tensor& tensor) {
+    switch (tensor.scalar_type()) {
+        case at::kBFloat16: return ncclBfloat16;
+        case at::kFloat: return ncclFloat;
+        case at::kHalf: return ncclFloat16;
+        default:
+            TORCH_CHECK(false, "unsupported LoRA gradient dtype for EP all-reduce: ",
+                        tensor.scalar_type());
+    }
+}
+
+static void allreduce_lora_grad(TrainingContext* ctx, at::Tensor& param) {
+    auto grad = param.grad();
+    if (!ctx->nccl_comm || !grad.defined()) return;
+    auto contiguous = grad.contiguous();
+    auto reduced = at::empty_like(contiguous);
+    int dev = contiguous.device().index();
+    cudaSetDevice(dev);
+    auto stream = c10::cuda::getCurrentCUDAStream(dev).stream();
+    auto err = ncclAllReduce(
+        contiguous.data_ptr(), reduced.data_ptr(), contiguous.numel(),
+        nccl_dtype_for(contiguous), ncclSum, ctx->nccl_comm, stream);
+    TORCH_CHECK(err == ncclSuccess, "NCCL LoRA gradient all-reduce failed: ",
+                ncclGetErrorString(err));
+    param.mutable_grad() = reduced;
+}
+
+// EP's routed expert output is summed across ranks in forward. The resulting
+// upstream gradient must likewise be summed before replicated LoRA Adam steps;
+// otherwise each rank updates attention/linear adapters from only its shard.
+static void synchronize_lora_gradients(TrainingContext* ctx) {
+    if (!ctx->nccl_comm) return;
+    for (auto& adapter : ctx->adapters) {
+        for (auto& [layer_idx, pairs] : adapter.params) {
+            auto table = lora_projection_table(ctx->layer_configs[layer_idx]);
+            for (int64_t pair = 0; pair < (int64_t)pairs.size(); ++pair) {
+                // Dynamic routed-expert tensors are sharded exactly like the
+                // base experts; only replicated adapter tensors are reduced.
+                if (table.entries[pair].grouped_expert) continue;
+                auto& [a, b] = pairs[pair];
+                allreduce_lora_grad(ctx, a);
+                allreduce_lora_grad(ctx, b);
+            }
+        }
+    }
+    for (int64_t layer = 0; layer < ctx->num_layers; ++layer) {
+        auto table = lora_projection_table(ctx->layer_configs[layer]);
+        int64_t offset = ctx->lora_layer_offset[layer];
+        for (int64_t pair = 0; pair < table.count; ++pair) {
+            // Routed expert LoRA is sharded with the base expert weights. Its
+            // local gradients belong only to this EP rank and must not be
+            // summed with a different expert shard on another rank.
+            if (table.entries[pair].grouped_expert) continue;
+            allreduce_lora_grad(ctx, ctx->lora_a[offset + pair]);
+            allreduce_lora_grad(ctx, ctx->lora_b[offset + pair]);
+        }
+    }
+}
+
+static void elide_trivial_attention_mask(TrainingContext* ctx) {
+    if (!ctx->attention_mask.defined() || ctx->attention_mask.numel() == 0) return;
+    // A padding-free batch can use SDPA's native causal fast path. This is one
+    // scalar synchronization per step, instead of materializing [B,S,S] in
+    // every full-attention layer.
+    if (at::all(ctx->attention_mask != 0).item<bool>()) {
+        ctx->attention_mask = at::Tensor();
+    }
+}
 
 // ── Multi-LoRA: concat all adapters' A/B, 2x GEMM ──
 // Pre-build cache of concatenated A/B per (layer, module) pair.
@@ -977,16 +1656,25 @@ static void precompute_lora_cache(TrainingContext* ctx) {
     std::vector<LoraEntry> entries;
 
     for (int64_t layer_idx = 0; layer_idx < ctx->num_layers; layer_idx++) {
-        int64_t num_pairs = (ctx->layer_configs[layer_idx].layer_type == 0) ? 4 : 3;
+        int64_t num_pairs = lora_pair_count(ctx->layer_configs[layer_idx]);
         for (int64_t pair_idx = 0; pair_idx < num_pairs; pair_idx++) {
+            auto projection_table = lora_projection_table(ctx->layer_configs[layer_idx]);
+            // Routed experts use activation-level low-rank GEMMs. Materializing
+            // B@A for every local expert would erase LoRA's memory advantage.
+            if (projection_table.entries[pair_idx].grouped_expert) continue;
             std::vector<at::Tensor> a_list, b_list;
+            const char* module_name = lora_pair_name(ctx->layer_configs[layer_idx], pair_idx);
             for (auto& adapter : ctx->adapters) {
+                if (!adapter.target_modules.empty() &&
+                    adapter.target_modules.find(module_name) == adapter.target_modules.end())
+                    continue;
                 if (!adapter.target_layers.empty() && adapter.target_layers.find(layer_idx) == adapter.target_layers.end())
                     continue;
                 auto it = adapter.params.find(layer_idx);
                 if (it == adapter.params.end()) continue;
                 if (pair_idx >= (int64_t)it->second.size()) continue;
                 auto& [a, b] = it->second[pair_idx];
+                if (!a.requires_grad() && !b.requires_grad()) continue;
                 double scaling = adapter.alpha / (double)adapter.rank;
                 b_list.push_back(b * scaling);
                 a_list.push_back(a);
@@ -995,6 +1683,10 @@ static void precompute_lora_cache(TrainingContext* ctx) {
                 if (!ctx->lora_a.empty() && layer_idx < (int64_t)ctx->lora_layer_offset.size()) {
                     int64_t la_offset = ctx->lora_layer_offset[layer_idx];
                     if (la_offset + pair_idx < (int64_t)ctx->lora_a.size()) {
+                        if (!ctx->lora_active.empty() &&
+                            !ctx->lora_active[la_offset + pair_idx]) {
+                            continue;
+                        }
                         b_list.push_back(ctx->lora_b[la_offset + pair_idx] * ctx->lora_scaling);
                         a_list.push_back(ctx->lora_a[la_offset + pair_idx]);
                     }
@@ -1009,7 +1701,7 @@ static void precompute_lora_cache(TrainingContext* ctx) {
                     a_concat = at::cat(a_list, 0);  // [sum_ranks, in]
                     b_concat = at::cat(b_list, 1);  // [out, sum_ranks]
                 }
-                entries.push_back({layer_idx * 10 + pair_idx, a_concat, b_concat});
+                entries.push_back({lora_cache_key(layer_idx, pair_idx), a_concat, b_concat});
             }
         }
     }
@@ -1076,22 +1768,26 @@ static void precompute_lora_cache(TrainingContext* ctx) {
 /// Stores in ctx->lora_batch_cache. Called once before forward.
 /// Replaces precompute_lora_cache when N > 1.
 static void prepare_lora_batch(TrainingContext* ctx) {
-    if (ctx->lora_batch_valid) return;
     ctx->lora_batch_cache.clear();
     ctx->lora_batch_n = 0;
 
     for (int64_t layer_idx = 0; layer_idx < ctx->num_layers; layer_idx++) {
-        int64_t num_pairs = (ctx->layer_configs[layer_idx].layer_type == 0) ? 4 : 3;
+        int64_t num_pairs = lora_pair_count(ctx->layer_configs[layer_idx]);
         for (int64_t pair_idx = 0; pair_idx < num_pairs; pair_idx++) {
             std::vector<at::Tensor> a_list, b_list;
             std::vector<double> scalings;
+            const char* module_name = lora_pair_name(ctx->layer_configs[layer_idx], pair_idx);
             for (auto& adapter : ctx->adapters) {
+                if (!adapter.target_modules.empty() &&
+                    adapter.target_modules.find(module_name) == adapter.target_modules.end())
+                    continue;
                 if (!adapter.target_layers.empty() && adapter.target_layers.find(layer_idx) == adapter.target_layers.end())
                     continue;
                 auto it = adapter.params.find(layer_idx);
                 if (it == adapter.params.end()) continue;
                 if (pair_idx >= (int64_t)it->second.size()) continue;
                 auto& [a, b] = it->second[pair_idx];
+                if (!a.requires_grad() && !b.requires_grad()) continue;
                 b_list.push_back(b);
                 a_list.push_back(a);
                 scalings.push_back(adapter.alpha / (double)adapter.rank);
@@ -1111,7 +1807,7 @@ static void prepare_lora_batch(TrainingContext* ctx) {
             );
             auto scaling = scaling_cpu.to(a_stack.device()).to(at::kBFloat16);  // [N, 1, 1]
 
-            ctx->lora_batch_cache[layer_idx * 10 + pair_idx] = {
+            ctx->lora_batch_cache[lora_cache_key(layer_idx, pair_idx)] = {
                 a_stack, b_stack, scaling
             };
         }
@@ -1140,12 +1836,43 @@ static at::Tensor lora_activation_delta(
     return delta * s_c;
 }
 
+static const LoraBatchEntry* lora_batch_entry(
+    TrainingContext* ctx, int64_t layer_idx, int64_t pair_idx
+) {
+    if (!ctx || !ctx->lora_batch_valid || pair_idx < 0) return nullptr;
+    auto it = ctx->lora_batch_cache.find(lora_cache_key(layer_idx, pair_idx));
+    return it == ctx->lora_batch_cache.end() ? nullptr : &it->second;
+}
+
+static at::Tensor dense_mlp_forward_batched(
+    TrainingContext* ctx, int64_t layer_idx, const at::Tensor& hidden,
+    const at::Tensor& gate_proj, const at::Tensor& up_proj,
+    const at::Tensor& down_proj, at::ScalarType compute_type
+) {
+    const auto& cfg = ctx->layer_configs[layer_idx];
+    const int64_t gate_pair = lora_pair_index(cfg, "gate_proj");
+    const int64_t up_pair = lora_pair_index(cfg, "up_proj");
+    const int64_t down_pair = lora_pair_index(cfg, "down_proj");
+
+    auto gate_out = at::matmul(hidden, gate_proj.t());
+    auto up_out = at::matmul(hidden, up_proj.t());
+    gate_out = add_batched_lora(
+        gate_out, hidden, lora_batch_entry(ctx, layer_idx, gate_pair));
+    up_out = add_batched_lora(
+        up_out, hidden, lora_batch_entry(ctx, layer_idx, up_pair));
+    auto activated = fused_swiglu_op(gate_out, up_out, 0.0);
+    auto result = at::matmul(activated, down_proj.t());
+    result = add_batched_lora(
+        result, activated, lora_batch_entry(ctx, layer_idx, down_pair));
+    return result.to(compute_type);
+}
+
 __attribute__((noinline, visibility("default")))
 at::Tensor apply_multi_lora(
     TrainingContext* ctx, int64_t layer_idx, int64_t pair_idx,
     const at::Tensor& base_weight
 ) {
-    auto it = ctx->lora_cache.find(layer_idx * 10 + pair_idx);
+    auto it = ctx->lora_cache.find(lora_cache_key(layer_idx, pair_idx));
     if (it == ctx->lora_cache.end()) return base_weight;
 
     // Cached delta_weight = b_concat @ a_concat (BF16, precomputed in batched bmm)
@@ -1194,7 +1921,7 @@ at::Tensor compute_attn_only(
     }
 
     // Legacy path: weight-level LoRA
-    int64_t lora_count = (cfg.layer_type == 0) ? 4 : 3;
+    int64_t lora_count = lora_pair_count(cfg);
     int64_t la_offset = ctx->lora_layer_offset[layer_idx];
     bool has_lora = (la_offset + lora_count) <= (int64_t)ctx->lora_a.size();
     std::vector<at::Tensor*> la(lora_count, nullptr), lb(lora_count, nullptr);
@@ -1223,7 +1950,9 @@ at::Tensor compute_attn_only(
         if (has_lora) {
             if (la[0]) qkv = lora_delta(qkv, *la[0], *lb[0], ctx->lora_scaling);
             if (la[1]) z = lora_delta(z, *la[1], *lb[1], ctx->lora_scaling);
-            if (la[2]) op = lora_delta(op, *la[2], *lb[2], ctx->lora_scaling);
+            if (la[2]) a = lora_delta(a, *la[2], *lb[2], ctx->lora_scaling);
+            if (la[3]) b = lora_delta(b, *la[3], *lb[3], ctx->lora_scaling);
+            if (la[4]) op = lora_delta(op, *la[4], *lb[4], ctx->lora_scaling);
         }
         return linear_attention(attn_input, qkv, z, a, b, al, db, cw, nw, op,
             cfg.num_k_heads, cfg.key_dim, cfg.num_v_heads, cfg.val_dim,
@@ -1242,17 +1971,50 @@ at::Tensor compute_mlp_only(
     int64_t mlp_start = (cfg.layer_type == 0) ? 8 : 11;
     auto post_attn = rms_norm(residual, *ctx->weight_ptrs[w_offset + 1], cfg.rms_eps);
     if (cfg.num_experts > 0) {
+        const bool use_batched = ctx->lora_batch_valid;
+        const int64_t shared_gate_pair = lora_pair_index(cfg, "shared_gate_proj");
+        const int64_t shared_up_pair = lora_pair_index(cfg, "shared_up_proj");
+        const int64_t shared_down_pair = lora_pair_index(cfg, "shared_down_proj");
+        const int64_t expert_gate_up_pair = lora_pair_index(cfg, "experts_gate_up_proj");
+        const int64_t expert_down_pair = lora_pair_index(cfg, "experts_down_proj");
+        auto shared_gate = use_batched ? *ctx->weight_ptrs[w_offset+mlp_start+2]
+            : apply_multi_lora(ctx, layer_idx, shared_gate_pair,
+                *ctx->weight_ptrs[w_offset+mlp_start+2]);
+        auto shared_up = use_batched ? *ctx->weight_ptrs[w_offset+mlp_start+3]
+            : apply_multi_lora(ctx, layer_idx, shared_up_pair,
+                *ctx->weight_ptrs[w_offset+mlp_start+3]);
+        auto shared_down = use_batched ? *ctx->weight_ptrs[w_offset+mlp_start+4]
+            : apply_multi_lora(ctx, layer_idx, shared_down_pair,
+                *ctx->weight_ptrs[w_offset+mlp_start+4]);
+        auto expert_lora = routed_expert_lora(ctx, layer_idx, cfg);
         return moe_forward(cfg.nccl_comm, cfg.nccl_stream, post_attn,
             *ctx->weight_ptrs[w_offset+mlp_start], *ctx->weight_ptrs[w_offset+mlp_start+1],
-            *ctx->weight_ptrs[w_offset+mlp_start+2], *ctx->weight_ptrs[w_offset+mlp_start+3],
-            *ctx->weight_ptrs[w_offset+mlp_start+4], *ctx->weight_ptrs[w_offset+mlp_start+5],
+            shared_gate, shared_up,
+            shared_down, *ctx->weight_ptrs[w_offset+mlp_start+5],
             *ctx->weight_ptrs[w_offset+mlp_start+6],
+            expert_lora,
             cfg.num_experts, cfg.top_k, cfg.moe_intermediate,
-            cfg.norm_topk_prob != 0, cfg.expert_start, cfg.expert_count, kind);
+            cfg.norm_topk_prob != 0, cfg.expert_start, cfg.expert_count, kind,
+            use_batched ? lora_batch_entry(ctx, layer_idx, shared_gate_pair) : nullptr,
+            use_batched ? lora_batch_entry(ctx, layer_idx, shared_up_pair) : nullptr,
+            use_batched ? lora_batch_entry(ctx, layer_idx, shared_down_pair) : nullptr,
+            use_batched ? lora_batch_entry(ctx, layer_idx, expert_gate_up_pair) : nullptr,
+            use_batched ? lora_batch_entry(ctx, layer_idx, expert_down_pair) : nullptr);
     } else {
-        return dense_mlp_forward(post_attn,
-            *ctx->weight_ptrs[w_offset+mlp_start], *ctx->weight_ptrs[w_offset+mlp_start+1],
-            *ctx->weight_ptrs[w_offset+mlp_start+2], kind);
+        if (ctx->lora_batch_valid) {
+            return dense_mlp_forward_batched(
+                ctx, layer_idx, post_attn,
+                *ctx->weight_ptrs[w_offset+mlp_start],
+                *ctx->weight_ptrs[w_offset+mlp_start+1],
+                *ctx->weight_ptrs[w_offset+mlp_start+2], kind);
+        }
+        auto gate = apply_multi_lora(ctx, layer_idx,
+            lora_pair_index(cfg, "gate_proj"), *ctx->weight_ptrs[w_offset+mlp_start]);
+        auto up = apply_multi_lora(ctx, layer_idx,
+            lora_pair_index(cfg, "up_proj"), *ctx->weight_ptrs[w_offset+mlp_start+1]);
+        auto down = apply_multi_lora(ctx, layer_idx,
+            lora_pair_index(cfg, "down_proj"), *ctx->weight_ptrs[w_offset+mlp_start+2]);
+        return dense_mlp_forward(post_attn, gate, up, down, kind);
     }
 }
 
@@ -1297,20 +2059,51 @@ struct SubLayerCkpt : public torch::autograd::Function<SubLayerCkpt> {
         bool is_attn = ctx->saved_data["is_attn"].toBool();
         at::AutoGradMode guard(true);
         input.set_requires_grad(true);
+
+        // Derived LoRA deltas belong to one recomputed segment's graph and are
+        // released by grad(..., retain_graph=false). Attention and MLP both
+        // need a fresh cache now that both segments can own adapters.
+        tc->lora_batch_valid = false;
+        tc->lora_cache_valid = false;
+        if (!tc->adapters.empty()) prepare_lora_batch(tc);
+        else precompute_lora_cache(tc);
         auto output = is_attn ? compute_attn_only(tc, input, layer, tc->compute_type)
                               : compute_mlp_only(tc, input, layer, tc->compute_type);
 
         // Collect all tensors to compute gradients for: input + LoRA params for this layer
         // This way grad() accumulates gradients into LoRA params (leaf nodes) too.
-        int64_t lora_count = (tc->layer_configs[layer].layer_type == 0) ? 4 : 3;
+        auto projection_table = lora_projection_table(tc->layer_configs[layer]);
+        int64_t lora_count = projection_table.count;
         int64_t la_offset = tc->lora_layer_offset[layer];
         bool has_lora = (la_offset + lora_count) <= (int64_t)tc->lora_a.size();
 
         std::vector<at::Tensor> grad_inputs = {input};
-        if (has_lora) {
+        std::vector<std::pair<at::Tensor*, at::Tensor*>> active_params;
+        if (!tc->adapters.empty()) {
+            for (auto& adapter : tc->adapters) {
+                auto it = adapter.params.find(layer);
+                if (it == adapter.params.end()) continue;
+                for (int64_t k = 0; k < lora_count && k < (int64_t)it->second.size(); ++k) {
+                    auto segment = projection_table.entries[k].segment;
+                    if ((is_attn && segment != LoraSegment::Attention) ||
+                        (!is_attn && segment != LoraSegment::Mlp)) continue;
+                    auto& [a, b] = it->second[k];
+                    if (!a.requires_grad() && !b.requires_grad()) continue;
+                    active_params.push_back({&a, &b});
+                    grad_inputs.push_back(a);
+                    grad_inputs.push_back(b);
+                }
+            }
+        } else if (has_lora) {
             for (int64_t k = 0; k < lora_count; k++) {
-                grad_inputs.push_back(tc->lora_a[la_offset + k]);
-                grad_inputs.push_back(tc->lora_b[la_offset + k]);
+                auto segment = projection_table.entries[k].segment;
+                if ((is_attn && segment != LoraSegment::Attention) ||
+                    (!is_attn && segment != LoraSegment::Mlp)) continue;
+                int64_t slot = la_offset + k;
+                if (!legacy_lora_slot_active(tc, slot)) continue;
+                active_params.push_back({&tc->lora_a[slot], &tc->lora_b[slot]});
+                grad_inputs.push_back(tc->lora_a[slot]);
+                grad_inputs.push_back(tc->lora_b[slot]);
             }
         }
 
@@ -1321,11 +2114,11 @@ struct SubLayerCkpt : public torch::autograd::Function<SubLayerCkpt> {
         );
 
         // Manually accumulate LoRA param gradients
-        if (has_lora) {
+        if (!active_params.empty()) {
             int64_t gi = 1;  // skip input grad (index 0)
-            for (int64_t k = 0; k < lora_count; k++) {
+            for (auto& [param_a_ptr, param_b_ptr] : active_params) {
                 if (grads[gi].defined()) {
-                    auto& param_a = tc->lora_a[la_offset + k];
+                    auto& param_a = *param_a_ptr;
                     if (param_a.grad().defined())
                         param_a.grad().add_(grads[gi]);
                     else
@@ -1333,7 +2126,7 @@ struct SubLayerCkpt : public torch::autograd::Function<SubLayerCkpt> {
                 }
                 gi++;
                 if (grads[gi].defined()) {
-                    auto& param_b = tc->lora_b[la_offset + k];
+                    auto& param_b = *param_b_ptr;
                     if (param_b.grad().defined())
                         param_b.grad().add_(grads[gi]);
                     else
@@ -1385,15 +2178,15 @@ static at::Tensor full_attention_batched(
     auto v = at::matmul(hidden, v_proj.t());
 
     // Apply activation-level LoRA: q += B@(A@hidden) * scaling
-    auto it_q = ctx->lora_batch_cache.find(layer_idx * 10 + 0);
+    auto it_q = ctx->lora_batch_cache.find(lora_cache_key(layer_idx, 0));
     if (it_q != ctx->lora_batch_cache.end()) {
         q = q + lora_activation_delta(hidden, it_q->second.a_stack, it_q->second.b_stack, it_q->second.scaling);
     }
-    auto it_k = ctx->lora_batch_cache.find(layer_idx * 10 + 1);
+    auto it_k = ctx->lora_batch_cache.find(lora_cache_key(layer_idx, 1));
     if (it_k != ctx->lora_batch_cache.end()) {
         k = k + lora_activation_delta(hidden, it_k->second.a_stack, it_k->second.b_stack, it_k->second.scaling);
     }
-    auto it_v = ctx->lora_batch_cache.find(layer_idx * 10 + 2);
+    auto it_v = ctx->lora_batch_cache.find(lora_cache_key(layer_idx, 2));
     if (it_v != ctx->lora_batch_cache.end()) {
         v = v + lora_activation_delta(hidden, it_v->second.a_stack, it_v->second.b_stack, it_v->second.scaling);
     }
@@ -1410,8 +2203,8 @@ static at::Tensor full_attention_batched(
     q_out = rms_norm(q_out, q_norm, rms_eps);
     k = rms_norm(k, k_norm, rms_eps);
 
-    // Release gate before RoPE
-    gate = at::Tensor();
+    // Keep gate alive until after SDPA. The architecture applies it to the
+    // attention value before the output projection.
 
     // RoPE
     int64_t rotary_dim = (int64_t)(head_dim * partial_rotary_factor);
@@ -1457,12 +2250,14 @@ static at::Tensor full_attention_batched(
     } else {
         attn_out = at::scaled_dot_product_attention(q_out, k, v, c10::nullopt, 0.0, true, c10::nullopt, true);
     }
-    auto result = attn_out.transpose(1, 2).reshape({batch, seq, qkv_dim}).matmul(o_proj.t());
+    auto gated_attn = attn_out * at::sigmoid(gate).to(attn_out.scalar_type());
+    auto attn_flat = gated_attn.transpose(1, 2).reshape({batch, seq, qkv_dim});
+    auto result = attn_flat.matmul(o_proj.t());
 
     // Apply LoRA delta on o_proj output
-    auto it_o = ctx->lora_batch_cache.find(layer_idx * 10 + 3);
+    auto it_o = ctx->lora_batch_cache.find(lora_cache_key(layer_idx, 3));
     if (it_o != ctx->lora_batch_cache.end()) {
-        result = result + lora_activation_delta(attn_out.transpose(1, 2).reshape({batch, seq, qkv_dim}),
+        result = result + lora_activation_delta(attn_flat,
             it_o->second.a_stack, it_o->second.b_stack, it_o->second.scaling);
     }
     return result;
@@ -1487,7 +2282,7 @@ static at::Tensor linear_attention_batched(
 
     // QKV projection + LoRA delta
     auto qkv = at::matmul(hidden, in_proj_qkv.t());
-    auto it_qkv = ctx->lora_batch_cache.find(layer_idx * 10 + 0);
+    auto it_qkv = ctx->lora_batch_cache.find(lora_cache_key(layer_idx, 0));
     if (it_qkv != ctx->lora_batch_cache.end()) {
         qkv = qkv + lora_activation_delta(hidden, it_qkv->second.a_stack, it_qkv->second.b_stack, it_qkv->second.scaling);
     }
@@ -1559,10 +2354,18 @@ static at::Tensor linear_attention_batched(
 
     auto a = at::matmul(hidden, in_proj_a.t());
     auto b = at::matmul(hidden, in_proj_b.t());
+    auto it_a = ctx->lora_batch_cache.find(lora_cache_key(layer_idx, 2));
+    if (it_a != ctx->lora_batch_cache.end()) {
+        a = a + lora_activation_delta(hidden, it_a->second.a_stack, it_a->second.b_stack, it_a->second.scaling);
+    }
+    auto it_b = ctx->lora_batch_cache.find(lora_cache_key(layer_idx, 3));
+    if (it_b != ctx->lora_batch_cache.end()) {
+        b = b + lora_activation_delta(hidden, it_b->second.a_stack, it_b->second.b_stack, it_b->second.scaling);
+    }
 
     // Z projection + LoRA delta
     auto z = at::matmul(hidden, in_proj_z.t());
-    auto it_z = ctx->lora_batch_cache.find(layer_idx * 10 + 1);
+    auto it_z = ctx->lora_batch_cache.find(lora_cache_key(layer_idx, 1));
     if (it_z != ctx->lora_batch_cache.end()) {
         z = z + lora_activation_delta(hidden, it_z->second.a_stack, it_z->second.b_stack, it_z->second.scaling);
     }
@@ -1622,14 +2425,12 @@ static at::Tensor linear_attention_batched(
     int64_t sub_batch = (BH_total > 8192) ? 256 : batch;  // 256 adapters or all if small
     sub_batch = std::min(sub_batch, batch);
 
-    auto outs = at::empty({BH_total, seq, head_v_dim}, q_t.options());
-    auto delta_buf = at::empty({BH_total, seq, head_v_dim}, q_t.options());
+    std::vector<at::Tensor> sub_outputs;
+    sub_outputs.reserve((batch + sub_batch - 1) / sub_batch);
 
     for (int64_t sb = 0; sb < batch; sb += sub_batch) {
         int64_t n = std::min(sub_batch, batch - sb);
         int64_t BH = n * num_v_heads;
-
-        auto state = at::zeros({BH, head_k_dim, head_v_dim}, q_t.options());
 
         // Narrow on dim 0 (batch/adapter dimension), then reshape to [BH, seq, dim]
         auto q_sub = q_t.narrow(0, sb, n);
@@ -1643,23 +2444,11 @@ static at::Tensor linear_attention_batched(
         auto v_contig = v_sub.reshape({BH, seq, head_v_dim}).contiguous().to(at::kFloat);
         auto g_contig = g_sub.reshape({BH, seq}).contiguous().to(at::kFloat);
         auto beta_contig = beta_sub.reshape({BH, seq}).contiguous().to(at::kFloat);
-        auto state_contig = state.contiguous();
-
-        // Output slices: [BH, seq, val_dim] → need to narrow on dim 0 too
-        // outs is [BH_total, seq, val_dim], so bh_start = sb * num_v_heads
-        int64_t bh_start = sb * num_v_heads;
-        cuda_gated_delta_rule(
-            q_contig.data_ptr<float>(),
-            k_contig.data_ptr<float>(),
-            v_contig.data_ptr<float>(),
-            g_contig.data_ptr<float>(),
-            beta_contig.data_ptr<float>(),
-            state_contig.data_ptr<float>(),
-            outs.narrow(0, bh_start, BH).data_ptr<float>(),
-            delta_buf.narrow(0, bh_start, BH).data_ptr<float>(),
-            (int)BH, (int)seq, (int)head_k_dim, (int)head_v_dim
-        );
+        sub_outputs.push_back(GatedDeltaRuleFunction::apply(
+            q_contig, k_contig, v_contig, g_contig, beta_contig));
     }
+
+    auto outs = at::cat(sub_outputs, 0);
 
     auto core_out = outs.reshape({batch, num_v_heads, seq, head_v_dim})
                          .transpose(1, 2).to(compute_type);
@@ -1688,7 +2477,7 @@ static at::Tensor linear_attention_batched(
     }
 
     // out_proj LoRA delta: result += B@(A@gated) * scaling
-    auto it_op = ctx->lora_batch_cache.find(layer_idx * 10 + 2);
+    auto it_op = ctx->lora_batch_cache.find(lora_cache_key(layer_idx, 4));
     if (it_op != ctx->lora_batch_cache.end()) {
         result = result + lora_activation_delta(gated, it_op->second.a_stack, it_op->second.b_stack, it_op->second.scaling);
     }
@@ -1743,7 +2532,7 @@ static at::Tensor forward_full(
                                          ctx->weight_ptrs.begin() + w_offset + w_count);
 
         // Get LoRA pointers for this layer (nullptr if no LoRA for this layer)
-        int64_t lora_count = (ctx->layer_configs[i].layer_type == 0) ? 4 : 3;
+        int64_t lora_count = lora_pair_count(ctx->layer_configs[i]);
         int64_t la_offset = ctx->lora_layer_offset[i];
         // Check if this layer has LoRA params (la_offset < lora_a.size())
         bool has_lora = (la_offset + lora_count) <= (int64_t)ctx->lora_a.size();
@@ -1797,7 +2586,7 @@ static at::Tensor forward_layer_group(
         std::vector<at::Tensor*> layer_w(ctx->weight_ptrs.begin() + w_offset,
                                          ctx->weight_ptrs.begin() + w_offset + w_count);
 
-        int64_t lora_count = (ctx->layer_configs[i].layer_type == 0) ? 4 : 3;
+        int64_t lora_count = lora_pair_count(ctx->layer_configs[i]);
         int64_t la_offset = ctx->lora_layer_offset[i];
         bool has_lora = (la_offset + lora_count) <= (int64_t)ctx->lora_a.size();
         std::vector<at::Tensor*> la_ptrs(lora_count, nullptr), lb_ptrs(lora_count, nullptr);
@@ -1922,7 +2711,7 @@ struct FusedLayerFunction : public torch::autograd::Function<FusedLayerFunction>
         int64_t w_count = weight_count_for_layer(tc->layer_configs[layer_idx]);
         std::vector<at::Tensor*> layer_w(tc->weight_ptrs.begin() + w_offset,
                                          tc->weight_ptrs.begin() + w_offset + w_count);
-        int64_t lora_count = (tc->layer_configs[layer_idx].layer_type == 0) ? 4 : 3;
+        int64_t lora_count = lora_pair_count(tc->layer_configs[layer_idx]);
         int64_t la_offset = tc->lora_layer_offset[layer_idx];
         bool has_lora = (la_offset + lora_count) <= (int64_t)tc->lora_a.size();
         std::vector<at::Tensor*> la(lora_count, nullptr), lb(lora_count, nullptr);
@@ -1992,7 +2781,7 @@ static at::Tensor forward_full_checkpoint(
                 h_f[0][0][0].item<float>(), h_f[0][0][1].item<float>(), h_f[0][0][2].item<float>());
     }
 
-    bool use_subckpt = getenv("QWEN36_SUBCKPT");
+    bool use_subckpt = env_enabled("QWEN36_SUBCKPT");
 
     if (use_subckpt) {
         at::AutoGradMode restore(true);
@@ -2040,8 +2829,6 @@ static at::Tensor forward_full_checkpoint(
         }
 
         hidden = forward_layer_group(ctx, hidden, start, end);
-        // emptyCache: needed for seq>4096 (memory pressure), skip for small seq (async benefit).
-        if (hidden.size(1) > 4096) c10::cuda::CUDACachingAllocator::emptyCache();
 
         if (getenv("QWEN36_DUMP_LAYERS")) {
             auto h_f = hidden.to(at::kFloat);
@@ -2068,20 +2855,20 @@ static void manual_group_backward(
     at::Tensor grad = hidden_grad;
     at::AutoGradMode grad_mode(true);
 
-    ctx->lora_batch_valid = false;
-    ctx->lora_cache_valid = false;
-    // Rebuild lora_batch_cache under AutoGradMode(true) — this is critical:
-    // forward pass built it in no-grad mode, so a_stack/b_stack didn't track
-    // gradients. Here we rebuild so at::stack(A_i) creates a differentiable
-    // graph: grad → bmm → stack → A_i (leaf). Without this, grads are undefined.
-    prepare_lora_batch(ctx);
-
     for (int64_t g = num_groups - 1; g >= 0; g--) {
         int64_t start = groups[g].first;
         int64_t end = groups[g].second;
 
         // Restore input from saved (CPU if offloaded)
         auto input = ctx->group_inputs[g].to(hidden_grad.device()).detach().set_requires_grad(true);
+
+        // Each recomputed group builds a fresh autograd graph. Reusing a
+        // differentiable LoRA cache after grad(..., retain_graph=false) would
+        // point the next group at freed graph nodes.
+        ctx->lora_batch_valid = false;
+        ctx->lora_cache_valid = false;
+        if (!ctx->adapters.empty()) prepare_lora_batch(ctx);
+        else precompute_lora_cache(ctx);
 
         // Recompute forward with grad for this group only
         auto output = forward_layer_group(ctx, input, start, end);
@@ -2095,12 +2882,13 @@ static void manual_group_backward(
         if (ctx->lora_batch_valid) {
             // Multi-LoRA: collect A/B from ctx->adapters
             for (int64_t l = start; l < end; l++) {
-                int64_t lora_count = (ctx->layer_configs[l].layer_type == 0) ? 4 : 3;
+                int64_t lora_count = lora_pair_count(ctx->layer_configs[l]);
                 for (auto& adapter : ctx->adapters) {
                     auto it = adapter.params.find(l);
                     if (it == adapter.params.end()) continue;
                     for (int64_t k = 0; k < lora_count && k < (int64_t)it->second.size(); k++) {
                         auto& [a, b] = it->second[k];
+                        if (!a.requires_grad() && !b.requires_grad()) continue;
                         grad_inputs.push_back(a);
                         grad_inputs.push_back(b);
                     }
@@ -2109,11 +2897,12 @@ static void manual_group_backward(
         } else {
             // Legacy single-LoRA
             for (int64_t l = start; l < end; l++) {
-                int64_t lora_count = (ctx->layer_configs[l].layer_type == 0) ? 4 : 3;
+                int64_t lora_count = lora_pair_count(ctx->layer_configs[l]);
                 int64_t la_offset = ctx->lora_layer_offset[l];
                 bool has_lora = (la_offset + lora_count) <= (int64_t)ctx->lora_a.size();
                 if (has_lora) {
                     for (int64_t k = 0; k < lora_count; k++) {
+                        if (!legacy_lora_slot_active(ctx, la_offset + k)) continue;
                         grad_inputs.push_back(ctx->lora_a[la_offset + k]);
                         grad_inputs.push_back(ctx->lora_b[la_offset + k]);
                     }
@@ -2133,12 +2922,13 @@ static void manual_group_backward(
             // Multi-LoRA: accumulate into ctx->adapters
             int64_t gi = 1;  // skip input grad (index 0)
             for (int64_t l = start; l < end; l++) {
-                int64_t lora_count = (ctx->layer_configs[l].layer_type == 0) ? 4 : 3;
+                int64_t lora_count = lora_pair_count(ctx->layer_configs[l]);
                 for (auto& adapter : ctx->adapters) {
                     auto it = adapter.params.find(l);
                     if (it == adapter.params.end()) continue;
                     for (int64_t k = 0; k < lora_count && k < (int64_t)it->second.size(); k++) {
                         auto& [a, b] = it->second[k];
+                        if (!a.requires_grad() && !b.requires_grad()) continue;
                         if (gi < (int64_t)grads.size() && grads[gi].defined()) {
                             if (a.grad().defined()) a.grad().add_(grads[gi]);
                             else a.mutable_grad() = grads[gi].clone();
@@ -2156,11 +2946,12 @@ static void manual_group_backward(
             // Legacy single-LoRA
             int64_t gi = 1;  // skip input grad (index 0)
             for (int64_t l = start; l < end; l++) {
-                int64_t lora_count = (ctx->layer_configs[l].layer_type == 0) ? 4 : 3;
+                int64_t lora_count = lora_pair_count(ctx->layer_configs[l]);
                 int64_t la_offset = ctx->lora_layer_offset[l];
                 bool has_lora = (la_offset + lora_count) <= (int64_t)ctx->lora_a.size();
                 if (has_lora) {
                     for (int64_t k = 0; k < lora_count; k++) {
+                        if (!legacy_lora_slot_active(ctx, la_offset + k)) continue;
                         if (grads[gi].defined()) {
                             auto& pa = ctx->lora_a[la_offset + k];
                             if (pa.grad().defined()) pa.grad().add_(grads[gi]);
@@ -2177,9 +2968,6 @@ static void manual_group_backward(
                 }
             }
         }
-
-        // emptyCache for backward groups when seq>4096.
-        if (hidden_grad.size(1) > 4096) c10::cuda::CUDACachingAllocator::emptyCache();
 
         // Gradient for this group's input = gradient for next group's output
         grad = grads[0];
@@ -2286,13 +3074,13 @@ static at::Tensor compute_loss_fused(
         sum_exp = old_exp * sum_exp + tile_exp.sum(/*dim=*/1, /*keepdim=*/true);
         logit_max = new_max;
 
-        c10::cuda::CUDACachingAllocator::emptyCache();
     }
 
     // Phase 2: compute target logit for each token
     // We need logits[target] — gather the target position's logit.
     // Do a second pass to find target logit.
-    auto target_logit = at::zeros({total_tokens, 1},
+    auto target_logit = at::full({total_tokens, 1},
+        -std::numeric_limits<float>::infinity(),
         at::TensorOptions().dtype(at::kFloat).device(hidden_flat.device()));
 
     for (int64_t t = 0; t < num_tiles; t++) {
@@ -2308,22 +3096,35 @@ static at::Tensor compute_loss_fused(
         auto logits_tile = at::matmul(hidden_flat, lm_head_tile.t()).to(at::kFloat);
 
         // Gather target logits: subtract v_start to get local index
-        auto local_targets = (shifted_targets - v_start).clamp_min(0);
+        auto local_targets = (shifted_targets - v_start).clamp(0, v_n - 1);
         // Gather: logits_tile[i, local_targets[i]] for tokens in range
         auto gathered = at::gather(logits_tile, /*dim=*/1, local_targets.reshape({-1, 1}));
         // Only keep tokens that are actually in range
-        gathered = gathered * in_range.to(at::kFloat).reshape({-1, 1});
+        gathered = at::where(
+            in_range.reshape({-1, 1}), gathered,
+            at::full_like(gathered, -std::numeric_limits<float>::infinity()));
         target_logit = at::max(target_logit, gathered);
 
-        c10::cuda::CUDACachingAllocator::emptyCache();
     }
 
     // Loss per token: log(sum_exp) - target_logit  (= -log(softmax[target]))
     auto log_sum_exp = at::log(sum_exp) + logit_max;  // log(sum(exp(x-max))) + max = logsumexp
     auto per_token_loss = log_sum_exp - target_logit;  // [total_tokens, 1]
+    per_token_loss = at::where(
+        mask_f.reshape({-1, 1}) > 0, per_token_loss,
+        at::zeros_like(per_token_loss));
     auto masked_loss = per_token_loss.squeeze(1) * mask_f;
     auto total_count = mask_f.sum().clamp_min(1.0);
     double loss_val = (masked_loss.sum().item<double>()) / total_count.item<double>();
+
+    // Evaluation runs with AutoGradMode disabled. The online-softmax passes
+    // above already produced the exact scalar value, so do not execute the
+    // training-only manual gradient pass below. Besides fixing eval on a
+    // no-grad graph, this avoids a third traversal of the vocabulary tiles.
+    if (!at::GradMode::is_enabled()) {
+        return at::tensor({loss_val},
+            at::TensorOptions().dtype(at::kFloat).device(hidden.device()));
+    }
 
     // ── Backward pass: compute grad_hidden_normed manually ──
     // dL/dhidden_normed = (softmax - one_hot) / count * mask
@@ -2365,7 +3166,6 @@ static at::Tensor compute_loss_fused(
         );
         grad_hidden.add_(grad_tile);
 
-        c10::cuda::CUDACachingAllocator::emptyCache();
     }
 
     // Set gradient on hidden_normed (leaf tensor).
@@ -2387,29 +3187,20 @@ static at::Tensor compute_loss_fused(
         hidden_normed_recompute.backward(hidden_normed.grad());
     }
 
-    c10::cuda::CUDACachingAllocator::emptyCache();
-
     return at::tensor({loss_val},
         at::TensorOptions().dtype(at::kFloat).device(hidden.device()));
 }
 
-// ──────────────────────────────────────────────────────────────────────
-// Conditional emptyCache — only syncs when GPU memory is running low.
-// This avoids the ~2s/step of GPU idle time caused by 24 unconditional
-// emptyCache calls (10 fwd groups + 10 bwd groups + 4 CE chunks).
-// ──────────────────────────────────────────────────────────────────────
-static void maybe_emptyCache(at::Device device, int64_t threshold_gb = 20) {
-    size_t free_mem, total_mem;
-    cudaMemGetInfo(&free_mem, &total_mem);
-    if ((int64_t)free_mem < threshold_gb * 1024 * 1024 * 1024) {
-        c10::cuda::CUDACachingAllocator::emptyCache();
-    }
-}
+struct LossResult {
+    at::Tensor value;
+    at::Tensor hidden_grad;
+};
 
 // Cross-entropy loss with response-only masking — chunked with detach.
-// Detach hidden_normed so CE backward doesn't traverse main model graph.
-// Accumulate hidden_normed gradient, then backprop to hidden separately.
-static at::Tensor compute_loss(
+// Return the hidden gradient instead of mutating/backpropagating through the
+// main model graph. The caller combines auxiliary gradients and performs one
+// main backward, which is required for checkpointed execution.
+static LossResult compute_loss(
     TrainingContext* ctx,
     const at::Tensor& hidden,
     const at::Tensor& input_ids,
@@ -2421,7 +3212,7 @@ static at::Tensor compute_loss(
 
     // Detach hidden for CE computation — CE backward won't touch main model graph.
     // We accumulate gradient into hidden_normed, then manually backprop to hidden.
-    auto hidden_detached = hidden.detach();
+    auto hidden_detached = hidden.detach().set_requires_grad(true);
 
     // Compute hidden_normed in no-grad, then set requires_grad on it.
     // This way CE backward only builds a tiny graph (hidden_normed → logits → loss),
@@ -2448,7 +3239,6 @@ static at::Tensor compute_loss(
     auto hidden_flat = shifted_hidden.reshape({-1, hidden_normed.size(2)});
 
     double total_loss_val = 0.0;
-    auto total_count_val = total_count.item<double>();
 
     for (int64_t c = 0; c < num_chunks; c++) {
         int64_t start = c * chunk_size;
@@ -2483,7 +3273,10 @@ static at::Tensor compute_loss(
             at::Tensor(), at::Reduction::None, -100, 0.0
         );
         auto masked_loss = per_token_loss * chunk_mask.to(at::kFloat);
-        auto chunk_loss = masked_loss.sum();
+        // Normalize every chunk by the global response-token count. Backward
+        // must match the mean returned to the caller, independent of sequence
+        // length or chunk boundaries.
+        auto chunk_loss = masked_loss.sum() / total_count;
 
         // Backward this chunk — each chunk creates an independent CE subgraph
         // because hidden_normed is a leaf tensor. retain_graph=false is safe
@@ -2493,24 +3286,21 @@ static at::Tensor compute_loss(
 
         total_loss_val += chunk_loss.item<double>();
 
-        if (hidden_normed.size(1) > 4096) c10::cuda::CUDACachingAllocator::emptyCache();
     }
 
-    // Backprop hidden_normed gradient to hidden via rms_norm.
-    // hidden_normed was computed in no-grad mode (detached from hidden_detached).
-    // Recompute rms_norm with grad tracking to get hidden's gradient.
-    if (hidden_normed.grad().defined()) {
-        hidden.set_requires_grad(true);
-        auto hidden_normed_recompute = rms_norm(hidden, final_norm, ctx->rms_eps);
-        hidden_normed_recompute.backward(hidden_normed.grad());
-        // hidden.grad() now has the CE gradient contribution
-    }
+    TORCH_CHECK(hidden_normed.grad().defined(),
+        "cross-entropy did not produce a hidden gradient");
+    auto hidden_normed_recompute = rms_norm(hidden_detached, final_norm, ctx->rms_eps);
+    auto hidden_grad = torch::autograd::grad(
+        {hidden_normed_recompute}, {hidden_detached}, {hidden_normed.grad()},
+        /*retain_graph=*/false, /*create_graph=*/false,
+        /*allow_unused=*/false)[0];
 
-    // emptyCache for CE intermediates when seq>4096.
-    if (hidden_normed.size(1) > 4096) c10::cuda::CUDACachingAllocator::emptyCache();
-
-    return at::tensor({total_loss_val / total_count_val},
-        at::TensorOptions().dtype(at::kFloat).device(hidden.device()));
+    return {
+        at::tensor({total_loss_val},
+            at::TensorOptions().dtype(at::kFloat).device(hidden.device())),
+        hidden_grad
+    };
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -2607,10 +3397,12 @@ static at::Tensor mtp_compute_loss(
             /*ignore_index=*/-100, /*label_smoothing=*/0.0
         );
         auto masked_loss = per_token_loss * chunk_mask.to(at::kFloat);
-        total_loss += masked_loss.sum();
+        // Avoid in-place accumulation into a non-grad leaf: out-of-place add
+        // keeps the MTP loss connected to the frozen-head input graph.
+        total_loss = total_loss + masked_loss.sum();
     }
 
-    return (total_loss / total_count) * 0.5;
+    return (total_loss / total_count) * ctx->mtp_loss_scale;
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -2618,6 +3410,10 @@ static at::Tensor mtp_compute_loss(
 // ──────────────────────────────────────────────────────────────────────
 
 extern "C" {
+
+__attribute__((visibility("default"))) int64_t qwen36_kernel_abi_version() {
+    return 4;
+}
 
 // Create training context — called once at startup
 // lora_rank: LoRA rank (from config)
@@ -2631,7 +3427,8 @@ __attribute__((visibility("default"))) void* qwen36_create_training_context(
     double lora_scaling, double lr, double beta1, double beta2, double eps,
     int64_t vocab_size, double rms_eps,
     int64_t lora_rank,
-    const int64_t* target_layers, int64_t num_target_layers
+    const int64_t* target_layers, int64_t num_target_layers,
+    const char* target_modules_str
 ) {
     try {
         auto* ctx = new TrainingContext();
@@ -2641,6 +3438,9 @@ __attribute__((visibility("default"))) void* qwen36_create_training_context(
         ctx->step_count = 0; ctx->lora_scaling = lora_scaling;
         ctx->num_layers = num_layers;
         ctx->use_checkpoint = false; ctx->group_size = 4;
+        if (const char* mtp_scale = getenv("QWEN36_MTP_LOSS_SCALE")) {
+            ctx->mtp_loss_scale = std::strtod(mtp_scale, nullptr);
+        }
 
         // Store weight pointers
         auto** wp = reinterpret_cast<at::Tensor**>(weight_ptrs);
@@ -2659,58 +3459,105 @@ __attribute__((visibility("default"))) void* qwen36_create_training_context(
 
         // Build target layer set
         std::set<int64_t> target_set;
+        const bool all_target_layers = !target_layers || num_target_layers == 0;
         if (target_layers && num_target_layers > 0) {
-            for (int64_t j = 0; j < num_target_layers; j++)
+            for (int64_t j = 0; j < num_target_layers; j++) {
+                TORCH_CHECK(target_layers[j] >= 0 && target_layers[j] < num_layers,
+                    "LoRA target layer out of range: ", target_layers[j],
+                    " for model with ", num_layers, " layers");
                 target_set.insert(target_layers[j]);
+            }
         }
 
-        // Create LoRA parameters for target layers only
-        int64_t offset = 0;
-        auto kind = ctx->compute_type;
-        for (int64_t i = 0; i < num_layers; i++) {
-            int64_t lora_count = (ctx->layer_configs[i].layer_type == 0) ? 4 : 3;
-            ctx->lora_layer_offset.push_back(offset);
-
-            if (target_set.find(i) == target_set.end()) {
-                // Not a target layer — no LoRA params, offset stays same
-                continue;
+        std::set<std::string> target_modules;
+        if (target_modules_str && target_modules_str[0] != '\0') {
+            std::stringstream ss(target_modules_str);
+            std::string item;
+            while (std::getline(ss, item, ',')) {
+                if (!item.empty()) target_modules.insert(item);
             }
+        }
+        for (const auto& name : target_modules) {
+            TORCH_CHECK(
+                name == "q_proj" || name == "k_proj" || name == "v_proj" ||
+                name == "o_proj" || name == "in_proj_qkv" ||
+                name == "in_proj_z" || name == "in_proj_a" ||
+                name == "in_proj_b" || name == "out_proj" ||
+                name == "gate_proj" || name == "up_proj" ||
+                name == "down_proj" || name == "shared_gate_proj" ||
+                name == "shared_up_proj" || name == "shared_down_proj" ||
+                name == "experts_gate_up_proj" || name == "experts_down_proj",
+                "unsupported native Qwen LoRA target module: ", name,
+                "; supported routed expert targets are experts_gate_up_proj/experts_down_proj");
+        }
+        for (const auto& name : target_modules) {
+            bool resolved = false;
+            for (const auto& layer_cfg : ctx->layer_configs) {
+                auto table = lora_projection_table(layer_cfg);
+                for (int64_t k = 0; k < table.count; ++k) {
+                    if (name == table.entries[k].name) {
+                        resolved = true;
+                        break;
+                    }
+                }
+                if (resolved) break;
+            }
+            TORCH_CHECK(resolved,
+                "LoRA target module does not exist in this model: ", name);
+        }
+
+        // Create fixed positional slots for every layer so layer offsets stay
+        // stable. Inactive slots are zero tensors without grad and are skipped
+        // by cache construction/Adam; this preserves the existing FFI export
+        // indexing while honoring target_modules exactly.
+        int64_t offset = 0;
+        for (int64_t i = 0; i < num_layers; i++) {
+            auto projection_table = lora_projection_table(ctx->layer_configs[i]);
+            int64_t lora_count = projection_table.count;
+            ctx->lora_layer_offset.push_back(offset);
 
             // Get base weight shapes from the weight pointers
             int64_t w_offset = 0;
             for (int64_t j = 0; j < i; j++)
                 w_offset += weight_count_for_layer(ctx->layer_configs[j]);
 
-            if (ctx->layer_configs[i].layer_type == 0) {
-                // Full attention: q_proj, k_proj, v_proj, o_proj
-                int64_t proj_indices[] = {2, 4, 6, 7};  // q, k, v, o
-                for (int k = 0; k < 4; k++) {
-                    auto* base = ctx->weight_ptrs[w_offset + proj_indices[k]];
+            for (int64_t k = 0; k < projection_table.count; ++k) {
+                const auto& projection = projection_table.entries[k];
+                auto* base = ctx->weight_ptrs[w_offset + projection.weight_index];
+                TORCH_CHECK(base, "null LoRA base projection: layer=", i,
+                    " module=", projection.name);
+                TORCH_CHECK(
+                    (!projection.grouped_expert && base->dim() == 2)
+                        || (projection.grouped_expert && base->dim() == 3),
+                    "LoRA projection rank mismatch: layer=", i,
+                    " module=", projection.name, " base_dim=", base->dim());
+                bool active = (all_target_layers || target_set.find(i) != target_set.end()) &&
+                    (target_modules.empty() || target_modules.count(projection.name) > 0);
+                auto opts = at::TensorOptions().dtype(ctx->compute_type).device(base->device());
+                at::Tensor a, b;
+                if (!active) {
+                    // Stable slot index without allocating potentially hundreds
+                    // of MB for inactive expert-local tensors.
+                    a = at::zeros({}, opts);
+                    b = at::zeros({}, opts);
+                } else if (projection.grouped_expert) {
+                    int64_t experts = base->size(0);
+                    int64_t out_f = base->size(1), in_f = base->size(2);
+                    a = at::randn({experts, lora_rank, in_f}, opts) * 0.01;
+                    b = at::zeros({experts, out_f, lora_rank}, opts);
+                } else {
                     int64_t out_f = base->size(0), in_f = base->size(1);
-                    auto a = at::randn({lora_rank, in_f}, at::TensorOptions().dtype(ctx->compute_type).device(base->device())) * 0.01;
-                    auto b = at::zeros({out_f, lora_rank}, at::TensorOptions().dtype(ctx->compute_type).device(base->device()));
-                    a.set_requires_grad(true);
-                    b.set_requires_grad(true);
-                    ctx->lora_a.push_back(std::move(a));
-                    ctx->lora_b.push_back(std::move(b));
-                    ctx->lora_names.push_back("lora_a_" + std::to_string(i) + "_" + std::to_string(k));
-                    ctx->lora_names.push_back("lora_b_" + std::to_string(i) + "_" + std::to_string(k));
+                    a = at::randn({lora_rank, in_f}, opts) * 0.01;
+                    b = at::zeros({out_f, lora_rank}, opts);
                 }
-            } else {
-                // Linear attention: in_proj_qkv, in_proj_z, out_proj
-                int64_t proj_indices[] = {2, 3, 10};  // qkv, z, out
-                for (int k = 0; k < 3; k++) {
-                    auto* base = ctx->weight_ptrs[w_offset + proj_indices[k]];
-                    int64_t out_f = base->size(0), in_f = base->size(1);
-                    auto a = at::randn({lora_rank, in_f}, at::TensorOptions().dtype(ctx->compute_type).device(base->device())) * 0.01;
-                    auto b = at::zeros({out_f, lora_rank}, at::TensorOptions().dtype(ctx->compute_type).device(base->device()));
-                    a.set_requires_grad(true);
-                    b.set_requires_grad(true);
-                    ctx->lora_a.push_back(std::move(a));
-                    ctx->lora_b.push_back(std::move(b));
-                    ctx->lora_names.push_back("lora_a_" + std::to_string(i) + "_" + std::to_string(k));
-                    ctx->lora_names.push_back("lora_b_" + std::to_string(i) + "_" + std::to_string(k));
-                }
+                a.set_requires_grad(active);
+                b.set_requires_grad(active);
+                ctx->lora_a.push_back(std::move(a));
+                ctx->lora_b.push_back(std::move(b));
+                ctx->lora_active.push_back(active ? 1 : 0);
+                auto prefix = "layers." + std::to_string(i) + "." + projection.name;
+                ctx->lora_names.push_back(prefix + ".lora_A.weight");
+                ctx->lora_names.push_back(prefix + ".lora_B.weight");
             }
             offset += lora_count;
         }
@@ -2777,17 +3624,20 @@ __attribute__((visibility("default"))) double qwen36_train_step(
         auto* ctx = reinterpret_cast<TrainingContext*>(ctx_ptr);
         // Set CUDA device for EP
         if (ctx->nccl_comm) {
-            c10::cuda::set_device(ctx->ep_rank);
-            cudaSetDevice(ctx->ep_rank);
+            c10::cuda::set_device(ctx->cuda_device);
+            cudaSetDevice(ctx->cuda_device);
         }
         auto& input_ids = *reinterpret_cast<at::Tensor*>(input_ids_ptr);
         auto& target_mask = *reinterpret_cast<at::Tensor*>(target_mask_ptr);
         if (attention_mask_ptr) {
             ctx->attention_mask = *reinterpret_cast<at::Tensor*>(attention_mask_ptr);
+            elide_trivial_attention_mask(ctx);
         }
 
         // Forward: checkpoint (default) or fused layer (QWEN36_FUSED_LAYER=1)
-        bool use_fused = getenv("QWEN36_FUSED_LAYER");
+        bool use_fused = env_enabled("QWEN36_FUSED_LAYER");
+        TORCH_CHECK(!use_fused,
+            "QWEN36_FUSED_LAYER is disabled until its custom backward preserves the layer graph");
         auto hidden = use_fused
             ? forward_full_fused(ctx, input_ids)
             : ctx->use_checkpoint
@@ -2802,59 +3652,35 @@ __attribute__((visibility("default"))) double qwen36_train_step(
 
         // Main loss — compute_loss does chunked CE with immediate backward per chunk.
         // This avoids accumulating 250 chunks of [512, vocab] logits in autograd graph.
-        auto loss = compute_loss(ctx, hidden, input_ids, target_mask, ctx->vocab_size);
+        auto main_loss = compute_loss(ctx, hidden, input_ids, target_mask, ctx->vocab_size);
+        double loss_val = main_loss.value.item<double>();
+        auto total_hidden_grad = main_loss.hidden_grad;
 
-        // compute_loss did chunked CE backward on detached hidden,
-        // accumulated gradient into hidden.grad().
-        // Now trigger main model backward using hidden's gradient.
-        double loss_val = loss.item<double>();
-
-        // Debug: GPU memory after CE backward
-        {
-            size_t free, total;
-            cudaMemGetInfo(&free, &total);
-        }
-
-        // Release CE's retained graph (hidden_normed etc.) before backward.
-        // CE gradient is already accumulated into hidden.grad().
-        // hidden.detach() breaks the autograd graph from CE.
-        hidden = hidden.detach();
-        if (hidden.size(1) > 4096) c10::cuda::CUDACachingAllocator::emptyCache();
-
-        // Debug: after releasing CE graph
-        {
-            size_t free, total;
-            cudaMemGetInfo(&free, &total);
-        }
-
-        // Trigger main model backward.
-        // FusedLayer: PyTorch autograd handles backward per layer.
-        // Checkpoint: manual_group_backward recomputes each group with PyTorch.
-        if (use_fused && hidden.grad().defined()) {
-            hidden.backward(hidden.grad());
-        } else if (hidden.grad().defined() && !ctx->group_inputs.empty() && !getenv("QWEN36_SUBCKPT")) {
-            manual_group_backward(ctx, hidden.grad());
-        } else if (hidden.grad().defined()) {
-            hidden.backward(hidden.grad());
-        }
-
-        // MTP loss (if enabled) — run AFTER main backward to reuse freed GPU memory
-        if (ctx->has_mtp && !getenv("QWEN36_DISABLE_MTP")) {
-            // Detach hidden so MTP forward doesn't rebuild main model graph
-            auto hidden_detached = hidden.detach().set_requires_grad(true);
-            auto mtp_hidden = mtp_forward(ctx, hidden_detached, input_ids);
+        // MTP must be differentiated before the main model backward. Its
+        // frozen head still contributes a hidden-state gradient to trainable
+        // main-layer LoRA parameters.
+        if (ctx->has_mtp && !env_enabled("QWEN36_DISABLE_MTP")) {
+            auto mtp_input = hidden.detach().set_requires_grad(true);
+            auto mtp_hidden = mtp_forward(ctx, mtp_input, input_ids);
             auto mtp_loss = mtp_compute_loss(ctx, mtp_hidden, input_ids, target_mask);
-            // Backward MTP loss — frees MTP intermediate tensors immediately
             mtp_loss.backward();
-            // Add MTP gradient to hidden's gradient (already populated by main backward)
-            if (hidden_detached.grad().defined()) {
-                if (hidden.grad().defined()) {
-                    hidden.grad().add_(hidden_detached.grad());
-                } else {
-                    hidden.mutable_grad() = hidden_detached.grad().clone();
-                }
-            }
+            TORCH_CHECK(mtp_input.grad().defined(), "MTP did not produce a hidden gradient");
+            total_hidden_grad.add_(mtp_input.grad());
+            loss_val += mtp_loss.item<double>();
         }
+
+        // Trigger exactly one main-model backward with the combined hidden
+        // gradient. Manual groups are the non-autograd checkpoint fallback;
+        // normal and sub-checkpoint paths use the real graph.
+        if (!ctx->group_inputs.empty() && !env_enabled("QWEN36_SUBCKPT")) {
+            manual_group_backward(ctx, total_hidden_grad);
+        } else {
+            hidden.backward(total_hidden_grad);
+        }
+
+        // EP produces a summed routed output, so synchronize replicated LoRA
+        // gradients before every rank performs its local Adam update.
+        synchronize_lora_gradients(ctx);
 
         // ── Adam optimizer step — CUDA multi-tensor fused kernel ──
         at::AutoGradMode guard(false);
@@ -2943,11 +3769,11 @@ __attribute__((visibility("default"))) double qwen36_train_step(
             auto m_cpu      = at::from_blob(h_m.data(),      {n_params}, opts_cpu_long);
             auto v_cpu      = at::from_blob(h_v.data(),      {n_params}, opts_cpu_long);
             auto sizes_cpu  = at::from_blob(h_sizes.data(),  {n_params}, opts_cpu_int);
-            ctx->adam_dev_bufs.params_buf.copy_(params_cpu);
-            ctx->adam_dev_bufs.grads_buf.copy_(grads_cpu);
-            ctx->adam_dev_bufs.m_buf.copy_(m_cpu);
-            ctx->adam_dev_bufs.v_buf.copy_(v_cpu);
-            ctx->adam_dev_bufs.sizes_buf.copy_(sizes_cpu);
+            ctx->adam_dev_bufs.params_buf.narrow(0, 0, n_params).copy_(params_cpu);
+            ctx->adam_dev_bufs.grads_buf.narrow(0, 0, n_params).copy_(grads_cpu);
+            ctx->adam_dev_bufs.m_buf.narrow(0, 0, n_params).copy_(m_cpu);
+            ctx->adam_dev_bufs.v_buf.narrow(0, 0, n_params).copy_(v_cpu);
+            ctx->adam_dev_bufs.sizes_buf.narrow(0, 0, n_params).copy_(sizes_cpu);
 
             // Single kernel launch for ALL params
             auto stream = c10::cuda::getCurrentCUDAStream().stream();
@@ -2975,13 +3801,42 @@ __attribute__((visibility("default"))) double qwen36_train_step(
 // Get LoRA A tensor pointer by index
 __attribute__((visibility("default"))) void* qwen36_get_lora_a(void* ctx_ptr, int64_t index) {
     auto* ctx = reinterpret_cast<TrainingContext*>(ctx_ptr);
+    if (index < 0 || index >= (int64_t)ctx->lora_a.size()) return nullptr;
     return &ctx->lora_a[index];
 }
 
 // Get LoRA B tensor pointer by index
 __attribute__((visibility("default"))) void* qwen36_get_lora_b(void* ctx_ptr, int64_t index) {
     auto* ctx = reinterpret_cast<TrainingContext*>(ctx_ptr);
+    if (index < 0 || index >= (int64_t)ctx->lora_b.size()) return nullptr;
     return &ctx->lora_b[index];
+}
+
+// Copy one exported LoRA tensor back into the native leaf parameter. This is
+// used by checkpoint resume and adapter import; derived delta caches are
+// invalidated so the next forward rebuilds the graph from the new leaf.
+__attribute__((visibility("default"))) int32_t qwen36_set_lora_tensor(
+    void* ctx_ptr, int64_t index, int32_t is_b, void* tensor_ptr
+) {
+    try {
+        auto* ctx = reinterpret_cast<TrainingContext*>(ctx_ptr);
+        TORCH_CHECK(tensor_ptr, "null LoRA tensor");
+        auto& slots = is_b ? ctx->lora_b : ctx->lora_a;
+        TORCH_CHECK(index >= 0 && index < (int64_t)slots.size(), "invalid LoRA slot");
+        auto& target = slots[index];
+        auto& source = *reinterpret_cast<at::Tensor*>(tensor_ptr);
+        TORCH_CHECK(source.sizes() == target.sizes(),
+            "LoRA tensor shape mismatch at slot ", index,
+            ": expected ", target.sizes(), " got ", source.sizes());
+        at::NoGradGuard guard;
+        target.copy_(source.to(target.device()).to(target.scalar_type()));
+        ctx->lora_cache_valid = false;
+        ctx->lora_batch_valid = false;
+        return 0;
+    } catch (const std::exception& e) {
+        fprintf(stderr, "[q36] set_lora_tensor FAILED: %s\n", e.what());
+        return -1;
+    }
 }
 
 // Free training context
@@ -3026,7 +3881,7 @@ static int64_t compute_n_max(
     // CE peak: one chunk of [16384, vocab] logits at a time.
     // BF16 logits (8GB) + FP32 CE loss (16GB) + grad (~8GB) ≈ 16GB.
     // But backward releases immediately, so effective peak is lower.
-    int64_t ce_peak = 16384 * 248320 * 4;  // ~16GB (FP32 logits only, others freed by autograd)
+    int64_t ce_peak = 16384LL * 248320LL * 4LL;  // ~16GB (FP32 logits only, others freed by autograd)
 
     // Attention intermediate: Q/K/V + attn_weights ≈ 4 × N × heads × seq × head_dim × 2 bytes
     // Flash attention keeps this O(seq) not O(seq²), but still significant at seq=16K
@@ -3051,7 +3906,8 @@ static int64_t compute_n_max(
 }
 
 /// Train all adapters in chunks. Each chunk: independent forward → loss → backward → Adam.
-/// Input is expanded to [N, seq] for each chunk.
+/// Inputs may be [1, seq] (shared prompt, repeated per chunk) or
+/// [n_total, seq] (one independent sample per adapter).
 __attribute__((visibility("default"))) double qwen36_train_multi_lora(
     void* ctx_ptr,
     void* input_ids_ptr,
@@ -3063,18 +3919,42 @@ __attribute__((visibility("default"))) double qwen36_train_multi_lora(
     try {
         auto* ctx = reinterpret_cast<TrainingContext*>(ctx_ptr);
         if (ctx->nccl_comm) {
-            c10::cuda::set_device(ctx->ep_rank);
-            cudaSetDevice(ctx->ep_rank);
+            c10::cuda::set_device(ctx->cuda_device);
+            cudaSetDevice(ctx->cuda_device);
         }
 
         auto& input_ids = *reinterpret_cast<at::Tensor*>(input_ids_ptr);
         auto& target_mask = *reinterpret_cast<at::Tensor*>(target_mask_ptr);
-        if (attention_mask_ptr) {
-            ctx->attention_mask = *reinterpret_cast<at::Tensor*>(attention_mask_ptr);
-        }
 
         int64_t total_adapters = (int64_t)ctx->adapters.size();
         if (total_adapters == 0) return -1.0;
+        TORCH_CHECK(n_total > 0 && total_adapters == n_total,
+            "n_total must equal the number of registered adapters (n_total=",
+            n_total, ", registered=", total_adapters, ")");
+        TORCH_CHECK(input_ids.dim() == 2 && target_mask.dim() == 2,
+            "multi-LoRA inputs must have shape [batch, seq]");
+        const int64_t input_batch = input_ids.size(0);
+        TORCH_CHECK(input_batch == 1 || input_batch == n_total,
+            "multi-LoRA input batch must be 1 or n_total (batch=", input_batch,
+            ", n_total=", n_total, ")");
+        TORCH_CHECK(target_mask.size(0) == input_batch &&
+                    target_mask.size(1) == input_ids.size(1),
+            "target_mask must match input_ids shape");
+
+        // Keep the caller's mask intact. Each chunk receives either the
+        // corresponding rows or a repeated batch-1 mask; this also prevents
+        // elide_trivial_attention_mask from leaking the last chunk into the
+        // next train step.
+        at::Tensor provided_attention_mask;
+        if (attention_mask_ptr) {
+            provided_attention_mask = *reinterpret_cast<at::Tensor*>(attention_mask_ptr);
+            TORCH_CHECK(provided_attention_mask.dim() == 2,
+                "multi-LoRA attention_mask must have shape [batch, seq]");
+            TORCH_CHECK(provided_attention_mask.size(0) == input_batch &&
+                        provided_attention_mask.size(1) == input_ids.size(1),
+                "attention_mask must match input_ids shape");
+        }
+        const at::Tensor saved_attention_mask = ctx->attention_mask;
 
         // Compute N_max from available GPU memory.
         // CRITICAL: all workers must agree on n_max to keep NCCL all-reduce in sync.
@@ -3083,7 +3963,7 @@ __attribute__((visibility("default"))) double qwen36_train_multi_lora(
         cudaMemGetInfo(&free_mem, &total_mem);
         int64_t n_max;
         if (ctx->nccl_comm && ctx->ep_world_size > 1) {
-            const char* sync_path = "/tmp/rustrain-nccl/nmax_sync.txt";
+            const std::string sync_path = nccl_sync_dir() + "/nmax_sync.txt";
             if (ctx->ep_rank == 0) {
                 n_max = compute_n_max(
                     (int64_t)free_mem, lora_rank,
@@ -3092,14 +3972,12 @@ __attribute__((visibility("default"))) double qwen36_train_multi_lora(
                 );
                 n_max = std::min(n_max, total_adapters);
                 if (n_max < 1) n_max = 1;
-                mkdir("/tmp/rustrain-nccl", 0777);
-                FILE* f = fopen(sync_path, "w");
+                FILE* f = fopen(sync_path.c_str(), "w");
                 fprintf(f, "%ld\n", (long)n_max);
                 fclose(f);
             } else {
-                mkdir("/tmp/rustrain-nccl", 0777);
                 for (int i = 0; i < 600; i++) {
-                    FILE* f = fopen(sync_path, "r");
+                    FILE* f = fopen(sync_path.c_str(), "r");
                     if (f) { fscanf(f, "%ld", (long*)&n_max); fclose(f); break; }
                     usleep(10000);
                 }
@@ -3132,16 +4010,29 @@ __attribute__((visibility("default"))) double qwen36_train_multi_lora(
             // Temporarily set lora_batch_valid so prepare_lora_batch runs
             // We need to select only adapters[start:end]
             // HACK: move non-chunk adapters to a temp vector, run, then restore
-            std::vector<TrainingContext::LoRAAdapter> temp;
-            temp.swap(ctx->adapters);
-            ctx->adapters.assign(temp.begin() + start, temp.begin() + end);
+            std::vector<TrainingContext::LoRAAdapter> all_adapters;
+            all_adapters.swap(ctx->adapters);
+            ctx->adapters.assign(
+                all_adapters.begin() + start, all_adapters.begin() + end);
 
             // Mark batched mode active
             ctx->lora_batch_valid = true;  // triggers prepare_lora_batch in forward
 
-            // Expand input_ids from [1, seq] to [N, seq]
-            auto ids_expanded = input_ids.repeat({n, 1});
-            auto mask_expanded = target_mask.repeat({n, 1});
+            // Expand only a shared batch-1 sample. With a tenant-specific
+            // [n_total, seq] batch, preserve each adapter's own row and slice
+            // the same chunk range as the adapter registry.
+            auto ids_expanded = input_batch == 1
+                ? input_ids.repeat({n, 1})
+                : input_ids.narrow(0, start, n).contiguous();
+            auto mask_expanded = input_batch == 1
+                ? target_mask.repeat({n, 1})
+                : target_mask.narrow(0, start, n).contiguous();
+            if (provided_attention_mask.defined()) {
+                ctx->attention_mask = input_batch == 1
+                    ? provided_attention_mask.repeat({n, 1})
+                    : provided_attention_mask.narrow(0, start, n).contiguous();
+                elide_trivial_attention_mask(ctx);
+            }
 
             // Run train_step (reuses existing forward + loss + backward + Adam)
             // But we need to pass the expanded tensors
@@ -3149,7 +4040,9 @@ __attribute__((visibility("default"))) double qwen36_train_multi_lora(
             auto& mask_ref = mask_expanded;
 
             // Forward — force checkpoint for multi-LoRA (needed for group_inputs)
-            bool use_fused = getenv("QWEN36_FUSED_LAYER");
+            bool use_fused = env_enabled("QWEN36_FUSED_LAYER");
+            TORCH_CHECK(!use_fused,
+                "QWEN36_FUSED_LAYER is disabled until its custom backward preserves the layer graph");
             ctx->use_checkpoint = true;  // force checkpoint for manual_group_backward
 
             auto t_fwd_start = std::chrono::steady_clock::now();
@@ -3161,34 +4054,37 @@ __attribute__((visibility("default"))) double qwen36_train_multi_lora(
 
             // Batched CE: compute loss with autograd enabled.
             double loss_val;
+            at::Tensor hidden_grad;
             auto t_loss_start = std::chrono::steady_clock::now();
             {
                 at::AutoGradMode grad_enable(true);
                 // Re-attach hidden to autograd graph
                 hidden = hidden.detach().set_requires_grad(true);
-                if (getenv("QWEN36_FUSED_CE")) {
-                    auto loss = compute_loss_fused(ctx, hidden, input_ref, mask_ref, ctx->vocab_size);
-                    loss_val = loss.item<double>();
-                } else {
-                    auto loss = compute_loss(ctx, hidden, input_ref, mask_ref, ctx->vocab_size);
-                    loss_val = loss.item<double>();
-                }
+                TORCH_CHECK(!env_enabled("QWEN36_FUSED_CE"),
+                    "QWEN36_FUSED_CE is disabled until its tile gather and gradient normalization are validated");
+                auto loss = compute_loss(ctx, hidden, input_ref, mask_ref, ctx->vocab_size);
+                loss_val = loss.value.item<double>();
+                hidden_grad = loss.hidden_grad;
             }
             auto t_loss_end = std::chrono::steady_clock::now();
             double loss_ms = std::chrono::duration<double, std::milli>(t_loss_end - t_loss_start).count();
 
             // Backward
             auto t_bwd_start = std::chrono::steady_clock::now();
-            auto hidden_grad = hidden.grad();
-            hidden = hidden.detach();
-            if (hidden.size(1) > 4096) c10::cuda::CUDACachingAllocator::emptyCache();
+            if (ctx->has_mtp && !env_enabled("QWEN36_DISABLE_MTP")) {
+                auto mtp_input = hidden.detach().set_requires_grad(true);
+                auto mtp_hidden = mtp_forward(ctx, mtp_input, input_ref);
+                auto mtp_loss = mtp_compute_loss(ctx, mtp_hidden, input_ref, mask_ref);
+                mtp_loss.backward();
+                TORCH_CHECK(mtp_input.grad().defined(), "MTP did not produce a hidden gradient");
+                hidden_grad.add_(mtp_input.grad());
+                loss_val += mtp_loss.item<double>();
+            }
 
-            if (use_fused && hidden_grad.defined()) {
-                hidden.backward(hidden_grad);
-            } else if (hidden_grad.defined() && !ctx->group_inputs.empty() && !getenv("QWEN36_SUBCKPT")) {
+            if (!ctx->group_inputs.empty() && !env_enabled("QWEN36_SUBCKPT")) {
                 manual_group_backward(ctx, hidden_grad);
-            } else if (hidden_grad.defined()) {
-                hidden.backward(hidden.grad());
+            } else {
+                hidden.backward(hidden_grad);
             }
             // No cudaDeviceSynchronize — let GPU pipeline run asynchronously.
             // The next chunk's CPU prep (LoRA batch, input expand) will overlap
@@ -3199,20 +4095,9 @@ __attribute__((visibility("default"))) double qwen36_train_multi_lora(
             fprintf(stderr, "[train_multi] chunk %ld/%ld: n=%ld loss=%f  fwd=%.0fms loss=%.0fms bwd=%.0fms\n",
                     (long)(chunk+1), (long)num_chunks, (long)n, loss_val, fwd_ms, loss_ms, bwd_ms);
 
-            // MTP (if enabled)
-            if (ctx->has_mtp && !getenv("QWEN36_DISABLE_MTP")) {
-                auto hidden_detached = hidden.detach().set_requires_grad(true);
-                auto mtp_hidden = mtp_forward(ctx, hidden_detached, input_ref);
-                auto mtp_loss = mtp_compute_loss(ctx, mtp_hidden, input_ref, mask_ref);
-                mtp_loss.backward();
-                if (hidden_detached.grad().defined()) {
-                    if (hidden.grad().defined()) {
-                        hidden.grad().add_(hidden_detached.grad());
-                    } else {
-                        hidden.mutable_grad() = hidden_detached.grad().clone();
-                    }
-                }
-            }
+            // EP gradient synchronization must happen before this chunk's
+            // replicated adapter parameters are updated.
+            synchronize_lora_gradients(ctx);
 
             // Adam step
             at::AutoGradMode guard(false);
@@ -3266,11 +4151,11 @@ __attribute__((visibility("default"))) double qwen36_train_multi_lora(
                 auto v_cpu      = at::from_blob(h_v.data(),      {n_params}, opts_cpu_long);
                 auto sizes_cpu  = at::from_blob(h_sizes.data(),  {n_params}, opts_cpu_int);
                 ctx->adam_dev_bufs.ensure(n_params, ctx->adapters[0].params.begin()->second[0].first);
-                ctx->adam_dev_bufs.params_buf.copy_(params_cpu);
-                ctx->adam_dev_bufs.grads_buf.copy_(grads_cpu);
-                ctx->adam_dev_bufs.m_buf.copy_(m_cpu);
-                ctx->adam_dev_bufs.v_buf.copy_(v_cpu);
-                ctx->adam_dev_bufs.sizes_buf.copy_(sizes_cpu);
+                ctx->adam_dev_bufs.params_buf.narrow(0, 0, n_params).copy_(params_cpu);
+                ctx->adam_dev_bufs.grads_buf.narrow(0, 0, n_params).copy_(grads_cpu);
+                ctx->adam_dev_bufs.m_buf.narrow(0, 0, n_params).copy_(m_cpu);
+                ctx->adam_dev_bufs.v_buf.narrow(0, 0, n_params).copy_(v_cpu);
+                ctx->adam_dev_bufs.sizes_buf.narrow(0, 0, n_params).copy_(sizes_cpu);
 
                 auto stream = c10::cuda::getCurrentCUDAStream().stream();
                 launch_fused_adam_multi(
@@ -3287,22 +4172,18 @@ __attribute__((visibility("default"))) double qwen36_train_multi_lora(
                 );
             }
 
-            // Restore adapters
-            ctx->adapters.swap(temp);
-            // Re-merge: put updated chunk adapters back
-            for (int64_t i = 0; i < n; i++) {
-                temp[start + i] = std::move(ctx->adapters[i]);
-            }
-            ctx->adapters.swap(temp);
+            // Restore the complete registry. Adapter parameter and Adam-state
+            // tensors are intrusive handles, so the chunk copies above share
+            // the updated storage with all_adapters; no value merge is needed.
+            ctx->adapters.swap(all_adapters);
 
             total_loss += loss_val;
-            // emptyCache at chunk boundary — does NOT sync GPU.
-            c10::cuda::CUDACachingAllocator::emptyCache();
 
             fprintf(stderr, "[train_multi] chunk %ld/%ld: n=%ld loss=%.6f\n",
                     (long)(chunk + 1), (long)num_chunks, (long)n, loss_val);
         }
 
+        ctx->attention_mask = saved_attention_mask;
         return total_loss / num_chunks;
     } catch (const std::exception& e) {
         fprintf(stderr, "[train_multi] FAILED: %s\n", e.what());
@@ -3322,6 +4203,7 @@ __attribute__((visibility("default"))) double qwen36_train_multi_lora(
 static ncclComm_t g_nccl_comm = nullptr;
 static cudaStream_t g_nccl_stream = nullptr;
 static bool g_nccl_initialized = false;
+static int g_cuda_device = 0;
 
 // Set CUDA device — called from Rust worker before any GPU operation.
 // Ensures PyTorch initializes CUDA context on the correct device.
@@ -3331,6 +4213,7 @@ __attribute__((visibility("default"))) void qwen36_set_cuda_device(int32_t devic
     // Must be called before any GPU operation in exec'd worker processes.
     c10::cuda::set_device(device);
     cudaSetDevice(device);
+    g_cuda_device = device;
     // Force PyTorch to create CUDA context on this device
     auto opts = at::TensorOptions().dtype(at::kFloat).device(at::kCUDA, device);
     auto dummy = at::empty({1}, opts);
@@ -3353,6 +4236,8 @@ __attribute__((visibility("default"))) int32_t qwen36_init_nccl(
         const char* world_str2 = getenv("WORLD_SIZE");
         if (rank_str2) ctx->ep_rank = atoi(rank_str2);
         if (world_str2) ctx->ep_world_size = atoi(world_str2);
+        const char* local_rank_str2 = getenv("LOCAL_RANK");
+        ctx->cuda_device = local_rank_str2 ? atoi(local_rank_str2) : g_cuda_device;
         for (auto& lc : ctx->layer_configs) { lc.nccl_comm = (void*)g_nccl_comm; lc.nccl_stream = (void*)g_nccl_stream; }
         for (auto& lc : ctx->mtp_layer_configs) { lc.nccl_comm = (void*)g_nccl_comm; lc.nccl_stream = (void*)g_nccl_stream; }
         return 0;
@@ -3371,7 +4256,10 @@ __attribute__((visibility("default"))) int32_t qwen36_init_nccl(
     // Creating a dummy tensor forces PyTorch to initialize its CUDA context.
     const char* local_rank_str = getenv("LOCAL_RANK");
     int local_rank = local_rank_str ? atoi(local_rank_str) : rank;
+    c10::cuda::set_device(local_rank);
     cudaSetDevice(local_rank);
+    g_cuda_device = local_rank;
+    ctx->cuda_device = local_rank;
     {
         // Force PyTorch CUDA context initialization on this device
         auto opts = at::TensorOptions().dtype(at::kFloat).device(at::kCUDA, local_rank);
@@ -3383,30 +4271,35 @@ __attribute__((visibility("default"))) int32_t qwen36_init_nccl(
     // Rank 0 generates ID, writes to file, then writes "ready" sentinel.
     // Other ranks wait for "ready" file, then read ID.
     // This ensures rank 0's write is visible before others read.
-    const char* id_path = "/tmp/rustrain-nccl/nccl-id.bin";
-    const char* ready_path = "/tmp/rustrain-nccl/nccl-ready.txt";
+    const std::string rendezvous_dir = nccl_sync_dir();
+    const std::string id_path = rendezvous_dir + "/nccl-id.bin";
+    const std::string ready_path = rendezvous_dir + "/nccl-ready.txt";
     ncclUniqueId unique_id;
     if (rank == 0) {
-        mkdir("/tmp/rustrain-nccl", 0777);
         // Clean up old files first
-        remove("/tmp/rustrain-nccl/nccl-ready.txt");
+        remove(ready_path.c_str());
+        for (int peer = 0; peer < world_size; ++peer) {
+            const std::string stale_barrier =
+                rendezvous_dir + "/barrier_" + std::to_string(peer);
+            remove(stale_barrier.c_str());
+        }
         ncclGetUniqueId(&unique_id);
-        FILE* f = fopen(id_path, "wb");
+        FILE* f = fopen(id_path.c_str(), "wb");
         fwrite(&unique_id, sizeof(unique_id), 1, f);
         fclose(f);
         // Write ready sentinel AFTER id file
-        FILE* rf = fopen(ready_path, "w");
+        FILE* rf = fopen(ready_path.c_str(), "w");
         fprintf(rf, "ready\n");
         fclose(rf);
     } else {
         // Wait for ready sentinel
         for (int i = 0; i < 600; i++) {
-            FILE* rf = fopen(ready_path, "r");
+            FILE* rf = fopen(ready_path.c_str(), "r");
             if (rf) { fclose(rf); break; }
             usleep(10000);  // 10ms
         }
         // Now read ID file
-        FILE* f = fopen(id_path, "rb");
+        FILE* f = fopen(id_path.c_str(), "rb");
         if (!f || fread(&unique_id, sizeof(unique_id), 1, f) != 1) {
             fprintf(stderr, "[ep_nccl] rank %d: failed to read ID file\n", rank);
             if (f) fclose(f);
@@ -3419,7 +4312,7 @@ __attribute__((visibility("default"))) int32_t qwen36_init_nccl(
     // Without this, rank 0 (fast load_model) reaches ncclCommInitRank before
     // rank 3 (slow load_model) → NCCL timeout.
     {
-        const char* barrier_dir = "/tmp/rustrain-nccl";
+        const char* barrier_dir = rendezvous_dir.c_str();
         char bpath[256];
         snprintf(bpath, sizeof(bpath), "%s/barrier_%d", barrier_dir, rank);
         FILE* bf = fopen(bpath, "w"); fprintf(bf, "1\n"); fclose(bf);
@@ -3483,6 +4376,9 @@ __attribute__((visibility("default"))) void qwen36_set_nccl_comm(
     ctx->nccl_stream = reinterpret_cast<cudaStream_t>(stream_ptr);
     ctx->ep_rank = ep_rank;
     ctx->ep_world_size = ep_world_size;
+    int current_device = g_cuda_device;
+    cudaGetDevice(&current_device);
+    ctx->cuda_device = current_device;
     // Propagate NCCL handles to all layer configs so moe_forward can access them
     for (auto& lc : ctx->layer_configs) {
         lc.nccl_comm = comm_ptr;
@@ -3535,6 +4431,8 @@ int64_t qwen36_add_lora(
 ) {
     try {
         auto* ctx = reinterpret_cast<TrainingContext*>(ctx_ptr);
+        TORCH_CHECK(rank > 0, "LoRA rank must be positive");
+        TORCH_CHECK(alpha > 0.0, "LoRA alpha must be positive");
         TrainingContext::LoRAAdapter adapter;
         adapter.id = ++ctx->next_adapter_id;
         adapter.rank = rank;
@@ -3550,32 +4448,93 @@ int64_t qwen36_add_lora(
             while (std::getline(ss, item, ','))
                 adapter.target_modules.insert(item);
         }
+        for (auto layer : adapter.target_layers) {
+            TORCH_CHECK(layer >= 0 && layer < ctx->num_layers,
+                "dynamic LoRA target layer out of range: ", layer,
+                " for model with ", ctx->num_layers, " layers");
+        }
+        // The activation-level batch path stacks A/B across adapters. Keep
+        // the batch rectangular and semantically aligned instead of waiting
+        // for an opaque ATen stack/shape failure during the first step.
+        if (!ctx->adapters.empty()) {
+            const auto& reference = ctx->adapters.front();
+            TORCH_CHECK(rank == reference.rank,
+                "dynamic LoRA adapters in one batch must use the same rank");
+            TORCH_CHECK(adapter.target_layers == reference.target_layers,
+                "dynamic LoRA adapters in one batch must use identical target_layers");
+            TORCH_CHECK(adapter.target_modules == reference.target_modules,
+                "dynamic LoRA adapters in one batch must use identical target_modules");
+        }
+        for (const auto& name : adapter.target_modules) {
+            TORCH_CHECK(
+                name == "q_proj" || name == "k_proj" || name == "v_proj" ||
+                name == "o_proj" || name == "in_proj_qkv" ||
+                name == "in_proj_z" || name == "in_proj_a" ||
+                name == "in_proj_b" || name == "out_proj" ||
+                name == "gate_proj" || name == "up_proj" ||
+                name == "down_proj" || name == "shared_gate_proj" ||
+                name == "shared_up_proj" || name == "shared_down_proj" ||
+                name == "experts_gate_up_proj" || name == "experts_down_proj",
+                "unsupported dynamic Qwen LoRA target module: ", name);
+            bool resolved = false;
+            for (const auto& layer_cfg : ctx->layer_configs) {
+                auto table = lora_projection_table(layer_cfg);
+                for (int64_t pair = 0; pair < table.count; ++pair) {
+                    if (name == table.entries[pair].name) {
+                        resolved = true;
+                        break;
+                    }
+                }
+                if (resolved) break;
+            }
+            TORCH_CHECK(resolved,
+                "dynamic LoRA target module does not exist in this model: ", name);
+        }
         for (int64_t i = 0; i < ctx->num_layers; i++) {
             if (!adapter.target_layers.empty() && adapter.target_layers.find(i) == adapter.target_layers.end())
                 continue;
             int64_t w_offset = 0;
             for (int64_t j = 0; j < i; j++)
                 w_offset += weight_count_for_layer(ctx->layer_configs[j]);
-            int64_t num_pairs;
-            const int64_t* proj_indices;
-            if (ctx->layer_configs[i].layer_type == 0) {
-                static const int64_t full_indices[] = {2, 4, 6, 7};
-                proj_indices = full_indices;
-                num_pairs = 4;
-            } else {
-                static const int64_t linear_indices[] = {2, 3, 10};
-                proj_indices = linear_indices;
-                num_pairs = 3;
-            }
+            auto projection_table = lora_projection_table(ctx->layer_configs[i]);
+            int64_t num_pairs = projection_table.count;
             std::vector<std::pair<at::Tensor, at::Tensor>> pairs;
             std::vector<std::array<at::Tensor, 4>> adam_states;
-            for (int k = 0; k < num_pairs; k++) {
-                auto* base = ctx->weight_ptrs[w_offset + proj_indices[k]];
-                int64_t out_f = base->size(0), in_f = base->size(1);
-                auto a = at::randn({rank, in_f}, at::TensorOptions().dtype(ctx->compute_type).device(base->device())) * 0.01;
-                auto b = at::zeros({out_f, rank}, at::TensorOptions().dtype(ctx->compute_type).device(base->device()));
-                a.set_requires_grad(true);
-                b.set_requires_grad(true);
+            for (int64_t k = 0; k < num_pairs; k++) {
+                const auto& projection = projection_table.entries[k];
+                auto* base = ctx->weight_ptrs[w_offset + projection.weight_index];
+                // Preserve the historical empty-target default (attention
+                // projections only). Explicit target lists may additionally
+                // select any 2D dense/shared MLP projection.
+                bool active = adapter.target_modules.empty()
+                    ? !projection.grouped_expert &&
+                        projection.segment == LoraSegment::Attention
+                    : adapter.target_modules.find(projection.name) !=
+                        adapter.target_modules.end();
+                auto opts = at::TensorOptions().dtype(ctx->compute_type).device(base->device());
+                at::Tensor a, b;
+                if (active) {
+                    if (projection.grouped_expert) {
+                        TORCH_CHECK(base->dim() == 3,
+                            "dynamic routed-expert LoRA projection must be rank 3: ",
+                            projection.name);
+                        int64_t experts = base->size(0);
+                        int64_t out_f = base->size(1), in_f = base->size(2);
+                        a = at::randn({experts, rank, in_f}, opts) * 0.01;
+                        b = at::zeros({experts, out_f, rank}, opts);
+                    } else {
+                        TORCH_CHECK(base->dim() == 2,
+                            "dynamic LoRA projection must be a matrix: ", projection.name);
+                        int64_t out_f = base->size(0), in_f = base->size(1);
+                        a = at::randn({rank, in_f}, opts) * 0.01;
+                        b = at::zeros({out_f, rank}, opts);
+                    }
+                } else {
+                    a = at::zeros({}, opts);
+                    b = at::zeros({}, opts);
+                }
+                a.set_requires_grad(active);
+                b.set_requires_grad(active);
                 // Adam state: FP32 for numerical stability
                 auto opts_f32 = at::TensorOptions().dtype(at::kFloat).device(base->device());
                 adam_states.push_back({
@@ -3624,13 +4583,65 @@ int64_t qwen36_list_lora(void* ctx_ptr, int64_t* out_ids, int64_t max_count) {
 }
 
 __attribute__((visibility("default")))
+void* qwen36_get_adapter_lora_tensor(
+    void* ctx_ptr, int64_t adapter_id, int64_t layer_idx,
+    const char* module_name, int32_t is_b
+) {
+    auto* ctx = reinterpret_cast<TrainingContext*>(ctx_ptr);
+    if (!ctx || !module_name || layer_idx < 0 || layer_idx >= ctx->num_layers)
+        return nullptr;
+    const int64_t pair_idx = lora_pair_index(
+        ctx->layer_configs[layer_idx], module_name);
+    if (pair_idx < 0) return nullptr;
+    for (auto& adapter : ctx->adapters) {
+        if (adapter.id != adapter_id) continue;
+        auto it = adapter.params.find(layer_idx);
+        if (it == adapter.params.end() ||
+            pair_idx >= static_cast<int64_t>(it->second.size()))
+            return nullptr;
+        auto& pair = it->second[pair_idx];
+        auto& tensor = is_b ? pair.second : pair.first;
+        return tensor.requires_grad() ? &tensor : nullptr;
+    }
+    return nullptr;
+}
+
+__attribute__((visibility("default")))
+int32_t qwen36_set_adapter_lora_tensor(
+    void* ctx_ptr, int64_t adapter_id, int64_t layer_idx,
+    const char* module_name, int32_t is_b, void* tensor_ptr
+) {
+    try {
+        auto* ctx = reinterpret_cast<TrainingContext*>(ctx_ptr);
+        TORCH_CHECK(ctx && module_name && tensor_ptr,
+            "invalid dynamic LoRA tensor setter arguments");
+        auto* target = reinterpret_cast<at::Tensor*>(
+            qwen36_get_adapter_lora_tensor(
+                ctx, adapter_id, layer_idx, module_name, is_b));
+        TORCH_CHECK(target, "dynamic LoRA target not found: adapter=", adapter_id,
+            " layer=", layer_idx, " module=", module_name);
+        auto& source = *reinterpret_cast<at::Tensor*>(tensor_ptr);
+        TORCH_CHECK(source.sizes() == target->sizes(),
+            "dynamic LoRA tensor shape mismatch: expected ", target->sizes(),
+            " got ", source.sizes());
+        at::NoGradGuard guard;
+        target->copy_(source.to(target->device()).to(target->scalar_type()));
+        ctx->lora_cache_valid = false;
+        ctx->lora_batch_valid = false;
+        return 0;
+    } catch (const std::exception& e) {
+        fprintf(stderr, "[q36] set_adapter_lora_tensor FAILED: %s\n", e.what());
+        return -1;
+    }
+}
+
+__attribute__((visibility("default")))
 int64_t qwen36_get_lora_count(void* ctx_ptr) {
     auto* ctx = reinterpret_cast<TrainingContext*>(ctx_ptr);
-    int64_t total = (int64_t)ctx->lora_a.size();
-    for (auto& adapter : ctx->adapters)
-        for (auto& [layer_idx, pairs] : adapter.params)
-            total += (int64_t)pairs.size() * 2;
-    return total;
+    // This legacy accessor is paired with get_lora_a/get_lora_b and therefore
+    // counts only the fixed single-adapter slots. Dynamic adapters have their
+    // own registry and must not make this count exceed those arrays.
+    return (int64_t)ctx->lora_a.size();
 }
 
 __attribute__((visibility("default")))
@@ -3641,9 +4652,10 @@ double qwen36_eval_step(void* ctx_ptr, void* input_ids_ptr, void* target_mask_pt
         auto& target_mask = *reinterpret_cast<at::Tensor*>(target_mask_ptr);
         if (attention_mask_ptr)
             ctx->attention_mask = *reinterpret_cast<at::Tensor*>(attention_mask_ptr);
+        elide_trivial_attention_mask(ctx);
         at::AutoGradMode no_grad(false);
         auto hidden = ctx->use_checkpoint ? forward_full_checkpoint(ctx, input_ids) : forward_full(ctx, input_ids);
-        auto loss = compute_loss(ctx, hidden, input_ids, target_mask, ctx->vocab_size);
+        auto loss = compute_loss_fused(ctx, hidden, input_ids, target_mask, ctx->vocab_size);
         return loss.item<double>();
     } catch (const std::exception& e) {
         fprintf(stderr, "[q36] eval_step FAILED: %s\n", e.what());

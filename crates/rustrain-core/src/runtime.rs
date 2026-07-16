@@ -3,11 +3,11 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use chrono::Local;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
-use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
+use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
 use crate::backend::BackendKind;
 
@@ -489,6 +489,11 @@ pub fn validate_config(config: &Config) -> Result<()> {
         && config.model.architecture == "qwen_trainable_session";
     let is_qwen_lora_sft = matches!(config.train.backend, BackendKind::Tch)
         && config.model.architecture == "qwen_lora_sft";
+    let is_qwen3_hybrid_lora_sft = matches!(config.train.backend, BackendKind::Tch)
+        && matches!(
+            config.model.architecture.as_str(),
+            "qwen3_5_lora_sft" | "qwen3_5_lora_sft_ep" | "qwen3_6_lora_sft" | "qwen3_6_lora_sft_ep"
+        );
     let is_tch_moe_ep_session = matches!(config.train.backend, BackendKind::Tch)
         && config.model.architecture == "tch_moe_ep_session";
     let is_v4_tp_rank = matches!(config.train.backend, BackendKind::Tch)
@@ -503,8 +508,11 @@ pub fn validate_config(config: &Config) -> Result<()> {
         && config.model.architecture == "deepseek_v4_lora_sft_ep";
     let is_glm5_lora_sft_ep = matches!(config.train.backend, BackendKind::Tch)
         && config.model.architecture == "glm5_lora_sft_ep";
-    let is_qwen3_6_lora_sft_ep = matches!(config.train.backend, BackendKind::Tch)
-        && config.model.architecture == "qwen3_6_lora_sft_ep";
+    let is_qwen3_hybrid_lora_sft_ep = matches!(config.train.backend, BackendKind::Tch)
+        && matches!(
+            config.model.architecture.as_str(),
+            "qwen3_5_lora_sft_ep" | "qwen3_6_lora_sft_ep"
+        );
     let is_v4_tp_ep_train = matches!(config.train.backend, BackendKind::Tch)
         && config.model.architecture == "deepseek_v4_tp_ep_train";
     let is_v3_tp_rank = matches!(config.train.backend, BackendKind::Tch)
@@ -531,7 +539,12 @@ pub fn validate_config(config: &Config) -> Result<()> {
             && !((is_v4_tp_rank || is_v3_tp_rank || is_v4_tp_train)
                 && name == "tensor_model_parallel_size"
                 && parallel.data_parallel_size == 1)
-            && !((is_v4_ep_rank || is_v3_ep_rank || is_v4_ep_train || is_v4_lora_sft_ep || is_glm5_lora_sft_ep || is_qwen3_6_lora_sft_ep)
+            && !((is_v4_ep_rank
+                || is_v3_ep_rank
+                || is_v4_ep_train
+                || is_v4_lora_sft_ep
+                || is_glm5_lora_sft_ep
+                || is_qwen3_hybrid_lora_sft_ep)
                 && name == "expert_model_parallel_size"
                 && parallel.data_parallel_size == 1)
             && !(is_glm5_lora_sft_ep
@@ -545,7 +558,7 @@ pub fn validate_config(config: &Config) -> Result<()> {
         }
     }
 
-    if is_qwen_trainable_session || is_qwen_lora_sft {
+    if is_qwen_trainable_session || is_qwen_lora_sft || is_qwen3_hybrid_lora_sft {
         if !matches!(config.train.device, Device::Cuda) {
             return Err(anyhow!(
                 "{} requires device = \"cuda\"",
@@ -580,7 +593,7 @@ pub fn validate_config(config: &Config) -> Result<()> {
         }
     }
 
-    if is_qwen_lora_sft {
+    if is_qwen_lora_sft || is_qwen3_hybrid_lora_sft {
         let lora = config
             .lora
             .as_ref()
@@ -606,20 +619,44 @@ pub fn validate_config(config: &Config) -> Result<()> {
         if lora.target_modules.is_empty() {
             return Err(anyhow!("lora.target_modules must not be empty"));
         }
-        let supported_lora_modules = [
-            "q_proj",
-            "k_proj",
-            "v_proj",
-            "o_proj",
-            "gate_proj",
-            "up_proj",
-            "down_proj",
-        ];
+        let supported_lora_modules: &[&str] = if is_qwen3_hybrid_lora_sft {
+            &[
+                "q_proj",
+                "k_proj",
+                "v_proj",
+                "o_proj",
+                "in_proj_qkv",
+                "in_proj_z",
+                "in_proj_a",
+                "in_proj_b",
+                "out_proj",
+                "gate_proj",
+                "up_proj",
+                "down_proj",
+                "shared_gate_proj",
+                "shared_up_proj",
+                "shared_down_proj",
+                "experts_gate_up_proj",
+                "experts_down_proj",
+            ]
+        } else {
+            &[
+                "q_proj",
+                "k_proj",
+                "v_proj",
+                "o_proj",
+                "gate_proj",
+                "up_proj",
+                "down_proj",
+            ]
+        };
         for module in &lora.target_modules {
             if !supported_lora_modules.contains(&module.as_str()) {
                 return Err(anyhow!(
-                    "qwen_lora_sft unsupported lora.target_modules entry {}; supported: q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj",
-                    module
+                    "{} unsupported lora.target_modules entry {}; supported: {}",
+                    config.model.architecture,
+                    module,
+                    supported_lora_modules.join(", ")
                 ));
             }
         }
@@ -630,17 +667,22 @@ pub fn validate_config(config: &Config) -> Result<()> {
             .any(|module| !unique_modules.insert(module))
         {
             return Err(anyhow!(
-                "qwen_lora_sft lora.target_modules must not contain duplicates"
+                "{} lora.target_modules must not contain duplicates",
+                config.model.architecture
             ));
         }
         if config.train.micro_batch_size == 0 {
-            return Err(anyhow!("qwen_lora_sft requires micro_batch_size > 0"));
+            return Err(anyhow!(
+                "{} requires micro_batch_size > 0",
+                config.model.architecture
+            ));
         }
         let expected_global_batch_size =
             config.train.micro_batch_size * config.train.gradient_accumulation_steps;
         if config.train.global_batch_size != expected_global_batch_size {
             return Err(anyhow!(
-                "qwen_lora_sft requires global_batch_size = micro_batch_size * gradient_accumulation_steps"
+                "{} requires global_batch_size = micro_batch_size * gradient_accumulation_steps",
+                config.model.architecture
             ));
         }
     } else if config.train.micro_batch_size != 1 || config.train.global_batch_size != 1 {
@@ -1273,15 +1315,34 @@ mod tests {
     }
 
     #[test]
+    fn qwen36_lora_sft_accepts_native_projection_targets() {
+        let mut config = qwen_lora_sft_config();
+        config.model.name = "qwen3_6_test".to_string();
+        config.lora.as_mut().unwrap().target_modules = vec![
+            "q_proj".to_string(),
+            "in_proj_qkv".to_string(),
+            "in_proj_z".to_string(),
+            "out_proj".to_string(),
+        ];
+
+        config.model.architecture = "qwen3_6_lora_sft".to_string();
+        validate_config(&config).expect("native Qwen3.6 LoRA targets should validate");
+        config.model.architecture = "qwen3_5_lora_sft".to_string();
+        validate_config(&config).expect("native Qwen3.5 LoRA targets should validate");
+    }
+
+    #[test]
     fn data_max_samples_must_be_positive_when_set() {
         let mut config = qwen_lora_sft_config();
         config.data.as_mut().unwrap().max_samples = Some(0);
 
         let error = validate_config(&config).expect_err("zero max_samples should fail");
 
-        assert!(error
-            .to_string()
-            .contains("data.max_samples must be greater than zero"));
+        assert!(
+            error
+                .to_string()
+                .contains("data.max_samples must be greater than zero")
+        );
     }
 
     #[test]
@@ -1300,9 +1361,11 @@ mod tests {
 
         let error = validate_config(&config).expect_err("invalid regex should fail");
 
-        assert!(error
-            .to_string()
-            .contains("data.field_regex_replacements invalid regex pattern"));
+        assert!(
+            error
+                .to_string()
+                .contains("data.field_regex_replacements invalid regex pattern")
+        );
     }
 
     #[test]
@@ -1322,9 +1385,11 @@ mod tests {
 
         let error = validate_config(&config).expect_err("invalid regex should fail");
 
-        assert!(error
-            .to_string()
-            .contains("data.field_transforms invalid regex_replace pattern"));
+        assert!(
+            error
+                .to_string()
+                .contains("data.field_transforms invalid regex_replace pattern")
+        );
     }
 
     #[test]
@@ -1342,9 +1407,11 @@ mod tests {
 
         let error = validate_config(&config).expect_err("invalid regex should fail");
 
-        assert!(error
-            .to_string()
-            .contains("data field regex filter invalid regex pattern"));
+        assert!(
+            error
+                .to_string()
+                .contains("data field regex filter invalid regex pattern")
+        );
     }
 
     fn qwen_lora_sft_config() -> Config {

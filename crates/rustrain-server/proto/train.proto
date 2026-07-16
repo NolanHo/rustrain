@@ -10,6 +10,7 @@ service TrainService {
   rpc SaveCheckpoint(SaveCheckpointRequest) returns (CheckpointInfo);
   rpc LoadCheckpoint(LoadCheckpointRequest) returns (CheckpointInfo);
   rpc ExportAdapter(ExportAdapterRequest) returns (AdapterInfo);
+  rpc ImportAdapter(ImportAdapterRequest) returns (ImportAdapterResponse);
   rpc StreamMetrics(StreamMetricsRequest) returns (stream StepMetric);
   rpc GetStatus(GetStatusRequest) returns (SessionStatus);
   rpc AddLoRA(AddLoRARequest) returns (AddLoRAResponse);
@@ -94,10 +95,19 @@ message CheckpointInfo {
 message ExportAdapterRequest {
   string session_id = 1;
   string path = 2;
+  int64 adapter_id = 3; // 0 exports the fixed adapter
 }
 message AdapterInfo {
   string path = 1;
   int64 param_count = 2;
+}
+
+message ImportAdapterRequest {
+  string session_id = 1;
+  string path = 2;
+}
+message ImportAdapterResponse {
+  int64 adapter_id = 1;
 }
 
 message StreamMetricsRequest {

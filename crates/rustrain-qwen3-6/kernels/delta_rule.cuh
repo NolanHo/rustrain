@@ -144,8 +144,11 @@ __global__ void gated_delta_rule_kernel(
         // --- delta = (v - kv_mem) * beta ---
         float delta = (v_t - kv_mem) * beta_t;
 
-        // Save delta for backward pass
-        delta_buf[bh * S * DR_D_V + t * DR_D_V + tid] = delta;
+        // Save delta only for the explicit chunked backward path. The
+        // autograd wrapper passes nullptr and recomputes a reference backward.
+        if (delta_buf != nullptr) {
+            delta_buf[bh * S * DR_D_V + t * DR_D_V + tid] = delta;
+        }
 
         // --- State update: S[:, dv] += k_t * delta ---
         // Rank-1 update: each row gets k_t[dk] * delta added
@@ -182,7 +185,7 @@ inline void launch_gated_delta_rule(
     const float* g_exp, const float* beta,
     float* state, float* out, float* delta_buf,
     int BH, int seq_len, int key_dim, int val_dim,
-    cudaStream_t stream = 0
+    cudaStream_t stream
 ) {
     if (key_dim != DR_D_K || val_dim != DR_D_V) {
         fprintf(stderr, "[delta_rule] ERROR: D_K=%d or D_V=%d mismatch (expected %d/%d)\n",
@@ -337,7 +340,7 @@ __global__ void gated_delta_rule_backward_kernel(
             // Actually beta is [BH, S], not per-dv. Need reduction.
             // For now, store per-dv and reduce later.
         }
-        gb_bh[t] = 0.0f;  // placeholder — needs warp reduction
+        gb_bh[t] = 0.0f;  // legacy kernel; not referenced by the host launcher
 
         // --- Step 5: grad_k from kv ---
         // d(kv)/d(k) = S_before_g → grad_k_kv = S_before_g · grad_kv
@@ -360,8 +363,154 @@ __global__ void gated_delta_rule_backward_kernel(
         // --- Step 7: grad_g = sum(grad_S_before_decay * S_before) ---
         // This needs S_before = state_s / g[t], and grad_S_before_decay
         // For simplicity, approximate grad_g as 0 (g is exp of a_log, small gradient)
-        gg_bh[t] = 0.0f;  // TODO: compute properly
+        gg_bh[t] = 0.0f;  // legacy kernel; not referenced by the host launcher
 
+        __syncthreads();
+    }
+}
+
+// Correct reverse-mode recurrence. The older kernel above is retained only as
+// a historical reference and is not used by any launcher; this kernel computes
+// all q/k/v/g/beta gradients.
+// The forward recurrence is:
+//   R = g * S_prev, kv = k^T R, delta = beta * (v - kv),
+//   S = R + k outer delta, out = q^T S.
+__global__ void gated_delta_rule_backward_kernel_correct(
+    const float* __restrict__ q,
+    const float* __restrict__ k,
+    const float* __restrict__ v,
+    const float* __restrict__ g_exp,
+    const float* __restrict__ beta,
+    const float* __restrict__ final_state,
+    const float* __restrict__ delta_buf,
+    const float* __restrict__ grad_out,
+    float* __restrict__ grad_q,
+    float* __restrict__ grad_k,
+    float* __restrict__ grad_v,
+    float* __restrict__ grad_g,
+    float* __restrict__ grad_beta,
+    int S
+) {
+    const int bh = blockIdx.x;
+    const int tid = threadIdx.x;
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
+
+    extern __shared__ float smem[];
+    float* state_s = smem;  // [D_K, D_V] = S_t while entering each step
+    float* grad_s = state_s + DR_D_K * DR_D_V;
+    // Four warp partials for reductions over D_V, followed by two scalar
+    // reductions. This avoids atomics and keeps the 128-thread block intact.
+    float* reduce_q = grad_s + DR_D_K * DR_D_V;
+    float* reduce_k = reduce_q + 4 * DR_D_K;
+    float* reduce_beta = reduce_k + 4 * DR_D_K;
+    float* reduce_g = reduce_beta + 4;
+
+    const float* state_g = final_state + bh * DR_D_K * DR_D_V;
+    for (int i = tid; i < DR_D_K * DR_D_V; i += DR_THREADS) {
+        state_s[i] = state_g[i];
+        grad_s[i] = 0.0f;
+    }
+    __syncthreads();
+
+    const float* q_bh = q + bh * S * DR_D_K;
+    const float* k_bh = k + bh * S * DR_D_K;
+    const float* v_bh = v + bh * S * DR_D_V;
+    const float* g_bh = g_exp + bh * S;
+    const float* beta_bh = beta + bh * S;
+    const float* go_bh = grad_out + bh * S * DR_D_V;
+    float* gq_bh = grad_q + bh * S * DR_D_K;
+    float* gk_bh = grad_k + bh * S * DR_D_K;
+    float* gv_bh = grad_v + bh * S * DR_D_V;
+    float* gg_bh = grad_g + bh * S;
+    float* gb_bh = grad_beta + bh * S;
+
+    for (int t = S - 1; t >= 0; --t) {
+        const float* q_t = q_bh + t * DR_D_K;
+        const float* k_t = k_bh + t * DR_D_K;
+        const float g_t = g_bh[t];
+        const float beta_t = beta_bh[t];
+        const float go_t = go_bh[t * DR_D_V + tid];
+        const float delta_t = delta_buf[bh * S * DR_D_V + t * DR_D_V + tid];
+
+        // Add the direct output contribution to dS_t and reduce dQ_t over
+        // value columns while state_s still contains the post-update state.
+        for (int dk = 0; dk < DR_D_K; ++dk) {
+            const int idx = dk * DR_D_V + tid;
+            const float s_after = state_s[idx];
+            grad_s[idx] += q_t[dk] * go_t;
+            float q_part = s_after * go_t;
+            for (int off = 16; off > 0; off >>= 1)
+                q_part += __shfl_down_sync(0xffffffff, q_part, off);
+            if (lane == 0) reduce_q[warp * DR_D_K + dk] = q_part;
+        }
+        __syncthreads();
+        if (tid < DR_D_K) {
+            gq_bh[t * DR_D_K + tid] =
+                reduce_q[tid] + reduce_q[DR_D_K + tid] +
+                reduce_q[2 * DR_D_K + tid] + reduce_q[3 * DR_D_K + tid];
+        }
+        __syncthreads();
+
+        // Undo S_t = R_t + k outer delta, leaving R_t = g_t*S_prev.
+        for (int dk = 0; dk < DR_D_K; ++dk)
+            state_s[dk * DR_D_V + tid] -= k_t[dk] * delta_t;
+        __syncthreads();
+
+        // ddelta = dS_t^T k and h = ddelta * beta. The same value-column
+        // thread computes dV and one partial for dBeta/dG.
+        float gdelta = 0.0f;
+        float kv_mem = 0.0f;
+        for (int dk = 0; dk < DR_D_K; ++dk) {
+            const int idx = dk * DR_D_V + tid;
+            gdelta += grad_s[idx] * k_t[dk];
+            kv_mem += state_s[idx] * k_t[dk];
+        }
+        const float h = gdelta * beta_t;
+        gv_bh[t * DR_D_V + tid] = h;
+        const float beta_part = gdelta * (v_bh[t * DR_D_V + tid] - kv_mem);
+        const float safe_g = fmaxf(g_t, 1.0e-8f);
+        float g_part = 0.0f;
+
+        // dR = dS - k outer h. Reduce dK over value columns and update dS_prev.
+        for (int dk = 0; dk < DR_D_K; ++dk) {
+            const int idx = dk * DR_D_V + tid;
+            const float r = state_s[idx];
+            const float s_prev = r / safe_g;
+            const float grad_r = grad_s[idx] - k_t[dk] * h;
+            const float k_part = grad_s[idx] * delta_t - r * h;
+            g_part += grad_r * s_prev;
+            float reduced_k = k_part;
+            for (int off = 16; off > 0; off >>= 1)
+                reduced_k += __shfl_down_sync(0xffffffff, reduced_k, off);
+            if (lane == 0) reduce_k[warp * DR_D_K + dk] = reduced_k;
+            grad_s[idx] = grad_r * g_t;
+            // The next reverse iteration starts from S_prev, not R_t.
+            state_s[idx] = s_prev;
+        }
+
+        float reduced_beta = beta_part;
+        float reduced_g = g_part;
+        for (int off = 16; off > 0; off >>= 1) {
+            reduced_beta += __shfl_down_sync(0xffffffff, reduced_beta, off);
+            reduced_g += __shfl_down_sync(0xffffffff, reduced_g, off);
+        }
+        if (lane == 0) {
+            reduce_beta[warp] = reduced_beta;
+            reduce_g[warp] = reduced_g;
+        }
+        __syncthreads();
+        if (tid < DR_D_K) {
+            gk_bh[t * DR_D_K + tid] =
+                reduce_k[tid] + reduce_k[DR_D_K + tid] +
+                reduce_k[2 * DR_D_K + tid] + reduce_k[3 * DR_D_K + tid];
+        }
+        if (tid == 0) {
+            gb_bh[t] = reduce_beta[0] + reduce_beta[1] +
+                       reduce_beta[2] + reduce_beta[3];
+            gg_bh[t] = reduce_g[0] + reduce_g[1] +
+                       reduce_g[2] + reduce_g[3];
+        }
         __syncthreads();
     }
 }
@@ -370,7 +519,7 @@ __global__ void gated_delta_rule_backward_kernel(
 // Host launcher (backward)
 // ──────────────────────────────────────────────────────────────────────
 
-inline void launch_gated_delta_rule_backward(
+inline int launch_gated_delta_rule_backward(
     const float* q, const float* k, const float* v,
     const float* g_exp, const float* beta,
     const float* final_state,
@@ -379,24 +528,30 @@ inline void launch_gated_delta_rule_backward(
     float* grad_q, float* grad_k, float* grad_v,
     float* grad_g, float* grad_beta,
     int BH, int seq_len, int key_dim, int val_dim,
-    cudaStream_t stream = 0
+    cudaStream_t stream
 ) {
     if (key_dim != DR_D_K || val_dim != DR_D_V) {
         fprintf(stderr, "[delta_rule_backward] ERROR: D_K=%d or D_V=%d mismatch\n", key_dim, val_dim);
-        return;
+        return -1;
     }
 
     dim3 grid(BH);
     dim3 block(DR_THREADS);
 
-    // 2 state matrices in shared memory: 2 * 64KB = 128KB
-    size_t smem_size = 2 * DR_D_K * DR_D_V * sizeof(float);
-    cudaFuncSetAttribute(
-        gated_delta_rule_backward_kernel,
+    // 2 state matrices plus four warp partials per D_K and scalar reductions.
+    size_t smem_size = (2 * DR_D_K * DR_D_V + 8 * DR_D_K + 8) * sizeof(float);
+    auto attr_status = cudaFuncSetAttribute(
+        gated_delta_rule_backward_kernel_correct,
         cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
+    if (attr_status != cudaSuccess) {
+        fprintf(stderr, "[delta_rule_backward] shared-memory attribute failed: %s\n",
+                cudaGetErrorString(attr_status));
+        return static_cast<int>(attr_status);
+    }
 
-    gated_delta_rule_backward_kernel<<<grid, block, smem_size, stream>>>(
+    gated_delta_rule_backward_kernel_correct<<<grid, block, smem_size, stream>>>(
         q, k, v, g_exp, beta, final_state, delta_buf, grad_out,
         grad_q, grad_k, grad_v, grad_g, grad_beta, seq_len
     );
+    return 0;
 }

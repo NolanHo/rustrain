@@ -3,40 +3,62 @@
 //! TrainingContext, train_step, and adapter export all happen in C++.
 //! Rust only handles: weight loading, data loading, training loop orchestration.
 
+use crate::lora::Qwen36LoraTargetModule;
+use anyhow::{Result, bail};
 use std::ffi::c_void;
 use std::sync::OnceLock;
 use tch::{Kind, Tensor};
-use anyhow::{Result, bail};
 
 // ── dlopen ──
 
 type FnCreateCtx = unsafe extern "C" fn(
-    *mut *mut c_void, i64, *mut c_void, *mut c_void, *mut c_void,
-    *mut c_void, i64, i32, f64, f64, f64, f64, f64, i64, f64,
-    i64, *const i64, i64,
+    *mut *mut c_void,
+    i64,
+    *mut c_void,
+    *mut c_void,
+    *mut c_void,
+    *mut c_void,
+    i64,
+    i32,
+    f64,
+    f64,
+    f64,
+    f64,
+    f64,
+    i64,
+    f64,
+    i64,
+    *const i64,
+    i64,
+    *const i8,
 ) -> *mut c_void;
+type FnKernelAbiVersion = unsafe extern "C" fn() -> i64;
 type FnTrainStep = unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void, *mut c_void) -> f64;
-type FnTrainMultiLora = unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void, *mut c_void, i32, i32) -> f64;
+type FnTrainMultiLora =
+    unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void, *mut c_void, i32, i32) -> f64;
 type FnEvalStep = unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void, *mut c_void) -> f64;
 type FnGetLoraCount = unsafe extern "C" fn(*mut c_void) -> i64;
 type FnGetLoraA = unsafe extern "C" fn(*mut c_void, i64) -> *mut c_void;
 type FnGetLoraB = unsafe extern "C" fn(*mut c_void, i64) -> *mut c_void;
+type FnSetLoraTensor = unsafe extern "C" fn(*mut c_void, i64, i32, *mut c_void) -> i32;
 type FnGetStepCount = unsafe extern "C" fn(*mut c_void) -> i64;
-type FnExportOptimizer = unsafe extern "C" fn(*mut c_void, *mut *mut c_void, *mut *mut c_void, i64) -> i64;
-type FnImportOptimizer = unsafe extern "C" fn(*mut c_void, *mut *mut c_void, *mut *mut c_void, i64) -> i64;
+type FnExportOptimizer =
+    unsafe extern "C" fn(*mut c_void, *mut *mut c_void, *mut *mut c_void, i64) -> i64;
+type FnImportOptimizer =
+    unsafe extern "C" fn(*mut c_void, *mut *mut c_void, *mut *mut c_void, i64) -> i64;
 type FnFreeCtx = unsafe extern "C" fn(*mut c_void);
 type FnGemm = unsafe extern "C" fn(*mut c_void, *mut c_void, i32) -> *mut c_void;
 type FnFreeTensor = unsafe extern "C" fn(*mut c_void);
 type FnSetMtpWeights = unsafe extern "C" fn(
-    *mut c_void,       // ctx_ptr
-    *mut c_void,       // mtp_fc_ptr
-    *mut c_void,       // mtp_pre_fc_norm_emb_ptr
-    *mut c_void,       // mtp_pre_fc_norm_hidden_ptr
-    *mut c_void,       // mtp_norm_ptr
-    *mut *mut c_void,  // mtp_layer_weight_ptrs
-    i64,               // num_mtp_layer_weights
-    *mut c_void,       // mtp_layer_configs_ptr
-    i64,               // num_mtp_layers
+    *mut c_void,      // ctx_ptr
+    *mut c_void,      // mtp_fc_ptr
+    *mut c_void,      // mtp_pre_fc_norm_emb_ptr
+    *mut c_void,      // mtp_pre_fc_norm_hidden_ptr
+    *mut c_void,      // mtp_norm_ptr
+    *mut *mut c_void, // mtp_layer_weight_ptrs
+    i64,              // num_mtp_layer_weights
+    *mut c_void,      // mtp_layer_configs_ptr
+    i64,              // num_mtp_layers
 );
 type FnSetCheckpoint = unsafe extern "C" fn(*mut c_void, i32, i64);
 type FnSetNcclComm = unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void, i32, i32);
@@ -45,6 +67,10 @@ type FnSetCudaDevice = unsafe extern "C" fn(i32);
 type FnAddLora = unsafe extern "C" fn(*mut c_void, i64, f64, *const i64, i64, *const i8) -> i64;
 type FnRemoveLora = unsafe extern "C" fn(*mut c_void, i64) -> i32;
 type FnListLora = unsafe extern "C" fn(*mut c_void, *mut i64, i64) -> i64;
+type FnGetAdapterLoraTensor =
+    unsafe extern "C" fn(*mut c_void, i64, i64, *const i8, i32) -> *mut c_void;
+type FnSetAdapterLoraTensor =
+    unsafe extern "C" fn(*mut c_void, i64, i64, *const i8, i32, *mut c_void) -> i32;
 
 #[repr(C)]
 pub struct CppLayerConfig {
@@ -80,6 +106,7 @@ struct KernelHandles {
     get_lora_count: FnGetLoraCount,
     get_lora_a: FnGetLoraA,
     get_lora_b: FnGetLoraB,
+    set_lora_tensor: FnSetLoraTensor,
     get_step_count: FnGetStepCount,
     export_optimizer: FnExportOptimizer,
     import_optimizer: FnImportOptimizer,
@@ -94,6 +121,8 @@ struct KernelHandles {
     add_lora: FnAddLora,
     remove_lora: FnRemoveLora,
     list_lora: FnListLora,
+    get_adapter_lora_tensor: FnGetAdapterLoraTensor,
+    set_adapter_lora_tensor: FnSetAdapterLoraTensor,
 }
 
 static KERNELS: OnceLock<Option<KernelHandles>> = OnceLock::new();
@@ -115,17 +144,27 @@ unsafe fn load_kernels() -> Option<KernelHandles> {
     let handle = libc::dlopen(lib_name.as_ptr(), libc::RTLD_LAZY | libc::RTLD_NOLOAD);
     let handle = if handle.is_null() {
         let h = libc::dlopen(lib_name.as_ptr(), libc::RTLD_LAZY);
-        if h.is_null() { return None; }
+        if h.is_null() {
+            return None;
+        }
         h
-    } else { handle };
+    } else {
+        handle
+    };
 
     macro_rules! sym {
         ($name:expr) => {{
             let s = CString::new($name).unwrap();
             let p = libc::dlsym(handle, s.as_ptr());
-            if p.is_null() { return None; }
+            if p.is_null() {
+                return None;
+            }
             std::mem::transmute::<*mut c_void, _>(p)
         }};
+    }
+    let abi_version: FnKernelAbiVersion = sym!("qwen36_kernel_abi_version");
+    if abi_version() != 4 {
+        return None;
     }
     Some(KernelHandles {
         create_ctx: sym!("qwen36_create_training_context"),
@@ -135,6 +174,7 @@ unsafe fn load_kernels() -> Option<KernelHandles> {
         get_lora_count: sym!("qwen36_get_lora_count"),
         get_lora_a: sym!("qwen36_get_lora_a"),
         get_lora_b: sym!("qwen36_get_lora_b"),
+        set_lora_tensor: sym!("qwen36_set_lora_tensor"),
         get_step_count: sym!("qwen36_get_step_count"),
         export_optimizer: sym!("qwen36_export_optimizer_state"),
         import_optimizer: sym!("qwen36_import_optimizer_state"),
@@ -149,6 +189,8 @@ unsafe fn load_kernels() -> Option<KernelHandles> {
         add_lora: sym!("qwen36_add_lora"),
         remove_lora: sym!("qwen36_remove_lora"),
         list_lora: sym!("qwen36_list_lora"),
+        get_adapter_lora_tensor: sym!("qwen36_get_adapter_lora_tensor"),
+        set_adapter_lora_tensor: sym!("qwen36_set_adapter_lora_tensor"),
     })
 }
 
@@ -178,7 +220,10 @@ pub fn build_weight_ptrs(
     for layer in 0..config.num_hidden_layers {
         let lp = format!("{p}layers.{layer}");
         ptrs.push(get_ptr(weights, &format!("{lp}.input_layernorm.weight")));
-        ptrs.push(get_ptr(weights, &format!("{lp}.post_attention_layernorm.weight")));
+        ptrs.push(get_ptr(
+            weights,
+            &format!("{lp}.post_attention_layernorm.weight"),
+        ));
         match config.layer_types[layer] {
             crate::config::LayerType::FullAttention => {
                 for w in &["q_proj", "q_norm", "k_proj", "k_norm", "v_proj", "o_proj"] {
@@ -186,23 +231,50 @@ pub fn build_weight_ptrs(
                 }
             }
             crate::config::LayerType::LinearAttention => {
-                ptrs.push(get_ptr(weights, &format!("{lp}.linear_attn.in_proj_qkv.weight")));
-                ptrs.push(get_ptr(weights, &format!("{lp}.linear_attn.in_proj_z.weight")));
-                ptrs.push(get_ptr(weights, &format!("{lp}.linear_attn.in_proj_a.weight")));
-                ptrs.push(get_ptr(weights, &format!("{lp}.linear_attn.in_proj_b.weight")));
+                ptrs.push(get_ptr(
+                    weights,
+                    &format!("{lp}.linear_attn.in_proj_qkv.weight"),
+                ));
+                ptrs.push(get_ptr(
+                    weights,
+                    &format!("{lp}.linear_attn.in_proj_z.weight"),
+                ));
+                ptrs.push(get_ptr(
+                    weights,
+                    &format!("{lp}.linear_attn.in_proj_a.weight"),
+                ));
+                ptrs.push(get_ptr(
+                    weights,
+                    &format!("{lp}.linear_attn.in_proj_b.weight"),
+                ));
                 ptrs.push(get_ptr(weights, &format!("{lp}.linear_attn.A_log")));
                 ptrs.push(get_ptr(weights, &format!("{lp}.linear_attn.dt_bias")));
                 ptrs.push(get_ptr(weights, &format!("{lp}.linear_attn.conv1d.weight")));
                 ptrs.push(get_ptr(weights, &format!("{lp}.linear_attn.norm.weight")));
-                ptrs.push(get_ptr(weights, &format!("{lp}.linear_attn.out_proj.weight")));
+                ptrs.push(get_ptr(
+                    weights,
+                    &format!("{lp}.linear_attn.out_proj.weight"),
+                ));
             }
         }
         if config.is_moe {
             ptrs.push(get_ptr(weights, &format!("{lp}.mlp.gate.weight")));
-            ptrs.push(get_ptr(weights, &format!("{lp}.mlp.shared_expert_gate.weight")));
-            ptrs.push(get_ptr(weights, &format!("{lp}.mlp.shared_expert.gate_proj.weight")));
-            ptrs.push(get_ptr(weights, &format!("{lp}.mlp.shared_expert.up_proj.weight")));
-            ptrs.push(get_ptr(weights, &format!("{lp}.mlp.shared_expert.down_proj.weight")));
+            ptrs.push(get_ptr(
+                weights,
+                &format!("{lp}.mlp.shared_expert_gate.weight"),
+            ));
+            ptrs.push(get_ptr(
+                weights,
+                &format!("{lp}.mlp.shared_expert.gate_proj.weight"),
+            ));
+            ptrs.push(get_ptr(
+                weights,
+                &format!("{lp}.mlp.shared_expert.up_proj.weight"),
+            ));
+            ptrs.push(get_ptr(
+                weights,
+                &format!("{lp}.mlp.shared_expert.down_proj.weight"),
+            ));
             ptrs.push(get_ptr(weights, &format!("{lp}.mlp.experts.gate_up_proj")));
             ptrs.push(get_ptr(weights, &format!("{lp}.mlp.experts.down_proj")));
         } else {
@@ -219,32 +291,37 @@ pub fn build_layer_configs(
     expert_start: usize,
     expert_count: usize,
 ) -> Vec<CppLayerConfig> {
-    (0..config.num_hidden_layers).map(|layer| {
-        let lt = &config.layer_types[layer];
-        CppLayerConfig {
-            layer_type: match lt { crate::config::LayerType::FullAttention => 0, _ => 1 },
-            num_heads: config.num_attention_heads,
-            num_kv_heads: config.num_key_value_heads,
-            head_dim: config.head_dim,
-            num_k_heads: config.linear_num_key_heads,
-            key_dim: config.linear_key_head_dim,
-            num_v_heads: config.linear_num_value_heads,
-            val_dim: config.linear_value_head_dim,
-            conv_kernel: config.linear_conv_kernel_dim,
-            partial_rotary_factor: config.partial_rotary_factor,
-            rope_theta: config.rope_theta,
-            rms_eps: config.rms_norm_eps,
-            num_experts: config.num_experts as i64,
-            top_k: config.num_experts_per_tok as i64,
-            moe_intermediate: config.moe_intermediate_size,
-            norm_topk_prob: if config.norm_topk_prob { 1 } else { 0 },
-            expert_start: expert_start as i64,
-            expert_count: expert_count as i64,
-            intermediate_size: config.intermediate_size,
-            nccl_comm: std::ptr::null_mut(),
-            nccl_stream: std::ptr::null_mut(),
-        }
-    }).collect()
+    (0..config.num_hidden_layers)
+        .map(|layer| {
+            let lt = &config.layer_types[layer];
+            CppLayerConfig {
+                layer_type: match lt {
+                    crate::config::LayerType::FullAttention => 0,
+                    _ => 1,
+                },
+                num_heads: config.num_attention_heads,
+                num_kv_heads: config.num_key_value_heads,
+                head_dim: config.head_dim,
+                num_k_heads: config.linear_num_key_heads,
+                key_dim: config.linear_key_head_dim,
+                num_v_heads: config.linear_num_value_heads,
+                val_dim: config.linear_value_head_dim,
+                conv_kernel: config.linear_conv_kernel_dim,
+                partial_rotary_factor: config.partial_rotary_factor,
+                rope_theta: config.rope_theta,
+                rms_eps: config.rms_norm_eps,
+                num_experts: config.num_experts as i64,
+                top_k: config.num_experts_per_tok as i64,
+                moe_intermediate: config.moe_intermediate_size,
+                norm_topk_prob: if config.norm_topk_prob { 1 } else { 0 },
+                expert_start: expert_start as i64,
+                expert_count: expert_count as i64,
+                intermediate_size: config.intermediate_size,
+                nccl_comm: std::ptr::null_mut(),
+                nccl_stream: std::ptr::null_mut(),
+            }
+        })
+        .collect()
 }
 
 /// Build weight pointers for MTP layers (full attention layers).
@@ -258,7 +335,10 @@ pub fn build_mtp_weight_ptrs(
     for layer in 0..config.mtp_num_hidden_layers {
         let lp = format!("mtp.layers.{layer}");
         ptrs.push(get_ptr(weights, &format!("{lp}.input_layernorm.weight")));
-        ptrs.push(get_ptr(weights, &format!("{lp}.post_attention_layernorm.weight")));
+        ptrs.push(get_ptr(
+            weights,
+            &format!("{lp}.post_attention_layernorm.weight"),
+        ));
         // Full attention: q, q_norm, k, k_norm, v, o
         for w in &["q_proj", "q_norm", "k_proj", "k_norm", "v_proj", "o_proj"] {
             ptrs.push(get_ptr(weights, &format!("{lp}.self_attn.{w}.weight")));
@@ -266,10 +346,22 @@ pub fn build_mtp_weight_ptrs(
         if config.is_moe {
             // MoE: gate, shared_expert_gate, shared_gate_proj, shared_up_proj, shared_down_proj, experts_gate_up, experts_down
             ptrs.push(get_ptr(weights, &format!("{lp}.mlp.gate.weight")));
-            ptrs.push(get_ptr(weights, &format!("{lp}.mlp.shared_expert_gate.weight")));
-            ptrs.push(get_ptr(weights, &format!("{lp}.mlp.shared_expert.gate_proj.weight")));
-            ptrs.push(get_ptr(weights, &format!("{lp}.mlp.shared_expert.up_proj.weight")));
-            ptrs.push(get_ptr(weights, &format!("{lp}.mlp.shared_expert.down_proj.weight")));
+            ptrs.push(get_ptr(
+                weights,
+                &format!("{lp}.mlp.shared_expert_gate.weight"),
+            ));
+            ptrs.push(get_ptr(
+                weights,
+                &format!("{lp}.mlp.shared_expert.gate_proj.weight"),
+            ));
+            ptrs.push(get_ptr(
+                weights,
+                &format!("{lp}.mlp.shared_expert.up_proj.weight"),
+            ));
+            ptrs.push(get_ptr(
+                weights,
+                &format!("{lp}.mlp.shared_expert.down_proj.weight"),
+            ));
             ptrs.push(get_ptr(weights, &format!("{lp}.mlp.experts.gate_up_proj")));
             ptrs.push(get_ptr(weights, &format!("{lp}.mlp.experts.down_proj")));
         } else {
@@ -288,31 +380,33 @@ pub fn build_mtp_layer_configs(
     expert_start: usize,
     expert_count: usize,
 ) -> Vec<CppLayerConfig> {
-    (0..config.mtp_num_hidden_layers).map(|_| {
-        CppLayerConfig {
-            layer_type: 0,  // MTP layers are always full attention
-            num_heads: config.num_attention_heads,
-            num_kv_heads: config.num_key_value_heads,
-            head_dim: config.head_dim,
-            num_k_heads: config.linear_num_key_heads,
-            key_dim: config.linear_key_head_dim,
-            num_v_heads: config.linear_num_value_heads,
-            val_dim: config.linear_value_head_dim,
-            conv_kernel: config.linear_conv_kernel_dim,
-            partial_rotary_factor: config.partial_rotary_factor,
-            rope_theta: config.rope_theta,
-            rms_eps: config.rms_norm_eps,
-            num_experts: config.num_experts as i64,
-            top_k: config.num_experts_per_tok as i64,
-            moe_intermediate: config.moe_intermediate_size,
-            norm_topk_prob: if config.norm_topk_prob { 1 } else { 0 },
-            expert_start: expert_start as i64,
-            expert_count: expert_count as i64,
-            intermediate_size: config.intermediate_size,
-            nccl_comm: std::ptr::null_mut(),
-            nccl_stream: std::ptr::null_mut(),
-        }
-    }).collect()
+    (0..config.mtp_num_hidden_layers)
+        .map(|_| {
+            CppLayerConfig {
+                layer_type: 0, // MTP layers are always full attention
+                num_heads: config.num_attention_heads,
+                num_kv_heads: config.num_key_value_heads,
+                head_dim: config.head_dim,
+                num_k_heads: config.linear_num_key_heads,
+                key_dim: config.linear_key_head_dim,
+                num_v_heads: config.linear_num_value_heads,
+                val_dim: config.linear_value_head_dim,
+                conv_kernel: config.linear_conv_kernel_dim,
+                partial_rotary_factor: config.partial_rotary_factor,
+                rope_theta: config.rope_theta,
+                rms_eps: config.rms_norm_eps,
+                num_experts: config.num_experts as i64,
+                top_k: config.num_experts_per_tok as i64,
+                moe_intermediate: config.moe_intermediate_size,
+                norm_topk_prob: if config.norm_topk_prob { 1 } else { 0 },
+                expert_start: expert_start as i64,
+                expert_count: expert_count as i64,
+                intermediate_size: config.intermediate_size,
+                nccl_comm: std::ptr::null_mut(),
+                nccl_stream: std::ptr::null_mut(),
+            }
+        })
+        .collect()
 }
 
 /// Opaque training context handle.
@@ -327,10 +421,14 @@ impl CppTrainingContext {
         weights: &std::collections::BTreeMap<String, Tensor>,
         config: &crate::config::Qwen36RuntimeConfig,
         compute_kind: Kind,
-        lr: f64, beta1: f64, beta2: f64, eps: f64,
+        lr: f64,
+        beta1: f64,
+        beta2: f64,
+        eps: f64,
         lora_scaling: f64,
         lora_rank: i64,
         target_layers: &[usize],
+        target_modules: &[Qwen36LoraTargetModule],
         expert_start: usize,
         expert_count: usize,
     ) -> Result<Self> {
@@ -338,7 +436,10 @@ impl CppTrainingContext {
         let mut weight_ptrs = build_weight_ptrs(weights, config);
         let layer_configs = build_layer_configs(config, expert_start, expert_count);
 
-        let embed_ptr = get_ptr(weights, &format!("{}embed_tokens.weight", config.weight_prefix));
+        let embed_ptr = get_ptr(
+            weights,
+            &format!("{}embed_tokens.weight", config.weight_prefix),
+        );
         let final_norm_ptr = get_ptr(weights, &format!("{}norm.weight", config.weight_prefix));
         let lm_head_ptr = if config.tie_word_embeddings {
             // Tied embeddings: use embed_tokens as lm_head
@@ -367,15 +468,40 @@ impl CppTrainingContext {
         };
         let tl_len = target_layers.len() as i64;
 
+        let module_names = target_modules
+            .iter()
+            .map(Qwen36LoraTargetModule::cpp_name)
+            .collect::<Vec<_>>()
+            .join(",");
+        let module_names_c = std::ffi::CString::new(module_names)
+            .map_err(|_| anyhow::anyhow!("LoRA target module contains NUL"))?;
+        let modules_ptr = if target_modules.is_empty() {
+            std::ptr::null()
+        } else {
+            module_names_c.as_ptr()
+        };
+
         let ptr = unsafe {
             (kh.create_ctx)(
-                wp_ptr, wp_len as i64,
-                embed_ptr, final_norm_ptr, lm_head_ptr,
-                lc_ptr, config.num_hidden_layers as i64,
-                compute_type, lora_scaling,
-                lr, beta1, beta2, eps,
-                config.vocab_size, config.rms_norm_eps,
-                lora_rank, tl_ptr, tl_len,
+                wp_ptr,
+                wp_len as i64,
+                embed_ptr,
+                final_norm_ptr,
+                lm_head_ptr,
+                lc_ptr,
+                config.num_hidden_layers as i64,
+                compute_type,
+                lora_scaling,
+                lr,
+                beta1,
+                beta2,
+                eps,
+                config.vocab_size,
+                config.rms_norm_eps,
+                lora_rank,
+                tl_ptr,
+                tl_len,
+                modules_ptr,
             )
         };
         if ptr.is_null() {
@@ -387,7 +513,12 @@ impl CppTrainingContext {
 
     /// Run one training step: forward + loss + backward + Adam update.
     /// Returns loss value.
-    pub fn train_step(&self, input_ids: &Tensor, target_mask: &Tensor, attention_mask: &Tensor) -> Result<f64> {
+    pub fn train_step(
+        &self,
+        input_ids: &Tensor,
+        target_mask: &Tensor,
+        attention_mask: &Tensor,
+    ) -> Result<f64> {
         let kh = get_kernels().ok_or_else(|| anyhow::anyhow!("kernels not loaded"))?;
         let loss = unsafe {
             (kh.train_step)(
@@ -408,8 +539,12 @@ impl CppTrainingContext {
     /// n_total: total number of adapters. lora_rank: LoRA rank for N_max calc.
     /// Returns average loss across chunks.
     pub fn train_multi_lora(
-        &self, input_ids: &Tensor, target_mask: &Tensor, attention_mask: &Tensor,
-        n_total: i32, lora_rank: i32,
+        &self,
+        input_ids: &Tensor,
+        target_mask: &Tensor,
+        attention_mask: &Tensor,
+        n_total: i32,
+        lora_rank: i32,
     ) -> Result<f64> {
         let kh = get_kernels().ok_or_else(|| anyhow::anyhow!("kernels not loaded"))?;
         let loss = unsafe {
@@ -432,7 +567,9 @@ impl CppTrainingContext {
     pub fn get_lora_a(&self, index: i64) -> Option<Tensor> {
         let kh = get_kernels()?;
         let ptr = unsafe { (kh.get_lora_a)(self.ptr, index) };
-        if ptr.is_null() { return None; }
+        if ptr.is_null() {
+            return None;
+        }
         Some(unsafe { Tensor::clone_from_ptr(ptr as *mut _) })
     }
 
@@ -440,8 +577,26 @@ impl CppTrainingContext {
     pub fn get_lora_b(&self, index: i64) -> Option<Tensor> {
         let kh = get_kernels()?;
         let ptr = unsafe { (kh.get_lora_b)(self.ptr, index) };
-        if ptr.is_null() { return None; }
+        if ptr.is_null() {
+            return None;
+        }
         Some(unsafe { Tensor::clone_from_ptr(ptr as *mut _) })
+    }
+
+    pub fn set_lora_tensor(&self, index: i64, is_b: bool, tensor: &Tensor) -> Result<()> {
+        let kh = get_kernels().ok_or_else(|| anyhow::anyhow!("kernels not loaded"))?;
+        let status = unsafe {
+            (kh.set_lora_tensor)(
+                self.ptr,
+                index,
+                if is_b { 1 } else { 0 },
+                tensor.as_ptr() as *mut c_void,
+            )
+        };
+        if status != 0 {
+            bail!("C++ set_lora_tensor failed for slot {index}");
+        }
+        Ok(())
     }
 
     pub fn lora_count(&self) -> i64 {
@@ -502,7 +657,13 @@ impl CppTrainingContext {
     /// Set NCCL communicator for Expert Parallel all-reduce.
     /// Must be called after `new()` if EP is enabled.
     /// comm_ptr / stream_ptr from `NcclPersistentComm::raw_comm_ptr()` / `raw_stream_ptr()`.
-    pub fn set_nccl_comm(&self, comm_ptr: *mut c_void, stream_ptr: *mut c_void, ep_rank: i32, ep_world_size: i32) {
+    pub fn set_nccl_comm(
+        &self,
+        comm_ptr: *mut c_void,
+        stream_ptr: *mut c_void,
+        ep_rank: i32,
+        ep_world_size: i32,
+    ) {
         let kh = get_kernels().expect("kernels not loaded");
         unsafe {
             (kh.set_nccl_comm)(self.ptr, comm_ptr, stream_ptr, ep_rank, ep_world_size);
@@ -528,17 +689,26 @@ impl CppTrainingContext {
     /// target_layers: empty = all layers
     /// target_modules: comma-separated, e.g. "q_proj,k_proj,v_proj,o_proj". Empty = all.
     pub fn add_lora(
-        &self, rank: i64, alpha: f64,
-        target_layers: &[i64], target_modules: &str,
+        &self,
+        rank: i64,
+        alpha: f64,
+        target_layers: &[i64],
+        target_modules: &str,
     ) -> Result<i64> {
         let kh = get_kernels().ok_or_else(|| anyhow::anyhow!("kernels not loaded"))?;
-        let tl_ptr = if target_layers.is_empty() { std::ptr::null() } else { target_layers.as_ptr() };
+        let tl_ptr = if target_layers.is_empty() {
+            std::ptr::null()
+        } else {
+            target_layers.as_ptr()
+        };
         let tl_len = target_layers.len() as i64;
         let modules_c = std::ffi::CString::new(target_modules).unwrap();
-        let modules_ptr = if target_modules.is_empty() { std::ptr::null() } else { modules_c.as_ptr() };
-        let id = unsafe {
-            (kh.add_lora)(self.ptr, rank, alpha, tl_ptr, tl_len, modules_ptr)
+        let modules_ptr = if target_modules.is_empty() {
+            std::ptr::null()
+        } else {
+            modules_c.as_ptr()
         };
+        let id = unsafe { (kh.add_lora)(self.ptr, rank, alpha, tl_ptr, tl_len, modules_ptr) };
         if id < 0 {
             bail!("C++ add_lora failed");
         }
@@ -547,6 +717,9 @@ impl CppTrainingContext {
 
     /// Remove a LoRA adapter by ID.
     pub fn remove_lora(&self, adapter_id: i64) -> Result<bool> {
+        if adapter_id == 0 {
+            return Ok(false);
+        }
         let kh = get_kernels().ok_or_else(|| anyhow::anyhow!("kernels not loaded"))?;
         let found = unsafe { (kh.remove_lora)(self.ptr, adapter_id) };
         Ok(found != 0)
@@ -554,15 +727,80 @@ impl CppTrainingContext {
 
     /// List all active adapter IDs.
     pub fn list_lora(&self) -> Vec<i64> {
-        let kh = match get_kernels() { Some(k) => k, None => return Vec::new() };
-        let mut ids = vec![0i64; 64];
-        let count = unsafe { (kh.list_lora)(self.ptr, ids.as_mut_ptr(), 64) };
-        ids.truncate(count as usize);
+        let kh = match get_kernels() {
+            Some(k) => k,
+            None => return Vec::new(),
+        };
+        let mut ids = Vec::with_capacity(65);
+        if self.lora_count > 0 {
+            // ID 0 is the fixed adapter created with the training context.
+            ids.push(0);
+        }
+        let mut dynamic_ids = vec![0i64; 64];
+        let count = unsafe { (kh.list_lora)(self.ptr, dynamic_ids.as_mut_ptr(), 64) };
+        ids.extend_from_slice(&dynamic_ids[..count as usize]);
         ids
     }
 
+    pub fn get_adapter_lora_tensor(
+        &self,
+        adapter_id: i64,
+        layer: i64,
+        module: &str,
+        is_b: bool,
+    ) -> Option<Tensor> {
+        let kh = get_kernels()?;
+        let module = std::ffi::CString::new(module).ok()?;
+        let ptr = unsafe {
+            (kh.get_adapter_lora_tensor)(
+                self.ptr,
+                adapter_id,
+                layer,
+                module.as_ptr(),
+                if is_b { 1 } else { 0 },
+            )
+        };
+        if ptr.is_null() {
+            return None;
+        }
+        Some(unsafe { Tensor::clone_from_ptr(ptr as *mut _) })
+    }
+
+    pub fn set_adapter_lora_tensor(
+        &self,
+        adapter_id: i64,
+        layer: i64,
+        module: &str,
+        is_b: bool,
+        tensor: &Tensor,
+    ) -> Result<()> {
+        let kh = get_kernels().ok_or_else(|| anyhow::anyhow!("kernels not loaded"))?;
+        let module = std::ffi::CString::new(module)?;
+        let status = unsafe {
+            (kh.set_adapter_lora_tensor)(
+                self.ptr,
+                adapter_id,
+                layer,
+                module.as_ptr(),
+                if is_b { 1 } else { 0 },
+                tensor.as_ptr() as *mut c_void,
+            )
+        };
+        if status != 0 {
+            bail!(
+                "C++ set_adapter_lora_tensor failed for adapter {adapter_id}, layer {layer}, module {module:?}"
+            );
+        }
+        Ok(())
+    }
+
     /// Eval step: forward + loss, no backward, no Adam update.
-    pub fn eval_step(&self, input_ids: &Tensor, target_mask: &Tensor, attention_mask: &Tensor) -> Result<f64> {
+    pub fn eval_step(
+        &self,
+        input_ids: &Tensor,
+        target_mask: &Tensor,
+        attention_mask: &Tensor,
+    ) -> Result<f64> {
         let kh = get_kernels().ok_or_else(|| anyhow::anyhow!("kernels not loaded"))?;
         let loss = unsafe {
             (kh.eval_step)(
@@ -580,7 +818,10 @@ impl CppTrainingContext {
 
     /// Get current training step count.
     pub fn get_step_count(&self) -> i64 {
-        let kh = match get_kernels() { Some(k) => k, None => return 0 };
+        let kh = match get_kernels() {
+            Some(k) => k,
+            None => return 0,
+        };
         unsafe { (kh.get_step_count)(self.ptr) }
     }
 
@@ -588,16 +829,11 @@ impl CppTrainingContext {
     /// Returns (m_tensors, v_tensors) — owned copies on CPU.
     pub fn export_optimizer_state(&self) -> Result<(Vec<Tensor>, Vec<Tensor>)> {
         let kh = get_kernels().ok_or_else(|| anyhow::anyhow!("kernels not loaded"))?;
-        let count = self.lora_count * 2;  // m and v per LoRA param (a+b)
+        let count = self.lora_count * 2; // m and v per LoRA param (a+b)
         let mut m_ptrs: Vec<*mut c_void> = vec![std::ptr::null_mut(); count as usize];
         let mut v_ptrs: Vec<*mut c_void> = vec![std::ptr::null_mut(); count as usize];
         let actual = unsafe {
-            (kh.export_optimizer)(
-                self.ptr,
-                m_ptrs.as_mut_ptr(),
-                v_ptrs.as_mut_ptr(),
-                count,
-            )
+            (kh.export_optimizer)(self.ptr, m_ptrs.as_mut_ptr(), v_ptrs.as_mut_ptr(), count)
         };
         let mut m_tensors = Vec::new();
         let mut v_tensors = Vec::new();
@@ -613,11 +849,21 @@ impl CppTrainingContext {
     }
 
     /// Import Adam optimizer state (m and v vectors).
-    pub fn import_optimizer_state(&self, m_tensors: &[Tensor], v_tensors: &[Tensor]) -> Result<i64> {
+    pub fn import_optimizer_state(
+        &self,
+        m_tensors: &[Tensor],
+        v_tensors: &[Tensor],
+    ) -> Result<i64> {
         let kh = get_kernels().ok_or_else(|| anyhow::anyhow!("kernels not loaded"))?;
         let count = m_tensors.len().min(v_tensors.len());
-        let m_ptrs: Vec<*mut c_void> = m_tensors.iter().map(|t| t.as_ptr() as *mut c_void).collect();
-        let v_ptrs: Vec<*mut c_void> = v_tensors.iter().map(|t| t.as_ptr() as *mut c_void).collect();
+        let m_ptrs: Vec<*mut c_void> = m_tensors
+            .iter()
+            .map(|t| t.as_ptr() as *mut c_void)
+            .collect();
+        let v_ptrs: Vec<*mut c_void> = v_tensors
+            .iter()
+            .map(|t| t.as_ptr() as *mut c_void)
+            .collect();
         let imported = unsafe {
             (kh.import_optimizer)(
                 self.ptr,

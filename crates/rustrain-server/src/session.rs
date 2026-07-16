@@ -1,6 +1,6 @@
 //! Training session trait + Qwen3.6 implementation.
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tch::{Device, Kind, Tensor};
@@ -8,6 +8,7 @@ use tokio::sync::Mutex;
 
 use crate::checkpoint;
 use crate::metrics::{FileMetricsSink, MetricsSink, StepMetric};
+use rustrain_qwen3_6::lora::{Qwen36AdapterArtifact, Qwen36LoraConfig, Qwen36LoraTargetModule};
 
 /// Session states.
 #[derive(Debug, Clone)]
@@ -36,7 +37,7 @@ pub struct SessLoadDatasetRequest {
 #[derive(Debug)]
 pub struct InitLoRARequest {
     pub rank: i64,
-    pub alpha: i64,
+    pub alpha: f64,
     pub target_layers: Vec<usize>,
     pub target_modules: Vec<String>,
     pub lr: f64,
@@ -77,11 +78,19 @@ pub trait TrainingSession: Send {
     fn load_dataset(&mut self, req: SessLoadDatasetRequest) -> Result<usize>;
     fn init_lora(&mut self, req: InitLoRARequest) -> Result<usize>;
     fn train_step(&mut self, input: TrainInput) -> Result<TrainOutput>;
-    fn train_multi_lora(&mut self, input: TrainInput, n_total: i32, rank: i32) -> Result<TrainOutput>;
+    fn train_multi_lora(
+        &mut self,
+        input: TrainInput,
+        n_total: i32,
+        rank: i32,
+    ) -> Result<TrainOutput>;
     fn eval_step(&self, input: TrainInput) -> Result<EvalOutput>;
     fn save_checkpoint(&self, path: &str) -> Result<(u64, f64)>;
     fn load_checkpoint(&mut self, path: &str) -> Result<(u64, f64)>;
-    fn export_adapter(&self, path: &str) -> Result<usize>;
+    fn export_adapter(&self, path: &str, adapter_id: Option<i64>) -> Result<usize>;
+    /// Import one PEFT-style adapter as a new dynamic adapter. The fixed
+    /// adapter remains reserved as ID 0 and is never overwritten by import.
+    fn import_adapter(&mut self, path: &str) -> Result<i64>;
     fn status(&self) -> SessionStatus;
     fn get_metrics(&self) -> Vec<StepMetric>;
 
@@ -101,7 +110,7 @@ pub struct AddLoRARequest {
     pub rank: i64,
     pub alpha: f64,
     pub target_layers: Vec<i64>,
-    pub target_modules: String,  // comma-separated, empty = all
+    pub target_modules: String, // comma-separated, empty = all
 }
 
 /// Qwen3.6 training session — wraps CppTrainingContext.
@@ -116,7 +125,10 @@ pub struct Qwen36Session {
     weights: Option<std::collections::BTreeMap<String, Tensor>>,
     dataset: Option<rustrain_qwen3_6::sft::SftDataset>,
     lora_rank: i64,
-    lora_alpha: i64,
+    lora_alpha: f64,
+    lora_target_layers: Vec<usize>,
+    lora_target_modules: Vec<Qwen36LoraTargetModule>,
+    dynamic_lora_configs: std::collections::BTreeMap<i64, Qwen36LoraConfig>,
     lr: f64,
     metrics: Option<Arc<FileMetricsSink>>,
     last_loss: f64,
@@ -142,7 +154,10 @@ impl Qwen36Session {
             weights: None,
             dataset: None,
             lora_rank: 0,
-            lora_alpha: 0,
+            lora_alpha: 0.0,
+            lora_target_layers: Vec::new(),
+            lora_target_modules: Vec::new(),
+            dynamic_lora_configs: std::collections::BTreeMap::new(),
             lr: 1e-4,
             metrics: Some(Arc::new(FileMetricsSink::new(metrics_path))),
             last_loss: 0.0,
@@ -200,10 +215,7 @@ impl TrainingSession for Qwen36Session {
 
         // Load runtime config from model's config.json (no need to parse full TOML)
         let model_path_obj = std::path::Path::new(model_path);
-        let runtime_config =
-            rustrain_qwen3_6::config::read_qwen36_runtime_config(
-                model_path_obj,
-            )?;
+        let runtime_config = rustrain_qwen3_6::config::read_qwen36_runtime_config(model_path_obj)?;
 
         // Build needed weight set — keys must match safetensors (with model prefix)
         let n_layers = runtime_config.num_hidden_layers;
@@ -289,15 +301,28 @@ impl TrainingSession for Qwen36Session {
 
         // ── Expert Parallel support ──
         // Read EP params from env vars (set by launcher script)
-        let ep_rank = std::env::var("RANK").ok().and_then(|s| s.parse::<usize>().ok()).unwrap_or(0);
-        let ep_world_size = std::env::var("WORLD_SIZE").ok().and_then(|s| s.parse::<usize>().ok()).unwrap_or(1);
-        let local_rank = std::env::var("LOCAL_RANK").ok().and_then(|s| s.parse::<usize>().ok()).unwrap_or(0);
+        let ep_rank = std::env::var("RANK")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(0);
+        let ep_world_size = std::env::var("WORLD_SIZE")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(1);
+        let local_rank = std::env::var("LOCAL_RANK")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(0);
         let is_ep = ep_world_size > 1 && runtime_config.is_moe;
 
         // Compute expert shard
         let (expert_start, expert_count) = if is_ep {
-            assert!(runtime_config.num_experts % ep_world_size == 0,
-                "num_experts {} not divisible by ep_world_size {}", runtime_config.num_experts, ep_world_size);
+            assert!(
+                runtime_config.num_experts % ep_world_size == 0,
+                "num_experts {} not divisible by ep_world_size {}",
+                runtime_config.num_experts,
+                ep_world_size
+            );
             let epr = runtime_config.num_experts / ep_world_size;
             (ep_rank * epr, epr)
         } else {
@@ -311,10 +336,12 @@ impl TrainingSession for Qwen36Session {
 
         // Move to device — for EP, narrow expert tensors before GPU transfer
         let num_experts = runtime_config.num_experts as i64;
-        let mut weights: std::collections::BTreeMap<String, Tensor> = std::collections::BTreeMap::new();
+        let mut weights: std::collections::BTreeMap<String, Tensor> =
+            std::collections::BTreeMap::new();
         for (name, tensor) in raw_weights {
             let needs_narrow = is_ep
-                && (name.contains(".mlp.experts.gate_up_proj") || name.contains(".mlp.experts.down_proj"));
+                && (name.contains(".mlp.experts.gate_up_proj")
+                    || name.contains(".mlp.experts.down_proj"));
             if needs_narrow && tensor.size()[0] == num_experts {
                 let narrowed = tensor
                     .narrow(0, expert_start as i64, expert_count as i64)
@@ -336,6 +363,20 @@ impl TrainingSession for Qwen36Session {
         } else {
             req.target_layers.clone()
         };
+        let target_modules = req
+            .target_modules
+            .iter()
+            .map(|name| rustrain_qwen3_6::lora::Qwen36LoraTargetModule::parse(name))
+            .collect::<Result<Vec<_>>>()?;
+        rustrain_qwen3_6::lora::validate_lora_targets(
+            &runtime_config,
+            &Qwen36LoraConfig {
+                rank: req.rank,
+                alpha: req.alpha,
+                target_layers: all_layers.clone(),
+                target_modules: target_modules.clone(),
+            },
+        )?;
         let lora_scaling = req.alpha as f64 / req.rank as f64;
         let ctx = rustrain_qwen3_6::kernel::CppTrainingContext::new(
             &weights,
@@ -348,6 +389,7 @@ impl TrainingSession for Qwen36Session {
             lora_scaling,
             req.rank,
             &all_layers,
+            &target_modules,
             expert_start,
             expert_count,
         )?;
@@ -358,7 +400,11 @@ impl TrainingSession for Qwen36Session {
             if ret != 0 {
                 return Err(anyhow!("C++ NCCL init failed (code {})", ret));
             }
-            tracing::info!(ep_rank, ep_world_size, "NCCL communicator created in C++ for EP");
+            tracing::info!(
+                ep_rank,
+                ep_world_size,
+                "NCCL communicator created in C++ for EP"
+            );
             true
         } else {
             false
@@ -366,10 +412,12 @@ impl TrainingSession for Qwen36Session {
 
         let count = ctx.lora_count() as usize;
         self.ctx = Some(ctx);
-        self.weights = Some(weights);  // Keep alive — C++ holds raw pointers
+        self.weights = Some(weights); // Keep alive — C++ holds raw pointers
         self._nccl_ep = nccl_ep;
         self.lora_rank = req.rank;
         self.lora_alpha = req.alpha;
+        self.lora_target_layers = all_layers;
+        self.lora_target_modules = target_modules;
         self.lr = req.lr;
         self.state = SessionState::Ready {
             model_path: model_path.clone(),
@@ -391,7 +439,9 @@ impl TrainingSession for Qwen36Session {
 
         // Record metric
         if let Some(ref metrics) = self.metrics {
-            let mem_gb = rustrain_train::metrics::gpu_memory_allocated_mb().map(|m| m / 1024.0).unwrap_or(0.0);
+            let mem_gb = rustrain_train::metrics::gpu_memory_allocated_mb()
+                .map(|m| m / 1024.0)
+                .unwrap_or(0.0);
             metrics.record_step(StepMetric {
                 step: self.step,
                 loss,
@@ -401,21 +451,38 @@ impl TrainingSession for Qwen36Session {
             });
         }
 
-        Ok(TrainOutput { loss, step: self.step })
+        Ok(TrainOutput {
+            loss,
+            step: self.step,
+        })
     }
 
-    fn train_multi_lora(&mut self, input: TrainInput, n_total: i32, rank: i32) -> Result<TrainOutput> {
+    fn train_multi_lora(
+        &mut self,
+        input: TrainInput,
+        n_total: i32,
+        rank: i32,
+    ) -> Result<TrainOutput> {
         let ctx = self
             .ctx
             .as_ref()
             .ok_or_else(|| anyhow!("LoRA not initialized"))?;
 
-        let loss = ctx.train_multi_lora(&input.input_ids, &input.target_mask, &input.attention_mask, n_total, rank)?;
+        let loss = ctx.train_multi_lora(
+            &input.input_ids,
+            &input.target_mask,
+            &input.attention_mask,
+            n_total,
+            rank,
+        )?;
         self.step += 1;
         self.last_loss = loss;
         self.state = SessionState::Training { step: self.step };
 
-        Ok(TrainOutput { loss, step: self.step })
+        Ok(TrainOutput {
+            loss,
+            step: self.step,
+        })
     }
 
     fn eval_step(&self, input: TrainInput) -> Result<EvalOutput> {
@@ -432,6 +499,11 @@ impl TrainingSession for Qwen36Session {
             .ctx
             .as_ref()
             .ok_or_else(|| anyhow!("LoRA not initialized"))?;
+        if !self.dynamic_lora_configs.is_empty() {
+            bail!(
+                "checkpoint-v1 stores only the fixed adapter; export dynamic adapters individually before checkpointing"
+            );
+        }
 
         let lora_count = ctx.lora_count();
         let mut lora_a = Vec::new();
@@ -466,12 +538,23 @@ impl TrainingSession for Qwen36Session {
         let data = checkpoint::load_checkpoint(std::path::Path::new(path))?;
         // Import Adam optimizer state into C++ context
         if let Some(ctx) = &self.ctx {
+            if data.lora_a.len() != data.lora_b.len()
+                || data.lora_a.len() != ctx.lora_count() as usize
+            {
+                return Err(anyhow!(
+                    "checkpoint LoRA slot count mismatch: checkpoint A/B={}/{}, context={}",
+                    data.lora_a.len(),
+                    data.lora_b.len(),
+                    ctx.lora_count()
+                ));
+            }
+            for (index, (a, b)) in data.lora_a.iter().zip(&data.lora_b).enumerate() {
+                ctx.set_lora_tensor(index as i64, false, a)?;
+                ctx.set_lora_tensor(index as i64, true, b)?;
+            }
             if !data.adam_m.is_empty() && !data.adam_v.is_empty() {
                 ctx.import_optimizer_state(&data.adam_m, &data.adam_v)?;
-                tracing::info!(
-                    imported = data.adam_m.len(),
-                    "optimizer state imported"
-                );
+                tracing::info!(imported = data.adam_m.len(), "optimizer state imported");
             }
         }
         self.step = data.manifest.step;
@@ -479,54 +562,146 @@ impl TrainingSession for Qwen36Session {
         Ok((data.manifest.step, data.manifest.loss))
     }
 
-    fn export_adapter(&self, path: &str) -> Result<usize> {
+    fn export_adapter(&self, path: &str, adapter_id: Option<i64>) -> Result<usize> {
         let ctx = self
             .ctx
             .as_ref()
             .ok_or_else(|| anyhow!("LoRA not initialized"))?;
 
-        let count = ctx.lora_count() as usize;
-        let mut named_tensors: std::collections::BTreeMap<String, Tensor> =
-            std::collections::BTreeMap::new();
-        for i in 0..count {
-            if let (Some(a), Some(b)) = (ctx.get_lora_a(i as i64), ctx.get_lora_b(i as i64)) {
-                named_tensors.insert(
-                    format!("lora_a_{i}"),
-                    a.to_kind(Kind::Float).to_device(tch::Device::Cpu),
-                );
-                named_tensors.insert(
-                    format!("lora_b_{i}"),
-                    b.to_kind(Kind::Float).to_device(tch::Device::Cpu),
-                );
+        let model_path = self
+            .model_path
+            .as_ref()
+            .ok_or_else(|| anyhow!("model not loaded"))?;
+        let runtime_config =
+            rustrain_qwen3_6::config::read_qwen36_runtime_config(std::path::Path::new(model_path))?;
+        let adapter_id = adapter_id.unwrap_or(0);
+        let lora_config = if adapter_id == 0 {
+            Qwen36LoraConfig {
+                rank: self.lora_rank,
+                alpha: self.lora_alpha,
+                target_layers: self.lora_target_layers.clone(),
+                target_modules: self.lora_target_modules.clone(),
+            }
+        } else {
+            self.dynamic_lora_configs
+                .get(&adapter_id)
+                .cloned()
+                .ok_or_else(|| anyhow!("unknown dynamic LoRA adapter: {adapter_id}"))?
+        };
+        let slots = rustrain_qwen3_6::lora::native_lora_slots(&runtime_config, &lora_config);
+        let mut exported = Vec::with_capacity(slots.len());
+        for slot in slots {
+            if adapter_id == 0 {
+                let a = ctx
+                    .get_lora_a(slot.index as i64)
+                    .with_context(|| format!("native LoRA slot {} is missing A", slot.index))?;
+                let b = ctx
+                    .get_lora_b(slot.index as i64)
+                    .with_context(|| format!("native LoRA slot {} is missing B", slot.index))?;
+                exported.push((a, b));
+            } else if slot.active {
+                let module = slot.module.cpp_name();
+                let a = ctx
+                    .get_adapter_lora_tensor(adapter_id, slot.layer as i64, module, false)
+                    .with_context(|| {
+                        format!(
+                            "dynamic LoRA A is missing: adapter={adapter_id} layer={} module={module}",
+                            slot.layer
+                        )
+                    })?;
+                let b = ctx
+                    .get_adapter_lora_tensor(adapter_id, slot.layer as i64, module, true)
+                    .with_context(|| {
+                        format!(
+                            "dynamic LoRA B is missing: adapter={adapter_id} layer={} module={module}",
+                            slot.layer
+                        )
+                    })?;
+                exported.push((a, b));
+            } else {
+                let placeholder = Tensor::zeros([], (Kind::Float, Device::Cpu));
+                exported.push((placeholder.shallow_clone(), placeholder));
             }
         }
-
-        // Write safetensors
-        use std::io::Write;
-        let mut header = serde_json::Map::new();
-        let mut offset = 0u64;
-        let mut all_bytes: Vec<u8> = Vec::new();
-        for (name, t) in &named_tensors {
-            let t = t.contiguous().to_kind(Kind::Float);
-            let shape: Vec<i64> = t.size().iter().copied().collect();
-            let data: Vec<f32> = Vec::<f32>::try_from(&t.reshape([-1]))?;
-            let bytes: Vec<u8> = data.iter().flat_map(|f| f.to_le_bytes()).collect();
-            header.insert(
-                name.clone(),
-                serde_json::json!({"dtype":"F32","shape":shape,"data_offsets":[offset, offset + bytes.len() as u64]}),
-            );
-            offset += bytes.len() as u64;
-            all_bytes.extend_from_slice(&bytes);
-        }
-        let header_str = serde_json::to_string(&serde_json::Value::Object(header))?;
-        let file = std::fs::File::create(path)?;
-        let mut writer = std::io::BufWriter::new(file);
-        writer.write_all(&(header_str.len() as u64).to_le_bytes())?;
-        writer.write_all(header_str.as_bytes())?;
-        writer.write_all(&all_bytes)?;
-
+        let artifact = Qwen36AdapterArtifact::from_native_exports(
+            model_path,
+            "qwen3_hybrid_lora_sft",
+            Some(std::path::Path::new(model_path)),
+            &runtime_config,
+            &lora_config,
+            exported,
+        )?;
+        let count = artifact.tensors.len();
+        artifact.save(std::path::Path::new(path))?;
         tracing::info!(params = count, path, "adapter exported");
         Ok(count)
+    }
+
+    fn import_adapter(&mut self, path: &str) -> Result<i64> {
+        let model_path = self
+            .model_path
+            .as_ref()
+            .ok_or_else(|| anyhow!("model not loaded"))?
+            .clone();
+        let runtime_config = rustrain_qwen3_6::config::read_qwen36_runtime_config(
+            std::path::Path::new(&model_path),
+        )?;
+        let artifact = Qwen36AdapterArtifact::load(std::path::Path::new(path))?;
+        let target_modules = artifact
+            .config
+            .target_modules
+            .iter()
+            .map(|name| Qwen36LoraTargetModule::parse(name))
+            .collect::<Result<Vec<_>>>()?;
+        let target_layers = artifact.config.target_layers.clone();
+        let lora_config = Qwen36LoraConfig {
+            rank: artifact.config.r,
+            alpha: artifact.config.lora_alpha,
+            target_layers: target_layers.clone(),
+            target_modules: target_modules.clone(),
+        };
+        rustrain_qwen3_6::lora::validate_lora_targets(&runtime_config, &lora_config)?;
+
+        let ctx = self
+            .ctx
+            .as_ref()
+            .ok_or_else(|| anyhow!("LoRA not initialized"))?;
+        let layer_ids = target_layers
+            .iter()
+            .map(|&layer| layer as i64)
+            .collect::<Vec<_>>();
+        let module_csv = target_modules
+            .iter()
+            .map(Qwen36LoraTargetModule::cpp_name)
+            .collect::<Vec<_>>()
+            .join(",");
+        let adapter_id =
+            ctx.add_lora(lora_config.rank, lora_config.alpha, &layer_ids, &module_csv)?;
+
+        let load_result = (|| -> Result<()> {
+            for (name, tensor) in &artifact.tensors {
+                let (layer, module, is_b) =
+                    rustrain_qwen3_6::lora::parse_adapter_tensor_name(&runtime_config, name)?;
+                if layer >= runtime_config.num_hidden_layers {
+                    bail!("adapter tensor layer {layer} is outside the model");
+                }
+                ctx.set_adapter_lora_tensor(
+                    adapter_id,
+                    layer as i64,
+                    module.cpp_name(),
+                    is_b,
+                    tensor,
+                )?;
+            }
+            Ok(())
+        })();
+        if let Err(error) = load_result {
+            let _ = ctx.remove_lora(adapter_id);
+            return Err(error);
+        }
+        self.dynamic_lora_configs.insert(adapter_id, lora_config);
+        tracing::info!(adapter_id, path, "LoRA adapter imported");
+        Ok(adapter_id)
     }
 
     fn status(&self) -> SessionStatus {
@@ -558,7 +733,76 @@ impl TrainingSession for Qwen36Session {
             .ctx
             .as_ref()
             .ok_or_else(|| anyhow!("model not loaded — call load_model + init_lora first"))?;
-        let id = ctx.add_lora(req.rank, req.alpha, &req.target_layers, &req.target_modules)?;
+        let model_path = self
+            .model_path
+            .as_ref()
+            .ok_or_else(|| anyhow!("model not loaded"))?;
+        let runtime_config =
+            rustrain_qwen3_6::config::read_qwen36_runtime_config(std::path::Path::new(model_path))?;
+        let target_modules = if req.target_modules.trim().is_empty() {
+            let mut modules = std::collections::BTreeSet::new();
+            for layer_type in &runtime_config.layer_types {
+                match layer_type {
+                    rustrain_qwen3_6::config::LayerType::FullAttention => {
+                        modules.extend([
+                            Qwen36LoraTargetModule::QProj,
+                            Qwen36LoraTargetModule::KProj,
+                            Qwen36LoraTargetModule::VProj,
+                            Qwen36LoraTargetModule::OProj,
+                        ]);
+                    }
+                    rustrain_qwen3_6::config::LayerType::LinearAttention => {
+                        modules.extend([
+                            Qwen36LoraTargetModule::InProjQkv,
+                            Qwen36LoraTargetModule::InProjZ,
+                            Qwen36LoraTargetModule::InProjA,
+                            Qwen36LoraTargetModule::InProjB,
+                            Qwen36LoraTargetModule::OutProj,
+                        ]);
+                    }
+                }
+            }
+            if runtime_config.is_moe {
+                modules.extend([
+                    Qwen36LoraTargetModule::SharedGateProj,
+                    Qwen36LoraTargetModule::SharedUpProj,
+                    Qwen36LoraTargetModule::SharedDownProj,
+                    Qwen36LoraTargetModule::ExpertsGateUpProj,
+                    Qwen36LoraTargetModule::ExpertsDownProj,
+                ]);
+            } else {
+                modules.extend([
+                    Qwen36LoraTargetModule::GateProj,
+                    Qwen36LoraTargetModule::UpProj,
+                    Qwen36LoraTargetModule::DownProj,
+                ]);
+            }
+            modules.into_iter().collect()
+        } else {
+            req.target_modules
+                .split(',')
+                .filter(|name| !name.is_empty())
+                .map(Qwen36LoraTargetModule::parse)
+                .collect::<Result<Vec<_>>>()?
+        };
+        let config = Qwen36LoraConfig {
+            rank: req.rank,
+            alpha: req.alpha,
+            target_layers: req
+                .target_layers
+                .iter()
+                .map(|&layer| layer as usize)
+                .collect(),
+            target_modules: target_modules.clone(),
+        };
+        rustrain_qwen3_6::lora::validate_lora_targets(&runtime_config, &config)?;
+        let native_module_names = target_modules
+            .iter()
+            .map(Qwen36LoraTargetModule::cpp_name)
+            .collect::<Vec<_>>();
+        let module_csv = native_module_names.join(",");
+        let id = ctx.add_lora(req.rank, req.alpha, &req.target_layers, &module_csv)?;
+        self.dynamic_lora_configs.insert(id, config);
         tracing::info!(adapter_id = id, rank = req.rank, "LoRA adapter added");
         Ok(id)
     }
@@ -570,6 +814,7 @@ impl TrainingSession for Qwen36Session {
             .ok_or_else(|| anyhow!("model not loaded"))?;
         let removed = ctx.remove_lora(adapter_id)?;
         if removed {
+            self.dynamic_lora_configs.remove(&adapter_id);
             tracing::info!(adapter_id, "LoRA adapter removed");
         }
         Ok(removed)

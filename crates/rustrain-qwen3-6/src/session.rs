@@ -7,11 +7,15 @@ use anyhow::{Context, Result, anyhow, bail};
 use tch::{Kind, Tensor};
 use tracing::info;
 
-use crate::config::{read_qwen36_runtime_config, resolve_qwen36_model_path, Qwen36RuntimeConfig, LayerType};
-use crate::lora::{Qwen36LoraConfig, Qwen36LoraTargetModule};
+use crate::config::{
+    LayerType, Qwen36RuntimeConfig, read_qwen36_runtime_config, resolve_qwen36_model_path,
+};
+use crate::lora::{
+    Qwen36AdapterArtifact, Qwen36LoraConfig, Qwen36LoraTargetModule, validate_lora_targets,
+};
 use crate::sft::SftDataset;
+use rustrain_checkpoint::safetensors::read_safetensors_dir_filtered;
 use rustrain_core::runtime::{Config, RunPaths};
-use rustrain_checkpoint::safetensors::{read_safetensors_dir_filtered};
 
 // ──────────────────────────────────────────────────────────────────────
 // EP Shard
@@ -27,7 +31,10 @@ pub struct EpShard {
 
 impl EpShard {
     pub fn new(rank: usize, world_size: usize, num_experts: usize) -> Self {
-        assert!(num_experts % world_size == 0, "num_experts {num_experts} not divisible by world_size {world_size}");
+        assert!(
+            num_experts % world_size == 0,
+            "num_experts {num_experts} not divisible by world_size {world_size}"
+        );
         let epr = num_experts / world_size;
         let start = rank * epr;
         Self {
@@ -62,11 +69,17 @@ pub struct Qwen36LoraSftSummary {
 fn parse_env_usize(key: &str) -> Result<usize> {
     env::var(key)
         .with_context(|| format!("{key} not set"))
-        .and_then(|v| v.parse::<usize>().with_context(|| format!("invalid {key}: {v}")))
+        .and_then(|v| {
+            v.parse::<usize>()
+                .with_context(|| format!("invalid {key}: {v}"))
+        })
 }
 
 fn lora_config_from_config(config: &Config) -> Result<Qwen36LoraConfig> {
-    let lora = config.lora.as_ref().ok_or_else(|| anyhow!("[lora] section required"))?;
+    let lora = config
+        .lora
+        .as_ref()
+        .ok_or_else(|| anyhow!("[lora] section required"))?;
     let target_layers: Vec<usize> = lora.target_layers.clone();
     let target_modules: Vec<Qwen36LoraTargetModule> = lora
         .target_modules
@@ -116,7 +129,13 @@ fn build_needed_weights(
                 needed.insert(format!("{lp}.linear_attn.conv1d.weight"));
                 needed.insert(format!("{lp}.linear_attn.dt_bias"));
                 needed.insert(format!("{lp}.linear_attn.norm.weight"));
-                for w in &["in_proj_qkv", "in_proj_z", "in_proj_a", "in_proj_b", "out_proj"] {
+                for w in &[
+                    "in_proj_qkv",
+                    "in_proj_z",
+                    "in_proj_a",
+                    "in_proj_b",
+                    "out_proj",
+                ] {
                     needed.insert(format!("{lp}.linear_attn.{w}.weight"));
                 }
             }
@@ -172,7 +191,10 @@ pub fn train_qwen3_6_lora_sft_ep(
     let rank = parse_env_usize("RANK")?;
     let world_size = parse_env_usize("WORLD_SIZE")?;
     // For MoE models, shard experts. For dense models, EP is a no-op (no experts to shard).
-    let model_path = config.model.model_path.as_ref()
+    let model_path = config
+        .model
+        .model_path
+        .as_ref()
         .ok_or_else(|| anyhow!("model.model_path required"))?;
     let model_path = resolve_qwen36_model_path(model_path)?;
     let runtime_config = read_qwen36_runtime_config(&model_path)?;
@@ -193,11 +215,15 @@ fn train_impl(
     run_paths: &RunPaths,
     ep_shard: Option<EpShard>,
 ) -> Result<Qwen36LoraSftSummary> {
-    let model_path = config.model.model_path.as_ref()
+    let model_path = config
+        .model
+        .model_path
+        .as_ref()
         .ok_or_else(|| anyhow!("model.model_path required"))?;
     let model_path = resolve_qwen36_model_path(model_path)?;
     let runtime_config = read_qwen36_runtime_config(&model_path)?;
     let lora_config = lora_config_from_config(config)?;
+    validate_lora_targets(&runtime_config, &lora_config)?;
     let device = match config.train.device {
         rustrain_core::runtime::Device::Cuda => {
             // EP mode: use LOCAL_RANK to select the correct GPU
@@ -214,6 +240,12 @@ fn train_impl(
         rustrain_core::runtime::DType::Bf16 => Kind::BFloat16,
         rustrain_core::runtime::DType::Fp32 => Kind::Float,
     };
+    if compute_kind != Kind::BFloat16 {
+        bail!(
+            "native Qwen3.5/3.6 LoRA currently supports bf16 only; {:?} would not be updated by the fused Adam kernel",
+            config.train.dtype
+        );
+    }
 
     let shard_ref = ep_shard.as_ref();
     let is_ep = shard_ref.is_some();
@@ -228,7 +260,11 @@ fn train_impl(
         std::thread::sleep(std::time::Duration::from_secs(rank as u64 * 5));
     }
 
-    info!("loading {} weight tensors from {}", needed.len(), model_path.display());
+    info!(
+        "loading {} weight tensors from {}",
+        needed.len(),
+        model_path.display()
+    );
     let weights = read_safetensors_dir_filtered(&model_path, &needed)?;
 
     // Move to device — for EP, narrow expert tensors on CPU first to save GPU memory
@@ -256,14 +292,20 @@ fn train_impl(
                 weights_gpu.insert(name.clone(), tensor.to_device(device).to_kind(compute_kind));
             }
         }
-        info!("EP{}: narrowed expert tensors to {} experts per rank", world_size, shard.experts_per_rank);
+        info!(
+            "EP{}: narrowed expert tensors to {} experts per rank",
+            world_size, shard.experts_per_rank
+        );
     } else {
         for (name, tensor) in &weights {
             weights_gpu.insert(name.clone(), tensor.to_device(device).to_kind(compute_kind));
         }
     }
 
-    info!("LoRA config: rank={}, alpha={}", lora_config.rank, lora_config.alpha);
+    info!(
+        "LoRA config: rank={}, alpha={}",
+        lora_config.rank, lora_config.alpha
+    );
 
     // Load SFT data
     let tokenizer_path = model_path.join("tokenizer.json");
@@ -294,18 +336,23 @@ fn train_impl(
     // ── C++ all-in-C++ training path (required) ──
     // LoRA A/B, Adam optimizer, forward, loss, backward all in C++.
     if !crate::kernel::kernels_available() {
-        bail!("C++ kernels (libqwen36_kernels.so) not found — required for training. Ensure the .so is in LD_LIBRARY_PATH.");
+        bail!(
+            "C++ kernels (libqwen36_kernels.so) not found — required for training. Ensure the .so is in LD_LIBRARY_PATH."
+        );
     }
 
     let ctx = crate::kernel::CppTrainingContext::new(
-        &weights_gpu, &runtime_config, compute_kind,
+        &weights_gpu,
+        &runtime_config,
+        compute_kind,
         config.train.learning_rate as f64,
         config.train.adam_beta1 as f64,
         config.train.adam_beta2 as f64,
         config.train.adam_eps as f64,
-        lora_config.alpha as f64 / lora_config.rank as f64,  // lora scaling = alpha / rank
+        lora_config.alpha as f64 / lora_config.rank as f64, // lora scaling = alpha / rank
         lora_config.rank as i64,
         &lora_config.target_layers,
+        &lora_config.target_modules,
         shard_ref.map(|s| s.expert_start).unwrap_or(0),
         shard_ref.map(|s| s.experts_per_rank).unwrap_or(0),
     )?;
@@ -314,11 +361,15 @@ fn train_impl(
     // Set MTP weights if available
     if runtime_config.mtp_num_hidden_layers > 0 {
         ctx.set_mtp_weights(
-            &weights_gpu, &runtime_config,
+            &weights_gpu,
+            &runtime_config,
             shard_ref.map(|s| s.expert_start).unwrap_or(0),
             shard_ref.map(|s| s.experts_per_rank).unwrap_or(0),
         )?;
-        info!("C++ TrainingContext: MTP weights set ({} layers)", runtime_config.mtp_num_hidden_layers);
+        info!(
+            "C++ TrainingContext: MTP weights set ({} layers)",
+            runtime_config.mtp_num_hidden_layers
+        );
     }
 
     // Enable gradient checkpointing if env var set
@@ -349,53 +400,47 @@ fn train_impl(
         // but padding also has mask=0, we can't distinguish prompt from padding using mask alone.
         // Solution: use the pad_token_id to build attention mask from input_ids.
         let pad_id = data.pad_token_id();
-        let attention_mask = input_ids.ne(pad_id).to_kind(Kind::Float).unsqueeze(0);  // [1, seq]
+        let attention_mask = input_ids.ne(pad_id).to_kind(Kind::Float).unsqueeze(0); // [1, seq]
 
         // C++ all-in-C++ path: single call does forward + loss + backward + Adam
         let loss_value = ctx.train_step(&input_ids, &target_mask, &attention_mask)?;
-        if step == 0 { initial_loss = loss_value; }
+        if step == 0 {
+            initial_loss = loss_value;
+        }
         final_loss = loss_value;
         if step % 10 == 0 || step == max_steps - 1 {
             info!("step {step}/{max_steps} loss={loss_value:.6}");
         }
     }
 
-    // Save adapter — export LoRA A/B from C++ to safetensors
-    let adapter_path = run_paths.root.join("adapter.safetensors");
-    {
-        let mut named_tensors: BTreeMap<String, Tensor> = BTreeMap::new();
-        for i in 0..ctx.lora_count() {
-            if let (Some(a), Some(b)) = (ctx.get_lora_a(i), ctx.get_lora_b(i)) {
-                named_tensors.insert(format!("lora_a_{i}"), a.to_kind(Kind::Float).to_device(tch::Device::Cpu));
-                named_tensors.insert(format!("lora_b_{i}"), b.to_kind(Kind::Float).to_device(tch::Device::Cpu));
-            }
-        }
-        use std::io::Write;
-        let mut tensors_data = Vec::new();
-        let mut header = serde_json::Map::new();
-        let mut offset = 0u64;
-        for (name, tensor) in &named_tensors {
-            let t = tensor.contiguous().to_kind(Kind::Float);
-            let shape: Vec<i64> = t.size().iter().copied().collect();
-            let data: Vec<f32> = Vec::<f32>::try_from(&t.reshape([-1]))?;
-            let bytes: Vec<u8> = data.iter().flat_map(|f| f.to_le_bytes()).collect();
-            header.insert(name.clone(), serde_json::json!({"dtype":"F32","shape":shape,"data_offsets":[offset,offset+bytes.len() as u64]}));
-            offset += bytes.len() as u64;
-            tensors_data.push(bytes);
-        }
-        let header_str = serde_json::to_string(&serde_json::Value::Object(header))?;
-        let file = std::fs::File::create(&adapter_path).with_context(|| format!("create {}", adapter_path.display()))?;
-        let mut writer = std::io::BufWriter::new(file);
-        writer.write_all(&(header_str.len() as u64).to_le_bytes())?;
-        writer.write_all(header_str.as_bytes())?;
-        for data in &tensors_data { writer.write_all(data)?; }
-        info!("saved adapter to {}", adapter_path.display());
+    // Export every positional native slot, then let the artifact mapper omit
+    // inactive slots and assign stable projection-aware tensor names.
+    let mut exported = Vec::with_capacity(ctx.lora_count() as usize);
+    for index in 0..ctx.lora_count() {
+        let a = ctx
+            .get_lora_a(index)
+            .with_context(|| format!("native LoRA slot {index} is missing A"))?;
+        let b = ctx
+            .get_lora_b(index)
+            .with_context(|| format!("native LoRA slot {index} is missing B"))?;
+        exported.push((a, b));
     }
+    let artifact = Qwen36AdapterArtifact::from_native_exports(
+        &config.model.name,
+        &config.model.architecture,
+        Some(&model_path),
+        &runtime_config,
+        &lora_config,
+        exported,
+    )?;
+    let trainable_params = artifact.tensors.len();
+    let adapter_path = artifact.save(&run_paths.root)?;
+    info!("saved adapter to {}", adapter_path.display());
 
     Ok(Qwen36LoraSftSummary {
         adapter_output: adapter_path.to_string_lossy().to_string(),
         initial_loss,
         final_loss,
-        trainable_params: ctx.lora_count() as usize * 2,
+        trainable_params,
     })
 }

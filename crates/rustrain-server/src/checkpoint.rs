@@ -12,7 +12,7 @@ pub struct CheckpointManifest {
     pub loss: f64,
     pub model_path: String,
     pub lora_rank: i64,
-    pub lora_alpha: i64,
+    pub lora_alpha: f64,
     pub files: Vec<String>,
 }
 
@@ -32,7 +32,7 @@ pub fn save_checkpoint(
     loss: f64,
     model_path: &str,
     lora_rank: i64,
-    lora_alpha: i64,
+    lora_alpha: f64,
     lora_a: &[Tensor],
     lora_b: &[Tensor],
     adam_m: &[Tensor],
@@ -64,7 +64,8 @@ pub fn save_checkpoint(
         .with_context(|| "write manifest.json")?;
 
     tracing::info!(
-        step, loss,
+        step,
+        loss,
         path = dir.display().to_string(),
         "checkpoint saved"
     );
@@ -102,102 +103,89 @@ pub fn load_checkpoint(dir: &Path) -> Result<CheckpointData> {
 }
 
 fn save_tensors(path: &Path, a: &[Tensor], b: &[Tensor]) -> Result<()> {
-    use std::io::Write;
     let mut named: Vec<(String, Tensor)> = Vec::new();
     for (i, t) in a.iter().enumerate() {
-        named.push((format!("a_{i}"), t.to_kind(tch::Kind::Float).to_device(tch::Device::Cpu)));
+        named.push((
+            format!("a_{i}"),
+            t.to_kind(tch::Kind::Float).to_device(tch::Device::Cpu),
+        ));
     }
     for (i, t) in b.iter().enumerate() {
-        named.push((format!("b_{i}"), t.to_kind(tch::Kind::Float).to_device(tch::Device::Cpu)));
+        named.push((
+            format!("b_{i}"),
+            t.to_kind(tch::Kind::Float).to_device(tch::Device::Cpu),
+        ));
     }
 
-    // Build safetensors manually (header + data)
-    let mut header = serde_json::Map::new();
-    let mut offset = 0u64;
-    let mut all_bytes: Vec<u8> = Vec::new();
-    for (name, t) in &named {
-        let t = t.contiguous().to_kind(tch::Kind::Float);
-        let shape: Vec<i64> = t.size().iter().copied().collect();
-        let data: Vec<f32> = Vec::<f32>::try_from(&t.reshape([-1]))?;
-        let bytes: Vec<u8> = data.iter().flat_map(|f| f.to_le_bytes()).collect();
-        header.insert(
-            name.clone(),
-            serde_json::json!({"dtype":"F32","shape":shape,"data_offsets":[offset, offset + bytes.len() as u64]}),
-        );
-        offset += bytes.len() as u64;
-        all_bytes.extend_from_slice(&bytes);
-    }
-    let header_str = serde_json::to_string(&serde_json::Value::Object(header))?;
-    let file = std::fs::File::create(path).with_context(|| format!("create {}", path.display()))?;
-    let mut writer = std::io::BufWriter::new(file);
-    writer.write_all(&(header_str.len() as u64).to_le_bytes())?;
-    writer.write_all(header_str.as_bytes())?;
-    writer.write_all(&all_bytes)?;
+    Tensor::write_safetensors(&named, path).with_context(|| format!("write {}", path.display()))?;
     Ok(())
 }
 
 fn load_tensors(path: &Path) -> Result<(Vec<Tensor>, Vec<Tensor>)> {
-    let data = std::fs::read(path).with_context(|| format!("read {}", path.display()))?;
-    if data.len() < 8 {
-        anyhow::bail!("safetensors file too small");
+    let named =
+        Tensor::read_safetensors(path).with_context(|| format!("read {}", path.display()))?;
+    let mut by_name = std::collections::BTreeMap::new();
+    for (name, tensor) in named {
+        by_name.insert(name, tensor);
     }
-    let header_len = u64::from_le_bytes(data[..8].try_into().unwrap()) as usize;
-    let header_str = std::str::from_utf8(&data[8..8 + header_len])?;
-    let header: serde_json::Value = serde_json::from_str(header_str)?;
-
-    // Count a_N and b_N entries
-    let mut a_count = 0;
-    let mut b_count = 0;
-    if let serde_json::Value::Object(map) = &header {
-        for key in map.keys() {
-            if key.starts_with("a_") {
-                a_count += 1;
-            } else if key.starts_with("b_") {
-                b_count += 1;
+    fn collect_side(
+        tensors: &std::collections::BTreeMap<String, Tensor>,
+        prefix: &str,
+    ) -> Result<Vec<Tensor>> {
+        let mut indices = tensors
+            .keys()
+            .filter_map(|name| name.strip_prefix(prefix)?.parse::<usize>().ok())
+            .collect::<Vec<_>>();
+        indices.sort_unstable();
+        let mut result = Vec::with_capacity(indices.len());
+        for (expected, index) in indices.into_iter().enumerate() {
+            if index != expected {
+                anyhow::bail!("checkpoint tensor indices for {prefix} are not contiguous");
             }
+            result.push(
+                tensors
+                    .get(&format!("{prefix}{index}"))
+                    .expect("index collected from map")
+                    .shallow_clone(),
+            );
         }
+        Ok(result)
     }
-
-    let mut a_tensors = Vec::new();
-    let mut b_tensors = Vec::new();
-
-    for i in 0..a_count {
-        let key = format!("a_{i}");
-        let (tensor, shape) = load_one_tensor(&header, &key, &data, 8 + header_len)?;
-        a_tensors.push(tensor.reshape(&shape));
-    }
-    for i in 0..b_count {
-        let key = format!("b_{i}");
-        let (tensor, shape) = load_one_tensor(&header, &key, &data, 8 + header_len)?;
-        b_tensors.push(tensor.reshape(&shape));
-    }
-
-    Ok((a_tensors, b_tensors))
+    Ok((collect_side(&by_name, "a_")?, collect_side(&by_name, "b_")?))
 }
 
-fn load_one_tensor(
-    header: &serde_json::Value,
-    key: &str,
-    data: &[u8],
-    data_offset: usize,
-) -> Result<(Tensor, Vec<i64>)> {
-    let entry = header
-        .get(key)
-        .ok_or_else(|| anyhow::anyhow!("key {key} not found in safetensors"))?;
-    let shape: Vec<i64> = entry["shape"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|v| v.as_i64().unwrap())
-        .collect();
-    let offsets = entry["data_offsets"].as_array().unwrap();
-    let start = data_offset + offsets[0].as_u64().unwrap() as usize;
-    let end = data_offset + offsets[1].as_u64().unwrap() as usize;
-    let bytes = &data[start..end];
-    let floats: Vec<f32> = bytes
-        .chunks_exact(4)
-        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-        .collect();
-    let tensor = Tensor::from_slice(&floats);
-    Ok((tensor, shape))
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn checkpoint_adapter_and_optimizer_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = Tensor::arange(6, (tch::Kind::Float, tch::Device::Cpu)).reshape([2, 3]);
+        let b = Tensor::arange(8, (tch::Kind::Float, tch::Device::Cpu)).reshape([4, 2]);
+        let m = Tensor::ones([2, 3], (tch::Kind::Float, tch::Device::Cpu));
+        let v = Tensor::full([4, 2], 2.0, (tch::Kind::Float, tch::Device::Cpu));
+        save_checkpoint(
+            dir.path(),
+            7,
+            1.25,
+            "Qwen/test",
+            2,
+            4.0,
+            &[a.shallow_clone()],
+            &[b.shallow_clone()],
+            &[m.shallow_clone()],
+            &[v.shallow_clone()],
+        )
+        .unwrap();
+        let loaded = load_checkpoint(dir.path()).unwrap();
+        assert_eq!(loaded.manifest.lora_alpha, 4.0);
+        assert_eq!(loaded.manifest.step, 7);
+        assert_eq!(loaded.lora_a[0].size(), [2, 3]);
+        assert_eq!(loaded.lora_b[0].size(), [4, 2]);
+        assert!(loaded.lora_a[0].allclose(&a, 1e-6, 1e-6, false));
+        assert!(loaded.lora_b[0].allclose(&b, 1e-6, 1e-6, false));
+        assert!(loaded.adam_m[0].allclose(&m, 1e-6, 1e-6, false));
+        assert!(loaded.adam_v[0].allclose(&v, 1e-6, 1e-6, false));
+    }
 }

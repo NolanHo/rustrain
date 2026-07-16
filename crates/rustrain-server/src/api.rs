@@ -1,11 +1,11 @@
 //! HTTP API (axum) — RESTful endpoints for training session management.
 
 use axum::{
+    Json, Router,
     extract::{Path, State},
     http::StatusCode,
     response::sse::{Event, KeepAlive, Sse},
     routing::{get, post},
-    Json, Router,
 };
 use futures::stream::{self, Stream};
 use serde::{Deserialize, Serialize};
@@ -39,6 +39,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/v1/sessions/{id}/save_checkpoint", post(save_checkpoint))
         .route("/v1/sessions/{id}/load_checkpoint", post(load_checkpoint))
         .route("/v1/sessions/{id}/export_adapter", post(export_adapter))
+        .route("/v1/sessions/{id}/import_adapter", post(import_adapter))
         .route("/v1/sessions/{id}/add_lora", post(add_lora))
         .route("/v1/sessions/{id}/remove_lora", post(remove_lora))
         .route("/v1/sessions/{id}/list_lora", get(list_lora))
@@ -55,7 +56,9 @@ struct ErrorResponse {
 fn err_resp(msg: &str) -> (StatusCode, Json<ErrorResponse>) {
     (
         StatusCode::BAD_REQUEST,
-        Json(ErrorResponse { error: msg.to_string() }),
+        Json(ErrorResponse {
+            error: msg.to_string(),
+        }),
     )
 }
 
@@ -76,7 +79,11 @@ async fn delete_session(
     State(state): State<Arc<AppState>>,
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
-    state.manager.delete_session(&id).await.map_err(|e| err_resp(&e))?;
+    state
+        .manager
+        .delete_session(&id)
+        .await
+        .map_err(|e| err_resp(&e))?;
     Ok(Json(serde_json::json!({"deleted": id})))
 }
 
@@ -89,9 +96,7 @@ struct CreateSessionResponse {
     session_id: String,
 }
 
-async fn list_sessions(
-    State(state): State<Arc<AppState>>,
-) -> Json<Vec<String>> {
+async fn list_sessions(State(state): State<Arc<AppState>>) -> Json<Vec<String>> {
     Json(state.manager.list_sessions().await)
 }
 
@@ -181,7 +186,7 @@ async fn init_lora(
 #[derive(Deserialize)]
 struct InitLoRAHttp {
     rank: i64,
-    alpha: i64,
+    alpha: f64,
     target_layers: Vec<usize>,
     target_modules: Vec<String>,
     lr: f64,
@@ -204,12 +209,9 @@ async fn train_step(
         .get_session(&id)
         .await
         .ok_or_else(|| err_resp("session not found"))?;
-    let input_ids = decode_tensor(&req.input_ids)
-        .map_err(|e| err_resp(&e))?;
-    let target_mask = decode_tensor(&req.target_mask)
-        .map_err(|e| err_resp(&e))?;
-    let attention_mask = decode_tensor(&req.attention_mask)
-        .map_err(|e| err_resp(&e))?;
+    let input_ids = decode_tensor(&req.input_ids).map_err(|e| err_resp(&e))?;
+    let target_mask = decode_tensor(&req.target_mask).map_err(|e| err_resp(&e))?;
+    let attention_mask = decode_tensor(&req.attention_mask).map_err(|e| err_resp(&e))?;
 
     let mut s = session.lock().await;
     let result = s
@@ -254,18 +256,73 @@ struct TrainStepResponse {
 
 /// Decode a base64-encoded int64 tensor to Vec<i64> (for EP IPC).
 fn decode_int64_vec(t: &TensorHttp) -> Result<Vec<i64>, String> {
-    use base64::{engine::general_purpose, Engine};
+    use base64::{Engine, engine::general_purpose};
     let bytes = general_purpose::STANDARD
         .decode(&t.data)
         .map_err(|e| format!("base64 decode: {e}"))?;
-    Ok(bytes
+    let values = bytes
         .chunks_exact(8)
         .map(|c| i64::from_le_bytes([c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]]))
-        .collect())
+        .collect::<Vec<_>>();
+    let expected = t
+        .shape
+        .iter()
+        .try_fold(1usize, |acc, dim| {
+            usize::try_from(*dim)
+                .ok()
+                .and_then(|dim| acc.checked_mul(dim))
+        })
+        .ok_or_else(|| format!("invalid tensor shape {:?}", t.shape))?;
+    if expected != values.len() {
+        return Err(format!(
+            "tensor shape {:?} expects {} int64 values, got {}",
+            t.shape,
+            expected,
+            values.len()
+        ));
+    }
+    Ok(values)
+}
+
+fn validate_multi_lora_http_shapes(
+    input_ids: &TensorHttp,
+    target_mask: &TensorHttp,
+    attention_mask: &TensorHttp,
+    n_total: i32,
+) -> Result<usize, String> {
+    if n_total <= 0 {
+        return Err(format!("n_total must be positive, got {n_total}"));
+    }
+    if input_ids.shape.len() != 1 && input_ids.shape.len() != 2 {
+        return Err(format!("input_ids must have shape [seq] or [batch, seq], got {:?}", input_ids.shape));
+    }
+    if target_mask.shape != input_ids.shape || attention_mask.shape != input_ids.shape {
+        return Err(format!(
+            "multi-LoRA masks must have the same shape as input_ids: input={:?} target={:?} attention={:?}",
+            input_ids.shape, target_mask.shape, attention_mask.shape
+        ));
+    }
+    let seq_len = *input_ids
+        .shape
+        .last()
+        .ok_or_else(|| "input_ids shape is empty".to_string())?;
+    if seq_len <= 0 {
+        return Err(format!("sequence length must be positive, got {seq_len}"));
+    }
+    if input_ids.shape.len() == 2 {
+        let batch = input_ids.shape[0];
+        if batch != 1 && batch != i64::from(n_total) {
+            return Err(format!(
+                "multi-LoRA batch must be 1 or n_total={}, got {}",
+                n_total, batch
+            ));
+        }
+    }
+    usize::try_from(seq_len).map_err(|_| format!("invalid sequence length {seq_len}"))
 }
 
 fn decode_tensor(t: &TensorHttp) -> Result<tch::Tensor, String> {
-    use base64::{engine::general_purpose, Engine};
+    use base64::{Engine, engine::general_purpose};
     let bytes = general_purpose::STANDARD
         .decode(&t.data)
         .map_err(|e| format!("base64 decode: {e}"))?;
@@ -293,8 +350,13 @@ fn decode_tensor(t: &TensorHttp) -> Result<tch::Tensor, String> {
         }
         _ => return Err("only int64 and float32 supported via HTTP".into()),
     };
-    let local_rank = std::env::var("LOCAL_RANK").ok().and_then(|s| s.parse::<usize>().ok()).unwrap_or(0);
-    Ok(tensor.reshape(&t.shape).to_device(tch::Device::Cuda(local_rank)))
+    let local_rank = std::env::var("LOCAL_RANK")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(0);
+    Ok(tensor
+        .reshape(&t.shape)
+        .to_device(tch::Device::Cuda(local_rank)))
 }
 
 async fn eval_step(
@@ -381,6 +443,8 @@ async fn load_checkpoint(
 #[derive(Deserialize)]
 struct ExportHttp {
     path: String,
+    #[serde(default)]
+    adapter_id: Option<i64>,
 }
 #[derive(Serialize)]
 struct ExportResponse {
@@ -400,12 +464,39 @@ async fn export_adapter(
         .ok_or_else(|| err_resp("session not found"))?;
     let s = session.lock().await;
     let count = s
-        .export_adapter(&req.path)
+        .export_adapter(&req.path, req.adapter_id)
         .map_err(|e| err_resp(&e.to_string()))?;
     Ok(Json(ExportResponse {
         path: req.path,
         param_count: count,
     }))
+}
+
+#[derive(Deserialize)]
+struct ImportHttp {
+    path: String,
+}
+
+#[derive(Serialize)]
+struct ImportResponse {
+    adapter_id: i64,
+}
+
+async fn import_adapter(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(req): Json<ImportHttp>,
+) -> Result<Json<ImportResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let session = state
+        .manager
+        .get_session(&id)
+        .await
+        .ok_or_else(|| err_resp("session not found"))?;
+    let mut s = session.lock().await;
+    let adapter_id = s
+        .import_adapter(&req.path)
+        .map_err(|e| err_resp(&e.to_string()))?;
+    Ok(Json(ImportResponse { adapter_id }))
 }
 
 async fn get_status(
@@ -522,13 +613,15 @@ async fn stream_metrics(
     drop(s);
 
     let stream = stream::iter(metrics.into_iter().map(|m| {
-        Ok(Event::default().json_data(StepMetricJson {
-            step: m.step,
-            loss: m.loss,
-            lr: m.lr,
-            mem_gb: m.mem_gb,
-            timestamp_unix: m.timestamp_unix,
-        }).unwrap_or_default())
+        Ok(Event::default()
+            .json_data(StepMetricJson {
+                step: m.step,
+                loss: m.loss,
+                lr: m.lr,
+                mem_gb: m.mem_gb,
+                timestamp_unix: m.timestamp_unix,
+            })
+            .unwrap_or_default())
     }));
 
     Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
@@ -550,7 +643,10 @@ struct StepMetricJson {
 pub fn ep_router(state: Arc<EpAppState>) -> Router {
     Router::new()
         .route("/v1/sessions", post(ep_create_session))
-        .route("/v1/sessions/{id}", axum::routing::delete(ep_delete_session))
+        .route(
+            "/v1/sessions/{id}",
+            axum::routing::delete(ep_delete_session),
+        )
         .route("/v1/sessions/{id}/load_model", post(ep_load_model))
         .route("/v1/sessions/{id}/load_dataset", post(ep_load_dataset))
         .route("/v1/sessions/{id}/init_lora", post(ep_init_lora))
@@ -575,9 +671,13 @@ async fn ep_create_session(
     State(state): State<Arc<EpAppState>>,
     Json(req): Json<CreateSessionRequest>,
 ) -> Result<Json<CreateSessionResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let cmd = rustrain_ipc::EpCommand::CreateSession { session_id: req.session_id.clone() };
+    let cmd = rustrain_ipc::EpCommand::CreateSession {
+        session_id: req.session_id.clone(),
+    };
     match state.coordinator.dispatch(&cmd) {
-        rustrain_ipc::EpResult::Ok => Ok(Json(CreateSessionResponse { session_id: req.session_id })),
+        rustrain_ipc::EpResult::Ok => Ok(Json(CreateSessionResponse {
+            session_id: req.session_id,
+        })),
         rustrain_ipc::EpResult::Error(e) => Err(err_resp(&e)),
         _ => Err(err_resp("unexpected result")),
     }
@@ -587,7 +687,9 @@ async fn ep_delete_session(
     State(state): State<Arc<EpAppState>>,
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
-    let cmd = rustrain_ipc::EpCommand::DeleteSession { session_id: id.clone() };
+    let cmd = rustrain_ipc::EpCommand::DeleteSession {
+        session_id: id.clone(),
+    };
     match state.coordinator.dispatch(&cmd) {
         rustrain_ipc::EpResult::Ok => Ok(Json(serde_json::json!({"deleted": id}))),
         rustrain_ipc::EpResult::Error(e) => Err(err_resp(&e)),
@@ -708,7 +810,13 @@ async fn ep_train_multi_lora(
     let input_ids = decode_int64_vec(&req.input_ids).map_err(|e| err_resp(&e))?;
     let target_mask = decode_int64_vec(&req.target_mask).map_err(|e| err_resp(&e))?;
     let attention_mask = decode_int64_vec(&req.attention_mask).map_err(|e| err_resp(&e))?;
-    let seq_len = input_ids.len();
+    let seq_len = validate_multi_lora_http_shapes(
+        &req.input_ids,
+        &req.target_mask,
+        &req.attention_mask,
+        req.n_total,
+    )
+    .map_err(|e| err_resp(&e))?;
 
     let cmd = rustrain_ipc::EpCommand::TrainMultiLora {
         session_id: id,
@@ -779,7 +887,10 @@ async fn ep_remove_lora(
     Path(id): Path<String>,
     Json(req): Json<RemoveLoRAHttp>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
-    let cmd = rustrain_ipc::EpCommand::RemoveLora { session_id: id, adapter_id: req.adapter_id };
+    let cmd = rustrain_ipc::EpCommand::RemoveLora {
+        session_id: id,
+        adapter_id: req.adapter_id,
+    };
     match state.coordinator.dispatch(&cmd) {
         rustrain_ipc::EpResult::Ok => Ok(Json(serde_json::json!({"removed": true}))),
         rustrain_ipc::EpResult::Error(e) => Err(err_resp(&e)),
@@ -804,7 +915,11 @@ async fn ep_export_adapter(
     Path(id): Path<String>,
     Json(req): Json<ExportHttp>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
-    let cmd = rustrain_ipc::EpCommand::ExportAdapter { session_id: id, path: req.path };
+    let cmd = rustrain_ipc::EpCommand::ExportAdapter {
+        session_id: id,
+        path: req.path,
+        adapter_id: req.adapter_id,
+    };
     match state.coordinator.dispatch(&cmd) {
         rustrain_ipc::EpResult::Count(n) => Ok(Json(serde_json::json!({"exported": n}))),
         rustrain_ipc::EpResult::Error(e) => Err(err_resp(&e)),
@@ -818,9 +933,17 @@ async fn ep_get_status(
 ) -> Result<Json<StatusResponse>, (StatusCode, Json<ErrorResponse>)> {
     let cmd = rustrain_ipc::EpCommand::Status { session_id: id };
     match state.coordinator.dispatch(&cmd) {
-        rustrain_ipc::EpResult::Status { state, step, last_loss, model_path } => {
-            Ok(Json(StatusResponse { state, step, last_loss, model_path }))
-        }
+        rustrain_ipc::EpResult::Status {
+            state,
+            step,
+            last_loss,
+            model_path,
+        } => Ok(Json(StatusResponse {
+            state,
+            step,
+            last_loss,
+            model_path,
+        })),
         rustrain_ipc::EpResult::Error(e) => Err(err_resp(&e)),
         _ => Err(err_resp("unexpected result")),
     }

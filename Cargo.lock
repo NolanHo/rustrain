@@ -2504,6 +2504,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tch",
+ "tempfile",
  "tokenizers",
  "tokio",
  "tokio-stream",

@@ -3,8 +3,12 @@ use serde::{Deserialize, Serialize};
 /// Commands that the HTTP server can send to workers.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum EpCommand {
-    CreateSession { session_id: String },
-    DeleteSession { session_id: String },
+    CreateSession {
+        session_id: String,
+    },
+    DeleteSession {
+        session_id: String,
+    },
     LoadModel {
         session_id: String,
         model_path: String,
@@ -18,7 +22,7 @@ pub enum EpCommand {
     InitLora {
         session_id: String,
         rank: i64,
-        alpha: i64,
+        alpha: f64,
         target_layers: Vec<usize>,
         target_modules: Vec<String>,
         lr: f64,
@@ -45,7 +49,9 @@ pub enum EpCommand {
         session_id: String,
         adapter_id: i64,
     },
-    ListLora { session_id: String },
+    ListLora {
+        session_id: String,
+    },
     TrainStep {
         session_id: String,
         input_ids: Vec<i64>,
@@ -72,8 +78,11 @@ pub enum EpCommand {
     ExportAdapter {
         session_id: String,
         path: String,
+        adapter_id: Option<i64>,
     },
-    Status { session_id: String },
+    Status {
+        session_id: String,
+    },
     Shutdown,
 }
 

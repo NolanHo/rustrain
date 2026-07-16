@@ -55,6 +55,7 @@ impl EpCoordinator {
                 .env("RANK", rank.to_string())
                 .env("WORLD_SIZE", world_size.to_string())
                 .env("LOCAL_RANK", rank.to_string())
+                .env("RUSTRAIN_NCCL_RUN_ID", &shm_name)
                 .env("QWEN36_LOSS_DIAG", std::env::var("QWEN36_LOSS_DIAG").unwrap_or_default())
                 .env("QWEN36_GROUP_SIZE", std::env::var("QWEN36_GROUP_SIZE").unwrap_or_default())
                 .env("QWEN36_FUSED_CE", std::env::var("QWEN36_FUSED_CE").unwrap_or_default())
@@ -263,9 +264,30 @@ fn execute_command(session: &mut Qwen36Session, cmd: &EpCommand) -> EpResult {
         }
         EpCommand::TrainMultiLora { input_ids, target_mask, attention_mask, seq_len, n_total, lora_rank, .. } => {
             let sl = *seq_len as i64;
-            let input_ids_tensor = tch::Tensor::from_slice(input_ids).reshape(&[1, sl]).to_device(session.device());
-            let target_mask_tensor = tch::Tensor::from_slice(target_mask).reshape(&[1, sl]).to_device(session.device());
-            let attention_mask_tensor = tch::Tensor::from_slice(attention_mask).reshape(&[1, sl]).to_device(session.device());
+            let batch = if *n_total > 0
+                && input_ids.len() == (*n_total as usize).saturating_mul(*seq_len)
+            {
+                *n_total as i64
+            } else if input_ids.len() == *seq_len {
+                1
+            } else {
+                return EpResult::Error(format!(
+                    "multi-LoRA input length {} is incompatible with n_total={} seq_len={}",
+                    input_ids.len(), n_total, seq_len
+                ));
+            };
+            let expected = (batch as usize).saturating_mul(*seq_len);
+            if target_mask.len() != expected || attention_mask.len() != expected {
+                return EpResult::Error(format!(
+                    "multi-LoRA mask lengths must equal {}, got target={} attention={}",
+                    expected,
+                    target_mask.len(),
+                    attention_mask.len()
+                ));
+            }
+            let input_ids_tensor = tch::Tensor::from_slice(input_ids).reshape(&[batch, sl]).to_device(session.device());
+            let target_mask_tensor = tch::Tensor::from_slice(target_mask).reshape(&[batch, sl]).to_device(session.device());
+            let attention_mask_tensor = tch::Tensor::from_slice(attention_mask).reshape(&[batch, sl]).to_device(session.device());
 
             match session.train_multi_lora(TrainInput {
                 input_ids: input_ids_tensor,
@@ -291,8 +313,10 @@ fn execute_command(session: &mut Qwen36Session, cmd: &EpCommand) -> EpResult {
                 Err(e) => EpResult::Error(e.to_string()),
             }
         }
-        EpCommand::ExportAdapter { path, .. } => {
-            match session.export_adapter(path) {
+        EpCommand::ExportAdapter {
+            path, adapter_id, ..
+        } => {
+            match session.export_adapter(path, *adapter_id) {
                 Ok(n) => EpResult::Count(n),
                 Err(e) => EpResult::Error(e.to_string()),
             }
