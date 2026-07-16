@@ -28,6 +28,8 @@ extern "C" int32_t qwen36_init_nccl(void*);
 extern "C" int64_t qwen36_get_lora_count(void*);
 extern "C" void* qwen36_get_lora_a(void*, int64_t);
 extern "C" void* qwen36_get_lora_b(void*, int64_t);
+extern "C" void* qwen36_get_lora_grad_accumulator(void*, int64_t, int32_t);
+extern "C" int32_t qwen36_abort_gradient_accumulation(void*);
 extern "C" int32_t qwen36_set_lora_tensor(void*, int64_t, int32_t, void*);
 extern "C" double qwen36_train_step(void*, void*, void*, void*);
 extern "C" double qwen36_train_micro_step(
@@ -54,7 +56,7 @@ static at::Tensor cuda_rand(std::initializer_list<int64_t> shape) {
 }
 
 int main() {
-    assert(qwen36_kernel_abi_version() == 10);
+    assert(qwen36_kernel_abi_version() == 11);
     const int world = std::atoi(std::getenv("WORLD_SIZE") ? std::getenv("WORLD_SIZE") : "1");
     const int process_rank = std::atoi(std::getenv("RANK") ? std::getenv("RANK") : "0");
     const int local_rank = std::atoi(std::getenv("LOCAL_RANK") ? std::getenv("LOCAL_RANK") : "0");
@@ -415,6 +417,12 @@ int main() {
     auto linear_b_value = at::ones(linear_b->sizes(), linear_b->options());
     assert(qwen36_set_lora_tensor(ctx, 0, 1, &linear_b_value) == 0);
     auto linear_a_before = linear_a->clone();
+    auto* linear_a_accum = reinterpret_cast<at::Tensor*>(
+        qwen36_get_lora_grad_accumulator(ctx, 0, 0));
+    assert(linear_a_accum);
+    assert(linear_a_accum->scalar_type() == at::kFloat);
+    assert(linear_a_accum->sizes() == linear_a->sizes());
+    assert(linear_a_accum->abs().sum().item<double>() == 0.0);
     assert(qwen36_get_step_count(ctx) == 0);
     assert(qwen36_set_step_count(ctx, -1) != 0);
     assert(qwen36_get_step_count(ctx) == 0);
@@ -427,12 +435,45 @@ int main() {
     assert(accum_loss_0 == accum_loss_0);
     assert(qwen36_get_step_count(ctx) == 0);
     assert((*linear_a - linear_a_before).abs().sum().item<double>() == 0.0);
+    assert(linear_a_accum->abs().sum().item<double>() > 0.0);
+    // The BF16 leaf gradient is consumed at the micro-step boundary; only the
+    // FP32 accumulator may survive.
+    assert(!linear_a->grad().defined());
+
+    // A failing final micro-step aborts the existing window transactionally.
+    const double failed_accum = qwen36_train_micro_step(
+        ctx, &input_ids, &target_mask, &attention_mask, NAN, 1);
+    c10::cuda::device_synchronize();
+    assert(failed_accum < 0.0);
+    assert(qwen36_get_step_count(ctx) == 0);
+    assert(linear_a_accum->abs().sum().item<double>() == 0.0);
+    assert((*linear_a - linear_a_before).abs().sum().item<double>() == 0.0);
+
+    // Explicit abort is idempotent and clears a successful non-final micro.
+    assert(qwen36_train_micro_step(
+        ctx, &input_ids, &target_mask, &attention_mask, 0.5, 0) > 0.0);
+    c10::cuda::device_synchronize();
+    assert(linear_a_accum->abs().sum().item<double>() > 0.0);
+    assert(qwen36_abort_gradient_accumulation(ctx) == 0);
+    c10::cuda::device_synchronize();
+    assert(linear_a_accum->abs().sum().item<double>() == 0.0);
+    assert(qwen36_get_step_count(ctx) == 0);
+    assert((*linear_a - linear_a_before).abs().sum().item<double>() == 0.0);
+
+    // Two clean micro-batches accumulate into FP32 and commit one Adam step.
+    const double clean_accum_loss_0 = qwen36_train_micro_step(
+        ctx, &input_ids, &target_mask, &attention_mask, 0.5, 0);
+    c10::cuda::device_synchronize();
+    assert(clean_accum_loss_0 == clean_accum_loss_0);
+    assert(linear_a_accum->scalar_type() == at::kFloat);
+    assert(linear_a_accum->abs().sum().item<double>() > 0.0);
     const double accum_loss_1 = qwen36_train_micro_step(
         ctx, &input_ids, &target_mask, &attention_mask, 0.5, 1);
     c10::cuda::device_synchronize();
     assert(accum_loss_1 == accum_loss_1);
     assert(qwen36_get_step_count(ctx) == 1);
     assert((*linear_a - linear_a_before).abs().sum().item<double>() > 0.0);
+    assert(linear_a_accum->abs().sum().item<double>() == 0.0);
     linear_a_before = linear_a->clone();
     const double linear_loss = qwen36_train_step(
         ctx, &input_ids, &target_mask, &attention_mask);

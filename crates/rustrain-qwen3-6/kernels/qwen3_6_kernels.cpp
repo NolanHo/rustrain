@@ -1503,6 +1503,10 @@ struct TrainingContext {
         std::set<std::string> target_modules;
         std::map<int64_t, std::vector<std::pair<at::Tensor, at::Tensor>>> params;
         std::map<int64_t, std::vector<std::array<at::Tensor, 4>>> adam_state;
+        // Gradients are harvested after each backward into FP32 tensors. The
+        // accumulator tensors are intentionally shared by value when chunk
+        // registry guards copy adapters, so their contents survive restore.
+        std::map<int64_t, std::vector<std::array<at::Tensor, 2>>> grad_accum;
     };
 
     std::vector<LoRAAdapter> adapters;
@@ -1522,6 +1526,10 @@ struct TrainingContext {
     // Legacy single-LoRA (backward compat)
     std::vector<at::Tensor> lora_a;
     std::vector<at::Tensor> lora_b;
+    // Fixed-slot FP32 gradient accumulators. Inactive slots are undefined
+    // tensors to preserve the positional LoRA ABI without extra allocation.
+    std::vector<at::Tensor> grad_accum_a;
+    std::vector<at::Tensor> grad_accum_b;
     std::vector<uint8_t> lora_active;
     std::vector<int64_t> lora_layer_offset;
     double lora_scaling;
@@ -1532,6 +1540,13 @@ struct TrainingContext {
     std::vector<at::Tensor> adam_v;
     double lr, beta1, beta2, eps;
     int64_t step_count;
+    // A failed native call aborts the in-flight gradient window. This flag is
+    // consumed by the scoped accumulation guard on stack unwinding.
+    bool accumulation_active = false;
+    // Sum of (micro weight * supervised tokens) for the fixed-LoRA window.
+    // Fixed gradients are accumulated as token-weighted numerators and
+    // normalized exactly once at the optimizer boundary.
+    double accumulated_token_weight = 0.0;
 
     // Device buffer cache for multi-tensor fused Adam
     AdamDevBuffers adam_dev_bufs;
@@ -1571,6 +1586,119 @@ struct TrainingContext {
     int tp_rank = 0;
     int cuda_device = 0;
 // ──────────────────────────────────────────────────────────────────────
+};
+
+static bool harvest_leaf_grad(
+    at::Tensor& param, at::Tensor& fp32_accumulator
+) {
+    auto grad = param.grad();
+    if (!grad.defined()) return false;
+    TORCH_CHECK(fp32_accumulator.defined(),
+        "active LoRA parameter is missing its FP32 gradient accumulator");
+    TORCH_CHECK(fp32_accumulator.scalar_type() == at::kFloat,
+        "LoRA gradient accumulator must be FP32");
+    TORCH_CHECK(fp32_accumulator.sizes() == param.sizes(),
+        "LoRA gradient accumulator shape mismatch");
+    at::NoGradGuard guard;
+    fp32_accumulator.add_(grad.to(at::kFloat));
+    // Never retain BF16 leaf gradients across micro-batches. The next
+    // backward starts with a fresh leaf grad and is harvested again.
+    param.mutable_grad() = at::Tensor();
+    return true;
+}
+
+static bool harvest_adapter_gradients(TrainingContext::LoRAAdapter& adapter) {
+    bool harvested = false;
+    for (auto& [layer_idx, pairs] : adapter.params) {
+        auto accum_it = adapter.grad_accum.find(layer_idx);
+        TORCH_CHECK(accum_it != adapter.grad_accum.end() &&
+                    accum_it->second.size() == pairs.size(),
+            "dynamic LoRA gradient accumulator layout mismatch");
+        for (size_t i = 0; i < pairs.size(); ++i) {
+            auto& [a, b] = pairs[i];
+            auto& accum = accum_it->second[i];
+            if (a.requires_grad()) harvested |= harvest_leaf_grad(a, accum[0]);
+            if (b.requires_grad()) harvested |= harvest_leaf_grad(b, accum[1]);
+        }
+    }
+    return harvested;
+}
+
+static bool harvest_gradient_accumulators(TrainingContext* ctx) {
+    bool harvested = false;
+    for (auto& adapter : ctx->adapters) {
+        harvested |= harvest_adapter_gradients(adapter);
+    }
+    TORCH_CHECK(ctx->grad_accum_a.size() == ctx->lora_a.size() &&
+                ctx->grad_accum_b.size() == ctx->lora_b.size(),
+        "fixed LoRA gradient accumulator layout mismatch");
+    for (size_t i = 0; i < ctx->lora_a.size(); ++i) {
+        if (!ctx->lora_active[i]) continue;
+        harvested |= harvest_leaf_grad(ctx->lora_a[i], ctx->grad_accum_a[i]);
+        harvested |= harvest_leaf_grad(ctx->lora_b[i], ctx->grad_accum_b[i]);
+    }
+    ctx->accumulation_active |= harvested;
+    return harvested;
+}
+
+static void clear_adapter_gradient_accumulators(
+    TrainingContext::LoRAAdapter& adapter
+) {
+    at::NoGradGuard guard;
+    for (auto& [layer_idx, pairs] : adapter.params) {
+        auto accum_it = adapter.grad_accum.find(layer_idx);
+        for (size_t i = 0; i < pairs.size(); ++i) {
+            auto& [a, b] = pairs[i];
+            if (a.grad().defined()) a.mutable_grad() = at::Tensor();
+            if (b.grad().defined()) b.mutable_grad() = at::Tensor();
+            if (accum_it != adapter.grad_accum.end() &&
+                i < accum_it->second.size()) {
+                if (accum_it->second[i][0].defined()) accum_it->second[i][0].zero_();
+                if (accum_it->second[i][1].defined()) accum_it->second[i][1].zero_();
+            }
+        }
+    }
+}
+
+static void clear_gradient_accumulators(TrainingContext* ctx) {
+    if (!ctx) return;
+    at::NoGradGuard guard;
+    for (auto& adapter : ctx->adapters) {
+        clear_adapter_gradient_accumulators(adapter);
+    }
+    for (size_t i = 0; i < ctx->lora_a.size(); ++i) {
+        if (ctx->lora_a[i].grad().defined())
+            ctx->lora_a[i].mutable_grad() = at::Tensor();
+        if (ctx->lora_b[i].grad().defined())
+            ctx->lora_b[i].mutable_grad() = at::Tensor();
+        if (i < ctx->grad_accum_a.size() && ctx->grad_accum_a[i].defined())
+            ctx->grad_accum_a[i].zero_();
+        if (i < ctx->grad_accum_b.size() && ctx->grad_accum_b[i].defined())
+            ctx->grad_accum_b[i].zero_();
+    }
+    ctx->group_inputs.clear();
+    ctx->group_outputs.clear();
+    ctx->lora_cache_valid = false;
+    ctx->lora_batch_valid = false;
+    ctx->accumulation_active = false;
+    ctx->accumulated_token_weight = 0.0;
+}
+
+struct GradientAccumulationFailureGuard {
+    TrainingContext* ctx;
+    bool disarmed = false;
+    ~GradientAccumulationFailureGuard() noexcept {
+        if (disarmed) return;
+        try {
+            clear_gradient_accumulators(ctx);
+        } catch (const std::exception& e) {
+            fprintf(stderr,
+                "[q36] secondary gradient cleanup failure: %s\n", e.what());
+        } catch (...) {
+            fprintf(stderr,
+                "[q36] secondary gradient cleanup failure: unknown error\n");
+        }
+    }
 };
 
 static at::Tensor tp_allreduce_lora_delta(
@@ -1649,15 +1777,23 @@ static ncclDataType_t nccl_dtype_for(const at::Tensor& tensor) {
     }
 }
 
-static void allreduce_lora_grad(
-    TrainingContext* ctx, at::Tensor& param, double local_token_scale
+static void reduce_lora_accumulator(
+    TrainingContext* ctx, at::Tensor& accumulator, double scale,
+    bool allreduce
 ) {
-    auto grad = param.grad();
-    if (!ctx->nccl_comm || !grad.defined()) return;
-    auto contiguous = grad.contiguous();
-    if (local_token_scale != 1.0) {
-        contiguous = contiguous * local_token_scale;
+    if (!accumulator.defined()) return;
+    TORCH_CHECK(accumulator.scalar_type() == at::kFloat,
+        "LoRA DP gradient accumulator must be FP32");
+    auto contiguous = accumulator.contiguous();
+    if (scale != 1.0) {
+        contiguous = contiguous * scale;
     }
+    if (!allreduce) {
+        at::NoGradGuard guard;
+        accumulator.copy_(contiguous);
+        return;
+    }
+    TORCH_CHECK(ctx->nccl_comm, "LoRA gradient all-reduce has no communicator");
     auto reduced = at::empty_like(contiguous);
     int dev = contiguous.device().index();
     cudaSetDevice(dev);
@@ -1667,7 +1803,8 @@ static void allreduce_lora_grad(
         nccl_dtype_for(contiguous), ncclSum, ctx->nccl_comm, stream);
     TORCH_CHECK(err == ncclSuccess, "NCCL LoRA gradient all-reduce failed: ",
                 ncclGetErrorString(err));
-    param.mutable_grad() = reduced;
+    at::NoGradGuard guard;
+    accumulator.copy_(reduced);
 }
 
 // Every rank evaluates the complete loss. Average replicated LoRA gradients
@@ -1676,32 +1813,73 @@ static void allreduce_lora_grad(
 // in forward and keep replicated gradients local; routed expert adapters remain
 // local because their parameter tensors are sharded.
 static void synchronize_lora_gradients(
-    TrainingContext* ctx, const at::Tensor& target_mask
+    TrainingContext* ctx, const at::Tensor& target_mask,
+    double accumulated_token_weight = 0.0
 ) {
-    if (!ctx->nccl_comm || !ctx->data_parallel) return;
-    auto shifted_mask = target_mask.narrow(1, 1, target_mask.size(1) - 1)
-        .to(at::kFloat).sum().reshape({1});
-    auto global_mask = at::empty_like(shifted_mask);
-    auto stream = c10::cuda::getCurrentCUDAStream(
-        shifted_mask.device().index()).stream();
-    auto err = ncclAllReduce(
-        shifted_mask.data_ptr(), global_mask.data_ptr(), 1,
-        ncclFloat, ncclSum, ctx->nccl_comm, stream);
-    TORCH_CHECK(err == ncclSuccess, "NCCL token-count all-reduce failed: ",
+    const bool allreduce = ctx->nccl_comm && ctx->data_parallel;
+    double scale = 1.0;
+    if (accumulated_token_weight > 0.0) {
+        double global_weight = accumulated_token_weight;
+        if (allreduce) {
+            auto local = at::full({1}, accumulated_token_weight,
+                at::TensorOptions().dtype(at::kFloat).device(target_mask.device()));
+            auto global = at::empty_like(local);
+            auto stream = c10::cuda::getCurrentCUDAStream(
+                target_mask.device().index()).stream();
+            auto err = ncclAllReduce(
+                local.data_ptr(), global.data_ptr(), 1,
+                ncclFloat, ncclSum, ctx->nccl_comm, stream);
+            TORCH_CHECK(err == ncclSuccess,
+                "NCCL accumulated token-count all-reduce failed: ",
                 ncclGetErrorString(err));
-    const double local_tokens = shifted_mask.item<double>();
-    const double global_tokens = global_mask.item<double>();
-    const double token_scale = local_tokens / std::max(global_tokens, 1.0);
+            global_weight = global.item<double>();
+        }
+        scale = 1.0 / std::max(global_weight, 1.0);
+    } else {
+        // Dynamic multi-LoRA currently contributes one independently-normalized
+        // row per tenant. Preserve that contract while weighting replicated DP
+        // ranks by the selected batch's token count.
+        if (!allreduce) return;
+        auto shifted_mask = target_mask.narrow(1, 1, target_mask.size(1) - 1)
+            .to(at::kFloat).sum().reshape({1});
+        auto global_mask = at::empty_like(shifted_mask);
+        auto stream = c10::cuda::getCurrentCUDAStream(
+            shifted_mask.device().index()).stream();
+        auto err = ncclAllReduce(
+            shifted_mask.data_ptr(), global_mask.data_ptr(), 1,
+            ncclFloat, ncclSum, ctx->nccl_comm, stream);
+        TORCH_CHECK(err == ncclSuccess, "NCCL token-count all-reduce failed: ",
+                    ncclGetErrorString(err));
+        const double local_tokens = shifted_mask.item<double>();
+        const double global_tokens = global_mask.item<double>();
+        scale = local_tokens / std::max(global_tokens, 1.0);
+    }
     for (auto& adapter : ctx->adapters) {
         for (auto& [layer_idx, pairs] : adapter.params) {
             auto table = lora_projection_table(ctx->layer_configs[layer_idx]);
             for (int64_t pair = 0; pair < (int64_t)pairs.size(); ++pair) {
+                auto accum_it = adapter.grad_accum.find(layer_idx);
+                TORCH_CHECK(accum_it != adapter.grad_accum.end() &&
+                            pair < (int64_t)accum_it->second.size(),
+                    "dynamic LoRA gradient accumulator layout mismatch");
                 // Dynamic routed-expert tensors are sharded exactly like the
-                // base experts; only replicated adapter tensors are reduced.
-                if (table.entries[pair].grouped_expert) continue;
-                auto& [a, b] = pairs[pair];
-                allreduce_lora_grad(ctx, a, token_scale);
-                allreduce_lora_grad(ctx, b, token_scale);
+                // base experts. In a fixed accumulation window they still
+                // need local token normalization, but must never be reduced
+                // across EP ranks; the legacy per-row path leaves them
+                // untouched to preserve its independent-sample contract.
+                if (table.entries[pair].grouped_expert) {
+                    if (accumulated_token_weight > 0.0) {
+                        reduce_lora_accumulator(
+                            ctx, accum_it->second[pair][0], scale, false);
+                        reduce_lora_accumulator(
+                            ctx, accum_it->second[pair][1], scale, false);
+                    }
+                    continue;
+                }
+                reduce_lora_accumulator(
+                    ctx, accum_it->second[pair][0], scale, allreduce);
+                reduce_lora_accumulator(
+                    ctx, accum_it->second[pair][1], scale, allreduce);
             }
         }
     }
@@ -1712,9 +1890,19 @@ static void synchronize_lora_gradients(
             // Routed expert LoRA is sharded with the base expert weights. Its
             // local gradients belong only to this EP rank and must not be
             // summed with a different expert shard on another rank.
-            if (table.entries[pair].grouped_expert) continue;
-            allreduce_lora_grad(ctx, ctx->lora_a[offset + pair], token_scale);
-            allreduce_lora_grad(ctx, ctx->lora_b[offset + pair], token_scale);
+            if (table.entries[pair].grouped_expert) {
+                if (accumulated_token_weight > 0.0) {
+                    reduce_lora_accumulator(
+                        ctx, ctx->grad_accum_a[offset + pair], scale, false);
+                    reduce_lora_accumulator(
+                        ctx, ctx->grad_accum_b[offset + pair], scale, false);
+                }
+                continue;
+            }
+            reduce_lora_accumulator(
+                ctx, ctx->grad_accum_a[offset + pair], scale, allreduce);
+            reduce_lora_accumulator(
+                ctx, ctx->grad_accum_b[offset + pair], scale, allreduce);
         }
     }
 }
@@ -3560,7 +3748,7 @@ static at::Tensor mtp_compute_loss(
 extern "C" {
 
 __attribute__((visibility("default"))) int64_t qwen36_kernel_abi_version() {
-    return 10;
+    return 11;
 }
 
 // Create training context — called once at startup
@@ -3712,6 +3900,11 @@ __attribute__((visibility("default"))) void* qwen36_create_training_context(
                 }
                 a.set_requires_grad(active);
                 b.set_requires_grad(active);
+                auto grad_opts = at::TensorOptions().dtype(at::kFloat).device(base->device());
+                ctx->grad_accum_a.push_back(
+                    active ? at::zeros(a.sizes(), grad_opts) : at::Tensor());
+                ctx->grad_accum_b.push_back(
+                    active ? at::zeros(b.sizes(), grad_opts) : at::Tensor());
                 ctx->lora_a.push_back(std::move(a));
                 ctx->lora_b.push_back(std::move(b));
                 ctx->lora_active.push_back(active ? 1 : 0);
@@ -3784,6 +3977,7 @@ __attribute__((visibility("default"))) double qwen36_train_micro_step(
 ) {
     try {
         auto* ctx = reinterpret_cast<TrainingContext*>(ctx_ptr);
+        GradientAccumulationFailureGuard accumulation_guard{ctx};
         TORCH_CHECK(gradient_scale > 0.0 && std::isfinite(gradient_scale),
             "gradient_scale must be finite and positive");
         // Set CUDA device for EP
@@ -3833,9 +4027,15 @@ __attribute__((visibility("default"))) double qwen36_train_micro_step(
             loss_val += mtp_loss.item<double>();
         }
 
-        if (gradient_scale != 1.0) {
-            total_hidden_grad.mul_(gradient_scale);
-        }
+        const double supervised_tokens = target_mask
+            .narrow(1, 1, target_mask.size(1) - 1)
+            .to(at::kFloat).sum().item<double>();
+        const double micro_token_weight =
+            gradient_scale * std::max(supervised_tokens, 1.0);
+        // compute_loss returns a local token mean. Convert it to a weighted
+        // numerator before backward; the FP32 window is divided by the global
+        // accumulated token weight exactly once at the optimizer boundary.
+        total_hidden_grad.mul_(micro_token_weight);
 
         // Trigger exactly one main-model backward with the combined hidden
         // gradient. Manual groups are the non-autograd checkpoint fallback;
@@ -3846,26 +4046,33 @@ __attribute__((visibility("default"))) double qwen36_train_micro_step(
             hidden.backward(total_hidden_grad);
         }
 
+        // Consume every BF16 leaf gradient immediately. Only the FP32 buffers
+        // survive the micro-step boundary.
+        harvest_gradient_accumulators(ctx);
+        ctx->accumulated_token_weight += micro_token_weight;
+
         if (!apply_optimizer) {
             // The forward graph has been consumed, but parameters remain
             // live for the next micro-batch. Never reuse cached LoRA deltas
             // whose autograd nodes were freed by this backward.
             ctx->lora_cache_valid = false;
             ctx->lora_batch_valid = false;
+            accumulation_guard.disarmed = true;
             return loss_val;
         }
 
         // Replicated DP gradients are synchronized before the local Adam
         // update. EP keeps replicated gradients local because its forward
         // routed activation already contains the cross-rank sum.
-        synchronize_lora_gradients(ctx, target_mask);
+        synchronize_lora_gradients(
+            ctx, target_mask, ctx->accumulated_token_weight);
 
         // ── Adam optimizer step — CUDA multi-tensor fused kernel ──
         at::AutoGradMode guard(false);
-        ctx->step_count++;
         ctx->lora_cache_valid = false;
         ctx->lora_batch_valid = false;
-        double step_f = (double)ctx->step_count;
+        const int64_t next_step = ctx->step_count + 1;
+        double step_f = (double)next_step;
         double bias_correction1 = 1.0 - std::pow(ctx->beta1, step_f);
         double bias_correction2 = 1.0 - std::pow(ctx->beta2, step_f);
         float lr_scaled = (float)(ctx->lr / bias_correction1);
@@ -3882,19 +4089,23 @@ __attribute__((visibility("default"))) double qwen36_train_micro_step(
         for (auto& adapter : ctx->adapters) {
             for (auto& [layer_idx, pairs] : adapter.params) {
                 auto& adam_states = adapter.adam_state[layer_idx];
+                auto& accumulators = adapter.grad_accum[layer_idx];
                 for (size_t i = 0; i < pairs.size(); i++) {
                     auto& [a, b] = pairs[i];
                     auto& [m_a, v_a, m_b, v_b] = adam_states[i];
-                    if (a.grad().defined() && a.scalar_type() == at::kBFloat16) {
+                    auto& [accum_a, accum_b] = accumulators[i];
+                    if (a.requires_grad() && accum_a.defined() &&
+                        a.scalar_type() == at::kBFloat16) {
                         h_params.push_back(a.data_ptr());
-                        h_grads.push_back(a.grad().data_ptr());
+                        h_grads.push_back(accum_a.data_ptr());
                         h_m.push_back((float*)m_a.data_ptr());
                         h_v.push_back((float*)v_a.data_ptr());
                         h_sizes.push_back((int)a.numel());
                     }
-                    if (b.grad().defined() && b.scalar_type() == at::kBFloat16) {
+                    if (b.requires_grad() && accum_b.defined() &&
+                        b.scalar_type() == at::kBFloat16) {
                         h_params.push_back(b.data_ptr());
-                        h_grads.push_back(b.grad().data_ptr());
+                        h_grads.push_back(accum_b.data_ptr());
                         h_m.push_back((float*)m_b.data_ptr());
                         h_v.push_back((float*)v_b.data_ptr());
                         h_sizes.push_back((int)b.numel());
@@ -3907,10 +4118,11 @@ __attribute__((visibility("default"))) double qwen36_train_micro_step(
         for (size_t i = 0; i < ctx->lora_a.size(); i++) {
             {
                 auto& param = ctx->lora_a[i];
-                auto& grad = param.grad();
-                if (grad.defined() && param.scalar_type() == at::kBFloat16) {
+                auto& accum = ctx->grad_accum_a[i];
+                if (ctx->lora_active[i] && accum.defined() &&
+                    param.scalar_type() == at::kBFloat16) {
                     h_params.push_back(param.data_ptr());
-                    h_grads.push_back(grad.data_ptr());
+                    h_grads.push_back(accum.data_ptr());
                     h_m.push_back((float*)ctx->adam_m[adam_idx].data_ptr());
                     h_v.push_back((float*)ctx->adam_v[adam_idx].data_ptr());
                     h_sizes.push_back((int)param.numel());
@@ -3919,10 +4131,11 @@ __attribute__((visibility("default"))) double qwen36_train_micro_step(
             adam_idx++;
             {
                 auto& param = ctx->lora_b[i];
-                auto& grad = param.grad();
-                if (grad.defined() && param.scalar_type() == at::kBFloat16) {
+                auto& accum = ctx->grad_accum_b[i];
+                if (ctx->lora_active[i] && accum.defined() &&
+                    param.scalar_type() == at::kBFloat16) {
                     h_params.push_back(param.data_ptr());
-                    h_grads.push_back(grad.data_ptr());
+                    h_grads.push_back(accum.data_ptr());
                     h_m.push_back((float*)ctx->adam_m[adam_idx].data_ptr());
                     h_v.push_back((float*)ctx->adam_v[adam_idx].data_ptr());
                     h_sizes.push_back((int)param.numel());
@@ -3967,8 +4180,15 @@ __attribute__((visibility("default"))) double qwen36_train_micro_step(
                 one_minus_b1, one_minus_b2,
                 (void*)stream
             );
+            auto launch_error = cudaGetLastError();
+            TORCH_CHECK(launch_error == cudaSuccess,
+                "fused FP32-gradient Adam launch failed: ",
+                cudaGetErrorString(launch_error));
+            ctx->step_count = next_step;
         }
 
+        clear_gradient_accumulators(ctx);
+        accumulation_guard.disarmed = true;
         return loss_val;
     } catch (const std::exception& e) {
         fprintf(stderr, "[q36] train_step FAILED: %s\n", e.what());
@@ -3999,6 +4219,35 @@ __attribute__((visibility("default"))) void* qwen36_get_lora_b(void* ctx_ptr, in
     auto* ctx = reinterpret_cast<TrainingContext*>(ctx_ptr);
     if (index < 0 || index >= (int64_t)ctx->lora_b.size()) return nullptr;
     return &ctx->lora_b[index];
+}
+
+// Read-only diagnostic accessor used by native validation and runtime
+// observability. The returned tensor is owned by the training context.
+__attribute__((visibility("default"))) void* qwen36_get_lora_grad_accumulator(
+    void* ctx_ptr, int64_t index, int32_t is_b
+) {
+    auto* ctx = reinterpret_cast<TrainingContext*>(ctx_ptr);
+    if (!ctx || index < 0 || index >= (int64_t)ctx->lora_a.size()) return nullptr;
+    auto& accumulators = is_b ? ctx->grad_accum_b : ctx->grad_accum_a;
+    if (index >= (int64_t)accumulators.size() || !accumulators[index].defined())
+        return nullptr;
+    return &accumulators[index];
+}
+
+// Explicitly abort an incomplete accumulation window. The operation is
+// idempotent and leaves parameters, Adam state, and optimizer clocks intact.
+__attribute__((visibility("default"))) int32_t qwen36_abort_gradient_accumulation(
+    void* ctx_ptr
+) {
+    try {
+        auto* ctx = reinterpret_cast<TrainingContext*>(ctx_ptr);
+        TORCH_CHECK(ctx, "null training context");
+        clear_gradient_accumulators(ctx);
+        return 0;
+    } catch (const std::exception& e) {
+        fprintf(stderr, "[q36] abort_gradient_accumulation FAILED: %s\n", e.what());
+        return -1;
+    }
 }
 
 // Copy one exported LoRA tensor back into the native leaf parameter. This is
@@ -4107,6 +4356,7 @@ __attribute__((visibility("default"))) double qwen36_train_multi_lora(
 ) {
     try {
         auto* ctx = reinterpret_cast<TrainingContext*>(ctx_ptr);
+        GradientAccumulationFailureGuard accumulation_guard{ctx};
         if (ctx->nccl_comm) {
             c10::cuda::set_device(ctx->cuda_device);
             cudaSetDevice(ctx->cuda_device);
@@ -4221,10 +4471,10 @@ __attribute__((visibility("default"))) double qwen36_train_multi_lora(
 
         double total_loss = 0.0;
         int64_t num_chunks = (total_adapters + n_max - 1) / n_max;
-        // Chunking is a memory scheduling detail, not an optimizer step. The
-        // session clock is kept for backwards-compatible status reporting;
-        // Adam bias correction below uses each adapter's own clock.
-        ctx->step_count++;
+        // Chunking is a memory scheduling detail, not an optimizer step. Both
+        // the session clock and tenant clocks commit only after Adam launches.
+        const int64_t next_session_step = ctx->step_count + 1;
+        bool any_update = false;
 
         for (int64_t chunk = 0; chunk < num_chunks; chunk++) {
             int64_t start = chunk * n_max;
@@ -4314,6 +4564,10 @@ __attribute__((visibility("default"))) double qwen36_train_multi_lora(
             } else {
                 hidden.backward(hidden_grad);
             }
+            // The chunk registry contains intrusive copies of the selected
+            // adapter tensors. Harvest now; FP32 accumulator contents remain
+            // shared when the full registry is restored below.
+            harvest_gradient_accumulators(ctx);
             // No cudaDeviceSynchronize — let GPU pipeline run asynchronously.
             // The next chunk's CPU prep (LoRA batch, input expand) will overlap
             // with the tail of this chunk's GPU backward.
@@ -4340,10 +4594,9 @@ __attribute__((visibility("default"))) double qwen36_train_multi_lora(
                 at::AutoGradMode guard(false);
                 ctx->lora_cache_valid = false;
                 ctx->lora_batch_valid = false;
-                for (auto& adapter : ctx->adapters) adapter.optimizer_step++;
                 std::map<int64_t, std::vector<TrainingContext::LoRAAdapter*>> groups;
                 for (auto& adapter : ctx->adapters) {
-                    groups[adapter.optimizer_step].push_back(&adapter);
+                    groups[adapter.optimizer_step + 1].push_back(&adapter);
                 }
                 for (auto& [logical_step, adapters] : groups) {
                     std::vector<void*> h_params, h_grads;
@@ -4352,19 +4605,23 @@ __attribute__((visibility("default"))) double qwen36_train_multi_lora(
                     for (auto* adapter : adapters) {
                         for (auto& [layer_idx, pairs] : adapter->params) {
                             auto& adam_states = adapter->adam_state[layer_idx];
+                            auto& accumulators = adapter->grad_accum[layer_idx];
                             for (size_t i = 0; i < pairs.size(); i++) {
                                 auto& [a, b] = pairs[i];
                                 auto& [m_a, v_a, m_b, v_b] = adam_states[i];
-                                if (a.grad().defined() && a.scalar_type() == at::kBFloat16) {
+                                auto& [accum_a, accum_b] = accumulators[i];
+                                if (a.requires_grad() && accum_a.defined() &&
+                                    a.scalar_type() == at::kBFloat16) {
                                     h_params.push_back(a.data_ptr());
-                                    h_grads.push_back(a.grad().data_ptr());
+                                    h_grads.push_back(accum_a.data_ptr());
                                     h_m.push_back((float*)m_a.data_ptr());
                                     h_v.push_back((float*)v_a.data_ptr());
                                     h_sizes.push_back((int)a.numel());
                                 }
-                                if (b.grad().defined() && b.scalar_type() == at::kBFloat16) {
+                                if (b.requires_grad() && accum_b.defined() &&
+                                    b.scalar_type() == at::kBFloat16) {
                                     h_params.push_back(b.data_ptr());
-                                    h_grads.push_back(b.grad().data_ptr());
+                                    h_grads.push_back(accum_b.data_ptr());
                                     h_m.push_back((float*)m_b.data_ptr());
                                     h_v.push_back((float*)v_b.data_ptr());
                                     h_sizes.push_back((int)b.numel());
@@ -4402,6 +4659,14 @@ __attribute__((visibility("default"))) double qwen36_train_multi_lora(
                         n_params, (float)ctx->beta1, (float)ctx->beta2,
                         lr_scaled, eps_scaled, one_minus_b1, one_minus_b2,
                         (void*)stream);
+                    auto launch_error = cudaGetLastError();
+                    TORCH_CHECK(launch_error == cudaSuccess,
+                        "dynamic fused FP32-gradient Adam launch failed: ",
+                        cudaGetErrorString(launch_error));
+                    for (auto* adapter : adapters) {
+                        adapter->optimizer_step = logical_step;
+                    }
+                    any_update = true;
                 }
             }
 
@@ -4411,6 +4676,9 @@ __attribute__((visibility("default"))) double qwen36_train_multi_lora(
                     (long)(chunk + 1), (long)num_chunks, (long)n, loss_val);
         }
 
+        if (any_update) ctx->step_count = next_session_step;
+        clear_gradient_accumulators(ctx);
+        accumulation_guard.disarmed = true;
         return total_loss / total_adapters;
     } catch (const std::exception& e) {
         fprintf(stderr, "[train_multi] FAILED: %s\n", e.what());
@@ -4863,6 +5131,7 @@ int64_t qwen36_add_lora(
             int64_t num_pairs = projection_table.count;
             std::vector<std::pair<at::Tensor, at::Tensor>> pairs;
             std::vector<std::array<at::Tensor, 4>> adam_states;
+            std::vector<std::array<at::Tensor, 2>> grad_accumulators;
             for (int64_t k = 0; k < num_pairs; k++) {
                 const auto& projection = projection_table.entries[k];
                 auto* base = ctx->weight_ptrs[w_offset + projection.weight_index];
@@ -4904,10 +5173,16 @@ int64_t qwen36_add_lora(
                     at::zeros(a.sizes(), opts_f32), at::zeros(a.sizes(), opts_f32),
                     at::zeros(b.sizes(), opts_f32), at::zeros(b.sizes(), opts_f32)
                 });
+                grad_accumulators.push_back(active
+                    ? std::array<at::Tensor, 2>{
+                        at::zeros(a.sizes(), opts_f32),
+                        at::zeros(b.sizes(), opts_f32)}
+                    : std::array<at::Tensor, 2>{at::Tensor(), at::Tensor()});
                 pairs.emplace_back(std::move(a), std::move(b));
             }
             adapter.params[i] = std::move(pairs);
             adapter.adam_state[i] = std::move(adam_states);
+            adapter.grad_accum[i] = std::move(grad_accumulators);
         }
         int64_t id = adapter.id;
         ctx->adapters.push_back(std::move(adapter));

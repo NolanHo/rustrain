@@ -52,6 +52,8 @@ type FnGetLoraCount = unsafe extern "C" fn(*mut c_void) -> i64;
 type FnGetLoraA = unsafe extern "C" fn(*mut c_void, i64) -> *mut c_void;
 type FnGetLoraB = unsafe extern "C" fn(*mut c_void, i64) -> *mut c_void;
 type FnSetLoraTensor = unsafe extern "C" fn(*mut c_void, i64, i32, *mut c_void) -> i32;
+type FnGetLoraGradAccumulator = unsafe extern "C" fn(*mut c_void, i64, i32) -> *mut c_void;
+type FnAbortGradientAccumulation = unsafe extern "C" fn(*mut c_void) -> i32;
 type FnGetStepCount = unsafe extern "C" fn(*mut c_void) -> i64;
 type FnSetStepCount = unsafe extern "C" fn(*mut c_void, i64) -> i32;
 type FnExportOptimizer =
@@ -128,6 +130,8 @@ struct KernelHandles {
     get_lora_a: FnGetLoraA,
     get_lora_b: FnGetLoraB,
     set_lora_tensor: FnSetLoraTensor,
+    get_lora_grad_accumulator: FnGetLoraGradAccumulator,
+    abort_gradient_accumulation: FnAbortGradientAccumulation,
     get_step_count: FnGetStepCount,
     set_step_count: FnSetStepCount,
     export_optimizer: FnExportOptimizer,
@@ -190,7 +194,7 @@ unsafe fn load_kernels() -> Option<KernelHandles> {
         }};
     }
     let abi_version: FnKernelAbiVersion = sym!("qwen36_kernel_abi_version");
-    if abi_version() != 10 {
+    if abi_version() != 11 {
         return None;
     }
     Some(KernelHandles {
@@ -204,6 +208,8 @@ unsafe fn load_kernels() -> Option<KernelHandles> {
         get_lora_a: sym!("qwen36_get_lora_a"),
         get_lora_b: sym!("qwen36_get_lora_b"),
         set_lora_tensor: sym!("qwen36_set_lora_tensor"),
+        get_lora_grad_accumulator: sym!("qwen36_get_lora_grad_accumulator"),
+        abort_gradient_accumulation: sym!("qwen36_abort_gradient_accumulation"),
         get_step_count: sym!("qwen36_get_step_count"),
         set_step_count: sym!("qwen36_set_step_count"),
         export_optimizer: sym!("qwen36_export_optimizer_state"),
@@ -674,6 +680,29 @@ impl CppTrainingContext {
             return None;
         }
         Some(unsafe { Tensor::clone_from_ptr(ptr as *mut _) })
+    }
+
+    /// Inspect the native FP32 gradient accumulator for one fixed LoRA slot.
+    /// The returned tensor is a shallow handle owned by the C++ context.
+    pub fn get_lora_gradient_accumulator(&self, index: i64, is_b: bool) -> Option<Tensor> {
+        let kh = get_kernels()?;
+        let ptr =
+            unsafe { (kh.get_lora_grad_accumulator)(self.ptr, index, if is_b { 1 } else { 0 }) };
+        if ptr.is_null() {
+            return None;
+        }
+        Some(unsafe { Tensor::clone_from_ptr(ptr as *mut _) })
+    }
+
+    /// Abort an incomplete micro-batch window without changing parameters,
+    /// Adam state, or optimizer clocks. Safe to call when no window is active.
+    pub fn abort_gradient_accumulation(&self) -> Result<()> {
+        let kh = get_kernels().ok_or_else(|| anyhow::anyhow!("kernels not loaded"))?;
+        let status = unsafe { (kh.abort_gradient_accumulation)(self.ptr) };
+        if status != 0 {
+            bail!("C++ abort_gradient_accumulation failed");
+        }
+        Ok(())
     }
 
     pub fn set_lora_tensor(&self, index: i64, is_b: bool, tensor: &Tensor) -> Result<()> {

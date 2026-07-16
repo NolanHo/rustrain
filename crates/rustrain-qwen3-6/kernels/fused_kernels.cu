@@ -187,7 +187,7 @@ __global__ void fused_rmsnorm_matmul_kernel(
 // 4. Multi-tensor Fused Adam
 // ──────────────────────────────────────────────────────────────────────
 // One block per param tensor. Each thread processes multiple elements.
-// Handles BF16 params/grads with FP32 m/v.
+// Handles BF16 params with FP32 accumulated grads and FP32 m/v.
 //
 // Replaces 7 ATen ops per param with 1 kernel launch for ALL params:
 //   m = m * beta1 + grad * (1 - beta1)
@@ -197,7 +197,7 @@ __global__ void fused_rmsnorm_matmul_kernel(
 
 __global__ void fused_adam_multi_kernel(
     void** __restrict__ param_ptrs,   // [n_params] BF16
-    void** __restrict__ grad_ptrs,    // [n_params] BF16
+    void** __restrict__ grad_ptrs,    // [n_params] FP32
     float** __restrict__ m_ptrs,      // [n_params] FP32
     float** __restrict__ v_ptrs,      // [n_params] FP32
     const int* __restrict__ sizes,   // [n_params]
@@ -211,12 +211,12 @@ __global__ void fused_adam_multi_kernel(
 
     int size = sizes[pidx];
     __nv_bfloat16* param = (__nv_bfloat16*)param_ptrs[pidx];
-    __nv_bfloat16* grad  = (__nv_bfloat16*)grad_ptrs[pidx];
+    float* grad = (float*)grad_ptrs[pidx];
     float* m = m_ptrs[pidx];
     float* v = v_ptrs[pidx];
 
     for (int i = threadIdx.x; i < size; i += blockDim.x) {
-        float g = __bfloat162float(grad[i]);
+        float g = grad[i];
         float m_new = m[i] * beta1 + g * one_minus_beta1;
         float v_new = v[i] * beta2 + g * g * one_minus_beta2;
         m[i] = m_new;
@@ -224,7 +224,7 @@ __global__ void fused_adam_multi_kernel(
         float p = __bfloat162float(param[i]);
         p -= lr_scaled * m_new / (sqrtf(v_new) + eps_scaled);
         param[i] = __float2bfloat16_rn(p);
-        grad[i] = __float2bfloat16_rn(0.0f);
+        grad[i] = 0.0f;
     }
 }
 
