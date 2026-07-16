@@ -700,7 +700,8 @@ impl TrainingSession for Qwen36Session {
             }
         }
 
-        checkpoint::save_checkpoint_with_dynamic(
+        let parallel = checkpoint::ParallelCheckpointManifest::from_env()?;
+        checkpoint::save_checkpoint_with_dynamic_for_topology(
             std::path::Path::new(path),
             self.step,
             self.last_loss,
@@ -712,13 +713,15 @@ impl TrainingSession for Qwen36Session {
             &adam_m,
             &adam_v,
             &dynamic_adapters,
+            &parallel,
         )?;
 
         Ok((self.step, self.last_loss))
     }
 
     fn load_checkpoint(&mut self, path: &str) -> Result<(u64, f64)> {
-        let data = checkpoint::load_checkpoint(std::path::Path::new(path))?;
+        let parallel = checkpoint::ParallelCheckpointManifest::from_env()?;
+        let data = checkpoint::load_checkpoint_for_topology(std::path::Path::new(path), &parallel)?;
         if !data.dynamic_adapters.is_empty() {
             let model_path = self
                 .model_path

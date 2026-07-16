@@ -1,9 +1,118 @@
 //! Checkpoint save/load: adapter (LoRA A/B) + optimizer state (Adam m/v) + step count.
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
-use std::path::Path;
+use std::collections::BTreeMap;
+use std::env;
+use std::path::{Path, PathBuf};
 use tch::Tensor;
+
+const TP_CHECKPOINT_FORMAT: &str = "rustrain-checkpoint-v3-tp";
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ParallelCheckpointManifest {
+    pub world_size: usize,
+    pub tensor_model_parallel_size: usize,
+    pub pipeline_model_parallel_size: usize,
+    pub data_parallel_size: usize,
+    pub expert_model_parallel_size: usize,
+    pub context_parallel_size: usize,
+    pub global_rank: usize,
+    pub tensor_model_parallel_rank: usize,
+}
+
+impl ParallelCheckpointManifest {
+    pub fn new(
+        world_size: usize,
+        global_rank: usize,
+        tensor_model_parallel_size: usize,
+        pipeline_model_parallel_size: usize,
+        data_parallel_size: usize,
+        expert_model_parallel_size: usize,
+        context_parallel_size: usize,
+    ) -> Result<Self> {
+        let sizes = [
+            tensor_model_parallel_size,
+            pipeline_model_parallel_size,
+            data_parallel_size,
+            expert_model_parallel_size,
+            context_parallel_size,
+        ];
+        if sizes.contains(&0) {
+            bail!("parallel checkpoint sizes must be positive");
+        }
+        let expected_world_size = sizes
+            .into_iter()
+            .try_fold(1usize, |product, size| product.checked_mul(size))
+            .context("parallel checkpoint world size overflow")?;
+        if world_size != expected_world_size {
+            bail!(
+                "parallel checkpoint topology product is {expected_world_size}, but WORLD_SIZE is {world_size}"
+            );
+        }
+        if global_rank >= world_size {
+            bail!("global rank {global_rank} is outside WORLD_SIZE={world_size}");
+        }
+        Ok(Self {
+            world_size,
+            tensor_model_parallel_size,
+            pipeline_model_parallel_size,
+            data_parallel_size,
+            expert_model_parallel_size,
+            context_parallel_size,
+            global_rank,
+            tensor_model_parallel_rank: global_rank % tensor_model_parallel_size,
+        })
+    }
+
+    pub fn from_env() -> Result<Self> {
+        let world_size = env_usize(&["WORLD_SIZE"], 1)?;
+        let global_rank = env_usize(&["RANK"], 0)?;
+        let tp = env_usize(&["TP_SIZE", "RUSTRAIN_TP_SIZE"], 1)?;
+        let pp = env_usize(&["PP_SIZE", "RUSTRAIN_PP_SIZE"], 1)?;
+        let ep = env_usize(&["EP_SIZE", "RUSTRAIN_EP_SIZE"], 1)?;
+        let cp = env_usize(&["CP_SIZE", "RUSTRAIN_CP_SIZE"], 1)?;
+        let non_dp = tp
+            .checked_mul(pp)
+            .and_then(|size| size.checked_mul(ep))
+            .and_then(|size| size.checked_mul(cp))
+            .context("model-parallel topology product overflow")?;
+        let dp = match env_usize_optional(&["DP_SIZE", "RUSTRAIN_DP_SIZE"])? {
+            Some(dp) => dp,
+            None if world_size % non_dp == 0 => world_size / non_dp,
+            None => {
+                bail!("WORLD_SIZE={world_size} is not divisible by model-parallel product {non_dp}")
+            }
+        };
+        Self::new(world_size, global_rank, tp, pp, dp, ep, cp)
+    }
+
+    fn is_tensor_parallel(&self) -> bool {
+        self.tensor_model_parallel_size > 1
+    }
+
+    fn replica_identity(&self) -> String {
+        format!(
+            "global-rank-{}-tp-rank-{}",
+            self.global_rank, self.tensor_model_parallel_rank
+        )
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TensorShardManifest {
+    pub file: String,
+    pub tensor_name: String,
+    pub state: String,
+    #[serde(default)]
+    pub adapter_id: Option<i64>,
+    pub global_lora_rank: i64,
+    pub global_shape: Vec<i64>,
+    pub local_shape: Vec<i64>,
+    pub partition_axis: usize,
+    pub global_offset: Vec<i64>,
+    pub replica_identity: String,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CheckpointManifest {
@@ -16,6 +125,10 @@ pub struct CheckpointManifest {
     pub files: Vec<String>,
     #[serde(default)]
     pub dynamic_adapters: Vec<DynamicAdapterManifest>,
+    #[serde(default)]
+    pub parallel: Option<ParallelCheckpointManifest>,
+    #[serde(default)]
+    pub tensor_shards: Vec<TensorShardManifest>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -93,6 +206,104 @@ pub fn save_checkpoint_with_dynamic(
     adam_v: &[Tensor],
     dynamic_adapters: &[DynamicAdapterCheckpoint],
 ) -> Result<()> {
+    save_checkpoint_with_dynamic_at(
+        dir,
+        step,
+        loss,
+        model_path,
+        lora_rank,
+        lora_alpha,
+        lora_a,
+        lora_b,
+        adam_m,
+        adam_v,
+        dynamic_adapters,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn save_checkpoint_with_dynamic_for_topology(
+    dir: &Path,
+    step: u64,
+    loss: f64,
+    model_path: &str,
+    lora_rank: i64,
+    lora_alpha: f64,
+    lora_a: &[Tensor],
+    lora_b: &[Tensor],
+    adam_m: &[Tensor],
+    adam_v: &[Tensor],
+    dynamic_adapters: &[DynamicAdapterCheckpoint],
+    parallel: &ParallelCheckpointManifest,
+) -> Result<()> {
+    if !parallel.is_tensor_parallel() {
+        return save_checkpoint_with_dynamic(
+            dir,
+            step,
+            loss,
+            model_path,
+            lora_rank,
+            lora_alpha,
+            lora_a,
+            lora_b,
+            adam_m,
+            adam_v,
+            dynamic_adapters,
+        );
+    }
+    let rank_dir = rank_checkpoint_dir(dir, parallel.global_rank);
+    save_checkpoint_with_dynamic_at(
+        &rank_dir,
+        step,
+        loss,
+        model_path,
+        lora_rank,
+        lora_alpha,
+        lora_a,
+        lora_b,
+        adam_m,
+        adam_v,
+        dynamic_adapters,
+        Some(parallel),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn save_checkpoint_with_dynamic_at(
+    dir: &Path,
+    step: u64,
+    loss: f64,
+    model_path: &str,
+    lora_rank: i64,
+    lora_alpha: f64,
+    lora_a: &[Tensor],
+    lora_b: &[Tensor],
+    adam_m: &[Tensor],
+    adam_v: &[Tensor],
+    dynamic_adapters: &[DynamicAdapterCheckpoint],
+    parallel: Option<&ParallelCheckpointManifest>,
+) -> Result<()> {
+    validate_tensor_counts(
+        lora_a,
+        lora_b,
+        adam_m,
+        adam_v,
+        dynamic_adapters,
+        parallel.is_some(),
+    )?;
+    let tensor_shards = match parallel {
+        Some(parallel) => build_tensor_shard_manifest(
+            parallel,
+            lora_rank,
+            lora_a,
+            lora_b,
+            adam_m,
+            adam_v,
+            dynamic_adapters,
+        )?,
+        None => Vec::new(),
+    };
     std::fs::create_dir_all(dir)
         .with_context(|| format!("create checkpoint dir {}", dir.display()))?;
 
@@ -101,16 +312,6 @@ pub fn save_checkpoint_with_dynamic(
     let mut adapter_tensors = named_tensors(lora_a, lora_b, "a_", "b_");
     let mut dynamic_manifests = Vec::with_capacity(dynamic_adapters.len());
     for adapter in dynamic_adapters {
-        if adapter.lora_a.len() != adapter.lora_b.len()
-            || adapter.adam_m.len() != adapter.adam_v.len()
-            || adapter.manifest.parameter_count != adapter.lora_a.len()
-            || adapter.manifest.optimizer_count != adapter.adam_m.len()
-        {
-            anyhow::bail!(
-                "dynamic adapter {} checkpoint count mismatch",
-                adapter.manifest.id
-            );
-        }
         let id = adapter.manifest.id;
         adapter_tensors.extend(named_tensors(
             &adapter.lora_a,
@@ -138,7 +339,9 @@ pub fn save_checkpoint_with_dynamic(
 
     // Write manifest
     let manifest = CheckpointManifest {
-        format: if dynamic_manifests.is_empty() {
+        format: if parallel.is_some() {
+            TP_CHECKPOINT_FORMAT.to_string()
+        } else if dynamic_manifests.is_empty() {
             "rustrain-checkpoint-v1".to_string()
         } else {
             "rustrain-checkpoint-v2".to_string()
@@ -150,6 +353,8 @@ pub fn save_checkpoint_with_dynamic(
         lora_alpha,
         files: vec!["adapter.safetensors".into(), "optimizer.safetensors".into()],
         dynamic_adapters: dynamic_manifests,
+        parallel: parallel.cloned(),
+        tensor_shards,
     };
     let manifest_path = dir.join("manifest.json");
     std::fs::write(&manifest_path, serde_json::to_string_pretty(&manifest)?)
@@ -166,12 +371,53 @@ pub fn save_checkpoint_with_dynamic(
 
 /// Load checkpoint from a directory.
 pub fn load_checkpoint(dir: &Path) -> Result<CheckpointData> {
+    load_checkpoint_at(dir, None)
+}
+
+pub fn load_checkpoint_for_topology(
+    dir: &Path,
+    parallel: &ParallelCheckpointManifest,
+) -> Result<CheckpointData> {
+    if !parallel.is_tensor_parallel() {
+        return load_checkpoint(dir);
+    }
+    let rank_dir = rank_checkpoint_dir(dir, parallel.global_rank);
+    load_checkpoint_at(&rank_dir, Some(parallel))
+}
+
+fn load_checkpoint_at(
+    dir: &Path,
+    expected_parallel: Option<&ParallelCheckpointManifest>,
+) -> Result<CheckpointData> {
     let manifest_path = dir.join("manifest.json");
     let manifest: CheckpointManifest = serde_json::from_str(
         &std::fs::read_to_string(&manifest_path)
             .with_context(|| format!("read {}", manifest_path.display()))?,
     )
     .with_context(|| "parse manifest.json")?;
+    match expected_parallel {
+        Some(expected) => {
+            if manifest.format != TP_CHECKPOINT_FORMAT {
+                bail!(
+                    "tensor-parallel resume requires {TP_CHECKPOINT_FORMAT}, found {}",
+                    manifest.format
+                );
+            }
+            let saved = manifest
+                .parallel
+                .as_ref()
+                .context("tensor-parallel checkpoint is missing topology metadata")?;
+            if saved != expected {
+                bail!(
+                    "tensor-parallel checkpoint topology mismatch: saved={saved:?}, current={expected:?}"
+                );
+            }
+        }
+        None if manifest.format == TP_CHECKPOINT_FORMAT => {
+            bail!("tensor-parallel checkpoint must be loaded with rank topology");
+        }
+        None => {}
+    }
 
     let adapter_path = dir.join("adapter.safetensors");
     let adapter_named = read_named_tensors(&adapter_path)?;
@@ -205,6 +451,19 @@ pub fn load_checkpoint(dir: &Path) -> Result<CheckpointData> {
         });
     }
 
+    if let Some(parallel) = expected_parallel {
+        let expected_shards = build_tensor_shard_manifest(
+            parallel,
+            manifest.lora_rank,
+            &lora_a,
+            &lora_b,
+            &adam_m,
+            &adam_v,
+            &dynamic_adapters,
+        )?;
+        validate_saved_shards(&manifest.tensor_shards, &expected_shards)?;
+    }
+
     tracing::info!(
         step = manifest.step,
         loss = manifest.loss,
@@ -219,6 +478,286 @@ pub fn load_checkpoint(dir: &Path) -> Result<CheckpointData> {
         adam_v,
         dynamic_adapters,
     })
+}
+
+#[derive(Clone, Copy)]
+enum LoraSide {
+    A,
+    B,
+}
+
+fn validate_tensor_counts(
+    lora_a: &[Tensor],
+    lora_b: &[Tensor],
+    adam_m: &[Tensor],
+    adam_v: &[Tensor],
+    dynamic_adapters: &[DynamicAdapterCheckpoint],
+    strict_optimizer_layout: bool,
+) -> Result<()> {
+    if lora_a.len() != lora_b.len() || adam_m.len() != adam_v.len() {
+        bail!("fixed adapter checkpoint tensor count mismatch");
+    }
+    if strict_optimizer_layout
+        && !adam_m.is_empty()
+        && adam_m.len() != lora_a.len().saturating_mul(2)
+    {
+        bail!("tensor-parallel fixed optimizer state must contain A/B entries for every LoRA slot");
+    }
+    for adapter in dynamic_adapters {
+        if adapter.lora_a.len() != adapter.lora_b.len()
+            || adapter.adam_m.len() != adapter.adam_v.len()
+            || adapter.manifest.parameter_count != adapter.lora_a.len()
+            || adapter.manifest.optimizer_count != adapter.adam_m.len()
+        {
+            bail!(
+                "dynamic adapter {} checkpoint count mismatch",
+                adapter.manifest.id
+            );
+        }
+        if strict_optimizer_layout
+            && !adapter.adam_m.is_empty()
+            && adapter.adam_m.len() != adapter.lora_a.len().saturating_mul(2)
+        {
+            bail!(
+                "tensor-parallel dynamic adapter {} optimizer state must contain A/B entries for every LoRA slot",
+                adapter.manifest.id
+            );
+        }
+    }
+    Ok(())
+}
+
+fn build_tensor_shard_manifest(
+    parallel: &ParallelCheckpointManifest,
+    fixed_lora_rank: i64,
+    lora_a: &[Tensor],
+    lora_b: &[Tensor],
+    adam_m: &[Tensor],
+    adam_v: &[Tensor],
+    dynamic_adapters: &[DynamicAdapterCheckpoint],
+) -> Result<Vec<TensorShardManifest>> {
+    validate_tensor_counts(lora_a, lora_b, adam_m, adam_v, dynamic_adapters, true)?;
+    let mut shards = Vec::new();
+    append_adapter_shards(
+        &mut shards,
+        parallel,
+        None,
+        fixed_lora_rank,
+        lora_a,
+        lora_b,
+        adam_m,
+        adam_v,
+    )?;
+    for adapter in dynamic_adapters {
+        append_adapter_shards(
+            &mut shards,
+            parallel,
+            Some(adapter.manifest.id),
+            adapter.manifest.rank,
+            &adapter.lora_a,
+            &adapter.lora_b,
+            &adapter.adam_m,
+            &adapter.adam_v,
+        )?;
+    }
+    Ok(shards)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn append_adapter_shards(
+    shards: &mut Vec<TensorShardManifest>,
+    parallel: &ParallelCheckpointManifest,
+    adapter_id: Option<i64>,
+    global_lora_rank: i64,
+    lora_a: &[Tensor],
+    lora_b: &[Tensor],
+    adam_m: &[Tensor],
+    adam_v: &[Tensor],
+) -> Result<()> {
+    let adapter_prefix = adapter_id
+        .map(|id| format!("dynamic_{id}_"))
+        .unwrap_or_default();
+    for (index, tensor) in lora_a.iter().enumerate() {
+        shards.push(tensor_shard(
+            parallel,
+            adapter_id,
+            global_lora_rank,
+            "adapter.safetensors",
+            format!("{adapter_prefix}a_{index}"),
+            "lora_a",
+            LoraSide::A,
+            tensor,
+        )?);
+    }
+    for (index, tensor) in lora_b.iter().enumerate() {
+        shards.push(tensor_shard(
+            parallel,
+            adapter_id,
+            global_lora_rank,
+            "adapter.safetensors",
+            format!("{adapter_prefix}b_{index}"),
+            "lora_b",
+            LoraSide::B,
+            tensor,
+        )?);
+    }
+    for (index, tensor) in adam_m.iter().enumerate() {
+        shards.push(tensor_shard(
+            parallel,
+            adapter_id,
+            global_lora_rank,
+            "optimizer.safetensors",
+            format!("{adapter_prefix}a_{index}"),
+            "adam_m",
+            if index % 2 == 0 {
+                LoraSide::A
+            } else {
+                LoraSide::B
+            },
+            tensor,
+        )?);
+    }
+    for (index, tensor) in adam_v.iter().enumerate() {
+        shards.push(tensor_shard(
+            parallel,
+            adapter_id,
+            global_lora_rank,
+            "optimizer.safetensors",
+            format!("{adapter_prefix}b_{index}"),
+            "adam_v",
+            if index % 2 == 0 {
+                LoraSide::A
+            } else {
+                LoraSide::B
+            },
+            tensor,
+        )?);
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn tensor_shard(
+    parallel: &ParallelCheckpointManifest,
+    adapter_id: Option<i64>,
+    global_lora_rank: i64,
+    file: &str,
+    tensor_name: String,
+    state: &str,
+    side: LoraSide,
+    tensor: &Tensor,
+) -> Result<TensorShardManifest> {
+    let tp_size = i64::try_from(parallel.tensor_model_parallel_size)
+        .context("TP size exceeds checkpoint tensor shape range")?;
+    let tp_rank = i64::try_from(parallel.tensor_model_parallel_rank)
+        .context("TP rank exceeds checkpoint tensor shape range")?;
+    if global_lora_rank <= 0 || global_lora_rank % tp_size != 0 {
+        bail!(
+            "global LoRA rank {global_lora_rank} must be positive and divisible by TP size {tp_size}"
+        );
+    }
+    let local_shape = tensor.size();
+    if local_shape.len() < 2 {
+        bail!("checkpoint tensor {file}:{tensor_name} must have at least two dimensions");
+    }
+    let partition_axis = match side {
+        LoraSide::A => local_shape.len() - 2,
+        LoraSide::B => local_shape.len() - 1,
+    };
+    let local_lora_rank = global_lora_rank / tp_size;
+    if local_shape[partition_axis] != local_lora_rank {
+        bail!(
+            "checkpoint tensor {file}:{tensor_name} has local rank {} on axis {partition_axis}, expected {local_lora_rank}",
+            local_shape[partition_axis]
+        );
+    }
+    let mut global_shape = local_shape.clone();
+    global_shape[partition_axis] = global_lora_rank;
+    let mut global_offset = vec![0; local_shape.len()];
+    global_offset[partition_axis] = tp_rank * local_lora_rank;
+    Ok(TensorShardManifest {
+        file: file.to_string(),
+        tensor_name,
+        state: state.to_string(),
+        adapter_id,
+        global_lora_rank,
+        global_shape,
+        local_shape,
+        partition_axis,
+        global_offset,
+        replica_identity: parallel.replica_identity(),
+    })
+}
+
+fn validate_saved_shards(
+    saved: &[TensorShardManifest],
+    expected: &[TensorShardManifest],
+) -> Result<()> {
+    let keyed = |shards: &[TensorShardManifest]| -> Result<BTreeMap<_, _>> {
+        let mut by_key = BTreeMap::new();
+        for shard in shards {
+            let key = (
+                shard.file.clone(),
+                shard.tensor_name.clone(),
+                shard.state.clone(),
+            );
+            if by_key.insert(key, shard.clone()).is_some() {
+                bail!(
+                    "duplicate tensor shard metadata for {}:{} ({})",
+                    shard.file,
+                    shard.tensor_name,
+                    shard.state
+                );
+            }
+        }
+        Ok(by_key)
+    };
+    let saved = keyed(saved)?;
+    let expected = keyed(expected)?;
+    if saved.len() != expected.len() {
+        bail!(
+            "tensor shard metadata count mismatch: saved={}, expected={}",
+            saved.len(),
+            expected.len()
+        );
+    }
+    for (key, expected_shard) in expected {
+        let saved_shard = saved
+            .get(&key)
+            .with_context(|| format!("missing tensor shard metadata for {}:{}", key.0, key.1))?;
+        if saved_shard != &expected_shard {
+            bail!(
+                "tensor shard metadata mismatch for {}:{}: saved={saved_shard:?}, expected={expected_shard:?}",
+                key.0,
+                key.1
+            );
+        }
+    }
+    Ok(())
+}
+
+fn rank_checkpoint_dir(root: &Path, global_rank: usize) -> PathBuf {
+    root.join(format!("rank-{global_rank:05}"))
+}
+
+fn env_usize(names: &[&str], default: usize) -> Result<usize> {
+    Ok(env_usize_optional(names)?.unwrap_or(default))
+}
+
+fn env_usize_optional(names: &[&str]) -> Result<Option<usize>> {
+    let Some((name, value)) = names
+        .iter()
+        .find_map(|name| env::var(name).ok().map(|value| (*name, value)))
+    else {
+        return Ok(None);
+    };
+    let value = value
+        .parse::<usize>()
+        .with_context(|| format!("{name} must be a non-negative integer"))?;
+    if value == 0 && name != "RANK" {
+        bail!("{name} must be positive");
+    }
+    Ok(Some(value))
 }
 
 fn named_tensors(
@@ -308,6 +847,8 @@ mod tests {
         )
         .unwrap();
         let loaded = load_checkpoint(dir.path()).unwrap();
+        assert!(loaded.manifest.parallel.is_none());
+        assert!(loaded.manifest.tensor_shards.is_empty());
         assert_eq!(loaded.manifest.lora_alpha, 4.0);
         assert_eq!(loaded.manifest.step, 7);
         assert_eq!(loaded.lora_a[0].size(), [2, 3]);
@@ -361,6 +902,8 @@ mod tests {
         .unwrap();
         let loaded = load_checkpoint(dir.path()).unwrap();
         assert_eq!(loaded.manifest.format, "rustrain-checkpoint-v2");
+        assert!(loaded.manifest.parallel.is_none());
+        assert!(loaded.manifest.tensor_shards.is_empty());
         assert_eq!(loaded.dynamic_adapters.len(), 1);
         let loaded_dynamic = &loaded.dynamic_adapters[0];
         assert_eq!(loaded_dynamic.manifest.id, 7);
@@ -390,5 +933,183 @@ mod tests {
         }"#;
         let manifest: DynamicAdapterManifest = serde_json::from_str(json).unwrap();
         assert_eq!(manifest.optimizer_step, 0);
+    }
+
+    fn tp_topology(global_rank: usize, tp_size: usize) -> ParallelCheckpointManifest {
+        ParallelCheckpointManifest::new(tp_size, global_rank, tp_size, 1, 1, 1, 1).unwrap()
+    }
+
+    fn tp_state(value: f64) -> (Vec<Tensor>, Vec<Tensor>, Vec<Tensor>, Vec<Tensor>) {
+        let a = Tensor::full([2, 3], value, (tch::Kind::Float, tch::Device::Cpu));
+        let b = Tensor::full([4, 2], value + 1.0, (tch::Kind::Float, tch::Device::Cpu));
+        let m = vec![a.zeros_like(), b.zeros_like()];
+        let v = vec![a.ones_like(), b.ones_like()];
+        (vec![a], vec![b], m, v)
+    }
+
+    fn tp_dynamic_adapter(value: f64) -> DynamicAdapterCheckpoint {
+        let a = Tensor::full([3, 5], value, (tch::Kind::Float, tch::Device::Cpu));
+        let b = Tensor::full([7, 3], value + 1.0, (tch::Kind::Float, tch::Device::Cpu));
+        DynamicAdapterCheckpoint {
+            manifest: DynamicAdapterManifest {
+                id: 9,
+                rank: 6,
+                alpha: 12.0,
+                optimizer_step: 4,
+                target_layers: vec![1],
+                target_modules: vec!["q_proj".into()],
+                parameter_count: 1,
+                optimizer_count: 2,
+            },
+            lora_a: vec![a.shallow_clone()],
+            lora_b: vec![b.shallow_clone()],
+            adam_m: vec![a.zeros_like(), b.zeros_like()],
+            adam_v: vec![a.ones_like(), b.ones_like()],
+        }
+    }
+
+    #[test]
+    fn tensor_parallel_ranks_use_distinct_paths_and_resume_same_topology() {
+        let dir = tempfile::tempdir().unwrap();
+        for global_rank in 0..2 {
+            let topology = tp_topology(global_rank, 2);
+            let (a, b, m, v) = tp_state(global_rank as f64 + 1.0);
+            let dynamic = tp_dynamic_adapter(global_rank as f64 + 10.0);
+            save_checkpoint_with_dynamic_for_topology(
+                dir.path(),
+                7,
+                0.25,
+                "Qwen/test",
+                4,
+                8.0,
+                &a,
+                &b,
+                &m,
+                &v,
+                &[dynamic],
+                &topology,
+            )
+            .unwrap();
+        }
+
+        let rank0_dir = dir.path().join("rank-00000");
+        let rank1_dir = dir.path().join("rank-00001");
+        assert!(rank0_dir.join("manifest.json").is_file());
+        assert!(rank1_dir.join("manifest.json").is_file());
+
+        let topology = tp_topology(1, 2);
+        let loaded = load_checkpoint_for_topology(dir.path(), &topology).unwrap();
+        assert_eq!(loaded.manifest.format, TP_CHECKPOINT_FORMAT);
+        assert_eq!(loaded.manifest.parallel.as_ref(), Some(&topology));
+        assert_eq!(loaded.manifest.tensor_shards.len(), 12);
+        assert_eq!(loaded.lora_a[0].double_value(&[0, 0]), 2.0);
+        assert_eq!(loaded.dynamic_adapters.len(), 1);
+        assert_eq!(
+            loaded.dynamic_adapters[0].lora_a[0].double_value(&[0, 0]),
+            11.0
+        );
+
+        let a_shard = loaded
+            .manifest
+            .tensor_shards
+            .iter()
+            .find(|shard| shard.state == "lora_a")
+            .unwrap();
+        assert_eq!(a_shard.global_lora_rank, 4);
+        assert_eq!(a_shard.local_shape, vec![2, 3]);
+        assert_eq!(a_shard.global_shape, vec![4, 3]);
+        assert_eq!(a_shard.partition_axis, 0);
+        assert_eq!(a_shard.global_offset, vec![2, 0]);
+        assert_eq!(a_shard.replica_identity, "global-rank-1-tp-rank-1");
+
+        let b_shard = loaded
+            .manifest
+            .tensor_shards
+            .iter()
+            .find(|shard| shard.state == "lora_b")
+            .unwrap();
+        assert_eq!(b_shard.global_shape, vec![4, 4]);
+        assert_eq!(b_shard.partition_axis, 1);
+        assert_eq!(b_shard.global_offset, vec![0, 2]);
+
+        let dynamic_a_shard = loaded
+            .manifest
+            .tensor_shards
+            .iter()
+            .find(|shard| shard.state == "lora_a" && shard.adapter_id == Some(9))
+            .unwrap();
+        assert_eq!(dynamic_a_shard.global_lora_rank, 6);
+        assert_eq!(dynamic_a_shard.global_shape, vec![6, 5]);
+        assert_eq!(dynamic_a_shard.global_offset, vec![3, 0]);
+    }
+
+    #[test]
+    fn tensor_parallel_resume_rejects_different_tp_size() {
+        let dir = tempfile::tempdir().unwrap();
+        let topology = tp_topology(0, 2);
+        let (a, b, m, v) = tp_state(1.0);
+        save_checkpoint_with_dynamic_for_topology(
+            dir.path(),
+            7,
+            0.25,
+            "Qwen/test",
+            4,
+            8.0,
+            &a,
+            &b,
+            &m,
+            &v,
+            &[],
+            &topology,
+        )
+        .unwrap();
+
+        let different_tp = tp_topology(0, 4);
+        let error = load_checkpoint_for_topology(dir.path(), &different_tp)
+            .err()
+            .expect("different TP size must fail");
+        assert!(error.to_string().contains("topology mismatch"));
+    }
+
+    #[test]
+    fn tensor_parallel_resume_rejects_another_ranks_shard() {
+        let dir = tempfile::tempdir().unwrap();
+        let rank0 = tp_topology(0, 2);
+        let (a, b, m, v) = tp_state(1.0);
+        save_checkpoint_with_dynamic_for_topology(
+            dir.path(),
+            7,
+            0.25,
+            "Qwen/test",
+            4,
+            8.0,
+            &a,
+            &b,
+            &m,
+            &v,
+            &[],
+            &rank0,
+        )
+        .unwrap();
+
+        let rank1_dir = dir.path().join("rank-00001");
+        std::fs::create_dir(&rank1_dir).unwrap();
+        for file in [
+            "manifest.json",
+            "adapter.safetensors",
+            "optimizer.safetensors",
+        ] {
+            std::fs::copy(
+                dir.path().join("rank-00000").join(file),
+                rank1_dir.join(file),
+            )
+            .unwrap();
+        }
+
+        let rank1 = tp_topology(1, 2);
+        let error = load_checkpoint_for_topology(dir.path(), &rank1)
+            .err()
+            .expect("loading another rank's shard must fail");
+        assert!(error.to_string().contains("topology mismatch"));
     }
 }
