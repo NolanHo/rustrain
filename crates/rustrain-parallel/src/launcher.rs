@@ -9,6 +9,8 @@ use std::{
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
+use crate::topology::ParallelTopology;
+
 #[derive(Debug, Serialize)]
 struct LaunchSummary {
     nproc_per_node: usize,
@@ -40,6 +42,12 @@ pub struct LaunchEnvSummary {
     pub cuda_visible_devices: Option<String>,
     pub assigned_cuda_visible_device: Option<String>,
     pub assigned_cuda_device_ordinal: Option<usize>,
+    pub tensor_model_parallel_size: usize,
+    pub pipeline_model_parallel_size: usize,
+    pub data_parallel_size: usize,
+    pub expert_model_parallel_size: usize,
+    pub context_parallel_size: usize,
+    pub parallel_rank_order: String,
 }
 
 pub fn launch(
@@ -49,7 +57,15 @@ pub fn launch(
     master_port: u16,
     command: &[String],
 ) -> Result<()> {
-    launch_multi(nproc_per_node, 1, 0, output_dir, master_addr, master_port, command)
+    launch_multi(
+        nproc_per_node,
+        1,
+        0,
+        output_dir,
+        master_addr,
+        master_port,
+        command,
+    )
 }
 
 pub fn launch_multi(
@@ -81,6 +97,7 @@ pub fn launch_multi(
         .with_context(|| format!("failed to create {}", output_dir.display()))?;
     let current_exe = std::env::current_exe().context("failed to locate current executable")?;
     let timeout = launch_timeout()?;
+    let topology = ParallelTopology::from_env_with_world_size(world_size)?;
     let visible_cuda_devices =
         parse_visible_cuda_devices(std::env::var("CUDA_VISIBLE_DEVICES").ok());
     validate_visible_cuda_devices(nproc_per_node, visible_cuda_devices.as_deref())?;
@@ -107,6 +124,47 @@ pub fn launch_multi(
             .env("RUSTRAIN_LAUNCH_OUTPUT_DIR", output_dir)
             .env("NNODES", nnodes.to_string())
             .env("NODE_RANK", node_rank.to_string())
+            // Normalize topology variables for every child. Explicit
+            // TP_SIZE/PP_SIZE/... values come from the parent environment;
+            // unspecified axes default to replicated DP and are validated
+            // against the launcher's world size above.
+            .env("TP_SIZE", topology.tensor_model_parallel_size().to_string())
+            .env(
+                "PP_SIZE",
+                topology.pipeline_model_parallel_size().to_string(),
+            )
+            .env("DP_SIZE", topology.data_parallel_size().to_string())
+            .env("EP_SIZE", topology.expert_model_parallel_size().to_string())
+            .env("CP_SIZE", topology.context_parallel_size().to_string())
+            .env(
+                "RUSTRAIN_TP_SIZE",
+                topology.tensor_model_parallel_size().to_string(),
+            )
+            .env(
+                "RUSTRAIN_PP_SIZE",
+                topology.pipeline_model_parallel_size().to_string(),
+            )
+            .env(
+                "RUSTRAIN_DP_SIZE",
+                topology.data_parallel_size().to_string(),
+            )
+            .env(
+                "RUSTRAIN_EP_SIZE",
+                topology.expert_model_parallel_size().to_string(),
+            )
+            .env(
+                "RUSTRAIN_CP_SIZE",
+                topology.context_parallel_size().to_string(),
+            )
+            .env(
+                "RUSTRAIN_PARALLEL_ORDER",
+                topology
+                    .order()
+                    .into_iter()
+                    .map(|axis| axis.name())
+                    .collect::<Vec<_>>()
+                    .join("-"),
+            )
             .env(
                 "PYTORCH_CUDA_ALLOC_CONF",
                 "expandable_segments:True,max_split_size_mb:512",
@@ -119,13 +177,19 @@ pub fn launch_multi(
         {
             child
                 .env("RUSTRAIN_ASSIGNED_CUDA_VISIBLE_DEVICE", assigned_device)
-                .env("RUSTRAIN_ASSIGNED_CUDA_DEVICE_ORDINAL", local_rank.to_string());
+                .env(
+                    "RUSTRAIN_ASSIGNED_CUDA_DEVICE_ORDINAL",
+                    local_rank.to_string(),
+                );
         }
         children.push((
             global_rank,
             log_path,
             child.spawn().with_context(|| {
-                format!("failed to spawn rank {global_rank} for command {:?}", command)
+                format!(
+                    "failed to spawn rank {global_rank} for command {:?}",
+                    command
+                )
             })?,
         ));
     }
@@ -188,6 +252,7 @@ pub fn print_launch_env() -> Result<()> {
 }
 
 fn read_launch_env() -> Result<LaunchEnvSummary> {
+    let topology = ParallelTopology::from_env()?;
     Ok(LaunchEnvSummary {
         rank: parse_env_usize("RANK")?,
         local_rank: parse_env_usize("LOCAL_RANK")?,
@@ -204,6 +269,17 @@ fn read_launch_env() -> Result<LaunchEnvSummary> {
                     .with_context(|| "RUSTRAIN_ASSIGNED_CUDA_DEVICE_ORDINAL must be a usize")
             })
             .transpose()?,
+        tensor_model_parallel_size: topology.tensor_model_parallel_size(),
+        pipeline_model_parallel_size: topology.pipeline_model_parallel_size(),
+        data_parallel_size: topology.data_parallel_size(),
+        expert_model_parallel_size: topology.expert_model_parallel_size(),
+        context_parallel_size: topology.context_parallel_size(),
+        parallel_rank_order: topology
+            .order()
+            .into_iter()
+            .map(|axis| axis.name())
+            .collect::<Vec<_>>()
+            .join("-"),
     })
 }
 
