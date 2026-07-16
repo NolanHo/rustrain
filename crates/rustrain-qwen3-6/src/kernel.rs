@@ -575,8 +575,8 @@ impl CppTrainingContext {
         Ok(loss)
     }
 
-    /// Train all adapters in batched chunks. Each chunk runs independent
-    /// forward → loss → backward → Adam. Input is expanded to [N, seq].
+    /// Train all adapters in batched activation chunks. Chunks accumulate
+    /// gradients and share one logical Adam update. Input is expanded to [N, seq].
     /// n_total: total number of adapters. lora_rank: LoRA rank for N_max calc.
     /// Returns average loss across chunks.
     pub fn train_multi_lora(
