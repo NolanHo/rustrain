@@ -73,11 +73,12 @@ type FnSetMtpWeights = unsafe extern "C" fn(
     i64,              // num_mtp_layer_weights
     *mut c_void,      // mtp_layer_configs_ptr
     i64,              // num_mtp_layers
-);
+) -> i32;
 type FnSetCheckpoint = unsafe extern "C" fn(*mut c_void, i32, i64);
 type FnSetNcclComm = unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void, i32, i32);
 type FnInitNccl = unsafe extern "C" fn(*mut c_void) -> i32;
 type FnSetCudaDevice = unsafe extern "C" fn(i32);
+type FnSetBaseTpMlp = unsafe extern "C" fn(*mut c_void, i32) -> i32;
 type FnAddLora = unsafe extern "C" fn(*mut c_void, i64, f64, *const i64, i64, *const i8) -> i64;
 type FnRemoveLora = unsafe extern "C" fn(*mut c_void, i64) -> i32;
 type FnListLora = unsafe extern "C" fn(*mut c_void, *mut i64, i64) -> i64;
@@ -144,6 +145,7 @@ struct KernelHandles {
     set_nccl_comm: FnSetNcclComm,
     init_nccl: FnInitNccl,
     set_cuda_device: FnSetCudaDevice,
+    set_base_tp_mlp: FnSetBaseTpMlp,
     add_lora: FnAddLora,
     remove_lora: FnRemoveLora,
     list_lora: FnListLora,
@@ -194,7 +196,7 @@ unsafe fn load_kernels() -> Option<KernelHandles> {
         }};
     }
     let abi_version: FnKernelAbiVersion = sym!("qwen36_kernel_abi_version");
-    if abi_version() != 11 {
+    if abi_version() != 13 {
         return None;
     }
     Some(KernelHandles {
@@ -222,6 +224,7 @@ unsafe fn load_kernels() -> Option<KernelHandles> {
         set_nccl_comm: sym!("qwen36_set_nccl_comm"),
         init_nccl: sym!("qwen36_init_nccl"),
         set_cuda_device: sym!("qwen36_set_cuda_device"),
+        set_base_tp_mlp: sym!("qwen36_set_base_tp_mlp"),
         add_lora: sym!("qwen36_add_lora"),
         remove_lora: sym!("qwen36_remove_lora"),
         list_lora: sym!("qwen36_list_lora"),
@@ -250,6 +253,38 @@ fn get_ptr(weights: &std::collections::BTreeMap<String, Tensor>, name: &str) -> 
         Some(t) => t.as_ptr() as *mut c_void,
         None => std::ptr::null_mut(),
     }
+}
+
+/// Return the rank-local frozen dense MLP shard for TP, or `None` when the
+/// tensor is not one of gate/up/down. This runs during CPU weight loading.
+pub fn shard_dense_mlp_weight_for_tp(
+    name: &str,
+    tensor: &Tensor,
+    tp_size: usize,
+    tp_rank: usize,
+) -> Result<Option<Tensor>> {
+    let dim = if name.ends_with(".mlp.gate_proj.weight") || name.ends_with(".mlp.up_proj.weight") {
+        0
+    } else if name.ends_with(".mlp.down_proj.weight") {
+        1
+    } else {
+        return Ok(None);
+    };
+    if tp_size <= 1 || tp_rank >= tp_size {
+        bail!("invalid dense MLP TP shard: tp_rank={tp_rank}, tp_size={tp_size}");
+    }
+    let full = *tensor
+        .size()
+        .get(dim as usize)
+        .ok_or_else(|| anyhow::anyhow!("base TP MLP weight {name} has no dimension {dim}"))?;
+    if full <= 0 || full % tp_size as i64 != 0 {
+        bail!(
+            "base TP MLP weight {name} dimension {dim}={full} is not divisible by TP_SIZE={tp_size}"
+        );
+    }
+    let shard = full / tp_size as i64;
+    let start = tp_rank as i64 * shard;
+    Ok(Some(tensor.narrow(dim, start, shard).contiguous()))
 }
 
 pub fn build_weight_ptrs(
@@ -468,6 +503,7 @@ impl CppTrainingContext {
         eps: f64,
         lora_scaling: f64,
         lora_rank: i64,
+        base_tp_mlp: bool,
         target_layers: &[usize],
         target_modules: &[Qwen36LoraTargetModule],
         expert_start: usize,
@@ -547,6 +583,11 @@ impl CppTrainingContext {
         };
         if ptr.is_null() {
             bail!("C++ create_training_context returned null");
+        }
+        let base_tp_status = unsafe { (kh.set_base_tp_mlp)(ptr, i32::from(base_tp_mlp)) };
+        if base_tp_status != 0 {
+            unsafe { (kh.free_ctx)(ptr) };
+            bail!("C++ base dense MLP TP configuration failed");
         }
         let lora_count = unsafe { (kh.get_lora_count)(ptr) };
         Ok(Self { ptr, lora_count })
@@ -750,7 +791,7 @@ impl CppTrainingContext {
         let lc_ptr = mtp_layer_configs.as_ptr() as *mut c_void;
         std::mem::forget(mtp_layer_configs);
 
-        unsafe {
+        let status = unsafe {
             (kh.set_mtp_weights)(
                 self.ptr,
                 mtp_fc_ptr,
@@ -761,7 +802,10 @@ impl CppTrainingContext {
                 wp_len as i64,
                 lc_ptr,
                 config.mtp_num_hidden_layers as i64,
-            );
+            )
+        };
+        if status != 0 {
+            bail!("C++ set_mtp_weights rejected the requested context state");
         }
         Ok(())
     }
@@ -1101,5 +1145,43 @@ impl Drop for CppTrainingContext {
                 unsafe { (kh.free_ctx)(self.ptr) };
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::shard_dense_mlp_weight_for_tp;
+    use tch::{Kind, Tensor};
+
+    #[test]
+    fn dense_mlp_tp_shards_matching_intermediate_axes() {
+        let gate = Tensor::arange(48, (Kind::Float, tch::Device::Cpu)).reshape([12, 4]);
+        let down = Tensor::arange(48, (Kind::Float, tch::Device::Cpu)).reshape([4, 12]);
+        let gate_rank_one =
+            shard_dense_mlp_weight_for_tp("model.layers.0.mlp.gate_proj.weight", &gate, 2, 1)
+                .unwrap()
+                .unwrap();
+        let down_rank_one =
+            shard_dense_mlp_weight_for_tp("model.layers.0.mlp.down_proj.weight", &down, 2, 1)
+                .unwrap()
+                .unwrap();
+        assert_eq!(gate_rank_one.size(), [6, 4]);
+        assert_eq!(down_rank_one.size(), [4, 6]);
+        assert_eq!(gate_rank_one.double_value(&[0, 0]), 24.0);
+        assert_eq!(down_rank_one.double_value(&[0, 0]), 6.0);
+    }
+
+    #[test]
+    fn dense_mlp_tp_ignores_non_mlp_weights_and_rejects_bad_shapes() {
+        let tensor = Tensor::zeros([5, 4], (Kind::Float, tch::Device::Cpu));
+        assert!(
+            shard_dense_mlp_weight_for_tp("model.layers.0.self_attn.q_proj.weight", &tensor, 2, 0)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            shard_dense_mlp_weight_for_tp("model.layers.0.mlp.up_proj.weight", &tensor, 2, 0)
+                .is_err()
+        );
     }
 }

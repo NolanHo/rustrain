@@ -194,6 +194,28 @@ struct NcclAllReduceFunction : public torch::autograd::Function<NcclAllReduceFun
     }
 };
 
+// Megatron's copy_to_tensor_model_parallel_region equivalent: replicated
+// input in forward, sum the column-parallel input-gradient contributions in
+// backward before they flow into the preceding replicated sub-layer.
+struct TpCopyToRegionFunction : public torch::autograd::Function<TpCopyToRegionFunction> {
+    static at::Tensor forward(torch::autograd::AutogradContext* ctx,
+        at::Tensor input, int64_t comm_ptr, int64_t stream_ptr) {
+        ctx->saved_data["comm"] = comm_ptr;
+        ctx->saved_data["stream"] = stream_ptr;
+        return input;
+    }
+
+    static std::vector<at::Tensor> backward(
+        torch::autograd::AutogradContext* ctx,
+        std::vector<at::Tensor> grad_output) {
+        auto comm = reinterpret_cast<ncclComm_t>(ctx->saved_data["comm"].toInt());
+        auto stream = reinterpret_cast<cudaStream_t>(ctx->saved_data["stream"].toInt());
+        auto grad_input = NcclAllReduceFunction::allreduce(
+            grad_output[0], comm, stream);
+        return {grad_input, at::Tensor(), at::Tensor()};
+    }
+};
+
 struct FusedSwiGLUFunction : public torch::autograd::Function<FusedSwiGLUFunction> {
     static at::Tensor forward(torch::autograd::AutogradContext* ctx,
         at::Tensor gate, at::Tensor up, double limit) {
@@ -1626,6 +1648,13 @@ static inline int64_t weight_count_for_layer(const LayerConfig& cfg) {
 
 enum class LoraSegment : uint8_t { Attention, Mlp };
 
+static bool is_mlp_lora_target(const std::string& name) {
+    return name == "gate_proj" || name == "up_proj" || name == "down_proj" ||
+        name == "shared_gate_proj" || name == "shared_up_proj" ||
+        name == "shared_down_proj" || name == "experts_gate_up_proj" ||
+        name == "experts_down_proj";
+}
+
 struct LoraProjectionSpec {
     const char* name;
     int64_t weight_index;
@@ -1692,6 +1721,10 @@ static int64_t lora_pair_index(const LayerConfig& cfg, const char* name) {
 
 static RoutedExpertLora routed_expert_lora(
     TrainingContext* ctx, int64_t layer_idx, const LayerConfig& cfg);
+static at::Tensor tp_allreduce_base_mlp(
+    TrainingContext* ctx, const at::Tensor& local_output);
+static at::Tensor tp_copy_base_mlp_input(
+    TrainingContext* ctx, const at::Tensor& input);
 
 static at::Tensor forward_single_layer(
     TrainingContext* ctx, const at::Tensor& hidden, at::Tensor** w, const LayerConfig* cfg,
@@ -1763,7 +1796,9 @@ static at::Tensor forward_single_layer(
                 lora_pair_index(*cfg, "up_proj"), *w[9]);
             auto down = apply_multi_lora(ctx, layer_idx,
                 lora_pair_index(*cfg, "down_proj"), *w[10]);
-            auto mlp_out = dense_mlp_forward(post_attn, gate, up, down, kind);
+            auto mlp_input = tp_copy_base_mlp_input(ctx, post_attn);
+            auto mlp_out = tp_allreduce_base_mlp(
+                ctx, dense_mlp_forward(mlp_input, gate, up, down, kind));
             return hidden + attn_output + mlp_out;
         }
     } else {
@@ -1825,7 +1860,9 @@ static at::Tensor forward_single_layer(
                 lora_pair_index(*cfg, "up_proj"), *w[12]);
             auto down = apply_multi_lora(ctx, layer_idx,
                 lora_pair_index(*cfg, "down_proj"), *w[13]);
-            auto mlp_out = dense_mlp_forward(post_attn, gate, up, down, kind);
+            auto mlp_input = tp_copy_base_mlp_input(ctx, post_attn);
+            auto mlp_out = tp_allreduce_base_mlp(
+                ctx, dense_mlp_forward(mlp_input, gate, up, down, kind));
             return hidden + attn_output + mlp_out;
         }
     }
@@ -1964,6 +2001,10 @@ struct TrainingContext {
     cudaStream_t tp_stream = nullptr;
     int tp_world_size = 1;
     int tp_rank = 0;
+    // Frozen dense SwiGLU TP: gate/up are output-sharded and down is
+    // input-sharded by the Rust weight loader.  The local row contribution
+    // is reduced over the TP communicator before the residual add.
+    bool base_tp_mlp = false;
     // Set when a legacy NCCL setter supplies an incompatible mixed topology.
     // Training entry points reject the context before touching parameters.
     bool topology_invalid = false;
@@ -2093,6 +2134,32 @@ static at::Tensor tp_allreduce_lora_delta(
         ctx->tp_world_size);
     return NcclAllReduceFunction::apply(
         local_delta, (int64_t)ctx->tp_comm,
+        (int64_t)reinterpret_cast<uintptr_t>(ctx->tp_stream));
+}
+
+static at::Tensor tp_allreduce_base_mlp(
+    TrainingContext* ctx, const at::Tensor& local_output
+) {
+    if (!ctx || !ctx->base_tp_mlp || ctx->tp_world_size <= 1)
+        return local_output;
+    TORCH_CHECK(ctx->tp_comm,
+        "base MLP TP communicator is not initialized for TP_SIZE=",
+        ctx->tp_world_size);
+    return NcclAllReduceFunction::apply(
+        local_output, (int64_t)ctx->tp_comm,
+        (int64_t)reinterpret_cast<uintptr_t>(ctx->tp_stream));
+}
+
+static at::Tensor tp_copy_base_mlp_input(
+    TrainingContext* ctx, const at::Tensor& input
+) {
+    if (!ctx || !ctx->base_tp_mlp || ctx->tp_world_size <= 1)
+        return input;
+    TORCH_CHECK(ctx->tp_comm,
+        "base MLP TP communicator is not initialized for TP_SIZE=",
+        ctx->tp_world_size);
+    return TpCopyToRegionFunction::apply(
+        input, (int64_t)ctx->tp_comm,
         (int64_t)reinterpret_cast<uintptr_t>(ctx->tp_stream));
 }
 
@@ -2709,17 +2776,20 @@ static at::Tensor dense_mlp_forward_batched(
     const int64_t up_pair = lora_pair_index(cfg, "up_proj");
     const int64_t down_pair = lora_pair_index(cfg, "down_proj");
 
-    auto gate_out = at::matmul(hidden, gate_proj.t());
-    auto up_out = at::matmul(hidden, up_proj.t());
+    auto mlp_input = tp_copy_base_mlp_input(ctx, hidden);
+    auto gate_out = at::matmul(mlp_input, gate_proj.t());
+    auto up_out = at::matmul(mlp_input, up_proj.t());
     gate_out = add_batched_lora(
-        ctx, gate_out, hidden, lora_batch_entry(ctx, layer_idx, gate_pair));
+        ctx, gate_out, mlp_input, lora_batch_entry(ctx, layer_idx, gate_pair));
     up_out = add_batched_lora(
-        ctx, up_out, hidden, lora_batch_entry(ctx, layer_idx, up_pair));
+        ctx, up_out, mlp_input, lora_batch_entry(ctx, layer_idx, up_pair));
     auto activated = fused_swiglu_op(gate_out, up_out, 0.0);
     auto result = at::matmul(activated, down_proj.t());
     result = add_batched_lora(
         ctx, result, activated, lora_batch_entry(ctx, layer_idx, down_pair));
-    return result.to(compute_type);
+    // Base TP uses a row-parallel down projection.  Reduce its local hidden
+    // contribution before the residual add.
+    return tp_allreduce_base_mlp(ctx, result.to(compute_type));
 }
 
 __attribute__((noinline, visibility("default")))
@@ -2869,7 +2939,9 @@ at::Tensor compute_mlp_only(
             lora_pair_index(cfg, "up_proj"), *ctx->weight_ptrs[w_offset+mlp_start+1]);
         auto down = apply_multi_lora(ctx, layer_idx,
             lora_pair_index(cfg, "down_proj"), *ctx->weight_ptrs[w_offset+mlp_start+2]);
-        return dense_mlp_forward(post_attn, gate, up, down, kind);
+        auto mlp_input = tp_copy_base_mlp_input(ctx, post_attn);
+        return tp_allreduce_base_mlp(
+            ctx, dense_mlp_forward(mlp_input, gate, up, down, kind));
     }
 }
 
@@ -4295,7 +4367,7 @@ static at::Tensor mtp_compute_loss(
 extern "C" {
 
 __attribute__((visibility("default"))) int64_t qwen36_kernel_abi_version() {
-    return 11;
+    return 13;
 }
 
 // Create training context — called once at startup
@@ -4321,6 +4393,7 @@ __attribute__((visibility("default"))) void* qwen36_create_training_context(
         ctx->vocab_size = vocab_size; ctx->rms_eps = rms_eps;
         ctx->step_count = 0; ctx->lora_scaling = lora_scaling;
         ctx->num_layers = num_layers;
+        ctx->has_mtp = false;
         ctx->use_checkpoint = false; ctx->group_size = 4;
         const char* tp_size_env = getenv("TP_SIZE");
         if (!tp_size_env) tp_size_env = getenv("RUSTRAIN_TP_SIZE");
@@ -4504,9 +4577,83 @@ __attribute__((visibility("default"))) void* qwen36_create_training_context(
     }
 }
 
+__attribute__((visibility("default"))) int32_t qwen36_set_base_tp_mlp(
+    void* ctx_ptr, int32_t enabled
+) {
+    try {
+        auto* ctx = reinterpret_cast<TrainingContext*>(ctx_ptr);
+        TORCH_CHECK(ctx, "null training context");
+        if (!enabled) {
+            TORCH_CHECK(!ctx->base_tp_mlp,
+                "base dense MLP TP cannot be disabled after enablement because "
+                "the context owns TP-sharded weights");
+            return 0;
+        }
+        if (ctx->base_tp_mlp) return 0;
+        TORCH_CHECK(ctx->tp_world_size > 1,
+            "base dense MLP TP requires TP_SIZE>1");
+        TORCH_CHECK(!ctx->has_mtp,
+            "base dense MLP TP requires MTP to be disabled");
+        for (const auto& adapter : ctx->adapters) {
+            TORCH_CHECK(!adapter.target_modules.empty(),
+                "base dense MLP TP does not support an existing dynamic LoRA "
+                "adapter targeting all modules");
+            for (const auto& name : adapter.target_modules) {
+                TORCH_CHECK(!is_mlp_lora_target(name),
+                    "base dense MLP TP does not support existing dynamic MLP LoRA target ",
+                    name, "; use attention-only targets");
+            }
+        }
+
+        int64_t weight_offset = 0;
+        for (int64_t layer = 0; layer < ctx->num_layers; ++layer) {
+            const auto& cfg = ctx->layer_configs[layer];
+            TORCH_CHECK(cfg.num_experts == 0,
+                "base dense MLP TP currently supports dense models only");
+            TORCH_CHECK(cfg.intermediate_size > 0 &&
+                    cfg.intermediate_size % ctx->tp_world_size == 0,
+                "dense intermediate_size must be divisible by TP_SIZE");
+            const int64_t local_intermediate =
+                cfg.intermediate_size / ctx->tp_world_size;
+            const int64_t mlp_start = cfg.layer_type == 0 ? 8 : 11;
+            auto* gate = ctx->weight_ptrs[weight_offset + mlp_start];
+            auto* up = ctx->weight_ptrs[weight_offset + mlp_start + 1];
+            auto* down = ctx->weight_ptrs[weight_offset + mlp_start + 2];
+            TORCH_CHECK(gate && up && down &&
+                    gate->dim() == 2 && up->dim() == 2 && down->dim() == 2,
+                "base dense MLP TP requires matrix gate/up/down weights");
+            TORCH_CHECK(gate->size(0) == local_intermediate &&
+                    up->size(0) == local_intermediate &&
+                    down->size(1) == local_intermediate &&
+                    gate->size(1) == up->size(1) &&
+                    gate->size(1) == down->size(0),
+                "base dense MLP TP received inconsistent local weight shapes: gate=",
+                gate->sizes(), " up=", up->sizes(), " down=", down->sizes(),
+                " expected local intermediate=", local_intermediate);
+
+            const int64_t lora_offset = ctx->lora_layer_offset[layer];
+            auto projections = lora_projection_table(cfg);
+            for (int64_t pair = 0; pair < projections.count; ++pair) {
+                if (projections.entries[pair].segment == LoraSegment::Mlp) {
+                    TORCH_CHECK(!ctx->lora_active[lora_offset + pair],
+                        "base dense MLP TP does not yet support MLP LoRA target ",
+                        projections.entries[pair].name,
+                        "; use explicit attention-only targets");
+                }
+            }
+            weight_offset += weight_count_for_layer(cfg);
+        }
+        ctx->base_tp_mlp = true;
+        return 0;
+    } catch (const std::exception& e) {
+        fprintf(stderr, "[q36] set_base_tp_mlp FAILED: %s\n", e.what());
+        return -1;
+    }
+}
+
 // Set MTP weights on an existing training context.
 // Called after create_training_context if MTP is enabled.
-__attribute__((visibility("default"))) void qwen36_set_mtp_weights(
+__attribute__((visibility("default"))) int32_t qwen36_set_mtp_weights(
     void* ctx_ptr,
     void* mtp_fc_ptr,
     void* mtp_pre_fc_norm_emb_ptr,
@@ -4515,25 +4662,35 @@ __attribute__((visibility("default"))) void qwen36_set_mtp_weights(
     void** mtp_layer_weight_ptrs, int64_t num_mtp_layer_weights,
     void* mtp_layer_configs_ptr, int64_t num_mtp_layers
 ) {
-    auto* ctx = reinterpret_cast<TrainingContext*>(ctx_ptr);
-    ctx->has_mtp = true;
-    ctx->mtp_fc = reinterpret_cast<at::Tensor*>(mtp_fc_ptr);
-    ctx->mtp_pre_fc_norm_emb = reinterpret_cast<at::Tensor*>(mtp_pre_fc_norm_emb_ptr);
-    ctx->mtp_pre_fc_norm_hidden = reinterpret_cast<at::Tensor*>(mtp_pre_fc_norm_hidden_ptr);
-    ctx->mtp_norm = reinterpret_cast<at::Tensor*>(mtp_norm_ptr);
+    try {
+        auto* ctx = reinterpret_cast<TrainingContext*>(ctx_ptr);
+        TORCH_CHECK(ctx, "null training context");
+        TORCH_CHECK(!ctx->base_tp_mlp,
+            "MTP cannot be enabled after base dense MLP TP because MTP weights are not sharded");
+        TORCH_CHECK(!ctx->has_mtp, "MTP weights are already configured");
+        ctx->has_mtp = true;
+        ctx->mtp_fc = reinterpret_cast<at::Tensor*>(mtp_fc_ptr);
+        ctx->mtp_pre_fc_norm_emb = reinterpret_cast<at::Tensor*>(mtp_pre_fc_norm_emb_ptr);
+        ctx->mtp_pre_fc_norm_hidden = reinterpret_cast<at::Tensor*>(mtp_pre_fc_norm_hidden_ptr);
+        ctx->mtp_norm = reinterpret_cast<at::Tensor*>(mtp_norm_ptr);
 
-    auto** wp = reinterpret_cast<at::Tensor**>(mtp_layer_weight_ptrs);
-    for (int64_t i = 0; i < num_mtp_layer_weights; i++) {
-        ctx->mtp_layer_weights.push_back(wp[i]);
+        auto** wp = reinterpret_cast<at::Tensor**>(mtp_layer_weight_ptrs);
+        for (int64_t i = 0; i < num_mtp_layer_weights; i++) {
+            ctx->mtp_layer_weights.push_back(wp[i]);
+        }
+
+        auto* lcfgs = reinterpret_cast<LayerConfig*>(mtp_layer_configs_ptr);
+        for (int64_t i = 0; i < num_mtp_layers; i++) {
+            ctx->mtp_layer_configs.push_back(lcfgs[i]);
+        }
+
+        fprintf(stderr, "[q36_ctx] MTP set: %ld MTP layers, %ld MTP weight pointers\n",
+            (long)num_mtp_layers, (long)num_mtp_layer_weights);
+        return 0;
+    } catch (const std::exception& e) {
+        fprintf(stderr, "[q36] set_mtp_weights FAILED: %s\n", e.what());
+        return -1;
     }
-
-    auto* lcfgs = reinterpret_cast<LayerConfig*>(mtp_layer_configs_ptr);
-    for (int64_t i = 0; i < num_mtp_layers; i++) {
-        ctx->mtp_layer_configs.push_back(lcfgs[i]);
-    }
-
-    fprintf(stderr, "[q36_ctx] MTP set: %ld MTP layers, %ld MTP weight pointers\n",
-        (long)num_mtp_layers, (long)num_mtp_layer_weights);
 }
 
 // One training micro-step. Non-final micro-steps accumulate scaled leaf
@@ -5746,6 +5903,16 @@ int64_t qwen36_add_lora(
             while (std::getline(ss, item, ','))
                 adapter.target_modules.insert(item);
         }
+        if (ctx->base_tp_mlp) {
+            TORCH_CHECK(!adapter.target_modules.empty(),
+                "base MLP tensor parallelism does not support a dynamic LoRA "
+                "adapter targeting all modules; use explicit attention-only targets");
+            for (const auto& name : adapter.target_modules) {
+                TORCH_CHECK(!is_mlp_lora_target(name),
+                    "base MLP tensor parallelism does not yet support dynamic MLP LoRA target ", name,
+                    "; use attention-only targets until projection-axis LoRA collectives are implemented");
+            }
+        }
         for (auto layer : adapter.target_layers) {
             TORCH_CHECK(layer >= 0 && layer < ctx->num_layers,
                 "dynamic LoRA target layer out of range: ", layer,
@@ -6056,6 +6223,17 @@ __attribute__((visibility("default")))
 double qwen36_eval_step(void* ctx_ptr, void* input_ids_ptr, void* target_mask_ptr, void* attention_mask_ptr) {
     try {
         auto* ctx = reinterpret_cast<TrainingContext*>(ctx_ptr);
+        struct EvalCacheGuard {
+            TrainingContext* ctx;
+            ~EvalCacheGuard() {
+                // Evaluation builds projection caches under no-grad. They
+                // must never be reused by the following training step.
+                if (!ctx) return;
+                ctx->lora_cache_valid = false;
+                ctx->lora_batch_valid = false;
+            }
+        } cache_guard{ctx};
+        TORCH_CHECK(ctx, "null training context");
         TORCH_CHECK(ctx->adapters.empty(),
             "dynamic LoRA adapters require selected multi-LoRA evaluation; "
             "ordinary eval_step has no tenant mapping");

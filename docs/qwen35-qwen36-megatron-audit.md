@@ -7,7 +7,7 @@
 - 模型语义：Qwen3.5 dense、Qwen3.6 dense/MoE 的 native forward/backward 路径已经覆盖 hybrid full attention、GDN、MoE、MTP 和 LoRA 目标模块；已有配置解析、集成测试及 H20 native smoke 证据。
 - 已实现并可验证的分布式子集：MoE expert parallel，以及 replicated LoRA 的 data parallel；梯度累积和 dynamic multi-LoRA 已有 logical-step 边界。DP 动态租户按 adapter token count 加权，sharded A2A native 路径会保留 source flattened row 来恢复租户，并按全局租户 token count 归一化。
 - 性能：MoE grouped dispatch 相对逐 expert matmul 的已有 microbenchmark 为约 3.70x（E=32, N=4096, H=2048, I=768，结果误差为 0）；这不是端到端训练吞吐或 Megatron 对比。
-- 已实现 LoRA latent-rank 的 TP-only 子集，但尚未实现 frozen base-weight tensor parallel、pipeline parallel、context parallel，以及 TP/PP/CP 与 EP/DP 的组合。当前训练上下文仍由单个进程持有完整 dense 权重和完整层栈。
+- 已实现 LoRA latent-rank TP-only，以及 frozen dense SwiGLU MLP 的 gate/up row shard、down column shard 和输出 all-reduce。attention/GDN/MoE/vocab 仍复制，MLP LoRA 在 base TP 下暂拒绝；PP/CP 和 TP 与 EP/DP 的组合仍未实现。
 - 因此当前实现不能宣称“Megatron-LM 级别”。它是一个计算集中在 C++ 的 LoRA/EP/DP 子集，离 Megatron 的完整并行和通信重叠仍有实质差距。
 
 ## 当前能力矩阵
@@ -23,7 +23,7 @@
 | microbatch accumulation | 已实现子集 | non-final microbatch 只 backward，final microbatch 才 optimizer；FP32 accumulator 存储/聚合，autograd leaf backward 仍为 BF16 |
 | replicated data parallel | 已实现 | logical-step 边界同步 replicated LoRA；EP expert 参数不走该 reduction |
 | expert parallel | 已实现子集 | 默认 routed-output all-reduce；gated variable-split A2A 已验证 fixed-LoRA 和 native dynamic-LoRA data sharding；GPU-only split planning、异步 overlap 和 DeepEP backend 未实现 |
-| tensor parallel | LoRA-only 子集 | latent rank 分片和独立 TP communicator 已验证；attention/MLP/LM-head base 权重仍不切分 |
+| tensor parallel | dense MLP 子集 | latent rank 分片和独立 TP communicator 已验证；dense gate/up/down base 权重按 intermediate 维切分并有 TP2 full-reference smoke；attention/GDN/MoE/LM-head 仍不切分，MLP LoRA/MTP 暂拒绝 |
 | pipeline parallel | 未实现于 Qwen native | 没有 stage 切分、microbatch scheduler 或 activation send/recv |
 | context parallel | 未实现于 Qwen native | 没有 ring attention、跨 rank KV/索引合并 |
 | distributed checkpoint | 已实现子集 | same-topology TP rank-sharded v3 已验证；跨 topology reshard 和 PP/CP 未实现 |
@@ -32,7 +32,9 @@
 
 ### 并行语义
 
-Megatron 的 TP 会按 head、hidden/intermediate 和 vocab 维度切分权重，并在线性层边界执行必要的 reduce-scatter/all-reduce；PP 会把层分到不同 stage 并使用 1F1B 等调度；CP 会在序列和 attention state 上做跨 rank 通信。当前 Qwen native `TrainingContext` 仍加载完整模型并在一个 C++ forward 中执行全部层，因此仅增加 `tensor_model_parallel_size` 等配置不能得到正确的 TP/PP/CP。
+Megatron 的通用 MLP 使用 ColumnParallel fc1、local gated activation 和 RowParallel fc2，并进一步提供 fused fc1/activation、sequence parallel、通信重叠和 sharded-state 支持。当前 Qwen native 已补上算法等价的 separate gate/up row shard 与 down column shard，但仍是两次独立 GEMM，且 attention/GDN/MoE/vocab 不分片。Megatron-LM 本仓库也没有直接的 Qwen3.5/3.6 模型实现，精确模型入口依赖外部 bridge，因此这里比较的是成熟的通用并行基础设施，不是同模型端到端实现。
+
+PP 会把层分到不同 stage 并使用 1F1B 等调度；CP 会在序列和 attention state 上做跨 rank 通信。当前 Qwen native `TrainingContext` 仍在每个进程执行完整层栈，因此仅增加 PP/CP 配置不能得到正确语义。
 
 当前 DP/EP 也不是完整 Megatron 语义：DP 同步 replicated LoRA 梯度并按租户 token count 归一化，expert 参数留在 EP rank；EP 默认使用 routed-output all-reduce，实验 gate 已加入 variable-split dispatch/inverse combine 和 fixed/dynamic LoRA data sharding。dynamic native path 的 source row metadata 已随 token index 传输，但仍逐 top-k 执行 host-visible count sync，没有 fused permutation、GPU-only split planning、异步 overlap 或 DeepEP backend。server 的 `TrainMultiLora` 目前向各 worker 广播相同 batch，因此不能把它当作 source-sharded 服务吞吐。
 
@@ -50,12 +52,12 @@ Megatron 的 TP 会按 head、hidden/intermediate 和 vocab 维度切分权重�
 
 ## 验证边界
 
-已运行的验证包括 Rust 编译检查、core 单测、Qwen3.6 配置/集成测试，以及 H20 ABI11 的单卡、TP2、EP2 和 DP2 native smoke。DP2 的 weighted m/grouped/v/Adam BF16 delta oracle 分别达到 `2.43e-8`、`2.27e-8`、`7.33e-8` 和 `0`；legacy EP2 与 full-expert reference 的 loss、LoRA、Adam state 和标准 Adam 首步 oracle 在两 rank 均为零差异。Replicated A2A 与 fixed-LoRA sharded A2A 也均通过两 rank full-expert reference；sharded token counts `[1,3]` 的加权 loss 与 global reference 相差约 `9.6e-7`，m/v 最大差 `1.22e-5` / `3.92e-9`，Adam oracle 差为 `0`。新增 H20 ABI1 dynamic sharded full-reference smoke 在两 rank 返回 `0`：互补 source masks 的 dynamic grouped-expert 参数最大差 `1.53e-5`，m/v 最大差 `4.88e-5` / `5.75e-8`；两次有效租户更新后 step 为 `[2,2]`，全局零 token 租户保持 step `0` 且参数无更新，普通 `train_step` 被显式拒绝。没有完成 Qwen3.5/3.6 完整大模型的长时间训练、跨节点通信、PP/CP smoke 或与 Megatron-LM 的同条件 benchmark。因此“正确”应理解为已覆盖且有直接 oracle 的子集，而不是所有并行配置。
+已运行的验证包括 Rust 编译检查、core 单测、Qwen3.6 配置/集成测试，以及 H20 ABI11 的单卡、TP2、EP2 和 DP2 native smoke。DP2 的 weighted m/grouped/v/Adam BF16 delta oracle 分别达到 `2.43e-8`、`2.27e-8`、`7.33e-8` 和 `0`；legacy EP2 与 full-expert reference 的 loss、LoRA、Adam state 和标准 Adam 首步 oracle 在两 rank 均为零差异。Replicated A2A 与 fixed-LoRA sharded A2A 也均通过两 rank full-expert reference；sharded token counts `[1,3]` 的加权 loss 与 global reference 相差约 `9.6e-7`，m/v 最大差 `1.22e-5` / `3.92e-9`，Adam oracle 差为 `0`。H20 ABI1 dynamic sharded full-reference smoke 在两 rank 返回 `0`：dynamic grouped-expert 参数最大差 `1.53e-5`，m/v 最大差 `4.88e-5` / `5.75e-8`。新增 ABI13 dense base-MLP TP2 smoke 对 gate/up/down 使用半尺寸本地权重，验证 row-parallel forward sum 与 column-parallel input dgrad sum；eval/train loss 与完整权重参考相差 `1.84e-5`，并直接比较 FP32 LoRA accumulator 和更新切片。没有完成完整大模型长时间训练、跨节点通信、完整 base TP、PP/CP smoke 或与 Megatron-LM 的同条件 benchmark。因此“正确”应理解为已覆盖且有直接 oracle 的子集，而不是所有并行配置。
 
 ## 继续达到 Megatron 级别所需的最小工作包
 
 1. 建立 5D TP/PP/DP/EP/CP topology，并让 launcher、NCCL process groups 和 checkpoint 使用同一 rank 映射。
-2. 为 Qwen full/GDN attention、dense MLP、MoE、LM-head/CE 实现 TP shard 和对应 collective；为 PP 实现 stage forward/backward 与 1F1B scheduler；为 CP 实现 ring attention/state exchange。
+2. 补齐 Qwen full/GDN attention、MoE、LM-head/CE 的 TP shard，并为 dense MLP 增加 projection-aware LoRA、fused gate/up FC1 和 MTP 支持；为 PP 实现 stage forward/backward 与 1F1B scheduler；为 CP 实现 ring attention/state exchange。
 3. 将 EP dispatch/combine 替换为 fused/异步路径，并测量通信与计算重叠。
 4. 为 LoRA 增加 FP32 accumulation、每 adapter optimizer step、可恢复的 accumulation 状态和 rank-sharded checkpoint。
 5. 在固定硬件和 workload 上，与 Megatron-LM 记录 tokens/s、step time、峰值显存、通信占比和 loss 曲线。

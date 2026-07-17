@@ -320,12 +320,12 @@ impl TrainingSession for Qwen36Session {
             .and_then(|s| s.parse::<usize>().ok())
             .unwrap_or(1);
         if tp_size > 1 {
-            if ep_world_size != tp_size || req.rank < 0 || req.rank as usize >= ep_world_size {
+            if ep_world_size != tp_size || ep_rank >= ep_world_size {
                 return Err(anyhow!(
                     "native Qwen server TP-only mode requires WORLD_SIZE=TP_SIZE and a valid global rank (world={}, tp={}, rank={})",
                     ep_world_size,
                     tp_size,
-                    req.rank
+                    ep_rank
                 ));
             }
             unsafe {
@@ -334,6 +334,41 @@ impl TrainingSession for Qwen36Session {
         }
         let is_ep = ep_world_size > 1 && runtime_config.is_moe && tp_size == 1;
         let is_data_parallel = ep_world_size > 1 && !runtime_config.is_moe && tp_size == 1;
+        let base_tp_mlp = tp_size > 1 && !runtime_config.is_moe;
+        if base_tp_mlp {
+            if runtime_config.mtp_num_hidden_layers > 0 {
+                return Err(anyhow!(
+                    "base dense TP MLP currently requires MTP to be disabled"
+                ));
+            }
+            if runtime_config.intermediate_size <= 0
+                || runtime_config.intermediate_size % tp_size as i64 != 0
+            {
+                return Err(anyhow!(
+                    "dense intermediate_size={} must be divisible by TP_SIZE={tp_size}",
+                    runtime_config.intermediate_size
+                ));
+            }
+            if req.target_modules.is_empty()
+                || req.target_modules.iter().any(|name| {
+                    matches!(
+                        name.as_str(),
+                        "gate_proj"
+                            | "up_proj"
+                            | "down_proj"
+                            | "shared_gate_proj"
+                            | "shared_up_proj"
+                            | "shared_down_proj"
+                            | "experts_gate_up_proj"
+                            | "experts_down_proj"
+                    )
+                })
+            {
+                return Err(anyhow!(
+                    "base dense TP MLP currently requires explicit attention-only LoRA target_modules"
+                ));
+            }
+        }
 
         // Compute expert shard
         let (expert_start, expert_count) = if is_ep {
@@ -371,7 +406,20 @@ impl TrainingSession for Qwen36Session {
                     .to_kind(self.compute_kind);
                 weights.insert(name, narrowed);
             } else {
-                let t = tensor.to_device(self.device);
+                let local_shard = if base_tp_mlp {
+                    rustrain_qwen3_6::kernel::shard_dense_mlp_weight_for_tp(
+                        &name,
+                        &tensor,
+                        tp_size,
+                        ep_rank % tp_size,
+                    )?
+                } else {
+                    None
+                };
+                let t = local_shard
+                    .as_ref()
+                    .unwrap_or(&tensor)
+                    .to_device(self.device);
                 let processed = t.to_kind(self.compute_kind);
                 weights.insert(name, processed);
             }
@@ -409,6 +457,7 @@ impl TrainingSession for Qwen36Session {
             req.eps,
             lora_scaling,
             req.rank,
+            base_tp_mlp,
             &all_layers,
             &target_modules,
             expert_start,

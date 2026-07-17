@@ -304,7 +304,10 @@ fn train_impl(
             );
         }
         if lora_config.rank % tp_size as i64 != 0 {
-            bail!("LoRA rank {} must be divisible by TP_SIZE={tp_size}", lora_config.rank);
+            bail!(
+                "LoRA rank {} must be divisible by TP_SIZE={tp_size}",
+                lora_config.rank
+            );
         }
         unsafe {
             std::env::set_var("TP_SIZE", tp_size.to_string());
@@ -323,6 +326,45 @@ fn train_impl(
                 .and_then(|s| s.parse::<i32>().ok())
                 .unwrap_or(0),
         );
+    }
+
+    // Dense base-weight TP follows Megatron's ColumnParallel/RowParallel MLP:
+    // gate/up rows are owned by one TP rank and down columns are owned by the
+    // same rank.  Attention and embeddings remain replicated in this first
+    // unit.  MoE, MTP, and mixed TP/DP/EP are rejected rather than silently
+    // running with an unsharded path.
+    let base_tp_mlp = tp_size > 1 && !runtime_config.is_moe;
+    if base_tp_mlp {
+        if runtime_config.mtp_num_hidden_layers > 0 {
+            bail!("base dense TP MLP currently requires MTP to be disabled");
+        }
+        if runtime_config.intermediate_size <= 0
+            || runtime_config.intermediate_size % tp_size as i64 != 0
+        {
+            bail!(
+                "dense intermediate_size={} must be divisible by TP_SIZE={tp_size}",
+                runtime_config.intermediate_size
+            );
+        }
+        if lora_config.target_modules.is_empty()
+            || lora_config.target_modules.iter().any(|module| {
+                matches!(
+                    module.cpp_name(),
+                    "gate_proj"
+                        | "up_proj"
+                        | "down_proj"
+                        | "shared_gate_proj"
+                        | "shared_up_proj"
+                        | "shared_down_proj"
+                        | "experts_gate_up_proj"
+                        | "experts_down_proj"
+                )
+            })
+        {
+            bail!(
+                "base dense TP MLP currently requires explicit attention-only LoRA target_modules"
+            );
+        }
     }
 
     // Build needed weight set
@@ -371,7 +413,24 @@ fn train_impl(
         );
     } else {
         for (name, tensor) in &weights {
-            weights_gpu.insert(name.clone(), tensor.to_device(device).to_kind(compute_kind));
+            let local_shard = if base_tp_mlp {
+                crate::kernel::shard_dense_mlp_weight_for_tp(name, tensor, tp_size, rank % tp_size)?
+            } else {
+                None
+            };
+            let gpu_tensor = local_shard
+                .as_ref()
+                .unwrap_or(tensor)
+                .to_device(device)
+                .to_kind(compute_kind);
+            weights_gpu.insert(name.clone(), gpu_tensor);
+        }
+        if base_tp_mlp {
+            info!(
+                tp_size,
+                tp_rank = rank % tp_size,
+                "base dense MLP TP enabled: gate/up row shards and down column shards"
+            );
         }
     }
 
@@ -429,6 +488,7 @@ fn train_impl(
         config.train.adam_eps as f64,
         lora_config.alpha as f64 / lora_config.rank as f64, // lora scaling = alpha / rank
         lora_config.rank as i64,
+        base_tp_mlp,
         &lora_config.target_layers,
         &lora_config.target_modules,
         expert_start,
@@ -458,12 +518,7 @@ fn train_impl(
 
     // Set MTP weights if available
     if runtime_config.mtp_num_hidden_layers > 0 {
-        ctx.set_mtp_weights(
-            &weights_gpu,
-            &runtime_config,
-            expert_start,
-            expert_count,
-        )?;
+        ctx.set_mtp_weights(&weights_gpu, &runtime_config, expert_start, expert_count)?;
         info!(
             "C++ TrainingContext: MTP weights set ({} layers)",
             runtime_config.mtp_num_hidden_layers
