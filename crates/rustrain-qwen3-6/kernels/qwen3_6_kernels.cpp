@@ -47,6 +47,8 @@ static int64_t g_context_sequence = 0;
 at::Tensor apply_multi_lora(TrainingContext* ctx, int64_t layer_idx, int64_t pair_idx, const at::Tensor& base_weight);
 static at::Tensor tp_allreduce_lora_delta(
     TrainingContext* ctx, const at::Tensor& local_delta);
+static at::Tensor tp_copy_lora_input(
+    TrainingContext* ctx, const at::Tensor& input);
 
 // ──────────────────────────────────────────────────────────────────────
 // Forward declarations
@@ -1181,7 +1183,8 @@ static at::Tensor dynamic_expert_lora_delta(
         .index_select(0, pair_indices).to(input.scalar_type());
     auto b = b_stack.flatten(0, 1)
         .index_select(0, pair_indices).to(input.scalar_type());
-    auto low_rank = at::bmm(a, input.unsqueeze(-1)).squeeze(-1);
+    auto lora_input = tp_copy_lora_input(ctx, input);
+    auto low_rank = at::bmm(a, lora_input.unsqueeze(-1)).squeeze(-1);
     auto delta = at::bmm(b, low_rank.unsqueeze(-1)).squeeze(-1);
     auto scaling_stack = entry->scaling;
     if (scaling_stack.size(0) == 1 && batch > 1) {
@@ -1233,7 +1236,8 @@ static at::Tensor moe_routed_a2a(
             if (expert_lora.gate_up_a && expert_lora.gate_up_b) {
                 auto a = expert_lora.gate_up_a->select(0, e_local);
                 auto b = expert_lora.gate_up_b->select(0, e_local);
-                auto delta = at::matmul(at::matmul(selected, a.t()), b.t()) *
+                auto lora_input = tp_copy_lora_input(training_ctx, selected);
+                auto delta = at::matmul(at::matmul(lora_input, a.t()), b.t()) *
                     expert_lora.scaling;
                 gu = gu + tp_allreduce_lora_delta(training_ctx, delta);
             }
@@ -1250,7 +1254,8 @@ static at::Tensor moe_routed_a2a(
             if (expert_lora.down_a && expert_lora.down_b) {
                 auto a = expert_lora.down_a->select(0, e_local);
                 auto b = expert_lora.down_b->select(0, e_local);
-                auto delta = at::matmul(at::matmul(activated, a.t()), b.t()) *
+                auto lora_input = tp_copy_lora_input(training_ctx, activated);
+                auto delta = at::matmul(at::matmul(lora_input, a.t()), b.t()) *
                     expert_lora.scaling;
                 expert_out = expert_out +
                     tp_allreduce_lora_delta(training_ctx, delta);
@@ -1462,8 +1467,9 @@ static at::Tensor moe_forward(
                 auto gu = at::_grouped_mm(
                     selected, experts_gate_up.transpose(1, 2), offsets);
                 if (expert_lora.gate_up_a && expert_lora.gate_up_b) {
+                    auto lora_input = tp_copy_lora_input(training_ctx, selected);
                     auto low_rank = at::_grouped_mm(
-                        selected, expert_lora.gate_up_a->transpose(1, 2), offsets);
+                        lora_input, expert_lora.gate_up_a->transpose(1, 2), offsets);
                     auto delta = at::_grouped_mm(
                         low_rank, expert_lora.gate_up_b->transpose(1, 2), offsets);
                     gu = gu + tp_allreduce_lora_delta(
@@ -1480,8 +1486,9 @@ static at::Tensor moe_forward(
                 auto expert_out = at::_grouped_mm(
                     activated, experts_down.transpose(1, 2), offsets);
                 if (expert_lora.down_a && expert_lora.down_b) {
+                    auto lora_input = tp_copy_lora_input(training_ctx, activated);
                     auto low_rank = at::_grouped_mm(
-                        activated, expert_lora.down_a->transpose(1, 2), offsets);
+                        lora_input, expert_lora.down_a->transpose(1, 2), offsets);
                     auto delta = at::_grouped_mm(
                         low_rank, expert_lora.down_b->transpose(1, 2), offsets);
                     expert_out = expert_out + tp_allreduce_lora_delta(
@@ -1521,7 +1528,8 @@ static at::Tensor moe_forward(
                 if (expert_lora.gate_up_a && expert_lora.gate_up_b) {
                     auto a = expert_lora.gate_up_a->select(0, e_local);
                     auto b = expert_lora.gate_up_b->select(0, e_local);
-                    auto delta = at::matmul(at::matmul(selected, a.t()), b.t())
+                    auto lora_input = tp_copy_lora_input(training_ctx, selected);
+                    auto delta = at::matmul(at::matmul(lora_input, a.t()), b.t())
                         * expert_lora.scaling;
                     gu = gu + tp_allreduce_lora_delta(training_ctx, delta);
                 }
@@ -1537,7 +1545,8 @@ static at::Tensor moe_forward(
                 if (expert_lora.down_a && expert_lora.down_b) {
                     auto a = expert_lora.down_a->select(0, e_local);
                     auto b = expert_lora.down_b->select(0, e_local);
-                    auto delta = at::matmul(at::matmul(activated, a.t()), b.t())
+                    auto lora_input = tp_copy_lora_input(training_ctx, activated);
+                    auto delta = at::matmul(at::matmul(lora_input, a.t()), b.t())
                         * expert_lora.scaling;
                     expert_out = expert_out
                         + tp_allreduce_lora_delta(training_ctx, delta);
@@ -2008,11 +2017,19 @@ struct TrainingContext {
     // Variable-size group ranges for selective checkpointing
     std::vector<std::pair<int64_t, int64_t>> group_ranges;
 
-    // NCCL for Expert Parallel all-reduce (nullptr if single-GPU)
+    // Expert-parallel communicator. Layer dispatch/combine and dense replica
+    // reductions use this axis; routed-expert parameters never reduce on it.
     ncclComm_t nccl_comm = nullptr;
     cudaStream_t nccl_stream = nullptr;
     int ep_world_size = 1;
     int ep_rank = 0;
+    bool expert_parallel = false;
+    // Expert-data-parallel communicator. Routed experts are replicated only
+    // across this axis, while dense parameters reduce across both EP and DP.
+    ncclComm_t dp_comm = nullptr;
+    cudaStream_t dp_stream = nullptr;
+    int dp_world_size = 1;
+    int dp_rank = 0;
     bool data_parallel = false;
     // LoRA-only tensor parallelism keeps frozen base weights replicated and
     // shards the latent rank. Only the local LoRA delta uses this communicator.
@@ -2101,7 +2118,7 @@ static void validate_adapter_collective_registry(
     int64_t requested_rank,
     bool use_registered_order
 ) {
-    if (!ctx || (!ctx->nccl_comm && !ctx->tp_comm)) return;
+    if (!ctx || (!ctx->nccl_comm && !ctx->dp_comm && !ctx->tp_comm)) return;
 
     AdapterRegistryHash hash;
     hash.add_u64(requested_count);
@@ -2166,9 +2183,10 @@ static void validate_adapter_collective_registry(
             ncclGetErrorString(err));
     };
 
-    // A reduction over one axis followed by the orthogonal axis propagates
-    // the extrema over the full TP x DP/EP grid.
-    reduce_axis(ctx->nccl_comm, "DP/EP");
+    // Sequential reductions over the orthogonal axes propagate the extrema
+    // over the complete TP x EP x DP grid.
+    reduce_axis(ctx->nccl_comm, "EP");
+    reduce_axis(ctx->dp_comm, "DP");
     reduce_axis(ctx->tp_comm, "TP");
     const auto minimum_cpu = minimum.to(at::kCPU);
     const auto maximum_cpu = maximum.to(at::kCPU);
@@ -2506,23 +2524,24 @@ static void tp_broadcast_lora_parameter(
         "NCCL LoRA parameter broadcast failed: ", ncclGetErrorString(err));
 }
 
-static void dp_broadcast_lora_parameter(
-    TrainingContext* ctx, at::Tensor& tensor
+static void replica_broadcast_lora_parameter(
+    at::Tensor& tensor, ncclComm_t communicator, int world_size,
+    const char* axis
 ) {
-    if (!ctx || !ctx->data_parallel || ctx->ep_world_size <= 1 ||
-        !tensor.defined()) return;
-    TORCH_CHECK(ctx->nccl_comm,
-        "LoRA DP communicator is not initialized for parameter broadcast");
+    if (world_size <= 1 || !tensor.defined()) return;
+    TORCH_CHECK(communicator, "LoRA ", axis,
+        " communicator is not initialized for parameter broadcast");
     TORCH_CHECK(tensor.is_cuda() && tensor.is_contiguous(),
-        "LoRA DP parameter broadcast requires a contiguous CUDA tensor");
+        "LoRA replica parameter broadcast requires a contiguous CUDA tensor");
     const int dev = tensor.device().index();
     cudaSetDevice(dev);
     auto stream = c10::cuda::getCurrentCUDAStream(dev).stream();
     auto err = ncclBroadcast(
         tensor.data_ptr(), tensor.data_ptr(), tensor.numel(),
-        nccl_dtype_for(tensor), 0, ctx->nccl_comm, stream);
+        nccl_dtype_for(tensor), 0, communicator, stream);
     TORCH_CHECK(err == ncclSuccess,
-        "NCCL LoRA DP parameter broadcast failed: ", ncclGetErrorString(err));
+        "NCCL LoRA ", axis, " parameter broadcast failed: ",
+        ncclGetErrorString(err));
 }
 
 static void synchronize_adapter_replicated_lora_parameters(
@@ -2543,8 +2562,19 @@ static void synchronize_fixed_replicated_lora_parameters(TrainingContext* ctx) {
             else if (ctx->base_tp_attention && ctx->tp_world_size > 1 &&
                      layout == LoraTpLayout::RowParallel)
                 tp_broadcast_lora_parameter(ctx, ctx->lora_b[slot]);
-            dp_broadcast_lora_parameter(ctx, ctx->lora_a[slot]);
-            dp_broadcast_lora_parameter(ctx, ctx->lora_b[slot]);
+            const bool grouped_expert =
+                lora_projection_table(ctx->layer_configs[layer])
+                    .entries[pair].grouped_expert;
+            if (!grouped_expert) {
+                replica_broadcast_lora_parameter(
+                    ctx->lora_a[slot], ctx->nccl_comm, ctx->ep_world_size, "EP");
+                replica_broadcast_lora_parameter(
+                    ctx->lora_b[slot], ctx->nccl_comm, ctx->ep_world_size, "EP");
+            }
+            replica_broadcast_lora_parameter(
+                ctx->lora_a[slot], ctx->dp_comm, ctx->dp_world_size, "DP");
+            replica_broadcast_lora_parameter(
+                ctx->lora_b[slot], ctx->dp_comm, ctx->dp_world_size, "DP");
         }
     }
     for (auto& adapter : ctx->adapters)
@@ -2557,7 +2587,9 @@ static void synchronize_adapter_replicated_lora_parameters(
     if (!ctx) return;
     if (ctx->base_tp_attention && ctx->tp_world_size > 1 && !ctx->tp_comm)
         return;  // qwen36_init_nccl synchronizes deferred adapters.
-    if (ctx->data_parallel && ctx->ep_world_size > 1 && !ctx->nccl_comm)
+    if (ctx->expert_parallel && ctx->ep_world_size > 1 && !ctx->nccl_comm)
+        return;
+    if (ctx->data_parallel && ctx->dp_world_size > 1 && !ctx->dp_comm)
         return;
     for (auto& [layer, pairs] : adapter.params) {
         for (int64_t pair = 0; pair < static_cast<int64_t>(pairs.size()); ++pair) {
@@ -2570,8 +2602,19 @@ static void synchronize_adapter_replicated_lora_parameters(
             else if (ctx->base_tp_attention && ctx->tp_world_size > 1 &&
                      layout == LoraTpLayout::RowParallel)
                 tp_broadcast_lora_parameter(ctx, b);
-            dp_broadcast_lora_parameter(ctx, a);
-            dp_broadcast_lora_parameter(ctx, b);
+            const bool grouped_expert =
+                lora_projection_table(ctx->layer_configs[layer])
+                    .entries[pair].grouped_expert;
+            if (!grouped_expert) {
+                replica_broadcast_lora_parameter(
+                    a, ctx->nccl_comm, ctx->ep_world_size, "EP");
+                replica_broadcast_lora_parameter(
+                    b, ctx->nccl_comm, ctx->ep_world_size, "EP");
+            }
+            replica_broadcast_lora_parameter(
+                a, ctx->dp_comm, ctx->dp_world_size, "DP");
+            replica_broadcast_lora_parameter(
+                b, ctx->dp_comm, ctx->dp_world_size, "DP");
         }
     }
 }
@@ -2594,7 +2637,7 @@ static void tp_sum_replicated_lora_accumulator(
 
 static void reduce_lora_accumulator(
     TrainingContext* ctx, at::Tensor& accumulator, double scale,
-    bool allreduce
+    bool reduce_ep, bool reduce_dp
 ) {
     if (!accumulator.defined()) return;
     TORCH_CHECK(accumulator.scalar_type() == at::kFloat,
@@ -2603,88 +2646,56 @@ static void reduce_lora_accumulator(
     if (scale != 1.0) {
         contiguous = contiguous * scale;
     }
-    if (!allreduce) {
-        at::NoGradGuard guard;
-        accumulator.copy_(contiguous);
-        return;
-    }
-    TORCH_CHECK(ctx->nccl_comm, "LoRA gradient all-reduce has no communicator");
-    auto reduced = at::empty_like(contiguous);
-    int dev = contiguous.device().index();
-    cudaSetDevice(dev);
-    auto stream = c10::cuda::getCurrentCUDAStream(dev).stream();
-    auto err = ncclAllReduce(
-        contiguous.data_ptr(), reduced.data_ptr(), contiguous.numel(),
-        nccl_dtype_for(contiguous), ncclSum, ctx->nccl_comm, stream);
-    TORCH_CHECK(err == ncclSuccess, "NCCL LoRA gradient all-reduce failed: ",
-                ncclGetErrorString(err));
+    auto reduce_axis = [&](ncclComm_t communicator, const char* axis) {
+        TORCH_CHECK(communicator, "LoRA ", axis,
+            " gradient all-reduce has no communicator");
+        auto reduced = at::empty_like(contiguous);
+        const int dev = contiguous.device().index();
+        cudaSetDevice(dev);
+        auto stream = c10::cuda::getCurrentCUDAStream(dev).stream();
+        auto err = ncclAllReduce(
+            contiguous.data_ptr(), reduced.data_ptr(), contiguous.numel(),
+            nccl_dtype_for(contiguous), ncclSum, communicator, stream);
+        TORCH_CHECK(err == ncclSuccess, "NCCL LoRA ", axis,
+            " gradient all-reduce failed: ", ncclGetErrorString(err));
+        contiguous = reduced;
+    };
+    if (reduce_ep) reduce_axis(ctx->nccl_comm, "EP");
+    if (reduce_dp) reduce_axis(ctx->dp_comm, "DP");
     at::NoGradGuard guard;
-    accumulator.copy_(reduced);
+    accumulator.copy_(contiguous);
 }
 
 static void normalize_lora_accumulator_numerator(
     TrainingContext* ctx, at::Tensor& accumulator,
-    const at::Tensor& global_weight, bool allreduce
+    const at::Tensor& global_weight, bool reduce_ep, bool reduce_dp
 ) {
     if (!accumulator.defined()) return;
     TORCH_CHECK(accumulator.scalar_type() == at::kFloat,
         "LoRA DP gradient accumulator must be FP32");
     TORCH_CHECK(global_weight.numel() == 1,
         "per-adapter LoRA global token weight must be scalar");
-    auto numerator = accumulator.contiguous();
-    at::Tensor reduced;
-    if (allreduce) {
-        TORCH_CHECK(ctx->nccl_comm,
-            "LoRA gradient all-reduce has no communicator");
-        reduced = at::empty_like(numerator);
-        int dev = numerator.device().index();
-        cudaSetDevice(dev);
-        auto stream = c10::cuda::getCurrentCUDAStream(dev).stream();
-        auto err = ncclAllReduce(
-            numerator.data_ptr(), reduced.data_ptr(), numerator.numel(),
-            nccl_dtype_for(numerator), ncclSum, ctx->nccl_comm, stream);
-        TORCH_CHECK(err == ncclSuccess,
-            "NCCL LoRA numerator all-reduce failed: ",
-            ncclGetErrorString(err));
-    } else {
-        reduced = numerator;
-    }
-    reduced = reduced / global_weight.clamp_min(1.0);
+    reduce_lora_accumulator(
+        ctx, accumulator, 1.0, reduce_ep, reduce_dp);
     at::NoGradGuard guard;
-    accumulator.copy_(reduced);
+    accumulator.div_(global_weight.clamp_min(1.0));
 }
 
 static void reduce_lora_accumulator_weighted(
     TrainingContext* ctx, at::Tensor& accumulator,
     const at::Tensor& local_weight, const at::Tensor& global_weight,
-    bool allreduce
+    bool reduce_ep, bool reduce_dp
 ) {
     if (!accumulator.defined()) return;
     TORCH_CHECK(accumulator.scalar_type() == at::kFloat,
         "LoRA DP gradient accumulator must be FP32");
     TORCH_CHECK(local_weight.numel() == 1 && global_weight.numel() == 1,
         "per-adapter LoRA token weights must be scalar");
-    auto weighted = accumulator.contiguous() * local_weight;
-    at::Tensor reduced;
-    if (allreduce) {
-        TORCH_CHECK(ctx->nccl_comm,
-            "LoRA gradient all-reduce has no communicator");
-        reduced = at::empty_like(weighted);
-        int dev = weighted.device().index();
-        cudaSetDevice(dev);
-        auto stream = c10::cuda::getCurrentCUDAStream(dev).stream();
-        auto err = ncclAllReduce(
-            weighted.data_ptr(), reduced.data_ptr(), weighted.numel(),
-            nccl_dtype_for(weighted), ncclSum, ctx->nccl_comm, stream);
-        TORCH_CHECK(err == ncclSuccess,
-            "NCCL weighted LoRA gradient all-reduce failed: ",
-            ncclGetErrorString(err));
-    } else {
-        reduced = weighted;
-    }
-    reduced = reduced / global_weight.clamp_min(1.0);
     at::NoGradGuard guard;
-    accumulator.copy_(reduced);
+    accumulator.mul_(local_weight);
+    reduce_lora_accumulator(
+        ctx, accumulator, 1.0, reduce_ep, reduce_dp);
+    accumulator.div_(global_weight.clamp_min(1.0));
 }
 
 // Fixed-LoRA gradients are accumulated as token-weighted numerators. Replicated
@@ -2699,12 +2710,32 @@ static void synchronize_lora_gradients(
     const at::Tensor* per_adapter_token_counts = nullptr,
     std::vector<uint8_t>* adapter_has_global_tokens = nullptr
 ) {
-    const bool sharded_a2a = ctx->nccl_comm && !ctx->data_parallel &&
+    const bool sharded_a2a = ctx->expert_parallel && ctx->nccl_comm &&
         env_enabled("QWEN36_EP_A2A_SHARDED");
     TORCH_CHECK(!sharded_a2a || env_enabled("QWEN36_EP_A2A"),
         "QWEN36_EP_A2A_SHARDED=1 requires QWEN36_EP_A2A=1");
-    const bool dp_allreduce = ctx->nccl_comm && ctx->data_parallel;
+    const bool dp_allreduce = ctx->data_parallel && ctx->dp_comm;
     const bool normalization_allreduce = dp_allreduce || sharded_a2a;
+    const double replicated_a2a_expert_scale =
+        ctx->expert_parallel && env_enabled("QWEN36_EP_A2A") && !sharded_a2a
+        ? 1.0 / static_cast<double>(ctx->ep_world_size)
+        : 1.0;
+    auto sum_replica_axes = [&](at::Tensor value, bool reduce_ep) {
+        auto reduce_axis = [&](ncclComm_t communicator, const char* axis) {
+            auto reduced = at::empty_like(value);
+            auto stream = c10::cuda::getCurrentCUDAStream(
+                value.device().index()).stream();
+            auto err = ncclAllReduce(
+                value.data_ptr(), reduced.data_ptr(), value.numel(),
+                nccl_dtype_for(value), ncclSum, communicator, stream);
+            TORCH_CHECK(err == ncclSuccess, "NCCL ", axis,
+                " replica all-reduce failed: ", ncclGetErrorString(err));
+            value = reduced;
+        };
+        if (reduce_ep) reduce_axis(ctx->nccl_comm, "EP");
+        if (dp_allreduce) reduce_axis(ctx->dp_comm, "DP");
+        return value;
+    };
     const bool per_adapter_weighting = per_adapter_token_counts &&
         per_adapter_token_counts->defined();
     at::Tensor local_adapter_weights;
@@ -2721,21 +2752,9 @@ static void synchronize_lora_gradients(
             "dynamic LoRA token counts must be finite");
         TORCH_CHECK((local_adapter_weights >= 0).all().item<bool>(),
             "dynamic LoRA token counts must be non-negative");
-        if (dp_allreduce || sharded_a2a) {
-            global_adapter_weights = at::empty_like(local_adapter_weights);
-            auto stream = c10::cuda::getCurrentCUDAStream(
-                local_adapter_weights.device().index()).stream();
-            auto err = ncclAllReduce(
-                local_adapter_weights.data_ptr(),
-                global_adapter_weights.data_ptr(),
-                local_adapter_weights.numel(), ncclFloat, ncclSum,
-                ctx->nccl_comm, stream);
-            TORCH_CHECK(err == ncclSuccess,
-                "NCCL per-adapter token-count all-reduce failed: ",
-                ncclGetErrorString(err));
-        } else {
-            global_adapter_weights = local_adapter_weights;
-        }
+        global_adapter_weights = normalization_allreduce
+            ? sum_replica_axes(local_adapter_weights, sharded_a2a)
+            : local_adapter_weights;
         if (adapter_has_global_tokens) {
             adapter_has_global_tokens->assign(ctx->adapters.size(), 0);
             auto global_cpu = global_adapter_weights.to(
@@ -2750,15 +2769,7 @@ static void synchronize_lora_gradients(
         if (normalization_allreduce) {
             auto local = at::full({1}, accumulated_token_weight,
                 at::TensorOptions().dtype(at::kFloat).device(target_mask.device()));
-            auto global = at::empty_like(local);
-            auto stream = c10::cuda::getCurrentCUDAStream(
-                target_mask.device().index()).stream();
-            auto err = ncclAllReduce(
-                local.data_ptr(), global.data_ptr(), 1,
-                ncclFloat, ncclSum, ctx->nccl_comm, stream);
-            TORCH_CHECK(err == ncclSuccess,
-                "NCCL accumulated token-count all-reduce failed: ",
-                ncclGetErrorString(err));
+            auto global = sum_replica_axes(local, sharded_a2a);
             global_weight = global.item<double>();
         }
         scale = 1.0 / std::max(global_weight, 1.0);
@@ -2771,14 +2782,7 @@ static void synchronize_lora_gradients(
         } else {
             auto shifted_mask = target_mask.narrow(1, 1, target_mask.size(1) - 1)
                 .to(at::kFloat).sum().reshape({1});
-            auto global_mask = at::empty_like(shifted_mask);
-            auto stream = c10::cuda::getCurrentCUDAStream(
-                shifted_mask.device().index()).stream();
-            auto err = ncclAllReduce(
-                shifted_mask.data_ptr(), global_mask.data_ptr(), 1,
-                ncclFloat, ncclSum, ctx->nccl_comm, stream);
-            TORCH_CHECK(err == ncclSuccess, "NCCL token-count all-reduce failed: ",
-                        ncclGetErrorString(err));
+            auto global_mask = sum_replica_axes(shifted_mask, false);
             const double local_tokens = shifted_mask.item<double>();
             const double global_tokens = global_mask.item<double>();
             scale = local_tokens / std::max(global_tokens, 1.0);
@@ -2817,17 +2821,25 @@ static void synchronize_lora_gradients(
                         // one all-reduce before division by the global count.
                         normalize_lora_accumulator_numerator(
                             ctx, accum_it->second[pair][0], global_weight,
-                            !grouped_expert);
+                            !grouped_expert, dp_allreduce);
                         normalize_lora_accumulator_numerator(
                             ctx, accum_it->second[pair][1], global_weight,
-                            !grouped_expert);
+                            !grouped_expert, dp_allreduce);
                     } else {
                         reduce_lora_accumulator_weighted(
                             ctx, accum_it->second[pair][0], local_weight,
-                            global_weight, dp_allreduce);
+                            global_weight, false, dp_allreduce);
                         reduce_lora_accumulator_weighted(
                             ctx, accum_it->second[pair][1], local_weight,
-                            global_weight, dp_allreduce);
+                            global_weight, false, dp_allreduce);
+                        if (grouped_expert &&
+                            replicated_a2a_expert_scale != 1.0) {
+                            at::NoGradGuard guard;
+                            accum_it->second[pair][0].mul_(
+                                replicated_a2a_expert_scale);
+                            accum_it->second[pair][1].mul_(
+                                replicated_a2a_expert_scale);
+                        }
                     }
                     continue;
                 }
@@ -2838,16 +2850,20 @@ static void synchronize_lora_gradients(
                 if (table.entries[pair].grouped_expert) {
                     if (accumulated_token_weight > 0.0) {
                         reduce_lora_accumulator(
-                            ctx, accum_it->second[pair][0], scale, dp_allreduce);
+                            ctx, accum_it->second[pair][0], scale,
+                            false, dp_allreduce);
                         reduce_lora_accumulator(
-                            ctx, accum_it->second[pair][1], scale, dp_allreduce);
+                            ctx, accum_it->second[pair][1], scale,
+                            false, dp_allreduce);
                     }
                     continue;
                 }
                 reduce_lora_accumulator(
-                    ctx, accum_it->second[pair][0], scale, dp_allreduce);
+                    ctx, accum_it->second[pair][0], scale,
+                    sharded_a2a, dp_allreduce);
                 reduce_lora_accumulator(
-                    ctx, accum_it->second[pair][1], scale, dp_allreduce);
+                    ctx, accum_it->second[pair][1], scale,
+                    sharded_a2a, dp_allreduce);
             }
         }
     }
@@ -2871,11 +2887,6 @@ static void synchronize_lora_gradients(
     // scaling the combine backward would also under-scale the activation
     // gradient returned to each source graph. Sharded A2A is handled above via
     // global token-count weighting and does not enter this branch.
-    const double replicated_a2a_expert_scale =
-        ctx->nccl_comm && env_enabled("QWEN36_EP_A2A") && !sharded_a2a &&
-            !ctx->data_parallel && ctx->ep_world_size > 1
-        ? 1.0 / static_cast<double>(ctx->ep_world_size)
-        : 1.0;
     for (int64_t layer = 0; layer < ctx->num_layers; ++layer) {
         auto table = lora_projection_table(ctx->layer_configs[layer]);
         int64_t offset = ctx->lora_layer_offset[layer];
@@ -2886,19 +2897,21 @@ static void synchronize_lora_gradients(
                 if (accumulated_token_weight > 0.0) {
                     reduce_lora_accumulator(
                         ctx, ctx->grad_accum_a[offset + pair],
-                        scale * replicated_a2a_expert_scale, dp_allreduce);
+                        scale * replicated_a2a_expert_scale,
+                        false, dp_allreduce);
                     reduce_lora_accumulator(
                         ctx, ctx->grad_accum_b[offset + pair],
-                        scale * replicated_a2a_expert_scale, dp_allreduce);
+                        scale * replicated_a2a_expert_scale,
+                        false, dp_allreduce);
                 }
                 continue;
             }
             reduce_lora_accumulator(
                 ctx, ctx->grad_accum_a[offset + pair], scale,
-                dp_allreduce || sharded_a2a);
+                sharded_a2a, dp_allreduce);
             reduce_lora_accumulator(
                 ctx, ctx->grad_accum_b[offset + pair], scale,
-                dp_allreduce || sharded_a2a);
+                sharded_a2a, dp_allreduce);
         }
     }
     for (int64_t layer = 0; layer < ctx->num_layers; ++layer) {
@@ -4999,12 +5012,13 @@ static at::Tensor mtp_compute_loss(
 extern "C" {
 
 __attribute__((visibility("default"))) int64_t qwen36_kernel_abi_version() {
-    return 17;
+    return 18;
 }
 
 static constexpr int32_t QWEN36_CONTEXT_BASE_TP_ATTENTION = 1 << 0;
 static constexpr int32_t QWEN36_CONTEXT_DATA_PARALLEL = 1 << 1;
 static constexpr int32_t QWEN36_CONTEXT_VOCAB_PARALLEL = 1 << 2;
+static constexpr int32_t QWEN36_CONTEXT_EXPERT_PARALLEL = 1 << 3;
 
 // Create training context — called once at startup
 // lora_rank: LoRA rank (from config)
@@ -5049,13 +5063,18 @@ static void* qwen36_create_training_context_impl(
         const char* dp_size_env = getenv("DP_SIZE");
         if (!dp_size_env) dp_size_env = getenv("RUSTRAIN_DP_SIZE");
         int configured_dp_size = dp_size_env ? atoi(dp_size_env) : 1;
-        if (data_parallel_requested && !dp_size_env &&
-            configured_world_size % ctx->tp_world_size == 0) {
-            configured_dp_size = configured_world_size / ctx->tp_world_size;
-        }
         const char* ep_size_env = getenv("EP_SIZE");
         if (!ep_size_env) ep_size_env = getenv("RUSTRAIN_EP_SIZE");
         const int configured_ep_size = ep_size_env ? atoi(ep_size_env) : 1;
+        const bool expert_parallel_requested =
+            (context_flags & QWEN36_CONTEXT_EXPERT_PARALLEL) != 0 ||
+            configured_ep_size > 1;
+        if (data_parallel_requested && !dp_size_env &&
+            configured_world_size %
+                (ctx->tp_world_size * configured_ep_size) == 0) {
+            configured_dp_size = configured_world_size /
+                (ctx->tp_world_size * configured_ep_size);
+        }
         const char* pp_size_env = getenv("PP_SIZE");
         if (!pp_size_env) pp_size_env = getenv("RUSTRAIN_PP_SIZE");
         const char* cp_size_env = getenv("CP_SIZE");
@@ -5065,29 +5084,38 @@ static void* qwen36_create_training_context_impl(
         TORCH_CHECK(configured_pp_size > 0 && configured_cp_size > 0 &&
                     configured_dp_size > 0 && configured_ep_size > 0,
             "PP_SIZE, CP_SIZE, DP_SIZE, and EP_SIZE must be positive");
-        TORCH_CHECK(configured_pp_size == 1 && configured_cp_size == 1 &&
-                    (!data_parallel_requested || configured_ep_size == 1),
-            "native Qwen LoRA does not implement PP/CP or mixed DP/EP yet; ",
+        TORCH_CHECK(configured_pp_size == 1 && configured_cp_size == 1,
+            "native Qwen LoRA does not implement PP/CP yet; ",
             "PP_SIZE=", configured_pp_size, " CP_SIZE=", configured_cp_size);
-        if (data_parallel_requested) {
-            TORCH_CHECK(
-                configured_world_size == ctx->tp_world_size * configured_dp_size,
-                "native Qwen LoRA requires WORLD_SIZE=TP_SIZE*DP_SIZE for dense DP; ",
-                "TP_SIZE=", ctx->tp_world_size, " DP_SIZE=", configured_dp_size,
-                " WORLD_SIZE=", configured_world_size);
-        } else if (ctx->tp_world_size > 1) {
-            TORCH_CHECK(configured_world_size == ctx->tp_world_size &&
-                        configured_ep_size == 1,
-                "native Qwen LoRA TP without DP requires WORLD_SIZE=TP_SIZE and EP_SIZE=1");
-        }
-        ctx->ep_world_size = data_parallel_requested
-            ? configured_dp_size : configured_world_size;
+        TORCH_CHECK(configured_world_size ==
+                ctx->tp_world_size * configured_ep_size * configured_dp_size,
+            "native Qwen LoRA requires WORLD_SIZE=TP_SIZE*EP_SIZE*DP_SIZE; ",
+            "TP_SIZE=", ctx->tp_world_size, " EP_SIZE=", configured_ep_size,
+            " DP_SIZE=", configured_dp_size,
+            " WORLD_SIZE=", configured_world_size);
+        TORCH_CHECK(expert_parallel_requested == (configured_ep_size > 1),
+            "expert-parallel context flag must match EP_SIZE");
+        TORCH_CHECK(data_parallel_requested == (configured_dp_size > 1),
+            "data-parallel context flag must match DP_SIZE");
+        ctx->ep_world_size = configured_ep_size;
+        ctx->expert_parallel = expert_parallel_requested;
+        ctx->dp_world_size = configured_dp_size;
         ctx->data_parallel = data_parallel_requested;
         const char* rank_env = getenv("RANK");
         const int global_rank = rank_env ? atoi(rank_env) : 0;
-        ctx->ep_rank = data_parallel_requested
-            ? global_rank / ctx->tp_world_size : global_rank;
-        ctx->tp_rank = global_rank % ctx->tp_world_size;
+        const char* tp_rank_env = getenv("RUSTRAIN_TP_RANK");
+        const char* ep_rank_env = getenv("RUSTRAIN_EP_RANK");
+        const char* dp_rank_env = getenv("RUSTRAIN_DP_RANK");
+        ctx->tp_rank = tp_rank_env ? atoi(tp_rank_env)
+            : global_rank % ctx->tp_world_size;
+        ctx->ep_rank = ep_rank_env ? atoi(ep_rank_env)
+            : (global_rank / ctx->tp_world_size) % configured_ep_size;
+        ctx->dp_rank = dp_rank_env ? atoi(dp_rank_env)
+            : global_rank / (ctx->tp_world_size * configured_ep_size);
+        TORCH_CHECK(ctx->tp_rank >= 0 && ctx->tp_rank < ctx->tp_world_size &&
+                    ctx->ep_rank >= 0 && ctx->ep_rank < ctx->ep_world_size &&
+                    ctx->dp_rank >= 0 && ctx->dp_rank < ctx->dp_world_size,
+            "parallel rank coordinates are outside their configured axes");
         TORCH_CHECK(lora_rank > 0 && lora_rank % ctx->tp_world_size == 0,
             "LoRA rank ", lora_rank, " must be divisible by TP_SIZE=",
             ctx->tp_world_size);
@@ -5550,7 +5578,7 @@ __attribute__((visibility("default"))) double qwen36_train_micro_step(
         TORCH_CHECK(gradient_scale > 0.0 && std::isfinite(gradient_scale),
             "gradient_scale must be finite and positive");
         // Set CUDA device for EP
-        if (ctx->nccl_comm || ctx->tp_comm) {
+        if (ctx->nccl_comm || ctx->dp_comm || ctx->tp_comm) {
             c10::cuda::set_device(ctx->cuda_device);
             cudaSetDevice(ctx->cuda_device);
         }
@@ -5937,7 +5965,7 @@ __attribute__((visibility("default"))) double qwen36_train_multi_lora(
             "cannot start dynamic multi-LoRA while a fixed-LoRA gradient "
             "accumulation window is pending");
         GradientAccumulationFailureGuard accumulation_guard{ctx};
-        if (ctx->nccl_comm) {
+        if (ctx->nccl_comm || ctx->dp_comm || ctx->tp_comm) {
             c10::cuda::set_device(ctx->cuda_device);
             cudaSetDevice(ctx->cuda_device);
         }
@@ -6039,6 +6067,7 @@ __attribute__((visibility("default"))) double qwen36_train_multi_lora(
         n_max = std::min(n_max, total_adapters);
         if (n_max < 1) n_max = 1;
         if ((ctx->nccl_comm && ctx->ep_world_size > 1) ||
+            (ctx->dp_comm && ctx->dp_world_size > 1) ||
             (ctx->tp_comm && ctx->tp_world_size > 1)) {
             auto published_n_max = at::full(
                 {1}, n_max, input_ids.options().dtype(at::kLong));
@@ -6049,7 +6078,15 @@ __attribute__((visibility("default"))) double qwen36_train_multi_lora(
                     published_n_max.data_ptr<int64_t>(),
                     published_n_max.data_ptr<int64_t>(), 1, ncclInt64, ncclMin,
                     reinterpret_cast<ncclComm_t>(ctx->nccl_comm), stream);
-                TORCH_CHECK(err == ncclSuccess, "DP/EP n_max all-reduce failed: ",
+                TORCH_CHECK(err == ncclSuccess, "EP n_max all-reduce failed: ",
+                    ncclGetErrorString(err));
+            }
+            if (ctx->dp_comm && ctx->dp_world_size > 1) {
+                auto err = ncclAllReduce(
+                    published_n_max.data_ptr<int64_t>(),
+                    published_n_max.data_ptr<int64_t>(), 1, ncclInt64, ncclMin,
+                    reinterpret_cast<ncclComm_t>(ctx->dp_comm), stream);
+                TORCH_CHECK(err == ncclSuccess, "DP n_max all-reduce failed: ",
                     ncclGetErrorString(err));
             }
             if (ctx->tp_comm && ctx->tp_world_size > 1) {
@@ -6145,7 +6182,7 @@ __attribute__((visibility("default"))) double qwen36_train_multi_lora(
             // independent_samples produces a local per-tenant mean. Restore
             // each row to a token-sum numerator before A2A backward so the
             // expert owner can combine unequal source shards correctly.
-            if (ctx->nccl_comm && !ctx->data_parallel &&
+            if (ctx->expert_parallel && ctx->nccl_comm &&
                 env_enabled("QWEN36_EP_A2A_SHARDED")) {
                 auto chunk_token_counts = adapter_token_counts
                     .narrow(0, start, n).reshape({n, 1, 1});
@@ -6414,6 +6451,8 @@ static ncclComm_t g_nccl_comm = nullptr;
 static cudaStream_t g_nccl_stream = nullptr;
 static ncclComm_t g_tp_comm = nullptr;
 static cudaStream_t g_tp_stream = nullptr;
+static ncclComm_t g_ep_comm = nullptr;
+static cudaStream_t g_ep_stream = nullptr;
 static ncclComm_t g_dp_comm = nullptr;
 static cudaStream_t g_dp_stream = nullptr;
 static bool g_nccl_initialized = false;
@@ -6423,16 +6462,20 @@ static int g_parallel_world_size = 1;
 static int g_parallel_tp_rank = 0;
 static int g_parallel_tp_size = 1;
 static int g_parallel_tp_color = 0;
+static int g_parallel_ep_rank = 0;
+static int g_parallel_ep_size = 1;
+static int g_parallel_ep_color = 0;
 static int g_parallel_dp_rank = 0;
 static int g_parallel_dp_size = 1;
 static int g_parallel_dp_color = 0;
-static bool g_parallel_data_parallel = false;
 
 static void qwen36_destroy_process_communicators() {
     if (g_dp_comm) ncclCommDestroy(g_dp_comm);
+    if (g_ep_comm) ncclCommDestroy(g_ep_comm);
     if (g_tp_comm) ncclCommDestroy(g_tp_comm);
     if (g_nccl_comm) ncclCommDestroy(g_nccl_comm);
     g_dp_comm = nullptr;
+    g_ep_comm = nullptr;
     g_tp_comm = nullptr;
     g_nccl_comm = nullptr;
     g_nccl_initialized = false;
@@ -6441,18 +6484,20 @@ static void qwen36_destroy_process_communicators() {
 static bool same_cached_parallel_topology(
     int rank, int world_size,
     int tp_rank, int tp_size, int tp_color,
-    int dp_rank, int dp_size, int dp_color,
-    bool data_parallel
+    int ep_rank, int ep_size, int ep_color,
+    int dp_rank, int dp_size, int dp_color
 ) {
     return g_parallel_rank == rank &&
         g_parallel_world_size == world_size &&
         g_parallel_tp_rank == tp_rank &&
         g_parallel_tp_size == tp_size &&
         g_parallel_tp_color == tp_color &&
+        g_parallel_ep_rank == ep_rank &&
+        g_parallel_ep_size == ep_size &&
+        g_parallel_ep_color == ep_color &&
         g_parallel_dp_rank == dp_rank &&
         g_parallel_dp_size == dp_size &&
-        g_parallel_dp_color == dp_color &&
-        g_parallel_data_parallel == data_parallel;
+        g_parallel_dp_color == dp_color;
 }
 static int g_cuda_device = 0;
 
@@ -6475,38 +6520,57 @@ static int32_t qwen36_init_parallel_nccl_impl(
     void* ctx_ptr,
     int rank, int world_size,
     int tp_rank, int tp_size, int tp_color,
-    int dp_rank, int dp_size, int dp_color,
-    bool data_parallel
+    int ep_rank, int ep_size, int ep_color,
+    int dp_rank, int dp_size, int dp_color
 ) {
     auto* ctx = reinterpret_cast<TrainingContext*>(ctx_ptr);
 
+    if (!ctx) return -1;
+
     if (rank < 0 || rank >= world_size || world_size <= 0 ||
         tp_rank < 0 || tp_rank >= tp_size || tp_size <= 0 || tp_color < 0 ||
+        ep_rank < 0 || ep_rank >= ep_size || ep_size <= 0 || ep_color < 0 ||
         dp_rank < 0 || dp_rank >= dp_size || dp_size <= 0 || dp_color < 0 ||
-        (data_parallel && world_size != tp_size * dp_size) ||
-        (!data_parallel && tp_size > 1 && world_size != tp_size)) {
+        world_size != tp_size * ep_size * dp_size) {
         ctx->topology_invalid = true;
         fprintf(stderr,
             "[parallel_nccl] invalid topology: rank=%d world=%d tp=%d/%d color=%d "
-            "dp=%d/%d color=%d data_parallel=%d\n",
+            "ep=%d/%d color=%d dp=%d/%d color=%d\n",
             rank, world_size, tp_rank, tp_size, tp_color,
-            dp_rank, dp_size, dp_color, data_parallel ? 1 : 0);
+            ep_rank, ep_size, ep_color, dp_rank, dp_size, dp_color);
         return -1;
     }
+    if (ctx->tp_world_size != tp_size || ctx->ep_world_size != ep_size ||
+        ctx->dp_world_size != dp_size ||
+        ctx->expert_parallel != (ep_size > 1) ||
+        ctx->data_parallel != (dp_size > 1)) {
+        ctx->topology_invalid = true;
+        fprintf(stderr,
+            "[parallel_nccl] init topology does not match context: "
+            "context tp=%d ep=%d dp=%d, init tp=%d ep=%d dp=%d\n",
+            ctx->tp_world_size, ctx->ep_world_size, ctx->dp_world_size,
+            tp_size, ep_size, dp_size);
+        return -1;
+    }
+    ctx->topology_invalid = false;
 
     // If already initialized, just set the pointer on this context
     if (g_nccl_initialized) {
         if (!same_cached_parallel_topology(
                 rank, world_size, tp_rank, tp_size, tp_color,
-                dp_rank, dp_size, dp_color, data_parallel)) {
+                ep_rank, ep_size, ep_color,
+                dp_rank, dp_size, dp_color)) {
             ctx->topology_invalid = true;
             fprintf(stderr,
                 "[parallel_nccl] process communicator topology cannot change after initialization\n");
             return -1;
         }
-        ctx->data_parallel = data_parallel;
-        ctx->ep_rank = data_parallel ? dp_rank : rank;
-        ctx->ep_world_size = data_parallel ? dp_size : world_size;
+        ctx->expert_parallel = ep_size > 1;
+        ctx->ep_rank = ep_rank;
+        ctx->ep_world_size = ep_size;
+        ctx->data_parallel = dp_size > 1;
+        ctx->dp_rank = dp_rank;
+        ctx->dp_world_size = dp_size;
         const char* local_rank_str2 = getenv("LOCAL_RANK");
         ctx->cuda_device = local_rank_str2 ? atoi(local_rank_str2) : g_cuda_device;
         ctx->tp_world_size = tp_size;
@@ -6514,14 +6578,12 @@ static int32_t qwen36_init_parallel_nccl_impl(
         ctx->topology_invalid = false;
         ctx->tp_comm = tp_size > 1 ? g_tp_comm : nullptr;
         ctx->tp_stream = tp_size > 1 ? g_tp_stream : nullptr;
-        ctx->nccl_comm = data_parallel
-            ? (dp_size > 1 ? g_dp_comm : nullptr)
-            : (tp_size > 1 ? nullptr : g_nccl_comm);
-        ctx->nccl_stream = data_parallel ? g_dp_stream : g_nccl_stream;
-        void* layer_comm = !data_parallel && tp_size <= 1
-            ? (void*)g_nccl_comm : nullptr;
-        void* layer_stream = !data_parallel && tp_size <= 1
-            ? (void*)g_nccl_stream : nullptr;
+        ctx->nccl_comm = ep_size > 1 ? g_ep_comm : nullptr;
+        ctx->nccl_stream = ep_size > 1 ? g_ep_stream : nullptr;
+        ctx->dp_comm = dp_size > 1 ? g_dp_comm : nullptr;
+        ctx->dp_stream = dp_size > 1 ? g_dp_stream : nullptr;
+        void* layer_comm = ep_size > 1 ? (void*)g_ep_comm : nullptr;
+        void* layer_stream = ep_size > 1 ? (void*)g_ep_stream : nullptr;
         for (auto& lc : ctx->layer_configs) {
             lc.nccl_comm = layer_comm;
             lc.nccl_stream = layer_stream;
@@ -6648,14 +6710,30 @@ static int32_t qwen36_init_parallel_nccl_impl(
         }
         g_tp_stream = nccl_stream;
     }
-    if (data_parallel && dp_size > 1) {
+    if (ep_size > 1) {
+        ncclResult_t ep_err = ncclCommSplit(
+            comm, ep_color, ep_rank, &g_ep_comm, nullptr);
+        if (ep_err != ncclSuccess) {
+            fprintf(stderr, "[ep_nccl] ncclCommSplit failed: %d (%s)\n",
+                ep_err, ncclGetErrorString(ep_err));
+            if (g_tp_comm) ncclCommDestroy(g_tp_comm);
+            ncclCommDestroy(comm);
+            g_tp_comm = nullptr;
+            g_nccl_comm = nullptr;
+            return -1;
+        }
+        g_ep_stream = nccl_stream;
+    }
+    if (dp_size > 1) {
         ncclResult_t dp_err = ncclCommSplit(
             comm, dp_color, dp_rank, &g_dp_comm, nullptr);
         if (dp_err != ncclSuccess) {
             fprintf(stderr, "[dp_nccl] ncclCommSplit failed: %d (%s)\n",
                 dp_err, ncclGetErrorString(dp_err));
+            if (g_ep_comm) ncclCommDestroy(g_ep_comm);
             if (g_tp_comm) ncclCommDestroy(g_tp_comm);
             ncclCommDestroy(comm);
+            g_ep_comm = nullptr;
             g_tp_comm = nullptr;
             g_nccl_comm = nullptr;
             return -1;
@@ -6667,33 +6745,36 @@ static int32_t qwen36_init_parallel_nccl_impl(
     g_parallel_tp_rank = tp_rank;
     g_parallel_tp_size = tp_size;
     g_parallel_tp_color = tp_color;
+    g_parallel_ep_rank = ep_rank;
+    g_parallel_ep_size = ep_size;
+    g_parallel_ep_color = ep_color;
     g_parallel_dp_rank = dp_rank;
     g_parallel_dp_size = dp_size;
     g_parallel_dp_color = dp_color;
-    g_parallel_data_parallel = data_parallel;
     g_nccl_initialized = true;
     if (!g_nccl_cleanup_registered) {
         std::atexit(qwen36_destroy_process_communicators);
         g_nccl_cleanup_registered = true;
     }
 
-    ctx->nccl_comm = data_parallel
-        ? (dp_size > 1 ? g_dp_comm : nullptr)
-        : (tp_size > 1 ? nullptr : comm);
-    ctx->nccl_stream = data_parallel ? g_dp_stream : nccl_stream;
-    ctx->ep_rank = data_parallel ? dp_rank : rank;
-    ctx->ep_world_size = data_parallel ? dp_size : world_size;
-    ctx->data_parallel = data_parallel;
+    ctx->nccl_comm = ep_size > 1 ? g_ep_comm : nullptr;
+    ctx->nccl_stream = ep_size > 1 ? g_ep_stream : nullptr;
+    ctx->ep_rank = ep_rank;
+    ctx->ep_world_size = ep_size;
+    ctx->expert_parallel = ep_size > 1;
+    ctx->dp_comm = dp_size > 1 ? g_dp_comm : nullptr;
+    ctx->dp_stream = dp_size > 1 ? g_dp_stream : nullptr;
+    ctx->dp_rank = dp_rank;
+    ctx->dp_world_size = dp_size;
+    ctx->data_parallel = dp_size > 1;
     ctx->tp_world_size = tp_size;
     ctx->tp_rank = tp_rank;
     ctx->tp_comm = tp_size > 1 ? g_tp_comm : nullptr;
     ctx->tp_stream = tp_size > 1 ? g_tp_stream : nullptr;
 
     // Propagate to layer configs
-    void* layer_comm = !data_parallel && tp_size <= 1
-        ? (void*)comm : nullptr;
-    void* layer_stream = !data_parallel && tp_size <= 1
-        ? (void*)nccl_stream : nullptr;
+    void* layer_comm = ep_size > 1 ? (void*)g_ep_comm : nullptr;
+    void* layer_stream = ep_size > 1 ? (void*)g_ep_stream : nullptr;
     for (auto& lc : ctx->layer_configs) {
         lc.nccl_comm = layer_comm;
         lc.nccl_stream = layer_stream;
@@ -6711,13 +6792,14 @@ __attribute__((visibility("default"))) int32_t qwen36_init_parallel_nccl(
     void* ctx_ptr,
     int32_t rank, int32_t world_size,
     int32_t tp_rank, int32_t tp_size, int32_t tp_color,
+    int32_t ep_rank, int32_t ep_size, int32_t ep_color,
     int32_t dp_rank, int32_t dp_size, int32_t dp_color
 ) {
     return qwen36_init_parallel_nccl_impl(
         ctx_ptr, rank, world_size,
         tp_rank, tp_size, tp_color,
-        dp_rank, dp_size, dp_color,
-        dp_size > 1);
+        ep_rank, ep_size, ep_color,
+        dp_rank, dp_size, dp_color);
 }
 
 __attribute__((visibility("default"))) int32_t qwen36_init_nccl(
@@ -6732,17 +6814,25 @@ __attribute__((visibility("default"))) int32_t qwen36_init_nccl(
     if (!tp_size_str) tp_size_str = getenv("RUSTRAIN_TP_SIZE");
     const int tp_size = tp_size_str ? atoi(tp_size_str) : 1;
     const bool data_parallel = env_enabled("RUSTRAIN_DATA_PARALLEL");
+    const char* ep_size_str = getenv("EP_SIZE");
+    if (!ep_size_str) ep_size_str = getenv("RUSTRAIN_EP_SIZE");
+    const int ep_size = ep_size_str ? atoi(ep_size_str) : 1;
     const char* dp_size_str = getenv("DP_SIZE");
     if (!dp_size_str) dp_size_str = getenv("RUSTRAIN_DP_SIZE");
     const int dp_size = dp_size_str
         ? atoi(dp_size_str)
-        : (data_parallel && tp_size > 0 ? world_size / tp_size : 1);
+        : (data_parallel && tp_size > 0 && ep_size > 0
+            ? world_size / (tp_size * ep_size) : 1);
     const int tp_rank = tp_size > 0 ? rank % tp_size : 0;
-    const int dp_rank = data_parallel && tp_size > 0 ? rank / tp_size : 0;
+    const int ep_rank = tp_size > 0 && ep_size > 0
+        ? (rank / tp_size) % ep_size : 0;
+    const int dp_rank = tp_size > 0 && ep_size > 0
+        ? rank / (tp_size * ep_size) : 0;
     return qwen36_init_parallel_nccl_impl(
         ctx_ptr, rank, world_size,
         tp_rank, tp_size, rank / std::max(tp_size, 1),
-        dp_rank, dp_size, tp_rank, data_parallel);
+        ep_rank, ep_size, dp_rank * std::max(tp_size, 1) + tp_rank,
+        dp_rank, dp_size, ep_rank * std::max(tp_size, 1) + tp_rank);
 }
 
 // Set NCCL communicator for Expert Parallel all-reduce (legacy, from Rust)
@@ -6751,19 +6841,35 @@ __attribute__((visibility("default"))) void qwen36_set_nccl_comm(
     int32_t ep_rank, int32_t ep_world_size
 ) {
     auto* ctx = reinterpret_cast<TrainingContext*>(ctx_ptr);
-    ctx->nccl_comm = reinterpret_cast<ncclComm_t>(comm_ptr);
-    ctx->nccl_stream = reinterpret_cast<cudaStream_t>(stream_ptr);
-    ctx->ep_rank = ep_rank;
-    ctx->ep_world_size = ep_world_size;
     ctx->data_parallel = env_enabled("RUSTRAIN_DATA_PARALLEL");
-    if (ctx->tp_world_size <= 0 ||
-        (ctx->tp_world_size > 1 &&
-            (ctx->data_parallel || ep_world_size != ctx->tp_world_size))) {
+    if (ctx->tp_world_size <= 0 || ctx->tp_world_size > 1) {
         ctx->topology_invalid = true;
         fprintf(stderr,
-            "[tp_nccl] reject mixed topology: TP_SIZE=%d WORLD_SIZE=%d DATA_PARALLEL=%d\n",
+            "[parallel_nccl] legacy setter only supports TP_SIZE=1: "
+            "TP_SIZE=%d WORLD_SIZE=%d DATA_PARALLEL=%d\n",
             ctx->tp_world_size, ep_world_size, ctx->data_parallel ? 1 : 0);
         return;
+    }
+    if (ctx->data_parallel) {
+        ctx->dp_comm = reinterpret_cast<ncclComm_t>(comm_ptr);
+        ctx->dp_stream = reinterpret_cast<cudaStream_t>(stream_ptr);
+        ctx->dp_rank = ep_rank;
+        ctx->dp_world_size = ep_world_size;
+        ctx->nccl_comm = nullptr;
+        ctx->nccl_stream = nullptr;
+        ctx->ep_rank = 0;
+        ctx->ep_world_size = 1;
+        ctx->expert_parallel = false;
+    } else {
+        ctx->nccl_comm = reinterpret_cast<ncclComm_t>(comm_ptr);
+        ctx->nccl_stream = reinterpret_cast<cudaStream_t>(stream_ptr);
+        ctx->ep_rank = ep_rank;
+        ctx->ep_world_size = ep_world_size;
+        ctx->expert_parallel = ep_world_size > 1;
+        ctx->dp_comm = nullptr;
+        ctx->dp_stream = nullptr;
+        ctx->dp_rank = 0;
+        ctx->dp_world_size = 1;
     }
     ctx->topology_invalid = false;
     int current_device = g_cuda_device;
@@ -6772,8 +6878,8 @@ __attribute__((visibility("default"))) void qwen36_set_nccl_comm(
     // Only EP owns routed-output collectives. In pure replicated DP the world
     // communicator belongs exclusively to LoRA gradient synchronization;
     // exposing it to moe_forward would mix activations from unrelated samples.
-    void* layer_comm = ctx->data_parallel ? nullptr : comm_ptr;
-    void* layer_stream = ctx->data_parallel ? nullptr : stream_ptr;
+    void* layer_comm = ctx->expert_parallel ? comm_ptr : nullptr;
+    void* layer_stream = ctx->expert_parallel ? stream_ptr : nullptr;
     for (auto& lc : ctx->layer_configs) {
         lc.nccl_comm = layer_comm;
         lc.nccl_stream = layer_stream;

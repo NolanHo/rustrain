@@ -12,9 +12,9 @@ timestamp: 2026-07-17T00:00:00Z
 
 # Current State
 
-Verified: Qwen3.5/3.6 native forward/backward slices, GDN CUDA path, grouped MoE fallback, EP parity against a full-expert reference, variable-split EP A2A with fixed-LoRA data sharding, dense replicated-DP smoke with per-tenant token weighting, latent-rank and projection-aware LoRA TP, frozen full-attention/GDN/dense-MLP base-weight TP, orthogonal dense TP x DP process groups, vocabulary-parallel embedding/LM-head/distributed cross entropy, dynamic batch logical-step update, FP32 gradient storage/aggregation, standard Adam bias correction, per-tenant optimizer-step restore, selected-tenant isolation, checkpoint v4 projection layouts and fixed-slot identities, and 5D topology mapping.
+Verified: Qwen3.5/3.6 native forward/backward slices, GDN CUDA path, grouped MoE fallback, EP parity against a full-expert reference, variable-split EP A2A with fixed-LoRA data sharding, dense replicated-DP smoke with per-tenant token weighting, latent-rank and projection-aware LoRA TP, frozen full-attention/GDN/dense-MLP base-weight TP, orthogonal dense TP x DP process groups, vocabulary-parallel embedding/LM-head/distributed cross entropy, composable LoRA-only TP x EP process groups with expert-local and dense-replicated gradient semantics, dynamic batch logical-step update, FP32 gradient storage/aggregation, standard Adam bias correction, per-tenant optimizer-step restore, selected-tenant isolation, checkpoint v4 projection layouts and fixed-slot identities, and 5D topology mapping.
 
-Not yet verified or implemented: combined MoE TP x EP/DP, MLP-targeted LoRA under base TP, fused QKV/gate-up and sequence parallel, PP/CP, DeepEP/TE/FLA prebuilt integration, server-side source-sharded dynamic dispatch, heterogeneous dynamic adapter signatures, dynamic+MTP objective normalization, cross-topology checkpoint resharding, old-v3 attention checkpoint migration, and matched Megatron throughput. Native direct dynamic source metadata under sharded A2A is implemented and full-reference smoke-tested.
+Not yet verified or implemented: the three-axis TP x EP x expert-DP combination, expert-tensor-parallel base-weight sharding, MLP-targeted LoRA under base TP, fused QKV/gate-up and sequence parallel, PP/CP, DeepEP/TE/FLA prebuilt integration, server-side source-sharded dynamic dispatch, TP x EP checkpoint metadata/resharding, heterogeneous dynamic adapter signatures, dynamic+MTP objective normalization, cross-topology checkpoint resharding, old-v3 attention checkpoint migration, and matched Megatron throughput. The server rejects MoE TP x EP until request source coordinates and checkpoint ownership are represented. Native direct dynamic source metadata under sharded A2A is implemented and full-reference smoke-tested.
 
 # Durable Milestones
 
@@ -47,6 +47,21 @@ Not yet verified or implemented: combined MoE TP x EP/DP, MLP-targeted LoRA unde
 - ABI17 working tree: CLI and server shard Qwen3.5 tied embeddings and Qwen3.6 untied embedding/LM-head rows on CPU before device transfer. C++ performs masked local embedding plus TP SUM and a two-pass distributed cross entropy with TP MAX/SUM statistics and TP-summed frozen-head dgrad. MTP remains explicitly rejected because its weights are not sharded.
 - H20 target: ABI17 TP2 GDN smoke passed tied fixed-LoRA and untied dynamic multi-LoRA against full-vocabulary references. Fixed loss differed by `5.90e-4`, dynamic loss by `1.16e-3`, FP32 m/v maxima were `1.07e-5` / `1.22e-9`, and the standard Adam formula error was zero. The world4 `dp-tp` rank-order oracle used TP groups `[0,2]` and `[1,3]`, proving vocabulary ranges follow explicit `tp_rank`; local loss differed by at most `2.31e-3`, with FP32 m/v maxima `3.44e-5` / `1.96e-8`.
 - H20 target: ABI17 real-vocabulary GDN benchmark (`batch=1`, `seq=128`, `hidden=2048`, `layers=3`, `vocab=248320`, warmup `2`, iterations `10`) recorded single-rank p50 `24.92 ms`, `5.10k model tokens/s`, and `3.33 GiB` peak resident memory. Vocab-parallel TP2 recorded p50 `23.17 ms`, `5.48k model tokens/s`, and `2.80 GiB` per-rank peak resident memory. The previous replicated-vocabulary ABI16 TP2 baseline was about `24.25 ms` and `4.22 GiB` per rank. This is a native scaling benchmark, not matched Megatron-LM parity.
+- ABI18 working tree: native topology owns independent TP, EP, and expert-DP communicators and validates `WORLD_SIZE=TP_SIZE*EP_SIZE*DP_SIZE`. Dense LoRA parameters synchronize and reduce over EP and expert-DP replicas; routed expert parameters remain local to EP and reduce only over expert-DP. TP-latent expert LoRA copies its input into the TP autograd region so backward sums the input gradient exactly once. CLI weight loading composes attention/GDN/vocabulary TP shards with expert EP shards; the server explicitly rejects the source-sharding contract it cannot yet represent.
+- H20 target: ABI18 TP2 x EP2 sharded-A2A smoke passed fixed Q and grouped expert gate-up/down LoRA against a full-model reference with unequal EP token counts. Standard Adam parameter oracles were zero on all four ranks; fixed FP32 m/v maxima were `1.01e-4` / `3.08e-9`. Selected dynamic multi-LoRA produced positive selected updates, exactly zero unselected updates, and clocks `[1,0]`; invalid topology and MTP guards fired.
+- H20 target: ABI18 regressions passed TP2 x DP2, GDN TP2 fixed/dynamic, and pure EP2 sharded A2A fixed/dynamic tests. GDN fixed/dynamic FP32 m/v maxima remained within `1.07e-5` / `1.22e-9`, and all standard Adam formula errors were zero. Pure EP fixed expert parameter differences were bounded by BF16 (`9.62e-4` maximum) with m/v maxima `1.22e-5` / `3.92e-9`.
+
+# Megatron-LM Performance Gap
+
+ABI18 establishes correct process groups and update ownership, but it does not
+close the MoE throughput gap. Base expert weights are replicated across TP
+ranks instead of using expert tensor parallelism. The native dispatcher still
+iterates routing slots and local experts, launches variable-split A2A work on
+the current stream, and performs TP LoRA reductions around individual expert
+paths. It lacks Megatron-style fused permutation, capacity-aligned dispatch,
+communication overlap, grouped expert GEMM scheduling across ETP, and inverse
+dispatch fusion. These are the next performance slice; the current evidence is
+correctness and regression evidence, not a matched throughput claim.
 
 # Decisions During Execution
 
@@ -60,6 +75,6 @@ Not yet verified or implemented: combined MoE TP x EP/DP, MLP-targeted LoRA unde
 
 # Verification
 
-Passed: `cargo check -p rustrain-qwen3-6 -p rustrain-server -p rustrain-ipc` (with the repository host venv), `cargo test -p rustrain-qwen3-6 --lib`, `cargo test -p rustrain-server checkpoint::tests --lib` (11), Qwen integration tests, remote ABI8-ABI14 native smokes listed above, ABI16 TP2 x DP2 and GDN TP2 smokes, and ABI17 TP2 tied/untied vocabulary parity plus world4 custom-rank-order TPDP smokes.
+Passed: `cargo check -p rustrain-core -p rustrain-qwen3-6 -p rustrain-server` (with the repository host venv), focused runtime/topology unit tests, remote ABI8-ABI14 native smokes listed above, ABI16 TP2 x DP2 and GDN TP2 smokes, ABI17 TP2 tied/untied vocabulary parity plus world4 custom-rank-order TPDP smokes, and ABI18 TP2 x EP2, TP2 x DP2, GDN TP2, and pure EP2 sharded-A2A native smokes.
 
-Not run: combined MoE TP x EP/DP, PP/CP, server-side source-sharded dynamic dispatch, heterogeneous dynamic adapter signatures, dynamic+MTP, cross-topology resharding, and a matched Megatron performance benchmark. No dependency installation or JIT workaround was used for ABI17; the implementation uses the existing prebuilt PyTorch ABI1 and NCCL runtime.
+Not run: TP x EP x expert-DP, PP/CP, server-side source-sharded dynamic dispatch, TP x EP checkpoint resume, heterogeneous dynamic adapter signatures, dynamic+MTP, cross-topology resharding, and a matched Megatron performance benchmark. No dependency installation or JIT workaround was used for ABI18; the implementation uses the existing prebuilt PyTorch ABI1 and NCCL runtime.

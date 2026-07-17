@@ -7,6 +7,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <string>
 #include <vector>
 
 struct LayerConfig {
@@ -221,9 +222,16 @@ int main() {
         &target_layer, 1, targets);
     assert(distributed_ctx);
 
-    // The reference owns all experts and deliberately never initializes NCCL.
-    // Its copied LayerConfig therefore retains null communication handles even
-    // though WORLD_SIZE remains two for the distributed process.
+    // The reference owns all experts and is explicitly process-local. Restore
+    // the distributed EP topology before initializing its communicator below.
+    setenv("WORLD_SIZE", "1", 1);
+    setenv("RANK", "0", 1);
+    setenv("TP_SIZE", "1", 1);
+    setenv("EP_SIZE", "1", 1);
+    setenv("DP_SIZE", "1", 1);
+    setenv("RUSTRAIN_TP_RANK", "0", 1);
+    setenv("RUSTRAIN_EP_RANK", "0", 1);
+    setenv("RUSTRAIN_DP_RANK", "0", 1);
     void* reference_ctx = qwen36_create_training_context(
         reference_weight_ptrs.data(),
         static_cast<int64_t>(reference_weight_ptrs.size()),
@@ -232,6 +240,13 @@ int main() {
         1.0, 1e-3, 0.9, 0.999, 1e-8, vocab, 1e-5, lora_rank,
         &target_layer, 1, targets);
     assert(reference_ctx);
+    const std::string distributed_rank = std::to_string(rank);
+    setenv("WORLD_SIZE", "2", 1);
+    setenv("RANK", distributed_rank.c_str(), 1);
+    setenv("EP_SIZE", "2", 1);
+    setenv("RUSTRAIN_TP_RANK", "0", 1);
+    setenv("RUSTRAIN_EP_RANK", distributed_rank.c_str(), 1);
+    setenv("RUSTRAIN_DP_RANK", "0", 1);
 
     auto opts = at::TensorOptions().device(at::kCUDA).dtype(at::kFloat);
     auto global_gate_up_a =

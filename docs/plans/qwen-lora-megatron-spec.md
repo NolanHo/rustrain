@@ -51,7 +51,12 @@ Full-parameter training, unfrozen base weights, unverified third-party packages,
 
 # Dependency Constraints
 
-The target host currently exposes PyTorch 2.5.1+cu121 with ABI0 and no importable Transformer Engine, flash-attn, DeepEP, or Triton package. Public prebuilt availability must be rechecked before any dependency change; no package is added based on an unavailable search backend.
+The target H20 runtime exposes PyTorch 2.12.1+cu130 with C++ ABI1,
+CUDA 13.0, and NCCL 2.29.7. Transformer Engine, flash-attn, FLA, DeepEP,
+and grouped-gemm packages are not installed. Triton and Tilelang import, but
+their runtime compilation model is excluded by the no-JIT contract. The
+current implementation therefore uses the prebuilt libtorch `at::_grouped_mm`
+and NCCL APIs without adding a dependency.
 
 # Known Baseline
 

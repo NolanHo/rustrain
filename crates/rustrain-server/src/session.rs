@@ -324,13 +324,11 @@ impl TrainingSession for Qwen36Session {
             &needed,
         )?;
 
-        // ── Expert Parallel support ──
-        // Read EP params from env vars (set by launcher script)
-        let ep_rank = std::env::var("RANK")
+        let global_rank = std::env::var("RANK")
             .ok()
             .and_then(|s| s.parse::<usize>().ok())
             .unwrap_or(0);
-        let ep_world_size = std::env::var("WORLD_SIZE")
+        let world_size = std::env::var("WORLD_SIZE")
             .ok()
             .and_then(|s| s.parse::<usize>().ok())
             .unwrap_or(1);
@@ -344,51 +342,92 @@ impl TrainingSession for Qwen36Session {
             .ok()
             .and_then(|s| s.parse::<usize>().ok())
             .unwrap_or(1);
-        let is_ep = ep_world_size > 1 && runtime_config.is_moe && tp_size == 1;
-        let dense_topology = if runtime_config.is_moe {
-            None
+        let has_explicit_non_tp_axis = [
+            "EP_SIZE",
+            "RUSTRAIN_EP_SIZE",
+            "EXPERT_MODEL_PARALLEL_SIZE",
+            "DP_SIZE",
+            "RUSTRAIN_DP_SIZE",
+            "DATA_PARALLEL_SIZE",
+            "PP_SIZE",
+            "RUSTRAIN_PP_SIZE",
+            "PIPELINE_MODEL_PARALLEL_SIZE",
+            "CP_SIZE",
+            "RUSTRAIN_CP_SIZE",
+            "CONTEXT_PARALLEL_SIZE",
+        ]
+        .iter()
+        .any(|name| std::env::var_os(name).is_some());
+        let topology = if runtime_config.is_moe && !has_explicit_non_tp_axis {
+            let ep_size = world_size
+                .checked_div(tp_size)
+                .filter(|size| size * tp_size == world_size)
+                .ok_or_else(|| {
+                    anyhow!("WORLD_SIZE={world_size} is not divisible by TP_SIZE={tp_size}")
+                })?;
+            let rank_order = std::env::var("RUSTRAIN_PARALLEL_ORDER")
+                .or_else(|_| std::env::var("PARALLEL_ORDER"))
+                .unwrap_or_else(|_| rustrain_parallel::topology::DEFAULT_RANK_ORDER.to_string());
+            ParallelTopology::with_order(tp_size, 1, 1, ep_size, 1, &rank_order)?
         } else {
-            let topology = ParallelTopology::from_env_with_world_size(ep_world_size)?;
-            if topology.pipeline_model_parallel_size() != 1
-                || topology.expert_model_parallel_size() != 1
-                || topology.context_parallel_size() != 1
-            {
-                return Err(anyhow!(
-                    "native dense Qwen server supports TPxDP only (tp={} pp={} dp={} ep={} cp={})",
-                    topology.tensor_model_parallel_size(),
-                    topology.pipeline_model_parallel_size(),
-                    topology.data_parallel_size(),
-                    topology.expert_model_parallel_size(),
-                    topology.context_parallel_size(),
-                ));
-            }
-            if topology.tensor_model_parallel_size() != tp_size {
-                return Err(anyhow!(
-                    "Qwen server topology TP={} does not match TP_SIZE={tp_size}",
-                    topology.tensor_model_parallel_size()
-                ));
-            }
-            topology.coordinates(ep_rank)?;
-            Some(topology)
+            ParallelTopology::from_env_with_world_size(world_size)?
         };
-        let dp_size = dense_topology
-            .as_ref()
-            .map(ParallelTopology::data_parallel_size)
-            .unwrap_or(1);
-        let tp_rank = dense_topology
-            .as_ref()
-            .map(|topology| topology.tensor_rank(ep_rank))
-            .transpose()?
-            .unwrap_or(0);
-        let dp_rank = dense_topology
-            .as_ref()
-            .map(|topology| topology.data_rank(ep_rank))
-            .transpose()?
-            .unwrap_or(ep_rank);
+        if topology.pipeline_model_parallel_size() != 1
+            || topology.context_parallel_size() != 1
+        {
+            return Err(anyhow!(
+                "native Qwen server does not support PP or CP (tp={} pp={} dp={} ep={} cp={})",
+                topology.tensor_model_parallel_size(),
+                topology.pipeline_model_parallel_size(),
+                topology.data_parallel_size(),
+                topology.expert_model_parallel_size(),
+                topology.context_parallel_size(),
+            ));
+        }
+        if topology.tensor_model_parallel_size() != tp_size {
+            return Err(anyhow!(
+                "Qwen server topology TP={} does not match TP_SIZE={tp_size}",
+                topology.tensor_model_parallel_size()
+            ));
+        }
+        topology.coordinates(global_rank)?;
+        if runtime_config.is_moe && tp_size > 1 {
+            return Err(anyhow!(
+                "Qwen server TPxEP requires a source-shard contract that keeps TP peers on identical input batches; use the native CLI trainer until the server request protocol carries source-shard coordinates"
+            ));
+        }
+        if runtime_config.is_moe && topology.data_parallel_size() > 1 {
+            return Err(anyhow!(
+                "native MoE Qwen server does not yet support data parallelism"
+            ));
+        }
+        if !runtime_config.is_moe && topology.expert_model_parallel_size() != 1 {
+            return Err(anyhow!(
+                "native dense Qwen server requires expert_model_parallel_size=1"
+            ));
+        }
+        let dp_size = topology.data_parallel_size();
+        let ep_size = topology.expert_model_parallel_size();
+        let tp_rank = topology.tensor_rank(global_rank)?;
+        let dp_rank = topology.data_rank(global_rank)?;
+        let expert_rank = topology.expert_rank(global_rank)?;
+        let is_ep = runtime_config.is_moe && ep_size > 1;
         let is_data_parallel = !runtime_config.is_moe && dp_size > 1;
+        let ep_a2a_sharded = std::env::var("QWEN36_EP_A2A_SHARDED")
+            .map(|value| !value.is_empty() && value != "0")
+            .unwrap_or(false);
+        if is_ep && ep_a2a_sharded {
+            return Err(anyhow!(
+                "QWEN36_EP_A2A_SHARDED is not supported by the Qwen server because TrainInput does not carry an EP source-shard coordinate"
+            ));
+        }
         unsafe {
             std::env::set_var("TP_SIZE", tp_size.to_string());
+            std::env::set_var("EP_SIZE", ep_size.to_string());
             std::env::set_var("DP_SIZE", dp_size.to_string());
+            std::env::set_var("RUSTRAIN_TP_RANK", tp_rank.to_string());
+            std::env::set_var("RUSTRAIN_EP_RANK", expert_rank.to_string());
+            std::env::set_var("RUSTRAIN_DP_RANK", dp_rank.to_string());
             std::env::set_var(
                 "RUSTRAIN_DATA_PARALLEL",
                 if is_data_parallel { "1" } else { "0" },
@@ -493,13 +532,13 @@ impl TrainingSession for Qwen36Session {
         // Compute expert shard
         let (expert_start, expert_count) = if is_ep {
             assert!(
-                runtime_config.num_experts % ep_world_size == 0,
-                "num_experts {} not divisible by ep_world_size {}",
+                runtime_config.num_experts % ep_size == 0,
+                "num_experts {} not divisible by ep_size {}",
                 runtime_config.num_experts,
-                ep_world_size
+                ep_size
             );
-            let epr = runtime_config.num_experts / ep_world_size;
-            (ep_rank * epr, epr)
+            let epr = runtime_config.num_experts / ep_size;
+            (expert_rank * epr, epr)
         } else {
             (0, runtime_config.num_experts)
         };
@@ -613,46 +652,47 @@ impl TrainingSession for Qwen36Session {
             base_tp_mlp,
             vocab_parallel,
             is_data_parallel,
+            is_ep,
             &all_layers,
             &target_modules,
             expert_start,
             expert_count,
         )?;
 
-        // Initialize NCCL directly in C++. Dense TPxDP receives explicit
-        // orthogonal group metadata; legacy EP keeps its world communicator.
-        let nccl_ep = if ep_world_size > 1 {
-            if let Some(topology) = dense_topology.as_ref() {
-                let tp_color = *topology
-                    .tensor_group(ep_rank)?
-                    .iter()
-                    .min()
-                    .ok_or_else(|| anyhow!("empty TP process group"))?;
-                let dp_color = *topology
-                    .data_group(ep_rank)?
-                    .iter()
-                    .min()
-                    .ok_or_else(|| anyhow!("empty DP process group"))?;
-                ctx.init_parallel_nccl(
-                    ep_rank,
-                    ep_world_size,
-                    tp_rank,
-                    tp_size,
-                    tp_color,
-                    dp_rank,
-                    dp_size,
-                    dp_color,
-                )?;
-            } else {
-                let ret = ctx.init_nccl();
-                if ret != 0 {
-                    return Err(anyhow!("C++ NCCL init failed (code {})", ret));
-                }
-            }
+        let nccl_ep = if world_size > 1 {
+            let tp_color = *topology
+                .tensor_group(global_rank)?
+                .iter()
+                .min()
+                .ok_or_else(|| anyhow!("empty TP process group"))?;
+            let ep_color = *topology
+                .expert_group(global_rank)?
+                .iter()
+                .min()
+                .ok_or_else(|| anyhow!("empty EP process group"))?;
+            let dp_color = *topology
+                .data_group(global_rank)?
+                .iter()
+                .min()
+                .ok_or_else(|| anyhow!("empty DP process group"))?;
+            ctx.init_parallel_nccl(
+                global_rank,
+                world_size,
+                tp_rank,
+                tp_size,
+                tp_color,
+                expert_rank,
+                ep_size,
+                ep_color,
+                dp_rank,
+                dp_size,
+                dp_color,
+            )?;
             tracing::info!(
-                ep_rank,
-                ep_world_size,
+                global_rank,
+                world_size,
                 data_parallel = is_data_parallel,
+                expert_parallel = is_ep,
                 tp_size,
                 "NCCL communicator created in C++ for Qwen parallel training"
             );

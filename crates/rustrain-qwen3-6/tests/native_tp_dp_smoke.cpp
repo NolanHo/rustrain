@@ -32,6 +32,7 @@ extern "C" void* qwen36_create_training_context_ex(
 extern "C" int32_t qwen36_init_nccl(void*);
 extern "C" int32_t qwen36_init_parallel_nccl(
     void*, int32_t, int32_t, int32_t, int32_t, int32_t,
+    int32_t, int32_t, int32_t,
     int32_t, int32_t, int32_t);
 extern "C" int32_t qwen36_set_lora_tensor(void*, int64_t, int32_t, void*);
 extern "C" void* qwen36_get_lora_a(void*, int64_t);
@@ -235,7 +236,7 @@ static FullReference run_full_reference(
 }
 
 int main() {
-    assert(qwen36_kernel_abi_version() == 17);
+    assert(qwen36_kernel_abi_version() == 18);
     const int rank = std::atoi(std::getenv("RANK"));
     const int world = std::atoi(std::getenv("WORLD_SIZE"));
     const int local_rank = std::atoi(
@@ -361,6 +362,7 @@ int main() {
     assert(qwen36_init_parallel_nccl(
         distributed, rank, world,
         tp_rank, 2, dp_rank,
+        0, 1, rank,
         dp_rank, 2, tp_rank) == 0);
 
     const auto synchronized_params = lora_parameters(distributed);
@@ -394,8 +396,14 @@ int main() {
     // Reference contexts stay process-local. The concatenated batch is the
     // hard oracle for the DP-reduced update; the two local references prove
     // that unequal token counts are not accidentally averaged by replica.
+    setenv("WORLD_SIZE", "1", 1);
+    setenv("RANK", "0", 1);
     setenv("TP_SIZE", "1", 1);
+    setenv("EP_SIZE", "1", 1);
     setenv("DP_SIZE", "1", 1);
+    setenv("RUSTRAIN_TP_RANK", "0", 1);
+    setenv("RUSTRAIN_EP_RANK", "0", 1);
+    setenv("RUSTRAIN_DP_RANK", "0", 1);
     unsetenv("RUSTRAIN_DATA_PARALLEL");
     auto reference_lora = make_lora_weights(
         hidden, heads, kv_heads, head_dim, lora_rank);

@@ -58,7 +58,7 @@ extern "C" void qwen36_free_training_context(void*);
 
 namespace {
 
-constexpr int64_t kAbiVersion = 17;
+constexpr int64_t kAbiVersion = 18;
 constexpr int32_t kBaseTpAttention = 1 << 0;
 constexpr int32_t kVocabParallel = 1 << 2;
 constexpr int64_t kLayers = 2;
@@ -374,7 +374,16 @@ static ContextPair create_context_pair(
         kBaseTpAttention | kVocabParallel);
     assert(distributed && qwen36_init_nccl(distributed) == 0);
 
+    const std::string distributed_rank = std::getenv("RANK");
+    const std::string distributed_world = std::getenv("WORLD_SIZE");
+    setenv("WORLD_SIZE", "1", 1);
+    setenv("RANK", "0", 1);
     setenv("TP_SIZE", "1", 1);
+    setenv("EP_SIZE", "1", 1);
+    setenv("DP_SIZE", "1", 1);
+    setenv("RUSTRAIN_TP_RANK", "0", 1);
+    setenv("RUSTRAIN_EP_RANK", "0", 1);
+    setenv("RUSTRAIN_DP_RANK", "0", 1);
     auto full_ptrs = pointers(full_weights);
     void* reference = qwen36_create_training_context(
         full_ptrs.data(), full_ptrs.size(), &full_embed, &final_norm,
@@ -383,6 +392,12 @@ static ContextPair create_context_pair(
         1.0, 1e-3, 0.9, 0.999, 1e-8, kVocab, 1e-5, kLoraRank,
         target_layers, kLayers, fixed_targets);
     assert(reference);
+    setenv("WORLD_SIZE", distributed_world.c_str(), 1);
+    setenv("RANK", distributed_rank.c_str(), 1);
+    setenv("TP_SIZE", "2", 1);
+    unsetenv("RUSTRAIN_TP_RANK");
+    unsetenv("RUSTRAIN_EP_RANK");
+    unsetenv("RUSTRAIN_DP_RANK");
     return {distributed, reference};
 }
 
