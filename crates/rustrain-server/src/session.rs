@@ -21,13 +21,22 @@ fn lora_tp_shard_layout(
         | Qwen36LoraTargetModule::VProj
         | Qwen36LoraTargetModule::InProjZ
         | Qwen36LoraTargetModule::InProjA
-        | Qwen36LoraTargetModule::InProjB => checkpoint::LoraTpShardLayout::ColumnParallel,
+        | Qwen36LoraTargetModule::InProjB
+        | Qwen36LoraTargetModule::GateProj
+        | Qwen36LoraTargetModule::UpProj
+        | Qwen36LoraTargetModule::SharedGateProj
+        | Qwen36LoraTargetModule::SharedUpProj => {
+            checkpoint::LoraTpShardLayout::ColumnParallel
+        }
         Qwen36LoraTargetModule::InProjQkv => checkpoint::LoraTpShardLayout::FlatQkvColumnParallel {
             q_rows: config.linear_num_key_heads * config.linear_key_head_dim,
             k_rows: config.linear_num_key_heads * config.linear_key_head_dim,
             v_rows: config.linear_num_value_heads * config.linear_value_head_dim,
         },
-        Qwen36LoraTargetModule::OProj | Qwen36LoraTargetModule::OutProj => {
+        Qwen36LoraTargetModule::OProj
+        | Qwen36LoraTargetModule::OutProj
+        | Qwen36LoraTargetModule::DownProj
+        | Qwen36LoraTargetModule::SharedDownProj => {
             checkpoint::LoraTpShardLayout::RowParallel
         }
         _ => checkpoint::LoraTpShardLayout::LatentRank,

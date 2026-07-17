@@ -61,10 +61,11 @@ extern "C" void qwen36_free_training_context(void*);
 
 namespace {
 
-constexpr int64_t kAbiVersion = 19;
+constexpr int64_t kAbiVersion = 20;
 constexpr int32_t kBaseTpAttention = 1 << 0;
 constexpr int32_t kVocabParallel = 1 << 2;
 constexpr int32_t kExpertParallel = 1 << 3;
+constexpr int32_t kBaseTpMlp = 1 << 4;
 constexpr int64_t kHidden = 16;
 constexpr int64_t kVocab = 16;
 constexpr int64_t kHeads = 2;
@@ -73,7 +74,6 @@ constexpr int64_t kHeadDim = 8;
 constexpr int64_t kExperts = 2;
 constexpr int64_t kIntermediate = 8;
 constexpr int64_t kLoraRank = 4;
-constexpr int64_t kLocalLoraRank = kLoraRank / 2;
 constexpr int64_t kLoraPairs = 9;
 constexpr int64_t kOptimizerSlots = 2 * kLoraPairs;
 constexpr double kLearningRate = 1e-3;
@@ -198,6 +198,7 @@ std::vector<at::Tensor> make_local_weights(
 ) {
     const int64_t local_heads = kHeads / 2;
     const int64_t local_kv_heads = kKvHeads / 2;
+    const int64_t local_intermediate = kIntermediate / 2;
     std::vector<at::Tensor> local;
     local.reserve(full.size());
     local.push_back(full[0]);
@@ -216,9 +217,31 @@ std::vector<at::Tensor> make_local_weights(
     local.push_back(full[7].narrow(
         1, tp_rank * local_heads * kHeadDim,
         local_heads * kHeadDim).contiguous());
-    local.insert(local.end(), full.begin() + 8, full.begin() + 13);
-    local.push_back(full[13].narrow(0, ep_rank, 1).contiguous());
-    local.push_back(full[14].narrow(0, ep_rank, 1).contiguous());
+    local.push_back(full[8]);
+    local.push_back(full[9]);
+    local.push_back(full[10].narrow(
+        0, tp_rank * local_intermediate, local_intermediate).contiguous());
+    local.push_back(full[11].narrow(
+        0, tp_rank * local_intermediate, local_intermediate).contiguous());
+    local.push_back(full[12].narrow(
+        1, tp_rank * local_intermediate, local_intermediate).contiguous());
+    auto local_gate_up = full[13].narrow(0, ep_rank, 1);
+    local.push_back(at::cat({
+        local_gate_up.narrow(
+            1, tp_rank * local_intermediate, local_intermediate),
+        local_gate_up.narrow(
+            1, kIntermediate + tp_rank * local_intermediate,
+            local_intermediate),
+    }, 1).contiguous());
+    local.push_back(full[14]
+        .narrow(0, ep_rank, 1)
+        .narrow(2, tp_rank * local_intermediate, local_intermediate)
+        .contiguous());
+    assert(local[10].sizes() == at::IntArrayRef({local_intermediate, kHidden}));
+    assert(local[11].sizes() == at::IntArrayRef({local_intermediate, kHidden}));
+    assert(local[12].sizes() == at::IntArrayRef({kHidden, local_intermediate}));
+    assert(local[13].sizes() == at::IntArrayRef({1, 2 * local_intermediate, kHidden}));
+    assert(local[14].sizes() == at::IntArrayRef({1, kHidden, local_intermediate}));
     return local;
 }
 
@@ -242,7 +265,13 @@ LayerConfig make_config(int expert_start, int expert_count) {
     return config;
 }
 
-enum class FixtureKind { Q, ExpertGateUp, ExpertDown };
+enum class FixtureKind {
+    Q,
+    SharedGate,
+    SharedDown,
+    ExpertGateUp,
+    ExpertDown,
+};
 
 struct LoraFixture {
     int64_t slot;
@@ -263,10 +292,33 @@ at::Tensor local_factor(
         const int64_t local_rows = full.size(0) / 2;
         return full.narrow(0, tp_rank * local_rows, local_rows).contiguous();
     }
+    const int64_t local_intermediate = kIntermediate / 2;
+    if (kind == FixtureKind::SharedGate) {
+        if (!is_b) return full.clone();
+        return full.narrow(
+            0, tp_rank * local_intermediate, local_intermediate).contiguous();
+    }
+    if (kind == FixtureKind::SharedDown) {
+        if (is_b) return full.clone();
+        return full.narrow(
+            1, tp_rank * local_intermediate, local_intermediate).contiguous();
+    }
     auto local = full.narrow(0, ep_rank, 1);
-    const int64_t rank_dim = is_b ? 2 : 1;
-    return local.narrow(
-        rank_dim, tp_rank * kLocalLoraRank, kLocalLoraRank).contiguous();
+    if (kind == FixtureKind::ExpertGateUp) {
+        if (!is_b) return local.contiguous();
+        return at::cat({
+            local.narrow(
+                1, tp_rank * local_intermediate, local_intermediate),
+            local.narrow(
+                1, kIntermediate + tp_rank * local_intermediate,
+                local_intermediate),
+        }, 1).contiguous();
+    }
+    if (!is_b) {
+        return local.narrow(
+            2, tp_rank * local_intermediate, local_intermediate).contiguous();
+    }
+    return local.contiguous();
 }
 
 std::vector<LoraFixture> make_lora_fixtures(
@@ -284,6 +336,12 @@ std::vector<LoraFixture> make_lora_fixtures(
         fingerprint({kLoraRank, kHidden}, 0.0007, offset + 1),
         fingerprint({2 * kHeads * kHeadDim, kLoraRank},
             0.0006, offset + 101));
+    add(4, "shared_gate_proj", FixtureKind::SharedGate,
+        fingerprint({kLoraRank, kHidden}, 0.0007, offset + 151),
+        fingerprint({kIntermediate, kLoraRank}, 0.0006, offset + 181));
+    add(6, "shared_down_proj", FixtureKind::SharedDown,
+        fingerprint({kLoraRank, kIntermediate}, 0.0007, offset + 191),
+        fingerprint({kHidden, kLoraRank}, 0.0006, offset + 201));
     add(7, "experts_gate_up_proj", FixtureKind::ExpertGateUp,
         fingerprint({kExperts, kLoraRank, kHidden}, 0.0007, offset + 211),
         fingerprint({kExperts, 2 * kIntermediate, kLoraRank},
@@ -293,6 +351,16 @@ std::vector<LoraFixture> make_lora_fixtures(
             0.0007, offset + 401),
         fingerprint({kExperts, kHidden, kLoraRank},
             0.0006, offset + 503));
+    assert(result[0].local_a.sizes() == at::IntArrayRef({kLoraRank, kHidden}));
+    assert(result[0].local_b.sizes() == at::IntArrayRef({kHidden, kLoraRank}));
+    assert(result[1].local_a.sizes() == at::IntArrayRef({kLoraRank, kHidden}));
+    assert(result[1].local_b.sizes() == at::IntArrayRef({kIntermediate / 2, kLoraRank}));
+    assert(result[2].local_a.sizes() == at::IntArrayRef({kLoraRank, kIntermediate / 2}));
+    assert(result[2].local_b.sizes() == at::IntArrayRef({kHidden, kLoraRank}));
+    assert(result[3].local_a.sizes() == at::IntArrayRef({1, kLoraRank, kHidden}));
+    assert(result[3].local_b.sizes() == at::IntArrayRef({1, kIntermediate, kLoraRank}));
+    assert(result[4].local_a.sizes() == at::IntArrayRef({1, kLoraRank, kIntermediate / 2}));
+    assert(result[4].local_b.sizes() == at::IntArrayRef({1, kHidden, kLoraRank}));
     return result;
 }
 
@@ -411,7 +479,8 @@ int main() {
     auto reference_config = make_config(0, kExperts);
     const int64_t target_layer = 0;
     constexpr const char* targets =
-        "q_proj,experts_gate_up_proj,experts_down_proj";
+        "q_proj,shared_gate_proj,shared_down_proj,"
+        "experts_gate_up_proj,experts_down_proj";
 
     // Reject a process grid that cannot cover WORLD_SIZE before any NCCL
     // communicator is created.
@@ -423,7 +492,7 @@ int main() {
         static_cast<int32_t>(at::kBFloat16),
         1.0, kLearningRate, kBeta1, kBeta2, kAdamEps,
         kVocab, 1e-5, kLoraRank, &target_layer, 1, targets,
-        kBaseTpAttention | kVocabParallel | kExpertParallel);
+        kBaseTpAttention | kVocabParallel | kExpertParallel | kBaseTpMlp);
     assert(invalid == nullptr);
     set_distributed_env(rank, tp_rank, ep_rank);
 
@@ -433,7 +502,7 @@ int main() {
         static_cast<int32_t>(at::kBFloat16),
         1.0, kLearningRate, kBeta1, kBeta2, kAdamEps,
         kVocab, 1e-5, kLoraRank, &target_layer, 1, targets,
-        kBaseTpAttention | kVocabParallel | kExpertParallel);
+        kBaseTpAttention | kVocabParallel | kExpertParallel | kBaseTpMlp);
     assert(distributed);
 
     set_reference_env();

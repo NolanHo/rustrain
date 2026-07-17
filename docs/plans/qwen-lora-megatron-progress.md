@@ -12,9 +12,9 @@ timestamp: 2026-07-17T00:00:00Z
 
 # Current State
 
-Verified: Qwen3.5/3.6 native forward/backward slices, GDN CUDA path, grouped MoE fallback, EP parity against a full-expert reference, variable-split EP A2A with fixed-LoRA data sharding, dense replicated-DP smoke with per-tenant token weighting, latent-rank and projection-aware LoRA TP, frozen full-attention/GDN/dense-MLP base-weight TP, orthogonal dense TP x DP process groups, vocabulary-parallel embedding/LM-head/distributed cross entropy, composable LoRA-only TP x EP process groups with expert-local and dense-replicated gradient semantics, dynamic batch logical-step update, FP32 gradient storage/aggregation, standard Adam bias correction, per-tenant optimizer-step restore, selected-tenant isolation, checkpoint v4 projection layouts and fixed-slot identities, and 5D topology mapping.
+Verified: Qwen3.5/3.6 native forward/backward slices, GDN CUDA path, grouped MoE fallback, EP parity against a full-expert reference, variable-split EP A2A with fixed-LoRA data sharding, dense replicated-DP smoke with per-tenant token weighting, latent-rank and projection-aware LoRA TP, frozen full-attention/GDN/dense-MLP base-weight TP, routed/shared expert tensor parallelism, orthogonal dense TP x DP process groups, vocabulary-parallel embedding/LM-head/distributed cross entropy, composable LoRA-only TP x EP process groups with expert-local and dense-replicated gradient semantics, dynamic batch logical-step update, FP32 gradient storage/aggregation, standard Adam bias correction, per-tenant optimizer-step restore, selected-tenant isolation, checkpoint v4 projection layouts and fixed-slot identities, and 5D topology mapping.
 
-Not yet verified or implemented: the three-axis TP x EP x expert-DP combination, expert-tensor-parallel base-weight sharding, MLP-targeted LoRA under base TP, fused QKV/gate-up and sequence parallel, PP/CP, DeepEP/TE/FLA prebuilt integration, server-side source-sharded dynamic dispatch, TP x EP checkpoint metadata/resharding, heterogeneous dynamic adapter signatures, dynamic+MTP objective normalization, cross-topology checkpoint resharding, old-v3 attention checkpoint migration, and matched Megatron throughput. The server rejects MoE TP x EP until request source coordinates and checkpoint ownership are represented. Native direct dynamic source metadata under sharded A2A is implemented and full-reference smoke-tested.
+Not yet verified or implemented: the three-axis TP x EP x expert-DP combination, fused QKV/gate-up and sequence parallel, PP/CP, DeepEP/TE/FLA prebuilt integration, server-side source-sharded dynamic dispatch, compound EP x ETP checkpoint metadata/resharding, heterogeneous dynamic adapter signatures, dynamic+MTP objective normalization, cross-topology checkpoint resharding, old-v3 attention checkpoint migration, and matched Megatron throughput. The server rejects MoE TP x EP until request source coordinates and compound checkpoint ownership are represented. Native direct dynamic source metadata under sharded A2A is implemented and full-reference smoke-tested.
 
 # Durable Milestones
 
@@ -54,31 +54,36 @@ Not yet verified or implemented: the three-axis TP x EP x expert-DP combination,
 - H20 target: ABI19 default-packed TP2 x EP2 fixed/dynamic smoke passed. The unaligned local-rank branch retained the ABI18 full-reference bounds (`1.98e-3` maximum BF16 parameter difference, `9.92e-5` / `3.02e-9` FP32 m/v maxima, zero standard-Adam error), and dynamic adapters kept positive selected updates, exactly zero isolated updates, and clocks `[1,0]`.
 - H20 target: matched native TP2 x EP2 fixed-LoRA benchmark (`B=2`, `S=128`, `H=1024`, `E=8`, `I=2048`, top-k 2, global rank 16, one layer, warmup 5, iterations 30) aggregates each measured step with a world-wide maximum across the TP x EP grid. It reduced p50 step time from `9.007 ms` to `6.499 ms` and increased unique-token throughput from `56.84k/s` to `78.78k/s` (`27.8%` lower p50, `38.6%` higher throughput). Allocator peak stayed near `0.26 GiB`; the larger packed workspace increased observed resident memory by at most `0.09 GiB` in this run.
 - H20 target: matched Nsight Systems traces recorded `6812 -> 5168` `cudaLaunchKernel` calls, NCCL SendRecv `96 -> 48`, AllGather `24 -> 12`, and BF16 AllReduce `216 -> 120` across four ranks for one warmup plus two measured steps. These traces predate and therefore exclude the benchmark-only world-max metrics collective, which runs outside step timing. The counts include initialization, so they are conservative end-to-end process-tree evidence rather than isolated dispatcher counts.
+- ABI20 shards routed and shared expert gate/up output rows and down-projection input columns across TP ranks. Projection LoRA follows the same column/row layouts, reducing only replicated A or B gradients at the optimizer boundary. Packed EP dispatch computes local ETP partials, TP-reduces them before routing weights, and no longer duplicates frozen expert compute or storage across TP peers. The checkpoint v4 format cannot encode the routed expert's compound EP leading-axis plus segmented gate/up ETP axis, so the server retains its MoE TP rejection pending an axis-aware checkpoint format.
+- H20 target: ABI20 TP2 x EP2 fixed and dynamic smokes passed routed gate/up/down, shared gate/up/down, selected-tenant isolation, and FP32 Adam-state oracles. Pure EP2, TP2 x DP2, and GDN TP2 regressions also passed. On the matched ABI19 workload, replicated experts recorded p50/p95 `8.742/9.822 ms` and `58.57k` unique tokens/s; ETP recorded `6.923/7.874 ms` and `73.95k` unique tokens/s, a `20.8%` p50 reduction and `26.3%` throughput increase. Peak allocator allocation fell from about `0.191 GiB` to `0.153 GiB`, while the frozen expert replication factor fell from two to one.
+- The CLI standard-PEFT artifact path now rejects TP- or EP-sharded LoRA before training because it has no rank-aware merge/reshard format; pure DP writes the replicated artifact only from DP rank zero. Native distributed training-step and benchmark entry points remain available, but distributed adapter delivery requires the pending axis-aware checkpoint/artifact format.
 
 # Megatron-LM Performance Gap
 
-ABI19 removes the top-k routing loop and groups local expert work, but it does
-not close the Megatron MoE throughput gap. Base expert weights are still
-replicated across TP ranks instead of using expert tensor parallelism. Split
-planning still has host-visible counts, dispatch and grouped GEMM use the
-current stream without communication overlap, and permutation/combine remain
-separate ATen operations. Capacity-aligned routing, fused permutation and
-inverse permutation, ETP-aware grouped GEMM, shared-expert overlap, and a
-DeepEP-class backend remain future work. The current evidence is a matched
-native legacy-versus-packed result, not a matched Megatron-LM comparison.
+ABI20 removes frozen routed/shared expert replication across TP ranks, but it
+does not close the Megatron MoE throughput gap. Rustrain's replicated TP input
+contract uses column-parallel FC1, row-parallel FC2, and a TP SUM before routing
+weights; Megatron's sequence-parallel dispatcher instead composes EP A2A with
+expert-TP gather/reduce-scatter. Split planning still has host-visible counts,
+dispatch and grouped GEMM use the current stream without communication overlap,
+and permutation/combine remain separate ATen operations. Capacity-aligned
+routing, fused permutation and inverse permutation, shared-expert overlap, a
+DeepEP-class backend, sequence parallelism, axis-aware distributed checkpointing,
+and a matched Megatron benchmark remain future work. The current evidence is a
+matched replicated-expert-versus-ETP native result, not Megatron-LM parity.
 
 # Decisions During Execution
 
 - Keep TP and EP communicators separate; do not reuse the existing EP `LayerConfig.nccl_comm` for LoRA TP deltas.
 - Publish multi-LoRA `n_max` directly from rank 0 with `ncclBroadcast`; filesystem rendezvous can reuse stale files across process restarts and give ranks different chunk schedules.
 - Do not enable Qwen TP/PP/CP by merely relaxing runtime validation.
-- Treat dense base-MLP TP as one accepted slice, not full model TP. Until projection-aware LoRA collectives exist, reject gate/up/down LoRA targets instead of applying the replicated-projection reduction rule to disjoint output shards.
+- Treat dense and expert MLP TP as projection-aware layouts: gate/up replicate A and shard B, while down shards A and replicates B. Reduce only the replicated parameter gradient at the optimizer boundary; never apply a replicated-projection reduction rule to a disjoint shard.
 - For frozen full-attention TP, use Q/K/V output-head sharding and O input-column sharding. Q/K/V replicate LoRA A and shard B; O shards A and replicates B. Sum only the replicated-side gradient at the optimizer boundary so the activation collective is not duplicated.
 - Do not reinterpret v3 attention LoRA tensors as projection-aware shards. Their latent-rank geometry is incompatible, so require v4 for Q/K/V/O resume and keep v3 compatibility for latent-rank-only modules.
 - Treat Exa/Jina dependency search failures as missing evidence, not as proof that a package is compatible.
 
 # Verification
 
-Passed: `cargo check -p rustrain-core -p rustrain-qwen3-6 -p rustrain-server` (with the repository host venv), focused runtime/topology unit tests, remote ABI8-ABI14 native smokes listed above, ABI16 TP2 x DP2 and GDN TP2 smokes, ABI17 TP2 tied/untied vocabulary parity plus world4 custom-rank-order TPDP smokes, ABI18 TP2 x EP2, TP2 x DP2, GDN TP2, and pure EP2 sharded-A2A native smokes, and ABI19 default-packed TP2 x EP2 fixed/dynamic smoke plus fixed/dynamic benchmarks and matched profiler traces.
+Passed: `cargo check -p rustrain-core -p rustrain-qwen3-6 -p rustrain-server` (with the repository host venv), focused runtime/topology unit tests, remote ABI8-ABI14 native smokes listed above, ABI16 TP2 x DP2 and GDN TP2 smokes, ABI17 TP2 tied/untied vocabulary parity plus world4 custom-rank-order TPDP smokes, ABI18 TP2 x EP2, TP2 x DP2, GDN TP2, and pure EP2 sharded-A2A native smokes, ABI19 default-packed TP2 x EP2 fixed/dynamic smoke plus fixed/dynamic benchmarks and matched profiler traces, and ABI20 ETP TP2 x EP2 fixed/dynamic smoke and matched replicated-versus-sharded expert benchmark. ABI20 regressions passed TP2 x DP2, GDN TP2, and pure EP2 fixed/dynamic smokes.
 
-Not run: TP x EP x expert-DP, PP/CP, server-side source-sharded dynamic dispatch, TP x EP checkpoint resume, heterogeneous dynamic adapter signatures, dynamic+MTP, cross-topology resharding, and a matched Megatron performance benchmark. No dependency installation or JIT workaround was used for ABI19; the implementation uses the existing prebuilt PyTorch ABI1 and NCCL runtime.
+Not run: TP x EP x expert-DP, PP/CP, server-side source-sharded dynamic dispatch, compound EP x ETP checkpoint resume or standard PEFT merge, heterogeneous dynamic adapter signatures, dynamic+MTP, cross-topology resharding, and a matched Megatron performance benchmark. No dependency installation or JIT workaround was used for ABI19 or ABI20; the implementation uses the existing prebuilt PyTorch ABI1 and NCCL runtime.

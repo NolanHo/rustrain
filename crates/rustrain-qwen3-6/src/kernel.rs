@@ -212,7 +212,7 @@ unsafe fn load_kernels() -> Option<KernelHandles> {
         }};
     }
     let abi_version: FnKernelAbiVersion = sym!("qwen36_kernel_abi_version");
-    if abi_version() != 19 {
+    if abi_version() != 20 {
         return None;
     }
     Some(KernelHandles {
@@ -332,6 +332,79 @@ pub fn shard_dense_mlp_weight_for_tp(
     let shard = full / tp_size as i64;
     let start = tp_rank as i64 * shard;
     Ok(Some(tensor.narrow(dim, start, shard).contiguous()))
+}
+
+/// Return the rank-local frozen MoE MLP shard for expert tensor parallelism.
+/// Routed expert tensors may already be narrowed on their leading EP axis.
+/// The packed gate/up layout is `[gate_all | up_all]`, so each half must be
+/// sliced independently before the local halves are concatenated.
+pub fn shard_moe_mlp_weight_for_tp(
+    name: &str,
+    tensor: &Tensor,
+    tp_size: usize,
+    tp_rank: usize,
+) -> Result<Option<Tensor>> {
+    let is_shared_gate_up = name.ends_with(".mlp.shared_expert.gate_proj.weight")
+        || name.ends_with(".mlp.shared_expert.up_proj.weight");
+    let is_shared_down = name.ends_with(".mlp.shared_expert.down_proj.weight");
+    let is_expert_gate_up = name.ends_with(".mlp.experts.gate_up_proj");
+    let is_expert_down = name.ends_with(".mlp.experts.down_proj");
+    if !(is_shared_gate_up || is_shared_down || is_expert_gate_up || is_expert_down) {
+        return Ok(None);
+    }
+    if tp_size <= 1 || tp_rank >= tp_size {
+        bail!("invalid MoE MLP TP shard: tp_rank={tp_rank}, tp_size={tp_size}");
+    }
+    let tp_size_i64 = tp_size as i64;
+    let rank = tp_rank as i64;
+    let shape = tensor.size();
+
+    if is_expert_gate_up {
+        if shape.len() != 3 || shape[1] <= 0 || shape[1] % 2 != 0 {
+            bail!(
+                "packed expert gate/up TP weight {name} must have shape [experts, 2*intermediate, hidden], got {shape:?}"
+            );
+        }
+        let intermediate = shape[1] / 2;
+        if intermediate % tp_size_i64 != 0 {
+            bail!(
+                "packed expert gate/up intermediate={intermediate} is not divisible by TP_SIZE={tp_size}"
+            );
+        }
+        let local = intermediate / tp_size_i64;
+        let gate = tensor.narrow(1, rank * local, local);
+        let up = tensor.narrow(1, intermediate + rank * local, local);
+        return Ok(Some(Tensor::cat(&[&gate, &up], 1).contiguous()));
+    }
+
+    let dim = if is_shared_gate_up {
+        if shape.len() != 2 {
+            bail!("shared expert gate/up TP weight {name} must be a matrix, got {shape:?}");
+        }
+        0
+    } else if is_shared_down {
+        if shape.len() != 2 {
+            bail!("shared expert down TP weight {name} must be a matrix, got {shape:?}");
+        }
+        1
+    } else {
+        if shape.len() != 3 {
+            bail!("routed expert down TP weight {name} must be rank 3, got {shape:?}");
+        }
+        2
+    };
+    let full = shape[dim];
+    if full <= 0 || full % tp_size_i64 != 0 {
+        bail!(
+            "MoE MLP TP weight {name} dimension {dim}={full} is not divisible by TP_SIZE={tp_size}"
+        );
+    }
+    let local = full / tp_size_i64;
+    Ok(Some(
+        tensor
+            .narrow(dim as i64, rank * local, local)
+            .contiguous(),
+    ))
 }
 
 /// Return the rank-local frozen full-attention shard for TP. Q/K/V own
@@ -762,7 +835,8 @@ impl CppTrainingContext {
                 i32::from(base_tp_attention)
                     | (i32::from(data_parallel) << 1)
                     | (i32::from(vocab_parallel) << 2)
-                    | (i32::from(expert_parallel) << 3),
+                    | (i32::from(expert_parallel) << 3)
+                    | (i32::from(base_tp_mlp) << 4),
             )
         };
         if ptr.is_null() {
@@ -1392,7 +1466,8 @@ impl Drop for CppTrainingContext {
 mod tests {
     use super::{
         shard_dense_mlp_weight_for_tp, shard_full_attention_weight_for_tp,
-        shard_linear_attention_weight_for_tp, shard_vocab_weight_for_tp,
+        shard_linear_attention_weight_for_tp, shard_moe_mlp_weight_for_tp,
+        shard_vocab_weight_for_tp,
     };
     use tch::{Kind, Tensor};
 
@@ -1471,6 +1546,100 @@ mod tests {
             shard_dense_mlp_weight_for_tp("model.layers.0.mlp.up_proj.weight", &tensor, 2, 0)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn moe_tp_repacks_each_gate_up_half_before_concatenation() {
+        let packed = Tensor::arange(96, (Kind::Float, tch::Device::Cpu))
+            .reshape([2, 12, 4]);
+        let rank_zero = shard_moe_mlp_weight_for_tp(
+            "model.layers.0.mlp.experts.gate_up_proj",
+            &packed,
+            2,
+            0,
+        )
+        .unwrap()
+        .unwrap();
+        let rank_one = shard_moe_mlp_weight_for_tp(
+            "model.layers.0.mlp.experts.gate_up_proj",
+            &packed,
+            2,
+            1,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(rank_zero.size(), [2, 6, 4]);
+        assert_eq!(rank_one.size(), [2, 6, 4]);
+        assert_eq!(rank_zero.double_value(&[0, 3, 0]), 24.0);
+        assert_eq!(rank_one.double_value(&[0, 0, 0]), 12.0);
+        assert_eq!(rank_one.double_value(&[0, 3, 0]), 36.0);
+
+        let rebuilt_gate = Tensor::cat(
+            &[&rank_zero.narrow(1, 0, 3), &rank_one.narrow(1, 0, 3)],
+            1,
+        );
+        let rebuilt_up = Tensor::cat(
+            &[&rank_zero.narrow(1, 3, 3), &rank_one.narrow(1, 3, 3)],
+            1,
+        );
+        let rebuilt = Tensor::cat(&[&rebuilt_gate, &rebuilt_up], 1);
+        assert_eq!(
+            rebuilt
+                .f_sub(&packed)
+                .unwrap()
+                .abs()
+                .max()
+                .double_value(&[]),
+            0.0
+        );
+    }
+
+    #[test]
+    fn moe_tp_shards_routed_and_shared_down_input_axes() {
+        let routed = Tensor::arange(96, (Kind::Float, tch::Device::Cpu))
+            .reshape([2, 4, 12]);
+        let shared = Tensor::arange(48, (Kind::Float, tch::Device::Cpu))
+            .reshape([4, 12]);
+        let routed_rank_one = shard_moe_mlp_weight_for_tp(
+            "model.layers.0.mlp.experts.down_proj",
+            &routed,
+            2,
+            1,
+        )
+        .unwrap()
+        .unwrap();
+        let shared_rank_one = shard_moe_mlp_weight_for_tp(
+            "model.layers.0.mlp.shared_expert.down_proj.weight",
+            &shared,
+            2,
+            1,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(routed_rank_one.size(), [2, 4, 6]);
+        assert_eq!(shared_rank_one.size(), [4, 6]);
+        assert_eq!(routed_rank_one.double_value(&[0, 0, 0]), 6.0);
+        assert_eq!(shared_rank_one.double_value(&[0, 0]), 6.0);
+    }
+
+    #[test]
+    fn moe_tp_rejects_invalid_packed_and_intermediate_shapes() {
+        let odd_packed = Tensor::zeros([2, 10, 4], (Kind::Float, tch::Device::Cpu));
+        assert!(shard_moe_mlp_weight_for_tp(
+            "model.layers.0.mlp.experts.gate_up_proj",
+            &odd_packed,
+            2,
+            0,
+        )
+        .is_err());
+        let down = Tensor::zeros([2, 4, 5], (Kind::Float, tch::Device::Cpu));
+        assert!(shard_moe_mlp_weight_for_tp(
+            "model.layers.0.mlp.experts.down_proj",
+            &down,
+            2,
+            0,
+        )
+        .is_err());
     }
 
     #[test]

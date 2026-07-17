@@ -48,10 +48,11 @@ extern "C" void qwen36_free_training_context(void*);
 
 namespace {
 
-constexpr int64_t kAbiVersion = 19;
+constexpr int64_t kAbiVersion = 20;
 constexpr int32_t kBaseTpAttention = 1 << 0;
 constexpr int32_t kVocabParallel = 1 << 2;
 constexpr int32_t kExpertParallel = 1 << 3;
+constexpr int32_t kBaseTpMlp = 1 << 4;
 constexpr int kTpSize = 2;
 constexpr int kEpSize = 2;
 constexpr int kDpSize = 1;
@@ -100,13 +101,17 @@ std::string json_escape(const std::string& input) {
     return output;
 }
 
-at::Tensor seeded_randn(
+at::Tensor seeded_cpu_randn(
     std::initializer_list<int64_t> shape, double scale, int64_t seed
 ) {
     at::manual_seed(seed);
     return (at::randn(shape,
-        at::TensorOptions().device(at::kCUDA).dtype(at::kBFloat16)) * scale)
+        at::TensorOptions().device(at::kCPU).dtype(at::kFloat)) * scale)
         .to(at::kBFloat16);
+}
+
+at::Tensor cuda_local(const at::Tensor& tensor) {
+    return tensor.contiguous().to(at::kCUDA);
 }
 
 at::Tensor unit(std::initializer_list<int64_t> shape) {
@@ -124,40 +129,88 @@ std::vector<void*> pointers(std::vector<at::Tensor>& tensors) {
 void append_layer_weights(
     std::vector<at::Tensor>& weights, int layer, int tp_rank, int ep_rank,
     int hidden, int heads, int kv_heads, int head_dim,
-    int experts, int intermediate
+    int experts, int intermediate, bool expert_tp
 ) {
     const int local_heads = heads / kTpSize;
     const int local_kv_heads = kv_heads / kTpSize;
     const int local_experts = experts / kEpSize;
+    const int local_intermediate = expert_tp
+        ? intermediate / kTpSize : intermediate;
     const int64_t common_seed = 1000 + layer * 100;
-    const int64_t tp_seed = common_seed + tp_rank * 10000;
-    const int64_t ep_seed = common_seed + ep_rank * 20000;
 
     weights.push_back(unit({hidden}));
     weights.push_back(unit({hidden}));
-    weights.push_back(seeded_randn(
-        {2 * local_heads * head_dim, hidden}, 0.0020, tp_seed + 2));
+    weights.push_back(cuda_local(seeded_cpu_randn(
+        {2 * heads * head_dim, hidden}, 0.0020, common_seed + 2).narrow(
+            0, tp_rank * 2 * local_heads * head_dim,
+            2 * local_heads * head_dim)));
     weights.push_back(unit({head_dim}));
-    weights.push_back(seeded_randn(
-        {local_kv_heads * head_dim, hidden}, 0.0020, tp_seed + 4));
+    weights.push_back(cuda_local(seeded_cpu_randn(
+        {kv_heads * head_dim, hidden}, 0.0020, common_seed + 4).narrow(
+            0, tp_rank * local_kv_heads * head_dim,
+            local_kv_heads * head_dim)));
     weights.push_back(unit({head_dim}));
-    weights.push_back(seeded_randn(
-        {local_kv_heads * head_dim, hidden}, 0.0020, tp_seed + 6));
-    weights.push_back(seeded_randn(
-        {hidden, local_heads * head_dim}, 0.0020, tp_seed + 7));
-    weights.push_back(seeded_randn(
-        {experts, hidden}, 0.0020, common_seed + 8));
-    weights.push_back(seeded_randn({1, hidden}, 0.0020, common_seed + 9));
-    weights.push_back(seeded_randn(
-        {intermediate, hidden}, 0.0020, common_seed + 10));
-    weights.push_back(seeded_randn(
-        {intermediate, hidden}, 0.0020, common_seed + 11));
-    weights.push_back(seeded_randn(
-        {hidden, intermediate}, 0.0020, common_seed + 12));
-    weights.push_back(seeded_randn(
-        {local_experts, 2 * intermediate, hidden}, 0.0020, ep_seed + 13));
-    weights.push_back(seeded_randn(
-        {local_experts, hidden, intermediate}, 0.0020, ep_seed + 14));
+    weights.push_back(cuda_local(seeded_cpu_randn(
+        {kv_heads * head_dim, hidden}, 0.0020, common_seed + 6).narrow(
+            0, tp_rank * local_kv_heads * head_dim,
+            local_kv_heads * head_dim)));
+    weights.push_back(cuda_local(seeded_cpu_randn(
+        {hidden, heads * head_dim}, 0.0020, common_seed + 7).narrow(
+            1, tp_rank * local_heads * head_dim,
+            local_heads * head_dim)));
+    weights.push_back(cuda_local(seeded_cpu_randn(
+        {experts, hidden}, 0.0020, common_seed + 8)));
+    weights.push_back(cuda_local(seeded_cpu_randn(
+        {1, hidden}, 0.0020, common_seed + 9)));
+
+    auto shared_gate = seeded_cpu_randn(
+        {intermediate, hidden}, 0.0020, common_seed + 10);
+    auto shared_up = seeded_cpu_randn(
+        {intermediate, hidden}, 0.0020, common_seed + 11);
+    auto shared_down = seeded_cpu_randn(
+        {hidden, intermediate}, 0.0020, common_seed + 12);
+    if (expert_tp) {
+        shared_gate = shared_gate.narrow(
+            0, tp_rank * local_intermediate, local_intermediate);
+        shared_up = shared_up.narrow(
+            0, tp_rank * local_intermediate, local_intermediate);
+        shared_down = shared_down.narrow(
+            1, tp_rank * local_intermediate, local_intermediate);
+    }
+    weights.push_back(cuda_local(shared_gate));
+    weights.push_back(cuda_local(shared_up));
+    weights.push_back(cuda_local(shared_down));
+
+    auto expert_gate_up = seeded_cpu_randn(
+        {experts, 2 * intermediate, hidden}, 0.0020, common_seed + 13)
+        .narrow(0, ep_rank * local_experts, local_experts);
+    auto expert_down = seeded_cpu_randn(
+        {experts, hidden, intermediate}, 0.0020, common_seed + 14)
+        .narrow(0, ep_rank * local_experts, local_experts);
+    if (expert_tp) {
+        expert_gate_up = at::cat({
+            expert_gate_up.narrow(
+                1, tp_rank * local_intermediate, local_intermediate),
+            expert_gate_up.narrow(
+                1, intermediate + tp_rank * local_intermediate,
+                local_intermediate),
+        }, 1);
+        expert_down = expert_down.narrow(
+            2, tp_rank * local_intermediate, local_intermediate);
+    }
+    weights.push_back(cuda_local(expert_gate_up));
+    weights.push_back(cuda_local(expert_down));
+
+    assert(weights[weights.size() - 5].sizes() ==
+        at::IntArrayRef({local_intermediate, hidden}));
+    assert(weights[weights.size() - 4].sizes() ==
+        at::IntArrayRef({local_intermediate, hidden}));
+    assert(weights[weights.size() - 3].sizes() ==
+        at::IntArrayRef({hidden, local_intermediate}));
+    assert(weights[weights.size() - 2].sizes() ==
+        at::IntArrayRef({local_experts, 2 * local_intermediate, hidden}));
+    assert(weights[weights.size() - 1].sizes() ==
+        at::IntArrayRef({local_experts, hidden, local_intermediate}));
 }
 
 double percentile(std::vector<double> values, double quantile) {
@@ -211,6 +264,10 @@ int main() {
 
     const std::string lora_mode = env_string("BENCH_LORA_MODE", "fixed");
     assert(lora_mode == "fixed" || lora_mode == "dynamic");
+    const std::string expert_tp_mode = env_string(
+        "BENCH_EXPERT_TP_MODE", "etp");
+    assert(expert_tp_mode == "replicated" || expert_tp_mode == "etp");
+    const bool expert_tp = expert_tp_mode == "etp";
     const std::string variant = env_string("BENCH_VARIANT", "baseline");
     const bool packed_a2a = env_enabled("QWEN36_EP_A2A_PACKED", true);
     const std::string targets = env_string(
@@ -238,6 +295,7 @@ int main() {
     assert(heads % kv_heads == 0);
     assert(experts % kEpSize == 0 && top_k <= experts);
     assert(lora_rank % kTpSize == 0 && vocab % kTpSize == 0);
+    assert(!expert_tp || intermediate % kTpSize == 0);
     assert(lora_mode != "dynamic" ||
         (active_tenants == batch && tenants >= active_tenants));
 
@@ -251,15 +309,20 @@ int main() {
     weights.reserve(static_cast<size_t>(layers) * 15);
     for (int layer = 0; layer < layers; ++layer) {
         append_layer_weights(weights, layer, tp_rank, ep_rank,
-            hidden, heads, kv_heads, head_dim, experts, intermediate);
+            hidden, heads, kv_heads, head_dim, experts, intermediate,
+            expert_tp);
     }
     for (auto& weight : weights) weight.set_requires_grad(false);
     auto weight_ptrs = pointers(weights);
 
     const int local_vocab = vocab / kTpSize;
-    auto embed = seeded_randn({local_vocab, hidden}, 0.0020, 41 + tp_rank);
+    auto embed = cuda_local(seeded_cpu_randn(
+        {vocab, hidden}, 0.0020, 41).narrow(
+            0, tp_rank * local_vocab, local_vocab));
     auto final_norm = unit({hidden});
-    auto lm_head = seeded_randn({local_vocab, hidden}, 0.0020, 47 + tp_rank);
+    auto lm_head = cuda_local(seeded_cpu_randn(
+        {vocab, hidden}, 0.0020, 47).narrow(
+            0, tp_rank * local_vocab, local_vocab));
     embed.set_requires_grad(false);
     final_norm.set_requires_grad(false);
     lm_head.set_requires_grad(false);
@@ -289,7 +352,8 @@ int main() {
         static_cast<int32_t>(at::kBFloat16),
         1.0, 1e-3, 0.9, 0.999, 1e-8, vocab, 1e-5, lora_rank,
         target_layers.data(), layers, targets.c_str(),
-        kBaseTpAttention | kVocabParallel | kExpertParallel);
+        kBaseTpAttention | kVocabParallel | kExpertParallel |
+            (expert_tp ? kBaseTpMlp : 0));
     assert(context);
     assert(qwen36_init_parallel_nccl(
         context, rank, world,
@@ -398,8 +462,9 @@ int main() {
 
     const auto allocator_stats =
         c10::cuda::CUDACachingAllocator::getDeviceStats(local_rank);
-    constexpr size_t aggregate = static_cast<size_t>(
-        c10::CachingAllocator::StatType::AGGREGATE);
+    // Aggregate is the stable first entry of CUDACachingAllocator StatArray;
+    // the enum namespace differs across prebuilt PyTorch releases.
+    constexpr size_t aggregate = 0;
     const auto& allocated = allocator_stats.allocated_bytes[aggregate];
     const auto& reserved = allocator_stats.reserved_bytes[aggregate];
     cudaDeviceProp properties{};
@@ -410,6 +475,7 @@ int main() {
         << "native_tp_ep_bench {"
         << "\"variant\":\"" << json_escape(variant) << "\","
         << "\"lora_mode\":\"" << lora_mode << "\","
+        << "\"expert_tp_mode\":\"" << expert_tp_mode << "\","
         << "\"targets\":\"" << json_escape(targets) << "\","
         << "\"rank\":" << rank << ",\"world\":" << world << ','
         << "\"tp_rank\":" << tp_rank << ",\"tp_size\":" << kTpSize << ','
@@ -423,7 +489,13 @@ int main() {
         << "\"hidden\":" << hidden << ",\"heads\":" << heads << ','
         << "\"kv_heads\":" << kv_heads << ",\"head_dim\":" << head_dim << ','
         << "\"layers\":" << layers << ",\"experts\":" << experts << ','
-        << "\"intermediate\":" << intermediate << ",\"top_k\":" << top_k << ','
+        << "\"intermediate\":" << intermediate << ','
+        << "\"global_intermediate\":" << intermediate << ','
+        << "\"local_intermediate\":"
+        << (expert_tp ? intermediate / kTpSize : intermediate) << ','
+        << "\"expert_base_replication_factor\":"
+        << (expert_tp ? 1 : kTpSize) << ','
+        << "\"top_k\":" << top_k << ','
         << "\"vocab\":" << vocab << ",\"lora_rank\":" << lora_rank << ','
         << "\"tenants\":" << (lora_mode == "dynamic" ? tenants : 0) << ','
         << "\"active_tenants\":"

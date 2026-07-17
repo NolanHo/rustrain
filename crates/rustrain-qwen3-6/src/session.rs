@@ -76,6 +76,15 @@ fn parse_env_usize(key: &str) -> Result<usize> {
         })
 }
 
+fn validate_standard_adapter_export_topology(tp_size: usize, ep_size: usize) -> Result<()> {
+    if tp_size > 1 || ep_size > 1 {
+        bail!(
+            "standard PEFT adapter export requires unsharded LoRA tensors; TP_SIZE={tp_size} EP_SIZE={ep_size} produces rank-local shards, and merge/reshard metadata is not implemented"
+        );
+    }
+    Ok(())
+}
+
 fn lora_config_from_config(config: &Config) -> Result<Qwen36LoraConfig> {
     let lora = config
         .lora
@@ -251,6 +260,14 @@ mod tests {
             let data_start = 3 * 2 * 2 + ep_rank * 2;
             assert_eq!(data_start, 12 + expected_ep_rank * 2);
         }
+    }
+
+    #[test]
+    fn standard_adapter_export_rejects_tp_and_ep_shards() {
+        validate_standard_adapter_export_topology(1, 1).unwrap();
+        assert!(validate_standard_adapter_export_topology(2, 1).is_err());
+        assert!(validate_standard_adapter_export_topology(1, 2).is_err());
+        assert!(validate_standard_adapter_export_topology(2, 2).is_err());
     }
 }
 
@@ -449,6 +466,7 @@ fn train_impl(
         .map(ParallelTopology::expert_model_parallel_size)
         .unwrap_or(1);
     let is_expert_parallel = ep_size > 1;
+    validate_standard_adapter_export_topology(tp_size, ep_size)?;
     unsafe {
         std::env::set_var("RUSTRAIN_TP_RANK", tp_rank.to_string());
         std::env::set_var("RUSTRAIN_EP_RANK", ep_rank.to_string());
@@ -469,7 +487,7 @@ fn train_impl(
     // contiguous vocabulary rows and remain tied through the C++ context when
     // the model uses tied word embeddings.
     let base_tp_attention = tp_size > 1;
-    let base_tp_mlp = tp_size > 1 && !runtime_config.is_moe;
+    let base_tp_mlp = tp_size > 1;
     let vocab_parallel = tp_size > 1;
     if vocab_parallel
         && (runtime_config.vocab_size <= 0 || runtime_config.vocab_size % tp_size as i64 != 0)
@@ -534,32 +552,20 @@ fn train_impl(
         }
     }
     if base_tp_mlp {
-        if runtime_config.intermediate_size <= 0
-            || runtime_config.intermediate_size % tp_size as i64 != 0
-        {
-            bail!(
-                "dense intermediate_size={} must be divisible by TP_SIZE={tp_size}",
-                runtime_config.intermediate_size
-            );
-        }
-        if lora_config.target_modules.is_empty()
-            || lora_config.target_modules.iter().any(|module| {
-                matches!(
-                    module.cpp_name(),
-                    "gate_proj"
-                        | "up_proj"
-                        | "down_proj"
-                        | "shared_gate_proj"
-                        | "shared_up_proj"
-                        | "shared_down_proj"
-                        | "experts_gate_up_proj"
-                        | "experts_down_proj"
-                )
-            })
-        {
-            bail!(
-                "base dense TP MLP currently requires explicit attention-only LoRA target_modules"
-            );
+        let intermediates = if runtime_config.is_moe {
+            vec![
+                ("routed expert", runtime_config.moe_intermediate_size),
+                ("shared expert", runtime_config.shared_expert_intermediate_size),
+            ]
+        } else {
+            vec![("dense", runtime_config.intermediate_size)]
+        };
+        for (kind, intermediate) in intermediates {
+            if intermediate <= 0 || intermediate % tp_size as i64 != 0 {
+                bail!(
+                    "{kind} intermediate_size={intermediate} must be divisible by TP_SIZE={tp_size}"
+                );
+            }
         }
     }
 
@@ -595,7 +601,18 @@ fn train_impl(
         } else {
             None
         };
-        let vocab_shard = if expert_shard.is_none() && vocab_parallel {
+        let expert_or_full = expert_shard.as_ref().unwrap_or(tensor);
+        let moe_tp_shard = if runtime_config.is_moe && base_tp_mlp {
+            crate::kernel::shard_moe_mlp_weight_for_tp(
+                name,
+                expert_or_full,
+                tp_size,
+                tp_rank,
+            )?
+        } else {
+            None
+        };
+        let vocab_shard = if expert_shard.is_none() && moe_tp_shard.is_none() && vocab_parallel {
             crate::kernel::shard_vocab_weight_for_tp(
                 name,
                 tensor,
@@ -606,7 +623,9 @@ fn train_impl(
         } else {
             None
         };
-        let local_shard = if expert_shard.is_some() {
+        let local_shard = if moe_tp_shard.is_some() {
+            moe_tp_shard
+        } else if expert_shard.is_some() {
             expert_shard
         } else if vocab_shard.is_some() {
             vocab_shard
@@ -657,7 +676,7 @@ fn train_impl(
             tp_rank,
             base_tp_mlp,
             vocab_parallel,
-            "frozen base TP enabled: attention/GDN, vocabulary, and optional dense MLP shards"
+            "frozen base TP enabled: attention/GDN, vocabulary, and dense/expert MLP shards"
         );
     }
 
@@ -849,8 +868,11 @@ fn train_impl(
         exported,
     )?;
     let trainable_params = artifact.tensors.len();
-    let adapter_path = artifact.save(&run_paths.root)?;
-    info!("saved adapter to {}", adapter_path.display());
+    let adapter_path = run_paths.root.join("adapter_model.safetensors");
+    if !is_data_parallel || dp_rank == 0 {
+        artifact.save(&run_paths.root)?;
+        info!("saved adapter to {}", adapter_path.display());
+    }
 
     Ok(Qwen36LoraSftSummary {
         adapter_output: adapter_path.to_string_lossy().to_string(),
