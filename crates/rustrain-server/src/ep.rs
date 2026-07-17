@@ -10,7 +10,7 @@
 use std::io;
 use std::ops::Range;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use rustrain_ipc::{EpChannel, EpCommand, EpResult, EpWorker};
 use rustrain_parallel::topology::ParallelTopology;
@@ -26,6 +26,7 @@ use crate::session::{
 pub struct EpCoordinator {
     channel: Arc<EpChannel>,
     worker_pids: Vec<u32>,
+    dispatch_lock: Mutex<()>,
 }
 
 impl EpCoordinator {
@@ -75,11 +76,19 @@ impl EpCoordinator {
         // Wait for workers to initialize
         std::thread::sleep(std::time::Duration::from_secs(2));
 
-        Ok(Self { channel, worker_pids })
+        Ok(Self {
+            channel,
+            worker_pids,
+            dispatch_lock: Mutex::new(()),
+        })
     }
 
     /// Dispatch a command to all workers, wait for completion, return rank 0's result.
     pub fn dispatch(&self, cmd: &EpCommand) -> EpResult {
+        let _guard = match self.dispatch_lock.lock() {
+            Ok(guard) => guard,
+            Err(error) => return EpResult::Error(format!("IPC dispatch lock poisoned: {error}")),
+        };
         match self.channel.broadcast(cmd) {
             Ok(result) => result,
             Err(e) => EpResult::Error(format!("IPC error: {}", e)),
@@ -88,6 +97,7 @@ impl EpCoordinator {
 
     /// Send shutdown command to all workers.
     pub fn shutdown(&self) {
+        let _guard = self.dispatch_lock.lock().ok();
         let _ = self.channel.broadcast(&EpCommand::Shutdown);
         // Wait for worker processes to exit
         for pid in &self.worker_pids {
@@ -372,9 +382,12 @@ fn execute_command(session: &mut Qwen36Session, cmd: &EpCommand) -> EpResult {
             }
         }
         EpCommand::ExportAdapter {
-            path, adapter_id, ..
+            path,
+            adapter_id,
+            generation,
+            ..
         } => {
-            match session.export_adapter(path, *adapter_id) {
+            match session.export_distributed_adapter(path, *adapter_id, generation) {
                 Ok(n) => EpResult::Count(n),
                 Err(e) => EpResult::Error(e.to_string()),
             }

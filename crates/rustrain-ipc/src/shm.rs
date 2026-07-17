@@ -99,7 +99,7 @@ impl EpChannel {
     pub fn shm_name(&self) -> &str { &self.shm_name }
     pub fn world_size(&self) -> usize { self.world_size }
 
-    /// Send command to ALL workers, wait for ALL to complete, return rank 0's result.
+    /// Send a command to all workers and propagate any rank's error.
     pub fn broadcast(&self, cmd: &EpCommand) -> io::Result<EpResult> {
         let json = serde_json::to_vec(cmd).map_err(|e| io::Error::other(e.to_string()))?;
         if json.len() > SLOT_DATA {
@@ -127,17 +127,34 @@ impl EpChannel {
             }
         }
 
-        // Read rank 0's result from its dedicated slot
-        let r0_off = result_offset(0);
-        unsafe {
-            let result_len = *(self.shm_ptr.add(r0_off) as *const u32) as usize;
-            if result_len == 0 || result_len > SLOT_DATA {
-                return Err(io::Error::other("worker returned empty result"));
+        let mut rank_zero = None;
+        for rank in 0..self.world_size {
+            let offset = result_offset(rank);
+            let result = unsafe {
+                let result_len = *(self.shm_ptr.add(offset) as *const u32) as usize;
+                if result_len == 0 || result_len > SLOT_DATA {
+                    return Err(io::Error::other(format!(
+                        "worker rank {rank} returned an invalid result length {result_len}"
+                    )));
+                }
+                let result_bytes = std::slice::from_raw_parts(
+                    self.shm_ptr.add(offset + SLOT_HEADER),
+                    result_len,
+                );
+                serde_json::from_slice::<EpResult>(result_bytes).map_err(|error| {
+                    io::Error::other(format!(
+                        "worker rank {rank} result deserialization failed: {error}"
+                    ))
+                })?
+            };
+            if let EpResult::Error(error) = &result {
+                return Ok(EpResult::Error(format!("worker rank {rank}: {error}")));
             }
-            let result_bytes = std::slice::from_raw_parts(self.shm_ptr.add(r0_off + SLOT_HEADER), result_len);
-            serde_json::from_slice::<EpResult>(result_bytes)
-                .map_err(|e| io::Error::other(format!("result deserialization: {e}")))
+            if rank == 0 {
+                rank_zero = Some(result);
+            }
         }
+        rank_zero.ok_or_else(|| io::Error::other("EP broadcast has no rank 0 worker"))
     }
 }
 
@@ -230,10 +247,42 @@ impl Drop for EpWorker {
 mod tests {
     use super::*;
 
+    static TEST_CHANNEL_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn test_channel_create_destroy() {
+        let _guard = TEST_CHANNEL_LOCK.lock().unwrap();
         let ch = EpChannel::new(2).expect("create channel");
         assert_eq!(ch.world_size(), 2);
         drop(ch);
+    }
+
+    #[test]
+    fn broadcast_propagates_nonzero_rank_error() {
+        let _guard = TEST_CHANNEL_LOCK.lock().unwrap();
+        let channel = EpChannel::new(2).expect("create channel");
+        let worker_zero = EpWorker::attach(channel.shm_name(), 0, 2).expect("attach rank 0");
+        let worker_one = EpWorker::attach(channel.shm_name(), 1, 2).expect("attach rank 1");
+        let rank_zero = std::thread::spawn(move || {
+            assert!(matches!(worker_zero.wait_command().unwrap(), EpCommand::Shutdown));
+            worker_zero.signal_done(&EpResult::Ok).unwrap();
+        });
+        let rank_one = std::thread::spawn(move || {
+            assert!(matches!(worker_one.wait_command().unwrap(), EpCommand::Shutdown));
+            worker_one
+                .signal_done(&EpResult::Error("rank one failed".into()))
+                .unwrap();
+        });
+
+        let result = channel.broadcast(&EpCommand::Shutdown).unwrap();
+        rank_zero.join().unwrap();
+        rank_one.join().unwrap();
+
+        match result {
+            EpResult::Error(error) => {
+                assert_eq!(error, "worker rank 1: rank one failed");
+            }
+            _ => panic!("rank 1 error was not propagated"),
+        }
     }
 }

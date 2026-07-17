@@ -85,6 +85,7 @@ pub enum EpCommand {
         session_id: String,
         path: String,
         adapter_id: Option<i64>,
+        generation: String,
     },
     Status {
         session_id: String,

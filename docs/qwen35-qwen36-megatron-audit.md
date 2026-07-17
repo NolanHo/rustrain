@@ -23,10 +23,10 @@
 | microbatch accumulation | 已实现子集 | non-final microbatch 只 backward，final microbatch 才 optimizer；FP32 accumulator 存储/聚合，autograd leaf backward 仍为 BF16 |
 | replicated data parallel | 已实现 | logical-step 边界同步 replicated LoRA；EP expert 参数不走该 reduction |
 | expert parallel | 已实现子集 | 默认 routed-output all-reduce；gated variable-split A2A 已验证 fixed-LoRA 和 native dynamic-LoRA data sharding；GPU-only split planning、异步 overlap 和 DeepEP backend 未实现 |
-| tensor parallel | attention + GDN + dense/expert MLP + vocabulary 子集 | full attention 与 GDN 使用 head-aligned ColumnParallel input projection 和 RowParallel output projection；GDN 的 flat QKV/conv 按 `[Q_local|K_local|V_local]` 重排。embedding/LM-head/CE 使用 vocabulary shard；routed/shared expert 使用 gate/up output shard、down input shard，并已在 TP2 x EP2 验证。标准 PEFT artifact 尚无 TP/EP merge/reshard，因此 CLI 会在分布式 export 前明确拒绝 |
+| tensor parallel | attention + GDN + dense/expert MLP + vocabulary 子集 | full attention 与 GDN 使用 head-aligned ColumnParallel input projection 和 RowParallel output projection；GDN 的 flat QKV/conv 按 `[Q_local|K_local|V_local]` 重排。embedding/LM-head/CE 使用 vocabulary shard；routed/shared expert 使用 gate/up output shard、down input shard，并已在 TP2 x EP2 验证。server 可通过 v5 rank shard 合并标准 PEFT；CLI 尚未接入共享合并器，仍在分布式 export 前明确拒绝 |
 | pipeline parallel | 未实现于 Qwen native | 没有 stage 切分、microbatch scheduler 或 activation send/recv |
 | context parallel | 未实现于 Qwen native | 没有 ring attention、跨 rank KV/索引合并 |
-| distributed checkpoint | 已实现子集 | v4 记录 projection layout、replicated tensor geometry 和 fixed slot identity，并验证 same-topology rank shard；v3 仅兼容 latent-rank checkpoint，旧 attention LoRA 因形状不可迁移而明确拒绝；跨 topology reshard 和 PP/CP 未实现 |
+| distributed checkpoint | 已实现子集 | v5 记录 rank order、完整五维坐标、TP/EP 多轴 placement、fused gate/up segments 及 fixed/dynamic slot identity；任意 multi-rank 拓扑使用 rank 目录，same-topology restore 和 server 标准 PEFT merge 已验证。v3/v4 保持只读兼容；跨 topology reshard 和 PP/CP 未实现 |
 
 ## 与 Megatron-LM 的关键差距
 
@@ -67,7 +67,7 @@ ABI15 的两层 GDN base-TP smoke 覆盖复合 QKV/conv head shard、Z/A/B/A_log
 ## 继续达到 Megatron 级别所需的最小工作包
 
 1. 在现有 TP x EP 和 TP x expert-DP 组合上补齐 TP x EP x expert-DP 三轴 oracle、PP/CP runtime process groups、launcher、scheduler 和 checkpoint rank mapping。
-2. 为 dense/expert MLP 增加 fused gate/up FC1、axis-aware checkpoint/artifact merge 与 MTP 支持；为 GDN 增加稳定的 chunk/state-checkpoint backward 与 sequence/context parallel，为 full attention 融合 QKV/SDPA 并增加 sequence parallel；为 PP 实现 stage forward/backward 与 1F1B scheduler；为 CP 实现 ring attention/state exchange。
+2. 为 dense/expert MLP 增加 fused gate/up FC1、跨 topology checkpoint reshard 与 MTP 支持；将 v5 artifact merge 提取为 CLI/server 共享模块；为 GDN 增加稳定的 chunk/state-checkpoint backward 与 sequence/context parallel，为 full attention 融合 QKV/SDPA 并增加 sequence parallel；为 PP 实现 stage forward/backward 与 1F1B scheduler；为 CP 实现 ring attention/state exchange。
 3. 将 EP dispatch/combine 替换为 fused/异步路径，并测量通信与计算重叠。
 4. 为 checkpoint 增加跨 topology reshard、可恢复的 pending accumulation state，并为旧 v3 attention checkpoint 提供离线迁移工具。
 5. 在固定硬件和 workload 上，与 Megatron-LM 记录 tokens/s、step time、峰值显存、通信占比和 loss 曲线。

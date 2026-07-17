@@ -1019,6 +1019,14 @@ async fn ep_export_adapter(
         session_id: id,
         path: req.path,
         adapter_id: req.adapter_id,
+        generation: format!(
+            "{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ),
     };
     match state.coordinator.dispatch(&cmd) {
         rustrain_ipc::EpResult::Count(n) => Ok(Json(serde_json::json!({"exported": n}))),
