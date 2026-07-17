@@ -7656,19 +7656,37 @@ int64_t qwen36_export_optimizer_state(void* ctx_ptr, void** m_ptrs, void** v_ptr
 
 __attribute__((visibility("default")))
 int64_t qwen36_import_optimizer_state(void* ctx_ptr, void** m_ptrs, void** v_ptrs, int64_t count) {
-    auto* ctx = reinterpret_cast<TrainingContext*>(ctx_ptr);
-    int64_t imported = 0;
-    for (int64_t i = 0; i < count && i < (int64_t)ctx->adam_m.size(); i++) {
-        auto* src_m = reinterpret_cast<at::Tensor*>(m_ptrs[i]);
-        auto* src_v = reinterpret_cast<at::Tensor*>(v_ptrs[i]);
-        if (src_m && src_v) {
-            ctx->adam_m[i] = src_m->clone();
-            ctx->adam_v[i] = src_v->clone();
-            imported++;
+    try {
+        auto* ctx = reinterpret_cast<TrainingContext*>(ctx_ptr);
+        TORCH_CHECK(ctx, "null training context");
+        TORCH_CHECK(count >= 0, "negative optimizer state count");
+        TORCH_CHECK(count <= (int64_t)ctx->adam_m.size() &&
+                count <= (int64_t)ctx->adam_v.size(),
+            "optimizer state count exceeds native state: count=", count,
+            " m=", ctx->adam_m.size(), " v=", ctx->adam_v.size());
+        TORCH_CHECK(count == 0 || (m_ptrs && v_ptrs),
+            "null optimizer state pointer array");
+        at::NoGradGuard guard;
+        for (int64_t i = 0; i < count; i++) {
+            auto* src_m = reinterpret_cast<at::Tensor*>(m_ptrs[i]);
+            auto* src_v = reinterpret_cast<at::Tensor*>(v_ptrs[i]);
+            TORCH_CHECK(src_m && src_v, "null optimizer tensor at index ", i);
+            auto& target_m = ctx->adam_m[i];
+            auto& target_v = ctx->adam_v[i];
+            TORCH_CHECK(src_m->sizes() == target_m.sizes(),
+                "Adam m shape mismatch at index ", i,
+                ": expected ", target_m.sizes(), " got ", src_m->sizes());
+            TORCH_CHECK(src_v->sizes() == target_v.sizes(),
+                "Adam v shape mismatch at index ", i,
+                ": expected ", target_v.sizes(), " got ", src_v->sizes());
+            target_m.copy_(src_m->to(target_m.device()).to(target_m.scalar_type()));
+            target_v.copy_(src_v->to(target_v.device()).to(target_v.scalar_type()));
         }
+        return count;
+    } catch (const std::exception& e) {
+        fprintf(stderr, "[q36] import_optimizer_state FAILED: %s\n", e.what());
+        return -1;
     }
-    return imported;
 }
-
 
 }  // extern "C"

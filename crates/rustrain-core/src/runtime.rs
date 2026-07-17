@@ -554,8 +554,7 @@ pub fn validate_config(config: &Config) -> Result<()> {
                 && value == 2
                 && parallel.data_parallel_size == 1)
             && !(is_qwen3_hybrid_lora_sft_ep
-                && (name == "tensor_model_parallel_size"
-                    || name == "expert_model_parallel_size")
+                && (name == "tensor_model_parallel_size" || name == "expert_model_parallel_size")
                 && parallel.pipeline_model_parallel_size == 1
                 && parallel.data_parallel_size == 1
                 && parallel.context_parallel_size == 1)
@@ -1248,8 +1247,8 @@ pub fn validate_config(config: &Config) -> Result<()> {
 }
 
 pub fn prepare_run_directory(run: &RunConfig) -> Result<RunPaths> {
-    let timestamp = Local::now().format("%Y%m%d-%H%M%S");
-    let root = run.base_dir.join(format!("{}-{timestamp}", run.name));
+    let run_id = std::env::var("RUSTRAIN_RUN_ID").ok();
+    let root = resolve_run_root(run, run_id.as_deref())?;
     let checkpoints = root.join("checkpoints");
     let logs = root.join("logs");
     let cache = root.join("cache");
@@ -1267,6 +1266,45 @@ pub fn prepare_run_directory(run: &RunConfig) -> Result<RunPaths> {
         cache,
         resolved_config,
     })
+}
+
+pub fn prepare_rank_log_directory(
+    run_paths: &RunPaths,
+    rank: usize,
+    world_size: usize,
+) -> Result<PathBuf> {
+    if world_size == 0 || rank >= world_size {
+        return Err(anyhow!(
+            "invalid launcher rank {rank} for WORLD_SIZE={world_size}"
+        ));
+    }
+    let log_dir = if world_size > 1 {
+        run_paths.logs.join(format!("rank-{rank:05}"))
+    } else {
+        run_paths.logs.clone()
+    };
+    fs::create_dir_all(&log_dir)
+        .with_context(|| format!("failed to create {}", log_dir.display()))?;
+    Ok(log_dir)
+}
+
+fn resolve_run_root(run: &RunConfig, run_id: Option<&str>) -> Result<PathBuf> {
+    let suffix = match run_id {
+        Some(run_id) => {
+            if run_id.is_empty()
+                || !run_id
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+            {
+                return Err(anyhow!(
+                    "RUSTRAIN_RUN_ID must contain only ASCII letters, digits, '.', '_', or '-'"
+                ));
+            }
+            run_id.to_string()
+        }
+        None => Local::now().format("%Y%m%d-%H%M%S").to_string(),
+    };
+    Ok(run.base_dir.join(format!("{}-{suffix}", run.name)))
 }
 
 pub fn init_logging(log_dir: &Path) -> Result<tracing_appender::non_blocking::WorkerGuard> {
@@ -1340,6 +1378,64 @@ fn default_backend() -> BackendKind {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shared_run_id_resolves_the_same_rank_output_directory() {
+        let run = RunConfig {
+            name: "distributed".into(),
+            base_dir: "/tmp/rustrain-tests".into(),
+            seed: 1,
+        };
+
+        let rank_zero = resolve_run_root(&run, Some("launch-123")).unwrap();
+        let rank_one = resolve_run_root(&run, Some("launch-123")).unwrap();
+
+        assert_eq!(rank_zero, rank_one);
+        assert_eq!(
+            rank_zero,
+            PathBuf::from("/tmp/rustrain-tests/distributed-launch-123")
+        );
+    }
+
+    #[test]
+    fn shared_run_id_rejects_path_components() {
+        let run = RunConfig {
+            name: "distributed".into(),
+            base_dir: "/tmp/rustrain-tests".into(),
+            seed: 1,
+        };
+
+        let error = resolve_run_root(&run, Some("../other-run")).unwrap_err();
+        assert!(error.to_string().contains("RUSTRAIN_RUN_ID"));
+    }
+
+    #[test]
+    fn distributed_rank_logs_are_isolated_under_shared_run_root() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "rustrain-rank-logs-{}-{unique}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let run_paths = RunPaths {
+            root: root.clone(),
+            checkpoints: root.join("checkpoints"),
+            logs: root.join("logs"),
+            cache: root.join("cache"),
+            resolved_config: root.join("resolved_config.toml"),
+        };
+
+        let rank_zero = prepare_rank_log_directory(&run_paths, 0, 2).unwrap();
+        let rank_one = prepare_rank_log_directory(&run_paths, 1, 2).unwrap();
+
+        assert_ne!(rank_zero, rank_one);
+        assert_eq!(rank_zero, root.join("logs/rank-00000"));
+        assert_eq!(rank_one, root.join("logs/rank-00001"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn qwen_lora_sft_global_batch_matches_gradient_accumulation() {

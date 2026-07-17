@@ -45,6 +45,10 @@ extern "C" void* qwen36_get_lora_b(void*, int64_t);
 extern "C" int32_t qwen36_set_lora_tensor(void*, int64_t, int32_t, void*);
 extern "C" int64_t qwen36_export_optimizer_state(
     void*, void**, void**, int64_t);
+extern "C" int64_t qwen36_import_optimizer_state(
+    void*, void**, void**, int64_t);
+extern "C" int64_t qwen36_get_step_count(void*);
+extern "C" int32_t qwen36_set_step_count(void*, int64_t);
 extern "C" double qwen36_train_step(void*, void*, void*, void*);
 extern "C" int64_t qwen36_add_lora(
     void*, int64_t, double, const int64_t*, int64_t, const char*);
@@ -626,6 +630,151 @@ int main() {
     assert(fixed_errors.v <= 2e-5);
     assert(fixed_errors.adam <= 1e-5);
 
+    // Simulate a safetensors checkpoint: fixed LoRA and Adam state leave the
+    // device, then a fresh distributed context restores them from CPU tensors.
+    std::vector<at::Tensor> checkpoint_a;
+    std::vector<at::Tensor> checkpoint_b;
+    std::vector<at::Tensor> checkpoint_m;
+    std::vector<at::Tensor> checkpoint_v;
+    checkpoint_a.reserve(kLoraPairs);
+    checkpoint_b.reserve(kLoraPairs);
+    checkpoint_m.reserve(kOptimizerSlots);
+    checkpoint_v.reserve(kOptimizerSlots);
+    for (int64_t slot = 0; slot < kLoraPairs; ++slot) {
+        auto* a = reinterpret_cast<at::Tensor*>(
+            qwen36_get_lora_a(distributed, slot));
+        auto* b = reinterpret_cast<at::Tensor*>(
+            qwen36_get_lora_b(distributed, slot));
+        assert(a && b);
+        checkpoint_a.push_back(a->to(at::kCPU).clone());
+        checkpoint_b.push_back(b->to(at::kCPU).clone());
+    }
+    for (int64_t index = 0; index < kOptimizerSlots; ++index) {
+        auto* m = reinterpret_cast<at::Tensor*>(local_m[index]);
+        auto* v = reinterpret_cast<at::Tensor*>(local_v[index]);
+        assert(m && v);
+        checkpoint_m.push_back(m->to(at::kCPU).clone());
+        checkpoint_v.push_back(v->to(at::kCPU).clone());
+    }
+
+    void* resumed = qwen36_create_training_context_ex(
+        local_ptrs.data(), local_ptrs.size(), &local_embed, &final_norm,
+        &local_lm_head, &distributed_config, 1,
+        static_cast<int32_t>(at::kBFloat16),
+        1.0, kLearningRate, kBeta1, kBeta2, kAdamEps,
+        kVocab, 1e-5, kLoraRank, &target_layer, 1, targets,
+        kBaseTpAttention | kVocabParallel | kExpertParallel | kBaseTpMlp);
+    assert(resumed);
+    assert(qwen36_init_parallel_nccl(
+        resumed, rank, world,
+        tp_rank, 2, tp_color,
+        ep_rank, 2, ep_color,
+        0, 1, dp_color) == 0);
+    for (int64_t slot = 0; slot < kLoraPairs; ++slot) {
+        assert(qwen36_set_lora_tensor(
+            resumed, slot, 0, &checkpoint_a[slot]) == 0);
+        assert(qwen36_set_lora_tensor(
+            resumed, slot, 1, &checkpoint_b[slot]) == 0);
+    }
+    auto checkpoint_m_ptrs = pointers(checkpoint_m);
+    auto checkpoint_v_ptrs = pointers(checkpoint_v);
+    assert(qwen36_import_optimizer_state(
+        resumed, checkpoint_m_ptrs.data(), checkpoint_v_ptrs.data(),
+        kOptimizerSlots) == kOptimizerSlots);
+    assert(qwen36_set_step_count(
+        resumed, qwen36_get_step_count(distributed)) == 0);
+
+    std::vector<void*> resumed_m(kOptimizerSlots), resumed_v(kOptimizerSlots);
+    assert(qwen36_export_optimizer_state(
+        resumed, resumed_m.data(), resumed_v.data(), kOptimizerSlots) ==
+        kOptimizerSlots);
+    double restored_param_diff = 0.0;
+    double restored_m_diff = 0.0;
+    double restored_v_diff = 0.0;
+    for (int64_t slot = 0; slot < kLoraPairs; ++slot) {
+        auto* original_a = reinterpret_cast<at::Tensor*>(
+            qwen36_get_lora_a(distributed, slot));
+        auto* original_b = reinterpret_cast<at::Tensor*>(
+            qwen36_get_lora_b(distributed, slot));
+        auto* restored_a = reinterpret_cast<at::Tensor*>(
+            qwen36_get_lora_a(resumed, slot));
+        auto* restored_b = reinterpret_cast<at::Tensor*>(
+            qwen36_get_lora_b(resumed, slot));
+        assert(original_a && original_b && restored_a && restored_b);
+        assert(restored_a->is_cuda() && restored_b->is_cuda());
+        restored_param_diff = std::max({restored_param_diff,
+            max_diff(*original_a, *restored_a),
+            max_diff(*original_b, *restored_b)});
+    }
+    for (int64_t index = 0; index < kOptimizerSlots; ++index) {
+        auto* original_m = reinterpret_cast<at::Tensor*>(local_m[index]);
+        auto* original_v = reinterpret_cast<at::Tensor*>(local_v[index]);
+        auto* restored_m = reinterpret_cast<at::Tensor*>(resumed_m[index]);
+        auto* restored_v = reinterpret_cast<at::Tensor*>(resumed_v[index]);
+        assert(original_m && original_v && restored_m && restored_v);
+        assert(restored_m->is_cuda() && restored_v->is_cuda());
+        assert(restored_m->scalar_type() == at::kFloat);
+        assert(restored_v->scalar_type() == at::kFloat);
+        restored_m_diff = std::max(
+            restored_m_diff, max_diff(*original_m, *restored_m));
+        restored_v_diff = std::max(
+            restored_v_diff, max_diff(*original_v, *restored_v));
+    }
+    assert(restored_param_diff == 0.0);
+    assert(restored_m_diff == 0.0);
+    assert(restored_v_diff == 0.0);
+    assert(qwen36_get_step_count(resumed) ==
+        qwen36_get_step_count(distributed));
+
+    const double continued_loss = qwen36_train_step(
+        distributed, &local_batch.input_ids, &local_batch.target_mask,
+        &local_batch.attention_mask);
+    const double resumed_loss = qwen36_train_step(
+        resumed, &local_batch.input_ids, &local_batch.target_mask,
+        &local_batch.attention_mask);
+    assert(std::abs(continued_loss - resumed_loss) <= 1e-6);
+    assert(qwen36_export_optimizer_state(
+        distributed, local_m.data(), local_v.data(), kOptimizerSlots) ==
+        kOptimizerSlots);
+    assert(qwen36_export_optimizer_state(
+        resumed, resumed_m.data(), resumed_v.data(), kOptimizerSlots) ==
+        kOptimizerSlots);
+    double continued_param_diff = 0.0;
+    double continued_m_diff = 0.0;
+    double continued_v_diff = 0.0;
+    for (int64_t slot = 0; slot < kLoraPairs; ++slot) {
+        auto* continued_a = reinterpret_cast<at::Tensor*>(
+            qwen36_get_lora_a(distributed, slot));
+        auto* continued_b = reinterpret_cast<at::Tensor*>(
+            qwen36_get_lora_b(distributed, slot));
+        auto* restored_a = reinterpret_cast<at::Tensor*>(
+            qwen36_get_lora_a(resumed, slot));
+        auto* restored_b = reinterpret_cast<at::Tensor*>(
+            qwen36_get_lora_b(resumed, slot));
+        continued_param_diff = std::max({continued_param_diff,
+            max_diff(*continued_a, *restored_a),
+            max_diff(*continued_b, *restored_b)});
+    }
+    for (int64_t index = 0; index < kOptimizerSlots; ++index) {
+        continued_m_diff = std::max(continued_m_diff, max_diff(
+            *reinterpret_cast<at::Tensor*>(local_m[index]),
+            *reinterpret_cast<at::Tensor*>(resumed_m[index])));
+        continued_v_diff = std::max(continued_v_diff, max_diff(
+            *reinterpret_cast<at::Tensor*>(local_v[index]),
+            *reinterpret_cast<at::Tensor*>(resumed_v[index])));
+    }
+    std::printf(
+        "native_tp_ep_resume rank=%d loss=%0.8f param_diff=%0.8e "
+        "m_diff=%0.8e v_diff=%0.8e step=%ld\n",
+        rank, resumed_loss, continued_param_diff, continued_m_diff,
+        continued_v_diff,
+        static_cast<long>(qwen36_get_step_count(resumed)));
+    std::fflush(stdout);
+    assert(continued_param_diff == 0.0);
+    assert(continued_m_diff == 0.0);
+    assert(continued_v_diff == 0.0);
+    assert(qwen36_get_step_count(resumed) == 2);
+
     const int64_t dynamic_targets[] = {0};
     const int64_t tenant_one = qwen36_add_lora(
         distributed, kLoraRank, kLoraRank,
@@ -720,6 +869,7 @@ int main() {
     assert(dynamic_adam_error <= 1e-5);
 
     qwen36_free_training_context(reference);
+    qwen36_free_training_context(resumed);
     qwen36_free_training_context(distributed);
     return 0;
 }

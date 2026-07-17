@@ -32,6 +32,17 @@ struct RankSummary {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+struct LaunchNodeMarker {
+    nnodes: usize,
+    nproc_per_node: usize,
+    node_rank: usize,
+    master_addr: String,
+    master_port: u16,
+    run_id: String,
+    attempt_id: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
 pub struct LaunchEnvSummary {
     pub rank: usize,
     pub local_rank: usize,
@@ -98,9 +109,24 @@ pub fn launch_multi(
     let current_exe = std::env::current_exe().context("failed to locate current executable")?;
     let timeout = launch_timeout()?;
     let topology = ParallelTopology::from_env_with_world_size(world_size)?;
+    let run_id = resolve_launch_run_id(nnodes, std::env::var("RUSTRAIN_RUN_ID").ok())?;
+    let attempt_id = resolve_launch_attempt_id(nnodes, std::env::var("RUSTRAIN_ATTEMPT_ID").ok())?;
     let visible_cuda_devices =
         parse_visible_cuda_devices(std::env::var("CUDA_VISIBLE_DEVICES").ok());
     validate_visible_cuda_devices(nproc_per_node, visible_cuda_devices.as_deref())?;
+    if nnodes > 1 {
+        rendezvous_launch_nodes(
+            output_dir,
+            nnodes,
+            nproc_per_node,
+            node_rank,
+            master_addr,
+            master_port,
+            &run_id,
+            &attempt_id,
+            timeout.unwrap_or(Duration::from_secs(120)),
+        )?;
+    }
 
     let mut children = Vec::with_capacity(nproc_per_node);
     for local_rank in 0..nproc_per_node {
@@ -122,6 +148,8 @@ pub fn launch_multi(
             .env("MASTER_ADDR", master_addr)
             .env("MASTER_PORT", master_port.to_string())
             .env("RUSTRAIN_LAUNCH_OUTPUT_DIR", output_dir)
+            .env("RUSTRAIN_RUN_ID", &run_id)
+            .env("RUSTRAIN_ATTEMPT_ID", &attempt_id)
             .env("NNODES", nnodes.to_string())
             .env("NODE_RANK", node_rank.to_string())
             // Normalize topology variables for every child. Explicit
@@ -198,21 +226,22 @@ pub fn launch_multi(
     let mut ranks = Vec::with_capacity(nproc_per_node);
     let mut failed = Vec::new();
     for wait_result in wait_results {
+        let local_rank = wait_result.rank - node_rank * nproc_per_node;
         if !wait_result.success() {
             failed.push(wait_result.rank);
         }
         ranks.push(RankSummary {
             rank: wait_result.rank,
-            local_rank: wait_result.rank,
-            world_size: nproc_per_node,
+            local_rank,
+            world_size,
             assigned_cuda_visible_device: visible_cuda_devices
                 .as_ref()
-                .and_then(|devices| devices.get(wait_result.rank))
+                .and_then(|devices| devices.get(local_rank))
                 .cloned(),
             assigned_cuda_device_ordinal: visible_cuda_devices
                 .as_ref()
-                .and_then(|devices| devices.get(wait_result.rank))
-                .map(|_| wait_result.rank),
+                .and_then(|devices| devices.get(local_rank))
+                .map(|_| local_rank),
             status_code: wait_result.status.and_then(|status| status.code()),
             timed_out: wait_result.timed_out,
             log_path: wait_result.log_path.display().to_string(),
@@ -226,7 +255,11 @@ pub fn launch_multi(
         ranks,
     };
     let summary_json = serde_json::to_string_pretty(&summary)?;
-    let summary_path = output_dir.join("launch-summary.json");
+    let summary_path = if nnodes > 1 {
+        output_dir.join(format!("launch-summary-node-{node_rank}.json"))
+    } else {
+        output_dir.join("launch-summary.json")
+    };
     fs::write(&summary_path, &summary_json)
         .with_context(|| format!("failed to write {}", summary_path.display()))?;
     println!("{summary_json}");
@@ -243,6 +276,128 @@ pub fn launch_multi(
     }
 
     Ok(())
+}
+
+fn resolve_launch_run_id(nnodes: usize, configured: Option<String>) -> Result<String> {
+    if let Some(configured) = configured.filter(|value| !value.is_empty()) {
+        validate_launch_id("RUSTRAIN_RUN_ID", &configured)?;
+        return Ok(configured);
+    }
+    if nnodes > 1 {
+        bail!("multi-node launch requires one shared RUSTRAIN_RUN_ID to be set on every launcher");
+    }
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .context("system clock is before the Unix epoch")?
+        .as_nanos();
+    Ok(format!("launch-{}-{nonce}", std::process::id()))
+}
+
+fn resolve_launch_attempt_id(nnodes: usize, configured: Option<String>) -> Result<String> {
+    if let Some(configured) = configured.filter(|value| !value.is_empty()) {
+        validate_launch_id("RUSTRAIN_ATTEMPT_ID", &configured)?;
+        return Ok(configured);
+    }
+    if nnodes > 1 {
+        bail!(
+            "multi-node launch requires one shared RUSTRAIN_ATTEMPT_ID to be set on every launcher"
+        );
+    }
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .context("system clock is before the Unix epoch")?
+        .as_nanos();
+    Ok(format!("attempt-{}-{nonce}", std::process::id()))
+}
+
+fn validate_launch_id(name: &str, value: &str) -> Result<()> {
+    if value.is_empty()
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+    {
+        bail!("{name} may contain only ASCII letters, digits, '-', '_', and '.'");
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn rendezvous_launch_nodes(
+    output_dir: &Path,
+    nnodes: usize,
+    nproc_per_node: usize,
+    node_rank: usize,
+    master_addr: &str,
+    master_port: u16,
+    run_id: &str,
+    attempt_id: &str,
+    timeout: Duration,
+) -> Result<()> {
+    let rendezvous = output_dir
+        .join(".rustrain-launch")
+        .join(run_id)
+        .join(attempt_id);
+    fs::create_dir_all(&rendezvous)
+        .with_context(|| format!("failed to create {}", rendezvous.display()))?;
+    let marker = LaunchNodeMarker {
+        nnodes,
+        nproc_per_node,
+        node_rank,
+        master_addr: master_addr.to_string(),
+        master_port,
+        run_id: run_id.to_string(),
+        attempt_id: attempt_id.to_string(),
+    };
+    let marker_path = rendezvous.join(format!("node-{node_rank:05}.json"));
+    let partial_path = rendezvous.join(format!(
+        ".node-{node_rank:05}-{}.partial",
+        std::process::id()
+    ));
+    fs::write(&partial_path, serde_json::to_vec_pretty(&marker)?)
+        .with_context(|| format!("failed to write {}", partial_path.display()))?;
+    fs::rename(&partial_path, &marker_path).with_context(|| {
+        format!(
+            "failed to publish launch rendezvous marker {}",
+            marker_path.display()
+        )
+    })?;
+
+    let deadline = Instant::now() + timeout;
+    loop {
+        let mut ready = true;
+        for expected_rank in 0..nnodes {
+            let path = rendezvous.join(format!("node-{expected_rank:05}.json"));
+            let Some(contents) = fs::read(&path).ok() else {
+                ready = false;
+                break;
+            };
+            let observed: LaunchNodeMarker = serde_json::from_slice(&contents)
+                .with_context(|| format!("failed to parse {}", path.display()))?;
+            if observed.nnodes != nnodes
+                || observed.nproc_per_node != nproc_per_node
+                || observed.node_rank != expected_rank
+                || observed.master_addr != master_addr
+                || observed.master_port != master_port
+                || observed.run_id != run_id
+                || observed.attempt_id != attempt_id
+            {
+                bail!(
+                    "multi-node launch rendezvous metadata differs at {}",
+                    path.display()
+                );
+            }
+        }
+        if ready {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            bail!(
+                "timed out waiting for all launch nodes under {}; multi-node output_dir must be on shared storage",
+                rendezvous.display()
+            );
+        }
+        sleep(Duration::from_millis(100));
+    }
 }
 
 pub fn print_launch_env() -> Result<()> {
@@ -411,6 +566,82 @@ mod tests {
         let error = launch(2, temp.path(), "127.0.0.1", 29500, &[])
             .expect_err("empty command should be rejected");
         assert!(error.to_string().contains("requires a child command"));
+    }
+
+    #[test]
+    fn launch_reuses_explicit_run_id_across_nodes() {
+        assert_eq!(
+            resolve_launch_run_id(2, Some("shared-run".into())).unwrap(),
+            "shared-run"
+        );
+    }
+
+    #[test]
+    fn multi_node_launch_requires_explicit_run_id() {
+        let error = resolve_launch_run_id(2, None).unwrap_err();
+        assert!(error.to_string().contains("shared RUSTRAIN_RUN_ID"));
+    }
+
+    #[test]
+    fn multi_node_launch_requires_explicit_attempt_id() {
+        let error = resolve_launch_attempt_id(2, None).unwrap_err();
+        assert!(error.to_string().contains("shared RUSTRAIN_ATTEMPT_ID"));
+        assert_eq!(
+            resolve_launch_attempt_id(2, Some("attempt-7".into())).unwrap(),
+            "attempt-7"
+        );
+    }
+
+    #[test]
+    fn launch_ids_reject_path_components() {
+        let error = resolve_launch_attempt_id(1, Some("../attempt".into())).unwrap_err();
+        assert!(error.to_string().contains("RUSTRAIN_ATTEMPT_ID"));
+    }
+
+    #[test]
+    fn multi_node_rendezvous_observes_every_node_on_shared_storage() {
+        let temp = tempdir().unwrap();
+        let root = temp.path();
+        std::thread::scope(|scope| {
+            let handles = (0..2)
+                .map(|node_rank| {
+                    scope.spawn(move || {
+                        rendezvous_launch_nodes(
+                            root,
+                            2,
+                            4,
+                            node_rank,
+                            "127.0.0.1",
+                            29500,
+                            "shared-run",
+                            "attempt-7",
+                            Duration::from_secs(1),
+                        )
+                    })
+                })
+                .collect::<Vec<_>>();
+            for handle in handles {
+                handle.join().unwrap().unwrap();
+            }
+        });
+    }
+
+    #[test]
+    fn multi_node_rendezvous_reports_non_shared_storage() {
+        let temp = tempdir().unwrap();
+        let error = rendezvous_launch_nodes(
+            temp.path(),
+            2,
+            4,
+            0,
+            "127.0.0.1",
+            29500,
+            "shared-run",
+            "attempt-7",
+            Duration::from_millis(20),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("shared storage"));
     }
 
     #[test]

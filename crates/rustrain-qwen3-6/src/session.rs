@@ -3,15 +3,17 @@
 use std::collections::{BTreeMap, HashSet};
 use std::env;
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use tch::{Kind, Tensor};
 use tracing::info;
 
+use crate::checkpoint;
 use crate::config::{
-    read_qwen36_runtime_config, resolve_qwen36_model_path, LayerType, Qwen36RuntimeConfig,
+    LayerType, Qwen36RuntimeConfig, read_qwen36_runtime_config, resolve_qwen36_model_path,
 };
 use crate::lora::{
-    validate_lora_targets, Qwen36AdapterArtifact, Qwen36LoraConfig, Qwen36LoraTargetModule,
+    Qwen36AdapterArtifact, Qwen36LoraConfig, Qwen36LoraTargetModule, native_lora_slots,
+    validate_lora_targets,
 };
 use crate::sft::SftDataset;
 use rustrain_checkpoint::safetensors::read_safetensors_dir_filtered;
@@ -76,11 +78,18 @@ fn parse_env_usize(key: &str) -> Result<usize> {
         })
 }
 
-fn validate_standard_adapter_export_topology(tp_size: usize, ep_size: usize) -> Result<()> {
-    if tp_size > 1 || ep_size > 1 {
-        bail!(
-            "standard PEFT adapter export requires unsharded LoRA tensors; TP_SIZE={tp_size} EP_SIZE={ep_size} produces rank-local shards, and merge/reshard metadata is not implemented"
-        );
+fn validate_lora_rank_for_tp(
+    lora_rank: i64,
+    tp_size: usize,
+    layouts: &[checkpoint::LoraTpShardLayout],
+) -> Result<()> {
+    if tp_size > 1
+        && layouts
+            .iter()
+            .any(|layout| *layout == checkpoint::LoraTpShardLayout::LatentRank)
+        && lora_rank % tp_size as i64 != 0
+    {
+        bail!("latent-rank LoRA rank {lora_rank} must be divisible by TP_SIZE={tp_size}");
     }
     Ok(())
 }
@@ -205,7 +214,8 @@ pub fn train_qwen3_6_lora_sft_ep(
         .model_path
         .as_ref()
         .ok_or_else(|| anyhow!("model.model_path required"))?;
-    let model_path = resolve_qwen36_model_path(model_path)?;
+    let model_path = std::fs::canonicalize(resolve_qwen36_model_path(model_path)?)
+        .with_context(|| format!("canonicalize Qwen model path {}", model_path.display()))?;
     let runtime_config = read_qwen36_runtime_config(&model_path)?;
     let ep_shard = if runtime_config.is_moe {
         if config.parallel.pipeline_model_parallel_size != 1
@@ -263,11 +273,19 @@ mod tests {
     }
 
     #[test]
-    fn standard_adapter_export_rejects_tp_and_ep_shards() {
-        validate_standard_adapter_export_topology(1, 1).unwrap();
-        assert!(validate_standard_adapter_export_topology(2, 1).is_err());
-        assert!(validate_standard_adapter_export_topology(1, 2).is_err());
-        assert!(validate_standard_adapter_export_topology(2, 2).is_err());
+    fn projection_sharded_lora_rank_does_not_require_tp_divisibility() {
+        validate_lora_rank_for_tp(
+            3,
+            2,
+            &[
+                checkpoint::LoraTpShardLayout::ColumnParallel,
+                checkpoint::LoraTpShardLayout::RoutedExpertFusedGateUp,
+            ],
+        )
+        .unwrap();
+        assert!(
+            validate_lora_rank_for_tp(3, 2, &[checkpoint::LoraTpShardLayout::LatentRank],).is_err()
+        );
     }
 }
 
@@ -285,7 +303,8 @@ fn train_impl(
         .model_path
         .as_ref()
         .ok_or_else(|| anyhow!("model.model_path required"))?;
-    let model_path = resolve_qwen36_model_path(model_path)?;
+    let model_path = std::fs::canonicalize(resolve_qwen36_model_path(model_path)?)
+        .with_context(|| format!("canonicalize Qwen model path {}", model_path.display()))?;
     let runtime_config = read_qwen36_runtime_config(&model_path)?;
     let lora_config = lora_config_from_config(config)?;
     validate_lora_targets(&runtime_config, &lora_config)?;
@@ -337,6 +356,14 @@ fn train_impl(
         .unwrap_or(0);
     let world_size = env_world_size;
     let rank = env_rank;
+    let distributed_generation =
+        if world_size > 1 {
+            Some(std::env::var("RUSTRAIN_ATTEMPT_ID").context(
+                "distributed CLI training requires launcher-provided RUSTRAIN_ATTEMPT_ID",
+            )?)
+        } else {
+            None
+        };
     let tp_size = config.parallel.tensor_model_parallel_size;
     let env_tp_size = std::env::var("TP_SIZE")
         .or_else(|_| std::env::var("RUSTRAIN_TP_SIZE"))
@@ -420,14 +447,13 @@ fn train_impl(
         topology.validate_world_size(world_size)?;
         topology.coordinates(rank)?;
     }
-    if tp_size > 1 {
-        if lora_config.rank % tp_size as i64 != 0 {
-            bail!(
-                "LoRA rank {} must be divisible by TP_SIZE={tp_size}",
-                lora_config.rank
-            );
-        }
-    }
+    let native_slots = native_lora_slots(&runtime_config, &lora_config);
+    let active_layouts = native_slots
+        .iter()
+        .filter(|slot| slot.active)
+        .map(|slot| checkpoint::lora_tp_shard_layout(slot.module, &runtime_config))
+        .collect::<Vec<_>>();
+    validate_lora_rank_for_tp(lora_config.rank, tp_size, &active_layouts)?;
     let is_data_parallel = dp_size > 1;
     if is_data_parallel && runtime_config.is_moe {
         bail!(
@@ -438,7 +464,10 @@ fn train_impl(
         std::env::set_var("TP_SIZE", tp_size.to_string());
         std::env::set_var(
             "EP_SIZE",
-            shard_ref.map(|shard| shard.world_size).unwrap_or(1).to_string(),
+            shard_ref
+                .map(|shard| shard.world_size)
+                .unwrap_or(1)
+                .to_string(),
         );
         std::env::set_var("DP_SIZE", dp_size.to_string());
         std::env::set_var(
@@ -466,7 +495,6 @@ fn train_impl(
         .map(ParallelTopology::expert_model_parallel_size)
         .unwrap_or(1);
     let is_expert_parallel = ep_size > 1;
-    validate_standard_adapter_export_topology(tp_size, ep_size)?;
     unsafe {
         std::env::set_var("RUSTRAIN_TP_RANK", tp_rank.to_string());
         std::env::set_var("RUSTRAIN_EP_RANK", ep_rank.to_string());
@@ -555,7 +583,10 @@ fn train_impl(
         let intermediates = if runtime_config.is_moe {
             vec![
                 ("routed expert", runtime_config.moe_intermediate_size),
-                ("shared expert", runtime_config.shared_expert_intermediate_size),
+                (
+                    "shared expert",
+                    runtime_config.shared_expert_intermediate_size,
+                ),
             ]
         } else {
             vec![("dense", runtime_config.intermediate_size)]
@@ -603,12 +634,7 @@ fn train_impl(
         };
         let expert_or_full = expert_shard.as_ref().unwrap_or(tensor);
         let moe_tp_shard = if runtime_config.is_moe && base_tp_mlp {
-            crate::kernel::shard_moe_mlp_weight_for_tp(
-                name,
-                expert_or_full,
-                tp_size,
-                tp_rank,
-            )?
+            crate::kernel::shard_moe_mlp_weight_for_tp(name, expert_or_full, tp_size, tp_rank)?
         } else {
             None
         };
@@ -630,9 +656,8 @@ fn train_impl(
         } else if vocab_shard.is_some() {
             vocab_shard
         } else if base_tp_attention {
-            let full_attention_shard = crate::kernel::shard_full_attention_weight_for_tp(
-                name, tensor, tp_size, tp_rank,
-            )?;
+            let full_attention_shard =
+                crate::kernel::shard_full_attention_weight_for_tp(name, tensor, tp_size, tp_rank)?;
             let attention_shard = if full_attention_shard.is_some() {
                 full_attention_shard
             } else {
@@ -795,11 +820,161 @@ fn train_impl(
         info!("C++ TrainingContext: gradient checkpointing ON (group_size={group_size})");
     }
 
-    // Training loop
-    let mut initial_loss = 0.0_f64;
-    let mut final_loss = 0.0_f64;
+    let native_count = ctx.lora_count() as usize;
+    if native_slots.len() != native_count {
+        bail!(
+            "LoRA registry count {} does not match native slot count {native_count}",
+            native_slots.len()
+        );
+    }
+    let mut start_step = 0usize;
+    let mut resumed_loss = 0.0_f64;
+    if let Some(resume_path) = config.train.resume_from.as_ref() {
+        let parallel = checkpoint::ParallelCheckpointManifest::from_topology(
+            world_size,
+            rank,
+            parallel_topology
+                .as_ref()
+                .context("Qwen checkpoint restore is missing parallel topology")?,
+        )?;
+        let data = checkpoint::load_checkpoint_for_topology(resume_path, &parallel)?;
+        let checkpoint_model_path =
+            std::fs::canonicalize(&data.manifest.model_path).with_context(|| {
+                format!(
+                    "canonicalize checkpoint base model path {}",
+                    data.manifest.model_path
+                )
+            })?;
+        if checkpoint_model_path != model_path {
+            bail!(
+                "checkpoint base model {} does not match configured model {}",
+                checkpoint_model_path.display(),
+                model_path.display()
+            );
+        }
+        if !data.dynamic_adapters.is_empty() {
+            bail!("Qwen CLI fixed-LoRA training cannot resume dynamic adapter state");
+        }
+        if data.manifest.lora_rank != lora_config.rank
+            || (data.manifest.lora_alpha - lora_config.alpha).abs() > 1e-12
+        {
+            bail!(
+                "checkpoint LoRA rank/alpha {}/{} does not match config {}/{}",
+                data.manifest.lora_rank,
+                data.manifest.lora_alpha,
+                lora_config.rank,
+                lora_config.alpha
+            );
+        }
+        let expected_identities = native_slots
+            .iter()
+            .filter(|slot| slot.active)
+            .map(|slot| checkpoint::LoraSlotIdentity {
+                index: slot.index,
+                layer: slot.layer,
+                module: slot.module.cpp_name().to_string(),
+            })
+            .collect::<Vec<_>>();
+        if world_size > 1 {
+            checkpoint::validate_fixed_tp_resume(
+                &data.manifest,
+                &active_layouts,
+                &expected_identities,
+            )?;
+        }
+        let active_slot_indices = native_slots
+            .iter()
+            .filter(|slot| slot.active)
+            .map(|slot| slot.index)
+            .collect::<Vec<_>>();
+        let restore_slot_indices = checkpoint::fixed_restore_slot_indices(
+            data.lora_a.len(),
+            data.lora_b.len(),
+            &active_slot_indices,
+            native_count,
+        )?;
+        for ((a, b), &slot_index) in data
+            .lora_a
+            .iter()
+            .zip(&data.lora_b)
+            .zip(&restore_slot_indices)
+        {
+            ctx.set_lora_tensor(slot_index as i64, false, a)?;
+            ctx.set_lora_tensor(slot_index as i64, true, b)?;
+        }
+        if data.adam_m.is_empty() != data.adam_v.is_empty() {
+            bail!(
+                "checkpoint fixed optimizer m/v count mismatch: {}/{}",
+                data.adam_m.len(),
+                data.adam_v.len()
+            );
+        }
+        if data.adam_m.is_empty() && data.manifest.step > 0 {
+            bail!(
+                "checkpoint at step {} has no Adam state",
+                data.manifest.step
+            );
+        }
+        if !data.adam_m.is_empty() {
+            let expected_saved_optimizer_count = restore_slot_indices.len().saturating_mul(2);
+            if data.adam_m.len() != expected_saved_optimizer_count
+                || data.adam_v.len() != expected_saved_optimizer_count
+            {
+                bail!(
+                    "checkpoint fixed optimizer count mismatch: m={}, v={}, expected={expected_saved_optimizer_count}",
+                    data.adam_m.len(),
+                    data.adam_v.len()
+                );
+            }
+            let (mut all_adam_m, mut all_adam_v) = ctx.export_optimizer_state()?;
+            let expected_native_optimizer_count = native_count.saturating_mul(2);
+            if all_adam_m.len() != expected_native_optimizer_count
+                || all_adam_v.len() != expected_native_optimizer_count
+            {
+                bail!(
+                    "native fixed optimizer count mismatch: m={}, v={}, expected={expected_native_optimizer_count}",
+                    all_adam_m.len(),
+                    all_adam_v.len()
+                );
+            }
+            for (saved_slot, &native_slot) in restore_slot_indices.iter().enumerate() {
+                let saved = saved_slot.saturating_mul(2);
+                let native = native_slot.saturating_mul(2);
+                all_adam_m[native] = data.adam_m[saved].shallow_clone();
+                all_adam_m[native + 1] = data.adam_m[saved + 1].shallow_clone();
+                all_adam_v[native] = data.adam_v[saved].shallow_clone();
+                all_adam_v[native + 1] = data.adam_v[saved + 1].shallow_clone();
+            }
+            let imported = ctx.import_optimizer_state(&all_adam_m, &all_adam_v)?;
+            if imported != expected_native_optimizer_count as i64 {
+                bail!(
+                    "native fixed optimizer import restored {imported} tensors, expected {expected_native_optimizer_count}"
+                );
+            }
+        }
+        let native_step = i64::try_from(data.manifest.step)
+            .context("checkpoint step exceeds the native optimizer range")?;
+        ctx.set_step_count(native_step)?;
+        start_step = usize::try_from(data.manifest.step)
+            .context("checkpoint step exceeds the CLI training range")?;
+        if start_step > max_steps {
+            bail!("checkpoint step {start_step} exceeds configured max_steps {max_steps}");
+        }
+        resumed_loss = data.manifest.loss;
+        info!(
+            step = start_step,
+            loss = resumed_loss,
+            path = %resume_path.display(),
+            "Qwen fixed LoRA checkpoint restored"
+        );
+    }
 
-    for step in 0..max_steps {
+    // Training loop
+    let mut initial_loss = resumed_loss;
+    let mut final_loss = resumed_loss;
+    let mut observed_loss = false;
+
+    for step in start_step..max_steps {
         let mut loss_value = 0.0;
         for accumulation_index in 0..gradient_accumulation_steps {
             let micro_step = step * gradient_accumulation_steps + accumulation_index;
@@ -838,8 +1013,9 @@ fn train_impl(
                 accumulation_index + 1 == gradient_accumulation_steps,
             )? / gradient_accumulation_steps as f64;
         }
-        if step == 0 {
+        if !observed_loss {
             initial_loss = loss_value;
+            observed_loss = true;
         }
         final_loss = loss_value;
         if step % 10 == 0 || step == max_steps - 1 {
@@ -847,32 +1023,121 @@ fn train_impl(
         }
     }
 
-    // Export every positional native slot, then let the artifact mapper omit
-    // inactive slots and assign stable projection-aware tensor names.
-    let mut exported = Vec::with_capacity(ctx.lora_count() as usize);
-    for index in 0..ctx.lora_count() {
-        let a = ctx
-            .get_lora_a(index)
-            .with_context(|| format!("native LoRA slot {index} is missing A"))?;
-        let b = ctx
-            .get_lora_b(index)
-            .with_context(|| format!("native LoRA slot {index} is missing B"))?;
-        exported.push((a, b));
-    }
-    let artifact = Qwen36AdapterArtifact::from_native_exports(
-        &config.model.name,
-        &config.model.architecture,
-        Some(&model_path),
-        &runtime_config,
-        &lora_config,
-        exported,
-    )?;
-    let trainable_params = artifact.tensors.len();
-    let adapter_path = run_paths.root.join("adapter_model.safetensors");
-    if !is_data_parallel || dp_rank == 0 {
+    let (adapter_path, trainable_params) = if world_size > 1 {
+        let generation = distributed_generation
+            .as_deref()
+            .expect("distributed attempt ID was validated before training");
+        let parallel = checkpoint::ParallelCheckpointManifest::from_topology(
+            world_size,
+            rank,
+            parallel_topology
+                .as_ref()
+                .context("distributed CLI export is missing parallel topology")?,
+        )?;
+        let (all_adam_m, all_adam_v) = ctx.export_optimizer_state()?;
+        let expected_optimizer_count = native_count.saturating_mul(2);
+        if all_adam_m.len() != expected_optimizer_count
+            || all_adam_v.len() != expected_optimizer_count
+        {
+            bail!(
+                "fixed optimizer state count mismatch: m={}, v={}, expected={expected_optimizer_count}",
+                all_adam_m.len(),
+                all_adam_v.len()
+            );
+        }
+        let active_slots = native_slots
+            .iter()
+            .filter(|slot| slot.active)
+            .collect::<Vec<_>>();
+        let mut lora_a = Vec::with_capacity(active_slots.len());
+        let mut lora_b = Vec::with_capacity(active_slots.len());
+        let mut adam_m = Vec::with_capacity(active_slots.len().saturating_mul(2));
+        let mut adam_v = Vec::with_capacity(active_slots.len().saturating_mul(2));
+        let mut layouts = Vec::with_capacity(active_slots.len());
+        let mut identities = Vec::with_capacity(active_slots.len());
+        for slot in active_slots {
+            lora_a.push(
+                ctx.get_lora_a(slot.index as i64)
+                    .with_context(|| format!("native LoRA slot {} is missing A", slot.index))?,
+            );
+            lora_b.push(
+                ctx.get_lora_b(slot.index as i64)
+                    .with_context(|| format!("native LoRA slot {} is missing B", slot.index))?,
+            );
+            let optimizer_index = slot.index.saturating_mul(2);
+            adam_m.push(all_adam_m[optimizer_index].shallow_clone());
+            adam_m.push(all_adam_m[optimizer_index + 1].shallow_clone());
+            adam_v.push(all_adam_v[optimizer_index].shallow_clone());
+            adam_v.push(all_adam_v[optimizer_index + 1].shallow_clone());
+            layouts.push(checkpoint::lora_tp_shard_layout(
+                slot.module,
+                &runtime_config,
+            ));
+            identities.push(checkpoint::LoraSlotIdentity {
+                index: slot.index,
+                layer: slot.layer,
+                module: slot.module.cpp_name().to_string(),
+            });
+        }
+        let adapter_dir = run_paths.root.join("adapter");
+        let step = u64::try_from(ctx.get_step_count())
+            .context("native fixed adapter optimizer step is negative")?;
+        let model_path_string = model_path
+            .to_str()
+            .context("Qwen model path is not UTF-8")?
+            .to_string();
+        let count = checkpoint::export_distributed_adapter_checkpoint(
+            &adapter_dir,
+            generation,
+            &parallel,
+            None,
+            |staging| {
+                checkpoint::save_checkpoint_with_dynamic_for_topology(
+                    staging,
+                    step,
+                    final_loss,
+                    &model_path_string,
+                    lora_config.rank,
+                    lora_config.alpha,
+                    &lora_a,
+                    &lora_b,
+                    &adam_m,
+                    &adam_v,
+                    &[],
+                    &layouts,
+                    &identities,
+                    &parallel,
+                )
+            },
+        )?;
+        (adapter_dir.join("adapter_model.safetensors"), count)
+    } else {
+        // Export every positional native slot, then let the artifact mapper omit
+        // inactive slots and assign stable projection-aware tensor names.
+        let mut exported = Vec::with_capacity(native_count);
+        for index in 0..ctx.lora_count() {
+            let a = ctx
+                .get_lora_a(index)
+                .with_context(|| format!("native LoRA slot {index} is missing A"))?;
+            let b = ctx
+                .get_lora_b(index)
+                .with_context(|| format!("native LoRA slot {index} is missing B"))?;
+            exported.push((a, b));
+        }
+        let artifact = Qwen36AdapterArtifact::from_native_exports(
+            &config.model.name,
+            &config.model.architecture,
+            Some(&model_path),
+            &runtime_config,
+            &lora_config,
+            exported,
+        )?;
+        let count = artifact.tensors.len();
+        let path = run_paths.root.join("adapter_model.safetensors");
         artifact.save(&run_paths.root)?;
-        info!("saved adapter to {}", adapter_path.display());
-    }
+        (path, count)
+    };
+    info!("saved adapter to {}", adapter_path.display());
 
     Ok(Qwen36LoraSftSummary {
         adapter_output: adapter_path.to_string_lossy().to_string(),

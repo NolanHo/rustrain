@@ -1,6 +1,6 @@
 //! Training session trait + Qwen3.6 implementation.
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tch::{Device, Kind, Tensor};
@@ -10,43 +10,6 @@ use crate::checkpoint;
 use crate::metrics::{FileMetricsSink, MetricsSink, StepMetric};
 use rustrain_parallel::topology::ParallelTopology;
 use rustrain_qwen3_6::lora::{Qwen36AdapterArtifact, Qwen36LoraConfig, Qwen36LoraTargetModule};
-
-fn lora_tp_shard_layout(
-    module: Qwen36LoraTargetModule,
-    config: &rustrain_qwen3_6::config::Qwen36RuntimeConfig,
-) -> checkpoint::LoraTpShardLayout {
-    match module {
-        Qwen36LoraTargetModule::QProj
-        | Qwen36LoraTargetModule::KProj
-        | Qwen36LoraTargetModule::VProj
-        | Qwen36LoraTargetModule::InProjZ
-        | Qwen36LoraTargetModule::InProjA
-        | Qwen36LoraTargetModule::InProjB
-        | Qwen36LoraTargetModule::GateProj
-        | Qwen36LoraTargetModule::UpProj
-        | Qwen36LoraTargetModule::SharedGateProj
-        | Qwen36LoraTargetModule::SharedUpProj => {
-            checkpoint::LoraTpShardLayout::ColumnParallel
-        }
-        Qwen36LoraTargetModule::InProjQkv => checkpoint::LoraTpShardLayout::FlatQkvColumnParallel {
-            q_rows: config.linear_num_key_heads * config.linear_key_head_dim,
-            k_rows: config.linear_num_key_heads * config.linear_key_head_dim,
-            v_rows: config.linear_num_value_heads * config.linear_value_head_dim,
-        },
-        Qwen36LoraTargetModule::OProj
-        | Qwen36LoraTargetModule::OutProj
-        | Qwen36LoraTargetModule::DownProj
-        | Qwen36LoraTargetModule::SharedDownProj => {
-            checkpoint::LoraTpShardLayout::RowParallel
-        }
-        Qwen36LoraTargetModule::ExpertsGateUpProj => {
-            checkpoint::LoraTpShardLayout::RoutedExpertFusedGateUp
-        }
-        Qwen36LoraTargetModule::ExpertsDownProj => {
-            checkpoint::LoraTpShardLayout::RoutedExpertDown
-        }
-    }
-}
 
 /// Session states.
 #[derive(Debug, Clone)]
@@ -221,177 +184,21 @@ impl Qwen36Session {
             return <Self as TrainingSession>::export_adapter(self, path, adapter_id);
         }
         let final_path = std::path::Path::new(path);
-        if final_path.extension().is_some() {
-            bail!("distributed adapter export requires a directory path");
-        }
-        let staging = PathBuf::from(format!("{path}.rustrain-shards-{generation}"));
-        let result = (|| -> Result<usize> {
-            <Self as TrainingSession>::save_checkpoint(
-                self,
-                staging
-                    .to_str()
-                    .context("distributed export staging path is not UTF-8")?,
-            )?;
-            wait_for_rank_manifests(&staging, parallel.world_size)?;
-
-            if parallel.global_rank == 0 {
-                if final_path.exists() {
-                    bail!("adapter export destination already exists: {}", final_path.display());
-                }
-                let merged = checkpoint::merge_distributed_adapter_checkpoint(
-                    &staging,
-                    adapter_id,
-                )?;
-                let runtime_config = rustrain_qwen3_6::config::read_qwen36_runtime_config(
-                    std::path::Path::new(&merged.model_path),
-                )?;
-                let target_modules = merged
-                    .target_modules
-                    .iter()
-                    .map(|module| Qwen36LoraTargetModule::parse(module))
-                    .collect::<Result<Vec<_>>>()?;
-                let lora_config = Qwen36LoraConfig {
-                    rank: merged.rank,
-                    alpha: merged.alpha,
-                    target_layers: merged.target_layers.clone(),
-                    target_modules,
-                };
-                let mut by_index = merged
-                    .slots
-                    .into_iter()
-                    .map(|slot| (slot.identity.index, slot))
-                    .collect::<std::collections::BTreeMap<_, _>>();
-                let native_slots =
-                    rustrain_qwen3_6::lora::native_lora_slots(&runtime_config, &lora_config);
-                let mut exported = Vec::with_capacity(native_slots.len());
-                for slot in native_slots {
-                    if slot.active {
-                        let merged_slot = by_index.remove(&slot.index).with_context(|| {
-                            format!("merged adapter is missing native slot {}", slot.index)
-                        })?;
-                        if merged_slot.identity.layer != slot.layer
-                            || merged_slot.identity.module != slot.module.cpp_name()
-                        {
-                            bail!("merged adapter slot {} identity is inconsistent", slot.index);
-                        }
-                        exported.push((merged_slot.lora_a, merged_slot.lora_b));
-                    } else {
-                        let placeholder = Tensor::zeros([], (Kind::Float, Device::Cpu));
-                        exported.push((placeholder.shallow_clone(), placeholder));
-                    }
-                }
-                if !by_index.is_empty() {
-                    bail!("merged adapter contains slots not present in the runtime model");
-                }
-                let artifact = Qwen36AdapterArtifact::from_native_exports(
-                    &merged.model_path,
-                    "qwen3_hybrid_lora_sft",
-                    Some(std::path::Path::new(&merged.model_path)),
-                    &runtime_config,
-                    &lora_config,
-                    exported,
-                )?;
-                let count = artifact.tensors.len();
-                let partial_path = PathBuf::from(format!("{path}.partial-{generation}"));
-                if partial_path.exists() {
-                    bail!(
-                        "adapter export partial destination already exists: {}",
-                        partial_path.display()
-                    );
-                }
-                artifact.save(&partial_path)?;
-                std::fs::rename(&partial_path, final_path).with_context(|| {
-                    format!(
-                        "publish adapter {} to {}",
-                        partial_path.display(),
-                        final_path.display()
-                    )
-                })?;
-                checkpoint::write_atomic(
-                    &staging.join("COMPLETED"),
-                    count.to_string().as_bytes(),
-                )?;
-                Ok(count)
-            } else {
-                wait_for_export_completion(&staging)
-            }
-        })();
-        if let Err(error) = &result {
-            let errors = staging.join("errors");
-            let _ = std::fs::create_dir_all(&errors);
-            let _ = checkpoint::write_atomic(
-                &errors.join(format!("rank-{:05}.txt", parallel.global_rank)),
-                error.to_string().as_bytes(),
-            );
-        }
-        result
-    }
-}
-
-fn wait_for_rank_manifests(root: &std::path::Path, world_size: usize) -> Result<()> {
-    wait_for_distributed_export(root, || rank_manifests_ready(root, world_size))
-}
-
-fn rank_manifests_ready(root: &std::path::Path, world_size: usize) -> bool {
-    (0..world_size).all(|rank| {
-        root.join(format!("rank-{rank:05}/manifest.json"))
-            .is_file()
-    })
-}
-
-fn wait_for_export_completion(root: &std::path::Path) -> Result<usize> {
-    wait_for_distributed_export(root, || root.join("COMPLETED").is_file())?;
-    let count = std::fs::read_to_string(root.join("COMPLETED"))?
-        .trim()
-        .parse::<usize>()
-        .context("distributed export COMPLETED marker has an invalid tensor count")?;
-    Ok(count)
-}
-
-fn wait_for_distributed_export(
-    root: &std::path::Path,
-    ready: impl Fn() -> bool,
-) -> Result<()> {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
-    loop {
-        let errors = root.join("errors");
-        if errors.is_dir() {
-            let mut entries = std::fs::read_dir(&errors)?
-                .collect::<std::io::Result<Vec<_>>>()?;
-            entries.sort_by_key(|entry| entry.file_name());
-            if let Some(error) = entries.first() {
-                let message = std::fs::read_to_string(error.path()).unwrap_or_else(|read_error| {
-                    format!("failed to read distributed export error: {read_error}")
-                });
-                bail!("distributed adapter export failed: {message}");
-            }
-        }
-        if ready() {
-            return Ok(());
-        }
-        if std::time::Instant::now() >= deadline {
-            bail!("timed out waiting for distributed adapter export at {}", root.display());
-        }
-        std::thread::sleep(std::time::Duration::from_millis(20));
-    }
-}
-
-#[cfg(test)]
-mod distributed_export_tests {
-    use super::rank_manifests_ready;
-
-    #[test]
-    fn partial_rank_manifest_is_not_ready() {
-        let root = tempfile::tempdir().unwrap();
-        let rank_dir = root.path().join("rank-00000");
-        std::fs::create_dir(&rank_dir).unwrap();
-        let partial = rank_dir.join(".manifest.json.partial");
-        std::fs::write(&partial, b"{\"format\":").unwrap();
-
-        assert!(!rank_manifests_ready(root.path(), 1));
-
-        std::fs::rename(partial, rank_dir.join("manifest.json")).unwrap();
-        assert!(rank_manifests_ready(root.path(), 1));
+        checkpoint::export_distributed_adapter_checkpoint(
+            final_path,
+            generation,
+            &parallel,
+            adapter_id,
+            |staging| {
+                <Self as TrainingSession>::save_checkpoint(
+                    self,
+                    staging
+                        .to_str()
+                        .context("distributed export staging path is not UTF-8")?,
+                )
+                .map(|_| ())
+            },
+        )
     }
 }
 
@@ -570,9 +377,7 @@ impl TrainingSession for Qwen36Session {
         } else {
             ParallelTopology::from_env_with_world_size(world_size)?
         };
-        if topology.pipeline_model_parallel_size() != 1
-            || topology.context_parallel_size() != 1
-        {
+        if topology.pipeline_model_parallel_size() != 1 || topology.context_parallel_size() != 1 {
             return Err(anyhow!(
                 "native Qwen server does not support PP or CP (tp={} pp={} dp={} ep={} cp={})",
                 topology.tensor_model_parallel_size(),
@@ -1073,7 +878,10 @@ impl TrainingSession for Qwen36Session {
             adam_m.push(all_adam_m[optimizer_index + 1].shallow_clone());
             adam_v.push(all_adam_v[optimizer_index].shallow_clone());
             adam_v.push(all_adam_v[optimizer_index + 1].shallow_clone());
-            fixed_shard_layouts.push(lora_tp_shard_layout(slot.module, &runtime_config));
+            fixed_shard_layouts.push(checkpoint::lora_tp_shard_layout(
+                slot.module,
+                &runtime_config,
+            ));
             fixed_slot_identities.push(checkpoint::LoraSlotIdentity {
                 index: slot.index,
                 layer: slot.layer,
@@ -1088,7 +896,7 @@ impl TrainingSession for Qwen36Session {
                 let shard_layouts = slots
                     .iter()
                     .filter(|slot| slot.active)
-                    .map(|slot| lora_tp_shard_layout(slot.module, &runtime_config))
+                    .map(|slot| checkpoint::lora_tp_shard_layout(slot.module, &runtime_config))
                     .collect::<Vec<_>>();
                 let mut dynamic_a = Vec::new();
                 let mut dynamic_b = Vec::new();
@@ -1260,7 +1068,7 @@ impl TrainingSession for Qwen36Session {
         let expected_fixed_layouts = fixed_slots
             .iter()
             .filter(|slot| slot.active)
-            .map(|slot| lora_tp_shard_layout(slot.module, &runtime_config))
+            .map(|slot| checkpoint::lora_tp_shard_layout(slot.module, &runtime_config))
             .collect::<Vec<_>>();
         let expected_fixed_identities = fixed_slots
             .iter()
@@ -1297,7 +1105,7 @@ impl TrainingSession for Qwen36Session {
                 let expected_layouts = expected_slots
                     .iter()
                     .filter(|slot| slot.active)
-                    .map(|slot| lora_tp_shard_layout(slot.module, &runtime_config))
+                    .map(|slot| checkpoint::lora_tp_shard_layout(slot.module, &runtime_config))
                     .collect::<Vec<_>>();
                 let expected_identities = expected_slots
                     .iter()

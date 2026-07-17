@@ -1448,6 +1448,9 @@ impl CppTrainingContext {
                 count as i64,
             )
         };
+        if imported < 0 {
+            anyhow::bail!("native Adam optimizer state import failed");
+        }
         Ok(imported)
     }
 }

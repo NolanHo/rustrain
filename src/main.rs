@@ -238,8 +238,22 @@ fn dispatch_train(config_path: &Path, resume_from: Option<PathBuf>) -> Result<()
     validate_config(&config)?;
 
     let run_paths = prepare_run_directory(&config.run)?;
-    let _log_guard = init_logging(&run_paths.logs)?;
-    write_resolved_config(&config, &run_paths.resolved_config)?;
+    let world_size = std::env::var("WORLD_SIZE")
+        .ok()
+        .map(|value| value.parse::<usize>().context("WORLD_SIZE must be a usize"))
+        .transpose()?
+        .unwrap_or(1);
+    let rank = std::env::var("RANK")
+        .ok()
+        .map(|value| value.parse::<usize>().context("RANK must be a usize"))
+        .transpose()?
+        .unwrap_or(0);
+    let rank_log_dir =
+        rustrain_core::runtime::prepare_rank_log_directory(&run_paths, rank, world_size)?;
+    let _log_guard = init_logging(&rank_log_dir)?;
+    if rank == 0 {
+        write_resolved_config(&config, &run_paths.resolved_config)?;
+    }
 
     info!(config_path = %config_path.display(), "loaded config");
     info!(run_dir = %run_paths.root.display(), "created run directory");

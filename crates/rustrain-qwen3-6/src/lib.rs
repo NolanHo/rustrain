@@ -1,6 +1,7 @@
 #![allow(unused_imports)]
 #![allow(dead_code)]
 
+pub mod checkpoint;
 pub mod config;
 pub mod kernel;
 pub mod lora;
