@@ -5,10 +5,10 @@
 ## 结论
 
 - 模型语义：Qwen3.5 dense、Qwen3.6 dense/MoE 的 native forward/backward 路径已经覆盖 hybrid full attention、GDN、MoE、MTP 和 LoRA 目标模块；已有配置解析、合成 oracle、集成测试及 H20 native smoke 证据，但尚未完成真实 35B/3.6 权重的长时间训练验证。
-- 已实现并可验证的分布式子集：MoE expert parallel，以及 replicated LoRA 的 data parallel；梯度累积和 dynamic multi-LoRA 已有 logical-step 边界。DP 动态租户按 adapter token count 加权，sharded A2A native 路径会保留 source flattened row 来恢复租户，并按全局租户 token count 归一化。
-- 性能：MoE grouped dispatch 相对逐 expert matmul 的已有 microbenchmark 为约 3.70x（E=32, N=4096, H=2048, I=768，结果误差为 0）；这不是端到端训练吞吐或 Megatron 对比。
-- 已实现 LoRA latent-rank TP-only、frozen full-attention TP、frozen GDN TP，以及 frozen dense SwiGLU MLP TP。GDN 按 K/V head group 切分复合 QKV、depthwise conv、Z/A/B、A_log/dt_bias 和 out-proj input columns；fixed 与 selected dynamic LoRA 使用 projection-aware shard 和梯度 reduction。MoE/embedding/LM-head 仍复制，MLP LoRA 在 base TP 下暂拒绝；PP/CP 和 TP 与 EP/DP 的组合仍未实现。
-- 因此当前实现不能宣称“Megatron-LM 级别”。它是一个计算集中在 C++ 的 LoRA/EP/DP 子集，离 Megatron 的完整并行和通信重叠仍有实质差距。
+- 已实现并可验证的分布式子集：独立且可组合的 LoRA TP、MoE EP 和 expert-DP process groups，包含 TP2 x EP2 和 TP2 x DP2 native oracle。DP 动态租户按 adapter token count 加权，sharded A2A 保留 source flattened row 来恢复租户，并按全局租户 token count 归一化。
+- 性能：ABI19 将 top-k assignment 合并为单次 packed dispatch/combine，并对接收 token 做一次 expert sort 和 grouped GEMM。H20 TP2 x EP2 端到端 fixed-LoRA benchmark 按每步 TP x EP 全局最慢 rank 计时，p50 从 `9.007 ms` 降到 `6.499 ms`，unique-token throughput 从 `56.84k/s` 提升到 `78.78k/s`；这是 native legacy/packed 对照，不是 Megatron 对比。
+- 已实现 LoRA latent-rank TP、frozen full-attention/GDN/dense SwiGLU MLP TP，以及 embedding/LM-head/vocabulary TP。GDN 按 K/V head group 切分复合 QKV、depthwise conv、Z/A/B、A_log/dt_bias 和 out-proj input columns；fixed 与 selected dynamic LoRA 使用 projection-aware shard 和梯度 reduction。TP 可与 EP 或 expert-DP 组合，但 routed base expert 权重仍在 TP 轴复制；PP/CP 仍未实现。
+- 因此当前实现不能宣称“Megatron-LM 级别”。它是一个计算集中在 C++ 的 LoRA TP/EP/expert-DP 子集，离 Megatron 的完整并行和通信重叠仍有实质差距。
 
 ## 当前能力矩阵
 
@@ -23,7 +23,7 @@
 | microbatch accumulation | 已实现子集 | non-final microbatch 只 backward，final microbatch 才 optimizer；FP32 accumulator 存储/聚合，autograd leaf backward 仍为 BF16 |
 | replicated data parallel | 已实现 | logical-step 边界同步 replicated LoRA；EP expert 参数不走该 reduction |
 | expert parallel | 已实现子集 | 默认 routed-output all-reduce；gated variable-split A2A 已验证 fixed-LoRA 和 native dynamic-LoRA data sharding；GPU-only split planning、异步 overlap 和 DeepEP backend 未实现 |
-| tensor parallel | full attention + GDN + dense MLP 子集 | full attention 与 GDN 均使用 head-aligned ColumnParallel input projection 和 RowParallel output projection；GDN 的 flat QKV/conv 按 `[Q_local|K_local|V_local]` 重排。两种 attention 的 fixed/dynamic LoRA 均通过 TP2 full-reference smoke；dense gate/up/down base 权重按 intermediate 维切分；MoE/embedding/LM-head 仍不切分，MLP LoRA/MTP 暂拒绝 |
+| tensor parallel | attention + GDN + dense MLP + vocabulary 子集 | full attention 与 GDN 使用 head-aligned ColumnParallel input projection 和 RowParallel output projection；GDN 的 flat QKV/conv 按 `[Q_local|K_local|V_local]` 重排。embedding/LM-head/CE 使用 vocabulary shard；TP 已与 EP 和 expert-DP 分别组合验证。routed base expert 仍在 TP 轴复制，尚无 ETP weight shard |
 | pipeline parallel | 未实现于 Qwen native | 没有 stage 切分、microbatch scheduler 或 activation send/recv |
 | context parallel | 未实现于 Qwen native | 没有 ring attention、跨 rank KV/索引合并 |
 | distributed checkpoint | 已实现子集 | v4 记录 projection layout、replicated tensor geometry 和 fixed slot identity，并验证 same-topology rank shard；v3 仅兼容 latent-rank checkpoint，旧 attention LoRA 因形状不可迁移而明确拒绝；跨 topology reshard 和 PP/CP 未实现 |
@@ -38,7 +38,7 @@ Megatron 的通用 MLP 使用 ColumnParallel fc1、local gated activation 和 Ro
 
 PP 会把层分到不同 stage 并使用 1F1B 等调度；CP 会在序列和 attention state 上做跨 rank 通信。当前 Qwen native `TrainingContext` 仍在每个进程执行完整层栈，因此仅增加 PP/CP 配置不能得到正确语义。
 
-当前 DP/EP 也不是完整 Megatron 语义：DP 同步 replicated LoRA 梯度并按租户 token count 归一化，expert 参数留在 EP rank；EP 默认使用 routed-output all-reduce，实验 gate 已加入 variable-split dispatch/inverse combine 和 fixed/dynamic LoRA data sharding。dynamic native path 的 source row metadata 已随 token index 传输，但仍逐 top-k 执行 host-visible count sync，没有 fused permutation、GPU-only split planning、异步 overlap 或 DeepEP backend。server 的 `TrainMultiLora` 目前向各 worker 广播相同 batch，因此不能把它当作 source-sharded 服务吞吐。
+当前 DP/EP 仍不是完整 Megatron 语义：DP 同步 replicated LoRA 梯度并按租户 token count 归一化，expert 参数留在 EP rank；sharded EP 使用 variable-split dispatch/inverse combine 和 fixed/dynamic LoRA data sharding。ABI19 已把所有 top-k assignment 合并为一次 dispatch，并把 local expert 计算合并为 grouped GEMM，但 count planning 仍可见于 host，且没有 fused permutation、异步 overlap 或 DeepEP backend。server 的 `TrainMultiLora` 目前向各 worker 广播相同 batch，因此不能把它当作 source-sharded 服务吞吐。
 
 ### 优化器与恢复
 
@@ -46,11 +46,13 @@ PP 会把层分到不同 stage 并使用 1F1B 等调度；CP 会在序列和 att
 
 ### 性能工程
 
-当前粗粒度 C++ FFI、grouped MoE、GDN head TP 和 activation checkpoint/offload 是有效优化，但 full attention 仍通过 ATen linear/SDPA，QKV 未融合，TP collective 同步执行，vocab 路径仍复制。GDN fused backward 通过反除 decay 重建历史 state；真实 time-step bias 下可运行，但极小 decay 的长序列会数值不稳，仍需 state checkpoint/chunk backward 替代。尚无 Megatron/Transformer Engine 级别的端到端数据：没有完整模型在同一 GPU、序列长度、microbatch、精度和通信配置下的 tokens/s、显存、扩展效率对照，也没有 FP8/FP4 参数与 fused attention/DeepEP 的 Qwen 路径。
+当前粗粒度 C++ FFI、packed/grouped MoE、GDN head TP、vocabulary TP 和 activation checkpoint/offload 是有效优化，但 full attention 仍通过 ATen linear/SDPA，QKV 未融合，TP collective 同步执行。GDN fused backward 通过反除 decay 重建历史 state；真实 time-step bias 下可运行，但极小 decay 的长序列会数值不稳，仍需 state checkpoint/chunk backward 替代。尚无 Megatron/Transformer Engine 级别的完整模型端到端数据：没有同一 GPU、序列长度、microbatch、精度和通信配置下的 tokens/s、显存、扩展效率对照，也没有 FP8/FP4 参数与 fused attention/DeepEP 的 Qwen 路径。
 
 ABI15 synthetic GDN TP benchmark 使用 3 层、S=512、H=2048、16 K heads、32 V heads 和 LoRA rank 8。在 B=2 时 single/TP2 p50 为 `81.10/约 76.06 ms`，只有约 `1.07x`；在 B=8 时为 `303.25/约 158.04 ms`，达到约 `1.92x`，每卡 observed resident 从 `4.59 GiB` 降到 `3.54 GiB`。`nsys` 的 B=2 TP2 trace 中 fused delta-rule backward 占 GPU kernel time `80.3%`、forward 占 `7.4%`，NCCL all-reduce 合计低于 `0.4%`。小 batch 下 single 和 TP2 都只需相近的 persistent-block wave 数，因此不能期待 head TP 自动加速；dynamic multi-LoRA batching 提高 BH 后才接近线性 scaling。这是 synthetic native 结果，不是完整模型或 matched Megatron 对比。
 
 本次 native benchmark 没有证明 gated A2A 的端到端 step-time 优势：在该小型 workload 上 sharded A2A 的中位 step 反而比 legacy 高约 `23%`。它没有实现 DeepEP 的 fused permutation、GPU-only split planning 或通信计算 overlap，也没有覆盖 H=`2048`/E=`256` 的完整 Qwen3.6 workload。legacy 模式复制输入 batch，因此必须同时报告唯一样本吞吐，不能只看所有 rank 的 processed tokens/s。
+
+上述结果是 ABI0 的纯 EP2 小模型历史基线。ABI19 在 TP2 x EP2、相同 source-sharded 语义下做了 matched routing-slot/packed 对照，并在每步训练后沿 EP、expert-DP、TP 依次做 MAX，从而让 4 个 rank 使用相同的全局最慢 rank 样本：p50 `9.007 -> 6.499 ms`，unique-token throughput `56.84k -> 78.78k/s`。Nsight Systems process-tree trace 同时记录到 CUDA kernel launch `6812 -> 5168`、NCCL SendRecv `96 -> 48` 和 AllGather `24 -> 12`；该 trace 采集于 benchmark-only world-max metrics collective 加入之前，因此不包含这个计时区间外的聚合。它证明 packed dispatcher 对当前 native 路径有效，但仍不等于 DeepEP 或 Megatron 的重叠能力。
 
 目标 H20 的 ABI1 环境有 PyTorch 2.12.1、Triton 和 NumPy，但没有 Megatron、Transformer Engine、FLA、DeepEP、flash-attn、Apex 或缓存的兼容 prebuilt wheel。虽然本地 Megatron Lite 源码包含 Qwen3.5 LoRA adapter，目标机仍不具备其高性能依赖。因此当前不能诚实地产出 matched Megatron-LoRA benchmark，且本工作没有通过 JIT 或自构建依赖绕过该限制。
 
@@ -64,8 +66,8 @@ ABI15 的两层 GDN base-TP smoke 覆盖复合 QKV/conv head shard、Z/A/B/A_log
 
 ## 继续达到 Megatron 级别所需的最小工作包
 
-1. 把现有 5D TP/PP/DP/EP/CP topology contract 落成可组合 runtime process groups、launcher 和 checkpoint rank mapping；当前 native 仍拒绝多轴组合。
-2. 补齐 MoE、embedding/LM-head/CE 的 TP shard，并为 dense MLP 增加 projection-aware LoRA、fused gate/up FC1 和 MTP 支持；为 GDN 增加稳定的 chunk/state-checkpoint backward 与 sequence/context parallel，为 full attention 融合 QKV/SDPA 并增加 sequence parallel；为 PP 实现 stage forward/backward 与 1F1B scheduler；为 CP 实现 ring attention/state exchange。
+1. 在现有 TP x EP 和 TP x expert-DP 组合上补齐 TP x EP x expert-DP 三轴 oracle、PP/CP runtime process groups、launcher、scheduler 和 checkpoint rank mapping。
+2. 为 routed base expert 增加 ETP weight shard 和 TP reduction，并为 dense MLP 增加 fused gate/up FC1 与 MTP 支持；为 GDN 增加稳定的 chunk/state-checkpoint backward 与 sequence/context parallel，为 full attention 融合 QKV/SDPA 并增加 sequence parallel；为 PP 实现 stage forward/backward 与 1F1B scheduler；为 CP 实现 ring attention/state exchange。
 3. 将 EP dispatch/combine 替换为 fused/异步路径，并测量通信与计算重叠。
 4. 为 checkpoint 增加跨 topology reshard、可恢复的 pending accumulation state，并为旧 v3 attention checkpoint 提供离线迁移工具。
 5. 在固定硬件和 workload 上，与 Megatron-LM 记录 tokens/s、step time、峰值显存、通信占比和 loss 曲线。

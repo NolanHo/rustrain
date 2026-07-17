@@ -50,18 +50,22 @@ Not yet verified or implemented: the three-axis TP x EP x expert-DP combination,
 - ABI18 working tree: native topology owns independent TP, EP, and expert-DP communicators and validates `WORLD_SIZE=TP_SIZE*EP_SIZE*DP_SIZE`. Dense LoRA parameters synchronize and reduce over EP and expert-DP replicas; routed expert parameters remain local to EP and reduce only over expert-DP. TP-latent expert LoRA copies its input into the TP autograd region so backward sums the input gradient exactly once. CLI weight loading composes attention/GDN/vocabulary TP shards with expert EP shards; the server explicitly rejects the source-sharding contract it cannot yet represent.
 - H20 target: ABI18 TP2 x EP2 sharded-A2A smoke passed fixed Q and grouped expert gate-up/down LoRA against a full-model reference with unequal EP token counts. Standard Adam parameter oracles were zero on all four ranks; fixed FP32 m/v maxima were `1.01e-4` / `3.08e-9`. Selected dynamic multi-LoRA produced positive selected updates, exactly zero unselected updates, and clocks `[1,0]`; invalid topology and MTP guards fired.
 - H20 target: ABI18 regressions passed TP2 x DP2, GDN TP2 fixed/dynamic, and pure EP2 sharded A2A fixed/dynamic tests. GDN fixed/dynamic FP32 m/v maxima remained within `1.07e-5` / `1.22e-9`, and all standard Adam formula errors were zero. Pure EP fixed expert parameter differences were bounded by BF16 (`9.62e-4` maximum) with m/v maxima `1.22e-5` / `3.92e-9`.
+- ABI19 packs all top-k assignments into one sharded EP dispatch/combine, sorts received rows once, and schedules base and aligned fixed-LoRA expert projections with prebuilt PyTorch `_grouped_mm`. Base grouped GEMM no longer falls back when the local LoRA rank is unaligned; only that low-rank delta uses per-expert matmul, followed by one packed TP reduction. `QWEN36_EP_A2A_PACKED=0` retains the old routing-slot loop for diagnosis.
+- H20 target: ABI19 default-packed TP2 x EP2 fixed/dynamic smoke passed. The unaligned local-rank branch retained the ABI18 full-reference bounds (`1.98e-3` maximum BF16 parameter difference, `9.92e-5` / `3.02e-9` FP32 m/v maxima, zero standard-Adam error), and dynamic adapters kept positive selected updates, exactly zero isolated updates, and clocks `[1,0]`.
+- H20 target: matched native TP2 x EP2 fixed-LoRA benchmark (`B=2`, `S=128`, `H=1024`, `E=8`, `I=2048`, top-k 2, global rank 16, one layer, warmup 5, iterations 30) aggregates each measured step with a world-wide maximum across the TP x EP grid. It reduced p50 step time from `9.007 ms` to `6.499 ms` and increased unique-token throughput from `56.84k/s` to `78.78k/s` (`27.8%` lower p50, `38.6%` higher throughput). Allocator peak stayed near `0.26 GiB`; the larger packed workspace increased observed resident memory by at most `0.09 GiB` in this run.
+- H20 target: matched Nsight Systems traces recorded `6812 -> 5168` `cudaLaunchKernel` calls, NCCL SendRecv `96 -> 48`, AllGather `24 -> 12`, and BF16 AllReduce `216 -> 120` across four ranks for one warmup plus two measured steps. These traces predate and therefore exclude the benchmark-only world-max metrics collective, which runs outside step timing. The counts include initialization, so they are conservative end-to-end process-tree evidence rather than isolated dispatcher counts.
 
 # Megatron-LM Performance Gap
 
-ABI18 establishes correct process groups and update ownership, but it does not
-close the MoE throughput gap. Base expert weights are replicated across TP
-ranks instead of using expert tensor parallelism. The native dispatcher still
-iterates routing slots and local experts, launches variable-split A2A work on
-the current stream, and performs TP LoRA reductions around individual expert
-paths. It lacks Megatron-style fused permutation, capacity-aligned dispatch,
-communication overlap, grouped expert GEMM scheduling across ETP, and inverse
-dispatch fusion. These are the next performance slice; the current evidence is
-correctness and regression evidence, not a matched throughput claim.
+ABI19 removes the top-k routing loop and groups local expert work, but it does
+not close the Megatron MoE throughput gap. Base expert weights are still
+replicated across TP ranks instead of using expert tensor parallelism. Split
+planning still has host-visible counts, dispatch and grouped GEMM use the
+current stream without communication overlap, and permutation/combine remain
+separate ATen operations. Capacity-aligned routing, fused permutation and
+inverse permutation, ETP-aware grouped GEMM, shared-expert overlap, and a
+DeepEP-class backend remain future work. The current evidence is a matched
+native legacy-versus-packed result, not a matched Megatron-LM comparison.
 
 # Decisions During Execution
 
@@ -75,6 +79,6 @@ correctness and regression evidence, not a matched throughput claim.
 
 # Verification
 
-Passed: `cargo check -p rustrain-core -p rustrain-qwen3-6 -p rustrain-server` (with the repository host venv), focused runtime/topology unit tests, remote ABI8-ABI14 native smokes listed above, ABI16 TP2 x DP2 and GDN TP2 smokes, ABI17 TP2 tied/untied vocabulary parity plus world4 custom-rank-order TPDP smokes, and ABI18 TP2 x EP2, TP2 x DP2, GDN TP2, and pure EP2 sharded-A2A native smokes.
+Passed: `cargo check -p rustrain-core -p rustrain-qwen3-6 -p rustrain-server` (with the repository host venv), focused runtime/topology unit tests, remote ABI8-ABI14 native smokes listed above, ABI16 TP2 x DP2 and GDN TP2 smokes, ABI17 TP2 tied/untied vocabulary parity plus world4 custom-rank-order TPDP smokes, ABI18 TP2 x EP2, TP2 x DP2, GDN TP2, and pure EP2 sharded-A2A native smokes, and ABI19 default-packed TP2 x EP2 fixed/dynamic smoke plus fixed/dynamic benchmarks and matched profiler traces.
 
-Not run: TP x EP x expert-DP, PP/CP, server-side source-sharded dynamic dispatch, TP x EP checkpoint resume, heterogeneous dynamic adapter signatures, dynamic+MTP, cross-topology resharding, and a matched Megatron performance benchmark. No dependency installation or JIT workaround was used for ABI18; the implementation uses the existing prebuilt PyTorch ABI1 and NCCL runtime.
+Not run: TP x EP x expert-DP, PP/CP, server-side source-sharded dynamic dispatch, TP x EP checkpoint resume, heterogeneous dynamic adapter signatures, dynamic+MTP, cross-topology resharding, and a matched Megatron performance benchmark. No dependency installation or JIT workaround was used for ABI19; the implementation uses the existing prebuilt PyTorch ABI1 and NCCL runtime.

@@ -11,8 +11,12 @@ case "$mode" in
         test_name=native_ep_smoke
         test_source=crates/rustrain-qwen3-6/tests/native_ep_smoke.cpp
         ;;
+    bench)
+        test_name=native_tp_ep_bench
+        test_source=crates/rustrain-qwen3-6/tests/native_tp_ep_bench.cpp
+        ;;
     *)
-        echo "usage: $0 [smoke|ep-smoke]" >&2
+        echo "usage: $0 [smoke|ep-smoke|bench]" >&2
         exit 2
         ;;
 esac
@@ -174,7 +178,7 @@ cu13_lib="$site_packages/nvidia/cu13/lib"
 export LD_LIBRARY_PATH="$native_dir:$torch_lib:$nccl_lib:$cuda_home/lib64:$cu13_lib:${LD_LIBRARY_PATH:-}"
 export RUSTRAIN_NCCL_RUN_ID="${RUSTRAIN_NCCL_RUN_ID:-qwen36-tp-ep-$$}"
 
-if [[ "$mode" == "smoke" ]]; then
+if [[ "$mode" == "smoke" || "$mode" == "bench" ]]; then
     TP_SIZE=2 EP_SIZE=2 DP_SIZE=1 \
     QWEN36_EP_A2A=1 QWEN36_EP_A2A_SHARDED=1 \
         "$python_bin" -m torch.distributed.run --standalone \

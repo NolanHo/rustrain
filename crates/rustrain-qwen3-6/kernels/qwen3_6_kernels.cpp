@@ -56,9 +56,11 @@ static at::Tensor tp_copy_lora_input(
 
 static at::Tensor rms_norm(const at::Tensor& input, const at::Tensor& weight, double eps);
 
-static bool env_enabled(const char* name) {
+static bool env_enabled(const char* name, bool fallback = false) {
     const char* value = std::getenv(name);
-    return value && value[0] != '\0' && std::strcmp(value, "0") != 0;
+    if (!value || value[0] == '\0') return fallback;
+    return std::strcmp(value, "0") != 0 &&
+        std::strcmp(value, "false") != 0;
 }
 
 static std::string nccl_sync_dir() {
@@ -924,6 +926,8 @@ struct Qwen36A2ADispatchFunction : public torch::autograd::Function<Qwen36A2ADis
             "ncclCommUserRank failed");
         TORCH_CHECK(expert_count > 0 && expert_indices.scalar_type() == at::kLong,
             "invalid EP A2A expert metadata");
+        TORCH_CHECK(expert_indices.numel() == token_indices.numel(),
+            "EP A2A expert and source-token metadata must have equal length");
         auto stream = c10::cuda::getCurrentCUDAStream(input.device().index()).stream();
         const int64_t hidden = input.size(1);
         std::vector<at::Tensor> indices(world);
@@ -934,9 +938,11 @@ struct Qwen36A2ADispatchFunction : public torch::autograd::Function<Qwen36A2ADis
             indices[dst] = at::nonzero(mask).reshape({-1});
             send_counts[dst] = static_cast<int32_t>(indices[dst].numel());
         }
-        auto count_opts = at::TensorOptions().device(input.device()).dtype(at::kInt);
-        auto local_counts = at::empty({world}, count_opts);
-        auto host_counts = at::empty({world}, at::TensorOptions().device(at::kCPU).dtype(at::kInt));
+        auto gpu_count_opts = at::TensorOptions()
+            .device(input.device()).dtype(at::kInt);
+        auto cpu_count_opts = at::TensorOptions().device(at::kCPU).dtype(at::kInt);
+        auto local_counts = at::empty({world}, gpu_count_opts);
+        auto host_counts = at::empty({world}, cpu_count_opts);
         std::memcpy(host_counts.data_ptr<int32_t>(), send_counts.data(), sizeof(int32_t) * world);
         local_counts.copy_(host_counts);
         auto recv_counts = qwen36_a2a_counts(local_counts, comm, stream);
@@ -946,8 +952,8 @@ struct Qwen36A2ADispatchFunction : public torch::autograd::Function<Qwen36A2ADis
             recv_offsets[i + 1] = recv_offsets[i] + recv_counts[i];
         }
         auto send_index = at::cat(indices, 0);
-        auto send_hidden = input.index_select(0, send_index).contiguous();
         auto send_token = token_indices.index_select(0, send_index).contiguous();
+        auto send_hidden = input.index_select(0, send_token).contiguous();
         auto send_expert = expert_indices.index_select(0, send_index).contiguous();
         auto recv_hidden = at::empty({recv_offsets.back(), hidden}, input.options());
         auto recv_token = at::empty({recv_offsets.back()}, token_indices.options());
@@ -991,13 +997,13 @@ struct Qwen36A2ADispatchFunction : public torch::autograd::Function<Qwen36A2ADis
         }
         TORCH_CHECK(ncclGroupEnd() == ncclSuccess, "A2A dispatch group failed");
         auto recv_local = recv_expert - rank * expert_count;
-        auto send_counts_tensor = at::empty({world}, count_opts);
-        auto recv_counts_tensor = at::empty({world}, count_opts);
-        std::memcpy(host_counts.data_ptr<int32_t>(), send_counts.data(), sizeof(int32_t) * world);
-        send_counts_tensor.copy_(host_counts);
-        std::memcpy(host_counts.data_ptr<int32_t>(), recv_counts.data(), sizeof(int32_t) * world);
-        recv_counts_tensor.copy_(host_counts);
-        ctx->save_for_backward({input, send_index, send_counts_tensor, recv_counts_tensor});
+        auto send_counts_tensor = at::empty({world}, cpu_count_opts);
+        auto recv_counts_tensor = at::empty({world}, cpu_count_opts);
+        std::memcpy(send_counts_tensor.data_ptr<int32_t>(), send_counts.data(),
+            sizeof(int32_t) * world);
+        std::memcpy(recv_counts_tensor.data_ptr<int32_t>(), recv_counts.data(),
+            sizeof(int32_t) * world);
+        ctx->save_for_backward({input, send_token, send_counts_tensor, recv_counts_tensor});
         ctx->saved_data["comm"] = comm_ptr;
         ctx->saved_data["expert_count"] = expert_count;
         return {recv_hidden, recv_token, recv_local, send_index, send_counts_tensor, recv_counts_tensor};
@@ -1008,7 +1014,7 @@ struct Qwen36A2ADispatchFunction : public torch::autograd::Function<Qwen36A2ADis
     ) {
         auto saved = ctx->get_saved_variables();
         auto input = saved[0];
-        auto send_index = saved[1];
+        auto send_token = saved[1];
         auto send_counts = saved[2].to(at::TensorOptions().device(at::kCPU));
         auto recv_counts = saved[3].to(at::TensorOptions().device(at::kCPU));
         const int world = send_counts.numel();
@@ -1034,7 +1040,7 @@ struct Qwen36A2ADispatchFunction : public torch::autograd::Function<Qwen36A2ADis
             TORCH_CHECK(err == ncclSuccess, "A2A backward send failed: ", ncclGetErrorString(err));
         }
         TORCH_CHECK(ncclGroupEnd() == ncclSuccess, "A2A dispatch backward group failed");
-        grad_input.index_add_(0, send_index, returned);
+        grad_input.index_add_(0, send_token, returned);
         return {grad_input, at::Tensor(), at::Tensor(), at::Tensor(), at::Tensor()};
     }
 };
@@ -1210,76 +1216,170 @@ static at::Tensor moe_routed_a2a(
     auto routed_output = at::zeros_like(flat);
     auto token_indices = at::arange(
         flat.size(0), at::TensorOptions().device(flat.device()).dtype(at::kLong));
-    for (int64_t kk = 0; kk < top_k; ++kk) {
-        auto expert_indices = topk_indices.select(-1, kk).contiguous();
-        // `received_tokens` preserves the source flattened row index through
-        // dispatch. Dynamic multi-LoRA uses floor_divide(row, seq) to recover
-        // the tenant/sample row, so sharded A2A does not need a second host
-        // metadata exchange for adapter IDs.
-        auto dispatched = Qwen36A2ADispatchFunction::apply(
-            flat, expert_indices, token_indices, expert_count,
-            static_cast<int64_t>(reinterpret_cast<uintptr_t>(comm)));
-        auto received = dispatched[0];
-        auto received_tokens = dispatched[1];
-        auto received_experts = dispatched[2];
-        auto send_index = dispatched[3];
-        auto send_counts = dispatched[4];
-        auto recv_counts = dispatched[5];
-        auto local_output = at::zeros_like(received);
-        for (int64_t e_local = 0; e_local < expert_count; ++e_local) {
-            auto rows = at::nonzero(received_experts == e_local).reshape({-1});
-            if (rows.numel() == 0) continue;
-            auto selected = received.index_select(0, rows);
-            auto selected_tokens = received_tokens.index_select(0, rows);
-            auto selected_experts = received_experts.index_select(0, rows);
-            auto gu = at::matmul(selected, experts_gate_up.select(0, e_local).t());
-            if (expert_lora.gate_up_a && expert_lora.gate_up_b) {
-                auto a = expert_lora.gate_up_a->select(0, e_local);
-                auto b = expert_lora.gate_up_b->select(0, e_local);
-                auto lora_input = tp_copy_lora_input(training_ctx, selected);
-                auto delta = at::matmul(at::matmul(lora_input, a.t()), b.t()) *
-                    expert_lora.scaling;
-                gu = gu + tp_allreduce_lora_delta(training_ctx, delta);
+    auto run_local_experts = [&](const at::Tensor& received,
+                                 const at::Tensor& received_tokens,
+                                 const at::Tensor& received_experts) {
+        auto [sorted_experts, expert_order] = received_experts.sort(0);
+        auto selected = received.index_select(0, expert_order);
+        auto selected_tokens = received_tokens.index_select(0, expert_order);
+        auto counts = at::bincount(
+            sorted_experts, c10::nullopt, expert_count);
+        auto offsets = counts.cumsum(0).to(at::kInt);
+        auto sorted_output = at::zeros_like(selected);
+
+        if (selected.size(0) > 0) {
+            at::Tensor expert_out;
+#if RUSTRAIN_HAS_ATEN_GROUPED_MM
+            const bool use_grouped_mm =
+                !env_enabled("QWEN36_DISABLE_GROUPED_MM") &&
+                selected.scalar_type() == at::kBFloat16 &&
+                hidden_dim % 8 == 0 && intermediate % 8 == 0;
+            if (use_grouped_mm) {
+                at::Tensor counts_cpu;
+                auto fixed_lora_delta = [&](const at::Tensor& input,
+                                            const at::Tensor& a,
+                                            const at::Tensor& b) {
+                    auto lora_input = tp_copy_lora_input(training_ctx, input);
+                    at::Tensor delta;
+                    if (a.size(1) % 8 == 0) {
+                        auto low_rank = at::_grouped_mm(
+                            lora_input, a.transpose(1, 2), offsets);
+                        delta = at::_grouped_mm(
+                            low_rank, b.transpose(1, 2), offsets);
+                    } else {
+                        if (!counts_cpu.defined()) {
+                            counts_cpu = counts.to(
+                                at::TensorOptions().device(at::kCPU));
+                        }
+                        std::vector<at::Tensor> chunks;
+                        chunks.reserve(expert_count);
+                        int64_t offset = 0;
+                        for (int64_t e_local = 0;
+                             e_local < expert_count; ++e_local) {
+                            const int64_t rows = counts_cpu.index(
+                                {e_local}).item<int64_t>();
+                            auto expert_input = lora_input.narrow(
+                                0, offset, rows);
+                            chunks.push_back(at::matmul(
+                                at::matmul(
+                                    expert_input, a.select(0, e_local).t()),
+                                b.select(0, e_local).t()));
+                            offset += rows;
+                        }
+                        delta = at::cat(chunks, 0);
+                    }
+                    return tp_allreduce_lora_delta(
+                        training_ctx, delta * expert_lora.scaling);
+                };
+                auto gu = at::_grouped_mm(
+                    selected, experts_gate_up.transpose(1, 2), offsets);
+                if (expert_lora.gate_up_a && expert_lora.gate_up_b) {
+                    gu = gu + fixed_lora_delta(
+                        selected, *expert_lora.gate_up_a,
+                        *expert_lora.gate_up_b);
+                }
+                if (expert_gate_up_lora) {
+                    gu = gu + dynamic_expert_lora_delta(
+                        training_ctx, selected, selected_tokens,
+                        sorted_experts, batch, seq, expert_gate_up_lora);
+                }
+                auto activated = fused_swiglu_op(
+                    gu.narrow(-1, 0, intermediate),
+                    gu.narrow(-1, intermediate, intermediate), 0.0);
+                expert_out = at::_grouped_mm(
+                    activated, experts_down.transpose(1, 2), offsets);
+                if (expert_lora.down_a && expert_lora.down_b) {
+                    expert_out = expert_out + fixed_lora_delta(
+                        activated, *expert_lora.down_a,
+                        *expert_lora.down_b);
+                }
+                if (expert_down_lora) {
+                    expert_out = expert_out + dynamic_expert_lora_delta(
+                        training_ctx, activated, selected_tokens,
+                        sorted_experts, batch, seq, expert_down_lora);
+                }
+            } else
+#endif
+            {
+                auto counts_cpu = counts.to(
+                    at::TensorOptions().device(at::kCPU));
+                expert_out = at::zeros_like(selected);
+                int64_t offset = 0;
+                for (int64_t e_local = 0; e_local < expert_count; ++e_local) {
+                    const int64_t rows =
+                        counts_cpu.index({e_local}).item<int64_t>();
+                    if (rows > 0) {
+                        auto expert_input = selected.narrow(0, offset, rows);
+                        auto expert_tokens = selected_tokens.narrow(
+                            0, offset, rows);
+                        auto local_experts = sorted_experts.narrow(
+                            0, offset, rows);
+                        auto gu = at::matmul(
+                            expert_input,
+                            experts_gate_up.select(0, e_local).t());
+                        if (expert_lora.gate_up_a && expert_lora.gate_up_b) {
+                            auto lora_input = tp_copy_lora_input(
+                                training_ctx, expert_input);
+                            auto delta = at::matmul(
+                                at::matmul(lora_input,
+                                    expert_lora.gate_up_a->select(
+                                        0, e_local).t()),
+                                expert_lora.gate_up_b->select(0, e_local).t()) *
+                                expert_lora.scaling;
+                            gu = gu + tp_allreduce_lora_delta(
+                                training_ctx, delta);
+                        }
+                        if (expert_gate_up_lora) {
+                            gu = gu + dynamic_expert_lora_delta(
+                                training_ctx, expert_input, expert_tokens,
+                                local_experts, batch, seq,
+                                expert_gate_up_lora);
+                        }
+                        auto activated = fused_swiglu_op(
+                            gu.narrow(-1, 0, intermediate),
+                            gu.narrow(-1, intermediate, intermediate), 0.0);
+                        auto local_out = at::matmul(
+                            activated,
+                            experts_down.select(0, e_local).t());
+                        if (expert_lora.down_a && expert_lora.down_b) {
+                            auto lora_input = tp_copy_lora_input(
+                                training_ctx, activated);
+                            auto delta = at::matmul(
+                                at::matmul(lora_input,
+                                    expert_lora.down_a->select(
+                                        0, e_local).t()),
+                                expert_lora.down_b->select(0, e_local).t()) *
+                                expert_lora.scaling;
+                            local_out = local_out + tp_allreduce_lora_delta(
+                                training_ctx, delta);
+                        }
+                        if (expert_down_lora) {
+                            local_out = local_out + dynamic_expert_lora_delta(
+                                training_ctx, activated, expert_tokens,
+                                local_experts, batch, seq, expert_down_lora);
+                        }
+                        expert_out = expert_out.index_add(
+                            0,
+                            at::arange(offset, offset + rows,
+                                expert_order.options()),
+                            local_out);
+                    }
+                    offset += rows;
+                }
             }
-            if (expert_gate_up_lora) {
-                gu = gu + dynamic_expert_lora_delta(
-                    training_ctx, selected, selected_tokens, selected_experts,
-                    batch, seq, expert_gate_up_lora);
-            }
-            auto activated = fused_swiglu_op(
-                gu.narrow(-1, 0, intermediate),
-                gu.narrow(-1, intermediate, intermediate), 0.0);
-            auto expert_out = at::matmul(
-                activated, experts_down.select(0, e_local).t());
-            if (expert_lora.down_a && expert_lora.down_b) {
-                auto a = expert_lora.down_a->select(0, e_local);
-                auto b = expert_lora.down_b->select(0, e_local);
-                auto lora_input = tp_copy_lora_input(training_ctx, activated);
-                auto delta = at::matmul(at::matmul(lora_input, a.t()), b.t()) *
-                    expert_lora.scaling;
-                expert_out = expert_out +
-                    tp_allreduce_lora_delta(training_ctx, delta);
-            }
-            if (expert_down_lora) {
-                expert_out = expert_out + dynamic_expert_lora_delta(
-                    training_ctx, activated, selected_tokens, selected_experts,
-                    batch, seq, expert_down_lora);
-            }
-            local_output = local_output.index_add(0, rows, expert_out);
+            sorted_output = expert_out;
         }
 
-        // Preserve a zero-valued dependency on every local expert LoRA when a
-        // rank receives no tokens. This keeps optimizer collective order equal
-        // across ranks without changing the output.
+        auto local_output = at::zeros_like(received).index_add(
+            0, expert_order, sorted_output);
+        // Empty destinations still need activation and parameter graph edges
+        // so every rank reaches the same optimizer collectives.
         if (!local_output.requires_grad()) {
-            // Even without routed-expert LoRA, an empty destination must keep
-            // the dispatch activation edge alive. Its zero gradient is sent
-            // back to the source in the inverse dispatch backward.
             at::Tensor anchor = received.sum().to(local_output.scalar_type());
             auto include = [&](const at::Tensor* tensor) {
-                if (!tensor || !tensor->defined() || !tensor->requires_grad()) return;
-                auto value = tensor->sum().to(local_output.scalar_type());
-                anchor = anchor + value;
+                if (!tensor || !tensor->defined() ||
+                    !tensor->requires_grad()) return;
+                anchor = anchor + tensor->sum().to(local_output.scalar_type());
             };
             include(expert_lora.gate_up_a);
             include(expert_lora.gate_up_b);
@@ -1295,17 +1395,52 @@ static at::Tensor moe_routed_a2a(
             }
             local_output = local_output + anchor * 0.0;
         }
+        return local_output;
+    };
 
-        // Expert results return in the source's packed dispatch order. Apply
-        // routing weights on the source rank, then restore source token order;
-        // this keeps router/hidden gradients on the correct source graph.
+    auto dispatch_and_combine = [&](const at::Tensor& assignment_input,
+                                    const at::Tensor& assignment_experts,
+                                    const at::Tensor& assignment_tokens,
+                                    const at::Tensor& assignment_weights) {
+        // `received_tokens` preserves the source flattened row index through
+        // dispatch so dynamic multi-LoRA can recover the tenant/sample row.
+        auto dispatched = Qwen36A2ADispatchFunction::apply(
+            assignment_input, assignment_experts, assignment_tokens,
+            expert_count,
+            static_cast<int64_t>(reinterpret_cast<uintptr_t>(comm)));
+        auto received = dispatched[0];
+        auto received_tokens = dispatched[1];
+        auto received_experts = dispatched[2];
+        auto send_index = dispatched[3];
+        auto send_counts = dispatched[4];
+        auto recv_counts = dispatched[5];
+        auto local_output = run_local_experts(
+            received, received_tokens, received_experts);
         auto returned = Qwen36A2ACombineFunction::apply(
             local_output, send_counts, recv_counts,
             static_cast<int64_t>(reinterpret_cast<uintptr_t>(comm)));
-        auto source_weights = topk_weights.select(-1, kk)
+        auto source_tokens = assignment_tokens.index_select(0, send_index);
+        auto source_weights = assignment_weights
             .index_select(0, send_index).unsqueeze(-1);
         routed_output = routed_output.index_add(
-            0, send_index, returned * source_weights);
+            0, source_tokens, returned * source_weights);
+    };
+
+    if (env_enabled("QWEN36_EP_A2A_PACKED", true)) {
+        auto assignment_tokens = token_indices.unsqueeze(1)
+            .expand({flat.size(0), top_k}).reshape({-1});
+        auto assignment_experts = topk_indices.reshape({-1}).contiguous();
+        auto assignment_weights = topk_weights.reshape({-1}).contiguous();
+        dispatch_and_combine(
+            flat, assignment_experts, assignment_tokens,
+            assignment_weights);
+    } else {
+        for (int64_t kk = 0; kk < top_k; ++kk) {
+            auto expert_indices = topk_indices.select(-1, kk).contiguous();
+            auto expert_weights = topk_weights.select(-1, kk).contiguous();
+            dispatch_and_combine(
+                flat, expert_indices, token_indices, expert_weights);
+        }
     }
     return routed_output;
 }
@@ -5012,7 +5147,40 @@ static at::Tensor mtp_compute_loss(
 extern "C" {
 
 __attribute__((visibility("default"))) int64_t qwen36_kernel_abi_version() {
-    return 18;
+    return 19;
+}
+
+// Benchmark/metrics helper. The orthogonal EP, DP, and TP reductions propagate
+// the maximum over the complete process grid without requiring a world group.
+__attribute__((visibility("default"))) double qwen36_parallel_max_double(
+    void* ctx_ptr, double value
+) {
+    try {
+        auto* ctx = reinterpret_cast<TrainingContext*>(ctx_ptr);
+        TORCH_CHECK(ctx, "parallel max requires a valid training context");
+        c10::cuda::set_device(ctx->cuda_device);
+        cudaSetDevice(ctx->cuda_device);
+        auto maximum = at::full(
+            {1}, value,
+            at::TensorOptions().device(at::kCUDA, ctx->cuda_device)
+                .dtype(at::kDouble));
+        auto stream = c10::cuda::getCurrentCUDAStream(ctx->cuda_device).stream();
+        auto reduce_axis = [&](ncclComm_t communicator, const char* axis) {
+            if (!communicator) return;
+            auto err = ncclAllReduce(
+                maximum.data_ptr<double>(), maximum.data_ptr<double>(), 1,
+                ncclDouble, ncclMax, communicator, stream);
+            TORCH_CHECK(err == ncclSuccess, axis,
+                " benchmark max all-reduce failed: ", ncclGetErrorString(err));
+        };
+        reduce_axis(ctx->nccl_comm, "EP");
+        reduce_axis(ctx->dp_comm, "DP");
+        reduce_axis(ctx->tp_comm, "TP");
+        return maximum.to(at::kCPU).item<double>();
+    } catch (const std::exception& error) {
+        fprintf(stderr, "[q36] parallel max FAILED: %s\n", error.what());
+        return std::numeric_limits<double>::quiet_NaN();
+    }
 }
 
 static constexpr int32_t QWEN36_CONTEXT_BASE_TP_ATTENTION = 1 << 0;
