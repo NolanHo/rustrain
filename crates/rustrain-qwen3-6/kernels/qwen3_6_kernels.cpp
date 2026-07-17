@@ -136,7 +136,8 @@ struct NcclAllReduceFunction : public torch::autograd::Function<NcclAllReduceFun
     // current compute stream. This keeps the operation asynchronous without
     // relying on a device-wide synchronize.
     static at::Tensor allreduce(
-        const at::Tensor& input, ncclComm_t comm, cudaStream_t requested_stream
+        const at::Tensor& input, ncclComm_t comm, cudaStream_t requested_stream,
+        ncclRedOp_t reduction = ncclSum
     ) {
         TORCH_CHECK(input.is_cuda(), "NCCL all-reduce requires a CUDA tensor");
         const int dev = input.device().index();
@@ -162,7 +163,7 @@ struct NcclAllReduceFunction : public torch::autograd::Function<NcclAllReduceFun
 
         auto err = ncclAllReduce(
             contiguous.data_ptr(), output.data_ptr(), contiguous.numel(),
-            dtype_for(contiguous.scalar_type()), ncclSum, comm, comm_stream);
+            dtype_for(contiguous.scalar_type()), reduction, comm, comm_stream);
         TORCH_CHECK(err == ncclSuccess, "ncclAllReduce failed: ", ncclGetErrorString(err));
 
         if (cross_stream) {
@@ -2026,6 +2027,11 @@ struct TrainingContext {
     // Frozen attention TP: full attention and GDN own disjoint head bundles;
     // their output projections own the matching input columns.
     bool base_tp_attention = false;
+    // Vocabulary parallelism shards embedding and LM-head rows over TP ranks.
+    // Hidden states remain replicated; embedding outputs and CE hidden
+    // gradients are summed over the TP communicator.
+    bool vocab_parallel = false;
+    int64_t local_vocab_size = 0;
     // Set when a legacy NCCL setter supplies an incompatible mixed topology.
     // Training entry points reject the context before touching parameters.
     bool topology_invalid = false;
@@ -2315,6 +2321,35 @@ static at::Tensor tp_copy_lora_input(
 
 static bool base_tp_attention_enabled(const TrainingContext* ctx) {
     return ctx && ctx->base_tp_attention && ctx->tp_world_size > 1;
+}
+
+static bool vocab_parallel_enabled(const TrainingContext* ctx) {
+    return ctx && ctx->vocab_parallel && ctx->tp_world_size > 1;
+}
+
+static at::Tensor tp_allreduce_value(
+    TrainingContext* ctx, const at::Tensor& input, ncclRedOp_t reduction
+) {
+    TORCH_CHECK(ctx && ctx->tp_comm,
+        "vocabulary TP communicator is not initialized for TP_SIZE=",
+        ctx ? ctx->tp_world_size : 0);
+    return NcclAllReduceFunction::allreduce(
+        input, ctx->tp_comm, ctx->tp_stream, reduction);
+}
+
+static at::Tensor vocabulary_embedding(
+    TrainingContext* ctx, const at::Tensor& input_ids
+) {
+    auto embed = *ctx->embed_ptr[0];
+    if (!vocab_parallel_enabled(ctx)) return at::embedding(embed, input_ids);
+
+    const int64_t vocab_start = ctx->tp_rank * ctx->local_vocab_size;
+    const int64_t vocab_end = vocab_start + ctx->local_vocab_size;
+    auto in_range = (input_ids >= vocab_start) & (input_ids < vocab_end);
+    auto local_ids = (input_ids - vocab_start).clamp(0, ctx->local_vocab_size - 1);
+    auto local_hidden = at::embedding(embed, local_ids);
+    local_hidden = local_hidden * in_range.unsqueeze(-1).to(local_hidden.scalar_type());
+    return tp_allreduce_value(ctx, local_hidden, ncclSum);
 }
 
 static at::Tensor tp_allreduce_base_mlp(
@@ -3834,11 +3869,8 @@ static at::Tensor forward_full(
     else if (ctx->tp_world_size > 1) prepare_fixed_lora_batch(ctx);
     else precompute_lora_cache(ctx);
     auto kind = ctx->compute_type;
-    auto embed = *ctx->embed_ptr[0];
-    auto final_norm = *ctx->final_norm_ptr[0];
-
     at::AutoGradMode guard(true);
-    at::Tensor hidden = at::embedding(embed, input_ids);
+    at::Tensor hidden = vocabulary_embedding(ctx, input_ids);
 
     // Debug: dump embedding output stats
     if (getenv("QWEN36_DUMP_LAYERS")) {
@@ -4070,8 +4102,7 @@ static at::Tensor forward_full_fused(
     if (!ctx->adapters.empty()) prepare_lora_batch(ctx);
     else if (ctx->tp_world_size > 1) prepare_fixed_lora_batch(ctx);
     else precompute_lora_cache(ctx);
-    auto embed = *ctx->embed_ptr[0];
-    at::Tensor hidden = at::embedding(embed, input_ids);
+    at::Tensor hidden = vocabulary_embedding(ctx, input_ids);
     hidden = hidden.detach().set_requires_grad(true);
 
     for (int64_t i = 0; i < ctx->num_layers; i++) {
@@ -4101,8 +4132,7 @@ static at::Tensor forward_full_checkpoint(
     } else {
         precompute_lora_cache(ctx);
     }
-    auto embed = *ctx->embed_ptr[0];
-    at::Tensor hidden = at::embedding(embed, input_ids);
+    at::Tensor hidden = vocabulary_embedding(ctx, input_ids);
 
     if (getenv("QWEN36_DUMP_LAYERS")) {
         auto h_f = hidden.to(at::kFloat);
@@ -4325,6 +4355,206 @@ static void manual_group_backward(
 //
 // Returns: scalar loss tensor (with autograd graph for hidden_normed)
 // ──────────────────────────────────────────────────────────────────────
+struct LossResult {
+    at::Tensor value;
+    at::Tensor hidden_grad;
+};
+
+// Vocabulary-parallel cross entropy. The first LM-head pass computes local
+// online-softmax statistics and target logits. TP MAX/SUM reductions produce
+// global statistics; the backward projection reuses cached local logits when
+// they fit under a bounded workspace cap, otherwise it recomputes them.
+static LossResult compute_vocab_parallel_loss(
+    TrainingContext* ctx,
+    const at::Tensor& hidden,
+    const at::Tensor& input_ids,
+    const at::Tensor& target_mask,
+    bool independent_samples,
+    bool compute_hidden_grad
+) {
+    TORCH_CHECK(vocab_parallel_enabled(ctx),
+        "distributed vocabulary loss requires vocabulary TP");
+    TORCH_CHECK(ctx->tp_comm, "distributed vocabulary loss requires a TP communicator");
+
+    auto final_norm = *ctx->final_norm_ptr[0];
+    auto lm_head = *ctx->lm_head_ptr[0];
+    auto hidden_detached = hidden.detach();
+    if (compute_hidden_grad) hidden_detached.set_requires_grad(true);
+
+    at::Tensor hidden_normed;
+    {
+        at::AutoGradMode no_grad(false);
+        hidden_normed = rms_norm(hidden_detached, final_norm, ctx->rms_eps);
+    }
+
+    const int64_t batch_size = hidden_normed.size(0);
+    const int64_t seq_len = hidden_normed.size(1);
+    const int64_t hidden_dim = hidden_normed.size(2);
+    const int64_t shifted_seq_len = seq_len - 1;
+    auto hidden_flat = hidden_normed.narrow(1, 0, shifted_seq_len)
+        .reshape({-1, hidden_dim}).contiguous();
+    auto shifted_targets = input_ids.narrow(1, 1, shifted_seq_len).reshape({-1});
+    auto shifted_mask = target_mask.narrow(1, 1, shifted_seq_len)
+        .reshape({-1}).to(at::kFloat);
+    const int64_t total_tokens = shifted_targets.size(0);
+
+    int64_t token_tile = 512;
+    if (const char* value = getenv("QWEN36_CE_TOKEN_TILE")) {
+        token_tile = std::max<int64_t>(1, std::atoll(value));
+    }
+    int64_t vocab_tile = ctx->local_vocab_size;
+    if (const char* value = getenv("QWEN36_CE_TILE")) {
+        vocab_tile = std::max<int64_t>(1, std::atoll(value));
+    }
+    int64_t logits_cache_bytes = 512LL * 1024LL * 1024LL;
+    if (const char* value = getenv("QWEN36_CE_LOGITS_CACHE_BYTES")) {
+        logits_cache_bytes = std::max<int64_t>(0, std::atoll(value));
+    }
+
+    auto total_count = shifted_mask.sum().clamp_min(1.0);
+    at::Tensor token_denominators;
+    if (independent_samples) {
+        auto per_sample_count = target_mask.narrow(1, 1, shifted_seq_len)
+            .sum(1, true).clamp_min(1.0);
+        token_denominators = per_sample_count
+            .expand({batch_size, shifted_seq_len}).reshape({-1}).to(at::kFloat);
+    }
+
+    auto total_loss = at::zeros({1},
+        at::TensorOptions().dtype(at::kFloat).device(hidden.device()));
+    at::Tensor grad_hidden_flat;
+    if (compute_hidden_grad) {
+        grad_hidden_flat = at::empty({total_tokens, hidden_dim},
+            at::TensorOptions().dtype(at::kFloat).device(hidden.device()));
+    }
+
+    at::AutoGradMode no_grad(false);
+    const int64_t vocab_start = ctx->tp_rank * ctx->local_vocab_size;
+    const int64_t num_token_tiles =
+        (total_tokens + token_tile - 1) / token_tile;
+    const int64_t num_vocab_tiles =
+        (ctx->local_vocab_size + vocab_tile - 1) / vocab_tile;
+
+    for (int64_t token_index = 0; token_index < num_token_tiles; ++token_index) {
+        const int64_t token_start = token_index * token_tile;
+        const int64_t token_count = std::min(
+            token_tile, total_tokens - token_start);
+        auto chunk_hidden = hidden_flat.narrow(0, token_start, token_count);
+        auto chunk_targets = shifted_targets.narrow(0, token_start, token_count);
+        auto chunk_mask = shifted_mask.narrow(0, token_start, token_count);
+
+        auto local_max = at::full({token_count, 1},
+            -std::numeric_limits<float>::infinity(),
+            at::TensorOptions().dtype(at::kFloat).device(hidden.device()));
+        auto local_sum_exp = at::zeros_like(local_max);
+        auto local_target_logit = at::zeros_like(local_max);
+        const bool cache_logits =
+            token_count * ctx->local_vocab_size * static_cast<int64_t>(sizeof(float)) <=
+            logits_cache_bytes;
+        std::vector<at::Tensor> cached_logits;
+        if (cache_logits) cached_logits.reserve(num_vocab_tiles);
+
+        for (int64_t vocab_index = 0; vocab_index < num_vocab_tiles; ++vocab_index) {
+            const int64_t local_start = vocab_index * vocab_tile;
+            const int64_t local_count = std::min(
+                vocab_tile, ctx->local_vocab_size - local_start);
+            const int64_t global_start = vocab_start + local_start;
+            const int64_t global_end = global_start + local_count;
+            auto head_tile = lm_head.narrow(0, local_start, local_count);
+            auto logits = at::matmul(chunk_hidden, head_tile.t()).to(at::kFloat);
+            if (cache_logits) cached_logits.push_back(logits);
+
+            auto tile_max = std::get<0>(at::max(logits, 1, true));
+            auto new_max = at::max(local_max, tile_max);
+            local_sum_exp = at::exp(local_max - new_max) * local_sum_exp +
+                at::exp(logits - new_max).sum(1, true);
+            local_max = new_max;
+
+            auto in_range = (chunk_targets >= global_start) &
+                (chunk_targets < global_end);
+            auto local_targets = (chunk_targets - global_start)
+                .clamp(0, local_count - 1).reshape({-1, 1});
+            auto gathered = at::gather(logits, 1, local_targets);
+            local_target_logit.add_(at::where(
+                in_range.reshape({-1, 1}), gathered, at::zeros_like(gathered)));
+        }
+
+        auto global_max = tp_allreduce_value(ctx, local_max, ncclMax);
+        local_sum_exp.mul_(at::exp(local_max - global_max));
+        auto global_stats = tp_allreduce_value(
+            ctx, at::cat({local_sum_exp, local_target_logit}, 1), ncclSum);
+        auto global_sum_exp = global_stats.narrow(1, 0, 1);
+        auto target_logit = global_stats.narrow(1, 1, 1);
+        auto per_token_loss =
+            (at::log(global_sum_exp) + global_max - target_logit).squeeze(1);
+        auto masked_loss = per_token_loss * chunk_mask;
+        if (independent_samples) {
+            total_loss.add_((masked_loss /
+                token_denominators.narrow(0, token_start, token_count)).sum());
+        } else {
+            total_loss.add_(masked_loss.sum() / total_count);
+        }
+
+        if (!compute_hidden_grad) continue;
+
+        auto grad_scale = independent_samples
+            ? chunk_mask /
+                token_denominators.narrow(0, token_start, token_count)
+            : chunk_mask / total_count;
+        auto local_grad_hidden = at::zeros({token_count, hidden_dim},
+            at::TensorOptions().dtype(at::kFloat).device(hidden.device()));
+        for (int64_t vocab_index = 0; vocab_index < num_vocab_tiles; ++vocab_index) {
+            const int64_t local_start = vocab_index * vocab_tile;
+            const int64_t local_count = std::min(
+                vocab_tile, ctx->local_vocab_size - local_start);
+            const int64_t global_start = vocab_start + local_start;
+            const int64_t global_end = global_start + local_count;
+            auto head_tile = lm_head.narrow(0, local_start, local_count);
+            auto logits = cache_logits
+                ? cached_logits[vocab_index]
+                : at::matmul(chunk_hidden, head_tile.t()).to(at::kFloat);
+            auto grad_logits = at::exp(logits - global_max) / global_sum_exp;
+
+            auto in_range = (chunk_targets >= global_start) &
+                (chunk_targets < global_end);
+            auto local_targets = (chunk_targets - global_start)
+                .clamp(0, local_count - 1).reshape({-1, 1});
+            auto one_hot = at::zeros_like(grad_logits);
+            one_hot.scatter_(1, local_targets, 1.0);
+            grad_logits.sub_(one_hot * in_range.to(at::kFloat).reshape({-1, 1}));
+            grad_logits.mul_(grad_scale.reshape({-1, 1}));
+            local_grad_hidden.add_(at::matmul(
+                grad_logits.to(head_tile.scalar_type()), head_tile).to(at::kFloat));
+        }
+        auto global_grad_hidden = tp_allreduce_value(
+            ctx, local_grad_hidden, ncclSum);
+        grad_hidden_flat.narrow(0, token_start, token_count)
+            .copy_(global_grad_hidden);
+    }
+
+    at::Tensor hidden_grad;
+    if (compute_hidden_grad) {
+        auto grad_shifted = grad_hidden_flat
+            .reshape({batch_size, shifted_seq_len, hidden_dim})
+            .to(hidden_normed.scalar_type());
+        auto grad_full = at::cat({
+            grad_shifted,
+            at::zeros({batch_size, 1, hidden_dim},
+                at::TensorOptions().dtype(hidden_normed.scalar_type())
+                    .device(hidden_normed.device()))
+        }, 1);
+        at::AutoGradMode grad_mode(true);
+        auto hidden_normed_recompute = rms_norm(
+            hidden_detached, final_norm, ctx->rms_eps);
+        hidden_grad = torch::autograd::grad(
+            {hidden_normed_recompute}, {hidden_detached}, {grad_full},
+            /*retain_graph=*/false, /*create_graph=*/false,
+            /*allow_unused=*/false)[0];
+    }
+
+    return {total_loss, hidden_grad};
+}
+
 static at::Tensor compute_loss_fused(
     TrainingContext* ctx,
     const at::Tensor& hidden,       // [batch, seq, hidden] (requires_grad)
@@ -4332,6 +4562,12 @@ static at::Tensor compute_loss_fused(
     const at::Tensor& target_mask,  // [batch, seq]
     int64_t vocab_size
 ) {
+    if (vocab_parallel_enabled(ctx)) {
+        return compute_vocab_parallel_loss(
+            ctx, hidden, input_ids, target_mask,
+            /*independent_samples=*/false,
+            /*compute_hidden_grad=*/false).value;
+    }
     auto final_norm = *ctx->final_norm_ptr[0];
     auto lm_head = *ctx->lm_head_ptr[0];  // [vocab, hidden]
 
@@ -4501,13 +4737,13 @@ static at::Tensor compute_loss_fused(
 
     // Set gradient on hidden_normed (leaf tensor).
     // grad_hidden covers [batch, seq-1, hidden] (shifted tokens).
-    // hidden_normed is [batch, seq, hidden] — pad first token with zeros.
+    // hidden_normed is [batch, seq, hidden] — the final position has no target.
     auto grad_reshaped = grad_hidden.to(hidden_normed.scalar_type())
         .reshape({hidden_normed.size(0), seq_len - 1, hidden_dim});
     auto grad_full = at::cat({
+        grad_reshaped,
         at::zeros({hidden_normed.size(0), 1, hidden_dim},
-            at::TensorOptions().dtype(hidden_normed.scalar_type()).device(hidden_normed.device())),
-        grad_reshaped
+            at::TensorOptions().dtype(hidden_normed.scalar_type()).device(hidden_normed.device()))
     }, /*dim=*/1);  // [batch, seq, hidden]
     hidden_normed.mutable_grad() = grad_full;
 
@@ -4522,11 +4758,6 @@ static at::Tensor compute_loss_fused(
         at::TensorOptions().dtype(at::kFloat).device(hidden.device()));
 }
 
-struct LossResult {
-    at::Tensor value;
-    at::Tensor hidden_grad;
-};
-
 // Cross-entropy loss with response-only masking — chunked with detach.
 // Return the hidden gradient instead of mutating/backpropagating through the
 // main model graph. The caller combines auxiliary gradients and performs one
@@ -4539,6 +4770,11 @@ static LossResult compute_loss(
     int64_t vocab_size,
     bool independent_samples = false
 ) {
+    if (vocab_parallel_enabled(ctx)) {
+        return compute_vocab_parallel_loss(
+            ctx, hidden, input_ids, target_mask,
+            independent_samples, /*compute_hidden_grad=*/true);
+    }
     auto final_norm = *ctx->final_norm_ptr[0];
     auto lm_head = *ctx->lm_head_ptr[0];
 
@@ -4657,13 +4893,12 @@ static at::Tensor mtp_forward(
     const at::Tensor& input_ids
 ) {
     auto kind = ctx->compute_type;
-    auto embed = *ctx->embed_ptr[0];
-
     int64_t seq_len = hidden.size(1);
 
     // hidden[t] + embed[t+1] → predict token t+2 (Megatron convention)
     auto hidden_shifted = hidden.narrow(1, 0, seq_len - 1);  // [batch, seq-1, hidden]
-    auto embed_next = at::embedding(embed, input_ids.narrow(1, 1, seq_len - 1));  // [batch, seq-1, hidden]
+    auto embed_next = vocabulary_embedding(
+        ctx, input_ids.narrow(1, 1, seq_len - 1));  // [batch, seq-1, hidden]
 
     // RMSNorm both
     auto h_normed = rms_norm(hidden_shifted, *ctx->mtp_pre_fc_norm_hidden, ctx->rms_eps).to(kind);
@@ -4764,11 +4999,12 @@ static at::Tensor mtp_compute_loss(
 extern "C" {
 
 __attribute__((visibility("default"))) int64_t qwen36_kernel_abi_version() {
-    return 16;
+    return 17;
 }
 
 static constexpr int32_t QWEN36_CONTEXT_BASE_TP_ATTENTION = 1 << 0;
 static constexpr int32_t QWEN36_CONTEXT_DATA_PARALLEL = 1 << 1;
+static constexpr int32_t QWEN36_CONTEXT_VOCAB_PARALLEL = 1 << 2;
 
 // Create training context — called once at startup
 // lora_rank: LoRA rank (from config)
@@ -4796,6 +5032,8 @@ static void* qwen36_create_training_context_impl(
         ctx->num_layers = num_layers;
         ctx->base_tp_attention =
             (context_flags & QWEN36_CONTEXT_BASE_TP_ATTENTION) != 0;
+        ctx->vocab_parallel =
+            (context_flags & QWEN36_CONTEXT_VOCAB_PARALLEL) != 0;
         ctx->has_mtp = false;
         ctx->use_checkpoint = false; ctx->group_size = 4;
         const char* tp_size_env = getenv("TP_SIZE");
@@ -4866,6 +5104,27 @@ static void* qwen36_create_training_context_impl(
         ctx->embed_ptr.push_back(reinterpret_cast<at::Tensor*>(embed_ptr));
         ctx->final_norm_ptr.push_back(reinterpret_cast<at::Tensor*>(final_norm_ptr));
         ctx->lm_head_ptr.push_back(reinterpret_cast<at::Tensor*>(lm_head_ptr));
+        if (ctx->vocab_parallel) {
+            TORCH_CHECK(ctx->tp_world_size > 1,
+                "vocabulary parallelism requires TP_SIZE>1");
+            TORCH_CHECK(ctx->vocab_size > 0 &&
+                    ctx->vocab_size % ctx->tp_world_size == 0,
+                "vocab_size=", ctx->vocab_size,
+                " must be divisible by TP_SIZE=", ctx->tp_world_size);
+            ctx->local_vocab_size = ctx->vocab_size / ctx->tp_world_size;
+            auto* embed = ctx->embed_ptr[0];
+            auto* lm_head = ctx->lm_head_ptr[0];
+            TORCH_CHECK(embed && lm_head && embed->dim() == 2 && lm_head->dim() == 2,
+                "vocabulary parallelism requires matrix embedding and LM-head weights");
+            TORCH_CHECK(embed->size(0) == ctx->local_vocab_size &&
+                    lm_head->size(0) == ctx->local_vocab_size &&
+                    embed->size(1) == lm_head->size(1),
+                "vocabulary parallelism received inconsistent local weight shapes: embed=",
+                embed->sizes(), " lm_head=", lm_head->sizes(),
+                " expected local vocab=", ctx->local_vocab_size);
+        } else {
+            ctx->local_vocab_size = ctx->vocab_size;
+        }
 
         // Copy layer configs
         auto* lcfgs = reinterpret_cast<LayerConfig*>(layer_configs_ptr);
@@ -5241,8 +5500,9 @@ __attribute__((visibility("default"))) int32_t qwen36_set_mtp_weights(
     try {
         auto* ctx = reinterpret_cast<TrainingContext*>(ctx_ptr);
         TORCH_CHECK(ctx, "null training context");
-        TORCH_CHECK(!ctx->base_tp_mlp && !ctx->base_tp_attention,
-            "MTP cannot be enabled after frozen base TP because MTP weights are not sharded");
+        TORCH_CHECK(!ctx->base_tp_mlp && !ctx->base_tp_attention &&
+                !ctx->vocab_parallel,
+            "MTP cannot be enabled after frozen base or vocabulary TP because MTP weights are not sharded");
         TORCH_CHECK(!ctx->has_mtp, "MTP weights are already configured");
         ctx->has_mtp = true;
         ctx->mtp_fc = reinterpret_cast<at::Tensor*>(mtp_fc_ptr);
@@ -5607,7 +5867,8 @@ __attribute__((visibility("default"))) void qwen36_free_training_context(void* c
 /// Based on per-adapter activation memory (dominant) + LoRA params + Adam state.
 static int64_t compute_n_max(
     int64_t free_gpu_bytes, int64_t rank, int64_t seq,
-    int64_t hidden, int64_t group_size, int64_t num_layers
+    int64_t hidden, int64_t group_size, int64_t num_layers,
+    bool vocab_parallel, int64_t local_vocab_size
 ) {
     // Per-adapter activation memory (BF16, group_size=2 optimal):
     // group_inputs: (num_layers / group_size) × seq × hidden × 2 bytes
@@ -5627,10 +5888,12 @@ static int64_t compute_n_max(
     int64_t num_modules = 280;
     int64_t lora_mem = num_modules * rank * hidden * 12;  // conservative
 
-    // CE peak: one chunk of [16384, vocab] logits at a time.
-    // BF16 logits (8GB) + FP32 CE loss (16GB) + grad (~8GB) ≈ 16GB.
-    // But backward releases immediately, so effective peak is lower.
-    int64_t ce_peak = 16384LL * 248320LL * 4LL;  // ~16GB (FP32 logits only, others freed by autograd)
+    // Vocabulary TP keeps a cached FP32 logits tile while backward also owns
+    // FP32 softmax and one-hot buffers. Reserve four tile-sized buffers plus
+    // the [token, hidden] gradient so tenant chunking stays conservative.
+    int64_t ce_peak = vocab_parallel
+        ? 512LL * local_vocab_size * 16LL + 512LL * hidden * 4LL
+        : 16384LL * 248320LL * 4LL;
 
     // Attention intermediate: Q/K/V + attn_weights ≈ 4 × N × heads × seq × head_dim × 2 bytes
     // Flash attention keeps this O(seq) not O(seq²), but still significant at seq=16K
@@ -5770,7 +6033,8 @@ __attribute__((visibility("default"))) double qwen36_train_multi_lora(
         n_max = compute_n_max(
             (int64_t)free_mem, lora_rank,
             input_ids.size(-1), 2048,
-            ctx->group_size, ctx->num_layers
+            ctx->group_size, ctx->num_layers, ctx->vocab_parallel,
+            ctx->local_vocab_size
         );
         n_max = std::min(n_max, total_adapters);
         if (n_max < 1) n_max = 1;

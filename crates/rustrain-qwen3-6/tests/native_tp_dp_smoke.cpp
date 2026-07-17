@@ -51,6 +51,9 @@ static constexpr double kBeta1 = 0.9;
 static constexpr double kBeta2 = 0.999;
 static constexpr double kAdamEps = 1e-8;
 static constexpr int64_t kOptimizerSlots = 14;
+static constexpr int32_t kBaseTpAttention = 1 << 0;
+static constexpr int32_t kDataParallel = 1 << 1;
+static constexpr int32_t kVocabParallel = 1 << 2;
 
 static at::Tensor deterministic(std::initializer_list<int64_t> shape, double scale) {
     int64_t count = 1;
@@ -232,14 +235,16 @@ static FullReference run_full_reference(
 }
 
 int main() {
-    assert(qwen36_kernel_abi_version() == 16);
+    assert(qwen36_kernel_abi_version() == 17);
     const int rank = std::atoi(std::getenv("RANK"));
     const int world = std::atoi(std::getenv("WORLD_SIZE"));
     const int local_rank = std::atoi(
         std::getenv("LOCAL_RANK") ? std::getenv("LOCAL_RANK") : "0");
     assert(world == 4 && rank >= 0 && rank < world);
-    const int tp_rank = rank % 2;
-    const int dp_rank = rank / 2;
+    // Deliberately use dp-tp rank order so vocabulary ownership follows the
+    // explicit topology rank rather than global_rank % TP_SIZE.
+    const int tp_rank = rank / 2;
+    const int dp_rank = rank % 2;
     qwen36_set_cuda_device(local_rank);
 
     constexpr int64_t hidden = 8;
@@ -294,6 +299,10 @@ int main() {
     auto final_norm = at::ones(
         {hidden}, at::TensorOptions().device(at::kCUDA).dtype(at::kBFloat16));
     auto lm_head = deterministic({vocab, hidden}, 0.015);
+    auto local_embed = embed.narrow(
+        0, tp_rank * (vocab / 2), vocab / 2).contiguous();
+    auto local_lm_head = lm_head.narrow(
+        0, tp_rank * (vocab / 2), vocab / 2).contiguous();
     LayerConfig config{};
     config.layer_type = 0;
     config.num_heads = heads;
@@ -314,11 +323,13 @@ int main() {
     setenv("DP_SIZE", "3", 1);
     setenv("RUSTRAIN_DATA_PARALLEL", "1", 1);
     void* invalid = qwen36_create_training_context_ex(
-        local_ptrs.data(), local_ptrs.size(), &embed, &final_norm, &lm_head,
+        local_ptrs.data(), local_ptrs.size(), &local_embed, &final_norm,
+        &local_lm_head,
         &config, 1, static_cast<int32_t>(at::kBFloat16),
         1.0, kLearningRate, kBeta1, kBeta2, kAdamEps,
         vocab, 1e-5, lora_rank, &target_layer, 1,
-        "q_proj,k_proj,v_proj,o_proj", 3);
+        "q_proj,k_proj,v_proj,o_proj",
+        kBaseTpAttention | kDataParallel | kVocabParallel);
     assert(invalid == nullptr);
 
     setenv("DP_SIZE", "2", 1);
@@ -338,16 +349,18 @@ int main() {
         local_lora.o_b.add_(0.25);
     }
     void* distributed = qwen36_create_training_context_ex(
-        local_ptrs.data(), local_ptrs.size(), &embed, &final_norm, &lm_head,
+        local_ptrs.data(), local_ptrs.size(), &local_embed, &final_norm,
+        &local_lm_head,
         &config, 1, static_cast<int32_t>(at::kBFloat16),
         1.0, kLearningRate, kBeta1, kBeta2, kAdamEps,
         vocab, 1e-5, lora_rank, &target_layer, 1,
-        "q_proj,k_proj,v_proj,o_proj", 3);
+        "q_proj,k_proj,v_proj,o_proj",
+        kBaseTpAttention | kDataParallel | kVocabParallel);
     assert(distributed);
     install_full_lora(distributed, local_lora);
     assert(qwen36_init_parallel_nccl(
         distributed, rank, world,
-        tp_rank, 2, dp_rank * 2,
+        tp_rank, 2, dp_rank,
         dp_rank, 2, tp_rank) == 0);
 
     const auto synchronized_params = lora_parameters(distributed);

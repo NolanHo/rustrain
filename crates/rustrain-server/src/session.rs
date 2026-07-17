@@ -396,6 +396,15 @@ impl TrainingSession for Qwen36Session {
         }
         let base_tp_attention = tp_size > 1;
         let base_tp_mlp = tp_size > 1 && !runtime_config.is_moe;
+        let vocab_parallel = tp_size > 1;
+        if vocab_parallel
+            && (runtime_config.vocab_size <= 0 || runtime_config.vocab_size % tp_size as i64 != 0)
+        {
+            return Err(anyhow!(
+                "vocab_size={} must be divisible by TP_SIZE={tp_size} for vocabulary parallelism",
+                runtime_config.vocab_size
+            ));
+        }
         if base_tp_attention {
             if runtime_config.mtp_num_hidden_layers > 0 {
                 return Err(anyhow!(
@@ -517,7 +526,20 @@ impl TrainingSession for Qwen36Session {
                     .to_kind(self.compute_kind);
                 weights.insert(name, narrowed);
             } else {
-                let local_shard = if base_tp_attention {
+                let vocab_shard = if vocab_parallel {
+                    rustrain_qwen3_6::kernel::shard_vocab_weight_for_tp(
+                        &name,
+                        &tensor,
+                        runtime_config.vocab_size,
+                        tp_size,
+                        tp_rank,
+                    )?
+                } else {
+                    None
+                };
+                let local_shard = if vocab_shard.is_some() {
+                    vocab_shard
+                } else if base_tp_attention {
                     let full_attention_shard =
                         rustrain_qwen3_6::kernel::shard_full_attention_weight_for_tp(
                             &name, &tensor, tp_size, tp_rank,
@@ -589,6 +611,7 @@ impl TrainingSession for Qwen36Session {
             req.rank,
             base_tp_attention,
             base_tp_mlp,
+            vocab_parallel,
             is_data_parallel,
             &all_layers,
             &target_modules,

@@ -200,7 +200,7 @@ unsafe fn load_kernels() -> Option<KernelHandles> {
         }};
     }
     let abi_version: FnKernelAbiVersion = sym!("qwen36_kernel_abi_version");
-    if abi_version() != 16 {
+    if abi_version() != 17 {
         return None;
     }
     Some(KernelHandles {
@@ -258,6 +258,36 @@ fn get_ptr(weights: &std::collections::BTreeMap<String, Tensor>, name: &str) -> 
         Some(t) => t.as_ptr() as *mut c_void,
         None => std::ptr::null_mut(),
     }
+}
+
+/// Return the rank-local frozen vocabulary shard for TP, or `None` when the
+/// tensor is not an embedding or LM-head weight. This runs during CPU loading.
+pub fn shard_vocab_weight_for_tp(
+    name: &str,
+    tensor: &Tensor,
+    vocab_size: i64,
+    tp_size: usize,
+    tp_rank: usize,
+) -> Result<Option<Tensor>> {
+    if !name.ends_with("embed_tokens.weight") && !name.ends_with("lm_head.weight") {
+        return Ok(None);
+    }
+    if tp_size <= 1 || tp_rank >= tp_size {
+        bail!("invalid vocabulary TP shard: tp_rank={tp_rank}, tp_size={tp_size}");
+    }
+    if vocab_size <= 0 || vocab_size % tp_size as i64 != 0 {
+        bail!("vocab_size={vocab_size} is not divisible by TP_SIZE={tp_size}");
+    }
+    let shape = tensor.size();
+    if shape.len() != 2 || shape[0] != vocab_size {
+        bail!("vocabulary TP weight {name} must have shape [{vocab_size}, hidden], got {shape:?}");
+    }
+    let local_vocab_size = vocab_size / tp_size as i64;
+    Ok(Some(
+        tensor
+            .narrow(0, tp_rank as i64 * local_vocab_size, local_vocab_size)
+            .contiguous(),
+    ))
 }
 
 /// Return the rank-local frozen dense MLP shard for TP, or `None` when the
@@ -639,6 +669,7 @@ impl CppTrainingContext {
         lora_rank: i64,
         base_tp_attention: bool,
         base_tp_mlp: bool,
+        vocab_parallel: bool,
         data_parallel: bool,
         target_layers: &[usize],
         target_modules: &[Qwen36LoraTargetModule],
@@ -715,7 +746,9 @@ impl CppTrainingContext {
                 tl_ptr,
                 tl_len,
                 modules_ptr,
-                i32::from(base_tp_attention) | (i32::from(data_parallel) << 1),
+                i32::from(base_tp_attention)
+                    | (i32::from(data_parallel) << 1)
+                    | (i32::from(vocab_parallel) << 2),
             )
         };
         if ptr.is_null() {
@@ -1327,7 +1360,7 @@ impl Drop for CppTrainingContext {
 mod tests {
     use super::{
         shard_dense_mlp_weight_for_tp, shard_full_attention_weight_for_tp,
-        shard_linear_attention_weight_for_tp,
+        shard_linear_attention_weight_for_tp, shard_vocab_weight_for_tp,
     };
     use tch::{Kind, Tensor};
 
@@ -1347,6 +1380,48 @@ mod tests {
         assert_eq!(down_rank_one.size(), [4, 6]);
         assert_eq!(gate_rank_one.double_value(&[0, 0]), 24.0);
         assert_eq!(down_rank_one.double_value(&[0, 0]), 6.0);
+    }
+
+    #[test]
+    fn vocabulary_tp_shards_embedding_and_head_rows() {
+        let tensor = Tensor::arange(48, (Kind::Float, tch::Device::Cpu)).reshape([12, 4]);
+        let embed = shard_vocab_weight_for_tp(
+            "model.language_model.embed_tokens.weight",
+            &tensor,
+            12,
+            2,
+            1,
+        )
+        .unwrap()
+        .unwrap();
+        let head = shard_vocab_weight_for_tp("lm_head.weight", &tensor, 12, 2, 1)
+            .unwrap()
+            .unwrap();
+        assert_eq!(embed.size(), [6, 4]);
+        assert_eq!(head.size(), [6, 4]);
+        assert_eq!(embed.double_value(&[0, 0]), 24.0);
+        assert_eq!(head.double_value(&[0, 0]), 24.0);
+    }
+
+    #[test]
+    fn vocabulary_tp_ignores_other_weights_and_rejects_invalid_layouts() {
+        let tensor = Tensor::zeros([12, 4], (Kind::Float, tch::Device::Cpu));
+        assert!(
+            shard_vocab_weight_for_tp("model.norm.weight", &tensor, 12, 2, 0)
+                .unwrap()
+                .is_none()
+        );
+        assert!(shard_vocab_weight_for_tp("lm_head.weight", &tensor, 11, 2, 0).is_err());
+        assert!(
+            shard_vocab_weight_for_tp(
+                "model.embed_tokens.weight",
+                &Tensor::zeros([11, 4], (Kind::Float, tch::Device::Cpu)),
+                12,
+                2,
+                0,
+            )
+            .is_err()
+        );
     }
 
     #[test]

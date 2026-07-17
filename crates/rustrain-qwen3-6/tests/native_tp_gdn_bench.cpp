@@ -42,8 +42,9 @@ extern "C" void qwen36_free_training_context(void*);
 
 namespace {
 
-constexpr int64_t kAbiVersion = 16;
+constexpr int64_t kAbiVersion = 17;
 constexpr int32_t kBaseTpAttention = 1 << 0;
+constexpr int32_t kVocabParallel = 1 << 2;
 
 static int env_int(const char* name, int fallback) {
     const char* value = std::getenv(name);
@@ -172,6 +173,7 @@ int main() {
     assert(value_heads % key_heads == 0);
     assert(key_heads % expected_world == 0 && value_heads % expected_world == 0);
     assert(lora_rank % expected_world == 0);
+    assert(vocab % expected_world == 0);
 
     size_t free_start = 0, total_bytes = 0;
     assert(cudaMemGetInfo(&free_start, &total_bytes) == cudaSuccess);
@@ -187,9 +189,10 @@ int main() {
     for (auto& weight : weights) weight.set_requires_grad(false);
     auto weight_ptrs = pointers(weights);
 
-    auto embed = seeded_randn({vocab, hidden}, 0.0020, 31);
+    const int local_vocab = vocab / expected_world;
+    auto embed = seeded_randn({local_vocab, hidden}, 0.0020, 31 + rank);
     auto final_norm = unit_weight({hidden});
-    auto lm_head = seeded_randn({vocab, hidden}, 0.0020, 37);
+    auto lm_head = seeded_randn({local_vocab, hidden}, 0.0020, 37 + rank);
     embed.set_requires_grad(false);
     final_norm.set_requires_grad(false);
     lm_head.set_requires_grad(false);
@@ -232,7 +235,8 @@ int main() {
             weight_ptrs.data(), weight_ptrs.size(), &embed, &final_norm, &lm_head,
             configs.data(), layers, static_cast<int32_t>(at::kBFloat16),
             1.0, 1e-3, 0.9, 0.999, 1e-8, vocab, 1e-5, lora_rank,
-            target_layers.data(), layers, targets, kBaseTpAttention)
+            target_layers.data(), layers, targets,
+            kBaseTpAttention | kVocabParallel)
         : qwen36_create_training_context(
             weight_ptrs.data(), weight_ptrs.size(), &embed, &final_norm, &lm_head,
             configs.data(), layers, static_cast<int32_t>(at::kBFloat16),

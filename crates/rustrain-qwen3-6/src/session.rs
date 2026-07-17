@@ -380,10 +380,20 @@ fn train_impl(
 
     // Full attention and GDN follow head-aligned ColumnParallel input
     // projections and RowParallel output projections. Dense MLP additionally
-    // shards gate/up rows and down columns. MoE experts, embeddings, and the
-    // LM head remain replicated.
+    // shards gate/up rows and down columns. Embeddings and the LM head shard
+    // contiguous vocabulary rows and remain tied through the C++ context when
+    // the model uses tied word embeddings.
     let base_tp_attention = tp_size > 1;
     let base_tp_mlp = tp_size > 1 && !runtime_config.is_moe;
+    let vocab_parallel = tp_size > 1;
+    if vocab_parallel
+        && (runtime_config.vocab_size <= 0 || runtime_config.vocab_size % tp_size as i64 != 0)
+    {
+        bail!(
+            "vocab_size={} must be divisible by TP_SIZE={tp_size} for vocabulary parallelism",
+            runtime_config.vocab_size
+        );
+    }
     if base_tp_attention {
         if runtime_config.mtp_num_hidden_layers > 0 {
             bail!("frozen base TP currently requires MTP to be disabled");
@@ -514,7 +524,20 @@ fn train_impl(
         );
     } else {
         for (name, tensor) in &weights {
-            let local_shard = if base_tp_attention {
+            let vocab_shard = if vocab_parallel {
+                crate::kernel::shard_vocab_weight_for_tp(
+                    name,
+                    tensor,
+                    runtime_config.vocab_size,
+                    tp_size,
+                    tp_rank,
+                )?
+            } else {
+                None
+            };
+            let local_shard = if vocab_shard.is_some() {
+                vocab_shard
+            } else if base_tp_attention {
                 let full_attention_shard = crate::kernel::shard_full_attention_weight_for_tp(
                     name, tensor, tp_size, tp_rank,
                 )?;
@@ -552,7 +575,8 @@ fn train_impl(
                 tp_size,
                 tp_rank,
                 base_tp_mlp,
-                "frozen base TP enabled: full-attention/GDN head shards and optional dense MLP shards"
+                vocab_parallel,
+                "frozen base TP enabled: attention/GDN, vocabulary, and optional dense MLP shards"
             );
         }
     }
@@ -613,6 +637,7 @@ fn train_impl(
         lora_config.rank as i64,
         base_tp_attention,
         base_tp_mlp,
+        vocab_parallel,
         is_data_parallel,
         &lora_config.target_layers,
         &lora_config.target_modules,
