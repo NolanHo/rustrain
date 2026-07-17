@@ -20,6 +20,14 @@ pub enum LoraTpShardLayout {
     #[default]
     LatentRank,
     ColumnParallel,
+    /// Column-parallel projection whose global rows use flat
+    /// `[Q_all | K_all | V_all]` storage while each rank stores packed
+    /// `[Q_local | K_local | V_local]` rows.
+    FlatQkvColumnParallel {
+        q_rows: i64,
+        k_rows: i64,
+        v_rows: i64,
+    },
     RowParallel,
 }
 
@@ -136,7 +144,18 @@ pub struct TensorShardManifest {
     #[serde(default)]
     pub replicated: bool,
     pub global_offset: Vec<i64>,
+    /// Non-contiguous mappings from rank-local storage into the original
+    /// global tensor. Empty for ordinary contiguous shards.
+    #[serde(default)]
+    pub segments: Vec<TensorShardSegmentManifest>,
     pub replica_identity: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TensorShardSegmentManifest {
+    pub local_offset: i64,
+    pub global_offset: i64,
+    pub length: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -171,7 +190,7 @@ pub fn validate_fixed_tp_resume(
             .any(|layout| *layout != LoraTpShardLayout::LatentRank)
         {
             bail!(
-                "legacy tensor-parallel v3 checkpoints cannot restore fixed Q/K/V/O LoRA into the projection-aware layout; use a v4 checkpoint or migrate the adapter from a merged artifact"
+                "legacy tensor-parallel v3 checkpoints cannot restore fixed projection-aware attention LoRA; use a v4 checkpoint or migrate the adapter from a merged artifact"
             );
         }
         return Ok(());
@@ -203,7 +222,7 @@ pub fn validate_dynamic_tp_resume(
             .any(|layout| *layout != LoraTpShardLayout::LatentRank)
         {
             bail!(
-                "legacy tensor-parallel v3 checkpoint adapter {adapter_id} contains Q/K/V/O LoRA that cannot be restored into the projection-aware layout; use a v4 checkpoint or migrate the adapter from a merged artifact"
+                "legacy tensor-parallel v3 checkpoint adapter {adapter_id} contains projection-aware attention LoRA that cannot be restored; use a v4 checkpoint or migrate the adapter from a merged artifact"
             );
         }
         return Ok(());
@@ -841,6 +860,7 @@ fn tensor_shard(
             (rank_axis, false)
         }
         (LoraTpShardLayout::ColumnParallel, LoraSide::A)
+        | (LoraTpShardLayout::FlatQkvColumnParallel { .. }, LoraSide::A)
         | (LoraTpShardLayout::RowParallel, LoraSide::B) => {
             if local_shape[rank_axis] != global_lora_rank {
                 bail!(
@@ -862,6 +882,45 @@ fn tensor_shard(
             global_offset[axis] = tp_rank * local_shape[axis];
             (axis, false)
         }
+        (
+            LoraTpShardLayout::FlatQkvColumnParallel {
+                q_rows,
+                k_rows,
+                v_rows,
+            },
+            LoraSide::B,
+        ) => {
+            if local_shape[rank_axis] != global_lora_rank {
+                bail!(
+                    "flat-QKV column-parallel checkpoint tensor {file}:{tensor_name} has rank {} on axis {rank_axis}, expected {global_lora_rank}",
+                    local_shape[rank_axis]
+                );
+            }
+            if q_rows <= 0
+                || k_rows <= 0
+                || v_rows <= 0
+                || q_rows % tp_size != 0
+                || k_rows % tp_size != 0
+                || v_rows % tp_size != 0
+            {
+                bail!(
+                    "flat-QKV global row segments [{q_rows}, {k_rows}, {v_rows}] must be positive and divisible by TP size {tp_size}"
+                );
+            }
+            let axis = local_shape.len() - 2;
+            let local_q = q_rows / tp_size;
+            let local_k = k_rows / tp_size;
+            let local_v = v_rows / tp_size;
+            if local_shape[axis] != local_q + local_k + local_v {
+                bail!(
+                    "flat-QKV checkpoint tensor {file}:{tensor_name} has {} local rows, expected {} from Q/K/V segments",
+                    local_shape[axis],
+                    local_q + local_k + local_v
+                );
+            }
+            global_shape[axis] = q_rows + k_rows + v_rows;
+            (axis, false)
+        }
         (LoraTpShardLayout::RowParallel, LoraSide::A) => {
             if local_shape[rank_axis] != global_lora_rank {
                 bail!(
@@ -875,6 +934,38 @@ fn tensor_shard(
             (axis, false)
         }
     };
+    let segments = match (layout, side) {
+        (
+            LoraTpShardLayout::FlatQkvColumnParallel {
+                q_rows,
+                k_rows,
+                v_rows,
+            },
+            LoraSide::B,
+        ) => {
+            let local_q = q_rows / tp_size;
+            let local_k = k_rows / tp_size;
+            let local_v = v_rows / tp_size;
+            vec![
+                TensorShardSegmentManifest {
+                    local_offset: 0,
+                    global_offset: tp_rank * local_q,
+                    length: local_q,
+                },
+                TensorShardSegmentManifest {
+                    local_offset: local_q,
+                    global_offset: q_rows + tp_rank * local_k,
+                    length: local_k,
+                },
+                TensorShardSegmentManifest {
+                    local_offset: local_q + local_k,
+                    global_offset: q_rows + k_rows + tp_rank * local_v,
+                    length: local_v,
+                },
+            ]
+        }
+        _ => Vec::new(),
+    };
     Ok(TensorShardManifest {
         file: file.to_string(),
         tensor_name,
@@ -887,6 +978,7 @@ fn tensor_shard(
         layout,
         replicated,
         global_offset,
+        segments,
         replica_identity: if replicated {
             "tp-replicated".to_string()
         } else {
@@ -1342,24 +1434,43 @@ mod tests {
         let topology = tp_topology(1, 2);
         let column_a = Tensor::zeros([4, 8], (tch::Kind::Float, tch::Device::Cpu));
         let column_b = Tensor::zeros([8, 4], (tch::Kind::Float, tch::Device::Cpu));
+        let flat_qkv_a = Tensor::zeros([4, 8], (tch::Kind::Float, tch::Device::Cpu));
+        let flat_qkv_b = Tensor::zeros([12, 4], (tch::Kind::Float, tch::Device::Cpu));
         let row_a = Tensor::zeros([4, 4], (tch::Kind::Float, tch::Device::Cpu));
         let row_b = Tensor::zeros([8, 4], (tch::Kind::Float, tch::Device::Cpu));
-        let lora_a = vec![column_a.shallow_clone(), row_a.shallow_clone()];
-        let lora_b = vec![column_b.shallow_clone(), row_b.shallow_clone()];
+        let lora_a = vec![
+            column_a.shallow_clone(),
+            flat_qkv_a.shallow_clone(),
+            row_a.shallow_clone(),
+        ];
+        let lora_b = vec![
+            column_b.shallow_clone(),
+            flat_qkv_b.shallow_clone(),
+            row_b.shallow_clone(),
+        ];
         let adam_m = vec![
             column_a.zeros_like(),
             column_b.zeros_like(),
+            flat_qkv_a.zeros_like(),
+            flat_qkv_b.zeros_like(),
             row_a.zeros_like(),
             row_b.zeros_like(),
         ];
         let adam_v = vec![
             column_a.ones_like(),
             column_b.ones_like(),
+            flat_qkv_a.ones_like(),
+            flat_qkv_b.ones_like(),
             row_a.ones_like(),
             row_b.ones_like(),
         ];
         let layouts = [
             LoraTpShardLayout::ColumnParallel,
+            LoraTpShardLayout::FlatQkvColumnParallel {
+                q_rows: 4,
+                k_rows: 4,
+                v_rows: 16,
+            },
             LoraTpShardLayout::RowParallel,
         ];
         let identities = [
@@ -1367,6 +1478,11 @@ mod tests {
                 index: 0,
                 layer: 0,
                 module: "q_proj".to_string(),
+            },
+            LoraSlotIdentity {
+                index: 4,
+                layer: 1,
+                module: "in_proj_qkv".to_string(),
             },
             LoraSlotIdentity {
                 index: 3,
@@ -1418,18 +1534,123 @@ mod tests {
         assert_eq!(column_b_shard.global_shape, vec![16, 4]);
         assert_eq!(column_b_shard.global_offset, vec![8, 0]);
 
-        let row_a_shard = shard("a_1");
+        let flat_qkv_a_shard = shard("a_1");
+        assert_eq!(
+            flat_qkv_a_shard.layout,
+            LoraTpShardLayout::FlatQkvColumnParallel {
+                q_rows: 4,
+                k_rows: 4,
+                v_rows: 16,
+            }
+        );
+        assert!(flat_qkv_a_shard.replicated);
+        assert_eq!(flat_qkv_a_shard.global_shape, vec![4, 8]);
+        assert_eq!(flat_qkv_a_shard.global_offset, vec![0, 0]);
+
+        let flat_qkv_b_shard = shard("b_1");
+        assert_eq!(
+            flat_qkv_b_shard.layout,
+            LoraTpShardLayout::FlatQkvColumnParallel {
+                q_rows: 4,
+                k_rows: 4,
+                v_rows: 16,
+            }
+        );
+        assert!(!flat_qkv_b_shard.replicated);
+        assert_eq!(flat_qkv_b_shard.partition_axis, 0);
+        assert_eq!(flat_qkv_b_shard.global_shape, vec![24, 4]);
+        assert_eq!(flat_qkv_b_shard.global_offset, vec![0, 0]);
+        assert_eq!(
+            flat_qkv_b_shard.segments,
+            vec![
+                TensorShardSegmentManifest {
+                    local_offset: 0,
+                    global_offset: 2,
+                    length: 2,
+                },
+                TensorShardSegmentManifest {
+                    local_offset: 2,
+                    global_offset: 6,
+                    length: 2,
+                },
+                TensorShardSegmentManifest {
+                    local_offset: 4,
+                    global_offset: 16,
+                    length: 8,
+                },
+            ]
+        );
+
+        let row_a_shard = shard("a_2");
         assert_eq!(row_a_shard.layout, LoraTpShardLayout::RowParallel);
         assert!(!row_a_shard.replicated);
         assert_eq!(row_a_shard.partition_axis, 1);
         assert_eq!(row_a_shard.global_shape, vec![4, 8]);
         assert_eq!(row_a_shard.global_offset, vec![0, 4]);
 
-        let row_b_shard = shard("b_1");
+        let row_b_shard = shard("b_2");
         assert!(row_b_shard.replicated);
         assert_eq!(row_b_shard.global_shape, vec![8, 4]);
         assert_eq!(row_b_shard.global_offset, vec![0, 0]);
         assert_eq!(row_b_shard.replica_identity, "tp-replicated");
+    }
+
+    #[test]
+    fn flat_qkv_segments_reconstruct_global_lora_and_optimizer_rows() {
+        let layout = LoraTpShardLayout::FlatQkvColumnParallel {
+            q_rows: 4,
+            k_rows: 4,
+            v_rows: 16,
+        };
+        let mut reconstructed = [vec![f64::NAN; 24], vec![f64::NAN; 24], vec![f64::NAN; 24]];
+
+        for rank in 0..2 {
+            let topology = tp_topology(rank, 2);
+            let global_rows = (0..24).map(f64::from).collect::<Vec<_>>();
+            let local_rows = [
+                &global_rows[rank * 2..rank * 2 + 2],
+                &global_rows[4 + rank * 2..4 + rank * 2 + 2],
+                &global_rows[8 + rank * 8..8 + rank * 8 + 8],
+            ]
+            .concat();
+
+            for (state_index, (state, delta)) in
+                [("lora_b", 0.0), ("adam_m", 100.0), ("adam_v", 200.0)]
+                    .into_iter()
+                    .enumerate()
+            {
+                let values = local_rows
+                    .iter()
+                    .map(|value| value + delta)
+                    .collect::<Vec<_>>();
+                let tensor = Tensor::from_slice(&values).reshape([12, 1]).repeat([1, 4]);
+                let shard = tensor_shard(
+                    &topology,
+                    None,
+                    4,
+                    "state.safetensors",
+                    state.to_string(),
+                    state,
+                    LoraSide::B,
+                    layout,
+                    &tensor,
+                )
+                .unwrap();
+                for segment in shard.segments {
+                    for offset in 0..segment.length {
+                        reconstructed[state_index][(segment.global_offset + offset) as usize] =
+                            tensor.double_value(&[segment.local_offset + offset, 0]);
+                    }
+                }
+            }
+        }
+
+        for (state_index, delta) in [0.0, 100.0, 200.0].into_iter().enumerate() {
+            let expected = (0..24)
+                .map(|row| f64::from(row) + delta)
+                .collect::<Vec<_>>();
+            assert_eq!(reconstructed[state_index], expected);
+        }
     }
 
     #[test]
@@ -1532,7 +1753,9 @@ mod tests {
         let fixed_error =
             validate_fixed_tp_resume(&manifest, &[LoraTpShardLayout::ColumnParallel], &[])
                 .unwrap_err();
-        assert!(fixed_error.to_string().contains("fixed Q/K/V/O"));
+        assert!(fixed_error
+            .to_string()
+            .contains("fixed projection-aware attention LoRA"));
         let dynamic_error =
             validate_dynamic_tp_resume(&manifest, 17, &[], &[LoraTpShardLayout::RowParallel])
                 .unwrap_err();

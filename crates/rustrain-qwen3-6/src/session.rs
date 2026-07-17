@@ -328,9 +328,10 @@ fn train_impl(
         );
     }
 
-    // Full attention follows Megatron's Q/K/V ColumnParallel and O
-    // RowParallel layout. Dense MLP additionally shards gate/up rows and down
-    // columns. GDN, MoE experts, embeddings, and the LM head remain replicated.
+    // Full attention and GDN follow head-aligned ColumnParallel input
+    // projections and RowParallel output projections. Dense MLP additionally
+    // shards gate/up rows and down columns. MoE experts, embeddings, and the
+    // LM head remain replicated.
     let base_tp_attention = tp_size > 1;
     let base_tp_mlp = tp_size > 1 && !runtime_config.is_moe;
     if base_tp_attention {
@@ -361,6 +362,30 @@ fn train_impl(
                 runtime_config.head_dim,
                 runtime_config.partial_rotary_factor
             );
+        }
+        if runtime_config
+            .layer_types
+            .iter()
+            .any(|layer| *layer == LayerType::LinearAttention)
+        {
+            if runtime_config.linear_num_key_heads <= 0
+                || runtime_config.linear_num_value_heads <= 0
+                || runtime_config.linear_num_value_heads % runtime_config.linear_num_key_heads != 0
+                || runtime_config.linear_num_key_heads % tp_size as i64 != 0
+                || runtime_config.linear_num_value_heads % tp_size as i64 != 0
+                || runtime_config.linear_key_head_dim != 128
+                || runtime_config.linear_value_head_dim != 128
+                || runtime_config.linear_conv_kernel_dim <= 0
+            {
+                bail!(
+                    "linear-attention TP requires k/v heads divisible by TP_SIZE with preserved value-head groups, 128-wide key/value heads, and a positive conv kernel: k_heads={}, v_heads={}, key_dim={}, value_dim={}, conv_kernel={}, tp={tp_size}",
+                    runtime_config.linear_num_key_heads,
+                    runtime_config.linear_num_value_heads,
+                    runtime_config.linear_key_head_dim,
+                    runtime_config.linear_value_head_dim,
+                    runtime_config.linear_conv_kernel_dim,
+                );
+            }
         }
     }
     if base_tp_mlp {
@@ -440,12 +465,26 @@ fn train_impl(
     } else {
         for (name, tensor) in &weights {
             let local_shard = if base_tp_attention {
-                let attention_shard = crate::kernel::shard_full_attention_weight_for_tp(
+                let full_attention_shard = crate::kernel::shard_full_attention_weight_for_tp(
                     name,
                     tensor,
                     tp_size,
                     rank % tp_size,
                 )?;
+                let attention_shard = if full_attention_shard.is_some() {
+                    full_attention_shard
+                } else {
+                    crate::kernel::shard_linear_attention_weight_for_tp(
+                        name,
+                        tensor,
+                        tp_size,
+                        rank % tp_size,
+                        runtime_config.linear_num_key_heads,
+                        runtime_config.linear_key_head_dim,
+                        runtime_config.linear_num_value_heads,
+                        runtime_config.linear_value_head_dim,
+                    )?
+                };
                 if attention_shard.is_some() || !base_tp_mlp {
                     attention_shard
                 } else {
@@ -471,7 +510,7 @@ fn train_impl(
                 tp_size,
                 tp_rank = rank % tp_size,
                 base_tp_mlp,
-                "frozen base TP enabled: full-attention head shards and optional dense MLP shards"
+                "frozen base TP enabled: full-attention/GDN head shards and optional dense MLP shards"
             );
         }
     }

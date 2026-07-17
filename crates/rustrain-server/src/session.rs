@@ -10,12 +10,25 @@ use crate::checkpoint;
 use crate::metrics::{FileMetricsSink, MetricsSink, StepMetric};
 use rustrain_qwen3_6::lora::{Qwen36AdapterArtifact, Qwen36LoraConfig, Qwen36LoraTargetModule};
 
-fn lora_tp_shard_layout(module: Qwen36LoraTargetModule) -> checkpoint::LoraTpShardLayout {
+fn lora_tp_shard_layout(
+    module: Qwen36LoraTargetModule,
+    config: &rustrain_qwen3_6::config::Qwen36RuntimeConfig,
+) -> checkpoint::LoraTpShardLayout {
     match module {
         Qwen36LoraTargetModule::QProj
         | Qwen36LoraTargetModule::KProj
-        | Qwen36LoraTargetModule::VProj => checkpoint::LoraTpShardLayout::ColumnParallel,
-        Qwen36LoraTargetModule::OProj => checkpoint::LoraTpShardLayout::RowParallel,
+        | Qwen36LoraTargetModule::VProj
+        | Qwen36LoraTargetModule::InProjZ
+        | Qwen36LoraTargetModule::InProjA
+        | Qwen36LoraTargetModule::InProjB => checkpoint::LoraTpShardLayout::ColumnParallel,
+        Qwen36LoraTargetModule::InProjQkv => checkpoint::LoraTpShardLayout::FlatQkvColumnParallel {
+            q_rows: config.linear_num_key_heads * config.linear_key_head_dim,
+            k_rows: config.linear_num_key_heads * config.linear_key_head_dim,
+            v_rows: config.linear_num_value_heads * config.linear_value_head_dim,
+        },
+        Qwen36LoraTargetModule::OProj | Qwen36LoraTargetModule::OutProj => {
+            checkpoint::LoraTpShardLayout::RowParallel
+        }
         _ => checkpoint::LoraTpShardLayout::LatentRank,
     }
 }
@@ -352,6 +365,29 @@ impl TrainingSession for Qwen36Session {
                     "frozen base TP currently requires MTP to be disabled"
                 ));
             }
+            if runtime_config
+                .layer_types
+                .iter()
+                .any(|layer| *layer == rustrain_qwen3_6::config::LayerType::LinearAttention)
+                && (runtime_config.linear_num_key_heads <= 0
+                    || runtime_config.linear_num_value_heads <= 0
+                    || runtime_config.linear_num_value_heads % runtime_config.linear_num_key_heads
+                        != 0
+                    || runtime_config.linear_num_key_heads % tp_size as i64 != 0
+                    || runtime_config.linear_num_value_heads % tp_size as i64 != 0
+                    || runtime_config.linear_key_head_dim != 128
+                    || runtime_config.linear_value_head_dim != 128
+                    || runtime_config.linear_conv_kernel_dim <= 0)
+            {
+                return Err(anyhow!(
+                    "linear-attention TP requires k/v heads divisible by TP_SIZE with preserved value-head groups, 128-wide key/value heads, and a positive conv kernel: k_heads={}, v_heads={}, key_dim={}, value_dim={}, conv_kernel={}, tp={tp_size}",
+                    runtime_config.linear_num_key_heads,
+                    runtime_config.linear_num_value_heads,
+                    runtime_config.linear_key_head_dim,
+                    runtime_config.linear_value_head_dim,
+                    runtime_config.linear_conv_kernel_dim,
+                ));
+            }
             if runtime_config.num_attention_heads <= 0
                 || runtime_config.num_attention_heads % tp_size as i64 != 0
                 || runtime_config.num_key_value_heads <= 0
@@ -445,13 +481,27 @@ impl TrainingSession for Qwen36Session {
                 weights.insert(name, narrowed);
             } else {
                 let local_shard = if base_tp_attention {
-                    let attention_shard =
+                    let full_attention_shard =
                         rustrain_qwen3_6::kernel::shard_full_attention_weight_for_tp(
                             &name,
                             &tensor,
                             tp_size,
                             ep_rank % tp_size,
                         )?;
+                    let attention_shard = if full_attention_shard.is_some() {
+                        full_attention_shard
+                    } else {
+                        rustrain_qwen3_6::kernel::shard_linear_attention_weight_for_tp(
+                            &name,
+                            &tensor,
+                            tp_size,
+                            ep_rank % tp_size,
+                            runtime_config.linear_num_key_heads,
+                            runtime_config.linear_key_head_dim,
+                            runtime_config.linear_num_value_heads,
+                            runtime_config.linear_value_head_dim,
+                        )?
+                    };
                     if attention_shard.is_some() || !base_tp_mlp {
                         attention_shard
                     } else {
@@ -714,7 +764,7 @@ impl TrainingSession for Qwen36Session {
             adam_m.push(all_adam_m[optimizer_index + 1].shallow_clone());
             adam_v.push(all_adam_v[optimizer_index].shallow_clone());
             adam_v.push(all_adam_v[optimizer_index + 1].shallow_clone());
-            fixed_shard_layouts.push(lora_tp_shard_layout(slot.module));
+            fixed_shard_layouts.push(lora_tp_shard_layout(slot.module, &runtime_config));
             fixed_slot_identities.push(checkpoint::LoraSlotIdentity {
                 index: slot.index,
                 layer: slot.layer,
@@ -729,7 +779,7 @@ impl TrainingSession for Qwen36Session {
                 let shard_layouts = slots
                     .iter()
                     .filter(|slot| slot.active)
-                    .map(|slot| lora_tp_shard_layout(slot.module))
+                    .map(|slot| lora_tp_shard_layout(slot.module, &runtime_config))
                     .collect::<Vec<_>>();
                 let mut dynamic_a = Vec::new();
                 let mut dynamic_b = Vec::new();
@@ -892,7 +942,7 @@ impl TrainingSession for Qwen36Session {
         let expected_fixed_layouts = fixed_slots
             .iter()
             .filter(|slot| slot.active)
-            .map(|slot| lora_tp_shard_layout(slot.module))
+            .map(|slot| lora_tp_shard_layout(slot.module, &runtime_config))
             .collect::<Vec<_>>();
         let expected_fixed_identities = fixed_slots
             .iter()
@@ -928,7 +978,7 @@ impl TrainingSession for Qwen36Session {
                     rustrain_qwen3_6::lora::native_lora_slots(&runtime_config, &config)
                         .iter()
                         .filter(|slot| slot.active)
-                        .map(|slot| lora_tp_shard_layout(slot.module))
+                        .map(|slot| lora_tp_shard_layout(slot.module, &runtime_config))
                         .collect::<Vec<_>>();
                 checkpoint::validate_dynamic_tp_resume(
                     &data.manifest,

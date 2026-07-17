@@ -197,7 +197,7 @@ unsafe fn load_kernels() -> Option<KernelHandles> {
         }};
     }
     let abi_version: FnKernelAbiVersion = sym!("qwen36_kernel_abi_version");
-    if abi_version() != 14 {
+    if abi_version() != 15 {
         return None;
     }
     Some(KernelHandles {
@@ -324,6 +324,97 @@ pub fn shard_full_attention_weight_for_tp(
             .narrow(dim, tp_rank as i64 * shard, shard)
             .contiguous(),
     ))
+}
+
+/// Return the rank-local frozen GDN shard for TP. Q/K/V use the model's flat
+/// `[Q_all | K_all | V_all]` layout, so QKV and depthwise-conv tensors must be
+/// sliced segment by segment before being packed into the local flat layout.
+#[allow(clippy::too_many_arguments)]
+pub fn shard_linear_attention_weight_for_tp(
+    name: &str,
+    tensor: &Tensor,
+    tp_size: usize,
+    tp_rank: usize,
+    num_k_heads: i64,
+    key_dim: i64,
+    num_v_heads: i64,
+    val_dim: i64,
+) -> Result<Option<Tensor>> {
+    let is_qkv = name.ends_with(".linear_attn.in_proj_qkv.weight");
+    let is_conv = name.ends_with(".linear_attn.conv1d.weight");
+    let is_z = name.ends_with(".linear_attn.in_proj_z.weight");
+    let is_ab = name.ends_with(".linear_attn.in_proj_a.weight")
+        || name.ends_with(".linear_attn.in_proj_b.weight");
+    let is_head = name.ends_with(".linear_attn.A_log") || name.ends_with(".linear_attn.dt_bias");
+    let is_out = name.ends_with(".linear_attn.out_proj.weight");
+    if !(is_qkv || is_conv || is_z || is_ab || is_head || is_out) {
+        return Ok(None);
+    }
+    if tp_size <= 1 || tp_rank >= tp_size {
+        bail!("invalid linear-attention TP shard: tp_rank={tp_rank}, tp_size={tp_size}");
+    }
+    let tp_size_i64 = tp_size as i64;
+    if num_k_heads <= 0
+        || num_v_heads <= 0
+        || key_dim <= 0
+        || val_dim <= 0
+        || num_v_heads % num_k_heads != 0
+        || num_k_heads % tp_size_i64 != 0
+        || num_v_heads % tp_size_i64 != 0
+    {
+        bail!(
+            "linear-attention heads/dimensions must preserve value-head groups and be divisible by TP_SIZE={tp_size}: k_heads={num_k_heads}, v_heads={num_v_heads}, key_dim={key_dim}, val_dim={val_dim}"
+        );
+    }
+
+    let q_total = num_k_heads * key_dim;
+    let v_total = num_v_heads * val_dim;
+    let qkv_total = q_total * 2 + v_total;
+    let local_q = q_total / tp_size_i64;
+    let local_v = v_total / tp_size_i64;
+    let local_heads = num_v_heads / tp_size_i64;
+    let rank = tp_rank as i64;
+    let shape = tensor.size();
+
+    let require_axis = |axis: usize, expected: i64| -> Result<()> {
+        let actual = shape.get(axis).copied().ok_or_else(|| {
+            anyhow::anyhow!("base TP linear-attention weight {name} has no dimension {axis}")
+        })?;
+        if actual != expected {
+            bail!(
+                "base TP linear-attention weight {name} dimension {axis}={actual}, expected {expected}"
+            );
+        }
+        Ok(())
+    };
+
+    if is_qkv || is_conv {
+        require_axis(0, qkv_total)?;
+        if is_qkv && shape.len() != 2 {
+            bail!("base TP linear-attention QKV weight {name} must be rank 2");
+        }
+        if is_conv && (shape.len() != 3 || shape[1] != 1) {
+            bail!("base TP linear-attention depthwise conv weight {name} must have shape [channels, 1, kernel]");
+        }
+        let q = tensor.narrow(0, rank * local_q, local_q);
+        let k = tensor.narrow(0, q_total + rank * local_q, local_q);
+        let v = tensor.narrow(0, q_total * 2 + rank * local_v, local_v);
+        return Ok(Some(Tensor::cat(&[&q, &k, &v], 0).contiguous()));
+    }
+    if is_z {
+        require_axis(0, v_total)?;
+        return Ok(Some(tensor.narrow(0, rank * local_v, local_v).contiguous()));
+    }
+    if is_ab || is_head {
+        require_axis(0, num_v_heads)?;
+        return Ok(Some(
+            tensor
+                .narrow(0, rank * local_heads, local_heads)
+                .contiguous(),
+        ));
+    }
+    require_axis(1, v_total)?;
+    Ok(Some(tensor.narrow(1, rank * local_v, local_v).contiguous()))
 }
 
 pub fn build_weight_ptrs(
@@ -1191,7 +1282,10 @@ impl Drop for CppTrainingContext {
 
 #[cfg(test)]
 mod tests {
-    use super::{shard_dense_mlp_weight_for_tp, shard_full_attention_weight_for_tp};
+    use super::{
+        shard_dense_mlp_weight_for_tp, shard_full_attention_weight_for_tp,
+        shard_linear_attention_weight_for_tp,
+    };
     use tch::{Kind, Tensor};
 
     #[test]
@@ -1263,6 +1357,110 @@ mod tests {
             &tensor,
             2,
             0,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn linear_attention_tp_preserves_flat_qkv_and_conv_segments() {
+        let qkv = Tensor::arange(48, (Kind::Float, tch::Device::Cpu)).reshape([12, 4]);
+        let conv = Tensor::arange(24, (Kind::Float, tch::Device::Cpu)).reshape([12, 1, 2]);
+        let qkv_rank_one = shard_linear_attention_weight_for_tp(
+            "model.layers.0.linear_attn.in_proj_qkv.weight",
+            &qkv,
+            2,
+            1,
+            2,
+            2,
+            4,
+            1,
+        )
+        .unwrap()
+        .unwrap();
+        let conv_rank_one = shard_linear_attention_weight_for_tp(
+            "model.layers.0.linear_attn.conv1d.weight",
+            &conv,
+            2,
+            1,
+            2,
+            2,
+            4,
+            1,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(qkv_rank_one.size(), [6, 4]);
+        assert_eq!(conv_rank_one.size(), [6, 1, 2]);
+        // Global rows are Q=[0..4], K=[4..8], V=[8..12]. Rank 1 owns the
+        // second half of each segment and repacks them as local [Q|K|V].
+        assert_eq!(qkv_rank_one.double_value(&[0, 0]), 8.0);
+        assert_eq!(qkv_rank_one.double_value(&[2, 0]), 24.0);
+        assert_eq!(qkv_rank_one.double_value(&[4, 0]), 40.0);
+        assert_eq!(conv_rank_one.double_value(&[0, 0, 0]), 4.0);
+        assert_eq!(conv_rank_one.double_value(&[2, 0, 0]), 12.0);
+        assert_eq!(conv_rank_one.double_value(&[4, 0, 0]), 20.0);
+    }
+
+    #[test]
+    fn linear_attention_tp_shards_value_head_tensors_and_output_columns() {
+        let z = Tensor::arange(32, (Kind::Float, tch::Device::Cpu)).reshape([8, 4]);
+        let a = Tensor::arange(16, (Kind::Float, tch::Device::Cpu)).reshape([4, 4]);
+        let a_log = Tensor::arange(4, (Kind::Float, tch::Device::Cpu));
+        let out = Tensor::arange(32, (Kind::Float, tch::Device::Cpu)).reshape([4, 8]);
+        let shard = |name: &str, tensor: &Tensor| {
+            shard_linear_attention_weight_for_tp(name, tensor, 2, 1, 2, 2, 4, 2)
+                .unwrap()
+                .unwrap()
+        };
+        let z = shard("model.layers.0.linear_attn.in_proj_z.weight", &z);
+        let a = shard("model.layers.0.linear_attn.in_proj_a.weight", &a);
+        let a_log = shard("model.layers.0.linear_attn.A_log", &a_log);
+        let out = shard("model.layers.0.linear_attn.out_proj.weight", &out);
+        assert_eq!(z.size(), [4, 4]);
+        assert_eq!(a.size(), [2, 4]);
+        assert_eq!(a_log.size(), [2]);
+        assert_eq!(out.size(), [4, 4]);
+        assert_eq!(z.double_value(&[0, 0]), 16.0);
+        assert_eq!(a.double_value(&[0, 0]), 8.0);
+        assert_eq!(a_log.double_value(&[0]), 2.0);
+        assert_eq!(out.double_value(&[0, 0]), 4.0);
+    }
+
+    #[test]
+    fn linear_attention_tp_rejects_invalid_groups_and_shapes() {
+        let tensor = Tensor::zeros([12, 4], (Kind::Float, tch::Device::Cpu));
+        assert!(shard_linear_attention_weight_for_tp(
+            "model.layers.0.linear_attn.norm.weight",
+            &tensor,
+            2,
+            0,
+            2,
+            2,
+            4,
+            1,
+        )
+        .unwrap()
+        .is_none());
+        assert!(shard_linear_attention_weight_for_tp(
+            "model.layers.0.linear_attn.in_proj_qkv.weight",
+            &tensor,
+            2,
+            0,
+            3,
+            2,
+            4,
+            1,
+        )
+        .is_err());
+        assert!(shard_linear_attention_weight_for_tp(
+            "model.layers.0.linear_attn.in_proj_qkv.weight",
+            &Tensor::zeros([11, 4], (Kind::Float, tch::Device::Cpu)),
+            2,
+            0,
+            2,
+            2,
+            4,
+            1,
         )
         .is_err());
     }

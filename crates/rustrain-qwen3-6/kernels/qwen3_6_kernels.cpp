@@ -1820,6 +1820,8 @@ static at::Tensor forward_single_layer(
         // Linear attention
         auto in_proj_qkv = *w[2], in_proj_z = *w[3], in_proj_a = *w[4], in_proj_b = *w[5];
         auto a_log = *w[6], dt_bias = *w[7], conv1d_w = *w[8], norm_w = *w[9], out_proj = *w[10];
+        TORCH_CHECK(!base_tp_attention_enabled(ctx) || use_batched,
+            "base linear-attention TP requires the activation-level LoRA path");
         if (use_batched) {
             attn_output = linear_attention_batched(
                 ctx, attn_input, layer_idx,
@@ -2020,9 +2022,8 @@ struct TrainingContext {
     // input-sharded by the Rust weight loader.  The local row contribution
     // is reduced over the TP communicator before the residual add.
     bool base_tp_mlp = false;
-    // Frozen full-attention TP: Q/K/V own disjoint head bundles and O owns
-    // the matching input columns. GDN layers remain replicated until their
-    // state/head bundle partition has a dedicated implementation.
+    // Frozen attention TP: full attention and GDN own disjoint head bundles;
+    // their output projections own the matching input columns.
     bool base_tp_attention = false;
     // Set when a legacy NCCL setter supplies an incompatible mixed topology.
     // Training entry points reject the context before touching parameters.
@@ -2231,14 +2232,16 @@ static LoraTpLayout lora_tp_layout(
         layer_idx < 0 || layer_idx >= ctx->num_layers)
         return LoraTpLayout::LatentRank;
     const auto& cfg = ctx->layer_configs[layer_idx];
-    if (cfg.layer_type != 0) return LoraTpLayout::LatentRank;
     auto table = lora_projection_table(cfg);
     TORCH_CHECK(pair_idx >= 0 && pair_idx < table.count,
         "invalid LoRA pair for TP layout");
     const std::string name(table.entries[pair_idx].name);
-    if (name == "q_proj" || name == "k_proj" || name == "v_proj")
+    if (name == "q_proj" || name == "k_proj" || name == "v_proj" ||
+        name == "in_proj_qkv" || name == "in_proj_z" ||
+        name == "in_proj_a" || name == "in_proj_b")
         return LoraTpLayout::ColumnParallel;
-    if (name == "o_proj") return LoraTpLayout::RowParallel;
+    if (name == "o_proj" || name == "out_proj")
+        return LoraTpLayout::RowParallel;
     return LoraTpLayout::LatentRank;
 }
 
@@ -3038,8 +3041,8 @@ at::Tensor compute_attn_only(
     }
 
     // Legacy path: weight-level LoRA
-    TORCH_CHECK(!ctx->base_tp_attention || cfg.layer_type != 0,
-        "base full-attention TP requires the activation-level LoRA path");
+    TORCH_CHECK(!ctx->base_tp_attention,
+        "base attention TP requires the activation-level LoRA path");
     int64_t lora_count = lora_pair_count(cfg);
     int64_t la_offset = ctx->lora_layer_offset[layer_idx];
     bool has_lora = (la_offset + lora_count) <= (int64_t)ctx->lora_a.size();
@@ -3408,17 +3411,26 @@ static at::Tensor linear_attention_batched(
 ) {
     // Full reimplementation of linear_attention non-chunked path with
     // activation-level LoRA delta on QKV, Z, and out_proj.
-    auto device = hidden.device();
     int64_t batch = hidden.size(0), seq = hidden.size(1);
+    auto projection_input = tp_copy_base_attention_input(ctx, hidden);
+    if (base_tp_attention_enabled(ctx)) {
+        TORCH_CHECK(num_k_heads > 0 && num_v_heads > 0 &&
+                num_v_heads % num_k_heads == 0 &&
+                num_k_heads % ctx->tp_world_size == 0 &&
+                num_v_heads % ctx->tp_world_size == 0,
+            "linear-attention heads must preserve value-head groups and be divisible by TP_SIZE");
+        num_k_heads /= ctx->tp_world_size;
+        num_v_heads /= ctx->tp_world_size;
+    }
     int64_t q_size = num_k_heads * key_dim;
     int64_t v_size = num_v_heads * val_dim;
     int64_t qkv_dim = q_size * 2 + v_size;
 
     // QKV projection + LoRA delta
-    auto qkv = at::matmul(hidden, in_proj_qkv.t());
+    auto qkv = at::matmul(projection_input, in_proj_qkv.t());
     auto it_qkv = ctx->lora_batch_cache.find(lora_cache_key(layer_idx, 0));
     if (it_qkv != ctx->lora_batch_cache.end()) {
-        qkv = qkv + lora_activation_delta(ctx, hidden, it_qkv->second.a_stack,
+        qkv = qkv + lora_activation_delta(ctx, projection_input, it_qkv->second.a_stack,
             it_qkv->second.b_stack, it_qkv->second.scaling, it_qkv->second.layout);
     }
 
@@ -3487,24 +3499,24 @@ static at::Tensor linear_attention_batched(
                 v_f[0][0][0][0].item<float>(), v_f[0][0][0][1].item<float>(), v_f[0][0][0][2].item<float>());
     }
 
-    auto a = at::matmul(hidden, in_proj_a.t());
-    auto b = at::matmul(hidden, in_proj_b.t());
+    auto a = at::matmul(projection_input, in_proj_a.t());
+    auto b = at::matmul(projection_input, in_proj_b.t());
     auto it_a = ctx->lora_batch_cache.find(lora_cache_key(layer_idx, 2));
     if (it_a != ctx->lora_batch_cache.end()) {
-        a = a + lora_activation_delta(ctx, hidden, it_a->second.a_stack,
+        a = a + lora_activation_delta(ctx, projection_input, it_a->second.a_stack,
             it_a->second.b_stack, it_a->second.scaling, it_a->second.layout);
     }
     auto it_b = ctx->lora_batch_cache.find(lora_cache_key(layer_idx, 3));
     if (it_b != ctx->lora_batch_cache.end()) {
-        b = b + lora_activation_delta(ctx, hidden, it_b->second.a_stack,
+        b = b + lora_activation_delta(ctx, projection_input, it_b->second.a_stack,
             it_b->second.b_stack, it_b->second.scaling, it_b->second.layout);
     }
 
     // Z projection + LoRA delta
-    auto z = at::matmul(hidden, in_proj_z.t());
+    auto z = at::matmul(projection_input, in_proj_z.t());
     auto it_z = ctx->lora_batch_cache.find(lora_cache_key(layer_idx, 1));
     if (it_z != ctx->lora_batch_cache.end()) {
-        z = z + lora_activation_delta(ctx, hidden, it_z->second.a_stack,
+        z = z + lora_activation_delta(ctx, projection_input, it_z->second.a_stack,
             it_z->second.b_stack, it_z->second.scaling, it_z->second.layout);
     }
     z = z.reshape({batch, seq, num_v_heads, head_v_dim});
@@ -3621,7 +3633,7 @@ static at::Tensor linear_attention_batched(
             it_op->second.b_stack, it_op->second.scaling, it_op->second.layout);
     }
 
-    return result;
+    return tp_allreduce_base_attention(ctx, result);
 }
 // ──────────────────────────────────────────────────────────────────────
 
@@ -4578,7 +4590,7 @@ static at::Tensor mtp_compute_loss(
 extern "C" {
 
 __attribute__((visibility("default"))) int64_t qwen36_kernel_abi_version() {
-    return 14;
+    return 15;
 }
 
 static constexpr int32_t QWEN36_CONTEXT_BASE_TP_ATTENTION = 1 << 0;
@@ -4667,7 +4679,7 @@ static void* qwen36_create_training_context_impl(
 
         if (ctx->base_tp_attention) {
             TORCH_CHECK(ctx->tp_world_size > 1,
-                "base full-attention TP requires TP_SIZE>1");
+                "base attention TP requires TP_SIZE>1");
             int64_t weight_offset = 0;
             for (int64_t layer = 0; layer < num_layers; ++layer) {
                 const auto& cfg = ctx->layer_configs[layer];
@@ -4706,6 +4718,67 @@ static void* qwen36_create_training_context_impl(
                         "base full-attention TP received inconsistent local weight shapes at layer ",
                         layer, ": q=", q->sizes(), " k=", k->sizes(),
                         " v=", v->sizes(), " o=", o->sizes());
+                } else {
+                    TORCH_CHECK(cfg.num_k_heads > 0 && cfg.num_v_heads > 0 &&
+                            cfg.key_dim == 128 && cfg.val_dim == 128 &&
+                            cfg.conv_kernel > 0,
+                        "invalid linear-attention configuration at layer ", layer);
+                    TORCH_CHECK(cfg.num_v_heads % cfg.num_k_heads == 0 &&
+                            cfg.num_k_heads % ctx->tp_world_size == 0 &&
+                            cfg.num_v_heads % ctx->tp_world_size == 0,
+                        "linear-attention heads must preserve value-head groups and be divisible by TP_SIZE at layer ",
+                        layer);
+                    auto* qkv = ctx->weight_ptrs[weight_offset + 2];
+                    auto* z = ctx->weight_ptrs[weight_offset + 3];
+                    auto* a = ctx->weight_ptrs[weight_offset + 4];
+                    auto* b = ctx->weight_ptrs[weight_offset + 5];
+                    auto* a_log = ctx->weight_ptrs[weight_offset + 6];
+                    auto* dt_bias = ctx->weight_ptrs[weight_offset + 7];
+                    auto* conv = ctx->weight_ptrs[weight_offset + 8];
+                    auto* norm = ctx->weight_ptrs[weight_offset + 9];
+                    auto* out = ctx->weight_ptrs[weight_offset + 10];
+                    TORCH_CHECK(qkv && z && a && b && a_log && dt_bias &&
+                            conv && norm && out,
+                        "base linear-attention TP received null weights at layer ", layer);
+                    const int64_t local_k_heads =
+                        cfg.num_k_heads / ctx->tp_world_size;
+                    const int64_t local_v_heads =
+                        cfg.num_v_heads / ctx->tp_world_size;
+                    const int64_t local_q = local_k_heads * cfg.key_dim;
+                    const int64_t local_v = local_v_heads * cfg.val_dim;
+                    const int64_t local_qkv = local_q * 2 + local_v;
+                    TORCH_CHECK(qkv->dim() == 2 &&
+                            qkv->size(0) == local_qkv,
+                        "base linear-attention TP QKV shape mismatch at layer ",
+                        layer, ": ", qkv->sizes(), " expected rows=", local_qkv);
+                    const int64_t hidden_size = qkv->size(1);
+                    TORCH_CHECK(z->dim() == 2 && z->size(0) == local_v &&
+                            z->size(1) == hidden_size &&
+                            a->dim() == 2 && a->size(0) == local_v_heads &&
+                            a->size(1) == hidden_size &&
+                            b->dim() == 2 && b->sizes() == a->sizes(),
+                        "base linear-attention TP Z/A/B shapes mismatch at layer ", layer,
+                        ": z=", z->sizes(), " a=", a->sizes(), " b=", b->sizes());
+                    TORCH_CHECK(a_log->dim() == 1 &&
+                            a_log->size(0) == local_v_heads &&
+                            dt_bias->dim() == 1 &&
+                            dt_bias->size(0) == local_v_heads,
+                        "base linear-attention TP A_log/dt_bias shapes mismatch at layer ",
+                        layer, ": A_log=", a_log->sizes(),
+                        " dt_bias=", dt_bias->sizes());
+                    TORCH_CHECK(conv->dim() == 3 &&
+                            conv->size(0) == local_qkv && conv->size(1) == 1 &&
+                            conv->size(2) == cfg.conv_kernel,
+                        "base linear-attention TP depthwise-conv shape mismatch at layer ",
+                        layer, ": ", conv->sizes());
+                    TORCH_CHECK(norm->dim() == 1 && norm->size(0) == cfg.val_dim,
+                        "base linear-attention TP norm must remain replicated at layer ",
+                        layer, ": ", norm->sizes());
+                    TORCH_CHECK(out->dim() == 2 && out->size(0) == hidden_size &&
+                            out->size(1) == local_v,
+                        "base linear-attention TP output shape mismatch at layer ",
+                        layer, ": ", out->sizes(), " expected [", hidden_size,
+                        ", ", local_v, "]");
                 }
                 weight_offset += weight_count_for_layer(cfg);
             }

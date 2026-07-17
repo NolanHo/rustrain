@@ -129,7 +129,9 @@ int main() {
         weight_ptrs.data(), weight_ptrs.size(), &embed, &final_norm, &lm_head,
         configs, 2, static_cast<int32_t>(at::kBFloat16),
         1.0, 1e-3, 0.9, 0.999, 1e-8, vocab, 1e-5, lora_rank,
-        target_layers, 2, "in_proj_qkv", 1);
+        // This regression exercises latent-rank-only TP with replicated GDN
+        // base weights. ABI15 bit 0 now explicitly enables base GDN head TP.
+        target_layers, 2, "in_proj_qkv", 0);
     assert(distributed && qwen36_init_nccl(distributed) == 0);
 
     setenv("TP_SIZE", "1", 1);

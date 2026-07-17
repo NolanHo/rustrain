@@ -40,6 +40,37 @@ S = S + k_t ⊗ delta                 # state update
 out_t = S @ q_t                     # output
 ```
 
+## Tensor Parallel Layout
+
+GDN TP partitions K/V head groups while preserving `n_rep = V_heads / K_heads`:
+
+- `in_proj_qkv.weight` and `conv1d.weight`: slice Q, K, and V segments independently, then repack each rank as `[Q_local | K_local | V_local]`.
+- `in_proj_z.weight`: shard output rows by local V heads.
+- `in_proj_a.weight`, `in_proj_b.weight`, `A_log`, `dt_bias`: shard by local V-head rows.
+- `norm.weight`: replicate `[value_head_dim]`.
+- `out_proj.weight`: shard input columns matching local V heads, then all-reduce the local output.
+- Column-parallel LoRA replicates A and shards B; row-parallel LoRA shards A and replicates B. Replicated-factor gradients are summed once at the optimizer boundary.
+
+The v4 flat-QKV checkpoint manifest records three local-to-global row segments for Q, K, and V. Merge or reshard must apply those segments instead of treating the packed rank-local rows as one contiguous global slice.
+
+One `TpCopyToRegion` must wrap the shared input before the QKV/Z/A/B forks so backward sums their input-gradient contributions once. Do not all-reduce each fork separately.
+
+## Backward Stability
+
+The current fused CUDA backward reconstructs earlier states by dividing the decayed state by `g_exp`. This is fast and verified with realistic negative `dt_bias`, where decay stays near one, but it is ill-conditioned for synthetic long sequences with decay near `0.5`. A stable production replacement should checkpoint recurrent state by chunks and replay each chunk during backward instead of repeatedly inverting the decay.
+
+## Native GDN TP Verification
+
+Use a Python environment with ABI-compatible prebuilt PyTorch, CUDA, and NCCL, then run:
+
+```bash
+PYTHON=/path/to/python scripts/run_qwen36_native_gdn_tp.sh smoke
+PYTHON=/path/to/python scripts/run_qwen36_native_gdn_tp.sh bench-single
+PYTHON=/path/to/python scripts/run_qwen36_native_gdn_tp.sh bench-tp2
+```
+
+The script builds only the repository kernel and native harnesses. It discovers and links the prebuilt dependency files from the selected Python environment; missing headers or libraries are reported instead of building third-party dependencies.
+
 ## L2 Normalization
 
 - Transformers: `x * rsqrt(sum(x²) + eps)` (eps=1e-6, in denominator)
