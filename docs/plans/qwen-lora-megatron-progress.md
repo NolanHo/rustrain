@@ -14,7 +14,7 @@ timestamp: 2026-07-17T00:00:00Z
 
 Verified: Qwen3.5/3.6 native forward/backward slices, GDN CUDA path, grouped MoE fallback, EP parity against a full-expert reference, variable-split EP A2A with fixed-LoRA data sharding, dense replicated-DP smoke with per-tenant token weighting, TP-only latent-rank-sharded LoRA smoke, dynamic batch logical-step update, ABI11 FP32 gradient storage/aggregation, standard Adam bias correction, per-tenant optimizer-step restore, selected-tenant isolation, same-topology rank-aware checkpointing, and 5D topology mapping.
 
-Not yet verified or implemented: Megatron-style frozen base-weight TP, multi-axis TP+DP/EP, PP/CP, DeepEP/TE prebuilt integration, dynamic multi-LoRA source metadata under sharded A2A, cross-topology checkpoint resharding, and matched Megatron throughput.
+Not yet verified or implemented: Megatron-style frozen base-weight TP, multi-axis TP+DP/EP, PP/CP, DeepEP/TE prebuilt integration, server-side source-sharded dynamic dispatch, heterogeneous dynamic adapter signatures, dynamic+MTP objective normalization, cross-topology checkpoint resharding, and matched Megatron throughput. Native direct dynamic source metadata under sharded A2A is now implemented and full-reference smoke-tested.
 
 # Durable Milestones
 
@@ -28,7 +28,7 @@ Not yet verified or implemented: Megatron-style frozen base-weight TP, multi-axi
 - `76eace6`: direct native context creation also rejects PP/CP sizes greater than one, so unsupported pipeline/context parallelism cannot silently fall back to replicated single-stage execution.
 - `b7050ea`: fixed standard Adam bias correction, separated pure-DP gradient NCCL from MoE activation collectives, made dynamic-MoE DP token weighting numerical, scoped n_max rendezvous by invocation with atomic publication, and added full-expert EP parity plus Adam oracles.
 - `bfa3d8e`: added a gated variable-split NCCL dispatch/inverse-combine prototype with differentiable forward/backward collectives; default legacy EP remains unchanged.
-- Working tree after `bfa3d8e`: `QWEN36_EP_A2A_SHARDED=1` disjoins EP input rows, all-reduces global fixed-LoRA token numerators, keeps grouped expert LoRA local after A2A, and explicitly rejects dynamic multi-LoRA until source tenant metadata exists.
+- Working tree after `bfa3d8e`: `QWEN36_EP_A2A_SHARDED=1` disjoins EP input rows, all-reduces global fixed-LoRA token numerators, and keeps grouped expert LoRA local after A2A. Native dynamic multi-LoRA now reuses the transported source row for tenant mapping, all-reduces per-tenant counts, skips zero-global-token tenants, and rejects ordinary single-adapter entry points while a dynamic registry is active.
 - H20 `123.57.26.97:28004`: ABI8 native smoke passed grouped/fallback parity, GDN, dense/MoE LoRA, dynamic adapters, and step setter validation.
 - H20 `123.57.26.97:28004`: ABI9 native smoke passed selected-tenant training with a positive selected update, exactly zero unselected update, independent clocks (`2` vs `1`), and registry preservation after an unknown ID.
 - H20 `123.57.26.97:28004`: ABI10 two-rank TP native smoke passed on both ranks for MoE, dense MLP, GDN/linear attention, dynamic multi-LoRA, and selected-tenant isolation. Rank-local LoRA tensors used distinct rank `4` slices for global rank `8`; losses matched and both shards had positive updates.
@@ -38,16 +38,17 @@ Not yet verified or implemented: Megatron-style frozen base-weight TP, multi-axi
 - H20 `123.57.26.97:28004`: gated A2A EP2 smoke passed in legacy, replicated-source, and sharded-source modes (`rank_statuses=0,0`). Sharded mode used token counts `[1,3]`; weighted global loss differed from the full-batch reference by `9.6e-7`, expert m/v maxima were `1.22e-5` / `3.92e-9`, and every standard Adam oracle was zero. One distributed BF16 parameter landed in the adjacent rounding bin (`9.61e-4`), bounded separately by the smoke.
 - Target runtime probe: PyTorch 2.5.1+cu121, ABI0; Transformer Engine, flash-attn, DeepEP, Triton, and DeepSpeed are not importable.
 - H20 `123.57.26.97:28004`: `native_ep_bench.cpp` fresh ABI0 benchmark (`seq=128, hidden=256, experts=8, intermediate=256, warmup=2, iters=10`) passed legacy and sharded A2A with `rank_statuses=0,0`. Legacy median was about `5.47 ms` / `46.4k processed tokens/s` (`23.2k unique tokens/s`), while sharded A2A was about `6.72 ms` / `37.8k processed and unique tokens/s`. This is a synthetic native baseline, not Megatron-LM parity.
+- H20 `123.57.26.97:28004`: fresh ABI1 dynamic sharded native smoke passed on both ranks (`rank_statuses=0,0`) against a full-expert reference with complementary source masks. Dynamic grouped-expert parameter/m/v maxima were `1.53e-5` / `4.88e-5` / `5.75e-8`; it also exercised a third tenant with zero global target tokens, clocks `[2,2,0]`, and explicit rejection of ordinary `train_step`. The server path still broadcasts replicated source batches, and dynamic+MTP is explicitly rejected until its two objective denominators are separated.
 
 # Decisions During Execution
 
 - Keep TP and EP communicators separate; do not reuse the existing EP `LayerConfig.nccl_comm` for LoRA TP deltas.
-- Scope multi-LoRA `n_max` rendezvous files per native context; reusing one filename across sessions can give ranks different chunk schedules and deadlock TP collectives.
+- Publish multi-LoRA `n_max` directly from rank 0 with `ncclBroadcast`; filesystem rendezvous can reuse stale files across process restarts and give ranks different chunk schedules.
 - Do not enable Qwen TP/PP/CP by merely relaxing runtime validation.
 - Treat Exa/Jina dependency search failures as missing evidence, not as proof that a package is compatible.
 
 # Verification
 
-Passed: `cargo check -p rustrain-qwen3-6 -p rustrain-server -p rustrain-ipc` (with the repository PyTorch 2.12.1 host venv), `cargo test -p rustrain-server --lib` (6), Qwen unit tests (3), Qwen integration (6), remote ABI8 smoke, remote ABI9 selected-tenant native smoke, remote ABI10 single-rank native smoke, remote ABI10 two-rank TP native smoke, and remote ABI11 single/TP2/DP2/EP2 native smoke with numerical Adam and parity oracles.
+Passed: `cargo check -p rustrain-qwen3-6 -p rustrain-server -p rustrain-ipc` (with the repository PyTorch 2.12.1 host venv), `cargo test -p rustrain-qwen3-6 --lib` (3), `cargo test -p rustrain-server --lib` (6), Qwen integration tests, remote ABI8 smoke, remote ABI9 selected-tenant native smoke, remote ABI10 single-rank native smoke, remote ABI10 two-rank TP native smoke, remote ABI11 single/TP2/DP2/EP2 native smoke with numerical Adam and parity oracles, and the ABI1 dynamic sharded full-reference smoke described above.
 
-Not run: Megatron-style base-model TP, multi-axis TP+DP/EP, PP/CP, dynamic multi-LoRA source metadata under sharded A2A, cross-topology resharding, and matched Megatron performance benchmark. The target host lacks importable Megatron/Transformer Engine/DeepEP/flash-attn prebuilt packages, so no dependency installation or JIT workaround was used.
+Not run: Megatron-style base-model TP, multi-axis TP+DP/EP, PP/CP, server-side source-sharded dynamic dispatch, heterogeneous dynamic adapter signatures, dynamic+MTP, cross-topology resharding, and matched Megatron performance benchmark. The target host lacks importable Megatron/Transformer Engine/DeepEP/flash-attn prebuilt packages, so no dependency installation or JIT workaround was used.

@@ -1177,6 +1177,10 @@ static at::Tensor moe_routed_a2a(
         flat.size(0), at::TensorOptions().device(flat.device()).dtype(at::kLong));
     for (int64_t kk = 0; kk < top_k; ++kk) {
         auto expert_indices = topk_indices.select(-1, kk).contiguous();
+        // `received_tokens` preserves the source flattened row index through
+        // dispatch. Dynamic multi-LoRA uses floor_divide(row, seq) to recover
+        // the tenant/sample row, so sharded A2A does not need a second host
+        // metadata exchange for adapter IDs.
         auto dispatched = Qwen36A2ADispatchFunction::apply(
             flat, expert_indices, token_indices, expert_count,
             static_cast<int64_t>(reinterpret_cast<uintptr_t>(comm)));
@@ -1307,8 +1311,10 @@ static at::Tensor moe_forward(
             "and QWEN36_EP_A2A=1");
     }
     bool use_a2a = false;
+    const bool sharded_a2a_mode = env_enabled("QWEN36_EP_A2A_SHARDED") &&
+        expert_count < num_experts;
     if (nccl_comm_v && env_enabled("QWEN36_EP_A2A") &&
-        !expert_gate_up_lora && !expert_down_lora) {
+        ((!expert_gate_up_lora && !expert_down_lora) || sharded_a2a_mode)) {
         auto comm = reinterpret_cast<ncclComm_t>(nccl_comm_v);
         int world = 1, rank = 0;
         auto err = ncclCommCount(comm, &world);
@@ -2184,6 +2190,38 @@ static void reduce_lora_accumulator(
     accumulator.copy_(reduced);
 }
 
+static void normalize_lora_accumulator_numerator(
+    TrainingContext* ctx, at::Tensor& accumulator,
+    const at::Tensor& global_weight, bool allreduce
+) {
+    if (!accumulator.defined()) return;
+    TORCH_CHECK(accumulator.scalar_type() == at::kFloat,
+        "LoRA DP gradient accumulator must be FP32");
+    TORCH_CHECK(global_weight.numel() == 1,
+        "per-adapter LoRA global token weight must be scalar");
+    auto numerator = accumulator.contiguous();
+    at::Tensor reduced;
+    if (allreduce) {
+        TORCH_CHECK(ctx->nccl_comm,
+            "LoRA gradient all-reduce has no communicator");
+        reduced = at::empty_like(numerator);
+        int dev = numerator.device().index();
+        cudaSetDevice(dev);
+        auto stream = c10::cuda::getCurrentCUDAStream(dev).stream();
+        auto err = ncclAllReduce(
+            numerator.data_ptr(), reduced.data_ptr(), numerator.numel(),
+            nccl_dtype_for(numerator), ncclSum, ctx->nccl_comm, stream);
+        TORCH_CHECK(err == ncclSuccess,
+            "NCCL LoRA numerator all-reduce failed: ",
+            ncclGetErrorString(err));
+    } else {
+        reduced = numerator;
+    }
+    reduced = reduced / global_weight.clamp_min(1.0);
+    at::NoGradGuard guard;
+    accumulator.copy_(reduced);
+}
+
 static void reduce_lora_accumulator_weighted(
     TrainingContext* ctx, at::Tensor& accumulator,
     const at::Tensor& local_weight, const at::Tensor& global_weight,
@@ -2226,7 +2264,8 @@ static void reduce_lora_accumulator_weighted(
 static void synchronize_lora_gradients(
     TrainingContext* ctx, const at::Tensor& target_mask,
     double accumulated_token_weight = 0.0,
-    const at::Tensor* per_adapter_token_counts = nullptr
+    const at::Tensor* per_adapter_token_counts = nullptr,
+    std::vector<uint8_t>* adapter_has_global_tokens = nullptr
 ) {
     const bool sharded_a2a = ctx->nccl_comm && !ctx->data_parallel &&
         env_enabled("QWEN36_EP_A2A_SHARDED");
@@ -2236,9 +2275,6 @@ static void synchronize_lora_gradients(
     const bool normalization_allreduce = dp_allreduce || sharded_a2a;
     const bool per_adapter_weighting = per_adapter_token_counts &&
         per_adapter_token_counts->defined();
-    TORCH_CHECK(!sharded_a2a || !per_adapter_weighting,
-        "dynamic multi-LoRA is not supported with sharded EP A2A; "
-        "source tenant metadata is not implemented");
     at::Tensor local_adapter_weights;
     at::Tensor global_adapter_weights;
     double scale = 1.0;
@@ -2253,7 +2289,7 @@ static void synchronize_lora_gradients(
             "dynamic LoRA token counts must be finite");
         TORCH_CHECK((local_adapter_weights >= 0).all().item<bool>(),
             "dynamic LoRA token counts must be non-negative");
-        if (dp_allreduce) {
+        if (dp_allreduce || sharded_a2a) {
             global_adapter_weights = at::empty_like(local_adapter_weights);
             auto stream = c10::cuda::getCurrentCUDAStream(
                 local_adapter_weights.device().index()).stream();
@@ -2268,8 +2304,15 @@ static void synchronize_lora_gradients(
         } else {
             global_adapter_weights = local_adapter_weights;
         }
-        TORCH_CHECK((global_adapter_weights > 0).all().item<bool>(),
-            "every dynamic LoRA adapter must have at least one global target token");
+        if (adapter_has_global_tokens) {
+            adapter_has_global_tokens->assign(ctx->adapters.size(), 0);
+            auto global_cpu = global_adapter_weights.to(
+                at::TensorOptions().device(at::kCPU));
+            const auto* counts = global_cpu.data_ptr<float>();
+            for (size_t i = 0; i < ctx->adapters.size(); ++i) {
+                (*adapter_has_global_tokens)[i] = counts[i] > 0.0f ? 1 : 0;
+            }
+        }
     } else if (accumulated_token_weight > 0.0) {
         double global_weight = accumulated_token_weight;
         if (normalization_allreduce) {
@@ -2321,12 +2364,36 @@ static void synchronize_lora_gradients(
                         {static_cast<int64_t>(adapter_index)});
                     auto global_weight = global_adapter_weights.index(
                         {static_cast<int64_t>(adapter_index)});
-                    reduce_lora_accumulator_weighted(
-                        ctx, accum_it->second[pair][0], local_weight,
-                        global_weight, dp_allreduce);
-                    reduce_lora_accumulator_weighted(
-                        ctx, accum_it->second[pair][1], local_weight,
-                        global_weight, dp_allreduce);
+                    TORCH_CHECK(adapter_has_global_tokens &&
+                            adapter_has_global_tokens->size() == ctx->adapters.size(),
+                        "dynamic LoRA global-token activity is unavailable");
+                    if (!(*adapter_has_global_tokens)[adapter_index]) {
+                        if (accum_it->second[pair][0].defined())
+                            accum_it->second[pair][0].zero_();
+                        if (accum_it->second[pair][1].defined())
+                            accum_it->second[pair][1].zero_();
+                        continue;
+                    }
+                    const bool grouped_expert = table.entries[pair].grouped_expert;
+                    if (sharded_a2a) {
+                        // Sharded A2A restores each source row to a numerator
+                        // before backward. Expert owners already receive all
+                        // source numerators; replicated projections still need
+                        // one all-reduce before division by the global count.
+                        normalize_lora_accumulator_numerator(
+                            ctx, accum_it->second[pair][0], global_weight,
+                            !grouped_expert);
+                        normalize_lora_accumulator_numerator(
+                            ctx, accum_it->second[pair][1], global_weight,
+                            !grouped_expert);
+                    } else {
+                        reduce_lora_accumulator_weighted(
+                            ctx, accum_it->second[pair][0], local_weight,
+                            global_weight, dp_allreduce);
+                        reduce_lora_accumulator_weighted(
+                            ctx, accum_it->second[pair][1], local_weight,
+                            global_weight, dp_allreduce);
+                    }
                     continue;
                 }
                 // Routed-expert tensors are sharded only in EP. Pure DP has
@@ -2350,13 +2417,11 @@ static void synchronize_lora_gradients(
         }
     }
     if (per_adapter_weighting) return;
-    // The gated A2A prototype currently runs on the repository's replicated
-    // EP batch layout. Every source rank therefore sends an identical token
-    // batch to the owning expert. Average only the sharded expert parameter
-    // gradients here; scaling the combine backward would also under-scale the
-    // activation gradient returned to each source graph. Unequal source-token
-    // shards will require global-token weighting before this gate can become
-    // the default dispatcher.
+    // The replicated-source A2A path sends an identical token batch from every
+    // EP rank. Average only its sharded expert parameter gradients here;
+    // scaling the combine backward would also under-scale the activation
+    // gradient returned to each source graph. Sharded A2A is handled above via
+    // global token-count weighting and does not enter this branch.
     const double replicated_a2a_expert_scale =
         ctx->nccl_comm && env_enabled("QWEN36_EP_A2A") && !sharded_a2a &&
             !ctx->data_parallel && ctx->ep_world_size > 1
@@ -4485,6 +4550,9 @@ __attribute__((visibility("default"))) double qwen36_train_micro_step(
         auto* ctx = reinterpret_cast<TrainingContext*>(ctx_ptr);
         TORCH_CHECK(!ctx->topology_invalid,
             "native Qwen context rejected an incompatible TP/DP/EP topology");
+        TORCH_CHECK(ctx->adapters.empty(),
+            "dynamic LoRA adapters require qwen36_train_multi_lora or "
+            "qwen36_train_multi_lora_selected");
         GradientAccumulationFailureGuard accumulation_guard{ctx};
         TORCH_CHECK(gradient_scale > 0.0 && std::isfinite(gradient_scale),
             "gradient_scale must be finite and positive");
@@ -4868,9 +4936,10 @@ __attribute__((visibility("default"))) double qwen36_train_multi_lora(
         auto* ctx = reinterpret_cast<TrainingContext*>(ctx_ptr);
         TORCH_CHECK(!ctx->topology_invalid,
             "native Qwen context rejected an incompatible TP/DP/EP topology");
-        TORCH_CHECK(!env_enabled("QWEN36_EP_A2A_SHARDED"),
-            "dynamic multi-LoRA is not supported with sharded EP A2A; "
-            "source tenant metadata is not implemented");
+        TORCH_CHECK(!ctx->accumulation_active &&
+                ctx->accumulated_token_weight == 0.0,
+            "cannot start dynamic multi-LoRA while a fixed-LoRA gradient "
+            "accumulation window is pending");
         GradientAccumulationFailureGuard accumulation_guard{ctx};
         if (ctx->nccl_comm) {
             c10::cuda::set_device(ctx->cuda_device);
@@ -4885,6 +4954,15 @@ __attribute__((visibility("default"))) double qwen36_train_multi_lora(
         TORCH_CHECK(n_total > 0 && total_adapters == n_total,
             "n_total must equal the number of registered adapters (n_total=",
             n_total, ", registered=", total_adapters, ")");
+        for (const auto& adapter : ctx->adapters) {
+            TORCH_CHECK(adapter.rank == lora_rank,
+                "lora_rank argument must match every registered adapter; adapter=",
+                adapter.id, " registered_rank=", adapter.rank,
+                " requested_rank=", lora_rank);
+        }
+        TORCH_CHECK(!ctx->has_mtp || env_enabled("QWEN36_DISABLE_MTP"),
+            "dynamic multi-LoRA with MTP is not supported until main and MTP "
+            "objectives have independent global token denominators");
         TORCH_CHECK(input_ids.dim() == 2 && target_mask.dim() == 2,
             "multi-LoRA inputs must have shape [batch, seq]");
         const int64_t input_batch = input_ids.size(0);
@@ -4900,8 +4978,6 @@ __attribute__((visibility("default"))) double qwen36_train_multi_lora(
         auto adapter_token_counts = input_batch == 1
             ? input_row_token_counts.repeat({total_adapters})
             : input_row_token_counts;
-        const int64_t multi_lora_invocation = ++ctx->multi_lora_invocation;
-
         // Keep the caller's mask intact. Each chunk receives either the
         // corresponding rows or a repeated batch-1 mask; this also prevents
         // elide_trivial_attention_mask from leaking the last chunk into the
@@ -4951,16 +5027,13 @@ __attribute__((visibility("default"))) double qwen36_train_multi_lora(
             ~AdapterRegistryChunkGuard() { restore(); }
         };
 
-        // Compute N_max from available GPU memory.
-        // CRITICAL: all workers must agree on n_max to keep NCCL all-reduce in sync.
-        // Use file-based barrier: rank 0 computes n_max, writes to file, others read.
+        // Compute N_max from available GPU memory. All workers must agree on
+        // the chunk schedule to keep later collectives in the same order, so
+        // rank 0 publishes its value through the existing communicator.
         size_t free_mem, total_mem;
         cudaMemGetInfo(&free_mem, &total_mem);
         int64_t n_max = 0;
         if (ctx->nccl_comm && ctx->ep_world_size > 1) {
-            const std::string sync_path = nccl_sync_dir() + "/nmax_sync_" +
-                std::to_string(ctx->context_sequence) + "_" +
-                std::to_string(multi_lora_invocation) + ".txt";
             if (ctx->ep_rank == 0) {
                 n_max = compute_n_max(
                     (int64_t)free_mem, lora_rank,
@@ -4969,33 +5042,19 @@ __attribute__((visibility("default"))) double qwen36_train_multi_lora(
                 );
                 n_max = std::min(n_max, total_adapters);
                 if (n_max < 1) n_max = 1;
-                const std::string temporary_path = sync_path + ".tmp." +
-                    std::to_string(static_cast<long long>(getpid()));
-                FILE* f = fopen(temporary_path.c_str(), "w");
-                TORCH_CHECK(f, "failed to create n_max rendezvous file: ",
-                    temporary_path);
-                TORCH_CHECK(fprintf(f, "%ld\n", (long)n_max) > 0,
-                    "failed to write n_max rendezvous file: ", temporary_path);
-                fclose(f);
-                TORCH_CHECK(rename(temporary_path.c_str(), sync_path.c_str()) == 0,
-                    "failed to publish n_max rendezvous file: ", sync_path);
-            } else {
-                bool loaded = false;
-                for (int i = 0; i < 600; i++) {
-                    FILE* f = fopen(sync_path.c_str(), "r");
-                    if (f) {
-                        const int parsed = fscanf(f, "%ld", (long*)&n_max);
-                        fclose(f);
-                        TORCH_CHECK(parsed == 1,
-                            "invalid n_max rendezvous file: ", sync_path);
-                        loaded = true;
-                        break;
-                    }
-                    usleep(10000);
-                }
-                TORCH_CHECK(loaded,
-                    "timed out waiting for n_max rendezvous file: ", sync_path);
             }
+            auto published_n_max = at::full(
+                {1}, n_max, input_ids.options().dtype(at::kLong));
+            auto stream = c10::cuda::getCurrentCUDAStream(
+                input_ids.device().index()).stream();
+            auto err = ncclBroadcast(
+                published_n_max.data_ptr<int64_t>(),
+                published_n_max.data_ptr<int64_t>(), 1, ncclInt64, 0,
+                reinterpret_cast<ncclComm_t>(ctx->nccl_comm), stream);
+            TORCH_CHECK(err == ncclSuccess, "n_max broadcast failed: ",
+                ncclGetErrorString(err));
+            n_max = published_n_max.to(
+                at::TensorOptions().device(at::kCPU)).item<int64_t>();
         } else {
             n_max = compute_n_max(
                 (int64_t)free_mem, lora_rank,
@@ -5082,6 +5141,15 @@ __attribute__((visibility("default"))) double qwen36_train_multi_lora(
                 loss_val = loss.value.item<double>();
                 hidden_grad = loss.hidden_grad;
             }
+            // independent_samples produces a local per-tenant mean. Restore
+            // each row to a token-sum numerator before A2A backward so the
+            // expert owner can combine unequal source shards correctly.
+            if (ctx->nccl_comm && !ctx->data_parallel &&
+                env_enabled("QWEN36_EP_A2A_SHARDED")) {
+                auto chunk_token_counts = adapter_token_counts
+                    .narrow(0, start, n).reshape({n, 1, 1});
+                hidden_grad.mul_(chunk_token_counts);
+            }
             auto t_loss_end = std::chrono::steady_clock::now();
             double loss_ms = std::chrono::duration<double, std::milli>(t_loss_end - t_loss_start).count();
 
@@ -5125,8 +5193,13 @@ __attribute__((visibility("default"))) double qwen36_train_multi_lora(
             if (chunk == num_chunks - 1) {
                 // DP gradient synchronization and Adam belong to the logical
                 // multi-tenant step, never to an activation-memory chunk.
+                std::vector<uint8_t> adapter_has_global_tokens;
                 synchronize_lora_gradients(
-                    ctx, target_mask, 0.0, &adapter_token_counts);
+                    ctx, target_mask, 0.0, &adapter_token_counts,
+                    &adapter_has_global_tokens);
+                TORCH_CHECK(adapter_has_global_tokens.size() ==
+                        ctx->adapters.size(),
+                    "dynamic LoRA global-token activity vector mismatch");
 
                 // Adam step. Group tenants by their own logical clock so
                 // newly-added or resumed tenants do not inherit another
@@ -5136,7 +5209,10 @@ __attribute__((visibility("default"))) double qwen36_train_multi_lora(
                 ctx->lora_cache_valid = false;
                 ctx->lora_batch_valid = false;
                 std::map<int64_t, std::vector<TrainingContext::LoRAAdapter*>> groups;
-                for (auto& adapter : ctx->adapters) {
+                for (size_t adapter_index = 0;
+                     adapter_index < ctx->adapters.size(); ++adapter_index) {
+                    if (!adapter_has_global_tokens[adapter_index]) continue;
+                    auto& adapter = ctx->adapters[adapter_index];
                     groups[adapter.optimizer_step + 1].push_back(&adapter);
                 }
                 for (auto& [logical_step, adapters] : groups) {
@@ -5980,6 +6056,9 @@ __attribute__((visibility("default")))
 double qwen36_eval_step(void* ctx_ptr, void* input_ids_ptr, void* target_mask_ptr, void* attention_mask_ptr) {
     try {
         auto* ctx = reinterpret_cast<TrainingContext*>(ctx_ptr);
+        TORCH_CHECK(ctx->adapters.empty(),
+            "dynamic LoRA adapters require selected multi-LoRA evaluation; "
+            "ordinary eval_step has no tenant mapping");
         auto& input_ids = *reinterpret_cast<at::Tensor*>(input_ids_ptr);
         auto& target_mask = *reinterpret_cast<at::Tensor*>(target_mask_ptr);
         if (attention_mask_ptr)

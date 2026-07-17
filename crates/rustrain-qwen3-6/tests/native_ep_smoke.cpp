@@ -25,6 +25,17 @@ extern "C" void* qwen36_create_training_context(
     double, double, double, double, double, int64_t, double, int64_t,
     const int64_t*, int64_t, const char*);
 extern "C" int32_t qwen36_init_nccl(void*);
+extern "C" int64_t qwen36_add_lora(
+    void*, int64_t, double, const int64_t*, int64_t, const char*);
+extern "C" void* qwen36_get_adapter_lora_tensor(
+    void*, int64_t, int64_t, const char*, int32_t);
+extern "C" int32_t qwen36_set_adapter_lora_tensor(
+    void*, int64_t, int64_t, const char*, int32_t, void*);
+extern "C" void* qwen36_get_adapter_optimizer_tensor(
+    void*, int64_t, int64_t, const char*, int32_t, int32_t);
+extern "C" int64_t qwen36_get_adapter_step_count(void*, int64_t);
+extern "C" double qwen36_train_multi_lora(
+    void*, void*, void*, void*, int32_t, int32_t);
 extern "C" int64_t qwen36_get_lora_count(void*);
 extern "C" void* qwen36_get_lora_a(void*, int64_t);
 extern "C" void* qwen36_get_lora_b(void*, int64_t);
@@ -113,6 +124,8 @@ int main() {
         std::strcmp(std::getenv("QWEN36_EP_A2A"), "0") != 0;
     const int sharded = a2a && std::getenv("QWEN36_EP_A2A_SHARDED") &&
         std::strcmp(std::getenv("QWEN36_EP_A2A_SHARDED"), "0") != 0;
+    const bool dynamic_only = std::getenv("QWEN36_DYNAMIC_ONLY") &&
+        std::strcmp(std::getenv("QWEN36_DYNAMIC_ONLY"), "0") != 0;
     // Replicated A2A receives duplicate source rows in rank order, so its BF16
     // accumulation is not bit-identical to the full-expert reference. Sharded
     // A2A uses distinct rows; its optimizer state matches closely, while a
@@ -272,15 +285,16 @@ int main() {
     // qwen36_init_nccl mutates only the distributed context's copied configs.
     assert(qwen36_init_nccl(distributed_ctx) == 0);
 
+    auto long_opts = at::TensorOptions().device(at::kCUDA).dtype(at::kLong);
+    auto float_opts = at::TensorOptions().device(at::kCUDA).dtype(at::kFloat);
+    auto bool_opts = at::TensorOptions().device(at::kCUDA).dtype(at::kBool);
+    if (!dynamic_only) {
     at::Tensor input_ids;
     at::Tensor target_mask;
     at::Tensor attention_mask;
     at::Tensor reference_input_ids;
     at::Tensor reference_target_mask;
     at::Tensor reference_attention_mask;
-    auto long_opts = at::TensorOptions().device(at::kCUDA).dtype(at::kLong);
-    auto float_opts = at::TensorOptions().device(at::kCUDA).dtype(at::kFloat);
-    auto bool_opts = at::TensorOptions().device(at::kCUDA).dtype(at::kBool);
     if (sharded) {
         // Deliberately unequal supervised-token counts: rank 0 contributes one
         // response token, rank 1 contributes three. The reference evaluates
@@ -416,6 +430,213 @@ int main() {
     assert(gate_up_b_adam_diff <= 1e-5);
     assert(down_a_adam_diff <= 1e-5);
     assert(down_b_adam_diff <= 1e-5);
+    }
+
+    if (sharded) {
+        // Dynamic tenant rows use the source flattened token index that
+        // sharded A2A already transports. Rank 0 and rank 1 deliberately swap
+        // token counts [1,2]/[2,1] for the two adapters, exercising the
+        // all-reduced per-adapter denominator and owner-local expert update.
+        const int64_t dynamic_targets[] = {0};
+        const char* dynamic_modules =
+            "experts_gate_up_proj,experts_down_proj";
+        const int64_t adapter_a = qwen36_add_lora(
+            distributed_ctx, lora_rank, 1.0, dynamic_targets, 1,
+            dynamic_modules);
+        const int64_t adapter_b = qwen36_add_lora(
+            distributed_ctx, lora_rank, 1.0, dynamic_targets, 1,
+            dynamic_modules);
+        const int64_t reference_adapter_a = qwen36_add_lora(
+            reference_ctx, lora_rank, 1.0, dynamic_targets, 1,
+            dynamic_modules);
+        const int64_t reference_adapter_b = qwen36_add_lora(
+            reference_ctx, lora_rank, 1.0, dynamic_targets, 1,
+            dynamic_modules);
+        assert(adapter_a > 0 && adapter_b > adapter_a);
+        assert(reference_adapter_a > 0 &&
+            reference_adapter_b > reference_adapter_a);
+        auto dynamic_tensor = [&](void* ctx, int64_t adapter,
+                                  const char* module, int b) {
+            auto* ptr = qwen36_get_adapter_lora_tensor(
+                ctx, adapter, 0, module, b);
+            assert(ptr);
+            return reinterpret_cast<at::Tensor*>(ptr);
+        };
+        auto initialize_dynamic_adapter = [&](int64_t distributed_adapter,
+                                              int64_t reference_adapter,
+                                              double offset) {
+            auto set_pair = [&](const char* module, int b,
+                                std::vector<int64_t> shape) {
+                int64_t numel = 1;
+                for (int64_t dim : shape) numel *= dim;
+                auto global = ((at::arange(numel, opts) + offset) * 5e-5)
+                    .reshape(shape).to(at::kBFloat16);
+                auto local = global.narrow(0, rank, 1).contiguous();
+                assert(qwen36_set_adapter_lora_tensor(
+                    distributed_ctx, distributed_adapter, 0, module, b,
+                    &local) == 0);
+                assert(qwen36_set_adapter_lora_tensor(
+                    reference_ctx, reference_adapter, 0, module, b,
+                    &global) == 0);
+            };
+            set_pair("experts_gate_up_proj", 0,
+                {experts, lora_rank, hidden});
+            set_pair("experts_gate_up_proj", 1,
+                {experts, 2 * intermediate, lora_rank});
+            set_pair("experts_down_proj", 0,
+                {experts, lora_rank, intermediate});
+            set_pair("experts_down_proj", 1,
+                {experts, hidden, lora_rank});
+        };
+        initialize_dynamic_adapter(
+            adapter_a, reference_adapter_a, 11.0);
+        initialize_dynamic_adapter(
+            adapter_b, reference_adapter_b, 1011.0);
+        auto* dynamic_a_gate = dynamic_tensor(
+            distributed_ctx, adapter_a, "experts_gate_up_proj", 1);
+        auto* dynamic_b_gate = dynamic_tensor(
+            distributed_ctx, adapter_b, "experts_gate_up_proj", 1);
+        auto dynamic_a_before = dynamic_a_gate->clone();
+        auto dynamic_b_before = dynamic_b_gate->clone();
+
+        auto dynamic_ids = at::tensor(
+            {1, 2, 3, 4, 4, 5, 6, 7}, long_opts).reshape({2, 4});
+        auto dynamic_mask = rank == 0
+            ? at::tensor({0, 1, 0, 0, 0, 1, 1, 0}, float_opts)
+                .reshape({2, 4})
+            : at::tensor({0, 0, 1, 1, 0, 0, 0, 1}, float_opts)
+                .reshape({2, 4});
+        auto dynamic_attention = at::ones({2, 4}, bool_opts);
+        const double dynamic_loss = qwen36_train_multi_lora(
+            distributed_ctx, &dynamic_ids, &dynamic_mask,
+            &dynamic_attention, 2, static_cast<int32_t>(lora_rank));
+        auto reference_dynamic_mask = at::tensor(
+            {0, 1, 1, 1, 0, 1, 1, 1}, float_opts).reshape({2, 4});
+        const double reference_dynamic_loss = dynamic_only
+            ? qwen36_train_multi_lora(
+                reference_ctx, &dynamic_ids, &reference_dynamic_mask,
+                &dynamic_attention, 2, static_cast<int32_t>(lora_rank))
+            : -1.0;
+        c10::cuda::device_synchronize();
+        assert(dynamic_loss > 0.0 && std::isfinite(dynamic_loss));
+        assert(!dynamic_only || (reference_dynamic_loss > 0.0 &&
+            std::isfinite(reference_dynamic_loss)));
+        assert(qwen36_get_adapter_step_count(distributed_ctx, adapter_a) == 1);
+        assert(qwen36_get_adapter_step_count(distributed_ctx, adapter_b) == 1);
+        const double dynamic_update_a = update_norm(
+            *dynamic_a_gate, dynamic_a_before);
+        const double dynamic_update_b = update_norm(
+            *dynamic_b_gate, dynamic_b_before);
+        assert(dynamic_update_a > 0.0 && dynamic_update_b > 0.0);
+
+        double dynamic_param_diff = -1.0;
+        double dynamic_m_diff = -1.0;
+        double dynamic_v_diff = -1.0;
+        if (dynamic_only) {
+            const auto reference_slice = [rank](const at::Tensor& tensor) {
+                return tensor.narrow(0, rank, 1);
+            };
+            auto optimizer_tensor = [](void* ctx, int64_t adapter,
+                                       const char* module, int b, int is_v) {
+                auto* ptr = qwen36_get_adapter_optimizer_tensor(
+                    ctx, adapter, 0, module, b, is_v);
+                assert(ptr);
+                return reinterpret_cast<at::Tensor*>(ptr);
+            };
+            const int64_t distributed_adapters[] = {adapter_a, adapter_b};
+            const int64_t reference_adapters[] = {
+                reference_adapter_a, reference_adapter_b};
+            dynamic_param_diff = 0.0;
+            dynamic_m_diff = 0.0;
+            dynamic_v_diff = 0.0;
+            for (int adapter_index = 0; adapter_index < 2; ++adapter_index) {
+                for (const char* module : {
+                         "experts_gate_up_proj", "experts_down_proj"}) {
+                    auto* distributed_b = dynamic_tensor(
+                        distributed_ctx, distributed_adapters[adapter_index],
+                        module, 1);
+                    auto* reference_b = dynamic_tensor(
+                        reference_ctx, reference_adapters[adapter_index],
+                        module, 1);
+                    dynamic_param_diff = std::max(
+                        dynamic_param_diff,
+                        max_abs_diff(*distributed_b,
+                            reference_slice(*reference_b)));
+                    for (int is_v = 0; is_v < 2; ++is_v) {
+                        auto* distributed_state = optimizer_tensor(
+                            distributed_ctx, distributed_adapters[adapter_index],
+                            module, 1, is_v);
+                        auto* reference_state = optimizer_tensor(
+                            reference_ctx, reference_adapters[adapter_index],
+                            module, 1, is_v);
+                        double diff = max_abs_diff(
+                            *distributed_state,
+                            reference_slice(*reference_state));
+                        if (is_v) dynamic_v_diff = std::max(dynamic_v_diff, diff);
+                        else dynamic_m_diff = std::max(dynamic_m_diff, diff);
+                    }
+                }
+            }
+            std::fprintf(stderr,
+                "native_qwen36_dynamic_reference rank=%d "
+                "param_diff=%0.8e m_diff=%0.8e v_diff=%0.8e\n",
+                rank, dynamic_param_diff, dynamic_m_diff, dynamic_v_diff);
+            assert(dynamic_param_diff <= 2e-3);
+            assert(dynamic_m_diff <= 5e-3);
+            assert(dynamic_v_diff <= 1e-5);
+        }
+
+        // A tenant with no supervised tokens on any rank is a valid no-op:
+        // it must not abort the logical step or advance its private Adam
+        // clock. This also covers the final chunk when n_max is smaller than
+        // the registry size.
+        const int64_t adapter_c = qwen36_add_lora(
+            distributed_ctx, lora_rank, 1.0, dynamic_targets, 1,
+            dynamic_modules);
+        assert(adapter_c > adapter_b);
+        auto* dynamic_c_gate = dynamic_tensor(
+            distributed_ctx, adapter_c, "experts_gate_up_proj", 1);
+        auto dynamic_c_before = dynamic_c_gate->clone();
+        auto zero_ids = at::tensor({
+            1, 2, 3, 4, 4, 5, 6, 7, 1, 2, 3, 4}, long_opts)
+            .reshape({3, 4});
+        auto zero_mask = at::tensor({
+            0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0}, float_opts)
+            .reshape({3, 4});
+        auto zero_attention = at::ones({3, 4}, bool_opts);
+        const double zero_loss = qwen36_train_multi_lora(
+            distributed_ctx, &zero_ids, &zero_mask,
+            &zero_attention, 3, static_cast<int32_t>(lora_rank));
+        assert(zero_loss > 0.0 && std::isfinite(zero_loss));
+        assert(qwen36_get_adapter_step_count(distributed_ctx, adapter_a) == 2);
+        assert(qwen36_get_adapter_step_count(distributed_ctx, adapter_b) == 2);
+        assert(qwen36_get_adapter_step_count(distributed_ctx, adapter_c) == 0);
+        assert(update_norm(*dynamic_c_gate, dynamic_c_before) == 0.0);
+
+        // Ordinary single-adapter entry points must not silently pick an
+        // arbitrary tenant or crash in a batched BMM after registration.
+        auto ordinary_ids = dynamic_ids.narrow(0, 0, 1).contiguous();
+        auto ordinary_mask = dynamic_mask.narrow(0, 0, 1).contiguous();
+        auto ordinary_attention = dynamic_attention.narrow(0, 0, 1).contiguous();
+        assert(qwen36_train_step(
+            distributed_ctx, &ordinary_ids, &ordinary_mask,
+            &ordinary_attention) < 0.0);
+        assert(qwen36_get_adapter_step_count(distributed_ctx, adapter_a) == 2);
+        assert(qwen36_get_adapter_step_count(distributed_ctx, adapter_b) == 2);
+        std::printf(
+            "native_qwen36_dynamic_sharded rank=%d world=%d loss=%0.8f "
+            "adapter_steps=[%ld,%ld,%ld] updates=[%0.8e,%0.8e] "
+            "zero_loss=%0.8f reference_loss=%0.8f "
+            "param_diff=%0.8e m_diff=%0.8e v_diff=%0.8e\n",
+            rank, world, dynamic_loss,
+            (long)qwen36_get_adapter_step_count(distributed_ctx, adapter_a),
+            (long)qwen36_get_adapter_step_count(distributed_ctx, adapter_b),
+            (long)qwen36_get_adapter_step_count(distributed_ctx, adapter_c),
+            dynamic_update_a, dynamic_update_b, zero_loss,
+            reference_dynamic_loss, dynamic_param_diff,
+            dynamic_m_diff, dynamic_v_diff);
+        std::fflush(stdout);
+    }
 
     qwen36_free_training_context(reference_ctx);
     qwen36_free_training_context(distributed_ctx);

@@ -5,7 +5,7 @@
 ## 结论
 
 - 模型语义：Qwen3.5 dense、Qwen3.6 dense/MoE 的 native forward/backward 路径已经覆盖 hybrid full attention、GDN、MoE、MTP 和 LoRA 目标模块；已有配置解析、集成测试及 H20 native smoke 证据。
-- 已实现并可验证的分布式子集：MoE expert parallel，以及 replicated LoRA 的 data parallel；梯度累积和 dynamic multi-LoRA 已有 logical-step 边界。DP 动态租户按 adapter token count 加权，纯 DP 不把 world communicator 传入 MoE activation reduction。
+- 已实现并可验证的分布式子集：MoE expert parallel，以及 replicated LoRA 的 data parallel；梯度累积和 dynamic multi-LoRA 已有 logical-step 边界。DP 动态租户按 adapter token count 加权，sharded A2A native 路径会保留 source flattened row 来恢复租户，并按全局租户 token count 归一化。
 - 性能：MoE grouped dispatch 相对逐 expert matmul 的已有 microbenchmark 为约 3.70x（E=32, N=4096, H=2048, I=768，结果误差为 0）；这不是端到端训练吞吐或 Megatron 对比。
 - 已实现 LoRA latent-rank 的 TP-only 子集，但尚未实现 frozen base-weight tensor parallel、pipeline parallel、context parallel，以及 TP/PP/CP 与 EP/DP 的组合。当前训练上下文仍由单个进程持有完整 dense 权重和完整层栈。
 - 因此当前实现不能宣称“Megatron-LM 级别”。它是一个计算集中在 C++ 的 LoRA/EP/DP 子集，离 Megatron 的完整并行和通信重叠仍有实质差距。
@@ -19,10 +19,10 @@
 | Qwen3.6 MoE | 已实现 | grouped dispatch、EP smoke；完整模型仍需目标 GPU/权重运行 |
 | MTP | 已实现 | C++ hidden gradient 检查和集成测试；可通过环境变量关闭 |
 | fixed LoRA | 已实现 | attention/GDN/MLP/shared/routed expert 目标模块 |
-| dynamic multi-LoRA | 已实现子集 | 请求按 adapter 分组，单个 logical step 统一 backward/Adam；每个 adapter 独立 optimizer clock 和 m/v，DP 按 token count 加权 |
+| dynamic multi-LoRA | 已实现子集 | 请求按 adapter 分组，单个 logical step 统一 backward/Adam；每个 adapter 独立 optimizer clock 和 m/v，DP 与 native sharded A2A 按全局 token count 加权；零全局 token 租户跳过更新；dynamic+MTP 暂拒绝 |
 | microbatch accumulation | 已实现子集 | non-final microbatch 只 backward，final microbatch 才 optimizer；FP32 accumulator 存储/聚合，autograd leaf backward 仍为 BF16 |
 | replicated data parallel | 已实现 | logical-step 边界同步 replicated LoRA；EP expert 参数不走该 reduction |
-| expert parallel | 已实现子集 | 默认 routed-output all-reduce；gated variable-split A2A 已验证 fixed-LoRA data sharding，但 dynamic tenant metadata、GPU-only split planning 和 overlap 未实现 |
+| expert parallel | 已实现子集 | 默认 routed-output all-reduce；gated variable-split A2A 已验证 fixed-LoRA 和 native dynamic-LoRA data sharding；GPU-only split planning、异步 overlap 和 DeepEP backend 未实现 |
 | tensor parallel | LoRA-only 子集 | latent rank 分片和独立 TP communicator 已验证；attention/MLP/LM-head base 权重仍不切分 |
 | pipeline parallel | 未实现于 Qwen native | 没有 stage 切分、microbatch scheduler 或 activation send/recv |
 | context parallel | 未实现于 Qwen native | 没有 ring attention、跨 rank KV/索引合并 |
@@ -34,7 +34,7 @@
 
 Megatron 的 TP 会按 head、hidden/intermediate 和 vocab 维度切分权重，并在线性层边界执行必要的 reduce-scatter/all-reduce；PP 会把层分到不同 stage 并使用 1F1B 等调度；CP 会在序列和 attention state 上做跨 rank 通信。当前 Qwen native `TrainingContext` 仍加载完整模型并在一个 C++ forward 中执行全部层，因此仅增加 `tensor_model_parallel_size` 等配置不能得到正确的 TP/PP/CP。
 
-当前 DP/EP 也不是完整 Megatron 语义：DP 同步 replicated LoRA 梯度并按租户 token count 归一化，expert 参数留在 EP rank；EP 默认使用 routed-output all-reduce，实验 gate 已加入 variable-split dispatch/inverse combine 和 fixed-LoRA data sharding。该 gate 仍逐 top-k 执行 host-visible count sync，没有 fused permutation、dynamic tenant source metadata、异步 overlap 或 DeepEP backend。
+当前 DP/EP 也不是完整 Megatron 语义：DP 同步 replicated LoRA 梯度并按租户 token count 归一化，expert 参数留在 EP rank；EP 默认使用 routed-output all-reduce，实验 gate 已加入 variable-split dispatch/inverse combine 和 fixed/dynamic LoRA data sharding。dynamic native path 的 source row metadata 已随 token index 传输，但仍逐 top-k 执行 host-visible count sync，没有 fused permutation、GPU-only split planning、异步 overlap 或 DeepEP backend。server 的 `TrainMultiLora` 目前向各 worker 广播相同 batch，因此不能把它当作 source-sharded 服务吞吐。
 
 ### 优化器与恢复
 
@@ -50,7 +50,7 @@ Megatron 的 TP 会按 head、hidden/intermediate 和 vocab 维度切分权重�
 
 ## 验证边界
 
-已运行的验证包括 Rust 编译检查、core 单测、Qwen3.6 配置/集成测试，以及 H20 ABI11 的单卡、TP2、EP2 和 DP2 native smoke。DP2 的 weighted m/grouped/v/Adam BF16 delta oracle 分别达到 `2.43e-8`、`2.27e-8`、`7.33e-8` 和 `0`；legacy EP2 与 full-expert reference 的 loss、LoRA、Adam state 和标准 Adam 首步 oracle 在两 rank 均为零差异。Replicated A2A 与 sharded A2A 也均通过两 rank full-expert reference；sharded token counts `[1,3]` 的加权 loss 与 global reference 相差约 `9.6e-7`，m/v 最大差 `1.22e-5` / `3.92e-9`，Adam oracle 差为 `0`。没有完成 Qwen3.5/3.6 完整大模型的长时间训练、跨节点通信、PP/CP smoke 或与 Megatron-LM 的同条件 benchmark。因此“正确”应理解为已覆盖且有直接 oracle 的子集，而不是所有并行配置。
+已运行的验证包括 Rust 编译检查、core 单测、Qwen3.6 配置/集成测试，以及 H20 ABI11 的单卡、TP2、EP2 和 DP2 native smoke。DP2 的 weighted m/grouped/v/Adam BF16 delta oracle 分别达到 `2.43e-8`、`2.27e-8`、`7.33e-8` 和 `0`；legacy EP2 与 full-expert reference 的 loss、LoRA、Adam state 和标准 Adam 首步 oracle 在两 rank 均为零差异。Replicated A2A 与 fixed-LoRA sharded A2A 也均通过两 rank full-expert reference；sharded token counts `[1,3]` 的加权 loss 与 global reference 相差约 `9.6e-7`，m/v 最大差 `1.22e-5` / `3.92e-9`，Adam oracle 差为 `0`。新增 H20 ABI1 dynamic sharded full-reference smoke 在两 rank 返回 `0`：互补 source masks 的 dynamic grouped-expert 参数最大差 `1.53e-5`，m/v 最大差 `4.88e-5` / `5.75e-8`；两次有效租户更新后 step 为 `[2,2]`，全局零 token 租户保持 step `0` 且参数无更新，普通 `train_step` 被显式拒绝。没有完成 Qwen3.5/3.6 完整大模型的长时间训练、跨节点通信、PP/CP smoke 或与 Megatron-LM 的同条件 benchmark。因此“正确”应理解为已覆盖且有直接 oracle 的子集，而不是所有并行配置。
 
 ## 继续达到 Megatron 级别所需的最小工作包
 
