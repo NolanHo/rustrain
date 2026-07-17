@@ -1,13 +1,34 @@
 //! Checkpoint save/load: adapter (LoRA A/B) + optimizer state (Adam m/v) + step count.
 
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::env;
 use std::path::{Path, PathBuf};
 use tch::Tensor;
 
-const TP_CHECKPOINT_FORMAT: &str = "rustrain-checkpoint-v3-tp";
+const TP_CHECKPOINT_FORMAT: &str = "rustrain-checkpoint-v4-tp";
+const LEGACY_TP_CHECKPOINT_FORMAT: &str = "rustrain-checkpoint-v3-tp";
+
+pub fn is_legacy_tensor_parallel_checkpoint(manifest: &CheckpointManifest) -> bool {
+    manifest.format == LEGACY_TP_CHECKPOINT_FORMAT
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LoraTpShardLayout {
+    #[default]
+    LatentRank,
+    ColumnParallel,
+    RowParallel,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LoraSlotIdentity {
+    pub index: usize,
+    pub layer: usize,
+    pub module: String,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ParallelCheckpointManifest {
@@ -110,6 +131,10 @@ pub struct TensorShardManifest {
     pub global_shape: Vec<i64>,
     pub local_shape: Vec<i64>,
     pub partition_axis: usize,
+    #[serde(default)]
+    pub layout: LoraTpShardLayout,
+    #[serde(default)]
+    pub replicated: bool,
     pub global_offset: Vec<i64>,
     pub replica_identity: String,
 }
@@ -129,6 +154,88 @@ pub struct CheckpointManifest {
     pub parallel: Option<ParallelCheckpointManifest>,
     #[serde(default)]
     pub tensor_shards: Vec<TensorShardManifest>,
+    #[serde(default)]
+    pub fixed_shard_layouts: Vec<LoraTpShardLayout>,
+    #[serde(default)]
+    pub fixed_slot_identities: Vec<LoraSlotIdentity>,
+}
+
+pub fn validate_fixed_tp_resume(
+    manifest: &CheckpointManifest,
+    expected_layouts: &[LoraTpShardLayout],
+    expected_identities: &[LoraSlotIdentity],
+) -> Result<()> {
+    if is_legacy_tensor_parallel_checkpoint(manifest) {
+        if expected_layouts
+            .iter()
+            .any(|layout| *layout != LoraTpShardLayout::LatentRank)
+        {
+            bail!(
+                "legacy tensor-parallel v3 checkpoints cannot restore fixed Q/K/V/O LoRA into the projection-aware layout; use a v4 checkpoint or migrate the adapter from a merged artifact"
+            );
+        }
+        return Ok(());
+    }
+    if manifest.fixed_shard_layouts != expected_layouts {
+        bail!(
+            "fixed LoRA shard layouts do not match the current runtime slots: checkpoint={:?}, runtime={expected_layouts:?}",
+            manifest.fixed_shard_layouts
+        );
+    }
+    if manifest.fixed_slot_identities != expected_identities {
+        bail!(
+            "fixed LoRA slot identities do not match the current runtime slots: checkpoint={:?}, runtime={expected_identities:?}",
+            manifest.fixed_slot_identities
+        );
+    }
+    Ok(())
+}
+
+pub fn validate_dynamic_tp_resume(
+    manifest: &CheckpointManifest,
+    adapter_id: i64,
+    saved_layouts: &[LoraTpShardLayout],
+    expected_layouts: &[LoraTpShardLayout],
+) -> Result<()> {
+    if is_legacy_tensor_parallel_checkpoint(manifest) {
+        if expected_layouts
+            .iter()
+            .any(|layout| *layout != LoraTpShardLayout::LatentRank)
+        {
+            bail!(
+                "legacy tensor-parallel v3 checkpoint adapter {adapter_id} contains Q/K/V/O LoRA that cannot be restored into the projection-aware layout; use a v4 checkpoint or migrate the adapter from a merged artifact"
+            );
+        }
+        return Ok(());
+    }
+    if saved_layouts != expected_layouts {
+        bail!(
+            "dynamic adapter {adapter_id} shard layouts do not match the current runtime slots: checkpoint={saved_layouts:?}, runtime={expected_layouts:?}"
+        );
+    }
+    Ok(())
+}
+
+pub fn fixed_restore_slot_indices(
+    saved_a_count: usize,
+    saved_b_count: usize,
+    active_slot_indices: &[usize],
+    native_slot_count: usize,
+) -> Result<Vec<usize>> {
+    if saved_a_count != saved_b_count {
+        bail!("checkpoint fixed LoRA A/B count mismatch: {saved_a_count}/{saved_b_count}");
+    }
+    if saved_a_count == active_slot_indices.len() {
+        return Ok(active_slot_indices.to_vec());
+    }
+    if saved_a_count == native_slot_count {
+        // v1/v2 checkpoints stored inactive positional placeholders.
+        return Ok((0..native_slot_count).collect());
+    }
+    bail!(
+        "checkpoint LoRA slot count mismatch: checkpoint A/B={saved_a_count}/{saved_b_count}, active={}, native={native_slot_count}",
+        active_slot_indices.len()
+    )
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -143,6 +250,8 @@ pub struct DynamicAdapterManifest {
     pub optimizer_step: u64,
     pub target_layers: Vec<usize>,
     pub target_modules: Vec<String>,
+    #[serde(default)]
+    pub shard_layouts: Vec<LoraTpShardLayout>,
     pub parameter_count: usize,
     pub optimizer_count: usize,
 }
@@ -218,6 +327,8 @@ pub fn save_checkpoint_with_dynamic(
         adam_m,
         adam_v,
         dynamic_adapters,
+        &[],
+        &[],
         None,
     )
 }
@@ -235,6 +346,8 @@ pub fn save_checkpoint_with_dynamic_for_topology(
     adam_m: &[Tensor],
     adam_v: &[Tensor],
     dynamic_adapters: &[DynamicAdapterCheckpoint],
+    fixed_shard_layouts: &[LoraTpShardLayout],
+    fixed_slot_identities: &[LoraSlotIdentity],
     parallel: &ParallelCheckpointManifest,
 ) -> Result<()> {
     if !parallel.is_tensor_parallel() {
@@ -265,6 +378,8 @@ pub fn save_checkpoint_with_dynamic_for_topology(
         adam_m,
         adam_v,
         dynamic_adapters,
+        fixed_shard_layouts,
+        fixed_slot_identities,
         Some(parallel),
     )
 }
@@ -282,6 +397,8 @@ fn save_checkpoint_with_dynamic_at(
     adam_m: &[Tensor],
     adam_v: &[Tensor],
     dynamic_adapters: &[DynamicAdapterCheckpoint],
+    fixed_shard_layouts: &[LoraTpShardLayout],
+    fixed_slot_identities: &[LoraSlotIdentity],
     parallel: Option<&ParallelCheckpointManifest>,
 ) -> Result<()> {
     validate_tensor_counts(
@@ -292,6 +409,20 @@ fn save_checkpoint_with_dynamic_at(
         dynamic_adapters,
         parallel.is_some(),
     )?;
+    if parallel.is_some() && fixed_slot_identities.len() != lora_a.len() {
+        bail!(
+            "fixed LoRA slot identity count {} does not match parameter count {}",
+            fixed_slot_identities.len(),
+            lora_a.len()
+        );
+    }
+    let unique_fixed_slots = fixed_slot_identities
+        .iter()
+        .map(|identity| (identity.index, identity.layer, identity.module.as_str()))
+        .collect::<std::collections::BTreeSet<_>>();
+    if unique_fixed_slots.len() != fixed_slot_identities.len() {
+        bail!("fixed LoRA slot identities must be unique");
+    }
     let tensor_shards = match parallel {
         Some(parallel) => build_tensor_shard_manifest(
             parallel,
@@ -301,6 +432,7 @@ fn save_checkpoint_with_dynamic_at(
             adam_m,
             adam_v,
             dynamic_adapters,
+            fixed_shard_layouts,
         )?,
         None => Vec::new(),
     };
@@ -355,6 +487,8 @@ fn save_checkpoint_with_dynamic_at(
         dynamic_adapters: dynamic_manifests,
         parallel: parallel.cloned(),
         tensor_shards,
+        fixed_shard_layouts: fixed_shard_layouts.to_vec(),
+        fixed_slot_identities: fixed_slot_identities.to_vec(),
     };
     let manifest_path = dir.join("manifest.json");
     std::fs::write(&manifest_path, serde_json::to_string_pretty(&manifest)?)
@@ -397,9 +531,11 @@ fn load_checkpoint_at(
     .with_context(|| "parse manifest.json")?;
     match expected_parallel {
         Some(expected) => {
-            if manifest.format != TP_CHECKPOINT_FORMAT {
+            if manifest.format != TP_CHECKPOINT_FORMAT
+                && manifest.format != LEGACY_TP_CHECKPOINT_FORMAT
+            {
                 bail!(
-                    "tensor-parallel resume requires {TP_CHECKPOINT_FORMAT}, found {}",
+                    "tensor-parallel resume requires {TP_CHECKPOINT_FORMAT} or {LEGACY_TP_CHECKPOINT_FORMAT}, found {}",
                     manifest.format
                 );
             }
@@ -413,7 +549,9 @@ fn load_checkpoint_at(
                 );
             }
         }
-        None if manifest.format == TP_CHECKPOINT_FORMAT => {
+        None if manifest.format == TP_CHECKPOINT_FORMAT
+            || manifest.format == LEGACY_TP_CHECKPOINT_FORMAT =>
+        {
             bail!("tensor-parallel checkpoint must be loaded with rank topology");
         }
         None => {}
@@ -460,6 +598,7 @@ fn load_checkpoint_at(
             &adam_m,
             &adam_v,
             &dynamic_adapters,
+            &manifest.fixed_shard_layouts,
         )?;
         validate_saved_shards(&manifest.tensor_shards, &expected_shards)?;
     }
@@ -535,6 +674,7 @@ fn build_tensor_shard_manifest(
     adam_m: &[Tensor],
     adam_v: &[Tensor],
     dynamic_adapters: &[DynamicAdapterCheckpoint],
+    fixed_shard_layouts: &[LoraTpShardLayout],
 ) -> Result<Vec<TensorShardManifest>> {
     validate_tensor_counts(lora_a, lora_b, adam_m, adam_v, dynamic_adapters, true)?;
     let mut shards = Vec::new();
@@ -547,6 +687,7 @@ fn build_tensor_shard_manifest(
         lora_b,
         adam_m,
         adam_v,
+        fixed_shard_layouts,
     )?;
     for adapter in dynamic_adapters {
         append_adapter_shards(
@@ -558,6 +699,7 @@ fn build_tensor_shard_manifest(
             &adapter.lora_b,
             &adapter.adam_m,
             &adapter.adam_v,
+            &adapter.manifest.shard_layouts,
         )?;
     }
     Ok(shards)
@@ -573,7 +715,21 @@ fn append_adapter_shards(
     lora_b: &[Tensor],
     adam_m: &[Tensor],
     adam_v: &[Tensor],
+    shard_layouts: &[LoraTpShardLayout],
 ) -> Result<()> {
+    if !shard_layouts.is_empty() && shard_layouts.len() != lora_a.len() {
+        bail!(
+            "LoRA shard layout count {} does not match parameter count {}",
+            shard_layouts.len(),
+            lora_a.len()
+        );
+    }
+    let layout = |index: usize| {
+        shard_layouts
+            .get(index)
+            .copied()
+            .unwrap_or(LoraTpShardLayout::LatentRank)
+    };
     let adapter_prefix = adapter_id
         .map(|id| format!("dynamic_{id}_"))
         .unwrap_or_default();
@@ -586,6 +742,7 @@ fn append_adapter_shards(
             format!("{adapter_prefix}a_{index}"),
             "lora_a",
             LoraSide::A,
+            layout(index),
             tensor,
         )?);
     }
@@ -598,6 +755,7 @@ fn append_adapter_shards(
             format!("{adapter_prefix}b_{index}"),
             "lora_b",
             LoraSide::B,
+            layout(index),
             tensor,
         )?);
     }
@@ -614,6 +772,7 @@ fn append_adapter_shards(
             } else {
                 LoraSide::B
             },
+            layout(index / 2),
             tensor,
         )?);
     }
@@ -630,6 +789,7 @@ fn append_adapter_shards(
             } else {
                 LoraSide::B
             },
+            layout(index / 2),
             tensor,
         )?);
     }
@@ -645,6 +805,7 @@ fn tensor_shard(
     tensor_name: String,
     state: &str,
     side: LoraSide,
+    layout: LoraTpShardLayout,
     tensor: &Tensor,
 ) -> Result<TensorShardManifest> {
     let tp_size = i64::try_from(parallel.tensor_model_parallel_size)
@@ -660,21 +821,60 @@ fn tensor_shard(
     if local_shape.len() < 2 {
         bail!("checkpoint tensor {file}:{tensor_name} must have at least two dimensions");
     }
-    let partition_axis = match side {
+    let rank_axis = match side {
         LoraSide::A => local_shape.len() - 2,
         LoraSide::B => local_shape.len() - 1,
     };
     let local_lora_rank = global_lora_rank / tp_size;
-    if local_shape[partition_axis] != local_lora_rank {
-        bail!(
-            "checkpoint tensor {file}:{tensor_name} has local rank {} on axis {partition_axis}, expected {local_lora_rank}",
-            local_shape[partition_axis]
-        );
-    }
     let mut global_shape = local_shape.clone();
-    global_shape[partition_axis] = global_lora_rank;
     let mut global_offset = vec![0; local_shape.len()];
-    global_offset[partition_axis] = tp_rank * local_lora_rank;
+    let (partition_axis, replicated) = match (layout, side) {
+        (LoraTpShardLayout::LatentRank, _) => {
+            if local_shape[rank_axis] != local_lora_rank {
+                bail!(
+                    "checkpoint tensor {file}:{tensor_name} has local rank {} on axis {rank_axis}, expected {local_lora_rank}",
+                    local_shape[rank_axis]
+                );
+            }
+            global_shape[rank_axis] = global_lora_rank;
+            global_offset[rank_axis] = tp_rank * local_lora_rank;
+            (rank_axis, false)
+        }
+        (LoraTpShardLayout::ColumnParallel, LoraSide::A)
+        | (LoraTpShardLayout::RowParallel, LoraSide::B) => {
+            if local_shape[rank_axis] != global_lora_rank {
+                bail!(
+                    "replicated checkpoint tensor {file}:{tensor_name} has rank {} on axis {rank_axis}, expected {global_lora_rank}",
+                    local_shape[rank_axis]
+                );
+            }
+            (rank_axis, true)
+        }
+        (LoraTpShardLayout::ColumnParallel, LoraSide::B) => {
+            if local_shape[rank_axis] != global_lora_rank {
+                bail!(
+                    "column-parallel checkpoint tensor {file}:{tensor_name} has rank {} on axis {rank_axis}, expected {global_lora_rank}",
+                    local_shape[rank_axis]
+                );
+            }
+            let axis = local_shape.len() - 2;
+            global_shape[axis] *= tp_size;
+            global_offset[axis] = tp_rank * local_shape[axis];
+            (axis, false)
+        }
+        (LoraTpShardLayout::RowParallel, LoraSide::A) => {
+            if local_shape[rank_axis] != global_lora_rank {
+                bail!(
+                    "row-parallel checkpoint tensor {file}:{tensor_name} has rank {} on axis {rank_axis}, expected {global_lora_rank}",
+                    local_shape[rank_axis]
+                );
+            }
+            let axis = local_shape.len() - 1;
+            global_shape[axis] *= tp_size;
+            global_offset[axis] = tp_rank * local_shape[axis];
+            (axis, false)
+        }
+    };
     Ok(TensorShardManifest {
         file: file.to_string(),
         tensor_name,
@@ -684,8 +884,14 @@ fn tensor_shard(
         global_shape,
         local_shape,
         partition_axis,
+        layout,
+        replicated,
         global_offset,
-        replica_identity: parallel.replica_identity(),
+        replica_identity: if replicated {
+            "tp-replicated".to_string()
+        } else {
+            parallel.replica_identity()
+        },
     })
 }
 
@@ -870,6 +1076,7 @@ mod tests {
                 optimizer_step: 19,
                 target_layers: vec![1, 3],
                 target_modules: vec!["q_proj".into(), "down_proj".into()],
+                shard_layouts: Vec::new(),
                 parameter_count: 2,
                 optimizer_count: 4,
             },
@@ -933,6 +1140,7 @@ mod tests {
         }"#;
         let manifest: DynamicAdapterManifest = serde_json::from_str(json).unwrap();
         assert_eq!(manifest.optimizer_step, 0);
+        assert!(manifest.shard_layouts.is_empty());
     }
 
     fn tp_topology(global_rank: usize, tp_size: usize) -> ParallelCheckpointManifest {
@@ -947,6 +1155,14 @@ mod tests {
         (vec![a], vec![b], m, v)
     }
 
+    fn tp_fixed_identities() -> [LoraSlotIdentity; 1] {
+        [LoraSlotIdentity {
+            index: 0,
+            layer: 0,
+            module: "in_proj_qkv".to_string(),
+        }]
+    }
+
     fn tp_dynamic_adapter(value: f64) -> DynamicAdapterCheckpoint {
         let a = Tensor::full([3, 5], value, (tch::Kind::Float, tch::Device::Cpu));
         let b = Tensor::full([7, 3], value + 1.0, (tch::Kind::Float, tch::Device::Cpu));
@@ -958,6 +1174,7 @@ mod tests {
                 optimizer_step: 4,
                 target_layers: vec![1],
                 target_modules: vec!["q_proj".into()],
+                shard_layouts: Vec::new(),
                 parameter_count: 1,
                 optimizer_count: 2,
             },
@@ -987,6 +1204,8 @@ mod tests {
                 &m,
                 &v,
                 &[dynamic],
+                &[],
+                &tp_fixed_identities(),
                 &topology,
             )
             .unwrap();
@@ -1060,6 +1279,8 @@ mod tests {
             &m,
             &v,
             &[],
+            &[],
+            &tp_fixed_identities(),
             &topology,
         )
         .unwrap();
@@ -1088,6 +1309,8 @@ mod tests {
             &m,
             &v,
             &[],
+            &[],
+            &tp_fixed_identities(),
             &rank0,
         )
         .unwrap();
@@ -1111,5 +1334,223 @@ mod tests {
             .err()
             .expect("loading another rank's shard must fail");
         assert!(error.to_string().contains("topology mismatch"));
+    }
+
+    #[test]
+    fn tensor_parallel_projection_layouts_record_global_tensor_geometry() {
+        let dir = tempfile::tempdir().unwrap();
+        let topology = tp_topology(1, 2);
+        let column_a = Tensor::zeros([4, 8], (tch::Kind::Float, tch::Device::Cpu));
+        let column_b = Tensor::zeros([8, 4], (tch::Kind::Float, tch::Device::Cpu));
+        let row_a = Tensor::zeros([4, 4], (tch::Kind::Float, tch::Device::Cpu));
+        let row_b = Tensor::zeros([8, 4], (tch::Kind::Float, tch::Device::Cpu));
+        let lora_a = vec![column_a.shallow_clone(), row_a.shallow_clone()];
+        let lora_b = vec![column_b.shallow_clone(), row_b.shallow_clone()];
+        let adam_m = vec![
+            column_a.zeros_like(),
+            column_b.zeros_like(),
+            row_a.zeros_like(),
+            row_b.zeros_like(),
+        ];
+        let adam_v = vec![
+            column_a.ones_like(),
+            column_b.ones_like(),
+            row_a.ones_like(),
+            row_b.ones_like(),
+        ];
+        let layouts = [
+            LoraTpShardLayout::ColumnParallel,
+            LoraTpShardLayout::RowParallel,
+        ];
+        let identities = [
+            LoraSlotIdentity {
+                index: 0,
+                layer: 0,
+                module: "q_proj".to_string(),
+            },
+            LoraSlotIdentity {
+                index: 3,
+                layer: 0,
+                module: "o_proj".to_string(),
+            },
+        ];
+
+        save_checkpoint_with_dynamic_for_topology(
+            dir.path(),
+            3,
+            0.5,
+            "Qwen/test",
+            4,
+            8.0,
+            &lora_a,
+            &lora_b,
+            &adam_m,
+            &adam_v,
+            &[],
+            &layouts,
+            &identities,
+            &topology,
+        )
+        .unwrap();
+
+        let loaded = load_checkpoint_for_topology(dir.path(), &topology).unwrap();
+        assert_eq!(loaded.manifest.fixed_shard_layouts, layouts);
+        assert_eq!(loaded.manifest.fixed_slot_identities, identities);
+        let shard = |name: &str| {
+            loaded
+                .manifest
+                .tensor_shards
+                .iter()
+                .find(|shard| shard.file == "adapter.safetensors" && shard.tensor_name == name)
+                .unwrap()
+        };
+
+        let column_a_shard = shard("a_0");
+        assert_eq!(column_a_shard.layout, LoraTpShardLayout::ColumnParallel);
+        assert!(column_a_shard.replicated);
+        assert_eq!(column_a_shard.global_shape, vec![4, 8]);
+        assert_eq!(column_a_shard.global_offset, vec![0, 0]);
+        assert_eq!(column_a_shard.replica_identity, "tp-replicated");
+
+        let column_b_shard = shard("b_0");
+        assert!(!column_b_shard.replicated);
+        assert_eq!(column_b_shard.partition_axis, 0);
+        assert_eq!(column_b_shard.global_shape, vec![16, 4]);
+        assert_eq!(column_b_shard.global_offset, vec![8, 0]);
+
+        let row_a_shard = shard("a_1");
+        assert_eq!(row_a_shard.layout, LoraTpShardLayout::RowParallel);
+        assert!(!row_a_shard.replicated);
+        assert_eq!(row_a_shard.partition_axis, 1);
+        assert_eq!(row_a_shard.global_shape, vec![4, 8]);
+        assert_eq!(row_a_shard.global_offset, vec![0, 4]);
+
+        let row_b_shard = shard("b_1");
+        assert!(row_b_shard.replicated);
+        assert_eq!(row_b_shard.global_shape, vec![8, 4]);
+        assert_eq!(row_b_shard.global_offset, vec![0, 0]);
+        assert_eq!(row_b_shard.replica_identity, "tp-replicated");
+    }
+
+    #[test]
+    fn tensor_parallel_loader_accepts_legacy_latent_rank_v3_manifest() {
+        let dir = tempfile::tempdir().unwrap();
+        let topology = tp_topology(0, 2);
+        let (a, b, m, v) = tp_state(1.0);
+        save_checkpoint_with_dynamic_for_topology(
+            dir.path(),
+            7,
+            0.25,
+            "Qwen/test",
+            4,
+            8.0,
+            &a,
+            &b,
+            &m,
+            &v,
+            &[],
+            &[],
+            &tp_fixed_identities(),
+            &topology,
+        )
+        .unwrap();
+
+        let manifest_path = dir.path().join("rank-00000/manifest.json");
+        let mut manifest: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&manifest_path).unwrap()).unwrap();
+        let object = manifest.as_object_mut().unwrap();
+        object.insert(
+            "format".to_string(),
+            serde_json::Value::String(LEGACY_TP_CHECKPOINT_FORMAT.to_string()),
+        );
+        object.remove("fixed_shard_layouts");
+        object.remove("fixed_slot_identities");
+        for shard in object
+            .get_mut("tensor_shards")
+            .unwrap()
+            .as_array_mut()
+            .unwrap()
+        {
+            let shard = shard.as_object_mut().unwrap();
+            shard.remove("layout");
+            shard.remove("replicated");
+        }
+        std::fs::write(
+            &manifest_path,
+            serde_json::to_string_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+
+        let loaded = load_checkpoint_for_topology(dir.path(), &topology).unwrap();
+        assert_eq!(loaded.manifest.format, LEGACY_TP_CHECKPOINT_FORMAT);
+        assert!(loaded.manifest.fixed_shard_layouts.is_empty());
+        assert!(loaded
+            .manifest
+            .tensor_shards
+            .iter()
+            .all(|shard| shard.layout == LoraTpShardLayout::LatentRank && !shard.replicated));
+    }
+
+    fn resume_validation_manifest(format: &str) -> CheckpointManifest {
+        CheckpointManifest {
+            format: format.to_string(),
+            step: 0,
+            loss: 0.0,
+            model_path: "Qwen/test".to_string(),
+            lora_rank: 4,
+            lora_alpha: 8.0,
+            files: Vec::new(),
+            dynamic_adapters: Vec::new(),
+            parallel: None,
+            tensor_shards: Vec::new(),
+            fixed_shard_layouts: vec![LoraTpShardLayout::ColumnParallel],
+            fixed_slot_identities: vec![LoraSlotIdentity {
+                index: 0,
+                layer: 0,
+                module: "q_proj".to_string(),
+            }],
+        }
+    }
+
+    #[test]
+    fn tensor_parallel_resume_rejects_fixed_slot_identity_mismatch() {
+        let manifest = resume_validation_manifest(TP_CHECKPOINT_FORMAT);
+        let expected = [LoraSlotIdentity {
+            index: 1,
+            layer: 0,
+            module: "k_proj".to_string(),
+        }];
+        let error =
+            validate_fixed_tp_resume(&manifest, &[LoraTpShardLayout::ColumnParallel], &expected)
+                .unwrap_err();
+        assert!(error.to_string().contains("slot identities"));
+    }
+
+    #[test]
+    fn legacy_tensor_parallel_resume_rejects_projection_aware_layouts() {
+        let manifest = resume_validation_manifest(LEGACY_TP_CHECKPOINT_FORMAT);
+        let fixed_error =
+            validate_fixed_tp_resume(&manifest, &[LoraTpShardLayout::ColumnParallel], &[])
+                .unwrap_err();
+        assert!(fixed_error.to_string().contains("fixed Q/K/V/O"));
+        let dynamic_error =
+            validate_dynamic_tp_resume(&manifest, 17, &[], &[LoraTpShardLayout::RowParallel])
+                .unwrap_err();
+        assert!(dynamic_error.to_string().contains("adapter 17"));
+        validate_fixed_tp_resume(&manifest, &[LoraTpShardLayout::LatentRank], &[]).unwrap();
+    }
+
+    #[test]
+    fn fixed_restore_mapping_supports_compact_and_legacy_positional_slots() {
+        assert_eq!(
+            fixed_restore_slot_indices(2, 2, &[1, 4], 7).unwrap(),
+            vec![1, 4]
+        );
+        assert_eq!(
+            fixed_restore_slot_indices(7, 7, &[1, 4], 7).unwrap(),
+            (0..7).collect::<Vec<_>>()
+        );
+        assert!(fixed_restore_slot_indices(2, 1, &[1, 4], 7).is_err());
+        assert!(fixed_restore_slot_indices(3, 3, &[1, 4], 7).is_err());
     }
 }

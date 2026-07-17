@@ -366,7 +366,7 @@ static int run_dynamic_dp_smoke(
 }
 
 int main() {
-    assert(qwen36_kernel_abi_version() == 13);
+    assert(qwen36_kernel_abi_version() == 14);
     const int world = std::atoi(std::getenv("WORLD_SIZE") ? std::getenv("WORLD_SIZE") : "1");
     const int process_rank = std::atoi(std::getenv("RANK") ? std::getenv("RANK") : "0");
     const int local_rank = std::atoi(std::getenv("LOCAL_RANK") ? std::getenv("LOCAL_RANK") : "0");

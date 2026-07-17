@@ -1,6 +1,6 @@
 //! Training session trait + Qwen3.6 implementation.
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{anyhow, bail, Context, Result};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tch::{Device, Kind, Tensor};
@@ -9,6 +9,16 @@ use tokio::sync::Mutex;
 use crate::checkpoint;
 use crate::metrics::{FileMetricsSink, MetricsSink, StepMetric};
 use rustrain_qwen3_6::lora::{Qwen36AdapterArtifact, Qwen36LoraConfig, Qwen36LoraTargetModule};
+
+fn lora_tp_shard_layout(module: Qwen36LoraTargetModule) -> checkpoint::LoraTpShardLayout {
+    match module {
+        Qwen36LoraTargetModule::QProj
+        | Qwen36LoraTargetModule::KProj
+        | Qwen36LoraTargetModule::VProj => checkpoint::LoraTpShardLayout::ColumnParallel,
+        Qwen36LoraTargetModule::OProj => checkpoint::LoraTpShardLayout::RowParallel,
+        _ => checkpoint::LoraTpShardLayout::LatentRank,
+    }
+}
 
 /// Session states.
 #[derive(Debug, Clone)]
@@ -334,13 +344,41 @@ impl TrainingSession for Qwen36Session {
         }
         let is_ep = ep_world_size > 1 && runtime_config.is_moe && tp_size == 1;
         let is_data_parallel = ep_world_size > 1 && !runtime_config.is_moe && tp_size == 1;
+        let base_tp_attention = tp_size > 1;
         let base_tp_mlp = tp_size > 1 && !runtime_config.is_moe;
-        if base_tp_mlp {
+        if base_tp_attention {
             if runtime_config.mtp_num_hidden_layers > 0 {
                 return Err(anyhow!(
-                    "base dense TP MLP currently requires MTP to be disabled"
+                    "frozen base TP currently requires MTP to be disabled"
                 ));
             }
+            if runtime_config.num_attention_heads <= 0
+                || runtime_config.num_attention_heads % tp_size as i64 != 0
+                || runtime_config.num_key_value_heads <= 0
+                || runtime_config.num_key_value_heads % tp_size as i64 != 0
+                || runtime_config.num_attention_heads % runtime_config.num_key_value_heads != 0
+            {
+                return Err(anyhow!(
+                    "full-attention heads (q={}, kv={}) must preserve GQA groups and be divisible by TP_SIZE={tp_size}",
+                    runtime_config.num_attention_heads,
+                    runtime_config.num_key_value_heads
+                ));
+            }
+            let rotary_dim =
+                (runtime_config.head_dim as f64 * runtime_config.partial_rotary_factor) as i64;
+            if runtime_config.head_dim <= 0
+                || rotary_dim < 0
+                || rotary_dim > runtime_config.head_dim
+                || rotary_dim % 2 != 0
+            {
+                return Err(anyhow!(
+                    "full-attention head_dim={} and partial_rotary_factor={} produce invalid rotary_dim={rotary_dim}",
+                    runtime_config.head_dim,
+                    runtime_config.partial_rotary_factor
+                ));
+            }
+        }
+        if base_tp_mlp {
             if runtime_config.intermediate_size <= 0
                 || runtime_config.intermediate_size % tp_size as i64 != 0
             {
@@ -406,13 +444,24 @@ impl TrainingSession for Qwen36Session {
                     .to_kind(self.compute_kind);
                 weights.insert(name, narrowed);
             } else {
-                let local_shard = if base_tp_mlp {
-                    rustrain_qwen3_6::kernel::shard_dense_mlp_weight_for_tp(
-                        &name,
-                        &tensor,
-                        tp_size,
-                        ep_rank % tp_size,
-                    )?
+                let local_shard = if base_tp_attention {
+                    let attention_shard =
+                        rustrain_qwen3_6::kernel::shard_full_attention_weight_for_tp(
+                            &name,
+                            &tensor,
+                            tp_size,
+                            ep_rank % tp_size,
+                        )?;
+                    if attention_shard.is_some() || !base_tp_mlp {
+                        attention_shard
+                    } else {
+                        rustrain_qwen3_6::kernel::shard_dense_mlp_weight_for_tp(
+                            &name,
+                            &tensor,
+                            tp_size,
+                            ep_rank % tp_size,
+                        )?
+                    }
                 } else {
                     None
                 };
@@ -457,6 +506,7 @@ impl TrainingSession for Qwen36Session {
             req.eps,
             lora_scaling,
             req.rank,
+            base_tp_attention,
             base_tp_mlp,
             &all_layers,
             &target_modules,
@@ -604,30 +654,83 @@ impl TrainingSession for Qwen36Session {
             .as_ref()
             .ok_or_else(|| anyhow!("LoRA not initialized"))?;
 
-        let lora_count = ctx.lora_count();
-        let mut lora_a = Vec::new();
-        let mut lora_b = Vec::new();
-        for i in 0..lora_count {
-            if let (Some(a), Some(b)) = (ctx.get_lora_a(i as i64), ctx.get_lora_b(i as i64)) {
-                lora_a.push(a);
-                lora_b.push(b);
-            }
+        let model_path = self
+            .model_path
+            .as_ref()
+            .ok_or_else(|| anyhow!("model path unavailable for checkpoint"))?;
+        let runtime_config =
+            rustrain_qwen3_6::config::read_qwen36_runtime_config(std::path::Path::new(model_path))?;
+        let parallel = checkpoint::ParallelCheckpointManifest::from_env()?;
+
+        let fixed_config = Qwen36LoraConfig {
+            rank: self.lora_rank,
+            alpha: self.lora_alpha,
+            target_layers: self.lora_target_layers.clone(),
+            target_modules: self.lora_target_modules.clone(),
+        };
+        let fixed_slots = rustrain_qwen3_6::lora::native_lora_slots(&runtime_config, &fixed_config);
+        let lora_count = ctx.lora_count() as usize;
+        if fixed_slots.len() != lora_count {
+            bail!(
+                "fixed LoRA registry count {} does not match native slot count {lora_count}",
+                fixed_slots.len()
+            );
+        }
+        let (all_adam_m, all_adam_v) = ctx.export_optimizer_state()?;
+        let expected_optimizer_count = lora_count.saturating_mul(2);
+        if all_adam_m.len() != expected_optimizer_count
+            || all_adam_v.len() != expected_optimizer_count
+        {
+            bail!(
+                "fixed optimizer state count mismatch: m={}, v={}, expected={expected_optimizer_count}",
+                all_adam_m.len(),
+                all_adam_v.len()
+            );
         }
 
-        // Export Adam optimizer state
-        let (adam_m, adam_v) = ctx.export_optimizer_state()?;
+        // TP v4 can compact inactive native slots because the manifest records
+        // exact identities. Keep the positional full-slot representation for
+        // v1/v2, whose manifests have no fixed-slot identity metadata.
+        let saved_fixed_slots = fixed_slots
+            .iter()
+            .filter(|slot| parallel.tensor_model_parallel_size <= 1 || slot.active)
+            .collect::<Vec<_>>();
+        let saved_fixed_count = saved_fixed_slots.len();
+        let mut lora_a = Vec::with_capacity(saved_fixed_count);
+        let mut lora_b = Vec::with_capacity(saved_fixed_count);
+        let mut adam_m = Vec::with_capacity(saved_fixed_count.saturating_mul(2));
+        let mut adam_v = Vec::with_capacity(saved_fixed_count.saturating_mul(2));
+        let mut fixed_shard_layouts = Vec::with_capacity(saved_fixed_count);
+        let mut fixed_slot_identities = Vec::with_capacity(saved_fixed_count);
+        for slot in saved_fixed_slots {
+            lora_a.push(ctx.get_lora_a(slot.index as i64).with_context(|| {
+                format!("fixed LoRA A is missing for native slot {}", slot.index)
+            })?);
+            lora_b.push(ctx.get_lora_b(slot.index as i64).with_context(|| {
+                format!("fixed LoRA B is missing for native slot {}", slot.index)
+            })?);
+            let optimizer_index = slot.index.saturating_mul(2);
+            adam_m.push(all_adam_m[optimizer_index].shallow_clone());
+            adam_m.push(all_adam_m[optimizer_index + 1].shallow_clone());
+            adam_v.push(all_adam_v[optimizer_index].shallow_clone());
+            adam_v.push(all_adam_v[optimizer_index + 1].shallow_clone());
+            fixed_shard_layouts.push(lora_tp_shard_layout(slot.module));
+            fixed_slot_identities.push(checkpoint::LoraSlotIdentity {
+                index: slot.index,
+                layer: slot.layer,
+                module: slot.module.cpp_name().to_string(),
+            });
+        }
 
         let mut dynamic_adapters = Vec::new();
         if !self.dynamic_lora_configs.is_empty() {
-            let model_path = self
-                .model_path
-                .as_ref()
-                .ok_or_else(|| anyhow!("model path unavailable for dynamic LoRA checkpoint"))?;
-            let runtime_config = rustrain_qwen3_6::config::read_qwen36_runtime_config(
-                std::path::Path::new(model_path),
-            )?;
             for (&adapter_id, lora_config) in &self.dynamic_lora_configs {
                 let slots = rustrain_qwen3_6::lora::native_lora_slots(&runtime_config, lora_config);
+                let shard_layouts = slots
+                    .iter()
+                    .filter(|slot| slot.active)
+                    .map(|slot| lora_tp_shard_layout(slot.module))
+                    .collect::<Vec<_>>();
                 let mut dynamic_a = Vec::new();
                 let mut dynamic_b = Vec::new();
                 let mut dynamic_m = Vec::new();
@@ -738,6 +841,7 @@ impl TrainingSession for Qwen36Session {
                             .iter()
                             .map(|module| module.cpp_name().to_string())
                             .collect(),
+                        shard_layouts,
                         parameter_count: dynamic_a.len(),
                         optimizer_count: dynamic_m.len(),
                     },
@@ -749,12 +853,11 @@ impl TrainingSession for Qwen36Session {
             }
         }
 
-        let parallel = checkpoint::ParallelCheckpointManifest::from_env()?;
         checkpoint::save_checkpoint_with_dynamic_for_topology(
             std::path::Path::new(path),
             self.step,
             self.last_loss,
-            self.model_path.as_deref().unwrap_or(""),
+            model_path,
             self.lora_rank,
             self.lora_alpha,
             &lora_a,
@@ -762,6 +865,8 @@ impl TrainingSession for Qwen36Session {
             &adam_m,
             &adam_v,
             &dynamic_adapters,
+            &fixed_shard_layouts,
+            &fixed_slot_identities,
             &parallel,
         )?;
 
@@ -771,14 +876,69 @@ impl TrainingSession for Qwen36Session {
     fn load_checkpoint(&mut self, path: &str) -> Result<(u64, f64)> {
         let parallel = checkpoint::ParallelCheckpointManifest::from_env()?;
         let data = checkpoint::load_checkpoint_for_topology(std::path::Path::new(path), &parallel)?;
-        if !data.dynamic_adapters.is_empty() {
-            let model_path = self
-                .model_path
-                .as_ref()
-                .ok_or_else(|| anyhow!("model path unavailable for dynamic LoRA checkpoint"))?;
-            let runtime_config = rustrain_qwen3_6::config::read_qwen36_runtime_config(
-                std::path::Path::new(model_path),
+        let model_path = self
+            .model_path
+            .as_ref()
+            .ok_or_else(|| anyhow!("model path unavailable for checkpoint restore"))?;
+        let runtime_config =
+            rustrain_qwen3_6::config::read_qwen36_runtime_config(std::path::Path::new(model_path))?;
+        let fixed_config = Qwen36LoraConfig {
+            rank: self.lora_rank,
+            alpha: self.lora_alpha,
+            target_layers: self.lora_target_layers.clone(),
+            target_modules: self.lora_target_modules.clone(),
+        };
+        let fixed_slots = rustrain_qwen3_6::lora::native_lora_slots(&runtime_config, &fixed_config);
+        let expected_fixed_layouts = fixed_slots
+            .iter()
+            .filter(|slot| slot.active)
+            .map(|slot| lora_tp_shard_layout(slot.module))
+            .collect::<Vec<_>>();
+        let expected_fixed_identities = fixed_slots
+            .iter()
+            .filter(|slot| slot.active)
+            .map(|slot| checkpoint::LoraSlotIdentity {
+                index: slot.index,
+                layer: slot.layer,
+                module: slot.module.cpp_name().to_string(),
+            })
+            .collect::<Vec<_>>();
+        if parallel.tensor_model_parallel_size > 1 {
+            checkpoint::validate_fixed_tp_resume(
+                &data.manifest,
+                &expected_fixed_layouts,
+                &expected_fixed_identities,
             )?;
+        }
+        if parallel.tensor_model_parallel_size > 1 {
+            for dynamic in &data.dynamic_adapters {
+                let target_modules = dynamic
+                    .manifest
+                    .target_modules
+                    .iter()
+                    .map(|name| Qwen36LoraTargetModule::parse(name))
+                    .collect::<Result<Vec<_>>>()?;
+                let config = Qwen36LoraConfig {
+                    rank: dynamic.manifest.rank,
+                    alpha: dynamic.manifest.alpha,
+                    target_layers: dynamic.manifest.target_layers.clone(),
+                    target_modules,
+                };
+                let expected_layouts =
+                    rustrain_qwen3_6::lora::native_lora_slots(&runtime_config, &config)
+                        .iter()
+                        .filter(|slot| slot.active)
+                        .map(|slot| lora_tp_shard_layout(slot.module))
+                        .collect::<Vec<_>>();
+                checkpoint::validate_dynamic_tp_resume(
+                    &data.manifest,
+                    dynamic.manifest.id,
+                    &dynamic.manifest.shard_layouts,
+                    &expected_layouts,
+                )?;
+            }
+        }
+        if !data.dynamic_adapters.is_empty() {
             if !self.dynamic_lora_configs.is_empty() {
                 bail!("cannot load dynamic LoRA checkpoint into a session with active adapters");
             }
@@ -908,23 +1068,77 @@ impl TrainingSession for Qwen36Session {
         }
         // Import Adam optimizer state into C++ context
         if let Some(ctx) = &self.ctx {
-            if data.lora_a.len() != data.lora_b.len()
-                || data.lora_a.len() != ctx.lora_count() as usize
+            let native_slot_count = ctx.lora_count() as usize;
+            if fixed_slots.len() != native_slot_count {
+                bail!(
+                    "fixed LoRA registry count {} does not match native slot count {native_slot_count}",
+                    fixed_slots.len()
+                );
+            }
+            let active_slot_indices = fixed_slots
+                .iter()
+                .filter(|slot| slot.active)
+                .map(|slot| slot.index)
+                .collect::<Vec<_>>();
+            let restore_slot_indices = checkpoint::fixed_restore_slot_indices(
+                data.lora_a.len(),
+                data.lora_b.len(),
+                &active_slot_indices,
+                native_slot_count,
+            )?;
+            for ((a, b), &slot_index) in data
+                .lora_a
+                .iter()
+                .zip(&data.lora_b)
+                .zip(&restore_slot_indices)
             {
-                return Err(anyhow!(
-                    "checkpoint LoRA slot count mismatch: checkpoint A/B={}/{}, context={}",
-                    data.lora_a.len(),
-                    data.lora_b.len(),
-                    ctx.lora_count()
-                ));
+                ctx.set_lora_tensor(slot_index as i64, false, a)?;
+                ctx.set_lora_tensor(slot_index as i64, true, b)?;
             }
-            for (index, (a, b)) in data.lora_a.iter().zip(&data.lora_b).enumerate() {
-                ctx.set_lora_tensor(index as i64, false, a)?;
-                ctx.set_lora_tensor(index as i64, true, b)?;
+            if data.adam_m.is_empty() != data.adam_v.is_empty() {
+                bail!(
+                    "checkpoint fixed optimizer m/v count mismatch: {}/{}",
+                    data.adam_m.len(),
+                    data.adam_v.len()
+                );
             }
-            if !data.adam_m.is_empty() && !data.adam_v.is_empty() {
-                ctx.import_optimizer_state(&data.adam_m, &data.adam_v)?;
-                tracing::info!(imported = data.adam_m.len(), "optimizer state imported");
+            if !data.adam_m.is_empty() {
+                let expected_saved_optimizer_count = restore_slot_indices.len().saturating_mul(2);
+                if data.adam_m.len() != expected_saved_optimizer_count
+                    || data.adam_v.len() != expected_saved_optimizer_count
+                {
+                    bail!(
+                        "checkpoint fixed optimizer count mismatch: m={}, v={}, expected={expected_saved_optimizer_count}",
+                        data.adam_m.len(),
+                        data.adam_v.len()
+                    );
+                }
+                let (mut all_adam_m, mut all_adam_v) = ctx.export_optimizer_state()?;
+                let expected_native_optimizer_count = native_slot_count.saturating_mul(2);
+                if all_adam_m.len() != expected_native_optimizer_count
+                    || all_adam_v.len() != expected_native_optimizer_count
+                {
+                    bail!(
+                        "native fixed optimizer count mismatch: m={}, v={}, expected={expected_native_optimizer_count}",
+                        all_adam_m.len(),
+                        all_adam_v.len()
+                    );
+                }
+                for (saved_slot, &native_slot) in restore_slot_indices.iter().enumerate() {
+                    let saved = saved_slot.saturating_mul(2);
+                    let native = native_slot.saturating_mul(2);
+                    all_adam_m[native] = data.adam_m[saved].shallow_clone();
+                    all_adam_m[native + 1] = data.adam_m[saved + 1].shallow_clone();
+                    all_adam_v[native] = data.adam_v[saved].shallow_clone();
+                    all_adam_v[native + 1] = data.adam_v[saved + 1].shallow_clone();
+                }
+                let imported = ctx.import_optimizer_state(&all_adam_m, &all_adam_v)?;
+                if imported != expected_native_optimizer_count as i64 {
+                    bail!(
+                        "native fixed optimizer import restored {imported} tensors, expected {expected_native_optimizer_count}"
+                    );
+                }
+                tracing::info!(imported, "optimizer state imported");
             }
             let native_step = i64::try_from(data.manifest.step)
                 .context("checkpoint step exceeds the native optimizer range")?;

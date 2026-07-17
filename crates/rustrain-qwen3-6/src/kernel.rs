@@ -4,7 +4,7 @@
 //! Rust only handles: weight loading, data loading, training loop orchestration.
 
 use crate::lora::Qwen36LoraTargetModule;
-use anyhow::{Result, bail};
+use anyhow::{bail, Result};
 use std::ffi::c_void;
 use std::sync::OnceLock;
 use tch::{Kind, Tensor};
@@ -31,6 +31,7 @@ type FnCreateCtx = unsafe extern "C" fn(
     *const i64,
     i64,
     *const i8,
+    i32,
 ) -> *mut c_void;
 type FnKernelAbiVersion = unsafe extern "C" fn() -> i64;
 type FnTrainStep = unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void, *mut c_void) -> f64;
@@ -196,11 +197,11 @@ unsafe fn load_kernels() -> Option<KernelHandles> {
         }};
     }
     let abi_version: FnKernelAbiVersion = sym!("qwen36_kernel_abi_version");
-    if abi_version() != 13 {
+    if abi_version() != 14 {
         return None;
     }
     Some(KernelHandles {
-        create_ctx: sym!("qwen36_create_training_context"),
+        create_ctx: sym!("qwen36_create_training_context_ex"),
         train_step: sym!("qwen36_train_step"),
         train_micro_step: sym!("qwen36_train_micro_step"),
         train_multi_lora: sym!("qwen36_train_multi_lora"),
@@ -285,6 +286,44 @@ pub fn shard_dense_mlp_weight_for_tp(
     let shard = full / tp_size as i64;
     let start = tp_rank as i64 * shard;
     Ok(Some(tensor.narrow(dim, start, shard).contiguous()))
+}
+
+/// Return the rank-local frozen full-attention shard for TP. Q/K/V own
+/// contiguous output-head bundles; O owns the matching input columns.
+pub fn shard_full_attention_weight_for_tp(
+    name: &str,
+    tensor: &Tensor,
+    tp_size: usize,
+    tp_rank: usize,
+) -> Result<Option<Tensor>> {
+    let dim = if name.ends_with(".self_attn.q_proj.weight")
+        || name.ends_with(".self_attn.k_proj.weight")
+        || name.ends_with(".self_attn.v_proj.weight")
+    {
+        0
+    } else if name.ends_with(".self_attn.o_proj.weight") {
+        1
+    } else {
+        return Ok(None);
+    };
+    if tp_size <= 1 || tp_rank >= tp_size {
+        bail!("invalid full-attention TP shard: tp_rank={tp_rank}, tp_size={tp_size}");
+    }
+    let full = *tensor
+        .size()
+        .get(dim as usize)
+        .ok_or_else(|| anyhow::anyhow!("base TP attention weight {name} has no dimension {dim}"))?;
+    if full <= 0 || full % tp_size as i64 != 0 {
+        bail!(
+            "base TP attention weight {name} dimension {dim}={full} is not divisible by TP_SIZE={tp_size}"
+        );
+    }
+    let shard = full / tp_size as i64;
+    Ok(Some(
+        tensor
+            .narrow(dim, tp_rank as i64 * shard, shard)
+            .contiguous(),
+    ))
 }
 
 pub fn build_weight_ptrs(
@@ -503,6 +542,7 @@ impl CppTrainingContext {
         eps: f64,
         lora_scaling: f64,
         lora_rank: i64,
+        base_tp_attention: bool,
         base_tp_mlp: bool,
         target_layers: &[usize],
         target_modules: &[Qwen36LoraTargetModule],
@@ -579,6 +619,7 @@ impl CppTrainingContext {
                 tl_ptr,
                 tl_len,
                 modules_ptr,
+                i32::from(base_tp_attention),
             )
         };
         if ptr.is_null() {
@@ -1150,7 +1191,7 @@ impl Drop for CppTrainingContext {
 
 #[cfg(test)]
 mod tests {
-    use super::shard_dense_mlp_weight_for_tp;
+    use super::{shard_dense_mlp_weight_for_tp, shard_full_attention_weight_for_tp};
     use tch::{Kind, Tensor};
 
     #[test]
@@ -1174,14 +1215,55 @@ mod tests {
     #[test]
     fn dense_mlp_tp_ignores_non_mlp_weights_and_rejects_bad_shapes() {
         let tensor = Tensor::zeros([5, 4], (Kind::Float, tch::Device::Cpu));
-        assert!(
-            shard_dense_mlp_weight_for_tp("model.layers.0.self_attn.q_proj.weight", &tensor, 2, 0)
-                .unwrap()
-                .is_none()
-        );
+        assert!(shard_dense_mlp_weight_for_tp(
+            "model.layers.0.self_attn.q_proj.weight",
+            &tensor,
+            2,
+            0
+        )
+        .unwrap()
+        .is_none());
         assert!(
             shard_dense_mlp_weight_for_tp("model.layers.0.mlp.up_proj.weight", &tensor, 2, 0)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn full_attention_tp_shards_head_and_output_axes() {
+        let q = Tensor::arange(96, (Kind::Float, tch::Device::Cpu)).reshape([24, 4]);
+        let o = Tensor::arange(48, (Kind::Float, tch::Device::Cpu)).reshape([4, 12]);
+        let q_rank_one =
+            shard_full_attention_weight_for_tp("model.layers.0.self_attn.q_proj.weight", &q, 2, 1)
+                .unwrap()
+                .unwrap();
+        let o_rank_one =
+            shard_full_attention_weight_for_tp("model.layers.0.self_attn.o_proj.weight", &o, 2, 1)
+                .unwrap()
+                .unwrap();
+        assert_eq!(q_rank_one.size(), [12, 4]);
+        assert_eq!(o_rank_one.size(), [4, 6]);
+        assert_eq!(q_rank_one.double_value(&[0, 0]), 48.0);
+        assert_eq!(o_rank_one.double_value(&[0, 0]), 6.0);
+    }
+
+    #[test]
+    fn full_attention_tp_ignores_other_weights_and_rejects_bad_shapes() {
+        let tensor = Tensor::zeros([5, 4], (Kind::Float, tch::Device::Cpu));
+        assert!(shard_full_attention_weight_for_tp(
+            "model.layers.0.mlp.gate_proj.weight",
+            &tensor,
+            2,
+            0,
+        )
+        .unwrap()
+        .is_none());
+        assert!(shard_full_attention_weight_for_tp(
+            "model.layers.0.self_attn.q_proj.weight",
+            &tensor,
+            2,
+            0,
+        )
+        .is_err());
     }
 }

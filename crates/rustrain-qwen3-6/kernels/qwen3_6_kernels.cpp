@@ -1108,6 +1108,12 @@ struct RoutedExpertLora {
     double scaling = 0.0;
 };
 
+enum class LoraTpLayout : uint8_t {
+    LatentRank,
+    ColumnParallel,
+    RowParallel,
+};
+
 // Per-sample adapter projection used by the batched multi-LoRA path.  This is
 // intentionally separate from RoutedExpertLora: routed experts carry one
 // A/B pair per local expert, while dense/shared projections carry one pair per
@@ -1115,7 +1121,8 @@ struct RoutedExpertLora {
 struct LoraBatchEntry {
     at::Tensor a_stack;    // [N, rank, in]
     at::Tensor b_stack;    // [N, out, rank]
-    at::Tensor scaling;     // [N, 1, 1]
+    at::Tensor scaling;    // [N, 1, 1]
+    LoraTpLayout layout = LoraTpLayout::LatentRank;
 };
 
 static const LoraBatchEntry* lora_batch_entry(
@@ -1128,7 +1135,7 @@ static at::Tensor dense_mlp_forward_batched(
 static at::Tensor lora_activation_delta(
     TrainingContext* ctx, const at::Tensor& x,
     const at::Tensor& A, const at::Tensor& B,
-    const at::Tensor& scaling);
+    const at::Tensor& scaling, LoraTpLayout layout);
 
 static at::Tensor add_batched_lora(
     TrainingContext* ctx, const at::Tensor& base, const at::Tensor& input,
@@ -1136,7 +1143,8 @@ static at::Tensor add_batched_lora(
 ) {
     if (!entry) return base;
     return base + lora_activation_delta(
-        ctx, input, entry->a_stack, entry->b_stack, entry->scaling);
+        ctx, input, entry->a_stack, entry->b_stack, entry->scaling,
+        entry->layout);
 }
 
 // Per-token routed-expert LoRA. Dynamic adapters add a leading sample axis to
@@ -1725,6 +1733,11 @@ static at::Tensor tp_allreduce_base_mlp(
     TrainingContext* ctx, const at::Tensor& local_output);
 static at::Tensor tp_copy_base_mlp_input(
     TrainingContext* ctx, const at::Tensor& input);
+static at::Tensor tp_allreduce_base_attention(
+    TrainingContext* ctx, const at::Tensor& local_output);
+static at::Tensor tp_copy_base_attention_input(
+    TrainingContext* ctx, const at::Tensor& input);
+static bool base_tp_attention_enabled(const TrainingContext* ctx);
 
 static at::Tensor forward_single_layer(
     TrainingContext* ctx, const at::Tensor& hidden, at::Tensor** w, const LayerConfig* cfg,
@@ -1740,6 +1753,8 @@ static at::Tensor forward_single_layer(
     if (cfg->layer_type == 0) {
         // Full attention
         auto q_proj = *w[2], q_norm = *w[3], k_proj = *w[4], k_norm = *w[5], v_proj = *w[6], o_proj = *w[7];
+        TORCH_CHECK(!base_tp_attention_enabled(ctx) || use_batched,
+            "base full-attention TP requires the activation-level LoRA path");
         if (use_batched) {
             // Activation-level LoRA: pass base weights, apply delta inside attention
             attn_output = full_attention_batched(
@@ -2005,6 +2020,10 @@ struct TrainingContext {
     // input-sharded by the Rust weight loader.  The local row contribution
     // is reduced over the TP communicator before the residual add.
     bool base_tp_mlp = false;
+    // Frozen full-attention TP: Q/K/V own disjoint head bundles and O owns
+    // the matching input columns. GDN layers remain replicated until their
+    // state/head bundle partition has a dedicated implementation.
+    bool base_tp_attention = false;
     // Set when a legacy NCCL setter supplies an incompatible mixed topology.
     // Training entry points reject the context before touching parameters.
     bool topology_invalid = false;
@@ -2137,6 +2156,22 @@ static at::Tensor tp_allreduce_lora_delta(
         (int64_t)reinterpret_cast<uintptr_t>(ctx->tp_stream));
 }
 
+static at::Tensor tp_copy_lora_input(
+    TrainingContext* ctx, const at::Tensor& input
+) {
+    if (!ctx || ctx->tp_world_size <= 1) return input;
+    TORCH_CHECK(ctx->tp_comm,
+        "LoRA TP communicator is not initialized for TP_SIZE=",
+        ctx->tp_world_size);
+    return TpCopyToRegionFunction::apply(
+        input, (int64_t)ctx->tp_comm,
+        (int64_t)reinterpret_cast<uintptr_t>(ctx->tp_stream));
+}
+
+static bool base_tp_attention_enabled(const TrainingContext* ctx) {
+    return ctx && ctx->base_tp_attention && ctx->tp_world_size > 1;
+}
+
 static at::Tensor tp_allreduce_base_mlp(
     TrainingContext* ctx, const at::Tensor& local_output
 ) {
@@ -2161,6 +2196,50 @@ static at::Tensor tp_copy_base_mlp_input(
     return TpCopyToRegionFunction::apply(
         input, (int64_t)ctx->tp_comm,
         (int64_t)reinterpret_cast<uintptr_t>(ctx->tp_stream));
+}
+
+static at::Tensor tp_allreduce_base_attention(
+    TrainingContext* ctx, const at::Tensor& local_output
+) {
+    if (!ctx || !ctx->base_tp_attention || ctx->tp_world_size <= 1)
+        return local_output;
+    TORCH_CHECK(ctx->tp_comm,
+        "base attention TP communicator is not initialized for TP_SIZE=",
+        ctx->tp_world_size);
+    return NcclAllReduceFunction::apply(
+        local_output, (int64_t)ctx->tp_comm,
+        (int64_t)reinterpret_cast<uintptr_t>(ctx->tp_stream));
+}
+
+static at::Tensor tp_copy_base_attention_input(
+    TrainingContext* ctx, const at::Tensor& input
+) {
+    if (!ctx || !ctx->base_tp_attention || ctx->tp_world_size <= 1)
+        return input;
+    TORCH_CHECK(ctx->tp_comm,
+        "base attention TP communicator is not initialized for TP_SIZE=",
+        ctx->tp_world_size);
+    return TpCopyToRegionFunction::apply(
+        input, (int64_t)ctx->tp_comm,
+        (int64_t)reinterpret_cast<uintptr_t>(ctx->tp_stream));
+}
+
+static LoraTpLayout lora_tp_layout(
+    const TrainingContext* ctx, int64_t layer_idx, int64_t pair_idx
+) {
+    if (!ctx || !ctx->base_tp_attention || ctx->tp_world_size <= 1 ||
+        layer_idx < 0 || layer_idx >= ctx->num_layers)
+        return LoraTpLayout::LatentRank;
+    const auto& cfg = ctx->layer_configs[layer_idx];
+    if (cfg.layer_type != 0) return LoraTpLayout::LatentRank;
+    auto table = lora_projection_table(cfg);
+    TORCH_CHECK(pair_idx >= 0 && pair_idx < table.count,
+        "invalid LoRA pair for TP layout");
+    const std::string name(table.entries[pair_idx].name);
+    if (name == "q_proj" || name == "k_proj" || name == "v_proj")
+        return LoraTpLayout::ColumnParallel;
+    if (name == "o_proj") return LoraTpLayout::RowParallel;
+    return LoraTpLayout::LatentRank;
 }
 
 static at::Tensor initialize_lora_a(
@@ -2225,6 +2304,80 @@ static ncclDataType_t nccl_dtype_for(const at::Tensor& tensor) {
             TORCH_CHECK(false, "unsupported LoRA gradient dtype for EP all-reduce: ",
                         tensor.scalar_type());
     }
+}
+
+static void tp_broadcast_lora_parameter(
+    TrainingContext* ctx, at::Tensor& tensor
+) {
+    if (!ctx || ctx->tp_world_size <= 1 || !tensor.defined()) return;
+    TORCH_CHECK(ctx->tp_comm,
+        "LoRA TP communicator is not initialized for parameter broadcast");
+    TORCH_CHECK(tensor.is_cuda() && tensor.is_contiguous(),
+        "LoRA TP parameter broadcast requires a contiguous CUDA tensor");
+    const int dev = tensor.device().index();
+    cudaSetDevice(dev);
+    auto stream = c10::cuda::getCurrentCUDAStream(dev).stream();
+    auto err = ncclBroadcast(
+        tensor.data_ptr(), tensor.data_ptr(), tensor.numel(),
+        nccl_dtype_for(tensor), 0, ctx->tp_comm, stream);
+    TORCH_CHECK(err == ncclSuccess,
+        "NCCL LoRA parameter broadcast failed: ", ncclGetErrorString(err));
+}
+
+static void synchronize_adapter_replicated_lora_parameters(
+    TrainingContext* ctx, TrainingContext::LoRAAdapter& adapter);
+
+static void synchronize_fixed_replicated_lora_parameters(TrainingContext* ctx) {
+    if (!ctx || !ctx->base_tp_attention || ctx->tp_world_size <= 1) return;
+    for (int64_t layer = 0; layer < ctx->num_layers; ++layer) {
+        const int64_t offset = ctx->lora_layer_offset[layer];
+        const int64_t pairs = lora_pair_count(ctx->layer_configs[layer]);
+        for (int64_t pair = 0; pair < pairs; ++pair) {
+            const int64_t slot = offset + pair;
+            if (!legacy_lora_slot_active(ctx, slot)) continue;
+            const auto layout = lora_tp_layout(ctx, layer, pair);
+            if (layout == LoraTpLayout::ColumnParallel)
+                tp_broadcast_lora_parameter(ctx, ctx->lora_a[slot]);
+            else if (layout == LoraTpLayout::RowParallel)
+                tp_broadcast_lora_parameter(ctx, ctx->lora_b[slot]);
+        }
+    }
+    for (auto& adapter : ctx->adapters)
+        synchronize_adapter_replicated_lora_parameters(ctx, adapter);
+}
+
+static void synchronize_adapter_replicated_lora_parameters(
+    TrainingContext* ctx, TrainingContext::LoRAAdapter& adapter
+) {
+    if (!ctx || !ctx->base_tp_attention || ctx->tp_world_size <= 1) return;
+    if (!ctx->tp_comm) return;  // qwen36_init_nccl synchronizes deferred adapters.
+    for (auto& [layer, pairs] : adapter.params) {
+        for (int64_t pair = 0; pair < static_cast<int64_t>(pairs.size()); ++pair) {
+            auto& [a, b] = pairs[pair];
+            if (!a.requires_grad() && !b.requires_grad()) continue;
+            const auto layout = lora_tp_layout(ctx, layer, pair);
+            if (layout == LoraTpLayout::ColumnParallel)
+                tp_broadcast_lora_parameter(ctx, a);
+            else if (layout == LoraTpLayout::RowParallel)
+                tp_broadcast_lora_parameter(ctx, b);
+        }
+    }
+}
+
+static void tp_sum_replicated_lora_accumulator(
+    TrainingContext* ctx, at::Tensor& accumulator,
+    LoraTpLayout layout, bool is_a
+) {
+    const bool replicated =
+        (layout == LoraTpLayout::ColumnParallel && is_a) ||
+        (layout == LoraTpLayout::RowParallel && !is_a);
+    if (!replicated || !accumulator.defined() || ctx->tp_world_size <= 1) return;
+    TORCH_CHECK(ctx->tp_comm,
+        "LoRA TP communicator is not initialized for replicated gradient sum");
+    auto reduced = NcclAllReduceFunction::allreduce(
+        accumulator, ctx->tp_comm, ctx->tp_stream);
+    at::NoGradGuard guard;
+    accumulator.copy_(reduced);
 }
 
 static void reduce_lora_accumulator(
@@ -2401,20 +2554,23 @@ static void synchronize_lora_gradients(
         // Dynamic multi-LoRA currently contributes one independently-normalized
         // row per tenant. Preserve that contract while weighting replicated DP
         // ranks by the selected batch's token count.
-        if (!dp_allreduce) return;
-        auto shifted_mask = target_mask.narrow(1, 1, target_mask.size(1) - 1)
-            .to(at::kFloat).sum().reshape({1});
-        auto global_mask = at::empty_like(shifted_mask);
-        auto stream = c10::cuda::getCurrentCUDAStream(
-            shifted_mask.device().index()).stream();
-        auto err = ncclAllReduce(
-            shifted_mask.data_ptr(), global_mask.data_ptr(), 1,
-            ncclFloat, ncclSum, ctx->nccl_comm, stream);
-        TORCH_CHECK(err == ncclSuccess, "NCCL token-count all-reduce failed: ",
-                    ncclGetErrorString(err));
-        const double local_tokens = shifted_mask.item<double>();
-        const double global_tokens = global_mask.item<double>();
-        scale = local_tokens / std::max(global_tokens, 1.0);
+        if (!dp_allreduce) {
+            if (!ctx->base_tp_attention) return;
+        } else {
+            auto shifted_mask = target_mask.narrow(1, 1, target_mask.size(1) - 1)
+                .to(at::kFloat).sum().reshape({1});
+            auto global_mask = at::empty_like(shifted_mask);
+            auto stream = c10::cuda::getCurrentCUDAStream(
+                shifted_mask.device().index()).stream();
+            auto err = ncclAllReduce(
+                shifted_mask.data_ptr(), global_mask.data_ptr(), 1,
+                ncclFloat, ncclSum, ctx->nccl_comm, stream);
+            TORCH_CHECK(err == ncclSuccess, "NCCL token-count all-reduce failed: ",
+                        ncclGetErrorString(err));
+            const double local_tokens = shifted_mask.item<double>();
+            const double global_tokens = global_mask.item<double>();
+            scale = local_tokens / std::max(global_tokens, 1.0);
+        }
     }
     for (size_t adapter_index = 0;
          adapter_index < ctx->adapters.size(); ++adapter_index) {
@@ -2483,6 +2639,20 @@ static void synchronize_lora_gradients(
             }
         }
     }
+    // Projection-aware TP keeps one LoRA factor replicated. Its gradient is
+    // the sum of disjoint output-head (column) or input-column (row)
+    // contributions and is synchronized once at the optimizer boundary.
+    for (auto& adapter : ctx->adapters) {
+        for (auto& [layer_idx, pairs] : adapter.grad_accum) {
+            for (int64_t pair = 0; pair < static_cast<int64_t>(pairs.size()); ++pair) {
+                const auto layout = lora_tp_layout(ctx, layer_idx, pair);
+                tp_sum_replicated_lora_accumulator(
+                    ctx, pairs[pair][0], layout, true);
+                tp_sum_replicated_lora_accumulator(
+                    ctx, pairs[pair][1], layout, false);
+            }
+        }
+    }
     if (per_adapter_weighting) return;
     // The replicated-source A2A path sends an identical token batch from every
     // EP rank. Average only its sharded expert parameter gradients here;
@@ -2517,6 +2687,17 @@ static void synchronize_lora_gradients(
             reduce_lora_accumulator(
                 ctx, ctx->grad_accum_b[offset + pair], scale,
                 dp_allreduce || sharded_a2a);
+        }
+    }
+    for (int64_t layer = 0; layer < ctx->num_layers; ++layer) {
+        const int64_t offset = ctx->lora_layer_offset[layer];
+        const int64_t pairs = lora_pair_count(ctx->layer_configs[layer]);
+        for (int64_t pair = 0; pair < pairs; ++pair) {
+            const auto layout = lora_tp_layout(ctx, layer, pair);
+            tp_sum_replicated_lora_accumulator(
+                ctx, ctx->grad_accum_a[offset + pair], layout, true);
+            tp_sum_replicated_lora_accumulator(
+                ctx, ctx->grad_accum_b[offset + pair], layout, false);
         }
     }
 }
@@ -2700,7 +2881,8 @@ static void prepare_lora_batch(TrainingContext* ctx) {
             auto scaling = scaling_cpu.to(a_stack.device()).to(at::kBFloat16);  // [N, 1, 1]
 
             ctx->lora_batch_cache[lora_cache_key(layer_idx, pair_idx)] = {
-                a_stack, b_stack, scaling
+                a_stack, b_stack, scaling,
+                lora_tp_layout(ctx, layer_idx, pair_idx)
             };
         }
     }
@@ -2725,7 +2907,8 @@ static void prepare_fixed_lora_batch(TrainingContext* ctx) {
                 {1, 1, 1}, ctx->lora_scaling,
                 at::TensorOptions().dtype(a.scalar_type()).device(a.device()));
             ctx->lora_batch_cache[lora_cache_key(layer_idx, pair_idx)] = {
-                a.unsqueeze(0), b.unsqueeze(0), scaling};
+                a.unsqueeze(0), b.unsqueeze(0), scaling,
+                lora_tp_layout(ctx, layer_idx, pair_idx)};
         }
     }
     ctx->lora_batch_valid = true;
@@ -2739,7 +2922,8 @@ static at::Tensor lora_activation_delta(
     const at::Tensor& x,          // [N, seq, in]
     const at::Tensor& A,          // [N, rank, in]
     const at::Tensor& B,          // [N, out, rank]
-    const at::Tensor& scaling     // [N, 1, 1]
+    const at::Tensor& scaling,    // [N, 1, 1]
+    LoraTpLayout layout
 ) {
     // Cast to compute dtype (BF16)
     auto kind = x.scalar_type();
@@ -2751,11 +2935,19 @@ static at::Tensor lora_activation_delta(
         B_c = B_c.expand({x.size(0), B_c.size(1), B_c.size(2)});
         s_c = s_c.expand({x.size(0), 1, 1});
     }
+    // Latent-rank TP sums local deltas in forward. Its replicated input must
+    // likewise sum the rank-local input-gradient contributions in backward;
+    // otherwise a later sharded LoRA branch feeds only a partial dgrad into
+    // preceding replicated layers.
+    auto lora_input = layout == LoraTpLayout::LatentRank
+        ? tp_copy_lora_input(ctx, x) : x;
     // Ax = A @ x^T  → [N, rank, seq]
-    auto Ax = at::bmm(A_c, x.transpose(-2, -1));
+    auto Ax = at::bmm(A_c, lora_input.transpose(-2, -1));
     // delta = B @ Ax → [N, out, seq] → transpose → [N, seq, out]
     auto delta = at::bmm(B_c, Ax).transpose(-2, -1);
-    return tp_allreduce_lora_delta(ctx, delta * s_c);
+    auto scaled = delta * s_c;
+    return layout == LoraTpLayout::LatentRank
+        ? tp_allreduce_lora_delta(ctx, scaled) : scaled;
 }
 
 static const LoraBatchEntry* lora_batch_entry(
@@ -2846,6 +3038,8 @@ at::Tensor compute_attn_only(
     }
 
     // Legacy path: weight-level LoRA
+    TORCH_CHECK(!ctx->base_tp_attention || cfg.layer_type != 0,
+        "base full-attention TP requires the activation-level LoRA path");
     int64_t lora_count = lora_pair_count(cfg);
     int64_t la_offset = ctx->lora_layer_offset[layer_idx];
     bool has_lora = (la_offset + lora_count) <= (int64_t)ctx->lora_a.size();
@@ -3099,24 +3293,35 @@ static at::Tensor full_attention_batched(
 ) {
     // Compute Q/K/V with base weight, then add LoRA delta if present
     int64_t batch = hidden.size(0), seq = hidden.size(1);
+    auto projection_input = tp_copy_base_attention_input(ctx, hidden);
+    if (ctx->base_tp_attention) {
+        TORCH_CHECK(num_heads % ctx->tp_world_size == 0 &&
+                num_kv_heads % ctx->tp_world_size == 0,
+            "full-attention heads must be divisible by TP_SIZE");
+        num_heads /= ctx->tp_world_size;
+        num_kv_heads /= ctx->tp_world_size;
+    }
     int64_t qkv_dim = num_heads * head_dim;
 
-    auto q = at::matmul(hidden, q_proj.t());
-    auto k = at::matmul(hidden, k_proj.t());
-    auto v = at::matmul(hidden, v_proj.t());
+    auto q = at::matmul(projection_input, q_proj.t());
+    auto k = at::matmul(projection_input, k_proj.t());
+    auto v = at::matmul(projection_input, v_proj.t());
 
     // Apply activation-level LoRA: q += B@(A@hidden) * scaling
     auto it_q = ctx->lora_batch_cache.find(lora_cache_key(layer_idx, 0));
     if (it_q != ctx->lora_batch_cache.end()) {
-        q = q + lora_activation_delta(ctx, hidden, it_q->second.a_stack, it_q->second.b_stack, it_q->second.scaling);
+        q = q + lora_activation_delta(ctx, projection_input, it_q->second.a_stack,
+            it_q->second.b_stack, it_q->second.scaling, it_q->second.layout);
     }
     auto it_k = ctx->lora_batch_cache.find(lora_cache_key(layer_idx, 1));
     if (it_k != ctx->lora_batch_cache.end()) {
-        k = k + lora_activation_delta(ctx, hidden, it_k->second.a_stack, it_k->second.b_stack, it_k->second.scaling);
+        k = k + lora_activation_delta(ctx, projection_input, it_k->second.a_stack,
+            it_k->second.b_stack, it_k->second.scaling, it_k->second.layout);
     }
     auto it_v = ctx->lora_batch_cache.find(lora_cache_key(layer_idx, 2));
     if (it_v != ctx->lora_batch_cache.end()) {
-        v = v + lora_activation_delta(ctx, hidden, it_v->second.a_stack, it_v->second.b_stack, it_v->second.scaling);
+        v = v + lora_activation_delta(ctx, projection_input, it_v->second.a_stack,
+            it_v->second.b_stack, it_v->second.scaling, it_v->second.layout);
     }
 
     // Reshape Q: [batch, seq, num_heads, head_dim*2] → split into q and gate
@@ -3186,9 +3391,10 @@ static at::Tensor full_attention_batched(
     auto it_o = ctx->lora_batch_cache.find(lora_cache_key(layer_idx, 3));
     if (it_o != ctx->lora_batch_cache.end()) {
         result = result + lora_activation_delta(ctx, attn_flat,
-            it_o->second.a_stack, it_o->second.b_stack, it_o->second.scaling);
+            it_o->second.a_stack, it_o->second.b_stack, it_o->second.scaling,
+            it_o->second.layout);
     }
-    return result;
+    return tp_allreduce_base_attention(ctx, result);
 }
 
 static at::Tensor linear_attention_batched(
@@ -3212,7 +3418,8 @@ static at::Tensor linear_attention_batched(
     auto qkv = at::matmul(hidden, in_proj_qkv.t());
     auto it_qkv = ctx->lora_batch_cache.find(lora_cache_key(layer_idx, 0));
     if (it_qkv != ctx->lora_batch_cache.end()) {
-        qkv = qkv + lora_activation_delta(ctx, hidden, it_qkv->second.a_stack, it_qkv->second.b_stack, it_qkv->second.scaling);
+        qkv = qkv + lora_activation_delta(ctx, hidden, it_qkv->second.a_stack,
+            it_qkv->second.b_stack, it_qkv->second.scaling, it_qkv->second.layout);
     }
 
     // DIAG: dump after QKV projection
@@ -3284,18 +3491,21 @@ static at::Tensor linear_attention_batched(
     auto b = at::matmul(hidden, in_proj_b.t());
     auto it_a = ctx->lora_batch_cache.find(lora_cache_key(layer_idx, 2));
     if (it_a != ctx->lora_batch_cache.end()) {
-        a = a + lora_activation_delta(ctx, hidden, it_a->second.a_stack, it_a->second.b_stack, it_a->second.scaling);
+        a = a + lora_activation_delta(ctx, hidden, it_a->second.a_stack,
+            it_a->second.b_stack, it_a->second.scaling, it_a->second.layout);
     }
     auto it_b = ctx->lora_batch_cache.find(lora_cache_key(layer_idx, 3));
     if (it_b != ctx->lora_batch_cache.end()) {
-        b = b + lora_activation_delta(ctx, hidden, it_b->second.a_stack, it_b->second.b_stack, it_b->second.scaling);
+        b = b + lora_activation_delta(ctx, hidden, it_b->second.a_stack,
+            it_b->second.b_stack, it_b->second.scaling, it_b->second.layout);
     }
 
     // Z projection + LoRA delta
     auto z = at::matmul(hidden, in_proj_z.t());
     auto it_z = ctx->lora_batch_cache.find(lora_cache_key(layer_idx, 1));
     if (it_z != ctx->lora_batch_cache.end()) {
-        z = z + lora_activation_delta(ctx, hidden, it_z->second.a_stack, it_z->second.b_stack, it_z->second.scaling);
+        z = z + lora_activation_delta(ctx, hidden, it_z->second.a_stack,
+            it_z->second.b_stack, it_z->second.scaling, it_z->second.layout);
     }
     z = z.reshape({batch, seq, num_v_heads, head_v_dim});
 
@@ -3407,7 +3617,8 @@ static at::Tensor linear_attention_batched(
     // out_proj LoRA delta: result += B@(A@gated) * scaling
     auto it_op = ctx->lora_batch_cache.find(lora_cache_key(layer_idx, 4));
     if (it_op != ctx->lora_batch_cache.end()) {
-        result = result + lora_activation_delta(ctx, gated, it_op->second.a_stack, it_op->second.b_stack, it_op->second.scaling);
+        result = result + lora_activation_delta(ctx, gated, it_op->second.a_stack,
+            it_op->second.b_stack, it_op->second.scaling, it_op->second.layout);
     }
 
     return result;
@@ -4367,14 +4578,16 @@ static at::Tensor mtp_compute_loss(
 extern "C" {
 
 __attribute__((visibility("default"))) int64_t qwen36_kernel_abi_version() {
-    return 13;
+    return 14;
 }
+
+static constexpr int32_t QWEN36_CONTEXT_BASE_TP_ATTENTION = 1 << 0;
 
 // Create training context — called once at startup
 // lora_rank: LoRA rank (from config)
 // target_layers: array of layer indices to apply LoRA (nullptr = all layers)
 // num_target_layers: length of target_layers array
-__attribute__((visibility("default"))) void* qwen36_create_training_context(
+static void* qwen36_create_training_context_impl(
     void** weight_ptrs, int64_t num_weight_ptrs,
     void* embed_ptr, void* final_norm_ptr, void* lm_head_ptr,
     void* layer_configs_ptr, int64_t num_layers,
@@ -4383,7 +4596,8 @@ __attribute__((visibility("default"))) void* qwen36_create_training_context(
     int64_t vocab_size, double rms_eps,
     int64_t lora_rank,
     const int64_t* target_layers, int64_t num_target_layers,
-    const char* target_modules_str
+    const char* target_modules_str,
+    int32_t context_flags
 ) {
     try {
         auto* ctx = new TrainingContext();
@@ -4393,6 +4607,8 @@ __attribute__((visibility("default"))) void* qwen36_create_training_context(
         ctx->vocab_size = vocab_size; ctx->rms_eps = rms_eps;
         ctx->step_count = 0; ctx->lora_scaling = lora_scaling;
         ctx->num_layers = num_layers;
+        ctx->base_tp_attention =
+            (context_flags & QWEN36_CONTEXT_BASE_TP_ATTENTION) != 0;
         ctx->has_mtp = false;
         ctx->use_checkpoint = false; ctx->group_size = 4;
         const char* tp_size_env = getenv("TP_SIZE");
@@ -4447,6 +4663,52 @@ __attribute__((visibility("default"))) void* qwen36_create_training_context(
         auto* lcfgs = reinterpret_cast<LayerConfig*>(layer_configs_ptr);
         for (int64_t i = 0; i < num_layers; i++) {
             ctx->layer_configs.push_back(lcfgs[i]);
+        }
+
+        if (ctx->base_tp_attention) {
+            TORCH_CHECK(ctx->tp_world_size > 1,
+                "base full-attention TP requires TP_SIZE>1");
+            int64_t weight_offset = 0;
+            for (int64_t layer = 0; layer < num_layers; ++layer) {
+                const auto& cfg = ctx->layer_configs[layer];
+                if (cfg.layer_type == 0) {
+                    TORCH_CHECK(cfg.num_heads > 0 && cfg.num_kv_heads > 0 &&
+                            cfg.head_dim > 0,
+                        "invalid full-attention head configuration at layer ", layer);
+                    TORCH_CHECK(cfg.num_heads % cfg.num_kv_heads == 0 &&
+                            cfg.num_heads % ctx->tp_world_size == 0 &&
+                            cfg.num_kv_heads % ctx->tp_world_size == 0,
+                        "full-attention heads must preserve GQA groups and be divisible by TP_SIZE at layer ",
+                        layer);
+                    const int64_t rotary_dim = static_cast<int64_t>(
+                        cfg.head_dim * cfg.partial_rotary_factor);
+                    TORCH_CHECK(rotary_dim >= 0 && rotary_dim <= cfg.head_dim &&
+                            rotary_dim % 2 == 0,
+                        "full-attention rotary dimension must be even and within head_dim at layer ",
+                        layer, ": rotary_dim=", rotary_dim,
+                        " head_dim=", cfg.head_dim);
+                    auto* q = ctx->weight_ptrs[weight_offset + 2];
+                    auto* k = ctx->weight_ptrs[weight_offset + 4];
+                    auto* v = ctx->weight_ptrs[weight_offset + 6];
+                    auto* o = ctx->weight_ptrs[weight_offset + 7];
+                    TORCH_CHECK(q && k && v && o && q->dim() == 2 &&
+                            k->dim() == 2 && v->dim() == 2 && o->dim() == 2,
+                        "base full-attention TP requires matrix Q/K/V/O weights at layer ",
+                        layer);
+                    const int64_t local_heads = cfg.num_heads / ctx->tp_world_size;
+                    const int64_t local_kv_heads = cfg.num_kv_heads / ctx->tp_world_size;
+                    TORCH_CHECK(q->size(0) == local_heads * cfg.head_dim * 2 &&
+                            k->size(0) == local_kv_heads * cfg.head_dim &&
+                            v->size(0) == local_kv_heads * cfg.head_dim &&
+                            o->size(1) == local_heads * cfg.head_dim &&
+                            q->size(1) == k->size(1) && q->size(1) == v->size(1) &&
+                            q->size(1) == o->size(0),
+                        "base full-attention TP received inconsistent local weight shapes at layer ",
+                        layer, ": q=", q->sizes(), " k=", k->sizes(),
+                        " v=", v->sizes(), " o=", o->sizes());
+                }
+                weight_offset += weight_count_for_layer(cfg);
+            }
         }
 
         // Build target layer set
@@ -4539,8 +4801,17 @@ __attribute__((visibility("default"))) void* qwen36_create_training_context(
                     b = at::zeros({experts, out_f, local_lora_rank}, opts);
                 } else {
                     int64_t out_f = base->size(0), in_f = base->size(1);
-                    a = initialize_lora_a(ctx, opts, 0, lora_rank, in_f);
-                    b = at::zeros({out_f, local_lora_rank}, opts);
+                    const auto layout = lora_tp_layout(ctx, i, k);
+                    if (layout == LoraTpLayout::ColumnParallel) {
+                        a = at::randn({lora_rank, in_f}, opts) * 0.01;
+                        b = at::zeros({out_f, lora_rank}, opts);
+                    } else if (layout == LoraTpLayout::RowParallel) {
+                        a = at::randn({lora_rank, in_f}, opts) * 0.01;
+                        b = at::zeros({out_f, lora_rank}, opts);
+                    } else {
+                        a = initialize_lora_a(ctx, opts, 0, lora_rank, in_f);
+                        b = at::zeros({out_f, local_lora_rank}, opts);
+                    }
                 }
                 a.set_requires_grad(active);
                 b.set_requires_grad(active);
@@ -4575,6 +4846,42 @@ __attribute__((visibility("default"))) void* qwen36_create_training_context(
         fprintf(stderr, "[q36] create FAILED: %s\n", e.what());
         return nullptr;
     }
+}
+
+__attribute__((visibility("default"))) void* qwen36_create_training_context(
+    void** weight_ptrs, int64_t num_weight_ptrs,
+    void* embed_ptr, void* final_norm_ptr, void* lm_head_ptr,
+    void* layer_configs_ptr, int64_t num_layers,
+    int32_t compute_type,
+    double lora_scaling, double lr, double beta1, double beta2, double eps,
+    int64_t vocab_size, double rms_eps,
+    int64_t lora_rank,
+    const int64_t* target_layers, int64_t num_target_layers,
+    const char* target_modules_str
+) {
+    return qwen36_create_training_context_impl(
+        weight_ptrs, num_weight_ptrs, embed_ptr, final_norm_ptr, lm_head_ptr,
+        layer_configs_ptr, num_layers, compute_type, lora_scaling, lr, beta1,
+        beta2, eps, vocab_size, rms_eps, lora_rank, target_layers,
+        num_target_layers, target_modules_str, 0);
+}
+
+__attribute__((visibility("default"))) void* qwen36_create_training_context_ex(
+    void** weight_ptrs, int64_t num_weight_ptrs,
+    void* embed_ptr, void* final_norm_ptr, void* lm_head_ptr,
+    void* layer_configs_ptr, int64_t num_layers,
+    int32_t compute_type,
+    double lora_scaling, double lr, double beta1, double beta2, double eps,
+    int64_t vocab_size, double rms_eps,
+    int64_t lora_rank,
+    const int64_t* target_layers, int64_t num_target_layers,
+    const char* target_modules_str, int32_t context_flags
+) {
+    return qwen36_create_training_context_impl(
+        weight_ptrs, num_weight_ptrs, embed_ptr, final_norm_ptr, lm_head_ptr,
+        layer_configs_ptr, num_layers, compute_type, lora_scaling, lr, beta1,
+        beta2, eps, vocab_size, rms_eps, lora_rank, target_layers,
+        num_target_layers, target_modules_str, context_flags);
 }
 
 __attribute__((visibility("default"))) int32_t qwen36_set_base_tp_mlp(
@@ -4665,8 +4972,8 @@ __attribute__((visibility("default"))) int32_t qwen36_set_mtp_weights(
     try {
         auto* ctx = reinterpret_cast<TrainingContext*>(ctx_ptr);
         TORCH_CHECK(ctx, "null training context");
-        TORCH_CHECK(!ctx->base_tp_mlp,
-            "MTP cannot be enabled after base dense MLP TP because MTP weights are not sharded");
+        TORCH_CHECK(!ctx->base_tp_mlp && !ctx->base_tp_attention,
+            "MTP cannot be enabled after frozen base TP because MTP weights are not sharded");
         TORCH_CHECK(!ctx->has_mtp, "MTP weights are already configured");
         ctx->has_mtp = true;
         ctx->mtp_fc = reinterpret_cast<at::Tensor*>(mtp_fc_ptr);
@@ -5634,6 +5941,7 @@ __attribute__((visibility("default"))) int32_t qwen36_init_nccl(
                 lc.nccl_stream = layer_stream;
             }
         }
+        synchronize_fixed_replicated_lora_parameters(ctx);
         return 0;
     }
 
@@ -5799,6 +6107,7 @@ __attribute__((visibility("default"))) int32_t qwen36_init_nccl(
         }
     }
 
+    synchronize_fixed_replicated_lora_parameters(ctx);
     return 0;
 }
 
@@ -5992,8 +6301,15 @@ int64_t qwen36_add_lora(
                         TORCH_CHECK(base->dim() == 2,
                             "dynamic LoRA projection must be a matrix: ", projection.name);
                         int64_t out_f = base->size(0), in_f = base->size(1);
-                        a = initialize_lora_a(ctx, opts, 0, rank, in_f);
-                        b = at::zeros({out_f, local_rank}, opts);
+                        const auto layout = lora_tp_layout(ctx, i, k);
+                        if (layout == LoraTpLayout::ColumnParallel ||
+                            layout == LoraTpLayout::RowParallel) {
+                            a = at::randn({rank, in_f}, opts) * 0.01;
+                            b = at::zeros({out_f, rank}, opts);
+                        } else {
+                            a = initialize_lora_a(ctx, opts, 0, rank, in_f);
+                            b = at::zeros({out_f, local_rank}, opts);
+                        }
                     }
                 } else {
                     a = at::zeros({}, opts);
@@ -6018,6 +6334,7 @@ int64_t qwen36_add_lora(
             adapter.adam_state[i] = std::move(adam_states);
             adapter.grad_accum[i] = std::move(grad_accumulators);
         }
+        synchronize_adapter_replicated_lora_parameters(ctx, adapter);
         int64_t id = adapter.id;
         ctx->adapters.push_back(std::move(adapter));
         ctx->lora_cache_valid = false;

@@ -3,15 +3,15 @@
 use std::collections::{BTreeMap, HashSet};
 use std::env;
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{anyhow, bail, Context, Result};
 use tch::{Kind, Tensor};
 use tracing::info;
 
 use crate::config::{
-    LayerType, Qwen36RuntimeConfig, read_qwen36_runtime_config, resolve_qwen36_model_path,
+    read_qwen36_runtime_config, resolve_qwen36_model_path, LayerType, Qwen36RuntimeConfig,
 };
 use crate::lora::{
-    Qwen36AdapterArtifact, Qwen36LoraConfig, Qwen36LoraTargetModule, validate_lora_targets,
+    validate_lora_targets, Qwen36AdapterArtifact, Qwen36LoraConfig, Qwen36LoraTargetModule,
 };
 use crate::sft::SftDataset;
 use rustrain_checkpoint::safetensors::read_safetensors_dir_filtered;
@@ -328,16 +328,42 @@ fn train_impl(
         );
     }
 
-    // Dense base-weight TP follows Megatron's ColumnParallel/RowParallel MLP:
-    // gate/up rows are owned by one TP rank and down columns are owned by the
-    // same rank.  Attention and embeddings remain replicated in this first
-    // unit.  MoE, MTP, and mixed TP/DP/EP are rejected rather than silently
-    // running with an unsharded path.
+    // Full attention follows Megatron's Q/K/V ColumnParallel and O
+    // RowParallel layout. Dense MLP additionally shards gate/up rows and down
+    // columns. GDN, MoE experts, embeddings, and the LM head remain replicated.
+    let base_tp_attention = tp_size > 1;
     let base_tp_mlp = tp_size > 1 && !runtime_config.is_moe;
-    if base_tp_mlp {
+    if base_tp_attention {
         if runtime_config.mtp_num_hidden_layers > 0 {
-            bail!("base dense TP MLP currently requires MTP to be disabled");
+            bail!("frozen base TP currently requires MTP to be disabled");
         }
+        if runtime_config.num_attention_heads <= 0
+            || runtime_config.num_attention_heads % tp_size as i64 != 0
+            || runtime_config.num_key_value_heads <= 0
+            || runtime_config.num_key_value_heads % tp_size as i64 != 0
+            || runtime_config.num_attention_heads % runtime_config.num_key_value_heads != 0
+        {
+            bail!(
+                "full-attention heads (q={}, kv={}) must preserve GQA groups and be divisible by TP_SIZE={tp_size}",
+                runtime_config.num_attention_heads,
+                runtime_config.num_key_value_heads
+            );
+        }
+        let rotary_dim =
+            (runtime_config.head_dim as f64 * runtime_config.partial_rotary_factor) as i64;
+        if runtime_config.head_dim <= 0
+            || rotary_dim < 0
+            || rotary_dim > runtime_config.head_dim
+            || rotary_dim % 2 != 0
+        {
+            bail!(
+                "full-attention head_dim={} and partial_rotary_factor={} produce invalid rotary_dim={rotary_dim}",
+                runtime_config.head_dim,
+                runtime_config.partial_rotary_factor
+            );
+        }
+    }
+    if base_tp_mlp {
         if runtime_config.intermediate_size <= 0
             || runtime_config.intermediate_size % tp_size as i64 != 0
         {
@@ -413,8 +439,23 @@ fn train_impl(
         );
     } else {
         for (name, tensor) in &weights {
-            let local_shard = if base_tp_mlp {
-                crate::kernel::shard_dense_mlp_weight_for_tp(name, tensor, tp_size, rank % tp_size)?
+            let local_shard = if base_tp_attention {
+                let attention_shard = crate::kernel::shard_full_attention_weight_for_tp(
+                    name,
+                    tensor,
+                    tp_size,
+                    rank % tp_size,
+                )?;
+                if attention_shard.is_some() || !base_tp_mlp {
+                    attention_shard
+                } else {
+                    crate::kernel::shard_dense_mlp_weight_for_tp(
+                        name,
+                        tensor,
+                        tp_size,
+                        rank % tp_size,
+                    )?
+                }
             } else {
                 None
             };
@@ -425,11 +466,12 @@ fn train_impl(
                 .to_kind(compute_kind);
             weights_gpu.insert(name.clone(), gpu_tensor);
         }
-        if base_tp_mlp {
+        if base_tp_attention {
             info!(
                 tp_size,
                 tp_rank = rank % tp_size,
-                "base dense MLP TP enabled: gate/up row shards and down column shards"
+                base_tp_mlp,
+                "frozen base TP enabled: full-attention head shards and optional dense MLP shards"
             );
         }
     }
@@ -488,6 +530,7 @@ fn train_impl(
         config.train.adam_eps as f64,
         lora_config.alpha as f64 / lora_config.rank as f64, // lora scaling = alpha / rank
         lora_config.rank as i64,
+        base_tp_attention,
         base_tp_mlp,
         &lora_config.target_layers,
         &lora_config.target_modules,
