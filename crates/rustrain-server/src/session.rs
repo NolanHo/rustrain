@@ -88,6 +88,16 @@ pub trait TrainingSession: Send {
     ) -> Result<TrainOutput>;
     fn eval_step(&self, input: TrainInput) -> Result<EvalOutput>;
     fn save_checkpoint(&self, path: &str) -> Result<(u64, f64)>;
+    fn save_checkpoint_with_generation(
+        &self,
+        path: &str,
+        checkpoint_generation: Option<&str>,
+    ) -> Result<(u64, f64)> {
+        if checkpoint_generation.is_some() {
+            bail!("this training session does not support coordinated checkpoint generations");
+        }
+        self.save_checkpoint(path)
+    }
     fn load_checkpoint(&mut self, path: &str) -> Result<(u64, f64)>;
     fn export_adapter(&self, path: &str, adapter_id: Option<i64>) -> Result<usize>;
     /// Import one PEFT-style adapter as a new dynamic adapter. The fixed
@@ -190,11 +200,12 @@ impl Qwen36Session {
             &parallel,
             adapter_id,
             |staging| {
-                <Self as TrainingSession>::save_checkpoint(
+                <Self as TrainingSession>::save_checkpoint_with_generation(
                     self,
                     staging
                         .to_str()
                         .context("distributed export staging path is not UTF-8")?,
+                    Some(generation),
                 )
                 .map(|_| ())
             },
@@ -814,6 +825,14 @@ impl TrainingSession for Qwen36Session {
     }
 
     fn save_checkpoint(&self, path: &str) -> Result<(u64, f64)> {
+        self.save_checkpoint_with_generation(path, None)
+    }
+
+    fn save_checkpoint_with_generation(
+        &self,
+        path: &str,
+        checkpoint_generation: Option<&str>,
+    ) -> Result<(u64, f64)> {
         let ctx = self
             .ctx
             .as_ref()
@@ -1029,22 +1048,47 @@ impl TrainingSession for Qwen36Session {
             }
         }
 
-        checkpoint::save_checkpoint_with_dynamic_for_topology(
-            std::path::Path::new(path),
-            self.step,
-            self.last_loss,
-            model_path,
-            self.lora_rank,
-            self.lora_alpha,
-            &lora_a,
-            &lora_b,
-            &adam_m,
-            &adam_v,
-            &dynamic_adapters,
-            &fixed_shard_layouts,
-            &fixed_slot_identities,
-            &parallel,
-        )?;
+        let fixed_optimizer_step = u64::try_from(ctx.get_step_count())
+            .context("native fixed adapter optimizer step is negative")?;
+        match checkpoint_generation {
+            Some(generation) => {
+                checkpoint::save_checkpoint_with_dynamic_and_fixed_step_for_topology_generation(
+                    std::path::Path::new(path),
+                    self.step,
+                    fixed_optimizer_step,
+                    self.last_loss,
+                    model_path,
+                    self.lora_rank,
+                    self.lora_alpha,
+                    &lora_a,
+                    &lora_b,
+                    &adam_m,
+                    &adam_v,
+                    &dynamic_adapters,
+                    &fixed_shard_layouts,
+                    &fixed_slot_identities,
+                    &parallel,
+                    Some(generation),
+                )?;
+            }
+            None => checkpoint::save_checkpoint_with_dynamic_and_fixed_step_for_topology(
+                std::path::Path::new(path),
+                self.step,
+                fixed_optimizer_step,
+                self.last_loss,
+                model_path,
+                self.lora_rank,
+                self.lora_alpha,
+                &lora_a,
+                &lora_b,
+                &adam_m,
+                &adam_v,
+                &dynamic_adapters,
+                &fixed_shard_layouts,
+                &fixed_slot_identities,
+                &parallel,
+            )?,
+        }
 
         Ok((self.step, self.last_loss))
     }
@@ -1289,6 +1333,14 @@ impl TrainingSession for Qwen36Session {
                     data.adam_v.len()
                 );
             }
+            if data.adam_m.is_empty()
+                && data.manifest.effective_fixed_optimizer_step() > 0
+            {
+                bail!(
+                    "checkpoint fixed optimizer step {} has no Adam state",
+                    data.manifest.effective_fixed_optimizer_step()
+                );
+            }
             if !data.adam_m.is_empty() {
                 let expected_saved_optimizer_count = restore_slot_indices.len().saturating_mul(2);
                 if data.adam_m.len() != expected_saved_optimizer_count
@@ -1327,7 +1379,7 @@ impl TrainingSession for Qwen36Session {
                 }
                 tracing::info!(imported, "optimizer state imported");
             }
-            let native_step = i64::try_from(data.manifest.step)
+            let native_step = i64::try_from(data.manifest.effective_fixed_optimizer_step())
                 .context("checkpoint step exceeds the native optimizer range")?;
             ctx.set_step_count(native_step)?;
         }

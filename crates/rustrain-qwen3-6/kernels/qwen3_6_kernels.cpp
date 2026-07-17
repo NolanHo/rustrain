@@ -2155,8 +2155,7 @@ struct TrainingContext {
     struct LoRAAdapter {
         int64_t id;
         int64_t rank;
-        // Each tenant owns an independent Adam bias-correction clock. The
-        // session-wide step_count remains a transport/metric clock only.
+        // Each tenant owns an independent Adam bias-correction clock.
         int64_t optimizer_step = 0;
         double alpha;
         std::set<int64_t> target_layers;
@@ -2200,7 +2199,9 @@ struct TrainingContext {
     std::vector<at::Tensor> adam_m;
     std::vector<at::Tensor> adam_v;
     double lr, beta1, beta2, eps;
-    int64_t step_count;
+    // The fixed adapter's Adam bias-correction clock. Dynamic tenant updates
+    // must not advance it because every tenant has its own optimizer_step.
+    int64_t fixed_optimizer_step;
     // A failed native call aborts the in-flight gradient window. This flag is
     // consumed by the scoped accumulation guard on stack unwinding.
     bool accumulation_active = false;
@@ -2677,6 +2678,48 @@ static LoraTpLayout lora_tp_layout(
          name == "experts_down_proj"))
         return LoraTpLayout::RowParallel;
     return LoraTpLayout::LatentRank;
+}
+
+static bool active_lora_targets_use_latent_rank_layout(
+    const TrainingContext* ctx,
+    const std::set<int64_t>& target_layers,
+    const std::set<std::string>& target_modules,
+    bool empty_modules_mean_attention_only
+) {
+    for (int64_t layer = 0; layer < ctx->num_layers; ++layer) {
+        if (!target_layers.empty() && target_layers.count(layer) == 0) continue;
+        const auto table = lora_projection_table(ctx->layer_configs[layer]);
+        for (int64_t pair = 0; pair < table.count; ++pair) {
+            const auto& projection = table.entries[pair];
+            const bool active = target_modules.empty()
+                ? !empty_modules_mean_attention_only ||
+                    (!projection.grouped_expert &&
+                     projection.segment == LoraSegment::Attention)
+                : target_modules.count(projection.name) > 0;
+            if (active &&
+                lora_tp_layout(ctx, layer, pair) == LoraTpLayout::LatentRank)
+                return true;
+        }
+    }
+    return false;
+}
+
+static int64_t local_lora_rank_for_active_targets(
+    const TrainingContext* ctx,
+    int64_t global_rank,
+    const std::set<int64_t>& target_layers,
+    const std::set<std::string>& target_modules,
+    bool empty_modules_mean_attention_only,
+    const char* adapter_kind
+) {
+    TORCH_CHECK(global_rank > 0, adapter_kind, " LoRA rank must be positive");
+    const bool uses_latent_rank = active_lora_targets_use_latent_rank_layout(
+        ctx, target_layers, target_modules, empty_modules_mean_attention_only);
+    TORCH_CHECK(!uses_latent_rank || global_rank % ctx->tp_world_size == 0,
+        adapter_kind, " LoRA rank ", global_rank,
+        " must be divisible by TP_SIZE=", ctx->tp_world_size,
+        " because at least one active projection uses latent-rank sharding");
+    return uses_latent_rank ? global_rank / ctx->tp_world_size : global_rank;
 }
 
 static at::Tensor initialize_lora_a(
@@ -5313,7 +5356,7 @@ static void* qwen36_create_training_context_impl(
         ctx->compute_type = static_cast<at::ScalarType>(compute_type);
         ctx->lr = lr; ctx->beta1 = beta1; ctx->beta2 = beta2; ctx->eps = eps;
         ctx->vocab_size = vocab_size; ctx->rms_eps = rms_eps;
-        ctx->step_count = 0; ctx->lora_scaling = lora_scaling;
+        ctx->fixed_optimizer_step = 0; ctx->lora_scaling = lora_scaling;
         ctx->num_layers = num_layers;
         ctx->base_tp_attention =
             (context_flags & QWEN36_CONTEXT_BASE_TP_ATTENTION) != 0;
@@ -5389,10 +5432,7 @@ static void* qwen36_create_training_context_impl(
                     ctx->ep_rank >= 0 && ctx->ep_rank < ctx->ep_world_size &&
                     ctx->dp_rank >= 0 && ctx->dp_rank < ctx->dp_world_size,
             "parallel rank coordinates are outside their configured axes");
-        TORCH_CHECK(lora_rank > 0 && lora_rank % ctx->tp_world_size == 0,
-            "LoRA rank ", lora_rank, " must be divisible by TP_SIZE=",
-            ctx->tp_world_size);
-        const int64_t local_lora_rank = lora_rank / ctx->tp_world_size;
+        TORCH_CHECK(lora_rank > 0, "LoRA rank must be positive");
         if (const char* mtp_scale = getenv("QWEN36_MTP_LOSS_SCALE")) {
             ctx->mtp_loss_scale = std::strtod(mtp_scale, nullptr);
         }
@@ -5588,6 +5628,9 @@ static void* qwen36_create_training_context_impl(
             TORCH_CHECK(resolved,
                 "LoRA target module does not exist in this model: ", name);
         }
+        const int64_t local_lora_rank = local_lora_rank_for_active_targets(
+            ctx, lora_rank, target_set, target_modules,
+            /*empty_modules_mean_attention_only=*/false, "fixed");
 
         // Create fixed positional slots for every layer so layer offsets stay
         // stable. Inactive slots are zero tensors without grad and are skipped
@@ -5989,7 +6032,7 @@ __attribute__((visibility("default"))) double qwen36_train_micro_step(
         at::AutoGradMode guard(false);
         ctx->lora_cache_valid = false;
         ctx->lora_batch_valid = false;
-        const int64_t next_step = ctx->step_count + 1;
+        const int64_t next_step = ctx->fixed_optimizer_step + 1;
         double step_f = (double)next_step;
         double bias_correction1 = 1.0 - std::pow(ctx->beta1, step_f);
         double bias_correction2 = 1.0 - std::pow(ctx->beta2, step_f);
@@ -6000,40 +6043,13 @@ __attribute__((visibility("default"))) double qwen36_train_micro_step(
         float one_minus_b1 = (float)(1.0 - ctx->beta1);
         float one_minus_b2 = (float)(1.0 - ctx->beta2);
 
-        // Collect all (param, grad, m, v, size) tuples from multi-LoRA + legacy
+        // Collect all fixed-adapter (param, grad, m, v, size) tuples. Dynamic
+        // registries are rejected at function entry and have a separate Adam
+        // boundary in qwen36_train_multi_lora.
         std::vector<void*> h_params, h_grads;
         std::vector<float*> h_m, h_v;
         std::vector<int> h_sizes;
 
-        // Multi-LoRA adapters
-        for (auto& adapter : ctx->adapters) {
-            for (auto& [layer_idx, pairs] : adapter.params) {
-                auto& adam_states = adapter.adam_state[layer_idx];
-                auto& accumulators = adapter.grad_accum[layer_idx];
-                for (size_t i = 0; i < pairs.size(); i++) {
-                    auto& [a, b] = pairs[i];
-                    auto& [m_a, v_a, m_b, v_b] = adam_states[i];
-                    auto& [accum_a, accum_b] = accumulators[i];
-                    if (a.requires_grad() && accum_a.defined() &&
-                        a.scalar_type() == at::kBFloat16) {
-                        h_params.push_back(a.data_ptr());
-                        h_grads.push_back(accum_a.data_ptr());
-                        h_m.push_back((float*)m_a.data_ptr());
-                        h_v.push_back((float*)v_a.data_ptr());
-                        h_sizes.push_back((int)a.numel());
-                    }
-                    if (b.requires_grad() && accum_b.defined() &&
-                        b.scalar_type() == at::kBFloat16) {
-                        h_params.push_back(b.data_ptr());
-                        h_grads.push_back(accum_b.data_ptr());
-                        h_m.push_back((float*)m_b.data_ptr());
-                        h_v.push_back((float*)v_b.data_ptr());
-                        h_sizes.push_back((int)b.numel());
-                    }
-                }
-            }
-        }
-        // Legacy single-LoRA
         size_t adam_idx = 0;
         for (size_t i = 0; i < ctx->lora_a.size(); i++) {
             {
@@ -6104,7 +6120,7 @@ __attribute__((visibility("default"))) double qwen36_train_micro_step(
             TORCH_CHECK(launch_error == cudaSuccess,
                 "fused FP32-gradient Adam launch failed: ",
                 cudaGetErrorString(launch_error));
-            ctx->step_count = next_step;
+            ctx->fixed_optimizer_step = next_step;
         }
 
         clear_gradient_accumulators(ctx);
@@ -6429,10 +6445,8 @@ __attribute__((visibility("default"))) double qwen36_train_multi_lora(
 
         double total_loss = 0.0;
         int64_t num_chunks = (total_adapters + n_max - 1) / n_max;
-        // Chunking is a memory scheduling detail, not an optimizer step. Both
-        // the session clock and tenant clocks commit only after Adam launches.
-        const int64_t next_session_step = ctx->step_count + 1;
-        bool any_update = false;
+        // Chunking is a memory scheduling detail, not an optimizer step. Each
+        // tenant clock commits only after its Adam launch succeeds.
 
         for (int64_t chunk = 0; chunk < num_chunks; chunk++) {
             int64_t start = chunk * n_max;
@@ -6650,7 +6664,6 @@ __attribute__((visibility("default"))) double qwen36_train_multi_lora(
                     for (auto* adapter : adapters) {
                         adapter->optimizer_step = logical_step;
                     }
-                    any_update = true;
                 }
             }
 
@@ -6660,7 +6673,6 @@ __attribute__((visibility("default"))) double qwen36_train_multi_lora(
                     (long)(chunk + 1), (long)num_chunks, (long)n, loss_val);
         }
 
-        if (any_update) ctx->step_count = next_session_step;
         clear_gradient_accumulators(ctx);
         accumulation_guard.disarmed = true;
         return total_loss / total_adapters;
@@ -7253,10 +7265,6 @@ int64_t qwen36_add_lora(
     try {
         auto* ctx = reinterpret_cast<TrainingContext*>(ctx_ptr);
         TORCH_CHECK(rank > 0, "LoRA rank must be positive");
-        TORCH_CHECK(rank % ctx->tp_world_size == 0,
-            "dynamic LoRA rank ", rank, " must be divisible by TP_SIZE=",
-            ctx->tp_world_size);
-        const int64_t local_rank = rank / ctx->tp_world_size;
         TORCH_CHECK(alpha > 0.0, "LoRA alpha must be positive");
         TrainingContext::LoRAAdapter adapter;
         adapter.id = ++ctx->next_adapter_id;
@@ -7315,6 +7323,9 @@ int64_t qwen36_add_lora(
             TORCH_CHECK(resolved,
                 "dynamic LoRA target module does not exist in this model: ", name);
         }
+        const int64_t local_rank = local_lora_rank_for_active_targets(
+            ctx, rank, adapter.target_layers, adapter.target_modules,
+            /*empty_modules_mean_attention_only=*/true, "dynamic");
         for (int64_t i = 0; i < ctx->num_layers; i++) {
             if (!adapter.target_layers.empty() && adapter.target_layers.find(i) == adapter.target_layers.end())
                 continue;
@@ -7629,7 +7640,7 @@ double qwen36_eval_step(void* ctx_ptr, void* input_ids_ptr, void* target_mask_pt
 
 __attribute__((visibility("default")))
 int64_t qwen36_get_step_count(void* ctx_ptr) {
-    return (int64_t)reinterpret_cast<TrainingContext*>(ctx_ptr)->step_count;
+    return (int64_t)reinterpret_cast<TrainingContext*>(ctx_ptr)->fixed_optimizer_step;
 }
 
 // Restore the Adam bias-correction clock independently from tensor state.
@@ -7638,7 +7649,7 @@ int64_t qwen36_get_step_count(void* ctx_ptr) {
 __attribute__((visibility("default")))
 int32_t qwen36_set_step_count(void* ctx_ptr, int64_t step_count) {
     if (!ctx_ptr || step_count < 0) return -1;
-    reinterpret_cast<TrainingContext*>(ctx_ptr)->step_count = step_count;
+    reinterpret_cast<TrainingContext*>(ctx_ptr)->fixed_optimizer_step = step_count;
     return 0;
 }
 

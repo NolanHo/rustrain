@@ -404,6 +404,23 @@ pub fn load_config(path: &Path) -> Result<Config> {
     toml::from_str(&contents).with_context(|| format!("failed to parse config {}", path.display()))
 }
 
+fn qwen_source_parallel_factor(
+    is_qwen_hybrid: bool,
+    is_expert_parallel_architecture: bool,
+    ep_source_sharded: bool,
+    parallel: &ParallelConfig,
+) -> usize {
+    if !is_qwen_hybrid {
+        return 1;
+    }
+    let ep_source_factor = if is_expert_parallel_architecture && ep_source_sharded {
+        parallel.expert_model_parallel_size
+    } else {
+        1
+    };
+    parallel.data_parallel_size * ep_source_factor
+}
+
 pub fn validate_config(config: &Config) -> Result<()> {
     if matches!(config.train.backend, BackendKind::NdArray)
         && !matches!(config.train.device, Device::Cpu)
@@ -494,11 +511,6 @@ pub fn validate_config(config: &Config) -> Result<()> {
             config.model.architecture.as_str(),
             "qwen3_5_lora_sft" | "qwen3_5_lora_sft_ep" | "qwen3_6_lora_sft" | "qwen3_6_lora_sft_ep"
         );
-    let is_qwen3_hybrid_lora_sft_dp = matches!(config.train.backend, BackendKind::Tch)
-        && matches!(
-            config.model.architecture.as_str(),
-            "qwen3_5_lora_sft" | "qwen3_6_lora_sft"
-        );
     let is_tch_moe_ep_session = matches!(config.train.backend, BackendKind::Tch)
         && config.model.architecture == "tch_moe_ep_session";
     let is_v4_tp_rank = matches!(config.train.backend, BackendKind::Tch)
@@ -526,11 +538,10 @@ pub fn validate_config(config: &Config) -> Result<()> {
         && config.model.architecture == "deepseek_ep_rank";
     if is_qwen3_hybrid_lora_sft_ep
         && (parallel.pipeline_model_parallel_size != 1
-            || parallel.data_parallel_size != 1
             || parallel.context_parallel_size != 1)
     {
         return Err(anyhow!(
-            "{} currently supports TPxEP only; pipeline_model_parallel_size, data_parallel_size, and context_parallel_size must be 1",
+            "{} currently supports TPxEPxDP only; pipeline_model_parallel_size and context_parallel_size must be 1",
             config.model.architecture
         ));
     }
@@ -542,21 +553,22 @@ pub fn validate_config(config: &Config) -> Result<()> {
             && !((is_tch_tiny_lm || is_qwen_trainable_session)
                 && name == "data_parallel_size"
                 && value == 2)
-            && !(is_qwen3_hybrid_lora_sft_dp
+            && !(is_qwen3_hybrid_lora_sft
                 && name == "data_parallel_size"
                 && value >= 2
-                && parallel.tensor_model_parallel_size == 1
                 && parallel.pipeline_model_parallel_size == 1
-                && parallel.expert_model_parallel_size == 1
+                && parallel.context_parallel_size == 1)
+            && !(is_qwen3_hybrid_lora_sft
+                && name == "tensor_model_parallel_size"
+                && parallel.pipeline_model_parallel_size == 1
                 && parallel.context_parallel_size == 1)
             && !(is_qwen_trainable_session
                 && name == "tensor_model_parallel_size"
                 && value == 2
                 && parallel.data_parallel_size == 1)
             && !(is_qwen3_hybrid_lora_sft_ep
-                && (name == "tensor_model_parallel_size" || name == "expert_model_parallel_size")
+                && name == "expert_model_parallel_size"
                 && parallel.pipeline_model_parallel_size == 1
-                && parallel.data_parallel_size == 1
                 && parallel.context_parallel_size == 1)
             && !(is_tch_moe_ep_session
                 && name == "expert_model_parallel_size"
@@ -704,19 +716,23 @@ pub fn validate_config(config: &Config) -> Result<()> {
                 config.model.architecture
             ));
         }
-        let data_parallel_factor = if is_qwen3_hybrid_lora_sft_dp {
-            config.parallel.data_parallel_size
-        } else {
-            1
-        };
+        let ep_source_sharded = std::env::var("QWEN36_EP_A2A_SHARDED")
+            .map(|value| !value.is_empty() && value != "0")
+            .unwrap_or(false);
+        let source_parallel_factor = qwen_source_parallel_factor(
+            is_qwen3_hybrid_lora_sft,
+            is_qwen3_hybrid_lora_sft_ep,
+            ep_source_sharded,
+            &config.parallel,
+        );
         let expected_global_batch_size = config.train.micro_batch_size
             * config.train.gradient_accumulation_steps
-            * data_parallel_factor;
+            * source_parallel_factor;
         if config.train.global_batch_size != expected_global_batch_size {
-            if data_parallel_factor > 1 {
+            if source_parallel_factor > 1 {
                 return Err(anyhow!(
-                    "{} requires global_batch_size = micro_batch_size * gradient_accumulation_steps * data_parallel_size",
-                    config.model.architecture
+                    "{} requires global_batch_size = micro_batch_size * gradient_accumulation_steps * effective source-parallel size ({source_parallel_factor}); this includes data_parallel_size and, for sharded EP sources, expert_model_parallel_size",
+                    config.model.architecture,
                 ));
             }
             return Err(anyhow!(
@@ -1486,19 +1502,28 @@ mod tests {
     }
 
     #[test]
-    fn qwen_hybrid_lora_sft_ep_accepts_tensor_expert_parallelism_only() {
+    fn qwen_hybrid_lora_sft_ep_accepts_tensor_expert_data_parallelism() {
         let mut config = qwen_lora_sft_config();
         config.model.architecture = "qwen3_6_lora_sft_ep".to_string();
         config.parallel.tensor_model_parallel_size = 2;
         config.parallel.expert_model_parallel_size = 2;
-        validate_config(&config).expect("Qwen3.6 LoRA TPxEP should validate");
+        config.parallel.data_parallel_size = 2;
+        let ep_source_sharded = std::env::var("QWEN36_EP_A2A_SHARDED")
+            .map(|value| !value.is_empty() && value != "0")
+            .unwrap_or(false);
+        config.train.global_batch_size = config.train.micro_batch_size
+            * config.train.gradient_accumulation_steps
+            * qwen_source_parallel_factor(true, true, ep_source_sharded, &config.parallel);
+        assert_eq!(qwen_source_parallel_factor(true, true, true, &config.parallel), 4);
+        assert_eq!(qwen_source_parallel_factor(true, true, false, &config.parallel), 2);
+        validate_config(&config).expect("Qwen3.6 LoRA TPxEPxDP should validate");
 
         config.model.architecture = "qwen3_5_lora_sft_ep".to_string();
-        validate_config(&config).expect("Qwen3.5 LoRA TPxEP should validate");
+        validate_config(&config).expect("Qwen3.5 LoRA TPxEPxDP should validate");
 
-        config.parallel.data_parallel_size = 2;
-        let error = validate_config(&config).expect_err("Qwen TPxEPxDP should fail early");
-        assert!(error.to_string().contains("data_parallel_size"));
+        config.parallel.context_parallel_size = 2;
+        let error = validate_config(&config).expect_err("Qwen TPxEPxDPxCP should fail early");
+        assert!(error.to_string().contains("context_parallel_size"));
     }
 
     #[test]

@@ -58,7 +58,11 @@ extern "C" int32_t qwen36_set_adapter_lora_tensor(
     void*, int64_t, int64_t, const char*, int32_t, void*);
 extern "C" void* qwen36_get_adapter_optimizer_tensor(
     void*, int64_t, int64_t, const char*, int32_t, int32_t);
+extern "C" int32_t qwen36_set_adapter_optimizer_tensor(
+    void*, int64_t, int64_t, const char*, int32_t, int32_t, void*);
 extern "C" int64_t qwen36_get_adapter_step_count(void*, int64_t);
+extern "C" int32_t qwen36_set_adapter_step_count(
+    void*, int64_t, int64_t);
 extern "C" double qwen36_train_multi_lora_selected(
     void*, void*, void*, void*, const int64_t*, int32_t, int32_t);
 extern "C" void qwen36_free_training_context(void*);
@@ -67,6 +71,7 @@ namespace {
 
 constexpr int64_t kAbiVersion = 20;
 constexpr int32_t kBaseTpAttention = 1 << 0;
+constexpr int32_t kDataParallel = 1 << 1;
 constexpr int32_t kVocabParallel = 1 << 2;
 constexpr int32_t kExpertParallel = 1 << 3;
 constexpr int32_t kBaseTpMlp = 1 << 4;
@@ -141,31 +146,59 @@ struct Batch {
     at::Tensor attention_mask;
 };
 
-Batch source_batch(int ep_rank) {
+Batch source_batch(int source_rank) {
     auto long_opts = at::TensorOptions().device(at::kCUDA).dtype(at::kLong);
     auto float_opts = at::TensorOptions().device(at::kCUDA).dtype(at::kFloat);
     auto bool_opts = at::TensorOptions().device(at::kCUDA).dtype(at::kBool);
-    if (ep_rank == 0) {
+    if (source_rank == 0) {
         return {
             at::tensor({1, 2, 3, 4}, long_opts).reshape({1, 4}),
             at::tensor({0.0, 1.0, 0.0, 0.0}, float_opts).reshape({1, 4}),
             at::ones({1, 4}, bool_opts),
         };
     }
+    if (source_rank == 1) {
+        return {
+            at::tensor({5, 6, 7, 8}, long_opts).reshape({1, 4}),
+            at::tensor({0.0, 1.0, 1.0, 1.0}, float_opts).reshape({1, 4}),
+            at::ones({1, 4}, bool_opts),
+        };
+    }
+    if (source_rank == 2) {
+        return {
+            at::tensor({9, 10, 11, 12}, long_opts).reshape({1, 4}),
+            at::tensor({0.0, 1.0, 0.0, 0.0}, float_opts).reshape({1, 4}),
+            at::ones({1, 4}, bool_opts),
+        };
+    }
+    assert(source_rank == 3);
     return {
-        at::tensor({5, 6, 7, 8}, long_opts).reshape({1, 4}),
-        at::tensor({0.0, 1.0, 1.0, 1.0}, float_opts).reshape({1, 4}),
+        at::tensor({13, 14, 15, 1}, long_opts).reshape({1, 4}),
+        at::tensor({0.0, 1.0, 1.0, 0.0}, float_opts).reshape({1, 4}),
         at::ones({1, 4}, bool_opts),
     };
 }
 
-Batch full_batch() {
+Batch full_batch(int source_count) {
     auto first = source_batch(0);
     auto second = source_batch(1);
+    if (source_count == 2) {
+        return {
+            at::cat({first.input_ids, second.input_ids}, 0),
+            at::cat({first.target_mask, second.target_mask}, 0),
+            at::cat({first.attention_mask, second.attention_mask}, 0),
+        };
+    }
+    assert(source_count == 4);
+    auto third = source_batch(2);
+    auto fourth = source_batch(3);
     return {
-        at::cat({first.input_ids, second.input_ids}, 0),
-        at::cat({first.target_mask, second.target_mask}, 0),
-        at::cat({first.attention_mask, second.attention_mask}, 0),
+        at::cat({first.input_ids, second.input_ids,
+            third.input_ids, fourth.input_ids}, 0),
+        at::cat({first.target_mask, second.target_mask,
+            third.target_mask, fourth.target_mask}, 0),
+        at::cat({first.attention_mask, second.attention_mask,
+            third.attention_mask, fourth.attention_mask}, 0),
     };
 }
 
@@ -198,7 +231,8 @@ std::vector<at::Tensor> make_full_weights() {
 }
 
 std::vector<at::Tensor> make_local_weights(
-    const std::vector<at::Tensor>& full, int tp_rank, int ep_rank
+    const std::vector<at::Tensor>& full, int tp_rank, int ep_rank,
+    bool base_tp_mlp
 ) {
     const int64_t local_heads = kHeads / 2;
     const int64_t local_kv_heads = kKvHeads / 2;
@@ -223,29 +257,37 @@ std::vector<at::Tensor> make_local_weights(
         local_heads * kHeadDim).contiguous());
     local.push_back(full[8]);
     local.push_back(full[9]);
-    local.push_back(full[10].narrow(
-        0, tp_rank * local_intermediate, local_intermediate).contiguous());
-    local.push_back(full[11].narrow(
-        0, tp_rank * local_intermediate, local_intermediate).contiguous());
-    local.push_back(full[12].narrow(
-        1, tp_rank * local_intermediate, local_intermediate).contiguous());
+    local.push_back(base_tp_mlp ? full[10].narrow(
+        0, tp_rank * local_intermediate, local_intermediate).contiguous()
+        : full[10]);
+    local.push_back(base_tp_mlp ? full[11].narrow(
+        0, tp_rank * local_intermediate, local_intermediate).contiguous()
+        : full[11]);
+    local.push_back(base_tp_mlp ? full[12].narrow(
+        1, tp_rank * local_intermediate, local_intermediate).contiguous()
+        : full[12]);
     auto local_gate_up = full[13].narrow(0, ep_rank, 1);
-    local.push_back(at::cat({
-        local_gate_up.narrow(
-            1, tp_rank * local_intermediate, local_intermediate),
-        local_gate_up.narrow(
-            1, kIntermediate + tp_rank * local_intermediate,
-            local_intermediate),
-    }, 1).contiguous());
-    local.push_back(full[14]
-        .narrow(0, ep_rank, 1)
+    local.push_back(base_tp_mlp ? at::cat({
+            local_gate_up.narrow(
+                1, tp_rank * local_intermediate, local_intermediate),
+            local_gate_up.narrow(
+                1, kIntermediate + tp_rank * local_intermediate,
+                local_intermediate),
+        }, 1).contiguous()
+        : local_gate_up.contiguous());
+    auto local_down = full[14].narrow(0, ep_rank, 1);
+    local.push_back(base_tp_mlp ? local_down
         .narrow(2, tp_rank * local_intermediate, local_intermediate)
-        .contiguous());
-    assert(local[10].sizes() == at::IntArrayRef({local_intermediate, kHidden}));
-    assert(local[11].sizes() == at::IntArrayRef({local_intermediate, kHidden}));
-    assert(local[12].sizes() == at::IntArrayRef({kHidden, local_intermediate}));
-    assert(local[13].sizes() == at::IntArrayRef({1, 2 * local_intermediate, kHidden}));
-    assert(local[14].sizes() == at::IntArrayRef({1, kHidden, local_intermediate}));
+        .contiguous() : local_down.contiguous());
+    const int64_t expected_intermediate =
+        base_tp_mlp ? local_intermediate : kIntermediate;
+    assert(local[10].sizes() == at::IntArrayRef({expected_intermediate, kHidden}));
+    assert(local[11].sizes() == at::IntArrayRef({expected_intermediate, kHidden}));
+    assert(local[12].sizes() == at::IntArrayRef({kHidden, expected_intermediate}));
+    assert(local[13].sizes() == at::IntArrayRef(
+        {1, 2 * expected_intermediate, kHidden}));
+    assert(local[14].sizes() == at::IntArrayRef(
+        {1, kHidden, expected_intermediate}));
     return local;
 }
 
@@ -289,7 +331,7 @@ struct LoraFixture {
 
 at::Tensor local_factor(
     const at::Tensor& full, FixtureKind kind, bool is_b,
-    int tp_rank, int ep_rank
+    int tp_rank, int ep_rank, bool base_tp_mlp
 ) {
     if (kind == FixtureKind::Q) {
         if (!is_b) return full.clone();
@@ -297,6 +339,20 @@ at::Tensor local_factor(
         return full.narrow(0, tp_rank * local_rows, local_rows).contiguous();
     }
     const int64_t local_intermediate = kIntermediate / 2;
+    if (!base_tp_mlp) {
+        if (kind == FixtureKind::SharedGate ||
+            kind == FixtureKind::SharedDown) {
+            const int64_t rank_dim = is_b ? 1 : 0;
+            const int64_t local_rank = full.size(rank_dim) / 2;
+            return full.narrow(
+                rank_dim, tp_rank * local_rank, local_rank).contiguous();
+        }
+        auto local = full.narrow(0, ep_rank, 1);
+        const int64_t rank_dim = is_b ? 2 : 1;
+        const int64_t local_rank = local.size(rank_dim) / 2;
+        return local.narrow(
+            rank_dim, tp_rank * local_rank, local_rank).contiguous();
+    }
     if (kind == FixtureKind::SharedGate) {
         if (!is_b) return full.clone();
         return full.narrow(
@@ -326,13 +382,18 @@ at::Tensor local_factor(
 }
 
 std::vector<LoraFixture> make_lora_fixtures(
-    int tp_rank, int ep_rank, int64_t offset
+    int tp_rank, int ep_rank, int64_t offset, bool base_tp_mlp
 ) {
     std::vector<LoraFixture> result;
     auto add = [&](int64_t slot, const char* module, FixtureKind kind,
                    at::Tensor full_a, at::Tensor full_b) {
-        auto local_a = local_factor(full_a, kind, false, tp_rank, ep_rank);
-        auto local_b = local_factor(full_b, kind, true, tp_rank, ep_rank);
+        // Some narrow slices are already contiguous, so contiguous() may keep
+        // aliasing the full-reference tensor. DP perturbations must only touch
+        // the local fixture.
+        auto local_a = local_factor(
+            full_a, kind, false, tp_rank, ep_rank, base_tp_mlp).clone();
+        auto local_b = local_factor(
+            full_b, kind, true, tp_rank, ep_rank, base_tp_mlp).clone();
         result.push_back({slot, module, kind, std::move(full_a),
             std::move(full_b), std::move(local_a), std::move(local_b)});
     };
@@ -357,14 +418,20 @@ std::vector<LoraFixture> make_lora_fixtures(
             0.0006, offset + 503));
     assert(result[0].local_a.sizes() == at::IntArrayRef({kLoraRank, kHidden}));
     assert(result[0].local_b.sizes() == at::IntArrayRef({kHidden, kLoraRank}));
-    assert(result[1].local_a.sizes() == at::IntArrayRef({kLoraRank, kHidden}));
-    assert(result[1].local_b.sizes() == at::IntArrayRef({kIntermediate / 2, kLoraRank}));
-    assert(result[2].local_a.sizes() == at::IntArrayRef({kLoraRank, kIntermediate / 2}));
-    assert(result[2].local_b.sizes() == at::IntArrayRef({kHidden, kLoraRank}));
-    assert(result[3].local_a.sizes() == at::IntArrayRef({1, kLoraRank, kHidden}));
-    assert(result[3].local_b.sizes() == at::IntArrayRef({1, kIntermediate, kLoraRank}));
-    assert(result[4].local_a.sizes() == at::IntArrayRef({1, kLoraRank, kIntermediate / 2}));
-    assert(result[4].local_b.sizes() == at::IntArrayRef({1, kHidden, kLoraRank}));
+    const int64_t local_rank = base_tp_mlp ? kLoraRank : kLoraRank / 2;
+    const int64_t local_intermediate =
+        base_tp_mlp ? kIntermediate / 2 : kIntermediate;
+    assert(result[1].local_a.sizes() == at::IntArrayRef({local_rank, kHidden}));
+    assert(result[1].local_b.sizes() == at::IntArrayRef({local_intermediate, local_rank}));
+    assert(result[2].local_a.sizes() == at::IntArrayRef({local_rank, local_intermediate}));
+    assert(result[2].local_b.sizes() == at::IntArrayRef({kHidden, local_rank}));
+    assert(result[3].local_a.sizes() == at::IntArrayRef({1, local_rank, kHidden}));
+    const int64_t local_gate_up_rows =
+        base_tp_mlp ? kIntermediate : 2 * kIntermediate;
+    assert(result[3].local_b.sizes() ==
+        at::IntArrayRef({1, local_gate_up_rows, local_rank}));
+    assert(result[4].local_a.sizes() == at::IntArrayRef({1, local_rank, local_intermediate}));
+    assert(result[4].local_b.sizes() == at::IntArrayRef({1, kHidden, local_rank}));
     return result;
 }
 
@@ -416,14 +483,17 @@ at::Tensor* dynamic_state(
     return tensor;
 }
 
-void set_distributed_env(int rank, int tp_rank, int ep_rank) {
-    setenv("WORLD_SIZE", "4", 1);
+void set_distributed_env(
+    int rank, int world, int tp_rank, int ep_rank, int dp_rank, int dp_size
+) {
+    setenv("WORLD_SIZE", std::to_string(world).c_str(), 1);
     setenv("TP_SIZE", "2", 1);
     setenv("EP_SIZE", "2", 1);
-    setenv("DP_SIZE", "1", 1);
+    setenv("DP_SIZE", std::to_string(dp_size).c_str(), 1);
     setenv("RUSTRAIN_TP_RANK", std::to_string(tp_rank).c_str(), 1);
     setenv("RUSTRAIN_EP_RANK", std::to_string(ep_rank).c_str(), 1);
-    setenv("RUSTRAIN_DP_RANK", "0", 1);
+    setenv("RUSTRAIN_DP_RANK", std::to_string(dp_rank).c_str(), 1);
+    setenv("RUSTRAIN_DATA_PARALLEL", dp_size > 1 ? "1" : "0", 1);
     setenv("RANK", std::to_string(rank).c_str(), 1);
 }
 
@@ -435,6 +505,7 @@ void set_reference_env() {
     setenv("RUSTRAIN_TP_RANK", "0", 1);
     setenv("RUSTRAIN_EP_RANK", "0", 1);
     setenv("RUSTRAIN_DP_RANK", "0", 1);
+    setenv("RUSTRAIN_DATA_PARALLEL", "0", 1);
     setenv("RANK", "0", 1);
 }
 
@@ -451,21 +522,30 @@ int main() {
     const int rank = required_env_int("RANK");
     const int world = required_env_int("WORLD_SIZE");
     const int local_rank = required_env_int("LOCAL_RANK");
-    assert(world == 4 && rank >= 0 && rank < world);
+    assert((world == 4 || world == 8) && rank >= 0 && rank < world);
+    const int dp_size = world / 4;
     const int tp_rank = rank % 2;
     const int ep_rank = (rank / 2) % 2;
-    const int tp_color = ep_rank;
-    const int ep_color = tp_rank;
-    const int dp_color = rank;
+    const int dp_rank = rank / 4;
+    const int tp_color = ep_rank + 2 * dp_rank;
+    const int ep_color = tp_rank + 2 * dp_rank;
+    const int dp_color = tp_rank + 2 * ep_rank;
+    const char* sharded_a2a_env = std::getenv("QWEN36_EP_A2A_SHARDED");
+    assert(sharded_a2a_env);
+    const bool sharded_source = std::strcmp(sharded_a2a_env, "0") != 0;
+    const bool base_tp_mlp = sharded_source;
+    const int32_t distributed_flags =
+        kBaseTpAttention | kVocabParallel | kExpertParallel |
+        (base_tp_mlp ? kBaseTpMlp : 0) |
+        (dp_size > 1 ? kDataParallel : 0);
     assert(qwen36_kernel_abi_version() == kAbiVersion);
     assert(std::getenv("QWEN36_EP_A2A") &&
         std::strcmp(std::getenv("QWEN36_EP_A2A"), "0") != 0);
-    assert(std::getenv("QWEN36_EP_A2A_SHARDED") &&
-        std::strcmp(std::getenv("QWEN36_EP_A2A_SHARDED"), "0") != 0);
     qwen36_set_cuda_device(local_rank);
 
     auto full_weights = make_full_weights();
-    auto local_weights = make_local_weights(full_weights, tp_rank, ep_rank);
+    auto local_weights = make_local_weights(
+        full_weights, tp_rank, ep_rank, base_tp_mlp);
     auto full_ptrs = pointers(full_weights);
     auto local_ptrs = pointers(local_weights);
     auto embed = fingerprint({kVocab, kHidden}, 0.0012, 1201);
@@ -485,10 +565,11 @@ int main() {
     constexpr const char* targets =
         "q_proj,shared_gate_proj,shared_down_proj,"
         "experts_gate_up_proj,experts_down_proj";
+    constexpr const char* projection_targets = "q_proj";
 
     // Reject a process grid that cannot cover WORLD_SIZE before any NCCL
     // communicator is created.
-    set_distributed_env(rank, tp_rank, ep_rank);
+    set_distributed_env(rank, world, tp_rank, ep_rank, dp_rank, dp_size);
     setenv("EP_SIZE", "3", 1);
     void* invalid = qwen36_create_training_context_ex(
         local_ptrs.data(), local_ptrs.size(), &local_embed, &final_norm,
@@ -496,9 +577,44 @@ int main() {
         static_cast<int32_t>(at::kBFloat16),
         1.0, kLearningRate, kBeta1, kBeta2, kAdamEps,
         kVocab, 1e-5, kLoraRank, &target_layer, 1, targets,
-        kBaseTpAttention | kVocabParallel | kExpertParallel | kBaseTpMlp);
+        distributed_flags);
     assert(invalid == nullptr);
-    set_distributed_env(rank, tp_rank, ep_rank);
+    set_distributed_env(rank, world, tp_rank, ep_rank, dp_rank, dp_size);
+
+    void* projection_rank_three = qwen36_create_training_context_ex(
+        local_ptrs.data(), local_ptrs.size(), &local_embed, &final_norm,
+        &local_lm_head, &distributed_config, 1,
+        static_cast<int32_t>(at::kBFloat16),
+        1.0, kLearningRate, kBeta1, kBeta2, kAdamEps,
+        kVocab, 1e-5, 3, &target_layer, 1, projection_targets,
+        distributed_flags);
+    assert(projection_rank_three);
+    assert(qwen36_add_lora(
+        projection_rank_three, 3, 3.0, &target_layer, 1,
+        projection_targets) > 0);
+    qwen36_free_training_context(projection_rank_three);
+
+    constexpr const char* mixed_targets = "q_proj,shared_gate_proj";
+    const int32_t mixed_flags = distributed_flags & ~kBaseTpMlp;
+    void* invalid_mixed_rank_three = qwen36_create_training_context_ex(
+        local_ptrs.data(), local_ptrs.size(), &local_embed, &final_norm,
+        &local_lm_head, &distributed_config, 1,
+        static_cast<int32_t>(at::kBFloat16),
+        1.0, kLearningRate, kBeta1, kBeta2, kAdamEps,
+        kVocab, 1e-5, 3, &target_layer, 1, mixed_targets,
+        mixed_flags);
+    assert(invalid_mixed_rank_three == nullptr);
+    void* mixed_rank_four = qwen36_create_training_context_ex(
+        local_ptrs.data(), local_ptrs.size(), &local_embed, &final_norm,
+        &local_lm_head, &distributed_config, 1,
+        static_cast<int32_t>(at::kBFloat16),
+        1.0, kLearningRate, kBeta1, kBeta2, kAdamEps,
+        kVocab, 1e-5, kLoraRank, &target_layer, 1, mixed_targets,
+        mixed_flags);
+    assert(mixed_rank_four);
+    assert(qwen36_add_lora(
+        mixed_rank_four, 3, 3.0, &target_layer, 1, mixed_targets) == -1);
+    qwen36_free_training_context(mixed_rank_four);
 
     void* distributed = qwen36_create_training_context_ex(
         local_ptrs.data(), local_ptrs.size(), &local_embed, &final_norm,
@@ -506,7 +622,7 @@ int main() {
         static_cast<int32_t>(at::kBFloat16),
         1.0, kLearningRate, kBeta1, kBeta2, kAdamEps,
         kVocab, 1e-5, kLoraRank, &target_layer, 1, targets,
-        kBaseTpAttention | kVocabParallel | kExpertParallel | kBaseTpMlp);
+        distributed_flags);
     assert(distributed);
 
     set_reference_env();
@@ -516,7 +632,7 @@ int main() {
         1.0, kLearningRate, kBeta1, kBeta2, kAdamEps,
         kVocab, 1e-5, kLoraRank, &target_layer, 1, targets);
     assert(reference);
-    set_distributed_env(rank, tp_rank, ep_rank);
+    set_distributed_env(rank, world, tp_rank, ep_rank, dp_rank, dp_size);
 
     // Frozen-base/vocabulary TP must reject unsharded MTP weights directly.
     auto mtp_dummy = unit({1});
@@ -524,16 +640,18 @@ int main() {
         distributed, &mtp_dummy, &mtp_dummy, &mtp_dummy, &mtp_dummy,
         nullptr, 0, nullptr, 0) == -1);
 
-    auto fixed_fixtures = make_lora_fixtures(tp_rank, ep_rank, 2001);
+    auto fixed_fixtures = make_lora_fixtures(
+        tp_rank, ep_rank, 2001, base_tp_mlp);
+    if (dp_rank > 0) {
+        for (auto& fixture : fixed_fixtures) {
+            fixture.local_a.add_(0.25);
+            fixture.local_b.add_(0.25);
+        }
+    }
     install_fixed(distributed, fixed_fixtures, true);
     install_fixed(reference, fixed_fixtures, false);
-    std::vector<std::array<at::Tensor, 2>> fixed_before;
-    for (auto& fixture : fixed_fixtures) {
-        fixed_before.push_back({fixture.local_a.clone(), fixture.local_b.clone()});
-    }
 
-    // Default tp-ep-dp rank order gives TP groups [0,1]/[2,3] and EP groups
-    // [0,2]/[1,3]. DP is a singleton axis in this oracle.
+    // Default tp-ep-dp rank order makes TP the least-significant coordinate.
     assert(qwen36_init_parallel_nccl(
         distributed, rank, world,
         0, 1, 0,
@@ -543,10 +661,41 @@ int main() {
         distributed, rank, world,
         tp_rank, 2, tp_color,
         ep_rank, 2, ep_color,
-        0, 1, dp_color) == 0);
+        dp_rank, dp_size, dp_color) == 0);
 
-    auto local_batch = source_batch(ep_rank);
-    auto global_batch = full_batch();
+    std::vector<std::array<at::Tensor, 2>> fixed_before;
+    double broadcast_diff = 0.0;
+    for (auto& fixture : fixed_fixtures) {
+        auto* a = reinterpret_cast<at::Tensor*>(
+            qwen36_get_lora_a(distributed, fixture.slot));
+        auto* b = reinterpret_cast<at::Tensor*>(
+            qwen36_get_lora_b(distributed, fixture.slot));
+        assert(a && b);
+        auto expected_a = local_factor(
+            fixture.full_a, fixture.kind, false, tp_rank, ep_rank,
+            base_tp_mlp);
+        auto expected_b = local_factor(
+            fixture.full_b, fixture.kind, true, tp_rank, ep_rank,
+            base_tp_mlp);
+        const double a_diff = max_diff(*a, expected_a);
+        const double b_diff = max_diff(*b, expected_b);
+        if (a_diff != 0.0 || b_diff != 0.0) {
+            std::fprintf(stderr,
+                "fixed_broadcast_mismatch rank=%d tp=%d ep=%d dp=%d "
+                "module=%s a_diff=%0.8e b_diff=%0.8e\n",
+                rank, tp_rank, ep_rank, dp_rank, fixture.module,
+                a_diff, b_diff);
+        }
+        broadcast_diff = std::max({broadcast_diff,
+            a_diff, b_diff});
+        fixed_before.push_back({a->clone(), b->clone()});
+    }
+    assert(broadcast_diff == 0.0);
+
+    const int source_rank = sharded_source ? 2 * dp_rank + ep_rank : dp_rank;
+    auto local_batch = source_batch(source_rank);
+    const int source_count = sharded_source ? 2 * dp_size : dp_size;
+    auto global_batch = full_batch(source_count);
     const double distributed_loss = qwen36_train_step(
         distributed, &local_batch.input_ids, &local_batch.target_mask,
         &local_batch.attention_mask);
@@ -580,9 +729,11 @@ int main() {
         assert(local_a && local_b && ref_a && ref_b);
         fixed_errors.param = std::max({fixed_errors.param,
             max_diff(*local_a, local_factor(
-                *ref_a, fixture.kind, false, tp_rank, ep_rank)),
+                *ref_a, fixture.kind, false, tp_rank, ep_rank,
+                base_tp_mlp)),
             max_diff(*local_b, local_factor(
-                *ref_b, fixture.kind, true, tp_rank, ep_rank))});
+                *ref_b, fixture.kind, true, tp_rank, ep_rank,
+                base_tp_mlp))});
 
         const int64_t a_state = 2 * fixture.slot;
         const int64_t b_state = a_state + 1;
@@ -598,14 +749,18 @@ int main() {
             ref_m_a && ref_m_b && ref_v_a && ref_v_b);
         fixed_errors.m = std::max({fixed_errors.m,
             max_diff(*m_a, local_factor(
-                *ref_m_a, fixture.kind, false, tp_rank, ep_rank)),
+                *ref_m_a, fixture.kind, false, tp_rank, ep_rank,
+                base_tp_mlp)),
             max_diff(*m_b, local_factor(
-                *ref_m_b, fixture.kind, true, tp_rank, ep_rank))});
+                *ref_m_b, fixture.kind, true, tp_rank, ep_rank,
+                base_tp_mlp))});
         fixed_errors.v = std::max({fixed_errors.v,
             max_diff(*v_a, local_factor(
-                *ref_v_a, fixture.kind, false, tp_rank, ep_rank)),
+                *ref_v_a, fixture.kind, false, tp_rank, ep_rank,
+                base_tp_mlp)),
             max_diff(*v_b, local_factor(
-                *ref_v_b, fixture.kind, true, tp_rank, ep_rank))});
+                *ref_v_b, fixture.kind, true, tp_rank, ep_rank,
+                base_tp_mlp))});
         fixed_errors.adam = std::max({fixed_errors.adam,
             max_diff(*local_a, adam_expected(
                 fixed_before[fixture_index][0], *m_a, *v_a)),
@@ -616,10 +771,13 @@ int main() {
     }
 
     std::printf(
-        "native_tp_ep_fixed rank=%d tp=%d ep=%d local_loss=%0.8f "
+        "native_tp_ep_fixed rank=%d tp=%d ep=%d dp=%d source_mode=%s "
+        "local_loss=%0.8f "
         "reference_loss=%0.8f param_diff=%0.8e m_diff=%0.8e "
         "v_diff=%0.8e adam_error=%0.8e\n",
-        rank, tp_rank, ep_rank, distributed_loss, reference_loss,
+        rank, tp_rank, ep_rank, dp_rank,
+        sharded_source ? "sharded" : "replicated",
+        distributed_loss, reference_loss,
         fixed_errors.param, fixed_errors.m, fixed_errors.v,
         fixed_errors.adam);
     std::fflush(stdout);
@@ -663,13 +821,13 @@ int main() {
         static_cast<int32_t>(at::kBFloat16),
         1.0, kLearningRate, kBeta1, kBeta2, kAdamEps,
         kVocab, 1e-5, kLoraRank, &target_layer, 1, targets,
-        kBaseTpAttention | kVocabParallel | kExpertParallel | kBaseTpMlp);
+        distributed_flags);
     assert(resumed);
     assert(qwen36_init_parallel_nccl(
         resumed, rank, world,
         tp_rank, 2, tp_color,
         ep_rank, 2, ep_color,
-        0, 1, dp_color) == 0);
+        dp_rank, dp_size, dp_color) == 0);
     for (int64_t slot = 0; slot < kLoraPairs; ++slot) {
         assert(qwen36_set_lora_tensor(
             resumed, slot, 0, &checkpoint_a[slot]) == 0);
@@ -774,6 +932,8 @@ int main() {
     assert(continued_m_diff == 0.0);
     assert(continued_v_diff == 0.0);
     assert(qwen36_get_step_count(resumed) == 2);
+    const int64_t fixed_step_before_dynamic =
+        qwen36_get_step_count(distributed);
 
     const int64_t dynamic_targets[] = {0};
     const int64_t tenant_one = qwen36_add_lora(
@@ -783,10 +943,32 @@ int main() {
         distributed, kLoraRank, kLoraRank,
         dynamic_targets, 1, targets);
     assert(tenant_one > 0 && tenant_two > tenant_one);
-    auto dynamic_one = make_lora_fixtures(tp_rank, ep_rank, 4001);
-    auto dynamic_two = make_lora_fixtures(tp_rank, ep_rank, 6001);
+    auto dynamic_one = make_lora_fixtures(
+        tp_rank, ep_rank, 4001, base_tp_mlp);
+    auto dynamic_two = make_lora_fixtures(
+        tp_rank, ep_rank, 6001, base_tp_mlp);
+    auto reference_dynamic_one = make_lora_fixtures(
+        tp_rank, ep_rank, 4001, base_tp_mlp);
     install_dynamic(distributed, tenant_one, dynamic_one, true);
     install_dynamic(distributed, tenant_two, dynamic_two, true);
+    // A selected dynamic tenant owns one activation row locally. Its full-rank
+    // oracle must aggregate every source row into one adapter update, which a
+    // fresh fixed-LoRA context does without conflating rows with tenant IDs.
+    set_reference_env();
+    void* dynamic_reference = qwen36_create_training_context(
+        full_ptrs.data(), full_ptrs.size(), &embed, &final_norm, &lm_head,
+        &reference_config, 1, static_cast<int32_t>(at::kBFloat16),
+        1.0, kLearningRate, kBeta1, kBeta2, kAdamEps,
+        kVocab, 1e-5, kLoraRank, &target_layer, 1, targets);
+    assert(dynamic_reference);
+    install_fixed(dynamic_reference, reference_dynamic_one, false);
+    set_distributed_env(rank, world, tp_rank, ep_rank, dp_rank, dp_size);
+    assert(qwen36_train_step(
+        distributed, &local_batch.input_ids, &local_batch.target_mask,
+        &local_batch.attention_mask) < 0.0);
+    assert(qwen36_get_step_count(distributed) == fixed_step_before_dynamic);
+    assert(qwen36_get_adapter_step_count(distributed, tenant_one) == 0);
+    assert(qwen36_get_adapter_step_count(distributed, tenant_two) == 0);
 
     std::vector<std::array<at::Tensor, 2>> tenant_one_before;
     std::vector<std::array<at::Tensor, 2>> tenant_two_before;
@@ -808,13 +990,26 @@ int main() {
     const double dynamic_loss = qwen36_train_multi_lora_selected(
         distributed, &local_batch.input_ids, &local_batch.target_mask,
         &local_batch.attention_mask, &tenant_one, 1, kLoraRank);
+    const double reference_dynamic_loss = qwen36_train_step(
+        dynamic_reference, &global_batch.input_ids, &global_batch.target_mask,
+        &global_batch.attention_mask);
     assert(dynamic_loss > 0.0 && std::isfinite(dynamic_loss));
+    assert(reference_dynamic_loss > 0.0 && std::isfinite(reference_dynamic_loss));
     assert(qwen36_get_adapter_step_count(distributed, tenant_one) == 1);
     assert(qwen36_get_adapter_step_count(distributed, tenant_two) == 0);
+    assert(qwen36_get_step_count(distributed) == fixed_step_before_dynamic);
 
     double selected_update = 0.0;
     double isolated_diff = 0.0;
     double dynamic_adam_error = 0.0;
+    double dynamic_param_diff = 0.0;
+    double dynamic_m_diff = 0.0;
+    double dynamic_v_diff = 0.0;
+    std::vector<void*> dynamic_reference_m(kOptimizerSlots);
+    std::vector<void*> dynamic_reference_v(kOptimizerSlots);
+    assert(qwen36_export_optimizer_state(
+        dynamic_reference, dynamic_reference_m.data(),
+        dynamic_reference_v.data(), kOptimizerSlots) == kOptimizerSlots);
     for (size_t index = 0; index < dynamic_one.size(); ++index) {
         const char* module = dynamic_one[index].module;
         auto* selected_a = dynamic_tensor(
@@ -825,6 +1020,12 @@ int main() {
             distributed, tenant_two, module, false);
         auto* isolated_b = dynamic_tensor(
             distributed, tenant_two, module, true);
+        const int64_t a_state = 2 * dynamic_one[index].slot;
+        const int64_t b_state = a_state + 1;
+        auto* reference_a = reinterpret_cast<at::Tensor*>(
+            qwen36_get_lora_a(dynamic_reference, dynamic_one[index].slot));
+        auto* reference_b = reinterpret_cast<at::Tensor*>(
+            qwen36_get_lora_b(dynamic_reference, dynamic_one[index].slot));
         selected_update += update_norm(
             *selected_a, tenant_one_before[index][0]);
         selected_update += update_norm(
@@ -841,6 +1042,37 @@ int main() {
             distributed, tenant_one, module, true, false);
         auto* v_b = dynamic_state(
             distributed, tenant_one, module, true, true);
+        auto* reference_m_a = reinterpret_cast<at::Tensor*>(
+            dynamic_reference_m[a_state]);
+        auto* reference_v_a = reinterpret_cast<at::Tensor*>(
+            dynamic_reference_v[a_state]);
+        auto* reference_m_b = reinterpret_cast<at::Tensor*>(
+            dynamic_reference_m[b_state]);
+        auto* reference_v_b = reinterpret_cast<at::Tensor*>(
+            dynamic_reference_v[b_state]);
+        assert(reference_a && reference_b && reference_m_a && reference_v_a &&
+            reference_m_b && reference_v_b);
+        dynamic_param_diff = std::max({dynamic_param_diff,
+            max_diff(*selected_a, local_factor(
+                *reference_a, dynamic_one[index].kind, false,
+                tp_rank, ep_rank, base_tp_mlp)),
+            max_diff(*selected_b, local_factor(
+                *reference_b, dynamic_one[index].kind, true,
+                tp_rank, ep_rank, base_tp_mlp))});
+        dynamic_m_diff = std::max({dynamic_m_diff,
+            max_diff(*m_a, local_factor(
+                *reference_m_a, dynamic_one[index].kind, false,
+                tp_rank, ep_rank, base_tp_mlp)),
+            max_diff(*m_b, local_factor(
+                *reference_m_b, dynamic_one[index].kind, true,
+                tp_rank, ep_rank, base_tp_mlp))});
+        dynamic_v_diff = std::max({dynamic_v_diff,
+            max_diff(*v_a, local_factor(
+                *reference_v_a, dynamic_one[index].kind, false,
+                tp_rank, ep_rank, base_tp_mlp)),
+            max_diff(*v_b, local_factor(
+                *reference_v_b, dynamic_one[index].kind, true,
+                tp_rank, ep_rank, base_tp_mlp))});
         dynamic_adam_error = std::max({dynamic_adam_error,
             max_diff(*selected_a, adam_expected(
                 tenant_one_before[index][0], *m_a, *v_a)),
@@ -854,11 +1086,13 @@ int main() {
             ->abs().max().item<double>() == 0.0);
     }
     std::printf(
-        "native_tp_ep_dynamic rank=%d tp=%d ep=%d loss=%0.8f "
+        "native_tp_ep_dynamic rank=%d tp=%d ep=%d dp=%d loss=%0.8f "
         "selected_update=%0.8e isolated_diff=%0.8e adam_error=%0.8e "
+        "param_diff=%0.8e m_diff=%0.8e v_diff=%0.8e "
         "steps=[%ld,%ld]\n",
-        rank, tp_rank, ep_rank, dynamic_loss, selected_update,
-        isolated_diff, dynamic_adam_error,
+        rank, tp_rank, ep_rank, dp_rank, dynamic_loss, selected_update,
+        isolated_diff, dynamic_adam_error, dynamic_param_diff,
+        dynamic_m_diff, dynamic_v_diff,
         static_cast<long>(qwen36_get_adapter_step_count(
             distributed, tenant_one)),
         static_cast<long>(qwen36_get_adapter_step_count(
@@ -867,8 +1101,86 @@ int main() {
     assert(selected_update > 0.0);
     assert(isolated_diff == 0.0);
     assert(dynamic_adam_error <= 1e-5);
+    assert(dynamic_param_diff <= 3e-3);
+    assert(dynamic_m_diff <= 7e-3);
+    assert(dynamic_v_diff <= 2e-5);
+
+    // Round-trip one tenant through CPU tensors and its independent optimizer
+    // clock, then require exact next-step parity with the uninterrupted context.
+    std::vector<std::array<at::Tensor, 6>> dynamic_checkpoint;
+    dynamic_checkpoint.reserve(dynamic_one.size());
+    for (const auto& fixture : dynamic_one) {
+        dynamic_checkpoint.push_back({
+            dynamic_tensor(distributed, tenant_one, fixture.module, false)
+                ->to(at::kCPU).clone(),
+            dynamic_tensor(distributed, tenant_one, fixture.module, true)
+                ->to(at::kCPU).clone(),
+            dynamic_state(distributed, tenant_one, fixture.module, false, false)
+                ->to(at::kCPU).clone(),
+            dynamic_state(distributed, tenant_one, fixture.module, false, true)
+                ->to(at::kCPU).clone(),
+            dynamic_state(distributed, tenant_one, fixture.module, true, false)
+                ->to(at::kCPU).clone(),
+            dynamic_state(distributed, tenant_one, fixture.module, true, true)
+                ->to(at::kCPU).clone(),
+        });
+    }
+    const int64_t resumed_tenant_one = qwen36_add_lora(
+        resumed, kLoraRank, kLoraRank, dynamic_targets, 1, targets);
+    const int64_t resumed_tenant_two = qwen36_add_lora(
+        resumed, kLoraRank, kLoraRank, dynamic_targets, 1, targets);
+    assert(resumed_tenant_one == tenant_one);
+    assert(resumed_tenant_two == tenant_two);
+    for (size_t index = 0; index < dynamic_one.size(); ++index) {
+        const char* module = dynamic_one[index].module;
+        auto& state = dynamic_checkpoint[index];
+        assert(qwen36_set_adapter_lora_tensor(
+            resumed, resumed_tenant_one, 0, module, 0, &state[0]) == 0);
+        assert(qwen36_set_adapter_lora_tensor(
+            resumed, resumed_tenant_one, 0, module, 1, &state[1]) == 0);
+        assert(qwen36_set_adapter_optimizer_tensor(
+            resumed, resumed_tenant_one, 0, module, 0, 0, &state[2]) == 0);
+        assert(qwen36_set_adapter_optimizer_tensor(
+            resumed, resumed_tenant_one, 0, module, 0, 1, &state[3]) == 0);
+        assert(qwen36_set_adapter_optimizer_tensor(
+            resumed, resumed_tenant_one, 0, module, 1, 0, &state[4]) == 0);
+        assert(qwen36_set_adapter_optimizer_tensor(
+            resumed, resumed_tenant_one, 0, module, 1, 1, &state[5]) == 0);
+    }
+    assert(qwen36_set_adapter_step_count(
+        resumed, resumed_tenant_one,
+        qwen36_get_adapter_step_count(distributed, tenant_one)) == 0);
+    const int64_t fixed_step_before_resumed_dynamic =
+        qwen36_get_step_count(distributed);
+    const double continued_dynamic_loss = qwen36_train_multi_lora_selected(
+        distributed, &local_batch.input_ids, &local_batch.target_mask,
+        &local_batch.attention_mask, &tenant_one, 1, kLoraRank);
+    const double resumed_dynamic_loss = qwen36_train_multi_lora_selected(
+        resumed, &local_batch.input_ids, &local_batch.target_mask,
+        &local_batch.attention_mask, &resumed_tenant_one, 1, kLoraRank);
+    assert(std::abs(continued_dynamic_loss - resumed_dynamic_loss) <= 1e-6);
+    assert(qwen36_get_adapter_step_count(distributed, tenant_one) == 2);
+    assert(qwen36_get_adapter_step_count(resumed, resumed_tenant_one) == 2);
+    assert(qwen36_get_adapter_step_count(resumed, resumed_tenant_two) == 0);
+    assert(qwen36_get_step_count(distributed) == fixed_step_before_resumed_dynamic);
+    assert(qwen36_get_step_count(resumed) == fixed_step_before_resumed_dynamic);
+    double resumed_dynamic_diff = 0.0;
+    for (const auto& fixture : dynamic_one) {
+        for (int is_b = 0; is_b < 2; ++is_b) {
+            resumed_dynamic_diff = std::max(resumed_dynamic_diff, max_diff(
+                *dynamic_tensor(distributed, tenant_one, fixture.module, is_b),
+                *dynamic_tensor(resumed, resumed_tenant_one, fixture.module, is_b)));
+            for (int is_v = 0; is_v < 2; ++is_v) {
+                resumed_dynamic_diff = std::max(resumed_dynamic_diff, max_diff(
+                    *dynamic_state(distributed, tenant_one, fixture.module, is_b, is_v),
+                    *dynamic_state(resumed, resumed_tenant_one, fixture.module, is_b, is_v)));
+            }
+        }
+    }
+    assert(resumed_dynamic_diff == 0.0);
 
     qwen36_free_training_context(reference);
+    qwen36_free_training_context(dynamic_reference);
     qwen36_free_training_context(resumed);
     qwen36_free_training_context(distributed);
     return 0;

@@ -113,6 +113,22 @@ fn lora_config_from_config(config: &Config) -> Result<Qwen36LoraConfig> {
     })
 }
 
+fn training_source_coordinate(
+    dp_rank: usize,
+    dp_size: usize,
+    ep_rank: usize,
+    ep_size: usize,
+    ep_source_sharded: bool,
+) -> (usize, usize) {
+    if ep_source_sharded {
+        (dp_rank * ep_size + ep_rank, dp_size * ep_size)
+    } else if dp_size > 1 {
+        (dp_rank, dp_size)
+    } else {
+        (0, 1)
+    }
+}
+
 /// Build the set of weight names needed for training.
 /// For EP mode, only load local expert slice.
 fn build_needed_weights(
@@ -219,11 +235,10 @@ pub fn train_qwen3_6_lora_sft_ep(
     let runtime_config = read_qwen36_runtime_config(&model_path)?;
     let ep_shard = if runtime_config.is_moe {
         if config.parallel.pipeline_model_parallel_size != 1
-            || config.parallel.data_parallel_size != 1
             || config.parallel.context_parallel_size != 1
         {
             bail!(
-                "native MoE Qwen LoRA currently supports TPxEP only: TP={} PP={} DP={} EP={} CP={}",
+                "native MoE Qwen LoRA currently supports TPxEPxDP only: TP={} PP={} DP={} EP={} CP={}",
                 config.parallel.tensor_model_parallel_size,
                 config.parallel.pipeline_model_parallel_size,
                 config.parallel.data_parallel_size,
@@ -237,7 +252,7 @@ pub fn train_qwen3_6_lora_sft_ep(
         let topology = ParallelTopology::with_order(
             config.parallel.tensor_model_parallel_size,
             1,
-            1,
+            config.parallel.data_parallel_size,
             config.parallel.expert_model_parallel_size,
             1,
             &rank_order,
@@ -267,9 +282,22 @@ mod tests {
             assert_eq!(ep_rank, expected_ep_rank);
             let shard = EpShard::new(ep_rank, 2, 8);
             assert_eq!(shard.expert_start, expected_ep_rank * 4);
-            let data_start = 3 * 2 * 2 + ep_rank * 2;
+            let (source_rank, source_count) =
+                training_source_coordinate(0, 1, ep_rank, 2, true);
+            let data_start = 3 * 2 * source_count + source_rank * 2;
             assert_eq!(data_start, 12 + expected_ep_rank * 2);
         }
+    }
+
+    #[test]
+    fn tp_ep_dp_uses_every_expert_and_data_source_coordinate() {
+        let expected = [(0, 4), (1, 4), (2, 4), (3, 4)];
+        let observed = [(0, 0), (0, 1), (1, 0), (1, 1)]
+            .map(|(dp_rank, ep_rank)| {
+                training_source_coordinate(dp_rank, 2, ep_rank, 2, true)
+            });
+        assert_eq!(observed, expected);
+        assert_eq!(training_source_coordinate(1, 2, 1, 2, false), (1, 2));
     }
 
     #[test]
@@ -358,9 +386,13 @@ fn train_impl(
     let rank = env_rank;
     let distributed_generation =
         if world_size > 1 {
-            Some(std::env::var("RUSTRAIN_ATTEMPT_ID").context(
+            let attempt = std::env::var("RUSTRAIN_ATTEMPT_ID").context(
                 "distributed CLI training requires launcher-provided RUSTRAIN_ATTEMPT_ID",
-            )?)
+            )?;
+            Some(format!(
+                "{attempt}.adapter-final.{ordinal:020}",
+                ordinal = 0
+            ))
         } else {
             None
         };
@@ -382,6 +414,12 @@ fn train_impl(
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
         .unwrap_or(config.parallel.data_parallel_size);
+    if is_ep && configured_dp_size != config.parallel.data_parallel_size {
+        bail!(
+            "DP_SIZE environment ({configured_dp_size}) does not match config data_parallel_size ({})",
+            config.parallel.data_parallel_size
+        );
+    }
     let dp_size = if !is_ep && configured_dp_size == 1 && world_size > tp_size {
         world_size
             .checked_div(tp_size)
@@ -397,12 +435,10 @@ fn train_impl(
         .unwrap_or_else(|_| DEFAULT_RANK_ORDER.to_string());
     let parallel_topology = if let Some(shard) = shard_ref {
         if config.parallel.pipeline_model_parallel_size != 1
-            || configured_dp_size != 1
-            || config.parallel.data_parallel_size != 1
             || config.parallel.context_parallel_size != 1
         {
             bail!(
-                "native MoE Qwen LoRA currently supports TPxEP only: TP={} WORLD_SIZE={} PP={} DP={} EP={} CP={}",
+                "native MoE Qwen LoRA currently supports TPxEPxDP only: TP={} WORLD_SIZE={} PP={} DP={} EP={} CP={}",
                 tp_size,
                 world_size,
                 config.parallel.pipeline_model_parallel_size,
@@ -414,7 +450,7 @@ fn train_impl(
         Some(ParallelTopology::with_order(
             tp_size,
             1,
-            1,
+            dp_size,
             shard.world_size,
             1,
             &rank_order,
@@ -455,11 +491,6 @@ fn train_impl(
         .collect::<Vec<_>>();
     validate_lora_rank_for_tp(lora_config.rank, tp_size, &active_layouts)?;
     let is_data_parallel = dp_size > 1;
-    if is_data_parallel && runtime_config.is_moe {
-        bail!(
-            "replicated Qwen data parallelism is only supported for dense/linear-attention models; use *_ep for MoE"
-        );
-    }
     unsafe {
         std::env::set_var("TP_SIZE", tp_size.to_string());
         std::env::set_var(
@@ -909,10 +940,10 @@ fn train_impl(
                 data.adam_v.len()
             );
         }
-        if data.adam_m.is_empty() && data.manifest.step > 0 {
+        if data.adam_m.is_empty() && data.manifest.effective_fixed_optimizer_step() > 0 {
             bail!(
-                "checkpoint at step {} has no Adam state",
-                data.manifest.step
+                "checkpoint fixed optimizer step {} has no Adam state",
+                data.manifest.effective_fixed_optimizer_step()
             );
         }
         if !data.adam_m.is_empty() {
@@ -952,7 +983,7 @@ fn train_impl(
                 );
             }
         }
-        let native_step = i64::try_from(data.manifest.step)
+        let native_step = i64::try_from(data.manifest.effective_fixed_optimizer_step())
             .context("checkpoint step exceeds the native optimizer range")?;
         ctx.set_step_count(native_step)?;
         start_step = usize::try_from(data.manifest.step)
@@ -978,16 +1009,15 @@ fn train_impl(
         let mut loss_value = 0.0;
         for accumulation_index in 0..gradient_accumulation_steps {
             let micro_step = step * gradient_accumulation_steps + accumulation_index;
-            let data_start = if is_data_parallel || ep_a2a_sharded {
-                let (replica_rank, replica_count) = if is_data_parallel {
-                    (dp_rank, dp_size)
-                } else {
-                    (ep_rank, ep_size)
-                };
-                (micro_step * batch_size * replica_count + replica_rank * batch_size) % data.len()
-            } else {
-                (micro_step * batch_size) % data.len()
-            };
+            let (source_rank, source_count) = training_source_coordinate(
+                dp_rank,
+                dp_size,
+                ep_rank,
+                ep_size,
+                ep_a2a_sharded,
+            );
+            let data_start =
+                (micro_step * batch_size * source_count + source_rank * batch_size) % data.len();
             let sft_batch = data.batch(data_start, batch_size);
             let (input_ids, target_mask) = sft_batch.to_tensors(device, compute_kind);
 
@@ -1026,7 +1056,7 @@ fn train_impl(
     let (adapter_path, trainable_params) = if world_size > 1 {
         let generation = distributed_generation
             .as_deref()
-            .expect("distributed attempt ID was validated before training");
+            .expect("distributed save generation was validated before training");
         let parallel = checkpoint::ParallelCheckpointManifest::from_topology(
             world_size,
             rank,
@@ -1092,8 +1122,9 @@ fn train_impl(
             &parallel,
             None,
             |staging| {
-                checkpoint::save_checkpoint_with_dynamic_for_topology(
+                checkpoint::save_checkpoint_with_dynamic_and_fixed_step_for_topology_generation(
                     staging,
+                    step,
                     step,
                     final_loss,
                     &model_path_string,
@@ -1107,6 +1138,7 @@ fn train_impl(
                     &layouts,
                     &identities,
                     &parallel,
+                    Some(generation),
                 )
             },
         )?;
