@@ -902,9 +902,11 @@ paths=["/tmp/qwen3_6_test.jsonl"]
         input_ids: ids.clone(),
         target_mask: mask.clone(),
         attention_mask: attn.clone(),
+        batch_size: 1,
         seq_len,
         n_total: n_adapters,
         lora_rank,
+        adapter_ids: vec![],
     }) {
         EpResult::Loss(l) => l,
         EpResult::Error(e) => {
@@ -941,9 +943,11 @@ paths=["/tmp/qwen3_6_test.jsonl"]
             input_ids: ids.clone(),
             target_mask: mask.clone(),
             attention_mask: attn.clone(),
+            batch_size: 1,
             seq_len,
             n_total: n_adapters,
             lora_rank,
+            adapter_ids: vec![],
         }) {
             EpResult::Loss(l) => {
                 losses.push(l);

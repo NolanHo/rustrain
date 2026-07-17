@@ -4,7 +4,7 @@
 //! Rust only handles: weight loading, data loading, training loop orchestration.
 
 use crate::lora::Qwen36LoraTargetModule;
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use std::ffi::c_void;
 use std::sync::OnceLock;
 use tch::{Kind, Tensor};
@@ -78,6 +78,8 @@ type FnSetMtpWeights = unsafe extern "C" fn(
 type FnSetCheckpoint = unsafe extern "C" fn(*mut c_void, i32, i64);
 type FnSetNcclComm = unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void, i32, i32);
 type FnInitNccl = unsafe extern "C" fn(*mut c_void) -> i32;
+type FnInitParallelNccl =
+    unsafe extern "C" fn(*mut c_void, i32, i32, i32, i32, i32, i32, i32, i32) -> i32;
 type FnSetCudaDevice = unsafe extern "C" fn(i32);
 type FnSetBaseTpMlp = unsafe extern "C" fn(*mut c_void, i32) -> i32;
 type FnAddLora = unsafe extern "C" fn(*mut c_void, i64, f64, *const i64, i64, *const i8) -> i64;
@@ -145,6 +147,7 @@ struct KernelHandles {
     set_checkpoint: FnSetCheckpoint,
     set_nccl_comm: FnSetNcclComm,
     init_nccl: FnInitNccl,
+    init_parallel_nccl: FnInitParallelNccl,
     set_cuda_device: FnSetCudaDevice,
     set_base_tp_mlp: FnSetBaseTpMlp,
     add_lora: FnAddLora,
@@ -197,7 +200,7 @@ unsafe fn load_kernels() -> Option<KernelHandles> {
         }};
     }
     let abi_version: FnKernelAbiVersion = sym!("qwen36_kernel_abi_version");
-    if abi_version() != 15 {
+    if abi_version() != 16 {
         return None;
     }
     Some(KernelHandles {
@@ -224,6 +227,7 @@ unsafe fn load_kernels() -> Option<KernelHandles> {
         set_checkpoint: sym!("qwen36_set_checkpoint"),
         set_nccl_comm: sym!("qwen36_set_nccl_comm"),
         init_nccl: sym!("qwen36_init_nccl"),
+        init_parallel_nccl: sym!("qwen36_init_parallel_nccl"),
         set_cuda_device: sym!("qwen36_set_cuda_device"),
         set_base_tp_mlp: sym!("qwen36_set_base_tp_mlp"),
         add_lora: sym!("qwen36_add_lora"),
@@ -635,6 +639,7 @@ impl CppTrainingContext {
         lora_rank: i64,
         base_tp_attention: bool,
         base_tp_mlp: bool,
+        data_parallel: bool,
         target_layers: &[usize],
         target_modules: &[Qwen36LoraTargetModule],
         expert_start: usize,
@@ -710,7 +715,7 @@ impl CppTrainingContext {
                 tl_ptr,
                 tl_len,
                 modules_ptr,
-                i32::from(base_tp_attention),
+                i32::from(base_tp_attention) | (i32::from(data_parallel) << 1),
             )
         };
         if ptr.is_null() {
@@ -974,6 +979,44 @@ impl CppTrainingContext {
     pub fn init_nccl(&self) -> i32 {
         let kh = get_kernels().expect("kernels not loaded");
         unsafe { (kh.init_nccl)(self.ptr) }
+    }
+
+    /// Initialize orthogonal TP and DP process groups from validated topology metadata.
+    pub fn init_parallel_nccl(
+        &self,
+        rank: usize,
+        world_size: usize,
+        tp_rank: usize,
+        tp_size: usize,
+        tp_color: usize,
+        dp_rank: usize,
+        dp_size: usize,
+        dp_color: usize,
+    ) -> Result<()> {
+        let values = [
+            rank, world_size, tp_rank, tp_size, tp_color, dp_rank, dp_size, dp_color,
+        ]
+        .map(|value| i32::try_from(value).context("parallel topology exceeds i32"));
+        let [rank, world_size, tp_rank, tp_size, tp_color, dp_rank, dp_size, dp_color] =
+            values;
+        let kh = get_kernels().expect("kernels not loaded");
+        let status = unsafe {
+            (kh.init_parallel_nccl)(
+                self.ptr,
+                rank?,
+                world_size?,
+                tp_rank?,
+                tp_size?,
+                tp_color?,
+                dp_rank?,
+                dp_size?,
+                dp_color?,
+            )
+        };
+        if status != 0 {
+            bail!("C++ parallel NCCL init failed (code {status})");
+        }
+        Ok(())
     }
 
     /// Set CUDA device and force PyTorch CUDA context initialization.

@@ -8,6 +8,7 @@ use tokio::sync::Mutex;
 
 use crate::checkpoint;
 use crate::metrics::{FileMetricsSink, MetricsSink, StepMetric};
+use rustrain_parallel::topology::ParallelTopology;
 use rustrain_qwen3_6::lora::{Qwen36AdapterArtifact, Qwen36LoraConfig, Qwen36LoraTargetModule};
 
 fn lora_tp_shard_layout(
@@ -339,24 +340,60 @@ impl TrainingSession for Qwen36Session {
             .unwrap_or(0);
         let tp_size = std::env::var("TP_SIZE")
             .or_else(|_| std::env::var("RUSTRAIN_TP_SIZE"))
+            .or_else(|_| std::env::var("TENSOR_MODEL_PARALLEL_SIZE"))
             .ok()
             .and_then(|s| s.parse::<usize>().ok())
             .unwrap_or(1);
-        if tp_size > 1 {
-            if ep_world_size != tp_size || ep_rank >= ep_world_size {
+        let is_ep = ep_world_size > 1 && runtime_config.is_moe && tp_size == 1;
+        let dense_topology = if runtime_config.is_moe {
+            None
+        } else {
+            let topology = ParallelTopology::from_env_with_world_size(ep_world_size)?;
+            if topology.pipeline_model_parallel_size() != 1
+                || topology.expert_model_parallel_size() != 1
+                || topology.context_parallel_size() != 1
+            {
                 return Err(anyhow!(
-                    "native Qwen server TP-only mode requires WORLD_SIZE=TP_SIZE and a valid global rank (world={}, tp={}, rank={})",
-                    ep_world_size,
-                    tp_size,
-                    ep_rank
+                    "native dense Qwen server supports TPxDP only (tp={} pp={} dp={} ep={} cp={})",
+                    topology.tensor_model_parallel_size(),
+                    topology.pipeline_model_parallel_size(),
+                    topology.data_parallel_size(),
+                    topology.expert_model_parallel_size(),
+                    topology.context_parallel_size(),
                 ));
             }
-            unsafe {
-                std::env::set_var("TP_SIZE", tp_size.to_string());
+            if topology.tensor_model_parallel_size() != tp_size {
+                return Err(anyhow!(
+                    "Qwen server topology TP={} does not match TP_SIZE={tp_size}",
+                    topology.tensor_model_parallel_size()
+                ));
             }
+            topology.coordinates(ep_rank)?;
+            Some(topology)
+        };
+        let dp_size = dense_topology
+            .as_ref()
+            .map(ParallelTopology::data_parallel_size)
+            .unwrap_or(1);
+        let tp_rank = dense_topology
+            .as_ref()
+            .map(|topology| topology.tensor_rank(ep_rank))
+            .transpose()?
+            .unwrap_or(0);
+        let dp_rank = dense_topology
+            .as_ref()
+            .map(|topology| topology.data_rank(ep_rank))
+            .transpose()?
+            .unwrap_or(ep_rank);
+        let is_data_parallel = !runtime_config.is_moe && dp_size > 1;
+        unsafe {
+            std::env::set_var("TP_SIZE", tp_size.to_string());
+            std::env::set_var("DP_SIZE", dp_size.to_string());
+            std::env::set_var(
+                "RUSTRAIN_DATA_PARALLEL",
+                if is_data_parallel { "1" } else { "0" },
+            );
         }
-        let is_ep = ep_world_size > 1 && runtime_config.is_moe && tp_size == 1;
-        let is_data_parallel = ep_world_size > 1 && !runtime_config.is_moe && tp_size == 1;
         let base_tp_attention = tp_size > 1;
         let base_tp_mlp = tp_size > 1 && !runtime_config.is_moe;
         if base_tp_attention {
@@ -483,10 +520,7 @@ impl TrainingSession for Qwen36Session {
                 let local_shard = if base_tp_attention {
                     let full_attention_shard =
                         rustrain_qwen3_6::kernel::shard_full_attention_weight_for_tp(
-                            &name,
-                            &tensor,
-                            tp_size,
-                            ep_rank % tp_size,
+                            &name, &tensor, tp_size, tp_rank,
                         )?;
                     let attention_shard = if full_attention_shard.is_some() {
                         full_attention_shard
@@ -495,7 +529,7 @@ impl TrainingSession for Qwen36Session {
                             &name,
                             &tensor,
                             tp_size,
-                            ep_rank % tp_size,
+                            tp_rank,
                             runtime_config.linear_num_key_heads,
                             runtime_config.linear_key_head_dim,
                             runtime_config.linear_num_value_heads,
@@ -506,10 +540,7 @@ impl TrainingSession for Qwen36Session {
                         attention_shard
                     } else {
                         rustrain_qwen3_6::kernel::shard_dense_mlp_weight_for_tp(
-                            &name,
-                            &tensor,
-                            tp_size,
-                            ep_rank % tp_size,
+                            &name, &tensor, tp_size, tp_rank,
                         )?
                     }
                 } else {
@@ -558,24 +589,42 @@ impl TrainingSession for Qwen36Session {
             req.rank,
             base_tp_attention,
             base_tp_mlp,
+            is_data_parallel,
             &all_layers,
             &target_modules,
             expert_start,
             expert_count,
         )?;
 
-        // Initialize NCCL directly in C++. The parent communicator handles
-        // EP/DP, while TP-only LoRA uses a split communicator for deltas.
+        // Initialize NCCL directly in C++. Dense TPxDP receives explicit
+        // orthogonal group metadata; legacy EP keeps its world communicator.
         let nccl_ep = if ep_world_size > 1 {
-            unsafe {
-                std::env::set_var(
-                    "RUSTRAIN_DATA_PARALLEL",
-                    if is_data_parallel { "1" } else { "0" },
-                );
-            }
-            let ret = ctx.init_nccl();
-            if ret != 0 {
-                return Err(anyhow!("C++ NCCL init failed (code {})", ret));
+            if let Some(topology) = dense_topology.as_ref() {
+                let tp_color = *topology
+                    .tensor_group(ep_rank)?
+                    .iter()
+                    .min()
+                    .ok_or_else(|| anyhow!("empty TP process group"))?;
+                let dp_color = *topology
+                    .data_group(ep_rank)?
+                    .iter()
+                    .min()
+                    .ok_or_else(|| anyhow!("empty DP process group"))?;
+                ctx.init_parallel_nccl(
+                    ep_rank,
+                    ep_world_size,
+                    tp_rank,
+                    tp_size,
+                    tp_color,
+                    dp_rank,
+                    dp_size,
+                    dp_color,
+                )?;
+            } else {
+                let ret = ctx.init_nccl();
+                if ret != 0 {
+                    return Err(anyhow!("C++ NCCL init failed (code {})", ret));
+                }
             }
             tracing::info!(
                 ep_rank,

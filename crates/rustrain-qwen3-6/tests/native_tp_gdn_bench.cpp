@@ -42,7 +42,7 @@ extern "C" void qwen36_free_training_context(void*);
 
 namespace {
 
-constexpr int64_t kAbiVersion = 15;
+constexpr int64_t kAbiVersion = 16;
 constexpr int32_t kBaseTpAttention = 1 << 0;
 
 static int env_int(const char* name, int fallback) {

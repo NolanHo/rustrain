@@ -2,13 +2,13 @@
 set -euo pipefail
 
 usage() {
-    echo "usage: $0 {smoke|bench-single|bench-tp2}" >&2
+    echo "usage: $0 {smoke|tpdp-smoke|bench-single|bench-tp2}" >&2
     exit 2
 }
 
 mode="${1:-}"
 case "$mode" in
-    smoke|bench-single|bench-tp2) ;;
+    smoke|tpdp-smoke|bench-single|bench-tp2) ;;
     *) usage ;;
 esac
 
@@ -16,8 +16,15 @@ repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo_root"
 
 python_bin="${PYTHON:-python3}"
-readarray -t torch_config < <(
-    "$python_bin" - <<'PY'
+if [[ -n "${TORCH_INCLUDE_PATH:-}" && -n "${TORCH_LIB_PATH:-}" && -n "${GLIBCXX_USE_CXX11_ABI:-}" ]]; then
+    torch_include="$TORCH_INCLUDE_PATH"
+    torch_lib="$TORCH_LIB_PATH"
+    cxx11_abi="$GLIBCXX_USE_CXX11_ABI"
+    site_packages="${PYTHON_SITE_PACKAGES:-${torch_include%/torch/include}}"
+    torch_version="${TORCH_VERSION:-prebuilt}"
+else
+    readarray -t torch_config < <(
+        "$python_bin" - <<'PY'
 import pathlib
 import torch
 
@@ -28,12 +35,13 @@ print(int(torch._C._GLIBCXX_USE_CXX11_ABI))
 print(root.parent)
 print(torch.__version__)
 PY
-)
-torch_include="${TORCH_INCLUDE_PATH:-${torch_config[0]}}"
-torch_lib="${TORCH_LIB_PATH:-${torch_config[1]}}"
-cxx11_abi="${GLIBCXX_USE_CXX11_ABI:-${torch_config[2]}}"
-site_packages="${torch_config[3]}"
-torch_version="${torch_config[4]}"
+    )
+    torch_include="${torch_config[0]}"
+    torch_lib="${torch_config[1]}"
+    cxx11_abi="${torch_config[2]}"
+    site_packages="${torch_config[3]}"
+    torch_version="${torch_config[4]}"
+fi
 
 cuda_home="${CUDA_HOME:-/usr/local/cuda}"
 cuda_include="${CUDA_INCLUDE_PATH:-$cuda_home/include}"
@@ -163,11 +171,16 @@ common_flags=(
 )
 
 smoke_bin="$native_dir/native_tp_gdn_smoke"
+tpdp_smoke_bin="$native_dir/native_tp_dp_smoke"
 bench_bin="$native_dir/native_tp_gdn_bench"
 smoke_source=crates/rustrain-qwen3-6/tests/native_tp_gdn_smoke.cpp
+tpdp_smoke_source=crates/rustrain-qwen3-6/tests/native_tp_dp_smoke.cpp
 bench_source=crates/rustrain-qwen3-6/tests/native_tp_gdn_bench.cpp
 if [[ ! -e "$smoke_bin" || "$smoke_source" -nt "$smoke_bin" || "$kernel_lib" -nt "$smoke_bin" ]]; then
     g++ "$smoke_source" -o "$smoke_bin" "${common_flags[@]}"
+fi
+if [[ ! -e "$tpdp_smoke_bin" || "$tpdp_smoke_source" -nt "$tpdp_smoke_bin" || "$kernel_lib" -nt "$tpdp_smoke_bin" ]]; then
+    g++ "$tpdp_smoke_source" -o "$tpdp_smoke_bin" "${common_flags[@]}"
 fi
 if [[ ! -e "$bench_bin" || "$bench_source" -nt "$bench_bin" || "$kernel_lib" -nt "$bench_bin" ]]; then
     g++ "$bench_source" -o "$bench_bin" "${common_flags[@]}"
@@ -181,6 +194,11 @@ case "$mode" in
     smoke)
         TP_SIZE=2 "$python_bin" -m torch.distributed.run --standalone \
             --nnodes=1 --nproc-per-node=2 --no-python "$smoke_bin"
+        ;;
+    tpdp-smoke)
+        TP_SIZE=2 DP_SIZE=2 RUSTRAIN_DATA_PARALLEL=1 \
+            "$python_bin" -m torch.distributed.run --standalone \
+            --nnodes=1 --nproc-per-node=4 --no-python "$tpdp_smoke_bin"
         ;;
     bench-single)
         BENCH_MODE=single WORLD_SIZE=1 RANK=0 LOCAL_RANK=0 "$bench_bin"

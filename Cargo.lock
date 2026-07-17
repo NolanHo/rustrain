@@ -2498,6 +2498,7 @@ dependencies = [
  "rustrain-checkpoint",
  "rustrain-core",
  "rustrain-ipc",
+ "rustrain-parallel",
  "rustrain-qwen3-6",
  "rustrain-train",
  "safetensors 0.8.0",

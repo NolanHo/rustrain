@@ -286,21 +286,20 @@ fn decode_int64_vec(t: &TensorHttp) -> Result<Vec<i64>, String> {
     Ok(values)
 }
 
-fn validate_multi_lora_http_shapes(
+fn validate_train_http_shapes(
     input_ids: &TensorHttp,
     target_mask: &TensorHttp,
     attention_mask: &TensorHttp,
-    n_total: i32,
-) -> Result<usize, String> {
-    if n_total <= 0 {
-        return Err(format!("n_total must be positive, got {n_total}"));
-    }
+) -> Result<(usize, usize), String> {
     if input_ids.shape.len() != 1 && input_ids.shape.len() != 2 {
-        return Err(format!("input_ids must have shape [seq] or [batch, seq], got {:?}", input_ids.shape));
+        return Err(format!(
+            "input_ids must have shape [seq] or [batch, seq], got {:?}",
+            input_ids.shape
+        ));
     }
     if target_mask.shape != input_ids.shape || attention_mask.shape != input_ids.shape {
         return Err(format!(
-            "multi-LoRA masks must have the same shape as input_ids: input={:?} target={:?} attention={:?}",
+            "masks must have the same shape as input_ids: input={:?} target={:?} attention={:?}",
             input_ids.shape, target_mask.shape, attention_mask.shape
         ));
     }
@@ -311,16 +310,37 @@ fn validate_multi_lora_http_shapes(
     if seq_len <= 0 {
         return Err(format!("sequence length must be positive, got {seq_len}"));
     }
-    if input_ids.shape.len() == 2 {
-        let batch = input_ids.shape[0];
-        if batch != 1 && batch != i64::from(n_total) {
-            return Err(format!(
-                "multi-LoRA batch must be 1 or n_total={}, got {}",
-                n_total, batch
-            ));
-        }
+    let batch_size = if input_ids.shape.len() == 2 {
+        input_ids.shape[0]
+    } else {
+        1
+    };
+    if batch_size <= 0 {
+        return Err(format!("batch size must be positive, got {batch_size}"));
     }
-    usize::try_from(seq_len).map_err(|_| format!("invalid sequence length {seq_len}"))
+    Ok((
+        usize::try_from(batch_size).map_err(|_| format!("invalid batch size {batch_size}"))?,
+        usize::try_from(seq_len).map_err(|_| format!("invalid sequence length {seq_len}"))?,
+    ))
+}
+
+fn validate_multi_lora_http_shapes(
+    input_ids: &TensorHttp,
+    target_mask: &TensorHttp,
+    attention_mask: &TensorHttp,
+    n_total: i32,
+) -> Result<(usize, usize), String> {
+    if n_total <= 0 {
+        return Err(format!("n_total must be positive, got {n_total}"));
+    }
+    let (batch_size, seq_len) = validate_train_http_shapes(input_ids, target_mask, attention_mask)?;
+    let n_total = n_total as usize;
+    if batch_size != 1 && batch_size % n_total != 0 {
+        return Err(format!(
+            "multi-LoRA batch must be 1 or a positive multiple of n_total={n_total}, got {batch_size}"
+        ));
+    }
+    Ok((batch_size, seq_len))
 }
 
 fn decode_tensor(t: &TensorHttp) -> Result<tch::Tensor, String> {
@@ -761,16 +781,19 @@ async fn ep_train_step(
     Path(id): Path<String>,
     Json(req): Json<TrainStepHttp>,
 ) -> Result<Json<TrainStepResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let (batch_size, seq_len) =
+        validate_train_http_shapes(&req.input_ids, &req.target_mask, &req.attention_mask)
+            .map_err(|e| err_resp(&e))?;
     let input_ids = decode_int64_vec(&req.input_ids).map_err(|e| err_resp(&e))?;
     let target_mask = decode_int64_vec(&req.target_mask).map_err(|e| err_resp(&e))?;
     let attention_mask = decode_int64_vec(&req.attention_mask).map_err(|e| err_resp(&e))?;
-    let seq_len = input_ids.len();
 
     let cmd = rustrain_ipc::EpCommand::TrainStep {
         session_id: id,
         input_ids,
         target_mask,
         attention_mask,
+        batch_size,
         seq_len,
     };
     match state.coordinator.dispatch(&cmd) {
@@ -812,7 +835,7 @@ async fn ep_train_multi_lora(
     let input_ids = decode_int64_vec(&req.input_ids).map_err(|e| err_resp(&e))?;
     let target_mask = decode_int64_vec(&req.target_mask).map_err(|e| err_resp(&e))?;
     let attention_mask = decode_int64_vec(&req.attention_mask).map_err(|e| err_resp(&e))?;
-    let seq_len = validate_multi_lora_http_shapes(
+    let (batch_size, seq_len) = validate_multi_lora_http_shapes(
         &req.input_ids,
         &req.target_mask,
         &req.attention_mask,
@@ -837,6 +860,7 @@ async fn ep_train_multi_lora(
         input_ids,
         target_mask,
         attention_mask,
+        batch_size,
         seq_len,
         n_total: req.n_total,
         lora_rank: req.lora_rank,
@@ -846,6 +870,67 @@ async fn ep_train_multi_lora(
         rustrain_ipc::EpResult::Loss(loss) => Ok(Json(TrainStepResponse { loss, step: 0 })),
         rustrain_ipc::EpResult::Error(e) => Err(err_resp(&e)),
         _ => Err(err_resp("unexpected result")),
+    }
+}
+
+#[cfg(test)]
+mod tensor_http_shape_tests {
+    use super::{TensorHttp, validate_multi_lora_http_shapes, validate_train_http_shapes};
+
+    fn tensor(shape: &[i64]) -> TensorHttp {
+        TensorHttp {
+            data: String::new(),
+            shape: shape.to_vec(),
+            dtype: "int64".into(),
+        }
+    }
+
+    #[test]
+    fn train_shape_keeps_batch_and_sequence_dimensions() {
+        let input = tensor(&[8, 128]);
+        let target = tensor(&[8, 128]);
+        let attention = tensor(&[8, 128]);
+
+        assert_eq!(
+            validate_train_http_shapes(&input, &target, &attention).unwrap(),
+            (8, 128)
+        );
+    }
+
+    #[test]
+    fn train_shape_rejects_mismatched_masks_and_non_positive_dimensions() {
+        let input = tensor(&[4, 16]);
+        assert!(validate_train_http_shapes(&input, &tensor(&[2, 16]), &tensor(&[4, 16])).is_err());
+        assert!(
+            validate_train_http_shapes(&tensor(&[0, 16]), &tensor(&[0, 16]), &tensor(&[0, 16]))
+                .is_err()
+        );
+        assert!(
+            validate_train_http_shapes(&tensor(&[4, 0]), &tensor(&[4, 0]), &tensor(&[4, 0]))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn multi_lora_shape_accepts_replica_and_global_row_layouts() {
+        for rows in [1, 3, 6] {
+            let input = tensor(&[rows, 32]);
+            assert_eq!(
+                validate_multi_lora_http_shapes(
+                    &input,
+                    &tensor(&[rows, 32]),
+                    &tensor(&[rows, 32]),
+                    3
+                )
+                .unwrap(),
+                (rows as usize, 32)
+            );
+        }
+        let invalid = tensor(&[5, 32]);
+        assert!(
+            validate_multi_lora_http_shapes(&invalid, &tensor(&[5, 32]), &tensor(&[5, 32]), 3)
+                .is_err()
+        );
     }
 }
 

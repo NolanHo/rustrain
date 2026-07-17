@@ -130,7 +130,7 @@ int main() {
         configs, 2, static_cast<int32_t>(at::kBFloat16),
         1.0, 1e-3, 0.9, 0.999, 1e-8, vocab, 1e-5, lora_rank,
         // This regression exercises latent-rank-only TP with replicated GDN
-        // base weights. ABI15 bit 0 now explicitly enables base GDN head TP.
+        // base weights. ABI16 bit 0 explicitly enables base GDN head TP.
         target_layers, 2, "in_proj_qkv", 0);
     assert(distributed && qwen36_init_nccl(distributed) == 0);
 

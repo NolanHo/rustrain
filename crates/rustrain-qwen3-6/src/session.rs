@@ -16,6 +16,7 @@ use crate::lora::{
 use crate::sft::SftDataset;
 use rustrain_checkpoint::safetensors::read_safetensors_dir_filtered;
 use rustrain_core::runtime::{Config, RunPaths};
+use rustrain_parallel::topology::{DEFAULT_RANK_ORDER, ParallelTopology};
 
 // ──────────────────────────────────────────────────────────────────────
 // EP Shard
@@ -278,6 +279,7 @@ fn train_impl(
     let tp_size = config.parallel.tensor_model_parallel_size;
     let env_tp_size = std::env::var("TP_SIZE")
         .or_else(|_| std::env::var("RUSTRAIN_TP_SIZE"))
+        .or_else(|_| std::env::var("TENSOR_MODEL_PARALLEL_SIZE"))
         .ok()
         .and_then(|s| s.parse::<usize>().ok())
         .unwrap_or(1);
@@ -286,39 +288,87 @@ fn train_impl(
             "TP_SIZE environment ({env_tp_size}) does not match config tensor_model_parallel_size ({tp_size})"
         );
     }
-    if tp_size > 1 {
-        if world_size != tp_size
-            || config.parallel.pipeline_model_parallel_size != 1
-            || config.parallel.data_parallel_size != 1
+    let configured_dp_size = std::env::var("DP_SIZE")
+        .or_else(|_| std::env::var("RUSTRAIN_DP_SIZE"))
+        .or_else(|_| std::env::var("DATA_PARALLEL_SIZE"))
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(config.parallel.data_parallel_size);
+    let dp_size = if !is_ep && configured_dp_size == 1 && world_size > tp_size {
+        world_size
+            .checked_div(tp_size)
+            .filter(|value| value * tp_size == world_size)
+            .ok_or_else(|| {
+                anyhow!("WORLD_SIZE={world_size} is not divisible by TP_SIZE={tp_size}")
+            })?
+    } else {
+        configured_dp_size
+    };
+    let rank_order = std::env::var("RUSTRAIN_PARALLEL_ORDER")
+        .or_else(|_| std::env::var("PARALLEL_ORDER"))
+        .unwrap_or_else(|_| DEFAULT_RANK_ORDER.to_string());
+    let dense_topology = if is_ep {
+        None
+    } else {
+        if config.parallel.pipeline_model_parallel_size != 1
             || config.parallel.expert_model_parallel_size != 1
             || config.parallel.context_parallel_size != 1
         {
             bail!(
-                "native Qwen LoRA currently supports TP-only topology: TP={} WORLD_SIZE={} PP={} DP={} EP={} CP={}",
+                "native dense Qwen LoRA supports TPxDP only: TP={} WORLD_SIZE={} PP={} DP={} EP={} CP={}",
                 tp_size,
                 world_size,
                 config.parallel.pipeline_model_parallel_size,
-                config.parallel.data_parallel_size,
+                dp_size,
                 config.parallel.expert_model_parallel_size,
                 config.parallel.context_parallel_size
             );
         }
+        Some(ParallelTopology::with_order(
+            tp_size,
+            1,
+            dp_size,
+            1,
+            1,
+            &rank_order,
+        )?)
+    };
+    if let Some(topology) = dense_topology.as_ref() {
+        topology.validate_world_size(world_size)?;
+        topology.coordinates(rank)?;
+    }
+    if tp_size > 1 {
         if lora_config.rank % tp_size as i64 != 0 {
             bail!(
                 "LoRA rank {} must be divisible by TP_SIZE={tp_size}",
                 lora_config.rank
             );
         }
-        unsafe {
-            std::env::set_var("TP_SIZE", tp_size.to_string());
-        }
     }
-    let is_data_parallel = !is_ep && world_size > 1 && tp_size == 1;
+    let is_data_parallel = !is_ep && dp_size > 1;
     if is_data_parallel && runtime_config.is_moe {
         bail!(
             "replicated Qwen data parallelism is only supported for dense/linear-attention models; use *_ep for MoE"
         );
     }
+    unsafe {
+        std::env::set_var("TP_SIZE", tp_size.to_string());
+        std::env::set_var("DP_SIZE", dp_size.to_string());
+        std::env::set_var(
+            "RUSTRAIN_DATA_PARALLEL",
+            if is_data_parallel { "1" } else { "0" },
+        );
+    }
+    let tp_rank = dense_topology
+        .as_ref()
+        .map(|topology| topology.tensor_rank(rank))
+        .transpose()?
+        .unwrap_or(0);
+    let dp_rank = dense_topology
+        .as_ref()
+        .map(|topology| topology.data_rank(rank))
+        .transpose()?
+        .unwrap_or(rank);
     if is_data_parallel || tp_size > 1 {
         crate::kernel::CppTrainingContext::set_cuda_device(
             std::env::var("LOCAL_RANK")
@@ -466,10 +516,7 @@ fn train_impl(
         for (name, tensor) in &weights {
             let local_shard = if base_tp_attention {
                 let full_attention_shard = crate::kernel::shard_full_attention_weight_for_tp(
-                    name,
-                    tensor,
-                    tp_size,
-                    rank % tp_size,
+                    name, tensor, tp_size, tp_rank,
                 )?;
                 let attention_shard = if full_attention_shard.is_some() {
                     full_attention_shard
@@ -478,7 +525,7 @@ fn train_impl(
                         name,
                         tensor,
                         tp_size,
-                        rank % tp_size,
+                        tp_rank,
                         runtime_config.linear_num_key_heads,
                         runtime_config.linear_key_head_dim,
                         runtime_config.linear_num_value_heads,
@@ -488,12 +535,7 @@ fn train_impl(
                 if attention_shard.is_some() || !base_tp_mlp {
                     attention_shard
                 } else {
-                    crate::kernel::shard_dense_mlp_weight_for_tp(
-                        name,
-                        tensor,
-                        tp_size,
-                        rank % tp_size,
-                    )?
+                    crate::kernel::shard_dense_mlp_weight_for_tp(name, tensor, tp_size, tp_rank)?
                 }
             } else {
                 None
@@ -508,7 +550,7 @@ fn train_impl(
         if base_tp_attention {
             info!(
                 tp_size,
-                tp_rank = rank % tp_size,
+                tp_rank,
                 base_tp_mlp,
                 "frozen base TP enabled: full-attention/GDN head shards and optional dense MLP shards"
             );
@@ -571,6 +613,7 @@ fn train_impl(
         lora_config.rank as i64,
         base_tp_attention,
         base_tp_mlp,
+        is_data_parallel,
         &lora_config.target_layers,
         &lora_config.target_modules,
         expert_start,
@@ -578,18 +621,25 @@ fn train_impl(
     )?;
 
     if world_size > 1 {
-        // Tell the native reducer whether this communicator is replicated DP
-        // or expert-parallel. EP already all-reduces routed activations and
-        // must not average replicated LoRA gradients a second time.
-        unsafe {
-            std::env::set_var(
-                "RUSTRAIN_DATA_PARALLEL",
-                if is_data_parallel { "1" } else { "0" },
-            );
-        }
-        let ret = ctx.init_nccl();
-        if ret != 0 {
-            bail!("C++ NCCL init failed (code {})", ret);
+        if let Some(topology) = dense_topology.as_ref() {
+            let tp_color = *topology
+                .tensor_group(rank)?
+                .iter()
+                .min()
+                .ok_or_else(|| anyhow!("empty TP process group"))?;
+            let dp_color = *topology
+                .data_group(rank)?
+                .iter()
+                .min()
+                .ok_or_else(|| anyhow!("empty DP process group"))?;
+            ctx.init_parallel_nccl(
+                rank, world_size, tp_rank, tp_size, tp_color, dp_rank, dp_size, dp_color,
+            )?;
+        } else {
+            let ret = ctx.init_nccl();
+            if ret != 0 {
+                bail!("C++ NCCL init failed (code {})", ret);
+            }
         }
         info!(
             rank,
@@ -623,7 +673,12 @@ fn train_impl(
         for accumulation_index in 0..gradient_accumulation_steps {
             let micro_step = step * gradient_accumulation_steps + accumulation_index;
             let data_start = if is_data_parallel || ep_a2a_sharded {
-                (micro_step * batch_size * world_size + rank * batch_size) % data.len()
+                let (replica_rank, replica_count) = if is_data_parallel {
+                    (dp_rank, dp_size)
+                } else {
+                    (rank, world_size)
+                };
+                (micro_step * batch_size * replica_count + replica_rank * batch_size) % data.len()
             } else {
                 (micro_step * batch_size) % data.len()
             };

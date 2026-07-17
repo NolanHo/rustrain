@@ -30,6 +30,7 @@
 #include <set>
 #include <array>
 #include <map>
+#include <limits>
 #include <sstream>
 #include <chrono>
 #include <sys/stat.h>
@@ -2032,6 +2033,149 @@ struct TrainingContext {
 // ──────────────────────────────────────────────────────────────────────
 };
 
+struct AdapterRegistryHash {
+    uint64_t first = 1469598103934665603ULL;
+    uint64_t second = 1099511628211ULL;
+
+    void add_u64(uint64_t value) {
+        first ^= value;
+        first *= 1099511628211ULL;
+        second ^= value + 0x9e3779b97f4a7c15ULL + (second << 6) +
+            (second >> 2);
+        second *= 0xbf58476d1ce4e5b9ULL;
+    }
+
+    void add_string(const std::string& value) {
+        add_u64(value.size());
+        for (const unsigned char byte : value) add_u64(byte);
+    }
+};
+
+static void hash_tensor_layout(
+    AdapterRegistryHash& hash, const at::Tensor& tensor
+) {
+    hash.add_u64(tensor.defined());
+    if (!tensor.defined()) return;
+    hash.add_u64(static_cast<uint64_t>(tensor.scalar_type()));
+    hash.add_u64(tensor.requires_grad());
+    hash.add_u64(tensor.dim());
+    for (const auto size : tensor.sizes()) hash.add_u64(size);
+}
+
+static void hash_adapter_layout(
+    AdapterRegistryHash& hash,
+    const TrainingContext::LoRAAdapter& adapter
+) {
+    hash.add_u64(adapter.id);
+    hash.add_u64(adapter.rank);
+    hash.add_u64(adapter.optimizer_step);
+    uint64_t alpha_bits = 0;
+    static_assert(sizeof(alpha_bits) == sizeof(adapter.alpha));
+    std::memcpy(&alpha_bits, &adapter.alpha, sizeof(alpha_bits));
+    hash.add_u64(alpha_bits);
+    hash.add_u64(adapter.target_layers.size());
+    for (const auto layer : adapter.target_layers) hash.add_u64(layer);
+    hash.add_u64(adapter.target_modules.size());
+    for (const auto& module : adapter.target_modules) hash.add_string(module);
+    hash.add_u64(adapter.params.size());
+    for (const auto& [layer, pairs] : adapter.params) {
+        hash.add_u64(layer);
+        hash.add_u64(pairs.size());
+        for (const auto& [a, b] : pairs) {
+            hash_tensor_layout(hash, a);
+            hash_tensor_layout(hash, b);
+        }
+    }
+}
+
+static void validate_adapter_collective_registry(
+    TrainingContext* ctx,
+    const int64_t* requested_ids,
+    int64_t requested_count,
+    int64_t requested_rank,
+    bool use_registered_order
+) {
+    if (!ctx || (!ctx->nccl_comm && !ctx->tp_comm)) return;
+
+    AdapterRegistryHash hash;
+    hash.add_u64(requested_count);
+    hash.add_u64(requested_rank);
+    hash.add_u64(use_registered_order);
+    int64_t found_count = 0;
+    if (use_registered_order) {
+        hash.add_u64(ctx->adapters.size());
+        for (const auto& adapter : ctx->adapters) {
+            hash_adapter_layout(hash, adapter);
+            ++found_count;
+        }
+    } else if (requested_ids && requested_count > 0) {
+        for (int64_t index = 0; index < requested_count; ++index) {
+            const int64_t requested_id = requested_ids[index];
+            hash.add_u64(requested_id);
+            const auto it = std::find_if(
+                ctx->adapters.begin(), ctx->adapters.end(),
+                [&](const auto& adapter) { return adapter.id == requested_id; });
+            if (it == ctx->adapters.end()) {
+                hash.add_u64(0x6d697373696e67ULL);
+                continue;
+            }
+            hash.add_u64(0x666f756e64ULL);
+            hash_adapter_layout(hash, *it);
+            ++found_count;
+        }
+    } else {
+        hash.add_u64(0x6e756c6cULL);
+    }
+
+    constexpr uint64_t kPositiveInt64Mask =
+        static_cast<uint64_t>(std::numeric_limits<int64_t>::max());
+    const std::vector<int64_t> signature_values{
+        requested_count,
+        requested_rank,
+        found_count,
+        static_cast<int64_t>(hash.first & kPositiveInt64Mask),
+        static_cast<int64_t>(hash.second & kPositiveInt64Mask),
+    };
+    c10::cuda::set_device(ctx->cuda_device);
+    cudaSetDevice(ctx->cuda_device);
+    auto options = at::TensorOptions().dtype(at::kLong).device(
+        at::kCUDA, ctx->cuda_device);
+    auto minimum = at::tensor(signature_values, options);
+    auto maximum = minimum.clone();
+    auto stream = c10::cuda::getCurrentCUDAStream(ctx->cuda_device).stream();
+
+    auto reduce_axis = [&](ncclComm_t communicator, const char* axis) {
+        if (!communicator) return;
+        auto err = ncclAllReduce(
+            minimum.data_ptr<int64_t>(), minimum.data_ptr<int64_t>(),
+            minimum.numel(), ncclInt64, ncclMin, communicator, stream);
+        TORCH_CHECK(err == ncclSuccess, axis,
+            " adapter registry minimum all-reduce failed: ",
+            ncclGetErrorString(err));
+        err = ncclAllReduce(
+            maximum.data_ptr<int64_t>(), maximum.data_ptr<int64_t>(),
+            maximum.numel(), ncclInt64, ncclMax, communicator, stream);
+        TORCH_CHECK(err == ncclSuccess, axis,
+            " adapter registry maximum all-reduce failed: ",
+            ncclGetErrorString(err));
+    };
+
+    // A reduction over one axis followed by the orthogonal axis propagates
+    // the extrema over the full TP x DP/EP grid.
+    reduce_axis(ctx->nccl_comm, "DP/EP");
+    reduce_axis(ctx->tp_comm, "TP");
+    const auto minimum_cpu = minimum.to(at::kCPU);
+    const auto maximum_cpu = maximum.to(at::kCPU);
+    const auto* minimum_data = minimum_cpu.data_ptr<int64_t>();
+    const auto* maximum_data = maximum_cpu.data_ptr<int64_t>();
+    for (int64_t index = 0; index < minimum.numel(); ++index) {
+        TORCH_CHECK(minimum_data[index] == maximum_data[index],
+            "dynamic LoRA adapter registry mismatch across distributed ranks; "
+            "all ranks must select the same ordered IDs, ranks, optimizer "
+            "clocks, targets, and tensor layouts");
+    }
+}
+
 static bool harvest_leaf_grad(
     at::Tensor& param, at::Tensor& fp32_accumulator
 ) {
@@ -2327,11 +2471,30 @@ static void tp_broadcast_lora_parameter(
         "NCCL LoRA parameter broadcast failed: ", ncclGetErrorString(err));
 }
 
+static void dp_broadcast_lora_parameter(
+    TrainingContext* ctx, at::Tensor& tensor
+) {
+    if (!ctx || !ctx->data_parallel || ctx->ep_world_size <= 1 ||
+        !tensor.defined()) return;
+    TORCH_CHECK(ctx->nccl_comm,
+        "LoRA DP communicator is not initialized for parameter broadcast");
+    TORCH_CHECK(tensor.is_cuda() && tensor.is_contiguous(),
+        "LoRA DP parameter broadcast requires a contiguous CUDA tensor");
+    const int dev = tensor.device().index();
+    cudaSetDevice(dev);
+    auto stream = c10::cuda::getCurrentCUDAStream(dev).stream();
+    auto err = ncclBroadcast(
+        tensor.data_ptr(), tensor.data_ptr(), tensor.numel(),
+        nccl_dtype_for(tensor), 0, ctx->nccl_comm, stream);
+    TORCH_CHECK(err == ncclSuccess,
+        "NCCL LoRA DP parameter broadcast failed: ", ncclGetErrorString(err));
+}
+
 static void synchronize_adapter_replicated_lora_parameters(
     TrainingContext* ctx, TrainingContext::LoRAAdapter& adapter);
 
 static void synchronize_fixed_replicated_lora_parameters(TrainingContext* ctx) {
-    if (!ctx || !ctx->base_tp_attention || ctx->tp_world_size <= 1) return;
+    if (!ctx) return;
     for (int64_t layer = 0; layer < ctx->num_layers; ++layer) {
         const int64_t offset = ctx->lora_layer_offset[layer];
         const int64_t pairs = lora_pair_count(ctx->layer_configs[layer]);
@@ -2339,10 +2502,14 @@ static void synchronize_fixed_replicated_lora_parameters(TrainingContext* ctx) {
             const int64_t slot = offset + pair;
             if (!legacy_lora_slot_active(ctx, slot)) continue;
             const auto layout = lora_tp_layout(ctx, layer, pair);
-            if (layout == LoraTpLayout::ColumnParallel)
+            if (ctx->base_tp_attention && ctx->tp_world_size > 1 &&
+                layout == LoraTpLayout::ColumnParallel)
                 tp_broadcast_lora_parameter(ctx, ctx->lora_a[slot]);
-            else if (layout == LoraTpLayout::RowParallel)
+            else if (ctx->base_tp_attention && ctx->tp_world_size > 1 &&
+                     layout == LoraTpLayout::RowParallel)
                 tp_broadcast_lora_parameter(ctx, ctx->lora_b[slot]);
+            dp_broadcast_lora_parameter(ctx, ctx->lora_a[slot]);
+            dp_broadcast_lora_parameter(ctx, ctx->lora_b[slot]);
         }
     }
     for (auto& adapter : ctx->adapters)
@@ -2352,17 +2519,24 @@ static void synchronize_fixed_replicated_lora_parameters(TrainingContext* ctx) {
 static void synchronize_adapter_replicated_lora_parameters(
     TrainingContext* ctx, TrainingContext::LoRAAdapter& adapter
 ) {
-    if (!ctx || !ctx->base_tp_attention || ctx->tp_world_size <= 1) return;
-    if (!ctx->tp_comm) return;  // qwen36_init_nccl synchronizes deferred adapters.
+    if (!ctx) return;
+    if (ctx->base_tp_attention && ctx->tp_world_size > 1 && !ctx->tp_comm)
+        return;  // qwen36_init_nccl synchronizes deferred adapters.
+    if (ctx->data_parallel && ctx->ep_world_size > 1 && !ctx->nccl_comm)
+        return;
     for (auto& [layer, pairs] : adapter.params) {
         for (int64_t pair = 0; pair < static_cast<int64_t>(pairs.size()); ++pair) {
             auto& [a, b] = pairs[pair];
             if (!a.requires_grad() && !b.requires_grad()) continue;
             const auto layout = lora_tp_layout(ctx, layer, pair);
-            if (layout == LoraTpLayout::ColumnParallel)
+            if (ctx->base_tp_attention && ctx->tp_world_size > 1 &&
+                layout == LoraTpLayout::ColumnParallel)
                 tp_broadcast_lora_parameter(ctx, a);
-            else if (layout == LoraTpLayout::RowParallel)
+            else if (ctx->base_tp_attention && ctx->tp_world_size > 1 &&
+                     layout == LoraTpLayout::RowParallel)
                 tp_broadcast_lora_parameter(ctx, b);
+            dp_broadcast_lora_parameter(ctx, a);
+            dp_broadcast_lora_parameter(ctx, b);
         }
     }
 }
@@ -4590,10 +4764,11 @@ static at::Tensor mtp_compute_loss(
 extern "C" {
 
 __attribute__((visibility("default"))) int64_t qwen36_kernel_abi_version() {
-    return 15;
+    return 16;
 }
 
 static constexpr int32_t QWEN36_CONTEXT_BASE_TP_ATTENTION = 1 << 0;
+static constexpr int32_t QWEN36_CONTEXT_DATA_PARALLEL = 1 << 1;
 
 // Create training context — called once at startup
 // lora_rank: LoRA rank (from config)
@@ -4630,29 +4805,50 @@ static void* qwen36_create_training_context_impl(
         const char* world_size_env = getenv("WORLD_SIZE");
         const int configured_world_size = world_size_env ? atoi(world_size_env) : 1;
         TORCH_CHECK(configured_world_size > 0, "WORLD_SIZE must be positive");
-        const bool data_parallel_requested = env_enabled("RUSTRAIN_DATA_PARALLEL");
+        const bool data_parallel_requested =
+            (context_flags & QWEN36_CONTEXT_DATA_PARALLEL) != 0 ||
+            env_enabled("RUSTRAIN_DATA_PARALLEL");
+        const char* dp_size_env = getenv("DP_SIZE");
+        if (!dp_size_env) dp_size_env = getenv("RUSTRAIN_DP_SIZE");
+        int configured_dp_size = dp_size_env ? atoi(dp_size_env) : 1;
+        if (data_parallel_requested && !dp_size_env &&
+            configured_world_size % ctx->tp_world_size == 0) {
+            configured_dp_size = configured_world_size / ctx->tp_world_size;
+        }
+        const char* ep_size_env = getenv("EP_SIZE");
+        if (!ep_size_env) ep_size_env = getenv("RUSTRAIN_EP_SIZE");
+        const int configured_ep_size = ep_size_env ? atoi(ep_size_env) : 1;
         const char* pp_size_env = getenv("PP_SIZE");
         if (!pp_size_env) pp_size_env = getenv("RUSTRAIN_PP_SIZE");
         const char* cp_size_env = getenv("CP_SIZE");
         if (!cp_size_env) cp_size_env = getenv("RUSTRAIN_CP_SIZE");
         const int configured_pp_size = pp_size_env ? atoi(pp_size_env) : 1;
         const int configured_cp_size = cp_size_env ? atoi(cp_size_env) : 1;
-        TORCH_CHECK(configured_pp_size > 0 && configured_cp_size > 0,
-            "PP_SIZE and CP_SIZE must be positive");
-        TORCH_CHECK(configured_pp_size == 1 && configured_cp_size == 1,
-            "native Qwen LoRA does not implement PP/CP yet; ",
+        TORCH_CHECK(configured_pp_size > 0 && configured_cp_size > 0 &&
+                    configured_dp_size > 0 && configured_ep_size > 0,
+            "PP_SIZE, CP_SIZE, DP_SIZE, and EP_SIZE must be positive");
+        TORCH_CHECK(configured_pp_size == 1 && configured_cp_size == 1 &&
+                    (!data_parallel_requested || configured_ep_size == 1),
+            "native Qwen LoRA does not implement PP/CP or mixed DP/EP yet; ",
             "PP_SIZE=", configured_pp_size, " CP_SIZE=", configured_cp_size);
-        TORCH_CHECK(
-            ctx->tp_world_size <= 1 ||
-                (!data_parallel_requested && configured_world_size == ctx->tp_world_size),
-            "native Qwen LoRA supports TP-only topology when TP_SIZE>1; "
-            "TP_SIZE=", ctx->tp_world_size, " WORLD_SIZE=", configured_world_size,
-            " DATA_PARALLEL=", data_parallel_requested ? 1 : 0,
-            " is an incompatible mixed TP/DP/EP topology");
-        ctx->ep_world_size = configured_world_size;
+        if (data_parallel_requested) {
+            TORCH_CHECK(
+                configured_world_size == ctx->tp_world_size * configured_dp_size,
+                "native Qwen LoRA requires WORLD_SIZE=TP_SIZE*DP_SIZE for dense DP; ",
+                "TP_SIZE=", ctx->tp_world_size, " DP_SIZE=", configured_dp_size,
+                " WORLD_SIZE=", configured_world_size);
+        } else if (ctx->tp_world_size > 1) {
+            TORCH_CHECK(configured_world_size == ctx->tp_world_size &&
+                        configured_ep_size == 1,
+                "native Qwen LoRA TP without DP requires WORLD_SIZE=TP_SIZE and EP_SIZE=1");
+        }
+        ctx->ep_world_size = data_parallel_requested
+            ? configured_dp_size : configured_world_size;
         ctx->data_parallel = data_parallel_requested;
         const char* rank_env = getenv("RANK");
         const int global_rank = rank_env ? atoi(rank_env) : 0;
+        ctx->ep_rank = data_parallel_requested
+            ? global_rank / ctx->tp_world_size : global_rank;
         ctx->tp_rank = global_rank % ctx->tp_world_size;
         TORCH_CHECK(lora_rank > 0 && lora_rank % ctx->tp_world_size == 0,
             "LoRA rank ", lora_rank, " must be divisible by TP_SIZE=",
@@ -5094,7 +5290,7 @@ __attribute__((visibility("default"))) double qwen36_train_micro_step(
         TORCH_CHECK(gradient_scale > 0.0 && std::isfinite(gradient_scale),
             "gradient_scale must be finite and positive");
         // Set CUDA device for EP
-        if (ctx->nccl_comm) {
+        if (ctx->nccl_comm || ctx->tp_comm) {
             c10::cuda::set_device(ctx->cuda_device);
             cudaSetDevice(ctx->cuda_device);
         }
@@ -5487,6 +5683,8 @@ __attribute__((visibility("default"))) double qwen36_train_multi_lora(
         auto& target_mask = *reinterpret_cast<at::Tensor*>(target_mask_ptr);
 
         int64_t total_adapters = (int64_t)ctx->adapters.size();
+        validate_adapter_collective_registry(
+            ctx, nullptr, n_total, lora_rank, true);
         if (total_adapters == 0) return -1.0;
         TORCH_CHECK(n_total > 0 && total_adapters == n_total,
             "n_total must equal the number of registered adapters (n_total=",
@@ -5564,40 +5762,42 @@ __attribute__((visibility("default"))) double qwen36_train_multi_lora(
             ~AdapterRegistryChunkGuard() { restore(); }
         };
 
-        // Compute N_max from available GPU memory. All workers must agree on
-        // the chunk schedule to keep later collectives in the same order, so
-        // rank 0 publishes its value through the existing communicator.
+        // Compute N_max from available GPU memory. All workers in the TP x DP
+        // grid must agree on the chunk schedule to keep collectives ordered.
         size_t free_mem, total_mem;
         cudaMemGetInfo(&free_mem, &total_mem);
         int64_t n_max = 0;
-        if (ctx->nccl_comm && ctx->ep_world_size > 1) {
-            if (ctx->ep_rank == 0) {
-                n_max = compute_n_max(
-                    (int64_t)free_mem, lora_rank,
-                    input_ids.size(-1), 2048,
-                    ctx->group_size, ctx->num_layers
-                );
-                n_max = std::min(n_max, total_adapters);
-                if (n_max < 1) n_max = 1;
-            }
+        n_max = compute_n_max(
+            (int64_t)free_mem, lora_rank,
+            input_ids.size(-1), 2048,
+            ctx->group_size, ctx->num_layers
+        );
+        n_max = std::min(n_max, total_adapters);
+        if (n_max < 1) n_max = 1;
+        if ((ctx->nccl_comm && ctx->ep_world_size > 1) ||
+            (ctx->tp_comm && ctx->tp_world_size > 1)) {
             auto published_n_max = at::full(
                 {1}, n_max, input_ids.options().dtype(at::kLong));
             auto stream = c10::cuda::getCurrentCUDAStream(
                 input_ids.device().index()).stream();
-            auto err = ncclBroadcast(
-                published_n_max.data_ptr<int64_t>(),
-                published_n_max.data_ptr<int64_t>(), 1, ncclInt64, 0,
-                reinterpret_cast<ncclComm_t>(ctx->nccl_comm), stream);
-            TORCH_CHECK(err == ncclSuccess, "n_max broadcast failed: ",
-                ncclGetErrorString(err));
+            if (ctx->nccl_comm && ctx->ep_world_size > 1) {
+                auto err = ncclAllReduce(
+                    published_n_max.data_ptr<int64_t>(),
+                    published_n_max.data_ptr<int64_t>(), 1, ncclInt64, ncclMin,
+                    reinterpret_cast<ncclComm_t>(ctx->nccl_comm), stream);
+                TORCH_CHECK(err == ncclSuccess, "DP/EP n_max all-reduce failed: ",
+                    ncclGetErrorString(err));
+            }
+            if (ctx->tp_comm && ctx->tp_world_size > 1) {
+                auto err = ncclAllReduce(
+                    published_n_max.data_ptr<int64_t>(),
+                    published_n_max.data_ptr<int64_t>(), 1, ncclInt64, ncclMin,
+                    reinterpret_cast<ncclComm_t>(ctx->tp_comm), stream);
+                TORCH_CHECK(err == ncclSuccess, "TP n_max all-reduce failed: ",
+                    ncclGetErrorString(err));
+            }
             n_max = published_n_max.to(
                 at::TensorOptions().device(at::kCPU)).item<int64_t>();
-        } else {
-            n_max = compute_n_max(
-                (int64_t)free_mem, lora_rank,
-                input_ids.size(-1), 2048,
-                ctx->group_size, ctx->num_layers
-            );
         }
         n_max = std::min(n_max, total_adapters);
         if (n_max < 1) n_max = 1;
@@ -5895,7 +6095,13 @@ __attribute__((visibility("default"))) double qwen36_train_multi_lora_selected(
         registry_detached = false;
     };
     try {
-        TORCH_CHECK(ctx && adapter_ids && n_adapters > 0,
+        TORCH_CHECK(ctx,
+            "selected multi-LoRA requires a valid training context");
+        TORCH_CHECK(!ctx->topology_invalid,
+            "native Qwen context rejected an incompatible TP/DP/EP topology");
+        validate_adapter_collective_registry(
+            ctx, adapter_ids, n_adapters, lora_rank, false);
+        TORCH_CHECK(adapter_ids && n_adapters > 0,
             "selected multi-LoRA requires at least one adapter ID");
         const auto original_count = ctx->adapters.size();
         original.reserve(original_count);
@@ -5944,7 +6150,46 @@ static ncclComm_t g_nccl_comm = nullptr;
 static cudaStream_t g_nccl_stream = nullptr;
 static ncclComm_t g_tp_comm = nullptr;
 static cudaStream_t g_tp_stream = nullptr;
+static ncclComm_t g_dp_comm = nullptr;
+static cudaStream_t g_dp_stream = nullptr;
 static bool g_nccl_initialized = false;
+static bool g_nccl_cleanup_registered = false;
+static int g_parallel_rank = 0;
+static int g_parallel_world_size = 1;
+static int g_parallel_tp_rank = 0;
+static int g_parallel_tp_size = 1;
+static int g_parallel_tp_color = 0;
+static int g_parallel_dp_rank = 0;
+static int g_parallel_dp_size = 1;
+static int g_parallel_dp_color = 0;
+static bool g_parallel_data_parallel = false;
+
+static void qwen36_destroy_process_communicators() {
+    if (g_dp_comm) ncclCommDestroy(g_dp_comm);
+    if (g_tp_comm) ncclCommDestroy(g_tp_comm);
+    if (g_nccl_comm) ncclCommDestroy(g_nccl_comm);
+    g_dp_comm = nullptr;
+    g_tp_comm = nullptr;
+    g_nccl_comm = nullptr;
+    g_nccl_initialized = false;
+}
+
+static bool same_cached_parallel_topology(
+    int rank, int world_size,
+    int tp_rank, int tp_size, int tp_color,
+    int dp_rank, int dp_size, int dp_color,
+    bool data_parallel
+) {
+    return g_parallel_rank == rank &&
+        g_parallel_world_size == world_size &&
+        g_parallel_tp_rank == tp_rank &&
+        g_parallel_tp_size == tp_size &&
+        g_parallel_tp_color == tp_color &&
+        g_parallel_dp_rank == dp_rank &&
+        g_parallel_dp_size == dp_size &&
+        g_parallel_dp_color == dp_color &&
+        g_parallel_data_parallel == data_parallel;
+}
 static int g_cuda_device = 0;
 
 // Set CUDA device — called from Rust worker before any GPU operation.
@@ -5962,79 +6207,67 @@ __attribute__((visibility("default"))) void qwen36_set_cuda_device(int32_t devic
     dummy.sizes();  // touch to ensure materialization
 }
 
-__attribute__((visibility("default"))) int32_t qwen36_init_nccl(
-    void* ctx_ptr
+static int32_t qwen36_init_parallel_nccl_impl(
+    void* ctx_ptr,
+    int rank, int world_size,
+    int tp_rank, int tp_size, int tp_color,
+    int dp_rank, int dp_size, int dp_color,
+    bool data_parallel
 ) {
     auto* ctx = reinterpret_cast<TrainingContext*>(ctx_ptr);
 
+    if (rank < 0 || rank >= world_size || world_size <= 0 ||
+        tp_rank < 0 || tp_rank >= tp_size || tp_size <= 0 || tp_color < 0 ||
+        dp_rank < 0 || dp_rank >= dp_size || dp_size <= 0 || dp_color < 0 ||
+        (data_parallel && world_size != tp_size * dp_size) ||
+        (!data_parallel && tp_size > 1 && world_size != tp_size)) {
+        ctx->topology_invalid = true;
+        fprintf(stderr,
+            "[parallel_nccl] invalid topology: rank=%d world=%d tp=%d/%d color=%d "
+            "dp=%d/%d color=%d data_parallel=%d\n",
+            rank, world_size, tp_rank, tp_size, tp_color,
+            dp_rank, dp_size, dp_color, data_parallel ? 1 : 0);
+        return -1;
+    }
+
     // If already initialized, just set the pointer on this context
     if (g_nccl_initialized) {
-        ctx->nccl_comm = g_nccl_comm;
-        ctx->nccl_stream = g_nccl_stream;
-        ctx->data_parallel = env_enabled("RUSTRAIN_DATA_PARALLEL");
-        // CRITICAL: also set ep_rank/ep_world_size — needed for new TrainingContext
-        // created by subsequent CreateSession commands. The fast path previously
-        // skipped this, leaving ep_rank=0 → cudaSetDevice(0) on all ranks → crash.
-        const char* rank_str2 = getenv("RANK");
-        const char* world_str2 = getenv("WORLD_SIZE");
-        if (rank_str2) ctx->ep_rank = atoi(rank_str2);
-        if (world_str2) ctx->ep_world_size = atoi(world_str2);
-        const char* local_rank_str2 = getenv("LOCAL_RANK");
-        ctx->cuda_device = local_rank_str2 ? atoi(local_rank_str2) : g_cuda_device;
-        const char* tp_size_str2 = getenv("TP_SIZE");
-        if (!tp_size_str2) tp_size_str2 = getenv("RUSTRAIN_TP_SIZE");
-        ctx->tp_world_size = tp_size_str2 ? atoi(tp_size_str2) : 1;
-        ctx->tp_rank = ctx->tp_world_size > 0
-            ? ctx->ep_rank % ctx->tp_world_size : 0;
-        if (ctx->tp_world_size <= 0 ||
-            (ctx->tp_world_size > 1 &&
-                (ctx->data_parallel || ctx->ep_world_size != ctx->tp_world_size))) {
+        if (!same_cached_parallel_topology(
+                rank, world_size, tp_rank, tp_size, tp_color,
+                dp_rank, dp_size, dp_color, data_parallel)) {
             ctx->topology_invalid = true;
             fprintf(stderr,
-                "[tp_nccl] reject mixed topology: TP_SIZE=%d WORLD_SIZE=%d DATA_PARALLEL=%d\n",
-                ctx->tp_world_size, ctx->ep_world_size, ctx->data_parallel ? 1 : 0);
+                "[parallel_nccl] process communicator topology cannot change after initialization\n");
             return -1;
         }
+        ctx->data_parallel = data_parallel;
+        ctx->ep_rank = data_parallel ? dp_rank : rank;
+        ctx->ep_world_size = data_parallel ? dp_size : world_size;
+        const char* local_rank_str2 = getenv("LOCAL_RANK");
+        ctx->cuda_device = local_rank_str2 ? atoi(local_rank_str2) : g_cuda_device;
+        ctx->tp_world_size = tp_size;
+        ctx->tp_rank = tp_rank;
         ctx->topology_invalid = false;
-        ctx->tp_comm = ctx->tp_world_size > 1 ? g_tp_comm : nullptr;
-        ctx->tp_stream = ctx->tp_world_size > 1 ? g_tp_stream : nullptr;
-        // In TP-only mode the parent communicator is reserved for the TP
-        // split; EP layer collectives must remain disabled on replicated MoE.
-        if (ctx->tp_world_size <= 1) {
-            void* layer_comm = ctx->data_parallel
-                ? nullptr : (void*)g_nccl_comm;
-            void* layer_stream = ctx->data_parallel
-                ? nullptr : (void*)g_nccl_stream;
-            for (auto& lc : ctx->layer_configs) {
-                lc.nccl_comm = layer_comm;
-                lc.nccl_stream = layer_stream;
-            }
-            for (auto& lc : ctx->mtp_layer_configs) {
-                lc.nccl_comm = layer_comm;
-                lc.nccl_stream = layer_stream;
-            }
+        ctx->tp_comm = tp_size > 1 ? g_tp_comm : nullptr;
+        ctx->tp_stream = tp_size > 1 ? g_tp_stream : nullptr;
+        ctx->nccl_comm = data_parallel
+            ? (dp_size > 1 ? g_dp_comm : nullptr)
+            : (tp_size > 1 ? nullptr : g_nccl_comm);
+        ctx->nccl_stream = data_parallel ? g_dp_stream : g_nccl_stream;
+        void* layer_comm = !data_parallel && tp_size <= 1
+            ? (void*)g_nccl_comm : nullptr;
+        void* layer_stream = !data_parallel && tp_size <= 1
+            ? (void*)g_nccl_stream : nullptr;
+        for (auto& lc : ctx->layer_configs) {
+            lc.nccl_comm = layer_comm;
+            lc.nccl_stream = layer_stream;
+        }
+        for (auto& lc : ctx->mtp_layer_configs) {
+            lc.nccl_comm = layer_comm;
+            lc.nccl_stream = layer_stream;
         }
         synchronize_fixed_replicated_lora_parameters(ctx);
         return 0;
-    }
-
-    const char* rank_str = getenv("RANK");
-    const char* world_str = getenv("WORLD_SIZE");
-    if (!rank_str || !world_str) return -1;
-    int rank = atoi(rank_str);
-    int world_size = atoi(world_str);
-    const char* tp_size_str = getenv("TP_SIZE");
-    if (!tp_size_str) tp_size_str = getenv("RUSTRAIN_TP_SIZE");
-    const int configured_tp_size = tp_size_str ? atoi(tp_size_str) : 1;
-    const bool data_parallel_requested = env_enabled("RUSTRAIN_DATA_PARALLEL");
-    if (configured_tp_size <= 0 ||
-        (configured_tp_size > 1 &&
-            (data_parallel_requested || world_size != configured_tp_size))) {
-        ctx->topology_invalid = true;
-        fprintf(stderr,
-            "[tp_nccl] reject mixed topology: TP_SIZE=%d WORLD_SIZE=%d DATA_PARALLEL=%d\n",
-            configured_tp_size, world_size, data_parallel_requested ? 1 : 0);
-        return -1;
     }
     if (world_size <= 1) return 0;  // no EP needed
 
@@ -6134,54 +6367,118 @@ __attribute__((visibility("default"))) int32_t qwen36_init_nccl(
     // Store as process-level singleton
     g_nccl_comm = comm;
     g_nccl_stream = nccl_stream;
-    const int tp_size = tp_size_str ? atoi(tp_size_str) : 1;
     if (tp_size <= 0 || world_size % tp_size != 0) {
         fprintf(stderr, "[tp_nccl] invalid TP_SIZE=%d for WORLD_SIZE=%d\n",
             tp_size, world_size);
         return -1;
     }
     if (tp_size > 1) {
-        // The default rank order makes TP the least-significant axis. A
-        // future multi-axis implementation must pass an explicit color/key
-        // mapping instead of reusing this world-rank split.
         ncclResult_t tp_err = ncclCommSplit(
-            comm, rank / tp_size, rank % tp_size, &g_tp_comm, nullptr);
+            comm, tp_color, tp_rank, &g_tp_comm, nullptr);
         if (tp_err != ncclSuccess) {
             fprintf(stderr, "[tp_nccl] ncclCommSplit failed: %d (%s)\n",
                 tp_err, ncclGetErrorString(tp_err));
+            ncclCommDestroy(comm);
+            g_nccl_comm = nullptr;
             return -1;
         }
         g_tp_stream = nccl_stream;
     }
+    if (data_parallel && dp_size > 1) {
+        ncclResult_t dp_err = ncclCommSplit(
+            comm, dp_color, dp_rank, &g_dp_comm, nullptr);
+        if (dp_err != ncclSuccess) {
+            fprintf(stderr, "[dp_nccl] ncclCommSplit failed: %d (%s)\n",
+                dp_err, ncclGetErrorString(dp_err));
+            if (g_tp_comm) ncclCommDestroy(g_tp_comm);
+            ncclCommDestroy(comm);
+            g_tp_comm = nullptr;
+            g_nccl_comm = nullptr;
+            return -1;
+        }
+        g_dp_stream = nccl_stream;
+    }
+    g_parallel_rank = rank;
+    g_parallel_world_size = world_size;
+    g_parallel_tp_rank = tp_rank;
+    g_parallel_tp_size = tp_size;
+    g_parallel_tp_color = tp_color;
+    g_parallel_dp_rank = dp_rank;
+    g_parallel_dp_size = dp_size;
+    g_parallel_dp_color = dp_color;
+    g_parallel_data_parallel = data_parallel;
     g_nccl_initialized = true;
+    if (!g_nccl_cleanup_registered) {
+        std::atexit(qwen36_destroy_process_communicators);
+        g_nccl_cleanup_registered = true;
+    }
 
-    ctx->nccl_comm = comm;
-    ctx->nccl_stream = nccl_stream;
-    ctx->ep_rank = rank;
-    ctx->ep_world_size = world_size;
-    ctx->data_parallel = env_enabled("RUSTRAIN_DATA_PARALLEL");
+    ctx->nccl_comm = data_parallel
+        ? (dp_size > 1 ? g_dp_comm : nullptr)
+        : (tp_size > 1 ? nullptr : comm);
+    ctx->nccl_stream = data_parallel ? g_dp_stream : nccl_stream;
+    ctx->ep_rank = data_parallel ? dp_rank : rank;
+    ctx->ep_world_size = data_parallel ? dp_size : world_size;
+    ctx->data_parallel = data_parallel;
     ctx->tp_world_size = tp_size;
-    ctx->tp_rank = rank % tp_size;
+    ctx->tp_rank = tp_rank;
     ctx->tp_comm = tp_size > 1 ? g_tp_comm : nullptr;
     ctx->tp_stream = tp_size > 1 ? g_tp_stream : nullptr;
 
     // Propagate to layer configs
-    if (tp_size <= 1) {
-        void* layer_comm = ctx->data_parallel ? nullptr : (void*)comm;
-        void* layer_stream = ctx->data_parallel
-            ? nullptr : (void*)nccl_stream;
-        for (auto& lc : ctx->layer_configs) {
-            lc.nccl_comm = layer_comm;
-            lc.nccl_stream = layer_stream;
-        }
-        for (auto& lc : ctx->mtp_layer_configs) {
-            lc.nccl_comm = layer_comm;
-            lc.nccl_stream = layer_stream;
-        }
+    void* layer_comm = !data_parallel && tp_size <= 1
+        ? (void*)comm : nullptr;
+    void* layer_stream = !data_parallel && tp_size <= 1
+        ? (void*)nccl_stream : nullptr;
+    for (auto& lc : ctx->layer_configs) {
+        lc.nccl_comm = layer_comm;
+        lc.nccl_stream = layer_stream;
+    }
+    for (auto& lc : ctx->mtp_layer_configs) {
+        lc.nccl_comm = layer_comm;
+        lc.nccl_stream = layer_stream;
     }
 
     synchronize_fixed_replicated_lora_parameters(ctx);
     return 0;
+}
+
+__attribute__((visibility("default"))) int32_t qwen36_init_parallel_nccl(
+    void* ctx_ptr,
+    int32_t rank, int32_t world_size,
+    int32_t tp_rank, int32_t tp_size, int32_t tp_color,
+    int32_t dp_rank, int32_t dp_size, int32_t dp_color
+) {
+    return qwen36_init_parallel_nccl_impl(
+        ctx_ptr, rank, world_size,
+        tp_rank, tp_size, tp_color,
+        dp_rank, dp_size, dp_color,
+        dp_size > 1);
+}
+
+__attribute__((visibility("default"))) int32_t qwen36_init_nccl(
+    void* ctx_ptr
+) {
+    const char* rank_str = getenv("RANK");
+    const char* world_str = getenv("WORLD_SIZE");
+    if (!rank_str || !world_str) return -1;
+    const int rank = atoi(rank_str);
+    const int world_size = atoi(world_str);
+    const char* tp_size_str = getenv("TP_SIZE");
+    if (!tp_size_str) tp_size_str = getenv("RUSTRAIN_TP_SIZE");
+    const int tp_size = tp_size_str ? atoi(tp_size_str) : 1;
+    const bool data_parallel = env_enabled("RUSTRAIN_DATA_PARALLEL");
+    const char* dp_size_str = getenv("DP_SIZE");
+    if (!dp_size_str) dp_size_str = getenv("RUSTRAIN_DP_SIZE");
+    const int dp_size = dp_size_str
+        ? atoi(dp_size_str)
+        : (data_parallel && tp_size > 0 ? world_size / tp_size : 1);
+    const int tp_rank = tp_size > 0 ? rank % tp_size : 0;
+    const int dp_rank = data_parallel && tp_size > 0 ? rank / tp_size : 0;
+    return qwen36_init_parallel_nccl_impl(
+        ctx_ptr, rank, world_size,
+        tp_rank, tp_size, rank / std::max(tp_size, 1),
+        dp_rank, dp_size, tp_rank, data_parallel);
 }
 
 // Set NCCL communicator for Expert Parallel all-reduce (legacy, from Rust)

@@ -481,6 +481,23 @@ mod tests {
     }
 
     #[test]
+    fn tp2_dp2_builds_orthogonal_groups_for_every_rank() {
+        let topology = ParallelTopology::new(2, 1, 2, 1, 1).unwrap();
+        let expected = [
+            (0, 0, vec![0, 1], vec![0, 2]),
+            (1, 0, vec![0, 1], vec![1, 3]),
+            (0, 1, vec![2, 3], vec![0, 2]),
+            (1, 1, vec![2, 3], vec![1, 3]),
+        ];
+        for (rank, (tp_rank, dp_rank, tp_group, dp_group)) in expected.into_iter().enumerate() {
+            assert_eq!(topology.tensor_rank(rank).unwrap(), tp_rank);
+            assert_eq!(topology.data_rank(rank).unwrap(), dp_rank);
+            assert_eq!(topology.tensor_group(rank).unwrap(), tp_group);
+            assert_eq!(topology.data_group(rank).unwrap(), dp_group);
+        }
+    }
+
+    #[test]
     fn five_dimensional_default_order_matches_orthogonal_mapping() {
         let topology = ParallelTopology::new(2, 2, 2, 2, 2).unwrap();
         let coordinates = RankCoordinates {
