@@ -2576,16 +2576,76 @@ static bool adapter_collective_all_succeeded(
 }
 
 static void require_clear_accumulation_for_registry_mutation(
-    TrainingContext* ctx, bool collective
+    TrainingContext* ctx
 ) {
     const bool local_clear = ctx && !ctx->accumulation_active &&
         ctx->accumulated_token_weight == 0.0;
-    const bool globally_clear = collective
-        ? adapter_collective_all_succeeded(ctx, local_clear)
-        : local_clear;
-    TORCH_CHECK(globally_clear && local_clear,
+    TORCH_CHECK(local_clear,
         "cannot mutate the dynamic LoRA registry while a gradient "
         "accumulation window is pending; finalize or abort it first");
+}
+
+static bool adapter_registration_phase_matches(
+    TrainingContext* ctx,
+    const TrainingContext::LoRAAdapter& candidate,
+    bool local_ready,
+    uint64_t phase
+) {
+    if (!ctx || (!ctx->nccl_comm && !ctx->dp_comm && !ctx->tp_comm))
+        return local_ready;
+
+    AdapterRegistryHash hash;
+    hash_collective_topology(hash, ctx);
+    hash.add_u64(phase);
+    hash.add_u64(ctx->restore_without_parameter_sync);
+    hash.add_u64(ctx->allow_heterogeneous_registration);
+    hash.add_u64(ctx->next_adapter_id);
+    hash.add_u64(ctx->adapters.size());
+    for (const auto& adapter : ctx->adapters)
+        hash_adapter_layout(hash, adapter);
+    hash_adapter_layout(hash, candidate);
+
+    constexpr uint64_t kPositiveInt64Mask =
+        static_cast<uint64_t>(std::numeric_limits<int64_t>::max());
+    const std::vector<int64_t> signature_values{
+        local_ready ? 1 : 0,
+        static_cast<int64_t>(hash.first & kPositiveInt64Mask),
+        static_cast<int64_t>(hash.second & kPositiveInt64Mask),
+    };
+    c10::cuda::set_device(ctx->cuda_device);
+    cudaSetDevice(ctx->cuda_device);
+    auto options = at::TensorOptions().dtype(at::kLong).device(
+        at::kCUDA, ctx->cuda_device);
+    auto minimum = at::tensor(signature_values, options);
+    auto maximum = minimum.clone();
+    auto stream = c10::cuda::getCurrentCUDAStream(ctx->cuda_device).stream();
+    auto reduce_axis = [&](ncclComm_t communicator, const char* axis) {
+        if (!communicator) return;
+        auto err = ncclAllReduce(
+            minimum.data_ptr<int64_t>(), minimum.data_ptr<int64_t>(),
+            minimum.numel(), ncclInt64, ncclMin, communicator, stream);
+        TORCH_CHECK(err == ncclSuccess, axis,
+            " adapter registration minimum all-reduce failed: ",
+            ncclGetErrorString(err));
+        err = ncclAllReduce(
+            maximum.data_ptr<int64_t>(), maximum.data_ptr<int64_t>(),
+            maximum.numel(), ncclInt64, ncclMax, communicator, stream);
+        TORCH_CHECK(err == ncclSuccess, axis,
+            " adapter registration maximum all-reduce failed: ",
+            ncclGetErrorString(err));
+    };
+    reduce_axis(ctx->nccl_comm, "EP");
+    reduce_axis(ctx->dp_comm, "DP");
+    reduce_axis(ctx->tp_comm, "TP");
+
+    const auto minimum_cpu = minimum.to(at::kCPU);
+    const auto maximum_cpu = maximum.to(at::kCPU);
+    const auto* minimum_data = minimum_cpu.data_ptr<int64_t>();
+    const auto* maximum_data = maximum_cpu.data_ptr<int64_t>();
+    for (int64_t index = 0; index < minimum.numel(); ++index) {
+        if (minimum_data[index] != maximum_data[index]) return false;
+    }
+    return minimum_data[0] == 1;
 }
 
 static bool supported_mask_dtype(const at::Tensor& tensor) {
@@ -8613,163 +8673,238 @@ int64_t qwen36_add_lora(
     try {
         auto* ctx = reinterpret_cast<TrainingContext*>(ctx_ptr);
         TORCH_CHECK(ctx, "dynamic LoRA registration requires a context");
-        require_clear_accumulation_for_registry_mutation(
-            ctx, /*collective=*/true);
-        TORCH_CHECK(rank > 0, "LoRA rank must be positive");
-        TORCH_CHECK(alpha > 0.0, "LoRA alpha must be positive");
-        TrainingContext::LoRAAdapter adapter;
-        adapter.id = ++ctx->next_adapter_id;
-        adapter.rank = rank;
-        adapter.alpha = alpha;
-        if (target_layers && num_target_layers > 0) {
+        TrainingContext::LoRAAdapter adapter{};
+        int64_t local_rank = 0;
+        std::string request_error;
+        try {
+            TORCH_CHECK(!ctx->topology_invalid,
+                "native Qwen context rejected an incompatible distributed "
+                "topology");
+            TORCH_CHECK(!ctx->accumulation_active &&
+                    ctx->accumulated_token_weight == 0.0,
+                "cannot mutate the dynamic LoRA registry while a gradient "
+                "accumulation window is pending; finalize or abort it first");
+            TORCH_CHECK(rank > 0, "LoRA rank must be positive");
+            TORCH_CHECK(std::isfinite(alpha) && alpha > 0.0,
+                "LoRA alpha must be finite and positive");
+            TORCH_CHECK(num_target_layers >= 0 &&
+                    (num_target_layers == 0 || target_layers),
+                "dynamic LoRA target layer list is invalid");
+            TORCH_CHECK(ctx->next_adapter_id <
+                    std::numeric_limits<int64_t>::max(),
+                "dynamic LoRA adapter ID space is exhausted");
+            adapter.id = ctx->next_adapter_id + 1;
+            adapter.rank = rank;
+            adapter.alpha = alpha;
             for (int64_t i = 0; i < num_target_layers; i++)
                 adapter.target_layers.insert(target_layers[i]);
-        }
-        if (target_modules_str) {
-            std::string s(target_modules_str);
-            std::stringstream ss(s);
-            std::string item;
-            while (std::getline(ss, item, ','))
-                adapter.target_modules.insert(item);
-        }
-        for (auto layer : adapter.target_layers) {
-            TORCH_CHECK(layer >= 0 && layer < ctx->num_layers,
-                "dynamic LoRA target layer out of range: ", layer,
-                " for model with ", ctx->num_layers, " layers");
-        }
-        // The activation-level batch path stacks A/B across adapters. Keep
-        // the batch rectangular and semantically aligned instead of waiting
-        // for an opaque ATen stack/shape failure during the first step. A
-        // restore context hydrates each adapter independently and may contain
-        // heterogeneous signatures before the grouped v2 trainer is enabled.
-        if (!ctx->adapters.empty() && !ctx->restore_without_parameter_sync &&
-            !ctx->allow_heterogeneous_registration) {
-            const auto& reference = ctx->adapters.front();
-            TORCH_CHECK(rank == reference.rank,
-                "dynamic LoRA adapters in one batch must use the same rank");
-            TORCH_CHECK(adapter.target_layers == reference.target_layers,
-                "dynamic LoRA adapters in one batch must use identical target_layers");
-            TORCH_CHECK(adapter.target_modules == reference.target_modules,
-                "dynamic LoRA adapters in one batch must use identical target_modules");
-        }
-        for (const auto& name : adapter.target_modules) {
-            TORCH_CHECK(
-                name == "q_proj" || name == "k_proj" || name == "v_proj" ||
-                name == "o_proj" || name == "in_proj_qkv" ||
-                name == "in_proj_z" || name == "in_proj_a" ||
-                name == "in_proj_b" || name == "out_proj" ||
-                name == "gate_proj" || name == "up_proj" ||
-                name == "down_proj" || name == "shared_gate_proj" ||
-                name == "shared_up_proj" || name == "shared_down_proj" ||
-                name == "experts_gate_up_proj" || name == "experts_down_proj",
-                "unsupported dynamic Qwen LoRA target module: ", name);
-            bool resolved = false;
-            for (const auto& layer_cfg : ctx->layer_configs) {
-                auto table = lora_projection_table(layer_cfg);
-                for (int64_t pair = 0; pair < table.count; ++pair) {
-                    if (name == table.entries[pair].name) {
-                        resolved = true;
-                        break;
-                    }
-                }
-                if (resolved) break;
+            if (target_modules_str) {
+                std::string s(target_modules_str);
+                std::stringstream ss(s);
+                std::string item;
+                while (std::getline(ss, item, ','))
+                    adapter.target_modules.insert(item);
             }
-            TORCH_CHECK(resolved,
-                "dynamic LoRA target module does not exist in this model: ", name);
+            for (auto layer : adapter.target_layers) {
+                TORCH_CHECK(layer >= 0 && layer < ctx->num_layers,
+                    "dynamic LoRA target layer out of range: ", layer,
+                    " for model with ", ctx->num_layers, " layers");
+            }
+            // The activation-level batch path stacks A/B across adapters.
+            // Keep the batch rectangular and semantically aligned instead of
+            // waiting for an opaque stack failure during the first step.
+            if (!ctx->adapters.empty() &&
+                !ctx->restore_without_parameter_sync &&
+                !ctx->allow_heterogeneous_registration) {
+                const auto& reference = ctx->adapters.front();
+                TORCH_CHECK(rank == reference.rank,
+                    "dynamic LoRA adapters in one batch must use the same rank");
+                TORCH_CHECK(adapter.target_layers == reference.target_layers,
+                    "dynamic LoRA adapters in one batch must use identical "
+                    "target_layers");
+                TORCH_CHECK(adapter.target_modules == reference.target_modules,
+                    "dynamic LoRA adapters in one batch must use identical "
+                    "target_modules");
+            }
+            for (const auto& name : adapter.target_modules) {
+                TORCH_CHECK(
+                    name == "q_proj" || name == "k_proj" ||
+                    name == "v_proj" || name == "o_proj" ||
+                    name == "in_proj_qkv" || name == "in_proj_z" ||
+                    name == "in_proj_a" || name == "in_proj_b" ||
+                    name == "out_proj" || name == "gate_proj" ||
+                    name == "up_proj" || name == "down_proj" ||
+                    name == "shared_gate_proj" ||
+                    name == "shared_up_proj" ||
+                    name == "shared_down_proj" ||
+                    name == "experts_gate_up_proj" ||
+                    name == "experts_down_proj",
+                    "unsupported dynamic Qwen LoRA target module: ", name);
+                bool resolved = false;
+                for (const auto& layer_cfg : ctx->layer_configs) {
+                    auto table = lora_projection_table(layer_cfg);
+                    for (int64_t pair = 0; pair < table.count; ++pair) {
+                        if (name == table.entries[pair].name) {
+                            resolved = true;
+                            break;
+                        }
+                    }
+                    if (resolved) break;
+                }
+                TORCH_CHECK(resolved,
+                    "dynamic LoRA target module does not exist in this model: ",
+                    name);
+            }
+            local_rank = local_lora_rank_for_active_targets(
+                ctx, rank, adapter.target_layers, adapter.target_modules,
+                /*empty_modules_mean_attention_only=*/true, "dynamic");
+        } catch (const std::exception& e) {
+            request_error = e.what();
         }
-        const int64_t local_rank = local_lora_rank_for_active_targets(
-            ctx, rank, adapter.target_layers, adapter.target_modules,
-            /*empty_modules_mean_attention_only=*/true, "dynamic");
-        for (int64_t i = 0; i < ctx->num_layers; i++) {
-            if (!adapter.target_layers.empty() && adapter.target_layers.find(i) == adapter.target_layers.end())
-                continue;
-            int64_t w_offset = 0;
-            for (int64_t j = 0; j < i; j++)
-                w_offset += weight_count_for_layer(ctx->layer_configs[j]);
-            auto projection_table = lora_projection_table(ctx->layer_configs[i]);
-            int64_t num_pairs = projection_table.count;
-            std::vector<std::pair<at::Tensor, at::Tensor>> pairs;
-            std::vector<std::array<at::Tensor, 4>> adam_states;
-            std::vector<std::array<at::Tensor, 6>> adam_shadows;
-            std::vector<std::array<at::Tensor, 2>> grad_accumulators;
-            for (int64_t k = 0; k < num_pairs; k++) {
-                const auto& projection = projection_table.entries[k];
-                auto* base = ctx->weight_ptrs[w_offset + projection.weight_index];
-                // Preserve the historical empty-target default (attention
-                // projections only). Explicit target lists may additionally
-                // select any 2D dense/shared MLP projection.
-                bool active = adapter.target_modules.empty()
-                    ? !projection.grouped_expert &&
-                        projection.segment == LoraSegment::Attention
-                    : adapter.target_modules.find(projection.name) !=
-                        adapter.target_modules.end();
-                auto opts = at::TensorOptions().dtype(ctx->compute_type).device(base->device());
-                at::Tensor a, b;
-                if (active) {
-                    if (projection.grouped_expert) {
-                        TORCH_CHECK(base->dim() == 3,
-                            "dynamic routed-expert LoRA projection must be rank 3: ",
-                            projection.name);
-                        int64_t experts = base->size(0);
-                        int64_t out_f = base->size(1), in_f = base->size(2);
-                        const auto layout = lora_tp_layout(ctx, i, k);
-                        if (layout == LoraTpLayout::ColumnParallel ||
-                            layout == LoraTpLayout::RowParallel) {
-                            a = at::randn({experts, rank, in_f}, opts) * 0.01;
-                            b = at::zeros({experts, out_f, rank}, opts);
+        const bool local_request_valid = request_error.empty();
+        const bool request_matches = adapter_registration_phase_matches(
+            ctx, adapter, local_request_valid, /*phase=*/0);
+        TORCH_CHECK(request_matches && local_request_valid,
+            "dynamic LoRA registration request is invalid or differs across "
+            "distributed ranks", request_error.empty() ? "" : ": ",
+            request_error);
+
+        std::string preparation_error;
+        try {
+            for (int64_t i = 0; i < ctx->num_layers; i++) {
+                if (!adapter.target_layers.empty() &&
+                    adapter.target_layers.find(i) ==
+                        adapter.target_layers.end())
+                    continue;
+                int64_t w_offset = 0;
+                for (int64_t j = 0; j < i; j++)
+                    w_offset += weight_count_for_layer(ctx->layer_configs[j]);
+                auto projection_table =
+                    lora_projection_table(ctx->layer_configs[i]);
+                int64_t num_pairs = projection_table.count;
+                std::vector<std::pair<at::Tensor, at::Tensor>> pairs;
+                std::vector<std::array<at::Tensor, 4>> adam_states;
+                std::vector<std::array<at::Tensor, 6>> adam_shadows;
+                std::vector<std::array<at::Tensor, 2>> grad_accumulators;
+                for (int64_t k = 0; k < num_pairs; k++) {
+                    const auto& projection = projection_table.entries[k];
+                    auto* base =
+                        ctx->weight_ptrs[w_offset + projection.weight_index];
+                    // Preserve the historical empty-target default (attention
+                    // projections only). Explicit lists may select any 2D
+                    // dense/shared MLP projection.
+                    bool active = adapter.target_modules.empty()
+                        ? !projection.grouped_expert &&
+                            projection.segment == LoraSegment::Attention
+                        : adapter.target_modules.find(projection.name) !=
+                            adapter.target_modules.end();
+                    auto opts = at::TensorOptions().dtype(ctx->compute_type)
+                        .device(base->device());
+                    at::Tensor a, b;
+                    if (active) {
+                        if (projection.grouped_expert) {
+                            TORCH_CHECK(base->dim() == 3,
+                                "dynamic routed-expert LoRA projection must "
+                                "be rank 3: ", projection.name);
+                            int64_t experts = base->size(0);
+                            int64_t out_f = base->size(1);
+                            int64_t in_f = base->size(2);
+                            const auto layout = lora_tp_layout(ctx, i, k);
+                            if (layout == LoraTpLayout::ColumnParallel ||
+                                layout == LoraTpLayout::RowParallel) {
+                                a = at::randn(
+                                    {experts, rank, in_f}, opts) * 0.01;
+                                b = at::zeros(
+                                    {experts, out_f, rank}, opts);
+                            } else {
+                                a = initialize_lora_a(
+                                    ctx, opts, experts, rank, in_f);
+                                b = at::zeros(
+                                    {experts, out_f, local_rank}, opts);
+                            }
                         } else {
-                            a = initialize_lora_a(ctx, opts, experts, rank, in_f);
-                            b = at::zeros({experts, out_f, local_rank}, opts);
+                            TORCH_CHECK(base->dim() == 2,
+                                "dynamic LoRA projection must be a matrix: ",
+                                projection.name);
+                            int64_t out_f = base->size(0);
+                            int64_t in_f = base->size(1);
+                            const auto layout = lora_tp_layout(ctx, i, k);
+                            if (layout == LoraTpLayout::ColumnParallel ||
+                                layout == LoraTpLayout::RowParallel) {
+                                a = at::randn({rank, in_f}, opts) * 0.01;
+                                b = at::zeros({out_f, rank}, opts);
+                            } else {
+                                a = initialize_lora_a(
+                                    ctx, opts, 0, rank, in_f);
+                                b = at::zeros({out_f, local_rank}, opts);
+                            }
                         }
                     } else {
-                        TORCH_CHECK(base->dim() == 2,
-                            "dynamic LoRA projection must be a matrix: ", projection.name);
-                        int64_t out_f = base->size(0), in_f = base->size(1);
-                        const auto layout = lora_tp_layout(ctx, i, k);
-                        if (layout == LoraTpLayout::ColumnParallel ||
-                            layout == LoraTpLayout::RowParallel) {
-                            a = at::randn({rank, in_f}, opts) * 0.01;
-                            b = at::zeros({out_f, rank}, opts);
-                        } else {
-                            a = initialize_lora_a(ctx, opts, 0, rank, in_f);
-                            b = at::zeros({out_f, local_rank}, opts);
-                        }
+                        a = at::zeros({}, opts);
+                        b = at::zeros({}, opts);
                     }
-                } else {
-                    a = at::zeros({}, opts);
-                    b = at::zeros({}, opts);
+                    a.set_requires_grad(active);
+                    b.set_requires_grad(active);
+                    auto opts_f32 = at::TensorOptions().dtype(at::kFloat)
+                        .device(base->device());
+                    adam_states.push_back({
+                        at::zeros(a.sizes(), opts_f32),
+                        at::zeros(a.sizes(), opts_f32),
+                        at::zeros(b.sizes(), opts_f32),
+                        at::zeros(b.sizes(), opts_f32)});
+                    adam_shadows.push_back(active
+                        ? std::array<at::Tensor, 6>{
+                            at::empty_like(a).set_requires_grad(true),
+                            at::empty(a.sizes(), opts_f32),
+                            at::empty(a.sizes(), opts_f32),
+                            at::empty_like(b).set_requires_grad(true),
+                            at::empty(b.sizes(), opts_f32),
+                            at::empty(b.sizes(), opts_f32)}
+                        : std::array<at::Tensor, 6>{});
+                    grad_accumulators.push_back(
+                        std::array<at::Tensor, 2>{
+                            at::Tensor(), at::Tensor()});
+                    pairs.emplace_back(std::move(a), std::move(b));
                 }
-                a.set_requires_grad(active);
-                b.set_requires_grad(active);
-                // Adam state: FP32 for numerical stability
-                auto opts_f32 = at::TensorOptions().dtype(at::kFloat).device(base->device());
-                adam_states.push_back({
-                    at::zeros(a.sizes(), opts_f32), at::zeros(a.sizes(), opts_f32),
-                    at::zeros(b.sizes(), opts_f32), at::zeros(b.sizes(), opts_f32)
-                });
-                adam_shadows.push_back(active
-                    ? std::array<at::Tensor, 6>{
-                        at::empty_like(a).set_requires_grad(true),
-                        at::empty(a.sizes(), opts_f32),
-                        at::empty(a.sizes(), opts_f32),
-                        at::empty_like(b).set_requires_grad(true),
-                        at::empty(b.sizes(), opts_f32),
-                        at::empty(b.sizes(), opts_f32)}
-                    : std::array<at::Tensor, 6>{});
-                grad_accumulators.push_back(
-                    std::array<at::Tensor, 2>{at::Tensor(), at::Tensor()});
-                pairs.emplace_back(std::move(a), std::move(b));
+                adapter.params[i] = std::move(pairs);
+                adapter.adam_state[i] = std::move(adam_states);
+                adapter.adam_shadow[i] = std::move(adam_shadows);
+                adapter.grad_accum[i] = std::move(grad_accumulators);
             }
-            adapter.params[i] = std::move(pairs);
-            adapter.adam_state[i] = std::move(adam_states);
-            adapter.adam_shadow[i] = std::move(adam_shadows);
-            adapter.grad_accum[i] = std::move(grad_accumulators);
+            bind_adapter_lora_gradient_slab(ctx, adapter);
+            ctx->adapters.reserve(ctx->adapters.size() + 1);
+        } catch (const std::exception& e) {
+            preparation_error = e.what();
         }
-        bind_adapter_lora_gradient_slab(ctx, adapter);
-        if (!ctx->restore_without_parameter_sync)
-            synchronize_adapter_replicated_lora_parameters(ctx, adapter);
+        const bool local_prepared = preparation_error.empty();
+        const bool preparation_matches = adapter_registration_phase_matches(
+            ctx, adapter, local_prepared, /*phase=*/1);
+        TORCH_CHECK(preparation_matches && local_prepared,
+            "dynamic LoRA registration preparation failed or differs across "
+            "distributed ranks", preparation_error.empty() ? "" : ": ",
+            preparation_error);
+        std::string synchronization_error;
+        try {
+            if (!ctx->restore_without_parameter_sync)
+                synchronize_adapter_replicated_lora_parameters(ctx, adapter);
+            TORCH_CHECK(!std::getenv(
+                    "QWEN36_TEST_FAIL_ADAPTER_REGISTRATION_AFTER_SYNC"),
+                "injected dynamic LoRA registration failure after "
+                "parameter synchronization");
+        } catch (const std::exception& e) {
+            synchronization_error = e.what();
+        }
+        const bool local_synchronized = synchronization_error.empty();
+        const bool synchronization_matches = adapter_registration_phase_matches(
+            ctx, adapter, local_synchronized, /*phase=*/2);
+        TORCH_CHECK(synchronization_matches && local_synchronized,
+            "dynamic LoRA parameter synchronization failed on at least one "
+            "distributed rank",
+            synchronization_error.empty() ? "" : ": ",
+            synchronization_error);
         int64_t id = adapter.id;
         ctx->adapters.push_back(std::move(adapter));
+        ctx->next_adapter_id = id;
         ctx->lora_cache_valid = false;
         ctx->lora_batch_valid = false;
         fprintf(stderr, "[q36_lora] added adapter %ld: rank=%ld alpha=%.1f\n", (long)id, (long)rank, alpha);
@@ -8780,6 +8915,18 @@ int64_t qwen36_add_lora(
     }
 }
 
+struct ScopedBoolOverride {
+    bool& target;
+    bool previous;
+
+    ScopedBoolOverride(bool& target_value, bool value)
+        : target(target_value), previous(target_value) {
+        target = value;
+    }
+
+    ~ScopedBoolOverride() { target = previous; }
+};
+
 __attribute__((visibility("default")))
 int64_t qwen36_add_lora_v2(
     void* ctx_ptr,
@@ -8789,12 +8936,10 @@ int64_t qwen36_add_lora_v2(
 ) {
     auto* ctx = reinterpret_cast<TrainingContext*>(ctx_ptr);
     if (!ctx) return -1;
-    ctx->allow_heterogeneous_registration = true;
-    const int64_t id = qwen36_add_lora(
+    ScopedBoolOverride guard(ctx->allow_heterogeneous_registration, true);
+    return qwen36_add_lora(
         ctx_ptr, rank, alpha, target_layers, num_target_layers,
         target_modules_str);
-    ctx->allow_heterogeneous_registration = false;
-    return id;
 }
 
 __attribute__((visibility("default")))
@@ -8806,12 +8951,10 @@ int64_t qwen36_add_lora_for_restore(
 ) {
     auto* ctx = reinterpret_cast<TrainingContext*>(ctx_ptr);
     if (!ctx) return -1;
-    ctx->restore_without_parameter_sync = true;
-    const int64_t id = qwen36_add_lora(
+    ScopedBoolOverride guard(ctx->restore_without_parameter_sync, true);
+    return qwen36_add_lora(
         ctx_ptr, rank, alpha, target_layers, num_target_layers,
         target_modules_str);
-    ctx->restore_without_parameter_sync = false;
-    return id;
 }
 
 // Restore a dynamic adapter's externally visible ID during checkpoint load.
@@ -8823,8 +8966,7 @@ int32_t qwen36_set_adapter_id(void* ctx_ptr, int64_t current_id, int64_t request
         auto* ctx = reinterpret_cast<TrainingContext*>(ctx_ptr);
         TORCH_CHECK(ctx && current_id > 0 && requested_id > 0,
             "dynamic adapter IDs must be positive");
-        require_clear_accumulation_for_registry_mutation(
-            ctx, /*collective=*/false);
+        require_clear_accumulation_for_registry_mutation(ctx);
         for (const auto& adapter : ctx->adapters) {
             TORCH_CHECK(adapter.id != requested_id || adapter.id == current_id,
                 "dynamic adapter ID already exists: ", requested_id);
@@ -8851,8 +8993,7 @@ int32_t qwen36_remove_lora(void* ctx_ptr, int64_t adapter_id) {
         auto* ctx = reinterpret_cast<TrainingContext*>(ctx_ptr);
         TORCH_CHECK(ctx && adapter_id > 0,
             "dynamic LoRA removal requires a context and positive adapter ID");
-        require_clear_accumulation_for_registry_mutation(
-            ctx, /*collective=*/false);
+        require_clear_accumulation_for_registry_mutation(ctx);
         for (auto it = ctx->adapters.begin(); it != ctx->adapters.end(); ++it) {
             if (it->id == adapter_id) {
                 ctx->adapters.erase(it);

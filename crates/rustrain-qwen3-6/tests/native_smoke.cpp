@@ -591,11 +591,13 @@ int main() {
     const char* shared_targets =
         "shared_gate_proj,shared_up_proj,shared_down_proj,"
         "experts_gate_up_proj,experts_down_proj";
+    assert(qwen36_add_lora(
+        ctx, rank, INFINITY, &target_layer, 1, shared_targets) < 0);
     const int64_t adapter_one = qwen36_add_lora(
         ctx, rank, 1.0, &target_layer, 1, shared_targets);
     const int64_t adapter_two = qwen36_add_lora(
         ctx, rank, 1.0, &target_layer, 1, shared_targets);
-    assert(adapter_one > 0 && adapter_two > adapter_one);
+    assert(adapter_one == 1 && adapter_two == 2);
     assert(qwen36_get_adapter_step_count(ctx, adapter_one) == 0);
     assert(qwen36_get_adapter_step_count(ctx, adapter_two) == 0);
     assert(qwen36_set_adapter_step_count(ctx, adapter_one, -1) != 0);
@@ -755,7 +757,7 @@ int main() {
         ctx, rank + 1, 12.0, &target_layer, 1, "q_proj") < 0);
     const int64_t heterogeneous_restore = qwen36_add_lora_v2(
         ctx, rank + 1, 12.0, &target_layer, 1, "q_proj");
-    assert(heterogeneous_restore > 0);
+    assert(heterogeneous_restore == adapter_two + 1);
     auto* heterogeneous_b = reinterpret_cast<at::Tensor*>(
         qwen36_get_adapter_lora_tensor(
             ctx, heterogeneous_restore, 0, "q_proj", 1));

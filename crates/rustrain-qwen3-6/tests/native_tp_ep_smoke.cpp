@@ -1048,13 +1048,37 @@ int main() {
         qwen36_get_step_count(distributed);
 
     const int64_t dynamic_targets[] = {0};
+    const int64_t divergent_rank = rank == 0 ? kLoraRank - 1 : kLoraRank;
+    assert(qwen36_add_lora(
+        distributed, divergent_rank, kLoraRank,
+        dynamic_targets, 1, targets) < 0);
+    const char* divergent_targets = rank == 0 ? "q_proj" : targets;
+    assert(qwen36_add_lora(
+        distributed, kLoraRank, kLoraRank,
+        dynamic_targets, 1, divergent_targets) < 0);
+    const int64_t divergent_mode_result = rank == 0
+        ? qwen36_add_lora(
+            distributed, kLoraRank, kLoraRank,
+            dynamic_targets, 1, targets)
+        : qwen36_add_lora_v2(
+            distributed, kLoraRank, kLoraRank,
+            dynamic_targets, 1, targets);
+    assert(divergent_mode_result < 0);
+    if (rank == 0) {
+        setenv(
+            "QWEN36_TEST_FAIL_ADAPTER_REGISTRATION_AFTER_SYNC", "1", 1);
+    }
+    assert(qwen36_add_lora(
+        distributed, kLoraRank, kLoraRank,
+        dynamic_targets, 1, targets) < 0);
+    unsetenv("QWEN36_TEST_FAIL_ADAPTER_REGISTRATION_AFTER_SYNC");
     const int64_t tenant_one = qwen36_add_lora(
         distributed, kLoraRank, kLoraRank,
         dynamic_targets, 1, targets);
     const int64_t tenant_two = qwen36_add_lora(
         distributed, kLoraRank, kLoraRank,
         dynamic_targets, 1, targets);
-    assert(tenant_one > 0 && tenant_two > tenant_one);
+    assert(tenant_one == 1 && tenant_two == 2);
     auto dynamic_one = make_lora_fixtures(
         tp_rank, ep_rank, 4001, base_tp_mlp);
     auto dynamic_two = make_lora_fixtures(
