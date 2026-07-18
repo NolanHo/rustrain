@@ -2354,6 +2354,31 @@ static void hash_adapter_layout(
             hash_tensor_layout(hash, b);
         }
     }
+    hash.add_u64(adapter.grad_accum.size());
+    for (const auto& [layer, pairs] : adapter.grad_accum) {
+        hash.add_u64(layer);
+        hash.add_u64(pairs.size());
+        for (const auto& pair : pairs) {
+            hash_tensor_layout(hash, pair[0]);
+            hash_tensor_layout(hash, pair[1]);
+        }
+    }
+}
+
+static void hash_collective_topology(
+    AdapterRegistryHash& hash, const TrainingContext* ctx
+) {
+    hash.add_u64(ctx->tp_world_size);
+    hash.add_u64(ctx->ep_world_size);
+    hash.add_u64(ctx->dp_world_size);
+    hash.add_u64(ctx->base_tp_attention);
+    hash.add_u64(ctx->base_tp_mlp);
+    hash.add_u64(ctx->vocab_parallel);
+    hash.add_u64(ctx->expert_parallel);
+    hash.add_u64(ctx->data_parallel);
+    hash.add_u64(env_enabled("QWEN36_EP_A2A"));
+    hash.add_u64(env_enabled("QWEN36_EP_A2A_SHARDED"));
+    hash.add_u64(env_enabled("QWEN36_GROUPED_LORA_SYNC", true));
 }
 
 static void validate_adapter_collective_registry(
@@ -2366,6 +2391,7 @@ static void validate_adapter_collective_registry(
     if (!ctx || (!ctx->nccl_comm && !ctx->dp_comm && !ctx->tp_comm)) return;
 
     AdapterRegistryHash hash;
+    hash_collective_topology(hash, ctx);
     hash.add_u64(requested_count);
     hash.add_u64(requested_rank);
     hash.add_u64(use_registered_order);
@@ -2451,6 +2477,7 @@ static void validate_fixed_collective_registry(
     if (!ctx || (!ctx->nccl_comm && !ctx->dp_comm && !ctx->tp_comm)) return;
 
     AdapterRegistryHash hash;
+    hash_collective_topology(hash, ctx);
     hash.add_u64(ctx->fixed_optimizer_step);
     hash.add_u64(ctx->lora_active.size());
     hash.add_u64(ctx->lora_a.size());
@@ -3168,6 +3195,156 @@ static void reduce_lora_accumulator_weighted(
     accumulator.div_(global_weight.clamp_min(1.0));
 }
 
+struct GroupedLoraGradientSyncPlan {
+    struct Entry {
+        at::Tensor* accumulator = nullptr;
+        at::Tensor local_weight;
+        at::Tensor global_weight;
+        at::Tensor work;
+        double pre_scale = 1.0;
+        double post_scale = 1.0;
+        bool reduce_ep = false;
+        bool reduce_dp = false;
+        bool reduce_tp = false;
+    };
+
+    std::vector<Entry> entries;
+
+    static bool tp_replicated(LoraTpLayout layout, bool is_a) {
+        return (layout == LoraTpLayout::ColumnParallel && is_a) ||
+            (layout == LoraTpLayout::RowParallel && !is_a);
+    }
+
+    void add(
+        TrainingContext* ctx,
+        at::Tensor& accumulator,
+        double pre_scale,
+        const at::Tensor& local_weight,
+        const at::Tensor& global_weight,
+        double post_scale,
+        bool reduce_ep,
+        bool reduce_dp,
+        LoraTpLayout tp_layout,
+        bool is_a
+    ) {
+        if (!accumulator.defined()) return;
+        Entry entry;
+        entry.accumulator = &accumulator;
+        entry.local_weight = local_weight;
+        entry.global_weight = global_weight;
+        entry.pre_scale = pre_scale;
+        entry.post_scale = post_scale;
+        entry.reduce_ep = reduce_ep;
+        entry.reduce_dp = reduce_dp;
+        entry.reduce_tp = ctx->tp_world_size > 1 &&
+            tp_replicated(tp_layout, is_a);
+        entries.push_back(std::move(entry));
+    }
+
+    void prepare(TrainingContext* ctx) {
+        for (auto& entry : entries) {
+            TORCH_CHECK(entry.accumulator && entry.accumulator->is_cuda() &&
+                    entry.accumulator->scalar_type() == at::kFloat &&
+                    entry.accumulator->device().index() == ctx->cuda_device,
+                "grouped LoRA gradient sync requires CUDA FP32 accumulators "
+                "on the context device");
+            TORCH_CHECK(std::isfinite(entry.pre_scale) &&
+                    std::isfinite(entry.post_scale),
+                "grouped LoRA gradient sync scale must be finite");
+            if (entry.local_weight.defined()) {
+                TORCH_CHECK(entry.local_weight.is_cuda() &&
+                        entry.local_weight.numel() == 1 &&
+                        entry.local_weight.device() == entry.accumulator->device(),
+                    "grouped LoRA local token weight must be a CUDA scalar");
+            }
+            if (entry.global_weight.defined()) {
+                TORCH_CHECK(entry.global_weight.is_cuda() &&
+                        entry.global_weight.numel() == 1 &&
+                        entry.global_weight.device() == entry.accumulator->device(),
+                    "grouped LoRA global token weight must be a CUDA scalar");
+            }
+            TORCH_CHECK(entry.accumulator->is_contiguous(),
+                "grouped LoRA gradient sync requires contiguous accumulators");
+            entry.work = *entry.accumulator;
+        }
+    }
+
+    template <typename Predicate>
+    static void run_group(
+        std::vector<Entry>& entries,
+        ncclComm_t communicator,
+        cudaStream_t stream,
+        const char* axis,
+        Predicate predicate
+    ) {
+        const bool any = std::any_of(
+            entries.begin(), entries.end(), predicate);
+        if (!any) return;
+        TORCH_CHECK(communicator, "grouped LoRA ", axis,
+            " gradient sync has no communicator");
+        const auto start_error = ncclGroupStart();
+        TORCH_CHECK(start_error == ncclSuccess,
+            "grouped LoRA ", axis, " ncclGroupStart failed: ",
+            ncclGetErrorString(start_error));
+        ncclResult_t first_error = ncclSuccess;
+        for (auto& entry : entries) {
+            if (!predicate(entry)) continue;
+            const auto error = ncclAllReduce(
+                entry.work.data_ptr(), entry.work.data_ptr(), entry.work.numel(),
+                nccl_dtype_for(entry.work), ncclSum, communicator, stream);
+            if (first_error == ncclSuccess && error != ncclSuccess)
+                first_error = error;
+        }
+        const auto end_error = ncclGroupEnd();
+        TORCH_CHECK(first_error == ncclSuccess,
+            "grouped LoRA ", axis, " gradient all-reduce failed: ",
+            ncclGetErrorString(first_error));
+        TORCH_CHECK(end_error == ncclSuccess,
+            "grouped LoRA ", axis, " ncclGroupEnd failed: ",
+            ncclGetErrorString(end_error));
+    }
+
+    void execute(TrainingContext* ctx) {
+        std::exception_ptr preparation_error;
+        try {
+            prepare(ctx);
+        } catch (...) {
+            preparation_error = std::current_exception();
+        }
+        const bool local_ready = !preparation_error;
+        const bool globally_ready = adapter_collective_all_succeeded(
+            ctx, local_ready);
+        if (!local_ready) std::rethrow_exception(preparation_error);
+        TORCH_CHECK(globally_ready,
+            "grouped LoRA gradient sync preparation failed on another rank");
+
+        at::NoGradGuard guard;
+        for (auto& entry : entries) {
+            if (entry.local_weight.defined())
+                entry.work.mul_(entry.local_weight);
+            if (entry.pre_scale != 1.0)
+                entry.work.mul_(entry.pre_scale);
+        }
+
+        const auto stream = c10::cuda::getCurrentCUDAStream(
+            ctx->cuda_device).stream();
+        run_group(entries, ctx->nccl_comm, stream, "EP",
+            [](const Entry& entry) { return entry.reduce_ep; });
+        run_group(entries, ctx->dp_comm, stream, "DP",
+            [](const Entry& entry) { return entry.reduce_dp; });
+
+        for (auto& entry : entries) {
+            if (entry.global_weight.defined())
+                entry.work.div_(entry.global_weight);
+            if (entry.post_scale != 1.0)
+                entry.work.mul_(entry.post_scale);
+        }
+
+        run_group(entries, ctx->tp_comm, stream, "TP",
+            [](const Entry& entry) { return entry.reduce_tp; });
+    }
+};
+
 // Fixed-LoRA gradients are accumulated as token-weighted numerators. Replicated
 // DP sums all replicated parameters and divides by the global token count;
 // legacy EP keeps its replicated batch/local expert semantics. Sharded A2A
@@ -3238,6 +3415,8 @@ static bool synchronize_lora_gradients(
     };
     const bool per_adapter_weighting = per_adapter_token_counts &&
         per_adapter_token_counts->defined();
+    const bool grouped_sync = env_enabled("QWEN36_GROUPED_LORA_SYNC", true);
+    GroupedLoraGradientSyncPlan grouped_plan;
     at::Tensor local_adapter_weights;
     at::Tensor global_adapter_weights;
     double scale = 1.0;
@@ -3327,25 +3506,51 @@ static bool synchronize_lora_gradients(
                         continue;
                     }
                     const bool grouped_expert = table.entries[pair].grouped_expert;
+                    const auto layout = lora_tp_layout(ctx, layer_idx, pair);
                     if (sharded_a2a) {
                         // Sharded A2A restores each source row to a numerator
                         // before backward. Expert owners already receive all
                         // source numerators; replicated projections still need
                         // one all-reduce before division by the global count.
-                        normalize_lora_accumulator_numerator(
-                            ctx, accum_it->second[pair][0], global_weight,
-                            !grouped_expert, dp_allreduce);
-                        normalize_lora_accumulator_numerator(
-                            ctx, accum_it->second[pair][1], global_weight,
-                            !grouped_expert, dp_allreduce);
+                        if (grouped_sync) {
+                            grouped_plan.add(
+                                ctx, accum_it->second[pair][0], 1.0,
+                                at::Tensor(), global_weight, 1.0,
+                                !grouped_expert, dp_allreduce, layout, true);
+                            grouped_plan.add(
+                                ctx, accum_it->second[pair][1], 1.0,
+                                at::Tensor(), global_weight, 1.0,
+                                !grouped_expert, dp_allreduce, layout, false);
+                        } else {
+                            normalize_lora_accumulator_numerator(
+                                ctx, accum_it->second[pair][0], global_weight,
+                                !grouped_expert, dp_allreduce);
+                            normalize_lora_accumulator_numerator(
+                                ctx, accum_it->second[pair][1], global_weight,
+                                !grouped_expert, dp_allreduce);
+                        }
                     } else {
-                        reduce_lora_accumulator_weighted(
-                            ctx, accum_it->second[pair][0], local_weight,
-                            global_weight, false, dp_allreduce);
-                        reduce_lora_accumulator_weighted(
-                            ctx, accum_it->second[pair][1], local_weight,
-                            global_weight, false, dp_allreduce);
-                        if (grouped_expert &&
+                        if (grouped_sync) {
+                            const double expert_scale = grouped_expert
+                                ? replicated_a2a_expert_scale
+                                : 1.0;
+                            grouped_plan.add(
+                                ctx, accum_it->second[pair][0], 1.0,
+                                local_weight, global_weight, expert_scale,
+                                false, dp_allreduce, layout, true);
+                            grouped_plan.add(
+                                ctx, accum_it->second[pair][1], 1.0,
+                                local_weight, global_weight, expert_scale,
+                                false, dp_allreduce, layout, false);
+                        } else {
+                            reduce_lora_accumulator_weighted(
+                                ctx, accum_it->second[pair][0], local_weight,
+                                global_weight, false, dp_allreduce);
+                            reduce_lora_accumulator_weighted(
+                                ctx, accum_it->second[pair][1], local_weight,
+                                global_weight, false, dp_allreduce);
+                        }
+                        if (!grouped_sync && grouped_expert &&
                             replicated_a2a_expert_scale != 1.0) {
                             at::NoGradGuard guard;
                             accum_it->second[pair][0].mul_(
@@ -3362,39 +3567,67 @@ static bool synchronize_lora_gradients(
                 // local normalization when no DP communicator is present.
                 if (table.entries[pair].grouped_expert) {
                     if (accumulated_token_weight > 0.0) {
-                        reduce_lora_accumulator(
-                            ctx, accum_it->second[pair][0], scale,
-                            false, dp_allreduce);
-                        reduce_lora_accumulator(
-                            ctx, accum_it->second[pair][1], scale,
-                            false, dp_allreduce);
+                        const auto layout = lora_tp_layout(ctx, layer_idx, pair);
+                        if (grouped_sync) {
+                            grouped_plan.add(
+                                ctx, accum_it->second[pair][0], scale,
+                                at::Tensor(), at::Tensor(), 1.0,
+                                false, dp_allreduce, layout, true);
+                            grouped_plan.add(
+                                ctx, accum_it->second[pair][1], scale,
+                                at::Tensor(), at::Tensor(), 1.0,
+                                false, dp_allreduce, layout, false);
+                        } else {
+                            reduce_lora_accumulator(
+                                ctx, accum_it->second[pair][0], scale,
+                                false, dp_allreduce);
+                            reduce_lora_accumulator(
+                                ctx, accum_it->second[pair][1], scale,
+                                false, dp_allreduce);
+                        }
                     }
                     continue;
                 }
-                reduce_lora_accumulator(
-                    ctx, accum_it->second[pair][0], scale,
-                    sharded_a2a, dp_allreduce);
-                reduce_lora_accumulator(
-                    ctx, accum_it->second[pair][1], scale,
-                    sharded_a2a, dp_allreduce);
+                const auto layout = lora_tp_layout(ctx, layer_idx, pair);
+                if (grouped_sync) {
+                    grouped_plan.add(
+                        ctx, accum_it->second[pair][0], scale,
+                        at::Tensor(), at::Tensor(), 1.0,
+                        sharded_a2a, dp_allreduce, layout, true);
+                    grouped_plan.add(
+                        ctx, accum_it->second[pair][1], scale,
+                        at::Tensor(), at::Tensor(), 1.0,
+                        sharded_a2a, dp_allreduce, layout, false);
+                } else {
+                    reduce_lora_accumulator(
+                        ctx, accum_it->second[pair][0], scale,
+                        sharded_a2a, dp_allreduce);
+                    reduce_lora_accumulator(
+                        ctx, accum_it->second[pair][1], scale,
+                        sharded_a2a, dp_allreduce);
+                }
             }
         }
     }
     // Projection-aware TP keeps one LoRA factor replicated. Its gradient is
     // the sum of disjoint output-head (column) or input-column (row)
     // contributions and is synchronized once at the optimizer boundary.
-    for (auto& adapter : ctx->adapters) {
-        for (auto& [layer_idx, pairs] : adapter.grad_accum) {
-            for (int64_t pair = 0; pair < static_cast<int64_t>(pairs.size()); ++pair) {
-                const auto layout = lora_tp_layout(ctx, layer_idx, pair);
-                tp_sum_replicated_lora_accumulator(
-                    ctx, pairs[pair][0], layout, true);
-                tp_sum_replicated_lora_accumulator(
-                    ctx, pairs[pair][1], layout, false);
+    if (!grouped_sync) {
+        for (auto& adapter : ctx->adapters) {
+            for (auto& [layer_idx, pairs] : adapter.grad_accum) {
+                for (int64_t pair = 0;
+                     pair < static_cast<int64_t>(pairs.size()); ++pair) {
+                    const auto layout = lora_tp_layout(ctx, layer_idx, pair);
+                    tp_sum_replicated_lora_accumulator(
+                        ctx, pairs[pair][0], layout, true);
+                    tp_sum_replicated_lora_accumulator(
+                        ctx, pairs[pair][1], layout, false);
+                }
             }
         }
     }
     if (per_adapter_weighting) {
+        if (grouped_sync) grouped_plan.execute(ctx);
         return adapter_has_global_tokens && std::any_of(
             adapter_has_global_tokens->begin(),
             adapter_has_global_tokens->end(),
@@ -3412,33 +3645,63 @@ static bool synchronize_lora_gradients(
             // Routed expert LoRA is local-only for EP, while pure DP owns the
             // complete replicated expert tensor and must all-reduce it.
             if (table.entries[pair].grouped_expert) {
-                reduce_lora_accumulator(
-                    ctx, ctx->grad_accum_a[offset + pair],
-                    scale * replicated_a2a_expert_scale,
-                    false, dp_allreduce);
-                reduce_lora_accumulator(
-                    ctx, ctx->grad_accum_b[offset + pair],
-                    scale * replicated_a2a_expert_scale,
-                    false, dp_allreduce);
+                const auto layout = lora_tp_layout(ctx, layer, pair);
+                if (grouped_sync) {
+                    grouped_plan.add(
+                        ctx, ctx->grad_accum_a[offset + pair],
+                        scale * replicated_a2a_expert_scale,
+                        at::Tensor(), at::Tensor(), 1.0,
+                        false, dp_allreduce, layout, true);
+                    grouped_plan.add(
+                        ctx, ctx->grad_accum_b[offset + pair],
+                        scale * replicated_a2a_expert_scale,
+                        at::Tensor(), at::Tensor(), 1.0,
+                        false, dp_allreduce, layout, false);
+                } else {
+                    reduce_lora_accumulator(
+                        ctx, ctx->grad_accum_a[offset + pair],
+                        scale * replicated_a2a_expert_scale,
+                        false, dp_allreduce);
+                    reduce_lora_accumulator(
+                        ctx, ctx->grad_accum_b[offset + pair],
+                        scale * replicated_a2a_expert_scale,
+                        false, dp_allreduce);
+                }
                 continue;
             }
-            reduce_lora_accumulator(
-                ctx, ctx->grad_accum_a[offset + pair], scale,
-                sharded_a2a, dp_allreduce);
-            reduce_lora_accumulator(
-                ctx, ctx->grad_accum_b[offset + pair], scale,
-                sharded_a2a, dp_allreduce);
+            const auto layout = lora_tp_layout(ctx, layer, pair);
+            if (grouped_sync) {
+                grouped_plan.add(
+                    ctx, ctx->grad_accum_a[offset + pair], scale,
+                    at::Tensor(), at::Tensor(), 1.0,
+                    sharded_a2a, dp_allreduce, layout, true);
+                grouped_plan.add(
+                    ctx, ctx->grad_accum_b[offset + pair], scale,
+                    at::Tensor(), at::Tensor(), 1.0,
+                    sharded_a2a, dp_allreduce, layout, false);
+            } else {
+                reduce_lora_accumulator(
+                    ctx, ctx->grad_accum_a[offset + pair], scale,
+                    sharded_a2a, dp_allreduce);
+                reduce_lora_accumulator(
+                    ctx, ctx->grad_accum_b[offset + pair], scale,
+                    sharded_a2a, dp_allreduce);
+            }
         }
     }
-    for (int64_t layer = 0; layer < ctx->num_layers; ++layer) {
-        const int64_t offset = ctx->lora_layer_offset[layer];
-        const int64_t pairs = lora_pair_count(ctx->layer_configs[layer]);
-        for (int64_t pair = 0; pair < pairs; ++pair) {
-            const auto layout = lora_tp_layout(ctx, layer, pair);
-            tp_sum_replicated_lora_accumulator(
-                ctx, ctx->grad_accum_a[offset + pair], layout, true);
-            tp_sum_replicated_lora_accumulator(
-                ctx, ctx->grad_accum_b[offset + pair], layout, false);
+    if (grouped_sync) {
+        grouped_plan.execute(ctx);
+    } else {
+        for (int64_t layer = 0; layer < ctx->num_layers; ++layer) {
+            const int64_t offset = ctx->lora_layer_offset[layer];
+            const int64_t pairs = lora_pair_count(ctx->layer_configs[layer]);
+            for (int64_t pair = 0; pair < pairs; ++pair) {
+                const auto layout = lora_tp_layout(ctx, layer, pair);
+                tp_sum_replicated_lora_accumulator(
+                    ctx, ctx->grad_accum_a[offset + pair], layout, true);
+                tp_sum_replicated_lora_accumulator(
+                    ctx, ctx->grad_accum_b[offset + pair], layout, false);
+            }
         }
     }
     return true;
