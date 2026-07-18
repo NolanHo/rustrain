@@ -29,7 +29,7 @@
 | pipeline parallel | 未实现于 Qwen native | 没有 stage 切分、microbatch scheduler 或 activation send/recv |
 | context parallel | 未实现于 Qwen native | 没有 ring attention、跨 rank KV/索引合并 |
 | distributed checkpoint | 已实现子集 | v5 记录 rank order、完整五维坐标、TP/EP 多轴 placement、fused gate/up segments 及 fixed/dynamic slot identity；任意 multi-rank 拓扑使用 rank 目录。compact receipt 将每 rank preflight 限制为 `O(world_size)` 小 metadata + `O(local state)`；CLI/server 共享 same-topology restore 和标准 PEFT merge。server save/load 使用全 rank prepare/validate/commit-or-abort，load 通过 no-sync shadow context 保证失败不改 live state；fresh destination 以 `RENAME_NOREPLACE` 原子可见。v3/v4 及旧 digest-v5 保持只读兼容；可覆盖 generation/LATEST、断电级 durability、跨 topology reshard 和 PP/CP 未实现 |
-| server tensor transport | 已实现 IPC 子集 | ABI22 parent/worker 共享 64-byte aligned binary slab 与 compact JSON descriptor；worker 不再反序列化三份 `Vec<i64>` 或在 Rust 热路径构造 `tch::Tensor`。tensor HTTP routes 在 decode 前 bounded admission；HTTP ingress 仍为 JSON/base64，pinned staging、异步 H2D 和 raw binary endpoint 未实现 |
+| server tensor transport | 已实现 IPC 子集 | ABI22 parent/worker 共享 64-byte aligned binary slab 与 compact JSON descriptor；worker 不再反序列化三份 `Vec<i64>` 或在 Rust 热路径构造 `tch::Tensor`。tensor HTTP routes 在 decode 前只允许一个 in-flight 请求，忙时快速返回 `429`；普通控制面和 checkpoint transaction 使用 bounded FIFO 单消费者 scheduler（默认队列 32，可由 `RUSTRAIN_EP_DISPATCH_QUEUE_CAPACITY` 调整），每个 accepted job 在 `spawn_blocking` 上串行执行。HTTP ingress 仍为 JSON/base64，pinned staging、异步 H2D、raw binary endpoint 和多请求 GPU batching 未实现 |
 
 ## 与 Megatron-LM 的关键差距
 
@@ -41,7 +41,7 @@ Megatron 的通用 MLP 使用 ColumnParallel fc1、local gated activation 和 Ro
 
 PP 会把层分到不同 stage 并使用 1F1B 等调度；CP 会在序列和 attention state 上做跨 rank 通信。当前 Qwen native `TrainingContext` 仍在每个进程执行完整层栈，因此仅增加 PP/CP 配置不能得到正确语义。
 
-当前 DP/EP 仍不是完整 Megatron 语义：DP 同步 replicated LoRA 梯度并按租户 token count 归一化，expert 参数留在 EP rank；sharded EP 使用 variable-split dispatch/inverse combine 和 fixed/dynamic LoRA data sharding。ABI19 已把所有 top-k assignment 合并为一次 dispatch，并把 local expert 计算合并为 grouped GEMM，但 count planning 仍可见于 host，且没有 fused permutation、异步 overlap 或 DeepEP backend。server 广播同一个 global batch descriptor，worker 按五维 topology 选择本 source rows：TP peers 保持相同，sharded EP 使用 `DP*EP` sources，replicated EP 只按 DP 分片。ABI22 将 parent/worker 数据从每 worker 全量 JSON vector 反序列化改为共享 binary slab；worker 直接借用 slab span 并调用 C++ host-i64 coarse ABI，Rust worker 热路径不再执行 `Tensor::from_slice`、`reshape` 或 `to_device`。IPC timeout 会永久 poison channel，首次失败立即终止并回收 worker；pre-publish `InvalidInput` 不 poison channel。health 在 terminal failure 后返回 unavailable，partial launch 同样回收已启动 ranks。HTTP ingress 仍是 base64/JSON，且缺少 pinned host staging、异步 H2D 与请求/计算 overlap，因此仍不能视为最终的高吞吐服务传输。
+当前 DP/EP 仍不是完整 Megatron 语义：DP 同步 replicated LoRA 梯度并按租户 token count 归一化，expert 参数留在 EP rank；sharded EP 使用 variable-split dispatch/inverse combine 和 fixed/dynamic LoRA data sharding。ABI19 已把所有 top-k assignment 合并为一次 dispatch，并把 local expert 计算合并为 grouped GEMM，但 count planning 仍可见于 host，且没有 fused permutation、异步 overlap 或 DeepEP backend。server 广播同一个 global batch descriptor，worker 按五维 topology 选择本 source rows：TP peers 保持相同，sharded EP 使用 `DP*EP` sources，replicated EP 只按 DP 分片。ABI22 将 parent/worker 数据从每 worker 全量 JSON vector 反序列化改为共享 binary slab；worker 直接借用 slab span 并调用 C++ host-i64 coarse ABI，Rust worker 热路径不再执行 `Tensor::from_slice`、`reshape` 或 `to_device`。普通控制面/检查点现在由 bounded FIFO 单消费者调度器承接，避免 Tokio handler 被阻塞式 IPC 占用；tensor 请求仍单 in-flight，避免多个 48 MiB body 同时驻留，因而它不是多租户 GPU batching。IPC timeout 会永久 poison channel，首次失败立即终止并回收 worker；pre-publish `InvalidInput` 不 poison channel。health 在 terminal failure 后返回 unavailable，partial launch 同样回收已启动 ranks。HTTP ingress 仍是 base64/JSON，且缺少 pinned host staging、异步 H2D 与请求/计算 overlap，因此仍不能视为最终的高吞吐服务传输。
 
 ### 优化器与恢复
 
@@ -57,6 +57,14 @@ the token-count CPU fence; it is not Megatron-style backward bucket overlap or
 reduce-scatter. H20 TP2 fixed-LoRA smoke and TP2 x DP2 oracle passed with both
 settings; the synthetic TP2 benchmark was `77.970 ms` packed versus `78.024 ms`
 fallback p50, within measurement noise.
+
+Server control-plane and checkpoint commands now use a bounded FIFO
+single-consumer dispatcher. Accepted jobs run one-at-a-time on
+`spawn_blocking`, preserving IPC collective order while keeping Tokio handlers
+responsive; queue pressure returns `429` and scheduler/worker failure returns
+`503`. The default capacity is 32 (hard maximum 4096). Tensor train/eval routes
+still admit only one 48 MiB body and reject while busy, so this is runtime
+backpressure/fairness rather than cross-tenant GPU batching.
 
 GDN fused backward 现在可通过
 `QWEN36_GDN_STATE_CHECKPOINT_STRIDE` 保存固定 token 边界的 FP32 recurrent

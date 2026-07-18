@@ -7,8 +7,8 @@ use axum::{
     extract::{Path, State},
     http::StatusCode,
     middleware::{self, Next},
-    response::Response,
     response::sse::{Event, KeepAlive, Sse},
+    response::{IntoResponse, Response},
     routing::{get, post},
 };
 use futures::stream::{self, Stream};
@@ -18,6 +18,7 @@ use std::sync::Arc;
 use tokio::sync::Semaphore;
 use tokio_stream::StreamExt;
 
+use crate::ep_dispatch::{EpDispatchScheduleError, EpDispatchScheduler, configured_queue_capacity};
 use crate::metrics::StepMetric;
 use crate::session::{InitLoRARequest, SessLoadDatasetRequest, SessLoadModelRequest, TrainInput};
 use crate::state::SessionManager;
@@ -29,6 +30,11 @@ pub struct AppState {
 /// EP mode: HTTP server dispatches to workers via IPC coordinator.
 pub struct EpAppState {
     pub coordinator: Arc<crate::ep::EpCoordinator>,
+}
+
+struct EpRouterState {
+    coordinator: Arc<crate::ep::EpCoordinator>,
+    dispatcher: EpDispatchScheduler,
 }
 
 pub fn router(state: Arc<AppState>) -> Router {
@@ -718,6 +724,10 @@ struct StepMetricJson {
 // ──────────────────────────────────────────────────────────────────────
 
 pub fn ep_router(state: Arc<EpAppState>) -> Router {
+    let state = Arc::new(EpRouterState {
+        coordinator: Arc::clone(&state.coordinator),
+        dispatcher: EpDispatchScheduler::new(configured_queue_capacity()),
+    });
     let tensor_routes = Router::new()
         .route("/v1/sessions/{id}/train_step", post(ep_train_step))
         .route("/v1/sessions/{id}/train_multi", post(ep_train_multi_lora))
@@ -763,14 +773,21 @@ async fn ep_tensor_admission(
 ) -> Response {
     // The IPC coordinator serializes dispatches, so decoding more than one tensor request only
     // increases peak memory without creating training concurrency.
-    let _permit = gate
-        .acquire_owned()
-        .await
-        .expect("EP tensor admission semaphore unexpectedly closed");
-    next.run(request).await
+    match gate.try_acquire_owned() {
+        Ok(_permit) => next.run(request).await,
+        Err(_) => (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(ErrorResponse {
+                error: "EP tensor request is already in progress".to_string(),
+            }),
+        )
+            .into_response(),
+    }
 }
 
-async fn ep_health(State(state): State<Arc<EpAppState>>) -> (StatusCode, Json<serde_json::Value>) {
+async fn ep_health(
+    State(state): State<Arc<EpRouterState>>,
+) -> (StatusCode, Json<serde_json::Value>) {
     if state.coordinator.is_healthy() {
         (
             StatusCode::OK,
@@ -785,13 +802,13 @@ async fn ep_health(State(state): State<Arc<EpAppState>>) -> (StatusCode, Json<se
 }
 
 async fn ep_create_session(
-    State(state): State<Arc<EpAppState>>,
+    State(state): State<Arc<EpRouterState>>,
     Json(req): Json<CreateSessionRequest>,
 ) -> Result<Json<CreateSessionResponse>, (StatusCode, Json<ErrorResponse>)> {
     let cmd = rustrain_ipc::EpCommand::CreateSession {
         session_id: req.session_id.clone(),
     };
-    match state.coordinator.dispatch(&cmd) {
+    match dispatch_ep(&state, cmd).await? {
         rustrain_ipc::EpResult::Ok => Ok(Json(CreateSessionResponse {
             session_id: req.session_id,
         })),
@@ -801,13 +818,13 @@ async fn ep_create_session(
 }
 
 async fn ep_delete_session(
-    State(state): State<Arc<EpAppState>>,
+    State(state): State<Arc<EpRouterState>>,
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
     let cmd = rustrain_ipc::EpCommand::DeleteSession {
         session_id: id.clone(),
     };
-    match state.coordinator.dispatch(&cmd) {
+    match dispatch_ep(&state, cmd).await? {
         rustrain_ipc::EpResult::Ok => Ok(Json(serde_json::json!({"deleted": id}))),
         rustrain_ipc::EpResult::Error(e) => Err(err_resp(&e)),
         _ => Err(err_resp("unexpected result")),
@@ -815,7 +832,7 @@ async fn ep_delete_session(
 }
 
 async fn ep_load_model(
-    State(state): State<Arc<EpAppState>>,
+    State(state): State<Arc<EpRouterState>>,
     Path(id): Path<String>,
     Json(req): Json<LoadModelHttp>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
@@ -824,7 +841,7 @@ async fn ep_load_model(
         model_path: req.model_path,
         config_toml: req.config_toml,
     };
-    match state.coordinator.dispatch(&cmd) {
+    match dispatch_ep(&state, cmd).await? {
         rustrain_ipc::EpResult::Ok => Ok(Json(serde_json::json!({"loaded": true}))),
         rustrain_ipc::EpResult::Error(e) => Err(err_resp(&e)),
         _ => Err(err_resp("unexpected result")),
@@ -832,7 +849,7 @@ async fn ep_load_model(
 }
 
 async fn ep_load_dataset(
-    State(state): State<Arc<EpAppState>>,
+    State(state): State<Arc<EpRouterState>>,
     Path(id): Path<String>,
     Json(req): Json<LoadDatasetHttp>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
@@ -841,7 +858,7 @@ async fn ep_load_dataset(
         jsonl_path: req.jsonl_path,
         seq_len: req.seq_len,
     };
-    match state.coordinator.dispatch(&cmd) {
+    match dispatch_ep(&state, cmd).await? {
         rustrain_ipc::EpResult::Count(n) => Ok(Json(serde_json::json!({"samples": n}))),
         rustrain_ipc::EpResult::Error(e) => Err(err_resp(&e)),
         _ => Err(err_resp("unexpected result")),
@@ -849,7 +866,7 @@ async fn ep_load_dataset(
 }
 
 async fn ep_init_lora(
-    State(state): State<Arc<EpAppState>>,
+    State(state): State<Arc<EpRouterState>>,
     Path(id): Path<String>,
     Json(req): Json<InitLoRAHttp>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
@@ -864,7 +881,7 @@ async fn ep_init_lora(
         beta2: req.beta2,
         eps: req.eps,
     };
-    match state.coordinator.dispatch(&cmd) {
+    match dispatch_ep(&state, cmd).await? {
         rustrain_ipc::EpResult::Count(n) => Ok(Json(serde_json::json!({"lora_count": n}))),
         rustrain_ipc::EpResult::Error(e) => Err(err_resp(&e)),
         _ => Err(err_resp("unexpected result")),
@@ -872,7 +889,7 @@ async fn ep_init_lora(
 }
 
 async fn ep_train_step(
-    State(state): State<Arc<EpAppState>>,
+    State(state): State<Arc<EpRouterState>>,
     Path(id): Path<String>,
     Json(req): Json<TrainStepHttp>,
 ) -> Result<Json<TrainStepResponse>, (StatusCode, Json<ErrorResponse>)> {
@@ -892,7 +909,7 @@ async fn ep_train_step(
         session_id: id,
         tensors,
     };
-    match dispatch_slab(state.coordinator.clone(), cmd, payload).await? {
+    match dispatch_slab(&state, cmd, payload).await? {
         rustrain_ipc::EpResult::Train { loss, step } => Ok(Json(TrainStepResponse { loss, step })),
         rustrain_ipc::EpResult::Error(e) => Err(err_resp(&e)),
         _ => Err(err_resp("unexpected result")),
@@ -900,7 +917,7 @@ async fn ep_train_step(
 }
 
 async fn ep_eval_step(
-    State(state): State<Arc<EpAppState>>,
+    State(state): State<Arc<EpRouterState>>,
     Path(id): Path<String>,
     Json(req): Json<TrainStepHttp>,
 ) -> Result<Json<EvalStepResponse>, (StatusCode, Json<ErrorResponse>)> {
@@ -920,7 +937,7 @@ async fn ep_eval_step(
         session_id: id,
         tensors,
     };
-    match dispatch_slab(state.coordinator.clone(), cmd, payload).await? {
+    match dispatch_slab(&state, cmd, payload).await? {
         rustrain_ipc::EpResult::Loss(loss) => Ok(Json(EvalStepResponse { loss })),
         rustrain_ipc::EpResult::Error(e) => Err(err_resp(&e)),
         _ => Err(err_resp("unexpected result")),
@@ -928,7 +945,7 @@ async fn ep_eval_step(
 }
 
 async fn ep_train_multi_lora(
-    State(state): State<Arc<EpAppState>>,
+    State(state): State<Arc<EpRouterState>>,
     Path(id): Path<String>,
     Json(req): Json<TrainMultiLoraHttp>,
 ) -> Result<Json<TrainStepResponse>, (StatusCode, Json<ErrorResponse>)> {
@@ -967,7 +984,7 @@ async fn ep_train_multi_lora(
         lora_rank: req.lora_rank,
         adapter_ids: req.adapter_ids,
     };
-    match dispatch_slab(state.coordinator.clone(), cmd, payload).await? {
+    match dispatch_slab(&state, cmd, payload).await? {
         rustrain_ipc::EpResult::Train { loss, step } => Ok(Json(TrainStepResponse { loss, step })),
         rustrain_ipc::EpResult::Error(e) => Err(err_resp(&e)),
         _ => Err(err_resp("unexpected result")),
@@ -975,13 +992,58 @@ async fn ep_train_multi_lora(
 }
 
 async fn dispatch_slab(
-    coordinator: Arc<crate::ep::EpCoordinator>,
+    state: &EpRouterState,
     command: rustrain_ipc::EpCommand,
     payload: Vec<u8>,
 ) -> Result<rustrain_ipc::EpResult, (StatusCode, Json<ErrorResponse>)> {
-    tokio::task::spawn_blocking(move || coordinator.dispatch_with_slab(&command, &payload))
+    if !state.coordinator.is_healthy() {
+        return Err(ep_dispatch_unavailable("EP coordinator is unavailable"));
+    }
+    let coordinator = Arc::clone(&state.coordinator);
+    state
+        .dispatcher
+        .run(move || coordinator.dispatch_with_slab(&command, &payload))
         .await
-        .map_err(|error| err_resp(&format!("EP dispatch task failed: {error}")))
+        .map_err(ep_dispatch_schedule_error)
+}
+
+async fn dispatch_ep(
+    state: &EpRouterState,
+    command: rustrain_ipc::EpCommand,
+) -> Result<rustrain_ipc::EpResult, (StatusCode, Json<ErrorResponse>)> {
+    if !state.coordinator.is_healthy() {
+        return Err(ep_dispatch_unavailable("EP coordinator is unavailable"));
+    }
+    let coordinator = Arc::clone(&state.coordinator);
+    state
+        .dispatcher
+        .run(move || coordinator.dispatch(&command))
+        .await
+        .map_err(ep_dispatch_schedule_error)
+}
+
+fn ep_dispatch_schedule_error(error: EpDispatchScheduleError) -> (StatusCode, Json<ErrorResponse>) {
+    let status = match error {
+        EpDispatchScheduleError::QueueFull => StatusCode::TOO_MANY_REQUESTS,
+        EpDispatchScheduleError::QueueClosed | EpDispatchScheduleError::WorkerFailed => {
+            StatusCode::SERVICE_UNAVAILABLE
+        }
+    };
+    (
+        status,
+        Json(ErrorResponse {
+            error: error.to_string(),
+        }),
+    )
+}
+
+fn ep_dispatch_unavailable(message: &str) -> (StatusCode, Json<ErrorResponse>) {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(ErrorResponse {
+            error: message.to_string(),
+        }),
+    )
 }
 
 #[cfg(test)]
@@ -989,7 +1051,8 @@ mod tensor_http_shape_tests {
     use base64::{Engine, engine::general_purpose};
 
     use super::{
-        TensorHttp, decode_int64_bytes, pack_tensor_slab, validate_multi_lora_http_shapes,
+        EpDispatchScheduleError, StatusCode, TensorHttp, decode_int64_bytes,
+        ep_dispatch_schedule_error, pack_tensor_slab, validate_multi_lora_http_shapes,
         validate_train_http_shapes,
     };
 
@@ -1082,10 +1145,26 @@ mod tensor_http_shape_tests {
         }
         reference.validate(payload.len()).unwrap();
     }
+
+    #[test]
+    fn dispatch_pressure_and_worker_failure_have_distinct_statuses() {
+        assert_eq!(
+            ep_dispatch_schedule_error(EpDispatchScheduleError::QueueFull).0,
+            StatusCode::TOO_MANY_REQUESTS
+        );
+        assert_eq!(
+            ep_dispatch_schedule_error(EpDispatchScheduleError::QueueClosed).0,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(
+            ep_dispatch_schedule_error(EpDispatchScheduleError::WorkerFailed).0,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+    }
 }
 
 async fn ep_add_lora(
-    State(state): State<Arc<EpAppState>>,
+    State(state): State<Arc<EpRouterState>>,
     Path(id): Path<String>,
     Json(req): Json<AddLoRAHttp>,
 ) -> Result<Json<AddLoRAResponse>, (StatusCode, Json<ErrorResponse>)> {
@@ -1096,7 +1175,7 @@ async fn ep_add_lora(
         target_layers: req.target_layers,
         target_modules: req.target_modules,
     };
-    match state.coordinator.dispatch(&cmd) {
+    match dispatch_ep(&state, cmd).await? {
         rustrain_ipc::EpResult::AdapterId(id) => Ok(Json(AddLoRAResponse { adapter_id: id })),
         rustrain_ipc::EpResult::Error(e) => Err(err_resp(&e)),
         _ => Err(err_resp("unexpected result")),
@@ -1113,12 +1192,11 @@ struct BatchAddLoRAHttp {
 }
 
 async fn ep_batch_add_lora(
-    State(state): State<Arc<EpAppState>>,
+    State(state): State<Arc<EpRouterState>>,
     Path(id): Path<String>,
     Json(req): Json<BatchAddLoRAHttp>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
-    crate::ep::validate_batch_add_lora_count(req.count)
-        .map_err(|error| err_resp(&error))?;
+    crate::ep::validate_batch_add_lora_count(req.count).map_err(|error| err_resp(&error))?;
     let cmd = rustrain_ipc::EpCommand::BatchAddLora {
         session_id: id,
         count: req.count,
@@ -1127,7 +1205,7 @@ async fn ep_batch_add_lora(
         target_layers: req.target_layers,
         target_modules: req.target_modules,
     };
-    match state.coordinator.dispatch(&cmd) {
+    match dispatch_ep(&state, cmd).await? {
         rustrain_ipc::EpResult::Count(n) => Ok(Json(serde_json::json!({"count": n}))),
         rustrain_ipc::EpResult::Error(e) => Err(err_resp(&e)),
         _ => Err(err_resp("unexpected result")),
@@ -1135,7 +1213,7 @@ async fn ep_batch_add_lora(
 }
 
 async fn ep_remove_lora(
-    State(state): State<Arc<EpAppState>>,
+    State(state): State<Arc<EpRouterState>>,
     Path(id): Path<String>,
     Json(req): Json<RemoveLoRAHttp>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
@@ -1143,7 +1221,7 @@ async fn ep_remove_lora(
         session_id: id,
         adapter_id: req.adapter_id,
     };
-    match state.coordinator.dispatch(&cmd) {
+    match dispatch_ep(&state, cmd).await? {
         rustrain_ipc::EpResult::Ok => Ok(Json(serde_json::json!({"removed": true}))),
         rustrain_ipc::EpResult::Error(e) => Err(err_resp(&e)),
         _ => Err(err_resp("unexpected result")),
@@ -1151,11 +1229,11 @@ async fn ep_remove_lora(
 }
 
 async fn ep_list_lora(
-    State(state): State<Arc<EpAppState>>,
+    State(state): State<Arc<EpRouterState>>,
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
     let cmd = rustrain_ipc::EpCommand::ListLora { session_id: id };
-    match state.coordinator.dispatch(&cmd) {
+    match dispatch_ep(&state, cmd).await? {
         rustrain_ipc::EpResult::AdapterIds(ids) => Ok(Json(serde_json::json!({"adapters": ids}))),
         rustrain_ipc::EpResult::Error(e) => Err(err_resp(&e)),
         _ => Err(err_resp("unexpected result")),
@@ -1163,7 +1241,7 @@ async fn ep_list_lora(
 }
 
 async fn ep_export_adapter(
-    State(state): State<Arc<EpAppState>>,
+    State(state): State<Arc<EpRouterState>>,
     Path(id): Path<String>,
     Json(req): Json<ExportHttp>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
@@ -1177,7 +1255,7 @@ async fn ep_export_adapter(
         adapter_id: req.adapter_id,
         generation,
     };
-    match state.coordinator.dispatch(&cmd) {
+    match dispatch_ep(&state, cmd).await? {
         rustrain_ipc::EpResult::Count(n) => Ok(Json(serde_json::json!({"exported": n}))),
         rustrain_ipc::EpResult::Error(e) => Err(err_resp(&e)),
         _ => Err(err_resp("unexpected result")),
@@ -1185,18 +1263,22 @@ async fn ep_export_adapter(
 }
 
 async fn ep_save_checkpoint(
-    State(state): State<Arc<EpAppState>>,
+    State(state): State<Arc<EpRouterState>>,
     Path(id): Path<String>,
     Json(req): Json<CheckpointHttp>,
 ) -> Result<Json<CheckpointResponse>, (StatusCode, Json<ErrorResponse>)> {
     let path = req.path;
     let response_path = path.clone();
+    if !state.coordinator.is_healthy() {
+        return Err(ep_dispatch_unavailable("EP coordinator is unavailable"));
+    }
     let coordinator = Arc::clone(&state.coordinator);
-    let (step, loss) =
-        tokio::task::spawn_blocking(move || coordinator.coordinated_save_checkpoint(&id, &path))
-            .await
-            .map_err(|error| err_resp(&format!("checkpoint save task failed: {error}")))?
-            .map_err(|error| err_resp(&error))?;
+    let (step, loss) = state
+        .dispatcher
+        .run(move || coordinator.coordinated_save_checkpoint(&id, &path))
+        .await
+        .map_err(ep_dispatch_schedule_error)?
+        .map_err(|error| err_resp(&error))?;
     Ok(Json(CheckpointResponse {
         step,
         loss,
@@ -1205,18 +1287,22 @@ async fn ep_save_checkpoint(
 }
 
 async fn ep_load_checkpoint(
-    State(state): State<Arc<EpAppState>>,
+    State(state): State<Arc<EpRouterState>>,
     Path(id): Path<String>,
     Json(req): Json<CheckpointHttp>,
 ) -> Result<Json<CheckpointResponse>, (StatusCode, Json<ErrorResponse>)> {
     let path = req.path;
     let response_path = path.clone();
+    if !state.coordinator.is_healthy() {
+        return Err(ep_dispatch_unavailable("EP coordinator is unavailable"));
+    }
     let coordinator = Arc::clone(&state.coordinator);
-    let (step, loss) =
-        tokio::task::spawn_blocking(move || coordinator.coordinated_load_checkpoint(&id, &path))
-            .await
-            .map_err(|error| err_resp(&format!("checkpoint load task failed: {error}")))?
-            .map_err(|error| err_resp(&error))?;
+    let (step, loss) = state
+        .dispatcher
+        .run(move || coordinator.coordinated_load_checkpoint(&id, &path))
+        .await
+        .map_err(ep_dispatch_schedule_error)?
+        .map_err(|error| err_resp(&error))?;
     Ok(Json(CheckpointResponse {
         step,
         loss,
@@ -1225,11 +1311,11 @@ async fn ep_load_checkpoint(
 }
 
 async fn ep_get_status(
-    State(state): State<Arc<EpAppState>>,
+    State(state): State<Arc<EpRouterState>>,
     Path(id): Path<String>,
 ) -> Result<Json<StatusResponse>, (StatusCode, Json<ErrorResponse>)> {
     let cmd = rustrain_ipc::EpCommand::Status { session_id: id };
-    match state.coordinator.dispatch(&cmd) {
+    match dispatch_ep(&state, cmd).await? {
         rustrain_ipc::EpResult::Status {
             state,
             step,
