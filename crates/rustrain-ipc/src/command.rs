@@ -102,6 +102,10 @@ const fn default_batch_size() -> usize {
 pub enum EpResult {
     Ok,
     Loss(f64),
+    Train {
+        loss: f64,
+        step: u64,
+    },
     AdapterId(i64),
     AdapterIds(Vec<i64>),
     Count(usize),
@@ -126,7 +130,7 @@ impl EpResult {
 
 #[cfg(test)]
 mod tests {
-    use super::EpCommand;
+    use super::{EpCommand, EpResult};
 
     #[test]
     fn train_step_serde_preserves_batch_and_sequence_shape() {
@@ -170,6 +174,23 @@ mod tests {
         match decoded {
             EpCommand::TrainStep { batch_size, .. } => assert_eq!(batch_size, 1),
             other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn train_result_serde_preserves_logical_step() {
+        let result = EpResult::Train {
+            loss: 1.25,
+            step: 7,
+        };
+        let json = serde_json::to_string(&result).unwrap();
+        let decoded: EpResult = serde_json::from_str(&json).unwrap();
+        match decoded {
+            EpResult::Train { loss, step } => {
+                assert_eq!(loss, 1.25);
+                assert_eq!(step, 7);
+            }
+            other => panic!("unexpected result: {other:?}"),
         }
     }
 }

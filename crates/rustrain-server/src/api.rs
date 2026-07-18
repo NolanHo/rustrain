@@ -685,8 +685,20 @@ pub fn ep_router(state: Arc<EpAppState>) -> Router {
         .with_state(state)
 }
 
-async fn ep_health() -> Json<serde_json::Value> {
-    Json(serde_json::json!({"status": "ok", "mode": "ep"}))
+async fn ep_health(
+    State(state): State<Arc<EpAppState>>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    if state.coordinator.is_healthy() {
+        (
+            StatusCode::OK,
+            Json(serde_json::json!({"status": "ok", "mode": "ep"})),
+        )
+    } else {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"status": "error", "mode": "ep"})),
+        )
+    }
 }
 
 async fn ep_create_session(
@@ -797,7 +809,9 @@ async fn ep_train_step(
         seq_len,
     };
     match state.coordinator.dispatch(&cmd) {
-        rustrain_ipc::EpResult::Loss(loss) => Ok(Json(TrainStepResponse { loss, step: 0 })),
+        rustrain_ipc::EpResult::Train { loss, step } => {
+            Ok(Json(TrainStepResponse { loss, step }))
+        }
         rustrain_ipc::EpResult::Error(e) => Err(err_resp(&e)),
         _ => Err(err_resp("unexpected result")),
     }
@@ -867,7 +881,9 @@ async fn ep_train_multi_lora(
         adapter_ids: req.adapter_ids,
     };
     match state.coordinator.dispatch(&cmd) {
-        rustrain_ipc::EpResult::Loss(loss) => Ok(Json(TrainStepResponse { loss, step: 0 })),
+        rustrain_ipc::EpResult::Train { loss, step } => {
+            Ok(Json(TrainStepResponse { loss, step }))
+        }
         rustrain_ipc::EpResult::Error(e) => Err(err_resp(&e)),
         _ => Err(err_resp("unexpected result")),
     }

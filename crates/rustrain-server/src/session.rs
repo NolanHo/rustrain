@@ -11,6 +11,37 @@ use crate::metrics::{FileMetricsSink, MetricsSink, StepMetric};
 use rustrain_parallel::topology::ParallelTopology;
 use rustrain_qwen3_6::lora::{Qwen36AdapterArtifact, Qwen36LoraConfig, Qwen36LoraTargetModule};
 
+fn validate_qwen_parallel_features(
+    is_moe: bool,
+    tp_size: usize,
+    ep_size: usize,
+    ep_a2a: bool,
+    ep_a2a_sharded: bool,
+) -> Result<()> {
+    let is_ep = is_moe && ep_size > 1;
+    if ep_a2a_sharded && !is_ep {
+        bail!("QWEN36_EP_A2A_SHARDED=1 requires expert-parallel training");
+    }
+    if ep_a2a_sharded && !ep_a2a {
+        bail!("QWEN36_EP_A2A_SHARDED=1 requires QWEN36_EP_A2A=1");
+    }
+    if is_moe && tp_size > 1 && ep_size > 1 && !ep_a2a_sharded {
+        bail!(
+            "Qwen server MoE TPxEP requires QWEN36_EP_A2A_SHARDED=1; replicated expert TP is not supported by the native kernel"
+        );
+    }
+    Ok(())
+}
+
+fn validate_tp_intermediate_sizes(tp_size: usize, sizes: &[(&str, i64)]) -> Result<()> {
+    for (kind, intermediate) in sizes {
+        if *intermediate <= 0 || *intermediate % tp_size as i64 != 0 {
+            bail!("{kind} intermediate_size={intermediate} must be divisible by TP_SIZE={tp_size}");
+        }
+    }
+    Ok(())
+}
+
 /// Session states.
 #[derive(Debug, Clone)]
 pub enum SessionState {
@@ -405,16 +436,6 @@ impl TrainingSession for Qwen36Session {
             ));
         }
         topology.coordinates(global_rank)?;
-        if runtime_config.is_moe && tp_size > 1 {
-            return Err(anyhow!(
-                "Qwen server TPxEP requires a source-shard contract that keeps TP peers on identical input batches; use the native CLI trainer until the server request protocol carries source-shard coordinates"
-            ));
-        }
-        if runtime_config.is_moe && topology.data_parallel_size() > 1 {
-            return Err(anyhow!(
-                "native MoE Qwen server does not yet support data parallelism"
-            ));
-        }
         if !runtime_config.is_moe && topology.expert_model_parallel_size() != 1 {
             return Err(anyhow!(
                 "native dense Qwen server requires expert_model_parallel_size=1"
@@ -426,15 +447,20 @@ impl TrainingSession for Qwen36Session {
         let dp_rank = topology.data_rank(global_rank)?;
         let expert_rank = topology.expert_rank(global_rank)?;
         let is_ep = runtime_config.is_moe && ep_size > 1;
-        let is_data_parallel = !runtime_config.is_moe && dp_size > 1;
+        let is_data_parallel = dp_size > 1;
+        let ep_a2a = std::env::var("QWEN36_EP_A2A")
+            .map(|value| !value.is_empty() && value != "0")
+            .unwrap_or(false);
         let ep_a2a_sharded = std::env::var("QWEN36_EP_A2A_SHARDED")
             .map(|value| !value.is_empty() && value != "0")
             .unwrap_or(false);
-        if is_ep && ep_a2a_sharded {
-            return Err(anyhow!(
-                "QWEN36_EP_A2A_SHARDED is not supported by the Qwen server because TrainInput does not carry an EP source-shard coordinate"
-            ));
-        }
+        validate_qwen_parallel_features(
+            runtime_config.is_moe,
+            tp_size,
+            ep_size,
+            ep_a2a,
+            ep_a2a_sharded,
+        )?;
         unsafe {
             std::env::set_var("TP_SIZE", tp_size.to_string());
             std::env::set_var("EP_SIZE", ep_size.to_string());
@@ -448,7 +474,7 @@ impl TrainingSession for Qwen36Session {
             );
         }
         let base_tp_attention = tp_size > 1;
-        let base_tp_mlp = tp_size > 1 && !runtime_config.is_moe;
+        let base_tp_mlp = tp_size > 1;
         let vocab_parallel = tp_size > 1;
         if vocab_parallel
             && (runtime_config.vocab_size <= 0 || runtime_config.vocab_size % tp_size as i64 != 0)
@@ -514,33 +540,18 @@ impl TrainingSession for Qwen36Session {
             }
         }
         if base_tp_mlp {
-            if runtime_config.intermediate_size <= 0
-                || runtime_config.intermediate_size % tp_size as i64 != 0
-            {
-                return Err(anyhow!(
-                    "dense intermediate_size={} must be divisible by TP_SIZE={tp_size}",
-                    runtime_config.intermediate_size
-                ));
-            }
-            if req.target_modules.is_empty()
-                || req.target_modules.iter().any(|name| {
-                    matches!(
-                        name.as_str(),
-                        "gate_proj"
-                            | "up_proj"
-                            | "down_proj"
-                            | "shared_gate_proj"
-                            | "shared_up_proj"
-                            | "shared_down_proj"
-                            | "experts_gate_up_proj"
-                            | "experts_down_proj"
-                    )
-                })
-            {
-                return Err(anyhow!(
-                    "base dense TP MLP currently requires explicit attention-only LoRA target_modules"
-                ));
-            }
+            let intermediates = if runtime_config.is_moe {
+                vec![
+                    ("routed expert", runtime_config.moe_intermediate_size),
+                    (
+                        "shared expert",
+                        runtime_config.shared_expert_intermediate_size,
+                    ),
+                ]
+            } else {
+                vec![("dense", runtime_config.intermediate_size)]
+            };
+            validate_tp_intermediate_sizes(tp_size, &intermediates)?;
         }
 
         // Compute expert shard
@@ -563,71 +574,87 @@ impl TrainingSession for Qwen36Session {
             self.device = tch::Device::Cuda(local_rank);
         }
 
-        // Move to device — for EP, narrow expert tensors before GPU transfer
+        // Apply orthogonal EP and TP shards on CPU before moving weights to CUDA.
         let num_experts = runtime_config.num_experts as i64;
         let mut weights: std::collections::BTreeMap<String, Tensor> =
             std::collections::BTreeMap::new();
         for (name, tensor) in raw_weights {
-            let needs_narrow = is_ep
+            let needs_expert_narrow = is_ep
                 && (name.contains(".mlp.experts.gate_up_proj")
                     || name.contains(".mlp.experts.down_proj"));
-            if needs_narrow && tensor.size()[0] == num_experts {
-                let narrowed = tensor
-                    .narrow(0, expert_start as i64, expert_count as i64)
-                    .contiguous()
-                    .to_device(self.device)
-                    .to_kind(self.compute_kind);
-                weights.insert(name, narrowed);
+            let expert_shard = if needs_expert_narrow && tensor.size()[0] == num_experts {
+                Some(
+                    tensor
+                        .narrow(0, expert_start as i64, expert_count as i64)
+                        .contiguous(),
+                )
             } else {
-                let vocab_shard = if vocab_parallel {
-                    rustrain_qwen3_6::kernel::shard_vocab_weight_for_tp(
+                None
+            };
+            let expert_or_full = expert_shard.as_ref().unwrap_or(&tensor);
+            let moe_tp_shard = if runtime_config.is_moe && base_tp_mlp {
+                rustrain_qwen3_6::kernel::shard_moe_mlp_weight_for_tp(
+                    &name,
+                    expert_or_full,
+                    tp_size,
+                    tp_rank,
+                )?
+            } else {
+                None
+            };
+            let vocab_shard = if expert_shard.is_none() && moe_tp_shard.is_none() && vocab_parallel
+            {
+                rustrain_qwen3_6::kernel::shard_vocab_weight_for_tp(
+                    &name,
+                    &tensor,
+                    runtime_config.vocab_size,
+                    tp_size,
+                    tp_rank,
+                )?
+            } else {
+                None
+            };
+            let local_shard = if moe_tp_shard.is_some() {
+                moe_tp_shard
+            } else if expert_shard.is_some() {
+                expert_shard
+            } else if vocab_shard.is_some() {
+                vocab_shard
+            } else if base_tp_attention {
+                let full_attention_shard =
+                    rustrain_qwen3_6::kernel::shard_full_attention_weight_for_tp(
+                        &name, &tensor, tp_size, tp_rank,
+                    )?;
+                let attention_shard = if full_attention_shard.is_some() {
+                    full_attention_shard
+                } else {
+                    rustrain_qwen3_6::kernel::shard_linear_attention_weight_for_tp(
                         &name,
                         &tensor,
-                        runtime_config.vocab_size,
                         tp_size,
                         tp_rank,
+                        runtime_config.linear_num_key_heads,
+                        runtime_config.linear_key_head_dim,
+                        runtime_config.linear_num_value_heads,
+                        runtime_config.linear_value_head_dim,
                     )?
-                } else {
-                    None
                 };
-                let local_shard = if vocab_shard.is_some() {
-                    vocab_shard
-                } else if base_tp_attention {
-                    let full_attention_shard =
-                        rustrain_qwen3_6::kernel::shard_full_attention_weight_for_tp(
-                            &name, &tensor, tp_size, tp_rank,
-                        )?;
-                    let attention_shard = if full_attention_shard.is_some() {
-                        full_attention_shard
-                    } else {
-                        rustrain_qwen3_6::kernel::shard_linear_attention_weight_for_tp(
-                            &name,
-                            &tensor,
-                            tp_size,
-                            tp_rank,
-                            runtime_config.linear_num_key_heads,
-                            runtime_config.linear_key_head_dim,
-                            runtime_config.linear_num_value_heads,
-                            runtime_config.linear_value_head_dim,
-                        )?
-                    };
-                    if attention_shard.is_some() || !base_tp_mlp {
-                        attention_shard
-                    } else {
-                        rustrain_qwen3_6::kernel::shard_dense_mlp_weight_for_tp(
-                            &name, &tensor, tp_size, tp_rank,
-                        )?
-                    }
+                if attention_shard.is_some() || !base_tp_mlp {
+                    attention_shard
                 } else {
-                    None
-                };
-                let t = local_shard
-                    .as_ref()
-                    .unwrap_or(&tensor)
-                    .to_device(self.device);
-                let processed = t.to_kind(self.compute_kind);
-                weights.insert(name, processed);
-            }
+                    rustrain_qwen3_6::kernel::shard_dense_mlp_weight_for_tp(
+                        &name, &tensor, tp_size, tp_rank,
+                    )?
+                }
+            } else {
+                None
+            };
+            let processed = local_shard
+                .as_ref()
+                .unwrap_or(&tensor)
+                .to_device(self.device)
+                .to_kind(self.compute_kind);
+            weights.insert(name, processed);
         }
 
         // Create C++ training context
@@ -1333,9 +1360,7 @@ impl TrainingSession for Qwen36Session {
                     data.adam_v.len()
                 );
             }
-            if data.adam_m.is_empty()
-                && data.manifest.effective_fixed_optimizer_step() > 0
-            {
+            if data.adam_m.is_empty() && data.manifest.effective_fixed_optimizer_step() > 0 {
                 bail!(
                     "checkpoint fixed optimizer step {} has no Adam state",
                     data.manifest.effective_fixed_optimizer_step()
@@ -1651,5 +1676,50 @@ impl TrainingSession for Qwen36Session {
             .as_ref()
             .map(|ctx| ctx.list_lora())
             .unwrap_or_default()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{validate_qwen_parallel_features, validate_tp_intermediate_sizes};
+
+    #[test]
+    fn source_sharded_moe_tp_ep_is_supported() {
+        validate_qwen_parallel_features(true, 2, 2, true, true).unwrap();
+    }
+
+    #[test]
+    fn replicated_expert_tp_is_rejected() {
+        let error = validate_qwen_parallel_features(true, 2, 2, true, false).unwrap_err();
+        assert!(error.to_string().contains("replicated expert TP"));
+    }
+
+    #[test]
+    fn source_sharded_ep_requires_a2a() {
+        let error = validate_qwen_parallel_features(true, 2, 2, false, true).unwrap_err();
+        assert!(error.to_string().contains("requires QWEN36_EP_A2A=1"));
+    }
+
+    #[test]
+    fn source_sharding_requires_expert_parallelism() {
+        let error = validate_qwen_parallel_features(true, 2, 1, true, true).unwrap_err();
+        assert!(error.to_string().contains("expert-parallel training"));
+    }
+
+    #[test]
+    fn tp_mlp_accepts_divisible_routed_and_shared_intermediates() {
+        validate_tp_intermediate_sizes(2, &[("routed expert", 128), ("shared expert", 64)])
+            .unwrap();
+    }
+
+    #[test]
+    fn tp_mlp_rejects_non_divisible_shared_intermediate() {
+        let error =
+            validate_tp_intermediate_sizes(4, &[("routed expert", 128), ("shared expert", 66)])
+                .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "shared expert intermediate_size=66 must be divisible by TP_SIZE=4"
+        );
     }
 }

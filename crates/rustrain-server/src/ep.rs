@@ -10,6 +10,7 @@
 use std::io;
 use std::ops::Range;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use rustrain_ipc::{EpChannel, EpCommand, EpResult, EpWorker};
@@ -27,6 +28,7 @@ pub struct EpCoordinator {
     channel: Arc<EpChannel>,
     worker_pids: Vec<u32>,
     dispatch_lock: Mutex<()>,
+    shutdown_started: AtomicBool,
 }
 
 impl EpCoordinator {
@@ -34,52 +36,90 @@ impl EpCoordinator {
     /// Each worker is pinned to GPU `rank`.
     /// Uses exec (not fork) because CUDA + fork is incompatible — forked children
     /// inherit parent's CUDA context but can't use it.
-    pub fn launch(
-        world_size: usize,
-        metrics_dir: PathBuf,
-    ) -> io::Result<Self> {
-        let channel = EpChannel::new(world_size)?;
+    pub fn launch(world_size: usize, metrics_dir: PathBuf) -> io::Result<Self> {
+        let dispatch_timeout = std::env::var("RUSTRAIN_EP_DISPATCH_TIMEOUT_SECS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|seconds| *seconds > 0)
+            .map(std::time::Duration::from_secs)
+            .unwrap_or_else(|| std::time::Duration::from_secs(10 * 60));
+        let channel = EpChannel::new_with_timeout(world_size, dispatch_timeout)?;
         let shm_name = channel.shm_name().to_string();
         let channel = Arc::new(channel);
 
-        let exe = std::env::current_exe()
-            .map_err(|e| io::Error::other(format!("current_exe: {e}")))?;
-        let mut worker_pids = Vec::with_capacity(world_size);
+        let exe =
+            std::env::current_exe().map_err(|e| io::Error::other(format!("current_exe: {e}")))?;
+        let mut workers = Vec::with_capacity(world_size);
 
         for rank in 0..world_size {
             let metrics_path = metrics_dir.join(format!("ep_rank{}_metrics.jsonl", rank));
             let child = std::process::Command::new(&exe)
                 .arg("ep-worker")
-                .arg("--shm-name").arg(&shm_name)
-                .arg("--rank").arg(rank.to_string())
-                .arg("--world-size").arg(world_size.to_string())
-                .arg("--metrics-path").arg(&metrics_path)
+                .arg("--shm-name")
+                .arg(&shm_name)
+                .arg("--rank")
+                .arg(rank.to_string())
+                .arg("--world-size")
+                .arg(world_size.to_string())
+                .arg("--metrics-path")
+                .arg(&metrics_path)
                 .env("RANK", rank.to_string())
                 .env("WORLD_SIZE", world_size.to_string())
                 .env("LOCAL_RANK", rank.to_string())
                 .env("RUSTRAIN_NCCL_RUN_ID", &shm_name)
-                .env("QWEN36_LOSS_DIAG", std::env::var("QWEN36_LOSS_DIAG").unwrap_or_default())
-                .env("QWEN36_GROUP_SIZE", std::env::var("QWEN36_GROUP_SIZE").unwrap_or_default())
-                .env("QWEN36_FUSED_CE", std::env::var("QWEN36_FUSED_CE").unwrap_or_default())
+                .env(
+                    "QWEN36_LOSS_DIAG",
+                    std::env::var("QWEN36_LOSS_DIAG").unwrap_or_default(),
+                )
+                .env(
+                    "QWEN36_GROUP_SIZE",
+                    std::env::var("QWEN36_GROUP_SIZE").unwrap_or_default(),
+                )
+                .env(
+                    "QWEN36_FUSED_CE",
+                    std::env::var("QWEN36_FUSED_CE").unwrap_or_default(),
+                )
                 .stdout(std::process::Stdio::inherit())
                 .stderr(std::process::Stdio::inherit())
-                .spawn()
-                .map_err(|e| io::Error::other(format!("spawn worker {rank}: {e}")))?;
+                .spawn();
+            let child = match child {
+                Ok(child) => child,
+                Err(error) => {
+                    terminate_children(&mut workers);
+                    return Err(io::Error::other(format!("spawn worker {rank}: {error}")));
+                }
+            };
             let pid = child.id();
-            // Keep child handle alive — store in a static to prevent early drop
-            // (drop would kill the child)
-            std::mem::forget(child);
-            worker_pids.push(pid);
+            workers.push(child);
             tracing::info!("Launched EP worker rank {} (PID {})", rank, pid);
         }
 
         // Wait for workers to initialize
         std::thread::sleep(std::time::Duration::from_secs(2));
+        for (rank, worker) in workers.iter_mut().enumerate() {
+            match worker.try_wait() {
+                Ok(None) => {}
+                Ok(Some(status)) => {
+                    terminate_children(&mut workers);
+                    return Err(io::Error::other(format!(
+                        "EP worker rank {rank} exited during startup with {status}"
+                    )));
+                }
+                Err(error) => {
+                    terminate_children(&mut workers);
+                    return Err(io::Error::other(format!(
+                        "inspect EP worker rank {rank} during startup: {error}"
+                    )));
+                }
+            }
+        }
+        let worker_pids = workers.iter().map(std::process::Child::id).collect();
 
         Ok(Self {
             channel,
             worker_pids,
             dispatch_lock: Mutex::new(()),
+            shutdown_started: AtomicBool::new(false),
         })
     }
 
@@ -89,21 +129,122 @@ impl EpCoordinator {
             Ok(guard) => guard,
             Err(error) => return EpResult::Error(format!("IPC dispatch lock poisoned: {error}")),
         };
+        if self.shutdown_started.load(Ordering::Acquire) {
+            return EpResult::Error("EP coordinator is shut down".to_string());
+        }
         match self.channel.broadcast(cmd) {
             Ok(result) => result,
-            Err(e) => EpResult::Error(format!("IPC error: {}", e)),
+            Err(error) => {
+                let exited = self.exited_workers();
+                if self
+                    .shutdown_started
+                    .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
+                {
+                    self.terminate_workers();
+                }
+                let message = if exited.is_empty() {
+                    format!("IPC error: {error}")
+                } else {
+                    format!(
+                        "IPC error: {error}; exited workers: {}",
+                        exited.join(", ")
+                    )
+                };
+                EpResult::Error(message)
+            }
         }
+    }
+
+    pub fn is_healthy(&self) -> bool {
+        !self.shutdown_started.load(Ordering::Acquire) && !self.channel.is_poisoned()
     }
 
     /// Send shutdown command to all workers.
     pub fn shutdown(&self) {
+        if self.shutdown_started.swap(true, Ordering::AcqRel) {
+            return;
+        }
         let _guard = self.dispatch_lock.lock().ok();
-        let _ = self.channel.broadcast(&EpCommand::Shutdown);
-        // Wait for worker processes to exit
-        for pid in &self.worker_pids {
-            unsafe {
-                libc::waitpid(*pid as i32, std::ptr::null_mut(), 0);
+        if !self.channel.is_poisoned()
+            && self.channel.broadcast(&EpCommand::Shutdown).is_ok()
+        {
+            let live = wait_for_worker_pids(
+                &self.worker_pids,
+                std::time::Duration::from_secs(2),
+            );
+            if !live.is_empty() {
+                terminate_worker_pids(&live);
             }
+            return;
+        }
+        self.terminate_workers();
+    }
+
+    fn exited_workers(&self) -> Vec<String> {
+        let mut exited = Vec::new();
+        for (rank, pid) in self.worker_pids.iter().enumerate() {
+            if unsafe { libc::kill(*pid as i32, 0) } != 0
+                && io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+            {
+                exited.push(format!("rank {rank} pid {pid}"));
+            }
+        }
+        exited
+    }
+
+    fn terminate_workers(&self) {
+        terminate_worker_pids(&self.worker_pids);
+    }
+}
+
+fn wait_for_worker_pids(pids: &[u32], timeout: std::time::Duration) -> Vec<u32> {
+    let deadline = std::time::Instant::now() + timeout;
+    let mut live = pids.to_vec();
+    while !live.is_empty() && std::time::Instant::now() < deadline {
+        live.retain(|pid| {
+            let result =
+                unsafe { libc::waitpid(*pid as i32, std::ptr::null_mut(), libc::WNOHANG) };
+            result == 0
+                || (result < 0
+                    && io::Error::last_os_error().raw_os_error() == Some(libc::EINTR))
+        });
+        if !live.is_empty() {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+    live
+}
+
+fn terminate_worker_pids(pids: &[u32]) {
+    for pid in pids {
+        unsafe {
+            libc::kill(*pid as i32, libc::SIGTERM);
+        }
+    }
+    let live = wait_for_worker_pids(pids, std::time::Duration::from_secs(2));
+    for pid in live {
+        unsafe {
+            libc::kill(pid as i32, libc::SIGKILL);
+        }
+        wait_for_worker_exit(pid);
+    }
+}
+
+fn terminate_children(children: &mut [std::process::Child]) {
+    for child in children.iter_mut() {
+        let _ = child.kill();
+    }
+    for child in children.iter_mut() {
+        let _ = child.wait();
+    }
+}
+
+fn wait_for_worker_exit(pid: u32) {
+    loop {
+        let result = unsafe { libc::waitpid(pid as i32, std::ptr::null_mut(), 0) };
+        if result >= 0 || io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
+            return;
         }
     }
 }
@@ -142,7 +283,8 @@ pub fn worker_main(
         std::env::set_var("LOCAL_RANK", rank.to_string());
     }
 
-    let mut session = Qwen36Session::new(device, compute_kind, metrics_path);
+    let mut session = Qwen36Session::new(device, compute_kind, metrics_path.clone());
+    let mut active_session_id = None;
 
     // Pre-create NCCL communicator — all workers reach this point simultaneously
     // because EpCoordinator::launch forks all workers before they enter the loop.
@@ -160,7 +302,28 @@ pub fn worker_main(
             }
         };
 
-        let result = execute_command(&mut session, &cmd);
+        let result = match &cmd {
+            EpCommand::CreateSession { session_id } => {
+                match create_worker_session(&mut active_session_id, session_id) {
+                    Ok(()) => EpResult::Ok,
+                    Err(error) => EpResult::Error(error),
+                }
+            }
+            EpCommand::DeleteSession { session_id } => {
+                match delete_worker_session(&mut active_session_id, session_id) {
+                    Ok(()) => {
+                        session = Qwen36Session::new(device, compute_kind, metrics_path.clone());
+                        EpResult::Ok
+                    }
+                    Err(error) => EpResult::Error(error),
+                }
+            }
+            EpCommand::Shutdown => execute_command(&mut session, &cmd),
+            _ => match require_worker_session(&active_session_id, command_session_id(&cmd)) {
+                Ok(()) => execute_command(&mut session, &cmd),
+                Err(error) => EpResult::Error(error),
+            },
+        };
 
         if let Err(e) = worker.signal_done(&result) {
             eprintln!("[ep-worker-{}] signal_done error: {}", rank, e);
@@ -179,16 +342,14 @@ pub fn worker_main(
 /// Execute a command on the local session, return result.
 fn execute_command(session: &mut Qwen36Session, cmd: &EpCommand) -> EpResult {
     match cmd {
-        EpCommand::CreateSession { session_id: _ } => {
-            // Session already created in worker_main; just acknowledge
-            EpResult::Ok
+        EpCommand::CreateSession { .. } | EpCommand::DeleteSession { .. } => {
+            EpResult::Error("session lifecycle command reached the execution layer".into())
         }
-        EpCommand::DeleteSession { .. } => {
-            // In EP mode, we don't really delete the session — just reset state
-            // A full implementation would manage session lifecycle per worker
-            EpResult::Ok
-        }
-        EpCommand::LoadModel { model_path, config_toml, .. } => {
+        EpCommand::LoadModel {
+            model_path,
+            config_toml,
+            ..
+        } => {
             match session.load_model(SessLoadModelRequest {
                 model_path: model_path.clone(),
                 config_toml: config_toml.clone(),
@@ -197,7 +358,11 @@ fn execute_command(session: &mut Qwen36Session, cmd: &EpCommand) -> EpResult {
                 Err(e) => EpResult::Error(e.to_string()),
             }
         }
-        EpCommand::LoadDataset { jsonl_path, seq_len, .. } => {
+        EpCommand::LoadDataset {
+            jsonl_path,
+            seq_len,
+            ..
+        } => {
             match session.load_dataset(SessLoadDatasetRequest {
                 jsonl_path: jsonl_path.clone(),
                 seq_len: *seq_len,
@@ -206,7 +371,17 @@ fn execute_command(session: &mut Qwen36Session, cmd: &EpCommand) -> EpResult {
                 Err(e) => EpResult::Error(e.to_string()),
             }
         }
-        EpCommand::InitLora { rank, alpha, target_layers, target_modules, lr, beta1, beta2, eps, .. } => {
+        EpCommand::InitLora {
+            rank,
+            alpha,
+            target_layers,
+            target_modules,
+            lr,
+            beta1,
+            beta2,
+            eps,
+            ..
+        } => {
             match session.init_lora(InitLoRARequest {
                 rank: *rank,
                 alpha: *alpha,
@@ -221,7 +396,13 @@ fn execute_command(session: &mut Qwen36Session, cmd: &EpCommand) -> EpResult {
                 Err(e) => EpResult::Error(e.to_string()),
             }
         }
-        EpCommand::AddLora { rank, alpha, target_layers, target_modules, .. } => {
+        EpCommand::AddLora {
+            rank,
+            alpha,
+            target_layers,
+            target_modules,
+            ..
+        } => {
             match session.add_lora(AddLoRARequest {
                 rank: *rank,
                 alpha: *alpha,
@@ -232,7 +413,14 @@ fn execute_command(session: &mut Qwen36Session, cmd: &EpCommand) -> EpResult {
                 Err(e) => EpResult::Error(e.to_string()),
             }
         }
-        EpCommand::BatchAddLora { count, rank, alpha, target_layers, target_modules, .. } => {
+        EpCommand::BatchAddLora {
+            count,
+            rank,
+            alpha,
+            target_layers,
+            target_modules,
+            ..
+        } => {
             let mut ids = Vec::with_capacity(*count as usize);
             for _ in 0..*count {
                 match session.add_lora(AddLoRARequest {
@@ -242,22 +430,24 @@ fn execute_command(session: &mut Qwen36Session, cmd: &EpCommand) -> EpResult {
                     target_modules: target_modules.clone(),
                 }) {
                     Ok(id) => ids.push(id),
-                    Err(e) => { return EpResult::Error(e.to_string()); }
+                    Err(e) => {
+                        return EpResult::Error(e.to_string());
+                    }
                 }
             }
             EpResult::Count(ids.len() as usize)
         }
-        EpCommand::RemoveLora { adapter_id, .. } => {
-            match session.remove_lora(*adapter_id) {
-                Ok(b) => {
-                    if b { EpResult::Ok } else { EpResult::Error("adapter not found".into()) }
+        EpCommand::RemoveLora { adapter_id, .. } => match session.remove_lora(*adapter_id) {
+            Ok(b) => {
+                if b {
+                    EpResult::Ok
+                } else {
+                    EpResult::Error("adapter not found".into())
                 }
-                Err(e) => EpResult::Error(e.to_string()),
             }
-        }
-        EpCommand::ListLora { .. } => {
-            EpResult::AdapterIds(session.list_lora())
-        }
+            Err(e) => EpResult::Error(e.to_string()),
+        },
+        EpCommand::ListLora { .. } => EpResult::AdapterIds(session.list_lora()),
         EpCommand::TrainStep {
             input_ids,
             target_mask,
@@ -266,11 +456,11 @@ fn execute_command(session: &mut Qwen36Session, cmd: &EpCommand) -> EpResult {
             seq_len,
             ..
         } => {
-            let dp_shard = match dense_dp_shard_from_env() {
+            let source_shard = match source_shard_from_env() {
                 Ok(shard) => shard,
                 Err(error) => return EpResult::Error(error),
             };
-            let rows = match train_step_rows(*batch_size, dp_shard) {
+            let rows = match train_step_rows(*batch_size, source_shard) {
                 Ok(rows) => rows,
                 Err(error) => return EpResult::Error(error),
             };
@@ -304,7 +494,7 @@ fn execute_command(session: &mut Qwen36Session, cmd: &EpCommand) -> EpResult {
                 target_mask: target_mask_tensor,
                 attention_mask: attention_mask_tensor,
             }) {
-                Ok(TrainOutput { loss, .. }) => EpResult::Loss(loss),
+                Ok(TrainOutput { loss, step }) => EpResult::Train { loss, step },
                 Err(e) => EpResult::Error(e.to_string()),
             }
         }
@@ -328,11 +518,11 @@ fn execute_command(session: &mut Qwen36Session, cmd: &EpCommand) -> EpResult {
             ) {
                 return EpResult::Error(error);
             }
-            let dp_shard = match dense_dp_shard_from_env() {
+            let source_shard = match source_shard_from_env() {
                 Ok(shard) => shard,
                 Err(error) => return EpResult::Error(error),
             };
-            let rows = match multi_lora_rows(*batch_size, *n_total, dp_shard) {
+            let rows = match multi_lora_rows(*batch_size, *n_total, source_shard) {
                 Ok(rows) => rows,
                 Err(error) => return EpResult::Error(error),
             };
@@ -362,15 +552,27 @@ fn execute_command(session: &mut Qwen36Session, cmd: &EpCommand) -> EpResult {
                 *lora_rank,
                 adapter_ids,
             ) {
-                Ok(TrainOutput { loss, .. }) => EpResult::Loss(loss),
+                Ok(TrainOutput { loss, step }) => EpResult::Train { loss, step },
                 Err(e) => EpResult::Error(e.to_string()),
             }
         }
-        EpCommand::EvalStep { input_ids, target_mask, attention_mask, seq_len, .. } => {
+        EpCommand::EvalStep {
+            input_ids,
+            target_mask,
+            attention_mask,
+            seq_len,
+            ..
+        } => {
             let sl = *seq_len as i64;
-            let input_ids_tensor = tch::Tensor::from_slice(input_ids).reshape(&[1, sl]).to_device(session.device());
-            let target_mask_tensor = tch::Tensor::from_slice(target_mask).reshape(&[1, sl]).to_device(session.device());
-            let attention_mask_tensor = tch::Tensor::from_slice(attention_mask).reshape(&[1, sl]).to_device(session.device());
+            let input_ids_tensor = tch::Tensor::from_slice(input_ids)
+                .reshape(&[1, sl])
+                .to_device(session.device());
+            let target_mask_tensor = tch::Tensor::from_slice(target_mask)
+                .reshape(&[1, sl])
+                .to_device(session.device());
+            let attention_mask_tensor = tch::Tensor::from_slice(attention_mask)
+                .reshape(&[1, sl])
+                .to_device(session.device());
 
             match session.eval_step(TrainInput {
                 input_ids: input_ids_tensor,
@@ -386,12 +588,10 @@ fn execute_command(session: &mut Qwen36Session, cmd: &EpCommand) -> EpResult {
             adapter_id,
             generation,
             ..
-        } => {
-            match session.export_distributed_adapter(path, *adapter_id, generation) {
-                Ok(n) => EpResult::Count(n),
-                Err(e) => EpResult::Error(e.to_string()),
-            }
-        }
+        } => match session.export_distributed_adapter(path, *adapter_id, generation) {
+            Ok(n) => EpResult::Count(n),
+            Err(e) => EpResult::Error(e.to_string()),
+        },
         EpCommand::Status { .. } => {
             let s = session.status();
             EpResult::Status {
@@ -401,47 +601,115 @@ fn execute_command(session: &mut Qwen36Session, cmd: &EpCommand) -> EpResult {
                 model_path: s.model_path,
             }
         }
-        EpCommand::Shutdown => {
-            EpResult::Ok
+        EpCommand::Shutdown => EpResult::Ok,
+    }
+}
+
+fn command_session_id(cmd: &EpCommand) -> &str {
+    match cmd {
+        EpCommand::CreateSession { session_id }
+        | EpCommand::DeleteSession { session_id }
+        | EpCommand::LoadModel { session_id, .. }
+        | EpCommand::LoadDataset { session_id, .. }
+        | EpCommand::InitLora { session_id, .. }
+        | EpCommand::AddLora { session_id, .. }
+        | EpCommand::BatchAddLora { session_id, .. }
+        | EpCommand::RemoveLora { session_id, .. }
+        | EpCommand::ListLora { session_id }
+        | EpCommand::TrainStep { session_id, .. }
+        | EpCommand::TrainMultiLora { session_id, .. }
+        | EpCommand::EvalStep { session_id, .. }
+        | EpCommand::ExportAdapter { session_id, .. }
+        | EpCommand::Status { session_id } => session_id,
+        EpCommand::Shutdown => "",
+    }
+}
+
+fn create_worker_session(active: &mut Option<String>, requested: &str) -> Result<(), String> {
+    if requested.is_empty() {
+        return Err("session_id must be non-empty".into());
+    }
+    match active {
+        Some(current) if current == requested => Ok(()),
+        Some(current) => Err(format!(
+            "distributed worker group already owns session {current}; use dynamic LoRA adapters for multi-tenant training or delete it before creating {requested}"
+        )),
+        None => {
+            *active = Some(requested.to_string());
+            Ok(())
         }
     }
 }
 
+fn require_worker_session(active: &Option<String>, requested: &str) -> Result<(), String> {
+    match active {
+        Some(current) if current == requested => Ok(()),
+        Some(current) => Err(format!(
+            "command targets session {requested}, but this distributed worker group owns {current}"
+        )),
+        None => Err(format!(
+            "command targets session {requested}, but no distributed session has been created"
+        )),
+    }
+}
+
+fn delete_worker_session(active: &mut Option<String>, requested: &str) -> Result<(), String> {
+    require_worker_session(active, requested)?;
+    *active = None;
+    Ok(())
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct DpShard {
+struct SourceShard {
     rank: usize,
     size: usize,
 }
 
-fn dense_dp_shard_from_env() -> Result<Option<DpShard>, String> {
-    let data_parallel = std::env::var("RUSTRAIN_DATA_PARALLEL")
-        .map(|value| !value.is_empty() && value != "0")
-        .unwrap_or(false);
-    if !data_parallel {
-        return Ok(None);
-    }
-
+fn source_shard_from_env() -> Result<Option<SourceShard>, String> {
     let topology = ParallelTopology::from_env()
-        .map_err(|error| format!("invalid dense DP topology: {error}"))?;
+        .map_err(|error| format!("invalid source-parallel topology: {error}"))?;
     let global_rank = std::env::var("RANK")
-        .map_err(|_| "RANK is required for dense data parallel training".to_string())?
+        .map_err(|_| "RANK is required for source-parallel training".to_string())?
         .parse::<usize>()
         .map_err(|_| "RANK must be a non-negative integer".to_string())?;
-    dp_shard_for_topology(&topology, global_rank)
+    let ep_source_sharded = std::env::var("QWEN36_EP_A2A_SHARDED")
+        .map(|value| !value.is_empty() && value != "0")
+        .unwrap_or(false);
+    source_shard_for_topology(&topology, global_rank, ep_source_sharded)
 }
 
-fn dp_shard_for_topology(
+fn source_shard_for_topology(
     topology: &ParallelTopology,
     global_rank: usize,
-) -> Result<Option<DpShard>, String> {
-    let size = topology.data_parallel_size();
+    ep_source_sharded: bool,
+) -> Result<Option<SourceShard>, String> {
+    let dp_size = topology.data_parallel_size();
+    let ep_size = topology.expert_model_parallel_size();
+    let size = if ep_source_sharded {
+        dp_size
+            .checked_mul(ep_size)
+            .ok_or_else(|| "source-parallel size overflowed usize".to_string())?
+    } else {
+        dp_size
+    };
     if size <= 1 {
         return Ok(None);
     }
-    let rank = topology
+    let dp_rank = topology
         .data_rank(global_rank)
-        .map_err(|error| format!("invalid dense DP rank: {error}"))?;
-    Ok(Some(DpShard { rank, size }))
+        .map_err(|error| format!("invalid source-parallel DP rank: {error}"))?;
+    let rank = if ep_source_sharded {
+        let ep_rank = topology
+            .expert_rank(global_rank)
+            .map_err(|error| format!("invalid source-parallel EP rank: {error}"))?;
+        dp_rank
+            .checked_mul(ep_size)
+            .and_then(|base| base.checked_add(ep_rank))
+            .ok_or_else(|| "source-parallel rank overflowed usize".to_string())?
+    } else {
+        dp_rank
+    };
+    Ok(Some(SourceShard { rank, size }))
 }
 
 fn validate_flat_tensor_lengths(
@@ -467,19 +735,19 @@ fn validate_flat_tensor_lengths(
     Ok(())
 }
 
-fn train_step_rows(batch_size: usize, shard: Option<DpShard>) -> Result<Range<usize>, String> {
+fn train_step_rows(batch_size: usize, shard: Option<SourceShard>) -> Result<Range<usize>, String> {
     let Some(shard) = shard else {
         return Ok(0..batch_size);
     };
     if shard.size == 0 || shard.rank >= shard.size {
         return Err(format!(
-            "invalid DP shard rank={}/size={}",
+            "invalid source shard rank={}/size={}",
             shard.rank, shard.size
         ));
     }
     if batch_size % shard.size != 0 {
         return Err(format!(
-            "global batch_size={batch_size} must be divisible by DP size {}",
+            "global batch_size={batch_size} must be divisible by source-parallel size {}",
             shard.size
         ));
     }
@@ -491,23 +759,23 @@ fn train_step_rows(batch_size: usize, shard: Option<DpShard>) -> Result<Range<us
 fn multi_lora_rows(
     batch_size: usize,
     n_total: i32,
-    shard: Option<DpShard>,
+    shard: Option<SourceShard>,
 ) -> Result<Range<usize>, String> {
     if n_total <= 0 {
         return Err(format!("n_total must be positive, got {n_total}"));
     }
     let n_total = n_total as usize;
-    if batch_size == 1 || batch_size == n_total {
-        return Ok(0..batch_size);
-    }
     let Some(shard) = shard else {
+        if batch_size == 1 || batch_size == n_total {
+            return Ok(0..batch_size);
+        }
         return Err(format!(
-            "multi-LoRA batch_size={batch_size} must be 1 or n_total={n_total} when DP is disabled"
+            "multi-LoRA batch_size={batch_size} must be 1 or n_total={n_total} when source parallelism is disabled"
         ));
     };
     if shard.size == 0 || shard.rank >= shard.size {
         return Err(format!(
-            "invalid DP shard rank={}/size={}",
+            "invalid source shard rank={}/size={}",
             shard.rank, shard.size
         ));
     }
@@ -516,7 +784,7 @@ fn multi_lora_rows(
         .ok_or_else(|| "multi-LoRA global row count overflowed usize".to_string())?;
     if batch_size != global_rows {
         return Err(format!(
-            "multi-LoRA batch_size={batch_size} must be n_total={n_total} (replicated) or n_total*dp_size={global_rows} (global)"
+            "source-parallel multi-LoRA batch_size={batch_size} must equal n_total*source_parallel_size={global_rows}; submit the complete global source batch"
         ));
     }
     let start = shard.rank * n_total;
@@ -548,38 +816,33 @@ fn tensor_element_range(
 #[cfg(test)]
 mod tests {
     use super::{
-        DpShard, dp_shard_for_topology, multi_lora_rows, tensor_element_range,
-        train_step_rows, validate_flat_tensor_lengths,
+        SourceShard, create_worker_session, delete_worker_session, multi_lora_rows,
+        require_worker_session, source_shard_for_topology, tensor_element_range, train_step_rows,
+        validate_flat_tensor_lengths,
     };
     use rustrain_parallel::topology::ParallelTopology;
 
     #[test]
-    fn train_step_slices_global_batch_contiguously_by_dp_rank() {
+    fn train_step_slices_global_batch_contiguously_by_source_rank() {
         assert_eq!(
-            train_step_rows(8, Some(DpShard { rank: 0, size: 2 })).unwrap(),
+            train_step_rows(8, Some(SourceShard { rank: 0, size: 2 })).unwrap(),
             0..4
         );
         assert_eq!(
-            train_step_rows(8, Some(DpShard { rank: 1, size: 2 })).unwrap(),
+            train_step_rows(8, Some(SourceShard { rank: 1, size: 2 })).unwrap(),
             4..8
         );
-        assert!(train_step_rows(7, Some(DpShard { rank: 0, size: 2 })).is_err());
+        assert!(train_step_rows(7, Some(SourceShard { rank: 0, size: 2 })).is_err());
         assert_eq!(train_step_rows(7, None).unwrap(), 0..7);
     }
 
     #[test]
     fn tp_peers_with_the_same_dp_rank_select_the_same_rows() {
         let topology = ParallelTopology::new(2, 1, 2, 1, 1).unwrap();
-        let tp_rank_zero_rows = train_step_rows(
-            12,
-            dp_shard_for_topology(&topology, 2).unwrap(),
-        )
-        .unwrap();
-        let tp_rank_one_rows = train_step_rows(
-            12,
-            dp_shard_for_topology(&topology, 3).unwrap(),
-        )
-        .unwrap();
+        let tp_rank_zero_rows =
+            train_step_rows(12, source_shard_for_topology(&topology, 2, false).unwrap()).unwrap();
+        let tp_rank_one_rows =
+            train_step_rows(12, source_shard_for_topology(&topology, 3, false).unwrap()).unwrap();
         assert_eq!(tp_rank_zero_rows, tp_rank_one_rows);
         assert_eq!(tp_rank_zero_rows, 6..12);
     }
@@ -587,28 +850,74 @@ mod tests {
     #[test]
     fn custom_rank_order_keeps_tp_peers_on_the_same_dp_shard() {
         let topology = ParallelTopology::with_order(2, 1, 2, 1, 1, "dp-tp").unwrap();
-        let first_tp_peer = train_step_rows(
-            12,
-            dp_shard_for_topology(&topology, 1).unwrap(),
-        )
-        .unwrap();
-        let second_tp_peer = train_step_rows(
-            12,
-            dp_shard_for_topology(&topology, 3).unwrap(),
-        )
-        .unwrap();
+        let first_tp_peer =
+            train_step_rows(12, source_shard_for_topology(&topology, 1, false).unwrap()).unwrap();
+        let second_tp_peer =
+            train_step_rows(12, source_shard_for_topology(&topology, 3, false).unwrap()).unwrap();
         assert_eq!(first_tp_peer, second_tp_peer);
         assert_eq!(first_tp_peer, 6..12);
     }
 
     #[test]
+    fn tp_ep_dp_source_shards_follow_ep_policy() {
+        let topology = ParallelTopology::new(2, 1, 2, 2, 1).unwrap();
+        for global_rank in 0..topology.world_size() {
+            let coordinates = topology.coordinates(global_rank).unwrap();
+            let sharded = source_shard_for_topology(&topology, global_rank, true)
+                .unwrap()
+                .unwrap();
+            assert_eq!(sharded.size, 4);
+            assert_eq!(sharded.rank, coordinates.data * 2 + coordinates.expert);
+
+            let replicated = source_shard_for_topology(&topology, global_rank, false)
+                .unwrap()
+                .unwrap();
+            assert_eq!(replicated.size, 2);
+            assert_eq!(replicated.rank, coordinates.data);
+        }
+    }
+
+    #[test]
+    fn tp_peers_share_tri_axis_source_rows() {
+        let topology = ParallelTopology::with_order(2, 1, 2, 2, 1, "ep-dp-tp").unwrap();
+        for dp_rank in 0..2 {
+            for ep_rank in 0..2 {
+                let peers = (0..topology.world_size())
+                    .filter(|global_rank| {
+                        let coordinates = topology.coordinates(*global_rank).unwrap();
+                        coordinates.data == dp_rank && coordinates.expert == ep_rank
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(peers.len(), 2);
+                let rows = peers
+                    .into_iter()
+                    .map(|global_rank| {
+                        train_step_rows(
+                            16,
+                            source_shard_for_topology(&topology, global_rank, true).unwrap(),
+                        )
+                        .unwrap()
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(rows[0], rows[1]);
+                assert_eq!(
+                    rows[0],
+                    (dp_rank * 8 + ep_rank * 4)..(dp_rank * 8 + ep_rank * 4 + 4)
+                );
+            }
+        }
+    }
+
+    #[test]
     fn multi_lora_supports_replicated_and_global_dp_rows() {
-        let shard = DpShard { rank: 1, size: 2 };
-        assert_eq!(multi_lora_rows(3, 3, Some(shard)).unwrap(), 0..3);
+        let shard = SourceShard { rank: 1, size: 2 };
         assert_eq!(multi_lora_rows(6, 3, Some(shard)).unwrap(), 3..6);
-        assert_eq!(multi_lora_rows(1, 3, Some(shard)).unwrap(), 0..1);
+        assert!(multi_lora_rows(3, 3, Some(shard)).is_err());
+        assert!(multi_lora_rows(1, 3, Some(shard)).is_err());
         assert!(multi_lora_rows(9, 3, Some(shard)).is_err());
         assert!(multi_lora_rows(6, 3, None).is_err());
+        assert_eq!(multi_lora_rows(3, 3, None).unwrap(), 0..3);
+        assert_eq!(multi_lora_rows(1, 3, None).unwrap(), 0..1);
     }
 
     #[test]
@@ -617,5 +926,20 @@ mod tests {
         assert!(validate_flat_tensor_lengths(4, 8, 31, 32, 32).is_err());
         assert!(validate_flat_tensor_lengths(0, 8, 0, 0, 0).is_err());
         assert_eq!(tensor_element_range(4, 8, 1..3).unwrap(), 8..24);
+    }
+
+    #[test]
+    fn distributed_worker_group_enforces_singleton_session_ownership() {
+        let mut active = None;
+        assert!(require_worker_session(&active, "tenant-a").is_err());
+        create_worker_session(&mut active, "tenant-a").unwrap();
+        create_worker_session(&mut active, "tenant-a").unwrap();
+        require_worker_session(&active, "tenant-a").unwrap();
+        assert!(create_worker_session(&mut active, "tenant-b").is_err());
+        assert!(require_worker_session(&active, "tenant-b").is_err());
+        assert!(delete_worker_session(&mut active, "tenant-b").is_err());
+        delete_worker_session(&mut active, "tenant-a").unwrap();
+        create_worker_session(&mut active, "tenant-b").unwrap();
+        require_worker_session(&active, "tenant-b").unwrap();
     }
 }

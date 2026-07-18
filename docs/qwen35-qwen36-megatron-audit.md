@@ -39,7 +39,7 @@ Megatron 的通用 MLP 使用 ColumnParallel fc1、local gated activation 和 Ro
 
 PP 会把层分到不同 stage 并使用 1F1B 等调度；CP 会在序列和 attention state 上做跨 rank 通信。当前 Qwen native `TrainingContext` 仍在每个进程执行完整层栈，因此仅增加 PP/CP 配置不能得到正确语义。
 
-当前 DP/EP 仍不是完整 Megatron 语义：DP 同步 replicated LoRA 梯度并按租户 token count 归一化，expert 参数留在 EP rank；sharded EP 使用 variable-split dispatch/inverse combine 和 fixed/dynamic LoRA data sharding。ABI19 已把所有 top-k assignment 合并为一次 dispatch，并把 local expert 计算合并为 grouped GEMM，但 count planning 仍可见于 host，且没有 fused permutation、异步 overlap 或 DeepEP backend。server 的 `TrainMultiLora` 目前向各 worker 广播相同 batch，因此不能把它当作 source-sharded 服务吞吐。
+当前 DP/EP 仍不是完整 Megatron 语义：DP 同步 replicated LoRA 梯度并按租户 token count 归一化，expert 参数留在 EP rank；sharded EP 使用 variable-split dispatch/inverse combine 和 fixed/dynamic LoRA data sharding。ABI19 已把所有 top-k assignment 合并为一次 dispatch，并把 local expert 计算合并为 grouped GEMM，但 count planning 仍可见于 host，且没有 fused permutation、异步 overlap 或 DeepEP backend。server 虽然广播同一个 global batch command，但 worker 已按五维 topology 选择本 source rows：TP peers 保持相同，sharded EP 使用 `DP*EP` sources，replicated EP 只按 DP 分片。IPC timeout 会永久 poison channel，首次失败立即终止并回收 worker，health 返回 unavailable；partial launch 同样回收已启动 ranks。数据面仍是 base64/JSON 和每 worker 全量反序列化，尚不能视为高吞吐服务传输。
 
 ### 优化器与恢复
 
@@ -67,7 +67,7 @@ ABI15 的两层 GDN base-TP smoke 覆盖复合 QKV/conv head shard、Z/A/B/A_log
 
 ## 继续达到 Megatron 级别所需的最小工作包
 
-1. 在已验证的 TP x EP x expert-DP 三轴子集上补齐 server source-sharded dispatch；实现 PP/CP runtime process groups、launcher、scheduler 和 checkpoint rank mapping。
+1. 把 server 的 JSON global-batch transport 替换为 binary tensor slab，并实现两阶段 distributed save/load；随后实现 PP/CP runtime process groups、launcher、scheduler 和 checkpoint rank mapping。
 2. 为 dense/expert MLP 增加 fused gate/up FC1、跨 topology checkpoint reshard 与 MTP 支持；为 GDN 增加稳定的 chunk/state-checkpoint backward 与 sequence/context parallel，为 full attention 融合 QKV/SDPA 并增加 sequence parallel；为 PP 实现 stage forward/backward 与 1F1B scheduler；为 CP 实现 ring attention/state exchange。
 3. 将 EP dispatch/combine 替换为 fused/异步路径，并测量通信与计算重叠。
 4. 为 checkpoint 增加跨 topology reshard、可恢复的 pending accumulation state，并为旧 v3 attention checkpoint 提供离线迁移工具。

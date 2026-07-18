@@ -899,14 +899,36 @@ paths=["/tmp/qwen3_6_test.jsonl"]
         _ => bail!("batch_add_lora unexpected result"),
     }
 
-    // Build input tensors
-    let ids: Vec<i64> = vec![1; seq_len];
-    let mask: Vec<i64> = {
-        let mut m = vec![0i64; 20];
-        m.extend(vec![1i64; seq_len - 20]);
-        m
+    // Build one n_total-row tenant batch for every independent source coordinate.
+    let topology = rustrain_parallel::topology::ParallelTopology::from_env_with_world_size(
+        world_size,
+    )?;
+    let ep_source_sharded = std::env::var("QWEN36_EP_A2A_SHARDED")
+        .map(|value| !value.is_empty() && value != "0")
+        .unwrap_or(false);
+    let source_parallel_size = if ep_source_sharded {
+        topology
+            .data_parallel_size()
+            .checked_mul(topology.expert_model_parallel_size())
+            .ok_or_else(|| anyhow!("source-parallel size overflowed usize"))?
+    } else {
+        topology.data_parallel_size()
     };
-    let attn: Vec<i64> = vec![1; seq_len];
+    let global_batch_size = usize::try_from(n_adapters)
+        .map_err(|_| anyhow!("n_adapters must be positive"))?
+        .checked_mul(source_parallel_size)
+        .ok_or_else(|| anyhow!("benchmark global batch size overflowed usize"))?;
+    if global_batch_size == 0 {
+        bail!("n_adapters and source-parallel size must be positive");
+    }
+    let tensor_elements = seq_len
+        .checked_mul(global_batch_size)
+        .ok_or_else(|| anyhow!("benchmark tensor element count overflowed usize"))?;
+    let ids = vec![1i64; tensor_elements];
+    let mut mask_row = vec![1i64; seq_len];
+    mask_row[..20.min(seq_len)].fill(0);
+    let mask = mask_row.repeat(global_batch_size);
+    let attn = vec![1i64; tensor_elements];
 
     // Warmup
     eprintln!("[bench] warmup...");
@@ -916,13 +938,13 @@ paths=["/tmp/qwen3_6_test.jsonl"]
         input_ids: ids.clone(),
         target_mask: mask.clone(),
         attention_mask: attn.clone(),
-        batch_size: 1,
+        batch_size: global_batch_size,
         seq_len,
         n_total: n_adapters,
         lora_rank,
         adapter_ids: vec![],
     }) {
-        EpResult::Loss(l) => l,
+        EpResult::Train { loss, .. } => loss,
         EpResult::Error(e) => {
             bail!("warmup failed: {}", e);
         }
@@ -957,14 +979,14 @@ paths=["/tmp/qwen3_6_test.jsonl"]
             input_ids: ids.clone(),
             target_mask: mask.clone(),
             attention_mask: attn.clone(),
-            batch_size: 1,
+            batch_size: global_batch_size,
             seq_len,
             n_total: n_adapters,
             lora_rank,
             adapter_ids: vec![],
         }) {
-            EpResult::Loss(l) => {
-                losses.push(l);
+            EpResult::Train { loss, .. } => {
+                losses.push(loss);
                 total_adapters += n_adapters as i64;
                 total_steps += 1;
                 let elapsed = start.elapsed().as_secs_f64();
@@ -973,7 +995,7 @@ paths=["/tmp/qwen3_6_test.jsonl"]
                     eprintln!(
                         "  step {}: loss={:.6} time={}ms total={} adp in {:.0}s = {:.1} adp/s",
                         total_steps,
-                        l,
+                        loss,
                         t0.elapsed().as_millis(),
                         total_adapters,
                         elapsed,
