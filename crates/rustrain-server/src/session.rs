@@ -989,6 +989,24 @@ impl TrainingSession for Qwen36Session {
             ep_a2a,
             ep_a2a_sharded,
         )?;
+        let sequence_parallel = std::env::var("QWEN36_SEQUENCE_PARALLEL")
+            .map(|value| !value.is_empty() && value != "0")
+            .unwrap_or(false);
+        if sequence_parallel
+            && (runtime_config.is_moe
+                || runtime_config.has_vision
+                || tp_size != 2
+                || cp_size != 1
+                || ep_size != 1
+                || dp_size != 1
+                || pp_size != 1
+                || runtime_config.mtp_num_hidden_layers > 0
+                || runtime_config.router_aux_loss_coef != 0.0)
+        {
+            return Err(anyhow!(
+                "QWEN36_SEQUENCE_PARALLEL=1 currently requires dense text-only fixed-LoRA TP2 with CP=EP=DP=PP=1, MTP disabled, and router_aux_loss_coef=0"
+            ));
+        }
         unsafe {
             std::env::set_var("TP_SIZE", tp_size.to_string());
             std::env::set_var("CP_SIZE", cp_size.to_string());

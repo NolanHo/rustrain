@@ -1617,6 +1617,11 @@ enum class LoraTpLayout : uint8_t {
     RowParallel,
 };
 
+struct TrainingContext;
+
+static LoraTpLayout lora_tp_layout(
+    const TrainingContext* ctx, int64_t layer_idx, int64_t pair_idx);
+
 // Per-sample adapter projection used by the batched multi-LoRA path.  This is
 // intentionally separate from RoutedExpertLora: routed experts carry one
 // A/B pair per local expert, while dense/shared projections carry one pair per

@@ -449,6 +449,21 @@ fn train_impl(
         topology.validate_world_size(world_size)?;
         topology.coordinates(rank)?;
     }
+    let sequence_parallel = env_enabled("QWEN36_SEQUENCE_PARALLEL");
+    if sequence_parallel
+        && (runtime_config.is_moe
+            || runtime_config.has_vision
+            || tp_size != 2
+            || pp_size != 1
+            || cp_size != 1
+            || dp_size != 1
+            || runtime_config.mtp_num_hidden_layers > 0
+            || runtime_config.router_aux_loss_coef != 0.0)
+    {
+        bail!(
+            "QWEN36_SEQUENCE_PARALLEL=1 currently requires dense text-only fixed-LoRA TP2 with PP=CP=DP=1, MTP disabled, and router_aux_loss_coef=0"
+        );
+    }
     let is_data_parallel = dp_size > 1;
     unsafe {
         std::env::set_var("TP_SIZE", tp_size.to_string());
