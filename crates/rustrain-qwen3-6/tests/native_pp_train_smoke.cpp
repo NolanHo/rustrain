@@ -31,7 +31,8 @@ extern "C" int32_t qwen36_init_parallel_nccl_v2(
     int32_t, int32_t, int32_t,
     int32_t, int32_t, int32_t,
     int32_t, int32_t, int32_t);
-extern "C" double qwen36_train_step(void*, void*, void*, void*);
+extern "C" double qwen36_train_micro_step(
+    void*, void*, void*, void*, double, int32_t);
 extern "C" int64_t qwen36_get_step_count(void*);
 extern "C" void qwen36_free_training_context(void*);
 
@@ -82,6 +83,7 @@ int main() {
     config.rms_eps = 1e-6;
     config.intermediate_size = 8;
     const int32_t stage_flags = pp_rank == 0 ? 1 : 2;
+    const int64_t target_layer = 0;
     void* context = qwen36_create_training_context_v2(
         weight_ptrs.data(), static_cast<int64_t>(weight_ptrs.size()),
         pp_rank == 0 ? &embed : nullptr,
@@ -90,7 +92,7 @@ int main() {
         &config, 1, pp_rank, 2, stage_flags,
         static_cast<int32_t>(at::kBFloat16),
         1.0, 1e-3, 0.9, 0.999, 1e-8, 4, 1e-6, 1,
-        nullptr, 0, "q_proj", 0);
+        &target_layer, 1, "q_proj", 0);
     assert(context);
     assert(qwen36_init_parallel_nccl_v2(
         context, rank, 2,
@@ -105,12 +107,16 @@ int main() {
         .reshape({1, 3});
     auto target_mask = at::ones(
         {1, 3}, at::TensorOptions().device(at::kCUDA).dtype(at::kLong));
-    const double loss = qwen36_train_step(
-        context, &input_ids, &target_mask, nullptr);
+    const double warmup_loss = qwen36_train_micro_step(
+        context, &input_ids, &target_mask, nullptr, 0.5, 0);
+    assert(std::isfinite(warmup_loss) && warmup_loss >= 0.0);
+    assert(qwen36_get_step_count(context) == 0);
+    const double loss = qwen36_train_micro_step(
+        context, &input_ids, &target_mask, nullptr, 0.5, 1);
     assert(std::isfinite(loss) && loss >= 0.0);
     assert(qwen36_get_step_count(context) == 1);
-    std::printf("native_qwen36_pp_train rank=%d loss=%0.6f step=1 ok\n",
-        rank, loss);
+    std::printf("native_qwen36_pp_train rank=%d loss=%0.6f "
+        "warmup=%0.6f step=1 ok\n", rank, loss, warmup_loss);
     qwen36_free_training_context(context);
     return 0;
 }

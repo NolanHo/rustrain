@@ -1155,8 +1155,9 @@ fn source_shard_from_env() -> Result<Option<SourceShard>, String> {
 pub(crate) fn validate_multi_lora_global_batch_size(
     batch_size: usize,
     n_total: i32,
+    world_size: usize,
 ) -> Result<(), String> {
-    let topology = ParallelTopology::from_env()
+    let topology = ParallelTopology::from_env_with_world_size(world_size)
         .map_err(|error| format!("invalid source-parallel topology: {error}"))?;
     let ep_source_sharded = std::env::var("QWEN36_EP_A2A_SHARDED")
         .map(|value| !value.is_empty() && value != "0")
@@ -1330,7 +1331,7 @@ mod tests {
         create_checkpoint_staging, create_worker_session, delete_worker_session, multi_lora_rows,
         publish_checkpoint_noreplace, require_worker_session, source_shard_for_topology,
         tensor_element_range, train_step_rows, validate_batch_add_lora_count,
-        validate_flat_tensor_lengths,
+        validate_flat_tensor_lengths, validate_multi_lora_global_batch_size,
     };
     use rustrain_parallel::topology::ParallelTopology;
 
@@ -1439,6 +1440,12 @@ mod tests {
         assert!(multi_lora_rows(6, 3, None).is_err());
         assert_eq!(multi_lora_rows(3, 3, None).unwrap(), 0..3);
         assert_eq!(multi_lora_rows(1, 3, None).unwrap(), 0..1);
+    }
+
+    #[test]
+    fn multi_lora_admission_uses_launcher_world_size() {
+        assert!(validate_multi_lora_global_batch_size(6, 3, 2).is_ok());
+        assert!(validate_multi_lora_global_batch_size(3, 3, 2).is_err());
     }
 
     #[test]

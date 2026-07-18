@@ -32,10 +32,12 @@ pub struct AppState {
 /// EP mode: HTTP server dispatches to workers via IPC coordinator.
 pub struct EpAppState {
     pub coordinator: Arc<crate::ep::EpCoordinator>,
+    pub world_size: usize,
 }
 
 struct EpRouterState {
     coordinator: Arc<crate::ep::EpCoordinator>,
+    world_size: usize,
     dispatcher: EpDispatchScheduler,
     dispatch_submission: Mutex<()>,
     multi_lora_batcher: MultiLoraBatcher,
@@ -1267,6 +1269,7 @@ pub fn ep_router(state: Arc<EpAppState>) -> Router {
     let multi_lora_batcher = MultiLoraBatcher::new(batch_config);
     let state = Arc::new(EpRouterState {
         coordinator: Arc::clone(&state.coordinator),
+        world_size: state.world_size,
         dispatcher: EpDispatchScheduler::new(configured_queue_capacity()),
         dispatch_submission: Mutex::new(()),
         multi_lora_batcher,
@@ -1505,7 +1508,7 @@ async fn ep_train_multi_lora(
         req.n_total,
     )
     .map_err(|e| err_resp(&e))?;
-    crate::ep::validate_multi_lora_global_batch_size(batch_size, req.n_total)
+    crate::ep::validate_multi_lora_global_batch_size(batch_size, req.n_total, state.world_size)
         .map_err(|error| err_resp(&error))?;
     let (tensors, payload) = pack_tensor_slab(
         &req.input_ids,

@@ -731,6 +731,7 @@ fn run_ep_server(
     rt.block_on(async move {
         let app_state = std::sync::Arc::new(api::EpAppState {
             coordinator: coordinator.clone(),
+            world_size,
         });
         let http_router = api::ep_router(app_state);
         let http_listener = tokio::net::TcpListener::bind(&http_addr)

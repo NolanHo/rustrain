@@ -2477,6 +2477,12 @@ struct TrainingContext {
     std::vector<at::Tensor> adam_m;
     std::vector<at::Tensor> adam_v;
     double lr, beta1, beta2, eps;
+    // Fixed-LoRA target identity is global even when the context owns only a
+    // pipeline stage. PP consensus hashes this metadata instead of local
+    // tensor slots, which legitimately differ between stages.
+    bool fixed_all_target_layers = true;
+    std::set<int64_t> fixed_target_layers_global;
+    std::set<std::string> fixed_target_modules;
     // The fixed adapter's Adam bias-correction clock. Dynamic tenant updates
     // must not advance it because every tenant has its own optimizer_step.
     int64_t fixed_optimizer_step;
@@ -2876,6 +2882,64 @@ static void validate_fixed_collective_registry(
             "fixed LoRA registry mismatch across distributed ranks; all "
             "ranks must use the same active slots, tensor layouts, and "
             "optimizer phase/clock");
+    }
+}
+
+static void validate_pipeline_collective_registry(
+    TrainingContext* ctx, int64_t optimizer_phase
+) {
+    if (!ctx || !ctx->pp_comm || ctx->pp_world_size <= 1) return;
+
+    AdapterRegistryHash hash;
+    hash.add_u64(ctx->global_num_layers);
+    hash.add_u64(ctx->fixed_all_target_layers);
+    hash.add_u64(ctx->fixed_target_layers_global.size());
+    for (const auto layer : ctx->fixed_target_layers_global)
+        hash.add_u64(layer);
+    hash.add_u64(ctx->fixed_target_modules.size());
+    for (const auto& module : ctx->fixed_target_modules)
+        hash.add_string(module);
+    hash.add_u64(ctx->fixed_optimizer_step);
+    uint64_t token_weight_bits = 0;
+    static_assert(sizeof(token_weight_bits) == sizeof(ctx->accumulated_token_weight));
+    std::memcpy(&token_weight_bits, &ctx->accumulated_token_weight,
+        sizeof(token_weight_bits));
+    hash.add_u64(token_weight_bits);
+
+    constexpr uint64_t kPositiveInt64Mask =
+        static_cast<uint64_t>(std::numeric_limits<int64_t>::max());
+    const std::vector<int64_t> signature_values{
+        optimizer_phase,
+        ctx->fixed_optimizer_step,
+        static_cast<int64_t>(hash.first & kPositiveInt64Mask),
+        static_cast<int64_t>(hash.second & kPositiveInt64Mask),
+    };
+    auto options = at::TensorOptions().dtype(at::kLong).device(
+        at::kCUDA, ctx->cuda_device);
+    auto minimum = at::tensor(signature_values, options);
+    auto maximum = minimum.clone();
+    auto stream = c10::cuda::getCurrentCUDAStream(ctx->cuda_device).stream();
+    auto min_error = ncclAllReduce(
+        minimum.data_ptr<int64_t>(), minimum.data_ptr<int64_t>(),
+        minimum.numel(), ncclInt64, ncclMin, ctx->pp_comm, stream);
+    TORCH_CHECK(min_error == ncclSuccess,
+        "PP fixed-LoRA registry minimum all-reduce failed: ",
+        ncclGetErrorString(min_error));
+    auto max_error = ncclAllReduce(
+        maximum.data_ptr<int64_t>(), maximum.data_ptr<int64_t>(),
+        maximum.numel(), ncclInt64, ncclMax, ctx->pp_comm, stream);
+    TORCH_CHECK(max_error == ncclSuccess,
+        "PP fixed-LoRA registry maximum all-reduce failed: ",
+        ncclGetErrorString(max_error));
+    const auto minimum_cpu = minimum.to(at::kCPU);
+    const auto maximum_cpu = maximum.to(at::kCPU);
+    const auto* minimum_data = minimum_cpu.data_ptr<int64_t>();
+    const auto* maximum_data = maximum_cpu.data_ptr<int64_t>();
+    for (int64_t index = 0; index < minimum.numel(); ++index) {
+        TORCH_CHECK(minimum_data[index] == maximum_data[index],
+            "pipeline fixed-LoRA registry mismatch across stages; all stages "
+            "must use the same global target identity, optimizer phase, "
+            "clock, and accumulation window");
     }
 }
 
@@ -6066,8 +6130,11 @@ static bool apply_fixed_lora_optimizer(
         TORCH_CHECK(launch_error == cudaSuccess,
             "fused FP32-gradient Adam launch failed: ",
             cudaGetErrorString(launch_error));
-        ctx->fixed_optimizer_step = next_step;
     }
+    // A pipeline stage may own no selected target slots. It still participates
+    // in the successful global optimizer commit and must advance its clock so
+    // PP checkpoint generations and later phase validation stay aligned.
+    ctx->fixed_optimizer_step = next_step;
     clear_gradient_accumulators(ctx);
     return true;
 }
@@ -6152,9 +6219,8 @@ static double qwen36_pipeline_train_micro_step(
         "pipeline fixed-LoRA path does not yet support dynamic adapters");
     TORCH_CHECK(!ctx->has_mtp && !ctx->use_checkpoint,
         "pipeline baseline does not support MTP or manual checkpointing");
-    TORCH_CHECK(apply_optimizer == 1,
-        "pipeline baseline requires apply_optimizer=1; gradient accumulation "
-        "scheduling is not wired yet");
+    TORCH_CHECK(apply_optimizer == 0 || apply_optimizer == 1,
+        "pipeline apply_optimizer must be 0 or 1");
     TORCH_CHECK(std::isfinite(gradient_scale) && gradient_scale > 0.0,
         "pipeline gradient scale must be finite and positive");
     TORCH_CHECK(input_ids.is_cuda() && target_mask.is_cuda() &&
@@ -6169,13 +6235,12 @@ static double qwen36_pipeline_train_micro_step(
         ctx->attention_mask = at::Tensor();
         ctx->attention_lengths = at::Tensor();
     }
-    validate_fixed_collective_registry(ctx, apply_optimizer);
-
     const double supervised_tokens = target_mask.narrow(
         1, 1, target_mask.size(1) - 1).to(at::kFloat).sum().item<double>();
     const double micro_token_weight = gradient_scale * supervised_tokens;
     TORCH_CHECK(std::isfinite(micro_token_weight) && micro_token_weight >= 0.0,
         "pipeline token weight must be finite and non-negative");
+    validate_pipeline_collective_registry(ctx, apply_optimizer);
     const int64_t hidden_size = ctx->weight_ptrs.empty()
         ? 0 : ctx->weight_ptrs[0]->numel();
     TORCH_CHECK(hidden_size > 0, "pipeline stage has no hidden-size metadata");
@@ -7487,11 +7552,13 @@ static void* qwen36_create_training_context_impl(
         // Build target layer set
         std::set<int64_t> target_set;
         const bool all_target_layers = !target_layers || num_target_layers == 0;
+        ctx->fixed_all_target_layers = all_target_layers;
         if (target_layers && num_target_layers > 0) {
             for (int64_t j = 0; j < num_target_layers; j++) {
                 TORCH_CHECK(target_layers[j] >= 0 && target_layers[j] < global_num_layers,
                     "LoRA target layer out of range: ", target_layers[j],
                     " for model with ", global_num_layers, " layers");
+                ctx->fixed_target_layers_global.insert(target_layers[j]);
                 if (target_layers[j] >= global_layer_start &&
                         target_layers[j] < global_layer_start + num_layers) {
                     target_set.insert(target_layers[j] - global_layer_start);
@@ -7507,6 +7574,7 @@ static void* qwen36_create_training_context_impl(
                 if (!item.empty()) target_modules.insert(item);
             }
         }
+        ctx->fixed_target_modules = target_modules;
         for (const auto& name : target_modules) {
             TORCH_CHECK(
                 name == "q_proj" || name == "k_proj" || name == "v_proj" ||
@@ -7866,6 +7934,7 @@ __attribute__((visibility("default"))) double qwen36_train_micro_step(
 ) {
     try {
         auto* ctx = reinterpret_cast<TrainingContext*>(ctx_ptr);
+        GradientAccumulationFailureGuard accumulation_guard{ctx};
         if (ctx && ctx->pp_world_size > 1) {
             auto* input_ids = reinterpret_cast<at::Tensor*>(input_ids_ptr);
             auto* target_mask = reinterpret_cast<at::Tensor*>(target_mask_ptr);
@@ -7874,12 +7943,13 @@ __attribute__((visibility("default"))) double qwen36_train_micro_step(
                 : nullptr;
             TORCH_CHECK(input_ids && target_mask,
                 "pipeline train step requires input and target tensors");
-            return qwen36_pipeline_train_micro_step(
+            const double loss = qwen36_pipeline_train_micro_step(
                 ctx, *input_ids, *target_mask, attention_mask,
                 gradient_scale, apply_optimizer);
+            accumulation_guard.disarmed = true;
+            return loss;
         }
         validate_native_execution_topology(ctx);
-        GradientAccumulationFailureGuard accumulation_guard{ctx};
         auto* input_ids_tensor = reinterpret_cast<at::Tensor*>(input_ids_ptr);
         auto* target_mask_tensor = reinterpret_cast<at::Tensor*>(target_mask_ptr);
         auto* attention_mask_tensor = attention_mask_ptr
