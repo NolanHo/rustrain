@@ -2345,7 +2345,7 @@ mod mtp_tests {
         descriptor.qk_rope = 2;
         descriptor.v_head = 2;
         descriptor.kv_lora = 2;
-        descriptor.idx_head_dim = hidden_size;
+        descriptor.idx_head_dim = hidden_size as i32;
         descriptor.idx_n_heads = 1;
         descriptor.idx_n_heads_global = 1;
         descriptor.idx_topk = 2;
