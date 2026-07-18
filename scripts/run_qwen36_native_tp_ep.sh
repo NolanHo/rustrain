@@ -7,7 +7,7 @@ case "$mode" in
         test_name=native_smoke
         test_source=crates/rustrain-qwen3-6/tests/native_smoke.cpp
         ;;
-    smoke|tri-smoke|tri-replicated-smoke)
+    smoke|gpu-metadata-smoke|tri-smoke|tri-replicated-smoke)
         test_name=native_tp_ep_smoke
         test_source=crates/rustrain-qwen3-6/tests/native_tp_ep_smoke.cpp
         ;;
@@ -15,12 +15,16 @@ case "$mode" in
         test_name=native_ep_smoke
         test_source=crates/rustrain-qwen3-6/tests/native_ep_smoke.cpp
         ;;
+    ep-bench)
+        test_name=native_ep_bench
+        test_source=crates/rustrain-qwen3-6/tests/native_ep_bench.cpp
+        ;;
     bench)
         test_name=native_tp_ep_bench
         test_source=crates/rustrain-qwen3-6/tests/native_tp_ep_bench.cpp
         ;;
     *)
-        echo "usage: $0 [local-smoke|smoke|tri-smoke|tri-replicated-smoke|ep-smoke|bench]" >&2
+        echo "usage: $0 [local-smoke|smoke|gpu-metadata-smoke|tri-smoke|tri-replicated-smoke|ep-smoke|ep-bench|bench]" >&2
         exit 2
         ;;
 esac
@@ -194,11 +198,22 @@ elif [[ "$mode" == "tri-smoke" || "$mode" == "tri-replicated-smoke" ]]; then
     QWEN36_EP_A2A=1 QWEN36_EP_A2A_SHARDED="$sharded_a2a" \
         "$python_bin" -m torch.distributed.run --standalone \
             --nnodes=1 --nproc-per-node=8 --no-python "$test_bin"
-elif [[ "$mode" == "smoke" || "$mode" == "bench" ]]; then
-    TP_SIZE=2 EP_SIZE=2 DP_SIZE=1 \
+elif [[ "$mode" == "smoke" || "$mode" == "gpu-metadata-smoke" || "$mode" == "bench" ]]; then
+    gpu_metadata_env=()
+    if [[ "$mode" == "gpu-metadata-smoke" ]]; then
+        gpu_metadata_env=(QWEN36_EP_A2A_GPU_METADATA=1)
+    fi
+    env "${gpu_metadata_env[@]}" TP_SIZE=2 EP_SIZE=2 DP_SIZE=1 \
     QWEN36_EP_A2A=1 QWEN36_EP_A2A_SHARDED=1 \
         "$python_bin" -m torch.distributed.run --standalone \
             --nnodes=1 --nproc-per-node=4 --no-python "$test_bin"
+elif [[ "$mode" == "ep-bench" ]]; then
+    ep_bench_world="${EP_BENCH_WORLD:-4}"
+    TP_SIZE=1 EP_SIZE="$ep_bench_world" DP_SIZE=1 \
+    QWEN36_EP_A2A=1 QWEN36_EP_A2A_SHARDED=1 \
+        "$python_bin" -m torch.distributed.run --standalone \
+            --nnodes=1 --nproc-per-node="$ep_bench_world" \
+            --no-python "$test_bin"
 else
     TP_SIZE=1 EP_SIZE=2 DP_SIZE=1 \
     QWEN36_EP_A2A=1 QWEN36_EP_A2A_SHARDED=1 \

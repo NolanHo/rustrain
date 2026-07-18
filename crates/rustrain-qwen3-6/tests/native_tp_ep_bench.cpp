@@ -281,6 +281,9 @@ int main() {
     const int experts = env_int("BENCH_EXPERTS", 8);
     const int intermediate = env_int("BENCH_INTERMEDIATE", 2048);
     const int top_k = env_int("BENCH_TOP_K", 2);
+    const bool gpu_metadata = env_enabled(
+        "QWEN36_EP_A2A_GPU_METADATA",
+        kEpSize >= 4 && batch * seq * (packed_a2a ? top_k : 1) >= 512);
     const int lora_rank = env_int("BENCH_LORA_RANK", 16);
     const int layers = env_int("BENCH_LAYERS", 1);
     const int vocab = env_int("BENCH_VOCAB", 8192);
@@ -484,6 +487,8 @@ int main() {
         << "\"abi\":" << kAbiVersion << ','
         << "\"ep_a2a\":true,\"ep_a2a_sharded\":true,"
         << "\"ep_a2a_packed\":" << (packed_a2a ? "true" : "false") << ','
+        << "\"ep_a2a_gpu_metadata\":"
+        << (gpu_metadata ? "true" : "false") << ','
         << "\"timing_scope\":\"world_max\","
         << "\"batch\":" << batch << ",\"seq\":" << seq << ','
         << "\"hidden\":" << hidden << ",\"heads\":" << heads << ','

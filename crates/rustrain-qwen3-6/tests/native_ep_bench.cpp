@@ -8,6 +8,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <initializer_list>
 #include <numeric>
 #include <vector>
@@ -30,10 +31,17 @@ extern "C" void* qwen36_create_training_context(
 extern "C" int32_t qwen36_init_nccl(void*);
 extern "C" double qwen36_train_step(void*, void*, void*, void*);
 extern "C" void qwen36_free_training_context(void*);
+extern "C" double qwen36_parallel_max_double(void*, double);
 
 static int env_int(const char* name, int fallback) {
     const char* value = std::getenv(name);
     return value ? std::max(1, std::atoi(value)) : fallback;
+}
+
+static bool env_enabled(const char* name, bool fallback = false) {
+    const char* value = std::getenv(name);
+    if (!value || value[0] == '\0') return fallback;
+    return std::strcmp(value, "0") != 0 && std::strcmp(value, "false") != 0;
 }
 
 static at::Tensor cuda_rand(std::initializer_list<int64_t> shape) {
@@ -63,16 +71,18 @@ int main() {
         std::getenv("WORLD_SIZE") ? std::getenv("WORLD_SIZE") : "1");
     const int local_rank = std::atoi(
         std::getenv("LOCAL_RANK") ? std::getenv("LOCAL_RANK") : "0");
-    const bool a2a = std::getenv("QWEN36_EP_A2A") &&
-        std::atoi(std::getenv("QWEN36_EP_A2A")) != 0;
-    const bool sharded = a2a && std::getenv("QWEN36_EP_A2A_SHARDED") &&
-        std::atoi(std::getenv("QWEN36_EP_A2A_SHARDED")) != 0;
+    const bool a2a = env_enabled("QWEN36_EP_A2A");
+    const bool sharded = a2a && env_enabled("QWEN36_EP_A2A_SHARDED");
+    const bool packed = env_enabled("QWEN36_EP_A2A_PACKED", true);
     const int seq = env_int("BENCH_SEQ", 128);
     const int hidden = env_int("BENCH_HIDDEN", 256);
     const int experts = env_int("BENCH_EXPERTS", 8);
     const int intermediate = env_int("BENCH_INTERMEDIATE", 256);
     const int warmup = env_int("BENCH_WARMUP", 2);
     const int iters = env_int("BENCH_ITERS", 10);
+    const bool gpu_metadata = env_enabled(
+        "QWEN36_EP_A2A_GPU_METADATA",
+        world >= 4 && seq * (packed ? 2 : 1) >= 512);
     assert(world >= 2 && rank >= 0 && rank < world);
     assert(hidden % 8 == 0 && experts % world == 0);
     assert(!sharded || a2a);
@@ -173,7 +183,10 @@ int main() {
         cudaEventSynchronize(stop);
         float elapsed_ms = 0.0f;
         cudaEventElapsedTime(&elapsed_ms, start, stop);
-        times.push_back(static_cast<double>(elapsed_ms));
+        const double world_max_ms = qwen36_parallel_max_double(
+            ctx, static_cast<double>(elapsed_ms));
+        assert(world_max_ms > 0.0 && std::isfinite(world_max_ms));
+        times.push_back(world_max_ms);
     }
     cudaEventDestroy(start);
     cudaEventDestroy(stop);
@@ -194,15 +207,19 @@ int main() {
     const double processed_tokens_per_sec = processed_tokens / median_seconds;
     const double unique_tokens_per_sec = unique_tokens / median_seconds;
     std::printf(
-        "native_qwen36_ep_bench rank=%d world=%d a2a=%d sharded=%d "
+        "native_qwen36_ep_bench rank=%d world=%d a2a=%d sharded=%d packed=%d "
+        "gpu_metadata=%d "
         "seq=%d hidden=%d experts=%d intermediate=%d warmup=%d iters=%d "
         "local_tokens=%.0f processed_tokens=%.0f unique_tokens=%.0f last_loss=%.8f "
-        "step_ms_mean=%.4f step_ms_median=%.4f step_ms_std=%.4f "
+        "timing_scope=world_max step_ms_mean=%.4f step_ms_p50=%.4f "
+        "step_ms_p95=%.4f step_ms_std=%.4f "
         "processed_tokens_per_sec=%.2f unique_tokens_per_sec=%.2f "
         "free_mem_gib=%.3f\n",
-        rank, world, a2a, sharded, seq, hidden, experts, intermediate,
+        rank, world, a2a, sharded, packed, gpu_metadata,
+        seq, hidden, experts, intermediate,
         warmup, iters, local_tokens, processed_tokens, unique_tokens, last_loss,
-        mean, percentile(times, 0.5), std::sqrt(variance),
+        mean, percentile(times, 0.5), percentile(times, 0.95),
+        std::sqrt(variance),
         processed_tokens_per_sec, unique_tokens_per_sec,
         static_cast<double>(free_bytes) / (1024.0 * 1024.0 * 1024.0));
     std::fflush(stdout);

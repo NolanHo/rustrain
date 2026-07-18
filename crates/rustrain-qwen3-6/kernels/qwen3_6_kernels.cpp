@@ -895,28 +895,52 @@ static ncclDataType_t qwen36_nccl_dtype(at::ScalarType type) {
     }
 }
 
-static std::vector<int32_t> qwen36_a2a_counts(
-    const at::Tensor& local_counts, ncclComm_t comm, cudaStream_t stream
+struct Qwen36A2ACountPlan {
+    std::vector<int32_t> send;
+    std::vector<int32_t> receive;
+    at::Tensor send_tensor;
+    at::Tensor receive_tensor;
+};
+
+static Qwen36A2ACountPlan qwen36_a2a_counts(
+    const at::Tensor& local_metadata, ncclComm_t comm, cudaStream_t stream
 ) {
-    const int world = static_cast<int>(local_counts.numel());
-    auto all_counts = at::empty({world, world}, local_counts.options());
-    auto err = ncclAllGather(
-        local_counts.data_ptr(), all_counts.data_ptr(), world,
+    int world = 0;
+    auto err = ncclCommCount(comm, &world);
+    TORCH_CHECK(err == ncclSuccess, "ncclCommCount failed: ",
+        ncclGetErrorString(err));
+    TORCH_CHECK(local_metadata.numel() == world + 1,
+        "EP A2A metadata must contain one count per peer and a validity flag");
+    auto all_counts = at::empty(
+        {world, world + 1}, local_metadata.options());
+    err = ncclAllGather(
+        local_metadata.data_ptr(), all_counts.data_ptr(), world + 1,
         ncclInt, comm, stream);
     TORCH_CHECK(err == ncclSuccess, "EP A2A count all-gather failed: ",
         ncclGetErrorString(err));
     auto host = all_counts.to(at::TensorOptions().device(at::kCPU));
-    std::vector<int32_t> recv_counts(world);
-    auto ptr = host.data_ptr<int32_t>();
     int rank = 0;
     err = ncclCommUserRank(comm, &rank);
     TORCH_CHECK(err == ncclSuccess, "ncclCommUserRank failed: ",
         ncclGetErrorString(err));
-    for (int src = 0; src < world; ++src) {
-        recv_counts[src] = ptr[src * world + rank];
-        TORCH_CHECK(recv_counts[src] >= 0, "negative EP A2A receive count");
+
+    Qwen36A2ACountPlan plan;
+    plan.send_tensor = host.select(0, rank).narrow(0, 0, world).contiguous();
+    plan.receive_tensor = host.narrow(1, 0, world)
+        .select(1, rank).contiguous();
+    plan.send.resize(world);
+    plan.receive.resize(world);
+    std::memcpy(plan.send.data(), plan.send_tensor.data_ptr<int32_t>(),
+        sizeof(int32_t) * world);
+    std::memcpy(plan.receive.data(), plan.receive_tensor.data_ptr<int32_t>(),
+        sizeof(int32_t) * world);
+    for (int peer = 0; peer < world; ++peer) {
+        TORCH_CHECK(plan.send[peer] >= 0 && plan.receive[peer] >= 0,
+            "negative EP A2A token count");
+        TORCH_CHECK(host.data_ptr<int32_t>()[peer * (world + 1) + world] == 0,
+            "EP A2A expert index is outside the communicator range");
     }
-    return recv_counts;
+    return plan;
 }
 
 // Variable-split token dispatch. Metadata is deliberately non-differentiable;
@@ -940,28 +964,52 @@ struct Qwen36A2ADispatchFunction : public torch::autograd::Function<Qwen36A2ADis
             "EP A2A expert and source-token metadata must have equal length");
         auto stream = c10::cuda::getCurrentCUDAStream(input.device().index()).stream();
         const int64_t hidden = input.size(1);
-        std::vector<at::Tensor> indices(world);
-        std::vector<int32_t> send_counts(world, 0);
-        for (int dst = 0; dst < world; ++dst) {
-            auto mask = (expert_indices >= dst * expert_count) &
-                (expert_indices < (dst + 1) * expert_count);
-            indices[dst] = at::nonzero(mask).reshape({-1});
-            send_counts[dst] = static_cast<int32_t>(indices[dst].numel());
-        }
         auto gpu_count_opts = at::TensorOptions()
             .device(input.device()).dtype(at::kInt);
-        auto cpu_count_opts = at::TensorOptions().device(at::kCPU).dtype(at::kInt);
-        auto local_counts = at::empty({world}, gpu_count_opts);
-        auto host_counts = at::empty({world}, cpu_count_opts);
-        std::memcpy(host_counts.data_ptr<int32_t>(), send_counts.data(), sizeof(int32_t) * world);
-        local_counts.copy_(host_counts);
-        auto recv_counts = qwen36_a2a_counts(local_counts, comm, stream);
+        at::Tensor send_index;
+        at::Tensor local_metadata;
+        // Peer-wise nonzero is cheaper at EP2; one GPU sort wins as the EP
+        // fan-out grows for sufficiently large token batches. The override
+        // keeps both paths available for A/B and production tuning.
+        const bool use_gpu_metadata = env_enabled(
+            "QWEN36_EP_A2A_GPU_METADATA",
+            world >= 4 && expert_indices.numel() >= 512);
+        if (use_gpu_metadata) {
+            auto destinations = at::floor_divide(
+                expert_indices, expert_count);
+            auto valid_destinations = destinations.clamp(0, world - 1);
+            auto invalid = destinations.ne(valid_destinations)
+                .any().to(at::kInt).reshape({1});
+            auto [sorted_destinations, order] = valid_destinations.sort(0);
+            send_index = std::move(order);
+            auto local_counts = at::bincount(
+                sorted_destinations, c10::nullopt, world).to(at::kInt);
+            local_metadata = at::cat({local_counts, invalid}, 0);
+        } else {
+            std::vector<at::Tensor> indices(world);
+            std::vector<int32_t> host_metadata(world + 1, 0);
+            for (int dst = 0; dst < world; ++dst) {
+                auto mask = (expert_indices >= dst * expert_count) &
+                    (expert_indices < (dst + 1) * expert_count);
+                indices[dst] = at::nonzero(mask).reshape({-1});
+                host_metadata[dst] = static_cast<int32_t>(
+                    indices[dst].numel());
+            }
+            send_index = at::cat(indices, 0);
+            host_metadata[world] = send_index.numel() != expert_indices.numel();
+            auto host_counts = at::from_blob(
+                host_metadata.data(), {world + 1},
+                at::TensorOptions().device(at::kCPU).dtype(at::kInt));
+            local_metadata = host_counts.to(gpu_count_opts);
+        }
+        auto count_plan = qwen36_a2a_counts(local_metadata, comm, stream);
+        const auto& send_counts = count_plan.send;
+        const auto& recv_counts = count_plan.receive;
         std::vector<int64_t> send_offsets(world + 1, 0), recv_offsets(world + 1, 0);
         for (int i = 0; i < world; ++i) {
             send_offsets[i + 1] = send_offsets[i] + send_counts[i];
             recv_offsets[i + 1] = recv_offsets[i] + recv_counts[i];
         }
-        auto send_index = at::cat(indices, 0);
         auto send_token = token_indices.index_select(0, send_index).contiguous();
         auto send_hidden = input.index_select(0, send_token).contiguous();
         auto send_expert = expert_indices.index_select(0, send_index).contiguous();
@@ -1007,12 +1055,8 @@ struct Qwen36A2ADispatchFunction : public torch::autograd::Function<Qwen36A2ADis
         }
         TORCH_CHECK(ncclGroupEnd() == ncclSuccess, "A2A dispatch group failed");
         auto recv_local = recv_expert - rank * expert_count;
-        auto send_counts_tensor = at::empty({world}, cpu_count_opts);
-        auto recv_counts_tensor = at::empty({world}, cpu_count_opts);
-        std::memcpy(send_counts_tensor.data_ptr<int32_t>(), send_counts.data(),
-            sizeof(int32_t) * world);
-        std::memcpy(recv_counts_tensor.data_ptr<int32_t>(), recv_counts.data(),
-            sizeof(int32_t) * world);
+        auto send_counts_tensor = std::move(count_plan.send_tensor);
+        auto recv_counts_tensor = std::move(count_plan.receive_tensor);
         ctx->save_for_backward({input, send_token, send_counts_tensor, recv_counts_tensor});
         ctx->saved_data["comm"] = comm_ptr;
         ctx->saved_data["expert_count"] = expert_count;
