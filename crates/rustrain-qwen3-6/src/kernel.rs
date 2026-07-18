@@ -920,7 +920,7 @@ impl CppTrainingContext {
         if n_total <= 0 {
             bail!("n_total must be positive, got {n_total}");
         }
-        let adapter_ids = self.list_lora();
+        let adapter_ids = self.list_dynamic_lora();
         if adapter_ids.len() != n_total as usize {
             bail!(
                 "live adapter count {} does not match n_total={n_total}",
@@ -1393,30 +1393,36 @@ impl CppTrainingContext {
 
     /// List all active adapter IDs.
     pub fn list_lora(&self) -> Vec<i64> {
+        let mut ids = self.list_dynamic_lora();
+        if self.lora_count > 0 {
+            // ID 0 is the fixed adapter created with the training context.
+            ids.insert(0, 0);
+        }
+        ids
+    }
+
+    /// List only dynamic adapter IDs. Fixed adapter ID 0 is intentionally
+    /// excluded because selected multi-LoRA training accepts dynamic tenants.
+    fn list_dynamic_lora(&self) -> Vec<i64> {
         let kh = match get_kernels() {
             Some(k) => k,
             None => return Vec::new(),
         };
-        let mut ids = Vec::new();
-        if self.lora_count > 0 {
-            // ID 0 is the fixed adapter created with the training context.
-            ids.push(0);
-        }
         // Query the native registry size first; the old fixed 64-entry buffer
         // silently truncated large multi-tenant registries.
         let total = unsafe { (kh.list_lora)(self.ptr, std::ptr::null_mut(), 0) };
         if total <= 0 {
-            return ids;
+            return Vec::new();
         }
         let mut dynamic_ids = vec![0i64; total as usize];
         let count = unsafe {
             (kh.list_lora)(self.ptr, dynamic_ids.as_mut_ptr(), dynamic_ids.len() as i64)
         };
-        if count > 0 {
-            dynamic_ids.truncate((count as usize).min(dynamic_ids.len()));
-            ids.extend_from_slice(&dynamic_ids);
+        if count <= 0 {
+            return Vec::new();
         }
-        ids
+        dynamic_ids.truncate((count as usize).min(dynamic_ids.len()));
+        dynamic_ids
     }
 
     /// Returns a shallow snapshot of the adapter tensor at call time.
