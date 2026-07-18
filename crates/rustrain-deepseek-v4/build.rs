@@ -5,6 +5,38 @@
 
 use std::process::Command;
 
+fn detect_python_torch_paths() -> Option<(String, String)> {
+    let mut candidates = Vec::new();
+    if let Ok(python) = std::env::var("PYTHON") {
+        candidates.push(python);
+    }
+    candidates.extend(["python3".to_string(), "python".to_string()]);
+    for python in candidates {
+        let Ok(output) = Command::new(python)
+            .args([
+                "-c",
+                "import pathlib, torch; root = pathlib.Path(torch.__file__).resolve().parent; print(root / 'include'); print(root / 'lib')",
+            ])
+            .output()
+        else {
+            continue;
+        };
+        if !output.status.success() {
+            continue;
+        }
+        let stdout = String::from_utf8(output.stdout).ok()?;
+        let mut lines = stdout.lines();
+        let include = lines.next()?.trim().to_string();
+        let lib = lines.next()?.trim().to_string();
+        if std::path::Path::new(&include).join("ATen/ATen.h").is_file()
+            && std::path::Path::new(&lib).join("libtorch.so").is_file()
+        {
+            return Some((include, lib));
+        }
+    }
+    None
+}
+
 /// Detect PyTorch's _GLIBCXX_USE_CXX11_ABI setting by running Python.
 fn detect_cxx11_abi() -> String {
     if let Ok(v) = std::env::var("GLIBCXX_USE_CXX11_ABI") {
@@ -35,13 +67,21 @@ fn main() {
     // Always re-run when env vars change
     println!("cargo:rerun-if-env-changed=TORCH_INCLUDE_PATH");
     println!("cargo:rerun-if-env-changed=TORCH_LIB_PATH");
+    println!("cargo:rerun-if-env-changed=PYTHON");
     println!("cargo:rerun-if-changed=kernels/fp8_gemm.cpp");
     println!("cargo:rerun-if-changed=kernels/glm5_attention.cpp");
     println!("cargo:rerun-if-changed=kernels/v4_flash_kernels.cpp");
     println!("cargo:rerun-if-changed=build.rs");
 
     // Skip on non-CUDA builds or when torch isn't available
+    let detected_torch = detect_python_torch_paths();
     let torch_include = std::env::var("TORCH_INCLUDE_PATH")
+        .or_else(|_| {
+            detected_torch
+                .as_ref()
+                .map(|(include, _)| include.clone())
+                .ok_or(std::env::VarError::NotPresent)
+        })
         .or_else(|_| {
             let candidates = [
                 "/vePFS-Mindverse/user/nolanho/rustrain-env/lib/python3.12/site-packages/torch/include",
@@ -68,6 +108,12 @@ fn main() {
     };
 
     let torch_lib = std::env::var("TORCH_LIB_PATH")
+        .or_else(|_| {
+            detected_torch
+                .as_ref()
+                .map(|(_, lib)| lib.clone())
+                .ok_or(std::env::VarError::NotPresent)
+        })
         .or_else(|_| {
             let candidates = [
                 "/vePFS-Mindverse/user/nolanho/rustrain-env/lib/python3.12/site-packages/torch/lib",

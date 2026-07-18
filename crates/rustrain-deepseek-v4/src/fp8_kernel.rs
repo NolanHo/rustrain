@@ -1889,7 +1889,21 @@ pub fn stream_wait_event(device_id: i32, event: &rustrain_nccl::nccl::CudaEventH
 #[cfg(test)]
 mod mtp_tests {
     use super::*;
-    use tch::{Device, Kind};
+    use tch::{Cuda, Device, Kind};
+
+    fn assert_finite_nonzero_grad(name: &str, tensor: &Tensor) {
+        let grad = tensor.grad();
+        assert!(grad.defined(), "{name} gradient is undefined");
+        assert_eq!(
+            grad.isfinite().all().int64_value(&[]),
+            1,
+            "{name} gradient contains non-finite values"
+        );
+        assert!(
+            grad.abs().sum(Kind::Float).double_value(&[]) > 0.0,
+            "{name} gradient is identically zero"
+        );
+    }
 
     #[test]
     fn mtp_prepare_aligns_next_token_embedding() {
@@ -2136,6 +2150,129 @@ mod mtp_tests {
             hidden.grad().defined(),
             "MTP decoder detached hidden autograd"
         );
+    }
+
+    #[test]
+    fn mtp_cuda_single_gpu_ffi_chain_forward_backward() {
+        if !Cuda::is_available() {
+            eprintln!("skipping CUDA MTP FFI chain test: CUDA is unavailable");
+            return;
+        }
+
+        let device = Device::Cuda(0);
+        let hidden_size = 4;
+        let intermediate_size = 8;
+        let vocab_size = 8;
+        let sequence_len = 4;
+        let raw_sequence_len = 6;
+
+        let hidden = Tensor::randn([1, sequence_len, hidden_size], (Kind::Float, device)) * 0.1;
+        let _ = hidden.set_requires_grad(true);
+        let input_ids = Tensor::from_slice(&[0_i64, 1, 2, 3, 4, 5])
+            .reshape([1, raw_sequence_len])
+            .to_device(device);
+        let target_mask = Tensor::ones([1, raw_sequence_len], (Kind::Float, device));
+        let embed = Tensor::randn([vocab_size, hidden_size], (Kind::Float, device)) * 0.1;
+        let enorm = Tensor::ones([hidden_size], (Kind::Float, device));
+        let hnorm = Tensor::ones([hidden_size], (Kind::Float, device));
+        let eh_proj = Tensor::randn([hidden_size, 2 * hidden_size], (Kind::Float, device)) * 0.1;
+        let _ = eh_proj.set_requires_grad(true);
+
+        let prepared = glm5_mtp_prepare_cpp(
+            &hidden, &input_ids, &embed, &enorm, &hnorm, &eh_proj, None, 1e-6, 1,
+        )
+        .expect("CUDA MTP prepare FFI failed");
+        assert_eq!(prepared.size(), vec![1, sequence_len, hidden_size]);
+        assert_eq!(prepared.device(), device);
+        assert_eq!(prepared.isfinite().all().int64_value(&[]), 1);
+
+        let input_norm = Tensor::ones([hidden_size], (Kind::Float, device));
+        let post_norm = Tensor::ones([hidden_size], (Kind::Float, device));
+        let q_a = Tensor::randn([hidden_size, hidden_size], (Kind::Float, device)) * 0.1;
+        let _ = q_a.set_requires_grad(true);
+        let q_b = Tensor::randn([hidden_size, hidden_size], (Kind::Float, device)) * 0.1;
+        let kv_a = Tensor::randn([hidden_size, hidden_size], (Kind::Float, device)) * 0.1;
+        let kv_b = Tensor::randn([hidden_size, 2], (Kind::Float, device)) * 0.1;
+        let q_layernorm = Tensor::ones([hidden_size], (Kind::Float, device));
+        let kv_layernorm = Tensor::ones([2], (Kind::Float, device));
+        let o_proj = Tensor::randn([hidden_size, 2], (Kind::Float, device)) * 0.1;
+        let dense_gate =
+            Tensor::randn([intermediate_size, hidden_size], (Kind::Float, device)) * 0.1;
+        let dense_up = Tensor::randn([intermediate_size, hidden_size], (Kind::Float, device)) * 0.1;
+        let dense_down =
+            Tensor::randn([hidden_size, intermediate_size], (Kind::Float, device)) * 0.1;
+        let _ = dense_down.set_requires_grad(true);
+
+        let ptr = |tensor: &Tensor| tensor.as_ptr() as *mut std::ffi::c_void;
+        let mut descriptor = Glm5MtpDecoderDescriptor::default();
+        descriptor.hidden = ptr(&prepared);
+        descriptor.input_norm_weight = ptr(&input_norm);
+        descriptor.post_norm_weight = ptr(&post_norm);
+        descriptor.q_a_proj = ptr(&q_a);
+        descriptor.q_a_layernorm = ptr(&q_layernorm);
+        descriptor.q_b_proj = ptr(&q_b);
+        descriptor.kv_a_proj = ptr(&kv_a);
+        descriptor.kv_a_layernorm = ptr(&kv_layernorm);
+        descriptor.kv_b_proj = ptr(&kv_b);
+        descriptor.o_proj = ptr(&o_proj);
+        descriptor.dense_gate = ptr(&dense_gate);
+        descriptor.dense_up = ptr(&dense_up);
+        descriptor.dense_down = ptr(&dense_down);
+        descriptor.tp_size = 1;
+        descriptor.cp_size = 1;
+        descriptor.ep_size = 1;
+        descriptor.num_heads = 1;
+        descriptor.qk_nope = 2;
+        descriptor.qk_rope = 2;
+        descriptor.v_head = 2;
+        descriptor.kv_lora = 2;
+        descriptor.rms_eps = 1e-6;
+        descriptor.rope_theta = 10_000.0;
+
+        let decoded = glm5_mtp_decoder_layer_cpp(&descriptor)
+            .expect("CUDA local dense MTP decoder FFI failed");
+        assert_eq!(decoded.size(), vec![1, sequence_len, hidden_size]);
+        assert_eq!(decoded.device(), device);
+        assert_eq!(decoded.isfinite().all().int64_value(&[]), 1);
+
+        let shared_head_norm = Tensor::ones([hidden_size], (Kind::Float, device));
+        let lm_head = Tensor::randn([vocab_size, hidden_size], (Kind::Float, device)) * 0.1;
+        let _ = lm_head.set_requires_grad(true);
+        let output = glm5_mtp_postprocess_loss_cpp(
+            &decoded,
+            &shared_head_norm,
+            &lm_head,
+            None,
+            &input_ids,
+            &target_mask,
+            1e-6,
+            0,
+            2,
+        )
+        .expect("CUDA MTP postprocess/CE FFI failed");
+        assert_eq!(output.normalized.size(), vec![1, sequence_len, hidden_size]);
+        assert_eq!(output.loss.size(), Vec::<i64>::new());
+        assert_eq!(output.loss_sum.size(), Vec::<i64>::new());
+        assert_eq!(output.token_count.size(), Vec::<i64>::new());
+        assert_eq!(output.token_count.double_value(&[]), sequence_len as f64);
+        for (name, tensor) in [
+            ("normalized", &output.normalized),
+            ("loss", &output.loss),
+            ("loss_sum", &output.loss_sum),
+        ] {
+            assert_eq!(
+                tensor.isfinite().all().int64_value(&[]),
+                1,
+                "{name} contains non-finite values"
+            );
+        }
+
+        output.loss.backward();
+        assert_finite_nonzero_grad("trunk hidden", &hidden);
+        assert_finite_nonzero_grad("MTP eh_proj", &eh_proj);
+        assert_finite_nonzero_grad("decoder q_a_proj", &q_a);
+        assert_finite_nonzero_grad("decoder dense_down", &dense_down);
+        assert_finite_nonzero_grad("shared lm_head", &lm_head);
     }
 
     #[test]
