@@ -614,6 +614,8 @@ mod tests {
                 max_grad_norm,
                 dtype: DType::Fp32,
                 device: Device::Cpu,
+                cuda_memory_fraction: 0.95,
+                predequant_expert_weights: true,
                 checkpoint_every: 0,
                 eval_every: 0,
             },

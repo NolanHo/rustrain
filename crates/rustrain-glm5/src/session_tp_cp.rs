@@ -1148,8 +1148,15 @@ pub fn train_glm5_lora_sft_tp_cp_ep(
     // IndexShare state is mutable across layers; avoid checkpointing attention
     // until forward/backward state snapshots are separate.
     let use_attention_checkpointing = false;
-    rustrain_deepseek_v4::fp8_kernel::set_memory_fraction(0.95, local_rank as i32);
-    info!(rank, "caching allocator set to 0.95");
+    rustrain_deepseek_v4::fp8_kernel::set_memory_fraction(
+        config.train.cuda_memory_fraction,
+        local_rank as i32,
+    );
+    info!(
+        rank,
+        memory_fraction = config.train.cuda_memory_fraction,
+        "set caching allocator memory fraction"
+    );
 
     // ── Training loop ──
     for step in 0..config.train.max_steps {

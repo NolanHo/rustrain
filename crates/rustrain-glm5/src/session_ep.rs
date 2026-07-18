@@ -846,17 +846,25 @@ pub fn train_glm5_lora_sft_ep(
     let use_cpp_optimizer = use_cpp_attention; // same .so provides optimizer
 
     // ── Pre-expand caching allocator ──
-    // Tell PyTorch's caching allocator it can use 95% of GPU memory.
+    // Apply the configured PyTorch caching-allocator device limit.
     // This causes it to pre-allocate large segments upfront instead of growing incrementally.
-    rustrain_deepseek_v4::fp8_kernel::set_memory_fraction(0.95, local_rank as i32);
-    info!(rank, "set caching allocator memory fraction to 0.95");
+    rustrain_deepseek_v4::fp8_kernel::set_memory_fraction(
+        config.train.cuda_memory_fraction,
+        local_rank as i32,
+    );
+    info!(
+        rank,
+        memory_fraction = config.train.cuda_memory_fraction,
+        "set caching allocator memory fraction"
+    );
 
     // ── Cache expert weights on GPU (eliminates per-layer CPU→GPU transfer) ──
     // Expert weights are frozen (LoRA targets attention only), so they can be
     // loaded once and reused every step. This eliminates ~87GB/layer PCIe transfer.
     info!(
         rank,
-        "caching expert weights on GPU (with FP8 pre-dequant)..."
+        predequant_fp8 = config.train.predequant_expert_weights,
+        "caching expert weights on GPU"
     );
     let mut expert_weights_gpu: BTreeMap<String, Tensor> = BTreeMap::new();
     // First pass: load all to GPU
@@ -864,24 +872,26 @@ pub fn train_glm5_lora_sft_ep(
         let gpu_t = t.to_device(device);
         expert_weights_gpu.insert(name.clone(), gpu_t);
     }
-    // Second pass: pre-dequant FP8 weights to BF16 (saves per-step dequant in safe_linear)
-    let expert_weight_names: Vec<String> = expert_weights_gpu.keys().cloned().collect();
-    for name in &expert_weight_names {
-        if let Some(t) = expert_weights_gpu.get(name) {
-            if t.kind() == Kind::Float8e4m3fn {
-                let scale_name = name.replace(".weight", ".weight_scale_inv");
-                if let Some(scale) = expert_weights_gpu.get(&scale_name) {
-                    match rustrain_deepseek_v4::fp8_kernel::dequant_fp8_weight(t, scale) {
-                        Ok(bf16) => {
-                            expert_weights_gpu.insert(name.clone(), bf16.to_kind(compute_kind));
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                rank,
-                                "pre-dequant failed for {}: {:?}, keeping FP8",
-                                name,
-                                e
-                            );
+    if config.train.predequant_expert_weights {
+        // Pre-dequant FP8 weights once to avoid repeating it in safe_linear.
+        let expert_weight_names: Vec<String> = expert_weights_gpu.keys().cloned().collect();
+        for name in &expert_weight_names {
+            if let Some(t) = expert_weights_gpu.get(name) {
+                if t.kind() == Kind::Float8e4m3fn {
+                    let scale_name = name.replace(".weight", ".weight_scale_inv");
+                    if let Some(scale) = expert_weights_gpu.get(&scale_name) {
+                        match rustrain_deepseek_v4::fp8_kernel::dequant_fp8_weight(t, scale) {
+                            Ok(bf16) => {
+                                expert_weights_gpu.insert(name.clone(), bf16.to_kind(compute_kind));
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    rank,
+                                    "pre-dequant failed for {}: {:?}, keeping FP8",
+                                    name,
+                                    e
+                                );
+                            }
                         }
                     }
                 }
@@ -892,7 +902,8 @@ pub fn train_glm5_lora_sft_ep(
     info!(
         rank,
         expert_tensors_on_gpu = expert_gpu_count,
-        "expert weights cached on GPU (FP8 pre-dequanted)"
+        predequant_fp8 = config.train.predequant_expert_weights,
+        "expert weights cached on GPU"
     );
 
     // ── Pre-extract constant tensors (avoid per-step BTreeMap lookups) ──

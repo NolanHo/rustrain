@@ -75,6 +75,12 @@ pub struct TrainConfig {
     pub max_grad_norm: Option<f32>,
     pub dtype: DType,
     pub device: Device,
+    /// Maximum fraction of a CUDA device available to PyTorch's caching allocator.
+    #[serde(default = "default_cuda_memory_fraction")]
+    pub cuda_memory_fraction: f64,
+    /// Pre-dequantize cached FP8 expert weights at startup for faster linear kernels.
+    #[serde(default = "default_predequant_expert_weights")]
+    pub predequant_expert_weights: bool,
     pub checkpoint_every: u64,
     #[serde(default = "default_eval_every")]
     pub eval_every: u64,
@@ -84,6 +90,14 @@ pub const DEFAULT_MTP_LOSS_SCALING_FACTOR: f64 = 0.1;
 
 fn default_mtp_loss_scaling_factor() -> f64 {
     DEFAULT_MTP_LOSS_SCALING_FACTOR
+}
+
+fn default_cuda_memory_fraction() -> f64 {
+    0.95
+}
+
+fn default_predequant_expert_weights() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -684,6 +698,12 @@ pub fn validate_config(config: &Config) -> Result<()> {
         return Err(anyhow!(
             "mtp_loss_scaling_factor must be finite and non-negative"
         ));
+    }
+    if !config.train.cuda_memory_fraction.is_finite()
+        || config.train.cuda_memory_fraction <= 0.0
+        || config.train.cuda_memory_fraction > 1.0
+    {
+        return Err(anyhow!("cuda_memory_fraction must be finite and in (0, 1]"));
     }
     if let Some(max_grad_norm) = config.train.max_grad_norm {
         if max_grad_norm <= 0.0 {
@@ -1294,6 +1314,26 @@ mod tests {
     }
 
     #[test]
+    fn cuda_memory_fraction_must_be_finite_and_bounded() {
+        let mut config = qwen_lora_sft_config();
+
+        for invalid in [0.0, -0.1, 1.01, f64::INFINITY, f64::NAN] {
+            config.train.cuda_memory_fraction = invalid;
+            let error = match validate_config(&config) {
+                Ok(()) => panic!("fraction {invalid:?} unexpectedly validated"),
+                Err(error) => error.to_string(),
+            };
+            assert!(
+                error.contains("cuda_memory_fraction must be finite and in (0, 1]"),
+                "fraction {invalid:?} unexpectedly validated or returned a different error: {error}"
+            );
+        }
+
+        config.train.cuda_memory_fraction = 1.0;
+        validate_config(&config).expect("a full-device allocator fraction should validate");
+    }
+
+    #[test]
     fn data_max_samples_must_be_positive_when_set() {
         let mut config = qwen_lora_sft_config();
         config.data.as_mut().unwrap().max_samples = Some(0);
@@ -1417,6 +1457,8 @@ mod tests {
                 max_grad_norm: Some(0.0001),
                 dtype: DType::Fp32,
                 device: Device::Cuda,
+                cuda_memory_fraction: 0.95,
+                predequant_expert_weights: true,
                 checkpoint_every: 0,
                 eval_every: 0,
             },

@@ -40,6 +40,10 @@ optimizer step.
   `topk_method`/`scoring_func` and group settings; no hidden fallback.
 - Expert caches are keyed by layer, device, dtype, shape, and weight identity
   (or are scoped per layer) and can never reuse another layer's weights.
+- CUDA allocator capacity and eager FP8 expert pre-dequantization are explicit
+  training options. Eager pre-dequantization is the throughput-oriented default;
+  memory-constrained hosts may keep cached experts in FP8 and dequantize inside
+  the C++ linear path instead of failing while expanding the full shard to BF16.
 - FP8 block scales are applied exactly once. LoRA fusion must preserve the
   base-weight scale semantics or explicitly dequantize through the safe path.
 - TP applies LoRA to sharded attention weights. CP computes global top-k and
@@ -205,6 +209,18 @@ through the optimizer step.
 - A fused CUDA linear-CE/online-vocabulary reduction remains a follow-up
   optimization: this environment has no visible GPU or CUDA compiler, so no
   throughput or peak-memory claim is made here.
+
+## Expert cache policy
+
+- `train.cuda_memory_fraction` defaults to `0.95` and must be finite and in
+  `(0, 1]`. GLM5 EP and TP/CP sessions apply the same value before training
+  allocations.
+- `train.predequant_expert_weights` defaults to `true`. This converts cached FP8
+  expert matrices once at startup and avoids repeated dequantization in
+  `safe_linear`, but requires approximately BF16-sized expert storage.
+- Setting `predequant_expert_weights = false` retains the checkpoint's FP8
+  matrices and scales on device. The C++ linear path then dequantizes on demand;
+  this trades throughput for enough capacity to run large expert shards.
 
 # Validation Limits
 
