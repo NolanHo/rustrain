@@ -206,6 +206,12 @@ through the optimizer step.
   known before launch. This is semantically correct but remains a measurable
   synchronization cost; device-side offsets or pinned count metadata is a
   follow-up optimization.
+- Persistent NCCL communicator setup uses an atomic epoch/ack/release file
+  handshake. A rank accepts the current `NcclUniqueId` only when the epoch and
+  its process nonce both match, so repeated runs cannot consume stale IDs,
+  acknowledgements, or releases. Concurrent launches must still use distinct
+  exchange directories because no file-only protocol can disambiguate two live
+  processes claiming the same rank without a launcher-provided job identity.
 - A fused CUDA linear-CE/online-vocabulary reduction remains a follow-up
   optimization: this environment has no visible GPU or CUDA compiler, so no
   throughput or peak-memory claim is made here.
