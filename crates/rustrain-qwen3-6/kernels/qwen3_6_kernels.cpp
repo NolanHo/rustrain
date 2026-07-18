@@ -5293,7 +5293,7 @@ static at::Tensor mtp_compute_loss(
 extern "C" {
 
 __attribute__((visibility("default"))) int64_t qwen36_kernel_abi_version() {
-    return 21;
+    return 22;
 }
 
 // Benchmark/metrics helper. The orthogonal EP, DP, and TP reductions propagate
@@ -7681,6 +7681,120 @@ double qwen36_eval_step(void* ctx_ptr, void* input_ids_ptr, void* target_mask_pt
         return loss.item<double>();
     } catch (const std::exception& e) {
         fprintf(stderr, "[q36] eval_step FAILED: %s\n", e.what());
+        return -1.0;
+    }
+}
+
+static at::Tensor qwen36_copy_host_i64_batch(
+    TrainingContext* ctx,
+    const int64_t* data,
+    int64_t batch_size,
+    int64_t seq_len,
+    const char* name
+) {
+    TORCH_CHECK(ctx, name, " requires a valid training context");
+    TORCH_CHECK(data, name, " requires a non-null host pointer");
+    TORCH_CHECK(batch_size > 0 && seq_len > 0,
+        name, " requires positive batch_size and seq_len");
+    TORCH_CHECK(batch_size <= std::numeric_limits<int64_t>::max() / seq_len,
+        name, " batch shape overflows int64");
+    c10::cuda::set_device(ctx->cuda_device);
+    cudaSetDevice(ctx->cuda_device);
+    auto host = at::from_blob(
+        const_cast<int64_t*>(data), {batch_size, seq_len},
+        at::TensorOptions().device(at::kCPU).dtype(at::kLong));
+    // Shared-memory storage remains owned by the IPC channel. A blocking H2D
+    // copy makes the returned CUDA tensor independent before the worker posts
+    // completion and permits the coordinator to reuse the slab.
+    return host.to(at::Device(at::kCUDA, ctx->cuda_device), at::kLong,
+        /*non_blocking=*/false, /*copy=*/true);
+}
+
+__attribute__((visibility("default")))
+double qwen36_train_step_host_i64(
+    void* ctx_ptr,
+    const int64_t* input_ids,
+    const int64_t* target_mask,
+    const int64_t* attention_mask,
+    int64_t batch_size,
+    int64_t seq_len
+) {
+    try {
+        auto* ctx = reinterpret_cast<TrainingContext*>(ctx_ptr);
+        auto input = qwen36_copy_host_i64_batch(
+            ctx, input_ids, batch_size, seq_len, "host train input_ids");
+        auto targets = qwen36_copy_host_i64_batch(
+            ctx, target_mask, batch_size, seq_len, "host train target_mask");
+        auto attention = qwen36_copy_host_i64_batch(
+            ctx, attention_mask, batch_size, seq_len, "host train attention_mask");
+        return qwen36_train_step(ctx, &input, &targets, &attention);
+    } catch (const std::exception& e) {
+        fprintf(stderr, "[q36] train_step_host_i64 FAILED: %s\n", e.what());
+        return -1.0;
+    }
+}
+
+__attribute__((visibility("default")))
+double qwen36_train_multi_lora_host_i64(
+    void* ctx_ptr,
+    const int64_t* input_ids,
+    const int64_t* target_mask,
+    const int64_t* attention_mask,
+    int64_t batch_size,
+    int64_t seq_len,
+    int32_t n_total,
+    int32_t lora_rank,
+    const int64_t* adapter_ids,
+    int32_t n_adapter_ids
+) {
+    try {
+        auto* ctx = reinterpret_cast<TrainingContext*>(ctx_ptr);
+        TORCH_CHECK(n_adapter_ids >= 0,
+            "host multi-LoRA adapter count must be non-negative");
+        TORCH_CHECK(n_adapter_ids == 0 || n_adapter_ids == n_total,
+            "host multi-LoRA selected adapter count must match n_total");
+        auto input = qwen36_copy_host_i64_batch(
+            ctx, input_ids, batch_size, seq_len, "host multi-LoRA input_ids");
+        auto targets = qwen36_copy_host_i64_batch(
+            ctx, target_mask, batch_size, seq_len, "host multi-LoRA target_mask");
+        auto attention = qwen36_copy_host_i64_batch(
+            ctx, attention_mask, batch_size, seq_len,
+            "host multi-LoRA attention_mask");
+        if (n_adapter_ids == 0) {
+            return qwen36_train_multi_lora(
+                ctx, &input, &targets, &attention, n_total, lora_rank);
+        }
+        TORCH_CHECK(adapter_ids,
+            "host selected multi-LoRA requires adapter IDs");
+        return qwen36_train_multi_lora_selected(
+            ctx, &input, &targets, &attention,
+            adapter_ids, n_adapter_ids, lora_rank);
+    } catch (const std::exception& e) {
+        fprintf(stderr, "[q36] train_multi_lora_host_i64 FAILED: %s\n", e.what());
+        return -1.0;
+    }
+}
+
+__attribute__((visibility("default")))
+double qwen36_eval_step_host_i64(
+    void* ctx_ptr,
+    const int64_t* input_ids,
+    const int64_t* target_mask,
+    const int64_t* attention_mask,
+    int64_t batch_size,
+    int64_t seq_len
+) {
+    try {
+        auto* ctx = reinterpret_cast<TrainingContext*>(ctx_ptr);
+        auto input = qwen36_copy_host_i64_batch(
+            ctx, input_ids, batch_size, seq_len, "host eval input_ids");
+        auto targets = qwen36_copy_host_i64_batch(
+            ctx, target_mask, batch_size, seq_len, "host eval target_mask");
+        auto attention = qwen36_copy_host_i64_batch(
+            ctx, attention_mask, batch_size, seq_len, "host eval attention_mask");
+        return qwen36_eval_step(ctx, &input, &targets, &attention);
+    } catch (const std::exception& e) {
+        fprintf(stderr, "[q36] eval_step_host_i64 FAILED: %s\n", e.what());
         return -1.0;
     }
 }

@@ -4,7 +4,7 @@
 //! Rust only handles: weight loading, data loading, training loop orchestration.
 
 use crate::lora::Qwen36LoraTargetModule;
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use std::ffi::c_void;
 use std::sync::OnceLock;
 use tch::{Kind, Tensor};
@@ -49,6 +49,20 @@ type FnTrainMultiLoraSelected = unsafe extern "C" fn(
     i32,
 ) -> f64;
 type FnEvalStep = unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void, *mut c_void) -> f64;
+type FnHostBatchStep =
+    unsafe extern "C" fn(*mut c_void, *const i64, *const i64, *const i64, i64, i64) -> f64;
+type FnHostMultiLoraStep = unsafe extern "C" fn(
+    *mut c_void,
+    *const i64,
+    *const i64,
+    *const i64,
+    i64,
+    i64,
+    i32,
+    i32,
+    *const i64,
+    i32,
+) -> f64;
 type FnGetLoraCount = unsafe extern "C" fn(*mut c_void) -> i64;
 type FnGetLoraA = unsafe extern "C" fn(*mut c_void, i64) -> *mut c_void;
 type FnGetLoraB = unsafe extern "C" fn(*mut c_void, i64) -> *mut c_void;
@@ -78,20 +92,8 @@ type FnSetMtpWeights = unsafe extern "C" fn(
 type FnSetCheckpoint = unsafe extern "C" fn(*mut c_void, i32, i64);
 type FnSetNcclComm = unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void, i32, i32);
 type FnInitNccl = unsafe extern "C" fn(*mut c_void) -> i32;
-type FnInitParallelNccl = unsafe extern "C" fn(
-    *mut c_void,
-    i32,
-    i32,
-    i32,
-    i32,
-    i32,
-    i32,
-    i32,
-    i32,
-    i32,
-    i32,
-    i32,
-) -> i32;
+type FnInitParallelNccl =
+    unsafe extern "C" fn(*mut c_void, i32, i32, i32, i32, i32, i32, i32, i32, i32, i32, i32) -> i32;
 type FnSetCudaDevice = unsafe extern "C" fn(i32);
 type FnSetBaseTpMlp = unsafe extern "C" fn(*mut c_void, i32) -> i32;
 type FnAddLora = unsafe extern "C" fn(*mut c_void, i64, f64, *const i64, i64, *const i8) -> i64;
@@ -142,6 +144,9 @@ struct KernelHandles {
     train_multi_lora: FnTrainMultiLora,
     train_multi_lora_selected: FnTrainMultiLoraSelected,
     eval_step: FnEvalStep,
+    train_step_host_i64: FnHostBatchStep,
+    train_multi_lora_host_i64: FnHostMultiLoraStep,
+    eval_step_host_i64: FnHostBatchStep,
     get_lora_count: FnGetLoraCount,
     get_lora_a: FnGetLoraA,
     get_lora_b: FnGetLoraB,
@@ -214,7 +219,7 @@ unsafe fn load_kernels() -> Option<KernelHandles> {
         }};
     }
     let abi_version: FnKernelAbiVersion = sym!("qwen36_kernel_abi_version");
-    if abi_version() != 21 {
+    if abi_version() != 22 {
         return None;
     }
     Some(KernelHandles {
@@ -224,6 +229,9 @@ unsafe fn load_kernels() -> Option<KernelHandles> {
         train_multi_lora: sym!("qwen36_train_multi_lora"),
         train_multi_lora_selected: sym!("qwen36_train_multi_lora_selected"),
         eval_step: sym!("qwen36_eval_step"),
+        train_step_host_i64: sym!("qwen36_train_step_host_i64"),
+        train_multi_lora_host_i64: sym!("qwen36_train_multi_lora_host_i64"),
+        eval_step_host_i64: sym!("qwen36_eval_step_host_i64"),
         get_lora_count: sym!("qwen36_get_lora_count"),
         get_lora_a: sym!("qwen36_get_lora_a"),
         get_lora_b: sym!("qwen36_get_lora_b"),
@@ -405,9 +413,7 @@ pub fn shard_moe_mlp_weight_for_tp(
     }
     let local = full / tp_size_i64;
     Ok(Some(
-        tensor
-            .narrow(dim as i64, rank * local, local)
-            .contiguous(),
+        tensor.narrow(dim as i64, rank * local, local).contiguous(),
     ))
 }
 
@@ -517,7 +523,9 @@ pub fn shard_linear_attention_weight_for_tp(
             bail!("base TP linear-attention QKV weight {name} must be rank 2");
         }
         if is_conv && (shape.len() != 3 || shape[1] != 1) {
-            bail!("base TP linear-attention depthwise conv weight {name} must have shape [channels, 1, kernel]");
+            bail!(
+                "base TP linear-attention depthwise conv weight {name} must have shape [channels, 1, kernel]"
+            );
         }
         let q = tensor.narrow(0, rank * local_q, local_q);
         let k = tensor.narrow(0, q_total + rank * local_q, local_q);
@@ -963,6 +971,83 @@ impl CppTrainingContext {
         Ok(loss)
     }
 
+    /// Run one complete fixed-LoRA step from a borrowed host int64 batch.
+    /// The native entry owns validation, H2D copies, forward/backward, and Adam.
+    pub fn train_step_host_i64(
+        &self,
+        input_ids: &[i64],
+        target_mask: &[i64],
+        attention_mask: &[i64],
+        batch_size: usize,
+        seq_len: usize,
+    ) -> Result<f64> {
+        validate_host_batch(input_ids, target_mask, attention_mask, batch_size, seq_len)?;
+        let kh = get_kernels().ok_or_else(|| anyhow::anyhow!("kernels not loaded"))?;
+        let loss = unsafe {
+            (kh.train_step_host_i64)(
+                self.ptr,
+                input_ids.as_ptr(),
+                target_mask.as_ptr(),
+                attention_mask.as_ptr(),
+                i64::try_from(batch_size).context("host batch_size exceeds i64")?,
+                i64::try_from(seq_len).context("host seq_len exceeds i64")?,
+            )
+        };
+        if loss < 0.0 {
+            bail!("C++ train_step_host_i64 failed");
+        }
+        Ok(loss)
+    }
+
+    /// Run one complete dynamic multi-LoRA step from a borrowed host batch.
+    pub fn train_multi_lora_host_i64(
+        &self,
+        input_ids: &[i64],
+        target_mask: &[i64],
+        attention_mask: &[i64],
+        batch_size: usize,
+        seq_len: usize,
+        n_total: i32,
+        lora_rank: i32,
+        adapter_ids: &[i64],
+    ) -> Result<f64> {
+        validate_host_batch(input_ids, target_mask, attention_mask, batch_size, seq_len)?;
+        if n_total <= 0 {
+            bail!("n_total must be positive, got {n_total}");
+        }
+        if !adapter_ids.is_empty() && adapter_ids.len() != n_total as usize {
+            bail!(
+                "selected adapter count {} does not match n_total={n_total}",
+                adapter_ids.len()
+            );
+        }
+        let adapter_count =
+            i32::try_from(adapter_ids.len()).context("selected adapter count exceeds i32")?;
+        let kh = get_kernels().ok_or_else(|| anyhow::anyhow!("kernels not loaded"))?;
+        let loss = unsafe {
+            (kh.train_multi_lora_host_i64)(
+                self.ptr,
+                input_ids.as_ptr(),
+                target_mask.as_ptr(),
+                attention_mask.as_ptr(),
+                i64::try_from(batch_size).context("host batch_size exceeds i64")?,
+                i64::try_from(seq_len).context("host seq_len exceeds i64")?,
+                n_total,
+                lora_rank,
+                if adapter_ids.is_empty() {
+                    std::ptr::null()
+                } else {
+                    adapter_ids.as_ptr()
+                },
+                adapter_count,
+            )
+        };
+        if loss < 0.0 {
+            bail!("C++ train_multi_lora_host_i64 failed");
+        }
+        Ok(loss)
+    }
+
     /// Get LoRA A tensor by index (for saving).
     pub fn get_lora_a(&self, index: i64) -> Option<Tensor> {
         let kh = get_kernels()?;
@@ -1278,14 +1363,7 @@ impl CppTrainingContext {
             modules_c.as_ptr()
         };
         let id = unsafe {
-            (kh.add_lora_for_restore)(
-                self.ptr,
-                rank,
-                alpha,
-                tl_ptr,
-                tl_len,
-                modules_ptr,
-            )
+            (kh.add_lora_for_restore)(self.ptr, rank, alpha, tl_ptr, tl_len, modules_ptr)
         };
         if id < 0 {
             bail!("C++ restore adapter allocation failed");
@@ -1480,6 +1558,33 @@ impl CppTrainingContext {
         Ok(loss)
     }
 
+    /// Evaluate a borrowed host int64 batch without constructing tensors in Rust.
+    pub fn eval_step_host_i64(
+        &self,
+        input_ids: &[i64],
+        target_mask: &[i64],
+        attention_mask: &[i64],
+        batch_size: usize,
+        seq_len: usize,
+    ) -> Result<f64> {
+        validate_host_batch(input_ids, target_mask, attention_mask, batch_size, seq_len)?;
+        let kh = get_kernels().ok_or_else(|| anyhow::anyhow!("kernels not loaded"))?;
+        let loss = unsafe {
+            (kh.eval_step_host_i64)(
+                self.ptr,
+                input_ids.as_ptr(),
+                target_mask.as_ptr(),
+                attention_mask.as_ptr(),
+                i64::try_from(batch_size).context("host batch_size exceeds i64")?,
+                i64::try_from(seq_len).context("host seq_len exceeds i64")?,
+            )
+        };
+        if loss < 0.0 {
+            bail!("C++ eval_step_host_i64 failed");
+        }
+        Ok(loss)
+    }
+
     /// Get current training step count.
     pub fn get_step_count(&self) -> i64 {
         let kh = match get_kernels() {
@@ -1551,6 +1656,33 @@ impl CppTrainingContext {
         }
         Ok(imported)
     }
+}
+
+fn validate_host_batch(
+    input_ids: &[i64],
+    target_mask: &[i64],
+    attention_mask: &[i64],
+    batch_size: usize,
+    seq_len: usize,
+) -> Result<()> {
+    if batch_size == 0 || seq_len == 0 {
+        bail!("host batch dimensions must be positive");
+    }
+    let expected = batch_size
+        .checked_mul(seq_len)
+        .context("host batch shape overflows usize")?;
+    for (name, actual) in [
+        ("input_ids", input_ids.len()),
+        ("target_mask", target_mask.len()),
+        ("attention_mask", attention_mask.len()),
+    ] {
+        if actual != expected {
+            bail!(
+                "host {name} length {actual} does not match batch_size={batch_size} * seq_len={seq_len}"
+            );
+        }
+    }
+    Ok(())
 }
 
 impl Drop for CppTrainingContext {
@@ -1635,14 +1767,11 @@ mod tests {
     #[test]
     fn dense_mlp_tp_ignores_non_mlp_weights_and_rejects_bad_shapes() {
         let tensor = Tensor::zeros([5, 4], (Kind::Float, tch::Device::Cpu));
-        assert!(shard_dense_mlp_weight_for_tp(
-            "model.layers.0.self_attn.q_proj.weight",
-            &tensor,
-            2,
-            0
-        )
-        .unwrap()
-        .is_none());
+        assert!(
+            shard_dense_mlp_weight_for_tp("model.layers.0.self_attn.q_proj.weight", &tensor, 2, 0)
+                .unwrap()
+                .is_none()
+        );
         assert!(
             shard_dense_mlp_weight_for_tp("model.layers.0.mlp.up_proj.weight", &tensor, 2, 0)
                 .is_err()
@@ -1651,38 +1780,23 @@ mod tests {
 
     #[test]
     fn moe_tp_repacks_each_gate_up_half_before_concatenation() {
-        let packed = Tensor::arange(96, (Kind::Float, tch::Device::Cpu))
-            .reshape([2, 12, 4]);
-        let rank_zero = shard_moe_mlp_weight_for_tp(
-            "model.layers.0.mlp.experts.gate_up_proj",
-            &packed,
-            2,
-            0,
-        )
-        .unwrap()
-        .unwrap();
-        let rank_one = shard_moe_mlp_weight_for_tp(
-            "model.layers.0.mlp.experts.gate_up_proj",
-            &packed,
-            2,
-            1,
-        )
-        .unwrap()
-        .unwrap();
+        let packed = Tensor::arange(96, (Kind::Float, tch::Device::Cpu)).reshape([2, 12, 4]);
+        let rank_zero =
+            shard_moe_mlp_weight_for_tp("model.layers.0.mlp.experts.gate_up_proj", &packed, 2, 0)
+                .unwrap()
+                .unwrap();
+        let rank_one =
+            shard_moe_mlp_weight_for_tp("model.layers.0.mlp.experts.gate_up_proj", &packed, 2, 1)
+                .unwrap()
+                .unwrap();
         assert_eq!(rank_zero.size(), [2, 6, 4]);
         assert_eq!(rank_one.size(), [2, 6, 4]);
         assert_eq!(rank_zero.double_value(&[0, 3, 0]), 24.0);
         assert_eq!(rank_one.double_value(&[0, 0, 0]), 12.0);
         assert_eq!(rank_one.double_value(&[0, 3, 0]), 36.0);
 
-        let rebuilt_gate = Tensor::cat(
-            &[&rank_zero.narrow(1, 0, 3), &rank_one.narrow(1, 0, 3)],
-            1,
-        );
-        let rebuilt_up = Tensor::cat(
-            &[&rank_zero.narrow(1, 3, 3), &rank_one.narrow(1, 3, 3)],
-            1,
-        );
+        let rebuilt_gate = Tensor::cat(&[&rank_zero.narrow(1, 0, 3), &rank_one.narrow(1, 0, 3)], 1);
+        let rebuilt_up = Tensor::cat(&[&rank_zero.narrow(1, 3, 3), &rank_one.narrow(1, 3, 3)], 1);
         let rebuilt = Tensor::cat(&[&rebuilt_gate, &rebuilt_up], 1);
         assert_eq!(
             rebuilt
@@ -1697,18 +1811,12 @@ mod tests {
 
     #[test]
     fn moe_tp_shards_routed_and_shared_down_input_axes() {
-        let routed = Tensor::arange(96, (Kind::Float, tch::Device::Cpu))
-            .reshape([2, 4, 12]);
-        let shared = Tensor::arange(48, (Kind::Float, tch::Device::Cpu))
-            .reshape([4, 12]);
-        let routed_rank_one = shard_moe_mlp_weight_for_tp(
-            "model.layers.0.mlp.experts.down_proj",
-            &routed,
-            2,
-            1,
-        )
-        .unwrap()
-        .unwrap();
+        let routed = Tensor::arange(96, (Kind::Float, tch::Device::Cpu)).reshape([2, 4, 12]);
+        let shared = Tensor::arange(48, (Kind::Float, tch::Device::Cpu)).reshape([4, 12]);
+        let routed_rank_one =
+            shard_moe_mlp_weight_for_tp("model.layers.0.mlp.experts.down_proj", &routed, 2, 1)
+                .unwrap()
+                .unwrap();
         let shared_rank_one = shard_moe_mlp_weight_for_tp(
             "model.layers.0.mlp.shared_expert.down_proj.weight",
             &shared,
@@ -1726,21 +1834,20 @@ mod tests {
     #[test]
     fn moe_tp_rejects_invalid_packed_and_intermediate_shapes() {
         let odd_packed = Tensor::zeros([2, 10, 4], (Kind::Float, tch::Device::Cpu));
-        assert!(shard_moe_mlp_weight_for_tp(
-            "model.layers.0.mlp.experts.gate_up_proj",
-            &odd_packed,
-            2,
-            0,
-        )
-        .is_err());
+        assert!(
+            shard_moe_mlp_weight_for_tp(
+                "model.layers.0.mlp.experts.gate_up_proj",
+                &odd_packed,
+                2,
+                0,
+            )
+            .is_err()
+        );
         let down = Tensor::zeros([2, 4, 5], (Kind::Float, tch::Device::Cpu));
-        assert!(shard_moe_mlp_weight_for_tp(
-            "model.layers.0.mlp.experts.down_proj",
-            &down,
-            2,
-            0,
-        )
-        .is_err());
+        assert!(
+            shard_moe_mlp_weight_for_tp("model.layers.0.mlp.experts.down_proj", &down, 2, 0,)
+                .is_err()
+        );
     }
 
     #[test]
@@ -1764,21 +1871,25 @@ mod tests {
     #[test]
     fn full_attention_tp_ignores_other_weights_and_rejects_bad_shapes() {
         let tensor = Tensor::zeros([5, 4], (Kind::Float, tch::Device::Cpu));
-        assert!(shard_full_attention_weight_for_tp(
-            "model.layers.0.mlp.gate_proj.weight",
-            &tensor,
-            2,
-            0,
-        )
-        .unwrap()
-        .is_none());
-        assert!(shard_full_attention_weight_for_tp(
-            "model.layers.0.self_attn.q_proj.weight",
-            &tensor,
-            2,
-            0,
-        )
-        .is_err());
+        assert!(
+            shard_full_attention_weight_for_tp(
+                "model.layers.0.mlp.gate_proj.weight",
+                &tensor,
+                2,
+                0,
+            )
+            .unwrap()
+            .is_none()
+        );
+        assert!(
+            shard_full_attention_weight_for_tp(
+                "model.layers.0.self_attn.q_proj.weight",
+                &tensor,
+                2,
+                0,
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -1849,39 +1960,45 @@ mod tests {
     #[test]
     fn linear_attention_tp_rejects_invalid_groups_and_shapes() {
         let tensor = Tensor::zeros([12, 4], (Kind::Float, tch::Device::Cpu));
-        assert!(shard_linear_attention_weight_for_tp(
-            "model.layers.0.linear_attn.norm.weight",
-            &tensor,
-            2,
-            0,
-            2,
-            2,
-            4,
-            1,
-        )
-        .unwrap()
-        .is_none());
-        assert!(shard_linear_attention_weight_for_tp(
-            "model.layers.0.linear_attn.in_proj_qkv.weight",
-            &tensor,
-            2,
-            0,
-            3,
-            2,
-            4,
-            1,
-        )
-        .is_err());
-        assert!(shard_linear_attention_weight_for_tp(
-            "model.layers.0.linear_attn.in_proj_qkv.weight",
-            &Tensor::zeros([11, 4], (Kind::Float, tch::Device::Cpu)),
-            2,
-            0,
-            2,
-            2,
-            4,
-            1,
-        )
-        .is_err());
+        assert!(
+            shard_linear_attention_weight_for_tp(
+                "model.layers.0.linear_attn.norm.weight",
+                &tensor,
+                2,
+                0,
+                2,
+                2,
+                4,
+                1,
+            )
+            .unwrap()
+            .is_none()
+        );
+        assert!(
+            shard_linear_attention_weight_for_tp(
+                "model.layers.0.linear_attn.in_proj_qkv.weight",
+                &tensor,
+                2,
+                0,
+                3,
+                2,
+                4,
+                1,
+            )
+            .is_err()
+        );
+        assert!(
+            shard_linear_attention_weight_for_tp(
+                "model.layers.0.linear_attn.in_proj_qkv.weight",
+                &Tensor::zeros([11, 4], (Kind::Float, tch::Device::Cpu)),
+                2,
+                0,
+                2,
+                2,
+                4,
+                1,
+            )
+            .is_err()
+        );
     }
 }

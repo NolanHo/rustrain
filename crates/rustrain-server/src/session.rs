@@ -327,6 +327,93 @@ impl Qwen36Session {
         self.device
     }
 
+    pub fn train_step_host_i64(
+        &mut self,
+        input_ids: &[i64],
+        target_mask: &[i64],
+        attention_mask: &[i64],
+        batch_size: usize,
+        seq_len: usize,
+    ) -> Result<TrainOutput> {
+        let loss = self
+            .ctx
+            .as_ref()
+            .ok_or_else(|| anyhow!("LoRA not initialized"))?
+            .train_step_host_i64(input_ids, target_mask, attention_mask, batch_size, seq_len)?;
+        self.finish_train_step(loss, true)
+    }
+
+    pub fn train_multi_lora_host_i64(
+        &mut self,
+        input_ids: &[i64],
+        target_mask: &[i64],
+        attention_mask: &[i64],
+        batch_size: usize,
+        seq_len: usize,
+        n_total: i32,
+        lora_rank: i32,
+        adapter_ids: &[i64],
+    ) -> Result<TrainOutput> {
+        let loss = self
+            .ctx
+            .as_ref()
+            .ok_or_else(|| anyhow!("LoRA not initialized"))?
+            .train_multi_lora_host_i64(
+                input_ids,
+                target_mask,
+                attention_mask,
+                batch_size,
+                seq_len,
+                n_total,
+                lora_rank,
+                adapter_ids,
+            )?;
+        self.finish_train_step(loss, false)
+    }
+
+    pub fn eval_step_host_i64(
+        &self,
+        input_ids: &[i64],
+        target_mask: &[i64],
+        attention_mask: &[i64],
+        batch_size: usize,
+        seq_len: usize,
+    ) -> Result<EvalOutput> {
+        let loss = self
+            .ctx
+            .as_ref()
+            .ok_or_else(|| anyhow!("LoRA not initialized"))?
+            .eval_step_host_i64(input_ids, target_mask, attention_mask, batch_size, seq_len)?;
+        Ok(EvalOutput { loss })
+    }
+
+    fn finish_train_step(&mut self, loss: f64, record_metric: bool) -> Result<TrainOutput> {
+        self.step = self
+            .step
+            .checked_add(1)
+            .context("training step counter overflow")?;
+        self.last_loss = loss;
+        self.state = SessionState::Training { step: self.step };
+        if record_metric {
+            if let Some(ref metrics) = self.metrics {
+                let mem_gb = rustrain_train::metrics::gpu_memory_allocated_mb()
+                    .map(|m| m / 1024.0)
+                    .unwrap_or(0.0);
+                metrics.record_step(StepMetric {
+                    step: self.step,
+                    loss,
+                    lr: self.lr,
+                    mem_gb,
+                    timestamp_unix: chrono::Utc::now().timestamp(),
+                });
+            }
+        }
+        Ok(TrainOutput {
+            loss,
+            step: self.step,
+        })
+    }
+
     pub fn prepare_checkpoint_load(
         &mut self,
         path: &str,
@@ -999,28 +1086,7 @@ impl TrainingSession for Qwen36Session {
             .ok_or_else(|| anyhow!("LoRA not initialized"))?;
 
         let loss = ctx.train_step(&input.input_ids, &input.target_mask, &input.attention_mask)?;
-        self.step += 1;
-        self.last_loss = loss;
-        self.state = SessionState::Training { step: self.step };
-
-        // Record metric
-        if let Some(ref metrics) = self.metrics {
-            let mem_gb = rustrain_train::metrics::gpu_memory_allocated_mb()
-                .map(|m| m / 1024.0)
-                .unwrap_or(0.0);
-            metrics.record_step(StepMetric {
-                step: self.step,
-                loss,
-                lr: self.lr,
-                mem_gb,
-                timestamp_unix: chrono::Utc::now().timestamp(),
-            });
-        }
-
-        Ok(TrainOutput {
-            loss,
-            step: self.step,
-        })
+        self.finish_train_step(loss, true)
     }
 
     fn train_multi_lora(
@@ -1066,14 +1132,7 @@ impl TrainingSession for Qwen36Session {
                 rank,
             )?
         };
-        self.step += 1;
-        self.last_loss = loss;
-        self.state = SessionState::Training { step: self.step };
-
-        Ok(TrainOutput {
-            loss,
-            step: self.step,
-        })
+        self.finish_train_step(loss, false)
     }
 
     fn eval_step(&self, input: TrainInput) -> Result<EvalOutput> {
@@ -1367,14 +1426,13 @@ impl TrainingSession for Qwen36Session {
             .ok_or_else(|| anyhow!("model path unavailable for checkpoint restore"))?;
         let current_model_path = std::fs::canonicalize(model_path)
             .with_context(|| format!("canonicalize current base model path {model_path}"))?;
-        let checkpoint_model_path = std::fs::canonicalize(&data.manifest.model_path).with_context(
-            || {
+        let checkpoint_model_path =
+            std::fs::canonicalize(&data.manifest.model_path).with_context(|| {
                 format!(
                     "canonicalize checkpoint base model path {}",
                     data.manifest.model_path
                 )
-            },
-        )?;
+            })?;
         if checkpoint_model_path != current_model_path {
             bail!(
                 "checkpoint base model {} does not match loaded model {}",

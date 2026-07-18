@@ -3,6 +3,10 @@ set -euo pipefail
 
 mode="${1:-smoke}"
 case "$mode" in
+    local-smoke)
+        test_name=native_smoke
+        test_source=crates/rustrain-qwen3-6/tests/native_smoke.cpp
+        ;;
     smoke|tri-smoke|tri-replicated-smoke)
         test_name=native_tp_ep_smoke
         test_source=crates/rustrain-qwen3-6/tests/native_tp_ep_smoke.cpp
@@ -16,7 +20,7 @@ case "$mode" in
         test_source=crates/rustrain-qwen3-6/tests/native_tp_ep_bench.cpp
         ;;
     *)
-        echo "usage: $0 [smoke|tri-smoke|tri-replicated-smoke|ep-smoke|bench]" >&2
+        echo "usage: $0 [local-smoke|smoke|tri-smoke|tri-replicated-smoke|ep-smoke|bench]" >&2
         exit 2
         ;;
 esac
@@ -178,7 +182,10 @@ cu13_lib="$site_packages/nvidia/cu13/lib"
 export LD_LIBRARY_PATH="$native_dir:$torch_lib:$nccl_lib:$cuda_home/lib64:$cu13_lib:${LD_LIBRARY_PATH:-}"
 export RUSTRAIN_NCCL_RUN_ID="${RUSTRAIN_NCCL_RUN_ID:-qwen36-tp-ep-$$}"
 
-if [[ "$mode" == "tri-smoke" || "$mode" == "tri-replicated-smoke" ]]; then
+if [[ "$mode" == "local-smoke" ]]; then
+    WORLD_SIZE=1 RANK=0 LOCAL_RANK=0 TP_SIZE=1 EP_SIZE=1 DP_SIZE=1 \
+        "$test_bin"
+elif [[ "$mode" == "tri-smoke" || "$mode" == "tri-replicated-smoke" ]]; then
     sharded_a2a=1
     if [[ "$mode" == "tri-replicated-smoke" ]]; then
         sharded_a2a=0

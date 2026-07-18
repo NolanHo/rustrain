@@ -51,6 +51,13 @@ extern "C" double qwen36_train_multi_lora(
     void*, void*, void*, void*, int32_t, int32_t);
 extern "C" double qwen36_train_multi_lora_selected(
     void*, void*, void*, void*, const int64_t*, int32_t, int32_t);
+extern "C" double qwen36_train_step_host_i64(
+    void*, const int64_t*, const int64_t*, const int64_t*, int64_t, int64_t);
+extern "C" double qwen36_train_multi_lora_host_i64(
+    void*, const int64_t*, const int64_t*, const int64_t*, int64_t, int64_t,
+    int32_t, int32_t, const int64_t*, int32_t);
+extern "C" double qwen36_eval_step_host_i64(
+    void*, const int64_t*, const int64_t*, const int64_t*, int64_t, int64_t);
 extern "C" int64_t qwen36_add_lora(
     void*, int64_t, double, const int64_t*, int64_t, const char*);
 extern "C" void* qwen36_get_adapter_lora_tensor(
@@ -366,7 +373,7 @@ static int run_dynamic_dp_smoke(
 }
 
 int main() {
-    assert(qwen36_kernel_abi_version() == 21);
+    assert(qwen36_kernel_abi_version() == 22);
     const int world = std::atoi(std::getenv("WORLD_SIZE") ? std::getenv("WORLD_SIZE") : "1");
     const int process_rank = std::atoi(std::getenv("RANK") ? std::getenv("RANK") : "0");
     const int local_rank = std::atoi(std::getenv("LOCAL_RANK") ? std::getenv("LOCAL_RANK") : "0");
@@ -525,13 +532,20 @@ int main() {
     setenv("QWEN36_REPORT_GROUPED_MM", "1", 1);
     const double grouped_loss =
         qwen36_eval_step(ctx, &input_ids, &target_mask, &attention_mask);
+    const int64_t host_input_ids[] = {1, 2};
+    const int64_t host_target_mask[] = {1, 1};
+    const int64_t host_attention_mask[] = {1, 1};
+    const double host_eval_loss = qwen36_eval_step_host_i64(
+        ctx, host_input_ids, host_target_mask, host_attention_mask, 1, 2);
     std::printf(
         "native_qwen36_moe_lora_parity fallback=%0.8f grouped=%0.8f diff=%0.8e\n",
         fallback_loss, grouped_loss, std::abs(fallback_loss - grouped_loss));
-    assert(fallback_loss > 0.0 && grouped_loss > 0.0);
+    assert(fallback_loss > 0.0 && grouped_loss > 0.0 && host_eval_loss > 0.0);
     assert(std::abs(fallback_loss - grouped_loss) <= 2e-2);
+    assert(std::abs(grouped_loss - host_eval_loss) <= 2e-2);
 
-    const double loss = qwen36_train_step(ctx, &input_ids, &target_mask, &attention_mask);
+    const double loss = qwen36_train_step_host_i64(
+        ctx, host_input_ids, host_target_mask, host_attention_mask, 1, 2);
     c10::cuda::device_synchronize();
     std::printf("native_qwen36_moe_lora_smoke loss=%0.8f\n", loss);
     assert(loss == loss);
@@ -643,9 +657,9 @@ int main() {
     auto selected_target_mask = multi_target_mask.narrow(0, 0, 1).contiguous();
     auto selected_attention_mask = multi_attention_mask.narrow(0, 0, 1).contiguous();
     const int64_t selected_adapter_ids[] = {adapter_one};
-    const double selected_loss = qwen36_train_multi_lora_selected(
-        ctx, &selected_input_ids, &selected_target_mask,
-        &selected_attention_mask, selected_adapter_ids, 1, rank);
+    const double selected_loss = qwen36_train_multi_lora_host_i64(
+        ctx, host_input_ids, host_target_mask, host_attention_mask,
+        1, 2, 1, rank, selected_adapter_ids, 1);
     c10::cuda::device_synchronize();
     assert(selected_loss == selected_loss && selected_loss > 0.0);
     assert(qwen36_get_adapter_step_count(ctx, adapter_one) == 2);

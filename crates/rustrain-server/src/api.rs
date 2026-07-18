@@ -2,8 +2,12 @@
 
 use axum::{
     Json, Router,
+    extract::DefaultBodyLimit,
+    extract::Request,
     extract::{Path, State},
     http::StatusCode,
+    middleware::{self, Next},
+    response::Response,
     response::sse::{Event, KeepAlive, Sse},
     routing::{get, post},
 };
@@ -11,6 +15,7 @@ use futures::stream::{self, Stream};
 use serde::{Deserialize, Serialize};
 use std::convert::Infallible;
 use std::sync::Arc;
+use tokio::sync::Semaphore;
 use tokio_stream::StreamExt;
 
 use crate::metrics::StepMetric;
@@ -256,16 +261,15 @@ struct TrainStepResponse {
     step: u64,
 }
 
-/// Decode a base64-encoded int64 tensor to Vec<i64> (for EP IPC).
-fn decode_int64_vec(t: &TensorHttp) -> Result<Vec<i64>, String> {
+/// Decode the little-endian wire representation without materializing host values.
+fn decode_int64_bytes(t: &TensorHttp) -> Result<Vec<u8>, String> {
     use base64::{Engine, engine::general_purpose};
+    if t.dtype != "int64" {
+        return Err(format!("EP tensor dtype must be int64, got {}", t.dtype));
+    }
     let bytes = general_purpose::STANDARD
         .decode(&t.data)
         .map_err(|e| format!("base64 decode: {e}"))?;
-    let values = bytes
-        .chunks_exact(8)
-        .map(|c| i64::from_le_bytes([c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]]))
-        .collect::<Vec<_>>();
     let expected = t
         .shape
         .iter()
@@ -275,15 +279,66 @@ fn decode_int64_vec(t: &TensorHttp) -> Result<Vec<i64>, String> {
                 .and_then(|dim| acc.checked_mul(dim))
         })
         .ok_or_else(|| format!("invalid tensor shape {:?}", t.shape))?;
-    if expected != values.len() {
+    let expected_bytes = expected
+        .checked_mul(std::mem::size_of::<i64>())
+        .ok_or_else(|| format!("tensor shape {:?} byte size overflows usize", t.shape))?;
+    if expected_bytes != bytes.len() {
         return Err(format!(
-            "tensor shape {:?} expects {} int64 values, got {}",
+            "tensor shape {:?} expects {} int64 bytes, got {}",
             t.shape,
-            expected,
-            values.len()
+            expected_bytes,
+            bytes.len()
         ));
     }
-    Ok(values)
+    Ok(bytes)
+}
+
+fn pack_tensor_slab(
+    input_ids: &TensorHttp,
+    target_mask: &TensorHttp,
+    attention_mask: &TensorHttp,
+    batch_size: usize,
+    seq_len: usize,
+) -> Result<(rustrain_ipc::TensorSlabRef, Vec<u8>), String> {
+    let decoded = [
+        decode_int64_bytes(input_ids)?,
+        decode_int64_bytes(target_mask)?,
+        decode_int64_bytes(attention_mask)?,
+    ];
+    let total = decoded
+        .iter()
+        .try_fold(0usize, |sum, bytes| sum.checked_add(bytes.len()))
+        .and_then(|sum| sum.checked_add(2 * (rustrain_ipc::TENSOR_SPAN_ALIGNMENT - 1)))
+        .ok_or_else(|| "tensor slab payload size overflows usize".to_string())?;
+    let mut payload = Vec::with_capacity(total);
+    let mut spans = Vec::with_capacity(3);
+    for bytes in decoded {
+        let aligned = payload
+            .len()
+            .checked_add(rustrain_ipc::TENSOR_SPAN_ALIGNMENT - 1)
+            .map(|value| value & !(rustrain_ipc::TENSOR_SPAN_ALIGNMENT - 1))
+            .ok_or_else(|| "tensor slab alignment overflows usize".to_string())?;
+        payload.resize(aligned, 0);
+        let offset_bytes =
+            u64::try_from(aligned).map_err(|_| "tensor slab offset exceeds u64".to_string())?;
+        let len_bytes = u64::try_from(bytes.len())
+            .map_err(|_| "tensor slab tensor length exceeds u64".to_string())?;
+        payload.extend_from_slice(&bytes);
+        spans.push(rustrain_ipc::TensorSpan {
+            offset_bytes,
+            len_bytes,
+        });
+    }
+    Ok((
+        rustrain_ipc::TensorSlabRef {
+            input_ids: spans[0],
+            target_mask: spans[1],
+            attention_mask: spans[2],
+            batch_size,
+            seq_len,
+        },
+        payload,
+    ))
 }
 
 fn validate_train_http_shapes(
@@ -663,7 +718,17 @@ struct StepMetricJson {
 // ──────────────────────────────────────────────────────────────────────
 
 pub fn ep_router(state: Arc<EpAppState>) -> Router {
+    let tensor_routes = Router::new()
+        .route("/v1/sessions/{id}/train_step", post(ep_train_step))
+        .route("/v1/sessions/{id}/train_multi", post(ep_train_multi_lora))
+        .route("/v1/sessions/{id}/eval_step", post(ep_eval_step))
+        .route_layer(middleware::from_fn_with_state(
+            Arc::new(Semaphore::new(1)),
+            ep_tensor_admission,
+        ));
+
     Router::new()
+        .merge(tensor_routes)
         .route("/v1/sessions", post(ep_create_session))
         .route(
             "/v1/sessions/{id}",
@@ -672,9 +737,6 @@ pub fn ep_router(state: Arc<EpAppState>) -> Router {
         .route("/v1/sessions/{id}/load_model", post(ep_load_model))
         .route("/v1/sessions/{id}/load_dataset", post(ep_load_dataset))
         .route("/v1/sessions/{id}/init_lora", post(ep_init_lora))
-        .route("/v1/sessions/{id}/train_step", post(ep_train_step))
-        .route("/v1/sessions/{id}/train_multi", post(ep_train_multi_lora))
-        .route("/v1/sessions/{id}/eval_step", post(ep_eval_step))
         .route(
             "/v1/sessions/{id}/save_checkpoint",
             post(ep_save_checkpoint),
@@ -690,12 +752,25 @@ pub fn ep_router(state: Arc<EpAppState>) -> Router {
         .route("/v1/sessions/{id}/export_adapter", post(ep_export_adapter))
         .route("/v1/sessions/{id}/status", get(ep_get_status))
         .route("/v1/health", get(ep_health))
+        .layer(DefaultBodyLimit::max(48 * 1024 * 1024))
         .with_state(state)
 }
 
-async fn ep_health(
-    State(state): State<Arc<EpAppState>>,
-) -> (StatusCode, Json<serde_json::Value>) {
+async fn ep_tensor_admission(
+    State(gate): State<Arc<Semaphore>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    // The IPC coordinator serializes dispatches, so decoding more than one tensor request only
+    // increases peak memory without creating training concurrency.
+    let _permit = gate
+        .acquire_owned()
+        .await
+        .expect("EP tensor admission semaphore unexpectedly closed");
+    next.run(request).await
+}
+
+async fn ep_health(State(state): State<Arc<EpAppState>>) -> (StatusCode, Json<serde_json::Value>) {
     if state.coordinator.is_healthy() {
         (
             StatusCode::OK,
@@ -804,22 +879,21 @@ async fn ep_train_step(
     let (batch_size, seq_len) =
         validate_train_http_shapes(&req.input_ids, &req.target_mask, &req.attention_mask)
             .map_err(|e| err_resp(&e))?;
-    let input_ids = decode_int64_vec(&req.input_ids).map_err(|e| err_resp(&e))?;
-    let target_mask = decode_int64_vec(&req.target_mask).map_err(|e| err_resp(&e))?;
-    let attention_mask = decode_int64_vec(&req.attention_mask).map_err(|e| err_resp(&e))?;
-
-    let cmd = rustrain_ipc::EpCommand::TrainStep {
-        session_id: id,
-        input_ids,
-        target_mask,
-        attention_mask,
+    let (tensors, payload) = pack_tensor_slab(
+        &req.input_ids,
+        &req.target_mask,
+        &req.attention_mask,
         batch_size,
         seq_len,
+    )
+    .map_err(|e| err_resp(&e))?;
+
+    let cmd = rustrain_ipc::EpCommand::TrainStepSlab {
+        session_id: id,
+        tensors,
     };
-    match state.coordinator.dispatch(&cmd) {
-        rustrain_ipc::EpResult::Train { loss, step } => {
-            Ok(Json(TrainStepResponse { loss, step }))
-        }
+    match dispatch_slab(state.coordinator.clone(), cmd, payload).await? {
+        rustrain_ipc::EpResult::Train { loss, step } => Ok(Json(TrainStepResponse { loss, step })),
         rustrain_ipc::EpResult::Error(e) => Err(err_resp(&e)),
         _ => Err(err_resp("unexpected result")),
     }
@@ -830,19 +904,23 @@ async fn ep_eval_step(
     Path(id): Path<String>,
     Json(req): Json<TrainStepHttp>,
 ) -> Result<Json<EvalStepResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let input_ids = decode_int64_vec(&req.input_ids).map_err(|e| err_resp(&e))?;
-    let target_mask = decode_int64_vec(&req.target_mask).map_err(|e| err_resp(&e))?;
-    let attention_mask = decode_int64_vec(&req.attention_mask).map_err(|e| err_resp(&e))?;
-    let seq_len = input_ids.len();
-
-    let cmd = rustrain_ipc::EpCommand::EvalStep {
-        session_id: id,
-        input_ids,
-        target_mask,
-        attention_mask,
+    let (batch_size, seq_len) =
+        validate_train_http_shapes(&req.input_ids, &req.target_mask, &req.attention_mask)
+            .map_err(|e| err_resp(&e))?;
+    let (tensors, payload) = pack_tensor_slab(
+        &req.input_ids,
+        &req.target_mask,
+        &req.attention_mask,
+        batch_size,
         seq_len,
+    )
+    .map_err(|e| err_resp(&e))?;
+
+    let cmd = rustrain_ipc::EpCommand::EvalStepSlab {
+        session_id: id,
+        tensors,
     };
-    match state.coordinator.dispatch(&cmd) {
+    match dispatch_slab(state.coordinator.clone(), cmd, payload).await? {
         rustrain_ipc::EpResult::Loss(loss) => Ok(Json(EvalStepResponse { loss })),
         rustrain_ipc::EpResult::Error(e) => Err(err_resp(&e)),
         _ => Err(err_resp("unexpected result")),
@@ -854,14 +932,19 @@ async fn ep_train_multi_lora(
     Path(id): Path<String>,
     Json(req): Json<TrainMultiLoraHttp>,
 ) -> Result<Json<TrainStepResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let input_ids = decode_int64_vec(&req.input_ids).map_err(|e| err_resp(&e))?;
-    let target_mask = decode_int64_vec(&req.target_mask).map_err(|e| err_resp(&e))?;
-    let attention_mask = decode_int64_vec(&req.attention_mask).map_err(|e| err_resp(&e))?;
     let (batch_size, seq_len) = validate_multi_lora_http_shapes(
         &req.input_ids,
         &req.target_mask,
         &req.attention_mask,
         req.n_total,
+    )
+    .map_err(|e| err_resp(&e))?;
+    let (tensors, payload) = pack_tensor_slab(
+        &req.input_ids,
+        &req.target_mask,
+        &req.attention_mask,
+        batch_size,
+        seq_len,
     )
     .map_err(|e| err_resp(&e))?;
     if !req.adapter_ids.is_empty() {
@@ -877,29 +960,38 @@ async fn ep_train_multi_lora(
         }
     }
 
-    let cmd = rustrain_ipc::EpCommand::TrainMultiLora {
+    let cmd = rustrain_ipc::EpCommand::TrainMultiLoraSlab {
         session_id: id,
-        input_ids,
-        target_mask,
-        attention_mask,
-        batch_size,
-        seq_len,
+        tensors,
         n_total: req.n_total,
         lora_rank: req.lora_rank,
         adapter_ids: req.adapter_ids,
     };
-    match state.coordinator.dispatch(&cmd) {
-        rustrain_ipc::EpResult::Train { loss, step } => {
-            Ok(Json(TrainStepResponse { loss, step }))
-        }
+    match dispatch_slab(state.coordinator.clone(), cmd, payload).await? {
+        rustrain_ipc::EpResult::Train { loss, step } => Ok(Json(TrainStepResponse { loss, step })),
         rustrain_ipc::EpResult::Error(e) => Err(err_resp(&e)),
         _ => Err(err_resp("unexpected result")),
     }
 }
 
+async fn dispatch_slab(
+    coordinator: Arc<crate::ep::EpCoordinator>,
+    command: rustrain_ipc::EpCommand,
+    payload: Vec<u8>,
+) -> Result<rustrain_ipc::EpResult, (StatusCode, Json<ErrorResponse>)> {
+    tokio::task::spawn_blocking(move || coordinator.dispatch_with_slab(&command, &payload))
+        .await
+        .map_err(|error| err_resp(&format!("EP dispatch task failed: {error}")))
+}
+
 #[cfg(test)]
 mod tensor_http_shape_tests {
-    use super::{TensorHttp, validate_multi_lora_http_shapes, validate_train_http_shapes};
+    use base64::{Engine, engine::general_purpose};
+
+    use super::{
+        TensorHttp, decode_int64_bytes, pack_tensor_slab, validate_multi_lora_http_shapes,
+        validate_train_http_shapes,
+    };
 
     fn tensor(shape: &[i64]) -> TensorHttp {
         TensorHttp {
@@ -955,6 +1047,40 @@ mod tensor_http_shape_tests {
             validate_multi_lora_http_shapes(&invalid, &tensor(&[5, 32]), &tensor(&[5, 32]), 3)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn int64_decode_rejects_wrong_dtype_and_trailing_bytes() {
+        let mut value = tensor(&[1]);
+        value.dtype = "float32".into();
+        value.data = general_purpose::STANDARD.encode(1_i64.to_le_bytes());
+        assert!(decode_int64_bytes(&value).is_err());
+
+        value.dtype = "int64".into();
+        value.data = general_purpose::STANDARD.encode([0_u8; 9]);
+        assert!(decode_int64_bytes(&value).is_err());
+    }
+
+    #[test]
+    fn tensor_slab_pack_aligns_spans_and_preserves_wire_bytes() {
+        let wire = [1_i64, -2_i64]
+            .into_iter()
+            .flat_map(i64::to_le_bytes)
+            .collect::<Vec<_>>();
+        let encoded = general_purpose::STANDARD.encode(&wire);
+        let make = || TensorHttp {
+            data: encoded.clone(),
+            shape: vec![1, 2],
+            dtype: "int64".into(),
+        };
+        let (reference, payload) = pack_tensor_slab(&make(), &make(), &make(), 1, 2).unwrap();
+        for span in reference.spans() {
+            assert_eq!(span.offset_bytes % 64, 0);
+            let start = span.offset_bytes as usize;
+            let end = start + span.len_bytes as usize;
+            assert_eq!(&payload[start..end], wire);
+        }
+        reference.validate(payload.len()).unwrap();
     }
 }
 

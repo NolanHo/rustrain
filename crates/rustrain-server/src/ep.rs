@@ -15,13 +15,13 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use rustrain_ipc::{EpChannel, EpCommand, EpResult, EpWorker};
+use rustrain_ipc::{EpChannel, EpCommand, EpResult, EpWorker, TensorSlabRef};
 use rustrain_parallel::topology::ParallelTopology;
 use tch::{Device, Kind};
 
 use crate::session::{
     AddLoRARequest, EvalOutput, InitLoRARequest, Qwen36Session, SessLoadDatasetRequest,
-    SessLoadModelRequest, TrainInput, TrainOutput, TrainingSession,
+    SessLoadModelRequest, TrainOutput, TrainingSession,
 };
 
 /// Coordinator for EP workers. Lives in the HTTP server process.
@@ -136,32 +136,48 @@ impl EpCoordinator {
         self.dispatch_locked(cmd)
     }
 
+    pub fn dispatch_with_slab(&self, cmd: &EpCommand, payload: &[u8]) -> EpResult {
+        let _guard = match self.dispatch_lock.lock() {
+            Ok(guard) => guard,
+            Err(error) => return EpResult::Error(format!("IPC dispatch lock poisoned: {error}")),
+        };
+        if self.shutdown_started.load(Ordering::Acquire) {
+            return EpResult::Error("EP coordinator is shut down".to_string());
+        }
+        match self.channel.broadcast_with_slab(cmd, payload) {
+            Ok(result) => result,
+            Err(error) => self.handle_dispatch_error(error),
+        }
+    }
+
     fn dispatch_locked(&self, cmd: &EpCommand) -> EpResult {
         if self.shutdown_started.load(Ordering::Acquire) {
             return EpResult::Error("EP coordinator is shut down".to_string());
         }
         match self.channel.broadcast(cmd) {
             Ok(result) => result,
-            Err(error) => {
-                let exited = self.exited_workers();
-                if self
-                    .shutdown_started
-                    .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-                    .is_ok()
-                {
-                    self.terminate_workers();
-                }
-                let message = if exited.is_empty() {
-                    format!("IPC error: {error}")
-                } else {
-                    format!(
-                        "IPC error: {error}; exited workers: {}",
-                        exited.join(", ")
-                    )
-                };
-                EpResult::Error(message)
-            }
+            Err(error) => self.handle_dispatch_error(error),
         }
+    }
+
+    fn handle_dispatch_error(&self, error: io::Error) -> EpResult {
+        if error.kind() == io::ErrorKind::InvalidInput {
+            return EpResult::Error(format!("invalid IPC request: {error}"));
+        }
+        let exited = self.exited_workers();
+        if self
+            .shutdown_started
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            self.terminate_workers();
+        }
+        let message = if exited.is_empty() {
+            format!("IPC error: {error}")
+        } else {
+            format!("IPC error: {error}; exited workers: {}", exited.join(", "))
+        };
+        EpResult::Error(message)
     }
 
     pub fn next_generation(&self, operation: &str) -> Result<String, String> {
@@ -349,13 +365,8 @@ impl EpCoordinator {
             return;
         }
         let _guard = self.dispatch_lock.lock().ok();
-        if !self.channel.is_poisoned()
-            && self.channel.broadcast(&EpCommand::Shutdown).is_ok()
-        {
-            let live = wait_for_worker_pids(
-                &self.worker_pids,
-                std::time::Duration::from_secs(2),
-            );
+        if !self.channel.is_poisoned() && self.channel.broadcast(&EpCommand::Shutdown).is_ok() {
+            let live = wait_for_worker_pids(&self.worker_pids, std::time::Duration::from_secs(2));
             if !live.is_empty() {
                 terminate_worker_pids(&live);
             }
@@ -479,11 +490,9 @@ fn wait_for_worker_pids(pids: &[u32], timeout: std::time::Duration) -> Vec<u32> 
     let mut live = pids.to_vec();
     while !live.is_empty() && std::time::Instant::now() < deadline {
         live.retain(|pid| {
-            let result =
-                unsafe { libc::waitpid(*pid as i32, std::ptr::null_mut(), libc::WNOHANG) };
+            let result = unsafe { libc::waitpid(*pid as i32, std::ptr::null_mut(), libc::WNOHANG) };
             result == 0
-                || (result < 0
-                    && io::Error::last_os_error().raw_os_error() == Some(libc::EINTR))
+                || (result < 0 && io::Error::last_os_error().raw_os_error() == Some(libc::EINTR))
         });
         if !live.is_empty() {
             std::thread::sleep(std::time::Duration::from_millis(10));
@@ -594,9 +603,9 @@ pub fn worker_main(
                     Err(error) => EpResult::Error(error),
                 }
             }
-            EpCommand::Shutdown => execute_command(&mut session, &cmd),
+            EpCommand::Shutdown => execute_command(&mut session, &worker, &cmd),
             _ => match require_worker_session(&active_session_id, command_session_id(&cmd)) {
-                Ok(()) => execute_command(&mut session, &cmd),
+                Ok(()) => execute_command(&mut session, &worker, &cmd),
                 Err(error) => EpResult::Error(error),
             },
         };
@@ -616,7 +625,7 @@ pub fn worker_main(
 }
 
 /// Execute a command on the local session, return result.
-fn execute_command(session: &mut Qwen36Session, cmd: &EpCommand) -> EpResult {
+fn execute_command(session: &mut Qwen36Session, worker: &EpWorker, cmd: &EpCommand) -> EpResult {
     match cmd {
         EpCommand::CreateSession { .. } | EpCommand::DeleteSession { .. } => {
             EpResult::Error("session lifecycle command reached the execution layer".into())
@@ -753,25 +762,45 @@ fn execute_command(session: &mut Qwen36Session, cmd: &EpCommand) -> EpResult {
             ) {
                 return EpResult::Error(error);
             }
-            let sl = *seq_len as i64;
-            let local_batch = rows.len() as i64;
-            let input_ids_tensor = tch::Tensor::from_slice(&input_ids[elements.clone()])
-                .reshape(&[local_batch, sl])
-                .to_device(session.device());
-            let target_mask_tensor = tch::Tensor::from_slice(&target_mask[elements.clone()])
-                .reshape(&[local_batch, sl])
-                .to_device(session.device());
-            let attention_mask_tensor = tch::Tensor::from_slice(&attention_mask[elements])
-                .reshape(&[local_batch, sl])
-                .to_device(session.device());
-
-            match session.train_step(TrainInput {
-                input_ids: input_ids_tensor,
-                target_mask: target_mask_tensor,
-                attention_mask: attention_mask_tensor,
-            }) {
+            match session.train_step_host_i64(
+                &input_ids[elements.clone()],
+                &target_mask[elements.clone()],
+                &attention_mask[elements],
+                rows.len(),
+                *seq_len,
+            ) {
                 Ok(TrainOutput { loss, step }) => EpResult::Train { loss, step },
                 Err(e) => EpResult::Error(e.to_string()),
+            }
+        }
+        EpCommand::TrainStepSlab { tensors, .. } => {
+            let (input_ids, target_mask, attention_mask) = match slab_tensor_views(worker, tensors)
+            {
+                Ok(views) => views,
+                Err(error) => return EpResult::Error(error),
+            };
+            let source_shard = match source_shard_from_env() {
+                Ok(shard) => shard,
+                Err(error) => return EpResult::Error(error),
+            };
+            let rows = match train_step_rows(tensors.batch_size, source_shard) {
+                Ok(rows) => rows,
+                Err(error) => return EpResult::Error(error),
+            };
+            let elements =
+                match tensor_element_range(tensors.batch_size, tensors.seq_len, rows.clone()) {
+                    Ok(elements) => elements,
+                    Err(error) => return EpResult::Error(error),
+                };
+            match session.train_step_host_i64(
+                &input_ids[elements.clone()],
+                &target_mask[elements.clone()],
+                &attention_mask[elements],
+                rows.len(),
+                tensors.seq_len,
+            ) {
+                Ok(TrainOutput { loss, step }) => EpResult::Train { loss, step },
+                Err(error) => EpResult::Error(error.to_string()),
             }
         }
         EpCommand::TrainMultiLora {
@@ -806,30 +835,57 @@ fn execute_command(session: &mut Qwen36Session, cmd: &EpCommand) -> EpResult {
                 Ok(elements) => elements,
                 Err(error) => return EpResult::Error(error),
             };
-            let sl = *seq_len as i64;
-            let local_batch = rows.len() as i64;
-            let input_ids_tensor = tch::Tensor::from_slice(&input_ids[elements.clone()])
-                .reshape(&[local_batch, sl])
-                .to_device(session.device());
-            let target_mask_tensor = tch::Tensor::from_slice(&target_mask[elements.clone()])
-                .reshape(&[local_batch, sl])
-                .to_device(session.device());
-            let attention_mask_tensor = tch::Tensor::from_slice(&attention_mask[elements])
-                .reshape(&[local_batch, sl])
-                .to_device(session.device());
-
-            match session.train_multi_lora(
-                TrainInput {
-                    input_ids: input_ids_tensor,
-                    target_mask: target_mask_tensor,
-                    attention_mask: attention_mask_tensor,
-                },
+            match session.train_multi_lora_host_i64(
+                &input_ids[elements.clone()],
+                &target_mask[elements.clone()],
+                &attention_mask[elements],
+                rows.len(),
+                *seq_len,
                 *n_total,
                 *lora_rank,
                 adapter_ids,
             ) {
                 Ok(TrainOutput { loss, step }) => EpResult::Train { loss, step },
                 Err(e) => EpResult::Error(e.to_string()),
+            }
+        }
+        EpCommand::TrainMultiLoraSlab {
+            tensors,
+            n_total,
+            lora_rank,
+            adapter_ids,
+            ..
+        } => {
+            let (input_ids, target_mask, attention_mask) = match slab_tensor_views(worker, tensors)
+            {
+                Ok(views) => views,
+                Err(error) => return EpResult::Error(error),
+            };
+            let source_shard = match source_shard_from_env() {
+                Ok(shard) => shard,
+                Err(error) => return EpResult::Error(error),
+            };
+            let rows = match multi_lora_rows(tensors.batch_size, *n_total, source_shard) {
+                Ok(rows) => rows,
+                Err(error) => return EpResult::Error(error),
+            };
+            let elements =
+                match tensor_element_range(tensors.batch_size, tensors.seq_len, rows.clone()) {
+                    Ok(elements) => elements,
+                    Err(error) => return EpResult::Error(error),
+                };
+            match session.train_multi_lora_host_i64(
+                &input_ids[elements.clone()],
+                &target_mask[elements.clone()],
+                &attention_mask[elements],
+                rows.len(),
+                tensors.seq_len,
+                *n_total,
+                *lora_rank,
+                adapter_ids,
+            ) {
+                Ok(TrainOutput { loss, step }) => EpResult::Train { loss, step },
+                Err(error) => EpResult::Error(error.to_string()),
             }
         }
         EpCommand::EvalStep {
@@ -839,24 +895,35 @@ fn execute_command(session: &mut Qwen36Session, cmd: &EpCommand) -> EpResult {
             seq_len,
             ..
         } => {
-            let sl = *seq_len as i64;
-            let input_ids_tensor = tch::Tensor::from_slice(input_ids)
-                .reshape(&[1, sl])
-                .to_device(session.device());
-            let target_mask_tensor = tch::Tensor::from_slice(target_mask)
-                .reshape(&[1, sl])
-                .to_device(session.device());
-            let attention_mask_tensor = tch::Tensor::from_slice(attention_mask)
-                .reshape(&[1, sl])
-                .to_device(session.device());
-
-            match session.eval_step(TrainInput {
-                input_ids: input_ids_tensor,
-                target_mask: target_mask_tensor,
-                attention_mask: attention_mask_tensor,
-            }) {
+            if let Err(error) = validate_flat_tensor_lengths(
+                1,
+                *seq_len,
+                input_ids.len(),
+                target_mask.len(),
+                attention_mask.len(),
+            ) {
+                return EpResult::Error(error);
+            }
+            match session.eval_step_host_i64(input_ids, target_mask, attention_mask, 1, *seq_len) {
                 Ok(EvalOutput { loss }) => EpResult::Loss(loss),
                 Err(e) => EpResult::Error(e.to_string()),
+            }
+        }
+        EpCommand::EvalStepSlab { tensors, .. } => {
+            let (input_ids, target_mask, attention_mask) = match slab_tensor_views(worker, tensors)
+            {
+                Ok(views) => views,
+                Err(error) => return EpResult::Error(error),
+            };
+            match session.eval_step_host_i64(
+                input_ids,
+                target_mask,
+                attention_mask,
+                tensors.batch_size,
+                tensors.seq_len,
+            ) {
+                Ok(EvalOutput { loss }) => EpResult::Loss(loss),
+                Err(error) => EpResult::Error(error.to_string()),
             }
         }
         EpCommand::ExportAdapter {
@@ -919,8 +986,11 @@ fn command_session_id(cmd: &EpCommand) -> &str {
         | EpCommand::RemoveLora { session_id, .. }
         | EpCommand::ListLora { session_id }
         | EpCommand::TrainStep { session_id, .. }
+        | EpCommand::TrainStepSlab { session_id, .. }
         | EpCommand::TrainMultiLora { session_id, .. }
+        | EpCommand::TrainMultiLoraSlab { session_id, .. }
         | EpCommand::EvalStep { session_id, .. }
+        | EpCommand::EvalStepSlab { session_id, .. }
         | EpCommand::ExportAdapter { session_id, .. }
         | EpCommand::PrepareSaveCheckpoint { session_id, .. }
         | EpCommand::PrepareLoadCheckpoint { session_id, .. }
@@ -1041,6 +1111,27 @@ fn validate_flat_tensor_lengths(
     Ok(())
 }
 
+fn slab_tensor_views<'a>(
+    worker: &'a EpWorker,
+    tensors: &TensorSlabRef,
+) -> Result<(&'a [i64], &'a [i64], &'a [i64]), String> {
+    // The worker signals completion only after execute_command returns, so
+    // these slab borrows cannot outlive the current broadcast.
+    unsafe {
+        Ok((
+            worker
+                .slab_i64(tensors.input_ids)
+                .map_err(|error| error.to_string())?,
+            worker
+                .slab_i64(tensors.target_mask)
+                .map_err(|error| error.to_string())?,
+            worker
+                .slab_i64(tensors.attention_mask)
+                .map_err(|error| error.to_string())?,
+        ))
+    }
+}
+
 fn train_step_rows(batch_size: usize, shard: Option<SourceShard>) -> Result<Range<usize>, String> {
     let Some(shard) = shard else {
         return Ok(0..batch_size);
@@ -1122,11 +1213,10 @@ fn tensor_element_range(
 #[cfg(test)]
 mod tests {
     use super::{
-        SourceShard, checkpoint_generation, checkpoint_staging_path, create_checkpoint_staging,
-        checkpoint_metadata_matches, create_worker_session, delete_worker_session,
-        multi_lora_rows, publish_checkpoint_noreplace, require_worker_session,
-        source_shard_for_topology, tensor_element_range, train_step_rows,
-        validate_flat_tensor_lengths,
+        SourceShard, checkpoint_generation, checkpoint_metadata_matches, checkpoint_staging_path,
+        create_checkpoint_staging, create_worker_session, delete_worker_session, multi_lora_rows,
+        publish_checkpoint_noreplace, require_worker_session, source_shard_for_topology,
+        tensor_element_range, train_step_rows, validate_flat_tensor_lengths,
     };
     use rustrain_parallel::topology::ParallelTopology;
 
