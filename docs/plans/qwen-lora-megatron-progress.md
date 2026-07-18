@@ -18,6 +18,8 @@ Not yet verified or implemented: fused QKV/gate-up and sequence parallel, PP act
 
 The native Qwen3.6 path now implements the configured Switch-style `router_aux_loss_coef` for fixed-LoRA PP1/CP1 training. Router probabilities remain unchanged in the forward pass; the auxiliary gradient is attached through C++ autograd, padding tokens are excluded, and expert-token counts reduce over source-sharded EP and expert-DP while TP remains replicated. H20 ABI1 native smoke covered the checkpoint recompute path and observed a nonzero loss/Adam-state delta versus coefficient zero. Dynamic multi-LoRA, MTP, and pipeline execution with a nonzero coefficient are rejected explicitly until their per-tenant/per-stage objective normalization is implemented. An opt-in dedicated NCCL stream was measured on the same H20 EP4 workload and removed after p50 regressed from `3.7746 ms` to `4.0496 ms`.
 
+Dynamic tenants now also have a native selected-eval ABI and Rust host-i64 binding. Evaluation scopes one adapter registry entry at a time and returns per-tenant losses; H20 single-rank smoke confirmed two registered tenants evaluate successfully without advancing optimizer clocks. The server route still needs wiring before this becomes an HTTP/gRPC feature.
+
 # Durable Milestones
 
 - `4e242ee`: added Megatron-style 5D topology contract and launcher normalization; `cargo test -p rustrain-parallel --lib` passed 14/14.

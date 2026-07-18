@@ -104,8 +104,30 @@ type FnTrainMultiLoraSelectedV3 = unsafe extern "C" fn(
     i32,
 ) -> i32;
 type FnEvalStep = unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void, *mut c_void) -> f64;
+type FnEvalMultiLoraSelected = unsafe extern "C" fn(
+    *mut c_void,
+    *mut c_void,
+    *mut c_void,
+    *mut c_void,
+    *const i64,
+    i32,
+    *mut f64,
+    i32,
+) -> i32;
 type FnHostBatchStep =
     unsafe extern "C" fn(*mut c_void, *const i64, *const i64, *const i64, i64, i64) -> f64;
+type FnEvalMultiLoraHost = unsafe extern "C" fn(
+    *mut c_void,
+    *const i64,
+    *const i64,
+    *const i64,
+    i64,
+    i64,
+    *const i64,
+    i32,
+    *mut f64,
+    i32,
+) -> i32;
 type FnHostMultiLoraStep = unsafe extern "C" fn(
     *mut c_void,
     *const i64,
@@ -245,10 +267,12 @@ struct KernelHandles {
     train_multi_lora_selected_v2: FnTrainMultiLoraSelectedV2,
     train_multi_lora_selected_v3: FnTrainMultiLoraSelectedV3,
     eval_step: FnEvalStep,
+    eval_multi_lora_selected: Option<FnEvalMultiLoraSelected>,
     train_step_host_i64: FnHostBatchStep,
     train_multi_lora_host_i64: FnHostMultiLoraStep,
     train_multi_lora_host_i64_v2: FnHostMultiLoraReport,
     eval_step_host_i64: FnHostBatchStep,
+    eval_multi_lora_host_i64: Option<FnEvalMultiLoraHost>,
     get_lora_count: FnGetLoraCount,
     get_lora_a: FnGetLoraA,
     get_lora_b: FnGetLoraB,
@@ -350,10 +374,28 @@ unsafe fn load_kernels() -> Option<KernelHandles> {
         train_multi_lora_selected_v2: sym!("qwen36_train_multi_lora_selected_v2"),
         train_multi_lora_selected_v3: sym!("qwen36_train_multi_lora_selected_v3"),
         eval_step: sym!("qwen36_eval_step"),
+        eval_multi_lora_selected: {
+            let name = CString::new("qwen36_eval_multi_lora_selected_v1").unwrap();
+            let symbol = libc::dlsym(handle, name.as_ptr());
+            if symbol.is_null() {
+                None
+            } else {
+                Some(std::mem::transmute::<*mut c_void, FnEvalMultiLoraSelected>(symbol))
+            }
+        },
         train_step_host_i64: sym!("qwen36_train_step_host_i64"),
         train_multi_lora_host_i64: sym!("qwen36_train_multi_lora_host_i64"),
         train_multi_lora_host_i64_v2: sym!("qwen36_train_multi_lora_host_i64_v2"),
         eval_step_host_i64: sym!("qwen36_eval_step_host_i64"),
+        eval_multi_lora_host_i64: {
+            let name = CString::new("qwen36_eval_multi_lora_host_i64_v1").unwrap();
+            let symbol = libc::dlsym(handle, name.as_ptr());
+            if symbol.is_null() {
+                None
+            } else {
+                Some(std::mem::transmute::<*mut c_void, FnEvalMultiLoraHost>(symbol))
+            }
+        },
         get_lora_count: sym!("qwen36_get_lora_count"),
         get_lora_a: sym!("qwen36_get_lora_a"),
         get_lora_b: sym!("qwen36_get_lora_b"),
@@ -2183,6 +2225,47 @@ impl CppTrainingContext {
             bail!("C++ eval_step_host_i64 failed");
         }
         Ok(loss)
+    }
+
+    /// Evaluate selected dynamic tenants independently and return one loss per
+    /// requested adapter. The native implementation scopes one registry entry
+    /// at a time, so heterogeneous tenant ranks remain isolated.
+    pub fn eval_multi_lora_host_i64(
+        &self,
+        input_ids: &[i64],
+        target_mask: &[i64],
+        attention_mask: &[i64],
+        batch_size: usize,
+        seq_len: usize,
+        adapter_ids: &[i64],
+    ) -> Result<Vec<f64>> {
+        validate_host_batch(input_ids, target_mask, attention_mask, batch_size, seq_len)?;
+        if adapter_ids.is_empty() {
+            bail!("selected multi-LoRA eval requires at least one adapter ID");
+        }
+        let kh = get_kernels().ok_or_else(|| anyhow::anyhow!("kernels not loaded"))?;
+        let eval = kh.eval_multi_lora_host_i64.ok_or_else(|| {
+            anyhow::anyhow!("native library does not export selected multi-LoRA eval")
+        })?;
+        let mut losses = vec![f64::NAN; adapter_ids.len()];
+        let status = unsafe {
+            eval(
+                self.ptr,
+                input_ids.as_ptr(),
+                target_mask.as_ptr(),
+                attention_mask.as_ptr(),
+                i64::try_from(batch_size).context("host batch_size exceeds i64")?,
+                i64::try_from(seq_len).context("host seq_len exceeds i64")?,
+                adapter_ids.as_ptr(),
+                i32::try_from(adapter_ids.len()).context("adapter count exceeds i32")?,
+                losses.as_mut_ptr(),
+                i32::try_from(losses.len()).context("adapter loss capacity exceeds i32")?,
+            )
+        };
+        if status != 0 || losses.iter().any(|loss| !loss.is_finite() || *loss < 0.0) {
+            bail!("C++ selected multi-LoRA eval failed");
+        }
+        Ok(losses)
     }
 
     /// Get current training step count.

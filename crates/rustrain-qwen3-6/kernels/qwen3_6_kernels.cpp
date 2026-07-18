@@ -11971,6 +11971,131 @@ double qwen36_eval_step(void* ctx_ptr, void* input_ids_ptr, void* target_mask_pt
     }
 }
 
+// Evaluate selected dynamic tenants independently. The registry is scoped to
+// one tenant at a time so heterogeneous ranks/modules cannot cross-contaminate
+// routing or activation-level LoRA batches. Loss numerators/counts are reduced
+// over source-sharded EP and expert-DP just like selected training reports.
+__attribute__((visibility("default"))) int32_t qwen36_eval_multi_lora_selected_v1(
+    void* ctx_ptr,
+    void* input_ids_ptr,
+    void* target_mask_ptr,
+    void* attention_mask_ptr,
+    const int64_t* adapter_ids,
+    int32_t n_adapters,
+    double* adapter_losses_out,
+    int32_t adapter_loss_capacity
+) {
+    auto* ctx = reinterpret_cast<TrainingContext*>(ctx_ptr);
+    std::vector<TrainingContext::LoRAAdapter> original;
+    std::vector<TrainingContext::LoRAAdapter> selected;
+    std::vector<size_t> selected_indexes;
+    bool registry_detached = false;
+    auto restore_registry = [&]() {
+        if (!ctx || !registry_detached) return;
+        for (size_t i = 0; i < selected.size(); ++i) {
+            original[selected_indexes[i]] = std::move(selected[i]);
+        }
+        ctx->adapters.clear();
+        ctx->adapters.swap(original);
+        registry_detached = false;
+    };
+    try {
+        TORCH_CHECK(ctx && adapter_ids && n_adapters > 0 &&
+                adapter_losses_out && adapter_loss_capacity >= n_adapters,
+            "selected multi-LoRA eval requires valid IDs and output storage");
+        validate_native_execution_topology(ctx);
+        TORCH_CHECK(ctx->pp_world_size == 1 && ctx->cp_world_size == 1,
+            "selected multi-LoRA eval requires PP=1 and CP=1");
+        auto* input = reinterpret_cast<at::Tensor*>(input_ids_ptr);
+        auto* target = reinterpret_cast<at::Tensor*>(target_mask_ptr);
+        auto* attention = attention_mask_ptr
+            ? reinterpret_cast<at::Tensor*>(attention_mask_ptr) : nullptr;
+        TORCH_CHECK(input && target && input->is_cuda() && target->is_cuda() &&
+                input->dim() == 2 && target->sizes() == input->sizes() &&
+                (input->size(0) == 1 || input->size(0) == n_adapters),
+            "selected multi-LoRA eval input batch must be [1, seq] or [n, seq]");
+        TORCH_CHECK(input->scalar_type() == at::kLong &&
+                supported_mask_dtype(*target),
+            "selected multi-LoRA eval input dtypes are invalid");
+        if (attention) {
+            TORCH_CHECK(attention->is_cuda() && attention->sizes() == input->sizes() &&
+                    supported_mask_dtype(*attention),
+                "selected multi-LoRA eval attention mask is invalid");
+        }
+        validate_adapter_collective_registry(
+            ctx, adapter_ids, n_adapters, 0, false);
+
+        original.swap(ctx->adapters);
+        registry_detached = true;
+        selected.reserve(n_adapters);
+        selected_indexes.reserve(n_adapters);
+        for (int32_t i = 0; i < n_adapters; ++i) {
+            TORCH_CHECK(adapter_ids[i] > 0,
+                "selected eval adapter IDs must be positive");
+            auto it = std::find_if(original.begin(), original.end(),
+                [&](const auto& adapter) { return adapter.id == adapter_ids[i]; });
+            TORCH_CHECK(it != original.end(),
+                "unknown selected eval adapter ID: ", adapter_ids[i]);
+            const size_t index = static_cast<size_t>(it - original.begin());
+            TORCH_CHECK(std::find(selected_indexes.begin(), selected_indexes.end(), index) ==
+                    selected_indexes.end(),
+                "duplicate selected eval adapter ID: ", adapter_ids[i]);
+            selected_indexes.push_back(index);
+            selected.push_back(std::move(*it));
+        }
+
+        const at::Tensor saved_attention_mask = ctx->attention_mask;
+        const at::Tensor saved_attention_lengths = ctx->attention_lengths;
+        struct EvalMaskGuard {
+            TrainingContext* ctx;
+            at::Tensor mask;
+            at::Tensor lengths;
+            ~EvalMaskGuard() {
+                ctx->attention_mask = mask;
+                ctx->attention_lengths = lengths;
+            }
+        } mask_guard{ctx, saved_attention_mask, saved_attention_lengths};
+        for (int32_t i = 0; i < n_adapters; ++i) {
+            ctx->adapters.clear();
+            ctx->adapters.push_back(selected[i]);
+            ctx->lora_cache_valid = false;
+            ctx->lora_batch_valid = false;
+            const bool shared_row = input->size(0) == 1;
+            auto ids = shared_row ? *input : input->narrow(0, i, 1).contiguous();
+            auto targets = shared_row ? *target : target->narrow(0, i, 1).contiguous();
+            if (attention) {
+                ctx->attention_mask = shared_row
+                    ? *attention : attention->narrow(0, i, 1).contiguous();
+                elide_trivial_attention_mask(ctx);
+            } else {
+                ctx->attention_mask = at::Tensor();
+                ctx->attention_lengths = at::Tensor();
+            }
+            at::AutoGradMode no_grad(false);
+            auto hidden = forward_full(ctx, ids);
+            auto loss = compute_loss_fused(
+                ctx, hidden, ids, targets, ctx->vocab_size);
+            auto counts = targets.narrow(1, 1, targets.size(1) - 1)
+                .to(at::kFloat).sum().reshape({1});
+            auto numerators = (loss * counts).reshape({1});
+            auto global_loss = global_dynamic_adapter_losses(
+                ctx, numerators, counts);
+            adapter_losses_out[i] = global_loss.item<double>();
+        }
+        restore_registry();
+        return 0;
+    } catch (const std::exception& error) {
+        try { restore_registry(); } catch (...) {}
+        fprintf(stderr, "[q36] selected multi-LoRA eval FAILED: %s\n",
+            error.what());
+        return -1;
+    } catch (...) {
+        try { restore_registry(); } catch (...) {}
+        fprintf(stderr, "[q36] selected multi-LoRA eval FAILED: unknown exception\n");
+        return -1;
+    }
+}
+
 static at::Tensor qwen36_copy_host_i64_batch(
     TrainingContext* ctx,
     const int64_t* data,
@@ -12136,6 +12261,41 @@ double qwen36_eval_step_host_i64(
     } catch (const std::exception& e) {
         fprintf(stderr, "[q36] eval_step_host_i64 FAILED: %s\n", e.what());
         return -1.0;
+    }
+}
+
+__attribute__((visibility("default"))) int32_t qwen36_eval_multi_lora_host_i64_v1(
+    void* ctx_ptr,
+    const int64_t* input_ids,
+    const int64_t* target_mask,
+    const int64_t* attention_mask,
+    int64_t batch_size,
+    int64_t seq_len,
+    const int64_t* adapter_ids,
+    int32_t n_adapters,
+    double* adapter_losses_out,
+    int32_t adapter_loss_capacity
+) {
+    try {
+        auto* ctx = reinterpret_cast<TrainingContext*>(ctx_ptr);
+        validate_native_execution_topology(ctx);
+        TORCH_CHECK(adapter_ids && n_adapters > 0,
+            "host selected eval requires adapter IDs");
+        auto input = qwen36_copy_host_i64_batch(
+            ctx, input_ids, batch_size, seq_len,
+            "host selected eval input_ids");
+        auto targets = qwen36_copy_host_i64_batch(
+            ctx, target_mask, batch_size, seq_len,
+            "host selected eval target_mask");
+        auto attention = qwen36_copy_host_i64_batch(
+            ctx, attention_mask, batch_size, seq_len,
+            "host selected eval attention_mask");
+        return qwen36_eval_multi_lora_selected_v1(
+            ctx, &input, &targets, &attention, adapter_ids, n_adapters,
+            adapter_losses_out, adapter_loss_capacity);
+    } catch (const std::exception& e) {
+        fprintf(stderr, "[q36] selected eval host_i64 FAILED: %s\n", e.what());
+        return -1;
     }
 }
 

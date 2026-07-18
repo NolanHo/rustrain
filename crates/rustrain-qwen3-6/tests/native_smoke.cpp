@@ -67,6 +67,9 @@ extern "C" double qwen36_train_multi_lora_host_i64(
     int32_t, int32_t, const int64_t*, int32_t);
 extern "C" double qwen36_eval_step_host_i64(
     void*, const int64_t*, const int64_t*, const int64_t*, int64_t, int64_t);
+extern "C" int32_t qwen36_eval_multi_lora_host_i64_v1(
+    void*, const int64_t*, const int64_t*, const int64_t*, int64_t, int64_t,
+    const int64_t*, int32_t, double*, int32_t);
 extern "C" int64_t qwen36_add_lora(
     void*, int64_t, double, const int64_t*, int64_t, const char*);
 extern "C" int64_t qwen36_add_lora_v2(
@@ -723,6 +726,17 @@ int main() {
     assert(dynamic_update > 0.0);
     assert(dynamic_expert_update > 0.0);
     assert(dynamic_two_update > 0.0);
+
+    double selected_eval_losses[2] = {-1.0, -1.0};
+    const int64_t eval_adapter_ids[] = {adapter_one, adapter_two};
+    assert(qwen36_eval_multi_lora_host_i64_v1(
+        ctx, host_input_ids, host_target_mask, host_attention_mask,
+        1, 2, eval_adapter_ids, 2, selected_eval_losses, 2) == 0);
+    std::printf(
+        "native_qwen36_selected_multi_lora_eval adapter_one=%0.8f "
+        "adapter_two=%0.8f\n",
+        selected_eval_losses[0], selected_eval_losses[1]);
+    assert(selected_eval_losses[0] >= 0.0 && selected_eval_losses[1] >= 0.0);
 
     auto adapter_one_before_selected = dynamic_b->clone();
     auto adapter_two_before_selected = dynamic_b_two->clone();
