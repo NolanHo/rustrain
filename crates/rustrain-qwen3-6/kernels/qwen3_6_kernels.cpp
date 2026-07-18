@@ -2411,6 +2411,10 @@ struct TrainingContext {
         // Each tenant owns an independent Adam bias-correction clock.
         int64_t optimizer_step = 0;
         double alpha;
+        bool all_target_layers = true;
+        // External identity remains global across pipeline stages. The local
+        // set below is used only for stage-owned parameter maps and compute.
+        std::set<int64_t> global_target_layers;
         std::set<int64_t> target_layers;
         std::set<std::string> target_modules;
         std::map<int64_t, std::vector<std::pair<at::Tensor, at::Tensor>>> params;
@@ -2576,6 +2580,17 @@ struct AdapterRegistryHash {
     }
 };
 
+static bool global_to_local_layer(
+    const TrainingContext* ctx, int64_t global_layer, int64_t& local_layer
+) {
+    if (!ctx || global_layer < ctx->global_layer_start ||
+            global_layer >= ctx->global_layer_start + ctx->num_layers) {
+        return false;
+    }
+    local_layer = global_layer - ctx->global_layer_start;
+    return true;
+}
+
 static void hash_tensor_layout(
     AdapterRegistryHash& hash, const at::Tensor& tensor
 ) {
@@ -2598,8 +2613,9 @@ static void hash_adapter_layout(
     static_assert(sizeof(alpha_bits) == sizeof(adapter.alpha));
     std::memcpy(&alpha_bits, &adapter.alpha, sizeof(alpha_bits));
     hash.add_u64(alpha_bits);
-    hash.add_u64(adapter.target_layers.size());
-    for (const auto layer : adapter.target_layers) hash.add_u64(layer);
+    hash.add_u64(adapter.all_target_layers);
+    hash.add_u64(adapter.global_target_layers.size());
+    for (const auto layer : adapter.global_target_layers) hash.add_u64(layer);
     hash.add_u64(adapter.target_modules.size());
     for (const auto& module : adapter.target_modules) hash.add_string(module);
     hash.add_u64(adapter.params.size());
@@ -4390,7 +4406,9 @@ static void precompute_lora_cache(TrainingContext* ctx) {
                 if (!adapter.target_modules.empty() &&
                     adapter.target_modules.find(module_name) == adapter.target_modules.end())
                     continue;
-                if (!adapter.target_layers.empty() && adapter.target_layers.find(layer_idx) == adapter.target_layers.end())
+                if (!adapter.all_target_layers &&
+                    adapter.target_layers.find(layer_idx) ==
+                        adapter.target_layers.end())
                     continue;
                 auto it = adapter.params.find(layer_idx);
                 if (it == adapter.params.end()) continue;
@@ -4535,7 +4553,7 @@ static void prepare_lora_batch(
                         adapter.target_modules.find(module_name) ==
                             adapter.target_modules.end())
                         continue;
-                    if (!adapter.target_layers.empty() &&
+                    if (!adapter.all_target_layers &&
                         adapter.target_layers.find(layer_idx) ==
                             adapter.target_layers.end())
                         continue;
@@ -4642,7 +4660,7 @@ static void prepare_lora_batch(
                         adapter.target_modules.find(module_name) ==
                             adapter.target_modules.end())
                         continue;
-                    if (!adapter.target_layers.empty() &&
+                    if (!adapter.all_target_layers &&
                         adapter.target_layers.find(layer_idx) ==
                             adapter.target_layers.end())
                         continue;
@@ -7965,7 +7983,10 @@ static double qwen36_train_multi_lora_impl(
                         adapter.id, " registered_rank=", adapter.rank,
                         " requested_rank=", lora_rank);
                     TORCH_CHECK(
-                        adapter.target_layers == reference_adapter.target_layers &&
+                        adapter.all_target_layers ==
+                            reference_adapter.all_target_layers &&
+                            adapter.global_target_layers ==
+                                reference_adapter.global_target_layers &&
                             adapter.target_modules == reference_adapter.target_modules,
                         "legacy multi-LoRA training requires homogeneous target layers/modules; "
                         "use the v2 trainer for heterogeneous adapters");
@@ -8671,20 +8692,11 @@ static std::string dynamic_adapter_group_key(
 ) {
     std::ostringstream key;
     key << "rank=" << adapter.rank;
-    key << "|layers=";
-    for (const auto layer : adapter.target_layers) key << layer << ",";
+    key << "|all_layers=" << adapter.all_target_layers;
+    key << "|global_layers=";
+    for (const auto layer : adapter.global_target_layers) key << layer << ",";
     key << "|modules=";
     for (const auto& module : adapter.target_modules) key << module << ",";
-    for (const auto& [layer_idx, pairs] : adapter.params) {
-        for (size_t pair_idx = 0; pair_idx < pairs.size(); ++pair_idx) {
-            const auto& [a, b] = pairs[pair_idx];
-            if (!a.requires_grad() && !b.requires_grad()) continue;
-            key << "|" << layer_idx << ":" << pair_idx << ":";
-            for (const auto size : a.sizes()) key << size << ",";
-            key << "/";
-            for (const auto size : b.sizes()) key << size << ",";
-        }
-    }
     return key.str();
 }
 
@@ -10032,19 +10044,27 @@ int64_t qwen36_add_lora(
             adapter.id = ctx->next_adapter_id + 1;
             adapter.rank = rank;
             adapter.alpha = alpha;
-            for (int64_t i = 0; i < num_target_layers; i++)
-                adapter.target_layers.insert(target_layers[i]);
+            adapter.all_target_layers = num_target_layers == 0;
+            for (int64_t i = 0; i < num_target_layers; i++) {
+                const int64_t global_layer = target_layers[i];
+                TORCH_CHECK(global_layer >= 0 &&
+                        global_layer < ctx->global_num_layers,
+                    "dynamic LoRA target layer out of range: ", global_layer,
+                    " for model with ", ctx->global_num_layers, " layers");
+                adapter.global_target_layers.insert(global_layer);
+                if (global_layer >= ctx->global_layer_start &&
+                        global_layer <
+                            ctx->global_layer_start + ctx->num_layers) {
+                    adapter.target_layers.insert(
+                        global_layer - ctx->global_layer_start);
+                }
+            }
             if (target_modules_str) {
                 std::string s(target_modules_str);
                 std::stringstream ss(s);
                 std::string item;
                 while (std::getline(ss, item, ','))
                     adapter.target_modules.insert(item);
-            }
-            for (auto layer : adapter.target_layers) {
-                TORCH_CHECK(layer >= 0 && layer < ctx->num_layers,
-                    "dynamic LoRA target layer out of range: ", layer,
-                    " for model with ", ctx->num_layers, " layers");
             }
             // The activation-level batch path stacks A/B across adapters.
             // Keep the batch rectangular and semantically aligned instead of
@@ -10055,7 +10075,10 @@ int64_t qwen36_add_lora(
                 const auto& reference = ctx->adapters.front();
                 TORCH_CHECK(rank == reference.rank,
                     "dynamic LoRA adapters in one batch must use the same rank");
-                TORCH_CHECK(adapter.target_layers == reference.target_layers,
+                TORCH_CHECK(adapter.all_target_layers ==
+                        reference.all_target_layers &&
+                        adapter.global_target_layers ==
+                            reference.global_target_layers,
                     "dynamic LoRA adapters in one batch must use identical "
                     "target_layers");
                 TORCH_CHECK(adapter.target_modules == reference.target_modules,
@@ -10087,13 +10110,14 @@ int64_t qwen36_add_lora(
                     }
                     if (resolved) break;
                 }
-                TORCH_CHECK(resolved,
+                TORCH_CHECK(resolved ||
+                        ctx->global_num_layers != ctx->num_layers,
                     "dynamic LoRA target module does not exist in this model: ",
                     name);
             }
             local_rank = local_lora_rank_for_active_targets(
                 ctx, rank, adapter.target_layers, adapter.target_modules,
-                adapter.target_layers.empty(),
+                adapter.all_target_layers,
                 /*empty_modules_mean_attention_only=*/true, "dynamic");
         } catch (const std::exception& e) {
             request_error = e.what();
@@ -10109,7 +10133,7 @@ int64_t qwen36_add_lora(
         std::string preparation_error;
         try {
             for (int64_t i = 0; i < ctx->num_layers; i++) {
-                if (!adapter.target_layers.empty() &&
+                if (!adapter.all_target_layers &&
                     adapter.target_layers.find(i) ==
                         adapter.target_layers.end())
                     continue;
@@ -10364,12 +10388,13 @@ int64_t qwen36_list_lora(void* ctx_ptr, int64_t* out_ids, int64_t max_count) {
 
 __attribute__((visibility("default")))
 void* qwen36_get_adapter_lora_tensor(
-    void* ctx_ptr, int64_t adapter_id, int64_t layer_idx,
+    void* ctx_ptr, int64_t adapter_id, int64_t global_layer,
     const char* module_name, int32_t is_b
 ) {
     auto* ctx = reinterpret_cast<TrainingContext*>(ctx_ptr);
-    if (!ctx || !module_name || layer_idx < 0 || layer_idx >= ctx->num_layers)
-        return nullptr;
+    int64_t layer_idx = -1;
+    if (!module_name ||
+            !global_to_local_layer(ctx, global_layer, layer_idx)) return nullptr;
     const int64_t pair_idx = lora_pair_index(
         ctx->layer_configs[layer_idx], module_name);
     if (pair_idx < 0) return nullptr;
@@ -10388,7 +10413,7 @@ void* qwen36_get_adapter_lora_tensor(
 
 __attribute__((visibility("default")))
 int32_t qwen36_set_adapter_lora_tensor(
-    void* ctx_ptr, int64_t adapter_id, int64_t layer_idx,
+    void* ctx_ptr, int64_t adapter_id, int64_t global_layer,
     const char* module_name, int32_t is_b, void* tensor_ptr
 ) {
     try {
@@ -10397,9 +10422,9 @@ int32_t qwen36_set_adapter_lora_tensor(
             "invalid dynamic LoRA tensor setter arguments");
         auto* target = reinterpret_cast<at::Tensor*>(
             qwen36_get_adapter_lora_tensor(
-                ctx, adapter_id, layer_idx, module_name, is_b));
+                ctx, adapter_id, global_layer, module_name, is_b));
         TORCH_CHECK(target, "dynamic LoRA target not found: adapter=", adapter_id,
-            " layer=", layer_idx, " module=", module_name);
+            " global_layer=", global_layer, " module=", module_name);
         auto& source = *reinterpret_cast<at::Tensor*>(tensor_ptr);
         TORCH_CHECK(source.sizes() == target->sizes(),
             "dynamic LoRA tensor shape mismatch: expected ", target->sizes(),
@@ -10419,12 +10444,13 @@ int32_t qwen36_set_adapter_lora_tensor(
 // {m_a, v_a, m_b, v_b}; `is_b` selects A/B and `is_v` selects m/v.
 __attribute__((visibility("default")))
 void* qwen36_get_adapter_optimizer_tensor(
-    void* ctx_ptr, int64_t adapter_id, int64_t layer_idx,
+    void* ctx_ptr, int64_t adapter_id, int64_t global_layer,
     const char* module_name, int32_t is_b, int32_t is_v
 ) {
     auto* ctx = reinterpret_cast<TrainingContext*>(ctx_ptr);
-    if (!ctx || !module_name || layer_idx < 0 || layer_idx >= ctx->num_layers)
-        return nullptr;
+    int64_t layer_idx = -1;
+    if (!module_name ||
+            !global_to_local_layer(ctx, global_layer, layer_idx)) return nullptr;
     const int64_t pair_idx = lora_pair_index(
         ctx->layer_configs[layer_idx], module_name);
     if (pair_idx < 0) return nullptr;
@@ -10443,13 +10469,13 @@ void* qwen36_get_adapter_optimizer_tensor(
 
 __attribute__((visibility("default")))
 int32_t qwen36_set_adapter_optimizer_tensor(
-    void* ctx_ptr, int64_t adapter_id, int64_t layer_idx,
+    void* ctx_ptr, int64_t adapter_id, int64_t global_layer,
     const char* module_name, int32_t is_b, int32_t is_v, void* tensor_ptr
 ) {
     try {
         auto* target = reinterpret_cast<at::Tensor*>(
             qwen36_get_adapter_optimizer_tensor(
-                ctx_ptr, adapter_id, layer_idx, module_name, is_b, is_v));
+                ctx_ptr, adapter_id, global_layer, module_name, is_b, is_v));
         TORCH_CHECK(target && tensor_ptr, "dynamic optimizer tensor not found");
         auto& source = *reinterpret_cast<at::Tensor*>(tensor_ptr);
         TORCH_CHECK(source.sizes() == target->sizes(),
