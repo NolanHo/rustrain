@@ -2210,6 +2210,12 @@ mod mtp_tests {
         let q_ln = Tensor::ones([4], (Kind::Float, Device::Cpu));
         let kv_ln = Tensor::ones([2], (Kind::Float, Device::Cpu));
         let o_proj = Tensor::randn([4, 2], (Kind::Float, Device::Cpu));
+        let idx_wq_b = Tensor::randn([4, 4], (Kind::Float, Device::Cpu));
+        let _ = idx_wq_b.set_requires_grad(true);
+        let idx_wk = Tensor::randn([4, 4], (Kind::Float, Device::Cpu));
+        let idx_k_norm_w = Tensor::ones([4], (Kind::Float, Device::Cpu));
+        let idx_k_norm_b = Tensor::zeros([4], (Kind::Float, Device::Cpu));
+        let idx_weights_proj = Tensor::randn([1, 4], (Kind::Float, Device::Cpu));
         let dense_gate = Tensor::randn([8, 4], (Kind::Float, Device::Cpu));
         let dense_up = Tensor::randn([8, 4], (Kind::Float, Device::Cpu));
         let dense_down = Tensor::randn([4, 8], (Kind::Float, Device::Cpu));
@@ -2225,6 +2231,11 @@ mod mtp_tests {
         d.kv_a_layernorm = ptr(&kv_ln);
         d.kv_b_proj = ptr(&kv_b);
         d.o_proj = ptr(&o_proj);
+        d.idx_wq_b = ptr(&idx_wq_b);
+        d.idx_wk = ptr(&idx_wk);
+        d.idx_k_norm_w = ptr(&idx_k_norm_w);
+        d.idx_k_norm_b = ptr(&idx_k_norm_b);
+        d.idx_weights_proj = ptr(&idx_weights_proj);
         d.dense_gate = ptr(&dense_gate);
         d.dense_up = ptr(&dense_up);
         d.dense_down = ptr(&dense_down);
@@ -2236,6 +2247,10 @@ mod mtp_tests {
         d.qk_rope = 2;
         d.v_head = 2;
         d.kv_lora = 2;
+        d.idx_head_dim = 4;
+        d.idx_n_heads = 1;
+        d.idx_n_heads_global = 1;
+        d.idx_topk = 2;
         d.rms_eps = 1e-6;
         d.rope_theta = 10_000.0;
         let output = glm5_mtp_decoder_layer_cpp(&d).unwrap();
@@ -2244,6 +2259,10 @@ mod mtp_tests {
         assert!(
             hidden.grad().defined(),
             "MTP decoder detached hidden autograd"
+        );
+        assert!(
+            idx_wq_b.grad().defined(),
+            "MTP decoder detached indexer autograd"
         );
     }
 

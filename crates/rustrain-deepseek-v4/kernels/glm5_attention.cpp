@@ -2297,7 +2297,10 @@ static at::Tensor glm5_mtp_attention(const at::Tensor& input,
                     static_cast<int64_t>(reinterpret_cast<intptr_t>(d.cp_comm)), next, prev);
             }
         }
-        global_topk = best_indices->expand({batch, nh, seq, actual_topk}, false);
+        // DSA selects one key set per token and shares it across all MLA heads.
+        // Drop the singleton indexer-head reduction dimension so the stored
+        // contract remains [batch, seq, topk].
+        global_topk = best_indices->squeeze(1);
     }
 
     at::Tensor context;
@@ -2319,8 +2322,12 @@ static at::Tensor glm5_mtp_attention(const at::Tensor& input,
             auto allowed = (k_pos.unsqueeze(0) <= q_pos.unsqueeze(1))
                 .unsqueeze(0).unsqueeze(0).expand({batch, nh, seq, seq}, false);
             if (global_topk) {
-                auto in_block = global_topk->ge(key_offset).logical_and(global_topk->lt(key_offset + seq));
-                auto local_indices = (*global_topk - key_offset).masked_fill(in_block.logical_not(), 0);
+                auto topk_per_head = global_topk->unsqueeze(1)
+                    .expand({batch, nh, seq, actual_topk}, false);
+                auto in_block = topk_per_head.ge(key_offset)
+                    .logical_and(topk_per_head.lt(key_offset + seq));
+                auto local_indices = (topk_per_head - key_offset)
+                    .masked_fill(in_block.logical_not(), 0);
                 auto sparse = at::zeros({batch, nh, seq, seq}, query.options());
                 sparse.scatter_add_(-1, local_indices,
                                     at::ones_like(local_indices, query.options()) * in_block.to(dtype));
