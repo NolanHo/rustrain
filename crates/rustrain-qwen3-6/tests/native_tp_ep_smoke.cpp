@@ -8,6 +8,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <initializer_list>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -55,6 +56,8 @@ extern "C" int64_t qwen36_import_optimizer_state(
 extern "C" int64_t qwen36_get_step_count(void*);
 extern "C" int32_t qwen36_set_step_count(void*, int64_t);
 extern "C" double qwen36_train_step(void*, void*, void*, void*);
+extern "C" double qwen36_train_micro_step(
+    void*, void*, void*, void*, double, int32_t);
 extern "C" int64_t qwen36_add_lora(
     void*, int64_t, double, const int64_t*, int64_t, const char*);
 extern "C" int64_t qwen36_add_lora_v2(
@@ -709,6 +712,62 @@ int main() {
     auto local_batch = source_batch(source_rank);
     const int source_count = sharded_source ? 2 * dp_size : dp_size;
     auto global_batch = full_batch(source_count);
+
+    auto* fixed_preflight_probe = reinterpret_cast<at::Tensor*>(
+        qwen36_get_lora_b(distributed, fixed_fixtures.front().slot));
+    assert(fixed_preflight_probe);
+    const auto fixed_preflight_probe_before = fixed_preflight_probe->clone();
+
+    // Replica input signatures must agree before TP/EP forward collectives.
+    auto mismatched_shape_input = local_batch.input_ids;
+    auto mismatched_shape_targets = local_batch.target_mask;
+    auto mismatched_shape_attention = local_batch.attention_mask;
+    if (rank == 0) {
+        mismatched_shape_input = mismatched_shape_input.narrow(1, 0, 3).contiguous();
+        mismatched_shape_targets = mismatched_shape_targets.narrow(1, 0, 3).contiguous();
+        mismatched_shape_attention = mismatched_shape_attention.narrow(1, 0, 3).contiguous();
+    }
+    assert(qwen36_train_micro_step(
+        distributed, &mismatched_shape_input, &mismatched_shape_targets,
+        &mismatched_shape_attention, 1.0, 1) < 0.0);
+    assert(qwen36_get_step_count(distributed) == 0);
+    assert(max_diff(*fixed_preflight_probe, fixed_preflight_probe_before) == 0.0);
+
+    // The scale itself is finite, but sources with multiple supervised tokens
+    // overflow the product. Every rank must fail before forward/backward.
+    assert(qwen36_train_micro_step(
+        distributed, &local_batch.input_ids, &local_batch.target_mask,
+        &local_batch.attention_mask,
+        std::numeric_limits<double>::max(), 1) < 0.0);
+    assert(qwen36_get_step_count(distributed) == 0);
+    assert(max_diff(*fixed_preflight_probe, fixed_preflight_probe_before) == 0.0);
+
+    // Optimizer phase is part of the distributed fixed-LoRA clock. A rank-local
+    // apply decision must fail before forward or accumulation can diverge.
+    const double mismatched_phase_loss = qwen36_train_micro_step(
+        distributed, &local_batch.input_ids, &local_batch.target_mask,
+        &local_batch.attention_mask, 1.0, rank == 0 ? 0 : 1);
+    assert(mismatched_phase_loss < 0.0);
+    assert(qwen36_get_step_count(distributed) == 0);
+    assert(max_diff(*fixed_preflight_probe, fixed_preflight_probe_before) == 0.0);
+
+    // A rank-local fixed optimizer clock must fail through full-topology
+    // consensus before gradient collectives or Adam can diverge.
+    auto* fixed_clock_probe = reinterpret_cast<at::Tensor*>(
+        qwen36_get_lora_b(distributed, fixed_fixtures.front().slot));
+    assert(fixed_clock_probe);
+    const auto fixed_clock_probe_before = fixed_clock_probe->clone();
+    if (rank == 0)
+        assert(qwen36_set_step_count(distributed, 1) == 0);
+    const double mismatched_clock_loss = qwen36_train_step(
+        distributed, &local_batch.input_ids, &local_batch.target_mask,
+        &local_batch.attention_mask);
+    assert(mismatched_clock_loss < 0.0);
+    if (rank == 0)
+        assert(qwen36_set_step_count(distributed, 0) == 0);
+    assert(qwen36_get_step_count(distributed) == 0);
+    assert(max_diff(*fixed_clock_probe, fixed_clock_probe_before) == 0.0);
+
     const double distributed_loss = qwen36_train_step(
         distributed, &local_batch.input_ids, &local_batch.target_mask,
         &local_batch.attention_mask);
@@ -1249,6 +1308,32 @@ int main() {
     const int64_t heterogeneous_ids[] = {tenant_one, heterogeneous_tenant};
     const int64_t tenant_one_step_before =
         qwen36_get_adapter_step_count(distributed, tenant_one);
+
+    // TP peers are replicas of the same source row. A rank-local target mask
+    // change must fail on every topology coordinate before gradient sync.
+    auto mismatched_tp_targets = local_batch.target_mask.clone();
+    if (ep_rank == 0 &&
+        ((dp_rank == 0 && tp_rank == 0) ||
+         (dp_rank == 1 && tp_rank == 1))) {
+        mismatched_tp_targets.zero_();
+    }
+    const int64_t finalizers_before_tp_mismatch =
+        qwen36_get_dynamic_finalizer_count(distributed);
+    const int64_t adam_before_tp_mismatch =
+        qwen36_get_dynamic_adam_launch_count(distributed);
+    assert(qwen36_train_multi_lora_selected_v2(
+        distributed, &local_batch.input_ids, &mismatched_tp_targets,
+        &local_batch.attention_mask, heterogeneous_ids, 2) < 0.0);
+    assert(qwen36_get_adapter_step_count(distributed, tenant_one) ==
+        tenant_one_step_before);
+    assert(qwen36_get_adapter_step_count(distributed, heterogeneous_tenant) == 0);
+    assert(max_diff(*homogeneous_b, homogeneous_before) == 0.0);
+    assert(max_diff(*heterogeneous_b, heterogeneous_before) == 0.0);
+    assert(qwen36_get_dynamic_finalizer_count(distributed) ==
+        finalizers_before_tp_mismatch + 1);
+    assert(qwen36_get_dynamic_adam_launch_count(distributed) ==
+        adam_before_tp_mismatch);
+
     const int64_t finalizers_before_heterogeneous =
         qwen36_get_dynamic_finalizer_count(distributed);
     const int64_t adam_launches_before_heterogeneous =
@@ -1305,19 +1390,49 @@ int main() {
     assert(qwen36_get_dynamic_adam_launch_count(distributed) ==
         adam_launches_before_heterogeneous + 1);
 
+    // Exercise request-order token normalization across two signatures with
+    // unequal positive counts and a third globally-empty tenant. The empty
+    // tenant must retain its parameters, Adam state, and private clock.
+    const int64_t heterogeneous_batch_ids[] = {
+        tenant_one, heterogeneous_tenant, tenant_two};
+    auto dense_targets = at::ones_like(local_batch.target_mask);
+    dense_targets.select(1, 0).zero_();
+    auto empty_targets = at::zeros_like(local_batch.target_mask);
+    auto heterogeneous_input = local_batch.input_ids.repeat({3, 1});
+    auto heterogeneous_targets = at::cat({
+        local_batch.target_mask, dense_targets, empty_targets}, 0);
+    auto heterogeneous_attention =
+        local_batch.attention_mask.repeat({3, 1});
+    auto* empty_tenant_b = dynamic_tensor(
+        distributed, tenant_two, projection_targets, true);
+    auto* empty_tenant_m = dynamic_state(
+        distributed, tenant_two, projection_targets, true, false);
+    auto* empty_tenant_v = dynamic_state(
+        distributed, tenant_two, projection_targets, true, true);
+    assert(empty_tenant_b && empty_tenant_m && empty_tenant_v);
+    const auto empty_tenant_b_before = empty_tenant_b->clone();
+    const auto empty_tenant_m_before = empty_tenant_m->clone();
+    const auto empty_tenant_v_before = empty_tenant_v->clone();
+    const int64_t empty_tenant_step_before =
+        qwen36_get_adapter_step_count(distributed, tenant_two);
     const double heterogeneous_loss = qwen36_train_multi_lora_selected_v2(
-        distributed, &local_batch.input_ids, &local_batch.target_mask,
-        &local_batch.attention_mask, heterogeneous_ids, 2);
+        distributed, &heterogeneous_input, &heterogeneous_targets,
+        &heterogeneous_attention, heterogeneous_batch_ids, 3);
     assert(heterogeneous_loss > 0.0 && std::isfinite(heterogeneous_loss));
     assert(qwen36_get_adapter_step_count(distributed, tenant_one) ==
         tenant_one_step_before + 1);
     assert(qwen36_get_adapter_step_count(distributed, heterogeneous_tenant) == 1);
+    assert(qwen36_get_adapter_step_count(distributed, tenant_two) ==
+        empty_tenant_step_before);
     assert(qwen36_get_dynamic_finalizer_count(distributed) ==
         finalizers_before_heterogeneous + 3);
     assert(qwen36_get_dynamic_adam_launch_count(distributed) ==
         adam_launches_before_heterogeneous + 2);
     assert(update_norm(*homogeneous_b, homogeneous_before) > 0.0);
     assert(update_norm(*heterogeneous_b, heterogeneous_before) > 0.0);
+    assert(max_diff(*empty_tenant_b, empty_tenant_b_before) == 0.0);
+    assert(max_diff(*empty_tenant_m, empty_tenant_m_before) == 0.0);
+    assert(max_diff(*empty_tenant_v, empty_tenant_v_before) == 0.0);
     std::printf(
         "native_tp_ep_heterogeneous_v2 rank=%d loss=%0.8f ok\n",
         rank, heterogeneous_loss);

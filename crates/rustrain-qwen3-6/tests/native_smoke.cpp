@@ -1002,13 +1002,42 @@ int main() {
     assert(qwen36_get_step_count(ctx) == 0);
     assert((*linear_a - linear_a_before).abs().sum().item<double>() == 0.0);
 
-    // Two clean micro-batches accumulate into FP32 and commit one Adam step.
+    // A globally empty fixed window is a strict no-op: no Adam state/clock
+    // transition and no lingering accumulation state.
+    auto fixed_zero_target_mask = at::zeros_like(target_mask);
+    const auto linear_a_before_empty = linear_a->clone();
+    const double empty_window_loss = qwen36_train_micro_step(
+        ctx, &input_ids, &fixed_zero_target_mask, &attention_mask, 0.5, 1);
+    c10::cuda::device_synchronize();
+    assert(std::isfinite(empty_window_loss));
+    assert(qwen36_get_step_count(ctx) == 0);
+    assert((*linear_a - linear_a_before_empty).abs()
+        .max().item<double>() == 0.0);
+    assert(linear_a_accum->abs().sum().item<double>() == 0.0);
+    assert(qwen36_get_accumulation_active(ctx) == 0);
+    assert(qwen36_get_accumulated_token_weight(ctx) == 0.0);
+
+    // Positive, zero, positive micro-batches accumulate into FP32 and commit
+    // one Adam step. The zero-token micro must not dilute the numerator or
+    // denominator already present in the window.
     const double clean_accum_loss_0 = qwen36_train_micro_step(
         ctx, &input_ids, &target_mask, &attention_mask, 0.5, 0);
     c10::cuda::device_synchronize();
     assert(clean_accum_loss_0 == clean_accum_loss_0);
     assert(linear_a_accum->scalar_type() == at::kFloat);
     assert(linear_a_accum->abs().sum().item<double>() > 0.0);
+    const auto positive_accumulator = linear_a_accum->clone();
+    const double positive_token_weight =
+        qwen36_get_accumulated_token_weight(ctx);
+    const double zero_micro_loss = qwen36_train_micro_step(
+        ctx, &input_ids, &fixed_zero_target_mask, &attention_mask, 0.5, 0);
+    c10::cuda::device_synchronize();
+    assert(std::isfinite(zero_micro_loss));
+    assert(qwen36_get_step_count(ctx) == 0);
+    assert((*linear_a_accum - positive_accumulator).abs()
+        .max().item<double>() == 0.0);
+    assert(qwen36_get_accumulated_token_weight(ctx) ==
+        positive_token_weight);
     const double accum_loss_1 = qwen36_train_micro_step(
         ctx, &input_ids, &target_mask, &attention_mask, 0.5, 1);
     c10::cuda::device_synchronize();

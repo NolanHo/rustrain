@@ -2445,10 +2445,84 @@ static void validate_adapter_collective_registry(
     }
 }
 
+static void validate_fixed_collective_registry(
+    TrainingContext* ctx, int64_t optimizer_phase = -1
+) {
+    if (!ctx || (!ctx->nccl_comm && !ctx->dp_comm && !ctx->tp_comm)) return;
+
+    AdapterRegistryHash hash;
+    hash.add_u64(ctx->fixed_optimizer_step);
+    hash.add_u64(ctx->lora_active.size());
+    hash.add_u64(ctx->lora_a.size());
+    hash.add_u64(ctx->lora_b.size());
+    hash.add_u64(ctx->adapters.size());
+    for (const auto& adapter : ctx->adapters)
+        hash_adapter_layout(hash, adapter);
+    for (size_t index = 0; index < ctx->lora_active.size(); ++index) {
+        hash.add_u64(ctx->lora_active[index]);
+        if (index < ctx->lora_a.size())
+            hash_tensor_layout(hash, ctx->lora_a[index]);
+        if (index < ctx->lora_b.size())
+            hash_tensor_layout(hash, ctx->lora_b[index]);
+        if (index < ctx->grad_accum_a.size())
+            hash_tensor_layout(hash, ctx->grad_accum_a[index]);
+        if (index < ctx->grad_accum_b.size())
+            hash_tensor_layout(hash, ctx->grad_accum_b[index]);
+    }
+
+    constexpr uint64_t kPositiveInt64Mask =
+        static_cast<uint64_t>(std::numeric_limits<int64_t>::max());
+    const std::vector<int64_t> signature_values{
+        optimizer_phase,
+        ctx->fixed_optimizer_step,
+        static_cast<int64_t>(ctx->lora_active.size()),
+        static_cast<int64_t>(hash.first & kPositiveInt64Mask),
+        static_cast<int64_t>(hash.second & kPositiveInt64Mask),
+    };
+    c10::cuda::set_device(ctx->cuda_device);
+    cudaSetDevice(ctx->cuda_device);
+    auto options = at::TensorOptions().dtype(at::kLong).device(
+        at::kCUDA, ctx->cuda_device);
+    auto minimum = at::tensor(signature_values, options);
+    auto maximum = minimum.clone();
+    auto stream = c10::cuda::getCurrentCUDAStream(ctx->cuda_device).stream();
+    auto reduce_axis = [&](ncclComm_t communicator, const char* axis) {
+        if (!communicator) return;
+        auto err = ncclAllReduce(
+            minimum.data_ptr<int64_t>(), minimum.data_ptr<int64_t>(),
+            minimum.numel(), ncclInt64, ncclMin, communicator, stream);
+        TORCH_CHECK(err == ncclSuccess, axis,
+            " fixed LoRA registry minimum all-reduce failed: ",
+            ncclGetErrorString(err));
+        err = ncclAllReduce(
+            maximum.data_ptr<int64_t>(), maximum.data_ptr<int64_t>(),
+            maximum.numel(), ncclInt64, ncclMax, communicator, stream);
+        TORCH_CHECK(err == ncclSuccess, axis,
+            " fixed LoRA registry maximum all-reduce failed: ",
+            ncclGetErrorString(err));
+    };
+    reduce_axis(ctx->nccl_comm, "EP");
+    reduce_axis(ctx->dp_comm, "DP");
+    reduce_axis(ctx->tp_comm, "TP");
+
+    const auto minimum_cpu = minimum.to(at::kCPU);
+    const auto maximum_cpu = maximum.to(at::kCPU);
+    const auto* minimum_data = minimum_cpu.data_ptr<int64_t>();
+    const auto* maximum_data = maximum_cpu.data_ptr<int64_t>();
+    for (int64_t index = 0; index < minimum.numel(); ++index) {
+        TORCH_CHECK(minimum_data[index] == maximum_data[index],
+            "fixed LoRA registry mismatch across distributed ranks; all "
+            "ranks must use the same active slots, tensor layouts, and "
+            "optimizer phase/clock");
+    }
+}
+
 static bool adapter_collective_all_succeeded(
     TrainingContext* ctx,
     bool local_success
 ) {
+    if (!ctx || (!ctx->nccl_comm && !ctx->dp_comm && !ctx->tp_comm))
+        return local_success;
     c10::cuda::set_device(ctx->cuda_device);
     cudaSetDevice(ctx->cuda_device);
     auto options = at::TensorOptions().dtype(at::kInt).device(
@@ -2467,6 +2541,73 @@ static bool adapter_collective_all_succeeded(
     reduce_axis(ctx->dp_comm, "DP");
     reduce_axis(ctx->tp_comm, "TP");
     return succeeded.to(at::kCPU).item<int32_t>() != 0;
+}
+
+static bool supported_mask_dtype(const at::Tensor& tensor) {
+    switch (tensor.scalar_type()) {
+        case at::kBool:
+        case at::kByte:
+        case at::kChar:
+        case at::kShort:
+        case at::kInt:
+        case at::kLong:
+        case at::kHalf:
+        case at::kBFloat16:
+        case at::kFloat:
+        case at::kDouble:
+            return true;
+        default:
+            return false;
+    }
+}
+
+static bool replica_input_signatures_match(
+    TrainingContext* ctx,
+    const at::Tensor& input_ids,
+    const at::Tensor& target_mask,
+    const at::Tensor* attention_mask
+) {
+    if (!ctx || (!ctx->tp_comm && !ctx->nccl_comm)) return true;
+    const std::vector<int64_t> signature_values{
+        input_ids.size(0),
+        input_ids.size(1),
+        static_cast<int64_t>(input_ids.scalar_type()),
+        target_mask.size(0),
+        target_mask.size(1),
+        static_cast<int64_t>(target_mask.scalar_type()),
+        attention_mask ? 1 : 0,
+        attention_mask ? attention_mask->size(0) : 0,
+        attention_mask ? attention_mask->size(1) : 0,
+        attention_mask
+            ? static_cast<int64_t>(attention_mask->scalar_type())
+            : 0,
+    };
+    auto options = at::TensorOptions().dtype(at::kLong).device(
+        at::kCUDA, ctx->cuda_device);
+    auto minimum = at::tensor(signature_values, options);
+    auto maximum = minimum.clone();
+    auto stream = c10::cuda::getCurrentCUDAStream(ctx->cuda_device).stream();
+    auto reduce_axis = [&](ncclComm_t communicator, const char* axis) {
+        if (!communicator) return;
+        auto err = ncclAllReduce(
+            minimum.data_ptr<int64_t>(), minimum.data_ptr<int64_t>(),
+            minimum.numel(), ncclInt64, ncclMin, communicator, stream);
+        TORCH_CHECK(err == ncclSuccess, axis,
+            " input signature minimum all-reduce failed: ",
+            ncclGetErrorString(err));
+        err = ncclAllReduce(
+            maximum.data_ptr<int64_t>(), maximum.data_ptr<int64_t>(),
+            maximum.numel(), ncclInt64, ncclMax, communicator, stream);
+        TORCH_CHECK(err == ncclSuccess, axis,
+            " input signature maximum all-reduce failed: ",
+            ncclGetErrorString(err));
+    };
+    reduce_axis(ctx->tp_comm, "TP");
+    const bool sharded_a2a = ctx->expert_parallel && ctx->nccl_comm &&
+        env_enabled("QWEN36_EP_A2A_SHARDED");
+    if (ctx->expert_parallel && !sharded_a2a)
+        reduce_axis(ctx->nccl_comm, "replicated EP");
+    return (minimum == maximum).all().item<bool>();
 }
 
 static bool harvest_leaf_grad(
@@ -3033,7 +3174,36 @@ static void reduce_lora_accumulator_weighted(
 // sums non-expert parameters across source ranks, while expert parameters have
 // already received all source numerators through the inverse A2A and therefore
 // only divide by the global token count.
-static void synchronize_lora_gradients(
+static bool replica_token_weights_match(
+    TrainingContext* ctx, const at::Tensor& weights,
+    ncclComm_t communicator, int32_t world_size, const char* axis
+) {
+    if (!communicator || world_size <= 1) return true;
+    TORCH_CHECK(weights.is_cuda() && weights.scalar_type() == at::kFloat &&
+            weights.is_contiguous(),
+        "LoRA replica token weights must be contiguous CUDA FP32");
+    auto minimum = weights.clone();
+    auto maximum = weights.clone();
+    auto stream = c10::cuda::getCurrentCUDAStream(
+        weights.device().index()).stream();
+    const auto minimum_error = ncclAllReduce(
+        minimum.data_ptr<float>(), minimum.data_ptr<float>(), minimum.numel(),
+        ncclFloat, ncclMin, communicator, stream);
+    TORCH_CHECK(minimum_error == ncclSuccess,
+        "NCCL LoRA ", axis,
+        " token-count minimum validation failed: ",
+        ncclGetErrorString(minimum_error));
+    const auto maximum_error = ncclAllReduce(
+        maximum.data_ptr<float>(), maximum.data_ptr<float>(), maximum.numel(),
+        ncclFloat, ncclMax, communicator, stream);
+    TORCH_CHECK(maximum_error == ncclSuccess,
+        "NCCL LoRA ", axis,
+        " token-count maximum validation failed: ",
+        ncclGetErrorString(maximum_error));
+    return (minimum == maximum).all().item<bool>();
+}
+
+static bool synchronize_lora_gradients(
     TrainingContext* ctx, const at::Tensor& target_mask,
     double accumulated_token_weight = 0.0,
     const at::Tensor* per_adapter_token_counts = nullptr,
@@ -3084,6 +3254,19 @@ static void synchronize_lora_gradients(
                     local_adapter_weights >= 0).all().item<bool>(),
                 "dynamic LoRA token counts must be finite and non-negative");
         }
+        bool replica_weights_match = replica_token_weights_match(
+            ctx, local_adapter_weights, ctx->tp_comm,
+            ctx->tp_world_size, "TP");
+        if (ctx->expert_parallel && !sharded_a2a) {
+            const bool ep_weights_match = replica_token_weights_match(
+                ctx, local_adapter_weights, ctx->nccl_comm,
+                ctx->ep_world_size, "replicated EP");
+            replica_weights_match = replica_weights_match && ep_weights_match;
+        }
+        TORCH_CHECK(adapter_collective_all_succeeded(
+                ctx, replica_weights_match) && replica_weights_match,
+            "dynamic LoRA token counts differ across TP or replicated EP "
+            "ranks; replicas must use identical target masks");
         global_adapter_weights = normalization_allreduce
             ? sum_replica_axes(local_adapter_weights, sharded_a2a)
             : local_adapter_weights;
@@ -3096,29 +3279,27 @@ static void synchronize_lora_gradients(
                 (*adapter_has_global_tokens)[i] = counts[i] > 0.0f ? 1 : 0;
             }
         }
-    } else if (accumulated_token_weight > 0.0) {
-        double global_weight = accumulated_token_weight;
-        if (normalization_allreduce) {
-            auto local = at::full({1}, accumulated_token_weight,
-                at::TensorOptions().dtype(at::kFloat).device(target_mask.device()));
-            auto global = sum_replica_axes(local, sharded_a2a);
-            global_weight = global.item<double>();
-        }
-        scale = 1.0 / std::max(global_weight, 1.0);
     } else {
-        // Dynamic multi-LoRA currently contributes one independently-normalized
-        // row per tenant. Preserve that contract while weighting replicated DP
-        // ranks by the selected batch's token count.
-        if (!dp_allreduce) {
-            if (!ctx->base_tp_attention && !ctx->base_tp_mlp) return;
-        } else {
-            auto shifted_mask = target_mask.narrow(1, 1, target_mask.size(1) - 1)
-                .to(at::kFloat).sum().reshape({1});
-            auto global_mask = sum_replica_axes(shifted_mask, false);
-            const double local_tokens = shifted_mask.item<double>();
-            const double global_tokens = global_mask.item<double>();
-            scale = local_tokens / std::max(global_tokens, 1.0);
+        auto local = at::full({1}, accumulated_token_weight,
+            at::TensorOptions().dtype(at::kFloat).device(target_mask.device()));
+        bool replica_weights_match = replica_token_weights_match(
+            ctx, local, ctx->tp_comm, ctx->tp_world_size, "TP");
+        if (ctx->expert_parallel && !sharded_a2a) {
+            const bool ep_weights_match = replica_token_weights_match(
+                ctx, local, ctx->nccl_comm,
+                ctx->ep_world_size, "replicated EP");
+            replica_weights_match = replica_weights_match && ep_weights_match;
         }
+        TORCH_CHECK(adapter_collective_all_succeeded(
+                ctx, replica_weights_match) && replica_weights_match,
+            "fixed LoRA token weights differ across TP or replicated EP "
+            "ranks; replicas must use identical accumulation windows");
+        auto global = normalization_allreduce
+            ? sum_replica_axes(local, sharded_a2a)
+            : local;
+        const double global_weight = global.item<double>();
+        if (global_weight <= 0.0) return false;
+        scale = 1.0 / global_weight;
     }
     for (size_t adapter_index = 0;
          adapter_index < ctx->adapters.size(); ++adapter_index) {
@@ -3213,7 +3394,12 @@ static void synchronize_lora_gradients(
             }
         }
     }
-    if (per_adapter_weighting) return;
+    if (per_adapter_weighting) {
+        return adapter_has_global_tokens && std::any_of(
+            adapter_has_global_tokens->begin(),
+            adapter_has_global_tokens->end(),
+            [](uint8_t active) { return active != 0; });
+    }
     // The replicated-source A2A path sends an identical token batch from every
     // EP rank. Average only its sharded expert parameter gradients here;
     // scaling the combine backward would also under-scale the activation
@@ -3226,16 +3412,14 @@ static void synchronize_lora_gradients(
             // Routed expert LoRA is local-only for EP, while pure DP owns the
             // complete replicated expert tensor and must all-reduce it.
             if (table.entries[pair].grouped_expert) {
-                if (accumulated_token_weight > 0.0) {
-                    reduce_lora_accumulator(
-                        ctx, ctx->grad_accum_a[offset + pair],
-                        scale * replicated_a2a_expert_scale,
-                        false, dp_allreduce);
-                    reduce_lora_accumulator(
-                        ctx, ctx->grad_accum_b[offset + pair],
-                        scale * replicated_a2a_expert_scale,
-                        false, dp_allreduce);
-                }
+                reduce_lora_accumulator(
+                    ctx, ctx->grad_accum_a[offset + pair],
+                    scale * replicated_a2a_expert_scale,
+                    false, dp_allreduce);
+                reduce_lora_accumulator(
+                    ctx, ctx->grad_accum_b[offset + pair],
+                    scale * replicated_a2a_expert_scale,
+                    false, dp_allreduce);
                 continue;
             }
             reduce_lora_accumulator(
@@ -3257,6 +3441,7 @@ static void synchronize_lora_gradients(
                 ctx, ctx->grad_accum_b[offset + pair], layout, false);
         }
     }
+    return true;
 }
 
 static void elide_trivial_attention_mask(TrainingContext* ctx) {
@@ -5990,19 +6175,72 @@ __attribute__((visibility("default"))) double qwen36_train_micro_step(
         auto* ctx = reinterpret_cast<TrainingContext*>(ctx_ptr);
         TORCH_CHECK(!ctx->topology_invalid,
             "native Qwen context rejected an incompatible TP/DP/EP topology");
-        TORCH_CHECK(ctx->adapters.empty(),
-            "dynamic LoRA adapters require qwen36_train_multi_lora or "
-            "qwen36_train_multi_lora_selected");
         GradientAccumulationFailureGuard accumulation_guard{ctx};
-        TORCH_CHECK(gradient_scale > 0.0 && std::isfinite(gradient_scale),
-            "gradient_scale must be finite and positive");
-        // Set CUDA device for EP
-        if (ctx->nccl_comm || ctx->dp_comm || ctx->tp_comm) {
-            c10::cuda::set_device(ctx->cuda_device);
-            cudaSetDevice(ctx->cuda_device);
+        auto* input_ids_tensor = reinterpret_cast<at::Tensor*>(input_ids_ptr);
+        auto* target_mask_tensor = reinterpret_cast<at::Tensor*>(target_mask_ptr);
+        auto* attention_mask_tensor = attention_mask_ptr
+            ? reinterpret_cast<at::Tensor*>(attention_mask_ptr)
+            : nullptr;
+        bool local_preflight_valid = input_ids_tensor && target_mask_tensor &&
+            input_ids_tensor->is_cuda() && target_mask_tensor->is_cuda() &&
+            input_ids_tensor->device() == target_mask_tensor->device() &&
+            input_ids_tensor->dim() == 2 && target_mask_tensor->dim() == 2 &&
+            input_ids_tensor->size(1) > 1 &&
+            input_ids_tensor->sizes() == target_mask_tensor->sizes() &&
+            input_ids_tensor->scalar_type() == at::kLong &&
+            supported_mask_dtype(*target_mask_tensor) &&
+            ctx->adapters.empty() && gradient_scale > 0.0 &&
+            std::isfinite(gradient_scale) &&
+            (apply_optimizer == 0 || apply_optimizer == 1);
+        if (local_preflight_valid && attention_mask_tensor) {
+            local_preflight_valid = attention_mask_tensor->is_cuda() &&
+                attention_mask_tensor->device() == input_ids_tensor->device() &&
+                attention_mask_tensor->dim() == 2 &&
+                attention_mask_tensor->sizes() == input_ids_tensor->sizes() &&
+                supported_mask_dtype(*attention_mask_tensor);
         }
-        auto& input_ids = *reinterpret_cast<at::Tensor*>(input_ids_ptr);
-        auto& target_mask = *reinterpret_cast<at::Tensor*>(target_mask_ptr);
+        if (local_preflight_valid &&
+            (ctx->nccl_comm || ctx->dp_comm || ctx->tp_comm)) {
+            local_preflight_valid =
+                input_ids_tensor->device().index() == ctx->cuda_device;
+        }
+        TORCH_CHECK(adapter_collective_all_succeeded(
+                ctx, local_preflight_valid) && local_preflight_valid,
+            "native Qwen fixed-LoRA call must use CUDA inputs on the NCCL "
+            "context device, a finite positive gradient scale, and no "
+            "dynamic adapters");
+        auto& input_ids = *input_ids_tensor;
+        const int input_device = input_ids.device().index();
+        if (!ctx->nccl_comm && !ctx->dp_comm && !ctx->tp_comm)
+            ctx->cuda_device = input_device;
+        c10::cuda::set_device(ctx->cuda_device);
+        cudaSetDevice(ctx->cuda_device);
+        const bool replica_inputs_match = replica_input_signatures_match(
+            ctx, input_ids, *target_mask_tensor, attention_mask_tensor);
+        TORCH_CHECK(adapter_collective_all_succeeded(
+                ctx, replica_inputs_match) && replica_inputs_match,
+            "native Qwen fixed-LoRA input shape and dtype differ across TP "
+            "or replicated EP ranks");
+        const double supervised_tokens = target_mask_tensor
+            ->narrow(1, 1, target_mask_tensor->size(1) - 1)
+            .to(at::kFloat).sum().item<double>();
+        const double micro_token_weight =
+            gradient_scale * supervised_tokens;
+        const double next_accumulated_token_weight =
+            ctx->accumulated_token_weight + micro_token_weight;
+        const bool local_token_weight_valid =
+            std::isfinite(supervised_tokens) && supervised_tokens >= 0.0 &&
+            std::isfinite(micro_token_weight) &&
+            std::isfinite(next_accumulated_token_weight);
+        TORCH_CHECK(adapter_collective_all_succeeded(
+                ctx, local_token_weight_valid) && local_token_weight_valid,
+            "native Qwen fixed-LoRA token weights must remain finite and "
+            "non-negative on every distributed rank");
+        // Fail collective-layout or optimizer-clock disagreement before
+        // forward/backward launches any work. The failure guard aborts any
+        // pending accumulation window without leaving queued graph work.
+        validate_fixed_collective_registry(ctx, apply_optimizer);
+        auto& target_mask = *target_mask_tensor;
         if (attention_mask_ptr) {
             ctx->attention_mask = *reinterpret_cast<at::Tensor*>(attention_mask_ptr);
             elide_trivial_attention_mask(ctx);
@@ -6043,11 +6281,6 @@ __attribute__((visibility("default"))) double qwen36_train_micro_step(
             loss_val += mtp_loss.item<double>();
         }
 
-        const double supervised_tokens = target_mask
-            .narrow(1, 1, target_mask.size(1) - 1)
-            .to(at::kFloat).sum().item<double>();
-        const double micro_token_weight =
-            gradient_scale * std::max(supervised_tokens, 1.0);
         // compute_loss returns a local token mean. Convert it to a weighted
         // numerator before backward; the FP32 window is divided by the global
         // accumulated token weight exactly once at the optimizer boundary.
@@ -6064,8 +6297,11 @@ __attribute__((visibility("default"))) double qwen36_train_micro_step(
 
         // Consume every BF16 leaf gradient immediately. Only the FP32 buffers
         // survive the micro-step boundary.
+        const bool accumulation_was_active = ctx->accumulation_active;
         harvest_gradient_accumulators(ctx);
-        ctx->accumulated_token_weight += micro_token_weight;
+        if (micro_token_weight == 0.0)
+            ctx->accumulation_active = accumulation_was_active;
+        ctx->accumulated_token_weight = next_accumulated_token_weight;
 
         if (!apply_optimizer) {
             // The forward graph has been consumed, but parameters remain
@@ -6080,8 +6316,13 @@ __attribute__((visibility("default"))) double qwen36_train_micro_step(
         // Replicated DP gradients are synchronized before the local Adam
         // update. EP keeps replicated gradients local because its forward
         // routed activation already contains the cross-rank sum.
-        synchronize_lora_gradients(
+        const bool has_global_tokens = synchronize_lora_gradients(
             ctx, target_mask, ctx->accumulated_token_weight);
+        if (!has_global_tokens) {
+            clear_gradient_accumulators(ctx);
+            accumulation_guard.disarmed = true;
+            return loss_val;
+        }
 
         // ── Adam optimizer step — CUDA multi-tensor fused kernel ──
         at::AutoGradMode guard(false);
@@ -6364,22 +6605,58 @@ static double qwen36_train_multi_lora_impl(
         if (finalize_only && finalizer_phase) *finalizer_phase = 0;
         TORCH_CHECK(!ctx->topology_invalid,
             "native Qwen context rejected an incompatible TP/DP/EP topology");
-        if (mode == DynamicMultiLoraMode::TrainAndFinalize) {
-            TORCH_CHECK(!ctx->accumulation_active &&
-                    ctx->accumulated_token_weight == 0.0,
-                "cannot start dynamic multi-LoRA while a fixed-LoRA gradient "
-                "accumulation window is pending");
+        auto* input_ids_tensor = reinterpret_cast<at::Tensor*>(input_ids_ptr);
+        auto* target_mask_tensor = reinterpret_cast<at::Tensor*>(target_mask_ptr);
+        auto* attention_mask_tensor = attention_mask_ptr
+            ? reinterpret_cast<at::Tensor*>(attention_mask_ptr)
+            : nullptr;
+        const int64_t total_adapters = (int64_t)ctx->adapters.size();
+        bool local_input_valid = input_ids_tensor && target_mask_tensor &&
+            input_ids_tensor->is_cuda() && target_mask_tensor->is_cuda() &&
+            input_ids_tensor->device() == target_mask_tensor->device() &&
+            input_ids_tensor->dim() == 2 && target_mask_tensor->dim() == 2 &&
+            input_ids_tensor->size(1) > 1 &&
+            input_ids_tensor->scalar_type() == at::kLong &&
+            supported_mask_dtype(*target_mask_tensor) &&
+            target_mask_tensor->sizes() == input_ids_tensor->sizes() &&
+            n_total > 0 &&
+            (input_ids_tensor->size(0) == 1 ||
+                input_ids_tensor->size(0) == n_total) &&
+            (mode != DynamicMultiLoraMode::TrainAndFinalize ||
+                (!ctx->accumulation_active &&
+                    ctx->accumulated_token_weight == 0.0)) &&
+            (!ctx->has_mtp || env_enabled("QWEN36_DISABLE_MTP"));
+        if (local_input_valid && attention_mask_tensor) {
+            local_input_valid = attention_mask_tensor->is_cuda() &&
+                attention_mask_tensor->device() == input_ids_tensor->device() &&
+                attention_mask_tensor->dim() == 2 &&
+                attention_mask_tensor->sizes() == input_ids_tensor->sizes() &&
+                supported_mask_dtype(*attention_mask_tensor);
         }
+        if (local_input_valid &&
+            (ctx->nccl_comm || ctx->dp_comm || ctx->tp_comm)) {
+            local_input_valid =
+                input_ids_tensor->device().index() == ctx->cuda_device;
+        }
+        TORCH_CHECK(adapter_collective_all_succeeded(
+                ctx, local_input_valid) && local_input_valid,
+            "native Qwen multi-LoRA inputs must be CUDA tensors on the "
+            "NCCL context device");
+        auto& input_ids = *input_ids_tensor;
+        auto& target_mask = *target_mask_tensor;
+        const int input_device = input_ids.device().index();
+        if (!ctx->nccl_comm && !ctx->dp_comm && !ctx->tp_comm)
+            ctx->cuda_device = input_device;
+        c10::cuda::set_device(ctx->cuda_device);
+        cudaSetDevice(ctx->cuda_device);
+        const bool replica_inputs_match = replica_input_signatures_match(
+            ctx, input_ids, target_mask, attention_mask_tensor);
+        TORCH_CHECK(adapter_collective_all_succeeded(
+                ctx, replica_inputs_match) && replica_inputs_match,
+            "native Qwen multi-LoRA input shape and dtype differ across TP "
+            "or replicated EP ranks");
         GradientAccumulationFailureGuard accumulation_guard{ctx};
-        if (ctx->nccl_comm || ctx->dp_comm || ctx->tp_comm) {
-            c10::cuda::set_device(ctx->cuda_device);
-            cudaSetDevice(ctx->cuda_device);
-        }
 
-        auto& input_ids = *reinterpret_cast<at::Tensor*>(input_ids_ptr);
-        auto& target_mask = *reinterpret_cast<at::Tensor*>(target_mask_ptr);
-
-        int64_t total_adapters = (int64_t)ctx->adapters.size();
         validate_adapter_collective_registry(
             ctx, nullptr, n_total, finalize_only ? 0 : lora_rank,
             true);
@@ -6401,18 +6678,7 @@ static double qwen36_train_multi_lora_impl(
                     "use the grouped v2 trainer for heterogeneous adapters");
             }
         }
-        TORCH_CHECK(!ctx->has_mtp || env_enabled("QWEN36_DISABLE_MTP"),
-            "dynamic multi-LoRA with MTP is not supported until main and MTP "
-            "objectives have independent global token denominators");
-        TORCH_CHECK(input_ids.dim() == 2 && target_mask.dim() == 2,
-            "multi-LoRA inputs must have shape [batch, seq]");
         const int64_t input_batch = input_ids.size(0);
-        TORCH_CHECK(input_batch == 1 || input_batch == n_total,
-            "multi-LoRA input batch must be 1 or n_total (batch=", input_batch,
-            ", n_total=", n_total, ")");
-        TORCH_CHECK(target_mask.size(0) == input_batch &&
-                    target_mask.size(1) == input_ids.size(1),
-            "target_mask must match input_ids shape");
         auto input_row_token_counts = target_mask
             .narrow(1, 1, target_mask.size(1) - 1)
             .to(at::kFloat).sum(1);
@@ -6424,13 +6690,8 @@ static double qwen36_train_multi_lora_impl(
         // elide_trivial_attention_mask from leaking the last chunk into the
         // next train step.
         at::Tensor provided_attention_mask;
-        if (attention_mask_ptr) {
-            provided_attention_mask = *reinterpret_cast<at::Tensor*>(attention_mask_ptr);
-            TORCH_CHECK(provided_attention_mask.dim() == 2,
-                "multi-LoRA attention_mask must have shape [batch, seq]");
-            TORCH_CHECK(provided_attention_mask.size(0) == input_batch &&
-                        provided_attention_mask.size(1) == input_ids.size(1),
-                "attention_mask must match input_ids shape");
+        if (attention_mask_tensor) {
+            provided_attention_mask = *attention_mask_tensor;
         }
         const at::Tensor saved_attention_mask = ctx->attention_mask;
         const bool saved_use_checkpoint = ctx->use_checkpoint;
@@ -7584,8 +7845,10 @@ static int32_t qwen36_init_parallel_nccl_impl(
             lc.nccl_comm = layer_comm;
             lc.nccl_stream = layer_stream;
         }
-        if (synchronize_parameters)
+        if (synchronize_parameters) {
+            validate_fixed_collective_registry(ctx);
             synchronize_fixed_replicated_lora_parameters(ctx);
+        }
         return 0;
     }
     if (world_size <= 1) return 0;  // no EP needed
@@ -7777,8 +8040,10 @@ static int32_t qwen36_init_parallel_nccl_impl(
         lc.nccl_stream = layer_stream;
     }
 
-    if (synchronize_parameters)
+    if (synchronize_parameters) {
+        validate_fixed_collective_registry(ctx);
         synchronize_fixed_replicated_lora_parameters(ctx);
+    }
     return 0;
 }
 
