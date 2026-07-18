@@ -46,6 +46,8 @@ optimizer step.
   the C++ linear path instead of failing while expanding the full shard to BF16.
 - FP8 block scales are applied exactly once. LoRA fusion must preserve the
   base-weight scale semantics or explicitly dequantize through the safe path.
+  Dense, shared, and routed expert weight selection always loads the matching
+  `weight_scale_inv`; an FP8 matrix without its scale is a hard error.
 - TP applies LoRA to sharded attention weights. CP computes global top-k and
   aligns cross-rank shifted targets/loss for the non-MTP path; MTP with CP>1 is
   rejected until its autograd ring is proven.

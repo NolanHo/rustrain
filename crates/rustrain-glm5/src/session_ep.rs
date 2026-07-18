@@ -535,9 +535,10 @@ pub fn train_glm5_lora_sft_ep(
         }
         // Dense layers: gate_proj, up_proj, down_proj (not under shared_experts)
         if !runtime_config.is_moe_layer(layer) {
-            needed.insert(format!("{p}.mlp.gate_proj.weight"));
-            needed.insert(format!("{p}.mlp.up_proj.weight"));
-            needed.insert(format!("{p}.mlp.down_proj.weight"));
+            for suffix in &["gate_proj.weight", "up_proj.weight", "down_proj.weight"] {
+                needed.insert(format!("{p}.mlp.{suffix}"));
+                needed.insert(format!("{p}.mlp.{suffix}_scale_inv"));
+            }
         }
     }
     for mtp_idx in 0..runtime_config.num_nextn_predict_layers {
