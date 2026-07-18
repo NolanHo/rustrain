@@ -31,6 +31,22 @@ fn parse_env_usize(name: &str) -> Result<usize> {
         .with_context(|| format!("{name} must be a usize"))
 }
 
+/// The current frozen trunk only has Megatron owner dispatch/return for the
+/// EP-only path. Combining attention TP with EP would require sequence-
+/// parallel token ownership plus the independent expert groups built below.
+/// Reject it before loading checkpoint tensors or initializing NCCL.
+pub fn validate_glm5_tp_ep_session_topology(tp_size: usize, ep_size: usize) -> Result<()> {
+    if tp_size == 0 || ep_size == 0 {
+        bail!("GLM-5 TP and EP sizes must be positive");
+    }
+    if tp_size > 1 && ep_size > 1 {
+        bail!(
+            "GLM-5 combined TP+EP is unsupported until the frozen trunk uses Megatron sequence-parallel owner dispatch/return with independent expert-EP and expert-DP groups (tp_size={tp_size}, ep_size={ep_size})"
+        );
+    }
+    Ok(())
+}
+
 fn keep_fp8(t: &Tensor, kind: Kind) -> Tensor {
     if t.kind() == Kind::Float8e4m3fn {
         t.shallow_clone()
@@ -475,33 +491,13 @@ pub fn train_glm5_lora_sft_tp_cp_ep(
     if world_size == 0 {
         bail!("GLM-5 TP+CP+EP: WORLD_SIZE must be positive");
     }
+    if rank >= world_size {
+        bail!("GLM-5 rank {rank} must be smaller than WORLD_SIZE {world_size}");
+    }
     let tp_size = config.parallel.tensor_model_parallel_size.max(1);
     let cp_size = config.parallel.context_parallel_size.max(1);
-    let product = tp_size
-        .checked_mul(cp_size)
-        .context("GLM-5 TP+CP+EP: TP×CP overflows usize")?;
-    if world_size < product || world_size % product != 0 {
-        bail!(
-            "world_size {world_size} must be a positive multiple of tp_size {tp_size} × cp_size {cp_size}"
-        );
-    }
-    let ep_size = world_size / product;
-    let declared_ep_size = config.parallel.expert_model_parallel_size.max(1);
-    if ep_size != declared_ep_size {
-        bail!(
-            "GLM-5 derived ep_size {ep_size} does not match configured expert_model_parallel_size {declared_ep_size}"
-        );
-    }
-
-    if world_size != tp_size * cp_size * ep_size {
-        bail!(
-            "world_size {world_size} must equal tp_size {tp_size} × cp_size {cp_size} × ep_size {ep_size}"
-        );
-    }
-
-    let tp_rank = rank % tp_size;
-    let cp_rank = (rank / tp_size) % cp_size;
-    let ep_rank = rank / (tp_size * cp_size);
+    let ep_size = config.parallel.expert_model_parallel_size.max(1);
+    validate_glm5_tp_ep_session_topology(tp_size, ep_size)?;
 
     // ── Model config ──
     let model_path = config
@@ -518,6 +514,48 @@ pub fn train_glm5_lora_sft_tp_cp_ep(
         cp_size,
         ep_size,
     )?;
+
+    // With CP=1, Megatron overlays two rank generators on the same ranks:
+    // dense coordinates are TP x dense-DP while expert coordinates are
+    // ETP(=1) x EP x expert-DP. EP is therefore not rank/(TP*CP).
+    let megatron_coords = if cp_size == 1 {
+        Some(glm5_megatron_rank_coordinates(
+            rank, world_size, tp_size, ep_size,
+        )?)
+    } else {
+        let product = tp_size
+            .checked_mul(cp_size)
+            .and_then(|value| value.checked_mul(ep_size))
+            .context("GLM-5 legacy TP×CP×EP topology overflows usize")?;
+        if world_size != product {
+            bail!(
+                "GLM-5 CP topology has no data-parallel rank generator: WORLD_SIZE {world_size} must equal TP {tp_size} × CP {cp_size} × EP {ep_size} = {product}"
+            );
+        }
+        None
+    };
+    let (tp_rank, cp_rank, ep_rank, dense_dp_rank, dense_dp_size, expert_dp_rank, expert_dp_size) =
+        if let Some(coords) = megatron_coords {
+            (
+                coords.tp_rank,
+                0,
+                coords.ep_rank,
+                coords.dense_dp_rank,
+                coords.dense_dp_size,
+                coords.expert_dp_rank,
+                coords.expert_dp_size,
+            )
+        } else {
+            (
+                rank % tp_size,
+                (rank / tp_size) % cp_size,
+                rank / (tp_size * cp_size),
+                0,
+                1,
+                0,
+                1,
+            )
+        };
     if runtime_config.num_nextn_predict_layers > 0 {
         let required_seq_len = runtime_config
             .num_nextn_predict_layers
@@ -614,6 +652,10 @@ pub fn train_glm5_lora_sft_tp_cp_ep(
         tp_rank,
         cp_rank,
         ep_rank,
+        dense_dp_rank,
+        dense_dp_size,
+        expert_dp_rank,
+        expert_dp_size,
         tp_size,
         cp_size,
         ep_size,
@@ -830,8 +872,9 @@ pub fn train_glm5_lora_sft_tp_cp_ep(
     info!(rank, "all ranks ready");
 
     // ── NCCL communication domains ──
-    // Each parallel axis must use its own communicator. A world communicator
-    // cannot stand in for TP/CP/EP because it mixes unrelated shards.
+    // Each parallel axis must use its own communicator. For CP=1 these are
+    // Megatron's independent dense and expert rank generators, not Cartesian
+    // TP x EP subgroups.
     let comm_root = config.run.base_dir.join(&config.run.name).join("nccl-comm");
     let world_comm = if world_size > 1 {
         Some(NcclPersistentComm::new_group(
@@ -844,9 +887,14 @@ pub fn train_glm5_lora_sft_tp_cp_ep(
         None
     };
     let tp_comm = if tp_size > 1 {
+        let (group_name, group_rank) = if megatron_coords.is_some() {
+            (format!("tp-dense-dp{dense_dp_rank}"), tp_rank)
+        } else {
+            (format!("tp-ep{ep_rank}-cp{cp_rank}"), tp_rank)
+        };
         Some(NcclPersistentComm::new_group(
-            &comm_root.join(format!("tp-ep{ep_rank}-cp{cp_rank}")),
-            tp_rank,
+            &comm_root.join(group_name),
+            group_rank,
             tp_size,
             local_rank,
         )?)
@@ -864,10 +912,38 @@ pub fn train_glm5_lora_sft_tp_cp_ep(
         None
     };
     let ep_comm = if ep_size > 1 {
+        let (group_name, group_rank) = if megatron_coords.is_some() {
+            (format!("expert-ep-edp{expert_dp_rank}"), ep_rank)
+        } else {
+            (format!("ep-cp{cp_rank}-tp{tp_rank}"), ep_rank)
+        };
         Some(NcclPersistentComm::new_group(
-            &comm_root.join(format!("ep-cp{cp_rank}-tp{tp_rank}")),
-            ep_rank,
+            &comm_root.join(group_name),
+            group_rank,
             ep_size,
+            local_rank,
+        )?)
+    } else {
+        None
+    };
+    let dense_dp_comm = if dense_dp_size > 1 {
+        Some(NcclPersistentComm::new_group(
+            &comm_root.join(format!("dense-dp-tp{tp_rank}")),
+            dense_dp_rank,
+            dense_dp_size,
+            local_rank,
+        )?)
+    } else {
+        None
+    };
+    // Routed experts are frozen in this LoRA session. Still create their
+    // parameter-replica group so a future trainable-expert path cannot reuse
+    // dense DP or EP by accident.
+    let _expert_dp_comm = if expert_dp_size > 1 {
+        Some(NcclPersistentComm::new_group(
+            &comm_root.join(format!("expert-dp-ep{ep_rank}")),
+            expert_dp_rank,
+            expert_dp_size,
             local_rank,
         )?)
     } else {
@@ -875,7 +951,12 @@ pub fn train_glm5_lora_sft_tp_cp_ep(
     };
     info!(
         rank,
-        tp_size, cp_size, ep_size, "NCCL communication domains created"
+        tp_size,
+        cp_size,
+        ep_size,
+        dense_dp_size,
+        expert_dp_size,
+        "NCCL communication domains created"
     );
 
     // ── SFT data ──
@@ -908,15 +989,23 @@ pub fn train_glm5_lora_sft_tp_cp_ep(
     let accumulation_batch_size = micro_batch_size
         .checked_mul(accumulation_steps)
         .context("GLM-5 MTP accumulation batch size overflows usize")?;
+    let distributed_batch_size = accumulation_batch_size
+        .checked_mul(dense_dp_size)
+        .context("GLM-5 dense-DP accumulation batch size overflows usize")?;
     let accumulation_dataset = Glm5SftDataset {
-        samples: (0..accumulation_batch_size)
+        samples: (0..distributed_batch_size)
             .map(|index| train_dataset.samples[index % train_dataset.samples.len()].clone())
             .collect(),
         pad_token_id: train_dataset.pad_token_id,
     };
-    // Every TP rank uses identical microbatch order. Tiny fixtures repeat data,
-    // but each accumulation slot still owns a separate autograd graph.
-    let raw_batch = accumulation_dataset.padded_batch(0, accumulation_batch_size, device);
+    // Ranks in one dense TP group share a sample; different dense-DP ranks own
+    // disjoint sample slots. Tiny fixtures may repeat content, but ownership
+    // and loss/gradient collectives still follow the Megatron contract.
+    let dense_batch_start = dense_dp_rank
+        .checked_mul(accumulation_batch_size)
+        .context("GLM-5 dense-DP batch offset overflows usize")?;
+    let raw_batch =
+        accumulation_dataset.padded_batch(dense_batch_start, accumulation_batch_size, device);
 
     let target_seq = if mtp_enabled {
         glm5_megatron_raw_seq_len(config.model.seq_len as i64)?
@@ -1064,12 +1153,21 @@ pub fn train_glm5_lora_sft_tp_cp_ep(
 
     // ── Training loop ──
     for step in 0..config.train.max_steps {
-        let aggregate_base_token_count = full_batch
+        let local_aggregate_base_token_count = full_batch
             .target_mask
             .narrow(1, 1, full_batch.target_mask.size()[1] - 1)
             .to_kind(Kind::Float)
             .sum(Kind::Float)
             .clamp_min(1.0);
+        let aggregate_base_token_count = if dense_dp_size > 1 {
+            dense_dp_comm
+                .as_ref()
+                .unwrap()
+                .all_reduce(&local_aggregate_base_token_count)?
+                .clamp_min(1.0)
+        } else {
+            local_aggregate_base_token_count
+        };
         let mut accumulated_loss_val = 0.0_f64;
         let mut accumulated_mtp_loss_val = 0.0_f64;
 
@@ -1094,7 +1192,15 @@ pub fn train_glm5_lora_sft_tp_cp_ep(
                 .narrow(1, 1, full_batch.target_mask.size()[1] - 1)
                 .to_kind(Kind::Float)
                 .sum(Kind::Float);
-            let microbatch_weight = &base_token_count / &aggregate_base_token_count;
+            let global_base_token_count = if dense_dp_size > 1 {
+                dense_dp_comm
+                    .as_ref()
+                    .unwrap()
+                    .all_reduce(&base_token_count)?
+            } else {
+                base_token_count.shallow_clone()
+            };
+            let microbatch_weight = &global_base_token_count / &aggregate_base_token_count;
 
             let embed = tensor(&weights_gpu, "model.embed_tokens.weight")?.to_kind(compute_kind);
             let mut hidden = Tensor::embedding(&embed, &cp_batch.input_ids, -1, false, false);
@@ -1527,9 +1633,13 @@ pub fn train_glm5_lora_sft_tp_cp_ep(
                         // local autograd edge by cp_size. The final gradient sync
                         // divides by cp_size once for both LM and MTP.
                         reattach_cp_token_mean(&local_sum, &reduced_sum, &reduced_count, cp_size)
-                    } else if ep_size > 1 {
-                        let reduced_sum = ep_comm.as_ref().unwrap().all_reduce(&local_sum)?;
-                        let reduced_count = ep_comm.as_ref().unwrap().all_reduce(&local_count)?;
+                    } else if dense_dp_size > 1 {
+                        // EP owns expert routing, not data-parallel loss
+                        // normalization. Only ranks with the same TP shard
+                        // participate in this dense-DP reduction.
+                        let reduced_sum = dense_dp_comm.as_ref().unwrap().all_reduce(&local_sum)?;
+                        let reduced_count =
+                            dense_dp_comm.as_ref().unwrap().all_reduce(&local_count)?;
                         reattach_global_token_mean(&local_sum, &reduced_sum, &reduced_count)
                     } else {
                         local_loss
@@ -1623,9 +1733,9 @@ pub fn train_glm5_lora_sft_tp_cp_ep(
                 let reduced = cp_comm.as_ref().unwrap().all_reduce(&loss_acc)?;
                 let reduced_mask = cp_comm.as_ref().unwrap().all_reduce(&total_mask)?;
                 reattach_cp_token_mean(&loss_acc, &reduced, &reduced_mask, cp_size)
-            } else if ep_size > 1 {
-                let reduced = ep_comm.as_ref().unwrap().all_reduce(&loss_acc)?;
-                let reduced_mask = ep_comm.as_ref().unwrap().all_reduce(&total_mask)?;
+            } else if dense_dp_size > 1 {
+                let reduced = dense_dp_comm.as_ref().unwrap().all_reduce(&loss_acc)?;
+                let reduced_mask = dense_dp_comm.as_ref().unwrap().all_reduce(&total_mask)?;
                 reattach_global_token_mean(&loss_acc, &reduced, &reduced_mask)
             } else {
                 loss_acc / total_mask.clamp_min(1.0)
@@ -1662,18 +1772,36 @@ pub fn train_glm5_lora_sft_tp_cp_ep(
             rustrain_deepseek_v4::fp8_kernel::empty_cache();
         }
 
-        // LoRA gradients are additive across TP head shards and EP expert
-        // branches. CP ranks each differentiate a token shard, whose identity
-        // loss construction contributes an extra cp_size factor; divide only
-        // by CP after the world sum.
+        // These adapters target dense attention weights only. Their full-sized
+        // A/B tensors are locally sliced by TP, so first reconstruct the full
+        // adapter gradient over normal TP, then accumulate samples over dense
+        // DP. Routed experts are frozen; trainable expert adapters would need
+        // the independent expert-DP communicator created above.
         let synced_grads: Vec<Tensor> = if world_size > 1 {
             let vars = registry.var_store.trainable_variables();
             let mut synced = Vec::with_capacity(vars.len());
             for var in &vars {
                 let g = var.grad();
                 if g.defined() && g.numel() > 0 {
-                    let reduced = world_comm.as_ref().unwrap().all_reduce(&g)?;
-                    synced.push(no_grad(|| (&reduced / (cp_size as f64)).to_kind(g.kind())));
+                    let reduced = if megatron_coords.is_some() {
+                        let tp_reduced = if tp_size > 1 {
+                            tp_comm.as_ref().unwrap().all_reduce(&g)?
+                        } else {
+                            g.shallow_clone()
+                        };
+                        if dense_dp_size > 1 {
+                            dense_dp_comm.as_ref().unwrap().all_reduce(&tp_reduced)?
+                        } else {
+                            tp_reduced
+                        }
+                    } else {
+                        // Legacy CP ranks differentiate disjoint token chunks.
+                        // Its identity reattachment contributes cp_size, so the
+                        // world sum is divided by CP exactly once.
+                        let reduced = world_comm.as_ref().unwrap().all_reduce(&g)?;
+                        &reduced / (cp_size as f64)
+                    };
+                    synced.push(no_grad(|| reduced.to_kind(g.kind())));
                 } else {
                     synced.push(g.shallow_clone());
                 }

@@ -32,6 +32,137 @@ fn megatron_tp_ep_rank_groups_are_not_cartesian_tp_times_ep() {
     assert!(glm5_megatron_rank_coordinates(0, 31, 4, 8).is_err());
 }
 
+#[test]
+fn megatron_tp4_ep8_groups_cover_each_rank_in_the_correct_domain() {
+    use rustrain_glm5::tp_cp::{
+        glm5_megatron_dense_dp_group, glm5_megatron_expert_dp_group, glm5_megatron_expert_ep_group,
+        glm5_megatron_rank_coordinates,
+    };
+
+    for rank in 0..32 {
+        let coords = glm5_megatron_rank_coordinates(rank, 32, 4, 8).unwrap();
+        let tp_start = coords.dense_dp_rank * coords.tp_size;
+        let tp_group = (tp_start..tp_start + coords.tp_size).collect::<Vec<_>>();
+        assert_eq!(
+            tp_group,
+            (rank / 4 * 4..rank / 4 * 4 + 4).collect::<Vec<_>>()
+        );
+        assert!(tp_group.contains(&rank));
+
+        let dense_dp = glm5_megatron_dense_dp_group(coords);
+        assert_eq!(dense_dp.len(), 8);
+        assert!(dense_dp.contains(&rank));
+        assert!(dense_dp.iter().all(|member| member % 4 == rank % 4));
+
+        let expert_ep = glm5_megatron_expert_ep_group(coords);
+        assert_eq!(expert_ep.len(), 8);
+        assert!(expert_ep.contains(&rank));
+        assert!(expert_ep.iter().all(|member| member / 8 == rank / 8));
+
+        let expert_dp = glm5_megatron_expert_dp_group(coords);
+        assert_eq!(expert_dp.len(), 4);
+        assert!(expert_dp.contains(&rank));
+        assert!(expert_dp.iter().all(|member| member % 8 == rank % 8));
+    }
+}
+
+#[test]
+fn loss_numerator_and_count_reduce_over_dense_dp_not_expert_ep() {
+    use rustrain_glm5::tp_cp::{
+        glm5_megatron_dense_dp_group, glm5_megatron_expert_ep_group, glm5_megatron_rank_coordinates,
+    };
+
+    // Each normal TP group sees one dense-DP sample, so ranks 4*d..4*d+3
+    // carry the same numerator/count. Counts intentionally differ by sample.
+    let numerators = [1.0_f64, 9.0, 4.0, 20.0, 7.0, 18.0, 11.0, 32.0];
+    let counts = [2.0_f64, 3.0, 5.0, 4.0, 7.0, 6.0, 8.0, 5.0];
+    let expected = numerators.iter().sum::<f64>() / counts.iter().sum::<f64>();
+
+    let coords = glm5_megatron_rank_coordinates(0, 32, 4, 8).unwrap();
+    let dense_dp = glm5_megatron_dense_dp_group(coords);
+    let dense_sum = dense_dp
+        .iter()
+        .map(|rank| numerators[rank / 4])
+        .sum::<f64>();
+    let dense_count = dense_dp.iter().map(|rank| counts[rank / 4]).sum::<f64>();
+    assert!((dense_sum / dense_count - expected).abs() < EPS);
+
+    // An expert-EP group contains four SP/TP ranks for each of two samples.
+    // Using it for loss normalization only sees that pair and is not global DP.
+    let expert_ep = glm5_megatron_expert_ep_group(coords);
+    let ep_sum = expert_ep
+        .iter()
+        .map(|rank| numerators[rank / 4])
+        .sum::<f64>();
+    let ep_count = expert_ep.iter().map(|rank| counts[rank / 4]).sum::<f64>();
+    assert!((ep_sum / ep_count - expected).abs() > 0.25);
+}
+
+#[test]
+fn dense_adapter_gradients_reduce_over_tp_then_dense_dp() {
+    use rustrain_glm5::tp_cp::{glm5_megatron_dense_dp_group, glm5_megatron_rank_coordinates};
+
+    // One full-sized dense adapter is sliced by normal TP in the forward.
+    // Its gradient must first sum the four shard contributions for one sample,
+    // then sum the eight samples through the matching dense-DP group.
+    let local_gradient = (0..32)
+        .map(|rank| (rank / 4 + 1) as f64 * (rank % 4 + 1) as f64)
+        .collect::<Vec<_>>();
+    let expected = local_gradient.iter().sum::<f64>();
+
+    let mut tp_reduced = [0.0_f64; 8];
+    for dense_dp_rank in 0..8 {
+        tp_reduced[dense_dp_rank] = (0..4)
+            .map(|tp_rank| local_gradient[dense_dp_rank * 4 + tp_rank])
+            .sum();
+    }
+
+    let coords = glm5_megatron_rank_coordinates(0, 32, 4, 8).unwrap();
+    let dense_dp = glm5_megatron_dense_dp_group(coords);
+    let reduced = dense_dp
+        .iter()
+        .map(|rank| tp_reduced[rank / 4])
+        .sum::<f64>();
+    assert!((reduced - expected).abs() < EPS);
+}
+
+#[test]
+fn expert_gradients_reduce_over_expert_dp_replicas() {
+    use rustrain_glm5::tp_cp::{glm5_megatron_expert_dp_group, glm5_megatron_rank_coordinates};
+
+    // EP group k dispatches two dense-DP samples (2k and 2k+1) to each
+    // expert owner. The same expert's replicas are e + 8*k.
+    let per_sample_gradient = [0.5_f64, -0.2, 1.1, 0.7, -0.4, 0.9, 1.6, -0.3];
+    let expert = 5;
+    let coords = glm5_megatron_rank_coordinates(expert, 32, 4, 8).unwrap();
+    let expert_dp = glm5_megatron_expert_dp_group(coords);
+    assert_eq!(expert_dp, vec![5, 13, 21, 29]);
+
+    let reduced = expert_dp
+        .iter()
+        .map(|rank| {
+            let replica = rank / 8;
+            per_sample_gradient[2 * replica] + per_sample_gradient[2 * replica + 1]
+        })
+        .sum::<f64>();
+    assert!((reduced - per_sample_gradient.iter().sum::<f64>()).abs() < EPS);
+}
+
+#[test]
+fn session_rejects_combined_tp_ep_before_runtime_collectives() {
+    use rustrain_glm5::session_tp_cp::validate_glm5_tp_ep_session_topology;
+
+    assert!(validate_glm5_tp_ep_session_topology(4, 1).is_ok());
+    assert!(validate_glm5_tp_ep_session_topology(1, 8).is_ok());
+    let error = validate_glm5_tp_ep_session_topology(4, 8).unwrap_err();
+    let message = error.to_string();
+    assert!(message.contains("sequence-parallel"));
+    assert!(message.contains("expert-EP"));
+    assert!(message.contains("expert-DP"));
+    assert!(validate_glm5_tp_ep_session_topology(0, 1).is_err());
+    assert!(validate_glm5_tp_ep_session_topology(1, 0).is_err());
+}
+
 fn assert_close(actual: &[f64], expected: &[f64]) {
     assert_eq!(actual.len(), expected.len());
     for (index, (&actual, &expected)) in actual.iter().zip(expected).enumerate() {
@@ -519,12 +650,10 @@ fn ep_owner_permutation_and_inverse_preserve_router_weights_and_add_shared_once(
                 (topk - 1) as f64 * shared[hidden];
         }
     }
-    assert!(
-        incorrectly_repeated_shared
-            .iter()
-            .zip(&reference)
-            .any(|(actual, expected)| (actual - expected).abs() > 1.0e-6)
-    );
+    assert!(incorrectly_repeated_shared
+        .iter()
+        .zip(&reference)
+        .any(|(actual, expected)| (actual - expected).abs() > 1.0e-6));
 }
 
 #[test]
