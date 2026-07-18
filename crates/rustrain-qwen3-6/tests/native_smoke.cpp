@@ -69,6 +69,8 @@ extern "C" int64_t qwen36_add_lora(
     void*, int64_t, double, const int64_t*, int64_t, const char*);
 extern "C" int64_t qwen36_add_lora_v2(
     void*, int64_t, double, const int64_t*, int64_t, const char*);
+extern "C" int64_t qwen36_add_lora_with_optimizer(
+    void*, int64_t, double, const int64_t*, int64_t, const char*, double);
 extern "C" int64_t qwen36_add_lora_for_restore(
     void*, int64_t, double, const int64_t*, int64_t, const char*);
 extern "C" int32_t qwen36_set_adapter_id(void*, int64_t, int64_t);
@@ -878,32 +880,70 @@ int main() {
     assert(ctx);
     if (world > 1) assert(qwen36_init_nccl(ctx) == 0);
     const char* dense_targets = "gate_proj,up_proj,down_proj";
-    const int64_t dense_one = qwen36_add_lora(
+    constexpr double fast_tenant_lr = 1e-2;
+    constexpr double default_tenant_lr = 1e-3;
+    constexpr double slow_tenant_lr = 1e-4;
+    const int64_t dense_fast = qwen36_add_lora_with_optimizer(
+        ctx, rank, 1.0, &target_layer, 1, dense_targets, fast_tenant_lr);
+    const int64_t dense_default = qwen36_add_lora(
         ctx, rank, 1.0, &target_layer, 1, dense_targets);
-    const int64_t dense_two = qwen36_add_lora(
-        ctx, rank, 1.0, &target_layer, 1, dense_targets);
-    assert(dense_one > 0 && dense_two > dense_one);
-    auto* dense_b = reinterpret_cast<at::Tensor*>(
-        qwen36_get_adapter_lora_tensor(ctx, dense_one, 0, "gate_proj", 1));
-    assert(dense_b && dense_b->sizes() == at::IntArrayRef({intermediate, local_lora_rank}));
+    const int64_t dense_slow = qwen36_add_lora_with_optimizer(
+        ctx, rank, 1.0, &target_layer, 1, dense_targets, slow_tenant_lr);
+    assert(dense_fast > 0 && dense_default > dense_fast && dense_slow > dense_default);
+    assert(qwen36_add_lora_with_optimizer(
+        ctx, rank, 1.0, &target_layer, 1, dense_targets, NAN) < 0);
+
+    auto* dense_fast_a = reinterpret_cast<at::Tensor*>(
+        qwen36_get_adapter_lora_tensor(ctx, dense_fast, 0, "gate_proj", 0));
+    auto* dense_fast_b = reinterpret_cast<at::Tensor*>(
+        qwen36_get_adapter_lora_tensor(ctx, dense_fast, 0, "gate_proj", 1));
+    assert(dense_fast_a && dense_fast_b && dense_fast_b->sizes() ==
+        at::IntArrayRef({intermediate, local_lora_rank}));
+    auto dense_a_value = dense_fast_a->clone();
     auto dense_b_value = at::full(
-        dense_b->sizes(), 0.01, dense_b->options());
-    assert(qwen36_set_adapter_lora_tensor(
-        ctx, dense_one, 0, "gate_proj", 1, &dense_b_value) == 0);
-    auto dense_b_before = dense_b->clone();
-    const double dense_loss = qwen36_train_multi_lora(
-        ctx, &multi_input_ids, &multi_target_mask, &multi_attention_mask, 2, rank);
+        dense_fast_b->sizes(), 0.01, dense_fast_b->options());
+    for (const int64_t adapter_id : {dense_fast, dense_default, dense_slow}) {
+        assert(qwen36_set_adapter_lora_tensor(
+            ctx, adapter_id, 0, "gate_proj", 0, &dense_a_value) == 0);
+        assert(qwen36_set_adapter_lora_tensor(
+            ctx, adapter_id, 0, "gate_proj", 1, &dense_b_value) == 0);
+    }
+    const auto dense_b_before = dense_b_value.clone();
+    const int64_t dense_ids[] = {dense_fast, dense_default, dense_slow};
+    const double dense_loss = qwen36_train_multi_lora_selected_v2(
+        ctx, &shared_input, &shared_target_row, &shared_attention,
+        dense_ids, 3);
     c10::cuda::device_synchronize();
-    dense_b = reinterpret_cast<at::Tensor*>(
-        qwen36_get_adapter_lora_tensor(ctx, dense_one, 0, "gate_proj", 1));
-    assert(dense_b);
-    const double dense_update =
-        (*dense_b - dense_b_before).abs().sum().item<double>();
+
+    auto validate_tenant_adam = [&](int64_t adapter_id, double learning_rate) {
+        auto* parameter = reinterpret_cast<at::Tensor*>(
+            qwen36_get_adapter_lora_tensor(
+                ctx, adapter_id, 0, "gate_proj", 1));
+        auto* moment = reinterpret_cast<at::Tensor*>(
+            qwen36_get_adapter_optimizer_tensor(
+                ctx, adapter_id, 0, "gate_proj", 1, 0));
+        auto* variance = reinterpret_cast<at::Tensor*>(
+            qwen36_get_adapter_optimizer_tensor(
+                ctx, adapter_id, 0, "gate_proj", 1, 1));
+        assert(parameter && moment && variance);
+        auto expected = (
+            dense_b_before.to(at::kFloat) - learning_rate *
+                (moment->to(at::kFloat) / (1.0 - 0.9)) /
+                ((variance->to(at::kFloat) / (1.0 - 0.999)).sqrt() + 1e-8))
+            .to(at::kBFloat16);
+        assert((*parameter - expected).abs().max().item<double>() == 0.0);
+        return (*parameter - dense_b_before).abs().sum().item<double>();
+    };
+    const double fast_update = validate_tenant_adam(dense_fast, fast_tenant_lr);
+    const double default_update =
+        validate_tenant_adam(dense_default, default_tenant_lr);
+    const double slow_update = validate_tenant_adam(dense_slow, slow_tenant_lr);
     std::printf(
-        "native_qwen35_dense_multi_lora_smoke loss=%0.8f gate_b_update=%0.8e\n",
-        dense_loss, dense_update);
+        "native_qwen35_tenant_optimizer_smoke loss=%0.8f "
+        "fast=%0.8e default=%0.8e slow=%0.8e\n",
+        dense_loss, fast_update, default_update, slow_update);
     assert(dense_loss == dense_loss && dense_loss > 0.0);
-    assert(dense_update > 0.0);
+    assert(fast_update > default_update && default_update > slow_update);
     qwen36_free_training_context(ctx);
 
     // Qwen3.5/3.6 linear-attention layers use the model's actual 128-wide

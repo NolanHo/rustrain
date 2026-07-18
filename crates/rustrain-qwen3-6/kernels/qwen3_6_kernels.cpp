@@ -2410,6 +2410,10 @@ struct TrainingContext {
         int64_t rank;
         // Each tenant owns an independent Adam bias-correction clock.
         int64_t optimizer_step = 0;
+        // Dynamic tenants may override the context learning rate while sharing
+        // one fused Adam launch. Beta/epsilon remain context-wide because the
+        // current fused kernel accepts one beta pair per launch.
+        double optimizer_lr = 0.0;
         double alpha;
         bool all_target_layers = true;
         // External identity remains global across pipeline stages. The local
@@ -2609,6 +2613,12 @@ static void hash_adapter_layout(
     hash.add_u64(adapter.id);
     hash.add_u64(adapter.rank);
     hash.add_u64(adapter.optimizer_step);
+    uint64_t optimizer_lr_bits = 0;
+    static_assert(sizeof(optimizer_lr_bits) == sizeof(adapter.optimizer_lr));
+    std::memcpy(
+        &optimizer_lr_bits, &adapter.optimizer_lr,
+        sizeof(optimizer_lr_bits));
+    hash.add_u64(optimizer_lr_bits);
     uint64_t alpha_bits = 0;
     static_assert(sizeof(alpha_bits) == sizeof(adapter.alpha));
     std::memcpy(&alpha_bits, &adapter.alpha, sizeof(alpha_bits));
@@ -2646,6 +2656,11 @@ static void hash_adapter_request_identity(
     hash.add_u64(adapter.id);
     hash.add_u64(adapter.rank);
     hash.add_u64(adapter.optimizer_step);
+    uint64_t optimizer_lr_bits = 0;
+    std::memcpy(
+        &optimizer_lr_bits, &adapter.optimizer_lr,
+        sizeof(optimizer_lr_bits));
+    hash.add_u64(optimizer_lr_bits);
     uint64_t alpha_bits = 0;
     std::memcpy(&alpha_bits, &adapter.alpha, sizeof(alpha_bits));
     hash.add_u64(alpha_bits);
@@ -8693,7 +8708,8 @@ static double qwen36_train_multi_lora_impl(
                     const double sqrt_bias_correction2 =
                         std::sqrt(bias_correction2);
                     const float lr_scaled = (float)(
-                        ctx->lr * sqrt_bias_correction2 / bias_correction1);
+                        adapter.optimizer_lr * sqrt_bias_correction2 /
+                        bias_correction1);
                     const float eps_scaled = (float)(
                         ctx->eps * sqrt_bias_correction2);
                     TORCH_CHECK(std::isfinite(lr_scaled) &&
@@ -10296,12 +10312,12 @@ __attribute__((visibility("default"))) void qwen36_free_tensor(void* tensor_ptr)
 
 // ── Multi-LoRA adapter management ──
 
-__attribute__((visibility("default")))
-int64_t qwen36_add_lora(
+static int64_t qwen36_add_lora_impl(
     void* ctx_ptr,
     int64_t rank, double alpha,
     const int64_t* target_layers, int64_t num_target_layers,
-    const char* target_modules_str
+    const char* target_modules_str,
+    double optimizer_lr
 ) {
     try {
         auto* ctx = reinterpret_cast<TrainingContext*>(ctx_ptr);
@@ -10320,6 +10336,9 @@ int64_t qwen36_add_lora(
             TORCH_CHECK(rank > 0, "LoRA rank must be positive");
             TORCH_CHECK(std::isfinite(alpha) && alpha > 0.0,
                 "LoRA alpha must be finite and positive");
+            TORCH_CHECK(std::isfinite(optimizer_lr) && optimizer_lr >= 0.0,
+                "dynamic LoRA optimizer learning rate must be finite and "
+                "non-negative");
             TORCH_CHECK(num_target_layers >= 0 &&
                     (num_target_layers == 0 || target_layers),
                 "dynamic LoRA target layer list is invalid");
@@ -10328,6 +10347,7 @@ int64_t qwen36_add_lora(
                 "dynamic LoRA adapter ID space is exhausted");
             adapter.id = ctx->next_adapter_id + 1;
             adapter.rank = rank;
+            adapter.optimizer_lr = optimizer_lr;
             adapter.alpha = alpha;
             adapter.all_target_layers = num_target_layers == 0;
             for (int64_t i = 0; i < num_target_layers; i++) {
@@ -10553,7 +10573,9 @@ int64_t qwen36_add_lora(
         ctx->next_adapter_id = id;
         ctx->lora_cache_valid = false;
         ctx->lora_batch_valid = false;
-        fprintf(stderr, "[q36_lora] added adapter %ld: rank=%ld alpha=%.1f\n", (long)id, (long)rank, alpha);
+        fprintf(stderr,
+            "[q36_lora] added adapter %ld: rank=%ld alpha=%.1f lr=%.8g\n",
+            (long)id, (long)rank, alpha, optimizer_lr);
         return id;
     } catch (const std::exception& e) {
         fprintf(stderr, "[q36] add_lora FAILED: %s\n", e.what());
@@ -10574,6 +10596,19 @@ struct ScopedBoolOverride {
 };
 
 __attribute__((visibility("default")))
+int64_t qwen36_add_lora(
+    void* ctx_ptr,
+    int64_t rank, double alpha,
+    const int64_t* target_layers, int64_t num_target_layers,
+    const char* target_modules_str
+) {
+    auto* ctx = reinterpret_cast<TrainingContext*>(ctx_ptr);
+    return qwen36_add_lora_impl(
+        ctx_ptr, rank, alpha, target_layers, num_target_layers,
+        target_modules_str, ctx ? ctx->lr : 0.0);
+}
+
+__attribute__((visibility("default")))
 int64_t qwen36_add_lora_v2(
     void* ctx_ptr,
     int64_t rank, double alpha,
@@ -10586,6 +10621,25 @@ int64_t qwen36_add_lora_v2(
     return qwen36_add_lora(
         ctx_ptr, rank, alpha, target_layers, num_target_layers,
         target_modules_str);
+}
+
+// Additive ABI27 extension. Older registration entry points preserve their
+// context-wide learning-rate behavior; callers that resolve this optional
+// symbol can select one learning rate per dynamic tenant.
+__attribute__((visibility("default")))
+int64_t qwen36_add_lora_with_optimizer(
+    void* ctx_ptr,
+    int64_t rank, double alpha,
+    const int64_t* target_layers, int64_t num_target_layers,
+    const char* target_modules_str,
+    double optimizer_lr
+) {
+    auto* ctx = reinterpret_cast<TrainingContext*>(ctx_ptr);
+    if (!ctx) return -1;
+    ScopedBoolOverride guard(ctx->allow_heterogeneous_registration, true);
+    return qwen36_add_lora_impl(
+        ctx_ptr, rank, alpha, target_layers, num_target_layers,
+        target_modules_str, optimizer_lr);
 }
 
 __attribute__((visibility("default")))

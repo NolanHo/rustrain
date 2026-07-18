@@ -148,6 +148,8 @@ type FnInitParallelNccl = unsafe extern "C" fn(
 type FnSetCudaDevice = unsafe extern "C" fn(i32);
 type FnSetBaseTpMlp = unsafe extern "C" fn(*mut c_void, i32) -> i32;
 type FnAddLora = unsafe extern "C" fn(*mut c_void, i64, f64, *const i64, i64, *const i8) -> i64;
+type FnAddLoraWithOptimizer =
+    unsafe extern "C" fn(*mut c_void, i64, f64, *const i64, i64, *const i8, f64) -> i64;
 type FnRemoveLora = unsafe extern "C" fn(*mut c_void, i64) -> i32;
 type FnListLora = unsafe extern "C" fn(*mut c_void, *mut i64, i64) -> i64;
 type FnGetAdapterLoraTensor =
@@ -222,6 +224,7 @@ struct KernelHandles {
     set_base_tp_mlp: FnSetBaseTpMlp,
     add_lora: FnAddLora,
     add_lora_v2: FnAddLora,
+    add_lora_with_optimizer: Option<FnAddLoraWithOptimizer>,
     add_lora_for_restore: FnAddLora,
     remove_lora: FnRemoveLora,
     list_lora: FnListLora,
@@ -275,6 +278,17 @@ unsafe fn load_kernels() -> Option<KernelHandles> {
     if abi_version() != 27 {
         return None;
     }
+    let add_lora_with_optimizer = {
+        let name = CString::new("qwen36_add_lora_with_optimizer").unwrap();
+        let symbol = libc::dlsym(handle, name.as_ptr());
+        if symbol.is_null() {
+            None
+        } else {
+            Some(std::mem::transmute::<*mut c_void, FnAddLoraWithOptimizer>(
+                symbol,
+            ))
+        }
+    };
     Some(KernelHandles {
         create_ctx: sym!("qwen36_create_training_context_v2"),
         train_step: sym!("qwen36_train_step"),
@@ -309,6 +323,7 @@ unsafe fn load_kernels() -> Option<KernelHandles> {
         set_base_tp_mlp: sym!("qwen36_set_base_tp_mlp"),
         add_lora: sym!("qwen36_add_lora"),
         add_lora_v2: sym!("qwen36_add_lora_v2"),
+        add_lora_with_optimizer,
         add_lora_for_restore: sym!("qwen36_add_lora_for_restore"),
         remove_lora: sym!("qwen36_remove_lora"),
         list_lora: sym!("qwen36_list_lora"),
@@ -1621,6 +1636,54 @@ impl CppTrainingContext {
         let id = unsafe { (kh.add_lora_v2)(self.ptr, rank, alpha, tl_ptr, tl_len, modules_ptr) };
         if id < 0 {
             bail!("C++ add_lora failed");
+        }
+        Ok(id)
+    }
+
+    /// Add a dynamic adapter with a tenant-specific Adam learning rate.
+    ///
+    /// Beta1, beta2, and epsilon still inherit the training context defaults.
+    /// The legacy `add_lora` entry point continues to inherit every optimizer
+    /// hyperparameter from the context.
+    pub fn add_lora_with_optimizer_lr(
+        &self,
+        rank: i64,
+        alpha: f64,
+        target_layers: &[i64],
+        target_modules: &str,
+        optimizer_lr: f64,
+    ) -> Result<i64> {
+        if !optimizer_lr.is_finite() || optimizer_lr < 0.0 {
+            bail!("dynamic LoRA optimizer learning rate must be finite and non-negative");
+        }
+        let kh = get_kernels().ok_or_else(|| anyhow::anyhow!("kernels not loaded"))?;
+        let add_lora = kh.add_lora_with_optimizer.ok_or_else(|| {
+            anyhow::anyhow!("loaded Qwen kernel does not support tenant optimizer overrides")
+        })?;
+        let tl_ptr = if target_layers.is_empty() {
+            std::ptr::null()
+        } else {
+            target_layers.as_ptr()
+        };
+        let modules = std::ffi::CString::new(target_modules)?;
+        let modules_ptr = if target_modules.is_empty() {
+            std::ptr::null()
+        } else {
+            modules.as_ptr()
+        };
+        let id = unsafe {
+            add_lora(
+                self.ptr,
+                rank,
+                alpha,
+                tl_ptr,
+                i64::try_from(target_layers.len()).context("target layer count exceeds i64")?,
+                modules_ptr,
+                optimizer_lr,
+            )
+        };
+        if id < 0 {
+            bail!("C++ add_lora_with_optimizer failed");
         }
         Ok(id)
     }
