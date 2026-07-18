@@ -157,7 +157,11 @@ fn max_abs_diff(actual: &Tensor, expected: &Tensor) -> f64 {
 
 fn check_close(name: &str, actual: &Tensor, expected: &Tensor) -> Result<f64> {
     if !actual.defined() || !expected.defined() {
-        bail!("{name} is undefined (actual={}, expected={})", actual.defined(), expected.defined());
+        bail!(
+            "{name} is undefined (actual={}, expected={})",
+            actual.defined(),
+            expected.defined()
+        );
     }
     let diff = max_abs_diff(actual, expected);
     if !diff.is_finite() || diff > TOLERANCE {

@@ -13,6 +13,7 @@
 #include <ATen/ops/matmul.h>
 #include <ATen/ops/linear.h>
 #include <ATen/ops/topk.h>
+#include <ATen/ops/floor_divide.h>
 #include <ATen/ops/sigmoid.h>
 #include <ATen/ops/softmax.h>
 #include <ATen/ops/silu.h>
@@ -1712,9 +1713,9 @@ static at::Tensor moe_forward(
     if (ep_size > 1) {
         const int64_t assignments = tk_indices.numel();
         auto assignment_ids = at::arange(assignments, tk_indices.options());
-        auto token_ids = assignment_ids / topk;
+        auto token_ids = at::floor_divide(assignment_ids, topk);
         auto flat_experts = tk_indices.reshape({-1});
-        auto owners = flat_experts / (n_routed_experts / ep_size);
+        auto owners = at::floor_divide(flat_experts, n_routed_experts / ep_size);
         auto sort_key = owners * assignments + assignment_ids;
         sort_order = std::get<1>(sort_key.sort(0, false));
         auto sorted_input = flat_input.index_select(0, token_ids).index_select(0, sort_order);
@@ -1733,7 +1734,8 @@ static at::Tensor moe_forward(
         recv_counts = dispatched[2];
     } else {
         auto assignment_ids = at::arange(tk_indices.numel(), tk_indices.options());
-        expert_input = flat_input.index_select(0, assignment_ids / topk);
+        expert_input = flat_input.index_select(
+            0, at::floor_divide(assignment_ids, topk));
         expert_ids = tk_indices.reshape({-1});
     }
     auto expert_output = at::zeros_like(expert_input);
@@ -2392,9 +2394,10 @@ void* v4_glm5_mtp_decoder_layer(const Glm5MtpDecoderDescriptor* descriptor) {
                             "MTP routed expert count must be divisible by EP size");
                 const int64_t assignments = indices.numel();
                 auto assignment_ids = at::arange(assignments, indices.options());
-                auto token_ids = assignment_ids / d.topk;
+                auto token_ids = at::floor_divide(assignment_ids, d.topk);
                 auto flat_experts = indices.reshape({-1});
-                auto owners = flat_experts / (d.n_routed_experts / d.ep_size);
+                auto owners = at::floor_divide(
+                    flat_experts, d.n_routed_experts / d.ep_size);
                 auto sort_key = owners * assignments + assignment_ids;
                 sort_order = std::get<1>(sort_key.sort(0, false));
                 auto sorted_input = flat.index_select(0, token_ids).index_select(0, sort_order);
@@ -2414,7 +2417,8 @@ void* v4_glm5_mtp_decoder_layer(const Glm5MtpDecoderDescriptor* descriptor) {
                 recv_counts = dispatched[2];
             } else {
                 auto assignment_ids = at::arange(indices.numel(), indices.options());
-                expert_input = flat.index_select(0, assignment_ids / d.topk);
+                expert_input = flat.index_select(
+                    0, at::floor_divide(assignment_ids, d.topk));
                 expert_ids = indices.reshape({-1});
             }
 
