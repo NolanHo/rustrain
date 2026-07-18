@@ -1408,6 +1408,10 @@ impl CppTrainingContext {
         ids
     }
 
+    /// Returns a shallow snapshot of the adapter tensor at call time.
+    ///
+    /// Dynamic Adam may atomically replace the native registry handle. Do not
+    /// cache this tensor across a training call; fetch it again after training.
     pub fn get_adapter_lora_tensor(
         &self,
         adapter_id: i64,
@@ -1460,6 +1464,9 @@ impl CppTrainingContext {
         Ok(())
     }
 
+    /// Returns a shallow snapshot of the optimizer tensor at call time.
+    /// Fetch it again after training because transactional Adam swaps native
+    /// registry handles instead of mutating the previously returned handle.
     pub fn get_adapter_optimizer_tensor(
         &self,
         adapter_id: i64,

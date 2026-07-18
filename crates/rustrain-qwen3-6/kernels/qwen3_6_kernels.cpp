@@ -101,6 +101,16 @@ extern "C" {
         float lr_scaled, float eps_scaled,
         float one_minus_beta1, float one_minus_beta2,
         void* stream);
+    void launch_fused_adam_multi_out_of_place(
+        void** d_src_param_ptrs, void** d_grad_ptrs,
+        float** d_src_m_ptrs, float** d_src_v_ptrs,
+        void** d_dst_param_ptrs,
+        float** d_dst_m_ptrs, float** d_dst_v_ptrs,
+        int* d_sizes, float* d_lr_scaled, float* d_eps_scaled,
+        int n_params,
+        float beta1, float beta2,
+        float one_minus_beta1, float one_minus_beta2,
+        void* stream);
 }
 
 /// Fused RMSNorm — single CUDA kernel (replaces 3 ATen ops)
@@ -2121,7 +2131,12 @@ struct AdamDevBuffers {
     at::Tensor grads_buf;    // [max_n] kLong
     at::Tensor m_buf;        // [max_n] kLong — float* stored as int64_t
     at::Tensor v_buf;        // [max_n] kLong
+    at::Tensor dst_params_buf;  // [max_n] kLong
+    at::Tensor dst_m_buf;       // [max_n] kLong
+    at::Tensor dst_v_buf;       // [max_n] kLong
     at::Tensor sizes_buf;    // [max_n] kInt
+    at::Tensor lr_buf;       // [max_n] kFloat
+    at::Tensor eps_buf;      // [max_n] kFloat
     int capacity = 0;
 
     void ensure(int n, const at::Tensor& ref) {
@@ -2131,7 +2146,12 @@ struct AdamDevBuffers {
         grads_buf  = at::empty({n}, at::TensorOptions().dtype(at::kLong).device(dev));
         m_buf      = at::empty({n}, at::TensorOptions().dtype(at::kLong).device(dev));
         v_buf      = at::empty({n}, at::TensorOptions().dtype(at::kLong).device(dev));
+        dst_params_buf = at::empty({n}, at::TensorOptions().dtype(at::kLong).device(dev));
+        dst_m_buf = at::empty({n}, at::TensorOptions().dtype(at::kLong).device(dev));
+        dst_v_buf = at::empty({n}, at::TensorOptions().dtype(at::kLong).device(dev));
         sizes_buf  = at::empty({n}, at::TensorOptions().dtype(at::kInt).device(dev));
+        lr_buf     = at::empty({n}, at::TensorOptions().dtype(at::kFloat).device(dev));
+        eps_buf    = at::empty({n}, at::TensorOptions().dtype(at::kFloat).device(dev));
         capacity = n;
     }
 };
@@ -2162,6 +2182,10 @@ struct TrainingContext {
         std::set<std::string> target_modules;
         std::map<int64_t, std::vector<std::pair<at::Tensor, at::Tensor>>> params;
         std::map<int64_t, std::vector<std::array<at::Tensor, 4>>> adam_state;
+        // Reusable out-of-place Adam destinations. Each entry stores
+        // {param_a, m_a, v_a, param_b, m_b, v_b}; a successful transaction
+        // swaps these handles with the live registry without allocating.
+        std::map<int64_t, std::vector<std::array<at::Tensor, 6>>> adam_shadow;
         // Gradients are harvested after each backward into FP32 tensors. The
         // accumulator tensors are intentionally shared by value when chunk
         // registry guards copy adapters, so their contents survive restore.
@@ -6581,52 +6605,93 @@ __attribute__((visibility("default"))) double qwen36_train_multi_lora(
                         ctx->adapters.size(),
                     "dynamic LoRA global-token activity vector mismatch");
 
-                // Adam step. Group tenants by their own logical clock so
-                // newly-added or resumed tenants do not inherit another
-                // tenant's bias correction. Adapters with the same clock
-                // still share one fused multi-tensor launch.
+                // Build every Adam result out of place. No live parameter,
+                // optimizer tensor, or tenant clock changes until the unified
+                // launch has passed preflight and CUDA launch validation.
                 at::AutoGradMode guard(false);
                 ctx->lora_cache_valid = false;
                 ctx->lora_batch_valid = false;
-                std::map<int64_t, std::vector<TrainingContext::LoRAAdapter*>> groups;
+                struct DynamicAdamCommit {
+                    at::Tensor* param;
+                    at::Tensor* accumulator;
+                    at::Tensor* m;
+                    at::Tensor* v;
+                    at::Tensor* next_param;
+                    at::Tensor* next_m;
+                    at::Tensor* next_v;
+                    float lr_scaled;
+                    float eps_scaled;
+                };
+                struct DynamicAdamClockCommit {
+                    TrainingContext::LoRAAdapter* adapter;
+                    int64_t logical_step;
+                };
+                std::vector<DynamicAdamCommit> commits;
+                std::vector<DynamicAdamClockCommit> clock_commits;
+                auto append_commit = [&](at::Tensor& param,
+                                         at::Tensor& accumulator,
+                                         at::Tensor& m,
+                                         at::Tensor& v,
+                                         at::Tensor& next_param,
+                                         at::Tensor& next_m,
+                                         at::Tensor& next_v,
+                                         float lr_scaled,
+                                         float eps_scaled) {
+                    if (!param.requires_grad() || !accumulator.defined()) return;
+                    TORCH_CHECK(param.defined() && param.is_cuda() &&
+                            param.is_contiguous() &&
+                            param.scalar_type() == at::kBFloat16,
+                        "dynamic Adam parameter must be contiguous CUDA BF16");
+                    TORCH_CHECK(accumulator.is_cuda() &&
+                            accumulator.is_contiguous() &&
+                            accumulator.scalar_type() == at::kFloat &&
+                            accumulator.sizes() == param.sizes() &&
+                            accumulator.device() == param.device(),
+                        "dynamic Adam accumulator must be matching contiguous CUDA FP32");
+                    TORCH_CHECK(m.defined() && v.defined() && m.is_cuda() &&
+                            v.is_cuda() && m.is_contiguous() && v.is_contiguous() &&
+                            m.scalar_type() == at::kFloat &&
+                            v.scalar_type() == at::kFloat &&
+                            m.sizes() == param.sizes() &&
+                            v.sizes() == param.sizes() &&
+                            m.device() == param.device() &&
+                            v.device() == param.device(),
+                        "dynamic Adam state must be matching contiguous CUDA FP32");
+                    TORCH_CHECK(next_param.defined() && next_param.is_cuda() &&
+                            next_param.is_contiguous() &&
+                            next_param.scalar_type() == at::kBFloat16 &&
+                            next_param.sizes() == param.sizes() &&
+                            next_param.device() == param.device() &&
+                            next_param.requires_grad() == param.requires_grad() &&
+                            next_m.defined() && next_v.defined() &&
+                            next_m.is_cuda() && next_v.is_cuda() &&
+                            next_m.is_contiguous() && next_v.is_contiguous() &&
+                            next_m.scalar_type() == at::kFloat &&
+                            next_v.scalar_type() == at::kFloat &&
+                            next_m.sizes() == param.sizes() &&
+                            next_v.sizes() == param.sizes() &&
+                            next_m.device() == param.device() &&
+                            next_v.device() == param.device(),
+                        "dynamic Adam shadow must match live tensor layout");
+                    TORCH_CHECK(param.numel() > 0 &&
+                            param.numel() <= std::numeric_limits<int>::max(),
+                        "dynamic Adam tensor size is outside fused-kernel range: ",
+                        param.numel());
+                    commits.push_back(DynamicAdamCommit{
+                        &param, &accumulator, &m, &v,
+                        &next_param, &next_m, &next_v,
+                        lr_scaled, eps_scaled});
+                };
                 for (size_t adapter_index = 0;
                      adapter_index < ctx->adapters.size(); ++adapter_index) {
                     if (!adapter_has_global_tokens[adapter_index]) continue;
                     auto& adapter = ctx->adapters[adapter_index];
-                    groups[adapter.optimizer_step + 1].push_back(&adapter);
-                }
-                for (auto& [logical_step, adapters] : groups) {
-                    std::vector<void*> h_params, h_grads;
-                    std::vector<float*> h_m, h_v;
-                    std::vector<int> h_sizes;
-                    for (auto* adapter : adapters) {
-                        for (auto& [layer_idx, pairs] : adapter->params) {
-                            auto& adam_states = adapter->adam_state[layer_idx];
-                            auto& accumulators = adapter->grad_accum[layer_idx];
-                            for (size_t i = 0; i < pairs.size(); i++) {
-                                auto& [a, b] = pairs[i];
-                                auto& [m_a, v_a, m_b, v_b] = adam_states[i];
-                                auto& [accum_a, accum_b] = accumulators[i];
-                                if (a.requires_grad() && accum_a.defined() &&
-                                    a.scalar_type() == at::kBFloat16) {
-                                    h_params.push_back(a.data_ptr());
-                                    h_grads.push_back(accum_a.data_ptr());
-                                    h_m.push_back((float*)m_a.data_ptr());
-                                    h_v.push_back((float*)v_a.data_ptr());
-                                    h_sizes.push_back((int)a.numel());
-                                }
-                                if (b.requires_grad() && accum_b.defined() &&
-                                    b.scalar_type() == at::kBFloat16) {
-                                    h_params.push_back(b.data_ptr());
-                                    h_grads.push_back(accum_b.data_ptr());
-                                    h_m.push_back((float*)m_b.data_ptr());
-                                    h_v.push_back((float*)v_b.data_ptr());
-                                    h_sizes.push_back((int)b.numel());
-                                }
-                            }
-                        }
-                    }
-                    if (h_params.empty()) continue;
+                    TORCH_CHECK(adapter.optimizer_step >= 0 &&
+                            adapter.optimizer_step <
+                                std::numeric_limits<int64_t>::max(),
+                        "dynamic Adam optimizer clock is outside valid range for adapter ",
+                        adapter.id, ": ", adapter.optimizer_step);
+                    const int64_t logical_step = adapter.optimizer_step + 1;
                     const double step_f = (double)logical_step;
                     const double bias_correction1 =
                         1.0 - std::pow(ctx->beta1, step_f);
@@ -6638,39 +6703,152 @@ __attribute__((visibility("default"))) double qwen36_train_multi_lora(
                         ctx->lr * sqrt_bias_correction2 / bias_correction1);
                     const float eps_scaled = (float)(
                         ctx->eps * sqrt_bias_correction2);
-                    const float one_minus_b1 = (float)(1.0 - ctx->beta1);
-                    const float one_minus_b2 = (float)(1.0 - ctx->beta2);
-                    int n_params = (int)h_params.size();
+                    TORCH_CHECK(std::isfinite(lr_scaled) &&
+                            std::isfinite(eps_scaled) &&
+                            bias_correction1 > 0.0 &&
+                            bias_correction2 > 0.0,
+                        "dynamic Adam bias correction is invalid for adapter ",
+                        adapter.id, " at logical step ", logical_step);
+                    const size_t adapter_commit_begin = commits.size();
+                    for (auto& [layer_idx, pairs] : adapter.params) {
+                        auto state_it = adapter.adam_state.find(layer_idx);
+                        auto shadow_it = adapter.adam_shadow.find(layer_idx);
+                        auto accum_it = adapter.grad_accum.find(layer_idx);
+                        TORCH_CHECK(state_it != adapter.adam_state.end() &&
+                                shadow_it != adapter.adam_shadow.end() &&
+                                accum_it != adapter.grad_accum.end() &&
+                                state_it->second.size() == pairs.size() &&
+                                shadow_it->second.size() == pairs.size() &&
+                                accum_it->second.size() == pairs.size(),
+                            "dynamic Adam registry layout mismatch for adapter ",
+                            adapter.id, " layer ", layer_idx);
+                        for (size_t i = 0; i < pairs.size(); ++i) {
+                            auto& [a, b] = pairs[i];
+                            auto& [m_a, v_a, m_b, v_b] = state_it->second[i];
+                            auto& [next_a, next_m_a, next_v_a,
+                                   next_b, next_m_b, next_v_b] =
+                                shadow_it->second[i];
+                            auto& [accum_a, accum_b] = accum_it->second[i];
+                            append_commit(
+                                a, accum_a, m_a, v_a,
+                                next_a, next_m_a, next_v_a,
+                                lr_scaled, eps_scaled);
+                            append_commit(
+                                b, accum_b, m_b, v_b,
+                                next_b, next_m_b, next_v_b,
+                                lr_scaled, eps_scaled);
+                        }
+                    }
+                    if (commits.size() > adapter_commit_begin) {
+                        clock_commits.push_back(
+                            DynamicAdamClockCommit{&adapter, logical_step});
+                    }
+                }
+                if (!commits.empty()) {
+                    TORCH_CHECK(commits.size() <=
+                            static_cast<size_t>(std::numeric_limits<int>::max()),
+                        "dynamic Adam tensor count exceeds fused-kernel range");
+                    std::vector<void*> h_params, h_grads, h_dst_params;
+                    std::vector<float*> h_m, h_v, h_dst_m, h_dst_v;
+                    std::vector<int> h_sizes;
+                    std::vector<float> h_lr_scaled, h_eps_scaled;
+                    const size_t tensor_count = commits.size();
+                    h_params.reserve(tensor_count);
+                    h_grads.reserve(tensor_count);
+                    h_m.reserve(tensor_count);
+                    h_v.reserve(tensor_count);
+                    h_dst_params.reserve(tensor_count);
+                    h_dst_m.reserve(tensor_count);
+                    h_dst_v.reserve(tensor_count);
+                    h_sizes.reserve(tensor_count);
+                    h_lr_scaled.reserve(tensor_count);
+                    h_eps_scaled.reserve(tensor_count);
+                    for (auto& commit : commits) {
+                        h_params.push_back(commit.param->data_ptr());
+                        h_grads.push_back(commit.accumulator->data_ptr());
+                        h_m.push_back((float*)commit.m->data_ptr());
+                        h_v.push_back((float*)commit.v->data_ptr());
+                        h_dst_params.push_back(commit.next_param->data_ptr());
+                        h_dst_m.push_back((float*)commit.next_m->data_ptr());
+                        h_dst_v.push_back((float*)commit.next_v->data_ptr());
+                        h_sizes.push_back((int)commit.param->numel());
+                        h_lr_scaled.push_back(commit.lr_scaled);
+                        h_eps_scaled.push_back(commit.eps_scaled);
+                    }
+                    const int n_params = (int)commits.size();
                     auto opts_cpu_long = at::TensorOptions().dtype(at::kLong).device(at::kCPU);
                     auto opts_cpu_int  = at::TensorOptions().dtype(at::kInt).device(at::kCPU);
+                    auto opts_cpu_float = at::TensorOptions().dtype(at::kFloat).device(at::kCPU);
                     auto params_cpu = at::from_blob(h_params.data(), {n_params}, opts_cpu_long);
                     auto grads_cpu  = at::from_blob(h_grads.data(),  {n_params}, opts_cpu_long);
                     auto m_cpu      = at::from_blob(h_m.data(),      {n_params}, opts_cpu_long);
                     auto v_cpu      = at::from_blob(h_v.data(),      {n_params}, opts_cpu_long);
+                    auto dst_params_cpu = at::from_blob(
+                        h_dst_params.data(), {n_params}, opts_cpu_long);
+                    auto dst_m_cpu = at::from_blob(
+                        h_dst_m.data(), {n_params}, opts_cpu_long);
+                    auto dst_v_cpu = at::from_blob(
+                        h_dst_v.data(), {n_params}, opts_cpu_long);
                     auto sizes_cpu  = at::from_blob(h_sizes.data(),  {n_params}, opts_cpu_int);
-                    ctx->adam_dev_bufs.ensure(n_params, adapters[0]->params.begin()->second[0].first);
+                    auto lr_cpu = at::from_blob(
+                        h_lr_scaled.data(), {n_params}, opts_cpu_float);
+                    auto eps_cpu = at::from_blob(
+                        h_eps_scaled.data(), {n_params}, opts_cpu_float);
+                    ctx->adam_dev_bufs.ensure(n_params, *commits[0].param);
                     ctx->adam_dev_bufs.params_buf.narrow(0, 0, n_params).copy_(params_cpu);
                     ctx->adam_dev_bufs.grads_buf.narrow(0, 0, n_params).copy_(grads_cpu);
                     ctx->adam_dev_bufs.m_buf.narrow(0, 0, n_params).copy_(m_cpu);
                     ctx->adam_dev_bufs.v_buf.narrow(0, 0, n_params).copy_(v_cpu);
+                    ctx->adam_dev_bufs.dst_params_buf.narrow(0, 0, n_params).copy_(dst_params_cpu);
+                    ctx->adam_dev_bufs.dst_m_buf.narrow(0, 0, n_params).copy_(dst_m_cpu);
+                    ctx->adam_dev_bufs.dst_v_buf.narrow(0, 0, n_params).copy_(dst_v_cpu);
                     ctx->adam_dev_bufs.sizes_buf.narrow(0, 0, n_params).copy_(sizes_cpu);
+                    ctx->adam_dev_bufs.lr_buf.narrow(0, 0, n_params).copy_(lr_cpu);
+                    ctx->adam_dev_bufs.eps_buf.narrow(0, 0, n_params).copy_(eps_cpu);
                     auto stream = c10::cuda::getCurrentCUDAStream().stream();
-                    launch_fused_adam_multi(
+                    launch_fused_adam_multi_out_of_place(
                         (void**)ctx->adam_dev_bufs.params_buf.data_ptr(),
                         (void**)ctx->adam_dev_bufs.grads_buf.data_ptr(),
                         (float**)ctx->adam_dev_bufs.m_buf.data_ptr(),
                         (float**)ctx->adam_dev_bufs.v_buf.data_ptr(),
+                        (void**)ctx->adam_dev_bufs.dst_params_buf.data_ptr(),
+                        (float**)ctx->adam_dev_bufs.dst_m_buf.data_ptr(),
+                        (float**)ctx->adam_dev_bufs.dst_v_buf.data_ptr(),
                         (int*)ctx->adam_dev_bufs.sizes_buf.data_ptr(),
+                        (float*)ctx->adam_dev_bufs.lr_buf.data_ptr(),
+                        (float*)ctx->adam_dev_bufs.eps_buf.data_ptr(),
                         n_params, (float)ctx->beta1, (float)ctx->beta2,
-                        lr_scaled, eps_scaled, one_minus_b1, one_minus_b2,
+                        (float)(1.0 - ctx->beta1),
+                        (float)(1.0 - ctx->beta2),
                         (void*)stream);
                     auto launch_error = cudaGetLastError();
                     TORCH_CHECK(launch_error == cudaSuccess,
-                        "dynamic fused FP32-gradient Adam launch failed: ",
+                        "dynamic transactional Adam launch failed: ",
                         cudaGetErrorString(launch_error));
-                    for (auto* adapter : adapters) {
-                        adapter->optimizer_step = logical_step;
+                    const bool inject_failure = env_enabled(
+                        "QWEN36_TEST_FAIL_DYNAMIC_ADAM_BEFORE_COMMIT");
+                    if (inject_failure || env_enabled(
+                            "QWEN36_STRICT_DYNAMIC_ADAM_COMMIT")) {
+                        auto completion_error = cudaStreamSynchronize(stream);
+                        TORCH_CHECK(completion_error == cudaSuccess,
+                            "dynamic transactional Adam execution failed: ",
+                            cudaGetErrorString(completion_error));
                     }
+                    // Production commits remain asynchronous: the next
+                    // forward consumes the swapped destinations on this same
+                    // stream. Strict mode is available for validation without
+                    // imposing a device barrier on every training step.
+                    TORCH_CHECK(!inject_failure,
+                        "injected dynamic Adam failure before commit");
+                    for (auto& commit : commits) {
+                        std::swap(*commit.param, *commit.next_param);
+                        std::swap(*commit.m, *commit.next_m);
+                        std::swap(*commit.v, *commit.next_v);
+                    }
+                }
+                for (const auto& clock_commit : clock_commits) {
+                    clock_commit.adapter->optimizer_step =
+                        clock_commit.logical_step;
                 }
             }
 
@@ -7373,6 +7551,7 @@ int64_t qwen36_add_lora(
             int64_t num_pairs = projection_table.count;
             std::vector<std::pair<at::Tensor, at::Tensor>> pairs;
             std::vector<std::array<at::Tensor, 4>> adam_states;
+            std::vector<std::array<at::Tensor, 6>> adam_shadows;
             std::vector<std::array<at::Tensor, 2>> grad_accumulators;
             for (int64_t k = 0; k < num_pairs; k++) {
                 const auto& projection = projection_table.entries[k];
@@ -7429,6 +7608,15 @@ int64_t qwen36_add_lora(
                     at::zeros(a.sizes(), opts_f32), at::zeros(a.sizes(), opts_f32),
                     at::zeros(b.sizes(), opts_f32), at::zeros(b.sizes(), opts_f32)
                 });
+                adam_shadows.push_back(active
+                    ? std::array<at::Tensor, 6>{
+                        at::empty_like(a).set_requires_grad(true),
+                        at::empty(a.sizes(), opts_f32),
+                        at::empty(a.sizes(), opts_f32),
+                        at::empty_like(b).set_requires_grad(true),
+                        at::empty(b.sizes(), opts_f32),
+                        at::empty(b.sizes(), opts_f32)}
+                    : std::array<at::Tensor, 6>{});
                 grad_accumulators.push_back(active
                     ? std::array<at::Tensor, 2>{
                         at::zeros(a.sizes(), opts_f32),
@@ -7438,6 +7626,7 @@ int64_t qwen36_add_lora(
             }
             adapter.params[i] = std::move(pairs);
             adapter.adam_state[i] = std::move(adam_states);
+            adapter.adam_shadow[i] = std::move(adam_shadows);
             adapter.grad_accum[i] = std::move(grad_accumulators);
         }
         if (!ctx->restore_without_parameter_sync)

@@ -21,7 +21,7 @@
 | Qwen3.6 MoE | 已实现 | grouped dispatch、EP smoke；完整模型仍需目标 GPU/权重运行 |
 | MTP | 已实现 | C++ hidden gradient 检查和集成测试；可通过环境变量关闭 |
 | fixed LoRA | 已实现 | attention/GDN/MLP/shared/routed expert 目标模块 |
-| dynamic multi-LoRA | 已实现子集 | homogeneous rank/target 请求按 adapter 分组，单个 logical step 统一 backward/Adam；每个 adapter 独立 alpha、optimizer clock 和 m/v，DP 与 native sharded A2A 按全局 token count 加权；零全局 token 租户跳过更新。checkpoint 可独立恢复 heterogeneous rank/alpha/targets，但同一步异构训练尚需 grouped v2 ABI；dynamic+MTP 暂拒绝 |
+| dynamic multi-LoRA | 已实现子集 | homogeneous rank/target 请求按 adapter 分组，单个 logical step 统一 backward，并以一次 out-of-place fused Adam launch 更新所有 active tenant；持久 shadow 双缓冲在 launch validation 后统一交换 live parameter/m/v/clock，strict/test 模式额外等待 stream completion，生产路径不增加 optimizer barrier。shadow 仅为 active projection 分配，但会额外常驻约 `10 bytes/LoRA parameter`，大租户容量仍需 benchmark。每个 adapter 独立 alpha、optimizer clock 和 m/v；checkpoint 可独立恢复 heterogeneous rank/alpha/targets，但同一步异构训练尚需 grouped v2 ABI；dynamic+MTP 暂拒绝 |
 | microbatch accumulation | 已实现子集 | non-final microbatch 只 backward，final microbatch 才 optimizer；FP32 accumulator 存储/聚合，autograd leaf backward 仍为 BF16 |
 | replicated data parallel | 已实现 | logical-step 边界同步 replicated LoRA；EP expert 参数不走该 reduction |
 | expert parallel | 已实现子集 | 默认 routed-output all-reduce；gated variable-split A2A 已验证 fixed-LoRA 和 native dynamic-LoRA data sharding；GPU-only split planning、异步 overlap 和 DeepEP backend 未实现 |
@@ -69,7 +69,7 @@ ABI15 的两层 GDN base-TP smoke 覆盖复合 QKV/conv head shard、Z/A/B/A_log
 
 ## 继续达到 Megatron 级别所需的最小工作包
 
-1. 为 selected dynamic multi-LoRA 增加按 `(rank, canonical active slots)` 分组的 v2 transactional step ABI，支持 heterogeneous adapter layout，并在所有组成功后以 out-of-place Adam shadow state 原子提交。
+1. 为 selected dynamic multi-LoRA 增加按 `(rank, canonical active slots)` 分组的 v2 step ABI，支持 heterogeneous adapter layout；复用现有的持久 out-of-place Adam shadow transaction，在所有分组 forward/backward 成功后统一提交。
 2. 实现 PP/CP runtime process groups、launcher、scheduler 和 checkpoint rank mapping；为 PP 实现 stage forward/backward 与 1F1B scheduler，为 CP 实现 ring attention/state exchange。
 3. 将 EP dispatch/combine 替换为 fused/异步路径，并测量通信与计算重叠。
 4. 为 dense/expert MLP 增加 fused gate/up FC1 和 MTP 支持；为 GDN 增加稳定的 chunk/state-checkpoint backward 与 sequence/context parallel，为 full attention 融合 QKV/SDPA 并增加 sequence parallel。

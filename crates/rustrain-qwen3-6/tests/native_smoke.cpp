@@ -685,6 +685,29 @@ int main() {
     assert(selected_update > 0.0);
     assert(unselected_update == 0.0);
 
+    auto* transactional_m = reinterpret_cast<at::Tensor*>(
+        qwen36_get_adapter_optimizer_tensor(
+            ctx, adapter_one, 0, "shared_gate_proj", 1, 0));
+    auto* transactional_v = reinterpret_cast<at::Tensor*>(
+        qwen36_get_adapter_optimizer_tensor(
+            ctx, adapter_one, 0, "shared_gate_proj", 1, 1));
+    assert(transactional_m && transactional_v);
+    auto transactional_b_before = dynamic_b->clone();
+    auto transactional_m_before = transactional_m->clone();
+    auto transactional_v_before = transactional_v->clone();
+    setenv("QWEN36_TEST_FAIL_DYNAMIC_ADAM_BEFORE_COMMIT", "1", 1);
+    const double injected_failure = qwen36_train_multi_lora_selected(
+        ctx, &selected_input_ids, &selected_target_mask,
+        &selected_attention_mask, selected_adapter_ids, 1, rank);
+    unsetenv("QWEN36_TEST_FAIL_DYNAMIC_ADAM_BEFORE_COMMIT");
+    c10::cuda::device_synchronize();
+    assert(injected_failure < 0.0);
+    assert(qwen36_get_adapter_step_count(ctx, adapter_one) == 2);
+    assert((*dynamic_b - transactional_b_before).abs().max().item<double>() == 0.0);
+    assert((*transactional_m - transactional_m_before).abs().max().item<double>() == 0.0);
+    assert((*transactional_v - transactional_v_before).abs().max().item<double>() == 0.0);
+    std::printf("native_qwen36_transactional_adam_failure_smoke ok\n");
+
     const int64_t unknown_adapter_ids[] = {adapter_two + 1000};
     assert(qwen36_train_multi_lora_selected(
         ctx, &selected_input_ids, &selected_target_mask,
