@@ -2323,7 +2323,7 @@ static at::Tensor glm5_mtp_attention(const at::Tensor& input,
                 .unsqueeze(0).unsqueeze(0).expand({batch, nh, seq, seq}, false);
             if (global_topk) {
                 auto topk_per_head = global_topk->unsqueeze(1)
-                    .expand({batch, nh, seq, actual_topk}, false);
+                    .expand({batch, nh, seq, global_topk->size(-1)}, false);
                 auto in_block = topk_per_head.ge(key_offset)
                     .logical_and(topk_per_head.lt(key_offset + seq));
                 auto local_indices = (topk_per_head - key_offset)
