@@ -23,7 +23,7 @@ const SLOT_EPOCH_OFFSET: usize = 8;
 const SLAB_ALIGNMENT: usize = 64;
 const SLAB_HEADER_SIZE: usize = 64;
 const SLAB_MAGIC: [u8; 8] = *b"RTSLAB01";
-const SLAB_VERSION: u32 = 1;
+const SLAB_VERSION: u32 = 2;
 const HEADER_MAGIC_OFFSET: usize = 0;
 const HEADER_VERSION_OFFSET: usize = 8;
 const HEADER_WORLD_SIZE_OFFSET: usize = 12;
@@ -38,6 +38,35 @@ const TENSOR_SLAB_BYTES_ENV: &str = "RUSTRAIN_EP_TENSOR_SLAB_BYTES";
 
 /// Default upper bound for one command across all workers.
 pub const DEFAULT_BROADCAST_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+
+fn multi_lora_results_are_consistent(reference: &EpResult, candidate: &EpResult) -> bool {
+    match (reference, candidate) {
+        (
+            EpResult::MultiLoraTrain {
+                loss: reference_loss,
+                step: reference_step,
+                adapter_losses: reference_adapters,
+            },
+            EpResult::MultiLoraTrain {
+                loss: candidate_loss,
+                step: candidate_step,
+                adapter_losses: candidate_adapters,
+            },
+        ) => {
+            reference_loss.to_bits() == candidate_loss.to_bits()
+                && reference_step == candidate_step
+                && reference_adapters.len() == candidate_adapters.len()
+                && reference_adapters.iter().zip(candidate_adapters).all(
+                    |(reference_adapter, candidate_adapter)| {
+                        reference_adapter.adapter_id == candidate_adapter.adapter_id
+                            && reference_adapter.loss.to_bits() == candidate_adapter.loss.to_bits()
+                    },
+                )
+        }
+        (EpResult::MultiLoraTrain { .. }, _) | (_, EpResult::MultiLoraTrain { .. }) => false,
+        _ => true,
+    }
+}
 
 fn cmd_offset() -> usize {
     0
@@ -441,6 +470,17 @@ impl EpChannel {
             }
             if rank == 0 {
                 rank_zero = Some(result);
+            } else if worker_error.is_none()
+                && !multi_lora_results_are_consistent(
+                    rank_zero
+                        .as_ref()
+                        .expect("rank zero result must be read before later ranks"),
+                    &result,
+                )
+            {
+                worker_error = Some(EpResult::Error(format!(
+                    "worker rank {rank} returned a multi-LoRA result inconsistent with rank 0"
+                )));
             }
         }
         if let Some(error) = worker_error {
@@ -844,9 +884,7 @@ impl EpWorker {
         if offset % TENSOR_SPAN_ALIGNMENT != 0 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!(
-                    "tensor slab offset {offset} is not {TENSOR_SPAN_ALIGNMENT}-byte aligned"
-                ),
+                format!("tensor slab offset {offset} is not {TENSOR_SPAN_ALIGNMENT}-byte aligned"),
             ));
         }
         if len % std::mem::size_of::<i64>() != 0 {
@@ -878,13 +916,7 @@ impl EpWorker {
     }
 
     pub fn signal_done(&self, result: &EpResult) -> io::Result<()> {
-        let json = serde_json::to_vec(result).map_err(|e| io::Error::other(e.to_string()))?;
-        if json.len() > SLOT_DATA {
-            return Err(io::Error::other(format!(
-                "result too large: {} bytes",
-                json.len()
-            )));
-        }
+        let json = encode_result_for_slot(result)?;
 
         // Write result to THIS worker's dedicated slot (no collision with other workers)
         let off = self.layout.result_offset(self.rank)?;
@@ -914,6 +946,17 @@ impl EpWorker {
     }
 }
 
+fn encode_result_for_slot(result: &EpResult) -> io::Result<Vec<u8>> {
+    let json = serde_json::to_vec(result).map_err(|e| io::Error::other(e.to_string()))?;
+    if json.len() <= SLOT_DATA {
+        return Ok(json);
+    }
+    serde_json::to_vec(&EpResult::Error(format!(
+        "worker result exceeded the {SLOT_DATA}-byte IPC slot"
+    )))
+    .map_err(|e| io::Error::other(e.to_string()))
+}
+
 impl Drop for EpWorker {
     fn drop(&mut self) {
         unsafe { libc::munmap(self.shm_ptr as *mut libc::c_void, self.shm_size) };
@@ -923,6 +966,47 @@ impl Drop for EpWorker {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn multi_lora_result_consistency_checks_rank_values_and_shape() {
+        let reference = EpResult::MultiLoraTrain {
+            loss: 2.0,
+            step: 7,
+            adapter_losses: vec![crate::command::AdapterLoss {
+                adapter_id: 41,
+                loss: 2.0,
+            }],
+        };
+        assert!(multi_lora_results_are_consistent(&reference, &reference));
+
+        let different_loss = EpResult::MultiLoraTrain {
+            loss: 2.0,
+            step: 7,
+            adapter_losses: vec![crate::command::AdapterLoss {
+                adapter_id: 41,
+                loss: 2.5,
+            }],
+        };
+        assert!(!multi_lora_results_are_consistent(
+            &reference,
+            &different_loss
+        ));
+        assert!(!multi_lora_results_are_consistent(
+            &reference,
+            &EpResult::Train { loss: 2.0, step: 7 }
+        ));
+    }
+
+    #[test]
+    fn oversized_result_is_replaced_by_a_compact_error() {
+        let encoded = encode_result_for_slot(&EpResult::Error("x".repeat(SLOT_DATA))).unwrap();
+        assert!(encoded.len() <= SLOT_DATA);
+        let decoded: EpResult = serde_json::from_slice(&encoded).unwrap();
+        match decoded {
+            EpResult::Error(message) => assert!(message.contains("exceeded")),
+            other => panic!("unexpected oversized-result replacement: {other:?}"),
+        }
+    }
     use crate::command::TensorSlabRef;
 
     static TEST_CHANNEL_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());

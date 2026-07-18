@@ -21,7 +21,7 @@
 | Qwen3.6 MoE | 已实现 | grouped dispatch、EP smoke；完整模型仍需目标 GPU/权重运行 |
 | MTP | 已实现 | C++ hidden gradient 检查和集成测试；可通过环境变量关闭 |
 | fixed LoRA | 已实现 | attention/GDN/MLP/shared/routed expert 目标模块 |
-| dynamic multi-LoRA | 已实现子集 | selected v2 默认把不同 rank/target 的租户按 projection-local 最大 rank 补零，保留各租户 `alpha / logical_rank`，在一个 activation batch 内完成一次 forward/backward，再以一次 FinalizeOnly 调用独立更新各租户参数、m/v 和 optimizer clock；未命中的 target 使用零张量且不更新。`QWEN36_HETERO_PADDED_BATCH=0` 保留按 signature 分组和跨组回滚。checkpoint 可独立恢复 heterogeneous rank/alpha/targets；HTTP 仍未把并发请求自动合并成该 native batch，dynamic+MTP 暂拒绝 |
+| dynamic multi-LoRA | 已实现子集 | selected v2 默认把不同 rank/target 的租户按 projection-local 最大 rank 补零，保留各租户 `alpha / logical_rank`，在一个 activation batch 内完成一次 forward/backward，再以一次 FinalizeOnly 调用独立更新各租户参数、m/v 和 optimizer clock；未命中的 target 使用零张量且不更新。`QWEN36_HETERO_PADDED_BATCH=0` 保留按 signature 分组和跨组回滚。checkpoint 可独立恢复 heterogeneous rank/alpha/targets；HTTP 可在显式 `allow_aggregate_loss=true` 时有界合并兼容且 adapter ID 不相交的并发请求，响应保留 aggregate scalar 并按请求返回 `adapter_losses`；默认仍保持单请求 dispatch，dynamic+MTP 暂拒绝 |
 | microbatch accumulation | 已实现子集 | non-final microbatch 只 backward，final microbatch 才 optimizer；FP32 accumulator 存储/聚合，autograd leaf backward 仍为 BF16 |
 | replicated data parallel | 已实现 | logical-step 边界同步 replicated LoRA；EP expert 参数不走该 reduction |
 | expert parallel | 已实现子集 | 默认 routed-output all-reduce；gated variable-split A2A 已验证 fixed-LoRA 和 native dynamic-LoRA data sharding；GPU-only split planning、异步 overlap 和 DeepEP backend 未实现 |
@@ -29,7 +29,7 @@
 | pipeline parallel | 未实现于 Qwen native | 没有 stage 切分、microbatch scheduler 或 activation send/recv |
 | context parallel | 未实现于 Qwen native | 没有 ring attention、跨 rank KV/索引合并 |
 | distributed checkpoint | 已实现子集 | v5 记录 rank order、完整五维坐标、TP/EP 多轴 placement、fused gate/up segments 及 fixed/dynamic slot identity；任意 multi-rank 拓扑使用 rank 目录。compact receipt 将每 rank preflight 限制为 `O(world_size)` 小 metadata + `O(local state)`；CLI/server 共享 same-topology restore 和标准 PEFT merge。server save/load 使用全 rank prepare/validate/commit-or-abort，load 通过 no-sync shadow context 保证失败不改 live state；fresh destination 以 `RENAME_NOREPLACE` 原子可见。v3/v4 及旧 digest-v5 保持只读兼容；可覆盖 generation/LATEST、断电级 durability、跨 topology reshard 和 PP/CP 未实现 |
-| server tensor transport | 已实现 IPC 子集 | ABI22 parent/worker 共享 64-byte aligned binary slab 与 compact JSON descriptor；worker 不再反序列化三份 `Vec<i64>` 或在 Rust 热路径构造 `tch::Tensor`。tensor HTTP routes 在 decode 前只允许一个 in-flight 请求，忙时快速返回 `429`；普通控制面和 checkpoint transaction 使用 bounded FIFO 单消费者 scheduler（默认队列 32，可由 `RUSTRAIN_EP_DISPATCH_QUEUE_CAPACITY` 调整），每个 accepted job 在 `spawn_blocking` 上串行执行。HTTP ingress 仍为 JSON/base64，pinned staging、异步 H2D、raw binary endpoint 和多请求 GPU batching 未实现 |
+| server tensor transport | 已实现 IPC 子集 | ABI22 parent/worker 共享 64-byte aligned binary slab 与 compact JSON descriptor；worker 不再反序列化三份 `Vec<i64>` 或在 Rust 热路径构造 `tch::Tensor`。普通 tensor HTTP routes 在 decode 前只允许一个 in-flight 请求，忙时快速返回 `429`；`/train_multi` 允许有界并发 admission，并仅对显式接受 aggregate loss 的兼容请求执行短窗口 GPU coalescing。普通控制面和 checkpoint transaction 使用 bounded FIFO 单消费者 scheduler（默认队列 32，可由 `RUSTRAIN_EP_DISPATCH_QUEUE_CAPACITY` 调整），每个 accepted job 在 `spawn_blocking` 上串行执行。HTTP ingress 仍为 JSON/base64，pinned staging、异步 H2D 和 raw binary endpoint 未实现 |
 
 ## 与 Megatron-LM 的关键差距
 
@@ -86,10 +86,18 @@ session, sequence/source layout, LoRA rank, and adapter IDs are compatible and
 disjoint. The coalescer rebuilds source-major rows into one native heterogeneous
 batch, is bounded by request/adapter/payload limits, and seals its window before
 ordinary tensor, registry, or checkpoint operations. Responses expose
-`loss_scope=coalesced_batch` and the number of merged requests, since the native
-scalar loss is an aggregate and cannot be represented as each request's local
-loss. This is a scheduling/transport optimization, not PP/CP or DeepEP
-communication overlap.
+`loss_scope=coalesced_batch` and the number of merged requests. ABI25 requires
+the native report symbols and returns adapter-ordered losses: it sums token-loss
+numerators and supervised-token counts only over DP and source-sharded EP,
+without double-counting TP or replicated EP. The server slices that vector back
+to each request while retaining the explicitly labelled aggregate scalar for
+wire compatibility. Older native libraries are rejected at load time; within
+ABI25, report/legacy call mode is negotiated collectively before report-only
+reductions. IPC slab wire version 2 rejects old parent/worker layouts, and the
+coordinator verifies rank-consistent report values. The coalescer is capped at
+2048 adapters for the fixed 256 KiB result slot; an oversized serialized result
+is replaced by a compact error and still signals the waiting parent. This is a
+scheduling/transport optimization, not PP/CP or DeepEP communication overlap.
 
 GDN fused backward 现在可通过
 `QWEN36_GDN_STATE_CHECKPOINT_STRIDE` 保存固定 token 边界的 FP32 recurrent
@@ -99,6 +107,17 @@ state，并在每个 reverse chunk 开始时从精确 chunk-end state 重启。�
 反向重建误差累积，但 chunk 内仍通过 clamp 后的 decay 反除，不能宣称已
 解决单 token 极小 decay 的数值问题，也没有提供 FLA/sequence-parallel
 chunk kernel 或 packed `cu_seqlens`。
+
+在此 checkpoint 基础上，显式 `QWEN36_GDN_CHUNKWISE_BWD=1` 启用两阶段 AOT
+backward：轻量串行 pass 生成精确 `dS` chunk 边界，随后以
+`(batch-head, chunk)` CTA 并行 replay 完整参数梯度。H20 TP2
+`B=2,S=512,H=2048,L=3,stride=32` 的重复 matched p50 为
+`71.484 -> 53.458 ms`（`-25.2%`），TP2 stride-2 fixed/dynamic oracle 的
+`adam_error=0`。该 flag 和 checkpoint stride 已进入 distributed topology
+hash，非法 checkpoint 配置 fail-fast，checkpoint address 使用 `size_t`。
+该路径不能默认开启：single-rank p50
+`76.195 -> 81.843 ms`（回退 `7.4%`），TP2 `B=8` 仅改善约 `1.15%`，且
+该 workload 的 state checkpoint 约增加 `100 MiB/GPU`。
 
 当前粗粒度 C++ FFI、packed/grouped MoE、GDN head TP、vocabulary TP 和 activation checkpoint/offload 是有效优化，但 full attention 仍通过 ATen linear/SDPA，QKV 未融合，TP collective 同步执行。heterogeneous selected v2 的 padded 路径消除了按 signature 重复完整 trainer 和组间 GPU success fence；在 H20 TP2 x EP2 的四租户 synthetic workload 上，p50 从 grouped 的 `17.750 ms` 降到 `13.841 ms`，unique-token throughput 从 `57.69k/s` 提升到 `73.98k/s`，但 allocator peak 从约 `0.240 GiB` 增至 `0.354 GiB`，且 10 次样本的 p95 为 `20.152 ms`，未优于 grouped 的 `19.441 ms`。这证明 unified padded batch 对当前 native 路径有效；HTTP 仅在显式 `allow_aggregate_loss=true` 时合并兼容请求，且 aggregate loss 会被明确标记，不是 Megatron 对比。尚无 Megatron/Transformer Engine 级别的完整模型端到端数据：没有同一 GPU、序列长度、microbatch、精度和通信配置下的 tokens/s、显存、扩展效率对照，也没有 FP8/FP4 参数与 fused attention/DeepEP 的 Qwen 路径。
 
@@ -120,7 +139,7 @@ ABI15 的两层 GDN base-TP smoke 覆盖复合 QKV/conv head shard、Z/A/B/A_log
 
 ## 继续达到 Megatron 级别所需的最小工作包
 
-1. 在 server 入口增加有界的跨请求 batch coalescing，把并发租户映射到已经验证的 native heterogeneous padded batch，同时保持每租户独立 optimizer clock、超时语义和 admission memory 上限；为 padding rank inflation 增加容量模型和长尾 benchmark。
+1. 为已实现的 opt-in server batch coalescing 增加 HTTP response capability/version negotiation，使支持 per-adapter loss 的客户端可取消显式 aggregate opt-in；补齐 padding rank inflation 容量模型和长尾 benchmark。
 2. 实现 PP/CP runtime process groups、launcher、scheduler 和 checkpoint rank mapping；为 PP 实现 stage forward/backward 与 1F1B scheduler，为 CP 实现 ring attention/state exchange。
 3. 将 EP dispatch/combine 替换为 fused/异步路径，并测量通信与计算重叠。
 4. 为 dense/expert MLP 增加 fused gate/up FC1 和 MTP 支持；为 GDN 消除 chunk 内 decay 反除并增加 sequence/context parallel 与 packed `cu_seqlens`，为 full attention 融合 QKV/SDPA 并增加 sequence parallel。

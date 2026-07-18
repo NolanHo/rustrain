@@ -46,7 +46,9 @@ const HARD_MAX_MULTI_LORA_BATCH_WINDOW_US: u64 = 100_000;
 const DEFAULT_MULTI_LORA_BATCH_REQUESTS: usize = 16;
 const HARD_MAX_MULTI_LORA_BATCH_REQUESTS: usize = 4_096;
 const DEFAULT_MULTI_LORA_BATCH_ADAPTERS: usize = 64;
-const HARD_MAX_MULTI_LORA_BATCH_ADAPTERS: usize = 4_096;
+// AdapterLoss is JSON-encoded into a fixed 256 KiB IPC result slot. Keep a
+// conservative margin for worst-case i64/f64 strings and the result envelope.
+const HARD_MAX_MULTI_LORA_BATCH_ADAPTERS: usize = 2_048;
 
 #[derive(Clone, Copy)]
 struct MultiLoraBatchConfig {
@@ -132,6 +134,44 @@ impl MultiLoraDispatchRequest {
 struct MultiLoraDispatchOutcome {
     result: rustrain_ipc::EpResult,
     request_count: usize,
+}
+
+struct MultiLoraResponseTarget {
+    response: oneshot::Sender<MultiLoraDispatchOutcome>,
+    adapter_range: std::ops::Range<usize>,
+}
+
+fn project_multi_lora_result(
+    result: &rustrain_ipc::EpResult,
+    adapter_range: std::ops::Range<usize>,
+) -> rustrain_ipc::EpResult {
+    match result {
+        rustrain_ipc::EpResult::MultiLoraTrain {
+            loss,
+            step,
+            adapter_losses,
+        } if adapter_losses.is_empty() => rustrain_ipc::EpResult::Train {
+            loss: *loss,
+            step: *step,
+        },
+        rustrain_ipc::EpResult::MultiLoraTrain {
+            loss,
+            step,
+            adapter_losses,
+        } if adapter_range.end <= adapter_losses.len() => rustrain_ipc::EpResult::MultiLoraTrain {
+            loss: *loss,
+            step: *step,
+            adapter_losses: adapter_losses[adapter_range].to_vec(),
+        },
+        rustrain_ipc::EpResult::MultiLoraTrain { adapter_losses, .. } => {
+            rustrain_ipc::EpResult::Error(format!(
+                "native adapter loss count {} does not cover coalesced range {:?}",
+                adapter_losses.len(),
+                adapter_range
+            ))
+        }
+        _ => result.clone(),
+    }
 }
 
 struct MultiLoraWindow {
@@ -299,8 +339,8 @@ impl MultiLoraBatcher {
             Ok(result) => result,
             Err((error, responses)) => {
                 let request_count = responses.len();
-                for response in responses {
-                    let _ = response.send(MultiLoraDispatchOutcome {
+                for target in responses {
+                    let _ = target.response.send(MultiLoraDispatchOutcome {
                         result: rustrain_ipc::EpResult::Error(error.clone()),
                         request_count,
                     });
@@ -310,8 +350,8 @@ impl MultiLoraBatcher {
         };
         if payload.len() > self.config.max_payload_bytes {
             let request_count = responses.len();
-            for response in responses {
-                let _ = response.send(MultiLoraDispatchOutcome {
+            for target in responses {
+                let _ = target.response.send(MultiLoraDispatchOutcome {
                     result: rustrain_ipc::EpResult::Error(format!(
                         "coalesced tensor payload {} exceeds configured limit {}",
                         payload.len(),
@@ -333,9 +373,10 @@ impl MultiLoraBatcher {
             rustrain_ipc::EpResult::Error("EP coordinator is unavailable".to_string())
         };
         let request_count = responses.len();
-        for response in responses {
-            let _ = response.send(MultiLoraDispatchOutcome {
-                result: result.clone(),
+        for target in responses {
+            let projected = project_multi_lora_result(&result, target.adapter_range);
+            let _ = target.response.send(MultiLoraDispatchOutcome {
+                result: projected,
                 request_count,
             });
         }
@@ -580,6 +621,8 @@ struct TrainMultiLoraResponse {
     step: u64,
     loss_scope: &'static str,
     coalesced_requests: usize,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    adapter_losses: Vec<rustrain_ipc::command::AdapterLoss>,
 }
 
 /// Decode the little-endian wire representation without materializing host values.
@@ -694,17 +737,26 @@ fn normalized_multi_lora_payload_bytes(
 type MultiLoraWindowBuild = (
     rustrain_ipc::EpCommand,
     Vec<u8>,
-    Vec<oneshot::Sender<MultiLoraDispatchOutcome>>,
+    Vec<MultiLoraResponseTarget>,
 );
 
 fn build_multi_lora_window(
     window: MultiLoraWindow,
-) -> Result<MultiLoraWindowBuild, (String, Vec<oneshot::Sender<MultiLoraDispatchOutcome>>)> {
+) -> Result<MultiLoraWindowBuild, (String, Vec<MultiLoraResponseTarget>)> {
     let build_result = build_multi_lora_window_payload(&window);
+    let mut adapter_start = 0usize;
     let responses = window
         .requests
         .into_iter()
-        .map(|request| request.response)
+        .map(|request| {
+            let adapter_end = adapter_start + request.n_total;
+            let target = MultiLoraResponseTarget {
+                response: request.response,
+                adapter_range: adapter_start..adapter_end,
+            };
+            adapter_start = adapter_end;
+            target
+        })
         .collect::<Vec<_>>();
     match build_result {
         Ok((tensors, payload, adapter_ids, lora_rank)) => {
@@ -1521,6 +1573,21 @@ async fn ep_train_multi_lora(
         .await
         .map_err(|_| ep_dispatch_schedule_error(EpDispatchScheduleError::WorkerFailed))?;
     match outcome.result {
+        rustrain_ipc::EpResult::MultiLoraTrain {
+            loss,
+            step,
+            adapter_losses,
+        } => Ok(Json(TrainMultiLoraResponse {
+            loss,
+            step,
+            loss_scope: if outcome.request_count > 1 {
+                "coalesced_batch"
+            } else {
+                "request"
+            },
+            coalesced_requests: outcome.request_count,
+            adapter_losses,
+        })),
         rustrain_ipc::EpResult::Train { loss, step } => Ok(Json(TrainMultiLoraResponse {
             loss,
             step,
@@ -1530,6 +1597,7 @@ async fn ep_train_multi_lora(
                 "request"
             },
             coalesced_requests: outcome.request_count,
+            adapter_losses: Vec::new(),
         })),
         rustrain_ipc::EpResult::Error(e) => Err(err_resp(&e)),
         _ => Err(err_resp("unexpected result")),
@@ -1617,7 +1685,8 @@ mod tensor_http_shape_tests {
         EpDispatchScheduleError, MultiLoraBatchConfig, MultiLoraDispatchRequest, MultiLoraWindow,
         StatusCode, TensorHttp, build_multi_lora_window_payload, decode_int64_bytes,
         ep_dispatch_schedule_error, multi_lora_source_count, normalized_multi_lora_payload_bytes,
-        pack_tensor_slab, validate_multi_lora_http_shapes, validate_train_http_shapes,
+        pack_tensor_slab, project_multi_lora_result, validate_multi_lora_http_shapes,
+        validate_train_http_shapes,
     };
 
     fn tensor(shape: &[i64]) -> TensorHttp {
@@ -1770,6 +1839,60 @@ mod tensor_http_shape_tests {
         let (tensors, payload, adapter_ids, _) = build_multi_lora_window_payload(&window).unwrap();
         assert_eq!(adapter_ids, vec![101, 102, 103]);
         assert_eq!(slab_i64(&payload, tensors.input_ids), vec![7, 7, 8]);
+    }
+
+    #[test]
+    fn coalesced_result_projects_only_the_request_adapter_range() {
+        let result = rustrain_ipc::EpResult::MultiLoraTrain {
+            loss: 2.0,
+            step: 9,
+            adapter_losses: vec![
+                rustrain_ipc::command::AdapterLoss {
+                    adapter_id: 101,
+                    loss: 1.0,
+                },
+                rustrain_ipc::command::AdapterLoss {
+                    adapter_id: 102,
+                    loss: 2.0,
+                },
+                rustrain_ipc::command::AdapterLoss {
+                    adapter_id: 103,
+                    loss: 3.0,
+                },
+            ],
+        };
+        let projected = project_multi_lora_result(&result, 1..3);
+        match projected {
+            rustrain_ipc::EpResult::MultiLoraTrain {
+                loss,
+                step,
+                adapter_losses,
+            } => {
+                assert_eq!(loss, 2.0);
+                assert_eq!(step, 9);
+                assert_eq!(
+                    adapter_losses
+                        .iter()
+                        .map(|item| item.adapter_id)
+                        .collect::<Vec<_>>(),
+                    vec![102, 103]
+                );
+            }
+            other => panic!("unexpected projected result: {other:?}"),
+        }
+
+        let legacy = rustrain_ipc::EpResult::MultiLoraTrain {
+            loss: 4.0,
+            step: 10,
+            adapter_losses: Vec::new(),
+        };
+        assert!(matches!(
+            project_multi_lora_result(&legacy, 0..1),
+            rustrain_ipc::EpResult::Train {
+                loss: 4.0,
+                step: 10
+            }
+        ));
     }
 
     #[test]

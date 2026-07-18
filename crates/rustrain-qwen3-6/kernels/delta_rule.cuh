@@ -126,7 +126,7 @@ __global__ void gated_delta_rule_kernel(
         : 0;
     if (state_checkpoints != nullptr) {
         float* checkpoint = state_checkpoints +
-            bh * checkpoint_count * DR_D_K * DR_D_V;
+            static_cast<size_t>(bh) * checkpoint_count * DR_D_K * DR_D_V;
         #pragma unroll
         for (int i = tid; i < DR_D_K * DR_D_V; i += DR_THREADS)
             checkpoint[i] = state_s[i];
@@ -192,7 +192,7 @@ __global__ void gated_delta_rule_kernel(
             (t + 1) % checkpoint_stride == 0) {
             const int checkpoint_index = (t + 1) / checkpoint_stride;
             float* checkpoint = state_checkpoints +
-                (bh * checkpoint_count + checkpoint_index) *
+                (static_cast<size_t>(bh) * checkpoint_count + checkpoint_index) *
                 DR_D_K * DR_D_V;
             #pragma unroll
             for (int i = tid; i < DR_D_K * DR_D_V; i += DR_THREADS)
@@ -206,9 +206,9 @@ __global__ void gated_delta_rule_kernel(
         const int first_unwritten = completed + 1;
         const int num_chunks = checkpoint_count - 1;
         for (int checkpoint_index = first_unwritten;
-             checkpoint_index <= num_chunks; ++checkpoint_index) {
+            checkpoint_index <= num_chunks; ++checkpoint_index) {
             float* checkpoint = state_checkpoints +
-                (bh * checkpoint_count + checkpoint_index) *
+                (static_cast<size_t>(bh) * checkpoint_count + checkpoint_index) *
                 DR_D_K * DR_D_V;
             for (int i = tid; i < DR_D_K * DR_D_V; i += DR_THREADS)
                 checkpoint[i] = state_s[i];
@@ -516,7 +516,8 @@ __global__ void gated_delta_rule_backward_kernel_correct(
             ? min(S, (chunk + 1) * checkpoint_stride) : S;
         if (state_checkpoints != nullptr) {
             const float* checkpoint = state_checkpoints +
-                (bh * checkpoint_count + chunk + 1) * DR_D_K * DR_D_V;
+                (static_cast<size_t>(bh) * checkpoint_count + chunk + 1) *
+                DR_D_K * DR_D_V;
             for (int i = tid; i < DR_D_K * DR_D_V; i += DR_THREADS)
                 state_s[i] = checkpoint[i];
             __syncthreads();
@@ -625,6 +626,243 @@ __global__ void gated_delta_rule_backward_kernel_correct(
     }
 }
 
+// Chunkwise backward splits the recurrent dependency from the expensive
+// parameter-gradient work. The boundary pass computes only dS at exact state
+// checkpoint boundaries. Independent chunk CTAs then replay the full backward
+// from their state/dS end boundaries, increasing parallelism when BH alone does
+// not fill the GPU.
+__global__ void gated_delta_rule_backward_boundaries_kernel(
+    const float* __restrict__ q,
+    const float* __restrict__ k,
+    const float* __restrict__ g_exp,
+    const float* __restrict__ beta,
+    const float* __restrict__ grad_out,
+    float* __restrict__ grad_boundaries,
+    const int32_t* __restrict__ lengths,
+    int heads_per_batch,
+    int S,
+    int checkpoint_stride,
+    int checkpoint_count
+) {
+    const int bh = blockIdx.x;
+    const int tid = threadIdx.x;
+    constexpr int state_elements = DR_D_K * DR_D_V;
+
+    extern __shared__ float grad_s[];
+    for (int i = tid; i < state_elements; i += DR_THREADS)
+        grad_s[i] = 0.0f;
+
+    const float* q_bh = q + bh * S * DR_D_K;
+    const float* k_bh = k + bh * S * DR_D_K;
+    const float* g_bh = g_exp + bh * S;
+    const float* beta_bh = beta + bh * S;
+    const float* go_bh = grad_out + bh * S * DR_D_V;
+    const int valid_len = lengths == nullptr ? S :
+        max(0, min(S, lengths[bh / heads_per_batch]));
+    const int num_chunks = checkpoint_count - 1;
+
+    float* final_boundary = grad_boundaries +
+        (static_cast<size_t>(bh) * checkpoint_count + num_chunks) *
+            state_elements;
+    for (int i = tid; i < state_elements; i += DR_THREADS)
+        final_boundary[i] = 0.0f;
+
+    // Each thread exclusively owns one value column of dS, so this recurrence
+    // needs no inter-thread synchronization inside the token loop.
+    for (int chunk = num_chunks - 1; chunk >= 0; --chunk) {
+        const int chunk_start = chunk * checkpoint_stride;
+        const int reverse_end = min(valid_len, (chunk + 1) * checkpoint_stride);
+        for (int t = reverse_end - 1; t >= chunk_start; --t) {
+            const float* q_t = q_bh + t * DR_D_K;
+            const float* k_t = k_bh + t * DR_D_K;
+            const float go_t = go_bh[t * DR_D_V + tid];
+            float gdelta = 0.0f;
+            for (int dk = 0; dk < DR_D_K; ++dk) {
+                const int idx = dk * DR_D_V + tid;
+                grad_s[idx] += q_t[dk] * go_t;
+                gdelta += grad_s[idx] * k_t[dk];
+            }
+            const float h = gdelta * beta_bh[t];
+            const float g_t = g_bh[t];
+            for (int dk = 0; dk < DR_D_K; ++dk) {
+                const int idx = dk * DR_D_V + tid;
+                grad_s[idx] = (grad_s[idx] - k_t[dk] * h) * g_t;
+            }
+        }
+
+        float* boundary = grad_boundaries +
+            (static_cast<size_t>(bh) * checkpoint_count + chunk) *
+                state_elements;
+        for (int i = tid; i < state_elements; i += DR_THREADS)
+            boundary[i] = grad_s[i];
+    }
+}
+
+__global__ void gated_delta_rule_backward_chunks_kernel(
+    const float* __restrict__ q,
+    const float* __restrict__ k,
+    const float* __restrict__ v,
+    const float* __restrict__ g_exp,
+    const float* __restrict__ beta,
+    const float* __restrict__ delta_buf,
+    const float* __restrict__ state_checkpoints,
+    const float* __restrict__ grad_boundaries,
+    int checkpoint_stride,
+    int checkpoint_count,
+    const float* __restrict__ grad_out,
+    float* __restrict__ grad_q,
+    float* __restrict__ grad_k,
+    float* __restrict__ grad_v,
+    float* __restrict__ grad_g,
+    float* __restrict__ grad_beta,
+    const int32_t* __restrict__ lengths,
+    int heads_per_batch,
+    int S
+) {
+    const int num_chunks = checkpoint_count - 1;
+    const int bh = blockIdx.x / num_chunks;
+    const int chunk = blockIdx.x - bh * num_chunks;
+    const int tid = threadIdx.x;
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
+    constexpr int state_elements = DR_D_K * DR_D_V;
+
+    extern __shared__ float smem[];
+    float* state_s = smem;
+    float* grad_s = state_s + state_elements;
+    float* reduce_q = grad_s + state_elements;
+    float* reduce_k = reduce_q + 4 * DR_D_K;
+    float* reduce_beta = reduce_k + 4 * DR_D_K;
+    float* reduce_g = reduce_beta + 4;
+
+    const float* state_boundary = state_checkpoints +
+        (static_cast<size_t>(bh) * checkpoint_count + chunk + 1) *
+            state_elements;
+    const float* grad_boundary = grad_boundaries +
+        (static_cast<size_t>(bh) * checkpoint_count + chunk + 1) *
+            state_elements;
+    for (int i = tid; i < state_elements; i += DR_THREADS) {
+        state_s[i] = state_boundary[i];
+        grad_s[i] = grad_boundary[i];
+    }
+    __syncthreads();
+
+    const float* q_bh = q + bh * S * DR_D_K;
+    const float* k_bh = k + bh * S * DR_D_K;
+    const float* v_bh = v + bh * S * DR_D_V;
+    const float* g_bh = g_exp + bh * S;
+    const float* beta_bh = beta + bh * S;
+    const float* go_bh = grad_out + bh * S * DR_D_V;
+    float* gq_bh = grad_q + bh * S * DR_D_K;
+    float* gk_bh = grad_k + bh * S * DR_D_K;
+    float* gv_bh = grad_v + bh * S * DR_D_V;
+    float* gg_bh = grad_g + bh * S;
+    float* gb_bh = grad_beta + bh * S;
+    const int valid_len = lengths == nullptr ? S :
+        max(0, min(S, lengths[bh / heads_per_batch]));
+    const int chunk_start = chunk * checkpoint_stride;
+    const int chunk_end = min(S, (chunk + 1) * checkpoint_stride);
+    const int reverse_end = min(valid_len, chunk_end);
+
+    for (int t = max(valid_len, chunk_start); t < chunk_end; ++t) {
+        if (tid < DR_D_K) {
+            gq_bh[t * DR_D_K + tid] = 0.0f;
+            gk_bh[t * DR_D_K + tid] = 0.0f;
+        }
+        gv_bh[t * DR_D_V + tid] = 0.0f;
+        if (tid == 0) {
+            gg_bh[t] = 0.0f;
+            gb_bh[t] = 0.0f;
+        }
+    }
+    __syncthreads();
+
+    for (int t = reverse_end - 1; t >= chunk_start; --t) {
+        const float* q_t = q_bh + t * DR_D_K;
+        const float* k_t = k_bh + t * DR_D_K;
+        const float g_t = g_bh[t];
+        const float beta_t = beta_bh[t];
+        const float go_t = go_bh[t * DR_D_V + tid];
+        const float delta_t =
+            delta_buf[bh * S * DR_D_V + t * DR_D_V + tid];
+
+        for (int dk = 0; dk < DR_D_K; ++dk) {
+            const int idx = dk * DR_D_V + tid;
+            const float s_after = state_s[idx];
+            grad_s[idx] += q_t[dk] * go_t;
+            state_s[idx] = s_after - k_t[dk] * delta_t;
+            float q_part = s_after * go_t;
+            for (int off = 16; off > 0; off >>= 1)
+                q_part += __shfl_down_sync(0xffffffff, q_part, off);
+            if (lane == 0) reduce_q[warp * DR_D_K + dk] = q_part;
+        }
+        __syncthreads();
+        if (tid < DR_D_K) {
+            gq_bh[t * DR_D_K + tid] =
+                reduce_q[tid] + reduce_q[DR_D_K + tid] +
+                reduce_q[2 * DR_D_K + tid] +
+                reduce_q[3 * DR_D_K + tid];
+        }
+
+        float gdelta = 0.0f;
+        float kv_mem = 0.0f;
+        for (int dk = 0; dk < DR_D_K; ++dk) {
+            const int idx = dk * DR_D_V + tid;
+            gdelta += grad_s[idx] * k_t[dk];
+            kv_mem += state_s[idx] * k_t[dk];
+        }
+        const float h = gdelta * beta_t;
+        gv_bh[t * DR_D_V + tid] = h;
+        const float beta_part =
+            gdelta * (v_bh[t * DR_D_V + tid] - kv_mem);
+        const float safe_g = fmaxf(g_t, 1.0e-8f);
+        float g_part = 0.0f;
+
+        for (int dk = 0; dk < DR_D_K; ++dk) {
+            const int idx = dk * DR_D_V + tid;
+            const float r = state_s[idx];
+            const float s_prev = r / safe_g;
+            const float grad_r = grad_s[idx] - k_t[dk] * h;
+            const float k_part = grad_s[idx] * delta_t - r * h;
+            g_part += grad_r * s_prev;
+            float reduced_k = k_part;
+            for (int off = 16; off > 0; off >>= 1)
+                reduced_k += __shfl_down_sync(
+                    0xffffffff, reduced_k, off);
+            if (lane == 0)
+                reduce_k[warp * DR_D_K + dk] = reduced_k;
+            grad_s[idx] = grad_r * g_t;
+            state_s[idx] = s_prev;
+        }
+
+        float reduced_beta = beta_part;
+        float reduced_g = g_part;
+        for (int off = 16; off > 0; off >>= 1) {
+            reduced_beta += __shfl_down_sync(
+                0xffffffff, reduced_beta, off);
+            reduced_g += __shfl_down_sync(0xffffffff, reduced_g, off);
+        }
+        if (lane == 0) {
+            reduce_beta[warp] = reduced_beta;
+            reduce_g[warp] = reduced_g;
+        }
+        __syncthreads();
+        if (tid < DR_D_K) {
+            gk_bh[t * DR_D_K + tid] =
+                reduce_k[tid] + reduce_k[DR_D_K + tid] +
+                reduce_k[2 * DR_D_K + tid] +
+                reduce_k[3 * DR_D_K + tid];
+        }
+        if (tid == 0) {
+            gb_bh[t] = reduce_beta[0] + reduce_beta[1] +
+                       reduce_beta[2] + reduce_beta[3];
+            gg_bh[t] = reduce_g[0] + reduce_g[1] +
+                       reduce_g[2] + reduce_g[3];
+        }
+        __syncthreads();
+    }
+}
+
 // ──────────────────────────────────────────────────────────────────────
 // Host launcher (backward)
 // ──────────────────────────────────────────────────────────────────────
@@ -645,6 +883,88 @@ inline int launch_gated_delta_rule_backward(
     if (key_dim != DR_D_K || val_dim != DR_D_V || heads_per_batch <= 0) {
         fprintf(stderr, "[delta_rule_backward] ERROR: D_K=%d or D_V=%d mismatch\n", key_dim, val_dim);
         return -1;
+    }
+
+    const char* chunkwise_env = std::getenv("QWEN36_GDN_CHUNKWISE_BWD");
+    const bool chunkwise = chunkwise_env && chunkwise_env[0] != '\0' &&
+        std::strcmp(chunkwise_env, "0") != 0 &&
+        std::strcmp(chunkwise_env, "false") != 0;
+    if (chunkwise && (state_checkpoints == nullptr || checkpoint_stride <= 0)) {
+        fprintf(stderr,
+                "[delta_rule_backward] chunkwise backward requires a state "
+                "checkpoint stride smaller than the sequence length\n");
+        return static_cast<int>(cudaErrorInvalidValue);
+    }
+    if (chunkwise) {
+        const int checkpoint_count =
+            (seq_len + checkpoint_stride - 1) / checkpoint_stride + 1;
+        const int num_chunks = checkpoint_count - 1;
+        constexpr size_t state_elements = DR_D_K * DR_D_V;
+        if (static_cast<size_t>(BH) >
+            std::numeric_limits<size_t>::max() /
+                static_cast<size_t>(checkpoint_count) /
+                state_elements / sizeof(float)) {
+            fprintf(stderr,
+                    "[delta_rule_backward] chunk boundary allocation overflow\n");
+            return static_cast<int>(cudaErrorInvalidValue);
+        }
+        const size_t boundary_bytes = static_cast<size_t>(BH) *
+            checkpoint_count * state_elements * sizeof(float);
+        float* grad_boundaries = nullptr;
+        auto alloc_status = cudaMallocAsync(
+            reinterpret_cast<void**>(&grad_boundaries), boundary_bytes, stream);
+        if (alloc_status != cudaSuccess) {
+            fprintf(stderr,
+                    "[delta_rule_backward] chunk boundary allocation failed: %s\n",
+                    cudaGetErrorString(alloc_status));
+            return static_cast<int>(alloc_status);
+        }
+
+        const size_t boundary_smem = state_elements * sizeof(float);
+        auto attr_status = cudaFuncSetAttribute(
+            gated_delta_rule_backward_boundaries_kernel,
+            cudaFuncAttributeMaxDynamicSharedMemorySize, boundary_smem);
+        if (attr_status != cudaSuccess) {
+            cudaFreeAsync(grad_boundaries, stream);
+            fprintf(stderr,
+                    "[delta_rule_backward] boundary shared-memory attribute failed: %s\n",
+                    cudaGetErrorString(attr_status));
+            return static_cast<int>(attr_status);
+        }
+        gated_delta_rule_backward_boundaries_kernel
+            <<<dim3(BH), dim3(DR_THREADS), boundary_smem, stream>>>(
+                q, k, g_exp, beta, grad_out, grad_boundaries,
+                lengths, heads_per_batch, seq_len, checkpoint_stride,
+                checkpoint_count);
+        auto launch_status = cudaGetLastError();
+        if (launch_status != cudaSuccess) {
+            cudaFreeAsync(grad_boundaries, stream);
+            return static_cast<int>(launch_status);
+        }
+
+        const size_t chunk_smem =
+            (2 * state_elements + 8 * DR_D_K + 8) * sizeof(float);
+        attr_status = cudaFuncSetAttribute(
+            gated_delta_rule_backward_chunks_kernel,
+            cudaFuncAttributeMaxDynamicSharedMemorySize, chunk_smem);
+        if (attr_status != cudaSuccess) {
+            cudaFreeAsync(grad_boundaries, stream);
+            fprintf(stderr,
+                    "[delta_rule_backward] chunk shared-memory attribute failed: %s\n",
+                    cudaGetErrorString(attr_status));
+            return static_cast<int>(attr_status);
+        }
+        gated_delta_rule_backward_chunks_kernel
+            <<<dim3(BH * num_chunks), dim3(DR_THREADS), chunk_smem, stream>>>(
+                q, k, v, g_exp, beta, delta_buf, state_checkpoints,
+                grad_boundaries, checkpoint_stride, checkpoint_count, grad_out,
+                grad_q, grad_k, grad_v, grad_g, grad_beta,
+                lengths, heads_per_batch, seq_len);
+        launch_status = cudaGetLastError();
+        const auto free_status = cudaFreeAsync(grad_boundaries, stream);
+        if (launch_status != cudaSuccess)
+            return static_cast<int>(launch_status);
+        return free_status == cudaSuccess ? 0 : static_cast<int>(free_status);
     }
 
     const char* fusion_env = std::getenv("QWEN36_GDN_RECURRENT_FUSION");

@@ -83,11 +83,14 @@ extern "C" double qwen36_train_multi_lora_selected(
     void*, void*, void*, void*, const int64_t*, int32_t, int32_t);
 extern "C" double qwen36_train_multi_lora_selected_v2(
     void*, void*, void*, void*, const int64_t*, int32_t);
+extern "C" int32_t qwen36_train_multi_lora_selected_v3(
+    void*, void*, void*, void*, const int64_t*, int32_t,
+    double*, double*, int32_t);
 extern "C" void qwen36_free_training_context(void*);
 
 namespace {
 
-constexpr int64_t kAbiVersion = 24;
+constexpr int64_t kAbiVersion = 25;
 constexpr int32_t kBaseTpAttention = 1 << 0;
 constexpr int32_t kDataParallel = 1 << 1;
 constexpr int32_t kVocabParallel = 1 << 2;
@@ -1455,10 +1458,43 @@ int main() {
         qwen36_get_adapter_step_count(distributed, tenant_two);
     const int64_t heterogeneous_train_batches_before =
         qwen36_get_dynamic_train_batch_count(distributed);
-    const double heterogeneous_loss = qwen36_train_multi_lora_selected_v2(
+
+    double mixed_aggregate = -1.0;
+    double mixed_adapter_losses[3] = {-1.0, -1.0, -1.0};
+    if (rank == 0) {
+        assert(qwen36_train_multi_lora_selected_v3(
+            distributed, &heterogeneous_input, &heterogeneous_targets,
+            &heterogeneous_attention, heterogeneous_batch_ids, 3,
+            &mixed_aggregate, mixed_adapter_losses, 3) < 0);
+        assert(mixed_aggregate == -1.0);
+        for (const double adapter_loss : mixed_adapter_losses)
+            assert(adapter_loss == -1.0);
+    } else {
+        assert(qwen36_train_multi_lora_selected_v2(
+            distributed, &heterogeneous_input, &heterogeneous_targets,
+            &heterogeneous_attention, heterogeneous_batch_ids, 3) < 0.0);
+    }
+    assert(qwen36_get_adapter_step_count(distributed, tenant_one) ==
+        tenant_one_step_before);
+    assert(qwen36_get_adapter_step_count(distributed, heterogeneous_tenant) == 0);
+    assert(qwen36_get_adapter_step_count(distributed, tenant_two) ==
+        empty_tenant_step_before);
+
+    double heterogeneous_loss = -1.0;
+    double heterogeneous_adapter_losses[3] = {-1.0, -1.0, -1.0};
+    assert(qwen36_train_multi_lora_selected_v3(
         distributed, &heterogeneous_input, &heterogeneous_targets,
-        &heterogeneous_attention, heterogeneous_batch_ids, 3);
+        &heterogeneous_attention, heterogeneous_batch_ids, 3,
+        &heterogeneous_loss, heterogeneous_adapter_losses, 3) == 0);
     assert(heterogeneous_loss > 0.0 && std::isfinite(heterogeneous_loss));
+    for (const double adapter_loss : heterogeneous_adapter_losses)
+        assert(adapter_loss >= 0.0 && std::isfinite(adapter_loss));
+    const double reported_mean =
+        (heterogeneous_adapter_losses[0] +
+         heterogeneous_adapter_losses[1] +
+         heterogeneous_adapter_losses[2]) / 3.0;
+    assert(std::abs(heterogeneous_loss - reported_mean) < 1e-8);
+    assert(heterogeneous_adapter_losses[2] == 0.0);
     assert(qwen36_get_adapter_step_count(distributed, tenant_one) ==
         tenant_one_step_before + 1);
     assert(qwen36_get_adapter_step_count(distributed, heterogeneous_tenant) == 1);

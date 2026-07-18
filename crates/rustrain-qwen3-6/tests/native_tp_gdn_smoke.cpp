@@ -53,16 +53,18 @@ extern "C" double qwen36_eval_step(void*, void*, void*, void*);
 extern "C" double qwen36_train_step(void*, void*, void*, void*);
 extern "C" double qwen36_train_micro_step(
     void*, void*, void*, void*, double, int32_t);
-extern "C" double qwen36_train_multi_lora_selected(
-    void*, void*, void*, void*, const int64_t*, int32_t, int32_t);
+extern "C" int32_t qwen36_train_multi_lora_selected_v3(
+    void*, void*, void*, void*, const int64_t*, int32_t,
+    double*, double*, int32_t);
 extern "C" void qwen36_set_checkpoint(void*, int32_t, int64_t);
 extern "C" int64_t qwen36_get_lora_batch_projection_build_count(void*);
 extern "C" int64_t qwen36_get_lora_batch_scaling_upload_count(void*);
+extern "C" int64_t qwen36_get_adapter_step_count(void*, int64_t);
 extern "C" void qwen36_free_training_context(void*);
 
 namespace {
 
-constexpr int64_t kAbiVersion = 24;
+constexpr int64_t kAbiVersion = 25;
 constexpr int32_t kBaseTpAttention = 1 << 0;
 constexpr int32_t kVocabParallel = 1 << 2;
 constexpr int64_t kLayers = 2;
@@ -618,13 +620,42 @@ static void check_dynamic_path(
     set_dynamic_lora(contexts.distributed, distributed_id, fixtures, true);
     set_dynamic_lora(contexts.reference, reference_id, fixtures, false);
 
-    const double distributed_loss = qwen36_train_multi_lora_selected(
+    const char* chunkwise_value = std::getenv("QWEN36_GDN_CHUNKWISE_BWD");
+    if (chunkwise_value && chunkwise_value[0] != '\0' &&
+        std::strcmp(chunkwise_value, "0") != 0 &&
+        std::strcmp(chunkwise_value, "false") != 0) {
+        const std::string saved_chunkwise_value(chunkwise_value);
+        if (rank == 0) unsetenv("QWEN36_GDN_CHUNKWISE_BWD");
+        double mismatched_loss = -1.0;
+        double mismatched_adapter_loss = -1.0;
+        assert(qwen36_train_multi_lora_selected_v3(
+            contexts.distributed, &batch.input_ids, &batch.target_mask,
+            &batch.attention_mask, &distributed_id, 1, &mismatched_loss,
+            &mismatched_adapter_loss, 1) < 0);
+        assert(mismatched_loss == -1.0 && mismatched_adapter_loss == -1.0);
+        assert(qwen36_get_adapter_step_count(
+            contexts.distributed, distributed_id) == 0);
+        if (rank == 0) {
+            setenv("QWEN36_GDN_CHUNKWISE_BWD",
+                saved_chunkwise_value.c_str(), 1);
+        }
+    }
+
+    double distributed_loss = -1.0;
+    double distributed_adapter_loss = -1.0;
+    double reference_loss = -1.0;
+    double reference_adapter_loss = -1.0;
+    assert(qwen36_train_multi_lora_selected_v3(
         contexts.distributed, &batch.input_ids, &batch.target_mask,
-        &batch.attention_mask, &distributed_id, 1, kLoraRank);
-    const double reference_loss = qwen36_train_multi_lora_selected(
+        &batch.attention_mask, &distributed_id, 1, &distributed_loss,
+        &distributed_adapter_loss, 1) == 0);
+    assert(qwen36_train_multi_lora_selected_v3(
         contexts.reference, &batch.input_ids, &batch.target_mask,
-        &batch.attention_mask, &reference_id, 1, kLoraRank);
+        &batch.attention_mask, &reference_id, 1, &reference_loss,
+        &reference_adapter_loss, 1) == 0);
     assert(std::isfinite(distributed_loss) && std::isfinite(reference_loss));
+    assert(std::abs(distributed_loss - distributed_adapter_loss) < 1e-8);
+    assert(std::abs(reference_loss - reference_adapter_loss) < 1e-8);
 
     ErrorSummary errors;
     for (auto& fixture : fixtures) {

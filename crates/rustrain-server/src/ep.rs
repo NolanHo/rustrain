@@ -749,9 +749,7 @@ fn execute_command(session: &mut Qwen36Session, worker: &EpWorker, cmd: &EpComma
                         let mut rollback_errors = Vec::new();
                         for id in ids.into_iter().rev() {
                             if let Err(rollback_error) = session.remove_lora(id) {
-                                rollback_errors.push(format!(
-                                    "adapter {id}: {rollback_error}"
-                                ));
+                                rollback_errors.push(format!("adapter {id}: {rollback_error}"));
                             }
                         }
                         if rollback_errors.is_empty() {
@@ -879,18 +877,46 @@ fn execute_command(session: &mut Qwen36Session, worker: &EpWorker, cmd: &EpComma
                 Ok(elements) => elements,
                 Err(error) => return EpResult::Error(error),
             };
-            match session.train_multi_lora_host_i64(
-                &input_ids[elements.clone()],
-                &target_mask[elements.clone()],
-                &attention_mask[elements],
-                rows.len(),
-                *seq_len,
-                *n_total,
-                *lora_rank,
-                adapter_ids,
-            ) {
-                Ok(TrainOutput { loss, step }) => EpResult::Train { loss, step },
-                Err(e) => EpResult::Error(e.to_string()),
+            if adapter_ids.is_empty() {
+                match session.train_multi_lora_host_i64(
+                    &input_ids[elements.clone()],
+                    &target_mask[elements.clone()],
+                    &attention_mask[elements],
+                    rows.len(),
+                    *seq_len,
+                    *n_total,
+                    *lora_rank,
+                    adapter_ids,
+                ) {
+                    Ok(TrainOutput { loss, step }) => EpResult::Train { loss, step },
+                    Err(error) => EpResult::Error(error.to_string()),
+                }
+            } else {
+                match session.train_multi_lora_host_i64_report(
+                    &input_ids[elements.clone()],
+                    &target_mask[elements.clone()],
+                    &attention_mask[elements],
+                    rows.len(),
+                    *seq_len,
+                    *n_total,
+                    *lora_rank,
+                    adapter_ids,
+                ) {
+                    Ok(output) => EpResult::MultiLoraTrain {
+                        loss: output.loss,
+                        step: output.step,
+                        adapter_losses: adapter_ids
+                            .iter()
+                            .copied()
+                            .zip(output.adapter_losses)
+                            .map(|(adapter_id, loss)| rustrain_ipc::command::AdapterLoss {
+                                adapter_id,
+                                loss,
+                            })
+                            .collect(),
+                    },
+                    Err(error) => EpResult::Error(error.to_string()),
+                }
             }
         }
         EpCommand::TrainMultiLoraSlab {
@@ -918,18 +944,46 @@ fn execute_command(session: &mut Qwen36Session, worker: &EpWorker, cmd: &EpComma
                     Ok(elements) => elements,
                     Err(error) => return EpResult::Error(error),
                 };
-            match session.train_multi_lora_host_i64(
-                &input_ids[elements.clone()],
-                &target_mask[elements.clone()],
-                &attention_mask[elements],
-                rows.len(),
-                tensors.seq_len,
-                *n_total,
-                *lora_rank,
-                adapter_ids,
-            ) {
-                Ok(TrainOutput { loss, step }) => EpResult::Train { loss, step },
-                Err(error) => EpResult::Error(error.to_string()),
+            if adapter_ids.is_empty() {
+                match session.train_multi_lora_host_i64(
+                    &input_ids[elements.clone()],
+                    &target_mask[elements.clone()],
+                    &attention_mask[elements],
+                    rows.len(),
+                    tensors.seq_len,
+                    *n_total,
+                    *lora_rank,
+                    adapter_ids,
+                ) {
+                    Ok(TrainOutput { loss, step }) => EpResult::Train { loss, step },
+                    Err(error) => EpResult::Error(error.to_string()),
+                }
+            } else {
+                match session.train_multi_lora_host_i64_report(
+                    &input_ids[elements.clone()],
+                    &target_mask[elements.clone()],
+                    &attention_mask[elements],
+                    rows.len(),
+                    tensors.seq_len,
+                    *n_total,
+                    *lora_rank,
+                    adapter_ids,
+                ) {
+                    Ok(output) => EpResult::MultiLoraTrain {
+                        loss: output.loss,
+                        step: output.step,
+                        adapter_losses: adapter_ids
+                            .iter()
+                            .copied()
+                            .zip(output.adapter_losses)
+                            .map(|(adapter_id, loss)| rustrain_ipc::command::AdapterLoss {
+                                adapter_id,
+                                loss,
+                            })
+                            .collect(),
+                    },
+                    Err(error) => EpResult::Error(error.to_string()),
+                }
             }
         }
         EpCommand::EvalStep {

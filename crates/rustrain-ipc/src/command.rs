@@ -220,6 +220,12 @@ const fn default_batch_size() -> usize {
     1
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AdapterLoss {
+    pub adapter_id: i64,
+    pub loss: f64,
+}
+
 /// Results that workers return to the HTTP server.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum EpResult {
@@ -228,6 +234,11 @@ pub enum EpResult {
     Train {
         loss: f64,
         step: u64,
+    },
+    MultiLoraTrain {
+        loss: f64,
+        step: u64,
+        adapter_losses: Vec<AdapterLoss>,
     },
     Checkpoint {
         step: u64,
@@ -257,7 +268,7 @@ impl EpResult {
 
 #[cfg(test)]
 mod tests {
-    use super::{EpCommand, EpResult, TensorSlabRef, TensorSpan};
+    use super::{AdapterLoss, EpCommand, EpResult, TensorSlabRef, TensorSpan};
 
     #[test]
     fn train_step_serde_preserves_batch_and_sequence_shape() {
@@ -301,6 +312,39 @@ mod tests {
         match decoded {
             EpCommand::TrainStep { batch_size, .. } => assert_eq!(batch_size, 1),
             other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn multi_lora_result_serde_preserves_adapter_loss_order() {
+        let result = EpResult::MultiLoraTrain {
+            loss: 2.0,
+            step: 7,
+            adapter_losses: vec![
+                AdapterLoss {
+                    adapter_id: 41,
+                    loss: 1.5,
+                },
+                AdapterLoss {
+                    adapter_id: 17,
+                    loss: 2.5,
+                },
+            ],
+        };
+        let encoded = serde_json::to_vec(&result).unwrap();
+        let decoded: EpResult = serde_json::from_slice(&encoded).unwrap();
+        match decoded {
+            EpResult::MultiLoraTrain {
+                loss,
+                step,
+                adapter_losses,
+            } => {
+                assert_eq!(loss, 2.0);
+                assert_eq!(step, 7);
+                assert_eq!(adapter_losses[0].adapter_id, 41);
+                assert_eq!(adapter_losses[1].adapter_id, 17);
+            }
+            other => panic!("unexpected result: {other:?}"),
         }
     }
 

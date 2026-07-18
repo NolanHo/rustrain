@@ -45,6 +45,17 @@ type FnTrainMultiLoraSelectedV2 = unsafe extern "C" fn(
     *const i64,
     i32,
 ) -> f64;
+type FnTrainMultiLoraSelectedV3 = unsafe extern "C" fn(
+    *mut c_void,
+    *mut c_void,
+    *mut c_void,
+    *mut c_void,
+    *const i64,
+    i32,
+    *mut f64,
+    *mut f64,
+    i32,
+) -> i32;
 type FnEvalStep = unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void, *mut c_void) -> f64;
 type FnHostBatchStep =
     unsafe extern "C" fn(*mut c_void, *const i64, *const i64, *const i64, i64, i64) -> f64;
@@ -60,6 +71,27 @@ type FnHostMultiLoraStep = unsafe extern "C" fn(
     *const i64,
     i32,
 ) -> f64;
+type FnHostMultiLoraReport = unsafe extern "C" fn(
+    *mut c_void,
+    *const i64,
+    *const i64,
+    *const i64,
+    i64,
+    i64,
+    i32,
+    i32,
+    *const i64,
+    i32,
+    *mut f64,
+    *mut f64,
+    i32,
+) -> i32;
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct MultiLoraLossReport {
+    pub aggregate_loss: f64,
+    pub adapter_losses: Vec<f64>,
+}
 type FnGetLoraCount = unsafe extern "C" fn(*mut c_void) -> i64;
 type FnGetLoraA = unsafe extern "C" fn(*mut c_void, i64) -> *mut c_void;
 type FnGetLoraB = unsafe extern "C" fn(*mut c_void, i64) -> *mut c_void;
@@ -139,9 +171,11 @@ struct KernelHandles {
     train_step: FnTrainStep,
     train_micro_step: FnTrainMicroStep,
     train_multi_lora_selected_v2: FnTrainMultiLoraSelectedV2,
+    train_multi_lora_selected_v3: FnTrainMultiLoraSelectedV3,
     eval_step: FnEvalStep,
     train_step_host_i64: FnHostBatchStep,
     train_multi_lora_host_i64: FnHostMultiLoraStep,
+    train_multi_lora_host_i64_v2: FnHostMultiLoraReport,
     eval_step_host_i64: FnHostBatchStep,
     get_lora_count: FnGetLoraCount,
     get_lora_a: FnGetLoraA,
@@ -216,7 +250,7 @@ unsafe fn load_kernels() -> Option<KernelHandles> {
         }};
     }
     let abi_version: FnKernelAbiVersion = sym!("qwen36_kernel_abi_version");
-    if abi_version() != 24 {
+    if abi_version() != 25 {
         return None;
     }
     Some(KernelHandles {
@@ -224,9 +258,11 @@ unsafe fn load_kernels() -> Option<KernelHandles> {
         train_step: sym!("qwen36_train_step"),
         train_micro_step: sym!("qwen36_train_micro_step"),
         train_multi_lora_selected_v2: sym!("qwen36_train_multi_lora_selected_v2"),
+        train_multi_lora_selected_v3: sym!("qwen36_train_multi_lora_selected_v3"),
         eval_step: sym!("qwen36_eval_step"),
         train_step_host_i64: sym!("qwen36_train_step_host_i64"),
         train_multi_lora_host_i64: sym!("qwen36_train_multi_lora_host_i64"),
+        train_multi_lora_host_i64_v2: sym!("qwen36_train_multi_lora_host_i64_v2"),
         eval_step_host_i64: sym!("qwen36_eval_step_host_i64"),
         get_lora_count: sym!("qwen36_get_lora_count"),
         get_lora_a: sym!("qwen36_get_lora_a"),
@@ -958,14 +994,59 @@ impl CppTrainingContext {
                 target_mask.as_ptr() as *mut _,
                 attention_mask.as_ptr() as *mut _,
                 adapter_ids.as_ptr(),
-                i32::try_from(adapter_ids.len())
-                    .context("selected adapter count exceeds i32")?,
+                i32::try_from(adapter_ids.len()).context("selected adapter count exceeds i32")?,
             )
         };
         if loss < 0.0 {
             bail!("C++ train_multi_lora_selected_v2 failed");
         }
         Ok(loss)
+    }
+
+    /// Train selected adapters once and return globally normalized losses in
+    /// the same order as `adapter_ids`.
+    pub fn train_multi_lora_selected_report(
+        &self,
+        input_ids: &Tensor,
+        target_mask: &Tensor,
+        attention_mask: &Tensor,
+        adapter_ids: &[i64],
+    ) -> Result<MultiLoraLossReport> {
+        if adapter_ids.is_empty() {
+            bail!("selected multi-LoRA loss report requires adapter IDs");
+        }
+        let adapter_count =
+            i32::try_from(adapter_ids.len()).context("selected adapter count exceeds i32")?;
+        let kh = get_kernels().ok_or_else(|| anyhow::anyhow!("kernels not loaded"))?;
+        let report = kh.train_multi_lora_selected_v3;
+        let mut aggregate_loss = f64::NAN;
+        let mut adapter_losses = vec![f64::NAN; adapter_ids.len()];
+        let status = unsafe {
+            report(
+                self.ptr,
+                input_ids.as_ptr() as *mut _,
+                target_mask.as_ptr() as *mut _,
+                attention_mask.as_ptr() as *mut _,
+                adapter_ids.as_ptr(),
+                adapter_count,
+                &mut aggregate_loss,
+                adapter_losses.as_mut_ptr(),
+                adapter_count,
+            )
+        };
+        if status != 0
+            || !aggregate_loss.is_finite()
+            || aggregate_loss < 0.0
+            || adapter_losses
+                .iter()
+                .any(|loss| !loss.is_finite() || *loss < 0.0)
+        {
+            bail!("C++ train_multi_lora_selected_v3 failed");
+        }
+        Ok(MultiLoraLossReport {
+            aggregate_loss,
+            adapter_losses,
+        })
     }
 
     /// Run one complete fixed-LoRA step from a borrowed host int64 batch.
@@ -1043,6 +1124,61 @@ impl CppTrainingContext {
             bail!("C++ train_multi_lora_host_i64 failed");
         }
         Ok(loss)
+    }
+
+    /// Borrow a host batch for selected adapters and return one globally
+    /// normalized loss per adapter alongside the scalar entry point.
+    pub fn train_multi_lora_host_i64_report(
+        &self,
+        input_ids: &[i64],
+        target_mask: &[i64],
+        attention_mask: &[i64],
+        batch_size: usize,
+        seq_len: usize,
+        n_total: i32,
+        lora_rank: i32,
+        adapter_ids: &[i64],
+    ) -> Result<MultiLoraLossReport> {
+        validate_host_batch(input_ids, target_mask, attention_mask, batch_size, seq_len)?;
+        if n_total <= 0 || adapter_ids.len() != n_total as usize {
+            bail!("multi-LoRA loss report requires n_total positive selected adapter IDs");
+        }
+        let adapter_count =
+            i32::try_from(adapter_ids.len()).context("selected adapter count exceeds i32")?;
+        let kh = get_kernels().ok_or_else(|| anyhow::anyhow!("kernels not loaded"))?;
+        let report = kh.train_multi_lora_host_i64_v2;
+        let mut aggregate_loss = f64::NAN;
+        let mut adapter_losses = vec![f64::NAN; adapter_ids.len()];
+        let status = unsafe {
+            report(
+                self.ptr,
+                input_ids.as_ptr(),
+                target_mask.as_ptr(),
+                attention_mask.as_ptr(),
+                i64::try_from(batch_size).context("host batch_size exceeds i64")?,
+                i64::try_from(seq_len).context("host seq_len exceeds i64")?,
+                n_total,
+                lora_rank,
+                adapter_ids.as_ptr(),
+                adapter_count,
+                &mut aggregate_loss,
+                adapter_losses.as_mut_ptr(),
+                adapter_count,
+            )
+        };
+        if status != 0
+            || !aggregate_loss.is_finite()
+            || aggregate_loss < 0.0
+            || adapter_losses
+                .iter()
+                .any(|loss| !loss.is_finite() || *loss < 0.0)
+        {
+            bail!("C++ train_multi_lora_host_i64_v2 failed");
+        }
+        Ok(MultiLoraLossReport {
+            aggregate_loss,
+            adapter_losses,
+        })
     }
 
     /// Get LoRA A tensor by index (for saving).
@@ -1415,9 +1551,8 @@ impl CppTrainingContext {
             return Vec::new();
         }
         let mut dynamic_ids = vec![0i64; total as usize];
-        let count = unsafe {
-            (kh.list_lora)(self.ptr, dynamic_ids.as_mut_ptr(), dynamic_ids.len() as i64)
-        };
+        let count =
+            unsafe { (kh.list_lora)(self.ptr, dynamic_ids.as_mut_ptr(), dynamic_ids.len() as i64) };
         if count <= 0 {
             return Vec::new();
         }

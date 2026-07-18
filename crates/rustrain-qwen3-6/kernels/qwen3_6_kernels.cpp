@@ -623,6 +623,10 @@ struct GatedDeltaRuleFunction : public torch::autograd::Function<GatedDeltaRuleF
         auto delta_buf = at::empty({bh, seq, val_dim}, q.options());
         const int64_t checkpoint_stride =
             gdn_state_checkpoint_stride(seq);
+        TORCH_CHECK(!env_enabled("QWEN36_GDN_CHUNKWISE_BWD") ||
+                checkpoint_stride > 0,
+            "QWEN36_GDN_CHUNKWISE_BWD requires a nonzero "
+            "QWEN36_GDN_STATE_CHECKPOINT_STRIDE smaller than the sequence length");
         const int64_t checkpoint_count = checkpoint_stride > 0
             ? (seq + checkpoint_stride - 1) / checkpoint_stride + 1
             : 0;
@@ -2552,6 +2556,7 @@ static void hash_collective_topology(
     hash.add_u64(env_enabled("QWEN36_GRAD_SLAB", true));
     hash.add_u64(env_enabled("QWEN36_HETERO_PADDED_BATCH", true));
     hash.add_u64(env_enabled("QWEN36_GDN_RECURRENT_FUSION", true));
+    hash.add_u64(env_enabled("QWEN36_GDN_CHUNKWISE_BWD"));
     hash.add_u64(gdn_state_checkpoint_config());
 }
 
@@ -5876,6 +5881,8 @@ static void manual_group_backward(
 struct LossResult {
     at::Tensor value;
     at::Tensor hidden_grad;
+    at::Tensor sample_loss_numerators;
+    at::Tensor sample_token_counts;
 };
 
 // Vocabulary-parallel cross entropy. The first LM-head pass computes local
@@ -5888,7 +5895,8 @@ static LossResult compute_vocab_parallel_loss(
     const at::Tensor& input_ids,
     const at::Tensor& target_mask,
     bool independent_samples,
-    bool compute_hidden_grad
+    bool compute_hidden_grad,
+    bool collect_sample_losses = false
 ) {
     TORCH_CHECK(vocab_parallel_enabled(ctx),
         "distributed vocabulary loss requires vocabulary TP");
@@ -5931,11 +5939,18 @@ static LossResult compute_vocab_parallel_loss(
 
     auto total_count = shifted_mask.sum().clamp_min(1.0);
     at::Tensor token_denominators;
+    at::Tensor sample_loss_numerators;
+    at::Tensor sample_token_counts;
     if (independent_samples) {
         auto per_sample_count = target_mask.narrow(1, 1, shifted_seq_len)
-            .sum(1, true).clamp_min(1.0);
-        token_denominators = per_sample_count
+            .sum(1).to(at::kFloat);
+        token_denominators = per_sample_count.clamp_min(1.0).reshape({batch_size, 1})
             .expand({batch_size, shifted_seq_len}).reshape({-1}).to(at::kFloat);
+        if (collect_sample_losses) {
+            sample_token_counts = per_sample_count;
+            sample_loss_numerators = at::zeros({batch_size},
+                at::TensorOptions().dtype(at::kFloat).device(hidden.device()));
+        }
     }
 
     auto total_loss = at::zeros({1},
@@ -6007,6 +6022,15 @@ static LossResult compute_vocab_parallel_loss(
             (at::log(global_sum_exp) + global_max - target_logit).squeeze(1);
         auto masked_loss = per_token_loss * chunk_mask;
         if (independent_samples) {
+            if (sample_loss_numerators.defined()) {
+                auto token_indexes = at::arange(
+                    token_start, token_start + token_count,
+                    shifted_targets.options());
+                auto sample_indexes = at::floor_divide(
+                    token_indexes, shifted_seq_len);
+                sample_loss_numerators.index_add_(
+                    0, sample_indexes, masked_loss.detach());
+            }
             total_loss.add_((masked_loss /
                 token_denominators.narrow(0, token_start, token_count)).sum());
         } else {
@@ -6070,7 +6094,12 @@ static LossResult compute_vocab_parallel_loss(
             /*allow_unused=*/false)[0];
     }
 
-    return {total_loss, hidden_grad};
+    return {
+        total_loss,
+        hidden_grad,
+        sample_loss_numerators,
+        sample_token_counts,
+    };
 }
 
 static at::Tensor compute_loss_fused(
@@ -6286,12 +6315,14 @@ static LossResult compute_loss(
     const at::Tensor& input_ids,
     const at::Tensor& target_mask,
     int64_t vocab_size,
-    bool independent_samples = false
+    bool independent_samples = false,
+    bool collect_sample_losses = false
 ) {
     if (vocab_parallel_enabled(ctx)) {
         return compute_vocab_parallel_loss(
             ctx, hidden, input_ids, target_mask,
-            independent_samples, /*compute_hidden_grad=*/true);
+            independent_samples, /*compute_hidden_grad=*/true,
+            collect_sample_losses);
     }
     auto final_norm = *ctx->final_norm_ptr[0];
     auto lm_head = *ctx->lm_head_ptr[0];
@@ -6323,11 +6354,19 @@ static LossResult compute_loss(
 
     auto total_count = shifted_mask.sum().clamp_min(1.0);
     at::Tensor token_denominators;
+    at::Tensor sample_loss_numerators;
+    at::Tensor sample_token_counts;
     if (independent_samples) {
         auto per_sample_count = target_mask.narrow(1, 1, seq_len - 1)
-            .sum(1, true).clamp_min(1.0);
-        token_denominators = per_sample_count
+            .sum(1).to(at::kFloat);
+        token_denominators = per_sample_count.clamp_min(1.0)
+            .reshape({target_mask.size(0), 1})
             .expand({target_mask.size(0), seq_len - 1}).reshape({-1});
+        if (collect_sample_losses) {
+            sample_token_counts = per_sample_count;
+            sample_loss_numerators = at::zeros({target_mask.size(0)},
+                at::TensorOptions().dtype(at::kFloat).device(hidden.device()));
+        }
     }
     auto hidden_flat = shifted_hidden.reshape({-1, hidden_normed.size(2)});
 
@@ -6366,6 +6405,13 @@ static LossResult compute_loss(
             at::Tensor(), at::Reduction::None, -100, 0.0
         );
         auto masked_loss = per_token_loss * chunk_mask.to(at::kFloat);
+        if (sample_loss_numerators.defined()) {
+            auto token_indexes = at::arange(
+                start, end, shifted_targets.options());
+            auto sample_indexes = at::floor_divide(token_indexes, seq_len - 1);
+            sample_loss_numerators.index_add_(
+                0, sample_indexes, masked_loss.detach());
+        }
         // Single-sample training uses the global response-token mean. Batched
         // multi-LoRA instead divides each row by its own response-token count
         // so tenant gradients do not depend on neighboring rows.
@@ -6394,7 +6440,9 @@ static LossResult compute_loss(
     return {
         at::tensor({total_loss_val},
             at::TensorOptions().dtype(at::kFloat).device(hidden.device())),
-        hidden_grad
+        hidden_grad,
+        sample_loss_numerators,
+        sample_token_counts,
     };
 }
 
@@ -6520,7 +6568,7 @@ static at::Tensor mtp_compute_loss(
 extern "C" {
 
 __attribute__((visibility("default"))) int64_t qwen36_kernel_abi_version() {
-    return 24;
+    return 25;
 }
 
 // Benchmark/metrics helper. The orthogonal EP, DP, and TP reductions propagate
@@ -7607,7 +7655,9 @@ static double qwen36_train_multi_lora_impl(
     int32_t n_total,
     int32_t lora_rank,
     DynamicMultiLoraMode mode,
-    int32_t* finalizer_phase = nullptr
+    int32_t* finalizer_phase = nullptr,
+    at::Tensor* loss_numerators_out = nullptr,
+    at::Tensor* token_counts_out = nullptr
 ) {
     try {
         auto* ctx = reinterpret_cast<TrainingContext*>(ctx_ptr);
@@ -7832,6 +7882,13 @@ static double qwen36_train_multi_lora_impl(
         }
 
         double total_loss = 0.0;
+        at::Tensor loss_numerators;
+        at::Tensor loss_token_counts;
+        if (!finalize_only && loss_numerators_out && token_counts_out) {
+            loss_numerators = at::zeros({total_adapters},
+                at::TensorOptions().dtype(at::kFloat).device(input_ids.device()));
+            loss_token_counts = at::zeros_like(loss_numerators);
+        }
         int64_t num_chunks = (total_adapters + n_max - 1) / n_max;
         // Chunking is a memory scheduling detail, not an optimizer step. Each
         // tenant clock commits only after its Adam launch succeeds.
@@ -7900,9 +7957,21 @@ static double qwen36_train_multi_lora_impl(
                     "QWEN36_FUSED_CE is disabled until its tile gather and gradient normalization are validated");
                 auto loss = compute_loss(
                     ctx, hidden, input_ref, mask_ref, ctx->vocab_size,
-                    /*independent_samples=*/true);
+                    /*independent_samples=*/true,
+                    /*collect_sample_losses=*/loss_numerators.defined());
                 loss_val = loss.value.item<double>();
                 hidden_grad = loss.hidden_grad;
+                if (loss_numerators.defined()) {
+                    TORCH_CHECK(loss.sample_loss_numerators.defined() &&
+                            loss.sample_token_counts.defined() &&
+                            loss.sample_loss_numerators.numel() == n &&
+                            loss.sample_token_counts.numel() == n,
+                        "dynamic per-adapter loss report shape mismatch");
+                    loss_numerators.narrow(0, start, n).copy_(
+                        loss.sample_loss_numerators);
+                    loss_token_counts.narrow(0, start, n).copy_(
+                        loss.sample_token_counts);
+                }
             }
             // independent_samples produces a local per-tenant mean. Restore
             // each row to a token-sum numerator before A2A backward so the
@@ -8252,6 +8321,10 @@ static double qwen36_train_multi_lora_impl(
         }
 
         if (!train_only) clear_gradient_accumulators(ctx);
+        if (!finalize_only && loss_numerators_out && token_counts_out) {
+            *loss_numerators_out = loss_numerators;
+            *token_counts_out = loss_token_counts;
+        }
         accumulation_guard.disarmed = true;
         return finalize_only ? 0.0 : total_loss / total_adapters;
     } catch (const std::exception& e) {
@@ -8425,19 +8498,75 @@ static void rollback_dynamic_adapter_commit(
     adapter.optimizer_step = optimizer_step;
 }
 
+static at::Tensor global_dynamic_adapter_losses(
+    TrainingContext* ctx,
+    at::Tensor loss_numerators,
+    at::Tensor token_counts
+) {
+    TORCH_CHECK(loss_numerators.defined() && token_counts.defined() &&
+            loss_numerators.dim() == 1 &&
+            loss_numerators.sizes() == token_counts.sizes(),
+        "dynamic loss report tensors must be matching vectors");
+    bool local_valid = false;
+    try {
+        local_valid = at::logical_and(
+                at::isfinite(loss_numerators),
+                at::logical_and(at::isfinite(token_counts), token_counts >= 0))
+            .all().item<bool>();
+    } catch (...) {
+        local_valid = false;
+    }
+    TORCH_CHECK(adapter_collective_all_succeeded(ctx, local_valid) && local_valid,
+        "dynamic loss report contains invalid numerator or token count");
+
+    auto packed = at::cat({loss_numerators, token_counts}, 0).contiguous();
+    auto reduce_source_axis = [&](ncclComm_t communicator, const char* axis) {
+        auto reduced = at::empty_like(packed);
+        auto stream = c10::cuda::getCurrentCUDAStream(
+            packed.device().index()).stream();
+        auto error = ncclAllReduce(
+            packed.data_ptr<float>(), reduced.data_ptr<float>(), packed.numel(),
+            ncclFloat, ncclSum, communicator, stream);
+        TORCH_CHECK(error == ncclSuccess,
+            "dynamic loss ", axis, " reduction failed: ",
+            ncclGetErrorString(error));
+        packed = reduced;
+    };
+    const bool sharded_ep = ctx->expert_parallel && ctx->nccl_comm &&
+        env_enabled("QWEN36_EP_A2A_SHARDED");
+    if (sharded_ep) {
+        reduce_source_axis(
+            reinterpret_cast<ncclComm_t>(ctx->nccl_comm), "sharded EP");
+    }
+    if (ctx->data_parallel && ctx->dp_comm && ctx->dp_world_size > 1) {
+        reduce_source_axis(
+            reinterpret_cast<ncclComm_t>(ctx->dp_comm), "DP");
+    }
+
+    const int64_t count = loss_numerators.numel();
+    auto global_numerators = packed.narrow(0, 0, count);
+    auto global_counts = packed.narrow(0, count, count);
+    return at::where(
+        global_counts > 0,
+        global_numerators / global_counts.clamp_min(1.0),
+        at::zeros_like(global_numerators));
+}
+
 // Heterogeneous selected training pads each active LoRA rank to the largest
 // rank needed by that projection and inserts zero A/B slots for adapters that
 // do not target it. This keeps the activation batch aligned with request order
 // so all selected tenants share one forward/backward and one transactional
 // synchronization/Adam finalizer.
-__attribute__((visibility("default"))) double
-qwen36_train_multi_lora_selected_v2(
+static double qwen36_train_multi_lora_selected_impl(
     void* ctx_ptr,
     void* input_ids_ptr,
     void* target_mask_ptr,
     void* attention_mask_ptr,
     const int64_t* adapter_ids,
-    int32_t n_adapters
+    int32_t n_adapters,
+    double* aggregate_loss_out,
+    double* adapter_losses_out,
+    int32_t adapter_loss_capacity
 ) {
     auto* ctx = reinterpret_cast<TrainingContext*>(ctx_ptr);
     std::vector<TrainingContext::LoRAAdapter> original;
@@ -8448,6 +8577,9 @@ qwen36_train_multi_lora_selected_v2(
     std::vector<int64_t> original_steps;
     bool registry_detached = false;
     bool selected_registry_installed = false;
+    at::Tensor selected_loss_numerators;
+    at::Tensor selected_token_counts;
+    at::Tensor global_adapter_loss_values;
     auto restore_registry = [&]() {
         if (!ctx || !registry_detached) return;
         for (size_t index = 0; index < original.size(); ++index) {
@@ -8546,6 +8678,22 @@ qwen36_train_multi_lora_selected_v2(
                 ctx, local_request_valid) && local_request_valid,
             "heterogeneous selected training requires rank-consistent "
             "adapter IDs and a positive adapter count");
+        const bool report_requested = aggregate_loss_out || adapter_losses_out;
+        const bool all_report_requested = adapter_collective_all_succeeded(
+            ctx, report_requested);
+        const bool all_legacy_requested = adapter_collective_all_succeeded(
+            ctx, !report_requested);
+        TORCH_CHECK(all_report_requested || all_legacy_requested,
+            "heterogeneous selected loss report capability differs across "
+            "distributed ranks");
+        const bool local_report_valid =
+            (!report_requested && !aggregate_loss_out && !adapter_losses_out) ||
+            (aggregate_loss_out && adapter_losses_out &&
+                adapter_loss_capacity >= n_adapters);
+        TORCH_CHECK(adapter_collective_all_succeeded(
+                ctx, local_report_valid) && local_report_valid,
+            "heterogeneous selected loss report requires aggregate and adapter "
+            "outputs with capacity for every selected adapter");
         const bool local_accumulation_clear = !ctx->accumulation_active &&
             ctx->accumulated_token_weight == 0.0;
         TORCH_CHECK(adapter_collective_all_succeeded(
@@ -8636,7 +8784,9 @@ qwen36_train_multi_lora_selected_v2(
             train_loss = qwen36_train_multi_lora_impl(
                 ctx, input_ids_ptr, target_mask_ptr, attention_mask_ptr,
                 n_adapters, static_cast<int32_t>(maximum_rank),
-                DynamicMultiLoraMode::TrainOnly);
+                DynamicMultiLoraMode::TrainOnly, nullptr,
+                report_requested ? &selected_loss_numerators : nullptr,
+                report_requested ? &selected_token_counts : nullptr);
             ctx->pad_heterogeneous_lora_batch = saved_padding_mode;
             selected.swap(ctx->adapters);
             selected_registry_installed = false;
@@ -8656,6 +8806,11 @@ qwen36_train_multi_lora_selected_v2(
                 "heterogeneous adapter batch failed on at least one "
                 "distributed rank");
         } else {
+            if (report_requested) {
+                selected_loss_numerators = at::zeros({n_adapters},
+                    at::TensorOptions().dtype(at::kFloat).device(input_ids.device()));
+                selected_token_counts = at::zeros_like(selected_loss_numerators);
+            }
             std::map<std::string, std::vector<size_t>> groups;
             for (size_t index = 0; index < selected.size(); ++index) {
                 groups[dynamic_adapter_group_key(selected[index])]
@@ -8710,10 +8865,14 @@ qwen36_train_multi_lora_selected_v2(
                     static_cast<int32_t>(indexes.size());
                 const int32_t group_rank = static_cast<int32_t>(
                     ctx->adapters.front().rank);
+                at::Tensor group_loss_numerators;
+                at::Tensor group_token_counts;
                 const double group_loss = qwen36_train_multi_lora_impl(
                     ctx, group_input_ptr, group_target_ptr,
                     group_attention_ptr, group_size, group_rank,
-                    DynamicMultiLoraMode::TrainOnly);
+                    DynamicMultiLoraMode::TrainOnly, nullptr,
+                    report_requested ? &group_loss_numerators : nullptr,
+                    report_requested ? &group_token_counts : nullptr);
 
                 group.swap(ctx->adapters);
                 for (size_t group_index = 0;
@@ -8738,9 +8897,30 @@ qwen36_train_multi_lora_selected_v2(
                         ctx, local_group_succeeded),
                     "heterogeneous adapter group failed on at least one "
                     "distributed rank: ", group_key);
+                if (report_requested) {
+                    TORCH_CHECK(group_loss_numerators.defined() &&
+                            group_token_counts.defined() &&
+                            group_loss_numerators.numel() == group_size &&
+                            group_token_counts.numel() == group_size,
+                        "heterogeneous adapter group loss report shape mismatch: ",
+                        group_key);
+                    auto group_indexes = at::tensor(
+                        row_indexes,
+                        input_ids.options().dtype(at::kLong));
+                    selected_loss_numerators.index_copy_(
+                        0, group_indexes, group_loss_numerators);
+                    selected_token_counts.index_copy_(
+                        0, group_indexes, group_token_counts);
+                }
                 weighted_loss += group_loss * indexes.size();
             }
             train_loss = weighted_loss / static_cast<double>(n_adapters);
+        }
+
+        if (report_requested) {
+            global_adapter_loss_values = global_dynamic_adapter_losses(
+                ctx, selected_loss_numerators, selected_token_counts);
+            train_loss = global_adapter_loss_values.mean().item<double>();
         }
 
         ctx->adapters.swap(selected);
@@ -8764,6 +8944,18 @@ qwen36_train_multi_lora_selected_v2(
             "heterogeneous adapter finalizer failed on at least one "
             "distributed rank");
         restore_registry();
+        if (aggregate_loss_out && adapter_losses_out) {
+            auto losses_cpu = global_adapter_loss_values.to(
+                at::TensorOptions().device(at::kCPU).dtype(at::kDouble));
+            const auto* losses = losses_cpu.data_ptr<double>();
+            double reported_loss = 0.0;
+            for (int32_t index = 0; index < n_adapters; ++index) {
+                adapter_losses_out[index] = losses[index];
+                reported_loss += losses[index];
+            }
+            train_loss = reported_loss / static_cast<double>(n_adapters);
+            *aggregate_loss_out = train_loss;
+        }
         return train_loss;
     } catch (const std::exception& e) {
         recover();
@@ -8775,6 +8967,39 @@ qwen36_train_multi_lora_selected_v2(
             "[train_multi_selected_v2] FAILED: unknown exception\n");
         return -1.0;
     }
+}
+
+__attribute__((visibility("default"))) double
+qwen36_train_multi_lora_selected_v2(
+    void* ctx_ptr,
+    void* input_ids_ptr,
+    void* target_mask_ptr,
+    void* attention_mask_ptr,
+    const int64_t* adapter_ids,
+    int32_t n_adapters
+) {
+    return qwen36_train_multi_lora_selected_impl(
+        ctx_ptr, input_ids_ptr, target_mask_ptr, attention_mask_ptr,
+        adapter_ids, n_adapters, nullptr, nullptr, 0);
+}
+
+__attribute__((visibility("default"))) int32_t
+qwen36_train_multi_lora_selected_v3(
+    void* ctx_ptr,
+    void* input_ids_ptr,
+    void* target_mask_ptr,
+    void* attention_mask_ptr,
+    const int64_t* adapter_ids,
+    int32_t n_adapters,
+    double* aggregate_loss_out,
+    double* adapter_losses_out,
+    int32_t adapter_loss_capacity
+) {
+    const double loss = qwen36_train_multi_lora_selected_impl(
+        ctx_ptr, input_ids_ptr, target_mask_ptr, attention_mask_ptr,
+        adapter_ids, n_adapters, aggregate_loss_out, adapter_losses_out,
+        adapter_loss_capacity);
+    return std::isfinite(loss) && loss >= 0.0 ? 0 : -1;
 }
 
 // Set NCCL communicator for Expert Parallel all-reduce
@@ -9928,6 +10153,48 @@ double qwen36_train_multi_lora_host_i64(
     } catch (const std::exception& e) {
         fprintf(stderr, "[q36] train_multi_lora_host_i64 FAILED: %s\n", e.what());
         return -1.0;
+    }
+}
+
+__attribute__((visibility("default")))
+int32_t qwen36_train_multi_lora_host_i64_v2(
+    void* ctx_ptr,
+    const int64_t* input_ids,
+    const int64_t* target_mask,
+    const int64_t* attention_mask,
+    int64_t batch_size,
+    int64_t seq_len,
+    int32_t n_total,
+    int32_t lora_rank,
+    const int64_t* adapter_ids,
+    int32_t n_adapter_ids,
+    double* aggregate_loss_out,
+    double* adapter_losses_out,
+    int32_t adapter_loss_capacity
+) {
+    try {
+        (void)lora_rank;
+        auto* ctx = reinterpret_cast<TrainingContext*>(ctx_ptr);
+        TORCH_CHECK(n_adapter_ids > 0 && n_adapter_ids == n_total,
+            "host multi-LoRA loss report requires every selected adapter ID");
+        TORCH_CHECK(adapter_ids,
+            "host multi-LoRA loss report requires adapter IDs");
+        auto input = qwen36_copy_host_i64_batch(
+            ctx, input_ids, batch_size, seq_len,
+            "host multi-LoRA report input_ids");
+        auto targets = qwen36_copy_host_i64_batch(
+            ctx, target_mask, batch_size, seq_len,
+            "host multi-LoRA report target_mask");
+        auto attention = qwen36_copy_host_i64_batch(
+            ctx, attention_mask, batch_size, seq_len,
+            "host multi-LoRA report attention_mask");
+        return qwen36_train_multi_lora_selected_v3(
+            ctx, &input, &targets, &attention, adapter_ids, n_adapter_ids,
+            aggregate_loss_out, adapter_losses_out, adapter_loss_capacity);
+    } catch (const std::exception& e) {
+        fprintf(stderr,
+            "[q36] train_multi_lora_host_i64_v2 FAILED: %s\n", e.what());
+        return -1;
     }
 }
 

@@ -110,6 +110,13 @@ pub struct TrainOutput {
 }
 
 #[derive(Debug)]
+pub struct MultiLoraTrainOutput {
+    pub loss: f64,
+    pub adapter_losses: Vec<f64>,
+    pub step: u64,
+}
+
+#[derive(Debug)]
 pub struct EvalOutput {
     pub loss: f64,
 }
@@ -387,6 +394,40 @@ impl Qwen36Session {
                 adapter_ids,
             )?;
         self.finish_train_step(loss, false)
+    }
+
+    pub fn train_multi_lora_host_i64_report(
+        &mut self,
+        input_ids: &[i64],
+        target_mask: &[i64],
+        attention_mask: &[i64],
+        batch_size: usize,
+        seq_len: usize,
+        n_total: i32,
+        lora_rank: i32,
+        adapter_ids: &[i64],
+    ) -> Result<MultiLoraTrainOutput> {
+        let ctx = self
+            .ctx
+            .as_ref()
+            .ok_or_else(|| anyhow!("LoRA not initialized"))?;
+        let report = ctx.train_multi_lora_host_i64_report(
+            input_ids,
+            target_mask,
+            attention_mask,
+            batch_size,
+            seq_len,
+            n_total,
+            lora_rank,
+            adapter_ids,
+        )?;
+        let loss = report.aggregate_loss;
+        let output = self.finish_train_step(loss, false)?;
+        Ok(MultiLoraTrainOutput {
+            loss: output.loss,
+            adapter_losses: report.adapter_losses,
+            step: output.step,
+        })
     }
 
     pub fn eval_step_host_i64(

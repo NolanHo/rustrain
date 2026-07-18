@@ -2,13 +2,13 @@
 set -euo pipefail
 
 usage() {
-    echo "usage: $0 {smoke|tpdp-smoke|bench-single|bench-tp2}" >&2
+    echo "usage: $0 {smoke|smoke-chunkwise|tpdp-smoke|bench-single|bench-tp2}" >&2
     exit 2
 }
 
 mode="${1:-}"
 case "$mode" in
-    smoke|tpdp-smoke|bench-single|bench-tp2) ;;
+    smoke|smoke-chunkwise|tpdp-smoke|bench-single|bench-tp2) ;;
     *) usage ;;
 esac
 
@@ -192,6 +192,12 @@ export RUSTRAIN_NCCL_RUN_ID="${RUSTRAIN_NCCL_RUN_ID:-qwen36-gdn-$$}"
 
 case "$mode" in
     smoke)
+        TP_SIZE=2 "$python_bin" -m torch.distributed.run --standalone \
+            --nnodes=1 --nproc-per-node=2 --no-python "$smoke_bin"
+        ;;
+    smoke-chunkwise)
+        QWEN36_GDN_STATE_CHECKPOINT_STRIDE=2 \
+        QWEN36_GDN_CHUNKWISE_BWD=1 \
         TP_SIZE=2 "$python_bin" -m torch.distributed.run --standalone \
             --nnodes=1 --nproc-per-node=2 --no-python "$smoke_bin"
         ;;
