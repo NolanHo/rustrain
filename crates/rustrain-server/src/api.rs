@@ -1505,6 +1505,8 @@ async fn ep_train_multi_lora(
         req.n_total,
     )
     .map_err(|e| err_resp(&e))?;
+    crate::ep::validate_multi_lora_global_batch_size(batch_size, req.n_total)
+        .map_err(|error| err_resp(&error))?;
     let (tensors, payload) = pack_tensor_slab(
         &req.input_ids,
         &req.target_mask,

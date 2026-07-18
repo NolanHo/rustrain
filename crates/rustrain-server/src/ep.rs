@@ -1152,6 +1152,21 @@ fn source_shard_from_env() -> Result<Option<SourceShard>, String> {
     source_shard_for_topology(&topology, global_rank, ep_source_sharded)
 }
 
+pub(crate) fn validate_multi_lora_global_batch_size(
+    batch_size: usize,
+    n_total: i32,
+) -> Result<(), String> {
+    let topology = ParallelTopology::from_env()
+        .map_err(|error| format!("invalid source-parallel topology: {error}"))?;
+    let ep_source_sharded = std::env::var("QWEN36_EP_A2A_SHARDED")
+        .map(|value| !value.is_empty() && value != "0")
+        .unwrap_or(false);
+    // Admission needs only the global source-parallel size. Rank zero is a
+    // valid representative and avoids requiring worker-only RANK in the API.
+    let source_shard = source_shard_for_topology(&topology, 0, ep_source_sharded)?;
+    multi_lora_rows(batch_size, n_total, source_shard).map(|_| ())
+}
+
 fn source_shard_for_topology(
     topology: &ParallelTopology,
     global_rank: usize,
