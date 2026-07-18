@@ -482,6 +482,7 @@ extern "C" int cuda_gated_delta_rule(
     const float* q, const float* k, const float* v,
     const float* g_exp, const float* beta,
     float* state, float* out, float* delta_buf,
+    const int32_t* lengths, int heads_per_batch,
     int BH, int seq_len, int key_dim, int val_dim, void* stream
 );
 
@@ -492,6 +493,7 @@ extern "C" int cuda_gated_delta_rule_backward(
     const float* grad_out,
     float* grad_q, float* grad_k, float* grad_v,
     float* grad_g, float* grad_beta,
+    const int32_t* lengths, int heads_per_batch,
     int BH, int seq_len, int key_dim, int val_dim, void* stream
 );
 
@@ -500,7 +502,8 @@ extern "C" int cuda_gated_delta_rule_backward(
 // while providing a complete autograd oracle for the custom CUDA forward.
 static at::Tensor gated_delta_rule_reference(
     const at::Tensor& q, const at::Tensor& k, const at::Tensor& v,
-    const at::Tensor& g_exp, const at::Tensor& beta
+    const at::Tensor& g_exp, const at::Tensor& beta,
+    const at::Tensor& lengths, int64_t heads_per_batch
 ) {
     TORCH_CHECK(q.dim() == 3 && k.dim() == 3 && v.dim() == 3,
         "gated_delta_rule_reference expects [BH, S, D] tensors");
@@ -515,6 +518,11 @@ static at::Tensor gated_delta_rule_reference(
     TORCH_CHECK(g_exp.size(0) == bh && g_exp.size(1) == seq &&
                 beta.size(0) == bh && beta.size(1) == seq,
         "g/beta shape mismatch");
+    if (lengths.defined()) {
+        TORCH_CHECK(lengths.dim() == 1 && lengths.scalar_type() == at::kInt &&
+                    lengths.size(0) * heads_per_batch == bh,
+            "lengths/head mapping mismatch");
+    }
 
     auto state = at::zeros({bh, key_dim, val_dim},
         q.options().dtype(at::kFloat));
@@ -523,6 +531,9 @@ static at::Tensor gated_delta_rule_reference(
     auto vf = v.to(at::kFloat);
     auto gf = g_exp.to(at::kFloat);
     auto bf = beta.to(at::kFloat);
+    auto bh_lengths = lengths.defined()
+        ? lengths.repeat_interleave(heads_per_batch)
+        : at::Tensor();
     std::vector<at::Tensor> outputs;
     outputs.reserve(seq);
     for (int64_t t = 0; t < seq; ++t) {
@@ -531,13 +542,32 @@ static at::Tensor gated_delta_rule_reference(
         auto vt = vf.select(1, t);
         auto qt = qf.select(1, t);
         auto bt = bf.select(1, t).view({bh, 1});
-        state = state * gt;
+        auto active = bh_lengths.defined()
+            ? (bh_lengths > t).to(at::kFloat).view({bh, 1, 1})
+            : at::Tensor();
+        state = active.defined()
+            ? state * (gt * active + (1.0 - active))
+            : state * gt;
         auto kv = at::bmm(kt.unsqueeze(1), state).squeeze(1);
         auto delta = (vt - kv) * bt;
+        if (active.defined()) delta = delta * active.view({bh, 1});
         state = state + kt.unsqueeze(2) * delta.unsqueeze(1);
-        outputs.push_back(at::bmm(qt.unsqueeze(1), state).squeeze(1));
+        auto output = at::bmm(qt.unsqueeze(1), state).squeeze(1);
+        if (active.defined()) output = output * active.view({bh, 1});
+        outputs.push_back(output);
     }
     return at::stack(outputs, 1);
+}
+
+// Autograd requires every Function input to be a defined tensor with a
+// device. An empty device-local int32 tensor is the dense-sequence sentinel;
+// CUDA launchers still receive a null lengths pointer for this case.
+static at::Tensor gdn_lengths_arg(
+    const at::Tensor& lengths, const at::Tensor& reference
+) {
+    return lengths.defined()
+        ? lengths
+        : at::empty({0}, reference.options().dtype(at::kInt));
 }
 
 // The forward and backward CUDA kernels are wrapped in one autograd Function.
@@ -547,7 +577,7 @@ struct GatedDeltaRuleFunction : public torch::autograd::Function<GatedDeltaRuleF
     static at::Tensor forward(
         torch::autograd::AutogradContext* ctx,
         at::Tensor q, at::Tensor k, at::Tensor v,
-        at::Tensor g_exp, at::Tensor beta
+        at::Tensor g_exp, at::Tensor beta, at::Tensor lengths
     ) {
         TORCH_CHECK(q.is_cuda() && k.is_cuda() && v.is_cuda(),
             "gated delta CUDA path requires CUDA tensors");
@@ -557,6 +587,16 @@ struct GatedDeltaRuleFunction : public torch::autograd::Function<GatedDeltaRuleF
             "gated delta CUDA path expects FP32 working tensors");
         const int64_t bh = q.size(0), seq = q.size(1);
         const int64_t key_dim = q.size(2), val_dim = v.size(2);
+        int64_t heads_per_batch = 1;
+        const bool has_lengths = lengths.defined() && lengths.numel() > 0;
+        if (has_lengths) {
+            TORCH_CHECK(lengths.is_cuda() && lengths.device() == q.device() &&
+                        lengths.scalar_type() == at::kInt &&
+                        lengths.dim() == 1 && lengths.is_contiguous() &&
+                        lengths.size(0) > 0 && bh % lengths.size(0) == 0,
+                "gated delta lengths must be contiguous CUDA int32 [batch]");
+            heads_per_batch = bh / lengths.size(0);
+        }
         auto state = at::zeros({bh, key_dim, val_dim}, q.options());
         auto out = at::empty({bh, seq, val_dim}, q.options());
         auto delta_buf = at::empty({bh, seq, val_dim}, q.options());
@@ -565,10 +605,12 @@ struct GatedDeltaRuleFunction : public torch::autograd::Function<GatedDeltaRuleF
             q.data_ptr<float>(), k.data_ptr<float>(), v.data_ptr<float>(),
             g_exp.data_ptr<float>(), beta.data_ptr<float>(),
             state.data_ptr<float>(), out.data_ptr<float>(), delta_buf.data_ptr<float>(),
+            has_lengths ? lengths.data_ptr<int32_t>() : nullptr,
+            (int)heads_per_batch,
             (int)bh, (int)seq, (int)key_dim, (int)val_dim,
             reinterpret_cast<void*>(stream));
         TORCH_CHECK(status == 0, "gated delta CUDA launch failed: ", status);
-        ctx->save_for_backward({q, k, v, g_exp, beta, state, delta_buf});
+        ctx->save_for_backward({q, k, v, g_exp, beta, state, delta_buf, lengths});
         return out;
     }
 
@@ -582,6 +624,11 @@ struct GatedDeltaRuleFunction : public torch::autograd::Function<GatedDeltaRuleF
         auto v = saved[2];
         auto g = saved[3];
         auto beta = saved[4];
+        auto lengths = saved[7];
+        const bool has_lengths = lengths.defined() && lengths.numel() > 0;
+        const int64_t heads_per_batch = has_lengths
+            ? q.size(0) / lengths.size(0)
+            : 1;
         if (env_enabled("QWEN36_DELTA_REFERENCE_BWD")) {
             auto q_ref = q.detach().set_requires_grad(true);
             auto k_ref = k.detach().set_requires_grad(true);
@@ -589,12 +636,14 @@ struct GatedDeltaRuleFunction : public torch::autograd::Function<GatedDeltaRuleF
             auto g_ref = g.detach().set_requires_grad(true);
             auto beta_ref = beta.detach().set_requires_grad(true);
             at::AutoGradMode guard(true);
-            auto reference = gated_delta_rule_reference(q_ref, k_ref, v_ref, g_ref, beta_ref);
+            auto reference = gated_delta_rule_reference(
+                q_ref, k_ref, v_ref, g_ref, beta_ref,
+                has_lengths ? lengths : at::Tensor(), heads_per_batch);
             auto grads = torch::autograd::grad(
                 {reference}, {q_ref, k_ref, v_ref, g_ref, beta_ref},
                 {grad_output[0]}, /*retain_graph=*/false,
                 /*create_graph=*/false, /*allow_unused=*/false);
-            return {grads[0], grads[1], grads[2], grads[3], grads[4]};
+            return {grads[0], grads[1], grads[2], grads[3], grads[4], at::Tensor()};
         }
 
         const int64_t bh = q.size(0), seq = q.size(1);
@@ -613,10 +662,12 @@ struct GatedDeltaRuleFunction : public torch::autograd::Function<GatedDeltaRuleF
             grad_out.data_ptr<float>(), grad_q.data_ptr<float>(),
             grad_k.data_ptr<float>(), grad_v.data_ptr<float>(),
             grad_g.data_ptr<float>(), grad_beta.data_ptr<float>(),
+            has_lengths ? lengths.data_ptr<int32_t>() : nullptr,
+            (int)heads_per_batch,
             (int)bh, (int)seq, (int)key_dim, (int)val_dim,
             reinterpret_cast<void*>(stream));
         TORCH_CHECK(status == 0, "gated delta backward launch failed: ", status);
-        return {grad_q, grad_k, grad_v, grad_g, grad_beta};
+        return {grad_q, grad_k, grad_v, grad_g, grad_beta, at::Tensor()};
     }
 };
 
@@ -630,7 +681,8 @@ static at::Tensor linear_attention(
     int64_t num_k_heads, int64_t key_dim,
     int64_t num_v_heads, int64_t val_dim,
     int64_t conv_kernel, double rms_eps,
-    at::ScalarType compute_type
+    at::ScalarType compute_type,
+    const at::Tensor& attention_lengths
 ) {
     auto device = hidden.device();
     int64_t batch = hidden.size(0), seq = hidden.size(1);
@@ -726,6 +778,9 @@ static at::Tensor linear_attention(
             auto state_contig = state.contiguous();
             auto outs = at::empty({BH, chunk_len, val_dim}, q_t.options());
             auto delta_buf = at::empty({BH, chunk_len, val_dim}, q_t.options());
+            auto chunk_lengths = attention_lengths.defined()
+                ? (attention_lengths - offset).clamp(0, chunk_len).to(at::kInt).contiguous()
+                : at::Tensor();
 
             // CUDA kernel — state is passed in and updated in-place
             auto stream = c10::cuda::getCurrentCUDAStream(device.index()).stream();
@@ -738,6 +793,8 @@ static at::Tensor linear_attention(
                 state_contig.data_ptr<float>(),
                 outs.data_ptr<float>(),
                 delta_buf.data_ptr<float>(),
+                chunk_lengths.defined() ? chunk_lengths.data_ptr<int32_t>() : nullptr,
+                (int)num_v_heads,
                 (int)BH, (int)chunk_len, (int)key_dim, (int)val_dim,
                 reinterpret_cast<void*>(stream)
             );
@@ -832,7 +889,8 @@ static at::Tensor linear_attention(
     auto g_contig = g_exp.reshape({BH, seq}).contiguous().to(at::kFloat);
     auto beta_contig = beta_t.reshape({BH, seq}).contiguous().to(at::kFloat);
     auto outs = GatedDeltaRuleFunction::apply(
-        q_contig, k_contig, v_contig, g_contig, beta_contig);
+        q_contig, k_contig, v_contig, g_contig, beta_contig,
+        gdn_lengths_arg(attention_lengths, q_contig));
 
     // Reshape: [B*H, S, D_v] → [B, H, S, D_v] → [B, S, H, D_v]
     auto core_out = outs.reshape({batch, num_v_heads, seq, val_dim})
@@ -881,7 +939,8 @@ static at::Tensor linear_attention_batched(TrainingContext* ctx, const at::Tenso
     const at::Tensor& a_log, const at::Tensor& dt_bias,
     const at::Tensor& conv1d_w, const at::Tensor& norm_w, const at::Tensor& out_proj,
     int64_t num_k_heads, int64_t key_dim, int64_t num_v_heads, int64_t val_dim,
-    int64_t conv_kernel, double rms_eps, at::ScalarType compute_type);
+    int64_t conv_kernel, double rms_eps, at::ScalarType compute_type,
+    const at::Tensor& attention_lengths);
 
 // ──────────────────────────────────────────────────────────────────────
 // MoE
@@ -2027,7 +2086,8 @@ static bool base_tp_attention_enabled(const TrainingContext* ctx);
 static at::Tensor forward_single_layer(
     TrainingContext* ctx, const at::Tensor& hidden, at::Tensor** w, const LayerConfig* cfg,
     int64_t layer_idx, at::ScalarType kind,
-    const at::Tensor& attention_mask, bool use_batched = false
+    const at::Tensor& attention_mask, const at::Tensor& attention_lengths,
+    bool use_batched = false
 ) {
     auto input_norm = *w[0];
     auto post_norm = *w[1];
@@ -2113,7 +2173,7 @@ static at::Tensor forward_single_layer(
                 in_proj_qkv, in_proj_z, in_proj_a, in_proj_b,
                 a_log, dt_bias, conv1d_w, norm_w, out_proj,
                 cfg->num_k_heads, cfg->key_dim, cfg->num_v_heads, cfg->val_dim,
-                cfg->conv_kernel, cfg->rms_eps, kind);
+                cfg->conv_kernel, cfg->rms_eps, kind, attention_lengths);
         } else {
             in_proj_qkv = apply_multi_lora(ctx, layer_idx, 0, in_proj_qkv);
             in_proj_z = apply_multi_lora(ctx, layer_idx, 1, in_proj_z);
@@ -2123,7 +2183,7 @@ static at::Tensor forward_single_layer(
             attn_output = linear_attention(attn_input, in_proj_qkv, in_proj_z, in_proj_a, in_proj_b,
                 a_log, dt_bias, conv1d_w, norm_w, out_proj,
                 cfg->num_k_heads, cfg->key_dim, cfg->num_v_heads, cfg->val_dim,
-                cfg->conv_kernel, cfg->rms_eps, kind);
+                cfg->conv_kernel, cfg->rms_eps, kind, attention_lengths);
         }
         auto post_attn = rms_norm(hidden + attn_output, post_norm, cfg->rms_eps);
         if (is_moe) {
@@ -2222,6 +2282,10 @@ struct TrainingContext {
 
     // Attention mask [batch, seq] — 1 for real tokens, 0 for padding
     at::Tensor attention_mask;
+    // Strict-right-padding valid lengths for GDN. Kept on device so every
+    // layer can pass it into the persistent recurrent kernel without a host
+    // sync or repeated mask reduction.
+    at::Tensor attention_lengths;
 
     // ── Multi-LoRA adapter registry ──
     struct LoRAAdapter {
@@ -3962,13 +4026,17 @@ static bool synchronize_lora_gradients(
 }
 
 static void elide_trivial_attention_mask(TrainingContext* ctx) {
+    ctx->attention_lengths = at::Tensor();
     if (!ctx->attention_mask.defined() || ctx->attention_mask.numel() == 0) return;
     // A padding-free batch can use SDPA's native causal fast path. This is one
     // scalar synchronization per step, instead of materializing [B,S,S] in
     // every full-attention layer.
     if (at::all(ctx->attention_mask != 0).item<bool>()) {
         ctx->attention_mask = at::Tensor();
+        return;
     }
+    ctx->attention_lengths = (ctx->attention_mask != 0).to(at::kInt).sum(1)
+        .clamp(0, ctx->attention_mask.size(1)).to(at::kInt).contiguous();
 }
 
 // Linear attention carries recurrent state across the sequence. Until the
@@ -4378,7 +4446,7 @@ at::Tensor compute_attn_only(
             return linear_attention_batched(
                 ctx, attn_input, layer_idx, qkv, z, a, b, al, db, cw, nw, op,
                 cfg.num_k_heads, cfg.key_dim, cfg.num_v_heads, cfg.val_dim,
-                cfg.conv_kernel, cfg.rms_eps, kind);
+                cfg.conv_kernel, cfg.rms_eps, kind, ctx->attention_lengths);
         }
     }
 
@@ -4420,7 +4488,7 @@ at::Tensor compute_attn_only(
         }
         return linear_attention(attn_input, qkv, z, a, b, al, db, cw, nw, op,
             cfg.num_k_heads, cfg.key_dim, cfg.num_v_heads, cfg.val_dim,
-            cfg.conv_kernel, cfg.rms_eps, kind);
+            cfg.conv_kernel, cfg.rms_eps, kind, ctx->attention_lengths);
     }
 }
 
@@ -4749,7 +4817,8 @@ static at::Tensor linear_attention_batched(
     const at::Tensor& a_log, const at::Tensor& dt_bias,
     const at::Tensor& conv1d_w, const at::Tensor& norm_w, const at::Tensor& out_proj,
     int64_t num_k_heads, int64_t key_dim, int64_t num_v_heads, int64_t val_dim,
-    int64_t conv_kernel, double rms_eps, at::ScalarType compute_type
+    int64_t conv_kernel, double rms_eps, at::ScalarType compute_type,
+    const at::Tensor& attention_lengths
 ) {
     // Full reimplementation of linear_attention non-chunked path with
     // activation-level LoRA delta on QKV, Z, and out_proj.
@@ -4946,6 +5015,9 @@ static at::Tensor linear_attention_batched(
         auto v_sub = v_t.narrow(0, sb, n);
         auto g_sub = g_exp.narrow(0, sb, n);
         auto beta_sub = beta_t.narrow(0, sb, n);
+        auto lengths_sub = attention_lengths.defined()
+            ? attention_lengths.narrow(0, sb, n).contiguous()
+            : at::Tensor();
 
         auto q_contig = q_sub.reshape({BH, seq, head_k_dim}).contiguous().to(at::kFloat);
         auto k_contig = k_sub.reshape({BH, seq, head_k_dim}).contiguous().to(at::kFloat);
@@ -4953,7 +5025,8 @@ static at::Tensor linear_attention_batched(
         auto g_contig = g_sub.reshape({BH, seq}).contiguous().to(at::kFloat);
         auto beta_contig = beta_sub.reshape({BH, seq}).contiguous().to(at::kFloat);
         sub_outputs.push_back(GatedDeltaRuleFunction::apply(
-            q_contig, k_contig, v_contig, g_contig, beta_contig));
+            q_contig, k_contig, v_contig, g_contig, beta_contig,
+            gdn_lengths_arg(lengths_sub, q_contig)));
     }
 
     auto outs = at::cat(sub_outputs, 0);
@@ -5052,7 +5125,7 @@ static at::Tensor forward_full(
         }
 
         hidden = forward_single_layer(ctx, hidden, layer_w.data(), &ctx->layer_configs[i], i,
-            kind, ctx->attention_mask, ctx->lora_batch_valid);
+            kind, ctx->attention_mask, ctx->attention_lengths, ctx->lora_batch_valid);
 
         // Debug: dump per-layer hidden state stats
         if (getenv("QWEN36_DUMP_LAYERS")) {
@@ -5105,7 +5178,7 @@ static at::Tensor forward_layer_group(
         }
 
         hidden = forward_single_layer(ctx, hidden, layer_w.data(), &ctx->layer_configs[i], i,
-            kind, ctx->attention_mask, ctx->lora_batch_valid);
+            kind, ctx->attention_mask, ctx->attention_lengths, ctx->lora_batch_valid);
 
         // Debug: dump per-layer hidden state stats (also in checkpoint recompute path)
         if (getenv("QWEN36_DUMP_LAYERS")) {
@@ -5226,7 +5299,8 @@ struct FusedLayerFunction : public torch::autograd::Function<FusedLayerFunction>
             la[k] = &tc->lora_a[la_offset + k]; lb[k] = &tc->lora_b[la_offset + k];
         }
         return forward_single_layer(tc, input, layer_w.data(), &tc->layer_configs[layer_idx],
-            layer_idx, kind, tc->attention_mask, tc->lora_batch_valid);
+            layer_idx, kind, tc->attention_mask, tc->attention_lengths,
+            tc->lora_batch_valid);
     }
 
     static std::vector<at::Tensor> backward(
@@ -6071,8 +6145,11 @@ static at::Tensor mtp_forward(
         auto mtp_mask = ctx->attention_mask.defined()
             ? ctx->attention_mask.narrow(-1, 0, h.size(1))
             : at::Tensor();
+        auto mtp_lengths = ctx->attention_lengths.defined()
+            ? ctx->attention_lengths.clamp(0, h.size(1)).to(at::kInt).contiguous()
+            : at::Tensor();
         h = forward_single_layer(ctx, h, layer_w.data(), &ctx->mtp_layer_configs[i],
-            ctx->num_layers + i, kind, mtp_mask);
+            ctx->num_layers + i, kind, mtp_mask, mtp_lengths);
     }
 
     // Final norm only — return hidden, not logits
@@ -6880,6 +6957,9 @@ __attribute__((visibility("default"))) double qwen36_train_micro_step(
             validate_linear_attention_mask(ctx, attention_mask);
             ctx->attention_mask = attention_mask;
             elide_trivial_attention_mask(ctx);
+        } else {
+            ctx->attention_mask = at::Tensor();
+            ctx->attention_lengths = at::Tensor();
         }
 
         // Forward: checkpoint (default) or fused layer (QWEN36_FUSED_LAYER=1)
@@ -7331,12 +7411,22 @@ static double qwen36_train_multi_lora_impl(
             validate_linear_attention_mask(ctx, provided_attention_mask);
         }
         const at::Tensor saved_attention_mask = ctx->attention_mask;
+        const at::Tensor saved_attention_lengths = ctx->attention_lengths;
         const bool saved_use_checkpoint = ctx->use_checkpoint;
         struct AttentionMaskGuard {
             TrainingContext* ctx;
             at::Tensor saved;
-            ~AttentionMaskGuard() { ctx->attention_mask = saved; }
-        } attention_mask_guard{ctx, saved_attention_mask};
+            at::Tensor saved_lengths;
+            ~AttentionMaskGuard() {
+                ctx->attention_mask = saved;
+                ctx->attention_lengths = saved_lengths;
+            }
+        } attention_mask_guard{
+            ctx, saved_attention_mask, saved_attention_lengths};
+        if (!provided_attention_mask.defined()) {
+            ctx->attention_mask = at::Tensor();
+            ctx->attention_lengths = at::Tensor();
+        }
         struct CheckpointModeGuard {
             TrainingContext* ctx;
             bool saved;
@@ -8828,6 +8918,10 @@ void qwen36_set_attention_mask(void* ctx_ptr, void* mask_ptr) {
         auto& mask = *reinterpret_cast<at::Tensor*>(mask_ptr);
         validate_linear_attention_mask(ctx, mask);
         ctx->attention_mask = mask;
+        elide_trivial_attention_mask(ctx);
+    } else {
+        ctx->attention_mask = at::Tensor();
+        ctx->attention_lengths = at::Tensor();
     }
 }
 
@@ -9361,6 +9455,9 @@ double qwen36_eval_step(void* ctx_ptr, void* input_ids_ptr, void* target_mask_pt
             auto& attention_mask = *reinterpret_cast<at::Tensor*>(attention_mask_ptr);
             validate_linear_attention_mask(ctx, attention_mask);
             ctx->attention_mask = attention_mask;
+        } else {
+            ctx->attention_mask = at::Tensor();
+            ctx->attention_lengths = at::Tensor();
         }
         elide_trivial_attention_mask(ctx);
         at::AutoGradMode no_grad(false);

@@ -49,6 +49,7 @@
 
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
+#include <cstdint>
 #include <cstdio>
 
 // ──────────────────────────────────────────────────────────────────────
@@ -89,6 +90,8 @@ __global__ void gated_delta_rule_kernel(
     float* __restrict__ state,         // [BH, D_K, D_V]
     float* __restrict__ out,           // [BH, S, D_V]
     float* __restrict__ delta_buf,     // [BH, S, D_V] — saved for backward
+    const int32_t* __restrict__ lengths, // [B], nullptr for dense sequences
+    int heads_per_batch,
     int S
 ) {
     const int bh = blockIdx.x;
@@ -111,6 +114,8 @@ __global__ void gated_delta_rule_kernel(
     const float* g_bh = g + bh * S;
     const float* beta_bh = beta + bh * S;
     float* out_bh = out + bh * S * DR_D_V;
+    const int valid_len = lengths == nullptr ? S :
+        max(0, min(S, lengths[bh / heads_per_batch]));
 
     // Each thread processes column dv = tid
     // Access pattern: state_s[dk * DR_D_V + tid] for dk = 0..127
@@ -118,7 +123,7 @@ __global__ void gated_delta_rule_kernel(
     // Bank mapping: bank = (dk * DR_D_V + tid) % 32 = tid % 32 (since 128 % 32 == 0)
     // → All threads in a warp access different banks (tid 0..31 → banks 0..31) ✅ no conflict
 
-    for (int t = 0; t < S; t++) {
+    for (int t = 0; t < valid_len; t++) {
         const float g_t = g_bh[t];
         const float beta_t = beta_bh[t];
         const float* q_t = q_bh + t * DR_D_K;
@@ -168,6 +173,12 @@ __global__ void gated_delta_rule_kernel(
         __syncthreads();  // Ensure state visible before next token
     }
 
+    for (int t = valid_len; t < S; ++t) {
+        out_bh[t * DR_D_V + tid] = 0.0f;
+        if (delta_buf != nullptr)
+            delta_buf[bh * S * DR_D_V + t * DR_D_V + tid] = 0.0f;
+    }
+
     // Write back state to global memory
     float* state_w = state + bh * DR_D_K * DR_D_V;
     #pragma unroll
@@ -184,10 +195,11 @@ inline void launch_gated_delta_rule(
     const float* q, const float* k, const float* v,
     const float* g_exp, const float* beta,
     float* state, float* out, float* delta_buf,
+    const int32_t* lengths, int heads_per_batch,
     int BH, int seq_len, int key_dim, int val_dim,
     cudaStream_t stream
 ) {
-    if (key_dim != DR_D_K || val_dim != DR_D_V) {
+    if (key_dim != DR_D_K || val_dim != DR_D_V || heads_per_batch <= 0) {
         fprintf(stderr, "[delta_rule] ERROR: D_K=%d or D_V=%d mismatch (expected %d/%d)\n",
                 key_dim, val_dim, DR_D_K, DR_D_V);
         return;
@@ -203,7 +215,8 @@ inline void launch_gated_delta_rule(
         cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
 
     gated_delta_rule_kernel<<<grid, block, smem_size, stream>>>(
-        q, k, v, g_exp, beta, state, out, delta_buf, seq_len
+        q, k, v, g_exp, beta, state, out, delta_buf,
+        lengths, heads_per_batch, seq_len
     );
 }
 
@@ -389,6 +402,8 @@ __global__ void gated_delta_rule_backward_kernel_correct(
     float* __restrict__ grad_v,
     float* __restrict__ grad_g,
     float* __restrict__ grad_beta,
+    const int32_t* __restrict__ lengths,
+    int heads_per_batch,
     int S
 ) {
     const int bh = blockIdx.x;
@@ -424,8 +439,23 @@ __global__ void gated_delta_rule_backward_kernel_correct(
     float* gv_bh = grad_v + bh * S * DR_D_V;
     float* gg_bh = grad_g + bh * S;
     float* gb_bh = grad_beta + bh * S;
+    const int valid_len = lengths == nullptr ? S :
+        max(0, min(S, lengths[bh / heads_per_batch]));
 
-    for (int t = S - 1; t >= 0; --t) {
+    for (int t = valid_len; t < S; ++t) {
+        if (tid < DR_D_K) {
+            gq_bh[t * DR_D_K + tid] = 0.0f;
+            gk_bh[t * DR_D_K + tid] = 0.0f;
+        }
+        gv_bh[t * DR_D_V + tid] = 0.0f;
+        if (tid == 0) {
+            gg_bh[t] = 0.0f;
+            gb_bh[t] = 0.0f;
+        }
+    }
+    __syncthreads();
+
+    for (int t = valid_len - 1; t >= 0; --t) {
         const float* q_t = q_bh + t * DR_D_K;
         const float* k_t = k_bh + t * DR_D_K;
         const float g_t = g_bh[t];
@@ -527,10 +557,11 @@ inline int launch_gated_delta_rule_backward(
     const float* grad_out,
     float* grad_q, float* grad_k, float* grad_v,
     float* grad_g, float* grad_beta,
+    const int32_t* lengths, int heads_per_batch,
     int BH, int seq_len, int key_dim, int val_dim,
     cudaStream_t stream
 ) {
-    if (key_dim != DR_D_K || val_dim != DR_D_V) {
+    if (key_dim != DR_D_K || val_dim != DR_D_V || heads_per_batch <= 0) {
         fprintf(stderr, "[delta_rule_backward] ERROR: D_K=%d or D_V=%d mismatch\n", key_dim, val_dim);
         return -1;
     }
@@ -551,7 +582,8 @@ inline int launch_gated_delta_rule_backward(
 
     gated_delta_rule_backward_kernel_correct<<<grid, block, smem_size, stream>>>(
         q, k, v, g_exp, beta, final_state, delta_buf, grad_out,
-        grad_q, grad_k, grad_v, grad_g, grad_beta, seq_len
+        grad_q, grad_k, grad_v, grad_g, grad_beta,
+        lengths, heads_per_batch, seq_len
     );
     return 0;
 }

@@ -59,6 +59,16 @@ One `TpCopyToRegion` must wrap the shared input before the QKV/Z/A/B forks so ba
 
 The current fused CUDA backward reconstructs earlier states by dividing the decayed state by `g_exp`. This is fast and verified with realistic negative `dt_bias`, where decay stays near one, but it is ill-conditioned for synthetic long sequences with decay near `0.5`. A stable production replacement should checkpoint recurrent state by chunks and replay each chunk during backward instead of repeatedly inverting the decay.
 
+## Right-Padding Fast Path
+
+Strict-right-padding masks are reduced once to device-resident `lengths[B]`.
+The persistent GDN forward and backward kernels stop at each sample's valid
+length and explicitly zero output and gradient tails. Chunked eval converts the
+global lengths to per-chunk offsets, and the batched LoRA path narrows lengths
+with the same adapter sub-batch as Q/K/V. Dense batches use an empty sentinel
+and retain the null-pointer fast path. Left padding and internal holes remain
+rejected until packed `cu_seqlens` boundaries are implemented.
+
 ## Native GDN TP Verification
 
 Use a Python environment with ABI-compatible prebuilt PyTorch, CUDA, and NCCL, then run:

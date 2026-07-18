@@ -744,9 +744,25 @@ int main() {
     auto right_target = batch.target_mask.clone();
     right_attention.select(1, right_attention.size(1) - 1).fill_(false);
     right_target.select(1, right_target.size(1) - 1).fill_(0.0);
-    assert(std::isfinite(qwen36_eval_step(
+    const double right_loss = qwen36_eval_step(
         fixed_contexts.distributed, &batch.input_ids, &right_target,
-        &right_attention)));
+        &right_attention);
+    assert(std::isfinite(right_loss));
+    // A strict-right-padded token must not enter the recurrent state or affect
+    // any scored position. Changing only that token should be observationally
+    // invisible to the GDN eval path.
+    auto padded_ids_a = batch.input_ids.clone();
+    auto padded_ids_b = batch.input_ids.clone();
+    padded_ids_a.select(1, padded_ids_a.size(1) - 1).fill_(17);
+    padded_ids_b.select(1, padded_ids_b.size(1) - 1).fill_(63);
+    const double padded_loss_a = qwen36_eval_step(
+        fixed_contexts.distributed, &padded_ids_a, &right_target,
+        &right_attention);
+    const double padded_loss_b = qwen36_eval_step(
+        fixed_contexts.distributed, &padded_ids_b, &right_target,
+        &right_attention);
+    assert(std::isfinite(padded_loss_a) && std::isfinite(padded_loss_b));
+    assert(std::fabs(padded_loss_a - padded_loss_b) < 1e-6);
     auto invalid_attention = batch.attention_mask.clone();
     invalid_attention.index_put_({0, 0}, false);
     const double invalid_mask_loss = qwen36_eval_step(
