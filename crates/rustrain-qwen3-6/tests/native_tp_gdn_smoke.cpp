@@ -735,6 +735,21 @@ int main() {
         configs, all_targets, true);
     auto fixed_fixtures = make_lora_fixtures(rank, 2000);
     set_fixed_lora(fixed_contexts, fixed_fixtures);
+    // GDN state is recurrent, so left padding/internal holes must be rejected
+    // until the native kernel accepts packed cu_seqlens boundaries.
+    auto right_attention = batch.attention_mask.clone();
+    auto right_target = batch.target_mask.clone();
+    right_attention.select(1, right_attention.size(1) - 1).fill_(false);
+    right_target.select(1, right_target.size(1) - 1).fill_(0.0);
+    assert(std::isfinite(qwen36_eval_step(
+        fixed_contexts.distributed, &batch.input_ids, &right_target,
+        &right_attention)));
+    auto invalid_attention = batch.attention_mask.clone();
+    invalid_attention.index_put_({0, 0}, false);
+    const double invalid_mask_loss = qwen36_eval_step(
+        fixed_contexts.distributed, &batch.input_ids, &batch.target_mask,
+        &invalid_attention);
+    assert(invalid_mask_loss < 0.0);
     check_fixed_path(
         fixed_contexts, fixed_fixtures, short_batch, batch, rank);
     qwen36_free_training_context(fixed_contexts.reference);

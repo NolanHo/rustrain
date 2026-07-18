@@ -3965,6 +3965,42 @@ static void elide_trivial_attention_mask(TrainingContext* ctx) {
     }
 }
 
+// Linear attention carries recurrent state across the sequence. Until the
+// kernel accepts packed cu_seqlens, only full sequences and strict right
+// padding are safe; a 0 -> 1 transition would let padding state leak into a
+// later real token (left padding and internal holes).
+static void validate_linear_attention_mask(
+    TrainingContext* ctx, const at::Tensor& attention_mask
+) {
+    if (!ctx || !attention_mask.defined() || attention_mask.numel() == 0) return;
+    bool has_linear = false;
+    for (const auto& cfg : ctx->layer_configs) {
+        if (cfg.layer_type != 0) {
+            has_linear = true;
+            break;
+        }
+    }
+    if (!has_linear) {
+        for (const auto& cfg : ctx->mtp_layer_configs) {
+            if (cfg.layer_type != 0) {
+                has_linear = true;
+                break;
+            }
+        }
+    }
+    if (!has_linear) return;
+    TORCH_CHECK(attention_mask.dim() == 2,
+        "linear-attention mask must be [batch, seq]");
+    auto mask = attention_mask.to(at::kBool);
+    if (mask.size(1) <= 1) return;
+    auto leading = mask.narrow(1, 0, mask.size(1) - 1);
+    auto trailing = mask.narrow(1, 1, mask.size(1) - 1);
+    auto invalid_transition = leading.logical_not().logical_and(trailing);
+    TORCH_CHECK(!invalid_transition.any().item<bool>(),
+        "linear attention only supports full or strict right-padding masks; "
+        "left-padding/internal holes require packed cu_seqlens support");
+}
+
 // ── Multi-LoRA: concat all adapters' A/B, 2x GEMM ──
 // Pre-build cache of concatenated A/B per (layer, module) pair.
 // Called once at start of forward; reused across all layers.
@@ -6787,7 +6823,9 @@ __attribute__((visibility("default"))) double qwen36_train_micro_step(
         validate_fixed_collective_registry(ctx, apply_optimizer);
         auto& target_mask = *target_mask_tensor;
         if (attention_mask_ptr) {
-            ctx->attention_mask = *reinterpret_cast<at::Tensor*>(attention_mask_ptr);
+            auto& attention_mask = *reinterpret_cast<at::Tensor*>(attention_mask_ptr);
+            validate_linear_attention_mask(ctx, attention_mask);
+            ctx->attention_mask = attention_mask;
             elide_trivial_attention_mask(ctx);
         }
 
@@ -7237,6 +7275,7 @@ static double qwen36_train_multi_lora_impl(
         at::Tensor provided_attention_mask;
         if (attention_mask_tensor) {
             provided_attention_mask = *attention_mask_tensor;
+            validate_linear_attention_mask(ctx, provided_attention_mask);
         }
         const at::Tensor saved_attention_mask = ctx->attention_mask;
         const bool saved_use_checkpoint = ctx->use_checkpoint;
@@ -8733,7 +8772,9 @@ __attribute__((visibility("default"), used))
 void qwen36_set_attention_mask(void* ctx_ptr, void* mask_ptr) {
     auto* ctx = reinterpret_cast<TrainingContext*>(ctx_ptr);
     if (mask_ptr) {
-        ctx->attention_mask = *reinterpret_cast<at::Tensor*>(mask_ptr);
+        auto& mask = *reinterpret_cast<at::Tensor*>(mask_ptr);
+        validate_linear_attention_mask(ctx, mask);
+        ctx->attention_mask = mask;
     }
 }
 
@@ -9263,8 +9304,11 @@ double qwen36_eval_step(void* ctx_ptr, void* input_ids_ptr, void* target_mask_pt
             "ordinary eval_step has no tenant mapping");
         auto& input_ids = *reinterpret_cast<at::Tensor*>(input_ids_ptr);
         auto& target_mask = *reinterpret_cast<at::Tensor*>(target_mask_ptr);
-        if (attention_mask_ptr)
-            ctx->attention_mask = *reinterpret_cast<at::Tensor*>(attention_mask_ptr);
+        if (attention_mask_ptr) {
+            auto& attention_mask = *reinterpret_cast<at::Tensor*>(attention_mask_ptr);
+            validate_linear_attention_mask(ctx, attention_mask);
+            ctx->attention_mask = attention_mask;
+        }
         elide_trivial_attention_mask(ctx);
         at::AutoGradMode no_grad(false);
         auto hidden = ctx->use_checkpoint ? forward_full_checkpoint(ctx, input_ids) : forward_full(ctx, input_ids);
