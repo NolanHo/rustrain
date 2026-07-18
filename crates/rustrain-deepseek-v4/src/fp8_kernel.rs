@@ -764,15 +764,38 @@ pub fn fp8_linear_bias(
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
-type ForwardFn = Box<dyn Fn(&Tensor) -> Tensor + Send>;
+type ForwardFn = Box<dyn Fn(&Tensor) -> Result<Tensor> + Send>;
+type SharedForwardFn = Arc<Mutex<ForwardFn>>;
 
-static CHECKPOINT_REGISTRY: OnceLock<Mutex<HashMap<usize, ForwardFn>>> = OnceLock::new();
+static CHECKPOINT_REGISTRY: OnceLock<Mutex<HashMap<usize, SharedForwardFn>>> = OnceLock::new();
+static CHECKPOINT_ERRORS: OnceLock<Mutex<HashMap<usize, String>>> = OnceLock::new();
 static CHECKPOINT_COUNTER: AtomicUsize = AtomicUsize::new(1);
 
-fn registry() -> &'static Mutex<HashMap<usize, ForwardFn>> {
+fn registry() -> &'static Mutex<HashMap<usize, SharedForwardFn>> {
     CHECKPOINT_REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn registry_lock() -> MutexGuard<'static, HashMap<usize, SharedForwardFn>> {
+    registry()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+fn checkpoint_errors() -> &'static Mutex<HashMap<usize, String>> {
+    CHECKPOINT_ERRORS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn checkpoint_errors_lock() -> MutexGuard<'static, HashMap<usize, String>> {
+    checkpoint_errors()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+fn record_checkpoint_error(key: usize, message: String) {
+    eprintln!("[checkpoint_callback] {message}");
+    checkpoint_errors_lock().insert(key, message);
 }
 
 /// C callback invoked by C++ CheckpointFunction (both forward and backward).
@@ -787,14 +810,29 @@ extern "C" fn checkpoint_callback(
     let input = unsafe { Tensor::clone_from_ptr(impl_ptr as *mut _) };
 
     // Run the forward function from registry
-    let output = {
-        let reg = registry().lock().unwrap();
-        match reg.get(&key) {
-            Some(forward) => forward(&input),
-            None => {
-                eprintln!("[checkpoint_callback] forward function not found for key {key}");
-                return std::ptr::null_mut();
-            }
+    let output = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let forward = registry_lock()
+            .get(&key)
+            .cloned()
+            .with_context(|| format!("checkpoint forward function not found for key {key}"))?;
+        let forward = forward
+            .lock()
+            .map_err(|_| anyhow::anyhow!("checkpoint forward lock is poisoned for key {key}"))?;
+        forward(&input)
+    })) {
+        Ok(Ok(output)) => output,
+        Ok(Err(error)) => {
+            record_checkpoint_error(key, format!("forward failed for key {key}: {error:#}"));
+            return std::ptr::null_mut();
+        }
+        Err(payload) => {
+            let message = payload
+                .downcast_ref::<&str>()
+                .copied()
+                .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+                .unwrap_or("unknown panic");
+            record_checkpoint_error(key, format!("forward panicked for key {key}: {message}"));
+            return std::ptr::null_mut();
         }
     };
 
@@ -812,8 +850,18 @@ pub fn checkpoint<F>(input: &Tensor, forward: F) -> Tensor
 where
     F: Fn(&Tensor) -> Tensor + Send + 'static,
 {
+    checkpoint_result(input, move |input| Ok(forward(input)))
+        .unwrap_or_else(|error| panic!("gradient checkpoint failed: {error:#}"))
+}
+
+/// Fallible gradient checkpoint wrapper for C++ kernels whose forward can
+/// report validation, allocation, or device errors.
+pub fn checkpoint_result<F>(input: &Tensor, forward: F) -> Result<Tensor>
+where
+    F: Fn(&Tensor) -> Result<Tensor> + Send + 'static,
+{
     let key = CHECKPOINT_COUNTER.fetch_add(1, Ordering::SeqCst);
-    registry().lock().unwrap().insert(key, Box::new(forward));
+    registry_lock().insert(key, Arc::new(Mutex::new(Box::new(forward))));
 
     let result_ptr = unsafe {
         v4_checkpoint(
@@ -824,8 +872,11 @@ where
     };
 
     if result_ptr.is_null() {
-        registry().lock().unwrap().remove(&key);
-        panic!("C++ v4_checkpoint returned null");
+        registry_lock().remove(&key);
+        let detail = checkpoint_errors_lock()
+            .remove(&key)
+            .unwrap_or_else(|| "C++ v4_checkpoint returned null".to_string());
+        bail!("{detail}");
     }
 
     let result = unsafe { Tensor::clone_from_ptr(result_ptr as *mut _) };
@@ -834,13 +885,14 @@ where
     // Registry entry is kept for backward pass.
     // It will be cleaned up via clear_checkpoint_registry() after each training step.
 
-    result
+    Ok(result)
 }
 
 /// Clear all checkpoint registry entries. Call after each training step
 /// to prevent GPU memory leak (closures hold tensor references).
 pub fn clear_checkpoint_registry() {
-    registry().lock().unwrap().clear();
+    registry_lock().clear();
+    checkpoint_errors_lock().clear();
     CHECKPOINT_COUNTER.store(1, Ordering::SeqCst);
 }
 
@@ -1897,6 +1949,26 @@ pub fn stream_wait_event(device_id: i32, event: &rustrain_nccl::nccl::CudaEventH
 mod mtp_tests {
     use super::*;
     use tch::{Cuda, Device, Kind};
+
+    #[test]
+    fn checkpoint_result_preserves_gradients_and_reports_forward_errors() {
+        let input = Tensor::from_slice(&[1.0_f32, -2.0, 3.0]).set_requires_grad(true);
+        let output = checkpoint_result(&input, |value| Ok(value * value))
+            .expect("fallible checkpoint forward should succeed");
+        output.sum(Kind::Float).backward();
+        let expected = Tensor::from_slice(&[2.0_f32, -4.0, 6.0]);
+        assert!(input.grad().allclose(&expected, 1e-6, 1e-6, false));
+        clear_checkpoint_registry();
+
+        let error_input = Tensor::ones([1], (Kind::Float, Device::Cpu));
+        let error = checkpoint_result(&error_input, |_| {
+            Err(anyhow::anyhow!("synthetic checkpoint failure"))
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("synthetic checkpoint failure"));
+        clear_checkpoint_registry();
+    }
 
     #[test]
     fn mtp_descriptor_places_weights_proj_scale_next_to_weight() {

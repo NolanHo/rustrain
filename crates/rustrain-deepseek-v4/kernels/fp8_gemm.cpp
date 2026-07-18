@@ -272,6 +272,7 @@ struct CheckpointFunction : public torch::autograd::Function<CheckpointFunction>
         at::AutoGradMode guard(false);
         auto fn = reinterpret_cast<CheckpointFn>(fn_val);
         void* out = fn(reinterpret_cast<void*>(&input), reinterpret_cast<void*>(user_ctx_val));
+        TORCH_CHECK(out != nullptr, "gradient checkpoint forward callback failed");
         auto* t = reinterpret_cast<at::Tensor*>(out);
         at::Tensor result = std::move(*t);
         delete t;
@@ -295,6 +296,7 @@ struct CheckpointFunction : public torch::autograd::Function<CheckpointFunction>
         input_detached.set_requires_grad(true);
 
         void* out = fn(reinterpret_cast<void*>(&input_detached), user_ctx);
+        TORCH_CHECK(out != nullptr, "gradient checkpoint backward callback failed");
         auto* t = reinterpret_cast<at::Tensor*>(out);
         at::Tensor output = std::move(*t);
         delete t;
@@ -307,22 +309,29 @@ struct CheckpointFunction : public torch::autograd::Function<CheckpointFunction>
 
 // C FFI entry point: call from Rust to wrap a forward function with checkpointing
 void* v4_checkpoint(void* fn_ptr, void* input_ptr, void* user_ctx) {
-    auto& input = *reinterpret_cast<at::Tensor*>(input_ptr);
-    auto fn = reinterpret_cast<CheckpointFn>(fn_ptr);
+    try {
+        auto& input = *reinterpret_cast<at::Tensor*>(input_ptr);
 
-    // Ensure input requires grad — checkpoint needs it to set up backward
-    if (!input.requires_grad()) {
-        input.set_requires_grad(true);
+        // Ensure input requires grad — checkpoint needs it to set up backward
+        if (!input.requires_grad()) {
+            input.set_requires_grad(true);
+        }
+
+        // apply() returns at::Tensor in this PyTorch version
+        at::Tensor result = CheckpointFunction::apply(
+            input,
+            (int64_t)(uintptr_t)fn_ptr,
+            (int64_t)(uintptr_t)user_ctx
+        );
+
+        return new at::Tensor(std::move(result));
+    } catch (const c10::Error& e) {
+        std::fprintf(stderr, "v4_checkpoint error: %s\n", e.what());
+        return nullptr;
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "v4_checkpoint exception: %s\n", e.what());
+        return nullptr;
     }
-
-    // apply() returns at::Tensor in this PyTorch version
-    at::Tensor result = CheckpointFunction::apply(
-        input,
-        (int64_t)(uintptr_t)fn_ptr,
-        (int64_t)(uintptr_t)user_ctx
-    );
-
-    return new at::Tensor(std::move(result));
 }
 
 // Helper: create a new at::Tensor* from another at::Tensor* (copy constructor increments refcount)

@@ -728,30 +728,32 @@ static at::Tensor apply_indexer_rope(const at::Tensor& value, const at::Tensor& 
 // to [N, K], multiply, convert to target dtype.
 static at::Tensor dequant_fp8(const at::Tensor& fp8_weight, const at::Tensor& scale,
                                 at::ScalarType target_dtype) {
+    TORCH_CHECK(fp8_weight.dim() == 2, "FP8 weight must be rank 2");
+    TORCH_CHECK(fp8_weight.scalar_type() == at::kFloat8_e4m3fn,
+                "FP8 dequant requires an e4m3fn weight");
+    TORCH_CHECK(scale.dim() == 2, "FP8 scale must be rank 2");
+    TORCH_CHECK(fp8_weight.device() == scale.device(),
+                "FP8 weight and scale must be on the same device before dequant");
     int64_t n = fp8_weight.size(0);
     int64_t k = fp8_weight.size(1);
-    auto device = fp8_weight.device();
-
-    TORCH_CHECK(fp8_weight.dim() == 2, "FP8 weight must be rank 2");
 
     // Step 1: FP8 → F32. Avoid shape-dependent FP8 view conversions by
     // converting a contiguous tensor, then restoring the original shape.
     auto f32_weight = fp8_weight.contiguous().reshape({-1}).to(at::kFloat).reshape({n, k});
 
     // Step 2: expand scale from [n_blocks, k_blocks] to [N, K]
-    // Ensure scale is on the same device as weight
-    auto scale_on_device = scale.to(device).to(at::kFloat);
+    auto scale_f32 = scale.to(at::kFloat);
     int64_t n_blocks = (n + 127) / 128;
     int64_t k_blocks = (k + 127) / 128;
     at::Tensor scale_expanded;
-    if (scale_on_device.size(0) == n_blocks && scale_on_device.size(1) == k_blocks) {
+    if (scale_f32.size(0) == n_blocks && scale_f32.size(1) == k_blocks) {
         // Repeat each block scale over its contiguous 128x128 weight tile.
-        auto expanded = at::repeat_interleave(scale_on_device, 128, 0)
+        auto expanded = at::repeat_interleave(scale_f32, 128, 0)
                             .repeat_interleave(128, 1);
         // Crop to actual [N, K]
         scale_expanded = expanded.narrow(0, 0, n).narrow(1, 0, k);
-    } else if (scale_on_device.sizes() == fp8_weight.sizes()) {
-        scale_expanded = scale_on_device;
+    } else if (scale_f32.sizes() == fp8_weight.sizes()) {
+        scale_expanded = scale_f32;
     } else {
         TORCH_CHECK(false, "FP8 scale must be [ceil(N/128), ceil(K/128)] or [N, K]");
     }
@@ -769,8 +771,18 @@ static at::Tensor safe_linear(const at::Tensor& input, const at::Tensor& weight,
     auto dtype = input.scalar_type();
     auto device = input.device();
     if (weight_scale.has_value() && weight.scalar_type() == at::kFloat8_e4m3fn) {
-        // FP8 path: dequant with scale, then linear
-        auto w_bf16 = dequant_fp8(weight, weight_scale.value(), dtype);
+        const auto& scale = weight_scale.value();
+        TORCH_CHECK(weight.device() == device || weight.device().is_cpu(),
+                    "FP8 weight must reside on CPU or the input device");
+        TORCH_CHECK(scale.device() == device || scale.device().is_cpu(),
+                    "FP8 scale must reside on CPU or the input device");
+
+        // CPU checkpoint tensors must reach the compute device before FP8
+        // conversion.  Tensor::to uses a blocking copy by default.  Already
+        // colocated GPU tensors reuse their existing storage without a copy.
+        auto weight_on_device = weight.device() == device ? weight : weight.to(device);
+        auto scale_on_device = scale.device() == device ? scale : scale.to(device);
+        auto w_bf16 = dequant_fp8(weight_on_device, scale_on_device, dtype);
         return at::linear(input, w_bf16);
     }
     TORCH_CHECK(weight.scalar_type() != at::kFloat8_e4m3fn,

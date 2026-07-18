@@ -38,6 +38,97 @@ fn reattach_ep_token_mean(
     visible_sum / reduced_count.clamp_min(1.0)
 }
 
+struct CheckpointedCppMoeLayer {
+    shared_gate: Tensor,
+    shared_up: Tensor,
+    shared_down: Tensor,
+    shared_gate_scale: Option<Tensor>,
+    shared_up_scale: Option<Tensor>,
+    shared_down_scale: Option<Tensor>,
+    gate: Tensor,
+    correction_bias: Option<Tensor>,
+    expert_gate: Vec<Tensor>,
+    expert_up: Vec<Tensor>,
+    expert_down: Vec<Tensor>,
+    expert_gate_scales: Vec<Option<Tensor>>,
+    expert_up_scales: Vec<Option<Tensor>>,
+    expert_down_scales: Vec<Option<Tensor>>,
+    local_expert_indices: Vec<usize>,
+    n_routed_experts: i32,
+    topk: i32,
+    n_group: i32,
+    topk_group: i32,
+    scoring_func: i32,
+    topk_method: i32,
+    norm_topk_prob: bool,
+    routed_scaling_factor: f64,
+    ep_comm: usize,
+    ep_rank: i32,
+    ep_size: i32,
+    device_id: i32,
+}
+
+impl CheckpointedCppMoeLayer {
+    fn forward(&self, input: &Tensor) -> Result<Tensor> {
+        let expert_gate = self.expert_gate.iter().collect::<Vec<_>>();
+        let expert_up = self.expert_up.iter().collect::<Vec<_>>();
+        let expert_down = self.expert_down.iter().collect::<Vec<_>>();
+        let expert_gate_scales = self
+            .expert_gate_scales
+            .iter()
+            .map(Option::as_ref)
+            .collect::<Vec<_>>();
+        let expert_up_scales = self
+            .expert_up_scales
+            .iter()
+            .map(Option::as_ref)
+            .collect::<Vec<_>>();
+        let expert_down_scales = self
+            .expert_down_scales
+            .iter()
+            .map(Option::as_ref)
+            .collect::<Vec<_>>();
+        rustrain_deepseek_v4::fp8_kernel::glm5_moe_layer_ep_cpp(
+            input,
+            &self.shared_gate,
+            &self.shared_up,
+            &self.shared_down,
+            self.shared_gate_scale.as_ref(),
+            self.shared_up_scale.as_ref(),
+            self.shared_down_scale.as_ref(),
+            &self.gate,
+            self.correction_bias.as_ref(),
+            &expert_gate,
+            &expert_up,
+            &expert_down,
+            &expert_gate_scales,
+            &expert_up_scales,
+            &expert_down_scales,
+            &self.local_expert_indices,
+            self.n_routed_experts,
+            self.topk,
+            self.n_group,
+            self.topk_group,
+            self.scoring_func,
+            self.topk_method,
+            self.norm_topk_prob,
+            self.routed_scaling_factor,
+            self.ep_comm as *mut std::ffi::c_void,
+            self.ep_rank,
+            self.ep_size,
+            self.device_id,
+        )
+    }
+}
+
+struct CheckpointRegistryGuard;
+
+impl Drop for CheckpointRegistryGuard {
+    fn drop(&mut self) {
+        rustrain_deepseek_v4::fp8_kernel::clear_checkpoint_registry();
+    }
+}
+
 /// EP shard for GLM-5.2 (same pattern as V4).
 pub struct Glm5EpShard {
     pub rank: usize,
@@ -126,7 +217,7 @@ fn forward_mtp_decoder_layer_ep(
     layer: usize,
     attn: &Glm5AttentionWeights,
     weights_gpu: &BTreeMap<String, Tensor>,
-    expert_weights_gpu: &BTreeMap<String, Tensor>,
+    expert_weights_runtime: &BTreeMap<String, Tensor>,
     config: &Glm5RuntimeConfig,
     ep_shard: &Glm5EpShard,
     nccl_comm: Option<&NcclPersistentComm>,
@@ -162,25 +253,25 @@ fn forward_mtp_decoder_layer_ep(
     for expert in &ep_shard.local_expert_indices {
         let prefix = format!("{p}.mlp.experts.{expert}");
         expert_gate.push(ptr(tensor(
-            expert_weights_gpu,
+            expert_weights_runtime,
             &format!("{prefix}.gate_proj.weight"),
         )?));
         expert_up.push(ptr(tensor(
-            expert_weights_gpu,
+            expert_weights_runtime,
             &format!("{prefix}.up_proj.weight"),
         )?));
         expert_down.push(ptr(tensor(
-            expert_weights_gpu,
+            expert_weights_runtime,
             &format!("{prefix}.down_proj.weight"),
         )?));
         expert_gate_scales.push(opt_ptr(
-            expert_weights_gpu.get(&format!("{prefix}.gate_proj.weight_scale_inv")),
+            expert_weights_runtime.get(&format!("{prefix}.gate_proj.weight_scale_inv")),
         ));
         expert_up_scales.push(opt_ptr(
-            expert_weights_gpu.get(&format!("{prefix}.up_proj.weight_scale_inv")),
+            expert_weights_runtime.get(&format!("{prefix}.up_proj.weight_scale_inv")),
         ));
         expert_down_scales.push(opt_ptr(
-            expert_weights_gpu.get(&format!("{prefix}.down_proj.weight_scale_inv")),
+            expert_weights_runtime.get(&format!("{prefix}.down_proj.weight_scale_inv")),
         ));
     }
     let local_expert_indices: Vec<i32> = ep_shard
@@ -511,10 +602,7 @@ pub fn train_glm5_lora_sft_ep(
             ] {
                 needed.insert(format!("{p}.self_attn.indexer.{suffix}"));
                 // FP8 scale for indexer wk and wq_b
-                if matches!(
-                    *suffix,
-                    "weights_proj.weight" | "wk.weight" | "wq_b.weight"
-                ) {
+                if matches!(*suffix, "weights_proj.weight" | "wk.weight" | "wq_b.weight") {
                     needed.insert(format!("{p}.self_attn.indexer.{suffix}_scale_inv"));
                 }
             }
@@ -818,7 +906,8 @@ pub fn train_glm5_lora_sft_ep(
     // The C++ attention path remains single-rank because its full-layer ABI has
     // no sequence-parallel/EP group descriptors. The standalone C++ MoE path,
     // however, owns differentiable EP dispatch/return and is safe for EP-only.
-    let use_cpp_attention = rustrain_deepseek_v4::fp8_kernel::is_glm5_attention_available()
+    let use_cpp_attention = config.train.predequant_expert_weights
+        && rustrain_deepseek_v4::fp8_kernel::is_glm5_attention_available()
         && world_size == 1
         && runtime_config
             .rope_scaling_type
@@ -842,6 +931,11 @@ pub fn train_glm5_lora_sft_ep(
             .as_deref()
             .is_none_or(|kind| kind == "default")
         && cpp_router_supported;
+    if !config.train.predequant_expert_weights && !use_cpp_mlp {
+        bail!(
+            "GLM-5 CPU-staged FP8 experts require the compiled C++ MoE kernel; set train.predequant_expert_weights=true only when the complete expert shard fits on each GPU"
+        );
+    }
     if runtime_config.num_nextn_predict_layers > 0 && world_size > 1 && !use_cpp_mlp {
         bail!(
             "GLM-5 native MTP with EP>1 requires the compiled C++ autograd-aware owner dispatch/return kernel; Rust same-position MoE fallback is disabled"
@@ -863,31 +957,35 @@ pub fn train_glm5_lora_sft_ep(
         "set caching allocator memory fraction"
     );
 
-    // ── Cache expert weights on GPU (eliminates per-layer CPU→GPU transfer) ──
-    // Expert weights are frozen (LoRA targets attention only), so they can be
-    // loaded once and reused every step. This eliminates ~87GB/layer PCIe transfer.
-    info!(
-        rank,
-        predequant_fp8 = config.train.predequant_expert_weights,
-        "caching expert weights on GPU"
-    );
-    let mut expert_weights_gpu: BTreeMap<String, Tensor> = BTreeMap::new();
-    // First pass: load all to GPU
-    for (name, t) in &expert_weights_cpu {
-        let gpu_t = t.to_device(device);
-        expert_weights_gpu.insert(name.clone(), gpu_t);
-    }
+    // Expert residency is an explicit throughput/memory policy. Eager mode
+    // keeps the full local shard in BF16 on GPU. Staged mode keeps the FP8
+    // checkpoint tensors on CPU; the checkpointed C++ MoE call transfers and
+    // dequantizes only the current layer, then drops those temporaries.
+    let mut expert_weights_runtime = if config.train.predequant_expert_weights {
+        info!(rank, "caching and pre-dequantizing expert weights on GPU");
+        expert_weights_cpu
+            .into_iter()
+            .map(|(name, tensor)| (name, tensor.to_device(device)))
+            .collect::<BTreeMap<_, _>>()
+    } else {
+        info!(
+            rank,
+            "keeping FP8 expert weights on CPU for checkpointed layer staging"
+        );
+        expert_weights_cpu
+    };
     if config.train.predequant_expert_weights {
         // Pre-dequant FP8 weights once to avoid repeating it in safe_linear.
-        let expert_weight_names: Vec<String> = expert_weights_gpu.keys().cloned().collect();
+        let expert_weight_names: Vec<String> = expert_weights_runtime.keys().cloned().collect();
         for name in &expert_weight_names {
-            if let Some(t) = expert_weights_gpu.get(name) {
+            if let Some(t) = expert_weights_runtime.get(name) {
                 if t.kind() == Kind::Float8e4m3fn {
                     let scale_name = name.replace(".weight", ".weight_scale_inv");
-                    if let Some(scale) = expert_weights_gpu.get(&scale_name) {
+                    if let Some(scale) = expert_weights_runtime.get(&scale_name) {
                         match rustrain_deepseek_v4::fp8_kernel::dequant_fp8_weight(t, scale) {
                             Ok(bf16) => {
-                                expert_weights_gpu.insert(name.clone(), bf16.to_kind(compute_kind));
+                                expert_weights_runtime
+                                    .insert(name.clone(), bf16.to_kind(compute_kind));
                             }
                             Err(e) => {
                                 tracing::warn!(
@@ -903,12 +1001,16 @@ pub fn train_glm5_lora_sft_ep(
             }
         }
     }
-    let expert_gpu_count = expert_weights_gpu.len();
     info!(
         rank,
-        expert_tensors_on_gpu = expert_gpu_count,
+        expert_tensor_count = expert_weights_runtime.len(),
+        residency = if config.train.predequant_expert_weights {
+            "gpu_bf16"
+        } else {
+            "cpu_fp8_staged"
+        },
         predequant_fp8 = config.train.predequant_expert_weights,
-        "expert weights cached on GPU"
+        "expert residency initialized"
     );
 
     // ── Pre-extract constant tensors (avoid per-step BTreeMap lookups) ──
@@ -988,6 +1090,7 @@ pub fn train_glm5_lora_sft_ep(
                 base_token_count_local
             };
             let microbatch_weight = &base_token_count / &aggregate_base_token_count;
+            let _checkpoint_registry_guard = CheckpointRegistryGuard;
 
             // ── Forward ──
             let embed = &embed_weight;
@@ -1091,28 +1194,31 @@ pub fn train_glm5_lora_sft_ep(
                         for &global_e in &ep_shard.local_expert_indices {
                             let eg = format!("{p_str}{global_e}");
                             egw.push(
-                                expert_weights_gpu
+                                expert_weights_runtime
                                     .get(&format!("{eg}.gate_proj.weight"))
                                     .unwrap(),
                             );
                             euw.push(
-                                expert_weights_gpu
+                                expert_weights_runtime
                                     .get(&format!("{eg}.up_proj.weight"))
                                     .unwrap(),
                             );
                             edw.push(
-                                expert_weights_gpu
+                                expert_weights_runtime
                                     .get(&format!("{eg}.down_proj.weight"))
                                     .unwrap(),
                             );
                             egs.push(
-                                expert_weights_gpu.get(&format!("{eg}.gate_proj.weight_scale_inv")),
+                                expert_weights_runtime
+                                    .get(&format!("{eg}.gate_proj.weight_scale_inv")),
                             );
                             eus.push(
-                                expert_weights_gpu.get(&format!("{eg}.up_proj.weight_scale_inv")),
+                                expert_weights_runtime
+                                    .get(&format!("{eg}.up_proj.weight_scale_inv")),
                             );
                             eds.push(
-                                expert_weights_gpu.get(&format!("{eg}.down_proj.weight_scale_inv")),
+                                expert_weights_runtime
+                                    .get(&format!("{eg}.down_proj.weight_scale_inv")),
                             );
                         }
 
@@ -1479,82 +1585,95 @@ pub fn train_glm5_lora_sft_ep(
                     ));
 
                     if use_cpp_mlp {
-                        // ── C++ MoE: one FFI call for routing + dispatch + shared + combine ──
-                        // Build expert weight arrays from CPU-offloaded weights
+                        // One C++ call owns routing, differentiable dispatch/return,
+                        // expert staging, shared MLP, and output combination.
                         let p_str = format!("{p}.mlp.experts.");
-                        let mut egw: Vec<&Tensor> = Vec::new();
-                        let mut euw: Vec<&Tensor> = Vec::new();
-                        let mut edw: Vec<&Tensor> = Vec::new();
-                        let mut egs: Vec<Option<&Tensor>> = Vec::new();
-                        let mut eus: Vec<Option<&Tensor>> = Vec::new();
-                        let mut eds: Vec<Option<&Tensor>> = Vec::new();
+                        let mut expert_gate = Vec::new();
+                        let mut expert_up = Vec::new();
+                        let mut expert_down = Vec::new();
+                        let mut expert_gate_scales = Vec::new();
+                        let mut expert_up_scales = Vec::new();
+                        let mut expert_down_scales = Vec::new();
                         for &global_e in &ep_shard.local_expert_indices {
                             let eg = format!("{p_str}{global_e}");
-                            egw.push(
-                                expert_weights_gpu
-                                    .get(&format!("{eg}.gate_proj.weight"))
-                                    .unwrap(),
+                            expert_gate.push(
+                                tensor(&expert_weights_runtime, &format!("{eg}.gate_proj.weight"))?
+                                    .shallow_clone(),
                             );
-                            euw.push(
-                                expert_weights_gpu
-                                    .get(&format!("{eg}.up_proj.weight"))
-                                    .unwrap(),
+                            expert_up.push(
+                                tensor(&expert_weights_runtime, &format!("{eg}.up_proj.weight"))?
+                                    .shallow_clone(),
                             );
-                            edw.push(
-                                expert_weights_gpu
-                                    .get(&format!("{eg}.down_proj.weight"))
-                                    .unwrap(),
+                            expert_down.push(
+                                tensor(&expert_weights_runtime, &format!("{eg}.down_proj.weight"))?
+                                    .shallow_clone(),
                             );
-                            egs.push(
-                                expert_weights_gpu.get(&format!("{eg}.gate_proj.weight_scale_inv")),
+                            expert_gate_scales.push(
+                                expert_weights_runtime
+                                    .get(&format!("{eg}.gate_proj.weight_scale_inv"))
+                                    .map(Tensor::shallow_clone),
                             );
-                            eus.push(
-                                expert_weights_gpu.get(&format!("{eg}.up_proj.weight_scale_inv")),
+                            expert_up_scales.push(
+                                expert_weights_runtime
+                                    .get(&format!("{eg}.up_proj.weight_scale_inv"))
+                                    .map(Tensor::shallow_clone),
                             );
-                            eds.push(
-                                expert_weights_gpu.get(&format!("{eg}.down_proj.weight_scale_inv")),
+                            expert_down_scales.push(
+                                expert_weights_runtime
+                                    .get(&format!("{eg}.down_proj.weight_scale_inv"))
+                                    .map(Tensor::shallow_clone),
                             );
                         }
-                        let full_mlp = rustrain_deepseek_v4::fp8_kernel::glm5_moe_layer_ep_cpp(
-                            &mlp_input,
-                            &shared_gate,
-                            &shared_up,
-                            &shared_down,
-                            shared_gate_scale,
-                            shared_up_scale,
-                            shared_down_scale,
-                            &gate,
-                            weights_gpu.get(&format!("{p}.mlp.gate.e_score_correction_bias")),
-                            &egw,
-                            &euw,
-                            &edw,
-                            &egs,
-                            &eus,
-                            &eds,
-                            &ep_shard.local_expert_indices,
-                            runtime_config.n_routed_experts as i32,
-                            runtime_config.num_experts_per_tok as i32,
-                            runtime_config.n_group as i32,
-                            runtime_config.topk_group as i32,
-                            match runtime_config.scoring_func.as_str() {
+                        let cpp_moe = CheckpointedCppMoeLayer {
+                            shared_gate,
+                            shared_up,
+                            shared_down,
+                            shared_gate_scale: shared_gate_scale.map(Tensor::shallow_clone),
+                            shared_up_scale: shared_up_scale.map(Tensor::shallow_clone),
+                            shared_down_scale: shared_down_scale.map(Tensor::shallow_clone),
+                            gate,
+                            correction_bias: weights_gpu
+                                .get(&format!("{p}.mlp.gate.e_score_correction_bias"))
+                                .map(Tensor::shallow_clone),
+                            expert_gate,
+                            expert_up,
+                            expert_down,
+                            expert_gate_scales,
+                            expert_up_scales,
+                            expert_down_scales,
+                            local_expert_indices: ep_shard.local_expert_indices.clone(),
+                            n_routed_experts: runtime_config.n_routed_experts as i32,
+                            topk: runtime_config.num_experts_per_tok as i32,
+                            n_group: runtime_config.n_group as i32,
+                            topk_group: runtime_config.topk_group as i32,
+                            scoring_func: match runtime_config.scoring_func.as_str() {
                                 "sigmoid" => 0,
                                 "softmax" => 1,
                                 other => bail!("unsupported GLM5 scoring_func {other:?}"),
                             },
-                            match runtime_config.topk_method.as_str() {
+                            topk_method: match runtime_config.topk_method.as_str() {
                                 "groupwise" => 0,
                                 "noaux_tc" => 1,
                                 other => bail!("unsupported GLM5 topk_method {other:?}"),
                             },
-                            runtime_config.norm_topk_prob,
-                            runtime_config.routed_scaling_factor,
-                            nccl_comm
+                            norm_topk_prob: runtime_config.norm_topk_prob,
+                            routed_scaling_factor: runtime_config.routed_scaling_factor,
+                            ep_comm: nccl_comm
                                 .as_ref()
-                                .map_or(std::ptr::null_mut(), NcclPersistentComm::raw_comm_ptr),
-                            rank as i32,
-                            world_size as i32,
-                            local_rank as i32,
-                        )?;
+                                .map_or(std::ptr::null_mut(), NcclPersistentComm::raw_comm_ptr)
+                                as usize,
+                            ep_rank: rank as i32,
+                            ep_size: world_size as i32,
+                            device_id: local_rank as i32,
+                        };
+                        let full_mlp = if config.train.predequant_expert_weights {
+                            cpp_moe.forward(&mlp_input)?
+                        } else {
+                            rustrain_deepseek_v4::fp8_kernel::checkpoint_result(
+                                &mlp_input,
+                                move |input| cpp_moe.forward(input),
+                            )?
+                        };
                         hidden = &residual + &full_mlp;
                     } else {
                         // ── Rust MoE path (fallback) ──
@@ -1628,27 +1747,27 @@ pub fn train_glm5_lora_sft_ep(
                             }
                             let eg = format!("{p}.mlp.experts.{global_e}");
                             // Expert weights from GPU cache (no CPU→GPU transfer)
-                            let gate_w = expert_weights_gpu
+                            let gate_w = expert_weights_runtime
                                 .get(&format!("{eg}.gate_proj.weight"))
                                 .with_context(|| {
                                     format!("expert weight not found: {eg}.gate_proj.weight")
                                 })?;
-                            let up_w = expert_weights_gpu
+                            let up_w = expert_weights_runtime
                                 .get(&format!("{eg}.up_proj.weight"))
                                 .with_context(|| {
                                     format!("expert weight not found: {eg}.up_proj.weight")
                                 })?;
-                            let down_w = expert_weights_gpu
+                            let down_w = expert_weights_runtime
                                 .get(&format!("{eg}.down_proj.weight"))
                                 .with_context(|| {
                                     format!("expert weight not found: {eg}.down_proj.weight")
                                 })?;
-                            let gate_w_scale =
-                                expert_weights_gpu.get(&format!("{eg}.gate_proj.weight_scale_inv"));
-                            let up_w_scale =
-                                expert_weights_gpu.get(&format!("{eg}.up_proj.weight_scale_inv"));
-                            let down_w_scale =
-                                expert_weights_gpu.get(&format!("{eg}.down_proj.weight_scale_inv"));
+                            let gate_w_scale = expert_weights_runtime
+                                .get(&format!("{eg}.gate_proj.weight_scale_inv"));
+                            let up_w_scale = expert_weights_runtime
+                                .get(&format!("{eg}.up_proj.weight_scale_inv"));
+                            let down_w_scale = expert_weights_runtime
+                                .get(&format!("{eg}.down_proj.weight_scale_inv"));
                             let expert_out = if use_cpp_mlp {
                                 rustrain_deepseek_v4::fp8_kernel::glm5_mlp_fp8_cpp(
                                     &flat_input,
@@ -1869,7 +1988,7 @@ pub fn train_glm5_lora_sft_ep(
                             .get(mtp_layer)
                             .context("cached MTP attention weights are missing")?,
                         &weights_gpu,
-                        &expert_weights_gpu,
+                        &expert_weights_runtime,
                         &runtime_config,
                         &ep_shard,
                         nccl_comm.as_ref(),
