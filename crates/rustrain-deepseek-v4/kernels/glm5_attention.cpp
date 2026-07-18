@@ -2192,7 +2192,7 @@ static at::Tensor tp_identity_sum_backward(const at::Tensor& input, void* comm,
                                            int32_t tp_size) {
     if (tp_size == 1) return input;
     TORCH_CHECK(tp_size > 1 && comm, "TP communicator is missing");
-    TORCH_CHECK(input.is_cuda(), "TP backward collective requires CUDA input");
+    TORCH_CHECK(input.is_cuda(), "TP collective requires CUDA input");
     return Glm5NcclIdentityAllReduceBackward::apply(
         input, static_cast<int64_t>(reinterpret_cast<intptr_t>(comm)));
 }
