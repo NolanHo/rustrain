@@ -316,10 +316,12 @@ pub fn linear_attention(
     let k = k.repeat_interleave_self_int(n_rep, 2, None);
 
     // L2 normalize Q, K (HF uses use_qk_l2norm_in_kernel=True)
-    let q_norm = q.pow_tensor_scalar(2.0).sum_dim_intlist([-1].as_slice(), true, compute_kind).sqrt().clamp_min(1e-6);
-    let k_norm = k.pow_tensor_scalar(2.0).sum_dim_intlist([-1].as_slice(), true, compute_kind).sqrt().clamp_min(1e-6);
-    let q = (&q / &q_norm).to_kind(Kind::Float);
-    let k = (&k / &k_norm).to_kind(Kind::Float);
+    let q = q.to_kind(Kind::Float);
+    let k = k.to_kind(Kind::Float);
+    let q_norm = (q.pow_tensor_scalar(2.0).sum_dim_intlist([-1].as_slice(), true, Kind::Float) + 1e-6).rsqrt();
+    let k_norm = (k.pow_tensor_scalar(2.0).sum_dim_intlist([-1].as_slice(), true, Kind::Float) + 1e-6).rsqrt();
+    let q = &q * &q_norm;
+    let k = &k * &k_norm;
 
     // Scale Q by 1/sqrt(key_dim) — matching HF: scale = 1 / (query.shape[-1] ** 0.5)
     let scale = 1.0 / (key_dim as f64).sqrt();

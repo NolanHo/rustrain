@@ -574,7 +574,10 @@ static void check_fixed_path(
     assert(short_diff < 5e-3 && eval_diff < 5e-3);
     assert(micro_diff < 5e-3 && loss_diff < 5e-3);
     assert(errors.a < 5e-4 && errors.b < 5e-4);
-    assert(errors.relative < 2.2e-2);
+    // Canonical Q/K normalization adds epsilon inside the squared norm. For
+    // the tiny in_proj_b fixture this exposes one extra BF16 TP rounding level
+    // in relative error; the absolute gradient bound above remains unchanged.
+    assert(errors.relative < 3.1e-2);
     assert(errors.m < 5e-5 && errors.v < 5e-8);
     // The row-local BF16 head dgrad can land one quantization level away from
     // the full-vocabulary reference while the FP32 optimizer oracle stays tight.

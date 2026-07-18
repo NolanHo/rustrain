@@ -705,8 +705,10 @@ static at::Tensor linear_attention(
             q = q.repeat_interleave(n_rep, 2);
             k = k.repeat_interleave(n_rep, 2);
 
-            q = (q.to(at::kFloat) / q.to(at::kFloat).norm(2, -1, true).clamp_min(1e-6));
-            k = (k.to(at::kFloat) / k.to(at::kFloat).norm(2, -1, true).clamp_min(1e-6));
+            auto q_f = q.to(at::kFloat);
+            auto k_f = k.to(at::kFloat);
+            q = q_f * (q_f.pow(2).sum(-1, true) + 1e-6).rsqrt();
+            k = k_f * (k_f.pow(2).sum(-1, true) + 1e-6).rsqrt();
             q = q * (1.0 / std::sqrt((double)key_dim));
 
             auto q_t = q.transpose(1, 2).contiguous();
@@ -803,8 +805,10 @@ static at::Tensor linear_attention(
     k = k.repeat_interleave(n_rep, 2);
 
     // L2 normalize Q, K (HF: use_qk_l2norm_in_kernel=True, eps=1e-6)
-    q = (q.to(at::kFloat) / q.to(at::kFloat).norm(2, -1, true).clamp_min(1e-6));
-    k = (k.to(at::kFloat) / k.to(at::kFloat).norm(2, -1, true).clamp_min(1e-6));
+    auto q_f = q.to(at::kFloat);
+    auto k_f = k.to(at::kFloat);
+    q = q_f * (q_f.pow(2).sum(-1, true) + 1e-6).rsqrt();
+    k = k_f * (k_f.pow(2).sum(-1, true) + 1e-6).rsqrt();
 
     // Scale Q by 1/sqrt(key_dim) — matching HF: scale = 1 / (key_dim ** 0.5)
     double scale = 1.0 / std::sqrt((double)key_dim);
@@ -4797,8 +4801,10 @@ static at::Tensor linear_attention_batched(
     k = k.repeat_interleave(n_rep, 2);
 
     // L2 normalize Q, K (per-head, matching HF)
-    q = (q.to(at::kFloat) / q.to(at::kFloat).norm(2, -1, true).clamp_min(1e-6));
-    k = (k.to(at::kFloat) / k.to(at::kFloat).norm(2, -1, true).clamp_min(1e-6));
+    auto q_f = q.to(at::kFloat);
+    auto k_f = k.to(at::kFloat);
+    q = q_f * (q_f.pow(2).sum(-1, true) + 1e-6).rsqrt();
+    k = k_f * (k_f.pow(2).sum(-1, true) + 1e-6).rsqrt();
 
     // DIAG: dump after L2 norm
     if (getenv("QWEN36_DUMP_LAYERS") && layer_idx == 0) {
