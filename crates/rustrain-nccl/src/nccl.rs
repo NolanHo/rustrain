@@ -681,6 +681,20 @@ mod tests {
             assert!((actual - expected).abs() < 1e-6);
         }
     }
+
+    #[test]
+    fn subgroup_coordinates_reject_invalid_sizes_and_ranks() {
+        let zero = validate_group_coordinates(0, 0, 0).unwrap_err();
+        assert!(zero.to_string().contains("greater than zero"));
+
+        let out_of_range = validate_group_coordinates(2, 2, 0).unwrap_err();
+        assert!(out_of_range.to_string().contains("rank 2"));
+    }
+
+    #[test]
+    fn subgroup_coordinates_accept_valid_explicit_ranks() {
+        validate_group_coordinates(1, 4, 3).expect("valid subgroup coordinates should pass");
+    }
 }
 
 // ── Persistent NCCL Communicator ─────────────────────────────────────────────
@@ -716,22 +730,37 @@ impl NcclPersistentComm {
         let rank = parse_env_usize("RANK")?;
         let local_rank = parse_env_usize("LOCAL_RANK")?;
         let world_size = parse_env_usize("WORLD_SIZE")?;
-        if rank >= world_size {
-            bail!("rank {rank} must be smaller than world_size {world_size}");
-        }
-        fs::create_dir_all(output_dir)
-            .with_context(|| format!("failed to create {}", output_dir.display()))?;
+        Self::new_group(output_dir, rank, world_size, local_rank)
+    }
+
+    /// Create a communicator for an explicit process subgroup.
+    ///
+    /// `rank` and `world_size` are relative to the subgroup, while `local_rank`
+    /// identifies the CUDA device on this host. Concurrent subgroups must use
+    /// distinct exchange directories so their NCCL unique IDs cannot collide.
+    pub fn new_group(
+        exchange_dir: &Path,
+        rank: usize,
+        world_size: usize,
+        local_rank: usize,
+    ) -> Result<Self> {
+        validate_group_coordinates(rank, world_size, local_rank)?;
+        fs::create_dir_all(exchange_dir)
+            .with_context(|| format!("failed to create {}", exchange_dir.display()))?;
 
         // Exchange unique ID via file system (only once)
-        let id_path = output_dir.join("nccl-persistent-id.bin");
+        let id_path = exchange_dir.join("nccl-persistent-id.bin");
         let unique_id = if rank == 0 {
             let id = nccl_unique_id()?;
             // Write and fsync to ensure visibility on network FS
-            let f = std::fs::File::create(&id_path)?;
+            let f = std::fs::File::create(&id_path)
+                .with_context(|| format!("failed to create {}", id_path.display()))?;
             use std::io::Write;
             let mut f = f;
-            f.write_all(&unique_id_to_bytes(&id))?;
-            f.sync_all()?;
+            f.write_all(&unique_id_to_bytes(&id))
+                .with_context(|| format!("failed to write {}", id_path.display()))?;
+            f.sync_all()
+                .with_context(|| format!("failed to sync {}", id_path.display()))?;
             id
         } else {
             // Wait for rank 0 to write the ID file
@@ -958,3 +987,19 @@ impl Drop for NcclPersistentComm {
 }
 
 unsafe impl Send for NcclPersistentComm {}
+
+fn validate_group_coordinates(rank: usize, world_size: usize, local_rank: usize) -> Result<()> {
+    if world_size == 0 {
+        bail!("NCCL group world_size must be greater than zero");
+    }
+    if rank >= world_size {
+        bail!("rank {rank} must be smaller than world_size {world_size}");
+    }
+    if world_size > c_int::MAX as usize {
+        bail!("NCCL group world_size {world_size} exceeds c_int::MAX");
+    }
+    if local_rank > c_int::MAX as usize {
+        bail!("NCCL local_rank {local_rank} exceeds c_int::MAX");
+    }
+    Ok(())
+}
