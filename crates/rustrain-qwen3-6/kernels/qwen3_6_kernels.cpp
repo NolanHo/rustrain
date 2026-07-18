@@ -397,6 +397,148 @@ struct TpCopyToRegionFunction : public torch::autograd::Function<TpCopyToRegionF
     }
 };
 
+// Sequence-parallel collectives keep the public activation layout
+// [batch, sequence, hidden]. NCCL's all-gather/reduce-scatter layout is
+// rank-major, so batch>1 requires an explicit permutation at both boundaries.
+static at::Tensor tp_sequence_all_gather(
+    const at::Tensor& input, ncclComm_t comm, cudaStream_t requested_stream,
+    int64_t world
+) {
+    TORCH_CHECK(input.is_cuda() && input.dim() == 3 && input.is_contiguous(),
+        "sequence all-gather requires contiguous CUDA [batch, seq, hidden]");
+    TORCH_CHECK(comm && world > 1, "sequence all-gather requires TP communicator");
+    const int device = input.device().index();
+    const auto current = c10::cuda::getCurrentCUDAStream(device).stream();
+    Qwen36StreamFence fence(current, requested_stream);
+    auto rank_major = at::empty(
+        {world, input.size(0), input.size(1), input.size(2)}, input.options());
+    const auto error = ncclAllGather(
+        input.data_ptr(), rank_major.data_ptr(), input.numel(),
+        NcclAllReduceFunction::dtype_for(input.scalar_type()), comm,
+        fence.operation);
+    TORCH_CHECK(error == ncclSuccess, "TP sequence all-gather failed: ",
+        ncclGetErrorString(error));
+    fence.complete();
+    return rank_major.permute({1, 0, 2, 3}).reshape({
+        input.size(0), input.size(1) * world, input.size(2)}).contiguous();
+}
+
+static at::Tensor tp_sequence_reduce_scatter(
+    const at::Tensor& input, ncclComm_t comm, cudaStream_t requested_stream,
+    int64_t world
+) {
+    TORCH_CHECK(input.is_cuda() && input.dim() == 3,
+        "sequence reduce-scatter requires CUDA [batch, seq, hidden]");
+    TORCH_CHECK(comm && world > 1 && input.size(1) % world == 0,
+        "sequence reduce-scatter requires sequence divisible by TP_SIZE");
+    const int64_t local_sequence = input.size(1) / world;
+    auto rank_major = input.reshape({
+        input.size(0), world, local_sequence, input.size(2)})
+        .permute({1, 0, 2, 3}).contiguous();
+    auto output = at::empty(
+        {input.size(0), local_sequence, input.size(2)}, input.options());
+    const int device = input.device().index();
+    const auto current = c10::cuda::getCurrentCUDAStream(device).stream();
+    Qwen36StreamFence fence(current, requested_stream);
+    const auto error = ncclReduceScatter(
+        rank_major.data_ptr(), output.data_ptr(), output.numel(),
+        NcclAllReduceFunction::dtype_for(input.scalar_type()), ncclSum, comm,
+        fence.operation);
+    TORCH_CHECK(error == ncclSuccess, "TP sequence reduce-scatter failed: ",
+        ncclGetErrorString(error));
+    fence.complete();
+    return output;
+}
+
+// Megatron gather_from_sequence_parallel_region: gather in forward and sum
+// column-parallel dgrad contributions while scattering them in backward.
+struct TpGatherFromSequenceFunction
+    : public torch::autograd::Function<TpGatherFromSequenceFunction> {
+    static at::Tensor forward(
+        torch::autograd::AutogradContext* ctx, at::Tensor input,
+        int64_t comm_ptr, int64_t stream_ptr, int64_t world
+    ) {
+        ctx->saved_data["comm"] = comm_ptr;
+        ctx->saved_data["stream"] = stream_ptr;
+        ctx->saved_data["world"] = world;
+        return tp_sequence_all_gather(
+            input.contiguous(), reinterpret_cast<ncclComm_t>(comm_ptr),
+            reinterpret_cast<cudaStream_t>(stream_ptr), world);
+    }
+
+    static std::vector<at::Tensor> backward(
+        torch::autograd::AutogradContext* ctx,
+        std::vector<at::Tensor> grad_output
+    ) {
+        auto grad_input = tp_sequence_reduce_scatter(
+            grad_output[0],
+            reinterpret_cast<ncclComm_t>(ctx->saved_data["comm"].toInt()),
+            reinterpret_cast<cudaStream_t>(ctx->saved_data["stream"].toInt()),
+            ctx->saved_data["world"].toInt());
+        return {grad_input, at::Tensor(), at::Tensor(), at::Tensor()};
+    }
+};
+
+// Megatron reduce_scatter_to_sequence_parallel_region: sum row-parallel
+// outputs in forward; backward is a plain all-gather because each rank owns a
+// disjoint upstream sequence slice.
+struct TpReduceScatterToSequenceFunction
+    : public torch::autograd::Function<TpReduceScatterToSequenceFunction> {
+    static at::Tensor forward(
+        torch::autograd::AutogradContext* ctx, at::Tensor input,
+        int64_t comm_ptr, int64_t stream_ptr, int64_t world
+    ) {
+        ctx->saved_data["comm"] = comm_ptr;
+        ctx->saved_data["stream"] = stream_ptr;
+        ctx->saved_data["world"] = world;
+        return tp_sequence_reduce_scatter(
+            input, reinterpret_cast<ncclComm_t>(comm_ptr),
+            reinterpret_cast<cudaStream_t>(stream_ptr), world);
+    }
+
+    static std::vector<at::Tensor> backward(
+        torch::autograd::AutogradContext* ctx,
+        std::vector<at::Tensor> grad_output
+    ) {
+        auto grad_input = tp_sequence_all_gather(
+            grad_output[0].contiguous(),
+            reinterpret_cast<ncclComm_t>(ctx->saved_data["comm"].toInt()),
+            reinterpret_cast<cudaStream_t>(ctx->saved_data["stream"].toInt()),
+            ctx->saved_data["world"].toInt());
+        return {grad_input, at::Tensor(), at::Tensor(), at::Tensor()};
+    }
+};
+
+// The vocabulary loss already sums its hidden dgrad over TP. Its gather must
+// therefore map backward to a plain local sequence slice, not another
+// reduce-scatter, which would multiply the hidden gradient by TP_SIZE.
+struct TpGatherForLossFunction
+    : public torch::autograd::Function<TpGatherForLossFunction> {
+    static at::Tensor forward(
+        torch::autograd::AutogradContext* ctx, at::Tensor input,
+        int64_t comm_ptr, int64_t stream_ptr, int64_t rank, int64_t world
+    ) {
+        ctx->saved_data["rank"] = rank;
+        ctx->saved_data["world"] = world;
+        ctx->saved_data["local_sequence"] = input.size(1);
+        return tp_sequence_all_gather(
+            input.contiguous(), reinterpret_cast<ncclComm_t>(comm_ptr),
+            reinterpret_cast<cudaStream_t>(stream_ptr), world);
+    }
+
+    static std::vector<at::Tensor> backward(
+        torch::autograd::AutogradContext* ctx,
+        std::vector<at::Tensor> grad_output
+    ) {
+        const int64_t rank = ctx->saved_data["rank"].toInt();
+        const int64_t local_sequence =
+            ctx->saved_data["local_sequence"].toInt();
+        auto grad_input = grad_output[0]
+            .narrow(1, rank * local_sequence, local_sequence).contiguous();
+        return {grad_input, at::Tensor(), at::Tensor(), at::Tensor(), at::Tensor()};
+    }
+};
+
 struct FusedSwiGLUFunction : public torch::autograd::Function<FusedSwiGLUFunction> {
     static at::Tensor forward(torch::autograd::AutogradContext* ctx,
         at::Tensor gate, at::Tensor up, double limit) {
@@ -2713,6 +2855,14 @@ struct TrainingContext {
     cudaStream_t tp_stream = nullptr;
     int tp_world_size = 1;
     int tp_rank = 0;
+    // TP2 sequence parallelism partitions hidden activations over sequence
+    // while frozen projection weights retain their existing TP shards.
+    bool sequence_parallel = false;
+    int64_t sequence_parallel_embedding_scatter_count = 0;
+    int64_t sequence_parallel_all_gather_count = 0;
+    int64_t sequence_parallel_reduce_scatter_count = 0;
+    int64_t sequence_parallel_loss_gather_count = 0;
+    int64_t sequence_parallel_last_local_sequence = 0;
     // Context and pipeline communicators are initialized as part of the
     // five-dimensional process grid. Model execution remains fail-closed
     // until sequence partitioning and stage ownership are implemented.
@@ -2993,6 +3143,7 @@ static void hash_collective_topology(
     hash.add_u64(ctx->base_tp_attention);
     hash.add_u64(ctx->base_tp_mlp);
     hash.add_u64(ctx->vocab_parallel);
+    hash.add_u64(ctx->sequence_parallel);
     hash.add_u64(ctx->expert_parallel);
     hash.add_u64(ctx->data_parallel);
     hash.add_u64(env_enabled("QWEN36_EP_A2A"));
@@ -3030,6 +3181,41 @@ static void validate_native_execution_topology(const TrainingContext* ctx) {
         "native Qwen PP/CP communicator initialization is available, but model "
         "execution requires stage ownership and context partitioning; CP_SIZE=",
         ctx->cp_world_size, " PP_SIZE=", ctx->pp_world_size);
+    if (ctx->sequence_parallel) {
+        TORCH_CHECK(ctx->tp_world_size == 2 && ctx->tp_comm,
+            "sequence parallelism currently requires initialized TP_SIZE=2");
+        TORCH_CHECK(ctx->cp_world_size == 1 && ctx->pp_world_size == 1 &&
+                ctx->ep_world_size == 1 && ctx->dp_world_size == 1,
+            "sequence parallelism currently requires CP=PP=EP=DP=1");
+        TORCH_CHECK(ctx->base_tp_attention && ctx->base_tp_mlp &&
+                ctx->vocab_parallel,
+            "sequence parallelism requires base attention, base MLP, and "
+            "vocabulary tensor parallelism");
+        TORCH_CHECK(!ctx->has_mtp,
+            "sequence parallelism does not support MTP");
+        TORCH_CHECK(ctx->adapters.empty(),
+            "sequence parallelism currently supports fixed LoRA only");
+        TORCH_CHECK(ctx->router_aux_loss_coef == 0.0,
+            "sequence parallelism does not support router auxiliary loss");
+        for (const auto& config : ctx->layer_configs) {
+            TORCH_CHECK(config.num_experts == 0,
+                "sequence parallelism currently supports dense layers only");
+        }
+        for (int64_t layer = 0; layer < ctx->num_layers; ++layer) {
+            const auto table = lora_projection_table(ctx->layer_configs[layer]);
+            const int64_t offset = ctx->lora_layer_offset[layer];
+            for (int64_t pair = 0; pair < table.count; ++pair) {
+                const int64_t slot = offset + pair;
+                if (slot >= static_cast<int64_t>(ctx->lora_active.size()) ||
+                    !ctx->lora_active[slot]) continue;
+                TORCH_CHECK(
+                    lora_tp_layout(ctx, layer, pair) != LoraTpLayout::LatentRank,
+                    "sequence parallelism does not support latent-rank LoRA; "
+                    "projection ", table.entries[pair].name,
+                    " at layer ", layer, " must use base TP sharding");
+            }
+        }
+    }
 }
 
 static void validate_adapter_collective_registry(
@@ -3699,6 +3885,72 @@ static bool base_tp_attention_enabled(const TrainingContext* ctx) {
     return ctx && ctx->base_tp_attention && ctx->tp_world_size > 1;
 }
 
+static bool sequence_parallel_enabled(const TrainingContext* ctx) {
+    return ctx && ctx->sequence_parallel && ctx->tp_world_size > 1;
+}
+
+static at::Tensor sequence_parallel_embedding_scatter(
+    TrainingContext* ctx, const at::Tensor& full_hidden
+) {
+    if (!sequence_parallel_enabled(ctx)) return full_hidden;
+    TORCH_CHECK(full_hidden.dim() == 3 &&
+            full_hidden.size(1) % ctx->tp_world_size == 0,
+        "sequence length=", full_hidden.dim() == 3 ? full_hidden.size(1) : -1,
+        " must be divisible by TP_SIZE=", ctx->tp_world_size);
+    const int64_t local_sequence = full_hidden.size(1) / ctx->tp_world_size;
+    ++ctx->sequence_parallel_embedding_scatter_count;
+    ctx->sequence_parallel_last_local_sequence = local_sequence;
+    return full_hidden.narrow(
+        1, ctx->tp_rank * local_sequence, local_sequence).contiguous();
+}
+
+static at::Tensor sequence_parallel_column_gather(
+    TrainingContext* ctx, const at::Tensor& local_hidden
+) {
+    TORCH_CHECK(sequence_parallel_enabled(ctx) && ctx->tp_comm,
+        "sequence column gather requires an initialized TP communicator");
+    ++ctx->sequence_parallel_all_gather_count;
+    return TpGatherFromSequenceFunction::apply(
+        local_hidden.contiguous(), (int64_t)ctx->tp_comm,
+        (int64_t)reinterpret_cast<uintptr_t>(ctx->tp_stream),
+        ctx->tp_world_size);
+}
+
+static at::Tensor sequence_parallel_row_reduce_scatter(
+    TrainingContext* ctx, const at::Tensor& full_local_output
+) {
+    TORCH_CHECK(sequence_parallel_enabled(ctx) && ctx->tp_comm,
+        "sequence row reduce-scatter requires an initialized TP communicator");
+    ++ctx->sequence_parallel_reduce_scatter_count;
+    return TpReduceScatterToSequenceFunction::apply(
+        full_local_output, (int64_t)ctx->tp_comm,
+        (int64_t)reinterpret_cast<uintptr_t>(ctx->tp_stream),
+        ctx->tp_world_size);
+}
+
+static at::Tensor sequence_parallel_loss_gather(
+    TrainingContext* ctx, const at::Tensor& local_hidden
+) {
+    if (!sequence_parallel_enabled(ctx)) return local_hidden;
+    ++ctx->sequence_parallel_loss_gather_count;
+    return TpGatherForLossFunction::apply(
+        local_hidden.contiguous(), (int64_t)ctx->tp_comm,
+        (int64_t)reinterpret_cast<uintptr_t>(ctx->tp_stream),
+        ctx->tp_rank, ctx->tp_world_size);
+}
+
+static at::Tensor sequence_parallel_plain_split(
+    TrainingContext* ctx, const at::Tensor& full_gradient
+) {
+    if (!sequence_parallel_enabled(ctx)) return full_gradient;
+    TORCH_CHECK(full_gradient.dim() == 3 &&
+            full_gradient.size(1) % ctx->tp_world_size == 0,
+        "loss hidden gradient sequence must be divisible by TP_SIZE");
+    const int64_t local_sequence = full_gradient.size(1) / ctx->tp_world_size;
+    return full_gradient.narrow(
+        1, ctx->tp_rank * local_sequence, local_sequence).contiguous();
+}
+
 static bool vocab_parallel_enabled(const TrainingContext* ctx) {
     return ctx && ctx->vocab_parallel && ctx->tp_world_size > 1;
 }
@@ -3717,7 +3969,9 @@ static at::Tensor vocabulary_embedding(
     TrainingContext* ctx, const at::Tensor& input_ids
 ) {
     auto embed = *ctx->embed_ptr[0];
-    if (!vocab_parallel_enabled(ctx)) return at::embedding(embed, input_ids);
+    if (!vocab_parallel_enabled(ctx))
+        return sequence_parallel_embedding_scatter(
+            ctx, at::embedding(embed, input_ids));
 
     const int64_t vocab_start = ctx->tp_rank * ctx->local_vocab_size;
     const int64_t vocab_end = vocab_start + ctx->local_vocab_size;
@@ -3725,7 +3979,8 @@ static at::Tensor vocabulary_embedding(
     auto local_ids = (input_ids - vocab_start).clamp(0, ctx->local_vocab_size - 1);
     auto local_hidden = at::embedding(embed, local_ids);
     local_hidden = local_hidden * in_range.unsqueeze(-1).to(local_hidden.scalar_type());
-    return tp_allreduce_value(ctx, local_hidden, ncclSum);
+    return sequence_parallel_embedding_scatter(
+        ctx, tp_allreduce_value(ctx, local_hidden, ncclSum));
 }
 
 static bool base_tp_mlp_enabled(const TrainingContext* ctx) {
@@ -3746,6 +4001,8 @@ static at::Tensor tp_allreduce_base_mlp(
     TORCH_CHECK(ctx->tp_comm,
         "base MLP TP communicator is not initialized for TP_SIZE=",
         ctx->tp_world_size);
+    if (sequence_parallel_enabled(ctx))
+        return sequence_parallel_row_reduce_scatter(ctx, local_output);
     return NcclAllReduceFunction::apply(
         local_output, (int64_t)ctx->tp_comm,
         (int64_t)reinterpret_cast<uintptr_t>(ctx->tp_stream));
@@ -3759,6 +4016,8 @@ static at::Tensor tp_copy_base_mlp_input(
     TORCH_CHECK(ctx->tp_comm,
         "base MLP TP communicator is not initialized for TP_SIZE=",
         ctx->tp_world_size);
+    if (sequence_parallel_enabled(ctx))
+        return sequence_parallel_column_gather(ctx, input);
     return TpCopyToRegionFunction::apply(
         input, (int64_t)ctx->tp_comm,
         (int64_t)reinterpret_cast<uintptr_t>(ctx->tp_stream));
@@ -3772,6 +4031,8 @@ static at::Tensor tp_allreduce_base_attention(
     TORCH_CHECK(ctx->tp_comm,
         "base attention TP communicator is not initialized for TP_SIZE=",
         ctx->tp_world_size);
+    if (sequence_parallel_enabled(ctx))
+        return sequence_parallel_row_reduce_scatter(ctx, local_output);
     return NcclAllReduceFunction::apply(
         local_output, (int64_t)ctx->tp_comm,
         (int64_t)reinterpret_cast<uintptr_t>(ctx->tp_stream));
@@ -3785,6 +4046,8 @@ static at::Tensor tp_copy_base_attention_input(
     TORCH_CHECK(ctx->tp_comm,
         "base attention TP communicator is not initialized for TP_SIZE=",
         ctx->tp_world_size);
+    if (sequence_parallel_enabled(ctx))
+        return sequence_parallel_column_gather(ctx, input);
     return TpCopyToRegionFunction::apply(
         input, (int64_t)ctx->tp_comm,
         (int64_t)reinterpret_cast<uintptr_t>(ctx->tp_stream));
@@ -5672,8 +5935,9 @@ static at::Tensor full_attention_batched(
     const at::Tensor& attention_mask
 ) {
     // Compute Q/K/V with base weight, then add LoRA delta if present
-    int64_t batch = hidden.size(0), seq = hidden.size(1);
     auto projection_input = tp_copy_base_attention_input(ctx, hidden);
+    int64_t batch = projection_input.size(0);
+    int64_t seq = projection_input.size(1);
     if (ctx->base_tp_attention) {
         TORCH_CHECK(num_heads % ctx->tp_world_size == 0 &&
                 num_kv_heads % ctx->tp_world_size == 0,
@@ -5789,8 +6053,9 @@ static at::Tensor linear_attention_batched(
 ) {
     // Full reimplementation of linear_attention non-chunked path with
     // activation-level LoRA delta on QKV, Z, and out_proj.
-    int64_t batch = hidden.size(0), seq = hidden.size(1);
     auto projection_input = tp_copy_base_attention_input(ctx, hidden);
+    int64_t batch = projection_input.size(0);
+    int64_t seq = projection_input.size(1);
     if (base_tp_attention_enabled(ctx)) {
         TORCH_CHECK(num_k_heads > 0 && num_v_heads > 0 &&
                 num_v_heads % num_k_heads == 0 &&
@@ -8183,6 +8448,7 @@ static void* qwen36_create_training_context_impl(
             (context_flags & QWEN36_CONTEXT_BASE_TP_MLP) != 0;
         ctx->vocab_parallel =
             (context_flags & QWEN36_CONTEXT_VOCAB_PARALLEL) != 0;
+        ctx->sequence_parallel = env_enabled("QWEN36_SEQUENCE_PARALLEL");
         ctx->has_mtp = false;
         ctx->use_checkpoint = false; ctx->group_size = 4;
         const char* tp_size_env = getenv("TP_SIZE");
@@ -9002,7 +9268,9 @@ __attribute__((visibility("default"))) double qwen36_train_micro_step(
 
         // Main loss — compute_loss does chunked CE with immediate backward per chunk.
         // This avoids accumulating 250 chunks of [512, vocab] logits in autograd graph.
-        auto main_loss = compute_loss(ctx, hidden, input_ids, target_mask, ctx->vocab_size);
+        auto loss_hidden = sequence_parallel_loss_gather(ctx, hidden);
+        auto main_loss = compute_loss(
+            ctx, loss_hidden, input_ids, target_mask, ctx->vocab_size);
         double loss_val = main_loss.value.item<double>() + router_aux_loss;
         auto total_hidden_grad = main_loss.hidden_grad;
 
@@ -9028,9 +9296,10 @@ __attribute__((visibility("default"))) double qwen36_train_micro_step(
         // gradient. Manual groups are the non-autograd checkpoint fallback;
         // normal and sub-checkpoint paths use the real graph.
         if (!ctx->group_inputs.empty() && !env_enabled("QWEN36_SUBCKPT")) {
-            manual_group_backward(ctx, total_hidden_grad);
+            manual_group_backward(
+                ctx, sequence_parallel_plain_split(ctx, total_hidden_grad));
         } else {
-            hidden.backward(total_hidden_grad);
+            loss_hidden.backward(total_hidden_grad);
         }
 
         // Consume every BF16 leaf gradient immediately. Only the FP32 buffers
@@ -11911,6 +12180,22 @@ int64_t qwen36_get_adapter_step_count(void* ctx_ptr, int64_t adapter_id) {
     return -1;
 }
 
+// Read-only native smoke/debug ABI. Kinds: 0 embedding scatters, 1 column
+// gathers, 2 row reduce-scatters, 3 loss gathers, 4 last local sequence.
+__attribute__((visibility("default")))
+int64_t qwen36_get_sequence_parallel_counter(void* ctx_ptr, int32_t kind) {
+    auto* ctx = reinterpret_cast<TrainingContext*>(ctx_ptr);
+    if (!ctx || !ctx->sequence_parallel) return -1;
+    switch (kind) {
+        case 0: return ctx->sequence_parallel_embedding_scatter_count;
+        case 1: return ctx->sequence_parallel_all_gather_count;
+        case 2: return ctx->sequence_parallel_reduce_scatter_count;
+        case 3: return ctx->sequence_parallel_loss_gather_count;
+        case 4: return ctx->sequence_parallel_last_local_sequence;
+        default: return -1;
+    }
+}
+
 __attribute__((visibility("default")))
 int32_t qwen36_validate_adapter_steps_v1(
     void* ctx_ptr, const int64_t* adapter_ids,
@@ -12003,7 +12288,9 @@ double qwen36_eval_step(void* ctx_ptr, void* input_ids_ptr, void* target_mask_pt
         elide_trivial_attention_mask(ctx);
         at::AutoGradMode no_grad(false);
         auto hidden = ctx->use_checkpoint ? forward_full_checkpoint(ctx, input_ids) : forward_full(ctx, input_ids);
-        auto loss = compute_loss_fused(ctx, hidden, input_ids, target_mask, ctx->vocab_size);
+        auto loss_hidden = sequence_parallel_loss_gather(ctx, hidden);
+        auto loss = compute_loss_fused(
+            ctx, loss_hidden, input_ids, target_mask, ctx->vocab_size);
         return loss.item<double>();
     } catch (const std::exception& e) {
         fprintf(stderr, "[q36] eval_step FAILED: %s\n", e.what());
