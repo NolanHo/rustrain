@@ -2210,6 +2210,10 @@ struct TrainingContext {
     std::vector<at::Tensor*> final_norm_ptr;
     std::vector<at::Tensor*> lm_head_ptr;
     std::vector<LayerConfig> layer_configs;
+    // Frozen GDN alpha/beta projections are tiny and launch-bound. Keep a
+    // context-owned concatenation so the activation-level LoRA path computes
+    // both with one GEMM without duplicating the large QKV/Z weights.
+    std::vector<at::Tensor> fused_gdn_ab_weights;
     int64_t num_layers;
 
     // Attention mask [batch, seq] — 1 for real tokens, 0 for padding
@@ -4744,8 +4748,22 @@ static at::Tensor linear_attention_batched(
                 v_f[0][0][0][0].item<float>(), v_f[0][0][0][1].item<float>(), v_f[0][0][0][2].item<float>());
     }
 
-    auto a = at::matmul(projection_input, in_proj_a.t());
-    auto b = at::matmul(projection_input, in_proj_b.t());
+    at::Tensor a;
+    at::Tensor b;
+    const bool use_fused_ab = layer_idx >= 0 &&
+        layer_idx < static_cast<int64_t>(ctx->fused_gdn_ab_weights.size()) &&
+        ctx->fused_gdn_ab_weights[layer_idx].defined();
+    if (use_fused_ab) {
+        auto ab = at::matmul(
+            projection_input, ctx->fused_gdn_ab_weights[layer_idx].t());
+        TORCH_CHECK(ab.size(-1) == num_v_heads * 2,
+            "fused GDN A/B projection output shape mismatch");
+        a = ab.narrow(-1, 0, num_v_heads);
+        b = ab.narrow(-1, num_v_heads, num_v_heads);
+    } else {
+        a = at::matmul(projection_input, in_proj_a.t());
+        b = at::matmul(projection_input, in_proj_b.t());
+    }
     auto it_a = ctx->lora_batch_cache.find(lora_cache_key(layer_idx, 2));
     if (it_a != ctx->lora_batch_cache.end()) {
         a = a + lora_activation_delta(ctx, projection_input, it_a->second.a_stack,
@@ -6214,6 +6232,26 @@ static void* qwen36_create_training_context_impl(
         auto* lcfgs = reinterpret_cast<LayerConfig*>(layer_configs_ptr);
         for (int64_t i = 0; i < num_layers; i++) {
             ctx->layer_configs.push_back(lcfgs[i]);
+        }
+
+        ctx->fused_gdn_ab_weights.resize(num_layers);
+        if (env_enabled("QWEN36_GDN_FUSED_AB_PROJECTION", true)) {
+            at::NoGradGuard guard;
+            int64_t weight_offset = 0;
+            for (int64_t layer = 0; layer < num_layers; ++layer) {
+                const auto& cfg = ctx->layer_configs[layer];
+                if (cfg.layer_type != 0) {
+                    auto* a = ctx->weight_ptrs[weight_offset + 4];
+                    auto* b = ctx->weight_ptrs[weight_offset + 5];
+                    TORCH_CHECK(a && b && a->dim() == 2 && b->dim() == 2 &&
+                            a->sizes() == b->sizes(),
+                        "GDN fused A/B projection requires matching matrix weights at layer ",
+                        layer);
+                    ctx->fused_gdn_ab_weights[layer] =
+                        at::cat({*a, *b}, 0).contiguous();
+                }
+                weight_offset += weight_count_for_layer(cfg);
+            }
         }
 
         if (ctx->base_tp_attention) {

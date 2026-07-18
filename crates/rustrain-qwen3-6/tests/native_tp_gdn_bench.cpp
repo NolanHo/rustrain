@@ -59,6 +59,12 @@ static int env_int_or(const char* primary, const char* secondary, int fallback) 
                                 : env_int(secondary, fallback);
 }
 
+static bool env_enabled(const char* name, bool fallback = false) {
+    const char* value = std::getenv(name);
+    if (!value || value[0] == '\0') return fallback;
+    return std::strcmp(value, "0") != 0 && std::strcmp(value, "false") != 0;
+}
+
 static at::Tensor seeded_randn(
     std::initializer_list<int64_t> shape, double scale, int64_t seed
 ) {
@@ -169,6 +175,7 @@ int main() {
     const int lora_rank = env_int("BENCH_LORA_RANK", 8);
     const int warmup = env_int("BENCH_WARMUP", 5);
     const int iters = env_int("BENCH_ITERS", 30);
+    const bool fused_ab = env_enabled("QWEN36_GDN_FUSED_AB_PROJECTION", true);
     assert(seq >= 2 && hidden > 0 && key_dim > 0 && value_dim > 0);
     assert(value_heads % key_heads == 0);
     assert(key_heads % expected_world == 0 && value_heads % expected_world == 0);
@@ -305,6 +312,7 @@ int main() {
         << "\"rank\":" << rank << ",\"world\":" << world << ","
         << "\"gpu\":\"" << properties.name << "\","
         << "\"abi\":" << kAbiVersion << ","
+        << "\"fused_ab_projection\":" << (fused_ab ? "true" : "false") << ","
         << "\"batch\":" << batch << ",\"seq\":" << seq << ","
         << "\"hidden\":" << hidden << ",\"layers\":" << layers << ","
         << "\"key_heads\":" << key_heads << ","
