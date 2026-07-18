@@ -37,6 +37,8 @@ extern "C" void* qwen36_get_lora_b(void*, int64_t);
 extern "C" void* qwen36_get_lora_grad_accumulator(void*, int64_t, int32_t);
 extern "C" int32_t qwen36_abort_gradient_accumulation(void*);
 extern "C" int32_t qwen36_set_lora_tensor(void*, int64_t, int32_t, void*);
+extern "C" int32_t qwen36_set_router_aux_loss_coef(void*, double);
+extern "C" void qwen36_set_checkpoint(void*, int32_t, int64_t);
 extern "C" double qwen36_train_step(void*, void*, void*, void*);
 extern "C" double qwen36_train_micro_step(
     void*, void*, void*, void*, double, int32_t);
@@ -560,6 +562,58 @@ int main() {
     assert(fallback_loss > 0.0 && grouped_loss > 0.0 && host_eval_loss > 0.0);
     assert(std::abs(fallback_loss - grouped_loss) <= 2e-2);
     assert(std::abs(grouped_loss - host_eval_loss) <= 2e-2);
+
+    if (world == 1) {
+        auto make_router_context = [&]() {
+            return qwen36_create_training_context(
+                weight_ptrs.data(), static_cast<int64_t>(weight_ptrs.size()),
+                &embed, &final_norm, &lm_head, &config, 1,
+                static_cast<int32_t>(at::kBFloat16),
+                1.0, 1e-3, 0.9, 0.999, 1e-8, vocab, 1e-5, rank,
+                &target_layer, 1, "q_proj");
+        };
+        at::manual_seed(1234);
+        void* router_reference = make_router_context();
+        at::manual_seed(1234);
+        void* router_aux = make_router_context();
+        assert(router_reference && router_aux);
+        assert(qwen36_set_router_aux_loss_coef(router_aux, -1.0) != 0);
+        assert(qwen36_set_router_aux_loss_coef(router_aux, 0.01) == 0);
+        auto* reference_b = reinterpret_cast<at::Tensor*>(
+            qwen36_get_lora_b(router_reference, 0));
+        auto* aux_b = reinterpret_cast<at::Tensor*>(
+            qwen36_get_lora_b(router_aux, 0));
+        assert(reference_b && aux_b && reference_b->sizes() == aux_b->sizes());
+        auto nonzero_b = at::full(reference_b->sizes(), 0.01, reference_b->options());
+        assert(qwen36_set_lora_tensor(router_reference, 0, 1, &nonzero_b) == 0);
+        assert(qwen36_set_lora_tensor(router_aux, 0, 1, &nonzero_b) == 0);
+        qwen36_set_checkpoint(router_reference, 1, 1);
+        qwen36_set_checkpoint(router_aux, 1, 1);
+        const double reference_loss = qwen36_train_step(
+            router_reference, &input_ids, &target_mask, &attention_mask);
+        const double aux_loss = qwen36_train_step(
+            router_aux, &input_ids, &target_mask, &attention_mask);
+        std::vector<void*> reference_m(18), reference_v(18), aux_m(18), aux_v(18);
+        assert(qwen36_export_optimizer_state(
+            router_reference, reference_m.data(), reference_v.data(), 18) == 18);
+        assert(qwen36_export_optimizer_state(
+            router_aux, aux_m.data(), aux_v.data(), 18) == 18);
+        auto* reference_a_m = reinterpret_cast<at::Tensor*>(reference_m[0]);
+        auto* aux_a_m = reinterpret_cast<at::Tensor*>(aux_m[0]);
+        assert(reference_a_m && aux_a_m);
+        const double router_m_gap =
+            (*reference_a_m - *aux_a_m).abs().sum().item<double>();
+        std::printf(
+            "native_qwen36_router_aux reference_loss=%0.8f aux_loss=%0.8f "
+            "loss_gap=%0.8e first_m_gap=%0.8e\n",
+            reference_loss, aux_loss, aux_loss - reference_loss, router_m_gap);
+        assert(aux_loss > reference_loss);
+        assert(router_m_gap > 0.0);
+        assert(qwen36_add_lora(
+            router_aux, rank, 1.0, &target_layer, 1, "q_proj") < 0);
+        qwen36_free_training_context(router_aux);
+        qwen36_free_training_context(router_reference);
+    }
 
     const double loss = qwen36_train_step_host_i64(
         ctx, host_input_ids, host_target_mask, host_attention_mask, 1, 2);

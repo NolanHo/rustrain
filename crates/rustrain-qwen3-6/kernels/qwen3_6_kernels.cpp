@@ -42,6 +42,15 @@
 #include <nccl.h>
 
 struct TrainingContext;  // forward declaration (defined below)
+
+static at::Tensor attach_router_aux_loss(
+    TrainingContext* ctx,
+    const at::Tensor& routing_weights,
+    const at::Tensor& topk_indices,
+    int64_t batch,
+    int64_t seq,
+    int64_t top_k,
+    int64_t num_experts);
 struct LayerConfig;
 static int64_t g_context_sequence = 0;
 
@@ -1867,6 +1876,10 @@ static at::Tensor moe_forward(
     auto router_logits = at::matmul(flat, gate_w.t());
     auto routing_weights = router_logits.softmax(-1, at::kFloat);
     auto [topk_weights, topk_indices] = routing_weights.topk(top_k, -1, true, true);
+    routing_weights = attach_router_aux_loss(
+        training_ctx, routing_weights, topk_indices,
+        batch, seq, top_k, num_experts);
+    topk_weights = routing_weights.gather(-1, topk_indices);
     if (norm_topk_prob) {
         auto denom = topk_weights.sum(-1, true).clamp_min(1e-9);
         topk_weights = topk_weights / denom;
@@ -2623,6 +2636,13 @@ struct TrainingContext {
     std::vector<at::Tensor> adam_m;
     std::vector<at::Tensor> adam_v;
     double lr, beta1, beta2, eps;
+    // Switch-style router load-balancing loss. The forward attachment keeps
+    // routing probabilities bit-identical and injects the auxiliary gradient
+    // when the model graph is traversed.
+    double router_aux_loss_coef = 0.0;
+    at::Tensor router_aux_backward_scale;
+    bool collect_router_aux_loss = false;
+    at::Tensor router_aux_loss_value;
     // Fixed-LoRA target identity is global even when the context owns only a
     // pipeline stage. PP consensus hashes this metadata instead of local
     // tensor slots, which legitimately differ between stages.
@@ -2671,7 +2691,12 @@ struct TrainingContext {
     // Expert-parallel communicator. Layer dispatch/combine and dense replica
     // reductions use this axis; routed-expert parameters never reduce on it.
     ncclComm_t nccl_comm = nullptr;
-    cudaStream_t nccl_stream = nullptr;
+    // Use PyTorch's compute stream for NCCL — NOT a separate stream.
+    // Separate stream causes "invalid argument" because NCCL communicator
+    // is bound to a CUDA context, and PyTorch's caching allocator stream
+    // may be on a different context. Using the same stream ensures same context.
+    // We store nullptr for stream — moe_forward will use getCurrentCUDAStream(dev).
+    cudaStream_t nccl_stream = nullptr;  // nullptr = use default stream
     int ep_world_size = 1;
     int ep_rank = 0;
     bool expert_parallel = false;
@@ -2718,6 +2743,138 @@ struct TrainingContext {
     int cuda_device = 0;
 // ──────────────────────────────────────────────────────────────────────
 };
+
+struct RouterAuxLossFunction
+    : public torch::autograd::Function<RouterAuxLossFunction> {
+    static at::Tensor forward(
+        torch::autograd::AutogradContext* autograd_ctx,
+        at::Tensor routing_weights,
+        at::Tensor aux_loss,
+        at::Tensor backward_scale
+    ) {
+        autograd_ctx->save_for_backward({aux_loss, backward_scale});
+        return routing_weights;
+    }
+
+    static std::vector<at::Tensor> backward(
+        torch::autograd::AutogradContext* autograd_ctx,
+        std::vector<at::Tensor> grad_outputs
+    ) {
+        auto saved = autograd_ctx->get_saved_variables();
+        return {
+            grad_outputs[0],
+            at::ones_like(saved[0]) * saved[1],
+            at::Tensor(),
+        };
+    }
+};
+
+static void router_aux_allreduce(
+    TrainingContext* ctx, at::Tensor& tensor, const char* operation
+) {
+    auto stream = c10::cuda::getCurrentCUDAStream(
+        tensor.device().index()).stream();
+    auto reduce = [&](ncclComm_t comm, int world, const char* axis) {
+        if (!comm || world <= 1) return;
+        auto err = ncclAllReduce(
+            tensor.data_ptr<float>(), tensor.data_ptr<float>(), tensor.numel(),
+            ncclFloat, ncclSum, comm, stream);
+        TORCH_CHECK(err == ncclSuccess, operation, " ", axis,
+            " all-reduce failed: ", ncclGetErrorString(err));
+    };
+    // EP and DP own distinct token shards. TP keeps hidden states replicated,
+    // so reducing over TP would count the same routing decisions twice.
+    reduce(ctx->nccl_comm, ctx->ep_world_size, "EP");
+    reduce(ctx->dp_comm, ctx->dp_world_size, "DP");
+}
+
+static at::Tensor attach_router_aux_loss(
+    TrainingContext* ctx,
+    const at::Tensor& routing_weights,
+    const at::Tensor& topk_indices,
+    int64_t batch,
+    int64_t seq,
+    int64_t top_k,
+    int64_t num_experts
+) {
+    if (!ctx || ctx->router_aux_loss_coef == 0.0 ||
+            (!ctx->collect_router_aux_loss && !at::GradMode::is_enabled()))
+        return routing_weights;
+
+    TORCH_CHECK(ctx->adapters.empty(),
+        "router auxiliary loss is not yet supported for dynamic multi-LoRA; "
+        "per-tenant routing statistics are required to preserve isolation");
+    TORCH_CHECK(!ctx->has_mtp,
+        "router auxiliary loss with MTP is not yet supported");
+    TORCH_CHECK(ctx->pp_world_size == 1,
+        "router auxiliary loss with pipeline parallelism is not yet supported");
+    TORCH_CHECK(routing_weights.dim() == 2 &&
+            routing_weights.size(0) == batch * seq &&
+            routing_weights.size(1) == num_experts,
+        "router auxiliary loss received invalid probability shape");
+
+    at::Tensor valid;
+    if (ctx->attention_mask.defined() && ctx->attention_mask.numel() > 0) {
+        TORCH_CHECK(ctx->attention_mask.dim() == 2 &&
+                ctx->attention_mask.size(0) == batch &&
+                ctx->attention_mask.size(1) == seq,
+            "router auxiliary loss attention-mask shape mismatch");
+        valid = ctx->attention_mask.reshape({batch * seq}).ne(0);
+    } else {
+        valid = at::ones(
+            {batch * seq}, routing_weights.options().dtype(at::kBool));
+    }
+
+    auto selected = topk_indices.masked_select(valid.unsqueeze(-1));
+    auto tokens_per_expert = at::bincount(
+        selected, c10::nullopt, num_experts).to(at::kFloat);
+    router_aux_allreduce(ctx, tokens_per_expert, "router token-count");
+
+    auto valid_probs = routing_weights *
+        valid.to(routing_weights.scalar_type()).unsqueeze(-1);
+    auto total_tokens =
+        (tokens_per_expert.sum() / static_cast<double>(top_k)).clamp_min(1.0);
+    auto aux_loss =
+        (valid_probs.sum(0) * tokens_per_expert).sum() *
+        (static_cast<double>(num_experts) * ctx->router_aux_loss_coef /
+            static_cast<double>(top_k)) /
+        (total_tokens * total_tokens);
+
+    if (ctx->collect_router_aux_loss) {
+        auto detached = aux_loss.detach();
+        ctx->router_aux_loss_value = ctx->router_aux_loss_value.defined()
+            ? ctx->router_aux_loss_value + detached
+            : detached;
+    }
+    return RouterAuxLossFunction::apply(
+        routing_weights, aux_loss, ctx->router_aux_backward_scale);
+}
+
+static void begin_router_aux_loss(
+    TrainingContext* ctx, double backward_scale
+) {
+    if (!ctx || ctx->router_aux_loss_coef == 0.0) return;
+    TORCH_CHECK(std::isfinite(backward_scale) && backward_scale >= 0.0,
+        "router auxiliary backward scale must be finite and non-negative");
+    ctx->router_aux_backward_scale = at::full(
+        {}, backward_scale,
+        at::TensorOptions().device(at::kCUDA, ctx->cuda_device).dtype(at::kFloat));
+    router_aux_allreduce(
+        ctx, ctx->router_aux_backward_scale, "router backward-scale");
+    ctx->router_aux_loss_value = at::Tensor();
+    ctx->collect_router_aux_loss = true;
+}
+
+static double finish_router_aux_loss(TrainingContext* ctx) {
+    if (!ctx || ctx->router_aux_loss_coef == 0.0) return 0.0;
+    ctx->collect_router_aux_loss = false;
+    if (!ctx->router_aux_loss_value.defined()) return 0.0;
+    auto global_value = ctx->router_aux_loss_value.detach().clone();
+    router_aux_allreduce(ctx, global_value, "router loss-value");
+    const double value = global_value.item<double>();
+    ctx->router_aux_loss_value = at::Tensor();
+    return value;
+}
 
 struct AdapterRegistryHash {
     uint64_t first = 1469598103934665603ULL;
@@ -2847,6 +3004,12 @@ static void hash_collective_topology(
     hash.add_u64(env_enabled("QWEN36_GDN_RECURRENT_FUSION", true));
     hash.add_u64(env_enabled("QWEN36_GDN_CHUNKWISE_BWD"));
     hash.add_u64(gdn_state_checkpoint_config());
+    uint64_t router_aux_bits = 0;
+    static_assert(sizeof(router_aux_bits) == sizeof(ctx->router_aux_loss_coef));
+    std::memcpy(
+        &router_aux_bits, &ctx->router_aux_loss_coef,
+        sizeof(router_aux_bits));
+    hash.add_u64(router_aux_bits);
 }
 
 static void validate_native_execution_topology(const TrainingContext* ctx) {
@@ -6772,6 +6935,8 @@ extern "C" __attribute__((visibility("default"))) int32_t qwen36_pipeline_begin_
             "pipeline window is already active");
         TORCH_CHECK(ctx->pp_world_size == 2 && ctx->cp_world_size == 1,
             "pipeline window currently requires PP=2 and CP=1");
+        TORCH_CHECK(ctx->router_aux_loss_coef == 0.0,
+            "pipeline router auxiliary loss is not yet supported");
         TORCH_CHECK(window_spec->window_id >= 0 &&
                 window_spec->num_microbatches > 0 &&
                 window_spec->num_microbatches <= 4096 &&
@@ -6974,6 +7139,8 @@ static double qwen36_pipeline_train_micro_step(
         "pipeline execution requires PP_SIZE>1 and CP_SIZE=1");
     TORCH_CHECK(ctx->adapters.empty(),
         "pipeline fixed-LoRA path does not yet support dynamic adapters");
+    TORCH_CHECK(ctx->router_aux_loss_coef == 0.0,
+        "pipeline router auxiliary loss is not yet supported");
     TORCH_CHECK(!ctx->has_mtp && !ctx->use_checkpoint,
         "pipeline baseline does not support MTP or manual checkpointing");
     TORCH_CHECK(apply_optimizer == 0 || apply_optimizer == 1,
@@ -8642,6 +8809,28 @@ __attribute__((visibility("default"))) int32_t qwen36_set_base_tp_mlp(
     }
 }
 
+__attribute__((visibility("default"))) int32_t qwen36_set_router_aux_loss_coef(
+    void* ctx_ptr, double coefficient
+) {
+    try {
+        auto* ctx = reinterpret_cast<TrainingContext*>(ctx_ptr);
+        TORCH_CHECK(ctx, "null training context");
+        TORCH_CHECK(std::isfinite(coefficient) && coefficient >= 0.0,
+            "router auxiliary loss coefficient must be finite and non-negative");
+        TORCH_CHECK(!ctx->accumulation_active && !ctx->pp_window.active,
+            "router auxiliary loss coefficient cannot change during training");
+        TORCH_CHECK(ctx->adapters.empty(),
+            "router auxiliary loss cannot be enabled after dynamic adapters are registered");
+        TORCH_CHECK(!ctx->has_mtp || coefficient == 0.0,
+            "router auxiliary loss with MTP is not yet supported");
+        ctx->router_aux_loss_coef = coefficient;
+        return 0;
+    } catch (const std::exception& error) {
+        fprintf(stderr, "[q36] set router aux loss FAILED: %s\n", error.what());
+        return -1;
+    }
+}
+
 // Set MTP weights on an existing training context.
 // Called after create_training_context if MTP is enabled.
 __attribute__((visibility("default"))) int32_t qwen36_set_mtp_weights(
@@ -8656,6 +8845,8 @@ __attribute__((visibility("default"))) int32_t qwen36_set_mtp_weights(
     try {
         auto* ctx = reinterpret_cast<TrainingContext*>(ctx_ptr);
         TORCH_CHECK(ctx, "null training context");
+        TORCH_CHECK(ctx->router_aux_loss_coef == 0.0,
+            "MTP cannot be enabled with router auxiliary loss");
         TORCH_CHECK(!ctx->base_tp_mlp && !ctx->base_tp_attention &&
                 !ctx->vocab_parallel,
             "MTP cannot be enabled after frozen base or vocabulary TP because MTP weights are not sharded");
@@ -8792,11 +8983,13 @@ __attribute__((visibility("default"))) double qwen36_train_micro_step(
         bool use_fused = env_enabled("QWEN36_FUSED_LAYER");
         TORCH_CHECK(!use_fused,
             "QWEN36_FUSED_LAYER is disabled until its custom backward preserves the layer graph");
+        begin_router_aux_loss(ctx, micro_token_weight);
         auto hidden = use_fused
             ? forward_full_fused(ctx, input_ids)
             : ctx->use_checkpoint
                 ? forward_full_checkpoint(ctx, input_ids)
                 : forward_full(ctx, input_ids);
+        const double router_aux_loss = finish_router_aux_loss(ctx);
 
         // Debug: GPU memory after forward
         {
@@ -8807,7 +9000,7 @@ __attribute__((visibility("default"))) double qwen36_train_micro_step(
         // Main loss — compute_loss does chunked CE with immediate backward per chunk.
         // This avoids accumulating 250 chunks of [512, vocab] logits in autograd graph.
         auto main_loss = compute_loss(ctx, hidden, input_ids, target_mask, ctx->vocab_size);
-        double loss_val = main_loss.value.item<double>();
+        double loss_val = main_loss.value.item<double>() + router_aux_loss;
         auto total_hidden_grad = main_loss.hidden_grad;
 
         // MTP must be differentiated before the main model backward. Its
@@ -10725,12 +10918,7 @@ static int32_t qwen36_init_parallel_nccl_impl(
         return -1;
     }
 
-    // Use PyTorch's compute stream for NCCL — NOT a separate stream.
-    // Separate stream causes "invalid argument" because NCCL communicator
-    // is bound to a CUDA context, and PyTorch's caching allocator stream
-    // may be on a different context. Using the same stream ensures same context.
-    // We store nullptr for stream — moe_forward will use getCurrentCUDAStream(dev).
-    cudaStream_t nccl_stream = nullptr;  // nullptr = use default stream
+    cudaStream_t nccl_stream = nullptr;
 
     // A divergent axis size would make ranks execute different split counts
     // and hang. Establish size consensus on the world communicator first.
@@ -11166,6 +11354,9 @@ static int64_t qwen36_add_lora_impl(
                     ctx->accumulated_token_weight == 0.0,
                 "cannot mutate the dynamic LoRA registry while a gradient "
                 "accumulation window is pending; finalize or abort it first");
+            TORCH_CHECK(ctx->router_aux_loss_coef == 0.0,
+                "dynamic multi-LoRA requires router_aux_loss_coef=0 until "
+                "per-tenant routing statistics are implemented");
             TORCH_CHECK(rank > 0, "LoRA rank must be positive");
             TORCH_CHECK(std::isfinite(alpha) && alpha > 0.0,
                 "LoRA alpha must be finite and positive");

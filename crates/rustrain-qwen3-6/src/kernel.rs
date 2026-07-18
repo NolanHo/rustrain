@@ -190,6 +190,7 @@ type FnInitParallelNccl = unsafe extern "C" fn(
 ) -> i32;
 type FnSetCudaDevice = unsafe extern "C" fn(i32);
 type FnSetBaseTpMlp = unsafe extern "C" fn(*mut c_void, i32) -> i32;
+type FnSetRouterAuxLossCoef = unsafe extern "C" fn(*mut c_void, f64) -> i32;
 type FnAddLora = unsafe extern "C" fn(*mut c_void, i64, f64, *const i64, i64, *const i8) -> i64;
 type FnAddLoraWithOptimizer =
     unsafe extern "C" fn(*mut c_void, i64, f64, *const i64, i64, *const i8, f64) -> i64;
@@ -269,6 +270,7 @@ struct KernelHandles {
     attach_parallel_nccl_no_sync: FnInitParallelNccl,
     set_cuda_device: FnSetCudaDevice,
     set_base_tp_mlp: FnSetBaseTpMlp,
+    set_router_aux_loss_coef: FnSetRouterAuxLossCoef,
     add_lora: FnAddLora,
     add_lora_v2: FnAddLora,
     add_lora_with_optimizer: Option<FnAddLoraWithOptimizer>,
@@ -373,6 +375,7 @@ unsafe fn load_kernels() -> Option<KernelHandles> {
         attach_parallel_nccl_no_sync: sym!("qwen36_attach_parallel_nccl_no_sync_v2"),
         set_cuda_device: sym!("qwen36_set_cuda_device"),
         set_base_tp_mlp: sym!("qwen36_set_base_tp_mlp"),
+        set_router_aux_loss_coef: sym!("qwen36_set_router_aux_loss_coef"),
         add_lora: sym!("qwen36_add_lora"),
         add_lora_v2: sym!("qwen36_add_lora_v2"),
         add_lora_with_optimizer,
@@ -1068,6 +1071,16 @@ impl CppTrainingContext {
         };
         if ptr.is_null() {
             bail!("C++ create_training_context returned null");
+        }
+        let router_aux_status = unsafe {
+            (kh.set_router_aux_loss_coef)(ptr, config.router_aux_loss_coef)
+        };
+        if router_aux_status != 0 {
+            unsafe { (kh.free_ctx)(ptr) };
+            bail!(
+                "C++ router auxiliary loss configuration failed for coefficient {}",
+                config.router_aux_loss_coef
+            );
         }
         let base_tp_status = unsafe { (kh.set_base_tp_mlp)(ptr, i32::from(base_tp_mlp)) };
         if base_tp_status != 0 {
