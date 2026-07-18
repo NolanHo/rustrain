@@ -2886,7 +2886,10 @@ static void validate_fixed_collective_registry(
 }
 
 static void validate_pipeline_collective_registry(
-    TrainingContext* ctx, int64_t optimizer_phase
+    TrainingContext* ctx,
+    int64_t optimizer_phase,
+    double micro_token_weight,
+    double next_accumulated_token_weight
 ) {
     if (!ctx || !ctx->pp_comm || ctx->pp_world_size <= 1) return;
 
@@ -2903,6 +2906,12 @@ static void validate_pipeline_collective_registry(
     uint64_t token_weight_bits = 0;
     static_assert(sizeof(token_weight_bits) == sizeof(ctx->accumulated_token_weight));
     std::memcpy(&token_weight_bits, &ctx->accumulated_token_weight,
+        sizeof(token_weight_bits));
+    hash.add_u64(token_weight_bits);
+    std::memcpy(&token_weight_bits, &micro_token_weight,
+        sizeof(token_weight_bits));
+    hash.add_u64(token_weight_bits);
+    std::memcpy(&token_weight_bits, &next_accumulated_token_weight,
         sizeof(token_weight_bits));
     hash.add_u64(token_weight_bits);
 
@@ -2939,7 +2948,7 @@ static void validate_pipeline_collective_registry(
         TORCH_CHECK(minimum_data[index] == maximum_data[index],
             "pipeline fixed-LoRA registry mismatch across stages; all stages "
             "must use the same global target identity, optimizer phase, "
-            "clock, and accumulation window");
+            "clock, microstep token weight, and accumulation window");
     }
 }
 
@@ -6238,9 +6247,15 @@ static double qwen36_pipeline_train_micro_step(
     const double supervised_tokens = target_mask.narrow(
         1, 1, target_mask.size(1) - 1).to(at::kFloat).sum().item<double>();
     const double micro_token_weight = gradient_scale * supervised_tokens;
+    const double next_accumulated_token_weight =
+        ctx->accumulated_token_weight + micro_token_weight;
     TORCH_CHECK(std::isfinite(micro_token_weight) && micro_token_weight >= 0.0,
         "pipeline token weight must be finite and non-negative");
-    validate_pipeline_collective_registry(ctx, apply_optimizer);
+    TORCH_CHECK(std::isfinite(next_accumulated_token_weight) &&
+            next_accumulated_token_weight >= 0.0,
+        "pipeline accumulated token weight must be finite and non-negative");
+    validate_pipeline_collective_registry(
+        ctx, apply_optimizer, micro_token_weight, next_accumulated_token_weight);
     const int64_t hidden_size = ctx->weight_ptrs.empty()
         ? 0 : ctx->weight_ptrs[0]->numel();
     TORCH_CHECK(hidden_size > 0, "pipeline stage has no hidden-size metadata");
@@ -6286,7 +6301,7 @@ static double qwen36_pipeline_train_micro_step(
     }
 
     harvest_gradient_accumulators(ctx);
-    ctx->accumulated_token_weight += micro_token_weight;
+    ctx->accumulated_token_weight = next_accumulated_token_weight;
     if (apply_optimizer) {
         apply_fixed_lora_optimizer(
             ctx, target_mask, ctx->accumulated_token_weight);
