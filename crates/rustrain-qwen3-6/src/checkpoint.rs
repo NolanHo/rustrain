@@ -15,6 +15,7 @@ use crate::lora::{
 };
 
 const TP_CHECKPOINT_FORMAT: &str = "rustrain-checkpoint-v5-parallel";
+const STAGE_UNION_CHECKPOINT_FORMAT: &str = "rustrain-checkpoint-v6-stage-union";
 const PROJECTION_AWARE_TP_CHECKPOINT_FORMAT: &str = "rustrain-checkpoint-v4-tp";
 const LEGACY_TP_CHECKPOINT_FORMAT: &str = "rustrain-checkpoint-v3-tp";
 const RANK_RECEIPT_FORMAT: &str = "rustrain-checkpoint-rank-receipt-v1";
@@ -81,6 +82,22 @@ pub struct LoraSlotIdentity {
     pub index: usize,
     pub layer: usize,
     pub module: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PipelineStageCheckpointManifest {
+    pub pipeline_rank: usize,
+    pub pipeline_size: usize,
+    pub global_num_layers: usize,
+    pub layer_start: usize,
+    pub layer_end: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StageUnionCheckpointMetadata {
+    pub pipeline_stage: PipelineStageCheckpointManifest,
+    pub fixed_target_layers: Vec<usize>,
+    pub fixed_target_modules: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -261,12 +278,119 @@ pub struct CheckpointManifest {
     pub fixed_shard_layouts: Vec<LoraTpShardLayout>,
     #[serde(default)]
     pub fixed_slot_identities: Vec<LoraSlotIdentity>,
+    /// V6 keeps the immutable global fixed-adapter signature separate from
+    /// the stage-local tensor inventory above.
+    #[serde(default)]
+    pub fixed_target_layers: Vec<usize>,
+    #[serde(default)]
+    pub fixed_target_modules: Vec<String>,
+    #[serde(default)]
+    pub pipeline_stage: Option<PipelineStageCheckpointManifest>,
 }
 
 impl CheckpointManifest {
     pub fn effective_fixed_optimizer_step(&self) -> u64 {
         self.fixed_optimizer_step.unwrap_or(self.step)
     }
+}
+
+fn is_current_distributed_checkpoint(format: &str) -> bool {
+    format == TP_CHECKPOINT_FORMAT || format == STAGE_UNION_CHECKPOINT_FORMAT
+}
+
+fn validate_stage_union_metadata(
+    parallel: &ParallelCheckpointManifest,
+    metadata: &StageUnionCheckpointMetadata,
+    fixed_slot_identities: &[LoraSlotIdentity],
+    dynamic_adapters: &[DynamicAdapterCheckpoint],
+) -> Result<()> {
+    let stage = &metadata.pipeline_stage;
+    if parallel.pipeline_model_parallel_size <= 1 {
+        bail!("stage-union checkpoint requires pipeline_model_parallel_size > 1");
+    }
+    if stage.pipeline_size != parallel.pipeline_model_parallel_size
+        || stage.pipeline_rank != parallel.coordinates.pipeline
+    {
+        bail!(
+            "stage-union checkpoint stage {}/{} does not match topology stage {}/{}",
+            stage.pipeline_rank,
+            stage.pipeline_size,
+            parallel.coordinates.pipeline,
+            parallel.pipeline_model_parallel_size
+        );
+    }
+    if stage.global_num_layers < stage.pipeline_size
+        || stage.layer_start >= stage.layer_end
+        || stage.layer_end > stage.global_num_layers
+    {
+        bail!(
+            "invalid stage-union layer range {}..{} for {} global layers",
+            stage.layer_start,
+            stage.layer_end,
+            stage.global_num_layers
+        );
+    }
+    if metadata
+        .fixed_target_layers
+        .iter()
+        .any(|layer| *layer >= stage.global_num_layers)
+    {
+        bail!("stage-union fixed target layer is outside the global model");
+    }
+    let local_identity_is_valid = |identity: &LoraSlotIdentity| {
+        identity.layer >= stage.layer_start && identity.layer < stage.layer_end
+    };
+    if fixed_slot_identities
+        .iter()
+        .any(|identity| !local_identity_is_valid(identity))
+    {
+        bail!("stage-union fixed slot identity is not owned by this pipeline stage");
+    }
+    for adapter in dynamic_adapters {
+        if adapter
+            .manifest
+            .target_layers
+            .iter()
+            .any(|layer| *layer >= stage.global_num_layers)
+        {
+            bail!(
+                "stage-union dynamic adapter {} target layer is outside the global model",
+                adapter.manifest.id
+            );
+        }
+        if adapter
+            .manifest
+            .slot_identities
+            .iter()
+            .any(|identity| !local_identity_is_valid(identity))
+        {
+            bail!(
+                "stage-union dynamic adapter {} contains a slot not owned by this pipeline stage",
+                adapter.manifest.id
+            );
+        }
+        if adapter.manifest.slot_identities.len() != adapter.manifest.parameter_count
+            || adapter.manifest.shard_layouts.len() != adapter.manifest.parameter_count
+        {
+            bail!(
+                "stage-union dynamic adapter {} local slot metadata count mismatch",
+                adapter.manifest.id
+            );
+        }
+        let unique_slots = adapter
+            .manifest
+            .slot_identities
+            .iter()
+            .map(|identity| (identity.index, identity.layer, identity.module.as_str()))
+            .collect::<std::collections::BTreeSet<_>>();
+        if unique_slots.len() != adapter.manifest.slot_identities.len() {
+            bail!(
+                "stage-union dynamic adapter {} local slot identities must be unique",
+                adapter.manifest.id
+            );
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -285,6 +409,10 @@ struct CheckpointRankReceipt {
     file_digests: BTreeMap<String, String>,
     all_files_declared: bool,
     data_replica_metadata_complete: bool,
+    #[serde(default)]
+    pipeline_stage: Option<PipelineStageCheckpointManifest>,
+    #[serde(default)]
+    stage_state_digest: String,
 }
 
 #[derive(Serialize)]
@@ -299,6 +427,46 @@ struct CheckpointGenerationIdentity<'a> {
     dynamic_adapters: &'a [DynamicAdapterManifest],
     fixed_shard_layouts: &'a [LoraTpShardLayout],
     fixed_slot_identities: &'a [LoraSlotIdentity],
+}
+
+#[derive(Serialize)]
+struct StageUnionGenerationIdentity<'a> {
+    checkpoint_generation: &'a Option<String>,
+    step: u64,
+    fixed_optimizer_step: u64,
+    model_path: &'a str,
+    lora_rank: i64,
+    lora_alpha_bits: u64,
+    files: &'a [String],
+    fixed_target_layers: &'a [usize],
+    fixed_target_modules: &'a [String],
+    dynamic_adapters: Vec<StageUnionDynamicAdapterIdentity<'a>>,
+}
+
+#[derive(Serialize)]
+struct StageUnionDynamicAdapterIdentity<'a> {
+    id: i64,
+    rank: i64,
+    alpha_bits: u64,
+    optimizer_step: u64,
+    target_layers: &'a [usize],
+    target_modules: &'a [String],
+}
+
+#[derive(Serialize)]
+struct StageUnionLocalStateIdentity<'a> {
+    fixed_shard_layouts: &'a [LoraTpShardLayout],
+    fixed_slot_identities: &'a [LoraSlotIdentity],
+    dynamic_adapters: Vec<StageUnionLocalAdapterIdentity<'a>>,
+}
+
+#[derive(Serialize)]
+struct StageUnionLocalAdapterIdentity<'a> {
+    id: i64,
+    shard_layouts: &'a [LoraTpShardLayout],
+    slot_identities: &'a [LoraSlotIdentity],
+    parameter_count: usize,
+    optimizer_count: usize,
 }
 
 pub fn validate_fixed_tp_resume(
@@ -355,7 +523,7 @@ pub fn validate_dynamic_tp_resume(
             "dynamic adapter {adapter_id} shard layouts do not match the current runtime slots: checkpoint={saved_layouts:?}, runtime={expected_layouts:?}"
         );
     }
-    if manifest.format == TP_CHECKPOINT_FORMAT {
+    if is_current_distributed_checkpoint(&manifest.format) {
         let saved = manifest
             .dynamic_adapters
             .iter()
@@ -850,6 +1018,7 @@ pub fn save_checkpoint_with_dynamic(
         &[],
         None,
         None,
+        None,
     )
 }
 
@@ -969,6 +1138,7 @@ pub fn save_checkpoint_with_dynamic_and_fixed_step_for_topology_generation(
             &[],
             None,
             None,
+            None,
         );
     }
     let checkpoint_generation = checkpoint_generation
@@ -1003,6 +1173,69 @@ pub fn save_checkpoint_with_dynamic_and_fixed_step_for_topology_generation(
         fixed_slot_identities,
         Some(parallel),
         Some(checkpoint_generation),
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn save_stage_union_checkpoint_with_dynamic_and_fixed_step_for_topology_generation(
+    dir: &Path,
+    step: u64,
+    fixed_optimizer_step: u64,
+    loss: f64,
+    model_path: &str,
+    lora_rank: i64,
+    lora_alpha: f64,
+    lora_a: &[Tensor],
+    lora_b: &[Tensor],
+    adam_m: &[Tensor],
+    adam_v: &[Tensor],
+    dynamic_adapters: &[DynamicAdapterCheckpoint],
+    fixed_shard_layouts: &[LoraTpShardLayout],
+    fixed_slot_identities: &[LoraSlotIdentity],
+    parallel: &ParallelCheckpointManifest,
+    checkpoint_generation: &str,
+    stage_union: &StageUnionCheckpointMetadata,
+) -> Result<()> {
+    validate_stage_union_metadata(
+        parallel,
+        stage_union,
+        fixed_slot_identities,
+        dynamic_adapters,
+    )?;
+    let checkpoint_generation = (!checkpoint_generation.is_empty())
+        .then_some(checkpoint_generation)
+        .context("distributed checkpoint generation must be non-empty")?;
+    validate_checkpoint_generation_value(checkpoint_generation)?;
+    let rank_dir = rank_checkpoint_dir(dir, parallel.global_rank);
+    let manifest_path = rank_dir.join("manifest.json");
+    if manifest_path.is_file() {
+        let previous = read_checkpoint_manifest(&manifest_path)?;
+        if previous.checkpoint_generation.as_deref() == Some(checkpoint_generation) {
+            bail!(
+                "distributed checkpoint generation {checkpoint_generation} has already been used for rank {}",
+                parallel.global_rank
+            );
+        }
+    }
+    save_checkpoint_with_dynamic_at(
+        &rank_dir,
+        step,
+        fixed_optimizer_step,
+        loss,
+        model_path,
+        lora_rank,
+        lora_alpha,
+        lora_a,
+        lora_b,
+        adam_m,
+        adam_v,
+        dynamic_adapters,
+        fixed_shard_layouts,
+        fixed_slot_identities,
+        Some(parallel),
+        Some(checkpoint_generation),
+        Some(stage_union),
     )
 }
 
@@ -1012,9 +1245,7 @@ fn validate_checkpoint_generation_value(generation: &str) -> Result<()> {
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
     {
-        bail!(
-            "distributed checkpoint generation must be at most 256 path-safe ASCII characters"
-        );
+        bail!("distributed checkpoint generation must be at most 256 path-safe ASCII characters");
     }
     Ok(())
 }
@@ -1037,6 +1268,7 @@ fn save_checkpoint_with_dynamic_at(
     fixed_slot_identities: &[LoraSlotIdentity],
     parallel: Option<&ParallelCheckpointManifest>,
     checkpoint_generation: Option<&str>,
+    stage_union: Option<&StageUnionCheckpointMetadata>,
 ) -> Result<()> {
     validate_tensor_counts(
         lora_a,
@@ -1046,11 +1278,20 @@ fn save_checkpoint_with_dynamic_at(
         dynamic_adapters,
         parallel.is_some(),
     )?;
-    if fixed_optimizer_step > 0 && (adam_m.is_empty() || adam_v.is_empty()) {
+    if stage_union.is_some()
+        != parallel.is_some_and(|parallel| parallel.pipeline_model_parallel_size > 1)
+    {
+        bail!("stage-union metadata is required exactly when pipeline parallelism is enabled");
+    }
+    if fixed_optimizer_step > 0
+        && (stage_union.is_none() || !lora_a.is_empty())
+        && (adam_m.is_empty() || adam_v.is_empty())
+    {
         bail!("fixed optimizer step {fixed_optimizer_step} requires Adam state");
     }
     for adapter in dynamic_adapters {
         if adapter.manifest.optimizer_step > 0
+            && (stage_union.is_none() || adapter.manifest.parameter_count > 0)
             && (adapter.adam_m.is_empty() || adapter.adam_v.is_empty())
         {
             bail!(
@@ -1121,7 +1362,10 @@ fn save_checkpoint_with_dynamic_at(
     save_named_tensors(&optimizer_path, optimizer_tensors)?;
 
     let file_digests = [
-        ("adapter.safetensors".to_string(), stable_file_digest(&adapter_path)?),
+        (
+            "adapter.safetensors".to_string(),
+            stable_file_digest(&adapter_path)?,
+        ),
         (
             "optimizer.safetensors".to_string(),
             stable_file_digest(&optimizer_path)?,
@@ -1132,7 +1376,9 @@ fn save_checkpoint_with_dynamic_at(
 
     // Write manifest
     let manifest = CheckpointManifest {
-        format: if parallel.is_some() {
+        format: if stage_union.is_some() {
+            STAGE_UNION_CHECKPOINT_FORMAT.to_string()
+        } else if parallel.is_some() {
             TP_CHECKPOINT_FORMAT.to_string()
         } else if dynamic_manifests.is_empty() {
             "rustrain-checkpoint-v1".to_string()
@@ -1154,14 +1400,17 @@ fn save_checkpoint_with_dynamic_at(
         tensor_shards,
         fixed_shard_layouts: fixed_shard_layouts.to_vec(),
         fixed_slot_identities: fixed_slot_identities.to_vec(),
+        fixed_target_layers: stage_union
+            .map(|metadata| metadata.fixed_target_layers.clone())
+            .unwrap_or_default(),
+        fixed_target_modules: stage_union
+            .map(|metadata| metadata.fixed_target_modules.clone())
+            .unwrap_or_default(),
+        pipeline_stage: stage_union.map(|metadata| metadata.pipeline_stage.clone()),
     };
     let manifest_path = dir.join("manifest.json");
     let manifest_contents = serde_json::to_vec_pretty(&manifest)?;
-    write_atomic(
-        &manifest_path,
-        &manifest_contents,
-    )
-    .with_context(|| "write manifest.json")?;
+    write_atomic(&manifest_path, &manifest_contents).with_context(|| "write manifest.json")?;
     if parallel.is_some() {
         let receipt = checkpoint_rank_receipt(&manifest, &manifest_contents)?;
         write_atomic(
@@ -1234,6 +1483,34 @@ fn stable_bytes_digest(contents: &[u8]) -> String {
 }
 
 fn checkpoint_generation_digest(manifest: &CheckpointManifest) -> Result<String> {
+    if manifest.format == STAGE_UNION_CHECKPOINT_FORMAT {
+        let dynamic_adapters = manifest
+            .dynamic_adapters
+            .iter()
+            .map(|adapter| StageUnionDynamicAdapterIdentity {
+                id: adapter.id,
+                rank: adapter.rank,
+                alpha_bits: adapter.alpha.to_bits(),
+                optimizer_step: adapter.optimizer_step,
+                target_layers: &adapter.target_layers,
+                target_modules: &adapter.target_modules,
+            })
+            .collect();
+        return Ok(stable_bytes_digest(&serde_json::to_vec(
+            &StageUnionGenerationIdentity {
+                checkpoint_generation: &manifest.checkpoint_generation,
+                step: manifest.step,
+                fixed_optimizer_step: manifest.effective_fixed_optimizer_step(),
+                model_path: &manifest.model_path,
+                lora_rank: manifest.lora_rank,
+                lora_alpha_bits: manifest.lora_alpha.to_bits(),
+                files: &manifest.files,
+                fixed_target_layers: &manifest.fixed_target_layers,
+                fixed_target_modules: &manifest.fixed_target_modules,
+                dynamic_adapters,
+            },
+        )?));
+    }
     Ok(stable_bytes_digest(&serde_json::to_vec(
         &CheckpointGenerationIdentity {
             checkpoint_generation: &manifest.checkpoint_generation,
@@ -1283,6 +1560,25 @@ fn checkpoint_rank_receipt(
             .tensor_shards
             .iter()
             .all(|shard| shard.replicated_axes.contains(&ParallelAxis::Data));
+    let stage_state_digest = if manifest.format == STAGE_UNION_CHECKPOINT_FORMAT {
+        stable_bytes_digest(&serde_json::to_vec(&StageUnionLocalStateIdentity {
+            fixed_shard_layouts: &manifest.fixed_shard_layouts,
+            fixed_slot_identities: &manifest.fixed_slot_identities,
+            dynamic_adapters: manifest
+                .dynamic_adapters
+                .iter()
+                .map(|adapter| StageUnionLocalAdapterIdentity {
+                    id: adapter.id,
+                    shard_layouts: &adapter.shard_layouts,
+                    slot_identities: &adapter.slot_identities,
+                    parameter_count: adapter.parameter_count,
+                    optimizer_count: adapter.optimizer_count,
+                })
+                .collect(),
+        })?)
+    } else {
+        String::new()
+    };
     Ok(CheckpointRankReceipt {
         format: RANK_RECEIPT_FORMAT.to_string(),
         checkpoint_format: manifest.format.clone(),
@@ -1298,6 +1594,8 @@ fn checkpoint_rank_receipt(
         file_digests: manifest.file_digests.clone(),
         all_files_declared,
         data_replica_metadata_complete,
+        pipeline_stage: manifest.pipeline_stage.clone(),
+        stage_state_digest,
     })
 }
 
@@ -1621,7 +1919,9 @@ fn preflight_distributed_receipts(
         .with_context(|| format!("read {}", requested_manifest_path.display()))?;
     let expected_local_receipt =
         checkpoint_rank_receipt(requested_manifest, &requested_manifest_contents)?;
+    let stage_union = requested_manifest.format == STAGE_UNION_CHECKPOINT_FORMAT;
     let mut baseline: Option<CheckpointRankReceipt> = None;
+    let mut stage_baselines: BTreeMap<usize, CheckpointRankReceipt> = BTreeMap::new();
     let mut replica_files: BTreeMap<DataReplicaFileKey, DataReplicaFileGroup> = BTreeMap::new();
 
     for global_rank in 0..expected.world_size {
@@ -1638,7 +1938,7 @@ fn preflight_distributed_receipts(
         let expected_parallel =
             ParallelCheckpointManifest::from_topology(expected.world_size, global_rank, topology)?;
         if receipt.format != RANK_RECEIPT_FORMAT
-            || receipt.checkpoint_format != TP_CHECKPOINT_FORMAT
+            || receipt.checkpoint_format != requested_manifest.format
             || receipt.global_rank != global_rank
             || receipt.parallel != expected_parallel
         {
@@ -1653,9 +1953,7 @@ fn preflight_distributed_receipts(
             bail!("rank {global_rank} checkpoint receipt has incomplete file declarations");
         }
         if !receipt.data_replica_metadata_complete {
-            bail!(
-                "rank {global_rank} checkpoint is missing data-parallel replica metadata"
-            );
+            bail!("rank {global_rank} checkpoint is missing data-parallel replica metadata");
         }
         if receipt.file_digests.len() != receipt.files.len()
             || receipt
@@ -1672,14 +1970,35 @@ fn preflight_distributed_receipts(
         if let Some(baseline) = &baseline {
             if receipt.checkpoint_generation != baseline.checkpoint_generation
                 || receipt.generation_digest != baseline.generation_digest
-                || receipt.shard_identity_digest != baseline.shard_identity_digest
-                || receipt.shard_count != baseline.shard_count
                 || receipt.files != baseline.files
+            {
+                bail!("rank {global_rank} receipt belongs to a different checkpoint generation");
+            }
+            if !stage_union
+                && (receipt.shard_identity_digest != baseline.shard_identity_digest
+                    || receipt.shard_count != baseline.shard_count)
             {
                 bail!("rank {global_rank} receipt belongs to a different checkpoint generation");
             }
         } else {
             baseline = Some(receipt.clone());
+        }
+
+        if stage_union {
+            let pipeline_rank = receipt.parallel.coordinates.pipeline;
+            if let Some(stage_baseline) = stage_baselines.get(&pipeline_rank) {
+                if receipt.pipeline_stage != stage_baseline.pipeline_stage
+                    || receipt.stage_state_digest != stage_baseline.stage_state_digest
+                    || receipt.shard_identity_digest != stage_baseline.shard_identity_digest
+                    || receipt.shard_count != stage_baseline.shard_count
+                {
+                    bail!(
+                        "rank {global_rank} stage-local checkpoint inventory differs within pipeline stage {pipeline_rank}"
+                    );
+                }
+            } else {
+                stage_baselines.insert(pipeline_rank, receipt.clone());
+            }
         }
 
         if expected.data_parallel_size <= 1 {
@@ -1735,6 +2054,52 @@ fn preflight_distributed_receipts(
             );
         }
     }
+    if stage_union {
+        validate_stage_union_receipt_coverage(&stage_baselines, expected)?;
+    }
+    Ok(())
+}
+
+fn validate_stage_union_receipt_coverage(
+    stages: &BTreeMap<usize, CheckpointRankReceipt>,
+    expected: &ParallelCheckpointManifest,
+) -> Result<()> {
+    if stages.len() != expected.pipeline_model_parallel_size {
+        bail!(
+            "stage-union checkpoint has {} pipeline stages, expected {}",
+            stages.len(),
+            expected.pipeline_model_parallel_size
+        );
+    }
+    let mut next_layer = 0usize;
+    let mut global_num_layers = None;
+    for pipeline_rank in 0..expected.pipeline_model_parallel_size {
+        let stage = stages
+            .get(&pipeline_rank)
+            .and_then(|receipt| receipt.pipeline_stage.as_ref())
+            .with_context(|| {
+                format!("stage-union checkpoint is missing pipeline stage {pipeline_rank}")
+            })?;
+        if stage.pipeline_rank != pipeline_rank
+            || stage.pipeline_size != expected.pipeline_model_parallel_size
+            || stage.layer_start != next_layer
+        {
+            bail!(
+                "stage-union checkpoint has invalid or non-contiguous metadata for pipeline stage {pipeline_rank}"
+            );
+        }
+        if let Some(expected_layers) = global_num_layers {
+            if stage.global_num_layers != expected_layers {
+                bail!("stage-union checkpoint stages disagree on global layer count");
+            }
+        } else {
+            global_num_layers = Some(stage.global_num_layers);
+        }
+        next_layer = stage.layer_end;
+    }
+    if Some(next_layer) != global_num_layers {
+        bail!("stage-union checkpoint layer ranges do not cover the global model");
+    }
     Ok(())
 }
 
@@ -1750,7 +2115,7 @@ fn preflight_distributed_checkpoint_set(
     expected: &ParallelCheckpointManifest,
 ) -> Result<()> {
     let requested_manifest = read_checkpoint_manifest(&requested_rank_dir.join("manifest.json"))?;
-    if requested_manifest.format != TP_CHECKPOINT_FORMAT {
+    if !is_current_distributed_checkpoint(&requested_manifest.format) {
         // V3/V4 rank shards predate complete-set and DP replica metadata.
         return Ok(());
     }
@@ -1793,6 +2158,9 @@ fn preflight_distributed_checkpoint_set(
         }
         Some(version) => {
             bail!("unsupported distributed checkpoint rank receipt version {version}");
+        }
+        None if requested_manifest.format == STAGE_UNION_CHECKPOINT_FORMAT => {
+            bail!("stage-union checkpoints require compact rank receipts");
         }
         None => {}
     }
@@ -1867,9 +2235,7 @@ fn preflight_distributed_checkpoint_set(
                     .iter()
                     .any(|file| !manifest.file_digests.contains_key(file))
             {
-                bail!(
-                    "rank {global_rank} checkpoint is missing tensor file content digests"
-                );
+                bail!("rank {global_rank} checkpoint is missing tensor file content digests");
             }
             for shard in &manifest.tensor_shards {
                 if !manifest.files.iter().any(|saved| saved == &shard.file) {
@@ -1905,9 +2271,7 @@ fn preflight_distributed_checkpoint_set(
                 match replica_files.entry(key) {
                     std::collections::btree_map::Entry::Vacant(entry) => {
                         entry.insert(DataReplicaFileGroup {
-                            data_ranks: [saved_parallel.coordinates.data]
-                                .into_iter()
-                                .collect(),
+                            data_ranks: [saved_parallel.coordinates.data].into_iter().collect(),
                             global_rank,
                             digest: digest.clone(),
                         });
@@ -2073,11 +2437,18 @@ fn validate_checkpoint_generation(
     manifest: &CheckpointManifest,
     global_rank: usize,
 ) -> Result<()> {
+    if baseline.format == STAGE_UNION_CHECKPOINT_FORMAT
+        && manifest.format == STAGE_UNION_CHECKPOINT_FORMAT
+    {
+        if checkpoint_generation_digest(baseline)? != checkpoint_generation_digest(manifest)? {
+            bail!("rank {global_rank} checkpoint belongs to a different checkpoint generation");
+        }
+        return Ok(());
+    }
     // Distributed ranks may report different local losses for the same step.
     if manifest.checkpoint_generation != baseline.checkpoint_generation
         || manifest.step != baseline.step
-        || manifest.effective_fixed_optimizer_step()
-            != baseline.effective_fixed_optimizer_step()
+        || manifest.effective_fixed_optimizer_step() != baseline.effective_fixed_optimizer_step()
         || manifest.model_path != baseline.model_path
         || manifest.lora_rank != baseline.lora_rank
         || manifest.lora_alpha.to_bits() != baseline.lora_alpha.to_bits()
@@ -2104,16 +2475,16 @@ fn load_checkpoint_at(
     validate_manifest_file_digests(dir, &manifest)?;
     match expected_parallel {
         Some(expected) => {
-            if manifest.format != TP_CHECKPOINT_FORMAT
+            if !is_current_distributed_checkpoint(&manifest.format)
                 && manifest.format != PROJECTION_AWARE_TP_CHECKPOINT_FORMAT
                 && manifest.format != LEGACY_TP_CHECKPOINT_FORMAT
             {
                 bail!(
-                    "distributed resume requires {TP_CHECKPOINT_FORMAT}, {PROJECTION_AWARE_TP_CHECKPOINT_FORMAT}, or {LEGACY_TP_CHECKPOINT_FORMAT}, found {}",
+                    "distributed resume requires {STAGE_UNION_CHECKPOINT_FORMAT}, {TP_CHECKPOINT_FORMAT}, {PROJECTION_AWARE_TP_CHECKPOINT_FORMAT}, or {LEGACY_TP_CHECKPOINT_FORMAT}, found {}",
                     manifest.format
                 );
             }
-            if manifest.format != TP_CHECKPOINT_FORMAT
+            if !is_current_distributed_checkpoint(&manifest.format)
                 && (expected.pipeline_model_parallel_size > 1
                     || expected.data_parallel_size > 1
                     || expected.expert_model_parallel_size > 1
@@ -2127,7 +2498,7 @@ fn load_checkpoint_at(
                 .parallel
                 .as_ref()
                 .context("tensor-parallel checkpoint is missing topology metadata")?;
-            let topology_matches = if manifest.format == TP_CHECKPOINT_FORMAT {
+            let topology_matches = if is_current_distributed_checkpoint(&manifest.format) {
                 saved == expected
             } else {
                 saved.legacy_fields_match(expected)
@@ -2138,7 +2509,7 @@ fn load_checkpoint_at(
                 );
             }
         }
-        None if manifest.format == TP_CHECKPOINT_FORMAT
+        None if is_current_distributed_checkpoint(&manifest.format)
             || manifest.format == PROJECTION_AWARE_TP_CHECKPOINT_FORMAT
             || manifest.format == LEGACY_TP_CHECKPOINT_FORMAT =>
         {
@@ -2178,12 +2549,7 @@ fn load_checkpoint_at(
             adam_v: dynamic_adam_v,
         });
     }
-    validate_optimizer_clock_state(
-        &manifest,
-        &adam_m,
-        &adam_v,
-        &dynamic_adapters,
-    )?;
+    validate_optimizer_clock_state(&manifest, &adam_m, &adam_v, &dynamic_adapters)?;
 
     if let Some(parallel) = expected_parallel {
         let mut expected_shards = build_tensor_shard_manifest(
@@ -2196,7 +2562,7 @@ fn load_checkpoint_at(
             &dynamic_adapters,
             &manifest.fixed_shard_layouts,
         )?;
-        if manifest.format != TP_CHECKPOINT_FORMAT {
+        if !is_current_distributed_checkpoint(&manifest.format) {
             for shard in &mut expected_shards {
                 shard.placements.clear();
                 shard.replicated_axes.clear();
@@ -2228,6 +2594,8 @@ fn validate_optimizer_clock_state(
     dynamic_adapters: &[DynamicAdapterCheckpoint],
 ) -> Result<()> {
     if manifest.effective_fixed_optimizer_step() > 0
+        && (manifest.format != STAGE_UNION_CHECKPOINT_FORMAT
+            || !manifest.fixed_slot_identities.is_empty())
         && (adam_m.is_empty() || adam_v.is_empty())
     {
         bail!(
@@ -2237,6 +2605,8 @@ fn validate_optimizer_clock_state(
     }
     for adapter in dynamic_adapters {
         if adapter.manifest.optimizer_step > 0
+            && (manifest.format != STAGE_UNION_CHECKPOINT_FORMAT
+                || adapter.manifest.parameter_count > 0)
             && (adapter.adam_m.is_empty() || adapter.adam_v.is_empty())
         {
             bail!(
@@ -2463,10 +2833,9 @@ fn tensor_shard(
     layout: LoraTpShardLayout,
     tensor: &Tensor,
 ) -> Result<TensorShardManifest> {
-    if parallel.pipeline_model_parallel_size > 1 || parallel.context_parallel_size > 1 {
+    if parallel.context_parallel_size > 1 {
         bail!(
-            "checkpoint v5 does not yet support pipeline/context sharded LoRA state (pp={}, cp={})",
-            parallel.pipeline_model_parallel_size,
+            "checkpoint does not yet support context-sharded LoRA state (cp={})",
             parallel.context_parallel_size
         );
     }
@@ -2971,26 +3340,25 @@ mod tests {
 
         let too_long = "x".repeat(257);
         for generation in ["bad/generation", too_long.as_str()] {
-            let error =
-                super::save_checkpoint_with_dynamic_and_fixed_step_for_topology_generation(
-                    root.path(),
-                    0,
-                    0,
-                    0.0,
-                    "Qwen/test",
-                    2,
-                    4.0,
-                    &[],
-                    &[],
-                    &[],
-                    &[],
-                    &[],
-                    &[],
-                    &[],
-                    &parallel,
-                    Some(generation),
-                )
-                .unwrap_err();
+            let error = super::save_checkpoint_with_dynamic_and_fixed_step_for_topology_generation(
+                root.path(),
+                0,
+                0,
+                0.0,
+                "Qwen/test",
+                2,
+                4.0,
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+                &parallel,
+                Some(generation),
+            )
+            .unwrap_err();
             assert!(error.to_string().contains("path-safe ASCII"));
         }
 
@@ -3203,8 +3571,15 @@ mod tests {
         let manifest_path = dir.path().join("manifest.json");
         let mut legacy: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&manifest_path).unwrap()).unwrap();
-        legacy.as_object_mut().unwrap().remove("fixed_optimizer_step");
-        std::fs::write(&manifest_path, serde_json::to_string_pretty(&legacy).unwrap()).unwrap();
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("fixed_optimizer_step");
+        std::fs::write(
+            &manifest_path,
+            serde_json::to_string_pretty(&legacy).unwrap(),
+        )
+        .unwrap();
         let legacy = load_checkpoint(dir.path()).unwrap();
         assert_eq!(legacy.manifest.fixed_optimizer_step, None);
         assert_eq!(legacy.manifest.effective_fixed_optimizer_step(), 7);
@@ -3351,6 +3726,110 @@ mod tests {
         ParallelCheckpointManifest::new(tp_size, global_rank, tp_size, 1, 1, 1, 1).unwrap()
     }
 
+    fn pp_topology(global_rank: usize, pp_size: usize) -> ParallelCheckpointManifest {
+        ParallelCheckpointManifest::new(pp_size, global_rank, 1, pp_size, 1, 1, 1).unwrap()
+    }
+
+    fn pp_stage_metadata(pipeline_rank: usize) -> StageUnionCheckpointMetadata {
+        StageUnionCheckpointMetadata {
+            pipeline_stage: PipelineStageCheckpointManifest {
+                pipeline_rank,
+                pipeline_size: 2,
+                global_num_layers: 2,
+                layer_start: pipeline_rank,
+                layer_end: pipeline_rank + 1,
+            },
+            fixed_target_layers: vec![0, 1],
+            fixed_target_modules: vec!["q_proj".to_string()],
+        }
+    }
+
+    #[test]
+    fn stage_union_checkpoint_round_trips_stage_local_global_identities() {
+        let root = tempfile::tempdir().unwrap();
+        for pipeline_rank in 0..2 {
+            let topology = pp_topology(pipeline_rank, 2);
+            let value = pipeline_rank as f64 + 1.0;
+            let a = Tensor::full([2, 4], value, (tch::Kind::Float, tch::Device::Cpu));
+            let b = Tensor::full([4, 2], value + 10.0, (tch::Kind::Float, tch::Device::Cpu));
+            let adam_m = vec![Tensor::zeros_like(&a), Tensor::zeros_like(&b)];
+            let adam_v = vec![Tensor::ones_like(&a), Tensor::ones_like(&b)];
+            let identity = LoraSlotIdentity {
+                index: pipeline_rank * 4,
+                layer: pipeline_rank,
+                module: "q_proj".to_string(),
+            };
+            save_stage_union_checkpoint_with_dynamic_and_fixed_step_for_topology_generation(
+                root.path(),
+                7,
+                3,
+                0.25,
+                "Qwen/test",
+                2,
+                4.0,
+                &[a],
+                &[b],
+                &adam_m,
+                &adam_v,
+                &[],
+                &[LoraTpShardLayout::LatentRank],
+                &[identity],
+                &topology,
+                "pp-stage-union-test",
+                &pp_stage_metadata(pipeline_rank),
+            )
+            .unwrap();
+        }
+
+        for pipeline_rank in 0..2 {
+            let topology = pp_topology(pipeline_rank, 2);
+            let loaded = load_checkpoint_for_topology(root.path(), &topology).unwrap();
+            assert_eq!(loaded.manifest.format, STAGE_UNION_CHECKPOINT_FORMAT);
+            assert_eq!(loaded.manifest.fixed_slot_identities.len(), 1);
+            assert_eq!(
+                loaded.manifest.fixed_slot_identities[0],
+                LoraSlotIdentity {
+                    index: pipeline_rank * 4,
+                    layer: pipeline_rank,
+                    module: "q_proj".to_string(),
+                }
+            );
+            assert_eq!(
+                loaded.lora_a[0].double_value(&[0, 0]),
+                pipeline_rank as f64 + 1.0
+            );
+        }
+    }
+
+    #[test]
+    fn stage_union_save_rejects_stage_topology_mismatch_before_writing() {
+        let root = tempfile::tempdir().unwrap();
+        let topology = pp_topology(0, 2);
+        let error =
+            save_stage_union_checkpoint_with_dynamic_and_fixed_step_for_topology_generation(
+                root.path(),
+                0,
+                0,
+                0.0,
+                "Qwen/test",
+                2,
+                4.0,
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+                &topology,
+                "pp-stage-union-invalid",
+                &pp_stage_metadata(1),
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("does not match topology stage"));
+        assert!(!root.path().join("rank-00000").exists());
+    }
+
     fn ep_topology(global_rank: usize, ep_size: usize) -> ParallelCheckpointManifest {
         ParallelCheckpointManifest::new(ep_size, global_rank, 1, 1, 1, ep_size, 1).unwrap()
     }
@@ -3471,10 +3950,7 @@ mod tests {
         save_named_tensors(path, tensors.into_iter().collect()).unwrap();
     }
 
-    fn write_test_manifest_and_receipt(
-        rank_dir: &Path,
-        manifest: &CheckpointManifest,
-    ) {
+    fn write_test_manifest_and_receipt(rank_dir: &Path, manifest: &CheckpointManifest) {
         let manifest_contents = serde_json::to_vec_pretty(manifest).unwrap();
         write_atomic(&rank_dir.join("manifest.json"), &manifest_contents).unwrap();
         let receipt = checkpoint_rank_receipt(manifest, &manifest_contents).unwrap();
@@ -3540,12 +4016,9 @@ mod tests {
         save_tp_ep_dp_checkpoint(missing_receipt.path());
         let receipt = rank_checkpoint_dir(missing_receipt.path(), 7).join(RANK_RECEIPT_FILE);
         std::fs::rename(&receipt, receipt.with_extension("missing")).unwrap();
-        let error = load_checkpoint_for_topology(
-            missing_receipt.path(),
-            &tp_ep_dp_topology(0),
-        )
-        .err()
-        .expect("new v5 checkpoints must not fall back when a receipt is missing");
+        let error = load_checkpoint_for_topology(missing_receipt.path(), &tp_ep_dp_topology(0))
+            .err()
+            .expect("new v5 checkpoints must not fall back when a receipt is missing");
         assert!(error.to_string().contains(RANK_RECEIPT_FILE));
     }
 
@@ -3619,12 +4092,9 @@ mod tests {
             rank_checkpoint_dir(dir.path(), corrupt_rank).join("adapter.safetensors");
         replace_checkpoint_tensor(&corrupt_path, "a_0", 555.0);
 
-        let error = load_checkpoint_for_topology(
-            dir.path(),
-            &tp_ep_dp_topology(corrupt_rank),
-        )
-        .err()
-        .expect("stale manifest must not accept newly overwritten tensor content");
+        let error = load_checkpoint_for_topology(dir.path(), &tp_ep_dp_topology(corrupt_rank))
+            .err()
+            .expect("stale manifest must not accept newly overwritten tensor content");
         assert!(
             error
                 .to_string()
@@ -4501,6 +4971,9 @@ mod tests {
                 layer: 0,
                 module: "q_proj".to_string(),
             }],
+            fixed_target_layers: Vec::new(),
+            fixed_target_modules: Vec::new(),
+            pipeline_stage: None,
         }
     }
 

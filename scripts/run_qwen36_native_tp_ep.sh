@@ -27,8 +27,12 @@ case "$mode" in
         test_name=native_pp_cp_comm_smoke
         test_source=crates/rustrain-qwen3-6/tests/native_pp_cp_comm_smoke.cpp
         ;;
+    pp-train-smoke)
+        test_name=native_pp_train_smoke
+        test_source=crates/rustrain-qwen3-6/tests/native_pp_train_smoke.cpp
+        ;;
     *)
-        echo "usage: $0 [local-smoke|smoke|gpu-metadata-smoke|tri-smoke|tri-replicated-smoke|ep-smoke|ep-bench|bench|pp-cp-comm-smoke]" >&2
+        echo "usage: $0 [local-smoke|smoke|gpu-metadata-smoke|tri-smoke|tri-replicated-smoke|ep-smoke|ep-bench|bench|pp-cp-comm-smoke|pp-train-smoke]" >&2
         exit 2
         ;;
 esac
@@ -200,6 +204,10 @@ elif [[ "$mode" == "pp-cp-comm-smoke" ]]; then
     TP_SIZE=1 CP_SIZE=2 EP_SIZE=1 DP_SIZE=1 PP_SIZE=2 \
         "$python_bin" -m torch.distributed.run --standalone \
             --nnodes=1 --nproc-per-node=4 --no-python "$test_bin"
+elif [[ "$mode" == "pp-train-smoke" ]]; then
+    TP_SIZE=1 CP_SIZE=1 EP_SIZE=1 DP_SIZE=1 PP_SIZE=2 \
+        "$python_bin" -m torch.distributed.run --standalone \
+            --nnodes=1 --nproc-per-node=2 --no-python "$test_bin"
 elif [[ "$mode" == "tri-smoke" || "$mode" == "tri-replicated-smoke" ]]; then
     sharded_a2a=1
     if [[ "$mode" == "tri-replicated-smoke" ]]; then

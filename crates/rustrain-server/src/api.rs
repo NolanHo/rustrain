@@ -178,7 +178,6 @@ struct MultiLoraWindow {
     session_id: String,
     seq_len: usize,
     source_count: usize,
-    lora_rank: i32,
     adapter_ids: HashSet<i64>,
     adapter_count: usize,
     payload_bytes: usize,
@@ -193,7 +192,6 @@ impl MultiLoraWindow {
             session_id: request.session_id.clone(),
             seq_len: request.tensors.seq_len,
             source_count: request.source_count,
-            lora_rank: request.lora_rank,
             adapter_ids,
             adapter_count: request.n_total,
             payload_bytes: request.normalized_payload_bytes,
@@ -208,7 +206,6 @@ impl MultiLoraWindow {
             || self.session_id != request.session_id
             || self.seq_len != request.tensors.seq_len
             || self.source_count != request.source_count
-            || self.lora_rank != request.lora_rank
             || self.requests.len() >= config.max_requests
             || self.adapter_count.saturating_add(request.n_total) > config.max_adapters
             || self
@@ -1906,7 +1903,7 @@ mod tensor_http_shape_tests {
         let mut window = MultiLoraWindow::new(batch_request("session", &[1], 1, &[11]));
         assert!(!window.can_accept(&batch_request("session", &[2], 1, &[11]), config));
         assert!(!window.can_accept(&batch_request("other", &[2], 1, &[12]), config));
-        assert!(!window.can_accept(
+        assert!(window.can_accept(
             &batch_request_with_rank("session", &[2], 1, &[12], 16),
             config
         ));

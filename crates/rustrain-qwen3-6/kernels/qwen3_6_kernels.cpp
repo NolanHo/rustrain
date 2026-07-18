@@ -5577,6 +5577,31 @@ static at::Tensor dense_mlp_forward(
     return at::matmul(activated, down_proj.t()).reshape({batch, seq, hidden_dim});
 }
 
+// Run the local stage layers starting from an already-materialized hidden
+// activation. Pipeline stages use this after receiving their predecessor's
+// activation; the full-model path keeps its existing embedding entry point.
+static at::Tensor forward_stage_layers(
+    TrainingContext* ctx,
+    const at::Tensor& initial_hidden
+) {
+    auto kind = ctx->compute_type;
+    at::Tensor hidden = initial_hidden;
+    for (int64_t i = 0; i < ctx->num_layers; ++i) {
+        int64_t w_offset = 0;
+        for (int64_t j = 0; j < i; ++j)
+            w_offset += weight_count_for_layer(ctx->layer_configs[j]);
+        const int64_t w_count = weight_count_for_layer(ctx->layer_configs[i]);
+        std::vector<at::Tensor*> layer_w(
+            ctx->weight_ptrs.begin() + w_offset,
+            ctx->weight_ptrs.begin() + w_offset + w_count);
+        hidden = forward_single_layer(
+            ctx, hidden, layer_w.data(), &ctx->layer_configs[i], i,
+            kind, ctx->attention_mask, ctx->attention_lengths,
+            ctx->lora_batch_valid);
+    }
+    return hidden;
+}
+
 // Forward pass (no checkpointing)
 static at::Tensor forward_full(
     TrainingContext* ctx,
@@ -5922,6 +5947,273 @@ static at::Tensor forward_full_checkpoint(
     at::AutoGradMode restore(true);
     hidden = hidden.set_requires_grad(true);
     return hidden;
+}
+
+struct PipelineLossResult {
+    double value;
+    at::Tensor hidden_grad;
+};
+
+static PipelineLossResult pipeline_compute_loss(
+    TrainingContext* ctx,
+    const at::Tensor& hidden,
+    const at::Tensor& input_ids,
+    const at::Tensor& target_mask
+);
+
+// Commit fixed-LoRA accumulators with one fused Adam launch. Ordinary and
+// pipeline execution share this boundary so their optimizer clocks and state
+// transitions remain identical.
+static bool apply_fixed_lora_optimizer(
+    TrainingContext* ctx,
+    const at::Tensor& target_mask,
+    double accumulated_token_weight
+) {
+    const bool has_global_tokens = synchronize_lora_gradients(
+        ctx, target_mask, accumulated_token_weight);
+    if (!has_global_tokens) {
+        clear_gradient_accumulators(ctx);
+        return false;
+    }
+
+    at::AutoGradMode guard(false);
+    ctx->lora_cache_valid = false;
+    ctx->lora_batch_valid = false;
+    const int64_t next_step = ctx->fixed_optimizer_step + 1;
+    const double step_f = static_cast<double>(next_step);
+    const double bias_correction1 = 1.0 - std::pow(ctx->beta1, step_f);
+    const double bias_correction2 = 1.0 - std::pow(ctx->beta2, step_f);
+    const double sqrt_bias_correction2 = std::sqrt(bias_correction2);
+    const float lr_scaled = static_cast<float>(
+        ctx->lr * sqrt_bias_correction2 / bias_correction1);
+    const float eps_scaled = static_cast<float>(ctx->eps * sqrt_bias_correction2);
+    const float one_minus_b1 = static_cast<float>(1.0 - ctx->beta1);
+    const float one_minus_b2 = static_cast<float>(1.0 - ctx->beta2);
+
+    std::vector<void*> h_params, h_grads;
+    std::vector<float*> h_m, h_v;
+    std::vector<int> h_sizes;
+    size_t adam_idx = 0;
+    for (size_t i = 0; i < ctx->lora_a.size(); ++i) {
+        auto& a = ctx->lora_a[i];
+        auto& a_grad = ctx->grad_accum_a[i];
+        if (ctx->lora_active[i] && a_grad.defined() &&
+            a.scalar_type() == at::kBFloat16) {
+            h_params.push_back(a.data_ptr());
+            h_grads.push_back(a_grad.data_ptr());
+            h_m.push_back(static_cast<float*>(ctx->adam_m[adam_idx].data_ptr()));
+            h_v.push_back(static_cast<float*>(ctx->adam_v[adam_idx].data_ptr()));
+            h_sizes.push_back(static_cast<int>(a.numel()));
+        }
+        ++adam_idx;
+        auto& b = ctx->lora_b[i];
+        auto& b_grad = ctx->grad_accum_b[i];
+        if (ctx->lora_active[i] && b_grad.defined() &&
+            b.scalar_type() == at::kBFloat16) {
+            h_params.push_back(b.data_ptr());
+            h_grads.push_back(b_grad.data_ptr());
+            h_m.push_back(static_cast<float*>(ctx->adam_m[adam_idx].data_ptr()));
+            h_v.push_back(static_cast<float*>(ctx->adam_v[adam_idx].data_ptr()));
+            h_sizes.push_back(static_cast<int>(b.numel()));
+        }
+        ++adam_idx;
+    }
+
+    const int n_params = static_cast<int>(h_params.size());
+    if (n_params > 0) {
+        TORCH_CHECK(!ctx->lora_a.empty(),
+            "fixed LoRA optimizer has gradients but no parameters");
+        ctx->adam_dev_bufs.ensure(n_params, ctx->lora_a[0]);
+        auto opts_cpu_long = at::TensorOptions().dtype(at::kLong).device(at::kCPU);
+        auto opts_cpu_int = at::TensorOptions().dtype(at::kInt).device(at::kCPU);
+        auto params_cpu = at::from_blob(h_params.data(), {n_params}, opts_cpu_long);
+        auto grads_cpu = at::from_blob(h_grads.data(), {n_params}, opts_cpu_long);
+        auto m_cpu = at::from_blob(h_m.data(), {n_params}, opts_cpu_long);
+        auto v_cpu = at::from_blob(h_v.data(), {n_params}, opts_cpu_long);
+        auto sizes_cpu = at::from_blob(h_sizes.data(), {n_params}, opts_cpu_int);
+        ctx->adam_dev_bufs.params_buf.narrow(0, 0, n_params).copy_(params_cpu);
+        ctx->adam_dev_bufs.grads_buf.narrow(0, 0, n_params).copy_(grads_cpu);
+        ctx->adam_dev_bufs.m_buf.narrow(0, 0, n_params).copy_(m_cpu);
+        ctx->adam_dev_bufs.v_buf.narrow(0, 0, n_params).copy_(v_cpu);
+        ctx->adam_dev_bufs.sizes_buf.narrow(0, 0, n_params).copy_(sizes_cpu);
+        auto stream = c10::cuda::getCurrentCUDAStream().stream();
+        launch_fused_adam_multi(
+            reinterpret_cast<void**>(ctx->adam_dev_bufs.params_buf.data_ptr()),
+            reinterpret_cast<void**>(ctx->adam_dev_bufs.grads_buf.data_ptr()),
+            reinterpret_cast<float**>(ctx->adam_dev_bufs.m_buf.data_ptr()),
+            reinterpret_cast<float**>(ctx->adam_dev_bufs.v_buf.data_ptr()),
+            reinterpret_cast<int*>(ctx->adam_dev_bufs.sizes_buf.data_ptr()),
+            n_params,
+            static_cast<float>(ctx->beta1), static_cast<float>(ctx->beta2),
+            lr_scaled, eps_scaled, one_minus_b1, one_minus_b2,
+            static_cast<void*>(stream));
+        auto launch_error = cudaGetLastError();
+        TORCH_CHECK(launch_error == cudaSuccess,
+            "fused FP32-gradient Adam launch failed: ",
+            cudaGetErrorString(launch_error));
+        ctx->fixed_optimizer_step = next_step;
+    }
+    clear_gradient_accumulators(ctx);
+    return true;
+}
+
+static void pipeline_send_tensor(
+    TrainingContext* ctx,
+    const at::Tensor& tensor,
+    int peer
+) {
+    TORCH_CHECK(ctx->pp_comm && peer >= 0 && peer < ctx->pp_world_size,
+        "pipeline send requires a valid PP communicator and peer");
+    auto stream = c10::cuda::getCurrentCUDAStream(
+        tensor.device().index()).stream();
+    TORCH_CHECK(ncclGroupStart() == ncclSuccess,
+        "pipeline forward ncclGroupStart failed");
+    auto send_error = ncclSend(
+        tensor.data_ptr(), tensor.numel(), qwen36_nccl_dtype(tensor.scalar_type()),
+        peer, ctx->pp_comm, stream);
+    auto end_error = ncclGroupEnd();
+    TORCH_CHECK(send_error == ncclSuccess && end_error == ncclSuccess,
+        "pipeline tensor send failed: ",
+        ncclGetErrorString(send_error == ncclSuccess ? end_error : send_error));
+}
+
+static at::Tensor pipeline_recv_tensor(
+    TrainingContext* ctx,
+    const at::Tensor& shape_source,
+    int peer,
+    int64_t hidden_size
+) {
+    TORCH_CHECK(ctx->pp_comm && peer >= 0 && peer < ctx->pp_world_size,
+        "pipeline receive requires a valid PP communicator and peer");
+    auto options = at::TensorOptions()
+        .device(shape_source.device())
+        .dtype(ctx->compute_type);
+    auto tensor = at::empty({shape_source.size(0), shape_source.size(1), hidden_size}, options);
+    auto stream = c10::cuda::getCurrentCUDAStream(
+        tensor.device().index()).stream();
+    TORCH_CHECK(ncclGroupStart() == ncclSuccess,
+        "pipeline backward ncclGroupStart failed");
+    auto recv_error = ncclRecv(
+        tensor.data_ptr(), tensor.numel(), qwen36_nccl_dtype(tensor.scalar_type()),
+        peer, ctx->pp_comm, stream);
+    auto end_error = ncclGroupEnd();
+    TORCH_CHECK(recv_error == ncclSuccess && end_error == ncclSuccess,
+        "pipeline tensor receive failed: ",
+        ncclGetErrorString(recv_error == ncclSuccess ? end_error : recv_error));
+    return tensor;
+}
+
+static double pipeline_broadcast_loss(
+    TrainingContext* ctx,
+    double local_loss,
+    const at::TensorOptions& options
+) {
+    auto loss = at::full({1}, local_loss, options.dtype(at::kFloat));
+    auto stream = c10::cuda::getCurrentCUDAStream(
+        loss.device().index()).stream();
+    auto error = ncclBroadcast(
+        loss.data_ptr(), loss.data_ptr(), 1, ncclFloat32,
+        ctx->pp_world_size - 1, ctx->pp_comm, stream);
+    TORCH_CHECK(error == ncclSuccess,
+        "pipeline loss broadcast failed: ", ncclGetErrorString(error));
+    return loss.to(at::kCPU).item<double>();
+}
+
+// One synchronous pipeline microbatch. This is intentionally a correctness
+// baseline: each rank owns a contiguous stage and exchanges one activation and
+// one gradient per step. It can later be replaced by a 1F1B scheduler without
+// changing the stage-local layer or optimizer boundaries.
+static double qwen36_pipeline_train_micro_step(
+    TrainingContext* ctx,
+    at::Tensor& input_ids,
+    at::Tensor& target_mask,
+    at::Tensor* attention_mask,
+    double gradient_scale,
+    int32_t apply_optimizer
+) {
+    TORCH_CHECK(ctx && ctx->pp_world_size > 1 && ctx->cp_world_size == 1,
+        "pipeline execution requires PP_SIZE>1 and CP_SIZE=1");
+    TORCH_CHECK(ctx->adapters.empty(),
+        "pipeline fixed-LoRA path does not yet support dynamic adapters");
+    TORCH_CHECK(!ctx->has_mtp && !ctx->use_checkpoint,
+        "pipeline baseline does not support MTP or manual checkpointing");
+    TORCH_CHECK(apply_optimizer == 1,
+        "pipeline baseline requires apply_optimizer=1; gradient accumulation "
+        "scheduling is not wired yet");
+    TORCH_CHECK(std::isfinite(gradient_scale) && gradient_scale > 0.0,
+        "pipeline gradient scale must be finite and positive");
+    TORCH_CHECK(input_ids.is_cuda() && target_mask.is_cuda() &&
+            input_ids.dim() == 2 && target_mask.sizes() == input_ids.sizes() &&
+            input_ids.scalar_type() == at::kLong,
+        "invalid pipeline input tensors");
+    if (attention_mask) {
+        validate_linear_attention_mask(ctx, *attention_mask);
+        ctx->attention_mask = *attention_mask;
+        elide_trivial_attention_mask(ctx);
+    } else {
+        ctx->attention_mask = at::Tensor();
+        ctx->attention_lengths = at::Tensor();
+    }
+    validate_fixed_collective_registry(ctx, apply_optimizer);
+
+    const double supervised_tokens = target_mask.narrow(
+        1, 1, target_mask.size(1) - 1).to(at::kFloat).sum().item<double>();
+    const double micro_token_weight = gradient_scale * supervised_tokens;
+    TORCH_CHECK(std::isfinite(micro_token_weight) && micro_token_weight >= 0.0,
+        "pipeline token weight must be finite and non-negative");
+    const int64_t hidden_size = ctx->weight_ptrs.empty()
+        ? 0 : ctx->weight_ptrs[0]->numel();
+    TORCH_CHECK(hidden_size > 0, "pipeline stage has no hidden-size metadata");
+
+    // Pipeline fixed-LoRA execution must retain the A/B graph for backward
+    // even when TP=1; the legacy materialized delta cache is inference-only.
+    prepare_fixed_lora_batch(ctx);
+    at::AutoGradMode grad_enable(true);
+    at::Tensor stage_input;
+    if (ctx->is_first_pipeline_stage) {
+        stage_input = vocabulary_embedding(ctx, input_ids);
+    } else {
+        stage_input = pipeline_recv_tensor(
+            ctx, input_ids, ctx->pp_rank - 1, hidden_size);
+        stage_input.set_requires_grad(true);
+    }
+    auto stage_output = forward_stage_layers(ctx, stage_input);
+
+    double local_loss = 0.0;
+    if (ctx->is_last_pipeline_stage) {
+        auto loss = pipeline_compute_loss(
+            ctx, stage_output, input_ids, target_mask);
+        local_loss = loss.value;
+        auto hidden_grad = loss.hidden_grad * micro_token_weight;
+        stage_output.backward(hidden_grad);
+        if (!ctx->is_first_pipeline_stage) {
+            auto input_grad = stage_input.grad();
+            TORCH_CHECK(input_grad.defined(),
+                "pipeline last stage did not produce input gradient");
+            pipeline_send_tensor(ctx, input_grad, ctx->pp_rank - 1);
+        }
+    } else {
+        pipeline_send_tensor(ctx, stage_output, ctx->pp_rank + 1);
+        auto output_grad = pipeline_recv_tensor(
+            ctx, input_ids, ctx->pp_rank + 1, hidden_size);
+        stage_output.backward(output_grad);
+        if (!ctx->is_first_pipeline_stage) {
+            auto input_grad = stage_input.grad();
+            TORCH_CHECK(input_grad.defined(),
+                "pipeline stage did not produce input gradient");
+            pipeline_send_tensor(ctx, input_grad, ctx->pp_rank - 1);
+        }
+    }
+
+    harvest_gradient_accumulators(ctx);
+    ctx->accumulated_token_weight += micro_token_weight;
+    if (apply_optimizer) {
+        apply_fixed_lora_optimizer(
+            ctx, target_mask, ctx->accumulated_token_weight);
+    }
+    ctx->lora_cache_valid = false;
+    ctx->lora_batch_valid = false;
+    return pipeline_broadcast_loss(ctx, local_loss, input_ids.options());
 }
 
 // Manual sequential backward — recompute each group with grad, backprop, free.
@@ -6640,6 +6932,20 @@ static LossResult compute_loss(
         hidden_grad,
         sample_loss_numerators,
         sample_token_counts,
+    };
+}
+
+static PipelineLossResult pipeline_compute_loss(
+    TrainingContext* ctx,
+    const at::Tensor& hidden,
+    const at::Tensor& input_ids,
+    const at::Tensor& target_mask
+) {
+    auto result = compute_loss(
+        ctx, hidden, input_ids, target_mask, ctx->vocab_size);
+    return {
+        result.value.item<double>(),
+        result.hidden_grad,
     };
 }
 
@@ -7545,6 +7851,18 @@ __attribute__((visibility("default"))) double qwen36_train_micro_step(
 ) {
     try {
         auto* ctx = reinterpret_cast<TrainingContext*>(ctx_ptr);
+        if (ctx && ctx->pp_world_size > 1) {
+            auto* input_ids = reinterpret_cast<at::Tensor*>(input_ids_ptr);
+            auto* target_mask = reinterpret_cast<at::Tensor*>(target_mask_ptr);
+            auto* attention_mask = attention_mask_ptr
+                ? reinterpret_cast<at::Tensor*>(attention_mask_ptr)
+                : nullptr;
+            TORCH_CHECK(input_ids && target_mask,
+                "pipeline train step requires input and target tensors");
+            return qwen36_pipeline_train_micro_step(
+                ctx, *input_ids, *target_mask, attention_mask,
+                gradient_scale, apply_optimizer);
+        }
         validate_native_execution_topology(ctx);
         GradientAccumulationFailureGuard accumulation_guard{ctx};
         auto* input_ids_tensor = reinterpret_cast<at::Tensor*>(input_ids_ptr);
@@ -7692,110 +8010,8 @@ __attribute__((visibility("default"))) double qwen36_train_micro_step(
         // Replicated DP gradients are synchronized before the local Adam
         // update. EP keeps replicated gradients local because its forward
         // routed activation already contains the cross-rank sum.
-        const bool has_global_tokens = synchronize_lora_gradients(
+        apply_fixed_lora_optimizer(
             ctx, target_mask, ctx->accumulated_token_weight);
-        if (!has_global_tokens) {
-            clear_gradient_accumulators(ctx);
-            accumulation_guard.disarmed = true;
-            return loss_val;
-        }
-
-        // ── Adam optimizer step — CUDA multi-tensor fused kernel ──
-        at::AutoGradMode guard(false);
-        ctx->lora_cache_valid = false;
-        ctx->lora_batch_valid = false;
-        const int64_t next_step = ctx->fixed_optimizer_step + 1;
-        double step_f = (double)next_step;
-        double bias_correction1 = 1.0 - std::pow(ctx->beta1, step_f);
-        double bias_correction2 = 1.0 - std::pow(ctx->beta2, step_f);
-        double sqrt_bias_correction2 = std::sqrt(bias_correction2);
-        float lr_scaled = (float)(
-            ctx->lr * sqrt_bias_correction2 / bias_correction1);
-        float eps_scaled = (float)(ctx->eps * sqrt_bias_correction2);
-        float one_minus_b1 = (float)(1.0 - ctx->beta1);
-        float one_minus_b2 = (float)(1.0 - ctx->beta2);
-
-        // Collect all fixed-adapter (param, grad, m, v, size) tuples. Dynamic
-        // registries are rejected at function entry and have a separate Adam
-        // boundary in qwen36_train_multi_lora.
-        std::vector<void*> h_params, h_grads;
-        std::vector<float*> h_m, h_v;
-        std::vector<int> h_sizes;
-
-        size_t adam_idx = 0;
-        for (size_t i = 0; i < ctx->lora_a.size(); i++) {
-            {
-                auto& param = ctx->lora_a[i];
-                auto& accum = ctx->grad_accum_a[i];
-                if (ctx->lora_active[i] && accum.defined() &&
-                    param.scalar_type() == at::kBFloat16) {
-                    h_params.push_back(param.data_ptr());
-                    h_grads.push_back(accum.data_ptr());
-                    h_m.push_back((float*)ctx->adam_m[adam_idx].data_ptr());
-                    h_v.push_back((float*)ctx->adam_v[adam_idx].data_ptr());
-                    h_sizes.push_back((int)param.numel());
-                }
-            }
-            adam_idx++;
-            {
-                auto& param = ctx->lora_b[i];
-                auto& accum = ctx->grad_accum_b[i];
-                if (ctx->lora_active[i] && accum.defined() &&
-                    param.scalar_type() == at::kBFloat16) {
-                    h_params.push_back(param.data_ptr());
-                    h_grads.push_back(accum.data_ptr());
-                    h_m.push_back((float*)ctx->adam_m[adam_idx].data_ptr());
-                    h_v.push_back((float*)ctx->adam_v[adam_idx].data_ptr());
-                    h_sizes.push_back((int)param.numel());
-                }
-            }
-            adam_idx++;
-        }
-
-        int n_params = (int)h_params.size();
-        if (n_params > 0) {
-            // ── CUDA multi-tensor fused Adam: 1 launch for all params ──
-            // Ensure device buffers are large enough
-            ctx->adam_dev_bufs.ensure(n_params, ctx->lora_a.empty()
-                ? ctx->adapters[0].params.begin()->second[0].first
-                : ctx->lora_a[0]);
-
-            // Copy pointer arrays to device
-            auto opts_cpu_long = at::TensorOptions().dtype(at::kLong).device(at::kCPU);
-            auto opts_cpu_int  = at::TensorOptions().dtype(at::kInt).device(at::kCPU);
-            auto params_cpu = at::from_blob(h_params.data(), {n_params}, opts_cpu_long);
-            auto grads_cpu  = at::from_blob(h_grads.data(),  {n_params}, opts_cpu_long);
-            auto m_cpu      = at::from_blob(h_m.data(),      {n_params}, opts_cpu_long);
-            auto v_cpu      = at::from_blob(h_v.data(),      {n_params}, opts_cpu_long);
-            auto sizes_cpu  = at::from_blob(h_sizes.data(),  {n_params}, opts_cpu_int);
-            ctx->adam_dev_bufs.params_buf.narrow(0, 0, n_params).copy_(params_cpu);
-            ctx->adam_dev_bufs.grads_buf.narrow(0, 0, n_params).copy_(grads_cpu);
-            ctx->adam_dev_bufs.m_buf.narrow(0, 0, n_params).copy_(m_cpu);
-            ctx->adam_dev_bufs.v_buf.narrow(0, 0, n_params).copy_(v_cpu);
-            ctx->adam_dev_bufs.sizes_buf.narrow(0, 0, n_params).copy_(sizes_cpu);
-
-            // Single kernel launch for ALL params
-            auto stream = c10::cuda::getCurrentCUDAStream().stream();
-            launch_fused_adam_multi(
-                (void**)ctx->adam_dev_bufs.params_buf.data_ptr(),
-                (void**)ctx->adam_dev_bufs.grads_buf.data_ptr(),
-                (float**)ctx->adam_dev_bufs.m_buf.data_ptr(),
-                (float**)ctx->adam_dev_bufs.v_buf.data_ptr(),
-                (int*)ctx->adam_dev_bufs.sizes_buf.data_ptr(),
-                n_params,
-                (float)ctx->beta1, (float)ctx->beta2,
-                lr_scaled, eps_scaled,
-                one_minus_b1, one_minus_b2,
-                (void*)stream
-            );
-            auto launch_error = cudaGetLastError();
-            TORCH_CHECK(launch_error == cudaSuccess,
-                "fused FP32-gradient Adam launch failed: ",
-                cudaGetErrorString(launch_error));
-            ctx->fixed_optimizer_step = next_step;
-        }
-
-        clear_gradient_accumulators(ctx);
         accumulation_guard.disarmed = true;
         return loss_val;
     } catch (const std::exception& e) {

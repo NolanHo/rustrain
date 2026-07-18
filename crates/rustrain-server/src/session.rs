@@ -10,7 +10,7 @@ use crate::checkpoint;
 use crate::metrics::{FileMetricsSink, MetricsSink, StepMetric};
 use rustrain_parallel::topology::ParallelTopology;
 use rustrain_qwen3_6::lora::{Qwen36AdapterArtifact, Qwen36LoraConfig, Qwen36LoraTargetModule};
-use rustrain_qwen3_6::pipeline::PipelineStageLayout;
+use rustrain_qwen3_6::pipeline::{PipelineStageLayout, stage_lora_slots};
 
 fn validate_qwen_parallel_features(
     is_moe: bool,
@@ -606,7 +606,6 @@ impl Qwen36Session {
         path: &str,
         transaction_id: &str,
     ) -> Result<(u64, f64)> {
-        self.ensure_stage_checkpoint_supported()?;
         if transaction_id.is_empty()
             || !transaction_id
                 .bytes()
@@ -728,17 +727,6 @@ impl Qwen36Session {
         self.commit_checkpoint_load(&transaction_id)
     }
 
-    fn ensure_stage_checkpoint_supported(&self) -> Result<()> {
-        if self
-            .context_spec
-            .as_ref()
-            .is_some_and(|spec| spec.pp_size > 1)
-        {
-            bail!("pipeline-parallel Qwen checkpointing requires the stage-union manifest format");
-        }
-        Ok(())
-    }
-
     pub fn export_distributed_adapter(
         &self,
         path: &str,
@@ -748,6 +736,11 @@ impl Qwen36Session {
         let parallel = checkpoint::ParallelCheckpointManifest::from_env()?;
         if parallel.world_size <= 1 {
             return <Self as TrainingSession>::export_adapter(self, path, adapter_id);
+        }
+        if parallel.pipeline_model_parallel_size > 1 {
+            bail!(
+                "pipeline-parallel adapter export requires cross-stage tensor-name remapping; checkpoint save/restore remains supported"
+            );
         }
         let final_path = std::path::Path::new(path);
         checkpoint::export_distributed_adapter_checkpoint(
@@ -1278,7 +1271,6 @@ impl TrainingSession for Qwen36Session {
         path: &str,
         checkpoint_generation: Option<&str>,
     ) -> Result<(u64, f64)> {
-        self.ensure_stage_checkpoint_supported()?;
         let ctx = self
             .ctx
             .as_ref()
@@ -1291,6 +1283,12 @@ impl TrainingSession for Qwen36Session {
         let runtime_config =
             rustrain_qwen3_6::config::read_qwen36_runtime_config(std::path::Path::new(model_path))?;
         let parallel = checkpoint::ParallelCheckpointManifest::from_env()?;
+        let stage = self
+            .context_spec
+            .as_ref()
+            .context("LoRA context specification is unavailable")?
+            .stage
+            .clone();
 
         let fixed_config = Qwen36LoraConfig {
             rank: self.lora_rank,
@@ -1298,7 +1296,9 @@ impl TrainingSession for Qwen36Session {
             target_layers: self.lora_target_layers.clone(),
             target_modules: self.lora_target_modules.clone(),
         };
-        let fixed_slots = rustrain_qwen3_6::lora::native_lora_slots(&runtime_config, &fixed_config);
+        let global_fixed_slots =
+            rustrain_qwen3_6::lora::native_lora_slots(&runtime_config, &fixed_config);
+        let fixed_slots = stage_lora_slots(&global_fixed_slots, &stage);
         let lora_count = ctx.lora_count() as usize;
         if fixed_slots.len() != lora_count {
             bail!(
@@ -1318,8 +1318,8 @@ impl TrainingSession for Qwen36Session {
             );
         }
 
-        // Distributed v5 can compact inactive native slots because the manifest
-        // records exact identities. Keep positional placeholders for v1/v2.
+        // Distributed manifests compact inactive stage-local slots while their
+        // identities retain global layer and slot indices.
         let saved_fixed_slots = fixed_slots
             .iter()
             .filter(|slot| parallel.world_size <= 1 || slot.active)
@@ -1332,13 +1332,19 @@ impl TrainingSession for Qwen36Session {
         let mut fixed_shard_layouts = Vec::with_capacity(saved_fixed_count);
         let mut fixed_slot_identities = Vec::with_capacity(saved_fixed_count);
         for slot in saved_fixed_slots {
-            lora_a.push(ctx.get_lora_a(slot.index as i64).with_context(|| {
-                format!("fixed LoRA A is missing for native slot {}", slot.index)
+            lora_a.push(ctx.get_lora_a(slot.local_index as i64).with_context(|| {
+                format!(
+                    "fixed LoRA A is missing for native slot {}",
+                    slot.local_index
+                )
             })?);
-            lora_b.push(ctx.get_lora_b(slot.index as i64).with_context(|| {
-                format!("fixed LoRA B is missing for native slot {}", slot.index)
+            lora_b.push(ctx.get_lora_b(slot.local_index as i64).with_context(|| {
+                format!(
+                    "fixed LoRA B is missing for native slot {}",
+                    slot.local_index
+                )
             })?);
-            let optimizer_index = slot.index.saturating_mul(2);
+            let optimizer_index = slot.local_index.saturating_mul(2);
             adam_m.push(all_adam_m[optimizer_index].shallow_clone());
             adam_m.push(all_adam_m[optimizer_index + 1].shallow_clone());
             adam_v.push(all_adam_v[optimizer_index].shallow_clone());
@@ -1348,7 +1354,7 @@ impl TrainingSession for Qwen36Session {
                 &runtime_config,
             ));
             fixed_slot_identities.push(checkpoint::LoraSlotIdentity {
-                index: slot.index,
+                index: slot.global_index,
                 layer: slot.layer,
                 module: slot.module.cpp_name().to_string(),
             });
@@ -1357,7 +1363,9 @@ impl TrainingSession for Qwen36Session {
         let mut dynamic_adapters = Vec::new();
         if !self.dynamic_lora_configs.is_empty() {
             for (&adapter_id, lora_config) in &self.dynamic_lora_configs {
-                let slots = rustrain_qwen3_6::lora::native_lora_slots(&runtime_config, lora_config);
+                let global_slots =
+                    rustrain_qwen3_6::lora::native_lora_slots(&runtime_config, lora_config);
+                let slots = stage_lora_slots(&global_slots, &stage);
                 let shard_layouts = slots
                     .iter()
                     .filter(|slot| slot.active)
@@ -1478,7 +1486,7 @@ impl TrainingSession for Qwen36Session {
                             .iter()
                             .filter(|slot| slot.active)
                             .map(|slot| checkpoint::LoraSlotIdentity {
-                                index: slot.index,
+                                index: slot.global_index,
                                 layer: slot.layer,
                                 module: slot.module.cpp_name().to_string(),
                             })
@@ -1496,9 +1504,48 @@ impl TrainingSession for Qwen36Session {
 
         let fixed_optimizer_step = u64::try_from(ctx.get_step_count())
             .context("native fixed adapter optimizer step is negative")?;
-        match checkpoint_generation {
-            Some(generation) => {
-                checkpoint::save_checkpoint_with_dynamic_and_fixed_step_for_topology_generation(
+        if stage.pipeline_size > 1 {
+            let generation = checkpoint_generation
+                .filter(|generation| !generation.is_empty())
+                .context("pipeline-parallel checkpoint save requires a coordinated generation")?;
+            let stage_union = checkpoint::StageUnionCheckpointMetadata {
+                pipeline_stage: checkpoint::PipelineStageCheckpointManifest {
+                    pipeline_rank: stage.pipeline_rank,
+                    pipeline_size: stage.pipeline_size,
+                    global_num_layers: stage.global_num_layers,
+                    layer_start: stage.layer_range.start,
+                    layer_end: stage.layer_range.end,
+                },
+                fixed_target_layers: self.lora_target_layers.clone(),
+                fixed_target_modules: self
+                    .lora_target_modules
+                    .iter()
+                    .map(|module| module.cpp_name().to_string())
+                    .collect(),
+            };
+            checkpoint::save_stage_union_checkpoint_with_dynamic_and_fixed_step_for_topology_generation(
+                std::path::Path::new(path),
+                self.step,
+                fixed_optimizer_step,
+                self.last_loss,
+                model_path,
+                self.lora_rank,
+                self.lora_alpha,
+                &lora_a,
+                &lora_b,
+                &adam_m,
+                &adam_v,
+                &dynamic_adapters,
+                &fixed_shard_layouts,
+                &fixed_slot_identities,
+                &parallel,
+                generation,
+                &stage_union,
+            )?;
+        } else {
+            match checkpoint_generation {
+                Some(generation) => {
+                    checkpoint::save_checkpoint_with_dynamic_and_fixed_step_for_topology_generation(
                     std::path::Path::new(path),
                     self.step,
                     fixed_optimizer_step,
@@ -1516,24 +1563,25 @@ impl TrainingSession for Qwen36Session {
                     &parallel,
                     Some(generation),
                 )?;
+                }
+                None => checkpoint::save_checkpoint_with_dynamic_and_fixed_step_for_topology(
+                    std::path::Path::new(path),
+                    self.step,
+                    fixed_optimizer_step,
+                    self.last_loss,
+                    model_path,
+                    self.lora_rank,
+                    self.lora_alpha,
+                    &lora_a,
+                    &lora_b,
+                    &adam_m,
+                    &adam_v,
+                    &dynamic_adapters,
+                    &fixed_shard_layouts,
+                    &fixed_slot_identities,
+                    &parallel,
+                )?,
             }
-            None => checkpoint::save_checkpoint_with_dynamic_and_fixed_step_for_topology(
-                std::path::Path::new(path),
-                self.step,
-                fixed_optimizer_step,
-                self.last_loss,
-                model_path,
-                self.lora_rank,
-                self.lora_alpha,
-                &lora_a,
-                &lora_b,
-                &adam_m,
-                &adam_v,
-                &dynamic_adapters,
-                &fixed_shard_layouts,
-                &fixed_slot_identities,
-                &parallel,
-            )?,
         }
 
         Ok((self.step, self.last_loss))
@@ -1544,9 +1592,14 @@ impl TrainingSession for Qwen36Session {
     }
 
     fn load_checkpoint_in_place(&mut self, path: &str) -> Result<(u64, f64)> {
-        self.ensure_stage_checkpoint_supported()?;
         let parallel = checkpoint::ParallelCheckpointManifest::from_env()?;
         let data = checkpoint::load_checkpoint_for_topology(std::path::Path::new(path), &parallel)?;
+        let stage = self
+            .context_spec
+            .as_ref()
+            .context("LoRA context specification is unavailable")?
+            .stage
+            .clone();
         let model_path = self
             .model_path
             .as_ref()
@@ -1586,7 +1639,33 @@ impl TrainingSession for Qwen36Session {
             target_layers: self.lora_target_layers.clone(),
             target_modules: self.lora_target_modules.clone(),
         };
-        let fixed_slots = rustrain_qwen3_6::lora::native_lora_slots(&runtime_config, &fixed_config);
+        if stage.pipeline_size > 1 {
+            let expected_stage = checkpoint::PipelineStageCheckpointManifest {
+                pipeline_rank: stage.pipeline_rank,
+                pipeline_size: stage.pipeline_size,
+                global_num_layers: stage.global_num_layers,
+                layer_start: stage.layer_range.start,
+                layer_end: stage.layer_range.end,
+            };
+            if data.manifest.pipeline_stage.as_ref() != Some(&expected_stage) {
+                bail!(
+                    "checkpoint pipeline stage metadata does not match the current runtime stage"
+                );
+            }
+            let expected_modules = self
+                .lora_target_modules
+                .iter()
+                .map(|module| module.cpp_name().to_string())
+                .collect::<Vec<_>>();
+            if data.manifest.fixed_target_layers != self.lora_target_layers
+                || data.manifest.fixed_target_modules != expected_modules
+            {
+                bail!("checkpoint global fixed LoRA target signature does not match the session");
+            }
+        }
+        let global_fixed_slots =
+            rustrain_qwen3_6::lora::native_lora_slots(&runtime_config, &fixed_config);
+        let fixed_slots = stage_lora_slots(&global_fixed_slots, &stage);
         let expected_fixed_layouts = fixed_slots
             .iter()
             .filter(|slot| slot.active)
@@ -1596,7 +1675,7 @@ impl TrainingSession for Qwen36Session {
             .iter()
             .filter(|slot| slot.active)
             .map(|slot| checkpoint::LoraSlotIdentity {
-                index: slot.index,
+                index: slot.global_index,
                 layer: slot.layer,
                 module: slot.module.cpp_name().to_string(),
             })
@@ -1629,8 +1708,9 @@ impl TrainingSession for Qwen36Session {
                     target_layers: dynamic.manifest.target_layers.clone(),
                     target_modules,
                 };
-                let expected_slots =
+                let global_expected_slots =
                     rustrain_qwen3_6::lora::native_lora_slots(&runtime_config, &config);
+                let expected_slots = stage_lora_slots(&global_expected_slots, &stage);
                 let expected_layouts = expected_slots
                     .iter()
                     .filter(|slot| slot.active)
@@ -1640,7 +1720,7 @@ impl TrainingSession for Qwen36Session {
                     .iter()
                     .filter(|slot| slot.active)
                     .map(|slot| checkpoint::LoraSlotIdentity {
-                        index: slot.index,
+                        index: slot.global_index,
                         layer: slot.layer,
                         module: slot.module.cpp_name().to_string(),
                     })
@@ -1673,7 +1753,8 @@ impl TrainingSession for Qwen36Session {
                 target_modules,
             };
             rustrain_qwen3_6::lora::validate_lora_targets(&runtime_config, &config)?;
-            let active_slots = rustrain_qwen3_6::lora::native_lora_slots(&runtime_config, &config)
+            let global_slots = rustrain_qwen3_6::lora::native_lora_slots(&runtime_config, &config);
+            let active_slots = stage_lora_slots(&global_slots, &stage)
                 .into_iter()
                 .filter(|slot| slot.active)
                 .count();
@@ -1738,8 +1819,9 @@ impl TrainingSession for Qwen36Session {
                 }
                 let adapter_id = dynamic.manifest.id;
                 let load_result = (|| -> Result<()> {
-                    let slots =
+                    let global_slots =
                         rustrain_qwen3_6::lora::native_lora_slots(&runtime_config, &lora_config);
+                    let slots = stage_lora_slots(&global_slots, &stage);
                     let mut optimizer_index = 0usize;
                     for (slot_index, slot) in slots.iter().filter(|slot| slot.active).enumerate() {
                         let module = slot.module.cpp_name();
@@ -1835,7 +1917,7 @@ impl TrainingSession for Qwen36Session {
             let active_slot_indices = fixed_slots
                 .iter()
                 .filter(|slot| slot.active)
-                .map(|slot| slot.index)
+                .map(|slot| slot.local_index)
                 .collect::<Vec<_>>();
             let restore_slot_indices = checkpoint::fixed_restore_slot_indices(
                 data.lora_a.len(),
@@ -1859,7 +1941,10 @@ impl TrainingSession for Qwen36Session {
                     data.adam_v.len()
                 );
             }
-            if data.adam_m.is_empty() && data.manifest.effective_fixed_optimizer_step() > 0 {
+            if data.adam_m.is_empty()
+                && !restore_slot_indices.is_empty()
+                && data.manifest.effective_fixed_optimizer_step() > 0
+            {
                 bail!(
                     "checkpoint fixed optimizer step {} has no Adam state",
                     data.manifest.effective_fixed_optimizer_step()
