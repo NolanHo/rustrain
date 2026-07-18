@@ -110,6 +110,14 @@ fn run_mtp_decoder_layer_tp_ep(
         }
     }
     let p = format!("model.layers.{layer}");
+    if attn.indexer_wq_b.is_none()
+        || attn.indexer_wk.is_none()
+        || attn.indexer_k_norm_weight.is_none()
+        || attn.indexer_k_norm_bias.is_none()
+        || attn.indexer_weights_proj.is_none()
+    {
+        bail!("GLM-5 MTP decoder layer {layer} is missing its full DSA indexer weights");
+    }
     let input_norm = tensor(weights_gpu, &format!("{p}.input_layernorm.weight"))?;
     let post_norm = tensor(weights_gpu, &format!("{p}.post_attention_layernorm.weight"))?;
     let is_moe = config.is_moe_layer(layer);

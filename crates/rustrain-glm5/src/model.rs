@@ -122,18 +122,17 @@ impl Glm5RuntimeConfig {
             .expect("GLM-5 config must be validated before selecting indexer weights")
     }
 
-    /// Whether this layer should skip sparse attention (first N layers)
+    /// Whether this layer reuses the preceding full layer's DSA top-k.
     pub fn should_skip_topk(&self, layer: usize) -> bool {
-        (layer as i64) < self.index_skip_topk_offset
+        self.indexer_types
+            .get(layer)
+            .is_some_and(|kind| kind == "shared")
     }
 
     pub fn should_recompute_indexer(&self, layer: usize) -> bool {
-        !self.should_skip_topk(layer)
-            && layer as i64 % self.index_topk_freq == 0
-            && self
-                .indexer_types
-                .get(layer)
-                .is_some_and(|kind| kind == "full")
+        self.indexer_types
+            .get(layer)
+            .is_some_and(|kind| kind == "full")
     }
 
     pub fn validate(&self) -> Result<()> {
@@ -332,6 +331,23 @@ fn default_true() -> bool {
     true
 }
 
+fn derive_indexer_types(num_layers: usize, topk_freq: i64, skip_topk_offset: i64) -> Vec<String> {
+    let freq = topk_freq.max(1);
+    (0..num_layers)
+        .map(|layer| {
+            // Megatron evaluates max(layer_number - offset, 0) % freq on
+            // 1-indexed layer numbers. HF exposes the same schedule in its
+            // zero-indexed `indexer_types` list.
+            let phase = (layer as i64 + 1 - skip_topk_offset).max(0);
+            if phase % freq == 0 {
+                "full".to_string()
+            } else {
+                "shared".to_string()
+            }
+        })
+        .collect()
+}
+
 pub fn read_glm5_config(path: &Path) -> Result<Glm5RuntimeConfig> {
     let contents =
         fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
@@ -339,9 +355,11 @@ pub fn read_glm5_config(path: &Path) -> Result<Glm5RuntimeConfig> {
         .with_context(|| format!("failed to parse {}", path.display()))?;
 
     let n_layers = c.num_hidden_layers;
-    let indexer_types = c
-        .indexer_types
-        .unwrap_or_else(|| vec!["full".to_string(); n_layers]);
+    let index_topk_freq = c.index_topk_freq.unwrap_or(1);
+    let index_skip_topk_offset = c.index_skip_topk_offset.unwrap_or(2);
+    let indexer_types = c.indexer_types.unwrap_or_else(|| {
+        derive_indexer_types(n_layers, index_topk_freq, index_skip_topk_offset)
+    });
     let mlp_layer_types = c.mlp_layer_types.unwrap_or_else(|| {
         // Default: first_k_dense_replace layers are "dense", rest are "sparse"
         let mut v = vec!["dense".to_string(); n_layers];
@@ -438,8 +456,8 @@ pub fn read_glm5_config(path: &Path) -> Result<Glm5RuntimeConfig> {
         index_n_heads: c.index_n_heads.unwrap_or(64),
         index_topk: c.index_topk.unwrap_or(2048),
         indexer_types,
-        index_topk_freq: c.index_topk_freq.unwrap_or(1),
-        index_skip_topk_offset: c.index_skip_topk_offset.unwrap_or(0),
+        index_topk_freq,
+        index_skip_topk_offset,
         index_share_for_mtp_iteration: c.index_share_for_mtp_iteration.unwrap_or(false),
         // RoPE
         rope_interleave: c.rope_interleave.unwrap_or(true),
@@ -1913,6 +1931,22 @@ mod tests {
         assert!(glm5_mtp_prediction_len(2).is_err());
         assert_eq!(glm5_mtp_prediction_len_for_layers(7, 2).unwrap(), 4);
         assert!(glm5_mtp_prediction_len_for_layers(3, 2).is_err());
+    }
+
+    #[test]
+    fn glm52_indexer_schedule_matches_megatron_phase() {
+        let types = derive_indexer_types(78, 4, 3);
+        let compute_layers: Vec<_> = types
+            .iter()
+            .enumerate()
+            .filter_map(|(layer, kind)| (kind == "full").then_some(layer))
+            .collect();
+        let mut expected = vec![0, 1, 2];
+        expected.extend((6..=74).step_by(4));
+        assert_eq!(compute_layers, expected);
+        for layer in [3, 4, 5, 75, 76, 77] {
+            assert_eq!(types[layer], "shared");
+        }
     }
 
     #[test]

@@ -1020,13 +1020,7 @@ pub fn glm5_dsa_attention_tp_cp(
     let attn_scale = 1.0 / ((qk_nope + qk_rope) as f64).sqrt();
 
     // ── DSA Indexer (TP-sharded, CP-local) ──
-    let should_compute_topk = !config.should_skip_topk(layer)
-        && layer as i64 % config.index_topk_freq == 0
-        && config
-            .indexer_types
-            .get(layer)
-            .map(|kind| kind == "full")
-            .unwrap_or(true);
+    let should_compute_topk = config.should_recompute_indexer(layer);
 
     if let (Some(wq_b), Some(wk), Some(k_norm_w), Some(k_norm_b), Some(weights_proj)) = (
         &indexer_weights.indexer_wq_b,

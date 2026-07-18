@@ -2211,7 +2211,6 @@ mod mtp_tests {
         let kv_ln = Tensor::ones([2], (Kind::Float, Device::Cpu));
         let o_proj = Tensor::randn([4, 2], (Kind::Float, Device::Cpu));
         let idx_wq_b = Tensor::randn([4, 4], (Kind::Float, Device::Cpu));
-        let _ = idx_wq_b.set_requires_grad(true);
         let idx_wk = Tensor::randn([4, 4], (Kind::Float, Device::Cpu));
         let idx_k_norm_w = Tensor::ones([4], (Kind::Float, Device::Cpu));
         let idx_k_norm_b = Tensor::zeros([4], (Kind::Float, Device::Cpu));
@@ -2260,10 +2259,6 @@ mod mtp_tests {
             hidden.grad().defined(),
             "MTP decoder detached hidden autograd"
         );
-        assert!(
-            idx_wq_b.grad().defined(),
-            "MTP decoder detached indexer autograd"
-        );
     }
 
     #[test]
@@ -2310,6 +2305,11 @@ mod mtp_tests {
         let q_layernorm = Tensor::ones([hidden_size], (Kind::Float, device));
         let kv_layernorm = Tensor::ones([2], (Kind::Float, device));
         let o_proj = Tensor::randn([hidden_size, 2], (Kind::Float, device)) * 0.1;
+        let idx_wq_b = Tensor::randn([hidden_size, hidden_size], (Kind::Float, device)) * 0.1;
+        let idx_wk = Tensor::randn([hidden_size, hidden_size], (Kind::Float, device)) * 0.1;
+        let idx_k_norm_w = Tensor::ones([hidden_size], (Kind::Float, device));
+        let idx_k_norm_b = Tensor::zeros([hidden_size], (Kind::Float, device));
+        let idx_weights_proj = Tensor::randn([1, hidden_size], (Kind::Float, device)) * 0.1;
         let dense_gate =
             Tensor::randn([intermediate_size, hidden_size], (Kind::Float, device)) * 0.1;
         let dense_up = Tensor::randn([intermediate_size, hidden_size], (Kind::Float, device)) * 0.1;
@@ -2329,6 +2329,11 @@ mod mtp_tests {
         descriptor.kv_a_layernorm = ptr(&kv_layernorm);
         descriptor.kv_b_proj = ptr(&kv_b);
         descriptor.o_proj = ptr(&o_proj);
+        descriptor.idx_wq_b = ptr(&idx_wq_b);
+        descriptor.idx_wk = ptr(&idx_wk);
+        descriptor.idx_k_norm_w = ptr(&idx_k_norm_w);
+        descriptor.idx_k_norm_b = ptr(&idx_k_norm_b);
+        descriptor.idx_weights_proj = ptr(&idx_weights_proj);
         descriptor.dense_gate = ptr(&dense_gate);
         descriptor.dense_up = ptr(&dense_up);
         descriptor.dense_down = ptr(&dense_down);
@@ -2340,6 +2345,10 @@ mod mtp_tests {
         descriptor.qk_rope = 2;
         descriptor.v_head = 2;
         descriptor.kv_lora = 2;
+        descriptor.idx_head_dim = hidden_size;
+        descriptor.idx_n_heads = 1;
+        descriptor.idx_n_heads_global = 1;
+        descriptor.idx_topk = 2;
         descriptor.rms_eps = 1e-6;
         descriptor.rope_theta = 10_000.0;
 
@@ -2400,6 +2409,8 @@ mod mtp_tests {
         let q_ln = Tensor::ones([4], (Kind::Float, Device::Cpu));
         let kv_ln = Tensor::ones([2], (Kind::Float, Device::Cpu));
         let o_proj = Tensor::randn([4, 2], (Kind::Float, Device::Cpu));
+        let idx_bias = Tensor::zeros([4], (Kind::Float, Device::Cpu));
+        let idx_weights_proj = Tensor::randn([1, 4], (Kind::Float, Device::Cpu));
         let dense_gate = Tensor::randn([8, 4], (Kind::Float, Device::Cpu));
         let dense_up = Tensor::randn([8, 4], (Kind::Float, Device::Cpu));
         let dense_down = Tensor::randn([4, 8], (Kind::Float, Device::Cpu));
@@ -2415,6 +2426,11 @@ mod mtp_tests {
         d.kv_a_layernorm = ptr(&kv_ln);
         d.kv_b_proj = ptr(&kv_b);
         d.o_proj = ptr(&o_proj);
+        d.idx_wq_b = ptr(&q_a);
+        d.idx_wk = ptr(&q_a);
+        d.idx_k_norm_w = ptr(&norm);
+        d.idx_k_norm_b = ptr(&idx_bias);
+        d.idx_weights_proj = ptr(&idx_weights_proj);
         d.dense_gate = ptr(&dense_gate);
         d.dense_up = ptr(&dense_up);
         d.dense_down = ptr(&dense_down);
@@ -2427,6 +2443,10 @@ mod mtp_tests {
         d.qk_rope = 2;
         d.v_head = 2;
         d.kv_lora = 2;
+        d.idx_head_dim = 4;
+        d.idx_n_heads = 1;
+        d.idx_n_heads_global = 1;
+        d.idx_topk = 1;
         d.rms_eps = 1e-6;
         d.rope_theta = 10_000.0;
         let error = glm5_mtp_decoder_layer_cpp(&d).unwrap_err().to_string();

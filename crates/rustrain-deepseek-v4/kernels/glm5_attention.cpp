@@ -1044,9 +1044,11 @@ void* v4_glm5_dsa_attention(
             (reinterpret_cast<at::Tensor*>(*topk_indices_ptr)->dim() != 3 ||
              reinterpret_cast<at::Tensor*>(*topk_indices_ptr)->size(0) != batch ||
              reinterpret_cast<at::Tensor*>(*topk_indices_ptr)->size(1) != seq);
-        bool should_compute_topk = is_full_layer &&
-            (*topk_indices_ptr == nullptr || state_shape_mismatch ||
-             layer_i % index_topk_freq_i == 0);
+        bool should_compute_topk = is_full_layer;
+        if (!is_full_layer) {
+            TORCH_CHECK(*topk_indices_ptr && !state_shape_mismatch,
+                        "IndexShare shared layer requires matching top-k state from a preceding full layer");
+        }
 
         if (idx_wq_b && idx_wk && idx_k_norm_w && idx_k_norm_b && idx_weights_proj) {
             if (should_compute_topk) {
@@ -1976,9 +1978,11 @@ void* v4_glm5_layer_forward(
             (reinterpret_cast<at::Tensor*>(*topk_indices_ptr)->dim() != 3 ||
              reinterpret_cast<at::Tensor*>(*topk_indices_ptr)->size(0) != batch ||
              reinterpret_cast<at::Tensor*>(*topk_indices_ptr)->size(1) != seq);
-        bool should_compute = is_full_layer &&
-            (*topk_indices_ptr == nullptr || state_shape_mismatch ||
-             layer_i % index_topk_freq_i == 0);
+        bool should_compute = is_full_layer;
+        if (!is_full_layer) {
+            TORCH_CHECK(*topk_indices_ptr && !state_shape_mismatch,
+                        "IndexShare shared layer requires matching top-k state from a preceding full layer");
+        }
 
         if (has_indexer && should_compute) {
             auto& wq_b = *reinterpret_cast<at::Tensor*>(idx_wq_b);
@@ -2238,6 +2242,8 @@ static at::Tensor glm5_mtp_attention(const at::Tensor& input,
     std::optional<at::Tensor> global_topk;
     const bool has_indexer = d.idx_wq_b && d.idx_wk && d.idx_k_norm_w &&
                              d.idx_k_norm_b && d.idx_weights_proj;
+    TORCH_CHECK(has_indexer,
+                "native MTP decoder requires a complete full DSA indexer");
     if (has_indexer) {
         TORCH_CHECK(d.idx_n_heads > 0 && d.idx_n_heads_global >= d.idx_n_heads,
                     "invalid local/global indexer head counts");
