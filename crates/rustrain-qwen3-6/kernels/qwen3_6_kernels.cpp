@@ -23,6 +23,7 @@
 #include <cstdint>
 #include <cmath>
 #include <algorithm>
+#include <iterator>
 #include <vector>
 #include <cstring>
 #include <memory>
@@ -2504,6 +2505,7 @@ static void hash_collective_topology(
     hash.add_u64(env_enabled("QWEN36_EP_A2A"));
     hash.add_u64(env_enabled("QWEN36_EP_A2A_SHARDED"));
     hash.add_u64(env_enabled("QWEN36_GROUPED_LORA_SYNC", true));
+    hash.add_u64(env_enabled("QWEN36_PACKED_LORA_SYNC", true));
     hash.add_u64(env_enabled("QWEN36_GRAD_SLAB", true));
 }
 
@@ -3514,6 +3516,10 @@ static void reduce_lora_accumulator_weighted(
 }
 
 struct GroupedLoraGradientSyncPlan {
+    static constexpr uint8_t kReduceEp = 1 << 0;
+    static constexpr uint8_t kReduceDp = 1 << 1;
+    static constexpr uint8_t kReduceTp = 1 << 2;
+
     struct Entry {
         at::Tensor* accumulator = nullptr;
         at::Tensor local_weight;
@@ -3526,7 +3532,14 @@ struct GroupedLoraGradientSyncPlan {
         bool reduce_tp = false;
     };
 
+    struct Bucket {
+        uint8_t communication_mask = 0;
+        std::vector<Entry*> entries;
+        at::Tensor storage;
+    };
+
     std::vector<Entry> entries;
+    std::vector<Bucket> buckets;
 
     static bool tp_replicated(LoraTpLayout layout, bool is_a) {
         return (layout == LoraTpLayout::ColumnParallel && is_a) ||
@@ -3559,7 +3572,14 @@ struct GroupedLoraGradientSyncPlan {
         entries.push_back(std::move(entry));
     }
 
-    void prepare(TrainingContext* ctx) {
+    static uint8_t communication_mask(const Entry& entry) {
+        return (entry.reduce_ep ? kReduceEp : 0) |
+            (entry.reduce_dp ? kReduceDp : 0) |
+            (entry.reduce_tp ? kReduceTp : 0);
+    }
+
+    void prepare(TrainingContext* ctx, bool packed_sync) {
+        buckets.clear();
         for (auto& entry : entries) {
             TORCH_CHECK(entry.accumulator && entry.accumulator->is_cuda() &&
                     entry.accumulator->scalar_type() == at::kFloat &&
@@ -3584,6 +3604,34 @@ struct GroupedLoraGradientSyncPlan {
             TORCH_CHECK(entry.accumulator->is_contiguous(),
                 "grouped LoRA gradient sync requires contiguous accumulators");
             entry.work = *entry.accumulator;
+            const uint8_t mask = communication_mask(entry);
+            if (!packed_sync || mask == 0) continue;
+            auto bucket = std::find_if(
+                buckets.begin(), buckets.end(),
+                [mask](const Bucket& candidate) {
+                    return candidate.communication_mask == mask;
+                });
+            if (bucket == buckets.end()) {
+                buckets.push_back(Bucket{});
+                bucket = std::prev(buckets.end());
+                bucket->communication_mask = mask;
+            }
+            bucket->entries.push_back(&entry);
+        }
+        for (auto& bucket : buckets) {
+            if (bucket.entries.size() < 2) continue;
+            std::vector<at::Tensor> flattened;
+            flattened.reserve(bucket.entries.size());
+            for (const auto* entry : bucket.entries)
+                flattened.push_back(entry->work.reshape({-1}));
+            bucket.storage = at::cat(flattened, 0);
+            int64_t offset = 0;
+            for (auto* entry : bucket.entries) {
+                const int64_t elements = entry->accumulator->numel();
+                entry->work = bucket.storage.narrow(0, offset, elements)
+                    .view(entry->accumulator->sizes());
+                offset += elements;
+            }
         }
     }
 
@@ -3622,10 +3670,53 @@ struct GroupedLoraGradientSyncPlan {
             ncclGetErrorString(end_error));
     }
 
+    static void run_bucket_group(
+        std::vector<Bucket>& buckets,
+        ncclComm_t communicator,
+        cudaStream_t stream,
+        const char* axis,
+        uint8_t axis_mask
+    ) {
+        const bool any = std::any_of(
+            buckets.begin(), buckets.end(),
+            [axis_mask](const Bucket& bucket) {
+                return bucket.entries.size() >= 2 &&
+                    (bucket.communication_mask & axis_mask) != 0;
+            });
+        if (!any) return;
+        TORCH_CHECK(communicator, "packed LoRA ", axis,
+            " gradient sync has no communicator");
+        const auto start_error = ncclGroupStart();
+        TORCH_CHECK(start_error == ncclSuccess,
+            "packed LoRA ", axis, " ncclGroupStart failed: ",
+            ncclGetErrorString(start_error));
+        ncclResult_t first_error = ncclSuccess;
+        for (auto& bucket : buckets) {
+            if (bucket.entries.size() < 2 ||
+                (bucket.communication_mask & axis_mask) == 0)
+                continue;
+            const auto error = ncclAllReduce(
+                bucket.storage.data_ptr(), bucket.storage.data_ptr(),
+                bucket.storage.numel(), nccl_dtype_for(bucket.storage),
+                ncclSum, communicator, stream);
+            if (first_error == ncclSuccess && error != ncclSuccess)
+                first_error = error;
+        }
+        const auto end_error = ncclGroupEnd();
+        TORCH_CHECK(first_error == ncclSuccess,
+            "packed LoRA ", axis, " gradient all-reduce failed: ",
+            ncclGetErrorString(first_error));
+        TORCH_CHECK(end_error == ncclSuccess,
+            "packed LoRA ", axis, " ncclGroupEnd failed: ",
+            ncclGetErrorString(end_error));
+    }
+
     void execute(TrainingContext* ctx) {
+        const bool packed_sync = env_enabled(
+            "QWEN36_PACKED_LORA_SYNC", true);
         std::exception_ptr preparation_error;
         try {
-            prepare(ctx);
+            prepare(ctx, packed_sync);
         } catch (...) {
             preparation_error = std::current_exception();
         }
@@ -3646,10 +3737,29 @@ struct GroupedLoraGradientSyncPlan {
 
         const auto stream = c10::cuda::getCurrentCUDAStream(
             ctx->cuda_device).stream();
-        run_group(entries, ctx->nccl_comm, stream, "EP",
-            [](const Entry& entry) { return entry.reduce_ep; });
-        run_group(entries, ctx->dp_comm, stream, "DP",
-            [](const Entry& entry) { return entry.reduce_dp; });
+        if (packed_sync) {
+            run_bucket_group(
+                buckets, ctx->nccl_comm, stream, "EP", kReduceEp);
+            run_bucket_group(
+                buckets, ctx->dp_comm, stream, "DP", kReduceDp);
+            run_group(entries, ctx->nccl_comm, stream, "EP",
+                [](const Entry& entry) {
+                    return entry.reduce_ep &&
+                        entry.work.data_ptr() ==
+                            entry.accumulator->data_ptr();
+                });
+            run_group(entries, ctx->dp_comm, stream, "DP",
+                [](const Entry& entry) {
+                    return entry.reduce_dp &&
+                        entry.work.data_ptr() ==
+                            entry.accumulator->data_ptr();
+                });
+        } else {
+            run_group(entries, ctx->nccl_comm, stream, "EP",
+                [](const Entry& entry) { return entry.reduce_ep; });
+            run_group(entries, ctx->dp_comm, stream, "DP",
+                [](const Entry& entry) { return entry.reduce_dp; });
+        }
 
         for (auto& entry : entries) {
             if (entry.global_weight.defined())
@@ -3658,8 +3768,23 @@ struct GroupedLoraGradientSyncPlan {
                 entry.work.mul_(entry.post_scale);
         }
 
-        run_group(entries, ctx->tp_comm, stream, "TP",
-            [](const Entry& entry) { return entry.reduce_tp; });
+        if (packed_sync) {
+            run_bucket_group(
+                buckets, ctx->tp_comm, stream, "TP", kReduceTp);
+            run_group(entries, ctx->tp_comm, stream, "TP",
+                [](const Entry& entry) {
+                    return entry.reduce_tp &&
+                        entry.work.data_ptr() ==
+                            entry.accumulator->data_ptr();
+                });
+            for (auto& entry : entries) {
+                if (entry.work.data_ptr() != entry.accumulator->data_ptr())
+                    entry.accumulator->copy_(entry.work);
+            }
+        } else {
+            run_group(entries, ctx->tp_comm, stream, "TP",
+                [](const Entry& entry) { return entry.reduce_tp; });
+        }
     }
 };
 

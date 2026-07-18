@@ -1117,6 +1117,8 @@ async fn ep_batch_add_lora(
     Path(id): Path<String>,
     Json(req): Json<BatchAddLoRAHttp>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    crate::ep::validate_batch_add_lora_count(req.count)
+        .map_err(|error| err_resp(&error))?;
     let cmd = rustrain_ipc::EpCommand::BatchAddLora {
         session_id: id,
         count: req.count,

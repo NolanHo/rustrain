@@ -49,6 +49,15 @@ PP 会把层分到不同 stage 并使用 1F1B 等调度；CP 会在序列和 att
 
 ### 性能工程
 
+ABI24 adds a packed LoRA gradient synchronization path: FP32 accumulators are
+grouped by EP/DP/TP reduction mask and each populated bucket/axis uses one NCCL
+all-reduce. `QWEN36_PACKED_LORA_SYNC=0` keeps the per-tensor grouped fallback.
+This reduces collective launch count, but it still runs after full backward and
+the token-count CPU fence; it is not Megatron-style backward bucket overlap or
+reduce-scatter. H20 TP2 fixed-LoRA smoke and TP2 x DP2 oracle passed with both
+settings; the synthetic TP2 benchmark was `77.970 ms` packed versus `78.024 ms`
+fallback p50, within measurement noise.
+
 当前粗粒度 C++ FFI、packed/grouped MoE、GDN head TP、vocabulary TP 和 activation checkpoint/offload 是有效优化，但 full attention 仍通过 ATen linear/SDPA，QKV 未融合，TP collective 同步执行。ABI23 heterogeneous v2 为每个 signature 独立运行完整 trainer，并在组准备和训练返回后读取 GPU success consensus 到 CPU；这是防止 rank 进入不同后续 collective 的 correctness fence，也会阻断跨组异步 overlap。它不能从旧 homogeneous trainer 内部不可恢复的 rank-local CUDA/NCCL failure 中恢复。GDN fused backward 通过反除 decay 重建历史 state；真实 time-step bias 下可运行，但极小 decay 的长序列会数值不稳，仍需 state checkpoint/chunk backward 替代。尚无 Megatron/Transformer Engine 级别的完整模型端到端数据：没有同一 GPU、序列长度、microbatch、精度和通信配置下的 tokens/s、显存、扩展效率对照，也没有 FP8/FP4 参数与 fused attention/DeepEP 的 Qwen 路径。
 
 ABI15 synthetic GDN TP benchmark 使用 3 层、S=512、H=2048、16 K heads、32 V heads 和 LoRA rank 8。在 B=2 时 single/TP2 p50 为 `81.10/约 76.06 ms`，只有约 `1.07x`；在 B=8 时为 `303.25/约 158.04 ms`，达到约 `1.92x`，每卡 observed resident 从 `4.59 GiB` 降到 `3.54 GiB`。`nsys` 的 B=2 TP2 trace 中 fused delta-rule backward 占 GPU kernel time `80.3%`、forward 占 `7.4%`，NCCL all-reduce 合计低于 `0.4%`。小 batch 下 single 和 TP2 都只需相近的 persistent-block wave 数，因此不能期待 head TP 自动加速；dynamic multi-LoRA batching 提高 BH 后才接近线性 scaling。这是 synthetic native 结果，不是完整模型或 matched Megatron 对比。

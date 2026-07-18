@@ -24,6 +24,31 @@ use crate::session::{
     SessLoadModelRequest, TrainOutput, TrainingSession,
 };
 
+const DEFAULT_MAX_BATCH_ADD_LORA: usize = 64;
+const HARD_MAX_BATCH_ADD_LORA: usize = 4096;
+
+/// Validate before allocating the request-sized vector or touching CUDA.
+/// Keep the same bound in the HTTP process and every worker process so an
+/// invalid batch is rejected before the collective registry can change.
+pub fn validate_batch_add_lora_count(count: i32) -> Result<usize, String> {
+    if count <= 0 {
+        return Err("batch LoRA count must be positive".to_string());
+    }
+    let configured = std::env::var("RUSTRAIN_MAX_BATCH_ADD_LORA")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_MAX_BATCH_ADD_LORA)
+        .min(HARD_MAX_BATCH_ADD_LORA);
+    let count = count as usize;
+    if count > configured {
+        return Err(format!(
+            "batch LoRA count {count} exceeds configured maximum {configured}"
+        ));
+    }
+    Ok(count)
+}
+
 /// Coordinator for EP workers. Lives in the HTTP server process.
 /// Holds no GPU resources — only IPC state.
 pub struct EpCoordinator {
@@ -706,8 +731,12 @@ fn execute_command(session: &mut Qwen36Session, worker: &EpWorker, cmd: &EpComma
             target_modules,
             ..
         } => {
-            let mut ids = Vec::with_capacity(*count as usize);
-            for _ in 0..*count {
+            let count = match validate_batch_add_lora_count(*count) {
+                Ok(count) => count,
+                Err(error) => return EpResult::Error(error),
+            };
+            let mut ids = Vec::with_capacity(count);
+            for _ in 0..count {
                 match session.add_lora(AddLoRARequest {
                     rank: *rank,
                     alpha: *alpha,
@@ -716,7 +745,22 @@ fn execute_command(session: &mut Qwen36Session, worker: &EpWorker, cmd: &EpComma
                 }) {
                     Ok(id) => ids.push(id),
                     Err(e) => {
-                        return EpResult::Error(e.to_string());
+                        let error = e.to_string();
+                        let mut rollback_errors = Vec::new();
+                        for id in ids.into_iter().rev() {
+                            if let Err(rollback_error) = session.remove_lora(id) {
+                                rollback_errors.push(format!(
+                                    "adapter {id}: {rollback_error}"
+                                ));
+                            }
+                        }
+                        if rollback_errors.is_empty() {
+                            return EpResult::Error(error);
+                        }
+                        return EpResult::Error(format!(
+                            "{error}; batch rollback failed: {}",
+                            rollback_errors.join("; ")
+                        ));
                     }
                 }
             }
@@ -1216,7 +1260,8 @@ mod tests {
         SourceShard, checkpoint_generation, checkpoint_metadata_matches, checkpoint_staging_path,
         create_checkpoint_staging, create_worker_session, delete_worker_session, multi_lora_rows,
         publish_checkpoint_noreplace, require_worker_session, source_shard_for_topology,
-        tensor_element_range, train_step_rows, validate_flat_tensor_lengths,
+        tensor_element_range, train_step_rows, validate_batch_add_lora_count,
+        validate_flat_tensor_lengths,
     };
     use rustrain_parallel::topology::ParallelTopology;
 
@@ -1232,6 +1277,15 @@ mod tests {
         );
         assert!(train_step_rows(7, Some(SourceShard { rank: 0, size: 2 })).is_err());
         assert_eq!(train_step_rows(7, None).unwrap(), 0..7);
+    }
+
+    #[test]
+    fn batch_add_lora_count_is_fail_closed_before_allocation() {
+        assert_eq!(validate_batch_add_lora_count(1).unwrap(), 1);
+        assert_eq!(validate_batch_add_lora_count(64).unwrap(), 64);
+        assert!(validate_batch_add_lora_count(0).is_err());
+        assert!(validate_batch_add_lora_count(-1).is_err());
+        assert!(validate_batch_add_lora_count(4097).is_err());
     }
 
     #[test]
