@@ -136,6 +136,8 @@ static inline float fp8_e4m3fn_to_f32(uint8_t b) {
     } else if (exp == 0) {
         // Subnormal: (mant / 8) * 2^(-6)
         val = (static_cast<float>(mant) / 8.0f) * 0.015625f;  // 2^-6
+    } else if (exp == 0x0F && mant == 0x07) {
+        val = NAN;
     } else {
         // Normal: (1 + mant/8) * 2^(exp - 7)
         val = (1.0f + static_cast<float>(mant) / 8.0f) *
@@ -193,9 +195,12 @@ void* v4_fp8_tiled_matmul(
         at::Tensor& weight = *reinterpret_cast<at::Tensor*>(weight_ptr);
         at::Tensor& scale  = *reinterpret_cast<at::Tensor*>(scale_ptr);
 
-        int64_t M = input.size(0);
         int64_t K = input.size(1);
         int64_t N = weight.size(0);
+
+        TORCH_CHECK(input.dim() == 2 && weight.dim() == 2,
+                    "FP8 tiled matmul expects rank-2 input and weight");
+        TORCH_CHECK(weight.size(1) == K, "FP8 weight/input K mismatch");
 
         // ── FP8 matmul with full autograd support ──
         // _scaled_mm has no backward in C++, so for frozen FP8 weights we:
@@ -206,10 +211,27 @@ void* v4_fp8_tiled_matmul(
 
         at::Tensor b_bf16;
         if (weight.scalar_type() == at::kFloat8_e4m3fn) {
-            // FP8 weight: dequant to BF16 on GPU (C++ at::to, no Python overhead)
-            b_bf16 = weight.to(at::kBFloat16);
+            // The checkpoint stores raw FP8 values plus one scale per 128x128
+            // tile. Apply that scale exactly once while dequantizing.
+            auto raw = weight.contiguous().reshape({-1}).to(at::kFloat).reshape({N, K});
+            auto scale_f32 = scale.to(weight.device()).to(at::kFloat);
+            int64_t n_blocks = (N + 127) / 128;
+            int64_t k_blocks = (K + 127) / 128;
+            at::Tensor expanded_scale;
+            if (scale_f32.dim() == 2 && scale_f32.size(0) == n_blocks &&
+                scale_f32.size(1) == k_blocks) {
+                expanded_scale = at::repeat_interleave(scale_f32, 128, 0)
+                                     .repeat_interleave(128, 1)
+                                     .narrow(0, 0, N).narrow(1, 0, K);
+            } else {
+                TORCH_CHECK(scale_f32.sizes() == weight.sizes(),
+                            "FP8 scale must be [ceil(N/128), ceil(K/128)] or [N, K]");
+                expanded_scale = scale_f32;
+            }
+            b_bf16 = (raw * expanded_scale).to(at::kBFloat16);
         } else {
-            // Already BF16 or other — use as-is
+            // A non-FP8 weight (for example a LoRA-fused BF16 weight) already
+            // includes the base scale. Applying checkpoint scale again is wrong.
             b_bf16 = weight.to(at::kBFloat16);
         }
 
@@ -250,6 +272,7 @@ struct CheckpointFunction : public torch::autograd::Function<CheckpointFunction>
         at::AutoGradMode guard(false);
         auto fn = reinterpret_cast<CheckpointFn>(fn_val);
         void* out = fn(reinterpret_cast<void*>(&input), reinterpret_cast<void*>(user_ctx_val));
+        TORCH_CHECK(out != nullptr, "gradient checkpoint forward callback failed");
         auto* t = reinterpret_cast<at::Tensor*>(out);
         at::Tensor result = std::move(*t);
         delete t;
@@ -273,6 +296,7 @@ struct CheckpointFunction : public torch::autograd::Function<CheckpointFunction>
         input_detached.set_requires_grad(true);
 
         void* out = fn(reinterpret_cast<void*>(&input_detached), user_ctx);
+        TORCH_CHECK(out != nullptr, "gradient checkpoint backward callback failed");
         auto* t = reinterpret_cast<at::Tensor*>(out);
         at::Tensor output = std::move(*t);
         delete t;
@@ -285,22 +309,29 @@ struct CheckpointFunction : public torch::autograd::Function<CheckpointFunction>
 
 // C FFI entry point: call from Rust to wrap a forward function with checkpointing
 void* v4_checkpoint(void* fn_ptr, void* input_ptr, void* user_ctx) {
-    auto& input = *reinterpret_cast<at::Tensor*>(input_ptr);
-    auto fn = reinterpret_cast<CheckpointFn>(fn_ptr);
+    try {
+        auto& input = *reinterpret_cast<at::Tensor*>(input_ptr);
 
-    // Ensure input requires grad — checkpoint needs it to set up backward
-    if (!input.requires_grad()) {
-        input.set_requires_grad(true);
+        // Ensure input requires grad — checkpoint needs it to set up backward
+        if (!input.requires_grad()) {
+            input.set_requires_grad(true);
+        }
+
+        // apply() returns at::Tensor in this PyTorch version
+        at::Tensor result = CheckpointFunction::apply(
+            input,
+            (int64_t)(uintptr_t)fn_ptr,
+            (int64_t)(uintptr_t)user_ctx
+        );
+
+        return new at::Tensor(std::move(result));
+    } catch (const c10::Error& e) {
+        std::fprintf(stderr, "v4_checkpoint error: %s\n", e.what());
+        return nullptr;
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "v4_checkpoint exception: %s\n", e.what());
+        return nullptr;
     }
-
-    // apply() returns at::Tensor in this PyTorch version
-    at::Tensor result = CheckpointFunction::apply(
-        input,
-        (int64_t)(uintptr_t)fn_ptr,
-        (int64_t)(uintptr_t)user_ctx
-    );
-
-    return new at::Tensor(std::move(result));
 }
 
 // Helper: create a new at::Tensor* from another at::Tensor* (copy constructor increments refcount)

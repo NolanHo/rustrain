@@ -4,7 +4,7 @@ use std::{
     path::{Path, PathBuf},
     ptr,
     thread::sleep,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -681,6 +681,84 @@ mod tests {
             assert!((actual - expected).abs() < 1e-6);
         }
     }
+
+    #[test]
+    fn subgroup_coordinates_reject_invalid_sizes_and_ranks() {
+        let zero = validate_group_coordinates(0, 0, 0).unwrap_err();
+        assert!(zero.to_string().contains("greater than zero"));
+
+        let out_of_range = validate_group_coordinates(2, 2, 0).unwrap_err();
+        assert!(out_of_range.to_string().contains("rank 2"));
+    }
+
+    #[test]
+    fn subgroup_coordinates_accept_valid_explicit_ranks() {
+        validate_group_coordinates(1, 4, 3).expect("valid subgroup coordinates should pass");
+    }
+
+    #[test]
+    fn persistent_exchange_rejects_stale_files_across_arrival_orders() {
+        let exchange_dir = std::env::temp_dir().join(format!(
+            "rustrain-nccl-rendezvous-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        fs::create_dir_all(&exchange_dir).expect("create exchange directory");
+        let stale = test_unique_id(11);
+        let fresh = test_unique_id(29);
+        write_bytes_atomically(
+            &exchange_dir.join("nccl-persistent-id.bin"),
+            &unique_id_to_bytes(&stale),
+        )
+        .expect("write stale ID");
+        let mut stale_release = unique_id_to_bytes(&stale);
+        stale_release.extend(b"stale-participant");
+        write_bytes_atomically(
+            &exchange_dir.join("nccl-release-rank-1.bin"),
+            &stale_release,
+        )
+        .expect("write stale release");
+
+        let peer_dir = exchange_dir.clone();
+        let peer = std::thread::spawn(move || {
+            exchange_persistent_unique_id(&peer_dir, 1, 2, None, Duration::from_secs(2))
+        });
+        std::thread::sleep(Duration::from_millis(100));
+        let root_id =
+            exchange_persistent_unique_id(&exchange_dir, 0, 2, Some(fresh), Duration::from_secs(2))
+                .expect("root rendezvous");
+        let peer_id = peer.join().expect("join peer").expect("peer rendezvous");
+        assert_eq!(unique_id_to_bytes(&root_id), unique_id_to_bytes(&fresh));
+        assert_eq!(unique_id_to_bytes(&peer_id), unique_id_to_bytes(&fresh));
+
+        let second = test_unique_id(47);
+        let root_dir = exchange_dir.clone();
+        let root = std::thread::spawn(move || {
+            exchange_persistent_unique_id(&root_dir, 0, 2, Some(second), Duration::from_secs(2))
+        });
+        std::thread::sleep(Duration::from_millis(100));
+        let peer_id =
+            exchange_persistent_unique_id(&exchange_dir, 1, 2, None, Duration::from_secs(2))
+                .expect("second peer rendezvous");
+        let root_id = root
+            .join()
+            .expect("join root")
+            .expect("second root rendezvous");
+        assert_eq!(unique_id_to_bytes(&root_id), unique_id_to_bytes(&second));
+        assert_eq!(unique_id_to_bytes(&peer_id), unique_id_to_bytes(&second));
+
+        fs::remove_dir_all(exchange_dir).expect("remove exchange directory");
+    }
+
+    fn test_unique_id(seed: u8) -> NcclUniqueId {
+        let mut id = NcclUniqueId {
+            internal: [0; NCCL_UNIQUE_ID_BYTES],
+        };
+        for (index, byte) in id.internal.iter_mut().enumerate() {
+            *byte = seed.wrapping_add(index as u8) as c_char;
+        }
+        id
+    }
 }
 
 // ── Persistent NCCL Communicator ─────────────────────────────────────────────
@@ -716,43 +794,36 @@ impl NcclPersistentComm {
         let rank = parse_env_usize("RANK")?;
         let local_rank = parse_env_usize("LOCAL_RANK")?;
         let world_size = parse_env_usize("WORLD_SIZE")?;
-        if rank >= world_size {
-            bail!("rank {rank} must be smaller than world_size {world_size}");
-        }
-        fs::create_dir_all(output_dir)
-            .with_context(|| format!("failed to create {}", output_dir.display()))?;
+        Self::new_group(output_dir, rank, world_size, local_rank)
+    }
 
-        // Exchange unique ID via file system (only once)
-        let id_path = output_dir.join("nccl-persistent-id.bin");
-        let unique_id = if rank == 0 {
-            let id = nccl_unique_id()?;
-            // Write and fsync to ensure visibility on network FS
-            let f = std::fs::File::create(&id_path)?;
-            use std::io::Write;
-            let mut f = f;
-            f.write_all(&unique_id_to_bytes(&id))?;
-            f.sync_all()?;
-            id
+    /// Create a communicator for an explicit process subgroup.
+    ///
+    /// `rank` and `world_size` are relative to the subgroup, while `local_rank`
+    /// identifies the CUDA device on this host. Concurrent subgroups must use
+    /// distinct exchange directories so their NCCL unique IDs cannot collide.
+    pub fn new_group(
+        exchange_dir: &Path,
+        rank: usize,
+        world_size: usize,
+        local_rank: usize,
+    ) -> Result<Self> {
+        validate_group_coordinates(rank, world_size, local_rank)?;
+        fs::create_dir_all(exchange_dir)
+            .with_context(|| format!("failed to create {}", exchange_dir.display()))?;
+
+        let rank0_id = if rank == 0 {
+            Some(nccl_unique_id()?)
         } else {
-            // Wait for rank 0 to write the ID file
-            let deadline = Instant::now() + Duration::from_secs(60);
-            loop {
-                if id_path.exists() {
-                    let bytes = fs::read(&id_path)
-                        .with_context(|| format!("failed to read {}", id_path.display()))?;
-                    if bytes.len() == NCCL_UNIQUE_ID_BYTES {
-                        break unique_id_from_bytes(&bytes)?;
-                    }
-                }
-                if Instant::now() > deadline {
-                    bail!(
-                        "timed out waiting for NCCL unique ID at {}",
-                        id_path.display()
-                    );
-                }
-                sleep(Duration::from_millis(50));
-            }
+            None
         };
+        let unique_id = exchange_persistent_unique_id(
+            exchange_dir,
+            rank,
+            world_size,
+            rank0_id,
+            Duration::from_secs(300),
+        )?;
 
         // Initialize communicator once
         check_cuda(
@@ -946,6 +1017,112 @@ impl NcclPersistentComm {
     }
 }
 
+fn exchange_persistent_unique_id(
+    exchange_dir: &Path,
+    rank: usize,
+    world_size: usize,
+    rank0_id: Option<NcclUniqueId>,
+    timeout: Duration,
+) -> Result<NcclUniqueId> {
+    let epoch_path = exchange_dir.join("nccl-persistent-id.bin");
+    let ack_path = |peer: usize| exchange_dir.join(format!("nccl-ack-rank-{peer}.bin"));
+    let release_path = |peer: usize| exchange_dir.join(format!("nccl-release-rank-{peer}.bin"));
+    let deadline = Instant::now() + timeout;
+
+    if rank == 0 {
+        let unique_id = rank0_id.context("rank 0 must provide a fresh NCCL unique ID")?;
+        let epoch = unique_id_to_bytes(&unique_id);
+        write_bytes_atomically(&epoch_path, &epoch)?;
+
+        let mut peer_nonces = vec![None; world_size];
+        while peer_nonces.iter().skip(1).any(Option::is_none) {
+            for (peer, nonce) in peer_nonces.iter_mut().enumerate().skip(1) {
+                if nonce.is_none()
+                    && let Ok(bytes) = fs::read(ack_path(peer))
+                    && bytes.len() > NCCL_UNIQUE_ID_BYTES
+                    && bytes.starts_with(&epoch)
+                {
+                    *nonce = Some(bytes[NCCL_UNIQUE_ID_BYTES..].to_vec());
+                }
+            }
+            if Instant::now() > deadline {
+                let missing = peer_nonces
+                    .iter()
+                    .enumerate()
+                    .skip(1)
+                    .filter_map(|(peer, nonce)| nonce.is_none().then_some(peer))
+                    .collect::<Vec<_>>();
+                bail!(
+                    "timed out waiting for NCCL epoch acknowledgements in {}: missing ranks {missing:?}",
+                    exchange_dir.display(),
+                );
+            }
+            sleep(Duration::from_millis(50));
+        }
+
+        for (peer, nonce) in peer_nonces.into_iter().enumerate().skip(1) {
+            let mut release = epoch.clone();
+            release.extend(nonce.context("missing NCCL participant nonce")?);
+            write_bytes_atomically(&release_path(peer), &release)?;
+        }
+        return Ok(unique_id);
+    }
+
+    let nonce = participant_nonce(rank)?;
+    loop {
+        if let Ok(epoch) = fs::read(&epoch_path)
+            && epoch.len() == NCCL_UNIQUE_ID_BYTES
+        {
+            let mut ack = epoch.clone();
+            ack.extend(&nonce);
+            write_bytes_atomically(&ack_path(rank), &ack)?;
+
+            if let Ok(release) = fs::read(release_path(rank))
+                && release.len() == NCCL_UNIQUE_ID_BYTES + nonce.len()
+                && release.starts_with(&epoch)
+                && release[NCCL_UNIQUE_ID_BYTES..] == nonce
+            {
+                return unique_id_from_bytes(&epoch);
+            }
+        }
+        if Instant::now() > deadline {
+            bail!(
+                "timed out waiting for NCCL epoch release for rank {rank} in {}",
+                exchange_dir.display()
+            );
+        }
+        sleep(Duration::from_millis(50));
+    }
+}
+
+fn participant_nonce(rank: usize) -> Result<Vec<u8>> {
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("system clock is before UNIX epoch")?
+        .as_nanos();
+    Ok(format!("{}:{rank}:{timestamp}", std::process::id()).into_bytes())
+}
+
+fn write_bytes_atomically(path: &Path, bytes: &[u8]) -> Result<()> {
+    use std::io::Write;
+
+    let temp_path = path.with_extension(format!("tmp-{}", std::process::id()));
+    let mut file = std::fs::File::create(&temp_path)
+        .with_context(|| format!("failed to create {}", temp_path.display()))?;
+    file.write_all(bytes)
+        .with_context(|| format!("failed to write {}", temp_path.display()))?;
+    file.sync_all()
+        .with_context(|| format!("failed to sync {}", temp_path.display()))?;
+    fs::rename(&temp_path, path).with_context(|| {
+        format!(
+            "failed to publish NCCL rendezvous file {} -> {}",
+            temp_path.display(),
+            path.display()
+        )
+    })?;
+    Ok(())
+}
+
 impl Drop for NcclPersistentComm {
     fn drop(&mut self) {
         if !self.comm.is_null() {
@@ -958,3 +1135,19 @@ impl Drop for NcclPersistentComm {
 }
 
 unsafe impl Send for NcclPersistentComm {}
+
+fn validate_group_coordinates(rank: usize, world_size: usize, local_rank: usize) -> Result<()> {
+    if world_size == 0 {
+        bail!("NCCL group world_size must be greater than zero");
+    }
+    if rank >= world_size {
+        bail!("rank {rank} must be smaller than world_size {world_size}");
+    }
+    if world_size > c_int::MAX as usize {
+        bail!("NCCL group world_size {world_size} exceeds c_int::MAX");
+    }
+    if local_rank > c_int::MAX as usize {
+        bail!("NCCL local_rank {local_rank} exceeds c_int::MAX");
+    }
+    Ok(())
+}

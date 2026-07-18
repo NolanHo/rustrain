@@ -3,11 +3,11 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use chrono::Local;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
-use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
+use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
 use crate::backend::BackendKind;
 
@@ -62,6 +62,9 @@ pub struct TrainConfig {
     pub global_batch_size: usize,
     pub gradient_accumulation_steps: usize,
     pub learning_rate: f32,
+    /// Megatron's total auxiliary MTP loss weight. Defaults to 0.1.
+    #[serde(default = "default_mtp_loss_scaling_factor")]
+    pub mtp_loss_scaling_factor: f64,
     pub weight_decay: f32,
     pub adam_beta1: f32,
     pub adam_beta2: f32,
@@ -72,9 +75,29 @@ pub struct TrainConfig {
     pub max_grad_norm: Option<f32>,
     pub dtype: DType,
     pub device: Device,
+    /// Maximum fraction of a CUDA device available to PyTorch's caching allocator.
+    #[serde(default = "default_cuda_memory_fraction")]
+    pub cuda_memory_fraction: f64,
+    /// Pre-dequantize cached FP8 expert weights at startup for faster linear kernels.
+    #[serde(default = "default_predequant_expert_weights")]
+    pub predequant_expert_weights: bool,
     pub checkpoint_every: u64,
     #[serde(default = "default_eval_every")]
     pub eval_every: u64,
+}
+
+pub const DEFAULT_MTP_LOSS_SCALING_FACTOR: f64 = 0.1;
+
+fn default_mtp_loss_scaling_factor() -> f64 {
+    DEFAULT_MTP_LOSS_SCALING_FACTOR
+}
+
+fn default_cuda_memory_fraction() -> f64 {
+    0.95
+}
+
+fn default_predequant_expert_weights() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -531,7 +554,12 @@ pub fn validate_config(config: &Config) -> Result<()> {
             && !((is_v4_tp_rank || is_v3_tp_rank || is_v4_tp_train)
                 && name == "tensor_model_parallel_size"
                 && parallel.data_parallel_size == 1)
-            && !((is_v4_ep_rank || is_v3_ep_rank || is_v4_ep_train || is_v4_lora_sft_ep || is_glm5_lora_sft_ep || is_qwen3_6_lora_sft_ep)
+            && !((is_v4_ep_rank
+                || is_v3_ep_rank
+                || is_v4_ep_train
+                || is_v4_lora_sft_ep
+                || is_glm5_lora_sft_ep
+                || is_qwen3_6_lora_sft_ep)
                 && name == "expert_model_parallel_size"
                 && parallel.data_parallel_size == 1)
             && !(is_glm5_lora_sft_ep
@@ -663,6 +691,19 @@ pub fn validate_config(config: &Config) -> Result<()> {
     }
     if config.train.learning_rate <= 0.0 {
         return Err(anyhow!("learning_rate must be greater than zero"));
+    }
+    if !config.train.mtp_loss_scaling_factor.is_finite()
+        || config.train.mtp_loss_scaling_factor < 0.0
+    {
+        return Err(anyhow!(
+            "mtp_loss_scaling_factor must be finite and non-negative"
+        ));
+    }
+    if !config.train.cuda_memory_fraction.is_finite()
+        || config.train.cuda_memory_fraction <= 0.0
+        || config.train.cuda_memory_fraction > 1.0
+    {
+        return Err(anyhow!("cuda_memory_fraction must be finite and in (0, 1]"));
     }
     if let Some(max_grad_norm) = config.train.max_grad_norm {
         if max_grad_norm <= 0.0 {
@@ -1273,15 +1314,37 @@ mod tests {
     }
 
     #[test]
+    fn cuda_memory_fraction_must_be_finite_and_bounded() {
+        let mut config = qwen_lora_sft_config();
+
+        for invalid in [0.0, -0.1, 1.01, f64::INFINITY, f64::NAN] {
+            config.train.cuda_memory_fraction = invalid;
+            let error = match validate_config(&config) {
+                Ok(()) => panic!("fraction {invalid:?} unexpectedly validated"),
+                Err(error) => error.to_string(),
+            };
+            assert!(
+                error.contains("cuda_memory_fraction must be finite and in (0, 1]"),
+                "fraction {invalid:?} unexpectedly validated or returned a different error: {error}"
+            );
+        }
+
+        config.train.cuda_memory_fraction = 1.0;
+        validate_config(&config).expect("a full-device allocator fraction should validate");
+    }
+
+    #[test]
     fn data_max_samples_must_be_positive_when_set() {
         let mut config = qwen_lora_sft_config();
         config.data.as_mut().unwrap().max_samples = Some(0);
 
         let error = validate_config(&config).expect_err("zero max_samples should fail");
 
-        assert!(error
-            .to_string()
-            .contains("data.max_samples must be greater than zero"));
+        assert!(
+            error
+                .to_string()
+                .contains("data.max_samples must be greater than zero")
+        );
     }
 
     #[test]
@@ -1300,9 +1363,11 @@ mod tests {
 
         let error = validate_config(&config).expect_err("invalid regex should fail");
 
-        assert!(error
-            .to_string()
-            .contains("data.field_regex_replacements invalid regex pattern"));
+        assert!(
+            error
+                .to_string()
+                .contains("data.field_regex_replacements invalid regex pattern")
+        );
     }
 
     #[test]
@@ -1322,9 +1387,11 @@ mod tests {
 
         let error = validate_config(&config).expect_err("invalid regex should fail");
 
-        assert!(error
-            .to_string()
-            .contains("data.field_transforms invalid regex_replace pattern"));
+        assert!(
+            error
+                .to_string()
+                .contains("data.field_transforms invalid regex_replace pattern")
+        );
     }
 
     #[test]
@@ -1342,9 +1409,11 @@ mod tests {
 
         let error = validate_config(&config).expect_err("invalid regex should fail");
 
-        assert!(error
-            .to_string()
-            .contains("data field regex filter invalid regex pattern"));
+        assert!(
+            error
+                .to_string()
+                .contains("data field regex filter invalid regex pattern")
+        );
     }
 
     fn qwen_lora_sft_config() -> Config {
@@ -1379,6 +1448,7 @@ mod tests {
                 global_batch_size: 4,
                 gradient_accumulation_steps: 2,
                 learning_rate: 100.0,
+                mtp_loss_scaling_factor: 0.1,
                 weight_decay: 0.0,
                 adam_beta1: 0.9,
                 adam_beta2: 0.999,
@@ -1387,6 +1457,8 @@ mod tests {
                 max_grad_norm: Some(0.0001),
                 dtype: DType::Fp32,
                 device: Device::Cuda,
+                cuda_memory_fraction: 0.95,
+                predequant_expert_weights: true,
                 checkpoint_every: 0,
                 eval_every: 0,
             },
