@@ -2359,6 +2359,7 @@ struct TrainingContext {
     int64_t dynamic_adam_launch_count = 0;
     bool restore_without_parameter_sync = false;
     bool allow_heterogeneous_registration = false;
+    bool pad_heterogeneous_lora_batch = false;
 
     // LoRA cache: pre-concatenated A/B per (layer, module) pair
     // Invalidated when adapters change or after Adam update
@@ -2549,6 +2550,7 @@ static void hash_collective_topology(
     hash.add_u64(env_enabled("QWEN36_GROUPED_LORA_SYNC", true));
     hash.add_u64(env_enabled("QWEN36_PACKED_LORA_SYNC", true));
     hash.add_u64(env_enabled("QWEN36_GRAD_SLAB", true));
+    hash.add_u64(env_enabled("QWEN36_HETERO_PADDED_BATCH", true));
     hash.add_u64(gdn_state_checkpoint_config());
 }
 
@@ -4400,23 +4402,145 @@ static void prepare_lora_batch(
             std::vector<int64_t> active_indices;
             std::vector<double> scalings;
             const char* module_name = lora_pair_name(ctx->layer_configs[layer_idx], pair_idx);
-            for (size_t adapter_index = 0;
-                 adapter_index < ctx->adapters.size(); ++adapter_index) {
-                auto& adapter = ctx->adapters[adapter_index];
-                if (!adapter.target_modules.empty() &&
-                    adapter.target_modules.find(module_name) == adapter.target_modules.end())
-                    continue;
-                if (!adapter.target_layers.empty() && adapter.target_layers.find(layer_idx) == adapter.target_layers.end())
-                    continue;
-                auto it = adapter.params.find(layer_idx);
-                if (it == adapter.params.end()) continue;
-                if (pair_idx >= (int64_t)it->second.size()) continue;
-                auto& [a, b] = it->second[pair_idx];
-                if (!a.requires_grad() && !b.requires_grad()) continue;
-                b_list.push_back(b);
-                a_list.push_back(a);
-                scalings.push_back(adapter.alpha / (double)adapter.rank);
-                active_indices.push_back((int64_t)adapter_index);
+            if (ctx->pad_heterogeneous_lora_batch) {
+                using LoraPair = std::pair<at::Tensor, at::Tensor>;
+                std::vector<LoraPair*> active_pairs(
+                    ctx->adapters.size(), nullptr);
+                at::Tensor template_a;
+                at::Tensor template_b;
+                int64_t a_rank_dim = -1;
+                int64_t b_rank_dim = -1;
+                int64_t padded_rank = 0;
+
+                for (size_t adapter_index = 0;
+                     adapter_index < ctx->adapters.size(); ++adapter_index) {
+                    auto& adapter = ctx->adapters[adapter_index];
+                    if (!adapter.target_modules.empty() &&
+                        adapter.target_modules.find(module_name) ==
+                            adapter.target_modules.end())
+                        continue;
+                    if (!adapter.target_layers.empty() &&
+                        adapter.target_layers.find(layer_idx) ==
+                            adapter.target_layers.end())
+                        continue;
+                    auto it = adapter.params.find(layer_idx);
+                    if (it == adapter.params.end() ||
+                        pair_idx >= static_cast<int64_t>(it->second.size()))
+                        continue;
+                    auto& pair = it->second[pair_idx];
+                    auto& [a, b] = pair;
+                    if (!a.requires_grad() && !b.requires_grad()) continue;
+                    TORCH_CHECK(a.requires_grad() && b.requires_grad(),
+                        "heterogeneous LoRA A/B activity mismatch for layer ",
+                        layer_idx, " projection ", module_name,
+                        " adapter ", adapter.id);
+                    TORCH_CHECK(
+                        (a.dim() == 2 && b.dim() == 2) ||
+                            (a.dim() == 3 && b.dim() == 3),
+                        "heterogeneous LoRA expects paired dense or routed-expert "
+                        "tensors for layer ", layer_idx, " projection ",
+                        module_name, " adapter ", adapter.id,
+                        ": A=", a.sizes(), " B=", b.sizes());
+                    const int64_t current_a_rank_dim = a.dim() == 2 ? 0 : 1;
+                    const int64_t current_b_rank_dim = b.dim() == 2 ? 1 : 2;
+                    TORCH_CHECK(a.size(current_a_rank_dim) ==
+                            b.size(current_b_rank_dim),
+                        "heterogeneous LoRA A/B rank mismatch for layer ",
+                        layer_idx, " projection ", module_name,
+                        " adapter ", adapter.id);
+                    if (!template_a.defined()) {
+                        template_a = a;
+                        template_b = b;
+                        a_rank_dim = current_a_rank_dim;
+                        b_rank_dim = current_b_rank_dim;
+                    } else {
+                        TORCH_CHECK(a.dim() == template_a.dim() &&
+                                b.dim() == template_b.dim() &&
+                                current_a_rank_dim == a_rank_dim &&
+                                current_b_rank_dim == b_rank_dim,
+                            "heterogeneous LoRA tensor rank differs within layer ",
+                            layer_idx, " projection ", module_name);
+                        for (int64_t dim = 0; dim < a.dim(); ++dim) {
+                            if (dim != a_rank_dim) {
+                                TORCH_CHECK(a.size(dim) == template_a.size(dim),
+                                    "heterogeneous LoRA A geometry differs within layer ",
+                                    layer_idx, " projection ", module_name);
+                            }
+                        }
+                        for (int64_t dim = 0; dim < b.dim(); ++dim) {
+                            if (dim != b_rank_dim) {
+                                TORCH_CHECK(b.size(dim) == template_b.size(dim),
+                                    "heterogeneous LoRA B geometry differs within layer ",
+                                    layer_idx, " projection ", module_name);
+                            }
+                        }
+                    }
+                    padded_rank = std::max(
+                        padded_rank, a.size(current_a_rank_dim));
+                    active_pairs[adapter_index] = &pair;
+                }
+                if (!template_a.defined()) continue;
+
+                auto padded_a_sizes = template_a.sizes().vec();
+                auto padded_b_sizes = template_b.sizes().vec();
+                padded_a_sizes[a_rank_dim] = padded_rank;
+                padded_b_sizes[b_rank_dim] = padded_rank;
+                a_list.reserve(ctx->adapters.size());
+                b_list.reserve(ctx->adapters.size());
+                active_indices.reserve(ctx->adapters.size());
+                for (size_t adapter_index = 0;
+                     adapter_index < ctx->adapters.size(); ++adapter_index) {
+                    auto* pair = active_pairs[adapter_index];
+                    if (!pair) {
+                        a_list.push_back(at::zeros(
+                            padded_a_sizes, template_a.options()));
+                        b_list.push_back(at::zeros(
+                            padded_b_sizes, template_b.options()));
+                    } else {
+                        auto& [a, b] = *pair;
+                        const int64_t rank = a.size(a_rank_dim);
+                        if (rank == padded_rank) {
+                            a_list.push_back(a);
+                            b_list.push_back(b);
+                        } else {
+                            auto a_padding_sizes = a.sizes().vec();
+                            auto b_padding_sizes = b.sizes().vec();
+                            a_padding_sizes[a_rank_dim] = padded_rank - rank;
+                            b_padding_sizes[b_rank_dim] = padded_rank - rank;
+                            a_list.push_back(at::cat(
+                                {a, at::zeros(a_padding_sizes, a.options())},
+                                a_rank_dim));
+                            b_list.push_back(at::cat(
+                                {b, at::zeros(b_padding_sizes, b.options())},
+                                b_rank_dim));
+                        }
+                    }
+                    active_indices.push_back(
+                        static_cast<int64_t>(adapter_index));
+                }
+            } else {
+                for (size_t adapter_index = 0;
+                     adapter_index < ctx->adapters.size(); ++adapter_index) {
+                    auto& adapter = ctx->adapters[adapter_index];
+                    if (!adapter.target_modules.empty() &&
+                        adapter.target_modules.find(module_name) ==
+                            adapter.target_modules.end())
+                        continue;
+                    if (!adapter.target_layers.empty() &&
+                        adapter.target_layers.find(layer_idx) ==
+                            adapter.target_layers.end())
+                        continue;
+                    auto it = adapter.params.find(layer_idx);
+                    if (it == adapter.params.end()) continue;
+                    if (pair_idx >= (int64_t)it->second.size()) continue;
+                    auto& [a, b] = it->second[pair_idx];
+                    if (!a.requires_grad() && !b.requires_grad()) continue;
+                    b_list.push_back(b);
+                    a_list.push_back(a);
+                    scalings.push_back(
+                        adapter.alpha / (double)adapter.rank);
+                    active_indices.push_back((int64_t)adapter_index);
+                }
             }
             if (a_list.empty()) continue;
 
@@ -7473,7 +7597,7 @@ enum class DynamicMultiLoraMode {
 /// Train all adapters in chunks. Inputs may be [1, seq] (shared prompt,
 /// repeated per chunk) or [n_total, seq] (one independent sample per adapter).
 /// Heterogeneous selected training reuses the same implementation in two
-/// phases so all signature groups share one synchronization/Adam boundary.
+/// phases so every selected adapter shares one synchronization/Adam boundary.
 static double qwen36_train_multi_lora_impl(
     void* ctx_ptr,
     void* input_ids_ptr,
@@ -7552,17 +7676,27 @@ static double qwen36_train_multi_lora_impl(
             n_total, ", registered=", total_adapters, ")");
         if (!finalize_only) {
             const auto& reference_adapter = ctx->adapters.front();
+            int64_t maximum_rank = 0;
             for (const auto& adapter : ctx->adapters) {
-                TORCH_CHECK(adapter.rank == lora_rank,
-                    "lora_rank argument must match every registered adapter; adapter=",
-                    adapter.id, " registered_rank=", adapter.rank,
-                    " requested_rank=", lora_rank);
-                TORCH_CHECK(
-                    adapter.target_layers == reference_adapter.target_layers &&
-                        adapter.target_modules == reference_adapter.target_modules,
-                    "legacy multi-LoRA training requires homogeneous target layers/modules; "
-                    "use the grouped v2 trainer for heterogeneous adapters");
+                maximum_rank = std::max(maximum_rank, adapter.rank);
+                if (!ctx->pad_heterogeneous_lora_batch) {
+                    TORCH_CHECK(adapter.rank == lora_rank,
+                        "lora_rank argument must match every registered adapter; adapter=",
+                        adapter.id, " registered_rank=", adapter.rank,
+                        " requested_rank=", lora_rank);
+                    TORCH_CHECK(
+                        adapter.target_layers == reference_adapter.target_layers &&
+                            adapter.target_modules == reference_adapter.target_modules,
+                        "legacy multi-LoRA training requires homogeneous target layers/modules; "
+                        "use the v2 trainer for heterogeneous adapters");
+                }
             }
+            TORCH_CHECK(!ctx->pad_heterogeneous_lora_batch ||
+                    maximum_rank == lora_rank,
+                "heterogeneous multi-LoRA rank hint must equal the maximum "
+                "registered rank; maximum=", maximum_rank,
+                " requested=", lora_rank);
+            ++ctx->multi_lora_invocation;
         }
         const int64_t input_batch = input_ids.size(0);
         auto input_row_token_counts = target_mask
@@ -8290,10 +8424,11 @@ static void rollback_dynamic_adapter_commit(
     adapter.optimizer_step = optimizer_step;
 }
 
-// Heterogeneous selected training groups only adapters whose active tensor
-// layouts can be stacked safely. Groups execute forward/backward in canonical
-// key order, then the complete selected registry shares one gradient
-// synchronization and one transactional Adam finalizer.
+// Heterogeneous selected training pads each active LoRA rank to the largest
+// rank needed by that projection and inserts zero A/B slots for adapters that
+// do not target it. This keeps the activation batch aligned with request order
+// so all selected tenants share one forward/backward and one transactional
+// synchronization/Adam finalizer.
 __attribute__((visibility("default"))) double
 qwen36_train_multi_lora_selected_v2(
     void* ctx_ptr,
@@ -8483,83 +8618,128 @@ qwen36_train_multi_lora_selected_v2(
             original_steps.push_back(original[index].optimizer_step);
             selected.push_back(std::move(original[index]));
         }
-        std::map<std::string, std::vector<size_t>> groups;
-        for (size_t index = 0; index < selected.size(); ++index) {
-            groups[dynamic_adapter_group_key(selected[index])].push_back(index);
-        }
+        double train_loss = 0.0;
+        if (env_enabled("QWEN36_HETERO_PADDED_BATCH", true)) {
+            int64_t maximum_rank = 0;
+            for (const auto& adapter : selected)
+                maximum_rank = std::max(maximum_rank, adapter.rank);
+            TORCH_CHECK(maximum_rank > 0 &&
+                    maximum_rank <= std::numeric_limits<int32_t>::max(),
+                "heterogeneous adapter rank is outside the native trainer range: ",
+                maximum_rank);
 
-        double weighted_loss = 0.0;
-        int32_t completed_groups = 0;
-        for (const auto& [group_key, indexes] : groups) {
-            std::vector<int64_t> row_indexes;
-            row_indexes.reserve(indexes.size());
-            for (const size_t selected_index : indexes)
-                row_indexes.push_back(static_cast<int64_t>(selected_index));
+            ctx->adapters.swap(selected);
+            selected_registry_installed = true;
+            const bool saved_padding_mode = ctx->pad_heterogeneous_lora_batch;
+            ctx->pad_heterogeneous_lora_batch = true;
+            train_loss = qwen36_train_multi_lora_impl(
+                ctx, input_ids_ptr, target_mask_ptr, attention_mask_ptr,
+                n_adapters, static_cast<int32_t>(maximum_rank),
+                DynamicMultiLoraMode::TrainOnly);
+            ctx->pad_heterogeneous_lora_batch = saved_padding_mode;
+            selected.swap(ctx->adapters);
+            selected_registry_installed = false;
 
-            at::Tensor group_input;
-            at::Tensor group_targets;
-            at::Tensor group_attention;
-            void* group_input_ptr = input_ids_ptr;
-            void* group_target_ptr = target_mask_ptr;
-            void* group_attention_ptr = attention_mask_ptr;
-            bool local_prepared = true;
-            try {
-                if (input_batch != 1) {
-                    auto row_tensor = at::tensor(
-                        row_indexes,
-                        input_ids.options().dtype(at::kLong));
-                    group_input = input_ids.index_select(0, row_tensor);
-                    group_targets = target_mask.index_select(0, row_tensor);
-                    group_input_ptr = &group_input;
-                    group_target_ptr = &group_targets;
-                    if (attention_mask.defined()) {
-                        group_attention = attention_mask.index_select(
-                            0, row_tensor);
-                        group_attention_ptr = &group_attention;
-                    }
-                }
-            } catch (...) {
-                local_prepared = false;
-            }
-            TORCH_CHECK(adapter_collective_all_succeeded(ctx, local_prepared),
-                "heterogeneous adapter group preparation failed on at least "
-                "one distributed rank: ", group_key);
-
-            std::vector<TrainingContext::LoRAAdapter> group;
-            group.reserve(indexes.size());
-            for (const size_t selected_index : indexes)
-                group.push_back(std::move(selected[selected_index]));
-            ctx->adapters.swap(group);
-            const int32_t group_size = static_cast<int32_t>(indexes.size());
-            const int32_t group_rank = static_cast<int32_t>(
-                ctx->adapters.front().rank);
-            const double group_loss = qwen36_train_multi_lora_impl(
-                ctx, group_input_ptr, group_target_ptr, group_attention_ptr,
-                group_size, group_rank, DynamicMultiLoraMode::TrainOnly);
-
-            group.swap(ctx->adapters);
-            for (size_t group_index = 0;
-                 group_index < indexes.size(); ++group_index) {
-                selected[indexes[group_index]] =
-                    std::move(group[group_index]);
-            }
-            ++completed_groups;
-            bool local_group_succeeded =
-                std::isfinite(group_loss) && group_loss >= 0.0;
+            bool local_batch_succeeded =
+                std::isfinite(train_loss) && train_loss >= 0.0;
             const char* fail_after = std::getenv(
                 "QWEN36_TEST_FAIL_HETERO_GROUP_AFTER");
             if (fail_after && fail_after[0] != '\0') {
                 char* end = nullptr;
                 const long requested = std::strtol(fail_after, &end, 10);
-                local_group_succeeded = local_group_succeeded &&
-                    end && *end == '\0' && requested > 0 &&
-                    completed_groups != requested;
+                local_batch_succeeded = local_batch_succeeded &&
+                    end && *end == '\0' && requested > 0 && requested != 1;
             }
             TORCH_CHECK(adapter_collective_all_succeeded(
-                    ctx, local_group_succeeded),
-                "heterogeneous adapter group failed on at least one "
-                "distributed rank: ", group_key);
-            weighted_loss += group_loss * indexes.size();
+                    ctx, local_batch_succeeded),
+                "heterogeneous adapter batch failed on at least one "
+                "distributed rank");
+        } else {
+            std::map<std::string, std::vector<size_t>> groups;
+            for (size_t index = 0; index < selected.size(); ++index) {
+                groups[dynamic_adapter_group_key(selected[index])]
+                    .push_back(index);
+            }
+
+            double weighted_loss = 0.0;
+            int32_t completed_groups = 0;
+            for (const auto& [group_key, indexes] : groups) {
+                std::vector<int64_t> row_indexes;
+                row_indexes.reserve(indexes.size());
+                for (const size_t selected_index : indexes)
+                    row_indexes.push_back(
+                        static_cast<int64_t>(selected_index));
+
+                at::Tensor group_input;
+                at::Tensor group_targets;
+                at::Tensor group_attention;
+                void* group_input_ptr = input_ids_ptr;
+                void* group_target_ptr = target_mask_ptr;
+                void* group_attention_ptr = attention_mask_ptr;
+                bool local_prepared = true;
+                try {
+                    if (input_batch != 1) {
+                        auto row_tensor = at::tensor(
+                            row_indexes,
+                            input_ids.options().dtype(at::kLong));
+                        group_input = input_ids.index_select(0, row_tensor);
+                        group_targets = target_mask.index_select(0, row_tensor);
+                        group_input_ptr = &group_input;
+                        group_target_ptr = &group_targets;
+                        if (attention_mask.defined()) {
+                            group_attention = attention_mask.index_select(
+                                0, row_tensor);
+                            group_attention_ptr = &group_attention;
+                        }
+                    }
+                } catch (...) {
+                    local_prepared = false;
+                }
+                TORCH_CHECK(adapter_collective_all_succeeded(
+                        ctx, local_prepared),
+                    "heterogeneous adapter group preparation failed on at "
+                    "least one distributed rank: ", group_key);
+
+                std::vector<TrainingContext::LoRAAdapter> group;
+                group.reserve(indexes.size());
+                for (const size_t selected_index : indexes)
+                    group.push_back(std::move(selected[selected_index]));
+                ctx->adapters.swap(group);
+                const int32_t group_size =
+                    static_cast<int32_t>(indexes.size());
+                const int32_t group_rank = static_cast<int32_t>(
+                    ctx->adapters.front().rank);
+                const double group_loss = qwen36_train_multi_lora_impl(
+                    ctx, group_input_ptr, group_target_ptr,
+                    group_attention_ptr, group_size, group_rank,
+                    DynamicMultiLoraMode::TrainOnly);
+
+                group.swap(ctx->adapters);
+                for (size_t group_index = 0;
+                     group_index < indexes.size(); ++group_index) {
+                    selected[indexes[group_index]] =
+                        std::move(group[group_index]);
+                }
+                ++completed_groups;
+                bool local_group_succeeded =
+                    std::isfinite(group_loss) && group_loss >= 0.0;
+                const char* fail_after = std::getenv(
+                    "QWEN36_TEST_FAIL_HETERO_GROUP_AFTER");
+                if (fail_after && fail_after[0] != '\0') {
+                    char* end = nullptr;
+                    const long requested = std::strtol(
+                        fail_after, &end, 10);
+                    local_group_succeeded = local_group_succeeded &&
+                        end && *end == '\0' && requested > 0 &&
+                        completed_groups != requested;
+                }
+                TORCH_CHECK(adapter_collective_all_succeeded(
+                        ctx, local_group_succeeded),
+                    "heterogeneous adapter group failed on at least one "
+                    "distributed rank: ", group_key);
+                weighted_loss += group_loss * indexes.size();
+            }
+            train_loss = weighted_loss / static_cast<double>(n_adapters);
         }
 
         ctx->adapters.swap(selected);
@@ -8583,7 +8763,7 @@ qwen36_train_multi_lora_selected_v2(
             "heterogeneous adapter finalizer failed on at least one "
             "distributed rank");
         restore_registry();
-        return weighted_loss / static_cast<double>(n_adapters);
+        return train_loss;
     } catch (const std::exception& e) {
         recover();
         fprintf(stderr, "[train_multi_selected_v2] FAILED: %s\n", e.what());
@@ -9789,6 +9969,13 @@ __attribute__((visibility("default")))
 int64_t qwen36_get_dynamic_adam_launch_count(void* ctx_ptr) {
     if (!ctx_ptr) return -1;
     return reinterpret_cast<TrainingContext*>(ctx_ptr)->dynamic_adam_launch_count;
+}
+
+__attribute__((visibility("default")))
+int64_t qwen36_get_dynamic_train_batch_count(void* ctx_ptr) {
+    if (!ctx_ptr) return -1;
+    return reinterpret_cast<TrainingContext*>(
+        ctx_ptr)->multi_lora_invocation;
 }
 
 __attribute__((visibility("default")))

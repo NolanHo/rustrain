@@ -47,6 +47,7 @@ extern "C" int64_t qwen36_export_optimizer_state(
 extern "C" int64_t qwen36_get_adapter_step_count(void*, int64_t);
 extern "C" int64_t qwen36_get_dynamic_finalizer_count(void*);
 extern "C" int64_t qwen36_get_dynamic_adam_launch_count(void*);
+extern "C" int64_t qwen36_get_dynamic_train_batch_count(void*);
 extern "C" int32_t qwen36_get_accumulation_active(void*);
 extern "C" double qwen36_get_accumulated_token_weight(void*);
 extern "C" int32_t qwen36_set_adapter_step_count(void*, int64_t, int64_t);
@@ -789,6 +790,8 @@ int main() {
         qwen36_get_dynamic_finalizer_count(ctx);
     const int64_t adam_launches_before_v2 =
         qwen36_get_dynamic_adam_launch_count(ctx);
+    const int64_t train_batches_before_v2 =
+        qwen36_get_dynamic_train_batch_count(ctx);
     const double heterogeneous_loss = qwen36_train_multi_lora_selected_v2(
         ctx, &shared_input, &shared_target_row, &shared_attention,
         heterogeneous_ids, 3);
@@ -801,6 +804,8 @@ int main() {
         finalizers_before_v2 + 1);
     assert(qwen36_get_dynamic_adam_launch_count(ctx) ==
         adam_launches_before_v2 + 1);
+    assert(qwen36_get_dynamic_train_batch_count(ctx) ==
+        train_batches_before_v2 + 1);
     assert((*dynamic_b - one_before_v2).abs().sum().item<double>() > 0.0);
     assert((*heterogeneous_b - heterogeneous_b_before).abs().sum().item<double>() > 0.0);
 
@@ -828,9 +833,13 @@ int main() {
     assert(qwen36_get_dynamic_adam_launch_count(ctx) ==
         adam_launches_before_v2 + 1);
 
+    const int64_t grouped_batches_before =
+        qwen36_get_dynamic_train_batch_count(ctx);
+    setenv("QWEN36_HETERO_PADDED_BATCH", "0", 1);
     assert(qwen36_train_multi_lora_host_i64(
         ctx, host_input_ids, host_target_mask, host_attention_mask,
         1, 2, 3, rank, nullptr, 0) > 0.0);
+    unsetenv("QWEN36_HETERO_PADDED_BATCH");
     c10::cuda::device_synchronize();
     assert(qwen36_get_adapter_step_count(ctx, adapter_one) == 5);
     assert(qwen36_get_adapter_step_count(ctx, adapter_two) == 3);
@@ -839,6 +848,8 @@ int main() {
         finalizers_before_v2 + 2);
     assert(qwen36_get_dynamic_adam_launch_count(ctx) ==
         adam_launches_before_v2 + 2);
+    assert(qwen36_get_dynamic_train_batch_count(ctx) ==
+        grouped_batches_before + 2);
     std::printf("native_qwen36_heterogeneous_v2_smoke loss=%0.8f ok\n",
         heterogeneous_loss);
     assert(qwen36_remove_lora(ctx, heterogeneous_restore) == 1);

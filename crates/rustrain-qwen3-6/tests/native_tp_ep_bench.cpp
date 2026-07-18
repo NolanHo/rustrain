@@ -42,8 +42,12 @@ extern "C" int32_t qwen36_init_parallel_nccl(
 extern "C" double qwen36_train_step(void*, void*, void*, void*);
 extern "C" int64_t qwen36_add_lora(
     void*, int64_t, double, const int64_t*, int64_t, const char*);
+extern "C" int64_t qwen36_add_lora_v2(
+    void*, int64_t, double, const int64_t*, int64_t, const char*);
 extern "C" double qwen36_train_multi_lora_selected(
     void*, void*, void*, void*, const int64_t*, int32_t, int32_t);
+extern "C" double qwen36_train_multi_lora_selected_v2(
+    void*, void*, void*, void*, const int64_t*, int32_t);
 extern "C" void qwen36_free_training_context(void*);
 
 namespace {
@@ -263,7 +267,9 @@ int main() {
     set_parallel_env(rank, tp_rank, ep_rank);
 
     const std::string lora_mode = env_string("BENCH_LORA_MODE", "fixed");
-    assert(lora_mode == "fixed" || lora_mode == "dynamic");
+    assert(lora_mode == "fixed" || lora_mode == "dynamic" ||
+        lora_mode == "heterogeneous");
+    const bool dynamic_lora = lora_mode != "fixed";
     const std::string expert_tp_mode = env_string(
         "BENCH_EXPERT_TP_MODE", "etp");
     assert(expert_tp_mode == "replicated" || expert_tp_mode == "etp");
@@ -272,6 +278,8 @@ int main() {
     const bool packed_a2a = env_enabled("QWEN36_EP_A2A_PACKED", true);
     const std::string targets = env_string(
         "BENCH_TARGETS", "q_proj,experts_gate_up_proj,experts_down_proj");
+    const std::string heterogeneous_targets = env_string(
+        "BENCH_HETERO_TARGETS", "q_proj");
     const int batch = env_int("BENCH_BATCH", 2);
     const int seq = env_int("BENCH_SEQ", 128);
     const int hidden = env_int("BENCH_HIDDEN", 1024);
@@ -285,6 +293,8 @@ int main() {
         "QWEN36_EP_A2A_GPU_METADATA",
         kEpSize >= 4 && batch * seq * (packed_a2a ? top_k : 1) >= 512);
     const int lora_rank = env_int("BENCH_LORA_RANK", 16);
+    const int heterogeneous_rank = env_int(
+        "BENCH_HETERO_LORA_RANK", std::max(1, lora_rank / 2));
     const int layers = env_int("BENCH_LAYERS", 1);
     const int vocab = env_int("BENCH_VOCAB", 8192);
     const int warmup = env_int("BENCH_WARMUP", 3);
@@ -299,7 +309,7 @@ int main() {
     assert(experts % kEpSize == 0 && top_k <= experts);
     assert(lora_rank % kTpSize == 0 && vocab % kTpSize == 0);
     assert(!expert_tp || intermediate % kTpSize == 0);
-    assert(lora_mode != "dynamic" ||
+    assert(!dynamic_lora ||
         (active_tenants == batch && tenants >= active_tenants));
 
     c10::cuda::CUDACachingAllocator::resetPeakStats(local_rank);
@@ -365,12 +375,22 @@ int main() {
         0, kDpSize, dp_color) == 0);
 
     std::vector<int64_t> adapter_ids;
-    if (lora_mode == "dynamic") {
+    if (dynamic_lora) {
         adapter_ids.reserve(tenants);
         for (int tenant = 0; tenant < tenants; ++tenant) {
-            const int64_t adapter_id = qwen36_add_lora(
-                context, lora_rank, static_cast<double>(lora_rank),
-                target_layers.data(), layers, targets.c_str());
+            const bool heterogeneous_tenant =
+                lora_mode == "heterogeneous" && tenant % 2 != 0;
+            const int tenant_rank = heterogeneous_tenant
+                ? heterogeneous_rank : lora_rank;
+            const std::string& tenant_targets = heterogeneous_tenant
+                ? heterogeneous_targets : targets;
+            const int64_t adapter_id = lora_mode == "heterogeneous"
+                ? qwen36_add_lora_v2(
+                    context, tenant_rank, static_cast<double>(tenant_rank),
+                    target_layers.data(), layers, tenant_targets.c_str())
+                : qwen36_add_lora(
+                    context, tenant_rank, static_cast<double>(tenant_rank),
+                    target_layers.data(), layers, tenant_targets.c_str());
             assert(adapter_id > 0);
             adapter_ids.push_back(adapter_id);
         }
@@ -399,7 +419,7 @@ int main() {
 
     std::vector<int64_t> selected(active_tenants);
     auto select_tenants = [&](int step) {
-        if (lora_mode != "dynamic") return;
+        if (!dynamic_lora) return;
         const int start = rotate_tenants
             ? (step * active_tenants) % tenants : 0;
         for (int index = 0; index < active_tenants; ++index) {
@@ -412,6 +432,11 @@ int main() {
                 context, &input_ids, &target_mask, &attention_mask);
         }
         select_tenants(step);
+        if (lora_mode == "heterogeneous") {
+            return qwen36_train_multi_lora_selected_v2(
+                context, &input_ids, &target_mask, &attention_mask,
+                selected.data(), active_tenants);
+        }
         return qwen36_train_multi_lora_selected(
             context, &input_ids, &target_mask, &attention_mask,
             selected.data(), active_tenants, lora_rank);
@@ -502,9 +527,12 @@ int main() {
         << (expert_tp ? 1 : kTpSize) << ','
         << "\"top_k\":" << top_k << ','
         << "\"vocab\":" << vocab << ",\"lora_rank\":" << lora_rank << ','
-        << "\"tenants\":" << (lora_mode == "dynamic" ? tenants : 0) << ','
+        << "\"heterogeneous_lora_rank\":" << heterogeneous_rank << ','
+        << "\"heterogeneous_targets\":\""
+        << json_escape(heterogeneous_targets) << "\","
+        << "\"tenants\":" << (dynamic_lora ? tenants : 0) << ','
         << "\"active_tenants\":"
-        << (lora_mode == "dynamic" ? active_tenants : 0) << ','
+        << (dynamic_lora ? active_tenants : 0) << ','
         << "\"rotate_tenants\":" << (rotate_tenants ? "true" : "false") << ','
         << "\"warmup\":" << warmup << ",\"iters\":" << iters << ','
         << "\"last_loss\":" << last_loss << ','

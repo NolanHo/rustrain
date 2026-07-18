@@ -76,6 +76,7 @@ extern "C" int32_t qwen36_set_adapter_optimizer_tensor(
 extern "C" int64_t qwen36_get_adapter_step_count(void*, int64_t);
 extern "C" int64_t qwen36_get_dynamic_finalizer_count(void*);
 extern "C" int64_t qwen36_get_dynamic_adam_launch_count(void*);
+extern "C" int64_t qwen36_get_dynamic_train_batch_count(void*);
 extern "C" int32_t qwen36_set_adapter_step_count(
     void*, int64_t, int64_t);
 extern "C" double qwen36_train_multi_lora_selected(
@@ -1452,6 +1453,8 @@ int main() {
     const auto empty_tenant_v_before = empty_tenant_v->clone();
     const int64_t empty_tenant_step_before =
         qwen36_get_adapter_step_count(distributed, tenant_two);
+    const int64_t heterogeneous_train_batches_before =
+        qwen36_get_dynamic_train_batch_count(distributed);
     const double heterogeneous_loss = qwen36_train_multi_lora_selected_v2(
         distributed, &heterogeneous_input, &heterogeneous_targets,
         &heterogeneous_attention, heterogeneous_batch_ids, 3);
@@ -1465,6 +1468,16 @@ int main() {
         finalizers_before_heterogeneous + 3);
     assert(qwen36_get_dynamic_adam_launch_count(distributed) ==
         adam_launches_before_heterogeneous + 2);
+    const char* heterogeneous_padded_env =
+        std::getenv("QWEN36_HETERO_PADDED_BATCH");
+    const int64_t expected_heterogeneous_train_batches =
+        heterogeneous_padded_env &&
+            std::strcmp(heterogeneous_padded_env, "0") == 0
+        ? 2
+        : 1;
+    assert(qwen36_get_dynamic_train_batch_count(distributed) ==
+        heterogeneous_train_batches_before +
+            expected_heterogeneous_train_batches);
     assert(update_norm(*homogeneous_b, homogeneous_before) > 0.0);
     assert(update_norm(*heterogeneous_b, heterogeneous_before) > 0.0);
     assert(max_diff(*empty_tenant_b, empty_tenant_b_before) == 0.0);
