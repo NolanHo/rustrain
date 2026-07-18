@@ -711,6 +711,7 @@ fn execute_command(session: &mut Qwen36Session, worker: &EpWorker, cmd: &EpComma
             alpha,
             target_layers,
             target_modules,
+            optimizer_lr,
             ..
         } => {
             match session.add_lora(AddLoRARequest {
@@ -718,6 +719,7 @@ fn execute_command(session: &mut Qwen36Session, worker: &EpWorker, cmd: &EpComma
                 alpha: *alpha,
                 target_layers: target_layers.clone(),
                 target_modules: target_modules.clone(),
+                optimizer_lr: *optimizer_lr,
             }) {
                 Ok(id) => EpResult::AdapterId(id),
                 Err(e) => EpResult::Error(e.to_string()),
@@ -729,6 +731,7 @@ fn execute_command(session: &mut Qwen36Session, worker: &EpWorker, cmd: &EpComma
             alpha,
             target_layers,
             target_modules,
+            optimizer_lr,
             ..
         } => {
             let count = match validate_batch_add_lora_count(*count) {
@@ -742,6 +745,7 @@ fn execute_command(session: &mut Qwen36Session, worker: &EpWorker, cmd: &EpComma
                     alpha: *alpha,
                     target_layers: target_layers.clone(),
                     target_modules: target_modules.clone(),
+                    optimizer_lr: *optimizer_lr,
                 }) {
                     Ok(id) => ids.push(id),
                     Err(e) => {

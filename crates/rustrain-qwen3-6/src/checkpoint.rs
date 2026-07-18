@@ -449,6 +449,7 @@ struct StageUnionDynamicAdapterIdentity<'a> {
     rank: i64,
     alpha_bits: u64,
     optimizer_step: u64,
+    optimizer_lr_bits: Option<u64>,
     target_layers: &'a [usize],
     target_modules: &'a [String],
 }
@@ -571,6 +572,10 @@ pub struct DynamicAdapterManifest {
     /// Missing values in older v2 manifests default to zero.
     #[serde(default)]
     pub optimizer_step: u64,
+    /// Effective Adam learning rate for this tenant. Older manifests omit it
+    /// and restore with the training context learning rate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub optimizer_lr: Option<f64>,
     pub target_layers: Vec<usize>,
     pub target_modules: Vec<String>,
     #[serde(default)]
@@ -1492,6 +1497,7 @@ fn checkpoint_generation_digest(manifest: &CheckpointManifest) -> Result<String>
                 rank: adapter.rank,
                 alpha_bits: adapter.alpha.to_bits(),
                 optimizer_step: adapter.optimizer_step,
+                optimizer_lr_bits: adapter.optimizer_lr.map(f64::to_bits),
                 target_layers: &adapter.target_layers,
                 target_modules: &adapter.target_modules,
             })
@@ -2668,6 +2674,16 @@ fn validate_tensor_counts(
         bail!("tensor-parallel fixed optimizer state must contain A/B entries for every LoRA slot");
     }
     for adapter in dynamic_adapters {
+        if adapter
+            .manifest
+            .optimizer_lr
+            .is_some_and(|lr| !lr.is_finite() || lr < 0.0)
+        {
+            bail!(
+                "dynamic adapter {} optimizer learning rate must be finite and non-negative",
+                adapter.manifest.id
+            );
+        }
         if adapter.lora_a.len() != adapter.lora_b.len()
             || adapter.adam_m.len() != adapter.adam_v.len()
             || adapter.manifest.parameter_count != adapter.lora_a.len()
@@ -3618,6 +3634,7 @@ mod tests {
                 rank: 3,
                 alpha: 6.0,
                 optimizer_step: 19,
+                optimizer_lr: Some(2.5e-4),
                 target_layers: vec![1, 3],
                 target_modules: vec!["q_proj".into(), "down_proj".into()],
                 shard_layouts: Vec::new(),
@@ -3661,6 +3678,7 @@ mod tests {
         assert_eq!(loaded_dynamic.manifest.id, 7);
         assert_eq!(loaded_dynamic.manifest.rank, 3);
         assert_eq!(loaded_dynamic.manifest.optimizer_step, 19);
+        assert_eq!(loaded_dynamic.manifest.optimizer_lr, Some(2.5e-4));
         assert_eq!(loaded_dynamic.manifest.target_layers, vec![1, 3]);
         assert_eq!(loaded_dynamic.lora_a.len(), 2);
         assert_eq!(loaded_dynamic.adam_m.len(), 4);
@@ -3685,6 +3703,7 @@ mod tests {
         }"#;
         let manifest: DynamicAdapterManifest = serde_json::from_str(json).unwrap();
         assert_eq!(manifest.optimizer_step, 0);
+        assert_eq!(manifest.optimizer_lr, None);
         assert!(manifest.shard_layouts.is_empty());
     }
 
@@ -3702,6 +3721,7 @@ mod tests {
                 rank: 4,
                 alpha: 8.0,
                 optimizer_step: 3,
+                optimizer_lr: None,
                 target_layers: vec![0],
                 target_modules: vec!["q_proj".to_string()],
                 shard_layouts: Vec::new(),
@@ -3867,6 +3887,7 @@ mod tests {
                     rank: 4,
                     alpha: 8.0,
                     optimizer_step: 29,
+                    optimizer_lr: Some(1e-3),
                     target_layers: vec![0],
                     target_modules: vec!["experts_gate_up_proj".to_string()],
                     shard_layouts: vec![LoraTpShardLayout::RoutedExpertFusedGateUp],
@@ -4422,6 +4443,7 @@ mod tests {
                 rank: 6,
                 alpha: 12.0,
                 optimizer_step: 4,
+                optimizer_lr: Some(5e-4),
                 target_layers: vec![1],
                 target_modules: vec!["q_proj".into()],
                 shard_layouts: Vec::new(),

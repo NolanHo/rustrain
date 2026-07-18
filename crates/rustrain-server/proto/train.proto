@@ -131,12 +131,17 @@ message SessionStatus {
   string model_path = 4;
 }
 
+message OptionalDouble {
+  double value = 1;
+}
+
 message AddLoRARequest {
   string session_id = 1;
   int64 rank = 2;
   double alpha = 3;
   repeated int64 target_layers = 4;
   string target_modules = 5;  // comma-separated, empty = all
+  OptionalDouble optimizer_lr = 6;  // omitted inherits the session optimizer
 }
 message AddLoRAResponse {
   int64 adapter_id = 1;

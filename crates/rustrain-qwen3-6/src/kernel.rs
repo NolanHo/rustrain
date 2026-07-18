@@ -41,6 +41,49 @@ type FnKernelAbiVersion = unsafe extern "C" fn() -> i64;
 type FnTrainStep = unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void, *mut c_void) -> f64;
 type FnTrainMicroStep =
     unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void, *mut c_void, f64, i32) -> f64;
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct PipelineWindowV1 {
+    pub struct_size: u32,
+    pub version: u32,
+    pub window_id: i64,
+    pub num_microbatches: i64,
+    pub schedule: i32,
+    pub num_chunks: i32,
+    pub flags: i32,
+}
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct PipelineTickV1 {
+    pub struct_size: u32,
+    pub version: u32,
+    pub window_id: i64,
+    pub forward_mb: i64,
+    pub backward_mb: i64,
+    pub chunk_id: i32,
+    pub phase: i32,
+    pub input_ids: *mut c_void,
+    pub target_mask: *mut c_void,
+    pub attention_mask: *mut c_void,
+    pub gradient_scale: f64,
+}
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct PipelineResultV1 {
+    pub struct_size: u32,
+    pub version: u32,
+    pub status: i32,
+    pub completed_fwd: i64,
+    pub completed_bwd: i64,
+    pub in_flight: i64,
+    pub optimizer_step: i64,
+    pub loss: f64,
+}
+type FnPipelineBegin = unsafe extern "C" fn(*mut c_void, *const PipelineWindowV1) -> i32;
+type FnPipelineTick =
+    unsafe extern "C" fn(*mut c_void, *const PipelineTickV1, *mut PipelineResultV1) -> i32;
+type FnPipelineFinish = unsafe extern "C" fn(*mut c_void, i32, *mut PipelineResultV1) -> i32;
+type FnPipelineAbort = unsafe extern "C" fn(*mut c_void) -> i32;
 type FnTrainMultiLoraSelectedV2 = unsafe extern "C" fn(
     *mut c_void,
     *mut c_void,
@@ -194,6 +237,10 @@ struct KernelHandles {
     create_ctx: FnCreateCtx,
     train_step: FnTrainStep,
     train_micro_step: FnTrainMicroStep,
+    pipeline_begin: FnPipelineBegin,
+    pipeline_tick: FnPipelineTick,
+    pipeline_finish: FnPipelineFinish,
+    pipeline_abort: FnPipelineAbort,
     train_multi_lora_selected_v2: FnTrainMultiLoraSelectedV2,
     train_multi_lora_selected_v3: FnTrainMultiLoraSelectedV3,
     eval_step: FnEvalStep,
@@ -226,6 +273,7 @@ struct KernelHandles {
     add_lora_v2: FnAddLora,
     add_lora_with_optimizer: Option<FnAddLoraWithOptimizer>,
     add_lora_for_restore: FnAddLora,
+    add_lora_for_restore_with_optimizer: FnAddLoraWithOptimizer,
     remove_lora: FnRemoveLora,
     list_lora: FnListLora,
     get_adapter_lora_tensor: FnGetAdapterLoraTensor,
@@ -275,7 +323,7 @@ unsafe fn load_kernels() -> Option<KernelHandles> {
         }};
     }
     let abi_version: FnKernelAbiVersion = sym!("qwen36_kernel_abi_version");
-    if abi_version() != 27 {
+    if abi_version() != 28 {
         return None;
     }
     let add_lora_with_optimizer = {
@@ -293,6 +341,10 @@ unsafe fn load_kernels() -> Option<KernelHandles> {
         create_ctx: sym!("qwen36_create_training_context_v2"),
         train_step: sym!("qwen36_train_step"),
         train_micro_step: sym!("qwen36_train_micro_step"),
+        pipeline_begin: sym!("qwen36_pipeline_begin_v1"),
+        pipeline_tick: sym!("qwen36_pipeline_tick_v1"),
+        pipeline_finish: sym!("qwen36_pipeline_finish_v1"),
+        pipeline_abort: sym!("qwen36_pipeline_abort_v1"),
         train_multi_lora_selected_v2: sym!("qwen36_train_multi_lora_selected_v2"),
         train_multi_lora_selected_v3: sym!("qwen36_train_multi_lora_selected_v3"),
         eval_step: sym!("qwen36_eval_step"),
@@ -325,6 +377,7 @@ unsafe fn load_kernels() -> Option<KernelHandles> {
         add_lora_v2: sym!("qwen36_add_lora_v2"),
         add_lora_with_optimizer,
         add_lora_for_restore: sym!("qwen36_add_lora_for_restore"),
+        add_lora_for_restore_with_optimizer: sym!("qwen36_add_lora_for_restore_with_optimizer"),
         remove_lora: sym!("qwen36_remove_lora"),
         list_lora: sym!("qwen36_list_lora"),
         get_adapter_lora_tensor: sym!("qwen36_get_adapter_lora_tensor"),
@@ -1074,6 +1127,124 @@ impl CppTrainingContext {
         Ok(loss)
     }
 
+    /// Open a fixed-shape PP2/1F1B pipeline window. The native side owns all
+    /// activation/gradient slots until `pipeline_finish_v1` or abort.
+    pub fn pipeline_begin_v1(&self, window_id: i64, num_microbatches: i64) -> Result<()> {
+        if window_id < 0 {
+            bail!("pipeline window id must be non-negative");
+        }
+        if num_microbatches <= 0 {
+            bail!("pipeline window must contain at least one microbatch");
+        }
+        let kh = get_kernels().ok_or_else(|| anyhow::anyhow!("kernels not loaded"))?;
+        let spec = PipelineWindowV1 {
+            struct_size: std::mem::size_of::<PipelineWindowV1>() as u32,
+            version: 1,
+            window_id,
+            num_microbatches,
+            schedule: 0,
+            num_chunks: 1,
+            flags: 0,
+        };
+        let status = unsafe { (kh.pipeline_begin)(self.ptr, &spec) };
+        if status != 0 {
+            bail!("C++ pipeline window begin failed with status {status}");
+        }
+        Ok(())
+    }
+
+    /// Advance a pipeline window by one canonical non-interleaved 1F1B tick.
+    pub fn pipeline_tick_v1(
+        &self,
+        window_id: i64,
+        forward_mb: Option<i64>,
+        backward_mb: Option<i64>,
+        input_ids: Option<&Tensor>,
+        target_mask: Option<&Tensor>,
+        attention_mask: Option<&Tensor>,
+        gradient_scale: f64,
+    ) -> Result<PipelineResultV1> {
+        if !gradient_scale.is_finite() || gradient_scale <= 0.0 {
+            bail!("pipeline gradient scale must be finite and positive");
+        }
+        if forward_mb.is_some() != input_ids.is_some()
+            || forward_mb.is_some() != target_mask.is_some()
+            || forward_mb.is_some() != attention_mask.is_some()
+        {
+            bail!("pipeline forward microbatch requires all input tensors");
+        }
+        let kh = get_kernels().ok_or_else(|| anyhow::anyhow!("kernels not loaded"))?;
+        let tick = PipelineTickV1 {
+            struct_size: std::mem::size_of::<PipelineTickV1>() as u32,
+            version: 1,
+            window_id,
+            forward_mb: forward_mb.unwrap_or(-1),
+            backward_mb: backward_mb.unwrap_or(-1),
+            chunk_id: 0,
+            phase: match (forward_mb, backward_mb) {
+                (Some(0), _) => 0,
+                (Some(_), _) => 1,
+                (None, Some(_)) => 2,
+                (None, None) => 2,
+            },
+            input_ids: input_ids
+                .map(|tensor| tensor.as_ptr() as *mut c_void)
+                .unwrap_or(std::ptr::null_mut()),
+            target_mask: target_mask
+                .map(|tensor| tensor.as_ptr() as *mut c_void)
+                .unwrap_or(std::ptr::null_mut()),
+            attention_mask: attention_mask
+                .map(|tensor| tensor.as_ptr() as *mut c_void)
+                .unwrap_or(std::ptr::null_mut()),
+            gradient_scale,
+        };
+        let mut result = PipelineResultV1 {
+            struct_size: std::mem::size_of::<PipelineResultV1>() as u32,
+            version: 1,
+            status: 0,
+            completed_fwd: 0,
+            completed_bwd: 0,
+            in_flight: 0,
+            optimizer_step: 0,
+            loss: 0.0,
+        };
+        let status = unsafe { (kh.pipeline_tick)(self.ptr, &tick, &mut result) };
+        if status != 0 || result.status != 0 {
+            bail!("C++ pipeline window tick failed with status {status}");
+        }
+        Ok(result)
+    }
+
+    /// Finish a pipeline window and apply its single accumulated optimizer step.
+    pub fn pipeline_finish_v1(&self) -> Result<PipelineResultV1> {
+        let kh = get_kernels().ok_or_else(|| anyhow::anyhow!("kernels not loaded"))?;
+        let mut result = PipelineResultV1 {
+            struct_size: std::mem::size_of::<PipelineResultV1>() as u32,
+            version: 1,
+            status: 0,
+            completed_fwd: 0,
+            completed_bwd: 0,
+            in_flight: 0,
+            optimizer_step: 0,
+            loss: 0.0,
+        };
+        let status = unsafe { (kh.pipeline_finish)(self.ptr, 1, &mut result) };
+        if status != 0 || result.status != 0 {
+            bail!("C++ pipeline window finish failed with status {status}");
+        }
+        Ok(result)
+    }
+
+    /// Abort a pipeline window and discard any accumulated gradients.
+    pub fn pipeline_abort_v1(&self) -> Result<()> {
+        let kh = get_kernels().ok_or_else(|| anyhow::anyhow!("kernels not loaded"))?;
+        let status = unsafe { (kh.pipeline_abort)(self.ptr) };
+        if status != 0 {
+            bail!("C++ pipeline window abort failed with status {status}");
+        }
+        Ok(())
+    }
+
     /// Train every live dynamic adapter, including heterogeneous signatures.
     /// The rank argument is retained for source compatibility with ABI22 callers.
     pub fn train_multi_lora(
@@ -1715,6 +1886,48 @@ impl CppTrainingContext {
         };
         if id < 0 {
             bail!("C++ restore adapter allocation failed");
+        }
+        Ok(id)
+    }
+
+    /// Allocate a dynamic adapter with a checkpointed learning rate while
+    /// suppressing synchronization of its temporary random initialization.
+    pub fn add_lora_for_restore_with_optimizer_lr(
+        &self,
+        rank: i64,
+        alpha: f64,
+        target_layers: &[i64],
+        target_modules: &str,
+        optimizer_lr: f64,
+    ) -> Result<i64> {
+        if !optimizer_lr.is_finite() || optimizer_lr < 0.0 {
+            bail!("dynamic LoRA optimizer learning rate must be finite and non-negative");
+        }
+        let kh = get_kernels().ok_or_else(|| anyhow::anyhow!("kernels not loaded"))?;
+        let tl_ptr = if target_layers.is_empty() {
+            std::ptr::null()
+        } else {
+            target_layers.as_ptr()
+        };
+        let modules_c = std::ffi::CString::new(target_modules)?;
+        let modules_ptr = if target_modules.is_empty() {
+            std::ptr::null()
+        } else {
+            modules_c.as_ptr()
+        };
+        let id = unsafe {
+            (kh.add_lora_for_restore_with_optimizer)(
+                self.ptr,
+                rank,
+                alpha,
+                tl_ptr,
+                target_layers.len() as i64,
+                modules_ptr,
+                optimizer_lr,
+            )
+        };
+        if id < 0 {
+            bail!("C++ restore adapter allocation with optimizer state failed");
         }
         Ok(id)
     }

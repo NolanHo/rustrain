@@ -164,6 +164,15 @@ fn validate_dynamic_adapter_manifests<'a>(
                 manifest.id
             );
         }
+        if manifest
+            .optimizer_lr
+            .is_some_and(|optimizer_lr| !optimizer_lr.is_finite() || optimizer_lr < 0.0)
+        {
+            bail!(
+                "dynamic adapter {} optimizer learning rate must be finite and non-negative",
+                manifest.id
+            );
+        }
     }
     Ok(())
 }
@@ -321,6 +330,7 @@ struct PendingCheckpointLoad {
     source_path: String,
     ctx: rustrain_qwen3_6::kernel::CppTrainingContext,
     dynamic_lora_configs: std::collections::BTreeMap<i64, Qwen36LoraConfig>,
+    dynamic_lora_optimizer_lrs: std::collections::BTreeMap<i64, f64>,
     state: SessionState,
     step: u64,
     last_loss: f64,
@@ -332,6 +342,8 @@ pub struct AddLoRARequest {
     pub alpha: f64,
     pub target_layers: Vec<i64>,
     pub target_modules: String, // comma-separated, empty = all
+    /// `None` inherits the training context learning rate.
+    pub optimizer_lr: Option<f64>,
 }
 
 /// Qwen3.6 training session — wraps CppTrainingContext.
@@ -350,6 +362,7 @@ pub struct Qwen36Session {
     lora_target_layers: Vec<usize>,
     lora_target_modules: Vec<Qwen36LoraTargetModule>,
     dynamic_lora_configs: std::collections::BTreeMap<i64, Qwen36LoraConfig>,
+    dynamic_lora_optimizer_lrs: std::collections::BTreeMap<i64, f64>,
     lr: f64,
     metrics: Option<Arc<FileMetricsSink>>,
     last_loss: f64,
@@ -465,6 +478,7 @@ impl Qwen36Session {
             lora_target_layers: Vec::new(),
             lora_target_modules: Vec::new(),
             dynamic_lora_configs: std::collections::BTreeMap::new(),
+            dynamic_lora_optimizer_lrs: std::collections::BTreeMap::new(),
             lr: 1e-4,
             metrics: Some(Arc::new(FileMetricsSink::new(metrics_path))),
             last_loss: 0.0,
@@ -652,6 +666,7 @@ impl Qwen36Session {
             lora_target_layers: self.lora_target_layers.clone(),
             lora_target_modules: self.lora_target_modules.clone(),
             dynamic_lora_configs: std::collections::BTreeMap::new(),
+            dynamic_lora_optimizer_lrs: std::collections::BTreeMap::new(),
             lr: self.lr,
             metrics: None,
             last_loss: self.last_loss,
@@ -670,6 +685,7 @@ impl Qwen36Session {
                 .take()
                 .context("checkpoint candidate lost its native context")?,
             dynamic_lora_configs: std::mem::take(&mut candidate.dynamic_lora_configs),
+            dynamic_lora_optimizer_lrs: std::mem::take(&mut candidate.dynamic_lora_optimizer_lrs),
             state: candidate.state.clone(),
             step,
             last_loss: loss,
@@ -694,6 +710,7 @@ impl Qwen36Session {
             .context("validated checkpoint transaction disappeared")?;
         self.ctx = Some(pending.ctx);
         self.dynamic_lora_configs = pending.dynamic_lora_configs;
+        self.dynamic_lora_optimizer_lrs = pending.dynamic_lora_optimizer_lrs;
         self.state = pending.state;
         self.step = pending.step;
         self.last_loss = pending.last_loss;
@@ -1469,12 +1486,18 @@ impl TrainingSession for Qwen36Session {
                 }
                 let optimizer_step = u64::try_from(ctx.get_adapter_step_count(adapter_id)?)
                     .context("native dynamic adapter optimizer step is negative")?;
+                let optimizer_lr = self
+                    .dynamic_lora_optimizer_lrs
+                    .get(&adapter_id)
+                    .copied()
+                    .unwrap_or(self.lr);
                 dynamic_adapters.push(checkpoint::DynamicAdapterCheckpoint {
                     manifest: checkpoint::DynamicAdapterManifest {
                         id: adapter_id,
                         rank: lora_config.rank,
                         alpha: lora_config.alpha,
                         optimizer_step,
+                        optimizer_lr: Some(optimizer_lr),
                         target_layers: lora_config.target_layers.clone(),
                         target_modules: lora_config
                             .target_modules
@@ -1805,12 +1828,23 @@ impl TrainingSession for Qwen36Session {
                     .map(Qwen36LoraTargetModule::cpp_name)
                     .collect::<Vec<_>>()
                     .join(",");
-                let allocated_id = ctx.add_lora_for_restore(
-                    lora_config.rank,
-                    lora_config.alpha,
-                    &layer_ids,
-                    &module_csv,
-                )?;
+                let optimizer_lr = dynamic.manifest.optimizer_lr.unwrap_or(self.lr);
+                let allocated_id = match dynamic.manifest.optimizer_lr {
+                    Some(saved_lr) if saved_lr.to_bits() != self.lr.to_bits() => ctx
+                        .add_lora_for_restore_with_optimizer_lr(
+                            lora_config.rank,
+                            lora_config.alpha,
+                            &layer_ids,
+                            &module_csv,
+                            saved_lr,
+                        )?,
+                    _ => ctx.add_lora_for_restore(
+                        lora_config.rank,
+                        lora_config.alpha,
+                        &layer_ids,
+                        &module_csv,
+                    )?,
+                };
                 if allocated_id != dynamic.manifest.id {
                     if let Err(error) = ctx.set_adapter_id(allocated_id, dynamic.manifest.id) {
                         let _ = ctx.remove_lora(allocated_id);
@@ -1903,6 +1937,8 @@ impl TrainingSession for Qwen36Session {
                     return Err(error);
                 }
                 self.dynamic_lora_configs.insert(adapter_id, lora_config);
+                self.dynamic_lora_optimizer_lrs
+                    .insert(adapter_id, optimizer_lr);
             }
         }
         // Import Adam optimizer state into C++ context
@@ -2136,6 +2172,7 @@ impl TrainingSession for Qwen36Session {
             return Err(error);
         }
         self.dynamic_lora_configs.insert(adapter_id, lora_config);
+        self.dynamic_lora_optimizer_lrs.insert(adapter_id, self.lr);
         tracing::info!(adapter_id, path, "LoRA adapter imported");
         Ok(adapter_id)
     }
@@ -2237,8 +2274,19 @@ impl TrainingSession for Qwen36Session {
             .map(Qwen36LoraTargetModule::cpp_name)
             .collect::<Vec<_>>();
         let module_csv = native_module_names.join(",");
-        let id = ctx.add_lora(req.rank, req.alpha, &req.target_layers, &module_csv)?;
+        let optimizer_lr = req.optimizer_lr.unwrap_or(self.lr);
+        let id = match req.optimizer_lr {
+            Some(optimizer_lr) => ctx.add_lora_with_optimizer_lr(
+                req.rank,
+                req.alpha,
+                &req.target_layers,
+                &module_csv,
+                optimizer_lr,
+            )?,
+            None => ctx.add_lora(req.rank, req.alpha, &req.target_layers, &module_csv)?,
+        };
         self.dynamic_lora_configs.insert(id, config);
+        self.dynamic_lora_optimizer_lrs.insert(id, optimizer_lr);
         tracing::info!(adapter_id = id, rank = req.rank, "LoRA adapter added");
         Ok(id)
     }
@@ -2251,6 +2299,7 @@ impl TrainingSession for Qwen36Session {
         let removed = ctx.remove_lora(adapter_id)?;
         if removed {
             self.dynamic_lora_configs.remove(&adapter_id);
+            self.dynamic_lora_optimizer_lrs.remove(&adapter_id);
             tracing::info!(adapter_id, "LoRA adapter removed");
         }
         Ok(removed)
@@ -2283,6 +2332,7 @@ mod tests {
             rank,
             alpha,
             optimizer_step: id as u64,
+            optimizer_lr: None,
             target_layers: vec![0],
             target_modules: target_modules
                 .iter()
@@ -2312,6 +2362,14 @@ mod tests {
         ];
         let error = validate_dynamic_adapter_manifests(manifests.iter()).unwrap_err();
         assert!(error.to_string().contains("positive and unique"));
+    }
+
+    #[test]
+    fn checkpoint_dynamic_manifests_reject_invalid_optimizer_lr() {
+        let mut manifest = dynamic_manifest(1, 4, 8.0, &["q_proj"]);
+        manifest.optimizer_lr = Some(f64::NAN);
+        let error = validate_dynamic_adapter_manifests([&manifest]).unwrap_err();
+        assert!(error.to_string().contains("optimizer learning rate"));
     }
 
     #[test]

@@ -73,6 +73,8 @@ extern "C" int64_t qwen36_add_lora_with_optimizer(
     void*, int64_t, double, const int64_t*, int64_t, const char*, double);
 extern "C" int64_t qwen36_add_lora_for_restore(
     void*, int64_t, double, const int64_t*, int64_t, const char*);
+extern "C" int64_t qwen36_add_lora_for_restore_with_optimizer(
+    void*, int64_t, double, const int64_t*, int64_t, const char*, double);
 extern "C" int32_t qwen36_set_adapter_id(void*, int64_t, int64_t);
 extern "C" int32_t qwen36_remove_lora(void*, int64_t);
 extern "C" void* qwen36_get_adapter_lora_tensor(
@@ -388,7 +390,7 @@ static int run_dynamic_dp_smoke(
 }
 
 int main() {
-    assert(qwen36_kernel_abi_version() == 27);
+    assert(qwen36_kernel_abi_version() == 28);
     const int world = std::atoi(std::getenv("WORLD_SIZE") ? std::getenv("WORLD_SIZE") : "1");
     const int process_rank = std::atoi(std::getenv("RANK") ? std::getenv("RANK") : "0");
     const int local_rank = std::atoi(std::getenv("LOCAL_RANK") ? std::getenv("LOCAL_RANK") : "0");
@@ -882,6 +884,7 @@ int main() {
     const char* dense_targets = "gate_proj,up_proj,down_proj";
     constexpr double fast_tenant_lr = 1e-2;
     constexpr double default_tenant_lr = 1e-3;
+    constexpr double restored_tenant_lr = 5e-4;
     constexpr double slow_tenant_lr = 1e-4;
     const int64_t dense_fast = qwen36_add_lora_with_optimizer(
         ctx, rank, 1.0, &target_layer, 1, dense_targets, fast_tenant_lr);
@@ -889,7 +892,10 @@ int main() {
         ctx, rank, 1.0, &target_layer, 1, dense_targets);
     const int64_t dense_slow = qwen36_add_lora_with_optimizer(
         ctx, rank, 1.0, &target_layer, 1, dense_targets, slow_tenant_lr);
-    assert(dense_fast > 0 && dense_default > dense_fast && dense_slow > dense_default);
+    const int64_t dense_restored = qwen36_add_lora_for_restore_with_optimizer(
+        ctx, rank, 1.0, &target_layer, 1, dense_targets, restored_tenant_lr);
+    assert(dense_fast > 0 && dense_default > dense_fast &&
+        dense_slow > dense_default && dense_restored > dense_slow);
     assert(qwen36_add_lora_with_optimizer(
         ctx, rank, 1.0, &target_layer, 1, dense_targets, NAN) < 0);
 
@@ -902,17 +908,19 @@ int main() {
     auto dense_a_value = dense_fast_a->clone();
     auto dense_b_value = at::full(
         dense_fast_b->sizes(), 0.01, dense_fast_b->options());
-    for (const int64_t adapter_id : {dense_fast, dense_default, dense_slow}) {
+    for (const int64_t adapter_id :
+         {dense_fast, dense_default, dense_slow, dense_restored}) {
         assert(qwen36_set_adapter_lora_tensor(
             ctx, adapter_id, 0, "gate_proj", 0, &dense_a_value) == 0);
         assert(qwen36_set_adapter_lora_tensor(
             ctx, adapter_id, 0, "gate_proj", 1, &dense_b_value) == 0);
     }
     const auto dense_b_before = dense_b_value.clone();
-    const int64_t dense_ids[] = {dense_fast, dense_default, dense_slow};
+    const int64_t dense_ids[] = {
+        dense_fast, dense_default, dense_slow, dense_restored};
     const double dense_loss = qwen36_train_multi_lora_selected_v2(
         ctx, &shared_input, &shared_target_row, &shared_attention,
-        dense_ids, 3);
+        dense_ids, 4);
     c10::cuda::device_synchronize();
 
     auto validate_tenant_adam = [&](int64_t adapter_id, double learning_rate) {
@@ -937,13 +945,16 @@ int main() {
     const double fast_update = validate_tenant_adam(dense_fast, fast_tenant_lr);
     const double default_update =
         validate_tenant_adam(dense_default, default_tenant_lr);
+    const double restored_update =
+        validate_tenant_adam(dense_restored, restored_tenant_lr);
     const double slow_update = validate_tenant_adam(dense_slow, slow_tenant_lr);
     std::printf(
         "native_qwen35_tenant_optimizer_smoke loss=%0.8f "
-        "fast=%0.8e default=%0.8e slow=%0.8e\n",
-        dense_loss, fast_update, default_update, slow_update);
+        "fast=%0.8e default=%0.8e restored=%0.8e slow=%0.8e\n",
+        dense_loss, fast_update, default_update, restored_update, slow_update);
     assert(dense_loss == dense_loss && dense_loss > 0.0);
-    assert(fast_update > default_update && default_update > slow_update);
+    assert(fast_update > default_update && default_update > restored_update &&
+        restored_update > slow_update);
     qwen36_free_training_context(ctx);
 
     // Qwen3.5/3.6 linear-attention layers use the model's actual 128-wide

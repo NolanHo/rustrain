@@ -1148,6 +1148,8 @@ struct AddLoRAHttp {
     alpha: f64,
     target_layers: Vec<i64>,
     target_modules: String,
+    #[serde(default)]
+    optimizer_lr: Option<f64>,
 }
 #[derive(Serialize)]
 struct AddLoRAResponse {
@@ -1171,6 +1173,7 @@ async fn add_lora(
             alpha: req.alpha,
             target_layers: req.target_layers,
             target_modules: req.target_modules,
+            optimizer_lr: req.optimizer_lr,
         })
         .map_err(|e| err_resp(&e.to_string()))?;
     Ok(Json(AddLoRAResponse { adapter_id }))
@@ -2005,6 +2008,7 @@ async fn ep_add_lora(
         alpha: req.alpha,
         target_layers: req.target_layers,
         target_modules: req.target_modules,
+        optimizer_lr: req.optimizer_lr,
     };
     match dispatch_ep(&state, cmd).await? {
         rustrain_ipc::EpResult::AdapterId(id) => Ok(Json(AddLoRAResponse { adapter_id: id })),
@@ -2020,6 +2024,8 @@ struct BatchAddLoRAHttp {
     alpha: f64,
     target_layers: Vec<i64>,
     target_modules: String,
+    #[serde(default)]
+    optimizer_lr: Option<f64>,
 }
 
 async fn ep_batch_add_lora(
@@ -2035,6 +2041,7 @@ async fn ep_batch_add_lora(
         alpha: req.alpha,
         target_layers: req.target_layers,
         target_modules: req.target_modules,
+        optimizer_lr: req.optimizer_lr,
     };
     match dispatch_ep(&state, cmd).await? {
         rustrain_ipc::EpResult::Count(n) => Ok(Json(serde_json::json!({"count": n}))),

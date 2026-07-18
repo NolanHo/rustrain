@@ -33,6 +33,9 @@ fn detect_cxx11_abi() -> String {
 fn main() {
     println!("cargo:rerun-if-env-changed=TORCH_INCLUDE_PATH");
     println!("cargo:rerun-if-env-changed=TORCH_LIB_PATH");
+    println!("cargo:rerun-if-env-changed=CUDA_HOME");
+    println!("cargo:rerun-if-env-changed=CUDA_INCLUDE_PATH");
+    println!("cargo:rerun-if-env-changed=CUDA_LIB_PATH");
     println!("cargo:rerun-if-env-changed=NCCL_INCLUDE_PATH");
     println!("cargo:rerun-if-env-changed=NCCL_LIB_PATH");
     println!("cargo:rerun-if-changed=kernels/qwen3_6_kernels.cpp");
@@ -168,6 +171,28 @@ fn main() {
         }
         "/usr/local/cuda/include".to_string()
     });
+    let cuda_lib = std::env::var("CUDA_LIB_PATH").unwrap_or_else(|_| {
+        let mut candidates = Vec::new();
+        if let Ok(cuda_home) = std::env::var("CUDA_HOME") {
+            candidates.push(std::path::PathBuf::from(&cuda_home).join("lib64"));
+            candidates.push(std::path::PathBuf::from(cuda_home).join("targets/x86_64-linux/lib"));
+        }
+        if let Some(include_parent) = std::path::Path::new(&cuda_inc).parent() {
+            candidates.push(include_parent.join("lib64"));
+            candidates.push(include_parent.join("lib"));
+        }
+        candidates.extend([
+            std::path::PathBuf::from("/usr/local/cuda-13.0/lib64"),
+            std::path::PathBuf::from("/usr/local/cuda-13/lib64"),
+            std::path::PathBuf::from("/usr/local/cuda/lib64"),
+        ]);
+        candidates
+            .into_iter()
+            .find(|path| path.join("libcudart.so").exists())
+            .unwrap_or_else(|| std::path::PathBuf::from("/usr/local/cuda/lib64"))
+            .display()
+            .to_string()
+    });
 
     let cpp_ok = Command::new("g++")
         .args([
@@ -294,8 +319,8 @@ fn main() {
                 format!("-Wl,-rpath,{torch_lib}"),
                 format!("-L{nccl_lib}"),
                 format!("-Wl,-rpath,{nccl_lib}"),
-                format!("-L{cuda_inc}/../lib64"),
-                format!("-Wl,-rpath,{cuda_inc}/../lib64"),
+                format!("-L{cuda_lib}"),
+                format!("-Wl,-rpath,{cuda_lib}"),
                 "-Wl,--no-as-needed".to_string(),
                 "-ltorch".to_string(),
                 "-ltorch_cuda".to_string(),

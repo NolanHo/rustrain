@@ -114,6 +114,8 @@ pub enum EpCommand {
         alpha: f64,
         target_layers: Vec<i64>,
         target_modules: String,
+        #[serde(default)]
+        optimizer_lr: Option<f64>,
     },
     BatchAddLora {
         session_id: String,
@@ -122,6 +124,8 @@ pub enum EpCommand {
         alpha: f64,
         target_layers: Vec<i64>,
         target_modules: String,
+        #[serde(default)]
+        optimizer_lr: Option<f64>,
     },
     RemoveLora {
         session_id: String,
@@ -311,6 +315,40 @@ mod tests {
         let decoded: EpCommand = serde_json::from_str(json).unwrap();
         match decoded {
             EpCommand::TrainStep { batch_size, .. } => assert_eq!(batch_size, 1),
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn add_lora_optimizer_lr_preserves_default_and_explicit_semantics() {
+        let legacy = r#"{
+            "AddLora": {
+                "session_id": "session",
+                "rank": 8,
+                "alpha": 16.0,
+                "target_layers": [0],
+                "target_modules": "q_proj"
+            }
+        }"#;
+        match serde_json::from_str::<EpCommand>(legacy).unwrap() {
+            EpCommand::AddLora { optimizer_lr, .. } => assert_eq!(optimizer_lr, None),
+            other => panic!("unexpected command: {other:?}"),
+        }
+
+        let command = EpCommand::BatchAddLora {
+            session_id: "session".into(),
+            count: 3,
+            rank: 8,
+            alpha: 16.0,
+            target_layers: vec![0],
+            target_modules: "q_proj".into(),
+            optimizer_lr: Some(2.5e-4),
+        };
+        let encoded = serde_json::to_vec(&command).unwrap();
+        match serde_json::from_slice::<EpCommand>(&encoded).unwrap() {
+            EpCommand::BatchAddLora { optimizer_lr, .. } => {
+                assert_eq!(optimizer_lr, Some(2.5e-4));
+            }
             other => panic!("unexpected command: {other:?}"),
         }
     }
