@@ -9296,7 +9296,13 @@ int32_t qwen36_remove_lora(void* ctx_ptr, int64_t adapter_id) {
 __attribute__((visibility("default")))
 int64_t qwen36_list_lora(void* ctx_ptr, int64_t* out_ids, int64_t max_count) {
     auto* ctx = reinterpret_cast<TrainingContext*>(ctx_ptr);
+    if (!ctx || max_count < 0) return -1;
     int64_t count = (int64_t)ctx->adapters.size();
+    // A zero-capacity call is a count query. This keeps the existing ABI while
+    // allowing callers to enumerate registries larger than the old 64-entry
+    // convenience buffer.
+    if (max_count == 0) return count;
+    if (!out_ids) return -1;
     if (count > max_count) count = max_count;
     for (int64_t i = 0; i < count; i++)
         out_ids[i] = ctx->adapters[i].id;

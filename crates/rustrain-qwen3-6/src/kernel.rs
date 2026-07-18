@@ -1397,14 +1397,25 @@ impl CppTrainingContext {
             Some(k) => k,
             None => return Vec::new(),
         };
-        let mut ids = Vec::with_capacity(65);
+        let mut ids = Vec::new();
         if self.lora_count > 0 {
             // ID 0 is the fixed adapter created with the training context.
             ids.push(0);
         }
-        let mut dynamic_ids = vec![0i64; 64];
-        let count = unsafe { (kh.list_lora)(self.ptr, dynamic_ids.as_mut_ptr(), 64) };
-        ids.extend_from_slice(&dynamic_ids[..count as usize]);
+        // Query the native registry size first; the old fixed 64-entry buffer
+        // silently truncated large multi-tenant registries.
+        let total = unsafe { (kh.list_lora)(self.ptr, std::ptr::null_mut(), 0) };
+        if total <= 0 {
+            return ids;
+        }
+        let mut dynamic_ids = vec![0i64; total as usize];
+        let count = unsafe {
+            (kh.list_lora)(self.ptr, dynamic_ids.as_mut_ptr(), dynamic_ids.len() as i64)
+        };
+        if count > 0 {
+            dynamic_ids.truncate((count as usize).min(dynamic_ids.len()));
+            ids.extend_from_slice(&dynamic_ids);
+        }
         ids
     }
 

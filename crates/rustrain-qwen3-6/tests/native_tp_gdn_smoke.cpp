@@ -35,6 +35,7 @@ extern "C" void* qwen36_create_training_context_ex(
 extern "C" int32_t qwen36_init_nccl(void*);
 extern "C" int64_t qwen36_add_lora(
     void*, int64_t, double, const int64_t*, int64_t, const char*);
+extern "C" int64_t qwen36_list_lora(void*, int64_t*, int64_t);
 extern "C" void* qwen36_get_adapter_lora_tensor(
     void*, int64_t, int64_t, const char*, int32_t);
 extern "C" int32_t qwen36_set_adapter_lora_tensor(
@@ -786,6 +787,24 @@ int main() {
         qwen36_get_lora_batch_scaling_upload_count(dynamic_contexts.distributed);
     check_dynamic_path(
         dynamic_contexts, dynamic_fixtures, dynamic_batch, rank);
+    // The native list ABI supports a zero-capacity count query. Exercise a
+    // registry larger than the historical 64-entry Rust buffer so truncation
+    // cannot silently reappear in train_multi_lora().
+    const int64_t target_layers[kLayers] = {0, 1};
+    constexpr const char* targets =
+        "in_proj_qkv,in_proj_z,in_proj_a,in_proj_b,out_proj";
+    for (int i = 0; i < 64; ++i) {
+        assert(qwen36_add_lora(dynamic_contexts.distributed,
+            kLoraRank, kLoraRank, target_layers, kLayers, targets) > 0);
+        assert(qwen36_add_lora(dynamic_contexts.reference,
+            kLoraRank, kLoraRank, target_layers, kLayers, targets) > 0);
+    }
+    const int64_t dynamic_count = qwen36_list_lora(
+        dynamic_contexts.distributed, nullptr, 0);
+    assert(dynamic_count == 65);
+    std::vector<int64_t> listed_ids(static_cast<size_t>(dynamic_count));
+    assert(qwen36_list_lora(dynamic_contexts.distributed,
+        listed_ids.data(), dynamic_count) == dynamic_count);
     const int64_t build_after =
         qwen36_get_lora_batch_projection_build_count(dynamic_contexts.distributed);
     const int64_t upload_after =
