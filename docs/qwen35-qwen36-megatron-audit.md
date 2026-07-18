@@ -58,6 +58,18 @@ reduce-scatter. H20 TP2 fixed-LoRA smoke and TP2 x DP2 oracle passed with both
 settings; the synthetic TP2 benchmark was `77.970 ms` packed versus `78.024 ms`
 fallback p50, within measurement noise.
 
+The GDN backward path now has a separately validated CUDA optimization. The
+reverse recurrence restores `R_t` while reading `S_t` for the direct output
+gradient, so the old standalone state-undo sweep and three per-token barriers
+are removed. Fusion is enabled by default and can be disabled with
+`QWEN36_GDN_RECURRENT_FUSION=0`. On H20, the matched `B=2,S=512,H=2048,L=3`
+benchmark improved single-rank p50 from `80.272` to `75.685 ms` and TP2 from
+`75.908` to `70.885 ms`; TP2 at `B=8` improved from `157.986` to `148.216 ms`.
+An independent ATen recurrence-backward TP2 smoke preserved fixed/dynamic loss,
+FP32 m/v and parameter deltas (`adam_error=0` on both ranks). This is a local
+GDN-kernel improvement, not evidence of FLA, sequence/context parallelism, or
+matched Megatron end-to-end throughput.
+
 Server control-plane and checkpoint commands now use a bounded FIFO
 single-consumer dispatcher. Accepted jobs run one-at-a-time on
 `spawn_blocking`, preserving IPC collective order while keeping Tokio handlers

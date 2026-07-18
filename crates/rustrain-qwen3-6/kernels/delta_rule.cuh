@@ -50,7 +50,9 @@
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 #include <cstdint>
+#include <cstdlib>
 #include <cstdio>
+#include <cstring>
 
 // ──────────────────────────────────────────────────────────────────────
 // Constants
@@ -431,6 +433,7 @@ __global__ void gated_delta_rule_backward_kernel(
 // The forward recurrence is:
 //   R = g * S_prev, kv = k^T R, delta = beta * (v - kv),
 //   S = R + k outer delta, out = q^T S.
+template <bool kFuseRecurrence>
 __global__ void gated_delta_rule_backward_kernel_correct(
     const float* __restrict__ q,
     const float* __restrict__ k,
@@ -534,6 +537,8 @@ __global__ void gated_delta_rule_backward_kernel_correct(
                 const int idx = dk * DR_D_V + tid;
                 const float s_after = state_s[idx];
                 grad_s[idx] += q_t[dk] * go_t;
+                if constexpr (kFuseRecurrence)
+                    state_s[idx] = s_after - k_t[dk] * delta_t;
                 float q_part = s_after * go_t;
                 for (int off = 16; off > 0; off >>= 1)
                     q_part += __shfl_down_sync(0xffffffff, q_part, off);
@@ -546,12 +551,14 @@ __global__ void gated_delta_rule_backward_kernel_correct(
                     reduce_q[2 * DR_D_K + tid] +
                     reduce_q[3 * DR_D_K + tid];
             }
-            __syncthreads();
+            if constexpr (!kFuseRecurrence) __syncthreads();
 
             // Undo S_t = R_t + k outer delta, leaving R_t = g_t*S_prev.
-            for (int dk = 0; dk < DR_D_K; ++dk)
-                state_s[dk * DR_D_V + tid] -= k_t[dk] * delta_t;
-            __syncthreads();
+            if constexpr (!kFuseRecurrence) {
+                for (int dk = 0; dk < DR_D_K; ++dk)
+                    state_s[dk * DR_D_V + tid] -= k_t[dk] * delta_t;
+                __syncthreads();
+            }
 
             // ddelta = dS_t^T k and h = ddelta * beta. The same value-column
             // thread computes dV and one partial for dBeta/dG.
@@ -613,7 +620,7 @@ __global__ void gated_delta_rule_backward_kernel_correct(
                 gg_bh[t] = reduce_g[0] + reduce_g[1] +
                            reduce_g[2] + reduce_g[3];
             }
-            __syncthreads();
+            if constexpr (!kFuseRecurrence) __syncthreads();
         }
     }
 }
@@ -640,25 +647,42 @@ inline int launch_gated_delta_rule_backward(
         return -1;
     }
 
+    const char* fusion_env = std::getenv("QWEN36_GDN_RECURRENT_FUSION");
+    const bool fuse_recurrence = !fusion_env || fusion_env[0] == '\0' ||
+        (std::strcmp(fusion_env, "0") != 0 &&
+         std::strcmp(fusion_env, "false") != 0);
     dim3 grid(BH);
     dim3 block(DR_THREADS);
 
     // 2 state matrices plus four warp partials per D_K and scalar reductions.
     size_t smem_size = (2 * DR_D_K * DR_D_V + 8 * DR_D_K + 8) * sizeof(float);
+    const void* kernel = fuse_recurrence
+        ? reinterpret_cast<const void*>(
+              gated_delta_rule_backward_kernel_correct<true>)
+        : reinterpret_cast<const void*>(
+              gated_delta_rule_backward_kernel_correct<false>);
     auto attr_status = cudaFuncSetAttribute(
-        gated_delta_rule_backward_kernel_correct,
-        cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
+        kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
     if (attr_status != cudaSuccess) {
         fprintf(stderr, "[delta_rule_backward] shared-memory attribute failed: %s\n",
                 cudaGetErrorString(attr_status));
         return static_cast<int>(attr_status);
     }
 
-    gated_delta_rule_backward_kernel_correct<<<grid, block, smem_size, stream>>>(
-        q, k, v, g_exp, beta, final_state, delta_buf,
-        state_checkpoints, checkpoint_stride, grad_out,
-        grad_q, grad_k, grad_v, grad_g, grad_beta,
-        lengths, heads_per_batch, seq_len
-    );
+    if (fuse_recurrence) {
+        gated_delta_rule_backward_kernel_correct<true>
+            <<<grid, block, smem_size, stream>>>(
+                q, k, v, g_exp, beta, final_state, delta_buf,
+                state_checkpoints, checkpoint_stride, grad_out,
+                grad_q, grad_k, grad_v, grad_g, grad_beta,
+                lengths, heads_per_batch, seq_len);
+    } else {
+        gated_delta_rule_backward_kernel_correct<false>
+            <<<grid, block, smem_size, stream>>>(
+                q, k, v, g_exp, beta, final_state, delta_buf,
+                state_checkpoints, checkpoint_stride, grad_out,
+                grad_q, grad_k, grad_v, grad_g, grad_beta,
+                lengths, heads_per_batch, seq_len);
+    }
     return 0;
 }

@@ -2551,6 +2551,7 @@ static void hash_collective_topology(
     hash.add_u64(env_enabled("QWEN36_PACKED_LORA_SYNC", true));
     hash.add_u64(env_enabled("QWEN36_GRAD_SLAB", true));
     hash.add_u64(env_enabled("QWEN36_HETERO_PADDED_BATCH", true));
+    hash.add_u64(env_enabled("QWEN36_GDN_RECURRENT_FUSION", true));
     hash.add_u64(gdn_state_checkpoint_config());
 }
 

@@ -176,6 +176,8 @@ int main() {
     const int warmup = env_int("BENCH_WARMUP", 5);
     const int iters = env_int("BENCH_ITERS", 30);
     const bool fused_ab = env_enabled("QWEN36_GDN_FUSED_AB_PROJECTION", true);
+    const bool recurrent_fusion = env_enabled(
+        "QWEN36_GDN_RECURRENT_FUSION", true);
     assert(seq >= 2 && hidden > 0 && key_dim > 0 && value_dim > 0);
     assert(value_heads % key_heads == 0);
     assert(key_heads % expected_world == 0 && value_heads % expected_world == 0);
@@ -313,6 +315,8 @@ int main() {
         << "\"gpu\":\"" << properties.name << "\","
         << "\"abi\":" << kAbiVersion << ","
         << "\"fused_ab_projection\":" << (fused_ab ? "true" : "false") << ","
+        << "\"gdn_recurrent_fusion\":"
+        << (recurrent_fusion ? "true" : "false") << ","
         << "\"batch\":" << batch << ",\"seq\":" << seq << ","
         << "\"hidden\":" << hidden << ",\"layers\":" << layers << ","
         << "\"key_heads\":" << key_heads << ","
