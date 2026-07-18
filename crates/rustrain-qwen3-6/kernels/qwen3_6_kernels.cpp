@@ -3382,10 +3382,11 @@ static bool active_lora_targets_use_latent_rank_layout(
     const TrainingContext* ctx,
     const std::set<int64_t>& target_layers,
     const std::set<std::string>& target_modules,
+    bool all_target_layers,
     bool empty_modules_mean_attention_only
 ) {
     for (int64_t layer = 0; layer < ctx->num_layers; ++layer) {
-        if (!target_layers.empty() && target_layers.count(layer) == 0) continue;
+        if (!all_target_layers && target_layers.count(layer) == 0) continue;
         const auto table = lora_projection_table(ctx->layer_configs[layer]);
         for (int64_t pair = 0; pair < table.count; ++pair) {
             const auto& projection = table.entries[pair];
@@ -3407,12 +3408,14 @@ static int64_t local_lora_rank_for_active_targets(
     int64_t global_rank,
     const std::set<int64_t>& target_layers,
     const std::set<std::string>& target_modules,
+    bool all_target_layers,
     bool empty_modules_mean_attention_only,
     const char* adapter_kind
 ) {
     TORCH_CHECK(global_rank > 0, adapter_kind, " LoRA rank must be positive");
     const bool uses_latent_rank = active_lora_targets_use_latent_rank_layout(
-        ctx, target_layers, target_modules, empty_modules_mean_attention_only);
+        ctx, target_layers, target_modules, all_target_layers,
+        empty_modules_mean_attention_only);
     TORCH_CHECK(!uses_latent_rank || global_rank % ctx->tp_world_size == 0,
         adapter_kind, " LoRA rank ", global_rank,
         " must be divisible by TP_SIZE=", ctx->tp_world_size,
@@ -7126,6 +7129,7 @@ static void* qwen36_create_training_context_impl(
         }
         const int64_t local_lora_rank = local_lora_rank_for_active_targets(
             ctx, lora_rank, target_set, target_modules,
+            all_target_layers,
             /*empty_modules_mean_attention_only=*/false, "fixed");
 
         // Create fixed positional slots for every layer so layer offsets stay
@@ -10089,6 +10093,7 @@ int64_t qwen36_add_lora(
             }
             local_rank = local_lora_rank_for_active_targets(
                 ctx, rank, adapter.target_layers, adapter.target_modules,
+                adapter.target_layers.empty(),
                 /*empty_modules_mean_attention_only=*/true, "dynamic");
         } catch (const std::exception& e) {
             request_error = e.what();

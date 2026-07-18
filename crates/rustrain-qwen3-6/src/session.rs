@@ -15,6 +15,7 @@ use crate::lora::{
     Qwen36AdapterArtifact, Qwen36LoraConfig, Qwen36LoraTargetModule, native_lora_slots,
     validate_lora_targets,
 };
+use crate::pipeline::{PipelineStageLayout, stage_lora_slots, stage_needed_weights};
 use crate::sft::SftDataset;
 use rustrain_checkpoint::safetensors::read_safetensors_dir_filtered;
 use rustrain_core::runtime::{Config, RunPaths};
@@ -129,81 +130,6 @@ fn training_source_coordinate(
     }
 }
 
-/// Build the set of weight names needed for training.
-/// For EP mode, only load local expert slice.
-fn build_needed_weights(
-    config: &Qwen36RuntimeConfig,
-    lora_config: &Qwen36LoraConfig,
-    ep_shard: Option<&EpShard>,
-) -> HashSet<String> {
-    let p = &config.weight_prefix;
-    let mut needed = HashSet::new();
-
-    // Embed, norm, lm_head
-    needed.insert(format!("{p}embed_tokens.weight"));
-    needed.insert(format!("{p}norm.weight"));
-    if !config.tie_word_embeddings {
-        needed.insert("lm_head.weight".to_string());
-    }
-
-    // Per-layer weights for ALL layers (not just LoRA targets)
-    for layer in 0..config.num_hidden_layers {
-        let lp = format!("{p}layers.{layer}");
-        needed.insert(format!("{lp}.input_layernorm.weight"));
-        needed.insert(format!("{lp}.post_attention_layernorm.weight"));
-
-        // Attention weights (full or linear)
-        match config.layer_types[layer] {
-            LayerType::FullAttention => {
-                for w in &["q_proj", "q_norm", "k_proj", "k_norm", "v_proj", "o_proj"] {
-                    needed.insert(format!("{lp}.self_attn.{w}.weight"));
-                }
-            }
-            LayerType::LinearAttention => {
-                needed.insert(format!("{lp}.linear_attn.A_log"));
-                needed.insert(format!("{lp}.linear_attn.conv1d.weight"));
-                needed.insert(format!("{lp}.linear_attn.dt_bias"));
-                needed.insert(format!("{lp}.linear_attn.norm.weight"));
-                for w in &[
-                    "in_proj_qkv",
-                    "in_proj_z",
-                    "in_proj_a",
-                    "in_proj_b",
-                    "out_proj",
-                ] {
-                    needed.insert(format!("{lp}.linear_attn.{w}.weight"));
-                }
-            }
-        }
-
-        // MLP weights — dense vs MoE
-        if config.is_moe {
-            needed.insert(format!("{lp}.mlp.gate.weight"));
-            needed.insert(format!("{lp}.mlp.shared_expert_gate.weight"));
-            needed.insert(format!("{lp}.mlp.shared_expert.gate_proj.weight"));
-            needed.insert(format!("{lp}.mlp.shared_expert.up_proj.weight"));
-            needed.insert(format!("{lp}.mlp.shared_expert.down_proj.weight"));
-            // Fused expert tensors are 3D [num_experts, ...], loaded as a whole
-            needed.insert(format!("{lp}.mlp.experts.gate_up_proj"));
-            needed.insert(format!("{lp}.mlp.experts.down_proj"));
-        } else {
-            // Dense MLP: standard SwiGLU (gate_proj, up_proj, down_proj)
-            needed.insert(format!("{lp}.mlp.gate_proj.weight"));
-            needed.insert(format!("{lp}.mlp.up_proj.weight"));
-            needed.insert(format!("{lp}.mlp.down_proj.weight"));
-        }
-    }
-
-    // Vision encoder (for multimodal)
-    if config.has_vision {
-        for name in crate::vision::VisionWeights::weight_names(config) {
-            needed.insert(name);
-        }
-    }
-
-    needed
-}
-
 // ──────────────────────────────────────────────────────────────────────
 // Entry point: single-GPU LoRA SFT
 // ──────────────────────────────────────────────────────────────────────
@@ -234,11 +160,9 @@ pub fn train_qwen3_6_lora_sft_ep(
         .with_context(|| format!("canonicalize Qwen model path {}", model_path.display()))?;
     let runtime_config = read_qwen36_runtime_config(&model_path)?;
     let ep_shard = if runtime_config.is_moe {
-        if config.parallel.pipeline_model_parallel_size != 1
-            || config.parallel.context_parallel_size != 1
-        {
+        if config.parallel.context_parallel_size != 1 {
             bail!(
-                "native MoE Qwen LoRA currently supports TPxEPxDP only: TP={} PP={} DP={} EP={} CP={}",
+                "native MoE Qwen LoRA does not yet support context parallelism: TP={} PP={} DP={} EP={} CP={}",
                 config.parallel.tensor_model_parallel_size,
                 config.parallel.pipeline_model_parallel_size,
                 config.parallel.data_parallel_size,
@@ -251,7 +175,7 @@ pub fn train_qwen3_6_lora_sft_ep(
             .unwrap_or_else(|_| DEFAULT_RANK_ORDER.to_string());
         let topology = ParallelTopology::with_order(
             config.parallel.tensor_model_parallel_size,
-            1,
+            config.parallel.pipeline_model_parallel_size,
             config.parallel.data_parallel_size,
             config.parallel.expert_model_parallel_size,
             1,
@@ -282,8 +206,7 @@ mod tests {
             assert_eq!(ep_rank, expected_ep_rank);
             let shard = EpShard::new(ep_rank, 2, 8);
             assert_eq!(shard.expert_start, expected_ep_rank * 4);
-            let (source_rank, source_count) =
-                training_source_coordinate(0, 1, ep_rank, 2, true);
+            let (source_rank, source_count) = training_source_coordinate(0, 1, ep_rank, 2, true);
             let data_start = 3 * 2 * source_count + source_rank * 2;
             assert_eq!(data_start, 12 + expected_ep_rank * 2);
         }
@@ -293,9 +216,7 @@ mod tests {
     fn tp_ep_dp_uses_every_expert_and_data_source_coordinate() {
         let expected = [(0, 4), (1, 4), (2, 4), (3, 4)];
         let observed = [(0, 0), (0, 1), (1, 0), (1, 1)]
-            .map(|(dp_rank, ep_rank)| {
-                training_source_coordinate(dp_rank, 2, ep_rank, 2, true)
-            });
+            .map(|(dp_rank, ep_rank)| training_source_coordinate(dp_rank, 2, ep_rank, 2, true));
         assert_eq!(observed, expected);
         assert_eq!(training_source_coordinate(1, 2, 1, 2, false), (1, 2));
     }
@@ -384,19 +305,19 @@ fn train_impl(
         .unwrap_or(0);
     let world_size = env_world_size;
     let rank = env_rank;
-    let distributed_generation =
-        if world_size > 1 {
-            let attempt = std::env::var("RUSTRAIN_ATTEMPT_ID").context(
-                "distributed CLI training requires launcher-provided RUSTRAIN_ATTEMPT_ID",
-            )?;
-            Some(format!(
-                "{attempt}.adapter-final.{ordinal:020}",
-                ordinal = 0
-            ))
-        } else {
-            None
-        };
+    let distributed_generation = if world_size > 1 {
+        let attempt = std::env::var("RUSTRAIN_ATTEMPT_ID")
+            .context("distributed CLI training requires launcher-provided RUSTRAIN_ATTEMPT_ID")?;
+        Some(format!(
+            "{attempt}.adapter-final.{ordinal:020}",
+            ordinal = 0
+        ))
+    } else {
+        None
+    };
     let tp_size = config.parallel.tensor_model_parallel_size;
+    let pp_size = config.parallel.pipeline_model_parallel_size;
+    let cp_size = config.parallel.context_parallel_size;
     let env_tp_size = std::env::var("TP_SIZE")
         .or_else(|_| std::env::var("RUSTRAIN_TP_SIZE"))
         .or_else(|_| std::env::var("TENSOR_MODEL_PARALLEL_SIZE"))
@@ -420,12 +341,18 @@ fn train_impl(
             config.parallel.data_parallel_size
         );
     }
-    let dp_size = if !is_ep && configured_dp_size == 1 && world_size > tp_size {
+    let dense_model_parallel_size = tp_size
+        .checked_mul(pp_size)
+        .and_then(|size| size.checked_mul(cp_size))
+        .context("Qwen model-parallel size overflow")?;
+    let dp_size = if !is_ep && configured_dp_size == 1 && world_size > dense_model_parallel_size {
         world_size
-            .checked_div(tp_size)
-            .filter(|value| value * tp_size == world_size)
+            .checked_div(dense_model_parallel_size)
+            .filter(|value| value * dense_model_parallel_size == world_size)
             .ok_or_else(|| {
-                anyhow!("WORLD_SIZE={world_size} is not divisible by TP_SIZE={tp_size}")
+                anyhow!(
+                    "WORLD_SIZE={world_size} is not divisible by TPxPPxCP={dense_model_parallel_size}"
+                )
             })?
     } else {
         configured_dp_size
@@ -433,49 +360,36 @@ fn train_impl(
     let rank_order = std::env::var("RUSTRAIN_PARALLEL_ORDER")
         .or_else(|_| std::env::var("PARALLEL_ORDER"))
         .unwrap_or_else(|_| DEFAULT_RANK_ORDER.to_string());
+    if cp_size != 1 {
+        bail!("native Qwen LoRA does not yet support context parallelism (CP={cp_size})");
+    }
     let parallel_topology = if let Some(shard) = shard_ref {
-        if config.parallel.pipeline_model_parallel_size != 1
-            || config.parallel.context_parallel_size != 1
-        {
-            bail!(
-                "native MoE Qwen LoRA currently supports TPxEPxDP only: TP={} WORLD_SIZE={} PP={} DP={} EP={} CP={}",
-                tp_size,
-                world_size,
-                config.parallel.pipeline_model_parallel_size,
-                configured_dp_size,
-                shard.world_size,
-                config.parallel.context_parallel_size,
-            );
-        }
         Some(ParallelTopology::with_order(
             tp_size,
-            1,
+            pp_size,
             dp_size,
             shard.world_size,
-            1,
+            cp_size,
             &rank_order,
         )?)
     } else {
-        if config.parallel.pipeline_model_parallel_size != 1
-            || config.parallel.expert_model_parallel_size != 1
-            || config.parallel.context_parallel_size != 1
-        {
+        if config.parallel.expert_model_parallel_size != 1 {
             bail!(
-                "native dense Qwen LoRA supports TPxDP only: TP={} WORLD_SIZE={} PP={} DP={} EP={} CP={}",
+                "native dense Qwen LoRA requires EP=1: TP={} WORLD_SIZE={} PP={} DP={} EP={} CP={}",
                 tp_size,
                 world_size,
-                config.parallel.pipeline_model_parallel_size,
+                pp_size,
                 dp_size,
                 config.parallel.expert_model_parallel_size,
-                config.parallel.context_parallel_size
+                cp_size
             );
         }
         Some(ParallelTopology::with_order(
             tp_size,
-            1,
+            pp_size,
             dp_size,
             1,
-            1,
+            cp_size,
             &rank_order,
         )?)
     };
@@ -483,13 +397,6 @@ fn train_impl(
         topology.validate_world_size(world_size)?;
         topology.coordinates(rank)?;
     }
-    let native_slots = native_lora_slots(&runtime_config, &lora_config);
-    let active_layouts = native_slots
-        .iter()
-        .filter(|slot| slot.active)
-        .map(|slot| checkpoint::lora_tp_shard_layout(slot.module, &runtime_config))
-        .collect::<Vec<_>>();
-    validate_lora_rank_for_tp(lora_config.rank, tp_size, &active_layouts)?;
     let is_data_parallel = dp_size > 1;
     unsafe {
         std::env::set_var("TP_SIZE", tp_size.to_string());
@@ -501,8 +408,8 @@ fn train_impl(
                 .to_string(),
         );
         std::env::set_var("DP_SIZE", dp_size.to_string());
-        std::env::set_var("CP_SIZE", "1");
-        std::env::set_var("PP_SIZE", "1");
+        std::env::set_var("CP_SIZE", cp_size.to_string());
+        std::env::set_var("PP_SIZE", pp_size.to_string());
         std::env::set_var(
             "RUSTRAIN_DATA_PARALLEL",
             if is_data_parallel { "1" } else { "0" },
@@ -537,6 +444,21 @@ fn train_impl(
         .as_ref()
         .map(ParallelTopology::expert_model_parallel_size)
         .unwrap_or(1);
+    let stage = PipelineStageLayout::new(runtime_config.num_hidden_layers, pp_rank, pp_size)?;
+    if pp_size > 1 && runtime_config.has_vision {
+        bail!("pipeline-parallel Qwen training does not yet support the vision encoder");
+    }
+    if pp_size > 1 && runtime_config.mtp_num_hidden_layers > 0 {
+        bail!("pipeline-parallel Qwen training does not yet support MTP layers");
+    }
+    let global_native_slots = native_lora_slots(&runtime_config, &lora_config);
+    let native_slots = stage_lora_slots(&global_native_slots, &stage);
+    let active_layouts = native_slots
+        .iter()
+        .filter(|slot| slot.active)
+        .map(|slot| checkpoint::lora_tp_shard_layout(slot.module, &runtime_config))
+        .collect::<Vec<_>>();
+    validate_lora_rank_for_tp(lora_config.rank, tp_size, &active_layouts)?;
     let is_expert_parallel = ep_size > 1;
     unsafe {
         std::env::set_var("RUSTRAIN_TP_RANK", tp_rank.to_string());
@@ -645,8 +567,8 @@ fn train_impl(
         }
     }
 
-    // Build needed weight set
-    let needed = build_needed_weights(&runtime_config, &lora_config, shard_ref);
+    // Load only the frozen weights owned by this physical pipeline stage.
+    let needed = stage_needed_weights(&runtime_config, &stage);
 
     // Stagger loading for EP to avoid OOM
     if is_ep {
@@ -794,9 +716,10 @@ fn train_impl(
     let expert_count = shard_ref
         .map(|s| s.experts_per_rank)
         .unwrap_or(runtime_config.num_experts);
-    let ctx = crate::kernel::CppTrainingContext::new(
+    let ctx = crate::kernel::CppTrainingContext::new_for_stage(
         &weights_gpu,
         &runtime_config,
+        &stage,
         compute_kind,
         config.train.learning_rate as f64,
         config.train.adam_beta1 as f64,
@@ -843,8 +766,8 @@ fn train_impl(
                 .min()
                 .ok_or_else(|| anyhow!("empty PP process group"))?;
             ctx.init_parallel_nccl(
-                rank, world_size, tp_rank, tp_size, tp_color, cp_rank, 1, cp_color, ep_rank,
-                ep_size, ep_color, dp_rank, dp_size, dp_color, pp_rank, 1, pp_color,
+                rank, world_size, tp_rank, tp_size, tp_color, cp_rank, cp_size, cp_color, ep_rank,
+                ep_size, ep_color, dp_rank, dp_size, dp_color, pp_rank, pp_size, pp_color,
             )?;
         } else {
             let ret = ctx.init_nccl();
@@ -878,7 +801,7 @@ fn train_impl(
     let native_count = ctx.lora_count() as usize;
     if native_slots.len() != native_count {
         bail!(
-            "LoRA registry count {} does not match native slot count {native_count}",
+            "pipeline-local LoRA registry count {} does not match native slot count {native_count}",
             native_slots.len()
         );
     }
@@ -925,7 +848,7 @@ fn train_impl(
             .iter()
             .filter(|slot| slot.active)
             .map(|slot| checkpoint::LoraSlotIdentity {
-                index: slot.index,
+                index: slot.global_index,
                 layer: slot.layer,
                 module: slot.module.cpp_name().to_string(),
             })
@@ -940,7 +863,7 @@ fn train_impl(
         let active_slot_indices = native_slots
             .iter()
             .filter(|slot| slot.active)
-            .map(|slot| slot.index)
+            .map(|slot| slot.local_index)
             .collect::<Vec<_>>();
         let restore_slot_indices = checkpoint::fixed_restore_slot_indices(
             data.lora_a.len(),
@@ -1033,13 +956,8 @@ fn train_impl(
         let mut loss_value = 0.0;
         for accumulation_index in 0..gradient_accumulation_steps {
             let micro_step = step * gradient_accumulation_steps + accumulation_index;
-            let (source_rank, source_count) = training_source_coordinate(
-                dp_rank,
-                dp_size,
-                ep_rank,
-                ep_size,
-                ep_a2a_sharded,
-            );
+            let (source_rank, source_count) =
+                training_source_coordinate(dp_rank, dp_size, ep_rank, ep_size, ep_a2a_sharded);
             let data_start =
                 (micro_step * batch_size * source_count + source_rank * batch_size) % data.len();
             let sft_batch = data.batch(data_start, batch_size);
@@ -1110,15 +1028,19 @@ fn train_impl(
         let mut layouts = Vec::with_capacity(active_slots.len());
         let mut identities = Vec::with_capacity(active_slots.len());
         for slot in active_slots {
-            lora_a.push(
-                ctx.get_lora_a(slot.index as i64)
-                    .with_context(|| format!("native LoRA slot {} is missing A", slot.index))?,
-            );
-            lora_b.push(
-                ctx.get_lora_b(slot.index as i64)
-                    .with_context(|| format!("native LoRA slot {} is missing B", slot.index))?,
-            );
-            let optimizer_index = slot.index.saturating_mul(2);
+            lora_a.push(ctx.get_lora_a(slot.local_index as i64).with_context(|| {
+                format!(
+                    "native LoRA slot {} (global {}) is missing A",
+                    slot.local_index, slot.global_index
+                )
+            })?);
+            lora_b.push(ctx.get_lora_b(slot.local_index as i64).with_context(|| {
+                format!(
+                    "native LoRA slot {} (global {}) is missing B",
+                    slot.local_index, slot.global_index
+                )
+            })?);
+            let optimizer_index = slot.local_index.saturating_mul(2);
             adam_m.push(all_adam_m[optimizer_index].shallow_clone());
             adam_m.push(all_adam_m[optimizer_index + 1].shallow_clone());
             adam_v.push(all_adam_v[optimizer_index].shallow_clone());
@@ -1128,7 +1050,7 @@ fn train_impl(
                 &runtime_config,
             ));
             identities.push(checkpoint::LoraSlotIdentity {
-                index: slot.index,
+                index: slot.global_index,
                 layer: slot.layer,
                 module: slot.module.cpp_name().to_string(),
             });
