@@ -248,6 +248,37 @@ unsafe extern "C" {
         device_id: i32,
     ) -> *mut std::ffi::c_void;
 
+    fn v4_glm5_moe_layer_tp(
+        mlp_input_ptr: *mut std::ffi::c_void,
+        shared_gate: *mut std::ffi::c_void,
+        shared_up: *mut std::ffi::c_void,
+        shared_down: *mut std::ffi::c_void,
+        shared_gate_scale: *mut std::ffi::c_void,
+        shared_up_scale: *mut std::ffi::c_void,
+        shared_down_scale: *mut std::ffi::c_void,
+        gate_weight: *mut std::ffi::c_void,
+        correction_bias: *mut std::ffi::c_void,
+        expert_gate_weights: *mut *mut std::ffi::c_void,
+        expert_up_weights: *mut *mut std::ffi::c_void,
+        expert_down_weights: *mut *mut std::ffi::c_void,
+        expert_gate_scales: *mut *mut std::ffi::c_void,
+        expert_up_scales: *mut *mut std::ffi::c_void,
+        expert_down_scales: *mut *mut std::ffi::c_void,
+        n_local_experts: i32,
+        local_expert_indices: *const i32,
+        n_routed_experts: i32,
+        topk: i32,
+        n_group: i32,
+        topk_group: i32,
+        scoring_func: i32,
+        topk_method: i32,
+        norm_topk_prob: i32,
+        routed_scaling_factor: f64,
+        tp_comm: *mut std::ffi::c_void,
+        tp_size: i32,
+        device_id: i32,
+    ) -> *mut std::ffi::c_void;
+
     fn v4_glm5_embedding(
         embed_weight_ptr: *mut std::ffi::c_void,
         input_ids_ptr: *mut std::ffi::c_void,
@@ -330,6 +361,12 @@ unsafe extern "C" {
 
     fn v4_glm5_mtp_decoder_layer(
         descriptor: *const Glm5MtpDecoderDescriptor,
+    ) -> *mut std::ffi::c_void;
+
+    fn v4_glm5_tp_identity_allreduce_backward(
+        input_ptr: *mut std::ffi::c_void,
+        tp_comm: *mut std::ffi::c_void,
+        tp_size: i32,
     ) -> *mut std::ffi::c_void;
 
     fn v4_stream_wait_event(device_id: i32, event_ptr: *mut std::ffi::c_void);
@@ -1650,6 +1687,123 @@ pub fn glm5_moe_layer_ep_cpp(
     Ok(tensor)
 }
 
+/// Call the C++ MoE layer with Megatron expert tensor parallelism. Routed and
+/// shared expert gate/up weights are column-sharded, down weights are row-
+/// sharded, and `tp_comm` supplies the autograd-aware input/output mappings.
+/// This entry point deliberately fixes EP to one.
+#[allow(clippy::too_many_arguments)]
+pub fn glm5_moe_layer_tp_cpp(
+    mlp_input: &Tensor,
+    shared_gate: &Tensor,
+    shared_up: &Tensor,
+    shared_down: &Tensor,
+    shared_gate_scale: Option<&Tensor>,
+    shared_up_scale: Option<&Tensor>,
+    shared_down_scale: Option<&Tensor>,
+    gate_weight: &Tensor,
+    correction_bias: Option<&Tensor>,
+    expert_gate_weights: &[&Tensor],
+    expert_up_weights: &[&Tensor],
+    expert_down_weights: &[&Tensor],
+    expert_gate_scales: &[Option<&Tensor>],
+    expert_up_scales: &[Option<&Tensor>],
+    expert_down_scales: &[Option<&Tensor>],
+    local_expert_indices: &[usize],
+    n_routed_experts: i32,
+    topk: i32,
+    n_group: i32,
+    topk_group: i32,
+    scoring_func: i32,
+    topk_method: i32,
+    norm_topk_prob: bool,
+    routed_scaling_factor: f64,
+    tp_comm: *mut std::ffi::c_void,
+    tp_size: i32,
+    device_id: i32,
+) -> Result<Tensor> {
+    fn opt_ptr(t: Option<&Tensor>) -> *mut std::ffi::c_void {
+        match t {
+            Some(t) if t.numel() > 0 => t.as_ptr() as *mut _,
+            _ => std::ptr::null_mut(),
+        }
+    }
+    if tp_size <= 0 || (tp_size > 1 && tp_comm.is_null()) {
+        bail!("GLM5 expert TP requires a positive size and communicator for multi-rank TP");
+    }
+    let n_usize = expert_gate_weights.len();
+    if expert_up_weights.len() != n_usize
+        || expert_down_weights.len() != n_usize
+        || expert_gate_scales.len() != n_usize
+        || expert_up_scales.len() != n_usize
+        || expert_down_scales.len() != n_usize
+        || local_expert_indices.len() != n_usize
+    {
+        bail!("GLM5 MoE expert weight/scale/index slices must have equal length");
+    }
+    let n = i32::try_from(n_usize).context("too many local experts for GLM5 ABI")?;
+    let mut gate_ptrs: Vec<*mut std::ffi::c_void> = expert_gate_weights
+        .iter()
+        .map(|t| t.as_ptr() as *mut _)
+        .collect();
+    let mut up_ptrs: Vec<*mut std::ffi::c_void> = expert_up_weights
+        .iter()
+        .map(|t| t.as_ptr() as *mut _)
+        .collect();
+    let mut down_ptrs: Vec<*mut std::ffi::c_void> = expert_down_weights
+        .iter()
+        .map(|t| t.as_ptr() as *mut _)
+        .collect();
+    let mut gs_ptrs: Vec<*mut std::ffi::c_void> =
+        expert_gate_scales.iter().map(|t| opt_ptr(*t)).collect();
+    let mut us_ptrs: Vec<*mut std::ffi::c_void> =
+        expert_up_scales.iter().map(|t| opt_ptr(*t)).collect();
+    let mut ds_ptrs: Vec<*mut std::ffi::c_void> =
+        expert_down_scales.iter().map(|t| opt_ptr(*t)).collect();
+    let indices: Vec<i32> = local_expert_indices
+        .iter()
+        .map(|&i| i32::try_from(i).context("local expert index exceeds GLM5 ABI"))
+        .collect::<Result<_>>()?;
+
+    let result_ptr = unsafe {
+        v4_glm5_moe_layer_tp(
+            mlp_input.as_ptr() as *mut _,
+            shared_gate.as_ptr() as *mut _,
+            shared_up.as_ptr() as *mut _,
+            shared_down.as_ptr() as *mut _,
+            opt_ptr(shared_gate_scale),
+            opt_ptr(shared_up_scale),
+            opt_ptr(shared_down_scale),
+            gate_weight.as_ptr() as *mut _,
+            opt_ptr(correction_bias),
+            gate_ptrs.as_mut_ptr(),
+            up_ptrs.as_mut_ptr(),
+            down_ptrs.as_mut_ptr(),
+            gs_ptrs.as_mut_ptr(),
+            us_ptrs.as_mut_ptr(),
+            ds_ptrs.as_mut_ptr(),
+            n,
+            indices.as_ptr(),
+            n_routed_experts,
+            topk,
+            n_group,
+            topk_group,
+            scoring_func,
+            topk_method,
+            i32::from(norm_topk_prob),
+            routed_scaling_factor,
+            tp_comm,
+            tp_size,
+            device_id,
+        )
+    };
+    if result_ptr.is_null() {
+        return Err(glm5_ffi_error("v4_glm5_moe_layer_tp"));
+    }
+    let tensor = unsafe { Tensor::clone_from_ptr(result_ptr as *mut _) };
+    unsafe { v4_glm5_free_at_tensor(result_ptr) };
+    Ok(tensor)
+}
+
 /// Single-rank compatibility wrapper for callers that do not need expert
 /// dispatch. The distributed session uses [`glm5_moe_layer_ep_cpp`] directly
 /// with the checkpoint's complete router configuration.
@@ -1923,14 +2077,56 @@ pub fn glm5_layer_forward_cpp(
     Ok(tensor)
 }
 
+fn validate_glm5_mtp_parallel_topology(descriptor: &Glm5MtpDecoderDescriptor) -> Result<()> {
+    if descriptor.tp_size <= 0 || descriptor.ep_size <= 0 {
+        bail!("native MTP TP/EP sizes must be positive");
+    }
+    if descriptor.cp_size != 1 || descriptor.cp_rank != 0 {
+        bail!("native MTP does not support context parallelism; expected cp_rank=0 and cp_size=1");
+    }
+    if descriptor.ep_rank < 0 || descriptor.ep_rank >= descriptor.ep_size {
+        bail!(
+            "native MTP EP rank {} is outside [0, {})",
+            descriptor.ep_rank,
+            descriptor.ep_size
+        );
+    }
+    if descriptor.tp_size > 1 && descriptor.ep_size > 1 {
+        bail!("native MTP does not support combined tensor and expert parallelism");
+    }
+    Ok(())
+}
+
 /// Execute one complete native GLM5 MTP decoder layer in one Rust -> C++ FFI
 /// call. The descriptor owns no tensors; all pointers are borrowed for this
-/// call. TP/EP use SUM-forward/identity-backward collectives and CP uses the
-/// autograd-aware K/V ring implemented in the C++ kernel.
+/// call. Native MTP supports TP or EP, but not both simultaneously, and CP must
+/// remain disabled (`cp_rank=0`, `cp_size=1`) until its ring is autograd-aware.
 pub fn glm5_mtp_decoder_layer_cpp(descriptor: &Glm5MtpDecoderDescriptor) -> Result<Tensor> {
+    validate_glm5_mtp_parallel_topology(descriptor)?;
     let result_ptr = unsafe { v4_glm5_mtp_decoder_layer(descriptor) };
     if result_ptr.is_null() {
         return Err(glm5_ffi_error("v4_glm5_mtp_decoder_layer"));
+    }
+    let tensor = unsafe { Tensor::clone_from_ptr(result_ptr as *mut _) };
+    unsafe { v4_glm5_free_at_tensor(result_ptr) };
+    Ok(tensor)
+}
+
+/// Megatron copy-to-tensor-parallel-region mapping: identity in forward and
+/// SUM across TP ranks in backward. `tp_size=1` is a zero-collective fast path.
+pub fn glm5_tp_identity_allreduce_backward_cpp(
+    input: &Tensor,
+    tp_comm: *mut std::ffi::c_void,
+    tp_size: i32,
+) -> Result<Tensor> {
+    if tp_size <= 0 || (tp_size > 1 && tp_comm.is_null()) {
+        bail!("GLM5 TP identity mapping requires a positive size and communicator");
+    }
+    let result_ptr = unsafe {
+        v4_glm5_tp_identity_allreduce_backward(input.as_ptr() as *mut _, tp_comm, tp_size)
+    };
+    if result_ptr.is_null() {
+        return Err(glm5_ffi_error("v4_glm5_tp_identity_allreduce_backward"));
     }
     let tensor = unsafe { Tensor::clone_from_ptr(result_ptr as *mut _) };
     unsafe { v4_glm5_free_at_tensor(result_ptr) };
@@ -1951,6 +2147,47 @@ mod mtp_tests {
     use tch::{Cuda, Device, Kind};
 
     #[test]
+    fn native_mtp_parallel_topology_rejects_unsupported_boundaries() {
+        let valid = || Glm5MtpDecoderDescriptor {
+            tp_size: 1,
+            cp_rank: 0,
+            cp_size: 1,
+            ep_rank: 0,
+            ep_size: 1,
+            ..Default::default()
+        };
+        assert!(validate_glm5_mtp_parallel_topology(&valid()).is_ok());
+
+        let mut descriptor = valid();
+        descriptor.cp_size = 2;
+        assert!(
+            validate_glm5_mtp_parallel_topology(&descriptor)
+                .unwrap_err()
+                .to_string()
+                .contains("does not support context parallelism")
+        );
+
+        let mut descriptor = valid();
+        descriptor.tp_size = 2;
+        descriptor.ep_size = 2;
+        assert!(
+            validate_glm5_mtp_parallel_topology(&descriptor)
+                .unwrap_err()
+                .to_string()
+                .contains("combined tensor and expert parallelism")
+        );
+
+        let mut descriptor = valid();
+        descriptor.ep_rank = 1;
+        assert!(
+            validate_glm5_mtp_parallel_topology(&descriptor)
+                .unwrap_err()
+                .to_string()
+                .contains("outside [0, 1)")
+        );
+    }
+
+    #[test]
     fn checkpoint_result_preserves_gradients_and_reports_forward_errors() {
         let input = Tensor::from_slice(&[1.0_f32, -2.0, 3.0]).set_requires_grad(true);
         let output = checkpoint_result(&input, |value| Ok(value * value))
@@ -1968,6 +2205,19 @@ mod mtp_tests {
         .to_string();
         assert!(error.contains("synthetic checkpoint failure"));
         clear_checkpoint_registry();
+    }
+
+    #[test]
+    fn tp_identity_size_one_is_forward_and_backward_identity() {
+        let input = Tensor::from_slice(&[1.0_f32, -2.0, 3.0]);
+        let _ = input.set_requires_grad(true);
+        let output = glm5_tp_identity_allreduce_backward_cpp(&input, std::ptr::null_mut(), 1)
+            .expect("single-rank TP identity FFI failed");
+        assert_eq!(output.size(), input.size());
+        assert!((&output - &input).abs().max().double_value(&[]) < 1e-6);
+        (&output * 2.5).sum(Kind::Float).backward();
+        let expected = Tensor::full([3], 2.5, (Kind::Float, Device::Cpu));
+        assert!((input.grad() - expected).abs().max().double_value(&[]) < 1e-6);
     }
 
     #[test]

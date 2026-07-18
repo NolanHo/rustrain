@@ -556,6 +556,120 @@ fn column_then_row_parallel_mlp_forward_and_input_gradient_match_full_mlp() {
     assert_close(&reduced_input_gradient, &full_input_gradient);
 }
 
+#[test]
+fn tp2_column_projection_forward_and_low_rank_input_gradient_match_full_attention() {
+    let tokens = 2;
+    let hidden = 3;
+    let low_rank = 2;
+    let output = 4;
+    let tp_size = 2;
+    let input = vec![0.2, -0.6, 0.9, -0.5, 0.7, 0.3];
+    let projection_a = vec![0.4, -0.2, 0.8, -0.7, 0.5, 0.1];
+    let projection_b = vec![0.3, -0.9, 0.6, 0.2, -0.4, 0.7, 0.8, -0.1];
+    let output_gradient = vec![0.2, -0.5, 0.7, 0.1, -0.3, 0.9, -0.4, 0.6];
+
+    let low_rank_input = matmul_rhs_transpose(&input, tokens, hidden, &projection_a, low_rank);
+    let full_output =
+        matmul_rhs_transpose(&low_rank_input, tokens, low_rank, &projection_b, output);
+    let full_low_rank_gradient =
+        input_gradient(&output_gradient, tokens, output, &projection_b, low_rank);
+    let full_input_gradient = input_gradient(
+        &full_low_rank_gradient,
+        tokens,
+        low_rank,
+        &projection_a,
+        hidden,
+    );
+
+    let output_per_rank = output / tp_size;
+    let mut gathered_output = vec![0.0; tokens * output];
+    let mut summed_low_rank_gradient = vec![0.0; tokens * low_rank];
+    for rank in 0..tp_size {
+        let start = rank * output_per_rank;
+        let b_shard = &projection_b[start * low_rank..(start + output_per_rank) * low_rank];
+        let local_output =
+            matmul_rhs_transpose(&low_rank_input, tokens, low_rank, b_shard, output_per_rank);
+        let mut local_gradient = vec![0.0; tokens * output_per_rank];
+        for token in 0..tokens {
+            gathered_output[token * output + start..token * output + start + output_per_rank]
+                .copy_from_slice(
+                    &local_output[token * output_per_rank..(token + 1) * output_per_rank],
+                );
+            local_gradient[token * output_per_rank..(token + 1) * output_per_rank].copy_from_slice(
+                &output_gradient[token * output + start..token * output + start + output_per_rank],
+            );
+        }
+        add_in_place(
+            &mut summed_low_rank_gradient,
+            &input_gradient(&local_gradient, tokens, output_per_rank, b_shard, low_rank),
+        );
+    }
+    let tp_input_gradient = input_gradient(
+        &summed_low_rank_gradient,
+        tokens,
+        low_rank,
+        &projection_a,
+        hidden,
+    );
+
+    assert_close(&gathered_output, &full_output);
+    assert_close(&summed_low_rank_gradient, &full_low_rank_gradient);
+    assert_close(&tp_input_gradient, &full_input_gradient);
+}
+
+#[test]
+fn tp2_replicated_kv_projection_sums_low_rank_and_rope_bypass_dgrad() {
+    let tokens = 1;
+    let hidden = 3;
+    let kv_lora = 2;
+    let rope = 2;
+    let kv_a_weight = vec![
+        0.4, -0.2, 0.8, -0.7, 0.5, 0.1, 0.3, 0.6, -0.4, -0.1, 0.9, 0.2,
+    ];
+    // Each TP rank contributes through its kv_b shard and through its local
+    // attention heads consuming the replicated k_rope branch.
+    let rank0_output_gradient = vec![0.2, -0.5, 0.7, 0.1];
+    let rank1_output_gradient = vec![-0.3, 0.9, -0.4, 0.6];
+    let summed_output_gradient = rank0_output_gradient
+        .iter()
+        .zip(&rank1_output_gradient)
+        .map(|(a, b)| a + b)
+        .collect::<Vec<_>>();
+    let expected_input_gradient = input_gradient(
+        &summed_output_gradient,
+        tokens,
+        kv_lora + rope,
+        &kv_a_weight,
+        hidden,
+    );
+
+    let rank0_input_gradient = input_gradient(
+        &rank0_output_gradient,
+        tokens,
+        kv_lora + rope,
+        &kv_a_weight,
+        hidden,
+    );
+    let rank1_input_gradient = input_gradient(
+        &rank1_output_gradient,
+        tokens,
+        kv_lora + rope,
+        &kv_a_weight,
+        hidden,
+    );
+    let mut reduced_input_gradient = rank0_input_gradient.clone();
+    add_in_place(&mut reduced_input_gradient, &rank1_input_gradient);
+
+    assert_close(&reduced_input_gradient, &expected_input_gradient);
+    assert!(
+        rank0_input_gradient
+            .iter()
+            .zip(&expected_input_gradient)
+            .any(|(local, expected)| (local - expected).abs() > EPS),
+        "the fixture must detect a k_rope branch that bypasses TP dgrad SUM"
+    );
+}
+
 fn expert_transform(expert: usize, token: &[f64]) -> Vec<f64> {
     let scale = 0.5 + expert as f64 * 0.4;
     vec![
@@ -650,10 +764,12 @@ fn ep_owner_permutation_and_inverse_preserve_router_weights_and_add_shared_once(
                 (topk - 1) as f64 * shared[hidden];
         }
     }
-    assert!(incorrectly_repeated_shared
-        .iter()
-        .zip(&reference)
-        .any(|(actual, expected)| (actual - expected).abs() > 1.0e-6));
+    assert!(
+        incorrectly_repeated_shared
+            .iter()
+            .zip(&reference)
+            .any(|(actual, expected)| (actual - expected).abs() > 1.0e-6)
+    );
 }
 
 #[test]

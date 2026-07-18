@@ -1,7 +1,7 @@
 ---
 type: ChangeSpec
 title: GLM-5.2 Complete Implementation
-description: Make GLM-5.2 EP, TP, and CP paths numerically correct, feature-complete, and independently testable.
+description: Make GLM-5.2 training correct for supported EP-only and TP-only topologies, with explicit fail-fast boundaries for unsupported combinations.
 tags: [glm5, training, ep, tp, cp, fp8]
 status: accepted
 ---
@@ -32,18 +32,24 @@ optimizer step.
 
 - Standard RoPE uses `theta^(-(2*i/head_dim))`; interleaved and contiguous
   layouts must match the configured checkpoint layout.
-- DSA indexer top-k is causal, stateful, and uses the configured
-  `index_topk_freq`, `indexer_types`, and source-layer weights. IndexShare
-  state owns its buffers and is freed exactly once.
+- DSA indexer top-k is causal and stateful. A trunk `full` layer computes a
+  fresh `[batch, seq, actual_topk]` state and a `shared` layer reuses the
+  preceding full layer's shape-matching state. `indexer_types` is the explicit
+  schedule; when absent it is derived from Megatron's one-indexed
+  `index_topk_freq`/`index_skip_topk_offset` formula. Frequency is not applied
+  again as a zero-indexed runtime modulo gate. IndexShare state owns its
+  buffers and is freed exactly once.
 - MoE computes every selected local expert, preserves each top-k weight, and
   returns zero for ranks with no local assignment. Router behavior follows
   `topk_method`/`scoring_func` and group settings; no hidden fallback.
 - Expert caches are keyed by layer, device, dtype, shape, and weight identity
   (or are scoped per layer) and can never reuse another layer's weights.
 - CUDA allocator capacity and eager FP8 expert pre-dequantization are explicit
-  training options. Eager pre-dequantization is the throughput-oriented default;
-  memory-constrained hosts may keep cached experts in FP8 and dequantize inside
-  the C++ linear path instead of failing while expanding the full shard to BF16.
+  training options. Eager pre-dequantization is the throughput-oriented default.
+  With `predequant_expert_weights=false`, routed FP8 weights and scales remain
+  on CPU. Each checkpointed trunk layer enters one C++ MoE call that stages and
+  dequantizes only selected experts; no-grad forward temporaries are released
+  and backward recomputes them. This mode requires the compiled C++ MoE kernel.
 - FP8 block scales are applied exactly once. LoRA fusion must preserve the
   base-weight scale semantics or explicitly dequantize through the safe path.
   Dense, shared, and routed expert weight selection always loads the matching
@@ -71,8 +77,10 @@ optimizer step.
    causal sparse masking, MoE routing, native MTP, and safe LoRA overlays.
 2. Correct C++ kernels and FFI: layer forward, FP8 dequant/GEMM, expert
    dispatch/cache, state lifecycle, batch shapes, and error propagation.
-3. Correct training orchestration: EP, TP+EP, CP+EP, LoRA gradients, NCCL
-   reductions, checkpointing, and loss evaluation.
+3. Correct training orchestration for EP-only, TP-only, and the non-MTP CP
+   path, with explicit pre-load rejection of native MTP with CP above one and
+   combined TP+EP; preserve LoRA gradients, NCCL reductions, checkpointing,
+   and loss evaluation in supported paths.
 4. Regression tests that run without GPUs for pure math/routing/config logic,
    plus CUDA-gated synthetic parity tests for Rust versus C++ where available.
 5. Documentation of the supported configurations and explicit failure modes.
@@ -80,7 +88,7 @@ optimizer step.
 # Out Of Scope
 
 - Replacing tch-rs or redesigning unrelated Qwen/DeepSeek engines.
-- Production deployment, GPU cluster operations, or publishing a PR.
+- Production deployment, merging the draft PR, or convergence claims.
 - Claiming full-model convergence without a real GLM-5.2 checkpoint run.
 
 # Deliverables
@@ -116,8 +124,9 @@ cross-boundary targets are included, and all ranks agree on loss.
 Observable outcome: training summaries report measured initial/final losses and
 adapter tensors change when a trainable fixture is run.
 
-Acceptance: CPU synthetic checks pass; a documented CUDA smoke command is
-provided and its unavailable environment is reported without false success.
+Acceptance: CPU synthetic checks and CUDA-gated MTP fusion tests pass; the
+documented multi-rank checkpoint smoke records its exact topology, checkpoint
+provenance, completed stages, and any failure without overstating parity.
 
 # Dependency Constraints
 
@@ -145,8 +154,11 @@ run cross-path tests and a fresh independent review.
   and routed experts. TP follows Megatron's column/row-parallel tensor layouts.
   The extra-layer EP kernel performs stable token dispatch to expert owners and
   an inverse return; routed output is not reconstructed with an all-reduce over
-  zero-filled full-token buffers. This kernel is not promoted as a supported EP
-  session until the frozen trunk uses the same owner-dispatch contract.
+  zero-filled full-token buffers. The trunk and extra layer use the same
+  autograd-aware owner-dispatch/return contract in EP-only training.
+- Teacher-forced native MTP is an independent full DSA indexer layer. It uses
+  the extra decoder layer's own indexer weights, computes fresh causal
+  `[batch, seq, actual_topk]` state, and never inherits trunk IndexShare state.
 - `index_share_for_mtp_iteration` controls top-k reuse across autoregressive
   draft iterations. It does not permit reusing an unrelated trunk-layer top-k
   state during teacher-forced training.
@@ -173,11 +185,10 @@ kernel distinguishes routed expert shards from replicated shared/attention/LoRA
 parameters; no single world-group scaling rule may be used for both. Router
 decisions are made in global expert coordinates before dispatch, routing
 weights are applied once, and the shared expert is evaluated once on the
-originating token rank. These rules are also the promotion contract for the
-currently incompatible trunk EP path.
+originating token rank. The trunk and native MTP layer both follow these rules.
 
 The gradient-accumulation promotion contract is explicit. Across microbatch
-`j`, the future loop must preserve base and MTP numerators/counts and scale the
+`j`, the loop preserves base and MTP numerators/counts and scales the
 MTP contribution as `lambda * (N_j / N'_j) * MTP_sum_j`; the optimizer-visible
 loss is divided once by `sum_j N_j`. A mean of per-microbatch means is not
 accepted as equivalent. The GLM5 sessions carry these numerator/count tensors
@@ -215,8 +226,9 @@ through the optimizer step.
   exchange directories because no file-only protocol can disambiguate two live
   processes claiming the same rank without a launcher-provided job identity.
 - A fused CUDA linear-CE/online-vocabulary reduction remains a follow-up
-  optimization: this environment has no visible GPU or CUDA compiler, so no
-  throughput or peak-memory claim is made here.
+  optimization. The implemented CE uses one coarse C++ call with a
+  single-chunk fast path and chunked fallback; no unsupported throughput claim
+  is inferred from functional smoke tests.
 
 ## Expert cache policy
 
@@ -226,26 +238,36 @@ through the optimizer step.
 - `train.predequant_expert_weights` defaults to `true`. This converts cached FP8
   expert matrices once at startup and avoids repeated dequantization in
   `safe_linear`, but requires approximately BF16-sized expert storage.
-- Setting `predequant_expert_weights = false` retains the checkpoint's FP8
-  matrices and scales on device. The C++ linear path then dequantizes on demand;
-  this trades throughput for enough capacity to run large expert shards.
+- Setting `predequant_expert_weights = false` retains routed FP8 expert matrices
+  and scales on CPU. The checkpointed trunk stages and dequantizes selected
+  experts inside one C++ layer call, releasing forward temporaries before
+  backward recomputation. The native extra layer uses the same CPU staging but
+  is a single direct descriptor call rather than an outer checkpointed layer.
 
 # Validation Limits
 
-- No real GLM-5.2 checkpoint, CUDA device, or multi-rank NCCL runtime is
-  available in this checkout, so numerical parity and convergence are not
-  claimed.
-- No CUDA parity run has exercised multi-rank TP or EP MTP against a real
-  checkpoint. Combined TP+EP is additionally blocked by independent process
-  groups and sequence-parallel token movement. CPU
-  reference tests cover the extra-token contract,
-  target/mask roll, valid-token count, loss scaling, TP decomposition, stable
-  EP permutation/inverse permutation, and unsupported CP topology. Multi-GPU
-  numerical parity remains a promotion gate; the absence of hardware is stated
-  explicitly rather than replaced by a throughput or convergence claim.
+- Local `cargo check -p rustrain-glm5 --tests` and `git diff --check` pass.
+  Linking local test binaries is unavailable because this development host does
+  not expose `libcudart`; CUDA tests run on the H20 host instead.
+- CUDA regression tests on H20 pass for the fused native-MTP descriptor chain
+  (`prepare -> decoder -> postprocess/CE -> backward`) and the fallible
+  checkpoint callback, including gradient propagation and callback errors.
+- An eight-rank H20 EP smoke (`TP=CP=1`, sequence length 64) used the local
+  78-layer FP8 checkpoint at `/mnt/workspace/glm5_local/step51_fp8` plus one
+  native MTP layer. Every rank loaded 16,329 tensors, retained 14,592 routed
+  expert tensors as `cpu_fp8_staged`, completed trunk and MTP forward/backward,
+  synchronized a finite optimizer step, and saved its adapter. All ranks
+  reported identical base loss `3.655280113` and MTP loss `3.563270807`; the
+  launcher reported `GLM5_TRAIN_SMOKE_PASS world_size=8`.
+- The checkpoint matches the target architecture but has not been independently
+  established as the official published GLM-5.2 checkpoint. Official-checkpoint
+  Megatron numerical parity and convergence are therefore not claimed.
+- Multi-rank TP-only numerical parity remains a promotion gate. Combined TP+EP
+  and native MTP with CP above one remain explicit unsupported boundaries.
 
 # Open Questions
 
-- Confirm GPU numerical parity for the native MTP layer against the official
-  checkpoint once the model shards and an appropriate multi-GPU host are
-  available.
+- Confirm numerical parity against Megatron with the official published
+  checkpoint, including a multi-rank TP-only run.
+- Profile the staged-expert and coarse C++ CE paths before making throughput or
+  peak-memory claims; functional smoke results are not performance benchmarks.

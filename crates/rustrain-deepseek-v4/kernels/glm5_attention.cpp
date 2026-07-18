@@ -1626,6 +1626,9 @@ static std::optional<at::Tensor> optional_tensor_at(void** tensors, int32_t inde
         : std::nullopt;
 }
 
+static at::Tensor distributed_sum_identity(const at::Tensor& input, void* comm,
+                                           int32_t group_size, const char* group_name);
+
 static at::Tensor moe_forward(
     const at::Tensor& mlp_input,
     void* shared_gate, void* shared_up, void* shared_down,
@@ -1638,7 +1641,8 @@ static at::Tensor moe_forward(
     int32_t n_group, int32_t topk_group, int32_t scoring_func,
     int32_t topk_method, int32_t norm_topk_prob,
     double routed_scaling_factor,
-    void* ep_comm, int32_t ep_rank, int32_t ep_size) {
+    void* ep_comm, int32_t ep_rank, int32_t ep_size,
+    void* tp_comm, int32_t tp_size) {
     TORCH_CHECK(mlp_input.dim() == 3, "MoE input must be [batch, seq, hidden]");
     TORCH_CHECK(shared_gate && shared_up && shared_down && gate_weight,
                 "required MoE tensor is null");
@@ -1652,6 +1656,10 @@ static at::Tensor moe_forward(
                 "invalid EP topology");
     TORCH_CHECK(ep_size == 1 || (ep_comm && mlp_input.is_cuda()),
                 "multi-rank EP MoE requires a CUDA NCCL communicator");
+    TORCH_CHECK(tp_size > 0 && (tp_size == 1 || (tp_comm && mlp_input.is_cuda())),
+                "multi-rank expert TP requires a CUDA NCCL communicator");
+    TORCH_CHECK(tp_size == 1 || ep_size == 1,
+                "combined expert TP+EP is unsupported by this MoE kernel");
     TORCH_CHECK(n_local_experts == 0 ||
                 (local_expert_indices && expert_gate_weights && expert_up_weights && expert_down_weights),
                 "local expert arrays are null");
@@ -1668,12 +1676,17 @@ static at::Tensor moe_forward(
     auto sg_scale = shared_gate_scale ? std::optional<at::Tensor>(*reinterpret_cast<at::Tensor*>(shared_gate_scale)) : std::nullopt;
     auto su_scale = shared_up_scale ? std::optional<at::Tensor>(*reinterpret_cast<at::Tensor*>(shared_up_scale)) : std::nullopt;
     auto sd_scale = shared_down_scale ? std::optional<at::Tensor>(*reinterpret_cast<at::Tensor*>(shared_down_scale)) : std::nullopt;
-    auto shared_output = safe_linear(
-        at::silu(safe_linear(mlp_input, sg, sg_scale)) * safe_linear(mlp_input, su, su_scale),
+    auto parallel_input = tp_size == 1
+        ? mlp_input
+        : Glm5NcclIdentityAllReduceBackward::apply(
+              mlp_input, static_cast<int64_t>(reinterpret_cast<intptr_t>(tp_comm)));
+    auto shared_local = safe_linear(
+        at::silu(safe_linear(parallel_input, sg, sg_scale)) *
+            safe_linear(parallel_input, su, su_scale),
         sd, sd_scale);
 
     auto& gate_w = *reinterpret_cast<at::Tensor*>(gate_weight);
-    auto logits = safe_linear(mlp_input, gate_w, std::nullopt).to(at::kFloat);
+    auto logits = safe_linear(parallel_input, gate_w, std::nullopt).to(at::kFloat);
     at::Tensor scores;
     if (scoring_func == 0) scores = at::sigmoid(logits);
     else if (scoring_func == 1) scores = at::softmax(logits, -1, at::kFloat);
@@ -1717,7 +1730,7 @@ static at::Tensor moe_forward(
     }
     topk_weights = topk_weights * routed_scaling_factor;
 
-    auto flat_input = mlp_input.reshape({batch * seq, hidden});
+    auto flat_input = parallel_input.reshape({batch * seq, hidden});
     auto tk_indices = topk_indices.reshape({batch * seq, topk});
     auto tk_weights = topk_weights.reshape({batch * seq, topk});
     at::Tensor expert_input;
@@ -1791,7 +1804,7 @@ static at::Tensor moe_forward(
     }
     auto routed = (returned * tk_weights.to(dtype).unsqueeze(-1)).sum(1)
         .reshape({batch, seq, hidden});
-    return routed + shared_output;
+    return distributed_sum_identity(routed + shared_local, tp_comm, tp_size, "expert TP");
 }
 
 void* v4_glm5_moe_layer(
@@ -1822,10 +1835,51 @@ void* v4_glm5_moe_layer(
             expert_gate_scales, expert_up_scales, expert_down_scales,
             n_local_experts, local_expert_indices, n_routed_experts, topk,
             n_group, topk_group, scoring_func, topk_method, norm_topk_prob,
-            routed_scaling_factor, ep_comm, ep_rank, ep_size);
+            routed_scaling_factor, ep_comm, ep_rank, ep_size, nullptr, 1);
         return new at::Tensor(std::move(output));
     } catch (const std::exception& e) {
         set_glm5_error("v4_glm5_moe_layer", e);
+        return nullptr;
+    }
+}
+
+// Tensor-parallel routed experts use Megatron's expert-tensor-parallel
+// contract: gate/up are column-sharded, down is row-sharded, the copied input
+// sums gradients in backward, and the partial down projection sums in forward.
+// EP is deliberately fixed to one here; combined TP+EP needs independent
+// expert-TP and expert-EP communicators and is rejected by the Rust session.
+void* v4_glm5_moe_layer_tp(
+    void* mlp_input_ptr,
+    void* shared_gate, void* shared_up, void* shared_down,
+    void* shared_gate_scale, void* shared_up_scale, void* shared_down_scale,
+    void* gate_weight, void* correction_bias,
+    void** expert_gate_weights, void** expert_up_weights, void** expert_down_weights,
+    void** expert_gate_scales, void** expert_up_scales, void** expert_down_scales,
+    int32_t n_local_experts, const int32_t* local_expert_indices,
+    int32_t n_routed_experts, int32_t topk,
+    int32_t n_group, int32_t topk_group, int32_t scoring_func,
+    int32_t topk_method, int32_t norm_topk_prob,
+    double routed_scaling_factor,
+    void* tp_comm, int32_t tp_size,
+    int32_t device_id) {
+    try {
+        g_glm5_last_error.clear();
+        TORCH_CHECK(mlp_input_ptr, "MoE input is null");
+        auto& mlp_input = *reinterpret_cast<at::Tensor*>(mlp_input_ptr);
+        TORCH_CHECK(!mlp_input.is_cuda() || mlp_input.device().index() == device_id,
+                    "MoE input device does not match device_id");
+        auto output = moe_forward(
+            mlp_input, shared_gate, shared_up, shared_down,
+            shared_gate_scale, shared_up_scale, shared_down_scale, gate_weight,
+            correction_bias,
+            expert_gate_weights, expert_up_weights, expert_down_weights,
+            expert_gate_scales, expert_up_scales, expert_down_scales,
+            n_local_experts, local_expert_indices, n_routed_experts, topk,
+            n_group, topk_group, scoring_func, topk_method, norm_topk_prob,
+            routed_scaling_factor, nullptr, 0, 1, tp_comm, tp_size);
+        return new at::Tensor(std::move(output));
+    } catch (const std::exception& e) {
+        set_glm5_error("v4_glm5_moe_layer_tp", e);
         return nullptr;
     }
 }
@@ -2047,7 +2101,7 @@ void* v4_glm5_layer_forward(
                 expert_gate_scales, expert_up_scales, expert_down_scales,
                 n_local_experts, local_expert_indices, n_routed_experts, topk,
                 1, 1, 0, 0, 1, routed_scaling_factor,
-                nullptr, 0, 1);
+                nullptr, 0, 1, nullptr, 1);
         } else {
             // Dense MLP
             auto& dg = *reinterpret_cast<at::Tensor*>(dense_gate);
@@ -2134,6 +2188,15 @@ static at::Tensor distributed_sum_identity(const at::Tensor& input, void* comm,
         input, static_cast<int64_t>(reinterpret_cast<intptr_t>(comm)));
 }
 
+static at::Tensor tp_identity_sum_backward(const at::Tensor& input, void* comm,
+                                           int32_t tp_size) {
+    if (tp_size == 1) return input;
+    TORCH_CHECK(tp_size > 1 && comm, "TP communicator is missing");
+    TORCH_CHECK(input.is_cuda(), "TP backward collective requires CUDA input");
+    return Glm5NcclIdentityAllReduceBackward::apply(
+        input, static_cast<int64_t>(reinterpret_cast<intptr_t>(comm)));
+}
+
 static std::pair<at::Tensor, at::Tensor> glm5_router(
     const at::Tensor& router_logits, const Glm5MtpDecoderDescriptor& d) {
     TORCH_CHECK(d.n_routed_experts > 0 && d.n_group > 0 &&
@@ -2198,17 +2261,22 @@ static at::Tensor glm5_mtp_attention(const at::Tensor& input,
     const int64_t vh = d.v_head, kvl = d.kv_lora;
     const int32_t device_id = input.is_cuda() ? input.device().index() : -1;
 
-    auto q_a = safe_linear(input, descriptor_tensor(d.q_a_proj, "q_a_proj"),
-                           descriptor_optional(d.q_a_scale));
-    auto q_an = rms_norm(q_a, descriptor_tensor(d.q_a_layernorm, "q_a_layernorm"), d.rms_eps);
+    auto q_a = tp_identity_sum_backward(
+        safe_linear(input, descriptor_tensor(d.q_a_proj, "q_a_proj"),
+                    descriptor_optional(d.q_a_scale)),
+        d.tp_comm, d.tp_size);
+    auto q_an = rms_norm(
+        q_a, descriptor_tensor(d.q_a_layernorm, "q_a_layernorm"), d.rms_eps);
     auto q = safe_linear(q_an, descriptor_tensor(d.q_b_proj, "q_b_proj"),
                          descriptor_optional(d.q_b_scale))
         .reshape({batch, seq, nh, qn + qr}).transpose(1, 2);
     auto q_nope = q.narrow(-1, 0, qn);
     auto q_rope = q.narrow(-1, qn, qr);
 
-    auto kv_a = safe_linear(input, descriptor_tensor(d.kv_a_proj, "kv_a_proj"),
-                            descriptor_optional(d.kv_a_scale));
+    auto kv_a = tp_identity_sum_backward(
+        safe_linear(input, descriptor_tensor(d.kv_a_proj, "kv_a_proj"),
+                    descriptor_optional(d.kv_a_scale)),
+        d.tp_comm, d.tp_size);
     auto kv_lora_raw = kv_a.narrow(-1, 0, kvl);
     auto k_rope = kv_a.narrow(-1, kvl, qr);
     auto kv_an = rms_norm(kv_lora_raw,
@@ -2381,8 +2449,15 @@ void* v4_glm5_mtp_decoder_layer(const Glm5MtpDecoderDescriptor* descriptor) {
         g_glm5_last_error.clear();
         TORCH_CHECK(descriptor, "MTP decoder descriptor is null");
         const auto& d = *descriptor;
-        TORCH_CHECK(d.tp_size > 0 && d.cp_size > 0 && d.ep_size > 0,
-                    "MTP parallel sizes must be positive");
+        TORCH_CHECK(d.tp_size > 0 && d.ep_size > 0,
+                    "native MTP TP/EP sizes must be positive");
+        TORCH_CHECK(d.cp_size == 1 && d.cp_rank == 0,
+                    "native MTP does not support context parallelism; "
+                    "expected cp_rank=0 and cp_size=1");
+        TORCH_CHECK(d.ep_rank >= 0 && d.ep_rank < d.ep_size,
+                    "native MTP EP rank is outside the EP group");
+        TORCH_CHECK(d.tp_size == 1 || d.ep_size == 1,
+                    "native MTP does not support combined tensor and expert parallelism");
         auto hidden = descriptor_tensor(d.hidden, "hidden");
         auto normalized = rms_norm(hidden,
             descriptor_tensor(d.input_norm_weight, "input_norm_weight"), d.rms_eps);
@@ -2395,23 +2470,22 @@ void* v4_glm5_mtp_decoder_layer(const Glm5MtpDecoderDescriptor* descriptor) {
         if (d.is_moe_layer) {
             TORCH_CHECK(d.gate_weight && d.shared_gate && d.shared_up && d.shared_down,
                         "MTP MoE weights are incomplete");
-            auto shared_input = d.tp_size == 1
+            auto parallel_input = d.tp_size == 1
                 ? mlp_input
                 : Glm5NcclIdentityAllReduceBackward::apply(
                       mlp_input, static_cast<int64_t>(reinterpret_cast<intptr_t>(d.tp_comm)));
             auto shared_local = safe_linear(
-                at::silu(safe_linear(shared_input, descriptor_tensor(d.shared_gate, "shared_gate"),
+                at::silu(safe_linear(parallel_input, descriptor_tensor(d.shared_gate, "shared_gate"),
                                      descriptor_optional(d.shared_gate_scale))) *
-                safe_linear(shared_input, descriptor_tensor(d.shared_up, "shared_up"),
+                safe_linear(parallel_input, descriptor_tensor(d.shared_up, "shared_up"),
                             descriptor_optional(d.shared_up_scale)),
                 descriptor_tensor(d.shared_down, "shared_down"),
                 descriptor_optional(d.shared_down_scale));
-            auto shared = distributed_sum_identity(shared_local, d.tp_comm, d.tp_size, "TP");
-            auto router_logits = safe_linear(mlp_input,
+            auto router_logits = safe_linear(parallel_input,
                 descriptor_tensor(d.gate_weight, "gate_weight"), std::nullopt);
             auto [weights, indices] = glm5_router(router_logits, d);
             const int64_t hidden_size = mlp_input.size(-1);
-            auto flat = mlp_input.reshape({-1, hidden_size});
+            auto flat = parallel_input.reshape({-1, hidden_size});
             at::Tensor expert_input;
             at::Tensor expert_ids;
             at::Tensor send_counts;
@@ -2490,7 +2564,8 @@ void* v4_glm5_mtp_decoder_layer(const Glm5MtpDecoderDescriptor* descriptor) {
                 routed = (returned * weights.to(hidden.scalar_type()).unsqueeze(-1))
                     .sum(1).reshape_as(mlp_input);
             }
-            mlp_output = routed + shared;
+            mlp_output = distributed_sum_identity(
+                routed + shared_local, d.tp_comm, d.tp_size, "expert TP");
         } else {
             TORCH_CHECK(d.dense_gate && d.dense_up && d.dense_down,
                         "MTP dense MLP weights are incomplete");
@@ -2510,6 +2585,20 @@ void* v4_glm5_mtp_decoder_layer(const Glm5MtpDecoderDescriptor* descriptor) {
         return new at::Tensor(residual + mlp_output);
     } catch (const std::exception& e) {
         set_glm5_error("v4_glm5_mtp_decoder_layer", e);
+        return nullptr;
+    }
+}
+
+void* v4_glm5_tp_identity_allreduce_backward(
+    void* input_ptr, void* tp_comm, int32_t tp_size) {
+    try {
+        g_glm5_last_error.clear();
+        TORCH_CHECK(input_ptr, "TP identity input is null");
+        auto& input = *reinterpret_cast<at::Tensor*>(input_ptr);
+        auto output = tp_identity_sum_backward(input, tp_comm, tp_size);
+        return new at::Tensor(std::move(output));
+    } catch (const std::exception& e) {
+        set_glm5_error("v4_glm5_tp_identity_allreduce_backward", e);
         return nullptr;
     }
 }

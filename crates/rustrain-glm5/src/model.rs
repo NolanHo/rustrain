@@ -333,12 +333,13 @@ fn default_true() -> bool {
 
 fn derive_indexer_types(num_layers: usize, topk_freq: i64, skip_topk_offset: i64) -> Vec<String> {
     let freq = topk_freq.max(1);
+    let offset = skip_topk_offset.max(1);
     (0..num_layers)
         .map(|layer| {
             // Megatron evaluates max(layer_number - offset, 0) % freq on
             // 1-indexed layer numbers. HF exposes the same schedule in its
             // zero-indexed `indexer_types` list.
-            let phase = (layer as i64 + 1 - skip_topk_offset).max(0);
+            let phase = (layer as i64 + 1 - offset).max(0);
             if phase % freq == 0 {
                 "full".to_string()
             } else {
@@ -356,10 +357,10 @@ pub fn read_glm5_config(path: &Path) -> Result<Glm5RuntimeConfig> {
 
     let n_layers = c.num_hidden_layers;
     let index_topk_freq = c.index_topk_freq.unwrap_or(1);
-    let index_skip_topk_offset = c.index_skip_topk_offset.unwrap_or(2);
-    let indexer_types = c.indexer_types.unwrap_or_else(|| {
-        derive_indexer_types(n_layers, index_topk_freq, index_skip_topk_offset)
-    });
+    let index_skip_topk_offset = c.index_skip_topk_offset.unwrap_or(0);
+    let indexer_types = c
+        .indexer_types
+        .unwrap_or_else(|| derive_indexer_types(n_layers, index_topk_freq, index_skip_topk_offset));
     let mlp_layer_types = c.mlp_layer_types.unwrap_or_else(|| {
         // Default: first_k_dense_replace layers are "dense", rest are "sparse"
         let mut v = vec!["dense".to_string(); n_layers];
@@ -988,9 +989,9 @@ pub fn glm5_dsa_attention(
                 weights_proj,
                 indexer_weights.indexer_weights_proj_scale.as_ref(),
             )
-                .reshape([batch, seq, idx_n_heads])
-                .transpose(1, 2)
-                .to_kind(Kind::Float)
+            .reshape([batch, seq, idx_n_heads])
+            .transpose(1, 2)
+            .to_kind(Kind::Float)
                 * ((idx_n_heads * idx_head_dim) as f64).sqrt().recip();
 
             let causal_mask = |k_start: i64, k_len: i64| {
@@ -1947,6 +1948,14 @@ mod tests {
         for layer in [3, 4, 5, 75, 76, 77] {
             assert_eq!(types[layer], "shared");
         }
+
+        let zero_offset = derive_indexer_types(8, 4, 0);
+        let zero_offset_compute: Vec<_> = zero_offset
+            .iter()
+            .enumerate()
+            .filter_map(|(layer, kind)| (kind == "full").then_some(layer))
+            .collect();
+        assert_eq!(zero_offset_compute, vec![0, 4]);
     }
 
     #[test]

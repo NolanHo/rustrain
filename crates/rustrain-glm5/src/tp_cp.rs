@@ -699,36 +699,33 @@ impl Glm5TpAttentionWeights {
         let indexer_k_norm_bias = weights
             .get(&format!("{p}.indexer.k_norm.bias"))
             .map(|t| t.to_kind(kind));
-        let weights_proj_scale = weights.get(&format!(
-            "{p}.indexer.weights_proj.weight_scale_inv"
-        ));
-        let (indexer_weights_proj, indexer_weights_proj_scale) = match weights
-            .get(&format!("{p}.indexer.weights_proj.weight"))
-        {
-            Some(weight) if weight.kind() == Kind::Float8e4m3fn && tp.tp_size > 1 => {
-                let scale = weights_proj_scale
-                    .context("FP8 TP indexer weights_proj is missing weight_scale_inv")?;
-                let full = rustrain_deepseek_v4::fp8_kernel::dequant_fp8_weight(weight, scale)
-                    .context("failed to dequantize FP8 TP indexer weights_proj")?;
-                (
-                    Some(full.narrow(0, tp.idx_head_start, tp.idx_heads_per_rank)),
-                    None,
-                )
-            }
-            Some(weight) => {
-                let weight = weight.keep_if_fp8(kind);
-                let weight = if tp.tp_size > 1 {
-                    weight.narrow(0, tp.idx_head_start, tp.idx_heads_per_rank)
-                } else {
-                    weight
-                };
-                (
-                    Some(weight),
-                    weights_proj_scale.map(|scale| scale.shallow_clone()),
-                )
-            }
-            None => (None, None),
-        };
+        let weights_proj_scale = weights.get(&format!("{p}.indexer.weights_proj.weight_scale_inv"));
+        let (indexer_weights_proj, indexer_weights_proj_scale) =
+            match weights.get(&format!("{p}.indexer.weights_proj.weight")) {
+                Some(weight) if weight.kind() == Kind::Float8e4m3fn && tp.tp_size > 1 => {
+                    let scale = weights_proj_scale
+                        .context("FP8 TP indexer weights_proj is missing weight_scale_inv")?;
+                    let full = rustrain_deepseek_v4::fp8_kernel::dequant_fp8_weight(weight, scale)
+                        .context("failed to dequantize FP8 TP indexer weights_proj")?;
+                    (
+                        Some(full.narrow(0, tp.idx_head_start, tp.idx_heads_per_rank)),
+                        None,
+                    )
+                }
+                Some(weight) => {
+                    let weight = weight.keep_if_fp8(kind);
+                    let weight = if tp.tp_size > 1 {
+                        weight.narrow(0, tp.idx_head_start, tp.idx_heads_per_rank)
+                    } else {
+                        weight
+                    };
+                    (
+                        Some(weight),
+                        weights_proj_scale.map(|scale| scale.shallow_clone()),
+                    )
+                }
+                None => (None, None),
+            };
 
         // FP8 scales
         let q_a_proj_scale = weights
@@ -957,6 +954,17 @@ pub fn glm5_dsa_attention_tp_cp(
 
     // ── Q/K/V projections (TP-sharded) ──
     let q_a = glm5_safe_linear(input, &attn.q_a_proj, attn.q_a_proj_scale.as_ref());
+    // q_a feeds both TP-sharded q_b and the TP-sharded DSA indexer query.
+    let q_a = if tp.tp_size > 1 {
+        rustrain_deepseek_v4::fp8_kernel::glm5_tp_identity_allreduce_backward_cpp(
+            &q_a,
+            tp_comm.map_or(std::ptr::null_mut(), |comm| comm.raw_comm_ptr()),
+            tp.tp_size as i32,
+        )
+        .expect("validated GLM-5 TP q_a output mapping")
+    } else {
+        q_a
+    };
     let q_a_normed = rms_norm(
         &q_a,
         &attn.q_a_layernorm.to_kind(compute_kind),
@@ -975,6 +983,18 @@ pub fn glm5_dsa_attention_tp_cp(
         &attn.kv_a_proj_with_mqa,
         attn.kv_a_proj_scale.as_ref(),
     );
+    // The replicated kv_a projection splits into a TP-sharded kv_b branch and
+    // a RoPE key branch consumed by every local head. Sum both dgrad branches.
+    let kv_a = if tp.tp_size > 1 {
+        rustrain_deepseek_v4::fp8_kernel::glm5_tp_identity_allreduce_backward_cpp(
+            &kv_a,
+            tp_comm.map_or(std::ptr::null_mut(), |comm| comm.raw_comm_ptr()),
+            tp.tp_size as i32,
+        )
+        .expect("validated GLM-5 TP kv_a output mapping")
+    } else {
+        kv_a
+    };
     let kv_lora_raw = kv_a.narrow(-1, 0, kv_lora);
     let k_rope = kv_a.narrow(-1, kv_lora, qk_rope);
     let kv_lora_part = rms_norm(
@@ -1082,9 +1102,9 @@ pub fn glm5_dsa_attention_tp_cp(
                 weights_proj,
                 indexer_weights.indexer_weights_proj_scale.as_ref(),
             )
-                .reshape([batch, s_local, idx_nh_local])
-                .transpose(1, 2)
-                .to_kind(Kind::Float)
+            .reshape([batch, s_local, idx_nh_local])
+            .transpose(1, 2)
+            .to_kind(Kind::Float)
                 * ((config.index_n_heads * idx_head_dim) as f64)
                     .sqrt()
                     .recip();

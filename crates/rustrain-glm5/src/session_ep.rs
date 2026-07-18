@@ -906,8 +906,12 @@ pub fn train_glm5_lora_sft_ep(
     // The C++ attention path remains single-rank because its full-layer ABI has
     // no sequence-parallel/EP group descriptors. The standalone C++ MoE path,
     // however, owns differentiable EP dispatch/return and is safe for EP-only.
+    let cpp_kernel_available = rustrain_deepseek_v4::fp8_kernel::is_glm5_attention_available();
+    // The standalone MoE kernel does not consume RoPE state. YaRN only gates
+    // the coarse full-attention path, not CPU-staged expert execution.
+    let use_cpp_mlp = cpp_kernel_available && cpp_router_supported;
     let use_cpp_attention = config.train.predequant_expert_weights
-        && rustrain_deepseek_v4::fp8_kernel::is_glm5_attention_available()
+        && cpp_kernel_available
         && world_size == 1
         && runtime_config
             .rope_scaling_type
@@ -915,22 +919,15 @@ pub fn train_glm5_lora_sft_ep(
             .is_none_or(|kind| kind == "default")
         && cpp_router_supported;
     if use_cpp_attention {
-        info!(
-            rank,
-            "C++ GLM5 attention kernel available — using coarse-grained C++ path"
-        );
+        info!(rank, "using coarse-grained C++ GLM5 attention path");
     } else {
         info!(
             rank,
-            "C++ GLM5 attention kernel not available — using Rust tch-rs path"
+            cpp_kernel_available,
+            standalone_cpp_moe = use_cpp_mlp,
+            "using Rust tch-rs attention path"
         );
     }
-    let use_cpp_mlp = rustrain_deepseek_v4::fp8_kernel::is_glm5_attention_available()
-        && runtime_config
-            .rope_scaling_type
-            .as_deref()
-            .is_none_or(|kind| kind == "default")
-        && cpp_router_supported;
     if !config.train.predequant_expert_weights && !use_cpp_mlp {
         bail!(
             "GLM-5 CPU-staged FP8 experts require the compiled C++ MoE kernel; set train.predequant_expert_weights=true only when the complete expert shard fits on each GPU"
