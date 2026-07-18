@@ -2190,6 +2190,7 @@ struct TrainingContext {
         // accumulator tensors are intentionally shared by value when chunk
         // registry guards copy adapters, so their contents survive restore.
         std::map<int64_t, std::vector<std::array<at::Tensor, 2>>> grad_accum;
+        at::Tensor grad_slab;
     };
 
     std::vector<LoRAAdapter> adapters;
@@ -2218,6 +2219,7 @@ struct TrainingContext {
     // tensors to preserve the positional LoRA ABI without extra allocation.
     std::vector<at::Tensor> grad_accum_a;
     std::vector<at::Tensor> grad_accum_b;
+    at::Tensor fixed_grad_slab;
     std::vector<uint8_t> lora_active;
     std::vector<int64_t> lora_layer_offset;
     double lora_scaling;
@@ -2363,6 +2365,7 @@ static void hash_adapter_layout(
             hash_tensor_layout(hash, pair[1]);
         }
     }
+    hash_tensor_layout(hash, adapter.grad_slab);
 }
 
 static void hash_collective_topology(
@@ -2379,6 +2382,7 @@ static void hash_collective_topology(
     hash.add_u64(env_enabled("QWEN36_EP_A2A"));
     hash.add_u64(env_enabled("QWEN36_EP_A2A_SHARDED"));
     hash.add_u64(env_enabled("QWEN36_GROUPED_LORA_SYNC", true));
+    hash.add_u64(env_enabled("QWEN36_GRAD_SLAB", true));
 }
 
 static void validate_adapter_collective_registry(
@@ -2496,6 +2500,7 @@ static void validate_fixed_collective_registry(
         if (index < ctx->grad_accum_b.size())
             hash_tensor_layout(hash, ctx->grad_accum_b[index]);
     }
+    hash_tensor_layout(hash, ctx->fixed_grad_slab);
 
     constexpr uint64_t kPositiveInt64Mask =
         static_cast<uint64_t>(std::numeric_limits<int64_t>::max());
@@ -2694,6 +2699,7 @@ static void clear_adapter_gradient_accumulators(
     TrainingContext::LoRAAdapter& adapter
 ) {
     at::NoGradGuard guard;
+    if (adapter.grad_slab.defined()) adapter.grad_slab.zero_();
     for (auto& [layer_idx, pairs] : adapter.params) {
         auto accum_it = adapter.grad_accum.find(layer_idx);
         for (size_t i = 0; i < pairs.size(); ++i) {
@@ -2701,7 +2707,7 @@ static void clear_adapter_gradient_accumulators(
             if (a.grad().defined()) a.mutable_grad() = at::Tensor();
             if (b.grad().defined()) b.mutable_grad() = at::Tensor();
             if (accum_it != adapter.grad_accum.end() &&
-                i < accum_it->second.size()) {
+                i < accum_it->second.size() && !adapter.grad_slab.defined()) {
                 if (accum_it->second[i][0].defined()) accum_it->second[i][0].zero_();
                 if (accum_it->second[i][1].defined()) accum_it->second[i][1].zero_();
             }
@@ -2715,14 +2721,17 @@ static void clear_gradient_accumulators(TrainingContext* ctx) {
     for (auto& adapter : ctx->adapters) {
         clear_adapter_gradient_accumulators(adapter);
     }
+    if (ctx->fixed_grad_slab.defined()) ctx->fixed_grad_slab.zero_();
     for (size_t i = 0; i < ctx->lora_a.size(); ++i) {
         if (ctx->lora_a[i].grad().defined())
             ctx->lora_a[i].mutable_grad() = at::Tensor();
         if (ctx->lora_b[i].grad().defined())
             ctx->lora_b[i].mutable_grad() = at::Tensor();
-        if (i < ctx->grad_accum_a.size() && ctx->grad_accum_a[i].defined())
+        if (!ctx->fixed_grad_slab.defined() &&
+            i < ctx->grad_accum_a.size() && ctx->grad_accum_a[i].defined())
             ctx->grad_accum_a[i].zero_();
-        if (i < ctx->grad_accum_b.size() && ctx->grad_accum_b[i].defined())
+        if (!ctx->fixed_grad_slab.defined() &&
+            i < ctx->grad_accum_b.size() && ctx->grad_accum_b[i].defined())
             ctx->grad_accum_b[i].zero_();
     }
     ctx->group_inputs.clear();
@@ -2898,6 +2907,120 @@ static LoraTpLayout lora_tp_layout(
          name == "experts_down_proj"))
         return LoraTpLayout::RowParallel;
     return LoraTpLayout::LatentRank;
+}
+
+struct LoraGradientSlabBinding {
+    at::Tensor* accumulator = nullptr;
+    const at::Tensor* parameter = nullptr;
+    uint8_t bucket_key = 0;
+    int64_t offset = 0;
+};
+
+static uint8_t lora_gradient_bucket_key(
+    const TrainingContext* ctx, int64_t layer, int64_t pair, bool is_a
+) {
+    const auto table = lora_projection_table(ctx->layer_configs[layer]);
+    const bool grouped_expert = table.entries[pair].grouped_expert;
+    const auto layout = lora_tp_layout(ctx, layer, pair);
+    const bool tp_replicated =
+        (layout == LoraTpLayout::ColumnParallel && is_a) ||
+        (layout == LoraTpLayout::RowParallel && !is_a);
+    return (grouped_expert ? 2 : 0) | (tp_replicated ? 1 : 0);
+}
+
+static void bind_lora_gradient_slab(
+    std::vector<LoraGradientSlabBinding>& bindings,
+    at::Tensor& slab
+) {
+    if (bindings.empty()) {
+        slab = at::Tensor();
+        return;
+    }
+    constexpr int64_t alignment = 64;
+    int64_t total = 0;
+    for (uint8_t key = 0; key < 4; ++key) {
+        total = ((total + alignment - 1) / alignment) * alignment;
+        for (auto& binding : bindings) {
+            if (binding.bucket_key != key) continue;
+            binding.offset = total;
+            total += binding.parameter->numel();
+        }
+    }
+    slab = at::zeros({total}, at::TensorOptions()
+        .dtype(at::kFloat).device(bindings.front().parameter->device()));
+    for (auto& binding : bindings) {
+        *binding.accumulator = slab.narrow(
+            0, binding.offset, binding.parameter->numel())
+            .view(binding.parameter->sizes());
+    }
+}
+
+static void bind_fixed_lora_gradient_slab(TrainingContext* ctx) {
+    if (!env_enabled("QWEN36_GRAD_SLAB", true)) {
+        for (size_t index = 0; index < ctx->lora_a.size(); ++index) {
+            if (!ctx->lora_active[index]) continue;
+            const auto options = at::TensorOptions().dtype(at::kFloat)
+                .device(ctx->lora_a[index].device());
+            ctx->grad_accum_a[index] = at::zeros(
+                ctx->lora_a[index].sizes(), options);
+            ctx->grad_accum_b[index] = at::zeros(
+                ctx->lora_b[index].sizes(), options);
+        }
+        return;
+    }
+    std::vector<LoraGradientSlabBinding> bindings;
+    for (int64_t layer = 0; layer < ctx->num_layers; ++layer) {
+        const int64_t offset = ctx->lora_layer_offset[layer];
+        const int64_t count = lora_pair_count(ctx->layer_configs[layer]);
+        for (int64_t pair = 0; pair < count; ++pair) {
+            const int64_t index = offset + pair;
+            if (!ctx->lora_active[index]) continue;
+            bindings.push_back({
+                &ctx->grad_accum_a[index], &ctx->lora_a[index],
+                lora_gradient_bucket_key(ctx, layer, pair, true), 0});
+            bindings.push_back({
+                &ctx->grad_accum_b[index], &ctx->lora_b[index],
+                lora_gradient_bucket_key(ctx, layer, pair, false), 0});
+        }
+    }
+    bind_lora_gradient_slab(bindings, ctx->fixed_grad_slab);
+}
+
+static void bind_adapter_lora_gradient_slab(
+    TrainingContext* ctx, TrainingContext::LoRAAdapter& adapter
+) {
+    if (!env_enabled("QWEN36_GRAD_SLAB", true)) {
+        for (auto& [layer, pairs] : adapter.params) {
+            auto& accumulators = adapter.grad_accum.at(layer);
+            for (size_t pair = 0; pair < pairs.size(); ++pair) {
+                auto& [a, b] = pairs[pair];
+                if (!a.requires_grad()) continue;
+                const auto options = at::TensorOptions().dtype(at::kFloat)
+                    .device(a.device());
+                accumulators[pair][0] = at::zeros(a.sizes(), options);
+                accumulators[pair][1] = at::zeros(b.sizes(), options);
+            }
+        }
+        return;
+    }
+    std::vector<LoraGradientSlabBinding> bindings;
+    for (auto& [layer, pairs] : adapter.params) {
+        auto accum_it = adapter.grad_accum.find(layer);
+        TORCH_CHECK(accum_it != adapter.grad_accum.end() &&
+                accum_it->second.size() == pairs.size(),
+            "dynamic LoRA gradient slab layout mismatch");
+        for (int64_t pair = 0; pair < static_cast<int64_t>(pairs.size()); ++pair) {
+            auto& [a, b] = pairs[pair];
+            if (!a.requires_grad()) continue;
+            bindings.push_back({
+                &accum_it->second[pair][0], &a,
+                lora_gradient_bucket_key(ctx, layer, pair, true), 0});
+            bindings.push_back({
+                &accum_it->second[pair][1], &b,
+                lora_gradient_bucket_key(ctx, layer, pair, false), 0});
+        }
+    }
+    bind_lora_gradient_slab(bindings, adapter.grad_slab);
 }
 
 static bool active_lora_targets_use_latent_rank_layout(
@@ -6197,11 +6320,8 @@ static void* qwen36_create_training_context_impl(
                 }
                 a.set_requires_grad(active);
                 b.set_requires_grad(active);
-                auto grad_opts = at::TensorOptions().dtype(at::kFloat).device(base->device());
-                ctx->grad_accum_a.push_back(
-                    active ? at::zeros(a.sizes(), grad_opts) : at::Tensor());
-                ctx->grad_accum_b.push_back(
-                    active ? at::zeros(b.sizes(), grad_opts) : at::Tensor());
+                ctx->grad_accum_a.push_back(at::Tensor());
+                ctx->grad_accum_b.push_back(at::Tensor());
                 ctx->lora_a.push_back(std::move(a));
                 ctx->lora_b.push_back(std::move(b));
                 ctx->lora_active.push_back(active ? 1 : 0);
@@ -6211,6 +6331,7 @@ static void* qwen36_create_training_context_impl(
             }
             offset += lora_count;
         }
+        bind_fixed_lora_gradient_slab(ctx);
 
         // Initialize Adam state (FP32 for numerical stability, even if params are BF16)
         for (size_t i = 0; i < ctx->lora_a.size(); i++) {
@@ -8619,11 +8740,8 @@ int64_t qwen36_add_lora(
                         at::empty(b.sizes(), opts_f32),
                         at::empty(b.sizes(), opts_f32)}
                     : std::array<at::Tensor, 6>{});
-                grad_accumulators.push_back(active
-                    ? std::array<at::Tensor, 2>{
-                        at::zeros(a.sizes(), opts_f32),
-                        at::zeros(b.sizes(), opts_f32)}
-                    : std::array<at::Tensor, 2>{at::Tensor(), at::Tensor()});
+                grad_accumulators.push_back(
+                    std::array<at::Tensor, 2>{at::Tensor(), at::Tensor()});
                 pairs.emplace_back(std::move(a), std::move(b));
             }
             adapter.params[i] = std::move(pairs);
@@ -8631,6 +8749,7 @@ int64_t qwen36_add_lora(
             adapter.adam_shadow[i] = std::move(adam_shadows);
             adapter.grad_accum[i] = std::move(grad_accumulators);
         }
+        bind_adapter_lora_gradient_slab(ctx, adapter);
         if (!ctx->restore_without_parameter_sync)
             synchronize_adapter_replicated_lora_parameters(ctx, adapter);
         int64_t id = adapter.id;
