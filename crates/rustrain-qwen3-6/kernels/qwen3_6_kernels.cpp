@@ -5390,9 +5390,11 @@ static at::Tensor forward_full_checkpoint(
     if (gs < 1) gs = 1;
     const char* gs_env = getenv("QWEN36_GROUP_SIZE");
     if (gs_env) { gs = atol(gs_env); if (gs < 1) gs = 1; }
-    fprintf(stderr, "[checkpoint] group_size=%ld (num_layers=%ld → %ld groups)\n",
-            (long)gs, (long)ctx->num_layers,
-            (long)((ctx->num_layers + gs - 1) / gs));
+    if (env_enabled("QWEN36_TRAIN_TRACE")) {
+        fprintf(stderr, "[checkpoint] group_size=%ld (num_layers=%ld → %ld groups)\n",
+                (long)gs, (long)ctx->num_layers,
+                (long)((ctx->num_layers + gs - 1) / gs));
+    }
 
     std::vector<std::pair<int64_t, int64_t>> groups;
     for (int64_t i = 0; i < ctx->num_layers; i += gs) {
@@ -7518,10 +7520,12 @@ static double qwen36_train_multi_lora_impl(
             }
             n_max = std::min(n_max, total_adapters);
             if (n_max < 1) n_max = 1;
-            fprintf(stderr,
-                "[train_multi] total=%ld n_max=%ld free=%.1fGB rank=%d\n",
-                (long)total_adapters, (long)n_max,
-                (double)free_mem / 1e9, lora_rank);
+            if (env_enabled("QWEN36_TRAIN_TRACE")) {
+                fprintf(stderr,
+                    "[train_multi] total=%ld n_max=%ld free=%.1fGB rank=%d\n",
+                    (long)total_adapters, (long)n_max,
+                    (double)free_mem / 1e9, lora_rank);
+            }
         }
 
         double total_loss = 0.0;
@@ -7638,8 +7642,10 @@ static double qwen36_train_multi_lora_impl(
             auto t_bwd_end = std::chrono::steady_clock::now();
             double bwd_ms = std::chrono::duration<double, std::milli>(t_bwd_end - t_bwd_start).count();
 
-            fprintf(stderr, "[train_multi] chunk %ld/%ld: n=%ld loss=%f  fwd=%.0fms loss=%.0fms bwd=%.0fms\n",
-                    (long)(chunk+1), (long)num_chunks, (long)n, loss_val, fwd_ms, loss_ms, bwd_ms);
+            if (env_enabled("QWEN36_TRAIN_TRACE")) {
+                fprintf(stderr, "[train_multi] chunk %ld/%ld: n=%ld loss=%f  fwd=%.0fms loss=%.0fms bwd=%.0fms\n",
+                        (long)(chunk+1), (long)num_chunks, (long)n, loss_val, fwd_ms, loss_ms, bwd_ms);
+            }
             }
 
             // Restore the complete registry before the next chunk. Gradients
@@ -7935,8 +7941,10 @@ static double qwen36_train_multi_lora_impl(
 
             if (!finalize_only) {
                 total_loss += loss_val;
-                fprintf(stderr, "[train_multi] chunk %ld/%ld: n=%ld loss=%.6f\n",
-                        (long)(chunk + 1), (long)num_chunks, (long)n, loss_val);
+                if (env_enabled("QWEN36_TRAIN_TRACE")) {
+                    fprintf(stderr, "[train_multi] chunk %ld/%ld: n=%ld loss=%.6f\n",
+                            (long)(chunk + 1), (long)num_chunks, (long)n, loss_val);
+                }
             }
         }
 
