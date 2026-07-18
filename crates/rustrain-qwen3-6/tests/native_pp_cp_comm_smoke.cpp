@@ -6,12 +6,29 @@
 #include <cstdio>
 #include <cstdlib>
 #include <string>
+#include <vector>
+
+struct LayerConfig {
+    int64_t layer_type, num_heads, num_kv_heads, head_dim;
+    int64_t num_k_heads, key_dim, num_v_heads, val_dim, conv_kernel;
+    double partial_rotary_factor, rope_theta, rms_eps;
+    int64_t num_experts, top_k, moe_intermediate, expert_start, expert_count;
+    int64_t intermediate_size;
+    int32_t norm_topk_prob;
+    void* nccl_comm;
+    void* nccl_stream;
+};
 
 extern "C" int64_t qwen36_kernel_abi_version();
 extern "C" void* qwen36_create_training_context(
     void**, int64_t, void*, void*, void*, void*, int64_t, int32_t,
     double, double, double, double, double, int64_t, double, int64_t,
     const int64_t*, int64_t, const char*);
+extern "C" void* qwen36_create_training_context_v2(
+    void**, int64_t, void*, void*, void*, void*, int64_t,
+    int64_t, int64_t, int32_t, int32_t,
+    double, double, double, double, double, int64_t, double, int64_t,
+    const int64_t*, int64_t, const char*, int32_t);
 extern "C" int32_t qwen36_init_parallel_nccl_v2(
     void*, int32_t, int32_t,
     int32_t, int32_t, int32_t,
@@ -29,6 +46,8 @@ extern "C" int32_t qwen36_attach_parallel_nccl_no_sync_v2(
 extern "C" double qwen36_parallel_max_double(void*, double);
 extern "C" double qwen36_train_step(void*, void*, void*, void*);
 extern "C" double qwen36_eval_step(void*, void*, void*, void*);
+extern "C" int64_t qwen36_get_lora_count(void*);
+extern "C" void* qwen36_get_lora_a(void*, int64_t);
 extern "C" void qwen36_free_training_context(void*);
 
 static void set_rank_environment(int rank, int cp_rank, int pp_rank) {
@@ -58,6 +77,24 @@ static void* create_empty_context(at::Tensor& embed, at::Tensor& norm,
         nullptr, 0, "");
 }
 
+static void* create_stage_context(
+    int pp_rank, at::Tensor& embed, at::Tensor& norm, at::Tensor& lm_head,
+    std::vector<at::Tensor>& weights, LayerConfig& config
+) {
+    std::vector<void*> weight_ptrs;
+    for (auto& weight : weights) weight_ptrs.push_back(&weight);
+    const int64_t target_layer = 0;
+    return qwen36_create_training_context_v2(
+        weight_ptrs.data(), static_cast<int64_t>(weight_ptrs.size()),
+        pp_rank == 0 ? &embed : nullptr,
+        pp_rank == 1 ? &norm : nullptr,
+        pp_rank == 1 ? &lm_head : nullptr,
+        &config, 1, pp_rank, 2, pp_rank == 0 ? 1 : 2,
+        static_cast<int32_t>(at::kBFloat16),
+        1.0, 1e-3, 0.9, 0.999, 1e-8, 4, 1e-6, 1,
+        &target_layer, 1, "q_proj", 0);
+}
+
 static int32_t initialize_five_axis_context(
     void* ctx, int rank, int cp_rank, int pp_rank, bool attach
 ) {
@@ -75,7 +112,7 @@ static int32_t initialize_five_axis_context(
 }
 
 int main() {
-    assert(qwen36_kernel_abi_version() == 26);
+    assert(qwen36_kernel_abi_version() == 27);
     const int rank = std::atoi(std::getenv("RANK"));
     const int local_rank = std::atoi(std::getenv("LOCAL_RANK"));
     assert(rank >= 0 && rank < 4);
@@ -88,6 +125,24 @@ int main() {
     auto embed = at::zeros({4, 4}, options);
     auto norm = at::ones({4}, options);
     auto lm_head = at::zeros({4, 4}, options);
+
+    std::vector<at::Tensor> stage_weights = {
+        at::ones({4}, options), at::ones({4}, options),
+        at::zeros({8, 4}, options), at::ones({4}, options),
+        at::zeros({4, 4}, options), at::ones({4}, options),
+        at::zeros({4, 4}, options), at::zeros({4, 4}, options),
+        at::zeros({8, 4}, options), at::zeros({8, 4}, options),
+        at::zeros({4, 8}, options),
+    };
+    LayerConfig stage_config{};
+    stage_config.layer_type = 0;
+    stage_config.num_heads = 1;
+    stage_config.num_kv_heads = 1;
+    stage_config.head_dim = 4;
+    stage_config.partial_rotary_factor = 1.0;
+    stage_config.rope_theta = 10000.0;
+    stage_config.rms_eps = 1e-6;
+    stage_config.intermediate_size = 8;
 
     void* premature_shadow = create_empty_context(embed, norm, lm_head);
     assert(premature_shadow);
@@ -122,6 +177,21 @@ int main() {
     assert(qwen36_train_step(context, nullptr, nullptr, nullptr) < 0.0);
     assert(qwen36_eval_step(context, nullptr, nullptr, nullptr) < 0.0);
 
+    void* stage_context = create_stage_context(
+        pp_rank, embed, norm, lm_head, stage_weights, stage_config);
+    assert(stage_context);
+    assert(initialize_five_axis_context(
+        stage_context, rank, cp_rank, pp_rank, true) == 0);
+    assert(qwen36_get_lora_count(stage_context) == 7);
+    auto* stage_lora_a = reinterpret_cast<at::Tensor*>(
+        qwen36_get_lora_a(stage_context, 0));
+    assert(stage_lora_a);
+    if (pp_rank == 0) {
+        assert(stage_lora_a->sizes() == at::IntArrayRef({1, 4}));
+    } else {
+        assert(stage_lora_a->dim() == 0);
+    }
+
     void* shadow = create_empty_context(embed, norm, lm_head);
     assert(shadow);
     assert(initialize_five_axis_context(
@@ -140,6 +210,7 @@ int main() {
         rank, cp_rank, pp_rank, maximum);
     qwen36_free_training_context(invalid);
     qwen36_free_training_context(shadow);
+    qwen36_free_training_context(stage_context);
     qwen36_free_training_context(context);
     return 0;
 }

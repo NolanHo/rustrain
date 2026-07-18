@@ -4,6 +4,7 @@
 //! Rust only handles: weight loading, data loading, training loop orchestration.
 
 use crate::lora::Qwen36LoraTargetModule;
+use crate::pipeline::PipelineStageLayout;
 use anyhow::{Context, Result, bail};
 use std::ffi::c_void;
 use std::sync::OnceLock;
@@ -19,6 +20,9 @@ type FnCreateCtx = unsafe extern "C" fn(
     *mut c_void,
     *mut c_void,
     i64,
+    i64,
+    i64,
+    i32,
     i32,
     f64,
     f64,
@@ -268,11 +272,11 @@ unsafe fn load_kernels() -> Option<KernelHandles> {
         }};
     }
     let abi_version: FnKernelAbiVersion = sym!("qwen36_kernel_abi_version");
-    if abi_version() != 26 {
+    if abi_version() != 27 {
         return None;
     }
     Some(KernelHandles {
-        create_ctx: sym!("qwen36_create_training_context_ex"),
+        create_ctx: sym!("qwen36_create_training_context_v2"),
         train_step: sym!("qwen36_train_step"),
         train_micro_step: sym!("qwen36_train_micro_step"),
         train_multi_lora_selected_v2: sym!("qwen36_train_multi_lora_selected_v2"),
@@ -603,9 +607,19 @@ pub fn build_weight_ptrs(
     weights: &std::collections::BTreeMap<String, Tensor>,
     config: &crate::config::Qwen36RuntimeConfig,
 ) -> Vec<*mut c_void> {
+    let stage = PipelineStageLayout::full(config.num_hidden_layers)
+        .expect("a full-model pipeline layout is always valid");
+    build_weight_ptrs_for_stage(weights, config, &stage)
+}
+
+pub fn build_weight_ptrs_for_stage(
+    weights: &std::collections::BTreeMap<String, Tensor>,
+    config: &crate::config::Qwen36RuntimeConfig,
+    stage: &PipelineStageLayout,
+) -> Vec<*mut c_void> {
     let p = &config.weight_prefix;
     let mut ptrs = Vec::new();
-    for layer in 0..config.num_hidden_layers {
+    for layer in stage.layer_range.clone() {
         let lp = format!("{p}layers.{layer}");
         ptrs.push(get_ptr(weights, &format!("{lp}.input_layernorm.weight")));
         ptrs.push(get_ptr(
@@ -679,7 +693,20 @@ pub fn build_layer_configs(
     expert_start: usize,
     expert_count: usize,
 ) -> Vec<CppLayerConfig> {
-    (0..config.num_hidden_layers)
+    let stage = PipelineStageLayout::full(config.num_hidden_layers)
+        .expect("a full-model pipeline layout is always valid");
+    build_layer_configs_for_stage(config, expert_start, expert_count, &stage)
+}
+
+pub fn build_layer_configs_for_stage(
+    config: &crate::config::Qwen36RuntimeConfig,
+    expert_start: usize,
+    expert_count: usize,
+    stage: &PipelineStageLayout,
+) -> Vec<CppLayerConfig> {
+    stage
+        .layer_range
+        .clone()
         .map(|layer| {
             let lt = &config.layer_types[layer];
             CppLayerConfig {
@@ -825,18 +852,86 @@ impl CppTrainingContext {
         expert_start: usize,
         expert_count: usize,
     ) -> Result<Self> {
-        let kh = get_kernels().ok_or_else(|| anyhow::anyhow!("kernels not loaded"))?;
-        let weight_ptrs = build_weight_ptrs(weights, config);
-        let layer_configs = build_layer_configs(config, expert_start, expert_count);
+        let stage = PipelineStageLayout::full(config.num_hidden_layers)?;
+        Self::new_for_stage(
+            weights,
+            config,
+            &stage,
+            compute_kind,
+            lr,
+            beta1,
+            beta2,
+            eps,
+            lora_scaling,
+            lora_rank,
+            base_tp_attention,
+            base_tp_mlp,
+            vocab_parallel,
+            data_parallel,
+            expert_parallel,
+            target_layers,
+            target_modules,
+            expert_start,
+            expert_count,
+        )
+    }
 
-        let embed_ptr = get_ptr(
+    /// Create a context that owns exactly one contiguous pipeline stage.
+    /// Target layers remain global IDs and are mapped to local slots by C++.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_for_stage(
+        weights: &std::collections::BTreeMap<String, Tensor>,
+        config: &crate::config::Qwen36RuntimeConfig,
+        stage: &PipelineStageLayout,
+        compute_kind: Kind,
+        lr: f64,
+        beta1: f64,
+        beta2: f64,
+        eps: f64,
+        lora_scaling: f64,
+        lora_rank: i64,
+        base_tp_attention: bool,
+        base_tp_mlp: bool,
+        vocab_parallel: bool,
+        data_parallel: bool,
+        expert_parallel: bool,
+        target_layers: &[usize],
+        target_modules: &[Qwen36LoraTargetModule],
+        expert_start: usize,
+        expert_count: usize,
+    ) -> Result<Self> {
+        if stage.global_num_layers != config.num_hidden_layers {
+            bail!(
+                "pipeline layout has {} global layers, but model config has {}",
+                stage.global_num_layers,
+                config.num_hidden_layers
+            );
+        }
+        let kh = get_kernels().ok_or_else(|| anyhow::anyhow!("kernels not loaded"))?;
+        let weight_ptrs = build_weight_ptrs_for_stage(weights, config, stage);
+        let layer_configs =
+            build_layer_configs_for_stage(config, expert_start, expert_count, stage);
+
+        let embedding_weight_ptr = get_ptr(
             weights,
             &format!("{}embed_tokens.weight", config.weight_prefix),
         );
-        let final_norm_ptr = get_ptr(weights, &format!("{}norm.weight", config.weight_prefix));
-        let lm_head_ptr = if config.tie_word_embeddings {
-            // Tied embeddings: use embed_tokens as lm_head
-            embed_ptr
+        let embed_ptr = if stage.is_first() {
+            embedding_weight_ptr
+        } else {
+            std::ptr::null_mut()
+        };
+        let final_norm_ptr = if stage.is_last() {
+            get_ptr(weights, &format!("{}norm.weight", config.weight_prefix))
+        } else {
+            std::ptr::null_mut()
+        };
+        let lm_head_ptr = if !stage.is_last() {
+            std::ptr::null_mut()
+        } else if config.tie_word_embeddings {
+            // Tied models duplicate the frozen vocabulary shard on the two
+            // boundary stages; the last stage receives it only as LM head.
+            embedding_weight_ptr
         } else {
             get_ptr(weights, "lm_head.weight")
         };
@@ -880,7 +975,10 @@ impl CppTrainingContext {
                 final_norm_ptr,
                 lm_head_ptr,
                 lc_ptr,
-                config.num_hidden_layers as i64,
+                stage.local_num_layers() as i64,
+                stage.layer_range.start as i64,
+                stage.global_num_layers as i64,
+                stage.native_flags(),
                 compute_type,
                 lora_scaling,
                 lr,

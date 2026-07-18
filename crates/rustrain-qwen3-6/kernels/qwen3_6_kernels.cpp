@@ -2487,6 +2487,10 @@ struct TrainingContext {
     at::ScalarType compute_type;
     int64_t vocab_size;
     double rms_eps;
+    int64_t global_layer_start = 0;
+    int64_t global_num_layers = 0;
+    bool is_first_pipeline_stage = true;
+    bool is_last_pipeline_stage = true;
 
     // MTP weights (optional)
     bool has_mtp;
@@ -6671,7 +6675,7 @@ static at::Tensor mtp_compute_loss(
 extern "C" {
 
 __attribute__((visibility("default"))) int64_t qwen36_kernel_abi_version() {
-    return 26;
+    return 27;
 }
 
 // Benchmark/metrics helper. Reducing over every orthogonal axis propagates the
@@ -6728,6 +6732,8 @@ static void* qwen36_create_training_context_impl(
     void** weight_ptrs, int64_t num_weight_ptrs,
     void* embed_ptr, void* final_norm_ptr, void* lm_head_ptr,
     void* layer_configs_ptr, int64_t num_layers,
+    int64_t global_layer_start, int64_t global_num_layers,
+    int32_t pipeline_stage_flags,
     int32_t compute_type,
     double lora_scaling, double lr, double beta1, double beta2, double eps,
     int64_t vocab_size, double rms_eps,
@@ -6744,6 +6750,24 @@ static void* qwen36_create_training_context_impl(
         ctx->vocab_size = vocab_size; ctx->rms_eps = rms_eps;
         ctx->fixed_optimizer_step = 0; ctx->lora_scaling = lora_scaling;
         ctx->num_layers = num_layers;
+        ctx->global_layer_start = global_layer_start;
+        ctx->global_num_layers = global_num_layers;
+        ctx->is_first_pipeline_stage = (pipeline_stage_flags & 1) != 0;
+        ctx->is_last_pipeline_stage = (pipeline_stage_flags & 2) != 0;
+        const bool communicator_only =
+            num_layers == 0 && global_num_layers == 0;
+        TORCH_CHECK(communicator_only || num_layers > 0,
+            "pipeline stage must own at least one layer");
+        TORCH_CHECK(global_layer_start >= 0 && global_num_layers >= num_layers &&
+                global_layer_start <= global_num_layers - num_layers,
+            "invalid pipeline layer range [", global_layer_start, ", ",
+            global_layer_start + num_layers, ") for ", global_num_layers,
+            " global layers");
+        TORCH_CHECK(ctx->is_first_pipeline_stage == (global_layer_start == 0),
+            "first-stage flag does not match the global layer range");
+        TORCH_CHECK(ctx->is_last_pipeline_stage ==
+                (global_layer_start + num_layers == global_num_layers),
+            "last-stage flag does not match the global layer range");
         ctx->base_tp_attention =
             (context_flags & QWEN36_CONTEXT_BASE_TP_ATTENTION) != 0;
         ctx->base_tp_mlp =
@@ -6848,6 +6872,18 @@ static void* qwen36_create_training_context_impl(
                     ctx->dp_rank >= 0 && ctx->dp_rank < ctx->dp_world_size &&
                     ctx->pp_rank >= 0 && ctx->pp_rank < ctx->pp_world_size,
             "parallel rank coordinates are outside their configured axes");
+        if (!communicator_only) {
+            const int64_t expected_stage_start =
+                global_num_layers * ctx->pp_rank / ctx->pp_world_size;
+            const int64_t expected_stage_end =
+                global_num_layers * (ctx->pp_rank + 1) / ctx->pp_world_size;
+            TORCH_CHECK(global_layer_start == expected_stage_start &&
+                    global_layer_start + num_layers == expected_stage_end,
+                "pipeline stage layer ownership mismatch for PP rank ",
+                ctx->pp_rank, ": received [", global_layer_start, ", ",
+                global_layer_start + num_layers, "), expected [",
+                expected_stage_start, ", ", expected_stage_end, ")");
+        }
         TORCH_CHECK(lora_rank > 0, "LoRA rank must be positive");
         if (const char* mtp_scale = getenv("QWEN36_MTP_LOSS_SCALE")) {
             ctx->mtp_loss_scale = std::strtod(mtp_scale, nullptr);
@@ -6858,9 +6894,18 @@ static void* qwen36_create_training_context_impl(
         for (int64_t i = 0; i < num_weight_ptrs; i++) {
             ctx->weight_ptrs.push_back(wp[i]);
         }
-        ctx->embed_ptr.push_back(reinterpret_cast<at::Tensor*>(embed_ptr));
-        ctx->final_norm_ptr.push_back(reinterpret_cast<at::Tensor*>(final_norm_ptr));
-        ctx->lm_head_ptr.push_back(reinterpret_cast<at::Tensor*>(lm_head_ptr));
+        auto* embed = reinterpret_cast<at::Tensor*>(embed_ptr);
+        auto* final_norm = reinterpret_cast<at::Tensor*>(final_norm_ptr);
+        auto* lm_head = reinterpret_cast<at::Tensor*>(lm_head_ptr);
+        TORCH_CHECK(ctx->is_first_pipeline_stage ? embed != nullptr : embed == nullptr,
+            "only the first pipeline stage may own the embedding weight");
+        TORCH_CHECK(ctx->is_last_pipeline_stage
+                ? final_norm != nullptr && lm_head != nullptr
+                : final_norm == nullptr && lm_head == nullptr,
+            "only the last pipeline stage may own final norm and LM-head weights");
+        ctx->embed_ptr.push_back(embed);
+        ctx->final_norm_ptr.push_back(final_norm);
+        ctx->lm_head_ptr.push_back(lm_head);
         if (ctx->vocab_parallel) {
             TORCH_CHECK(ctx->tp_world_size > 1,
                 "vocabulary parallelism requires TP_SIZE>1");
@@ -6869,16 +6914,18 @@ static void* qwen36_create_training_context_impl(
                 "vocab_size=", ctx->vocab_size,
                 " must be divisible by TP_SIZE=", ctx->tp_world_size);
             ctx->local_vocab_size = ctx->vocab_size / ctx->tp_world_size;
-            auto* embed = ctx->embed_ptr[0];
-            auto* lm_head = ctx->lm_head_ptr[0];
-            TORCH_CHECK(embed && lm_head && embed->dim() == 2 && lm_head->dim() == 2,
-                "vocabulary parallelism requires matrix embedding and LM-head weights");
-            TORCH_CHECK(embed->size(0) == ctx->local_vocab_size &&
-                    lm_head->size(0) == ctx->local_vocab_size &&
-                    embed->size(1) == lm_head->size(1),
-                "vocabulary parallelism received inconsistent local weight shapes: embed=",
-                embed->sizes(), " lm_head=", lm_head->sizes(),
-                " expected local vocab=", ctx->local_vocab_size);
+            if (embed) {
+                TORCH_CHECK(embed->dim() == 2 &&
+                        embed->size(0) == ctx->local_vocab_size,
+                    "vocabulary-parallel embedding has invalid local shape: ",
+                    embed->sizes(), " expected local vocab=", ctx->local_vocab_size);
+            }
+            if (lm_head) {
+                TORCH_CHECK(lm_head->dim() == 2 &&
+                        lm_head->size(0) == ctx->local_vocab_size,
+                    "vocabulary-parallel LM head has invalid local shape: ",
+                    lm_head->sizes(), " expected local vocab=", ctx->local_vocab_size);
+            }
         } else {
             ctx->local_vocab_size = ctx->vocab_size;
         }
@@ -6887,6 +6934,16 @@ static void* qwen36_create_training_context_impl(
         auto* lcfgs = reinterpret_cast<LayerConfig*>(layer_configs_ptr);
         for (int64_t i = 0; i < num_layers; i++) {
             ctx->layer_configs.push_back(lcfgs[i]);
+        }
+        int64_t expected_weight_ptrs = 0;
+        for (const auto& cfg : ctx->layer_configs)
+            expected_weight_ptrs += weight_count_for_layer(cfg);
+        TORCH_CHECK(num_weight_ptrs == expected_weight_ptrs,
+            "pipeline stage received ", num_weight_ptrs,
+            " frozen layer weights, expected ", expected_weight_ptrs);
+        for (int64_t i = 0; i < num_weight_ptrs; ++i) {
+            TORCH_CHECK(ctx->weight_ptrs[i],
+                "pipeline stage received null frozen layer weight at local index ", i);
         }
 
         ctx->fused_gdn_ab_weights.resize(num_layers);
@@ -7021,10 +7078,13 @@ static void* qwen36_create_training_context_impl(
         const bool all_target_layers = !target_layers || num_target_layers == 0;
         if (target_layers && num_target_layers > 0) {
             for (int64_t j = 0; j < num_target_layers; j++) {
-                TORCH_CHECK(target_layers[j] >= 0 && target_layers[j] < num_layers,
+                TORCH_CHECK(target_layers[j] >= 0 && target_layers[j] < global_num_layers,
                     "LoRA target layer out of range: ", target_layers[j],
-                    " for model with ", num_layers, " layers");
-                target_set.insert(target_layers[j]);
+                    " for model with ", global_num_layers, " layers");
+                if (target_layers[j] >= global_layer_start &&
+                        target_layers[j] < global_layer_start + num_layers) {
+                    target_set.insert(target_layers[j] - global_layer_start);
+                }
             }
         }
 
@@ -7061,7 +7121,7 @@ static void* qwen36_create_training_context_impl(
                 }
                 if (resolved) break;
             }
-            TORCH_CHECK(resolved,
+            TORCH_CHECK(resolved || global_num_layers != num_layers,
                 "LoRA target module does not exist in this model: ", name);
         }
         const int64_t local_lora_rank = local_lora_rank_for_active_targets(
@@ -7135,7 +7195,8 @@ static void* qwen36_create_training_context_impl(
                 ctx->lora_a.push_back(std::move(a));
                 ctx->lora_b.push_back(std::move(b));
                 ctx->lora_active.push_back(active ? 1 : 0);
-                auto prefix = "layers." + std::to_string(i) + "." + projection.name;
+                auto prefix = "layers." +
+                    std::to_string(global_layer_start + i) + "." + projection.name;
                 ctx->lora_names.push_back(prefix + ".lora_A.weight");
                 ctx->lora_names.push_back(prefix + ".lora_B.weight");
             }
@@ -7152,8 +7213,11 @@ static void* qwen36_create_training_context_impl(
             ctx->adam_v.push_back(at::zeros(ctx->lora_b[i].sizes(), opts_f32));
         }
 
-        fprintf(stderr, "[q36_ctx] created: %ld layers, %ld LoRA params, %ld Adam states\n",
-            (long)num_layers, (long)ctx->lora_a.size(), (long)ctx->adam_m.size());
+        fprintf(stderr,
+            "[q36_ctx] created: layers=[%ld,%ld)/%ld, %ld LoRA params, %ld Adam states\n",
+            (long)global_layer_start, (long)(global_layer_start + num_layers),
+            (long)global_num_layers, (long)ctx->lora_a.size(),
+            (long)ctx->adam_m.size());
         return ctx;
     } catch (const std::exception& e) {
         fprintf(stderr, "[q36] create FAILED: %s\n", e.what());
@@ -7174,7 +7238,8 @@ __attribute__((visibility("default"))) void* qwen36_create_training_context(
 ) {
     return qwen36_create_training_context_impl(
         weight_ptrs, num_weight_ptrs, embed_ptr, final_norm_ptr, lm_head_ptr,
-        layer_configs_ptr, num_layers, compute_type, lora_scaling, lr, beta1,
+        layer_configs_ptr, num_layers, 0, num_layers, 3, compute_type,
+        lora_scaling, lr, beta1,
         beta2, eps, vocab_size, rms_eps, lora_rank, target_layers,
         num_target_layers, target_modules_str, 0);
 }
@@ -7192,8 +7257,30 @@ __attribute__((visibility("default"))) void* qwen36_create_training_context_ex(
 ) {
     return qwen36_create_training_context_impl(
         weight_ptrs, num_weight_ptrs, embed_ptr, final_norm_ptr, lm_head_ptr,
-        layer_configs_ptr, num_layers, compute_type, lora_scaling, lr, beta1,
+        layer_configs_ptr, num_layers, 0, num_layers, 3, compute_type,
+        lora_scaling, lr, beta1,
         beta2, eps, vocab_size, rms_eps, lora_rank, target_layers,
+        num_target_layers, target_modules_str, context_flags);
+}
+
+__attribute__((visibility("default"))) void* qwen36_create_training_context_v2(
+    void** weight_ptrs, int64_t num_weight_ptrs,
+    void* embed_ptr, void* final_norm_ptr, void* lm_head_ptr,
+    void* layer_configs_ptr, int64_t num_layers,
+    int64_t global_layer_start, int64_t global_num_layers,
+    int32_t pipeline_stage_flags,
+    int32_t compute_type,
+    double lora_scaling, double lr, double beta1, double beta2, double eps,
+    int64_t vocab_size, double rms_eps,
+    int64_t lora_rank,
+    const int64_t* target_layers, int64_t num_target_layers,
+    const char* target_modules_str, int32_t context_flags
+) {
+    return qwen36_create_training_context_impl(
+        weight_ptrs, num_weight_ptrs, embed_ptr, final_norm_ptr, lm_head_ptr,
+        layer_configs_ptr, num_layers, global_layer_start, global_num_layers,
+        pipeline_stage_flags, compute_type, lora_scaling, lr, beta1, beta2,
+        eps, vocab_size, rms_eps, lora_rank, target_layers,
         num_target_layers, target_modules_str, context_flags);
 }
 
