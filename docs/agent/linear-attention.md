@@ -57,7 +57,25 @@ One `TpCopyToRegion` must wrap the shared input before the QKV/Z/A/B forks so ba
 
 ## Backward Stability
 
-The current fused CUDA backward reconstructs earlier states by dividing the decayed state by `g_exp`. This is fast and verified with realistic negative `dt_bias`, where decay stays near one, but it is ill-conditioned for synthetic long sequences with decay near `0.5`. A stable production replacement should checkpoint recurrent state by chunks and replay each chunk during backward instead of repeatedly inverting the decay.
+The fused CUDA backward reconstructs earlier states by dividing the decayed
+state by `g_exp`. This is fast and verified with realistic negative `dt_bias`,
+where decay stays near one, but repeated reverse reconstruction is
+ill-conditioned for long sequences with small decay.
+
+Set `QWEN36_GDN_STATE_CHECKPOINT_STRIDE=N` (`N >= 2`) to save exact FP32
+recurrent state at every `N`-token boundary. Backward reloads the exact state at
+the end of each reverse chunk, so reconstruction error cannot accumulate across
+chunk boundaries. The saved-state footprint per GDN layer is approximately
+`BH * (ceil(S / N) + 1) * key_dim * value_dim * 4` bytes. The default is `0`
+(disabled) because this is a stability/memory tradeoff. Distributed adapter
+registry consensus includes the configured stride so ranks cannot silently use
+different backward paths.
+
+This does not remove division by a clamped `g_exp` inside an individual chunk.
+Very small per-token decay still needs a replay-based backward or a forward
+formulation that does not invert decay. The kernel also remains a serial
+persistent block per `BH`; checkpoints are not FLA-style sequence-parallel
+chunking.
 
 ## Right-Padding Fast Path
 
@@ -78,6 +96,11 @@ PYTHON=/path/to/python scripts/run_qwen36_native_gdn_tp.sh smoke
 PYTHON=/path/to/python scripts/run_qwen36_native_gdn_tp.sh bench-single
 PYTHON=/path/to/python scripts/run_qwen36_native_gdn_tp.sh bench-tp2
 ```
+
+For checkpoint coverage, run the same smoke with
+`QWEN36_GDN_STATE_CHECKPOINT_STRIDE=2`. The synthetic training sequence has
+length 9, so this exercises five reverse chunks while retaining the distributed
+full-weight gradient and Adam-state oracle.
 
 The script builds only the repository kernel and native harnesses. It discovers and links the prebuilt dependency files from the selected Python environment; missing headers or libraries are reported instead of building third-party dependencies.
 

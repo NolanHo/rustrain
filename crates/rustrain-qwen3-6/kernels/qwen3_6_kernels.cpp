@@ -483,6 +483,7 @@ extern "C" int cuda_gated_delta_rule(
     const float* q, const float* k, const float* v,
     const float* g_exp, const float* beta,
     float* state, float* out, float* delta_buf,
+    float* state_checkpoints, int checkpoint_stride,
     const int32_t* lengths, int heads_per_batch,
     int BH, int seq_len, int key_dim, int val_dim, void* stream
 );
@@ -491,6 +492,7 @@ extern "C" int cuda_gated_delta_rule_backward(
     const float* q, const float* k, const float* v,
     const float* g_exp, const float* beta,
     const float* final_state, const float* delta_buf,
+    const float* state_checkpoints, int checkpoint_stride,
     const float* grad_out,
     float* grad_q, float* grad_k, float* grad_v,
     float* grad_g, float* grad_beta,
@@ -571,6 +573,24 @@ static at::Tensor gdn_lengths_arg(
         : at::empty({0}, reference.options().dtype(at::kInt));
 }
 
+static int64_t gdn_state_checkpoint_config() {
+    const char* value = std::getenv("QWEN36_GDN_STATE_CHECKPOINT_STRIDE");
+    if (!value || value[0] == '\0') return 0;
+    char* end = nullptr;
+    const long long parsed = std::strtoll(value, &end, 10);
+    TORCH_CHECK(end && *end == '\0' && parsed >= 0,
+        "QWEN36_GDN_STATE_CHECKPOINT_STRIDE must be a non-negative integer");
+    if (parsed == 0) return 0;
+    TORCH_CHECK(parsed >= 2,
+        "QWEN36_GDN_STATE_CHECKPOINT_STRIDE must be zero or at least 2");
+    return static_cast<int64_t>(parsed);
+}
+
+static int64_t gdn_state_checkpoint_stride(int64_t seq) {
+    const int64_t configured = gdn_state_checkpoint_config();
+    return configured < seq ? configured : 0;
+}
+
 // The forward and backward CUDA kernels are wrapped in one autograd Function.
 // Set QWEN36_DELTA_REFERENCE_BWD=1 to run the ATen recurrence oracle for parity
 // debugging; production training uses the current-stream fused backward.
@@ -601,17 +621,32 @@ struct GatedDeltaRuleFunction : public torch::autograd::Function<GatedDeltaRuleF
         auto state = at::zeros({bh, key_dim, val_dim}, q.options());
         auto out = at::empty({bh, seq, val_dim}, q.options());
         auto delta_buf = at::empty({bh, seq, val_dim}, q.options());
+        const int64_t checkpoint_stride =
+            gdn_state_checkpoint_stride(seq);
+        const int64_t checkpoint_count = checkpoint_stride > 0
+            ? (seq + checkpoint_stride - 1) / checkpoint_stride + 1
+            : 0;
+        auto state_checkpoints = checkpoint_stride > 0
+            ? at::empty(
+                {bh, checkpoint_count, key_dim, val_dim}, q.options())
+            : at::empty({0}, q.options());
         auto stream = c10::cuda::getCurrentCUDAStream(q.device().index()).stream();
         int status = cuda_gated_delta_rule(
             q.data_ptr<float>(), k.data_ptr<float>(), v.data_ptr<float>(),
             g_exp.data_ptr<float>(), beta.data_ptr<float>(),
             state.data_ptr<float>(), out.data_ptr<float>(), delta_buf.data_ptr<float>(),
+            checkpoint_stride > 0
+                ? state_checkpoints.data_ptr<float>() : nullptr,
+            static_cast<int>(checkpoint_stride),
             has_lengths ? lengths.data_ptr<int32_t>() : nullptr,
             (int)heads_per_batch,
             (int)bh, (int)seq, (int)key_dim, (int)val_dim,
             reinterpret_cast<void*>(stream));
         TORCH_CHECK(status == 0, "gated delta CUDA launch failed: ", status);
-        ctx->save_for_backward({q, k, v, g_exp, beta, state, delta_buf, lengths});
+        ctx->save_for_backward({
+            q, k, v, g_exp, beta, state, delta_buf, lengths,
+            state_checkpoints});
+        ctx->saved_data["checkpoint_stride"] = checkpoint_stride;
         return out;
     }
 
@@ -626,6 +661,9 @@ struct GatedDeltaRuleFunction : public torch::autograd::Function<GatedDeltaRuleF
         auto g = saved[3];
         auto beta = saved[4];
         auto lengths = saved[7];
+        auto state_checkpoints = saved[8];
+        const int64_t checkpoint_stride =
+            ctx->saved_data["checkpoint_stride"].toInt();
         const bool has_lengths = lengths.defined() && lengths.numel() > 0;
         const int64_t heads_per_batch = has_lengths
             ? q.size(0) / lengths.size(0)
@@ -660,6 +698,9 @@ struct GatedDeltaRuleFunction : public torch::autograd::Function<GatedDeltaRuleF
             q.data_ptr<float>(), k.data_ptr<float>(), v.data_ptr<float>(),
             g.data_ptr<float>(), beta.data_ptr<float>(),
             saved[5].data_ptr<float>(), saved[6].data_ptr<float>(),
+            checkpoint_stride > 0
+                ? state_checkpoints.data_ptr<float>() : nullptr,
+            static_cast<int>(checkpoint_stride),
             grad_out.data_ptr<float>(), grad_q.data_ptr<float>(),
             grad_k.data_ptr<float>(), grad_v.data_ptr<float>(),
             grad_g.data_ptr<float>(), grad_beta.data_ptr<float>(),
@@ -794,6 +835,7 @@ static at::Tensor linear_attention(
                 state_contig.data_ptr<float>(),
                 outs.data_ptr<float>(),
                 delta_buf.data_ptr<float>(),
+                nullptr, 0,
                 chunk_lengths.defined() ? chunk_lengths.data_ptr<int32_t>() : nullptr,
                 (int)num_v_heads,
                 (int)BH, (int)chunk_len, (int)key_dim, (int)val_dim,
@@ -2507,6 +2549,7 @@ static void hash_collective_topology(
     hash.add_u64(env_enabled("QWEN36_GROUPED_LORA_SYNC", true));
     hash.add_u64(env_enabled("QWEN36_PACKED_LORA_SYNC", true));
     hash.add_u64(env_enabled("QWEN36_GRAD_SLAB", true));
+    hash.add_u64(gdn_state_checkpoint_config());
 }
 
 static void validate_adapter_collective_registry(

@@ -90,6 +90,8 @@ __global__ void gated_delta_rule_kernel(
     float* __restrict__ state,         // [BH, D_K, D_V]
     float* __restrict__ out,           // [BH, S, D_V]
     float* __restrict__ delta_buf,     // [BH, S, D_V] — saved for backward
+    float* __restrict__ state_checkpoints, // [BH, checkpoints, D_K, D_V]
+    int checkpoint_stride,             // <=0 disables boundary checkpoints
     const int32_t* __restrict__ lengths, // [B], nullptr for dense sequences
     int heads_per_batch,
     int S
@@ -116,6 +118,18 @@ __global__ void gated_delta_rule_kernel(
     float* out_bh = out + bh * S * DR_D_V;
     const int valid_len = lengths == nullptr ? S :
         max(0, min(S, lengths[bh / heads_per_batch]));
+
+    const int checkpoint_count = checkpoint_stride > 0
+        ? (S + checkpoint_stride - 1) / checkpoint_stride + 1
+        : 0;
+    if (state_checkpoints != nullptr) {
+        float* checkpoint = state_checkpoints +
+            bh * checkpoint_count * DR_D_K * DR_D_V;
+        #pragma unroll
+        for (int i = tid; i < DR_D_K * DR_D_V; i += DR_THREADS)
+            checkpoint[i] = state_s[i];
+        __syncthreads();
+    }
 
     // Each thread processes column dv = tid
     // Access pattern: state_s[dk * DR_D_V + tid] for dk = 0..127
@@ -171,6 +185,33 @@ __global__ void gated_delta_rule_kernel(
         }
         out_bh[t * DR_D_V + tid] = out_val;
         __syncthreads();  // Ensure state visible before next token
+
+        if (state_checkpoints != nullptr &&
+            (t + 1) % checkpoint_stride == 0) {
+            const int checkpoint_index = (t + 1) / checkpoint_stride;
+            float* checkpoint = state_checkpoints +
+                (bh * checkpoint_count + checkpoint_index) *
+                DR_D_K * DR_D_V;
+            #pragma unroll
+            for (int i = tid; i < DR_D_K * DR_D_V; i += DR_THREADS)
+                checkpoint[i] = state_s[i];
+            __syncthreads();
+        }
+    }
+
+    if (state_checkpoints != nullptr) {
+        const int completed = valid_len / checkpoint_stride;
+        const int first_unwritten = completed + 1;
+        const int num_chunks = checkpoint_count - 1;
+        for (int checkpoint_index = first_unwritten;
+             checkpoint_index <= num_chunks; ++checkpoint_index) {
+            float* checkpoint = state_checkpoints +
+                (bh * checkpoint_count + checkpoint_index) *
+                DR_D_K * DR_D_V;
+            for (int i = tid; i < DR_D_K * DR_D_V; i += DR_THREADS)
+                checkpoint[i] = state_s[i];
+            __syncthreads();
+        }
     }
 
     for (int t = valid_len; t < S; ++t) {
@@ -195,6 +236,7 @@ inline void launch_gated_delta_rule(
     const float* q, const float* k, const float* v,
     const float* g_exp, const float* beta,
     float* state, float* out, float* delta_buf,
+    float* state_checkpoints, int checkpoint_stride,
     const int32_t* lengths, int heads_per_batch,
     int BH, int seq_len, int key_dim, int val_dim,
     cudaStream_t stream
@@ -216,6 +258,7 @@ inline void launch_gated_delta_rule(
 
     gated_delta_rule_kernel<<<grid, block, smem_size, stream>>>(
         q, k, v, g_exp, beta, state, out, delta_buf,
+        state_checkpoints, checkpoint_stride,
         lengths, heads_per_batch, seq_len
     );
 }
@@ -396,6 +439,8 @@ __global__ void gated_delta_rule_backward_kernel_correct(
     const float* __restrict__ beta,
     const float* __restrict__ final_state,
     const float* __restrict__ delta_buf,
+    const float* __restrict__ state_checkpoints,
+    int checkpoint_stride,
     const float* __restrict__ grad_out,
     float* __restrict__ grad_q,
     float* __restrict__ grad_k,
@@ -455,93 +500,121 @@ __global__ void gated_delta_rule_backward_kernel_correct(
     }
     __syncthreads();
 
-    for (int t = valid_len - 1; t >= 0; --t) {
-        const float* q_t = q_bh + t * DR_D_K;
-        const float* k_t = k_bh + t * DR_D_K;
-        const float g_t = g_bh[t];
-        const float beta_t = beta_bh[t];
-        const float go_t = go_bh[t * DR_D_V + tid];
-        const float delta_t = delta_buf[bh * S * DR_D_V + t * DR_D_V + tid];
+    const int checkpoint_count = checkpoint_stride > 0
+        ? (S + checkpoint_stride - 1) / checkpoint_stride + 1
+        : 0;
+    const int num_chunks = state_checkpoints != nullptr
+        ? checkpoint_count - 1
+        : 1;
+    for (int chunk = num_chunks - 1; chunk >= 0; --chunk) {
+        const int chunk_start = state_checkpoints != nullptr
+            ? chunk * checkpoint_stride : 0;
+        const int chunk_end = state_checkpoints != nullptr
+            ? min(S, (chunk + 1) * checkpoint_stride) : S;
+        if (state_checkpoints != nullptr) {
+            const float* checkpoint = state_checkpoints +
+                (bh * checkpoint_count + chunk + 1) * DR_D_K * DR_D_V;
+            for (int i = tid; i < DR_D_K * DR_D_V; i += DR_THREADS)
+                state_s[i] = checkpoint[i];
+            __syncthreads();
+        }
+        const int reverse_end = min(valid_len, chunk_end);
+        for (int t = reverse_end - 1; t >= chunk_start; --t) {
+            const float* q_t = q_bh + t * DR_D_K;
+            const float* k_t = k_bh + t * DR_D_K;
+            const float g_t = g_bh[t];
+            const float beta_t = beta_bh[t];
+            const float go_t = go_bh[t * DR_D_V + tid];
+            const float delta_t =
+                delta_buf[bh * S * DR_D_V + t * DR_D_V + tid];
 
-        // Add the direct output contribution to dS_t and reduce dQ_t over
-        // value columns while state_s still contains the post-update state.
-        for (int dk = 0; dk < DR_D_K; ++dk) {
-            const int idx = dk * DR_D_V + tid;
-            const float s_after = state_s[idx];
-            grad_s[idx] += q_t[dk] * go_t;
-            float q_part = s_after * go_t;
-            for (int off = 16; off > 0; off >>= 1)
-                q_part += __shfl_down_sync(0xffffffff, q_part, off);
-            if (lane == 0) reduce_q[warp * DR_D_K + dk] = q_part;
-        }
-        __syncthreads();
-        if (tid < DR_D_K) {
-            gq_bh[t * DR_D_K + tid] =
-                reduce_q[tid] + reduce_q[DR_D_K + tid] +
-                reduce_q[2 * DR_D_K + tid] + reduce_q[3 * DR_D_K + tid];
-        }
-        __syncthreads();
+            // Add the direct output contribution to dS_t and reduce dQ_t over
+            // value columns while state_s still contains the post-update state.
+            for (int dk = 0; dk < DR_D_K; ++dk) {
+                const int idx = dk * DR_D_V + tid;
+                const float s_after = state_s[idx];
+                grad_s[idx] += q_t[dk] * go_t;
+                float q_part = s_after * go_t;
+                for (int off = 16; off > 0; off >>= 1)
+                    q_part += __shfl_down_sync(0xffffffff, q_part, off);
+                if (lane == 0) reduce_q[warp * DR_D_K + dk] = q_part;
+            }
+            __syncthreads();
+            if (tid < DR_D_K) {
+                gq_bh[t * DR_D_K + tid] =
+                    reduce_q[tid] + reduce_q[DR_D_K + tid] +
+                    reduce_q[2 * DR_D_K + tid] +
+                    reduce_q[3 * DR_D_K + tid];
+            }
+            __syncthreads();
 
-        // Undo S_t = R_t + k outer delta, leaving R_t = g_t*S_prev.
-        for (int dk = 0; dk < DR_D_K; ++dk)
-            state_s[dk * DR_D_V + tid] -= k_t[dk] * delta_t;
-        __syncthreads();
+            // Undo S_t = R_t + k outer delta, leaving R_t = g_t*S_prev.
+            for (int dk = 0; dk < DR_D_K; ++dk)
+                state_s[dk * DR_D_V + tid] -= k_t[dk] * delta_t;
+            __syncthreads();
 
-        // ddelta = dS_t^T k and h = ddelta * beta. The same value-column
-        // thread computes dV and one partial for dBeta/dG.
-        float gdelta = 0.0f;
-        float kv_mem = 0.0f;
-        for (int dk = 0; dk < DR_D_K; ++dk) {
-            const int idx = dk * DR_D_V + tid;
-            gdelta += grad_s[idx] * k_t[dk];
-            kv_mem += state_s[idx] * k_t[dk];
-        }
-        const float h = gdelta * beta_t;
-        gv_bh[t * DR_D_V + tid] = h;
-        const float beta_part = gdelta * (v_bh[t * DR_D_V + tid] - kv_mem);
-        const float safe_g = fmaxf(g_t, 1.0e-8f);
-        float g_part = 0.0f;
+            // ddelta = dS_t^T k and h = ddelta * beta. The same value-column
+            // thread computes dV and one partial for dBeta/dG.
+            float gdelta = 0.0f;
+            float kv_mem = 0.0f;
+            for (int dk = 0; dk < DR_D_K; ++dk) {
+                const int idx = dk * DR_D_V + tid;
+                gdelta += grad_s[idx] * k_t[dk];
+                kv_mem += state_s[idx] * k_t[dk];
+            }
+            const float h = gdelta * beta_t;
+            gv_bh[t * DR_D_V + tid] = h;
+            const float beta_part =
+                gdelta * (v_bh[t * DR_D_V + tid] - kv_mem);
+            const float safe_g = fmaxf(g_t, 1.0e-8f);
+            float g_part = 0.0f;
 
-        // dR = dS - k outer h. Reduce dK over value columns and update dS_prev.
-        for (int dk = 0; dk < DR_D_K; ++dk) {
-            const int idx = dk * DR_D_V + tid;
-            const float r = state_s[idx];
-            const float s_prev = r / safe_g;
-            const float grad_r = grad_s[idx] - k_t[dk] * h;
-            const float k_part = grad_s[idx] * delta_t - r * h;
-            g_part += grad_r * s_prev;
-            float reduced_k = k_part;
-            for (int off = 16; off > 0; off >>= 1)
-                reduced_k += __shfl_down_sync(0xffffffff, reduced_k, off);
-            if (lane == 0) reduce_k[warp * DR_D_K + dk] = reduced_k;
-            grad_s[idx] = grad_r * g_t;
-            // The next reverse iteration starts from S_prev, not R_t.
-            state_s[idx] = s_prev;
-        }
+            // dR = dS - k outer h. Reduce dK over value columns and update
+            // dS_prev.
+            for (int dk = 0; dk < DR_D_K; ++dk) {
+                const int idx = dk * DR_D_V + tid;
+                const float r = state_s[idx];
+                const float s_prev = r / safe_g;
+                const float grad_r = grad_s[idx] - k_t[dk] * h;
+                const float k_part = grad_s[idx] * delta_t - r * h;
+                g_part += grad_r * s_prev;
+                float reduced_k = k_part;
+                for (int off = 16; off > 0; off >>= 1)
+                    reduced_k += __shfl_down_sync(
+                        0xffffffff, reduced_k, off);
+                if (lane == 0)
+                    reduce_k[warp * DR_D_K + dk] = reduced_k;
+                grad_s[idx] = grad_r * g_t;
+                // The next reverse iteration starts from S_prev, not R_t.
+                state_s[idx] = s_prev;
+            }
 
-        float reduced_beta = beta_part;
-        float reduced_g = g_part;
-        for (int off = 16; off > 0; off >>= 1) {
-            reduced_beta += __shfl_down_sync(0xffffffff, reduced_beta, off);
-            reduced_g += __shfl_down_sync(0xffffffff, reduced_g, off);
+            float reduced_beta = beta_part;
+            float reduced_g = g_part;
+            for (int off = 16; off > 0; off >>= 1) {
+                reduced_beta += __shfl_down_sync(
+                    0xffffffff, reduced_beta, off);
+                reduced_g += __shfl_down_sync(0xffffffff, reduced_g, off);
+            }
+            if (lane == 0) {
+                reduce_beta[warp] = reduced_beta;
+                reduce_g[warp] = reduced_g;
+            }
+            __syncthreads();
+            if (tid < DR_D_K) {
+                gk_bh[t * DR_D_K + tid] =
+                    reduce_k[tid] + reduce_k[DR_D_K + tid] +
+                    reduce_k[2 * DR_D_K + tid] +
+                    reduce_k[3 * DR_D_K + tid];
+            }
+            if (tid == 0) {
+                gb_bh[t] = reduce_beta[0] + reduce_beta[1] +
+                           reduce_beta[2] + reduce_beta[3];
+                gg_bh[t] = reduce_g[0] + reduce_g[1] +
+                           reduce_g[2] + reduce_g[3];
+            }
+            __syncthreads();
         }
-        if (lane == 0) {
-            reduce_beta[warp] = reduced_beta;
-            reduce_g[warp] = reduced_g;
-        }
-        __syncthreads();
-        if (tid < DR_D_K) {
-            gk_bh[t * DR_D_K + tid] =
-                reduce_k[tid] + reduce_k[DR_D_K + tid] +
-                reduce_k[2 * DR_D_K + tid] + reduce_k[3 * DR_D_K + tid];
-        }
-        if (tid == 0) {
-            gb_bh[t] = reduce_beta[0] + reduce_beta[1] +
-                       reduce_beta[2] + reduce_beta[3];
-            gg_bh[t] = reduce_g[0] + reduce_g[1] +
-                       reduce_g[2] + reduce_g[3];
-        }
-        __syncthreads();
     }
 }
 
@@ -554,6 +627,7 @@ inline int launch_gated_delta_rule_backward(
     const float* g_exp, const float* beta,
     const float* final_state,
     const float* delta_buf,
+    const float* state_checkpoints, int checkpoint_stride,
     const float* grad_out,
     float* grad_q, float* grad_k, float* grad_v,
     float* grad_g, float* grad_beta,
@@ -581,7 +655,8 @@ inline int launch_gated_delta_rule_backward(
     }
 
     gated_delta_rule_backward_kernel_correct<<<grid, block, smem_size, stream>>>(
-        q, k, v, g_exp, beta, final_state, delta_buf, grad_out,
+        q, k, v, g_exp, beta, final_state, delta_buf,
+        state_checkpoints, checkpoint_stride, grad_out,
         grad_q, grad_k, grad_v, grad_g, grad_beta,
         lengths, heads_per_batch, seq_len
     );

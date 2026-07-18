@@ -58,7 +58,16 @@ reduce-scatter. H20 TP2 fixed-LoRA smoke and TP2 x DP2 oracle passed with both
 settings; the synthetic TP2 benchmark was `77.970 ms` packed versus `78.024 ms`
 fallback p50, within measurement noise.
 
-当前粗粒度 C++ FFI、packed/grouped MoE、GDN head TP、vocabulary TP 和 activation checkpoint/offload 是有效优化，但 full attention 仍通过 ATen linear/SDPA，QKV 未融合，TP collective 同步执行。ABI23 heterogeneous v2 为每个 signature 独立运行完整 trainer，并在组准备和训练返回后读取 GPU success consensus 到 CPU；这是防止 rank 进入不同后续 collective 的 correctness fence，也会阻断跨组异步 overlap。它不能从旧 homogeneous trainer 内部不可恢复的 rank-local CUDA/NCCL failure 中恢复。GDN fused backward 通过反除 decay 重建历史 state；真实 time-step bias 下可运行，但极小 decay 的长序列会数值不稳，仍需 state checkpoint/chunk backward 替代。尚无 Megatron/Transformer Engine 级别的完整模型端到端数据：没有同一 GPU、序列长度、microbatch、精度和通信配置下的 tokens/s、显存、扩展效率对照，也没有 FP8/FP4 参数与 fused attention/DeepEP 的 Qwen 路径。
+GDN fused backward 现在可通过
+`QWEN36_GDN_STATE_CHECKPOINT_STRIDE` 保存固定 token 边界的 FP32 recurrent
+state，并在每个 reverse chunk 开始时从精确 chunk-end state 重启。默认值
+为 `0`，因为每层额外占用约
+`BH * (ceil(S / stride) + 1) * DK * DV * 4` bytes。该路径限制跨 chunk 的
+反向重建误差累积，但 chunk 内仍通过 clamp 后的 decay 反除，不能宣称已
+解决单 token 极小 decay 的数值问题，也没有提供 FLA/sequence-parallel
+chunk kernel 或 packed `cu_seqlens`。
+
+当前粗粒度 C++ FFI、packed/grouped MoE、GDN head TP、vocabulary TP 和 activation checkpoint/offload 是有效优化，但 full attention 仍通过 ATen linear/SDPA，QKV 未融合，TP collective 同步执行。ABI23 heterogeneous v2 为每个 signature 独立运行完整 trainer，并在组准备和训练返回后读取 GPU success consensus 到 CPU；这是防止 rank 进入不同后续 collective 的 correctness fence，也会阻断跨组异步 overlap。它不能从旧 homogeneous trainer 内部不可恢复的 rank-local CUDA/NCCL failure 中恢复。尚无 Megatron/Transformer Engine 级别的完整模型端到端数据：没有同一 GPU、序列长度、microbatch、精度和通信配置下的 tokens/s、显存、扩展效率对照，也没有 FP8/FP4 参数与 fused attention/DeepEP 的 Qwen 路径。
 
 ABI15 synthetic GDN TP benchmark 使用 3 层、S=512、H=2048、16 K heads、32 V heads 和 LoRA rank 8。在 B=2 时 single/TP2 p50 为 `81.10/约 76.06 ms`，只有约 `1.07x`；在 B=8 时为 `303.25/约 158.04 ms`，达到约 `1.92x`，每卡 observed resident 从 `4.59 GiB` 降到 `3.54 GiB`。`nsys` 的 B=2 TP2 trace 中 fused delta-rule backward 占 GPU kernel time `80.3%`、forward 占 `7.4%`，NCCL all-reduce 合计低于 `0.4%`。小 batch 下 single 和 TP2 都只需相近的 persistent-block wave 数，因此不能期待 head TP 自动加速；dynamic multi-LoRA batching 提高 BH 后才接近线性 scaling。这是 synthetic native 结果，不是完整模型或 matched Megatron 对比。
 
@@ -81,7 +90,7 @@ ABI15 的两层 GDN base-TP smoke 覆盖复合 QKV/conv head shard、Z/A/B/A_log
 1. 将 ABI23 heterogeneous v2 从“每 signature 一次完整训练 + 失败补偿回滚”重构为所有 signature 先 harvest gradients、一次统一同步/Adam finalizer、最后原子交换全部 tenant state，减少 group 数增长带来的 launch 和 collective 开销。
 2. 实现 PP/CP runtime process groups、launcher、scheduler 和 checkpoint rank mapping；为 PP 实现 stage forward/backward 与 1F1B scheduler，为 CP 实现 ring attention/state exchange。
 3. 将 EP dispatch/combine 替换为 fused/异步路径，并测量通信与计算重叠。
-4. 为 dense/expert MLP 增加 fused gate/up FC1 和 MTP 支持；为 GDN 增加稳定的 chunk/state-checkpoint backward 与 sequence/context parallel，为 full attention 融合 QKV/SDPA 并增加 sequence parallel。
+4. 为 dense/expert MLP 增加 fused gate/up FC1 和 MTP 支持；为 GDN 消除 chunk 内 decay 反除并增加 sequence/context parallel 与 packed `cu_seqlens`，为 full attention 融合 QKV/SDPA 并增加 sequence parallel。
 5. 为 server 增加 raw binary HTTP ingress、pinned staging、异步 H2D/request overlap；为 checkpoint 增加 generation/`LATEST`、断电级 durability、跨 topology reshard、可恢复的 pending accumulation state 和旧 v3 attention checkpoint 离线迁移工具。
 6. 在固定硬件和 workload 上，与 Megatron-LM 记录 tokens/s、step time、峰值显存、通信占比和 loss 曲线。
 
