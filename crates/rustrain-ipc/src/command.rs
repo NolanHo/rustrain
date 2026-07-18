@@ -179,6 +179,11 @@ pub enum EpCommand {
         session_id: String,
         tensors: TensorSlabRef,
     },
+    EvalMultiLoraSlab {
+        session_id: String,
+        tensors: TensorSlabRef,
+        adapter_ids: Vec<i64>,
+    },
     ExportAdapter {
         session_id: String,
         path: String,
@@ -214,7 +219,8 @@ impl EpCommand {
         match self {
             Self::TrainStepSlab { tensors, .. }
             | Self::TrainMultiLoraSlab { tensors, .. }
-            | Self::EvalStepSlab { tensors, .. } => Some(tensors),
+            | Self::EvalStepSlab { tensors, .. }
+            | Self::EvalMultiLoraSlab { tensors, .. } => Some(tensors),
             _ => None,
         }
     }
@@ -242,6 +248,9 @@ pub enum EpResult {
     MultiLoraTrain {
         loss: f64,
         step: u64,
+        adapter_losses: Vec<AdapterLoss>,
+    },
+    MultiLoraEval {
         adapter_losses: Vec<AdapterLoss>,
     },
     Checkpoint {

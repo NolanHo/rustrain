@@ -20,8 +20,8 @@ use rustrain_parallel::topology::ParallelTopology;
 use tch::{Device, Kind};
 
 use crate::session::{
-    AddLoRARequest, EvalOutput, InitLoRARequest, Qwen36Session, SessLoadDatasetRequest,
-    SessLoadModelRequest, TrainOutput, TrainingSession,
+    AddLoRARequest, EvalOutput, InitLoRARequest, MultiLoraEvalOutput, Qwen36Session,
+    SessLoadDatasetRequest, SessLoadModelRequest, TrainOutput, TrainingSession,
 };
 
 const DEFAULT_MAX_BATCH_ADD_LORA: usize = 64;
@@ -1028,6 +1028,46 @@ fn execute_command(session: &mut Qwen36Session, worker: &EpWorker, cmd: &EpComma
                 Err(error) => EpResult::Error(error.to_string()),
             }
         }
+        EpCommand::EvalMultiLoraSlab {
+            tensors,
+            adapter_ids,
+            ..
+        } => {
+            if adapter_ids.is_empty() || adapter_ids.iter().any(|id| *id <= 0) {
+                return EpResult::Error("adapter_ids must contain positive IDs".into());
+            }
+            if tensors.batch_size != 1 && tensors.batch_size != adapter_ids.len() {
+                return EpResult::Error(format!(
+                    "selected eval batch_size must be 1 or adapter count {}, got {}",
+                    adapter_ids.len(),
+                    tensors.batch_size
+                ));
+            }
+            let (input_ids, target_mask, attention_mask) = match slab_tensor_views(worker, tensors)
+            {
+                Ok(views) => views,
+                Err(error) => return EpResult::Error(error),
+            };
+            match session.eval_multi_lora_host_i64(
+                input_ids,
+                target_mask,
+                attention_mask,
+                tensors.batch_size,
+                tensors.seq_len,
+                adapter_ids,
+            ) {
+                Ok(MultiLoraEvalOutput { adapter_losses }) => EpResult::MultiLoraEval {
+                    adapter_losses: adapter_losses
+                        .into_iter()
+                        .map(|(adapter_id, loss)| rustrain_ipc::command::AdapterLoss {
+                            adapter_id,
+                            loss,
+                        })
+                        .collect(),
+                },
+                Err(error) => EpResult::Error(error.to_string()),
+            }
+        }
         EpCommand::ExportAdapter {
             path,
             adapter_id,
@@ -1093,6 +1133,7 @@ fn command_session_id(cmd: &EpCommand) -> &str {
         | EpCommand::TrainMultiLoraSlab { session_id, .. }
         | EpCommand::EvalStep { session_id, .. }
         | EpCommand::EvalStepSlab { session_id, .. }
+        | EpCommand::EvalMultiLoraSlab { session_id, .. }
         | EpCommand::ExportAdapter { session_id, .. }
         | EpCommand::PrepareSaveCheckpoint { session_id, .. }
         | EpCommand::PrepareLoadCheckpoint { session_id, .. }
@@ -1331,11 +1372,11 @@ fn tensor_element_range(
 #[cfg(test)]
 mod tests {
     use super::{
-        SourceShard, checkpoint_generation, checkpoint_metadata_matches, checkpoint_staging_path,
+        checkpoint_generation, checkpoint_metadata_matches, checkpoint_staging_path,
         create_checkpoint_staging, create_worker_session, delete_worker_session, multi_lora_rows,
         publish_checkpoint_noreplace, require_worker_session, source_shard_for_topology,
         tensor_element_range, train_step_rows, validate_batch_add_lora_count,
-        validate_flat_tensor_lengths, validate_multi_lora_global_batch_size,
+        validate_flat_tensor_lengths, validate_multi_lora_global_batch_size, SourceShard,
     };
     use rustrain_parallel::topology::ParallelTopology;
 
@@ -1480,11 +1521,9 @@ mod tests {
         let first = checkpoint_generation(42, 100, 0, "save").unwrap();
         let second = checkpoint_generation(42, 100, 1, "save").unwrap();
         assert_ne!(first, second);
-        assert!(
-            first
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
-        );
+        assert!(first
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.')));
         assert!(checkpoint_generation(42, 100, 2, "bad/path").is_err());
         assert!(checkpoint_generation(42, 100, 3, "").is_err());
     }

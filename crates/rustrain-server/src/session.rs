@@ -1,6 +1,6 @@
 //! Training session trait + Qwen3.6 implementation.
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{anyhow, bail, Context, Result};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tch::{Device, Kind, Tensor};
@@ -10,7 +10,7 @@ use crate::checkpoint;
 use crate::metrics::{FileMetricsSink, MetricsSink, StepMetric};
 use rustrain_parallel::topology::ParallelTopology;
 use rustrain_qwen3_6::lora::{Qwen36AdapterArtifact, Qwen36LoraConfig, Qwen36LoraTargetModule};
-use rustrain_qwen3_6::pipeline::{PipelineStageLayout, stage_lora_slots};
+use rustrain_qwen3_6::pipeline::{stage_lora_slots, PipelineStageLayout};
 
 fn validate_qwen_parallel_features(
     is_moe: bool,
@@ -239,6 +239,11 @@ pub struct EvalOutput {
 }
 
 #[derive(Debug)]
+pub struct MultiLoraEvalOutput {
+    pub adapter_losses: Vec<(i64, f64)>,
+}
+
+#[derive(Debug)]
 pub struct SessionStatus {
     pub state: String,
     pub step: u64,
@@ -260,6 +265,25 @@ pub trait TrainingSession: Send {
         adapter_ids: &[i64],
     ) -> Result<TrainOutput>;
     fn eval_step(&self, input: TrainInput) -> Result<EvalOutput>;
+    fn eval_multi_lora_host_i64(
+        &self,
+        input_ids: &[i64],
+        target_mask: &[i64],
+        attention_mask: &[i64],
+        batch_size: usize,
+        seq_len: usize,
+        adapter_ids: &[i64],
+    ) -> Result<MultiLoraEvalOutput> {
+        let _ = (
+            input_ids,
+            target_mask,
+            attention_mask,
+            batch_size,
+            seq_len,
+            adapter_ids,
+        );
+        bail!("selected multi-LoRA evaluation is not supported by this session")
+    }
     fn save_checkpoint(&self, path: &str) -> Result<(u64, f64)>;
     fn save_checkpoint_with_generation(
         &self,
@@ -586,6 +610,32 @@ impl Qwen36Session {
             .ok_or_else(|| anyhow!("LoRA not initialized"))?
             .eval_step_host_i64(input_ids, target_mask, attention_mask, batch_size, seq_len)?;
         Ok(EvalOutput { loss })
+    }
+
+    pub fn eval_multi_lora_host_i64(
+        &self,
+        input_ids: &[i64],
+        target_mask: &[i64],
+        attention_mask: &[i64],
+        batch_size: usize,
+        seq_len: usize,
+        adapter_ids: &[i64],
+    ) -> Result<MultiLoraEvalOutput> {
+        let losses = self
+            .ctx
+            .as_ref()
+            .ok_or_else(|| anyhow!("LoRA not initialized"))?
+            .eval_multi_lora_host_i64(
+                input_ids,
+                target_mask,
+                attention_mask,
+                batch_size,
+                seq_len,
+                adapter_ids,
+            )?;
+        Ok(MultiLoraEvalOutput {
+            adapter_losses: adapter_ids.iter().copied().zip(losses).collect(),
+        })
     }
 
     fn finish_train_step(&mut self, loss: f64, record_metric: bool) -> Result<TrainOutput> {
@@ -1277,6 +1327,26 @@ impl TrainingSession for Qwen36Session {
             .ok_or_else(|| anyhow!("LoRA not initialized"))?;
         let loss = ctx.eval_step(&input.input_ids, &input.target_mask, &input.attention_mask)?;
         Ok(EvalOutput { loss })
+    }
+
+    fn eval_multi_lora_host_i64(
+        &self,
+        input_ids: &[i64],
+        target_mask: &[i64],
+        attention_mask: &[i64],
+        batch_size: usize,
+        seq_len: usize,
+        adapter_ids: &[i64],
+    ) -> Result<MultiLoraEvalOutput> {
+        Qwen36Session::eval_multi_lora_host_i64(
+            self,
+            input_ids,
+            target_mask,
+            attention_mask,
+            batch_size,
+            seq_len,
+            adapter_ids,
+        )
     }
 
     fn save_checkpoint(&self, path: &str) -> Result<(u64, f64)> {

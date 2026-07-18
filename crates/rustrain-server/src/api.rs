@@ -1,7 +1,6 @@
 //! HTTP API (axum) — RESTful endpoints for training session management.
 
 use axum::{
-    Json, Router,
     extract::DefaultBodyLimit,
     extract::Request,
     extract::{Path, State},
@@ -10,6 +9,7 @@ use axum::{
     response::sse::{Event, KeepAlive, Sse},
     response::{IntoResponse, Response},
     routing::{get, post},
+    Json, Router,
 };
 use futures::stream::{self, Stream};
 use serde::{Deserialize, Serialize};
@@ -17,10 +17,10 @@ use std::collections::{HashMap, HashSet};
 use std::convert::Infallible;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::sync::{Semaphore, oneshot};
+use tokio::sync::{oneshot, Semaphore};
 use tokio_stream::StreamExt;
 
-use crate::ep_dispatch::{EpDispatchScheduleError, EpDispatchScheduler, configured_queue_capacity};
+use crate::ep_dispatch::{configured_queue_capacity, EpDispatchScheduleError, EpDispatchScheduler};
 use crate::metrics::StepMetric;
 use crate::session::{InitLoRARequest, SessLoadDatasetRequest, SessLoadModelRequest, TrainInput};
 use crate::state::SessionManager;
@@ -392,6 +392,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/v1/sessions/{id}/init_lora", post(init_lora))
         .route("/v1/sessions/{id}/train_step", post(train_step))
         .route("/v1/sessions/{id}/eval_step", post(eval_step))
+        .route("/v1/sessions/{id}/eval_multi_lora", post(eval_multi_lora))
         .route("/v1/sessions/{id}/save_checkpoint", post(save_checkpoint))
         .route("/v1/sessions/{id}/load_checkpoint", post(load_checkpoint))
         .route("/v1/sessions/{id}/export_adapter", post(export_adapter))
@@ -597,6 +598,14 @@ struct TrainStepHttp {
 }
 
 #[derive(Deserialize)]
+struct EvalMultiLoraHttp {
+    input_ids: TensorHttp,
+    target_mask: TensorHttp,
+    attention_mask: TensorHttp,
+    adapter_ids: Vec<i64>,
+}
+
+#[derive(Deserialize)]
 struct TrainMultiLoraHttp {
     input_ids: TensorHttp,
     target_mask: TensorHttp,
@@ -626,7 +635,7 @@ struct TrainMultiLoraResponse {
 
 /// Decode the little-endian wire representation without materializing host values.
 fn decode_int64_bytes(t: &TensorHttp) -> Result<Vec<u8>, String> {
-    use base64::{Engine, engine::general_purpose};
+    use base64::{engine::general_purpose, Engine};
     if t.dtype != "int64" {
         return Err(format!("EP tensor dtype must be int64, got {}", t.dtype));
     }
@@ -654,6 +663,19 @@ fn decode_int64_bytes(t: &TensorHttp) -> Result<Vec<u8>, String> {
         ));
     }
     Ok(bytes)
+}
+
+fn decode_int64_values(t: &TensorHttp) -> Result<Vec<i64>, String> {
+    let bytes = decode_int64_bytes(t)?;
+    bytes
+        .chunks_exact(std::mem::size_of::<i64>())
+        .map(|chunk| {
+            let bytes: [u8; 8] = chunk
+                .try_into()
+                .map_err(|_| "invalid int64 byte width".to_string())?;
+            Ok(i64::from_le_bytes(bytes))
+        })
+        .collect()
 }
 
 fn pack_tensor_slab(
@@ -945,8 +967,28 @@ fn validate_multi_lora_http_shapes(
     Ok((batch_size, seq_len))
 }
 
+fn validate_selected_eval_http_shapes(
+    input_ids: &TensorHttp,
+    target_mask: &TensorHttp,
+    attention_mask: &TensorHttp,
+    adapter_ids: &[i64],
+) -> Result<(usize, usize), String> {
+    if adapter_ids.is_empty() || adapter_ids.iter().any(|id| *id <= 0) {
+        return Err("adapter_ids must contain positive IDs".to_string());
+    }
+    let (batch_size, seq_len) = validate_train_http_shapes(input_ids, target_mask, attention_mask)?;
+    if batch_size != 1 && batch_size != adapter_ids.len() {
+        return Err(format!(
+            "selected eval batch_size must be 1 or adapter count {}, got {}",
+            adapter_ids.len(),
+            batch_size
+        ));
+    }
+    Ok((batch_size, seq_len))
+}
+
 fn decode_tensor(t: &TensorHttp) -> Result<tch::Tensor, String> {
-    use base64::{Engine, engine::general_purpose};
+    use base64::{engine::general_purpose, Engine};
     let bytes = general_purpose::STANDARD
         .decode(&t.data)
         .map_err(|e| format!("base64 decode: {e}"))?;
@@ -1006,6 +1048,52 @@ async fn eval_step(
         .map_err(|e| err_resp(&e.to_string()))?;
     Ok(Json(EvalStepResponse { loss: result.loss }))
 }
+
+async fn eval_multi_lora(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(req): Json<EvalMultiLoraHttp>,
+) -> Result<Json<TrainMultiLoraEvalResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let (batch_size, seq_len) = validate_selected_eval_http_shapes(
+        &req.input_ids,
+        &req.target_mask,
+        &req.attention_mask,
+        &req.adapter_ids,
+    )
+    .map_err(|e| err_resp(&e))?;
+    let input_ids = decode_int64_values(&req.input_ids).map_err(|e| err_resp(&e))?;
+    let target_mask = decode_int64_values(&req.target_mask).map_err(|e| err_resp(&e))?;
+    let attention_mask = decode_int64_values(&req.attention_mask).map_err(|e| err_resp(&e))?;
+    let session = state
+        .manager
+        .get_session(&id)
+        .await
+        .ok_or_else(|| err_resp("session not found"))?;
+    let s = session.lock().await;
+    let output = s
+        .eval_multi_lora_host_i64(
+            &input_ids,
+            &target_mask,
+            &attention_mask,
+            batch_size,
+            seq_len,
+            &req.adapter_ids,
+        )
+        .map_err(|e| err_resp(&e.to_string()))?;
+    Ok(Json(TrainMultiLoraEvalResponse {
+        adapter_losses: output
+            .adapter_losses
+            .into_iter()
+            .map(|(adapter_id, loss)| rustrain_ipc::command::AdapterLoss { adapter_id, loss })
+            .collect(),
+    }))
+}
+
+#[derive(Serialize)]
+struct TrainMultiLoraEvalResponse {
+    adapter_losses: Vec<rustrain_ipc::command::AdapterLoss>,
+}
+
 #[derive(Serialize)]
 struct EvalStepResponse {
     loss: f64,
@@ -1280,6 +1368,10 @@ pub fn ep_router(state: Arc<EpAppState>) -> Router {
     let tensor_routes = Router::new()
         .route("/v1/sessions/{id}/train_step", post(ep_train_step))
         .route("/v1/sessions/{id}/eval_step", post(ep_eval_step))
+        .route(
+            "/v1/sessions/{id}/eval_multi_lora",
+            post(ep_eval_multi_lora),
+        )
         .route_layer(middleware::from_fn_with_state(
             Arc::new(Semaphore::new(1)),
             ep_tensor_admission,
@@ -1499,6 +1591,40 @@ async fn ep_eval_step(
     }
 }
 
+async fn ep_eval_multi_lora(
+    State(state): State<Arc<EpRouterState>>,
+    Path(id): Path<String>,
+    Json(req): Json<EvalMultiLoraHttp>,
+) -> Result<Json<TrainMultiLoraEvalResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let (batch_size, seq_len) = validate_selected_eval_http_shapes(
+        &req.input_ids,
+        &req.target_mask,
+        &req.attention_mask,
+        &req.adapter_ids,
+    )
+    .map_err(|e| err_resp(&e))?;
+    let (tensors, payload) = pack_tensor_slab(
+        &req.input_ids,
+        &req.target_mask,
+        &req.attention_mask,
+        batch_size,
+        seq_len,
+    )
+    .map_err(|e| err_resp(&e))?;
+    let cmd = rustrain_ipc::EpCommand::EvalMultiLoraSlab {
+        session_id: id,
+        tensors,
+        adapter_ids: req.adapter_ids,
+    };
+    match dispatch_slab(&state, cmd, payload).await? {
+        rustrain_ipc::EpResult::MultiLoraEval { adapter_losses } => {
+            Ok(Json(TrainMultiLoraEvalResponse { adapter_losses }))
+        }
+        rustrain_ipc::EpResult::Error(e) => Err(err_resp(&e)),
+        _ => Err(err_resp("unexpected result")),
+    }
+}
+
 async fn ep_train_multi_lora(
     State(state): State<Arc<EpRouterState>>,
     Path(id): Path<String>,
@@ -1684,14 +1810,15 @@ fn ep_dispatch_unavailable(message: &str) -> (StatusCode, Json<ErrorResponse>) {
 
 #[cfg(test)]
 mod tensor_http_shape_tests {
-    use base64::{Engine, engine::general_purpose};
+    use base64::{engine::general_purpose, Engine};
 
     use super::{
+        build_multi_lora_window_payload, decode_int64_bytes, ep_dispatch_schedule_error,
+        multi_lora_source_count, normalized_multi_lora_payload_bytes, pack_tensor_slab,
+        project_multi_lora_result, validate_multi_lora_http_shapes,
+        validate_selected_eval_http_shapes, validate_train_http_shapes,
         EpDispatchScheduleError, MultiLoraBatchConfig, MultiLoraDispatchRequest, MultiLoraWindow,
-        StatusCode, TensorHttp, build_multi_lora_window_payload, decode_int64_bytes,
-        ep_dispatch_schedule_error, multi_lora_source_count, normalized_multi_lora_payload_bytes,
-        pack_tensor_slab, project_multi_lora_result, validate_multi_lora_http_shapes,
-        validate_train_http_shapes,
+        StatusCode, TensorHttp,
     };
 
     fn tensor(shape: &[i64]) -> TensorHttp {
@@ -1779,10 +1906,12 @@ mod tensor_http_shape_tests {
     fn train_shape_rejects_mismatched_masks_and_non_positive_dimensions() {
         let input = tensor(&[4, 16]);
         assert!(validate_train_http_shapes(&input, &tensor(&[2, 16]), &tensor(&[4, 16])).is_err());
-        assert!(
-            validate_train_http_shapes(&tensor(&[0, 16]), &tensor(&[0, 16]), &tensor(&[0, 16]))
-                .is_err()
-        );
+        assert!(validate_train_http_shapes(
+            &tensor(&[0, 16]),
+            &tensor(&[0, 16]),
+            &tensor(&[0, 16])
+        )
+        .is_err());
         assert!(
             validate_train_http_shapes(&tensor(&[4, 0]), &tensor(&[4, 0]), &tensor(&[4, 0]))
                 .is_err()
@@ -1809,6 +1938,22 @@ mod tensor_http_shape_tests {
             validate_multi_lora_http_shapes(&invalid, &tensor(&[5, 32]), &tensor(&[5, 32]), 3)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn selected_eval_shape_requires_one_row_or_one_row_per_adapter() {
+        let one = tensor(&[1, 32]);
+        assert_eq!(
+            validate_selected_eval_http_shapes(&one, &one, &one, &[11, 12]).unwrap(),
+            (1, 32)
+        );
+        let two = tensor(&[2, 32]);
+        assert_eq!(
+            validate_selected_eval_http_shapes(&two, &two, &two, &[11, 12]).unwrap(),
+            (2, 32)
+        );
+        assert!(validate_selected_eval_http_shapes(&two, &two, &two, &[11]).is_err());
+        assert!(validate_selected_eval_http_shapes(&one, &one, &one, &[0, 12]).is_err());
     }
 
     #[test]
