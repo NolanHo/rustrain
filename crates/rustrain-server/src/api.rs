@@ -675,6 +675,14 @@ pub fn ep_router(state: Arc<EpAppState>) -> Router {
         .route("/v1/sessions/{id}/train_step", post(ep_train_step))
         .route("/v1/sessions/{id}/train_multi", post(ep_train_multi_lora))
         .route("/v1/sessions/{id}/eval_step", post(ep_eval_step))
+        .route(
+            "/v1/sessions/{id}/save_checkpoint",
+            post(ep_save_checkpoint),
+        )
+        .route(
+            "/v1/sessions/{id}/load_checkpoint",
+            post(ep_load_checkpoint),
+        )
         .route("/v1/sessions/{id}/add_lora", post(ep_add_lora))
         .route("/v1/sessions/{id}/batch_add_lora", post(ep_batch_add_lora))
         .route("/v1/sessions/{id}/remove_lora", post(ep_remove_lora))
@@ -1031,24 +1039,61 @@ async fn ep_export_adapter(
     Path(id): Path<String>,
     Json(req): Json<ExportHttp>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    let generation = state
+        .coordinator
+        .next_generation("export")
+        .map_err(|error| err_resp(&error))?;
     let cmd = rustrain_ipc::EpCommand::ExportAdapter {
         session_id: id,
         path: req.path,
         adapter_id: req.adapter_id,
-        generation: format!(
-            "{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos()
-        ),
+        generation,
     };
     match state.coordinator.dispatch(&cmd) {
         rustrain_ipc::EpResult::Count(n) => Ok(Json(serde_json::json!({"exported": n}))),
         rustrain_ipc::EpResult::Error(e) => Err(err_resp(&e)),
         _ => Err(err_resp("unexpected result")),
     }
+}
+
+async fn ep_save_checkpoint(
+    State(state): State<Arc<EpAppState>>,
+    Path(id): Path<String>,
+    Json(req): Json<CheckpointHttp>,
+) -> Result<Json<CheckpointResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let path = req.path;
+    let response_path = path.clone();
+    let coordinator = Arc::clone(&state.coordinator);
+    let (step, loss) =
+        tokio::task::spawn_blocking(move || coordinator.coordinated_save_checkpoint(&id, &path))
+            .await
+            .map_err(|error| err_resp(&format!("checkpoint save task failed: {error}")))?
+            .map_err(|error| err_resp(&error))?;
+    Ok(Json(CheckpointResponse {
+        step,
+        loss,
+        path: response_path,
+    }))
+}
+
+async fn ep_load_checkpoint(
+    State(state): State<Arc<EpAppState>>,
+    Path(id): Path<String>,
+    Json(req): Json<CheckpointHttp>,
+) -> Result<Json<CheckpointResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let path = req.path;
+    let response_path = path.clone();
+    let coordinator = Arc::clone(&state.coordinator);
+    let (step, loss) =
+        tokio::task::spawn_blocking(move || coordinator.coordinated_load_checkpoint(&id, &path))
+            .await
+            .map_err(|error| err_resp(&format!("checkpoint load task failed: {error}")))?
+            .map_err(|error| err_resp(&error))?;
+    Ok(Json(CheckpointResponse {
+        step,
+        loss,
+        path: response_path,
+    }))
 }
 
 async fn ep_get_status(

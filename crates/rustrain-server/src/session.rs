@@ -66,7 +66,7 @@ pub struct SessLoadDatasetRequest {
     pub seq_len: usize,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct InitLoRARequest {
     pub rank: i64,
     pub alpha: f64,
@@ -130,6 +130,8 @@ pub trait TrainingSession: Send {
         self.save_checkpoint(path)
     }
     fn load_checkpoint(&mut self, path: &str) -> Result<(u64, f64)>;
+    #[doc(hidden)]
+    fn load_checkpoint_in_place(&mut self, path: &str) -> Result<(u64, f64)>;
     fn export_adapter(&self, path: &str, adapter_id: Option<i64>) -> Result<usize>;
     /// Import one PEFT-style adapter as a new dynamic adapter. The fixed
     /// adapter remains reserved as ID 0 and is never overwritten by import.
@@ -146,6 +148,42 @@ pub trait TrainingSession: Send {
 
     /// List all active adapter IDs.
     fn list_lora(&self) -> Vec<i64>;
+}
+
+#[derive(Clone)]
+struct QwenContextSpec {
+    runtime_config: rustrain_qwen3_6::config::Qwen36RuntimeConfig,
+    init: InitLoRARequest,
+    target_layers: Vec<usize>,
+    target_modules: Vec<Qwen36LoraTargetModule>,
+    base_tp_attention: bool,
+    base_tp_mlp: bool,
+    vocab_parallel: bool,
+    data_parallel: bool,
+    expert_parallel: bool,
+    expert_start: usize,
+    expert_count: usize,
+    global_rank: usize,
+    world_size: usize,
+    tp_rank: usize,
+    tp_size: usize,
+    tp_color: usize,
+    ep_rank: usize,
+    ep_size: usize,
+    ep_color: usize,
+    dp_rank: usize,
+    dp_size: usize,
+    dp_color: usize,
+}
+
+struct PendingCheckpointLoad {
+    transaction_id: String,
+    source_path: String,
+    ctx: rustrain_qwen3_6::kernel::CppTrainingContext,
+    dynamic_lora_configs: std::collections::BTreeMap<i64, Qwen36LoraConfig>,
+    state: SessionState,
+    step: u64,
+    last_loss: f64,
 }
 
 #[derive(Debug)]
@@ -176,6 +214,8 @@ pub struct Qwen36Session {
     metrics: Option<Arc<FileMetricsSink>>,
     last_loss: f64,
     step: u64,
+    context_spec: Option<QwenContextSpec>,
+    pending_checkpoint_load: Option<PendingCheckpointLoad>,
     // NCCL marker for EP (comm stored in C++ TrainingContext)
     _nccl_ep: bool,
 }
@@ -184,6 +224,77 @@ pub struct Qwen36Session {
 // The C++ context is only accessed from the thread that owns Qwen36Session.
 // The Mutex in SessionManager ensures single-threaded access.
 unsafe impl Send for Qwen36Session {}
+
+impl Drop for Qwen36Session {
+    fn drop(&mut self) {
+        // Both native contexts borrow the frozen tensors through raw pointers.
+        // Destroy every context explicitly before Rust releases those tensors.
+        self.pending_checkpoint_load = None;
+        self.ctx = None;
+        self.weights = None;
+    }
+}
+
+fn create_qwen_context(
+    weights: &std::collections::BTreeMap<String, Tensor>,
+    compute_kind: Kind,
+    spec: &QwenContextSpec,
+    synchronize_parameters: bool,
+) -> Result<rustrain_qwen3_6::kernel::CppTrainingContext> {
+    let lora_scaling = spec.init.alpha / spec.init.rank as f64;
+    let ctx = rustrain_qwen3_6::kernel::CppTrainingContext::new(
+        weights,
+        &spec.runtime_config,
+        compute_kind,
+        spec.init.lr,
+        spec.init.beta1,
+        spec.init.beta2,
+        spec.init.eps,
+        lora_scaling,
+        spec.init.rank,
+        spec.base_tp_attention,
+        spec.base_tp_mlp,
+        spec.vocab_parallel,
+        spec.data_parallel,
+        spec.expert_parallel,
+        &spec.target_layers,
+        &spec.target_modules,
+        spec.expert_start,
+        spec.expert_count,
+    )?;
+    if spec.world_size > 1 {
+        if synchronize_parameters {
+            ctx.init_parallel_nccl(
+                spec.global_rank,
+                spec.world_size,
+                spec.tp_rank,
+                spec.tp_size,
+                spec.tp_color,
+                spec.ep_rank,
+                spec.ep_size,
+                spec.ep_color,
+                spec.dp_rank,
+                spec.dp_size,
+                spec.dp_color,
+            )?;
+        } else {
+            ctx.attach_parallel_nccl_no_sync(
+                spec.global_rank,
+                spec.world_size,
+                spec.tp_rank,
+                spec.tp_size,
+                spec.tp_color,
+                spec.ep_rank,
+                spec.ep_size,
+                spec.ep_color,
+                spec.dp_rank,
+                spec.dp_size,
+                spec.dp_color,
+            )?;
+        }
+    }
+    Ok(ctx)
+}
 
 impl Qwen36Session {
     pub fn new(device: Device, compute_kind: Kind, metrics_path: PathBuf) -> Self {
@@ -205,6 +316,8 @@ impl Qwen36Session {
             metrics: Some(Arc::new(FileMetricsSink::new(metrics_path))),
             last_loss: 0.0,
             step: 0,
+            context_spec: None,
+            pending_checkpoint_load: None,
             _nccl_ep: false,
         }
     }
@@ -212,6 +325,132 @@ impl Qwen36Session {
     /// Get the device this session is bound to.
     pub fn device(&self) -> Device {
         self.device
+    }
+
+    pub fn prepare_checkpoint_load(
+        &mut self,
+        path: &str,
+        transaction_id: &str,
+    ) -> Result<(u64, f64)> {
+        if transaction_id.is_empty()
+            || !transaction_id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+        {
+            bail!("checkpoint transaction ID must be non-empty and path-safe");
+        }
+        if let Some(pending) = &self.pending_checkpoint_load {
+            if pending.transaction_id == transaction_id {
+                if pending.source_path != path {
+                    bail!(
+                        "checkpoint transaction {transaction_id} is already prepared from {}",
+                        pending.source_path
+                    );
+                }
+                return Ok((pending.step, pending.last_loss));
+            }
+            bail!(
+                "checkpoint transaction {} is already prepared",
+                pending.transaction_id
+            );
+        }
+        let spec = self
+            .context_spec
+            .as_ref()
+            .context("LoRA context specification is unavailable")?
+            .clone();
+        let weights = self
+            .weights
+            .as_ref()
+            .context("base model weights are unavailable")?;
+        let shadow_ctx = create_qwen_context(weights, self.compute_kind, &spec, false)?;
+        let mut candidate = Self {
+            state: self.state.clone(),
+            model_path: self.model_path.clone(),
+            config_toml: self.config_toml.clone(),
+            device: self.device,
+            compute_kind: self.compute_kind,
+            ctx: Some(shadow_ctx),
+            weights: None,
+            dataset: None,
+            lora_rank: self.lora_rank,
+            lora_alpha: self.lora_alpha,
+            lora_target_layers: self.lora_target_layers.clone(),
+            lora_target_modules: self.lora_target_modules.clone(),
+            dynamic_lora_configs: std::collections::BTreeMap::new(),
+            lr: self.lr,
+            metrics: None,
+            last_loss: self.last_loss,
+            step: self.step,
+            context_spec: Some(spec),
+            pending_checkpoint_load: None,
+            _nccl_ep: self._nccl_ep,
+        };
+        let (step, loss) =
+            <Self as TrainingSession>::load_checkpoint_in_place(&mut candidate, path)?;
+        self.pending_checkpoint_load = Some(PendingCheckpointLoad {
+            transaction_id: transaction_id.to_string(),
+            source_path: path.to_string(),
+            ctx: candidate
+                .ctx
+                .take()
+                .context("checkpoint candidate lost its native context")?,
+            dynamic_lora_configs: std::mem::take(&mut candidate.dynamic_lora_configs),
+            state: candidate.state.clone(),
+            step,
+            last_loss: loss,
+        });
+        Ok((step, loss))
+    }
+
+    pub fn commit_checkpoint_load(&mut self, transaction_id: &str) -> Result<(u64, f64)> {
+        let pending = self
+            .pending_checkpoint_load
+            .as_ref()
+            .with_context(|| format!("checkpoint transaction {transaction_id} is not prepared"))?;
+        if pending.transaction_id != transaction_id {
+            bail!(
+                "checkpoint transaction {} is prepared, not {transaction_id}",
+                pending.transaction_id
+            );
+        }
+        let pending = self
+            .pending_checkpoint_load
+            .take()
+            .context("validated checkpoint transaction disappeared")?;
+        self.ctx = Some(pending.ctx);
+        self.dynamic_lora_configs = pending.dynamic_lora_configs;
+        self.state = pending.state;
+        self.step = pending.step;
+        self.last_loss = pending.last_loss;
+        Ok((self.step, self.last_loss))
+    }
+
+    pub fn abort_checkpoint_load(&mut self, transaction_id: &str) -> Result<()> {
+        match self.pending_checkpoint_load.as_ref() {
+            Some(pending) if pending.transaction_id != transaction_id => bail!(
+                "checkpoint transaction {} is prepared, not {transaction_id}",
+                pending.transaction_id
+            ),
+            Some(_) => {
+                self.pending_checkpoint_load = None;
+                Ok(())
+            }
+            None => Ok(()),
+        }
+    }
+
+    fn load_checkpoint_transactional(&mut self, path: &str) -> Result<(u64, f64)> {
+        let transaction_id = format!(
+            "direct-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        );
+        self.prepare_checkpoint_load(path, &transaction_id)?;
+        self.commit_checkpoint_load(&transaction_id)
     }
 
     pub fn export_distributed_adapter(
@@ -678,29 +917,7 @@ impl TrainingSession for Qwen36Session {
                 target_modules: target_modules.clone(),
             },
         )?;
-        let lora_scaling = req.alpha as f64 / req.rank as f64;
-        let ctx = rustrain_qwen3_6::kernel::CppTrainingContext::new(
-            &weights,
-            &runtime_config,
-            self.compute_kind,
-            req.lr,
-            req.beta1,
-            req.beta2,
-            req.eps,
-            lora_scaling,
-            req.rank,
-            base_tp_attention,
-            base_tp_mlp,
-            vocab_parallel,
-            is_data_parallel,
-            is_ep,
-            &all_layers,
-            &target_modules,
-            expert_start,
-            expert_count,
-        )?;
-
-        let nccl_ep = if world_size > 1 {
+        let (tp_color, ep_color, dp_color) = if world_size > 1 {
             let tp_color = *topology
                 .tensor_group(global_rank)?
                 .iter()
@@ -716,19 +933,37 @@ impl TrainingSession for Qwen36Session {
                 .iter()
                 .min()
                 .ok_or_else(|| anyhow!("empty DP process group"))?;
-            ctx.init_parallel_nccl(
-                global_rank,
-                world_size,
-                tp_rank,
-                tp_size,
-                tp_color,
-                expert_rank,
-                ep_size,
-                ep_color,
-                dp_rank,
-                dp_size,
-                dp_color,
-            )?;
+            (tp_color, ep_color, dp_color)
+        } else {
+            (0, 0, 0)
+        };
+        let context_spec = QwenContextSpec {
+            runtime_config: runtime_config.clone(),
+            init: req.clone(),
+            target_layers: all_layers.clone(),
+            target_modules: target_modules.clone(),
+            base_tp_attention,
+            base_tp_mlp,
+            vocab_parallel,
+            data_parallel: is_data_parallel,
+            expert_parallel: is_ep,
+            expert_start,
+            expert_count,
+            global_rank,
+            world_size,
+            tp_rank,
+            tp_size,
+            tp_color,
+            ep_rank: expert_rank,
+            ep_size,
+            ep_color,
+            dp_rank,
+            dp_size,
+            dp_color,
+        };
+        let ctx = create_qwen_context(&weights, self.compute_kind, &context_spec, true)?;
+        let nccl_ep = world_size > 1;
+        if nccl_ep {
             tracing::info!(
                 global_rank,
                 world_size,
@@ -737,14 +972,13 @@ impl TrainingSession for Qwen36Session {
                 tp_size,
                 "NCCL communicator created in C++ for Qwen parallel training"
             );
-            true
-        } else {
-            false
-        };
+        }
 
         let count = ctx.lora_count() as usize;
         self.ctx = Some(ctx);
         self.weights = Some(weights); // Keep alive — C++ holds raw pointers
+        self.context_spec = Some(context_spec);
+        self.pending_checkpoint_load = None;
         self._nccl_ep = nccl_ep;
         self.lora_rank = req.rank;
         self.lora_alpha = req.alpha;
@@ -1121,12 +1355,44 @@ impl TrainingSession for Qwen36Session {
     }
 
     fn load_checkpoint(&mut self, path: &str) -> Result<(u64, f64)> {
+        self.load_checkpoint_transactional(path)
+    }
+
+    fn load_checkpoint_in_place(&mut self, path: &str) -> Result<(u64, f64)> {
         let parallel = checkpoint::ParallelCheckpointManifest::from_env()?;
         let data = checkpoint::load_checkpoint_for_topology(std::path::Path::new(path), &parallel)?;
         let model_path = self
             .model_path
             .as_ref()
             .ok_or_else(|| anyhow!("model path unavailable for checkpoint restore"))?;
+        let current_model_path = std::fs::canonicalize(model_path)
+            .with_context(|| format!("canonicalize current base model path {model_path}"))?;
+        let checkpoint_model_path = std::fs::canonicalize(&data.manifest.model_path).with_context(
+            || {
+                format!(
+                    "canonicalize checkpoint base model path {}",
+                    data.manifest.model_path
+                )
+            },
+        )?;
+        if checkpoint_model_path != current_model_path {
+            bail!(
+                "checkpoint base model {} does not match loaded model {}",
+                checkpoint_model_path.display(),
+                current_model_path.display()
+            );
+        }
+        if data.manifest.lora_rank != self.lora_rank
+            || data.manifest.lora_alpha.to_bits() != self.lora_alpha.to_bits()
+        {
+            bail!(
+                "checkpoint fixed LoRA rank/alpha {}/{} does not match session {}/{}",
+                data.manifest.lora_rank,
+                data.manifest.lora_alpha,
+                self.lora_rank,
+                self.lora_alpha
+            );
+        }
         let runtime_config =
             rustrain_qwen3_6::config::read_qwen36_runtime_config(std::path::Path::new(model_path))?;
         let fixed_config = Qwen36LoraConfig {
@@ -1150,14 +1416,21 @@ impl TrainingSession for Qwen36Session {
                 module: slot.module.cpp_name().to_string(),
             })
             .collect::<Vec<_>>();
-        if parallel.world_size > 1 {
+        if parallel.world_size > 1
+            || !data.manifest.fixed_shard_layouts.is_empty()
+            || !data.manifest.fixed_slot_identities.is_empty()
+        {
             checkpoint::validate_fixed_tp_resume(
                 &data.manifest,
                 &expected_fixed_layouts,
                 &expected_fixed_identities,
             )?;
         }
-        if parallel.world_size > 1 {
+        if parallel.world_size > 1
+            || data.manifest.dynamic_adapters.iter().any(|adapter| {
+                !adapter.shard_layouts.is_empty() || !adapter.slot_identities.is_empty()
+            })
+        {
             for dynamic in &data.dynamic_adapters {
                 let target_modules = dynamic
                     .manifest
@@ -1196,6 +1469,62 @@ impl TrainingSession for Qwen36Session {
                 )?;
             }
         }
+        let mut dynamic_ids = std::collections::BTreeSet::new();
+        let mut dynamic_signature: Option<&checkpoint::DynamicAdapterManifest> = None;
+        for dynamic in &data.dynamic_adapters {
+            let manifest = &dynamic.manifest;
+            if manifest.id <= 0 || !dynamic_ids.insert(manifest.id) {
+                bail!("checkpoint dynamic adapter IDs must be positive and unique");
+            }
+            if i64::try_from(manifest.optimizer_step).is_err() {
+                bail!(
+                    "dynamic adapter {} optimizer step exceeds native range",
+                    manifest.id
+                );
+            }
+            if let Some(reference) = dynamic_signature {
+                if manifest.rank != reference.rank
+                    || manifest.alpha.to_bits() != reference.alpha.to_bits()
+                    || manifest.target_layers != reference.target_layers
+                    || manifest.target_modules != reference.target_modules
+                {
+                    bail!(
+                        "dynamic checkpoint adapters must share rank, alpha, target layers, and target modules"
+                    );
+                }
+            } else {
+                dynamic_signature = Some(manifest);
+            }
+            let target_modules = manifest
+                .target_modules
+                .iter()
+                .map(|name| Qwen36LoraTargetModule::parse(name))
+                .collect::<Result<Vec<_>>>()?;
+            let config = Qwen36LoraConfig {
+                rank: manifest.rank,
+                alpha: manifest.alpha,
+                target_layers: manifest.target_layers.clone(),
+                target_modules,
+            };
+            rustrain_qwen3_6::lora::validate_lora_targets(&runtime_config, &config)?;
+            let active_slots = rustrain_qwen3_6::lora::native_lora_slots(&runtime_config, &config)
+                .into_iter()
+                .filter(|slot| slot.active)
+                .count();
+            let expected_optimizer_count = active_slots.saturating_mul(2);
+            if dynamic.lora_a.len() != active_slots
+                || dynamic.lora_b.len() != active_slots
+                || dynamic.adam_m.len() != expected_optimizer_count
+                || dynamic.adam_v.len() != expected_optimizer_count
+                || manifest.parameter_count != active_slots
+                || manifest.optimizer_count != expected_optimizer_count
+            {
+                bail!(
+                    "dynamic adapter {} tensor count does not match its runtime slot signature",
+                    manifest.id
+                );
+            }
+        }
         if !data.dynamic_adapters.is_empty() {
             if !self.dynamic_lora_configs.is_empty() {
                 bail!("cannot load dynamic LoRA checkpoint into a session with active adapters");
@@ -1229,8 +1558,12 @@ impl TrainingSession for Qwen36Session {
                     .map(Qwen36LoraTargetModule::cpp_name)
                     .collect::<Vec<_>>()
                     .join(",");
-                let allocated_id =
-                    ctx.add_lora(lora_config.rank, lora_config.alpha, &layer_ids, &module_csv)?;
+                let allocated_id = ctx.add_lora_for_restore(
+                    lora_config.rank,
+                    lora_config.alpha,
+                    &layer_ids,
+                    &module_csv,
+                )?;
                 if allocated_id != dynamic.manifest.id {
                     if let Err(error) = ctx.set_adapter_id(allocated_id, dynamic.manifest.id) {
                         let _ = ctx.remove_lora(allocated_id);
@@ -1410,6 +1743,7 @@ impl TrainingSession for Qwen36Session {
         }
         self.step = data.manifest.step;
         self.last_loss = data.manifest.loss;
+        self.state = SessionState::Paused { step: self.step };
         Ok((data.manifest.step, data.manifest.loss))
     }
 

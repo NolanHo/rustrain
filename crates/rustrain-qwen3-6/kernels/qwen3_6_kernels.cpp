@@ -2171,6 +2171,7 @@ struct TrainingContext {
     std::vector<LoRAAdapter> adapters;
     int64_t next_adapter_id = 0;
     int64_t multi_lora_invocation = 0;
+    bool restore_without_parameter_sync = false;
 
     // LoRA cache: pre-concatenated A/B per (layer, module) pair
     // Invalidated when adapters change or after Adam update
@@ -5292,7 +5293,7 @@ static at::Tensor mtp_compute_loss(
 extern "C" {
 
 __attribute__((visibility("default"))) int64_t qwen36_kernel_abi_version() {
-    return 20;
+    return 21;
 }
 
 // Benchmark/metrics helper. The orthogonal EP, DP, and TP reductions propagate
@@ -6854,7 +6855,8 @@ static int32_t qwen36_init_parallel_nccl_impl(
     int rank, int world_size,
     int tp_rank, int tp_size, int tp_color,
     int ep_rank, int ep_size, int ep_color,
-    int dp_rank, int dp_size, int dp_color
+    int dp_rank, int dp_size, int dp_color,
+    bool synchronize_parameters
 ) {
     auto* ctx = reinterpret_cast<TrainingContext*>(ctx_ptr);
 
@@ -6925,7 +6927,8 @@ static int32_t qwen36_init_parallel_nccl_impl(
             lc.nccl_comm = layer_comm;
             lc.nccl_stream = layer_stream;
         }
-        synchronize_fixed_replicated_lora_parameters(ctx);
+        if (synchronize_parameters)
+            synchronize_fixed_replicated_lora_parameters(ctx);
         return 0;
     }
     if (world_size <= 1) return 0;  // no EP needed
@@ -7117,7 +7120,8 @@ static int32_t qwen36_init_parallel_nccl_impl(
         lc.nccl_stream = layer_stream;
     }
 
-    synchronize_fixed_replicated_lora_parameters(ctx);
+    if (synchronize_parameters)
+        synchronize_fixed_replicated_lora_parameters(ctx);
     return 0;
 }
 
@@ -7132,7 +7136,31 @@ __attribute__((visibility("default"))) int32_t qwen36_init_parallel_nccl(
         ctx_ptr, rank, world_size,
         tp_rank, tp_size, tp_color,
         ep_rank, ep_size, ep_color,
-        dp_rank, dp_size, dp_color);
+        dp_rank, dp_size, dp_color,
+        /*synchronize_parameters=*/true);
+}
+
+// Attach a shadow restore context to process-cached communicators without
+// broadcasting its temporary random LoRA initialization. Checkpoint tensors
+// replace every active parameter before the context can become live.
+__attribute__((visibility("default"))) int32_t qwen36_attach_parallel_nccl_no_sync(
+    void* ctx_ptr,
+    int32_t rank, int32_t world_size,
+    int32_t tp_rank, int32_t tp_size, int32_t tp_color,
+    int32_t ep_rank, int32_t ep_size, int32_t ep_color,
+    int32_t dp_rank, int32_t dp_size, int32_t dp_color
+) {
+    if (world_size > 1 && !g_nccl_initialized) {
+        fprintf(stderr,
+            "[parallel_nccl] restore attach requires initialized process communicators\n");
+        return -1;
+    }
+    return qwen36_init_parallel_nccl_impl(
+        ctx_ptr, rank, world_size,
+        tp_rank, tp_size, tp_color,
+        ep_rank, ep_size, ep_color,
+        dp_rank, dp_size, dp_color,
+        /*synchronize_parameters=*/false);
 }
 
 __attribute__((visibility("default"))) int32_t qwen36_init_nccl(
@@ -7165,7 +7193,8 @@ __attribute__((visibility("default"))) int32_t qwen36_init_nccl(
         ctx_ptr, rank, world_size,
         tp_rank, tp_size, rank / std::max(tp_size, 1),
         ep_rank, ep_size, dp_rank * std::max(tp_size, 1) + tp_rank,
-        dp_rank, dp_size, ep_rank * std::max(tp_size, 1) + tp_rank);
+        dp_rank, dp_size, ep_rank * std::max(tp_size, 1) + tp_rank,
+        /*synchronize_parameters=*/true);
 }
 
 // Set NCCL communicator for Expert Parallel all-reduce (legacy, from Rust)
@@ -7403,7 +7432,8 @@ int64_t qwen36_add_lora(
             adapter.adam_state[i] = std::move(adam_states);
             adapter.grad_accum[i] = std::move(grad_accumulators);
         }
-        synchronize_adapter_replicated_lora_parameters(ctx, adapter);
+        if (!ctx->restore_without_parameter_sync)
+            synchronize_adapter_replicated_lora_parameters(ctx, adapter);
         int64_t id = adapter.id;
         ctx->adapters.push_back(std::move(adapter));
         ctx->lora_cache_valid = false;
@@ -7414,6 +7444,23 @@ int64_t qwen36_add_lora(
         fprintf(stderr, "[q36] add_lora FAILED: %s\n", e.what());
         return -1;
     }
+}
+
+__attribute__((visibility("default")))
+int64_t qwen36_add_lora_for_restore(
+    void* ctx_ptr,
+    int64_t rank, double alpha,
+    const int64_t* target_layers, int64_t num_target_layers,
+    const char* target_modules_str
+) {
+    auto* ctx = reinterpret_cast<TrainingContext*>(ctx_ptr);
+    if (!ctx) return -1;
+    ctx->restore_without_parameter_sync = true;
+    const int64_t id = qwen36_add_lora(
+        ctx_ptr, rank, alpha, target_layers, num_target_layers,
+        target_modules_str);
+    ctx->restore_without_parameter_sync = false;
+    return id;
 }
 
 // Restore a dynamic adapter's externally visible ID during checkpoint load.

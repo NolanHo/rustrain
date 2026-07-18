@@ -37,6 +37,11 @@ extern "C" int32_t qwen36_init_parallel_nccl(
     int32_t, int32_t, int32_t,
     int32_t, int32_t, int32_t,
     int32_t, int32_t, int32_t);
+extern "C" int32_t qwen36_attach_parallel_nccl_no_sync(
+    void*, int32_t, int32_t,
+    int32_t, int32_t, int32_t,
+    int32_t, int32_t, int32_t,
+    int32_t, int32_t, int32_t);
 extern "C" int32_t qwen36_set_mtp_weights(
     void*, void*, void*, void*, void*, void**, int64_t, void*, int64_t);
 extern "C" int64_t qwen36_get_lora_count(void*);
@@ -51,6 +56,8 @@ extern "C" int64_t qwen36_get_step_count(void*);
 extern "C" int32_t qwen36_set_step_count(void*, int64_t);
 extern "C" double qwen36_train_step(void*, void*, void*, void*);
 extern "C" int64_t qwen36_add_lora(
+    void*, int64_t, double, const int64_t*, int64_t, const char*);
+extern "C" int64_t qwen36_add_lora_for_restore(
     void*, int64_t, double, const int64_t*, int64_t, const char*);
 extern "C" void* qwen36_get_adapter_lora_tensor(
     void*, int64_t, int64_t, const char*, int32_t);
@@ -69,7 +76,7 @@ extern "C" void qwen36_free_training_context(void*);
 
 namespace {
 
-constexpr int64_t kAbiVersion = 20;
+constexpr int64_t kAbiVersion = 21;
 constexpr int32_t kBaseTpAttention = 1 << 0;
 constexpr int32_t kDataParallel = 1 << 1;
 constexpr int32_t kVocabParallel = 1 << 2;
@@ -823,11 +830,38 @@ int main() {
         kVocab, 1e-5, kLoraRank, &target_layer, 1, targets,
         distributed_flags);
     assert(resumed);
-    assert(qwen36_init_parallel_nccl(
+    std::vector<std::array<at::Tensor, 2>> shadow_fixed_before_attach;
+    shadow_fixed_before_attach.reserve(kLoraPairs);
+    for (int64_t slot = 0; slot < kLoraPairs; ++slot) {
+        auto* a = reinterpret_cast<at::Tensor*>(
+            qwen36_get_lora_a(resumed, slot));
+        auto* b = reinterpret_cast<at::Tensor*>(
+            qwen36_get_lora_b(resumed, slot));
+        assert(a && b);
+        if (dp_rank > 0) {
+            auto divergent_a = a->detach().clone().add_(0.125);
+            auto divergent_b = b->detach().clone().add_(0.25);
+            assert(qwen36_set_lora_tensor(
+                resumed, slot, 0, &divergent_a) == 0);
+            assert(qwen36_set_lora_tensor(
+                resumed, slot, 1, &divergent_b) == 0);
+        }
+        shadow_fixed_before_attach.push_back({a->clone(), b->clone()});
+    }
+    assert(qwen36_attach_parallel_nccl_no_sync(
         resumed, rank, world,
         tp_rank, 2, tp_color,
         ep_rank, 2, ep_color,
         dp_rank, dp_size, dp_color) == 0);
+    for (int64_t slot = 0; slot < kLoraPairs; ++slot) {
+        auto* a = reinterpret_cast<at::Tensor*>(
+            qwen36_get_lora_a(resumed, slot));
+        auto* b = reinterpret_cast<at::Tensor*>(
+            qwen36_get_lora_b(resumed, slot));
+        assert(a && b);
+        assert(max_diff(*a, shadow_fixed_before_attach[slot][0]) == 0.0);
+        assert(max_diff(*b, shadow_fixed_before_attach[slot][1]) == 0.0);
+    }
     for (int64_t slot = 0; slot < kLoraPairs; ++slot) {
         assert(qwen36_set_lora_tensor(
             resumed, slot, 0, &checkpoint_a[slot]) == 0);
@@ -1125,9 +1159,9 @@ int main() {
                 ->to(at::kCPU).clone(),
         });
     }
-    const int64_t resumed_tenant_one = qwen36_add_lora(
+    const int64_t resumed_tenant_one = qwen36_add_lora_for_restore(
         resumed, kLoraRank, kLoraRank, dynamic_targets, 1, targets);
-    const int64_t resumed_tenant_two = qwen36_add_lora(
+    const int64_t resumed_tenant_two = qwen36_add_lora_for_restore(
         resumed, kLoraRank, kLoraRank, dynamic_targets, 1, targets);
     assert(resumed_tenant_one == tenant_one);
     assert(resumed_tenant_two == tenant_two);
@@ -1150,6 +1184,24 @@ int main() {
     assert(qwen36_set_adapter_step_count(
         resumed, resumed_tenant_one,
         qwen36_get_adapter_step_count(distributed, tenant_one)) == 0);
+    assert(qwen36_get_adapter_step_count(resumed, resumed_tenant_one) ==
+        qwen36_get_adapter_step_count(distributed, tenant_one));
+    double restored_dynamic_diff = 0.0;
+    for (const auto& fixture : dynamic_one) {
+        for (int is_b = 0; is_b < 2; ++is_b) {
+            restored_dynamic_diff = std::max(restored_dynamic_diff, max_diff(
+                *dynamic_tensor(distributed, tenant_one, fixture.module, is_b),
+                *dynamic_tensor(resumed, resumed_tenant_one, fixture.module, is_b)));
+            for (int is_v = 0; is_v < 2; ++is_v) {
+                restored_dynamic_diff = std::max(restored_dynamic_diff, max_diff(
+                    *dynamic_state(
+                        distributed, tenant_one, fixture.module, is_b, is_v),
+                    *dynamic_state(
+                        resumed, resumed_tenant_one, fixture.module, is_b, is_v)));
+            }
+        }
+    }
+    assert(restored_dynamic_diff == 0.0);
     const int64_t fixed_step_before_resumed_dynamic =
         qwen36_get_step_count(distributed);
     const double continued_dynamic_loss = qwen36_train_multi_lora_selected(

@@ -7,10 +7,12 @@
 //!
 //! Workers use `worker_main()` to enter the wait loop.
 
+use std::ffi::CString;
 use std::io;
 use std::ops::Range;
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::os::unix::ffi::OsStrExt;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use rustrain_ipc::{EpChannel, EpCommand, EpResult, EpWorker};
@@ -29,6 +31,7 @@ pub struct EpCoordinator {
     worker_pids: Vec<u32>,
     dispatch_lock: Mutex<()>,
     shutdown_started: AtomicBool,
+    transaction_sequence: AtomicU64,
 }
 
 impl EpCoordinator {
@@ -120,6 +123,7 @@ impl EpCoordinator {
             worker_pids,
             dispatch_lock: Mutex::new(()),
             shutdown_started: AtomicBool::new(false),
+            transaction_sequence: AtomicU64::new(0),
         })
     }
 
@@ -129,6 +133,10 @@ impl EpCoordinator {
             Ok(guard) => guard,
             Err(error) => return EpResult::Error(format!("IPC dispatch lock poisoned: {error}")),
         };
+        self.dispatch_locked(cmd)
+    }
+
+    fn dispatch_locked(&self, cmd: &EpCommand) -> EpResult {
         if self.shutdown_started.load(Ordering::Acquire) {
             return EpResult::Error("EP coordinator is shut down".to_string());
         }
@@ -153,6 +161,181 @@ impl EpCoordinator {
                 };
                 EpResult::Error(message)
             }
+        }
+    }
+
+    pub fn next_generation(&self, operation: &str) -> Result<String, String> {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|error| format!("system clock precedes UNIX epoch: {error}"))?
+            .as_nanos();
+        let sequence = self.transaction_sequence.fetch_add(1, Ordering::Relaxed);
+        checkpoint_generation(std::process::id(), nanos, sequence, operation)
+    }
+
+    pub fn coordinated_save_checkpoint(
+        &self,
+        session_id: &str,
+        final_path: &str,
+    ) -> Result<(u64, f64), String> {
+        let _guard = self
+            .dispatch_lock
+            .lock()
+            .map_err(|error| format!("IPC dispatch lock poisoned: {error}"))?;
+        if self.shutdown_started.load(Ordering::Acquire) {
+            return Err("EP coordinator is shut down".into());
+        }
+
+        let generation = self.next_generation("save")?;
+        let final_path = Path::new(final_path);
+        let expected_staging = checkpoint_staging_path(final_path, &generation)?;
+        let staging_string = expected_staging
+            .to_str()
+            .ok_or_else(|| "checkpoint staging path is not UTF-8".to_string())?
+            .to_string();
+        let staging = create_checkpoint_staging(final_path, &generation)?;
+        debug_assert_eq!(staging, expected_staging);
+
+        let result = (|| {
+            let saved = match expect_checkpoint_result(
+                self.dispatch_locked(&EpCommand::PrepareSaveCheckpoint {
+                    session_id: session_id.to_string(),
+                    path: staging_string.clone(),
+                    generation: generation.clone(),
+                }),
+                "prepare distributed checkpoint save",
+            ) {
+                Ok(result) => result,
+                Err(error) => {
+                    if !self.shutdown_started.load(Ordering::Acquire) {
+                        self.abort_checkpoint_locked(session_id, &generation)?;
+                    }
+                    return Err(error);
+                }
+            };
+
+            let validated = match expect_checkpoint_result(
+                self.dispatch_locked(&EpCommand::PrepareLoadCheckpoint {
+                    session_id: session_id.to_string(),
+                    path: staging_string.clone(),
+                    transaction_id: generation.clone(),
+                }),
+                "validate distributed checkpoint staging",
+            ) {
+                Ok(result) => result,
+                Err(error) => {
+                    if !self.shutdown_started.load(Ordering::Acquire) {
+                        self.abort_checkpoint_locked(session_id, &generation)?;
+                    }
+                    return Err(error);
+                }
+            };
+            if !checkpoint_metadata_matches(saved, validated) {
+                self.abort_checkpoint_locked(session_id, &generation)?;
+                return Err(format!(
+                    "saved checkpoint metadata {saved:?} differs from validated metadata {validated:?}"
+                ));
+            }
+            self.abort_checkpoint_locked(session_id, &generation)?;
+            publish_checkpoint_noreplace(&staging, final_path)?;
+            Ok(saved)
+        })();
+
+        if result.is_err() && staging.exists() {
+            if let Err(cleanup_error) = std::fs::remove_dir_all(&staging) {
+                tracing::warn!(
+                    path = %staging.display(),
+                    error = %cleanup_error,
+                    "failed to clean checkpoint transaction staging"
+                );
+            }
+        }
+        result
+    }
+
+    pub fn coordinated_load_checkpoint(
+        &self,
+        session_id: &str,
+        path: &str,
+    ) -> Result<(u64, f64), String> {
+        let _guard = self
+            .dispatch_lock
+            .lock()
+            .map_err(|error| format!("IPC dispatch lock poisoned: {error}"))?;
+        if self.shutdown_started.load(Ordering::Acquire) {
+            return Err("EP coordinator is shut down".into());
+        }
+
+        let transaction_id = self.next_generation("load")?;
+        let prepared = match expect_checkpoint_result(
+            self.dispatch_locked(&EpCommand::PrepareLoadCheckpoint {
+                session_id: session_id.to_string(),
+                path: path.to_string(),
+                transaction_id: transaction_id.clone(),
+            }),
+            "prepare distributed checkpoint load",
+        ) {
+            Ok(result) => result,
+            Err(error) => {
+                if !self.shutdown_started.load(Ordering::Acquire) {
+                    self.abort_checkpoint_locked(session_id, &transaction_id)?;
+                }
+                return Err(error);
+            }
+        };
+
+        let committed = expect_checkpoint_result(
+            self.dispatch_locked(&EpCommand::CommitLoadCheckpoint {
+                session_id: session_id.to_string(),
+                transaction_id,
+            }),
+            "commit distributed checkpoint load",
+        );
+        match committed {
+            Ok(committed) if checkpoint_metadata_matches(committed, prepared) => Ok(committed),
+            Ok(committed) => {
+                self.enter_terminal();
+                Err(format!(
+                    "committed checkpoint metadata {committed:?} differs from prepared metadata {prepared:?}"
+                ))
+            }
+            Err(error) => {
+                self.enter_terminal();
+                Err(error)
+            }
+        }
+    }
+
+    fn abort_checkpoint_locked(
+        &self,
+        session_id: &str,
+        transaction_id: &str,
+    ) -> Result<(), String> {
+        match self.dispatch_locked(&EpCommand::AbortLoadCheckpoint {
+            session_id: session_id.to_string(),
+            transaction_id: transaction_id.to_string(),
+        }) {
+            EpResult::Ok => Ok(()),
+            EpResult::Error(error) => {
+                self.enter_terminal();
+                Err(format!("abort checkpoint transaction: {error}"))
+            }
+            other => {
+                self.enter_terminal();
+                Err(format!(
+                    "abort checkpoint transaction returned unexpected result: {other:?}"
+                ))
+            }
+        }
+    }
+
+    fn enter_terminal(&self) {
+        if self
+            .shutdown_started
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            self.terminate_workers();
         }
     }
 
@@ -195,6 +378,99 @@ impl EpCoordinator {
 
     fn terminate_workers(&self) {
         terminate_worker_pids(&self.worker_pids);
+    }
+}
+
+fn expect_checkpoint_result(result: EpResult, operation: &str) -> Result<(u64, f64), String> {
+    match result {
+        EpResult::Checkpoint { step, loss } => Ok((step, loss)),
+        EpResult::Error(error) => Err(format!("{operation}: {error}")),
+        other => Err(format!("{operation} returned unexpected result: {other:?}")),
+    }
+}
+
+fn checkpoint_metadata_matches(left: (u64, f64), right: (u64, f64)) -> bool {
+    left.0 == right.0 && left.1.to_bits() == right.1.to_bits()
+}
+
+fn checkpoint_generation(
+    pid: u32,
+    nanos: u128,
+    sequence: u64,
+    operation: &str,
+) -> Result<String, String> {
+    if operation.is_empty()
+        || !operation
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+    {
+        return Err("checkpoint operation must be non-empty path-safe ASCII".into());
+    }
+    let generation = format!("ep-{pid}-{nanos}-{sequence:020}-{operation}");
+    if generation.len() > 256 {
+        return Err("checkpoint generation must be at most 256 characters".into());
+    }
+    Ok(generation)
+}
+
+fn checkpoint_staging_path(final_path: &Path, generation: &str) -> Result<PathBuf, String> {
+    if generation.is_empty()
+        || !generation
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+    {
+        return Err("checkpoint generation must be non-empty path-safe ASCII".into());
+    }
+    let file_name = final_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty() && *name != "." && *name != "..")
+        .ok_or_else(|| "checkpoint destination must have a UTF-8 file name".to_string())?;
+    Ok(final_path.with_file_name(format!(
+        ".{file_name}.rustrain-checkpoint-{generation}.partial"
+    )))
+}
+
+fn create_checkpoint_staging(final_path: &Path, generation: &str) -> Result<PathBuf, String> {
+    if final_path.exists() {
+        return Err(format!(
+            "checkpoint destination already exists: {}",
+            final_path.display()
+        ));
+    }
+    let staging = checkpoint_staging_path(final_path, generation)?;
+    std::fs::create_dir(&staging).map_err(|error| {
+        format!(
+            "create exclusive checkpoint staging {}: {error}",
+            staging.display()
+        )
+    })?;
+    Ok(staging)
+}
+
+fn publish_checkpoint_noreplace(staging: &Path, final_path: &Path) -> Result<(), String> {
+    let staging_c = CString::new(staging.as_os_str().as_bytes())
+        .map_err(|_| "checkpoint staging path contains a NUL byte".to_string())?;
+    let final_c = CString::new(final_path.as_os_str().as_bytes())
+        .map_err(|_| "checkpoint destination path contains a NUL byte".to_string())?;
+    let result = unsafe {
+        libc::renameat2(
+            libc::AT_FDCWD,
+            staging_c.as_ptr(),
+            libc::AT_FDCWD,
+            final_c.as_ptr(),
+            libc::RENAME_NOREPLACE,
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        let error = io::Error::last_os_error();
+        Err(format!(
+            "publish checkpoint {} as {} without replacement: {error}",
+            staging.display(),
+            final_path.display()
+        ))
     }
 }
 
@@ -592,6 +868,32 @@ fn execute_command(session: &mut Qwen36Session, cmd: &EpCommand) -> EpResult {
             Ok(n) => EpResult::Count(n),
             Err(e) => EpResult::Error(e.to_string()),
         },
+        EpCommand::PrepareSaveCheckpoint {
+            path, generation, ..
+        } => match session.save_checkpoint_with_generation(path, Some(generation)) {
+            Ok((step, loss)) => EpResult::Checkpoint { step, loss },
+            Err(error) => EpResult::Error(error.to_string()),
+        },
+        EpCommand::PrepareLoadCheckpoint {
+            path,
+            transaction_id,
+            ..
+        } => match session.prepare_checkpoint_load(path, transaction_id) {
+            Ok((step, loss)) => EpResult::Checkpoint { step, loss },
+            Err(error) => EpResult::Error(error.to_string()),
+        },
+        EpCommand::CommitLoadCheckpoint { transaction_id, .. } => {
+            match session.commit_checkpoint_load(transaction_id) {
+                Ok((step, loss)) => EpResult::Checkpoint { step, loss },
+                Err(error) => EpResult::Error(error.to_string()),
+            }
+        }
+        EpCommand::AbortLoadCheckpoint { transaction_id, .. } => {
+            match session.abort_checkpoint_load(transaction_id) {
+                Ok(()) => EpResult::Ok,
+                Err(error) => EpResult::Error(error.to_string()),
+            }
+        }
         EpCommand::Status { .. } => {
             let s = session.status();
             EpResult::Status {
@@ -620,6 +922,10 @@ fn command_session_id(cmd: &EpCommand) -> &str {
         | EpCommand::TrainMultiLora { session_id, .. }
         | EpCommand::EvalStep { session_id, .. }
         | EpCommand::ExportAdapter { session_id, .. }
+        | EpCommand::PrepareSaveCheckpoint { session_id, .. }
+        | EpCommand::PrepareLoadCheckpoint { session_id, .. }
+        | EpCommand::CommitLoadCheckpoint { session_id, .. }
+        | EpCommand::AbortLoadCheckpoint { session_id, .. }
         | EpCommand::Status { session_id } => session_id,
         EpCommand::Shutdown => "",
     }
@@ -816,8 +1122,10 @@ fn tensor_element_range(
 #[cfg(test)]
 mod tests {
     use super::{
-        SourceShard, create_worker_session, delete_worker_session, multi_lora_rows,
-        require_worker_session, source_shard_for_topology, tensor_element_range, train_step_rows,
+        SourceShard, checkpoint_generation, checkpoint_staging_path, create_checkpoint_staging,
+        checkpoint_metadata_matches, create_worker_session, delete_worker_session,
+        multi_lora_rows, publish_checkpoint_noreplace, require_worker_session,
+        source_shard_for_topology, tensor_element_range, train_step_rows,
         validate_flat_tensor_lengths,
     };
     use rustrain_parallel::topology::ParallelTopology;
@@ -941,5 +1249,70 @@ mod tests {
         delete_worker_session(&mut active, "tenant-a").unwrap();
         create_worker_session(&mut active, "tenant-b").unwrap();
         require_worker_session(&active, "tenant-b").unwrap();
+    }
+
+    #[test]
+    fn checkpoint_generation_is_unique_and_path_safe() {
+        let first = checkpoint_generation(42, 100, 0, "save").unwrap();
+        let second = checkpoint_generation(42, 100, 1, "save").unwrap();
+        assert_ne!(first, second);
+        assert!(
+            first
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+        );
+        assert!(checkpoint_generation(42, 100, 2, "bad/path").is_err());
+        assert!(checkpoint_generation(42, 100, 3, "").is_err());
+    }
+
+    #[test]
+    fn checkpoint_metadata_compares_loss_bits_including_nan() {
+        let nan = f64::from_bits(0x7ff8_0000_0000_0042);
+        assert!(checkpoint_metadata_matches((7, nan), (7, nan)));
+        assert!(!checkpoint_metadata_matches((8, nan), (7, nan)));
+        assert!(!checkpoint_metadata_matches(
+            (7, nan),
+            (7, f64::from_bits(nan.to_bits() + 1))
+        ));
+    }
+
+    #[test]
+    fn checkpoint_staging_is_exclusive_and_sibling_scoped() {
+        let dir = tempfile::tempdir().unwrap();
+        let final_path = dir.path().join("checkpoint");
+        let generation = checkpoint_generation(42, 100, 0, "save").unwrap();
+        let expected = checkpoint_staging_path(&final_path, &generation).unwrap();
+        assert_eq!(expected.parent(), final_path.parent());
+
+        let staging = create_checkpoint_staging(&final_path, &generation).unwrap();
+        assert_eq!(staging, expected);
+        assert!(staging.is_dir());
+        assert!(create_checkpoint_staging(&final_path, &generation).is_err());
+    }
+
+    #[test]
+    fn checkpoint_publish_never_replaces_existing_destination() {
+        let dir = tempfile::tempdir().unwrap();
+        let final_path = dir.path().join("checkpoint");
+        let generation = checkpoint_generation(42, 100, 0, "save").unwrap();
+        let staging = create_checkpoint_staging(&final_path, &generation).unwrap();
+        std::fs::write(staging.join("receipt"), b"prepared").unwrap();
+        std::fs::create_dir(&final_path).unwrap();
+        std::fs::write(final_path.join("receipt"), b"existing").unwrap();
+
+        assert!(publish_checkpoint_noreplace(&staging, &final_path).is_err());
+        assert_eq!(
+            std::fs::read(final_path.join("receipt")).unwrap(),
+            b"existing"
+        );
+        assert!(staging.exists());
+
+        std::fs::remove_dir_all(&final_path).unwrap();
+        publish_checkpoint_noreplace(&staging, &final_path).unwrap();
+        assert!(!staging.exists());
+        assert_eq!(
+            std::fs::read(final_path.join("receipt")).unwrap(),
+            b"prepared"
+        );
     }
 }

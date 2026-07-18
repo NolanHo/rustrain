@@ -160,9 +160,11 @@ struct KernelHandles {
     set_nccl_comm: FnSetNcclComm,
     init_nccl: FnInitNccl,
     init_parallel_nccl: FnInitParallelNccl,
+    attach_parallel_nccl_no_sync: FnInitParallelNccl,
     set_cuda_device: FnSetCudaDevice,
     set_base_tp_mlp: FnSetBaseTpMlp,
     add_lora: FnAddLora,
+    add_lora_for_restore: FnAddLora,
     remove_lora: FnRemoveLora,
     list_lora: FnListLora,
     get_adapter_lora_tensor: FnGetAdapterLoraTensor,
@@ -212,7 +214,7 @@ unsafe fn load_kernels() -> Option<KernelHandles> {
         }};
     }
     let abi_version: FnKernelAbiVersion = sym!("qwen36_kernel_abi_version");
-    if abi_version() != 20 {
+    if abi_version() != 21 {
         return None;
     }
     Some(KernelHandles {
@@ -240,9 +242,11 @@ unsafe fn load_kernels() -> Option<KernelHandles> {
         set_nccl_comm: sym!("qwen36_set_nccl_comm"),
         init_nccl: sym!("qwen36_init_nccl"),
         init_parallel_nccl: sym!("qwen36_init_parallel_nccl"),
+        attach_parallel_nccl_no_sync: sym!("qwen36_attach_parallel_nccl_no_sync"),
         set_cuda_device: sym!("qwen36_set_cuda_device"),
         set_base_tp_mlp: sym!("qwen36_set_base_tp_mlp"),
         add_lora: sym!("qwen36_add_lora"),
+        add_lora_for_restore: sym!("qwen36_add_lora_for_restore"),
         remove_lora: sym!("qwen36_remove_lora"),
         list_lora: sym!("qwen36_list_lora"),
         get_adapter_lora_tensor: sym!("qwen36_get_adapter_lora_tensor"),
@@ -763,7 +767,7 @@ impl CppTrainingContext {
         expert_count: usize,
     ) -> Result<Self> {
         let kh = get_kernels().ok_or_else(|| anyhow::anyhow!("kernels not loaded"))?;
-        let mut weight_ptrs = build_weight_ptrs(weights, config);
+        let weight_ptrs = build_weight_ptrs(weights, config);
         let layer_configs = build_layer_configs(config, expert_start, expert_count);
 
         let embed_ptr = get_ptr(
@@ -780,21 +784,19 @@ impl CppTrainingContext {
 
         let compute_type = compute_kind as i32;
 
-        // LEAK the Vecs so their backing arrays survive (C++ holds raw pointers)
+        // The C++ constructor copies these pointer/config arrays into its own
+        // vectors before returning. The tensors they point to remain owned by
+        // the Rust session for the full context lifetime.
         let wp_ptr = weight_ptrs.as_ptr() as *mut *mut c_void;
         let wp_len = weight_ptrs.len();
-        std::mem::forget(weight_ptrs);
         let lc_ptr = layer_configs.as_ptr() as *mut c_void;
-        std::mem::forget(layer_configs);
 
-        // Convert target_layers to i64 array (leaked to keep alive)
+        // The constructor also consumes the target layer array synchronously.
         let target_i64: Vec<i64> = target_layers.iter().map(|&x| x as i64).collect();
         let tl_ptr = if target_i64.is_empty() {
             std::ptr::null()
         } else {
-            let p = target_i64.as_ptr();
-            std::mem::forget(target_i64);
-            p
+            target_i64.as_ptr()
         };
         let tl_len = target_layers.len() as i64;
 
@@ -1158,6 +1160,64 @@ impl CppTrainingContext {
         Ok(())
     }
 
+    /// Attach a checkpoint shadow context to process-cached communicators.
+    /// This deliberately skips parameter broadcasts because restore replaces
+    /// every active LoRA/Adam tensor before the context can become live.
+    pub fn attach_parallel_nccl_no_sync(
+        &self,
+        rank: usize,
+        world_size: usize,
+        tp_rank: usize,
+        tp_size: usize,
+        tp_color: usize,
+        ep_rank: usize,
+        ep_size: usize,
+        ep_color: usize,
+        dp_rank: usize,
+        dp_size: usize,
+        dp_color: usize,
+    ) -> Result<()> {
+        let values = [
+            rank, world_size, tp_rank, tp_size, tp_color, ep_rank, ep_size, ep_color, dp_rank,
+            dp_size, dp_color,
+        ]
+        .map(|value| i32::try_from(value).context("parallel topology exceeds i32"));
+        let [
+            rank,
+            world_size,
+            tp_rank,
+            tp_size,
+            tp_color,
+            ep_rank,
+            ep_size,
+            ep_color,
+            dp_rank,
+            dp_size,
+            dp_color,
+        ] = values;
+        let kh = get_kernels().expect("kernels not loaded");
+        let status = unsafe {
+            (kh.attach_parallel_nccl_no_sync)(
+                self.ptr,
+                rank?,
+                world_size?,
+                tp_rank?,
+                tp_size?,
+                tp_color?,
+                ep_rank?,
+                ep_size?,
+                ep_color?,
+                dp_rank?,
+                dp_size?,
+                dp_color?,
+            )
+        };
+        if status != 0 {
+            bail!("C++ parallel NCCL restore attach failed (code {status})");
+        }
+        Ok(())
+    }
+
     /// Set CUDA device and force PyTorch CUDA context initialization.
     /// Must be called before any GPU operation in worker processes.
     pub fn set_cuda_device(device: i32) {
@@ -1191,6 +1251,44 @@ impl CppTrainingContext {
         let id = unsafe { (kh.add_lora)(self.ptr, rank, alpha, tl_ptr, tl_len, modules_ptr) };
         if id < 0 {
             bail!("C++ add_lora failed");
+        }
+        Ok(id)
+    }
+
+    /// Allocate a dynamic adapter for checkpoint hydration without collective
+    /// synchronization of its temporary random initialization.
+    pub fn add_lora_for_restore(
+        &self,
+        rank: i64,
+        alpha: f64,
+        target_layers: &[i64],
+        target_modules: &str,
+    ) -> Result<i64> {
+        let kh = get_kernels().ok_or_else(|| anyhow::anyhow!("kernels not loaded"))?;
+        let tl_ptr = if target_layers.is_empty() {
+            std::ptr::null()
+        } else {
+            target_layers.as_ptr()
+        };
+        let tl_len = target_layers.len() as i64;
+        let modules_c = std::ffi::CString::new(target_modules)?;
+        let modules_ptr = if target_modules.is_empty() {
+            std::ptr::null()
+        } else {
+            modules_c.as_ptr()
+        };
+        let id = unsafe {
+            (kh.add_lora_for_restore)(
+                self.ptr,
+                rank,
+                alpha,
+                tl_ptr,
+                tl_len,
+                modules_ptr,
+            )
+        };
+        if id < 0 {
+            bail!("C++ restore adapter allocation failed");
         }
         Ok(id)
     }

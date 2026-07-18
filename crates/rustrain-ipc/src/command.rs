@@ -87,6 +87,24 @@ pub enum EpCommand {
         adapter_id: Option<i64>,
         generation: String,
     },
+    PrepareSaveCheckpoint {
+        session_id: String,
+        path: String,
+        generation: String,
+    },
+    PrepareLoadCheckpoint {
+        session_id: String,
+        path: String,
+        transaction_id: String,
+    },
+    CommitLoadCheckpoint {
+        session_id: String,
+        transaction_id: String,
+    },
+    AbortLoadCheckpoint {
+        session_id: String,
+        transaction_id: String,
+    },
     Status {
         session_id: String,
     },
@@ -105,6 +123,10 @@ pub enum EpResult {
     Train {
         loss: f64,
         step: u64,
+    },
+    Checkpoint {
+        step: u64,
+        loss: f64,
     },
     AdapterId(i64),
     AdapterIds(Vec<i64>),
@@ -189,6 +211,56 @@ mod tests {
             EpResult::Train { loss, step } => {
                 assert_eq!(loss, 1.25);
                 assert_eq!(step, 7);
+            }
+            other => panic!("unexpected result: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn checkpoint_commands_preserve_transaction_identity() {
+        let commands = [
+            EpCommand::PrepareSaveCheckpoint {
+                session_id: "session".into(),
+                path: "/tmp/checkpoint.partial".into(),
+                generation: "ep-1-2-3-save".into(),
+            },
+            EpCommand::PrepareLoadCheckpoint {
+                session_id: "session".into(),
+                path: "/tmp/checkpoint".into(),
+                transaction_id: "ep-1-2-4-load".into(),
+            },
+            EpCommand::CommitLoadCheckpoint {
+                session_id: "session".into(),
+                transaction_id: "ep-1-2-4-load".into(),
+            },
+            EpCommand::AbortLoadCheckpoint {
+                session_id: "session".into(),
+                transaction_id: "ep-1-2-4-load".into(),
+            },
+        ];
+
+        for command in commands {
+            let encoded = serde_json::to_string(&command).unwrap();
+            let decoded: EpCommand = serde_json::from_str(&encoded).unwrap();
+            assert_eq!(
+                serde_json::to_value(decoded).unwrap(),
+                serde_json::to_value(command).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn checkpoint_result_serde_preserves_step_and_loss() {
+        let result = EpResult::Checkpoint {
+            step: 19,
+            loss: 0.625,
+        };
+        let encoded = serde_json::to_string(&result).unwrap();
+        let decoded: EpResult = serde_json::from_str(&encoded).unwrap();
+        match decoded {
+            EpResult::Checkpoint { step, loss } => {
+                assert_eq!(step, 19);
+                assert_eq!(loss, 0.625);
             }
             other => panic!("unexpected result: {other:?}"),
         }
