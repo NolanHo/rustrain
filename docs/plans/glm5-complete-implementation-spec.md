@@ -196,9 +196,11 @@ through the optimizer step.
 
 ## Kernel performance contract
 
-- MTP offset alignment, embedding gather, projection, shared-head RMSNorm, and
-  CE are dispatched from Rust through coarse-grained C++ calls. Rust no longer
-  allocates per-layer hidden halos or performs hot-loop pad/cat/narrow work.
+- MTP offset alignment, embedding gather, and projection are dispatched from
+  Rust through coarse-grained C++ calls. Base and MTP shared-head RMSNorm,
+  FP8 linear, and vocabulary-parallel CE each remain inside one C++ dispatch;
+  Rust no longer loops over vocabulary chunks or allocates per-layer hidden
+  halos and hot-loop pad/cat/narrow tensors.
 - The native MTP decoder is one C++ call per rank. TP projection gathers,
   row-parallel reductions, vocabulary CE collectives, and EP token dispatch
   are autograd-aware C++ operations; Rust does not shuttle hot-path tensors
@@ -213,7 +215,9 @@ through the optimizer step.
 - The CE path uses a single-chunk fast path for normal MTP windows and keeps a
   chunked fallback for longer windows, avoiding repeated FFI crossings. TP uses
   the vocabulary-parallel CE ABI directly and never gathers full-vocabulary
-  logits.
+  logits. A final non-MTP CP rank with no next-token target returns zero
+  numerator/count with a zero-valued hidden-state autograd edge, so it still
+  participates in CP loss reduction without a special topology rejection.
 - Variable-size EP dispatch/return currently copies the small per-peer count
   vectors to host memory once per exchange so NCCL send/receive offsets are
   known before launch. This is semantically correct but remains a measurable
@@ -259,15 +263,23 @@ through the optimizer step.
   synchronized a finite optimizer step, and saved its adapter. All ranks
   reported identical base loss `3.655280113` and MTP loss `3.563270807`; the
   launcher reported `GLM5_TRAIN_SMOKE_PASS world_size=8`.
+- An eight-rank H20 TP smoke (`TP=8`, `CP=EP=1`, sequence length 64) used the
+  same 78-layer checkpoint and one native MTP layer. Every rank loaded 118,473
+  required tensors, retained 116,736 routed-expert tensors as rank-local
+  `cpu_fp8_tp_shard_staged` residency, and completed trunk/MTP forward,
+  backward, optimizer, and adapter save. All ranks reported identical total
+  loss `4.5275139808654785` and MTP loss `3.677131414413452`; with the configured
+  MTP weight `0.1`, the corresponding base loss is `4.159800839424133`. The
+  launcher reported `GLM5_TP_TRAIN_SMOKE_PASS world_size=8`.
 - The checkpoint matches the target architecture but has not been independently
   established as the official published GLM-5.2 checkpoint. Official-checkpoint
   Megatron numerical parity and convergence are therefore not claimed.
-- Multi-rank TP-only numerical parity remains a promotion gate. Combined TP+EP
-  and native MTP with CP above one remain explicit unsupported boundaries.
+- Combined TP+EP and native MTP with CP above one remain explicit unsupported
+  boundaries.
 
 # Open Questions
 
-- Confirm numerical parity against Megatron with the official published
-  checkpoint, including a multi-rank TP-only run.
+- Confirm pointwise numerical parity and convergence against Megatron with the
+  official published checkpoint.
 - Profile the staged-expert and coarse C++ CE paths before making throughput or
   peak-memory claims; functional smoke results are not performance benchmarks.

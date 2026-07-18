@@ -12,7 +12,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result, bail};
-use tch::{Device, Kind, Reduction, Tensor, no_grad};
+use tch::{Device, Kind, Tensor, no_grad};
 use tracing::info;
 
 use crate::lora::*;
@@ -258,6 +258,20 @@ fn reattach_global_token_mean(
 ) -> Tensor {
     let visible_sum = local_sum + &(reduced_sum - local_sum).detach();
     visible_sum / reduced_count.clamp_min(1.0)
+}
+
+fn insert_glm5_dense_mlp_weights(needed: &mut HashSet<String>, prefix: &str) {
+    for projection in ["gate_proj", "up_proj", "down_proj"] {
+        needed.insert(format!("{prefix}.{projection}.weight"));
+        needed.insert(format!("{prefix}.{projection}.weight_scale_inv"));
+    }
+}
+
+fn glm5_next_token_target_offset(global_offset: i64) -> Result<i32> {
+    let target_offset = global_offset
+        .checked_add(1)
+        .context("GLM5 next-token target offset overflows i64")?;
+    i32::try_from(target_offset).context("GLM5 next-token target offset exceeds i32")
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -993,9 +1007,7 @@ pub fn train_glm5_lora_sft_tp_cp_ep(
             }
         }
         if !runtime_config.is_moe_layer(layer) {
-            needed.insert(format!("{p}.mlp.gate_proj.weight"));
-            needed.insert(format!("{p}.mlp.up_proj.weight"));
-            needed.insert(format!("{p}.mlp.down_proj.weight"));
+            insert_glm5_dense_mlp_weights(&mut needed, &format!("{p}.mlp"));
         }
     }
     for mtp_layer in glm5_mtp_layer_indices(&runtime_config)? {
@@ -1932,16 +1944,42 @@ pub fn train_glm5_lora_sft_tp_cp_ep(
                 }
             }
 
-            // ── Final norm + lm_head + chunked CE loss ──
+            // Final norm, FP8 lm_head, and vocabulary-parallel CE stay in one
+            // C++ dispatch. The returned normalized state also feeds native MTP.
             let final_norm = tensor(&weights_gpu, "model.norm.weight")?.to_kind(compute_kind);
-            let normed = rms_norm(&hidden, &final_norm, runtime_config.rms_norm_eps);
-            let lm_head = if runtime_config.tie_word_embeddings {
-                embed.shallow_clone()
-            } else {
-                tensor(&weights_gpu, "lm_head.weight")?.to_kind(compute_kind)
-            };
-
             let global_offset = cp_rank as i64 * s_local;
+            let seq_len_local = cp_batch.input_ids.size()[1];
+            let target_len = if global_offset + seq_len_local < target_seq {
+                seq_len_local
+            } else {
+                seq_len_local - 1
+            };
+            let base_output = rustrain_deepseek_v4::fp8_kernel::
+                glm5_next_token_postprocess_loss_vocab_parallel_cpp(
+                    &hidden,
+                    &final_norm,
+                    &tp_vocab.lm_head.weight,
+                    tp_vocab.lm_head.weight_scale.as_ref(),
+                    &full_batch.input_ids,
+                    &full_batch.target_mask,
+                    runtime_config.rms_norm_eps,
+                    glm5_next_token_target_offset(global_offset)?,
+                    4096,
+                    tp_vocab.lm_head.range.vocab_start,
+                    tp_vocab.lm_head.range.padded_vocab_size,
+                    tp_comm
+                        .as_ref()
+                        .map_or(std::ptr::null_mut(), |comm| comm.raw_comm_ptr()),
+                    tp_size as i32,
+                )?;
+            let normed = base_output.normalized;
+            if normed.size()[1] != target_len {
+                bail!(
+                    "GLM5 base CE normalized {} positions, expected {target_len}",
+                    normed.size()[1]
+                );
+            }
+
             let mtp_losses = if runtime_config.num_nextn_predict_layers > 0 {
                 let mut previous_mtp_block: Option<Tensor> = None;
                 let mut mtp_losses = Vec::with_capacity(runtime_config.num_nextn_predict_layers);
@@ -2008,7 +2046,7 @@ pub fn train_glm5_lora_sft_tp_cp_ep(
                         &mtp_target_mask,
                         runtime_config.rms_norm_eps,
                         (global_offset + offset) as i32,
-                        256,
+                        4096,
                         tp_vocab.lm_head.range.vocab_start,
                         tp_vocab.lm_head.range.padded_vocab_size,
                         tp_comm
@@ -2046,93 +2084,24 @@ pub fn train_glm5_lora_sft_tp_cp_ep(
                 Vec::new()
             };
 
-            let seq_len_local = cp_batch.input_ids.size()[1];
-            let vocab = runtime_config.vocab_size;
-            // Targets are indexed in global sequence coordinates.  In particular,
-            // every non-final CP rank must include the token immediately after its
-            // local chunk; the old local `narrow(1, 1, ..)` silently dropped this
-            // cross-boundary target.
-            let target_len = if global_offset + seq_len_local < target_seq {
-                seq_len_local
-            } else {
-                seq_len_local - 1
-            };
-            let shifted_targets = if cp_size > 1 {
-                let available = (target_seq - global_offset - 1).clamp(0, target_len);
-                let prefix = if available > 0 {
-                    full_batch.input_ids.narrow(1, global_offset + 1, available)
-                } else {
-                    Tensor::zeros([1, 0], (Kind::Int64, device))
-                };
-                if available < target_len {
-                    let pad = Tensor::full(
-                        [1, target_len - available],
-                        train_dataset.pad_token_id,
-                        (Kind::Int64, device),
-                    );
-                    Tensor::cat(&[&prefix, &pad], 1)
-                } else {
-                    prefix
-                }
-            } else {
-                cp_batch.input_ids.narrow(1, 1, target_len)
-            };
-            let shifted_mask = if cp_size > 1 {
-                let available = (target_seq - global_offset - 1).clamp(0, target_len);
-                let prefix = if available > 0 {
-                    full_batch
-                        .target_mask
-                        .narrow(1, global_offset + 1, available)
-                } else {
-                    Tensor::zeros([1, 0], (Kind::Int64, device))
-                };
-                let mask = if available < target_len {
-                    let pad = Tensor::zeros([1, target_len - available], (Kind::Int64, device));
-                    Tensor::cat(&[&prefix, &pad], 1)
-                } else {
-                    prefix
-                };
-                mask.to_kind(Kind::Float)
-            } else {
-                cp_batch
-                    .target_mask
-                    .narrow(1, 1, target_len)
-                    .to_kind(Kind::Float)
-            };
-            let total_mask = shifted_mask.sum(Kind::Float);
-
-            let ce_chunk_size = 256;
-            let mut loss_acc = Tensor::zeros([], (Kind::Float, device));
-
-            for start in (0..target_len).step_by(ce_chunk_size as usize) {
-                let end = (start + ce_chunk_size as i64).min(target_len);
-                let chunk_len = end - start;
-                let normed_chunk = normed.narrow(1, start, chunk_len);
-                let logits_chunk = normed_chunk.linear::<&Tensor>(&lm_head, None);
-                let log_probs = logits_chunk
-                    .reshape([-1, vocab])
-                    .log_softmax(-1, Kind::Float);
-                let targets_chunk = shifted_targets.narrow(1, start, chunk_len).reshape([-1]);
-                let mask_chunk = shifted_mask.narrow(1, start, chunk_len);
-                let per_token_loss = log_probs
-                    .g_nll_loss::<&Tensor>(&targets_chunk, None, Reduction::None, -100)
-                    .reshape([1, chunk_len]);
-                let masked = &per_token_loss * &mask_chunk;
-                loss_acc = loss_acc + masked.sum(Kind::Float);
-            }
-
             // CP all-reduce: preserve the local graph while exposing the global
             // token-normalized loss value on every CP rank.
+            let local_lm_loss = base_output.loss;
+            let local_lm_sum = base_output.loss_sum;
+            let local_lm_count = base_output.token_count;
             let lm_loss = if cp_size > 1 {
-                let reduced = cp_comm.as_ref().unwrap().all_reduce(&loss_acc)?;
-                let reduced_mask = cp_comm.as_ref().unwrap().all_reduce(&total_mask)?;
-                reattach_cp_token_mean(&loss_acc, &reduced, &reduced_mask, cp_size)
+                let reduced_sum = cp_comm.as_ref().unwrap().all_reduce(&local_lm_sum)?;
+                let reduced_count = cp_comm.as_ref().unwrap().all_reduce(&local_lm_count)?;
+                reattach_cp_token_mean(&local_lm_sum, &reduced_sum, &reduced_count, cp_size)
             } else if dense_dp_size > 1 {
-                let reduced = dense_dp_comm.as_ref().unwrap().all_reduce(&loss_acc)?;
-                let reduced_mask = dense_dp_comm.as_ref().unwrap().all_reduce(&total_mask)?;
-                reattach_global_token_mean(&loss_acc, &reduced, &reduced_mask)
+                let reduced_sum = dense_dp_comm.as_ref().unwrap().all_reduce(&local_lm_sum)?;
+                let reduced_count = dense_dp_comm
+                    .as_ref()
+                    .unwrap()
+                    .all_reduce(&local_lm_count)?;
+                reattach_global_token_mean(&local_lm_sum, &reduced_sum, &reduced_count)
             } else {
-                loss_acc / total_mask.clamp_min(1.0)
+                local_lm_loss
             };
             let weighted_lm_loss = &lm_loss * &microbatch_weight;
             let loss = if mtp_losses.is_empty() {
@@ -2410,6 +2379,24 @@ mod tests {
         .unwrap();
         assert_eq!(scale.size(), vec![1, 1]);
         assert!((scale.double_value(&[0, 0]) - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn dense_mlp_needed_set_keeps_fp8_weights_and_scales_paired() {
+        let mut needed = HashSet::new();
+        insert_glm5_dense_mlp_weights(&mut needed, "model.layers.0.mlp");
+
+        assert_eq!(needed.len(), 6);
+        for projection in ["gate_proj", "up_proj", "down_proj"] {
+            assert!(needed.contains(&format!("model.layers.0.mlp.{projection}.weight")));
+            assert!(needed.contains(&format!("model.layers.0.mlp.{projection}.weight_scale_inv")));
+        }
+    }
+
+    #[test]
+    fn base_ce_starts_at_the_first_shifted_raw_token() {
+        assert_eq!(glm5_next_token_target_offset(0).unwrap(), 1);
+        assert_eq!(glm5_next_token_target_offset(64).unwrap(), 65);
     }
 
     #[test]

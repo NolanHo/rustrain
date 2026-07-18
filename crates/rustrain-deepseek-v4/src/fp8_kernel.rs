@@ -1393,6 +1393,44 @@ pub fn glm5_mtp_postprocess_loss_cpp(
     )
 }
 
+/// Megatron-compatible next-token CE using the same fused postprocess and
+/// vocabulary-parallel kernel as native MTP. `target_offset` is the absolute
+/// raw-sequence index predicted by `block_raw[:, 0]`.
+pub fn glm5_next_token_postprocess_loss_vocab_parallel_cpp(
+    block_raw: &Tensor,
+    shared_head_norm: &Tensor,
+    lm_head: &Tensor,
+    lm_head_scale: Option<&Tensor>,
+    input_ids: &Tensor,
+    target_mask: &Tensor,
+    eps: f64,
+    target_offset: i32,
+    chunk_size: i32,
+    vocab_start: i64,
+    global_vocab_size: i64,
+    tp_comm: *mut std::ffi::c_void,
+    tp_size: i32,
+) -> Result<Glm5MtpPostprocessOutput> {
+    if target_offset < 1 {
+        bail!("GLM5 next-token target_offset must be positive, got {target_offset}");
+    }
+    glm5_mtp_postprocess_loss_vocab_parallel_cpp(
+        block_raw,
+        shared_head_norm,
+        lm_head,
+        lm_head_scale,
+        input_ids,
+        target_mask,
+        eps,
+        target_offset - 2,
+        chunk_size,
+        vocab_start,
+        global_vocab_size,
+        tp_comm,
+        tp_size,
+    )
+}
+
 /// Megatron-compatible vocabulary-parallel MTP CE. `lm_head` contains only
 /// the local vocab shard `[vocab_start, vocab_start + local_vocab)`. The NCCL
 /// communicator is required only when `tp_size > 1`; the kernel performs the
@@ -2365,6 +2403,75 @@ mod mtp_tests {
             misaligned_loss > 5.0,
             "misaligned loss was {misaligned_loss}"
         );
+    }
+
+    #[test]
+    fn next_token_loss_uses_the_first_shifted_target() {
+        let input_ids = Tensor::from_slice(&[0_i64, 1, 2, 3]).reshape([1, 4]);
+        let mask = Tensor::ones([1, 4], (Kind::Float, Device::Cpu));
+        let norm = Tensor::ones([4], (Kind::Float, Device::Cpu));
+        let lm_head = Tensor::eye(4, (Kind::Float, Device::Cpu)) * 10.0;
+        let aligned = Tensor::from_slice(&[
+            0.0_f32, 1.0, 0.0, 0.0, // predicts token 1
+            0.0, 0.0, 1.0, 0.0, // predicts token 2
+            0.0, 0.0, 0.0, 1.0, // predicts token 3
+        ])
+        .reshape([1, 3, 4]);
+
+        let output = glm5_next_token_postprocess_loss_vocab_parallel_cpp(
+            &aligned,
+            &norm,
+            &lm_head,
+            None,
+            &input_ids,
+            &mask,
+            1e-6,
+            1,
+            16,
+            0,
+            4,
+            std::ptr::null_mut(),
+            1,
+        )
+        .unwrap();
+
+        assert!(output.loss.double_value(&[]) < 0.01);
+        assert_eq!(output.token_count.double_value(&[]), 3.0);
+    }
+
+    #[test]
+    fn next_token_loss_allows_a_zero_target_cp_rank() {
+        let input_ids = Tensor::from_slice(&[0_i64, 1, 2, 3]).reshape([1, 4]);
+        let mask = Tensor::ones([1, 4], (Kind::Float, Device::Cpu));
+        let norm = Tensor::ones([4], (Kind::Float, Device::Cpu));
+        let lm_head = Tensor::eye(4, (Kind::Float, Device::Cpu));
+        let block = Tensor::randn([1, 1, 4], (Kind::Float, Device::Cpu)).set_requires_grad(true);
+
+        let output = glm5_next_token_postprocess_loss_vocab_parallel_cpp(
+            &block,
+            &norm,
+            &lm_head,
+            None,
+            &input_ids,
+            &mask,
+            1e-6,
+            4,
+            16,
+            0,
+            4,
+            std::ptr::null_mut(),
+            1,
+        )
+        .unwrap();
+
+        assert_eq!(output.normalized.size(), vec![1, 0, 4]);
+        assert_eq!(output.loss.double_value(&[]), 0.0);
+        assert_eq!(output.loss_sum.double_value(&[]), 0.0);
+        assert_eq!(output.token_count.double_value(&[]), 0.0);
+        output.loss.backward();
+        let grad = block.grad();
+        assert!(grad.defined());
+        assert_eq!(grad.abs().sum(Kind::Float).double_value(&[]), 0.0);
     }
 
     #[test]

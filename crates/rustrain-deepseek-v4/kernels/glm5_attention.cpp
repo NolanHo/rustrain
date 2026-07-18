@@ -1417,8 +1417,8 @@ void* v4_glm5_mtp_cross_entropy_loss(
         }
         TORCH_CHECK(block_raw_ptr && shared_head_norm_ptr && lm_head_ptr && input_ids_ptr &&
                     target_mask_ptr, "MTP CE tensor is null");
-        TORCH_CHECK(start_offset_i >= 0 && chunk_size_i > 0,
-                    "MTP CE start_offset must be non-negative and chunk_size positive");
+        TORCH_CHECK(start_offset_i >= -1 && chunk_size_i > 0,
+                    "CE start_offset must be at least -1 and chunk_size positive");
         TORCH_CHECK(tp_size_i > 0, "MTP CE TP size must be positive");
         auto& block = *reinterpret_cast<at::Tensor*>(block_raw_ptr);
         auto& norm = *reinterpret_cast<at::Tensor*>(shared_head_norm_ptr);
@@ -1452,8 +1452,9 @@ void* v4_glm5_mtp_cross_entropy_loss(
 
         const int64_t available = input_ids.size(1) - static_cast<int64_t>(start_offset_i) - 2;
         const int64_t usable = std::min<int64_t>(block.size(1), std::max<int64_t>(available, 0));
-        TORCH_CHECK(usable > 0, "MTP CE has no target positions after start_offset");
-        auto normalized = rms_norm(block.narrow(1, 0, usable), norm, eps);
+        auto normalized = usable > 0
+            ? rms_norm(block.narrow(1, 0, usable), norm, eps)
+            : block.narrow(1, 0, 0);
         std::optional<at::Tensor> lm_scale = lm_head_scale_ptr
             ? std::optional<at::Tensor>(*reinterpret_cast<at::Tensor*>(lm_head_scale_ptr))
             : std::nullopt;
@@ -1482,6 +1483,13 @@ void* v4_glm5_mtp_cross_entropy_loss(
             }
             return result.release();
         };
+
+        // A final CP rank can legitimately own no next-token target when its
+        // local sequence contains one token. Keep a zero-valued autograd edge
+        // to the local hidden state and let the caller reduce sum/count over CP.
+        if (usable == 0) {
+            return finish(block.sum(at::kFloat) * 0.0);
+        }
 
         const bool vocab_parallel = tp_size_i > 1;
         auto ce_input = [&](const at::Tensor& input) {
