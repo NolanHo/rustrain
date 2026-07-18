@@ -50,6 +50,8 @@ extern "C" int64_t qwen36_get_lora_count(void*);
 extern "C" void* qwen36_get_lora_a(void*, int64_t);
 extern "C" int64_t qwen36_add_lora(
     void*, int64_t, double, const int64_t*, int64_t, const char*);
+extern "C" int32_t qwen36_set_adapter_id(void*, int64_t, int64_t);
+extern "C" int32_t qwen36_remove_lora(void*, int64_t);
 extern "C" void* qwen36_get_adapter_lora_tensor(
     void*, int64_t, int64_t, const char*, int32_t);
 extern "C" void qwen36_free_training_context(void*);
@@ -210,6 +212,22 @@ int main() {
     }
     assert(qwen36_get_adapter_lora_tensor(
         stage_context, adapter_id, 1, "q_proj", 0) == nullptr);
+    assert(qwen36_set_adapter_id(stage_context, adapter_id, 7) == 0);
+    assert(qwen36_get_adapter_lora_tensor(
+        stage_context, adapter_id, dynamic_target_layer, "q_proj", 0) ==
+        nullptr);
+    auto* renamed_dynamic_a = reinterpret_cast<at::Tensor*>(
+        qwen36_get_adapter_lora_tensor(
+            stage_context, 7, dynamic_target_layer, "q_proj", 0));
+    if (pp_rank == 0) {
+        assert(renamed_dynamic_a);
+        assert(renamed_dynamic_a->sizes() == at::IntArrayRef({4, 4}));
+    } else {
+        assert(renamed_dynamic_a == nullptr);
+    }
+    assert(qwen36_remove_lora(stage_context, 7) == 1);
+    assert(qwen36_get_adapter_lora_tensor(
+        stage_context, 7, dynamic_target_layer, "q_proj", 0) == nullptr);
 
     void* shadow = create_empty_context(embed, norm, lm_head);
     assert(shadow);

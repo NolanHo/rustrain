@@ -10,6 +10,7 @@ use crate::checkpoint;
 use crate::metrics::{FileMetricsSink, MetricsSink, StepMetric};
 use rustrain_parallel::topology::ParallelTopology;
 use rustrain_qwen3_6::lora::{Qwen36AdapterArtifact, Qwen36LoraConfig, Qwen36LoraTargetModule};
+use rustrain_qwen3_6::pipeline::PipelineStageLayout;
 
 fn validate_qwen_parallel_features(
     is_moe: bool,
@@ -40,6 +41,113 @@ fn validate_tp_intermediate_sizes(tp_size: usize, sizes: &[(&str, i64)]) -> Resu
         }
     }
     Ok(())
+}
+
+struct ResolvedQwenTopology {
+    topology: ParallelTopology,
+    global_rank: usize,
+    world_size: usize,
+    local_rank: usize,
+    tp_rank: usize,
+    cp_rank: usize,
+    ep_rank: usize,
+    dp_rank: usize,
+    pp_rank: usize,
+    tp_size: usize,
+    cp_size: usize,
+    ep_size: usize,
+    dp_size: usize,
+    pp_size: usize,
+}
+
+fn resolve_qwen_topology(
+    runtime_config: &rustrain_qwen3_6::config::Qwen36RuntimeConfig,
+) -> Result<ResolvedQwenTopology> {
+    let global_rank = std::env::var("RANK")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(0);
+    let world_size = std::env::var("WORLD_SIZE")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(1);
+    let local_rank = std::env::var("LOCAL_RANK")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(0);
+    let tp_size = std::env::var("TP_SIZE")
+        .or_else(|_| std::env::var("RUSTRAIN_TP_SIZE"))
+        .or_else(|_| std::env::var("TENSOR_MODEL_PARALLEL_SIZE"))
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(1);
+    let has_explicit_non_tp_axis = [
+        "EP_SIZE",
+        "RUSTRAIN_EP_SIZE",
+        "EXPERT_MODEL_PARALLEL_SIZE",
+        "DP_SIZE",
+        "RUSTRAIN_DP_SIZE",
+        "DATA_PARALLEL_SIZE",
+        "PP_SIZE",
+        "RUSTRAIN_PP_SIZE",
+        "PIPELINE_MODEL_PARALLEL_SIZE",
+        "CP_SIZE",
+        "RUSTRAIN_CP_SIZE",
+        "CONTEXT_PARALLEL_SIZE",
+    ]
+    .iter()
+    .any(|name| std::env::var_os(name).is_some());
+    let topology = if runtime_config.is_moe && !has_explicit_non_tp_axis {
+        let ep_size = world_size
+            .checked_div(tp_size)
+            .filter(|size| size * tp_size == world_size)
+            .ok_or_else(|| {
+                anyhow!("WORLD_SIZE={world_size} is not divisible by TP_SIZE={tp_size}")
+            })?;
+        let rank_order = std::env::var("RUSTRAIN_PARALLEL_ORDER")
+            .or_else(|_| std::env::var("PARALLEL_ORDER"))
+            .unwrap_or_else(|_| rustrain_parallel::topology::DEFAULT_RANK_ORDER.to_string());
+        ParallelTopology::with_order(tp_size, 1, 1, ep_size, 1, &rank_order)?
+    } else {
+        ParallelTopology::from_env_with_world_size(world_size)?
+    };
+    if topology.context_parallel_size() != 1 {
+        bail!(
+            "native Qwen server does not yet support CP (tp={} pp={} dp={} ep={} cp={})",
+            topology.tensor_model_parallel_size(),
+            topology.pipeline_model_parallel_size(),
+            topology.data_parallel_size(),
+            topology.expert_model_parallel_size(),
+            topology.context_parallel_size(),
+        );
+    }
+    if topology.tensor_model_parallel_size() != tp_size {
+        bail!(
+            "Qwen server topology TP={} does not match TP_SIZE={tp_size}",
+            topology.tensor_model_parallel_size()
+        );
+    }
+    topology.coordinates(global_rank)?;
+    if !runtime_config.is_moe && topology.expert_model_parallel_size() != 1 {
+        bail!("native dense Qwen server requires expert_model_parallel_size=1");
+    }
+
+    Ok(ResolvedQwenTopology {
+        tp_rank: topology.tensor_rank(global_rank)?,
+        cp_rank: topology.context_rank(global_rank)?,
+        ep_rank: topology.expert_rank(global_rank)?,
+        dp_rank: topology.data_rank(global_rank)?,
+        pp_rank: topology.pipeline_rank(global_rank)?,
+        tp_size: topology.tensor_model_parallel_size(),
+        cp_size: topology.context_parallel_size(),
+        ep_size: topology.expert_model_parallel_size(),
+        dp_size: topology.data_parallel_size(),
+        pp_size: topology.pipeline_model_parallel_size(),
+        topology,
+        global_rank,
+        world_size,
+        local_rank,
+    })
 }
 
 fn validate_dynamic_adapter_manifests<'a>(
@@ -178,6 +286,7 @@ pub trait TrainingSession: Send {
 #[derive(Clone)]
 struct QwenContextSpec {
     runtime_config: rustrain_qwen3_6::config::Qwen36RuntimeConfig,
+    stage: PipelineStageLayout,
     init: InitLoRARequest,
     target_layers: Vec<usize>,
     target_modules: Vec<Qwen36LoraTargetModule>,
@@ -273,9 +382,10 @@ fn create_qwen_context(
     synchronize_parameters: bool,
 ) -> Result<rustrain_qwen3_6::kernel::CppTrainingContext> {
     let lora_scaling = spec.init.alpha / spec.init.rank as f64;
-    let ctx = rustrain_qwen3_6::kernel::CppTrainingContext::new(
+    let ctx = rustrain_qwen3_6::kernel::CppTrainingContext::new_for_stage(
         weights,
         &spec.runtime_config,
+        &spec.stage,
         compute_kind,
         spec.init.lr,
         spec.init.beta1,
@@ -496,6 +606,7 @@ impl Qwen36Session {
         path: &str,
         transaction_id: &str,
     ) -> Result<(u64, f64)> {
+        self.ensure_stage_checkpoint_supported()?;
         if transaction_id.is_empty()
             || !transaction_id
                 .bytes()
@@ -617,6 +728,17 @@ impl Qwen36Session {
         self.commit_checkpoint_load(&transaction_id)
     }
 
+    fn ensure_stage_checkpoint_supported(&self) -> Result<()> {
+        if self
+            .context_spec
+            .as_ref()
+            .is_some_and(|spec| spec.pp_size > 1)
+        {
+            bail!("pipeline-parallel Qwen checkpointing requires the stage-union manifest format");
+        }
+        Ok(())
+    }
+
     pub fn export_distributed_adapter(
         &self,
         path: &str,
@@ -692,52 +814,33 @@ impl TrainingSession for Qwen36Session {
         let model_path_obj = std::path::Path::new(model_path);
         let runtime_config = rustrain_qwen3_6::config::read_qwen36_runtime_config(model_path_obj)?;
 
-        // Build needed weight set — keys must match safetensors (with model prefix)
-        let n_layers = runtime_config.num_hidden_layers;
+        let resolved = resolve_qwen_topology(&runtime_config)?;
+        let ResolvedQwenTopology {
+            ref topology,
+            global_rank,
+            world_size,
+            local_rank,
+            tp_rank,
+            cp_rank,
+            ep_rank: expert_rank,
+            dp_rank,
+            pp_rank,
+            tp_size,
+            cp_size,
+            ep_size,
+            dp_size,
+            pp_size,
+        } = resolved;
+        let stage = PipelineStageLayout::new(runtime_config.num_hidden_layers, pp_rank, pp_size)?;
+        if pp_size > 1 && runtime_config.mtp_num_hidden_layers > 0 {
+            bail!("pipeline-parallel Qwen server does not yet support MTP layers");
+        }
+
+        // Resolve topology before disk IO so every worker reads only its
+        // frozen stage ownership set.
         let wp = &runtime_config.weight_prefix;
-        let mut needed: std::collections::HashSet<String> = std::collections::HashSet::new();
-        needed.insert(format!("{wp}embed_tokens.weight"));
-        needed.insert(format!("{wp}norm.weight"));
-        if !runtime_config.tie_word_embeddings {
-            // lm_head.weight is always at top level (no model prefix), even for multimodal models
-            needed.insert("lm_head.weight".to_string());
-        }
-        for layer in 0..n_layers {
-            let p = format!("{wp}layers.{layer}");
-            needed.insert(format!("{p}.input_layernorm.weight"));
-            needed.insert(format!("{p}.post_attention_layernorm.weight"));
-            match runtime_config.layer_types[layer] {
-                rustrain_qwen3_6::config::LayerType::FullAttention => {
-                    for w in &["q_proj", "q_norm", "k_proj", "k_norm", "v_proj", "o_proj"] {
-                        needed.insert(format!("{p}.self_attn.{w}.weight"));
-                    }
-                }
-                rustrain_qwen3_6::config::LayerType::LinearAttention => {
-                    needed.insert(format!("{p}.linear_attn.in_proj_qkv.weight"));
-                    needed.insert(format!("{p}.linear_attn.in_proj_z.weight"));
-                    needed.insert(format!("{p}.linear_attn.in_proj_a.weight"));
-                    needed.insert(format!("{p}.linear_attn.in_proj_b.weight"));
-                    needed.insert(format!("{p}.linear_attn.A_log"));
-                    needed.insert(format!("{p}.linear_attn.dt_bias"));
-                    needed.insert(format!("{p}.linear_attn.conv1d.weight"));
-                    needed.insert(format!("{p}.linear_attn.norm.weight"));
-                    needed.insert(format!("{p}.linear_attn.out_proj.weight"));
-                }
-            }
-            if runtime_config.is_moe {
-                needed.insert(format!("{p}.mlp.gate.weight"));
-                needed.insert(format!("{p}.mlp.shared_expert_gate.weight"));
-                needed.insert(format!("{p}.mlp.shared_expert.gate_proj.weight"));
-                needed.insert(format!("{p}.mlp.shared_expert.up_proj.weight"));
-                needed.insert(format!("{p}.mlp.shared_expert.down_proj.weight"));
-                needed.insert(format!("{p}.mlp.experts.gate_up_proj"));
-                needed.insert(format!("{p}.mlp.experts.down_proj"));
-            } else {
-                needed.insert(format!("{p}.mlp.gate_proj.weight"));
-                needed.insert(format!("{p}.mlp.up_proj.weight"));
-                needed.insert(format!("{p}.mlp.down_proj.weight"));
-            }
-        }
+        let mut needed =
+            rustrain_qwen3_6::pipeline::stage_text_needed_weights(&runtime_config, &stage);
         // MTP weights
         if runtime_config.mtp_num_hidden_layers > 0 {
             for i in 0..runtime_config.mtp_num_hidden_layers {
@@ -773,86 +876,6 @@ impl TrainingSession for Qwen36Session {
             model_path_obj,
             &needed,
         )?;
-
-        let global_rank = std::env::var("RANK")
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok())
-            .unwrap_or(0);
-        let world_size = std::env::var("WORLD_SIZE")
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok())
-            .unwrap_or(1);
-        let local_rank = std::env::var("LOCAL_RANK")
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok())
-            .unwrap_or(0);
-        let tp_size = std::env::var("TP_SIZE")
-            .or_else(|_| std::env::var("RUSTRAIN_TP_SIZE"))
-            .or_else(|_| std::env::var("TENSOR_MODEL_PARALLEL_SIZE"))
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok())
-            .unwrap_or(1);
-        let has_explicit_non_tp_axis = [
-            "EP_SIZE",
-            "RUSTRAIN_EP_SIZE",
-            "EXPERT_MODEL_PARALLEL_SIZE",
-            "DP_SIZE",
-            "RUSTRAIN_DP_SIZE",
-            "DATA_PARALLEL_SIZE",
-            "PP_SIZE",
-            "RUSTRAIN_PP_SIZE",
-            "PIPELINE_MODEL_PARALLEL_SIZE",
-            "CP_SIZE",
-            "RUSTRAIN_CP_SIZE",
-            "CONTEXT_PARALLEL_SIZE",
-        ]
-        .iter()
-        .any(|name| std::env::var_os(name).is_some());
-        let topology = if runtime_config.is_moe && !has_explicit_non_tp_axis {
-            let ep_size = world_size
-                .checked_div(tp_size)
-                .filter(|size| size * tp_size == world_size)
-                .ok_or_else(|| {
-                    anyhow!("WORLD_SIZE={world_size} is not divisible by TP_SIZE={tp_size}")
-                })?;
-            let rank_order = std::env::var("RUSTRAIN_PARALLEL_ORDER")
-                .or_else(|_| std::env::var("PARALLEL_ORDER"))
-                .unwrap_or_else(|_| rustrain_parallel::topology::DEFAULT_RANK_ORDER.to_string());
-            ParallelTopology::with_order(tp_size, 1, 1, ep_size, 1, &rank_order)?
-        } else {
-            ParallelTopology::from_env_with_world_size(world_size)?
-        };
-        if topology.pipeline_model_parallel_size() != 1 || topology.context_parallel_size() != 1 {
-            return Err(anyhow!(
-                "native Qwen server does not support PP or CP (tp={} pp={} dp={} ep={} cp={})",
-                topology.tensor_model_parallel_size(),
-                topology.pipeline_model_parallel_size(),
-                topology.data_parallel_size(),
-                topology.expert_model_parallel_size(),
-                topology.context_parallel_size(),
-            ));
-        }
-        if topology.tensor_model_parallel_size() != tp_size {
-            return Err(anyhow!(
-                "Qwen server topology TP={} does not match TP_SIZE={tp_size}",
-                topology.tensor_model_parallel_size()
-            ));
-        }
-        topology.coordinates(global_rank)?;
-        if !runtime_config.is_moe && topology.expert_model_parallel_size() != 1 {
-            return Err(anyhow!(
-                "native dense Qwen server requires expert_model_parallel_size=1"
-            ));
-        }
-        let dp_size = topology.data_parallel_size();
-        let ep_size = topology.expert_model_parallel_size();
-        let cp_size = topology.context_parallel_size();
-        let pp_size = topology.pipeline_model_parallel_size();
-        let tp_rank = topology.tensor_rank(global_rank)?;
-        let cp_rank = topology.context_rank(global_rank)?;
-        let dp_rank = topology.data_rank(global_rank)?;
-        let expert_rank = topology.expert_rank(global_rank)?;
-        let pp_rank = topology.pipeline_rank(global_rank)?;
         let is_ep = runtime_config.is_moe && ep_size > 1;
         let is_data_parallel = dp_size > 1;
         let ep_a2a = std::env::var("QWEN36_EP_A2A")
@@ -1121,6 +1144,7 @@ impl TrainingSession for Qwen36Session {
         };
         let context_spec = QwenContextSpec {
             runtime_config: runtime_config.clone(),
+            stage,
             init: req.clone(),
             target_layers: all_layers.clone(),
             target_modules: target_modules.clone(),
@@ -1254,6 +1278,7 @@ impl TrainingSession for Qwen36Session {
         path: &str,
         checkpoint_generation: Option<&str>,
     ) -> Result<(u64, f64)> {
+        self.ensure_stage_checkpoint_supported()?;
         let ctx = self
             .ctx
             .as_ref()
@@ -1519,6 +1544,7 @@ impl TrainingSession for Qwen36Session {
     }
 
     fn load_checkpoint_in_place(&mut self, path: &str) -> Result<(u64, f64)> {
+        self.ensure_stage_checkpoint_supported()?;
         let parallel = checkpoint::ParallelCheckpointManifest::from_env()?;
         let data = checkpoint::load_checkpoint_for_topology(std::path::Path::new(path), &parallel)?;
         let model_path = self

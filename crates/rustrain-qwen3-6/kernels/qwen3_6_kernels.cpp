@@ -2639,6 +2639,23 @@ static void hash_adapter_layout(
     hash_tensor_layout(hash, adapter.grad_slab);
 }
 
+static void hash_adapter_request_identity(
+    AdapterRegistryHash& hash,
+    const TrainingContext::LoRAAdapter& adapter
+) {
+    hash.add_u64(adapter.id);
+    hash.add_u64(adapter.rank);
+    hash.add_u64(adapter.optimizer_step);
+    uint64_t alpha_bits = 0;
+    std::memcpy(&alpha_bits, &adapter.alpha, sizeof(alpha_bits));
+    hash.add_u64(alpha_bits);
+    hash.add_u64(adapter.all_target_layers);
+    hash.add_u64(adapter.global_target_layers.size());
+    for (const auto layer : adapter.global_target_layers) hash.add_u64(layer);
+    hash.add_u64(adapter.target_modules.size());
+    for (const auto& module : adapter.target_modules) hash.add_string(module);
+}
+
 static void hash_collective_topology(
     AdapterRegistryHash& hash, const TrainingContext* ctx
 ) {
@@ -2889,7 +2906,8 @@ static bool adapter_registration_phase_matches(
     bool local_ready,
     uint64_t phase
 ) {
-    if (!ctx || (!ctx->nccl_comm && !ctx->dp_comm && !ctx->tp_comm))
+    if (!ctx || (!ctx->nccl_comm && !ctx->dp_comm && !ctx->tp_comm &&
+            !ctx->cp_comm && !ctx->pp_comm))
         return local_ready;
 
     AdapterRegistryHash hash;
@@ -2943,7 +2961,58 @@ static bool adapter_registration_phase_matches(
     for (int64_t index = 0; index < minimum.numel(); ++index) {
         if (minimum_data[index] != maximum_data[index]) return false;
     }
-    return minimum_data[0] == 1;
+    if (minimum_data[0] != 1) return false;
+
+    // Pipeline stages intentionally own different parameter layouts. Compare
+    // only the canonical tenant request across PP/CP while the full layout
+    // comparison above remains scoped to ranks sharing stage ownership.
+    AdapterRegistryHash request_hash;
+    hash_collective_topology(request_hash, ctx);
+    request_hash.add_u64(phase);
+    request_hash.add_u64(ctx->restore_without_parameter_sync);
+    request_hash.add_u64(ctx->allow_heterogeneous_registration);
+    request_hash.add_u64(ctx->next_adapter_id);
+    request_hash.add_u64(ctx->adapters.size());
+    for (const auto& adapter : ctx->adapters)
+        hash_adapter_request_identity(request_hash, adapter);
+    hash_adapter_request_identity(request_hash, candidate);
+    const std::vector<int64_t> request_values{
+        local_ready ? 1 : 0,
+        static_cast<int64_t>(request_hash.first & kPositiveInt64Mask),
+        static_cast<int64_t>(request_hash.second & kPositiveInt64Mask),
+    };
+    auto request_minimum = at::tensor(request_values, options);
+    auto request_maximum = request_minimum.clone();
+    auto reduce_request_axis = [&](ncclComm_t communicator, const char* axis) {
+        if (!communicator) return;
+        auto err = ncclAllReduce(
+            request_minimum.data_ptr<int64_t>(),
+            request_minimum.data_ptr<int64_t>(), request_minimum.numel(),
+            ncclInt64, ncclMin, communicator, stream);
+        TORCH_CHECK(err == ncclSuccess, axis,
+            " adapter request minimum all-reduce failed: ",
+            ncclGetErrorString(err));
+        err = ncclAllReduce(
+            request_maximum.data_ptr<int64_t>(),
+            request_maximum.data_ptr<int64_t>(), request_maximum.numel(),
+            ncclInt64, ncclMax, communicator, stream);
+        TORCH_CHECK(err == ncclSuccess, axis,
+            " adapter request maximum all-reduce failed: ",
+            ncclGetErrorString(err));
+    };
+    reduce_request_axis(ctx->cp_comm, "CP");
+    reduce_request_axis(ctx->pp_comm, "PP");
+    const auto request_minimum_cpu = request_minimum.to(at::kCPU);
+    const auto request_maximum_cpu = request_maximum.to(at::kCPU);
+    const auto* request_minimum_data =
+        request_minimum_cpu.data_ptr<int64_t>();
+    const auto* request_maximum_data =
+        request_maximum_cpu.data_ptr<int64_t>();
+    for (int64_t index = 0; index < request_minimum.numel(); ++index) {
+        if (request_minimum_data[index] != request_maximum_data[index])
+            return false;
+    }
+    return request_minimum_data[0] == 1;
 }
 
 static bool supported_mask_dtype(const at::Tensor& tensor) {
@@ -10328,10 +10397,23 @@ int32_t qwen36_set_adapter_id(void* ctx_ptr, int64_t current_id, int64_t request
         TORCH_CHECK(ctx && current_id > 0 && requested_id > 0,
             "dynamic adapter IDs must be positive");
         require_clear_accumulation_for_registry_mutation(ctx);
+        bool current_found = false;
+        bool requested_available = true;
         for (const auto& adapter : ctx->adapters) {
-            TORCH_CHECK(adapter.id != requested_id || adapter.id == current_id,
-                "dynamic adapter ID already exists: ", requested_id);
+            current_found = current_found || adapter.id == current_id;
+            requested_available = requested_available &&
+                (adapter.id != requested_id || adapter.id == current_id);
         }
+        TrainingContext::LoRAAdapter request{};
+        request.id = current_id;
+        request.rank = requested_id;
+        request.alpha = 1.0;
+        const bool local_valid = current_found && requested_available;
+        TORCH_CHECK(adapter_registration_phase_matches(
+                ctx, request, local_valid, /*phase=*/3) && local_valid,
+            current_found ? "dynamic adapter ID already exists: " :
+                "dynamic adapter not found: ",
+            current_found ? requested_id : current_id);
         for (auto& adapter : ctx->adapters) {
             if (adapter.id == current_id) {
                 adapter.id = requested_id;
@@ -10341,7 +10423,7 @@ int32_t qwen36_set_adapter_id(void* ctx_ptr, int64_t current_id, int64_t request
                 return 0;
             }
         }
-        TORCH_CHECK(false, "dynamic adapter not found: ", current_id);
+        TORCH_CHECK(false, "validated dynamic adapter disappeared: ", current_id);
     } catch (const std::exception& e) {
         fprintf(stderr, "[q36] set_adapter_id FAILED: %s\n", e.what());
         return -1;
@@ -10355,6 +10437,18 @@ int32_t qwen36_remove_lora(void* ctx_ptr, int64_t adapter_id) {
         TORCH_CHECK(ctx && adapter_id > 0,
             "dynamic LoRA removal requires a context and positive adapter ID");
         require_clear_accumulation_for_registry_mutation(ctx);
+        const bool local_found = std::any_of(
+            ctx->adapters.begin(), ctx->adapters.end(),
+            [&](const auto& adapter) { return adapter.id == adapter_id; });
+        TrainingContext::LoRAAdapter request{};
+        request.id = adapter_id;
+        request.rank = -1;
+        request.optimizer_step = local_found ? 1 : 0;
+        request.alpha = 1.0;
+        TORCH_CHECK(adapter_registration_phase_matches(
+                ctx, request, true, /*phase=*/4),
+            "dynamic LoRA removal request or registry differs across ranks");
+        if (!local_found) return 0;
         for (auto it = ctx->adapters.begin(); it != ctx->adapters.end(); ++it) {
             if (it->id == adapter_id) {
                 ctx->adapters.erase(it);
@@ -10363,7 +10457,7 @@ int32_t qwen36_remove_lora(void* ctx_ptr, int64_t adapter_id) {
                 return 1;
             }
         }
-        return 0;
+        TORCH_CHECK(false, "validated dynamic adapter disappeared: ", adapter_id);
     } catch (const std::exception& e) {
         fprintf(stderr, "[q36] remove_lora FAILED: %s\n", e.what());
         return -1;

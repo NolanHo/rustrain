@@ -110,7 +110,7 @@ pub fn stage_lora_slots(
 /// Tied vocabulary weights are intentionally present on both boundary stages:
 /// the first consumes them as embeddings and the last consumes them as the LM
 /// head. All other layer weights have exactly one owner.
-pub fn stage_needed_weights(
+pub fn stage_text_needed_weights(
     config: &Qwen36RuntimeConfig,
     stage: &PipelineStageLayout,
 ) -> HashSet<String> {
@@ -170,6 +170,14 @@ pub fn stage_needed_weights(
         }
     }
 
+    needed
+}
+
+pub fn stage_needed_weights(
+    config: &Qwen36RuntimeConfig,
+    stage: &PipelineStageLayout,
+) -> HashSet<String> {
+    let mut needed = stage_text_needed_weights(config, stage);
     if config.has_vision && stage.is_first() {
         needed.extend(crate::vision::VisionWeights::weight_names(config));
     }
