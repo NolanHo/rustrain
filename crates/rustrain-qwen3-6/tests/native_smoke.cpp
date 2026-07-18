@@ -51,6 +51,8 @@ extern "C" double qwen36_train_multi_lora(
     void*, void*, void*, void*, int32_t, int32_t);
 extern "C" double qwen36_train_multi_lora_selected(
     void*, void*, void*, void*, const int64_t*, int32_t, int32_t);
+extern "C" double qwen36_train_multi_lora_selected_v2(
+    void*, void*, void*, void*, const int64_t*, int32_t);
 extern "C" double qwen36_train_step_host_i64(
     void*, const int64_t*, const int64_t*, const int64_t*, int64_t, int64_t);
 extern "C" double qwen36_train_multi_lora_host_i64(
@@ -59,6 +61,8 @@ extern "C" double qwen36_train_multi_lora_host_i64(
 extern "C" double qwen36_eval_step_host_i64(
     void*, const int64_t*, const int64_t*, const int64_t*, int64_t, int64_t);
 extern "C" int64_t qwen36_add_lora(
+    void*, int64_t, double, const int64_t*, int64_t, const char*);
+extern "C" int64_t qwen36_add_lora_v2(
     void*, int64_t, double, const int64_t*, int64_t, const char*);
 extern "C" int64_t qwen36_add_lora_for_restore(
     void*, int64_t, double, const int64_t*, int64_t, const char*);
@@ -376,7 +380,7 @@ static int run_dynamic_dp_smoke(
 }
 
 int main() {
-    assert(qwen36_kernel_abi_version() == 22);
+    assert(qwen36_kernel_abi_version() == 23);
     const int world = std::atoi(std::getenv("WORLD_SIZE") ? std::getenv("WORLD_SIZE") : "1");
     const int process_rank = std::atoi(std::getenv("RANK") ? std::getenv("RANK") : "0");
     const int local_rank = std::atoi(std::getenv("LOCAL_RANK") ? std::getenv("LOCAL_RANK") : "0");
@@ -744,21 +748,77 @@ int main() {
     assert((*empty_tenant_v - empty_tenant_v_before).abs().max().item<double>() == 0.0);
     assert(qwen36_add_lora(
         ctx, rank + 1, 12.0, &target_layer, 1, "q_proj") < 0);
-    const int64_t heterogeneous_restore = qwen36_add_lora_for_restore(
+    const int64_t heterogeneous_restore = qwen36_add_lora_v2(
         ctx, rank + 1, 12.0, &target_layer, 1, "q_proj");
     assert(heterogeneous_restore > 0);
-    assert(qwen36_get_adapter_lora_tensor(
-        ctx, heterogeneous_restore, 0, "q_proj", 0) != nullptr);
-    assert(qwen36_remove_lora(ctx, heterogeneous_restore) == 1);
-    const int64_t heterogeneous_target_restore = qwen36_add_lora_for_restore(
-        ctx, rank, 12.0, &target_layer, 1, "q_proj");
-    assert(heterogeneous_target_restore > 0);
+    auto* heterogeneous_b = reinterpret_cast<at::Tensor*>(
+        qwen36_get_adapter_lora_tensor(
+            ctx, heterogeneous_restore, 0, "q_proj", 1));
+    assert(heterogeneous_b);
     assert(qwen36_train_multi_lora(
         ctx, &multi_input_ids, &multi_target_mask, &multi_attention_mask,
         3, rank) < 0.0);
     assert(qwen36_get_adapter_step_count(ctx, adapter_one) == 3);
     assert(qwen36_get_adapter_step_count(ctx, adapter_two) == 1);
-    assert(qwen36_remove_lora(ctx, heterogeneous_target_restore) == 1);
+    const int64_t heterogeneous_ids[] = {
+        adapter_one, adapter_two, heterogeneous_restore};
+    auto heterogeneous_b_before = heterogeneous_b->clone();
+    auto one_before_v2 = dynamic_b->clone();
+    auto shared_input = multi_input_ids.narrow(0, 0, 1).contiguous();
+    auto shared_target_row = multi_target_mask.narrow(0, 0, 1).contiguous();
+    auto shared_attention = multi_attention_mask.narrow(0, 0, 1).contiguous();
+    const int64_t duplicate_ids[] = {adapter_one, adapter_one};
+    assert(qwen36_train_multi_lora_selected_v2(
+        ctx, &multi_input_ids, &multi_target_mask, &multi_attention_mask,
+        duplicate_ids, 2) < 0.0);
+    const int64_t unknown_ids[] = {adapter_one, heterogeneous_restore + 1000};
+    assert(qwen36_train_multi_lora_selected_v2(
+        ctx, &multi_input_ids, &multi_target_mask, &multi_attention_mask,
+        unknown_ids, 2) < 0.0);
+    assert(qwen36_get_adapter_step_count(ctx, adapter_one) == 3);
+    assert(qwen36_get_adapter_step_count(ctx, adapter_two) == 1);
+    assert(qwen36_get_adapter_step_count(ctx, heterogeneous_restore) == 0);
+    const double heterogeneous_loss = qwen36_train_multi_lora_selected_v2(
+        ctx, &shared_input, &shared_target_row, &shared_attention,
+        heterogeneous_ids, 3);
+    c10::cuda::device_synchronize();
+    assert(heterogeneous_loss == heterogeneous_loss && heterogeneous_loss > 0.0);
+    assert(qwen36_get_adapter_step_count(ctx, adapter_one) == 4);
+    assert(qwen36_get_adapter_step_count(ctx, adapter_two) == 2);
+    assert(qwen36_get_adapter_step_count(ctx, heterogeneous_restore) == 1);
+    assert((*dynamic_b - one_before_v2).abs().sum().item<double>() > 0.0);
+    assert((*heterogeneous_b - heterogeneous_b_before).abs().sum().item<double>() > 0.0);
+
+    auto rollback_one_b = dynamic_b->clone();
+    auto rollback_heterogeneous_b = heterogeneous_b->clone();
+    auto* rollback_one_m = reinterpret_cast<at::Tensor*>(
+        qwen36_get_adapter_optimizer_tensor(
+            ctx, adapter_one, 0, "shared_gate_proj", 1, 0));
+    assert(rollback_one_m);
+    auto rollback_one_m_before = rollback_one_m->clone();
+    setenv("QWEN36_TEST_FAIL_HETERO_GROUP_AFTER", "1", 1);
+    assert(qwen36_train_multi_lora_selected_v2(
+        ctx, &shared_input, &shared_target_row, &shared_attention,
+        heterogeneous_ids, 3) < 0.0);
+    unsetenv("QWEN36_TEST_FAIL_HETERO_GROUP_AFTER");
+    c10::cuda::device_synchronize();
+    assert(qwen36_get_adapter_step_count(ctx, adapter_one) == 4);
+    assert(qwen36_get_adapter_step_count(ctx, adapter_two) == 2);
+    assert(qwen36_get_adapter_step_count(ctx, heterogeneous_restore) == 1);
+    assert((*dynamic_b - rollback_one_b).abs().max().item<double>() == 0.0);
+    assert((*rollback_one_m - rollback_one_m_before).abs().max().item<double>() == 0.0);
+    assert((*heterogeneous_b - rollback_heterogeneous_b).abs().max().item<double>() == 0.0);
+
+    assert(qwen36_train_multi_lora_host_i64(
+        ctx, host_input_ids, host_target_mask, host_attention_mask,
+        1, 2, 3, rank, nullptr, 0) > 0.0);
+    c10::cuda::device_synchronize();
+    assert(qwen36_get_adapter_step_count(ctx, adapter_one) == 5);
+    assert(qwen36_get_adapter_step_count(ctx, adapter_two) == 3);
+    assert(qwen36_get_adapter_step_count(ctx, heterogeneous_restore) == 2);
+    std::printf("native_qwen36_heterogeneous_v2_smoke loss=%0.8f ok\n",
+        heterogeneous_loss);
+    assert(qwen36_remove_lora(ctx, heterogeneous_restore) == 1);
     qwen36_free_training_context(ctx);
 
     // Dense Qwen3.5 variants use the same per-sample activation path for

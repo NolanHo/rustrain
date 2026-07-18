@@ -37,15 +37,12 @@ type FnKernelAbiVersion = unsafe extern "C" fn() -> i64;
 type FnTrainStep = unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void, *mut c_void) -> f64;
 type FnTrainMicroStep =
     unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void, *mut c_void, f64, i32) -> f64;
-type FnTrainMultiLora =
-    unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void, *mut c_void, i32, i32) -> f64;
-type FnTrainMultiLoraSelected = unsafe extern "C" fn(
+type FnTrainMultiLoraSelectedV2 = unsafe extern "C" fn(
     *mut c_void,
     *mut c_void,
     *mut c_void,
     *mut c_void,
     *const i64,
-    i32,
     i32,
 ) -> f64;
 type FnEvalStep = unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void, *mut c_void) -> f64;
@@ -141,8 +138,7 @@ struct KernelHandles {
     create_ctx: FnCreateCtx,
     train_step: FnTrainStep,
     train_micro_step: FnTrainMicroStep,
-    train_multi_lora: FnTrainMultiLora,
-    train_multi_lora_selected: FnTrainMultiLoraSelected,
+    train_multi_lora_selected_v2: FnTrainMultiLoraSelectedV2,
     eval_step: FnEvalStep,
     train_step_host_i64: FnHostBatchStep,
     train_multi_lora_host_i64: FnHostMultiLoraStep,
@@ -169,6 +165,7 @@ struct KernelHandles {
     set_cuda_device: FnSetCudaDevice,
     set_base_tp_mlp: FnSetBaseTpMlp,
     add_lora: FnAddLora,
+    add_lora_v2: FnAddLora,
     add_lora_for_restore: FnAddLora,
     remove_lora: FnRemoveLora,
     list_lora: FnListLora,
@@ -219,15 +216,14 @@ unsafe fn load_kernels() -> Option<KernelHandles> {
         }};
     }
     let abi_version: FnKernelAbiVersion = sym!("qwen36_kernel_abi_version");
-    if abi_version() != 22 {
+    if abi_version() != 23 {
         return None;
     }
     Some(KernelHandles {
         create_ctx: sym!("qwen36_create_training_context_ex"),
         train_step: sym!("qwen36_train_step"),
         train_micro_step: sym!("qwen36_train_micro_step"),
-        train_multi_lora: sym!("qwen36_train_multi_lora"),
-        train_multi_lora_selected: sym!("qwen36_train_multi_lora_selected"),
+        train_multi_lora_selected_v2: sym!("qwen36_train_multi_lora_selected_v2"),
         eval_step: sym!("qwen36_eval_step"),
         train_step_host_i64: sym!("qwen36_train_step_host_i64"),
         train_multi_lora_host_i64: sym!("qwen36_train_multi_lora_host_i64"),
@@ -254,6 +250,7 @@ unsafe fn load_kernels() -> Option<KernelHandles> {
         set_cuda_device: sym!("qwen36_set_cuda_device"),
         set_base_tp_mlp: sym!("qwen36_set_base_tp_mlp"),
         add_lora: sym!("qwen36_add_lora"),
+        add_lora_v2: sym!("qwen36_add_lora_v2"),
         add_lora_for_restore: sym!("qwen36_add_lora_for_restore"),
         remove_lora: sym!("qwen36_remove_lora"),
         list_lora: sym!("qwen36_list_lora"),
@@ -910,10 +907,8 @@ impl CppTrainingContext {
         Ok(loss)
     }
 
-    /// Train all adapters in batched activation chunks. Chunks accumulate
-    /// gradients and share one logical Adam update. Input is expanded to [N, seq].
-    /// n_total: total number of adapters. lora_rank: LoRA rank for N_max calc.
-    /// Returns average loss across chunks.
+    /// Train every live dynamic adapter, including heterogeneous signatures.
+    /// The rank argument is retained for source compatibility with ABI22 callers.
     pub fn train_multi_lora(
         &self,
         input_ids: &Tensor,
@@ -922,21 +917,23 @@ impl CppTrainingContext {
         n_total: i32,
         lora_rank: i32,
     ) -> Result<f64> {
-        let kh = get_kernels().ok_or_else(|| anyhow::anyhow!("kernels not loaded"))?;
-        let loss = unsafe {
-            (kh.train_multi_lora)(
-                self.ptr,
-                input_ids.as_ptr() as *mut _,
-                target_mask.as_ptr() as *mut _,
-                attention_mask.as_ptr() as *mut _,
-                n_total,
-                lora_rank,
-            )
-        };
-        if loss < 0.0 {
-            bail!("C++ train_multi_lora failed");
+        if n_total <= 0 {
+            bail!("n_total must be positive, got {n_total}");
         }
-        Ok(loss)
+        let adapter_ids = self.list_lora();
+        if adapter_ids.len() != n_total as usize {
+            bail!(
+                "live adapter count {} does not match n_total={n_total}",
+                adapter_ids.len()
+            );
+        }
+        self.train_multi_lora_selected(
+            input_ids,
+            target_mask,
+            attention_mask,
+            &adapter_ids,
+            lora_rank,
+        )
     }
 
     /// Train only the requested dynamic adapters. The native wrapper scopes
@@ -948,25 +945,25 @@ impl CppTrainingContext {
         target_mask: &Tensor,
         attention_mask: &Tensor,
         adapter_ids: &[i64],
-        lora_rank: i32,
+        _lora_rank: i32,
     ) -> Result<f64> {
         if adapter_ids.is_empty() {
             bail!("selected multi-LoRA requires at least one adapter ID");
         }
         let kh = get_kernels().ok_or_else(|| anyhow::anyhow!("kernels not loaded"))?;
         let loss = unsafe {
-            (kh.train_multi_lora_selected)(
+            (kh.train_multi_lora_selected_v2)(
                 self.ptr,
                 input_ids.as_ptr() as *mut _,
                 target_mask.as_ptr() as *mut _,
                 attention_mask.as_ptr() as *mut _,
                 adapter_ids.as_ptr(),
-                adapter_ids.len() as i32,
-                lora_rank,
+                i32::try_from(adapter_ids.len())
+                    .context("selected adapter count exceeds i32")?,
             )
         };
         if loss < 0.0 {
-            bail!("C++ train_multi_lora_selected failed");
+            bail!("C++ train_multi_lora_selected_v2 failed");
         }
         Ok(loss)
     }
@@ -1333,7 +1330,7 @@ impl CppTrainingContext {
         } else {
             modules_c.as_ptr()
         };
-        let id = unsafe { (kh.add_lora)(self.ptr, rank, alpha, tl_ptr, tl_len, modules_ptr) };
+        let id = unsafe { (kh.add_lora_v2)(self.ptr, rank, alpha, tl_ptr, tl_len, modules_ptr) };
         if id < 0 {
             bail!("C++ add_lora failed");
         }

@@ -57,6 +57,8 @@ extern "C" int32_t qwen36_set_step_count(void*, int64_t);
 extern "C" double qwen36_train_step(void*, void*, void*, void*);
 extern "C" int64_t qwen36_add_lora(
     void*, int64_t, double, const int64_t*, int64_t, const char*);
+extern "C" int64_t qwen36_add_lora_v2(
+    void*, int64_t, double, const int64_t*, int64_t, const char*);
 extern "C" int64_t qwen36_add_lora_for_restore(
     void*, int64_t, double, const int64_t*, int64_t, const char*);
 extern "C" void* qwen36_get_adapter_lora_tensor(
@@ -72,11 +74,13 @@ extern "C" int32_t qwen36_set_adapter_step_count(
     void*, int64_t, int64_t);
 extern "C" double qwen36_train_multi_lora_selected(
     void*, void*, void*, void*, const int64_t*, int32_t, int32_t);
+extern "C" double qwen36_train_multi_lora_selected_v2(
+    void*, void*, void*, void*, const int64_t*, int32_t);
 extern "C" void qwen36_free_training_context(void*);
 
 namespace {
 
-constexpr int64_t kAbiVersion = 22;
+constexpr int64_t kAbiVersion = 23;
 constexpr int32_t kBaseTpAttention = 1 << 0;
 constexpr int32_t kDataParallel = 1 << 1;
 constexpr int32_t kVocabParallel = 1 << 2;
@@ -1230,6 +1234,59 @@ int main() {
         }
     }
     assert(resumed_dynamic_diff == 0.0);
+
+    const int64_t heterogeneous_tenant = qwen36_add_lora_v2(
+        distributed, 3, 3.0, &target_layer, 1, projection_targets);
+    assert(heterogeneous_tenant > tenant_two);
+    auto* heterogeneous_b = dynamic_tensor(
+        distributed, heterogeneous_tenant, projection_targets, true);
+    auto* homogeneous_b = dynamic_tensor(
+        distributed, tenant_one, projection_targets, true);
+    auto heterogeneous_before = heterogeneous_b->clone();
+    auto homogeneous_before = homogeneous_b->clone();
+    const int64_t heterogeneous_ids[] = {tenant_one, heterogeneous_tenant};
+    const int64_t tenant_one_step_before =
+        qwen36_get_adapter_step_count(distributed, tenant_one);
+
+    if (rank == 0)
+        setenv("QWEN36_TEST_FAIL_HETERO_GROUP_AFTER", "1", 1);
+    assert(qwen36_train_multi_lora_selected_v2(
+        distributed, &local_batch.input_ids, &local_batch.target_mask,
+        &local_batch.attention_mask, heterogeneous_ids, 2) < 0.0);
+    if (rank == 0)
+        unsetenv("QWEN36_TEST_FAIL_HETERO_GROUP_AFTER");
+    assert(qwen36_get_adapter_step_count(distributed, tenant_one) ==
+        tenant_one_step_before);
+    assert(qwen36_get_adapter_step_count(distributed, heterogeneous_tenant) == 0);
+    assert(max_diff(*homogeneous_b, homogeneous_before) == 0.0);
+    assert(max_diff(*heterogeneous_b, heterogeneous_before) == 0.0);
+
+    if (rank == 0)
+        setenv("QWEN36_TEST_FAIL_DYNAMIC_ADAM_BEFORE_COMMIT", "1", 1);
+    assert(qwen36_train_multi_lora_selected_v2(
+        distributed, &local_batch.input_ids, &local_batch.target_mask,
+        &local_batch.attention_mask, heterogeneous_ids, 2) < 0.0);
+    if (rank == 0)
+        unsetenv("QWEN36_TEST_FAIL_DYNAMIC_ADAM_BEFORE_COMMIT");
+    assert(qwen36_get_adapter_step_count(distributed, tenant_one) ==
+        tenant_one_step_before);
+    assert(qwen36_get_adapter_step_count(distributed, heterogeneous_tenant) == 0);
+    assert(max_diff(*homogeneous_b, homogeneous_before) == 0.0);
+    assert(max_diff(*heterogeneous_b, heterogeneous_before) == 0.0);
+
+    const double heterogeneous_loss = qwen36_train_multi_lora_selected_v2(
+        distributed, &local_batch.input_ids, &local_batch.target_mask,
+        &local_batch.attention_mask, heterogeneous_ids, 2);
+    assert(heterogeneous_loss > 0.0 && std::isfinite(heterogeneous_loss));
+    assert(qwen36_get_adapter_step_count(distributed, tenant_one) ==
+        tenant_one_step_before + 1);
+    assert(qwen36_get_adapter_step_count(distributed, heterogeneous_tenant) == 1);
+    assert(update_norm(*homogeneous_b, homogeneous_before) > 0.0);
+    assert(update_norm(*heterogeneous_b, heterogeneous_before) > 0.0);
+    std::printf(
+        "native_tp_ep_heterogeneous_v2 rank=%d loss=%0.8f ok\n",
+        rank, heterogeneous_loss);
+    std::fflush(stdout);
 
     qwen36_free_training_context(reference);
     qwen36_free_training_context(dynamic_reference);

@@ -2196,6 +2196,7 @@ struct TrainingContext {
     int64_t next_adapter_id = 0;
     int64_t multi_lora_invocation = 0;
     bool restore_without_parameter_sync = false;
+    bool allow_heterogeneous_registration = false;
 
     // LoRA cache: pre-concatenated A/B per (layer, module) pair
     // Invalidated when adapters change or after Adam update
@@ -2440,6 +2441,30 @@ static void validate_adapter_collective_registry(
             "all ranks must select the same ordered IDs, ranks, optimizer "
             "clocks, targets, and tensor layouts");
     }
+}
+
+static bool adapter_collective_all_succeeded(
+    TrainingContext* ctx,
+    bool local_success
+) {
+    c10::cuda::set_device(ctx->cuda_device);
+    cudaSetDevice(ctx->cuda_device);
+    auto options = at::TensorOptions().dtype(at::kInt).device(
+        at::kCUDA, ctx->cuda_device);
+    auto succeeded = at::full({1}, local_success ? 1 : 0, options);
+    auto stream = c10::cuda::getCurrentCUDAStream(ctx->cuda_device).stream();
+    auto reduce_axis = [&](ncclComm_t communicator, const char* axis) {
+        if (!communicator) return;
+        const auto err = ncclAllReduce(
+            succeeded.data_ptr<int32_t>(), succeeded.data_ptr<int32_t>(),
+            1, ncclInt32, ncclMin, communicator, stream);
+        TORCH_CHECK(err == ncclSuccess, axis,
+            " adapter success consensus failed: ", ncclGetErrorString(err));
+    };
+    reduce_axis(ctx->nccl_comm, "EP");
+    reduce_axis(ctx->dp_comm, "DP");
+    reduce_axis(ctx->tp_comm, "TP");
+    return succeeded.to(at::kCPU).item<int32_t>() != 0;
 }
 
 static bool harvest_leaf_grad(
@@ -5317,7 +5342,7 @@ static at::Tensor mtp_compute_loss(
 extern "C" {
 
 __attribute__((visibility("default"))) int64_t qwen36_kernel_abi_version() {
-    return 22;
+    return 23;
 }
 
 // Benchmark/metrics helper. The orthogonal EP, DP, and TP reductions propagate
@@ -6959,6 +6984,319 @@ __attribute__((visibility("default"))) double qwen36_train_multi_lora_selected(
     }
 }
 
+static std::string dynamic_adapter_group_key(
+    const TrainingContext::LoRAAdapter& adapter
+) {
+    std::ostringstream key;
+    key << "rank=" << adapter.rank;
+    key << "|layers=";
+    for (const auto layer : adapter.target_layers) key << layer << ",";
+    key << "|modules=";
+    for (const auto& module : adapter.target_modules) key << module << ",";
+    for (const auto& [layer_idx, pairs] : adapter.params) {
+        for (size_t pair_idx = 0; pair_idx < pairs.size(); ++pair_idx) {
+            const auto& [a, b] = pairs[pair_idx];
+            if (!a.requires_grad() && !b.requires_grad()) continue;
+            key << "|" << layer_idx << ":" << pair_idx << ":";
+            for (const auto size : a.sizes()) key << size << ",";
+            key << "/";
+            for (const auto size : b.sizes()) key << size << ",";
+        }
+    }
+    return key.str();
+}
+
+static void rollback_dynamic_adapter_commit(
+    TrainingContext::LoRAAdapter& adapter,
+    int64_t optimizer_step
+) {
+    if (adapter.optimizer_step == optimizer_step) return;
+    TORCH_CHECK(adapter.optimizer_step == optimizer_step + 1,
+        "heterogeneous rollback observed unexpected optimizer clock for adapter ",
+        adapter.id, ": expected ", optimizer_step + 1,
+        " got ", adapter.optimizer_step);
+    for (auto& [layer_idx, pairs] : adapter.params) {
+        auto state_it = adapter.adam_state.find(layer_idx);
+        auto shadow_it = adapter.adam_shadow.find(layer_idx);
+        TORCH_CHECK(state_it != adapter.adam_state.end() &&
+                shadow_it != adapter.adam_shadow.end() &&
+                state_it->second.size() == pairs.size() &&
+                shadow_it->second.size() == pairs.size(),
+            "heterogeneous rollback registry mismatch for adapter ",
+            adapter.id, " layer ", layer_idx);
+        for (size_t pair_idx = 0; pair_idx < pairs.size(); ++pair_idx) {
+            auto& [a, b] = pairs[pair_idx];
+            auto& [m_a, v_a, m_b, v_b] = state_it->second[pair_idx];
+            auto& [old_a, old_m_a, old_v_a,
+                   old_b, old_m_b, old_v_b] = shadow_it->second[pair_idx];
+            if (a.requires_grad()) {
+                std::swap(a, old_a);
+                std::swap(m_a, old_m_a);
+                std::swap(v_a, old_v_a);
+            }
+            if (b.requires_grad()) {
+                std::swap(b, old_b);
+                std::swap(m_b, old_m_b);
+                std::swap(v_b, old_v_b);
+            }
+        }
+    }
+    adapter.optimizer_step = optimizer_step;
+}
+
+// Heterogeneous selected training groups only adapters whose active tensor
+// layouts can be stacked safely. Groups execute in canonical key order on
+// every rank. Until grouped harvest and optimizer finalization are split into
+// separate internal phases, a later group failure rolls earlier commits back
+// through their persistent Adam shadow buffers.
+__attribute__((visibility("default"))) double
+qwen36_train_multi_lora_selected_v2(
+    void* ctx_ptr,
+    void* input_ids_ptr,
+    void* target_mask_ptr,
+    void* attention_mask_ptr,
+    const int64_t* adapter_ids,
+    int32_t n_adapters
+) {
+    auto* ctx = reinterpret_cast<TrainingContext*>(ctx_ptr);
+    std::vector<TrainingContext::LoRAAdapter> original;
+    std::vector<TrainingContext::LoRAAdapter> selected;
+    std::vector<TrainingContext::LoRAAdapter> merged;
+    std::vector<size_t> selected_indexes;
+    std::vector<uint8_t> moved;
+    std::vector<int64_t> original_steps;
+    bool registry_detached = false;
+    auto restore_registry = [&]() {
+        if (!ctx || !registry_detached) return;
+        for (size_t index = 0; index < original.size(); ++index) {
+            if (!moved[index]) {
+                merged.push_back(std::move(original[index]));
+                continue;
+            }
+            auto selected_it = std::find(
+                selected_indexes.begin(), selected_indexes.end(), index);
+            TORCH_CHECK(selected_it != selected_indexes.end(),
+                "heterogeneous selected adapter index disappeared: ", index);
+            const size_t selected_index = static_cast<size_t>(
+                selected_it - selected_indexes.begin());
+            merged.push_back(std::move(selected[selected_index]));
+        }
+        ctx->adapters.swap(merged);
+        registry_detached = false;
+    };
+    auto rollback = [&]() {
+        const size_t rollback_count = std::min(
+            selected.size(), original_steps.size());
+        for (size_t index = 0; index < rollback_count; ++index) {
+            rollback_dynamic_adapter_commit(
+                selected[index], original_steps[index]);
+        }
+    };
+    auto recover = [&]() {
+        try {
+            if (ctx && registry_detached && !ctx->adapters.empty()) {
+                // A failing legacy group returns with its registry installed.
+                // Move it back before rolling prior successful groups back.
+                for (auto& adapter : ctx->adapters) {
+                    auto selected_it = std::find_if(
+                        selected.begin(), selected.end(),
+                        [&](const auto& item) { return item.id == adapter.id; });
+                    if (selected_it != selected.end())
+                        *selected_it = std::move(adapter);
+                }
+                ctx->adapters.clear();
+            }
+        } catch (const std::exception& e) {
+            fprintf(stderr,
+                "[train_multi_selected_v2] group recovery FAILED: %s\n",
+                e.what());
+        } catch (...) {
+            fprintf(stderr,
+                "[train_multi_selected_v2] group recovery FAILED\n");
+        }
+        try {
+            rollback();
+        } catch (const std::exception& e) {
+            fprintf(stderr,
+                "[train_multi_selected_v2] rollback FAILED: %s\n", e.what());
+        } catch (...) {
+            fprintf(stderr, "[train_multi_selected_v2] rollback FAILED\n");
+        }
+        try {
+            restore_registry();
+        } catch (const std::exception& e) {
+            fprintf(stderr,
+                "[train_multi_selected_v2] registry restore FAILED: %s\n",
+                e.what());
+        } catch (...) {
+            fprintf(stderr,
+                "[train_multi_selected_v2] registry restore FAILED\n");
+        }
+    };
+    try {
+        TORCH_CHECK(ctx && adapter_ids && n_adapters > 0,
+            "heterogeneous selected training requires a context and adapter IDs");
+        TORCH_CHECK(!ctx->topology_invalid,
+            "native Qwen context rejected an incompatible TP/DP/EP topology");
+        validate_adapter_collective_registry(
+            ctx, adapter_ids, n_adapters, 0, false);
+        auto* input_ids_tensor = reinterpret_cast<at::Tensor*>(input_ids_ptr);
+        auto* target_mask_tensor = reinterpret_cast<at::Tensor*>(target_mask_ptr);
+        bool local_input_valid = input_ids_tensor && target_mask_tensor;
+        if (local_input_valid) {
+            local_input_valid = input_ids_tensor->dim() == 2 &&
+                target_mask_tensor->dim() == 2 &&
+                input_ids_tensor->sizes() == target_mask_tensor->sizes();
+        }
+        int64_t input_batch = 0;
+        if (local_input_valid) {
+            input_batch = input_ids_tensor->size(0);
+            local_input_valid = input_batch == 1 || input_batch == n_adapters;
+        }
+        at::Tensor attention_mask;
+        if (local_input_valid && attention_mask_ptr) {
+            attention_mask = *reinterpret_cast<at::Tensor*>(attention_mask_ptr);
+            local_input_valid =
+                attention_mask.sizes() == input_ids_tensor->sizes();
+        }
+        const bool global_input_valid = adapter_collective_all_succeeded(
+            ctx, local_input_valid);
+        TORCH_CHECK(global_input_valid && local_input_valid,
+            "heterogeneous multi-LoRA inputs must be rank-consistent [batch, seq] "
+            "tensors with batch 1 or adapter count");
+        auto& input_ids = *input_ids_tensor;
+        auto& target_mask = *target_mask_tensor;
+
+        const size_t original_count = ctx->adapters.size();
+        std::vector<size_t> requested_indexes;
+        std::vector<uint8_t> requested(original_count, 0);
+        requested_indexes.reserve(n_adapters);
+        for (int32_t request_index = 0;
+             request_index < n_adapters; ++request_index) {
+            TORCH_CHECK(adapter_ids[request_index] > 0,
+                "heterogeneous selected adapter IDs must be positive");
+            auto it = std::find_if(
+                ctx->adapters.begin(), ctx->adapters.end(),
+                [&](const auto& adapter) {
+                    return adapter.id == adapter_ids[request_index];
+                });
+            TORCH_CHECK(it != ctx->adapters.end(),
+                "unknown heterogeneous selected adapter ID: ",
+                adapter_ids[request_index]);
+            const size_t index = static_cast<size_t>(
+                it - ctx->adapters.begin());
+            TORCH_CHECK(!requested[index],
+                "duplicate heterogeneous selected adapter ID: ",
+                adapter_ids[request_index]);
+            requested[index] = 1;
+            requested_indexes.push_back(index);
+        }
+        original.reserve(original_count);
+        selected.reserve(n_adapters);
+        merged.reserve(original_count);
+        selected_indexes.reserve(n_adapters);
+        moved.resize(original_count, 0);
+        original.swap(ctx->adapters);
+        registry_detached = true;
+        original_steps.reserve(requested_indexes.size());
+        for (const size_t index : requested_indexes) {
+            moved[index] = 1;
+            selected_indexes.push_back(index);
+            original_steps.push_back(original[index].optimizer_step);
+            selected.push_back(std::move(original[index]));
+        }
+        std::map<std::string, std::vector<size_t>> groups;
+        for (size_t index = 0; index < selected.size(); ++index) {
+            groups[dynamic_adapter_group_key(selected[index])].push_back(index);
+        }
+
+        double weighted_loss = 0.0;
+        int32_t completed_groups = 0;
+        for (const auto& [group_key, indexes] : groups) {
+            std::vector<int64_t> row_indexes;
+            row_indexes.reserve(indexes.size());
+            for (const size_t selected_index : indexes)
+                row_indexes.push_back(static_cast<int64_t>(selected_index));
+
+            at::Tensor group_input;
+            at::Tensor group_targets;
+            at::Tensor group_attention;
+            void* group_input_ptr = input_ids_ptr;
+            void* group_target_ptr = target_mask_ptr;
+            void* group_attention_ptr = attention_mask_ptr;
+            bool local_prepared = true;
+            try {
+                if (input_batch != 1) {
+                    auto row_tensor = at::tensor(
+                        row_indexes,
+                        input_ids.options().dtype(at::kLong));
+                    group_input = input_ids.index_select(0, row_tensor);
+                    group_targets = target_mask.index_select(0, row_tensor);
+                    group_input_ptr = &group_input;
+                    group_target_ptr = &group_targets;
+                    if (attention_mask.defined()) {
+                        group_attention = attention_mask.index_select(
+                            0, row_tensor);
+                        group_attention_ptr = &group_attention;
+                    }
+                }
+            } catch (...) {
+                local_prepared = false;
+            }
+            TORCH_CHECK(adapter_collective_all_succeeded(ctx, local_prepared),
+                "heterogeneous adapter group preparation failed on at least "
+                "one distributed rank: ", group_key);
+
+            std::vector<TrainingContext::LoRAAdapter> group;
+            group.reserve(indexes.size());
+            for (const size_t selected_index : indexes)
+                group.push_back(std::move(selected[selected_index]));
+            ctx->adapters.swap(group);
+            const int32_t group_size = static_cast<int32_t>(indexes.size());
+            const int32_t group_rank = static_cast<int32_t>(
+                ctx->adapters.front().rank);
+            const double group_loss = qwen36_train_multi_lora(
+                ctx, group_input_ptr, group_target_ptr, group_attention_ptr,
+                group_size, group_rank);
+
+            group.swap(ctx->adapters);
+            for (size_t group_index = 0;
+                 group_index < indexes.size(); ++group_index) {
+                selected[indexes[group_index]] =
+                    std::move(group[group_index]);
+            }
+            ++completed_groups;
+            bool local_group_succeeded =
+                std::isfinite(group_loss) && group_loss >= 0.0;
+            const char* fail_after = std::getenv(
+                "QWEN36_TEST_FAIL_HETERO_GROUP_AFTER");
+            if (fail_after && fail_after[0] != '\0') {
+                char* end = nullptr;
+                const long requested = std::strtol(fail_after, &end, 10);
+                local_group_succeeded = local_group_succeeded &&
+                    end && *end == '\0' && requested > 0 &&
+                    completed_groups != requested;
+            }
+            TORCH_CHECK(adapter_collective_all_succeeded(
+                    ctx, local_group_succeeded),
+                "heterogeneous adapter group failed on at least one "
+                "distributed rank: ", group_key);
+            weighted_loss += group_loss * indexes.size();
+        }
+        restore_registry();
+        return weighted_loss / static_cast<double>(n_adapters);
+    } catch (const std::exception& e) {
+        recover();
+        fprintf(stderr, "[train_multi_selected_v2] FAILED: %s\n", e.what());
+        return -1.0;
+    } catch (...) {
+        recover();
+        fprintf(stderr,
+            "[train_multi_selected_v2] FAILED: unknown exception\n");
+        return -1.0;
+    }
+}
+
 // Set NCCL communicator for Expert Parallel all-reduce
 // Creates NCCL communicator directly in C++ using env vars RANK/WORLD_SIZE.
 // Rank 0 generates unique ID and writes to /tmp/rustrain-nccl/nccl-id.bin
@@ -7504,7 +7842,8 @@ int64_t qwen36_add_lora(
         // for an opaque ATen stack/shape failure during the first step. A
         // restore context hydrates each adapter independently and may contain
         // heterogeneous signatures before the grouped v2 trainer is enabled.
-        if (!ctx->adapters.empty() && !ctx->restore_without_parameter_sync) {
+        if (!ctx->adapters.empty() && !ctx->restore_without_parameter_sync &&
+            !ctx->allow_heterogeneous_registration) {
             const auto& reference = ctx->adapters.front();
             TORCH_CHECK(rank == reference.rank,
                 "dynamic LoRA adapters in one batch must use the same rank");
@@ -7641,6 +7980,23 @@ int64_t qwen36_add_lora(
         fprintf(stderr, "[q36] add_lora FAILED: %s\n", e.what());
         return -1;
     }
+}
+
+__attribute__((visibility("default")))
+int64_t qwen36_add_lora_v2(
+    void* ctx_ptr,
+    int64_t rank, double alpha,
+    const int64_t* target_layers, int64_t num_target_layers,
+    const char* target_modules_str
+) {
+    auto* ctx = reinterpret_cast<TrainingContext*>(ctx_ptr);
+    if (!ctx) return -1;
+    ctx->allow_heterogeneous_registration = true;
+    const int64_t id = qwen36_add_lora(
+        ctx_ptr, rank, alpha, target_layers, num_target_layers,
+        target_modules_str);
+    ctx->allow_heterogeneous_registration = false;
+    return id;
 }
 
 __attribute__((visibility("default")))
@@ -7945,6 +8301,7 @@ double qwen36_train_multi_lora_host_i64(
     int32_t n_adapter_ids
 ) {
     try {
+        (void)lora_rank;  // Retained for the ABI22 host wire contract.
         auto* ctx = reinterpret_cast<TrainingContext*>(ctx_ptr);
         TORCH_CHECK(n_adapter_ids >= 0,
             "host multi-LoRA adapter count must be non-negative");
@@ -7958,14 +8315,21 @@ double qwen36_train_multi_lora_host_i64(
             ctx, attention_mask, batch_size, seq_len,
             "host multi-LoRA attention_mask");
         if (n_adapter_ids == 0) {
-            return qwen36_train_multi_lora(
-                ctx, &input, &targets, &attention, n_total, lora_rank);
+            TORCH_CHECK(ctx && static_cast<int32_t>(ctx->adapters.size()) == n_total,
+                "host multi-LoRA adapter count must match the live registry");
+            std::vector<int64_t> all_adapter_ids;
+            all_adapter_ids.reserve(ctx->adapters.size());
+            for (const auto& adapter : ctx->adapters)
+                all_adapter_ids.push_back(adapter.id);
+            return qwen36_train_multi_lora_selected_v2(
+                ctx, &input, &targets, &attention,
+                all_adapter_ids.data(), n_total);
         }
         TORCH_CHECK(adapter_ids,
             "host selected multi-LoRA requires adapter IDs");
-        return qwen36_train_multi_lora_selected(
+        return qwen36_train_multi_lora_selected_v2(
             ctx, &input, &targets, &attention,
-            adapter_ids, n_adapter_ids, lora_rank);
+            adapter_ids, n_adapter_ids);
     } catch (const std::exception& e) {
         fprintf(stderr, "[q36] train_multi_lora_host_i64 FAILED: %s\n", e.what());
         return -1.0;
