@@ -585,6 +585,7 @@ pub struct Glm5TpAttentionWeights {
     pub kv_a_proj_scale: Option<Tensor>,
     pub kv_b_proj_scale: Option<Tensor>,
     pub o_proj_scale: Option<Tensor>,
+    pub indexer_weights_proj_scale: Option<Tensor>,
     pub indexer_wq_b_scale: Option<Tensor>,
     pub indexer_wk_scale: Option<Tensor>,
 }
@@ -614,6 +615,7 @@ impl Clone for Glm5TpAttentionWeights {
             kv_a_proj_scale: clone_opt!(&self.kv_a_proj_scale),
             kv_b_proj_scale: clone_opt!(&self.kv_b_proj_scale),
             o_proj_scale: clone_opt!(&self.o_proj_scale),
+            indexer_weights_proj_scale: clone_opt!(&self.indexer_weights_proj_scale),
             indexer_wq_b_scale: clone_opt!(&self.indexer_wq_b_scale),
             indexer_wk_scale: clone_opt!(&self.indexer_wk_scale),
         }
@@ -697,16 +699,36 @@ impl Glm5TpAttentionWeights {
         let indexer_k_norm_bias = weights
             .get(&format!("{p}.indexer.k_norm.bias"))
             .map(|t| t.to_kind(kind));
-        let indexer_weights_proj = weights
+        let weights_proj_scale = weights.get(&format!(
+            "{p}.indexer.weights_proj.weight_scale_inv"
+        ));
+        let (indexer_weights_proj, indexer_weights_proj_scale) = match weights
             .get(&format!("{p}.indexer.weights_proj.weight"))
-            .map(|t| {
-                // TP-shard by idx_n_heads if needed
-                if tp.tp_size > 1 {
-                    t.narrow(0, tp.idx_head_start as i64, tp.idx_heads_per_rank)
+        {
+            Some(weight) if weight.kind() == Kind::Float8e4m3fn && tp.tp_size > 1 => {
+                let scale = weights_proj_scale
+                    .context("FP8 TP indexer weights_proj is missing weight_scale_inv")?;
+                let full = rustrain_deepseek_v4::fp8_kernel::dequant_fp8_weight(weight, scale)
+                    .context("failed to dequantize FP8 TP indexer weights_proj")?;
+                (
+                    Some(full.narrow(0, tp.idx_head_start, tp.idx_heads_per_rank)),
+                    None,
+                )
+            }
+            Some(weight) => {
+                let weight = weight.keep_if_fp8(kind);
+                let weight = if tp.tp_size > 1 {
+                    weight.narrow(0, tp.idx_head_start, tp.idx_heads_per_rank)
                 } else {
-                    t.to_kind(kind)
-                }
-            });
+                    weight
+                };
+                (
+                    Some(weight),
+                    weights_proj_scale.map(|scale| scale.shallow_clone()),
+                )
+            }
+            None => (None, None),
+        };
 
         // FP8 scales
         let q_a_proj_scale = weights
@@ -745,6 +767,7 @@ impl Glm5TpAttentionWeights {
             q_b_proj_scale,
             kv_a_proj_scale,
             o_proj_scale,
+            indexer_weights_proj_scale,
             kv_b_proj_scale,
             indexer_wq_b_scale,
             indexer_wk_scale,
@@ -880,6 +903,10 @@ impl Glm5TpAttentionWeights {
             } else {
                 self.o_proj_scale.as_ref().map(Tensor::shallow_clone)
             },
+            indexer_weights_proj_scale: self
+                .indexer_weights_proj_scale
+                .as_ref()
+                .map(Tensor::shallow_clone),
             indexer_wq_b_scale: self.indexer_wq_b_scale.as_ref().map(Tensor::shallow_clone),
             indexer_wk_scale: self.indexer_wk_scale.as_ref().map(Tensor::shallow_clone),
         })
@@ -1056,7 +1083,11 @@ pub fn glm5_dsa_attention_tp_cp(
             };
             let idx_q_rotated = rotate_indexer(&idx_q);
             let idx_k_rotated = rotate_indexer(&idx_k_expanded);
-            let head_weights = glm5_safe_linear(input, weights_proj, None)
+            let head_weights = glm5_safe_linear(
+                input,
+                weights_proj,
+                indexer_weights.indexer_weights_proj_scale.as_ref(),
+            )
                 .reshape([batch, s_local, idx_nh_local])
                 .transpose(1, 2)
                 .to_kind(Kind::Float)

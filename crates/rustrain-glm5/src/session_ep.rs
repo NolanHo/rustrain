@@ -99,7 +99,7 @@ fn add_mtp_decoder_weights(
         "wq_b.weight",
     ] {
         needed.insert(format!("{p}.self_attn.indexer.{suffix}"));
-        if matches!(suffix, "wk.weight" | "wq_b.weight") {
+        if matches!(suffix, "weights_proj.weight" | "wk.weight" | "wq_b.weight") {
             needed.insert(format!("{p}.self_attn.indexer.{suffix}_scale_inv"));
         }
     }
@@ -211,6 +211,7 @@ fn forward_mtp_decoder_layer_ep(
         idx_k_norm_w: opt_ptr(attn.indexer_k_norm_weight.as_ref()),
         idx_k_norm_b: opt_ptr(attn.indexer_k_norm_bias.as_ref()),
         idx_weights_proj: opt_ptr(attn.indexer_weights_proj.as_ref()),
+        idx_weights_proj_scale: opt_ptr(attn.indexer_weights_proj_scale.as_ref()),
         idx_wq_b_scale: opt_ptr(attn.indexer_wq_b_scale.as_ref()),
         idx_wk_scale: opt_ptr(attn.indexer_wk_scale.as_ref()),
         gate_weight: opt_ptr(
@@ -510,7 +511,10 @@ pub fn train_glm5_lora_sft_ep(
             ] {
                 needed.insert(format!("{p}.self_attn.indexer.{suffix}"));
                 // FP8 scale for indexer wk and wq_b
-                if suffix == &"wk.weight" || suffix == &"wq_b.weight" {
+                if matches!(
+                    *suffix,
+                    "weights_proj.weight" | "wk.weight" | "wq_b.weight"
+                ) {
                     needed.insert(format!("{p}.self_attn.indexer.{suffix}_scale_inv"));
                 }
             }
@@ -1133,6 +1137,7 @@ pub fn train_glm5_lora_sft_ep(
                             indexer_weights.indexer_k_norm_weight.as_ref(),
                             indexer_weights.indexer_k_norm_bias.as_ref(),
                             indexer_weights.indexer_weights_proj.as_ref(),
+                            indexer_weights.indexer_weights_proj_scale.as_ref(),
                             indexer_weights.indexer_wq_b_scale.as_ref(),
                             indexer_weights.indexer_wk_scale.as_ref(),
                             Some(&gate),
@@ -1238,6 +1243,7 @@ pub fn train_glm5_lora_sft_ep(
                             indexer_weights.indexer_k_norm_weight.as_ref(),
                             indexer_weights.indexer_k_norm_bias.as_ref(),
                             indexer_weights.indexer_weights_proj.as_ref(),
+                            indexer_weights.indexer_weights_proj_scale.as_ref(),
                             indexer_weights.indexer_wq_b_scale.as_ref(),
                             indexer_weights.indexer_wk_scale.as_ref(),
                             None,
@@ -1352,6 +1358,7 @@ pub fn train_glm5_lora_sft_ep(
                         indexer_weights.indexer_k_norm_weight.as_ref(),
                         indexer_weights.indexer_k_norm_bias.as_ref(),
                         indexer_weights.indexer_weights_proj.as_ref(),
+                        indexer_weights.indexer_weights_proj_scale.as_ref(),
                         indexer_weights.indexer_wq_b_scale.as_ref(),
                         indexer_weights.indexer_wk_scale.as_ref(),
                         hidden.size()[0] as i32,

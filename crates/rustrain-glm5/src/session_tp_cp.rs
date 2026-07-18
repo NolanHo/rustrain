@@ -192,6 +192,7 @@ fn run_mtp_decoder_layer_tp_ep(
         idx_k_norm_w: opt(attn.indexer_k_norm_weight.as_ref()),
         idx_k_norm_b: opt(attn.indexer_k_norm_bias.as_ref()),
         idx_weights_proj: opt(attn.indexer_weights_proj.as_ref()),
+        idx_weights_proj_scale: opt(attn.indexer_weights_proj_scale.as_ref()),
         idx_wq_b_scale: opt(attn.indexer_wq_b_scale.as_ref()),
         idx_wk_scale: opt(attn.indexer_wk_scale.as_ref()),
         gate_weight: opt(is_moe
@@ -757,7 +758,10 @@ pub fn train_glm5_lora_sft_tp_cp_ep(
                 "wq_b.weight",
             ] {
                 needed.insert(format!("{p}.self_attn.indexer.{suffix}"));
-                if suffix == &"wk.weight" || suffix == &"wq_b.weight" {
+                if matches!(
+                    *suffix,
+                    "weights_proj.weight" | "wk.weight" | "wq_b.weight"
+                ) {
                     needed.insert(format!("{p}.self_attn.indexer.{suffix}_scale_inv"));
                 }
             }

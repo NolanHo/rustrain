@@ -940,7 +940,7 @@ void* v4_glm5_dsa_attention(
     void* q_a_scale, void* q_b_scale, void* kv_a_scale, void* kv_b_scale, void* o_scale,
     // Indexer weights (nullable for non-full layers)
     void* idx_wq_b, void* idx_wk, void* idx_k_norm_w, void* idx_k_norm_b,
-    void* idx_weights_proj,
+    void* idx_weights_proj, void* idx_weights_proj_scale,
     void* idx_wq_b_scale, void* idx_wk_scale,
     // Config
     int32_t batch_i, int32_t seq_i, int32_t num_heads_i, int32_t qk_nope_i, int32_t qk_rope_i,
@@ -990,6 +990,7 @@ void* v4_glm5_dsa_attention(
         auto o_s = o_scale ? std::optional<at::Tensor>(*reinterpret_cast<at::Tensor*>(o_scale)) : std::nullopt;
         auto iwq_s = idx_wq_b_scale ? std::optional<at::Tensor>(*reinterpret_cast<at::Tensor*>(idx_wq_b_scale)) : std::nullopt;
         auto iwk_s = idx_wk_scale ? std::optional<at::Tensor>(*reinterpret_cast<at::Tensor*>(idx_wk_scale)) : std::nullopt;
+        auto iwp_s = idx_weights_proj_scale ? std::optional<at::Tensor>(*reinterpret_cast<at::Tensor*>(idx_weights_proj_scale)) : std::nullopt;
 
         auto q_a = safe_linear(input, q_a_w, qa_s);
         auto q_a_normed = rms_norm(q_a, q_a_ln.to(compute_dtype), rms_eps);
@@ -1062,7 +1063,7 @@ void* v4_glm5_dsa_attention(
                     idx_k_expanded, ci, si, qr, rope_interleave);
 
                 int64_t actual_topk = std::min(itk, seq);
-                auto head_weights = safe_linear(input, wproj, std::nullopt)
+                auto head_weights = safe_linear(input, wproj, iwp_s)
                     .reshape({batch, seq, inh}) *
                     (1.0 / std::sqrt((double)(inh * ihd)));
                 auto topk_indices = chunked_topk(
@@ -1849,7 +1850,8 @@ void* v4_glm5_layer_forward(
     void* kv_a_proj, void* kv_a_layernorm, void* kv_b_proj, void* o_proj,
     void* q_a_scale, void* q_b_scale, void* kv_a_scale, void* kv_b_scale, void* o_scale,
     void* idx_wq_b, void* idx_wk, void* idx_k_norm_w, void* idx_k_norm_b,
-    void* idx_weights_proj, void* idx_wq_b_scale, void* idx_wk_scale,
+    void* idx_weights_proj, void* idx_weights_proj_scale,
+    void* idx_wq_b_scale, void* idx_wk_scale,
     // MLP/MoE weights
     void* gate_weight,             // MoE router (or nullptr for dense)
     void* shared_gate, void* shared_up, void* shared_down,  // shared expert (or nullptr for dense)
@@ -1972,6 +1974,7 @@ void* v4_glm5_layer_forward(
             auto& kn_w = *reinterpret_cast<at::Tensor*>(idx_k_norm_w);
             auto& kn_b = *reinterpret_cast<at::Tensor*>(idx_k_norm_b);
             auto& wproj = *reinterpret_cast<at::Tensor*>(idx_weights_proj);
+            auto idx_weights_proj_scale_t = idx_weights_proj_scale ? std::optional<at::Tensor>(*reinterpret_cast<at::Tensor*>(idx_weights_proj_scale)) : std::nullopt;
             auto idx_wq_b_scale_t = idx_wq_b_scale ? std::optional<at::Tensor>(*reinterpret_cast<at::Tensor*>(idx_wq_b_scale)) : std::nullopt;
             auto idx_wk_scale_t = idx_wk_scale ? std::optional<at::Tensor>(*reinterpret_cast<at::Tensor*>(idx_wk_scale)) : std::nullopt;
             auto idx_q = safe_linear(q_a, wq_b, idx_wq_b_scale_t);
@@ -1985,7 +1988,7 @@ void* v4_glm5_layer_forward(
             auto idx_q_rot = apply_indexer_rope(idx_q, ci, si, qr, rope_interleave);
             auto idx_k_rot = apply_indexer_rope(idx_k_exp, ci, si, qr, rope_interleave);
             int64_t actual_topk = std::min(itk, seq);
-            auto head_weights = safe_linear(hidden, wproj, std::nullopt)
+            auto head_weights = safe_linear(hidden, wproj, idx_weights_proj_scale_t)
                 .reshape({batch, seq, inh}) *
                 (1.0 / std::sqrt((double)(inh * ihd)));
             auto topk_indices = chunked_topk(
@@ -2064,7 +2067,8 @@ struct Glm5MtpDecoderDescriptor {
     void* kv_a_proj; void* kv_a_layernorm; void* kv_b_proj; void* o_proj;
     void* q_a_scale; void* q_b_scale; void* kv_a_scale; void* kv_b_scale; void* o_scale;
     void* idx_wq_b; void* idx_wk; void* idx_k_norm_w; void* idx_k_norm_b;
-    void* idx_weights_proj; void* idx_wq_b_scale; void* idx_wk_scale;
+    void* idx_weights_proj; void* idx_weights_proj_scale;
+    void* idx_wq_b_scale; void* idx_wk_scale;
 
     void* gate_weight; void* correction_bias;
     void* shared_gate; void* shared_up; void* shared_down;
@@ -2239,7 +2243,8 @@ static at::Tensor glm5_mtp_attention(const at::Tensor& input,
         auto idx_k_rot = apply_indexer_rope(
             idx_k, cos, sin, qr, d.indexer_rope_interleave != 0);
         auto head_weights = safe_linear(input,
-            descriptor_tensor(d.idx_weights_proj, "idx_weights_proj"), std::nullopt)
+            descriptor_tensor(d.idx_weights_proj, "idx_weights_proj"),
+            descriptor_optional(d.idx_weights_proj_scale))
             .reshape({batch, seq, d.idx_n_heads}).transpose(1, 2).to(at::kFloat) *
             (1.0 / std::sqrt(static_cast<double>(
                 d.idx_n_heads_global * d.idx_head_dim)));

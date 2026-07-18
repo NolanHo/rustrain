@@ -657,6 +657,7 @@ pub struct Glm5AttentionWeights {
     pub kv_a_proj_scale: Option<Tensor>,
     pub kv_b_proj_scale: Option<Tensor>,
     pub o_proj_scale: Option<Tensor>,
+    pub indexer_weights_proj_scale: Option<Tensor>,
     pub indexer_wk_scale: Option<Tensor>,
     pub indexer_wq_b_scale: Option<Tensor>,
 }
@@ -687,6 +688,10 @@ impl Clone for Glm5AttentionWeights {
             kv_a_proj_scale: self.kv_a_proj_scale.as_ref().map(|t| t.shallow_clone()),
             kv_b_proj_scale: self.kv_b_proj_scale.as_ref().map(|t| t.shallow_clone()),
             o_proj_scale: self.o_proj_scale.as_ref().map(|t| t.shallow_clone()),
+            indexer_weights_proj_scale: self
+                .indexer_weights_proj_scale
+                .as_ref()
+                .map(|t| t.shallow_clone()),
             indexer_wk_scale: self.indexer_wk_scale.as_ref().map(|t| t.shallow_clone()),
             indexer_wq_b_scale: self.indexer_wq_b_scale.as_ref().map(|t| t.shallow_clone()),
         }
@@ -718,7 +723,7 @@ impl Glm5AttentionWeights {
             .map(|t| t.to_kind(kind));
         let indexer_weights_proj = weights
             .get(&format!("{p}.indexer.weights_proj.weight"))
-            .map(|t| t.to_kind(kind));
+            .map(|t| t.keep_if_fp8(kind));
         let indexer_wk = weights
             .get(&format!("{p}.indexer.wk.weight"))
             .map(|t| t.keep_if_fp8(kind));
@@ -741,6 +746,9 @@ impl Glm5AttentionWeights {
             .map(|t| t.shallow_clone());
         let o_proj_scale = weights
             .get(&format!("{p}.o_proj.weight_scale_inv"))
+            .map(|t| t.shallow_clone());
+        let indexer_weights_proj_scale = weights
+            .get(&format!("{p}.indexer.weights_proj.weight_scale_inv"))
             .map(|t| t.shallow_clone());
         let indexer_wk_scale = weights
             .get(&format!("{p}.indexer.wk.weight_scale_inv"))
@@ -767,6 +775,7 @@ impl Glm5AttentionWeights {
             kv_a_proj_scale,
             kv_b_proj_scale,
             o_proj_scale,
+            indexer_weights_proj_scale,
             indexer_wk_scale,
             indexer_wq_b_scale,
         })
@@ -956,7 +965,11 @@ pub fn glm5_dsa_attention(
             let score_chunk = 512_i64;
             // weights_proj is a per-query head weight for the indexer score:
             // sum_h(relu(q_h dot k) * weight_h). It is not an SDPA bias.
-            let head_weights = glm5_safe_linear(input, weights_proj, None)
+            let head_weights = glm5_safe_linear(
+                input,
+                weights_proj,
+                indexer_weights.indexer_weights_proj_scale.as_ref(),
+            )
                 .reshape([batch, seq, idx_n_heads])
                 .transpose(1, 2)
                 .to_kind(Kind::Float)
@@ -1253,25 +1266,10 @@ pub fn glm5_mlp_fp8(
     up_scale: Option<&Tensor>,
     down_scale: Option<&Tensor>,
 ) -> Tensor {
-    let use_fp8 = gate_scale.is_some()
-        && up_scale.is_some()
-        && down_scale.is_some()
-        && rustrain_deepseek_v4::fp8_kernel::is_fp8_kernel_available()
-        && matches!(input.device(), tch::Device::Cuda(_));
-
-    if use_fp8 {
-        // fp8_linear now handles 3D input internally (flattens to 2D, reshapes back)
-        let gate_out =
-            rustrain_deepseek_v4::fp8_kernel::fp8_linear(input, gate, gate_scale.unwrap())
-                .expect("GLM-5 FP8 gate projection failed");
-        let up_out = rustrain_deepseek_v4::fp8_kernel::fp8_linear(input, up, up_scale.unwrap())
-            .expect("GLM-5 FP8 up projection failed");
-        let activated = gate_out.silu() * up_out;
-        rustrain_deepseek_v4::fp8_kernel::fp8_linear(&activated, down, down_scale.unwrap())
-            .expect("GLM-5 FP8 down projection failed")
-    } else {
-        glm5_mlp(input, gate, up, down)
-    }
+    let gate_out = glm5_safe_linear(input, gate, gate_scale);
+    let up_out = glm5_safe_linear(input, up, up_scale);
+    let activated = gate_out.silu() * up_out;
+    glm5_safe_linear(&activated, down, down_scale)
 }
 
 // ── MoE ─────────────────────────────────────────────────────────

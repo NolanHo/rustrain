@@ -257,6 +257,19 @@ pub fn lora_attention_weights(
     layer: usize,
     registry: &mut Glm5LoraRegistry,
 ) -> Result<Glm5AttentionWeights> {
+    let q_a_modified = registry
+        .adapters
+        .contains_key(&(layer, Glm5LoraTargetModule::WqA));
+    let q_b_modified = registry
+        .adapters
+        .contains_key(&(layer, Glm5LoraTargetModule::WqB));
+    let kv_a_modified = registry
+        .adapters
+        .contains_key(&(layer, Glm5LoraTargetModule::Wkv));
+    let o_modified = registry
+        .adapters
+        .contains_key(&(layer, Glm5LoraTargetModule::Wo));
+
     Ok(Glm5AttentionWeights {
         q_a_proj: glm5_lora_weight(
             &base.q_a_proj,
@@ -300,14 +313,98 @@ pub fn lora_attention_weights(
             .map(|t| t.shallow_clone()),
         indexer_wk: base.indexer_wk.as_ref().map(|t| t.shallow_clone()),
         indexer_wq_b: base.indexer_wq_b.as_ref().map(|t| t.shallow_clone()),
-        // Scales set to None for LoRA-modified weights (already dequanted to BFloat16)
-        q_a_proj_scale: None,
-        q_b_proj_scale: None,
-        kv_a_proj_scale: None,
+        // A merged LoRA weight is already dequantized. Untargeted layers still
+        // hold their original FP8 weight and must retain its block scale.
+        q_a_proj_scale: (!q_a_modified)
+            .then(|| base.q_a_proj_scale.as_ref().map(|t| t.shallow_clone()))
+            .flatten(),
+        q_b_proj_scale: (!q_b_modified)
+            .then(|| base.q_b_proj_scale.as_ref().map(|t| t.shallow_clone()))
+            .flatten(),
+        kv_a_proj_scale: (!kv_a_modified)
+            .then(|| base.kv_a_proj_scale.as_ref().map(|t| t.shallow_clone()))
+            .flatten(),
         // kv_b_proj is NOT a LoRA target — keep its scale
         kv_b_proj_scale: base.kv_b_proj_scale.as_ref().map(|t| t.shallow_clone()),
-        o_proj_scale: None,
+        o_proj_scale: (!o_modified)
+            .then(|| base.o_proj_scale.as_ref().map(|t| t.shallow_clone()))
+            .flatten(),
+        indexer_weights_proj_scale: base
+            .indexer_weights_proj_scale
+            .as_ref()
+            .map(|t| t.shallow_clone()),
         indexer_wk_scale: base.indexer_wk_scale.as_ref().map(|t| t.shallow_clone()),
         indexer_wq_b_scale: base.indexer_wq_b_scale.as_ref().map(|t| t.shallow_clone()),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn attention_weights() -> Glm5AttentionWeights {
+        let matrix = || Tensor::zeros([2, 2], (Kind::Float, Device::Cpu));
+        let norm = || Tensor::ones([2], (Kind::Float, Device::Cpu));
+        let scale = || Some(Tensor::ones([1, 1], (Kind::Float, Device::Cpu)));
+        Glm5AttentionWeights {
+            q_a_proj: matrix(),
+            q_a_layernorm: norm(),
+            q_b_proj: matrix(),
+            kv_a_proj_with_mqa: matrix(),
+            kv_a_layernorm: norm(),
+            kv_b_proj: matrix(),
+            o_proj: matrix(),
+            indexer_k_norm_weight: None,
+            indexer_k_norm_bias: None,
+            indexer_weights_proj: None,
+            indexer_wk: None,
+            indexer_wq_b: None,
+            q_a_proj_scale: scale(),
+            q_b_proj_scale: scale(),
+            kv_a_proj_scale: scale(),
+            kv_b_proj_scale: scale(),
+            o_proj_scale: scale(),
+            indexer_weights_proj_scale: None,
+            indexer_wk_scale: None,
+            indexer_wq_b_scale: None,
+        }
+    }
+
+    #[test]
+    fn lora_only_clears_scales_for_weights_modified_on_that_layer() -> Result<()> {
+        let mut weights = BTreeMap::new();
+        for suffix in ["q_a_proj", "q_b_proj", "kv_a_proj_with_mqa", "o_proj"] {
+            weights.insert(
+                format!("model.layers.0.self_attn.{suffix}.weight"),
+                Tensor::zeros([2, 2], (Kind::Float, Device::Cpu)),
+            );
+        }
+        let config = Glm5LoraConfig {
+            rank: 1,
+            alpha: 1,
+            target_layers: vec![0],
+            target_modules: vec![
+                Glm5LoraTargetModule::WqA,
+                Glm5LoraTargetModule::WqB,
+                Glm5LoraTargetModule::Wkv,
+                Glm5LoraTargetModule::Wo,
+            ],
+        };
+        let mut registry = Glm5LoraRegistry::new(&weights, config, Device::Cpu)?;
+
+        let targeted = lora_attention_weights(&attention_weights(), 0, &mut registry)?;
+        assert!(targeted.q_a_proj_scale.is_none());
+        assert!(targeted.q_b_proj_scale.is_none());
+        assert!(targeted.kv_a_proj_scale.is_none());
+        assert!(targeted.o_proj_scale.is_none());
+        assert!(targeted.kv_b_proj_scale.is_some());
+
+        let untargeted = lora_attention_weights(&attention_weights(), 1, &mut registry)?;
+        assert!(untargeted.q_a_proj_scale.is_some());
+        assert!(untargeted.q_b_proj_scale.is_some());
+        assert!(untargeted.kv_a_proj_scale.is_some());
+        assert!(untargeted.o_proj_scale.is_some());
+        assert!(untargeted.kv_b_proj_scale.is_some());
+        Ok(())
+    }
 }

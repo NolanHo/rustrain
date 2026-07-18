@@ -86,6 +86,7 @@ unsafe extern "C" {
         idx_k_norm_w: *mut std::ffi::c_void,
         idx_k_norm_b: *mut std::ffi::c_void,
         idx_weights_proj: *mut std::ffi::c_void,
+        idx_weights_proj_scale: *mut std::ffi::c_void,
         idx_wq_b_scale: *mut std::ffi::c_void,
         idx_wk_scale: *mut std::ffi::c_void,
         // Config
@@ -275,6 +276,7 @@ unsafe extern "C" {
         idx_k_norm_w: *mut std::ffi::c_void,
         idx_k_norm_b: *mut std::ffi::c_void,
         idx_weights_proj: *mut std::ffi::c_void,
+        idx_weights_proj_scale: *mut std::ffi::c_void,
         idx_wq_b_scale: *mut std::ffi::c_void,
         idx_wk_scale: *mut std::ffi::c_void,
         // MLP/MoE
@@ -359,6 +361,7 @@ pub struct Glm5MtpDecoderDescriptor {
     pub idx_k_norm_w: *mut std::ffi::c_void,
     pub idx_k_norm_b: *mut std::ffi::c_void,
     pub idx_weights_proj: *mut std::ffi::c_void,
+    pub idx_weights_proj_scale: *mut std::ffi::c_void,
     pub idx_wq_b_scale: *mut std::ffi::c_void,
     pub idx_wk_scale: *mut std::ffi::c_void,
     pub gate_weight: *mut std::ffi::c_void,
@@ -947,6 +950,7 @@ pub fn glm5_dsa_attention_cpp(
     idx_k_norm_w: Option<&Tensor>,
     idx_k_norm_b: Option<&Tensor>,
     idx_weights_proj: Option<&Tensor>,
+    idx_weights_proj_scale: Option<&Tensor>,
     idx_wq_b_scale: Option<&Tensor>,
     idx_wk_scale: Option<&Tensor>,
     // Config
@@ -997,6 +1001,7 @@ pub fn glm5_dsa_attention_cpp(
             opt_ptr(idx_k_norm_w),
             opt_ptr(idx_k_norm_b),
             opt_ptr(idx_weights_proj),
+            opt_ptr(idx_weights_proj_scale),
             opt_ptr(idx_wq_b_scale),
             opt_ptr(idx_wk_scale),
             batch,
@@ -1696,6 +1701,7 @@ pub fn glm5_layer_forward_cpp(
     idx_k_norm_w: Option<&Tensor>,
     idx_k_norm_b: Option<&Tensor>,
     idx_weights_proj: Option<&Tensor>,
+    idx_weights_proj_scale: Option<&Tensor>,
     idx_wq_b_scale: Option<&Tensor>,
     idx_wk_scale: Option<&Tensor>,
     // MLP/MoE
@@ -1807,6 +1813,7 @@ pub fn glm5_layer_forward_cpp(
             opt_ptr(idx_k_norm_w),
             opt_ptr(idx_k_norm_b),
             opt_ptr(idx_weights_proj),
+            opt_ptr(idx_weights_proj_scale),
             opt_ptr(idx_wq_b_scale),
             opt_ptr(idx_wk_scale),
             opt_ptr(gate_weight),
@@ -1890,6 +1897,22 @@ pub fn stream_wait_event(device_id: i32, event: &rustrain_nccl::nccl::CudaEventH
 mod mtp_tests {
     use super::*;
     use tch::{Cuda, Device, Kind};
+
+    #[test]
+    fn mtp_descriptor_places_weights_proj_scale_next_to_weight() {
+        let pointer_size = std::mem::size_of::<*mut std::ffi::c_void>();
+        assert_eq!(
+            std::mem::offset_of!(Glm5MtpDecoderDescriptor, idx_weights_proj_scale),
+            std::mem::offset_of!(Glm5MtpDecoderDescriptor, idx_weights_proj) + pointer_size
+        );
+        assert_eq!(
+            std::mem::offset_of!(Glm5MtpDecoderDescriptor, idx_wq_b_scale),
+            std::mem::offset_of!(Glm5MtpDecoderDescriptor, idx_weights_proj_scale) + pointer_size
+        );
+
+        let descriptor = Glm5MtpDecoderDescriptor::default();
+        assert!(descriptor.idx_weights_proj_scale.is_null());
+    }
 
     fn assert_finite_nonzero_grad(name: &str, tensor: &Tensor) {
         let grad = tensor.grad();
