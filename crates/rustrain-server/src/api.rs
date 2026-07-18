@@ -13,9 +13,11 @@ use axum::{
 };
 use futures::stream::{self, Stream};
 use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet};
 use std::convert::Infallible;
-use std::sync::Arc;
-use tokio::sync::Semaphore;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+use tokio::sync::{Semaphore, oneshot};
 use tokio_stream::StreamExt;
 
 use crate::ep_dispatch::{EpDispatchScheduleError, EpDispatchScheduler, configured_queue_capacity};
@@ -35,6 +37,309 @@ pub struct EpAppState {
 struct EpRouterState {
     coordinator: Arc<crate::ep::EpCoordinator>,
     dispatcher: EpDispatchScheduler,
+    dispatch_submission: Mutex<()>,
+    multi_lora_batcher: MultiLoraBatcher,
+}
+
+const DEFAULT_MULTI_LORA_BATCH_WINDOW_US: u64 = 2_000;
+const HARD_MAX_MULTI_LORA_BATCH_WINDOW_US: u64 = 100_000;
+const DEFAULT_MULTI_LORA_BATCH_REQUESTS: usize = 16;
+const HARD_MAX_MULTI_LORA_BATCH_REQUESTS: usize = 4_096;
+const DEFAULT_MULTI_LORA_BATCH_ADAPTERS: usize = 64;
+const HARD_MAX_MULTI_LORA_BATCH_ADAPTERS: usize = 4_096;
+
+#[derive(Clone, Copy)]
+struct MultiLoraBatchConfig {
+    window: Duration,
+    max_requests: usize,
+    max_adapters: usize,
+    max_payload_bytes: usize,
+}
+
+impl MultiLoraBatchConfig {
+    fn from_env() -> Self {
+        let window_us = configured_positive_us(
+            "RUSTRAIN_MULTI_LORA_BATCH_WINDOW_US",
+            DEFAULT_MULTI_LORA_BATCH_WINDOW_US,
+            HARD_MAX_MULTI_LORA_BATCH_WINDOW_US,
+        );
+        let max_requests = configured_positive_usize(
+            "RUSTRAIN_MULTI_LORA_BATCH_MAX_REQUESTS",
+            DEFAULT_MULTI_LORA_BATCH_REQUESTS,
+            HARD_MAX_MULTI_LORA_BATCH_REQUESTS,
+        );
+        let max_adapters = configured_positive_usize(
+            "RUSTRAIN_MULTI_LORA_BATCH_MAX_ADAPTERS",
+            DEFAULT_MULTI_LORA_BATCH_ADAPTERS,
+            HARD_MAX_MULTI_LORA_BATCH_ADAPTERS,
+        );
+        let slab_bytes = configured_positive_usize(
+            "RUSTRAIN_EP_TENSOR_SLAB_BYTES",
+            rustrain_ipc::DEFAULT_TENSOR_SLAB_BYTES,
+            usize::MAX,
+        );
+        let max_payload_bytes = configured_positive_usize(
+            "RUSTRAIN_MULTI_LORA_BATCH_MAX_BYTES",
+            slab_bytes,
+            slab_bytes,
+        );
+        Self {
+            window: Duration::from_micros(window_us),
+            max_requests,
+            max_adapters,
+            max_payload_bytes,
+        }
+    }
+}
+
+fn configured_positive_us(name: &str, default: u64, hard_max: u64) -> u64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(default)
+        .min(hard_max)
+}
+
+fn configured_positive_usize(name: &str, default: usize, hard_max: usize) -> usize {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(default)
+        .min(hard_max)
+}
+
+struct MultiLoraDispatchRequest {
+    session_id: String,
+    tensors: rustrain_ipc::TensorSlabRef,
+    payload: Vec<u8>,
+    n_total: usize,
+    lora_rank: i32,
+    adapter_ids: Vec<i64>,
+    source_count: usize,
+    normalized_payload_bytes: usize,
+    allow_aggregate_loss: bool,
+    response: oneshot::Sender<MultiLoraDispatchOutcome>,
+}
+
+impl MultiLoraDispatchRequest {
+    fn coalescible(&self) -> bool {
+        self.allow_aggregate_loss && !self.adapter_ids.is_empty()
+    }
+}
+
+struct MultiLoraDispatchOutcome {
+    result: rustrain_ipc::EpResult,
+    request_count: usize,
+}
+
+struct MultiLoraWindow {
+    session_id: String,
+    seq_len: usize,
+    source_count: usize,
+    lora_rank: i32,
+    adapter_ids: HashSet<i64>,
+    adapter_count: usize,
+    payload_bytes: usize,
+    coalescible: bool,
+    requests: Vec<MultiLoraDispatchRequest>,
+}
+
+impl MultiLoraWindow {
+    fn new(request: MultiLoraDispatchRequest) -> Self {
+        let adapter_ids = request.adapter_ids.iter().copied().collect();
+        Self {
+            session_id: request.session_id.clone(),
+            seq_len: request.tensors.seq_len,
+            source_count: request.source_count,
+            lora_rank: request.lora_rank,
+            adapter_ids,
+            adapter_count: request.n_total,
+            payload_bytes: request.normalized_payload_bytes,
+            coalescible: request.coalescible(),
+            requests: vec![request],
+        }
+    }
+
+    fn can_accept(&self, request: &MultiLoraDispatchRequest, config: MultiLoraBatchConfig) -> bool {
+        if !self.coalescible
+            || !request.coalescible()
+            || self.session_id != request.session_id
+            || self.seq_len != request.tensors.seq_len
+            || self.source_count != request.source_count
+            || self.lora_rank != request.lora_rank
+            || self.requests.len() >= config.max_requests
+            || self.adapter_count.saturating_add(request.n_total) > config.max_adapters
+            || self
+                .payload_bytes
+                .saturating_add(request.normalized_payload_bytes)
+                > config.max_payload_bytes
+        {
+            return false;
+        }
+        request
+            .adapter_ids
+            .iter()
+            .all(|adapter_id| !self.adapter_ids.contains(adapter_id))
+    }
+
+    fn push(&mut self, request: MultiLoraDispatchRequest) {
+        self.adapter_count += request.n_total;
+        self.payload_bytes += request.normalized_payload_bytes;
+        self.adapter_ids.extend(request.adapter_ids.iter().copied());
+        self.requests.push(request);
+    }
+}
+
+#[derive(Default)]
+struct MultiLoraBatchState {
+    next_window_id: u64,
+    current_window_id: Option<u64>,
+    windows: HashMap<u64, MultiLoraWindow>,
+}
+
+#[derive(Clone)]
+struct MultiLoraBatcher {
+    state: Arc<Mutex<MultiLoraBatchState>>,
+    config: MultiLoraBatchConfig,
+}
+
+impl MultiLoraBatcher {
+    fn new(config: MultiLoraBatchConfig) -> Self {
+        Self {
+            state: Arc::new(Mutex::new(MultiLoraBatchState::default())),
+            config,
+        }
+    }
+
+    fn seal_current(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.current_window_id = None;
+    }
+
+    fn submit(
+        &self,
+        scheduler: &EpDispatchScheduler,
+        coordinator: Arc<crate::ep::EpCoordinator>,
+        request: MultiLoraDispatchRequest,
+    ) -> Result<(), EpDispatchScheduleError> {
+        if request.n_total > self.config.max_adapters
+            || request.normalized_payload_bytes > self.config.max_payload_bytes
+        {
+            return Err(EpDispatchScheduleError::QueueFull);
+        }
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(window_id) = state.current_window_id {
+            if state
+                .windows
+                .get(&window_id)
+                .is_some_and(|window| window.can_accept(&request, self.config))
+            {
+                state.windows.get_mut(&window_id).unwrap().push(request);
+                return Ok(());
+            }
+            state.current_window_id = None;
+        }
+
+        let window_id = state.next_window_id;
+        state.next_window_id = state.next_window_id.wrapping_add(1);
+        let coalescible = request.coalescible();
+        state
+            .windows
+            .insert(window_id, MultiLoraWindow::new(request));
+        if coalescible {
+            state.current_window_id = Some(window_id);
+        }
+
+        let batcher = self.clone();
+        let wait = if coalescible {
+            self.config.window
+        } else {
+            Duration::ZERO
+        };
+        let scheduled = scheduler.submit(move || {
+            if !wait.is_zero() {
+                std::thread::sleep(wait);
+            }
+            batcher.execute_window(window_id, &coordinator);
+        });
+        if let Err(error) = scheduled {
+            state.windows.remove(&window_id);
+            if state.current_window_id == Some(window_id) {
+                state.current_window_id = None;
+            }
+            return Err(error);
+        }
+        drop(scheduled);
+        Ok(())
+    }
+
+    fn execute_window(&self, window_id: u64, coordinator: &crate::ep::EpCoordinator) {
+        let window = {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if state.current_window_id == Some(window_id) {
+                state.current_window_id = None;
+            }
+            state.windows.remove(&window_id)
+        };
+        let Some(window) = window else {
+            return;
+        };
+        let (command, payload, responses) = match build_multi_lora_window(window) {
+            Ok(result) => result,
+            Err((error, responses)) => {
+                let request_count = responses.len();
+                for response in responses {
+                    let _ = response.send(MultiLoraDispatchOutcome {
+                        result: rustrain_ipc::EpResult::Error(error.clone()),
+                        request_count,
+                    });
+                }
+                return;
+            }
+        };
+        if payload.len() > self.config.max_payload_bytes {
+            let request_count = responses.len();
+            for response in responses {
+                let _ = response.send(MultiLoraDispatchOutcome {
+                    result: rustrain_ipc::EpResult::Error(format!(
+                        "coalesced tensor payload {} exceeds configured limit {}",
+                        payload.len(),
+                        self.config.max_payload_bytes
+                    )),
+                    request_count,
+                });
+            }
+            return;
+        }
+        tracing::debug!(
+            requests = responses.len(),
+            payload_bytes = payload.len(),
+            "dispatching coalesced multi-LoRA training batch"
+        );
+        let result = if coordinator.is_healthy() {
+            coordinator.dispatch_with_slab(&command, &payload)
+        } else {
+            rustrain_ipc::EpResult::Error("EP coordinator is unavailable".to_string())
+        };
+        let request_count = responses.len();
+        for response in responses {
+            let _ = response.send(MultiLoraDispatchOutcome {
+                result: result.clone(),
+                request_count,
+            });
+        }
+    }
 }
 
 pub fn router(state: Arc<AppState>) -> Router {
@@ -260,11 +565,21 @@ struct TrainMultiLoraHttp {
     lora_rank: i32,
     #[serde(default)]
     adapter_ids: Vec<i64>,
+    #[serde(default)]
+    allow_aggregate_loss: bool,
 }
 #[derive(Serialize)]
 struct TrainStepResponse {
     loss: f64,
     step: u64,
+}
+
+#[derive(Serialize)]
+struct TrainMultiLoraResponse {
+    loss: f64,
+    step: u64,
+    loss_scope: &'static str,
+    coalesced_requests: usize,
 }
 
 /// Decode the little-endian wire representation without materializing host values.
@@ -345,6 +660,181 @@ fn pack_tensor_slab(
         },
         payload,
     ))
+}
+
+fn multi_lora_source_count(batch_size: usize, n_total: usize) -> Result<usize, String> {
+    if n_total == 0 {
+        return Err("multi-LoRA adapter count must be positive".to_string());
+    }
+    if batch_size == 1 {
+        return Ok(1);
+    }
+    if batch_size % n_total != 0 {
+        return Err(format!(
+            "multi-LoRA batch_size={batch_size} must be 1 or a multiple of n_total={n_total}"
+        ));
+    }
+    Ok(batch_size / n_total)
+}
+
+fn normalized_multi_lora_payload_bytes(
+    seq_len: usize,
+    n_total: usize,
+    source_count: usize,
+) -> Result<usize, String> {
+    n_total
+        .checked_mul(source_count)
+        .and_then(|rows| rows.checked_mul(seq_len))
+        .and_then(|elements| elements.checked_mul(std::mem::size_of::<i64>()))
+        .and_then(|tensor_bytes| tensor_bytes.checked_mul(3))
+        .and_then(|bytes| bytes.checked_add(2 * (rustrain_ipc::TENSOR_SPAN_ALIGNMENT - 1)))
+        .ok_or_else(|| "normalized multi-LoRA payload size overflowed usize".to_string())
+}
+
+type MultiLoraWindowBuild = (
+    rustrain_ipc::EpCommand,
+    Vec<u8>,
+    Vec<oneshot::Sender<MultiLoraDispatchOutcome>>,
+);
+
+fn build_multi_lora_window(
+    window: MultiLoraWindow,
+) -> Result<MultiLoraWindowBuild, (String, Vec<oneshot::Sender<MultiLoraDispatchOutcome>>)> {
+    let build_result = build_multi_lora_window_payload(&window);
+    let responses = window
+        .requests
+        .into_iter()
+        .map(|request| request.response)
+        .collect::<Vec<_>>();
+    match build_result {
+        Ok((tensors, payload, adapter_ids, lora_rank)) => {
+            let n_total = match i32::try_from(adapter_ids.len()) {
+                Ok(n_total) => n_total,
+                Err(_) => {
+                    return Err(("coalesced adapter count exceeds i32".to_string(), responses));
+                }
+            };
+            Ok((
+                rustrain_ipc::EpCommand::TrainMultiLoraSlab {
+                    session_id: window.session_id,
+                    tensors,
+                    n_total,
+                    lora_rank,
+                    adapter_ids,
+                },
+                payload,
+                responses,
+            ))
+        }
+        Err(error) => Err((error, responses)),
+    }
+}
+
+fn build_multi_lora_window_payload(
+    window: &MultiLoraWindow,
+) -> Result<(rustrain_ipc::TensorSlabRef, Vec<u8>, Vec<i64>, i32), String> {
+    if window.requests.is_empty() {
+        return Err("coalesced multi-LoRA window is empty".to_string());
+    }
+    let total_adapters = window
+        .requests
+        .iter()
+        .try_fold(0usize, |total, request| total.checked_add(request.n_total))
+        .ok_or_else(|| "coalesced adapter count overflowed usize".to_string())?;
+    let batch_size = total_adapters
+        .checked_mul(window.source_count)
+        .ok_or_else(|| "coalesced batch size overflowed usize".to_string())?;
+    let row_bytes = window
+        .seq_len
+        .checked_mul(std::mem::size_of::<i64>())
+        .ok_or_else(|| "coalesced row byte count overflowed usize".to_string())?;
+    let tensor_bytes = batch_size
+        .checked_mul(row_bytes)
+        .ok_or_else(|| "coalesced tensor byte count overflowed usize".to_string())?;
+    let payload_capacity = tensor_bytes
+        .checked_mul(3)
+        .and_then(|bytes| bytes.checked_add(2 * (rustrain_ipc::TENSOR_SPAN_ALIGNMENT - 1)))
+        .ok_or_else(|| "coalesced payload capacity overflowed usize".to_string())?;
+    let mut payload = Vec::with_capacity(payload_capacity);
+    let mut spans = Vec::with_capacity(3);
+
+    for tensor_index in 0..3 {
+        let aligned = payload
+            .len()
+            .checked_add(rustrain_ipc::TENSOR_SPAN_ALIGNMENT - 1)
+            .map(|value| value & !(rustrain_ipc::TENSOR_SPAN_ALIGNMENT - 1))
+            .ok_or_else(|| "coalesced tensor alignment overflowed usize".to_string())?;
+        payload.resize(aligned, 0);
+        let offset_bytes = u64::try_from(aligned)
+            .map_err(|_| "coalesced tensor offset exceeds u64".to_string())?;
+        for source_index in 0..window.source_count {
+            for request in &window.requests {
+                request.tensors.validate(request.payload.len())?;
+                if request.source_count != window.source_count
+                    || request.tensors.seq_len != window.seq_len
+                {
+                    return Err("coalesced request layout changed after admission".to_string());
+                }
+                let span = request.tensors.spans()[tensor_index];
+                let tensor_start = usize::try_from(span.offset_bytes)
+                    .map_err(|_| "request tensor offset exceeds usize".to_string())?;
+                for adapter_index in 0..request.n_total {
+                    let row_index = if request.tensors.batch_size == 1 {
+                        0
+                    } else {
+                        source_index
+                            .checked_mul(request.n_total)
+                            .and_then(|row| row.checked_add(adapter_index))
+                            .ok_or_else(|| "request row index overflowed usize".to_string())?
+                    };
+                    let start = tensor_start
+                        .checked_add(
+                            row_index
+                                .checked_mul(row_bytes)
+                                .ok_or_else(|| "request row offset overflowed usize".to_string())?,
+                        )
+                        .ok_or_else(|| "request tensor range overflowed usize".to_string())?;
+                    let end = start
+                        .checked_add(row_bytes)
+                        .ok_or_else(|| "request tensor range overflowed usize".to_string())?;
+                    let row = request
+                        .payload
+                        .get(start..end)
+                        .ok_or_else(|| "request tensor row exceeds payload".to_string())?;
+                    payload.extend_from_slice(row);
+                }
+            }
+        }
+        spans.push(rustrain_ipc::TensorSpan {
+            offset_bytes,
+            len_bytes: u64::try_from(tensor_bytes)
+                .map_err(|_| "coalesced tensor length exceeds u64".to_string())?,
+        });
+    }
+
+    let adapter_ids = window
+        .requests
+        .iter()
+        .flat_map(|request| request.adapter_ids.iter().copied())
+        .collect::<Vec<_>>();
+    if adapter_ids.len() != total_adapters && !adapter_ids.is_empty() {
+        return Err("coalesced adapter ID count does not match batch geometry".to_string());
+    }
+    let lora_rank = window
+        .requests
+        .iter()
+        .map(|request| request.lora_rank)
+        .max()
+        .unwrap_or(0);
+    let tensors = rustrain_ipc::TensorSlabRef {
+        input_ids: spans[0],
+        target_mask: spans[1],
+        attention_mask: spans[2],
+        batch_size,
+        seq_len: window.seq_len,
+    };
+    tensors.validate(payload.len())?;
+    Ok((tensors, payload, adapter_ids, lora_rank))
 }
 
 fn validate_train_http_shapes(
@@ -724,21 +1214,31 @@ struct StepMetricJson {
 // ──────────────────────────────────────────────────────────────────────
 
 pub fn ep_router(state: Arc<EpAppState>) -> Router {
+    let batch_config = MultiLoraBatchConfig::from_env();
+    let multi_lora_batcher = MultiLoraBatcher::new(batch_config);
     let state = Arc::new(EpRouterState {
         coordinator: Arc::clone(&state.coordinator),
         dispatcher: EpDispatchScheduler::new(configured_queue_capacity()),
+        dispatch_submission: Mutex::new(()),
+        multi_lora_batcher,
     });
     let tensor_routes = Router::new()
         .route("/v1/sessions/{id}/train_step", post(ep_train_step))
-        .route("/v1/sessions/{id}/train_multi", post(ep_train_multi_lora))
         .route("/v1/sessions/{id}/eval_step", post(ep_eval_step))
         .route_layer(middleware::from_fn_with_state(
             Arc::new(Semaphore::new(1)),
             ep_tensor_admission,
         ));
+    let multi_lora_route = Router::new()
+        .route("/v1/sessions/{id}/train_multi", post(ep_train_multi_lora))
+        .route_layer(middleware::from_fn_with_state(
+            Arc::new(Semaphore::new(batch_config.max_requests)),
+            ep_tensor_admission,
+        ));
 
     Router::new()
         .merge(tensor_routes)
+        .merge(multi_lora_route)
         .route("/v1/sessions", post(ep_create_session))
         .route(
             "/v1/sessions/{id}",
@@ -778,7 +1278,7 @@ async fn ep_tensor_admission(
         Err(_) => (
             StatusCode::TOO_MANY_REQUESTS,
             Json(ErrorResponse {
-                error: "EP tensor request is already in progress".to_string(),
+                error: "EP tensor admission capacity is exhausted".to_string(),
             }),
         )
             .into_response(),
@@ -948,7 +1448,7 @@ async fn ep_train_multi_lora(
     State(state): State<Arc<EpRouterState>>,
     Path(id): Path<String>,
     Json(req): Json<TrainMultiLoraHttp>,
-) -> Result<Json<TrainStepResponse>, (StatusCode, Json<ErrorResponse>)> {
+) -> Result<Json<TrainMultiLoraResponse>, (StatusCode, Json<ErrorResponse>)> {
     let (batch_size, seq_len) = validate_multi_lora_http_shapes(
         &req.input_ids,
         &req.target_mask,
@@ -975,17 +1475,62 @@ async fn ep_train_multi_lora(
         if req.adapter_ids.iter().any(|id| *id <= 0) {
             return Err(err_resp("adapter_ids must contain only positive IDs"));
         }
+        if req
+            .adapter_ids
+            .iter()
+            .copied()
+            .collect::<HashSet<_>>()
+            .len()
+            != req.adapter_ids.len()
+        {
+            return Err(err_resp("adapter_ids must not contain duplicates"));
+        }
     }
-
-    let cmd = rustrain_ipc::EpCommand::TrainMultiLoraSlab {
+    let source_count = multi_lora_source_count(batch_size, req.n_total as usize)
+        .map_err(|error| err_resp(&error))?;
+    let normalized_payload_bytes =
+        normalized_multi_lora_payload_bytes(seq_len, req.n_total as usize, source_count)
+            .map_err(|error| err_resp(&error))?;
+    if !state.coordinator.is_healthy() {
+        return Err(ep_dispatch_unavailable("EP coordinator is unavailable"));
+    }
+    let (response, receiver) = oneshot::channel();
+    let request = MultiLoraDispatchRequest {
         session_id: id,
         tensors,
-        n_total: req.n_total,
+        payload,
+        n_total: req.n_total as usize,
         lora_rank: req.lora_rank,
         adapter_ids: req.adapter_ids,
+        source_count,
+        normalized_payload_bytes,
+        allow_aggregate_loss: req.allow_aggregate_loss,
+        response,
     };
-    match dispatch_slab(&state, cmd, payload).await? {
-        rustrain_ipc::EpResult::Train { loss, step } => Ok(Json(TrainStepResponse { loss, step })),
+    {
+        let _submission = state
+            .dispatch_submission
+            .lock()
+            .map_err(|_| ep_dispatch_schedule_error(EpDispatchScheduleError::WorkerFailed))?;
+        state
+            .multi_lora_batcher
+            .submit(&state.dispatcher, Arc::clone(&state.coordinator), request)
+            .map_err(ep_dispatch_schedule_error)?;
+    }
+    let outcome = receiver
+        .await
+        .map_err(|_| ep_dispatch_schedule_error(EpDispatchScheduleError::WorkerFailed))?;
+    match outcome.result {
+        rustrain_ipc::EpResult::Train { loss, step } => Ok(Json(TrainMultiLoraResponse {
+            loss,
+            step,
+            loss_scope: if outcome.request_count > 1 {
+                "coalesced_batch"
+            } else {
+                "request"
+            },
+            coalesced_requests: outcome.request_count,
+        })),
         rustrain_ipc::EpResult::Error(e) => Err(err_resp(&e)),
         _ => Err(err_resp("unexpected result")),
     }
@@ -1000,11 +1545,20 @@ async fn dispatch_slab(
         return Err(ep_dispatch_unavailable("EP coordinator is unavailable"));
     }
     let coordinator = Arc::clone(&state.coordinator);
-    state
-        .dispatcher
-        .run(move || coordinator.dispatch_with_slab(&command, &payload))
+    let receiver = {
+        let _submission = state
+            .dispatch_submission
+            .lock()
+            .map_err(|_| ep_dispatch_schedule_error(EpDispatchScheduleError::WorkerFailed))?;
+        state.multi_lora_batcher.seal_current();
+        state
+            .dispatcher
+            .submit(move || coordinator.dispatch_with_slab(&command, &payload))
+            .map_err(ep_dispatch_schedule_error)?
+    };
+    receiver
         .await
-        .map_err(ep_dispatch_schedule_error)
+        .map_err(|_| ep_dispatch_schedule_error(EpDispatchScheduleError::WorkerFailed))
 }
 
 async fn dispatch_ep(
@@ -1015,11 +1569,20 @@ async fn dispatch_ep(
         return Err(ep_dispatch_unavailable("EP coordinator is unavailable"));
     }
     let coordinator = Arc::clone(&state.coordinator);
-    state
-        .dispatcher
-        .run(move || coordinator.dispatch(&command))
+    let receiver = {
+        let _submission = state
+            .dispatch_submission
+            .lock()
+            .map_err(|_| ep_dispatch_schedule_error(EpDispatchScheduleError::WorkerFailed))?;
+        state.multi_lora_batcher.seal_current();
+        state
+            .dispatcher
+            .submit(move || coordinator.dispatch(&command))
+            .map_err(ep_dispatch_schedule_error)?
+    };
+    receiver
         .await
-        .map_err(ep_dispatch_schedule_error)
+        .map_err(|_| ep_dispatch_schedule_error(EpDispatchScheduleError::WorkerFailed))
 }
 
 fn ep_dispatch_schedule_error(error: EpDispatchScheduleError) -> (StatusCode, Json<ErrorResponse>) {
@@ -1051,9 +1614,10 @@ mod tensor_http_shape_tests {
     use base64::{Engine, engine::general_purpose};
 
     use super::{
-        EpDispatchScheduleError, StatusCode, TensorHttp, decode_int64_bytes,
-        ep_dispatch_schedule_error, pack_tensor_slab, validate_multi_lora_http_shapes,
-        validate_train_http_shapes,
+        EpDispatchScheduleError, MultiLoraBatchConfig, MultiLoraDispatchRequest, MultiLoraWindow,
+        StatusCode, TensorHttp, build_multi_lora_window_payload, decode_int64_bytes,
+        ep_dispatch_schedule_error, multi_lora_source_count, normalized_multi_lora_payload_bytes,
+        pack_tensor_slab, validate_multi_lora_http_shapes, validate_train_http_shapes,
     };
 
     fn tensor(shape: &[i64]) -> TensorHttp {
@@ -1062,6 +1626,67 @@ mod tensor_http_shape_tests {
             shape: shape.to_vec(),
             dtype: "int64".into(),
         }
+    }
+
+    fn encoded_tensor(rows: &[i64]) -> TensorHttp {
+        TensorHttp {
+            data: general_purpose::STANDARD.encode(
+                rows.iter()
+                    .copied()
+                    .flat_map(i64::to_le_bytes)
+                    .collect::<Vec<_>>(),
+            ),
+            shape: vec![rows.len() as i64, 1],
+            dtype: "int64".into(),
+        }
+    }
+
+    fn batch_request(
+        session_id: &str,
+        rows: &[i64],
+        n_total: usize,
+        adapter_ids: &[i64],
+    ) -> MultiLoraDispatchRequest {
+        let tensor = encoded_tensor(rows);
+        let (tensors, payload) =
+            pack_tensor_slab(&tensor, &tensor, &tensor, rows.len(), 1).unwrap();
+        let source_count = multi_lora_source_count(rows.len(), n_total).unwrap();
+        let normalized_payload_bytes =
+            normalized_multi_lora_payload_bytes(1, n_total, source_count).unwrap();
+        let (response, _receiver) = tokio::sync::oneshot::channel();
+        MultiLoraDispatchRequest {
+            session_id: session_id.to_string(),
+            tensors,
+            payload,
+            n_total,
+            lora_rank: 8,
+            adapter_ids: adapter_ids.to_vec(),
+            source_count,
+            normalized_payload_bytes,
+            allow_aggregate_loss: true,
+            response,
+        }
+    }
+
+    fn batch_request_with_rank(
+        session_id: &str,
+        rows: &[i64],
+        n_total: usize,
+        adapter_ids: &[i64],
+        lora_rank: i32,
+    ) -> MultiLoraDispatchRequest {
+        let mut request = batch_request(session_id, rows, n_total, adapter_ids);
+        request.lora_rank = lora_rank;
+        request
+    }
+
+    fn slab_i64(payload: &[u8], span: rustrain_ipc::TensorSpan) -> Vec<i64> {
+        let start = span.offset_bytes as usize;
+        let end = start + span.len_bytes as usize;
+        payload[start..end]
+            .chunks_exact(8)
+            .map(|bytes| i64::from_le_bytes(bytes.try_into().unwrap()))
+            .collect()
     }
 
     #[test]
@@ -1110,6 +1735,87 @@ mod tensor_http_shape_tests {
             validate_multi_lora_http_shapes(&invalid, &tensor(&[5, 32]), &tensor(&[5, 32]), 3)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn coalesced_multi_lora_preserves_source_major_adapter_rows() {
+        let mut window = MultiLoraWindow::new(batch_request(
+            "tenant-session",
+            &[10, 11, 20, 21],
+            2,
+            &[101, 102],
+        ));
+        window.push(batch_request("tenant-session", &[12, 22], 1, &[103]));
+
+        let (tensors, payload, adapter_ids, _) = build_multi_lora_window_payload(&window).unwrap();
+        assert_eq!(adapter_ids, vec![101, 102, 103]);
+        assert_eq!(tensors.batch_size, 6);
+        assert_eq!(
+            slab_i64(&payload, tensors.input_ids),
+            vec![10, 11, 12, 20, 21, 22]
+        );
+        assert_eq!(
+            slab_i64(&payload, tensors.target_mask),
+            vec![10, 11, 12, 20, 21, 22]
+        );
+        tensors.validate(payload.len()).unwrap();
+    }
+
+    #[test]
+    fn coalesced_multi_lora_expands_request_shared_rows_per_adapter() {
+        let mut window =
+            MultiLoraWindow::new(batch_request("tenant-session", &[7], 2, &[101, 102]));
+        window.push(batch_request("tenant-session", &[8], 1, &[103]));
+
+        let (tensors, payload, adapter_ids, _) = build_multi_lora_window_payload(&window).unwrap();
+        assert_eq!(adapter_ids, vec![101, 102, 103]);
+        assert_eq!(slab_i64(&payload, tensors.input_ids), vec![7, 7, 8]);
+    }
+
+    #[test]
+    fn coalescing_rejects_overlapping_tenants_and_capacity_overflow() {
+        let config = MultiLoraBatchConfig {
+            window: std::time::Duration::from_millis(1),
+            max_requests: 2,
+            max_adapters: 3,
+            max_payload_bytes: usize::MAX,
+        };
+        let mut window = MultiLoraWindow::new(batch_request("session", &[1], 1, &[11]));
+        assert!(!window.can_accept(&batch_request("session", &[2], 1, &[11]), config));
+        assert!(!window.can_accept(&batch_request("other", &[2], 1, &[12]), config));
+        assert!(!window.can_accept(
+            &batch_request_with_rank("session", &[2], 1, &[12], 16),
+            config
+        ));
+        assert!(window.can_accept(&batch_request("session", &[2, 3], 2, &[12, 13]), config));
+        window.push(batch_request("session", &[2], 1, &[12]));
+        assert!(!window.can_accept(&batch_request("session", &[3], 1, &[13]), config));
+    }
+
+    #[test]
+    fn implicit_registry_request_is_an_exclusive_window() {
+        let config = MultiLoraBatchConfig {
+            window: std::time::Duration::from_millis(1),
+            max_requests: 4,
+            max_adapters: 4,
+            max_payload_bytes: usize::MAX,
+        };
+        let window = MultiLoraWindow::new(batch_request("session", &[1], 1, &[]));
+        assert!(!window.can_accept(&batch_request("session", &[2], 1, &[12]), config));
+    }
+
+    #[test]
+    fn request_local_loss_opt_out_is_an_exclusive_window() {
+        let config = MultiLoraBatchConfig {
+            window: std::time::Duration::from_millis(1),
+            max_requests: 4,
+            max_adapters: 4,
+            max_payload_bytes: usize::MAX,
+        };
+        let mut request = batch_request("session", &[1], 1, &[11]);
+        request.allow_aggregate_loss = false;
+        let window = MultiLoraWindow::new(request);
+        assert!(!window.can_accept(&batch_request("session", &[2], 1, &[12]), config));
     }
 
     #[test]
@@ -1273,11 +1979,20 @@ async fn ep_save_checkpoint(
         return Err(ep_dispatch_unavailable("EP coordinator is unavailable"));
     }
     let coordinator = Arc::clone(&state.coordinator);
-    let (step, loss) = state
-        .dispatcher
-        .run(move || coordinator.coordinated_save_checkpoint(&id, &path))
+    let receiver = {
+        let _submission = state
+            .dispatch_submission
+            .lock()
+            .map_err(|_| ep_dispatch_schedule_error(EpDispatchScheduleError::WorkerFailed))?;
+        state.multi_lora_batcher.seal_current();
+        state
+            .dispatcher
+            .submit(move || coordinator.coordinated_save_checkpoint(&id, &path))
+            .map_err(ep_dispatch_schedule_error)?
+    };
+    let (step, loss) = receiver
         .await
-        .map_err(ep_dispatch_schedule_error)?
+        .map_err(|_| ep_dispatch_schedule_error(EpDispatchScheduleError::WorkerFailed))?
         .map_err(|error| err_resp(&error))?;
     Ok(Json(CheckpointResponse {
         step,
@@ -1297,11 +2012,20 @@ async fn ep_load_checkpoint(
         return Err(ep_dispatch_unavailable("EP coordinator is unavailable"));
     }
     let coordinator = Arc::clone(&state.coordinator);
-    let (step, loss) = state
-        .dispatcher
-        .run(move || coordinator.coordinated_load_checkpoint(&id, &path))
+    let receiver = {
+        let _submission = state
+            .dispatch_submission
+            .lock()
+            .map_err(|_| ep_dispatch_schedule_error(EpDispatchScheduleError::WorkerFailed))?;
+        state.multi_lora_batcher.seal_current();
+        state
+            .dispatcher
+            .submit(move || coordinator.coordinated_load_checkpoint(&id, &path))
+            .map_err(ep_dispatch_schedule_error)?
+    };
+    let (step, loss) = receiver
         .await
-        .map_err(ep_dispatch_schedule_error)?
+        .map_err(|_| ep_dispatch_schedule_error(EpDispatchScheduleError::WorkerFailed))?
         .map_err(|error| err_resp(&error))?;
     Ok(Json(CheckpointResponse {
         step,

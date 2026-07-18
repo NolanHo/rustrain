@@ -54,7 +54,10 @@ impl EpDispatchScheduler {
             .map_err(|_| EpDispatchScheduleError::WorkerFailed)
     }
 
-    fn submit<T, F>(&self, operation: F) -> Result<oneshot::Receiver<T>, EpDispatchScheduleError>
+    pub(crate) fn submit<T, F>(
+        &self,
+        operation: F,
+    ) -> Result<oneshot::Receiver<T>, EpDispatchScheduleError>
     where
         T: Send + 'static,
         F: FnOnce() -> T + Send + 'static,

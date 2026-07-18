@@ -76,7 +76,20 @@ single-consumer dispatcher. Accepted jobs run one-at-a-time on
 responsive; queue pressure returns `429` and scheduler/worker failure returns
 `503`. The default capacity is 32 (hard maximum 4096). Tensor train/eval routes
 still admit only one 48 MiB body and reject while busy, so this is runtime
-backpressure/fairness rather than cross-tenant GPU batching.
+backpressure/fairness rather than cross-tenant GPU batching. The separate
+`/train_multi` route now supports the opt-in bounded coalescer described below.
+
+The EP `/train_multi` route now adds an opt-in cross-request coalescer. A client
+must set `allow_aggregate_loss=true`; otherwise the legacy one-request dispatch
+and request-local loss are preserved. Opt-in requests are grouped only when
+session, sequence/source layout, LoRA rank, and adapter IDs are compatible and
+disjoint. The coalescer rebuilds source-major rows into one native heterogeneous
+batch, is bounded by request/adapter/payload limits, and seals its window before
+ordinary tensor, registry, or checkpoint operations. Responses expose
+`loss_scope=coalesced_batch` and the number of merged requests, since the native
+scalar loss is an aggregate and cannot be represented as each request's local
+loss. This is a scheduling/transport optimization, not PP/CP or DeepEP
+communication overlap.
 
 GDN fused backward 现在可通过
 `QWEN36_GDN_STATE_CHECKPOINT_STRIDE` 保存固定 token 边界的 FP32 recurrent
@@ -87,7 +100,7 @@ state，并在每个 reverse chunk 开始时从精确 chunk-end state 重启。�
 解决单 token 极小 decay 的数值问题，也没有提供 FLA/sequence-parallel
 chunk kernel 或 packed `cu_seqlens`。
 
-当前粗粒度 C++ FFI、packed/grouped MoE、GDN head TP、vocabulary TP 和 activation checkpoint/offload 是有效优化，但 full attention 仍通过 ATen linear/SDPA，QKV 未融合，TP collective 同步执行。heterogeneous selected v2 的 padded 路径消除了按 signature 重复完整 trainer 和组间 GPU success fence；在 H20 TP2 x EP2 的四租户 synthetic workload 上，p50 从 grouped 的 `17.750 ms` 降到 `13.841 ms`，unique-token throughput 从 `57.69k/s` 提升到 `73.98k/s`，但 allocator peak 从约 `0.240 GiB` 增至 `0.354 GiB`，且 10 次样本的 p95 为 `20.152 ms`，未优于 grouped 的 `19.441 ms`。这证明 unified padded batch 对当前 native 路径有效，不代表 HTTP 已支持请求聚合，也不是 Megatron 对比。尚无 Megatron/Transformer Engine 级别的完整模型端到端数据：没有同一 GPU、序列长度、microbatch、精度和通信配置下的 tokens/s、显存、扩展效率对照，也没有 FP8/FP4 参数与 fused attention/DeepEP 的 Qwen 路径。
+当前粗粒度 C++ FFI、packed/grouped MoE、GDN head TP、vocabulary TP 和 activation checkpoint/offload 是有效优化，但 full attention 仍通过 ATen linear/SDPA，QKV 未融合，TP collective 同步执行。heterogeneous selected v2 的 padded 路径消除了按 signature 重复完整 trainer 和组间 GPU success fence；在 H20 TP2 x EP2 的四租户 synthetic workload 上，p50 从 grouped 的 `17.750 ms` 降到 `13.841 ms`，unique-token throughput 从 `57.69k/s` 提升到 `73.98k/s`，但 allocator peak 从约 `0.240 GiB` 增至 `0.354 GiB`，且 10 次样本的 p95 为 `20.152 ms`，未优于 grouped 的 `19.441 ms`。这证明 unified padded batch 对当前 native 路径有效；HTTP 仅在显式 `allow_aggregate_loss=true` 时合并兼容请求，且 aggregate loss 会被明确标记，不是 Megatron 对比。尚无 Megatron/Transformer Engine 级别的完整模型端到端数据：没有同一 GPU、序列长度、microbatch、精度和通信配置下的 tokens/s、显存、扩展效率对照，也没有 FP8/FP4 参数与 fused attention/DeepEP 的 Qwen 路径。
 
 ABI15 synthetic GDN TP benchmark 使用 3 层、S=512、H=2048、16 K heads、32 V heads 和 LoRA rank 8。在 B=2 时 single/TP2 p50 为 `81.10/约 76.06 ms`，只有约 `1.07x`；在 B=8 时为 `303.25/约 158.04 ms`，达到约 `1.92x`，每卡 observed resident 从 `4.59 GiB` 降到 `3.54 GiB`。`nsys` 的 B=2 TP2 trace 中 fused delta-rule backward 占 GPU kernel time `80.3%`、forward 占 `7.4%`，NCCL all-reduce 合计低于 `0.4%`。小 batch 下 single 和 TP2 都只需相近的 persistent-block wave 数，因此不能期待 head TP 自动加速；dynamic multi-LoRA batching 提高 BH 后才接近线性 scaling。这是 synthetic native 结果，不是完整模型或 matched Megatron 对比。
 
