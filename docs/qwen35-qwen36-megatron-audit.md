@@ -21,7 +21,7 @@
 | Qwen3.6 MoE | 已实现 | grouped dispatch、EP smoke；完整模型仍需目标 GPU/权重运行 |
 | MTP | 已实现 | C++ hidden gradient 检查和集成测试；可通过环境变量关闭 |
 | fixed LoRA | 已实现 | attention/GDN/MLP/shared/routed expert 目标模块 |
-| dynamic multi-LoRA | 已实现子集 | selected v2 默认把不同 rank/target 的租户按 projection-local 最大 rank 补零，保留各租户 `alpha / logical_rank`，在一个 activation batch 内完成一次 forward/backward，再以一次 FinalizeOnly 调用独立更新各租户参数、m/v 和 optimizer clock；未命中的 target 使用零张量且不更新。`QWEN36_HETERO_PADDED_BATCH=0` 保留按 signature 分组和跨组回滚。checkpoint 可独立恢复 heterogeneous rank/alpha/targets；HTTP 可在显式 `allow_aggregate_loss=true` 时有界合并兼容且 adapter ID 不相交的并发请求，响应保留 aggregate scalar 并按请求返回 `adapter_losses`；默认仍保持单请求 dispatch，dynamic+MTP 暂拒绝 |
+| dynamic multi-LoRA | 已实现子集 | selected v2 默认把不同 rank/target 的租户按 projection-local 最大 rank 补零，保留各租户 `alpha / logical_rank`，在一个 activation batch 内完成一次 forward/backward，再以一次 FinalizeOnly 调用独立更新各租户参数、m/v 和 optimizer clock；未命中的 target 使用零张量且不更新。`QWEN36_HETERO_PADDED_BATCH=0` 保留按 signature 分组和跨组回滚。checkpoint 可独立恢复 heterogeneous rank/alpha/targets；HTTP 可在显式 `allow_aggregate_loss=true` 时有界合并兼容且 adapter ID 不相交的并发请求，响应保留 aggregate scalar、adapter loss 和真实 optimizer step；`expected_steps` 在原生 TP/EP/DP collective 前做全秩乐观并发校验，过期重试 fail closed；默认仍保持单请求 dispatch，dynamic+MTP 暂拒绝 |
 | microbatch accumulation | 已实现子集 | non-final microbatch 只 backward，final microbatch 才 optimizer；FP32 accumulator 存储/聚合，autograd leaf backward 仍为 BF16 |
 | replicated data parallel | 已实现 | logical-step 边界同步 replicated LoRA；EP expert 参数不走该 reduction |
 | expert parallel | 已实现子集 | 默认 routed-output all-reduce；gated variable-split A2A 已验证 fixed-LoRA 和 native dynamic-LoRA data sharding；GPU-only split planning、异步 overlap 和 DeepEP backend 未实现 |

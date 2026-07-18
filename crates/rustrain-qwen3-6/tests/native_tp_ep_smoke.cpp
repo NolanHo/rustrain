@@ -74,6 +74,8 @@ extern "C" void* qwen36_get_adapter_optimizer_tensor(
 extern "C" int32_t qwen36_set_adapter_optimizer_tensor(
     void*, int64_t, int64_t, const char*, int32_t, int32_t, void*);
 extern "C" int64_t qwen36_get_adapter_step_count(void*, int64_t);
+extern "C" int32_t qwen36_validate_adapter_steps_v1(
+    void*, const int64_t*, const int64_t*, int32_t);
 extern "C" int64_t qwen36_get_dynamic_finalizer_count(void*);
 extern "C" int64_t qwen36_get_dynamic_adam_launch_count(void*);
 extern "C" int64_t qwen36_get_dynamic_train_batch_count(void*);
@@ -1107,6 +1109,16 @@ int main() {
         distributed, &local_batch.input_ids, &local_batch.target_mask,
         &local_batch.attention_mask) < 0.0);
     assert(qwen36_get_step_count(distributed) == fixed_step_before_dynamic);
+    assert(qwen36_get_adapter_step_count(distributed, tenant_one) == 0);
+    assert(qwen36_get_adapter_step_count(distributed, tenant_two) == 0);
+    const int64_t guarded_tenants[] = {tenant_one, tenant_two};
+    const int64_t initial_steps[] = {0, 0};
+    assert(qwen36_validate_adapter_steps_v1(
+        distributed, guarded_tenants, initial_steps, 2) == 0);
+    const int64_t divergent_expected_steps[] = {
+        rank == 0 ? 1 : 0, 0};
+    assert(qwen36_validate_adapter_steps_v1(
+        distributed, guarded_tenants, divergent_expected_steps, 2) < 0);
     assert(qwen36_get_adapter_step_count(distributed, tenant_one) == 0);
     assert(qwen36_get_adapter_step_count(distributed, tenant_two) == 0);
 

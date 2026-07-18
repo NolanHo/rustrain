@@ -230,6 +230,7 @@ pub struct TrainOutput {
 pub struct MultiLoraTrainOutput {
     pub loss: f64,
     pub adapter_losses: Vec<f64>,
+    pub adapter_steps: Vec<u64>,
     pub step: u64,
 }
 
@@ -265,6 +266,14 @@ pub trait TrainingSession: Send {
         adapter_ids: &[i64],
     ) -> Result<TrainOutput>;
     fn eval_step(&self, input: TrainInput) -> Result<EvalOutput>;
+    fn validate_dynamic_adapter_steps(
+        &self,
+        adapter_ids: &[i64],
+        expected_steps: &[u64],
+    ) -> Result<()> {
+        let _ = (adapter_ids, expected_steps);
+        bail!("dynamic adapter step validation is not supported by this session")
+    }
     fn eval_multi_lora_host_i64(
         &self,
         input_ids: &[i64],
@@ -587,11 +596,19 @@ impl Qwen36Session {
             lora_rank,
             adapter_ids,
         )?;
+        let adapter_steps = adapter_ids
+            .iter()
+            .map(|adapter_id| {
+                u64::try_from(ctx.get_adapter_step_count(*adapter_id)?)
+                    .context("native dynamic adapter optimizer step is negative")
+            })
+            .collect::<Result<Vec<_>>>()?;
         let loss = report.aggregate_loss;
         let output = self.finish_train_step(loss, false)?;
         Ok(MultiLoraTrainOutput {
             loss: output.loss,
             adapter_losses: report.adapter_losses,
+            adapter_steps,
             step: output.step,
         })
     }
@@ -636,6 +653,27 @@ impl Qwen36Session {
         Ok(MultiLoraEvalOutput {
             adapter_losses: adapter_ids.iter().copied().zip(losses).collect(),
         })
+    }
+
+    pub fn validate_dynamic_adapter_steps(
+        &self,
+        adapter_ids: &[i64],
+        expected_steps: &[u64],
+    ) -> Result<()> {
+        if expected_steps.is_empty() {
+            return Ok(());
+        }
+        if adapter_ids.is_empty() || expected_steps.len() != adapter_ids.len() {
+            bail!(
+                "expected_steps length {} must match adapter_ids length {}",
+                expected_steps.len(),
+                adapter_ids.len()
+            );
+        }
+        self.ctx
+            .as_ref()
+            .ok_or_else(|| anyhow!("LoRA not initialized"))?
+            .validate_adapter_steps(adapter_ids, expected_steps)
     }
 
     fn finish_train_step(&mut self, loss: f64, record_metric: bool) -> Result<TrainOutput> {
@@ -1347,6 +1385,14 @@ impl TrainingSession for Qwen36Session {
             seq_len,
             adapter_ids,
         )
+    }
+
+    fn validate_dynamic_adapter_steps(
+        &self,
+        adapter_ids: &[i64],
+        expected_steps: &[u64],
+    ) -> Result<()> {
+        Qwen36Session::validate_dynamic_adapter_steps(self, adapter_ids, expected_steps)
     }
 
     fn save_checkpoint(&self, path: &str) -> Result<(u64, f64)> {

@@ -46,16 +46,19 @@ fn multi_lora_results_are_consistent(reference: &EpResult, candidate: &EpResult)
                 loss: reference_loss,
                 step: reference_step,
                 adapter_losses: reference_adapters,
+                adapter_steps: reference_steps,
             },
             EpResult::MultiLoraTrain {
                 loss: candidate_loss,
                 step: candidate_step,
                 adapter_losses: candidate_adapters,
+                adapter_steps: candidate_steps,
             },
         ) => {
             reference_loss.to_bits() == candidate_loss.to_bits()
                 && reference_step == candidate_step
                 && reference_adapters.len() == candidate_adapters.len()
+                && reference_steps == candidate_steps
                 && reference_adapters.iter().zip(candidate_adapters).all(
                     |(reference_adapter, candidate_adapter)| {
                         reference_adapter.adapter_id == candidate_adapter.adapter_id
@@ -976,6 +979,10 @@ mod tests {
                 adapter_id: 41,
                 loss: 2.0,
             }],
+            adapter_steps: vec![crate::command::AdapterStep {
+                adapter_id: 41,
+                step: 3,
+            }],
         };
         assert!(multi_lora_results_are_consistent(&reference, &reference));
 
@@ -985,6 +992,10 @@ mod tests {
             adapter_losses: vec![crate::command::AdapterLoss {
                 adapter_id: 41,
                 loss: 2.5,
+            }],
+            adapter_steps: vec![crate::command::AdapterStep {
+                adapter_id: 41,
+                step: 3,
             }],
         };
         assert!(!multi_lora_results_are_consistent(

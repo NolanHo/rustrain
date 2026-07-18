@@ -3037,7 +3037,8 @@ static void validate_adapter_collective_registry(
     const int64_t* requested_ids,
     int64_t requested_count,
     int64_t requested_rank,
-    bool use_registered_order
+    bool use_registered_order,
+    const int64_t* expected_steps = nullptr
 ) {
     if (!ctx || (!ctx->nccl_comm && !ctx->dp_comm && !ctx->tp_comm)) return;
 
@@ -3046,6 +3047,7 @@ static void validate_adapter_collective_registry(
     hash.add_u64(requested_count);
     hash.add_u64(requested_rank);
     hash.add_u64(use_registered_order);
+    hash.add_u64(expected_steps != nullptr);
     int64_t found_count = 0;
     if (use_registered_order) {
         hash.add_u64(ctx->adapters.size());
@@ -3057,6 +3059,7 @@ static void validate_adapter_collective_registry(
         for (int64_t index = 0; index < requested_count; ++index) {
             const int64_t requested_id = requested_ids[index];
             hash.add_u64(requested_id);
+            if (expected_steps) hash.add_u64(expected_steps[index]);
             const auto it = std::find_if(
                 ctx->adapters.begin(), ctx->adapters.end(),
                 [&](const auto& adapter) { return adapter.id == requested_id; });
@@ -11906,6 +11909,43 @@ int64_t qwen36_get_adapter_step_count(void* ctx_ptr, int64_t adapter_id) {
         if (adapter.id == adapter_id) return adapter.optimizer_step;
     }
     return -1;
+}
+
+__attribute__((visibility("default")))
+int32_t qwen36_validate_adapter_steps_v1(
+    void* ctx_ptr, const int64_t* adapter_ids,
+    const int64_t* expected_steps, int32_t n_adapters
+) {
+    try {
+        auto* ctx = reinterpret_cast<TrainingContext*>(ctx_ptr);
+        TORCH_CHECK(ctx && adapter_ids && expected_steps && n_adapters > 0,
+            "adapter step validation requires a context and non-empty arrays");
+        validate_native_execution_topology(ctx);
+        // This hashes the ordered selection and every tenant's actual clock,
+        // plus the expected clocks, then reduces min/max over TP, EP, and DP
+        // before any rank can return.
+        validate_adapter_collective_registry(
+            ctx, adapter_ids, n_adapters, 0, false, expected_steps);
+        for (int32_t index = 0; index < n_adapters; ++index) {
+            TORCH_CHECK(adapter_ids[index] > 0 && expected_steps[index] >= 0,
+                "adapter IDs must be positive and expected steps non-negative");
+            const auto it = std::find_if(
+                ctx->adapters.begin(), ctx->adapters.end(),
+                [&](const auto& adapter) {
+                    return adapter.id == adapter_ids[index];
+                });
+            TORCH_CHECK(it != ctx->adapters.end(),
+                "unknown dynamic adapter ID: ", adapter_ids[index]);
+            TORCH_CHECK(it->optimizer_step == expected_steps[index],
+                "adapter ", adapter_ids[index],
+                " optimizer step conflict: expected ", expected_steps[index],
+                ", actual ", it->optimizer_step);
+        }
+        return 0;
+    } catch (const std::exception& e) {
+        fprintf(stderr, "[q36] validate_adapter_steps FAILED: %s\n", e.what());
+        return -1;
+    }
 }
 
 __attribute__((visibility("default")))

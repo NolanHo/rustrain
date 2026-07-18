@@ -858,6 +858,7 @@ fn execute_command(session: &mut Qwen36Session, worker: &EpWorker, cmd: &EpComma
             n_total,
             lora_rank,
             adapter_ids,
+            expected_steps,
             ..
         } => {
             if let Err(error) = validate_flat_tensor_lengths(
@@ -868,6 +869,9 @@ fn execute_command(session: &mut Qwen36Session, worker: &EpWorker, cmd: &EpComma
                 attention_mask.len(),
             ) {
                 return EpResult::Error(error);
+            }
+            if let Err(error) = session.validate_dynamic_adapter_steps(adapter_ids, expected_steps) {
+                return EpResult::Error(error.to_string());
             }
             let source_shard = match source_shard_from_env() {
                 Ok(shard) => shard,
@@ -918,6 +922,15 @@ fn execute_command(session: &mut Qwen36Session, worker: &EpWorker, cmd: &EpComma
                                 loss,
                             })
                             .collect(),
+                        adapter_steps: adapter_ids
+                            .iter()
+                            .copied()
+                            .zip(output.adapter_steps)
+                            .map(|(adapter_id, step)| rustrain_ipc::command::AdapterStep {
+                                adapter_id,
+                                step,
+                            })
+                            .collect(),
                     },
                     Err(error) => EpResult::Error(error.to_string()),
                 }
@@ -928,6 +941,7 @@ fn execute_command(session: &mut Qwen36Session, worker: &EpWorker, cmd: &EpComma
             n_total,
             lora_rank,
             adapter_ids,
+            expected_steps,
             ..
         } => {
             let (input_ids, target_mask, attention_mask) = match slab_tensor_views(worker, tensors)
@@ -935,6 +949,9 @@ fn execute_command(session: &mut Qwen36Session, worker: &EpWorker, cmd: &EpComma
                 Ok(views) => views,
                 Err(error) => return EpResult::Error(error),
             };
+            if let Err(error) = session.validate_dynamic_adapter_steps(adapter_ids, expected_steps) {
+                return EpResult::Error(error.to_string());
+            }
             let source_shard = match source_shard_from_env() {
                 Ok(shard) => shard,
                 Err(error) => return EpResult::Error(error),
@@ -983,6 +1000,15 @@ fn execute_command(session: &mut Qwen36Session, worker: &EpWorker, cmd: &EpComma
                             .map(|(adapter_id, loss)| rustrain_ipc::command::AdapterLoss {
                                 adapter_id,
                                 loss,
+                            })
+                            .collect(),
+                        adapter_steps: adapter_ids
+                            .iter()
+                            .copied()
+                            .zip(output.adapter_steps)
+                            .map(|(adapter_id, step)| rustrain_ipc::command::AdapterStep {
+                                adapter_id,
+                                step,
                             })
                             .collect(),
                     },

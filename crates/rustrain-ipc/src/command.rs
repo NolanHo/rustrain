@@ -159,6 +159,8 @@ pub enum EpCommand {
         lora_rank: i32,
         #[serde(default)]
         adapter_ids: Vec<i64>,
+        #[serde(default)]
+        expected_steps: Vec<u64>,
     },
     TrainMultiLoraSlab {
         session_id: String,
@@ -167,6 +169,8 @@ pub enum EpCommand {
         lora_rank: i32,
         #[serde(default)]
         adapter_ids: Vec<i64>,
+        #[serde(default)]
+        expected_steps: Vec<u64>,
     },
     EvalStep {
         session_id: String,
@@ -236,6 +240,12 @@ pub struct AdapterLoss {
     pub loss: f64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AdapterStep {
+    pub adapter_id: i64,
+    pub step: u64,
+}
+
 /// Results that workers return to the HTTP server.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum EpResult {
@@ -249,6 +259,8 @@ pub enum EpResult {
         loss: f64,
         step: u64,
         adapter_losses: Vec<AdapterLoss>,
+        #[serde(default)]
+        adapter_steps: Vec<AdapterStep>,
     },
     MultiLoraEval {
         adapter_losses: Vec<AdapterLoss>,
@@ -377,6 +389,16 @@ mod tests {
                     loss: 2.5,
                 },
             ],
+            adapter_steps: vec![
+                super::AdapterStep {
+                    adapter_id: 41,
+                    step: 5,
+                },
+                super::AdapterStep {
+                    adapter_id: 17,
+                    step: 9,
+                },
+            ],
         };
         let encoded = serde_json::to_vec(&result).unwrap();
         let decoded: EpResult = serde_json::from_slice(&encoded).unwrap();
@@ -385,13 +407,59 @@ mod tests {
                 loss,
                 step,
                 adapter_losses,
+                adapter_steps,
             } => {
                 assert_eq!(loss, 2.0);
                 assert_eq!(step, 7);
                 assert_eq!(adapter_losses[0].adapter_id, 41);
                 assert_eq!(adapter_losses[1].adapter_id, 17);
+                assert_eq!(adapter_steps[0].step, 5);
+                assert_eq!(adapter_steps[1].step, 9);
             }
             other => panic!("unexpected result: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn multi_lora_expected_steps_are_backward_compatible() {
+        let legacy = r#"{
+            "TrainMultiLora": {
+                "session_id": "session",
+                "input_ids": [1, 2],
+                "target_mask": [1, 1],
+                "attention_mask": [1, 1],
+                "batch_size": 1,
+                "seq_len": 2,
+                "n_total": 2,
+                "lora_rank": 8,
+                "adapter_ids": [11, 12]
+            }
+        }"#;
+        match serde_json::from_str::<EpCommand>(legacy).unwrap() {
+            EpCommand::TrainMultiLora { expected_steps, .. } => {
+                assert!(expected_steps.is_empty());
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+
+        let command = EpCommand::TrainMultiLora {
+            session_id: "session".into(),
+            input_ids: vec![1, 2],
+            target_mask: vec![1, 1],
+            attention_mask: vec![1, 1],
+            batch_size: 1,
+            seq_len: 2,
+            n_total: 2,
+            lora_rank: 8,
+            adapter_ids: vec![11, 12],
+            expected_steps: vec![7, 9],
+        };
+        let encoded = serde_json::to_vec(&command).unwrap();
+        match serde_json::from_slice::<EpCommand>(&encoded).unwrap() {
+            EpCommand::TrainMultiLora { expected_steps, .. } => {
+                assert_eq!(expected_steps, vec![7, 9]);
+            }
+            other => panic!("unexpected command: {other:?}"),
         }
     }
 

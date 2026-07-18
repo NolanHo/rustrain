@@ -229,6 +229,8 @@ type FnSetAdapterOptimizerTensor =
     unsafe extern "C" fn(*mut c_void, i64, i64, *const i8, i32, i32, *mut c_void) -> i32;
 type FnGetAdapterStepCount = unsafe extern "C" fn(*mut c_void, i64) -> i64;
 type FnSetAdapterStepCount = unsafe extern "C" fn(*mut c_void, i64, i64) -> i32;
+type FnValidateAdapterSteps =
+    unsafe extern "C" fn(*mut c_void, *const i64, *const i64, i32) -> i32;
 
 #[repr(C)]
 pub struct CppLayerConfig {
@@ -309,6 +311,7 @@ struct KernelHandles {
     set_adapter_optimizer_tensor: FnSetAdapterOptimizerTensor,
     get_adapter_step_count: FnGetAdapterStepCount,
     set_adapter_step_count: FnSetAdapterStepCount,
+    validate_adapter_steps: Option<FnValidateAdapterSteps>,
 }
 
 static KERNELS: OnceLock<Option<KernelHandles>> = OnceLock::new();
@@ -394,6 +397,15 @@ unsafe fn load_kernels() -> Option<KernelHandles> {
                 None
             } else {
                 Some(std::mem::transmute::<*mut c_void, FnEvalMultiLoraHost>(symbol))
+            }
+        },
+        validate_adapter_steps: {
+            let name = CString::new("qwen36_validate_adapter_steps_v1").unwrap();
+            let symbol = libc::dlsym(handle, name.as_ptr());
+            if symbol.is_null() {
+                None
+            } else {
+                Some(std::mem::transmute::<*mut c_void, FnValidateAdapterSteps>(symbol))
             }
         },
         get_lora_count: sym!("qwen36_get_lora_count"),
@@ -2166,6 +2178,40 @@ impl CppTrainingContext {
             bail!("C++ get_adapter_step_count failed for adapter {adapter_id}");
         }
         Ok(step)
+    }
+
+    pub fn validate_adapter_steps(
+        &self,
+        adapter_ids: &[i64],
+        expected_steps: &[u64],
+    ) -> Result<()> {
+        if adapter_ids.is_empty() || adapter_ids.len() != expected_steps.len() {
+            bail!(
+                "expected_steps length {} must match non-empty adapter_ids length {}",
+                expected_steps.len(),
+                adapter_ids.len()
+            );
+        }
+        let expected_steps = expected_steps
+            .iter()
+            .map(|step| i64::try_from(*step).context("expected adapter step exceeds i64"))
+            .collect::<Result<Vec<_>>>()?;
+        let kh = get_kernels().ok_or_else(|| anyhow::anyhow!("kernels not loaded"))?;
+        let validate = kh.validate_adapter_steps.ok_or_else(|| {
+            anyhow::anyhow!("native library does not export adapter step validation")
+        })?;
+        let status = unsafe {
+            validate(
+                self.ptr,
+                adapter_ids.as_ptr(),
+                expected_steps.as_ptr(),
+                i32::try_from(adapter_ids.len()).context("adapter count exceeds i32")?,
+            )
+        };
+        if status != 0 {
+            bail!("C++ dynamic adapter step validation failed");
+        }
+        Ok(())
     }
 
     /// Restore a dynamic tenant's Adam bias-correction clock.

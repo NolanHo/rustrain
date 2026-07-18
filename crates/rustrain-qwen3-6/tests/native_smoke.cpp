@@ -47,6 +47,8 @@ extern "C" int32_t qwen36_set_step_count(void*, int64_t);
 extern "C" int64_t qwen36_export_optimizer_state(
     void*, void**, void**, int64_t);
 extern "C" int64_t qwen36_get_adapter_step_count(void*, int64_t);
+extern "C" int32_t qwen36_validate_adapter_steps_v1(
+    void*, const int64_t*, const int64_t*, int32_t);
 extern "C" int64_t qwen36_get_dynamic_finalizer_count(void*);
 extern "C" int64_t qwen36_get_dynamic_adam_launch_count(void*);
 extern "C" int64_t qwen36_get_dynamic_train_batch_count(void*);
@@ -666,6 +668,15 @@ int main() {
     assert(qwen36_set_adapter_step_count(ctx, adapter_one, 4) == 0);
     assert(qwen36_get_adapter_step_count(ctx, adapter_one) == 4);
     assert(qwen36_set_adapter_step_count(ctx, adapter_one, 0) == 0);
+    const int64_t initial_adapter_ids[] = {adapter_one, adapter_two};
+    const int64_t initial_adapter_steps[] = {0, 0};
+    const int64_t stale_adapter_steps[] = {1, 0};
+    assert(qwen36_validate_adapter_steps_v1(
+        ctx, initial_adapter_ids, initial_adapter_steps, 2) == 0);
+    assert(qwen36_validate_adapter_steps_v1(
+        ctx, initial_adapter_ids, stale_adapter_steps, 2) != 0);
+    assert(qwen36_get_adapter_step_count(ctx, adapter_one) == 0);
+    assert(qwen36_get_adapter_step_count(ctx, adapter_two) == 0);
     auto* dynamic_b = reinterpret_cast<at::Tensor*>(
         qwen36_get_adapter_lora_tensor(
             ctx, adapter_one, 0, "shared_gate_proj", 1));

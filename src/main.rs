@@ -944,6 +944,7 @@ paths=["/tmp/qwen3_6_test.jsonl"]
         n_total: n_adapters,
         lora_rank,
         adapter_ids: vec![],
+        expected_steps: vec![],
     }) {
         EpResult::Train { loss, .. } => loss,
         EpResult::Error(e) => {
@@ -985,6 +986,7 @@ paths=["/tmp/qwen3_6_test.jsonl"]
             n_total: n_adapters,
             lora_rank,
             adapter_ids: vec![],
+            expected_steps: vec![],
         }) {
             EpResult::Train { loss, .. } => {
                 losses.push(loss);

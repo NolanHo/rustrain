@@ -121,6 +121,7 @@ struct MultiLoraDispatchRequest {
     n_total: usize,
     lora_rank: i32,
     adapter_ids: Vec<i64>,
+    expected_steps: Vec<u64>,
     source_count: usize,
     normalized_payload_bytes: usize,
     allow_aggregate_loss: bool,
@@ -152,6 +153,7 @@ fn project_multi_lora_result(
             loss,
             step,
             adapter_losses,
+            ..
         } if adapter_losses.is_empty() => rustrain_ipc::EpResult::Train {
             loss: *loss,
             step: *step,
@@ -160,18 +162,31 @@ fn project_multi_lora_result(
             loss,
             step,
             adapter_losses,
-        } if adapter_range.end <= adapter_losses.len() => rustrain_ipc::EpResult::MultiLoraTrain {
-            loss: *loss,
-            step: *step,
-            adapter_losses: adapter_losses[adapter_range].to_vec(),
-        },
-        rustrain_ipc::EpResult::MultiLoraTrain { adapter_losses, .. } => {
-            rustrain_ipc::EpResult::Error(format!(
-                "native adapter loss count {} does not cover coalesced range {:?}",
-                adapter_losses.len(),
-                adapter_range
-            ))
+            adapter_steps,
+        } if adapter_range.end <= adapter_losses.len()
+            && (adapter_steps.is_empty() || adapter_range.end <= adapter_steps.len()) =>
+        {
+            rustrain_ipc::EpResult::MultiLoraTrain {
+                loss: *loss,
+                step: *step,
+                adapter_losses: adapter_losses[adapter_range.clone()].to_vec(),
+                adapter_steps: if adapter_steps.is_empty() {
+                    Vec::new()
+                } else {
+                    adapter_steps[adapter_range].to_vec()
+                },
+            }
         }
+        rustrain_ipc::EpResult::MultiLoraTrain {
+            adapter_losses,
+            adapter_steps,
+            ..
+        } => rustrain_ipc::EpResult::Error(format!(
+            "native adapter result counts (losses={}, steps={}) do not cover coalesced range {:?}",
+            adapter_losses.len(),
+            adapter_steps.len(),
+            adapter_range
+        )),
         _ => result.clone(),
     }
 }
@@ -184,6 +199,7 @@ struct MultiLoraWindow {
     adapter_count: usize,
     payload_bytes: usize,
     coalescible: bool,
+    validates_steps: bool,
     requests: Vec<MultiLoraDispatchRequest>,
 }
 
@@ -198,6 +214,7 @@ impl MultiLoraWindow {
             adapter_count: request.n_total,
             payload_bytes: request.normalized_payload_bytes,
             coalescible: request.coalescible(),
+            validates_steps: !request.expected_steps.is_empty(),
             requests: vec![request],
         }
     }
@@ -208,6 +225,7 @@ impl MultiLoraWindow {
             || self.session_id != request.session_id
             || self.seq_len != request.tensors.seq_len
             || self.source_count != request.source_count
+            || self.validates_steps != !request.expected_steps.is_empty()
             || self.requests.len() >= config.max_requests
             || self.adapter_count.saturating_add(request.n_total) > config.max_adapters
             || self
@@ -615,6 +633,8 @@ struct TrainMultiLoraHttp {
     #[serde(default)]
     adapter_ids: Vec<i64>,
     #[serde(default)]
+    expected_steps: Vec<u64>,
+    #[serde(default)]
     allow_aggregate_loss: bool,
 }
 #[derive(Serialize)]
@@ -631,6 +651,8 @@ struct TrainMultiLoraResponse {
     coalesced_requests: usize,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     adapter_losses: Vec<rustrain_ipc::command::AdapterLoss>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    adapter_steps: Vec<rustrain_ipc::command::AdapterStep>,
 }
 
 /// Decode the little-endian wire representation without materializing host values.
@@ -780,7 +802,7 @@ fn build_multi_lora_window(
         })
         .collect::<Vec<_>>();
     match build_result {
-        Ok((tensors, payload, adapter_ids, lora_rank)) => {
+        Ok((tensors, payload, adapter_ids, lora_rank, expected_steps)) => {
             let n_total = match i32::try_from(adapter_ids.len()) {
                 Ok(n_total) => n_total,
                 Err(_) => {
@@ -794,6 +816,7 @@ fn build_multi_lora_window(
                     n_total,
                     lora_rank,
                     adapter_ids,
+                    expected_steps,
                 },
                 payload,
                 responses,
@@ -805,7 +828,16 @@ fn build_multi_lora_window(
 
 fn build_multi_lora_window_payload(
     window: &MultiLoraWindow,
-) -> Result<(rustrain_ipc::TensorSlabRef, Vec<u8>, Vec<i64>, i32), String> {
+) -> Result<
+    (
+        rustrain_ipc::TensorSlabRef,
+        Vec<u8>,
+        Vec<i64>,
+        i32,
+        Vec<u64>,
+    ),
+    String,
+> {
     if window.requests.is_empty() {
         return Err("coalesced multi-LoRA window is empty".to_string());
     }
@@ -893,6 +925,14 @@ fn build_multi_lora_window_payload(
     if adapter_ids.len() != total_adapters && !adapter_ids.is_empty() {
         return Err("coalesced adapter ID count does not match batch geometry".to_string());
     }
+    let expected_steps = window
+        .requests
+        .iter()
+        .flat_map(|request| request.expected_steps.iter().copied())
+        .collect::<Vec<_>>();
+    if !expected_steps.is_empty() && expected_steps.len() != total_adapters {
+        return Err("expected step count does not match coalesced adapter count".to_string());
+    }
     let lora_rank = window
         .requests
         .iter()
@@ -907,7 +947,7 @@ fn build_multi_lora_window_payload(
         seq_len: window.seq_len,
     };
     tensors.validate(payload.len())?;
-    Ok((tensors, payload, adapter_ids, lora_rank))
+    Ok((tensors, payload, adapter_ids, lora_rank, expected_steps))
 }
 
 fn validate_train_http_shapes(
@@ -1668,6 +1708,15 @@ async fn ep_train_multi_lora(
         {
             return Err(err_resp("adapter_ids must not contain duplicates"));
         }
+        if !req.expected_steps.is_empty() && req.expected_steps.len() != req.adapter_ids.len() {
+            return Err(err_resp(&format!(
+                "expected_steps length {} must match adapter_ids length {}",
+                req.expected_steps.len(),
+                req.adapter_ids.len()
+            )));
+        }
+    } else if !req.expected_steps.is_empty() {
+        return Err(err_resp("expected_steps requires adapter_ids"));
     }
     let source_count = multi_lora_source_count(batch_size, req.n_total as usize)
         .map_err(|error| err_resp(&error))?;
@@ -1685,6 +1734,7 @@ async fn ep_train_multi_lora(
         n_total: req.n_total as usize,
         lora_rank: req.lora_rank,
         adapter_ids: req.adapter_ids,
+        expected_steps: req.expected_steps,
         source_count,
         normalized_payload_bytes,
         allow_aggregate_loss: req.allow_aggregate_loss,
@@ -1708,6 +1758,7 @@ async fn ep_train_multi_lora(
             loss,
             step,
             adapter_losses,
+            adapter_steps,
         } => Ok(Json(TrainMultiLoraResponse {
             loss,
             step,
@@ -1718,6 +1769,7 @@ async fn ep_train_multi_lora(
             },
             coalesced_requests: outcome.request_count,
             adapter_losses,
+            adapter_steps,
         })),
         rustrain_ipc::EpResult::Train { loss, step } => Ok(Json(TrainMultiLoraResponse {
             loss,
@@ -1729,6 +1781,7 @@ async fn ep_train_multi_lora(
             },
             coalesced_requests: outcome.request_count,
             adapter_losses: Vec::new(),
+            adapter_steps: Vec::new(),
         })),
         rustrain_ipc::EpResult::Error(e) => Err(err_resp(&e)),
         _ => Err(err_resp("unexpected result")),
@@ -1862,6 +1915,7 @@ mod tensor_http_shape_tests {
             n_total,
             lora_rank: 8,
             adapter_ids: adapter_ids.to_vec(),
+            expected_steps: Vec::new(),
             source_count,
             normalized_payload_bytes,
             allow_aggregate_loss: true,
@@ -1966,7 +2020,8 @@ mod tensor_http_shape_tests {
         ));
         window.push(batch_request("tenant-session", &[12, 22], 1, &[103]));
 
-        let (tensors, payload, adapter_ids, _) = build_multi_lora_window_payload(&window).unwrap();
+        let (tensors, payload, adapter_ids, _, _) =
+            build_multi_lora_window_payload(&window).unwrap();
         assert_eq!(adapter_ids, vec![101, 102, 103]);
         assert_eq!(tensors.batch_size, 6);
         assert_eq!(
@@ -1986,9 +2041,25 @@ mod tensor_http_shape_tests {
             MultiLoraWindow::new(batch_request("tenant-session", &[7], 2, &[101, 102]));
         window.push(batch_request("tenant-session", &[8], 1, &[103]));
 
-        let (tensors, payload, adapter_ids, _) = build_multi_lora_window_payload(&window).unwrap();
+        let (tensors, payload, adapter_ids, _, _) =
+            build_multi_lora_window_payload(&window).unwrap();
         assert_eq!(adapter_ids, vec![101, 102, 103]);
         assert_eq!(slab_i64(&payload, tensors.input_ids), vec![7, 7, 8]);
+    }
+
+    #[test]
+    fn coalesced_multi_lora_preserves_expected_optimizer_steps() {
+        let mut first = batch_request("tenant-session", &[7], 2, &[101, 102]);
+        first.expected_steps = vec![3, 5];
+        let mut window = MultiLoraWindow::new(first);
+        let mut second = batch_request("tenant-session", &[8], 1, &[103]);
+        second.expected_steps = vec![9];
+        window.push(second);
+
+        let (_, _, adapter_ids, _, expected_steps) =
+            build_multi_lora_window_payload(&window).unwrap();
+        assert_eq!(adapter_ids, vec![101, 102, 103]);
+        assert_eq!(expected_steps, vec![3, 5, 9]);
     }
 
     #[test]
@@ -2010,6 +2081,20 @@ mod tensor_http_shape_tests {
                     loss: 3.0,
                 },
             ],
+            adapter_steps: vec![
+                rustrain_ipc::command::AdapterStep {
+                    adapter_id: 101,
+                    step: 4,
+                },
+                rustrain_ipc::command::AdapterStep {
+                    adapter_id: 102,
+                    step: 5,
+                },
+                rustrain_ipc::command::AdapterStep {
+                    adapter_id: 103,
+                    step: 6,
+                },
+            ],
         };
         let projected = project_multi_lora_result(&result, 1..3);
         match projected {
@@ -2017,6 +2102,7 @@ mod tensor_http_shape_tests {
                 loss,
                 step,
                 adapter_losses,
+                adapter_steps,
             } => {
                 assert_eq!(loss, 2.0);
                 assert_eq!(step, 9);
@@ -2027,6 +2113,13 @@ mod tensor_http_shape_tests {
                         .collect::<Vec<_>>(),
                     vec![102, 103]
                 );
+                assert_eq!(
+                    adapter_steps
+                        .iter()
+                        .map(|item| (item.adapter_id, item.step))
+                        .collect::<Vec<_>>(),
+                    vec![(102, 5), (103, 6)]
+                );
             }
             other => panic!("unexpected projected result: {other:?}"),
         }
@@ -2035,6 +2128,7 @@ mod tensor_http_shape_tests {
             loss: 4.0,
             step: 10,
             adapter_losses: Vec::new(),
+            adapter_steps: Vec::new(),
         };
         assert!(matches!(
             project_multi_lora_result(&legacy, 0..1),
@@ -2060,6 +2154,9 @@ mod tensor_http_shape_tests {
             &batch_request_with_rank("session", &[2], 1, &[12], 16),
             config
         ));
+        let mut guarded = batch_request("session", &[2], 1, &[12]);
+        guarded.expected_steps = vec![0];
+        assert!(!window.can_accept(&guarded, config));
         assert!(window.can_accept(&batch_request("session", &[2, 3], 2, &[12, 13]), config));
         window.push(batch_request("session", &[2], 1, &[12]));
         assert!(!window.can_accept(&batch_request("session", &[3], 1, &[13]), config));
