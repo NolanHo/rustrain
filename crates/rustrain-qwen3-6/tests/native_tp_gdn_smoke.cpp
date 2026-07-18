@@ -54,6 +54,9 @@ extern "C" double qwen36_train_micro_step(
     void*, void*, void*, void*, double, int32_t);
 extern "C" double qwen36_train_multi_lora_selected(
     void*, void*, void*, void*, const int64_t*, int32_t, int32_t);
+extern "C" void qwen36_set_checkpoint(void*, int32_t, int64_t);
+extern "C" int64_t qwen36_get_lora_batch_projection_build_count(void*);
+extern "C" int64_t qwen36_get_lora_batch_scaling_upload_count(void*);
 extern "C" void qwen36_free_training_context(void*);
 
 namespace {
@@ -759,8 +762,23 @@ int main() {
         local_embed, embed, final_norm, local_lm_head, lm_head,
         configs, "in_proj_qkv", false);
     auto dynamic_fixtures = make_lora_fixtures(rank, 4000);
+    qwen36_set_checkpoint(dynamic_contexts.distributed, 1, 1);
+    qwen36_set_checkpoint(dynamic_contexts.reference, 1, 1);
+    const int64_t build_before =
+        qwen36_get_lora_batch_projection_build_count(dynamic_contexts.distributed);
+    const int64_t upload_before =
+        qwen36_get_lora_batch_scaling_upload_count(dynamic_contexts.distributed);
     check_dynamic_path(
         dynamic_contexts, dynamic_fixtures, dynamic_batch, rank);
+    const int64_t build_after =
+        qwen36_get_lora_batch_projection_build_count(dynamic_contexts.distributed);
+    const int64_t upload_after =
+        qwen36_get_lora_batch_scaling_upload_count(dynamic_contexts.distributed);
+    // Two GDN layers x five LoRA projections are built once in the forward
+    // and once per one-layer recompute group; scaling is uploaded once and
+    // reused by both backward groups.
+    assert(build_after - build_before == 20);
+    assert(upload_after - upload_before == 1);
     qwen36_free_training_context(dynamic_contexts.reference);
     qwen36_free_training_context(dynamic_contexts.distributed);
     return 0;

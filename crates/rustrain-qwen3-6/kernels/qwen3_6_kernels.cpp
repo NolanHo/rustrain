@@ -2264,6 +2264,12 @@ struct TrainingContext {
     bool lora_batch_valid = false;
     int64_t lora_batch_n = 0;  // number of adapters in current batch
     std::map<int64_t, LoraBatchEntry> lora_batch_cache;
+    // Shared BF16 alpha/rank scale for the current activation batch. Building
+    // it once avoids one tiny CPU->GPU transfer per layer/module projection.
+    at::Tensor lora_batch_scaling;
+    std::vector<double> lora_batch_scaling_values;
+    int64_t lora_batch_projection_build_count = 0;
+    int64_t lora_batch_scaling_upload_count = 0;
     // Legacy single-LoRA (backward compat)
     std::vector<at::Tensor> lora_a;
     std::vector<at::Tensor> lora_b;
@@ -4126,20 +4132,41 @@ static void precompute_lora_cache(TrainingContext* ctx) {
 
 // ── Batched Multi-LoRA: activation-level B@(A@x) ──
 
-/// Prepare stacked A/B tensors for all adapters per (layer, module).
-/// Stores in ctx->lora_batch_cache. Called once before forward.
+/// Prepare stacked A/B tensors for the requested adapter layer range.
+/// Stores in ctx->lora_batch_cache. Recompute groups pass their own range so
+/// manual checkpoint backward does not rebuild projections for other layers.
 /// Replaces precompute_lora_cache when N > 1.
-static void prepare_lora_batch(TrainingContext* ctx) {
+static void prepare_lora_batch(
+    TrainingContext* ctx, int64_t start_layer = 0, int64_t end_layer = -1
+) {
     ctx->lora_batch_cache.clear();
     ctx->lora_batch_n = 0;
+    TORCH_CHECK(start_layer >= 0 && start_layer <= ctx->num_layers,
+        "invalid LoRA batch start layer: ", start_layer);
+    if (end_layer < 0) end_layer = ctx->num_layers;
+    TORCH_CHECK(end_layer >= start_layer && end_layer <= ctx->num_layers,
+        "invalid LoRA batch end layer: ", end_layer);
 
-    for (int64_t layer_idx = 0; layer_idx < ctx->num_layers; layer_idx++) {
+    std::vector<double> adapter_scalings;
+    adapter_scalings.reserve(ctx->adapters.size());
+    for (const auto& adapter : ctx->adapters)
+        adapter_scalings.push_back(adapter.alpha / (double)adapter.rank);
+    if (adapter_scalings != ctx->lora_batch_scaling_values) {
+        ctx->lora_batch_scaling = at::Tensor();
+        ctx->lora_batch_scaling_values = adapter_scalings;
+    }
+
+    for (int64_t layer_idx = start_layer;
+         layer_idx < end_layer; layer_idx++) {
         int64_t num_pairs = lora_pair_count(ctx->layer_configs[layer_idx]);
         for (int64_t pair_idx = 0; pair_idx < num_pairs; pair_idx++) {
             std::vector<at::Tensor> a_list, b_list;
+            std::vector<int64_t> active_indices;
             std::vector<double> scalings;
             const char* module_name = lora_pair_name(ctx->layer_configs[layer_idx], pair_idx);
-            for (auto& adapter : ctx->adapters) {
+            for (size_t adapter_index = 0;
+                 adapter_index < ctx->adapters.size(); ++adapter_index) {
+                auto& adapter = ctx->adapters[adapter_index];
                 if (!adapter.target_modules.empty() &&
                     adapter.target_modules.find(module_name) == adapter.target_modules.end())
                     continue;
@@ -4153,6 +4180,7 @@ static void prepare_lora_batch(TrainingContext* ctx) {
                 b_list.push_back(b);
                 a_list.push_back(a);
                 scalings.push_back(adapter.alpha / (double)adapter.rank);
+                active_indices.push_back((int64_t)adapter_index);
             }
             if (a_list.empty()) continue;
 
@@ -4161,18 +4189,42 @@ static void prepare_lora_batch(TrainingContext* ctx) {
 
             auto a_stack = at::stack(a_list, 0);  // [N, rank, in]
             auto b_stack = at::stack(b_list, 0);  // [N, out, rank]
-            // Create scaling tensor on GPU — from_blob only wraps CPU pointer,
-            // so we must explicitly move it to the right device.
-            auto scaling_cpu = at::from_blob(
-                scalings.data(), {(int64_t)n, 1, 1},
-                at::TensorOptions().dtype(at::kDouble)
-            );
-            auto scaling = scaling_cpu.to(a_stack.device()).to(at::kBFloat16);  // [N, 1, 1]
+            at::Tensor scaling;
+            bool all_adapters_active = active_indices.size() ==
+                ctx->adapters.size();
+            if (all_adapters_active) {
+                for (size_t i = 0; i < active_indices.size(); ++i) {
+                    if (active_indices[i] != (int64_t)i) {
+                        all_adapters_active = false;
+                        break;
+                    }
+                }
+            }
+            if (all_adapters_active) {
+                if (!ctx->lora_batch_scaling.defined()) {
+                    auto scaling_cpu = at::from_blob(
+                        adapter_scalings.data(),
+                        {(int64_t)adapter_scalings.size(), 1, 1},
+                        at::TensorOptions().dtype(at::kDouble)).clone();
+                    ctx->lora_batch_scaling = scaling_cpu.to(
+                        a_stack.device()).to(at::kBFloat16);
+                    ++ctx->lora_batch_scaling_upload_count;
+                }
+                scaling = ctx->lora_batch_scaling;
+            } else {
+                // Heterogeneous target subsets can omit adapters for a
+                // projection; retain the compact fallback for that case.
+                auto scaling_cpu = at::from_blob(
+                    scalings.data(), {(int64_t)n, 1, 1},
+                    at::TensorOptions().dtype(at::kDouble)).clone();
+                scaling = scaling_cpu.to(a_stack.device()).to(at::kBFloat16);
+            }
 
             ctx->lora_batch_cache[lora_cache_key(layer_idx, pair_idx)] = {
                 a_stack, b_stack, scaling,
                 lora_tp_layout(ctx, layer_idx, pair_idx)
             };
+            ++ctx->lora_batch_projection_build_count;
         }
     }
     ctx->lora_batch_valid = true;
@@ -4184,6 +4236,7 @@ static void prepare_lora_batch(TrainingContext* ctx) {
 static void prepare_fixed_lora_batch(TrainingContext* ctx) {
     ctx->lora_batch_cache.clear();
     ctx->lora_batch_n = 1;
+    ctx->lora_batch_scaling = at::Tensor();
     for (int64_t layer_idx = 0; layer_idx < ctx->num_layers; ++layer_idx) {
         const int64_t pair_count = lora_pair_count(ctx->layer_configs[layer_idx]);
         const int64_t offset = ctx->lora_layer_offset[layer_idx];
@@ -5323,7 +5376,7 @@ static void manual_group_backward(
         // point the next group at freed graph nodes.
         ctx->lora_batch_valid = false;
         ctx->lora_cache_valid = false;
-        if (!ctx->adapters.empty()) prepare_lora_batch(ctx);
+        if (!ctx->adapters.empty()) prepare_lora_batch(ctx, start, end);
         else if (ctx->tp_world_size > 1) prepare_fixed_lora_batch(ctx);
         else precompute_lora_cache(ctx);
 
@@ -9457,6 +9510,20 @@ __attribute__((visibility("default")))
 int64_t qwen36_get_dynamic_adam_launch_count(void* ctx_ptr) {
     if (!ctx_ptr) return -1;
     return reinterpret_cast<TrainingContext*>(ctx_ptr)->dynamic_adam_launch_count;
+}
+
+__attribute__((visibility("default")))
+int64_t qwen36_get_lora_batch_projection_build_count(void* ctx_ptr) {
+    if (!ctx_ptr) return -1;
+    return reinterpret_cast<TrainingContext*>(
+        ctx_ptr)->lora_batch_projection_build_count;
+}
+
+__attribute__((visibility("default")))
+int64_t qwen36_get_lora_batch_scaling_upload_count(void* ctx_ptr) {
+    if (!ctx_ptr) return -1;
+    return reinterpret_cast<TrainingContext*>(
+        ctx_ptr)->lora_batch_scaling_upload_count;
 }
 
 __attribute__((visibility("default")))

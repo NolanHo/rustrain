@@ -144,8 +144,8 @@ __global__ void gated_delta_rule_kernel(
         // --- delta = (v - kv_mem) * beta ---
         float delta = (v_t - kv_mem) * beta_t;
 
-        // Save delta only for the explicit chunked backward path. The
-        // autograd wrapper passes nullptr and recomputes a reference backward.
+        // Save delta for the fused autograd backward. The reference backward
+        // path is selected explicitly and does not use this CUDA kernel.
         if (delta_buf != nullptr) {
             delta_buf[bh * S * DR_D_V + t * DR_D_V + tid] = delta;
         }

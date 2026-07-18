@@ -73,10 +73,11 @@ The script builds only the repository kernel and native harnesses. It discovers 
 
 ## L2 Normalization
 
-- Transformers: `x * rsqrt(sum(x²) + eps)` (eps=1e-6, in denominator)
-- rustrain: `x / max(sqrt(sum(x²)), eps)` (eps=1e-6, as clamp)
+- Transformers/Megatron fused pre-GDN: `x * rsqrt(sum(x²) + eps)` (eps=1e-6)
+- rustrain C++ and Rust fallback: `x * rsqrt(sum(x²) + 1e-6)`
 
-Mathematically equivalent but numerically slightly different.
+The epsilon is inside the squared norm. Keeping this form is important for
+low-norm Q/K vectors; a post-sqrt clamp is not numerically equivalent.
 
 ## Diagnostic Dumps
 
