@@ -312,11 +312,14 @@ fn resolve_launch_attempt_id(nnodes: usize, configured: Option<String>) -> Resul
 
 fn validate_launch_id(name: &str, value: &str) -> Result<()> {
     if value.is_empty()
+        || matches!(value, "." | "..")
         || !value
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
     {
-        bail!("{name} may contain only ASCII letters, digits, '-', '_', and '.'");
+        bail!(
+            "{name} may contain only ASCII letters, digits, '-', '_', and '.', and cannot be '.' or '..'"
+        );
     }
     Ok(())
 }
@@ -594,8 +597,12 @@ mod tests {
 
     #[test]
     fn launch_ids_reject_path_components() {
-        let error = resolve_launch_attempt_id(1, Some("../attempt".into())).unwrap_err();
-        assert!(error.to_string().contains("RUSTRAIN_ATTEMPT_ID"));
+        for value in [".", "..", "../attempt"] {
+            let run_error = resolve_launch_run_id(1, Some(value.into())).unwrap_err();
+            assert!(run_error.to_string().contains("RUSTRAIN_RUN_ID"));
+            let attempt_error = resolve_launch_attempt_id(1, Some(value.into())).unwrap_err();
+            assert!(attempt_error.to_string().contains("RUSTRAIN_ATTEMPT_ID"));
+        }
     }
 
     #[test]

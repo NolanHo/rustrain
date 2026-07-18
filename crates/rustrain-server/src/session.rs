@@ -193,12 +193,18 @@ struct QwenContextSpec {
     tp_rank: usize,
     tp_size: usize,
     tp_color: usize,
+    cp_rank: usize,
+    cp_size: usize,
+    cp_color: usize,
     ep_rank: usize,
     ep_size: usize,
     ep_color: usize,
     dp_rank: usize,
     dp_size: usize,
     dp_color: usize,
+    pp_rank: usize,
+    pp_size: usize,
+    pp_color: usize,
 }
 
 struct PendingCheckpointLoad {
@@ -295,12 +301,18 @@ fn create_qwen_context(
                 spec.tp_rank,
                 spec.tp_size,
                 spec.tp_color,
+                spec.cp_rank,
+                spec.cp_size,
+                spec.cp_color,
                 spec.ep_rank,
                 spec.ep_size,
                 spec.ep_color,
                 spec.dp_rank,
                 spec.dp_size,
                 spec.dp_color,
+                spec.pp_rank,
+                spec.pp_size,
+                spec.pp_color,
             )?;
         } else {
             ctx.attach_parallel_nccl_no_sync(
@@ -309,12 +321,18 @@ fn create_qwen_context(
                 spec.tp_rank,
                 spec.tp_size,
                 spec.tp_color,
+                spec.cp_rank,
+                spec.cp_size,
+                spec.cp_color,
                 spec.ep_rank,
                 spec.ep_size,
                 spec.ep_color,
                 spec.dp_rank,
                 spec.dp_size,
                 spec.dp_color,
+                spec.pp_rank,
+                spec.pp_size,
+                spec.pp_color,
             )?;
         }
     }
@@ -828,9 +846,13 @@ impl TrainingSession for Qwen36Session {
         }
         let dp_size = topology.data_parallel_size();
         let ep_size = topology.expert_model_parallel_size();
+        let cp_size = topology.context_parallel_size();
+        let pp_size = topology.pipeline_model_parallel_size();
         let tp_rank = topology.tensor_rank(global_rank)?;
+        let cp_rank = topology.context_rank(global_rank)?;
         let dp_rank = topology.data_rank(global_rank)?;
         let expert_rank = topology.expert_rank(global_rank)?;
+        let pp_rank = topology.pipeline_rank(global_rank)?;
         let is_ep = runtime_config.is_moe && ep_size > 1;
         let is_data_parallel = dp_size > 1;
         let ep_a2a = std::env::var("QWEN36_EP_A2A")
@@ -848,11 +870,15 @@ impl TrainingSession for Qwen36Session {
         )?;
         unsafe {
             std::env::set_var("TP_SIZE", tp_size.to_string());
+            std::env::set_var("CP_SIZE", cp_size.to_string());
             std::env::set_var("EP_SIZE", ep_size.to_string());
             std::env::set_var("DP_SIZE", dp_size.to_string());
+            std::env::set_var("PP_SIZE", pp_size.to_string());
             std::env::set_var("RUSTRAIN_TP_RANK", tp_rank.to_string());
+            std::env::set_var("RUSTRAIN_CP_RANK", cp_rank.to_string());
             std::env::set_var("RUSTRAIN_EP_RANK", expert_rank.to_string());
             std::env::set_var("RUSTRAIN_DP_RANK", dp_rank.to_string());
+            std::env::set_var("RUSTRAIN_PP_RANK", pp_rank.to_string());
             std::env::set_var(
                 "RUSTRAIN_DATA_PARALLEL",
                 if is_data_parallel { "1" } else { "0" },
@@ -1063,12 +1089,17 @@ impl TrainingSession for Qwen36Session {
                 target_modules: target_modules.clone(),
             },
         )?;
-        let (tp_color, ep_color, dp_color) = if world_size > 1 {
+        let (tp_color, cp_color, ep_color, dp_color, pp_color) = if world_size > 1 {
             let tp_color = *topology
                 .tensor_group(global_rank)?
                 .iter()
                 .min()
                 .ok_or_else(|| anyhow!("empty TP process group"))?;
+            let cp_color = *topology
+                .context_group(global_rank)?
+                .iter()
+                .min()
+                .ok_or_else(|| anyhow!("empty CP process group"))?;
             let ep_color = *topology
                 .expert_group(global_rank)?
                 .iter()
@@ -1079,9 +1110,14 @@ impl TrainingSession for Qwen36Session {
                 .iter()
                 .min()
                 .ok_or_else(|| anyhow!("empty DP process group"))?;
-            (tp_color, ep_color, dp_color)
+            let pp_color = *topology
+                .pipeline_group(global_rank)?
+                .iter()
+                .min()
+                .ok_or_else(|| anyhow!("empty PP process group"))?;
+            (tp_color, cp_color, ep_color, dp_color, pp_color)
         } else {
-            (0, 0, 0)
+            (0, 0, 0, 0, 0)
         };
         let context_spec = QwenContextSpec {
             runtime_config: runtime_config.clone(),
@@ -1100,12 +1136,18 @@ impl TrainingSession for Qwen36Session {
             tp_rank,
             tp_size,
             tp_color,
+            cp_rank,
+            cp_size,
+            cp_color,
             ep_rank: expert_rank,
             ep_size,
             ep_color,
             dp_rank,
             dp_size,
             dp_color,
+            pp_rank,
+            pp_size,
+            pp_color,
         };
         let ctx = create_qwen_context(&weights, self.compute_kind, &context_spec, true)?;
         let nccl_ep = world_size > 1;

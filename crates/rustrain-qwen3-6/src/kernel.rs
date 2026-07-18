@@ -121,8 +121,26 @@ type FnSetMtpWeights = unsafe extern "C" fn(
 type FnSetCheckpoint = unsafe extern "C" fn(*mut c_void, i32, i64);
 type FnSetNcclComm = unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void, i32, i32);
 type FnInitNccl = unsafe extern "C" fn(*mut c_void) -> i32;
-type FnInitParallelNccl =
-    unsafe extern "C" fn(*mut c_void, i32, i32, i32, i32, i32, i32, i32, i32, i32, i32, i32) -> i32;
+type FnInitParallelNccl = unsafe extern "C" fn(
+    *mut c_void,
+    i32,
+    i32,
+    i32,
+    i32,
+    i32,
+    i32,
+    i32,
+    i32,
+    i32,
+    i32,
+    i32,
+    i32,
+    i32,
+    i32,
+    i32,
+    i32,
+    i32,
+) -> i32;
 type FnSetCudaDevice = unsafe extern "C" fn(i32);
 type FnSetBaseTpMlp = unsafe extern "C" fn(*mut c_void, i32) -> i32;
 type FnAddLora = unsafe extern "C" fn(*mut c_void, i64, f64, *const i64, i64, *const i8) -> i64;
@@ -250,7 +268,7 @@ unsafe fn load_kernels() -> Option<KernelHandles> {
         }};
     }
     let abi_version: FnKernelAbiVersion = sym!("qwen36_kernel_abi_version");
-    if abi_version() != 25 {
+    if abi_version() != 26 {
         return None;
     }
     Some(KernelHandles {
@@ -281,8 +299,8 @@ unsafe fn load_kernels() -> Option<KernelHandles> {
         set_checkpoint: sym!("qwen36_set_checkpoint"),
         set_nccl_comm: sym!("qwen36_set_nccl_comm"),
         init_nccl: sym!("qwen36_init_nccl"),
-        init_parallel_nccl: sym!("qwen36_init_parallel_nccl"),
-        attach_parallel_nccl_no_sync: sym!("qwen36_attach_parallel_nccl_no_sync"),
+        init_parallel_nccl: sym!("qwen36_init_parallel_nccl_v2"),
+        attach_parallel_nccl_no_sync: sym!("qwen36_attach_parallel_nccl_no_sync_v2"),
         set_cuda_device: sym!("qwen36_set_cuda_device"),
         set_base_tp_mlp: sym!("qwen36_set_base_tp_mlp"),
         add_lora: sym!("qwen36_add_lora"),
@@ -1322,7 +1340,7 @@ impl CppTrainingContext {
         unsafe { (kh.init_nccl)(self.ptr) }
     }
 
-    /// Initialize orthogonal TP, EP, and DP process groups from validated topology metadata.
+    /// Initialize the orthogonal TP, CP, EP, DP, and PP process grid.
     pub fn init_parallel_nccl(
         &self,
         rank: usize,
@@ -1330,16 +1348,22 @@ impl CppTrainingContext {
         tp_rank: usize,
         tp_size: usize,
         tp_color: usize,
+        cp_rank: usize,
+        cp_size: usize,
+        cp_color: usize,
         ep_rank: usize,
         ep_size: usize,
         ep_color: usize,
         dp_rank: usize,
         dp_size: usize,
         dp_color: usize,
+        pp_rank: usize,
+        pp_size: usize,
+        pp_color: usize,
     ) -> Result<()> {
         let values = [
-            rank, world_size, tp_rank, tp_size, tp_color, ep_rank, ep_size, ep_color, dp_rank,
-            dp_size, dp_color,
+            rank, world_size, tp_rank, tp_size, tp_color, cp_rank, cp_size, cp_color, ep_rank,
+            ep_size, ep_color, dp_rank, dp_size, dp_color, pp_rank, pp_size, pp_color,
         ]
         .map(|value| i32::try_from(value).context("parallel topology exceeds i32"));
         let [
@@ -1348,12 +1372,18 @@ impl CppTrainingContext {
             tp_rank,
             tp_size,
             tp_color,
+            cp_rank,
+            cp_size,
+            cp_color,
             ep_rank,
             ep_size,
             ep_color,
             dp_rank,
             dp_size,
             dp_color,
+            pp_rank,
+            pp_size,
+            pp_color,
         ] = values;
         let kh = get_kernels().expect("kernels not loaded");
         let status = unsafe {
@@ -1364,12 +1394,18 @@ impl CppTrainingContext {
                 tp_rank?,
                 tp_size?,
                 tp_color?,
+                cp_rank?,
+                cp_size?,
+                cp_color?,
                 ep_rank?,
                 ep_size?,
                 ep_color?,
                 dp_rank?,
                 dp_size?,
                 dp_color?,
+                pp_rank?,
+                pp_size?,
+                pp_color?,
             )
         };
         if status != 0 {
@@ -1388,16 +1424,22 @@ impl CppTrainingContext {
         tp_rank: usize,
         tp_size: usize,
         tp_color: usize,
+        cp_rank: usize,
+        cp_size: usize,
+        cp_color: usize,
         ep_rank: usize,
         ep_size: usize,
         ep_color: usize,
         dp_rank: usize,
         dp_size: usize,
         dp_color: usize,
+        pp_rank: usize,
+        pp_size: usize,
+        pp_color: usize,
     ) -> Result<()> {
         let values = [
-            rank, world_size, tp_rank, tp_size, tp_color, ep_rank, ep_size, ep_color, dp_rank,
-            dp_size, dp_color,
+            rank, world_size, tp_rank, tp_size, tp_color, cp_rank, cp_size, cp_color, ep_rank,
+            ep_size, ep_color, dp_rank, dp_size, dp_color, pp_rank, pp_size, pp_color,
         ]
         .map(|value| i32::try_from(value).context("parallel topology exceeds i32"));
         let [
@@ -1406,12 +1448,18 @@ impl CppTrainingContext {
             tp_rank,
             tp_size,
             tp_color,
+            cp_rank,
+            cp_size,
+            cp_color,
             ep_rank,
             ep_size,
             ep_color,
             dp_rank,
             dp_size,
             dp_color,
+            pp_rank,
+            pp_size,
+            pp_color,
         ] = values;
         let kh = get_kernels().expect("kernels not loaded");
         let status = unsafe {
@@ -1422,12 +1470,18 @@ impl CppTrainingContext {
                 tp_rank?,
                 tp_size?,
                 tp_color?,
+                cp_rank?,
+                cp_size?,
+                cp_color?,
                 ep_rank?,
                 ep_size?,
                 ep_color?,
                 dp_rank?,
                 dp_size?,
                 dp_color?,
+                pp_rank?,
+                pp_size?,
+                pp_color?,
             )
         };
         if status != 0 {

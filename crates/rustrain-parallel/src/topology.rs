@@ -515,6 +515,33 @@ mod tests {
     }
 
     #[test]
+    fn cp2_pp2_groups_match_native_communicator_colors() {
+        let topology = ParallelTopology::new(1, 2, 1, 1, 2).unwrap();
+        let expected = [
+            (0, 0, vec![0, 1], vec![0, 2]),
+            (1, 0, vec![0, 1], vec![1, 3]),
+            (0, 1, vec![2, 3], vec![0, 2]),
+            (1, 1, vec![2, 3], vec![1, 3]),
+        ];
+        for (rank, (cp_rank, pp_rank, cp_group, pp_group)) in
+            expected.into_iter().enumerate()
+        {
+            assert_eq!(topology.context_rank(rank).unwrap(), cp_rank);
+            assert_eq!(topology.pipeline_rank(rank).unwrap(), pp_rank);
+            assert_eq!(topology.context_group(rank).unwrap(), cp_group);
+            assert_eq!(topology.pipeline_group(rank).unwrap(), pp_group);
+            assert_eq!(
+                topology.context_group(rank).unwrap().into_iter().min(),
+                Some(if pp_rank == 0 { 0 } else { 2 })
+            );
+            assert_eq!(
+                topology.pipeline_group(rank).unwrap().into_iter().min(),
+                Some(cp_rank)
+            );
+        }
+    }
+
+    #[test]
     fn rejects_invalid_order_and_world_size() {
         assert!(ParallelTopology::with_order(1, 1, 1, 1, 1, "tp-unknown").is_err());
         assert!(ParallelTopology::with_order(1, 1, 1, 1, 1, "tp-dp-dp-ep-cp").is_err());

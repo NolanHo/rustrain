@@ -34,6 +34,7 @@
 #include <limits>
 #include <sstream>
 #include <chrono>
+#include <cerrno>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -64,23 +65,92 @@ static bool env_enabled(const char* name, bool fallback = false) {
         std::strcmp(value, "false") != 0;
 }
 
-static std::string nccl_sync_dir() {
-    const char* run_id = std::getenv("RUSTRAIN_NCCL_RUN_ID");
-    if (!run_id || run_id[0] == '\0') return "/tmp/rustrain-nccl";
-    std::string sanitized;
-    for (const unsigned char ch : std::string(run_id)) {
-        if ((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') ||
-            (ch >= '0' && ch <= '9') || ch == '-' || ch == '_') {
-            sanitized.push_back(static_cast<char>(ch));
-        } else {
-            sanitized.push_back('_');
+static bool valid_rendezvous_component(const char* value) {
+    if (!value || value[0] == '\0' || std::strcmp(value, ".") == 0 ||
+        std::strcmp(value, "..") == 0) {
+        return false;
+    }
+    for (const unsigned char ch : std::string(value)) {
+        if (!((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') ||
+              (ch >= '0' && ch <= '9') || ch == '-' || ch == '_' ||
+              ch == '.')) {
+            return false;
         }
     }
-    if (sanitized.empty()) sanitized = "default";
-    mkdir("/tmp/rustrain-nccl", 0777);
-    std::string path = "/tmp/rustrain-nccl/" + sanitized;
-    mkdir(path.c_str(), 0777);
-    return path;
+    return true;
+}
+
+static bool create_rendezvous_directory(const std::string& path) {
+    return mkdir(path.c_str(), 0770) == 0 || errno == EEXIST;
+}
+
+static bool nccl_sync_dir(std::string* output) {
+    if (!output) return false;
+    const char* explicit_run_id = std::getenv("RUSTRAIN_NCCL_RUN_ID");
+    const char* launch_run_id = std::getenv("RUSTRAIN_RUN_ID");
+    const char* launch_attempt_id = std::getenv("RUSTRAIN_ATTEMPT_ID");
+    const bool use_explicit_run_id = explicit_run_id && explicit_run_id[0] != '\0';
+    if (!use_explicit_run_id &&
+        (!launch_run_id || launch_run_id[0] == '\0' ||
+         !launch_attempt_id || launch_attempt_id[0] == '\0')) {
+        fprintf(stderr,
+            "[parallel_nccl] distributed initialization requires either "
+            "RUSTRAIN_NCCL_RUN_ID or both RUSTRAIN_RUN_ID and "
+            "RUSTRAIN_ATTEMPT_ID\n");
+        return false;
+    }
+
+    const char* configured_base = std::getenv("RUSTRAIN_NCCL_SYNC_DIR");
+    const char* launch_output = std::getenv("RUSTRAIN_LAUNCH_OUTPUT_DIR");
+    std::string base;
+    if (configured_base && configured_base[0] != '\0') {
+        base = configured_base;
+    } else if (launch_output && launch_output[0] != '\0') {
+        base = std::string(launch_output) + "/.rustrain-nccl";
+    } else {
+        base = "/tmp/rustrain-nccl";
+    }
+    if (!create_rendezvous_directory(base)) {
+        fprintf(stderr,
+            "[parallel_nccl] failed to create rendezvous base directory %s: %s\n",
+            base.c_str(), std::strerror(errno));
+        return false;
+    }
+
+    const char* selected_run_id =
+        use_explicit_run_id ? explicit_run_id : launch_run_id;
+    if (!valid_rendezvous_component(selected_run_id)) {
+        fprintf(stderr,
+            "[parallel_nccl] rendezvous run ID must contain only ASCII "
+            "letters, digits, '.', '_', or '-' and cannot be '.' or '..'\n");
+        return false;
+    }
+    const std::string run_id(selected_run_id);
+    std::string path = base + "/" + run_id;
+    if (!create_rendezvous_directory(path)) {
+        fprintf(stderr,
+            "[parallel_nccl] failed to create rendezvous run directory %s: %s\n",
+            path.c_str(), std::strerror(errno));
+        return false;
+    }
+    if (!use_explicit_run_id) {
+        if (!valid_rendezvous_component(launch_attempt_id)) {
+            fprintf(stderr,
+                "[parallel_nccl] rendezvous attempt ID must contain only ASCII "
+                "letters, digits, '.', '_', or '-' and cannot be '.' or '..'\n");
+            return false;
+        }
+        const std::string attempt_id(launch_attempt_id);
+        path += "/" + attempt_id;
+        if (!create_rendezvous_directory(path)) {
+            fprintf(stderr,
+                "[parallel_nccl] failed to create rendezvous attempt directory %s: %s\n",
+                path.c_str(), std::strerror(errno));
+            return false;
+        }
+    }
+    *output = std::move(path);
+    return true;
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -2454,6 +2524,17 @@ struct TrainingContext {
     cudaStream_t tp_stream = nullptr;
     int tp_world_size = 1;
     int tp_rank = 0;
+    // Context and pipeline communicators are initialized as part of the
+    // five-dimensional process grid. Model execution remains fail-closed
+    // until sequence partitioning and stage ownership are implemented.
+    ncclComm_t cp_comm = nullptr;
+    cudaStream_t cp_stream = nullptr;
+    int cp_world_size = 1;
+    int cp_rank = 0;
+    ncclComm_t pp_comm = nullptr;
+    cudaStream_t pp_stream = nullptr;
+    int pp_world_size = 1;
+    int pp_rank = 0;
     // Frozen dense SwiGLU TP: gate/up are output-sharded and down is
     // input-sharded by the Rust weight loader.  The local row contribution
     // is reduced over the TP communicator before the residual add.
@@ -2542,8 +2623,10 @@ static void hash_collective_topology(
     AdapterRegistryHash& hash, const TrainingContext* ctx
 ) {
     hash.add_u64(ctx->tp_world_size);
+    hash.add_u64(ctx->cp_world_size);
     hash.add_u64(ctx->ep_world_size);
     hash.add_u64(ctx->dp_world_size);
+    hash.add_u64(ctx->pp_world_size);
     hash.add_u64(ctx->base_tp_attention);
     hash.add_u64(ctx->base_tp_mlp);
     hash.add_u64(ctx->vocab_parallel);
@@ -2558,6 +2641,26 @@ static void hash_collective_topology(
     hash.add_u64(env_enabled("QWEN36_GDN_RECURRENT_FUSION", true));
     hash.add_u64(env_enabled("QWEN36_GDN_CHUNKWISE_BWD"));
     hash.add_u64(gdn_state_checkpoint_config());
+}
+
+static void validate_native_execution_topology(const TrainingContext* ctx) {
+    TORCH_CHECK(ctx, "native Qwen execution requires a valid context");
+    TORCH_CHECK(!ctx->topology_invalid,
+        "native Qwen context rejected an incompatible TP/CP/EP/DP/PP topology");
+    TORCH_CHECK(ctx->tp_world_size == 1 || ctx->tp_comm,
+        "native Qwen TP communicator is not initialized");
+    TORCH_CHECK(ctx->cp_world_size == 1 || ctx->cp_comm,
+        "native Qwen CP communicator is not initialized");
+    TORCH_CHECK(ctx->ep_world_size == 1 || ctx->nccl_comm,
+        "native Qwen EP communicator is not initialized");
+    TORCH_CHECK(ctx->dp_world_size == 1 || ctx->dp_comm,
+        "native Qwen DP communicator is not initialized");
+    TORCH_CHECK(ctx->pp_world_size == 1 || ctx->pp_comm,
+        "native Qwen PP communicator is not initialized");
+    TORCH_CHECK(ctx->cp_world_size == 1 && ctx->pp_world_size == 1,
+        "native Qwen PP/CP communicator initialization is available, but model "
+        "execution requires stage ownership and context partitioning; CP_SIZE=",
+        ctx->cp_world_size, " PP_SIZE=", ctx->pp_world_size);
 }
 
 static void validate_adapter_collective_registry(
@@ -6568,17 +6671,19 @@ static at::Tensor mtp_compute_loss(
 extern "C" {
 
 __attribute__((visibility("default"))) int64_t qwen36_kernel_abi_version() {
-    return 25;
+    return 26;
 }
 
-// Benchmark/metrics helper. The orthogonal EP, DP, and TP reductions propagate
-// the maximum over the complete process grid without requiring a world group.
+// Benchmark/metrics helper. Reducing over every orthogonal axis propagates the
+// maximum over the complete process grid without requiring a world group.
 __attribute__((visibility("default"))) double qwen36_parallel_max_double(
     void* ctx_ptr, double value
 ) {
     try {
         auto* ctx = reinterpret_cast<TrainingContext*>(ctx_ptr);
         TORCH_CHECK(ctx, "parallel max requires a valid training context");
+        TORCH_CHECK(!ctx->topology_invalid,
+            "parallel max rejected an invalid process topology");
         c10::cuda::set_device(ctx->cuda_device);
         cudaSetDevice(ctx->cuda_device);
         auto maximum = at::full(
@@ -6586,17 +6691,22 @@ __attribute__((visibility("default"))) double qwen36_parallel_max_double(
             at::TensorOptions().device(at::kCUDA, ctx->cuda_device)
                 .dtype(at::kDouble));
         auto stream = c10::cuda::getCurrentCUDAStream(ctx->cuda_device).stream();
-        auto reduce_axis = [&](ncclComm_t communicator, const char* axis) {
-            if (!communicator) return;
+        auto reduce_axis = [&](ncclComm_t communicator, int axis_size,
+                               const char* axis) {
+            TORCH_CHECK(axis_size == 1 || communicator,
+                axis, " benchmark reduction is missing its communicator");
+            if (axis_size == 1) return;
             auto err = ncclAllReduce(
                 maximum.data_ptr<double>(), maximum.data_ptr<double>(), 1,
                 ncclDouble, ncclMax, communicator, stream);
             TORCH_CHECK(err == ncclSuccess, axis,
                 " benchmark max all-reduce failed: ", ncclGetErrorString(err));
         };
-        reduce_axis(ctx->nccl_comm, "EP");
-        reduce_axis(ctx->dp_comm, "DP");
-        reduce_axis(ctx->tp_comm, "TP");
+        reduce_axis(ctx->tp_comm, ctx->tp_world_size, "TP");
+        reduce_axis(ctx->cp_comm, ctx->cp_world_size, "CP");
+        reduce_axis(ctx->nccl_comm, ctx->ep_world_size, "EP");
+        reduce_axis(ctx->dp_comm, ctx->dp_world_size, "DP");
+        reduce_axis(ctx->pp_comm, ctx->pp_world_size, "PP");
         return maximum.to(at::kCPU).item<double>();
     } catch (const std::exception& error) {
         fprintf(stderr, "[q36] parallel max FAILED: %s\n", error.what());
@@ -6658,32 +6768,37 @@ static void* qwen36_create_training_context_impl(
         const char* ep_size_env = getenv("EP_SIZE");
         if (!ep_size_env) ep_size_env = getenv("RUSTRAIN_EP_SIZE");
         const int configured_ep_size = ep_size_env ? atoi(ep_size_env) : 1;
-        const bool expert_parallel_requested =
-            (context_flags & QWEN36_CONTEXT_EXPERT_PARALLEL) != 0 ||
-            configured_ep_size > 1;
-        if (data_parallel_requested && !dp_size_env &&
-            configured_world_size %
-                (ctx->tp_world_size * configured_ep_size) == 0) {
-            configured_dp_size = configured_world_size /
-                (ctx->tp_world_size * configured_ep_size);
-        }
         const char* pp_size_env = getenv("PP_SIZE");
         if (!pp_size_env) pp_size_env = getenv("RUSTRAIN_PP_SIZE");
         const char* cp_size_env = getenv("CP_SIZE");
         if (!cp_size_env) cp_size_env = getenv("RUSTRAIN_CP_SIZE");
         const int configured_pp_size = pp_size_env ? atoi(pp_size_env) : 1;
         const int configured_cp_size = cp_size_env ? atoi(cp_size_env) : 1;
+        const bool expert_parallel_requested =
+            (context_flags & QWEN36_CONTEXT_EXPERT_PARALLEL) != 0 ||
+            configured_ep_size > 1;
+        const int64_t non_data_parallel_product =
+            static_cast<int64_t>(ctx->tp_world_size) * configured_cp_size *
+            configured_ep_size * configured_pp_size;
+        if (data_parallel_requested && !dp_size_env &&
+            non_data_parallel_product > 0 &&
+            configured_world_size % non_data_parallel_product == 0) {
+            configured_dp_size = static_cast<int>(
+                configured_world_size / non_data_parallel_product);
+        }
         TORCH_CHECK(configured_pp_size > 0 && configured_cp_size > 0 &&
                     configured_dp_size > 0 && configured_ep_size > 0,
             "PP_SIZE, CP_SIZE, DP_SIZE, and EP_SIZE must be positive");
-        TORCH_CHECK(configured_pp_size == 1 && configured_cp_size == 1,
-            "native Qwen LoRA does not implement PP/CP yet; ",
-            "PP_SIZE=", configured_pp_size, " CP_SIZE=", configured_cp_size);
-        TORCH_CHECK(configured_world_size ==
-                ctx->tp_world_size * configured_ep_size * configured_dp_size,
-            "native Qwen LoRA requires WORLD_SIZE=TP_SIZE*EP_SIZE*DP_SIZE; ",
+        const int64_t configured_parallel_product =
+            static_cast<int64_t>(ctx->tp_world_size) * configured_cp_size *
+            configured_ep_size * configured_dp_size * configured_pp_size;
+        TORCH_CHECK(configured_parallel_product <= std::numeric_limits<int>::max() &&
+                configured_world_size == configured_parallel_product,
+            "native Qwen LoRA requires "
+            "WORLD_SIZE=TP_SIZE*CP_SIZE*EP_SIZE*DP_SIZE*PP_SIZE; ",
             "TP_SIZE=", ctx->tp_world_size, " EP_SIZE=", configured_ep_size,
-            " DP_SIZE=", configured_dp_size,
+            " DP_SIZE=", configured_dp_size, " PP_SIZE=", configured_pp_size,
+            " CP_SIZE=", configured_cp_size,
             " WORLD_SIZE=", configured_world_size);
         TORCH_CHECK(expert_parallel_requested == (configured_ep_size > 1),
             "expert-parallel context flag must match EP_SIZE");
@@ -6693,20 +6808,45 @@ static void* qwen36_create_training_context_impl(
         ctx->expert_parallel = expert_parallel_requested;
         ctx->dp_world_size = configured_dp_size;
         ctx->data_parallel = data_parallel_requested;
+        ctx->cp_world_size = configured_cp_size;
+        ctx->pp_world_size = configured_pp_size;
         const char* rank_env = getenv("RANK");
         const int global_rank = rank_env ? atoi(rank_env) : 0;
         const char* tp_rank_env = getenv("RUSTRAIN_TP_RANK");
+        const char* cp_rank_env = getenv("RUSTRAIN_CP_RANK");
         const char* ep_rank_env = getenv("RUSTRAIN_EP_RANK");
         const char* dp_rank_env = getenv("RUSTRAIN_DP_RANK");
+        const char* pp_rank_env = getenv("RUSTRAIN_PP_RANK");
+        const char* parallel_order_env = getenv("RUSTRAIN_PARALLEL_ORDER");
+        if (!parallel_order_env) parallel_order_env = getenv("PARALLEL_ORDER");
+        if (parallel_order_env &&
+            std::strcmp(parallel_order_env, "tp-cp-ep-dp-pp") != 0) {
+            TORCH_CHECK(tp_rank_env && cp_rank_env && ep_rank_env &&
+                    dp_rank_env && pp_rank_env,
+                "custom parallel rank order requires explicit "
+                "RUSTRAIN_TP_RANK/RUSTRAIN_CP_RANK/RUSTRAIN_EP_RANK/"
+                "RUSTRAIN_DP_RANK/RUSTRAIN_PP_RANK coordinates");
+        }
         ctx->tp_rank = tp_rank_env ? atoi(tp_rank_env)
             : global_rank % ctx->tp_world_size;
+        ctx->cp_rank = cp_rank_env ? atoi(cp_rank_env)
+            : (global_rank / ctx->tp_world_size) % configured_cp_size;
         ctx->ep_rank = ep_rank_env ? atoi(ep_rank_env)
-            : (global_rank / ctx->tp_world_size) % configured_ep_size;
+            : (global_rank / (ctx->tp_world_size * configured_cp_size)) %
+                configured_ep_size;
         ctx->dp_rank = dp_rank_env ? atoi(dp_rank_env)
-            : global_rank / (ctx->tp_world_size * configured_ep_size);
+            : (global_rank /
+                (ctx->tp_world_size * configured_cp_size * configured_ep_size)) %
+                configured_dp_size;
+        ctx->pp_rank = pp_rank_env ? atoi(pp_rank_env)
+            : global_rank /
+                (ctx->tp_world_size * configured_cp_size * configured_ep_size *
+                    configured_dp_size);
         TORCH_CHECK(ctx->tp_rank >= 0 && ctx->tp_rank < ctx->tp_world_size &&
+                    ctx->cp_rank >= 0 && ctx->cp_rank < ctx->cp_world_size &&
                     ctx->ep_rank >= 0 && ctx->ep_rank < ctx->ep_world_size &&
-                    ctx->dp_rank >= 0 && ctx->dp_rank < ctx->dp_world_size,
+                    ctx->dp_rank >= 0 && ctx->dp_rank < ctx->dp_world_size &&
+                    ctx->pp_rank >= 0 && ctx->pp_rank < ctx->pp_world_size,
             "parallel rank coordinates are outside their configured axes");
         TORCH_CHECK(lora_rank > 0, "LoRA rank must be positive");
         if (const char* mtp_scale = getenv("QWEN36_MTP_LOSS_SCALE")) {
@@ -7227,8 +7367,7 @@ __attribute__((visibility("default"))) double qwen36_train_micro_step(
 ) {
     try {
         auto* ctx = reinterpret_cast<TrainingContext*>(ctx_ptr);
-        TORCH_CHECK(!ctx->topology_invalid,
-            "native Qwen context rejected an incompatible TP/DP/EP topology");
+        validate_native_execution_topology(ctx);
         GradientAccumulationFailureGuard accumulation_guard{ctx};
         auto* input_ids_tensor = reinterpret_cast<at::Tensor*>(input_ids_ptr);
         auto* target_mask_tensor = reinterpret_cast<at::Tensor*>(target_mask_ptr);
@@ -7664,8 +7803,7 @@ static double qwen36_train_multi_lora_impl(
         const bool train_only = mode == DynamicMultiLoraMode::TrainOnly;
         const bool finalize_only = mode == DynamicMultiLoraMode::FinalizeOnly;
         if (finalize_only && finalizer_phase) *finalizer_phase = 0;
-        TORCH_CHECK(!ctx->topology_invalid,
-            "native Qwen context rejected an incompatible TP/DP/EP topology");
+        validate_native_execution_topology(ctx);
         auto* input_ids_tensor = reinterpret_cast<at::Tensor*>(input_ids_ptr);
         auto* target_mask_tensor = reinterpret_cast<at::Tensor*>(target_mask_ptr);
         auto* attention_mask_tensor = attention_mask_ptr
@@ -8395,8 +8533,7 @@ __attribute__((visibility("default"))) double qwen36_train_multi_lora_selected(
     try {
         TORCH_CHECK(ctx,
             "selected multi-LoRA requires a valid training context");
-        TORCH_CHECK(!ctx->topology_invalid,
-            "native Qwen context rejected an incompatible TP/DP/EP topology");
+        validate_native_execution_topology(ctx);
         validate_adapter_collective_registry(
             ctx, adapter_ids, n_adapters, lora_rank, false);
         TORCH_CHECK(adapter_ids && n_adapters > 0,
@@ -8671,8 +8808,7 @@ static double qwen36_train_multi_lora_selected_impl(
     try {
         TORCH_CHECK(ctx,
             "heterogeneous selected training requires a context");
-        TORCH_CHECK(!ctx->topology_invalid,
-            "native Qwen context rejected an incompatible TP/DP/EP topology");
+        validate_native_execution_topology(ctx);
         const bool local_request_valid = adapter_ids && n_adapters > 0;
         TORCH_CHECK(adapter_collective_all_succeeded(
                 ctx, local_request_valid) && local_request_valid,
@@ -9012,10 +9148,14 @@ static ncclComm_t g_nccl_comm = nullptr;
 static cudaStream_t g_nccl_stream = nullptr;
 static ncclComm_t g_tp_comm = nullptr;
 static cudaStream_t g_tp_stream = nullptr;
+static ncclComm_t g_cp_comm = nullptr;
+static cudaStream_t g_cp_stream = nullptr;
 static ncclComm_t g_ep_comm = nullptr;
 static cudaStream_t g_ep_stream = nullptr;
 static ncclComm_t g_dp_comm = nullptr;
 static cudaStream_t g_dp_stream = nullptr;
+static ncclComm_t g_pp_comm = nullptr;
+static cudaStream_t g_pp_stream = nullptr;
 static bool g_nccl_initialized = false;
 static bool g_nccl_cleanup_registered = false;
 static int g_parallel_rank = 0;
@@ -9023,20 +9163,30 @@ static int g_parallel_world_size = 1;
 static int g_parallel_tp_rank = 0;
 static int g_parallel_tp_size = 1;
 static int g_parallel_tp_color = 0;
+static int g_parallel_cp_rank = 0;
+static int g_parallel_cp_size = 1;
+static int g_parallel_cp_color = 0;
 static int g_parallel_ep_rank = 0;
 static int g_parallel_ep_size = 1;
 static int g_parallel_ep_color = 0;
 static int g_parallel_dp_rank = 0;
 static int g_parallel_dp_size = 1;
 static int g_parallel_dp_color = 0;
+static int g_parallel_pp_rank = 0;
+static int g_parallel_pp_size = 1;
+static int g_parallel_pp_color = 0;
 
 static void qwen36_destroy_process_communicators() {
+    if (g_pp_comm) ncclCommDestroy(g_pp_comm);
     if (g_dp_comm) ncclCommDestroy(g_dp_comm);
     if (g_ep_comm) ncclCommDestroy(g_ep_comm);
+    if (g_cp_comm) ncclCommDestroy(g_cp_comm);
     if (g_tp_comm) ncclCommDestroy(g_tp_comm);
     if (g_nccl_comm) ncclCommDestroy(g_nccl_comm);
+    g_pp_comm = nullptr;
     g_dp_comm = nullptr;
     g_ep_comm = nullptr;
+    g_cp_comm = nullptr;
     g_tp_comm = nullptr;
     g_nccl_comm = nullptr;
     g_nccl_initialized = false;
@@ -9045,20 +9195,28 @@ static void qwen36_destroy_process_communicators() {
 static bool same_cached_parallel_topology(
     int rank, int world_size,
     int tp_rank, int tp_size, int tp_color,
+    int cp_rank, int cp_size, int cp_color,
     int ep_rank, int ep_size, int ep_color,
-    int dp_rank, int dp_size, int dp_color
+    int dp_rank, int dp_size, int dp_color,
+    int pp_rank, int pp_size, int pp_color
 ) {
     return g_parallel_rank == rank &&
         g_parallel_world_size == world_size &&
         g_parallel_tp_rank == tp_rank &&
         g_parallel_tp_size == tp_size &&
         g_parallel_tp_color == tp_color &&
+        g_parallel_cp_rank == cp_rank &&
+        g_parallel_cp_size == cp_size &&
+        g_parallel_cp_color == cp_color &&
         g_parallel_ep_rank == ep_rank &&
         g_parallel_ep_size == ep_size &&
         g_parallel_ep_color == ep_color &&
         g_parallel_dp_rank == dp_rank &&
         g_parallel_dp_size == dp_size &&
-        g_parallel_dp_color == dp_color;
+        g_parallel_dp_color == dp_color &&
+        g_parallel_pp_rank == pp_rank &&
+        g_parallel_pp_size == pp_size &&
+        g_parallel_pp_color == pp_color;
 }
 static int g_cuda_device = 0;
 
@@ -9081,37 +9239,53 @@ static int32_t qwen36_init_parallel_nccl_impl(
     void* ctx_ptr,
     int rank, int world_size,
     int tp_rank, int tp_size, int tp_color,
+    int cp_rank, int cp_size, int cp_color,
     int ep_rank, int ep_size, int ep_color,
     int dp_rank, int dp_size, int dp_color,
+    int pp_rank, int pp_size, int pp_color,
     bool synchronize_parameters
 ) {
     auto* ctx = reinterpret_cast<TrainingContext*>(ctx_ptr);
 
     if (!ctx) return -1;
 
+    const int64_t topology_product = static_cast<int64_t>(tp_size) * cp_size *
+        ep_size * dp_size * pp_size;
     if (rank < 0 || rank >= world_size || world_size <= 0 ||
         tp_rank < 0 || tp_rank >= tp_size || tp_size <= 0 || tp_color < 0 ||
+        cp_rank < 0 || cp_rank >= cp_size || cp_size <= 0 || cp_color < 0 ||
         ep_rank < 0 || ep_rank >= ep_size || ep_size <= 0 || ep_color < 0 ||
         dp_rank < 0 || dp_rank >= dp_size || dp_size <= 0 || dp_color < 0 ||
-        world_size != tp_size * ep_size * dp_size) {
+        pp_rank < 0 || pp_rank >= pp_size || pp_size <= 0 || pp_color < 0 ||
+        topology_product > std::numeric_limits<int>::max() ||
+        world_size != topology_product) {
         ctx->topology_invalid = true;
         fprintf(stderr,
-            "[parallel_nccl] invalid topology: rank=%d world=%d tp=%d/%d color=%d "
-            "ep=%d/%d color=%d dp=%d/%d color=%d\n",
+            "[parallel_nccl] invalid topology: rank=%d world=%d "
+            "tp=%d/%d color=%d cp=%d/%d color=%d ep=%d/%d color=%d "
+            "dp=%d/%d color=%d pp=%d/%d color=%d\n",
             rank, world_size, tp_rank, tp_size, tp_color,
-            ep_rank, ep_size, ep_color, dp_rank, dp_size, dp_color);
+            cp_rank, cp_size, cp_color, ep_rank, ep_size, ep_color,
+            dp_rank, dp_size, dp_color, pp_rank, pp_size, pp_color);
         return -1;
     }
-    if (ctx->tp_world_size != tp_size || ctx->ep_world_size != ep_size ||
-        ctx->dp_world_size != dp_size ||
+    if (ctx->tp_world_size != tp_size || ctx->tp_rank != tp_rank ||
+        ctx->cp_world_size != cp_size || ctx->cp_rank != cp_rank ||
+        ctx->ep_world_size != ep_size || ctx->dp_world_size != dp_size ||
+        ctx->ep_rank != ep_rank || ctx->dp_rank != dp_rank ||
+        ctx->pp_world_size != pp_size || ctx->pp_rank != pp_rank ||
         ctx->expert_parallel != (ep_size > 1) ||
         ctx->data_parallel != (dp_size > 1)) {
         ctx->topology_invalid = true;
         fprintf(stderr,
             "[parallel_nccl] init topology does not match context: "
-            "context tp=%d ep=%d dp=%d, init tp=%d ep=%d dp=%d\n",
-            ctx->tp_world_size, ctx->ep_world_size, ctx->dp_world_size,
-            tp_size, ep_size, dp_size);
+            "context tp=%d/%d cp=%d/%d ep=%d/%d dp=%d/%d pp=%d/%d, "
+            "init tp=%d/%d cp=%d/%d ep=%d/%d dp=%d/%d pp=%d/%d\n",
+            ctx->tp_rank, ctx->tp_world_size, ctx->cp_rank, ctx->cp_world_size,
+            ctx->ep_rank, ctx->ep_world_size, ctx->dp_rank, ctx->dp_world_size,
+            ctx->pp_rank, ctx->pp_world_size,
+            tp_rank, tp_size, cp_rank, cp_size, ep_rank, ep_size,
+            dp_rank, dp_size, pp_rank, pp_size);
         return -1;
     }
     ctx->topology_invalid = false;
@@ -9120,8 +9294,10 @@ static int32_t qwen36_init_parallel_nccl_impl(
     if (g_nccl_initialized) {
         if (!same_cached_parallel_topology(
                 rank, world_size, tp_rank, tp_size, tp_color,
+                cp_rank, cp_size, cp_color,
                 ep_rank, ep_size, ep_color,
-                dp_rank, dp_size, dp_color)) {
+                dp_rank, dp_size, dp_color,
+                pp_rank, pp_size, pp_color)) {
             ctx->topology_invalid = true;
             fprintf(stderr,
                 "[parallel_nccl] process communicator topology cannot change after initialization\n");
@@ -9137,13 +9313,21 @@ static int32_t qwen36_init_parallel_nccl_impl(
         ctx->cuda_device = local_rank_str2 ? atoi(local_rank_str2) : g_cuda_device;
         ctx->tp_world_size = tp_size;
         ctx->tp_rank = tp_rank;
+        ctx->cp_world_size = cp_size;
+        ctx->cp_rank = cp_rank;
+        ctx->pp_world_size = pp_size;
+        ctx->pp_rank = pp_rank;
         ctx->topology_invalid = false;
         ctx->tp_comm = tp_size > 1 ? g_tp_comm : nullptr;
         ctx->tp_stream = tp_size > 1 ? g_tp_stream : nullptr;
+        ctx->cp_comm = cp_size > 1 ? g_cp_comm : nullptr;
+        ctx->cp_stream = cp_size > 1 ? g_cp_stream : nullptr;
         ctx->nccl_comm = ep_size > 1 ? g_ep_comm : nullptr;
         ctx->nccl_stream = ep_size > 1 ? g_ep_stream : nullptr;
         ctx->dp_comm = dp_size > 1 ? g_dp_comm : nullptr;
         ctx->dp_stream = dp_size > 1 ? g_dp_stream : nullptr;
+        ctx->pp_comm = pp_size > 1 ? g_pp_comm : nullptr;
+        ctx->pp_stream = pp_size > 1 ? g_pp_stream : nullptr;
         void* layer_comm = ep_size > 1 ? (void*)g_ep_comm : nullptr;
         void* layer_stream = ep_size > 1 ? (void*)g_ep_stream : nullptr;
         for (auto& lc : ctx->layer_configs) {
@@ -9183,7 +9367,11 @@ static int32_t qwen36_init_parallel_nccl_impl(
     // Rank 0 generates ID, writes to file, then writes "ready" sentinel.
     // Other ranks wait for "ready" file, then read ID.
     // This ensures rank 0's write is visible before others read.
-    const std::string rendezvous_dir = nccl_sync_dir();
+    std::string rendezvous_dir;
+    if (!nccl_sync_dir(&rendezvous_dir)) {
+        ctx->topology_invalid = true;
+        return -1;
+    }
     const std::string id_path = rendezvous_dir + "/nccl-id.bin";
     const std::string ready_path = rendezvous_dir + "/nccl-ready.txt";
     ncclUniqueId unique_id;
@@ -9195,26 +9383,60 @@ static int32_t qwen36_init_parallel_nccl_impl(
                 rendezvous_dir + "/barrier_" + std::to_string(peer);
             remove(stale_barrier.c_str());
         }
-        ncclGetUniqueId(&unique_id);
-        FILE* f = fopen(id_path.c_str(), "wb");
-        fwrite(&unique_id, sizeof(unique_id), 1, f);
-        fclose(f);
-        // Write ready sentinel AFTER id file
-        FILE* rf = fopen(ready_path.c_str(), "w");
-        fprintf(rf, "ready\n");
-        fclose(rf);
+        if (ncclGetUniqueId(&unique_id) != ncclSuccess) {
+            fprintf(stderr, "[parallel_nccl] failed to generate NCCL unique ID\n");
+            ctx->topology_invalid = true;
+            return -1;
+        }
+        const std::string id_temporary = id_path + ".tmp." +
+            std::to_string(static_cast<long long>(getpid()));
+        FILE* f = fopen(id_temporary.c_str(), "wb");
+        const bool id_written = f &&
+            fwrite(&unique_id, sizeof(unique_id), 1, f) == 1;
+        const bool id_closed = f && fclose(f) == 0;
+        f = nullptr;
+        if (!id_written || !id_closed ||
+            rename(id_temporary.c_str(), id_path.c_str()) != 0) {
+            remove(id_temporary.c_str());
+            fprintf(stderr, "[parallel_nccl] failed to publish NCCL unique ID\n");
+            ctx->topology_invalid = true;
+            return -1;
+        }
+        // Publish the ready sentinel only after the ID rename is visible.
+        const std::string ready_temporary = ready_path + ".tmp." +
+            std::to_string(static_cast<long long>(getpid()));
+        FILE* rf = fopen(ready_temporary.c_str(), "w");
+        const bool ready_written = rf && fprintf(rf, "ready\n") >= 0;
+        const bool ready_closed = rf && fclose(rf) == 0;
+        rf = nullptr;
+        if (!ready_written || !ready_closed ||
+            rename(ready_temporary.c_str(), ready_path.c_str()) != 0) {
+            remove(ready_temporary.c_str());
+            fprintf(stderr, "[parallel_nccl] failed to publish ready sentinel\n");
+            ctx->topology_invalid = true;
+            return -1;
+        }
     } else {
         // Wait for ready sentinel
+        bool ready = false;
         for (int i = 0; i < 600; i++) {
             FILE* rf = fopen(ready_path.c_str(), "r");
-            if (rf) { fclose(rf); break; }
+            if (rf) { fclose(rf); ready = true; break; }
             usleep(10000);  // 10ms
+        }
+        if (!ready) {
+            fprintf(stderr,
+                "[parallel_nccl] rank %d timed out waiting for ready sentinel\n",
+                rank);
+            ctx->topology_invalid = true;
+            return -1;
         }
         // Now read ID file
         FILE* f = fopen(id_path.c_str(), "rb");
         if (!f || fread(&unique_id, sizeof(unique_id), 1, f) != 1) {
-            fprintf(stderr, "[ep_nccl] rank %d: failed to read ID file\n", rank);
+            fprintf(stderr, "[parallel_nccl] rank %d: failed to read ID file\n", rank);
             if (f) fclose(f);
+            ctx->topology_invalid = true;
             return -1;
         }
         fclose(f);
@@ -9227,15 +9449,32 @@ static int32_t qwen36_init_parallel_nccl_impl(
         const char* barrier_dir = rendezvous_dir.c_str();
         char bpath[256];
         snprintf(bpath, sizeof(bpath), "%s/barrier_%d", barrier_dir, rank);
-        FILE* bf = fopen(bpath, "w"); fprintf(bf, "1\n"); fclose(bf);
+        FILE* bf = fopen(bpath, "w");
+        const bool barrier_written = bf && fprintf(bf, "1\n") >= 0;
+        const bool barrier_closed = bf && fclose(bf) == 0;
+        bf = nullptr;
+        if (!barrier_written || !barrier_closed) {
+            fprintf(stderr,
+                "[parallel_nccl] rank %d failed to publish barrier file\n", rank);
+            ctx->topology_invalid = true;
+            return -1;
+        }
         // Wait for all ranks
         for (int i = 0; i < world_size; i++) {
             char p[256];
             snprintf(p, sizeof(p), "%s/barrier_%d", barrier_dir, i);
+            bool peer_ready = false;
             for (int w = 0; w < 6000; w++) {  // 60s timeout
                 FILE* f2 = fopen(p, "r");
-                if (f2) { fclose(f2); break; }
+                if (f2) { fclose(f2); peer_ready = true; break; }
                 usleep(10000);
+            }
+            if (!peer_ready) {
+                fprintf(stderr,
+                    "[parallel_nccl] rank %d timed out waiting for rank %d barrier\n",
+                    rank, i);
+                ctx->topology_invalid = true;
+                return -1;
             }
         }
     }
@@ -9245,6 +9484,7 @@ static int32_t qwen36_init_parallel_nccl_impl(
     ncclResult_t err = ncclCommInitRank(&comm, world_size, unique_id, rank);
     if (err != ncclSuccess) {
         fprintf(stderr, "[ep_nccl] ncclCommInitRank failed: %d (%s)\n", err, ncclGetErrorString(err));
+        ctx->topology_invalid = true;
         return -1;
     }
 
@@ -9255,67 +9495,124 @@ static int32_t qwen36_init_parallel_nccl_impl(
     // We store nullptr for stream — moe_forward will use getCurrentCUDAStream(dev).
     cudaStream_t nccl_stream = nullptr;  // nullptr = use default stream
 
-    // Store as process-level singleton
-    g_nccl_comm = comm;
-    g_nccl_stream = nccl_stream;
-    if (tp_size <= 0 || world_size % tp_size != 0) {
-        fprintf(stderr, "[tp_nccl] invalid TP_SIZE=%d for WORLD_SIZE=%d\n",
-            tp_size, world_size);
+    // A divergent axis size would make ranks execute different split counts
+    // and hang. Establish size consensus on the world communicator first.
+    try {
+        auto topology_sizes = at::tensor(
+            std::vector<int32_t>{tp_size, cp_size, ep_size, dp_size, pp_size},
+            at::TensorOptions().device(at::kCUDA, local_rank).dtype(at::kInt));
+        auto minimum_sizes = topology_sizes.clone();
+        auto maximum_sizes = topology_sizes.clone();
+        auto topology_stream =
+            c10::cuda::getCurrentCUDAStream(local_rank).stream();
+        const ncclResult_t min_error = ncclAllReduce(
+            minimum_sizes.data_ptr<int32_t>(), minimum_sizes.data_ptr<int32_t>(),
+            5, ncclInt32, ncclMin, comm, topology_stream);
+        const ncclResult_t max_error = ncclAllReduce(
+            maximum_sizes.data_ptr<int32_t>(), maximum_sizes.data_ptr<int32_t>(),
+            5, ncclInt32, ncclMax, comm, topology_stream);
+        if (min_error != ncclSuccess || max_error != ncclSuccess) {
+            fprintf(stderr,
+                "[parallel_nccl] topology size consensus failed: min=%s max=%s\n",
+                ncclGetErrorString(min_error), ncclGetErrorString(max_error));
+            ncclCommDestroy(comm);
+            ctx->topology_invalid = true;
+            return -1;
+        }
+        const auto minimum_cpu = minimum_sizes.to(at::kCPU);
+        const auto maximum_cpu = maximum_sizes.to(at::kCPU);
+        bool sizes_match = true;
+        for (int axis = 0; axis < 5; ++axis) {
+            sizes_match = sizes_match &&
+                minimum_cpu.data_ptr<int32_t>()[axis] ==
+                    maximum_cpu.data_ptr<int32_t>()[axis];
+        }
+        if (!sizes_match) {
+            fprintf(stderr,
+                "[parallel_nccl] TP/CP/EP/DP/PP sizes differ across ranks\n");
+            ncclCommDestroy(comm);
+            ctx->topology_invalid = true;
+            return -1;
+        }
+    } catch (const std::exception& error) {
+        fprintf(stderr,
+            "[parallel_nccl] topology size consensus threw an exception: %s\n",
+            error.what());
+        ncclCommDestroy(comm);
+        ctx->topology_invalid = true;
+        return -1;
+    } catch (...) {
+        fprintf(stderr,
+            "[parallel_nccl] topology size consensus threw an unknown exception\n");
+        ncclCommDestroy(comm);
+        ctx->topology_invalid = true;
         return -1;
     }
-    if (tp_size > 1) {
-        ncclResult_t tp_err = ncclCommSplit(
-            comm, tp_color, tp_rank, &g_tp_comm, nullptr);
-        if (tp_err != ncclSuccess) {
-            fprintf(stderr, "[tp_nccl] ncclCommSplit failed: %d (%s)\n",
-                tp_err, ncclGetErrorString(tp_err));
-            ncclCommDestroy(comm);
-            g_nccl_comm = nullptr;
-            return -1;
-        }
-        g_tp_stream = nccl_stream;
+
+    // Build every sub-communicator before publishing process-global state.
+    // All ranks use the same TP, CP, EP, DP, PP split order.
+    ncclComm_t tp_comm = nullptr;
+    ncclComm_t cp_comm = nullptr;
+    ncclComm_t ep_comm = nullptr;
+    ncclComm_t dp_comm = nullptr;
+    ncclComm_t pp_comm = nullptr;
+    auto destroy_local_communicators = [&]() {
+        if (pp_comm) ncclCommDestroy(pp_comm);
+        if (dp_comm) ncclCommDestroy(dp_comm);
+        if (ep_comm) ncclCommDestroy(ep_comm);
+        if (cp_comm) ncclCommDestroy(cp_comm);
+        if (tp_comm) ncclCommDestroy(tp_comm);
+        ncclCommDestroy(comm);
+    };
+    auto split_axis = [&](const char* axis, int size, int color, int key,
+                          ncclComm_t* output) {
+        if (size <= 1) return true;
+        const ncclResult_t split_error = ncclCommSplit(
+            comm, color, key, output, nullptr);
+        if (split_error == ncclSuccess) return true;
+        fprintf(stderr, "[%s_nccl] ncclCommSplit failed: %d (%s)\n",
+            axis, split_error, ncclGetErrorString(split_error));
+        return false;
+    };
+    if (!split_axis("tp", tp_size, tp_color, tp_rank, &tp_comm) ||
+        !split_axis("cp", cp_size, cp_color, cp_rank, &cp_comm) ||
+        !split_axis("ep", ep_size, ep_color, ep_rank, &ep_comm) ||
+        !split_axis("dp", dp_size, dp_color, dp_rank, &dp_comm) ||
+        !split_axis("pp", pp_size, pp_color, pp_rank, &pp_comm)) {
+        destroy_local_communicators();
+        ctx->topology_invalid = true;
+        return -1;
     }
-    if (ep_size > 1) {
-        ncclResult_t ep_err = ncclCommSplit(
-            comm, ep_color, ep_rank, &g_ep_comm, nullptr);
-        if (ep_err != ncclSuccess) {
-            fprintf(stderr, "[ep_nccl] ncclCommSplit failed: %d (%s)\n",
-                ep_err, ncclGetErrorString(ep_err));
-            if (g_tp_comm) ncclCommDestroy(g_tp_comm);
-            ncclCommDestroy(comm);
-            g_tp_comm = nullptr;
-            g_nccl_comm = nullptr;
-            return -1;
-        }
-        g_ep_stream = nccl_stream;
-    }
-    if (dp_size > 1) {
-        ncclResult_t dp_err = ncclCommSplit(
-            comm, dp_color, dp_rank, &g_dp_comm, nullptr);
-        if (dp_err != ncclSuccess) {
-            fprintf(stderr, "[dp_nccl] ncclCommSplit failed: %d (%s)\n",
-                dp_err, ncclGetErrorString(dp_err));
-            if (g_ep_comm) ncclCommDestroy(g_ep_comm);
-            if (g_tp_comm) ncclCommDestroy(g_tp_comm);
-            ncclCommDestroy(comm);
-            g_ep_comm = nullptr;
-            g_tp_comm = nullptr;
-            g_nccl_comm = nullptr;
-            return -1;
-        }
-        g_dp_stream = nccl_stream;
-    }
+
+    g_nccl_comm = comm;
+    g_nccl_stream = nccl_stream;
+    g_tp_comm = tp_comm;
+    g_tp_stream = nccl_stream;
+    g_cp_comm = cp_comm;
+    g_cp_stream = nccl_stream;
+    g_ep_comm = ep_comm;
+    g_ep_stream = nccl_stream;
+    g_dp_comm = dp_comm;
+    g_dp_stream = nccl_stream;
+    g_pp_comm = pp_comm;
+    g_pp_stream = nccl_stream;
     g_parallel_rank = rank;
     g_parallel_world_size = world_size;
     g_parallel_tp_rank = tp_rank;
     g_parallel_tp_size = tp_size;
     g_parallel_tp_color = tp_color;
+    g_parallel_cp_rank = cp_rank;
+    g_parallel_cp_size = cp_size;
+    g_parallel_cp_color = cp_color;
     g_parallel_ep_rank = ep_rank;
     g_parallel_ep_size = ep_size;
     g_parallel_ep_color = ep_color;
     g_parallel_dp_rank = dp_rank;
     g_parallel_dp_size = dp_size;
     g_parallel_dp_color = dp_color;
+    g_parallel_pp_rank = pp_rank;
+    g_parallel_pp_size = pp_size;
+    g_parallel_pp_color = pp_color;
     g_nccl_initialized = true;
     if (!g_nccl_cleanup_registered) {
         std::atexit(qwen36_destroy_process_communicators);
@@ -9336,6 +9633,14 @@ static int32_t qwen36_init_parallel_nccl_impl(
     ctx->tp_rank = tp_rank;
     ctx->tp_comm = tp_size > 1 ? g_tp_comm : nullptr;
     ctx->tp_stream = tp_size > 1 ? g_tp_stream : nullptr;
+    ctx->cp_world_size = cp_size;
+    ctx->cp_rank = cp_rank;
+    ctx->cp_comm = cp_size > 1 ? g_cp_comm : nullptr;
+    ctx->cp_stream = cp_size > 1 ? g_cp_stream : nullptr;
+    ctx->pp_world_size = pp_size;
+    ctx->pp_rank = pp_rank;
+    ctx->pp_comm = pp_size > 1 ? g_pp_comm : nullptr;
+    ctx->pp_stream = pp_size > 1 ? g_pp_stream : nullptr;
 
     // Propagate to layer configs
     void* layer_comm = ep_size > 1 ? (void*)g_ep_comm : nullptr;
@@ -9356,6 +9661,36 @@ static int32_t qwen36_init_parallel_nccl_impl(
     return 0;
 }
 
+__attribute__((visibility("default"))) int32_t qwen36_init_parallel_nccl_v2(
+    void* ctx_ptr,
+    int32_t rank, int32_t world_size,
+    int32_t tp_rank, int32_t tp_size, int32_t tp_color,
+    int32_t cp_rank, int32_t cp_size, int32_t cp_color,
+    int32_t ep_rank, int32_t ep_size, int32_t ep_color,
+    int32_t dp_rank, int32_t dp_size, int32_t dp_color,
+    int32_t pp_rank, int32_t pp_size, int32_t pp_color
+) {
+    auto* ctx = reinterpret_cast<TrainingContext*>(ctx_ptr);
+    try {
+        return qwen36_init_parallel_nccl_impl(
+            ctx_ptr, rank, world_size,
+            tp_rank, tp_size, tp_color,
+            cp_rank, cp_size, cp_color,
+            ep_rank, ep_size, ep_color,
+            dp_rank, dp_size, dp_color,
+            pp_rank, pp_size, pp_color,
+            /*synchronize_parameters=*/true);
+    } catch (const std::exception& error) {
+        fprintf(stderr, "[parallel_nccl] initialization failed: %s\n", error.what());
+    } catch (...) {
+        fprintf(stderr, "[parallel_nccl] initialization failed with an unknown exception\n");
+    }
+    if (ctx) ctx->topology_invalid = true;
+    return -1;
+}
+
+// ABI25-compatible three-axis wrapper. ABI26 callers use the five-axis v2
+// entry point; retaining this symbol keeps native TP/EP/DP diagnostics simple.
 __attribute__((visibility("default"))) int32_t qwen36_init_parallel_nccl(
     void* ctx_ptr,
     int32_t rank, int32_t world_size,
@@ -9363,17 +9698,53 @@ __attribute__((visibility("default"))) int32_t qwen36_init_parallel_nccl(
     int32_t ep_rank, int32_t ep_size, int32_t ep_color,
     int32_t dp_rank, int32_t dp_size, int32_t dp_color
 ) {
-    return qwen36_init_parallel_nccl_impl(
+    return qwen36_init_parallel_nccl_v2(
         ctx_ptr, rank, world_size,
         tp_rank, tp_size, tp_color,
+        0, 1, 0,
         ep_rank, ep_size, ep_color,
         dp_rank, dp_size, dp_color,
-        /*synchronize_parameters=*/true);
+        0, 1, 0);
 }
 
 // Attach a shadow restore context to process-cached communicators without
 // broadcasting its temporary random LoRA initialization. Checkpoint tensors
 // replace every active parameter before the context can become live.
+__attribute__((visibility("default"))) int32_t
+qwen36_attach_parallel_nccl_no_sync_v2(
+    void* ctx_ptr,
+    int32_t rank, int32_t world_size,
+    int32_t tp_rank, int32_t tp_size, int32_t tp_color,
+    int32_t cp_rank, int32_t cp_size, int32_t cp_color,
+    int32_t ep_rank, int32_t ep_size, int32_t ep_color,
+    int32_t dp_rank, int32_t dp_size, int32_t dp_color,
+    int32_t pp_rank, int32_t pp_size, int32_t pp_color
+) {
+    auto* ctx = reinterpret_cast<TrainingContext*>(ctx_ptr);
+    if (world_size > 1 && !g_nccl_initialized) {
+        fprintf(stderr,
+            "[parallel_nccl] restore attach requires initialized process communicators\n");
+        if (ctx) ctx->topology_invalid = true;
+        return -1;
+    }
+    try {
+        return qwen36_init_parallel_nccl_impl(
+            ctx_ptr, rank, world_size,
+            tp_rank, tp_size, tp_color,
+            cp_rank, cp_size, cp_color,
+            ep_rank, ep_size, ep_color,
+            dp_rank, dp_size, dp_color,
+            pp_rank, pp_size, pp_color,
+            /*synchronize_parameters=*/false);
+    } catch (const std::exception& error) {
+        fprintf(stderr, "[parallel_nccl] restore attach failed: %s\n", error.what());
+    } catch (...) {
+        fprintf(stderr, "[parallel_nccl] restore attach failed with an unknown exception\n");
+    }
+    if (ctx) ctx->topology_invalid = true;
+    return -1;
+}
+
 __attribute__((visibility("default"))) int32_t qwen36_attach_parallel_nccl_no_sync(
     void* ctx_ptr,
     int32_t rank, int32_t world_size,
@@ -9381,27 +9752,40 @@ __attribute__((visibility("default"))) int32_t qwen36_attach_parallel_nccl_no_sy
     int32_t ep_rank, int32_t ep_size, int32_t ep_color,
     int32_t dp_rank, int32_t dp_size, int32_t dp_color
 ) {
-    if (world_size > 1 && !g_nccl_initialized) {
-        fprintf(stderr,
-            "[parallel_nccl] restore attach requires initialized process communicators\n");
-        return -1;
-    }
-    return qwen36_init_parallel_nccl_impl(
+    return qwen36_attach_parallel_nccl_no_sync_v2(
         ctx_ptr, rank, world_size,
         tp_rank, tp_size, tp_color,
+        0, 1, 0,
         ep_rank, ep_size, ep_color,
         dp_rank, dp_size, dp_color,
-        /*synchronize_parameters=*/false);
+        0, 1, 0);
 }
 
 __attribute__((visibility("default"))) int32_t qwen36_init_nccl(
     void* ctx_ptr
 ) {
+    auto* ctx = reinterpret_cast<TrainingContext*>(ctx_ptr);
+    if (!ctx) return -1;
     const char* rank_str = getenv("RANK");
     const char* world_str = getenv("WORLD_SIZE");
-    if (!rank_str || !world_str) return -1;
+    if (!rank_str || !world_str) {
+        ctx->topology_invalid = true;
+        return -1;
+    }
     const int rank = atoi(rank_str);
     const int world_size = atoi(world_str);
+    const char* cp_size_str = getenv("CP_SIZE");
+    if (!cp_size_str) cp_size_str = getenv("RUSTRAIN_CP_SIZE");
+    const char* pp_size_str = getenv("PP_SIZE");
+    if (!pp_size_str) pp_size_str = getenv("RUSTRAIN_PP_SIZE");
+    if ((cp_size_str && atoi(cp_size_str) != 1) ||
+        (pp_size_str && atoi(pp_size_str) != 1)) {
+        fprintf(stderr,
+            "[parallel_nccl] qwen36_init_nccl only supports singleton CP/PP; "
+            "use qwen36_init_parallel_nccl_v2\n");
+        ctx->topology_invalid = true;
+        return -1;
+    }
     const char* tp_size_str = getenv("TP_SIZE");
     if (!tp_size_str) tp_size_str = getenv("RUSTRAIN_TP_SIZE");
     const int tp_size = tp_size_str ? atoi(tp_size_str) : 1;
@@ -9420,12 +9804,13 @@ __attribute__((visibility("default"))) int32_t qwen36_init_nccl(
         ? (rank / tp_size) % ep_size : 0;
     const int dp_rank = tp_size > 0 && ep_size > 0
         ? rank / (tp_size * ep_size) : 0;
-    return qwen36_init_parallel_nccl_impl(
+    return qwen36_init_parallel_nccl_v2(
         ctx_ptr, rank, world_size,
         tp_rank, tp_size, rank / std::max(tp_size, 1),
+        0, 1, 0,
         ep_rank, ep_size, dp_rank * std::max(tp_size, 1) + tp_rank,
         dp_rank, dp_size, ep_rank * std::max(tp_size, 1) + tp_rank,
-        /*synchronize_parameters=*/true);
+        0, 1, 0);
 }
 
 // Set NCCL communicator for Expert Parallel all-reduce (legacy, from Rust)
@@ -9435,12 +9820,14 @@ __attribute__((visibility("default"))) void qwen36_set_nccl_comm(
 ) {
     auto* ctx = reinterpret_cast<TrainingContext*>(ctx_ptr);
     ctx->data_parallel = env_enabled("RUSTRAIN_DATA_PARALLEL");
-    if (ctx->tp_world_size <= 0 || ctx->tp_world_size > 1) {
+    if (ctx->tp_world_size <= 0 || ctx->tp_world_size > 1 ||
+        ctx->cp_world_size != 1 || ctx->pp_world_size != 1) {
         ctx->topology_invalid = true;
         fprintf(stderr,
-            "[parallel_nccl] legacy setter only supports TP_SIZE=1: "
-            "TP_SIZE=%d WORLD_SIZE=%d DATA_PARALLEL=%d\n",
-            ctx->tp_world_size, ep_world_size, ctx->data_parallel ? 1 : 0);
+            "[parallel_nccl] legacy setter only supports singleton TP/CP/PP: "
+            "TP_SIZE=%d CP_SIZE=%d PP_SIZE=%d WORLD_SIZE=%d DATA_PARALLEL=%d\n",
+            ctx->tp_world_size, ctx->cp_world_size, ctx->pp_world_size,
+            ep_world_size, ctx->data_parallel ? 1 : 0);
         return;
     }
     if (ctx->data_parallel) {
@@ -10033,7 +10420,7 @@ double qwen36_eval_step(void* ctx_ptr, void* input_ids_ptr, void* target_mask_pt
                 ctx->lora_batch_valid = false;
             }
         } cache_guard{ctx};
-        TORCH_CHECK(ctx, "null training context");
+        validate_native_execution_topology(ctx);
         TORCH_CHECK(ctx->adapters.empty(),
             "dynamic LoRA adapters require selected multi-LoRA evaluation; "
             "ordinary eval_step has no tenant mapping");
@@ -10094,6 +10481,7 @@ double qwen36_train_step_host_i64(
 ) {
     try {
         auto* ctx = reinterpret_cast<TrainingContext*>(ctx_ptr);
+        validate_native_execution_topology(ctx);
         auto input = qwen36_copy_host_i64_batch(
             ctx, input_ids, batch_size, seq_len, "host train input_ids");
         auto targets = qwen36_copy_host_i64_batch(
@@ -10123,6 +10511,7 @@ double qwen36_train_multi_lora_host_i64(
     try {
         (void)lora_rank;  // Retained for the ABI22 host wire contract.
         auto* ctx = reinterpret_cast<TrainingContext*>(ctx_ptr);
+        validate_native_execution_topology(ctx);
         TORCH_CHECK(n_adapter_ids >= 0,
             "host multi-LoRA adapter count must be non-negative");
         TORCH_CHECK(n_adapter_ids == 0 || n_adapter_ids == n_total,
@@ -10175,6 +10564,7 @@ int32_t qwen36_train_multi_lora_host_i64_v2(
     try {
         (void)lora_rank;
         auto* ctx = reinterpret_cast<TrainingContext*>(ctx_ptr);
+        validate_native_execution_topology(ctx);
         TORCH_CHECK(n_adapter_ids > 0 && n_adapter_ids == n_total,
             "host multi-LoRA loss report requires every selected adapter ID");
         TORCH_CHECK(adapter_ids,
@@ -10209,6 +10599,7 @@ double qwen36_eval_step_host_i64(
 ) {
     try {
         auto* ctx = reinterpret_cast<TrainingContext*>(ctx_ptr);
+        validate_native_execution_topology(ctx);
         auto input = qwen36_copy_host_i64_batch(
             ctx, input_ids, batch_size, seq_len, "host eval input_ids");
         auto targets = qwen36_copy_host_i64_batch(

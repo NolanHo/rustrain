@@ -23,8 +23,12 @@ case "$mode" in
         test_name=native_tp_ep_bench
         test_source=crates/rustrain-qwen3-6/tests/native_tp_ep_bench.cpp
         ;;
+    pp-cp-comm-smoke)
+        test_name=native_pp_cp_comm_smoke
+        test_source=crates/rustrain-qwen3-6/tests/native_pp_cp_comm_smoke.cpp
+        ;;
     *)
-        echo "usage: $0 [local-smoke|smoke|gpu-metadata-smoke|tri-smoke|tri-replicated-smoke|ep-smoke|ep-bench|bench]" >&2
+        echo "usage: $0 [local-smoke|smoke|gpu-metadata-smoke|tri-smoke|tri-replicated-smoke|ep-smoke|ep-bench|bench|pp-cp-comm-smoke]" >&2
         exit 2
         ;;
 esac
@@ -184,11 +188,18 @@ fi
 
 cu13_lib="$site_packages/nvidia/cu13/lib"
 export LD_LIBRARY_PATH="$native_dir:$torch_lib:$nccl_lib:$cuda_home/lib64:$cu13_lib:${LD_LIBRARY_PATH:-}"
-export RUSTRAIN_NCCL_RUN_ID="${RUSTRAIN_NCCL_RUN_ID:-qwen36-tp-ep-$$}"
+if [[ -z "${RUSTRAIN_NCCL_RUN_ID:-}" &&
+      ( -z "${RUSTRAIN_RUN_ID:-}" || -z "${RUSTRAIN_ATTEMPT_ID:-}" ) ]]; then
+    export RUSTRAIN_NCCL_RUN_ID="qwen36-tp-ep-$$"
+fi
 
 if [[ "$mode" == "local-smoke" ]]; then
     WORLD_SIZE=1 RANK=0 LOCAL_RANK=0 TP_SIZE=1 EP_SIZE=1 DP_SIZE=1 \
         "$test_bin"
+elif [[ "$mode" == "pp-cp-comm-smoke" ]]; then
+    TP_SIZE=1 CP_SIZE=2 EP_SIZE=1 DP_SIZE=1 PP_SIZE=2 \
+        "$python_bin" -m torch.distributed.run --standalone \
+            --nnodes=1 --nproc-per-node=4 --no-python "$test_bin"
 elif [[ "$mode" == "tri-smoke" || "$mode" == "tri-replicated-smoke" ]]; then
     sharded_a2a=1
     if [[ "$mode" == "tri-replicated-smoke" ]]; then

@@ -236,7 +236,7 @@ static FullReference run_full_reference(
 }
 
 int main() {
-    assert(qwen36_kernel_abi_version() == 25);
+    assert(qwen36_kernel_abi_version() == 26);
     const int rank = std::atoi(std::getenv("RANK"));
     const int world = std::atoi(std::getenv("WORLD_SIZE"));
     const int local_rank = std::atoi(

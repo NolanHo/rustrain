@@ -501,6 +501,8 @@ fn train_impl(
                 .to_string(),
         );
         std::env::set_var("DP_SIZE", dp_size.to_string());
+        std::env::set_var("CP_SIZE", "1");
+        std::env::set_var("PP_SIZE", "1");
         std::env::set_var(
             "RUSTRAIN_DATA_PARALLEL",
             if is_data_parallel { "1" } else { "0" },
@@ -516,6 +518,16 @@ fn train_impl(
         .map(|topology| topology.data_rank(rank))
         .transpose()?
         .unwrap_or(0);
+    let cp_rank = parallel_topology
+        .as_ref()
+        .map(|topology| topology.context_rank(rank))
+        .transpose()?
+        .unwrap_or(0);
+    let pp_rank = parallel_topology
+        .as_ref()
+        .map(|topology| topology.pipeline_rank(rank))
+        .transpose()?
+        .unwrap_or(0);
     let ep_rank = parallel_topology
         .as_ref()
         .map(|topology| topology.expert_rank(rank))
@@ -528,8 +540,10 @@ fn train_impl(
     let is_expert_parallel = ep_size > 1;
     unsafe {
         std::env::set_var("RUSTRAIN_TP_RANK", tp_rank.to_string());
+        std::env::set_var("RUSTRAIN_CP_RANK", cp_rank.to_string());
         std::env::set_var("RUSTRAIN_EP_RANK", ep_rank.to_string());
         std::env::set_var("RUSTRAIN_DP_RANK", dp_rank.to_string());
+        std::env::set_var("RUSTRAIN_PP_RANK", pp_rank.to_string());
     }
     if is_data_parallel || is_expert_parallel || tp_size > 1 {
         crate::kernel::CppTrainingContext::set_cuda_device(
@@ -813,14 +827,24 @@ fn train_impl(
                 .iter()
                 .min()
                 .ok_or_else(|| anyhow!("empty EP process group"))?;
+            let cp_color = *topology
+                .context_group(rank)?
+                .iter()
+                .min()
+                .ok_or_else(|| anyhow!("empty CP process group"))?;
             let dp_color = *topology
                 .data_group(rank)?
                 .iter()
                 .min()
                 .ok_or_else(|| anyhow!("empty DP process group"))?;
+            let pp_color = *topology
+                .pipeline_group(rank)?
+                .iter()
+                .min()
+                .ok_or_else(|| anyhow!("empty PP process group"))?;
             ctx.init_parallel_nccl(
-                rank, world_size, tp_rank, tp_size, tp_color, ep_rank, ep_size, ep_color, dp_rank,
-                dp_size, dp_color,
+                rank, world_size, tp_rank, tp_size, tp_color, cp_rank, 1, cp_color, ep_rank,
+                ep_size, ep_color, dp_rank, dp_size, dp_color, pp_rank, 1, pp_color,
             )?;
         } else {
             let ret = ctx.init_nccl();
