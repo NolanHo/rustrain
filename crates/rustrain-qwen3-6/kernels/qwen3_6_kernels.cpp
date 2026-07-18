@@ -6318,11 +6318,17 @@ __attribute__((visibility("default"))) double qwen36_train_multi_lora(
         TORCH_CHECK(n_total > 0 && total_adapters == n_total,
             "n_total must equal the number of registered adapters (n_total=",
             n_total, ", registered=", total_adapters, ")");
+        const auto& reference_adapter = ctx->adapters.front();
         for (const auto& adapter : ctx->adapters) {
             TORCH_CHECK(adapter.rank == lora_rank,
                 "lora_rank argument must match every registered adapter; adapter=",
                 adapter.id, " registered_rank=", adapter.rank,
                 " requested_rank=", lora_rank);
+            TORCH_CHECK(
+                adapter.target_layers == reference_adapter.target_layers &&
+                    adapter.target_modules == reference_adapter.target_modules,
+                "legacy multi-LoRA training requires homogeneous target layers/modules; "
+                "use the grouped v2 trainer for heterogeneous adapters");
         }
         TORCH_CHECK(!ctx->has_mtp || env_enabled("QWEN36_DISABLE_MTP"),
             "dynamic multi-LoRA with MTP is not supported until main and MTP "
@@ -7317,8 +7323,10 @@ int64_t qwen36_add_lora(
         }
         // The activation-level batch path stacks A/B across adapters. Keep
         // the batch rectangular and semantically aligned instead of waiting
-        // for an opaque ATen stack/shape failure during the first step.
-        if (!ctx->adapters.empty()) {
+        // for an opaque ATen stack/shape failure during the first step. A
+        // restore context hydrates each adapter independently and may contain
+        // heterogeneous signatures before the grouped v2 trainer is enabled.
+        if (!ctx->adapters.empty() && !ctx->restore_without_parameter_sync) {
             const auto& reference = ctx->adapters.front();
             TORCH_CHECK(rank == reference.rank,
                 "dynamic LoRA adapters in one batch must use the same rank");

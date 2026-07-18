@@ -60,6 +60,9 @@ extern "C" double qwen36_eval_step_host_i64(
     void*, const int64_t*, const int64_t*, const int64_t*, int64_t, int64_t);
 extern "C" int64_t qwen36_add_lora(
     void*, int64_t, double, const int64_t*, int64_t, const char*);
+extern "C" int64_t qwen36_add_lora_for_restore(
+    void*, int64_t, double, const int64_t*, int64_t, const char*);
+extern "C" int32_t qwen36_remove_lora(void*, int64_t);
 extern "C" void* qwen36_get_adapter_lora_tensor(
     void*, int64_t, int64_t, const char*, int32_t);
 extern "C" int32_t qwen36_set_adapter_lora_tensor(
@@ -716,6 +719,23 @@ int main() {
     assert((*dynamic_b_two - empty_tenant_b_before).abs().max().item<double>() == 0.0);
     assert((*empty_tenant_m - empty_tenant_m_before).abs().max().item<double>() == 0.0);
     assert((*empty_tenant_v - empty_tenant_v_before).abs().max().item<double>() == 0.0);
+    assert(qwen36_add_lora(
+        ctx, rank + 1, 12.0, &target_layer, 1, "q_proj") < 0);
+    const int64_t heterogeneous_restore = qwen36_add_lora_for_restore(
+        ctx, rank + 1, 12.0, &target_layer, 1, "q_proj");
+    assert(heterogeneous_restore > 0);
+    assert(qwen36_get_adapter_lora_tensor(
+        ctx, heterogeneous_restore, 0, "q_proj", 0) != nullptr);
+    assert(qwen36_remove_lora(ctx, heterogeneous_restore) == 1);
+    const int64_t heterogeneous_target_restore = qwen36_add_lora_for_restore(
+        ctx, rank, 12.0, &target_layer, 1, "q_proj");
+    assert(heterogeneous_target_restore > 0);
+    assert(qwen36_train_multi_lora(
+        ctx, &multi_input_ids, &multi_target_mask, &multi_attention_mask,
+        3, rank) < 0.0);
+    assert(qwen36_get_adapter_step_count(ctx, adapter_one) == 3);
+    assert(qwen36_get_adapter_step_count(ctx, adapter_two) == 1);
+    assert(qwen36_remove_lora(ctx, heterogeneous_target_restore) == 1);
     qwen36_free_training_context(ctx);
 
     // Dense Qwen3.5 variants use the same per-sample activation path for

@@ -42,6 +42,24 @@ fn validate_tp_intermediate_sizes(tp_size: usize, sizes: &[(&str, i64)]) -> Resu
     Ok(())
 }
 
+fn validate_dynamic_adapter_manifests<'a>(
+    manifests: impl IntoIterator<Item = &'a checkpoint::DynamicAdapterManifest>,
+) -> Result<()> {
+    let mut adapter_ids = std::collections::BTreeSet::new();
+    for manifest in manifests {
+        if manifest.id <= 0 || !adapter_ids.insert(manifest.id) {
+            bail!("checkpoint dynamic adapter IDs must be positive and unique");
+        }
+        if i64::try_from(manifest.optimizer_step).is_err() {
+            bail!(
+                "dynamic adapter {} optimizer step exceeds native range",
+                manifest.id
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Session states.
 #[derive(Debug, Clone)]
 pub enum SessionState {
@@ -1527,32 +1545,13 @@ impl TrainingSession for Qwen36Session {
                 )?;
             }
         }
-        let mut dynamic_ids = std::collections::BTreeSet::new();
-        let mut dynamic_signature: Option<&checkpoint::DynamicAdapterManifest> = None;
+        validate_dynamic_adapter_manifests(
+            data.dynamic_adapters
+                .iter()
+                .map(|dynamic| &dynamic.manifest),
+        )?;
         for dynamic in &data.dynamic_adapters {
             let manifest = &dynamic.manifest;
-            if manifest.id <= 0 || !dynamic_ids.insert(manifest.id) {
-                bail!("checkpoint dynamic adapter IDs must be positive and unique");
-            }
-            if i64::try_from(manifest.optimizer_step).is_err() {
-                bail!(
-                    "dynamic adapter {} optimizer step exceeds native range",
-                    manifest.id
-                );
-            }
-            if let Some(reference) = dynamic_signature {
-                if manifest.rank != reference.rank
-                    || manifest.alpha.to_bits() != reference.alpha.to_bits()
-                    || manifest.target_layers != reference.target_layers
-                    || manifest.target_modules != reference.target_modules
-                {
-                    bail!(
-                        "dynamic checkpoint adapters must share rank, alpha, target layers, and target modules"
-                    );
-                }
-            } else {
-                dynamic_signature = Some(manifest);
-            }
             let target_modules = manifest
                 .target_modules
                 .iter()
@@ -2073,7 +2072,53 @@ impl TrainingSession for Qwen36Session {
 
 #[cfg(test)]
 mod tests {
-    use super::{validate_qwen_parallel_features, validate_tp_intermediate_sizes};
+    use super::{
+        validate_dynamic_adapter_manifests, validate_qwen_parallel_features,
+        validate_tp_intermediate_sizes,
+    };
+    use rustrain_qwen3_6::checkpoint::DynamicAdapterManifest;
+
+    fn dynamic_manifest(
+        id: i64,
+        rank: i64,
+        alpha: f64,
+        target_modules: &[&str],
+    ) -> DynamicAdapterManifest {
+        DynamicAdapterManifest {
+            id,
+            rank,
+            alpha,
+            optimizer_step: id as u64,
+            target_layers: vec![0],
+            target_modules: target_modules
+                .iter()
+                .map(|module| (*module).to_string())
+                .collect(),
+            shard_layouts: Vec::new(),
+            slot_identities: Vec::new(),
+            parameter_count: 1,
+            optimizer_count: 2,
+        }
+    }
+
+    #[test]
+    fn checkpoint_dynamic_manifests_allow_heterogeneous_signatures() {
+        let manifests = [
+            dynamic_manifest(1, 4, 8.0, &["q_proj", "v_proj"]),
+            dynamic_manifest(2, 16, 32.0, &["down_proj"]),
+        ];
+        validate_dynamic_adapter_manifests(manifests.iter()).unwrap();
+    }
+
+    #[test]
+    fn checkpoint_dynamic_manifests_reject_duplicate_ids() {
+        let manifests = [
+            dynamic_manifest(7, 4, 8.0, &["q_proj"]),
+            dynamic_manifest(7, 8, 16.0, &["down_proj"]),
+        ];
+        let error = validate_dynamic_adapter_manifests(manifests.iter()).unwrap_err();
+        assert!(error.to_string().contains("positive and unique"));
+    }
 
     #[test]
     fn source_sharded_moe_tp_ep_is_supported() {
