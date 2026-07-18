@@ -70,6 +70,8 @@ extern "C" void* qwen36_get_adapter_optimizer_tensor(
 extern "C" int32_t qwen36_set_adapter_optimizer_tensor(
     void*, int64_t, int64_t, const char*, int32_t, int32_t, void*);
 extern "C" int64_t qwen36_get_adapter_step_count(void*, int64_t);
+extern "C" int64_t qwen36_get_dynamic_finalizer_count(void*);
+extern "C" int64_t qwen36_get_dynamic_adam_launch_count(void*);
 extern "C" int32_t qwen36_set_adapter_step_count(
     void*, int64_t, int64_t);
 extern "C" double qwen36_train_multi_lora_selected(
@@ -80,7 +82,7 @@ extern "C" void qwen36_free_training_context(void*);
 
 namespace {
 
-constexpr int64_t kAbiVersion = 23;
+constexpr int64_t kAbiVersion = 24;
 constexpr int32_t kBaseTpAttention = 1 << 0;
 constexpr int32_t kDataParallel = 1 << 1;
 constexpr int32_t kVocabParallel = 1 << 2;
@@ -1247,6 +1249,10 @@ int main() {
     const int64_t heterogeneous_ids[] = {tenant_one, heterogeneous_tenant};
     const int64_t tenant_one_step_before =
         qwen36_get_adapter_step_count(distributed, tenant_one);
+    const int64_t finalizers_before_heterogeneous =
+        qwen36_get_dynamic_finalizer_count(distributed);
+    const int64_t adam_launches_before_heterogeneous =
+        qwen36_get_dynamic_adam_launch_count(distributed);
 
     if (rank == 0)
         setenv("QWEN36_TEST_FAIL_HETERO_GROUP_AFTER", "1", 1);
@@ -1260,6 +1266,27 @@ int main() {
     assert(qwen36_get_adapter_step_count(distributed, heterogeneous_tenant) == 0);
     assert(max_diff(*homogeneous_b, homogeneous_before) == 0.0);
     assert(max_diff(*heterogeneous_b, heterogeneous_before) == 0.0);
+    assert(qwen36_get_dynamic_finalizer_count(distributed) ==
+        finalizers_before_heterogeneous);
+    assert(qwen36_get_dynamic_adam_launch_count(distributed) ==
+        adam_launches_before_heterogeneous);
+
+    if (rank == 0)
+        setenv("QWEN36_TEST_FAIL_FINALIZER_BEFORE_TOKEN_PREFLIGHT", "1", 1);
+    assert(qwen36_train_multi_lora_selected_v2(
+        distributed, &local_batch.input_ids, &local_batch.target_mask,
+        &local_batch.attention_mask, heterogeneous_ids, 2) < 0.0);
+    if (rank == 0)
+        unsetenv("QWEN36_TEST_FAIL_FINALIZER_BEFORE_TOKEN_PREFLIGHT");
+    assert(qwen36_get_adapter_step_count(distributed, tenant_one) ==
+        tenant_one_step_before);
+    assert(qwen36_get_adapter_step_count(distributed, heterogeneous_tenant) == 0);
+    assert(max_diff(*homogeneous_b, homogeneous_before) == 0.0);
+    assert(max_diff(*heterogeneous_b, heterogeneous_before) == 0.0);
+    assert(qwen36_get_dynamic_finalizer_count(distributed) ==
+        finalizers_before_heterogeneous + 1);
+    assert(qwen36_get_dynamic_adam_launch_count(distributed) ==
+        adam_launches_before_heterogeneous);
 
     if (rank == 0)
         setenv("QWEN36_TEST_FAIL_DYNAMIC_ADAM_BEFORE_COMMIT", "1", 1);
@@ -1273,6 +1300,10 @@ int main() {
     assert(qwen36_get_adapter_step_count(distributed, heterogeneous_tenant) == 0);
     assert(max_diff(*homogeneous_b, homogeneous_before) == 0.0);
     assert(max_diff(*heterogeneous_b, heterogeneous_before) == 0.0);
+    assert(qwen36_get_dynamic_finalizer_count(distributed) ==
+        finalizers_before_heterogeneous + 2);
+    assert(qwen36_get_dynamic_adam_launch_count(distributed) ==
+        adam_launches_before_heterogeneous + 1);
 
     const double heterogeneous_loss = qwen36_train_multi_lora_selected_v2(
         distributed, &local_batch.input_ids, &local_batch.target_mask,
@@ -1281,6 +1312,10 @@ int main() {
     assert(qwen36_get_adapter_step_count(distributed, tenant_one) ==
         tenant_one_step_before + 1);
     assert(qwen36_get_adapter_step_count(distributed, heterogeneous_tenant) == 1);
+    assert(qwen36_get_dynamic_finalizer_count(distributed) ==
+        finalizers_before_heterogeneous + 3);
+    assert(qwen36_get_dynamic_adam_launch_count(distributed) ==
+        adam_launches_before_heterogeneous + 2);
     assert(update_norm(*homogeneous_b, homogeneous_before) > 0.0);
     assert(update_norm(*heterogeneous_b, heterogeneous_before) > 0.0);
     std::printf(

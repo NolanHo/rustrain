@@ -2195,6 +2195,8 @@ struct TrainingContext {
     std::vector<LoRAAdapter> adapters;
     int64_t next_adapter_id = 0;
     int64_t multi_lora_invocation = 0;
+    int64_t dynamic_finalizer_count = 0;
+    int64_t dynamic_adam_launch_count = 0;
     bool restore_without_parameter_sync = false;
     bool allow_heterogeneous_registration = false;
 
@@ -3035,7 +3037,8 @@ static void synchronize_lora_gradients(
     TrainingContext* ctx, const at::Tensor& target_mask,
     double accumulated_token_weight = 0.0,
     const at::Tensor* per_adapter_token_counts = nullptr,
-    std::vector<uint8_t>* adapter_has_global_tokens = nullptr
+    std::vector<uint8_t>* adapter_has_global_tokens = nullptr,
+    bool adapter_token_counts_prevalidated = false
 ) {
     const bool sharded_a2a = ctx->expert_parallel && ctx->nccl_comm &&
         env_enabled("QWEN36_EP_A2A_SHARDED");
@@ -3075,10 +3078,12 @@ static void synchronize_lora_gradients(
             "dynamic LoRA token-count vector must match adapter registry");
         local_adapter_weights = per_adapter_token_counts->to(at::kFloat)
             .contiguous();
-        TORCH_CHECK(at::isfinite(local_adapter_weights).all().item<bool>(),
-            "dynamic LoRA token counts must be finite");
-        TORCH_CHECK((local_adapter_weights >= 0).all().item<bool>(),
-            "dynamic LoRA token counts must be non-negative");
+        if (!adapter_token_counts_prevalidated) {
+            TORCH_CHECK(at::logical_and(
+                    at::isfinite(local_adapter_weights),
+                    local_adapter_weights >= 0).all().item<bool>(),
+                "dynamic LoRA token counts must be finite and non-negative");
+        }
         global_adapter_weights = normalization_allreduce
             ? sum_replica_axes(local_adapter_weights, sharded_a2a)
             : local_adapter_weights;
@@ -5342,7 +5347,7 @@ static at::Tensor mtp_compute_loss(
 extern "C" {
 
 __attribute__((visibility("default"))) int64_t qwen36_kernel_abi_version() {
-    return 23;
+    return 24;
 }
 
 // Benchmark/metrics helper. The orthogonal EP, DP, and TP reductions propagate
@@ -6332,25 +6337,39 @@ static int64_t compute_n_max(
     return n_max < 1 ? 1 : n_max;
 }
 
-/// Train all adapters in chunks. Each chunk: independent forward → loss → backward → Adam.
-/// Inputs may be [1, seq] (shared prompt, repeated per chunk) or
-/// [n_total, seq] (one independent sample per adapter).
-__attribute__((visibility("default"))) double qwen36_train_multi_lora(
+enum class DynamicMultiLoraMode {
+    TrainAndFinalize,
+    TrainOnly,
+    FinalizeOnly,
+};
+
+/// Train all adapters in chunks. Inputs may be [1, seq] (shared prompt,
+/// repeated per chunk) or [n_total, seq] (one independent sample per adapter).
+/// Heterogeneous selected training reuses the same implementation in two
+/// phases so all signature groups share one synchronization/Adam boundary.
+static double qwen36_train_multi_lora_impl(
     void* ctx_ptr,
     void* input_ids_ptr,
     void* target_mask_ptr,
     void* attention_mask_ptr,
     int32_t n_total,
-    int32_t lora_rank
+    int32_t lora_rank,
+    DynamicMultiLoraMode mode,
+    int32_t* finalizer_phase = nullptr
 ) {
     try {
         auto* ctx = reinterpret_cast<TrainingContext*>(ctx_ptr);
+        const bool train_only = mode == DynamicMultiLoraMode::TrainOnly;
+        const bool finalize_only = mode == DynamicMultiLoraMode::FinalizeOnly;
+        if (finalize_only && finalizer_phase) *finalizer_phase = 0;
         TORCH_CHECK(!ctx->topology_invalid,
             "native Qwen context rejected an incompatible TP/DP/EP topology");
-        TORCH_CHECK(!ctx->accumulation_active &&
-                ctx->accumulated_token_weight == 0.0,
-            "cannot start dynamic multi-LoRA while a fixed-LoRA gradient "
-            "accumulation window is pending");
+        if (mode == DynamicMultiLoraMode::TrainAndFinalize) {
+            TORCH_CHECK(!ctx->accumulation_active &&
+                    ctx->accumulated_token_weight == 0.0,
+                "cannot start dynamic multi-LoRA while a fixed-LoRA gradient "
+                "accumulation window is pending");
+        }
         GradientAccumulationFailureGuard accumulation_guard{ctx};
         if (ctx->nccl_comm || ctx->dp_comm || ctx->tp_comm) {
             c10::cuda::set_device(ctx->cuda_device);
@@ -6362,22 +6381,25 @@ __attribute__((visibility("default"))) double qwen36_train_multi_lora(
 
         int64_t total_adapters = (int64_t)ctx->adapters.size();
         validate_adapter_collective_registry(
-            ctx, nullptr, n_total, lora_rank, true);
+            ctx, nullptr, n_total, finalize_only ? 0 : lora_rank,
+            true);
         if (total_adapters == 0) return -1.0;
         TORCH_CHECK(n_total > 0 && total_adapters == n_total,
             "n_total must equal the number of registered adapters (n_total=",
             n_total, ", registered=", total_adapters, ")");
-        const auto& reference_adapter = ctx->adapters.front();
-        for (const auto& adapter : ctx->adapters) {
-            TORCH_CHECK(adapter.rank == lora_rank,
-                "lora_rank argument must match every registered adapter; adapter=",
-                adapter.id, " registered_rank=", adapter.rank,
-                " requested_rank=", lora_rank);
-            TORCH_CHECK(
-                adapter.target_layers == reference_adapter.target_layers &&
-                    adapter.target_modules == reference_adapter.target_modules,
-                "legacy multi-LoRA training requires homogeneous target layers/modules; "
-                "use the grouped v2 trainer for heterogeneous adapters");
+        if (!finalize_only) {
+            const auto& reference_adapter = ctx->adapters.front();
+            for (const auto& adapter : ctx->adapters) {
+                TORCH_CHECK(adapter.rank == lora_rank,
+                    "lora_rank argument must match every registered adapter; adapter=",
+                    adapter.id, " registered_rank=", adapter.rank,
+                    " requested_rank=", lora_rank);
+                TORCH_CHECK(
+                    adapter.target_layers == reference_adapter.target_layers &&
+                        adapter.target_modules == reference_adapter.target_modules,
+                    "legacy multi-LoRA training requires homogeneous target layers/modules; "
+                    "use the grouped v2 trainer for heterogeneous adapters");
+            }
         }
         TORCH_CHECK(!ctx->has_mtp || env_enabled("QWEN36_DISABLE_MTP"),
             "dynamic multi-LoRA with MTP is not supported until main and MTP "
@@ -6411,11 +6433,17 @@ __attribute__((visibility("default"))) double qwen36_train_multi_lora(
                 "attention_mask must match input_ids shape");
         }
         const at::Tensor saved_attention_mask = ctx->attention_mask;
+        const bool saved_use_checkpoint = ctx->use_checkpoint;
         struct AttentionMaskGuard {
             TrainingContext* ctx;
             at::Tensor saved;
             ~AttentionMaskGuard() { ctx->attention_mask = saved; }
         } attention_mask_guard{ctx, saved_attention_mask};
+        struct CheckpointModeGuard {
+            TrainingContext* ctx;
+            bool saved;
+            ~CheckpointModeGuard() { ctx->use_checkpoint = saved; }
+        } checkpoint_mode_guard{ctx, saved_use_checkpoint};
 
         struct AdapterRegistryChunkGuard {
             TrainingContext* ctx;
@@ -6423,8 +6451,10 @@ __attribute__((visibility("default"))) double qwen36_train_multi_lora(
             bool active = false;
 
             AdapterRegistryChunkGuard(
-                TrainingContext* context, int64_t start, int64_t end)
+                TrainingContext* context, int64_t start, int64_t end,
+                bool scope_registry)
                 : ctx(context) {
+                if (!scope_registry) return;
                 all.swap(ctx->adapters);
                 try {
                     ctx->adapters.assign(all.begin() + start, all.begin() + end);
@@ -6446,58 +6476,65 @@ __attribute__((visibility("default"))) double qwen36_train_multi_lora(
             ~AdapterRegistryChunkGuard() { restore(); }
         };
 
-        // Compute N_max from available GPU memory. All workers in the TP x DP
-        // grid must agree on the chunk schedule to keep collectives ordered.
-        size_t free_mem, total_mem;
-        cudaMemGetInfo(&free_mem, &total_mem);
-        int64_t n_max = 0;
-        n_max = compute_n_max(
-            (int64_t)free_mem, lora_rank,
-            input_ids.size(-1), 2048,
-            ctx->group_size, ctx->num_layers, ctx->vocab_parallel,
-            ctx->local_vocab_size
-        );
-        n_max = std::min(n_max, total_adapters);
-        if (n_max < 1) n_max = 1;
-        if ((ctx->nccl_comm && ctx->ep_world_size > 1) ||
-            (ctx->dp_comm && ctx->dp_world_size > 1) ||
-            (ctx->tp_comm && ctx->tp_world_size > 1)) {
-            auto published_n_max = at::full(
-                {1}, n_max, input_ids.options().dtype(at::kLong));
-            auto stream = c10::cuda::getCurrentCUDAStream(
-                input_ids.device().index()).stream();
-            if (ctx->nccl_comm && ctx->ep_world_size > 1) {
-                auto err = ncclAllReduce(
-                    published_n_max.data_ptr<int64_t>(),
-                    published_n_max.data_ptr<int64_t>(), 1, ncclInt64, ncclMin,
-                    reinterpret_cast<ncclComm_t>(ctx->nccl_comm), stream);
-                TORCH_CHECK(err == ncclSuccess, "EP n_max all-reduce failed: ",
-                    ncclGetErrorString(err));
+        int64_t n_max = total_adapters;
+        if (!finalize_only) {
+            // All workers in the TP x EP x DP grid must agree on the
+            // activation chunk schedule to keep forward collectives ordered.
+            size_t free_mem = 0;
+            size_t total_mem = 0;
+            cudaMemGetInfo(&free_mem, &total_mem);
+            n_max = compute_n_max(
+                (int64_t)free_mem, lora_rank,
+                input_ids.size(-1), 2048,
+                ctx->group_size, ctx->num_layers, ctx->vocab_parallel,
+                ctx->local_vocab_size
+            );
+            n_max = std::min(n_max, total_adapters);
+            if (n_max < 1) n_max = 1;
+            if ((ctx->nccl_comm && ctx->ep_world_size > 1) ||
+                (ctx->dp_comm && ctx->dp_world_size > 1) ||
+                (ctx->tp_comm && ctx->tp_world_size > 1)) {
+                auto published_n_max = at::full(
+                    {1}, n_max, input_ids.options().dtype(at::kLong));
+                auto stream = c10::cuda::getCurrentCUDAStream(
+                    input_ids.device().index()).stream();
+                if (ctx->nccl_comm && ctx->ep_world_size > 1) {
+                    auto err = ncclAllReduce(
+                        published_n_max.data_ptr<int64_t>(),
+                        published_n_max.data_ptr<int64_t>(), 1, ncclInt64,
+                        ncclMin, reinterpret_cast<ncclComm_t>(ctx->nccl_comm),
+                        stream);
+                    TORCH_CHECK(err == ncclSuccess,
+                        "EP n_max all-reduce failed: ", ncclGetErrorString(err));
+                }
+                if (ctx->dp_comm && ctx->dp_world_size > 1) {
+                    auto err = ncclAllReduce(
+                        published_n_max.data_ptr<int64_t>(),
+                        published_n_max.data_ptr<int64_t>(), 1, ncclInt64,
+                        ncclMin, reinterpret_cast<ncclComm_t>(ctx->dp_comm),
+                        stream);
+                    TORCH_CHECK(err == ncclSuccess,
+                        "DP n_max all-reduce failed: ", ncclGetErrorString(err));
+                }
+                if (ctx->tp_comm && ctx->tp_world_size > 1) {
+                    auto err = ncclAllReduce(
+                        published_n_max.data_ptr<int64_t>(),
+                        published_n_max.data_ptr<int64_t>(), 1, ncclInt64,
+                        ncclMin, reinterpret_cast<ncclComm_t>(ctx->tp_comm),
+                        stream);
+                    TORCH_CHECK(err == ncclSuccess,
+                        "TP n_max all-reduce failed: ", ncclGetErrorString(err));
+                }
+                n_max = published_n_max.to(
+                    at::TensorOptions().device(at::kCPU)).item<int64_t>();
             }
-            if (ctx->dp_comm && ctx->dp_world_size > 1) {
-                auto err = ncclAllReduce(
-                    published_n_max.data_ptr<int64_t>(),
-                    published_n_max.data_ptr<int64_t>(), 1, ncclInt64, ncclMin,
-                    reinterpret_cast<ncclComm_t>(ctx->dp_comm), stream);
-                TORCH_CHECK(err == ncclSuccess, "DP n_max all-reduce failed: ",
-                    ncclGetErrorString(err));
-            }
-            if (ctx->tp_comm && ctx->tp_world_size > 1) {
-                auto err = ncclAllReduce(
-                    published_n_max.data_ptr<int64_t>(),
-                    published_n_max.data_ptr<int64_t>(), 1, ncclInt64, ncclMin,
-                    reinterpret_cast<ncclComm_t>(ctx->tp_comm), stream);
-                TORCH_CHECK(err == ncclSuccess, "TP n_max all-reduce failed: ",
-                    ncclGetErrorString(err));
-            }
-            n_max = published_n_max.to(
-                at::TensorOptions().device(at::kCPU)).item<int64_t>();
+            n_max = std::min(n_max, total_adapters);
+            if (n_max < 1) n_max = 1;
+            fprintf(stderr,
+                "[train_multi] total=%ld n_max=%ld free=%.1fGB rank=%d\n",
+                (long)total_adapters, (long)n_max,
+                (double)free_mem / 1e9, lora_rank);
         }
-        n_max = std::min(n_max, total_adapters);
-        if (n_max < 1) n_max = 1;
-
-        fprintf(stderr, "[train_multi] total=%ld n_max=%ld free=%.1fGB rank=%d\n",
-                (long)total_adapters, (long)n_max, (double)free_mem / 1e9, lora_rank);
 
         double total_loss = 0.0;
         int64_t num_chunks = (total_adapters + n_max - 1) / n_max;
@@ -6515,10 +6552,13 @@ __attribute__((visibility("default"))) double qwen36_train_multi_lora(
 
             // Scope the registry to this activation-memory chunk. The guard
             // restores the full registry even if forward/backward fails.
-            AdapterRegistryChunkGuard registry_guard(ctx, start, end);
+            AdapterRegistryChunkGuard registry_guard(
+                ctx, start, end, !finalize_only);
 
-            // Mark batched mode active
-            ctx->lora_batch_valid = true;  // triggers prepare_lora_batch in forward
+            double loss_val = 0.0;
+            if (!finalize_only) {
+                // Mark batched mode active
+                ctx->lora_batch_valid = true;  // triggers prepare_lora_batch in forward
 
             // Expand only a shared batch-1 sample. With a tenant-specific
             // [n_total, seq] batch, preserve each adapter's own row and slice
@@ -6555,7 +6595,6 @@ __attribute__((visibility("default"))) double qwen36_train_multi_lora(
             double fwd_ms = std::chrono::duration<double, std::milli>(t_fwd_end - t_fwd_start).count();
 
             // Batched CE: compute loss with autograd enabled.
-            double loss_val;
             at::Tensor hidden_grad;
             auto t_loss_start = std::chrono::steady_clock::now();
             {
@@ -6613,19 +6652,47 @@ __attribute__((visibility("default"))) double qwen36_train_multi_lora(
 
             fprintf(stderr, "[train_multi] chunk %ld/%ld: n=%ld loss=%f  fwd=%.0fms loss=%.0fms bwd=%.0fms\n",
                     (long)(chunk+1), (long)num_chunks, (long)n, loss_val, fwd_ms, loss_ms, bwd_ms);
+            }
 
             // Restore the complete registry before the next chunk. Gradients
             // remain attached to the intrusive tensor handles, so all chunks
             // can accumulate and the optimizer runs exactly once below.
             registry_guard.restore();
 
-            if (chunk == num_chunks - 1) {
+            if (chunk == num_chunks - 1 && !train_only) {
                 // DP gradient synchronization and Adam belong to the logical
                 // multi-tenant step, never to an activation-memory chunk.
+                ++ctx->dynamic_finalizer_count;
+                TORCH_CHECK(!finalize_only || !env_enabled(
+                        "QWEN36_TEST_FAIL_FINALIZER_BEFORE_TOKEN_PREFLIGHT"),
+                    "injected dynamic finalizer failure before token preflight");
+                bool local_token_counts_valid = false;
+                try {
+                    local_token_counts_valid =
+                        at::logical_and(
+                            at::isfinite(adapter_token_counts),
+                            adapter_token_counts >= 0).all().item<bool>();
+                } catch (...) {
+                    local_token_counts_valid = false;
+                }
+                bool global_token_counts_valid = local_token_counts_valid;
+                if ((ctx->nccl_comm && ctx->ep_world_size > 1) ||
+                    (ctx->dp_comm && ctx->dp_world_size > 1) ||
+                    (ctx->tp_comm && ctx->tp_world_size > 1)) {
+                    global_token_counts_valid =
+                        adapter_collective_all_succeeded(
+                            ctx, local_token_counts_valid);
+                }
+                if (finalize_only && finalizer_phase) *finalizer_phase = 1;
+                TORCH_CHECK(global_token_counts_valid &&
+                        local_token_counts_valid,
+                    "dynamic LoRA token counts must be finite, non-negative, "
+                    "and valid on every distributed rank");
                 std::vector<uint8_t> adapter_has_global_tokens;
                 synchronize_lora_gradients(
                     ctx, target_mask, 0.0, &adapter_token_counts,
-                    &adapter_has_global_tokens);
+                    &adapter_has_global_tokens,
+                    /*adapter_token_counts_prevalidated=*/true);
                 TORCH_CHECK(adapter_has_global_tokens.size() ==
                         ctx->adapters.size(),
                     "dynamic LoRA global-token activity vector mismatch");
@@ -6831,6 +6898,7 @@ __attribute__((visibility("default"))) double qwen36_train_multi_lora(
                     ctx->adam_dev_bufs.lr_buf.narrow(0, 0, n_params).copy_(lr_cpu);
                     ctx->adam_dev_bufs.eps_buf.narrow(0, 0, n_params).copy_(eps_cpu);
                     auto stream = c10::cuda::getCurrentCUDAStream().stream();
+                    ++ctx->dynamic_adam_launch_count;
                     launch_fused_adam_multi_out_of_place(
                         (void**)ctx->adam_dev_bufs.params_buf.data_ptr(),
                         (void**)ctx->adam_dev_bufs.grads_buf.data_ptr(),
@@ -6877,15 +6945,16 @@ __attribute__((visibility("default"))) double qwen36_train_multi_lora(
                 }
             }
 
-            total_loss += loss_val;
-
-            fprintf(stderr, "[train_multi] chunk %ld/%ld: n=%ld loss=%.6f\n",
-                    (long)(chunk + 1), (long)num_chunks, (long)n, loss_val);
+            if (!finalize_only) {
+                total_loss += loss_val;
+                fprintf(stderr, "[train_multi] chunk %ld/%ld: n=%ld loss=%.6f\n",
+                        (long)(chunk + 1), (long)num_chunks, (long)n, loss_val);
+            }
         }
 
-        clear_gradient_accumulators(ctx);
+        if (!train_only) clear_gradient_accumulators(ctx);
         accumulation_guard.disarmed = true;
-        return total_loss / total_adapters;
+        return finalize_only ? 0.0 : total_loss / total_adapters;
     } catch (const std::exception& e) {
         fprintf(stderr, "[train_multi] FAILED: %s\n", e.what());
         return -1.0;
@@ -6893,6 +6962,19 @@ __attribute__((visibility("default"))) double qwen36_train_multi_lora(
         fprintf(stderr, "[train_multi] FAILED: unknown exception\n");
         return -1.0;
     }
+}
+
+__attribute__((visibility("default"))) double qwen36_train_multi_lora(
+    void* ctx_ptr,
+    void* input_ids_ptr,
+    void* target_mask_ptr,
+    void* attention_mask_ptr,
+    int32_t n_total,
+    int32_t lora_rank
+) {
+    return qwen36_train_multi_lora_impl(
+        ctx_ptr, input_ids_ptr, target_mask_ptr, attention_mask_ptr,
+        n_total, lora_rank, DynamicMultiLoraMode::TrainAndFinalize);
 }
 
 // Train only the requested dynamic tenants. The existing train_multi_lora
@@ -7045,10 +7127,9 @@ static void rollback_dynamic_adapter_commit(
 }
 
 // Heterogeneous selected training groups only adapters whose active tensor
-// layouts can be stacked safely. Groups execute in canonical key order on
-// every rank. Until grouped harvest and optimizer finalization are split into
-// separate internal phases, a later group failure rolls earlier commits back
-// through their persistent Adam shadow buffers.
+// layouts can be stacked safely. Groups execute forward/backward in canonical
+// key order, then the complete selected registry shares one gradient
+// synchronization and one transactional Adam finalizer.
 __attribute__((visibility("default"))) double
 qwen36_train_multi_lora_selected_v2(
     void* ctx_ptr,
@@ -7066,6 +7147,7 @@ qwen36_train_multi_lora_selected_v2(
     std::vector<uint8_t> moved;
     std::vector<int64_t> original_steps;
     bool registry_detached = false;
+    bool selected_registry_installed = false;
     auto restore_registry = [&]() {
         if (!ctx || !registry_detached) return;
         for (size_t index = 0; index < original.size(); ++index) {
@@ -7094,9 +7176,11 @@ qwen36_train_multi_lora_selected_v2(
     };
     auto recover = [&]() {
         try {
-            if (ctx && registry_detached && !ctx->adapters.empty()) {
-                // A failing legacy group returns with its registry installed.
-                // Move it back before rolling prior successful groups back.
+            if (ctx && registry_detached && selected_registry_installed) {
+                selected.swap(ctx->adapters);
+                selected_registry_installed = false;
+            } else if (ctx && registry_detached && !ctx->adapters.empty()) {
+                // A failing group returns with its scoped registry installed.
                 for (auto& adapter : ctx->adapters) {
                     auto selected_it = std::find_if(
                         selected.begin(), selected.end(),
@@ -7113,6 +7197,25 @@ qwen36_train_multi_lora_selected_v2(
         } catch (...) {
             fprintf(stderr,
                 "[train_multi_selected_v2] group recovery FAILED\n");
+        }
+        try {
+            if (ctx && registry_detached) {
+                for (auto& adapter : selected)
+                    clear_adapter_gradient_accumulators(adapter);
+                ctx->group_inputs.clear();
+                ctx->group_outputs.clear();
+                ctx->lora_cache_valid = false;
+                ctx->lora_batch_valid = false;
+                ctx->accumulation_active = false;
+                ctx->accumulated_token_weight = 0.0;
+            }
+        } catch (const std::exception& e) {
+            fprintf(stderr,
+                "[train_multi_selected_v2] gradient cleanup FAILED: %s\n",
+                e.what());
+        } catch (...) {
+            fprintf(stderr,
+                "[train_multi_selected_v2] gradient cleanup FAILED\n");
         }
         try {
             rollback();
@@ -7134,10 +7237,21 @@ qwen36_train_multi_lora_selected_v2(
         }
     };
     try {
-        TORCH_CHECK(ctx && adapter_ids && n_adapters > 0,
-            "heterogeneous selected training requires a context and adapter IDs");
+        TORCH_CHECK(ctx,
+            "heterogeneous selected training requires a context");
         TORCH_CHECK(!ctx->topology_invalid,
             "native Qwen context rejected an incompatible TP/DP/EP topology");
+        const bool local_request_valid = adapter_ids && n_adapters > 0;
+        TORCH_CHECK(adapter_collective_all_succeeded(
+                ctx, local_request_valid) && local_request_valid,
+            "heterogeneous selected training requires rank-consistent "
+            "adapter IDs and a positive adapter count");
+        const bool local_accumulation_clear = !ctx->accumulation_active &&
+            ctx->accumulated_token_weight == 0.0;
+        TORCH_CHECK(adapter_collective_all_succeeded(
+                ctx, local_accumulation_clear) && local_accumulation_clear,
+            "cannot start heterogeneous multi-LoRA while a fixed or dynamic "
+            "gradient accumulation window is pending");
         validate_adapter_collective_registry(
             ctx, adapter_ids, n_adapters, 0, false);
         auto* input_ids_tensor = reinterpret_cast<at::Tensor*>(input_ids_ptr);
@@ -7255,9 +7369,9 @@ qwen36_train_multi_lora_selected_v2(
             const int32_t group_size = static_cast<int32_t>(indexes.size());
             const int32_t group_rank = static_cast<int32_t>(
                 ctx->adapters.front().rank);
-            const double group_loss = qwen36_train_multi_lora(
+            const double group_loss = qwen36_train_multi_lora_impl(
                 ctx, group_input_ptr, group_target_ptr, group_attention_ptr,
-                group_size, group_rank);
+                group_size, group_rank, DynamicMultiLoraMode::TrainOnly);
 
             group.swap(ctx->adapters);
             for (size_t group_index = 0;
@@ -7283,6 +7397,27 @@ qwen36_train_multi_lora_selected_v2(
                 "distributed rank: ", group_key);
             weighted_loss += group_loss * indexes.size();
         }
+
+        ctx->adapters.swap(selected);
+        selected_registry_installed = true;
+        int32_t finalizer_phase = 0;
+        const double finalizer_result = qwen36_train_multi_lora_impl(
+            ctx, input_ids_ptr, target_mask_ptr, attention_mask_ptr,
+            n_adapters, 0, DynamicMultiLoraMode::FinalizeOnly,
+            &finalizer_phase);
+        selected.swap(ctx->adapters);
+        selected_registry_installed = false;
+        if (finalizer_phase < 1) {
+            // Match peers already waiting in the token preflight phase when
+            // this rank failed during finalizer-local preparation.
+            adapter_collective_all_succeeded(ctx, false);
+        }
+        const bool local_finalizer_succeeded =
+            std::isfinite(finalizer_result) && finalizer_result >= 0.0;
+        TORCH_CHECK(adapter_collective_all_succeeded(
+                ctx, local_finalizer_succeeded),
+            "heterogeneous adapter finalizer failed on at least one "
+            "distributed rank");
         restore_registry();
         return weighted_loss / static_cast<double>(n_adapters);
     } catch (const std::exception& e) {
@@ -8363,6 +8498,32 @@ double qwen36_eval_step_host_i64(
 __attribute__((visibility("default")))
 int64_t qwen36_get_step_count(void* ctx_ptr) {
     return (int64_t)reinterpret_cast<TrainingContext*>(ctx_ptr)->fixed_optimizer_step;
+}
+
+__attribute__((visibility("default")))
+int64_t qwen36_get_dynamic_finalizer_count(void* ctx_ptr) {
+    if (!ctx_ptr) return -1;
+    return reinterpret_cast<TrainingContext*>(ctx_ptr)->dynamic_finalizer_count;
+}
+
+__attribute__((visibility("default")))
+int64_t qwen36_get_dynamic_adam_launch_count(void* ctx_ptr) {
+    if (!ctx_ptr) return -1;
+    return reinterpret_cast<TrainingContext*>(ctx_ptr)->dynamic_adam_launch_count;
+}
+
+__attribute__((visibility("default")))
+int32_t qwen36_get_accumulation_active(void* ctx_ptr) {
+    if (!ctx_ptr) return -1;
+    return reinterpret_cast<TrainingContext*>(ctx_ptr)->accumulation_active
+        ? 1 : 0;
+}
+
+__attribute__((visibility("default")))
+double qwen36_get_accumulated_token_weight(void* ctx_ptr) {
+    if (!ctx_ptr) return -1.0;
+    return reinterpret_cast<TrainingContext*>(
+        ctx_ptr)->accumulated_token_weight;
 }
 
 // Restore the Adam bias-correction clock independently from tensor state.

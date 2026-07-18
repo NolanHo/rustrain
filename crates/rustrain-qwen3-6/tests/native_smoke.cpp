@@ -45,6 +45,10 @@ extern "C" int32_t qwen36_set_step_count(void*, int64_t);
 extern "C" int64_t qwen36_export_optimizer_state(
     void*, void**, void**, int64_t);
 extern "C" int64_t qwen36_get_adapter_step_count(void*, int64_t);
+extern "C" int64_t qwen36_get_dynamic_finalizer_count(void*);
+extern "C" int64_t qwen36_get_dynamic_adam_launch_count(void*);
+extern "C" int32_t qwen36_get_accumulation_active(void*);
+extern "C" double qwen36_get_accumulated_token_weight(void*);
 extern "C" int32_t qwen36_set_adapter_step_count(void*, int64_t, int64_t);
 extern "C" double qwen36_eval_step(void*, void*, void*, void*);
 extern "C" double qwen36_train_multi_lora(
@@ -380,7 +384,7 @@ static int run_dynamic_dp_smoke(
 }
 
 int main() {
-    assert(qwen36_kernel_abi_version() == 23);
+    assert(qwen36_kernel_abi_version() == 24);
     const int world = std::atoi(std::getenv("WORLD_SIZE") ? std::getenv("WORLD_SIZE") : "1");
     const int process_rank = std::atoi(std::getenv("RANK") ? std::getenv("RANK") : "0");
     const int local_rank = std::atoi(std::getenv("LOCAL_RANK") ? std::getenv("LOCAL_RANK") : "0");
@@ -778,6 +782,10 @@ int main() {
     assert(qwen36_get_adapter_step_count(ctx, adapter_one) == 3);
     assert(qwen36_get_adapter_step_count(ctx, adapter_two) == 1);
     assert(qwen36_get_adapter_step_count(ctx, heterogeneous_restore) == 0);
+    const int64_t finalizers_before_v2 =
+        qwen36_get_dynamic_finalizer_count(ctx);
+    const int64_t adam_launches_before_v2 =
+        qwen36_get_dynamic_adam_launch_count(ctx);
     const double heterogeneous_loss = qwen36_train_multi_lora_selected_v2(
         ctx, &shared_input, &shared_target_row, &shared_attention,
         heterogeneous_ids, 3);
@@ -786,6 +794,10 @@ int main() {
     assert(qwen36_get_adapter_step_count(ctx, adapter_one) == 4);
     assert(qwen36_get_adapter_step_count(ctx, adapter_two) == 2);
     assert(qwen36_get_adapter_step_count(ctx, heterogeneous_restore) == 1);
+    assert(qwen36_get_dynamic_finalizer_count(ctx) ==
+        finalizers_before_v2 + 1);
+    assert(qwen36_get_dynamic_adam_launch_count(ctx) ==
+        adam_launches_before_v2 + 1);
     assert((*dynamic_b - one_before_v2).abs().sum().item<double>() > 0.0);
     assert((*heterogeneous_b - heterogeneous_b_before).abs().sum().item<double>() > 0.0);
 
@@ -808,6 +820,10 @@ int main() {
     assert((*dynamic_b - rollback_one_b).abs().max().item<double>() == 0.0);
     assert((*rollback_one_m - rollback_one_m_before).abs().max().item<double>() == 0.0);
     assert((*heterogeneous_b - rollback_heterogeneous_b).abs().max().item<double>() == 0.0);
+    assert(qwen36_get_dynamic_finalizer_count(ctx) ==
+        finalizers_before_v2 + 1);
+    assert(qwen36_get_dynamic_adam_launch_count(ctx) ==
+        adam_launches_before_v2 + 1);
 
     assert(qwen36_train_multi_lora_host_i64(
         ctx, host_input_ids, host_target_mask, host_attention_mask,
@@ -816,6 +832,10 @@ int main() {
     assert(qwen36_get_adapter_step_count(ctx, adapter_one) == 5);
     assert(qwen36_get_adapter_step_count(ctx, adapter_two) == 3);
     assert(qwen36_get_adapter_step_count(ctx, heterogeneous_restore) == 2);
+    assert(qwen36_get_dynamic_finalizer_count(ctx) ==
+        finalizers_before_v2 + 2);
+    assert(qwen36_get_dynamic_adam_launch_count(ctx) ==
+        adam_launches_before_v2 + 2);
     std::printf("native_qwen36_heterogeneous_v2_smoke loss=%0.8f ok\n",
         heterogeneous_loss);
     assert(qwen36_remove_lora(ctx, heterogeneous_restore) == 1);
@@ -943,9 +963,24 @@ int main() {
     assert(qwen36_get_step_count(ctx) == 0);
     assert((*linear_a - linear_a_before).abs().sum().item<double>() == 0.0);
     assert(linear_a_accum->abs().sum().item<double>() > 0.0);
+    assert(qwen36_get_accumulation_active(ctx) == 1);
+    const double pending_token_weight =
+        qwen36_get_accumulated_token_weight(ctx);
+    assert(pending_token_weight > 0.0);
     // The BF16 leaf gradient is consumed at the micro-step boundary; only the
     // FP32 accumulator may survive.
     assert(!linear_a->grad().defined());
+    auto pending_accumulator = linear_a_accum->clone();
+    const int64_t unavailable_dynamic_id[] = {1};
+    assert(qwen36_train_multi_lora_selected_v2(
+        ctx, &input_ids, &target_mask, &attention_mask,
+        unavailable_dynamic_id, 1) < 0.0);
+    c10::cuda::device_synchronize();
+    assert((*linear_a_accum - pending_accumulator).abs()
+        .max().item<double>() == 0.0);
+    assert(qwen36_get_accumulation_active(ctx) == 1);
+    assert(qwen36_get_accumulated_token_weight(ctx) ==
+        pending_token_weight);
 
     // A failing final micro-step aborts the existing window transactionally.
     const double failed_accum = qwen36_train_micro_step(
