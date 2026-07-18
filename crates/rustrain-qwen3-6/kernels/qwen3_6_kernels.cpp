@@ -2575,6 +2575,19 @@ static bool adapter_collective_all_succeeded(
     return succeeded.to(at::kCPU).item<int32_t>() != 0;
 }
 
+static void require_clear_accumulation_for_registry_mutation(
+    TrainingContext* ctx, bool collective
+) {
+    const bool local_clear = ctx && !ctx->accumulation_active &&
+        ctx->accumulated_token_weight == 0.0;
+    const bool globally_clear = collective
+        ? adapter_collective_all_succeeded(ctx, local_clear)
+        : local_clear;
+    TORCH_CHECK(globally_clear && local_clear,
+        "cannot mutate the dynamic LoRA registry while a gradient "
+        "accumulation window is pending; finalize or abort it first");
+}
+
 static bool supported_mask_dtype(const at::Tensor& tensor) {
     switch (tensor.scalar_type()) {
         case at::kBool:
@@ -8599,6 +8612,9 @@ int64_t qwen36_add_lora(
 ) {
     try {
         auto* ctx = reinterpret_cast<TrainingContext*>(ctx_ptr);
+        TORCH_CHECK(ctx, "dynamic LoRA registration requires a context");
+        require_clear_accumulation_for_registry_mutation(
+            ctx, /*collective=*/true);
         TORCH_CHECK(rank > 0, "LoRA rank must be positive");
         TORCH_CHECK(alpha > 0.0, "LoRA alpha must be positive");
         TrainingContext::LoRAAdapter adapter;
@@ -8807,6 +8823,8 @@ int32_t qwen36_set_adapter_id(void* ctx_ptr, int64_t current_id, int64_t request
         auto* ctx = reinterpret_cast<TrainingContext*>(ctx_ptr);
         TORCH_CHECK(ctx && current_id > 0 && requested_id > 0,
             "dynamic adapter IDs must be positive");
+        require_clear_accumulation_for_registry_mutation(
+            ctx, /*collective=*/false);
         for (const auto& adapter : ctx->adapters) {
             TORCH_CHECK(adapter.id != requested_id || adapter.id == current_id,
                 "dynamic adapter ID already exists: ", requested_id);
@@ -8829,16 +8847,25 @@ int32_t qwen36_set_adapter_id(void* ctx_ptr, int64_t current_id, int64_t request
 
 __attribute__((visibility("default")))
 int32_t qwen36_remove_lora(void* ctx_ptr, int64_t adapter_id) {
-    auto* ctx = reinterpret_cast<TrainingContext*>(ctx_ptr);
-    for (auto it = ctx->adapters.begin(); it != ctx->adapters.end(); ++it) {
-        if (it->id == adapter_id) {
-            ctx->adapters.erase(it);
-            ctx->lora_cache_valid = false;
-            ctx->lora_batch_valid = false;
-            return 1;
+    try {
+        auto* ctx = reinterpret_cast<TrainingContext*>(ctx_ptr);
+        TORCH_CHECK(ctx && adapter_id > 0,
+            "dynamic LoRA removal requires a context and positive adapter ID");
+        require_clear_accumulation_for_registry_mutation(
+            ctx, /*collective=*/false);
+        for (auto it = ctx->adapters.begin(); it != ctx->adapters.end(); ++it) {
+            if (it->id == adapter_id) {
+                ctx->adapters.erase(it);
+                ctx->lora_cache_valid = false;
+                ctx->lora_batch_valid = false;
+                return 1;
+            }
         }
+        return 0;
+    } catch (const std::exception& e) {
+        fprintf(stderr, "[q36] remove_lora FAILED: %s\n", e.what());
+        return -1;
     }
-    return 0;
 }
 
 __attribute__((visibility("default")))

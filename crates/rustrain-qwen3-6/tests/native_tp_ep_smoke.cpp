@@ -58,6 +58,7 @@ extern "C" int32_t qwen36_set_step_count(void*, int64_t);
 extern "C" double qwen36_train_step(void*, void*, void*, void*);
 extern "C" double qwen36_train_micro_step(
     void*, void*, void*, void*, double, int32_t);
+extern "C" int32_t qwen36_abort_gradient_accumulation(void*);
 extern "C" int64_t qwen36_add_lora(
     void*, int64_t, double, const int64_t*, int64_t, const char*);
 extern "C" int64_t qwen36_add_lora_v2(
@@ -767,6 +768,18 @@ int main() {
         assert(qwen36_set_step_count(distributed, 0) == 0);
     assert(qwen36_get_step_count(distributed) == 0);
     assert(max_diff(*fixed_clock_probe, fixed_clock_probe_before) == 0.0);
+
+    // Registry mutation is collective and must reject disagreement about a
+    // pending accumulation window before adapter parameter synchronization.
+    assert(qwen36_train_micro_step(
+        distributed, &local_batch.input_ids, &local_batch.target_mask,
+        &local_batch.attention_mask, 1.0, 0) > 0.0);
+    if (rank == 0)
+        assert(qwen36_abort_gradient_accumulation(distributed) == 0);
+    assert(qwen36_add_lora(
+        distributed, kLoraRank, 1.0, &target_layer, 1, targets) < 0);
+    assert(qwen36_abort_gradient_accumulation(distributed) == 0);
+    assert(qwen36_get_step_count(distributed) == 0);
 
     const double distributed_loss = qwen36_train_step(
         distributed, &local_batch.input_ids, &local_batch.target_mask,

@@ -1374,8 +1374,11 @@ impl CppTrainingContext {
             return Ok(false);
         }
         let kh = get_kernels().ok_or_else(|| anyhow::anyhow!("kernels not loaded"))?;
-        let found = unsafe { (kh.remove_lora)(self.ptr, adapter_id) };
-        Ok(found != 0)
+        let status = unsafe { (kh.remove_lora)(self.ptr, adapter_id) };
+        if status < 0 {
+            bail!("C++ remove_lora failed for adapter {adapter_id}");
+        }
+        Ok(status != 0)
     }
 
     /// Restore a dynamic adapter's stable external ID from a checkpoint.

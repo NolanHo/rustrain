@@ -70,6 +70,7 @@ extern "C" int64_t qwen36_add_lora_v2(
     void*, int64_t, double, const int64_t*, int64_t, const char*);
 extern "C" int64_t qwen36_add_lora_for_restore(
     void*, int64_t, double, const int64_t*, int64_t, const char*);
+extern "C" int32_t qwen36_set_adapter_id(void*, int64_t, int64_t);
 extern "C" int32_t qwen36_remove_lora(void*, int64_t);
 extern "C" void* qwen36_get_adapter_lora_tensor(
     void*, int64_t, int64_t, const char*, int32_t);
@@ -967,6 +968,14 @@ int main() {
     const double pending_token_weight =
         qwen36_get_accumulated_token_weight(ctx);
     assert(pending_token_weight > 0.0);
+    assert(qwen36_add_lora(
+        ctx, rank, 1.0, &target_layer, 1, "in_proj_qkv") < 0);
+    assert(qwen36_add_lora_v2(
+        ctx, rank, 1.0, &target_layer, 1, "in_proj_qkv") < 0);
+    assert(qwen36_add_lora_for_restore(
+        ctx, rank, 1.0, &target_layer, 1, "in_proj_qkv") < 0);
+    assert(qwen36_set_adapter_id(ctx, 1, 2) < 0);
+    assert(qwen36_remove_lora(ctx, 1) < 0);
     // The BF16 leaf gradient is consumed at the micro-step boundary; only the
     // FP32 accumulator may survive.
     assert(!linear_a->grad().defined());
