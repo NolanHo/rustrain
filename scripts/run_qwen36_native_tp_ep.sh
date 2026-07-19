@@ -213,9 +213,14 @@ elif [[ "$mode" == "pp-cp-comm-smoke" ]]; then
         "$python_bin" -m torch.distributed.run --standalone \
             --nnodes=1 --nproc-per-node=4 --no-python "$test_bin"
 elif [[ "$mode" == "pp-train-smoke" ]]; then
-    TP_SIZE=1 CP_SIZE=1 EP_SIZE=1 DP_SIZE=1 PP_SIZE=2 \
+    pp_train_world="${PP_TRAIN_WORLD:-2}"
+    if [[ "$pp_train_world" -lt 2 ]]; then
+        echo "PP_TRAIN_WORLD must be >= 2" >&2
+        exit 1
+    fi
+    TP_SIZE=1 CP_SIZE=1 EP_SIZE=1 DP_SIZE=1 PP_SIZE="$pp_train_world" \
         "$python_bin" -m torch.distributed.run --standalone \
-            --nnodes=1 --nproc-per-node=2 --no-python "$test_bin"
+            --nnodes=1 --nproc-per-node="$pp_train_world" --no-python "$test_bin"
 elif [[ "$mode" == "tri-smoke" || "$mode" == "tri-replicated-smoke" ]]; then
     sharded_a2a=1
     if [[ "$mode" == "tri-replicated-smoke" ]]; then

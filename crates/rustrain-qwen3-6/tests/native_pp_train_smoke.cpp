@@ -6,6 +6,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <utility>
 #include <vector>
 
 struct LayerConfig {
@@ -26,6 +27,13 @@ extern "C" void* qwen36_create_training_context_v2(
     double, double, double, double, double, int64_t, double, int64_t,
     const int64_t*, int64_t, const char*, int32_t);
 extern "C" int32_t qwen36_init_parallel_nccl_v2(
+    void*, int32_t, int32_t,
+    int32_t, int32_t, int32_t,
+    int32_t, int32_t, int32_t,
+    int32_t, int32_t, int32_t,
+    int32_t, int32_t, int32_t,
+    int32_t, int32_t, int32_t);
+extern "C" int32_t qwen36_attach_parallel_nccl_no_sync_v2(
     void*, int32_t, int32_t,
     int32_t, int32_t, int32_t,
     int32_t, int32_t, int32_t,
@@ -207,7 +215,12 @@ int main() {
     const int rank = std::atoi(std::getenv("RANK") ? std::getenv("RANK") : "0");
     const int local_rank = std::atoi(
         std::getenv("LOCAL_RANK") ? std::getenv("LOCAL_RANK") : "0");
-    assert(rank == 0 || rank == 1);
+    const int pp_size = std::atoi(
+        std::getenv("PP_SIZE") ? std::getenv("PP_SIZE") : "2");
+    const int world_size = std::atoi(
+        std::getenv("WORLD_SIZE") ? std::getenv("WORLD_SIZE") : "1");
+    assert(pp_size >= 2 && world_size == pp_size);
+    assert(rank >= 0 && rank < pp_size);
     c10::cuda::CUDAGuard guard(local_rank);
 
     const int pp_rank = rank;
@@ -243,30 +256,43 @@ int main() {
     config.rope_theta = 10000.0;
     config.rms_eps = 1e-6;
     config.intermediate_size = 8;
-    const int32_t stage_flags = pp_rank == 0 ? 1 : 2;
-    const int64_t target_layers[] = {0, 1};
-    auto create_context = [&]() {
+    const int32_t stage_flags = pp_rank == 0 ? 1
+        : (pp_rank + 1 == pp_size ? 2 : 0);
+    std::vector<int64_t> target_layers(pp_size);
+    for (int64_t layer = 0; layer < pp_size; ++layer)
+        target_layers[layer] = layer;
+    auto create_context = [&](bool synchronize_parameters) {
         void* context = qwen36_create_training_context_v2(
             weight_ptrs.data(), static_cast<int64_t>(weight_ptrs.size()),
             pp_rank == 0 ? &embed : nullptr,
-            pp_rank == 1 ? &final_norm : nullptr,
-            pp_rank == 1 ? &lm_head : nullptr,
-            &config, 1, pp_rank, 2, stage_flags,
+            pp_rank + 1 == pp_size ? &final_norm : nullptr,
+            pp_rank + 1 == pp_size ? &lm_head : nullptr,
+            &config, 1, pp_rank, pp_size, stage_flags,
             static_cast<int32_t>(at::kBFloat16),
             1.0, 1e-3, 0.9, 0.999, 1e-8, 4, 1e-6, 1,
-            target_layers, 2, "q_proj", 0);
+            target_layers.data(), static_cast<int64_t>(target_layers.size()),
+            "q_proj", 0);
         assert(context);
-        assert(qwen36_init_parallel_nccl_v2(
-            context, rank, 2,
-            0, 1, 0,
-            0, 1, 0,
-            0, 1, 0,
-            0, 1, 0,
-            pp_rank, 2, 0) == 0);
+        const auto init = synchronize_parameters
+            ? qwen36_init_parallel_nccl_v2(
+                context, rank, world_size,
+                0, 1, 0,
+                0, 1, 0,
+                0, 1, 0,
+                0, 1, 0,
+                pp_rank, pp_size, 0)
+            : qwen36_attach_parallel_nccl_no_sync_v2(
+                context, rank, world_size,
+                0, 1, 0,
+                0, 1, 0,
+                0, 1, 0,
+                0, 1, 0,
+                pp_rank, pp_size, 0);
+        assert(init == 0);
         return context;
     };
-    void* window_context = create_context();
-    void* legacy_context = create_context();
+    void* window_context = create_context(true);
+    void* legacy_context = create_context(false);
     copy_fixed_lora(window_context, legacy_context);
     const auto initial_state = snapshot_fixed_state(window_context);
     const auto copied_state = snapshot_fixed_state(legacy_context);
@@ -299,29 +325,36 @@ int main() {
         }
         target_microbatches.push_back(std::move(target));
     }
+    const int64_t num_microbatches = 4;
+    const int64_t warmup = std::min<int64_t>(
+        pp_size - pp_rank - 1, num_microbatches);
+    std::vector<std::pair<int64_t, int64_t>> schedule;
+    for (int64_t microbatch = 0; microbatch < warmup; ++microbatch)
+        schedule.emplace_back(microbatch, -1);
+    for (int64_t microbatch = warmup;
+         microbatch < num_microbatches; ++microbatch)
+        schedule.emplace_back(microbatch, microbatch - warmup);
+    for (int64_t microbatch = num_microbatches - warmup;
+         microbatch < num_microbatches; ++microbatch)
+        schedule.emplace_back(-1, microbatch);
     Qwen36PipelineWindowV1 window{
-        sizeof(Qwen36PipelineWindowV1), 1, 7, 4, 0, 1, 0};
+        sizeof(Qwen36PipelineWindowV1), 1, 7, num_microbatches, 0, 1, 0};
     assert(qwen36_pipeline_begin_v1(window_context, &window) == 0);
     int64_t max_in_flight = 0;
     Qwen36PipelineResultV1 result{};
     result.struct_size = sizeof(Qwen36PipelineResultV1);
     result.version = 1;
-    const int ticks = pp_rank == 0 ? 5 : 4;
-    for (int tick_index = 0; tick_index < ticks; ++tick_index) {
-        const int64_t forward_mb = pp_rank == 0
-            ? (tick_index < 4 ? tick_index : -1) : tick_index;
-        const int64_t backward_mb = pp_rank == 0
-            ? (tick_index == 0 ? -1 : tick_index - 1) : tick_index;
+    for (const auto& [forward_mb, backward_mb] : schedule) {
         Qwen36PipelineTickV1 tick{
             sizeof(Qwen36PipelineTickV1), 1, 7, forward_mb, backward_mb,
-            0, forward_mb < 0 ? 2 : (forward_mb == 0 ? 0 : 1),
+            0, forward_mb < 0 ? 2 : (backward_mb < 0 ? 0 : 1),
             forward_mb >= 0 ? &input_microbatches[forward_mb] : nullptr,
             forward_mb >= 0 ? &target_microbatches[forward_mb] : nullptr,
             nullptr, 0.25};
         assert(qwen36_pipeline_tick_v1(window_context, &tick, &result) == 0);
         max_in_flight = std::max(max_in_flight, result.in_flight);
     }
-    assert(max_in_flight == (pp_rank == 0 ? 1 : 0));
+    assert(max_in_flight <= warmup);
     assert(qwen36_get_step_count(window_context) == 0);
 
     double gradient_difference = 0.0;
@@ -391,16 +424,48 @@ int main() {
     auto bad_target_mask = at::ones(
         {1, sequence_length - 1},
         at::TensorOptions().device(at::kCUDA).dtype(at::kLong));
+    Qwen36PipelineWindowV1 late_bad_window{
+        sizeof(Qwen36PipelineWindowV1), 1, 8, 2, 0, 1, 0};
+    assert(qwen36_pipeline_begin_v1(window_context, &late_bad_window) == 0);
+    const int64_t late_warmup = std::min<int64_t>(pp_size - pp_rank - 1, 2);
+    std::vector<std::pair<int64_t, int64_t>> late_schedule;
+    for (int64_t microbatch = 0; microbatch < late_warmup; ++microbatch)
+        late_schedule.emplace_back(microbatch, -1);
+    for (int64_t microbatch = late_warmup; microbatch < 2; ++microbatch)
+        late_schedule.emplace_back(microbatch, microbatch - late_warmup);
+    for (int64_t microbatch = 2 - late_warmup; microbatch < 2; ++microbatch)
+        late_schedule.emplace_back(-1, microbatch);
+    for (const auto& [forward_mb, backward_mb] : late_schedule) {
+        void* target = nullptr;
+        if (forward_mb >= 0) {
+            target = forward_mb == 1 && rank == 0
+                ? static_cast<void*>(&bad_target_mask)
+                : static_cast<void*>(&target_microbatches[forward_mb]);
+        }
+        int32_t phase = forward_mb < 0 ? 2 : (backward_mb < 0 ? 0 : 1);
+        if (forward_mb == 1 && rank == 1) phase = (phase + 1) % 3;
+        Qwen36PipelineTickV1 tick{
+            sizeof(Qwen36PipelineTickV1), 1, 8, forward_mb, backward_mb,
+            0, phase,
+            forward_mb >= 0 ? &input_microbatches[forward_mb] : nullptr,
+            target, nullptr, 0.5};
+        assert(qwen36_pipeline_tick_v1(window_context, &tick, &result) == 0);
+    }
+    assert(qwen36_pipeline_finish_v1(window_context, 1, &result) != 0);
+    assert(qwen36_get_step_count(window_context) == 1);
+
     // Deliberately make only rank 0 violate the next window's shape contract.
-    // Both ranks must fail at the PP min/max preflight, before any NCCL P2P
+    // All ranks must fail at the PP min/max preflight, before any NCCL P2P
     // count can diverge.
     auto* bad_target_ptr = rank == 0
         ? &bad_target_mask : &target_microbatches[0];
     Qwen36PipelineWindowV1 bad_window{
-        sizeof(Qwen36PipelineWindowV1), 1, 8, 1, 0, 1, 0};
+        sizeof(Qwen36PipelineWindowV1), 1, 9, 1, 0, 1, 0};
     assert(qwen36_pipeline_begin_v1(window_context, &bad_window) == 0);
+    const int64_t bad_backward = warmup == 0 ? 0 : -1;
     Qwen36PipelineTickV1 bad_tick{
-        sizeof(Qwen36PipelineTickV1), 1, 8, 0, pp_rank == 0 ? -1 : 0, 0, 0,
+        sizeof(Qwen36PipelineTickV1), 1, 9, 0, bad_backward, 0,
+        bad_backward < 0 ? 0 : 1,
         &input_microbatches[0], bad_target_ptr, nullptr, 1.0};
     assert(qwen36_pipeline_tick_v1(window_context, &bad_tick, &result) != 0);
     std::printf("native_qwen36_pp_train rank=%d loss=%0.6f "

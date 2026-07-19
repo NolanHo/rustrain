@@ -54,8 +54,8 @@ static at::Tensor attach_router_aux_loss(
 struct LayerConfig;
 static int64_t g_context_sequence = 0;
 
-// ABI-stable non-interleaved pipeline window contract. The first release is
-// intentionally bounded to PP=2/chunk=0/fixed-shape execution; the legacy
+// ABI-stable non-interleaved pipeline window contract. The window supports
+// fixed-shape, one-chunk 1F1B execution for any PP size >= 2; the legacy
 // one-microstep entry point remains available as a compatibility fallback.
 struct Qwen36PipelineWindowV1 {
     uint32_t struct_size;
@@ -2684,6 +2684,7 @@ struct PipelineWindowState {
     int32_t target_dtype = -1;
     int32_t attention_present = -1;
     int32_t attention_dtype = -1;
+    bool local_error = false;
     std::map<int64_t, PipelineWindowSlot> slots;
 };
 
@@ -2877,6 +2878,9 @@ struct TrainingContext {
     int cp_rank = 0;
     ncclComm_t pp_comm = nullptr;
     cudaStream_t pp_stream = nullptr;
+    // PP control collectives use a duplicate communicator so shape/registry
+    // checks cannot be ordered against activation/gradient P2P traffic.
+    ncclComm_t pp_control_comm = nullptr;
     int pp_world_size = 1;
     int pp_rank = 0;
     PipelineWindowState pp_window;
@@ -3436,15 +3440,17 @@ static void validate_pipeline_collective_registry(
     auto minimum = at::tensor(signature_values, options);
     auto maximum = minimum.clone();
     auto stream = c10::cuda::getCurrentCUDAStream(ctx->cuda_device).stream();
+    auto control_comm = ctx->pp_control_comm ?
+        ctx->pp_control_comm : ctx->pp_comm;
     auto min_error = ncclAllReduce(
         minimum.data_ptr<int64_t>(), minimum.data_ptr<int64_t>(),
-        minimum.numel(), ncclInt64, ncclMin, ctx->pp_comm, stream);
+        minimum.numel(), ncclInt64, ncclMin, control_comm, stream);
     TORCH_CHECK(min_error == ncclSuccess,
         "PP fixed-LoRA registry minimum all-reduce failed: ",
         ncclGetErrorString(min_error));
     auto max_error = ncclAllReduce(
         maximum.data_ptr<int64_t>(), maximum.data_ptr<int64_t>(),
-        maximum.numel(), ncclInt64, ncclMax, ctx->pp_comm, stream);
+        maximum.numel(), ncclInt64, ncclMax, control_comm, stream);
     TORCH_CHECK(max_error == ncclSuccess,
         "PP fixed-LoRA registry maximum all-reduce failed: ",
         ncclGetErrorString(max_error));
@@ -3468,8 +3474,9 @@ static void validate_pipeline_window_collective_registry(
     int32_t num_chunks,
     int32_t flags
 ) {
-    TORCH_CHECK(ctx && ctx->pp_comm && ctx->pp_world_size == 2,
-        "pipeline window requires a PP=2 communicator");
+    TORCH_CHECK(ctx && (ctx->pp_control_comm || ctx->pp_comm) &&
+            ctx->pp_world_size >= 2,
+        "pipeline window requires a PP communicator with PP_SIZE >= 2");
     AdapterRegistryHash hash;
     hash.add_u64(ctx->global_num_layers);
     hash.add_u64(ctx->fixed_all_target_layers);
@@ -3507,15 +3514,17 @@ static void validate_pipeline_window_collective_registry(
     auto minimum = at::tensor(values, options);
     auto maximum = minimum.clone();
     auto stream = c10::cuda::getCurrentCUDAStream(ctx->cuda_device).stream();
+    auto control_comm = ctx->pp_control_comm ?
+        ctx->pp_control_comm : ctx->pp_comm;
     auto min_error = ncclAllReduce(
         minimum.data_ptr<int64_t>(), minimum.data_ptr<int64_t>(),
-        minimum.numel(), ncclInt64, ncclMin, ctx->pp_comm, stream);
+        minimum.numel(), ncclInt64, ncclMin, control_comm, stream);
     TORCH_CHECK(min_error == ncclSuccess,
         "pipeline window registry minimum all-reduce failed: ",
         ncclGetErrorString(min_error));
     auto max_error = ncclAllReduce(
         maximum.data_ptr<int64_t>(), maximum.data_ptr<int64_t>(),
-        maximum.numel(), ncclInt64, ncclMax, ctx->pp_comm, stream);
+        maximum.numel(), ncclInt64, ncclMax, control_comm, stream);
     TORCH_CHECK(max_error == ncclSuccess,
         "pipeline window registry maximum all-reduce failed: ",
         ncclGetErrorString(max_error));
@@ -6940,9 +6949,11 @@ static double pipeline_broadcast_loss(
     auto loss = at::full({1}, local_loss, options.dtype(at::kFloat));
     auto stream = c10::cuda::getCurrentCUDAStream(
         loss.device().index()).stream();
+    auto control_comm = ctx->pp_control_comm ?
+        ctx->pp_control_comm : ctx->pp_comm;
     auto error = ncclBroadcast(
         loss.data_ptr(), loss.data_ptr(), 1, ncclFloat32,
-        ctx->pp_world_size - 1, ctx->pp_comm, stream);
+        ctx->pp_world_size - 1, control_comm, stream);
     TORCH_CHECK(error == ncclSuccess,
         "pipeline loss broadcast failed: ", ncclGetErrorString(error));
     return loss.to(at::kCPU).item<double>();
@@ -6975,7 +6986,7 @@ static void pipeline_window_validate_result(
         "unsupported pipeline result ABI or undersized result buffer");
 }
 
-static void pipeline_window_validate_forward_contract(
+static bool pipeline_window_validate_forward_contract(
     TrainingContext* ctx,
     const Qwen36PipelineTickV1& tick
 ) {
@@ -7012,106 +7023,109 @@ static void pipeline_window_validate_forward_contract(
         locally_valid && attention_defined
             ? static_cast<int64_t>(attention_mask->scalar_type()) : -1,
     };
-    // Every forward tick participates in the PP contract check. Checking only
-    // the first microbatch lets a later shape mismatch reach NCCL with
-    // different element counts, where it can hang instead of failing closed.
-    auto options = at::TensorOptions().dtype(at::kLong).device(
-        at::kCUDA, ctx->cuda_device);
-    auto minimum = at::tensor(signature, options);
-    auto maximum = minimum.clone();
-    auto stream = c10::cuda::getCurrentCUDAStream(ctx->cuda_device).stream();
-    TORCH_CHECK(ncclGroupStart() == ncclSuccess,
-        "pipeline contract ncclGroupStart failed");
-    const auto min_error = ncclAllReduce(
-        minimum.data_ptr<int64_t>(), minimum.data_ptr<int64_t>(),
-        minimum.numel(), ncclInt64, ncclMin, ctx->pp_comm, stream);
-    const auto max_error = ncclAllReduce(
-        maximum.data_ptr<int64_t>(), maximum.data_ptr<int64_t>(),
-        maximum.numel(), ncclInt64, ncclMax, ctx->pp_comm, stream);
-    const auto end_error = ncclGroupEnd();
-    const auto error = min_error != ncclSuccess ? min_error
-        : (max_error != ncclSuccess ? max_error : end_error);
-    TORCH_CHECK(error == ncclSuccess,
-        "pipeline contract consensus failed: ", ncclGetErrorString(error));
-    const auto minimum_cpu = minimum.to(at::kCPU);
-    const auto maximum_cpu = maximum.to(at::kCPU);
-    const auto* minimum_data = minimum_cpu.data_ptr<int64_t>();
-    const auto* maximum_data = maximum_cpu.data_ptr<int64_t>();
-    for (int64_t index = 0; index < minimum.numel(); ++index) {
-        TORCH_CHECK(minimum_data[index] == maximum_data[index],
-            "pipeline tensor shape/dtype contract differs across PP stages");
-    }
-    TORCH_CHECK(minimum_data[0] == 1,
-        "invalid pipeline window forward tensors");
+    std::vector<int64_t> agreed_signature = signature;
     if (window.batch_size < 0) {
-        window.batch_size = minimum_data[1];
-        window.sequence_length = minimum_data[2];
-        window.input_dtype = static_cast<int32_t>(minimum_data[3]);
-        window.target_dtype = static_cast<int32_t>(minimum_data[4]);
-        window.attention_present = static_cast<int32_t>(minimum_data[5]);
-        window.attention_dtype = static_cast<int32_t>(minimum_data[6]);
-    } else {
-        TORCH_CHECK(minimum_data[1] == window.batch_size &&
-                minimum_data[2] == window.sequence_length &&
-                minimum_data[3] == window.input_dtype &&
-                minimum_data[4] == window.target_dtype &&
-                minimum_data[5] == window.attention_present &&
-                minimum_data[6] == window.attention_dtype,
-            "pipeline microbatch violates the window's fixed shape/dtype contract");
+        // A PP-wide collective is safe only before the first activation enters
+        // the pipeline. Later stages intentionally run at different tick
+        // indices, so a per-tick collective would deadlock against P2P traffic.
+        auto options = at::TensorOptions().dtype(at::kLong).device(
+            at::kCUDA, ctx->cuda_device);
+        auto minimum = at::tensor(signature, options);
+        auto maximum = minimum.clone();
+        auto stream = c10::cuda::getCurrentCUDAStream(ctx->cuda_device).stream();
+        auto control_comm = ctx->pp_control_comm ?
+            ctx->pp_control_comm : ctx->pp_comm;
+        TORCH_CHECK(ncclGroupStart() == ncclSuccess,
+            "pipeline contract ncclGroupStart failed");
+        const auto min_error = ncclAllReduce(
+            minimum.data_ptr<int64_t>(), minimum.data_ptr<int64_t>(),
+            minimum.numel(), ncclInt64, ncclMin, control_comm, stream);
+        const auto max_error = ncclAllReduce(
+            maximum.data_ptr<int64_t>(), maximum.data_ptr<int64_t>(),
+            maximum.numel(), ncclInt64, ncclMax, control_comm, stream);
+        const auto end_error = ncclGroupEnd();
+        const auto error = min_error != ncclSuccess ? min_error
+            : (max_error != ncclSuccess ? max_error : end_error);
+        TORCH_CHECK(error == ncclSuccess,
+            "pipeline contract consensus failed: ", ncclGetErrorString(error));
+        const auto minimum_cpu = minimum.to(at::kCPU);
+        const auto maximum_cpu = maximum.to(at::kCPU);
+        const auto* minimum_data = minimum_cpu.data_ptr<int64_t>();
+        const auto* maximum_data = maximum_cpu.data_ptr<int64_t>();
+        for (int64_t index = 0; index < minimum.numel(); ++index) {
+            TORCH_CHECK(minimum_data[index] == maximum_data[index],
+                "pipeline tensor shape/dtype contract differs across PP stages");
+            agreed_signature[index] = minimum_data[index];
+        }
     }
-    TORCH_CHECK(std::isfinite(tick.gradient_scale) && tick.gradient_scale > 0.0,
-        "pipeline window gradient scale must be finite and positive");
-    if (attention_defined)
-        validate_linear_attention_mask(ctx, *attention_mask);
+    const auto* contract = agreed_signature.data();
+    if (contract[0] != 1) return false;
+    if (window.batch_size < 0) {
+        window.batch_size = contract[1];
+        window.sequence_length = contract[2];
+        window.input_dtype = static_cast<int32_t>(contract[3]);
+        window.target_dtype = static_cast<int32_t>(contract[4]);
+        window.attention_present = static_cast<int32_t>(contract[5]);
+        window.attention_dtype = static_cast<int32_t>(contract[6]);
+    } else {
+        if (contract[1] != window.batch_size ||
+                contract[2] != window.sequence_length ||
+                contract[3] != window.input_dtype ||
+                contract[4] != window.target_dtype ||
+                contract[5] != window.attention_present ||
+                contract[6] != window.attention_dtype)
+            return false;
+    }
+    if (!std::isfinite(tick.gradient_scale) || tick.gradient_scale <= 0.0)
+        return false;
+    if (attention_defined) {
+        try {
+            validate_linear_attention_mask(ctx, *attention_mask);
+        } catch (...) {
+            return false;
+        }
+    }
+    return true;
 }
 
-static void pipeline_window_validate_tick(
+static bool pipeline_window_validate_tick(
     TrainingContext* ctx,
     const Qwen36PipelineTickV1& tick
 ) {
     auto& window = ctx->pp_window;
     TORCH_CHECK(window.active, "pipeline window is not active");
-    TORCH_CHECK(tick.window_id == window.window_id,
-        "pipeline tick window id does not match active window");
-    TORCH_CHECK(tick.chunk_id == 0,
-        "pipeline window currently supports chunk_id=0 only");
+    bool valid = tick.window_id == window.window_id && tick.chunk_id == 0;
     const int32_t expected_phase = tick.forward_mb < 0 ? 2
-        : (tick.forward_mb == 0 ? 0 : 1);
-    TORCH_CHECK(tick.phase == expected_phase,
-        "pipeline tick phase mismatch: expected ", expected_phase,
-        " got ", tick.phase);
-    TORCH_CHECK(tick.forward_mb >= -1 && tick.backward_mb >= -1,
-        "pipeline tick microbatch ids must be >= -1");
+        : (tick.backward_mb < 0 ? 0 : 1);
+    valid = valid && tick.phase == expected_phase;
+    valid = valid && tick.forward_mb >= -1 && tick.backward_mb >= -1;
+    const int64_t warmup = std::min<int64_t>(
+        ctx->pp_world_size - ctx->pp_rank - 1,
+        window.num_microbatches);
     const int64_t expected_forward = window.next_forward;
     const int64_t expected_backward = window.next_backward;
     int64_t required_forward = -1;
     int64_t required_backward = -1;
-    if (ctx->pp_rank == 0) {
-        required_forward = expected_forward < window.num_microbatches
-            ? expected_forward : -1;
-        required_backward = required_forward >= 0
-            ? (required_forward == 0 ? -1 : required_forward - 1)
-            : expected_backward;
-    } else {
-        required_forward = expected_forward < window.num_microbatches
-            ? expected_forward : -1;
-        required_backward = required_forward >= 0 ? expected_backward : -1;
+    if (expected_forward < warmup) {
+        required_forward = expected_forward;
+    } else if (expected_forward < window.num_microbatches) {
+        required_forward = expected_forward;
+        required_backward = expected_forward - warmup;
+    } else if (expected_backward < window.num_microbatches) {
+        required_backward = expected_backward;
     }
-    TORCH_CHECK(tick.forward_mb == required_forward &&
-            tick.backward_mb == required_backward,
-        "pipeline tick schedule mismatch on PP rank ", ctx->pp_rank,
-        ": expected F", required_forward, "/B", required_backward,
-        " got F", tick.forward_mb, "/B", tick.backward_mb);
-    if (tick.backward_mb >= 0) {
-        auto it = window.slots.find(tick.backward_mb);
-        const bool same_tick_forward = tick.forward_mb == tick.backward_mb &&
-            tick.forward_mb >= 0;
+    valid = valid && tick.forward_mb == required_forward &&
+        tick.backward_mb == required_backward;
+    if (required_backward >= 0) {
+        auto it = window.slots.find(required_backward);
+        const bool same_tick_forward = required_forward == required_backward &&
+            required_forward >= 0;
         if (!same_tick_forward) {
-            TORCH_CHECK(it != window.slots.end() && it->second.forward_done &&
-                    !it->second.backward_done,
-                "pipeline backward microbatch does not have a live forward slot");
+            valid = valid && it != window.slots.end() &&
+                it->second.forward_done && !it->second.backward_done;
         }
     }
+    return valid;
 }
 
 static at::Tensor pipeline_window_forward(
@@ -7252,8 +7266,8 @@ extern "C" __attribute__((visibility("default"))) int32_t qwen36_pipeline_begin_
             "unsupported pipeline window ABI");
         TORCH_CHECK(!ctx->pp_window.active,
             "pipeline window is already active");
-        TORCH_CHECK(ctx->pp_world_size == 2 && ctx->cp_world_size == 1,
-            "pipeline window currently requires PP=2 and CP=1");
+        TORCH_CHECK(ctx->pp_world_size >= 2 && ctx->cp_world_size == 1,
+            "pipeline window requires PP>=2 and CP=1");
         TORCH_CHECK(ctx->router_aux_loss_coef == 0.0,
             "pipeline router auxiliary loss is not yet supported");
         TORCH_CHECK(window_spec->window_id >= 0 &&
@@ -7299,78 +7313,139 @@ extern "C" __attribute__((visibility("default"))) int32_t qwen36_pipeline_tick_v
                 tick->version == 1,
             "unsupported pipeline tick ABI");
         pipeline_window_validate_result(result);
-        pipeline_window_validate_tick(ctx, *tick);
         auto& window = ctx->pp_window;
+        const bool tick_valid = pipeline_window_validate_tick(ctx, *tick);
+        if (!tick_valid) window.local_error = true;
+        const int64_t warmup = std::min<int64_t>(
+            ctx->pp_world_size - ctx->pp_rank - 1,
+            window.num_microbatches);
+        const int64_t expected_forward = window.next_forward;
+        const int64_t expected_backward = window.next_backward;
+        int64_t required_forward = -1;
+        int64_t required_backward = -1;
+        if (expected_forward < warmup) {
+            required_forward = expected_forward;
+        } else if (expected_forward < window.num_microbatches) {
+            required_forward = expected_forward;
+            required_backward = expected_forward - warmup;
+        } else if (expected_backward < window.num_microbatches) {
+            required_backward = expected_backward;
+        }
         const int64_t hidden_size = ctx->weight_ptrs.empty()
             ? 0 : ctx->weight_ptrs[0]->numel();
         TORCH_CHECK(hidden_size > 0,
             "pipeline stage has no hidden-size metadata");
-        if (tick->forward_mb >= 0) {
-            pipeline_window_validate_forward_contract(ctx, *tick);
-        }
-
-        if (ctx->pp_rank == 0) {
-            if (tick->forward_mb >= 0) {
-                auto stage_output = pipeline_window_forward(
-                    ctx, *tick, hidden_size).contiguous();
-                if (tick->backward_mb >= 0) {
-                    auto& backward_slot = window.slots.at(tick->backward_mb);
-                    auto output_grad = pipeline_exchange_tensor(
-                        ctx, stage_output, backward_slot.input_ids,
-                        ctx->pp_rank + 1, hidden_size);
-                    pipeline_window_backward(
-                        ctx, tick->backward_mb, output_grad);
-                } else {
-                    pipeline_send_tensor(ctx, stage_output, ctx->pp_rank + 1);
+        const bool is_first_stage = ctx->is_first_pipeline_stage;
+        const bool is_last_stage = ctx->is_last_pipeline_stage;
+        const bool has_forward = required_forward >= 0;
+        const bool has_backward = required_backward >= 0;
+        if (has_forward) {
+            Qwen36PipelineTickV1 effective_tick = *tick;
+            effective_tick.window_id = window.window_id;
+            effective_tick.forward_mb = required_forward;
+            effective_tick.backward_mb = required_backward;
+            effective_tick.chunk_id = 0;
+            effective_tick.phase = has_backward ? 1 : 0;
+            bool forward_valid = tick_valid &&
+                pipeline_window_validate_forward_contract(ctx, *tick);
+            at::Tensor fallback_input_ids;
+            at::Tensor fallback_target_mask;
+            at::Tensor fallback_attention_mask;
+            if (!forward_valid) {
+                window.local_error = true;
+                int64_t fallback_batch = window.batch_size;
+                int64_t fallback_sequence = window.sequence_length;
+                if (tick->input_ids) {
+                    const auto& candidate = *reinterpret_cast<at::Tensor*>(
+                        tick->input_ids);
+                    if (candidate.defined() && candidate.dim() == 2) {
+                        if (fallback_batch <= 0) fallback_batch = candidate.size(0);
+                        if (fallback_sequence <= 1)
+                            fallback_sequence = candidate.size(1);
+                    }
                 }
-            } else {
-                TORCH_CHECK(tick->backward_mb >= 0,
-                    "pipeline cooldown tick requires a backward microbatch");
-                auto& backward_slot = window.slots.at(tick->backward_mb);
-                auto output_grad = pipeline_recv_tensor(
-                    ctx, backward_slot.input_ids,
-                    ctx->pp_rank + 1, hidden_size);
-                pipeline_window_backward(ctx, tick->backward_mb, output_grad);
+                if ((fallback_batch <= 0 || fallback_sequence <= 1) &&
+                        tick->target_mask) {
+                    const auto& candidate = *reinterpret_cast<at::Tensor*>(
+                        tick->target_mask);
+                    if (candidate.defined() && candidate.dim() == 2) {
+                        if (fallback_batch <= 0) fallback_batch = candidate.size(0);
+                        if (fallback_sequence <= 1)
+                            fallback_sequence = candidate.size(1);
+                    }
+                }
+                TORCH_CHECK(fallback_batch > 0 && fallback_sequence > 1,
+                    "pipeline window cannot recover a malformed first input");
+                std::vector<int64_t> shape_values{
+                    fallback_batch, fallback_sequence};
+                auto shape = at::IntArrayRef(shape_values);
+                auto device = at::Device(at::kCUDA, ctx->cuda_device);
+                fallback_input_ids = at::zeros(
+                    shape, at::TensorOptions().device(device).dtype(at::kLong));
+                fallback_target_mask = at::zeros(
+                    shape, at::TensorOptions().device(device).dtype(at::kLong));
+                if (window.attention_present > 0)
+                    fallback_attention_mask = at::ones(
+                        shape, at::TensorOptions().device(device).dtype(at::kFloat));
+                effective_tick.input_ids = &fallback_input_ids;
+                effective_tick.target_mask = &fallback_target_mask;
+                effective_tick.attention_mask =
+                    fallback_attention_mask.defined() ? &fallback_attention_mask : nullptr;
+                effective_tick.gradient_scale = 1.0;
             }
-        } else {
-            TORCH_CHECK(tick->forward_mb >= 0 && tick->backward_mb >= 0,
-                "last pipeline stage requires paired forward/backward ticks");
-            auto& input_ids = *reinterpret_cast<at::Tensor*>(tick->input_ids);
+            auto& input_ids = *reinterpret_cast<at::Tensor*>(
+                effective_tick.input_ids);
             at::Tensor stage_input;
-            if (tick->forward_mb == 0) {
-                TORCH_CHECK(!window.pending_backward_send.defined(),
-                    "pipeline warmup has an unexpected pending gradient");
+            if (!is_first_stage) {
                 stage_input = pipeline_recv_tensor(
                     ctx, input_ids, ctx->pp_rank - 1, hidden_size);
-            } else {
-                TORCH_CHECK(window.pending_backward_send.defined() &&
-                        window.pending_backward_mb == tick->backward_mb - 1,
-                    "pipeline steady tick is missing its pending backward gradient");
-                stage_input = pipeline_exchange_tensor(
-                    ctx, window.pending_backward_send, input_ids,
-                    ctx->pp_rank - 1, hidden_size);
-                window.pending_backward_send = at::Tensor();
-                window.pending_backward_mb = -1;
             }
-            pipeline_window_forward(ctx, *tick, hidden_size, stage_input);
+            auto stage_output = pipeline_window_forward(
+                ctx, effective_tick, hidden_size, stage_input).contiguous();
+
+            if (is_last_stage) {
+                auto input_grad = pipeline_window_backward(
+                    ctx, required_backward).contiguous();
+                if (!is_first_stage)
+                    pipeline_send_tensor(ctx, input_grad, ctx->pp_rank - 1);
+            } else if (has_backward) {
+                auto& backward_slot = window.slots.at(required_backward);
+                auto output_grad = pipeline_exchange_tensor(
+                    ctx, stage_output, backward_slot.input_ids,
+                    ctx->pp_rank + 1, hidden_size);
+                auto input_grad = pipeline_window_backward(
+                    ctx, required_backward, output_grad);
+                if (!is_first_stage)
+                    pipeline_send_tensor(ctx, input_grad, ctx->pp_rank - 1);
+            } else {
+                pipeline_send_tensor(ctx, stage_output, ctx->pp_rank + 1);
+            }
+        } else {
+            auto& backward_slot = window.slots.at(required_backward);
+            at::Tensor output_grad;
+            if (!is_last_stage) {
+                output_grad = pipeline_recv_tensor(
+                    ctx, backward_slot.input_ids,
+                    ctx->pp_rank + 1, hidden_size);
+            }
             auto input_grad = pipeline_window_backward(
-                ctx, tick->backward_mb).contiguous();
-            if (tick->backward_mb + 1 == window.num_microbatches) {
+                ctx, required_backward, output_grad);
+            if (!is_first_stage)
                 pipeline_send_tensor(ctx, input_grad, ctx->pp_rank - 1);
-            } else {
-                window.pending_backward_send = input_grad;
-                window.pending_backward_mb = tick->backward_mb;
-            }
         }
         pipeline_window_write_result(ctx, result, 0, window.total_loss);
         return 0;
     } catch (const std::exception& e) {
         fprintf(stderr, "[pipeline_window] tick FAILED: %s\n", e.what());
-        pipeline_window_reset(reinterpret_cast<TrainingContext*>(ctx_ptr));
+        auto* ctx = reinterpret_cast<TrainingContext*>(ctx_ptr);
+        clear_gradient_accumulators(ctx);
+        pipeline_window_reset(ctx);
         return -1;
     } catch (...) {
         fprintf(stderr, "[pipeline_window] tick FAILED: unknown error\n");
-        pipeline_window_reset(reinterpret_cast<TrainingContext*>(ctx_ptr));
+        auto* ctx = reinterpret_cast<TrainingContext*>(ctx_ptr);
+        clear_gradient_accumulators(ctx);
+        pipeline_window_reset(ctx);
         return -1;
     }
 }
@@ -7396,6 +7471,20 @@ extern "C" __attribute__((visibility("default"))) int32_t qwen36_pipeline_finish
             "pipeline window cannot finish before every forward/backward completes");
         TORCH_CHECK(window.normalization_mask.defined(),
             "pipeline window has no normalization mask");
+        auto status = at::full(
+            {1}, window.local_error ? 0 : 1,
+            at::TensorOptions().device(at::kCUDA, ctx->cuda_device).dtype(at::kInt));
+        auto control_comm = ctx->pp_control_comm ?
+            ctx->pp_control_comm : ctx->pp_comm;
+        auto stream = c10::cuda::getCurrentCUDAStream(ctx->cuda_device).stream();
+        const auto status_error = ncclAllReduce(
+            status.data_ptr<int32_t>(), status.data_ptr<int32_t>(), 1,
+            ncclInt32, ncclMin, control_comm, stream);
+        TORCH_CHECK(status_error == ncclSuccess,
+            "pipeline error consensus failed: ",
+            ncclGetErrorString(status_error));
+        TORCH_CHECK(status.to(at::kCPU).item<int32_t>() == 1,
+            "pipeline window aborted because at least one PP rank rejected a tick");
         validate_pipeline_collective_registry(
             ctx, 1, 0.0, ctx->accumulated_token_weight);
         const int64_t completed_microbatches = window.num_microbatches;
@@ -7415,11 +7504,15 @@ extern "C" __attribute__((visibility("default"))) int32_t qwen36_pipeline_finish
         return 0;
     } catch (const std::exception& e) {
         fprintf(stderr, "[pipeline_window] finish FAILED: %s\n", e.what());
-        pipeline_window_reset(reinterpret_cast<TrainingContext*>(ctx_ptr));
+        auto* ctx = reinterpret_cast<TrainingContext*>(ctx_ptr);
+        clear_gradient_accumulators(ctx);
+        pipeline_window_reset(ctx);
         return -1;
     } catch (...) {
         fprintf(stderr, "[pipeline_window] finish FAILED: unknown error\n");
-        pipeline_window_reset(reinterpret_cast<TrainingContext*>(ctx_ptr));
+        auto* ctx = reinterpret_cast<TrainingContext*>(ctx_ptr);
+        clear_gradient_accumulators(ctx);
+        pipeline_window_reset(ctx);
         return -1;
     }
 }
@@ -10946,6 +11039,7 @@ static ncclComm_t g_dp_comm = nullptr;
 static cudaStream_t g_dp_stream = nullptr;
 static ncclComm_t g_pp_comm = nullptr;
 static cudaStream_t g_pp_stream = nullptr;
+static ncclComm_t g_pp_control_comm = nullptr;
 static bool g_nccl_initialized = false;
 static bool g_nccl_cleanup_registered = false;
 static int g_parallel_rank = 0;
@@ -10967,6 +11061,7 @@ static int g_parallel_pp_size = 1;
 static int g_parallel_pp_color = 0;
 
 static void qwen36_destroy_process_communicators() {
+    if (g_pp_control_comm) ncclCommDestroy(g_pp_control_comm);
     if (g_pp_comm) ncclCommDestroy(g_pp_comm);
     if (g_dp_comm) ncclCommDestroy(g_dp_comm);
     if (g_ep_comm) ncclCommDestroy(g_ep_comm);
@@ -10974,6 +11069,7 @@ static void qwen36_destroy_process_communicators() {
     if (g_tp_comm) ncclCommDestroy(g_tp_comm);
     if (g_nccl_comm) ncclCommDestroy(g_nccl_comm);
     g_pp_comm = nullptr;
+    g_pp_control_comm = nullptr;
     g_dp_comm = nullptr;
     g_ep_comm = nullptr;
     g_cp_comm = nullptr;
@@ -11118,6 +11214,7 @@ static int32_t qwen36_init_parallel_nccl_impl(
         ctx->dp_stream = dp_size > 1 ? g_dp_stream : nullptr;
         ctx->pp_comm = pp_size > 1 ? g_pp_comm : nullptr;
         ctx->pp_stream = pp_size > 1 ? g_pp_stream : nullptr;
+        ctx->pp_control_comm = pp_size > 1 ? g_pp_control_comm : nullptr;
         void* layer_comm = ep_size > 1 ? (void*)g_ep_comm : nullptr;
         void* layer_stream = ep_size > 1 ? (void*)g_ep_stream : nullptr;
         for (auto& lc : ctx->layer_configs) {
@@ -11341,7 +11438,9 @@ static int32_t qwen36_init_parallel_nccl_impl(
     ncclComm_t ep_comm = nullptr;
     ncclComm_t dp_comm = nullptr;
     ncclComm_t pp_comm = nullptr;
+    ncclComm_t pp_control_comm = nullptr;
     auto destroy_local_communicators = [&]() {
+        if (pp_control_comm) ncclCommDestroy(pp_control_comm);
         if (pp_comm) ncclCommDestroy(pp_comm);
         if (dp_comm) ncclCommDestroy(dp_comm);
         if (ep_comm) ncclCommDestroy(ep_comm);
@@ -11368,6 +11467,17 @@ static int32_t qwen36_init_parallel_nccl_impl(
         ctx->topology_invalid = true;
         return -1;
     }
+    if (pp_comm) {
+        const ncclResult_t control_error = ncclCommSplit(
+            pp_comm, 0, pp_rank, &pp_control_comm, nullptr);
+        if (control_error != ncclSuccess) {
+            fprintf(stderr, "[pp_nccl] control communicator split failed: %d (%s)\\n",
+                control_error, ncclGetErrorString(control_error));
+            destroy_local_communicators();
+            ctx->topology_invalid = true;
+            return -1;
+        }
+    }
 
     g_nccl_comm = comm;
     g_nccl_stream = nccl_stream;
@@ -11381,6 +11491,7 @@ static int32_t qwen36_init_parallel_nccl_impl(
     g_dp_stream = nccl_stream;
     g_pp_comm = pp_comm;
     g_pp_stream = nccl_stream;
+    g_pp_control_comm = pp_control_comm;
     g_parallel_rank = rank;
     g_parallel_world_size = world_size;
     g_parallel_tp_rank = tp_rank;
@@ -11426,6 +11537,7 @@ static int32_t qwen36_init_parallel_nccl_impl(
     ctx->pp_rank = pp_rank;
     ctx->pp_comm = pp_size > 1 ? g_pp_comm : nullptr;
     ctx->pp_stream = pp_size > 1 ? g_pp_stream : nullptr;
+    ctx->pp_control_comm = pp_size > 1 ? g_pp_control_comm : nullptr;
 
     // Propagate to layer configs
     void* layer_comm = ep_size > 1 ? (void*)g_ep_comm : nullptr;

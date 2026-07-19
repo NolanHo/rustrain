@@ -132,29 +132,36 @@ fn training_source_coordinate(
 
 fn pipeline_1f1b_schedule(
     pp_rank: usize,
+    pp_size: usize,
     num_microbatches: usize,
 ) -> Result<Vec<(Option<i64>, Option<i64>)>> {
-    if pp_rank >= 2 {
-        bail!("PP2 schedule received invalid pipeline rank {pp_rank}");
+    if pp_size < 2 {
+        bail!("pipeline schedule requires PP_SIZE >= 2");
+    }
+    if pp_rank >= pp_size {
+        bail!("pipeline rank {pp_rank} is outside PP_SIZE={pp_size}");
     }
     if num_microbatches == 0 {
         bail!("pipeline schedule requires at least one microbatch");
     }
-    let mut schedule = Vec::with_capacity(num_microbatches + usize::from(pp_rank == 0));
-    if pp_rank == 0 {
-        for microbatch in 0..num_microbatches {
-            let microbatch = i64::try_from(microbatch).context("microbatch id exceeds i64")?;
-            schedule.push((Some(microbatch), (microbatch > 0).then_some(microbatch - 1)));
-        }
+    let warmup = (pp_size - pp_rank - 1).min(num_microbatches);
+    let mut schedule = Vec::with_capacity(num_microbatches + warmup);
+    for microbatch in 0..warmup {
+        schedule.push((
+            Some(i64::try_from(microbatch).context("microbatch id exceeds i64")?),
+            None,
+        ));
+    }
+    for microbatch in warmup..num_microbatches {
+        let forward = i64::try_from(microbatch).context("microbatch id exceeds i64")?;
+        let backward = i64::try_from(microbatch - warmup).context("microbatch id exceeds i64")?;
+        schedule.push((Some(forward), Some(backward)));
+    }
+    for microbatch in num_microbatches - warmup..num_microbatches {
         schedule.push((
             None,
-            Some(i64::try_from(num_microbatches - 1).context("microbatch id exceeds i64")?),
+            Some(i64::try_from(microbatch).context("microbatch id exceeds i64")?),
         ));
-    } else {
-        for microbatch in 0..num_microbatches {
-            let microbatch = i64::try_from(microbatch).context("microbatch id exceeds i64")?;
-            schedule.push((Some(microbatch), Some(microbatch)));
-        }
     }
     Ok(schedule)
 }
@@ -251,9 +258,9 @@ mod tests {
     }
 
     #[test]
-    fn pp2_schedule_matches_non_interleaved_1f1b() {
+    fn pipeline_schedule_matches_non_interleaved_1f1b() {
         assert_eq!(
-            pipeline_1f1b_schedule(0, 4).unwrap(),
+            pipeline_1f1b_schedule(0, 2, 4).unwrap(),
             vec![
                 (Some(0), None),
                 (Some(1), Some(0)),
@@ -263,7 +270,37 @@ mod tests {
             ]
         );
         assert_eq!(
-            pipeline_1f1b_schedule(1, 4).unwrap(),
+            pipeline_1f1b_schedule(1, 2, 4).unwrap(),
+            vec![
+                (Some(0), Some(0)),
+                (Some(1), Some(1)),
+                (Some(2), Some(2)),
+                (Some(3), Some(3)),
+            ]
+        );
+        assert_eq!(
+            pipeline_1f1b_schedule(1, 3, 4).unwrap(),
+            vec![
+                (Some(0), None),
+                (Some(1), Some(0)),
+                (Some(2), Some(1)),
+                (Some(3), Some(2)),
+                (None, Some(3)),
+            ]
+        );
+        assert_eq!(
+            pipeline_1f1b_schedule(0, 3, 4).unwrap(),
+            vec![
+                (Some(0), None),
+                (Some(1), None),
+                (Some(2), Some(0)),
+                (Some(3), Some(1)),
+                (None, Some(2)),
+                (None, Some(3)),
+            ]
+        );
+        assert_eq!(
+            pipeline_1f1b_schedule(2, 3, 4).unwrap(),
             vec![
                 (Some(0), Some(0)),
                 (Some(1), Some(1)),
@@ -1046,7 +1083,7 @@ fn train_impl(
             (input_ids, target_mask, attention_mask)
         };
 
-        let loss_value = if pp_size == 2 {
+        let loss_value = if pp_size > 1 {
             let window_id = i64::try_from(step).context("pipeline window id exceeds i64")?;
             let num_microbatches = i64::try_from(gradient_accumulation_steps)
                 .context("pipeline microbatch count exceeds i64")?;
@@ -1054,7 +1091,7 @@ fn train_impl(
             let schedule_result = (|| -> Result<f64> {
                 let gradient_scale = 1.0 / gradient_accumulation_steps as f64;
                 for (forward_mb, backward_mb) in
-                    pipeline_1f1b_schedule(pp_rank, gradient_accumulation_steps)?
+                    pipeline_1f1b_schedule(pp_rank, pp_size, gradient_accumulation_steps)?
                 {
                     if let Some(microbatch) = forward_mb {
                         let (input_ids, target_mask, attention_mask) =

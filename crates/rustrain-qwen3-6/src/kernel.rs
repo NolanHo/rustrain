@@ -1207,7 +1207,7 @@ impl CppTrainingContext {
         Ok(loss)
     }
 
-    /// Open a fixed-shape PP2/1F1B pipeline window. The native side owns all
+    /// Open a fixed-shape non-interleaved 1F1B pipeline window. The native side owns all
     /// activation/gradient slots until `pipeline_finish_v1` or abort.
     pub fn pipeline_begin_v1(&self, window_id: i64, num_microbatches: i64) -> Result<()> {
         if window_id < 0 {
@@ -1262,10 +1262,9 @@ impl CppTrainingContext {
             backward_mb: backward_mb.unwrap_or(-1),
             chunk_id: 0,
             phase: match (forward_mb, backward_mb) {
-                (Some(0), _) => 0,
-                (Some(_), _) => 1,
-                (None, Some(_)) => 2,
-                (None, None) => 2,
+                (Some(_), None) => 0,
+                (Some(_), Some(_)) => 1,
+                (None, _) => 2,
             },
             input_ids: input_ids
                 .map(|tensor| tensor.as_ptr() as *mut c_void)
