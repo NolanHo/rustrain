@@ -62,6 +62,9 @@ pub struct TrainConfig {
     pub global_batch_size: usize,
     pub gradient_accumulation_steps: usize,
     pub learning_rate: f32,
+    /// Megatron's total auxiliary MTP loss weight. Defaults to 0.1.
+    #[serde(default = "default_mtp_loss_scaling_factor")]
+    pub mtp_loss_scaling_factor: f64,
     pub weight_decay: f32,
     pub adam_beta1: f32,
     pub adam_beta2: f32,
@@ -72,9 +75,29 @@ pub struct TrainConfig {
     pub max_grad_norm: Option<f32>,
     pub dtype: DType,
     pub device: Device,
+    /// Maximum fraction of a CUDA device available to PyTorch's caching allocator.
+    #[serde(default = "default_cuda_memory_fraction")]
+    pub cuda_memory_fraction: f64,
+    /// Pre-dequantize cached FP8 expert weights at startup for faster linear kernels.
+    #[serde(default = "default_predequant_expert_weights")]
+    pub predequant_expert_weights: bool,
     pub checkpoint_every: u64,
     #[serde(default = "default_eval_every")]
     pub eval_every: u64,
+}
+
+pub const DEFAULT_MTP_LOSS_SCALING_FACTOR: f64 = 0.1;
+
+fn default_mtp_loss_scaling_factor() -> f64 {
+    DEFAULT_MTP_LOSS_SCALING_FACTOR
+}
+
+fn default_cuda_memory_fraction() -> f64 {
+    0.95
+}
+
+fn default_predequant_expert_weights() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -757,6 +780,19 @@ pub fn validate_config(config: &Config) -> Result<()> {
     }
     if config.train.learning_rate <= 0.0 {
         return Err(anyhow!("learning_rate must be greater than zero"));
+    }
+    if !config.train.mtp_loss_scaling_factor.is_finite()
+        || config.train.mtp_loss_scaling_factor < 0.0
+    {
+        return Err(anyhow!(
+            "mtp_loss_scaling_factor must be finite and non-negative"
+        ));
+    }
+    if !config.train.cuda_memory_fraction.is_finite()
+        || config.train.cuda_memory_fraction <= 0.0
+        || config.train.cuda_memory_fraction > 1.0
+    {
+        return Err(anyhow!("cuda_memory_fraction must be finite and in (0, 1]"));
     }
     if let Some(max_grad_norm) = config.train.max_grad_norm {
         if max_grad_norm <= 0.0 {
@@ -1647,6 +1683,7 @@ mod tests {
                 global_batch_size: 4,
                 gradient_accumulation_steps: 2,
                 learning_rate: 100.0,
+                mtp_loss_scaling_factor: 0.1,
                 weight_decay: 0.0,
                 adam_beta1: 0.9,
                 adam_beta2: 0.999,
@@ -1655,6 +1692,8 @@ mod tests {
                 max_grad_norm: Some(0.0001),
                 dtype: DType::Fp32,
                 device: Device::Cuda,
+                cuda_memory_fraction: 0.95,
+                predequant_expert_weights: true,
                 checkpoint_every: 0,
                 eval_every: 0,
             },

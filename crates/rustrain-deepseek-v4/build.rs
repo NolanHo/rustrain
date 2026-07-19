@@ -3,8 +3,39 @@
 // Detects the PyTorch installation (same one tch-rs uses) and compiles
 // kernels/fp8_gemm.cpp with g++, linking against libtorch/libtorch_cuda.
 
-use std::path::PathBuf;
 use std::process::Command;
+
+fn detect_python_torch_paths() -> Option<(String, String)> {
+    let mut candidates = Vec::new();
+    if let Ok(python) = std::env::var("PYTHON") {
+        candidates.push(python);
+    }
+    candidates.extend(["python3".to_string(), "python".to_string()]);
+    for python in candidates {
+        let Ok(output) = Command::new(python)
+            .args([
+                "-c",
+                "import pathlib, torch; root = pathlib.Path(torch.__file__).resolve().parent; print(root / 'include'); print(root / 'lib')",
+            ])
+            .output()
+        else {
+            continue;
+        };
+        if !output.status.success() {
+            continue;
+        }
+        let stdout = String::from_utf8(output.stdout).ok()?;
+        let mut lines = stdout.lines();
+        let include = lines.next()?.trim().to_string();
+        let lib = lines.next()?.trim().to_string();
+        if std::path::Path::new(&include).join("ATen/ATen.h").is_file()
+            && std::path::Path::new(&lib).join("libtorch.so").is_file()
+        {
+            return Some((include, lib));
+        }
+    }
+    None
+}
 
 /// Detect PyTorch's _GLIBCXX_USE_CXX11_ABI setting by running Python.
 fn detect_cxx11_abi() -> String {
@@ -13,7 +44,10 @@ fn detect_cxx11_abi() -> String {
     }
     for py in &["python3", "python"] {
         if let Ok(out) = std::process::Command::new(py)
-            .args(["-c", "import torch; print(int(torch._C._GLIBCXX_USE_CXX11_ABI))"])
+            .args([
+                "-c",
+                "import torch; print(int(torch._C._GLIBCXX_USE_CXX11_ABI))",
+            ])
             .output()
         {
             if out.status.success() {
@@ -33,13 +67,21 @@ fn main() {
     // Always re-run when env vars change
     println!("cargo:rerun-if-env-changed=TORCH_INCLUDE_PATH");
     println!("cargo:rerun-if-env-changed=TORCH_LIB_PATH");
+    println!("cargo:rerun-if-env-changed=PYTHON");
     println!("cargo:rerun-if-changed=kernels/fp8_gemm.cpp");
     println!("cargo:rerun-if-changed=kernels/glm5_attention.cpp");
     println!("cargo:rerun-if-changed=kernels/v4_flash_kernels.cpp");
     println!("cargo:rerun-if-changed=build.rs");
 
     // Skip on non-CUDA builds or when torch isn't available
+    let detected_torch = detect_python_torch_paths();
     let torch_include = std::env::var("TORCH_INCLUDE_PATH")
+        .or_else(|_| {
+            detected_torch
+                .as_ref()
+                .map(|(include, _)| include.clone())
+                .ok_or(std::env::VarError::NotPresent)
+        })
         .or_else(|_| {
             let candidates = [
                 "/vePFS-Mindverse/user/nolanho/rustrain-env/lib/python3.12/site-packages/torch/include",
@@ -66,6 +108,12 @@ fn main() {
     };
 
     let torch_lib = std::env::var("TORCH_LIB_PATH")
+        .or_else(|_| {
+            detected_torch
+                .as_ref()
+                .map(|(_, lib)| lib.clone())
+                .ok_or(std::env::VarError::NotPresent)
+        })
         .or_else(|_| {
             let candidates = [
                 "/vePFS-Mindverse/user/nolanho/rustrain-env/lib/python3.12/site-packages/torch/lib",
@@ -105,20 +153,19 @@ fn main() {
     println!("cargo:warning=CXX11 ABI detected: {cxx11_abi_val}");
 
     // Find CUDA include path
-    let cuda_inc = std::env::var("CUDA_INCLUDE_PATH")
-        .unwrap_or_else(|_| {
-            let candidates = [
-                "/share/code/nolanho/pydeps/lora-research/nvidia/cu13/include",
-                "/usr/local/cuda-13.0/include",
-                "/usr/local/cuda/include",
-            ];
-            for c in &candidates {
-                if std::path::Path::new(&format!("{c}/cuda_runtime_api.h")).exists() {
-                    return c.to_string();
-                }
+    let cuda_inc = std::env::var("CUDA_INCLUDE_PATH").unwrap_or_else(|_| {
+        let candidates = [
+            "/share/code/nolanho/pydeps/lora-research/nvidia/cu13/include",
+            "/usr/local/cuda-13.0/include",
+            "/usr/local/cuda/include",
+        ];
+        for c in &candidates {
+            if std::path::Path::new(&format!("{c}/cuda_runtime_api.h")).exists() {
+                return c.to_string();
             }
-            "/usr/local/cuda/include".to_string()
-        });
+        }
+        "/usr/local/cuda/include".to_string()
+    });
 
     // CUDA headers are split across two dirs (cuda_runtime_api.h in one, crt/ in another)
     let cuda_inc2 = std::env::var("CUDA_INCLUDE_PATH2")
@@ -159,7 +206,7 @@ fn main() {
         .args([
             &format!("-L{torch_lib}"),
             &format!("-Wl,-rpath,{torch_lib}"),
-            "-Wl,--no-as-needed",  // Force all libs into NEEDED list
+            "-Wl,--no-as-needed", // Force all libs into NEEDED list
             "-ltorch",
             "-ltorch_cuda",
             "-ltorch_cpu",
@@ -189,6 +236,44 @@ fn main() {
         }
     }
 
+    // GLM5 CP autograd and the V4 flash kernel both call NCCL directly.
+    let nccl_inc = std::env::var("NCCL_INCLUDE_PATH").unwrap_or_else(|_| {
+        let candidates = [
+            "/share/code/nolanho/mint-runtime-py31213/host-venv/lib/python3.12/site-packages/nvidia/nccl/include",
+        ];
+        for c in &candidates {
+            if std::path::Path::new(&format!("{c}/nccl.h")).exists() {
+                return c.to_string();
+            }
+        }
+        String::new()
+    });
+    let nccl_lib_dir = std::env::var("NCCL_LIB_PATH").unwrap_or_else(|_| {
+        let candidates = [
+            "/share/code/nolanho/mint-runtime-py31213/host-venv/lib/python3.12/site-packages/nvidia/nccl/lib",
+        ];
+        for c in &candidates {
+            if std::path::Path::new(&format!("{c}/libnccl.so")).exists() {
+                return c.to_string();
+            }
+        }
+        String::new()
+    });
+    let nccl_inc_arg = if nccl_inc.is_empty() {
+        String::new()
+    } else {
+        format!("-I{nccl_inc}")
+    };
+    let nccl_lib_args: Vec<String> = if nccl_lib_dir.is_empty() {
+        vec![]
+    } else {
+        vec![
+            format!("-L{nccl_lib_dir}"),
+            format!("-Wl,-rpath,{nccl_lib_dir}"),
+            "-lnccl".to_string(),
+        ]
+    };
+
     // ── Compile GLM5 attention kernel ──
     let glm5_src = "kernels/glm5_attention.cpp";
     let glm5_lib = format!("{out_dir}/libglm5_attention.so");
@@ -203,26 +288,50 @@ fn main() {
     let inc_torch = format!("-I{torch_include}");
     let inc_cuda = format!("-I{cuda_inc}");
 
-    let glm5_status = Command::new("g++")
-        .args([
-            "-shared", "-fPIC", "-std=c++17", "-O2",
-            cxx11_abi.as_str(),
-            "-o", &glm5_lib,
-            glm5_src,
-            &inc_torch, &inc_aten, &inc_c10, &inc_caffe2, &inc_cuda,
-            &l_arg, &rpath_arg,
-            "-Wl,--no-as-needed",
-            "-ltorch", "-ltorch_cuda", "-ltorch_cpu", "-lc10", "-lc10_cuda",
-        ])
-        .args(if cuda_inc2.is_empty() { vec![] } else { vec![format!("-I{cuda_inc2}")] })
-        .status();
+    let mut glm5_args: Vec<String> = [
+        "-shared",
+        "-fPIC",
+        "-std=c++17",
+        "-O2",
+        cxx11_abi.as_str(),
+        "-o",
+        &glm5_lib,
+        glm5_src,
+        &inc_torch,
+        &inc_aten,
+        &inc_c10,
+        &inc_caffe2,
+        &inc_cuda,
+        &l_arg,
+        &rpath_arg,
+        "-Wl,--no-as-needed",
+        "-ltorch",
+        "-ltorch_cuda",
+        "-ltorch_cpu",
+        "-lc10",
+        "-lc10_cuda",
+    ]
+    .into_iter()
+    .map(String::from)
+    .collect();
+    if !cuda_inc2.is_empty() {
+        glm5_args.push(format!("-I{cuda_inc2}"));
+    }
+    glm5_args.extend(nccl_lib_args.iter().cloned());
+    let glm5_status = Command::new("g++").args(&glm5_args).status();
 
     match glm5_status {
         Ok(s) if s.success() => {
             println!("cargo:rustc-link-lib=dylib=glm5_attention");
+            if !nccl_lib_dir.is_empty() {
+                println!("cargo:rustc-link-search=native={nccl_lib_dir}");
+                println!("cargo:rustc-link-lib=dylib=nccl");
+            }
         }
         _ => {
-            println!("cargo:warning=Failed to compile GLM5 attention kernel, C++ attention disabled");
+            println!(
+                "cargo:warning=Failed to compile GLM5 attention kernel, C++ attention disabled"
+            );
         }
     }
 
@@ -230,58 +339,45 @@ fn main() {
     let v4_src = "kernels/v4_flash_kernels.cpp";
     let v4_lib = format!("{out_dir}/libv4_flash_kernels.so");
 
-    // Find NCCL include + lib paths
-    let nccl_inc = std::env::var("NCCL_INCLUDE_PATH")
-        .unwrap_or_else(|_| {
-            let candidates = [
-                "/share/code/nolanho/mint-runtime-py31213/host-venv/lib/python3.12/site-packages/nvidia/nccl/include",
-            ];
-            for c in &candidates {
-                if std::path::Path::new(&format!("{c}/nccl.h")).exists() {
-                    return c.to_string();
-                }
-            }
-            String::new()
-        });
-    let nccl_lib_dir = std::env::var("NCCL_LIB_PATH")
-        .unwrap_or_else(|_| {
-            let candidates = [
-                "/share/code/nolanho/mint-runtime-py31213/host-venv/lib/python3.12/site-packages/nvidia/nccl/lib",
-            ];
-            for c in &candidates {
-                if std::path::Path::new(&format!("{c}/libnccl.so")).exists() {
-                    return c.to_string();
-                }
-            }
-            String::new()
-        });
-
-    let nccl_inc_arg = if nccl_inc.is_empty() { String::new() } else { format!("-I{nccl_inc}") };
-    let nccl_lib_args: Vec<String> = if nccl_lib_dir.is_empty() {
-        vec![]
-    } else {
-        vec![format!("-L{nccl_lib_dir}"), format!("-Wl,-rpath,{nccl_lib_dir}"), "-lnccl".to_string()]
-    };
-
-    println!("cargo:warning=Compiling V4 Flash kernel: src={v4_src} nccl_inc={nccl_inc} nccl_lib={nccl_lib_dir}");
+    println!(
+        "cargo:warning=Compiling V4 Flash kernel: src={v4_src} nccl_inc={nccl_inc} nccl_lib={nccl_lib_dir}"
+    );
 
     let mut v4_args: Vec<String> = vec![
-        "-shared", "-fPIC", "-std=c++17", "-O2",
+        "-shared",
+        "-fPIC",
+        "-std=c++17",
+        "-O2",
         cxx11_abi.as_str(),
-        "-o", &v4_lib,
+        "-o",
+        &v4_lib,
         v4_src,
-        &inc_torch, &inc_aten, &inc_c10, &inc_caffe2, &inc_cuda,
-        &l_arg, &rpath_arg,
+        &inc_torch,
+        &inc_aten,
+        &inc_c10,
+        &inc_caffe2,
+        &inc_cuda,
+        &l_arg,
+        &rpath_arg,
         "-Wl,--no-as-needed",
-        "-ltorch", "-ltorch_cuda", "-ltorch_cpu", "-lc10", "-lc10_cuda",
-    ].into_iter().map(String::from).collect();
-    if !nccl_inc_arg.is_empty() { v4_args.push(nccl_inc_arg); }
-    if !cuda_inc2.is_empty() { v4_args.push(format!("-I{cuda_inc2}")); }
+        "-ltorch",
+        "-ltorch_cuda",
+        "-ltorch_cpu",
+        "-lc10",
+        "-lc10_cuda",
+    ]
+    .into_iter()
+    .map(String::from)
+    .collect();
+    if !nccl_inc_arg.is_empty() {
+        v4_args.push(nccl_inc_arg);
+    }
+    if !cuda_inc2.is_empty() {
+        v4_args.push(format!("-I{cuda_inc2}"));
+    }
     v4_args.extend(nccl_lib_args.iter().cloned());
 
-    let v4_status = Command::new("g++")
-        .args(&v4_args)
-        .status();
+    let v4_status = Command::new("g++").args(&v4_args).status();
 
     match v4_status {
         Ok(s) if s.success() => {
@@ -299,7 +395,9 @@ fn main() {
     // ── Compile fused_kernels.cu with nvcc ──
     let nvcc_path = {
         let candidates = [
-            std::env::var("CUDA_HOME").ok().map(|h| format!("{h}/bin/nvcc")),
+            std::env::var("CUDA_HOME")
+                .ok()
+                .map(|h| format!("{h}/bin/nvcc")),
             Some("nvcc".to_string()),
         ];
         let mut found = String::new();
@@ -309,7 +407,11 @@ fn main() {
                     found = c.clone();
                     break;
                 }
-                if std::process::Command::new(c).arg("--version").output().is_ok() {
+                if std::process::Command::new(c)
+                    .arg("--version")
+                    .output()
+                    .is_ok()
+                {
                     found = c.clone();
                     break;
                 }
@@ -324,32 +426,53 @@ fn main() {
             let fused_obj = format!("{out_dir}/fused_kernels.o");
             let fused_status = Command::new(&nvcc_path)
                 .args([
-                    "-c", fused_cu, "-o", &fused_obj,
-                    "-O2", "-std=c++17",
+                    "-c",
+                    fused_cu,
+                    "-o",
+                    &fused_obj,
+                    "-O2",
+                    "-std=c++17",
                     &cxx11_abi,
                     &format!("-I{inc_torch}"),
                     &format!("-I{inc_aten}"),
                     &format!("-I{inc_c10}"),
                     &format!("-I{inc_caffe2}"),
                     &format!("-I{inc_cuda}"),
-                    "-Xcompiler", "-fPIC",
+                    "-Xcompiler",
+                    "-fPIC",
                 ])
                 .status();
             if fused_status.map(|s| s.success()).unwrap_or(false) {
                 // Re-link v4_flash_kernels.so with fused_kernels.o
                 let mut relink_args = vec![
-                    "-shared".to_string(), "-fPIC".to_string(), "-std=c++17".to_string(), "-O2".to_string(),
+                    "-shared".to_string(),
+                    "-fPIC".to_string(),
+                    "-std=c++17".to_string(),
+                    "-O2".to_string(),
                     cxx11_abi.to_string(),
-                    "-o".to_string(), v4_lib.clone(), v4_src.to_string(), fused_obj.clone(),
-                    inc_torch.clone(), inc_aten.clone(), inc_c10.clone(), inc_caffe2.clone(), inc_cuda.clone(),
-                    l_arg.clone(), rpath_arg.clone(),
+                    "-o".to_string(),
+                    v4_lib.clone(),
+                    v4_src.to_string(),
+                    fused_obj.clone(),
+                    inc_torch.clone(),
+                    inc_aten.clone(),
+                    inc_c10.clone(),
+                    inc_caffe2.clone(),
+                    inc_cuda.clone(),
+                    l_arg.clone(),
+                    rpath_arg.clone(),
                     "-Wl,--no-as-needed".to_string(),
-                    "-ltorch".to_string(), "-ltorch_cuda".to_string(), "-ltorch_cpu".to_string(),
-                    "-lc10".to_string(), "-lc10_cuda".to_string(),
+                    "-ltorch".to_string(),
+                    "-ltorch_cuda".to_string(),
+                    "-ltorch_cpu".to_string(),
+                    "-lc10".to_string(),
+                    "-lc10_cuda".to_string(),
                 ];
                 relink_args.extend(nccl_lib_args.iter().cloned());
                 let _ = Command::new("g++").args(&relink_args).status();
-                println!("cargo:warning=Fused CUDA kernels compiled and linked into v4_flash_kernels.so");
+                println!(
+                    "cargo:warning=Fused CUDA kernels compiled and linked into v4_flash_kernels.so"
+                );
             }
         }
     }
