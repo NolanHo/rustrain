@@ -6967,35 +6967,38 @@ static void pipeline_window_validate_forward_contract(
         locally_valid && attention_defined
             ? static_cast<int64_t>(attention_mask->scalar_type()) : -1,
     };
+    // Every forward tick participates in the PP contract check. Checking only
+    // the first microbatch lets a later shape mismatch reach NCCL with
+    // different element counts, where it can hang instead of failing closed.
+    auto options = at::TensorOptions().dtype(at::kLong).device(
+        at::kCUDA, ctx->cuda_device);
+    auto minimum = at::tensor(signature, options);
+    auto maximum = minimum.clone();
+    auto stream = c10::cuda::getCurrentCUDAStream(ctx->cuda_device).stream();
+    TORCH_CHECK(ncclGroupStart() == ncclSuccess,
+        "pipeline contract ncclGroupStart failed");
+    const auto min_error = ncclAllReduce(
+        minimum.data_ptr<int64_t>(), minimum.data_ptr<int64_t>(),
+        minimum.numel(), ncclInt64, ncclMin, ctx->pp_comm, stream);
+    const auto max_error = ncclAllReduce(
+        maximum.data_ptr<int64_t>(), maximum.data_ptr<int64_t>(),
+        maximum.numel(), ncclInt64, ncclMax, ctx->pp_comm, stream);
+    const auto end_error = ncclGroupEnd();
+    const auto error = min_error != ncclSuccess ? min_error
+        : (max_error != ncclSuccess ? max_error : end_error);
+    TORCH_CHECK(error == ncclSuccess,
+        "pipeline contract consensus failed: ", ncclGetErrorString(error));
+    const auto minimum_cpu = minimum.to(at::kCPU);
+    const auto maximum_cpu = maximum.to(at::kCPU);
+    const auto* minimum_data = minimum_cpu.data_ptr<int64_t>();
+    const auto* maximum_data = maximum_cpu.data_ptr<int64_t>();
+    for (int64_t index = 0; index < minimum.numel(); ++index) {
+        TORCH_CHECK(minimum_data[index] == maximum_data[index],
+            "pipeline tensor shape/dtype contract differs across PP stages");
+    }
+    TORCH_CHECK(minimum_data[0] == 1,
+        "invalid pipeline window forward tensors");
     if (window.batch_size < 0) {
-        auto options = at::TensorOptions().dtype(at::kLong).device(
-            at::kCUDA, ctx->cuda_device);
-        auto minimum = at::tensor(signature, options);
-        auto maximum = minimum.clone();
-        auto stream = c10::cuda::getCurrentCUDAStream(ctx->cuda_device).stream();
-        TORCH_CHECK(ncclGroupStart() == ncclSuccess,
-            "pipeline contract ncclGroupStart failed");
-        const auto min_error = ncclAllReduce(
-            minimum.data_ptr<int64_t>(), minimum.data_ptr<int64_t>(),
-            minimum.numel(), ncclInt64, ncclMin, ctx->pp_comm, stream);
-        const auto max_error = ncclAllReduce(
-            maximum.data_ptr<int64_t>(), maximum.data_ptr<int64_t>(),
-            maximum.numel(), ncclInt64, ncclMax, ctx->pp_comm, stream);
-        const auto end_error = ncclGroupEnd();
-        const auto error = min_error != ncclSuccess ? min_error
-            : (max_error != ncclSuccess ? max_error : end_error);
-        TORCH_CHECK(error == ncclSuccess,
-            "pipeline contract consensus failed: ", ncclGetErrorString(error));
-        const auto minimum_cpu = minimum.to(at::kCPU);
-        const auto maximum_cpu = maximum.to(at::kCPU);
-        const auto* minimum_data = minimum_cpu.data_ptr<int64_t>();
-        const auto* maximum_data = maximum_cpu.data_ptr<int64_t>();
-        for (int64_t index = 0; index < minimum.numel(); ++index) {
-            TORCH_CHECK(minimum_data[index] == maximum_data[index],
-                "pipeline tensor shape/dtype contract differs across PP stages");
-        }
-        TORCH_CHECK(minimum_data[0] == 1,
-            "invalid pipeline window forward tensors");
         window.batch_size = minimum_data[1];
         window.sequence_length = minimum_data[2];
         window.input_dtype = static_cast<int32_t>(minimum_data[3]);
@@ -7003,14 +7006,12 @@ static void pipeline_window_validate_forward_contract(
         window.attention_present = static_cast<int32_t>(minimum_data[5]);
         window.attention_dtype = static_cast<int32_t>(minimum_data[6]);
     } else {
-        TORCH_CHECK(locally_valid &&
-                input_ids->size(0) == window.batch_size &&
-                input_ids->size(1) == window.sequence_length &&
-                static_cast<int32_t>(input_ids->scalar_type()) == window.input_dtype &&
-                static_cast<int32_t>(target_mask->scalar_type()) == window.target_dtype &&
-                static_cast<int32_t>(attention_defined) == window.attention_present &&
-                (!attention_defined || static_cast<int32_t>(
-                    attention_mask->scalar_type()) == window.attention_dtype),
+        TORCH_CHECK(minimum_data[1] == window.batch_size &&
+                minimum_data[2] == window.sequence_length &&
+                minimum_data[3] == window.input_dtype &&
+                minimum_data[4] == window.target_dtype &&
+                minimum_data[5] == window.attention_present &&
+                minimum_data[6] == window.attention_dtype,
             "pipeline microbatch violates the window's fixed shape/dtype contract");
     }
     TORCH_CHECK(std::isfinite(tick.gradient_scale) && tick.gradient_scale > 0.0,

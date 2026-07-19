@@ -391,12 +391,17 @@ int main() {
     auto bad_target_mask = at::ones(
         {1, sequence_length - 1},
         at::TensorOptions().device(at::kCUDA).dtype(at::kLong));
+    // Deliberately make only rank 0 violate the next window's shape contract.
+    // Both ranks must fail at the PP min/max preflight, before any NCCL P2P
+    // count can diverge.
+    auto* bad_target_ptr = rank == 0
+        ? &bad_target_mask : &target_microbatches[0];
     Qwen36PipelineWindowV1 bad_window{
         sizeof(Qwen36PipelineWindowV1), 1, 8, 1, 0, 1, 0};
     assert(qwen36_pipeline_begin_v1(window_context, &bad_window) == 0);
     Qwen36PipelineTickV1 bad_tick{
         sizeof(Qwen36PipelineTickV1), 1, 8, 0, pp_rank == 0 ? -1 : 0, 0, 0,
-        &input_microbatches[0], &bad_target_mask, nullptr, 1.0};
+        &input_microbatches[0], bad_target_ptr, nullptr, 1.0};
     assert(qwen36_pipeline_tick_v1(window_context, &bad_tick, &result) != 0);
     std::printf("native_qwen36_pp_train rank=%d loss=%0.6f "
         "grad_diff=%0.8e param_diff=%0.8e m_diff=%0.8e v_diff=%0.8e "
