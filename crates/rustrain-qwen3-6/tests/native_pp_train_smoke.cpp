@@ -92,6 +92,7 @@ extern "C" int32_t qwen36_abort_gradient_accumulation(void*);
 extern "C" int64_t qwen36_export_optimizer_state(
     void*, void**, void**, int64_t);
 extern "C" int64_t qwen36_get_step_count(void*);
+extern "C" int64_t qwen36_get_lora_batch_projection_build_count(void*);
 extern "C" void qwen36_free_training_context(void*);
 
 static at::Tensor cuda_tensor(std::initializer_list<int64_t> shape, double value) {
@@ -339,6 +340,8 @@ int main() {
         schedule.emplace_back(-1, microbatch);
     Qwen36PipelineWindowV1 window{
         sizeof(Qwen36PipelineWindowV1), 1, 7, num_microbatches, 0, 1, 0};
+    const int64_t window_builds_before =
+        qwen36_get_lora_batch_projection_build_count(window_context);
     assert(qwen36_pipeline_begin_v1(window_context, &window) == 0);
     int64_t max_in_flight = 0;
     Qwen36PipelineResultV1 result{};
@@ -356,16 +359,27 @@ int main() {
     }
     assert(max_in_flight <= warmup);
     assert(qwen36_get_step_count(window_context) == 0);
+    const int64_t window_projection_builds =
+        qwen36_get_lora_batch_projection_build_count(window_context) -
+        window_builds_before;
+    assert(window_projection_builds > 0);
 
     double gradient_difference = 0.0;
     double gradient_magnitude = 0.0;
     double legacy_probe_loss = 0.0;
+    const int64_t legacy_builds_before =
+        qwen36_get_lora_batch_projection_build_count(legacy_context);
     for (int64_t microbatch = 0; microbatch < 4; ++microbatch) {
         legacy_probe_loss = qwen36_train_micro_step(
             legacy_context, &input_microbatches[microbatch],
             &target_microbatches[microbatch], nullptr, 0.25, 0);
         assert(std::isfinite(legacy_probe_loss) && legacy_probe_loss >= 0.0);
     }
+    const int64_t legacy_projection_builds =
+        qwen36_get_lora_batch_projection_build_count(legacy_context) -
+        legacy_builds_before;
+    assert(legacy_projection_builds ==
+        window_projection_builds * num_microbatches);
     const int64_t lora_count = qwen36_get_lora_count(window_context);
     assert(lora_count == qwen36_get_lora_count(legacy_context));
     for (int64_t index = 0; index < lora_count; ++index) {
@@ -502,9 +516,11 @@ int main() {
     assert(qwen36_pipeline_tick_v1(window_context, &bad_tick, &result) != 0);
     std::printf("native_qwen36_pp_train rank=%d loss=%0.6f "
         "grad_diff=%0.8e param_diff=%0.8e m_diff=%0.8e v_diff=%0.8e "
-        "max_in_flight=%ld step=1 ok\n", rank,
+        "max_in_flight=%ld cache_builds=%ld legacy_cache_builds=%ld "
+        "step=1 ok\n", rank,
         window_loss, gradient_difference, parity.parameter, parity.adam_m,
-        parity.adam_v, (long)max_in_flight);
+        parity.adam_v, (long)max_in_flight, (long)window_projection_builds,
+        (long)legacy_projection_builds);
     qwen36_free_training_context(legacy_context);
     qwen36_free_training_context(window_context);
     return 0;

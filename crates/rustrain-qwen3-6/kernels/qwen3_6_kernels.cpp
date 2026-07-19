@@ -6042,6 +6042,7 @@ static void prepare_fixed_lora_batch(TrainingContext* ctx) {
             ctx->lora_batch_cache[lora_cache_key(layer_idx, pair_idx)] = {
                 a.unsqueeze(0), b.unsqueeze(0), scaling,
                 lora_tp_layout(ctx, layer_idx, pair_idx)};
+            ++ctx->lora_batch_projection_build_count;
         }
     }
     ctx->lora_batch_valid = true;
@@ -7691,12 +7692,11 @@ static at::Tensor pipeline_window_forward(
     if (attention_mask) slot.attention_mask = *attention_mask;
     slot.gradient_scale = tick.gradient_scale;
     slot.token_weight = token_weight;
-    // Each in-flight microbatch gets an independent autograd graph and LoRA
-    // projection cache. This is the invariant that the legacy single-step
-    // path cannot provide for an in-flight 1F1B window.
+    // Each in-flight microbatch gets an independent activation graph. Fixed
+    // LoRA parameters and their singleton views are immutable until finish,
+    // so keep the projection metadata cache for the whole pipeline window.
     ctx->lora_cache_valid = false;
-    ctx->lora_batch_valid = false;
-    prepare_fixed_lora_batch(ctx);
+    if (!ctx->lora_batch_valid) prepare_fixed_lora_batch(ctx);
     at::AutoGradMode grad_enable(true);
     if (ctx->is_first_pipeline_stage) {
         TORCH_CHECK(!received_stage_input.defined(),
@@ -7774,7 +7774,6 @@ static at::Tensor pipeline_window_backward(
     window.next_backward++;
     window.slots.erase(it);
     ctx->lora_cache_valid = false;
-    ctx->lora_batch_valid = false;
     return input_grad;
 }
 
