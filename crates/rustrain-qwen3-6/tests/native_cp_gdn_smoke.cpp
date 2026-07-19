@@ -39,6 +39,18 @@ extern "C" int32_t qwen36_init_parallel_nccl_v2(
     int32_t, int32_t, int32_t,
     int32_t, int32_t, int32_t);
 extern "C" int32_t qwen36_set_lora_tensor(void*, int64_t, int32_t, void*);
+extern "C" int64_t qwen36_add_lora(
+    void*, int64_t, double, const int64_t*, int64_t, const char*);
+extern "C" void* qwen36_get_adapter_lora_tensor(
+    void*, int64_t, int64_t, const char*, int32_t);
+extern "C" int32_t qwen36_set_adapter_lora_tensor(
+    void*, int64_t, int64_t, const char*, int32_t, void*);
+extern "C" void* qwen36_get_adapter_optimizer_tensor(
+    void*, int64_t, int64_t, const char*, int32_t, int32_t);
+extern "C" int64_t qwen36_get_adapter_step_count(void*, int64_t);
+extern "C" int32_t qwen36_train_multi_lora_selected_v3(
+    void*, void*, void*, void*, const int64_t*, int32_t,
+    double*, double*, int32_t);
 extern "C" void* qwen36_get_lora_a(void*, int64_t);
 extern "C" void* qwen36_get_lora_b(void*, int64_t);
 extern "C" int64_t qwen36_export_optimizer_state(
@@ -168,6 +180,18 @@ static std::vector<LoraFixture> make_lora() {
         });
     }
     return fixtures;
+}
+
+static void set_dynamic_lora(
+    void* context, int64_t adapter_id,
+    std::vector<LoraFixture>& fixtures
+) {
+    for (auto& fixture : fixtures) {
+        assert(qwen36_set_adapter_lora_tensor(
+            context, adapter_id, 0, fixture.module, 0, &fixture.a) == 0);
+        assert(qwen36_set_adapter_lora_tensor(
+            context, adapter_id, 0, fixture.module, 1, &fixture.b) == 0);
+    }
 }
 
 struct Batch {
@@ -402,5 +426,164 @@ int main() {
 
     qwen36_free_training_context(reference);
     qwen36_free_training_context(distributed);
+
+    // Dynamic CP keeps the full tenant batch descriptor replicated while
+    // each rank owns one sequence/head contribution. Two selected tenants
+    // use different token counts; a third tenant must remain bitwise idle.
+    auto dynamic_batch = make_right_padded_batch();
+    set_parallel_environment(rank, world, rank, 2);
+    void* dynamic_distributed = create_context(
+        weights, embedding, final_norm, lm_head, config, true);
+    assert(dynamic_distributed);
+    assert(qwen36_init_parallel_nccl_v2(
+        dynamic_distributed, rank, world,
+        0, 1, 0,
+        rank, 2, 0,
+        0, 1, 0,
+        0, 1, 0,
+        0, 1, 0) == 0);
+
+    set_parallel_environment(0, 1, 0, 1);
+    void* dynamic_reference = create_context(
+        weights, embedding, final_norm, lm_head, config, false);
+    assert(dynamic_reference);
+    set_parallel_environment(rank, world, rank, 2);
+
+    const int64_t dynamic_target_layer = 0;
+    constexpr const char* dynamic_targets =
+        "in_proj_qkv,in_proj_z,in_proj_a,in_proj_b,out_proj";
+    std::array<int64_t, 3> distributed_adapters{};
+    std::array<int64_t, 3> reference_adapters{};
+    for (int64_t index = 0; index < 3; ++index) {
+        distributed_adapters[index] = qwen36_add_lora(
+            dynamic_distributed, kLoraRank, kLoraRank,
+            &dynamic_target_layer, 1, dynamic_targets);
+        reference_adapters[index] = qwen36_add_lora(
+            dynamic_reference, kLoraRank, kLoraRank,
+            &dynamic_target_layer, 1, dynamic_targets);
+        assert(distributed_adapters[index] > 0 &&
+            reference_adapters[index] > 0);
+        set_dynamic_lora(
+            dynamic_distributed, distributed_adapters[index], fixtures);
+        set_dynamic_lora(
+            dynamic_reference, reference_adapters[index], fixtures);
+    }
+
+    double distributed_dynamic_loss = -1.0;
+    double reference_dynamic_loss = -1.0;
+    std::array<double, 2> distributed_tenant_losses{-1.0, -1.0};
+    std::array<double, 2> reference_tenant_losses{-1.0, -1.0};
+    assert(qwen36_train_multi_lora_selected_v3(
+        dynamic_distributed, &dynamic_batch.ids, &dynamic_batch.targets,
+        &dynamic_batch.attention, distributed_adapters.data(), 2,
+        &distributed_dynamic_loss, distributed_tenant_losses.data(), 2) == 0);
+    assert(qwen36_train_multi_lora_selected_v3(
+        dynamic_reference, &dynamic_batch.ids, &dynamic_batch.targets,
+        &dynamic_batch.attention, reference_adapters.data(), 2,
+        &reference_dynamic_loss, reference_tenant_losses.data(), 2) == 0);
+
+    auto adapter_tensor = [](void* context, int64_t adapter_id,
+                             const LoraFixture& fixture, bool is_b) {
+        auto* tensor = reinterpret_cast<at::Tensor*>(
+            qwen36_get_adapter_lora_tensor(
+                context, adapter_id, 0, fixture.module, is_b ? 1 : 0));
+        assert(tensor);
+        return tensor;
+    };
+    auto optimizer_tensor = [](void* context, int64_t adapter_id,
+                               const LoraFixture& fixture,
+                               bool is_b, bool is_v) {
+        auto* tensor = reinterpret_cast<at::Tensor*>(
+            qwen36_get_adapter_optimizer_tensor(
+                context, adapter_id, 0, fixture.module,
+                is_b ? 1 : 0, is_v ? 1 : 0));
+        assert(tensor && tensor->scalar_type() == at::kFloat);
+        return tensor;
+    };
+
+    double dynamic_param_diff = 0.0;
+    double dynamic_m_diff = 0.0;
+    double dynamic_v_diff = 0.0;
+    double dynamic_update = 0.0;
+    double unselected_diff = 0.0;
+    for (int64_t adapter_index = 0; adapter_index < 2; ++adapter_index) {
+        for (const auto& fixture : fixtures) {
+            for (int is_b = 0; is_b < 2; ++is_b) {
+                auto* distributed_param = adapter_tensor(
+                    dynamic_distributed,
+                    distributed_adapters[adapter_index], fixture, is_b != 0);
+                auto* reference_param = adapter_tensor(
+                    dynamic_reference,
+                    reference_adapters[adapter_index], fixture, is_b != 0);
+                dynamic_param_diff = std::max(dynamic_param_diff,
+                    max_diff(*distributed_param, *reference_param));
+                dynamic_update = std::max(dynamic_update,
+                    max_diff(*distributed_param,
+                        is_b ? fixture.b : fixture.a));
+                auto* distributed_m = optimizer_tensor(
+                    dynamic_distributed,
+                    distributed_adapters[adapter_index], fixture,
+                    is_b != 0, false);
+                auto* reference_m = optimizer_tensor(
+                    dynamic_reference,
+                    reference_adapters[adapter_index], fixture,
+                    is_b != 0, false);
+                auto* distributed_v = optimizer_tensor(
+                    dynamic_distributed,
+                    distributed_adapters[adapter_index], fixture,
+                    is_b != 0, true);
+                auto* reference_v = optimizer_tensor(
+                    dynamic_reference,
+                    reference_adapters[adapter_index], fixture,
+                    is_b != 0, true);
+                dynamic_m_diff = std::max(dynamic_m_diff,
+                    max_diff(*distributed_m, *reference_m));
+                dynamic_v_diff = std::max(dynamic_v_diff,
+                    max_diff(*distributed_v, *reference_v));
+            }
+        }
+    }
+    for (const auto& fixture : fixtures) {
+        for (int is_b = 0; is_b < 2; ++is_b) {
+            auto* parameter = adapter_tensor(
+                dynamic_distributed, distributed_adapters[2], fixture,
+                is_b != 0);
+            unselected_diff = std::max(unselected_diff,
+                max_diff(*parameter, is_b ? fixture.b : fixture.a));
+            for (int is_v = 0; is_v < 2; ++is_v) {
+                auto* state = optimizer_tensor(
+                    dynamic_distributed, distributed_adapters[2], fixture,
+                    is_b != 0, is_v != 0);
+                unselected_diff = std::max(unselected_diff,
+                    state->abs().max().item<double>());
+            }
+        }
+    }
+
+    const double dynamic_loss_diff =
+        std::abs(distributed_dynamic_loss - reference_dynamic_loss);
+    const double tenant_loss_diff = std::max(
+        std::abs(distributed_tenant_losses[0] - reference_tenant_losses[0]),
+        std::abs(distributed_tenant_losses[1] - reference_tenant_losses[1]));
+    std::printf(
+        "native_cp_gdn_dynamic rank=%d loss_diff=%0.8e "
+        "tenant_loss_diff=%0.8e param_diff=%0.8e m_diff=%0.8e "
+        "v_diff=%0.8e update=%0.8e unselected_diff=%0.8e\n",
+        rank, dynamic_loss_diff, tenant_loss_diff, dynamic_param_diff,
+        dynamic_m_diff, dynamic_v_diff, dynamic_update, unselected_diff);
+    std::fflush(stdout);
+    assert(dynamic_loss_diff < 1e-2 && tenant_loss_diff < 1e-2);
+    assert(dynamic_param_diff <= 2.1e-3);
+    assert(dynamic_m_diff < 5e-4 && dynamic_v_diff < 5e-7);
+    assert(dynamic_update > 0.0 && unselected_diff == 0.0);
+    assert(qwen36_get_adapter_step_count(
+        dynamic_distributed, distributed_adapters[0]) == 1);
+    assert(qwen36_get_adapter_step_count(
+        dynamic_distributed, distributed_adapters[1]) == 1);
+    assert(qwen36_get_adapter_step_count(
+        dynamic_distributed, distributed_adapters[2]) == 0);
+
+    qwen36_free_training_context(dynamic_reference);
+    qwen36_free_training_context(dynamic_distributed);
     return 0;
 }

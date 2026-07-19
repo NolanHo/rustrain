@@ -3602,8 +3602,9 @@ static void validate_native_execution_topology(
             "GDN context parallelism cannot be combined with TP or sequence parallelism");
         TORCH_CHECK(!ctx->has_mtp,
             "GDN context parallelism does not support MTP");
-        TORCH_CHECK(ctx->adapters.empty(),
-            "GDN context parallelism currently supports fixed LoRA only");
+        TORCH_CHECK(ctx->adapters.empty() ||
+                env_enabled("QWEN36_GROUPED_LORA_SYNC", true),
+            "dynamic GDN context parallelism requires grouped LoRA gradient sync");
         TORCH_CHECK(ctx->router_aux_loss_coef == 0.0,
             "GDN context parallelism does not support router auxiliary loss");
         const char* sequence_chunk = getenv("QWEN36_SEQ_CHUNK");
@@ -5289,6 +5290,7 @@ struct GroupedLoraGradientSyncPlan {
     static constexpr uint8_t kReduceEp = 1 << 0;
     static constexpr uint8_t kReduceDp = 1 << 1;
     static constexpr uint8_t kReduceTp = 1 << 2;
+    static constexpr uint8_t kReduceCp = 1 << 3;
 
     struct Entry {
         at::Tensor* accumulator = nullptr;
@@ -5300,6 +5302,7 @@ struct GroupedLoraGradientSyncPlan {
         bool reduce_ep = false;
         bool reduce_dp = false;
         bool reduce_tp = false;
+        bool reduce_cp = false;
     };
 
     struct Bucket {
@@ -5310,6 +5313,11 @@ struct GroupedLoraGradientSyncPlan {
 
     std::vector<Entry> entries;
     std::vector<Bucket> buckets;
+    // Dynamic CP keeps LoRA parameters replicated while each rank owns a
+    // different sequence/head contribution. Sum those gradients here; the
+    // full-batch token denominator remains replicated. Fixed LoRA keeps its
+    // legacy CP reduction after this plan.
+    bool reduce_cp = false;
 
     static bool tp_replicated(LoraTpLayout layout, bool is_a) {
         return (layout == LoraTpLayout::ColumnParallel && is_a) ||
@@ -5339,13 +5347,15 @@ struct GroupedLoraGradientSyncPlan {
         entry.reduce_dp = reduce_dp;
         entry.reduce_tp = ctx->tp_world_size > 1 &&
             tp_replicated(tp_layout, is_a);
+        entry.reduce_cp = reduce_cp;
         entries.push_back(std::move(entry));
     }
 
     static uint8_t communication_mask(const Entry& entry) {
         return (entry.reduce_ep ? kReduceEp : 0) |
             (entry.reduce_dp ? kReduceDp : 0) |
-            (entry.reduce_tp ? kReduceTp : 0);
+            (entry.reduce_tp ? kReduceTp : 0) |
+            (entry.reduce_cp ? kReduceCp : 0);
     }
 
     void prepare(TrainingContext* ctx, bool packed_sync) {
@@ -5509,9 +5519,17 @@ struct GroupedLoraGradientSyncPlan {
             ctx->cuda_device).stream();
         if (packed_sync) {
             run_bucket_group(
+                buckets, ctx->cp_comm, stream, "CP", kReduceCp);
+            run_bucket_group(
                 buckets, ctx->nccl_comm, stream, "EP", kReduceEp);
             run_bucket_group(
                 buckets, ctx->dp_comm, stream, "DP", kReduceDp);
+            run_group(entries, ctx->cp_comm, stream, "CP",
+                [](const Entry& entry) {
+                    return entry.reduce_cp &&
+                        entry.work.data_ptr() ==
+                            entry.accumulator->data_ptr();
+                });
             run_group(entries, ctx->nccl_comm, stream, "EP",
                 [](const Entry& entry) {
                     return entry.reduce_ep &&
@@ -5525,6 +5543,8 @@ struct GroupedLoraGradientSyncPlan {
                             entry.accumulator->data_ptr();
                 });
         } else {
+            run_group(entries, ctx->cp_comm, stream, "CP",
+                [](const Entry& entry) { return entry.reduce_cp; });
             run_group(entries, ctx->nccl_comm, stream, "EP",
                 [](const Entry& entry) { return entry.reduce_ep; });
             run_group(entries, ctx->dp_comm, stream, "DP",
@@ -5656,6 +5676,10 @@ static bool synchronize_lora_gradients(
     TORCH_CHECK(!sharded_a2a || env_enabled("QWEN36_EP_A2A"),
         "QWEN36_EP_A2A_SHARDED=1 requires QWEN36_EP_A2A=1");
     const bool dp_allreduce = ctx->data_parallel && ctx->dp_comm;
+    const bool per_adapter_weighting = per_adapter_token_counts &&
+        per_adapter_token_counts->defined();
+    const bool dynamic_cp = per_adapter_weighting &&
+        context_parallel_enabled(ctx);
     const bool normalization_allreduce = dp_allreduce || sharded_a2a;
     const double replicated_a2a_expert_scale =
         ctx->expert_parallel && env_enabled("QWEN36_EP_A2A") && !sharded_a2a
@@ -5677,10 +5701,11 @@ static bool synchronize_lora_gradients(
         if (dp_allreduce) reduce_axis(ctx->dp_comm, "DP");
         return value;
     };
-    const bool per_adapter_weighting = per_adapter_token_counts &&
-        per_adapter_token_counts->defined();
     const bool grouped_sync = env_enabled("QWEN36_GROUPED_LORA_SYNC", true);
+    TORCH_CHECK(!dynamic_cp || grouped_sync,
+        "dynamic LoRA with context parallelism requires grouped gradient sync");
     GroupedLoraGradientSyncPlan grouped_plan;
+    grouped_plan.reduce_cp = dynamic_cp;
     at::Tensor local_adapter_weights;
     at::Tensor global_adapter_weights;
     double scale = 1.0;
@@ -11358,7 +11383,7 @@ double qwen36_train_multi_lora_impl(
 
         int64_t n_max = total_adapters;
         if (!finalize_only) {
-            // All workers in the TP x EP x DP grid must agree on the
+            // All workers in the TP x CP x EP x DP grid must agree on the
             // activation chunk schedule to keep forward collectives ordered.
             size_t free_mem = 0;
             size_t total_mem = 0;
@@ -11373,11 +11398,21 @@ double qwen36_train_multi_lora_impl(
             if (n_max < 1) n_max = 1;
             if ((ctx->nccl_comm && ctx->ep_world_size > 1) ||
                 (ctx->dp_comm && ctx->dp_world_size > 1) ||
-                (ctx->tp_comm && ctx->tp_world_size > 1)) {
+                (ctx->tp_comm && ctx->tp_world_size > 1) ||
+                (ctx->cp_comm && ctx->cp_world_size > 1)) {
                 auto published_n_max = at::full(
                     {1}, n_max, input_ids.options().dtype(at::kLong));
                 auto stream = c10::cuda::getCurrentCUDAStream(
                     input_ids.device().index()).stream();
+                if (ctx->cp_comm && ctx->cp_world_size > 1) {
+                    auto err = ncclAllReduce(
+                        published_n_max.data_ptr<int64_t>(),
+                        published_n_max.data_ptr<int64_t>(), 1, ncclInt64,
+                        ncclMin, reinterpret_cast<ncclComm_t>(ctx->cp_comm),
+                        stream);
+                    TORCH_CHECK(err == ncclSuccess,
+                        "CP n_max all-reduce failed: ", ncclGetErrorString(err));
+                }
                 if (ctx->nccl_comm && ctx->ep_world_size > 1) {
                     auto err = ncclAllReduce(
                         published_n_max.data_ptr<int64_t>(),
@@ -11485,15 +11520,20 @@ double qwen36_train_multi_lora_impl(
 
             // Batched CE: compute loss with autograd enabled.
             at::Tensor hidden_grad;
+            at::Tensor loss_hidden;
             auto t_loss_start = std::chrono::steady_clock::now();
             {
                 at::AutoGradMode grad_enable(true);
                 // Re-attach hidden to autograd graph
                 hidden = hidden.detach().set_requires_grad(true);
+                // CP owns disjoint sequence slices. Gather them before CE so
+                // every tenant sees the full target row; the gather backward
+                // returns the rank-local gradient slice.
+                loss_hidden = sequence_parallel_loss_gather(ctx, hidden);
                 TORCH_CHECK(!env_enabled("QWEN36_FUSED_CE"),
                     "QWEN36_FUSED_CE is disabled until its tile gather and gradient normalization are validated");
                 auto loss = compute_loss(
-                    ctx, hidden, input_ref, mask_ref, ctx->vocab_size,
+                    ctx, loss_hidden, input_ref, mask_ref, ctx->vocab_size,
                     /*independent_samples=*/true,
                     /*collect_sample_losses=*/loss_numerators.defined());
                 loss_val = loss.value.item<double>();
@@ -11550,9 +11590,12 @@ double qwen36_train_multi_lora_impl(
                 "dynamic LoRA loss or hidden gradient became non-finite");
 
             if (!ctx->group_inputs.empty() && !env_enabled("QWEN36_SUBCKPT")) {
-                manual_group_backward(ctx, hidden_grad);
+                manual_group_backward(
+                    ctx, context_parallel_enabled(ctx)
+                        ? sequence_parallel_plain_split(ctx, hidden_grad)
+                        : hidden_grad);
             } else {
-                hidden.backward(hidden_grad);
+                loss_hidden.backward(hidden_grad);
             }
             // The chunk registry contains intrusive copies of the selected
             // adapter tensors. Harvest now; FP32 accumulator contents remain
@@ -11594,7 +11637,8 @@ double qwen36_train_multi_lora_impl(
                 bool global_token_counts_valid = local_token_counts_valid;
                 if ((ctx->nccl_comm && ctx->ep_world_size > 1) ||
                     (ctx->dp_comm && ctx->dp_world_size > 1) ||
-                    (ctx->tp_comm && ctx->tp_world_size > 1)) {
+                    (ctx->tp_comm && ctx->tp_world_size > 1) ||
+                    (ctx->cp_comm && ctx->cp_world_size > 1)) {
                     global_token_counts_valid =
                         adapter_collective_all_succeeded(
                             ctx, local_token_counts_valid);
