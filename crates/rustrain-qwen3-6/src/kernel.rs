@@ -81,9 +81,22 @@ pub struct PipelineResultV1 {
     pub loss: f64,
 }
 type FnPipelineBegin = unsafe extern "C" fn(*mut c_void, *const PipelineWindowV1) -> i32;
+type FnPipelineBeginSelected = unsafe extern "C" fn(
+    *mut c_void,
+    *const PipelineWindowV1,
+    *const i64,
+    i32,
+) -> i32;
 type FnPipelineTick =
     unsafe extern "C" fn(*mut c_void, *const PipelineTickV1, *mut PipelineResultV1) -> i32;
 type FnPipelineFinish = unsafe extern "C" fn(*mut c_void, i32, *mut PipelineResultV1) -> i32;
+type FnPipelineFinishReport = unsafe extern "C" fn(
+    *mut c_void,
+    i32,
+    *mut PipelineResultV1,
+    *mut f64,
+    i32,
+) -> i32;
 type FnPipelineAbort = unsafe extern "C" fn(*mut c_void) -> i32;
 type FnTrainMultiLoraSelectedV2 = unsafe extern "C" fn(
     *mut c_void,
@@ -308,8 +321,10 @@ struct KernelHandles {
     train_step: FnTrainStep,
     train_micro_step: FnTrainMicroStep,
     pipeline_begin: FnPipelineBegin,
+    pipeline_begin_selected: Option<FnPipelineBeginSelected>,
     pipeline_tick: FnPipelineTick,
     pipeline_finish: FnPipelineFinish,
+    pipeline_finish_report: Option<FnPipelineFinishReport>,
     pipeline_abort: FnPipelineAbort,
     train_multi_lora_selected_v2: FnTrainMultiLoraSelectedV2,
     train_multi_lora_selected_v3: FnTrainMultiLoraSelectedV3,
@@ -438,8 +453,26 @@ unsafe fn load_kernels() -> Option<KernelHandles> {
         train_step: sym!("qwen36_train_step"),
         train_micro_step: sym!("qwen36_train_micro_step"),
         pipeline_begin: sym!("qwen36_pipeline_begin_v1"),
+        pipeline_begin_selected: {
+            let name = CString::new("qwen36_pipeline_begin_dynamic_selected_v1").unwrap();
+            let symbol = libc::dlsym(handle, name.as_ptr());
+            if symbol.is_null() {
+                None
+            } else {
+                Some(std::mem::transmute::<*mut c_void, FnPipelineBeginSelected>(symbol))
+            }
+        },
         pipeline_tick: sym!("qwen36_pipeline_tick_v1"),
         pipeline_finish: sym!("qwen36_pipeline_finish_v1"),
+        pipeline_finish_report: {
+            let name = CString::new("qwen36_pipeline_finish_dynamic_report_v1").unwrap();
+            let symbol = libc::dlsym(handle, name.as_ptr());
+            if symbol.is_null() {
+                None
+            } else {
+                Some(std::mem::transmute::<*mut c_void, FnPipelineFinishReport>(symbol))
+            }
+        },
         pipeline_abort: sym!("qwen36_pipeline_abort_v1"),
         train_multi_lora_selected_v2: sym!("qwen36_train_multi_lora_selected_v2"),
         train_multi_lora_selected_v3: sym!("qwen36_train_multi_lora_selected_v3"),
@@ -1322,6 +1355,42 @@ impl CppTrainingContext {
         )
     }
 
+    /// Open a dynamic pipeline window for only the requested live tenants.
+    /// Unselected adapters retain their parameters, accumulators, and clocks.
+    pub fn pipeline_begin_dynamic_selected_v1(
+        &self,
+        window_id: i64,
+        num_microbatches: i64,
+        adapter_ids: &[i64],
+    ) -> Result<()> {
+        if adapter_ids.is_empty() {
+            bail!("selected dynamic pipeline requires at least one adapter ID");
+        }
+        if window_id < 0 || num_microbatches <= 0 {
+            bail!("pipeline window id and microbatch count must be positive");
+        }
+        let kh = get_kernels().ok_or_else(|| anyhow::anyhow!("kernels not loaded"))?;
+        let begin = kh.pipeline_begin_selected.ok_or_else(|| {
+            anyhow::anyhow!("native kernels do not expose selected dynamic pipeline ABI")
+        })?;
+        let spec = PipelineWindowV1 {
+            struct_size: std::mem::size_of::<PipelineWindowV1>() as u32,
+            version: 1,
+            window_id,
+            num_microbatches,
+            schedule: 0,
+            num_chunks: 1,
+            flags: PIPELINE_WINDOW_FLAG_DYNAMIC_LORA,
+        };
+        let count = i32::try_from(adapter_ids.len())
+            .context("selected adapter count exceeds i32")?;
+        let status = unsafe { begin(self.ptr, &spec, adapter_ids.as_ptr(), count) };
+        if status != 0 {
+            bail!("C++ selected dynamic pipeline begin failed with status {status}");
+        }
+        Ok(())
+    }
+
     fn pipeline_begin_with_flags_v1(
         &self,
         window_id: i64,
@@ -1430,6 +1499,46 @@ impl CppTrainingContext {
             bail!("C++ pipeline window finish failed with status {status}");
         }
         Ok(result)
+    }
+
+    /// Finish a selected dynamic PP window and return one loss per tenant.
+    pub fn pipeline_finish_dynamic_report_v1(
+        &self,
+        adapter_count: usize,
+    ) -> Result<(PipelineResultV1, Vec<f64>)> {
+        let kh = get_kernels().ok_or_else(|| anyhow::anyhow!("kernels not loaded"))?;
+        let report = kh.pipeline_finish_report.ok_or_else(|| {
+            anyhow::anyhow!("loaded kernel does not provide dynamic pipeline loss reports")
+        })?;
+        let mut result = PipelineResultV1 {
+            struct_size: std::mem::size_of::<PipelineResultV1>() as u32,
+            version: 1,
+            status: 0,
+            completed_fwd: 0,
+            completed_bwd: 0,
+            in_flight: 0,
+            optimizer_step: 0,
+            loss: 0.0,
+        };
+        let mut adapter_losses = vec![f64::NAN; adapter_count];
+        let status = unsafe {
+            report(
+                self.ptr,
+                1,
+                &mut result,
+                adapter_losses.as_mut_ptr(),
+                i32::try_from(adapter_count).context("adapter count exceeds i32")?,
+            )
+        };
+        if status != 0
+            || result.status != 0
+            || adapter_losses
+                .iter()
+                .any(|loss| !loss.is_finite() || *loss < 0.0)
+        {
+            bail!("C++ dynamic pipeline loss report failed with status {status}");
+        }
+        Ok((result, adapter_losses))
     }
 
     /// Abort a pipeline window and discard any accumulated gradients.

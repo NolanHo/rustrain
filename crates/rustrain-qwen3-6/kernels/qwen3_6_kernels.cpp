@@ -2896,11 +2896,14 @@ struct PipelineWindowState {
     int32_t num_chunks = 1;
     int32_t flags = 0;
     bool dynamic_lora = false;
+    std::vector<size_t> selected_adapter_indices;
     int64_t next_forward = 0;
     int64_t next_backward = 0;
     double total_loss = 0.0;
     double total_loss_weight = 0.0;
     at::Tensor adapter_token_counts;
+    at::Tensor loss_numerators;
+    at::Tensor loss_token_counts;
     at::Tensor normalization_mask;
     at::Tensor pending_backward_send;
     int64_t pending_backward_mb = -1;
@@ -6245,7 +6248,8 @@ static void precompute_lora_cache(TrainingContext* ctx) {
 /// manual checkpoint backward does not rebuild projections for other layers.
 /// Replaces precompute_lora_cache when N > 1.
 static void prepare_lora_batch(
-    TrainingContext* ctx, int64_t start_layer = 0, int64_t end_layer = -1
+    TrainingContext* ctx, int64_t start_layer = 0, int64_t end_layer = -1,
+    const std::vector<size_t>* selected_indices = nullptr
 ) {
     ctx->lora_batch_cache.clear();
     ctx->lora_batch_n = 0;
@@ -6255,10 +6259,24 @@ static void prepare_lora_batch(
     TORCH_CHECK(end_layer >= start_layer && end_layer <= ctx->num_layers,
         "invalid LoRA batch end layer: ", end_layer);
 
+    std::vector<size_t> adapter_order;
+    if (selected_indices) {
+        adapter_order = *selected_indices;
+    } else {
+        adapter_order.reserve(ctx->adapters.size());
+        for (size_t i = 0; i < ctx->adapters.size(); ++i)
+            adapter_order.push_back(i);
+    }
+    TORCH_CHECK(!adapter_order.empty(), "LoRA batch requires at least one adapter");
+    for (const auto index : adapter_order)
+        TORCH_CHECK(index < ctx->adapters.size(), "LoRA batch adapter index is out of range");
+    const size_t batch_adapter_count = adapter_order.size();
     std::vector<double> adapter_scalings;
-    adapter_scalings.reserve(ctx->adapters.size());
-    for (const auto& adapter : ctx->adapters)
+    adapter_scalings.reserve(batch_adapter_count);
+    for (const auto index : adapter_order) {
+        const auto& adapter = ctx->adapters[index];
         adapter_scalings.push_back(adapter.alpha / (double)adapter.rank);
+    }
     if (adapter_scalings != ctx->lora_batch_scaling_values) {
         ctx->lora_batch_scaling = at::Tensor();
         ctx->lora_batch_scaling_values = adapter_scalings;
@@ -6275,15 +6293,16 @@ static void prepare_lora_batch(
             if (ctx->pad_heterogeneous_lora_batch) {
                 using LoraPair = std::pair<at::Tensor, at::Tensor>;
                 std::vector<LoraPair*> active_pairs(
-                    ctx->adapters.size(), nullptr);
+                    batch_adapter_count, nullptr);
                 at::Tensor template_a;
                 at::Tensor template_b;
                 int64_t a_rank_dim = -1;
                 int64_t b_rank_dim = -1;
                 int64_t padded_rank = 0;
 
-                for (size_t adapter_index = 0;
-                     adapter_index < ctx->adapters.size(); ++adapter_index) {
+                for (size_t ordinal = 0;
+                     ordinal < batch_adapter_count; ++ordinal) {
+                    const size_t adapter_index = adapter_order[ordinal];
                     auto& adapter = ctx->adapters[adapter_index];
                     if (!adapter.target_modules.empty() &&
                         adapter.target_modules.find(module_name) ==
@@ -6347,7 +6366,7 @@ static void prepare_lora_batch(
                     }
                     padded_rank = std::max(
                         padded_rank, a.size(current_a_rank_dim));
-                    active_pairs[adapter_index] = &pair;
+                    active_pairs[ordinal] = &pair;
                 }
                 if (!template_a.defined()) continue;
 
@@ -6355,12 +6374,12 @@ static void prepare_lora_batch(
                 auto padded_b_sizes = template_b.sizes().vec();
                 padded_a_sizes[a_rank_dim] = padded_rank;
                 padded_b_sizes[b_rank_dim] = padded_rank;
-                a_list.reserve(ctx->adapters.size());
-                b_list.reserve(ctx->adapters.size());
-                active_indices.reserve(ctx->adapters.size());
-                for (size_t adapter_index = 0;
-                     adapter_index < ctx->adapters.size(); ++adapter_index) {
-                    auto* pair = active_pairs[adapter_index];
+                a_list.reserve(batch_adapter_count);
+                b_list.reserve(batch_adapter_count);
+                active_indices.reserve(batch_adapter_count);
+                for (size_t ordinal = 0;
+                     ordinal < batch_adapter_count; ++ordinal) {
+                    auto* pair = active_pairs[ordinal];
                     if (!pair) {
                         a_list.push_back(at::zeros(
                             padded_a_sizes, template_a.options()));
@@ -6385,12 +6404,12 @@ static void prepare_lora_batch(
                                 b_rank_dim));
                         }
                     }
-                    active_indices.push_back(
-                        static_cast<int64_t>(adapter_index));
+                    active_indices.push_back(static_cast<int64_t>(ordinal));
                 }
             } else {
-                for (size_t adapter_index = 0;
-                     adapter_index < ctx->adapters.size(); ++adapter_index) {
+                for (size_t ordinal = 0;
+                     ordinal < batch_adapter_count; ++ordinal) {
+                    const size_t adapter_index = adapter_order[ordinal];
                     auto& adapter = ctx->adapters[adapter_index];
                     if (!adapter.target_modules.empty() &&
                         adapter.target_modules.find(module_name) ==
@@ -6409,7 +6428,7 @@ static void prepare_lora_batch(
                     a_list.push_back(a);
                     scalings.push_back(
                         adapter.alpha / (double)adapter.rank);
-                    active_indices.push_back((int64_t)adapter_index);
+                    active_indices.push_back(static_cast<int64_t>(ordinal));
                 }
             }
             if (a_list.empty()) continue;
@@ -6421,7 +6440,7 @@ static void prepare_lora_batch(
             auto b_stack = at::stack(b_list, 0);  // [N, out, rank]
             at::Tensor scaling;
             bool all_adapters_active = active_indices.size() ==
-                ctx->adapters.size();
+                batch_adapter_count;
             if (all_adapters_active) {
                 for (size_t i = 0; i < active_indices.size(); ++i) {
                     if (active_indices[i] != (int64_t)i) {
@@ -7713,7 +7732,15 @@ struct PipelineLossResult {
     at::Tensor hidden_grad;
     double numerator = 0.0;
     double denominator = 0.0;
+    at::Tensor sample_loss_numerators;
+    at::Tensor sample_token_counts;
 };
+
+static at::Tensor global_dynamic_adapter_losses(
+    TrainingContext* ctx,
+    at::Tensor loss_numerators,
+    at::Tensor token_counts
+);
 
 static PipelineLossResult pipeline_compute_loss(
     TrainingContext* ctx,
@@ -8158,7 +8185,8 @@ static at::Tensor pipeline_window_forward(
     ctx->lora_cache_valid = false;
     if (ctx->pp_window.dynamic_lora) {
         ctx->lora_batch_valid = true;
-        prepare_lora_batch(ctx);
+        prepare_lora_batch(ctx, 0, -1,
+            &ctx->pp_window.selected_adapter_indices);
     } else if (!ctx->lora_batch_valid) {
         prepare_fixed_lora_batch(ctx);
     }
@@ -8222,6 +8250,19 @@ static at::Tensor pipeline_window_backward(
         local_loss = loss.value;
         local_loss_numerator = loss.numerator * slot.gradient_scale;
         local_loss_denominator = loss.denominator * slot.gradient_scale;
+        if (window.dynamic_lora) {
+            TORCH_CHECK(loss.sample_loss_numerators.defined() &&
+                    loss.sample_token_counts.defined() &&
+                    loss.sample_loss_numerators.numel() ==
+                        window.loss_numerators.numel() &&
+                    loss.sample_token_counts.numel() ==
+                        window.loss_token_counts.numel(),
+                "dynamic pipeline loss statistics do not match selected adapters");
+            window.loss_numerators.add_(
+                loss.sample_loss_numerators * slot.gradient_scale);
+            window.loss_token_counts.add_(
+                loss.sample_token_counts * slot.gradient_scale);
+        }
         auto hidden_grad = window.dynamic_lora
             ? loss.hidden_grad * slot.row_token_weights.reshape({-1, 1, 1})
             : loss.hidden_grad * slot.token_weight;
@@ -8277,9 +8318,6 @@ extern "C" __attribute__((visibility("default"))) int32_t qwen36_pipeline_begin_
             window_spec->flags == kPipelineWindowFlagDynamicLora;
         const bool supported_flags = valid_abi &&
             (window_spec->flags == 0 || dynamic_lora);
-        const bool fixed_lora_inactive = std::none_of(
-            ctx->lora_active.begin(), ctx->lora_active.end(),
-            [](bool active) { return active; });
         const bool local_valid = valid_abi && supported_flags &&
             !ctx->pp_window.active && ctx->cp_world_size == 1 &&
             ctx->router_aux_loss_coef == 0.0 &&
@@ -8287,9 +8325,7 @@ extern "C" __attribute__((visibility("default"))) int32_t qwen36_pipeline_begin_
             window_spec->num_microbatches > 0 &&
             window_spec->num_microbatches <= 4096 &&
             window_spec->schedule == 0 && window_spec->num_chunks == 1 &&
-            (dynamic_lora
-                ? (!ctx->adapters.empty() && fixed_lora_inactive)
-                : ctx->adapters.empty()) &&
+            (dynamic_lora ? !ctx->adapters.empty() : ctx->adapters.empty()) &&
             !ctx->has_mtp && !ctx->use_checkpoint &&
             !ctx->accumulation_active &&
             ctx->accumulated_token_weight == 0.0 &&
@@ -8309,10 +8345,17 @@ extern "C" __attribute__((visibility("default"))) int32_t qwen36_pipeline_begin_
         ctx->pp_window.flags = window_spec->flags;
         ctx->pp_window.dynamic_lora = dynamic_lora;
         if (dynamic_lora) {
+            ctx->pp_window.selected_adapter_indices.clear();
+            for (size_t index = 0; index < ctx->adapters.size(); ++index)
+                ctx->pp_window.selected_adapter_indices.push_back(index);
             ctx->pp_window.adapter_token_counts = at::zeros(
                 {static_cast<int64_t>(ctx->adapters.size())},
                 at::TensorOptions().dtype(at::kFloat).device(
                     at::kCUDA, ctx->cuda_device));
+            ctx->pp_window.loss_numerators = at::zeros_like(
+                ctx->pp_window.adapter_token_counts);
+            ctx->pp_window.loss_token_counts = at::zeros_like(
+                ctx->pp_window.adapter_token_counts);
         }
         return 0;
     } catch (const std::exception& e) {
@@ -8320,6 +8363,82 @@ extern "C" __attribute__((visibility("default"))) int32_t qwen36_pipeline_begin_
         return -1;
     } catch (...) {
         fprintf(stderr, "[pipeline_window] begin FAILED: unknown error\n");
+        return -1;
+    }
+}
+
+// Selected dynamic tenants use the same v1 tick/finish ABI. The selection is
+// validated before opening the window, then stored as stable registry indices;
+// unselected adapters remain untouched by the dynamic finalizer.
+extern "C" __attribute__((visibility("default"))) int32_t
+qwen36_pipeline_begin_dynamic_selected_v1(
+    void* ctx_ptr,
+    const Qwen36PipelineWindowV1* window_spec,
+    const int64_t* adapter_ids,
+    int32_t adapter_count
+) {
+    try {
+        auto* ctx = reinterpret_cast<TrainingContext*>(ctx_ptr);
+        const bool local_valid = ctx && adapter_ids && adapter_count > 0 &&
+            adapter_count <= static_cast<int32_t>(ctx->adapters.size()) &&
+            window_spec && window_spec->flags == kPipelineWindowFlagDynamicLora;
+        std::vector<size_t> selected;
+        std::vector<int64_t> ids;
+        if (local_valid) {
+            ids.assign(adapter_ids, adapter_ids + adapter_count);
+            for (const auto id : ids) {
+                auto it = std::find_if(ctx->adapters.begin(), ctx->adapters.end(),
+                    [id](const auto& adapter) { return adapter.id == id; });
+                if (id <= 0 || it == ctx->adapters.end()) {
+                    selected.clear();
+                    break;
+                }
+                selected.push_back(static_cast<size_t>(
+                    std::distance(ctx->adapters.begin(), it)));
+            }
+            if (selected.size() != ids.size()) selected.clear();
+            if (!selected.empty()) {
+                std::set<size_t> unique(selected.begin(), selected.end());
+                if (unique.size() != selected.size()) selected.clear();
+            }
+        }
+        const bool globally_valid = adapter_collective_all_succeeded(
+            ctx, local_valid && !selected.empty());
+        TORCH_CHECK(local_valid && !selected.empty() && globally_valid,
+            "selected dynamic pipeline adapter request is invalid on one or more ranks");
+        auto options = at::TensorOptions().dtype(at::kLong).device(
+            at::kCUDA, ctx->cuda_device);
+        auto local = at::tensor(ids, options);
+        auto minimum = local.clone();
+        auto maximum = local.clone();
+        auto stream = c10::cuda::getCurrentCUDAStream(ctx->cuda_device).stream();
+        auto comm = ctx->pp_control_comm ? ctx->pp_control_comm : ctx->pp_comm;
+        TORCH_CHECK(ncclAllReduce(local.data_ptr<int64_t>(), minimum.data_ptr<int64_t>(),
+                local.numel(), ncclInt64, ncclMin, comm, stream) == ncclSuccess &&
+            ncclAllReduce(local.data_ptr<int64_t>(), maximum.data_ptr<int64_t>(),
+                local.numel(), ncclInt64, ncclMax, comm, stream) == ncclSuccess &&
+            at::equal(minimum, maximum),
+            "selected dynamic pipeline adapter order differs across PP stages");
+        const int32_t status = qwen36_pipeline_begin_v1(ctx_ptr, window_spec);
+        if (status != 0) return status;
+        ctx->pp_window.selected_adapter_indices = std::move(selected);
+        ctx->pp_window.adapter_token_counts = at::zeros(
+            {adapter_count}, at::TensorOptions().dtype(at::kFloat).device(
+                at::kCUDA, ctx->cuda_device));
+        ctx->pp_window.loss_numerators = at::zeros_like(
+            ctx->pp_window.adapter_token_counts);
+        ctx->pp_window.loss_token_counts = at::zeros_like(
+            ctx->pp_window.adapter_token_counts);
+        return 0;
+    } catch (const std::exception& error) {
+        fprintf(stderr, "[pipeline_window] selected begin FAILED: %s\n",
+            error.what());
+        auto* ctx = reinterpret_cast<TrainingContext*>(ctx_ptr);
+        if (ctx && ctx->pp_window.active) pipeline_window_reset(ctx);
+        return -1;
+    } catch (...) {
+        auto* ctx = reinterpret_cast<TrainingContext*>(ctx_ptr);
+        if (ctx && ctx->pp_window.active) pipeline_window_reset(ctx);
         return -1;
     }
 }
@@ -8383,7 +8502,12 @@ extern "C" __attribute__((visibility("default"))) int32_t qwen36_pipeline_tick_v
             if (window.dynamic_lora && tick->input_ids && tick->target_mask) {
                 auto& raw_ids = *reinterpret_cast<at::Tensor*>(tick->input_ids);
                 auto& raw_targets = *reinterpret_cast<at::Tensor*>(tick->target_mask);
-                const int64_t tenants = static_cast<int64_t>(ctx->adapters.size());
+                const int64_t tenants = static_cast<int64_t>(
+                    window.selected_adapter_indices.size());
+                if (raw_ids.defined() && raw_targets.defined() &&
+                        raw_ids.dim() == 2 && raw_targets.dim() == 2 &&
+                        raw_ids.size(0) != 1 && raw_ids.size(0) != tenants)
+                    forward_valid = false;
                 if (raw_ids.defined() && raw_targets.defined() &&
                         raw_ids.dim() == 2 && raw_targets.dim() == 2 &&
                         raw_ids.size(0) == 1 && raw_targets.size(0) == 1) {
@@ -8552,6 +8676,39 @@ extern "C" __attribute__((visibility("default"))) int32_t qwen36_pipeline_finish
         if (window.dynamic_lora) {
             TORCH_CHECK(window.adapter_token_counts.defined(),
                 "dynamic pipeline window has no adapter token counts");
+            // Every PP stage receives the same tenant rows. Compare the
+            // accumulated token vector before the optimizer boundary so a
+            // rank-local mask/value divergence cannot silently skew only one
+            // stage's numerator normalization.
+            auto token_min = window.adapter_token_counts.clone();
+            auto token_max = window.adapter_token_counts.clone();
+            auto token_stream = c10::cuda::getCurrentCUDAStream(
+                ctx->cuda_device).stream();
+            auto token_comm = ctx->pp_control_comm ?
+                ctx->pp_control_comm : ctx->pp_comm;
+            auto token_min_error = ncclAllReduce(
+                window.adapter_token_counts.data_ptr<float>(),
+                token_min.data_ptr<float>(), token_min.numel(), ncclFloat,
+                ncclMin, token_comm, token_stream);
+            auto token_max_error = ncclAllReduce(
+                window.adapter_token_counts.data_ptr<float>(),
+                token_max.data_ptr<float>(), token_max.numel(), ncclFloat,
+                ncclMax, token_comm, token_stream);
+            TORCH_CHECK(token_min_error == ncclSuccess &&
+                    token_max_error == ncclSuccess,
+                "dynamic pipeline token-count consensus failed");
+            TORCH_CHECK(at::equal(token_min, token_max),
+                "dynamic pipeline token counts differ across PP stages");
+            auto full_adapter_token_counts = at::zeros(
+                {static_cast<int64_t>(ctx->adapters.size())},
+                window.adapter_token_counts.options());
+            for (size_t ordinal = 0;
+                 ordinal < window.selected_adapter_indices.size(); ++ordinal) {
+                full_adapter_token_counts.select(
+                    0, static_cast<int64_t>(window.selected_adapter_indices[ordinal]))
+                    .copy_(window.adapter_token_counts.select(
+                        0, static_cast<int64_t>(ordinal)));
+            }
             int32_t finalizer_phase = 0;
             int64_t max_rank = 1;
             for (const auto& adapter : ctx->adapters)
@@ -8566,7 +8723,7 @@ extern "C" __attribute__((visibility("default"))) int32_t qwen36_pipeline_finish
                 static_cast<int32_t>(ctx->adapters.size()),
                 static_cast<int32_t>(max_rank),
                 static_cast<DynamicMultiLoraMode>(2), &finalizer_phase,
-                nullptr, nullptr, true, &window.adapter_token_counts, true);
+                nullptr, nullptr, true, &full_adapter_token_counts, true);
             TORCH_CHECK(finalizer_loss >= 0.0 && finalizer_phase >= 1,
                 "dynamic pipeline finalizer failed");
             const int64_t completed_microbatches = window.num_microbatches;
@@ -9494,6 +9651,8 @@ static PipelineLossResult pipeline_compute_loss(
         result.hidden_grad,
         numerator,
         denominator,
+        result.sample_loss_numerators,
+        result.sample_token_counts,
     };
 }
 
@@ -11446,6 +11605,12 @@ double qwen36_train_multi_lora_impl(
                             DynamicAdamClockCommit{&adapter, logical_step});
                     }
                 }
+                // All PP stages must rendezvous before any live/shadow swap;
+                // a stage with no local parameters still participates.
+                if (allow_pipeline) {
+                    TORCH_CHECK(adapter_collective_all_succeeded(ctx, true),
+                        "dynamic pipeline Adam commit consensus failed");
+                }
                 if (!commits.empty()) {
                     TORCH_CHECK(commits.size() <=
                             static_cast<size_t>(std::numeric_limits<int>::max()),
@@ -11556,10 +11721,6 @@ double qwen36_train_multi_lora_impl(
                     // imposing a device barrier on every training step.
                     TORCH_CHECK(!inject_failure,
                         "injected dynamic Adam failure before commit");
-                    if (allow_pipeline) {
-                        TORCH_CHECK(adapter_collective_all_succeeded(ctx, true),
-                            "dynamic pipeline Adam commit consensus failed");
-                    }
                     for (auto& commit : commits) {
                         std::swap(*commit.param, *commit.next_param);
                         std::swap(*commit.m, *commit.next_m);
@@ -11814,6 +11975,86 @@ static at::Tensor global_dynamic_adapter_losses(
         global_counts > 0,
         global_numerators / global_counts.clamp_min(1.0),
         at::zeros_like(global_numerators));
+}
+
+// Finish a selected dynamic PP window while returning one normalized loss per
+// selected tenant. Loss statistics are produced only on the last PP stage;
+// reduce them across PP before the existing DP/EP reductions in the helper.
+extern "C" __attribute__((visibility("default"))) int32_t
+qwen36_pipeline_finish_dynamic_report_v1(
+    void* ctx_ptr,
+    int32_t apply_optimizer,
+    Qwen36PipelineResultV1* result,
+    double* adapter_losses,
+    int32_t adapter_loss_capacity
+) {
+    try {
+        auto* ctx = reinterpret_cast<TrainingContext*>(ctx_ptr);
+        TORCH_CHECK(ctx && ctx->pp_window.active &&
+                ctx->pp_window.dynamic_lora,
+            "dynamic pipeline report requires an active dynamic window");
+        auto& window = ctx->pp_window;
+        const auto selected_count =
+            static_cast<int32_t>(window.selected_adapter_indices.size());
+        TORCH_CHECK(adapter_losses && adapter_loss_capacity >= selected_count,
+            "dynamic pipeline report output buffer is too small");
+        TORCH_CHECK(window.loss_numerators.defined() &&
+                window.loss_token_counts.defined() &&
+                window.loss_numerators.numel() == selected_count &&
+                window.loss_token_counts.numel() == selected_count,
+            "dynamic pipeline report statistics are unavailable");
+        bool local_stats_valid = false;
+        try {
+            local_stats_valid = at::logical_and(
+                    at::isfinite(window.loss_numerators),
+                    at::logical_and(at::isfinite(window.loss_token_counts),
+                        window.loss_token_counts >= 0))
+                .all().item<bool>();
+        } catch (...) {
+            local_stats_valid = false;
+        }
+        TORCH_CHECK(pipeline_control_all_succeeded(ctx, local_stats_valid) &&
+                local_stats_valid,
+            "dynamic pipeline loss statistics are invalid on one or more PP stages");
+
+        auto global_numerators = window.loss_numerators;
+        auto global_counts = window.loss_token_counts;
+        auto comm = ctx->pp_control_comm ? ctx->pp_control_comm : ctx->pp_comm;
+        auto stream = c10::cuda::getCurrentCUDAStream(ctx->cuda_device).stream();
+        auto pp_numerators = at::empty_like(global_numerators);
+        auto pp_counts = at::empty_like(global_counts);
+        TORCH_CHECK(ncclAllReduce(
+                global_numerators.data_ptr<float>(),
+                pp_numerators.data_ptr<float>(), global_numerators.numel(),
+                ncclFloat, ncclSum, comm, stream) == ncclSuccess &&
+            ncclAllReduce(
+                global_counts.data_ptr<float>(), pp_counts.data_ptr<float>(),
+                global_counts.numel(), ncclFloat, ncclSum, comm, stream) ==
+                ncclSuccess,
+            "dynamic pipeline loss statistics PP reduction failed");
+        auto losses = global_dynamic_adapter_losses(
+            ctx, pp_numerators, pp_counts).to(
+                at::TensorOptions().device(at::kCPU).dtype(at::kDouble));
+        std::memcpy(adapter_losses, losses.data_ptr<double>(),
+            static_cast<size_t>(selected_count) * sizeof(double));
+        return qwen36_pipeline_finish_v1(ctx_ptr, apply_optimizer, result);
+    } catch (const std::exception& error) {
+        fprintf(stderr, "[pipeline_window] dynamic report FAILED: %s\n",
+            error.what());
+        auto* ctx = reinterpret_cast<TrainingContext*>(ctx_ptr);
+        if (ctx) {
+            clear_gradient_accumulators(ctx);
+            pipeline_window_reset(ctx);
+        }
+        return -1;
+    } catch (...) {
+        auto* ctx = reinterpret_cast<TrainingContext*>(ctx_ptr);
+        if (ctx) {
+            clear_gradient_accumulators(ctx);
+            pipeline_window_reset(ctx);
+        }
+        return -1;
+    }
 }
 
 // Heterogeneous selected training pads each active LoRA rank to the largest

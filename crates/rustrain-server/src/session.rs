@@ -13,6 +13,28 @@ use rustrain_qwen3_6::kernel::DynamicAdamConfig;
 use rustrain_qwen3_6::lora::{Qwen36AdapterArtifact, Qwen36LoraConfig, Qwen36LoraTargetModule};
 use rustrain_qwen3_6::pipeline::{stage_lora_slots, PipelineStageLayout};
 
+fn dynamic_pipeline_schedule(
+    pp_rank: usize,
+    pp_size: usize,
+    num_microbatches: usize,
+) -> Result<Vec<(Option<i64>, Option<i64>)>> {
+    if pp_size < 2 || pp_rank >= pp_size || num_microbatches == 0 {
+        bail!("invalid dynamic pipeline schedule PP={pp_rank}/{pp_size} microbatches={num_microbatches}");
+    }
+    let warmup = (pp_size - pp_rank - 1).min(num_microbatches);
+    let mut schedule = Vec::with_capacity(num_microbatches + warmup);
+    for mb in 0..warmup {
+        schedule.push((Some(mb as i64), None));
+    }
+    for mb in warmup..num_microbatches {
+        schedule.push((Some(mb as i64), Some((mb - warmup) as i64)));
+    }
+    for mb in num_microbatches - warmup..num_microbatches {
+        schedule.push((None, Some(mb as i64)));
+    }
+    Ok(schedule)
+}
+
 fn validate_qwen_parallel_features(
     is_moe: bool,
     tp_size: usize,
@@ -574,6 +596,128 @@ impl Qwen36Session {
             .unwrap_or(true)
     }
 
+    fn train_multi_lora_pipeline(
+        &mut self,
+        input: &TrainInput,
+        n_total: i32,
+        adapter_ids: &[i64],
+    ) -> Result<TrainOutput> {
+        let (pp_rank, pp_size) = self
+            .context_spec
+            .as_ref()
+            .map(|spec| (spec.pp_rank, spec.pp_size))
+            .ok_or_else(|| anyhow!("Qwen context is not initialized"))?;
+        if pp_size < 2 {
+            bail!("dynamic pipeline training requires PP_SIZE >= 2");
+        }
+        let ctx = self
+            .ctx
+            .as_ref()
+            .ok_or_else(|| anyhow!("LoRA not initialized"))?;
+        let selected = if adapter_ids.is_empty() {
+            ctx.list_lora().into_iter().filter(|id| *id > 0).collect::<Vec<_>>()
+        } else {
+            adapter_ids.to_vec()
+        };
+        if selected.is_empty() || selected.len() != n_total as usize {
+            bail!("dynamic pipeline adapter count does not match n_total={n_total}");
+        }
+        let window_id = i64::try_from(self.step).context("pipeline step exceeds i64")?;
+        ctx.pipeline_begin_dynamic_selected_v1(window_id, 1, &selected)?;
+        let result = (|| -> Result<f64> {
+            for (forward_mb, backward_mb) in
+                dynamic_pipeline_schedule(pp_rank, pp_size, 1)?
+            {
+                let tick_result = ctx.pipeline_tick_v1(
+                    window_id,
+                    forward_mb,
+                    backward_mb,
+                    forward_mb.map(|_| &input.input_ids),
+                    forward_mb.map(|_| &input.target_mask),
+                    forward_mb.map(|_| &input.attention_mask),
+                    1.0,
+                )?;
+                if !tick_result.loss.is_finite() {
+                    bail!("dynamic pipeline returned a non-finite tick loss");
+                }
+            }
+            Ok(ctx.pipeline_finish_v1()?.loss)
+        })();
+        match result {
+            Ok(loss) => self.finish_train_step(loss, false),
+            Err(error) => {
+                let _ = ctx.pipeline_abort_v1();
+                Err(error)
+            }
+        }
+    }
+
+    fn train_multi_lora_pipeline_report(
+        &mut self,
+        input: &TrainInput,
+        n_total: i32,
+        adapter_ids: &[i64],
+    ) -> Result<MultiLoraTrainOutput> {
+        let (pp_rank, pp_size) = self
+            .context_spec
+            .as_ref()
+            .map(|spec| (spec.pp_rank, spec.pp_size))
+            .ok_or_else(|| anyhow!("Qwen context is not initialized"))?;
+        if pp_size < 2 {
+            bail!("dynamic pipeline loss reporting requires PP_SIZE >= 2");
+        }
+        let ctx = self
+            .ctx
+            .as_ref()
+            .ok_or_else(|| anyhow!("LoRA not initialized"))?;
+        if adapter_ids.is_empty() || adapter_ids.len() != n_total as usize {
+            bail!("dynamic pipeline report adapter count does not match n_total={n_total}");
+        }
+        let window_id = i64::try_from(self.step).context("pipeline step exceeds i64")?;
+        ctx.pipeline_begin_dynamic_selected_v1(window_id, 1, adapter_ids)?;
+        let result = (|| -> Result<(f64, Vec<f64>)> {
+            for (forward_mb, backward_mb) in dynamic_pipeline_schedule(pp_rank, pp_size, 1)? {
+                let tick_result = ctx.pipeline_tick_v1(
+                    window_id,
+                    forward_mb,
+                    backward_mb,
+                    forward_mb.map(|_| &input.input_ids),
+                    forward_mb.map(|_| &input.target_mask),
+                    forward_mb.map(|_| &input.attention_mask),
+                    1.0,
+                )?;
+                if !tick_result.loss.is_finite() {
+                    bail!("dynamic pipeline returned a non-finite tick loss");
+                }
+            }
+            let (finish, adapter_losses) =
+                ctx.pipeline_finish_dynamic_report_v1(adapter_ids.len())?;
+            Ok((finish.loss, adapter_losses))
+        })();
+        match result {
+            Ok((loss, adapter_losses)) => {
+                let adapter_steps = adapter_ids
+                    .iter()
+                    .map(|adapter_id| {
+                        u64::try_from(ctx.get_adapter_step_count(*adapter_id)?)
+                            .context("native dynamic adapter optimizer step is negative")
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                let output = self.finish_train_step(loss, false)?;
+                Ok(MultiLoraTrainOutput {
+                    loss: output.loss,
+                    adapter_losses,
+                    adapter_steps,
+                    step: output.step,
+                })
+            }
+            Err(error) => {
+                let _ = ctx.pipeline_abort_v1();
+                Err(error)
+            }
+        }
+    }
+
     pub fn train_step_host_i64(
         &mut self,
         input_ids: &[i64],
@@ -601,6 +745,25 @@ impl Qwen36Session {
         lora_rank: i32,
         adapter_ids: &[i64],
     ) -> Result<TrainOutput> {
+        if self
+            .context_spec
+            .as_ref()
+            .map(|spec| spec.pp_size > 1)
+            .unwrap_or(false)
+        {
+            let input = TrainInput {
+                input_ids: Tensor::from_slice(input_ids)
+                    .reshape([batch_size as i64, seq_len as i64])
+                    .to_device(self.device),
+                target_mask: Tensor::from_slice(target_mask)
+                    .reshape([batch_size as i64, seq_len as i64])
+                    .to_device(self.device),
+                attention_mask: Tensor::from_slice(attention_mask)
+                    .reshape([batch_size as i64, seq_len as i64])
+                    .to_device(self.device),
+            };
+            return self.train_multi_lora_pipeline(&input, n_total, adapter_ids);
+        }
         let loss = self
             .ctx
             .as_ref()
@@ -629,6 +792,25 @@ impl Qwen36Session {
         lora_rank: i32,
         adapter_ids: &[i64],
     ) -> Result<MultiLoraTrainOutput> {
+        if self
+            .context_spec
+            .as_ref()
+            .map(|spec| spec.pp_size > 1)
+            .unwrap_or(false)
+        {
+            let input = TrainInput {
+                input_ids: Tensor::from_slice(input_ids)
+                    .reshape([batch_size as i64, seq_len as i64])
+                    .to_device(self.device),
+                target_mask: Tensor::from_slice(target_mask)
+                    .reshape([batch_size as i64, seq_len as i64])
+                    .to_device(self.device),
+                attention_mask: Tensor::from_slice(attention_mask)
+                    .reshape([batch_size as i64, seq_len as i64])
+                    .to_device(self.device),
+            };
+            return self.train_multi_lora_pipeline_report(&input, n_total, adapter_ids);
+        }
         let ctx = self
             .ctx
             .as_ref()
@@ -1410,6 +1592,14 @@ impl TrainingSession for Qwen36Session {
             if adapter_ids.iter().any(|id| *id <= 0) {
                 return Err(anyhow!("selected adapter IDs must be positive"));
             }
+        }
+        if self
+            .context_spec
+            .as_ref()
+            .map(|spec| spec.pp_size > 1)
+            .unwrap_or(false)
+        {
+            return self.train_multi_lora_pipeline(&input, n_total, adapter_ids);
         }
         let loss = if adapter_ids.is_empty() {
             ctx.train_multi_lora(
@@ -2549,8 +2739,8 @@ impl TrainingSession for Qwen36Session {
 #[cfg(test)]
 mod tests {
     use super::{
-        validate_dynamic_adapter_manifests, validate_qwen_parallel_features,
-        validate_tp_intermediate_sizes,
+        dynamic_pipeline_schedule, validate_dynamic_adapter_manifests,
+        validate_qwen_parallel_features, validate_tp_intermediate_sizes,
     };
     use rustrain_qwen3_6::checkpoint::DynamicAdapterManifest;
 
@@ -2658,6 +2848,23 @@ mod tests {
         assert_eq!(
             error.to_string(),
             "shared expert intermediate_size=66 must be divisible by TP_SIZE=4"
+        );
+    }
+
+    #[test]
+    fn dynamic_pipeline_schedule_is_shape_safe_for_two_stages() {
+        assert_eq!(
+            dynamic_pipeline_schedule(0, 2, 3).unwrap(),
+            vec![
+                (Some(0), None),
+                (Some(1), Some(0)),
+                (Some(2), Some(1)),
+                (None, Some(2)),
+            ]
+        );
+        assert_eq!(
+            dynamic_pipeline_schedule(1, 2, 3).unwrap(),
+            vec![(Some(0), Some(0)), (Some(1), Some(1)), (Some(2), Some(2))]
         );
     }
 }
