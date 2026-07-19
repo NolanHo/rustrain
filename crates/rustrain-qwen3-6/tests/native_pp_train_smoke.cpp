@@ -365,6 +365,28 @@ int main() {
         window_context, &runtime_mismatch_window) != 0);
     unsetenv("QWEN36_GDN_INVERSE_BWD");
 
+    // Frozen FC1 fusion is a PP-wide runtime choice even when only one stage
+    // owns a dense or shared MLP.  Preserve the caller's setting after the
+    // negative test so the real window below uses the requested mode.
+    const bool fused_mlp_fc1_enabled =
+        std::getenv("QWEN36_FUSED_MLP_FC1") &&
+        std::atoi(std::getenv("QWEN36_FUSED_MLP_FC1")) != 0;
+    if (rank == 0) {
+        setenv("QWEN36_FUSED_MLP_FC1",
+            fused_mlp_fc1_enabled ? "0" : "1", 1);
+    } else {
+        setenv("QWEN36_FUSED_MLP_FC1",
+            fused_mlp_fc1_enabled ? "1" : "0", 1);
+    }
+    runtime_mismatch_window.window_id = 14;
+    assert(qwen36_pipeline_begin_v1(
+        window_context, &runtime_mismatch_window) != 0);
+    if (fused_mlp_fc1_enabled) {
+        setenv("QWEN36_FUSED_MLP_FC1", "1", 1);
+    } else {
+        unsetenv("QWEN36_FUSED_MLP_FC1");
+    }
+
     if (rank == 0) {
         setenv("QWEN36_GDN_STATE_CHECKPOINT_STRIDE", "invalid", 1);
     } else {

@@ -1847,6 +1847,8 @@ static at::Tensor dense_mlp_forward_batched(
     TrainingContext* ctx, int64_t layer_idx, const at::Tensor& hidden,
     const at::Tensor& gate_proj, const at::Tensor& up_proj,
     const at::Tensor& down_proj, at::ScalarType compute_type);
+static at::Tensor fused_mlp_fc1_weight(
+    TrainingContext* ctx, int64_t layer_idx);
 static bool base_tp_mlp_enabled(const TrainingContext* ctx);
 static int64_t base_tp_mlp_world_size(const TrainingContext* ctx);
 static at::Tensor tp_allreduce_base_mlp(
@@ -2183,6 +2185,7 @@ static at::Tensor moe_routed_a2a(
 
 static at::Tensor moe_forward(
     TrainingContext* training_ctx,
+    int64_t layer_idx,
     void* nccl_comm_v, void* nccl_stream_v,
     const at::Tensor& hidden,
     const at::Tensor& gate_w, const at::Tensor& shared_expert_gate_w,
@@ -2191,7 +2194,7 @@ static at::Tensor moe_forward(
     const RoutedExpertLora& expert_lora,
     int64_t num_experts, int64_t top_k, int64_t intermediate,
     bool norm_topk_prob, int64_t expert_start, int64_t expert_count,
-    at::ScalarType compute_type,
+    at::ScalarType compute_type, bool use_batched,
     const LoraBatchEntry* shared_gate_lora = nullptr,
     const LoraBatchEntry* shared_up_lora = nullptr,
     const LoraBatchEntry* shared_down_lora = nullptr,
@@ -2529,8 +2532,27 @@ static at::Tensor moe_forward(
 
     // Shared expert (same as before, with fused SwiGLU)
     auto shared_input = tp_copy_base_mlp_input(training_ctx, flat);
-    auto shared_gate = at::matmul(shared_input, shared_gate_proj.t());
-    auto shared_up = at::matmul(shared_input, shared_up_proj.t());
+    at::Tensor shared_gate;
+    at::Tensor shared_up;
+    const auto fused_shared_fc1 = use_batched
+        ? fused_mlp_fc1_weight(training_ctx, layer_idx)
+        : at::Tensor();
+    if (fused_shared_fc1.defined()) {
+        TORCH_CHECK(fused_shared_fc1.dim() == 2 &&
+                fused_shared_fc1.size(0) ==
+                    shared_gate_proj.size(0) + shared_up_proj.size(0) &&
+                fused_shared_fc1.size(1) == shared_input.size(1),
+            "fused shared-expert FC1 weight shape is incompatible with the "
+            "local MLP geometry");
+        auto shared_fc1 = at::matmul(shared_input, fused_shared_fc1.t());
+        shared_gate = shared_fc1.narrow(
+            -1, 0, shared_gate_proj.size(0));
+        shared_up = shared_fc1.narrow(
+            -1, shared_gate_proj.size(0), shared_up_proj.size(0));
+    } else {
+        shared_gate = at::matmul(shared_input, shared_gate_proj.t());
+        shared_up = at::matmul(shared_input, shared_up_proj.t());
+    }
     if (shared_gate_lora) {
         shared_gate = add_batched_lora(
             training_ctx, shared_gate.reshape({batch, seq, -1}),
@@ -2735,11 +2757,13 @@ static at::Tensor forward_single_layer(
             auto shared_down = use_batched ? *w[12]
                 : apply_multi_lora(ctx, layer_idx, shared_down_pair, *w[12]);
             auto expert_lora = routed_expert_lora(ctx, layer_idx, *cfg);
-            auto mlp_out = moe_forward(ctx, cfg->nccl_comm, cfg->nccl_stream, post_attn,
+            auto mlp_out = moe_forward(ctx, layer_idx,
+                cfg->nccl_comm, cfg->nccl_stream, post_attn,
                 *w[8], *w[9], shared_gate, shared_up, shared_down, *w[13], *w[14],
                 expert_lora,
                 cfg->num_experts, cfg->top_k, cfg->moe_intermediate,
-                cfg->norm_topk_prob != 0, cfg->expert_start, cfg->expert_count, kind,
+                cfg->norm_topk_prob != 0, cfg->expert_start, cfg->expert_count,
+                kind, use_batched,
                 use_batched ? lora_batch_entry(ctx, layer_idx, shared_gate_pair) : nullptr,
                 use_batched ? lora_batch_entry(ctx, layer_idx, shared_up_pair) : nullptr,
                 use_batched ? lora_batch_entry(ctx, layer_idx, shared_down_pair) : nullptr,
@@ -2801,11 +2825,13 @@ static at::Tensor forward_single_layer(
             auto shared_down = use_batched ? *w[15]
                 : apply_multi_lora(ctx, layer_idx, shared_down_pair, *w[15]);
             auto expert_lora = routed_expert_lora(ctx, layer_idx, *cfg);
-            auto mlp_out = moe_forward(ctx, cfg->nccl_comm, cfg->nccl_stream, post_attn,
+            auto mlp_out = moe_forward(ctx, layer_idx,
+                cfg->nccl_comm, cfg->nccl_stream, post_attn,
                 *w[11], *w[12], shared_gate, shared_up, shared_down, *w[16], *w[17],
                 expert_lora,
                 cfg->num_experts, cfg->top_k, cfg->moe_intermediate,
-                cfg->norm_topk_prob != 0, cfg->expert_start, cfg->expert_count, kind,
+                cfg->norm_topk_prob != 0, cfg->expert_start, cfg->expert_count,
+                kind, use_batched,
                 use_batched ? lora_batch_entry(ctx, layer_idx, shared_gate_pair) : nullptr,
                 use_batched ? lora_batch_entry(ctx, layer_idx, shared_up_pair) : nullptr,
                 use_batched ? lora_batch_entry(ctx, layer_idx, shared_down_pair) : nullptr,
@@ -2941,6 +2967,10 @@ struct TrainingContext {
     // it duplicates frozen Q/K/V storage, but it reduces three base GEMMs to
     // one for activation-level LoRA and TP-local attention.
     std::vector<at::Tensor> fused_full_attention_qkv_weights;
+    // Optional frozen dense/shared SwiGLU FC1 concatenation. Dynamic LoRA
+    // deltas remain separate per tenant and are added after the single base
+    // projection is split back into gate/up activations.
+    std::vector<at::Tensor> fused_mlp_fc1_weights;
     int64_t num_layers;
 
     // Attention mask [batch, seq] — 1 for real tokens, 0 for padding
@@ -3157,6 +3187,15 @@ static at::Tensor fused_full_attention_qkv_weight(
             ctx->fused_full_attention_qkv_weights.size()))
         return at::Tensor();
     return ctx->fused_full_attention_qkv_weights[layer_idx];
+}
+
+static at::Tensor fused_mlp_fc1_weight(
+    TrainingContext* ctx, int64_t layer_idx
+) {
+    if (!ctx || layer_idx < 0 || layer_idx >= static_cast<int64_t>(
+            ctx->fused_mlp_fc1_weights.size()))
+        return at::Tensor();
+    return ctx->fused_mlp_fc1_weights[layer_idx];
 }
 
 struct RouterAuxLossFunction
@@ -3414,6 +3453,7 @@ static void hash_collective_runtime_environment(AdapterRegistryHash& hash) {
     hash.add_u64(env_enabled("QWEN36_FUSED_LAYER"));
     hash.add_u64(env_enabled("QWEN36_FUSED_CE"));
     hash.add_u64(env_enabled("QWEN36_FUSED_QKV"));
+    hash.add_u64(env_enabled("QWEN36_FUSED_MLP_FC1"));
     const char* checkpoint_stride =
         getenv("QWEN36_GDN_STATE_CHECKPOINT_STRIDE");
     hash.add_string(checkpoint_stride ? checkpoint_stride : "");
@@ -6663,8 +6703,21 @@ static at::Tensor dense_mlp_forward_batched(
     const int64_t down_pair = lora_pair_index(cfg, "down_proj");
 
     auto mlp_input = tp_copy_base_mlp_input(ctx, hidden);
-    auto gate_out = at::matmul(mlp_input, gate_proj.t());
-    auto up_out = at::matmul(mlp_input, up_proj.t());
+    at::Tensor gate_out;
+    at::Tensor up_out;
+    const auto fused_fc1 = fused_mlp_fc1_weight(ctx, layer_idx);
+    if (fused_fc1.defined()) {
+        TORCH_CHECK(fused_fc1.dim() == 2 &&
+                fused_fc1.size(0) == gate_proj.size(0) + up_proj.size(0) &&
+                fused_fc1.size(1) == mlp_input.size(2),
+            "fused dense FC1 weight shape is incompatible with the local MLP geometry");
+        auto fc1 = at::matmul(mlp_input, fused_fc1.t());
+        gate_out = fc1.narrow(-1, 0, gate_proj.size(0));
+        up_out = fc1.narrow(-1, gate_proj.size(0), up_proj.size(0));
+    } else {
+        gate_out = at::matmul(mlp_input, gate_proj.t());
+        up_out = at::matmul(mlp_input, up_proj.t());
+    }
     gate_out = add_batched_lora(
         ctx, gate_out, mlp_input, lora_batch_entry(ctx, layer_idx, gate_pair));
     up_out = add_batched_lora(
@@ -6802,14 +6855,16 @@ at::Tensor compute_mlp_only(
             : apply_multi_lora(ctx, layer_idx, shared_down_pair,
                 *ctx->weight_ptrs[w_offset+mlp_start+4]);
         auto expert_lora = routed_expert_lora(ctx, layer_idx, cfg);
-        return moe_forward(ctx, cfg.nccl_comm, cfg.nccl_stream, post_attn,
+        return moe_forward(ctx, layer_idx,
+            cfg.nccl_comm, cfg.nccl_stream, post_attn,
             *ctx->weight_ptrs[w_offset+mlp_start], *ctx->weight_ptrs[w_offset+mlp_start+1],
             shared_gate, shared_up,
             shared_down, *ctx->weight_ptrs[w_offset+mlp_start+5],
             *ctx->weight_ptrs[w_offset+mlp_start+6],
             expert_lora,
             cfg.num_experts, cfg.top_k, cfg.moe_intermediate,
-            cfg.norm_topk_prob != 0, cfg.expert_start, cfg.expert_count, kind,
+            cfg.norm_topk_prob != 0, cfg.expert_start, cfg.expert_count,
+            kind, use_batched,
             use_batched ? lora_batch_entry(ctx, layer_idx, shared_gate_pair) : nullptr,
             use_batched ? lora_batch_entry(ctx, layer_idx, shared_up_pair) : nullptr,
             use_batched ? lora_batch_entry(ctx, layer_idx, shared_down_pair) : nullptr,
@@ -10204,6 +10259,27 @@ static void* qwen36_create_training_context_impl(
                     ctx->fused_full_attention_qkv_weights[layer] =
                         at::cat({*q, *k, *v}, 0).contiguous();
                 }
+                weight_offset += weight_count_for_layer(cfg);
+            }
+        }
+        ctx->fused_mlp_fc1_weights.resize(num_layers);
+        if (env_enabled("QWEN36_FUSED_MLP_FC1", false)) {
+            at::NoGradGuard guard;
+            int64_t weight_offset = 0;
+            for (int64_t layer = 0; layer < num_layers; ++layer) {
+                const auto& cfg = ctx->layer_configs[layer];
+                const int64_t mlp_start = cfg.layer_type == 0 ? 8 : 11;
+                const int64_t gate_offset = cfg.num_experts > 0
+                    ? mlp_start + 2 : mlp_start;
+                const int64_t up_offset = gate_offset + 1;
+                auto* gate = ctx->weight_ptrs[weight_offset + gate_offset];
+                auto* up = ctx->weight_ptrs[weight_offset + up_offset];
+                TORCH_CHECK(gate && up && gate->dim() == 2 && up->dim() == 2 &&
+                        gate->sizes() == up->sizes(),
+                    "fused MLP FC1 requires matching gate/up matrix weights at layer ",
+                    layer);
+                ctx->fused_mlp_fc1_weights[layer] =
+                    at::cat({*gate, *up}, 0).contiguous();
                 weight_offset += weight_count_for_layer(cfg);
             }
         }
