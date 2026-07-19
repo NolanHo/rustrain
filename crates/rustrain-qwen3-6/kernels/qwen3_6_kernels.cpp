@@ -538,6 +538,160 @@ struct TpGatherForLossFunction
     }
 };
 
+// Headwise GDN context parallelism maps local sequence slices to local head
+// bundles before the recurrent kernel, then performs the inverse mapping
+// before the output projection. Inputs are packed peer-major on the feature
+// axis so section-aware Q/K/V slicing stays outside the communication layer.
+static at::Tensor cp_sequence_to_head_exchange(
+    const at::Tensor& input, ncclComm_t comm,
+    cudaStream_t requested_stream, int64_t world
+) {
+    TORCH_CHECK(input.is_cuda() && input.dim() == 3 && input.is_contiguous(),
+        "CP sequence-to-head requires contiguous CUDA [batch, seq, features]");
+    TORCH_CHECK(comm && world == 2 && input.size(2) % world == 0,
+        "CP sequence-to-head currently requires CP_SIZE=2 and divisible features");
+    const int64_t peer_features = input.size(2) / world;
+    auto packed = input.reshape({
+        input.size(0), input.size(1), world, peer_features})
+        .permute({2, 0, 1, 3}).contiguous();
+    auto received = at::empty_like(packed);
+    const int device = input.device().index();
+    const auto current = c10::cuda::getCurrentCUDAStream(device).stream();
+    Qwen36StreamFence fence(current, requested_stream);
+    TORCH_CHECK(ncclGroupStart() == ncclSuccess,
+        "CP sequence-to-head group start failed");
+    ncclResult_t first_error = ncclSuccess;
+    for (int peer = 0; peer < world; ++peer) {
+        auto source = packed.select(0, peer);
+        const auto error = ncclSend(
+            source.data_ptr(), source.numel(),
+            NcclAllReduceFunction::dtype_for(input.scalar_type()), peer,
+            comm, fence.operation);
+        if (first_error == ncclSuccess && error != ncclSuccess)
+            first_error = error;
+    }
+    for (int peer = 0; peer < world; ++peer) {
+        auto destination = received.select(0, peer);
+        const auto error = ncclRecv(
+            destination.data_ptr(), destination.numel(),
+            NcclAllReduceFunction::dtype_for(input.scalar_type()), peer,
+            comm, fence.operation);
+        if (first_error == ncclSuccess && error != ncclSuccess)
+            first_error = error;
+    }
+    const auto group_error = ncclGroupEnd();
+    TORCH_CHECK(first_error == ncclSuccess,
+        "CP sequence-to-head P2P failed: ", ncclGetErrorString(first_error));
+    TORCH_CHECK(group_error == ncclSuccess,
+        "CP sequence-to-head group end failed: ",
+        ncclGetErrorString(group_error));
+    fence.complete();
+    return received.permute({1, 0, 2, 3}).reshape({
+        input.size(0), input.size(1) * world, peer_features}).contiguous();
+}
+
+static at::Tensor cp_head_to_sequence_exchange(
+    const at::Tensor& input, ncclComm_t comm,
+    cudaStream_t requested_stream, int64_t world
+) {
+    TORCH_CHECK(input.is_cuda() && input.dim() == 3 && input.is_contiguous(),
+        "CP head-to-sequence requires contiguous CUDA [batch, seq, features]");
+    TORCH_CHECK(comm && world == 2 && input.size(1) % world == 0,
+        "CP head-to-sequence currently requires CP_SIZE=2 and divisible sequence");
+    const int64_t local_sequence = input.size(1) / world;
+    auto packed = input.reshape({
+        input.size(0), world, local_sequence, input.size(2)})
+        .permute({1, 0, 2, 3}).contiguous();
+    auto received = at::empty_like(packed);
+    const int device = input.device().index();
+    const auto current = c10::cuda::getCurrentCUDAStream(device).stream();
+    Qwen36StreamFence fence(current, requested_stream);
+    TORCH_CHECK(ncclGroupStart() == ncclSuccess,
+        "CP head-to-sequence group start failed");
+    ncclResult_t first_error = ncclSuccess;
+    for (int peer = 0; peer < world; ++peer) {
+        auto source = packed.select(0, peer);
+        const auto error = ncclSend(
+            source.data_ptr(), source.numel(),
+            NcclAllReduceFunction::dtype_for(input.scalar_type()), peer,
+            comm, fence.operation);
+        if (first_error == ncclSuccess && error != ncclSuccess)
+            first_error = error;
+    }
+    for (int peer = 0; peer < world; ++peer) {
+        auto destination = received.select(0, peer);
+        const auto error = ncclRecv(
+            destination.data_ptr(), destination.numel(),
+            NcclAllReduceFunction::dtype_for(input.scalar_type()), peer,
+            comm, fence.operation);
+        if (first_error == ncclSuccess && error != ncclSuccess)
+            first_error = error;
+    }
+    const auto group_error = ncclGroupEnd();
+    TORCH_CHECK(first_error == ncclSuccess,
+        "CP head-to-sequence P2P failed: ", ncclGetErrorString(first_error));
+    TORCH_CHECK(group_error == ncclSuccess,
+        "CP head-to-sequence group end failed: ",
+        ncclGetErrorString(group_error));
+    fence.complete();
+    return received.permute({1, 2, 0, 3}).reshape({
+        input.size(0), local_sequence, input.size(2) * world}).contiguous();
+}
+
+struct CpSequenceToHeadFunction
+    : public torch::autograd::Function<CpSequenceToHeadFunction> {
+    static at::Tensor forward(
+        torch::autograd::AutogradContext* ctx, at::Tensor input,
+        int64_t comm_ptr, int64_t stream_ptr, int64_t world
+    ) {
+        ctx->saved_data["comm"] = comm_ptr;
+        ctx->saved_data["stream"] = stream_ptr;
+        ctx->saved_data["world"] = world;
+        return cp_sequence_to_head_exchange(
+            input.contiguous(), reinterpret_cast<ncclComm_t>(comm_ptr),
+            reinterpret_cast<cudaStream_t>(stream_ptr), world);
+    }
+
+    static std::vector<at::Tensor> backward(
+        torch::autograd::AutogradContext* ctx,
+        std::vector<at::Tensor> grad_output
+    ) {
+        auto grad_input = cp_head_to_sequence_exchange(
+            grad_output[0].contiguous(),
+            reinterpret_cast<ncclComm_t>(ctx->saved_data["comm"].toInt()),
+            reinterpret_cast<cudaStream_t>(ctx->saved_data["stream"].toInt()),
+            ctx->saved_data["world"].toInt());
+        return {grad_input, at::Tensor(), at::Tensor(), at::Tensor()};
+    }
+};
+
+struct CpHeadToSequenceFunction
+    : public torch::autograd::Function<CpHeadToSequenceFunction> {
+    static at::Tensor forward(
+        torch::autograd::AutogradContext* ctx, at::Tensor input,
+        int64_t comm_ptr, int64_t stream_ptr, int64_t world
+    ) {
+        ctx->saved_data["comm"] = comm_ptr;
+        ctx->saved_data["stream"] = stream_ptr;
+        ctx->saved_data["world"] = world;
+        return cp_head_to_sequence_exchange(
+            input.contiguous(), reinterpret_cast<ncclComm_t>(comm_ptr),
+            reinterpret_cast<cudaStream_t>(stream_ptr), world);
+    }
+
+    static std::vector<at::Tensor> backward(
+        torch::autograd::AutogradContext* ctx,
+        std::vector<at::Tensor> grad_output
+    ) {
+        auto grad_input = cp_sequence_to_head_exchange(
+            grad_output[0].contiguous(),
+            reinterpret_cast<ncclComm_t>(ctx->saved_data["comm"].toInt()),
+            reinterpret_cast<cudaStream_t>(ctx->saved_data["stream"].toInt()),
+            ctx->saved_data["world"].toInt());
+        return {grad_input, at::Tensor(), at::Tensor(), at::Tensor()};
+    }
+};
+
 struct FusedSwiGLUFunction : public torch::autograd::Function<FusedSwiGLUFunction> {
     static at::Tensor forward(torch::autograd::AutogradContext* ctx,
         at::Tensor gate, at::Tensor up, double limit) {
@@ -3159,6 +3313,9 @@ static void hash_adapter_request_identity(
 static void hash_collective_topology(
     AdapterRegistryHash& hash, const TrainingContext* ctx
 ) {
+    hash.add_u64(ctx->num_layers);
+    hash.add_u64(ctx->global_layer_start);
+    hash.add_u64(ctx->global_num_layers);
     hash.add_u64(ctx->tp_world_size);
     hash.add_u64(ctx->cp_world_size);
     hash.add_u64(ctx->ep_world_size);
@@ -3178,7 +3335,53 @@ static void hash_collective_topology(
     hash.add_u64(env_enabled("QWEN36_HETERO_PADDED_BATCH", true));
     hash.add_u64(env_enabled("QWEN36_GDN_RECURRENT_FUSION", true));
     hash.add_u64(env_enabled("QWEN36_GDN_CHUNKWISE_BWD"));
+    hash.add_u64(env_enabled("QWEN36_GDN_FUSED_AB_PROJECTION", true));
+    hash.add_u64(env_enabled("QWEN36_DELTA_REFERENCE_BWD"));
+    hash.add_u64(env_enabled("QWEN36_SUBCKPT"));
+    hash.add_u64(env_enabled("QWEN36_FUSED_LAYER"));
+    hash.add_u64(env_enabled("QWEN36_FUSED_CE"));
+    hash.add_u64(ctx->use_checkpoint);
+    hash.add_u64(ctx->group_size);
     hash.add_u64(gdn_state_checkpoint_config());
+    const char* sequence_chunk = getenv("QWEN36_SEQ_CHUNK");
+    hash.add_string(sequence_chunk ? sequence_chunk : "");
+    const char* checkpoint_group = getenv("QWEN36_GROUP_SIZE");
+    hash.add_string(checkpoint_group ? checkpoint_group : "");
+    if (ctx->cp_world_size > 1) {
+        for (const auto& config : ctx->layer_configs) {
+            hash.add_u64(config.layer_type);
+            hash.add_u64(config.num_heads);
+            hash.add_u64(config.num_kv_heads);
+            hash.add_u64(config.head_dim);
+            hash.add_u64(config.num_k_heads);
+            hash.add_u64(config.key_dim);
+            hash.add_u64(config.num_v_heads);
+            hash.add_u64(config.val_dim);
+            hash.add_u64(config.conv_kernel);
+            hash_double(hash, config.partial_rotary_factor);
+            hash_double(hash, config.rope_theta);
+            hash_double(hash, config.rms_eps);
+            hash.add_u64(config.num_experts);
+            hash.add_u64(config.top_k);
+            hash.add_u64(config.moe_intermediate);
+            hash.add_u64(config.expert_start);
+            hash.add_u64(config.expert_count);
+            hash.add_u64(config.intermediate_size);
+            hash.add_u64(config.norm_topk_prob);
+        }
+        hash.add_u64(ctx->weight_ptrs.size());
+        for (const auto* weight : ctx->weight_ptrs) {
+            hash.add_u64(weight != nullptr);
+            if (weight) hash_tensor_layout(hash, *weight);
+        }
+        for (const auto* tensor : {
+                ctx->embed_ptr.empty() ? nullptr : ctx->embed_ptr[0],
+                ctx->final_norm_ptr.empty() ? nullptr : ctx->final_norm_ptr[0],
+                ctx->lm_head_ptr.empty() ? nullptr : ctx->lm_head_ptr[0]}) {
+            hash.add_u64(tensor != nullptr);
+            if (tensor) hash_tensor_layout(hash, *tensor);
+        }
+    }
     uint64_t router_aux_bits = 0;
     static_assert(sizeof(router_aux_bits) == sizeof(ctx->router_aux_loss_coef));
     std::memcpy(
@@ -3201,10 +3404,8 @@ static void validate_native_execution_topology(const TrainingContext* ctx) {
         "native Qwen DP communicator is not initialized");
     TORCH_CHECK(ctx->pp_world_size == 1 || ctx->pp_comm,
         "native Qwen PP communicator is not initialized");
-    TORCH_CHECK(ctx->cp_world_size == 1 && ctx->pp_world_size == 1,
-        "native Qwen PP/CP communicator initialization is available, but model "
-        "execution requires stage ownership and context partitioning; CP_SIZE=",
-        ctx->cp_world_size, " PP_SIZE=", ctx->pp_world_size);
+    TORCH_CHECK(ctx->pp_world_size == 1,
+        "native Qwen pipeline execution must use the pipeline training ABI");
     if (ctx->sequence_parallel) {
         TORCH_CHECK(ctx->tp_world_size == 2 && ctx->tp_comm,
             "sequence parallelism currently requires initialized TP_SIZE=2");
@@ -3240,6 +3441,69 @@ static void validate_native_execution_topology(const TrainingContext* ctx) {
             }
         }
     }
+    if (ctx->cp_world_size > 1) {
+        TORCH_CHECK(ctx->cp_world_size == 2 && ctx->cp_comm,
+            "GDN context parallelism currently requires initialized CP_SIZE=2");
+        TORCH_CHECK(ctx->tp_world_size == 1 && ctx->ep_world_size == 1 &&
+                ctx->dp_world_size == 1 && ctx->pp_world_size == 1,
+            "GDN context parallelism currently requires TP=EP=DP=PP=1");
+        TORCH_CHECK(!ctx->sequence_parallel && !ctx->base_tp_attention &&
+                !ctx->base_tp_mlp && !ctx->vocab_parallel,
+            "GDN context parallelism cannot be combined with TP or sequence parallelism");
+        TORCH_CHECK(!ctx->has_mtp,
+            "GDN context parallelism does not support MTP");
+        TORCH_CHECK(ctx->adapters.empty(),
+            "GDN context parallelism currently supports fixed LoRA only");
+        TORCH_CHECK(ctx->router_aux_loss_coef == 0.0,
+            "GDN context parallelism does not support router auxiliary loss");
+        const char* sequence_chunk = getenv("QWEN36_SEQ_CHUNK");
+        TORCH_CHECK(!sequence_chunk || atoll(sequence_chunk) <= 0,
+            "GDN context parallelism does not support QWEN36_SEQ_CHUNK");
+        int64_t weight_offset = 0;
+        for (int64_t layer = 0; layer < ctx->num_layers; ++layer) {
+            const auto& config = ctx->layer_configs[layer];
+            TORCH_CHECK(config.layer_type != 0 && config.num_experts == 0,
+                "GDN context parallelism currently requires dense linear-attention layers");
+            TORCH_CHECK(config.num_k_heads > 0 && config.num_v_heads > 0 &&
+                    config.key_dim > 0 && config.val_dim > 0 &&
+                    config.conv_kernel > 0 &&
+                    config.num_v_heads % config.num_k_heads == 0 &&
+                    config.num_k_heads % ctx->cp_world_size == 0 &&
+                    config.num_v_heads % ctx->cp_world_size == 0,
+                "GDN head counts must preserve groups and be divisible by CP_SIZE");
+            auto* qkv = ctx->weight_ptrs[weight_offset + 2];
+            auto* z = ctx->weight_ptrs[weight_offset + 3];
+            auto* a = ctx->weight_ptrs[weight_offset + 4];
+            auto* b = ctx->weight_ptrs[weight_offset + 5];
+            auto* a_log = ctx->weight_ptrs[weight_offset + 6];
+            auto* dt_bias = ctx->weight_ptrs[weight_offset + 7];
+            auto* conv = ctx->weight_ptrs[weight_offset + 8];
+            auto* norm = ctx->weight_ptrs[weight_offset + 9];
+            auto* out = ctx->weight_ptrs[weight_offset + 10];
+            TORCH_CHECK(qkv && z && a && b && a_log && dt_bias && conv &&
+                    norm && out && qkv->dim() == 2,
+                "GDN context parallelism received missing or invalid weights");
+            const int64_t q = config.num_k_heads * config.key_dim;
+            const int64_t v = config.num_v_heads * config.val_dim;
+            const int64_t hidden = qkv->size(1);
+            TORCH_CHECK(qkv->size(0) == q * 2 + v &&
+                    z->dim() == 2 && z->sizes() == at::IntArrayRef({v, hidden}) &&
+                    a->dim() == 2 &&
+                    a->sizes() == at::IntArrayRef({config.num_v_heads, hidden}) &&
+                    b->sizes() == a->sizes() &&
+                    a_log->dim() == 1 &&
+                    a_log->size(0) == config.num_v_heads &&
+                    dt_bias->sizes() == a_log->sizes() &&
+                    conv->dim() == 3 && conv->size(0) == q * 2 + v &&
+                    conv->size(1) == 1 &&
+                    conv->size(2) == config.conv_kernel &&
+                    norm->dim() == 1 && norm->size(0) == config.val_dim &&
+                    out->dim() == 2 &&
+                    out->sizes() == at::IntArrayRef({hidden, v}),
+                "GDN context-parallel weight shapes do not match the model configuration");
+            weight_offset += weight_count_for_layer(config);
+        }
+    }
 }
 
 static void validate_adapter_collective_registry(
@@ -3250,7 +3514,8 @@ static void validate_adapter_collective_registry(
     bool use_registered_order,
     const int64_t* expected_steps = nullptr
 ) {
-    if (!ctx || (!ctx->nccl_comm && !ctx->dp_comm && !ctx->tp_comm)) return;
+    if (!ctx || (!ctx->nccl_comm && !ctx->dp_comm && !ctx->tp_comm &&
+            !ctx->cp_comm)) return;
 
     AdapterRegistryHash hash;
     hash_collective_topology(hash, ctx);
@@ -3323,6 +3588,7 @@ static void validate_adapter_collective_registry(
     reduce_axis(ctx->nccl_comm, "EP");
     reduce_axis(ctx->dp_comm, "DP");
     reduce_axis(ctx->tp_comm, "TP");
+    reduce_axis(ctx->cp_comm, "CP");
     const auto minimum_cpu = minimum.to(at::kCPU);
     const auto maximum_cpu = maximum.to(at::kCPU);
     const auto* minimum_data = minimum_cpu.data_ptr<int64_t>();
@@ -3338,7 +3604,8 @@ static void validate_adapter_collective_registry(
 static void validate_fixed_collective_registry(
     TrainingContext* ctx, int64_t optimizer_phase = -1
 ) {
-    if (!ctx || (!ctx->nccl_comm && !ctx->dp_comm && !ctx->tp_comm)) return;
+    if (!ctx || (!ctx->nccl_comm && !ctx->dp_comm && !ctx->tp_comm &&
+            !ctx->cp_comm)) return;
 
     AdapterRegistryHash hash;
     hash_collective_topology(hash, ctx);
@@ -3396,6 +3663,7 @@ static void validate_fixed_collective_registry(
     reduce_axis(ctx->nccl_comm, "EP");
     reduce_axis(ctx->dp_comm, "DP");
     reduce_axis(ctx->tp_comm, "TP");
+    reduce_axis(ctx->cp_comm, "CP");
 
     const auto minimum_cpu = minimum.to(at::kCPU);
     const auto maximum_cpu = maximum.to(at::kCPU);
@@ -3555,7 +3823,8 @@ static bool adapter_collective_all_succeeded(
     TrainingContext* ctx,
     bool local_success
 ) {
-    if (!ctx || (!ctx->nccl_comm && !ctx->dp_comm && !ctx->tp_comm))
+    if (!ctx || (!ctx->nccl_comm && !ctx->dp_comm && !ctx->tp_comm &&
+            !ctx->cp_comm))
         return local_success;
     c10::cuda::set_device(ctx->cuda_device);
     cudaSetDevice(ctx->cuda_device);
@@ -3574,7 +3843,26 @@ static bool adapter_collective_all_succeeded(
     reduce_axis(ctx->nccl_comm, "EP");
     reduce_axis(ctx->dp_comm, "DP");
     reduce_axis(ctx->tp_comm, "TP");
+    reduce_axis(ctx->cp_comm, "CP");
     return succeeded.to(at::kCPU).item<int32_t>() != 0;
+}
+
+static void validate_native_execution_topology_collective(
+    TrainingContext* ctx
+) {
+    std::string local_error;
+    try {
+        validate_native_execution_topology(ctx);
+    } catch (const std::exception& error) {
+        local_error = error.what();
+    }
+    const bool local_valid = local_error.empty();
+    const bool globally_valid = adapter_collective_all_succeeded(
+        ctx, local_valid);
+    TORCH_CHECK(local_valid && globally_valid,
+        "native Qwen execution topology or model contract differs across "
+        "distributed ranks",
+        local_error.empty() ? "" : ": ", local_error);
 }
 
 static std::vector<int32_t> adapter_collective_min_flags(
@@ -3583,7 +3871,8 @@ static std::vector<int32_t> adapter_collective_min_flags(
 ) {
     TORCH_CHECK(!local_flags.empty(),
         "adapter flag consensus requires at least one flag");
-    if (!ctx || (!ctx->nccl_comm && !ctx->dp_comm && !ctx->tp_comm))
+    if (!ctx || (!ctx->nccl_comm && !ctx->dp_comm && !ctx->tp_comm &&
+            !ctx->cp_comm))
         return local_flags;
     c10::cuda::set_device(ctx->cuda_device);
     cudaSetDevice(ctx->cuda_device);
@@ -3603,6 +3892,7 @@ static std::vector<int32_t> adapter_collective_min_flags(
     reduce_axis(ctx->nccl_comm, "EP");
     reduce_axis(ctx->dp_comm, "DP");
     reduce_axis(ctx->tp_comm, "TP");
+    reduce_axis(ctx->cp_comm, "CP");
     auto cpu = flags.to(at::kCPU).contiguous();
     const auto* values = cpu.data_ptr<int32_t>();
     return std::vector<int32_t>(values, values + cpu.numel());
@@ -3768,7 +4058,8 @@ static bool replica_input_signatures_match(
     const at::Tensor& target_mask,
     const at::Tensor* attention_mask
 ) {
-    if (!ctx || (!ctx->tp_comm && !ctx->nccl_comm)) return true;
+    if (!ctx || (!ctx->tp_comm && !ctx->nccl_comm && !ctx->cp_comm))
+        return true;
     const std::vector<int64_t> signature_values{
         input_ids.size(0),
         input_ids.size(1),
@@ -3804,11 +4095,40 @@ static bool replica_input_signatures_match(
             ncclGetErrorString(err));
     };
     reduce_axis(ctx->tp_comm, "TP");
+    reduce_axis(ctx->cp_comm, "CP");
     const bool sharded_a2a = ctx->expert_parallel && ctx->nccl_comm &&
         env_enabled("QWEN36_EP_A2A_SHARDED");
     if (ctx->expert_parallel && !sharded_a2a)
         reduce_axis(ctx->nccl_comm, "replicated EP");
-    return (minimum == maximum).all().item<bool>();
+    const bool signatures_match =
+        (minimum == maximum).all().item<bool>();
+    if (!signatures_match || ctx->cp_world_size <= 1)
+        return signatures_match;
+
+    auto cp_values_match = [&](const at::Tensor& tensor, bool integer) {
+        auto values = tensor.to(integer ? at::kLong : at::kFloat)
+            .contiguous();
+        auto values_minimum = values.clone();
+        auto values_maximum = values.clone();
+        const auto dtype = integer ? ncclInt64 : ncclFloat;
+        auto error = ncclAllReduce(
+            values_minimum.data_ptr(), values_minimum.data_ptr(),
+            values_minimum.numel(), dtype, ncclMin, ctx->cp_comm, stream);
+        TORCH_CHECK(error == ncclSuccess,
+            "CP input-value minimum all-reduce failed: ",
+            ncclGetErrorString(error));
+        error = ncclAllReduce(
+            values_maximum.data_ptr(), values_maximum.data_ptr(),
+            values_maximum.numel(), dtype, ncclMax, ctx->cp_comm, stream);
+        TORCH_CHECK(error == ncclSuccess,
+            "CP input-value maximum all-reduce failed: ",
+            ncclGetErrorString(error));
+        return values_minimum.equal(values_maximum);
+    };
+    if (!cp_values_match(input_ids, true) ||
+            !cp_values_match(target_mask, false))
+        return false;
+    return !attention_mask || cp_values_match(*attention_mask, false);
 }
 
 static bool harvest_leaf_grad(
@@ -3960,6 +4280,10 @@ static bool sequence_parallel_enabled(const TrainingContext* ctx) {
     return ctx && ctx->sequence_parallel && ctx->tp_world_size > 1;
 }
 
+static bool context_parallel_enabled(const TrainingContext* ctx) {
+    return ctx && ctx->cp_world_size > 1;
+}
+
 static at::Tensor sequence_parallel_embedding_scatter(
     TrainingContext* ctx, const at::Tensor& full_hidden
 ) {
@@ -4002,7 +4326,14 @@ static at::Tensor sequence_parallel_row_reduce_scatter(
 static at::Tensor sequence_parallel_loss_gather(
     TrainingContext* ctx, const at::Tensor& local_hidden
 ) {
-    if (!sequence_parallel_enabled(ctx)) return local_hidden;
+    if (!sequence_parallel_enabled(ctx) && !context_parallel_enabled(ctx))
+        return local_hidden;
+    if (context_parallel_enabled(ctx)) {
+        return TpGatherForLossFunction::apply(
+            local_hidden.contiguous(), (int64_t)ctx->cp_comm,
+            (int64_t)reinterpret_cast<uintptr_t>(ctx->cp_stream),
+            ctx->cp_rank, ctx->cp_world_size);
+    }
     ++ctx->sequence_parallel_loss_gather_count;
     return TpGatherForLossFunction::apply(
         local_hidden.contiguous(), (int64_t)ctx->tp_comm,
@@ -4013,13 +4344,18 @@ static at::Tensor sequence_parallel_loss_gather(
 static at::Tensor sequence_parallel_plain_split(
     TrainingContext* ctx, const at::Tensor& full_gradient
 ) {
-    if (!sequence_parallel_enabled(ctx)) return full_gradient;
+    if (!sequence_parallel_enabled(ctx) && !context_parallel_enabled(ctx))
+        return full_gradient;
+    const int64_t world = context_parallel_enabled(ctx)
+        ? ctx->cp_world_size : ctx->tp_world_size;
+    const int64_t rank = context_parallel_enabled(ctx)
+        ? ctx->cp_rank : ctx->tp_rank;
     TORCH_CHECK(full_gradient.dim() == 3 &&
-            full_gradient.size(1) % ctx->tp_world_size == 0,
-        "loss hidden gradient sequence must be divisible by TP_SIZE");
-    const int64_t local_sequence = full_gradient.size(1) / ctx->tp_world_size;
+            full_gradient.size(1) % world == 0,
+        "loss hidden gradient sequence must be divisible by the sequence axis");
+    const int64_t local_sequence = full_gradient.size(1) / world;
     return full_gradient.narrow(
-        1, ctx->tp_rank * local_sequence, local_sequence).contiguous();
+        1, rank * local_sequence, local_sequence).contiguous();
 }
 
 static bool vocab_parallel_enabled(const TrainingContext* ctx) {
@@ -4040,9 +4376,26 @@ static at::Tensor vocabulary_embedding(
     TrainingContext* ctx, const at::Tensor& input_ids
 ) {
     auto embed = *ctx->embed_ptr[0];
-    if (!vocab_parallel_enabled(ctx))
-        return sequence_parallel_embedding_scatter(
+    if (!vocab_parallel_enabled(ctx)) {
+        if (context_parallel_enabled(ctx)) {
+            TORCH_CHECK(input_ids.dim() == 2 &&
+                    input_ids.size(1) % ctx->cp_world_size == 0,
+                "input sequence length=",
+                input_ids.dim() == 2 ? input_ids.size(1) : -1,
+                " must be divisible by CP_SIZE=", ctx->cp_world_size);
+            const int64_t local_sequence =
+                input_ids.size(1) / ctx->cp_world_size;
+            auto local_ids = input_ids.narrow(
+                1, ctx->cp_rank * local_sequence, local_sequence);
+            return at::embedding(embed, local_ids);
+        }
+        auto hidden = sequence_parallel_embedding_scatter(
             ctx, at::embedding(embed, input_ids));
+        return hidden;
+    }
+
+    TORCH_CHECK(!context_parallel_enabled(ctx),
+        "vocabulary TP cannot be combined with GDN context parallelism");
 
     const int64_t vocab_start = ctx->tp_rank * ctx->local_vocab_size;
     const int64_t vocab_end = vocab_start + ctx->local_vocab_size;
@@ -4445,6 +4798,10 @@ static void synchronize_fixed_replicated_lora_parameters(TrainingContext* ctx) {
                 ctx->lora_a[slot], ctx->dp_comm, ctx->dp_world_size, "DP");
             replica_broadcast_lora_parameter(
                 ctx->lora_b[slot], ctx->dp_comm, ctx->dp_world_size, "DP");
+            replica_broadcast_lora_parameter(
+                ctx->lora_a[slot], ctx->cp_comm, ctx->cp_world_size, "CP");
+            replica_broadcast_lora_parameter(
+                ctx->lora_b[slot], ctx->cp_comm, ctx->cp_world_size, "CP");
         }
     }
     for (auto& adapter : ctx->adapters)
@@ -4484,6 +4841,10 @@ static void synchronize_adapter_replicated_lora_parameters(
                 a, ctx->dp_comm, ctx->dp_world_size, "DP");
             replica_broadcast_lora_parameter(
                 b, ctx->dp_comm, ctx->dp_world_size, "DP");
+            replica_broadcast_lora_parameter(
+                a, ctx->cp_comm, ctx->cp_world_size, "CP");
+            replica_broadcast_lora_parameter(
+                b, ctx->cp_comm, ctx->cp_world_size, "CP");
         }
     }
 }
@@ -4875,6 +5236,56 @@ static bool replica_token_weights_match(
     return (minimum == maximum).all().item<bool>();
 }
 
+static void cp_sum_fixed_lora_accumulators(TrainingContext* ctx) {
+    if (!context_parallel_enabled(ctx)) return;
+    TORCH_CHECK(ctx->cp_comm && ctx->adapters.empty(),
+        "CP gradient synchronization requires fixed LoRA and a CP communicator");
+    auto stream = c10::cuda::getCurrentCUDAStream(ctx->cuda_device).stream();
+    if (ctx->fixed_grad_slab.defined()) {
+        const auto error = ncclAllReduce(
+            ctx->fixed_grad_slab.data_ptr<float>(),
+            ctx->fixed_grad_slab.data_ptr<float>(),
+            ctx->fixed_grad_slab.numel(), ncclFloat, ncclSum,
+            ctx->cp_comm, stream);
+        TORCH_CHECK(error == ncclSuccess,
+            "CP packed LoRA gradient all-reduce failed: ",
+            ncclGetErrorString(error));
+        return;
+    }
+    for (size_t index = 0; index < ctx->lora_a.size(); ++index) {
+        if (!ctx->lora_active[index]) continue;
+        for (auto* accumulator : {
+                &ctx->grad_accum_a[index], &ctx->grad_accum_b[index]}) {
+            TORCH_CHECK(accumulator->defined() &&
+                    accumulator->scalar_type() == at::kFloat &&
+                    accumulator->is_cuda() && accumulator->is_contiguous(),
+                "CP LoRA gradient accumulator must be contiguous CUDA FP32");
+        }
+    }
+    TORCH_CHECK(ncclGroupStart() == ncclSuccess,
+        "CP LoRA gradient group start failed");
+    ncclResult_t first_error = ncclSuccess;
+    for (size_t index = 0; index < ctx->lora_a.size(); ++index) {
+        if (!ctx->lora_active[index]) continue;
+        for (auto* accumulator : {
+                &ctx->grad_accum_a[index], &ctx->grad_accum_b[index]}) {
+            const auto error = ncclAllReduce(
+                accumulator->data_ptr<float>(), accumulator->data_ptr<float>(),
+                accumulator->numel(), ncclFloat, ncclSum,
+                ctx->cp_comm, stream);
+            if (first_error == ncclSuccess && error != ncclSuccess)
+                first_error = error;
+        }
+    }
+    const auto group_error = ncclGroupEnd();
+    TORCH_CHECK(first_error == ncclSuccess,
+        "CP LoRA gradient all-reduce failed: ",
+        ncclGetErrorString(first_error));
+    TORCH_CHECK(group_error == ncclSuccess,
+        "CP LoRA gradient group end failed: ",
+        ncclGetErrorString(group_error));
+}
+
 static bool synchronize_lora_gradients(
     TrainingContext* ctx, const at::Tensor& target_mask,
     double accumulated_token_weight = 0.0,
@@ -4931,6 +5342,10 @@ static bool synchronize_lora_gradients(
         bool replica_weights_match = replica_token_weights_match(
             ctx, local_adapter_weights, ctx->tp_comm,
             ctx->tp_world_size, "TP");
+        replica_weights_match = replica_weights_match &&
+            replica_token_weights_match(
+                ctx, local_adapter_weights, ctx->cp_comm,
+                ctx->cp_world_size, "CP");
         if (ctx->expert_parallel && !sharded_a2a) {
             const bool ep_weights_match = replica_token_weights_match(
                 ctx, local_adapter_weights, ctx->nccl_comm,
@@ -4958,6 +5373,9 @@ static bool synchronize_lora_gradients(
             at::TensorOptions().dtype(at::kFloat).device(target_mask.device()));
         bool replica_weights_match = replica_token_weights_match(
             ctx, local, ctx->tp_comm, ctx->tp_world_size, "TP");
+        replica_weights_match = replica_weights_match &&
+            replica_token_weights_match(
+                ctx, local, ctx->cp_comm, ctx->cp_world_size, "CP");
         if (ctx->expert_parallel && !sharded_a2a) {
             const bool ep_weights_match = replica_token_weights_match(
                 ctx, local, ctx->nccl_comm,
@@ -4966,7 +5384,7 @@ static bool synchronize_lora_gradients(
         }
         TORCH_CHECK(adapter_collective_all_succeeded(
                 ctx, replica_weights_match) && replica_weights_match,
-            "fixed LoRA token weights differ across TP or replicated EP "
+            "fixed LoRA token weights differ across TP, CP, or replicated EP "
             "ranks; replicas must use identical accumulation windows");
         auto global = normalization_allreduce
             ? sum_replica_axes(local, sharded_a2a)
@@ -5199,6 +5617,7 @@ static bool synchronize_lora_gradients(
             }
         }
     }
+    cp_sum_fixed_lora_accumulators(ctx);
     return true;
 }
 
@@ -5901,7 +6320,8 @@ struct SubLayerCkpt : public torch::autograd::Function<SubLayerCkpt> {
         tc->lora_batch_valid = false;
         tc->lora_cache_valid = false;
         if (!tc->adapters.empty()) prepare_lora_batch(tc);
-        else if (tc->tp_world_size > 1) prepare_fixed_lora_batch(tc);
+        else if (tc->tp_world_size > 1 || tc->cp_world_size > 1)
+            prepare_fixed_lora_batch(tc);
         else precompute_lora_cache(tc);
         auto output = is_attn ? compute_attn_only(tc, input, layer, tc->compute_type)
                               : compute_mlp_only(tc, input, layer, tc->compute_type);
@@ -6127,6 +6547,8 @@ static at::Tensor linear_attention_batched(
     auto projection_input = tp_copy_base_attention_input(ctx, hidden);
     int64_t batch = projection_input.size(0);
     int64_t seq = projection_input.size(1);
+    const int64_t local_sequence = seq;
+    const bool use_context_parallel = context_parallel_enabled(ctx);
     if (base_tp_attention_enabled(ctx)) {
         TORCH_CHECK(num_k_heads > 0 && num_v_heads > 0 &&
                 num_v_heads % num_k_heads == 0 &&
@@ -6136,6 +6558,8 @@ static at::Tensor linear_attention_batched(
         num_k_heads /= ctx->tp_world_size;
         num_v_heads /= ctx->tp_world_size;
     }
+    const int64_t projected_num_v_heads = num_v_heads;
+    const int64_t projected_v_size = projected_num_v_heads * val_dim;
     int64_t q_size = num_k_heads * key_dim;
     int64_t v_size = num_v_heads * val_dim;
     int64_t qkv_dim = q_size * 2 + v_size;
@@ -6146,6 +6570,47 @@ static at::Tensor linear_attention_batched(
     if (it_qkv != ctx->lora_batch_cache.end()) {
         qkv = qkv + lora_activation_delta(ctx, projection_input, it_qkv->second.a_stack,
             it_qkv->second.b_stack, it_qkv->second.scaling, it_qkv->second.layout);
+    }
+
+    at::Tensor effective_conv1d_w = conv1d_w;
+    if (use_context_parallel) {
+        TORCH_CHECK(!base_tp_attention_enabled(ctx) && ctx->cp_world_size == 2 &&
+                ctx->cp_comm && q_size % ctx->cp_world_size == 0 &&
+                v_size % ctx->cp_world_size == 0,
+            "GDN context parallelism requires CP2-divisible Q/K/V head bundles");
+        const int64_t local_q_size = q_size / ctx->cp_world_size;
+        const int64_t local_v_size = v_size / ctx->cp_world_size;
+        std::vector<at::Tensor> peer_qkv;
+        std::vector<at::Tensor> peer_conv;
+        peer_qkv.reserve(ctx->cp_world_size);
+        peer_conv.reserve(ctx->cp_world_size);
+        for (int64_t peer = 0; peer < ctx->cp_world_size; ++peer) {
+            peer_qkv.push_back(at::cat({
+                qkv.narrow(-1, peer * local_q_size, local_q_size),
+                qkv.narrow(-1, q_size + peer * local_q_size, local_q_size),
+                qkv.narrow(-1, q_size * 2 + peer * local_v_size,
+                    local_v_size)}, -1));
+            peer_conv.push_back(at::cat({
+                conv1d_w.narrow(0, peer * local_q_size, local_q_size),
+                conv1d_w.narrow(0, q_size + peer * local_q_size,
+                    local_q_size),
+                conv1d_w.narrow(0, q_size * 2 + peer * local_v_size,
+                    local_v_size)}, 0));
+        }
+        auto packed_qkv = at::cat(peer_qkv, -1).contiguous();
+        qkv = CpSequenceToHeadFunction::apply(
+            packed_qkv, (int64_t)ctx->cp_comm,
+            (int64_t)reinterpret_cast<uintptr_t>(ctx->cp_stream),
+            ctx->cp_world_size);
+        effective_conv1d_w = peer_conv[ctx->cp_rank].contiguous();
+        num_k_heads /= ctx->cp_world_size;
+        num_v_heads /= ctx->cp_world_size;
+        q_size = local_q_size;
+        v_size = local_v_size;
+        qkv_dim = q_size * 2 + v_size;
+        seq *= ctx->cp_world_size;
+        TORCH_CHECK(qkv.sizes() == at::IntArrayRef({batch, seq, qkv_dim}),
+            "GDN context-parallel QKV exchange produced an invalid shape");
     }
 
     // DIAG: dump after QKV projection
@@ -6171,7 +6636,7 @@ static at::Tensor linear_attention_batched(
     int64_t pad = conv_kernel - 1;
     auto padding = at::zeros({batch, qkv_dim, pad}, qkv.options());
     auto padded = at::cat({padding, qkv_t}, 2);
-    auto conv_out = at::conv1d(padded, conv1d_w, /*bias=*/{},
+    auto conv_out = at::conv1d(padded, effective_conv1d_w, /*bias=*/{},
         at::IntArrayRef({1}), at::IntArrayRef({0}), at::IntArrayRef({1}), qkv_dim);
     conv_out = at::silu(conv_out.narrow(2, 0, seq));
     auto qkv_conv = conv_out.transpose(1, 2);
@@ -6221,10 +6686,11 @@ static at::Tensor linear_attention_batched(
     if (use_fused_ab) {
         auto ab = at::matmul(
             projection_input, ctx->fused_gdn_ab_weights[layer_idx].t());
-        TORCH_CHECK(ab.size(-1) == num_v_heads * 2,
+        TORCH_CHECK(ab.size(-1) == projected_num_v_heads * 2,
             "fused GDN A/B projection output shape mismatch");
-        a = ab.narrow(-1, 0, num_v_heads);
-        b = ab.narrow(-1, num_v_heads, num_v_heads);
+        a = ab.narrow(-1, 0, projected_num_v_heads);
+        b = ab.narrow(
+            -1, projected_num_v_heads, projected_num_v_heads);
     } else {
         a = at::matmul(projection_input, in_proj_a.t());
         b = at::matmul(projection_input, in_proj_b.t());
@@ -6247,11 +6713,42 @@ static at::Tensor linear_attention_batched(
         z = z + lora_activation_delta(ctx, projection_input, it_z->second.a_stack,
             it_z->second.b_stack, it_z->second.scaling, it_z->second.layout);
     }
+
+    at::Tensor effective_a_log = a_log;
+    at::Tensor effective_dt_bias = dt_bias;
+    if (use_context_parallel) {
+        std::vector<at::Tensor> peer_controls;
+        peer_controls.reserve(ctx->cp_world_size);
+        for (int64_t peer = 0; peer < ctx->cp_world_size; ++peer) {
+            peer_controls.push_back(at::cat({
+                z.narrow(-1, peer * v_size, v_size),
+                a.narrow(-1, peer * num_v_heads, num_v_heads),
+                b.narrow(-1, peer * num_v_heads, num_v_heads)}, -1));
+        }
+        auto controls = CpSequenceToHeadFunction::apply(
+            at::cat(peer_controls, -1).contiguous(),
+            (int64_t)ctx->cp_comm,
+            (int64_t)reinterpret_cast<uintptr_t>(ctx->cp_stream),
+            ctx->cp_world_size);
+        TORCH_CHECK(controls.size(0) == batch && controls.size(1) == seq &&
+                controls.size(2) == v_size + num_v_heads * 2,
+            "GDN context-parallel control exchange produced an invalid shape");
+        z = controls.narrow(-1, 0, v_size);
+        a = controls.narrow(-1, v_size, num_v_heads);
+        b = controls.narrow(-1, v_size + num_v_heads, num_v_heads);
+        effective_a_log = a_log.narrow(
+            0, ctx->cp_rank * num_v_heads, num_v_heads);
+        effective_dt_bias = dt_bias.narrow(
+            0, ctx->cp_rank * num_v_heads, num_v_heads);
+    } else {
+        TORCH_CHECK(z.size(-1) == projected_v_size,
+            "GDN Z projection output shape mismatch");
+    }
     z = z.reshape({batch, seq, num_v_heads, head_v_dim});
 
     // g = -exp(A_log) * softplus(a + dt_bias)
-    auto a_log_f = a_log.to(at::kFloat);
-    auto dt_bias_f = dt_bias.to(at::kFloat);
+    auto a_log_f = effective_a_log.to(at::kFloat);
+    auto dt_bias_f = effective_dt_bias.to(at::kFloat);
     auto a_f = a.to(at::kFloat);
     auto g = a_log_f.unsqueeze(0).unsqueeze(0).exp().neg() * at::softplus(a_f + dt_bias_f.unsqueeze(0).unsqueeze(0));
     auto beta = at::sigmoid(b);
@@ -6350,6 +6847,15 @@ static at::Tensor linear_attention_batched(
     auto variance = core_flat.to(at::kFloat).pow(2).mean(-1, true);
     auto normed = (core_flat.to(at::kFloat) * (variance + rms_eps).rsqrt() * norm_w.to(at::kFloat)).to(core_flat.scalar_type());
     auto gated = (normed * at::silu(z_flat.to(at::kFloat)).to(normed.scalar_type())).reshape({batch, seq, num_v_heads * head_v_dim});
+    if (use_context_parallel) {
+        gated = CpHeadToSequenceFunction::apply(
+            gated.contiguous(), (int64_t)ctx->cp_comm,
+            (int64_t)reinterpret_cast<uintptr_t>(ctx->cp_stream),
+            ctx->cp_world_size);
+        TORCH_CHECK(gated.sizes() == at::IntArrayRef({
+                batch, local_sequence, projected_v_size}),
+            "GDN context-parallel output exchange produced an invalid shape");
+    }
     auto result = at::matmul(gated, out_proj.t());
 
     // DIAG: dump after norm+gate+out_proj
@@ -6416,7 +6922,8 @@ static at::Tensor forward_full(
     const at::Tensor& input_ids
 ) {
     if (!ctx->adapters.empty()) prepare_lora_batch(ctx);
-    else if (ctx->tp_world_size > 1) prepare_fixed_lora_batch(ctx);
+    else if (ctx->tp_world_size > 1 || ctx->cp_world_size > 1)
+        prepare_fixed_lora_batch(ctx);
     else precompute_lora_cache(ctx);
     auto kind = ctx->compute_type;
     at::AutoGradMode guard(true);
@@ -6651,7 +7158,8 @@ static at::Tensor forward_full_fused(
     const at::Tensor& input_ids
 ) {
     if (!ctx->adapters.empty()) prepare_lora_batch(ctx);
-    else if (ctx->tp_world_size > 1) prepare_fixed_lora_batch(ctx);
+    else if (ctx->tp_world_size > 1 || ctx->cp_world_size > 1)
+        prepare_fixed_lora_batch(ctx);
     else precompute_lora_cache(ctx);
     at::Tensor hidden = vocabulary_embedding(ctx, input_ids);
     hidden = hidden.detach().set_requires_grad(true);
@@ -6678,7 +7186,7 @@ static at::Tensor forward_full_checkpoint(
     // legacy weight cache remains the single-rank fast path.
     if (!ctx->adapters.empty()) {
         prepare_lora_batch(ctx);
-    } else if (ctx->tp_world_size > 1) {
+    } else if (ctx->tp_world_size > 1 || ctx->cp_world_size > 1) {
         prepare_fixed_lora_batch(ctx);
     } else {
         precompute_lora_cache(ctx);
@@ -7688,7 +8196,8 @@ static void manual_group_backward(
         ctx->lora_batch_valid = false;
         ctx->lora_cache_valid = false;
         if (!ctx->adapters.empty()) prepare_lora_batch(ctx, start, end);
-        else if (ctx->tp_world_size > 1) prepare_fixed_lora_batch(ctx);
+        else if (ctx->tp_world_size > 1 || ctx->cp_world_size > 1)
+            prepare_fixed_lora_batch(ctx);
         else precompute_lora_cache(ctx);
 
         // Recompute forward with grad for this group only
@@ -9342,7 +9851,7 @@ __attribute__((visibility("default"))) double qwen36_train_micro_step(
             accumulation_guard.disarmed = true;
             return loss;
         }
-        validate_native_execution_topology(ctx);
+        validate_native_execution_topology_collective(ctx);
         auto* input_ids_tensor = reinterpret_cast<at::Tensor*>(input_ids_ptr);
         auto* target_mask_tensor = reinterpret_cast<at::Tensor*>(target_mask_ptr);
         auto* attention_mask_tensor = attention_mask_ptr
@@ -9367,7 +9876,8 @@ __attribute__((visibility("default"))) double qwen36_train_micro_step(
                 supported_mask_dtype(*attention_mask_tensor);
         }
         if (local_preflight_valid &&
-            (ctx->nccl_comm || ctx->dp_comm || ctx->tp_comm)) {
+            (ctx->nccl_comm || ctx->dp_comm || ctx->tp_comm ||
+                ctx->cp_comm)) {
             local_preflight_valid =
                 input_ids_tensor->device().index() == ctx->cuda_device;
         }
@@ -9378,7 +9888,8 @@ __attribute__((visibility("default"))) double qwen36_train_micro_step(
             "dynamic adapters");
         auto& input_ids = *input_ids_tensor;
         const int input_device = input_ids.device().index();
-        if (!ctx->nccl_comm && !ctx->dp_comm && !ctx->tp_comm)
+        if (!ctx->nccl_comm && !ctx->dp_comm && !ctx->tp_comm &&
+                !ctx->cp_comm)
             ctx->cuda_device = input_device;
         c10::cuda::set_device(ctx->cuda_device);
         cudaSetDevice(ctx->cuda_device);
@@ -9386,8 +9897,8 @@ __attribute__((visibility("default"))) double qwen36_train_micro_step(
             ctx, input_ids, *target_mask_tensor, attention_mask_tensor);
         TORCH_CHECK(adapter_collective_all_succeeded(
                 ctx, replica_inputs_match) && replica_inputs_match,
-            "native Qwen fixed-LoRA input shape and dtype differ across TP "
-            "or replicated EP ranks");
+            "native Qwen fixed-LoRA input shape, dtype, or value differs "
+            "across TP, CP, or replicated EP ranks");
         const double supervised_tokens = target_mask_tensor
             ->narrow(1, 1, target_mask_tensor->size(1) - 1)
             .to(at::kFloat).sum().item<double>();
@@ -9682,7 +10193,7 @@ static double qwen36_train_multi_lora_impl(
         if (finalize_only && finalizer_phase) *finalizer_phase = 0;
         if (mode == DynamicMultiLoraMode::TrainAndFinalize)
             validate_dynamic_context_health(ctx);
-        validate_native_execution_topology(ctx);
+        validate_native_execution_topology_collective(ctx);
         auto* input_ids_tensor = reinterpret_cast<at::Tensor*>(input_ids_ptr);
         auto* target_mask_tensor = reinterpret_cast<at::Tensor*>(target_mask_ptr);
         auto* attention_mask_tensor = attention_mask_ptr
@@ -9712,7 +10223,8 @@ static double qwen36_train_multi_lora_impl(
                 supported_mask_dtype(*attention_mask_tensor);
         }
         if (local_input_valid &&
-            (ctx->nccl_comm || ctx->dp_comm || ctx->tp_comm)) {
+            (ctx->nccl_comm || ctx->dp_comm || ctx->tp_comm ||
+                ctx->cp_comm)) {
             local_input_valid =
                 input_ids_tensor->device().index() == ctx->cuda_device;
         }
@@ -9723,7 +10235,8 @@ static double qwen36_train_multi_lora_impl(
         auto& input_ids = *input_ids_tensor;
         auto& target_mask = *target_mask_tensor;
         const int input_device = input_ids.device().index();
-        if (!ctx->nccl_comm && !ctx->dp_comm && !ctx->tp_comm)
+        if (!ctx->nccl_comm && !ctx->dp_comm && !ctx->tp_comm &&
+                !ctx->cp_comm)
             ctx->cuda_device = input_device;
         c10::cuda::set_device(ctx->cuda_device);
         cudaSetDevice(ctx->cuda_device);
@@ -10438,7 +10951,7 @@ __attribute__((visibility("default"))) double qwen36_train_multi_lora_selected(
         TORCH_CHECK(ctx,
             "selected multi-LoRA requires a valid training context");
         validate_dynamic_context_health(ctx);
-        validate_native_execution_topology(ctx);
+        validate_native_execution_topology_collective(ctx);
         validate_adapter_collective_registry(
             ctx, adapter_ids, n_adapters, lora_rank, false);
         TORCH_CHECK(adapter_ids && n_adapters > 0,
@@ -10732,7 +11245,7 @@ static double qwen36_train_multi_lora_selected_impl(
     try {
         TORCH_CHECK(ctx,
             "heterogeneous selected training requires a context");
-        validate_native_execution_topology(ctx);
+        validate_native_execution_topology_collective(ctx);
         const bool local_healthy = !ctx->poisoned;
         const bool local_request_valid = adapter_ids && n_adapters > 0;
         const bool report_requested = aggregate_loss_out || adapter_losses_out;
@@ -12523,7 +13036,7 @@ int32_t qwen36_validate_adapter_steps_v1(
         auto* ctx = reinterpret_cast<TrainingContext*>(ctx_ptr);
         TORCH_CHECK(ctx && adapter_ids && expected_steps && n_adapters > 0,
             "adapter step validation requires a context and non-empty arrays");
-        validate_native_execution_topology(ctx);
+        validate_native_execution_topology_collective(ctx);
         // This hashes the ordered selection and every tenant's actual clock,
         // plus the expected clocks, then reduces min/max over TP, EP, and DP
         // before any rank can return.
@@ -12589,14 +13102,54 @@ double qwen36_eval_step(void* ctx_ptr, void* input_ids_ptr, void* target_mask_pt
                 ctx->lora_batch_valid = false;
             }
         } cache_guard{ctx};
-        validate_native_execution_topology(ctx);
-        TORCH_CHECK(ctx->adapters.empty(),
-            "dynamic LoRA adapters require selected multi-LoRA evaluation; "
-            "ordinary eval_step has no tenant mapping");
-        auto& input_ids = *reinterpret_cast<at::Tensor*>(input_ids_ptr);
-        auto& target_mask = *reinterpret_cast<at::Tensor*>(target_mask_ptr);
-        if (attention_mask_ptr) {
-            auto& attention_mask = *reinterpret_cast<at::Tensor*>(attention_mask_ptr);
+        validate_native_execution_topology_collective(ctx);
+        auto* input_ids_tensor = reinterpret_cast<at::Tensor*>(input_ids_ptr);
+        auto* target_mask_tensor = reinterpret_cast<at::Tensor*>(target_mask_ptr);
+        auto* attention_mask_tensor = attention_mask_ptr
+            ? reinterpret_cast<at::Tensor*>(attention_mask_ptr)
+            : nullptr;
+        bool local_preflight_valid = input_ids_tensor && target_mask_tensor &&
+            input_ids_tensor->is_cuda() && target_mask_tensor->is_cuda() &&
+            input_ids_tensor->device() == target_mask_tensor->device() &&
+            input_ids_tensor->dim() == 2 && target_mask_tensor->dim() == 2 &&
+            input_ids_tensor->size(1) > 1 &&
+            input_ids_tensor->sizes() == target_mask_tensor->sizes() &&
+            input_ids_tensor->scalar_type() == at::kLong &&
+            supported_mask_dtype(*target_mask_tensor) &&
+            ctx->adapters.empty();
+        if (local_preflight_valid && attention_mask_tensor) {
+            local_preflight_valid = attention_mask_tensor->is_cuda() &&
+                attention_mask_tensor->device() == input_ids_tensor->device() &&
+                attention_mask_tensor->dim() == 2 &&
+                attention_mask_tensor->sizes() == input_ids_tensor->sizes() &&
+                supported_mask_dtype(*attention_mask_tensor);
+        }
+        if (local_preflight_valid &&
+                (ctx->nccl_comm || ctx->dp_comm || ctx->tp_comm ||
+                    ctx->cp_comm)) {
+            local_preflight_valid =
+                input_ids_tensor->device().index() == ctx->cuda_device;
+        }
+        TORCH_CHECK(adapter_collective_all_succeeded(
+                ctx, local_preflight_valid) && local_preflight_valid,
+            "native Qwen fixed-LoRA eval requires matching CUDA input and "
+            "mask tensors on every distributed rank and no dynamic adapters");
+        auto& input_ids = *input_ids_tensor;
+        auto& target_mask = *target_mask_tensor;
+        if (!ctx->nccl_comm && !ctx->dp_comm && !ctx->tp_comm &&
+                !ctx->cp_comm)
+            ctx->cuda_device = input_ids.device().index();
+        c10::cuda::set_device(ctx->cuda_device);
+        cudaSetDevice(ctx->cuda_device);
+        validate_fixed_collective_registry(ctx);
+        const bool replica_inputs_match = replica_input_signatures_match(
+            ctx, input_ids, target_mask, attention_mask_tensor);
+        TORCH_CHECK(adapter_collective_all_succeeded(
+                ctx, replica_inputs_match) && replica_inputs_match,
+            "native Qwen fixed-LoRA eval input shape, dtype, or value differs "
+            "across TP, CP, or replicated EP ranks");
+        if (attention_mask_tensor) {
+            auto& attention_mask = *attention_mask_tensor;
             validate_linear_attention_mask(ctx, attention_mask);
             ctx->attention_mask = attention_mask;
         } else {
@@ -12649,7 +13202,7 @@ __attribute__((visibility("default"))) int32_t qwen36_eval_multi_lora_selected_v
                 adapter_losses_out && adapter_loss_capacity >= n_adapters,
             "selected multi-LoRA eval requires valid IDs and output storage");
         validate_dynamic_context_health(ctx);
-        validate_native_execution_topology(ctx);
+        validate_native_execution_topology_collective(ctx);
         TORCH_CHECK(ctx->pp_world_size == 1 && ctx->cp_world_size == 1,
             "selected multi-LoRA eval requires PP=1 and CP=1");
         auto* input = reinterpret_cast<at::Tensor*>(input_ids_ptr);
@@ -12767,6 +13320,53 @@ static at::Tensor qwen36_copy_host_i64_batch(
         /*non_blocking=*/false, /*copy=*/true);
 }
 
+struct Qwen36HostI64Batch {
+    at::Tensor input;
+    at::Tensor targets;
+    at::Tensor attention;
+};
+
+static Qwen36HostI64Batch qwen36_copy_host_i64_batch_collective(
+    TrainingContext* ctx,
+    const int64_t* input_ids,
+    const int64_t* target_mask,
+    const int64_t* attention_mask,
+    int64_t batch_size,
+    int64_t seq_len,
+    bool local_request_valid,
+    const char* name
+) {
+    const bool shape_valid = batch_size > 0 && seq_len > 0 &&
+        batch_size <= std::numeric_limits<int64_t>::max() / seq_len;
+    const bool local_preflight_valid = ctx && input_ids && target_mask &&
+        attention_mask && shape_valid && local_request_valid;
+    const bool globally_valid = adapter_collective_all_succeeded(
+        ctx, local_preflight_valid);
+    TORCH_CHECK(local_preflight_valid && globally_valid,
+        name, " request pointers, dimensions, or distributed metadata are "
+        "invalid or differ across ranks");
+
+    Qwen36HostI64Batch batch;
+    std::string local_copy_error;
+    try {
+        batch.input = qwen36_copy_host_i64_batch(
+            ctx, input_ids, batch_size, seq_len, name);
+        batch.targets = qwen36_copy_host_i64_batch(
+            ctx, target_mask, batch_size, seq_len, name);
+        batch.attention = qwen36_copy_host_i64_batch(
+            ctx, attention_mask, batch_size, seq_len, name);
+    } catch (const std::exception& error) {
+        local_copy_error = error.what();
+    }
+    const bool local_copy_succeeded = local_copy_error.empty();
+    const bool globally_copied = adapter_collective_all_succeeded(
+        ctx, local_copy_succeeded);
+    TORCH_CHECK(local_copy_succeeded && globally_copied,
+        name, " H2D copy failed on at least one distributed rank",
+        local_copy_error.empty() ? "" : ": ", local_copy_error);
+    return batch;
+}
+
 __attribute__((visibility("default")))
 double qwen36_train_step_host_i64(
     void* ctx_ptr,
@@ -12778,14 +13378,12 @@ double qwen36_train_step_host_i64(
 ) {
     try {
         auto* ctx = reinterpret_cast<TrainingContext*>(ctx_ptr);
-        validate_native_execution_topology(ctx);
-        auto input = qwen36_copy_host_i64_batch(
-            ctx, input_ids, batch_size, seq_len, "host train input_ids");
-        auto targets = qwen36_copy_host_i64_batch(
-            ctx, target_mask, batch_size, seq_len, "host train target_mask");
-        auto attention = qwen36_copy_host_i64_batch(
-            ctx, attention_mask, batch_size, seq_len, "host train attention_mask");
-        return qwen36_train_step(ctx, &input, &targets, &attention);
+        validate_native_execution_topology_collective(ctx);
+        auto batch = qwen36_copy_host_i64_batch_collective(
+            ctx, input_ids, target_mask, attention_mask,
+            batch_size, seq_len, true, "host fixed-LoRA train");
+        return qwen36_train_step(
+            ctx, &batch.input, &batch.targets, &batch.attention);
     } catch (const std::exception& e) {
         fprintf(stderr, "[q36] train_step_host_i64 FAILED: %s\n", e.what());
         return -1.0;
@@ -12808,33 +13406,27 @@ double qwen36_train_multi_lora_host_i64(
     try {
         (void)lora_rank;  // Retained for the ABI22 host wire contract.
         auto* ctx = reinterpret_cast<TrainingContext*>(ctx_ptr);
-        validate_native_execution_topology(ctx);
-        TORCH_CHECK(n_adapter_ids >= 0,
-            "host multi-LoRA adapter count must be non-negative");
-        TORCH_CHECK(n_adapter_ids == 0 || n_adapter_ids == n_total,
-            "host multi-LoRA selected adapter count must match n_total");
-        auto input = qwen36_copy_host_i64_batch(
-            ctx, input_ids, batch_size, seq_len, "host multi-LoRA input_ids");
-        auto targets = qwen36_copy_host_i64_batch(
-            ctx, target_mask, batch_size, seq_len, "host multi-LoRA target_mask");
-        auto attention = qwen36_copy_host_i64_batch(
-            ctx, attention_mask, batch_size, seq_len,
-            "host multi-LoRA attention_mask");
+        validate_native_execution_topology_collective(ctx);
+        const bool local_request_valid = n_total > 0 &&
+            n_adapter_ids >= 0 &&
+            (n_adapter_ids == 0 || n_adapter_ids == n_total) &&
+            (n_adapter_ids == 0 || adapter_ids) &&
+            (n_adapter_ids != 0 ||
+                static_cast<int32_t>(ctx->adapters.size()) == n_total);
+        auto batch = qwen36_copy_host_i64_batch_collective(
+            ctx, input_ids, target_mask, attention_mask,
+            batch_size, seq_len, local_request_valid, "host multi-LoRA train");
         if (n_adapter_ids == 0) {
-            TORCH_CHECK(ctx && static_cast<int32_t>(ctx->adapters.size()) == n_total,
-                "host multi-LoRA adapter count must match the live registry");
             std::vector<int64_t> all_adapter_ids;
             all_adapter_ids.reserve(ctx->adapters.size());
             for (const auto& adapter : ctx->adapters)
                 all_adapter_ids.push_back(adapter.id);
             return qwen36_train_multi_lora_selected_v2(
-                ctx, &input, &targets, &attention,
+                ctx, &batch.input, &batch.targets, &batch.attention,
                 all_adapter_ids.data(), n_total);
         }
-        TORCH_CHECK(adapter_ids,
-            "host selected multi-LoRA requires adapter IDs");
         return qwen36_train_multi_lora_selected_v2(
-            ctx, &input, &targets, &attention,
+            ctx, &batch.input, &batch.targets, &batch.attention,
             adapter_ids, n_adapter_ids);
     } catch (const std::exception& e) {
         fprintf(stderr, "[q36] train_multi_lora_host_i64 FAILED: %s\n", e.what());
@@ -12861,22 +13453,22 @@ int32_t qwen36_train_multi_lora_host_i64_v2(
     try {
         (void)lora_rank;
         auto* ctx = reinterpret_cast<TrainingContext*>(ctx_ptr);
-        validate_native_execution_topology(ctx);
-        TORCH_CHECK(n_adapter_ids > 0 && n_adapter_ids == n_total,
-            "host multi-LoRA loss report requires every selected adapter ID");
-        TORCH_CHECK(adapter_ids,
-            "host multi-LoRA loss report requires adapter IDs");
-        auto input = qwen36_copy_host_i64_batch(
-            ctx, input_ids, batch_size, seq_len,
-            "host multi-LoRA report input_ids");
-        auto targets = qwen36_copy_host_i64_batch(
-            ctx, target_mask, batch_size, seq_len,
-            "host multi-LoRA report target_mask");
-        auto attention = qwen36_copy_host_i64_batch(
-            ctx, attention_mask, batch_size, seq_len,
-            "host multi-LoRA report attention_mask");
+        validate_native_execution_topology_collective(ctx);
+        const bool report_requested = aggregate_loss_out || adapter_losses_out;
+        const bool report_valid =
+            (!report_requested && !aggregate_loss_out && !adapter_losses_out) ||
+            (aggregate_loss_out && adapter_losses_out &&
+                adapter_loss_capacity >= n_adapter_ids);
+        const bool local_request_valid = n_total > 0 && adapter_ids &&
+            n_adapter_ids > 0 && n_adapter_ids == n_total &&
+            report_valid;
+        auto batch = qwen36_copy_host_i64_batch_collective(
+            ctx, input_ids, target_mask, attention_mask,
+            batch_size, seq_len, local_request_valid,
+            "host multi-LoRA report train");
         return qwen36_train_multi_lora_selected_v3(
-            ctx, &input, &targets, &attention, adapter_ids, n_adapter_ids,
+            ctx, &batch.input, &batch.targets, &batch.attention,
+            adapter_ids, n_adapter_ids,
             aggregate_loss_out, adapter_losses_out, adapter_loss_capacity);
     } catch (const std::exception& e) {
         fprintf(stderr,
@@ -12896,14 +13488,12 @@ double qwen36_eval_step_host_i64(
 ) {
     try {
         auto* ctx = reinterpret_cast<TrainingContext*>(ctx_ptr);
-        validate_native_execution_topology(ctx);
-        auto input = qwen36_copy_host_i64_batch(
-            ctx, input_ids, batch_size, seq_len, "host eval input_ids");
-        auto targets = qwen36_copy_host_i64_batch(
-            ctx, target_mask, batch_size, seq_len, "host eval target_mask");
-        auto attention = qwen36_copy_host_i64_batch(
-            ctx, attention_mask, batch_size, seq_len, "host eval attention_mask");
-        return qwen36_eval_step(ctx, &input, &targets, &attention);
+        validate_native_execution_topology_collective(ctx);
+        auto batch = qwen36_copy_host_i64_batch_collective(
+            ctx, input_ids, target_mask, attention_mask,
+            batch_size, seq_len, true, "host fixed-LoRA eval");
+        return qwen36_eval_step(
+            ctx, &batch.input, &batch.targets, &batch.attention);
     } catch (const std::exception& e) {
         fprintf(stderr, "[q36] eval_step_host_i64 FAILED: %s\n", e.what());
         return -1.0;
@@ -12924,20 +13514,16 @@ __attribute__((visibility("default"))) int32_t qwen36_eval_multi_lora_host_i64_v
 ) {
     try {
         auto* ctx = reinterpret_cast<TrainingContext*>(ctx_ptr);
-        validate_native_execution_topology(ctx);
-        TORCH_CHECK(adapter_ids && n_adapters > 0,
-            "host selected eval requires adapter IDs");
-        auto input = qwen36_copy_host_i64_batch(
-            ctx, input_ids, batch_size, seq_len,
-            "host selected eval input_ids");
-        auto targets = qwen36_copy_host_i64_batch(
-            ctx, target_mask, batch_size, seq_len,
-            "host selected eval target_mask");
-        auto attention = qwen36_copy_host_i64_batch(
-            ctx, attention_mask, batch_size, seq_len,
-            "host selected eval attention_mask");
+        validate_native_execution_topology_collective(ctx);
+        const bool local_request_valid = adapter_ids && n_adapters > 0 &&
+            adapter_losses_out && adapter_loss_capacity >= n_adapters;
+        auto batch = qwen36_copy_host_i64_batch_collective(
+            ctx, input_ids, target_mask, attention_mask,
+            batch_size, seq_len, local_request_valid,
+            "host selected multi-LoRA eval");
         return qwen36_eval_multi_lora_selected_v1(
-            ctx, &input, &targets, &attention, adapter_ids, n_adapters,
+            ctx, &batch.input, &batch.targets, &batch.attention,
+            adapter_ids, n_adapters,
             adapter_losses_out, adapter_loss_capacity);
     } catch (const std::exception& e) {
         fprintf(stderr, "[q36] selected eval host_i64 FAILED: %s\n", e.what());
