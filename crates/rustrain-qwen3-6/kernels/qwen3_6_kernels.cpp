@@ -3556,6 +3556,37 @@ static bool adapter_collective_all_succeeded(
     return succeeded.to(at::kCPU).item<int32_t>() != 0;
 }
 
+static std::vector<int32_t> adapter_collective_min_flags(
+    TrainingContext* ctx,
+    const std::vector<int32_t>& local_flags
+) {
+    TORCH_CHECK(!local_flags.empty(),
+        "adapter flag consensus requires at least one flag");
+    if (!ctx || (!ctx->nccl_comm && !ctx->dp_comm && !ctx->tp_comm))
+        return local_flags;
+    c10::cuda::set_device(ctx->cuda_device);
+    cudaSetDevice(ctx->cuda_device);
+    auto flags = at::tensor(
+        local_flags, at::TensorOptions().dtype(at::kInt).device(
+            at::kCUDA, ctx->cuda_device));
+    auto stream = c10::cuda::getCurrentCUDAStream(ctx->cuda_device).stream();
+    auto reduce_axis = [&](ncclComm_t communicator, const char* axis) {
+        if (!communicator) return;
+        const auto error = ncclAllReduce(
+            flags.data_ptr<int32_t>(), flags.data_ptr<int32_t>(),
+            flags.numel(), ncclInt32, ncclMin, communicator, stream);
+        TORCH_CHECK(error == ncclSuccess, axis,
+            " packed adapter flag consensus failed: ",
+            ncclGetErrorString(error));
+    };
+    reduce_axis(ctx->nccl_comm, "EP");
+    reduce_axis(ctx->dp_comm, "DP");
+    reduce_axis(ctx->tp_comm, "TP");
+    auto cpu = flags.to(at::kCPU).contiguous();
+    const auto* values = cpu.data_ptr<int32_t>();
+    return std::vector<int32_t>(values, values + cpu.numel());
+}
+
 static void validate_dynamic_context_health(TrainingContext* ctx) {
     TORCH_CHECK(ctx, "dynamic multi-LoRA requires a valid training context");
     const bool local_healthy = !ctx->poisoned;
@@ -10561,33 +10592,38 @@ static double qwen36_train_multi_lora_selected_impl(
     try {
         TORCH_CHECK(ctx,
             "heterogeneous selected training requires a context");
-        validate_dynamic_context_health(ctx);
         validate_native_execution_topology(ctx);
+        const bool local_healthy = !ctx->poisoned;
         const bool local_request_valid = adapter_ids && n_adapters > 0;
-        TORCH_CHECK(adapter_collective_all_succeeded(
-                ctx, local_request_valid) && local_request_valid,
-            "heterogeneous selected training requires rank-consistent "
-            "adapter IDs and a positive adapter count");
         const bool report_requested = aggregate_loss_out || adapter_losses_out;
-        const bool all_report_requested = adapter_collective_all_succeeded(
-            ctx, report_requested);
-        const bool all_legacy_requested = adapter_collective_all_succeeded(
-            ctx, !report_requested);
-        TORCH_CHECK(all_report_requested || all_legacy_requested,
-            "heterogeneous selected loss report capability differs across "
-            "distributed ranks");
         const bool local_report_valid =
             (!report_requested && !aggregate_loss_out && !adapter_losses_out) ||
             (aggregate_loss_out && adapter_losses_out &&
                 adapter_loss_capacity >= n_adapters);
-        TORCH_CHECK(adapter_collective_all_succeeded(
-                ctx, local_report_valid) && local_report_valid,
-            "heterogeneous selected loss report requires aggregate and adapter "
-            "outputs with capacity for every selected adapter");
         const bool local_accumulation_clear = !ctx->accumulation_active &&
             ctx->accumulated_token_weight == 0.0;
-        TORCH_CHECK(adapter_collective_all_succeeded(
-                ctx, local_accumulation_clear) && local_accumulation_clear,
+        const auto preflight = adapter_collective_min_flags(ctx, {
+            local_healthy ? 1 : 0,
+            local_request_valid ? 1 : 0,
+            report_requested ? 1 : 0,
+            report_requested ? 0 : 1,
+            local_report_valid ? 1 : 0,
+            local_accumulation_clear ? 1 : 0,
+        });
+        TORCH_INTERNAL_ASSERT(preflight.size() == 6);
+        if (!preflight[0]) ctx->poisoned = true;
+        TORCH_CHECK(local_healthy && preflight[0],
+            "dynamic multi-LoRA context is poisoned; restart the worker");
+        TORCH_CHECK(local_request_valid && preflight[1],
+            "heterogeneous selected training requires rank-consistent "
+            "adapter IDs and a positive adapter count");
+        TORCH_CHECK(preflight[2] || preflight[3],
+            "heterogeneous selected loss report capability differs across "
+            "distributed ranks");
+        TORCH_CHECK(local_report_valid && preflight[4],
+            "heterogeneous selected loss report requires aggregate and adapter "
+            "outputs with capacity for every selected adapter");
+        TORCH_CHECK(local_accumulation_clear && preflight[5],
             "cannot start heterogeneous multi-LoRA while a fixed or dynamic "
             "gradient accumulation window is pending");
         validate_adapter_collective_registry(

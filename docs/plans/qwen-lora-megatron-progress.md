@@ -24,6 +24,8 @@ The guarded sequence-parallel path uses Megatron-style sequence ownership: embed
 
 Dynamic selected training now quarantines a context when registry restoration, gradient cleanup, transactional rollback, or registry restore fails during secondary recovery. The next dynamic request performs a TP/EP/DP health consensus before touching the tenant registry, propagates quarantine to the full worker group, and fails closed until the workers are recreated. The optional ABI28 health symbol is wired through Rust; EP workers return a terminal result and the parent coordinator immediately becomes unavailable and reaps the group. H20 world4 `TP2 x EP2` passed a rank0-only poison injection on all ranks without a collective hang, while the normal injected Adam failure still recovers with a healthy context.
 
+ABI28 selected-v2 preflight now packs health, request validity, report capability/buffer, and accumulation-clear flags into one `int32[6]` MIN collective per EP/DP/TP axis. H20 TP2 x EP2 heterogeneous B=8/S=128 A/B runs against the legacy six-call implementation measured p50 old/packed pairs of `13.394/13.256`, `13.219/13.153`, and `13.638/13.199 ms`; the median improved about 1.5%, and a matched Nsight Systems trace reduced u32 all-reduce instances from `1032` to `752`. World4 heterogeneous, rank-local failure, report-mode mismatch, rollback, and poison smokes remained green.
+
 # Durable Milestones
 
 - `4e242ee`: added Megatron-style 5D topology contract and launcher normalization; `cargo test -p rustrain-parallel --lib` passed 14/14.

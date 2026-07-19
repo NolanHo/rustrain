@@ -7,6 +7,7 @@
 - 模型语义：Qwen3.5 dense、Qwen3.6 dense/MoE 的 native forward/backward 路径已经覆盖 hybrid full attention、GDN、MoE、MTP 和 LoRA 目标模块；已有配置解析、合成 oracle、集成测试及 H20 native smoke 证据，但尚未完成真实 35B/3.6 权重的长时间训练验证。
 - 已实现并可验证的分布式子集：ABI26 可按 `TP-CP-EP-DP-PP` 五维拓扑建立、缓存和 attach 正交 NCCL process groups；LoRA 模型执行已覆盖可组合的 TP、MoE EP 和 expert-DP，包含 TP2 x EP2、TP2 x DP2 和 TP2 x EP2 x expert-DP2 native oracle。CP2 x PP2 communicator smoke 已验证交叉分组和全网 max 传播，但 PP stage 与 CP sequence/attention 语义仍 fail-closed。DP 动态租户按 adapter token count 加权，sharded A2A 保留 source flattened row 来恢复租户，并按全局租户 token count 归一化。
 - 性能：ABI19 将 top-k assignment 合并为单次 packed dispatch/combine，并对接收 token 做一次 expert sort 和 grouped GEMM。H20 TP2 x EP2 端到端 fixed-LoRA benchmark 按每步 TP x EP 全局最慢 rank 计时，p50 从 `9.007 ms` 降到 `6.499 ms`，unique-token throughput 从 `56.84k/s` 提升到 `78.78k/s`；这是 native legacy/packed 对照，不是 Megatron 对比。
+- 性能：ABI28 在 heterogeneous selected-v2 入口把 health、request、loss-report capability、report buffer 和 accumulation-clear 状态打包成一个 `int32[6]`，每个 EP/DP/TP 轴只做一次 MIN collective。H20 TP2 x EP2、B=8/S=128/8 active tenants 相对旧六次 collective 实现的三次交错 A/B，中位 p50 约从 `13.394 ms` 降到 `13.199 ms`，Nsight Systems 的 `u32` all-reduce 实例从 `1032` 降到 `752`；这是 native synthetic benchmark，不是 Megatron 对比。
 - 已实现 LoRA latent-rank TP、frozen full-attention/GDN/dense SwiGLU MLP TP、routed/shared ETP，以及 embedding/LM-head/vocabulary TP。GDN 按 K/V head group 切分复合 QKV、depthwise conv、Z/A/B、A_log/dt_bias 和 out-proj input columns；fixed 与 selected dynamic LoRA 使用 projection-aware shard 和梯度 reduction。ABI20 对 routed fused gate/up 的 gate/up 两半分别切分后重排，并在 routing weight 前归约 local expert partial。TP 可与 EP 或 expert-DP 组合；新增 `QWEN36_SEQUENCE_PARALLEL=1` 的 guarded TP2 dense fixed-LoRA 子集，按 Megatron 语义执行 sequence scatter/all-gather/reduce-scatter/loss gather，但 CP/PP/EP/DP、MoE、MTP、dynamic LoRA 和 latent-rank target 仍 fail-closed。
 - CLI 与 server 共享 checkpoint v5 实现。分布式 CLI 训练按 shared run ID 隔离 rank 日志，以唯一 save transaction generation 协调 rank shard，原子发布标准 PEFT 目录，并支持相同 topology 下恢复 fixed LoRA、FP32 Adam m/v 和独立 fixed optimizer step。checkpoint library 不再把 run-scoped attempt ID 隐式当作 save generation；缺失、空、非法或复用 generation 的分布式保存直接拒绝。新 writer 用内容 digest 绑定 manifest/tensor，并发布定长 compact rank receipt；每个进程预检 receipt set 后只解析、hash 和加载本地完整 manifest/tensor。distributed server 的 save/load coordinator 在同一个 dispatch lock 内执行两阶段事务：save 写入 exclusive sibling staging，要求所有 rank receipt 完整并用 shadow context 全量 hydrate 验证，再以 `RENAME_NOREPLACE` 发布 fresh destination；load 先在所有 rank 建立 no-sync shadow context，全部成功后才交换 live context，commit 不完整则 worker group fail-stop。当前不覆盖已有 destination，不提供 `LATEST` generation 指针或断电级目录 fsync 保证；跨 topology reshard 仍未实现。
 - ABI22 server 训练数据面在 parent/worker IPC 间使用 64-byte aligned binary tensor slab：parent 只做一次 base64 decode/packing，worker 零拷贝借用 host `int64` span，按 topology 选取本地 rows，并通过一次粗粒度 C++ 调用完成 H2D 与完整 train/eval step。shared-memory layout、epoch、span 边界/重叠和 timeout poison 均有校验；默认 slab 为 32 MiB，可通过环境变量配置。tensor routes 在 body decode 前使用单许可 admission gate，与本来串行的 IPC dispatch 对齐并限制并发请求内存。HTTP 边界仍是 JSON/base64，host memory 也尚未 pin，因此这不是最终的高吞吐 ingress。
@@ -21,7 +22,7 @@
 | Qwen3.6 MoE | 已实现 | grouped dispatch、EP smoke；完整模型仍需目标 GPU/权重运行 |
 | MTP | 已实现 | C++ hidden gradient 检查和集成测试；可通过环境变量关闭 |
 | fixed LoRA | 已实现 | attention/GDN/MLP/shared/routed expert 目标模块 |
-| dynamic multi-LoRA | 已实现子集 | selected v2 默认把不同 rank/target 的租户按 projection-local 最大 rank 补零，保留各租户 `alpha / logical_rank`，在一个 activation batch 内完成一次 forward/backward，再以一次 FinalizeOnly 调用独立更新各租户参数、m/v 和 optimizer clock；未命中的 target 使用零张量且不更新。`QWEN36_HETERO_PADDED_BATCH=0` 保留按 signature 分组和跨组回滚。checkpoint 可独立恢复 heterogeneous rank/alpha/targets；HTTP 可在显式 `allow_aggregate_loss=true` 时有界合并兼容且 adapter ID 不相交的并发请求，响应保留 aggregate scalar、adapter loss 和真实 optimizer step；`expected_steps` 在原生 TP/EP/DP collective 前做全秩乐观并发校验，过期重试 fail closed；默认仍保持单请求 dispatch，dynamic+MTP 暂拒绝 |
+| dynamic multi-LoRA | 已实现子集 | selected v2 默认把不同 rank/target 的租户按 projection-local 最大 rank 补零，保留各租户 `alpha / logical_rank`，在一个 activation batch 内完成一次 forward/backward，再以一次 FinalizeOnly 调用独立更新各租户参数、m/v 和 optimizer clock；入口 preflight 默认合并 6 个布尔状态 collective，未命中的 target 使用零张量且不更新。`QWEN36_HETERO_PADDED_BATCH=0` 保留按 signature 分组和跨组回滚。checkpoint 可独立恢复 heterogeneous rank/alpha/targets；HTTP 可在显式 `allow_aggregate_loss=true` 时有界合并兼容且 adapter ID 不相交的并发请求，响应保留 aggregate scalar、adapter loss 和真实 optimizer step；`expected_steps` 在原生 TP/EP/DP collective 前做全秩乐观并发校验，过期重试 fail closed；默认仍保持单请求 dispatch，dynamic+MTP 暂拒绝 |
 | microbatch accumulation | 已实现子集 | non-final microbatch 只 backward，final microbatch 才 optimizer；FP32 accumulator 存储/聚合，autograd leaf backward 仍为 BF16 |
 | replicated data parallel | 已实现 | logical-step 边界同步 replicated LoRA；EP expert 参数不走该 reduction |
 | expert parallel | 已实现子集 | 默认 routed-output all-reduce；gated variable-split A2A 已验证 fixed-LoRA 和 native dynamic-LoRA data sharding；GPU-only split planning、异步 overlap 和 DeepEP backend 未实现 |
@@ -58,6 +59,17 @@ the token-count CPU fence; it is not Megatron-style backward bucket overlap or
 reduce-scatter. H20 TP2 fixed-LoRA smoke and TP2 x DP2 oracle passed with both
 settings; the synthetic TP2 benchmark was `77.970 ms` packed versus `78.024 ms`
 fallback p50, within measurement noise.
+
+ABI28 also packs the selected-v2 preflight booleans (health, request validity,
+loss-report mode/capacity, and accumulation state) into one per-axis MIN
+all-reduce. On H20 TP2 x EP2 with the synthetic
+heterogeneous workload (`B=8`, `S=128`, eight active tenants), three interleaved
+runs measured p50 old/packed pairs of `13.394/13.256`, `13.219/13.153`, and
+`13.638/13.199 ms`; the median improved by about `1.5%`. An Nsight Systems
+process-tree trace reduced `ncclDevKernel_AllReduce_Sum_u32_RING_LL` instances
+from `1032` to `752`; u64 registry/hash collectives were unchanged. This is a
+control-plane launch reduction, not communication/compute overlap or a matched
+Megatron result.
 
 The GDN backward path now has a separately validated CUDA optimization. The
 reverse recurrence restores `R_t` while reading `S_t` for the direct output

@@ -40,14 +40,17 @@ extern "C" int32_t qwen36_init_parallel_nccl(
     int32_t, int32_t, int32_t,
     int32_t, int32_t, int32_t);
 extern "C" double qwen36_train_step(void*, void*, void*, void*);
+extern "C" double qwen36_train_step_host_i64(
+    void*, const int64_t*, const int64_t*, const int64_t*, int64_t, int64_t);
 extern "C" int64_t qwen36_add_lora(
     void*, int64_t, double, const int64_t*, int64_t, const char*);
 extern "C" int64_t qwen36_add_lora_v2(
     void*, int64_t, double, const int64_t*, int64_t, const char*);
-extern "C" double qwen36_train_multi_lora_selected(
-    void*, void*, void*, void*, const int64_t*, int32_t, int32_t);
 extern "C" double qwen36_train_multi_lora_selected_v2(
     void*, void*, void*, void*, const int64_t*, int32_t);
+extern "C" double qwen36_train_multi_lora_host_i64(
+    void*, const int64_t*, const int64_t*, const int64_t*, int64_t, int64_t,
+    int32_t, int32_t, const int64_t*, int32_t);
 extern "C" void qwen36_free_training_context(void*);
 
 namespace {
@@ -275,6 +278,8 @@ int main() {
     assert(expert_tp_mode == "replicated" || expert_tp_mode == "etp");
     const bool expert_tp = expert_tp_mode == "etp";
     const std::string variant = env_string("BENCH_VARIANT", "baseline");
+    const std::string input_abi = env_string("BENCH_INPUT_ABI", "tensor");
+    assert(input_abi == "tensor" || input_abi == "host");
     const bool packed_a2a = env_enabled("QWEN36_EP_A2A_PACKED", true);
     const std::string targets = env_string(
         "BENCH_TARGETS", "q_proj,experts_gate_up_proj,experts_down_proj");
@@ -397,6 +402,8 @@ int main() {
     }
 
     std::vector<int64_t> host_ids(static_cast<size_t>(batch) * seq);
+    std::vector<int64_t> host_targets(static_cast<size_t>(batch) * seq, 1);
+    std::vector<int64_t> host_attention(static_cast<size_t>(batch) * seq, 1);
     for (int b = 0; b < batch; ++b) {
         for (int s = 0; s < seq; ++s) {
             const int64_t global_source =
@@ -427,19 +434,26 @@ int main() {
         }
     };
     auto train_once = [&](int step) {
+        if (input_abi == "host") {
+            select_tenants(step);
+            if (lora_mode == "fixed") {
+                return qwen36_train_step_host_i64(
+                    context, host_ids.data(), host_targets.data(),
+                    host_attention.data(), batch, seq);
+            }
+            return qwen36_train_multi_lora_host_i64(
+                context, host_ids.data(), host_targets.data(),
+                host_attention.data(), batch, seq, active_tenants, lora_rank,
+                selected.data(), active_tenants);
+        }
         if (lora_mode == "fixed") {
             return qwen36_train_step(
                 context, &input_ids, &target_mask, &attention_mask);
         }
         select_tenants(step);
-        if (lora_mode == "heterogeneous") {
-            return qwen36_train_multi_lora_selected_v2(
-                context, &input_ids, &target_mask, &attention_mask,
-                selected.data(), active_tenants);
-        }
-        return qwen36_train_multi_lora_selected(
+        return qwen36_train_multi_lora_selected_v2(
             context, &input_ids, &target_mask, &attention_mask,
-            selected.data(), active_tenants, lora_rank);
+            selected.data(), active_tenants);
     };
 
     double last_loss = 0.0;
@@ -503,6 +517,7 @@ int main() {
         << "native_tp_ep_bench {"
         << "\"variant\":\"" << json_escape(variant) << "\","
         << "\"lora_mode\":\"" << lora_mode << "\","
+        << "\"input_abi\":\"" << input_abi << "\","
         << "\"expert_tp_mode\":\"" << expert_tp_mode << "\","
         << "\"targets\":\"" << json_escape(targets) << "\","
         << "\"rank\":" << rank << ",\"world\":" << world << ','
