@@ -1046,6 +1046,14 @@ static at::Tensor linear_attention(
     int64_t seq_chunk = 0;
     if (chunk_env) seq_chunk = atoll(chunk_env);
 
+    if (seq_chunk > 0 && seq > seq_chunk && conv_kernel > 1 &&
+        seq_chunk < conv_kernel - 1) {
+        TORCH_CHECK(false,
+            "QWEN36_SEQ_CHUNK must be at least conv_kernel - 1 for causal "
+            "overlap: seq_chunk=", seq_chunk,
+            " conv_kernel=", conv_kernel);
+    }
+
     // Stateful chunking currently has no autograd state input/output contract.
     // Keep it for inference/eval only; training uses the autograd-wrapped full
     // sequence path below until chunk state gradients are implemented.

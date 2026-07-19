@@ -1152,6 +1152,22 @@ int main() {
     assert(ctx);
     if (world > 1) assert(qwen36_init_nccl(ctx) == 0);
     assert(qwen36_get_lora_count(ctx) == 8);
+    // A chunk smaller than the causal-convolution overlap used to form a
+    // negative narrow() start for the second chunk. Reject it before any
+    // collective or tensor allocation instead of failing deep in ATen.
+    auto invalid_chunk_input = at::arange(
+        1, 5, at::TensorOptions().device(at::kCUDA).dtype(at::kLong))
+        .reshape({1, 4});
+    auto invalid_chunk_target = at::ones(
+        {1, 4}, at::TensorOptions().device(at::kCUDA).dtype(at::kFloat));
+    auto invalid_chunk_attention = at::ones(
+        {1, 4}, at::TensorOptions().device(at::kCUDA).dtype(at::kBool));
+    setenv("QWEN36_SEQ_CHUNK", "2", 1);
+    const double invalid_chunk_loss = qwen36_eval_step(
+        ctx, &invalid_chunk_input, &invalid_chunk_target,
+        &invalid_chunk_attention);
+    unsetenv("QWEN36_SEQ_CHUNK");
+    assert(invalid_chunk_loss < 0.0);
     auto* linear_a = reinterpret_cast<at::Tensor*>(qwen36_get_lora_a(ctx, 0));
     auto* linear_b = reinterpret_cast<at::Tensor*>(qwen36_get_lora_b(ctx, 0));
     assert(linear_a && linear_b);
