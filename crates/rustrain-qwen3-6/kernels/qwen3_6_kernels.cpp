@@ -3472,6 +3472,7 @@ static void hash_collective_runtime_environment(AdapterRegistryHash& hash) {
     hash.add_u64(env_enabled("QWEN36_FUSED_CE"));
     hash.add_u64(env_enabled("QWEN36_FUSED_QKV"));
     hash.add_u64(env_enabled("QWEN36_FUSED_MLP_FC1"));
+    hash.add_u64(env_enabled("QWEN36_DISABLE_MTP"));
     const char* checkpoint_stride =
         getenv("QWEN36_GDN_STATE_CHECKPOINT_STRIDE");
     hash.add_string(checkpoint_stride ? checkpoint_stride : "");
@@ -3490,6 +3491,43 @@ static void hash_collective_runtime_config(
     hash.add_u64(ctx->use_checkpoint);
     hash.add_u64(ctx->group_size);
     hash_double(hash, ctx->max_grad_norm);
+    hash.add_u64(ctx->has_mtp);
+    hash_double(hash, ctx->mtp_loss_scale);
+    if (ctx->has_mtp) {
+        for (const auto* tensor : {
+                ctx->mtp_fc, ctx->mtp_pre_fc_norm_emb,
+                ctx->mtp_pre_fc_norm_hidden, ctx->mtp_norm}) {
+            hash.add_u64(tensor != nullptr);
+            if (tensor) hash_tensor_layout(hash, *tensor);
+        }
+        hash.add_u64(ctx->mtp_layer_configs.size());
+        for (const auto& config : ctx->mtp_layer_configs) {
+            hash.add_u64(config.layer_type);
+            hash.add_u64(config.num_heads);
+            hash.add_u64(config.num_kv_heads);
+            hash.add_u64(config.head_dim);
+            hash.add_u64(config.num_k_heads);
+            hash.add_u64(config.key_dim);
+            hash.add_u64(config.num_v_heads);
+            hash.add_u64(config.val_dim);
+            hash.add_u64(config.conv_kernel);
+            hash_double(hash, config.partial_rotary_factor);
+            hash_double(hash, config.rope_theta);
+            hash_double(hash, config.rms_eps);
+            hash.add_u64(config.num_experts);
+            hash.add_u64(config.top_k);
+            hash.add_u64(config.moe_intermediate);
+            hash.add_u64(config.expert_start);
+            hash.add_u64(config.expert_count);
+            hash.add_u64(config.intermediate_size);
+            hash.add_u64(config.norm_topk_prob);
+        }
+        hash.add_u64(ctx->mtp_layer_weights.size());
+        for (const auto* tensor : ctx->mtp_layer_weights) {
+            hash.add_u64(tensor != nullptr);
+            if (tensor) hash_tensor_layout(hash, *tensor);
+        }
+    }
 }
 
 static void hash_collective_topology(
@@ -10015,15 +10053,22 @@ static at::Tensor mtp_forward(
     return rms_norm(h, *ctx->mtp_norm, ctx->rms_eps).to(kind);
 }
 
-// MTP loss: chunked matmul + cross-entropy, weighted by 0.5
+struct MtpLossResult {
+    at::Tensor value;
+    at::Tensor sample_loss_numerators;
+    at::Tensor sample_token_counts;
+};
+
+// MTP loss: chunked matmul + cross-entropy.
 // mtp_hidden[t] (from hidden[t] + embed[t+1]) predicts token t+2 (Megatron convention)
 // No full logits tensor — chunked matmul + fused CE
-static at::Tensor mtp_compute_loss(
+static MtpLossResult mtp_compute_loss(
     TrainingContext* ctx,
     const at::Tensor& mtp_hidden,
     const at::Tensor& input_ids,
     const at::Tensor& target_mask,
-    bool independent_samples = false
+    bool independent_samples = false,
+    bool collect_sample_losses = false
 ) {
     int64_t vocab_size = ctx->vocab_size;
     int64_t seq_len = input_ids.size(1);
@@ -10043,11 +10088,19 @@ static at::Tensor mtp_compute_loss(
     auto total_loss = at::zeros({1}, at::TensorOptions().dtype(at::kFloat).device(mtp_hidden.device()));
     auto total_count = shifted_mask.sum().clamp_min(1.0);
     at::Tensor token_denominators;
+    at::Tensor sample_loss_numerators;
+    at::Tensor sample_token_counts;
     if (independent_samples) {
         auto per_sample_count = target_mask.narrow(1, 2, n_tokens)
-            .sum(1, true).clamp_min(1.0);
-        token_denominators = per_sample_count
+            .sum(1).to(at::kFloat);
+        token_denominators = per_sample_count.clamp_min(1.0).reshape({-1, 1})
             .expand({target_mask.size(0), n_tokens}).reshape({-1});
+        if (collect_sample_losses) {
+            sample_token_counts = per_sample_count;
+            sample_loss_numerators = at::zeros(
+                {target_mask.size(0)},
+                at::TensorOptions().dtype(at::kFloat).device(mtp_hidden.device()));
+        }
     }
 
     for (int64_t c = 0; c < num_chunks; c++) {
@@ -10066,6 +10119,13 @@ static at::Tensor mtp_compute_loss(
             /*ignore_index=*/-100, /*label_smoothing=*/0.0
         );
         auto masked_loss = per_token_loss * chunk_mask.to(at::kFloat);
+        if (sample_loss_numerators.defined()) {
+            auto token_indexes = at::arange(
+                start, end, shifted_targets.options());
+            auto sample_indexes = at::floor_divide(token_indexes, n_tokens);
+            sample_loss_numerators.index_add_(
+                0, sample_indexes, masked_loss.detach());
+        }
         // Avoid in-place accumulation into a non-grad leaf: out-of-place add
         // keeps the MTP loss connected to the frozen-head input graph.
         total_loss = total_loss + (independent_samples
@@ -10074,7 +10134,13 @@ static at::Tensor mtp_compute_loss(
     }
 
     if (!independent_samples) total_loss = total_loss / total_count;
-    return total_loss * ctx->mtp_loss_scale;
+    return {
+        total_loss * ctx->mtp_loss_scale,
+        sample_loss_numerators.defined()
+            ? sample_loss_numerators * ctx->mtp_loss_scale
+            : at::Tensor(),
+        sample_token_counts,
+    };
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -10924,21 +10990,77 @@ __attribute__((visibility("default"))) int32_t qwen36_set_mtp_weights(
                 !ctx->vocab_parallel,
             "MTP cannot be enabled after frozen base or vocabulary TP because MTP weights are not sharded");
         TORCH_CHECK(!ctx->has_mtp, "MTP weights are already configured");
+        TORCH_CHECK(!ctx->accumulation_active && !ctx->pp_window.active,
+            "MTP weights cannot be configured during an active training window");
+        TORCH_CHECK(std::isfinite(ctx->mtp_loss_scale) &&
+                ctx->mtp_loss_scale >= 0.0,
+            "MTP loss scale must be finite and non-negative");
+        TORCH_CHECK(mtp_fc_ptr && mtp_pre_fc_norm_emb_ptr &&
+                mtp_pre_fc_norm_hidden_ptr && mtp_norm_ptr,
+            "MTP requires projection and normalization tensors");
+        TORCH_CHECK(num_mtp_layers > 0 && mtp_layer_configs_ptr,
+            "MTP requires at least one configured prediction layer");
+
+        auto* mtp_fc = reinterpret_cast<at::Tensor*>(mtp_fc_ptr);
+        auto* pre_norm_emb = reinterpret_cast<at::Tensor*>(
+            mtp_pre_fc_norm_emb_ptr);
+        auto* pre_norm_hidden = reinterpret_cast<at::Tensor*>(
+            mtp_pre_fc_norm_hidden_ptr);
+        auto* mtp_norm = reinterpret_cast<at::Tensor*>(mtp_norm_ptr);
+        TORCH_CHECK(!ctx->embed_ptr.empty() && ctx->embed_ptr[0] &&
+                ctx->embed_ptr[0]->dim() == 2,
+            "MTP requires a valid vocabulary embedding");
+        const int64_t hidden_size = ctx->embed_ptr[0]->size(1);
+        const auto device = ctx->embed_ptr[0]->device();
+        for (const auto* tensor : {
+                mtp_fc, pre_norm_emb, pre_norm_hidden, mtp_norm}) {
+            TORCH_CHECK(tensor->defined() && tensor->is_cuda() &&
+                    tensor->device() == device &&
+                    tensor->scalar_type() == ctx->compute_type &&
+                    !tensor->requires_grad(),
+                "MTP tensors must be frozen CUDA tensors matching the base compute type");
+        }
+        TORCH_CHECK(mtp_fc->dim() == 2 &&
+                mtp_fc->sizes() == at::IntArrayRef({hidden_size, 2 * hidden_size}),
+            "MTP projection must have shape [hidden, 2 * hidden]");
+        for (const auto* tensor : {pre_norm_emb, pre_norm_hidden, mtp_norm}) {
+            TORCH_CHECK(tensor->dim() == 1 && tensor->size(0) == hidden_size,
+                "MTP normalization tensors must have shape [hidden]");
+        }
+
+        auto* layer_configs = reinterpret_cast<LayerConfig*>(
+            mtp_layer_configs_ptr);
+        std::vector<LayerConfig> configured_layers(
+            layer_configs, layer_configs + num_mtp_layers);
+        int64_t expected_weight_count = 0;
+        for (const auto& config : configured_layers)
+            expected_weight_count += weight_count_for_layer(config);
+        TORCH_CHECK(expected_weight_count == num_mtp_layer_weights &&
+                mtp_layer_weight_ptrs,
+            "MTP layer weight count does not match configured prediction layers");
+        auto** layer_weights = reinterpret_cast<at::Tensor**>(
+            mtp_layer_weight_ptrs);
+        std::vector<at::Tensor*> configured_weights;
+        configured_weights.reserve(num_mtp_layer_weights);
+        for (int64_t i = 0; i < num_mtp_layer_weights; ++i) {
+            auto* tensor = layer_weights[i];
+            TORCH_CHECK(tensor && tensor->defined() && tensor->is_cuda() &&
+                    tensor->device() == device &&
+                    tensor->scalar_type() == ctx->compute_type &&
+                    !tensor->requires_grad(),
+                "MTP layer weights must be frozen CUDA tensors matching the base compute type");
+            configured_weights.push_back(tensor);
+        }
+
+        // Commit only after every pointer and layout has passed validation so a
+        // failed setup cannot leave a half-configured collective context.
+        ctx->mtp_fc = mtp_fc;
+        ctx->mtp_pre_fc_norm_emb = pre_norm_emb;
+        ctx->mtp_pre_fc_norm_hidden = pre_norm_hidden;
+        ctx->mtp_norm = mtp_norm;
+        ctx->mtp_layer_weights = std::move(configured_weights);
+        ctx->mtp_layer_configs = std::move(configured_layers);
         ctx->has_mtp = true;
-        ctx->mtp_fc = reinterpret_cast<at::Tensor*>(mtp_fc_ptr);
-        ctx->mtp_pre_fc_norm_emb = reinterpret_cast<at::Tensor*>(mtp_pre_fc_norm_emb_ptr);
-        ctx->mtp_pre_fc_norm_hidden = reinterpret_cast<at::Tensor*>(mtp_pre_fc_norm_hidden_ptr);
-        ctx->mtp_norm = reinterpret_cast<at::Tensor*>(mtp_norm_ptr);
-
-        auto** wp = reinterpret_cast<at::Tensor**>(mtp_layer_weight_ptrs);
-        for (int64_t i = 0; i < num_mtp_layer_weights; i++) {
-            ctx->mtp_layer_weights.push_back(wp[i]);
-        }
-
-        auto* lcfgs = reinterpret_cast<LayerConfig*>(mtp_layer_configs_ptr);
-        for (int64_t i = 0; i < num_mtp_layers; i++) {
-            ctx->mtp_layer_configs.push_back(lcfgs[i]);
-        }
 
         fprintf(stderr, "[q36_ctx] MTP set: %ld MTP layers, %ld MTP weight pointers\n",
             (long)num_mtp_layers, (long)num_mtp_layer_weights);
@@ -11003,6 +11125,7 @@ __attribute__((visibility("default"))) double qwen36_train_micro_step(
             input_ids_tensor->device() == target_mask_tensor->device() &&
             input_ids_tensor->dim() == 2 && target_mask_tensor->dim() == 2 &&
             input_ids_tensor->size(1) > 1 &&
+            (!ctx->has_mtp || input_ids_tensor->size(1) >= 3) &&
             input_ids_tensor->sizes() == target_mask_tensor->sizes() &&
             input_ids_tensor->scalar_type() == at::kLong &&
             supported_mask_dtype(*target_mask_tensor) &&
@@ -11023,10 +11146,10 @@ __attribute__((visibility("default"))) double qwen36_train_micro_step(
                 input_ids_tensor->device().index() == ctx->cuda_device;
         }
         TORCH_CHECK(adapter_collective_all_succeeded(
-                ctx, local_preflight_valid) && local_preflight_valid,
+            ctx, local_preflight_valid) && local_preflight_valid,
             "native Qwen fixed-LoRA call must use CUDA inputs on the NCCL "
-            "context device, a finite positive gradient scale, and no "
-            "dynamic adapters");
+            "context device, a finite positive gradient scale, sequence "
+            "length >= 3 when MTP is enabled, and no dynamic adapters");
         auto& input_ids = *input_ids_tensor;
         const int input_device = input_ids.device().index();
         if (!ctx->nccl_comm && !ctx->dp_comm && !ctx->tp_comm &&
@@ -11106,10 +11229,17 @@ __attribute__((visibility("default"))) double qwen36_train_micro_step(
             auto mtp_input = hidden.detach().set_requires_grad(true);
             auto mtp_hidden = mtp_forward(ctx, mtp_input, input_ids);
             auto mtp_loss = mtp_compute_loss(ctx, mtp_hidden, input_ids, target_mask);
-            mtp_loss.backward();
+            mtp_loss.value.backward();
             TORCH_CHECK(mtp_input.grad().defined(), "MTP did not produce a hidden gradient");
-            total_hidden_grad.add_(mtp_input.grad());
-            loss_val += mtp_loss.item<double>();
+            const double mtp_tokens = target_mask.narrow(1, 2,
+                target_mask.size(1) - 2).to(at::kFloat).sum().item<double>();
+            const double mtp_to_main_scale = supervised_tokens > 0.0
+                ? mtp_tokens / supervised_tokens : 0.0;
+            // MTP is averaged over its own response-token set. Convert it to
+            // the main-loss denominator before the common token-weighted
+            // gradient path, including uneven masks and DP replicas.
+            total_hidden_grad.add_(mtp_input.grad() * mtp_to_main_scale);
+            loss_val += mtp_loss.value.item<double>() * mtp_to_main_scale;
         }
 
         const bool local_loss_finite =
@@ -11359,6 +11489,13 @@ double qwen36_train_multi_lora_impl(
             ? reinterpret_cast<at::Tensor*>(attention_mask_ptr)
             : nullptr;
         const int64_t total_adapters = (int64_t)ctx->adapters.size();
+        const bool mtp_enabled =
+            ctx->has_mtp && !env_enabled("QWEN36_DISABLE_MTP");
+        const bool dynamic_mtp_topology_supported = !mtp_enabled ||
+            (!allow_pipeline && ctx->tp_world_size == 1 &&
+                ctx->cp_world_size == 1 && ctx->ep_world_size == 1 &&
+                ctx->pp_world_size == 1 &&
+                ctx->router_aux_loss_coef == 0.0);
         bool local_input_valid = input_ids_tensor && target_mask_tensor &&
             input_ids_tensor->is_cuda() && target_mask_tensor->is_cuda() &&
             input_ids_tensor->device() == target_mask_tensor->device() &&
@@ -11373,7 +11510,9 @@ double qwen36_train_multi_lora_impl(
             (mode != DynamicMultiLoraMode::TrainAndFinalize ||
                 (!ctx->accumulation_active &&
                     ctx->accumulated_token_weight == 0.0)) &&
-            (!ctx->has_mtp || env_enabled("QWEN36_DISABLE_MTP"));
+            dynamic_mtp_topology_supported &&
+            (!mtp_enabled || input_ids_tensor->size(1) >= 3) &&
+            (!mtp_enabled || !token_counts_override);
         if (local_input_valid && attention_mask_tensor) {
             local_input_valid = attention_mask_tensor->is_cuda() &&
                 attention_mask_tensor->device() == input_ids_tensor->device() &&
@@ -11391,6 +11530,8 @@ double qwen36_train_multi_lora_impl(
                 ctx, local_input_valid) && local_input_valid,
             "native Qwen multi-LoRA inputs must be CUDA tensors on the "
             "NCCL context device");
+        TORCH_CHECK(dynamic_mtp_topology_supported,
+            "dynamic MTP currently requires TP=CP=EP=PP=1, DP>=1, and router aux disabled");
         auto& input_ids = *input_ids_tensor;
         auto& target_mask = *target_mask_tensor;
         const int input_device = input_ids.device().index();
@@ -11455,6 +11596,65 @@ double qwen36_train_multi_lora_impl(
                 "dynamic token-count override must match adapter registry");
             adapter_token_counts = token_counts_override->to(at::kFloat)
                 .to(input_ids.device()).contiguous();
+        }
+        at::Tensor mtp_adapter_token_counts;
+        at::Tensor mtp_gradient_scales;
+        at::Tensor mtp_report_scales;
+        if (mtp_enabled && !finalize_only) {
+            auto input_row_mtp_counts = target_mask
+                .narrow(1, 2, target_mask.size(1) - 2)
+                .to(at::kFloat).sum(1);
+            mtp_adapter_token_counts = input_batch == 1
+                ? input_row_mtp_counts.repeat({total_adapters})
+                : input_row_mtp_counts;
+            bool local_counts_valid = false;
+            try {
+                local_counts_valid = at::logical_and(
+                        at::isfinite(mtp_adapter_token_counts),
+                        at::logical_and(
+                            mtp_adapter_token_counts >= 0,
+                            mtp_adapter_token_counts <= adapter_token_counts))
+                    .all().item<bool>();
+            } catch (...) {
+                local_counts_valid = false;
+            }
+            TORCH_CHECK(adapter_collective_all_succeeded(
+                    ctx, local_counts_valid) && local_counts_valid,
+                "dynamic MTP token counts must be finite, non-negative, and no "
+                "larger than the corresponding main-loss token counts");
+
+            auto packed_counts = at::cat({
+                adapter_token_counts.to(at::kFloat),
+                mtp_adapter_token_counts}, 0).contiguous();
+            if (ctx->data_parallel && ctx->dp_comm &&
+                    ctx->dp_world_size > 1) {
+                auto reduced_counts = at::empty_like(packed_counts);
+                auto stream = c10::cuda::getCurrentCUDAStream(
+                    packed_counts.device().index()).stream();
+                auto error = ncclAllReduce(
+                    packed_counts.data_ptr<float>(),
+                    reduced_counts.data_ptr<float>(), packed_counts.numel(),
+                    ncclFloat, ncclSum,
+                    reinterpret_cast<ncclComm_t>(ctx->dp_comm), stream);
+                TORCH_CHECK(error == ncclSuccess,
+                    "dynamic MTP token-count DP reduction failed: ",
+                    ncclGetErrorString(error));
+                packed_counts = reduced_counts;
+            }
+            auto global_main_counts = packed_counts.narrow(
+                0, 0, total_adapters);
+            auto global_mtp_counts = packed_counts.narrow(
+                0, total_adapters, total_adapters);
+            mtp_report_scales = at::where(
+                global_mtp_counts > 0,
+                global_main_counts / global_mtp_counts.clamp_min(1.0),
+                at::zeros_like(global_main_counts));
+            mtp_gradient_scales = at::where(
+                at::logical_and(
+                    adapter_token_counts > 0, global_mtp_counts > 0),
+                (mtp_adapter_token_counts /
+                    adapter_token_counts.clamp_min(1.0)) * mtp_report_scales,
+                at::zeros_like(adapter_token_counts));
         }
         // Keep the caller's mask intact. Each chunk receives either the
         // corresponding rows or a repeated batch-1 mask; this also prevents
@@ -11691,6 +11891,42 @@ double qwen36_train_multi_lora_impl(
                         loss.sample_token_counts);
                 }
             }
+            auto t_loss_end = std::chrono::steady_clock::now();
+            double loss_ms = std::chrono::duration<double, std::milli>(t_loss_end - t_loss_start).count();
+
+            // Backward
+            auto t_bwd_start = std::chrono::steady_clock::now();
+            if (mtp_enabled) {
+                auto mtp_input = hidden.detach().set_requires_grad(true);
+                auto mtp_hidden = mtp_forward(ctx, mtp_input, input_ref);
+                auto mtp_loss = mtp_compute_loss(
+                    ctx, mtp_hidden, input_ref, mask_ref,
+                    /*independent_samples=*/true,
+                    /*collect_sample_losses=*/loss_numerators.defined());
+                mtp_loss.value.backward();
+                TORCH_CHECK(mtp_input.grad().defined(), "MTP did not produce a hidden gradient");
+                auto chunk_gradient_scales = mtp_gradient_scales
+                    .narrow(0, start, n).to(mtp_input.grad().scalar_type())
+                    .reshape({n, 1, 1});
+                hidden_grad.add_(mtp_input.grad() * chunk_gradient_scales);
+                loss_val += mtp_loss.value.item<double>();
+                if (loss_numerators.defined()) {
+                    TORCH_CHECK(mtp_loss.sample_loss_numerators.defined() &&
+                            mtp_loss.sample_token_counts.defined() &&
+                            mtp_loss.sample_loss_numerators.numel() == n &&
+                            mtp_loss.sample_token_counts.numel() == n,
+                        "dynamic MTP per-adapter loss report shape mismatch");
+                    auto expected_counts = mtp_adapter_token_counts.narrow(
+                        0, start, n);
+                    TORCH_CHECK(at::equal(
+                            mtp_loss.sample_token_counts, expected_counts),
+                        "dynamic MTP sample token counts disagree with optimizer normalization");
+                    loss_numerators.narrow(0, start, n).add_(
+                        mtp_loss.sample_loss_numerators *
+                        mtp_report_scales.narrow(0, start, n));
+                }
+            }
+
             // independent_samples produces a local per-tenant mean. Restore
             // each row to a token-sum numerator before A2A backward so the
             // expert owner can combine unequal source shards correctly.
@@ -11699,22 +11935,6 @@ double qwen36_train_multi_lora_impl(
                 auto chunk_token_counts = adapter_token_counts
                     .narrow(0, start, n).reshape({n, 1, 1});
                 hidden_grad.mul_(chunk_token_counts);
-            }
-            auto t_loss_end = std::chrono::steady_clock::now();
-            double loss_ms = std::chrono::duration<double, std::milli>(t_loss_end - t_loss_start).count();
-
-            // Backward
-            auto t_bwd_start = std::chrono::steady_clock::now();
-            if (ctx->has_mtp && !env_enabled("QWEN36_DISABLE_MTP")) {
-                auto mtp_input = hidden.detach().set_requires_grad(true);
-                auto mtp_hidden = mtp_forward(ctx, mtp_input, input_ref);
-                auto mtp_loss = mtp_compute_loss(
-                    ctx, mtp_hidden, input_ref, mask_ref,
-                    /*independent_samples=*/true);
-                mtp_loss.backward();
-                TORCH_CHECK(mtp_input.grad().defined(), "MTP did not produce a hidden gradient");
-                hidden_grad.add_(mtp_input.grad());
-                loss_val += mtp_loss.item<double>();
             }
 
             bool local_loss_finite = false;
