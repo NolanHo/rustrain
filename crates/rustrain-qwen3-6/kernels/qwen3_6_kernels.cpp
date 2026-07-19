@@ -225,9 +225,8 @@ extern "C" {
         void** d_dst_param_ptrs,
         float** d_dst_m_ptrs, float** d_dst_v_ptrs,
         int* d_sizes, float* d_lr_scaled, float* d_eps_scaled,
+        float* d_beta1, float* d_beta2,
         int n_params,
-        float beta1, float beta2,
-        float one_minus_beta1, float one_minus_beta2,
         void* stream);
 }
 
@@ -2634,6 +2633,8 @@ struct AdamDevBuffers {
     at::Tensor sizes_buf;    // [max_n] kInt
     at::Tensor lr_buf;       // [max_n] kFloat
     at::Tensor eps_buf;      // [max_n] kFloat
+    at::Tensor beta1_buf;    // [max_n] kFloat
+    at::Tensor beta2_buf;    // [max_n] kFloat
     int capacity = 0;
 
     void ensure(int n, const at::Tensor& ref) {
@@ -2649,6 +2650,8 @@ struct AdamDevBuffers {
         sizes_buf  = at::empty({n}, at::TensorOptions().dtype(at::kInt).device(dev));
         lr_buf     = at::empty({n}, at::TensorOptions().dtype(at::kFloat).device(dev));
         eps_buf    = at::empty({n}, at::TensorOptions().dtype(at::kFloat).device(dev));
+        beta1_buf  = at::empty({n}, at::TensorOptions().dtype(at::kFloat).device(dev));
+        beta2_buf  = at::empty({n}, at::TensorOptions().dtype(at::kFloat).device(dev));
         capacity = n;
     }
 };
@@ -2717,10 +2720,12 @@ struct TrainingContext {
         int64_t rank;
         // Each tenant owns an independent Adam bias-correction clock.
         int64_t optimizer_step = 0;
-        // Dynamic tenants may override the context learning rate while sharing
-        // one fused Adam launch. Beta/epsilon remain context-wide because the
-        // current fused kernel accepts one beta pair per launch.
+        // Dynamic tenants own complete Adam hyperparameters while sharing one
+        // fused launch through per-tensor scalar buffers.
         double optimizer_lr = 0.0;
+        double optimizer_beta1 = 0.9;
+        double optimizer_beta2 = 0.999;
+        double optimizer_eps = 1e-8;
         double alpha;
         bool all_target_layers = true;
         // External identity remains global across pipeline stages. The local
@@ -3056,6 +3061,13 @@ struct AdapterRegistryHash {
     }
 };
 
+static void hash_double(AdapterRegistryHash& hash, double value) {
+    uint64_t bits = 0;
+    static_assert(sizeof(bits) == sizeof(value));
+    std::memcpy(&bits, &value, sizeof(bits));
+    hash.add_u64(bits);
+}
+
 
 static bool global_to_local_layer(
     const TrainingContext* ctx, int64_t global_layer, int64_t& local_layer
@@ -3086,16 +3098,11 @@ static void hash_adapter_layout(
     hash.add_u64(adapter.id);
     hash.add_u64(adapter.rank);
     hash.add_u64(adapter.optimizer_step);
-    uint64_t optimizer_lr_bits = 0;
-    static_assert(sizeof(optimizer_lr_bits) == sizeof(adapter.optimizer_lr));
-    std::memcpy(
-        &optimizer_lr_bits, &adapter.optimizer_lr,
-        sizeof(optimizer_lr_bits));
-    hash.add_u64(optimizer_lr_bits);
-    uint64_t alpha_bits = 0;
-    static_assert(sizeof(alpha_bits) == sizeof(adapter.alpha));
-    std::memcpy(&alpha_bits, &adapter.alpha, sizeof(alpha_bits));
-    hash.add_u64(alpha_bits);
+    hash_double(hash, adapter.optimizer_lr);
+    hash_double(hash, adapter.optimizer_beta1);
+    hash_double(hash, adapter.optimizer_beta2);
+    hash_double(hash, adapter.optimizer_eps);
+    hash_double(hash, adapter.alpha);
     hash.add_u64(adapter.all_target_layers);
     hash.add_u64(adapter.global_target_layers.size());
     for (const auto layer : adapter.global_target_layers) hash.add_u64(layer);
@@ -3129,14 +3136,11 @@ static void hash_adapter_request_identity(
     hash.add_u64(adapter.id);
     hash.add_u64(adapter.rank);
     hash.add_u64(adapter.optimizer_step);
-    uint64_t optimizer_lr_bits = 0;
-    std::memcpy(
-        &optimizer_lr_bits, &adapter.optimizer_lr,
-        sizeof(optimizer_lr_bits));
-    hash.add_u64(optimizer_lr_bits);
-    uint64_t alpha_bits = 0;
-    std::memcpy(&alpha_bits, &adapter.alpha, sizeof(alpha_bits));
-    hash.add_u64(alpha_bits);
+    hash_double(hash, adapter.optimizer_lr);
+    hash_double(hash, adapter.optimizer_beta1);
+    hash_double(hash, adapter.optimizer_beta2);
+    hash_double(hash, adapter.optimizer_eps);
+    hash_double(hash, adapter.alpha);
     hash.add_u64(adapter.all_target_layers);
     hash.add_u64(adapter.global_target_layers.size());
     for (const auto layer : adapter.global_target_layers) hash.add_u64(layer);
@@ -10087,6 +10091,8 @@ static double qwen36_train_multi_lora_impl(
                     at::Tensor* next_v;
                     float lr_scaled;
                     float eps_scaled;
+                    float beta1;
+                    float beta2;
                 };
                 struct DynamicAdamClockCommit {
                     TrainingContext::LoRAAdapter* adapter;
@@ -10102,7 +10108,9 @@ static double qwen36_train_multi_lora_impl(
                                          at::Tensor& next_m,
                                          at::Tensor& next_v,
                                          float lr_scaled,
-                                         float eps_scaled) {
+                                         float eps_scaled,
+                                         float beta1,
+                                         float beta2) {
                     if (!param.requires_grad() || !accumulator.defined()) return;
                     TORCH_CHECK(param.defined() && param.is_cuda() &&
                             param.is_contiguous() &&
@@ -10146,7 +10154,7 @@ static double qwen36_train_multi_lora_impl(
                     commits.push_back(DynamicAdamCommit{
                         &param, &accumulator, &m, &v,
                         &next_param, &next_m, &next_v,
-                        lr_scaled, eps_scaled});
+                        lr_scaled, eps_scaled, beta1, beta2});
                 };
                 for (size_t adapter_index = 0;
                      adapter_index < ctx->adapters.size(); ++adapter_index) {
@@ -10160,16 +10168,16 @@ static double qwen36_train_multi_lora_impl(
                     const int64_t logical_step = adapter.optimizer_step + 1;
                     const double step_f = (double)logical_step;
                     const double bias_correction1 =
-                        1.0 - std::pow(ctx->beta1, step_f);
+                        1.0 - std::pow(adapter.optimizer_beta1, step_f);
                     const double bias_correction2 =
-                        1.0 - std::pow(ctx->beta2, step_f);
+                        1.0 - std::pow(adapter.optimizer_beta2, step_f);
                     const double sqrt_bias_correction2 =
                         std::sqrt(bias_correction2);
                     const float lr_scaled = (float)(
                         adapter.optimizer_lr * sqrt_bias_correction2 /
                         bias_correction1);
                     const float eps_scaled = (float)(
-                        ctx->eps * sqrt_bias_correction2);
+                        adapter.optimizer_eps * sqrt_bias_correction2);
                     TORCH_CHECK(std::isfinite(lr_scaled) &&
                             std::isfinite(eps_scaled) &&
                             bias_correction1 > 0.0 &&
@@ -10199,11 +10207,15 @@ static double qwen36_train_multi_lora_impl(
                             append_commit(
                                 a, accum_a, m_a, v_a,
                                 next_a, next_m_a, next_v_a,
-                                lr_scaled, eps_scaled);
+                                lr_scaled, eps_scaled,
+                                static_cast<float>(adapter.optimizer_beta1),
+                                static_cast<float>(adapter.optimizer_beta2));
                             append_commit(
                                 b, accum_b, m_b, v_b,
                                 next_b, next_m_b, next_v_b,
-                                lr_scaled, eps_scaled);
+                                lr_scaled, eps_scaled,
+                                static_cast<float>(adapter.optimizer_beta1),
+                                static_cast<float>(adapter.optimizer_beta2));
                         }
                     }
                     if (commits.size() > adapter_commit_begin) {
@@ -10219,6 +10231,7 @@ static double qwen36_train_multi_lora_impl(
                     std::vector<float*> h_m, h_v, h_dst_m, h_dst_v;
                     std::vector<int> h_sizes;
                     std::vector<float> h_lr_scaled, h_eps_scaled;
+                    std::vector<float> h_beta1, h_beta2;
                     const size_t tensor_count = commits.size();
                     h_params.reserve(tensor_count);
                     h_grads.reserve(tensor_count);
@@ -10230,6 +10243,8 @@ static double qwen36_train_multi_lora_impl(
                     h_sizes.reserve(tensor_count);
                     h_lr_scaled.reserve(tensor_count);
                     h_eps_scaled.reserve(tensor_count);
+                    h_beta1.reserve(tensor_count);
+                    h_beta2.reserve(tensor_count);
                     for (auto& commit : commits) {
                         h_params.push_back(commit.param->data_ptr());
                         h_grads.push_back(commit.accumulator->data_ptr());
@@ -10241,6 +10256,8 @@ static double qwen36_train_multi_lora_impl(
                         h_sizes.push_back((int)commit.param->numel());
                         h_lr_scaled.push_back(commit.lr_scaled);
                         h_eps_scaled.push_back(commit.eps_scaled);
+                        h_beta1.push_back(commit.beta1);
+                        h_beta2.push_back(commit.beta2);
                     }
                     const int n_params = (int)commits.size();
                     auto opts_cpu_long = at::TensorOptions().dtype(at::kLong).device(at::kCPU);
@@ -10261,6 +10278,10 @@ static double qwen36_train_multi_lora_impl(
                         h_lr_scaled.data(), {n_params}, opts_cpu_float);
                     auto eps_cpu = at::from_blob(
                         h_eps_scaled.data(), {n_params}, opts_cpu_float);
+                    auto beta1_cpu = at::from_blob(
+                        h_beta1.data(), {n_params}, opts_cpu_float);
+                    auto beta2_cpu = at::from_blob(
+                        h_beta2.data(), {n_params}, opts_cpu_float);
                     ctx->adam_dev_bufs.ensure(n_params, *commits[0].param);
                     ctx->adam_dev_bufs.params_buf.narrow(0, 0, n_params).copy_(params_cpu);
                     ctx->adam_dev_bufs.grads_buf.narrow(0, 0, n_params).copy_(grads_cpu);
@@ -10272,6 +10293,10 @@ static double qwen36_train_multi_lora_impl(
                     ctx->adam_dev_bufs.sizes_buf.narrow(0, 0, n_params).copy_(sizes_cpu);
                     ctx->adam_dev_bufs.lr_buf.narrow(0, 0, n_params).copy_(lr_cpu);
                     ctx->adam_dev_bufs.eps_buf.narrow(0, 0, n_params).copy_(eps_cpu);
+                    ctx->adam_dev_bufs.beta1_buf.narrow(
+                        0, 0, n_params).copy_(beta1_cpu);
+                    ctx->adam_dev_bufs.beta2_buf.narrow(
+                        0, 0, n_params).copy_(beta2_cpu);
                     auto stream = c10::cuda::getCurrentCUDAStream().stream();
                     ++ctx->dynamic_adam_launch_count;
                     launch_fused_adam_multi_out_of_place(
@@ -10285,9 +10310,9 @@ static double qwen36_train_multi_lora_impl(
                         (int*)ctx->adam_dev_bufs.sizes_buf.data_ptr(),
                         (float*)ctx->adam_dev_bufs.lr_buf.data_ptr(),
                         (float*)ctx->adam_dev_bufs.eps_buf.data_ptr(),
-                        n_params, (float)ctx->beta1, (float)ctx->beta2,
-                        (float)(1.0 - ctx->beta1),
-                        (float)(1.0 - ctx->beta2),
+                        (float*)ctx->adam_dev_bufs.beta1_buf.data_ptr(),
+                        (float*)ctx->adam_dev_bufs.beta2_buf.data_ptr(),
+                        n_params,
                         (void*)stream);
                     auto launch_error = cudaGetLastError();
                     TORCH_CHECK(launch_error == cudaSuccess,
@@ -11824,7 +11849,8 @@ static int64_t qwen36_add_lora_impl(
     int64_t rank, double alpha,
     const int64_t* target_layers, int64_t num_target_layers,
     const char* target_modules_str,
-    double optimizer_lr
+    double optimizer_lr, double optimizer_beta1,
+    double optimizer_beta2, double optimizer_eps
 ) {
     try {
         auto* ctx = reinterpret_cast<TrainingContext*>(ctx_ptr);
@@ -11850,6 +11876,21 @@ static int64_t qwen36_add_lora_impl(
             TORCH_CHECK(std::isfinite(optimizer_lr) && optimizer_lr >= 0.0,
                 "dynamic LoRA optimizer learning rate must be finite and "
                 "non-negative");
+            TORCH_CHECK(std::isfinite(optimizer_beta1) &&
+                    optimizer_beta1 >= 0.0 && optimizer_beta1 < 1.0,
+                "dynamic LoRA optimizer beta1 must be finite and in [0, 1)");
+            TORCH_CHECK(std::isfinite(optimizer_beta2) &&
+                    optimizer_beta2 >= 0.0 && optimizer_beta2 < 1.0,
+                "dynamic LoRA optimizer beta2 must be finite and in [0, 1)");
+            const float beta1_f = static_cast<float>(optimizer_beta1);
+            const float beta2_f = static_cast<float>(optimizer_beta2);
+            TORCH_CHECK(std::isfinite(beta1_f) && beta1_f >= 0.0f &&
+                    beta1_f < 1.0f && std::isfinite(beta2_f) &&
+                    beta2_f >= 0.0f && beta2_f < 1.0f,
+                "dynamic LoRA optimizer betas must be representable as finite "
+                "FP32 values below 1");
+            TORCH_CHECK(std::isfinite(optimizer_eps) && optimizer_eps >= 0.0,
+                "dynamic LoRA optimizer epsilon must be finite and non-negative");
             TORCH_CHECK(num_target_layers >= 0 &&
                     (num_target_layers == 0 || target_layers),
                 "dynamic LoRA target layer list is invalid");
@@ -11859,6 +11900,12 @@ static int64_t qwen36_add_lora_impl(
             adapter.id = ctx->next_adapter_id + 1;
             adapter.rank = rank;
             adapter.optimizer_lr = optimizer_lr;
+            // The fused state update consumes FP32 scalar buffers. Store the
+            // representable values so bias correction and recurrence use the
+            // same beta semantics, including near-one configurations.
+            adapter.optimizer_beta1 = beta1_f;
+            adapter.optimizer_beta2 = beta2_f;
+            adapter.optimizer_eps = optimizer_eps;
             adapter.alpha = alpha;
             adapter.all_target_layers = num_target_layers == 0;
             for (int64_t i = 0; i < num_target_layers; i++) {
@@ -12085,8 +12132,10 @@ static int64_t qwen36_add_lora_impl(
         ctx->lora_cache_valid = false;
         ctx->lora_batch_valid = false;
         fprintf(stderr,
-            "[q36_lora] added adapter %ld: rank=%ld alpha=%.1f lr=%.8g\n",
-            (long)id, (long)rank, alpha, optimizer_lr);
+            "[q36_lora] added adapter %ld: rank=%ld alpha=%.1f "
+            "lr=%.8g beta1=%.8g beta2=%.8g eps=%.8g\n",
+            (long)id, (long)rank, alpha, optimizer_lr,
+            optimizer_beta1, optimizer_beta2, optimizer_eps);
         return id;
     } catch (const std::exception& e) {
         fprintf(stderr, "[q36] add_lora FAILED: %s\n", e.what());
@@ -12116,7 +12165,11 @@ int64_t qwen36_add_lora(
     auto* ctx = reinterpret_cast<TrainingContext*>(ctx_ptr);
     return qwen36_add_lora_impl(
         ctx_ptr, rank, alpha, target_layers, num_target_layers,
-        target_modules_str, ctx ? ctx->lr : 0.0);
+        target_modules_str,
+        ctx ? ctx->lr : 0.0,
+        ctx ? ctx->beta1 : 0.0,
+        ctx ? ctx->beta2 : 0.0,
+        ctx ? ctx->eps : 0.0);
 }
 
 __attribute__((visibility("default")))
@@ -12150,7 +12203,29 @@ int64_t qwen36_add_lora_with_optimizer(
     ScopedBoolOverride guard(ctx->allow_heterogeneous_registration, true);
     return qwen36_add_lora_impl(
         ctx_ptr, rank, alpha, target_layers, num_target_layers,
-        target_modules_str, optimizer_lr);
+        target_modules_str, optimizer_lr,
+        ctx->beta1, ctx->beta2, ctx->eps);
+}
+
+// Additive ABI28 extension for complete per-tenant Adam isolation. The
+// transactional update still executes all selected tenants in one fused
+// kernel launch through per-tensor optimizer scalar buffers.
+__attribute__((visibility("default")))
+int64_t qwen36_add_lora_with_optimizer_v2(
+    void* ctx_ptr,
+    int64_t rank, double alpha,
+    const int64_t* target_layers, int64_t num_target_layers,
+    const char* target_modules_str,
+    double optimizer_lr, double optimizer_beta1,
+    double optimizer_beta2, double optimizer_eps
+) {
+    auto* ctx = reinterpret_cast<TrainingContext*>(ctx_ptr);
+    if (!ctx) return -1;
+    ScopedBoolOverride guard(ctx->allow_heterogeneous_registration, true);
+    return qwen36_add_lora_impl(
+        ctx_ptr, rank, alpha, target_layers, num_target_layers,
+        target_modules_str, optimizer_lr, optimizer_beta1,
+        optimizer_beta2, optimizer_eps);
 }
 
 __attribute__((visibility("default")))
@@ -12185,7 +12260,27 @@ int64_t qwen36_add_lora_for_restore_with_optimizer(
     ScopedBoolOverride heterogeneous_guard(ctx->allow_heterogeneous_registration, true);
     return qwen36_add_lora_impl(
         ctx_ptr, rank, alpha, target_layers, num_target_layers,
-        target_modules_str, optimizer_lr);
+        target_modules_str, optimizer_lr,
+        ctx->beta1, ctx->beta2, ctx->eps);
+}
+
+__attribute__((visibility("default")))
+int64_t qwen36_add_lora_for_restore_with_optimizer_v2(
+    void* ctx_ptr,
+    int64_t rank, double alpha,
+    const int64_t* target_layers, int64_t num_target_layers,
+    const char* target_modules_str,
+    double optimizer_lr, double optimizer_beta1,
+    double optimizer_beta2, double optimizer_eps
+) {
+    auto* ctx = reinterpret_cast<TrainingContext*>(ctx_ptr);
+    if (!ctx) return -1;
+    ScopedBoolOverride restore_guard(ctx->restore_without_parameter_sync, true);
+    ScopedBoolOverride heterogeneous_guard(ctx->allow_heterogeneous_registration, true);
+    return qwen36_add_lora_impl(
+        ctx_ptr, rank, alpha, target_layers, num_target_layers,
+        target_modules_str, optimizer_lr, optimizer_beta1,
+        optimizer_beta2, optimizer_eps);
 }
 
 // Restore a dynamic adapter's externally visible ID during checkpoint load.

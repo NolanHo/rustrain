@@ -1,6 +1,6 @@
 //! Qwen checkpoint save/load: LoRA parameters, Adam state, and parallel metadata.
 
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 use rustrain_parallel::topology::{ParallelAxis, ParallelTopology, RankCoordinates};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -11,7 +11,7 @@ use tch::Tensor;
 
 use crate::config::Qwen36RuntimeConfig;
 use crate::lora::{
-    Qwen36AdapterArtifact, Qwen36LoraConfig, Qwen36LoraTargetModule, native_lora_slots,
+    native_lora_slots, Qwen36AdapterArtifact, Qwen36LoraConfig, Qwen36LoraTargetModule,
 };
 
 const TP_CHECKPOINT_FORMAT: &str = "rustrain-checkpoint-v5-parallel";
@@ -450,8 +450,39 @@ struct StageUnionDynamicAdapterIdentity<'a> {
     alpha_bits: u64,
     optimizer_step: u64,
     optimizer_lr_bits: Option<u64>,
+    optimizer_beta1_bits: Option<u64>,
+    optimizer_beta2_bits: Option<u64>,
+    optimizer_eps_bits: Option<u64>,
     target_layers: &'a [usize],
     target_modules: &'a [String],
+}
+
+/// Stage-union generation identity used before tenant-local beta/epsilon
+/// metadata was added. Keep this wire shape for old rank receipts whose
+/// manifests omit all three optional fields.
+#[derive(Serialize)]
+struct LegacyStageUnionDynamicAdapterIdentity<'a> {
+    id: i64,
+    rank: i64,
+    alpha_bits: u64,
+    optimizer_step: u64,
+    optimizer_lr_bits: Option<u64>,
+    target_layers: &'a [usize],
+    target_modules: &'a [String],
+}
+
+#[derive(Serialize)]
+struct LegacyStageUnionGenerationIdentity<'a> {
+    checkpoint_generation: &'a Option<String>,
+    step: u64,
+    fixed_optimizer_step: u64,
+    model_path: &'a str,
+    lora_rank: i64,
+    lora_alpha_bits: u64,
+    files: &'a [String],
+    fixed_target_layers: &'a [usize],
+    fixed_target_modules: &'a [String],
+    dynamic_adapters: Vec<LegacyStageUnionDynamicAdapterIdentity<'a>>,
 }
 
 #[derive(Serialize)]
@@ -576,6 +607,15 @@ pub struct DynamicAdapterManifest {
     /// and restore with the training context learning rate.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub optimizer_lr: Option<f64>,
+    /// Tenant-local Adam beta1. Older manifests inherit the session value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub optimizer_beta1: Option<f64>,
+    /// Tenant-local Adam beta2. Older manifests inherit the session value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub optimizer_beta2: Option<f64>,
+    /// Tenant-local Adam epsilon. Older manifests inherit the session value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub optimizer_eps: Option<f64>,
     pub target_layers: Vec<usize>,
     pub target_modules: Vec<String>,
     #[serde(default)]
@@ -1489,6 +1529,40 @@ fn stable_bytes_digest(contents: &[u8]) -> String {
 
 fn checkpoint_generation_digest(manifest: &CheckpointManifest) -> Result<String> {
     if manifest.format == STAGE_UNION_CHECKPOINT_FORMAT {
+        let use_legacy_identity = manifest.dynamic_adapters.iter().all(|adapter| {
+            adapter.optimizer_beta1.is_none()
+                && adapter.optimizer_beta2.is_none()
+                && adapter.optimizer_eps.is_none()
+        });
+        if use_legacy_identity {
+            let dynamic_adapters = manifest
+                .dynamic_adapters
+                .iter()
+                .map(|adapter| LegacyStageUnionDynamicAdapterIdentity {
+                    id: adapter.id,
+                    rank: adapter.rank,
+                    alpha_bits: adapter.alpha.to_bits(),
+                    optimizer_step: adapter.optimizer_step,
+                    optimizer_lr_bits: adapter.optimizer_lr.map(f64::to_bits),
+                    target_layers: &adapter.target_layers,
+                    target_modules: &adapter.target_modules,
+                })
+                .collect();
+            return Ok(stable_bytes_digest(&serde_json::to_vec(
+                &LegacyStageUnionGenerationIdentity {
+                    checkpoint_generation: &manifest.checkpoint_generation,
+                    step: manifest.step,
+                    fixed_optimizer_step: manifest.effective_fixed_optimizer_step(),
+                    model_path: &manifest.model_path,
+                    lora_rank: manifest.lora_rank,
+                    lora_alpha_bits: manifest.lora_alpha.to_bits(),
+                    files: &manifest.files,
+                    fixed_target_layers: &manifest.fixed_target_layers,
+                    fixed_target_modules: &manifest.fixed_target_modules,
+                    dynamic_adapters,
+                },
+            )?));
+        }
         let dynamic_adapters = manifest
             .dynamic_adapters
             .iter()
@@ -1498,6 +1572,9 @@ fn checkpoint_generation_digest(manifest: &CheckpointManifest) -> Result<String>
                 alpha_bits: adapter.alpha.to_bits(),
                 optimizer_step: adapter.optimizer_step,
                 optimizer_lr_bits: adapter.optimizer_lr.map(f64::to_bits),
+                optimizer_beta1_bits: adapter.optimizer_beta1.map(f64::to_bits),
+                optimizer_beta2_bits: adapter.optimizer_beta2.map(f64::to_bits),
+                optimizer_eps_bits: adapter.optimizer_eps.map(f64::to_bits),
                 target_layers: &adapter.target_layers,
                 target_modules: &adapter.target_modules,
             })
@@ -2684,6 +2761,27 @@ fn validate_tensor_counts(
                 adapter.manifest.id
             );
         }
+        for (name, value) in [
+            ("beta1", adapter.manifest.optimizer_beta1),
+            ("beta2", adapter.manifest.optimizer_beta2),
+        ] {
+            if value.is_some_and(|value| !value.is_finite() || !(0.0..1.0).contains(&value)) {
+                bail!(
+                    "dynamic adapter {} optimizer {name} must be finite and in [0, 1)",
+                    adapter.manifest.id
+                );
+            }
+        }
+        if adapter
+            .manifest
+            .optimizer_eps
+            .is_some_and(|value| !value.is_finite() || value < 0.0)
+        {
+            bail!(
+                "dynamic adapter {} optimizer epsilon must be finite and non-negative",
+                adapter.manifest.id
+            );
+        }
         if adapter.lora_a.len() != adapter.lora_b.len()
             || adapter.adam_m.len() != adapter.adam_v.len()
             || adapter.manifest.parameter_count != adapter.lora_a.len()
@@ -3347,11 +3445,9 @@ mod tests {
                 generation,
             )
             .unwrap_err();
-            assert!(
-                error
-                    .to_string()
-                    .contains("distributed checkpoint generation must be non-empty")
-            );
+            assert!(error
+                .to_string()
+                .contains("distributed checkpoint generation must be non-empty"));
         }
 
         let too_long = "x".repeat(257);
@@ -3529,12 +3625,10 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.to_string().contains("attempt IDs cannot be reused"));
-        assert!(
-            !root
-                .path()
-                .join("adapter.rustrain-shards-reused/errors")
-                .exists()
-        );
+        assert!(!root
+            .path()
+            .join("adapter.rustrain-shards-reused/errors")
+            .exists());
     }
 
     #[test]
@@ -3635,6 +3729,9 @@ mod tests {
                 alpha: 6.0,
                 optimizer_step: 19,
                 optimizer_lr: Some(2.5e-4),
+                optimizer_beta1: Some(0.8),
+                optimizer_beta2: Some(0.95),
+                optimizer_eps: Some(1e-6),
                 target_layers: vec![1, 3],
                 target_modules: vec!["q_proj".into(), "down_proj".into()],
                 shard_layouts: Vec::new(),
@@ -3679,6 +3776,9 @@ mod tests {
         assert_eq!(loaded_dynamic.manifest.rank, 3);
         assert_eq!(loaded_dynamic.manifest.optimizer_step, 19);
         assert_eq!(loaded_dynamic.manifest.optimizer_lr, Some(2.5e-4));
+        assert_eq!(loaded_dynamic.manifest.optimizer_beta1, Some(0.8));
+        assert_eq!(loaded_dynamic.manifest.optimizer_beta2, Some(0.95));
+        assert_eq!(loaded_dynamic.manifest.optimizer_eps, Some(1e-6));
         assert_eq!(loaded_dynamic.manifest.target_layers, vec![1, 3]);
         assert_eq!(loaded_dynamic.lora_a.len(), 2);
         assert_eq!(loaded_dynamic.adam_m.len(), 4);
@@ -3722,6 +3822,9 @@ mod tests {
                 alpha: 8.0,
                 optimizer_step: 3,
                 optimizer_lr: None,
+                optimizer_beta1: None,
+                optimizer_beta2: None,
+                optimizer_eps: None,
                 target_layers: vec![0],
                 target_modules: vec!["q_proj".to_string()],
                 shard_layouts: Vec::new(),
@@ -3735,11 +3838,9 @@ mod tests {
             adam_v: Vec::new(),
         };
         let error = validate_optimizer_clock_state(&manifest, &[], &[], &[dynamic]).unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("dynamic adapter 7 optimizer step 3")
-        );
+        assert!(error
+            .to_string()
+            .contains("dynamic adapter 7 optimizer step 3"));
     }
 
     fn tp_topology(global_rank: usize, tp_size: usize) -> ParallelCheckpointManifest {
@@ -3822,6 +3923,59 @@ mod tests {
     }
 
     #[test]
+    fn stage_union_legacy_dynamic_digest_keeps_receipt_compatibility() {
+        let mut manifest = resume_validation_manifest(STAGE_UNION_CHECKPOINT_FORMAT);
+        manifest.checkpoint_generation = Some("legacy-stage-union".to_string());
+        manifest.fixed_target_layers = vec![0];
+        manifest.fixed_target_modules = vec!["q_proj".to_string()];
+        manifest.dynamic_adapters = vec![DynamicAdapterManifest {
+            id: 7,
+            rank: 4,
+            alpha: 8.0,
+            optimizer_step: 3,
+            optimizer_lr: Some(5e-4),
+            optimizer_beta1: None,
+            optimizer_beta2: None,
+            optimizer_eps: None,
+            target_layers: vec![0],
+            target_modules: vec!["q_proj".to_string()],
+            shard_layouts: Vec::new(),
+            slot_identities: Vec::new(),
+            parameter_count: 0,
+            optimizer_count: 0,
+        }];
+        let expected_dynamic = manifest
+            .dynamic_adapters
+            .iter()
+            .map(|adapter| LegacyStageUnionDynamicAdapterIdentity {
+                id: adapter.id,
+                rank: adapter.rank,
+                alpha_bits: adapter.alpha.to_bits(),
+                optimizer_step: adapter.optimizer_step,
+                optimizer_lr_bits: adapter.optimizer_lr.map(f64::to_bits),
+                target_layers: &adapter.target_layers,
+                target_modules: &adapter.target_modules,
+            })
+            .collect();
+        let expected = stable_bytes_digest(
+            &serde_json::to_vec(&LegacyStageUnionGenerationIdentity {
+                checkpoint_generation: &manifest.checkpoint_generation,
+                step: manifest.step,
+                fixed_optimizer_step: manifest.effective_fixed_optimizer_step(),
+                model_path: &manifest.model_path,
+                lora_rank: manifest.lora_rank,
+                lora_alpha_bits: manifest.lora_alpha.to_bits(),
+                files: &manifest.files,
+                fixed_target_layers: &manifest.fixed_target_layers,
+                fixed_target_modules: &manifest.fixed_target_modules,
+                dynamic_adapters: expected_dynamic,
+            })
+            .unwrap(),
+        );
+        assert_eq!(checkpoint_generation_digest(&manifest).unwrap(), expected);
+    }
+
+    #[test]
     fn stage_union_save_rejects_stage_topology_mismatch_before_writing() {
         let root = tempfile::tempdir().unwrap();
         let topology = pp_topology(0, 2);
@@ -3888,6 +4042,9 @@ mod tests {
                     alpha: 8.0,
                     optimizer_step: 29,
                     optimizer_lr: Some(1e-3),
+                    optimizer_beta1: Some(0.85),
+                    optimizer_beta2: Some(0.97),
+                    optimizer_eps: Some(1e-7),
                     target_layers: vec![0],
                     target_modules: vec!["experts_gate_up_proj".to_string()],
                     shard_layouts: vec![LoraTpShardLayout::RoutedExpertFusedGateUp],
@@ -4009,13 +4166,11 @@ mod tests {
                 loaded.dynamic_adapters[0].adam_v[1].double_value(&[0, 0, 0]),
                 value + 16.0
             );
-            assert!(
-                loaded
-                    .manifest
-                    .tensor_shards
-                    .iter()
-                    .all(|shard| { shard.replicated_axes.contains(&ParallelAxis::Data) })
-            );
+            assert!(loaded
+                .manifest
+                .tensor_shards
+                .iter()
+                .all(|shard| { shard.replicated_axes.contains(&ParallelAxis::Data) }));
         }
     }
 
@@ -4075,11 +4230,9 @@ mod tests {
         let error = load_checkpoint_for_topology(dir.path(), &tp_ep_dp_topology(0))
             .err()
             .expect("divergent DP adapter replica must fail preflight");
-        assert!(
-            error
-                .to_string()
-                .contains("data-parallel replica content digest differs")
-        );
+        assert!(error
+            .to_string()
+            .contains("data-parallel replica content digest differs"));
         assert!(error.to_string().contains("adapter.safetensors"));
     }
 
@@ -4096,11 +4249,9 @@ mod tests {
         let error = load_checkpoint_for_topology(dir.path(), &tp_ep_dp_topology(0))
             .err()
             .expect("divergent DP optimizer replica must fail preflight");
-        assert!(
-            error
-                .to_string()
-                .contains("data-parallel replica content digest differs")
-        );
+        assert!(error
+            .to_string()
+            .contains("data-parallel replica content digest differs"));
         assert!(error.to_string().contains("optimizer.safetensors"));
     }
 
@@ -4116,11 +4267,9 @@ mod tests {
         let error = load_checkpoint_for_topology(dir.path(), &tp_ep_dp_topology(corrupt_rank))
             .err()
             .expect("stale manifest must not accept newly overwritten tensor content");
-        assert!(
-            error
-                .to_string()
-                .contains("checkpoint content digest differs from manifest")
-        );
+        assert!(error
+            .to_string()
+            .contains("checkpoint content digest differs from manifest"));
     }
 
     #[test]
@@ -4147,11 +4296,9 @@ mod tests {
         let error = load_checkpoint_for_topology(mixed.path(), &tp_ep_dp_topology(0))
             .err()
             .expect("mixed checkpoint generation must fail preflight");
-        assert!(
-            error
-                .to_string()
-                .contains("different checkpoint generation")
-        );
+        assert!(error
+            .to_string()
+            .contains("different checkpoint generation"));
     }
 
     fn tp_state(value: f64) -> (Vec<Tensor>, Vec<Tensor>, Vec<Tensor>, Vec<Tensor>) {
@@ -4444,6 +4591,9 @@ mod tests {
                 alpha: 12.0,
                 optimizer_step: 4,
                 optimizer_lr: Some(5e-4),
+                optimizer_beta1: None,
+                optimizer_beta2: None,
+                optimizer_eps: None,
                 target_layers: vec![1],
                 target_modules: vec!["q_proj".into()],
                 shard_layouts: Vec::new(),
@@ -4898,13 +5048,11 @@ mod tests {
         let loaded = load_checkpoint_for_topology(dir.path(), &topology).unwrap();
         assert_eq!(loaded.manifest.format, LEGACY_TP_CHECKPOINT_FORMAT);
         assert!(loaded.manifest.fixed_shard_layouts.is_empty());
-        assert!(
-            loaded
-                .manifest
-                .tensor_shards
-                .iter()
-                .all(|shard| shard.layout == LoraTpShardLayout::LatentRank && !shard.replicated)
-        );
+        assert!(loaded
+            .manifest
+            .tensor_shards
+            .iter()
+            .all(|shard| shard.layout == LoraTpShardLayout::LatentRank && !shard.replicated));
     }
 
     #[test]
@@ -4962,13 +5110,11 @@ mod tests {
             loaded.manifest.format,
             PROJECTION_AWARE_TP_CHECKPOINT_FORMAT
         );
-        assert!(
-            loaded
-                .manifest
-                .tensor_shards
-                .iter()
-                .all(|shard| shard.placements.is_empty() && shard.replicated_axes.is_empty())
-        );
+        assert!(loaded
+            .manifest
+            .tensor_shards
+            .iter()
+            .all(|shard| shard.placements.is_empty() && shard.replicated_axes.is_empty()));
     }
 
     fn resume_validation_manifest(format: &str) -> CheckpointManifest {
@@ -5019,11 +5165,9 @@ mod tests {
         let fixed_error =
             validate_fixed_tp_resume(&manifest, &[LoraTpShardLayout::ColumnParallel], &[])
                 .unwrap_err();
-        assert!(
-            fixed_error
-                .to_string()
-                .contains("fixed projection-aware attention LoRA")
-        );
+        assert!(fixed_error
+            .to_string()
+            .contains("fixed projection-aware attention LoRA"));
         let dynamic_error =
             validate_dynamic_tp_resume(&manifest, 17, &[], &[LoraTpShardLayout::RowParallel], &[])
                 .unwrap_err();

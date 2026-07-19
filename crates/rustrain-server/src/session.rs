@@ -9,6 +9,7 @@ use tokio::sync::Mutex;
 use crate::checkpoint;
 use crate::metrics::{FileMetricsSink, MetricsSink, StepMetric};
 use rustrain_parallel::topology::ParallelTopology;
+use rustrain_qwen3_6::kernel::DynamicAdamConfig;
 use rustrain_qwen3_6::lora::{Qwen36AdapterArtifact, Qwen36LoraConfig, Qwen36LoraTargetModule};
 use rustrain_qwen3_6::pipeline::{stage_lora_slots, PipelineStageLayout};
 
@@ -170,6 +171,26 @@ fn validate_dynamic_adapter_manifests<'a>(
         {
             bail!(
                 "dynamic adapter {} optimizer learning rate must be finite and non-negative",
+                manifest.id
+            );
+        }
+        for (name, value) in [
+            ("beta1", manifest.optimizer_beta1),
+            ("beta2", manifest.optimizer_beta2),
+        ] {
+            if value.is_some_and(|value| !value.is_finite() || !(0.0..1.0).contains(&value)) {
+                bail!(
+                    "dynamic adapter {} optimizer {name} must be finite and in [0, 1)",
+                    manifest.id
+                );
+            }
+        }
+        if manifest
+            .optimizer_eps
+            .is_some_and(|value| !value.is_finite() || value < 0.0)
+        {
+            bail!(
+                "dynamic adapter {} optimizer epsilon must be finite and non-negative",
                 manifest.id
             );
         }
@@ -363,7 +384,7 @@ struct PendingCheckpointLoad {
     source_path: String,
     ctx: rustrain_qwen3_6::kernel::CppTrainingContext,
     dynamic_lora_configs: std::collections::BTreeMap<i64, Qwen36LoraConfig>,
-    dynamic_lora_optimizer_lrs: std::collections::BTreeMap<i64, f64>,
+    dynamic_lora_optimizer_configs: std::collections::BTreeMap<i64, DynamicAdamConfig>,
     state: SessionState,
     step: u64,
     last_loss: f64,
@@ -377,6 +398,10 @@ pub struct AddLoRARequest {
     pub target_modules: String, // comma-separated, empty = all
     /// `None` inherits the training context learning rate.
     pub optimizer_lr: Option<f64>,
+    /// Missing Adam scalars inherit the training context defaults.
+    pub optimizer_beta1: Option<f64>,
+    pub optimizer_beta2: Option<f64>,
+    pub optimizer_eps: Option<f64>,
 }
 
 /// Qwen3.6 training session — wraps CppTrainingContext.
@@ -395,8 +420,11 @@ pub struct Qwen36Session {
     lora_target_layers: Vec<usize>,
     lora_target_modules: Vec<Qwen36LoraTargetModule>,
     dynamic_lora_configs: std::collections::BTreeMap<i64, Qwen36LoraConfig>,
-    dynamic_lora_optimizer_lrs: std::collections::BTreeMap<i64, f64>,
+    dynamic_lora_optimizer_configs: std::collections::BTreeMap<i64, DynamicAdamConfig>,
     lr: f64,
+    beta1: f64,
+    beta2: f64,
+    eps: f64,
     metrics: Option<Arc<FileMetricsSink>>,
     last_loss: f64,
     step: u64,
@@ -511,8 +539,11 @@ impl Qwen36Session {
             lora_target_layers: Vec::new(),
             lora_target_modules: Vec::new(),
             dynamic_lora_configs: std::collections::BTreeMap::new(),
-            dynamic_lora_optimizer_lrs: std::collections::BTreeMap::new(),
+            dynamic_lora_optimizer_configs: std::collections::BTreeMap::new(),
             lr: 1e-4,
+            beta1: 0.9,
+            beta2: 0.999,
+            eps: 1e-8,
             metrics: Some(Arc::new(FileMetricsSink::new(metrics_path))),
             last_loss: 0.0,
             step: 0,
@@ -522,13 +553,25 @@ impl Qwen36Session {
         }
     }
 
+    fn default_dynamic_adam_config(&self) -> DynamicAdamConfig {
+        DynamicAdamConfig {
+            lr: self.lr,
+            beta1: self.beta1,
+            beta2: self.beta2,
+            eps: self.eps,
+        }
+    }
+
     /// Get the device this session is bound to.
     pub fn device(&self) -> Device {
         self.device
     }
 
     pub fn native_context_is_healthy(&self) -> bool {
-        self.ctx.as_ref().map(|ctx| ctx.is_healthy()).unwrap_or(true)
+        self.ctx
+            .as_ref()
+            .map(|ctx| ctx.is_healthy())
+            .unwrap_or(true)
     }
 
     pub fn train_step_host_i64(
@@ -758,8 +801,11 @@ impl Qwen36Session {
             lora_target_layers: self.lora_target_layers.clone(),
             lora_target_modules: self.lora_target_modules.clone(),
             dynamic_lora_configs: std::collections::BTreeMap::new(),
-            dynamic_lora_optimizer_lrs: std::collections::BTreeMap::new(),
+            dynamic_lora_optimizer_configs: std::collections::BTreeMap::new(),
             lr: self.lr,
+            beta1: self.beta1,
+            beta2: self.beta2,
+            eps: self.eps,
             metrics: None,
             last_loss: self.last_loss,
             step: self.step,
@@ -777,7 +823,9 @@ impl Qwen36Session {
                 .take()
                 .context("checkpoint candidate lost its native context")?,
             dynamic_lora_configs: std::mem::take(&mut candidate.dynamic_lora_configs),
-            dynamic_lora_optimizer_lrs: std::mem::take(&mut candidate.dynamic_lora_optimizer_lrs),
+            dynamic_lora_optimizer_configs: std::mem::take(
+                &mut candidate.dynamic_lora_optimizer_configs,
+            ),
             state: candidate.state.clone(),
             step,
             last_loss: loss,
@@ -802,7 +850,7 @@ impl Qwen36Session {
             .context("validated checkpoint transaction disappeared")?;
         self.ctx = Some(pending.ctx);
         self.dynamic_lora_configs = pending.dynamic_lora_configs;
-        self.dynamic_lora_optimizer_lrs = pending.dynamic_lora_optimizer_lrs;
+        self.dynamic_lora_optimizer_configs = pending.dynamic_lora_optimizer_configs;
         self.state = pending.state;
         self.step = pending.step;
         self.last_loss = pending.last_loss;
@@ -1317,6 +1365,9 @@ impl TrainingSession for Qwen36Session {
         self.lora_target_layers = all_layers;
         self.lora_target_modules = target_modules;
         self.lr = req.lr;
+        self.beta1 = req.beta1;
+        self.beta2 = req.beta2;
+        self.eps = req.eps;
         self.state = SessionState::Ready {
             model_path: model_path.clone(),
         };
@@ -1515,6 +1566,7 @@ impl TrainingSession for Qwen36Session {
             });
         }
 
+        let supports_complete_dynamic_adam = ctx.supports_complete_dynamic_adam();
         let mut dynamic_adapters = Vec::new();
         if !self.dynamic_lora_configs.is_empty() {
             for (&adapter_id, lora_config) in &self.dynamic_lora_configs {
@@ -1624,18 +1676,24 @@ impl TrainingSession for Qwen36Session {
                 }
                 let optimizer_step = u64::try_from(ctx.get_adapter_step_count(adapter_id)?)
                     .context("native dynamic adapter optimizer step is negative")?;
-                let optimizer_lr = self
-                    .dynamic_lora_optimizer_lrs
+                let optimizer = self
+                    .dynamic_lora_optimizer_configs
                     .get(&adapter_id)
                     .copied()
-                    .unwrap_or(self.lr);
+                    .unwrap_or_else(|| self.default_dynamic_adam_config());
                 dynamic_adapters.push(checkpoint::DynamicAdapterCheckpoint {
                     manifest: checkpoint::DynamicAdapterManifest {
                         id: adapter_id,
                         rank: lora_config.rank,
                         alpha: lora_config.alpha,
                         optimizer_step,
-                        optimizer_lr: Some(optimizer_lr),
+                        optimizer_lr: Some(optimizer.lr),
+                        optimizer_beta1: supports_complete_dynamic_adam
+                            .then_some(optimizer.beta1),
+                        optimizer_beta2: supports_complete_dynamic_adam
+                            .then_some(optimizer.beta2),
+                        optimizer_eps: supports_complete_dynamic_adam
+                            .then_some(optimizer.eps),
                         target_layers: lora_config.target_layers.clone(),
                         target_modules: lora_config
                             .target_modules
@@ -1966,22 +2024,40 @@ impl TrainingSession for Qwen36Session {
                     .map(Qwen36LoraTargetModule::cpp_name)
                     .collect::<Vec<_>>()
                     .join(",");
-                let optimizer_lr = dynamic.manifest.optimizer_lr.unwrap_or(self.lr);
-                let allocated_id = match dynamic.manifest.optimizer_lr {
-                    Some(saved_lr) if saved_lr.to_bits() != self.lr.to_bits() => ctx
-                        .add_lora_for_restore_with_optimizer_lr(
-                            lora_config.rank,
-                            lora_config.alpha,
-                            &layer_ids,
-                            &module_csv,
-                            saved_lr,
-                        )?,
-                    _ => ctx.add_lora_for_restore(
+                let optimizer = DynamicAdamConfig {
+                    lr: dynamic.manifest.optimizer_lr.unwrap_or(self.lr),
+                    beta1: dynamic.manifest.optimizer_beta1.unwrap_or(self.beta1),
+                    beta2: dynamic.manifest.optimizer_beta2.unwrap_or(self.beta2),
+                    eps: dynamic.manifest.optimizer_eps.unwrap_or(self.eps),
+                };
+                let has_complete_override = dynamic.manifest.optimizer_beta1.is_some()
+                    || dynamic.manifest.optimizer_beta2.is_some()
+                    || dynamic.manifest.optimizer_eps.is_some();
+                let allocated_id = if has_complete_override {
+                    ctx.add_lora_for_restore_with_optimizer_config(
                         lora_config.rank,
                         lora_config.alpha,
                         &layer_ids,
                         &module_csv,
-                    )?,
+                        optimizer,
+                    )?
+                } else if dynamic.manifest.optimizer_lr.is_some()
+                    && optimizer.lr.to_bits() != self.lr.to_bits()
+                {
+                    ctx.add_lora_for_restore_with_optimizer_lr(
+                        lora_config.rank,
+                        lora_config.alpha,
+                        &layer_ids,
+                        &module_csv,
+                        optimizer.lr,
+                    )?
+                } else {
+                    ctx.add_lora_for_restore(
+                        lora_config.rank,
+                        lora_config.alpha,
+                        &layer_ids,
+                        &module_csv,
+                    )?
                 };
                 if allocated_id != dynamic.manifest.id {
                     if let Err(error) = ctx.set_adapter_id(allocated_id, dynamic.manifest.id) {
@@ -2075,8 +2151,8 @@ impl TrainingSession for Qwen36Session {
                     return Err(error);
                 }
                 self.dynamic_lora_configs.insert(adapter_id, lora_config);
-                self.dynamic_lora_optimizer_lrs
-                    .insert(adapter_id, optimizer_lr);
+                self.dynamic_lora_optimizer_configs
+                    .insert(adapter_id, optimizer);
             }
         }
         // Import Adam optimizer state into C++ context
@@ -2310,7 +2386,8 @@ impl TrainingSession for Qwen36Session {
             return Err(error);
         }
         self.dynamic_lora_configs.insert(adapter_id, lora_config);
-        self.dynamic_lora_optimizer_lrs.insert(adapter_id, self.lr);
+        self.dynamic_lora_optimizer_configs
+            .insert(adapter_id, self.default_dynamic_adam_config());
         tracing::info!(adapter_id, path, "LoRA adapter imported");
         Ok(adapter_id)
     }
@@ -2412,19 +2489,37 @@ impl TrainingSession for Qwen36Session {
             .map(Qwen36LoraTargetModule::cpp_name)
             .collect::<Vec<_>>();
         let module_csv = native_module_names.join(",");
-        let optimizer_lr = req.optimizer_lr.unwrap_or(self.lr);
-        let id = match req.optimizer_lr {
-            Some(optimizer_lr) => ctx.add_lora_with_optimizer_lr(
+        let optimizer = DynamicAdamConfig {
+            lr: req.optimizer_lr.unwrap_or(self.lr),
+            beta1: req.optimizer_beta1.unwrap_or(self.beta1),
+            beta2: req.optimizer_beta2.unwrap_or(self.beta2),
+            eps: req.optimizer_eps.unwrap_or(self.eps),
+        };
+        let complete_override = req.optimizer_beta1.is_some()
+            || req.optimizer_beta2.is_some()
+            || req.optimizer_eps.is_some();
+        let id = if complete_override {
+            ctx.add_lora_with_optimizer_config(
                 req.rank,
                 req.alpha,
                 &req.target_layers,
                 &module_csv,
-                optimizer_lr,
-            )?,
-            None => ctx.add_lora(req.rank, req.alpha, &req.target_layers, &module_csv)?,
+                optimizer,
+            )?
+        } else {
+            match req.optimizer_lr {
+                Some(optimizer_lr) => ctx.add_lora_with_optimizer_lr(
+                    req.rank,
+                    req.alpha,
+                    &req.target_layers,
+                    &module_csv,
+                    optimizer_lr,
+                )?,
+                None => ctx.add_lora(req.rank, req.alpha, &req.target_layers, &module_csv)?,
+            }
         };
         self.dynamic_lora_configs.insert(id, config);
-        self.dynamic_lora_optimizer_lrs.insert(id, optimizer_lr);
+        self.dynamic_lora_optimizer_configs.insert(id, optimizer);
         tracing::info!(adapter_id = id, rank = req.rank, "LoRA adapter added");
         Ok(id)
     }
@@ -2437,7 +2532,7 @@ impl TrainingSession for Qwen36Session {
         let removed = ctx.remove_lora(adapter_id)?;
         if removed {
             self.dynamic_lora_configs.remove(&adapter_id);
-            self.dynamic_lora_optimizer_lrs.remove(&adapter_id);
+            self.dynamic_lora_optimizer_configs.remove(&adapter_id);
             tracing::info!(adapter_id, "LoRA adapter removed");
         }
         Ok(removed)
@@ -2471,6 +2566,9 @@ mod tests {
             alpha,
             optimizer_step: id as u64,
             optimizer_lr: None,
+            optimizer_beta1: None,
+            optimizer_beta2: None,
+            optimizer_eps: None,
             target_layers: vec![0],
             target_modules: target_modules
                 .iter()
@@ -2508,6 +2606,19 @@ mod tests {
         manifest.optimizer_lr = Some(f64::NAN);
         let error = validate_dynamic_adapter_manifests([&manifest]).unwrap_err();
         assert!(error.to_string().contains("optimizer learning rate"));
+    }
+
+    #[test]
+    fn checkpoint_dynamic_manifests_reject_invalid_optimizer_scalars() {
+        let mut manifest = dynamic_manifest(1, 4, 8.0, &["q_proj"]);
+        manifest.optimizer_beta1 = Some(1.0);
+        let error = validate_dynamic_adapter_manifests([&manifest]).unwrap_err();
+        assert!(error.to_string().contains("optimizer beta1"));
+
+        manifest.optimizer_beta1 = Some(0.9);
+        manifest.optimizer_eps = Some(f64::NAN);
+        let error = validate_dynamic_adapter_manifests([&manifest]).unwrap_err();
+        assert!(error.to_string().contains("optimizer epsilon"));
     }
 
     #[test]

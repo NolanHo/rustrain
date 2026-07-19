@@ -10,7 +10,9 @@
 #include <cstring>
 #include <string>
 #include <sys/stat.h>
+#include <tuple>
 #include <unistd.h>
+#include <utility>
 #include <vector>
 
 struct LayerConfig {
@@ -79,10 +81,16 @@ extern "C" int64_t qwen36_add_lora_v2(
     void*, int64_t, double, const int64_t*, int64_t, const char*);
 extern "C" int64_t qwen36_add_lora_with_optimizer(
     void*, int64_t, double, const int64_t*, int64_t, const char*, double);
+extern "C" int64_t qwen36_add_lora_with_optimizer_v2(
+    void*, int64_t, double, const int64_t*, int64_t, const char*,
+    double, double, double, double);
 extern "C" int64_t qwen36_add_lora_for_restore(
     void*, int64_t, double, const int64_t*, int64_t, const char*);
 extern "C" int64_t qwen36_add_lora_for_restore_with_optimizer(
     void*, int64_t, double, const int64_t*, int64_t, const char*, double);
+extern "C" int64_t qwen36_add_lora_for_restore_with_optimizer_v2(
+    void*, int64_t, double, const int64_t*, int64_t, const char*,
+    double, double, double, double);
 extern "C" int32_t qwen36_set_adapter_id(void*, int64_t, int64_t);
 extern "C" int32_t qwen36_remove_lora(void*, int64_t);
 extern "C" void* qwen36_get_adapter_lora_tensor(
@@ -977,18 +985,33 @@ int main() {
     constexpr double default_tenant_lr = 1e-3;
     constexpr double restored_tenant_lr = 5e-4;
     constexpr double slow_tenant_lr = 1e-4;
-    const int64_t dense_fast = qwen36_add_lora_with_optimizer(
-        ctx, rank, 1.0, &target_layer, 1, dense_targets, fast_tenant_lr);
+    constexpr double fast_beta1 = 0.8;
+    constexpr double fast_beta2 = 0.95;
+    constexpr double fast_eps = 1e-6;
+    constexpr double restored_beta1 = 0.7;
+    constexpr double restored_beta2 = 0.9;
+    constexpr double restored_eps = 1e-5;
+    const int64_t dense_fast = qwen36_add_lora_with_optimizer_v2(
+        ctx, rank, 1.0, &target_layer, 1, dense_targets,
+        fast_tenant_lr, fast_beta1, fast_beta2, fast_eps);
     const int64_t dense_default = qwen36_add_lora(
         ctx, rank, 1.0, &target_layer, 1, dense_targets);
     const int64_t dense_slow = qwen36_add_lora_with_optimizer(
         ctx, rank, 1.0, &target_layer, 1, dense_targets, slow_tenant_lr);
-    const int64_t dense_restored = qwen36_add_lora_for_restore_with_optimizer(
-        ctx, rank, 1.0, &target_layer, 1, dense_targets, restored_tenant_lr);
+    const int64_t dense_restored =
+        qwen36_add_lora_for_restore_with_optimizer_v2(
+            ctx, rank, 1.0, &target_layer, 1, dense_targets,
+            restored_tenant_lr, restored_beta1, restored_beta2, restored_eps);
     assert(dense_fast > 0 && dense_default > dense_fast &&
         dense_slow > dense_default && dense_restored > dense_slow);
     assert(qwen36_add_lora_with_optimizer(
         ctx, rank, 1.0, &target_layer, 1, dense_targets, NAN) < 0);
+    assert(qwen36_add_lora_with_optimizer_v2(
+        ctx, rank, 1.0, &target_layer, 1, dense_targets,
+        1e-3, 1.0, 0.999, 1e-8) < 0);
+    assert(qwen36_add_lora_with_optimizer_v2(
+        ctx, rank, 1.0, &target_layer, 1, dense_targets,
+        1e-3, std::nextafter(1.0, 0.0), 0.999, 1e-8) < 0);
 
     auto* dense_fast_a = reinterpret_cast<at::Tensor*>(
         qwen36_get_adapter_lora_tensor(ctx, dense_fast, 0, "gate_proj", 0));
@@ -1009,12 +1032,17 @@ int main() {
     const auto dense_b_before = dense_b_value.clone();
     const int64_t dense_ids[] = {
         dense_fast, dense_default, dense_slow, dense_restored};
+    const int64_t dense_adam_launches_before =
+        qwen36_get_dynamic_adam_launch_count(ctx);
     const double dense_loss = qwen36_train_multi_lora_selected_v2(
         ctx, &shared_input, &shared_target_row, &shared_attention,
         dense_ids, 4);
     c10::cuda::device_synchronize();
+    assert(qwen36_get_dynamic_adam_launch_count(ctx) ==
+        dense_adam_launches_before + 1);
 
-    auto validate_tenant_adam = [&](int64_t adapter_id, double learning_rate) {
+    auto validate_tenant_adam = [&](int64_t adapter_id, double learning_rate,
+                                     double beta1, double beta2, double eps) {
         auto* parameter = reinterpret_cast<at::Tensor*>(
             qwen36_get_adapter_lora_tensor(
                 ctx, adapter_id, 0, "gate_proj", 1));
@@ -1025,20 +1053,52 @@ int main() {
             qwen36_get_adapter_optimizer_tensor(
                 ctx, adapter_id, 0, "gate_proj", 1, 1));
         assert(parameter && moment && variance);
-        auto expected = (
-            dense_b_before.to(at::kFloat) - learning_rate *
-                (moment->to(at::kFloat) / (1.0 - 0.9)) /
-                ((variance->to(at::kFloat) / (1.0 - 0.999)).sqrt() + 1e-8))
-            .to(at::kBFloat16);
+        const float beta1_f = static_cast<float>(beta1);
+        const float beta2_f = static_cast<float>(beta2);
+        const float step_lr = static_cast<float>(
+            learning_rate * std::sqrt(1.0 - std::pow(beta2_f, 1.0)) /
+            (1.0 - std::pow(beta1_f, 1.0)));
+        const float step_eps = static_cast<float>(
+            eps * std::sqrt(1.0 - std::pow(beta2_f, 1.0)));
+        auto expected = (dense_b_before.to(at::kFloat) - step_lr *
+            moment->to(at::kFloat) /
+            (variance->to(at::kFloat).sqrt() + step_eps)).to(at::kBFloat16);
         assert((*parameter - expected).abs().max().item<double>() == 0.0);
         return (*parameter - dense_b_before).abs().sum().item<double>();
     };
-    const double fast_update = validate_tenant_adam(dense_fast, fast_tenant_lr);
+    const double fast_update = validate_tenant_adam(
+        dense_fast, fast_tenant_lr, fast_beta1, fast_beta2, fast_eps);
     const double default_update =
-        validate_tenant_adam(dense_default, default_tenant_lr);
+        validate_tenant_adam(dense_default, default_tenant_lr, 0.9, 0.999, 1e-8);
     const double restored_update =
-        validate_tenant_adam(dense_restored, restored_tenant_lr);
-    const double slow_update = validate_tenant_adam(dense_slow, slow_tenant_lr);
+        validate_tenant_adam(dense_restored, restored_tenant_lr,
+            restored_beta1, restored_beta2, restored_eps);
+    const double slow_update =
+        validate_tenant_adam(dense_slow, slow_tenant_lr, 0.9, 0.999, 1e-8);
+    auto normalized_tenant_state = [&](int64_t adapter_id,
+                                       double beta1, double beta2) {
+        auto* moment = reinterpret_cast<at::Tensor*>(
+            qwen36_get_adapter_optimizer_tensor(
+                ctx, adapter_id, 0, "gate_proj", 1, 0));
+        auto* variance = reinterpret_cast<at::Tensor*>(
+            qwen36_get_adapter_optimizer_tensor(
+                ctx, adapter_id, 0, "gate_proj", 1, 1));
+        assert(moment && variance);
+        return std::make_pair(
+            moment->to(at::kFloat) / (1.0 - beta1),
+            variance->to(at::kFloat) / (1.0 - beta2));
+    };
+    const auto default_state = normalized_tenant_state(
+        dense_default, 0.9, 0.999);
+    for (const auto& [adapter_id, beta1, beta2] :
+         std::vector<std::tuple<int64_t, double, double>>{
+             {dense_fast, fast_beta1, fast_beta2},
+             {dense_slow, 0.9, 0.999},
+             {dense_restored, restored_beta1, restored_beta2}}) {
+        const auto state = normalized_tenant_state(adapter_id, beta1, beta2);
+        assert(at::allclose(state.first, default_state.first, 2e-5, 1e-7));
+        assert(at::allclose(state.second, default_state.second, 2e-5, 1e-7));
+    }
     std::printf(
         "native_qwen35_tenant_optimizer_smoke loss=%0.8f "
         "fast=%0.8e default=%0.8e restored=%0.8e slow=%0.8e\n",

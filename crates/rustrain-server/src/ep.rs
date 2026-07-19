@@ -735,6 +735,9 @@ fn execute_command(session: &mut Qwen36Session, worker: &EpWorker, cmd: &EpComma
             target_layers,
             target_modules,
             optimizer_lr,
+            optimizer_beta1,
+            optimizer_beta2,
+            optimizer_eps,
             ..
         } => {
             match session.add_lora(AddLoRARequest {
@@ -743,6 +746,9 @@ fn execute_command(session: &mut Qwen36Session, worker: &EpWorker, cmd: &EpComma
                 target_layers: target_layers.clone(),
                 target_modules: target_modules.clone(),
                 optimizer_lr: *optimizer_lr,
+                optimizer_beta1: *optimizer_beta1,
+                optimizer_beta2: *optimizer_beta2,
+                optimizer_eps: *optimizer_eps,
             }) {
                 Ok(id) => EpResult::AdapterId(id),
                 Err(e) => EpResult::Error(e.to_string()),
@@ -755,6 +761,9 @@ fn execute_command(session: &mut Qwen36Session, worker: &EpWorker, cmd: &EpComma
             target_layers,
             target_modules,
             optimizer_lr,
+            optimizer_beta1,
+            optimizer_beta2,
+            optimizer_eps,
             ..
         } => {
             let count = match validate_batch_add_lora_count(*count) {
@@ -769,6 +778,9 @@ fn execute_command(session: &mut Qwen36Session, worker: &EpWorker, cmd: &EpComma
                     target_layers: target_layers.clone(),
                     target_modules: target_modules.clone(),
                     optimizer_lr: *optimizer_lr,
+                    optimizer_beta1: *optimizer_beta1,
+                    optimizer_beta2: *optimizer_beta2,
+                    optimizer_eps: *optimizer_eps,
                 }) {
                     Ok(id) => ids.push(id),
                     Err(e) => {
@@ -893,7 +905,8 @@ fn execute_command(session: &mut Qwen36Session, worker: &EpWorker, cmd: &EpComma
             ) {
                 return EpResult::Error(error);
             }
-            if let Err(error) = session.validate_dynamic_adapter_steps(adapter_ids, expected_steps) {
+            if let Err(error) = session.validate_dynamic_adapter_steps(adapter_ids, expected_steps)
+            {
                 return EpResult::Error(error.to_string());
             }
             let source_shard = match source_shard_from_env() {
@@ -972,7 +985,8 @@ fn execute_command(session: &mut Qwen36Session, worker: &EpWorker, cmd: &EpComma
                 Ok(views) => views,
                 Err(error) => return EpResult::Error(error),
             };
-            if let Err(error) = session.validate_dynamic_adapter_steps(adapter_ids, expected_steps) {
+            if let Err(error) = session.validate_dynamic_adapter_steps(adapter_ids, expected_steps)
+            {
                 return EpResult::Error(error.to_string());
             }
             let source_shard = match source_shard_from_env() {
@@ -1422,9 +1436,9 @@ fn tensor_element_range(
 mod tests {
     use super::{
         checkpoint_generation, checkpoint_metadata_matches, checkpoint_staging_path,
-        create_checkpoint_staging, create_worker_session, delete_worker_session, multi_lora_rows,
-        is_terminal_native_context_result, publish_checkpoint_noreplace, require_worker_session,
-        source_shard_for_topology, tensor_element_range, train_step_rows,
+        create_checkpoint_staging, create_worker_session, delete_worker_session,
+        is_terminal_native_context_result, multi_lora_rows, publish_checkpoint_noreplace,
+        require_worker_session, source_shard_for_topology, tensor_element_range, train_step_rows,
         validate_batch_add_lora_count, validate_flat_tensor_lengths,
         validate_multi_lora_global_batch_size, SourceShard,
     };

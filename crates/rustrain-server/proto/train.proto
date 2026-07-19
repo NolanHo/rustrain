@@ -142,6 +142,9 @@ message AddLoRARequest {
   repeated int64 target_layers = 4;
   string target_modules = 5;  // comma-separated, empty = all
   OptionalDouble optimizer_lr = 6;  // omitted inherits the session optimizer
+  OptionalDouble optimizer_beta1 = 7;
+  OptionalDouble optimizer_beta2 = 8;
+  OptionalDouble optimizer_eps = 9;
 }
 message AddLoRAResponse {
   int64 adapter_id = 1;

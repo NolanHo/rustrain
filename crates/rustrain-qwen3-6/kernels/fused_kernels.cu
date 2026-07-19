@@ -242,9 +242,9 @@ __global__ void fused_adam_multi_out_of_place_kernel(
     const int* __restrict__ sizes,
     const float* __restrict__ lr_scaled,
     const float* __restrict__ eps_scaled,
-    int n_params,
-    float beta1, float beta2,
-    float one_minus_beta1, float one_minus_beta2
+    const float* __restrict__ beta1,
+    const float* __restrict__ beta2,
+    int n_params
 ) {
     int pidx = blockIdx.x;
     if (pidx >= n_params) return;
@@ -260,11 +260,17 @@ __global__ void fused_adam_multi_out_of_place_kernel(
     float* dst_v = dst_v_ptrs[pidx];
     const float tensor_lr = lr_scaled[pidx];
     const float tensor_eps = eps_scaled[pidx];
+    const float tensor_beta1 = beta1[pidx];
+    const float tensor_beta2 = beta2[pidx];
+    const float tensor_one_minus_beta1 = 1.0f - tensor_beta1;
+    const float tensor_one_minus_beta2 = 1.0f - tensor_beta2;
 
     for (int i = threadIdx.x; i < size; i += blockDim.x) {
         float g = grad[i];
-        float m_new = src_m[i] * beta1 + g * one_minus_beta1;
-        float v_new = src_v[i] * beta2 + g * g * one_minus_beta2;
+        float m_new = src_m[i] * tensor_beta1 +
+            g * tensor_one_minus_beta1;
+        float v_new = src_v[i] * tensor_beta2 +
+            g * g * tensor_one_minus_beta2;
         dst_m[i] = m_new;
         dst_v[i] = v_new;
         float p = __bfloat162float(src_param[i]);
@@ -344,9 +350,8 @@ void launch_fused_adam_multi_out_of_place(
     void** d_dst_param_ptrs,
     float** d_dst_m_ptrs, float** d_dst_v_ptrs,
     int* d_sizes, float* d_lr_scaled, float* d_eps_scaled,
+    float* d_beta1, float* d_beta2,
     int n_params,
-    float beta1, float beta2,
-    float one_minus_beta1, float one_minus_beta2,
     cudaStream_t stream
 ) {
     if (n_params <= 0) return;
@@ -355,8 +360,9 @@ void launch_fused_adam_multi_out_of_place(
     fused_adam_multi_out_of_place_kernel<<<blocks, threads, 0, stream>>>(
         d_src_param_ptrs, d_grad_ptrs, d_src_m_ptrs, d_src_v_ptrs,
         d_dst_param_ptrs, d_dst_m_ptrs, d_dst_v_ptrs,
-        d_sizes, d_lr_scaled, d_eps_scaled, n_params,
-        beta1, beta2, one_minus_beta1, one_minus_beta2
+        d_sizes, d_lr_scaled, d_eps_scaled,
+        d_beta1, d_beta2,
+        n_params
     );
 }
 

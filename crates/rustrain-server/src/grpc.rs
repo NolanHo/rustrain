@@ -291,6 +291,9 @@ impl TrainService for TrainServiceImpl {
                 target_layers: req.target_layers,
                 target_modules: req.target_modules,
                 optimizer_lr: req.optimizer_lr.map(|value| value.value),
+                optimizer_beta1: req.optimizer_beta1.map(|value| value.value),
+                optimizer_beta2: req.optimizer_beta2.map(|value| value.value),
+                optimizer_eps: req.optimizer_eps.map(|value| value.value),
             })
             .map_err(|e| Status::internal(e.to_string()))?;
         Ok(Response::new(train::AddLoRaResponse { adapter_id: id }))

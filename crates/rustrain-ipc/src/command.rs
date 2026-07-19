@@ -116,6 +116,12 @@ pub enum EpCommand {
         target_modules: String,
         #[serde(default)]
         optimizer_lr: Option<f64>,
+        #[serde(default)]
+        optimizer_beta1: Option<f64>,
+        #[serde(default)]
+        optimizer_beta2: Option<f64>,
+        #[serde(default)]
+        optimizer_eps: Option<f64>,
     },
     BatchAddLora {
         session_id: String,
@@ -126,6 +132,12 @@ pub enum EpCommand {
         target_modules: String,
         #[serde(default)]
         optimizer_lr: Option<f64>,
+        #[serde(default)]
+        optimizer_beta1: Option<f64>,
+        #[serde(default)]
+        optimizer_beta2: Option<f64>,
+        #[serde(default)]
+        optimizer_eps: Option<f64>,
     },
     RemoveLora {
         session_id: String,
@@ -364,11 +376,23 @@ mod tests {
             target_layers: vec![0],
             target_modules: "q_proj".into(),
             optimizer_lr: Some(2.5e-4),
+            optimizer_beta1: Some(0.8),
+            optimizer_beta2: Some(0.95),
+            optimizer_eps: Some(1e-6),
         };
         let encoded = serde_json::to_vec(&command).unwrap();
         match serde_json::from_slice::<EpCommand>(&encoded).unwrap() {
-            EpCommand::BatchAddLora { optimizer_lr, .. } => {
+            EpCommand::BatchAddLora {
+                optimizer_lr,
+                optimizer_beta1,
+                optimizer_beta2,
+                optimizer_eps,
+                ..
+            } => {
                 assert_eq!(optimizer_lr, Some(2.5e-4));
+                assert_eq!(optimizer_beta1, Some(0.8));
+                assert_eq!(optimizer_beta2, Some(0.95));
+                assert_eq!(optimizer_eps, Some(1e-6));
             }
             other => panic!("unexpected command: {other:?}"),
         }

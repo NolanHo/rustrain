@@ -5,7 +5,7 @@
 
 use crate::lora::Qwen36LoraTargetModule;
 use crate::pipeline::PipelineStageLayout;
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 use std::ffi::c_void;
 use std::sync::OnceLock;
 use tch::{Kind, Tensor};
@@ -161,6 +161,37 @@ pub struct MultiLoraLossReport {
     pub aggregate_loss: f64,
     pub adapter_losses: Vec<f64>,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DynamicAdamConfig {
+    pub lr: f64,
+    pub beta1: f64,
+    pub beta2: f64,
+    pub eps: f64,
+}
+
+impl DynamicAdamConfig {
+    fn validate(self) -> Result<Self> {
+        if !self.lr.is_finite() || self.lr < 0.0 {
+            bail!("dynamic LoRA optimizer learning rate must be finite and non-negative");
+        }
+        if !self.beta1.is_finite() || !(0.0..1.0).contains(&self.beta1) {
+            bail!("dynamic LoRA optimizer beta1 must be finite and in [0, 1)");
+        }
+        if !self.beta2.is_finite() || !(0.0..1.0).contains(&self.beta2) {
+            bail!("dynamic LoRA optimizer beta2 must be finite and in [0, 1)");
+        }
+        if !((self.beta1 as f32).is_finite() && (self.beta1 as f32) < 1.0)
+            || !((self.beta2 as f32).is_finite() && (self.beta2 as f32) < 1.0)
+        {
+            bail!("dynamic LoRA optimizer betas must be representable as finite FP32 values below 1");
+        }
+        if !self.eps.is_finite() || self.eps < 0.0 {
+            bail!("dynamic LoRA optimizer epsilon must be finite and non-negative");
+        }
+        Ok(self)
+    }
+}
 type FnGetLoraCount = unsafe extern "C" fn(*mut c_void) -> i64;
 type FnGetLoraA = unsafe extern "C" fn(*mut c_void, i64) -> *mut c_void;
 type FnGetLoraB = unsafe extern "C" fn(*mut c_void, i64) -> *mut c_void;
@@ -216,6 +247,18 @@ type FnSetRouterAuxLossCoef = unsafe extern "C" fn(*mut c_void, f64) -> i32;
 type FnAddLora = unsafe extern "C" fn(*mut c_void, i64, f64, *const i64, i64, *const i8) -> i64;
 type FnAddLoraWithOptimizer =
     unsafe extern "C" fn(*mut c_void, i64, f64, *const i64, i64, *const i8, f64) -> i64;
+type FnAddLoraWithOptimizerV2 = unsafe extern "C" fn(
+    *mut c_void,
+    i64,
+    f64,
+    *const i64,
+    i64,
+    *const i8,
+    f64,
+    f64,
+    f64,
+    f64,
+) -> i64;
 type FnRemoveLora = unsafe extern "C" fn(*mut c_void, i64) -> i32;
 type FnListLora = unsafe extern "C" fn(*mut c_void, *mut i64, i64) -> i64;
 type FnGetAdapterLoraTensor =
@@ -229,8 +272,7 @@ type FnSetAdapterOptimizerTensor =
     unsafe extern "C" fn(*mut c_void, i64, i64, *const i8, i32, i32, *mut c_void) -> i32;
 type FnGetAdapterStepCount = unsafe extern "C" fn(*mut c_void, i64) -> i64;
 type FnSetAdapterStepCount = unsafe extern "C" fn(*mut c_void, i64, i64) -> i32;
-type FnValidateAdapterSteps =
-    unsafe extern "C" fn(*mut c_void, *const i64, *const i64, i32) -> i32;
+type FnValidateAdapterSteps = unsafe extern "C" fn(*mut c_void, *const i64, *const i64, i32) -> i32;
 type FnGetContextHealth = unsafe extern "C" fn(*mut c_void) -> i32;
 
 #[repr(C)]
@@ -301,8 +343,10 @@ struct KernelHandles {
     add_lora: FnAddLora,
     add_lora_v2: FnAddLora,
     add_lora_with_optimizer: Option<FnAddLoraWithOptimizer>,
+    add_lora_with_optimizer_v2: Option<FnAddLoraWithOptimizerV2>,
     add_lora_for_restore: FnAddLora,
     add_lora_for_restore_with_optimizer: FnAddLoraWithOptimizer,
+    add_lora_for_restore_with_optimizer_v2: Option<FnAddLoraWithOptimizerV2>,
     remove_lora: FnRemoveLora,
     list_lora: FnListLora,
     get_adapter_lora_tensor: FnGetAdapterLoraTensor,
@@ -368,6 +412,24 @@ unsafe fn load_kernels() -> Option<KernelHandles> {
             ))
         }
     };
+    let add_lora_with_optimizer_v2 = {
+        let name = CString::new("qwen36_add_lora_with_optimizer_v2").unwrap();
+        let symbol = libc::dlsym(handle, name.as_ptr());
+        if symbol.is_null() {
+            None
+        } else {
+            Some(std::mem::transmute::<*mut c_void, FnAddLoraWithOptimizerV2>(symbol))
+        }
+    };
+    let add_lora_for_restore_with_optimizer_v2 = {
+        let name = CString::new("qwen36_add_lora_for_restore_with_optimizer_v2").unwrap();
+        let symbol = libc::dlsym(handle, name.as_ptr());
+        if symbol.is_null() {
+            None
+        } else {
+            Some(std::mem::transmute::<*mut c_void, FnAddLoraWithOptimizerV2>(symbol))
+        }
+    };
     Some(KernelHandles {
         create_ctx: sym!("qwen36_create_training_context_v2"),
         train_step: sym!("qwen36_train_step"),
@@ -385,7 +447,9 @@ unsafe fn load_kernels() -> Option<KernelHandles> {
             if symbol.is_null() {
                 None
             } else {
-                Some(std::mem::transmute::<*mut c_void, FnEvalMultiLoraSelected>(symbol))
+                Some(std::mem::transmute::<*mut c_void, FnEvalMultiLoraSelected>(
+                    symbol,
+                ))
             }
         },
         train_step_host_i64: sym!("qwen36_train_step_host_i64"),
@@ -398,7 +462,9 @@ unsafe fn load_kernels() -> Option<KernelHandles> {
             if symbol.is_null() {
                 None
             } else {
-                Some(std::mem::transmute::<*mut c_void, FnEvalMultiLoraHost>(symbol))
+                Some(std::mem::transmute::<*mut c_void, FnEvalMultiLoraHost>(
+                    symbol,
+                ))
             }
         },
         validate_adapter_steps: {
@@ -407,7 +473,9 @@ unsafe fn load_kernels() -> Option<KernelHandles> {
             if symbol.is_null() {
                 None
             } else {
-                Some(std::mem::transmute::<*mut c_void, FnValidateAdapterSteps>(symbol))
+                Some(std::mem::transmute::<*mut c_void, FnValidateAdapterSteps>(
+                    symbol,
+                ))
             }
         },
         get_context_health: {
@@ -446,8 +514,10 @@ unsafe fn load_kernels() -> Option<KernelHandles> {
         add_lora: sym!("qwen36_add_lora"),
         add_lora_v2: sym!("qwen36_add_lora_v2"),
         add_lora_with_optimizer,
+        add_lora_with_optimizer_v2,
         add_lora_for_restore: sym!("qwen36_add_lora_for_restore"),
         add_lora_for_restore_with_optimizer: sym!("qwen36_add_lora_for_restore_with_optimizer"),
+        add_lora_for_restore_with_optimizer_v2,
         remove_lora: sym!("qwen36_remove_lora"),
         list_lora: sym!("qwen36_list_lora"),
         get_adapter_lora_tensor: sym!("qwen36_get_adapter_lora_tensor"),
@@ -969,6 +1039,15 @@ pub struct CppTrainingContext {
 }
 
 impl CppTrainingContext {
+    /// Whether the loaded native library supports complete tenant-local Adam
+    /// overrides (beta1, beta2, and epsilon) in addition to learning rate.
+    pub fn supports_complete_dynamic_adam(&self) -> bool {
+        get_kernels().is_some_and(|kernels| {
+            kernels.add_lora_with_optimizer_v2.is_some()
+                && kernels.add_lora_for_restore_with_optimizer_v2.is_some()
+        })
+    }
+
     /// Create training context — LoRA A/B created in C++ as at::Tensor (requires_grad=true).
     pub fn new(
         weights: &std::collections::BTreeMap<String, Tensor>,
@@ -1139,9 +1218,8 @@ impl CppTrainingContext {
         if ptr.is_null() {
             bail!("C++ create_training_context returned null");
         }
-        let router_aux_status = unsafe {
-            (kh.set_router_aux_loss_coef)(ptr, config.router_aux_loss_coef)
-        };
+        let router_aux_status =
+            unsafe { (kh.set_router_aux_loss_coef)(ptr, config.router_aux_loss_coef) };
         if router_aux_status != 0 {
             unsafe { (kh.free_ctx)(ptr) };
             bail!(
@@ -1741,25 +1819,8 @@ impl CppTrainingContext {
             ep_size, ep_color, dp_rank, dp_size, dp_color, pp_rank, pp_size, pp_color,
         ]
         .map(|value| i32::try_from(value).context("parallel topology exceeds i32"));
-        let [
-            rank,
-            world_size,
-            tp_rank,
-            tp_size,
-            tp_color,
-            cp_rank,
-            cp_size,
-            cp_color,
-            ep_rank,
-            ep_size,
-            ep_color,
-            dp_rank,
-            dp_size,
-            dp_color,
-            pp_rank,
-            pp_size,
-            pp_color,
-        ] = values;
+        let [rank, world_size, tp_rank, tp_size, tp_color, cp_rank, cp_size, cp_color, ep_rank, ep_size, ep_color, dp_rank, dp_size, dp_color, pp_rank, pp_size, pp_color] =
+            values;
         let kh = get_kernels().expect("kernels not loaded");
         let status = unsafe {
             (kh.init_parallel_nccl)(
@@ -1817,25 +1878,8 @@ impl CppTrainingContext {
             ep_size, ep_color, dp_rank, dp_size, dp_color, pp_rank, pp_size, pp_color,
         ]
         .map(|value| i32::try_from(value).context("parallel topology exceeds i32"));
-        let [
-            rank,
-            world_size,
-            tp_rank,
-            tp_size,
-            tp_color,
-            cp_rank,
-            cp_size,
-            cp_color,
-            ep_rank,
-            ep_size,
-            ep_color,
-            dp_rank,
-            dp_size,
-            dp_color,
-            pp_rank,
-            pp_size,
-            pp_color,
-        ] = values;
+        let [rank, world_size, tp_rank, tp_size, tp_color, cp_rank, cp_size, cp_color, ep_rank, ep_size, ep_color, dp_rank, dp_size, dp_color, pp_rank, pp_size, pp_color] =
+            values;
         let kh = get_kernels().expect("kernels not loaded");
         let status = unsafe {
             (kh.attach_parallel_nccl_no_sync)(
@@ -1903,10 +1947,7 @@ impl CppTrainingContext {
     }
 
     /// Add a dynamic adapter with a tenant-specific Adam learning rate.
-    ///
-    /// Beta1, beta2, and epsilon still inherit the training context defaults.
-    /// The legacy `add_lora` entry point continues to inherit every optimizer
-    /// hyperparameter from the context.
+    /// The remaining hyperparameters inherit the training context defaults.
     pub fn add_lora_with_optimizer_lr(
         &self,
         rank: i64,
@@ -1946,6 +1987,54 @@ impl CppTrainingContext {
         };
         if id < 0 {
             bail!("C++ add_lora_with_optimizer failed");
+        }
+        Ok(id)
+    }
+
+    /// Add a dynamic adapter with a complete tenant-local Adam configuration.
+    /// All selected tenants still share one transactional fused Adam launch.
+    pub fn add_lora_with_optimizer_config(
+        &self,
+        rank: i64,
+        alpha: f64,
+        target_layers: &[i64],
+        target_modules: &str,
+        optimizer: DynamicAdamConfig,
+    ) -> Result<i64> {
+        let optimizer = optimizer.validate()?;
+        let kh = get_kernels().ok_or_else(|| anyhow::anyhow!("kernels not loaded"))?;
+        let add_lora = kh.add_lora_with_optimizer_v2.ok_or_else(|| {
+            anyhow::anyhow!(
+                "loaded Qwen kernel does not support complete tenant optimizer overrides"
+            )
+        })?;
+        let tl_ptr = if target_layers.is_empty() {
+            std::ptr::null()
+        } else {
+            target_layers.as_ptr()
+        };
+        let modules = std::ffi::CString::new(target_modules)?;
+        let modules_ptr = if target_modules.is_empty() {
+            std::ptr::null()
+        } else {
+            modules.as_ptr()
+        };
+        let id = unsafe {
+            add_lora(
+                self.ptr,
+                rank,
+                alpha,
+                tl_ptr,
+                i64::try_from(target_layers.len()).context("target layer count exceeds i64")?,
+                modules_ptr,
+                optimizer.lr,
+                optimizer.beta1,
+                optimizer.beta2,
+                optimizer.eps,
+            )
+        };
+        if id < 0 {
+            bail!("C++ add_lora_with_optimizer_v2 failed");
         }
         Ok(id)
     }
@@ -2019,6 +2108,52 @@ impl CppTrainingContext {
         };
         if id < 0 {
             bail!("C++ restore adapter allocation with optimizer state failed");
+        }
+        Ok(id)
+    }
+
+    /// Allocate a dynamic adapter with checkpointed tenant-local Adam
+    /// hyperparameters while suppressing temporary parameter synchronization.
+    pub fn add_lora_for_restore_with_optimizer_config(
+        &self,
+        rank: i64,
+        alpha: f64,
+        target_layers: &[i64],
+        target_modules: &str,
+        optimizer: DynamicAdamConfig,
+    ) -> Result<i64> {
+        let optimizer = optimizer.validate()?;
+        let kh = get_kernels().ok_or_else(|| anyhow::anyhow!("kernels not loaded"))?;
+        let add_lora = kh.add_lora_for_restore_with_optimizer_v2.ok_or_else(|| {
+            anyhow::anyhow!("loaded Qwen kernel does not support complete tenant optimizer restore")
+        })?;
+        let tl_ptr = if target_layers.is_empty() {
+            std::ptr::null()
+        } else {
+            target_layers.as_ptr()
+        };
+        let modules = std::ffi::CString::new(target_modules)?;
+        let modules_ptr = if target_modules.is_empty() {
+            std::ptr::null()
+        } else {
+            modules.as_ptr()
+        };
+        let id = unsafe {
+            add_lora(
+                self.ptr,
+                rank,
+                alpha,
+                tl_ptr,
+                i64::try_from(target_layers.len()).context("target layer count exceeds i64")?,
+                modules_ptr,
+                optimizer.lr,
+                optimizer.beta1,
+                optimizer.beta2,
+                optimizer.eps,
+            )
+        };
+        if id < 0 {
+            bail!("C++ add_lora_for_restore_with_optimizer_v2 failed");
         }
         Ok(id)
     }
@@ -2519,26 +2654,27 @@ mod tests {
                 .is_none()
         );
         assert!(shard_vocab_weight_for_tp("lm_head.weight", &tensor, 11, 2, 0).is_err());
-        assert!(
-            shard_vocab_weight_for_tp(
-                "model.embed_tokens.weight",
-                &Tensor::zeros([11, 4], (Kind::Float, tch::Device::Cpu)),
-                12,
-                2,
-                0,
-            )
-            .is_err()
-        );
+        assert!(shard_vocab_weight_for_tp(
+            "model.embed_tokens.weight",
+            &Tensor::zeros([11, 4], (Kind::Float, tch::Device::Cpu)),
+            12,
+            2,
+            0,
+        )
+        .is_err());
     }
 
     #[test]
     fn dense_mlp_tp_ignores_non_mlp_weights_and_rejects_bad_shapes() {
         let tensor = Tensor::zeros([5, 4], (Kind::Float, tch::Device::Cpu));
-        assert!(
-            shard_dense_mlp_weight_for_tp("model.layers.0.self_attn.q_proj.weight", &tensor, 2, 0)
-                .unwrap()
-                .is_none()
-        );
+        assert!(shard_dense_mlp_weight_for_tp(
+            "model.layers.0.self_attn.q_proj.weight",
+            &tensor,
+            2,
+            0
+        )
+        .unwrap()
+        .is_none());
         assert!(
             shard_dense_mlp_weight_for_tp("model.layers.0.mlp.up_proj.weight", &tensor, 2, 0)
                 .is_err()
@@ -2601,15 +2737,13 @@ mod tests {
     #[test]
     fn moe_tp_rejects_invalid_packed_and_intermediate_shapes() {
         let odd_packed = Tensor::zeros([2, 10, 4], (Kind::Float, tch::Device::Cpu));
-        assert!(
-            shard_moe_mlp_weight_for_tp(
-                "model.layers.0.mlp.experts.gate_up_proj",
-                &odd_packed,
-                2,
-                0,
-            )
-            .is_err()
-        );
+        assert!(shard_moe_mlp_weight_for_tp(
+            "model.layers.0.mlp.experts.gate_up_proj",
+            &odd_packed,
+            2,
+            0,
+        )
+        .is_err());
         let down = Tensor::zeros([2, 4, 5], (Kind::Float, tch::Device::Cpu));
         assert!(
             shard_moe_mlp_weight_for_tp("model.layers.0.mlp.experts.down_proj", &down, 2, 0,)
@@ -2638,25 +2772,21 @@ mod tests {
     #[test]
     fn full_attention_tp_ignores_other_weights_and_rejects_bad_shapes() {
         let tensor = Tensor::zeros([5, 4], (Kind::Float, tch::Device::Cpu));
-        assert!(
-            shard_full_attention_weight_for_tp(
-                "model.layers.0.mlp.gate_proj.weight",
-                &tensor,
-                2,
-                0,
-            )
-            .unwrap()
-            .is_none()
-        );
-        assert!(
-            shard_full_attention_weight_for_tp(
-                "model.layers.0.self_attn.q_proj.weight",
-                &tensor,
-                2,
-                0,
-            )
-            .is_err()
-        );
+        assert!(shard_full_attention_weight_for_tp(
+            "model.layers.0.mlp.gate_proj.weight",
+            &tensor,
+            2,
+            0,
+        )
+        .unwrap()
+        .is_none());
+        assert!(shard_full_attention_weight_for_tp(
+            "model.layers.0.self_attn.q_proj.weight",
+            &tensor,
+            2,
+            0,
+        )
+        .is_err());
     }
 
     #[test]
@@ -2727,45 +2857,39 @@ mod tests {
     #[test]
     fn linear_attention_tp_rejects_invalid_groups_and_shapes() {
         let tensor = Tensor::zeros([12, 4], (Kind::Float, tch::Device::Cpu));
-        assert!(
-            shard_linear_attention_weight_for_tp(
-                "model.layers.0.linear_attn.norm.weight",
-                &tensor,
-                2,
-                0,
-                2,
-                2,
-                4,
-                1,
-            )
-            .unwrap()
-            .is_none()
-        );
-        assert!(
-            shard_linear_attention_weight_for_tp(
-                "model.layers.0.linear_attn.in_proj_qkv.weight",
-                &tensor,
-                2,
-                0,
-                3,
-                2,
-                4,
-                1,
-            )
-            .is_err()
-        );
-        assert!(
-            shard_linear_attention_weight_for_tp(
-                "model.layers.0.linear_attn.in_proj_qkv.weight",
-                &Tensor::zeros([11, 4], (Kind::Float, tch::Device::Cpu)),
-                2,
-                0,
-                2,
-                2,
-                4,
-                1,
-            )
-            .is_err()
-        );
+        assert!(shard_linear_attention_weight_for_tp(
+            "model.layers.0.linear_attn.norm.weight",
+            &tensor,
+            2,
+            0,
+            2,
+            2,
+            4,
+            1,
+        )
+        .unwrap()
+        .is_none());
+        assert!(shard_linear_attention_weight_for_tp(
+            "model.layers.0.linear_attn.in_proj_qkv.weight",
+            &tensor,
+            2,
+            0,
+            3,
+            2,
+            4,
+            1,
+        )
+        .is_err());
+        assert!(shard_linear_attention_weight_for_tp(
+            "model.layers.0.linear_attn.in_proj_qkv.weight",
+            &Tensor::zeros([11, 4], (Kind::Float, tch::Device::Cpu)),
+            2,
+            0,
+            2,
+            2,
+            4,
+            1,
+        )
+        .is_err());
     }
 }

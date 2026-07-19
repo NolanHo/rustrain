@@ -15,8 +15,8 @@ use futures::stream::{self, Stream};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::convert::Infallible;
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant};
 use tokio::sync::{oneshot, Semaphore};
 use tokio_stream::StreamExt;
 
@@ -247,6 +247,12 @@ impl MultiLoraWindow {
         self.adapter_ids.extend(request.adapter_ids.iter().copied());
         self.requests.push(request);
     }
+
+    fn at_capacity(&self, config: MultiLoraBatchConfig) -> bool {
+        self.requests.len() >= config.max_requests
+            || self.adapter_count >= config.max_adapters
+            || self.payload_bytes >= config.max_payload_bytes
+    }
 }
 
 #[derive(Default)]
@@ -259,6 +265,7 @@ struct MultiLoraBatchState {
 #[derive(Clone)]
 struct MultiLoraBatcher {
     state: Arc<Mutex<MultiLoraBatchState>>,
+    window_wakeup: Arc<Condvar>,
     config: MultiLoraBatchConfig,
 }
 
@@ -266,6 +273,7 @@ impl MultiLoraBatcher {
     fn new(config: MultiLoraBatchConfig) -> Self {
         Self {
             state: Arc::new(Mutex::new(MultiLoraBatchState::default())),
+            window_wakeup: Arc::new(Condvar::new()),
             config,
         }
     }
@@ -276,6 +284,52 @@ impl MultiLoraBatcher {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         state.current_window_id = None;
+        self.window_wakeup.notify_all();
+    }
+
+    /// Wait for a coalescing window to be sealed or for its normal deadline.
+    /// The window ID predicate makes spurious notifications harmless and
+    /// treats replacement by a newer window as sealing the old one. The
+    /// scheduler remains single-consumer, so this only changes when the
+    /// existing FIFO job becomes dispatchable.
+    fn wait_for_window(&self, window_id: u64, wait: Duration) {
+        if wait.is_zero() {
+            return;
+        }
+        let deadline = Instant::now() + wait;
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        while state.current_window_id == Some(window_id) {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            let (next_state, timeout) = self
+                .window_wakeup
+                .wait_timeout(state, remaining)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state = next_state;
+            if timeout.timed_out() {
+                break;
+            }
+        }
+        if state.current_window_id == Some(window_id) {
+            state.current_window_id = None;
+        }
+    }
+
+    fn seal_window_if_at_capacity(&self, state: &mut MultiLoraBatchState, window_id: u64) {
+        if state.current_window_id == Some(window_id)
+            && state
+                .windows
+                .get(&window_id)
+                .is_some_and(|window| window.at_capacity(self.config))
+        {
+            state.current_window_id = None;
+            self.window_wakeup.notify_all();
+        }
     }
 
     fn submit(
@@ -300,9 +354,11 @@ impl MultiLoraBatcher {
                 .is_some_and(|window| window.can_accept(&request, self.config))
             {
                 state.windows.get_mut(&window_id).unwrap().push(request);
+                self.seal_window_if_at_capacity(&mut state, window_id);
                 return Ok(());
             }
             state.current_window_id = None;
+            self.window_wakeup.notify_all();
         }
 
         let window_id = state.next_window_id;
@@ -313,6 +369,7 @@ impl MultiLoraBatcher {
             .insert(window_id, MultiLoraWindow::new(request));
         if coalescible {
             state.current_window_id = Some(window_id);
+            self.seal_window_if_at_capacity(&mut state, window_id);
         }
 
         let batcher = self.clone();
@@ -322,15 +379,14 @@ impl MultiLoraBatcher {
             Duration::ZERO
         };
         let scheduled = scheduler.submit(move || {
-            if !wait.is_zero() {
-                std::thread::sleep(wait);
-            }
+            batcher.wait_for_window(window_id, wait);
             batcher.execute_window(window_id, &coordinator);
         });
         if let Err(error) = scheduled {
             state.windows.remove(&window_id);
             if state.current_window_id == Some(window_id) {
                 state.current_window_id = None;
+                self.window_wakeup.notify_all();
             }
             return Err(error);
         }
@@ -1278,6 +1334,12 @@ struct AddLoRAHttp {
     target_modules: String,
     #[serde(default)]
     optimizer_lr: Option<f64>,
+    #[serde(default)]
+    optimizer_beta1: Option<f64>,
+    #[serde(default)]
+    optimizer_beta2: Option<f64>,
+    #[serde(default)]
+    optimizer_eps: Option<f64>,
 }
 #[derive(Serialize)]
 struct AddLoRAResponse {
@@ -1302,6 +1364,9 @@ async fn add_lora(
             target_layers: req.target_layers,
             target_modules: req.target_modules,
             optimizer_lr: req.optimizer_lr,
+            optimizer_beta1: req.optimizer_beta1,
+            optimizer_beta2: req.optimizer_beta2,
+            optimizer_eps: req.optimizer_eps,
         })
         .map_err(|e| err_resp(&e.to_string()))?;
     Ok(Json(AddLoRAResponse { adapter_id }))
@@ -1869,8 +1934,8 @@ mod tensor_http_shape_tests {
         build_multi_lora_window_payload, decode_int64_bytes, ep_dispatch_schedule_error,
         multi_lora_source_count, normalized_multi_lora_payload_bytes, pack_tensor_slab,
         project_multi_lora_result, validate_multi_lora_http_shapes,
-        validate_selected_eval_http_shapes, validate_train_http_shapes,
-        EpDispatchScheduleError, MultiLoraBatchConfig, MultiLoraDispatchRequest, MultiLoraWindow,
+        validate_selected_eval_http_shapes, validate_train_http_shapes, EpDispatchScheduleError,
+        MultiLoraBatchConfig, MultiLoraBatcher, MultiLoraDispatchRequest, MultiLoraWindow,
         StatusCode, TensorHttp,
     };
 
@@ -2163,6 +2228,98 @@ mod tensor_http_shape_tests {
     }
 
     #[test]
+    fn coalescing_wait_wakes_when_current_window_is_sealed() {
+        let config = MultiLoraBatchConfig {
+            window: std::time::Duration::from_secs(2),
+            max_requests: 4,
+            max_adapters: 4,
+            max_payload_bytes: usize::MAX,
+        };
+        let batcher = MultiLoraBatcher::new(config);
+        let window_id = 7;
+        batcher.state.lock().unwrap().current_window_id = Some(window_id);
+
+        let waiting_batcher = batcher.clone();
+        let (started, started_rx) = std::sync::mpsc::channel();
+        let waiter = std::thread::spawn(move || {
+            let start = std::time::Instant::now();
+            started.send(()).unwrap();
+            waiting_batcher.wait_for_window(window_id, config.window);
+            start.elapsed()
+        });
+        started_rx.recv().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        batcher.seal_current();
+
+        assert!(
+            waiter.join().unwrap() < std::time::Duration::from_millis(500),
+            "sealed coalescing window must not wait for its full deadline"
+        );
+    }
+
+    #[test]
+    fn coalescing_wait_wakes_when_window_reaches_capacity() {
+        let config = MultiLoraBatchConfig {
+            window: std::time::Duration::from_secs(2),
+            max_requests: 1,
+            max_adapters: 4,
+            max_payload_bytes: usize::MAX,
+        };
+        let batcher = MultiLoraBatcher::new(config);
+        let window_id = 11;
+        {
+            let mut state = batcher.state.lock().unwrap();
+            state.current_window_id = Some(window_id);
+            state.windows.insert(
+                window_id,
+                MultiLoraWindow::new(batch_request("session", &[1], 1, &[11])),
+            );
+        }
+
+        let waiting_batcher = batcher.clone();
+        let (started, started_rx) = std::sync::mpsc::channel();
+        let waiter = std::thread::spawn(move || {
+            let start = std::time::Instant::now();
+            started.send(()).unwrap();
+            waiting_batcher.wait_for_window(window_id, config.window);
+            start.elapsed()
+        });
+        started_rx.recv().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        {
+            let mut state = batcher.state.lock().unwrap();
+            batcher.seal_window_if_at_capacity(&mut state, window_id);
+        }
+
+        assert!(
+            waiter.join().unwrap() < std::time::Duration::from_millis(500),
+            "full coalescing window must not wait for its full deadline"
+        );
+        assert_eq!(batcher.state.lock().unwrap().current_window_id, None);
+    }
+
+    #[test]
+    fn coalescing_wait_keeps_the_deadline_for_an_open_window() {
+        let config = MultiLoraBatchConfig {
+            window: std::time::Duration::from_millis(30),
+            max_requests: 4,
+            max_adapters: 4,
+            max_payload_bytes: usize::MAX,
+        };
+        let batcher = MultiLoraBatcher::new(config);
+        let window_id = 13;
+        batcher.state.lock().unwrap().current_window_id = Some(window_id);
+
+        let start = std::time::Instant::now();
+        batcher.wait_for_window(window_id, config.window);
+        assert!(
+            start.elapsed() >= std::time::Duration::from_millis(20),
+            "open coalescing window must retain its normal batching deadline"
+        );
+        assert_eq!(batcher.state.lock().unwrap().current_window_id, None);
+    }
+
+    #[test]
     fn implicit_registry_request_is_an_exclusive_window() {
         let config = MultiLoraBatchConfig {
             window: std::time::Duration::from_millis(1),
@@ -2251,6 +2408,9 @@ async fn ep_add_lora(
         target_layers: req.target_layers,
         target_modules: req.target_modules,
         optimizer_lr: req.optimizer_lr,
+        optimizer_beta1: req.optimizer_beta1,
+        optimizer_beta2: req.optimizer_beta2,
+        optimizer_eps: req.optimizer_eps,
     };
     match dispatch_ep(&state, cmd).await? {
         rustrain_ipc::EpResult::AdapterId(id) => Ok(Json(AddLoRAResponse { adapter_id: id })),
@@ -2268,6 +2428,12 @@ struct BatchAddLoRAHttp {
     target_modules: String,
     #[serde(default)]
     optimizer_lr: Option<f64>,
+    #[serde(default)]
+    optimizer_beta1: Option<f64>,
+    #[serde(default)]
+    optimizer_beta2: Option<f64>,
+    #[serde(default)]
+    optimizer_eps: Option<f64>,
 }
 
 async fn ep_batch_add_lora(
@@ -2284,6 +2450,9 @@ async fn ep_batch_add_lora(
         target_layers: req.target_layers,
         target_modules: req.target_modules,
         optimizer_lr: req.optimizer_lr,
+        optimizer_beta1: req.optimizer_beta1,
+        optimizer_beta2: req.optimizer_beta2,
+        optimizer_eps: req.optimizer_eps,
     };
     match dispatch_ep(&state, cmd).await? {
         rustrain_ipc::EpResult::Count(n) => Ok(Json(serde_json::json!({"count": n}))),
