@@ -53,6 +53,7 @@ extern "C" int64_t qwen36_get_dynamic_finalizer_count(void*);
 extern "C" int64_t qwen36_get_dynamic_adam_launch_count(void*);
 extern "C" int64_t qwen36_get_dynamic_train_batch_count(void*);
 extern "C" int32_t qwen36_get_accumulation_active(void*);
+extern "C" int32_t qwen36_get_context_health(void*);
 extern "C" double qwen36_get_accumulated_token_weight(void*);
 extern "C" int32_t qwen36_set_adapter_step_count(void*, int64_t, int64_t);
 extern "C" double qwen36_eval_step(void*, void*, void*, void*);
@@ -801,6 +802,7 @@ int main() {
     assert((*dynamic_b - transactional_b_before).abs().max().item<double>() == 0.0);
     assert((*transactional_m - transactional_m_before).abs().max().item<double>() == 0.0);
     assert((*transactional_v - transactional_v_before).abs().max().item<double>() == 0.0);
+    assert(qwen36_get_context_health(ctx) == 0);
     std::printf("native_qwen36_transactional_adam_failure_smoke ok\n");
 
     const int64_t unknown_adapter_ids[] = {adapter_two + 1000};
@@ -936,6 +938,16 @@ int main() {
     std::printf("native_qwen36_heterogeneous_v2_smoke loss=%0.8f ok\n",
         heterogeneous_loss);
     assert(qwen36_remove_lora(ctx, heterogeneous_restore) == 1);
+    setenv("QWEN36_TEST_POISON_DYNAMIC_RECOVERY", "1", 1);
+    assert(qwen36_train_multi_lora_selected_v2(
+        ctx, &selected_input_ids, &selected_target_mask,
+        &selected_attention_mask, unknown_adapter_ids, 1) < 0.0);
+    unsetenv("QWEN36_TEST_POISON_DYNAMIC_RECOVERY");
+    assert(qwen36_get_context_health(ctx) == -1);
+    assert(qwen36_train_multi_lora_selected_v2(
+        ctx, &selected_input_ids, &selected_target_mask,
+        &selected_attention_mask, selected_adapter_ids, 1) < 0.0);
+    std::printf("native_qwen36_dynamic_recovery_poison_smoke ok\n");
     qwen36_free_training_context(ctx);
 
     // Dense Qwen3.5 variants use the same per-sample activation path for

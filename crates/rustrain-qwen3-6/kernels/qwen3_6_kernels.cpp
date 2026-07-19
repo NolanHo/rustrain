@@ -2895,6 +2895,9 @@ struct TrainingContext {
     // Set when a legacy NCCL setter supplies an incompatible mixed topology.
     // Training entry points reject the context before touching parameters.
     bool topology_invalid = false;
+    // A failed transactional recovery quarantines this context. Continuing
+    // would risk rank-divergent NCCL collectives or tenant state corruption.
+    bool poisoned = false;
     int cuda_device = 0;
 // ──────────────────────────────────────────────────────────────────────
 };
@@ -3553,9 +3556,19 @@ static bool adapter_collective_all_succeeded(
     return succeeded.to(at::kCPU).item<int32_t>() != 0;
 }
 
+static void validate_dynamic_context_health(TrainingContext* ctx) {
+    TORCH_CHECK(ctx, "dynamic multi-LoRA requires a valid training context");
+    const bool local_healthy = !ctx->poisoned;
+    const bool globally_healthy = adapter_collective_all_succeeded(
+        ctx, local_healthy);
+    TORCH_CHECK(local_healthy && globally_healthy,
+        "dynamic multi-LoRA context is poisoned; restart the worker");
+}
+
 static void require_clear_accumulation_for_registry_mutation(
     TrainingContext* ctx
 ) {
+    validate_dynamic_context_health(ctx);
     const bool local_clear = ctx && !ctx->accumulation_active &&
         ctx->accumulated_token_weight == 0.0;
     TORCH_CHECK(local_clear,
@@ -9516,6 +9529,8 @@ static double qwen36_train_multi_lora_impl(
         const bool train_only = mode == DynamicMultiLoraMode::TrainOnly;
         const bool finalize_only = mode == DynamicMultiLoraMode::FinalizeOnly;
         if (finalize_only && finalizer_phase) *finalizer_phase = 0;
+        if (mode == DynamicMultiLoraMode::TrainAndFinalize)
+            validate_dynamic_context_health(ctx);
         validate_native_execution_topology(ctx);
         auto* input_ids_tensor = reinterpret_cast<at::Tensor*>(input_ids_ptr);
         auto* target_mask_tensor = reinterpret_cast<at::Tensor*>(target_mask_ptr);
@@ -10250,6 +10265,7 @@ __attribute__((visibility("default"))) double qwen36_train_multi_lora_selected(
     try {
         TORCH_CHECK(ctx,
             "selected multi-LoRA requires a valid training context");
+        validate_dynamic_context_health(ctx);
         validate_native_execution_topology(ctx);
         validate_adapter_collective_registry(
             ctx, adapter_ids, n_adapters, lora_rank, false);
@@ -10282,11 +10298,23 @@ __attribute__((visibility("default"))) double qwen36_train_multi_lora_selected(
         restore_registry();
         return loss;
     } catch (const std::exception& e) {
-        try { restore_registry(); } catch (...) {}
+        try {
+            restore_registry();
+        } catch (...) {
+            if (ctx) ctx->poisoned = true;
+            fprintf(stderr,
+                "[train_multi_selected] registry restore FAILED; context poisoned\n");
+        }
         fprintf(stderr, "[train_multi_selected] FAILED: %s\n", e.what());
         return -1.0;
     } catch (...) {
-        try { restore_registry(); } catch (...) {}
+        try {
+            restore_registry();
+        } catch (...) {
+            if (ctx) ctx->poisoned = true;
+            fprintf(stderr,
+                "[train_multi_selected] registry restore FAILED; context poisoned\n");
+        }
         fprintf(stderr, "[train_multi_selected] FAILED: unknown exception\n");
         return -1.0;
     }
@@ -10420,6 +10448,7 @@ static double qwen36_train_multi_lora_selected_impl(
     std::vector<size_t> selected_indexes;
     std::vector<uint8_t> moved;
     std::vector<int64_t> original_steps;
+    bool recovery_failed = false;
     bool registry_detached = false;
     bool selected_registry_installed = false;
     at::Tensor selected_loss_numerators;
@@ -10468,10 +10497,12 @@ static double qwen36_train_multi_lora_selected_impl(
                 ctx->adapters.clear();
             }
         } catch (const std::exception& e) {
+            recovery_failed = true;
             fprintf(stderr,
                 "[train_multi_selected_v2] group recovery FAILED: %s\n",
                 e.what());
         } catch (...) {
+            recovery_failed = true;
             fprintf(stderr,
                 "[train_multi_selected_v2] group recovery FAILED\n");
         }
@@ -10487,35 +10518,49 @@ static double qwen36_train_multi_lora_selected_impl(
                 ctx->accumulated_token_weight = 0.0;
             }
         } catch (const std::exception& e) {
+            recovery_failed = true;
             fprintf(stderr,
                 "[train_multi_selected_v2] gradient cleanup FAILED: %s\n",
                 e.what());
         } catch (...) {
+            recovery_failed = true;
             fprintf(stderr,
                 "[train_multi_selected_v2] gradient cleanup FAILED\n");
         }
         try {
             rollback();
         } catch (const std::exception& e) {
+            recovery_failed = true;
             fprintf(stderr,
                 "[train_multi_selected_v2] rollback FAILED: %s\n", e.what());
         } catch (...) {
+            recovery_failed = true;
             fprintf(stderr, "[train_multi_selected_v2] rollback FAILED\n");
         }
         try {
             restore_registry();
         } catch (const std::exception& e) {
+            recovery_failed = true;
             fprintf(stderr,
                 "[train_multi_selected_v2] registry restore FAILED: %s\n",
                 e.what());
         } catch (...) {
+            recovery_failed = true;
             fprintf(stderr,
                 "[train_multi_selected_v2] registry restore FAILED\n");
+        }
+        if (env_enabled("QWEN36_TEST_POISON_DYNAMIC_RECOVERY"))
+            recovery_failed = true;
+        if (ctx && recovery_failed) {
+            ctx->poisoned = true;
+            fprintf(stderr,
+                "[train_multi_selected_v2] context poisoned after failed recovery\n");
         }
     };
     try {
         TORCH_CHECK(ctx,
             "heterogeneous selected training requires a context");
+        validate_dynamic_context_health(ctx);
         validate_native_execution_topology(ctx);
         const bool local_request_valid = adapter_ids && n_adapters > 0;
         TORCH_CHECK(adapter_collective_all_succeeded(
@@ -11621,6 +11666,7 @@ static int64_t qwen36_add_lora_impl(
     try {
         auto* ctx = reinterpret_cast<TrainingContext*>(ctx_ptr);
         TORCH_CHECK(ctx, "dynamic LoRA registration requires a context");
+        validate_dynamic_context_health(ctx);
         TrainingContext::LoRAAdapter adapter{};
         int64_t local_rank = 0;
         std::string request_error;
@@ -12336,6 +12382,7 @@ __attribute__((visibility("default"))) int32_t qwen36_eval_multi_lora_selected_v
         TORCH_CHECK(ctx && adapter_ids && n_adapters > 0 &&
                 adapter_losses_out && adapter_loss_capacity >= n_adapters,
             "selected multi-LoRA eval requires valid IDs and output storage");
+        validate_dynamic_context_health(ctx);
         validate_native_execution_topology(ctx);
         TORCH_CHECK(ctx->pp_world_size == 1 && ctx->cp_world_size == 1,
             "selected multi-LoRA eval requires PP=1 and CP=1");
@@ -12675,6 +12722,14 @@ int32_t qwen36_get_accumulation_active(void* ctx_ptr) {
     if (!ctx_ptr) return -1;
     return reinterpret_cast<TrainingContext*>(ctx_ptr)->accumulation_active
         ? 1 : 0;
+}
+
+// 0 means usable, -1 means null or quarantined. The worker uses this after a
+// failed dynamic-LoRA transaction to decide whether the session can continue.
+__attribute__((visibility("default")))
+int32_t qwen36_get_context_health(void* ctx_ptr) {
+    if (!ctx_ptr) return -1;
+    return reinterpret_cast<TrainingContext*>(ctx_ptr)->poisoned ? -1 : 0;
 }
 
 __attribute__((visibility("default")))
