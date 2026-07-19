@@ -1,5 +1,6 @@
 #include <ATen/ATen.h>
 #include <c10/cuda/CUDAStream.h>
+#include <c10/cuda/CUDACachingAllocator.h>
 #include <cuda_runtime.h>
 
 #include <algorithm>
@@ -37,6 +38,13 @@ extern "C" void* qwen36_create_training_context_ex(
     double, double, double, double, double, int64_t, double, int64_t,
     const int64_t*, int64_t, const char*, int32_t);
 extern "C" int32_t qwen36_init_nccl(void*);
+extern "C" int32_t qwen36_init_parallel_nccl_v2(
+    void*, int32_t, int32_t,
+    int32_t, int32_t, int32_t,
+    int32_t, int32_t, int32_t,
+    int32_t, int32_t, int32_t,
+    int32_t, int32_t, int32_t,
+    int32_t, int32_t, int32_t);
 extern "C" double qwen36_train_step(void*, void*, void*, void*);
 extern "C" void qwen36_free_training_context(void*);
 
@@ -148,9 +156,11 @@ static size_t used_since(size_t initial_free, size_t observed_free) {
 int main() {
     const char* mode_env = std::getenv("BENCH_MODE");
     const std::string mode = mode_env ? mode_env : "single";
-    assert(mode == "single" || mode == "tp2");
+    assert(mode == "single" || mode == "tp2" || mode == "cp2");
     const bool use_tp = mode == "tp2";
-    const int expected_world = use_tp ? 2 : 1;
+    const bool use_cp = mode == "cp2";
+    const int expected_world = (use_tp || use_cp) ? 2 : 1;
+    const int weight_shards = use_tp ? expected_world : 1;
     const int rank = std::getenv("RANK") ? std::atoi(std::getenv("RANK")) : 0;
     const int world = std::getenv("WORLD_SIZE")
         ? std::atoi(std::getenv("WORLD_SIZE")) : 1;
@@ -181,9 +191,10 @@ int main() {
     assert(seq >= 2 && hidden > 0 && key_dim > 0 && value_dim > 0);
     assert(value_heads % key_heads == 0);
     assert(key_heads % expected_world == 0 && value_heads % expected_world == 0);
-    assert(lora_rank % expected_world == 0);
-    assert(vocab % expected_world == 0);
+    assert(!use_tp || lora_rank % expected_world == 0);
+    assert(!use_tp || vocab % expected_world == 0);
 
+    c10::cuda::CUDACachingAllocator::resetPeakStats(local_rank);
     size_t free_start = 0, total_bytes = 0;
     assert(cudaMemGetInfo(&free_start, &total_bytes) == cudaSuccess);
     size_t min_observed_free = free_start;
@@ -193,15 +204,18 @@ int main() {
     for (int64_t layer = 0; layer < layers; ++layer) {
         append_gdn_layer(weights, layer, hidden, intermediate,
             key_heads, value_heads, key_dim, value_dim, conv_kernel,
-            expected_world);
+            weight_shards);
     }
     for (auto& weight : weights) weight.set_requires_grad(false);
     auto weight_ptrs = pointers(weights);
 
-    const int local_vocab = vocab / expected_world;
-    auto embed = seeded_randn({local_vocab, hidden}, 0.0020, 31 + rank);
+    const int local_vocab = vocab / weight_shards;
+    const int rank_seed_offset = use_tp ? rank : 0;
+    auto embed = seeded_randn(
+        {local_vocab, hidden}, 0.0020, 31 + rank_seed_offset);
     auto final_norm = unit_weight({hidden});
-    auto lm_head = seeded_randn({local_vocab, hidden}, 0.0020, 37 + rank);
+    auto lm_head = seeded_randn(
+        {local_vocab, hidden}, 0.0020, 37 + rank_seed_offset);
     embed.set_requires_grad(false);
     final_norm.set_requires_grad(false);
     lm_head.set_requires_grad(false);
@@ -238,14 +252,23 @@ int main() {
     assert(cudaMemGetInfo(&free_before_context, &total_bytes) == cudaSuccess);
     min_observed_free = std::min(min_observed_free, free_before_context);
     setenv("TP_SIZE", use_tp ? "2" : "1", 1);
+    setenv("CP_SIZE", use_cp ? "2" : "1", 1);
+    setenv("EP_SIZE", "1", 1);
+    setenv("DP_SIZE", "1", 1);
+    setenv("PP_SIZE", "1", 1);
+    setenv("RUSTRAIN_TP_RANK", use_tp ? std::to_string(rank).c_str() : "0", 1);
+    setenv("RUSTRAIN_CP_RANK", use_cp ? std::to_string(rank).c_str() : "0", 1);
+    setenv("RUSTRAIN_EP_RANK", "0", 1);
+    setenv("RUSTRAIN_DP_RANK", "0", 1);
+    setenv("RUSTRAIN_PP_RANK", "0", 1);
     unsetenv("RUSTRAIN_DATA_PARALLEL");
-    void* context = use_tp
+    void* context = (use_tp || use_cp)
         ? qwen36_create_training_context_ex(
             weight_ptrs.data(), weight_ptrs.size(), &embed, &final_norm, &lm_head,
             configs.data(), layers, static_cast<int32_t>(at::kBFloat16),
             1.0, 1e-3, 0.9, 0.999, 1e-8, vocab, 1e-5, lora_rank,
             target_layers.data(), layers, targets,
-            kBaseTpAttention | kVocabParallel)
+            use_tp ? kBaseTpAttention | kVocabParallel : 0)
         : qwen36_create_training_context(
             weight_ptrs.data(), weight_ptrs.size(), &embed, &final_norm, &lm_head,
             configs.data(), layers, static_cast<int32_t>(at::kBFloat16),
@@ -253,6 +276,15 @@ int main() {
             target_layers.data(), layers, targets);
     assert(context);
     if (use_tp) assert(qwen36_init_nccl(context) == 0);
+    if (use_cp) {
+        assert(qwen36_init_parallel_nccl_v2(
+            context, rank, world,
+            0, 1, 0,
+            rank, 2, 0,
+            0, 1, 0,
+            0, 1, 0,
+            0, 1, 0) == 0);
+    }
 
     size_t free_after_context = 0;
     assert(cudaMemGetInfo(&free_after_context, &total_bytes) == cudaSuccess);
@@ -264,6 +296,7 @@ int main() {
         assert(std::isfinite(last_loss));
     }
     assert(cudaDeviceSynchronize() == cudaSuccess);
+    c10::cuda::CUDACachingAllocator::resetPeakStats(local_rank);
 
     size_t free_after_warmup = 0;
     assert(cudaMemGetInfo(&free_after_warmup, &total_bytes) == cudaSuccess);
@@ -304,6 +337,12 @@ int main() {
     const double layer_tokens = model_tokens * layers;
     const double model_tokens_per_second = model_tokens / (p50 / 1000.0);
     const double layer_tokens_per_second = layer_tokens / (p50 / 1000.0);
+
+    const auto allocator_stats =
+        c10::cuda::CUDACachingAllocator::getDeviceStats(local_rank);
+    constexpr size_t aggregate = 0;
+    const auto& allocated = allocator_stats.allocated_bytes[aggregate];
+    const auto& reserved = allocator_stats.reserved_bytes[aggregate];
 
     cudaDeviceProp properties{};
     assert(cudaGetDeviceProperties(&properties, local_rank) == cudaSuccess);
@@ -346,6 +385,8 @@ int main() {
         << gib(used_since(free_before_context, free_after_context)) << ","
         << "\"max_observed_resident_gib\":"
         << gib(used_since(free_start, min_observed_free)) << ","
+        << "\"allocator_peak_allocated_gib\":" << gib(allocated.peak) << ','
+        << "\"allocator_peak_reserved_gib\":" << gib(reserved.peak) << ','
         << "\"samples_ms\":[";
     for (size_t i = 0; i < times.size(); ++i) {
         if (i) output << ',';

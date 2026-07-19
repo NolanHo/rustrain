@@ -2,13 +2,13 @@
 set -euo pipefail
 
 usage() {
-    echo "usage: $0 {smoke|smoke-chunkwise|tpdp-smoke|bench-single|bench-tp2}" >&2
+    echo "usage: $0 {smoke|smoke-chunkwise|tpdp-smoke|bench-single|bench-tp2|bench-cp2}" >&2
     exit 2
 }
 
 mode="${1:-}"
 case "$mode" in
-    smoke|smoke-chunkwise|tpdp-smoke|bench-single|bench-tp2) ;;
+    smoke|smoke-chunkwise|tpdp-smoke|bench-single|bench-tp2|bench-cp2) ;;
     *) usage ;;
 esac
 
@@ -212,5 +212,10 @@ case "$mode" in
     bench-tp2)
         BENCH_MODE=tp2 TP_SIZE=2 "$python_bin" -m torch.distributed.run \
             --standalone --nnodes=1 --nproc-per-node=2 --no-python "$bench_bin"
+        ;;
+    bench-cp2)
+        BENCH_MODE=cp2 TP_SIZE=1 CP_SIZE=2 EP_SIZE=1 DP_SIZE=1 PP_SIZE=1 \
+            "$python_bin" -m torch.distributed.run --standalone \
+            --nnodes=1 --nproc-per-node=2 --no-python "$bench_bin"
         ;;
 esac
