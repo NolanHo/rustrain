@@ -1500,6 +1500,21 @@ mod tests {
     }
 
     #[test]
+    fn cuda_memory_fraction_must_be_finite_and_bounded() {
+        let mut config = qwen_lora_sft_config();
+        config.train.cuda_memory_fraction = f64::NAN;
+        assert!(validate_config(&config)
+            .expect_err("NaN CUDA memory fraction must fail")
+            .to_string()
+            .contains("cuda_memory_fraction"));
+        config.train.cuda_memory_fraction = 1.01;
+        assert!(validate_config(&config)
+            .expect_err("CUDA memory fraction above one must fail")
+            .to_string()
+            .contains("cuda_memory_fraction"));
+    }
+
+    #[test]
     fn qwen36_lora_sft_accepts_native_projection_targets() {
         let mut config = qwen_lora_sft_config();
         config.model.name = "qwen3_6_test".to_string();
