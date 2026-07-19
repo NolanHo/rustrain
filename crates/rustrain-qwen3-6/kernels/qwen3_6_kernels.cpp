@@ -2679,6 +2679,8 @@ static at::Tensor tp_allreduce_base_attention(
 static at::Tensor tp_copy_base_attention_input(
     TrainingContext* ctx, const at::Tensor& input);
 static bool base_tp_attention_enabled(const TrainingContext* ctx);
+static at::Tensor fused_full_attention_qkv_weight(
+    TrainingContext* ctx, int64_t layer_idx);
 
 static at::Tensor forward_single_layer(
     TrainingContext* ctx, const at::Tensor& hidden, at::Tensor** w, const LayerConfig* cfg,
@@ -2695,11 +2697,9 @@ static at::Tensor forward_single_layer(
     if (cfg->layer_type == 0) {
         // Full attention
         auto q_proj = *w[2], q_norm = *w[3], k_proj = *w[4], k_norm = *w[5], v_proj = *w[6], o_proj = *w[7];
-        const at::Tensor fused_qkv =
-            (ctx->lora_batch_valid && layer_idx >= 0 &&
-             layer_idx < static_cast<int64_t>(ctx->fused_full_attention_qkv_weights.size()))
-                ? ctx->fused_full_attention_qkv_weights[layer_idx]
-                : at::Tensor();
+        const at::Tensor fused_qkv = use_batched
+            ? fused_full_attention_qkv_weight(ctx, layer_idx)
+            : at::Tensor();
         TORCH_CHECK(!base_tp_attention_enabled(ctx) || use_batched,
             "base full-attention TP requires the activation-level LoRA path");
         if (use_batched) {
@@ -3149,6 +3149,15 @@ struct TrainingContext {
     int cuda_device = 0;
 // ──────────────────────────────────────────────────────────────────────
 };
+
+static at::Tensor fused_full_attention_qkv_weight(
+    TrainingContext* ctx, int64_t layer_idx
+) {
+    if (!ctx || layer_idx < 0 || layer_idx >= static_cast<int64_t>(
+            ctx->fused_full_attention_qkv_weights.size()))
+        return at::Tensor();
+    return ctx->fused_full_attention_qkv_weights[layer_idx];
+}
 
 struct RouterAuxLossFunction
     : public torch::autograd::Function<RouterAuxLossFunction> {
@@ -6705,10 +6714,7 @@ at::Tensor compute_attn_only(
             auto kp = *ctx->weight_ptrs[w_offset+4], kn = *ctx->weight_ptrs[w_offset+5];
             auto vp = *ctx->weight_ptrs[w_offset+6], op = *ctx->weight_ptrs[w_offset+7];
             const at::Tensor fused_qkv =
-                (layer_idx >= 0 && layer_idx < static_cast<int64_t>(
-                    ctx->fused_full_attention_qkv_weights.size()))
-                    ? ctx->fused_full_attention_qkv_weights[layer_idx]
-                    : at::Tensor();
+                fused_full_attention_qkv_weight(ctx, layer_idx);
             return full_attention_batched(
                 ctx, attn_input, layer_idx, qp, qn, kp, kn, vp, op,
                 cfg.num_heads, cfg.num_kv_heads, cfg.head_dim,
@@ -7853,12 +7859,6 @@ struct PipelineLossResult {
     at::Tensor sample_loss_numerators;
     at::Tensor sample_token_counts;
 };
-
-static at::Tensor global_dynamic_adapter_losses(
-    TrainingContext* ctx,
-    at::Tensor loss_numerators,
-    at::Tensor token_counts
-);
 
 static PipelineLossResult pipeline_compute_loss(
     TrainingContext* ctx,
