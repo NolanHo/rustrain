@@ -1492,7 +1492,8 @@ static at::Tensor full_attention_batched(TrainingContext* ctx, const at::Tensor&
     const at::Tensor& v_proj, const at::Tensor& o_proj,
     int64_t num_heads, int64_t num_kv_heads, int64_t head_dim,
     double partial_rotary_factor, double rope_theta,
-    double rms_eps, at::ScalarType kind, const at::Tensor& attention_mask);
+    double rms_eps, at::ScalarType kind, const at::Tensor& attention_mask,
+    const at::Tensor& fused_qkv);
 static at::Tensor linear_attention_batched(TrainingContext* ctx, const at::Tensor& hidden,
     int64_t layer_idx, const at::Tensor& in_proj_qkv, const at::Tensor& in_proj_z,
     const at::Tensor& in_proj_a, const at::Tensor& in_proj_b,
@@ -2694,6 +2695,11 @@ static at::Tensor forward_single_layer(
     if (cfg->layer_type == 0) {
         // Full attention
         auto q_proj = *w[2], q_norm = *w[3], k_proj = *w[4], k_norm = *w[5], v_proj = *w[6], o_proj = *w[7];
+        const at::Tensor fused_qkv =
+            (ctx->lora_batch_valid && layer_idx >= 0 &&
+             layer_idx < static_cast<int64_t>(ctx->fused_full_attention_qkv_weights.size()))
+                ? ctx->fused_full_attention_qkv_weights[layer_idx]
+                : at::Tensor();
         TORCH_CHECK(!base_tp_attention_enabled(ctx) || use_batched,
             "base full-attention TP requires the activation-level LoRA path");
         if (use_batched) {
@@ -2703,7 +2709,7 @@ static at::Tensor forward_single_layer(
                 q_proj, q_norm, k_proj, k_norm, v_proj, o_proj,
                 cfg->num_heads, cfg->num_kv_heads, cfg->head_dim,
                 cfg->partial_rotary_factor, cfg->rope_theta, cfg->rms_eps, kind,
-                attention_mask);
+                attention_mask, fused_qkv);
         } else {
             // Weight-level LoRA (legacy: modify weights, single forward)
             q_proj = apply_multi_lora(ctx, layer_idx, 0, q_proj);
@@ -2931,6 +2937,10 @@ struct TrainingContext {
     // context-owned concatenation so the activation-level LoRA path computes
     // both with one GEMM without duplicating the large QKV/Z weights.
     std::vector<at::Tensor> fused_gdn_ab_weights;
+    // Optional full-attention base QKV concatenation. This is opt-in because
+    // it duplicates frozen Q/K/V storage, but it reduces three base GEMMs to
+    // one for activation-level LoRA and TP-local attention.
+    std::vector<at::Tensor> fused_full_attention_qkv_weights;
     int64_t num_layers;
 
     // Attention mask [batch, seq] — 1 for real tokens, 0 for padding
@@ -3939,6 +3949,85 @@ static void validate_pipeline_window_collective_registry(
             "must use the same runtime configuration and execute the same "
             "window and schedule");
     }
+}
+
+// Selected dynamic pipeline requests must agree across every axis that can
+// execute the same adapter projection. PP stages intentionally have different
+// tensor layouts, so this uses the canonical request identity rather than the
+// stage-local adapter tensor layout hash.
+static void validate_pipeline_selected_adapter_request(
+    TrainingContext* ctx,
+    const int64_t* adapter_ids,
+    int32_t adapter_count
+) {
+    TORCH_CHECK(ctx && adapter_ids && adapter_count > 0,
+        "selected pipeline request requires at least one adapter ID");
+    AdapterRegistryHash hash;
+    hash_collective_request_topology(hash, ctx);
+    hash.add_u64(static_cast<uint64_t>(adapter_count));
+    int32_t found_count = 0;
+    for (int32_t index = 0; index < adapter_count; ++index) {
+        const int64_t requested_id = adapter_ids[index];
+        hash.add_u64(static_cast<uint64_t>(requested_id));
+        auto it = std::find_if(ctx->adapters.begin(), ctx->adapters.end(),
+            [requested_id](const auto& adapter) {
+                return adapter.id == requested_id;
+            });
+        if (it == ctx->adapters.end()) {
+            hash.add_u64(0x6d697373696e67ULL);
+            continue;
+        }
+        hash.add_u64(0x666f756e64ULL);
+        hash_adapter_request_identity(hash, *it);
+        ++found_count;
+    }
+    constexpr uint64_t kPositiveInt64Mask =
+        static_cast<uint64_t>(std::numeric_limits<int64_t>::max());
+    const std::vector<int64_t> values{
+        found_count == adapter_count ? 1 : 0,
+        adapter_count,
+        found_count,
+        static_cast<int64_t>(hash.first & kPositiveInt64Mask),
+        static_cast<int64_t>(hash.second & kPositiveInt64Mask),
+    };
+    auto options = at::TensorOptions().dtype(at::kLong).device(
+        at::kCUDA, ctx->cuda_device);
+    auto minimum = at::tensor(values, options);
+    auto maximum = minimum.clone();
+    auto stream = c10::cuda::getCurrentCUDAStream(ctx->cuda_device).stream();
+    auto reduce_axis = [&](ncclComm_t communicator, const char* axis) {
+        if (!communicator) return;
+        auto error = ncclAllReduce(
+            minimum.data_ptr<int64_t>(), minimum.data_ptr<int64_t>(),
+            minimum.numel(), ncclInt64, ncclMin, communicator, stream);
+        TORCH_CHECK(error == ncclSuccess,
+            "selected pipeline request minimum ", axis,
+            " reduction failed: ", ncclGetErrorString(error));
+        error = ncclAllReduce(
+            maximum.data_ptr<int64_t>(), maximum.data_ptr<int64_t>(),
+            maximum.numel(), ncclInt64, ncclMax, communicator, stream);
+        TORCH_CHECK(error == ncclSuccess,
+            "selected pipeline request maximum ", axis,
+            " reduction failed: ", ncclGetErrorString(error));
+    };
+    reduce_axis(ctx->nccl_comm, "EP");
+    reduce_axis(ctx->dp_comm, "DP");
+    reduce_axis(ctx->tp_comm, "TP");
+    reduce_axis(ctx->cp_comm, "CP");
+    reduce_axis(ctx->pp_control_comm ? ctx->pp_control_comm : ctx->pp_comm,
+        "PP");
+    const auto minimum_cpu = minimum.to(at::kCPU);
+    const auto maximum_cpu = maximum.to(at::kCPU);
+    const auto* minimum_data = minimum_cpu.data_ptr<int64_t>();
+    const auto* maximum_data = maximum_cpu.data_ptr<int64_t>();
+    for (int64_t index = 0; index < minimum.numel(); ++index) {
+        TORCH_CHECK(minimum_data[index] == maximum_data[index],
+            "selected dynamic pipeline adapter request differs across "
+            "distributed ranks");
+    }
+    TORCH_CHECK(minimum_data[0] == 1,
+        "selected dynamic pipeline adapter request is invalid on one or "
+        "more distributed ranks");
 }
 
 static bool adapter_collective_all_succeeded(
@@ -6614,11 +6703,16 @@ at::Tensor compute_attn_only(
             auto qp = *ctx->weight_ptrs[w_offset+2], qn = *ctx->weight_ptrs[w_offset+3];
             auto kp = *ctx->weight_ptrs[w_offset+4], kn = *ctx->weight_ptrs[w_offset+5];
             auto vp = *ctx->weight_ptrs[w_offset+6], op = *ctx->weight_ptrs[w_offset+7];
+            const at::Tensor fused_qkv =
+                (layer_idx >= 0 && layer_idx < static_cast<int64_t>(
+                    ctx->fused_full_attention_qkv_weights.size()))
+                    ? ctx->fused_full_attention_qkv_weights[layer_idx]
+                    : at::Tensor();
             return full_attention_batched(
                 ctx, attn_input, layer_idx, qp, qn, kp, kn, vp, op,
                 cfg.num_heads, cfg.num_kv_heads, cfg.head_dim,
                 cfg.partial_rotary_factor, cfg.rope_theta, cfg.rms_eps, kind,
-                ctx->attention_mask);
+                ctx->attention_mask, fused_qkv);
         } else {
             auto qkv = *ctx->weight_ptrs[w_offset+2], z = *ctx->weight_ptrs[w_offset+3];
             auto a = *ctx->weight_ptrs[w_offset+4], b = *ctx->weight_ptrs[w_offset+5];
@@ -6885,7 +6979,8 @@ static at::Tensor full_attention_batched(
     int64_t num_heads, int64_t num_kv_heads, int64_t head_dim,
     double partial_rotary_factor, double rope_theta,
     double rms_eps, at::ScalarType kind,
-    const at::Tensor& attention_mask
+    const at::Tensor& attention_mask,
+    const at::Tensor& fused_qkv
 ) {
     // Compute Q/K/V with base weight, then add LoRA delta if present
     auto projection_input = tp_copy_base_attention_input(ctx, hidden);
@@ -6899,10 +6994,32 @@ static at::Tensor full_attention_batched(
         num_kv_heads /= ctx->tp_world_size;
     }
     int64_t qkv_dim = num_heads * head_dim;
+    const int64_t q_projection_dim = num_heads * head_dim * 2;
+    const int64_t k_projection_dim = num_kv_heads * head_dim;
+    const bool use_fused_qkv = fused_qkv.defined();
+    if (use_fused_qkv) {
+        TORCH_CHECK(fused_qkv.dim() == 2 &&
+                fused_qkv.size(0) == q_projection_dim +
+                    2 * k_projection_dim &&
+                fused_qkv.size(1) == projection_input.size(2),
+            "fused full-attention QKV weight shape is incompatible with "
+            "the local head geometry");
+    }
 
-    auto q = at::matmul(projection_input, q_proj.t());
-    auto k = at::matmul(projection_input, k_proj.t());
-    auto v = at::matmul(projection_input, v_proj.t());
+    at::Tensor q;
+    at::Tensor k;
+    at::Tensor v;
+    if (use_fused_qkv) {
+        auto qkv = at::matmul(projection_input, fused_qkv.t());
+        q = qkv.narrow(-1, 0, q_projection_dim);
+        k = qkv.narrow(-1, q_projection_dim, k_projection_dim);
+        v = qkv.narrow(-1, q_projection_dim + k_projection_dim,
+            k_projection_dim);
+    } else {
+        q = at::matmul(projection_input, q_proj.t());
+        k = at::matmul(projection_input, k_proj.t());
+        v = at::matmul(projection_input, v_proj.t());
+    }
 
     // Apply activation-level LoRA: q += B@(A@hidden) * scaling
     auto it_q = ctx->lora_batch_cache.find(lora_cache_key(layer_idx, 0));
@@ -8406,19 +8523,8 @@ qwen36_pipeline_begin_dynamic_selected_v1(
             ctx, local_valid && !selected.empty());
         TORCH_CHECK(local_valid && !selected.empty() && globally_valid,
             "selected dynamic pipeline adapter request is invalid on one or more ranks");
-        auto options = at::TensorOptions().dtype(at::kLong).device(
-            at::kCUDA, ctx->cuda_device);
-        auto local = at::tensor(ids, options);
-        auto minimum = local.clone();
-        auto maximum = local.clone();
-        auto stream = c10::cuda::getCurrentCUDAStream(ctx->cuda_device).stream();
-        auto comm = ctx->pp_control_comm ? ctx->pp_control_comm : ctx->pp_comm;
-        TORCH_CHECK(ncclAllReduce(local.data_ptr<int64_t>(), minimum.data_ptr<int64_t>(),
-                local.numel(), ncclInt64, ncclMin, comm, stream) == ncclSuccess &&
-            ncclAllReduce(local.data_ptr<int64_t>(), maximum.data_ptr<int64_t>(),
-                local.numel(), ncclInt64, ncclMax, comm, stream) == ncclSuccess &&
-            at::equal(minimum, maximum),
-            "selected dynamic pipeline adapter order differs across PP stages");
+        validate_pipeline_selected_adapter_request(
+            ctx, adapter_ids, adapter_count);
         const int32_t status = qwen36_pipeline_begin_v1(ctx_ptr, window_spec);
         if (status != 0) return status;
         ctx->pp_window.selected_adapter_indices = std::move(selected);
@@ -10074,6 +10180,28 @@ static void* qwen36_create_training_context_impl(
                         layer);
                     ctx->fused_gdn_ab_weights[layer] =
                         at::cat({*a, *b}, 0).contiguous();
+                }
+                weight_offset += weight_count_for_layer(cfg);
+            }
+        }
+        ctx->fused_full_attention_qkv_weights.resize(num_layers);
+        if (env_enabled("QWEN36_FUSED_QKV", false)) {
+            at::NoGradGuard guard;
+            int64_t weight_offset = 0;
+            for (int64_t layer = 0; layer < num_layers; ++layer) {
+                const auto& cfg = ctx->layer_configs[layer];
+                if (cfg.layer_type == 0) {
+                    auto* q = ctx->weight_ptrs[weight_offset + 2];
+                    auto* k = ctx->weight_ptrs[weight_offset + 4];
+                    auto* v = ctx->weight_ptrs[weight_offset + 6];
+                    TORCH_CHECK(q && k && v && q->dim() == 2 &&
+                            k->dim() == 2 && v->dim() == 2 &&
+                            q->size(1) == k->size(1) &&
+                            q->size(1) == v->size(1),
+                        "fused full-attention QKV requires matching input dimensions at layer ",
+                        layer);
+                    ctx->fused_full_attention_qkv_weights[layer] =
+                        at::cat({*q, *k, *v}, 0).contiguous();
                 }
                 weight_offset += weight_count_for_layer(cfg);
             }
