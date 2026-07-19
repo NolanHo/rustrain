@@ -140,7 +140,7 @@ ABI15 synthetic GDN TP benchmark 使用 3 层、S=512、H=2048、16 K heads、32
 
 上述结果是 ABI0 的纯 EP2 小模型历史基线。ABI19 在 TP2 x EP2、相同 source-sharded 语义下做了 matched routing-slot/packed 对照，并在每步训练后沿 EP、expert-DP、TP 依次做 MAX，从而让 4 个 rank 使用相同的全局最慢 rank 样本：p50 `9.007 -> 6.499 ms`，unique-token throughput `56.84k -> 78.78k/s`。Nsight Systems process-tree trace 同时记录到 CUDA kernel launch `6812 -> 5168`、NCCL SendRecv `96 -> 48` 和 AllGather `24 -> 12`；该 trace 采集于 benchmark-only world-max metrics collective 加入之前，因此不包含这个计时区间外的聚合。它证明 packed dispatcher 对当前 native 路径有效，但仍不等于 DeepEP 或 Megatron 的重叠能力。新增 TP2 dense sequence-parallel H20 smoke 只验证 all-gather/reduce-scatter/loss-gather 与固定 LoRA 更新，不提供吞吐结论。
 
-目标 H20 的 ABI1 环境有 PyTorch 2.12.1、Triton 和 NumPy，但没有 Megatron、Transformer Engine、FLA、DeepEP、flash-attn、Apex 或缓存的兼容 prebuilt wheel。虽然本地 Megatron Lite 源码包含 Qwen3.5 LoRA adapter，目标机仍不具备其高性能依赖。因此当前不能诚实地产出 matched Megatron-LoRA benchmark，且本工作没有通过 JIT 或自构建依赖绕过该限制。
+目标 H20 的 ABI1 环境有 PyTorch 2.12.1+cu130、Triton 和 NumPy，但没有 Megatron Core、Transformer Engine、FLA、DeepEP、FlashMLA、flash-attn 或 Apex。PyTorch SDPA 自带的 flash backend 可用；现存 TE 2.11 wheel 是 CPython 3.10/cu12，不能加载到当前 CPython 3.12/cu130 环境。已有 `mint:18-sm90` runtime manifest 声明预构建 Torch、TE 和 DeepEP，但这些 image-managed native 模块不在当前 Pod，节点也没有可用的容器运行时；符合“不自构建依赖”约束的路径是由平台启动该预构建镜像。FLA 的高性能 GDN 路径依赖 Triton runtime JIT，只适合作为外部 Megatron warmup 后参考，不进入 rustrain 生产依赖。本地 Megatron Lite 已有 Qwen3.5 LoRA/GDN 和 matched benchmark 框架，但没有 Qwen3.6 model registration，当前 benchmark CLI 也还没有 LoRA-only 冻结入口。因此当前不能诚实地产出 matched Megatron-LoRA benchmark，且本工作没有通过 Python JIT 或自构建依赖绕过该限制。
 
 ## 验证边界
 

@@ -83,6 +83,8 @@ extern "C" int32_t qwen36_pipeline_finish_v1(
 extern "C" int32_t qwen36_pipeline_abort_v1(void*);
 extern "C" void qwen36_set_checkpoint(void*, int32_t, int64_t);
 extern "C" int32_t qwen36_set_max_grad_norm(void*, double);
+extern "C" int64_t qwen36_add_lora(
+    void*, int64_t, double, const int64_t*, int64_t, const char*);
 extern "C" int64_t qwen36_get_lora_count(void*);
 extern "C" void* qwen36_get_lora_a(void*, int64_t);
 extern "C" void* qwen36_get_lora_b(void*, int64_t);
@@ -425,6 +427,12 @@ int main() {
     const int64_t window_builds_before =
         qwen36_get_lora_batch_projection_build_count(window_context);
     assert(qwen36_pipeline_begin_v1(window_context, &window) == 0);
+    // Registry identity must remain immutable for the whole PP window.  A
+    // failed mutation must be uniform across stages and must not abort the
+    // active window or desynchronize its later P2P schedule.
+    const int64_t dynamic_target_layer = 0;
+    assert(qwen36_add_lora(
+        window_context, 2, 4.0, &dynamic_target_layer, 1, "q_proj") < 0);
     int64_t max_in_flight = 0;
     Qwen36PipelineResultV1 result{};
     result.struct_size = sizeof(Qwen36PipelineResultV1);

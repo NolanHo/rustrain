@@ -197,6 +197,12 @@ int main() {
     } else {
         assert(stage_lora_a->dim() == 0);
     }
+    // A single CP replica presenting a different canonical request must make
+    // every rank fail without letting unaffected PP stages skip the request
+    // consensus and deadlock.
+    const int64_t mismatched_target_layer = rank == 0 ? 1 : 0;
+    assert(qwen36_add_lora(
+        stage_context, 4, 8.0, &mismatched_target_layer, 1, "q_proj") < 0);
     const int64_t dynamic_target_layer = 0;
     const int64_t adapter_id = qwen36_add_lora(
         stage_context, 4, 8.0, &dynamic_target_layer, 1, "q_proj");

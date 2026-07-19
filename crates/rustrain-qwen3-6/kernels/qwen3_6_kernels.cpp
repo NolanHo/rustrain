@@ -3579,6 +3579,29 @@ static void validate_native_execution_topology(const TrainingContext* ctx) {
     }
 }
 
+// Adapter requests are canonical across pipeline stages.  A PP stage owns a
+// different contiguous layer slice, so the local layer count/start and local
+// tensor layouts must not participate in the request identity.  The full
+// topology hash above remains the stricter check for ranks that share tensor
+// ownership (TP/EP/DP).
+static void hash_collective_request_topology(
+    AdapterRegistryHash& hash, const TrainingContext* ctx
+) {
+    hash.add_u64(ctx->global_num_layers);
+    hash.add_u64(ctx->tp_world_size);
+    hash.add_u64(ctx->cp_world_size);
+    hash.add_u64(ctx->ep_world_size);
+    hash.add_u64(ctx->dp_world_size);
+    hash.add_u64(ctx->pp_world_size);
+    hash.add_u64(ctx->base_tp_attention);
+    hash.add_u64(ctx->base_tp_mlp);
+    hash.add_u64(ctx->vocab_parallel);
+    hash.add_u64(ctx->sequence_parallel);
+    hash.add_u64(ctx->expert_parallel);
+    hash.add_u64(ctx->data_parallel);
+    hash_collective_runtime_config(hash, ctx);
+}
+
 static void validate_adapter_collective_registry(
     TrainingContext* ctx,
     const int64_t* requested_ids,
@@ -3900,7 +3923,7 @@ static bool adapter_collective_all_succeeded(
     bool local_success
 ) {
     if (!ctx || (!ctx->nccl_comm && !ctx->dp_comm && !ctx->tp_comm &&
-            !ctx->cp_comm))
+            !ctx->cp_comm && !ctx->pp_control_comm && !ctx->pp_comm))
         return local_success;
     c10::cuda::set_device(ctx->cuda_device);
     cudaSetDevice(ctx->cuda_device);
@@ -3920,6 +3943,8 @@ static bool adapter_collective_all_succeeded(
     reduce_axis(ctx->dp_comm, "DP");
     reduce_axis(ctx->tp_comm, "TP");
     reduce_axis(ctx->cp_comm, "CP");
+    reduce_axis(
+        ctx->pp_control_comm ? ctx->pp_control_comm : ctx->pp_comm, "PP");
     return succeeded.to(at::kCPU).item<int32_t>() != 0;
 }
 
@@ -4021,10 +4046,13 @@ static void require_clear_accumulation_for_registry_mutation(
 ) {
     validate_dynamic_context_health(ctx);
     const bool local_clear = ctx && !ctx->accumulation_active &&
-        ctx->accumulated_token_weight == 0.0;
-    TORCH_CHECK(local_clear,
-        "cannot mutate the dynamic LoRA registry while a gradient "
-        "accumulation window is pending; finalize or abort it first");
+        ctx->accumulated_token_weight == 0.0 &&
+        !ctx->pp_window.active;
+    const bool globally_clear = adapter_collective_all_succeeded(
+        ctx, local_clear);
+    TORCH_CHECK(local_clear && globally_clear,
+        "cannot mutate the dynamic LoRA registry while a gradient or "
+        "pipeline window is pending; finalize or abort it first");
 }
 
 static bool adapter_registration_phase_matches(
@@ -4085,16 +4113,16 @@ static bool adapter_registration_phase_matches(
     const auto maximum_cpu = maximum.to(at::kCPU);
     const auto* minimum_data = minimum_cpu.data_ptr<int64_t>();
     const auto* maximum_data = maximum_cpu.data_ptr<int64_t>();
-    for (int64_t index = 0; index < minimum.numel(); ++index) {
-        if (minimum_data[index] != maximum_data[index]) return false;
-    }
-    if (minimum_data[0] != 1) return false;
+    bool stage_matches = minimum_data[0] == 1;
+    for (int64_t index = 0; index < minimum.numel(); ++index)
+        stage_matches = stage_matches &&
+            minimum_data[index] == maximum_data[index];
 
     // Pipeline stages intentionally own different parameter layouts. Compare
     // only the canonical tenant request across PP/CP while the full layout
     // comparison above remains scoped to ranks sharing stage ownership.
     AdapterRegistryHash request_hash;
-    hash_collective_topology(request_hash, ctx);
+    hash_collective_request_topology(request_hash, ctx);
     request_hash.add_u64(phase);
     request_hash.add_u64(ctx->restore_without_parameter_sync);
     request_hash.add_u64(ctx->allow_heterogeneous_registration);
@@ -4104,7 +4132,7 @@ static bool adapter_registration_phase_matches(
         hash_adapter_request_identity(request_hash, adapter);
     hash_adapter_request_identity(request_hash, candidate);
     const std::vector<int64_t> request_values{
-        local_ready ? 1 : 0,
+        local_ready && stage_matches ? 1 : 0,
         static_cast<int64_t>(request_hash.first & kPositiveInt64Mask),
         static_cast<int64_t>(request_hash.second & kPositiveInt64Mask),
     };
@@ -12888,9 +12916,10 @@ static int64_t qwen36_add_lora_impl(
                 "native Qwen context rejected an incompatible distributed "
                 "topology");
             TORCH_CHECK(!ctx->accumulation_active &&
-                    ctx->accumulated_token_weight == 0.0,
-                "cannot mutate the dynamic LoRA registry while a gradient "
-                "accumulation window is pending; finalize or abort it first");
+                    ctx->accumulated_token_weight == 0.0 &&
+                    !ctx->pp_window.active,
+                "cannot mutate the dynamic LoRA registry while a gradient or "
+                "pipeline window is pending; finalize or abort it first");
             TORCH_CHECK(ctx->router_aux_loss_coef == 0.0,
                 "dynamic multi-LoRA requires router_aux_loss_coef=0 until "
                 "per-tenant routing statistics are implemented");
