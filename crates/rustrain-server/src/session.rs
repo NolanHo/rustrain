@@ -53,12 +53,14 @@ fn prepare_dynamic_pipeline_microbatches(
     if adapter_count == 0 {
         bail!("dynamic pipeline requires at least one selected adapter");
     }
-    let input_batch = input
-        .input_ids
-        .size()
-        .first()
-        .copied()
-        .ok_or_else(|| anyhow!("dynamic pipeline input_ids must be rank-2"))?;
+    let input_shape = input.input_ids.size();
+    if input_shape.len() != 2 {
+        bail!("dynamic pipeline input_ids must be rank-2");
+    }
+    if input.target_mask.size() != input_shape || input.attention_mask.size() != input_shape {
+        bail!("dynamic pipeline input and mask shapes must match");
+    }
+    let input_batch = input_shape[0];
     if input_batch <= 0 {
         bail!("dynamic pipeline input batch must be positive");
     }
