@@ -446,6 +446,11 @@ impl Qwen36AdapterArtifact {
 
     pub fn save(&self, path: &Path) -> Result<PathBuf> {
         let (tensor_path, config_path) = resolve_artifact_paths(path);
+        for (name, tensor) in &self.tensors {
+            if tensor.isfinite().all().int64_value(&[]) != 1 {
+                bail!("refusing to save non-finite LoRA tensor {name}");
+            }
+        }
         if let Some(parent) = tensor_path.parent() {
             fs::create_dir_all(parent)
                 .with_context(|| format!("failed to create {}", parent.display()))?;

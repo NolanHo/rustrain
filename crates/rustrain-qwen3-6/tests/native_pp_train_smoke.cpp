@@ -81,6 +81,7 @@ extern "C" int32_t qwen36_pipeline_tick_v1(
 extern "C" int32_t qwen36_pipeline_finish_v1(
     void*, int32_t, Qwen36PipelineResultV1*);
 extern "C" int32_t qwen36_pipeline_abort_v1(void*);
+extern "C" void qwen36_set_checkpoint(void*, int32_t, int64_t);
 extern "C" int64_t qwen36_get_lora_count(void*);
 extern "C" void* qwen36_get_lora_a(void*, int64_t);
 extern "C" void* qwen36_get_lora_b(void*, int64_t);
@@ -338,6 +339,78 @@ int main() {
     for (int64_t microbatch = num_microbatches - warmup;
          microbatch < num_microbatches; ++microbatch)
         schedule.emplace_back(-1, microbatch);
+
+    // Runtime kernel choices are part of the PP contract even when a stage
+    // does not own a GDN layer. Reject a mismatch before any data P2P begins.
+    if (rank == 0) {
+        setenv("QWEN36_GDN_INVERSE_BWD", "1", 1);
+    } else {
+        unsetenv("QWEN36_GDN_INVERSE_BWD");
+    }
+    Qwen36PipelineWindowV1 runtime_mismatch_window{
+        sizeof(Qwen36PipelineWindowV1), 1, 6, 1, 0, 1, 0};
+    assert(qwen36_pipeline_begin_v1(
+        window_context, &runtime_mismatch_window) != 0);
+    unsetenv("QWEN36_GDN_INVERSE_BWD");
+
+    if (rank == 0) {
+        setenv("QWEN36_GDN_STATE_CHECKPOINT_STRIDE", "invalid", 1);
+    } else {
+        setenv("QWEN36_GDN_STATE_CHECKPOINT_STRIDE", "4", 1);
+    }
+    runtime_mismatch_window.window_id = 2;
+    assert(qwen36_pipeline_begin_v1(
+        window_context, &runtime_mismatch_window) != 0);
+    unsetenv("QWEN36_GDN_STATE_CHECKPOINT_STRIDE");
+
+    if (rank == 0) qwen36_set_checkpoint(window_context, 1, 2);
+    runtime_mismatch_window.window_id = 3;
+    assert(qwen36_pipeline_begin_v1(
+        window_context, &runtime_mismatch_window) != 0);
+    if (rank == 0) qwen36_set_checkpoint(window_context, 0, 1);
+
+    if (rank == 0) {
+        setenv("QWEN36_EP_A2A_PACKED", "0", 1);
+    } else {
+        setenv("QWEN36_EP_A2A_PACKED", "1", 1);
+    }
+    runtime_mismatch_window.window_id = 4;
+    assert(qwen36_pipeline_begin_v1(
+        window_context, &runtime_mismatch_window) != 0);
+    unsetenv("QWEN36_EP_A2A_PACKED");
+
+    setenv("QWEN36_GDN_STATE_CHECKPOINT_STRIDE", "invalid", 1);
+    runtime_mismatch_window.window_id = 5;
+    assert(qwen36_pipeline_begin_v1(
+        window_context, &runtime_mismatch_window) != 0);
+    unsetenv("QWEN36_GDN_STATE_CHECKPOINT_STRIDE");
+
+    setenv("QWEN36_GDN_STATE_CHECKPOINT_STRIDE", "0", 1);
+    runtime_mismatch_window.window_id = 10;
+    assert(qwen36_pipeline_begin_v1(
+        window_context, &runtime_mismatch_window) != 0);
+    unsetenv("QWEN36_GDN_STATE_CHECKPOINT_STRIDE");
+
+    if (rank == 0) {
+        setenv("QWEN36_DISABLE_GROUPED_MM", "1", 1);
+    } else {
+        unsetenv("QWEN36_DISABLE_GROUPED_MM");
+    }
+    runtime_mismatch_window.window_id = 8;
+    assert(qwen36_pipeline_begin_v1(
+        window_context, &runtime_mismatch_window) != 0);
+    unsetenv("QWEN36_DISABLE_GROUPED_MM");
+
+    if (rank == 0) {
+        setenv("QWEN36_CE_TOKEN_TILE", "128", 1);
+    } else {
+        setenv("QWEN36_CE_TOKEN_TILE", "256", 1);
+    }
+    runtime_mismatch_window.window_id = 9;
+    assert(qwen36_pipeline_begin_v1(
+        window_context, &runtime_mismatch_window) != 0);
+    unsetenv("QWEN36_CE_TOKEN_TILE");
+
     Qwen36PipelineWindowV1 window{
         sizeof(Qwen36PipelineWindowV1), 1, 7, num_microbatches, 0, 1, 0};
     const int64_t window_builds_before =

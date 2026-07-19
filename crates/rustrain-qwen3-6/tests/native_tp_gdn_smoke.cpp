@@ -240,6 +240,25 @@ static bool is_column_parallel(const char* module) {
     return std::strcmp(module, "out_proj") != 0;
 }
 
+static at::Tensor expected_first_adam_step(
+    const at::Tensor& parameter,
+    const at::Tensor& first_moment,
+    const at::Tensor& second_moment,
+    double effective_beta1,
+    double effective_beta2
+) {
+    constexpr double lr = 1e-3;
+    constexpr double eps = 1e-8;
+    const float lr_scaled = static_cast<float>(
+        lr * std::sqrt(1.0 - effective_beta2) /
+        (1.0 - effective_beta1));
+    const float eps_scaled = static_cast<float>(
+        eps * std::sqrt(1.0 - effective_beta2));
+    return (parameter.to(at::kFloat) -
+        lr_scaled * first_moment /
+            (second_moment.sqrt() + eps_scaled)).to(at::kBFloat16);
+}
+
 static int64_t full_output_size(const char* module) {
     if (std::strcmp(module, "in_proj_qkv") == 0) return kQkvSize;
     if (std::strcmp(module, "in_proj_z") == 0) return kVSize;
@@ -433,6 +452,129 @@ struct ErrorSummary {
     double adam = 0.0;
 };
 
+static void check_backward_reference_parity(
+    void* context, const std::vector<LoraFixture>& fixtures,
+    std::vector<at::Tensor>& local_weights, Batch& batch, int rank
+) {
+    struct SavedEnv {
+        const char* name;
+        bool present;
+        std::string value;
+    };
+    std::vector<SavedEnv> saved_env;
+    for (const char* name : {
+             "QWEN36_DELTA_REFERENCE_BWD", "QWEN36_GDN_INVERSE_BWD",
+             "QWEN36_GDN_CHUNKWISE_BWD",
+             "QWEN36_GDN_STATE_CHECKPOINT_STRIDE"}) {
+        const char* value = std::getenv(name);
+        saved_env.push_back({name, value != nullptr, value ? value : ""});
+    }
+    unsetenv("QWEN36_DELTA_REFERENCE_BWD");
+    unsetenv("QWEN36_GDN_INVERSE_BWD");
+    unsetenv("QWEN36_GDN_CHUNKWISE_BWD");
+    setenv("QWEN36_GDN_STATE_CHECKPOINT_STRIDE", "4", 1);
+
+    // Stress both ordinary and near-zero recurrence decays without changing
+    // the baseline TP fixture used by the rest of this smoke test.
+    auto stress_a_log = at::tensor(
+        {0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 4.75f},
+        at::TensorOptions().device(at::kCUDA).dtype(at::kFloat))
+        .to(at::kBFloat16);
+    std::vector<at::Tensor> original_a_log;
+    original_a_log.reserve(kLayers);
+    for (int64_t layer = 0; layer < kLayers; ++layer) {
+        auto& local_a_log = local_weights[layer * 14 + 6];
+        original_a_log.push_back(local_a_log.clone());
+        local_a_log.copy_(stress_a_log.narrow(
+            0, rank * local_a_log.size(0), local_a_log.size(0)));
+    }
+
+    const double stable_loss = qwen36_train_micro_step(
+        context, &batch.input_ids, &batch.target_mask,
+        &batch.attention_mask, 1.0, 0);
+    assert(std::isfinite(stable_loss));
+    std::vector<at::Tensor> stable_a;
+    std::vector<at::Tensor> stable_b;
+    stable_a.reserve(fixtures.size());
+    stable_b.reserve(fixtures.size());
+    for (const auto& fixture : fixtures) {
+        const int64_t slot = fixture.layer * kPairsPerLayer + fixture.pair;
+        auto* a = reinterpret_cast<at::Tensor*>(
+            qwen36_get_lora_grad_accumulator(context, slot, 0));
+        auto* b = reinterpret_cast<at::Tensor*>(
+            qwen36_get_lora_grad_accumulator(context, slot, 1));
+        assert(a && b && a->scalar_type() == at::kFloat &&
+            b->scalar_type() == at::kFloat);
+        stable_a.push_back(a->clone());
+        stable_b.push_back(b->clone());
+    }
+    assert(qwen36_abort_gradient_accumulation(context) == 0);
+
+    setenv("QWEN36_DELTA_REFERENCE_BWD", "1", 1);
+    const double reference_loss = qwen36_train_micro_step(
+        context, &batch.input_ids, &batch.target_mask,
+        &batch.attention_mask, 1.0, 0);
+    assert(std::isfinite(reference_loss));
+
+    double worst_absolute = 0.0;
+    double worst_relative = 0.0;
+    double worst_reference = 0.0;
+    int64_t mismatches = 0;
+    int64_t significant_sign_mismatches = 0;
+    int64_t compared = 0;
+    for (size_t index = 0; index < fixtures.size(); ++index) {
+        const auto& fixture = fixtures[index];
+        const int64_t slot = fixture.layer * kPairsPerLayer + fixture.pair;
+        for (int is_b = 0; is_b < 2; ++is_b) {
+            auto* reference = reinterpret_cast<at::Tensor*>(
+                qwen36_get_lora_grad_accumulator(context, slot, is_b));
+            assert(reference && reference->scalar_type() == at::kFloat);
+            const auto& stable = is_b ? stable_b[index] : stable_a[index];
+            auto stable_f = stable.to(at::kFloat);
+            auto reference_f = reference->to(at::kFloat);
+            auto delta = (stable_f - reference_f).abs();
+            worst_reference = std::max(
+                worst_reference, reference_f.abs().max().item<double>());
+            worst_absolute = std::max(
+                worst_absolute, delta.max().item<double>());
+            worst_relative = std::max(
+                worst_relative, relative_l2(stable_f, reference_f));
+            auto close = at::isclose(
+                stable_f, reference_f, 1e-2, 1e-4, true);
+            mismatches += close.logical_not().sum().item<int64_t>();
+            auto sign_mismatch = stable_f.sign().ne(reference_f.sign());
+            significant_sign_mismatches += sign_mismatch
+                .logical_and(reference_f.abs().gt(1e-5))
+                .sum().item<int64_t>();
+            compared += reference_f.numel();
+        }
+    }
+    assert(qwen36_abort_gradient_accumulation(context) == 0);
+    for (int64_t layer = 0; layer < kLayers; ++layer) {
+        local_weights[layer * 14 + 6].copy_(original_a_log[layer]);
+    }
+    for (const auto& saved : saved_env) {
+        if (saved.present) {
+            setenv(saved.name, saved.value.c_str(), 1);
+        } else {
+            unsetenv(saved.name);
+        }
+    }
+
+    std::printf(
+        "native_gdn_backward_parity rank=%d loss_diff=%0.8e "
+        "max_abs=%0.8e max_ref=%0.8e max_relative_l2=%0.8e "
+        "mismatches=%ld/%ld "
+        "significant_sign_mismatches=%ld\n",
+        rank, std::abs(stable_loss - reference_loss), worst_absolute,
+        worst_reference, worst_relative, mismatches, compared,
+        significant_sign_mismatches);
+    std::fflush(stdout);
+    assert(std::abs(stable_loss - reference_loss) < 1e-8);
+    assert(mismatches == 0);
+    assert(significant_sign_mismatches == 0);
+}
+
 static void check_fixed_path(
     ContextPair contexts, std::vector<LoraFixture>& fixtures,
     Batch& short_batch, Batch& batch, int rank
@@ -554,12 +696,10 @@ static void check_fixed_path(
             max_diff(*updated_b, expected_local_factor(
                 *reference_b, fixture.module, true, rank))});
 
-        auto expected_a = (fixture.local_a.to(at::kFloat) - 1e-3 *
-            (*m_a / (1.0 - 0.9)) /
-            (((*v_a / (1.0 - 0.999)).sqrt()) + 1e-8)).to(at::kBFloat16);
-        auto expected_b = (fixture.local_b.to(at::kFloat) - 1e-3 *
-            (*m_b / (1.0 - 0.9)) /
-            (((*v_b / (1.0 - 0.999)).sqrt()) + 1e-8)).to(at::kBFloat16);
+        auto expected_a = expected_first_adam_step(
+            fixture.local_a, *m_a, *v_a, 0.9, 0.999);
+        auto expected_b = expected_first_adam_step(
+            fixture.local_b, *m_b, *v_b, 0.9, 0.999);
         errors.adam = std::max({errors.adam,
             max_diff(*updated_a, expected_a), max_diff(*updated_b, expected_b)});
     }
@@ -704,12 +844,12 @@ static void check_dynamic_path(
             max_diff(*v_b, expected_local_factor(
                 *full_v_b, fixture.module, true, rank))});
 
-        auto expected_a = (fixture.local_a.to(at::kFloat) - 1e-3 *
-            (*m_a / (1.0 - 0.9)) /
-            (((*v_a / (1.0 - 0.999)).sqrt()) + 1e-8)).to(at::kBFloat16);
-        auto expected_b = (fixture.local_b.to(at::kFloat) - 1e-3 *
-            (*m_b / (1.0 - 0.9)) /
-            (((*v_b / (1.0 - 0.999)).sqrt()) + 1e-8)).to(at::kBFloat16);
+        auto expected_a = expected_first_adam_step(
+            fixture.local_a, *m_a, *v_a,
+            static_cast<double>(0.9f), static_cast<double>(0.999f));
+        auto expected_b = expected_first_adam_step(
+            fixture.local_b, *m_b, *v_b,
+            static_cast<double>(0.9f), static_cast<double>(0.999f));
         errors.adam = std::max({errors.adam,
             max_diff(*local_a, expected_a), max_diff(*local_b, expected_b)});
     }
@@ -770,6 +910,8 @@ int main() {
         configs, all_targets, true);
     auto fixed_fixtures = make_lora_fixtures(rank, 2000);
     set_fixed_lora(fixed_contexts, fixed_fixtures);
+    check_backward_reference_parity(
+        fixed_contexts.distributed, fixed_fixtures, local_weights, batch, rank);
     // GDN state is recurrent, so left padding/internal holes must be rejected
     // until the native kernel accepts packed cu_seqlens boundaries.
     auto right_attention = batch.attention_mask.clone();

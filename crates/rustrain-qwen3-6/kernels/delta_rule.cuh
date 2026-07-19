@@ -53,6 +53,7 @@
 #include <cstdlib>
 #include <cstdio>
 #include <cstring>
+#include <limits>
 
 // ──────────────────────────────────────────────────────────────────────
 // Constants
@@ -323,7 +324,6 @@ __global__ void gated_delta_rule_backward_kernel(
 
     const float* q_bh = q + bh * S * DR_D_K;
     const float* k_bh = k + bh * S * DR_D_K;
-    const float* v_bh = v + bh * S * DR_D_V;
     const float* g_bh = g_exp + bh * S;
     const float* beta_bh = beta + bh * S;
     const float* go_bh = grad_out + bh * S * DR_D_V;
@@ -340,7 +340,6 @@ __global__ void gated_delta_rule_backward_kernel(
         const float beta_t = beta_bh[t];
         const float* q_t = q_bh + t * DR_D_K;
         const float* k_t = k_bh + t * DR_D_K;
-        const float v_t = v_bh[t * DR_D_V + tid];
         const float go_t = go_bh[t * DR_D_V + tid];
         const float delta_t = delta_buf[bh * S * DR_D_V + t * DR_D_V + tid];
 
@@ -863,6 +862,214 @@ __global__ void gated_delta_rule_backward_chunks_kernel(
     }
 }
 
+// Stable reverse-mode recurrence. Each CTA owns one batch-head. For every
+// reverse chunk it reloads the exact state at the chunk start, replays the
+// forward recurrence once into a compact per-CTA global workspace, then reads
+// exact S_{t-1}/S_t pairs while computing gradients. Unlike the legacy kernels,
+// this never reconstructs S_{t-1} by subtracting the rank-1 update and dividing
+// by g_t, which is ill-conditioned when the learned decay is tiny.
+__global__ void gated_delta_rule_backward_replay_kernel(
+    const float* __restrict__ q,
+    const float* __restrict__ k,
+    const float* __restrict__ v,
+    const float* __restrict__ g_exp,
+    const float* __restrict__ beta,
+    const float* __restrict__ delta_buf,
+    const float* __restrict__ state_checkpoints,
+    int checkpoint_stride,
+    float* __restrict__ replay_states,
+    const float* __restrict__ grad_out,
+    float* __restrict__ grad_q,
+    float* __restrict__ grad_k,
+    float* __restrict__ grad_v,
+    float* __restrict__ grad_g,
+    float* __restrict__ grad_beta,
+    const int32_t* __restrict__ lengths,
+    int heads_per_batch,
+    int S
+) {
+    const int bh = blockIdx.x;
+    const int tid = threadIdx.x;
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
+    constexpr int state_elements = DR_D_K * DR_D_V;
+
+    extern __shared__ float smem[];
+    float* state_s = smem;
+    float* grad_s = state_s + state_elements;
+    float* reduce_q = grad_s + state_elements;
+    float* reduce_k = reduce_q + 4 * DR_D_K;
+    float* reduce_beta = reduce_k + 4 * DR_D_K;
+    float* reduce_g = reduce_beta + 4;
+
+    for (int i = tid; i < state_elements; i += DR_THREADS)
+        grad_s[i] = 0.0f;
+
+    const float* q_bh = q + bh * S * DR_D_K;
+    const float* k_bh = k + bh * S * DR_D_K;
+    const float* v_bh = v + bh * S * DR_D_V;
+    const float* g_bh = g_exp + bh * S;
+    const float* beta_bh = beta + bh * S;
+    const float* go_bh = grad_out + bh * S * DR_D_V;
+    float* gq_bh = grad_q + bh * S * DR_D_K;
+    float* gk_bh = grad_k + bh * S * DR_D_K;
+    float* gv_bh = grad_v + bh * S * DR_D_V;
+    float* gg_bh = grad_g + bh * S;
+    float* gb_bh = grad_beta + bh * S;
+    const int valid_len = lengths == nullptr ? S :
+        max(0, min(S, lengths[bh / heads_per_batch]));
+
+    for (int t = valid_len; t < S; ++t) {
+        if (tid < DR_D_K) {
+            gq_bh[t * DR_D_K + tid] = 0.0f;
+            gk_bh[t * DR_D_K + tid] = 0.0f;
+        }
+        gv_bh[t * DR_D_V + tid] = 0.0f;
+        if (tid == 0) {
+            gg_bh[t] = 0.0f;
+            gb_bh[t] = 0.0f;
+        }
+    }
+    __syncthreads();
+
+    const int checkpoint_count =
+        (S + checkpoint_stride - 1) / checkpoint_stride + 1;
+    const int num_chunks = checkpoint_count - 1;
+    float* replay_bh = replay_states +
+        static_cast<size_t>(bh) * (checkpoint_stride + 1) * state_elements;
+
+    for (int chunk = num_chunks - 1; chunk >= 0; --chunk) {
+        const int chunk_start = chunk * checkpoint_stride;
+        const int chunk_end = min(S, (chunk + 1) * checkpoint_stride);
+        const int reverse_end = min(valid_len, chunk_end);
+        if (reverse_end <= chunk_start) continue;
+
+        const float* chunk_start_state = state_checkpoints +
+            (static_cast<size_t>(bh) * checkpoint_count + chunk) *
+                state_elements;
+        for (int i = tid; i < state_elements; i += DR_THREADS) {
+            const float initial = chunk_start_state[i];
+            state_s[i] = initial;
+            replay_bh[i] = initial;
+        }
+        __syncthreads();
+
+        // Replay the exact forward update order and retain only this chunk's
+        // states. delta_buf is the forward-computed innovation, so replay does
+        // not introduce a second beta/KV evaluation or extra rounding there.
+        for (int t = chunk_start; t < reverse_end; ++t) {
+            const float g_t = g_bh[t];
+            const float* k_t = k_bh + t * DR_D_K;
+            const float delta_t =
+                delta_buf[bh * S * DR_D_V + t * DR_D_V + tid];
+            for (int dk = 0; dk < DR_D_K; ++dk) {
+                const int idx = dk * DR_D_V + tid;
+                state_s[idx] *= g_t;
+            }
+            __syncthreads();
+            for (int dk = 0; dk < DR_D_K; ++dk) {
+                const int idx = dk * DR_D_V + tid;
+                state_s[idx] += k_t[dk] * delta_t;
+            }
+            __syncthreads();
+            float* replay_slot = replay_bh +
+                static_cast<size_t>(t - chunk_start + 1) * state_elements;
+            for (int dk = 0; dk < DR_D_K; ++dk) {
+                const int idx = dk * DR_D_V + tid;
+                replay_slot[idx] = state_s[idx];
+            }
+            __syncthreads();
+        }
+
+        for (int t = reverse_end - 1; t >= chunk_start; --t) {
+            const int local_t = t - chunk_start;
+            const float* s_prev = replay_bh +
+                static_cast<size_t>(local_t) * state_elements;
+            const float* s_after = replay_bh +
+                static_cast<size_t>(local_t + 1) * state_elements;
+            const float* q_t = q_bh + t * DR_D_K;
+            const float* k_t = k_bh + t * DR_D_K;
+            const float g_t = g_bh[t];
+            const float beta_t = beta_bh[t];
+            const float go_t = go_bh[t * DR_D_V + tid];
+            const float delta_t =
+                delta_buf[bh * S * DR_D_V + t * DR_D_V + tid];
+
+            for (int dk = 0; dk < DR_D_K; ++dk) {
+                const int idx = dk * DR_D_V + tid;
+                grad_s[idx] += q_t[dk] * go_t;
+                float q_part = s_after[idx] * go_t;
+                for (int off = 16; off > 0; off >>= 1)
+                    q_part += __shfl_down_sync(0xffffffff, q_part, off);
+                if (lane == 0)
+                    reduce_q[warp * DR_D_K + dk] = q_part;
+            }
+            __syncthreads();
+            if (tid < DR_D_K) {
+                gq_bh[t * DR_D_K + tid] =
+                    reduce_q[tid] + reduce_q[DR_D_K + tid] +
+                    reduce_q[2 * DR_D_K + tid] +
+                    reduce_q[3 * DR_D_K + tid];
+            }
+
+            float gdelta = 0.0f;
+            float kv_mem = 0.0f;
+            for (int dk = 0; dk < DR_D_K; ++dk) {
+                const int idx = dk * DR_D_V + tid;
+                gdelta += grad_s[idx] * k_t[dk];
+                kv_mem += (s_prev[idx] * g_t) * k_t[dk];
+            }
+            const float h = gdelta * beta_t;
+            gv_bh[t * DR_D_V + tid] = h;
+            const float beta_part =
+                gdelta * (v_bh[t * DR_D_V + tid] - kv_mem);
+            float g_part = 0.0f;
+
+            for (int dk = 0; dk < DR_D_K; ++dk) {
+                const int idx = dk * DR_D_V + tid;
+                const float r = s_prev[idx] * g_t;
+                const float grad_r = grad_s[idx] - k_t[dk] * h;
+                const float k_part = grad_s[idx] * delta_t - r * h;
+                g_part += grad_r * s_prev[idx];
+                float reduced_k = k_part;
+                for (int off = 16; off > 0; off >>= 1)
+                    reduced_k += __shfl_down_sync(
+                        0xffffffff, reduced_k, off);
+                if (lane == 0)
+                    reduce_k[warp * DR_D_K + dk] = reduced_k;
+                grad_s[idx] = grad_r * g_t;
+            }
+
+            float reduced_beta = beta_part;
+            float reduced_g = g_part;
+            for (int off = 16; off > 0; off >>= 1) {
+                reduced_beta += __shfl_down_sync(
+                    0xffffffff, reduced_beta, off);
+                reduced_g += __shfl_down_sync(
+                    0xffffffff, reduced_g, off);
+            }
+            if (lane == 0) {
+                reduce_beta[warp] = reduced_beta;
+                reduce_g[warp] = reduced_g;
+            }
+            __syncthreads();
+            if (tid < DR_D_K) {
+                gk_bh[t * DR_D_K + tid] =
+                    reduce_k[tid] + reduce_k[DR_D_K + tid] +
+                    reduce_k[2 * DR_D_K + tid] +
+                    reduce_k[3 * DR_D_K + tid];
+            }
+            if (tid == 0) {
+                gb_bh[t] = reduce_beta[0] + reduce_beta[1] +
+                           reduce_beta[2] + reduce_beta[3];
+                gg_bh[t] = reduce_g[0] + reduce_g[1] +
+                           reduce_g[2] + reduce_g[3];
+            }
+            __syncthreads();
+        }
+    }
+}
+
 // ──────────────────────────────────────────────────────────────────────
 // Host launcher (backward)
 // ──────────────────────────────────────────────────────────────────────
@@ -889,10 +1096,85 @@ inline int launch_gated_delta_rule_backward(
     const bool chunkwise = chunkwise_env && chunkwise_env[0] != '\0' &&
         std::strcmp(chunkwise_env, "0") != 0 &&
         std::strcmp(chunkwise_env, "false") != 0;
+    const char* inverse_env = std::getenv("QWEN36_GDN_INVERSE_BWD");
+    const bool inverse = inverse_env && inverse_env[0] != '\0' &&
+        std::strcmp(inverse_env, "0") != 0 &&
+        std::strcmp(inverse_env, "false") != 0;
+
+    // The default path replays each forward chunk from its exact boundary
+    // state. The checkpoint at index zero is required because the state input
+    // is updated in place by forward and final_state cannot recover it stably.
+    // QWEN36_GDN_INVERSE_BWD=1 retains the old low-memory inverse recurrence
+    // solely as an explicit diagnostic/compatibility opt-in.
+    if (!chunkwise && !inverse) {
+        if (state_checkpoints == nullptr || checkpoint_stride <= 0) {
+            fprintf(stderr,
+                    "[delta_rule_backward] stable replay backward requires "
+                    "forward state checkpoints; set a positive checkpoint "
+                    "stride\n");
+            return static_cast<int>(cudaErrorInvalidValue);
+        }
+        if (BH <= 0 || seq_len <= 0) {
+            fprintf(stderr,
+                    "[delta_rule_backward] invalid replay dimensions: "
+                    "BH=%d, S=%d\n", BH, seq_len);
+            return static_cast<int>(cudaErrorInvalidValue);
+        }
+
+        constexpr size_t state_elements = DR_D_K * DR_D_V;
+        const int replay_stride = checkpoint_stride < seq_len
+            ? checkpoint_stride : seq_len;
+        const size_t replay_slots = static_cast<size_t>(replay_stride) + 1;
+        if (static_cast<size_t>(BH) >
+            std::numeric_limits<size_t>::max() / replay_slots /
+                state_elements / sizeof(float)) {
+            fprintf(stderr,
+                    "[delta_rule_backward] replay workspace allocation "
+                    "overflow\n");
+            return static_cast<int>(cudaErrorInvalidValue);
+        }
+        const size_t replay_bytes = static_cast<size_t>(BH) * replay_slots *
+            state_elements * sizeof(float);
+        float* replay_states = nullptr;
+        auto alloc_status = cudaMallocAsync(
+            reinterpret_cast<void**>(&replay_states), replay_bytes, stream);
+        if (alloc_status != cudaSuccess) {
+            fprintf(stderr,
+                    "[delta_rule_backward] replay workspace allocation "
+                    "failed (%zu bytes): %s\n", replay_bytes,
+                    cudaGetErrorString(alloc_status));
+            return static_cast<int>(alloc_status);
+        }
+
+        const size_t replay_smem =
+            (2 * state_elements + 8 * DR_D_K + 8) * sizeof(float);
+        auto attr_status = cudaFuncSetAttribute(
+            gated_delta_rule_backward_replay_kernel,
+            cudaFuncAttributeMaxDynamicSharedMemorySize, replay_smem);
+        if (attr_status != cudaSuccess) {
+            cudaFreeAsync(replay_states, stream);
+            fprintf(stderr,
+                    "[delta_rule_backward] replay shared-memory attribute "
+                    "failed: %s\n", cudaGetErrorString(attr_status));
+            return static_cast<int>(attr_status);
+        }
+        gated_delta_rule_backward_replay_kernel
+            <<<dim3(BH), dim3(DR_THREADS), replay_smem, stream>>>(
+                q, k, v, g_exp, beta, delta_buf, state_checkpoints,
+                replay_stride, replay_states, grad_out,
+                grad_q, grad_k, grad_v, grad_g, grad_beta,
+                lengths, heads_per_batch, seq_len);
+        const auto launch_status = cudaGetLastError();
+        const auto free_status = cudaFreeAsync(replay_states, stream);
+        if (launch_status != cudaSuccess)
+            return static_cast<int>(launch_status);
+        return free_status == cudaSuccess ? 0 : static_cast<int>(free_status);
+    }
+
     if (chunkwise && (state_checkpoints == nullptr || checkpoint_stride <= 0)) {
         fprintf(stderr,
                 "[delta_rule_backward] chunkwise backward requires a state "
-                "checkpoint stride smaller than the sequence length\n");
+                "checkpoint stride no greater than the sequence length\n");
         return static_cast<int>(cudaErrorInvalidValue);
     }
     if (chunkwise) {
@@ -967,6 +1249,8 @@ inline int launch_gated_delta_rule_backward(
         return free_status == cudaSuccess ? 0 : static_cast<int>(free_status);
     }
 
+    // Once inverse recurrence is explicitly enabled, this flag selects its
+    // fused or checkpoint-reload implementation. Neither is a default path.
     const char* fusion_env = std::getenv("QWEN36_GDN_RECURRENT_FUSION");
     const bool fuse_recurrence = !fusion_env || fusion_env[0] == '\0' ||
         (std::strcmp(fusion_env, "0") != 0 &&

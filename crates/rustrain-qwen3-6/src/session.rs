@@ -166,6 +166,15 @@ fn pipeline_1f1b_schedule(
     Ok(schedule)
 }
 
+fn validate_native_optimizer_options(max_grad_norm: Option<f32>) -> Result<()> {
+    if let Some(max_grad_norm) = max_grad_norm {
+        bail!(
+            "train.max_grad_norm={max_grad_norm} is not yet supported by the native Qwen3.5/3.6 LoRA optimizer; omit it rather than silently training without gradient clipping"
+        );
+    }
+    Ok(())
+}
+
 // ──────────────────────────────────────────────────────────────────────
 // Entry point: single-GPU LoRA SFT
 // ──────────────────────────────────────────────────────────────────────
@@ -325,6 +334,13 @@ mod tests {
             validate_lora_rank_for_tp(3, 2, &[checkpoint::LoraTpShardLayout::LatentRank],).is_err()
         );
     }
+
+    #[test]
+    fn native_optimizer_rejects_unimplemented_gradient_clipping() {
+        let error = validate_native_optimizer_options(Some(1.0)).unwrap_err();
+        assert!(error.to_string().contains("not yet supported"));
+        validate_native_optimizer_options(None).unwrap();
+    }
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -336,6 +352,7 @@ fn train_impl(
     run_paths: &RunPaths,
     ep_shard: Option<EpShard>,
 ) -> Result<Qwen36LoraSftSummary> {
+    validate_native_optimizer_options(config.train.max_grad_norm)?;
     let model_path = config
         .model
         .model_path
@@ -368,6 +385,9 @@ fn train_impl(
             config.train.dtype
         );
     }
+    let seed = i64::try_from(config.run.seed)
+        .context("run.seed exceeds libtorch's signed 64-bit seed range")?;
+    tch::manual_seed(seed);
 
     let shard_ref = ep_shard.as_ref();
     let is_ep = shard_ref.is_some();

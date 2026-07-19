@@ -1032,22 +1032,52 @@ static at::Tensor gdn_lengths_arg(
         : at::empty({0}, reference.options().dtype(at::kInt));
 }
 
-static int64_t gdn_state_checkpoint_config() {
+static bool try_parse_gdn_state_checkpoint_config(int64_t* parsed_out) {
+    if (!parsed_out) return false;
     const char* value = std::getenv("QWEN36_GDN_STATE_CHECKPOINT_STRIDE");
-    if (!value || value[0] == '\0') return 0;
+    if (!value || value[0] == '\0') {
+        *parsed_out = -1;
+        return true;
+    }
+    errno = 0;
     char* end = nullptr;
     const long long parsed = std::strtoll(value, &end, 10);
-    TORCH_CHECK(end && *end == '\0' && parsed >= 0,
-        "QWEN36_GDN_STATE_CHECKPOINT_STRIDE must be a non-negative integer");
-    if (parsed == 0) return 0;
-    TORCH_CHECK(parsed >= 2,
-        "QWEN36_GDN_STATE_CHECKPOINT_STRIDE must be zero or at least 2");
-    return static_cast<int64_t>(parsed);
+    if (errno == ERANGE || !end || *end != '\0' || parsed < 0 ||
+            parsed == 1)
+        return false;
+    *parsed_out = static_cast<int64_t>(parsed);
+    return true;
+}
+
+static bool gdn_state_checkpoint_environment_valid() {
+    int64_t parsed = 0;
+    if (!try_parse_gdn_state_checkpoint_config(&parsed)) return false;
+    if (parsed != 0) return true;
+    // Zero disables checkpoint storage and is only valid for diagnostic
+    // inverse/reference backward, never for production replay/chunkwise paths.
+    return !env_enabled("QWEN36_GDN_CHUNKWISE_BWD") &&
+        (env_enabled("QWEN36_GDN_INVERSE_BWD") ||
+         env_enabled("QWEN36_DELTA_REFERENCE_BWD"));
+}
+
+static int64_t gdn_state_checkpoint_config() {
+    int64_t parsed = 0;
+    TORCH_CHECK(try_parse_gdn_state_checkpoint_config(&parsed),
+        "QWEN36_GDN_STATE_CHECKPOINT_STRIDE must be unset, zero, or an "
+        "integer of at least 2");
+    return parsed;
 }
 
 static int64_t gdn_state_checkpoint_stride(int64_t seq) {
     const int64_t configured = gdn_state_checkpoint_config();
-    return configured < seq ? configured : 0;
+    if (configured < 0) {
+        if (seq <= 1) return 0;
+        const auto automatic = static_cast<int64_t>(
+            std::ceil(std::sqrt(static_cast<double>(seq))));
+        return std::max<int64_t>(2, std::min<int64_t>(automatic, seq - 1));
+    }
+    if (configured == 0 || seq <= 0) return 0;
+    return std::min(configured, seq);
 }
 
 // The forward and backward CUDA kernels are wrapped in one autograd Function.
@@ -1085,7 +1115,7 @@ struct GatedDeltaRuleFunction : public torch::autograd::Function<GatedDeltaRuleF
         TORCH_CHECK(!env_enabled("QWEN36_GDN_CHUNKWISE_BWD") ||
                 checkpoint_stride > 0,
             "QWEN36_GDN_CHUNKWISE_BWD requires a nonzero "
-            "QWEN36_GDN_STATE_CHECKPOINT_STRIDE smaller than the sequence length");
+            "QWEN36_GDN_STATE_CHECKPOINT_STRIDE no greater than the sequence length");
         const int64_t checkpoint_count = checkpoint_stride > 0
             ? (seq + checkpoint_stride - 1) / checkpoint_stride + 1
             : 0;
@@ -3310,6 +3340,42 @@ static void hash_adapter_request_identity(
     for (const auto& module : adapter.target_modules) hash.add_string(module);
 }
 
+static void hash_collective_runtime_environment(AdapterRegistryHash& hash) {
+    hash.add_u64(env_enabled("QWEN36_EP_A2A"));
+    hash.add_u64(env_enabled("QWEN36_EP_A2A_SHARDED"));
+    hash.add_u64(env_enabled("QWEN36_EP_A2A_PACKED", true));
+    hash.add_u64(env_enabled("QWEN36_DISABLE_GROUPED_MM"));
+    hash.add_u64(env_enabled("QWEN36_GROUPED_LORA_SYNC", true));
+    hash.add_u64(env_enabled("QWEN36_PACKED_LORA_SYNC", true));
+    hash.add_u64(env_enabled("QWEN36_GRAD_SLAB", true));
+    hash.add_u64(env_enabled("QWEN36_HETERO_PADDED_BATCH", true));
+    hash.add_u64(env_enabled("QWEN36_GDN_RECURRENT_FUSION", true));
+    hash.add_u64(env_enabled("QWEN36_GDN_CHUNKWISE_BWD"));
+    hash.add_u64(env_enabled("QWEN36_GDN_INVERSE_BWD"));
+    hash.add_u64(env_enabled("QWEN36_GDN_FUSED_AB_PROJECTION", true));
+    hash.add_u64(env_enabled("QWEN36_DELTA_REFERENCE_BWD"));
+    hash.add_u64(env_enabled("QWEN36_SUBCKPT"));
+    hash.add_u64(env_enabled("QWEN36_FUSED_LAYER"));
+    hash.add_u64(env_enabled("QWEN36_FUSED_CE"));
+    const char* checkpoint_stride =
+        getenv("QWEN36_GDN_STATE_CHECKPOINT_STRIDE");
+    hash.add_string(checkpoint_stride ? checkpoint_stride : "");
+    const char* sequence_chunk = getenv("QWEN36_SEQ_CHUNK");
+    hash.add_string(sequence_chunk ? sequence_chunk : "");
+    const char* ce_token_tile = getenv("QWEN36_CE_TOKEN_TILE");
+    hash.add_string(ce_token_tile ? ce_token_tile : "");
+    const char* checkpoint_group = getenv("QWEN36_GROUP_SIZE");
+    hash.add_string(checkpoint_group ? checkpoint_group : "");
+}
+
+static void hash_collective_runtime_config(
+    AdapterRegistryHash& hash, const TrainingContext* ctx
+) {
+    hash_collective_runtime_environment(hash);
+    hash.add_u64(ctx->use_checkpoint);
+    hash.add_u64(ctx->group_size);
+}
+
 static void hash_collective_topology(
     AdapterRegistryHash& hash, const TrainingContext* ctx
 ) {
@@ -3327,26 +3393,7 @@ static void hash_collective_topology(
     hash.add_u64(ctx->sequence_parallel);
     hash.add_u64(ctx->expert_parallel);
     hash.add_u64(ctx->data_parallel);
-    hash.add_u64(env_enabled("QWEN36_EP_A2A"));
-    hash.add_u64(env_enabled("QWEN36_EP_A2A_SHARDED"));
-    hash.add_u64(env_enabled("QWEN36_GROUPED_LORA_SYNC", true));
-    hash.add_u64(env_enabled("QWEN36_PACKED_LORA_SYNC", true));
-    hash.add_u64(env_enabled("QWEN36_GRAD_SLAB", true));
-    hash.add_u64(env_enabled("QWEN36_HETERO_PADDED_BATCH", true));
-    hash.add_u64(env_enabled("QWEN36_GDN_RECURRENT_FUSION", true));
-    hash.add_u64(env_enabled("QWEN36_GDN_CHUNKWISE_BWD"));
-    hash.add_u64(env_enabled("QWEN36_GDN_FUSED_AB_PROJECTION", true));
-    hash.add_u64(env_enabled("QWEN36_DELTA_REFERENCE_BWD"));
-    hash.add_u64(env_enabled("QWEN36_SUBCKPT"));
-    hash.add_u64(env_enabled("QWEN36_FUSED_LAYER"));
-    hash.add_u64(env_enabled("QWEN36_FUSED_CE"));
-    hash.add_u64(ctx->use_checkpoint);
-    hash.add_u64(ctx->group_size);
-    hash.add_u64(gdn_state_checkpoint_config());
-    const char* sequence_chunk = getenv("QWEN36_SEQ_CHUNK");
-    hash.add_string(sequence_chunk ? sequence_chunk : "");
-    const char* checkpoint_group = getenv("QWEN36_GROUP_SIZE");
-    hash.add_string(checkpoint_group ? checkpoint_group : "");
+    hash_collective_runtime_config(hash, ctx);
     if (ctx->cp_world_size > 1) {
         for (const auto& config : ctx->layer_configs) {
             hash.add_u64(config.layer_type);
@@ -3392,6 +3439,10 @@ static void hash_collective_topology(
 
 static void validate_native_execution_topology(const TrainingContext* ctx) {
     TORCH_CHECK(ctx, "native Qwen execution requires a valid context");
+    TORCH_CHECK(gdn_state_checkpoint_environment_valid(),
+        "QWEN36_GDN_STATE_CHECKPOINT_STRIDE=0 is only valid with "
+        "QWEN36_GDN_INVERSE_BWD or QWEN36_DELTA_REFERENCE_BWD and not "
+        "QWEN36_GDN_CHUNKWISE_BWD; otherwise use unset or an integer >= 2");
     TORCH_CHECK(!ctx->topology_invalid,
         "native Qwen context rejected an incompatible TP/CP/EP/DP/PP topology");
     TORCH_CHECK(ctx->tp_world_size == 1 || ctx->tp_comm,
@@ -3694,6 +3745,7 @@ static void validate_pipeline_collective_registry(
     hash.add_u64(ctx->fixed_target_modules.size());
     for (const auto& module : ctx->fixed_target_modules)
         hash.add_string(module);
+    hash_collective_runtime_environment(hash);
     hash.add_u64(ctx->fixed_optimizer_step);
     uint64_t token_weight_bits = 0;
     static_assert(sizeof(token_weight_bits) == sizeof(ctx->accumulated_token_weight));
@@ -3741,8 +3793,8 @@ static void validate_pipeline_collective_registry(
     for (int64_t index = 0; index < minimum.numel(); ++index) {
         TORCH_CHECK(minimum_data[index] == maximum_data[index],
             "pipeline fixed-LoRA registry mismatch across stages; all stages "
-            "must use the same global target identity, optimizer phase, "
-            "clock, microstep token weight, and accumulation window");
+            "must use the same global target identity, runtime configuration, "
+            "optimizer phase, clock, microstep token weight, and accumulation window");
     }
 }
 
@@ -3766,6 +3818,7 @@ static void validate_pipeline_window_collective_registry(
     hash.add_u64(ctx->fixed_target_modules.size());
     for (const auto& module : ctx->fixed_target_modules)
         hash.add_string(module);
+    hash_collective_runtime_environment(hash);
     hash.add_u64(ctx->fixed_optimizer_step);
     uint64_t token_weight_bits = 0;
     std::memcpy(&token_weight_bits, &ctx->accumulated_token_weight,
@@ -3815,7 +3868,8 @@ static void validate_pipeline_window_collective_registry(
     for (int64_t index = 0; index < minimum.numel(); ++index) {
         TORCH_CHECK(minimum_data[index] == maximum_data[index],
             "pipeline window registry mismatch across stages; all stages "
-            "must execute the same window and schedule");
+            "must use the same runtime configuration and execute the same "
+            "window and schedule");
     }
 }
 
@@ -3845,6 +3899,38 @@ static bool adapter_collective_all_succeeded(
     reduce_axis(ctx->tp_comm, "TP");
     reduce_axis(ctx->cp_comm, "CP");
     return succeeded.to(at::kCPU).item<int32_t>() != 0;
+}
+
+static bool pipeline_control_all_succeeded(
+    TrainingContext* ctx,
+    bool local_success
+) {
+    if (!ctx || ctx->pp_world_size <= 1 ||
+            (!ctx->pp_control_comm && !ctx->pp_comm))
+        return local_success;
+    c10::cuda::set_device(ctx->cuda_device);
+    cudaSetDevice(ctx->cuda_device);
+    auto options = at::TensorOptions().dtype(at::kInt).device(
+        at::kCUDA, ctx->cuda_device);
+    auto status = at::full({1}, local_success ? 1 : 0, options);
+    auto stream = c10::cuda::getCurrentCUDAStream(ctx->cuda_device).stream();
+    auto control_comm = ctx->pp_control_comm ?
+        ctx->pp_control_comm : ctx->pp_comm;
+    const auto error = ncclAllReduce(
+        status.data_ptr<int32_t>(), status.data_ptr<int32_t>(), 1,
+        ncclInt32, ncclMin, control_comm, stream);
+    TORCH_CHECK(error == ncclSuccess,
+        "PP control success consensus failed: ", ncclGetErrorString(error));
+    return status.to(at::kCPU).item<int32_t>() != 0;
+}
+
+static bool fixed_optimizer_collective_all_succeeded(
+    TrainingContext* ctx,
+    bool local_success
+) {
+    bool succeeded = adapter_collective_all_succeeded(ctx, local_success);
+    return pipeline_control_all_succeeded(
+        ctx, succeeded && local_success);
 }
 
 static void validate_native_execution_topology_collective(
@@ -4182,6 +4268,60 @@ static bool harvest_gradient_accumulators(TrainingContext* ctx) {
     }
     ctx->accumulation_active |= harvested;
     return harvested;
+}
+
+static bool fixed_lora_accumulators_are_finite(TrainingContext* ctx) {
+    try {
+        TORCH_CHECK(ctx, "fixed LoRA finite check requires a training context");
+        if (ctx->fixed_grad_slab.defined())
+            return at::isfinite(ctx->fixed_grad_slab).all().item<bool>();
+        for (size_t i = 0; i < ctx->lora_a.size(); ++i) {
+            if (!ctx->lora_active[i]) continue;
+            for (const auto* accumulator : {
+                    &ctx->grad_accum_a[i], &ctx->grad_accum_b[i]}) {
+                if (!accumulator->defined() ||
+                        !at::isfinite(*accumulator).all().item<bool>())
+                    return false;
+            }
+        }
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
+static bool dynamic_lora_accumulators_are_finite(
+    TrainingContext* ctx,
+    const std::vector<uint8_t>& adapter_has_global_tokens
+) {
+    TORCH_CHECK(ctx && adapter_has_global_tokens.size() == ctx->adapters.size(),
+        "dynamic LoRA finite check requires matching adapter activity");
+    for (size_t adapter_index = 0;
+         adapter_index < ctx->adapters.size(); ++adapter_index) {
+        if (!adapter_has_global_tokens[adapter_index]) continue;
+        const auto& adapter = ctx->adapters[adapter_index];
+        if (adapter.grad_slab.defined()) {
+            if (!at::isfinite(adapter.grad_slab).all().item<bool>())
+                return false;
+            continue;
+        }
+        for (const auto& [layer_idx, pairs] : adapter.params) {
+            const auto accum_it = adapter.grad_accum.find(layer_idx);
+            if (accum_it == adapter.grad_accum.end() ||
+                    accum_it->second.size() != pairs.size())
+                return false;
+            for (size_t pair = 0; pair < pairs.size(); ++pair) {
+                if (!pairs[pair].first.requires_grad()) continue;
+                const auto& accumulators = accum_it->second[pair];
+                for (const auto& accumulator : accumulators) {
+                    if (!accumulator.defined() ||
+                            !at::isfinite(accumulator).all().item<bool>())
+                        return false;
+                }
+            }
+        }
+    }
+    return true;
 }
 
 static void clear_adapter_gradient_accumulators(
@@ -7293,6 +7433,14 @@ static bool apply_fixed_lora_optimizer(
         return false;
     }
 
+    const bool local_gradients_finite =
+        fixed_lora_accumulators_are_finite(ctx);
+    const bool all_gradients_finite =
+        fixed_optimizer_collective_all_succeeded(
+            ctx, local_gradients_finite);
+    TORCH_CHECK(local_gradients_finite && all_gradients_finite,
+        "fixed LoRA optimizer rejected non-finite accumulated gradients");
+
     at::AutoGradMode guard(false);
     ctx->lora_cache_valid = false;
     ctx->lora_batch_valid = false;
@@ -7788,28 +7936,29 @@ extern "C" __attribute__((visibility("default"))) int32_t qwen36_pipeline_begin_
 ) {
     try {
         auto* ctx = reinterpret_cast<TrainingContext*>(ctx_ptr);
-        TORCH_CHECK(ctx && window_spec,
-            "pipeline begin requires a context and window specification");
-        TORCH_CHECK(window_spec->struct_size >= sizeof(Qwen36PipelineWindowV1) &&
-                window_spec->version == 1,
-            "unsupported pipeline window ABI");
-        TORCH_CHECK(!ctx->pp_window.active,
-            "pipeline window is already active");
-        TORCH_CHECK(ctx->pp_world_size >= 2 && ctx->cp_world_size == 1,
-            "pipeline window requires PP>=2 and CP=1");
-        TORCH_CHECK(ctx->router_aux_loss_coef == 0.0,
-            "pipeline router auxiliary loss is not yet supported");
-        TORCH_CHECK(window_spec->window_id >= 0 &&
-                window_spec->num_microbatches > 0 &&
-                window_spec->num_microbatches <= 4096 &&
-                window_spec->schedule == 0 && window_spec->num_chunks == 1,
-            "pipeline window supports schedule=0, chunk=0, and 1..4096 microbatches");
-        TORCH_CHECK(window_spec->flags == 0,
-            "pipeline window flags are not supported yet");
-        TORCH_CHECK(ctx->adapters.empty() && !ctx->has_mtp &&
-                !ctx->use_checkpoint && !ctx->accumulation_active &&
-                ctx->accumulated_token_weight == 0.0,
-            "pipeline window requires a clear fixed-LoRA accumulation state");
+        TORCH_CHECK(ctx, "pipeline begin requires a context");
+        TORCH_CHECK(ctx->pp_world_size >= 2 &&
+                (ctx->pp_control_comm || ctx->pp_comm),
+            "pipeline window requires a PP communicator with PP_SIZE >= 2");
+        const bool valid_abi = window_spec &&
+            window_spec->struct_size >= sizeof(Qwen36PipelineWindowV1) &&
+            window_spec->version == 1;
+        const bool local_valid = valid_abi &&
+            !ctx->pp_window.active && ctx->cp_world_size == 1 &&
+            ctx->router_aux_loss_coef == 0.0 &&
+            window_spec->window_id >= 0 &&
+            window_spec->num_microbatches > 0 &&
+            window_spec->num_microbatches <= 4096 &&
+            window_spec->schedule == 0 && window_spec->num_chunks == 1 &&
+            window_spec->flags == 0 && ctx->adapters.empty() &&
+            !ctx->has_mtp && !ctx->use_checkpoint &&
+            !ctx->accumulation_active &&
+            ctx->accumulated_token_weight == 0.0 &&
+            gdn_state_checkpoint_environment_valid();
+        const bool globally_valid = pipeline_control_all_succeeded(
+            ctx, local_valid);
+        TORCH_CHECK(local_valid && globally_valid,
+            "pipeline begin preflight failed on one or more PP stages");
         validate_pipeline_window_collective_registry(
             ctx, window_spec->window_id, window_spec->num_microbatches,
             window_spec->schedule, window_spec->num_chunks, window_spec->flags);
@@ -8023,10 +8172,12 @@ extern "C" __attribute__((visibility("default"))) int32_t qwen36_pipeline_finish
         const int64_t completed_microbatches = window.num_microbatches;
         const double aggregate_loss = window.total_loss /
             static_cast<double>(completed_microbatches);
-        apply_fixed_lora_optimizer(
-            ctx, window.normalization_mask, ctx->accumulated_token_weight);
         const double loss = pipeline_broadcast_loss(
             ctx, aggregate_loss, window.normalization_mask.options());
+        TORCH_CHECK(std::isfinite(loss) && loss >= 0.0,
+            "pipeline fixed-LoRA loss became non-finite");
+        apply_fixed_lora_optimizer(
+            ctx, window.normalization_mask, ctx->accumulated_token_weight);
         pipeline_window_write_result(ctx, result, 0, loss);
         pipeline_window_reset(ctx);
         if (result) {
@@ -8162,13 +8313,23 @@ static double qwen36_pipeline_train_micro_step(
 
     harvest_gradient_accumulators(ctx);
     ctx->accumulated_token_weight = next_accumulated_token_weight;
+    const double loss = pipeline_broadcast_loss(
+        ctx, local_loss, input_ids.options());
+    TORCH_CHECK(std::isfinite(loss) && loss >= 0.0,
+        "pipeline fixed-LoRA loss became non-finite");
     if (apply_optimizer) {
         apply_fixed_lora_optimizer(
             ctx, target_mask, ctx->accumulated_token_weight);
+    } else {
+        const bool local_gradients_finite =
+            fixed_lora_accumulators_are_finite(ctx);
+        TORCH_CHECK(fixed_optimizer_collective_all_succeeded(
+                ctx, local_gradients_finite) && local_gradients_finite,
+            "pipeline fixed-LoRA accumulated gradient became non-finite");
     }
     ctx->lora_cache_valid = false;
     ctx->lora_batch_valid = false;
-    return pipeline_broadcast_loss(ctx, local_loss, input_ids.options());
+    return loss;
 }
 
 // Manual sequential backward — recompute each group with grad, backprop, free.
@@ -9095,6 +9256,15 @@ static void* qwen36_create_training_context_impl(
     int32_t context_flags
 ) {
     try {
+        TORCH_CHECK(std::isfinite(lora_scaling) && lora_scaling > 0.0,
+            "fixed LoRA scaling must be finite and positive");
+        TORCH_CHECK(std::isfinite(lr) && lr >= 0.0,
+            "fixed Adam learning rate must be finite and non-negative");
+        TORCH_CHECK(std::isfinite(beta1) && beta1 >= 0.0 && beta1 < 1.0 &&
+                std::isfinite(beta2) && beta2 >= 0.0 && beta2 < 1.0,
+            "fixed Adam betas must be finite and in [0, 1)");
+        TORCH_CHECK(std::isfinite(eps) && eps >= 0.0,
+            "fixed Adam epsilon must be finite and non-negative");
         auto* ctx = new TrainingContext();
         ctx->context_sequence = ++g_context_sequence;
         ctx->compute_type = static_cast<at::ScalarType>(compute_type);
@@ -9967,6 +10137,13 @@ __attribute__((visibility("default"))) double qwen36_train_micro_step(
             loss_val += mtp_loss.item<double>();
         }
 
+        const bool local_loss_finite =
+            std::isfinite(loss_val) && loss_val >= 0.0 &&
+            at::isfinite(total_hidden_grad).all().item<bool>();
+        TORCH_CHECK(adapter_collective_all_succeeded(
+                ctx, local_loss_finite) && local_loss_finite,
+            "native Qwen fixed-LoRA loss or hidden gradient became non-finite");
+
         // compute_loss returns a local token mean. Convert it to a weighted
         // numerator before backward; the FP32 window is divided by the global
         // accumulated token weight exactly once at the optimizer boundary.
@@ -9991,6 +10168,11 @@ __attribute__((visibility("default"))) double qwen36_train_micro_step(
         ctx->accumulated_token_weight = next_accumulated_token_weight;
 
         if (!apply_optimizer) {
+            const bool local_gradients_finite =
+                fixed_lora_accumulators_are_finite(ctx);
+            TORCH_CHECK(adapter_collective_all_succeeded(
+                    ctx, local_gradients_finite) && local_gradients_finite,
+                "native Qwen fixed-LoRA accumulated gradient became non-finite");
             // The forward graph has been consumed, but parameters remain
             // live for the next micro-batch. Never reuse cached LoRA deltas
             // whose autograd nodes were freed by this backward.
@@ -10531,6 +10713,19 @@ static double qwen36_train_multi_lora_impl(
                 loss_val += mtp_loss.item<double>();
             }
 
+            bool local_loss_finite = false;
+            try {
+                local_loss_finite =
+                    std::isfinite(loss_val) && loss_val >= 0.0 &&
+                    at::isfinite(hidden_grad).all().item<bool>();
+            } catch (...) {
+                local_loss_finite = false;
+            }
+            const bool all_losses_finite =
+                adapter_collective_all_succeeded(ctx, local_loss_finite);
+            TORCH_CHECK(all_losses_finite && local_loss_finite,
+                "dynamic LoRA loss or hidden gradient became non-finite");
+
             if (!ctx->group_inputs.empty() && !env_enabled("QWEN36_SUBCKPT")) {
                 manual_group_backward(ctx, hidden_grad);
             } else {
@@ -10594,6 +10789,52 @@ static double qwen36_train_multi_lora_impl(
                 TORCH_CHECK(adapter_has_global_tokens.size() ==
                         ctx->adapters.size(),
                     "dynamic LoRA global-token activity vector mismatch");
+                const bool inject_dynamic_nan =
+                    env_enabled("QWEN36_TEST_INJECT_DYNAMIC_GRAD_NAN");
+                bool injection_ready = !inject_dynamic_nan;
+                if (inject_dynamic_nan) {
+                    try {
+                        for (size_t adapter_index = 0;
+                             adapter_index < ctx->adapters.size() &&
+                                 !injection_ready;
+                             ++adapter_index) {
+                            if (!adapter_has_global_tokens[adapter_index]) continue;
+                            for (auto& [layer_idx, pairs] :
+                                    ctx->adapters[adapter_index].grad_accum) {
+                                (void)layer_idx;
+                                for (auto& accumulators : pairs) {
+                                    if (accumulators[0].defined() &&
+                                            accumulators[0].numel() > 0) {
+                                        accumulators[0].view({-1})
+                                            .narrow(0, 0, 1)
+                                            .fill_(std::numeric_limits<float>::quiet_NaN());
+                                        injection_ready = true;
+                                        break;
+                                    }
+                                }
+                                if (injection_ready) break;
+                            }
+                        }
+                    } catch (...) {
+                        injection_ready = false;
+                    }
+                }
+                bool local_gradients_finite = false;
+                if (injection_ready) {
+                    try {
+                        local_gradients_finite =
+                            dynamic_lora_accumulators_are_finite(
+                                ctx, adapter_has_global_tokens);
+                    } catch (...) {
+                        local_gradients_finite = false;
+                    }
+                }
+                const bool all_gradients_finite =
+                    adapter_collective_all_succeeded(
+                        ctx, local_gradients_finite);
+                TORCH_CHECK(local_gradients_finite && all_gradients_finite,
+                    "dynamic LoRA optimizer rejected missing or non-finite "
+                    "accumulated gradients");
 
                 // Build every Adam result out of place. No live parameter,
                 // optimizer tensor, or tenant clock changes until the unified

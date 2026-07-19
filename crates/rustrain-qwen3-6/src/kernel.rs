@@ -1253,7 +1253,7 @@ impl CppTrainingContext {
                 attention_mask.as_ptr() as *mut _,
             )
         };
-        if loss < 0.0 {
+        if !loss.is_finite() || loss < 0.0 {
             bail!("C++ train_step failed");
         }
         Ok(loss)
@@ -1279,7 +1279,7 @@ impl CppTrainingContext {
                 i32::from(apply_optimizer),
             )
         };
-        if loss < 0.0 {
+        if !loss.is_finite() || loss < 0.0 {
             bail!("C++ train_micro_step failed");
         }
         Ok(loss)
@@ -1456,7 +1456,7 @@ impl CppTrainingContext {
                 i32::try_from(adapter_ids.len()).context("selected adapter count exceeds i32")?,
             )
         };
-        if loss < 0.0 {
+        if !loss.is_finite() || loss < 0.0 {
             if !self.is_healthy() {
                 bail!("native dynamic LoRA context is poisoned; recreate the session");
             }
@@ -1536,7 +1536,7 @@ impl CppTrainingContext {
                 i64::try_from(seq_len).context("host seq_len exceeds i64")?,
             )
         };
-        if loss < 0.0 {
+        if !loss.is_finite() || loss < 0.0 {
             bail!("C++ train_step_host_i64 failed");
         }
         Ok(loss)
@@ -1585,7 +1585,7 @@ impl CppTrainingContext {
                 adapter_count,
             )
         };
-        if loss < 0.0 {
+        if !loss.is_finite() || loss < 0.0 {
             if !self.is_healthy() {
                 bail!("native dynamic LoRA context is poisoned; recreate the session");
             }
@@ -2410,7 +2410,7 @@ impl CppTrainingContext {
                 attention_mask.as_ptr() as *mut _,
             )
         };
-        if loss < 0.0 {
+        if !loss.is_finite() || loss < 0.0 {
             bail!("C++ eval_step failed");
         }
         Ok(loss)
@@ -2437,7 +2437,7 @@ impl CppTrainingContext {
                 i64::try_from(seq_len).context("host seq_len exceeds i64")?,
             )
         };
-        if loss < 0.0 {
+        if !loss.is_finite() || loss < 0.0 {
             bail!("C++ eval_step_host_i64 failed");
         }
         Ok(loss)

@@ -1140,6 +1140,35 @@ int main() {
         });
     }
 
+    const int64_t launches_before_nan =
+        qwen36_get_dynamic_adam_launch_count(distributed);
+    if (rank == 0) {
+        setenv("QWEN36_TEST_INJECT_DYNAMIC_GRAD_NAN", "1", 1);
+    }
+    assert(qwen36_train_multi_lora_selected(
+        distributed, &local_batch.input_ids, &local_batch.target_mask,
+        &local_batch.attention_mask, &tenant_one, 1, kLoraRank) < 0.0);
+    unsetenv("QWEN36_TEST_INJECT_DYNAMIC_GRAD_NAN");
+    assert(qwen36_get_dynamic_adam_launch_count(distributed) ==
+        launches_before_nan);
+    assert(qwen36_get_adapter_step_count(distributed, tenant_one) == 0);
+    assert(qwen36_get_adapter_step_count(distributed, tenant_two) == 0);
+    for (size_t index = 0; index < dynamic_one.size(); ++index) {
+        const char* module = dynamic_one[index].module;
+        assert(max_diff(
+            *dynamic_tensor(distributed, tenant_one, module, false),
+            tenant_one_before[index][0]) == 0.0);
+        assert(max_diff(
+            *dynamic_tensor(distributed, tenant_one, module, true),
+            tenant_one_before[index][1]) == 0.0);
+        assert(dynamic_state(
+            distributed, tenant_one, module, false, false)
+            ->abs().max().item<double>() == 0.0);
+        assert(dynamic_state(
+            distributed, tenant_one, module, true, false)
+            ->abs().max().item<double>() == 0.0);
+    }
+
     const double dynamic_loss = qwen36_train_multi_lora_selected(
         distributed, &local_batch.input_ids, &local_batch.target_mask,
         &local_batch.attention_mask, &tenant_one, 1, kLoraRank);

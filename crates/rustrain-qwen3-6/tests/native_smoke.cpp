@@ -813,6 +813,27 @@ int main() {
     assert(qwen36_get_context_health(ctx) == 0);
     std::printf("native_qwen36_transactional_adam_failure_smoke ok\n");
 
+    const int64_t launches_before_non_finite =
+        qwen36_get_dynamic_adam_launch_count(ctx);
+    setenv("QWEN36_TEST_INJECT_DYNAMIC_GRAD_NAN", "1", 1);
+    const double non_finite_gradient_failure =
+        qwen36_train_multi_lora_selected(
+            ctx, &selected_input_ids, &selected_target_mask,
+            &selected_attention_mask, selected_adapter_ids, 1, rank);
+    unsetenv("QWEN36_TEST_INJECT_DYNAMIC_GRAD_NAN");
+    c10::cuda::device_synchronize();
+    assert(non_finite_gradient_failure < 0.0);
+    assert(qwen36_get_dynamic_adam_launch_count(ctx) ==
+        launches_before_non_finite);
+    assert(qwen36_get_adapter_step_count(ctx, adapter_one) == 2);
+    assert((*dynamic_b - transactional_b_before).abs().max().item<double>() == 0.0);
+    assert((*transactional_m - transactional_m_before).abs().max().item<double>() == 0.0);
+    assert((*transactional_v - transactional_v_before).abs().max().item<double>() == 0.0);
+    assert(qwen36_get_accumulation_active(ctx) == 0);
+    assert(qwen36_get_accumulated_token_weight(ctx) == 0.0);
+    assert(qwen36_get_context_health(ctx) == 0);
+    std::printf("native_qwen36_dynamic_non_finite_gradient_smoke ok\n");
+
     const int64_t unknown_adapter_ids[] = {adapter_two + 1000};
     assert(qwen36_train_multi_lora_selected(
         ctx, &selected_input_ids, &selected_target_mask,
@@ -1285,6 +1306,46 @@ int main() {
     assert(qwen36_get_step_count(ctx) == 1);
     assert((*linear_a - linear_a_before).abs().sum().item<double>() > 0.0);
     assert(linear_a_accum->abs().sum().item<double>() == 0.0);
+
+    // A non-finite accumulated gradient must abort before the in-place Adam
+    // launch. Parameters, optimizer state, and the bias-correction clock are
+    // one transaction; none may advance on rejection.
+    const auto poisoned_a_before = linear_a->clone();
+    const auto poisoned_b_before = linear_b->clone();
+    const int64_t optimizer_count = qwen36_get_lora_count(ctx) * 2;
+    std::vector<void*> optimizer_m_ptrs(optimizer_count);
+    std::vector<void*> optimizer_v_ptrs(optimizer_count);
+    assert(qwen36_export_optimizer_state(
+        ctx, optimizer_m_ptrs.data(), optimizer_v_ptrs.data(),
+        optimizer_count) == optimizer_count);
+    std::vector<at::Tensor> optimizer_m_before;
+    std::vector<at::Tensor> optimizer_v_before;
+    optimizer_m_before.reserve(optimizer_count);
+    optimizer_v_before.reserve(optimizer_count);
+    for (int64_t index = 0; index < optimizer_count; ++index) {
+        optimizer_m_before.push_back(
+            reinterpret_cast<at::Tensor*>(optimizer_m_ptrs[index])->clone());
+        optimizer_v_before.push_back(
+            reinterpret_cast<at::Tensor*>(optimizer_v_ptrs[index])->clone());
+    }
+    linear_a_accum->fill_(NAN);
+    const double poisoned_loss = qwen36_train_micro_step(
+        ctx, &input_ids, &target_mask, &attention_mask, 1.0, 1);
+    c10::cuda::device_synchronize();
+    assert(poisoned_loss < 0.0);
+    assert(qwen36_get_step_count(ctx) == 1);
+    assert(at::equal(*linear_a, poisoned_a_before));
+    assert(at::equal(*linear_b, poisoned_b_before));
+    assert(linear_a_accum->abs().sum().item<double>() == 0.0);
+    for (int64_t index = 0; index < optimizer_count; ++index) {
+        assert(at::equal(
+            *reinterpret_cast<at::Tensor*>(optimizer_m_ptrs[index]),
+            optimizer_m_before[index]));
+        assert(at::equal(
+            *reinterpret_cast<at::Tensor*>(optimizer_v_ptrs[index]),
+            optimizer_v_before[index]));
+    }
+
     linear_a_before = linear_a->clone();
     const double linear_loss = qwen36_train_step(
         ctx, &input_ids, &target_mask, &attention_mask);

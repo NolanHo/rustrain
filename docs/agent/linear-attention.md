@@ -57,25 +57,29 @@ One `TpCopyToRegion` must wrap the shared input before the QKV/Z/A/B forks so ba
 
 ## Backward Stability
 
-The fused CUDA backward reconstructs earlier states by dividing the decayed
-state by `g_exp`. This is fast and verified with realistic negative `dt_bias`,
-where decay stays near one, but repeated reverse reconstruction is
-ill-conditioned for long sequences with small decay.
+The default CUDA backward never reconstructs earlier states by dividing by
+`g_exp`. Real Qwen weights can produce decay below `1e-8`, where subtracting the
+rank-one update and dividing by decay is numerically irreversible even though
+the forward and reference backward remain finite.
 
-Set `QWEN36_GDN_STATE_CHECKPOINT_STRIDE=N` (`N >= 2`) to save exact FP32
-recurrent state at every `N`-token boundary. Backward reloads the exact state at
-the end of each reverse chunk, so reconstruction error cannot accumulate across
-chunk boundaries. The saved-state footprint per GDN layer is approximately
-`BH * (ceil(S / N) + 1) * key_dim * value_dim * 4` bytes. The default is `0`
-(disabled) because this is a stability/memory tradeoff. Distributed adapter
-registry consensus includes the configured stride so ranks cannot silently use
-different backward paths.
+Forward saves exact FP32 recurrent state at chunk boundaries. Backward reloads
+each chunk start, replays that chunk once, and retains exact `S_prev/S_t` pairs
+in a temporary per-batch-head workspace. The automatic checkpoint stride is
+`ceil(sqrt(sequence_length))`, which approximately minimizes the sum of saved
+forward boundaries and replay workspace. Set
+`QWEN36_GDN_STATE_CHECKPOINT_STRIDE=N` (`N >= 2`) to override it; values above
+the current sequence length are clamped to one full-sequence replay chunk. The
+two footprints are approximately:
 
-This does not remove division by a clamped `g_exp` inside an individual chunk.
-Very small per-token decay still needs a replay-based backward or a forward
-formulation that does not invert decay. The kernel also remains a serial
-persistent block per `BH`; checkpoints are not FLA-style sequence-parallel
-chunking.
+- saved states per live GDN layer: `BH * (ceil(S / N) + 1) * D_K * D_V * 4`
+- replay workspace: `BH * (N + 1) * D_K * D_V * 4`
+
+`QWEN36_GDN_INVERSE_BWD=1` explicitly selects the old low-memory inverse
+recurrence for diagnostics only. `QWEN36_GDN_CHUNKWISE_BWD=1` also retains its
+older inverse formulation and is not a correctness fallback for very small
+decay. Distributed registry consensus includes these settings so ranks cannot
+silently use different backward paths. The replay kernel remains one persistent
+block per `BH`; it is not FLA-style sequence-parallel chunking.
 
 ## Right-Padding Fast Path
 
@@ -100,7 +104,9 @@ PYTHON=/path/to/python scripts/run_qwen36_native_gdn_tp.sh bench-tp2
 For checkpoint coverage, run the same smoke with
 `QWEN36_GDN_STATE_CHECKPOINT_STRIDE=2`. The synthetic training sequence has
 length 9, so this exercises five reverse chunks while retaining the distributed
-full-weight gradient and Adam-state oracle.
+full-weight gradient and Adam-state oracle. The default smoke also injects decay
+below `1e-30` and directly compares every FP32 LoRA gradient accumulator from
+the stable replay backward with the ATen recurrence oracle.
 
 The script builds only the repository kernel and native harnesses. It discovers and links the prebuilt dependency files from the selected Python environment; missing headers or libraries are reported instead of building third-party dependencies.
 
