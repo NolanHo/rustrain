@@ -7059,7 +7059,17 @@ static bool pipeline_window_validate_forward_contract(
         }
     }
     const auto* contract = agreed_signature.data();
-    if (contract[0] != 1) return false;
+    if (window.batch_size < 0) {
+        // The first forward establishes the PP-wide tensor contract. Even when
+        // every rank reports an invalid local tensor, fail after the collective
+        // so all ranks take the same path instead of fabricating shapes.
+        TORCH_CHECK(contract[0] == 1,
+            "pipeline window forward tensors invalid on at least one PP stage");
+    } else if (contract[0] != 1) {
+        // Later local errors are converted into dummy work by the caller so
+        // activation/gradient P2P remains aligned until finish consensus.
+        return false;
+    }
     if (window.batch_size < 0) {
         window.batch_size = contract[1];
         window.sequence_length = contract[2];
@@ -7346,8 +7356,12 @@ extern "C" __attribute__((visibility("default"))) int32_t qwen36_pipeline_tick_v
             effective_tick.backward_mb = required_backward;
             effective_tick.chunk_id = 0;
             effective_tick.phase = has_backward ? 1 : 0;
-            bool forward_valid = tick_valid &&
+            // Always enter the first contract handshake on canonical forwards.
+            // Short-circuiting this call on a local metadata error would let
+            // one PP rank skip the control collective while others wait.
+            const bool forward_contract_valid =
                 pipeline_window_validate_forward_contract(ctx, *tick);
+            bool forward_valid = tick_valid && forward_contract_valid;
             at::Tensor fallback_input_ids;
             at::Tensor fallback_target_mask;
             at::Tensor fallback_attention_mask;

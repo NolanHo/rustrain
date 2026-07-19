@@ -454,17 +454,49 @@ int main() {
     assert(qwen36_pipeline_finish_v1(window_context, 1, &result) != 0);
     assert(qwen36_get_step_count(window_context) == 1);
 
+    // A first-tick metadata error must still participate in the initial
+    // contract handshake.  The window should drain its fixed P2P schedule and
+    // fail uniformly at finish instead of deadlocking on the control stream.
+    Qwen36PipelineWindowV1 first_metadata_bad_window{
+        sizeof(Qwen36PipelineWindowV1), 1, 9, 2, 0, 1, 0};
+    assert(qwen36_pipeline_begin_v1(
+        window_context, &first_metadata_bad_window) == 0);
+    const int64_t first_warmup = std::min<int64_t>(
+        pp_size - pp_rank - 1, 2);
+    std::vector<std::pair<int64_t, int64_t>> first_metadata_schedule;
+    for (int64_t microbatch = 0; microbatch < first_warmup; ++microbatch)
+        first_metadata_schedule.emplace_back(microbatch, -1);
+    for (int64_t microbatch = first_warmup; microbatch < 2; ++microbatch)
+        first_metadata_schedule.emplace_back(
+            microbatch, microbatch - first_warmup);
+    for (int64_t microbatch = 2 - first_warmup; microbatch < 2; ++microbatch)
+        first_metadata_schedule.emplace_back(-1, microbatch);
+    for (const auto& [forward_mb, backward_mb] : first_metadata_schedule) {
+        int32_t phase = forward_mb < 0 ? 2 : (backward_mb < 0 ? 0 : 1);
+        if (forward_mb == 0 && rank == 1) phase = (phase + 1) % 3;
+        Qwen36PipelineTickV1 first_metadata_bad_tick{
+            sizeof(Qwen36PipelineTickV1), 1, 9, forward_mb, backward_mb,
+            0, phase,
+            forward_mb >= 0 ? &input_microbatches[forward_mb] : nullptr,
+            forward_mb >= 0 ? &target_microbatches[forward_mb] : nullptr,
+            nullptr, 1.0};
+        assert(qwen36_pipeline_tick_v1(
+            window_context, &first_metadata_bad_tick, &result) == 0);
+    }
+    assert(qwen36_pipeline_finish_v1(window_context, 1, &result) != 0);
+    assert(qwen36_get_step_count(window_context) == 1);
+
     // Deliberately make only rank 0 violate the next window's shape contract.
     // All ranks must fail at the PP min/max preflight, before any NCCL P2P
     // count can diverge.
     auto* bad_target_ptr = rank == 0
         ? &bad_target_mask : &target_microbatches[0];
     Qwen36PipelineWindowV1 bad_window{
-        sizeof(Qwen36PipelineWindowV1), 1, 9, 1, 0, 1, 0};
+        sizeof(Qwen36PipelineWindowV1), 1, 10, 1, 0, 1, 0};
     assert(qwen36_pipeline_begin_v1(window_context, &bad_window) == 0);
     const int64_t bad_backward = warmup == 0 ? 0 : -1;
     Qwen36PipelineTickV1 bad_tick{
-        sizeof(Qwen36PipelineTickV1), 1, 9, 0, bad_backward, 0,
+        sizeof(Qwen36PipelineTickV1), 1, 10, 0, bad_backward, 0,
         bad_backward < 0 ? 0 : 1,
         &input_microbatches[0], bad_target_ptr, nullptr, 1.0};
     assert(qwen36_pipeline_tick_v1(window_context, &bad_tick, &result) != 0);
