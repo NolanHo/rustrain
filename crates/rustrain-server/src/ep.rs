@@ -1381,10 +1381,6 @@ fn multi_lora_rows(
     n_total: i32,
     shard: Option<SourceShard>,
 ) -> Result<Range<usize>, String> {
-    if n_total <= 0 {
-        return Err(format!("n_total must be positive, got {n_total}"));
-    }
-    let n_total = n_total as usize;
     let pp_size = std::env::var("PP_SIZE")
         .or_else(|_| std::env::var("RUSTRAIN_PP_SIZE"))
         .or_else(|_| std::env::var("PIPELINE_MODEL_PARALLEL_SIZE"))
@@ -1396,13 +1392,32 @@ fn multi_lora_rows(
     } else {
         1
     };
+    multi_lora_rows_with_microbatches(batch_size, n_total, shard, pipeline_microbatches)
+}
+
+fn multi_lora_rows_with_microbatches(
+    batch_size: usize,
+    n_total: i32,
+    shard: Option<SourceShard>,
+    pipeline_microbatches: usize,
+) -> Result<Range<usize>, String> {
+    if n_total <= 0 {
+        return Err(format!("n_total must be positive, got {n_total}"));
+    }
+    if pipeline_microbatches == 0 {
+        return Err("pipeline_microbatches must be positive".to_string());
+    }
+    let n_total = n_total as usize;
     let Some(shard) = shard else {
-        if batch_size == 1 || batch_size == n_total * pipeline_microbatches {
+        let expected_rows = n_total
+            .checked_mul(pipeline_microbatches)
+            .ok_or_else(|| "multi-LoRA row count overflowed usize".to_string())?;
+        if batch_size == 1 || batch_size == expected_rows {
             return Ok(0..batch_size);
         }
         return Err(format!(
             "multi-LoRA batch_size={batch_size} must be 1 or n_total*microbatches={} when source parallelism is disabled",
-            n_total * pipeline_microbatches
+            expected_rows
         ));
     };
     if shard.size == 0 || shard.rank >= shard.size {
@@ -1420,8 +1435,13 @@ fn multi_lora_rows(
             "source-parallel multi-LoRA batch_size={batch_size} must equal n_total*source_parallel_size*microbatches={global_rows}; submit the complete global source batch"
         ));
     }
-    let local_rows = n_total * pipeline_microbatches;
-    let start = shard.rank * local_rows;
+    let local_rows = n_total
+        .checked_mul(pipeline_microbatches)
+        .ok_or_else(|| "multi-LoRA local row count overflowed usize".to_string())?;
+    let start = shard
+        .rank
+        .checked_mul(local_rows)
+        .ok_or_else(|| "multi-LoRA source row start overflowed usize".to_string())?;
     Ok(start..start + local_rows)
 }
 
@@ -1452,7 +1472,8 @@ mod tests {
     use super::{
         checkpoint_generation, checkpoint_metadata_matches, checkpoint_staging_path,
         create_checkpoint_staging, create_worker_session, delete_worker_session,
-        is_terminal_native_context_result, multi_lora_rows, publish_checkpoint_noreplace,
+        is_terminal_native_context_result, multi_lora_rows, multi_lora_rows_with_microbatches,
+        publish_checkpoint_noreplace,
         require_worker_session, source_shard_for_topology, tensor_element_range, train_step_rows,
         validate_batch_add_lora_count, validate_flat_tensor_lengths,
         validate_multi_lora_global_batch_size, SourceShard,
@@ -1575,6 +1596,27 @@ mod tests {
         assert!(multi_lora_rows(6, 3, None).is_err());
         assert_eq!(multi_lora_rows(3, 3, None).unwrap(), 0..3);
         assert_eq!(multi_lora_rows(1, 3, None).unwrap(), 0..1);
+    }
+
+    #[test]
+    fn multi_lora_rows_support_explicit_pipeline_microbatches() {
+        assert_eq!(
+            multi_lora_rows_with_microbatches(
+                12,
+                3,
+                Some(SourceShard { rank: 1, size: 2 }),
+                2,
+            )
+            .unwrap(),
+            6..12
+        );
+        assert_eq!(
+            multi_lora_rows_with_microbatches(6, 3, None, 2).unwrap(),
+            0..6
+        );
+        assert!(multi_lora_rows_with_microbatches(9, 3, None, 2).is_err());
+        assert!(multi_lora_rows_with_microbatches(12, 3, Some(SourceShard { rank: 1, size: 2 }), 0)
+            .is_err());
     }
 
     #[test]
