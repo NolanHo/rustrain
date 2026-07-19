@@ -22,6 +22,7 @@ use tch::{Device, Kind};
 use crate::session::{
     AddLoRARequest, EvalOutput, InitLoRARequest, MultiLoraEvalOutput, Qwen36Session,
     SessLoadDatasetRequest, SessLoadModelRequest, TrainOutput, TrainingSession,
+    configured_dynamic_pipeline_microbatches,
 };
 
 const TERMINAL_NATIVE_CONTEXT_PREFIX: &str = "terminal native LoRA context";
@@ -1384,12 +1385,24 @@ fn multi_lora_rows(
         return Err(format!("n_total must be positive, got {n_total}"));
     }
     let n_total = n_total as usize;
+    let pp_size = std::env::var("PP_SIZE")
+        .or_else(|_| std::env::var("RUSTRAIN_PP_SIZE"))
+        .or_else(|_| std::env::var("PIPELINE_MODEL_PARALLEL_SIZE"))
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(1);
+    let pipeline_microbatches = if pp_size > 1 {
+        configured_dynamic_pipeline_microbatches().map_err(|error| error.to_string())?
+    } else {
+        1
+    };
     let Some(shard) = shard else {
-        if batch_size == 1 || batch_size == n_total {
+        if batch_size == 1 || batch_size == n_total * pipeline_microbatches {
             return Ok(0..batch_size);
         }
         return Err(format!(
-            "multi-LoRA batch_size={batch_size} must be 1 or n_total={n_total} when source parallelism is disabled"
+            "multi-LoRA batch_size={batch_size} must be 1 or n_total*microbatches={} when source parallelism is disabled",
+            n_total * pipeline_microbatches
         ));
     };
     if shard.size == 0 || shard.rank >= shard.size {
@@ -1400,14 +1413,16 @@ fn multi_lora_rows(
     }
     let global_rows = n_total
         .checked_mul(shard.size)
+        .and_then(|rows| rows.checked_mul(pipeline_microbatches))
         .ok_or_else(|| "multi-LoRA global row count overflowed usize".to_string())?;
     if batch_size != global_rows {
         return Err(format!(
-            "source-parallel multi-LoRA batch_size={batch_size} must equal n_total*source_parallel_size={global_rows}; submit the complete global source batch"
+            "source-parallel multi-LoRA batch_size={batch_size} must equal n_total*source_parallel_size*microbatches={global_rows}; submit the complete global source batch"
         ));
     }
-    let start = shard.rank * n_total;
-    Ok(start..start + n_total)
+    let local_rows = n_total * pipeline_microbatches;
+    let start = shard.rank * local_rows;
+    Ok(start..start + local_rows)
 }
 
 fn tensor_element_range(

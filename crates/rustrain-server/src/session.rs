@@ -35,6 +35,73 @@ fn dynamic_pipeline_schedule(
     Ok(schedule)
 }
 
+pub(crate) fn configured_dynamic_pipeline_microbatches() -> Result<usize> {
+    let raw = std::env::var("QWEN36_PP_MICROBATCHES").unwrap_or_else(|_| "1".to_string());
+    let count = raw
+        .parse::<usize>()
+        .with_context(|| format!("QWEN36_PP_MICROBATCHES must be a positive integer, got {raw}"))?;
+    if count == 0 || count > 4096 {
+        bail!("QWEN36_PP_MICROBATCHES must be in 1..=4096, got {count}");
+    }
+    Ok(count)
+}
+
+fn prepare_dynamic_pipeline_microbatches(
+    input: &TrainInput,
+    adapter_count: usize,
+) -> Result<Vec<(Tensor, Tensor, Tensor)>> {
+    if adapter_count == 0 {
+        bail!("dynamic pipeline requires at least one selected adapter");
+    }
+    let input_batch = input
+        .input_ids
+        .size()
+        .first()
+        .copied()
+        .ok_or_else(|| anyhow!("dynamic pipeline input_ids must be rank-2"))?;
+    if input_batch <= 0 {
+        bail!("dynamic pipeline input batch must be positive");
+    }
+    let configured = configured_dynamic_pipeline_microbatches()?;
+    let microbatch_count = if input_batch == 1 { 1 } else { configured };
+    let expected_rows = i64::try_from(
+        adapter_count
+            .checked_mul(microbatch_count)
+            .ok_or_else(|| anyhow!("dynamic pipeline microbatch row count overflowed"))?,
+    )
+    .context("dynamic pipeline microbatch row count exceeds i64")?;
+    if input_batch != 1 && input_batch != expected_rows {
+        bail!(
+            "dynamic pipeline input batch={input_batch} must be 1 or selected_adapters*microbatches={expected_rows}"
+        );
+    }
+    if microbatch_count == 1 && input_batch == 1 {
+        return Ok(vec![(
+            input.input_ids.shallow_clone(),
+            input.target_mask.shallow_clone(),
+            input.attention_mask.shallow_clone(),
+        )]);
+    }
+
+    let rows_per_microbatch = if input_batch == 1 {
+        1
+    } else {
+        i64::try_from(adapter_count).context("adapter count exceeds i64")?
+    };
+    let mut microbatches = Vec::with_capacity(microbatch_count);
+    for index in 0..microbatch_count {
+        let start = i64::try_from(index)
+            .context("dynamic pipeline microbatch index exceeds i64")?
+            * rows_per_microbatch;
+        microbatches.push((
+            input.input_ids.narrow(0, start, rows_per_microbatch),
+            input.target_mask.narrow(0, start, rows_per_microbatch),
+            input.attention_mask.narrow(0, start, rows_per_microbatch),
+        ));
+    }
+    Ok(microbatches)
+}
+
 fn validate_qwen_parallel_features(
     is_moe: bool,
     tp_size: usize,
@@ -622,19 +689,30 @@ impl Qwen36Session {
         if selected.is_empty() || selected.len() != n_total as usize {
             bail!("dynamic pipeline adapter count does not match n_total={n_total}");
         }
+        let microbatches = prepare_dynamic_pipeline_microbatches(input, selected.len())?;
+        let num_microbatches = i64::try_from(microbatches.len())
+            .context("dynamic pipeline microbatch count exceeds i64")?;
         let window_id = i64::try_from(self.step).context("pipeline step exceeds i64")?;
-        ctx.pipeline_begin_dynamic_selected_v1(window_id, 1, &selected)?;
+        ctx.pipeline_begin_dynamic_selected_v1(window_id, num_microbatches, &selected)?;
         let result = (|| -> Result<f64> {
-            for (forward_mb, backward_mb) in
-                dynamic_pipeline_schedule(pp_rank, pp_size, 1)?
-            {
+            for (forward_mb, backward_mb) in dynamic_pipeline_schedule(
+                pp_rank,
+                pp_size,
+                microbatches.len(),
+            )? {
+                let forward_input_ids = forward_mb
+                    .and_then(|index| microbatches.get(index as usize).map(|batch| &batch.0));
+                let forward_target_mask = forward_mb
+                    .and_then(|index| microbatches.get(index as usize).map(|batch| &batch.1));
+                let forward_attention_mask = forward_mb
+                    .and_then(|index| microbatches.get(index as usize).map(|batch| &batch.2));
                 let tick_result = ctx.pipeline_tick_v1(
                     window_id,
                     forward_mb,
                     backward_mb,
-                    forward_mb.map(|_| &input.input_ids),
-                    forward_mb.map(|_| &input.target_mask),
-                    forward_mb.map(|_| &input.attention_mask),
+                    forward_input_ids,
+                    forward_target_mask,
+                    forward_attention_mask,
                     1.0,
                 )?;
                 if !tick_result.loss.is_finite() {
@@ -673,17 +751,30 @@ impl Qwen36Session {
         if adapter_ids.is_empty() || adapter_ids.len() != n_total as usize {
             bail!("dynamic pipeline report adapter count does not match n_total={n_total}");
         }
+        let microbatches = prepare_dynamic_pipeline_microbatches(input, adapter_ids.len())?;
+        let num_microbatches = i64::try_from(microbatches.len())
+            .context("dynamic pipeline microbatch count exceeds i64")?;
         let window_id = i64::try_from(self.step).context("pipeline step exceeds i64")?;
-        ctx.pipeline_begin_dynamic_selected_v1(window_id, 1, adapter_ids)?;
+        ctx.pipeline_begin_dynamic_selected_v1(window_id, num_microbatches, adapter_ids)?;
         let result = (|| -> Result<(f64, Vec<f64>)> {
-            for (forward_mb, backward_mb) in dynamic_pipeline_schedule(pp_rank, pp_size, 1)? {
+            for (forward_mb, backward_mb) in dynamic_pipeline_schedule(
+                pp_rank,
+                pp_size,
+                microbatches.len(),
+            )? {
+                let forward_input_ids = forward_mb
+                    .and_then(|index| microbatches.get(index as usize).map(|batch| &batch.0));
+                let forward_target_mask = forward_mb
+                    .and_then(|index| microbatches.get(index as usize).map(|batch| &batch.1));
+                let forward_attention_mask = forward_mb
+                    .and_then(|index| microbatches.get(index as usize).map(|batch| &batch.2));
                 let tick_result = ctx.pipeline_tick_v1(
                     window_id,
                     forward_mb,
                     backward_mb,
-                    forward_mb.map(|_| &input.input_ids),
-                    forward_mb.map(|_| &input.target_mask),
-                    forward_mb.map(|_| &input.attention_mask),
+                    forward_input_ids,
+                    forward_target_mask,
+                    forward_attention_mask,
                     1.0,
                 )?;
                 if !tick_result.loss.is_finite() {
