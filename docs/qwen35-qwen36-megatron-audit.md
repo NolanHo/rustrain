@@ -160,7 +160,7 @@ ABI15 的两层 GDN base-TP smoke 覆盖复合 QKV/conv head shard、Z/A/B/A_log
 
 本轮新增 H20 ABI1 CP2 GDN full-reference smoke：`QWEN36_GDN_FUSED_CP_EXCHANGE=0/1` 两种模式均通过 fixed eval/train 与 dynamic selected training。fixed eval/loss 差为 `5.1117e-4`，五种 GDN LoRA projection 的 A/B 参数差为 `1.9531e-3/1.9989e-3`，Adam m/v 差为 `3.0518e-6/1.4198e-10`；dynamic aggregate/per-tenant loss 差均为 `0`，LoRA 参数差 `9.8801e-4`，Adam m/v 差 `1.5259e-6/1.5669e-10`。两个 selected tenant 正常更新，第三个未选 tenant 的参数、m/v 与 optimizer step 均逐位不变；rank-local fused flag mismatch 也在 P2P 前一致 fail-closed。实现将 CP local hidden 先 gather 后计算 CE，再由 autograd/手动 checkpoint backward 切回 local gradient，并在 dynamic grouped gradient sync 中加入 CP all-reduce；非 grouped dynamic CP 继续 fail-closed。
 
-本轮新增 H20 ABI1 `mtp-dynamic-smoke`：注册三个 dense LoRA tenant，选择两个不同主/MTP token-count 的租户，安装一层真实 frozen MTP prediction layer；dynamic per-tenant report 与单租户 oracle 的 loss 和参数差均为 `0`，第三个未选择租户参数逐位不变。实现一次性 all-reduce `[main_counts, mtp_counts]`（DP>1 时）并将 MTP hidden gradient/report numerator 转到主 loss denominator；fixed micro-step 使用同一比例，seq<3 和 `TP/CP/EP/PP>1` 组合 fail-closed。
+本轮新增 H20 ABI1 `mtp-dynamic-smoke` 和 `mtp-dp-smoke`：注册三个 dense LoRA tenant，选择两个不同主/MTP token-count 的租户，安装一层真实 frozen MTP prediction layer；单卡 dynamic per-tenant report 与单租户 oracle 的 loss 和参数差均为 `0`，DP2 complementary-source rows 对两个 singleton oracle 的 loss、参数、Adam m/v 差均为 `0`，第三个未选择租户参数/m/v/step 逐位不变。DP2 MTP objective 的 loss effect 为 `1.0821`、parameter effect 为 `2.0142e-3`，证明 MTP 分支实际参与训练。实现一次性 all-reduce `[main_counts, mtp_counts]`（DP>1 时）并将 MTP hidden gradient/report numerator 转到主 loss denominator；fixed micro-step 使用同一比例，seq<3 和 `TP/CP/EP/PP>1` 组合 fail-closed。
 
 这里“尚未完成 CP model execution”指任意五维组合、ring attention 和长序列 CP；本轮 CP2 结果是严格受限的 dense GDN 单轴切片，不应外推为完整 Megatron CP。
 

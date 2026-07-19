@@ -23,6 +23,10 @@ case "$mode" in
         test_name=native_mtp_dynamic_smoke
         test_source=crates/rustrain-qwen3-6/tests/native_mtp_dynamic_smoke.cpp
         ;;
+    mtp-dp-smoke)
+        test_name=native_mtp_dp_smoke
+        test_source=crates/rustrain-qwen3-6/tests/native_mtp_dp_smoke.cpp
+        ;;
     cp-gdn-smoke)
         test_name=native_cp_gdn_smoke
         test_source=crates/rustrain-qwen3-6/tests/native_cp_gdn_smoke.cpp
@@ -48,7 +52,7 @@ case "$mode" in
         test_source=crates/rustrain-qwen3-6/tests/native_pp_train_smoke.cpp
         ;;
     *)
-    echo "usage: $0 [local-smoke|smoke|sequence-parallel-smoke|tp-attention-smoke|mtp-dynamic-smoke|cp-gdn-smoke|gpu-metadata-smoke|tri-smoke|tri-replicated-smoke|ep-smoke|ep-bench|bench|pp-cp-comm-smoke|pp-train-smoke]" >&2
+    echo "usage: $0 [local-smoke|smoke|sequence-parallel-smoke|tp-attention-smoke|mtp-dynamic-smoke|mtp-dp-smoke|cp-gdn-smoke|gpu-metadata-smoke|tri-smoke|tri-replicated-smoke|ep-smoke|ep-bench|bench|pp-cp-comm-smoke|pp-train-smoke]" >&2
         exit 2
         ;;
 esac
@@ -227,6 +231,10 @@ elif [[ "$mode" == "tp-attention-smoke" ]]; then
 elif [[ "$mode" == "mtp-dynamic-smoke" ]]; then
     WORLD_SIZE=1 RANK=0 LOCAL_RANK=0 TP_SIZE=1 CP_SIZE=1 EP_SIZE=1 DP_SIZE=1 PP_SIZE=1 \
         "$test_bin"
+elif [[ "$mode" == "mtp-dp-smoke" ]]; then
+    TP_SIZE=1 CP_SIZE=1 EP_SIZE=1 DP_SIZE=2 PP_SIZE=1 \
+        "$python_bin" -m torch.distributed.run --standalone \
+            --nnodes=1 --nproc-per-node=2 --no-python "$test_bin"
 elif [[ "$mode" == "cp-gdn-smoke" ]]; then
     TP_SIZE=1 CP_SIZE=2 EP_SIZE=1 DP_SIZE=1 PP_SIZE=1 \
         "$python_bin" -m torch.distributed.run --standalone \
