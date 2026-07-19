@@ -42,6 +42,7 @@ extern "C" int32_t qwen36_attach_parallel_nccl_no_sync_v2(
     int32_t, int32_t, int32_t);
 extern "C" double qwen36_train_micro_step(
     void*, void*, void*, void*, double, int32_t);
+extern "C" int32_t qwen36_set_pad_token_id(void*, int64_t);
 struct Qwen36PipelineWindowV1 {
     uint32_t struct_size;
     uint32_t version;
@@ -303,6 +304,9 @@ int main() {
                 0, 1, 0,
                 pp_rank, pp_size, 0);
         assert(init == 0);
+        // Exercise the native null-mask path while keeping this fixture's
+        // token stream unchanged (99 is absent from the vocabulary rows).
+        assert(qwen36_set_pad_token_id(context, 99) == 0);
         return context;
     };
     void* window_context = create_context(true);

@@ -256,6 +256,7 @@ type FnInitParallelNccl = unsafe extern "C" fn(
     i32,
 ) -> i32;
 type FnSetCudaDevice = unsafe extern "C" fn(i32);
+type FnSetPadTokenId = unsafe extern "C" fn(*mut c_void, i64) -> i32;
 type FnSetBaseTpMlp = unsafe extern "C" fn(*mut c_void, i32) -> i32;
 type FnSetMaxGradNorm = unsafe extern "C" fn(*mut c_void, f64) -> i32;
 type FnSetRouterAuxLossCoef = unsafe extern "C" fn(*mut c_void, f64) -> i32;
@@ -355,6 +356,7 @@ struct KernelHandles {
     init_parallel_nccl: FnInitParallelNccl,
     attach_parallel_nccl_no_sync: FnInitParallelNccl,
     set_cuda_device: FnSetCudaDevice,
+    set_pad_token_id: Option<FnSetPadTokenId>,
     set_base_tp_mlp: FnSetBaseTpMlp,
     set_max_grad_norm: FnSetMaxGradNorm,
     set_router_aux_loss_coef: FnSetRouterAuxLossCoef,
@@ -545,6 +547,15 @@ unsafe fn load_kernels() -> Option<KernelHandles> {
         init_parallel_nccl: sym!("qwen36_init_parallel_nccl_v2"),
         attach_parallel_nccl_no_sync: sym!("qwen36_attach_parallel_nccl_no_sync_v2"),
         set_cuda_device: sym!("qwen36_set_cuda_device"),
+        set_pad_token_id: {
+            let name = CString::new("qwen36_set_pad_token_id").unwrap();
+            let symbol = libc::dlsym(handle, name.as_ptr());
+            if symbol.is_null() {
+                None
+            } else {
+                Some(std::mem::transmute::<*mut c_void, FnSetPadTokenId>(symbol))
+            }
+        },
         set_base_tp_mlp: sym!("qwen36_set_base_tp_mlp"),
         set_max_grad_norm: sym!("qwen36_set_max_grad_norm"),
         set_router_aux_loss_coef: sym!("qwen36_set_router_aux_loss_coef"),
@@ -1287,6 +1298,24 @@ impl CppTrainingContext {
         Ok(())
     }
 
+    /// Configure the native padding token so training can derive its
+    /// attention mask inside the C++ kernel. This keeps GPU mask construction
+    /// out of the Rust training loop.
+    pub fn set_pad_token_id(&self, pad_token_id: i64) -> Result<()> {
+        if pad_token_id < 0 {
+            bail!("native pad_token_id must be non-negative");
+        }
+        let kh = get_kernels().ok_or_else(|| anyhow::anyhow!("kernels not loaded"))?;
+        let setter = kh
+            .set_pad_token_id
+            .ok_or_else(|| anyhow::anyhow!("native kernel lacks pad-token mask support"))?;
+        let status = unsafe { setter(self.ptr, pad_token_id) };
+        if status != 0 {
+            bail!("C++ pad_token_id configuration failed");
+        }
+        Ok(())
+    }
+
     /// Run one training step: forward + loss + backward + Adam update.
     /// Returns loss value.
     pub fn train_step(
@@ -1315,7 +1344,7 @@ impl CppTrainingContext {
         &self,
         input_ids: &Tensor,
         target_mask: &Tensor,
-        attention_mask: &Tensor,
+        attention_mask: Option<&Tensor>,
         gradient_scale: f64,
         apply_optimizer: bool,
     ) -> Result<f64> {
@@ -1325,7 +1354,8 @@ impl CppTrainingContext {
                 self.ptr,
                 input_ids.as_ptr() as *mut _,
                 target_mask.as_ptr() as *mut _,
-                attention_mask.as_ptr() as *mut _,
+                attention_mask
+                    .map_or(std::ptr::null_mut(), |tensor| tensor.as_ptr() as *mut _),
                 gradient_scale,
                 i32::from(apply_optimizer),
             )

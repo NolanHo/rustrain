@@ -2975,6 +2975,10 @@ struct TrainingContext {
 
     // Attention mask [batch, seq] — 1 for real tokens, 0 for padding
     at::Tensor attention_mask;
+    // The Rust training loop passes input IDs directly to the native entry
+    // point. When no explicit mask is supplied, native code can derive the
+    // padding mask without a Rust-side GPU comparison/kernel launch.
+    int64_t pad_token_id = -1;
     // Strict-right-padding valid lengths for GDN. Kept on device so every
     // layer can pass it into the persistent recurrent kernel without a host
     // sync or repeated mask reduction.
@@ -3179,6 +3183,17 @@ struct TrainingContext {
     int cuda_device = 0;
 // ──────────────────────────────────────────────────────────────────────
 };
+
+static at::Tensor derive_attention_mask(
+    TrainingContext* ctx, const at::Tensor& input_ids
+) {
+    TORCH_CHECK(ctx && ctx->pad_token_id >= 0,
+        "attention mask is omitted but no pad_token_id is configured");
+    TORCH_CHECK(input_ids.defined() && input_ids.dim() == 2 &&
+            input_ids.scalar_type() == at::kLong,
+        "cannot derive attention mask from invalid input_ids");
+    return input_ids.ne(ctx->pad_token_id).to(at::kFloat).contiguous();
+}
 
 static at::Tensor fused_full_attention_qkv_weight(
     TrainingContext* ctx, int64_t layer_idx
@@ -3568,8 +3583,6 @@ static void validate_native_execution_topology(
             "vocabulary tensor parallelism");
         TORCH_CHECK(!ctx->has_mtp,
             "sequence parallelism does not support MTP");
-        TORCH_CHECK(ctx->adapters.empty(),
-            "sequence parallelism currently supports fixed LoRA only");
         TORCH_CHECK(ctx->router_aux_loss_coef == 0.0,
             "sequence parallelism does not support router auxiliary loss");
         for (const auto& config : ctx->layer_configs) {
@@ -3588,6 +3601,33 @@ static void validate_native_execution_topology(
                     "sequence parallelism does not support latent-rank LoRA; "
                     "projection ", table.entries[pair].name,
                     " at layer ", layer, " must use base TP sharding");
+            }
+        }
+        // Dynamic adapters use the same projection-aware TP geometry as the
+        // fixed registry. Sequence-parallel activation sharding cannot split
+        // latent-rank factors because those factors are owned by TP ranks.
+        for (const auto& adapter : ctx->adapters) {
+            for (const auto& [layer, pairs] : adapter.params) {
+                TORCH_CHECK(layer >= 0 &&
+                        layer < static_cast<int64_t>(ctx->layer_configs.size()),
+                    "dynamic LoRA adapter ", adapter.id,
+                    " references an invalid layer: ", layer);
+                const auto table = lora_projection_table(ctx->layer_configs[layer]);
+                TORCH_CHECK(pairs.size() <= table.entries.size(),
+                    "dynamic LoRA adapter ", adapter.id,
+                    " has an invalid projection registry at layer ", layer);
+                for (int64_t pair = 0;
+                     pair < static_cast<int64_t>(pairs.size()); ++pair) {
+                    if (!pairs[pair].first.defined() ||
+                            !pairs[pair].first.requires_grad()) continue;
+                    TORCH_CHECK(
+                        lora_tp_layout(ctx, layer, pair) != LoraTpLayout::LatentRank,
+                        "sequence parallelism does not support latent-rank dynamic LoRA; "
+                        "adapter ", adapter.id, " projection ",
+                        table.entries[pair].name,
+                        " at layer ", layer,
+                        " must use base TP sharding");
+                }
             }
         }
     }
@@ -8355,6 +8395,9 @@ static at::Tensor pipeline_window_forward(
             attention_mask->numel() > 0) {
         ctx->attention_mask = *attention_mask;
         elide_trivial_attention_mask(ctx);
+    } else if (ctx->pad_token_id >= 0) {
+        ctx->attention_mask = derive_attention_mask(ctx, input_ids);
+        elide_trivial_attention_mask(ctx);
     } else {
         ctx->attention_mask = at::Tensor();
         ctx->attention_lengths = at::Tensor();
@@ -8371,7 +8414,7 @@ static at::Tensor pipeline_window_forward(
     PipelineWindowSlot slot;
     slot.input_ids = input_ids;
     slot.target_mask = target_mask;
-    if (attention_mask) slot.attention_mask = *attention_mask;
+    if (ctx->attention_mask.defined()) slot.attention_mask = ctx->attention_mask;
     slot.gradient_scale = tick.gradient_scale;
     slot.token_weight = token_weight;
     slot.row_token_weights = target_mask.narrow(
@@ -9012,6 +9055,9 @@ static double qwen36_pipeline_train_micro_step(
     if (attention_mask) {
         validate_linear_attention_mask(ctx, *attention_mask);
         ctx->attention_mask = *attention_mask;
+        elide_trivial_attention_mask(ctx);
+    } else if (ctx->pad_token_id >= 0) {
+        ctx->attention_mask = derive_attention_mask(ctx, input_ids);
         elide_trivial_attention_mask(ctx);
     } else {
         ctx->attention_mask = at::Tensor();
@@ -10830,6 +10876,22 @@ __attribute__((visibility("default"))) int32_t qwen36_set_mtp_weights(
     }
 }
 
+__attribute__((visibility("default"))) int32_t qwen36_set_pad_token_id(
+    void* ctx_ptr, int64_t pad_token_id
+) {
+    try {
+        auto* ctx = reinterpret_cast<TrainingContext*>(ctx_ptr);
+        TORCH_CHECK(ctx, "null training context");
+        TORCH_CHECK(pad_token_id >= 0,
+            "pad_token_id must be non-negative");
+        ctx->pad_token_id = pad_token_id;
+        return 0;
+    } catch (const std::exception& e) {
+        fprintf(stderr, "[q36] set_pad_token_id FAILED: %s\n", e.what());
+        return -1;
+    }
+}
+
 // One training micro-step. Non-final micro-steps accumulate scaled leaf
 // gradients; only the final micro-step synchronizes and updates parameters.
 __attribute__((visibility("default"))) double qwen36_train_micro_step(
@@ -10929,6 +10991,9 @@ __attribute__((visibility("default"))) double qwen36_train_micro_step(
             auto& attention_mask = *reinterpret_cast<at::Tensor*>(attention_mask_ptr);
             validate_linear_attention_mask(ctx, attention_mask);
             ctx->attention_mask = attention_mask;
+            elide_trivial_attention_mask(ctx);
+        } else if (ctx->pad_token_id >= 0) {
+            ctx->attention_mask = derive_attention_mask(ctx, input_ids);
             elide_trivial_attention_mask(ctx);
         } else {
             ctx->attention_mask = at::Tensor();
@@ -11326,6 +11391,9 @@ double qwen36_train_multi_lora_impl(
         if (attention_mask_tensor) {
             provided_attention_mask = *attention_mask_tensor;
             validate_linear_attention_mask(ctx, provided_attention_mask);
+        } else if (ctx->pad_token_id >= 0) {
+            provided_attention_mask = derive_attention_mask(ctx, input_ids);
+            validate_linear_attention_mask(ctx, provided_attention_mask);
         }
         const at::Tensor saved_attention_mask = ctx->attention_mask;
         const at::Tensor saved_attention_lengths = ctx->attention_lengths;
@@ -11591,7 +11659,8 @@ double qwen36_train_multi_lora_impl(
 
             if (!ctx->group_inputs.empty() && !env_enabled("QWEN36_SUBCKPT")) {
                 manual_group_backward(
-                    ctx, context_parallel_enabled(ctx)
+                    ctx, sequence_parallel_enabled(ctx) ||
+                        context_parallel_enabled(ctx)
                         ? sequence_parallel_plain_split(ctx, hidden_grad)
                         : hidden_grad);
             } else {

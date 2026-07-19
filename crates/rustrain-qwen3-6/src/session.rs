@@ -862,6 +862,7 @@ fn train_impl(
         expert_start,
         expert_count,
     )?;
+    ctx.set_pad_token_id(data.pad_token_id())?;
     ctx.set_max_grad_norm(config.train.max_grad_norm.map(f64::from).unwrap_or(0.0))?;
 
     if world_size > 1 {
@@ -1088,21 +1089,9 @@ fn train_impl(
             let sft_batch = data.batch(data_start, batch_size);
             let (input_ids, target_mask) = sft_batch.to_tensors(device, compute_kind);
 
-            // Build attention mask: 1 for real tokens, 0 for padding
-            // target_mask > 0 means the token is either response (loss) or prompt (no loss but attend)
-            // We need: 1 for all non-padding tokens, 0 for padding tokens
-            // The SFT batch's target_mask is: 0=prompt, 1=response, but padding has mask=0 too.
-            // We need attention_mask = (target_mask >= 0).to(float) but that's all 1s.
-            // Actually: padding tokens have target_mask=0 AND are after EOS.
-            // The SftBatch already has padding at the end with mask=0.
-            // We need: attention_mask = 1 where token is NOT padding.
-            // Since prompt tokens have mask=0 and response tokens have mask=1,
-            // but padding also has mask=0, we can't distinguish prompt from padding using mask alone.
-            // Solution: use the pad_token_id to build attention mask from input_ids.
-            let pad_id = data.pad_token_id();
-            let attention_mask = input_ids.ne(pad_id).to_kind(Kind::Float); // [batch, seq]
-
-            (input_ids, target_mask, attention_mask)
+            // The native C++ context derives the padding mask from input IDs,
+            // keeping GPU mask construction out of this Rust hot loop.
+            (input_ids, target_mask)
         };
 
         let loss_value = if pp_size > 1 {
@@ -1116,7 +1105,7 @@ fn train_impl(
                     pipeline_1f1b_schedule(pp_rank, pp_size, gradient_accumulation_steps)?
                 {
                     if let Some(microbatch) = forward_mb {
-                        let (input_ids, target_mask, attention_mask) =
+                        let (input_ids, target_mask) =
                             load_microbatch(microbatch as usize);
                         ctx.pipeline_tick_v1(
                             window_id,
@@ -1124,7 +1113,7 @@ fn train_impl(
                             backward_mb,
                             Some(&input_ids),
                             Some(&target_mask),
-                            Some(&attention_mask),
+                            None,
                             gradient_scale,
                         )?;
                     } else {
@@ -1151,12 +1140,12 @@ fn train_impl(
         } else {
             let mut loss = 0.0;
             for accumulation_index in 0..gradient_accumulation_steps {
-                let (input_ids, target_mask, attention_mask) = load_microbatch(accumulation_index);
+                let (input_ids, target_mask) = load_microbatch(accumulation_index);
 
                 loss += ctx.train_micro_step(
                     &input_ids,
                     &target_mask,
-                    &attention_mask,
+                    None,
                     1.0 / gradient_accumulation_steps as f64,
                     accumulation_index + 1 == gradient_accumulation_steps,
                 )? / gradient_accumulation_steps as f64;
