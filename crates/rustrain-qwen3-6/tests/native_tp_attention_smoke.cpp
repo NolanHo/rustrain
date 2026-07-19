@@ -5,6 +5,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <string>
 #include <vector>
 
 struct LayerConfig {
@@ -76,6 +77,26 @@ int main() {
     const int world = std::atoi(std::getenv("WORLD_SIZE"));
     assert(world == 2 && rank >= 0 && rank < world);
     qwen36_set_cuda_device(rank);
+    auto set_distributed_env = [&]() {
+        setenv("WORLD_SIZE", std::to_string(world).c_str(), 1);
+        setenv("RANK", std::to_string(rank).c_str(), 1);
+        setenv("TP_SIZE", "2", 1);
+        setenv("CP_SIZE", "1", 1);
+        setenv("EP_SIZE", "1", 1);
+        setenv("DP_SIZE", "1", 1);
+        setenv("PP_SIZE", "1", 1);
+        setenv("RUSTRAIN_TP_RANK", std::to_string(rank).c_str(), 1);
+    };
+    auto set_reference_env = []() {
+        setenv("WORLD_SIZE", "1", 1);
+        setenv("RANK", "0", 1);
+        setenv("TP_SIZE", "1", 1);
+        setenv("CP_SIZE", "1", 1);
+        setenv("EP_SIZE", "1", 1);
+        setenv("DP_SIZE", "1", 1);
+        setenv("PP_SIZE", "1", 1);
+        setenv("RUSTRAIN_TP_RANK", "0", 1);
+    };
 
     constexpr int64_t hidden = 8;
     constexpr int64_t heads = 4;
@@ -132,7 +153,7 @@ int main() {
 
     const int64_t target_layer = 0;
     auto local_ptrs = pointers(local_weights);
-    setenv("TP_SIZE", "2", 1);
+    set_distributed_env();
     unsetenv("RUSTRAIN_DATA_PARALLEL");
     void* distributed = qwen36_create_training_context_ex(
         local_ptrs.data(), local_ptrs.size(), &embed, &final_norm, &lm_head,
@@ -144,7 +165,7 @@ int main() {
         distributed, nullptr, nullptr, nullptr, nullptr, nullptr, 0, nullptr, 0) != 0);
     assert(qwen36_init_nccl(distributed) == 0);
 
-    setenv("TP_SIZE", "1", 1);
+    set_reference_env();
     auto full_ptrs = pointers(full_weights);
     void* reference = qwen36_create_training_context(
         full_ptrs.data(), full_ptrs.size(), &embed, &final_norm, &lm_head,
@@ -152,6 +173,7 @@ int main() {
         1.0, 1e-3, 0.9, 0.999, 1e-8, vocab, 1e-5, lora_rank,
         &target_layer, 1, "q_proj,k_proj,v_proj,o_proj");
     assert(reference);
+    set_distributed_env();
 
     auto q_a = deterministic({lora_rank, hidden}, 0.0020);
     auto q_b = deterministic({2 * heads * head_dim, lora_rank}, 0.0010);
@@ -369,7 +391,7 @@ int main() {
     qwen36_free_training_context(reference);
     qwen36_free_training_context(distributed);
 
-    setenv("TP_SIZE", "2", 1);
+    set_distributed_env();
     void* dynamic_distributed = qwen36_create_training_context_ex(
         local_ptrs.data(), local_ptrs.size(), &embed, &final_norm, &lm_head,
         &config, 1, static_cast<int32_t>(at::kBFloat16),
@@ -381,7 +403,7 @@ int main() {
         &target_layer, 1, "q_proj,k_proj,v_proj,o_proj");
     assert(distributed_id > 0);
 
-    setenv("TP_SIZE", "1", 1);
+    set_reference_env();
     void* dynamic_reference = qwen36_create_training_context(
         full_ptrs.data(), full_ptrs.size(), &embed, &final_norm, &lm_head,
         &config, 1, static_cast<int32_t>(at::kBFloat16),
@@ -392,6 +414,7 @@ int main() {
         dynamic_reference, lora_rank, lora_rank,
         &target_layer, 1, "q_proj,k_proj,v_proj,o_proj");
     assert(reference_id > 0);
+    set_distributed_env();
 
     assert(qwen36_set_adapter_lora_tensor(
         dynamic_distributed, distributed_id, 0, "q_proj", 0, &q_a) == 0);

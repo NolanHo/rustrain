@@ -15,6 +15,10 @@ case "$mode" in
         test_name=native_sequence_parallel_smoke
         test_source=crates/rustrain-qwen3-6/tests/native_sequence_parallel_smoke.cpp
         ;;
+    tp-attention-smoke)
+        test_name=native_tp_attention_smoke
+        test_source=crates/rustrain-qwen3-6/tests/native_tp_attention_smoke.cpp
+        ;;
     cp-gdn-smoke)
         test_name=native_cp_gdn_smoke
         test_source=crates/rustrain-qwen3-6/tests/native_cp_gdn_smoke.cpp
@@ -40,7 +44,7 @@ case "$mode" in
         test_source=crates/rustrain-qwen3-6/tests/native_pp_train_smoke.cpp
         ;;
     *)
-    echo "usage: $0 [local-smoke|smoke|sequence-parallel-smoke|cp-gdn-smoke|gpu-metadata-smoke|tri-smoke|tri-replicated-smoke|ep-smoke|ep-bench|bench|pp-cp-comm-smoke|pp-train-smoke]" >&2
+    echo "usage: $0 [local-smoke|smoke|sequence-parallel-smoke|tp-attention-smoke|cp-gdn-smoke|gpu-metadata-smoke|tri-smoke|tri-replicated-smoke|ep-smoke|ep-bench|bench|pp-cp-comm-smoke|pp-train-smoke]" >&2
         exit 2
         ;;
 esac
@@ -210,6 +214,10 @@ if [[ "$mode" == "local-smoke" ]]; then
         "$test_bin"
 elif [[ "$mode" == "sequence-parallel-smoke" ]]; then
     QWEN36_SEQUENCE_PARALLEL=1 TP_SIZE=2 CP_SIZE=1 EP_SIZE=1 DP_SIZE=1 PP_SIZE=1 \
+        "$python_bin" -m torch.distributed.run --standalone \
+            --nnodes=1 --nproc-per-node=2 --no-python "$test_bin"
+elif [[ "$mode" == "tp-attention-smoke" ]]; then
+    TP_SIZE=2 CP_SIZE=1 EP_SIZE=1 DP_SIZE=1 PP_SIZE=1 \
         "$python_bin" -m torch.distributed.run --standalone \
             --nnodes=1 --nproc-per-node=2 --no-python "$test_bin"
 elif [[ "$mode" == "cp-gdn-smoke" ]]; then

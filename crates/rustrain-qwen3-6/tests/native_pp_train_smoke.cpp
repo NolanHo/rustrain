@@ -76,15 +76,24 @@ struct Qwen36PipelineResultV1 {
 };
 extern "C" int32_t qwen36_pipeline_begin_v1(
     void*, const Qwen36PipelineWindowV1*);
+extern "C" int32_t qwen36_pipeline_begin_dynamic_selected_v1(
+    void*, const Qwen36PipelineWindowV1*, const int64_t*, int32_t);
 extern "C" int32_t qwen36_pipeline_tick_v1(
     void*, const Qwen36PipelineTickV1*, Qwen36PipelineResultV1*);
 extern "C" int32_t qwen36_pipeline_finish_v1(
     void*, int32_t, Qwen36PipelineResultV1*);
+extern "C" int32_t qwen36_pipeline_finish_dynamic_report_v1(
+    void*, int32_t, Qwen36PipelineResultV1*, double*, int32_t);
 extern "C" int32_t qwen36_pipeline_abort_v1(void*);
 extern "C" void qwen36_set_checkpoint(void*, int32_t, int64_t);
 extern "C" int32_t qwen36_set_max_grad_norm(void*, double);
 extern "C" int64_t qwen36_add_lora(
     void*, int64_t, double, const int64_t*, int64_t, const char*);
+extern "C" void* qwen36_get_adapter_lora_tensor(
+    void*, int64_t, int64_t, const char*, int32_t);
+extern "C" void* qwen36_get_adapter_optimizer_tensor(
+    void*, int64_t, int64_t, const char*, int32_t, int32_t);
+extern "C" int64_t qwen36_get_adapter_step_count(void*, int64_t);
 extern "C" int64_t qwen36_get_lora_count(void*);
 extern "C" void* qwen36_get_lora_a(void*, int64_t);
 extern "C" void* qwen36_get_lora_b(void*, int64_t);
@@ -612,13 +621,143 @@ int main() {
         bad_backward < 0 ? 0 : 1,
         &input_microbatches[0], bad_target_ptr, nullptr, 1.0};
     assert(qwen36_pipeline_tick_v1(window_context, &bad_tick, &result) != 0);
+
+    const int64_t adapter_one = qwen36_add_lora(
+        window_context, 2, 4.0, &dynamic_target_layer, 1, "q_proj");
+    const int64_t adapter_two = qwen36_add_lora(
+        window_context, 2, 4.0, &dynamic_target_layer, 1, "q_proj");
+    const int64_t adapter_unselected = qwen36_add_lora(
+        window_context, 2, 4.0, &dynamic_target_layer, 1, "q_proj");
+    assert(adapter_one > 0 && adapter_two > adapter_one &&
+        adapter_unselected > adapter_two);
+    assert(qwen36_get_adapter_step_count(window_context, adapter_one) == 0);
+    assert(qwen36_get_adapter_step_count(window_context, adapter_two) == 0);
+    assert(qwen36_get_adapter_step_count(
+        window_context, adapter_unselected) == 0);
+
+    Qwen36PipelineWindowV1 mismatched_dynamic_window{
+        sizeof(Qwen36PipelineWindowV1), 1, 12, 2, 0, 1, 1};
+    const int64_t mismatched_ids[] = {
+        rank == 0 ? adapter_one : adapter_two,
+        rank == 0 ? adapter_two : adapter_one,
+    };
+    assert(qwen36_pipeline_begin_dynamic_selected_v1(
+        window_context, &mismatched_dynamic_window,
+        mismatched_ids, 2) != 0);
+
+    auto* selected_one_b = reinterpret_cast<at::Tensor*>(
+        qwen36_get_adapter_lora_tensor(
+            window_context, adapter_one, 0, "q_proj", 1));
+    auto* selected_two_b = reinterpret_cast<at::Tensor*>(
+        qwen36_get_adapter_lora_tensor(
+            window_context, adapter_two, 0, "q_proj", 1));
+    auto* unselected_b = reinterpret_cast<at::Tensor*>(
+        qwen36_get_adapter_lora_tensor(
+            window_context, adapter_unselected, 0, "q_proj", 1));
+    auto* unselected_m = reinterpret_cast<at::Tensor*>(
+        qwen36_get_adapter_optimizer_tensor(
+            window_context, adapter_unselected, 0, "q_proj", 1, 0));
+    auto* unselected_v = reinterpret_cast<at::Tensor*>(
+        qwen36_get_adapter_optimizer_tensor(
+            window_context, adapter_unselected, 0, "q_proj", 1, 1));
+    assert((selected_one_b != nullptr) == (pp_rank == 0));
+    assert((selected_two_b != nullptr) == (pp_rank == 0));
+    assert((unselected_b != nullptr) == (pp_rank == 0));
+    assert((unselected_m != nullptr) == (pp_rank == 0));
+    assert((unselected_v != nullptr) == (pp_rank == 0));
+    at::Tensor selected_one_before;
+    at::Tensor selected_two_before;
+    at::Tensor unselected_before;
+    at::Tensor unselected_m_before;
+    at::Tensor unselected_v_before;
+    if (pp_rank == 0) {
+        selected_one_before = selected_one_b->clone();
+        selected_two_before = selected_two_b->clone();
+        unselected_before = unselected_b->clone();
+        unselected_m_before = unselected_m->clone();
+        unselected_v_before = unselected_v->clone();
+    }
+
+    const int64_t dynamic_sequence_length =
+        std::max<int64_t>(sequence_length, 3);
+    auto dynamic_positions = at::arange(dynamic_sequence_length, long_options);
+    std::vector<at::Tensor> dynamic_inputs;
+    std::vector<at::Tensor> dynamic_targets;
+    for (int64_t microbatch = 0; microbatch < 2; ++microbatch) {
+        dynamic_inputs.push_back(at::stack({
+            dynamic_positions.add(microbatch).remainder(4),
+            dynamic_positions.add(microbatch + 2).remainder(4),
+        }));
+        auto target = at::ones({2, dynamic_sequence_length}, long_options);
+        target.select(0, 1).select(0, dynamic_sequence_length - 1).zero_();
+        dynamic_targets.push_back(std::move(target));
+    }
+    const int64_t dynamic_microbatches = 2;
+    const int64_t dynamic_warmup = std::min<int64_t>(
+        pp_size - pp_rank - 1, dynamic_microbatches);
+    std::vector<std::pair<int64_t, int64_t>> dynamic_schedule;
+    for (int64_t microbatch = 0; microbatch < dynamic_warmup; ++microbatch)
+        dynamic_schedule.emplace_back(microbatch, -1);
+    for (int64_t microbatch = dynamic_warmup;
+         microbatch < dynamic_microbatches; ++microbatch)
+        dynamic_schedule.emplace_back(microbatch, microbatch - dynamic_warmup);
+    for (int64_t microbatch = dynamic_microbatches - dynamic_warmup;
+         microbatch < dynamic_microbatches; ++microbatch)
+        dynamic_schedule.emplace_back(-1, microbatch);
+
+    Qwen36PipelineWindowV1 dynamic_window{
+        sizeof(Qwen36PipelineWindowV1), 1, 13,
+        dynamic_microbatches, 0, 1, 1};
+    const int64_t selected_ids[] = {adapter_one, adapter_two};
+    assert(qwen36_pipeline_begin_dynamic_selected_v1(
+        window_context, &dynamic_window, selected_ids, 2) == 0);
+    for (const auto& [forward_mb, backward_mb] : dynamic_schedule) {
+        Qwen36PipelineTickV1 tick{
+            sizeof(Qwen36PipelineTickV1), 1, 13, forward_mb, backward_mb,
+            0, forward_mb < 0 ? 2 : (backward_mb < 0 ? 0 : 1),
+            forward_mb >= 0 ? &dynamic_inputs[forward_mb] : nullptr,
+            forward_mb >= 0 ? &dynamic_targets[forward_mb] : nullptr,
+            nullptr, 0.5};
+        assert(qwen36_pipeline_tick_v1(
+            window_context, &tick, &result) == 0);
+    }
+    double tenant_losses[2] = {-1.0, -1.0};
+    assert(qwen36_pipeline_finish_dynamic_report_v1(
+        window_context, 1, &result, tenant_losses, 2) == 0);
+    assert(result.completed_fwd == dynamic_microbatches &&
+        result.completed_bwd == dynamic_microbatches &&
+        result.in_flight == 0 && result.optimizer_step == -1);
+    assert(std::isfinite(result.loss) && result.loss >= 0.0);
+    assert(std::isfinite(tenant_losses[0]) && tenant_losses[0] >= 0.0);
+    assert(std::isfinite(tenant_losses[1]) && tenant_losses[1] >= 0.0);
+    const double tenant_one_tokens =
+        static_cast<double>(dynamic_sequence_length - 1);
+    const double tenant_two_tokens =
+        static_cast<double>(dynamic_sequence_length - 2);
+    const double reported_aggregate =
+        (tenant_losses[0] * tenant_one_tokens +
+         tenant_losses[1] * tenant_two_tokens) /
+        (tenant_one_tokens + tenant_two_tokens);
+    assert(std::abs(result.loss - reported_aggregate) <= 1e-5);
+    assert(qwen36_get_adapter_step_count(window_context, adapter_one) == 1);
+    assert(qwen36_get_adapter_step_count(window_context, adapter_two) == 1);
+    assert(qwen36_get_adapter_step_count(
+        window_context, adapter_unselected) == 0);
+    if (pp_rank == 0) {
+        assert(max_diff(*selected_one_b, selected_one_before) > 0.0);
+        assert(max_diff(*selected_two_b, selected_two_before) > 0.0);
+        assert(max_diff(*unselected_b, unselected_before) == 0.0);
+        assert(max_diff(*unselected_m, unselected_m_before) == 0.0);
+        assert(max_diff(*unselected_v, unselected_v_before) == 0.0);
+    }
     std::printf("native_qwen36_pp_train rank=%d loss=%0.6f "
         "grad_diff=%0.8e param_diff=%0.8e m_diff=%0.8e v_diff=%0.8e "
         "max_in_flight=%ld cache_builds=%ld legacy_cache_builds=%ld "
-        "step=1 ok\n", rank,
+        "dynamic_loss=%0.6f tenant_losses=%0.6f,%0.6f step=1 ok\n", rank,
         window_loss, gradient_difference, parity.parameter, parity.adam_m,
         parity.adam_v, (long)max_in_flight, (long)window_projection_builds,
-        (long)legacy_projection_builds);
+        (long)legacy_projection_builds, result.loss,
+        tenant_losses[0], tenant_losses[1]);
     qwen36_free_training_context(legacy_context);
     qwen36_free_training_context(window_context);
     return 0;
