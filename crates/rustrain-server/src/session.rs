@@ -684,7 +684,10 @@ impl Qwen36Session {
             .as_ref()
             .ok_or_else(|| anyhow!("LoRA not initialized"))?;
         let selected = if adapter_ids.is_empty() {
-            ctx.list_lora().into_iter().filter(|id| *id > 0).collect::<Vec<_>>()
+            ctx.list_lora()
+                .into_iter()
+                .filter(|id| *id > 0)
+                .collect::<Vec<_>>()
         } else {
             adapter_ids.to_vec()
         };
@@ -697,11 +700,9 @@ impl Qwen36Session {
         let window_id = i64::try_from(self.step).context("pipeline step exceeds i64")?;
         ctx.pipeline_begin_dynamic_selected_v1(window_id, num_microbatches, &selected)?;
         let result = (|| -> Result<f64> {
-            for (forward_mb, backward_mb) in dynamic_pipeline_schedule(
-                pp_rank,
-                pp_size,
-                microbatches.len(),
-            )? {
+            for (forward_mb, backward_mb) in
+                dynamic_pipeline_schedule(pp_rank, pp_size, microbatches.len())?
+            {
                 let forward_input_ids = forward_mb
                     .and_then(|index| microbatches.get(index as usize).map(|batch| &batch.0));
                 let forward_target_mask = forward_mb
@@ -759,11 +760,9 @@ impl Qwen36Session {
         let window_id = i64::try_from(self.step).context("pipeline step exceeds i64")?;
         ctx.pipeline_begin_dynamic_selected_v1(window_id, num_microbatches, adapter_ids)?;
         let result = (|| -> Result<(f64, Vec<f64>)> {
-            for (forward_mb, backward_mb) in dynamic_pipeline_schedule(
-                pp_rank,
-                pp_size,
-                microbatches.len(),
-            )? {
+            for (forward_mb, backward_mb) in
+                dynamic_pipeline_schedule(pp_rank, pp_size, microbatches.len())?
+            {
                 let forward_input_ids = forward_mb
                     .and_then(|index| microbatches.get(index as usize).map(|batch| &batch.0));
                 let forward_target_mask = forward_mb

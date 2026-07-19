@@ -20,9 +20,9 @@ use rustrain_parallel::topology::ParallelTopology;
 use tch::{Device, Kind};
 
 use crate::session::{
-    AddLoRARequest, EvalOutput, InitLoRARequest, MultiLoraEvalOutput, Qwen36Session,
-    SessLoadDatasetRequest, SessLoadModelRequest, TrainOutput, TrainingSession,
-    configured_dynamic_pipeline_microbatches,
+    configured_dynamic_pipeline_microbatches, AddLoRARequest, EvalOutput, InitLoRARequest,
+    MultiLoraEvalOutput, Qwen36Session, SessLoadDatasetRequest, SessLoadModelRequest, TrainOutput,
+    TrainingSession,
 };
 
 const TERMINAL_NATIVE_CONTEXT_PREFIX: &str = "terminal native LoRA context";
