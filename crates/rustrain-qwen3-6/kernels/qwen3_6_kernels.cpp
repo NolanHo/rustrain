@@ -3404,6 +3404,7 @@ static void hash_collective_runtime_environment(AdapterRegistryHash& hash) {
     hash.add_u64(env_enabled("QWEN36_SUBCKPT"));
     hash.add_u64(env_enabled("QWEN36_FUSED_LAYER"));
     hash.add_u64(env_enabled("QWEN36_FUSED_CE"));
+    hash.add_u64(env_enabled("QWEN36_FUSED_QKV"));
     const char* checkpoint_stride =
         getenv("QWEN36_GDN_STATE_CHECKPOINT_STRIDE");
     hash.add_string(checkpoint_stride ? checkpoint_stride : "");
