@@ -279,6 +279,62 @@ __global__ void fused_adam_multi_out_of_place_kernel(
     }
 }
 
+// Accumulate one FP32 squared L2 norm per logical adapter. Pointer lists only
+// contain the unique owners of replicated parameters, so the caller can sum
+// these device scalars over the orthogonal process grid without double count.
+__global__ void fused_multi_tensor_l2_norm_kernel(
+    void** __restrict__ grad_ptrs,
+    const int* __restrict__ sizes,
+    const int* __restrict__ groups,
+    int n_tensors,
+    float* __restrict__ norm_squares
+) {
+    const int tensor_index = blockIdx.x;
+    if (tensor_index >= n_tensors) return;
+
+    const float* grad = (const float*)grad_ptrs[tensor_index];
+    const int size = sizes[tensor_index];
+    float sum = 0.0f;
+    for (int i = threadIdx.x; i < size; i += blockDim.x) {
+        const float value = grad[i];
+        sum += value * value;
+    }
+    for (int offset = 16; offset > 0; offset >>= 1)
+        sum += __shfl_down_sync(0xffffffff, sum, offset);
+
+    __shared__ float warp_sums[8];
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    if (lane == 0) warp_sums[warp] = sum;
+    __syncthreads();
+    if (warp == 0) {
+        sum = lane < (blockDim.x + 31) / 32 ? warp_sums[lane] : 0.0f;
+        for (int offset = 16; offset > 0; offset >>= 1)
+            sum += __shfl_down_sync(0xffffffff, sum, offset);
+        if (lane == 0) atomicAdd(norm_squares + groups[tensor_index], sum);
+    }
+}
+
+__global__ void fused_multi_tensor_clip_kernel(
+    void** __restrict__ grad_ptrs,
+    const int* __restrict__ sizes,
+    const int* __restrict__ groups,
+    int n_tensors,
+    const float* __restrict__ norm_squares,
+    float max_norm
+) {
+    const int tensor_index = blockIdx.x;
+    if (tensor_index >= n_tensors) return;
+    const float total_norm = sqrtf(norm_squares[groups[tensor_index]]);
+    const float scale = fminf(1.0f, max_norm / (total_norm + 1.0e-6f));
+    if (scale >= 1.0f) return;
+
+    float* grad = (float*)grad_ptrs[tensor_index];
+    const int size = sizes[tensor_index];
+    for (int i = threadIdx.x; i < size; i += blockDim.x)
+        grad[i] *= scale;
+}
+
 // ──────────────────────────────────────────────────────────────────────
 // C wrapper functions (called from C++ via extern "C")
 // ──────────────────────────────────────────────────────────────────────
@@ -364,6 +420,26 @@ void launch_fused_adam_multi_out_of_place(
         d_beta1, d_beta2,
         n_params
     );
+}
+
+void launch_fused_multi_tensor_l2_norm(
+    void** d_grad_ptrs, int* d_sizes, int* d_groups,
+    int n_tensors, float* d_norm_squares, cudaStream_t stream
+) {
+    if (n_tensors <= 0) return;
+    fused_multi_tensor_l2_norm_kernel<<<n_tensors, 256, 0, stream>>>(
+        d_grad_ptrs, d_sizes, d_groups, n_tensors, d_norm_squares);
+}
+
+void launch_fused_multi_tensor_clip(
+    void** d_grad_ptrs, int* d_sizes, int* d_groups,
+    int n_tensors, const float* d_norm_squares, float max_norm,
+    cudaStream_t stream
+) {
+    if (n_tensors <= 0) return;
+    fused_multi_tensor_clip_kernel<<<n_tensors, 256, 0, stream>>>(
+        d_grad_ptrs, d_sizes, d_groups, n_tensors,
+        d_norm_squares, max_norm);
 }
 
 }  // extern "C"

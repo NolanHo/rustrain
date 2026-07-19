@@ -40,6 +40,7 @@ extern "C" void* qwen36_get_lora_grad_accumulator(void*, int64_t, int32_t);
 extern "C" int32_t qwen36_abort_gradient_accumulation(void*);
 extern "C" int32_t qwen36_set_lora_tensor(void*, int64_t, int32_t, void*);
 extern "C" int32_t qwen36_set_router_aux_loss_coef(void*, double);
+extern "C" int32_t qwen36_set_max_grad_norm(void*, double);
 extern "C" void qwen36_set_checkpoint(void*, int32_t, int64_t);
 extern "C" double qwen36_train_step(void*, void*, void*, void*);
 extern "C" double qwen36_train_micro_step(
@@ -406,7 +407,7 @@ static int run_dynamic_dp_smoke(
 }
 
 int main() {
-    assert(qwen36_kernel_abi_version() == 28);
+    assert(qwen36_kernel_abi_version() == 29);
     const int world = std::atoi(std::getenv("WORLD_SIZE") ? std::getenv("WORLD_SIZE") : "1");
     const int process_rank = std::atoi(std::getenv("RANK") ? std::getenv("RANK") : "0");
     const int local_rank = std::atoi(std::getenv("LOCAL_RANK") ? std::getenv("LOCAL_RANK") : "0");
@@ -1346,6 +1347,7 @@ int main() {
             optimizer_v_before[index]));
     }
 
+    assert(qwen36_set_max_grad_norm(ctx, 1.0e-4) == 0);
     linear_a_before = linear_a->clone();
     const double linear_loss = qwen36_train_step(
         ctx, &input_ids, &target_mask, &attention_mask);
@@ -1357,6 +1359,7 @@ int main() {
         linear_loss, linear_update);
     assert(linear_loss == linear_loss && linear_loss > 0.0);
     assert(linear_update > 0.0);
+    assert(qwen36_set_max_grad_norm(ctx, 0.0) == 0);
 
     const int64_t linear_adapter_one = qwen36_add_lora(
         ctx, rank, 1.0, &target_layer, 1, "in_proj_qkv");
@@ -1374,6 +1377,7 @@ int main() {
         ctx, linear_adapter_one, 0, "in_proj_qkv", 1,
         &dynamic_linear_b_value) == 0);
     auto dynamic_linear_b_before = dynamic_linear_b->clone();
+    assert(qwen36_set_max_grad_norm(ctx, 1.0e-4) == 0);
     const double dynamic_linear_loss = qwen36_train_multi_lora(
         ctx, &multi_input_ids, &multi_target_mask, &multi_attention_mask, 2, rank);
     c10::cuda::device_synchronize();
@@ -1387,6 +1391,7 @@ int main() {
         "native_qwen35_linear_multi_lora_smoke loss=%0.8f qkv_b_update=%0.8e\n",
         dynamic_linear_loss, dynamic_linear_update);
     assert(dynamic_linear_loss == dynamic_linear_loss && dynamic_linear_loss > 0.0);
+    assert(qwen36_set_max_grad_norm(ctx, 0.0) == 0);
     assert(dynamic_linear_update > 0.0);
     qwen36_free_training_context(ctx);
     return 0;

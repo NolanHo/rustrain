@@ -82,6 +82,7 @@ extern "C" int32_t qwen36_pipeline_finish_v1(
     void*, int32_t, Qwen36PipelineResultV1*);
 extern "C" int32_t qwen36_pipeline_abort_v1(void*);
 extern "C" void qwen36_set_checkpoint(void*, int32_t, int64_t);
+extern "C" int32_t qwen36_set_max_grad_norm(void*, double);
 extern "C" int64_t qwen36_get_lora_count(void*);
 extern "C" void* qwen36_get_lora_a(void*, int64_t);
 extern "C" void* qwen36_get_lora_b(void*, int64_t);
@@ -213,7 +214,7 @@ static StateDiff compare_fixed_state(
 }
 
 int main() {
-    assert(qwen36_kernel_abi_version() == 28);
+    assert(qwen36_kernel_abi_version() == 29);
     const int rank = std::atoi(std::getenv("RANK") ? std::getenv("RANK") : "0");
     const int local_rank = std::atoi(
         std::getenv("LOCAL_RANK") ? std::getenv("LOCAL_RANK") : "0");
@@ -260,9 +261,9 @@ int main() {
     config.intermediate_size = 8;
     const int32_t stage_flags = pp_rank == 0 ? 1
         : (pp_rank + 1 == pp_size ? 2 : 0);
-    std::vector<int64_t> target_layers(pp_size);
-    for (int64_t layer = 0; layer < pp_size; ++layer)
-        target_layers[layer] = layer;
+    // Keep the last PP stage free of active LoRA parameters. Its clipping
+    // path must still participate in the scalar PP norm reduction.
+    std::vector<int64_t> target_layers{0};
     auto create_context = [&](bool synchronize_parameters) {
         void* context = qwen36_create_training_context_v2(
             weight_ptrs.data(), static_cast<int64_t>(weight_ptrs.size()),
@@ -367,7 +368,7 @@ int main() {
     runtime_mismatch_window.window_id = 3;
     assert(qwen36_pipeline_begin_v1(
         window_context, &runtime_mismatch_window) != 0);
-    if (rank == 0) qwen36_set_checkpoint(window_context, 0, 1);
+    qwen36_set_checkpoint(window_context, 0, 1);
 
     if (rank == 0) {
         setenv("QWEN36_EP_A2A_PACKED", "0", 1);
@@ -411,6 +412,14 @@ int main() {
         window_context, &runtime_mismatch_window) != 0);
     unsetenv("QWEN36_CE_TOKEN_TILE");
 
+    assert(qwen36_set_max_grad_norm(
+        window_context, rank == 0 ? 0.0 : 1e-4) == 0);
+    runtime_mismatch_window.window_id = 11;
+    assert(qwen36_pipeline_begin_v1(
+        window_context, &runtime_mismatch_window) != 0);
+    assert(qwen36_set_max_grad_norm(window_context, 1e-4) == 0);
+    assert(qwen36_set_max_grad_norm(legacy_context, 1e-4) == 0);
+
     Qwen36PipelineWindowV1 window{
         sizeof(Qwen36PipelineWindowV1), 1, 7, num_microbatches, 0, 1, 0};
     const int64_t window_builds_before =
@@ -435,7 +444,8 @@ int main() {
     const int64_t window_projection_builds =
         qwen36_get_lora_batch_projection_build_count(window_context) -
         window_builds_before;
-    assert(window_projection_builds > 0);
+    if (pp_rank == 0) assert(window_projection_builds > 0);
+    else assert(window_projection_builds == 0);
 
     double gradient_difference = 0.0;
     double gradient_magnitude = 0.0;
@@ -472,7 +482,8 @@ int main() {
                 gradient_magnitude, max_abs(*window_gradient));
         }
     }
-    assert(gradient_magnitude > 1e-8);
+    if (pp_rank == 0) assert(gradient_magnitude > 1e-8);
+    else assert(gradient_magnitude == 0.0);
     assert(gradient_difference <= 1e-6);
     assert(qwen36_abort_gradient_accumulation(legacy_context) == 0);
     assert(qwen36_get_step_count(legacy_context) == 0);
@@ -505,8 +516,14 @@ int main() {
     assert(parity.adam_m <= 1e-5);
     assert(parity.adam_v <= 1e-7);
     const auto update = compare_fixed_state(initial_state, window_state);
-    assert(update.parameter > 0.0);
-    assert(std::max(update.adam_m, update.adam_v) > 0.0);
+    if (pp_rank == 0) {
+        assert(update.parameter > 0.0);
+        assert(std::max(update.adam_m, update.adam_v) > 0.0);
+    } else {
+        assert(update.parameter == 0.0);
+        assert(update.adam_m == 0.0 && update.adam_v == 0.0);
+    }
+    assert(update.adam_m <= 1.1e-5);
 
     auto bad_target_mask = at::ones(
         {1, sequence_length - 1},

@@ -243,6 +243,7 @@ type FnInitParallelNccl = unsafe extern "C" fn(
 ) -> i32;
 type FnSetCudaDevice = unsafe extern "C" fn(i32);
 type FnSetBaseTpMlp = unsafe extern "C" fn(*mut c_void, i32) -> i32;
+type FnSetMaxGradNorm = unsafe extern "C" fn(*mut c_void, f64) -> i32;
 type FnSetRouterAuxLossCoef = unsafe extern "C" fn(*mut c_void, f64) -> i32;
 type FnAddLora = unsafe extern "C" fn(*mut c_void, i64, f64, *const i64, i64, *const i8) -> i64;
 type FnAddLoraWithOptimizer =
@@ -339,6 +340,7 @@ struct KernelHandles {
     attach_parallel_nccl_no_sync: FnInitParallelNccl,
     set_cuda_device: FnSetCudaDevice,
     set_base_tp_mlp: FnSetBaseTpMlp,
+    set_max_grad_norm: FnSetMaxGradNorm,
     set_router_aux_loss_coef: FnSetRouterAuxLossCoef,
     add_lora: FnAddLora,
     add_lora_v2: FnAddLora,
@@ -398,7 +400,7 @@ unsafe fn load_kernels() -> Option<KernelHandles> {
         }};
     }
     let abi_version: FnKernelAbiVersion = sym!("qwen36_kernel_abi_version");
-    if abi_version() != 28 {
+    if abi_version() != 29 {
         return None;
     }
     let add_lora_with_optimizer = {
@@ -510,6 +512,7 @@ unsafe fn load_kernels() -> Option<KernelHandles> {
         attach_parallel_nccl_no_sync: sym!("qwen36_attach_parallel_nccl_no_sync_v2"),
         set_cuda_device: sym!("qwen36_set_cuda_device"),
         set_base_tp_mlp: sym!("qwen36_set_base_tp_mlp"),
+        set_max_grad_norm: sym!("qwen36_set_max_grad_norm"),
         set_router_aux_loss_coef: sym!("qwen36_set_router_aux_loss_coef"),
         add_lora: sym!("qwen36_add_lora"),
         add_lora_v2: sym!("qwen36_add_lora_v2"),
@@ -1234,6 +1237,20 @@ impl CppTrainingContext {
         }
         let lora_count = unsafe { (kh.get_lora_count)(ptr) };
         Ok(Self { ptr, lora_count })
+    }
+
+    /// Configure native Megatron-style global gradient clipping. Zero disables
+    /// clipping; dynamic multi-LoRA applies the threshold independently per tenant.
+    pub fn set_max_grad_norm(&self, max_grad_norm: f64) -> Result<()> {
+        if !max_grad_norm.is_finite() || max_grad_norm < 0.0 {
+            bail!("native max_grad_norm must be finite and non-negative");
+        }
+        let kh = get_kernels().ok_or_else(|| anyhow::anyhow!("kernels not loaded"))?;
+        let status = unsafe { (kh.set_max_grad_norm)(self.ptr, max_grad_norm) };
+        if status != 0 {
+            bail!("C++ max gradient norm configuration failed");
+        }
+        Ok(())
     }
 
     /// Run one training step: forward + loss + backward + Adam update.

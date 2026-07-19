@@ -228,6 +228,13 @@ extern "C" {
         float* d_beta1, float* d_beta2,
         int n_params,
         void* stream);
+    void launch_fused_multi_tensor_l2_norm(
+        void** d_grad_ptrs, int* d_sizes, int* d_groups,
+        int n_tensors, float* d_norm_squares, void* stream);
+    void launch_fused_multi_tensor_clip(
+        void** d_grad_ptrs, int* d_sizes, int* d_groups,
+        int n_tensors, const float* d_norm_squares, float max_norm,
+        void* stream);
 }
 
 /// Fused RMSNorm — single CUDA kernel (replaces 3 ATen ops)
@@ -2827,7 +2834,10 @@ struct AdamDevBuffers {
     at::Tensor eps_buf;      // [max_n] kFloat
     at::Tensor beta1_buf;    // [max_n] kFloat
     at::Tensor beta2_buf;    // [max_n] kFloat
+    at::Tensor groups_buf;   // [max_n] kInt
+    at::Tensor clip_norm_squares;  // [max_groups] kFloat
     int capacity = 0;
+    int group_capacity = 0;
 
     void ensure(int n, const at::Tensor& ref) {
         if (n <= capacity) return;
@@ -2844,7 +2854,15 @@ struct AdamDevBuffers {
         eps_buf    = at::empty({n}, at::TensorOptions().dtype(at::kFloat).device(dev));
         beta1_buf  = at::empty({n}, at::TensorOptions().dtype(at::kFloat).device(dev));
         beta2_buf  = at::empty({n}, at::TensorOptions().dtype(at::kFloat).device(dev));
+        groups_buf = at::empty({n}, at::TensorOptions().dtype(at::kInt).device(dev));
         capacity = n;
+    }
+
+    void ensure_groups(int n, const at::Tensor& ref) {
+        if (n <= group_capacity) return;
+        clip_norm_squares = at::empty(
+            {n}, at::TensorOptions().dtype(at::kFloat).device(ref.device()));
+        group_capacity = n;
     }
 };
 
@@ -2981,6 +2999,9 @@ struct TrainingContext {
     std::vector<at::Tensor> adam_m;
     std::vector<at::Tensor> adam_v;
     double lr, beta1, beta2, eps;
+    // Zero disables clipping. Positive values apply one logical global norm
+    // to fixed LoRA and one independent global norm per dynamic tenant.
+    double max_grad_norm = 0.0;
     // Switch-style router load-balancing loss. The forward attachment keeps
     // routing probabilities bit-identical and injects the auxiliary gradient
     // when the model graph is traversed.
@@ -3374,6 +3395,7 @@ static void hash_collective_runtime_config(
     hash_collective_runtime_environment(hash);
     hash.add_u64(ctx->use_checkpoint);
     hash.add_u64(ctx->group_size);
+    hash_double(hash, ctx->max_grad_norm);
 }
 
 static void hash_collective_topology(
@@ -3745,7 +3767,7 @@ static void validate_pipeline_collective_registry(
     hash.add_u64(ctx->fixed_target_modules.size());
     for (const auto& module : ctx->fixed_target_modules)
         hash.add_string(module);
-    hash_collective_runtime_environment(hash);
+    hash_collective_runtime_config(hash, ctx);
     hash.add_u64(ctx->fixed_optimizer_step);
     uint64_t token_weight_bits = 0;
     static_assert(sizeof(token_weight_bits) == sizeof(ctx->accumulated_token_weight));
@@ -3818,7 +3840,7 @@ static void validate_pipeline_window_collective_registry(
     hash.add_u64(ctx->fixed_target_modules.size());
     for (const auto& module : ctx->fixed_target_modules)
         hash.add_string(module);
-    hash_collective_runtime_environment(hash);
+    hash_collective_runtime_config(hash, ctx);
     hash.add_u64(ctx->fixed_optimizer_step);
     uint64_t token_weight_bits = 0;
     std::memcpy(&token_weight_bits, &ctx->accumulated_token_weight,
@@ -4646,6 +4668,11 @@ static LoraTpLayout lora_tp_layout(
          name == "experts_down_proj"))
         return LoraTpLayout::RowParallel;
     return LoraTpLayout::LatentRank;
+}
+
+static bool lora_tp_parameter_replicated(LoraTpLayout layout, bool is_a) {
+    return (layout == LoraTpLayout::ColumnParallel && is_a) ||
+        (layout == LoraTpLayout::RowParallel && !is_a);
 }
 
 struct LoraGradientSlabBinding {
@@ -5759,6 +5786,221 @@ static bool synchronize_lora_gradients(
     }
     cp_sum_fixed_lora_accumulators(ctx);
     return true;
+}
+
+struct GradientClipEntry {
+    at::Tensor* accumulator;
+    int32_t group;
+    bool norm_owner;
+};
+
+static bool gradient_norm_owner(
+    const TrainingContext* ctx, bool grouped_expert,
+    LoraTpLayout layout, bool is_a
+) {
+    // DP and CP keep complete LoRA tensors replicated. Count one owner before
+    // reducing the scalar over those axes. EP only replicates dense tensors;
+    // routed experts are disjoint across EP ranks. TP ownership follows the
+    // projection-aware LoRA layout (one factor replicated, one sharded).
+    if (ctx->data_parallel && ctx->dp_world_size > 1 && ctx->dp_rank != 0)
+        return false;
+    if (ctx->cp_world_size > 1 && ctx->cp_rank != 0)
+        return false;
+    if (ctx->expert_parallel && ctx->ep_world_size > 1 &&
+            !grouped_expert && ctx->ep_rank != 0)
+        return false;
+    if (ctx->tp_world_size > 1 &&
+            lora_tp_parameter_replicated(layout, is_a) && ctx->tp_rank != 0)
+        return false;
+    return true;
+}
+
+static void reduce_clip_norm_squares(
+    TrainingContext* ctx, at::Tensor& norm_squares
+) {
+    auto stream = c10::cuda::getCurrentCUDAStream(
+        norm_squares.device().index()).stream();
+    auto reduce_axis = [&](ncclComm_t communicator, int world_size,
+                           const char* axis) {
+        if (!communicator || world_size <= 1) return;
+        const auto error = ncclAllReduce(
+            norm_squares.data_ptr<float>(), norm_squares.data_ptr<float>(),
+            norm_squares.numel(), ncclFloat, ncclSum, communicator, stream);
+        TORCH_CHECK(error == ncclSuccess,
+            "NCCL ", axis, " gradient norm all-reduce failed: ",
+            ncclGetErrorString(error));
+    };
+    reduce_axis(ctx->tp_comm, ctx->tp_world_size, "TP");
+    reduce_axis(ctx->cp_comm, ctx->cp_world_size, "CP");
+    reduce_axis(ctx->nccl_comm, ctx->ep_world_size, "EP");
+    reduce_axis(ctx->dp_comm, ctx->dp_world_size, "DP");
+    auto pp_control = ctx->pp_control_comm ?
+        ctx->pp_control_comm : ctx->pp_comm;
+    reduce_axis(pp_control, ctx->pp_world_size, "PP");
+}
+
+static void clip_lora_gradient_entries(
+    TrainingContext* ctx,
+    const std::vector<GradientClipEntry>& entries,
+    int32_t group_count
+) {
+    if (!ctx || ctx->max_grad_norm <= 0.0) return;
+    TORCH_CHECK(std::isfinite(ctx->max_grad_norm) &&
+            ctx->max_grad_norm > 0.0 && ctx->max_grad_norm <=
+            static_cast<double>(std::numeric_limits<float>::max()),
+        "native LoRA max gradient norm must be finite and representable as FP32");
+    TORCH_CHECK(group_count > 0, "native LoRA gradient clipping requires groups");
+    at::Tensor reference;
+    for (const auto& entry : entries) {
+        if (entry.accumulator && entry.accumulator->defined()) {
+            reference = *entry.accumulator;
+            break;
+        }
+    }
+    if (!reference.defined()) {
+        for (const auto* weight : ctx->weight_ptrs) {
+            if (weight && weight->defined()) {
+                reference = *weight;
+                break;
+            }
+        }
+    }
+    TORCH_CHECK(reference.defined() && reference.is_cuda(),
+        "native LoRA gradient clipping requires a CUDA reference tensor");
+
+    std::vector<void*> all_ptrs;
+    std::vector<int32_t> all_sizes;
+    std::vector<int32_t> all_groups;
+    std::vector<void*> owner_ptrs;
+    std::vector<int32_t> owner_sizes;
+    std::vector<int32_t> owner_groups;
+    all_ptrs.reserve(entries.size());
+    all_sizes.reserve(entries.size());
+    all_groups.reserve(entries.size());
+    for (const auto& entry : entries) {
+        TORCH_CHECK(entry.accumulator && entry.accumulator->defined() &&
+                entry.accumulator->is_cuda() && entry.accumulator->is_contiguous() &&
+                entry.accumulator->scalar_type() == at::kFloat &&
+                entry.accumulator->numel() <= std::numeric_limits<int32_t>::max(),
+            "native LoRA gradient clipping received an invalid accumulator");
+        all_ptrs.push_back(entry.accumulator->data_ptr());
+        all_sizes.push_back(static_cast<int32_t>(entry.accumulator->numel()));
+        all_groups.push_back(entry.group);
+        if (entry.norm_owner) {
+            owner_ptrs.push_back(entry.accumulator->data_ptr());
+            owner_sizes.push_back(static_cast<int32_t>(entry.accumulator->numel()));
+            owner_groups.push_back(entry.group);
+        }
+    }
+
+    auto& buffers = ctx->adam_dev_bufs;
+    buffers.ensure(static_cast<int>(std::max(all_ptrs.size(), owner_ptrs.size())), reference);
+    buffers.ensure_groups(group_count, reference);
+    auto norm_squares = buffers.clip_norm_squares.narrow(0, 0, group_count);
+    norm_squares.zero_();
+    auto upload = [&](std::vector<void*>& pointers,
+                      std::vector<int32_t>& sizes,
+                      std::vector<int32_t>& groups) {
+        const int count = static_cast<int>(pointers.size());
+        if (count == 0) return count;
+        auto long_options = at::TensorOptions().dtype(at::kLong).device(at::kCPU);
+        auto int_options = at::TensorOptions().dtype(at::kInt).device(at::kCPU);
+        auto pointers_cpu = at::from_blob(
+            pointers.data(), {count}, long_options);
+        auto sizes_cpu = at::from_blob(sizes.data(), {count}, int_options);
+        auto groups_cpu = at::from_blob(groups.data(), {count}, int_options);
+        buffers.grads_buf.narrow(0, 0, count).copy_(pointers_cpu);
+        buffers.sizes_buf.narrow(0, 0, count).copy_(sizes_cpu);
+        buffers.groups_buf.narrow(0, 0, count).copy_(groups_cpu);
+        return count;
+    };
+    const int owner_count = upload(owner_ptrs, owner_sizes, owner_groups);
+    auto stream = c10::cuda::getCurrentCUDAStream(reference.device().index()).stream();
+    if (owner_count > 0) {
+        launch_fused_multi_tensor_l2_norm(
+            reinterpret_cast<void**>(buffers.grads_buf.data_ptr()),
+            buffers.sizes_buf.data_ptr<int>(), buffers.groups_buf.data_ptr<int>(),
+            owner_count, norm_squares.data_ptr<float>(), static_cast<void*>(stream));
+        const auto norm_launch_error = cudaGetLastError();
+        TORCH_CHECK(norm_launch_error == cudaSuccess,
+            "fused LoRA gradient norm launch failed: ",
+            cudaGetErrorString(norm_launch_error));
+    }
+    reduce_clip_norm_squares(ctx, norm_squares);
+
+    const int all_count = upload(all_ptrs, all_sizes, all_groups);
+    if (all_count > 0) {
+        launch_fused_multi_tensor_clip(
+            reinterpret_cast<void**>(buffers.grads_buf.data_ptr()),
+            buffers.sizes_buf.data_ptr<int>(), buffers.groups_buf.data_ptr<int>(),
+            all_count, norm_squares.data_ptr<float>(),
+            static_cast<float>(ctx->max_grad_norm), static_cast<void*>(stream));
+        const auto clip_launch_error = cudaGetLastError();
+        TORCH_CHECK(clip_launch_error == cudaSuccess,
+            "fused LoRA gradient clip launch failed: ",
+            cudaGetErrorString(clip_launch_error));
+    }
+}
+
+static void clip_fixed_lora_gradients(TrainingContext* ctx) {
+    if (!ctx || ctx->max_grad_norm <= 0.0) return;
+    std::vector<GradientClipEntry> entries;
+    for (int64_t layer = 0; layer < ctx->num_layers; ++layer) {
+        const auto table = lora_projection_table(ctx->layer_configs[layer]);
+        const int64_t offset = ctx->lora_layer_offset[layer];
+        for (int64_t pair = 0; pair < table.count; ++pair) {
+            const int64_t index = offset + pair;
+            if (!ctx->lora_active[index]) continue;
+            const auto layout = lora_tp_layout(ctx, layer, pair);
+            entries.push_back({&ctx->grad_accum_a[index], 0,
+                gradient_norm_owner(ctx, table.entries[pair].grouped_expert,
+                    layout, true)});
+            entries.push_back({&ctx->grad_accum_b[index], 0,
+                gradient_norm_owner(ctx, table.entries[pair].grouped_expert,
+                    layout, false)});
+        }
+    }
+    clip_lora_gradient_entries(ctx, entries, 1);
+}
+
+static void clip_dynamic_lora_gradients(
+    TrainingContext* ctx, const std::vector<uint8_t>& adapter_has_global_tokens
+) {
+    if (!ctx || ctx->max_grad_norm <= 0.0) return;
+    TORCH_CHECK(adapter_has_global_tokens.size() == ctx->adapters.size(),
+        "dynamic LoRA gradient clipping activity mismatch");
+    std::vector<GradientClipEntry> entries;
+    for (size_t adapter_index = 0;
+         adapter_index < ctx->adapters.size(); ++adapter_index) {
+        if (!adapter_has_global_tokens[adapter_index]) continue;
+        auto& adapter = ctx->adapters[adapter_index];
+        for (const auto& [layer_idx, pairs] : adapter.params) {
+            const auto table = lora_projection_table(ctx->layer_configs[layer_idx]);
+            const auto accum_it = adapter.grad_accum.find(layer_idx);
+            TORCH_CHECK(accum_it != adapter.grad_accum.end() &&
+                    accum_it->second.size() == pairs.size(),
+                "dynamic LoRA gradient clipping layout mismatch");
+            for (size_t pair = 0; pair < pairs.size(); ++pair) {
+                if (!pairs[pair].first.requires_grad()) continue;
+                const auto layout = lora_tp_layout(
+                    ctx, layer_idx, static_cast<int64_t>(pair));
+                if (accum_it->second[pair][0].defined()) {
+                    entries.push_back({&accum_it->second[pair][0],
+                        static_cast<int32_t>(adapter_index),
+                        gradient_norm_owner(ctx, table.entries[pair].grouped_expert,
+                            layout, true)});
+                }
+                if (accum_it->second[pair][1].defined()) {
+                    entries.push_back({&accum_it->second[pair][1],
+                        static_cast<int32_t>(adapter_index),
+                        gradient_norm_owner(ctx, table.entries[pair].grouped_expert,
+                            layout, false)});
+                }
+            }
+        }
+    }
+    clip_lora_gradient_entries(
+        ctx, entries, static_cast<int32_t>(ctx->adapters.size()));
 }
 
 static void elide_trivial_attention_mask(TrainingContext* ctx) {
@@ -7440,6 +7682,8 @@ static bool apply_fixed_lora_optimizer(
             ctx, local_gradients_finite);
     TORCH_CHECK(local_gradients_finite && all_gradients_finite,
         "fixed LoRA optimizer rejected non-finite accumulated gradients");
+
+    clip_fixed_lora_gradients(ctx);
 
     at::AutoGradMode guard(false);
     ctx->lora_cache_valid = false;
@@ -9188,7 +9432,7 @@ static at::Tensor mtp_compute_loss(
 extern "C" {
 
 __attribute__((visibility("default"))) int64_t qwen36_kernel_abi_version() {
-    return 28;
+    return 29;
 }
 
 // Benchmark/metrics helper. Reducing over every orthogonal axis propagates the
@@ -9922,6 +10166,23 @@ __attribute__((visibility("default"))) int32_t qwen36_set_base_tp_mlp(
         return 0;
     } catch (const std::exception& e) {
         fprintf(stderr, "[q36] set_base_tp_mlp FAILED: %s\n", e.what());
+        return -1;
+    }
+}
+
+__attribute__((visibility("default"))) int32_t qwen36_set_max_grad_norm(
+    void* ctx_ptr, double max_grad_norm
+) {
+    try {
+        auto* ctx = reinterpret_cast<TrainingContext*>(ctx_ptr);
+        TORCH_CHECK(ctx, "null training context");
+        TORCH_CHECK(std::isfinite(max_grad_norm) && max_grad_norm >= 0.0 &&
+                max_grad_norm <= static_cast<double>(std::numeric_limits<float>::max()),
+            "max gradient norm must be finite, non-negative, and representable as FP32");
+        ctx->max_grad_norm = max_grad_norm;
+        return 0;
+    } catch (const std::exception& e) {
+        fprintf(stderr, "[q36] set_max_grad_norm FAILED: %s\n", e.what());
         return -1;
     }
 }
@@ -10835,6 +11096,8 @@ static double qwen36_train_multi_lora_impl(
                 TORCH_CHECK(local_gradients_finite && all_gradients_finite,
                     "dynamic LoRA optimizer rejected missing or non-finite "
                     "accumulated gradients");
+
+                clip_dynamic_lora_gradients(ctx, adapter_has_global_tokens);
 
                 // Build every Adam result out of place. No live parameter,
                 // optimizer tensor, or tenant clock changes until the unified

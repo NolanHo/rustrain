@@ -49,7 +49,7 @@ static std::vector<void*> ptrs(std::vector<at::Tensor>& tensors) {
 }
 
 int main() {
-    assert(qwen36_kernel_abi_version() == 28);
+    assert(qwen36_kernel_abi_version() == 29);
     const int rank = std::atoi(std::getenv("RANK"));
     const int world = std::atoi(std::getenv("WORLD_SIZE"));
     const int local_rank = std::atoi(std::getenv("LOCAL_RANK"));

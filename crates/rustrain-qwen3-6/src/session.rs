@@ -168,9 +168,9 @@ fn pipeline_1f1b_schedule(
 
 fn validate_native_optimizer_options(max_grad_norm: Option<f32>) -> Result<()> {
     if let Some(max_grad_norm) = max_grad_norm {
-        bail!(
-            "train.max_grad_norm={max_grad_norm} is not yet supported by the native Qwen3.5/3.6 LoRA optimizer; omit it rather than silently training without gradient clipping"
-        );
+        if !max_grad_norm.is_finite() || max_grad_norm <= 0.0 {
+            bail!("train.max_grad_norm must be finite and greater than zero");
+        }
     }
     Ok(())
 }
@@ -336,9 +336,10 @@ mod tests {
     }
 
     #[test]
-    fn native_optimizer_rejects_unimplemented_gradient_clipping() {
-        let error = validate_native_optimizer_options(Some(1.0)).unwrap_err();
-        assert!(error.to_string().contains("not yet supported"));
+    fn native_optimizer_accepts_gradient_clipping() {
+        validate_native_optimizer_options(Some(1.0)).unwrap();
+        assert!(validate_native_optimizer_options(Some(0.0)).is_err());
+        assert!(validate_native_optimizer_options(Some(f32::NAN)).is_err());
         validate_native_optimizer_options(None).unwrap();
     }
 }
@@ -861,6 +862,7 @@ fn train_impl(
         expert_start,
         expert_count,
     )?;
+    ctx.set_max_grad_norm(config.train.max_grad_norm.map(f64::from).unwrap_or(0.0))?;
 
     if world_size > 1 {
         if let Some(topology) = parallel_topology.as_ref() {

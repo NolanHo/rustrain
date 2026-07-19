@@ -118,7 +118,7 @@ static int32_t initialize_five_axis_context(
 }
 
 int main() {
-    assert(qwen36_kernel_abi_version() == 28);
+    assert(qwen36_kernel_abi_version() == 29);
     const int rank = std::atoi(std::getenv("RANK"));
     const int local_rank = std::atoi(std::getenv("LOCAL_RANK"));
     assert(rank >= 0 && rank < 4);
