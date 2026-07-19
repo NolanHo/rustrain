@@ -67,6 +67,10 @@ struct Qwen36PipelineWindowV1 {
     int32_t flags;
 };
 
+// Window flags are additive to the v1 ABI. Bit 0 selects the dynamic
+// multi-tenant LoRA finalizer while retaining the fixed 1F1B schedule.
+static constexpr int32_t kPipelineWindowFlagDynamicLora = 1 << 0;
+
 struct Qwen36PipelineTickV1 {
     uint32_t struct_size;
     uint32_t version;
@@ -91,6 +95,11 @@ struct Qwen36PipelineResultV1 {
     int64_t optimizer_step;
     double loss;
 };
+
+enum class DynamicMultiLoraMode;
+extern "C" double qwen36_train_multi_lora_impl(
+    void*, void*, void*, void*, int32_t, int32_t, DynamicMultiLoraMode,
+    int32_t*, at::Tensor*, at::Tensor*, bool, const at::Tensor*, bool);
 
 // Forward declarations for functions defined after TrainingContext
 at::Tensor apply_multi_lora(TrainingContext* ctx, int64_t layer_idx, int64_t pair_idx, const at::Tensor& base_weight);
@@ -2874,6 +2883,7 @@ struct PipelineWindowSlot {
     at::Tensor stage_output;
     double gradient_scale = 0.0;
     double token_weight = 0.0;
+    at::Tensor row_token_weights;
     bool forward_done = false;
     bool backward_done = false;
 };
@@ -2885,9 +2895,12 @@ struct PipelineWindowState {
     int32_t schedule = 0;
     int32_t num_chunks = 1;
     int32_t flags = 0;
+    bool dynamic_lora = false;
     int64_t next_forward = 0;
     int64_t next_backward = 0;
     double total_loss = 0.0;
+    double total_loss_weight = 0.0;
+    at::Tensor adapter_token_counts;
     at::Tensor normalization_mask;
     at::Tensor pending_backward_send;
     int64_t pending_backward_mb = -1;
@@ -3459,7 +3472,8 @@ static void hash_collective_topology(
     hash.add_u64(router_aux_bits);
 }
 
-static void validate_native_execution_topology(const TrainingContext* ctx) {
+static void validate_native_execution_topology(
+    const TrainingContext* ctx, bool allow_pipeline = false) {
     TORCH_CHECK(ctx, "native Qwen execution requires a valid context");
     TORCH_CHECK(gdn_state_checkpoint_environment_valid(),
         "QWEN36_GDN_STATE_CHECKPOINT_STRIDE=0 is only valid with "
@@ -3477,7 +3491,7 @@ static void validate_native_execution_topology(const TrainingContext* ctx) {
         "native Qwen DP communicator is not initialized");
     TORCH_CHECK(ctx->pp_world_size == 1 || ctx->pp_comm,
         "native Qwen PP communicator is not initialized");
-    TORCH_CHECK(ctx->pp_world_size == 1,
+    TORCH_CHECK(allow_pipeline || ctx->pp_world_size == 1,
         "native Qwen pipeline execution must use the pipeline training ABI");
     if (ctx->sequence_parallel) {
         TORCH_CHECK(ctx->tp_world_size == 2 && ctx->tp_comm,
@@ -3856,6 +3870,12 @@ static void validate_pipeline_window_collective_registry(
         "pipeline window requires a PP communicator with PP_SIZE >= 2");
     AdapterRegistryHash hash;
     hash.add_u64(ctx->global_num_layers);
+    if (flags == kPipelineWindowFlagDynamicLora) {
+        hash.add_u64(ctx->adapters.size());
+        for (const auto& adapter : ctx->adapters)
+            hash_adapter_request_identity(hash, adapter);
+        hash.add_u64(ctx->pad_heterogeneous_lora_batch);
+    }
     hash.add_u64(ctx->fixed_all_target_layers);
     hash.add_u64(ctx->fixed_target_layers_global.size());
     for (const auto layer : ctx->fixed_target_layers_global)
@@ -3981,11 +4001,11 @@ static bool fixed_optimizer_collective_all_succeeded(
 }
 
 static void validate_native_execution_topology_collective(
-    TrainingContext* ctx
+    TrainingContext* ctx, bool allow_pipeline = false
 ) {
     std::string local_error;
     try {
-        validate_native_execution_topology(ctx);
+        validate_native_execution_topology(ctx, allow_pipeline);
     } catch (const std::exception& error) {
         local_error = error.what();
     }
@@ -5486,7 +5506,8 @@ static bool synchronize_lora_gradients(
     double accumulated_token_weight = 0.0,
     const at::Tensor* per_adapter_token_counts = nullptr,
     std::vector<uint8_t>* adapter_has_global_tokens = nullptr,
-    bool adapter_token_counts_prevalidated = false
+    bool adapter_token_counts_prevalidated = false,
+    bool accumulators_are_numerators = false
 ) {
     const bool sharded_a2a = ctx->expert_parallel && ctx->nccl_comm &&
         env_enabled("QWEN36_EP_A2A_SHARDED");
@@ -5644,19 +5665,30 @@ static bool synchronize_lora_gradients(
                                 : 1.0;
                             grouped_plan.add(
                                 ctx, accum_it->second[pair][0], 1.0,
-                                local_weight, global_weight, expert_scale,
+                                accumulators_are_numerators ? at::Tensor() : local_weight,
+                                global_weight, expert_scale,
                                 false, dp_allreduce, layout, true);
                             grouped_plan.add(
                                 ctx, accum_it->second[pair][1], 1.0,
-                                local_weight, global_weight, expert_scale,
+                                accumulators_are_numerators ? at::Tensor() : local_weight,
+                                global_weight, expert_scale,
                                 false, dp_allreduce, layout, false);
                         } else {
-                            reduce_lora_accumulator_weighted(
-                                ctx, accum_it->second[pair][0], local_weight,
-                                global_weight, false, dp_allreduce);
-                            reduce_lora_accumulator_weighted(
-                                ctx, accum_it->second[pair][1], local_weight,
-                                global_weight, false, dp_allreduce);
+                            if (accumulators_are_numerators) {
+                                normalize_lora_accumulator_numerator(
+                                    ctx, accum_it->second[pair][0], global_weight,
+                                    false, dp_allreduce);
+                                normalize_lora_accumulator_numerator(
+                                    ctx, accum_it->second[pair][1], global_weight,
+                                    false, dp_allreduce);
+                            } else {
+                                reduce_lora_accumulator_weighted(
+                                    ctx, accum_it->second[pair][0], local_weight,
+                                    global_weight, false, dp_allreduce);
+                                reduce_lora_accumulator_weighted(
+                                    ctx, accum_it->second[pair][1], local_weight,
+                                    global_weight, false, dp_allreduce);
+                            }
                         }
                         if (!grouped_sync && grouped_expert &&
                             replicated_a2a_expert_scale != 1.0) {
@@ -7679,6 +7711,8 @@ static at::Tensor forward_full_checkpoint(
 struct PipelineLossResult {
     double value;
     at::Tensor hidden_grad;
+    double numerator = 0.0;
+    double denominator = 0.0;
 };
 
 static PipelineLossResult pipeline_compute_loss(
@@ -7914,7 +7948,10 @@ static void pipeline_window_write_result(
     result->completed_bwd = ctx ? ctx->pp_window.next_backward : 0;
     result->in_flight = ctx
         ? static_cast<int64_t>(ctx->pp_window.slots.size()) : 0;
-    result->optimizer_step = ctx ? ctx->fixed_optimizer_step : 0;
+    // v1 exposes one scalar clock for the fixed-LoRA path. Dynamic windows
+    // have one independent clock per tenant, so mark this field unavailable.
+    result->optimizer_step = ctx && !ctx->pp_window.dynamic_lora
+        ? ctx->fixed_optimizer_step : -1;
     result->loss = loss;
 }
 
@@ -8112,11 +8149,19 @@ static at::Tensor pipeline_window_forward(
     if (attention_mask) slot.attention_mask = *attention_mask;
     slot.gradient_scale = tick.gradient_scale;
     slot.token_weight = token_weight;
+    slot.row_token_weights = target_mask.narrow(
+        1, 1, target_mask.size(1) - 1).to(at::kFloat).sum(1)
+        .mul(tick.gradient_scale).contiguous();
     // Each in-flight microbatch gets an independent activation graph. Fixed
     // LoRA parameters and their singleton views are immutable until finish,
     // so keep the projection metadata cache for the whole pipeline window.
     ctx->lora_cache_valid = false;
-    if (!ctx->lora_batch_valid) prepare_fixed_lora_batch(ctx);
+    if (ctx->pp_window.dynamic_lora) {
+        ctx->lora_batch_valid = true;
+        prepare_lora_batch(ctx);
+    } else if (!ctx->lora_batch_valid) {
+        prepare_fixed_lora_batch(ctx);
+    }
     at::AutoGradMode grad_enable(true);
     if (ctx->is_first_pipeline_stage) {
         TORCH_CHECK(!received_stage_input.defined(),
@@ -8139,6 +8184,8 @@ static at::Tensor pipeline_window_forward(
     auto inserted = ctx->pp_window.slots.emplace(tick.forward_mb, std::move(slot));
     TORCH_CHECK(inserted.second, "pipeline forward slot insertion failed");
     auto& live_slot = inserted.first->second;
+    if (ctx->pp_window.dynamic_lora)
+        ctx->pp_window.adapter_token_counts.add_(live_slot.row_token_weights);
     if (!ctx->pp_window.normalization_mask.defined())
         ctx->pp_window.normalization_mask = target_mask;
     ctx->pp_window.next_forward++;
@@ -8165,13 +8212,19 @@ static at::Tensor pipeline_window_backward(
         ctx->attention_lengths = at::Tensor();
     }
     double local_loss = 0.0;
+    double local_loss_numerator = 0.0;
+    double local_loss_denominator = 0.0;
     if (ctx->is_last_pipeline_stage) {
         TORCH_CHECK(!received_output_grad.defined(),
             "last pipeline stage must not receive an output gradient");
         auto loss = pipeline_compute_loss(
             ctx, slot.stage_output, slot.input_ids, slot.target_mask);
         local_loss = loss.value;
-        auto hidden_grad = loss.hidden_grad * slot.token_weight;
+        local_loss_numerator = loss.numerator * slot.gradient_scale;
+        local_loss_denominator = loss.denominator * slot.gradient_scale;
+        auto hidden_grad = window.dynamic_lora
+            ? loss.hidden_grad * slot.row_token_weights.reshape({-1, 1, 1})
+            : loss.hidden_grad * slot.token_weight;
         slot.stage_output.backward(hidden_grad);
     } else {
         TORCH_CHECK(received_output_grad.defined() &&
@@ -8188,8 +8241,13 @@ static at::Tensor pipeline_window_backward(
         input_grad = input_grad.contiguous();
     }
     harvest_gradient_accumulators(ctx);
-    window.total_loss += local_loss;
-    ctx->accumulated_token_weight += slot.token_weight;
+    if (window.dynamic_lora) {
+        window.total_loss += local_loss_numerator;
+        window.total_loss_weight += local_loss_denominator;
+    } else {
+        window.total_loss += local_loss;
+    }
+    if (!window.dynamic_lora) ctx->accumulated_token_weight += slot.token_weight;
     slot.backward_done = true;
     window.next_backward++;
     window.slots.erase(it);
@@ -8215,14 +8273,18 @@ extern "C" __attribute__((visibility("default"))) int32_t qwen36_pipeline_begin_
         const bool valid_abi = window_spec &&
             window_spec->struct_size >= sizeof(Qwen36PipelineWindowV1) &&
             window_spec->version == 1;
-        const bool local_valid = valid_abi &&
+        const bool dynamic_lora = valid_abi &&
+            window_spec->flags == kPipelineWindowFlagDynamicLora;
+        const bool supported_flags = valid_abi &&
+            (window_spec->flags == 0 || dynamic_lora);
+        const bool local_valid = valid_abi && supported_flags &&
             !ctx->pp_window.active && ctx->cp_world_size == 1 &&
             ctx->router_aux_loss_coef == 0.0 &&
             window_spec->window_id >= 0 &&
             window_spec->num_microbatches > 0 &&
             window_spec->num_microbatches <= 4096 &&
             window_spec->schedule == 0 && window_spec->num_chunks == 1 &&
-            window_spec->flags == 0 && ctx->adapters.empty() &&
+            (dynamic_lora ? !ctx->adapters.empty() : ctx->adapters.empty()) &&
             !ctx->has_mtp && !ctx->use_checkpoint &&
             !ctx->accumulation_active &&
             ctx->accumulated_token_weight == 0.0 &&
@@ -8240,6 +8302,13 @@ extern "C" __attribute__((visibility("default"))) int32_t qwen36_pipeline_begin_
         ctx->pp_window.schedule = window_spec->schedule;
         ctx->pp_window.num_chunks = window_spec->num_chunks;
         ctx->pp_window.flags = window_spec->flags;
+        ctx->pp_window.dynamic_lora = dynamic_lora;
+        if (dynamic_lora) {
+            ctx->pp_window.adapter_token_counts = at::zeros(
+                {static_cast<int64_t>(ctx->adapters.size())},
+                at::TensorOptions().dtype(at::kFloat).device(
+                    at::kCUDA, ctx->cuda_device));
+        }
         return 0;
     } catch (const std::exception& e) {
         fprintf(stderr, "[pipeline_window] begin FAILED: %s\n", e.what());
@@ -8299,12 +8368,46 @@ extern "C" __attribute__((visibility("default"))) int32_t qwen36_pipeline_tick_v
             // Always enter the first contract handshake on canonical forwards.
             // Short-circuiting this call on a local metadata error would let
             // one PP rank skip the control collective while others wait.
-            const bool forward_contract_valid =
-                pipeline_window_validate_forward_contract(ctx, *tick);
-            bool forward_valid = tick_valid && forward_contract_valid;
+            bool forward_valid = tick_valid;
             at::Tensor fallback_input_ids;
             at::Tensor fallback_target_mask;
             at::Tensor fallback_attention_mask;
+            at::Tensor dynamic_input_ids;
+            at::Tensor dynamic_target_mask;
+            at::Tensor dynamic_attention_mask;
+            if (window.dynamic_lora && tick->input_ids && tick->target_mask) {
+                auto& raw_ids = *reinterpret_cast<at::Tensor*>(tick->input_ids);
+                auto& raw_targets = *reinterpret_cast<at::Tensor*>(tick->target_mask);
+                const int64_t tenants = static_cast<int64_t>(ctx->adapters.size());
+                if (raw_ids.defined() && raw_targets.defined() &&
+                        raw_ids.dim() == 2 && raw_targets.dim() == 2 &&
+                        raw_ids.size(0) == 1 && raw_targets.size(0) == 1) {
+                    dynamic_input_ids = raw_ids.repeat({tenants, 1});
+                    dynamic_target_mask = raw_targets.repeat({tenants, 1});
+                    if (tick->attention_mask) {
+                        auto& raw_attention = *reinterpret_cast<at::Tensor*>(
+                            tick->attention_mask);
+                        if (raw_attention.defined() && raw_attention.dim() == 2 &&
+                                raw_attention.size(0) == 1)
+                            dynamic_attention_mask = raw_attention.repeat({tenants, 1});
+                    }
+                } else {
+                    dynamic_input_ids = raw_ids;
+                    dynamic_target_mask = raw_targets;
+                    if (tick->attention_mask)
+                        dynamic_attention_mask = *reinterpret_cast<at::Tensor*>(
+                            tick->attention_mask);
+                }
+                if (dynamic_input_ids.defined() && dynamic_target_mask.defined()) {
+                    effective_tick.input_ids = &dynamic_input_ids;
+                    effective_tick.target_mask = &dynamic_target_mask;
+                    effective_tick.attention_mask = dynamic_attention_mask.defined()
+                        ? &dynamic_attention_mask : nullptr;
+                }
+            }
+            const bool forward_contract_valid =
+                pipeline_window_validate_forward_contract(ctx, effective_tick);
+            forward_valid = forward_valid && forward_contract_valid;
             if (!forward_valid) {
                 window.local_error = true;
                 int64_t fallback_batch = window.batch_size;
@@ -8318,6 +8421,8 @@ extern "C" __attribute__((visibility("default"))) int32_t qwen36_pipeline_tick_v
                             fallback_sequence = candidate.size(1);
                     }
                 }
+                if (window.dynamic_lora && fallback_batch > 0)
+                    fallback_batch = static_cast<int64_t>(ctx->adapters.size());
                 if ((fallback_batch <= 0 || fallback_sequence <= 1) &&
                         tick->target_mask) {
                     const auto& candidate = *reinterpret_cast<at::Tensor*>(
@@ -8439,6 +8544,42 @@ extern "C" __attribute__((visibility("default"))) int32_t qwen36_pipeline_finish
             ncclGetErrorString(status_error));
         TORCH_CHECK(status.to(at::kCPU).item<int32_t>() == 1,
             "pipeline window aborted because at least one PP rank rejected a tick");
+        if (window.dynamic_lora) {
+            TORCH_CHECK(window.adapter_token_counts.defined(),
+                "dynamic pipeline window has no adapter token counts");
+            int32_t finalizer_phase = 0;
+            int64_t max_rank = 1;
+            for (const auto& adapter : ctx->adapters)
+                max_rank = std::max(max_rank, adapter.rank);
+            auto dummy_ids = at::zeros(
+                {static_cast<int64_t>(ctx->adapters.size()), 2},
+                at::TensorOptions().dtype(at::kLong).device(
+                    at::kCUDA, ctx->cuda_device));
+            auto dummy_mask = at::zeros_like(dummy_ids);
+            const double finalizer_loss = qwen36_train_multi_lora_impl(
+                ctx, &dummy_ids, &dummy_mask, nullptr,
+                static_cast<int32_t>(ctx->adapters.size()),
+                static_cast<int32_t>(max_rank),
+                static_cast<DynamicMultiLoraMode>(2), &finalizer_phase,
+                nullptr, nullptr, true, &window.adapter_token_counts, true);
+            TORCH_CHECK(finalizer_loss >= 0.0 && finalizer_phase >= 1,
+                "dynamic pipeline finalizer failed");
+            const int64_t completed_microbatches = window.num_microbatches;
+            const double aggregate_loss = window.total_loss /
+                std::max(1.0, window.total_loss_weight);
+            const double loss = pipeline_broadcast_loss(
+                ctx, aggregate_loss, window.normalization_mask.options());
+            TORCH_CHECK(std::isfinite(loss) && loss >= 0.0,
+                "pipeline dynamic-LoRA loss became non-finite");
+            pipeline_window_write_result(ctx, result, 0, loss);
+            pipeline_window_reset(ctx);
+            if (result) {
+                result->completed_fwd = completed_microbatches;
+                result->completed_bwd = completed_microbatches;
+                result->in_flight = 0;
+            }
+            return 0;
+        }
         validate_pipeline_collective_registry(
             ctx, 1, 0.0, ctx->accumulated_token_weight);
         const int64_t completed_microbatches = window.num_microbatches;
@@ -9331,10 +9472,23 @@ static PipelineLossResult pipeline_compute_loss(
     const at::Tensor& target_mask
 ) {
     auto result = compute_loss(
-        ctx, hidden, input_ids, target_mask, ctx->vocab_size);
+        ctx, hidden, input_ids, target_mask, ctx->vocab_size,
+        /*independent_samples=*/ctx->pp_window.dynamic_lora,
+        /*collect_sample_losses=*/ctx->pp_window.dynamic_lora);
+    double value = result.value.item<double>();
+    double numerator = value;
+    double denominator = 1.0;
+    if (ctx->pp_window.dynamic_lora && result.sample_loss_numerators.defined() &&
+            result.sample_token_counts.defined()) {
+        numerator = result.sample_loss_numerators.sum().item<double>();
+        denominator = result.sample_token_counts.sum().item<double>();
+        value = numerator / std::max(1.0, denominator);
+    }
     return {
-        result.value.item<double>(),
+        value,
         result.hidden_grad,
+        numerator,
+        denominator,
     };
 }
 
@@ -10644,7 +10798,7 @@ enum class DynamicMultiLoraMode {
 /// repeated per chunk) or [n_total, seq] (one independent sample per adapter).
 /// Heterogeneous selected training reuses the same implementation in two
 /// phases so every selected adapter shares one synchronization/Adam boundary.
-static double qwen36_train_multi_lora_impl(
+double qwen36_train_multi_lora_impl(
     void* ctx_ptr,
     void* input_ids_ptr,
     void* target_mask_ptr,
@@ -10654,7 +10808,10 @@ static double qwen36_train_multi_lora_impl(
     DynamicMultiLoraMode mode,
     int32_t* finalizer_phase = nullptr,
     at::Tensor* loss_numerators_out = nullptr,
-    at::Tensor* token_counts_out = nullptr
+    at::Tensor* token_counts_out = nullptr,
+    bool allow_pipeline = false,
+    const at::Tensor* token_counts_override = nullptr,
+    bool accumulators_are_numerators = false
 ) {
     try {
         auto* ctx = reinterpret_cast<TrainingContext*>(ctx_ptr);
@@ -10663,7 +10820,7 @@ static double qwen36_train_multi_lora_impl(
         if (finalize_only && finalizer_phase) *finalizer_phase = 0;
         if (mode == DynamicMultiLoraMode::TrainAndFinalize)
             validate_dynamic_context_health(ctx);
-        validate_native_execution_topology_collective(ctx);
+        validate_native_execution_topology_collective(ctx, allow_pipeline);
         auto* input_ids_tensor = reinterpret_cast<at::Tensor*>(input_ids_ptr);
         auto* target_mask_tensor = reinterpret_cast<at::Tensor*>(target_mask_ptr);
         auto* attention_mask_tensor = attention_mask_ptr
@@ -10759,6 +10916,14 @@ static double qwen36_train_multi_lora_impl(
         auto adapter_token_counts = input_batch == 1
             ? input_row_token_counts.repeat({total_adapters})
             : input_row_token_counts;
+        if (token_counts_override) {
+            TORCH_CHECK(token_counts_override->defined() &&
+                    token_counts_override->dim() == 1 &&
+                    token_counts_override->size(0) == total_adapters,
+                "dynamic token-count override must match adapter registry");
+            adapter_token_counts = token_counts_override->to(at::kFloat)
+                .to(input_ids.device()).contiguous();
+        }
         // Keep the caller's mask intact. Each chunk receives either the
         // corresponding rows or a repeated batch-1 mask; this also prevents
         // elide_trivial_attention_mask from leaking the last chunk into the
@@ -11074,7 +11239,8 @@ static double qwen36_train_multi_lora_impl(
                 synchronize_lora_gradients(
                     ctx, target_mask, 0.0, &adapter_token_counts,
                     &adapter_has_global_tokens,
-                    /*adapter_token_counts_prevalidated=*/true);
+                    /*adapter_token_counts_prevalidated=*/true,
+                    accumulators_are_numerators);
                 TORCH_CHECK(adapter_has_global_tokens.size() ==
                         ctx->adapters.size(),
                     "dynamic LoRA global-token activity vector mismatch");
@@ -11270,7 +11436,7 @@ static double qwen36_train_multi_lora_impl(
                                 static_cast<float>(adapter.optimizer_beta2));
                         }
                     }
-                    if (commits.size() > adapter_commit_begin) {
+                    if (commits.size() > adapter_commit_begin || allow_pipeline) {
                         clock_commits.push_back(
                             DynamicAdamClockCommit{&adapter, logical_step});
                     }

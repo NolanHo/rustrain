@@ -52,6 +52,7 @@ pub struct PipelineWindowV1 {
     pub num_chunks: i32,
     pub flags: i32,
 }
+pub const PIPELINE_WINDOW_FLAG_DYNAMIC_LORA: i32 = 1;
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct PipelineTickV1 {
@@ -1305,6 +1306,28 @@ impl CppTrainingContext {
     /// Open a fixed-shape non-interleaved 1F1B pipeline window. The native side owns all
     /// activation/gradient slots until `pipeline_finish_v1` or abort.
     pub fn pipeline_begin_v1(&self, window_id: i64, num_microbatches: i64) -> Result<()> {
+        self.pipeline_begin_with_flags_v1(window_id, num_microbatches, 0)
+    }
+
+    /// Open a dynamic multi-tenant LoRA 1F1B window in native registry order.
+    pub fn pipeline_begin_dynamic_v1(
+        &self,
+        window_id: i64,
+        num_microbatches: i64,
+    ) -> Result<()> {
+        self.pipeline_begin_with_flags_v1(
+            window_id,
+            num_microbatches,
+            PIPELINE_WINDOW_FLAG_DYNAMIC_LORA,
+        )
+    }
+
+    fn pipeline_begin_with_flags_v1(
+        &self,
+        window_id: i64,
+        num_microbatches: i64,
+        flags: i32,
+    ) -> Result<()> {
         if window_id < 0 {
             bail!("pipeline window id must be non-negative");
         }
@@ -1319,7 +1342,7 @@ impl CppTrainingContext {
             num_microbatches,
             schedule: 0,
             num_chunks: 1,
-            flags: 0,
+            flags,
         };
         let status = unsafe { (kh.pipeline_begin)(self.ptr, &spec) };
         if status != 0 {
