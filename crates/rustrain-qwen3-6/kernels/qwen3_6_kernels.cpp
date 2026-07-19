@@ -8277,6 +8277,9 @@ extern "C" __attribute__((visibility("default"))) int32_t qwen36_pipeline_begin_
             window_spec->flags == kPipelineWindowFlagDynamicLora;
         const bool supported_flags = valid_abi &&
             (window_spec->flags == 0 || dynamic_lora);
+        const bool fixed_lora_inactive = std::none_of(
+            ctx->lora_active.begin(), ctx->lora_active.end(),
+            [](bool active) { return active; });
         const bool local_valid = valid_abi && supported_flags &&
             !ctx->pp_window.active && ctx->cp_world_size == 1 &&
             ctx->router_aux_loss_coef == 0.0 &&
@@ -8284,7 +8287,9 @@ extern "C" __attribute__((visibility("default"))) int32_t qwen36_pipeline_begin_
             window_spec->num_microbatches > 0 &&
             window_spec->num_microbatches <= 4096 &&
             window_spec->schedule == 0 && window_spec->num_chunks == 1 &&
-            (dynamic_lora ? !ctx->adapters.empty() : ctx->adapters.empty()) &&
+            (dynamic_lora
+                ? (!ctx->adapters.empty() && fixed_lora_inactive)
+                : ctx->adapters.empty()) &&
             !ctx->has_mtp && !ctx->use_checkpoint &&
             !ctx->accumulation_active &&
             ctx->accumulated_token_weight == 0.0 &&
@@ -11551,6 +11556,10 @@ double qwen36_train_multi_lora_impl(
                     // imposing a device barrier on every training step.
                     TORCH_CHECK(!inject_failure,
                         "injected dynamic Adam failure before commit");
+                    if (allow_pipeline) {
+                        TORCH_CHECK(adapter_collective_all_succeeded(ctx, true),
+                            "dynamic pipeline Adam commit consensus failed");
+                    }
                     for (auto& commit : commits) {
                         std::swap(*commit.param, *commit.next_param);
                         std::swap(*commit.m, *commit.next_m);
