@@ -894,6 +894,10 @@ paths=["/tmp/qwen3_6_test.jsonl"]
         alpha: (lora_rank * 2) as f64,
         target_layers: vec![],
         target_modules: "".to_string(),
+        optimizer_lr: None,
+        optimizer_beta1: None,
+        optimizer_beta2: None,
+        optimizer_eps: None,
     }) {
         EpResult::Count(n) => eprintln!("[bench] added {} adapters", n),
         EpResult::Error(e) => bail!("batch_add_lora failed: {}", e),
