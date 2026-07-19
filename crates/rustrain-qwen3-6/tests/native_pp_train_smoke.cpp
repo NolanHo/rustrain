@@ -90,6 +90,8 @@ extern "C" void qwen36_set_checkpoint(void*, int32_t, int64_t);
 extern "C" int32_t qwen36_set_max_grad_norm(void*, double);
 extern "C" int64_t qwen36_add_lora(
     void*, int64_t, double, const int64_t*, int64_t, const char*);
+extern "C" int64_t qwen36_add_lora_v2(
+    void*, int64_t, double, const int64_t*, int64_t, const char*);
 extern "C" void* qwen36_get_adapter_lora_tensor(
     void*, int64_t, int64_t, const char*, int32_t);
 extern "C" void* qwen36_get_adapter_optimizer_tensor(
@@ -650,8 +652,8 @@ int main() {
 
     const int64_t adapter_one = qwen36_add_lora(
         window_context, 2, 4.0, &dynamic_target_layer, 1, "q_proj");
-    const int64_t adapter_two = qwen36_add_lora(
-        window_context, 2, 4.0, &dynamic_target_layer, 1, "q_proj");
+    const int64_t adapter_two = qwen36_add_lora_v2(
+        window_context, 3, 4.0, &dynamic_target_layer, 1, "q_proj");
     const int64_t adapter_unselected = qwen36_add_lora(
         window_context, 2, 4.0, &dynamic_target_layer, 1, "q_proj");
     assert(adapter_one > 0 && adapter_two > adapter_one &&
@@ -776,6 +778,50 @@ int main() {
         assert(max_diff(*unselected_m, unselected_m_before) == 0.0);
         assert(max_diff(*unselected_v, unselected_v_before) == 0.0);
     }
+
+    // A late dynamic metadata error must keep the selected-tenant batch
+    // contract (two rows here), even though the registry also contains an
+    // unselected third tenant.  This drains the fixed P2P schedule and fails
+    // uniformly at finish without a cross-stage count mismatch.
+    auto dynamic_bad_target = at::ones(
+        {1, dynamic_sequence_length - 1}, long_options);
+    Qwen36PipelineWindowV1 dynamic_late_bad_window{
+        sizeof(Qwen36PipelineWindowV1), 1, 14, 2, 0, 1, 1};
+    assert(qwen36_pipeline_begin_dynamic_selected_v1(
+        window_context, &dynamic_late_bad_window, selected_ids, 2) == 0);
+    const int64_t late_dynamic_warmup = std::min<int64_t>(
+        pp_size - pp_rank - 1, 2);
+    std::vector<std::pair<int64_t, int64_t>> late_dynamic_schedule;
+    for (int64_t microbatch = 0; microbatch < late_dynamic_warmup; ++microbatch)
+        late_dynamic_schedule.emplace_back(microbatch, -1);
+    for (int64_t microbatch = late_dynamic_warmup;
+         microbatch < 2; ++microbatch)
+        late_dynamic_schedule.emplace_back(microbatch,
+            microbatch - late_dynamic_warmup);
+    for (int64_t microbatch = 2 - late_dynamic_warmup;
+         microbatch < 2; ++microbatch)
+        late_dynamic_schedule.emplace_back(-1, microbatch);
+    for (const auto& [forward_mb, backward_mb] : late_dynamic_schedule) {
+        void* target = nullptr;
+        if (forward_mb >= 0) {
+            target = (forward_mb == 1 && rank == 0)
+                ? static_cast<void*>(&dynamic_bad_target)
+                : static_cast<void*>(&dynamic_targets[forward_mb]);
+        }
+        Qwen36PipelineTickV1 tick{
+            sizeof(Qwen36PipelineTickV1), 1, 14, forward_mb, backward_mb,
+            0, forward_mb < 0 ? 2 : (backward_mb < 0 ? 0 : 1),
+            forward_mb >= 0 ? &dynamic_inputs[forward_mb] : nullptr,
+            target, nullptr, 1.0};
+        assert(qwen36_pipeline_tick_v1(
+            window_context, &tick, &result) == 0);
+    }
+    assert(qwen36_pipeline_finish_dynamic_report_v1(
+        window_context, 1, &result, tenant_losses, 2) != 0);
+    assert(qwen36_get_adapter_step_count(window_context, adapter_one) == 1);
+    assert(qwen36_get_adapter_step_count(window_context, adapter_two) == 1);
+    assert(qwen36_get_adapter_step_count(
+        window_context, adapter_unselected) == 0);
     std::printf("native_qwen36_pp_train rank=%d loss=%0.6f "
         "grad_diff=%0.8e param_diff=%0.8e m_diff=%0.8e v_diff=%0.8e "
         "max_in_flight=%ld cache_builds=%ld legacy_cache_builds=%ld "

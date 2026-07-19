@@ -2928,6 +2928,8 @@ struct PipelineWindowState {
     int32_t num_chunks = 1;
     int32_t flags = 0;
     bool dynamic_lora = false;
+    bool previous_pad_heterogeneous_lora_batch = false;
+    bool padding_mode_overridden = false;
     std::vector<size_t> selected_adapter_indices;
     int64_t next_forward = 0;
     int64_t next_backward = 0;
@@ -8539,6 +8541,9 @@ static at::Tensor pipeline_window_backward(
 
 static void pipeline_window_reset(TrainingContext* ctx) {
     if (!ctx) return;
+    if (ctx->pp_window.padding_mode_overridden)
+        ctx->pad_heterogeneous_lora_batch =
+            ctx->pp_window.previous_pad_heterogeneous_lora_batch;
     ctx->pp_window = PipelineWindowState{};
 }
 
@@ -8585,6 +8590,16 @@ extern "C" __attribute__((visibility("default"))) int32_t qwen36_pipeline_begin_
         ctx->pp_window.num_chunks = window_spec->num_chunks;
         ctx->pp_window.flags = window_spec->flags;
         ctx->pp_window.dynamic_lora = dynamic_lora;
+        if (dynamic_lora) {
+            // PP keeps one projection cache alive across the whole 1F1B
+            // window.  Always use the padded representation here so a
+            // selected request may mix ranks and target-module holes without
+            // discovering a stack/shape mismatch after P2P has started.
+            ctx->pp_window.previous_pad_heterogeneous_lora_batch =
+                ctx->pad_heterogeneous_lora_batch;
+            ctx->pp_window.padding_mode_overridden = true;
+            ctx->pad_heterogeneous_lora_batch = true;
+        }
         if (dynamic_lora) {
             ctx->pp_window.selected_adapter_indices.clear();
             for (size_t index = 0; index < ctx->adapters.size(); ++index)
@@ -8781,7 +8796,8 @@ extern "C" __attribute__((visibility("default"))) int32_t qwen36_pipeline_tick_v
                     }
                 }
                 if (window.dynamic_lora && fallback_batch > 0)
-                    fallback_batch = static_cast<int64_t>(ctx->adapters.size());
+                    fallback_batch = static_cast<int64_t>(
+                        window.selected_adapter_indices.size());
                 if ((fallback_batch <= 0 || fallback_sequence <= 1) &&
                         tick->target_mask) {
                     const auto& candidate = *reinterpret_cast<at::Tensor*>(
