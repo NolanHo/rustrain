@@ -608,7 +608,10 @@ fn train_impl(
     // the model uses tied word embeddings.
     let base_tp_attention = tp_size > 1;
     let base_tp_mlp = tp_size > 1;
-    let vocab_parallel = tp_size > 1;
+    // MTP loss still uses a replicated vocabulary projection. Its prediction
+    // layers are tensor parallel, while embedding/LM-head sharding remains a
+    // separate capability boundary.
+    let vocab_parallel = tp_size > 1 && runtime_config.mtp_num_hidden_layers == 0;
     if vocab_parallel
         && (runtime_config.vocab_size <= 0 || runtime_config.vocab_size % tp_size as i64 != 0)
     {
@@ -618,8 +621,8 @@ fn train_impl(
         );
     }
     if base_tp_attention {
-        if runtime_config.mtp_num_hidden_layers > 0 {
-            bail!("frozen base TP currently requires MTP to be disabled");
+        if runtime_config.mtp_num_hidden_layers > 0 && runtime_config.is_moe {
+            bail!("TP2 MTP currently supports dense prediction layers only; Qwen3.6 MoE MTP remains fail-closed");
         }
         if runtime_config.num_attention_heads <= 0
             || runtime_config.num_attention_heads % tp_size as i64 != 0
@@ -818,7 +821,27 @@ fn train_impl(
         let mtp_tensors = read_safetensors_dir_filtered(&model_path, &mtp_needed)?;
         let mut mtp_gpu = BTreeMap::new();
         for (name, tensor) in &mtp_tensors {
-            mtp_gpu.insert(name.clone(), tensor.to_device(device).to_kind(compute_kind));
+            let moe_shard = if base_tp_mlp {
+                crate::kernel::shard_moe_mlp_weight_for_tp(name, tensor, tp_size, tp_rank)?
+            } else {
+                None
+            };
+            let attention_shard = if moe_shard.is_none() && base_tp_attention {
+                crate::kernel::shard_full_attention_weight_for_tp(name, tensor, tp_size, tp_rank)?
+            } else {
+                None
+            };
+            let dense_shard = if moe_shard.is_none() && attention_shard.is_none() && base_tp_mlp {
+                crate::kernel::shard_dense_mlp_weight_for_tp(name, tensor, tp_size, tp_rank)?
+            } else {
+                None
+            };
+            let local = moe_shard
+                .as_ref()
+                .or(attention_shard.as_ref())
+                .or(dense_shard.as_ref())
+                .unwrap_or(tensor);
+            mtp_gpu.insert(name.clone(), local.to_device(device).to_kind(compute_kind));
         }
         for (name, tensor) in mtp_gpu {
             weights_gpu.insert(name, tensor);

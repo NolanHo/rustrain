@@ -1846,7 +1846,8 @@ static const LoraBatchEntry* lora_batch_entry(
 static at::Tensor dense_mlp_forward_batched(
     TrainingContext* ctx, int64_t layer_idx, const at::Tensor& hidden,
     const at::Tensor& gate_proj, const at::Tensor& up_proj,
-    const at::Tensor& down_proj, at::ScalarType compute_type);
+    const at::Tensor& down_proj, at::ScalarType compute_type,
+    const LayerConfig* config_override = nullptr);
 static at::Tensor fused_mlp_fc1_weight(
     TrainingContext* ctx, int64_t layer_idx);
 static bool base_tp_mlp_enabled(const TrainingContext* ctx);
@@ -2773,7 +2774,7 @@ static at::Tensor forward_single_layer(
         } else {
             if (use_batched) {
                 auto mlp_out = dense_mlp_forward_batched(
-                    ctx, layer_idx, post_attn, *w[8], *w[9], *w[10], kind);
+                    ctx, layer_idx, post_attn, *w[8], *w[9], *w[10], kind, cfg);
                 return hidden + attn_output + mlp_out;
             }
             auto gate = apply_multi_lora(ctx, layer_idx,
@@ -2841,7 +2842,7 @@ static at::Tensor forward_single_layer(
         } else {
             if (use_batched) {
                 auto mlp_out = dense_mlp_forward_batched(
-                    ctx, layer_idx, post_attn, *w[11], *w[12], *w[13], kind);
+                    ctx, layer_idx, post_attn, *w[11], *w[12], *w[13], kind, cfg);
                 return hidden + attn_output + mlp_out;
             }
             auto gate = apply_multi_lora(ctx, layer_idx,
@@ -3494,6 +3495,14 @@ static void hash_collective_runtime_config(
     hash.add_u64(ctx->has_mtp);
     hash_double(hash, ctx->mtp_loss_scale);
     if (ctx->has_mtp) {
+        hash.add_u64(ctx->vocab_size);
+        hash.add_u64(ctx->local_vocab_size);
+        for (const auto* tensor : {
+                ctx->embed_ptr.empty() ? nullptr : ctx->embed_ptr[0],
+                ctx->lm_head_ptr.empty() ? nullptr : ctx->lm_head_ptr[0]}) {
+            hash.add_u64(tensor != nullptr);
+            if (tensor) hash_tensor_layout(hash, *tensor);
+        }
         for (const auto* tensor : {
                 ctx->mtp_fc, ctx->mtp_pre_fc_norm_emb,
                 ctx->mtp_pre_fc_norm_hidden, ctx->mtp_norm}) {
@@ -3612,6 +3621,22 @@ static void validate_native_execution_topology(
         "native Qwen PP communicator is not initialized");
     TORCH_CHECK(allow_pipeline || ctx->pp_world_size == 1,
         "native Qwen pipeline execution must use the pipeline training ABI");
+    if (ctx->has_mtp && ctx->tp_world_size > 1) {
+        TORCH_CHECK(ctx->tp_world_size == 2 && ctx->tp_comm &&
+                ctx->base_tp_attention && ctx->base_tp_mlp,
+            "MTP tensor parallelism currently requires initialized TP_SIZE=2 "
+            "with both base attention and MLP tensor parallelism");
+        TORCH_CHECK(!ctx->sequence_parallel && !ctx->vocab_parallel &&
+                ctx->cp_world_size == 1 && ctx->ep_world_size == 1 &&
+                ctx->pp_world_size == 1,
+            "MTP tensor parallelism currently requires replicated sequence "
+            "and vocabulary state with CP=EP=PP=1");
+        for (const auto& config : ctx->mtp_layer_configs) {
+            TORCH_CHECK(config.layer_type == 0 && config.num_experts == 0,
+                "MTP tensor parallelism currently supports dense full-attention "
+                "prediction layers only");
+        }
+    }
     if (ctx->sequence_parallel) {
         TORCH_CHECK(ctx->tp_world_size == 2 && ctx->tp_comm,
             "sequence parallelism currently requires initialized TP_SIZE=2");
@@ -5142,7 +5167,9 @@ static RoutedExpertLora routed_expert_lora(
     RoutedExpertLora result;
     // Dynamic multi-LoRA supplies per-sample activation-level tensors. Do not
     // mix the fixed adapter's expert tensors into those batches.
-    if (!ctx->adapters.empty() || cfg.num_experts <= 0) return result;
+    if (!ctx->adapters.empty() || cfg.num_experts <= 0 || layer_idx < 0 ||
+            layer_idx >= (int64_t)ctx->lora_layer_offset.size())
+        return result;
 
     const int64_t offset = ctx->lora_layer_offset[layer_idx];
     const int64_t gate_up_pair = lora_pair_index(cfg, "experts_gate_up_proj");
@@ -6801,9 +6828,11 @@ static const LoraBatchEntry* lora_batch_entry(
 static at::Tensor dense_mlp_forward_batched(
     TrainingContext* ctx, int64_t layer_idx, const at::Tensor& hidden,
     const at::Tensor& gate_proj, const at::Tensor& up_proj,
-    const at::Tensor& down_proj, at::ScalarType compute_type
+    const at::Tensor& down_proj, at::ScalarType compute_type,
+    const LayerConfig* config_override
 ) {
-    const auto& cfg = ctx->layer_configs[layer_idx];
+    const auto& cfg = config_override
+        ? *config_override : ctx->layer_configs.at(layer_idx);
     const int64_t gate_pair = lora_pair_index(cfg, "gate_proj");
     const int64_t up_pair = lora_pair_index(cfg, "up_proj");
     const int64_t down_pair = lora_pair_index(cfg, "down_proj");
@@ -10046,7 +10075,8 @@ static at::Tensor mtp_forward(
             ? ctx->attention_lengths.clamp(0, h.size(1)).to(at::kInt).contiguous()
             : at::Tensor();
         h = forward_single_layer(ctx, h, layer_w.data(), &ctx->mtp_layer_configs[i],
-            ctx->num_layers + i, kind, mtp_mask, mtp_lengths);
+            ctx->num_layers + i, kind, mtp_mask, mtp_lengths,
+            ctx->base_tp_attention || ctx->base_tp_mlp);
     }
 
     // Final norm only — return hidden, not logits
@@ -10831,8 +10861,9 @@ __attribute__((visibility("default"))) int32_t qwen36_set_base_tp_mlp(
         const bool preconfigured = ctx->base_tp_mlp;
         TORCH_CHECK(ctx->tp_world_size > 1,
             "base MLP TP requires TP_SIZE>1");
-        TORCH_CHECK(!ctx->has_mtp,
-            "base MLP TP requires MTP to be disabled");
+        TORCH_CHECK(!ctx->has_mtp || preconfigured,
+            "base MLP TP must be selected when the context is created before "
+            "MTP weights are configured");
         if (!preconfigured) {
             for (const auto& adapter : ctx->adapters) {
                 TORCH_CHECK(!adapter.target_modules.empty(),
@@ -10970,6 +11001,131 @@ __attribute__((visibility("default"))) int32_t qwen36_set_router_aux_loss_coef(
     }
 }
 
+static void validate_mtp_prediction_layer_layout(
+    const TrainingContext* ctx,
+    const LayerConfig& cfg,
+    at::Tensor** weights,
+    int64_t weight_offset,
+    int64_t layer_index,
+    int64_t hidden_size
+) {
+    TORCH_CHECK(cfg.layer_type == 0,
+        "MTP prediction layer ", layer_index,
+        " must use full attention");
+    TORCH_CHECK(ctx->tp_world_size == 1 || cfg.num_experts == 0,
+        "MTP tensor parallelism currently supports dense prediction layers only");
+    auto* input_norm = weights[weight_offset];
+    auto* post_norm = weights[weight_offset + 1];
+    TORCH_CHECK(input_norm->dim() == 1 && input_norm->size(0) == hidden_size &&
+            post_norm->dim() == 1 && post_norm->size(0) == hidden_size,
+        "MTP prediction layer ", layer_index,
+        " normalization weights must have shape [hidden]");
+
+    TORCH_CHECK(cfg.num_heads > 0 && cfg.num_kv_heads > 0 &&
+            cfg.head_dim > 0 && cfg.num_heads % cfg.num_kv_heads == 0,
+        "MTP prediction layer ", layer_index,
+        " has an invalid full-attention head configuration");
+    const int64_t attention_partitions =
+        ctx->base_tp_attention ? ctx->tp_world_size : 1;
+    TORCH_CHECK(cfg.num_heads % attention_partitions == 0 &&
+            cfg.num_kv_heads % attention_partitions == 0,
+        "MTP prediction layer ", layer_index,
+        " attention heads must be divisible by its TP partition count");
+    const int64_t rotary_dim = static_cast<int64_t>(
+        cfg.head_dim * cfg.partial_rotary_factor);
+    TORCH_CHECK(rotary_dim >= 0 && rotary_dim <= cfg.head_dim &&
+            rotary_dim % 2 == 0,
+        "MTP prediction layer ", layer_index,
+        " has an invalid rotary dimension");
+    const int64_t local_heads = cfg.num_heads / attention_partitions;
+    const int64_t local_kv_heads = cfg.num_kv_heads / attention_partitions;
+    auto* q = weights[weight_offset + 2];
+    auto* q_norm = weights[weight_offset + 3];
+    auto* k = weights[weight_offset + 4];
+    auto* k_norm = weights[weight_offset + 5];
+    auto* v = weights[weight_offset + 6];
+    auto* o = weights[weight_offset + 7];
+    TORCH_CHECK(q->dim() == 2 && k->dim() == 2 && v->dim() == 2 &&
+            o->dim() == 2 && q_norm->dim() == 1 && k_norm->dim() == 1,
+        "MTP prediction layer ", layer_index,
+        " requires matrix Q/K/V/O and vector Q/K norm weights");
+    TORCH_CHECK(q->size(0) == local_heads * cfg.head_dim * 2 &&
+            k->size(0) == local_kv_heads * cfg.head_dim &&
+            v->size(0) == local_kv_heads * cfg.head_dim &&
+            q->size(1) == hidden_size && k->size(1) == hidden_size &&
+            v->size(1) == hidden_size && o->size(0) == hidden_size &&
+            o->size(1) == local_heads * cfg.head_dim &&
+            q_norm->size(0) == cfg.head_dim &&
+            k_norm->size(0) == cfg.head_dim,
+        "MTP prediction layer ", layer_index,
+        " received inconsistent local attention weights: q=", q->sizes(),
+        " k=", k->sizes(), " v=", v->sizes(), " o=", o->sizes(),
+        " attention partitions=", attention_partitions);
+
+    const int64_t mlp_partitions = ctx->base_tp_mlp
+        ? ctx->tp_world_size : 1;
+    if (cfg.num_experts <= 0) {
+        TORCH_CHECK(cfg.intermediate_size > 0 &&
+                cfg.intermediate_size % mlp_partitions == 0,
+            "MTP prediction layer ", layer_index,
+            " dense intermediate size must be divisible by its TP partition count");
+        const int64_t local_intermediate =
+            cfg.intermediate_size / mlp_partitions;
+        auto* gate = weights[weight_offset + 8];
+        auto* up = weights[weight_offset + 9];
+        auto* down = weights[weight_offset + 10];
+        TORCH_CHECK(gate->dim() == 2 && up->dim() == 2 && down->dim() == 2 &&
+                gate->size(0) == local_intermediate &&
+                up->size(0) == local_intermediate &&
+                gate->size(1) == hidden_size && up->size(1) == hidden_size &&
+                down->size(0) == hidden_size &&
+                down->size(1) == local_intermediate,
+            "MTP prediction layer ", layer_index,
+            " received inconsistent local dense MLP weights: gate=",
+            gate->sizes(), " up=", up->sizes(), " down=", down->sizes(),
+            " MLP partitions=", mlp_partitions);
+        return;
+    }
+
+    TORCH_CHECK(cfg.moe_intermediate > 0 &&
+            cfg.moe_intermediate % mlp_partitions == 0,
+        "MTP prediction layer ", layer_index,
+        " routed intermediate size must be divisible by its TP partition count");
+    const int64_t local_intermediate =
+        cfg.moe_intermediate / mlp_partitions;
+    auto* router = weights[weight_offset + 8];
+    auto* shared_router = weights[weight_offset + 9];
+    auto* shared_gate = weights[weight_offset + 10];
+    auto* shared_up = weights[weight_offset + 11];
+    auto* shared_down = weights[weight_offset + 12];
+    auto* experts_gate_up = weights[weight_offset + 13];
+    auto* experts_down = weights[weight_offset + 14];
+    TORCH_CHECK(router->dim() == 2 && router->size(1) == hidden_size &&
+            shared_router->dim() == 2 &&
+            shared_router->size(1) == hidden_size,
+        "MTP prediction layer ", layer_index,
+        " router weights must remain replicated matrices over hidden");
+    TORCH_CHECK(shared_gate->dim() == 2 && shared_up->dim() == 2 &&
+            shared_down->dim() == 2 &&
+            shared_gate->sizes() == shared_up->sizes() &&
+            shared_gate->size(0) > 0 && shared_gate->size(1) == hidden_size &&
+            shared_down->size(0) == hidden_size &&
+            shared_down->size(1) == shared_gate->size(0),
+        "MTP prediction layer ", layer_index,
+        " received inconsistent local shared-expert weights");
+    TORCH_CHECK(experts_gate_up->dim() == 3 && experts_down->dim() == 3 &&
+            experts_gate_up->size(0) == cfg.expert_count &&
+            experts_down->size(0) == cfg.expert_count &&
+            experts_gate_up->size(1) == 2 * local_intermediate &&
+            experts_gate_up->size(2) == hidden_size &&
+            experts_down->size(1) == hidden_size &&
+            experts_down->size(2) == local_intermediate,
+        "MTP prediction layer ", layer_index,
+        " received inconsistent local routed-expert weights: gate_up=",
+        experts_gate_up->sizes(), " down=", experts_down->sizes(),
+        " MLP partitions=", mlp_partitions);
+}
+
 // Set MTP weights on an existing training context.
 // Called after create_training_context if MTP is enabled.
 __attribute__((visibility("default"))) int32_t qwen36_set_mtp_weights(
@@ -10986,9 +11142,13 @@ __attribute__((visibility("default"))) int32_t qwen36_set_mtp_weights(
         TORCH_CHECK(ctx, "null training context");
         TORCH_CHECK(ctx->router_aux_loss_coef == 0.0,
             "MTP cannot be enabled with router auxiliary loss");
-        TORCH_CHECK(!ctx->base_tp_mlp && !ctx->base_tp_attention &&
-                !ctx->vocab_parallel,
-            "MTP cannot be enabled after frozen base or vocabulary TP because MTP weights are not sharded");
+        TORCH_CHECK(!ctx->sequence_parallel && !ctx->vocab_parallel,
+            "MTP currently requires replicated sequence and vocabulary state");
+        TORCH_CHECK(ctx->tp_world_size == 1 ||
+                (ctx->tp_world_size == 2 &&
+                    ctx->base_tp_attention && ctx->base_tp_mlp),
+            "TP MTP requires TP_SIZE=2 with attention and MLP TP selected "
+            "when the context is created");
         TORCH_CHECK(!ctx->has_mtp, "MTP weights are already configured");
         TORCH_CHECK(!ctx->accumulation_active && !ctx->pp_window.active,
             "MTP weights cannot be configured during an active training window");
@@ -11008,9 +11168,15 @@ __attribute__((visibility("default"))) int32_t qwen36_set_mtp_weights(
             mtp_pre_fc_norm_hidden_ptr);
         auto* mtp_norm = reinterpret_cast<at::Tensor*>(mtp_norm_ptr);
         TORCH_CHECK(!ctx->embed_ptr.empty() && ctx->embed_ptr[0] &&
-                ctx->embed_ptr[0]->dim() == 2,
-            "MTP requires a valid vocabulary embedding");
+                !ctx->lm_head_ptr.empty() && ctx->lm_head_ptr[0] &&
+                ctx->embed_ptr[0]->dim() == 2 &&
+                ctx->lm_head_ptr[0]->dim() == 2,
+            "MTP requires valid replicated vocabulary embedding and LM-head matrices");
         const int64_t hidden_size = ctx->embed_ptr[0]->size(1);
+        TORCH_CHECK(ctx->embed_ptr[0]->size(0) == ctx->vocab_size &&
+                ctx->lm_head_ptr[0]->size(0) == ctx->vocab_size &&
+                ctx->lm_head_ptr[0]->size(1) == hidden_size,
+            "MTP requires replicated embedding and LM-head shapes [vocab, hidden]");
         const auto device = ctx->embed_ptr[0]->device();
         for (const auto* tensor : {
                 mtp_fc, pre_norm_emb, pre_norm_hidden, mtp_norm}) {
@@ -11051,6 +11217,39 @@ __attribute__((visibility("default"))) int32_t qwen36_set_mtp_weights(
                 "MTP layer weights must be frozen CUDA tensors matching the base compute type");
             configured_weights.push_back(tensor);
         }
+        int64_t weight_offset = 0;
+        for (int64_t layer = 0; layer < num_mtp_layers; ++layer) {
+            validate_mtp_prediction_layer_layout(
+                ctx, configured_layers[layer], layer_weights, weight_offset,
+                layer, hidden_size);
+            weight_offset += weight_count_for_layer(configured_layers[layer]);
+        }
+
+        auto configured_fused_qkv = ctx->fused_full_attention_qkv_weights;
+        auto configured_fused_fc1 = ctx->fused_mlp_fc1_weights;
+        configured_fused_qkv.resize(ctx->num_layers + num_mtp_layers);
+        configured_fused_fc1.resize(ctx->num_layers + num_mtp_layers);
+        {
+            at::NoGradGuard guard;
+            weight_offset = 0;
+            for (int64_t layer = 0; layer < num_mtp_layers; ++layer) {
+                const int64_t cache_index = ctx->num_layers + layer;
+                if (env_enabled("QWEN36_FUSED_QKV", false)) {
+                    configured_fused_qkv[cache_index] = at::cat({
+                        *layer_weights[weight_offset + 2],
+                        *layer_weights[weight_offset + 4],
+                        *layer_weights[weight_offset + 6]}, 0).contiguous();
+                }
+                if (env_enabled("QWEN36_FUSED_MLP_FC1", false) &&
+                        configured_layers[layer].num_experts == 0) {
+                    configured_fused_fc1[cache_index] = at::cat({
+                        *layer_weights[weight_offset + 8],
+                        *layer_weights[weight_offset + 9]}, 0).contiguous();
+                }
+                weight_offset += weight_count_for_layer(
+                    configured_layers[layer]);
+            }
+        }
 
         // Commit only after every pointer and layout has passed validation so a
         // failed setup cannot leave a half-configured collective context.
@@ -11060,6 +11259,9 @@ __attribute__((visibility("default"))) int32_t qwen36_set_mtp_weights(
         ctx->mtp_norm = mtp_norm;
         ctx->mtp_layer_weights = std::move(configured_weights);
         ctx->mtp_layer_configs = std::move(configured_layers);
+        ctx->fused_full_attention_qkv_weights =
+            std::move(configured_fused_qkv);
+        ctx->fused_mlp_fc1_weights = std::move(configured_fused_fc1);
         ctx->has_mtp = true;
 
         fprintf(stderr, "[q36_ctx] MTP set: %ld MTP layers, %ld MTP weight pointers\n",
@@ -11491,8 +11693,12 @@ double qwen36_train_multi_lora_impl(
         const int64_t total_adapters = (int64_t)ctx->adapters.size();
         const bool mtp_enabled =
             ctx->has_mtp && !env_enabled("QWEN36_DISABLE_MTP");
+        const bool dynamic_mtp_tp_supported = ctx->tp_world_size == 1 ||
+            (ctx->tp_world_size == 2 && ctx->tp_comm &&
+                !ctx->sequence_parallel && !ctx->vocab_parallel &&
+                ctx->base_tp_attention && ctx->base_tp_mlp);
         const bool dynamic_mtp_topology_supported = !mtp_enabled ||
-            (!allow_pipeline && ctx->tp_world_size == 1 &&
+            (!allow_pipeline && dynamic_mtp_tp_supported &&
                 ctx->cp_world_size == 1 && ctx->ep_world_size == 1 &&
                 ctx->pp_world_size == 1 &&
                 ctx->router_aux_loss_coef == 0.0);
@@ -11531,7 +11737,9 @@ double qwen36_train_multi_lora_impl(
             "native Qwen multi-LoRA inputs must be CUDA tensors on the "
             "NCCL context device");
         TORCH_CHECK(dynamic_mtp_topology_supported,
-            "dynamic MTP currently requires TP=CP=EP=PP=1, DP>=1, and router aux disabled");
+            "dynamic MTP currently requires CP=EP=PP=1, DP>=1, replicated "
+            "vocabulary and sequence state, sharded prediction-layer weights "
+            "when TP>1, and router aux disabled");
         auto& input_ids = *input_ids_tensor;
         auto& target_mask = *target_mask_tensor;
         const int input_device = input_ids.device().index();
@@ -11626,6 +11834,11 @@ double qwen36_train_multi_lora_impl(
             auto packed_counts = at::cat({
                 adapter_token_counts.to(at::kFloat),
                 mtp_adapter_token_counts}, 0).contiguous();
+            TORCH_CHECK(replica_token_weights_match(
+                    ctx, packed_counts,
+                    reinterpret_cast<ncclComm_t>(ctx->tp_comm),
+                    ctx->tp_world_size, "TP MTP"),
+                "dynamic MTP token counts differ across TP ranks");
             if (ctx->data_parallel && ctx->dp_comm &&
                     ctx->dp_world_size > 1) {
                 auto reduced_counts = at::empty_like(packed_counts);

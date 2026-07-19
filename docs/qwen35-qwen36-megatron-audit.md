@@ -20,7 +20,7 @@
 | Qwen3.5 full attention | 已实现 | native smoke、Qwen3.5 配置集成测试 |
 | Qwen3.5 GDN/linear attention | 已实现 | CUDA delta-rule forward/backward 与 native smoke |
 | Qwen3.6 MoE | 已实现 | grouped dispatch、EP smoke；完整模型仍需目标 GPU/权重运行 |
-| MTP | 已实现受限子集 | fixed LoRA 和 dynamic selected LoRA 的 C++ hidden gradient；dynamic 仅允许 `TP=CP=EP=PP=1, DP>=1` 且 aux loss=0，主/MTP token denominator 已分离并有 H20 单卡 oracle；PP/TP/CP/EP MTP 仍 fail-closed |
+| MTP | 已实现受限子集 | fixed LoRA 和 dynamic selected LoRA 的 C++ hidden gradient；单轴 DP 与 TP2 dense full-attention prediction-layer shard 均有 H20 oracle，TP2 只保留 replicated embedding/LM-head 并要求两类 base TP；MoE prediction layers、vocabulary-parallel MTP、PP/CP/EP MTP 仍 fail-closed |
 | fixed LoRA | 已实现 | attention/GDN/MLP/shared/routed expert 目标模块 |
 | dynamic multi-LoRA | 已实现子集 | selected v2 默认把不同 rank/target 的租户按 projection-local 最大 rank 补零，保留各租户 `alpha / logical_rank`，在一个 activation batch 内完成一次 forward/backward，再以一次 FinalizeOnly 调用独立更新各租户参数、m/v 和 optimizer clock；入口 preflight 默认合并 6 个布尔状态 collective，未命中的 target 使用零张量且不更新。`QWEN36_HETERO_PADDED_BATCH=0` 保留按 signature 分组和跨组回滚。checkpoint 可独立恢复 heterogeneous rank/alpha/targets；HTTP 可在显式 `allow_aggregate_loss=true` 时有界合并兼容且 adapter ID 不相交的并发请求，响应保留 aggregate scalar、adapter loss 和真实 optimizer step；`expected_steps` 在原生 TP/EP/DP collective 前做全秩乐观并发校验，过期重试 fail closed；dynamic+MTP 仅在 `TP=CP=EP=PP=1, DP>=1` 的 dense 单轴配置启用，其他组合显式拒绝，默认仍保持单请求 dispatch |
 | microbatch accumulation | 已实现子集 | non-final microbatch 只 backward，final microbatch 才 optimizer；FP32 accumulator 存储/聚合，autograd leaf backward 仍为 BF16 |
@@ -161,6 +161,8 @@ ABI15 的两层 GDN base-TP smoke 覆盖复合 QKV/conv head shard、Z/A/B/A_log
 本轮新增 H20 ABI1 CP2 GDN full-reference smoke：`QWEN36_GDN_FUSED_CP_EXCHANGE=0/1` 两种模式均通过 fixed eval/train 与 dynamic selected training。fixed eval/loss 差为 `5.1117e-4`，五种 GDN LoRA projection 的 A/B 参数差为 `1.9531e-3/1.9989e-3`，Adam m/v 差为 `3.0518e-6/1.4198e-10`；dynamic aggregate/per-tenant loss 差均为 `0`，LoRA 参数差 `9.8801e-4`，Adam m/v 差 `1.5259e-6/1.5669e-10`。两个 selected tenant 正常更新，第三个未选 tenant 的参数、m/v 与 optimizer step 均逐位不变；rank-local fused flag mismatch 也在 P2P 前一致 fail-closed。实现将 CP local hidden 先 gather 后计算 CE，再由 autograd/手动 checkpoint backward 切回 local gradient，并在 dynamic grouped gradient sync 中加入 CP all-reduce；非 grouped dynamic CP 继续 fail-closed。
 
 本轮新增 H20 ABI1 `mtp-dynamic-smoke` 和 `mtp-dp-smoke`：注册三个 dense LoRA tenant，选择两个不同主/MTP token-count 的租户，安装一层真实 frozen MTP prediction layer；单卡 dynamic per-tenant report 与单租户 oracle 的 loss 和参数差均为 `0`，DP2 complementary-source rows 对两个 singleton oracle 的 loss、参数、Adam m/v 差均为 `0`，第三个未选择租户参数/m/v/step 逐位不变。DP2 MTP objective 的 loss effect 为 `1.0821`、parameter effect 为 `2.0142e-3`，证明 MTP 分支实际参与训练。实现一次性 all-reduce `[main_counts, mtp_counts]`（DP>1 时）并将 MTP hidden gradient/report numerator 转到主 loss denominator；fixed micro-step 使用同一比例，seq<3 和 `TP/CP/EP/PP>1` 组合 fail-closed。
+
+本轮再新增 H20 ABI1 `mtp-tp-smoke`：TP2 两 rank 对主层和 dense MTP prediction layer 同时使用 attention/MLP 列/行并行，embedding/LM-head 保持 replicated，两个 selected dynamic tenant 与一个未选 tenant 对照单卡 full-weight oracle。两 rank 的 `loss_diff` 最大 `3.53e-3`、参数差最大 `1.87e-9`、Adam m/v 差最大 `2.14e-5/3.23e-9`，未选状态逐位不变；开启 `QWEN36_FUSED_QKV=1` 与 `QWEN36_FUSED_MLP_FC1=1` 后仍通过。MTP token counts 在 TP 只做 min/max 一致性检查，不做求和，避免重复放大 hidden gradient。该路径明确不覆盖 Qwen3.6 MoE MTP、vocabulary-parallel MTP 或其他 TP/CP/EP/PP 组合。
 
 这里“尚未完成 CP model execution”指任意五维组合、ring attention 和长序列 CP；本轮 CP2 结果是严格受限的 dense GDN 单轴切片，不应外推为完整 Megatron CP。
 
