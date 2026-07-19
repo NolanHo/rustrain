@@ -123,13 +123,16 @@ int main() {
     }
     assert(qwen36_init_parallel_nccl(ctx, rank, world, rank, 2, 0,
         0, 1, 0, 0, 1, 0) == 0);
+    auto* b_before_ptr = reinterpret_cast<at::Tensor*>(qwen36_get_lora_b(ctx, 0));
+    assert(b_before_ptr);
+    auto b_before = b_before_ptr->clone();
     auto ids = at::tensor({1, 2, 3, 4}, at::TensorOptions().device(at::kCUDA).dtype(at::kLong)).reshape({1, 4});
     auto target = at::ones({1, 4}, at::TensorOptions().device(at::kCUDA).dtype(at::kFloat));
     auto mask = at::ones({1, 4}, at::TensorOptions().device(at::kCUDA).dtype(at::kBool));
     const double loss = qwen36_train_step(ctx, &ids, &target, &mask);
     assert(std::isfinite(loss) && loss > 0.0);
     auto* b = reinterpret_cast<at::Tensor*>(qwen36_get_lora_b(ctx, 0));
-    assert(b && b->abs().sum().item<double>() > 0.0);
+    assert(b && (*b - b_before).abs().sum().item<double>() > 0.0);
     assert(qwen36_get_sequence_parallel_counter(ctx, 0) == 1);
     assert(qwen36_get_sequence_parallel_counter(ctx, 1) > 0);
     assert(qwen36_get_sequence_parallel_counter(ctx, 2) > 0);
