@@ -3465,6 +3465,7 @@ static void hash_collective_runtime_environment(AdapterRegistryHash& hash) {
     hash.add_u64(env_enabled("QWEN36_GDN_CHUNKWISE_BWD"));
     hash.add_u64(env_enabled("QWEN36_GDN_INVERSE_BWD"));
     hash.add_u64(env_enabled("QWEN36_GDN_FUSED_AB_PROJECTION", true));
+    hash.add_u64(env_enabled("QWEN36_GDN_FUSED_CP_EXCHANGE"));
     hash.add_u64(env_enabled("QWEN36_DELTA_REFERENCE_BWD"));
     hash.add_u64(env_enabled("QWEN36_SUBCKPT"));
     hash.add_u64(env_enabled("QWEN36_FUSED_LAYER"));
@@ -7281,6 +7282,51 @@ static at::Tensor linear_attention_batched(
     }
 
     at::Tensor effective_conv1d_w = conv1d_w;
+    at::Tensor a;
+    at::Tensor b;
+    at::Tensor z;
+    at::Tensor cp_controls;
+    const bool use_fused_cp_exchange = use_context_parallel &&
+        env_enabled("QWEN36_GDN_FUSED_CP_EXCHANGE");
+    auto project_gdn_controls = [&]() {
+        const bool use_fused_ab = layer_idx >= 0 &&
+            layer_idx < static_cast<int64_t>(
+                ctx->fused_gdn_ab_weights.size()) &&
+            ctx->fused_gdn_ab_weights[layer_idx].defined();
+        if (use_fused_ab) {
+            auto ab = at::matmul(
+                projection_input, ctx->fused_gdn_ab_weights[layer_idx].t());
+            TORCH_CHECK(ab.size(-1) == projected_num_v_heads * 2,
+                "fused GDN A/B projection output shape mismatch");
+            a = ab.narrow(-1, 0, projected_num_v_heads);
+            b = ab.narrow(
+                -1, projected_num_v_heads, projected_num_v_heads);
+        } else {
+            a = at::matmul(projection_input, in_proj_a.t());
+            b = at::matmul(projection_input, in_proj_b.t());
+        }
+        auto it_a = ctx->lora_batch_cache.find(lora_cache_key(layer_idx, 2));
+        if (it_a != ctx->lora_batch_cache.end()) {
+            a = a + lora_activation_delta(ctx, projection_input,
+                it_a->second.a_stack, it_a->second.b_stack,
+                it_a->second.scaling, it_a->second.layout);
+        }
+        auto it_b = ctx->lora_batch_cache.find(lora_cache_key(layer_idx, 3));
+        if (it_b != ctx->lora_batch_cache.end()) {
+            b = b + lora_activation_delta(ctx, projection_input,
+                it_b->second.a_stack, it_b->second.b_stack,
+                it_b->second.scaling, it_b->second.layout);
+        }
+
+        z = at::matmul(projection_input, in_proj_z.t());
+        auto it_z = ctx->lora_batch_cache.find(lora_cache_key(layer_idx, 1));
+        if (it_z != ctx->lora_batch_cache.end()) {
+            z = z + lora_activation_delta(ctx, projection_input,
+                it_z->second.a_stack, it_z->second.b_stack,
+                it_z->second.scaling, it_z->second.layout);
+        }
+    };
+    if (use_fused_cp_exchange) project_gdn_controls();
     if (use_context_parallel) {
         TORCH_CHECK(!base_tp_attention_enabled(ctx) && ctx->cp_world_size == 2 &&
                 ctx->cp_comm && q_size % ctx->cp_world_size == 0 &&
@@ -7288,16 +7334,22 @@ static at::Tensor linear_attention_batched(
             "GDN context parallelism requires CP2-divisible Q/K/V head bundles");
         const int64_t local_q_size = q_size / ctx->cp_world_size;
         const int64_t local_v_size = v_size / ctx->cp_world_size;
+        const int64_t local_v_heads = num_v_heads / ctx->cp_world_size;
+        const int64_t local_qkv_dim = local_q_size * 2 + local_v_size;
+        const int64_t local_control_dim = local_v_size + local_v_heads * 2;
         std::vector<at::Tensor> peer_qkv;
         std::vector<at::Tensor> peer_conv;
-        peer_qkv.reserve(ctx->cp_world_size);
+        if (!use_fused_cp_exchange)
+            peer_qkv.reserve(ctx->cp_world_size);
         peer_conv.reserve(ctx->cp_world_size);
         for (int64_t peer = 0; peer < ctx->cp_world_size; ++peer) {
-            peer_qkv.push_back(at::cat({
-                qkv.narrow(-1, peer * local_q_size, local_q_size),
-                qkv.narrow(-1, q_size + peer * local_q_size, local_q_size),
-                qkv.narrow(-1, q_size * 2 + peer * local_v_size,
-                    local_v_size)}, -1));
+            if (!use_fused_cp_exchange) {
+                peer_qkv.push_back(at::cat({
+                    qkv.narrow(-1, peer * local_q_size, local_q_size),
+                    qkv.narrow(-1, q_size + peer * local_q_size, local_q_size),
+                    qkv.narrow(-1, q_size * 2 + peer * local_v_size,
+                        local_v_size)}, -1));
+            }
             peer_conv.push_back(at::cat({
                 conv1d_w.narrow(0, peer * local_q_size, local_q_size),
                 conv1d_w.narrow(0, q_size + peer * local_q_size,
@@ -7305,11 +7357,45 @@ static at::Tensor linear_attention_batched(
                 conv1d_w.narrow(0, q_size * 2 + peer * local_v_size,
                     local_v_size)}, 0));
         }
-        auto packed_qkv = at::cat(peer_qkv, -1).contiguous();
-        qkv = CpSequenceToHeadFunction::apply(
-            packed_qkv, (int64_t)ctx->cp_comm,
-            (int64_t)reinterpret_cast<uintptr_t>(ctx->cp_stream),
-            ctx->cp_world_size);
+        if (use_fused_cp_exchange) {
+            std::vector<at::Tensor> payload_sections;
+            payload_sections.reserve(ctx->cp_world_size * 6);
+            for (int64_t peer = 0; peer < ctx->cp_world_size; ++peer) {
+                // One final cat preserves peer-major [Q,K,V,Z,A,B] layout;
+                // avoiding nested cats keeps the fused path from copying the
+                // complete payload more than once before NCCL.
+                payload_sections.push_back(
+                    qkv.narrow(-1, peer * local_q_size, local_q_size));
+                payload_sections.push_back(qkv.narrow(
+                    -1, q_size + peer * local_q_size, local_q_size));
+                payload_sections.push_back(qkv.narrow(
+                    -1, q_size * 2 + peer * local_v_size, local_v_size));
+                payload_sections.push_back(
+                    z.narrow(-1, peer * local_v_size, local_v_size));
+                payload_sections.push_back(
+                    a.narrow(-1, peer * local_v_heads, local_v_heads));
+                payload_sections.push_back(
+                    b.narrow(-1, peer * local_v_heads, local_v_heads));
+            }
+            auto exchanged = CpSequenceToHeadFunction::apply(
+                at::cat(payload_sections, -1).contiguous(),
+                (int64_t)ctx->cp_comm,
+                (int64_t)reinterpret_cast<uintptr_t>(ctx->cp_stream),
+                ctx->cp_world_size);
+            TORCH_CHECK(exchanged.sizes() == at::IntArrayRef({
+                    batch, seq * ctx->cp_world_size,
+                    local_qkv_dim + local_control_dim}),
+                "fused GDN context-parallel exchange produced an invalid shape");
+            qkv = exchanged.narrow(-1, 0, local_qkv_dim).contiguous();
+            cp_controls = exchanged.narrow(
+                -1, local_qkv_dim, local_control_dim).contiguous();
+        } else {
+            auto packed_qkv = at::cat(peer_qkv, -1).contiguous();
+            qkv = CpSequenceToHeadFunction::apply(
+                packed_qkv, (int64_t)ctx->cp_comm,
+                (int64_t)reinterpret_cast<uintptr_t>(ctx->cp_stream),
+                ctx->cp_world_size);
+        }
         effective_conv1d_w = peer_conv[ctx->cp_rank].contiguous();
         num_k_heads /= ctx->cp_world_size;
         num_v_heads /= ctx->cp_world_size;
@@ -7386,58 +7472,29 @@ static at::Tensor linear_attention_batched(
                 v_f[0][0][0][0].item<float>(), v_f[0][0][0][1].item<float>(), v_f[0][0][0][2].item<float>());
     }
 
-    at::Tensor a;
-    at::Tensor b;
-    const bool use_fused_ab = layer_idx >= 0 &&
-        layer_idx < static_cast<int64_t>(ctx->fused_gdn_ab_weights.size()) &&
-        ctx->fused_gdn_ab_weights[layer_idx].defined();
-    if (use_fused_ab) {
-        auto ab = at::matmul(
-            projection_input, ctx->fused_gdn_ab_weights[layer_idx].t());
-        TORCH_CHECK(ab.size(-1) == projected_num_v_heads * 2,
-            "fused GDN A/B projection output shape mismatch");
-        a = ab.narrow(-1, 0, projected_num_v_heads);
-        b = ab.narrow(
-            -1, projected_num_v_heads, projected_num_v_heads);
-    } else {
-        a = at::matmul(projection_input, in_proj_a.t());
-        b = at::matmul(projection_input, in_proj_b.t());
-    }
-    auto it_a = ctx->lora_batch_cache.find(lora_cache_key(layer_idx, 2));
-    if (it_a != ctx->lora_batch_cache.end()) {
-        a = a + lora_activation_delta(ctx, projection_input, it_a->second.a_stack,
-            it_a->second.b_stack, it_a->second.scaling, it_a->second.layout);
-    }
-    auto it_b = ctx->lora_batch_cache.find(lora_cache_key(layer_idx, 3));
-    if (it_b != ctx->lora_batch_cache.end()) {
-        b = b + lora_activation_delta(ctx, projection_input, it_b->second.a_stack,
-            it_b->second.b_stack, it_b->second.scaling, it_b->second.layout);
-    }
-
-    // Z projection + LoRA delta
-    auto z = at::matmul(projection_input, in_proj_z.t());
-    auto it_z = ctx->lora_batch_cache.find(lora_cache_key(layer_idx, 1));
-    if (it_z != ctx->lora_batch_cache.end()) {
-        z = z + lora_activation_delta(ctx, projection_input, it_z->second.a_stack,
-            it_z->second.b_stack, it_z->second.scaling, it_z->second.layout);
-    }
+    if (!use_fused_cp_exchange) project_gdn_controls();
 
     at::Tensor effective_a_log = a_log;
     at::Tensor effective_dt_bias = dt_bias;
     if (use_context_parallel) {
-        std::vector<at::Tensor> peer_controls;
-        peer_controls.reserve(ctx->cp_world_size);
-        for (int64_t peer = 0; peer < ctx->cp_world_size; ++peer) {
-            peer_controls.push_back(at::cat({
-                z.narrow(-1, peer * v_size, v_size),
-                a.narrow(-1, peer * num_v_heads, num_v_heads),
-                b.narrow(-1, peer * num_v_heads, num_v_heads)}, -1));
+        at::Tensor controls;
+        if (use_fused_cp_exchange) {
+            controls = cp_controls;
+        } else {
+            std::vector<at::Tensor> peer_controls;
+            peer_controls.reserve(ctx->cp_world_size);
+            for (int64_t peer = 0; peer < ctx->cp_world_size; ++peer) {
+                peer_controls.push_back(at::cat({
+                    z.narrow(-1, peer * v_size, v_size),
+                    a.narrow(-1, peer * num_v_heads, num_v_heads),
+                    b.narrow(-1, peer * num_v_heads, num_v_heads)}, -1));
+            }
+            controls = CpSequenceToHeadFunction::apply(
+                at::cat(peer_controls, -1).contiguous(),
+                (int64_t)ctx->cp_comm,
+                (int64_t)reinterpret_cast<uintptr_t>(ctx->cp_stream),
+                ctx->cp_world_size);
         }
-        auto controls = CpSequenceToHeadFunction::apply(
-            at::cat(peer_controls, -1).contiguous(),
-            (int64_t)ctx->cp_comm,
-            (int64_t)reinterpret_cast<uintptr_t>(ctx->cp_stream),
-            ctx->cp_world_size);
         TORCH_CHECK(controls.size(0) == batch && controls.size(1) == seq &&
                 controls.size(2) == v_size + num_v_heads * 2,
             "GDN context-parallel control exchange produced an invalid shape");

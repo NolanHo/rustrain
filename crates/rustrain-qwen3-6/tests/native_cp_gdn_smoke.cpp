@@ -408,6 +408,28 @@ int main() {
     assert(max_update > 0.0);
     assert(distributed_step == 1 && reference_step == 1);
 
+    const char* fused_cp_exchange_env =
+        getenv("QWEN36_GDN_FUSED_CP_EXCHANGE");
+    const bool had_fused_cp_exchange_env = fused_cp_exchange_env != nullptr;
+    const std::string saved_fused_cp_exchange =
+        fused_cp_exchange_env ? fused_cp_exchange_env : "";
+    const bool fused_cp_exchange_enabled = fused_cp_exchange_env &&
+        std::string(fused_cp_exchange_env) != "0";
+    if (rank == 1) {
+        setenv("QWEN36_GDN_FUSED_CP_EXCHANGE",
+            fused_cp_exchange_enabled ? "0" : "1", 1);
+    }
+    assert(qwen36_eval_step(
+        distributed, &batch.ids, &batch.targets, &batch.attention) < 0.0);
+    if (rank == 1) {
+        if (had_fused_cp_exchange_env) {
+            setenv("QWEN36_GDN_FUSED_CP_EXCHANGE",
+                saved_fused_cp_exchange.c_str(), 1);
+        } else {
+            unsetenv("QWEN36_GDN_FUSED_CP_EXCHANGE");
+        }
+    }
+
     if (rank == 1) setenv("QWEN36_SEQ_CHUNK", "4", 1);
     assert(qwen36_eval_step(
         distributed, &batch.ids, &batch.targets, &batch.attention) < 0.0);
