@@ -3561,6 +3561,7 @@ static void validate_dynamic_context_health(TrainingContext* ctx) {
     const bool local_healthy = !ctx->poisoned;
     const bool globally_healthy = adapter_collective_all_succeeded(
         ctx, local_healthy);
+    if (!globally_healthy) ctx->poisoned = true;
     TORCH_CHECK(local_healthy && globally_healthy,
         "dynamic multi-LoRA context is poisoned; restart the worker");
 }

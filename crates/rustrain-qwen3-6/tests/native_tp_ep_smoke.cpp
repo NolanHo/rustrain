@@ -74,6 +74,7 @@ extern "C" void* qwen36_get_adapter_optimizer_tensor(
 extern "C" int32_t qwen36_set_adapter_optimizer_tensor(
     void*, int64_t, int64_t, const char*, int32_t, int32_t, void*);
 extern "C" int64_t qwen36_get_adapter_step_count(void*, int64_t);
+extern "C" int32_t qwen36_get_context_health(void*);
 extern "C" int32_t qwen36_validate_adapter_steps_v1(
     void*, const int64_t*, const int64_t*, int32_t);
 extern "C" int64_t qwen36_get_dynamic_finalizer_count(void*);
@@ -1534,6 +1535,21 @@ int main() {
     std::printf(
         "native_tp_ep_heterogeneous_v2 rank=%d loss=%0.8f ok\n",
         rank, heterogeneous_loss);
+    std::fflush(stdout);
+
+    const int64_t poison_request[] = {tenant_one + 100000};
+    if (rank == 0)
+        setenv("QWEN36_TEST_POISON_DYNAMIC_RECOVERY", "1", 1);
+    assert(qwen36_train_multi_lora_selected_v2(
+        distributed, &local_batch.input_ids, &local_batch.target_mask,
+        &local_batch.attention_mask, poison_request, 1) < 0.0);
+    if (rank == 0)
+        unsetenv("QWEN36_TEST_POISON_DYNAMIC_RECOVERY");
+    assert(qwen36_train_multi_lora_selected_v2(
+        distributed, &local_batch.input_ids, &local_batch.target_mask,
+        &local_batch.attention_mask, &tenant_one, 1) < 0.0);
+    assert(qwen36_get_context_health(distributed) == -1);
+    std::printf("native_tp_ep_dynamic_recovery_poison rank=%d ok\n", rank);
     std::fflush(stdout);
 
     qwen36_free_training_context(reference);
