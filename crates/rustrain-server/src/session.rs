@@ -527,6 +527,10 @@ impl Qwen36Session {
         self.device
     }
 
+    pub fn native_context_is_healthy(&self) -> bool {
+        self.ctx.as_ref().map(|ctx| ctx.is_healthy()).unwrap_or(true)
+    }
+
     pub fn train_step_host_i64(
         &mut self,
         input_ids: &[i64],

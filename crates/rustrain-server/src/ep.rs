@@ -24,6 +24,15 @@ use crate::session::{
     SessLoadDatasetRequest, SessLoadModelRequest, TrainOutput, TrainingSession,
 };
 
+const TERMINAL_NATIVE_CONTEXT_PREFIX: &str = "terminal native LoRA context";
+
+fn is_terminal_native_context_result(result: &EpResult) -> bool {
+    matches!(
+        result,
+        EpResult::Error(error) if error.starts_with(TERMINAL_NATIVE_CONTEXT_PREFIX)
+    )
+}
+
 const DEFAULT_MAX_BATCH_ADD_LORA: usize = 64;
 const HARD_MAX_BATCH_ADD_LORA: usize = 4096;
 
@@ -170,7 +179,7 @@ impl EpCoordinator {
             return EpResult::Error("EP coordinator is shut down".to_string());
         }
         match self.channel.broadcast_with_slab(cmd, payload) {
-            Ok(result) => result,
+            Ok(result) => self.handle_dispatch_result(result),
             Err(error) => self.handle_dispatch_error(error),
         }
     }
@@ -180,9 +189,16 @@ impl EpCoordinator {
             return EpResult::Error("EP coordinator is shut down".to_string());
         }
         match self.channel.broadcast(cmd) {
-            Ok(result) => result,
+            Ok(result) => self.handle_dispatch_result(result),
             Err(error) => self.handle_dispatch_error(error),
         }
+    }
+
+    fn handle_dispatch_result(&self, result: EpResult) -> EpResult {
+        if is_terminal_native_context_result(&result) {
+            self.enter_terminal();
+        }
+        result
     }
 
     fn handle_dispatch_error(&self, error: io::Error) -> EpResult {
@@ -633,6 +649,13 @@ pub fn worker_main(
                 Ok(()) => execute_command(&mut session, &worker, &cmd),
                 Err(error) => EpResult::Error(error),
             },
+        };
+        let result = if session.native_context_is_healthy() {
+            result
+        } else {
+            EpResult::Error(format!(
+                "{TERMINAL_NATIVE_CONTEXT_PREFIX}: worker group must be recreated"
+            ))
         };
 
         if let Err(e) = worker.signal_done(&result) {
@@ -1400,10 +1423,12 @@ mod tests {
     use super::{
         checkpoint_generation, checkpoint_metadata_matches, checkpoint_staging_path,
         create_checkpoint_staging, create_worker_session, delete_worker_session, multi_lora_rows,
-        publish_checkpoint_noreplace, require_worker_session, source_shard_for_topology,
-        tensor_element_range, train_step_rows, validate_batch_add_lora_count,
-        validate_flat_tensor_lengths, validate_multi_lora_global_batch_size, SourceShard,
+        is_terminal_native_context_result, publish_checkpoint_noreplace, require_worker_session,
+        source_shard_for_topology, tensor_element_range, train_step_rows,
+        validate_batch_add_lora_count, validate_flat_tensor_lengths,
+        validate_multi_lora_global_batch_size, SourceShard,
     };
+    use rustrain_ipc::EpResult;
     use rustrain_parallel::topology::ParallelTopology;
 
     #[test]
@@ -1427,6 +1452,16 @@ mod tests {
         assert!(validate_batch_add_lora_count(0).is_err());
         assert!(validate_batch_add_lora_count(-1).is_err());
         assert!(validate_batch_add_lora_count(4097).is_err());
+    }
+
+    #[test]
+    fn native_context_poison_is_a_terminal_worker_result() {
+        assert!(is_terminal_native_context_result(&EpResult::Error(
+            "terminal native LoRA context: worker group must be recreated".into()
+        )));
+        assert!(!is_terminal_native_context_result(&EpResult::Error(
+            "ordinary request validation failed".into()
+        )));
     }
 
     #[test]

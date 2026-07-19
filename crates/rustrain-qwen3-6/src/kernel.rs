@@ -231,6 +231,7 @@ type FnGetAdapterStepCount = unsafe extern "C" fn(*mut c_void, i64) -> i64;
 type FnSetAdapterStepCount = unsafe extern "C" fn(*mut c_void, i64, i64) -> i32;
 type FnValidateAdapterSteps =
     unsafe extern "C" fn(*mut c_void, *const i64, *const i64, i32) -> i32;
+type FnGetContextHealth = unsafe extern "C" fn(*mut c_void) -> i32;
 
 #[repr(C)]
 pub struct CppLayerConfig {
@@ -312,6 +313,7 @@ struct KernelHandles {
     get_adapter_step_count: FnGetAdapterStepCount,
     set_adapter_step_count: FnSetAdapterStepCount,
     validate_adapter_steps: Option<FnValidateAdapterSteps>,
+    get_context_health: Option<FnGetContextHealth>,
 }
 
 static KERNELS: OnceLock<Option<KernelHandles>> = OnceLock::new();
@@ -406,6 +408,17 @@ unsafe fn load_kernels() -> Option<KernelHandles> {
                 None
             } else {
                 Some(std::mem::transmute::<*mut c_void, FnValidateAdapterSteps>(symbol))
+            }
+        },
+        get_context_health: {
+            let name = CString::new("qwen36_get_context_health").unwrap();
+            let symbol = libc::dlsym(handle, name.as_ptr());
+            if symbol.is_null() {
+                None
+            } else {
+                Some(std::mem::transmute::<*mut c_void, FnGetContextHealth>(
+                    symbol,
+                ))
             }
         },
         get_lora_count: sym!("qwen36_get_lora_count"),
@@ -1367,6 +1380,9 @@ impl CppTrainingContext {
             )
         };
         if loss < 0.0 {
+            if !self.is_healthy() {
+                bail!("native dynamic LoRA context is poisoned; recreate the session");
+            }
             bail!("C++ train_multi_lora_selected_v2 failed");
         }
         Ok(loss)
@@ -1410,6 +1426,9 @@ impl CppTrainingContext {
                 .iter()
                 .any(|loss| !loss.is_finite() || *loss < 0.0)
         {
+            if !self.is_healthy() {
+                bail!("native dynamic LoRA context is poisoned; recreate the session");
+            }
             bail!("C++ train_multi_lora_selected_v3 failed");
         }
         Ok(MultiLoraLossReport {
@@ -1490,6 +1509,9 @@ impl CppTrainingContext {
             )
         };
         if loss < 0.0 {
+            if !self.is_healthy() {
+                bail!("native dynamic LoRA context is poisoned; recreate the session");
+            }
             bail!("C++ train_multi_lora_host_i64 failed");
         }
         Ok(loss)
@@ -1542,6 +1564,9 @@ impl CppTrainingContext {
                 .iter()
                 .any(|loss| !loss.is_finite() || *loss < 0.0)
         {
+            if !self.is_healthy() {
+                bail!("native dynamic LoRA context is poisoned; recreate the session");
+            }
             bail!("C++ train_multi_lora_host_i64_v2 failed");
         }
         Ok(MultiLoraLossReport {
@@ -2180,6 +2205,17 @@ impl CppTrainingContext {
         Ok(step)
     }
 
+    /// A failed native dynamic-LoRA recovery quarantines the whole context.
+    /// ABI28 libraries predating the health symbol are treated as healthy.
+    pub fn is_healthy(&self) -> bool {
+        let Some(kh) = get_kernels() else {
+            return false;
+        };
+        kh.get_context_health
+            .map(|health| unsafe { health(self.ptr) == 0 })
+            .unwrap_or(true)
+    }
+
     pub fn validate_adapter_steps(
         &self,
         adapter_ids: &[i64],
@@ -2309,6 +2345,9 @@ impl CppTrainingContext {
             )
         };
         if status != 0 || losses.iter().any(|loss| !loss.is_finite() || *loss < 0.0) {
+            if !self.is_healthy() {
+                bail!("native dynamic LoRA context is poisoned; recreate the session");
+            }
             bail!("C++ selected multi-LoRA eval failed");
         }
         Ok(losses)
