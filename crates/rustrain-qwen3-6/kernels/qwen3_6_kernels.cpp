@@ -1542,16 +1542,36 @@ static Qwen36A2ACountPlan qwen36_a2a_counts(
         ncclInt, comm, stream);
     TORCH_CHECK(err == ncclSuccess, "EP A2A count all-gather failed: ",
         ncclGetErrorString(err));
-    auto host = all_counts.to(at::TensorOptions().device(at::kCPU));
     int rank = 0;
     err = ncclCommUserRank(comm, &rank);
     TORCH_CHECK(err == ncclSuccess, "ncclCommUserRank failed: ",
         ncclGetErrorString(err));
 
     Qwen36A2ACountPlan plan;
-    plan.send_tensor = host.select(0, rank).narrow(0, 0, world).contiguous();
-    plan.receive_tensor = host.narrow(1, 0, world)
-        .select(1, rank).contiguous();
+    // The legacy path copies the complete world-by-world metadata matrix to
+    // CPU. For larger EP groups, only this rank's send row, receive column,
+    // and one validity flag per peer are needed by the host-side NCCL
+    // variable-count enqueue. Keep the compact path opt-in for small worlds
+    // because its extra device gather is not worth it at EP2/EP4.
+    const bool compact_metadata = env_enabled(
+        "QWEN36_EP_A2A_COMPACT_COUNTS", world >= 8);
+    at::Tensor host;
+    if (compact_metadata) {
+        auto send_row = all_counts.select(0, rank).narrow(0, 0, world);
+        auto receive_column = all_counts.narrow(1, rank, 1)
+            .select(1, 0).narrow(0, 0, world);
+        auto invalid_flags = all_counts.select(1, world);
+        host = at::cat({send_row, receive_column, invalid_flags}, 0)
+            .contiguous()
+            .to(at::TensorOptions().device(at::kCPU));
+        plan.send_tensor = host.narrow(0, 0, world).contiguous();
+        plan.receive_tensor = host.narrow(0, world, world).contiguous();
+    } else {
+        host = all_counts.to(at::TensorOptions().device(at::kCPU));
+        plan.send_tensor = host.select(0, rank).narrow(0, 0, world).contiguous();
+        plan.receive_tensor = host.narrow(1, 0, world)
+            .select(1, rank).contiguous();
+    }
     plan.send.resize(world);
     plan.receive.resize(world);
     std::memcpy(plan.send.data(), plan.send_tensor.data_ptr<int32_t>(),
@@ -1561,7 +1581,10 @@ static Qwen36A2ACountPlan qwen36_a2a_counts(
     for (int peer = 0; peer < world; ++peer) {
         TORCH_CHECK(plan.send[peer] >= 0 && plan.receive[peer] >= 0,
             "negative EP A2A token count");
-        TORCH_CHECK(host.data_ptr<int32_t>()[peer * (world + 1) + world] == 0,
+        const int32_t invalid = compact_metadata
+            ? host.data_ptr<int32_t>()[2 * world + peer]
+            : host.data_ptr<int32_t>()[peer * (world + 1) + world];
+        TORCH_CHECK(invalid == 0,
             "EP A2A expert index is outside the communicator range");
     }
     return plan;
