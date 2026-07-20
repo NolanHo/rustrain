@@ -388,6 +388,23 @@ int main() {
     assert(std::max({q_a_diff, q_b_diff, k_a_diff, k_b_diff,
         v_a_diff, v_b_diff, o_a_diff, o_b_diff}) <= 2e-3);
 
+    const char* fused_lora_qkv = std::getenv("QWEN36_FUSED_LORA_QKV_A");
+    if (fused_lora_qkv && std::string(fused_lora_qkv) != "0") {
+        setenv("QWEN36_FUSED_LORA_QKV_A", "0", 1);
+        const double legacy_lora_qkv = qwen36_eval_step(
+            distributed, &input_ids, &target_mask, &attention_mask);
+        setenv("QWEN36_FUSED_LORA_QKV_A", "1", 1);
+        const double fused_lora_qkv_loss = qwen36_eval_step(
+            distributed, &input_ids, &target_mask, &attention_mask);
+        assert(std::abs(fused_lora_qkv_loss - legacy_lora_qkv) < 5e-5);
+
+        if (rank == 1) setenv("QWEN36_FUSED_LORA_QKV_A", "0", 1);
+        const double flag_mismatch = qwen36_eval_step(
+            distributed, &input_ids, &target_mask, &attention_mask);
+        assert(flag_mismatch < 0.0);
+        setenv("QWEN36_FUSED_LORA_QKV_A", "1", 1);
+    }
+
     qwen36_free_training_context(reference);
     qwen36_free_training_context(distributed);
 

@@ -3513,6 +3513,7 @@ static void hash_collective_runtime_environment(AdapterRegistryHash& hash) {
     hash.add_u64(env_enabled("QWEN36_FUSED_LAYER"));
     hash.add_u64(env_enabled("QWEN36_FUSED_CE"));
     hash.add_u64(env_enabled("QWEN36_FUSED_QKV"));
+    hash.add_u64(env_enabled("QWEN36_FUSED_LORA_QKV_A"));
     hash.add_u64(env_enabled("QWEN36_FUSED_MLP_FC1"));
     hash.add_u64(env_enabled("QWEN36_CP_FULL_ATTENTION_KV_GATHER"));
     hash.add_u64(env_enabled("QWEN36_DISABLE_MTP"));
@@ -6938,6 +6939,82 @@ static at::Tensor lora_activation_delta(
         ? tp_allreduce_lora_delta(ctx, scaled) : scaled;
 }
 
+// Fuse the shared A@x stage for dense Q/K/V LoRA projections.  The base QKV
+// weight may already use QWEN36_FUSED_QKV, but activation-level LoRA still
+// has three independent A and B batched matmuls unless this opt-in path is
+// enabled.  Heterogeneous ranks/layouts deliberately fall back to the
+// projection-local implementation above.
+static bool lora_activation_deltas_shared_qkv(
+    TrainingContext* ctx, const at::Tensor& x,
+    const std::array<const LoraBatchEntry*, 3>& entries,
+    std::array<at::Tensor, 3>& outputs
+) {
+    if (!env_enabled("QWEN36_FUSED_LORA_QKV_A")) return false;
+    if (!x.defined() || x.dim() != 3) return false;
+    const auto* first = entries[0];
+    if (!first) return false;
+    const auto layout = first->layout;
+    const int64_t batch = x.size(0);
+    const int64_t input_size = x.size(2);
+    const int64_t rank = first->a_stack.dim() == 3
+        ? first->a_stack.size(1) : -1;
+    if (rank <= 0 || input_size <= 0) return false;
+
+    std::array<at::Tensor, 3> a_cast;
+    std::array<at::Tensor, 3> b_cast;
+    std::array<at::Tensor, 3> scaling_cast;
+    for (size_t index = 0; index < entries.size(); ++index) {
+        const auto* entry = entries[index];
+        if (!entry || entry->layout != layout || entry->a_stack.dim() != 3 ||
+                entry->b_stack.dim() != 3 || entry->scaling.dim() != 3 ||
+                entry->a_stack.device() != x.device() ||
+                entry->b_stack.device() != x.device() ||
+                entry->scaling.device() != x.device() ||
+                entry->a_stack.size(1) != rank ||
+                entry->a_stack.size(2) != input_size ||
+                entry->b_stack.size(2) != rank ||
+                (entry->a_stack.size(0) != 1 &&
+                    entry->a_stack.size(0) != batch) ||
+                (entry->b_stack.size(0) != 1 &&
+                    entry->b_stack.size(0) != batch) ||
+                (entry->scaling.size(0) != 1 &&
+                    entry->scaling.size(0) != batch) ||
+                entry->scaling.size(1) != 1 || entry->scaling.size(2) != 1) {
+            return false;
+        }
+        a_cast[index] = entry->a_stack.to(x.scalar_type());
+        b_cast[index] = entry->b_stack.to(x.scalar_type());
+        scaling_cast[index] = entry->scaling.to(x.scalar_type());
+        if (batch > 1) {
+            if (a_cast[index].size(0) == 1)
+                a_cast[index] = a_cast[index].expand({batch, rank, input_size});
+            if (b_cast[index].size(0) == 1)
+                b_cast[index] = b_cast[index].expand({batch,
+                    b_cast[index].size(1), rank});
+            if (scaling_cast[index].size(0) == 1)
+                scaling_cast[index] = scaling_cast[index].expand({batch, 1, 1});
+        }
+    }
+
+    // Latent-rank LoRA needs the same replicated input copy for all three
+    // projections.  Sharing this copy is important: otherwise the A-side
+    // fusion would still launch three identical input collectives.
+    auto lora_input = layout == LoraTpLayout::LatentRank
+        ? tp_copy_lora_input(ctx, x) : x;
+    auto a_cat = at::cat({a_cast[0], a_cast[1], a_cast[2]}, 1);
+    auto ax = at::bmm(a_cat, lora_input.transpose(-2, -1));
+    int64_t rank_offset = 0;
+    for (size_t index = 0; index < entries.size(); ++index) {
+        auto ax_part = ax.narrow(1, rank_offset, rank);
+        auto delta = at::bmm(b_cast[index], ax_part).transpose(-2, -1);
+        auto scaled = delta * scaling_cast[index];
+        outputs[index] = layout == LoraTpLayout::LatentRank
+            ? tp_allreduce_lora_delta(ctx, scaled) : scaled;
+        rank_offset += rank;
+    }
+    return true;
+}
+
 static const LoraBatchEntry* lora_batch_entry(
     TrainingContext* ctx, int64_t layer_idx, int64_t pair_idx
 ) {
@@ -7347,21 +7424,39 @@ static at::Tensor full_attention_batched(
         v = at::matmul(projection_input, v_proj.t());
     }
 
-    // Apply activation-level LoRA: q += B@(A@hidden) * scaling
+    // Apply activation-level LoRA: q/k/v += B@(A@hidden) * scaling.  When
+    // all three projections share compatible tenant geometry, fuse their
+    // A-side batched matmul while keeping the output-specific B projections.
     auto it_q = ctx->lora_batch_cache.find(lora_cache_key(layer_idx, 0));
-    if (it_q != ctx->lora_batch_cache.end()) {
-        q = q + lora_activation_delta(ctx, projection_input, it_q->second.a_stack,
-            it_q->second.b_stack, it_q->second.scaling, it_q->second.layout);
-    }
     auto it_k = ctx->lora_batch_cache.find(lora_cache_key(layer_idx, 1));
-    if (it_k != ctx->lora_batch_cache.end()) {
-        k = k + lora_activation_delta(ctx, projection_input, it_k->second.a_stack,
-            it_k->second.b_stack, it_k->second.scaling, it_k->second.layout);
-    }
     auto it_v = ctx->lora_batch_cache.find(lora_cache_key(layer_idx, 2));
-    if (it_v != ctx->lora_batch_cache.end()) {
-        v = v + lora_activation_delta(ctx, projection_input, it_v->second.a_stack,
-            it_v->second.b_stack, it_v->second.scaling, it_v->second.layout);
+    const std::array<const LoraBatchEntry*, 3> qkv_entries = {
+        it_q == ctx->lora_batch_cache.end() ? nullptr : &it_q->second,
+        it_k == ctx->lora_batch_cache.end() ? nullptr : &it_k->second,
+        it_v == ctx->lora_batch_cache.end() ? nullptr : &it_v->second,
+    };
+    std::array<at::Tensor, 3> qkv_lora;
+    if (lora_activation_deltas_shared_qkv(
+            ctx, projection_input, qkv_entries, qkv_lora)) {
+        q = q + qkv_lora[0];
+        k = k + qkv_lora[1];
+        v = v + qkv_lora[2];
+    } else {
+        if (qkv_entries[0]) {
+            q = q + lora_activation_delta(ctx, projection_input,
+                qkv_entries[0]->a_stack, qkv_entries[0]->b_stack,
+                qkv_entries[0]->scaling, qkv_entries[0]->layout);
+        }
+        if (qkv_entries[1]) {
+            k = k + lora_activation_delta(ctx, projection_input,
+                qkv_entries[1]->a_stack, qkv_entries[1]->b_stack,
+                qkv_entries[1]->scaling, qkv_entries[1]->layout);
+        }
+        if (qkv_entries[2]) {
+            v = v + lora_activation_delta(ctx, projection_input,
+                qkv_entries[2]->a_stack, qkv_entries[2]->b_stack,
+                qkv_entries[2]->scaling, qkv_entries[2]->layout);
+        }
     }
 
     // Reshape Q: [batch, seq, num_heads, head_dim*2] → split into q and gate
