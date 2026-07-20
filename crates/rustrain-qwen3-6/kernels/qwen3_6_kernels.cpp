@@ -12190,7 +12190,13 @@ double qwen36_train_multi_lora_impl(
             }
         }
 
-        double total_loss = 0.0;
+        at::Tensor total_loss;
+        at::Tensor step_numerics_valid;
+        if (!finalize_only) {
+            total_loss = at::zeros({}, input_ids.options().dtype(at::kDouble));
+            step_numerics_valid = at::ones(
+                {}, input_ids.options().dtype(at::kBool));
+        }
         at::Tensor loss_numerators;
         at::Tensor loss_token_counts;
         if (!finalize_only && loss_numerators_out && token_counts_out) {
@@ -12216,7 +12222,7 @@ double qwen36_train_multi_lora_impl(
             AdapterRegistryChunkGuard registry_guard(
                 ctx, start, end, !finalize_only);
 
-            double loss_val = 0.0;
+            at::Tensor chunk_loss;
             if (!finalize_only) {
                 // Mark batched mode active
                 ctx->lora_batch_valid = true;  // triggers prepare_lora_batch in forward
@@ -12273,7 +12279,7 @@ double qwen36_train_multi_lora_impl(
                     ctx, loss_hidden, input_ref, mask_ref, ctx->vocab_size,
                     /*independent_samples=*/true,
                     /*collect_sample_losses=*/loss_numerators.defined());
-                loss_val = loss.value.item<double>();
+                chunk_loss = loss.value.detach();
                 hidden_grad = loss.hidden_grad;
                 if (loss_numerators.defined()) {
                     TORCH_CHECK(loss.sample_loss_numerators.defined() &&
@@ -12305,7 +12311,7 @@ double qwen36_train_multi_lora_impl(
                     .narrow(0, start, n).to(mtp_input.grad().scalar_type())
                     .reshape({n, 1, 1});
                 hidden_grad.add_(mtp_input.grad() * chunk_gradient_scales);
-                loss_val += mtp_loss.value.item<double>();
+                chunk_loss = chunk_loss + mtp_loss.value.detach();
                 if (loss_numerators.defined()) {
                     TORCH_CHECK(mtp_loss.sample_loss_numerators.defined() &&
                             mtp_loss.sample_token_counts.defined() &&
@@ -12314,9 +12320,10 @@ double qwen36_train_multi_lora_impl(
                         "dynamic MTP per-adapter loss report shape mismatch");
                     auto expected_counts = mtp_adapter_token_counts.narrow(
                         0, start, n);
-                    TORCH_CHECK(at::equal(
-                            mtp_loss.sample_token_counts, expected_counts),
-                        "dynamic MTP sample token counts disagree with optimizer normalization");
+                    step_numerics_valid = at::logical_and(
+                        step_numerics_valid,
+                        mtp_loss.sample_token_counts.eq(
+                            expected_counts).all());
                     loss_numerators.narrow(0, start, n).add_(
                         mtp_loss.sample_loss_numerators *
                         mtp_report_scales.narrow(0, start, n));
@@ -12333,18 +12340,13 @@ double qwen36_train_multi_lora_impl(
                 hidden_grad.mul_(chunk_token_counts);
             }
 
-            bool local_loss_finite = false;
-            try {
-                local_loss_finite =
-                    std::isfinite(loss_val) && loss_val >= 0.0 &&
-                    at::isfinite(hidden_grad).all().item<bool>();
-            } catch (...) {
-                local_loss_finite = false;
-            }
-            const bool all_losses_finite =
-                adapter_collective_all_succeeded(ctx, local_loss_finite);
-            TORCH_CHECK(all_losses_finite && local_loss_finite,
-                "dynamic LoRA loss or hidden gradient became non-finite");
+            auto chunk_loss_valid = at::logical_and(
+                at::isfinite(chunk_loss), chunk_loss >= 0).all();
+            auto chunk_gradient_valid = at::isfinite(hidden_grad).all();
+            step_numerics_valid = at::logical_and(
+                step_numerics_valid,
+                at::logical_and(chunk_loss_valid, chunk_gradient_valid));
+            total_loss = total_loss + chunk_loss.to(at::kDouble);
 
             if (!ctx->group_inputs.empty() && !env_enabled("QWEN36_SUBCKPT")) {
                 manual_group_backward(
@@ -12366,8 +12368,11 @@ double qwen36_train_multi_lora_impl(
             double bwd_ms = std::chrono::duration<double, std::milli>(t_bwd_end - t_bwd_start).count();
 
             if (env_enabled("QWEN36_TRAIN_TRACE")) {
-                fprintf(stderr, "[train_multi] chunk %ld/%ld: n=%ld loss=%f  fwd=%.0fms loss=%.0fms bwd=%.0fms\n",
-                        (long)(chunk+1), (long)num_chunks, (long)n, loss_val, fwd_ms, loss_ms, bwd_ms);
+                fprintf(stderr,
+                    "[train_multi] chunk %ld/%ld: n=%ld loss=device-deferred  "
+                    "fwd=%.0fms loss=%.0fms bwd=%.0fms\n",
+                    (long)(chunk + 1), (long)num_chunks, (long)n,
+                    fwd_ms, loss_ms, bwd_ms);
             }
             }
 
@@ -12375,6 +12380,20 @@ double qwen36_train_multi_lora_impl(
             // remain attached to the intrusive tensor handles, so all chunks
             // can accumulate and the optimizer runs exactly once below.
             registry_guard.restore();
+
+            if (chunk == num_chunks - 1 && !finalize_only) {
+                bool local_step_valid = false;
+                try {
+                    local_step_valid = step_numerics_valid.item<bool>();
+                } catch (...) {
+                    local_step_valid = false;
+                }
+                const bool global_step_valid =
+                    adapter_collective_all_succeeded(ctx, local_step_valid);
+                TORCH_CHECK(global_step_valid && local_step_valid,
+                    "dynamic LoRA loss, hidden gradient, or MTP token counts "
+                    "became invalid");
+            }
 
             if (chunk == num_chunks - 1 && !train_only) {
                 // DP gradient synchronization and Adam belong to the logical
@@ -12740,13 +12759,6 @@ double qwen36_train_multi_lora_impl(
                 }
             }
 
-            if (!finalize_only) {
-                total_loss += loss_val;
-                if (env_enabled("QWEN36_TRAIN_TRACE")) {
-                    fprintf(stderr, "[train_multi] chunk %ld/%ld: n=%ld loss=%.6f\n",
-                            (long)(chunk + 1), (long)num_chunks, (long)n, loss_val);
-                }
-            }
         }
 
         if (!train_only) clear_gradient_accumulators(ctx);
@@ -12755,7 +12767,8 @@ double qwen36_train_multi_lora_impl(
             *token_counts_out = loss_token_counts;
         }
         accumulation_guard.disarmed = true;
-        return finalize_only ? 0.0 : total_loss / total_adapters;
+        if (finalize_only || loss_numerators.defined()) return 0.0;
+        return total_loss.item<double>() / total_adapters;
     } catch (const std::exception& e) {
         fprintf(stderr, "[train_multi] FAILED: %s\n", e.what());
         return -1.0;
@@ -13453,7 +13466,16 @@ static double qwen36_train_multi_lora_selected_impl(
         if (report_requested) {
             global_adapter_loss_values = global_dynamic_adapter_losses(
                 ctx, selected_loss_numerators, selected_token_counts);
-            train_loss = global_adapter_loss_values.mean().item<double>();
+            auto losses_cpu = global_adapter_loss_values.to(
+                at::TensorOptions().device(at::kCPU).dtype(at::kDouble));
+            const auto* losses = losses_cpu.data_ptr<double>();
+            double reported_loss = 0.0;
+            for (int32_t index = 0; index < n_adapters; ++index) {
+                adapter_losses_out[index] = losses[index];
+                reported_loss += losses[index];
+            }
+            train_loss = reported_loss / static_cast<double>(n_adapters);
+            *aggregate_loss_out = train_loss;
         }
 
         ctx->adapters.swap(selected);
@@ -13477,18 +13499,6 @@ static double qwen36_train_multi_lora_selected_impl(
             "heterogeneous adapter finalizer failed on at least one "
             "distributed rank");
         restore_registry();
-        if (aggregate_loss_out && adapter_losses_out) {
-            auto losses_cpu = global_adapter_loss_values.to(
-                at::TensorOptions().device(at::kCPU).dtype(at::kDouble));
-            const auto* losses = losses_cpu.data_ptr<double>();
-            double reported_loss = 0.0;
-            for (int32_t index = 0; index < n_adapters; ++index) {
-                adapter_losses_out[index] = losses[index];
-                reported_loss += losses[index];
-            }
-            train_loss = reported_loss / static_cast<double>(n_adapters);
-            *aggregate_loss_out = train_loss;
-        }
         return train_loss;
     } catch (const std::exception& e) {
         recover();
