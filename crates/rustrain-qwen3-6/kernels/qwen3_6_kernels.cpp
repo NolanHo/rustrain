@@ -3019,6 +3019,15 @@ struct TrainingContext {
     // sync or repeated mask reduction.
     at::Tensor attention_lengths;
 
+    // Optional host staging for the shared-memory i64 ingress. The IPC slab
+    // is pageable and may be reused as soon as the native call returns, so
+    // each logical input owns a separate pinned buffer before an async H2D
+    // copy is enqueued. The buffers are resized only when the request shape
+    // changes and are kept context-owned until the next synchronous request.
+    at::Tensor host_i64_input_staging;
+    at::Tensor host_i64_target_staging;
+    at::Tensor host_i64_attention_staging;
+
     // ── Multi-LoRA adapter registry ──
     struct LoRAAdapter {
         int64_t id;
@@ -15304,7 +15313,8 @@ static at::Tensor qwen36_copy_host_i64_batch(
     const int64_t* data,
     int64_t batch_size,
     int64_t seq_len,
-    const char* name
+    const char* name,
+    at::Tensor* pinned_staging
 ) {
     TORCH_CHECK(ctx, name, " requires a valid training context");
     TORCH_CHECK(data, name, " requires a non-null host pointer");
@@ -15317,6 +15327,26 @@ static at::Tensor qwen36_copy_host_i64_batch(
     auto host = at::from_blob(
         const_cast<int64_t*>(data), {batch_size, seq_len},
         at::TensorOptions().device(at::kCPU).dtype(at::kLong));
+    if (env_enabled("QWEN36_HOST_PINNED_STAGING")) {
+        TORCH_CHECK(pinned_staging,
+            name, " pinned staging destination is unavailable");
+        if (!pinned_staging->defined() || pinned_staging->dim() != 2 ||
+                pinned_staging->size(0) != batch_size ||
+                pinned_staging->size(1) != seq_len) {
+            *pinned_staging = at::empty(
+                {batch_size, seq_len},
+                at::TensorOptions().device(at::kCPU).dtype(at::kLong)
+                    .pinned_memory(true));
+        }
+        // This CPU copy is intentionally synchronous: the source is a
+        // pageable IPC slab. Only the subsequent pinned H2D transfer is
+        // asynchronous; the host-i64 ABI still returns after its scalar
+        // result is materialized, so this does not imply request overlap.
+        pinned_staging->copy_(host);
+        return pinned_staging->to(
+            at::Device(at::kCUDA, ctx->cuda_device), at::kLong,
+            /*non_blocking=*/true, /*copy=*/true);
+    }
     // Shared-memory storage remains owned by the IPC channel. A blocking H2D
     // copy makes the returned CUDA tensor independent before the worker posts
     // completion and permits the coordinator to reuse the slab.
@@ -15354,11 +15384,14 @@ static Qwen36HostI64Batch qwen36_copy_host_i64_batch_collective(
     std::string local_copy_error;
     try {
         batch.input = qwen36_copy_host_i64_batch(
-            ctx, input_ids, batch_size, seq_len, name);
+            ctx, input_ids, batch_size, seq_len, name,
+            &ctx->host_i64_input_staging);
         batch.targets = qwen36_copy_host_i64_batch(
-            ctx, target_mask, batch_size, seq_len, name);
+            ctx, target_mask, batch_size, seq_len, name,
+            &ctx->host_i64_target_staging);
         batch.attention = qwen36_copy_host_i64_batch(
-            ctx, attention_mask, batch_size, seq_len, name);
+            ctx, attention_mask, batch_size, seq_len, name,
+            &ctx->host_i64_attention_staging);
     } catch (const std::exception& error) {
         local_copy_error = error.what();
     }

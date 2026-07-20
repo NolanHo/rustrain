@@ -2,6 +2,8 @@
 
 本文记录当前 native Qwen3.5/3.6 LoRA 后端与 Megatron-LM 级训练栈的边界。结论按实际代码和 smoke/integration 结果整理，不把配置字段或通用拓扑类型当作已经实现的 kernel。
 
+本轮补上了 native host-i64 入口的 opt-in `QWEN36_HOST_PINNED_STAGING=1`：context 缓存独立的 pinned input/target/attention staging，并以 non-blocking H2D 替代 pageable blocking copy。H20 TP2 x EP2 matched native benchmark（`B=2,S=64,H=1024,E=8,I=2048,L=1`，5 warmup/50 iterations）loss 保持 `5.411833`，pageable/pinned p50 为 `6.336/6.959 ms`，p95 为 `7.148/7.108 ms`；因此默认关闭，且不能把该路径等同于已经实现 request/compute overlap。
+
 ## 结论
 
 - 模型语义：Qwen3.5 dense、Qwen3.6 dense/MoE 的 native forward/backward 路径已经覆盖 hybrid full attention、GDN、MoE、MTP 和 LoRA 目标模块；已有配置解析、合成 oracle、集成测试及 H20 native smoke 证据，但尚未完成真实 35B/3.6 权重的长时间训练验证。
