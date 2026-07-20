@@ -3121,6 +3121,11 @@ struct TrainingContext {
     };
 
     std::vector<LoRAAdapter> adapters;
+    // Sorted external ID -> canonical registry slot. Temporary selected/chunk
+    // registries explicitly invalidate this index; their adapter order is not
+    // the canonical order represented here.
+    std::vector<std::pair<int64_t, size_t>> adapter_id_index;
+    bool adapter_id_index_valid = true;
     int64_t next_adapter_id = 0;
     int64_t multi_lora_invocation = 0;
     int64_t dynamic_finalizer_count = 0;
@@ -3291,6 +3296,29 @@ struct TrainingContext {
     int cuda_device = 0;
 // ──────────────────────────────────────────────────────────────────────
 };
+
+static bool find_canonical_adapter_index(
+    const TrainingContext* ctx, int64_t adapter_id, size_t& adapter_index
+) {
+    if (!ctx || !ctx->adapter_id_index_valid ||
+            ctx->adapter_id_index.size() != ctx->adapters.size())
+        return false;
+    const auto it = std::lower_bound(
+        ctx->adapter_id_index.begin(), ctx->adapter_id_index.end(), adapter_id,
+        [](const auto& entry, int64_t id) { return entry.first < id; });
+    if (it == ctx->adapter_id_index.end() || it->first != adapter_id ||
+            it->second >= ctx->adapters.size() ||
+            ctx->adapters[it->second].id != adapter_id)
+        return false;
+    adapter_index = it->second;
+    return true;
+}
+
+static void require_canonical_adapter_index(const TrainingContext* ctx) {
+    TORCH_CHECK(ctx && ctx->adapter_id_index_valid &&
+            ctx->adapter_id_index.size() == ctx->adapters.size(),
+        "dynamic LoRA adapter ID index is unavailable or inconsistent");
+}
 
 static cudaStream_t context_moe_shared_stream(TrainingContext* ctx) {
     TORCH_CHECK(ctx, "shared-expert overlap requires a training context");
@@ -4005,15 +4033,14 @@ static void validate_adapter_collective_registry(
             const int64_t requested_id = requested_ids[index];
             hash.add_u64(requested_id);
             if (expected_steps) hash.add_u64(expected_steps[index]);
-            const auto it = std::find_if(
-                ctx->adapters.begin(), ctx->adapters.end(),
-                [&](const auto& adapter) { return adapter.id == requested_id; });
-            if (it == ctx->adapters.end()) {
+            size_t adapter_index = 0;
+            if (!find_canonical_adapter_index(
+                    ctx, requested_id, adapter_index)) {
                 hash.add_u64(0x6d697373696e67ULL);
                 continue;
             }
             hash.add_u64(0x666f756e64ULL);
-            hash_adapter_layout(hash, *it);
+            hash_adapter_layout(hash, ctx->adapters[adapter_index]);
             ++found_count;
         }
     } else {
@@ -12437,16 +12464,20 @@ double qwen36_train_multi_lora_impl(
             int64_t start = 0;
             size_t moved = 0;
             bool active = false;
+            bool adapter_id_index_was_valid = false;
 
             AdapterRegistryChunkGuard(
                 TrainingContext* context, int64_t start, int64_t end,
                 bool scope_registry)
-                : ctx(context), start(start) {
+                : ctx(context), start(start),
+                  adapter_id_index_was_valid(
+                      context && context->adapter_id_index_valid) {
                 if (!scope_registry) return;
                 TORCH_CHECK(start >= 0 && end >= start &&
                         end <= static_cast<int64_t>(ctx->adapters.size()),
                     "invalid dynamic adapter chunk range [", start, ", ",
                     end, ") for registry size ", ctx->adapters.size());
+                ctx->adapter_id_index_valid = false;
                 all.swap(ctx->adapters);
                 try {
                     const size_t count = static_cast<size_t>(end - start);
@@ -12462,6 +12493,8 @@ double qwen36_train_multi_lora_impl(
                             std::move(ctx->adapters[index]);
                     ctx->adapters.clear();
                     ctx->adapters.swap(all);
+                    ctx->adapter_id_index_valid =
+                        adapter_id_index_was_valid;
                     throw;
                 }
             }
@@ -12473,6 +12506,7 @@ double qwen36_train_multi_lora_impl(
                         std::move(ctx->adapters[index]);
                 ctx->adapters.clear();
                 ctx->adapters.swap(all);
+                ctx->adapter_id_index_valid = adapter_id_index_was_valid;
                 moved = 0;
                 active = false;
             }
@@ -13174,6 +13208,7 @@ __attribute__((visibility("default"))) double qwen36_train_multi_lora_selected(
     std::vector<uint8_t> moved;
     bool registry_detached = false;
     bool selected_installed = false;
+    bool adapter_id_index_was_valid = false;
     auto restore_registry = [&]() {
         if (!ctx || !registry_detached) return;
         if (selected_installed) {
@@ -13194,6 +13229,7 @@ __attribute__((visibility("default"))) double qwen36_train_multi_lora_selected(
             merged.push_back(std::move(selected[selected_index]));
         }
         ctx->adapters.swap(merged);
+        ctx->adapter_id_index_valid = adapter_id_index_was_valid;
         registry_detached = false;
     };
     try {
@@ -13211,18 +13247,26 @@ __attribute__((visibility("default"))) double qwen36_train_multi_lora_selected(
         merged.reserve(original_count);
         selected_indexes.reserve(n_adapters);
         moved.resize(original_count, 0);
+        require_canonical_adapter_index(ctx);
+        for (int32_t i = 0; i < n_adapters; ++i) {
+            TORCH_CHECK(adapter_ids[i] > 0,
+                "selected adapter IDs must be positive");
+            size_t index = 0;
+            TORCH_CHECK(find_canonical_adapter_index(
+                    ctx, adapter_ids[i], index),
+                "unknown selected adapter ID: ", adapter_ids[i]);
+            TORCH_CHECK(!moved[index],
+                "duplicate selected adapter ID: ", adapter_ids[i]);
+            moved[index] = 1;
+            selected_indexes.push_back(index);
+        }
+        adapter_id_index_was_valid = ctx->adapter_id_index_valid;
+        ctx->adapter_id_index_valid = false;
         original.swap(ctx->adapters);
         registry_detached = true;
         for (int32_t i = 0; i < n_adapters; ++i) {
-            TORCH_CHECK(adapter_ids[i] > 0, "selected adapter IDs must be positive");
-            auto it = std::find_if(original.begin(), original.end(),
-                [&](const auto& adapter) { return adapter.id == adapter_ids[i]; });
-            TORCH_CHECK(it != original.end(), "unknown selected adapter ID: ", adapter_ids[i]);
-            const auto index = static_cast<size_t>(it - original.begin());
-            TORCH_CHECK(!moved[index], "duplicate selected adapter ID: ", adapter_ids[i]);
-            moved[index] = 1;
-            selected_indexes.push_back(index);
-            selected.push_back(std::move(*it));
+            selected.push_back(
+                std::move(original[selected_indexes[static_cast<size_t>(i)]]));
         }
         ctx->adapters.swap(selected);
         selected_installed = true;
@@ -13463,6 +13507,7 @@ static double qwen36_train_multi_lora_selected_impl(
     bool recovery_failed = false;
     bool registry_detached = false;
     bool selected_registry_installed = false;
+    bool adapter_id_index_was_valid = false;
     at::Tensor selected_loss_numerators;
     at::Tensor selected_token_counts;
     at::Tensor global_adapter_loss_values;
@@ -13480,6 +13525,7 @@ static double qwen36_train_multi_lora_selected_impl(
         }
         ctx->adapters.clear();
         ctx->adapters.swap(original);
+        ctx->adapter_id_index_valid = adapter_id_index_was_valid;
         registry_detached = false;
     };
     auto rollback = [&]() {
@@ -13634,21 +13680,7 @@ static double qwen36_train_multi_lora_selected_impl(
         auto& target_mask = *target_mask_tensor;
 
         const size_t original_count = ctx->adapters.size();
-        // Sparse selections are cheaper to resolve with the existing linear scan;
-        // build an index only when the requested set is large enough to amortize it.
-        const bool use_adapter_index =
-            n_adapters >= (original_count + static_cast<size_t>(7)) / 8;
-        std::unordered_map<int64_t, size_t> adapter_indexes;
-        if (use_adapter_index) {
-            adapter_indexes.reserve(original_count);
-            for (size_t index = 0; index < original_count; ++index) {
-                const bool inserted = adapter_indexes.emplace(
-                    ctx->adapters[index].id, index).second;
-                TORCH_CHECK(inserted,
-                    "duplicate heterogeneous registered adapter ID: ",
-                    ctx->adapters[index].id);
-            }
-        }
+        require_canonical_adapter_index(ctx);
         std::vector<size_t> requested_indexes;
         std::vector<uint8_t> requested(original_count, 0);
         requested_indexes.reserve(n_adapters);
@@ -13657,23 +13689,10 @@ static double qwen36_train_multi_lora_selected_impl(
             TORCH_CHECK(adapter_ids[request_index] > 0,
                 "heterogeneous selected adapter IDs must be positive");
             size_t index = 0;
-            if (use_adapter_index) {
-                const auto it = adapter_indexes.find(adapter_ids[request_index]);
-                TORCH_CHECK(it != adapter_indexes.end(),
-                    "unknown heterogeneous selected adapter ID: ",
-                    adapter_ids[request_index]);
-                index = it->second;
-            } else {
-                const auto it = std::find_if(
-                    ctx->adapters.begin(), ctx->adapters.end(),
-                    [&](const auto& adapter) {
-                        return adapter.id == adapter_ids[request_index];
-                    });
-                TORCH_CHECK(it != ctx->adapters.end(),
-                    "unknown heterogeneous selected adapter ID: ",
-                    adapter_ids[request_index]);
-                index = static_cast<size_t>(it - ctx->adapters.begin());
-            }
+            TORCH_CHECK(find_canonical_adapter_index(
+                    ctx, adapter_ids[request_index], index),
+                "unknown heterogeneous selected adapter ID: ",
+                adapter_ids[request_index]);
             TORCH_CHECK(!requested[index],
                 "duplicate heterogeneous selected adapter ID: ",
                 adapter_ids[request_index]);
@@ -13683,9 +13702,11 @@ static double qwen36_train_multi_lora_selected_impl(
         original.reserve(original_count);
         selected.reserve(n_adapters);
         selected_indexes.reserve(n_adapters);
+        original_steps.reserve(requested_indexes.size());
+        adapter_id_index_was_valid = ctx->adapter_id_index_valid;
+        ctx->adapter_id_index_valid = false;
         original.swap(ctx->adapters);
         registry_detached = true;
-        original_steps.reserve(requested_indexes.size());
         for (const size_t index : requested_indexes) {
             selected_indexes.push_back(index);
             original_steps.push_back(original[index].optimizer_step);
@@ -14723,6 +14744,7 @@ static int64_t qwen36_add_lora_impl(
         int64_t local_rank = 0;
         std::string request_error;
         try {
+            require_canonical_adapter_index(ctx);
             TORCH_CHECK(!ctx->topology_invalid,
                 "native Qwen context rejected an incompatible distributed "
                 "topology");
@@ -14961,6 +14983,7 @@ static int64_t qwen36_add_lora_impl(
             }
             bind_adapter_lora_gradient_slab(ctx, adapter);
             ctx->adapters.reserve(ctx->adapters.size() + 1);
+            ctx->adapter_id_index.reserve(ctx->adapter_id_index.size() + 1);
         } catch (const std::exception& e) {
             preparation_error = e.what();
         }
@@ -14991,7 +15014,9 @@ static int64_t qwen36_add_lora_impl(
             synchronization_error.empty() ? "" : ": ",
             synchronization_error);
         int64_t id = adapter.id;
+        const size_t canonical_index = ctx->adapters.size();
         ctx->adapters.push_back(std::move(adapter));
+        ctx->adapter_id_index.emplace_back(id, canonical_index);
         ctx->next_adapter_id = id;
         ctx->lora_cache_valid = false;
         ctx->lora_batch_valid = false;
@@ -15157,33 +15182,46 @@ int32_t qwen36_set_adapter_id(void* ctx_ptr, int64_t current_id, int64_t request
         TORCH_CHECK(ctx && current_id > 0 && requested_id > 0,
             "dynamic adapter IDs must be positive");
         require_clear_accumulation_for_registry_mutation(ctx);
-        bool current_found = false;
-        bool requested_available = true;
-        for (const auto& adapter : ctx->adapters) {
-            current_found = current_found || adapter.id == current_id;
-            requested_available = requested_available &&
-                (adapter.id != requested_id || adapter.id == current_id);
-        }
+        const bool index_available = ctx->adapter_id_index_valid &&
+            ctx->adapter_id_index.size() == ctx->adapters.size();
+        size_t current_index = 0;
+        size_t requested_index = 0;
+        const bool current_found = find_canonical_adapter_index(
+            ctx, current_id, current_index);
+        const bool requested_found = find_canonical_adapter_index(
+            ctx, requested_id, requested_index);
+        const bool requested_available =
+            !requested_found || requested_id == current_id;
         TrainingContext::LoRAAdapter request{};
         request.id = current_id;
         request.rank = requested_id;
         request.alpha = 1.0;
-        const bool local_valid = current_found && requested_available;
+        const bool local_valid =
+            index_available && current_found && requested_available;
         TORCH_CHECK(adapter_registration_phase_matches(
                 ctx, request, local_valid, /*phase=*/3) && local_valid,
             current_found ? "dynamic adapter ID already exists: " :
                 "dynamic adapter not found: ",
             current_found ? requested_id : current_id);
-        for (auto& adapter : ctx->adapters) {
-            if (adapter.id == current_id) {
-                adapter.id = requested_id;
-                ctx->next_adapter_id = std::max(ctx->next_adapter_id, requested_id);
-                ctx->lora_cache_valid = false;
-                ctx->lora_batch_valid = false;
-                return 0;
-            }
-        }
-        TORCH_CHECK(false, "validated dynamic adapter disappeared: ", current_id);
+        auto index_it = std::lower_bound(
+            ctx->adapter_id_index.begin(), ctx->adapter_id_index.end(),
+            current_id,
+            [](const auto& entry, int64_t id) { return entry.first < id; });
+        TORCH_CHECK(index_it != ctx->adapter_id_index.end() &&
+                index_it->first == current_id &&
+                index_it->second == current_index,
+            "validated dynamic adapter disappeared: ", current_id);
+        ctx->adapters[current_index].id = requested_id;
+        index_it->first = requested_id;
+        std::sort(
+            ctx->adapter_id_index.begin(), ctx->adapter_id_index.end(),
+            [](const auto& left, const auto& right) {
+                return left.first < right.first;
+            });
+        ctx->next_adapter_id = std::max(ctx->next_adapter_id, requested_id);
+        ctx->lora_cache_valid = false;
+        ctx->lora_batch_valid = false;
+        return 0;
     } catch (const std::exception& e) {
         fprintf(stderr, "[q36] set_adapter_id FAILED: %s\n", e.what());
         return -1;
@@ -15197,27 +15235,36 @@ int32_t qwen36_remove_lora(void* ctx_ptr, int64_t adapter_id) {
         TORCH_CHECK(ctx && adapter_id > 0,
             "dynamic LoRA removal requires a context and positive adapter ID");
         require_clear_accumulation_for_registry_mutation(ctx);
-        const bool local_found = std::any_of(
-            ctx->adapters.begin(), ctx->adapters.end(),
-            [&](const auto& adapter) { return adapter.id == adapter_id; });
+        const bool index_available = ctx->adapter_id_index_valid &&
+            ctx->adapter_id_index.size() == ctx->adapters.size();
+        size_t canonical_index = 0;
+        const bool local_found = find_canonical_adapter_index(
+            ctx, adapter_id, canonical_index);
         TrainingContext::LoRAAdapter request{};
         request.id = adapter_id;
-        request.rank = -1;
+        request.rank = index_available ? -1 : -2;
         request.optimizer_step = local_found ? 1 : 0;
         request.alpha = 1.0;
         TORCH_CHECK(adapter_registration_phase_matches(
-                ctx, request, true, /*phase=*/4),
+                ctx, request, index_available, /*phase=*/4),
             "dynamic LoRA removal request or registry differs across ranks");
         if (!local_found) return 0;
-        for (auto it = ctx->adapters.begin(); it != ctx->adapters.end(); ++it) {
-            if (it->id == adapter_id) {
-                ctx->adapters.erase(it);
-                ctx->lora_cache_valid = false;
-                ctx->lora_batch_valid = false;
-                return 1;
-            }
+        const auto index_it = std::lower_bound(
+            ctx->adapter_id_index.begin(), ctx->adapter_id_index.end(),
+            adapter_id,
+            [](const auto& entry, int64_t id) { return entry.first < id; });
+        TORCH_CHECK(index_it != ctx->adapter_id_index.end() &&
+                index_it->first == adapter_id &&
+                index_it->second == canonical_index,
+            "validated dynamic adapter disappeared: ", adapter_id);
+        ctx->adapters.erase(ctx->adapters.begin() + canonical_index);
+        ctx->adapter_id_index.erase(index_it);
+        for (auto& entry : ctx->adapter_id_index) {
+            if (entry.second > canonical_index) --entry.second;
         }
-        TORCH_CHECK(false, "validated dynamic adapter disappeared: ", adapter_id);
+        ctx->lora_cache_valid = false;
+        ctx->lora_batch_valid = false;
+        return 1;
     } catch (const std::exception& e) {
         fprintf(stderr, "[q36] remove_lora FAILED: %s\n", e.what());
         return -1;
@@ -15385,20 +15432,19 @@ int32_t qwen36_validate_adapter_steps_v1(
         // before any rank can return.
         validate_adapter_collective_registry(
             ctx, adapter_ids, n_adapters, 0, false, expected_steps);
+        require_canonical_adapter_index(ctx);
         for (int32_t index = 0; index < n_adapters; ++index) {
             TORCH_CHECK(adapter_ids[index] > 0 && expected_steps[index] >= 0,
                 "adapter IDs must be positive and expected steps non-negative");
-            const auto it = std::find_if(
-                ctx->adapters.begin(), ctx->adapters.end(),
-                [&](const auto& adapter) {
-                    return adapter.id == adapter_ids[index];
-                });
-            TORCH_CHECK(it != ctx->adapters.end(),
+            size_t adapter_index = 0;
+            TORCH_CHECK(find_canonical_adapter_index(
+                    ctx, adapter_ids[index], adapter_index),
                 "unknown dynamic adapter ID: ", adapter_ids[index]);
-            TORCH_CHECK(it->optimizer_step == expected_steps[index],
+            const auto& adapter = ctx->adapters[adapter_index];
+            TORCH_CHECK(adapter.optimizer_step == expected_steps[index],
                 "adapter ", adapter_ids[index],
                 " optimizer step conflict: expected ", expected_steps[index],
-                ", actual ", it->optimizer_step);
+                ", actual ", adapter.optimizer_step);
         }
         return 0;
     } catch (const std::exception& e) {
@@ -15531,6 +15577,7 @@ __attribute__((visibility("default"))) int32_t qwen36_eval_multi_lora_selected_v
     std::vector<TrainingContext::LoRAAdapter> selected;
     std::vector<size_t> selected_indexes;
     bool registry_detached = false;
+    bool adapter_id_index_was_valid = false;
     auto restore_registry = [&]() {
         if (!ctx || !registry_detached) return;
         for (size_t i = 0; i < selected.size(); ++i) {
@@ -15538,6 +15585,7 @@ __attribute__((visibility("default"))) int32_t qwen36_eval_multi_lora_selected_v
         }
         ctx->adapters.clear();
         ctx->adapters.swap(original);
+        ctx->adapter_id_index_valid = adapter_id_index_was_valid;
         registry_detached = false;
     };
     try {
@@ -15567,23 +15615,29 @@ __attribute__((visibility("default"))) int32_t qwen36_eval_multi_lora_selected_v
         validate_adapter_collective_registry(
             ctx, adapter_ids, n_adapters, 0, false);
 
-        original.swap(ctx->adapters);
-        registry_detached = true;
+        require_canonical_adapter_index(ctx);
         selected.reserve(n_adapters);
         selected_indexes.reserve(n_adapters);
+        std::vector<uint8_t> requested(ctx->adapters.size(), 0);
         for (int32_t i = 0; i < n_adapters; ++i) {
             TORCH_CHECK(adapter_ids[i] > 0,
                 "selected eval adapter IDs must be positive");
-            auto it = std::find_if(original.begin(), original.end(),
-                [&](const auto& adapter) { return adapter.id == adapter_ids[i]; });
-            TORCH_CHECK(it != original.end(),
+            size_t index = 0;
+            TORCH_CHECK(find_canonical_adapter_index(
+                    ctx, adapter_ids[i], index),
                 "unknown selected eval adapter ID: ", adapter_ids[i]);
-            const size_t index = static_cast<size_t>(it - original.begin());
-            TORCH_CHECK(std::find(selected_indexes.begin(), selected_indexes.end(), index) ==
-                    selected_indexes.end(),
+            TORCH_CHECK(!requested[index],
                 "duplicate selected eval adapter ID: ", adapter_ids[i]);
+            requested[index] = 1;
             selected_indexes.push_back(index);
-            selected.push_back(std::move(*it));
+        }
+        adapter_id_index_was_valid = ctx->adapter_id_index_valid;
+        ctx->adapter_id_index_valid = false;
+        original.swap(ctx->adapters);
+        registry_detached = true;
+        for (int32_t i = 0; i < n_adapters; ++i) {
+            selected.push_back(std::move(
+                original[selected_indexes[static_cast<size_t>(i)]]));
         }
 
         const at::Tensor saved_attention_mask = ctx->attention_mask;
