@@ -366,11 +366,7 @@ impl MultiLoraBatcher {
     /// treats removal from the bounded open-window set as sealing. The
     /// scheduler remains single-consumer, so this only changes when the
     /// existing FIFO job becomes dispatchable.
-    fn wait_for_window(&self, window_id: u64, wait: Duration) {
-        if wait.is_zero() {
-            return;
-        }
-        let deadline = Instant::now() + wait;
+    fn wait_for_window(&self, window_id: u64, deadline: Instant) {
         let mut state = self
             .state
             .lock()
@@ -445,13 +441,17 @@ impl MultiLoraBatcher {
         }
 
         let batcher = self.clone();
-        let wait = if coalescible {
-            self.config.window
-        } else {
-            Duration::ZERO
-        };
+        // Start the batching window at admission. The FIFO dispatcher may still be
+        // running the previous GPU step, and that compute time should consume this
+        // deadline instead of creating another idle batching delay afterwards.
+        let deadline = Instant::now()
+            + if coalescible {
+                self.config.window
+            } else {
+                Duration::ZERO
+            };
         let scheduled = scheduler.submit(move || {
-            batcher.wait_for_window(window_id, wait);
+            batcher.wait_for_window(window_id, deadline);
             batcher.execute_window(window_id, &coordinator);
         });
         if let Err(error) = scheduled {
@@ -2296,9 +2296,10 @@ mod tensor_http_shape_tests {
         multi_lora_capability_v1, multi_lora_source_count, normalized_multi_lora_payload_bytes,
         pack_tensor_slab, parse_binary_multi_lora_request, project_multi_lora_result,
         validate_multi_lora_http_shapes, validate_selected_eval_http_shapes,
-        validate_train_http_shapes, EpDispatchScheduleError, HeaderMap, HeaderValue,
-        MultiLoraBatchConfig, MultiLoraBatchState, MultiLoraBatcher, MultiLoraDispatchRequest,
-        MultiLoraWindow, StatusCode, TensorHttp, MULTI_LORA_CAPABILITY_HEADER,
+        validate_train_http_shapes, EpDispatchScheduleError, EpDispatchScheduler, HeaderMap,
+        HeaderValue, MultiLoraBatchConfig, MultiLoraBatchState, MultiLoraBatcher,
+        MultiLoraDispatchRequest, MultiLoraWindow, StatusCode, TensorHttp,
+        MULTI_LORA_CAPABILITY_HEADER,
     };
 
     fn tensor(shape: &[i64]) -> TensorHttp {
@@ -2684,7 +2685,10 @@ mod tensor_http_shape_tests {
         let waiter = std::thread::spawn(move || {
             let start = std::time::Instant::now();
             started.send(()).unwrap();
-            waiting_batcher.wait_for_window(window_id, config.window);
+            waiting_batcher.wait_for_window(
+                window_id,
+                std::time::Instant::now() + config.window,
+            );
             start.elapsed()
         });
         started_rx.recv().unwrap();
@@ -2723,7 +2727,10 @@ mod tensor_http_shape_tests {
         let waiter = std::thread::spawn(move || {
             let start = std::time::Instant::now();
             started.send(()).unwrap();
-            waiting_batcher.wait_for_window(window_id, config.window);
+            waiting_batcher.wait_for_window(
+                window_id,
+                std::time::Instant::now() + config.window,
+            );
             start.elapsed()
         });
         started_rx.recv().unwrap();
@@ -2803,10 +2810,72 @@ mod tensor_http_shape_tests {
             .push_back(window_id);
 
         let start = std::time::Instant::now();
-        batcher.wait_for_window(window_id, config.window);
+        batcher.wait_for_window(window_id, std::time::Instant::now() + config.window);
         assert!(
             start.elapsed() >= std::time::Duration::from_millis(20),
             "open coalescing window must retain its normal batching deadline"
+        );
+        assert!(batcher.state.lock().unwrap().open_window_ids.is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn coalescing_deadline_overlaps_a_busy_dispatcher() {
+        let config = MultiLoraBatchConfig {
+            window: std::time::Duration::from_millis(40),
+            max_requests: 4,
+            max_open_windows: 2,
+            max_adapters: 4,
+            max_rank_work: 64,
+            max_payload_bytes: usize::MAX,
+        };
+        let batcher = MultiLoraBatcher::new(config);
+        let window_id = 23;
+        batcher
+            .state
+            .lock()
+            .unwrap()
+            .open_window_ids
+            .push_back(window_id);
+
+        let scheduler = EpDispatchScheduler::new(2);
+        let gate = std::sync::Arc::new((
+            std::sync::Mutex::new(false),
+            std::sync::Condvar::new(),
+        ));
+        let job_gate = std::sync::Arc::clone(&gate);
+        let (started, started_rx) = tokio::sync::oneshot::channel();
+        let first = scheduler
+            .submit(move || {
+                let _ = started.send(());
+                let (lock, wake) = &*job_gate;
+                let mut released = lock.lock().unwrap();
+                while !*released {
+                    released = wake.wait(released).unwrap();
+                }
+            })
+            .unwrap();
+        started_rx.await.unwrap();
+
+        let deadline = std::time::Instant::now() + config.window;
+        let waiting_batcher = batcher.clone();
+        let second = scheduler
+            .submit(move || {
+                let start = std::time::Instant::now();
+                waiting_batcher.wait_for_window(window_id, deadline);
+                start.elapsed()
+            })
+            .unwrap();
+
+        tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+        {
+            let (lock, wake) = &*gate;
+            *lock.lock().unwrap() = true;
+            wake.notify_all();
+        }
+        first.await.unwrap();
+        assert!(
+            second.await.unwrap() < std::time::Duration::from_millis(20),
+            "an expired batching deadline must dispatch immediately after the previous GPU job"
         );
         assert!(batcher.state.lock().unwrap().open_window_ids.is_empty());
     }
