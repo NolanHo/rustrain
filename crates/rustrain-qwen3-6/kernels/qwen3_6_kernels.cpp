@@ -257,6 +257,19 @@ extern "C" {
         void* grad_returned, void* grad_assignment_weights,
         int64_t assignments, int64_t hidden, int top_k,
         int dtype, void* stream);
+    void launch_fused_moe_local_permute_forward(
+        const void* received,
+        const int64_t* received_tokens, int64_t token_stride,
+        const int64_t* received_experts, int64_t expert_stride,
+        void* selected, int64_t* selected_tokens, int64_t* sorted_experts,
+        int* counts, int* offsets, int* cursors,
+        int64_t* sorted_to_received,
+        int64_t rows, int64_t hidden, int expert_count,
+        int dtype, void* stream);
+    void launch_fused_moe_local_permute_rows(
+        const void* input, const int64_t* sorted_to_received, void* output,
+        int64_t rows, int64_t hidden, int dtype, bool inverse,
+        void* stream);
 }
 
 /// Fused RMSNorm — single CUDA kernel (replaces 3 ATen ops)
@@ -2018,6 +2031,184 @@ struct Qwen36FusedWeightedUnpermuteFunction
     }
 };
 
+struct Qwen36FusedLocalPermuteFunction
+    : public torch::autograd::Function<Qwen36FusedLocalPermuteFunction> {
+    static int dtype_code(at::ScalarType type) {
+        switch (type) {
+            case at::kBFloat16: return 0;
+            case at::kFloat: return 1;
+            case at::kHalf: return 2;
+            default:
+                TORCH_CHECK(false,
+                    "fused MoE local permutation does not support dtype ",
+                    type);
+        }
+    }
+
+    static std::vector<at::Tensor> forward(
+        torch::autograd::AutogradContext* ctx,
+        at::Tensor received, at::Tensor received_tokens,
+        at::Tensor received_experts, int64_t expert_count) {
+        TORCH_CHECK(received.is_cuda() && received_tokens.is_cuda() &&
+                received_experts.is_cuda(),
+            "fused MoE local permutation expects CUDA tensors");
+        TORCH_CHECK(received.device() == received_tokens.device() &&
+                received.device() == received_experts.device(),
+            "fused MoE local permutation tensors must share one CUDA device");
+        TORCH_CHECK(received.dim() == 2 && received_tokens.dim() == 1 &&
+                received_experts.dim() == 1,
+            "invalid fused MoE local permutation tensor ranks");
+        TORCH_CHECK(received.is_contiguous(),
+            "fused MoE local permutation expects contiguous activations");
+        TORCH_CHECK(received_tokens.scalar_type() == at::kLong &&
+                received_experts.scalar_type() == at::kLong,
+            "fused MoE local permutation expects int64 metadata");
+        TORCH_CHECK(received.size(0) == received_tokens.numel() &&
+                received.size(0) == received_experts.numel(),
+            "fused MoE local permutation row count mismatch");
+        TORCH_CHECK(expert_count > 0 && expert_count <= 1024,
+            "fused MoE local permutation supports 1..1024 local experts");
+        TORCH_CHECK(received.size(0) <= std::numeric_limits<int>::max(),
+            "fused MoE local permutation has too many received rows");
+
+        const int dtype = dtype_code(received.scalar_type());
+        auto selected = at::empty_like(received);
+        auto selected_tokens = at::empty(
+            {received.size(0)}, received_tokens.options());
+        auto sorted_experts = at::empty(
+            {received.size(0)}, received_experts.options());
+        auto int_options = at::TensorOptions()
+            .device(received.device()).dtype(at::kInt);
+        auto counts = at::empty({expert_count}, int_options);
+        auto offsets = at::empty({expert_count}, int_options);
+        auto cursors = at::empty({expert_count}, int_options);
+        auto sorted_to_received = at::empty(
+            {received.size(0)}, received_experts.options());
+        auto stream = c10::cuda::getCurrentCUDAStream(
+            received.device().index()).stream();
+        launch_fused_moe_local_permute_forward(
+            received.data_ptr(), received_tokens.data_ptr<int64_t>(),
+            received_tokens.stride(0), received_experts.data_ptr<int64_t>(),
+            received_experts.stride(0), selected.data_ptr(),
+            selected_tokens.data_ptr<int64_t>(),
+            sorted_experts.data_ptr<int64_t>(), counts.data_ptr<int>(),
+            offsets.data_ptr<int>(), cursors.data_ptr<int>(),
+            sorted_to_received.data_ptr<int64_t>(), received.size(0),
+            received.size(1), static_cast<int>(expert_count), dtype, stream);
+        const auto launch_error = cudaGetLastError();
+        TORCH_CHECK(launch_error == cudaSuccess,
+            "fused MoE local permutation launch failed: ",
+            cudaGetErrorString(launch_error));
+
+        ctx->save_for_backward({received, sorted_to_received});
+        ctx->saved_data["dtype"] = dtype;
+        ctx->saved_data["hidden"] = received.size(1);
+        ctx->mark_non_differentiable(
+            {selected_tokens, sorted_experts, counts, offsets,
+                sorted_to_received});
+        return {selected, selected_tokens, sorted_experts, counts, offsets,
+            sorted_to_received};
+    }
+
+    static std::vector<at::Tensor> backward(
+        torch::autograd::AutogradContext* ctx,
+        std::vector<at::Tensor> grad_output) {
+        auto saved = ctx->get_saved_variables();
+        const auto& received = saved[0];
+        const auto& sorted_to_received = saved[1];
+        if (!grad_output[0].defined()) {
+            return {at::zeros_like(received), at::Tensor(), at::Tensor(),
+                at::Tensor()};
+        }
+        auto grad_selected = grad_output[0].contiguous();
+        auto grad_received = at::empty_like(grad_selected);
+        const int dtype = static_cast<int>(
+            ctx->saved_data["dtype"].toInt());
+        const int64_t hidden = ctx->saved_data["hidden"].toInt();
+        auto stream = c10::cuda::getCurrentCUDAStream(
+            grad_selected.device().index()).stream();
+        launch_fused_moe_local_permute_rows(
+            grad_selected.data_ptr(), sorted_to_received.data_ptr<int64_t>(),
+            grad_received.data_ptr(), sorted_to_received.numel(), hidden,
+            dtype, true, stream);
+        const auto launch_error = cudaGetLastError();
+        TORCH_CHECK(launch_error == cudaSuccess,
+            "fused MoE local permutation backward launch failed: ",
+            cudaGetErrorString(launch_error));
+        return {grad_received, at::Tensor(), at::Tensor(), at::Tensor()};
+    }
+};
+
+struct Qwen36FusedLocalInversePermuteFunction
+    : public torch::autograd::Function<
+          Qwen36FusedLocalInversePermuteFunction> {
+    static at::Tensor forward(torch::autograd::AutogradContext* ctx,
+        at::Tensor sorted_output, at::Tensor sorted_to_received,
+        int64_t dtype) {
+        TORCH_CHECK(sorted_output.is_cuda() &&
+                sorted_to_received.is_cuda() && sorted_output.is_contiguous(),
+            "fused MoE local inverse permutation expects contiguous CUDA "
+            "tensors");
+        TORCH_CHECK(sorted_output.device() == sorted_to_received.device() &&
+                sorted_to_received.is_contiguous(),
+            "fused MoE local inverse permutation tensors must be contiguous "
+            "and share one CUDA device");
+        TORCH_CHECK(sorted_output.dim() == 2 &&
+                sorted_to_received.dim() == 1 &&
+                sorted_to_received.scalar_type() == at::kLong &&
+                sorted_output.size(0) == sorted_to_received.numel(),
+            "invalid fused MoE local inverse permutation tensors");
+        TORCH_CHECK(dtype >= 0 && dtype <= 2 &&
+                dtype == Qwen36FusedLocalPermuteFunction::dtype_code(
+                    sorted_output.scalar_type()),
+            "invalid fused MoE local inverse permutation dtype code");
+        auto output = at::empty_like(sorted_output);
+        auto stream = c10::cuda::getCurrentCUDAStream(
+            sorted_output.device().index()).stream();
+        launch_fused_moe_local_permute_rows(
+            sorted_output.data_ptr(),
+            sorted_to_received.data_ptr<int64_t>(), output.data_ptr(),
+            sorted_output.size(0), sorted_output.size(1),
+            static_cast<int>(dtype), true, stream);
+        const auto launch_error = cudaGetLastError();
+        TORCH_CHECK(launch_error == cudaSuccess,
+            "fused MoE local inverse permutation launch failed: ",
+            cudaGetErrorString(launch_error));
+        ctx->save_for_backward({sorted_output, sorted_to_received});
+        ctx->saved_data["dtype"] = dtype;
+        ctx->saved_data["hidden"] = sorted_output.size(1);
+        return output;
+    }
+
+    static std::vector<at::Tensor> backward(
+        torch::autograd::AutogradContext* ctx,
+        std::vector<at::Tensor> grad_output) {
+        auto saved = ctx->get_saved_variables();
+        const auto& sorted_output = saved[0];
+        const auto& sorted_to_received = saved[1];
+        if (!grad_output[0].defined()) {
+            return {at::zeros_like(sorted_output), at::Tensor(),
+                at::Tensor()};
+        }
+        auto grad_received_order = grad_output[0].contiguous();
+        auto grad_sorted = at::empty_like(grad_received_order);
+        const int dtype = static_cast<int>(
+            ctx->saved_data["dtype"].toInt());
+        const int64_t hidden = ctx->saved_data["hidden"].toInt();
+        auto stream = c10::cuda::getCurrentCUDAStream(
+            grad_received_order.device().index()).stream();
+        launch_fused_moe_local_permute_rows(
+            grad_received_order.data_ptr(),
+            sorted_to_received.data_ptr<int64_t>(), grad_sorted.data_ptr(),
+            sorted_to_received.numel(), hidden, dtype, false, stream);
+        const auto launch_error = cudaGetLastError();
+        TORCH_CHECK(launch_error == cudaSuccess,
+            "fused MoE local inverse permutation backward launch failed: ",
+            cudaGetErrorString(launch_error));
+        return {grad_sorted, at::Tensor(), at::Tensor()};
+    }
+};
+
 struct RoutedExpertLora {
     const at::Tensor* gate_up_a = nullptr;  // [local_experts, rank, hidden]
     const at::Tensor* gate_up_b = nullptr;  // [local_experts, 2*intermediate, rank]
@@ -2150,12 +2341,34 @@ static at::Tensor moe_routed_a2a(
     auto run_local_experts = [&](const at::Tensor& received,
                                  const at::Tensor& received_tokens,
                                  const at::Tensor& received_experts) {
-        auto [sorted_experts, expert_order] = received_experts.sort(0);
-        auto selected = received.index_select(0, expert_order);
-        auto selected_tokens = received_tokens.index_select(0, expert_order);
-        auto counts = at::bincount(
-            sorted_experts, c10::nullopt, expert_count);
-        auto offsets = counts.cumsum(0).to(at::kInt);
+        at::Tensor sorted_experts;
+        at::Tensor expert_order;
+        at::Tensor selected;
+        at::Tensor selected_tokens;
+        at::Tensor counts;
+        at::Tensor offsets;
+        const bool fused_local_permute =
+            env_enabled("QWEN36_MOE_FUSED_LOCAL_PERMUTE") &&
+            expert_count <= 1024;
+        if (fused_local_permute) {
+            auto permutation = Qwen36FusedLocalPermuteFunction::apply(
+                received, received_tokens, received_experts, expert_count);
+            selected = permutation[0];
+            selected_tokens = permutation[1];
+            sorted_experts = permutation[2];
+            counts = permutation[3];
+            offsets = permutation[4];
+            expert_order = permutation[5];
+        } else {
+            auto sorted = received_experts.sort(0);
+            sorted_experts = std::get<0>(sorted);
+            expert_order = std::get<1>(sorted);
+            selected = received.index_select(0, expert_order);
+            selected_tokens = received_tokens.index_select(0, expert_order);
+            counts = at::bincount(
+                sorted_experts, c10::nullopt, expert_count);
+            offsets = counts.cumsum(0).to(at::kInt);
+        }
         auto sorted_output = at::zeros_like(selected);
 
         if (selected.size(0) > 0) {
@@ -2313,8 +2526,13 @@ static at::Tensor moe_routed_a2a(
             sorted_output = expert_out;
         }
 
-        auto local_output = at::zeros_like(received).index_add(
-            0, expert_order, sorted_output);
+        auto local_output = fused_local_permute
+            ? Qwen36FusedLocalInversePermuteFunction::apply(
+                sorted_output, expert_order,
+                Qwen36FusedLocalPermuteFunction::dtype_code(
+                    sorted_output.scalar_type()))
+            : at::zeros_like(received).index_add(
+                0, expert_order, sorted_output);
         // Empty destinations still need activation and parameter graph edges
         // so every rank reaches the same optimizer collectives.
         if (!local_output.requires_grad()) {
@@ -3798,6 +4016,7 @@ static void hash_collective_runtime_environment(AdapterRegistryHash& hash) {
     hash.add_u64(env_enabled("QWEN36_EP_A2A_PACKED", true));
     hash.add_u64(env_enabled("QWEN36_EP_A2A_PACKED_METADATA", true));
     hash.add_u64(env_enabled("QWEN36_MOE_FUSED_UNPERMUTE"));
+    hash.add_u64(env_enabled("QWEN36_MOE_FUSED_LOCAL_PERMUTE"));
     hash.add_u64(env_enabled("QWEN36_DISABLE_GROUPED_MM"));
     hash.add_u64(env_enabled("QWEN36_GROUPED_LORA_SYNC", true));
     hash.add_u64(env_enabled("QWEN36_PACKED_LORA_SYNC", true));

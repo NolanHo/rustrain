@@ -311,6 +311,93 @@ __global__ void moe_weighted_unpermute_backward_kernel(
     }
 }
 
+// GPU counting sort for the receive-side local-expert permutation. The
+// sorted_to_received mapping is the single source of truth for activation and
+// token metadata alignment, and is reused to invert the permutation.
+__global__ void moe_local_expert_histogram_kernel(
+    const int64_t* __restrict__ received_experts,
+    int64_t expert_stride,
+    int* __restrict__ counts,
+    int64_t rows,
+    int expert_count
+) {
+    const int64_t row =
+        static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (row >= rows) return;
+    const int64_t expert = received_experts[row * expert_stride];
+    if (expert >= 0 && expert < expert_count)
+        atomicAdd(counts + expert, 1);
+}
+
+__global__ void moe_local_expert_prefix_kernel(
+    const int* __restrict__ counts,
+    int* __restrict__ offsets,
+    int* __restrict__ cursors,
+    int expert_count
+) {
+    __shared__ int scan[1024];
+    const int tid = threadIdx.x;
+    if (tid < expert_count) scan[tid] = counts[tid];
+
+    for (int distance = 1; distance < expert_count; distance <<= 1) {
+        __syncthreads();
+        const int value = tid < expert_count ? scan[tid] : 0;
+        const int prefix = tid >= distance && tid < expert_count
+            ? scan[tid - distance] : 0;
+        __syncthreads();
+        if (tid < expert_count) scan[tid] = value + prefix;
+    }
+    __syncthreads();
+    if (tid < expert_count) {
+        offsets[tid] = scan[tid];
+        cursors[tid] = tid == 0 ? 0 : scan[tid - 1];
+    }
+}
+
+__global__ void moe_local_expert_scatter_metadata_kernel(
+    const int64_t* __restrict__ received_tokens,
+    int64_t token_stride,
+    const int64_t* __restrict__ received_experts,
+    int64_t expert_stride,
+    int* __restrict__ cursors,
+    int64_t* __restrict__ selected_tokens,
+    int64_t* __restrict__ sorted_experts,
+    int64_t* __restrict__ sorted_to_received,
+    int64_t rows,
+    int expert_count
+) {
+    const int64_t received_row =
+        static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (received_row >= rows) return;
+    const int64_t expert = received_experts[received_row * expert_stride];
+    if (expert < 0 || expert >= expert_count) return;
+    const int sorted_row = atomicAdd(cursors + expert, 1);
+    sorted_to_received[sorted_row] = received_row;
+    selected_tokens[sorted_row] =
+        received_tokens[received_row * token_stride];
+    sorted_experts[sorted_row] = expert;
+}
+
+template <typename T, bool Inverse>
+__global__ void moe_local_permute_rows_kernel(
+    const T* __restrict__ input,
+    const int64_t* __restrict__ sorted_to_received,
+    T* __restrict__ output,
+    int64_t rows,
+    int64_t hidden
+) {
+    const int64_t sorted_row = blockIdx.x;
+    if (sorted_row >= rows) return;
+    const int64_t received_row = sorted_to_received[sorted_row];
+    const int64_t source_row = Inverse ? sorted_row : received_row;
+    const int64_t destination_row = Inverse ? received_row : sorted_row;
+    for (int64_t column = threadIdx.x;
+         column < hidden; column += blockDim.x) {
+        output[destination_row * hidden + column] =
+            input[source_row * hidden + column];
+    }
+}
+
 // ──────────────────────────────────────────────────────────────────────
 // 5. Multi-tensor Fused Adam
 // ──────────────────────────────────────────────────────────────────────
@@ -586,6 +673,113 @@ void launch_fused_moe_weighted_unpermute_backward(
                 static_cast<__half*>(grad_assignment_weights),
                 assignments, hidden, top_k);
             break;
+    }
+}
+
+void launch_fused_moe_local_permute_forward(
+    const void* received,
+    const int64_t* received_tokens, int64_t token_stride,
+    const int64_t* received_experts, int64_t expert_stride,
+    void* selected, int64_t* selected_tokens, int64_t* sorted_experts,
+    int* counts, int* offsets, int* cursors,
+    int64_t* sorted_to_received,
+    int64_t rows, int64_t hidden, int expert_count,
+    int dtype, cudaStream_t stream
+) {
+    constexpr int threads = 256;
+    cudaMemsetAsync(counts, 0, expert_count * sizeof(int), stream);
+    if (rows > 0) {
+        const int blocks = static_cast<int>((rows + threads - 1) / threads);
+        moe_local_expert_histogram_kernel<<<blocks, threads, 0, stream>>>(
+            received_experts, expert_stride, counts, rows, expert_count);
+    }
+    moe_local_expert_prefix_kernel<<<1, 1024, 0, stream>>>(
+        counts, offsets, cursors, expert_count);
+    if (rows <= 0) return;
+
+    const int metadata_blocks = static_cast<int>(
+        (rows + threads - 1) / threads);
+    moe_local_expert_scatter_metadata_kernel<<<
+        metadata_blocks, threads, 0, stream>>>(
+        received_tokens, token_stride, received_experts, expert_stride,
+        cursors, selected_tokens, sorted_experts, sorted_to_received,
+        rows, expert_count);
+    const auto row_blocks = static_cast<unsigned int>(rows);
+    switch (dtype) {
+        case 0:
+            moe_local_permute_rows_kernel<__nv_bfloat16, false><<<
+                row_blocks, threads, 0, stream>>>(
+                static_cast<const __nv_bfloat16*>(received),
+                sorted_to_received, static_cast<__nv_bfloat16*>(selected),
+                rows, hidden);
+            break;
+        case 1:
+            moe_local_permute_rows_kernel<float, false><<<
+                row_blocks, threads, 0, stream>>>(
+                static_cast<const float*>(received), sorted_to_received,
+                static_cast<float*>(selected), rows, hidden);
+            break;
+        case 2:
+            moe_local_permute_rows_kernel<__half, false><<<
+                row_blocks, threads, 0, stream>>>(
+                static_cast<const __half*>(received), sorted_to_received,
+                static_cast<__half*>(selected), rows, hidden);
+            break;
+    }
+}
+
+void launch_fused_moe_local_permute_rows(
+    const void* input, const int64_t* sorted_to_received, void* output,
+    int64_t rows, int64_t hidden, int dtype, bool inverse,
+    cudaStream_t stream
+) {
+    if (rows <= 0) return;
+    constexpr int threads = 256;
+    const auto blocks = static_cast<unsigned int>(rows);
+    if (inverse) {
+        switch (dtype) {
+            case 0:
+                moe_local_permute_rows_kernel<__nv_bfloat16, true><<<
+                    blocks, threads, 0, stream>>>(
+                    static_cast<const __nv_bfloat16*>(input),
+                    sorted_to_received, static_cast<__nv_bfloat16*>(output),
+                    rows, hidden);
+                break;
+            case 1:
+                moe_local_permute_rows_kernel<float, true><<<
+                    blocks, threads, 0, stream>>>(
+                    static_cast<const float*>(input), sorted_to_received,
+                    static_cast<float*>(output), rows, hidden);
+                break;
+            case 2:
+                moe_local_permute_rows_kernel<__half, true><<<
+                    blocks, threads, 0, stream>>>(
+                    static_cast<const __half*>(input), sorted_to_received,
+                    static_cast<__half*>(output), rows, hidden);
+                break;
+        }
+    } else {
+        switch (dtype) {
+            case 0:
+                moe_local_permute_rows_kernel<__nv_bfloat16, false><<<
+                    blocks, threads, 0, stream>>>(
+                    static_cast<const __nv_bfloat16*>(input),
+                    sorted_to_received, static_cast<__nv_bfloat16*>(output),
+                    rows, hidden);
+                break;
+            case 1:
+                moe_local_permute_rows_kernel<float, false><<<
+                    blocks, threads, 0, stream>>>(
+                    static_cast<const float*>(input), sorted_to_received,
+                    static_cast<float*>(output), rows, hidden);
+                break;
+            case 2:
+                moe_local_permute_rows_kernel<__half, false><<<
+                    blocks, threads, 0, stream>>>(
+                    static_cast<const __half*>(input), sorted_to_received,
+                    static_cast<__half*>(output), rows, hidden);
+                break;
+        }
     }
 }
 
