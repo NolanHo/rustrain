@@ -125,6 +125,13 @@ The bounded multi-bucket scheduler passed 53/53 server tests in both the local
 ABI1 environment and on H20, including interleaved-layout retention, deadline,
 capacity, binary ingress, and rank-work admission cases.
 
+An opt-in asynchronous A2A metadata prototype was tested against the
+compact-count path on H20. EP4 `H=4096, I=8192, S=128` regressed p50 from
+`5.6632 ms` to `5.8951 ms`; EP8 repeated runs were effectively tied at p50
+(`5.6856` vs `5.6524 ms`) while async p95 worsened to `7.1466` from `5.9853 ms`.
+The uncommitted prototype was removed; `QWEN36_EP_A2A_ASYNC_METADATA` is not a
+supported runtime flag.
+
 The `/train_multi_binary` endpoint accepts version-1 `RLM1` requests with a
 56-byte header, adapter IDs/optional expected steps, and three contiguous
 little-endian int64 tensor sections. It validates exact `[batch, seq]` geometry,
