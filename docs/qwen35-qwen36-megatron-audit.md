@@ -32,7 +32,7 @@
 | pipeline parallel | 已实现受限 non-interleaved 子集 | ABI27 stage-local ownership 加上任意 `PP_SIZE>=2` 的固定 shape、单 chunk 1F1B 窗口。新增 opt-in dynamic-LoRA flag：共享 batch 行按注册 tenant 展开，反向恢复 per-tenant token numerator，并复用动态归一化/clip/事务 Adam finalizer；selected tenant 的 ordered request identity 现在在 TP/EP/DP/CP/PP 轴统一校验，并提供 per-tenant loss-report ABI；server 可通过 `QWEN36_PP_MICROBATCHES` 将 `[tenant, seq]` 行批次拆成真实多微批次 1F1B。H20 ABI1 PP2 fused-MLP dynamic smoke 已通过，包含 runtime mismatch、异构 rank 两 tenant/两 microbatch 和独立 loss/Adam 状态。dynamic window 在窗口期间固定 heterogeneous padding，后续本地 shape/mask/tick 错误用 selected-row contract-shape dummy 激活完成固定 P2P，并在 finish 做全 rank fail-closed consensus、禁止 optimizer commit。H20 PP2/PP3 `pp-train-smoke` 均通过固定 LoRA 的正常 loss/gradient/Adam parity、late shape+phase failure 和 divergent-target negative case。仍无 MTP/aux、CP、interleaved/chunked schedule 和 PP-aware reshard |
 | context parallel | 已实现受限 GDN CP2 子集 | 仅 `CP_SIZE=2, TP=EP=DP=PP=1` 的 dense GDN；支持 fixed 和 grouped selected dynamic LoRA、序列/头置换、loss gather 与梯度 reduction，拒绝 MTP、aux loss、sequence chunk 和非 grouped dynamic sync。full attention、ring CP、CP4 及多轴组合仍 fail-closed |
 | distributed checkpoint | 已实现子集 | v5 记录 rank order、完整五维坐标、TP/EP 多轴 placement、fused gate/up segments 及 fixed/dynamic slot identity；任意 multi-rank 拓扑使用 rank 目录。compact receipt 将每 rank preflight 限制为 `O(world_size)` 小 metadata + `O(local state)`；CLI/server 共享 same-topology restore 和标准 PEFT merge。server save/load 使用全 rank prepare/validate/commit-or-abort，load 通过 no-sync shadow context 保证失败不改 live state；fresh destination 以 `RENAME_NOREPLACE` 原子可见。v3/v4 及旧 digest-v5 保持只读兼容；可覆盖 generation/LATEST、断电级 durability、跨 topology reshard 和 PP/CP 未实现 |
-| server tensor transport | 已实现 IPC 子集 | ABI22 parent/worker 共享 64-byte aligned binary slab 与 compact JSON descriptor；worker 不再反序列化三份 `Vec<i64>` 或在 Rust 热路径构造 `tch::Tensor`。普通 tensor HTTP routes 在 decode 前只允许一个 in-flight 请求，忙时快速返回 `429`；`/train_multi` 允许有界并发 admission，并仅对显式 `allow_aggregate_loss=true` 或 `X-Rustrain-Multi-LoRA-Capability: v1` 协商的兼容请求执行短窗口 GPU coalescing，响应声明 capability version 和 per-adapter result contract。普通控制面和 checkpoint transaction 使用 bounded FIFO 单消费者 scheduler（默认队列 32，可由 `RUSTRAIN_EP_DISPATCH_QUEUE_CAPACITY` 调整），每个 accepted job 在 `spawn_blocking` 上串行执行。HTTP ingress 仍为 JSON/base64，pinned staging、异步 H2D 和 raw binary endpoint 未实现 |
+| server tensor transport | 已实现 IPC 子集 | ABI22 parent/worker 共享 64-byte aligned binary slab 与 compact JSON descriptor；worker 不再反序列化三份 `Vec<i64>` 或在 Rust 热路径构造 `tch::Tensor`。普通 tensor HTTP routes 在 decode 前只允许一个 in-flight 请求，忙时快速返回 `429`；`/train_multi` 允许有界并发 admission，并仅对显式 `allow_aggregate_loss=true` 或 `X-Rustrain-Multi-LoRA-Capability: v1` 协商的兼容请求执行短窗口 GPU coalescing，响应声明 capability version 和 per-adapter result contract。新增 `/train_multi_binary` 固定版本 little-endian wire，直接解析 int64 tensor sections 后写入 IPC slab，绕过 base64；普通控制面和 checkpoint transaction 使用 bounded FIFO 单消费者 scheduler（默认队列 32，可由 `RUSTRAIN_EP_DISPATCH_QUEUE_CAPACITY` 调整），每个 accepted job 在 `spawn_blocking` 上串行执行。仍缺 pinned staging、异步 H2D 和跨请求 GPU/HTTP overlap |
 
 ## 与 Megatron-LM 的关键差距
 
@@ -115,6 +115,14 @@ coordinator verifies rank-consistent report values. The coalescer is capped at
 2048 adapters for the fixed 256 KiB result slot; an oversized serialized result
 is replaced by a compact error and still signals the waiting parent. This is a
 scheduling/transport optimization, not PP/CP or DeepEP communication overlap.
+
+The `/train_multi_binary` endpoint accepts version-1 `RLM1` requests with a
+56-byte header, adapter IDs/optional expected steps, and three contiguous
+little-endian int64 tensor sections. It validates exact `[batch, seq]` geometry,
+alignment, counts, and trailing bytes before dispatching the same coalescer and
+native ABI as JSON requests. This removes base64 expansion and JSON tensor
+materialization from the ingress path; the IPC worker still receives the same
+validated slab contract.
 
 Variable-split A2A also has an opt-in compact count transfer. With
 `QWEN36_EP_A2A_COMPACT_COUNTS=1` (enabled by default for communicator worlds

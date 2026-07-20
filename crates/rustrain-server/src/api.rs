@@ -1,6 +1,7 @@
 //! HTTP API (axum) — RESTful endpoints for training session management.
 
 use axum::{
+    body::Bytes,
     extract::DefaultBodyLimit,
     extract::Request,
     extract::{Path, State},
@@ -699,6 +700,213 @@ struct TrainMultiLoraHttp {
     expected_steps: Vec<u64>,
     #[serde(default)]
     allow_aggregate_loss: bool,
+}
+
+const MULTI_LORA_BINARY_MAGIC: [u8; 4] = *b"RLM1";
+const MULTI_LORA_BINARY_VERSION: u16 = 1;
+const MULTI_LORA_BINARY_HEADER_BYTES: usize = 56;
+
+struct BinaryMultiLoraRequest {
+    tensors: rustrain_ipc::TensorSlabRef,
+    payload: Vec<u8>,
+    batch_size: usize,
+    seq_len: usize,
+    n_total: i32,
+    lora_rank: i32,
+    adapter_ids: Vec<i64>,
+    expected_steps: Vec<u64>,
+}
+
+fn read_binary_u16(bytes: &[u8], offset: &mut usize) -> Result<u16, String> {
+    let end = offset
+        .checked_add(2)
+        .ok_or_else(|| "binary header offset overflowed".to_string())?;
+    let value = bytes
+        .get(*offset..end)
+        .ok_or_else(|| "binary multi-LoRA header is truncated".to_string())?;
+    *offset = end;
+    Ok(u16::from_le_bytes([value[0], value[1]]))
+}
+
+fn read_binary_u32(bytes: &[u8], offset: &mut usize) -> Result<u32, String> {
+    let end = offset
+        .checked_add(4)
+        .ok_or_else(|| "binary header offset overflowed".to_string())?;
+    let value = bytes
+        .get(*offset..end)
+        .ok_or_else(|| "binary multi-LoRA header is truncated".to_string())?;
+    *offset = end;
+    Ok(u32::from_le_bytes(value.try_into().unwrap()))
+}
+
+fn read_binary_i32(bytes: &[u8], offset: &mut usize) -> Result<i32, String> {
+    Ok(read_binary_u32(bytes, offset)? as i32)
+}
+
+fn read_binary_u64(bytes: &[u8], offset: &mut usize) -> Result<u64, String> {
+    let end = offset
+        .checked_add(8)
+        .ok_or_else(|| "binary header offset overflowed".to_string())?;
+    let value = bytes
+        .get(*offset..end)
+        .ok_or_else(|| "binary multi-LoRA header is truncated".to_string())?;
+    *offset = end;
+    Ok(u64::from_le_bytes(value.try_into().unwrap()))
+}
+
+fn read_binary_i64_vec(
+    bytes: &[u8],
+    offset: &mut usize,
+    count: usize,
+    label: &str,
+) -> Result<Vec<i64>, String> {
+    let byte_count = count
+        .checked_mul(std::mem::size_of::<i64>())
+        .ok_or_else(|| format!("binary {label} count overflowed"))?;
+    let end = offset
+        .checked_add(byte_count)
+        .ok_or_else(|| format!("binary {label} offset overflowed"))?;
+    let value = bytes
+        .get(*offset..end)
+        .ok_or_else(|| format!("binary {label} section is truncated"))?;
+    *offset = end;
+    value
+        .chunks_exact(8)
+        .map(|chunk| Ok(i64::from_le_bytes(chunk.try_into().unwrap())))
+        .collect()
+}
+
+fn parse_binary_multi_lora_request(bytes: &[u8]) -> Result<BinaryMultiLoraRequest, String> {
+    if bytes.len() < MULTI_LORA_BINARY_HEADER_BYTES {
+        return Err("binary multi-LoRA request is shorter than its header".to_string());
+    }
+    if bytes[..4] != MULTI_LORA_BINARY_MAGIC {
+        return Err("binary multi-LoRA request has an invalid magic".to_string());
+    }
+    let mut offset = 4;
+    let version = read_binary_u16(bytes, &mut offset)?;
+    let flags = read_binary_u16(bytes, &mut offset)?;
+    if version != MULTI_LORA_BINARY_VERSION {
+        return Err(format!(
+            "unsupported binary multi-LoRA version {version}, expected {MULTI_LORA_BINARY_VERSION}"
+        ));
+    }
+    if flags != 0 {
+        return Err("binary multi-LoRA request contains unsupported flags".to_string());
+    }
+    let batch_size = usize::try_from(read_binary_u32(bytes, &mut offset)?)
+        .map_err(|_| "binary batch size does not fit usize".to_string())?;
+    let seq_len = usize::try_from(read_binary_u32(bytes, &mut offset)?)
+        .map_err(|_| "binary sequence length does not fit usize".to_string())?;
+    let n_total = read_binary_i32(bytes, &mut offset)?;
+    let lora_rank = read_binary_i32(bytes, &mut offset)?;
+    let adapter_count = usize::try_from(read_binary_u32(bytes, &mut offset)?)
+        .map_err(|_| "binary adapter count does not fit usize".to_string())?;
+    let expected_count = usize::try_from(read_binary_u32(bytes, &mut offset)?)
+        .map_err(|_| "binary expected-step count does not fit usize".to_string())?;
+    let input_bytes = usize::try_from(read_binary_u64(bytes, &mut offset)?)
+        .map_err(|_| "binary input length does not fit usize".to_string())?;
+    let target_bytes = usize::try_from(read_binary_u64(bytes, &mut offset)?)
+        .map_err(|_| "binary target length does not fit usize".to_string())?;
+    let attention_bytes = usize::try_from(read_binary_u64(bytes, &mut offset)?)
+        .map_err(|_| "binary attention length does not fit usize".to_string())?;
+    if offset != MULTI_LORA_BINARY_HEADER_BYTES {
+        return Err("binary multi-LoRA header size mismatch".to_string());
+    }
+    if batch_size == 0 || seq_len <= 1 || n_total <= 0 || lora_rank <= 0 {
+        return Err("binary multi-LoRA dimensions and counts must be positive".to_string());
+    }
+    let n_total_usize = usize::try_from(n_total)
+        .map_err(|_| "binary adapter count does not fit usize".to_string())?;
+    if adapter_count != n_total_usize {
+        return Err(format!(
+            "binary adapter count {adapter_count} does not match n_total {n_total}"
+        ));
+    }
+    if expected_count != 0 && expected_count != n_total_usize {
+        return Err("binary expected-step count must be zero or n_total".to_string());
+    }
+    let elements = batch_size
+        .checked_mul(seq_len)
+        .ok_or_else(|| "binary tensor element count overflowed".to_string())?;
+    let expected_tensor_bytes = elements
+        .checked_mul(std::mem::size_of::<i64>())
+        .ok_or_else(|| "binary tensor byte count overflowed".to_string())?;
+    if input_bytes != expected_tensor_bytes
+        || target_bytes != expected_tensor_bytes
+        || attention_bytes != expected_tensor_bytes
+    {
+        return Err(format!(
+            "binary tensor lengths must all equal {expected_tensor_bytes}"
+        ));
+    }
+    let adapter_ids = read_binary_i64_vec(bytes, &mut offset, n_total_usize, "adapter IDs")?;
+    let expected_steps = if expected_count == 0 {
+        Vec::new()
+    } else {
+        let values = read_binary_i64_vec(bytes, &mut offset, expected_count, "expected steps")?;
+        values
+            .into_iter()
+            .map(|value| {
+                u64::try_from(value)
+                    .map_err(|_| "binary expected steps must be non-negative".to_string())
+            })
+            .collect::<Result<Vec<_>, _>>()?
+    };
+    let tensor_sections = [input_bytes, target_bytes, attention_bytes];
+    let mut payload = Vec::with_capacity(
+        tensor_sections
+            .iter()
+            .try_fold(0usize, |total, size| total.checked_add(*size))
+            .and_then(|total| total.checked_add(2 * (rustrain_ipc::TENSOR_SPAN_ALIGNMENT - 1)))
+            .ok_or_else(|| "binary tensor slab capacity overflowed".to_string())?,
+    );
+    let mut spans = Vec::with_capacity(3);
+    for section_size in tensor_sections {
+        let aligned = payload
+            .len()
+            .checked_add(rustrain_ipc::TENSOR_SPAN_ALIGNMENT - 1)
+            .map(|value| value & !(rustrain_ipc::TENSOR_SPAN_ALIGNMENT - 1))
+            .ok_or_else(|| "binary tensor slab alignment overflowed".to_string())?;
+        payload.resize(aligned, 0);
+        let start = offset;
+        let end = start
+            .checked_add(section_size)
+            .ok_or_else(|| "binary tensor section offset overflowed".to_string())?;
+        payload.extend_from_slice(
+            bytes
+                .get(start..end)
+                .ok_or_else(|| "binary tensor section is truncated".to_string())?,
+        );
+        offset = end;
+        spans.push(rustrain_ipc::TensorSpan {
+            offset_bytes: u64::try_from(aligned)
+                .map_err(|_| "binary tensor span offset exceeds u64".to_string())?,
+            len_bytes: u64::try_from(section_size)
+                .map_err(|_| "binary tensor span length exceeds u64".to_string())?,
+        });
+    }
+    if offset != bytes.len() {
+        return Err("binary multi-LoRA request has trailing bytes".to_string());
+    }
+    let tensors = rustrain_ipc::TensorSlabRef {
+        input_ids: spans[0],
+        target_mask: spans[1],
+        attention_mask: spans[2],
+        batch_size,
+        seq_len,
+    };
+    tensors.validate(payload.len())?;
+    Ok(BinaryMultiLoraRequest {
+        tensors,
+        payload,
+        batch_size,
+        seq_len,
+        n_total,
+        lora_rank,
+        adapter_ids,
+        expected_steps,
+    })
 }
 #[derive(Serialize)]
 struct TrainStepResponse {
@@ -1504,6 +1712,10 @@ pub fn ep_router(state: Arc<EpAppState>) -> Router {
         ));
     let multi_lora_route = Router::new()
         .route("/v1/sessions/{id}/train_multi", post(ep_train_multi_lora))
+        .route(
+            "/v1/sessions/{id}/train_multi_binary",
+            post(ep_train_multi_lora_binary),
+        )
         .route_layer(middleware::from_fn_with_state(
             Arc::new(Semaphore::new(batch_config.max_requests)),
             ep_tensor_admission,
@@ -1774,41 +1986,95 @@ async fn ep_train_multi_lora(
         seq_len,
     )
     .map_err(|e| err_resp(&e))?;
-    if !req.adapter_ids.is_empty() {
-        if req.adapter_ids.len() != req.n_total as usize {
+    submit_ep_multi_lora(
+        state,
+        id,
+        headers,
+        tensors,
+        payload,
+        batch_size,
+        seq_len,
+        req.n_total,
+        req.lora_rank,
+        req.adapter_ids,
+        req.expected_steps,
+        req.allow_aggregate_loss,
+    )
+    .await
+}
+
+async fn ep_train_multi_lora_binary(
+    State(state): State<Arc<EpRouterState>>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Json<TrainMultiLoraResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let request = parse_binary_multi_lora_request(&body).map_err(|e| err_resp(&e))?;
+    crate::ep::validate_multi_lora_global_batch_size(
+        request.batch_size,
+        request.n_total,
+        state.world_size,
+    )
+    .map_err(|error| err_resp(&error))?;
+    submit_ep_multi_lora(
+        state,
+        id,
+        headers,
+        request.tensors,
+        request.payload,
+        request.batch_size,
+        request.seq_len,
+        request.n_total,
+        request.lora_rank,
+        request.adapter_ids,
+        request.expected_steps,
+        false,
+    )
+    .await
+}
+
+async fn submit_ep_multi_lora(
+    state: Arc<EpRouterState>,
+    id: String,
+    headers: HeaderMap,
+    tensors: rustrain_ipc::TensorSlabRef,
+    payload: Vec<u8>,
+    batch_size: usize,
+    seq_len: usize,
+    n_total: i32,
+    lora_rank: i32,
+    adapter_ids: Vec<i64>,
+    expected_steps: Vec<u64>,
+    allow_aggregate_loss: bool,
+) -> Result<Json<TrainMultiLoraResponse>, (StatusCode, Json<ErrorResponse>)> {
+    if !adapter_ids.is_empty() {
+        if adapter_ids.len() != n_total as usize {
             return Err(err_resp(&format!(
                 "adapter_ids length {} must match n_total={}",
-                req.adapter_ids.len(),
-                req.n_total
+                adapter_ids.len(),
+                n_total
             )));
         }
-        if req.adapter_ids.iter().any(|id| *id <= 0) {
+        if adapter_ids.iter().any(|id| *id <= 0) {
             return Err(err_resp("adapter_ids must contain only positive IDs"));
         }
-        if req
-            .adapter_ids
-            .iter()
-            .copied()
-            .collect::<HashSet<_>>()
-            .len()
-            != req.adapter_ids.len()
-        {
+        if adapter_ids.iter().copied().collect::<HashSet<_>>().len() != adapter_ids.len() {
             return Err(err_resp("adapter_ids must not contain duplicates"));
         }
-        if !req.expected_steps.is_empty() && req.expected_steps.len() != req.adapter_ids.len() {
+        if !expected_steps.is_empty() && expected_steps.len() != adapter_ids.len() {
             return Err(err_resp(&format!(
                 "expected_steps length {} must match adapter_ids length {}",
-                req.expected_steps.len(),
-                req.adapter_ids.len()
+                expected_steps.len(),
+                adapter_ids.len()
             )));
         }
-    } else if !req.expected_steps.is_empty() {
+    } else if !expected_steps.is_empty() {
         return Err(err_resp("expected_steps requires adapter_ids"));
     }
-    let source_count = multi_lora_source_count(batch_size, req.n_total as usize)
-        .map_err(|error| err_resp(&error))?;
+    let source_count =
+        multi_lora_source_count(batch_size, n_total as usize).map_err(|error| err_resp(&error))?;
     let normalized_payload_bytes =
-        normalized_multi_lora_payload_bytes(seq_len, req.n_total as usize, source_count)
+        normalized_multi_lora_payload_bytes(seq_len, n_total as usize, source_count)
             .map_err(|error| err_resp(&error))?;
     if !state.coordinator.is_healthy() {
         return Err(ep_dispatch_unavailable("EP coordinator is unavailable"));
@@ -1818,16 +2084,16 @@ async fn ep_train_multi_lora(
         session_id: id,
         tensors,
         payload,
-        n_total: req.n_total as usize,
-        lora_rank: req.lora_rank,
-        adapter_ids: req.adapter_ids,
-        expected_steps: req.expected_steps,
+        n_total: n_total as usize,
+        lora_rank,
+        adapter_ids,
+        expected_steps,
         source_count,
         normalized_payload_bytes,
         // Capability v1 means the client understands per-adapter losses,
         // optimizer steps, and the explicit coalesced loss scope returned
         // below. Keep the body flag as a backwards-compatible override.
-        allow_aggregate_loss: req.allow_aggregate_loss || multi_lora_capability_v1(&headers),
+        allow_aggregate_loss: allow_aggregate_loss || multi_lora_capability_v1(&headers),
         response,
     };
     {
@@ -1962,10 +2228,11 @@ mod tensor_http_shape_tests {
     use super::{
         build_multi_lora_window_payload, decode_int64_bytes, ep_dispatch_schedule_error,
         multi_lora_capability_v1, multi_lora_source_count, normalized_multi_lora_payload_bytes,
-        pack_tensor_slab, project_multi_lora_result, validate_multi_lora_http_shapes,
-        validate_selected_eval_http_shapes, validate_train_http_shapes, EpDispatchScheduleError,
-        HeaderMap, HeaderValue, MultiLoraBatchConfig, MultiLoraBatcher, MultiLoraDispatchRequest,
-        MultiLoraWindow, StatusCode, TensorHttp, MULTI_LORA_CAPABILITY_HEADER,
+        pack_tensor_slab, parse_binary_multi_lora_request, project_multi_lora_result,
+        validate_multi_lora_http_shapes, validate_selected_eval_http_shapes,
+        validate_train_http_shapes, EpDispatchScheduleError, HeaderMap, HeaderValue,
+        MultiLoraBatchConfig, MultiLoraBatcher, MultiLoraDispatchRequest, MultiLoraWindow,
+        StatusCode, TensorHttp, MULTI_LORA_CAPABILITY_HEADER,
     };
 
     fn tensor(shape: &[i64]) -> TensorHttp {
@@ -2066,6 +2333,49 @@ mod tensor_http_shape_tests {
             HeaderValue::from_static("v10"),
         );
         assert!(!multi_lora_capability_v1(&headers));
+    }
+
+    #[test]
+    fn binary_multi_lora_request_parses_wire_sections_without_base64() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"RLM1");
+        bytes.extend_from_slice(&1u16.to_le_bytes());
+        bytes.extend_from_slice(&0u16.to_le_bytes());
+        bytes.extend_from_slice(&2u32.to_le_bytes()); // batch
+        bytes.extend_from_slice(&2u32.to_le_bytes()); // sequence
+        bytes.extend_from_slice(&1u32.to_le_bytes()); // n_total
+        bytes.extend_from_slice(&4i32.to_le_bytes()); // LoRA rank
+        bytes.extend_from_slice(&1u32.to_le_bytes()); // adapter count
+        bytes.extend_from_slice(&1u32.to_le_bytes()); // expected-step count
+        for _ in 0..3 {
+            bytes.extend_from_slice(&32u64.to_le_bytes());
+        }
+        bytes.extend_from_slice(&7i64.to_le_bytes());
+        bytes.extend_from_slice(&3i64.to_le_bytes());
+        for value in 0i64..12 {
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        let request = parse_binary_multi_lora_request(&bytes).unwrap();
+        assert_eq!(request.batch_size, 2);
+        assert_eq!(request.seq_len, 2);
+        assert_eq!(request.adapter_ids, vec![7]);
+        assert_eq!(request.expected_steps, vec![3]);
+        assert_eq!(request.payload.len(), 160);
+        assert_eq!(request.tensors.input_ids.len_bytes, 32);
+        assert_eq!(request.tensors.target_mask.len_bytes, 32);
+        assert_eq!(request.tensors.attention_mask.len_bytes, 32);
+        request.tensors.validate(request.payload.len()).unwrap();
+    }
+
+    #[test]
+    fn binary_multi_lora_request_rejects_trailing_or_invalid_sections() {
+        let mut bytes = b"RLM1".to_vec();
+        bytes.extend_from_slice(&1u16.to_le_bytes());
+        bytes.extend_from_slice(&0u16.to_le_bytes());
+        bytes.extend_from_slice(&[0; 48]);
+        assert!(parse_binary_multi_lora_request(&bytes).is_err());
+        bytes[0] = b'X';
+        assert!(parse_binary_multi_lora_request(&bytes).is_err());
     }
 
     #[test]
