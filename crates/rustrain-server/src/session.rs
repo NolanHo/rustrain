@@ -1870,6 +1870,8 @@ impl TrainingSession for Qwen36Session {
                     .filter(|slot| slot.active)
                     .map(|slot| checkpoint::lora_tp_shard_layout(slot.module, &runtime_config))
                     .collect::<Vec<_>>();
+                let optimizer_step = u64::try_from(ctx.get_adapter_step_count(adapter_id)?)
+                    .context("native dynamic adapter optimizer step is negative")?;
                 let mut dynamic_a = Vec::new();
                 let mut dynamic_b = Vec::new();
                 let mut dynamic_m = Vec::new();
@@ -1904,70 +1906,70 @@ impl TrainingSession for Qwen36Session {
                             )
                         })?,
                     );
-                    // Keep one m/v entry for each A and B tensor, in slot order.
-                    dynamic_m.push(
-                        ctx.get_adapter_optimizer_tensor(
-                            adapter_id,
-                            slot.layer as i64,
-                            module,
-                            false,
-                            false,
-                        )
-                        .with_context(|| {
-                            format!(
-                                "dynamic LoRA m_a is missing: adapter={adapter_id} layer={} module={module}",
-                                slot.layer
+                    if optimizer_step > 0 {
+                        // Keep one m/v entry for each A and B tensor, in slot order.
+                        dynamic_m.push(
+                            ctx.get_adapter_optimizer_tensor(
+                                adapter_id,
+                                slot.layer as i64,
+                                module,
+                                false,
+                                false,
                             )
-                        })?,
-                    );
-                    dynamic_m.push(
-                        ctx.get_adapter_optimizer_tensor(
-                            adapter_id,
-                            slot.layer as i64,
-                            module,
-                            true,
-                            false,
-                        )
-                        .with_context(|| {
-                            format!(
-                                "dynamic LoRA m_b is missing: adapter={adapter_id} layer={} module={module}",
-                                slot.layer
+                            .with_context(|| {
+                                format!(
+                                    "dynamic LoRA m_a is missing: adapter={adapter_id} layer={} module={module}",
+                                    slot.layer
+                                )
+                            })?,
+                        );
+                        dynamic_m.push(
+                            ctx.get_adapter_optimizer_tensor(
+                                adapter_id,
+                                slot.layer as i64,
+                                module,
+                                true,
+                                false,
                             )
-                        })?,
-                    );
-                    dynamic_v.push(
-                        ctx.get_adapter_optimizer_tensor(
-                            adapter_id,
-                            slot.layer as i64,
-                            module,
-                            false,
-                            true,
-                        )
-                        .with_context(|| {
-                            format!(
-                                "dynamic LoRA v_a is missing: adapter={adapter_id} layer={} module={module}",
-                                slot.layer
+                            .with_context(|| {
+                                format!(
+                                    "dynamic LoRA m_b is missing: adapter={adapter_id} layer={} module={module}",
+                                    slot.layer
+                                )
+                            })?,
+                        );
+                        dynamic_v.push(
+                            ctx.get_adapter_optimizer_tensor(
+                                adapter_id,
+                                slot.layer as i64,
+                                module,
+                                false,
+                                true,
                             )
-                        })?,
-                    );
-                    dynamic_v.push(
-                        ctx.get_adapter_optimizer_tensor(
-                            adapter_id,
-                            slot.layer as i64,
-                            module,
-                            true,
-                            true,
-                        )
-                        .with_context(|| {
-                            format!(
-                                "dynamic LoRA v_b is missing: adapter={adapter_id} layer={} module={module}",
-                                slot.layer
+                            .with_context(|| {
+                                format!(
+                                    "dynamic LoRA v_a is missing: adapter={adapter_id} layer={} module={module}",
+                                    slot.layer
+                                )
+                            })?,
+                        );
+                        dynamic_v.push(
+                            ctx.get_adapter_optimizer_tensor(
+                                adapter_id,
+                                slot.layer as i64,
+                                module,
+                                true,
+                                true,
                             )
-                        })?,
-                    );
+                            .with_context(|| {
+                                format!(
+                                    "dynamic LoRA v_b is missing: adapter={adapter_id} layer={} module={module}",
+                                    slot.layer
+                                )
+                            })?,
+                        );
+                    }
                 }
-                let optimizer_step = u64::try_from(ctx.get_adapter_step_count(adapter_id)?)
-                    .context("native dynamic adapter optimizer step is negative")?;
                 let optimizer = self
                     .dynamic_lora_optimizer_configs
                     .get(&adapter_id)
@@ -1980,12 +1982,9 @@ impl TrainingSession for Qwen36Session {
                         alpha: lora_config.alpha,
                         optimizer_step,
                         optimizer_lr: Some(optimizer.lr),
-                        optimizer_beta1: supports_complete_dynamic_adam
-                            .then_some(optimizer.beta1),
-                        optimizer_beta2: supports_complete_dynamic_adam
-                            .then_some(optimizer.beta2),
-                        optimizer_eps: supports_complete_dynamic_adam
-                            .then_some(optimizer.eps),
+                        optimizer_beta1: supports_complete_dynamic_adam.then_some(optimizer.beta1),
+                        optimizer_beta2: supports_complete_dynamic_adam.then_some(optimizer.beta2),
+                        optimizer_eps: supports_complete_dynamic_adam.then_some(optimizer.eps),
                         target_layers: lora_config.target_layers.clone(),
                         target_modules: lora_config
                             .target_modules
@@ -2269,13 +2268,19 @@ impl TrainingSession for Qwen36Session {
                 .into_iter()
                 .filter(|slot| slot.active)
                 .count();
-            let expected_optimizer_count = active_slots.saturating_mul(2);
+            let full_optimizer_count = active_slots.saturating_mul(2);
+            let optimizer_count_valid = if dynamic.manifest.optimizer_step == 0 {
+                dynamic.manifest.optimizer_count == 0
+                    || dynamic.manifest.optimizer_count == full_optimizer_count
+            } else {
+                dynamic.manifest.optimizer_count == full_optimizer_count
+            };
             if dynamic.lora_a.len() != active_slots
                 || dynamic.lora_b.len() != active_slots
-                || dynamic.adam_m.len() != expected_optimizer_count
-                || dynamic.adam_v.len() != expected_optimizer_count
+                || dynamic.adam_m.len() != dynamic.manifest.optimizer_count
+                || dynamic.adam_v.len() != dynamic.manifest.optimizer_count
                 || manifest.parameter_count != active_slots
-                || manifest.optimizer_count != expected_optimizer_count
+                || !optimizer_count_valid
             {
                 bail!(
                     "dynamic adapter {} tensor count does not match its runtime slot signature",
@@ -2363,12 +2368,14 @@ impl TrainingSession for Qwen36Session {
                         rustrain_qwen3_6::lora::native_lora_slots(&runtime_config, &lora_config);
                     let slots = stage_lora_slots(&global_slots, &stage);
                     let mut optimizer_index = 0usize;
+                    let restore_optimizer = dynamic.manifest.optimizer_count != 0;
                     for (slot_index, slot) in slots.iter().filter(|slot| slot.active).enumerate() {
                         let module = slot.module.cpp_name();
                         if slot_index >= dynamic.lora_a.len()
                             || slot_index >= dynamic.lora_b.len()
-                            || optimizer_index + 1 >= dynamic.adam_m.len()
-                            || optimizer_index + 1 >= dynamic.adam_v.len()
+                            || (restore_optimizer
+                                && (optimizer_index + 1 >= dynamic.adam_m.len()
+                                    || optimizer_index + 1 >= dynamic.adam_v.len()))
                         {
                             bail!(
                                 "dynamic adapter {} tensor count mismatch",
@@ -2390,39 +2397,41 @@ impl TrainingSession for Qwen36Session {
                             true,
                             &dynamic.lora_b[slot_index],
                         )?;
-                        ctx.set_adapter_optimizer_tensor(
-                            adapter_id,
-                            slot.layer as i64,
-                            module,
-                            false,
-                            false,
-                            &dynamic.adam_m[optimizer_index],
-                        )?;
-                        ctx.set_adapter_optimizer_tensor(
-                            adapter_id,
-                            slot.layer as i64,
-                            module,
-                            true,
-                            false,
-                            &dynamic.adam_m[optimizer_index + 1],
-                        )?;
-                        ctx.set_adapter_optimizer_tensor(
-                            adapter_id,
-                            slot.layer as i64,
-                            module,
-                            false,
-                            true,
-                            &dynamic.adam_v[optimizer_index],
-                        )?;
-                        ctx.set_adapter_optimizer_tensor(
-                            adapter_id,
-                            slot.layer as i64,
-                            module,
-                            true,
-                            true,
-                            &dynamic.adam_v[optimizer_index + 1],
-                        )?;
-                        optimizer_index += 2;
+                        if restore_optimizer {
+                            ctx.set_adapter_optimizer_tensor(
+                                adapter_id,
+                                slot.layer as i64,
+                                module,
+                                false,
+                                false,
+                                &dynamic.adam_m[optimizer_index],
+                            )?;
+                            ctx.set_adapter_optimizer_tensor(
+                                adapter_id,
+                                slot.layer as i64,
+                                module,
+                                true,
+                                false,
+                                &dynamic.adam_m[optimizer_index + 1],
+                            )?;
+                            ctx.set_adapter_optimizer_tensor(
+                                adapter_id,
+                                slot.layer as i64,
+                                module,
+                                false,
+                                true,
+                                &dynamic.adam_v[optimizer_index],
+                            )?;
+                            ctx.set_adapter_optimizer_tensor(
+                                adapter_id,
+                                slot.layer as i64,
+                                module,
+                                true,
+                                true,
+                                &dynamic.adam_v[optimizer_index + 1],
+                            )?;
+                            optimizer_index += 2;
+                        }
                     }
                     if optimizer_index != dynamic.manifest.optimizer_count {
                         bail!(

@@ -229,6 +229,10 @@ ABI15 的两层 GDN base-TP smoke 覆盖复合 QKV/conv head shard、Z/A/B/A_log
 
 本轮对 heterogeneous selected-v2 的 registry 管理做了小范围优化：恢复阶段按保存的 canonical index 原位放回 selected adapter，并维护持久排序的 `adapter_id -> canonical slot` 索引，供 distributed validator、selected-v2、expected-step 和 selected-eval 使用；临时 selected/chunk registry detach 时显式使索引失效，canonical vector 恢复后再启用。H20 TP2 x EP2 synthetic dynamic-MoE（`B=8,S=128,H=1024,I=2048`、rank 16、q/expert targets、50 iterations）中，8 registered/8 active tenants 的 p50/p95 为 `13.859/17.561 ms`，1024 registered/8 active 为 `14.390/19.579 ms`，p50 增加约 `3.8%`；allocator reserved 从约 `1.04` 增至 `9.46 GiB/GPU`。local smoke 和 TP2 x EP2 distributed smoke 均通过。该结果只证明 registry scaling 的查找开销受控，不等于完整模型端到端收益；大注册表的 adapter 状态显存仍是容量约束。
 
+本轮进一步将动态 Adam 状态改为默认懒 materialize（`QWEN36_LAZY_DYNAMIC_OPTIMIZER_STATE=1`）。冷租户只保留 live LoRA 与 FP32 gradient slab，首个有全局 token 的 finalizer 才分配 `m/v` 与 transactional shadow；getter/checkpoint hydration 只分配 `m/v`，避免恢复历史冷租户时复制 shadow。step 0 checkpoint 使用 `optimizer_count=0` 表示隐式零状态，同时兼容旧的 full-state step 0 manifest。H20 TP2 x EP2 matched synthetic A/B（`B=8,S=128,H=1024,I=2048`、rank 16、8 active）中，8 registered/8 active reserved `1.035 GiB/GPU`，1024 registered/8 active `2.918-3.148 GiB/GPU`，此前完整状态约 `9.46 GiB/GPU`；p50 `14.017/14.058 ms`，处于噪声范围。native local/distributed smoke 和 ABI1 `cargo check --lib` 均通过，materialization allocation failure 通过现有 collective gate fail-closed。
+
+GDN persistent forward 与 checkpoint replay 的 token-loop barrier 已按列独占数据布局移除，初始化及 reverse reduction barrier 保留。H20 TP2 smoke、chunkwise smoke 和 backward parity 均通过；matched `B=2,S=512,H=2048,L=3` 的 stride32 replay p50 baseline/optimized 为 `106.26/106.73 ms`，无 checkpoint 默认路径为 `102.62/102.34 ms`。该结果只支持低风险的同步微优化，不支持宣称有稳定的多百分比端到端收益。
+
 这里“尚未完成 CP model execution”指任意五维组合、ring attention 和长序列 CP；当前新增的 full-attention CP2 仅是 opt-in KV all-gather correctness bridge，和 GDN CP2 一样不应外推为完整 Megatron CP。
 
 ## 继续达到 Megatron 级别所需的最小工作包

@@ -3662,6 +3662,8 @@ static void hash_collective_runtime_environment(AdapterRegistryHash& hash) {
     hash.add_u64(env_enabled("QWEN36_GROUPED_LORA_SYNC", true));
     hash.add_u64(env_enabled("QWEN36_PACKED_LORA_SYNC", true));
     hash.add_u64(env_enabled("QWEN36_GRAD_SLAB", true));
+    hash.add_u64(env_enabled(
+        "QWEN36_LAZY_DYNAMIC_OPTIMIZER_STATE", true));
     hash.add_u64(env_enabled("QWEN36_HETERO_PADDED_BATCH", true));
     hash.add_u64(env_enabled("QWEN36_GDN_RECURRENT_FUSION", true));
     hash.add_u64(env_enabled("QWEN36_GDN_CHUNKWISE_BWD"));
@@ -5366,6 +5368,77 @@ static void bind_adapter_lora_gradient_slab(
         }
     }
     bind_lora_gradient_slab(bindings, adapter.grad_slab);
+}
+
+// Dynamic tenants may be registered long before they are selected for a
+// training step. Keep their Adam state and transactional shadow handles lazy
+// in that case; the activation parameters and FP32 gradient slab remain ready
+// for the first selected backward. The helper is idempotent so checkpoint
+// hydration and a partially failed allocation can safely retry it.
+static void materialize_dynamic_adam_state(
+    TrainingContext::LoRAAdapter& adapter
+) {
+    at::NoGradGuard guard;
+    for (auto& [layer_idx, pairs] : adapter.params) {
+        auto& states = adapter.adam_state[layer_idx];
+        auto& shadows = adapter.adam_shadow[layer_idx];
+        TORCH_CHECK(states.size() == pairs.size() &&
+                shadows.size() == pairs.size(),
+            "dynamic optimizer lazy-state layout mismatch for adapter ",
+            adapter.id, " layer ", layer_idx);
+        for (size_t pair_idx = 0; pair_idx < pairs.size(); ++pair_idx) {
+            auto& [a, b] = pairs[pair_idx];
+            if (!a.requires_grad()) continue;
+            auto& [m_a, v_a, m_b, v_b] = states[pair_idx];
+            auto f32_options = at::TensorOptions().dtype(at::kFloat)
+                .device(a.device());
+            if (!m_a.defined()) m_a = at::zeros(a.sizes(), f32_options);
+            if (!v_a.defined()) v_a = at::zeros(a.sizes(), f32_options);
+            if (!m_b.defined()) m_b = at::zeros(b.sizes(), f32_options);
+            if (!v_b.defined()) v_b = at::zeros(b.sizes(), f32_options);
+        }
+    }
+}
+
+static void materialize_dynamic_adam_shadow(
+    TrainingContext::LoRAAdapter& adapter
+) {
+    at::NoGradGuard guard;
+    for (auto& [layer_idx, pairs] : adapter.params) {
+        auto& states = adapter.adam_state[layer_idx];
+        auto& shadows = adapter.adam_shadow[layer_idx];
+        TORCH_CHECK(states.size() == pairs.size() &&
+                shadows.size() == pairs.size(),
+            "dynamic optimizer lazy-state layout mismatch for adapter ",
+            adapter.id, " layer ", layer_idx);
+        for (size_t pair_idx = 0; pair_idx < pairs.size(); ++pair_idx) {
+            auto& [a, b] = pairs[pair_idx];
+            if (!a.requires_grad()) continue;
+            auto& [next_a, next_m_a, next_v_a,
+                   next_b, next_m_b, next_v_b] = shadows[pair_idx];
+            auto f32_options = at::TensorOptions().dtype(at::kFloat)
+                .device(a.device());
+            if (!next_a.defined())
+                next_a = at::empty_like(a).set_requires_grad(true);
+            if (!next_m_a.defined())
+                next_m_a = at::empty(a.sizes(), f32_options);
+            if (!next_v_a.defined())
+                next_v_a = at::empty(a.sizes(), f32_options);
+            if (!next_b.defined())
+                next_b = at::empty_like(b).set_requires_grad(true);
+            if (!next_m_b.defined())
+                next_m_b = at::empty(b.sizes(), f32_options);
+            if (!next_v_b.defined())
+                next_v_b = at::empty(b.sizes(), f32_options);
+        }
+    }
+}
+
+static void materialize_dynamic_optimizer_state(
+    TrainingContext::LoRAAdapter& adapter
+) {
+    materialize_dynamic_adam_state(adapter);
+    materialize_dynamic_adam_shadow(adapter);
 }
 
 static bool active_lora_targets_use_latent_rank_layout(
@@ -12910,8 +12983,21 @@ double qwen36_train_multi_lora_impl(
                         injection_ready = false;
                     }
                 }
+                bool local_optimizer_state_ready = true;
+                try {
+                    for (size_t adapter_index = 0;
+                         adapter_index < ctx->adapters.size();
+                         ++adapter_index) {
+                        if (!adapter_has_global_tokens[adapter_index])
+                            continue;
+                        materialize_dynamic_optimizer_state(
+                            ctx->adapters[adapter_index]);
+                    }
+                } catch (...) {
+                    local_optimizer_state_ready = false;
+                }
                 bool local_gradients_finite = false;
-                if (injection_ready) {
+                if (injection_ready && local_optimizer_state_ready) {
                     try {
                         local_gradients_finite =
                             dynamic_lora_accumulators_are_finite(
@@ -12923,9 +13009,10 @@ double qwen36_train_multi_lora_impl(
                 const bool all_gradients_finite =
                     adapter_collective_all_succeeded(
                         ctx, local_gradients_finite);
-                TORCH_CHECK(local_gradients_finite && all_gradients_finite,
+                TORCH_CHECK(local_optimizer_state_ready &&
+                        local_gradients_finite && all_gradients_finite,
                     "dynamic LoRA optimizer rejected missing or non-finite "
-                    "accumulated gradients");
+                    "accumulated gradients or could not materialize lazy state");
 
                 clip_dynamic_lora_gradients(ctx, adapter_has_global_tokens);
 
@@ -13385,11 +13472,23 @@ static void rollback_dynamic_adapter_commit(
             auto& [old_a, old_m_a, old_v_a,
                    old_b, old_m_b, old_v_b] = shadow_it->second[pair_idx];
             if (a.requires_grad()) {
+                TORCH_CHECK(m_a.defined() && v_a.defined() &&
+                        old_a.defined() && old_m_a.defined() &&
+                        old_v_a.defined(),
+                    "dynamic rollback observed unmaterialized A state for adapter ",
+                    adapter.id, " layer ", layer_idx,
+                    " pair ", pair_idx);
                 std::swap(a, old_a);
                 std::swap(m_a, old_m_a);
                 std::swap(v_a, old_v_a);
             }
             if (b.requires_grad()) {
+                TORCH_CHECK(m_b.defined() && v_b.defined() &&
+                        old_b.defined() && old_m_b.defined() &&
+                        old_v_b.defined(),
+                    "dynamic rollback observed unmaterialized B state for adapter ",
+                    adapter.id, " layer ", layer_idx,
+                    " pair ", pair_idx);
                 std::swap(b, old_b);
                 std::swap(m_b, old_m_b);
                 std::swap(v_b, old_v_b);
@@ -14946,6 +15045,8 @@ static int64_t qwen36_add_lora_impl(
                 std::vector<std::array<at::Tensor, 4>> adam_states;
                 std::vector<std::array<at::Tensor, 6>> adam_shadows;
                 std::vector<std::array<at::Tensor, 2>> grad_accumulators;
+                const bool lazy_optimizer_state = env_enabled(
+                    "QWEN36_LAZY_DYNAMIC_OPTIMIZER_STATE", true);
                 for (int64_t k = 0; k < num_pairs; k++) {
                     const auto& projection = projection_table.entries[k];
                     auto* base =
@@ -15007,12 +15108,14 @@ static int64_t qwen36_add_lora_impl(
                     b.set_requires_grad(active);
                     auto opts_f32 = at::TensorOptions().dtype(at::kFloat)
                         .device(base->device());
-                    adam_states.push_back({
-                        at::zeros(a.sizes(), opts_f32),
-                        at::zeros(a.sizes(), opts_f32),
-                        at::zeros(b.sizes(), opts_f32),
-                        at::zeros(b.sizes(), opts_f32)});
-                    adam_shadows.push_back(active
+                    adam_states.push_back(lazy_optimizer_state
+                        ? std::array<at::Tensor, 4>{}
+                        : std::array<at::Tensor, 4>{
+                            at::zeros(a.sizes(), opts_f32),
+                            at::zeros(a.sizes(), opts_f32),
+                            at::zeros(b.sizes(), opts_f32),
+                            at::zeros(b.sizes(), opts_f32)});
+                    adam_shadows.push_back(active && !lazy_optimizer_state
                         ? std::array<at::Tensor, 6>{
                             at::empty_like(a).set_requires_grad(true),
                             at::empty(a.sizes(), opts_f32),
@@ -15398,24 +15501,36 @@ void* qwen36_get_adapter_optimizer_tensor(
     void* ctx_ptr, int64_t adapter_id, int64_t global_layer,
     const char* module_name, int32_t is_b, int32_t is_v
 ) {
-    auto* ctx = reinterpret_cast<TrainingContext*>(ctx_ptr);
-    int64_t layer_idx = -1;
-    if (!module_name ||
-            !global_to_local_layer(ctx, global_layer, layer_idx)) return nullptr;
-    const int64_t pair_idx = lora_pair_index(
-        ctx->layer_configs[layer_idx], module_name);
-    if (pair_idx < 0) return nullptr;
-    for (auto& adapter : ctx->adapters) {
-        if (adapter.id != adapter_id) continue;
-        auto state_it = adapter.adam_state.find(layer_idx);
-        if (state_it == adapter.adam_state.end() ||
-            pair_idx >= static_cast<int64_t>(state_it->second.size()))
+    try {
+        auto* ctx = reinterpret_cast<TrainingContext*>(ctx_ptr);
+        int64_t layer_idx = -1;
+        if (!module_name ||
+                !global_to_local_layer(ctx, global_layer, layer_idx))
             return nullptr;
-        // array order: m_a, v_a, m_b, v_b
-        const int index = (is_b ? 2 : 0) + (is_v ? 1 : 0);
-        return &state_it->second[pair_idx][index];
+        const int64_t pair_idx = lora_pair_index(
+            ctx->layer_configs[layer_idx], module_name);
+        if (pair_idx < 0) return nullptr;
+        for (auto& adapter : ctx->adapters) {
+            if (adapter.id != adapter_id) continue;
+            if (env_enabled(
+                    "QWEN36_LAZY_DYNAMIC_OPTIMIZER_STATE", true)) {
+                materialize_dynamic_adam_state(adapter);
+            }
+            auto state_it = adapter.adam_state.find(layer_idx);
+            if (state_it == adapter.adam_state.end() ||
+                pair_idx >= static_cast<int64_t>(state_it->second.size()))
+                return nullptr;
+            // array order: m_a, v_a, m_b, v_b
+            const int index = (is_b ? 2 : 0) + (is_v ? 1 : 0);
+            auto& tensor = state_it->second[pair_idx][index];
+            return tensor.defined() ? &tensor : nullptr;
+        }
+        return nullptr;
+    } catch (const std::exception& e) {
+        fprintf(stderr,
+            "[q36] get_adapter_optimizer_tensor FAILED: %s\n", e.what());
+        return nullptr;
     }
-    return nullptr;
 }
 
 __attribute__((visibility("default")))

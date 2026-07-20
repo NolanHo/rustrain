@@ -153,7 +153,6 @@ __global__ void gated_delta_rule_kernel(
         for (int dk = 0; dk < DR_D_K; dk++) {
             state_s[dk * DR_D_V + tid] *= g_t;
         }
-        __syncthreads();
 
         // --- kv_mem = K[t] · S[:, dv] ---
         // Dot product of k_t[0..127] with state_s[0..127, tid]
@@ -178,7 +177,6 @@ __global__ void gated_delta_rule_kernel(
         for (int dk = 0; dk < DR_D_K; dk++) {
             state_s[dk * DR_D_V + tid] += k_t[dk] * delta;
         }
-        __syncthreads();
 
         // --- Output: out[t, dv] = Q[t] · S[:, dv] ---
         float out_val = 0.0f;
@@ -187,7 +185,6 @@ __global__ void gated_delta_rule_kernel(
             out_val += q_t[dk] * state_s[dk * DR_D_V + tid];
         }
         out_bh[t * DR_D_V + tid] = out_val;
-        __syncthreads();  // Ensure state visible before next token
 
         if (state_checkpoints != nullptr &&
             (t + 1) % checkpoint_stride == 0) {
@@ -198,7 +195,6 @@ __global__ void gated_delta_rule_kernel(
             #pragma unroll
             for (int i = tid; i < DR_D_K * DR_D_V; i += DR_THREADS)
                 checkpoint[i] = state_s[i];
-            __syncthreads();
         }
     }
 
@@ -213,7 +209,6 @@ __global__ void gated_delta_rule_kernel(
                 DR_D_K * DR_D_V;
             for (int i = tid; i < DR_D_K * DR_D_V; i += DR_THREADS)
                 checkpoint[i] = state_s[i];
-            __syncthreads();
         }
     }
 
@@ -966,19 +961,16 @@ __global__ void gated_delta_rule_backward_replay_kernel(
                 const int idx = dk * DR_D_V + tid;
                 state_s[idx] *= g_t;
             }
-            __syncthreads();
             for (int dk = 0; dk < DR_D_K; ++dk) {
                 const int idx = dk * DR_D_V + tid;
                 state_s[idx] += k_t[dk] * delta_t;
             }
-            __syncthreads();
             float* replay_slot = replay_bh +
                 static_cast<size_t>(t - chunk_start + 1) * state_elements;
             for (int dk = 0; dk < DR_D_K; ++dk) {
                 const int idx = dk * DR_D_V + tid;
                 replay_slot[idx] = state_s[idx];
             }
-            __syncthreads();
         }
 
         for (int t = reverse_end - 1; t >= chunk_start; --t) {
