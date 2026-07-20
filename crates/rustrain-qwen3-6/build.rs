@@ -1,17 +1,5 @@
 // build.rs — Compile C++ Qwen3.6 kernels and link against libtorch.
-use std::path::PathBuf;
 use std::process::Command;
-
-fn which(cmd: &str) -> Option<String> {
-    std::process::Command::new("which")
-        .arg(cmd)
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-}
 
 /// Detect PyTorch's _GLIBCXX_USE_CXX11_ABI setting by running Python.
 /// Returns "1" or "0". Defaults to "1" if detection fails.
@@ -23,7 +11,10 @@ fn detect_cxx11_abi() -> String {
     // Try python3 -c 'import torch; print(int(torch._C._GLIBCXX_USE_CXX11_ABI))'
     for py in &["python3", "python"] {
         if let Ok(out) = std::process::Command::new(py)
-            .args(["-c", "import torch; print(int(torch._C._GLIBCXX_USE_CXX11_ABI))"])
+            .args([
+                "-c",
+                "import torch; print(int(torch._C._GLIBCXX_USE_CXX11_ABI))",
+            ])
             .output()
         {
             if out.status.success() {
@@ -42,7 +33,15 @@ fn detect_cxx11_abi() -> String {
 fn main() {
     println!("cargo:rerun-if-env-changed=TORCH_INCLUDE_PATH");
     println!("cargo:rerun-if-env-changed=TORCH_LIB_PATH");
+    println!("cargo:rerun-if-env-changed=CUDA_HOME");
+    println!("cargo:rerun-if-env-changed=CUDA_INCLUDE_PATH");
+    println!("cargo:rerun-if-env-changed=CUDA_LIB_PATH");
+    println!("cargo:rerun-if-env-changed=NCCL_INCLUDE_PATH");
+    println!("cargo:rerun-if-env-changed=NCCL_LIB_PATH");
     println!("cargo:rerun-if-changed=kernels/qwen3_6_kernels.cpp");
+    println!("cargo:rerun-if-changed=kernels/delta_rule.cu");
+    println!("cargo:rerun-if-changed=kernels/delta_rule.cuh");
+    println!("cargo:rerun-if-changed=kernels/fused_kernels.cu");
     println!("cargo:rerun-if-changed=build.rs");
 
     let cxx11_abi = detect_cxx11_abi();
@@ -93,53 +92,152 @@ fn main() {
         }
     };
 
+    let torch_package_dir = std::path::Path::new(&torch_lib)
+        .parent()
+        .and_then(std::path::Path::parent);
+    let sibling_nccl = torch_package_dir.map(|dir| dir.join("nvidia/nccl"));
+    let nccl_include = std::env::var("NCCL_INCLUDE_PATH").unwrap_or_else(|_| {
+        let mut candidates = Vec::new();
+        if let Some(root) = &sibling_nccl {
+            candidates.push(root.join("include"));
+        }
+        candidates.extend([
+            std::path::PathBuf::from(
+                "/share/code/nolanho/mint-runtime-py31213/host-venv/lib/python3.12/site-packages/nvidia/nccl/include",
+            ),
+            std::path::PathBuf::from(
+                "/usr/local/lib/python3.13/dist-packages/nvidia/nccl/include",
+            ),
+            std::path::PathBuf::from("/usr/include"),
+        ]);
+        candidates
+            .into_iter()
+            .find(|path| path.join("nccl.h").exists())
+            .unwrap_or_else(|| std::path::PathBuf::from("/usr/include"))
+            .display()
+            .to_string()
+    });
+    let nccl_lib = std::env::var("NCCL_LIB_PATH").unwrap_or_else(|_| {
+        let mut candidates = Vec::new();
+        if let Some(root) = &sibling_nccl {
+            candidates.push(root.join("lib"));
+        }
+        candidates.extend([
+            std::path::PathBuf::from(
+                "/share/code/nolanho/mint-runtime-py31213/host-venv/lib/python3.12/site-packages/nvidia/nccl/lib",
+            ),
+            std::path::PathBuf::from(
+                "/usr/local/lib/python3.13/dist-packages/nvidia/nccl/lib",
+            ),
+            std::path::PathBuf::from("/usr/lib/x86_64-linux-gnu"),
+        ]);
+        candidates
+            .into_iter()
+            .find(|path| {
+                path.join("libnccl.so").exists() || path.join("libnccl.so.2").exists()
+            })
+            .unwrap_or_else(|| std::path::PathBuf::from("/usr/lib/x86_64-linux-gnu"))
+            .display()
+            .to_string()
+    });
+    let nccl_link = if std::path::Path::new(&nccl_lib).join("libnccl.so").exists() {
+        "-lnccl"
+    } else {
+        "-l:libnccl.so.2"
+    };
+
     let out_dir = std::env::var("OUT_DIR").unwrap_or_else(|_| "target/debug".to_string());
     let kernel_src = "kernels/qwen3_6_kernels.cpp";
     let output_lib = format!("{out_dir}/libqwen36_kernels.so");
+    // Never leave a previously built kernel at the current OUT_DIR after a
+    // failed rebuild. Runtime loading must not silently pick up stale code.
+    let _ = std::fs::remove_file(&output_lib);
 
     println!("cargo:warning=Compiling Qwen3.6 kernels: include={torch_include} lib={torch_lib}");
 
     let cuda_inc = std::env::var("CUDA_INCLUDE_PATH").unwrap_or_else(|_| {
         let candidates = [
             "/share/code/nolanho/pydeps/lora-research/nvidia/cu13/include",
+            "/usr/local/cuda-13/include",
             "/usr/local/cuda-13.0/include",
             "/usr/local/cuda/include",
         ];
         for c in &candidates {
-            if std::path::Path::new(&format!("{c}/cuda_runtime_api.h")).exists() {
+            if std::path::Path::new(&format!("{c}/cuda_runtime_api.h")).exists()
+                && std::path::Path::new(&format!("{c}/crt/host_defines.h")).exists()
+            {
                 return c.to_string();
             }
         }
         "/usr/local/cuda/include".to_string()
     });
+    let cuda_lib = std::env::var("CUDA_LIB_PATH").unwrap_or_else(|_| {
+        let mut candidates = Vec::new();
+        if let Ok(cuda_home) = std::env::var("CUDA_HOME") {
+            candidates.push(std::path::PathBuf::from(&cuda_home).join("lib64"));
+            candidates.push(std::path::PathBuf::from(cuda_home).join("targets/x86_64-linux/lib"));
+        }
+        if let Some(include_parent) = std::path::Path::new(&cuda_inc).parent() {
+            candidates.push(include_parent.join("lib64"));
+            candidates.push(include_parent.join("lib"));
+        }
+        candidates.extend([
+            std::path::PathBuf::from("/usr/local/cuda-13.0/lib64"),
+            std::path::PathBuf::from("/usr/local/cuda-13/lib64"),
+            std::path::PathBuf::from("/usr/local/cuda/lib64"),
+        ]);
+        candidates
+            .into_iter()
+            .find(|path| path.join("libcudart.so").exists())
+            .unwrap_or_else(|| std::path::PathBuf::from("/usr/local/cuda/lib64"))
+            .display()
+            .to_string()
+    });
 
-    let status = Command::new("g++")
+    let cpp_ok = Command::new("g++")
         .args([
-            "-shared", "-fPIC", "-std=c++17", "-O2",
-            &cxx11_flag,
-            "-fvisibility=default",
-            "-o", &output_lib, kernel_src,
-            &format!("-I{torch_include}"),
-            &format!("-I{torch_include}/ATen"),
-            &format!("-I{torch_include}/c10"),
-            &format!("-I{torch_include}/caffe2"),
-            &format!("-I{cuda_inc}"),
+            "-shared".to_string(),
+            "-fPIC".to_string(),
+            "-std=c++17".to_string(),
+            "-O2".to_string(),
+            cxx11_flag.clone(),
+            "-fvisibility=default".to_string(),
+            "-o".to_string(),
+            output_lib.clone(),
+            kernel_src.to_string(),
+            format!("-I{torch_include}"),
+            format!("-I{torch_include}/ATen"),
+            format!("-I{torch_include}/c10"),
+            format!("-I{torch_include}/caffe2"),
+            format!("-I{cuda_inc}"),
+            format!("-I{nccl_include}"),
+            format!("-L{torch_lib}"),
+            format!("-Wl,-rpath,{torch_lib}"),
+            format!("-L{nccl_lib}"),
+            format!("-Wl,-rpath,{nccl_lib}"),
+            "-Wl,--no-as-needed".to_string(),
+            "-Wl,--export-dynamic".to_string(),
+            "-ltorch".to_string(),
+            "-ltorch_cuda".to_string(),
+            "-ltorch_cpu".to_string(),
+            "-lc10".to_string(),
+            "-lc10_cuda".to_string(),
+            nccl_link.to_string(),
         ])
-        .args([
-            &format!("-L{torch_lib}"),
-            &format!("-Wl,-rpath,{torch_lib}"),
-            "-Wl,--no-as-needed",
-            "-Wl,--export-dynamic",
-            "-fvisibility=default",
-            "-ltorch", "-ltorch_cuda", "-ltorch_cpu", "-lc10", "-lc10_cuda",
-            "-lnccl",
-        ])
-        .status();
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
 
     // ── Compile CUDA kernels (.cu files) with nvcc ──
     let nvcc_path = {
+        let cuda_from_include = std::path::Path::new(&cuda_inc)
+            .parent()
+            .map(|home| home.join("bin/nvcc").display().to_string());
         let candidates = [
-            std::env::var("CUDA_HOME").ok().map(|h| format!("{h}/bin/nvcc")),
+            std::env::var("CUDA_HOME")
+                .ok()
+                .map(|h| format!("{h}/bin/nvcc")),
+            cuda_from_include,
             Some("nvcc".to_string()),
         ];
         let mut found = String::new();
@@ -149,7 +247,11 @@ fn main() {
                     found = c.clone();
                     break;
                 }
-                if std::process::Command::new(c).arg("--version").output().is_ok() {
+                if std::process::Command::new(c)
+                    .arg("--version")
+                    .output()
+                    .is_ok()
+                {
                     found = c.clone();
                     break;
                 }
@@ -158,7 +260,7 @@ fn main() {
         found
     };
 
-    if !nvcc_path.is_empty() {
+    let build_ok = if !nvcc_path.is_empty() {
         // CUDA files needing nvcc: delta_rule.cu (has __global__) + fused_kernels.cu (hand-written CUDA)
         let cu_files_nvcc = ["kernels/delta_rule.cu", "kernels/fused_kernels.cu"];
 
@@ -166,20 +268,29 @@ fn main() {
 
         // Compile CUDA kernels with nvcc
         for cu_file in &cu_files_nvcc {
-            if !std::path::Path::new(cu_file).exists() { continue; }
-            let obj_file = format!("{out_dir}/{}.o",
-                cu_file.replace("kernels/", "").replace(".cu", ""));
+            if !std::path::Path::new(cu_file).exists() {
+                continue;
+            }
+            let obj_file = format!(
+                "{out_dir}/{}.o",
+                cu_file.replace("kernels/", "").replace(".cu", "")
+            );
             let cu_status = Command::new(&nvcc_path)
                 .args([
-                    "-c", cu_file, "-o", &obj_file,
-                    "-O2", "-std=c++17",
+                    "-c",
+                    cu_file,
+                    "-o",
+                    &obj_file,
+                    "-O2",
+                    "-std=c++17",
                     &cxx11_flag,
                     &format!("-I{torch_include}"),
                     &format!("-I{torch_include}/ATen"),
                     &format!("-I{torch_include}/c10"),
                     &format!("-I{torch_include}/caffe2"),
                     &format!("-I{cuda_inc}"),
-                    "-Xcompiler", "-fPIC",
+                    "-Xcompiler",
+                    "-fPIC",
                 ])
                 .status();
             if cu_status.map(|s| s.success()).unwrap_or(false) {
@@ -187,46 +298,68 @@ fn main() {
             }
         }
 
-        // Re-link the .so with all .o files
-        if !obj_files.is_empty() {
+        // Re-link only when every required CUDA translation unit compiled.
+        if obj_files.len() == cu_files_nvcc.len() {
             let mut link_args = vec![
-                "-shared".to_string(), "-fPIC".to_string(), "-std=c++17".to_string(), "-O2".to_string(),
+                "-shared".to_string(),
+                "-fPIC".to_string(),
+                "-std=c++17".to_string(),
+                "-O2".to_string(),
                 cxx11_flag.clone(),
-                "-o".to_string(), output_lib.clone(), kernel_src.to_string(),
+                "-o".to_string(),
+                output_lib.clone(),
+                kernel_src.to_string(),
                 format!("-I{torch_include}"),
                 format!("-I{torch_include}/ATen"),
                 format!("-I{torch_include}/c10"),
                 format!("-I{torch_include}/caffe2"),
                 format!("-I{cuda_inc}"),
+                format!("-I{nccl_include}"),
                 format!("-L{torch_lib}"),
                 format!("-Wl,-rpath,{torch_lib}"),
-                format!("-L{cuda_inc}/../lib64"),
-                format!("-Wl,-rpath,{cuda_inc}/../lib64"),
+                format!("-L{nccl_lib}"),
+                format!("-Wl,-rpath,{nccl_lib}"),
+                format!("-L{cuda_lib}"),
+                format!("-Wl,-rpath,{cuda_lib}"),
                 "-Wl,--no-as-needed".to_string(),
-                "-ltorch".to_string(), "-ltorch_cuda".to_string(), "-ltorch_cpu".to_string(),
-                "-lc10".to_string(), "-lc10_cuda".to_string(), "-lcudart".to_string(), "-lnccl".to_string(),
+                "-ltorch".to_string(),
+                "-ltorch_cuda".to_string(),
+                "-ltorch_cpu".to_string(),
+                "-lc10".to_string(),
+                "-lc10_cuda".to_string(),
+                "-lcudart".to_string(),
+                nccl_link.to_string(),
             ];
             for obj in &obj_files {
                 link_args.push(obj.clone());
             }
-            let _ = Command::new("g++").args(&link_args).status();
+            cpp_ok
+                && Command::new("g++")
+                    .args(&link_args)
+                    .status()
+                    .map(|s| s.success())
+                    .unwrap_or(false)
+        } else {
+            false
         }
-    }
+    } else {
+        false
+    };
 
-    match status {
-        Ok(s) if s.success() => {
-            println!("cargo:rustc-link-search=native={torch_lib}");
-            println!("cargo:rustc-link-search=native={out_dir}");
-            println!("cargo:rustc-link-lib=dylib=qwen36_kernels");
-            println!("cargo:rustc-link-lib=dylib=c10");
-            println!("cargo:rustc-link-lib=dylib=torch");
-            println!("cargo:rustc-link-lib=dylib=torch_cpu");
-            println!("cargo:rustc-link-lib=dylib=torch_cuda");
-            println!("cargo:rustc-link-arg=-Wl,--no-as-needed");
-            println!("cargo:rustc-link-arg=-Wl,--allow-shlib-undefined");
-        }
-        _ => {
-            println!("cargo:warning=Failed to compile Qwen3.6 kernels, C++ path disabled");
-        }
+    if build_ok {
+        println!("cargo:rustc-link-search=native={torch_lib}");
+        println!("cargo:rustc-link-search=native={out_dir}");
+        println!("cargo:rustc-link-lib=dylib=qwen36_kernels");
+        println!("cargo:rustc-link-lib=dylib=c10");
+        println!("cargo:rustc-link-lib=dylib=torch");
+        println!("cargo:rustc-link-lib=dylib=torch_cpu");
+        println!("cargo:rustc-link-lib=dylib=torch_cuda");
+        println!("cargo:rustc-link-arg=-Wl,--no-as-needed");
+        println!("cargo:rustc-link-arg=-Wl,--allow-shlib-undefined");
+    } else {
+        let _ = std::fs::remove_file(&output_lib);
+        println!(
+            "cargo:warning=Failed to compile complete Qwen3.6 C++/CUDA kernels; native training path disabled"
+        );
     }
 }

@@ -40,12 +40,83 @@ S = S + k_t ⊗ delta                 # state update
 out_t = S @ q_t                     # output
 ```
 
+## Tensor Parallel Layout
+
+GDN TP partitions K/V head groups while preserving `n_rep = V_heads / K_heads`:
+
+- `in_proj_qkv.weight` and `conv1d.weight`: slice Q, K, and V segments independently, then repack each rank as `[Q_local | K_local | V_local]`.
+- `in_proj_z.weight`: shard output rows by local V heads.
+- `in_proj_a.weight`, `in_proj_b.weight`, `A_log`, `dt_bias`: shard by local V-head rows.
+- `norm.weight`: replicate `[value_head_dim]`.
+- `out_proj.weight`: shard input columns matching local V heads, then all-reduce the local output.
+- Column-parallel LoRA replicates A and shards B; row-parallel LoRA shards A and replicates B. Replicated-factor gradients are summed once at the optimizer boundary.
+
+The v4 flat-QKV checkpoint manifest records three local-to-global row segments for Q, K, and V. Merge or reshard must apply those segments instead of treating the packed rank-local rows as one contiguous global slice.
+
+One `TpCopyToRegion` must wrap the shared input before the QKV/Z/A/B forks so backward sums their input-gradient contributions once. Do not all-reduce each fork separately.
+
+## Backward Stability
+
+The default CUDA backward never reconstructs earlier states by dividing by
+`g_exp`. Real Qwen weights can produce decay below `1e-8`, where subtracting the
+rank-one update and dividing by decay is numerically irreversible even though
+the forward and reference backward remain finite.
+
+Forward saves exact FP32 recurrent state at chunk boundaries. Backward reloads
+each chunk start, replays that chunk once, and retains exact `S_prev/S_t` pairs
+in a temporary per-batch-head workspace. The automatic checkpoint stride is
+`ceil(sqrt(sequence_length))`, which approximately minimizes the sum of saved
+forward boundaries and replay workspace. Set
+`QWEN36_GDN_STATE_CHECKPOINT_STRIDE=N` (`N >= 2`) to override it; values above
+the current sequence length are clamped to one full-sequence replay chunk. The
+two footprints are approximately:
+
+- saved states per live GDN layer: `BH * (ceil(S / N) + 1) * D_K * D_V * 4`
+- replay workspace: `BH * (N + 1) * D_K * D_V * 4`
+
+`QWEN36_GDN_INVERSE_BWD=1` explicitly selects the old low-memory inverse
+recurrence for diagnostics only. `QWEN36_GDN_CHUNKWISE_BWD=1` also retains its
+older inverse formulation and is not a correctness fallback for very small
+decay. Distributed registry consensus includes these settings so ranks cannot
+silently use different backward paths. The replay kernel remains one persistent
+block per `BH`; it is not FLA-style sequence-parallel chunking.
+
+## Right-Padding Fast Path
+
+Strict-right-padding masks are reduced once to device-resident `lengths[B]`.
+The persistent GDN forward and backward kernels stop at each sample's valid
+length and explicitly zero output and gradient tails. Chunked eval converts the
+global lengths to per-chunk offsets, and the batched LoRA path narrows lengths
+with the same adapter sub-batch as Q/K/V. Dense batches use an empty sentinel
+and retain the null-pointer fast path. Left padding and internal holes remain
+rejected until packed `cu_seqlens` boundaries are implemented.
+
+## Native GDN TP Verification
+
+Use a Python environment with ABI-compatible prebuilt PyTorch, CUDA, and NCCL, then run:
+
+```bash
+PYTHON=/path/to/python scripts/run_qwen36_native_gdn_tp.sh smoke
+PYTHON=/path/to/python scripts/run_qwen36_native_gdn_tp.sh bench-single
+PYTHON=/path/to/python scripts/run_qwen36_native_gdn_tp.sh bench-tp2
+```
+
+For checkpoint coverage, run the same smoke with
+`QWEN36_GDN_STATE_CHECKPOINT_STRIDE=2`. The synthetic training sequence has
+length 9, so this exercises five reverse chunks while retaining the distributed
+full-weight gradient and Adam-state oracle. The default smoke also injects decay
+below `1e-30` and directly compares every FP32 LoRA gradient accumulator from
+the stable replay backward with the ATen recurrence oracle.
+
+The script builds only the repository kernel and native harnesses. It discovers and links the prebuilt dependency files from the selected Python environment; missing headers or libraries are reported instead of building third-party dependencies.
+
 ## L2 Normalization
 
-- Transformers: `x * rsqrt(sum(x²) + eps)` (eps=1e-6, in denominator)
-- rustrain: `x / max(sqrt(sum(x²)), eps)` (eps=1e-6, as clamp)
+- Transformers/Megatron fused pre-GDN: `x * rsqrt(sum(x²) + eps)` (eps=1e-6)
+- rustrain C++ and Rust fallback: `x * rsqrt(sum(x²) + 1e-6)`
 
-Mathematically equivalent but numerically slightly different.
+The epsilon is inside the squared norm. Keeping this form is important for
+low-norm Q/K vectors; a post-sqrt clamp is not numerically equivalent.
 
 ## Diagnostic Dumps
 

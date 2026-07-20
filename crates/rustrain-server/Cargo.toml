@@ -9,6 +9,7 @@ rustrain-qwen3-6 = { path = "../rustrain-qwen3-6" }
 rustrain-checkpoint = { path = "../rustrain-checkpoint" }
 rustrain-train = { path = "../rustrain-train" }
 rustrain-ipc = { path = "../rustrain-ipc" }
+rustrain-parallel = { path = "../rustrain-parallel" }
 anyhow.workspace = true
 axum.workspace = true
 base64 = "0.22"
@@ -30,3 +31,6 @@ tracing.workspace = true
 
 [build-dependencies]
 tonic-build.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

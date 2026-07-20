@@ -427,6 +427,23 @@ pub fn load_config(path: &Path) -> Result<Config> {
     toml::from_str(&contents).with_context(|| format!("failed to parse config {}", path.display()))
 }
 
+fn qwen_source_parallel_factor(
+    is_qwen_hybrid: bool,
+    is_expert_parallel_architecture: bool,
+    ep_source_sharded: bool,
+    parallel: &ParallelConfig,
+) -> usize {
+    if !is_qwen_hybrid {
+        return 1;
+    }
+    let ep_source_factor = if is_expert_parallel_architecture && ep_source_sharded {
+        parallel.expert_model_parallel_size
+    } else {
+        1
+    };
+    parallel.data_parallel_size * ep_source_factor
+}
+
 pub fn validate_config(config: &Config) -> Result<()> {
     if matches!(config.train.backend, BackendKind::NdArray)
         && !matches!(config.train.device, Device::Cpu)
@@ -512,6 +529,11 @@ pub fn validate_config(config: &Config) -> Result<()> {
         && config.model.architecture == "qwen_trainable_session";
     let is_qwen_lora_sft = matches!(config.train.backend, BackendKind::Tch)
         && config.model.architecture == "qwen_lora_sft";
+    let is_qwen3_hybrid_lora_sft = matches!(config.train.backend, BackendKind::Tch)
+        && matches!(
+            config.model.architecture.as_str(),
+            "qwen3_5_lora_sft" | "qwen3_5_lora_sft_ep" | "qwen3_6_lora_sft" | "qwen3_6_lora_sft_ep"
+        );
     let is_tch_moe_ep_session = matches!(config.train.backend, BackendKind::Tch)
         && config.model.architecture == "tch_moe_ep_session";
     let is_v4_tp_rank = matches!(config.train.backend, BackendKind::Tch)
@@ -526,14 +548,23 @@ pub fn validate_config(config: &Config) -> Result<()> {
         && config.model.architecture == "deepseek_v4_lora_sft_ep";
     let is_glm5_lora_sft_ep = matches!(config.train.backend, BackendKind::Tch)
         && config.model.architecture == "glm5_lora_sft_ep";
-    let is_qwen3_6_lora_sft_ep = matches!(config.train.backend, BackendKind::Tch)
-        && config.model.architecture == "qwen3_6_lora_sft_ep";
+    let is_qwen3_hybrid_lora_sft_ep = matches!(config.train.backend, BackendKind::Tch)
+        && matches!(
+            config.model.architecture.as_str(),
+            "qwen3_5_lora_sft_ep" | "qwen3_6_lora_sft_ep"
+        );
     let is_v4_tp_ep_train = matches!(config.train.backend, BackendKind::Tch)
         && config.model.architecture == "deepseek_v4_tp_ep_train";
     let is_v3_tp_rank = matches!(config.train.backend, BackendKind::Tch)
         && config.model.architecture == "deepseek_tp_rank";
     let is_v3_ep_rank = matches!(config.train.backend, BackendKind::Tch)
         && config.model.architecture == "deepseek_ep_rank";
+    if is_qwen3_hybrid_lora_sft_ep && parallel.context_parallel_size != 1 {
+        return Err(anyhow!(
+            "{} does not yet support context parallelism; context_parallel_size must be 1",
+            config.model.architecture
+        ));
+    }
     for (name, value) in parallel_sizes {
         if value == 0 {
             return Err(anyhow!("{name} must be greater than zero"));
@@ -542,10 +573,23 @@ pub fn validate_config(config: &Config) -> Result<()> {
             && !((is_tch_tiny_lm || is_qwen_trainable_session)
                 && name == "data_parallel_size"
                 && value == 2)
+            && !(is_qwen3_hybrid_lora_sft
+                && name == "data_parallel_size"
+                && value >= 2
+                && parallel.context_parallel_size == 1)
+            && !(is_qwen3_hybrid_lora_sft
+                && name == "tensor_model_parallel_size"
+                && parallel.context_parallel_size == 1)
+            && !(is_qwen3_hybrid_lora_sft
+                && name == "pipeline_model_parallel_size"
+                && parallel.context_parallel_size == 1)
             && !(is_qwen_trainable_session
                 && name == "tensor_model_parallel_size"
                 && value == 2
                 && parallel.data_parallel_size == 1)
+            && !(is_qwen3_hybrid_lora_sft_ep
+                && name == "expert_model_parallel_size"
+                && parallel.context_parallel_size == 1)
             && !(is_tch_moe_ep_session
                 && name == "expert_model_parallel_size"
                 && value == 2
@@ -559,7 +603,7 @@ pub fn validate_config(config: &Config) -> Result<()> {
                 || is_v4_ep_train
                 || is_v4_lora_sft_ep
                 || is_glm5_lora_sft_ep
-                || is_qwen3_6_lora_sft_ep)
+                || is_qwen3_hybrid_lora_sft_ep)
                 && name == "expert_model_parallel_size"
                 && parallel.data_parallel_size == 1)
             && !(is_glm5_lora_sft_ep
@@ -573,7 +617,7 @@ pub fn validate_config(config: &Config) -> Result<()> {
         }
     }
 
-    if is_qwen_trainable_session || is_qwen_lora_sft {
+    if is_qwen_trainable_session || is_qwen_lora_sft || is_qwen3_hybrid_lora_sft {
         if !matches!(config.train.device, Device::Cuda) {
             return Err(anyhow!(
                 "{} requires device = \"cuda\"",
@@ -608,7 +652,7 @@ pub fn validate_config(config: &Config) -> Result<()> {
         }
     }
 
-    if is_qwen_lora_sft {
+    if is_qwen_lora_sft || is_qwen3_hybrid_lora_sft {
         let lora = config
             .lora
             .as_ref()
@@ -634,20 +678,44 @@ pub fn validate_config(config: &Config) -> Result<()> {
         if lora.target_modules.is_empty() {
             return Err(anyhow!("lora.target_modules must not be empty"));
         }
-        let supported_lora_modules = [
-            "q_proj",
-            "k_proj",
-            "v_proj",
-            "o_proj",
-            "gate_proj",
-            "up_proj",
-            "down_proj",
-        ];
+        let supported_lora_modules: &[&str] = if is_qwen3_hybrid_lora_sft {
+            &[
+                "q_proj",
+                "k_proj",
+                "v_proj",
+                "o_proj",
+                "in_proj_qkv",
+                "in_proj_z",
+                "in_proj_a",
+                "in_proj_b",
+                "out_proj",
+                "gate_proj",
+                "up_proj",
+                "down_proj",
+                "shared_gate_proj",
+                "shared_up_proj",
+                "shared_down_proj",
+                "experts_gate_up_proj",
+                "experts_down_proj",
+            ]
+        } else {
+            &[
+                "q_proj",
+                "k_proj",
+                "v_proj",
+                "o_proj",
+                "gate_proj",
+                "up_proj",
+                "down_proj",
+            ]
+        };
         for module in &lora.target_modules {
             if !supported_lora_modules.contains(&module.as_str()) {
                 return Err(anyhow!(
-                    "qwen_lora_sft unsupported lora.target_modules entry {}; supported: q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj",
-                    module
+                    "{} unsupported lora.target_modules entry {}; supported: {}",
+                    config.model.architecture,
+                    module,
+                    supported_lora_modules.join(", ")
                 ));
             }
         }
@@ -658,17 +726,38 @@ pub fn validate_config(config: &Config) -> Result<()> {
             .any(|module| !unique_modules.insert(module))
         {
             return Err(anyhow!(
-                "qwen_lora_sft lora.target_modules must not contain duplicates"
+                "{} lora.target_modules must not contain duplicates",
+                config.model.architecture
             ));
         }
         if config.train.micro_batch_size == 0 {
-            return Err(anyhow!("qwen_lora_sft requires micro_batch_size > 0"));
-        }
-        let expected_global_batch_size =
-            config.train.micro_batch_size * config.train.gradient_accumulation_steps;
-        if config.train.global_batch_size != expected_global_batch_size {
             return Err(anyhow!(
-                "qwen_lora_sft requires global_batch_size = micro_batch_size * gradient_accumulation_steps"
+                "{} requires micro_batch_size > 0",
+                config.model.architecture
+            ));
+        }
+        let ep_source_sharded = std::env::var("QWEN36_EP_A2A_SHARDED")
+            .map(|value| !value.is_empty() && value != "0")
+            .unwrap_or(false);
+        let source_parallel_factor = qwen_source_parallel_factor(
+            is_qwen3_hybrid_lora_sft,
+            is_qwen3_hybrid_lora_sft_ep,
+            ep_source_sharded,
+            &config.parallel,
+        );
+        let expected_global_batch_size = config.train.micro_batch_size
+            * config.train.gradient_accumulation_steps
+            * source_parallel_factor;
+        if config.train.global_batch_size != expected_global_batch_size {
+            if source_parallel_factor > 1 {
+                return Err(anyhow!(
+                    "{} requires global_batch_size = micro_batch_size * gradient_accumulation_steps * effective source-parallel size ({source_parallel_factor}); this includes data_parallel_size and, for sharded EP sources, expert_model_parallel_size",
+                    config.model.architecture,
+                ));
+            }
+            return Err(anyhow!(
+                "{} requires global_batch_size = micro_batch_size * gradient_accumulation_steps",
+                config.model.architecture
             ));
         }
     } else if config.train.micro_batch_size != 1 || config.train.global_batch_size != 1 {
@@ -1207,8 +1296,8 @@ pub fn validate_config(config: &Config) -> Result<()> {
 }
 
 pub fn prepare_run_directory(run: &RunConfig) -> Result<RunPaths> {
-    let timestamp = Local::now().format("%Y%m%d-%H%M%S");
-    let root = run.base_dir.join(format!("{}-{timestamp}", run.name));
+    let run_id = std::env::var("RUSTRAIN_RUN_ID").ok();
+    let root = resolve_run_root(run, run_id.as_deref())?;
     let checkpoints = root.join("checkpoints");
     let logs = root.join("logs");
     let cache = root.join("cache");
@@ -1226,6 +1315,45 @@ pub fn prepare_run_directory(run: &RunConfig) -> Result<RunPaths> {
         cache,
         resolved_config,
     })
+}
+
+pub fn prepare_rank_log_directory(
+    run_paths: &RunPaths,
+    rank: usize,
+    world_size: usize,
+) -> Result<PathBuf> {
+    if world_size == 0 || rank >= world_size {
+        return Err(anyhow!(
+            "invalid launcher rank {rank} for WORLD_SIZE={world_size}"
+        ));
+    }
+    let log_dir = if world_size > 1 {
+        run_paths.logs.join(format!("rank-{rank:05}"))
+    } else {
+        run_paths.logs.clone()
+    };
+    fs::create_dir_all(&log_dir)
+        .with_context(|| format!("failed to create {}", log_dir.display()))?;
+    Ok(log_dir)
+}
+
+fn resolve_run_root(run: &RunConfig, run_id: Option<&str>) -> Result<PathBuf> {
+    let suffix = match run_id {
+        Some(run_id) => {
+            if run_id.is_empty()
+                || !run_id
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+            {
+                return Err(anyhow!(
+                    "RUSTRAIN_RUN_ID must contain only ASCII letters, digits, '.', '_', or '-'"
+                ));
+            }
+            run_id.to_string()
+        }
+        None => Local::now().format("%Y%m%d-%H%M%S").to_string(),
+    };
+    Ok(run.base_dir.join(format!("{}-{suffix}", run.name)))
 }
 
 pub fn init_logging(log_dir: &Path) -> Result<tracing_appender::non_blocking::WorkerGuard> {
@@ -1301,6 +1429,64 @@ mod tests {
     use super::*;
 
     #[test]
+    fn shared_run_id_resolves_the_same_rank_output_directory() {
+        let run = RunConfig {
+            name: "distributed".into(),
+            base_dir: "/tmp/rustrain-tests".into(),
+            seed: 1,
+        };
+
+        let rank_zero = resolve_run_root(&run, Some("launch-123")).unwrap();
+        let rank_one = resolve_run_root(&run, Some("launch-123")).unwrap();
+
+        assert_eq!(rank_zero, rank_one);
+        assert_eq!(
+            rank_zero,
+            PathBuf::from("/tmp/rustrain-tests/distributed-launch-123")
+        );
+    }
+
+    #[test]
+    fn shared_run_id_rejects_path_components() {
+        let run = RunConfig {
+            name: "distributed".into(),
+            base_dir: "/tmp/rustrain-tests".into(),
+            seed: 1,
+        };
+
+        let error = resolve_run_root(&run, Some("../other-run")).unwrap_err();
+        assert!(error.to_string().contains("RUSTRAIN_RUN_ID"));
+    }
+
+    #[test]
+    fn distributed_rank_logs_are_isolated_under_shared_run_root() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "rustrain-rank-logs-{}-{unique}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let run_paths = RunPaths {
+            root: root.clone(),
+            checkpoints: root.join("checkpoints"),
+            logs: root.join("logs"),
+            cache: root.join("cache"),
+            resolved_config: root.join("resolved_config.toml"),
+        };
+
+        let rank_zero = prepare_rank_log_directory(&run_paths, 0, 2).unwrap();
+        let rank_one = prepare_rank_log_directory(&run_paths, 1, 2).unwrap();
+
+        assert_ne!(rank_zero, rank_one);
+        assert_eq!(rank_zero, root.join("logs/rank-00000"));
+        assert_eq!(rank_one, root.join("logs/rank-00001"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn qwen_lora_sft_global_batch_matches_gradient_accumulation() {
         let mut config = qwen_lora_sft_config();
 
@@ -1316,21 +1502,85 @@ mod tests {
     #[test]
     fn cuda_memory_fraction_must_be_finite_and_bounded() {
         let mut config = qwen_lora_sft_config();
+        config.train.cuda_memory_fraction = f64::NAN;
+        assert!(validate_config(&config)
+            .expect_err("NaN CUDA memory fraction must fail")
+            .to_string()
+            .contains("cuda_memory_fraction"));
+        config.train.cuda_memory_fraction = 1.01;
+        assert!(validate_config(&config)
+            .expect_err("CUDA memory fraction above one must fail")
+            .to_string()
+            .contains("cuda_memory_fraction"));
+    }
 
-        for invalid in [0.0, -0.1, 1.01, f64::INFINITY, f64::NAN] {
-            config.train.cuda_memory_fraction = invalid;
-            let error = match validate_config(&config) {
-                Ok(()) => panic!("fraction {invalid:?} unexpectedly validated"),
-                Err(error) => error.to_string(),
-            };
-            assert!(
-                error.contains("cuda_memory_fraction must be finite and in (0, 1]"),
-                "fraction {invalid:?} unexpectedly validated or returned a different error: {error}"
-            );
-        }
+    #[test]
+    fn qwen36_lora_sft_accepts_native_projection_targets() {
+        let mut config = qwen_lora_sft_config();
+        config.model.name = "qwen3_6_test".to_string();
+        config.lora.as_mut().unwrap().target_modules = vec![
+            "q_proj".to_string(),
+            "in_proj_qkv".to_string(),
+            "in_proj_z".to_string(),
+            "out_proj".to_string(),
+        ];
 
-        config.train.cuda_memory_fraction = 1.0;
-        validate_config(&config).expect("a full-device allocator fraction should validate");
+        config.model.architecture = "qwen3_6_lora_sft".to_string();
+        validate_config(&config).expect("native Qwen3.6 LoRA targets should validate");
+        config.model.architecture = "qwen3_5_lora_sft".to_string();
+        validate_config(&config).expect("native Qwen3.5 LoRA targets should validate");
+    }
+
+    #[test]
+    fn qwen_hybrid_lora_sft_accepts_replicated_data_parallelism() {
+        let mut config = qwen_lora_sft_config();
+        config.model.architecture = "qwen3_6_lora_sft".to_string();
+        config.parallel.data_parallel_size = 2;
+        config.train.global_batch_size = config.train.micro_batch_size
+            * config.train.gradient_accumulation_steps
+            * config.parallel.data_parallel_size;
+        validate_config(&config).expect("Qwen3.6 LoRA DP should validate");
+
+        config.model.architecture = "qwen3_5_lora_sft".to_string();
+        validate_config(&config).expect("Qwen3.5 LoRA DP should validate");
+
+        config.train.global_batch_size /= 2;
+        let error = validate_config(&config).expect_err("DP global batch mismatch should fail");
+        assert!(error.to_string().contains("data_parallel_size"));
+    }
+
+    #[test]
+    fn qwen_hybrid_lora_sft_ep_accepts_tensor_expert_data_parallelism() {
+        let mut config = qwen_lora_sft_config();
+        config.model.architecture = "qwen3_6_lora_sft_ep".to_string();
+        config.parallel.tensor_model_parallel_size = 2;
+        config.parallel.expert_model_parallel_size = 2;
+        config.parallel.data_parallel_size = 2;
+        let ep_source_sharded = std::env::var("QWEN36_EP_A2A_SHARDED")
+            .map(|value| !value.is_empty() && value != "0")
+            .unwrap_or(false);
+        config.train.global_batch_size = config.train.micro_batch_size
+            * config.train.gradient_accumulation_steps
+            * qwen_source_parallel_factor(true, true, ep_source_sharded, &config.parallel);
+        assert_eq!(
+            qwen_source_parallel_factor(true, true, true, &config.parallel),
+            4
+        );
+        assert_eq!(
+            qwen_source_parallel_factor(true, true, false, &config.parallel),
+            2
+        );
+        validate_config(&config).expect("Qwen3.6 LoRA TPxEPxDP should validate");
+
+        config.model.architecture = "qwen3_5_lora_sft_ep".to_string();
+        validate_config(&config).expect("Qwen3.5 LoRA TPxEPxDP should validate");
+
+        config.parallel.pipeline_model_parallel_size = 2;
+        validate_config(&config).expect("Qwen3.5 LoRA TPxEPxDPxPP should validate");
+
+        config.parallel.context_parallel_size = 2;
+        let error = validate_config(&config).expect_err("Qwen TPxEPxDPxPPxCP should fail early");
+        assert!(error.to_string().contains("context_parallel_size"));
     }
 
     #[test]

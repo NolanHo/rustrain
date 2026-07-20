@@ -75,7 +75,7 @@ impl TrainService for TrainServiceImpl {
         let count = s
             .init_lora(InitLoRARequest {
                 rank: req.rank,
-                alpha: req.alpha as i64,
+                alpha: req.alpha,
                 target_layers: req.target_layers.iter().map(|&l| l as usize).collect(),
                 target_modules: req.target_modules,
                 lr: req.lr,
@@ -141,9 +141,7 @@ impl TrainService for TrainServiceImpl {
                 attention_mask,
             })
             .map_err(|e| Status::internal(e.to_string()))?;
-        Ok(Response::new(EvalStepResponse {
-            loss: result.loss,
-        }))
+        Ok(Response::new(EvalStepResponse { loss: result.loss }))
     }
 
     async fn save_checkpoint(
@@ -200,7 +198,7 @@ impl TrainService for TrainServiceImpl {
             .ok_or_else(|| Status::not_found("session not found"))?;
         let s = session.lock().await;
         let count = s
-            .export_adapter(&req.path)
+            .export_adapter(&req.path, Some(req.adapter_id))
             .map_err(|e| Status::internal(e.to_string()))?;
         Ok(Response::new(AdapterInfo {
             path: req.path,
@@ -208,7 +206,25 @@ impl TrainService for TrainServiceImpl {
         }))
     }
 
-    type StreamMetricsStream = std::pin::Pin<Box<dyn futures::Stream<Item = Result<StepMetric, Status>> + Send>>;
+    async fn import_adapter(
+        &self,
+        request: Request<ImportAdapterRequest>,
+    ) -> Result<Response<ImportAdapterResponse>, Status> {
+        let req = request.into_inner();
+        let session = self
+            .manager
+            .get_session(&req.session_id)
+            .await
+            .ok_or_else(|| Status::not_found("session not found"))?;
+        let mut s = session.lock().await;
+        let adapter_id = s
+            .import_adapter(&req.path)
+            .map_err(|e| Status::internal(e.to_string()))?;
+        Ok(Response::new(ImportAdapterResponse { adapter_id }))
+    }
+
+    type StreamMetricsStream =
+        std::pin::Pin<Box<dyn futures::Stream<Item = Result<StepMetric, Status>> + Send>>;
 
     async fn stream_metrics(
         &self,
@@ -274,6 +290,10 @@ impl TrainService for TrainServiceImpl {
                 alpha: req.alpha,
                 target_layers: req.target_layers,
                 target_modules: req.target_modules,
+                optimizer_lr: req.optimizer_lr.map(|value| value.value),
+                optimizer_beta1: req.optimizer_beta1.map(|value| value.value),
+                optimizer_beta2: req.optimizer_beta2.map(|value| value.value),
+                optimizer_eps: req.optimizer_eps.map(|value| value.value),
             })
             .map_err(|e| Status::internal(e.to_string()))?;
         Ok(Response::new(train::AddLoRaResponse { adapter_id: id }))
@@ -321,7 +341,12 @@ fn decode_tensor_data(td: &Option<TensorData>) -> Result<tch::Tensor, Status> {
         "int64" => tch::Kind::Int64,
         "float32" => tch::Kind::Float,
         "bfloat16" => tch::Kind::BFloat16,
-        _ => return Err(Status::invalid_argument(format!("unsupported dtype: {}", td.dtype))),
+        _ => {
+            return Err(Status::invalid_argument(format!(
+                "unsupported dtype: {}",
+                td.dtype
+            )));
+        }
     };
     let tensor = match kind {
         tch::Kind::Int64 => {
@@ -342,6 +367,11 @@ fn decode_tensor_data(td: &Option<TensorData>) -> Result<tch::Tensor, Status> {
         }
         _ => return Err(Status::invalid_argument("only int64 and float32 supported")),
     };
-    let local_rank = std::env::var("LOCAL_RANK").ok().and_then(|s| s.parse::<usize>().ok()).unwrap_or(0);
-    Ok(tensor.reshape(&td.shape).to_device(tch::Device::Cuda(local_rank)))
+    let local_rank = std::env::var("LOCAL_RANK")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(0);
+    Ok(tensor
+        .reshape(&td.shape)
+        .to_device(tch::Device::Cuda(local_rank)))
 }
