@@ -470,8 +470,23 @@ fn train_impl(
     let rank_order = std::env::var("RUSTRAIN_PARALLEL_ORDER")
         .or_else(|_| std::env::var("PARALLEL_ORDER"))
         .unwrap_or_else(|_| DEFAULT_RANK_ORDER.to_string());
-    if cp_size != 1 {
-        bail!("native Qwen LoRA does not yet support context parallelism (CP={cp_size})");
+    let cp_full_attention = env_enabled("QWEN36_CP_FULL_ATTENTION_KV_GATHER");
+    if cp_size != 1
+        && (cp_size != 2
+            || tp_size != 1
+            || pp_size != 1
+            || dp_size != 1
+            || is_ep
+            || !cp_full_attention)
+    {
+        bail!(
+            "native Qwen CP requires CP2 with TP=EP=DP=PP=1 and QWEN36_CP_FULL_ATTENTION_KV_GATHER=1 (got TP={} EP={} DP={} PP={} CP={})",
+            tp_size,
+            if is_ep { 1 } else { config.parallel.expert_model_parallel_size },
+            dp_size,
+            pp_size,
+            cp_size
+        );
     }
     let parallel_topology = if let Some(shard) = shard_ref {
         Some(ParallelTopology::with_order(

@@ -3514,6 +3514,7 @@ static void hash_collective_runtime_environment(AdapterRegistryHash& hash) {
     hash.add_u64(env_enabled("QWEN36_FUSED_CE"));
     hash.add_u64(env_enabled("QWEN36_FUSED_QKV"));
     hash.add_u64(env_enabled("QWEN36_FUSED_MLP_FC1"));
+    hash.add_u64(env_enabled("QWEN36_CP_FULL_ATTENTION_KV_GATHER"));
     hash.add_u64(env_enabled("QWEN36_DISABLE_MTP"));
     const char* checkpoint_stride =
         getenv("QWEN36_GDN_STATE_CHECKPOINT_STRIDE");
@@ -3758,28 +3759,74 @@ static void validate_native_execution_topology(
     }
     if (ctx->cp_world_size > 1) {
         TORCH_CHECK(ctx->cp_world_size == 2 && ctx->cp_comm,
-            "GDN context parallelism currently requires initialized CP_SIZE=2");
+            "Qwen context parallelism currently requires initialized CP_SIZE=2");
         TORCH_CHECK(ctx->tp_world_size == 1 && ctx->ep_world_size == 1 &&
                 ctx->dp_world_size == 1 && ctx->pp_world_size == 1,
-            "GDN context parallelism currently requires TP=EP=DP=PP=1");
+            "Qwen context parallelism currently requires TP=EP=DP=PP=1");
         TORCH_CHECK(!ctx->sequence_parallel && !ctx->base_tp_attention &&
                 !ctx->base_tp_mlp && !ctx->vocab_parallel,
-            "GDN context parallelism cannot be combined with TP or sequence parallelism");
+            "Qwen context parallelism cannot be combined with TP or sequence parallelism");
         TORCH_CHECK(!ctx->has_mtp,
-            "GDN context parallelism does not support MTP");
+            "Qwen context parallelism does not support MTP");
         TORCH_CHECK(ctx->adapters.empty() ||
                 env_enabled("QWEN36_GROUPED_LORA_SYNC", true),
-            "dynamic GDN context parallelism requires grouped LoRA gradient sync");
+            "dynamic Qwen context parallelism requires grouped LoRA gradient sync");
         TORCH_CHECK(ctx->router_aux_loss_coef == 0.0,
-            "GDN context parallelism does not support router auxiliary loss");
+            "Qwen context parallelism does not support router auxiliary loss");
         const char* sequence_chunk = getenv("QWEN36_SEQ_CHUNK");
         TORCH_CHECK(!sequence_chunk || atoll(sequence_chunk) <= 0,
-            "GDN context parallelism does not support QWEN36_SEQ_CHUNK");
+            "Qwen context parallelism does not support QWEN36_SEQ_CHUNK");
         int64_t weight_offset = 0;
         for (int64_t layer = 0; layer < ctx->num_layers; ++layer) {
             const auto& config = ctx->layer_configs[layer];
-            TORCH_CHECK(config.layer_type != 0 && config.num_experts == 0,
-                "GDN context parallelism currently requires dense linear-attention layers");
+            TORCH_CHECK(config.num_experts == 0,
+                "Qwen context parallelism currently requires dense layers");
+            if (config.layer_type == 0) {
+                TORCH_CHECK(env_enabled(
+                        "QWEN36_CP_FULL_ATTENTION_KV_GATHER"),
+                    "full-attention context parallelism requires "
+                    "QWEN36_CP_FULL_ATTENTION_KV_GATHER=1");
+                TORCH_CHECK(config.num_heads > 0 &&
+                        config.num_kv_heads > 0 && config.head_dim > 0 &&
+                        config.num_heads % config.num_kv_heads == 0 &&
+                        config.partial_rotary_factor >= 0.0 &&
+                        config.partial_rotary_factor <= 1.0,
+                    "full-attention CP head geometry is invalid");
+                const int64_t rotary_dim = static_cast<int64_t>(
+                    config.head_dim * config.partial_rotary_factor);
+                TORCH_CHECK(rotary_dim >= 0 &&
+                        rotary_dim <= config.head_dim &&
+                        rotary_dim % 2 == 0,
+                    "full-attention CP rotary dimension must be even and "
+                    "no larger than head_dim");
+                auto* q = ctx->weight_ptrs[weight_offset + 2];
+                auto* q_norm = ctx->weight_ptrs[weight_offset + 3];
+                auto* k = ctx->weight_ptrs[weight_offset + 4];
+                auto* k_norm = ctx->weight_ptrs[weight_offset + 5];
+                auto* v = ctx->weight_ptrs[weight_offset + 6];
+                auto* out = ctx->weight_ptrs[weight_offset + 7];
+                TORCH_CHECK(q && q_norm && k && k_norm && v && out &&
+                        q->dim() == 2 && k->dim() == 2 && v->dim() == 2 &&
+                        out->dim() == 2 && q_norm->dim() == 1 &&
+                        k_norm->dim() == 1,
+                    "full-attention CP received missing or invalid weights");
+                const int64_t hidden = q->size(1);
+                const int64_t q_size =
+                    config.num_heads * config.head_dim;
+                const int64_t kv_size =
+                    config.num_kv_heads * config.head_dim;
+                TORCH_CHECK(q->sizes() == at::IntArrayRef({
+                            q_size * 2, hidden}) &&
+                        q_norm->size(0) == config.head_dim &&
+                        k->sizes() == at::IntArrayRef({kv_size, hidden}) &&
+                        k_norm->size(0) == config.head_dim &&
+                        v->sizes() == at::IntArrayRef({kv_size, hidden}) &&
+                        out->sizes() == at::IntArrayRef({hidden, q_size}),
+                    "full-attention CP weight shapes do not match the model "
+                    "configuration");
+                weight_offset += weight_count_for_layer(config);
+                continue;
+            }
             TORCH_CHECK(config.num_k_heads > 0 && config.num_v_heads > 0 &&
                     config.key_dim > 0 && config.val_dim > 0 &&
                     config.conv_kernel > 0 &&
@@ -4827,6 +4874,21 @@ static at::Tensor sequence_parallel_column_gather(
         local_hidden.contiguous(), (int64_t)ctx->tp_comm,
         (int64_t)reinterpret_cast<uintptr_t>(ctx->tp_stream),
         ctx->tp_world_size);
+}
+
+// Full-attention CP keeps local queries and gathers the normalized, RoPE'd
+// K/V sequence once. The reduce-scatter backward is required because every
+// query rank contributes gradients to every global key/value owner.
+static at::Tensor context_parallel_kv_gather(
+    TrainingContext* ctx, const at::Tensor& local_kv
+) {
+    TORCH_CHECK(context_parallel_enabled(ctx) && ctx->cp_comm &&
+            env_enabled("QWEN36_CP_FULL_ATTENTION_KV_GATHER"),
+        "full-attention context parallelism requires the guarded KV gather");
+    return TpGatherFromSequenceFunction::apply(
+        local_kv.contiguous(), (int64_t)ctx->cp_comm,
+        (int64_t)reinterpret_cast<uintptr_t>(ctx->cp_stream),
+        ctx->cp_world_size);
 }
 
 static at::Tensor sequence_parallel_row_reduce_scatter(
@@ -7242,6 +7304,14 @@ static at::Tensor full_attention_batched(
     auto projection_input = tp_copy_base_attention_input(ctx, hidden);
     int64_t batch = projection_input.size(0);
     int64_t seq = projection_input.size(1);
+    const bool use_context_parallel = context_parallel_enabled(ctx);
+    if (use_context_parallel) {
+        TORCH_CHECK(ctx->cp_world_size == 2 && ctx->cp_comm &&
+                env_enabled("QWEN36_CP_FULL_ATTENTION_KV_GATHER") &&
+                !ctx->base_tp_attention,
+            "full-attention context parallelism requires guarded CP2 KV "
+            "gather without tensor-parallel attention");
+    }
     if (ctx->base_tp_attention) {
         TORCH_CHECK(num_heads % ctx->tp_world_size == 0 &&
                 num_kv_heads % ctx->tp_world_size == 0,
@@ -7313,7 +7383,11 @@ static at::Tensor full_attention_batched(
     int64_t rotary_dim = (int64_t)(head_dim * partial_rotary_factor);
     if (rotary_dim > 0) {
         auto device = hidden.device();
-        auto pos = at::arange(seq, at::TensorOptions().dtype(at::kFloat).device(device)).unsqueeze(0);
+        const int64_t position_start = use_context_parallel
+            ? ctx->cp_rank * seq : 0;
+        auto pos = at::arange(
+            position_start, position_start + seq,
+            at::TensorOptions().dtype(at::kFloat).device(device)).unsqueeze(0);
         auto exponents = at::arange(0, rotary_dim, 2, at::TensorOptions().dtype(at::kFloat).device(device)) / (double)rotary_dim;
         auto inv_freq = (exponents * std::log(rope_theta)).exp().reciprocal();
         auto freqs = pos.unsqueeze(-1) * inv_freq.unsqueeze(0);
@@ -7329,12 +7403,61 @@ static at::Tensor full_attention_batched(
         cos = at::Tensor(); sin = at::Tensor();
     }
 
+    int64_t key_sequence = seq;
+    if (use_context_parallel) {
+        auto local_k = k.transpose(1, 2).reshape({
+            batch, seq, k_projection_dim});
+        auto local_v = v.transpose(1, 2).reshape({
+            batch, seq, k_projection_dim});
+        auto global_kv = context_parallel_kv_gather(
+            ctx, at::cat({local_k, local_v}, -1).contiguous());
+        key_sequence = seq * ctx->cp_world_size;
+        TORCH_CHECK(global_kv.sizes() == at::IntArrayRef({
+                batch, key_sequence, k_projection_dim * 2}),
+            "full-attention CP KV gather produced an invalid shape");
+        k = global_kv.narrow(-1, 0, k_projection_dim)
+            .reshape({batch, key_sequence, num_kv_heads, head_dim})
+            .transpose(1, 2).contiguous();
+        v = global_kv.narrow(-1, k_projection_dim, k_projection_dim)
+            .reshape({batch, key_sequence, num_kv_heads, head_dim})
+            .transpose(1, 2).contiguous();
+    }
+
     // GQA: no K/V expansion needed (PT 2.5+ enable_gqa=true)
     double scale = 1.0 / std::sqrt((double)head_dim);
 
     // SDPA with GQA
     at::Tensor attn_out;
-    if (attention_mask.defined() && attention_mask.numel() > 0) {
+    if (use_context_parallel) {
+        const int64_t query_start = ctx->cp_rank * seq;
+        auto query_positions = at::arange(
+            query_start, query_start + seq,
+            at::TensorOptions().dtype(at::kLong).device(q_out.device()))
+            .unsqueeze(1);
+        auto key_positions = at::arange(
+            key_sequence,
+            at::TensorOptions().dtype(at::kLong).device(q_out.device()))
+            .unsqueeze(0);
+        auto combined = key_positions.gt(query_positions)
+            .unsqueeze(0).unsqueeze(0);
+        if (attention_mask.defined() && attention_mask.numel() > 0) {
+            auto key_padding = attention_mask.to(at::kBool);
+            TORCH_CHECK(key_padding.dim() == 2 &&
+                    key_padding.size(0) == batch &&
+                    key_padding.size(1) == key_sequence,
+                "full-attention CP padding mask must be [batch, global_seq]");
+            combined = combined.logical_or(
+                key_padding.logical_not().unsqueeze(1).unsqueeze(1));
+        }
+        auto additive_mask = at::zeros(
+            {batch, 1, seq, key_sequence},
+            at::TensorOptions().dtype(q_out.scalar_type())
+                .device(q_out.device()));
+        additive_mask = additive_mask.masked_fill(
+            combined, -std::numeric_limits<float>::infinity());
+        attn_out = at::scaled_dot_product_attention(
+            q_out, k, v, additive_mask, 0.0, false, c10::nullopt, true);
+    } else if (attention_mask.defined() && attention_mask.numel() > 0) {
         auto kpm = attention_mask.to(at::kBool);
         while (kpm.dim() > 2) kpm = kpm.squeeze(0);
         if (kpm.size(0) == 1) {
@@ -12122,18 +12245,32 @@ double qwen36_train_multi_lora_impl(
         struct AdapterRegistryChunkGuard {
             TrainingContext* ctx;
             std::vector<TrainingContext::LoRAAdapter> all;
+            int64_t start = 0;
+            size_t moved = 0;
             bool active = false;
 
             AdapterRegistryChunkGuard(
                 TrainingContext* context, int64_t start, int64_t end,
                 bool scope_registry)
-                : ctx(context) {
+                : ctx(context), start(start) {
                 if (!scope_registry) return;
+                TORCH_CHECK(start >= 0 && end >= start &&
+                        end <= static_cast<int64_t>(ctx->adapters.size()),
+                    "invalid dynamic adapter chunk range [", start, ", ",
+                    end, ") for registry size ", ctx->adapters.size());
                 all.swap(ctx->adapters);
                 try {
-                    ctx->adapters.assign(all.begin() + start, all.begin() + end);
+                    const size_t count = static_cast<size_t>(end - start);
+                    ctx->adapters.reserve(count);
+                    for (int64_t index = start; index < end; ++index) {
+                        ctx->adapters.emplace_back(std::move(all[index]));
+                        ++moved;
+                    }
                     active = true;
                 } catch (...) {
+                    for (size_t index = 0; index < moved; ++index)
+                        all[static_cast<size_t>(start) + index] =
+                            std::move(ctx->adapters[index]);
                     ctx->adapters.clear();
                     ctx->adapters.swap(all);
                     throw;
@@ -12142,8 +12279,12 @@ double qwen36_train_multi_lora_impl(
 
             void restore() {
                 if (!active) return;
+                for (size_t index = 0; index < moved; ++index)
+                    all[static_cast<size_t>(start) + index] =
+                        std::move(ctx->adapters[index]);
                 ctx->adapters.clear();
                 ctx->adapters.swap(all);
+                moved = 0;
                 active = false;
             }
 
@@ -12389,9 +12530,9 @@ double qwen36_train_multi_lora_impl(
             } else {
                 loss_hidden.backward(hidden_grad);
             }
-            // The chunk registry contains intrusive copies of the selected
-            // adapter tensors. Harvest now; FP32 accumulator contents remain
-            // shared when the full registry is restored below.
+            // The chunk registry owns moved adapter handles for this chunk.
+            // Harvest now; restoring by canonical index keeps FP32 accumulator
+            // identity intact without copying the full registry maps.
             harvest_gradient_accumulators(ctx);
             // No cudaDeviceSynchronize — let GPU pipeline run asynchronously.
             // The next chunk's CPU prep (LoRA batch, input expand) will overlap

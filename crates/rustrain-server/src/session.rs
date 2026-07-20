@@ -203,9 +203,19 @@ fn resolve_qwen_topology(
     } else {
         ParallelTopology::from_env_with_world_size(world_size)?
     };
-    if topology.context_parallel_size() != 1 {
+    let cp_full_attention = std::env::var("QWEN36_CP_FULL_ATTENTION_KV_GATHER")
+        .map(|value| !value.is_empty() && value != "0")
+        .unwrap_or(false);
+    if topology.context_parallel_size() != 1
+        && (topology.context_parallel_size() != 2
+            || topology.tensor_model_parallel_size() != 1
+            || topology.pipeline_model_parallel_size() != 1
+            || topology.data_parallel_size() != 1
+            || topology.expert_model_parallel_size() != 1
+            || !cp_full_attention)
+    {
         bail!(
-            "native Qwen server does not yet support CP (tp={} pp={} dp={} ep={} cp={})",
+            "native Qwen server CP requires CP2 with TP=EP=DP=PP=1 and QWEN36_CP_FULL_ATTENTION_KV_GATHER=1 (tp={} pp={} dp={} ep={} cp={})",
             topology.tensor_model_parallel_size(),
             topology.pipeline_model_parallel_size(),
             topology.data_parallel_size(),

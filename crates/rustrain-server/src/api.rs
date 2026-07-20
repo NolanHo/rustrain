@@ -156,7 +156,11 @@ struct MultiLoraDispatchRequest {
 
 impl MultiLoraDispatchRequest {
     fn coalescible(&self) -> bool {
-        self.allow_aggregate_loss && !self.adapter_ids.is_empty()
+        // Optimistic step checks are request-local failure boundaries. Keeping
+        // them out of shared windows prevents one stale retry from failing
+        // unrelated tenants in the same flattened native command.
+        self.allow_aggregate_loss && !self.adapter_ids.is_empty() &&
+            self.expected_steps.is_empty()
     }
 }
 
@@ -2659,6 +2663,27 @@ mod tensor_http_shape_tests {
         assert!(window.can_accept(&batch_request("session", &[2, 3], 2, &[12, 13]), config));
         window.push(batch_request("session", &[2], 1, &[12]));
         assert!(!window.can_accept(&batch_request("session", &[3], 1, &[13]), config));
+    }
+
+    #[test]
+    fn expected_steps_make_request_exclusive() {
+        let config = MultiLoraBatchConfig {
+            window: std::time::Duration::from_millis(1),
+            max_requests: 4,
+            max_open_windows: 2,
+            max_adapters: 4,
+            max_rank_work: 64,
+            max_payload_bytes: usize::MAX,
+        };
+        let mut first = batch_request("session", &[1], 1, &[11]);
+        first.expected_steps = vec![0];
+        let second = batch_request("session", &[2], 1, &[12]);
+        assert!(!first.coalescible());
+        assert!(!MultiLoraWindow::new(first).can_accept(&second, config));
+
+        let mut second_guarded = batch_request("session", &[2], 1, &[12]);
+        second_guarded.expected_steps = vec![0];
+        assert!(!second_guarded.coalescible());
     }
 
     #[test]
