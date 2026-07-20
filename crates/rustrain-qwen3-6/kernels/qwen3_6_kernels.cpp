@@ -1535,10 +1535,8 @@ static ncclDataType_t qwen36_nccl_dtype(at::ScalarType type) {
 }
 
 struct Qwen36A2ACountPlan {
-    std::vector<int32_t> send;
-    std::vector<int32_t> receive;
-    at::Tensor send_tensor;
-    at::Tensor receive_tensor;
+    at::Tensor send_offsets;
+    at::Tensor receive_offsets;
 };
 
 static Qwen36A2ACountPlan qwen36_a2a_counts(
@@ -1579,28 +1577,38 @@ static Qwen36A2ACountPlan qwen36_a2a_counts(
         host = at::cat({send_row, receive_column, invalid_flags}, 0)
             .contiguous()
             .to(at::TensorOptions().device(at::kCPU));
-        plan.send_tensor = host.narrow(0, 0, world).contiguous();
-        plan.receive_tensor = host.narrow(0, world, world).contiguous();
     } else {
         host = all_counts.to(at::TensorOptions().device(at::kCPU));
-        plan.send_tensor = host.select(0, rank).narrow(0, 0, world).contiguous();
-        plan.receive_tensor = host.narrow(1, 0, world)
-            .select(1, rank).contiguous();
     }
-    plan.send.resize(world);
-    plan.receive.resize(world);
-    std::memcpy(plan.send.data(), plan.send_tensor.data_ptr<int32_t>(),
-        sizeof(int32_t) * world);
-    std::memcpy(plan.receive.data(), plan.receive_tensor.data_ptr<int32_t>(),
-        sizeof(int32_t) * world);
+    // Dispatch forward, dispatch backward, combine forward, and combine
+    // backward all use the same variable-count layout. Materialize the two
+    // prefix plans once and keep them in the autograd graph instead of
+    // repeatedly copying count tensors into vectors and rescanning them.
+    auto offset_storage = at::empty(
+        {2, world + 1},
+        at::TensorOptions().device(at::kCPU).dtype(at::kLong));
+    plan.send_offsets = offset_storage.select(0, 0);
+    plan.receive_offsets = offset_storage.select(0, 1);
+    auto* send_offsets = plan.send_offsets.data_ptr<int64_t>();
+    auto* receive_offsets = plan.receive_offsets.data_ptr<int64_t>();
+    send_offsets[0] = 0;
+    receive_offsets[0] = 0;
     for (int peer = 0; peer < world; ++peer) {
-        TORCH_CHECK(plan.send[peer] >= 0 && plan.receive[peer] >= 0,
+        const int32_t send_count = compact_metadata
+            ? host.data_ptr<int32_t>()[peer]
+            : host.data_ptr<int32_t>()[rank * (world + 1) + peer];
+        const int32_t receive_count = compact_metadata
+            ? host.data_ptr<int32_t>()[world + peer]
+            : host.data_ptr<int32_t>()[peer * (world + 1) + rank];
+        TORCH_CHECK(send_count >= 0 && receive_count >= 0,
             "negative EP A2A token count");
         const int32_t invalid = compact_metadata
             ? host.data_ptr<int32_t>()[2 * world + peer]
             : host.data_ptr<int32_t>()[peer * (world + 1) + world];
         TORCH_CHECK(invalid == 0,
             "EP A2A expert index is outside the communicator range");
+        send_offsets[peer + 1] = send_offsets[peer] + send_count;
+        receive_offsets[peer + 1] = receive_offsets[peer] + receive_count;
     }
     return plan;
 }
@@ -1665,13 +1673,10 @@ struct Qwen36A2ADispatchFunction : public torch::autograd::Function<Qwen36A2ADis
             local_metadata = host_counts.to(gpu_count_opts);
         }
         auto count_plan = qwen36_a2a_counts(local_metadata, comm, stream);
-        const auto& send_counts = count_plan.send;
-        const auto& recv_counts = count_plan.receive;
-        std::vector<int64_t> send_offsets(world + 1, 0), recv_offsets(world + 1, 0);
-        for (int i = 0; i < world; ++i) {
-            send_offsets[i + 1] = send_offsets[i] + send_counts[i];
-            recv_offsets[i + 1] = recv_offsets[i] + recv_counts[i];
-        }
+        auto send_offsets_tensor = std::move(count_plan.send_offsets);
+        auto recv_offsets_tensor = std::move(count_plan.receive_offsets);
+        const auto* send_offsets = send_offsets_tensor.data_ptr<int64_t>();
+        const auto* recv_offsets = recv_offsets_tensor.data_ptr<int64_t>();
         auto send_token = token_indices.index_select(0, send_index).contiguous();
         auto send_hidden = input.index_select(0, send_token).contiguous();
         auto send_expert = expert_indices.index_select(0, send_index).contiguous();
@@ -1686,18 +1691,18 @@ struct Qwen36A2ADispatchFunction : public torch::autograd::Function<Qwen36A2ADis
             send_metadata = at::stack(
                 {send_token, send_expert}, 1).contiguous();
         }
-        auto recv_hidden = at::empty({recv_offsets.back(), hidden}, input.options());
+        auto recv_hidden = at::empty({recv_offsets[world], hidden}, input.options());
         at::Tensor recv_metadata;
         at::Tensor recv_token;
         at::Tensor recv_expert;
         if (packed_metadata) {
             recv_metadata = at::empty(
-                {recv_offsets.back(), 2}, token_indices.options());
+                {recv_offsets[world], 2}, token_indices.options());
             recv_token = recv_metadata.select(1, 0);
             recv_expert = recv_metadata.select(1, 1);
         } else {
-            recv_token = at::empty({recv_offsets.back()}, token_indices.options());
-            recv_expert = at::empty({recv_offsets.back()}, expert_indices.options());
+            recv_token = at::empty({recv_offsets[world]}, token_indices.options());
+            recv_expert = at::empty({recv_offsets[world]}, expert_indices.options());
         }
         auto send_ptr = [&](at::Tensor& t, int64_t row, int64_t width) -> const void* {
             return static_cast<const char*>(t.data_ptr()) +
@@ -1712,7 +1717,7 @@ struct Qwen36A2ADispatchFunction : public torch::autograd::Function<Qwen36A2ADis
         auto operation_stream = stream_fence.operation;
         TORCH_CHECK(ncclGroupStart() == ncclSuccess, "ncclGroupStart failed");
         for (int peer = 0; peer < world; ++peer) {
-            const int64_t rows = send_counts[peer];
+            const int64_t rows = send_offsets[peer + 1] - send_offsets[peer];
             if (rows) {
                 auto err = ncclSend(send_ptr(send_hidden, send_offsets[peer], hidden),
                     rows * hidden, qwen36_nccl_dtype(input.scalar_type()), peer, comm, operation_stream);
@@ -1740,7 +1745,7 @@ struct Qwen36A2ADispatchFunction : public torch::autograd::Function<Qwen36A2ADis
             }
         }
         for (int peer = 0; peer < world; ++peer) {
-            const int64_t rows = recv_counts[peer];
+            const int64_t rows = recv_offsets[peer + 1] - recv_offsets[peer];
             if (rows) {
                 auto err = ncclRecv(recv_ptr(recv_hidden, recv_offsets[peer], hidden),
                     rows * hidden, qwen36_nccl_dtype(input.scalar_type()), peer, comm, operation_stream);
@@ -1770,13 +1775,12 @@ struct Qwen36A2ADispatchFunction : public torch::autograd::Function<Qwen36A2ADis
         TORCH_CHECK(ncclGroupEnd() == ncclSuccess, "A2A dispatch group failed");
         stream_fence.complete();
         auto recv_local = recv_expert - rank * expert_count;
-        auto send_counts_tensor = std::move(count_plan.send_tensor);
-        auto recv_counts_tensor = std::move(count_plan.receive_tensor);
-        ctx->save_for_backward({input, send_token, send_counts_tensor, recv_counts_tensor});
+        ctx->save_for_backward({input, send_token, send_offsets_tensor, recv_offsets_tensor});
         ctx->saved_data["comm"] = comm_ptr;
         ctx->saved_data["stream"] = stream_ptr;
         ctx->saved_data["expert_count"] = expert_count;
-        return {recv_hidden, recv_token, recv_local, send_index, send_counts_tensor, recv_counts_tensor};
+        return {recv_hidden, recv_token, recv_local, send_index,
+            send_offsets_tensor, recv_offsets_tensor};
     }
 
     static std::vector<at::Tensor> backward(
@@ -1785,32 +1789,33 @@ struct Qwen36A2ADispatchFunction : public torch::autograd::Function<Qwen36A2ADis
         auto saved = ctx->get_saved_variables();
         auto input = saved[0];
         auto send_token = saved[1];
-        auto send_counts = saved[2].to(at::TensorOptions().device(at::kCPU));
-        auto recv_counts = saved[3].to(at::TensorOptions().device(at::kCPU));
-        const int world = send_counts.numel();
+        const auto& send_offsets = saved[2];
+        const auto& recv_offsets = saved[3];
+        const int world = send_offsets.numel() - 1;
+        TORCH_CHECK(world >= 1 && recv_offsets.numel() == world + 1,
+            "invalid saved EP A2A prefix plan");
+        const auto* so = send_offsets.data_ptr<int64_t>();
+        const auto* ro = recv_offsets.data_ptr<int64_t>();
         auto comm = reinterpret_cast<ncclComm_t>(ctx->saved_data["comm"].toInt());
         auto stream = c10::cuda::getCurrentCUDAStream(input.device().index()).stream();
         auto requested_stream = reinterpret_cast<cudaStream_t>(
             ctx->saved_data["stream"].toInt());
-        std::vector<int32_t> sc(world), rc(world);
-        std::memcpy(sc.data(), send_counts.data_ptr<int32_t>(), sizeof(int32_t) * world);
-        std::memcpy(rc.data(), recv_counts.data_ptr<int32_t>(), sizeof(int32_t) * world);
-        std::vector<int64_t> so(world + 1, 0), ro(world + 1, 0);
-        for (int i = 0; i < world; ++i) { so[i + 1] = so[i] + sc[i]; ro[i + 1] = ro[i] + rc[i]; }
         auto grad_input = at::zeros_like(input);
-        auto returned = at::empty({so.back(), input.size(1)}, input.options());
+        auto returned = at::empty({so[world], input.size(1)}, input.options());
         const size_t elem_bytes = input.element_size();
         Qwen36StreamFence stream_fence(stream, requested_stream);
         auto operation_stream = stream_fence.operation;
         TORCH_CHECK(ncclGroupStart() == ncclSuccess, "ncclGroupStart failed");
-        for (int peer = 0; peer < world; ++peer) if (sc[peer]) {
+        for (int peer = 0; peer < world; ++peer) if (so[peer + 1] != so[peer]) {
+            const int64_t rows = so[peer + 1] - so[peer];
             auto err = ncclRecv(static_cast<char*>(returned.data_ptr()) + so[peer] * input.size(1) * elem_bytes,
-                sc[peer] * input.size(1), qwen36_nccl_dtype(input.scalar_type()), peer, comm, operation_stream);
+                rows * input.size(1), qwen36_nccl_dtype(input.scalar_type()), peer, comm, operation_stream);
             TORCH_CHECK(err == ncclSuccess, "A2A backward recv failed: ", ncclGetErrorString(err));
         }
-        for (int peer = 0; peer < world; ++peer) if (rc[peer]) {
+        for (int peer = 0; peer < world; ++peer) if (ro[peer + 1] != ro[peer]) {
+            const int64_t rows = ro[peer + 1] - ro[peer];
             auto err = ncclSend(static_cast<const char*>(grad_output[0].data_ptr()) + ro[peer] * input.size(1) * elem_bytes,
-                rc[peer] * input.size(1), qwen36_nccl_dtype(input.scalar_type()), peer, comm, operation_stream);
+                rows * input.size(1), qwen36_nccl_dtype(input.scalar_type()), peer, comm, operation_stream);
             TORCH_CHECK(err == ncclSuccess, "A2A backward send failed: ", ncclGetErrorString(err));
         }
         TORCH_CHECK(ncclGroupEnd() == ncclSuccess, "A2A dispatch backward group failed");
@@ -1823,18 +1828,15 @@ struct Qwen36A2ADispatchFunction : public torch::autograd::Function<Qwen36A2ADis
 
 struct Qwen36A2ACombineFunction : public torch::autograd::Function<Qwen36A2ACombineFunction> {
     static at::Tensor forward(torch::autograd::AutogradContext* ctx,
-        at::Tensor local_output, at::Tensor send_counts,
-        at::Tensor recv_counts, int64_t comm_ptr, int64_t stream_ptr) {
+        at::Tensor local_output, at::Tensor send_offsets,
+        at::Tensor recv_offsets, int64_t comm_ptr, int64_t stream_ptr) {
         auto comm = reinterpret_cast<ncclComm_t>(comm_ptr);
-        const int world = send_counts.numel();
-        auto sc_cpu = send_counts.to(at::TensorOptions().device(at::kCPU));
-        auto rc_cpu = recv_counts.to(at::TensorOptions().device(at::kCPU));
-        std::vector<int32_t> sc(world), rc(world);
-        std::memcpy(sc.data(), sc_cpu.data_ptr<int32_t>(), sizeof(int32_t) * world);
-        std::memcpy(rc.data(), rc_cpu.data_ptr<int32_t>(), sizeof(int32_t) * world);
-        std::vector<int64_t> so(world + 1, 0), ro(world + 1, 0);
-        for (int i = 0; i < world; ++i) { so[i + 1] = so[i] + sc[i]; ro[i + 1] = ro[i] + rc[i]; }
-        auto returned = at::empty({so.back(), local_output.size(1)}, local_output.options());
+        const int world = send_offsets.numel() - 1;
+        TORCH_CHECK(world >= 1 && recv_offsets.numel() == world + 1,
+            "invalid EP A2A prefix plan");
+        const auto* so = send_offsets.data_ptr<int64_t>();
+        const auto* ro = recv_offsets.data_ptr<int64_t>();
+        auto returned = at::empty({so[world], local_output.size(1)}, local_output.options());
         const size_t elem_bytes = local_output.element_size();
         auto current_stream = c10::cuda::getCurrentCUDAStream(
             local_output.device().index()).stream();
@@ -1842,19 +1844,21 @@ struct Qwen36A2ACombineFunction : public torch::autograd::Function<Qwen36A2AComb
             current_stream, reinterpret_cast<cudaStream_t>(stream_ptr));
         auto operation_stream = stream_fence.operation;
         TORCH_CHECK(ncclGroupStart() == ncclSuccess, "ncclGroupStart failed");
-        for (int peer = 0; peer < world; ++peer) if (rc[peer]) {
+        for (int peer = 0; peer < world; ++peer) if (ro[peer + 1] != ro[peer]) {
+            const int64_t rows = ro[peer + 1] - ro[peer];
             auto err = ncclSend(static_cast<const char*>(local_output.data_ptr()) + ro[peer] * local_output.size(1) * elem_bytes,
-                rc[peer] * local_output.size(1), qwen36_nccl_dtype(local_output.scalar_type()), peer, comm, operation_stream);
+                rows * local_output.size(1), qwen36_nccl_dtype(local_output.scalar_type()), peer, comm, operation_stream);
             TORCH_CHECK(err == ncclSuccess, "A2A combine send failed: ", ncclGetErrorString(err));
         }
-        for (int peer = 0; peer < world; ++peer) if (sc[peer]) {
+        for (int peer = 0; peer < world; ++peer) if (so[peer + 1] != so[peer]) {
+            const int64_t rows = so[peer + 1] - so[peer];
             auto err = ncclRecv(static_cast<char*>(returned.data_ptr()) + so[peer] * local_output.size(1) * elem_bytes,
-                sc[peer] * local_output.size(1), qwen36_nccl_dtype(local_output.scalar_type()), peer, comm, operation_stream);
+                rows * local_output.size(1), qwen36_nccl_dtype(local_output.scalar_type()), peer, comm, operation_stream);
             TORCH_CHECK(err == ncclSuccess, "A2A combine recv failed: ", ncclGetErrorString(err));
         }
         TORCH_CHECK(ncclGroupEnd() == ncclSuccess, "A2A combine group failed");
         stream_fence.complete();
-        ctx->save_for_backward({send_counts, recv_counts});
+        ctx->save_for_backward({send_offsets, recv_offsets});
         ctx->saved_data["comm"] = comm_ptr;
         ctx->saved_data["stream"] = stream_ptr;
         return returned;
@@ -1863,32 +1867,33 @@ struct Qwen36A2ACombineFunction : public torch::autograd::Function<Qwen36A2AComb
     static std::vector<at::Tensor> backward(torch::autograd::AutogradContext* ctx,
         std::vector<at::Tensor> grad_output) {
         auto saved = ctx->get_saved_variables();
-        auto sc_cpu = saved[0].to(at::TensorOptions().device(at::kCPU));
-        auto rc_cpu = saved[1].to(at::TensorOptions().device(at::kCPU));
-        const int world = sc_cpu.numel();
-        std::vector<int32_t> sc(world), rc(world);
-        std::memcpy(sc.data(), sc_cpu.data_ptr<int32_t>(), sizeof(int32_t) * world);
-        std::memcpy(rc.data(), rc_cpu.data_ptr<int32_t>(), sizeof(int32_t) * world);
-        std::vector<int64_t> so(world + 1, 0), ro(world + 1, 0);
-        for (int i = 0; i < world; ++i) { so[i + 1] = so[i] + sc[i]; ro[i + 1] = ro[i] + rc[i]; }
+        const auto& send_offsets = saved[0];
+        const auto& recv_offsets = saved[1];
+        const int world = send_offsets.numel() - 1;
+        TORCH_CHECK(world >= 1 && recv_offsets.numel() == world + 1,
+            "invalid saved EP A2A prefix plan");
+        const auto* so = send_offsets.data_ptr<int64_t>();
+        const auto* ro = recv_offsets.data_ptr<int64_t>();
         auto comm = reinterpret_cast<ncclComm_t>(ctx->saved_data["comm"].toInt());
         auto stream = c10::cuda::getCurrentCUDAStream(grad_output[0].device().index()).stream();
         auto requested_stream = reinterpret_cast<cudaStream_t>(
             ctx->saved_data["stream"].toInt());
         auto packed = grad_output[0].contiguous();
-        auto grad_local = at::empty({ro.back(), grad_output[0].size(1)}, grad_output[0].options());
+        auto grad_local = at::empty({ro[world], grad_output[0].size(1)}, grad_output[0].options());
         const size_t elem_bytes = grad_output[0].element_size();
         Qwen36StreamFence stream_fence(stream, requested_stream);
         auto operation_stream = stream_fence.operation;
         TORCH_CHECK(ncclGroupStart() == ncclSuccess, "ncclGroupStart failed");
-        for (int peer = 0; peer < world; ++peer) if (sc[peer]) {
+        for (int peer = 0; peer < world; ++peer) if (so[peer + 1] != so[peer]) {
+            const int64_t rows = so[peer + 1] - so[peer];
             auto err = ncclSend(static_cast<const char*>(packed.data_ptr()) + so[peer] * grad_output[0].size(1) * elem_bytes,
-                sc[peer] * grad_output[0].size(1), qwen36_nccl_dtype(grad_output[0].scalar_type()), peer, comm, operation_stream);
+                rows * grad_output[0].size(1), qwen36_nccl_dtype(grad_output[0].scalar_type()), peer, comm, operation_stream);
             TORCH_CHECK(err == ncclSuccess, "A2A combine backward send failed: ", ncclGetErrorString(err));
         }
-        for (int peer = 0; peer < world; ++peer) if (rc[peer]) {
+        for (int peer = 0; peer < world; ++peer) if (ro[peer + 1] != ro[peer]) {
+            const int64_t rows = ro[peer + 1] - ro[peer];
             auto err = ncclRecv(static_cast<char*>(grad_local.data_ptr()) + ro[peer] * grad_output[0].size(1) * elem_bytes,
-                rc[peer] * grad_output[0].size(1), qwen36_nccl_dtype(grad_output[0].scalar_type()), peer, comm, operation_stream);
+                rows * grad_output[0].size(1), qwen36_nccl_dtype(grad_output[0].scalar_type()), peer, comm, operation_stream);
             TORCH_CHECK(err == ncclSuccess, "A2A combine backward recv failed: ", ncclGetErrorString(err));
         }
         TORCH_CHECK(ncclGroupEnd() == ncclSuccess, "A2A combine backward group failed");
@@ -2236,12 +2241,12 @@ static at::Tensor moe_routed_a2a(
         auto received_tokens = dispatched[1];
         auto received_experts = dispatched[2];
         auto send_index = dispatched[3];
-        auto send_counts = dispatched[4];
-        auto recv_counts = dispatched[5];
+        auto send_offsets = dispatched[4];
+        auto recv_offsets = dispatched[5];
         auto local_output = run_local_experts(
             received, received_tokens, received_experts);
         auto returned = Qwen36A2ACombineFunction::apply(
-            local_output, send_counts, recv_counts,
+            local_output, send_offsets, recv_offsets,
             static_cast<int64_t>(reinterpret_cast<uintptr_t>(comm)),
             static_cast<int64_t>(reinterpret_cast<uintptr_t>(requested_stream)));
         returned = tp_allreduce_base_mlp(training_ctx, returned);
