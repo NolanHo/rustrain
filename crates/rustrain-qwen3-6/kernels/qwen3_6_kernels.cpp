@@ -12,7 +12,6 @@
 #define RUSTRAIN_HAS_ATEN_GROUPED_MM 0
 #endif
 #include <c10/cuda/CUDAStream.h>
-#include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDACachingAllocator.h>
 #include <cuda_runtime.h>
 #include <torch/csrc/autograd/grad_mode.h>
@@ -28,7 +27,6 @@
 #include <vector>
 #include <cstring>
 #include <memory>
-#include <optional>
 #include <unordered_map>
 #include <set>
 #include <array>
@@ -44,41 +42,6 @@
 #include <nccl.h>
 
 struct TrainingContext;  // forward declaration (defined below)
-
-static c10::cuda::CUDAStream begin_moe_shared_overlap(
-    TrainingContext* ctx, cudaStream_t current_stream);
-static void record_moe_shared_overlap_done(TrainingContext* ctx);
-static void join_moe_shared_overlap(
-    TrainingContext* ctx, cudaStream_t current_stream);
-static void abort_moe_shared_overlap(TrainingContext* ctx) noexcept;
-
-class ScopedMoeSharedOverlapJoin {
-public:
-    ScopedMoeSharedOverlapJoin(
-        TrainingContext* ctx, cudaStream_t current_stream)
-        : ctx_(ctx), current_stream_(current_stream) {}
-
-    void arm() { active_ = true; }
-
-    void join() {
-        if (!active_) return;
-        join_moe_shared_overlap(ctx_, current_stream_);
-        active_ = false;
-    }
-
-    ~ScopedMoeSharedOverlapJoin() {
-        if (active_) abort_moe_shared_overlap(ctx_);
-    }
-
-    ScopedMoeSharedOverlapJoin(const ScopedMoeSharedOverlapJoin&) = delete;
-    ScopedMoeSharedOverlapJoin& operator=(
-        const ScopedMoeSharedOverlapJoin&) = delete;
-
-private:
-    TrainingContext* ctx_;
-    cudaStream_t current_stream_;
-    bool active_ = false;
-};
 
 static at::Tensor attach_router_aux_loss(
     TrainingContext* ctx,
@@ -2328,32 +2291,6 @@ static at::Tensor moe_forward(
     const bool sharded_a2a_mode =
         env_enabled("QWEN36_EP_A2A_SHARDED") &&
         expert_count < num_experts;
-    const bool shared_overlap_requested =
-        env_enabled("QWEN36_MOE_SHARED_EXPERT_OVERLAP");
-    const bool shared_overlap_supported = nccl_comm_v &&
-        env_enabled("QWEN36_EP_A2A") && sharded_a2a_mode &&
-        env_enabled("QWEN36_EP_A2A_PACKED", true);
-    TORCH_CHECK(!shared_overlap_requested ||
-            expert_count == num_experts || shared_overlap_supported,
-        "QWEN36_MOE_SHARED_EXPERT_OVERLAP=1 currently requires packed "
-        "sharded EP A2A");
-    const bool shared_overlap =
-        shared_overlap_requested && shared_overlap_supported;
-    const auto compute_stream = c10::cuda::getCurrentCUDAStream(
-        hidden.device().index()).stream();
-    at::Tensor shared_out;
-    ScopedMoeSharedOverlapJoin shared_overlap_join(
-        training_ctx, compute_stream);
-    if (shared_overlap) {
-        auto side_stream = begin_moe_shared_overlap(
-            training_ctx, compute_stream);
-        shared_overlap_join.arm();
-        {
-            c10::cuda::CUDAStreamGuard stream_guard(side_stream);
-            shared_out = compute_shared_expert();
-            record_moe_shared_overlap_done(training_ctx);
-        }
-    }
 
     auto router_logits = at::matmul(flat, gate_w.t());
     auto routing_weights = router_logits.softmax(-1, at::kFloat);
@@ -2652,11 +2589,7 @@ static at::Tensor moe_forward(
             (int64_t)reinterpret_cast<uintptr_t>(nccl_stream_v));
     }
 
-    if (shared_overlap) {
-        shared_overlap_join.join();
-    } else {
-        shared_out = compute_shared_expert();
-    }
+    auto shared_out = compute_shared_expert();
 
     // Debug: dump routed_output AFTER loop
     if (getenv("QWEN36_DUMP_MOE")) {
@@ -3205,13 +3138,6 @@ struct TrainingContext {
     int ep_world_size = 1;
     int ep_rank = 0;
     bool expert_parallel = false;
-    // Optional shared-expert compute stream. The stream comes from PyTorch's
-    // per-device pool; events make the shared branch consume the current
-    // activation and publish its result before the residual add.
-    std::optional<c10::cuda::CUDAStream> moe_shared_stream;
-    cudaEvent_t moe_shared_ready_event = nullptr;
-    cudaEvent_t moe_shared_done_event = nullptr;
-    bool moe_shared_overlap_inflight = false;
     // Expert-data-parallel communicator. Routed experts are replicated only
     // across this axis, while dense parameters reduce across both EP and DP.
     ncclComm_t dp_comm = nullptr;
@@ -3269,80 +3195,6 @@ struct TrainingContext {
     int cuda_device = 0;
 // ──────────────────────────────────────────────────────────────────────
 };
-
-static void ensure_moe_shared_overlap_state(TrainingContext* ctx) {
-    TORCH_CHECK(ctx, "MoE shared-expert overlap requires a training context");
-    TORCH_CHECK(!ctx->moe_shared_overlap_inflight,
-        "MoE shared-expert overlap was re-entered before its previous join");
-    cudaSetDevice(ctx->cuda_device);
-    if (!ctx->moe_shared_stream.has_value()) {
-        ctx->moe_shared_stream.emplace(c10::cuda::getStreamFromPool(
-            /*isHighPriority=*/false, ctx->cuda_device));
-    }
-    if (!ctx->moe_shared_ready_event) {
-        TORCH_CHECK(cudaEventCreateWithFlags(
-                &ctx->moe_shared_ready_event, cudaEventDisableTiming) ==
-                cudaSuccess,
-            "failed to create MoE shared-expert producer event");
-    }
-    if (!ctx->moe_shared_done_event) {
-        TORCH_CHECK(cudaEventCreateWithFlags(
-                &ctx->moe_shared_done_event, cudaEventDisableTiming) ==
-                cudaSuccess,
-            "failed to create MoE shared-expert completion event");
-    }
-}
-
-static c10::cuda::CUDAStream begin_moe_shared_overlap(
-    TrainingContext* ctx, cudaStream_t current_stream
-) {
-    ensure_moe_shared_overlap_state(ctx);
-    auto side_stream = *ctx->moe_shared_stream;
-    TORCH_CHECK(cudaEventRecord(
-            ctx->moe_shared_ready_event, current_stream) == cudaSuccess,
-        "failed to record MoE shared-expert producer event");
-    TORCH_CHECK(cudaStreamWaitEvent(
-            side_stream.stream(), ctx->moe_shared_ready_event, 0) ==
-            cudaSuccess,
-        "failed to fence MoE shared-expert compute stream");
-    ctx->moe_shared_overlap_inflight = true;
-    return side_stream;
-}
-
-static void record_moe_shared_overlap_done(TrainingContext* ctx) {
-    TORCH_CHECK(ctx && ctx->moe_shared_overlap_inflight &&
-            ctx->moe_shared_stream.has_value(),
-        "MoE shared-expert completion has no active launch");
-    TORCH_CHECK(cudaEventRecord(
-            ctx->moe_shared_done_event,
-            ctx->moe_shared_stream->stream()) == cudaSuccess,
-        "failed to record MoE shared-expert completion event");
-}
-
-static void join_moe_shared_overlap(
-    TrainingContext* ctx, cudaStream_t current_stream
-) {
-    TORCH_CHECK(ctx && ctx->moe_shared_overlap_inflight,
-        "MoE shared-expert join has no active launch");
-    const auto error = cudaStreamWaitEvent(
-        current_stream, ctx->moe_shared_done_event, 0);
-    if (error == cudaSuccess) ctx->moe_shared_overlap_inflight = false;
-    TORCH_CHECK(error == cudaSuccess,
-        "failed to join MoE shared-expert compute stream");
-}
-
-static void abort_moe_shared_overlap(TrainingContext* ctx) noexcept {
-    if (!ctx || !ctx->moe_shared_overlap_inflight ||
-        !ctx->moe_shared_stream.has_value()) return;
-    cudaSetDevice(ctx->cuda_device);
-    const auto error = cudaStreamSynchronize(ctx->moe_shared_stream->stream());
-    if (error != cudaSuccess) {
-        std::fprintf(stderr,
-            "[q36_moe] shared-expert stream recovery failed: %s\n",
-            cudaGetErrorString(error));
-    }
-    ctx->moe_shared_overlap_inflight = false;
-}
 
 static at::Tensor derive_attention_mask(
     TrainingContext* ctx, const at::Tensor& input_ids
@@ -3614,7 +3466,6 @@ static void hash_collective_runtime_environment(AdapterRegistryHash& hash) {
     hash.add_u64(env_enabled("QWEN36_EP_A2A"));
     hash.add_u64(env_enabled("QWEN36_EP_A2A_SHARDED"));
     hash.add_u64(env_enabled("QWEN36_EP_A2A_PACKED", true));
-    hash.add_u64(env_enabled("QWEN36_MOE_SHARED_EXPERT_OVERLAP"));
     hash.add_u64(env_enabled("QWEN36_DISABLE_GROUPED_MM"));
     hash.add_u64(env_enabled("QWEN36_GROUPED_LORA_SYNC", true));
     hash.add_u64(env_enabled("QWEN36_PACKED_LORA_SYNC", true));
@@ -11895,18 +11746,6 @@ __attribute__((visibility("default"))) int32_t qwen36_set_lora_tensor(
 __attribute__((visibility("default"))) void qwen36_free_training_context(void* ctx_ptr) {
     if (ctx_ptr) {
         auto* ctx = reinterpret_cast<TrainingContext*>(ctx_ptr);
-        if (ctx->moe_shared_stream.has_value()) {
-            cudaSetDevice(ctx->cuda_device);
-            cudaStreamSynchronize(ctx->moe_shared_stream->stream());
-        }
-        if (ctx->moe_shared_ready_event) {
-            cudaEventDestroy(ctx->moe_shared_ready_event);
-            ctx->moe_shared_ready_event = nullptr;
-        }
-        if (ctx->moe_shared_done_event) {
-            cudaEventDestroy(ctx->moe_shared_done_event);
-            ctx->moe_shared_done_event = nullptr;
-        }
         // Don't destroy NCCL communicator — it's a process-level singleton
         // (g_nccl_comm). It must survive context destruction so the next
         // session can reuse it. Destroying it would break NCCL for all
