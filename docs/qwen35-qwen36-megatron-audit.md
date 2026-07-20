@@ -165,6 +165,8 @@ ABI15 的两层 GDN base-TP smoke 覆盖复合 QKV/conv head shard、Z/A/B/A_log
 
 本轮再新增 H20 ABI1 `mtp-tp-smoke`：TP2 两 rank 对主层和 dense MTP prediction layer 同时使用 attention/MLP 列/行并行，embedding/LM-head 保持 replicated，两个 selected dynamic tenant 与一个未选 tenant 对照单卡 full-weight oracle。两 rank 的 `loss_diff` 最大 `3.53e-3`、参数差最大 `1.87e-9`、Adam m/v 差最大 `2.14e-5/3.23e-9`，未选状态逐位不变；开启 `QWEN36_FUSED_QKV=1` 与 `QWEN36_FUSED_MLP_FC1=1` 后仍通过。后续真实 MoE prediction-layer TP2 MTP oracle 的 `loss_diff=1.50e-3`、参数差 `3.05e-5`；vocabulary-parallel MTP 的 `loss_diff=3.62e-3`、参数差 `2.01e-3`，未选状态均逐位不变。MTP token counts 在 TP 只做 min/max 一致性检查，不做求和，避免重复放大 hidden gradient。TP2xEP2 uneven source-token-count MTP 也已通过（main/MTP tokens `7/5`，loss diff `4.38e-4`，参数差 `2.01e-3`）。这些仍是受限 oracle，不覆盖 PP/CP MTP 或完整模型长跑。
 
+本轮对 heterogeneous selected-v2 的 registry 管理做了小范围优化：恢复阶段按保存的 canonical index 原位放回 selected adapter，避免每次训练构造完整 merged registry 和对每个 selected adapter 做二次线性搜索；仅当 active set 足够大时建立 ID hash index，稀疏选择保留线性路径以避免每步构造大表。H20 TP2 x EP2、`B=8,S=128,H=1024,I=2048`、q_proj-only、8 active tenants 的 30-step p50/p95 为 `10.574/11.411 ms`；注册 1024 tenants 但仍 active 8 时为 `10.773/11.150 ms`，相对既有 `10.946 ms` p50 基线约下降 `1.6%`。local smoke、padded TP2xEP2、显式 grouped fallback 和 uneven-MTP 均通过；该结果只证明当前 synthetic registry overhead 的改善，不等于完整模型端到端收益。
+
 这里“尚未完成 CP model execution”指任意五维组合、ring attention 和长序列 CP；本轮 CP2 结果是严格受限的 dense GDN 单轴切片，不应外推为完整 Megatron CP。
 
 ## 继续达到 Megatron 级别所需的最小工作包

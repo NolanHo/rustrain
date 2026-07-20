@@ -13096,9 +13096,7 @@ static double qwen36_train_multi_lora_selected_impl(
     auto* ctx = reinterpret_cast<TrainingContext*>(ctx_ptr);
     std::vector<TrainingContext::LoRAAdapter> original;
     std::vector<TrainingContext::LoRAAdapter> selected;
-    std::vector<TrainingContext::LoRAAdapter> merged;
     std::vector<size_t> selected_indexes;
-    std::vector<uint8_t> moved;
     std::vector<int64_t> original_steps;
     bool recovery_failed = false;
     bool registry_detached = false;
@@ -13108,20 +13106,18 @@ static double qwen36_train_multi_lora_selected_impl(
     at::Tensor global_adapter_loss_values;
     auto restore_registry = [&]() {
         if (!ctx || !registry_detached) return;
-        for (size_t index = 0; index < original.size(); ++index) {
-            if (!moved[index]) {
-                merged.push_back(std::move(original[index]));
-                continue;
-            }
-            auto selected_it = std::find(
-                selected_indexes.begin(), selected_indexes.end(), index);
-            TORCH_CHECK(selected_it != selected_indexes.end(),
-                "heterogeneous selected adapter index disappeared: ", index);
-            const size_t selected_index = static_cast<size_t>(
-                selected_it - selected_indexes.begin());
-            merged.push_back(std::move(selected[selected_index]));
+        TORCH_CHECK(selected.size() == selected_indexes.size(),
+            "heterogeneous selected adapter restore count mismatch");
+        for (size_t selected_index = 0;
+             selected_index < selected.size(); ++selected_index) {
+            const size_t original_index = selected_indexes[selected_index];
+            TORCH_CHECK(original_index < original.size(),
+                "heterogeneous selected adapter restore index is out of range: ",
+                original_index);
+            original[original_index] = std::move(selected[selected_index]);
         }
-        ctx->adapters.swap(merged);
+        ctx->adapters.clear();
+        ctx->adapters.swap(original);
         registry_detached = false;
     };
     auto rollback = [&]() {
@@ -13276,6 +13272,21 @@ static double qwen36_train_multi_lora_selected_impl(
         auto& target_mask = *target_mask_tensor;
 
         const size_t original_count = ctx->adapters.size();
+        // Sparse selections are cheaper to resolve with the existing linear scan;
+        // build an index only when the requested set is large enough to amortize it.
+        const bool use_adapter_index =
+            n_adapters >= (original_count + static_cast<size_t>(7)) / 8;
+        std::unordered_map<int64_t, size_t> adapter_indexes;
+        if (use_adapter_index) {
+            adapter_indexes.reserve(original_count);
+            for (size_t index = 0; index < original_count; ++index) {
+                const bool inserted = adapter_indexes.emplace(
+                    ctx->adapters[index].id, index).second;
+                TORCH_CHECK(inserted,
+                    "duplicate heterogeneous registered adapter ID: ",
+                    ctx->adapters[index].id);
+            }
+        }
         std::vector<size_t> requested_indexes;
         std::vector<uint8_t> requested(original_count, 0);
         requested_indexes.reserve(n_adapters);
@@ -13283,16 +13294,24 @@ static double qwen36_train_multi_lora_selected_impl(
              request_index < n_adapters; ++request_index) {
             TORCH_CHECK(adapter_ids[request_index] > 0,
                 "heterogeneous selected adapter IDs must be positive");
-            auto it = std::find_if(
-                ctx->adapters.begin(), ctx->adapters.end(),
-                [&](const auto& adapter) {
-                    return adapter.id == adapter_ids[request_index];
-                });
-            TORCH_CHECK(it != ctx->adapters.end(),
-                "unknown heterogeneous selected adapter ID: ",
-                adapter_ids[request_index]);
-            const size_t index = static_cast<size_t>(
-                it - ctx->adapters.begin());
+            size_t index = 0;
+            if (use_adapter_index) {
+                const auto it = adapter_indexes.find(adapter_ids[request_index]);
+                TORCH_CHECK(it != adapter_indexes.end(),
+                    "unknown heterogeneous selected adapter ID: ",
+                    adapter_ids[request_index]);
+                index = it->second;
+            } else {
+                const auto it = std::find_if(
+                    ctx->adapters.begin(), ctx->adapters.end(),
+                    [&](const auto& adapter) {
+                        return adapter.id == adapter_ids[request_index];
+                    });
+                TORCH_CHECK(it != ctx->adapters.end(),
+                    "unknown heterogeneous selected adapter ID: ",
+                    adapter_ids[request_index]);
+                index = static_cast<size_t>(it - ctx->adapters.begin());
+            }
             TORCH_CHECK(!requested[index],
                 "duplicate heterogeneous selected adapter ID: ",
                 adapter_ids[request_index]);
@@ -13301,14 +13320,11 @@ static double qwen36_train_multi_lora_selected_impl(
         }
         original.reserve(original_count);
         selected.reserve(n_adapters);
-        merged.reserve(original_count);
         selected_indexes.reserve(n_adapters);
-        moved.resize(original_count, 0);
         original.swap(ctx->adapters);
         registry_detached = true;
         original_steps.reserve(requested_indexes.size());
         for (const size_t index : requested_indexes) {
-            moved[index] = 1;
             selected_indexes.push_back(index);
             original_steps.push_back(original[index].optimizer_step);
             selected.push_back(std::move(original[index]));
