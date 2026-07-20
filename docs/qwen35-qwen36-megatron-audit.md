@@ -260,7 +260,17 @@ ATen/C++ kernel 路径因此仍是可复现基线。
 现在通过 bulk host import 保持 restore 后 GPU resident count 为 0，首次选中 tenant
 时才按 pair hydrate。H20 local 与 TP2xEP2 distributed smoke 验证了 step-0/step-1、
 重复 snapshot、partial-import 原子失败、恢复 parity 和 resident count；这减少保存
-与恢复时的 GPU materialization，但还不是完整 CPU optimizer paging/offload/LRU。
+与恢复时的 GPU materialization。新增的动态 Adam host paging 保持默认关闭；仅当
+`QWEN36_DYNAMIC_ADAM_HOST_PAGING=1` 且
+`QWEN36_DYNAMIC_ADAM_RESIDENT_BYTES=<bytes>` 有效时，selected finalizer 全秩成功、
+canonical registry 恢复且 transaction/shadow 释放后，才按 tenant 最近成功访问顺序
+逐出本轮未选中的冷 m/v。逐出先原子发布完整 host snapshot，再用 map swap 清空
+device state；刚训练的 tenant 始终受保护，因此 budget 是 best-effort。默认路径不做
+device 同步，超预算逐出才付出 checkpoint 级同步与 D2H copy；paging 失败保留原 device
+state，也不会把已 commit 的 step 误报为训练失败。native TP/EP smoke 覆盖两 tenant、
+零预算逐出、CPU getter 不触发 hydrate，以及被逐出 tenant 下一步相对 resident oracle
+的 loss、参数和 m/v 精确 parity。该实现尚未覆盖异步 pinned D2H、prefetch、PP window
+逐出或跨进程共享 host tier，不能等同于 Megatron distributed optimizer/offload。
 
 ## 继续达到 Megatron 级别所需的最小工作包
 

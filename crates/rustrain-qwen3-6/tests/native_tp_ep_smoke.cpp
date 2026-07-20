@@ -78,6 +78,8 @@ extern "C" int32_t qwen36_import_adapter_optimizer_state_host_v1(
     int64_t, int64_t);
 extern "C" int64_t qwen36_get_adapter_optimizer_resident_count_v1(
     void*, int64_t);
+extern "C" int64_t qwen36_get_adapter_optimizer_resident_bytes_v1(
+    void*, int64_t);
 extern "C" int32_t qwen36_set_adapter_optimizer_tensor(
     void*, int64_t, int64_t, const char*, int32_t, int32_t, void*);
 extern "C" int64_t qwen36_get_adapter_step_count(void*, int64_t);
@@ -1433,6 +1435,61 @@ int main() {
         }
     }
     assert(resumed_dynamic_diff == 0.0);
+
+    // A zero-byte paging budget protects the selected tenant and evicts the
+    // colder resident tenant. The evicted tenant must hydrate from its host
+    // snapshot and preserve exact next-step parity with the resident oracle.
+    assert(qwen36_get_adapter_optimizer_resident_bytes_v1(
+        distributed, tenant_one) > 0);
+    assert(qwen36_get_adapter_optimizer_resident_bytes_v1(
+        distributed, tenant_two) > 0);
+    setenv("QWEN36_DYNAMIC_ADAM_HOST_PAGING", "1", 1);
+    setenv("QWEN36_DYNAMIC_ADAM_RESIDENT_BYTES", "0", 1);
+    const double paging_trigger_loss = qwen36_train_multi_lora_selected(
+        distributed, &local_batch.input_ids, &local_batch.target_mask,
+        &local_batch.attention_mask, &tenant_two, 1, kLoraRank);
+    assert(std::isfinite(paging_trigger_loss) && paging_trigger_loss >= 0.0);
+    assert(qwen36_get_adapter_optimizer_resident_bytes_v1(
+        distributed, tenant_one) == 0);
+    assert(qwen36_get_adapter_optimizer_resident_bytes_v1(
+        distributed, tenant_two) > 0);
+    const auto paged_tenant_one_m = dynamic_state_cpu(
+        distributed, tenant_one, dynamic_one.front().module, false, false);
+    assert(qwen36_get_adapter_optimizer_resident_bytes_v1(
+        distributed, tenant_one) == 0);
+    assert(max_diff(paged_tenant_one_m, *dynamic_state(
+        resumed, resumed_tenant_one, dynamic_one.front().module,
+        false, false)) == 0.0);
+    unsetenv("QWEN36_DYNAMIC_ADAM_HOST_PAGING");
+    unsetenv("QWEN36_DYNAMIC_ADAM_RESIDENT_BYTES");
+
+    const double paged_next_loss = qwen36_train_multi_lora_selected(
+        distributed, &local_batch.input_ids, &local_batch.target_mask,
+        &local_batch.attention_mask, &tenant_one, 1, kLoraRank);
+    const double resident_next_loss = qwen36_train_multi_lora_selected(
+        resumed, &local_batch.input_ids, &local_batch.target_mask,
+        &local_batch.attention_mask, &resumed_tenant_one, 1, kLoraRank);
+    assert(std::abs(paged_next_loss - resident_next_loss) <= 1e-6);
+    assert(qwen36_get_adapter_step_count(distributed, tenant_one) == 3);
+    assert(qwen36_get_adapter_step_count(resumed, resumed_tenant_one) == 3);
+    double paging_resume_diff = 0.0;
+    for (const auto& fixture : dynamic_one) {
+        for (int is_b = 0; is_b < 2; ++is_b) {
+            paging_resume_diff = std::max(paging_resume_diff, max_diff(
+                *dynamic_tensor(
+                    distributed, tenant_one, fixture.module, is_b),
+                *dynamic_tensor(
+                    resumed, resumed_tenant_one, fixture.module, is_b)));
+            for (int is_v = 0; is_v < 2; ++is_v) {
+                paging_resume_diff = std::max(paging_resume_diff, max_diff(
+                    *dynamic_state(distributed, tenant_one,
+                        fixture.module, is_b, is_v),
+                    *dynamic_state(resumed, resumed_tenant_one,
+                        fixture.module, is_b, is_v)));
+            }
+        }
+    }
+    assert(paging_resume_diff == 0.0);
 
     const int64_t heterogeneous_tenant = qwen36_add_lora_v2(
         distributed, 3, 3.0, &target_layer, 1, projection_targets);

@@ -3674,6 +3674,7 @@ struct TrainingContext {
         std::map<int64_t, std::vector<std::array<at::Tensor, 4>>>
             adam_host_state;
         int64_t adam_host_step = -1;
+        uint64_t adam_last_used_tick = 0;
         // Reusable out-of-place Adam destinations. Each entry stores
         // {param_a, m_a, v_a, param_b, m_b, v_b}; a successful transaction
         // swaps these handles with the live registry without allocating.
@@ -3706,6 +3707,7 @@ struct TrainingContext {
     int64_t multi_lora_invocation = 0;
     int64_t dynamic_finalizer_count = 0;
     int64_t dynamic_adam_launch_count = 0;
+    uint64_t dynamic_adam_lru_tick = 0;
     bool dynamic_adam_transaction_active = false;
     bool restore_without_parameter_sync = false;
     bool allow_heterogeneous_registration = false;
@@ -6092,6 +6094,132 @@ static void snapshot_dynamic_adam_state_to_host(
         "dynamic Adam changed while creating its host snapshot");
     adapter.adam_host_state.swap(snapshot);
     adapter.adam_host_step = snapshot_step;
+}
+
+static uint64_t dynamic_adam_resident_bytes(
+    const TrainingContext::LoRAAdapter& adapter
+) {
+    uint64_t bytes = 0;
+    for (const auto& [layer_idx, states] : adapter.adam_state) {
+        (void)layer_idx;
+        for (const auto& state : states) {
+            for (const auto& tensor : state) {
+                if (!tensor.defined()) continue;
+                const uint64_t count = static_cast<uint64_t>(tensor.numel());
+                const uint64_t width =
+                    static_cast<uint64_t>(tensor.element_size());
+                if (width != 0 && count >
+                        (std::numeric_limits<uint64_t>::max() - bytes) / width)
+                    return std::numeric_limits<uint64_t>::max();
+                bytes += count * width;
+            }
+        }
+    }
+    return bytes;
+}
+
+static void clear_dynamic_adam_device_state(
+    TrainingContext::LoRAAdapter& adapter
+) {
+    std::map<int64_t, std::vector<std::array<at::Tensor, 4>>> empty_state;
+    for (const auto& [layer_idx, pairs] : adapter.params) {
+        empty_state.emplace(layer_idx,
+            std::vector<std::array<at::Tensor, 4>>(pairs.size()));
+    }
+    adapter.adam_state.swap(empty_state);
+}
+
+static bool try_dynamic_adam_resident_budget(uint64_t* budget) {
+    if (!budget) return false;
+    const char* value = std::getenv(
+        "QWEN36_DYNAMIC_ADAM_RESIDENT_BYTES");
+    if (!value || value[0] == '\0' || value[0] == '-') return false;
+    errno = 0;
+    char* end = nullptr;
+    const unsigned long long parsed = std::strtoull(value, &end, 10);
+    if (errno == ERANGE || !end || *end != '\0') return false;
+    *budget = static_cast<uint64_t>(parsed);
+    return true;
+}
+
+// Paging is intentionally a post-commit, best-effort maintenance action. It
+// must never turn an already committed optimizer step into a reported failure.
+static void page_cold_dynamic_adam_state(
+    TrainingContext* ctx, const int64_t* protected_ids,
+    int32_t protected_count
+) noexcept {
+    if (!ctx || !env_enabled("QWEN36_DYNAMIC_ADAM_HOST_PAGING")) return;
+    uint64_t budget = 0;
+    if (!try_dynamic_adam_resident_budget(&budget)) {
+        fprintf(stderr,
+            "[q36] dynamic Adam paging ignored invalid or missing "
+            "QWEN36_DYNAMIC_ADAM_RESIDENT_BYTES\n");
+        return;
+    }
+    try {
+        TORCH_CHECK(!ctx->dynamic_adam_transaction_active,
+            "dynamic Adam paging requires a completed transaction");
+        if (ctx->dynamic_adam_lru_tick ==
+                std::numeric_limits<uint64_t>::max()) {
+            ctx->dynamic_adam_lru_tick = 0;
+            for (auto& adapter : ctx->adapters)
+                adapter.adam_last_used_tick = 0;
+        }
+        const uint64_t access_tick = ++ctx->dynamic_adam_lru_tick;
+        std::set<int64_t> protected_set;
+        for (int32_t index = 0; index < protected_count; ++index) {
+            if (protected_ids && protected_ids[index] > 0)
+                protected_set.insert(protected_ids[index]);
+        }
+        for (auto& adapter : ctx->adapters) {
+            if (protected_set.count(adapter.id) != 0)
+                adapter.adam_last_used_tick = access_tick;
+        }
+
+        uint64_t resident = 0;
+        std::vector<TrainingContext::LoRAAdapter*> candidates;
+        for (auto& adapter : ctx->adapters) {
+            const uint64_t adapter_bytes =
+                dynamic_adam_resident_bytes(adapter);
+            if (adapter_bytes > std::numeric_limits<uint64_t>::max() - resident)
+                resident = std::numeric_limits<uint64_t>::max();
+            else
+                resident += adapter_bytes;
+            if (adapter_bytes > 0 &&
+                    protected_set.count(adapter.id) == 0)
+                candidates.push_back(&adapter);
+        }
+        if (resident <= budget) return;
+        std::sort(candidates.begin(), candidates.end(),
+            [](const auto* lhs, const auto* rhs) {
+                if (lhs->adam_last_used_tick != rhs->adam_last_used_tick)
+                    return lhs->adam_last_used_tick < rhs->adam_last_used_tick;
+                return lhs->id < rhs->id;
+            });
+        for (auto* adapter : candidates) {
+            if (resident <= budget) break;
+            const uint64_t adapter_bytes =
+                dynamic_adam_resident_bytes(*adapter);
+            if (adapter_bytes == 0) continue;
+            try {
+                if (adapter->optimizer_step > 0)
+                    snapshot_dynamic_adam_state_to_host(ctx, *adapter);
+                clear_dynamic_adam_device_state(*adapter);
+                resident = adapter_bytes >= resident
+                    ? 0
+                    : resident - adapter_bytes;
+            } catch (const std::exception& error) {
+                fprintf(stderr,
+                    "[q36] dynamic Adam paging kept adapter %ld resident: %s\n",
+                    static_cast<long>(adapter->id), error.what());
+            }
+        }
+    } catch (const std::exception& error) {
+        fprintf(stderr, "[q36] dynamic Adam paging skipped: %s\n",
+            error.what());
+    } catch (...) {
+        fprintf(stderr, "[q36] dynamic Adam paging skipped: unknown error\n");
+    }
 }
 
 static bool dynamic_adam_shadow_layout_matches(
@@ -14263,6 +14391,9 @@ __attribute__((visibility("default"))) double qwen36_train_multi_lora_selected(
             ctx_ptr, input_ids_ptr, target_mask_ptr, attention_mask_ptr,
             n_adapters, lora_rank);
         restore_registry();
+        if (std::isfinite(loss) && loss >= 0.0)
+            page_cold_dynamic_adam_state(
+                ctx, adapter_ids, n_adapters);
         return loss;
     } catch (const std::exception& e) {
         try {
@@ -14903,6 +15034,7 @@ static double qwen36_train_multi_lora_selected_impl(
         restore_registry();
         release_dynamic_adam_shadows(ctx);
         if (ctx) ctx->dynamic_adam_transaction_active = false;
+        page_cold_dynamic_adam_state(ctx, adapter_ids, n_adapters);
         return train_loss;
     } catch (const std::exception& e) {
         recover();
@@ -16587,6 +16719,23 @@ int64_t qwen36_get_adapter_optimizer_resident_count_v1(
         }
     }
     return count;
+}
+
+__attribute__((visibility("default")))
+int64_t qwen36_get_adapter_optimizer_resident_bytes_v1(
+    void* ctx_ptr, int64_t adapter_id
+) {
+    auto* ctx = reinterpret_cast<TrainingContext*>(ctx_ptr);
+    if (!ctx || adapter_id <= 0) return -1;
+    size_t adapter_index = 0;
+    if (!find_canonical_adapter_index(ctx, adapter_id, adapter_index))
+        return -1;
+    const uint64_t bytes = dynamic_adam_resident_bytes(
+        ctx->adapters[adapter_index]);
+    return bytes > static_cast<uint64_t>(
+            std::numeric_limits<int64_t>::max())
+        ? std::numeric_limits<int64_t>::max()
+        : static_cast<int64_t>(bytes);
 }
 
 __attribute__((visibility("default")))
