@@ -239,6 +239,28 @@ GDN persistent forward 与 checkpoint replay 的 token-loop barrier 已按列独
 
 这里“尚未完成 CP model execution”指任意五维组合、ring attention 和长序列 CP；当前新增的 full-attention CP2 仅是 opt-in KV all-gather correctness bridge，和 GDN CP2 一样不应外推为完整 Megatron CP。
 
+本轮 EP dispatch 新增默认关闭的 `QWEN36_EP_A2A_COUNT_OVERLAP=1`：count
+all-gather、compact metadata copy 和 host prefix bookkeeping 使用独立的
+non-blocking CUDA stream，并与当前 stream 的 token packing 建立 event 依赖；
+flag 关闭时保留原路径。H20 TP2xEP2 dynamic matched smoke（packed A2A、
+fused local permutation/weighted unpermute）以及 local/distributed correctness
+均通过。`B=8,S=128,H=1024,I=2048` 的 50-iteration A/B mean 为
+`13.625/13.807 ms`（overlap on/off），但 `B=8,S=512,H=2048,I=4096` 的
+matched mean 为 `52.758/52.772 ms`，因此没有稳定端到端收益，不能宣称已达到
+Megatron/DeepEP 的通信计算重叠。
+
+H20 依赖审计确认项目 ABI1 PyTorch 2.12.1/cu130 环境没有可直接复用的
+Transformer Engine、DeepEP、FLA 或 standalone flash-attn 预编译包；PyTorch
+自带 Flash-SDPA 在 H20 上可用。没有安装依赖、没有 JIT workaround，当前 native
+ATen/C++ kernel 路径因此仍是可复现基线。
+
+动态 Adam checkpoint 保存新增 host-authoritative CPU snapshot（ABI30）。
+第一次导出按 tenant optimizer clock 将完整 FP32 m/v 从 GPU 拷到临时 host map，
+原子发布后四个 getter 复用该 snapshot；step 0 仍使用隐式零状态，restore 路径
+暂时保持旧的 GPU materialize 语义。H20 local 与 TP2xEP2 distributed smoke
+验证了 step-0/step-1、重复 snapshot、恢复 parity；这减少保存时的重复 GPU
+materialization，但还不是完整 CPU optimizer paging/offload。
+
 ## 继续达到 Megatron 级别所需的最小工作包
 
 1. 为已实现的 opt-in server batch coalescing 增加 HTTP response capability/version negotiation，使支持 per-adapter loss 的客户端可取消显式 aggregate opt-in；补齐 padding rank inflation 容量模型和长尾 benchmark。

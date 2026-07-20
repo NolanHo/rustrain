@@ -71,6 +71,8 @@ extern "C" int32_t qwen36_set_adapter_lora_tensor(
     void*, int64_t, int64_t, const char*, int32_t, void*);
 extern "C" void* qwen36_get_adapter_optimizer_tensor(
     void*, int64_t, int64_t, const char*, int32_t, int32_t);
+extern "C" int32_t qwen36_export_adapter_optimizer_tensor_cpu_v1(
+    void*, int64_t, int64_t, const char*, int32_t, int32_t, void**);
 extern "C" int32_t qwen36_set_adapter_optimizer_tensor(
     void*, int64_t, int64_t, const char*, int32_t, int32_t, void*);
 extern "C" int64_t qwen36_get_adapter_step_count(void*, int64_t);
@@ -90,10 +92,11 @@ extern "C" int32_t qwen36_train_multi_lora_selected_v3(
     void*, void*, void*, void*, const int64_t*, int32_t,
     double*, double*, int32_t);
 extern "C" void qwen36_free_training_context(void*);
+extern "C" void qwen36_free_tensor(void*);
 
 namespace {
 
-constexpr int64_t kAbiVersion = 29;
+constexpr int64_t kAbiVersion = 30;
 constexpr int32_t kBaseTpAttention = 1 << 0;
 constexpr int32_t kDataParallel = 1 << 1;
 constexpr int32_t kVocabParallel = 1 << 2;
@@ -505,6 +508,22 @@ at::Tensor* dynamic_state(
             is_b ? 1 : 0, is_v ? 1 : 0));
     assert(tensor && tensor->scalar_type() == at::kFloat);
     return tensor;
+}
+
+at::Tensor dynamic_state_cpu(
+    void* context, int64_t adapter_id, const char* module,
+    bool is_b, bool is_v
+) {
+    void* output = nullptr;
+    assert(qwen36_export_adapter_optimizer_tensor_cpu_v1(
+        context, adapter_id, 0, module,
+        is_b ? 1 : 0, is_v ? 1 : 0, &output) == 0);
+    auto* tensor = reinterpret_cast<at::Tensor*>(output);
+    assert(tensor && tensor->device().is_cpu() &&
+        tensor->scalar_type() == at::kFloat && tensor->is_contiguous());
+    auto result = *tensor;
+    qwen36_free_tensor(output);
+    return result;
 }
 
 void set_distributed_env(
@@ -1094,6 +1113,11 @@ int main() {
         tp_rank, ep_rank, 4001, base_tp_mlp);
     install_dynamic(distributed, tenant_one, dynamic_one, true);
     install_dynamic(distributed, tenant_two, dynamic_two, true);
+    void* untrained_state = reinterpret_cast<void*>(1);
+    assert(qwen36_export_adapter_optimizer_tensor_cpu_v1(
+        distributed, tenant_one, 0, dynamic_one.front().module,
+        0, 0, &untrained_state) == 1);
+    assert(untrained_state == nullptr);
     // A selected dynamic tenant owns one activation row locally. Its full-rank
     // oracle must aggregate every source row into one adapter update, which a
     // fresh fixed-LoRA context does without conflating rows with tenant IDs.
@@ -1289,6 +1313,11 @@ int main() {
 
     // Round-trip one tenant through CPU tensors and its independent optimizer
     // clock, then require exact next-step parity with the uninterrupted context.
+    const auto first_host_snapshot = dynamic_state_cpu(
+        distributed, tenant_one, dynamic_one.front().module, false, false);
+    const auto repeated_host_snapshot = dynamic_state_cpu(
+        distributed, tenant_one, dynamic_one.front().module, false, false);
+    assert(max_diff(first_host_snapshot, repeated_host_snapshot) == 0.0);
     std::vector<std::array<at::Tensor, 6>> dynamic_checkpoint;
     dynamic_checkpoint.reserve(dynamic_one.size());
     for (const auto& fixture : dynamic_one) {
@@ -1297,14 +1326,14 @@ int main() {
                 ->to(at::kCPU).clone(),
             dynamic_tensor(distributed, tenant_one, fixture.module, true)
                 ->to(at::kCPU).clone(),
-            dynamic_state(distributed, tenant_one, fixture.module, false, false)
-                ->to(at::kCPU).clone(),
-            dynamic_state(distributed, tenant_one, fixture.module, false, true)
-                ->to(at::kCPU).clone(),
-            dynamic_state(distributed, tenant_one, fixture.module, true, false)
-                ->to(at::kCPU).clone(),
-            dynamic_state(distributed, tenant_one, fixture.module, true, true)
-                ->to(at::kCPU).clone(),
+            dynamic_state_cpu(
+                distributed, tenant_one, fixture.module, false, false),
+            dynamic_state_cpu(
+                distributed, tenant_one, fixture.module, false, true),
+            dynamic_state_cpu(
+                distributed, tenant_one, fixture.module, true, false),
+            dynamic_state_cpu(
+                distributed, tenant_one, fixture.module, true, true),
         });
     }
     const int64_t resumed_tenant_one = qwen36_add_lora_for_restore(

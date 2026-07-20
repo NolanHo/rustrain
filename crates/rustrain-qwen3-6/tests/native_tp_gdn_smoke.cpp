@@ -64,7 +64,7 @@ extern "C" void qwen36_free_training_context(void*);
 
 namespace {
 
-constexpr int64_t kAbiVersion = 29;
+constexpr int64_t kAbiVersion = 30;
 constexpr int32_t kBaseTpAttention = 1 << 0;
 constexpr int32_t kVocabParallel = 1 << 2;
 constexpr int64_t kLayers = 2;

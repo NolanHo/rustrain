@@ -1909,13 +1909,19 @@ impl TrainingSession for Qwen36Session {
                     if optimizer_step > 0 {
                         // Keep one m/v entry for each A and B tensor, in slot order.
                         dynamic_m.push(
-                            ctx.get_adapter_optimizer_tensor(
+                            ctx.export_adapter_optimizer_tensor_cpu(
                                 adapter_id,
                                 slot.layer as i64,
                                 module,
                                 false,
                                 false,
                             )
+                            .with_context(|| {
+                                format!(
+                                    "export dynamic LoRA m_a: adapter={adapter_id} layer={} module={module}",
+                                    slot.layer
+                                )
+                            })?
                             .with_context(|| {
                                 format!(
                                     "dynamic LoRA m_a is missing: adapter={adapter_id} layer={} module={module}",
@@ -1924,13 +1930,19 @@ impl TrainingSession for Qwen36Session {
                             })?,
                         );
                         dynamic_m.push(
-                            ctx.get_adapter_optimizer_tensor(
+                            ctx.export_adapter_optimizer_tensor_cpu(
                                 adapter_id,
                                 slot.layer as i64,
                                 module,
                                 true,
                                 false,
                             )
+                            .with_context(|| {
+                                format!(
+                                    "export dynamic LoRA m_b: adapter={adapter_id} layer={} module={module}",
+                                    slot.layer
+                                )
+                            })?
                             .with_context(|| {
                                 format!(
                                     "dynamic LoRA m_b is missing: adapter={adapter_id} layer={} module={module}",
@@ -1939,7 +1951,7 @@ impl TrainingSession for Qwen36Session {
                             })?,
                         );
                         dynamic_v.push(
-                            ctx.get_adapter_optimizer_tensor(
+                            ctx.export_adapter_optimizer_tensor_cpu(
                                 adapter_id,
                                 slot.layer as i64,
                                 module,
@@ -1948,13 +1960,19 @@ impl TrainingSession for Qwen36Session {
                             )
                             .with_context(|| {
                                 format!(
+                                    "export dynamic LoRA v_a: adapter={adapter_id} layer={} module={module}",
+                                    slot.layer
+                                )
+                            })?
+                            .with_context(|| {
+                                format!(
                                     "dynamic LoRA v_a is missing: adapter={adapter_id} layer={} module={module}",
                                     slot.layer
                                 )
                             })?,
                         );
                         dynamic_v.push(
-                            ctx.get_adapter_optimizer_tensor(
+                            ctx.export_adapter_optimizer_tensor_cpu(
                                 adapter_id,
                                 slot.layer as i64,
                                 module,
@@ -1963,12 +1981,27 @@ impl TrainingSession for Qwen36Session {
                             )
                             .with_context(|| {
                                 format!(
+                                    "export dynamic LoRA v_b: adapter={adapter_id} layer={} module={module}",
+                                    slot.layer
+                                )
+                            })?
+                            .with_context(|| {
+                                format!(
                                     "dynamic LoRA v_b is missing: adapter={adapter_id} layer={} module={module}",
                                     slot.layer
                                 )
                             })?,
                         );
                     }
+                }
+                let snapshot_step = u64::try_from(
+                    ctx.get_adapter_step_count(adapter_id)?,
+                )
+                .context("native dynamic adapter optimizer step is negative after export")?;
+                if snapshot_step != optimizer_step {
+                    bail!(
+                        "dynamic adapter {adapter_id} optimizer step changed during checkpoint export: {optimizer_step} -> {snapshot_step}"
+                    );
                 }
                 let optimizer = self
                     .dynamic_lora_optimizer_configs

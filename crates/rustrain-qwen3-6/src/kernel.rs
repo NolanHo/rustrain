@@ -284,6 +284,15 @@ type FnSetAdapterLoraTensor =
 type FnSetAdapterId = unsafe extern "C" fn(*mut c_void, i64, i64) -> i32;
 type FnGetAdapterOptimizerTensor =
     unsafe extern "C" fn(*mut c_void, i64, i64, *const i8, i32, i32) -> *mut c_void;
+type FnExportAdapterOptimizerTensorCpuV1 = unsafe extern "C" fn(
+    *mut c_void,
+    i64,
+    i64,
+    *const i8,
+    i32,
+    i32,
+    *mut *mut c_void,
+) -> i32;
 type FnSetAdapterOptimizerTensor =
     unsafe extern "C" fn(*mut c_void, i64, i64, *const i8, i32, i32, *mut c_void) -> i32;
 type FnGetAdapterStepCount = unsafe extern "C" fn(*mut c_void, i64) -> i64;
@@ -373,6 +382,7 @@ struct KernelHandles {
     set_adapter_lora_tensor: FnSetAdapterLoraTensor,
     set_adapter_id: FnSetAdapterId,
     get_adapter_optimizer_tensor: FnGetAdapterOptimizerTensor,
+    export_adapter_optimizer_tensor_cpu: FnExportAdapterOptimizerTensorCpuV1,
     set_adapter_optimizer_tensor: FnSetAdapterOptimizerTensor,
     get_adapter_step_count: FnGetAdapterStepCount,
     set_adapter_step_count: FnSetAdapterStepCount,
@@ -418,7 +428,7 @@ unsafe fn load_kernels() -> Option<KernelHandles> {
         }};
     }
     let abi_version: FnKernelAbiVersion = sym!("qwen36_kernel_abi_version");
-    if abi_version() != 29 {
+    if abi_version() != 30 {
         return None;
     }
     let add_lora_with_optimizer = {
@@ -572,6 +582,9 @@ unsafe fn load_kernels() -> Option<KernelHandles> {
         set_adapter_lora_tensor: sym!("qwen36_set_adapter_lora_tensor"),
         set_adapter_id: sym!("qwen36_set_adapter_id"),
         get_adapter_optimizer_tensor: sym!("qwen36_get_adapter_optimizer_tensor"),
+        export_adapter_optimizer_tensor_cpu: sym!(
+            "qwen36_export_adapter_optimizer_tensor_cpu_v1"
+        ),
         set_adapter_optimizer_tensor: sym!("qwen36_set_adapter_optimizer_tensor"),
         get_adapter_step_count: sym!("qwen36_get_adapter_step_count"),
         set_adapter_step_count: sym!("qwen36_set_adapter_step_count"),
@@ -2476,6 +2489,48 @@ impl CppTrainingContext {
             return None;
         }
         Some(unsafe { Tensor::clone_from_ptr(ptr as *mut _) })
+    }
+
+    /// Export one dynamic Adam tensor as an owned CPU snapshot for checkpointing.
+    /// `None` is valid only for a tenant that has not completed an optimizer step.
+    pub fn export_adapter_optimizer_tensor_cpu(
+        &self,
+        adapter_id: i64,
+        layer: i64,
+        module: &str,
+        is_b: bool,
+        is_v: bool,
+    ) -> Result<Option<Tensor>> {
+        let kh = get_kernels().ok_or_else(|| anyhow::anyhow!("kernels not loaded"))?;
+        let module = std::ffi::CString::new(module)?;
+        let mut ptr = std::ptr::null_mut();
+        let status = unsafe {
+            (kh.export_adapter_optimizer_tensor_cpu)(
+                self.ptr,
+                adapter_id,
+                layer,
+                module.as_ptr(),
+                if is_b { 1 } else { 0 },
+                if is_v { 1 } else { 0 },
+                &mut ptr,
+            )
+        };
+        match status {
+            0 if !ptr.is_null() => {
+                let tensor = unsafe { Tensor::clone_from_ptr(ptr as *mut _) };
+                unsafe { (kh.free_tensor)(ptr) };
+                Ok(Some(tensor))
+            }
+            1 if ptr.is_null() => Ok(None),
+            _ => {
+                if !ptr.is_null() {
+                    unsafe { (kh.free_tensor)(ptr) };
+                }
+                bail!(
+                    "C++ dynamic optimizer CPU export failed for adapter {adapter_id}, layer {layer}, module {module:?}, status={status}"
+                );
+            }
+        }
     }
 
     pub fn set_adapter_optimizer_tensor(

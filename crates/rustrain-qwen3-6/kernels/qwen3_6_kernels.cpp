@@ -3666,6 +3666,14 @@ struct TrainingContext {
         std::set<std::string> target_modules;
         std::map<int64_t, std::vector<std::pair<at::Tensor, at::Tensor>>> params;
         std::map<int64_t, std::vector<std::array<at::Tensor, 4>>> adam_state;
+        // Checkpoint snapshots are host-resident and versioned by the
+        // tenant-local Adam clock. They never participate in the training
+        // transaction; a successful step invalidates them by advancing
+        // optimizer_step, while rollback makes the previous snapshot current
+        // again without copying.
+        std::map<int64_t, std::vector<std::array<at::Tensor, 4>>>
+            adam_host_state;
+        int64_t adam_host_step = -1;
         // Reusable out-of-place Adam destinations. Each entry stores
         // {param_a, m_a, v_a, param_b, m_b, v_b}; a successful transaction
         // swaps these handles with the live registry without allocating.
@@ -5948,6 +5956,82 @@ static void materialize_dynamic_adam_state(
             if (!v_b.defined()) v_b = at::zeros(b.sizes(), f32_options);
         }
     }
+}
+
+static void snapshot_dynamic_adam_state_to_host(
+    TrainingContext* ctx,
+    TrainingContext::LoRAAdapter& adapter
+) {
+    TORCH_CHECK(ctx, "dynamic Adam host snapshot requires a context");
+    TORCH_CHECK(!ctx->dynamic_adam_transaction_active,
+        "cannot snapshot dynamic Adam during an active transaction");
+    TORCH_CHECK(adapter.optimizer_step > 0,
+        "untrained dynamic adapter has no Adam checkpoint state");
+    if (adapter.adam_host_step == adapter.optimizer_step) return;
+
+    const int64_t snapshot_step = adapter.optimizer_step;
+    // Production Adam commits are asynchronous. Checkpointing is an explicit
+    // persistence boundary and may run on a different host thread/current
+    // stream, so complete all device writes before starting D2H copies.
+    const auto sync_error = cudaDeviceSynchronize();
+    TORCH_CHECK(sync_error == cudaSuccess,
+        "dynamic Adam checkpoint device synchronization failed: ",
+        cudaGetErrorString(sync_error));
+    TORCH_CHECK(!ctx->dynamic_adam_transaction_active &&
+            adapter.optimizer_step == snapshot_step,
+        "dynamic Adam changed before its host snapshot copy");
+    std::map<int64_t, std::vector<std::array<at::Tensor, 4>>> snapshot;
+    at::NoGradGuard guard;
+    for (const auto& [layer_idx, pairs] : adapter.params) {
+        auto state_it = adapter.adam_state.find(layer_idx);
+        TORCH_CHECK(state_it != adapter.adam_state.end() &&
+                state_it->second.size() == pairs.size(),
+            "dynamic Adam checkpoint layout mismatch for adapter ",
+            adapter.id, " layer ", layer_idx);
+        std::vector<std::array<at::Tensor, 4>> host_states;
+        host_states.reserve(pairs.size());
+        for (size_t pair_idx = 0; pair_idx < pairs.size(); ++pair_idx) {
+            const auto& [a, b] = pairs[pair_idx];
+            if (!a.requires_grad()) {
+                host_states.push_back(std::array<at::Tensor, 4>{});
+                continue;
+            }
+            const auto& state = state_it->second[pair_idx];
+            const auto& m_a = state[0];
+            const auto& v_a = state[1];
+            const auto& m_b = state[2];
+            const auto& v_b = state[3];
+            for (const auto* tensor : {&m_a, &v_a, &m_b, &v_b}) {
+                TORCH_CHECK(tensor->defined() && tensor->is_cuda() &&
+                        tensor->is_contiguous() &&
+                        tensor->scalar_type() == at::kFloat,
+                    "dynamic Adam checkpoint requires contiguous CUDA FP32 "
+                    "state for adapter ", adapter.id, " layer ", layer_idx,
+                    " pair ", pair_idx);
+            }
+            TORCH_CHECK(m_a.sizes() == a.sizes() &&
+                    v_a.sizes() == a.sizes() &&
+                    m_b.sizes() == b.sizes() &&
+                    v_b.sizes() == b.sizes() &&
+                    m_a.device() == a.device() &&
+                    v_a.device() == a.device() &&
+                    m_b.device() == b.device() &&
+                    v_b.device() == b.device(),
+                "dynamic Adam checkpoint shape mismatch for adapter ",
+                adapter.id, " layer ", layer_idx, " pair ", pair_idx);
+            host_states.push_back({
+                m_a.to(at::kCPU).contiguous(),
+                v_a.to(at::kCPU).contiguous(),
+                m_b.to(at::kCPU).contiguous(),
+                v_b.to(at::kCPU).contiguous()});
+        }
+        snapshot.emplace(layer_idx, std::move(host_states));
+    }
+    TORCH_CHECK(!ctx->dynamic_adam_transaction_active &&
+            adapter.optimizer_step == snapshot_step,
+        "dynamic Adam changed while creating its host snapshot");
+    adapter.adam_host_state.swap(snapshot);
+    adapter.adam_host_step = snapshot_step;
 }
 
 static bool dynamic_adam_shadow_layout_matches(
@@ -11494,7 +11578,7 @@ static MtpLossResult mtp_compute_loss(
 extern "C" {
 
 __attribute__((visibility("default"))) int64_t qwen36_kernel_abi_version() {
-    return 29;
+    return 30;
 }
 
 // Benchmark/metrics helper. Reducing over every orthogonal axis propagates the
@@ -16253,6 +16337,63 @@ void* qwen36_get_adapter_optimizer_tensor(
     }
 }
 
+// Export a checkpoint-owned CPU snapshot without materializing lazy device
+// state. Status 0 returns a heap-allocated at::Tensor wrapper through `out`;
+// status 1 means the adapter has never completed an optimizer step; -1 is an
+// invalid or inconsistent request. The caller releases a successful result
+// with qwen36_free_tensor.
+__attribute__((visibility("default")))
+int32_t qwen36_export_adapter_optimizer_tensor_cpu_v1(
+    void* ctx_ptr, int64_t adapter_id, int64_t global_layer,
+    const char* module_name, int32_t is_b, int32_t is_v, void** out
+) {
+    if (out) *out = nullptr;
+    try {
+        auto* ctx = reinterpret_cast<TrainingContext*>(ctx_ptr);
+        TORCH_CHECK(ctx && out && module_name && adapter_id > 0,
+            "invalid dynamic Adam checkpoint export arguments");
+        TORCH_CHECK((is_b == 0 || is_b == 1) &&
+                (is_v == 0 || is_v == 1),
+            "dynamic Adam checkpoint selectors must be boolean");
+        TORCH_CHECK(!ctx->dynamic_adam_transaction_active,
+            "cannot export dynamic Adam during an active transaction");
+        int64_t layer_idx = -1;
+        TORCH_CHECK(global_to_local_layer(ctx, global_layer, layer_idx),
+            "dynamic Adam checkpoint layer is not owned by this stage: ",
+            global_layer);
+        const int64_t pair_idx = lora_pair_index(
+            ctx->layer_configs[layer_idx], module_name);
+        TORCH_CHECK(pair_idx >= 0,
+            "dynamic Adam checkpoint module is not present: ", module_name);
+        size_t adapter_index = 0;
+        TORCH_CHECK(find_canonical_adapter_index(
+                ctx, adapter_id, adapter_index),
+            "dynamic Adam checkpoint adapter not found: ", adapter_id);
+        auto& adapter = ctx->adapters[adapter_index];
+        if (adapter.optimizer_step == 0) return 1;
+        snapshot_dynamic_adam_state_to_host(ctx, adapter);
+        auto state_it = adapter.adam_host_state.find(layer_idx);
+        TORCH_CHECK(state_it != adapter.adam_host_state.end() &&
+                pair_idx < static_cast<int64_t>(state_it->second.size()),
+            "dynamic Adam host snapshot layout mismatch for adapter ",
+            adapter_id, " layer ", global_layer);
+        const int index = (is_b ? 2 : 0) + (is_v ? 1 : 0);
+        const auto& tensor = state_it->second[pair_idx][index];
+        TORCH_CHECK(tensor.defined() && tensor.device().is_cpu() &&
+                tensor.is_contiguous() &&
+                tensor.scalar_type() == at::kFloat,
+            "dynamic Adam host snapshot tensor is unavailable for adapter ",
+            adapter_id, " layer ", global_layer, " module ", module_name);
+        *out = new at::Tensor(tensor);
+        return 0;
+    } catch (const std::exception& e) {
+        fprintf(stderr,
+            "[q36] export_adapter_optimizer_tensor_cpu FAILED: %s\n",
+            e.what());
+        return -1;
+    }
+}
+
 __attribute__((visibility("default")))
 int32_t qwen36_set_adapter_optimizer_tensor(
     void* ctx_ptr, int64_t adapter_id, int64_t global_layer,
@@ -16269,6 +16410,12 @@ int32_t qwen36_set_adapter_optimizer_tensor(
             " got ", source.sizes());
         at::NoGradGuard guard;
         target->copy_(source.to(target->device()).to(target->scalar_type()));
+        auto* ctx = reinterpret_cast<TrainingContext*>(ctx_ptr);
+        for (auto& adapter : ctx->adapters) {
+            if (adapter.id != adapter_id) continue;
+            adapter.adam_host_step = -1;
+            break;
+        }
         return 0;
     } catch (const std::exception& e) {
         fprintf(stderr, "[q36] set_adapter_optimizer_tensor FAILED: %s\n", e.what());
@@ -16346,6 +16493,8 @@ int32_t qwen36_set_adapter_step_count(
     if (!ctx || adapter_id <= 0 || step_count < 0) return -1;
     for (auto& adapter : ctx->adapters) {
         if (adapter.id == adapter_id) {
+            if (adapter.optimizer_step != step_count)
+                adapter.adam_host_step = -1;
             adapter.optimizer_step = step_count;
             return 0;
         }
