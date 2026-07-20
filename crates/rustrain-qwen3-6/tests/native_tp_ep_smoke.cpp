@@ -1457,7 +1457,7 @@ int main() {
         distributed, tenant_one, dynamic_one.front().module, false, false);
     assert(qwen36_get_adapter_optimizer_resident_bytes_v1(
         distributed, tenant_one) == 0);
-    assert(max_diff(paged_tenant_one_m, *dynamic_state(
+    assert(max_diff(paged_tenant_one_m, dynamic_state_cpu(
         resumed, resumed_tenant_one, dynamic_one.front().module,
         false, false)) == 0.0);
     unsetenv("QWEN36_DYNAMIC_ADAM_HOST_PAGING");
