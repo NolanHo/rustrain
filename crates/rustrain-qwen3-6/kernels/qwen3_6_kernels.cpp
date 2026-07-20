@@ -44,6 +44,7 @@
 
 struct TrainingContext;  // forward declaration (defined below)
 static cudaStream_t context_moe_shared_stream(TrainingContext* ctx);
+static cudaStream_t context_moe_ep_metadata_stream(TrainingContext* ctx);
 
 static at::Tensor attach_router_aux_loss(
     TrainingContext* ctx,
@@ -1563,47 +1564,187 @@ struct Qwen36A2ACountPlan {
     at::Tensor receive_offsets;
 };
 
-static Qwen36A2ACountPlan qwen36_a2a_counts(
-    const at::Tensor& local_metadata, ncclComm_t comm, cudaStream_t stream
+struct Qwen36A2ACountExchange {
+    at::Tensor all_counts;
+    at::Tensor staged_counts;
+    at::Tensor host_counts;
+    cudaStream_t metadata_stream = nullptr;
+    cudaEvent_t ready = nullptr;
+    cudaEvent_t done = nullptr;
+    int device = -1;
+    int world = 0;
+    int rank = 0;
+    bool compact_metadata = false;
+    bool completion_recorded = false;
+
+    Qwen36A2ACountExchange() = default;
+    Qwen36A2ACountExchange(const Qwen36A2ACountExchange&) = delete;
+    Qwen36A2ACountExchange& operator=(const Qwen36A2ACountExchange&) = delete;
+
+    Qwen36A2ACountExchange(Qwen36A2ACountExchange&& other) noexcept
+        : all_counts(std::move(other.all_counts)),
+          staged_counts(std::move(other.staged_counts)),
+          host_counts(std::move(other.host_counts)),
+          metadata_stream(other.metadata_stream),
+          ready(other.ready),
+          done(other.done),
+          device(other.device),
+          world(other.world),
+          rank(other.rank),
+          compact_metadata(other.compact_metadata),
+          completion_recorded(other.completion_recorded) {
+        other.metadata_stream = nullptr;
+        other.ready = nullptr;
+        other.done = nullptr;
+        other.device = -1;
+        other.completion_recorded = false;
+    }
+
+    ~Qwen36A2ACountExchange() {
+        // A packing/allocation exception after launch must not let the caching
+        // allocator recycle tensors while NCCL or the D2H copy still uses them.
+        int previous_device = -1;
+        const bool restore_device = device >= 0 &&
+            cudaGetDevice(&previous_device) == cudaSuccess &&
+            previous_device != device &&
+            cudaSetDevice(device) == cudaSuccess;
+        if (completion_recorded && done) {
+            cudaEventSynchronize(done);
+        } else if (metadata_stream) {
+            cudaStreamSynchronize(metadata_stream);
+        }
+        if (ready) cudaEventDestroy(ready);
+        if (done) cudaEventDestroy(done);
+        if (restore_device) cudaSetDevice(previous_device);
+    }
+
+    void wait() {
+        if (!completion_recorded) return;
+        int previous_device = -1;
+        const bool restore_device = device >= 0 &&
+            cudaGetDevice(&previous_device) == cudaSuccess &&
+            previous_device != device &&
+            cudaSetDevice(device) == cudaSuccess;
+        const auto status = cudaEventSynchronize(done);
+        if (restore_device) cudaSetDevice(previous_device);
+        TORCH_CHECK(status == cudaSuccess,
+            "failed to synchronize EP A2A count metadata");
+        completion_recorded = false;
+        metadata_stream = nullptr;
+    }
+};
+
+static Qwen36A2ACountExchange qwen36_a2a_counts_launch(
+    const at::Tensor& local_metadata, ncclComm_t comm,
+    cudaStream_t current_stream, cudaStream_t metadata_stream,
+    bool overlap
 ) {
+    Qwen36A2ACountExchange exchange;
     int world = 0;
     auto err = ncclCommCount(comm, &world);
     TORCH_CHECK(err == ncclSuccess, "ncclCommCount failed: ",
         ncclGetErrorString(err));
     TORCH_CHECK(local_metadata.numel() == world + 1,
         "EP A2A metadata must contain one count per peer and a validity flag");
-    auto all_counts = at::empty(
+    exchange.device = local_metadata.device().index();
+    exchange.world = world;
+    exchange.all_counts = at::empty(
         {world, world + 1}, local_metadata.options());
+    const bool use_overlap = overlap && metadata_stream &&
+        metadata_stream != current_stream;
+    auto count_stream = current_stream;
+    if (use_overlap) {
+        exchange.metadata_stream = metadata_stream;
+        count_stream = metadata_stream;
+        TORCH_CHECK(cudaEventCreateWithFlags(
+                &exchange.ready, cudaEventDisableTiming) == cudaSuccess,
+            "failed to create EP A2A count producer event");
+        TORCH_CHECK(cudaEventCreateWithFlags(
+                &exchange.done, cudaEventDisableTiming) == cudaSuccess,
+            "failed to create EP A2A count completion event");
+        TORCH_CHECK(cudaEventRecord(exchange.ready, current_stream) == cudaSuccess,
+            "failed to record EP A2A count producer event");
+        TORCH_CHECK(cudaStreamWaitEvent(
+                metadata_stream, exchange.ready, 0) == cudaSuccess,
+            "failed to fence EP A2A metadata stream");
+    }
     err = ncclAllGather(
-        local_metadata.data_ptr(), all_counts.data_ptr(), world + 1,
-        ncclInt, comm, stream);
+        local_metadata.data_ptr(), exchange.all_counts.data_ptr(),
+        world + 1, ncclInt, comm, count_stream);
     TORCH_CHECK(err == ncclSuccess, "EP A2A count all-gather failed: ",
         ncclGetErrorString(err));
     int rank = 0;
     err = ncclCommUserRank(comm, &rank);
     TORCH_CHECK(err == ncclSuccess, "ncclCommUserRank failed: ",
         ncclGetErrorString(err));
+    exchange.rank = rank;
 
-    Qwen36A2ACountPlan plan;
     // The legacy path copies the complete world-by-world metadata matrix to
     // CPU. For larger EP groups, only this rank's send row, receive column,
     // and one validity flag per peer are needed by the host-side NCCL
     // variable-count enqueue. Keep the compact path opt-in for small worlds
     // because its extra device gather is not worth it at EP2/EP4.
-    const bool compact_metadata = env_enabled(
+    exchange.compact_metadata = env_enabled(
         "QWEN36_EP_A2A_COMPACT_COUNTS", world >= 8);
-    at::Tensor host;
-    if (compact_metadata) {
-        auto send_row = all_counts.select(0, rank).narrow(0, 0, world);
-        auto receive_column = all_counts.narrow(1, rank, 1)
-            .select(1, 0).narrow(0, 0, world);
-        auto invalid_flags = all_counts.select(1, world);
-        host = at::cat({send_row, receive_column, invalid_flags}, 0)
-            .contiguous()
-            .to(at::TensorOptions().device(at::kCPU));
+    if (use_overlap) {
+
+        const auto side_stream = c10::cuda::getStreamFromExternal(
+            metadata_stream, local_metadata.device().index());
+        {
+            c10::cuda::CUDAStreamGuard guard(side_stream);
+            if (exchange.compact_metadata) {
+                auto send_row = exchange.all_counts.select(0, rank)
+                    .narrow(0, 0, world);
+                auto receive_column = exchange.all_counts.narrow(1, rank, 1)
+                    .select(1, 0).narrow(0, 0, world);
+                auto invalid_flags = exchange.all_counts.select(1, world);
+                exchange.staged_counts = at::cat(
+                    {send_row, receive_column, invalid_flags}, 0).contiguous();
+            } else {
+                exchange.staged_counts = exchange.all_counts;
+            }
+        }
+        exchange.host_counts = at::empty(
+            exchange.staged_counts.sizes(),
+            at::TensorOptions().device(at::kCPU).dtype(at::kInt)
+                .pinned_memory(true));
+        TORCH_CHECK(cudaMemcpyAsync(
+                exchange.host_counts.data_ptr<int32_t>(),
+                exchange.staged_counts.data_ptr<int32_t>(),
+                exchange.staged_counts.numel() * sizeof(int32_t),
+                cudaMemcpyDeviceToHost, metadata_stream) == cudaSuccess,
+            "failed to copy EP A2A count metadata to pinned host memory");
+        TORCH_CHECK(cudaEventRecord(exchange.done, metadata_stream) == cudaSuccess,
+            "failed to record EP A2A count completion event");
+        exchange.completion_recorded = true;
     } else {
-        host = all_counts.to(at::TensorOptions().device(at::kCPU));
+        if (exchange.compact_metadata) {
+            auto send_row = exchange.all_counts.select(0, rank)
+                .narrow(0, 0, world);
+            auto receive_column = exchange.all_counts.narrow(1, rank, 1)
+                .select(1, 0).narrow(0, 0, world);
+            auto invalid_flags = exchange.all_counts.select(1, world);
+            exchange.host_counts = at::cat(
+                {send_row, receive_column, invalid_flags}, 0)
+                .contiguous()
+                .to(at::TensorOptions().device(at::kCPU));
+        } else {
+            exchange.host_counts = exchange.all_counts.to(
+                at::TensorOptions().device(at::kCPU));
+        }
     }
+    return exchange;
+}
+
+static Qwen36A2ACountPlan qwen36_a2a_counts_finalize(
+    Qwen36A2ACountExchange& exchange
+) {
+    exchange.wait();
+    const int world = exchange.world;
+    const int rank = exchange.rank;
+    const bool compact_metadata = exchange.compact_metadata;
+    const auto& host = exchange.host_counts;
+    Qwen36A2ACountPlan plan;
     // Dispatch forward, dispatch backward, combine forward, and combine
     // backward all use the same variable-count layout. Materialize the two
     // prefix plans once and keep them in the autograd graph instead of
@@ -1643,7 +1784,8 @@ struct Qwen36A2ADispatchFunction : public torch::autograd::Function<Qwen36A2ADis
     static std::vector<at::Tensor> forward(
         torch::autograd::AutogradContext* ctx,
         at::Tensor input, at::Tensor expert_indices, at::Tensor token_indices,
-        int64_t expert_count, int64_t comm_ptr, int64_t stream_ptr
+        int64_t expert_count, int64_t comm_ptr, int64_t stream_ptr,
+        int64_t metadata_stream_ptr
     ) {
         auto comm = reinterpret_cast<ncclComm_t>(comm_ptr);
         TORCH_CHECK(comm, "EP A2A requires an NCCL communicator");
@@ -1696,11 +1838,20 @@ struct Qwen36A2ADispatchFunction : public torch::autograd::Function<Qwen36A2ADis
                 at::TensorOptions().device(at::kCPU).dtype(at::kInt));
             local_metadata = host_counts.to(gpu_count_opts);
         }
-        auto count_plan = qwen36_a2a_counts(local_metadata, comm, stream);
-        auto send_offsets_tensor = std::move(count_plan.send_offsets);
-        auto recv_offsets_tensor = std::move(count_plan.receive_offsets);
-        const auto* send_offsets = send_offsets_tensor.data_ptr<int64_t>();
-        const auto* recv_offsets = recv_offsets_tensor.data_ptr<int64_t>();
+        const auto metadata_stream =
+            reinterpret_cast<cudaStream_t>(metadata_stream_ptr);
+        const bool count_overlap =
+            env_enabled("QWEN36_EP_A2A_COUNT_OVERLAP") &&
+            metadata_stream && metadata_stream != stream;
+        auto count_exchange = qwen36_a2a_counts_launch(
+            local_metadata, comm, stream,
+            metadata_stream, count_overlap);
+        Qwen36A2ACountPlan count_plan;
+        if (!count_overlap) {
+            // Preserve the legacy validation/error boundary before payload
+            // packing when overlap is disabled or unavailable.
+            count_plan = qwen36_a2a_counts_finalize(count_exchange);
+        }
         auto send_token = token_indices.index_select(0, send_index).contiguous();
         auto send_hidden = input.index_select(0, send_token).contiguous();
         auto send_expert = expert_indices.index_select(0, send_index).contiguous();
@@ -1715,6 +1866,13 @@ struct Qwen36A2ADispatchFunction : public torch::autograd::Function<Qwen36A2ADis
             send_metadata = at::stack(
                 {send_token, send_expert}, 1).contiguous();
         }
+        if (count_overlap) {
+            count_plan = qwen36_a2a_counts_finalize(count_exchange);
+        }
+        auto send_offsets_tensor = std::move(count_plan.send_offsets);
+        auto recv_offsets_tensor = std::move(count_plan.receive_offsets);
+        const auto* send_offsets = send_offsets_tensor.data_ptr<int64_t>();
+        const auto* recv_offsets = recv_offsets_tensor.data_ptr<int64_t>();
         auto recv_hidden = at::empty({recv_offsets[world], hidden}, input.options());
         at::Tensor recv_metadata;
         at::Tensor recv_token;
@@ -1846,7 +2004,7 @@ struct Qwen36A2ADispatchFunction : public torch::autograd::Function<Qwen36A2ADis
         stream_fence.complete();
         grad_input.index_add_(0, send_token, returned);
         return {grad_input, at::Tensor(), at::Tensor(), at::Tensor(),
-            at::Tensor(), at::Tensor()};
+            at::Tensor(), at::Tensor(), at::Tensor()};
     }
 };
 
@@ -2330,6 +2488,10 @@ static at::Tensor moe_routed_a2a(
     const LoraBatchEntry* expert_down_lora
 ) {
     const int64_t hidden_dim = flat.size(1);
+    const auto metadata_stream = env_enabled(
+            "QWEN36_EP_A2A_COUNT_OVERLAP")
+        ? context_moe_ep_metadata_stream(training_ctx)
+        : nullptr;
     const bool expert_tp = base_tp_mlp_enabled(training_ctx);
     const auto gate_up_layout = expert_tp
         ? LoraTpLayout::ColumnParallel : LoraTpLayout::LatentRank;
@@ -2570,7 +2732,8 @@ static at::Tensor moe_routed_a2a(
             assignment_input, assignment_experts, assignment_tokens,
             expert_count,
             static_cast<int64_t>(reinterpret_cast<uintptr_t>(comm)),
-            static_cast<int64_t>(reinterpret_cast<uintptr_t>(requested_stream)));
+            static_cast<int64_t>(reinterpret_cast<uintptr_t>(requested_stream)),
+            static_cast<int64_t>(reinterpret_cast<uintptr_t>(metadata_stream)));
         auto received = dispatched[0];
         auto received_tokens = dispatched[1];
         auto received_experts = dispatched[2];
@@ -3642,6 +3805,11 @@ struct TrainingContext {
     // overlap. A stream-pool lookup per layer retains one allocator workspace
     // per pooled stream, so the runtime creates exactly one stream lazily.
     cudaStream_t moe_shared_stream = nullptr;
+    // The variable-count exchange uses this stream only for the count
+    // all-gather and pinned D2H copy. Payload A2A retains its existing stream
+    // and fences, while send packing proceeds concurrently on the compute
+    // stream.
+    cudaStream_t moe_ep_metadata_stream = nullptr;
     int ep_world_size = 1;
     int ep_rank = 0;
     bool expert_parallel = false;
@@ -3742,6 +3910,24 @@ static cudaStream_t context_moe_shared_stream(TrainingContext* ctx) {
     TORCH_CHECK(create_status == cudaSuccess,
         "failed to create context-owned shared-expert stream");
     return ctx->moe_shared_stream;
+}
+
+static cudaStream_t context_moe_ep_metadata_stream(TrainingContext* ctx) {
+    TORCH_CHECK(ctx, "EP count overlap requires a training context");
+    if (ctx->moe_ep_metadata_stream) return ctx->moe_ep_metadata_stream;
+    int previous_device = 0;
+    TORCH_CHECK(cudaGetDevice(&previous_device) == cudaSuccess,
+        "failed to query CUDA device for EP metadata stream");
+    if (previous_device != ctx->cuda_device) {
+        TORCH_CHECK(cudaSetDevice(ctx->cuda_device) == cudaSuccess,
+            "failed to select CUDA device for EP metadata stream");
+    }
+    const auto create_status = cudaStreamCreateWithFlags(
+        &ctx->moe_ep_metadata_stream, cudaStreamNonBlocking);
+    if (previous_device != ctx->cuda_device) cudaSetDevice(previous_device);
+    TORCH_CHECK(create_status == cudaSuccess,
+        "failed to create context-owned EP metadata stream");
+    return ctx->moe_ep_metadata_stream;
 }
 
 static at::Tensor derive_attention_mask(
@@ -4015,6 +4201,7 @@ static void hash_collective_runtime_environment(AdapterRegistryHash& hash) {
     hash.add_u64(env_enabled("QWEN36_EP_A2A_SHARDED"));
     hash.add_u64(env_enabled("QWEN36_EP_A2A_PACKED", true));
     hash.add_u64(env_enabled("QWEN36_EP_A2A_PACKED_METADATA", true));
+    hash.add_u64(env_enabled("QWEN36_EP_A2A_COUNT_OVERLAP"));
     hash.add_u64(env_enabled("QWEN36_MOE_FUSED_UNPERMUTE"));
     hash.add_u64(env_enabled("QWEN36_MOE_FUSED_LOCAL_PERMUTE"));
     hash.add_u64(env_enabled("QWEN36_DISABLE_GROUPED_MM"));
@@ -12744,16 +12931,20 @@ __attribute__((visibility("default"))) void qwen36_free_training_context(void* c
         // session can reuse it. Destroying it would break NCCL for all
         // subsequent sessions in the same worker process.
         // ncclCommDestroy is called only on process exit (via atexit or Drop).
-        if (ctx->moe_shared_stream) {
+        if (ctx->moe_shared_stream || ctx->moe_ep_metadata_stream) {
             int previous_device = 0;
             if (cudaGetDevice(&previous_device) == cudaSuccess) {
                 if (previous_device != ctx->cuda_device)
                     cudaSetDevice(ctx->cuda_device);
-                cudaStreamDestroy(ctx->moe_shared_stream);
+                if (ctx->moe_shared_stream)
+                    cudaStreamDestroy(ctx->moe_shared_stream);
+                if (ctx->moe_ep_metadata_stream)
+                    cudaStreamDestroy(ctx->moe_ep_metadata_stream);
                 if (previous_device != ctx->cuda_device)
                     cudaSetDevice(previous_device);
             }
             ctx->moe_shared_stream = nullptr;
+            ctx->moe_ep_metadata_stream = nullptr;
         }
         delete ctx;
     }
