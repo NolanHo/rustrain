@@ -14,7 +14,7 @@ use axum::{
 };
 use futures::stream::{self, Stream};
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::convert::Infallible;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
@@ -48,6 +48,8 @@ const DEFAULT_MULTI_LORA_BATCH_WINDOW_US: u64 = 2_000;
 const HARD_MAX_MULTI_LORA_BATCH_WINDOW_US: u64 = 100_000;
 const DEFAULT_MULTI_LORA_BATCH_REQUESTS: usize = 16;
 const HARD_MAX_MULTI_LORA_BATCH_REQUESTS: usize = 4_096;
+const DEFAULT_MULTI_LORA_BATCH_OPEN_WINDOWS: usize = 8;
+const HARD_MAX_MULTI_LORA_BATCH_OPEN_WINDOWS: usize = 64;
 const DEFAULT_MULTI_LORA_BATCH_ADAPTERS: usize = 64;
 const DEFAULT_MULTI_LORA_BATCH_RANK_WORK: usize = 32_768;
 const HARD_MAX_MULTI_LORA_BATCH_RANK_WORK: usize = 4_194_304;
@@ -66,6 +68,7 @@ const MULTI_LORA_RESPONSE_CAPABILITIES: &[&str] = &[
 struct MultiLoraBatchConfig {
     window: Duration,
     max_requests: usize,
+    max_open_windows: usize,
     max_adapters: usize,
     max_rank_work: usize,
     max_payload_bytes: usize,
@@ -82,6 +85,11 @@ impl MultiLoraBatchConfig {
             "RUSTRAIN_MULTI_LORA_BATCH_MAX_REQUESTS",
             DEFAULT_MULTI_LORA_BATCH_REQUESTS,
             HARD_MAX_MULTI_LORA_BATCH_REQUESTS,
+        );
+        let max_open_windows = configured_positive_usize(
+            "RUSTRAIN_MULTI_LORA_BATCH_MAX_OPEN_WINDOWS",
+            DEFAULT_MULTI_LORA_BATCH_OPEN_WINDOWS,
+            HARD_MAX_MULTI_LORA_BATCH_OPEN_WINDOWS,
         );
         let max_adapters = configured_positive_usize(
             "RUSTRAIN_MULTI_LORA_BATCH_MAX_ADAPTERS",
@@ -106,6 +114,7 @@ impl MultiLoraBatchConfig {
         Self {
             window: Duration::from_micros(window_us),
             max_requests,
+            max_open_windows,
             max_adapters,
             max_rank_work,
             max_payload_bytes,
@@ -293,7 +302,7 @@ impl MultiLoraWindow {
 #[derive(Default)]
 struct MultiLoraBatchState {
     next_window_id: u64,
-    current_window_id: Option<u64>,
+    open_window_ids: VecDeque<u64>,
     windows: HashMap<u64, MultiLoraWindow>,
 }
 
@@ -318,13 +327,43 @@ impl MultiLoraBatcher {
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        state.current_window_id = None;
+        state.open_window_ids.clear();
         self.window_wakeup.notify_all();
+    }
+
+    fn seal_window(state: &mut MultiLoraBatchState, window_id: u64) -> bool {
+        let Some(index) = state
+            .open_window_ids
+            .iter()
+            .position(|candidate| *candidate == window_id)
+        else {
+            return false;
+        };
+        state.open_window_ids.remove(index);
+        true
+    }
+
+    fn compatible_window_id(
+        state: &MultiLoraBatchState,
+        request: &MultiLoraDispatchRequest,
+        config: MultiLoraBatchConfig,
+    ) -> Option<u64> {
+        state
+            .open_window_ids
+            .iter()
+            .rev()
+            .copied()
+            .find(|window_id| {
+                state
+                    .windows
+                    .get(window_id)
+                    .is_some_and(|window| window.can_accept(request, config))
+            })
     }
 
     /// Wait for a coalescing window to be sealed or for its normal deadline.
     /// The window ID predicate makes spurious notifications harmless and
-    /// treats replacement by a newer window as sealing the old one. The
+    /// treats removal from the bounded open-window set as sealing. The
     /// scheduler remains single-consumer, so this only changes when the
     /// existing FIFO job becomes dispatchable.
     fn wait_for_window(&self, window_id: u64, wait: Duration) {
@@ -336,7 +375,7 @@ impl MultiLoraBatcher {
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        while state.current_window_id == Some(window_id) {
+        while state.open_window_ids.contains(&window_id) {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
                 break;
@@ -350,19 +389,16 @@ impl MultiLoraBatcher {
                 break;
             }
         }
-        if state.current_window_id == Some(window_id) {
-            state.current_window_id = None;
-        }
+        Self::seal_window(&mut state, window_id);
     }
 
     fn seal_window_if_at_capacity(&self, state: &mut MultiLoraBatchState, window_id: u64) {
-        if state.current_window_id == Some(window_id)
-            && state
-                .windows
-                .get(&window_id)
-                .is_some_and(|window| window.at_capacity(self.config))
+        if state
+            .windows
+            .get(&window_id)
+            .is_some_and(|window| window.at_capacity(self.config))
+            && Self::seal_window(state, window_id)
         {
-            state.current_window_id = None;
             self.window_wakeup.notify_all();
         }
     }
@@ -387,18 +423,10 @@ impl MultiLoraBatcher {
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(window_id) = state.current_window_id {
-            if state
-                .windows
-                .get(&window_id)
-                .is_some_and(|window| window.can_accept(&request, self.config))
-            {
-                state.windows.get_mut(&window_id).unwrap().push(request);
-                self.seal_window_if_at_capacity(&mut state, window_id);
-                return Ok(());
-            }
-            state.current_window_id = None;
-            self.window_wakeup.notify_all();
+        if let Some(window_id) = Self::compatible_window_id(&state, &request, self.config) {
+            state.windows.get_mut(&window_id).unwrap().push(request);
+            self.seal_window_if_at_capacity(&mut state, window_id);
+            return Ok(());
         }
 
         let window_id = state.next_window_id;
@@ -408,7 +436,11 @@ impl MultiLoraBatcher {
             .windows
             .insert(window_id, MultiLoraWindow::new(request));
         if coalescible {
-            state.current_window_id = Some(window_id);
+            if state.open_window_ids.len() >= self.config.max_open_windows {
+                state.open_window_ids.pop_front();
+                self.window_wakeup.notify_all();
+            }
+            state.open_window_ids.push_back(window_id);
             self.seal_window_if_at_capacity(&mut state, window_id);
         }
 
@@ -424,8 +456,7 @@ impl MultiLoraBatcher {
         });
         if let Err(error) = scheduled {
             state.windows.remove(&window_id);
-            if state.current_window_id == Some(window_id) {
-                state.current_window_id = None;
+            if Self::seal_window(&mut state, window_id) {
                 self.window_wakeup.notify_all();
             }
             return Err(error);
@@ -440,9 +471,7 @@ impl MultiLoraBatcher {
                 .state
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if state.current_window_id == Some(window_id) {
-                state.current_window_id = None;
-            }
+            Self::seal_window(&mut state, window_id);
             state.windows.remove(&window_id)
         };
         let Some(window) = window else {
@@ -2268,8 +2297,8 @@ mod tensor_http_shape_tests {
         pack_tensor_slab, parse_binary_multi_lora_request, project_multi_lora_result,
         validate_multi_lora_http_shapes, validate_selected_eval_http_shapes,
         validate_train_http_shapes, EpDispatchScheduleError, HeaderMap, HeaderValue,
-        MultiLoraBatchConfig, MultiLoraBatcher, MultiLoraDispatchRequest, MultiLoraWindow,
-        StatusCode, TensorHttp, MULTI_LORA_CAPABILITY_HEADER,
+        MultiLoraBatchConfig, MultiLoraBatchState, MultiLoraBatcher, MultiLoraDispatchRequest,
+        MultiLoraWindow, StatusCode, TensorHttp, MULTI_LORA_CAPABILITY_HEADER,
     };
 
     fn tensor(shape: &[i64]) -> TensorHttp {
@@ -2603,6 +2632,7 @@ mod tensor_http_shape_tests {
         let config = MultiLoraBatchConfig {
             window: std::time::Duration::from_millis(1),
             max_requests: 2,
+            max_open_windows: 2,
             max_adapters: 3,
             max_rank_work: 64,
             max_payload_bytes: usize::MAX,
@@ -2631,17 +2661,23 @@ mod tensor_http_shape_tests {
     }
 
     #[test]
-    fn coalescing_wait_wakes_when_current_window_is_sealed() {
+    fn coalescing_wait_wakes_when_open_window_is_sealed() {
         let config = MultiLoraBatchConfig {
             window: std::time::Duration::from_secs(2),
             max_requests: 4,
+            max_open_windows: 2,
             max_adapters: 4,
             max_rank_work: 64,
             max_payload_bytes: usize::MAX,
         };
         let batcher = MultiLoraBatcher::new(config);
         let window_id = 7;
-        batcher.state.lock().unwrap().current_window_id = Some(window_id);
+        batcher
+            .state
+            .lock()
+            .unwrap()
+            .open_window_ids
+            .push_back(window_id);
 
         let waiting_batcher = batcher.clone();
         let (started, started_rx) = std::sync::mpsc::channel();
@@ -2666,6 +2702,7 @@ mod tensor_http_shape_tests {
         let config = MultiLoraBatchConfig {
             window: std::time::Duration::from_secs(2),
             max_requests: 1,
+            max_open_windows: 2,
             max_adapters: 4,
             max_rank_work: 64,
             max_payload_bytes: usize::MAX,
@@ -2674,7 +2711,7 @@ mod tensor_http_shape_tests {
         let window_id = 11;
         {
             let mut state = batcher.state.lock().unwrap();
-            state.current_window_id = Some(window_id);
+            state.open_window_ids.push_back(window_id);
             state.windows.insert(
                 window_id,
                 MultiLoraWindow::new(batch_request("session", &[1], 1, &[11])),
@@ -2700,7 +2737,50 @@ mod tensor_http_shape_tests {
             waiter.join().unwrap() < std::time::Duration::from_millis(500),
             "full coalescing window must not wait for its full deadline"
         );
-        assert_eq!(batcher.state.lock().unwrap().current_window_id, None);
+        assert!(batcher.state.lock().unwrap().open_window_ids.is_empty());
+    }
+
+    #[test]
+    fn coalescing_keeps_interleaved_layout_buckets_open() {
+        let config = MultiLoraBatchConfig {
+            window: std::time::Duration::from_millis(30),
+            max_requests: 4,
+            max_open_windows: 2,
+            max_adapters: 4,
+            max_rank_work: 64,
+            max_payload_bytes: usize::MAX,
+        };
+        let mut state = MultiLoraBatchState::default();
+        state.open_window_ids.extend([17, 19]);
+        state.windows.insert(
+            17,
+            MultiLoraWindow::new(batch_request("session", &[1], 1, &[11])),
+        );
+        state.windows.insert(
+            19,
+            MultiLoraWindow::new(batch_request("session", &[2, 3], 1, &[21])),
+        );
+
+        assert_eq!(
+            MultiLoraBatcher::compatible_window_id(
+                &state,
+                &batch_request("session", &[4], 1, &[12]),
+                config,
+            ),
+            Some(17)
+        );
+        assert_eq!(
+            MultiLoraBatcher::compatible_window_id(
+                &state,
+                &batch_request("session", &[5, 6], 1, &[22]),
+                config,
+            ),
+            Some(19)
+        );
+        assert_eq!(
+            state.open_window_ids.iter().copied().collect::<Vec<_>>(),
+            vec![17, 19]
+        );
     }
 
     #[test]
@@ -2708,13 +2788,19 @@ mod tensor_http_shape_tests {
         let config = MultiLoraBatchConfig {
             window: std::time::Duration::from_millis(30),
             max_requests: 4,
+            max_open_windows: 2,
             max_adapters: 4,
             max_rank_work: 64,
             max_payload_bytes: usize::MAX,
         };
         let batcher = MultiLoraBatcher::new(config);
         let window_id = 13;
-        batcher.state.lock().unwrap().current_window_id = Some(window_id);
+        batcher
+            .state
+            .lock()
+            .unwrap()
+            .open_window_ids
+            .push_back(window_id);
 
         let start = std::time::Instant::now();
         batcher.wait_for_window(window_id, config.window);
@@ -2722,7 +2808,7 @@ mod tensor_http_shape_tests {
             start.elapsed() >= std::time::Duration::from_millis(20),
             "open coalescing window must retain its normal batching deadline"
         );
-        assert_eq!(batcher.state.lock().unwrap().current_window_id, None);
+        assert!(batcher.state.lock().unwrap().open_window_ids.is_empty());
     }
 
     #[test]
@@ -2730,6 +2816,7 @@ mod tensor_http_shape_tests {
         let config = MultiLoraBatchConfig {
             window: std::time::Duration::from_millis(1),
             max_requests: 4,
+            max_open_windows: 2,
             max_adapters: 4,
             max_rank_work: 64,
             max_payload_bytes: usize::MAX,
@@ -2743,6 +2830,7 @@ mod tensor_http_shape_tests {
         let config = MultiLoraBatchConfig {
             window: std::time::Duration::from_millis(1),
             max_requests: 4,
+            max_open_windows: 2,
             max_adapters: 4,
             max_rank_work: 64,
             max_payload_bytes: usize::MAX,

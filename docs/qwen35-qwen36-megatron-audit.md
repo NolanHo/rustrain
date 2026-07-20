@@ -100,6 +100,9 @@ per-adapter loss/step results and the explicit loss scope. Without either
 signal, the legacy one-request dispatch and request-local loss are preserved.
 Opt-in requests are grouped only when
 session, sequence/source layout, and adapter IDs are compatible and disjoint.
+The scheduler keeps up to `RUSTRAIN_MULTI_LORA_BATCH_MAX_OPEN_WINDOWS`
+compatible layout buckets open (default 8, hard maximum 64), so interleaved
+sequence/source layouts no longer seal otherwise mergeable windows early.
 Admission also enforces `RUSTRAIN_MULTI_LORA_BATCH_MAX_RANK_WORK` over
 `adapter_count * max_lora_rank` so heterogeneous rank padding cannot silently
 turn a small request window into an oversized GEMM. The coalescer rebuilds
@@ -118,6 +121,9 @@ coordinator verifies rank-consistent report values. The coalescer is capped at
 2048 adapters for the fixed 256 KiB result slot; an oversized serialized result
 is replaced by a compact error and still signals the waiting parent. This is a
 scheduling/transport optimization, not PP/CP or DeepEP communication overlap.
+The bounded multi-bucket scheduler passed 53/53 server tests in both the local
+ABI1 environment and on H20, including interleaved-layout retention, deadline,
+capacity, binary ingress, and rank-work admission cases.
 
 The `/train_multi_binary` endpoint accepts version-1 `RLM1` requests with a
 56-byte header, adapter IDs/optional expected steps, and three contiguous
