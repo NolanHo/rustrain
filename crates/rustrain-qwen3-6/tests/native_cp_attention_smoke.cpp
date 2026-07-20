@@ -5,6 +5,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <string>
 #include <vector>
 
@@ -79,19 +80,22 @@ static double max_diff(const at::Tensor& lhs, const at::Tensor& rhs) {
 int main() {
     const int rank = std::atoi(std::getenv("RANK"));
     const int world = std::atoi(std::getenv("WORLD_SIZE"));
-    assert(world == 2 && rank >= 0 && rank < world);
+    assert((world == 2 || world == 4) && rank >= 0 && rank < world);
+    const bool ring_test = std::getenv("QWEN36_TEST_CP_RING") &&
+        std::strcmp(std::getenv("QWEN36_TEST_CP_RING"), "0") != 0;
     qwen36_set_cuda_device(rank);
     auto set_distributed_env = [&]() {
         setenv("WORLD_SIZE", std::to_string(world).c_str(), 1);
         setenv("RANK", std::to_string(rank).c_str(), 1);
         setenv("TP_SIZE", "1", 1);
-        setenv("CP_SIZE", "2", 1);
+        setenv("CP_SIZE", std::to_string(world).c_str(), 1);
         setenv("EP_SIZE", "1", 1);
         setenv("DP_SIZE", "1", 1);
         setenv("PP_SIZE", "1", 1);
         setenv("RUSTRAIN_TP_RANK", "0", 1);
         setenv("RUSTRAIN_CP_RANK", std::to_string(rank).c_str(), 1);
-        setenv("QWEN36_CP_FULL_ATTENTION_KV_GATHER", "1", 1);
+        setenv("QWEN36_CP_FULL_ATTENTION_KV_GATHER", ring_test ? "0" : "1", 1);
+        setenv("QWEN36_CP_FULL_ATTENTION_RING", ring_test ? "1" : "0", 1);
     };
     auto set_reference_env = []() {
         setenv("WORLD_SIZE", "1", 1);
@@ -104,6 +108,7 @@ int main() {
         setenv("RUSTRAIN_TP_RANK", "0", 1);
         setenv("RUSTRAIN_CP_RANK", "0", 1);
         setenv("QWEN36_CP_FULL_ATTENTION_KV_GATHER", "1", 1);
+        setenv("QWEN36_CP_FULL_ATTENTION_RING", "0", 1);
     };
 
     constexpr int64_t hidden = 8;
@@ -156,7 +161,7 @@ int main() {
     assert(qwen36_init_parallel_nccl_v2(
         distributed, rank, world,
         0, 1, 0,
-        rank, 2, 0,
+        rank, world, 0,
         0, 1, 0,
         0, 1, 0,
         0, 1, 0) == 0);
@@ -340,20 +345,26 @@ int main() {
     assert(std::isfinite(v_b_grad_diff) && std::isfinite(o_a_grad_diff));
     assert(optimizer_m_diff < 5e-5 && optimizer_v_diff < 5e-8);
     assert(adam_error < 1e-8);
+    const double parameter_threshold = world > 2 ? 3e-3 : 2e-3;
     assert(std::max({q_a_diff, q_b_diff, k_a_diff, k_b_diff,
-        v_a_diff, v_b_diff, o_a_diff, o_b_diff}) <= 2e-3);
+        v_a_diff, v_b_diff, o_a_diff, o_b_diff}) <= parameter_threshold);
 
     set_distributed_env();
-    if (rank == 1) setenv("QWEN36_CP_FULL_ATTENTION_KV_GATHER", "0", 1);
+    if (rank == 1) {
+        setenv("QWEN36_CP_FULL_ATTENTION_KV_GATHER", "0", 1);
+        setenv("QWEN36_CP_FULL_ATTENTION_RING", "0", 1);
+    }
     const double flag_mismatch = qwen36_eval_step(
         distributed, &input_ids, &target_mask, &attention_mask);
     assert(flag_mismatch < 0.0);
-    setenv("QWEN36_CP_FULL_ATTENTION_KV_GATHER", "1", 1);
+    setenv("QWEN36_CP_FULL_ATTENTION_KV_GATHER", ring_test ? "0" : "1", 1);
+    setenv("QWEN36_CP_FULL_ATTENTION_RING", ring_test ? "1" : "0", 1);
 
     qwen36_free_training_context(reference);
     qwen36_free_training_context(distributed);
 
-    std::printf("cp_full_attention_kv_gather_smoke rank=%d flag_mismatch=ok\n", rank);
+    std::printf("cp_full_attention_%s_smoke rank=%d flag_mismatch=ok\n",
+        ring_test ? "ring" : "kv_gather", rank);
     std::fflush(stdout);
     return 0;
 }

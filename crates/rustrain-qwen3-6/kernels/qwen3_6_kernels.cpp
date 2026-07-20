@@ -505,6 +505,229 @@ static at::Tensor tp_sequence_reduce_scatter(
     return output;
 }
 
+// Ring attention communication primitive.  Every rank issues the same
+// send/recv schedule, including the final rotation which returns the local
+// KV block to its owner.  Keeping this primitive separate from attention
+// makes it possible to reuse the exact schedule in the hand-written backward.
+static std::vector<at::Tensor> cp_ring_exchange(
+    const std::vector<at::Tensor>& payloads, ncclComm_t comm,
+    cudaStream_t requested_stream, int64_t rank, int64_t world
+) {
+    TORCH_CHECK(!payloads.empty() && comm && world > 1 &&
+            rank >= 0 && rank < world,
+        "CP ring exchange requires a valid communicator and world");
+    const auto& first = payloads.front();
+    TORCH_CHECK(first.is_cuda() && first.is_contiguous(),
+        "CP ring payloads must be contiguous CUDA tensors");
+    const int device = first.device().index();
+    const auto current = c10::cuda::getCurrentCUDAStream(device).stream();
+    Qwen36StreamFence fence(current, requested_stream);
+    std::vector<at::Tensor> received;
+    received.reserve(payloads.size());
+    for (const auto& payload : payloads) {
+        TORCH_CHECK(payload.is_cuda() && payload.is_contiguous() &&
+                payload.sizes() == first.sizes(),
+            "CP ring payloads must have identical contiguous CUDA shapes");
+        received.push_back(at::empty_like(payload));
+    }
+    const int peer_next = static_cast<int>((rank + 1) % world);
+    const int peer_prev = static_cast<int>((rank + world - 1) % world);
+    TORCH_CHECK(ncclGroupStart() == ncclSuccess,
+        "CP ring group start failed");
+    ncclResult_t first_error = ncclSuccess;
+    for (const auto& payload : payloads) {
+        const auto error = ncclSend(
+            payload.data_ptr(), payload.numel(),
+            NcclAllReduceFunction::dtype_for(payload.scalar_type()),
+            peer_next, comm, fence.operation);
+        if (first_error == ncclSuccess && error != ncclSuccess)
+            first_error = error;
+    }
+    for (auto& output : received) {
+        const auto error = ncclRecv(
+            output.data_ptr(), output.numel(),
+            NcclAllReduceFunction::dtype_for(output.scalar_type()),
+            peer_prev, comm, fence.operation);
+        if (first_error == ncclSuccess && error != ncclSuccess)
+            first_error = error;
+    }
+    const auto group_error = ncclGroupEnd();
+    TORCH_CHECK(first_error == ncclSuccess,
+        "CP ring P2P failed: ", ncclGetErrorString(first_error));
+    TORCH_CHECK(group_error == ncclSuccess,
+        "CP ring group end failed: ", ncclGetErrorString(group_error));
+    fence.complete();
+    return received;
+}
+
+static at::Tensor cp_ring_attention_mask(
+    const at::Tensor& attention_mask, const at::Tensor& device_tensor,
+    int64_t batch, int64_t query_start,
+    int64_t query_length, int64_t key_start, int64_t key_length
+) {
+    auto options = at::TensorOptions().dtype(at::kLong)
+        .device(device_tensor.device());
+    auto query_positions = at::arange(
+        query_start, query_start + query_length, options).view({1, 1, query_length, 1});
+    auto key_positions = at::arange(
+        key_start, key_start + key_length, options).view({1, 1, 1, key_length});
+    auto mask = key_positions.gt(query_positions);
+    if (attention_mask.defined() && attention_mask.numel() > 0) {
+        TORCH_CHECK(attention_mask.dim() == 2 &&
+                attention_mask.size(0) == batch,
+            "CP ring attention mask must be [batch, global_seq]");
+        auto key_valid = attention_mask.to(at::kBool).narrow(
+            1, key_start, key_length).view({batch, 1, 1, key_length});
+        mask = mask.logical_or(key_valid.logical_not());
+    }
+    return mask.expand({batch, 1, query_length, key_length});
+}
+
+// Memory-scalable causal full attention for arbitrary CP world sizes.  The
+// forward maintains online-softmax state while KV blocks rotate through the
+// ring.  Backward replays the same ring and carries FP32 dK/dV accumulators
+// with each block so every owner receives contributions from all query ranks.
+struct Qwen36RingAttentionFunction
+    : public torch::autograd::Function<Qwen36RingAttentionFunction> {
+    static at::Tensor forward(
+        torch::autograd::AutogradContext* ctx, at::Tensor q,
+        at::Tensor local_kv, at::Tensor attention_mask, int64_t comm_ptr,
+        int64_t stream_ptr, int64_t rank, int64_t world, int64_t group,
+        int64_t query_start
+    ) {
+        TORCH_CHECK(q.dim() == 4 && local_kv.dim() == 4 &&
+                q.is_cuda() && local_kv.is_cuda() && q.is_contiguous() &&
+                local_kv.is_contiguous(),
+            "CP ring attention requires contiguous CUDA Q/KV tensors");
+        TORCH_CHECK(world > 1 && group > 0 && q.size(1) == local_kv.size(1) * group &&
+                q.size(2) == local_kv.size(2),
+            "CP ring attention Q/KV head geometry is invalid");
+        TORCH_CHECK(local_kv.size(3) % 2 == 0,
+            "CP ring KV payload must concatenate K and V");
+        const int64_t batch = q.size(0);
+        const int64_t query_length = q.size(2);
+        const int64_t head_dim = local_kv.size(3) / 2;
+        const double scale = 1.0 / std::sqrt(static_cast<double>(head_dim));
+        auto q_float = q.to(at::kFloat);
+        auto running_m = at::full(
+            {batch, q.size(1), query_length, 1}, -std::numeric_limits<float>::infinity(),
+            q_float.options());
+        auto running_l = at::zeros_like(running_m);
+        auto running_o = at::zeros(
+            {batch, q.size(1), query_length, head_dim}, q_float.options());
+        auto current_kv = local_kv;
+        for (int64_t step = 0; step < world; ++step) {
+            const int64_t owner = (rank + world - step) % world;
+            auto k = current_kv.narrow(-1, 0, head_dim)
+                .to(at::kFloat).repeat_interleave(group, 1);
+            auto v = current_kv.narrow(-1, head_dim, head_dim)
+                .to(at::kFloat).repeat_interleave(group, 1);
+            auto scores = at::matmul(q_float, k.transpose(-2, -1)) * scale;
+            auto mask = cp_ring_attention_mask(
+                attention_mask, q, batch, query_start, query_length,
+                owner * query_length, query_length);
+            scores = scores.masked_fill(mask, -std::numeric_limits<float>::infinity());
+            auto block_m = std::get<0>(scores.max(-1, true));
+            auto new_m = at::maximum(running_m, block_m);
+            auto new_m_safe = at::where(
+                at::isfinite(new_m), new_m, at::zeros_like(new_m));
+            auto old_scale = at::where(
+                at::isfinite(running_m), at::exp(running_m - new_m_safe),
+                at::zeros_like(running_m));
+            auto block_exp = at::exp(scores - new_m_safe).masked_fill(mask, 0.0);
+            running_o = running_o * old_scale + at::matmul(block_exp, v);
+            running_l = running_l * old_scale + block_exp.sum(-1, true);
+            running_m = new_m;
+            auto rotated = cp_ring_exchange(
+                {current_kv}, reinterpret_cast<ncclComm_t>(comm_ptr),
+                reinterpret_cast<cudaStream_t>(stream_ptr), rank, world);
+            current_kv = rotated.front();
+        }
+        auto output = running_o / running_l.clamp_min(1e-9);
+        auto lse = at::where(
+            running_l > 0, running_m + at::log(running_l),
+            at::full_like(running_l, -std::numeric_limits<float>::infinity()));
+        ctx->saved_data["comm"] = comm_ptr;
+        ctx->saved_data["stream"] = stream_ptr;
+        ctx->saved_data["rank"] = rank;
+        ctx->saved_data["world"] = world;
+        ctx->saved_data["group"] = group;
+        ctx->saved_data["query_start"] = query_start;
+        ctx->save_for_backward({q, local_kv, attention_mask, output, lse});
+        return output.to(q.scalar_type());
+    }
+
+    static std::vector<at::Tensor> backward(
+        torch::autograd::AutogradContext* ctx,
+        std::vector<at::Tensor> grad_output
+    ) {
+        auto saved = ctx->get_saved_variables();
+        auto q = saved[0];
+        auto local_kv = saved[1];
+        auto attention_mask = saved[2];
+        auto output = saved[3];
+        auto lse = saved[4];
+        const int64_t rank = ctx->saved_data["rank"].toInt();
+        const int64_t world = ctx->saved_data["world"].toInt();
+        const int64_t group = ctx->saved_data["group"].toInt();
+        const int64_t query_start = ctx->saved_data["query_start"].toInt();
+        const int64_t head_dim = local_kv.size(3) / 2;
+        const int64_t batch = q.size(0);
+        const int64_t query_length = q.size(2);
+        const double scale = 1.0 / std::sqrt(static_cast<double>(head_dim));
+        auto q_float = q.to(at::kFloat);
+        auto grad_out = grad_output[0].to(at::kFloat);
+        auto grad_q = at::zeros_like(q_float);
+        auto grad_kv = at::zeros(local_kv.sizes(), q_float.options());
+        auto current_kv = local_kv;
+        auto current_grad = at::zeros_like(grad_kv);
+        auto delta = (grad_out * output).sum(-1, true);
+        for (int64_t step = 0; step < world; ++step) {
+            const int64_t owner = (rank + world - step) % world;
+            auto k = current_kv.narrow(-1, 0, head_dim)
+                .to(at::kFloat).repeat_interleave(group, 1);
+            auto v = current_kv.narrow(-1, head_dim, head_dim)
+                .to(at::kFloat).repeat_interleave(group, 1);
+            auto scores = at::matmul(q_float, k.transpose(-2, -1)) * scale;
+            auto mask = cp_ring_attention_mask(
+                attention_mask, q, batch, query_start, query_length,
+                owner * query_length, query_length);
+            auto safe_lse = at::where(
+                at::isfinite(lse), lse, at::zeros_like(lse));
+            scores = scores.masked_fill(mask, -std::numeric_limits<float>::infinity());
+            auto probs = at::exp(scores - safe_lse);
+            probs = probs.masked_fill(mask, 0.0);
+            auto grad_scores = probs * (
+                at::matmul(grad_out, v.transpose(-2, -1)) - delta);
+            grad_q = grad_q + at::matmul(grad_scores, k) * scale;
+            auto grad_k_expanded = at::matmul(
+                grad_scores.transpose(-2, -1), q_float) * scale;
+            auto grad_v_expanded = at::matmul(
+                probs.transpose(-2, -1), grad_out);
+            auto grad_k = grad_k_expanded.view({
+                batch, local_kv.size(1), group, query_length, head_dim})
+                .sum(2);
+            auto grad_v = grad_v_expanded.view({
+                batch, local_kv.size(1), group, query_length, head_dim})
+                .sum(2);
+            current_grad.narrow(-1, 0, head_dim).add_(grad_k);
+            current_grad.narrow(-1, head_dim, head_dim).add_(grad_v);
+            auto rotated = cp_ring_exchange(
+                {current_kv, current_grad},
+                reinterpret_cast<ncclComm_t>(ctx->saved_data["comm"].toInt()),
+                reinterpret_cast<cudaStream_t>(ctx->saved_data["stream"].toInt()),
+                rank, world);
+            current_kv = rotated[0];
+            current_grad = rotated[1];
+        }
+        grad_kv.copy_(current_grad);
+        return {grad_q.to(q.scalar_type()),
+            grad_kv.to(local_kv.scalar_type()), at::Tensor(), at::Tensor(),
+            at::Tensor(), at::Tensor(), at::Tensor(), at::Tensor(), at::Tensor(),
+        };
+    }
+};
+
 // Megatron gather_from_sequence_parallel_region: gather in forward and sum
 // column-parallel dgrad contributions while scattering them in backward.
 struct TpGatherFromSequenceFunction
@@ -4237,6 +4460,7 @@ static void hash_collective_runtime_environment(AdapterRegistryHash& hash) {
     hash.add_u64(env_enabled("QWEN36_FUSED_MLP_FC1"));
     hash.add_u64(env_enabled("QWEN36_MOE_SHARED_OVERLAP"));
     hash.add_u64(env_enabled("QWEN36_CP_FULL_ATTENTION_KV_GATHER"));
+    hash.add_u64(env_enabled("QWEN36_CP_FULL_ATTENTION_RING"));
     hash.add_u64(env_enabled("QWEN36_DISABLE_MTP"));
     const char* checkpoint_stride =
         getenv("QWEN36_GDN_STATE_CHECKPOINT_STRIDE");
@@ -4480,8 +4704,8 @@ static void validate_native_execution_topology(
         }
     }
     if (ctx->cp_world_size > 1) {
-        TORCH_CHECK(ctx->cp_world_size == 2 && ctx->cp_comm,
-            "Qwen context parallelism currently requires initialized CP_SIZE=2");
+        TORCH_CHECK(ctx->cp_comm,
+            "Qwen context parallelism requires an initialized CP communicator");
         TORCH_CHECK(ctx->tp_world_size == 1 && ctx->ep_world_size == 1 &&
                 ctx->dp_world_size == 1 && ctx->pp_world_size == 1,
             "Qwen context parallelism currently requires TP=EP=DP=PP=1");
@@ -4504,10 +4728,17 @@ static void validate_native_execution_topology(
             TORCH_CHECK(config.num_experts == 0,
                 "Qwen context parallelism currently requires dense layers");
             if (config.layer_type == 0) {
-                TORCH_CHECK(env_enabled(
-                        "QWEN36_CP_FULL_ATTENTION_KV_GATHER"),
-                    "full-attention context parallelism requires "
-                    "QWEN36_CP_FULL_ATTENTION_KV_GATHER=1");
+                const bool use_kv_gather = env_enabled(
+                    "QWEN36_CP_FULL_ATTENTION_KV_GATHER");
+                const bool use_ring = env_enabled(
+                    "QWEN36_CP_FULL_ATTENTION_RING");
+                TORCH_CHECK(use_kv_gather != use_ring,
+                    "full-attention context parallelism requires exactly one of "
+                    "QWEN36_CP_FULL_ATTENTION_KV_GATHER=1 or "
+                    "QWEN36_CP_FULL_ATTENTION_RING=1");
+                TORCH_CHECK(ctx->cp_world_size == 2 || use_ring,
+                    "CP_SIZE>2 full attention requires "
+                    "QWEN36_CP_FULL_ATTENTION_RING=1");
                 TORCH_CHECK(config.num_heads > 0 &&
                         config.num_kv_heads > 0 && config.head_dim > 0 &&
                         config.num_heads % config.num_kv_heads == 0 &&
@@ -4549,6 +4780,9 @@ static void validate_native_execution_topology(
                 weight_offset += weight_count_for_layer(config);
                 continue;
             }
+            TORCH_CHECK(ctx->cp_world_size == 2,
+                "CP_SIZE>2 currently supports full-attention-only models; "
+                "hybrid GDN context parallelism remains restricted to CP2");
             TORCH_CHECK(config.num_k_heads > 0 && config.num_v_heads > 0 &&
                     config.key_dim > 0 && config.val_dim > 0 &&
                     config.conv_kernel > 0 &&
@@ -8583,12 +8817,17 @@ static at::Tensor full_attention_batched(
     int64_t batch = projection_input.size(0);
     int64_t seq = projection_input.size(1);
     const bool use_context_parallel = context_parallel_enabled(ctx);
+    const bool use_cp_ring = use_context_parallel &&
+        env_enabled("QWEN36_CP_FULL_ATTENTION_RING");
     if (use_context_parallel) {
-        TORCH_CHECK(ctx->cp_world_size == 2 && ctx->cp_comm &&
-                env_enabled("QWEN36_CP_FULL_ATTENTION_KV_GATHER") &&
+        const bool use_kv_gather =
+            env_enabled("QWEN36_CP_FULL_ATTENTION_KV_GATHER");
+        TORCH_CHECK(ctx->cp_comm && use_kv_gather != use_cp_ring &&
                 !ctx->base_tp_attention,
-            "full-attention context parallelism requires guarded CP2 KV "
-            "gather without tensor-parallel attention");
+            "full-attention context parallelism requires exactly one guarded "
+            "KV gather or ring path without tensor-parallel attention");
+        TORCH_CHECK(ctx->cp_world_size == 2 || use_cp_ring,
+            "full-attention CP_SIZE>2 requires ring attention");
     }
     if (ctx->base_tp_attention) {
         TORCH_CHECK(num_heads % ctx->tp_world_size == 0 &&
@@ -8700,7 +8939,11 @@ static at::Tensor full_attention_batched(
     }
 
     int64_t key_sequence = seq;
-    if (use_context_parallel) {
+    at::Tensor local_ring_kv;
+    if (use_cp_ring) {
+        local_ring_kv = at::cat({k, v}, -1).contiguous();
+        key_sequence = seq * ctx->cp_world_size;
+    } else if (use_context_parallel) {
         auto local_k = k.transpose(1, 2).reshape({
             batch, seq, k_projection_dim});
         auto local_v = v.transpose(1, 2).reshape({
@@ -8724,7 +8967,24 @@ static at::Tensor full_attention_batched(
 
     // SDPA with GQA
     at::Tensor attn_out;
-    if (use_context_parallel) {
+    if (use_cp_ring) {
+        if (attention_mask.defined() && attention_mask.numel() > 0) {
+            TORCH_CHECK(attention_mask.dim() == 2 &&
+                    attention_mask.size(0) == batch &&
+                    attention_mask.size(1) == key_sequence,
+                "full-attention CP ring mask must be [batch, global_seq]");
+        }
+        auto ring_mask = attention_mask.defined()
+            ? attention_mask.to(at::kBool).contiguous()
+            : at::empty({0}, at::TensorOptions().dtype(at::kBool)
+                .device(q_out.device()));
+        attn_out = Qwen36RingAttentionFunction::apply(
+            q_out.contiguous(), local_ring_kv, ring_mask,
+            (int64_t)ctx->cp_comm,
+            (int64_t)reinterpret_cast<uintptr_t>(ctx->cp_stream),
+            ctx->cp_rank, ctx->cp_world_size,
+            num_heads / num_kv_heads, ctx->cp_rank * seq);
+    } else if (use_context_parallel) {
         const int64_t query_start = ctx->cp_rank * seq;
         auto query_positions = at::arange(
             query_start, query_start + seq,

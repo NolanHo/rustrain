@@ -262,10 +262,13 @@ elif [[ "$mode" == "cp-gdn-smoke" ]]; then
         "$python_bin" -m torch.distributed.run --standalone \
             --nnodes=1 --nproc-per-node=2 --no-python "$test_bin"
 elif [[ "$mode" == "cp-attention-smoke" ]]; then
-    QWEN36_CP_FULL_ATTENTION_KV_GATHER=1 \
-    TP_SIZE=1 CP_SIZE=2 EP_SIZE=1 DP_SIZE=1 PP_SIZE=1 \
+    cp_test_size="${QWEN36_TEST_CP_SIZE:-2}"
+    QWEN36_TEST_CP_RING="${QWEN36_TEST_CP_RING:-0}" \
+    QWEN36_CP_FULL_ATTENTION_KV_GATHER="$([[ "${QWEN36_TEST_CP_RING:-0}" == "1" ]] && echo 0 || echo 1)" \
+    QWEN36_CP_FULL_ATTENTION_RING="$([[ "${QWEN36_TEST_CP_RING:-0}" == "1" ]] && echo 1 || echo 0)" \
+    TP_SIZE=1 CP_SIZE="$cp_test_size" EP_SIZE=1 DP_SIZE=1 PP_SIZE=1 \
         "$python_bin" -m torch.distributed.run --standalone \
-            --nnodes=1 --nproc-per-node=2 --no-python "$test_bin"
+            --nnodes=1 --nproc-per-node="$cp_test_size" --no-python "$test_bin"
 elif [[ "$mode" == "pp-cp-comm-smoke" ]]; then
     TP_SIZE=1 CP_SIZE=2 EP_SIZE=1 DP_SIZE=1 PP_SIZE=2 \
         "$python_bin" -m torch.distributed.run --standalone \
