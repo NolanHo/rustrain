@@ -99,9 +99,12 @@ may set `allow_aggregate_loss=true`, or advertise
 per-adapter loss/step results and the explicit loss scope. Without either
 signal, the legacy one-request dispatch and request-local loss are preserved.
 Opt-in requests are grouped only when
-session, sequence/source layout, LoRA rank, and adapter IDs are compatible and
-disjoint. The coalescer rebuilds source-major rows into one native heterogeneous
-batch, is bounded by request/adapter/payload limits, and seals its window before
+session, sequence/source layout, and adapter IDs are compatible and disjoint.
+Admission also enforces `RUSTRAIN_MULTI_LORA_BATCH_MAX_RANK_WORK` over
+`adapter_count * max_lora_rank` so heterogeneous rank padding cannot silently
+turn a small request window into an oversized GEMM. The coalescer rebuilds
+source-major rows into one native heterogeneous batch, is bounded by
+request/adapter/rank-work/payload limits, and seals its window before
 ordinary tensor, registry, or checkpoint operations. Responses expose
 `loss_scope=coalesced_batch` and the number of merged requests. ABI25 requires
 the native report symbols and returns adapter-ordered losses: it sums token-loss

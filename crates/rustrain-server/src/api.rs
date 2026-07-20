@@ -49,6 +49,8 @@ const HARD_MAX_MULTI_LORA_BATCH_WINDOW_US: u64 = 100_000;
 const DEFAULT_MULTI_LORA_BATCH_REQUESTS: usize = 16;
 const HARD_MAX_MULTI_LORA_BATCH_REQUESTS: usize = 4_096;
 const DEFAULT_MULTI_LORA_BATCH_ADAPTERS: usize = 64;
+const DEFAULT_MULTI_LORA_BATCH_RANK_WORK: usize = 32_768;
+const HARD_MAX_MULTI_LORA_BATCH_RANK_WORK: usize = 4_194_304;
 // AdapterLoss is JSON-encoded into a fixed 256 KiB IPC result slot. Keep a
 // conservative margin for worst-case i64/f64 strings and the result envelope.
 const HARD_MAX_MULTI_LORA_BATCH_ADAPTERS: usize = 2_048;
@@ -65,6 +67,7 @@ struct MultiLoraBatchConfig {
     window: Duration,
     max_requests: usize,
     max_adapters: usize,
+    max_rank_work: usize,
     max_payload_bytes: usize,
 }
 
@@ -85,6 +88,11 @@ impl MultiLoraBatchConfig {
             DEFAULT_MULTI_LORA_BATCH_ADAPTERS,
             HARD_MAX_MULTI_LORA_BATCH_ADAPTERS,
         );
+        let max_rank_work = configured_positive_usize(
+            "RUSTRAIN_MULTI_LORA_BATCH_MAX_RANK_WORK",
+            DEFAULT_MULTI_LORA_BATCH_RANK_WORK,
+            HARD_MAX_MULTI_LORA_BATCH_RANK_WORK,
+        );
         let slab_bytes = configured_positive_usize(
             "RUSTRAIN_EP_TENSOR_SLAB_BYTES",
             rustrain_ipc::DEFAULT_TENSOR_SLAB_BYTES,
@@ -99,6 +107,7 @@ impl MultiLoraBatchConfig {
             window: Duration::from_micros(window_us),
             max_requests,
             max_adapters,
+            max_rank_work,
             max_payload_bytes,
         }
     }
@@ -205,6 +214,8 @@ struct MultiLoraWindow {
     source_count: usize,
     adapter_ids: HashSet<i64>,
     adapter_count: usize,
+    max_lora_rank: usize,
+    rank_work: usize,
     payload_bytes: usize,
     coalescible: bool,
     validates_steps: bool,
@@ -220,6 +231,10 @@ impl MultiLoraWindow {
             source_count: request.source_count,
             adapter_ids,
             adapter_count: request.n_total,
+            max_lora_rank: request.lora_rank.max(0) as usize,
+            rank_work: request
+                .n_total
+                .saturating_mul(request.lora_rank.max(0) as usize),
             payload_bytes: request.normalized_payload_bytes,
             coalescible: request.coalescible(),
             validates_steps: !request.expected_steps.is_empty(),
@@ -236,11 +251,20 @@ impl MultiLoraWindow {
             || self.validates_steps != !request.expected_steps.is_empty()
             || self.requests.len() >= config.max_requests
             || self.adapter_count.saturating_add(request.n_total) > config.max_adapters
+            || request.lora_rank <= 0
             || self
                 .payload_bytes
                 .saturating_add(request.normalized_payload_bytes)
                 > config.max_payload_bytes
         {
+            return false;
+        }
+        let projected_count = self.adapter_count.saturating_add(request.n_total);
+        let projected_max_rank = self.max_lora_rank.max(request.lora_rank as usize);
+        let Some(projected_rank_work) = projected_count.checked_mul(projected_max_rank) else {
+            return false;
+        };
+        if projected_rank_work > config.max_rank_work {
             return false;
         }
         request
@@ -251,6 +275,8 @@ impl MultiLoraWindow {
 
     fn push(&mut self, request: MultiLoraDispatchRequest) {
         self.adapter_count += request.n_total;
+        self.max_lora_rank = self.max_lora_rank.max(request.lora_rank as usize);
+        self.rank_work = self.adapter_count.saturating_mul(self.max_lora_rank);
         self.payload_bytes += request.normalized_payload_bytes;
         self.adapter_ids.extend(request.adapter_ids.iter().copied());
         self.requests.push(request);
@@ -259,6 +285,7 @@ impl MultiLoraWindow {
     fn at_capacity(&self, config: MultiLoraBatchConfig) -> bool {
         self.requests.len() >= config.max_requests
             || self.adapter_count >= config.max_adapters
+            || self.rank_work >= config.max_rank_work
             || self.payload_bytes >= config.max_payload_bytes
     }
 }
@@ -348,6 +375,11 @@ impl MultiLoraBatcher {
     ) -> Result<(), EpDispatchScheduleError> {
         if request.n_total > self.config.max_adapters
             || request.normalized_payload_bytes > self.config.max_payload_bytes
+            || request.lora_rank <= 0
+            || request
+                .n_total
+                .checked_mul(request.lora_rank as usize)
+                .map_or(true, |rank_work| rank_work > self.config.max_rank_work)
         {
             return Err(EpDispatchScheduleError::QueueFull);
         }
@@ -2047,6 +2079,11 @@ async fn submit_ep_multi_lora(
     expected_steps: Vec<u64>,
     allow_aggregate_loss: bool,
 ) -> Result<Json<TrainMultiLoraResponse>, (StatusCode, Json<ErrorResponse>)> {
+    if n_total <= 0 || lora_rank <= 0 {
+        return Err(err_resp(
+            "multi-LoRA n_total and lora_rank must be positive",
+        ));
+    }
     if !adapter_ids.is_empty() {
         if adapter_ids.len() != n_total as usize {
             return Err(err_resp(&format!(
@@ -2567,6 +2604,7 @@ mod tensor_http_shape_tests {
             window: std::time::Duration::from_millis(1),
             max_requests: 2,
             max_adapters: 3,
+            max_rank_work: 64,
             max_payload_bytes: usize::MAX,
         };
         let mut window = MultiLoraWindow::new(batch_request("session", &[1], 1, &[11]));
@@ -2575,6 +2613,14 @@ mod tensor_http_shape_tests {
         assert!(window.can_accept(
             &batch_request_with_rank("session", &[2], 1, &[12], 16),
             config
+        ));
+        let tight_config = MultiLoraBatchConfig {
+            max_rank_work: 16,
+            ..config
+        };
+        assert!(!window.can_accept(
+            &batch_request_with_rank("session", &[2], 1, &[12], 16),
+            tight_config
         ));
         let mut guarded = batch_request("session", &[2], 1, &[12]);
         guarded.expected_steps = vec![0];
@@ -2590,6 +2636,7 @@ mod tensor_http_shape_tests {
             window: std::time::Duration::from_secs(2),
             max_requests: 4,
             max_adapters: 4,
+            max_rank_work: 64,
             max_payload_bytes: usize::MAX,
         };
         let batcher = MultiLoraBatcher::new(config);
@@ -2620,6 +2667,7 @@ mod tensor_http_shape_tests {
             window: std::time::Duration::from_secs(2),
             max_requests: 1,
             max_adapters: 4,
+            max_rank_work: 64,
             max_payload_bytes: usize::MAX,
         };
         let batcher = MultiLoraBatcher::new(config);
@@ -2661,6 +2709,7 @@ mod tensor_http_shape_tests {
             window: std::time::Duration::from_millis(30),
             max_requests: 4,
             max_adapters: 4,
+            max_rank_work: 64,
             max_payload_bytes: usize::MAX,
         };
         let batcher = MultiLoraBatcher::new(config);
@@ -2682,6 +2731,7 @@ mod tensor_http_shape_tests {
             window: std::time::Duration::from_millis(1),
             max_requests: 4,
             max_adapters: 4,
+            max_rank_work: 64,
             max_payload_bytes: usize::MAX,
         };
         let window = MultiLoraWindow::new(batch_request("session", &[1], 1, &[]));
@@ -2694,6 +2744,7 @@ mod tensor_http_shape_tests {
             window: std::time::Duration::from_millis(1),
             max_requests: 4,
             max_adapters: 4,
+            max_rank_work: 64,
             max_payload_bytes: usize::MAX,
         };
         let mut request = batch_request("session", &[1], 1, &[11]);
