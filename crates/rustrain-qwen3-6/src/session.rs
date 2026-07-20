@@ -621,9 +621,6 @@ fn train_impl(
         );
     }
     if base_tp_attention {
-        if runtime_config.mtp_num_hidden_layers > 0 && runtime_config.is_moe {
-            bail!("TP2 MTP currently supports dense prediction layers only; Qwen3.6 MoE MTP remains fail-closed");
-        }
         if runtime_config.num_attention_heads <= 0
             || runtime_config.num_attention_heads % tp_size as i64 != 0
             || runtime_config.num_key_value_heads <= 0
@@ -693,6 +690,11 @@ fn train_impl(
                 );
             }
         }
+    }
+    if runtime_config.mtp_num_hidden_layers > 0 && ep_size > 1 {
+        bail!(
+            "fixed-LoRA MTP with EP_SIZE={ep_size} remains fail-closed until its MTP/main denominator uses global source token counts; dynamic multi-LoRA EP MTP is supported through the native API"
+        );
     }
 
     // Load only the frozen weights owned by this physical pipeline stage.
@@ -821,8 +823,27 @@ fn train_impl(
         let mtp_tensors = read_safetensors_dir_filtered(&model_path, &mtp_needed)?;
         let mut mtp_gpu = BTreeMap::new();
         for (name, tensor) in &mtp_tensors {
+            let needs_expert_narrow = shard_ref.is_some()
+                && (name.contains(".mlp.experts.gate_up_proj")
+                    || name.contains(".mlp.experts.down_proj"));
+            let expert_shard = if needs_expert_narrow && tensor.size()[0] == num_experts {
+                let shard = shard_ref.expect("expert shard checked above");
+                Some(
+                    tensor
+                        .narrow(0, shard.expert_start as i64, shard.experts_per_rank as i64)
+                        .contiguous(),
+                )
+            } else {
+                None
+            };
+            let expert_or_full = expert_shard.as_ref().unwrap_or(tensor);
             let moe_shard = if base_tp_mlp {
-                crate::kernel::shard_moe_mlp_weight_for_tp(name, tensor, tp_size, tp_rank)?
+                crate::kernel::shard_moe_mlp_weight_for_tp(
+                    name,
+                    expert_or_full,
+                    tp_size,
+                    tp_rank,
+                )?
             } else {
                 None
             };
@@ -840,6 +861,7 @@ fn train_impl(
                 .as_ref()
                 .or(attention_shard.as_ref())
                 .or(dense_shard.as_ref())
+                .or(expert_shard.as_ref())
                 .unwrap_or(tensor);
             mtp_gpu.insert(name.clone(), local.to_device(device).to_kind(compute_kind));
         }

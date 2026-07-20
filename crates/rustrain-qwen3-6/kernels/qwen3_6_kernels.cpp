@@ -3526,8 +3526,15 @@ static void hash_collective_runtime_config(
             hash.add_u64(config.num_experts);
             hash.add_u64(config.top_k);
             hash.add_u64(config.moe_intermediate);
-            hash.add_u64(config.expert_start);
             hash.add_u64(config.expert_count);
+            const bool ownership_valid = config.num_experts <= 0 ||
+                (ctx->ep_world_size > 0 &&
+                    config.num_experts % ctx->ep_world_size == 0 &&
+                    config.expert_count ==
+                        config.num_experts / ctx->ep_world_size &&
+                    config.expert_start ==
+                        ctx->ep_rank * config.expert_count);
+            hash.add_u64(ownership_valid);
             hash.add_u64(config.intermediate_size);
             hash.add_u64(config.norm_topk_prob);
         }
@@ -3621,20 +3628,31 @@ static void validate_native_execution_topology(
         "native Qwen PP communicator is not initialized");
     TORCH_CHECK(allow_pipeline || ctx->pp_world_size == 1,
         "native Qwen pipeline execution must use the pipeline training ABI");
-    if (ctx->has_mtp && ctx->tp_world_size > 1) {
-        TORCH_CHECK(ctx->tp_world_size == 2 && ctx->tp_comm &&
-                ctx->base_tp_attention && ctx->base_tp_mlp,
-            "MTP tensor parallelism currently requires initialized TP_SIZE=2 "
-            "with both base attention and MLP tensor parallelism");
+    if (ctx->has_mtp) {
+        if (ctx->tp_world_size > 1) {
+            TORCH_CHECK(ctx->tp_world_size == 2 && ctx->tp_comm &&
+                    ctx->base_tp_attention && ctx->base_tp_mlp,
+                "MTP tensor parallelism currently requires initialized "
+                "TP_SIZE=2 with both base attention and MLP tensor parallelism");
+        }
         TORCH_CHECK(!ctx->sequence_parallel && !ctx->vocab_parallel &&
-                ctx->cp_world_size == 1 && ctx->ep_world_size == 1 &&
-                ctx->pp_world_size == 1,
-            "MTP tensor parallelism currently requires replicated sequence "
-            "and vocabulary state with CP=EP=PP=1");
+                ctx->cp_world_size == 1 && ctx->pp_world_size == 1,
+            "MTP parallelism currently requires replicated sequence and "
+            "vocabulary state with CP=PP=1");
+        if (ctx->ep_world_size > 1) {
+            TORCH_CHECK(ctx->expert_parallel && ctx->nccl_comm &&
+                    env_enabled("QWEN36_EP_A2A") &&
+                    env_enabled("QWEN36_EP_A2A_SHARDED") &&
+                    env_enabled("QWEN36_EP_A2A_PACKED", true),
+                "MTP expert parallelism requires initialized packed sharded "
+                "A2A");
+        }
         for (const auto& config : ctx->mtp_layer_configs) {
-            TORCH_CHECK(config.layer_type == 0 && config.num_experts == 0,
-                "MTP tensor parallelism currently supports dense full-attention "
+            TORCH_CHECK(config.layer_type == 0,
+                "MTP parallelism currently supports full-attention "
                 "prediction layers only");
+            TORCH_CHECK(ctx->ep_world_size == 1 || config.num_experts > 0,
+                "MTP expert parallelism requires MoE prediction layers");
         }
     }
     if (ctx->sequence_parallel) {
@@ -11012,8 +11030,6 @@ static void validate_mtp_prediction_layer_layout(
     TORCH_CHECK(cfg.layer_type == 0,
         "MTP prediction layer ", layer_index,
         " must use full attention");
-    TORCH_CHECK(ctx->tp_world_size == 1 || cfg.num_experts == 0,
-        "MTP tensor parallelism currently supports dense prediction layers only");
     auto* input_norm = weights[weight_offset];
     auto* post_norm = weights[weight_offset + 1];
     TORCH_CHECK(input_norm->dim() == 1 && input_norm->size(0) == hidden_size &&
@@ -11091,6 +11107,18 @@ static void validate_mtp_prediction_layer_layout(
             cfg.moe_intermediate % mlp_partitions == 0,
         "MTP prediction layer ", layer_index,
         " routed intermediate size must be divisible by its TP partition count");
+    TORCH_CHECK(cfg.top_k > 0 && cfg.top_k <= cfg.num_experts,
+        "MTP prediction layer ", layer_index,
+        " has an invalid routed-expert top-k");
+    TORCH_CHECK(ctx->ep_world_size > 0 &&
+            cfg.num_experts % ctx->ep_world_size == 0 &&
+            cfg.expert_count == cfg.num_experts / ctx->ep_world_size &&
+            cfg.expert_start == ctx->ep_rank * cfg.expert_count,
+        "MTP prediction layer ", layer_index,
+        " requires equal rank-contiguous expert ownership: global_experts=",
+        cfg.num_experts, " EP_SIZE=", ctx->ep_world_size,
+        " EP_RANK=", ctx->ep_rank, " expert_start=", cfg.expert_start,
+        " expert_count=", cfg.expert_count);
     const int64_t local_intermediate =
         cfg.moe_intermediate / mlp_partitions;
     auto* router = weights[weight_offset + 8];
@@ -11100,9 +11128,10 @@ static void validate_mtp_prediction_layer_layout(
     auto* shared_down = weights[weight_offset + 12];
     auto* experts_gate_up = weights[weight_offset + 13];
     auto* experts_down = weights[weight_offset + 14];
-    TORCH_CHECK(router->dim() == 2 && router->size(1) == hidden_size &&
+    TORCH_CHECK(router->dim() == 2 &&
+            router->sizes() == at::IntArrayRef({cfg.num_experts, hidden_size}) &&
             shared_router->dim() == 2 &&
-            shared_router->size(1) == hidden_size,
+            shared_router->sizes() == at::IntArrayRef({1, hidden_size}),
         "MTP prediction layer ", layer_index,
         " router weights must remain replicated matrices over hidden");
     TORCH_CHECK(shared_gate->dim() == 2 && shared_up->dim() == 2 &&
@@ -11198,6 +11227,11 @@ __attribute__((visibility("default"))) int32_t qwen36_set_mtp_weights(
             mtp_layer_configs_ptr);
         std::vector<LayerConfig> configured_layers(
             layer_configs, layer_configs + num_mtp_layers);
+        for (auto& config : configured_layers) {
+            config.nccl_comm = ctx->expert_parallel ? ctx->nccl_comm : nullptr;
+            config.nccl_stream = ctx->expert_parallel
+                ? ctx->nccl_stream : nullptr;
+        }
         int64_t expected_weight_count = 0;
         for (const auto& config : configured_layers)
             expected_weight_count += weight_count_for_layer(config);
@@ -11240,11 +11274,14 @@ __attribute__((visibility("default"))) int32_t qwen36_set_mtp_weights(
                         *layer_weights[weight_offset + 4],
                         *layer_weights[weight_offset + 6]}, 0).contiguous();
                 }
-                if (env_enabled("QWEN36_FUSED_MLP_FC1", false) &&
-                        configured_layers[layer].num_experts == 0) {
+                if (env_enabled("QWEN36_FUSED_MLP_FC1", false)) {
+                    const int64_t mlp_start = 8;
+                    const int64_t gate_offset = configured_layers[layer].num_experts > 0
+                        ? mlp_start + 2 : mlp_start;
                     configured_fused_fc1[cache_index] = at::cat({
-                        *layer_weights[weight_offset + 8],
-                        *layer_weights[weight_offset + 9]}, 0).contiguous();
+                        *layer_weights[weight_offset + gate_offset],
+                        *layer_weights[weight_offset + gate_offset + 1]},
+                        0).contiguous();
                 }
                 weight_offset += weight_count_for_layer(
                     configured_layers[layer]);
@@ -11317,6 +11354,10 @@ __attribute__((visibility("default"))) double qwen36_train_micro_step(
             return loss;
         }
         validate_native_execution_topology_collective(ctx);
+        TORCH_CHECK(!ctx->has_mtp || ctx->ep_world_size == 1,
+            "fixed-LoRA MTP with expert parallelism remains disabled until "
+            "its MTP/main denominator uses global source token counts; use "
+            "dynamic multi-LoRA for EP MTP");
         auto* input_ids_tensor = reinterpret_cast<at::Tensor*>(input_ids_ptr);
         auto* target_mask_tensor = reinterpret_cast<at::Tensor*>(target_mask_ptr);
         auto* attention_mask_tensor = attention_mask_ptr
@@ -11697,9 +11738,14 @@ double qwen36_train_multi_lora_impl(
             (ctx->tp_world_size == 2 && ctx->tp_comm &&
                 !ctx->sequence_parallel && !ctx->vocab_parallel &&
                 ctx->base_tp_attention && ctx->base_tp_mlp);
+        const bool dynamic_mtp_ep_supported = ctx->ep_world_size == 1 ||
+            (ctx->expert_parallel && ctx->nccl_comm &&
+                env_enabled("QWEN36_EP_A2A") &&
+                env_enabled("QWEN36_EP_A2A_SHARDED") &&
+                env_enabled("QWEN36_EP_A2A_PACKED", true));
         const bool dynamic_mtp_topology_supported = !mtp_enabled ||
             (!allow_pipeline && dynamic_mtp_tp_supported &&
-                ctx->cp_world_size == 1 && ctx->ep_world_size == 1 &&
+                dynamic_mtp_ep_supported && ctx->cp_world_size == 1 &&
                 ctx->pp_world_size == 1 &&
                 ctx->router_aux_loss_coef == 0.0);
         bool local_input_valid = input_ids_tensor && target_mask_tensor &&
@@ -11737,9 +11783,9 @@ double qwen36_train_multi_lora_impl(
             "native Qwen multi-LoRA inputs must be CUDA tensors on the "
             "NCCL context device");
         TORCH_CHECK(dynamic_mtp_topology_supported,
-            "dynamic MTP currently requires CP=EP=PP=1, DP>=1, replicated "
+            "dynamic MTP currently requires CP=PP=1, DP>=1, replicated "
             "vocabulary and sequence state, sharded prediction-layer weights "
-            "when TP>1, and router aux disabled");
+            "when TP>1, packed sharded A2A when EP>1, and router aux disabled");
         auto& input_ids = *input_ids_tensor;
         auto& target_mask = *target_mask_tensor;
         const int input_device = input_ids.device().index();
@@ -11839,20 +11885,37 @@ double qwen36_train_multi_lora_impl(
                     reinterpret_cast<ncclComm_t>(ctx->tp_comm),
                     ctx->tp_world_size, "TP MTP"),
                 "dynamic MTP token counts differ across TP ranks");
-            if (ctx->data_parallel && ctx->dp_comm &&
-                    ctx->dp_world_size > 1) {
+            const bool sharded_ep = ctx->expert_parallel && ctx->nccl_comm &&
+                env_enabled("QWEN36_EP_A2A_SHARDED");
+            if (ctx->expert_parallel && ctx->nccl_comm && !sharded_ep) {
+                TORCH_CHECK(replica_token_weights_match(
+                        ctx, packed_counts,
+                        reinterpret_cast<ncclComm_t>(ctx->nccl_comm),
+                        ctx->ep_world_size, "replicated EP MTP"),
+                    "dynamic MTP token counts differ across replicated EP ranks");
+            }
+            auto sum_counts = [&](ncclComm_t communicator, const char* axis) {
                 auto reduced_counts = at::empty_like(packed_counts);
                 auto stream = c10::cuda::getCurrentCUDAStream(
                     packed_counts.device().index()).stream();
                 auto error = ncclAllReduce(
                     packed_counts.data_ptr<float>(),
                     reduced_counts.data_ptr<float>(), packed_counts.numel(),
-                    ncclFloat, ncclSum,
-                    reinterpret_cast<ncclComm_t>(ctx->dp_comm), stream);
+                    ncclFloat, ncclSum, communicator, stream);
                 TORCH_CHECK(error == ncclSuccess,
-                    "dynamic MTP token-count DP reduction failed: ",
+                    "dynamic MTP token-count ", axis, " reduction failed: ",
                     ncclGetErrorString(error));
                 packed_counts = reduced_counts;
+            };
+            if (sharded_ep) {
+                sum_counts(
+                    reinterpret_cast<ncclComm_t>(ctx->nccl_comm),
+                    "sharded EP");
+            }
+            if (ctx->data_parallel && ctx->dp_comm &&
+                    ctx->dp_world_size > 1) {
+                sum_counts(
+                    reinterpret_cast<ncclComm_t>(ctx->dp_comm), "DP");
             }
             auto global_main_counts = packed_counts.narrow(
                 0, 0, total_adapters);

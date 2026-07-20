@@ -55,8 +55,17 @@ static constexpr int64_t kHeads = 4;
 static constexpr int64_t kKvHeads = 2;
 static constexpr int64_t kHeadDim = 2;
 static constexpr int64_t kIntermediate = 12;
+static constexpr int64_t kExperts = 4;
+static constexpr int64_t kTopK = 2;
+static constexpr int64_t kMoeIntermediate = 16;
+static constexpr int64_t kSharedIntermediate = 8;
 static constexpr int64_t kVocab = 16;
 static constexpr int64_t kLoraRank = 2;
+
+static bool mtp_moe_enabled() {
+    const char* value = std::getenv("QWEN36_TEST_MTP_MOE");
+    return value && std::string(value) != "0";
+}
 
 static at::Tensor values(std::initializer_list<int64_t> shape, double scale,
                          int64_t offset = 0) {
@@ -79,7 +88,9 @@ static double max_diff(const at::Tensor& lhs, const at::Tensor& rhs) {
         .abs().max().item<double>();
 }
 
-static std::vector<at::Tensor> make_layer_weights(double scale, int64_t offset) {
+static std::vector<at::Tensor> make_layer_weights(
+    double scale, int64_t offset, bool moe
+) {
     auto options = at::TensorOptions().device(at::kCUDA).dtype(at::kBFloat16);
     std::vector<at::Tensor> result;
     result.push_back(at::ones({kHidden}, options));
@@ -90,20 +101,40 @@ static std::vector<at::Tensor> make_layer_weights(double scale, int64_t offset) 
     result.push_back(at::ones({kHeadDim}, options));
     result.push_back(values({kKvHeads * kHeadDim, kHidden}, scale * .8, offset + 5));
     result.push_back(values({kHidden, kHeads * kHeadDim}, scale * 1.1, offset + 7));
-    result.push_back(values({kIntermediate, kHidden}, scale * .9, offset + 11));
-    result.push_back(values({kIntermediate, kHidden}, scale * .7, offset + 13));
-    result.push_back(values({kHidden, kIntermediate}, scale, offset + 17));
+    if (moe) {
+        result.push_back(values({kExperts, kHidden}, scale * .9, offset + 11));
+        result.push_back(values({1, kHidden}, scale * .7, offset + 13));
+        result.push_back(values(
+            {kSharedIntermediate, kHidden}, scale * .8, offset + 17));
+        result.push_back(values(
+            {kSharedIntermediate, kHidden}, scale * .6, offset + 19));
+        result.push_back(values(
+            {kHidden, kSharedIntermediate}, scale * .9, offset + 23));
+        result.push_back(values(
+            {kExperts, 2 * kMoeIntermediate, kHidden},
+            scale * .7, offset + 29));
+        result.push_back(values(
+            {kExperts, kHidden, kMoeIntermediate},
+            scale * .8, offset + 31));
+    } else {
+        result.push_back(values(
+            {kIntermediate, kHidden}, scale * .9, offset + 11));
+        result.push_back(values(
+            {kIntermediate, kHidden}, scale * .7, offset + 13));
+        result.push_back(values(
+            {kHidden, kIntermediate}, scale, offset + 17));
+    }
     for (auto& tensor : result) tensor.set_requires_grad(false);
     return result;
 }
 
 static std::vector<at::Tensor> shard_layer_weights(
-    const std::vector<at::Tensor>& full, int rank
+    const std::vector<at::Tensor>& full, int rank, bool moe
 ) {
     const int64_t local_heads = kHeads / kTpSize;
     const int64_t local_kv_heads = kKvHeads / kTpSize;
     const int64_t local_intermediate = kIntermediate / kTpSize;
-    return {
+    std::vector<at::Tensor> local{
         full[0], full[1],
         full[2].narrow(0, rank * 2 * local_heads * kHeadDim,
             2 * local_heads * kHeadDim).contiguous(),
@@ -115,16 +146,38 @@ static std::vector<at::Tensor> shard_layer_weights(
             local_kv_heads * kHeadDim).contiguous(),
         full[7].narrow(1, rank * local_heads * kHeadDim,
             local_heads * kHeadDim).contiguous(),
-        full[8].narrow(0, rank * local_intermediate,
-            local_intermediate).contiguous(),
-        full[9].narrow(0, rank * local_intermediate,
-            local_intermediate).contiguous(),
-        full[10].narrow(1, rank * local_intermediate,
-            local_intermediate).contiguous(),
     };
+    if (moe) {
+        const int64_t local_moe = kMoeIntermediate / kTpSize;
+        const int64_t local_shared = kSharedIntermediate / kTpSize;
+        auto expert_gate = full[13].narrow(
+            1, rank * local_moe, local_moe);
+        auto expert_up = full[13].narrow(
+            1, kMoeIntermediate + rank * local_moe, local_moe);
+        local.push_back(full[8]);
+        local.push_back(full[9]);
+        local.push_back(full[10].narrow(
+            0, rank * local_shared, local_shared).contiguous());
+        local.push_back(full[11].narrow(
+            0, rank * local_shared, local_shared).contiguous());
+        local.push_back(full[12].narrow(
+            1, rank * local_shared, local_shared).contiguous());
+        local.push_back(at::cat({expert_gate, expert_up}, 1).contiguous());
+        local.push_back(full[14].narrow(
+            2, rank * local_moe, local_moe).contiguous());
+    } else {
+        local.push_back(full[8].narrow(
+            0, rank * local_intermediate, local_intermediate).contiguous());
+        local.push_back(full[9].narrow(
+            0, rank * local_intermediate, local_intermediate).contiguous());
+        local.push_back(full[10].narrow(
+            1, rank * local_intermediate, local_intermediate).contiguous());
+    }
+    return local;
 }
 
 struct ModelFixture {
+    bool moe;
     std::vector<at::Tensor> full_weights;
     std::vector<at::Tensor> full_mtp_weights;
     at::Tensor embed;
@@ -137,8 +190,9 @@ struct ModelFixture {
     LayerConfig config{};
 
     ModelFixture()
-        : full_weights(make_layer_weights(.010, 0)),
-          full_mtp_weights(make_layer_weights(.008, 41)),
+        : moe(mtp_moe_enabled()),
+          full_weights(make_layer_weights(.010, 0, moe)),
+          full_mtp_weights(make_layer_weights(.008, 41, moe)),
           embed(values({kVocab, kHidden}, .020, 19)),
           final_norm(at::ones({kHidden}, at::TensorOptions()
               .device(at::kCUDA).dtype(at::kBFloat16))),
@@ -160,7 +214,16 @@ struct ModelFixture {
         config.partial_rotary_factor = 1.0;
         config.rope_theta = 10000.0;
         config.rms_eps = 1e-5;
-        config.intermediate_size = kIntermediate;
+        if (moe) {
+            config.num_experts = kExperts;
+            config.top_k = kTopK;
+            config.moe_intermediate = kMoeIntermediate;
+            config.expert_start = 0;
+            config.expert_count = kExperts;
+            config.norm_topk_prob = 1;
+        } else {
+            config.intermediate_size = kIntermediate;
+        }
     }
 };
 
@@ -291,8 +354,10 @@ int main() {
     set_distributed_environment(rank, local_rank);
 
     ModelFixture model;
-    auto local_weights = shard_layer_weights(model.full_weights, rank);
-    auto local_mtp_weights = shard_layer_weights(model.full_mtp_weights, rank);
+    auto local_weights = shard_layer_weights(
+        model.full_weights, rank, model.moe);
+    auto local_mtp_weights = shard_layer_weights(
+        model.full_mtp_weights, rank, model.moe);
     auto local_weight_ptrs = pointers(local_weights);
     const int64_t target_layer = 0;
     void* distributed = qwen36_create_training_context_ex(
@@ -438,11 +503,12 @@ int main() {
             main_only_state.parameters[factor]));
     }
     std::printf(
-        "native_qwen36_mtp_tp rank=%d aggregate_diff=%0.8e "
+        "native_qwen36_mtp_tp mode=%s rank=%d aggregate_diff=%0.8e "
         "loss_diff=%0.8e parameter_diff=%0.8e m_diff=%0.8e "
         "v_diff=%0.8e unselected_diff=%0.8e mtp_loss_effect=%0.8e "
         "mtp_parameter_effect=%0.8e losses=%0.8g,%0.8g\n",
-        rank, aggregate_diff, loss_diff, parameter_diff, adam_m_diff,
+        model.moe ? "moe" : "dense", rank,
+        aggregate_diff, loss_diff, parameter_diff, adam_m_diff,
         adam_v_diff, unselected_diff, mtp_loss_effect,
         mtp_parameter_effect, losses[0], losses[1]);
     std::fflush(stdout);
