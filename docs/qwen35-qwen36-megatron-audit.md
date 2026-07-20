@@ -208,7 +208,7 @@ ABI15 的两层 GDN base-TP smoke 覆盖复合 QKV/conv head shard、Z/A/B/A_log
 
 本轮对 heterogeneous selected-v2 的 registry 管理做了小范围优化：恢复阶段按保存的 canonical index 原位放回 selected adapter，避免每次训练构造完整 merged registry 和对每个 selected adapter 做二次线性搜索；仅当 active set 足够大时建立 ID hash index，稀疏选择保留线性路径以避免每步构造大表。H20 TP2 x EP2、`B=8,S=128,H=1024,I=2048`、q_proj-only、8 active tenants 的 30-step p50/p95 为 `10.574/11.411 ms`；注册 1024 tenants 但仍 active 8 时为 `10.773/11.150 ms`，相对既有 `10.946 ms` p50 基线约下降 `1.6%`。local smoke、padded TP2xEP2、显式 grouped fallback 和 uneven-MTP 均通过；该结果只证明当前 synthetic registry overhead 的改善，不等于完整模型端到端收益。
 
-这里“尚未完成 CP model execution”指任意五维组合、ring attention 和长序列 CP；本轮 CP2 结果是严格受限的 dense GDN 单轴切片，不应外推为完整 Megatron CP。
+这里“尚未完成 CP model execution”指任意五维组合、ring attention 和长序列 CP；当前新增的 full-attention CP2 仅是 opt-in KV all-gather correctness bridge，和 GDN CP2 一样不应外推为完整 Megatron CP。
 
 ## 继续达到 Megatron 级别所需的最小工作包
 
