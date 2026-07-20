@@ -154,6 +154,17 @@ On the small TP2 x EP2 benchmark the compact path was not enabled by default;
 forced compact A/B was `22.707 ms` p50 versus `22.385 ms` legacy, so EP2/EP4
 keep the legacy path.
 
+The A2A dispatch now packs the int64 token and expert IDs into one two-column
+metadata message per peer, reducing the forward dispatch protocol from three
+NCCL messages (hidden/token/expert) to two (hidden/metadata). The runtime hash
+includes `QWEN36_EP_A2A_PACKED_METADATA`; setting it to `0` restores the split
+protocol. H20 local and TP2 x EP2 distributed smokes passed. On the same
+synthetic dynamic-MoE workload (`B=8,S=128,H=1024,I=2048`, 8 tenants, 50
+iterations), split/packed p50 was `14.155/14.051 ms` and p95 was
+`16.849/16.016 ms`. The roughly `0.7%` p50 change is small enough to treat as
+neutral rather than a stable throughput win. Count planning still crosses the
+host boundary, so this remains materially below DeepEP's GPU-only dispatcher.
+
 GDN fused backward 现在可通过
 `QWEN36_GDN_STATE_CHECKPOINT_STRIDE` 保存固定 token 边界的 FP32 recurrent
 state，并在每个 reverse chunk 开始时从精确 chunk-end state 重启。默认值

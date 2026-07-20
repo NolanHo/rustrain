@@ -1675,9 +1675,30 @@ struct Qwen36A2ADispatchFunction : public torch::autograd::Function<Qwen36A2ADis
         auto send_token = token_indices.index_select(0, send_index).contiguous();
         auto send_hidden = input.index_select(0, send_token).contiguous();
         auto send_expert = expert_indices.index_select(0, send_index).contiguous();
+        // Token and expert IDs always travel together and are both int64.
+        // Packing them removes one NCCL enqueue per peer without changing the
+        // variable-count protocol or the autograd payload. Keep the legacy
+        // split form as a runtime fallback for protocol A/B and rollback.
+        const bool packed_metadata = env_enabled(
+            "QWEN36_EP_A2A_PACKED_METADATA", true);
+        at::Tensor send_metadata;
+        if (packed_metadata) {
+            send_metadata = at::stack(
+                {send_token, send_expert}, 1).contiguous();
+        }
         auto recv_hidden = at::empty({recv_offsets.back(), hidden}, input.options());
-        auto recv_token = at::empty({recv_offsets.back()}, token_indices.options());
-        auto recv_expert = at::empty({recv_offsets.back()}, expert_indices.options());
+        at::Tensor recv_metadata;
+        at::Tensor recv_token;
+        at::Tensor recv_expert;
+        if (packed_metadata) {
+            recv_metadata = at::empty(
+                {recv_offsets.back(), 2}, token_indices.options());
+            recv_token = recv_metadata.select(1, 0);
+            recv_expert = recv_metadata.select(1, 1);
+        } else {
+            recv_token = at::empty({recv_offsets.back()}, token_indices.options());
+            recv_expert = at::empty({recv_offsets.back()}, expert_indices.options());
+        }
         auto send_ptr = [&](at::Tensor& t, int64_t row, int64_t width) -> const void* {
             return static_cast<const char*>(t.data_ptr()) +
                 row * width * t.element_size();
@@ -1696,12 +1717,26 @@ struct Qwen36A2ADispatchFunction : public torch::autograd::Function<Qwen36A2ADis
                 auto err = ncclSend(send_ptr(send_hidden, send_offsets[peer], hidden),
                     rows * hidden, qwen36_nccl_dtype(input.scalar_type()), peer, comm, operation_stream);
                 TORCH_CHECK(err == ncclSuccess, "A2A hidden send failed: ", ncclGetErrorString(err));
-                err = ncclSend(send_ptr(send_token, send_offsets[peer], 1), rows,
-                    ncclInt64, peer, comm, operation_stream);
-                TORCH_CHECK(err == ncclSuccess, "A2A token send failed: ", ncclGetErrorString(err));
-                err = ncclSend(send_ptr(send_expert, send_offsets[peer], 1), rows,
-                    ncclInt64, peer, comm, operation_stream);
-                TORCH_CHECK(err == ncclSuccess, "A2A expert send failed: ", ncclGetErrorString(err));
+                if (packed_metadata) {
+                    err = ncclSend(
+                        static_cast<const char*>(send_metadata.data_ptr()) +
+                            send_offsets[peer] * 2 * send_metadata.element_size(),
+                        rows * 2, ncclInt64, peer, comm, operation_stream);
+                    TORCH_CHECK(err == ncclSuccess,
+                        "A2A token/expert metadata send failed: ",
+                        ncclGetErrorString(err));
+                } else {
+                    err = ncclSend(
+                        send_ptr(send_token, send_offsets[peer], 1), rows,
+                        ncclInt64, peer, comm, operation_stream);
+                    TORCH_CHECK(err == ncclSuccess,
+                        "A2A token send failed: ", ncclGetErrorString(err));
+                    err = ncclSend(
+                        send_ptr(send_expert, send_offsets[peer], 1), rows,
+                        ncclInt64, peer, comm, operation_stream);
+                    TORCH_CHECK(err == ncclSuccess,
+                        "A2A expert send failed: ", ncclGetErrorString(err));
+                }
             }
         }
         for (int peer = 0; peer < world; ++peer) {
@@ -1710,12 +1745,26 @@ struct Qwen36A2ADispatchFunction : public torch::autograd::Function<Qwen36A2ADis
                 auto err = ncclRecv(recv_ptr(recv_hidden, recv_offsets[peer], hidden),
                     rows * hidden, qwen36_nccl_dtype(input.scalar_type()), peer, comm, operation_stream);
                 TORCH_CHECK(err == ncclSuccess, "A2A hidden recv failed: ", ncclGetErrorString(err));
-                err = ncclRecv(recv_ptr(recv_token, recv_offsets[peer], 1), rows,
-                    ncclInt64, peer, comm, operation_stream);
-                TORCH_CHECK(err == ncclSuccess, "A2A token recv failed: ", ncclGetErrorString(err));
-                err = ncclRecv(recv_ptr(recv_expert, recv_offsets[peer], 1), rows,
-                    ncclInt64, peer, comm, operation_stream);
-                TORCH_CHECK(err == ncclSuccess, "A2A expert recv failed: ", ncclGetErrorString(err));
+                if (packed_metadata) {
+                    err = ncclRecv(
+                        static_cast<char*>(recv_metadata.data_ptr()) +
+                            recv_offsets[peer] * 2 * recv_metadata.element_size(),
+                        rows * 2, ncclInt64, peer, comm, operation_stream);
+                    TORCH_CHECK(err == ncclSuccess,
+                        "A2A token/expert metadata recv failed: ",
+                        ncclGetErrorString(err));
+                } else {
+                    err = ncclRecv(
+                        recv_ptr(recv_token, recv_offsets[peer], 1), rows,
+                        ncclInt64, peer, comm, operation_stream);
+                    TORCH_CHECK(err == ncclSuccess,
+                        "A2A token recv failed: ", ncclGetErrorString(err));
+                    err = ncclRecv(
+                        recv_ptr(recv_expert, recv_offsets[peer], 1), rows,
+                        ncclInt64, peer, comm, operation_stream);
+                    TORCH_CHECK(err == ncclSuccess,
+                        "A2A expert recv failed: ", ncclGetErrorString(err));
+                }
             }
         }
         TORCH_CHECK(ncclGroupEnd() == ncclSuccess, "A2A dispatch group failed");
@@ -3608,6 +3657,7 @@ static void hash_collective_runtime_environment(AdapterRegistryHash& hash) {
     hash.add_u64(env_enabled("QWEN36_EP_A2A"));
     hash.add_u64(env_enabled("QWEN36_EP_A2A_SHARDED"));
     hash.add_u64(env_enabled("QWEN36_EP_A2A_PACKED", true));
+    hash.add_u64(env_enabled("QWEN36_EP_A2A_PACKED_METADATA", true));
     hash.add_u64(env_enabled("QWEN36_DISABLE_GROUPED_MM"));
     hash.add_u64(env_enabled("QWEN36_GROUPED_LORA_SYNC", true));
     hash.add_u64(env_enabled("QWEN36_PACKED_LORA_SYNC", true));
