@@ -12,6 +12,7 @@
 #define RUSTRAIN_HAS_ATEN_GROUPED_MM 0
 #endif
 #include <c10/cuda/CUDAStream.h>
+#include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDACachingAllocator.h>
 #include <cuda_runtime.h>
 #include <torch/csrc/autograd/grad_mode.h>
@@ -42,6 +43,7 @@
 #include <nccl.h>
 
 struct TrainingContext;  // forward declaration (defined below)
+static cudaStream_t context_moe_shared_stream(TrainingContext* ctx);
 
 static at::Tensor attach_router_aux_loss(
     TrainingContext* ctx,
@@ -387,6 +389,19 @@ struct Qwen36StreamFence {
     ~Qwen36StreamFence() {
         if (before) cudaEventDestroy(before);
         if (after) cudaEventDestroy(after);
+    }
+};
+
+// Lifetime guard for the optional MoE shared-expert overlap path. CUDA event
+// destruction is safe while work is pending; the explicit consumer wait is
+// still enqueued before the result is consumed on the compute stream.
+struct Qwen36EventPair {
+    cudaEvent_t ready = nullptr;
+    cudaEvent_t done = nullptr;
+
+    ~Qwen36EventPair() {
+        if (ready) cudaEventDestroy(ready);
+        if (done) cudaEventDestroy(done);
     }
 };
 
@@ -2311,6 +2326,43 @@ static at::Tensor moe_forward(
         return (shared_out * seg).to(compute_type);
     };
 
+    at::Tensor shared_out;
+    Qwen36EventPair shared_events;
+    bool shared_overlap_active = false;
+    if (env_enabled("QWEN36_MOE_SHARED_OVERLAP")) {
+        // The shared expert consumes only the replicated flattened input. Its
+        // dense GEMMs can therefore run while the current stream performs
+        // routed sorting/A2A and local expert grouped GEMMs. The event pair
+        // avoids a device-wide synchronize and is kept opt-in until each
+        // target topology has a matched latency result.
+        const auto current_stream =
+            c10::cuda::getCurrentCUDAStream(device.index()).stream();
+        const auto raw_shared_stream =
+            context_moe_shared_stream(training_ctx);
+        const auto shared_stream = c10::cuda::getStreamFromExternal(
+            raw_shared_stream, device.index());
+        TORCH_CHECK(cudaEventCreateWithFlags(
+                &shared_events.ready, cudaEventDisableTiming) == cudaSuccess,
+            "failed to create shared-expert producer event");
+        TORCH_CHECK(cudaEventCreateWithFlags(
+                &shared_events.done, cudaEventDisableTiming) == cudaSuccess,
+            "failed to create shared-expert completion event");
+        TORCH_CHECK(cudaEventRecord(shared_events.ready, current_stream) ==
+                cudaSuccess,
+            "failed to record shared-expert producer event");
+        TORCH_CHECK(cudaStreamWaitEvent(
+                shared_stream.stream(), shared_events.ready, 0) == cudaSuccess,
+            "failed to fence shared-expert stream");
+        {
+            c10::cuda::CUDAStreamGuard guard(shared_stream);
+            shared_out = compute_shared_expert();
+        }
+        TORCH_CHECK(cudaEventRecord(
+                shared_events.done, shared_stream.stream()) == cudaSuccess,
+            "failed to record shared-expert completion event");
+        shared_overlap_active = true;
+    }
+
     const bool sharded_a2a_mode =
         env_enabled("QWEN36_EP_A2A_SHARDED") &&
         expert_count < num_experts;
@@ -2612,7 +2664,15 @@ static at::Tensor moe_forward(
             (int64_t)reinterpret_cast<uintptr_t>(nccl_stream_v));
     }
 
-    auto shared_out = compute_shared_expert();
+    if (!shared_overlap_active) {
+        shared_out = compute_shared_expert();
+    } else {
+        const auto current_stream =
+            c10::cuda::getCurrentCUDAStream(device.index()).stream();
+        TORCH_CHECK(cudaStreamWaitEvent(
+                current_stream, shared_events.done, 0) == cudaSuccess,
+            "failed to fence compute stream before shared-expert combine");
+    }
 
     // Debug: dump routed_output AFTER loop
     if (getenv("QWEN36_DUMP_MOE")) {
@@ -3167,6 +3227,10 @@ struct TrainingContext {
     // may be on a different context. Using the same stream ensures same context.
     // We store nullptr for stream — moe_forward will use getCurrentCUDAStream(dev).
     cudaStream_t nccl_stream = nullptr;  // nullptr = use default stream
+    // Stable context-owned compute stream for optional routed/shared expert
+    // overlap. A stream-pool lookup per layer retains one allocator workspace
+    // per pooled stream, so the runtime creates exactly one stream lazily.
+    cudaStream_t moe_shared_stream = nullptr;
     int ep_world_size = 1;
     int ep_rank = 0;
     bool expert_parallel = false;
@@ -3227,6 +3291,24 @@ struct TrainingContext {
     int cuda_device = 0;
 // ──────────────────────────────────────────────────────────────────────
 };
+
+static cudaStream_t context_moe_shared_stream(TrainingContext* ctx) {
+    TORCH_CHECK(ctx, "shared-expert overlap requires a training context");
+    if (ctx->moe_shared_stream) return ctx->moe_shared_stream;
+    int previous_device = 0;
+    TORCH_CHECK(cudaGetDevice(&previous_device) == cudaSuccess,
+        "failed to query CUDA device for shared-expert stream");
+    if (previous_device != ctx->cuda_device) {
+        TORCH_CHECK(cudaSetDevice(ctx->cuda_device) == cudaSuccess,
+            "failed to select CUDA device for shared-expert stream");
+    }
+    const auto create_status = cudaStreamCreateWithFlags(
+        &ctx->moe_shared_stream, cudaStreamNonBlocking);
+    if (previous_device != ctx->cuda_device) cudaSetDevice(previous_device);
+    TORCH_CHECK(create_status == cudaSuccess,
+        "failed to create context-owned shared-expert stream");
+    return ctx->moe_shared_stream;
+}
 
 static at::Tensor derive_attention_mask(
     TrainingContext* ctx, const at::Tensor& input_ids
@@ -3515,6 +3597,7 @@ static void hash_collective_runtime_environment(AdapterRegistryHash& hash) {
     hash.add_u64(env_enabled("QWEN36_FUSED_QKV"));
     hash.add_u64(env_enabled("QWEN36_FUSED_LORA_QKV_A"));
     hash.add_u64(env_enabled("QWEN36_FUSED_MLP_FC1"));
+    hash.add_u64(env_enabled("QWEN36_MOE_SHARED_OVERLAP"));
     hash.add_u64(env_enabled("QWEN36_CP_FULL_ATTENTION_KV_GATHER"));
     hash.add_u64(env_enabled("QWEN36_DISABLE_MTP"));
     const char* checkpoint_stride =
@@ -12001,6 +12084,17 @@ __attribute__((visibility("default"))) void qwen36_free_training_context(void* c
         // session can reuse it. Destroying it would break NCCL for all
         // subsequent sessions in the same worker process.
         // ncclCommDestroy is called only on process exit (via atexit or Drop).
+        if (ctx->moe_shared_stream) {
+            int previous_device = 0;
+            if (cudaGetDevice(&previous_device) == cudaSuccess) {
+                if (previous_device != ctx->cuda_device)
+                    cudaSetDevice(ctx->cuda_device);
+                cudaStreamDestroy(ctx->moe_shared_stream);
+                if (previous_device != ctx->cuda_device)
+                    cudaSetDevice(previous_device);
+            }
+            ctx->moe_shared_stream = nullptr;
+        }
         delete ctx;
     }
 }
