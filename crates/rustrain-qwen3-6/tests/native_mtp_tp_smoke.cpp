@@ -37,6 +37,12 @@ extern "C" int64_t qwen36_add_lora(
     void*, int64_t, double, const int64_t*, int64_t, const char*);
 extern "C" int32_t qwen36_set_adapter_lora_tensor(
     void*, int64_t, int64_t, const char*, int32_t, void*);
+extern "C" int32_t qwen36_set_lora_tensor(
+    void*, int64_t, int32_t, void*);
+extern "C" void* qwen36_get_lora_a(void*, int64_t);
+extern "C" void* qwen36_get_lora_b(void*, int64_t);
+extern "C" int64_t qwen36_export_optimizer_state(
+    void*, void**, void**, int64_t);
 extern "C" void* qwen36_get_adapter_lora_tensor(
     void*, int64_t, int64_t, const char*, int32_t);
 extern "C" void* qwen36_get_adapter_optimizer_tensor(
@@ -45,9 +51,12 @@ extern "C" int64_t qwen36_get_adapter_step_count(void*, int64_t);
 extern "C" int32_t qwen36_train_multi_lora_selected_v3(
     void*, void*, void*, void*, const int64_t*, int32_t,
     double*, double*, int32_t);
+extern "C" double qwen36_train_step(void*, void*, void*, void*);
 extern "C" void qwen36_free_training_context(void*);
 
 static constexpr int32_t kBaseTpAttention = 1 << 0;
+static constexpr int32_t kVocabParallel = 1 << 2;
+static constexpr int32_t kExpertParallel = 1 << 3;
 static constexpr int32_t kBaseTpMlp = 1 << 4;
 static constexpr int64_t kTpSize = 2;
 static constexpr int64_t kHidden = 8;
@@ -64,6 +73,16 @@ static constexpr int64_t kLoraRank = 2;
 
 static bool mtp_moe_enabled() {
     const char* value = std::getenv("QWEN36_TEST_MTP_MOE");
+    return value && std::string(value) != "0";
+}
+
+static bool mtp_ep_enabled() {
+    const char* value = std::getenv("QWEN36_TEST_MTP_EP");
+    return value && std::string(value) != "0";
+}
+
+static bool mtp_vocab_enabled() {
+    const char* value = std::getenv("QWEN36_TEST_MTP_VOCAB");
     return value && std::string(value) != "0";
 }
 
@@ -129,49 +148,55 @@ static std::vector<at::Tensor> make_layer_weights(
 }
 
 static std::vector<at::Tensor> shard_layer_weights(
-    const std::vector<at::Tensor>& full, int rank, bool moe
+    const std::vector<at::Tensor>& full, int tp_rank, bool moe,
+    int ep_rank = 0, int ep_size = 1
 ) {
     const int64_t local_heads = kHeads / kTpSize;
     const int64_t local_kv_heads = kKvHeads / kTpSize;
     const int64_t local_intermediate = kIntermediate / kTpSize;
     std::vector<at::Tensor> local{
         full[0], full[1],
-        full[2].narrow(0, rank * 2 * local_heads * kHeadDim,
+        full[2].narrow(0, tp_rank * 2 * local_heads * kHeadDim,
             2 * local_heads * kHeadDim).contiguous(),
         full[3],
-        full[4].narrow(0, rank * local_kv_heads * kHeadDim,
+        full[4].narrow(0, tp_rank * local_kv_heads * kHeadDim,
             local_kv_heads * kHeadDim).contiguous(),
         full[5],
-        full[6].narrow(0, rank * local_kv_heads * kHeadDim,
+        full[6].narrow(0, tp_rank * local_kv_heads * kHeadDim,
             local_kv_heads * kHeadDim).contiguous(),
-        full[7].narrow(1, rank * local_heads * kHeadDim,
+        full[7].narrow(1, tp_rank * local_heads * kHeadDim,
             local_heads * kHeadDim).contiguous(),
     };
     if (moe) {
         const int64_t local_moe = kMoeIntermediate / kTpSize;
         const int64_t local_shared = kSharedIntermediate / kTpSize;
-        auto expert_gate = full[13].narrow(
-            1, rank * local_moe, local_moe);
-        auto expert_up = full[13].narrow(
-            1, kMoeIntermediate + rank * local_moe, local_moe);
+        assert(ep_size > 0 && kExperts % ep_size == 0);
+        const int64_t local_experts = kExperts / ep_size;
+        auto local_gate_up = full[13].narrow(
+            0, ep_rank * local_experts, local_experts);
+        auto expert_gate = local_gate_up.narrow(
+            1, tp_rank * local_moe, local_moe);
+        auto expert_up = local_gate_up.narrow(
+            1, kMoeIntermediate + tp_rank * local_moe, local_moe);
         local.push_back(full[8]);
         local.push_back(full[9]);
         local.push_back(full[10].narrow(
-            0, rank * local_shared, local_shared).contiguous());
+            0, tp_rank * local_shared, local_shared).contiguous());
         local.push_back(full[11].narrow(
-            0, rank * local_shared, local_shared).contiguous());
+            0, tp_rank * local_shared, local_shared).contiguous());
         local.push_back(full[12].narrow(
-            1, rank * local_shared, local_shared).contiguous());
+            1, tp_rank * local_shared, local_shared).contiguous());
         local.push_back(at::cat({expert_gate, expert_up}, 1).contiguous());
         local.push_back(full[14].narrow(
-            2, rank * local_moe, local_moe).contiguous());
+            0, ep_rank * local_experts, local_experts).narrow(
+            2, tp_rank * local_moe, local_moe).contiguous());
     } else {
         local.push_back(full[8].narrow(
-            0, rank * local_intermediate, local_intermediate).contiguous());
+            0, tp_rank * local_intermediate, local_intermediate).contiguous());
         local.push_back(full[9].narrow(
-            0, rank * local_intermediate, local_intermediate).contiguous());
+            0, tp_rank * local_intermediate, local_intermediate).contiguous());
         local.push_back(full[10].narrow(
-            1, rank * local_intermediate, local_intermediate).contiguous());
+            1, tp_rank * local_intermediate, local_intermediate).contiguous());
     }
     return local;
 }
@@ -271,7 +296,9 @@ static void set_distributed_environment(int rank, int local_rank) {
     setenv("RUSTRAIN_PP_RANK", "0", 1);
     unsetenv("RUSTRAIN_DATA_PARALLEL");
     unsetenv("QWEN36_SEQUENCE_PARALLEL");
-    unsetenv("QWEN36_DISABLE_MTP");
+    if (!std::getenv("QWEN36_DISABLE_MTP")) {
+        unsetenv("QWEN36_DISABLE_MTP");
+    }
     setenv("QWEN36_MTP_LOSS_SCALE", "0.4", 1);
 }
 
@@ -335,13 +362,236 @@ static double state_diff(const AdapterState& lhs, const AdapterState& rhs) {
 }
 
 static void install_mtp(
-    void* context, ModelFixture& model, std::vector<at::Tensor>& weights
+    void* context, ModelFixture& model, std::vector<at::Tensor>& weights,
+    LayerConfig& config
 ) {
     auto weight_ptrs = pointers(weights);
     assert(qwen36_set_mtp_weights(
         context, &model.mtp_fc, &model.mtp_pre_emb,
         &model.mtp_pre_hidden, &model.mtp_norm,
-        weight_ptrs.data(), weight_ptrs.size(), &model.config, 1) == 0);
+        weight_ptrs.data(), weight_ptrs.size(), &config, 1) == 0);
+}
+
+static void set_tp_ep_environment(
+    int rank, int local_rank, int tp_rank, int ep_rank
+) {
+    setenv("WORLD_SIZE", "4", 1);
+    setenv("RANK", std::to_string(rank).c_str(), 1);
+    setenv("LOCAL_RANK", std::to_string(local_rank).c_str(), 1);
+    setenv("TP_SIZE", "2", 1);
+    setenv("CP_SIZE", "1", 1);
+    setenv("EP_SIZE", "2", 1);
+    setenv("DP_SIZE", "1", 1);
+    setenv("PP_SIZE", "1", 1);
+    setenv("RUSTRAIN_TP_RANK", std::to_string(tp_rank).c_str(), 1);
+    setenv("RUSTRAIN_CP_RANK", "0", 1);
+    setenv("RUSTRAIN_EP_RANK", std::to_string(ep_rank).c_str(), 1);
+    setenv("RUSTRAIN_DP_RANK", "0", 1);
+    setenv("RUSTRAIN_PP_RANK", "0", 1);
+    unsetenv("RUSTRAIN_DATA_PARALLEL");
+    unsetenv("QWEN36_SEQUENCE_PARALLEL");
+    unsetenv("QWEN36_DISABLE_MTP");
+    setenv("QWEN36_MTP_LOSS_SCALE", "0.4", 1);
+    setenv("QWEN36_EP_A2A", "1", 1);
+    setenv("QWEN36_EP_A2A_SHARDED", "1", 1);
+    setenv("QWEN36_EP_A2A_PACKED", "1", 1);
+}
+
+struct Batch {
+    at::Tensor ids;
+    at::Tensor targets;
+    at::Tensor attention;
+};
+
+static Batch ep_source_batch(int ep_rank) {
+    auto long_options = at::TensorOptions().device(at::kCUDA).dtype(at::kLong);
+    auto float_options = at::TensorOptions().device(at::kCUDA).dtype(at::kFloat);
+    auto bool_options = at::TensorOptions().device(at::kCUDA).dtype(at::kBool);
+    if (ep_rank == 0) {
+        return {
+            at::tensor({1, 2, 3, 4, 5, 6}, long_options).reshape({1, 6}),
+            at::tensor({0., 1., 1., 1., 1., 1.}, float_options)
+                .reshape({1, 6}),
+            at::ones({1, 6}, bool_options),
+        };
+    }
+    assert(ep_rank == 1);
+    return {
+        at::tensor({7, 8, 9, 10, 11, 12}, long_options).reshape({1, 6}),
+        at::tensor({0., 1., 1., 0., 0., 0.}, float_options)
+            .reshape({1, 6}),
+        at::ones({1, 6}, bool_options),
+    };
+}
+
+static Batch full_ep_batch() {
+    auto first = ep_source_batch(0);
+    auto second = ep_source_batch(1);
+    return {
+        at::cat({first.ids, second.ids}, 0),
+        at::cat({first.targets, second.targets}, 0),
+        at::cat({first.attention, second.attention}, 0),
+    };
+}
+
+static int run_tp_ep(int rank, int world, int local_rank) {
+    assert(world == 4 && rank >= 0 && rank < world);
+    const int tp_rank = rank % 2;
+    const int ep_rank = rank / 2;
+    set_tp_ep_environment(rank, local_rank, tp_rank, ep_rank);
+
+    ModelFixture model;
+    assert(model.moe);
+    auto local_weights = shard_layer_weights(
+        model.full_weights, tp_rank, true, ep_rank, 2);
+    auto local_mtp_weights = shard_layer_weights(
+        model.full_mtp_weights, tp_rank, true, ep_rank, 2);
+    auto local_weight_ptrs = pointers(local_weights);
+    LayerConfig distributed_config = model.config;
+    distributed_config.expert_start = ep_rank * (kExperts / 2);
+    distributed_config.expert_count = kExperts / 2;
+    const int64_t target_layer = 0;
+    void* distributed = qwen36_create_training_context_ex(
+        local_weight_ptrs.data(), local_weight_ptrs.size(),
+        &model.embed, &model.final_norm, &model.lm_head,
+        &distributed_config, 1, static_cast<int32_t>(at::kBFloat16),
+        1.0, 1e-3, .9, .999, 1e-8, kVocab, 1e-5, kLoraRank,
+        &target_layer, 1, "q_proj",
+        kBaseTpAttention | kExpertParallel | kBaseTpMlp);
+    assert(distributed);
+    install_mtp(
+        distributed, model, local_mtp_weights, distributed_config);
+    assert(qwen36_init_nccl(distributed) == 0);
+
+    const auto selected_lora = make_lora(.0020, .0010, 0);
+    const auto isolated_lora = make_lora(.0008, .0016, 31);
+    const int64_t selected_adapter = qwen36_add_lora(
+        distributed, kLoraRank, 2.0, &target_layer, 1, "q_proj");
+    const int64_t isolated_adapter = qwen36_add_lora(
+        distributed, kLoraRank, 2.0, &target_layer, 1, "q_proj");
+    assert(selected_adapter > 0 && isolated_adapter > selected_adapter);
+    install_lora(
+        distributed, selected_adapter, selected_lora, tp_rank, true);
+    install_lora(
+        distributed, isolated_adapter, isolated_lora, tp_rank, true);
+    const auto isolated_before = adapter_state(distributed, isolated_adapter);
+
+    auto local_batch = ep_source_batch(ep_rank);
+    double distributed_aggregate = -1.0;
+    double distributed_loss = -1.0;
+    assert(qwen36_train_multi_lora_selected_v3(
+        distributed, &local_batch.ids, &local_batch.targets,
+        &local_batch.attention, &selected_adapter, 1,
+        &distributed_aggregate, &distributed_loss, 1) == 0);
+    assert(std::isfinite(distributed_loss) &&
+        std::abs(distributed_aggregate - distributed_loss) < 1e-12);
+
+    set_reference_environment(local_rank);
+    auto full_weight_ptrs = pointers(model.full_weights);
+    void* reference = qwen36_create_training_context(
+        full_weight_ptrs.data(), full_weight_ptrs.size(),
+        &model.embed, &model.final_norm, &model.lm_head,
+        &model.config, 1, static_cast<int32_t>(at::kBFloat16),
+        1.0, 1e-3, .9, .999, 1e-8, kVocab, 1e-5, kLoraRank,
+        &target_layer, 1, "q_proj");
+    assert(reference);
+    install_mtp(reference, model, model.full_mtp_weights, model.config);
+    auto reference_a_initial = selected_lora.a.clone();
+    auto reference_b_initial = selected_lora.b.clone();
+    assert(qwen36_set_lora_tensor(
+        reference, 0, 0, &reference_a_initial) == 0);
+    assert(qwen36_set_lora_tensor(
+        reference, 0, 1, &reference_b_initial) == 0);
+    auto global_batch = full_ep_batch();
+    const double reference_loss = qwen36_train_step(
+        reference, &global_batch.ids, &global_batch.targets,
+        &global_batch.attention);
+    assert(std::isfinite(reference_loss) && reference_loss > 0.0);
+
+    void* main_only = qwen36_create_training_context(
+        full_weight_ptrs.data(), full_weight_ptrs.size(),
+        &model.embed, &model.final_norm, &model.lm_head,
+        &model.config, 1, static_cast<int32_t>(at::kBFloat16),
+        1.0, 1e-3, .9, .999, 1e-8, kVocab, 1e-5, kLoraRank,
+        &target_layer, 1, "q_proj");
+    assert(main_only);
+    auto main_only_a_initial = selected_lora.a.clone();
+    auto main_only_b_initial = selected_lora.b.clone();
+    assert(qwen36_set_lora_tensor(
+        main_only, 0, 0, &main_only_a_initial) == 0);
+    assert(qwen36_set_lora_tensor(
+        main_only, 0, 1, &main_only_b_initial) == 0);
+    const double main_only_loss = qwen36_train_step(
+        main_only, &global_batch.ids, &global_batch.targets,
+        &global_batch.attention);
+    assert(std::isfinite(main_only_loss) && main_only_loss > 0.0);
+
+    const auto selected_state = adapter_state(distributed, selected_adapter);
+    const auto isolated_after = adapter_state(distributed, isolated_adapter);
+    auto* reference_a = reinterpret_cast<at::Tensor*>(
+        qwen36_get_lora_a(reference, 0));
+    auto* reference_b = reinterpret_cast<at::Tensor*>(
+        qwen36_get_lora_b(reference, 0));
+    auto* main_only_a = reinterpret_cast<at::Tensor*>(
+        qwen36_get_lora_a(main_only, 0));
+    auto* main_only_b = reinterpret_cast<at::Tensor*>(
+        qwen36_get_lora_b(main_only, 0));
+    assert(reference_a && reference_b && main_only_a && main_only_b);
+    std::array<void*, 2> reference_m{};
+    std::array<void*, 2> reference_v{};
+    assert(qwen36_export_optimizer_state(
+        reference, reference_m.data(), reference_v.data(), 2) == 2);
+
+    const int64_t local_q_rows = 2 * (kHeads / 2) * kHeadDim;
+    auto local_reference_b = reference_b->narrow(
+        0, tp_rank * local_q_rows, local_q_rows);
+    auto local_reference_m_b = reinterpret_cast<at::Tensor*>(
+        reference_m[1])->narrow(0, tp_rank * local_q_rows, local_q_rows);
+    auto local_reference_v_b = reinterpret_cast<at::Tensor*>(
+        reference_v[1])->narrow(0, tp_rank * local_q_rows, local_q_rows);
+    const double parameter_diff = std::max(
+        max_diff(selected_state.parameters[0], *reference_a),
+        max_diff(selected_state.parameters[1], local_reference_b));
+    const double adam_m_diff = std::max(
+        max_diff(selected_state.adam_m[0],
+            *reinterpret_cast<at::Tensor*>(reference_m[0])),
+        max_diff(selected_state.adam_m[1], local_reference_m_b));
+    const double adam_v_diff = std::max(
+        max_diff(selected_state.adam_v[0],
+            *reinterpret_cast<at::Tensor*>(reference_v[0])),
+        max_diff(selected_state.adam_v[1], local_reference_v_b));
+    const double isolated_diff = state_diff(isolated_before, isolated_after);
+    const double loss_diff = std::abs(distributed_loss - reference_loss);
+    const double mtp_loss_effect = std::abs(reference_loss - main_only_loss);
+    const double mtp_parameter_effect = std::max(
+        max_diff(*reference_a, *main_only_a),
+        max_diff(*reference_b, *main_only_b));
+
+    std::printf(
+        "native_qwen36_mtp_tp_ep rank=%d tp=%d ep=%d "
+        "main_tokens=7 mtp_tokens=5 loss_diff=%0.8e "
+        "parameter_diff=%0.8e m_diff=%0.8e v_diff=%0.8e "
+        "isolated_diff=%0.8e mtp_loss_effect=%0.8e "
+        "mtp_parameter_effect=%0.8e distributed=%0.8g reference=%0.8g main_only=%0.8g\n",
+        rank, tp_rank, ep_rank, loss_diff, parameter_diff,
+        adam_m_diff, adam_v_diff, isolated_diff, mtp_loss_effect,
+        mtp_parameter_effect, distributed_loss, reference_loss, main_only_loss);
+    std::fflush(stdout);
+
+    assert(loss_diff < 1e-2);
+    assert(parameter_diff <= 3e-3);
+    assert(adam_m_diff <= 7e-3 && adam_v_diff <= 2e-5);
+    assert(isolated_diff == 0.0);
+    assert(qwen36_get_adapter_step_count(
+        distributed, selected_adapter) == 1);
+    assert(qwen36_get_adapter_step_count(
+        distributed, isolated_adapter) == 0);
+    assert(mtp_loss_effect > 1e-6 || mtp_parameter_effect > 0.0);
+
+    qwen36_free_training_context(main_only);
+    qwen36_free_training_context(reference);
+    qwen36_free_training_context(distributed);
+    return 0;
 }
 
 int main() {
@@ -349,11 +599,21 @@ int main() {
     const int world = std::atoi(std::getenv("WORLD_SIZE"));
     const int local_rank = std::atoi(
         std::getenv("LOCAL_RANK") ? std::getenv("LOCAL_RANK") : "0");
-    assert(world == kTpSize && rank >= 0 && rank < world);
     qwen36_set_cuda_device(local_rank);
+    if (mtp_ep_enabled()) return run_tp_ep(rank, world, local_rank);
+    assert(world == kTpSize && rank >= 0 && rank < world);
     set_distributed_environment(rank, local_rank);
 
     ModelFixture model;
+    const bool vocab_parallel = mtp_vocab_enabled();
+    at::Tensor local_embed = vocab_parallel
+        ? model.embed.narrow(0, rank * (kVocab / kTpSize), kVocab / kTpSize)
+            .contiguous()
+        : model.embed;
+    at::Tensor local_lm_head = vocab_parallel
+        ? model.lm_head.narrow(0, rank * (kVocab / kTpSize), kVocab / kTpSize)
+            .contiguous()
+        : model.lm_head;
     auto local_weights = shard_layer_weights(
         model.full_weights, rank, model.moe);
     auto local_mtp_weights = shard_layer_weights(
@@ -362,12 +622,14 @@ int main() {
     const int64_t target_layer = 0;
     void* distributed = qwen36_create_training_context_ex(
         local_weight_ptrs.data(), local_weight_ptrs.size(),
-        &model.embed, &model.final_norm, &model.lm_head,
+        &local_embed, &model.final_norm, &local_lm_head,
         &model.config, 1, static_cast<int32_t>(at::kBFloat16),
         1.0, 1e-3, .9, .999, 1e-8, kVocab, 1e-5, kLoraRank,
-        &target_layer, 1, "q_proj", kBaseTpAttention | kBaseTpMlp);
+        &target_layer, 1, "q_proj",
+        kBaseTpAttention | kBaseTpMlp |
+            (vocab_parallel ? kVocabParallel : 0));
     assert(distributed);
-    install_mtp(distributed, model, local_mtp_weights);
+    install_mtp(distributed, model, local_mtp_weights, model.config);
     assert(qwen36_init_nccl(distributed) == 0);
 
     const auto lora_one = make_lora(.0020, .0010, 0);
@@ -410,7 +672,7 @@ int main() {
         1.0, 1e-3, .9, .999, 1e-8, kVocab, 1e-5, kLoraRank,
         &target_layer, 1, "q_proj");
     assert(reference);
-    install_mtp(reference, model, model.full_mtp_weights);
+    install_mtp(reference, model, model.full_mtp_weights, model.config);
     const int64_t reference_one = qwen36_add_lora(
         reference, kLoraRank, 2.0, &target_layer, 1, "q_proj");
     const int64_t reference_two = qwen36_add_lora(
@@ -507,7 +769,7 @@ int main() {
         "loss_diff=%0.8e parameter_diff=%0.8e m_diff=%0.8e "
         "v_diff=%0.8e unselected_diff=%0.8e mtp_loss_effect=%0.8e "
         "mtp_parameter_effect=%0.8e losses=%0.8g,%0.8g\n",
-        model.moe ? "moe" : "dense", rank,
+        vocab_parallel ? "vocab" : (model.moe ? "moe" : "dense"), rank,
         aggregate_diff, loss_diff, parameter_diff, adam_m_diff,
         adam_v_diff, unselected_diff, mtp_loss_effect,
         mtp_parameter_effect, losses[0], losses[1]);
@@ -516,7 +778,7 @@ int main() {
     assert(std::isfinite(aggregate) && std::isfinite(losses[0]) &&
         std::isfinite(losses[1]));
     assert(aggregate_diff < 5e-3 && loss_diff < 5e-3);
-    assert(parameter_diff <= 2e-3);
+    assert(parameter_diff <= (vocab_parallel ? 2.1e-3 : 2e-3));
     assert(adam_m_diff < 5e-4 && adam_v_diff < 5e-7);
     assert(unselected_diff == 0.0);
     assert(qwen36_get_adapter_step_count(distributed, adapter_one) == 1);

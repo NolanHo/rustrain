@@ -12,6 +12,7 @@
 #define RUSTRAIN_HAS_ATEN_GROUPED_MM 0
 #endif
 #include <c10/cuda/CUDAStream.h>
+#include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDACachingAllocator.h>
 #include <cuda_runtime.h>
 #include <torch/csrc/autograd/grad_mode.h>
@@ -27,6 +28,7 @@
 #include <vector>
 #include <cstring>
 #include <memory>
+#include <optional>
 #include <unordered_map>
 #include <set>
 #include <array>
@@ -42,6 +44,41 @@
 #include <nccl.h>
 
 struct TrainingContext;  // forward declaration (defined below)
+
+static c10::cuda::CUDAStream begin_moe_shared_overlap(
+    TrainingContext* ctx, cudaStream_t current_stream);
+static void record_moe_shared_overlap_done(TrainingContext* ctx);
+static void join_moe_shared_overlap(
+    TrainingContext* ctx, cudaStream_t current_stream);
+static void abort_moe_shared_overlap(TrainingContext* ctx) noexcept;
+
+class ScopedMoeSharedOverlapJoin {
+public:
+    ScopedMoeSharedOverlapJoin(
+        TrainingContext* ctx, cudaStream_t current_stream)
+        : ctx_(ctx), current_stream_(current_stream) {}
+
+    void arm() { active_ = true; }
+
+    void join() {
+        if (!active_) return;
+        join_moe_shared_overlap(ctx_, current_stream_);
+        active_ = false;
+    }
+
+    ~ScopedMoeSharedOverlapJoin() {
+        if (active_) abort_moe_shared_overlap(ctx_);
+    }
+
+    ScopedMoeSharedOverlapJoin(const ScopedMoeSharedOverlapJoin&) = delete;
+    ScopedMoeSharedOverlapJoin& operator=(
+        const ScopedMoeSharedOverlapJoin&) = delete;
+
+private:
+    TrainingContext* ctx_;
+    cudaStream_t current_stream_;
+    bool active_ = false;
+};
 
 static at::Tensor attach_router_aux_loss(
     TrainingContext* ctx,
@@ -2232,6 +2269,92 @@ static at::Tensor moe_forward(
     }
     auto expert_flat = tp_copy_base_mlp_input(training_ctx, flat);
 
+    auto compute_shared_expert = [&]() {
+        auto shared_input = tp_copy_base_mlp_input(training_ctx, flat);
+        at::Tensor shared_gate;
+        at::Tensor shared_up;
+        const auto fused_shared_fc1 = use_batched
+            ? fused_mlp_fc1_weight(training_ctx, layer_idx)
+            : at::Tensor();
+        if (fused_shared_fc1.defined()) {
+            TORCH_CHECK(fused_shared_fc1.dim() == 2 &&
+                    fused_shared_fc1.size(0) ==
+                        shared_gate_proj.size(0) + shared_up_proj.size(0) &&
+                    fused_shared_fc1.size(1) == shared_input.size(1),
+                "fused shared-expert FC1 weight shape is incompatible with the "
+                "local MLP geometry");
+            auto shared_fc1 = at::matmul(
+                shared_input, fused_shared_fc1.t());
+            shared_gate = shared_fc1.narrow(
+                -1, 0, shared_gate_proj.size(0));
+            shared_up = shared_fc1.narrow(
+                -1, shared_gate_proj.size(0), shared_up_proj.size(0));
+        } else {
+            shared_gate = at::matmul(shared_input, shared_gate_proj.t());
+            shared_up = at::matmul(shared_input, shared_up_proj.t());
+        }
+        if (shared_gate_lora) {
+            shared_gate = add_batched_lora(
+                training_ctx, shared_gate.reshape({batch, seq, -1}),
+                shared_input.reshape({batch, seq, hidden_dim}),
+                shared_gate_lora)
+                .reshape({batch * seq, -1});
+        }
+        if (shared_up_lora) {
+            shared_up = add_batched_lora(
+                training_ctx, shared_up.reshape({batch, seq, -1}),
+                shared_input.reshape({batch, seq, hidden_dim}),
+                shared_up_lora)
+                .reshape({batch * seq, -1});
+        }
+        auto shared_hidden = fused_swiglu_op(
+            shared_gate.reshape({batch, seq, -1}),
+            shared_up.reshape({batch, seq, -1}), 0.0);
+        auto shared_out = at::matmul(
+            shared_hidden.reshape({batch * seq, -1}),
+            shared_down_proj.t());
+        if (shared_down_lora) {
+            shared_out = add_batched_lora(
+                training_ctx, shared_out.reshape({batch, seq, -1}),
+                shared_hidden, shared_down_lora)
+                .reshape({batch * seq, -1});
+        }
+        shared_out = tp_allreduce_base_mlp(training_ctx, shared_out);
+        auto seg = at::sigmoid(
+            at::matmul(flat, shared_expert_gate_w.t())).to(compute_type);
+        return (shared_out * seg).to(compute_type);
+    };
+
+    const bool sharded_a2a_mode =
+        env_enabled("QWEN36_EP_A2A_SHARDED") &&
+        expert_count < num_experts;
+    const bool shared_overlap_requested =
+        env_enabled("QWEN36_MOE_SHARED_EXPERT_OVERLAP");
+    const bool shared_overlap_supported = nccl_comm_v &&
+        env_enabled("QWEN36_EP_A2A") && sharded_a2a_mode &&
+        env_enabled("QWEN36_EP_A2A_PACKED", true);
+    TORCH_CHECK(!shared_overlap_requested ||
+            expert_count == num_experts || shared_overlap_supported,
+        "QWEN36_MOE_SHARED_EXPERT_OVERLAP=1 currently requires packed "
+        "sharded EP A2A");
+    const bool shared_overlap =
+        shared_overlap_requested && shared_overlap_supported;
+    const auto compute_stream = c10::cuda::getCurrentCUDAStream(
+        hidden.device().index()).stream();
+    at::Tensor shared_out;
+    ScopedMoeSharedOverlapJoin shared_overlap_join(
+        training_ctx, compute_stream);
+    if (shared_overlap) {
+        auto side_stream = begin_moe_shared_overlap(
+            training_ctx, compute_stream);
+        shared_overlap_join.arm();
+        {
+            c10::cuda::CUDAStreamGuard stream_guard(side_stream);
+            shared_out = compute_shared_expert();
+            record_moe_shared_overlap_done(training_ctx);
+        }
+    }
+
     auto router_logits = at::matmul(flat, gate_w.t());
     auto routing_weights = router_logits.softmax(-1, at::kFloat);
     auto [topk_weights, topk_indices] = routing_weights.topk(top_k, -1, true, true);
@@ -2252,8 +2375,6 @@ static at::Tensor moe_forward(
             "and QWEN36_EP_A2A=1");
     }
     bool use_a2a = false;
-    const bool sharded_a2a_mode = env_enabled("QWEN36_EP_A2A_SHARDED") &&
-        expert_count < num_experts;
     if (expert_tp && expert_count < num_experts) {
         TORCH_CHECK(sharded_a2a_mode && env_enabled("QWEN36_EP_A2A") &&
                 env_enabled("QWEN36_EP_A2A_PACKED", true),
@@ -2531,56 +2652,11 @@ static at::Tensor moe_forward(
             (int64_t)reinterpret_cast<uintptr_t>(nccl_stream_v));
     }
 
-    // Shared expert (same as before, with fused SwiGLU)
-    auto shared_input = tp_copy_base_mlp_input(training_ctx, flat);
-    at::Tensor shared_gate;
-    at::Tensor shared_up;
-    const auto fused_shared_fc1 = use_batched
-        ? fused_mlp_fc1_weight(training_ctx, layer_idx)
-        : at::Tensor();
-    if (fused_shared_fc1.defined()) {
-        TORCH_CHECK(fused_shared_fc1.dim() == 2 &&
-                fused_shared_fc1.size(0) ==
-                    shared_gate_proj.size(0) + shared_up_proj.size(0) &&
-                fused_shared_fc1.size(1) == shared_input.size(1),
-            "fused shared-expert FC1 weight shape is incompatible with the "
-            "local MLP geometry");
-        auto shared_fc1 = at::matmul(shared_input, fused_shared_fc1.t());
-        shared_gate = shared_fc1.narrow(
-            -1, 0, shared_gate_proj.size(0));
-        shared_up = shared_fc1.narrow(
-            -1, shared_gate_proj.size(0), shared_up_proj.size(0));
+    if (shared_overlap) {
+        shared_overlap_join.join();
     } else {
-        shared_gate = at::matmul(shared_input, shared_gate_proj.t());
-        shared_up = at::matmul(shared_input, shared_up_proj.t());
+        shared_out = compute_shared_expert();
     }
-    if (shared_gate_lora) {
-        shared_gate = add_batched_lora(
-            training_ctx, shared_gate.reshape({batch, seq, -1}),
-            shared_input.reshape({batch, seq, hidden_dim}),
-            shared_gate_lora)
-            .reshape({batch * seq, -1});
-    }
-    if (shared_up_lora) {
-        shared_up = add_batched_lora(
-            training_ctx, shared_up.reshape({batch, seq, -1}),
-            shared_input.reshape({batch, seq, hidden_dim}),
-            shared_up_lora)
-            .reshape({batch * seq, -1});
-    }
-    auto shared_hidden = fused_swiglu_op(
-        shared_gate.reshape({batch, seq, -1}),
-        shared_up.reshape({batch, seq, -1}), 0.0);
-    auto shared_out = at::matmul(shared_hidden.reshape({batch * seq, -1}), shared_down_proj.t());
-    if (shared_down_lora) {
-        shared_out = add_batched_lora(
-            training_ctx, shared_out.reshape({batch, seq, -1}), shared_hidden,
-            shared_down_lora)
-            .reshape({batch * seq, -1});
-    }
-    shared_out = tp_allreduce_base_mlp(training_ctx, shared_out);
-    auto seg = at::sigmoid(at::matmul(flat, shared_expert_gate_w.t())).to(compute_type);
-    shared_out = (shared_out * seg).to(compute_type);
 
     // Debug: dump routed_output AFTER loop
     if (getenv("QWEN36_DUMP_MOE")) {
@@ -3129,6 +3205,13 @@ struct TrainingContext {
     int ep_world_size = 1;
     int ep_rank = 0;
     bool expert_parallel = false;
+    // Optional shared-expert compute stream. The stream comes from PyTorch's
+    // per-device pool; events make the shared branch consume the current
+    // activation and publish its result before the residual add.
+    std::optional<c10::cuda::CUDAStream> moe_shared_stream;
+    cudaEvent_t moe_shared_ready_event = nullptr;
+    cudaEvent_t moe_shared_done_event = nullptr;
+    bool moe_shared_overlap_inflight = false;
     // Expert-data-parallel communicator. Routed experts are replicated only
     // across this axis, while dense parameters reduce across both EP and DP.
     ncclComm_t dp_comm = nullptr;
@@ -3186,6 +3269,80 @@ struct TrainingContext {
     int cuda_device = 0;
 // ──────────────────────────────────────────────────────────────────────
 };
+
+static void ensure_moe_shared_overlap_state(TrainingContext* ctx) {
+    TORCH_CHECK(ctx, "MoE shared-expert overlap requires a training context");
+    TORCH_CHECK(!ctx->moe_shared_overlap_inflight,
+        "MoE shared-expert overlap was re-entered before its previous join");
+    cudaSetDevice(ctx->cuda_device);
+    if (!ctx->moe_shared_stream.has_value()) {
+        ctx->moe_shared_stream.emplace(c10::cuda::getStreamFromPool(
+            /*isHighPriority=*/false, ctx->cuda_device));
+    }
+    if (!ctx->moe_shared_ready_event) {
+        TORCH_CHECK(cudaEventCreateWithFlags(
+                &ctx->moe_shared_ready_event, cudaEventDisableTiming) ==
+                cudaSuccess,
+            "failed to create MoE shared-expert producer event");
+    }
+    if (!ctx->moe_shared_done_event) {
+        TORCH_CHECK(cudaEventCreateWithFlags(
+                &ctx->moe_shared_done_event, cudaEventDisableTiming) ==
+                cudaSuccess,
+            "failed to create MoE shared-expert completion event");
+    }
+}
+
+static c10::cuda::CUDAStream begin_moe_shared_overlap(
+    TrainingContext* ctx, cudaStream_t current_stream
+) {
+    ensure_moe_shared_overlap_state(ctx);
+    auto side_stream = *ctx->moe_shared_stream;
+    TORCH_CHECK(cudaEventRecord(
+            ctx->moe_shared_ready_event, current_stream) == cudaSuccess,
+        "failed to record MoE shared-expert producer event");
+    TORCH_CHECK(cudaStreamWaitEvent(
+            side_stream.stream(), ctx->moe_shared_ready_event, 0) ==
+            cudaSuccess,
+        "failed to fence MoE shared-expert compute stream");
+    ctx->moe_shared_overlap_inflight = true;
+    return side_stream;
+}
+
+static void record_moe_shared_overlap_done(TrainingContext* ctx) {
+    TORCH_CHECK(ctx && ctx->moe_shared_overlap_inflight &&
+            ctx->moe_shared_stream.has_value(),
+        "MoE shared-expert completion has no active launch");
+    TORCH_CHECK(cudaEventRecord(
+            ctx->moe_shared_done_event,
+            ctx->moe_shared_stream->stream()) == cudaSuccess,
+        "failed to record MoE shared-expert completion event");
+}
+
+static void join_moe_shared_overlap(
+    TrainingContext* ctx, cudaStream_t current_stream
+) {
+    TORCH_CHECK(ctx && ctx->moe_shared_overlap_inflight,
+        "MoE shared-expert join has no active launch");
+    const auto error = cudaStreamWaitEvent(
+        current_stream, ctx->moe_shared_done_event, 0);
+    if (error == cudaSuccess) ctx->moe_shared_overlap_inflight = false;
+    TORCH_CHECK(error == cudaSuccess,
+        "failed to join MoE shared-expert compute stream");
+}
+
+static void abort_moe_shared_overlap(TrainingContext* ctx) noexcept {
+    if (!ctx || !ctx->moe_shared_overlap_inflight ||
+        !ctx->moe_shared_stream.has_value()) return;
+    cudaSetDevice(ctx->cuda_device);
+    const auto error = cudaStreamSynchronize(ctx->moe_shared_stream->stream());
+    if (error != cudaSuccess) {
+        std::fprintf(stderr,
+            "[q36_moe] shared-expert stream recovery failed: %s\n",
+            cudaGetErrorString(error));
+    }
+    ctx->moe_shared_overlap_inflight = false;
+}
 
 static at::Tensor derive_attention_mask(
     TrainingContext* ctx, const at::Tensor& input_ids
@@ -3457,6 +3614,7 @@ static void hash_collective_runtime_environment(AdapterRegistryHash& hash) {
     hash.add_u64(env_enabled("QWEN36_EP_A2A"));
     hash.add_u64(env_enabled("QWEN36_EP_A2A_SHARDED"));
     hash.add_u64(env_enabled("QWEN36_EP_A2A_PACKED", true));
+    hash.add_u64(env_enabled("QWEN36_MOE_SHARED_EXPERT_OVERLAP"));
     hash.add_u64(env_enabled("QWEN36_DISABLE_GROUPED_MM"));
     hash.add_u64(env_enabled("QWEN36_GROUPED_LORA_SYNC", true));
     hash.add_u64(env_enabled("QWEN36_PACKED_LORA_SYNC", true));
@@ -3635,10 +3793,10 @@ static void validate_native_execution_topology(
                 "MTP tensor parallelism currently requires initialized "
                 "TP_SIZE=2 with both base attention and MLP tensor parallelism");
         }
-        TORCH_CHECK(!ctx->sequence_parallel && !ctx->vocab_parallel &&
+        TORCH_CHECK(!ctx->sequence_parallel &&
                 ctx->cp_world_size == 1 && ctx->pp_world_size == 1,
             "MTP parallelism currently requires replicated sequence and "
-            "vocabulary state with CP=PP=1");
+            "vocabulary-compatible state with CP=PP=1");
         if (ctx->ep_world_size > 1) {
             TORCH_CHECK(ctx->expert_parallel && ctx->nccl_comm &&
                     env_enabled("QWEN36_EP_A2A") &&
@@ -10107,6 +10265,108 @@ struct MtpLossResult {
     at::Tensor sample_token_counts;
 };
 
+// Vocabulary-parallel MTP CE.  The online softmax statistics are computed
+// from detached local logits and reduced over TP; a zero-valued straight-
+// through surrogate supplies the exact local softmax gradient without asking
+// the generic NCCL helper to differentiate a collective it does not own.
+static MtpLossResult mtp_compute_vocab_parallel_loss(
+    TrainingContext* ctx,
+    const at::Tensor& mtp_hidden,
+    const at::Tensor& input_ids,
+    const at::Tensor& target_mask,
+    bool independent_samples,
+    bool collect_sample_losses
+) {
+    TORCH_CHECK(vocab_parallel_enabled(ctx) && ctx->tp_comm,
+        "vocabulary-parallel MTP requires an initialized TP communicator");
+    const int64_t seq_len = input_ids.size(1);
+    const int64_t n_tokens = seq_len - 2;
+    const int64_t batch_size = input_ids.size(0);
+    const int64_t hidden_dim = mtp_hidden.size(2);
+    auto hidden_flat = mtp_hidden.narrow(1, 0, n_tokens)
+        .reshape({-1, hidden_dim});
+    auto shifted_targets = input_ids.narrow(1, 2, n_tokens).reshape({-1});
+    auto shifted_mask = target_mask.narrow(1, 2, n_tokens)
+        .reshape({-1}).to(at::kFloat);
+    const int64_t total_tokens = shifted_targets.size(0);
+    const int64_t token_tile = 512;
+    const int64_t vocab_start = ctx->tp_rank * ctx->local_vocab_size;
+    const int64_t vocab_end = vocab_start + ctx->local_vocab_size;
+    auto lm_head = *ctx->lm_head_ptr[0];
+    auto total_count = shifted_mask.sum().clamp_min(1.0);
+    at::Tensor token_denominators;
+    at::Tensor sample_loss_numerators;
+    at::Tensor sample_token_counts;
+    if (independent_samples) {
+        auto per_sample_count = target_mask.narrow(1, 2, n_tokens)
+            .sum(1).to(at::kFloat);
+        token_denominators = per_sample_count.clamp_min(1.0)
+            .reshape({batch_size, 1}).expand({batch_size, n_tokens})
+            .reshape({-1});
+        if (collect_sample_losses) {
+            sample_token_counts = per_sample_count;
+            sample_loss_numerators = at::zeros({batch_size},
+                at::TensorOptions().dtype(at::kFloat)
+                    .device(mtp_hidden.device()));
+        }
+    }
+    auto total_loss = at::zeros({1},
+        at::TensorOptions().dtype(at::kFloat).device(mtp_hidden.device()));
+    for (int64_t start = 0; start < total_tokens; start += token_tile) {
+        const int64_t n = std::min(token_tile, total_tokens - start);
+        auto chunk_hidden = hidden_flat.narrow(0, start, n);
+        auto chunk_targets = shifted_targets.narrow(0, start, n);
+        auto chunk_mask = shifted_mask.narrow(0, start, n);
+        auto logits = at::matmul(chunk_hidden, lm_head.t()).to(at::kFloat);
+        auto logits_detached = logits.detach();
+        auto local_max = std::get<0>(at::max(logits_detached, 1, true));
+        auto global_max = tp_allreduce_value(ctx, local_max, ncclMax);
+        auto local_exp = at::exp(logits_detached - global_max);
+        auto global_sum = tp_allreduce_value(
+            ctx, local_exp.sum(1, true), ncclSum);
+        auto in_range = (chunk_targets >= vocab_start) &
+            (chunk_targets < vocab_end);
+        auto local_targets = (chunk_targets - vocab_start)
+            .clamp(0, ctx->local_vocab_size - 1).reshape({-1, 1});
+        auto local_target = at::gather(
+            logits_detached, 1, local_targets);
+        local_target = at::where(
+            in_range.reshape({-1, 1}), local_target,
+            at::zeros_like(local_target));
+        auto global_target = tp_allreduce_value(
+            ctx, local_target, ncclSum);
+        auto global_logsum = at::log(global_sum) + global_max;
+        auto global_per_loss = (global_logsum - global_target).squeeze(1);
+
+        auto local_probability = at::exp(
+            logits_detached - global_logsum);
+        auto local_one_hot = at::zeros_like(logits_detached);
+        local_one_hot.scatter_(1, local_targets,
+            in_range.reshape({-1, 1}).to(at::kFloat));
+        auto surrogate = (logits *
+            (local_probability - local_one_hot)).sum(1);
+        auto connected_loss = global_per_loss + surrogate - surrogate.detach();
+        auto masked_loss = connected_loss * chunk_mask;
+        if (sample_loss_numerators.defined()) {
+            auto token_indexes = at::arange(
+                start, start + n, shifted_targets.options());
+            auto sample_indexes = at::floor_divide(token_indexes, n_tokens);
+            sample_loss_numerators.index_add_(
+                0, sample_indexes, masked_loss.detach());
+        }
+        total_loss = total_loss + (independent_samples
+            ? (masked_loss / token_denominators.narrow(0, start, n)).sum()
+            : masked_loss.sum() / total_count);
+    }
+    return {
+        total_loss * ctx->mtp_loss_scale,
+        sample_loss_numerators.defined()
+            ? sample_loss_numerators * ctx->mtp_loss_scale
+            : at::Tensor(),
+        sample_token_counts,
+    };
+}
+
 // MTP loss: chunked matmul + cross-entropy.
 // mtp_hidden[t] (from hidden[t] + embed[t+1]) predicts token t+2 (Megatron convention)
 // No full logits tensor — chunked matmul + fused CE
@@ -10118,6 +10378,11 @@ static MtpLossResult mtp_compute_loss(
     bool independent_samples = false,
     bool collect_sample_losses = false
 ) {
+    if (vocab_parallel_enabled(ctx)) {
+        return mtp_compute_vocab_parallel_loss(
+            ctx, mtp_hidden, input_ids, target_mask,
+            independent_samples, collect_sample_losses);
+    }
     int64_t vocab_size = ctx->vocab_size;
     int64_t seq_len = input_ids.size(1);
     auto lm_head = *ctx->lm_head_ptr[0];
@@ -11171,8 +11436,8 @@ __attribute__((visibility("default"))) int32_t qwen36_set_mtp_weights(
         TORCH_CHECK(ctx, "null training context");
         TORCH_CHECK(ctx->router_aux_loss_coef == 0.0,
             "MTP cannot be enabled with router auxiliary loss");
-        TORCH_CHECK(!ctx->sequence_parallel && !ctx->vocab_parallel,
-            "MTP currently requires replicated sequence and vocabulary state");
+        TORCH_CHECK(!ctx->sequence_parallel,
+            "MTP currently requires replicated sequence state");
         TORCH_CHECK(ctx->tp_world_size == 1 ||
                 (ctx->tp_world_size == 2 &&
                     ctx->base_tp_attention && ctx->base_tp_mlp),
@@ -11200,12 +11465,14 @@ __attribute__((visibility("default"))) int32_t qwen36_set_mtp_weights(
                 !ctx->lm_head_ptr.empty() && ctx->lm_head_ptr[0] &&
                 ctx->embed_ptr[0]->dim() == 2 &&
                 ctx->lm_head_ptr[0]->dim() == 2,
-            "MTP requires valid replicated vocabulary embedding and LM-head matrices");
+            "MTP requires valid vocabulary embedding and LM-head matrices");
         const int64_t hidden_size = ctx->embed_ptr[0]->size(1);
-        TORCH_CHECK(ctx->embed_ptr[0]->size(0) == ctx->vocab_size &&
-                ctx->lm_head_ptr[0]->size(0) == ctx->vocab_size &&
+        const int64_t expected_vocab_rows = ctx->vocab_parallel
+            ? ctx->local_vocab_size : ctx->vocab_size;
+        TORCH_CHECK(ctx->embed_ptr[0]->size(0) == expected_vocab_rows &&
+                ctx->lm_head_ptr[0]->size(0) == expected_vocab_rows &&
                 ctx->lm_head_ptr[0]->size(1) == hidden_size,
-            "MTP requires replicated embedding and LM-head shapes [vocab, hidden]");
+            "MTP requires embedding and LM-head shapes [local_vocab, hidden]");
         const auto device = ctx->embed_ptr[0]->device();
         for (const auto* tensor : {
                 mtp_fc, pre_norm_emb, pre_norm_hidden, mtp_norm}) {
@@ -11628,6 +11895,18 @@ __attribute__((visibility("default"))) int32_t qwen36_set_lora_tensor(
 __attribute__((visibility("default"))) void qwen36_free_training_context(void* ctx_ptr) {
     if (ctx_ptr) {
         auto* ctx = reinterpret_cast<TrainingContext*>(ctx_ptr);
+        if (ctx->moe_shared_stream.has_value()) {
+            cudaSetDevice(ctx->cuda_device);
+            cudaStreamSynchronize(ctx->moe_shared_stream->stream());
+        }
+        if (ctx->moe_shared_ready_event) {
+            cudaEventDestroy(ctx->moe_shared_ready_event);
+            ctx->moe_shared_ready_event = nullptr;
+        }
+        if (ctx->moe_shared_done_event) {
+            cudaEventDestroy(ctx->moe_shared_done_event);
+            ctx->moe_shared_done_event = nullptr;
+        }
         // Don't destroy NCCL communicator — it's a process-level singleton
         // (g_nccl_comm). It must survive context destruction so the next
         // session can reuse it. Destroying it would break NCCL for all
@@ -11736,7 +12015,7 @@ double qwen36_train_multi_lora_impl(
             ctx->has_mtp && !env_enabled("QWEN36_DISABLE_MTP");
         const bool dynamic_mtp_tp_supported = ctx->tp_world_size == 1 ||
             (ctx->tp_world_size == 2 && ctx->tp_comm &&
-                !ctx->sequence_parallel && !ctx->vocab_parallel &&
+                !ctx->sequence_parallel &&
                 ctx->base_tp_attention && ctx->base_tp_mlp);
         const bool dynamic_mtp_ep_supported = ctx->ep_world_size == 1 ||
             (ctx->expert_parallel && ctx->nccl_comm &&
@@ -11783,8 +12062,8 @@ double qwen36_train_multi_lora_impl(
             "native Qwen multi-LoRA inputs must be CUDA tensors on the "
             "NCCL context device");
         TORCH_CHECK(dynamic_mtp_topology_supported,
-            "dynamic MTP currently requires CP=PP=1, DP>=1, replicated "
-            "vocabulary and sequence state, sharded prediction-layer weights "
+            "dynamic MTP currently requires CP=PP=1, DP>=1, compatible "
+            "vocabulary and replicated sequence state, sharded prediction-layer weights "
             "when TP>1, packed sharded A2A when EP>1, and router aux disabled");
         auto& input_ids = *input_ids_tensor;
         auto& target_mask = *target_mask_tensor;
@@ -11921,15 +12200,17 @@ double qwen36_train_multi_lora_impl(
                 0, 0, total_adapters);
             auto global_mtp_counts = packed_counts.narrow(
                 0, total_adapters, total_adapters);
-            mtp_report_scales = at::where(
-                global_mtp_counts > 0,
-                global_main_counts / global_mtp_counts.clamp_min(1.0),
-                at::zeros_like(global_main_counts));
+            // MTP sample numerators already carry the MTP loss coefficient
+            // and are token sums.  The report denominator is the main-loss
+            // token count, so no extra MTP/main ratio belongs here; dividing
+            // the sum by global_main_counts applies that ratio exactly once.
+            mtp_report_scales = at::ones_like(global_main_counts);
             mtp_gradient_scales = at::where(
                 at::logical_and(
                     adapter_token_counts > 0, global_mtp_counts > 0),
                 (mtp_adapter_token_counts /
-                    adapter_token_counts.clamp_min(1.0)) * mtp_report_scales,
+                    adapter_token_counts.clamp_min(1.0)) *
+                    (global_main_counts / global_mtp_counts.clamp_min(1.0)),
                 at::zeros_like(adapter_token_counts));
         }
         // Keep the caller's mask intact. Each chunk receives either the
