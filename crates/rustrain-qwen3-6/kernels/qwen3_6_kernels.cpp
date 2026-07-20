@@ -101,7 +101,7 @@ struct Qwen36PipelineResultV1 {
 enum class DynamicMultiLoraMode;
 extern "C" double qwen36_train_multi_lora_impl(
     void*, void*, void*, void*, int32_t, int32_t, DynamicMultiLoraMode,
-    int32_t*, at::Tensor*, at::Tensor*, bool, const at::Tensor*, bool);
+    int32_t*, at::Tensor*, at::Tensor*, bool, const at::Tensor*, bool, bool);
 
 // Forward declarations for functions defined after TrainingContext
 at::Tensor apply_multi_lora(TrainingContext* ctx, int64_t layer_idx, int64_t pair_idx, const at::Tensor& base_weight);
@@ -3289,6 +3289,10 @@ struct TrainingContext {
         // {param_a, m_a, v_a, param_b, m_b, v_b}; a successful transaction
         // swaps these handles with the live registry without allocating.
         std::map<int64_t, std::vector<std::array<at::Tensor, 6>>> adam_shadow;
+        // When pooled shadows are enabled, each active pair borrows one
+        // context-owned slot for the duration of a logical transaction.
+        // Inactive adapters retain only these small integer lease records.
+        std::map<int64_t, std::vector<int64_t>> adam_shadow_slots;
         // Gradients are harvested after each backward into FP32 tensors. The
         // accumulator tensors are intentionally shared by value when chunk
         // registry guards copy adapters, so their contents survive restore.
@@ -3297,6 +3301,13 @@ struct TrainingContext {
     };
 
     std::vector<LoRAAdapter> adapters;
+    struct DynamicAdamShadowPoolEntry {
+        std::array<at::Tensor, 6> tensors;
+        bool in_use = false;
+    };
+    // Transaction destinations scale with the maximum simultaneously active
+    // adapter layouts instead of every tenant that has ever trained.
+    std::vector<DynamicAdamShadowPoolEntry> dynamic_adam_shadow_pool;
     // Sorted external ID -> canonical registry slot. Temporary selected/chunk
     // registries explicitly invalidate this index; their adapter order is not
     // the canonical order represented here.
@@ -3306,6 +3317,7 @@ struct TrainingContext {
     int64_t multi_lora_invocation = 0;
     int64_t dynamic_finalizer_count = 0;
     int64_t dynamic_adam_launch_count = 0;
+    bool dynamic_adam_transaction_active = false;
     bool restore_without_parameter_sync = false;
     bool allow_heterogeneous_registration = false;
     bool pad_heterogeneous_lora_batch = false;
@@ -3792,6 +3804,8 @@ static void hash_collective_runtime_environment(AdapterRegistryHash& hash) {
     hash.add_u64(env_enabled("QWEN36_GRAD_SLAB", true));
     hash.add_u64(env_enabled(
         "QWEN36_LAZY_DYNAMIC_OPTIMIZER_STATE", true));
+    hash.add_u64(env_enabled(
+        "QWEN36_DYNAMIC_ADAM_SHADOW_POOL", true));
     hash.add_u64(env_enabled("QWEN36_HETERO_PADDED_BATCH", true));
     hash.add_u64(env_enabled("QWEN36_GDN_RECURRENT_FUSION", true));
     hash.add_u64(env_enabled("QWEN36_GDN_CHUNKWISE_BWD"));
@@ -5510,8 +5524,10 @@ static void materialize_dynamic_adam_state(
     for (auto& [layer_idx, pairs] : adapter.params) {
         auto& states = adapter.adam_state[layer_idx];
         auto& shadows = adapter.adam_shadow[layer_idx];
+        auto& shadow_slots = adapter.adam_shadow_slots[layer_idx];
         TORCH_CHECK(states.size() == pairs.size() &&
-                shadows.size() == pairs.size(),
+                shadows.size() == pairs.size() &&
+                shadow_slots.size() == pairs.size(),
             "dynamic optimizer lazy-state layout mismatch for adapter ",
             adapter.id, " layer ", layer_idx);
         for (size_t pair_idx = 0; pair_idx < pairs.size(); ++pair_idx) {
@@ -5528,15 +5544,92 @@ static void materialize_dynamic_adam_state(
     }
 }
 
+static bool dynamic_adam_shadow_layout_matches(
+    const std::array<at::Tensor, 6>& tensors,
+    const at::Tensor& a,
+    const at::Tensor& b
+) {
+    for (const auto& tensor : tensors) {
+        if (!tensor.defined() || !tensor.is_cuda() ||
+                !tensor.is_contiguous())
+            return false;
+    }
+    return tensors[0].sizes() == a.sizes() &&
+        tensors[0].device() == a.device() &&
+        tensors[0].scalar_type() == a.scalar_type() &&
+        tensors[0].requires_grad() == a.requires_grad() &&
+        tensors[1].sizes() == a.sizes() &&
+        tensors[1].device() == a.device() &&
+        tensors[1].scalar_type() == at::kFloat &&
+        tensors[2].sizes() == a.sizes() &&
+        tensors[2].device() == a.device() &&
+        tensors[2].scalar_type() == at::kFloat &&
+        tensors[3].sizes() == b.sizes() &&
+        tensors[3].device() == b.device() &&
+        tensors[3].scalar_type() == b.scalar_type() &&
+        tensors[3].requires_grad() == b.requires_grad() &&
+        tensors[4].sizes() == b.sizes() &&
+        tensors[4].device() == b.device() &&
+        tensors[4].scalar_type() == at::kFloat &&
+        tensors[5].sizes() == b.sizes() &&
+        tensors[5].device() == b.device() &&
+        tensors[5].scalar_type() == at::kFloat;
+}
+
+static int64_t acquire_dynamic_adam_shadow_slot(
+    TrainingContext* ctx,
+    const at::Tensor& a,
+    const at::Tensor& b
+) {
+    TORCH_CHECK(ctx, "dynamic Adam shadow pool requires a context");
+    size_t reusable_index = ctx->dynamic_adam_shadow_pool.size();
+    for (size_t index = 0;
+         index < ctx->dynamic_adam_shadow_pool.size(); ++index) {
+        auto& entry = ctx->dynamic_adam_shadow_pool[index];
+        if (entry.in_use) continue;
+        if (dynamic_adam_shadow_layout_matches(entry.tensors, a, b)) {
+            entry.in_use = true;
+            return static_cast<int64_t>(index);
+        }
+        if (reusable_index == ctx->dynamic_adam_shadow_pool.size())
+            reusable_index = index;
+    }
+    TORCH_CHECK(ctx->dynamic_adam_shadow_pool.size() <
+            static_cast<size_t>(std::numeric_limits<int64_t>::max()),
+        "dynamic Adam shadow pool exhausted its index range");
+    auto f32_options = at::TensorOptions().dtype(at::kFloat)
+        .device(a.device());
+    std::array<at::Tensor, 6> replacement{
+        at::empty_like(a).set_requires_grad(a.requires_grad()),
+        at::empty(a.sizes(), f32_options),
+        at::empty(a.sizes(), f32_options),
+        at::empty_like(b).set_requires_grad(b.requires_grad()),
+        at::empty(b.sizes(), f32_options),
+        at::empty(b.sizes(), f32_options)};
+    if (reusable_index == ctx->dynamic_adam_shadow_pool.size()) {
+        ctx->dynamic_adam_shadow_pool.emplace_back();
+        reusable_index = ctx->dynamic_adam_shadow_pool.size() - 1;
+    }
+    auto& entry = ctx->dynamic_adam_shadow_pool[reusable_index];
+    entry.tensors = std::move(replacement);
+    entry.in_use = true;
+    return static_cast<int64_t>(reusable_index);
+}
+
 static void materialize_dynamic_adam_shadow(
+    TrainingContext* ctx,
     TrainingContext::LoRAAdapter& adapter
 ) {
     at::NoGradGuard guard;
+    const bool use_pool = env_enabled(
+        "QWEN36_DYNAMIC_ADAM_SHADOW_POOL", true);
     for (auto& [layer_idx, pairs] : adapter.params) {
         auto& states = adapter.adam_state[layer_idx];
         auto& shadows = adapter.adam_shadow[layer_idx];
+        auto& shadow_slots = adapter.adam_shadow_slots[layer_idx];
         TORCH_CHECK(states.size() == pairs.size() &&
-                shadows.size() == pairs.size(),
+                shadows.size() == pairs.size() &&
+                shadow_slots.size() == pairs.size(),
             "dynamic optimizer lazy-state layout mismatch for adapter ",
             adapter.id, " layer ", layer_idx);
         for (size_t pair_idx = 0; pair_idx < pairs.size(); ++pair_idx) {
@@ -5544,6 +5637,23 @@ static void materialize_dynamic_adam_shadow(
             if (!a.requires_grad()) continue;
             auto& [next_a, next_m_a, next_v_a,
                    next_b, next_m_b, next_v_b] = shadows[pair_idx];
+            if (use_pool) {
+                auto& slot = shadow_slots[pair_idx];
+                if (slot < 0) {
+                    slot = acquire_dynamic_adam_shadow_slot(ctx, a, b);
+                    shadows[pair_idx] =
+                        ctx->dynamic_adam_shadow_pool[slot].tensors;
+                }
+                TORCH_CHECK(slot < static_cast<int64_t>(
+                                ctx->dynamic_adam_shadow_pool.size()) &&
+                        ctx->dynamic_adam_shadow_pool[slot].in_use &&
+                        dynamic_adam_shadow_layout_matches(
+                            shadows[pair_idx], a, b),
+                    "dynamic Adam shadow pool lease is invalid for adapter ",
+                    adapter.id, " layer ", layer_idx,
+                    " pair ", pair_idx);
+                continue;
+            }
             auto f32_options = at::TensorOptions().dtype(at::kFloat)
                 .device(a.device());
             if (!next_a.defined())
@@ -5562,11 +5672,63 @@ static void materialize_dynamic_adam_shadow(
     }
 }
 
+static void release_dynamic_adam_shadows(
+    TrainingContext* ctx,
+    TrainingContext::LoRAAdapter& adapter
+) noexcept {
+    if (!ctx) return;
+    for (auto& [layer_idx, shadows] : adapter.adam_shadow) {
+        auto slots_it = adapter.adam_shadow_slots.find(layer_idx);
+        if (slots_it == adapter.adam_shadow_slots.end()) continue;
+        auto& slots = slots_it->second;
+        const size_t count = std::min(shadows.size(), slots.size());
+        for (size_t pair_idx = 0; pair_idx < count; ++pair_idx) {
+            const int64_t slot = slots[pair_idx];
+            if (slot < 0 || slot >= static_cast<int64_t>(
+                    ctx->dynamic_adam_shadow_pool.size()))
+                continue;
+            auto& entry = ctx->dynamic_adam_shadow_pool[slot];
+            entry.tensors = std::move(shadows[pair_idx]);
+            shadows[pair_idx] = std::array<at::Tensor, 6>{};
+            entry.in_use = false;
+            slots[pair_idx] = -1;
+        }
+    }
+}
+
+static void release_dynamic_adam_shadows(
+    TrainingContext* ctx,
+    std::vector<TrainingContext::LoRAAdapter>& adapters
+) noexcept {
+    if (!ctx) return;
+    for (auto& adapter : adapters)
+        release_dynamic_adam_shadows(ctx, adapter);
+}
+
+static void release_dynamic_adam_shadows(TrainingContext* ctx) noexcept {
+    if (!ctx) return;
+    release_dynamic_adam_shadows(ctx, ctx->adapters);
+}
+
+struct DynamicAdamShadowLeaseScope {
+    TrainingContext* ctx = nullptr;
+    bool retain_for_outer_transaction = false;
+    bool active = false;
+
+    ~DynamicAdamShadowLeaseScope() {
+        if (active && !retain_for_outer_transaction) {
+            release_dynamic_adam_shadows(ctx);
+            if (ctx) ctx->dynamic_adam_transaction_active = false;
+        }
+    }
+};
+
 static void materialize_dynamic_optimizer_state(
+    TrainingContext* ctx,
     TrainingContext::LoRAAdapter& adapter
 ) {
     materialize_dynamic_adam_state(adapter);
-    materialize_dynamic_adam_shadow(adapter);
+    materialize_dynamic_adam_shadow(ctx, adapter);
 }
 
 static bool active_lora_targets_use_latent_rank_layout(
@@ -9731,7 +9893,8 @@ extern "C" __attribute__((visibility("default"))) int32_t qwen36_pipeline_finish
                 static_cast<int32_t>(ctx->adapters.size()),
                 static_cast<int32_t>(max_rank),
                 static_cast<DynamicMultiLoraMode>(2), &finalizer_phase,
-                nullptr, nullptr, true, &full_adapter_token_counts, true);
+                nullptr, nullptr, true, &full_adapter_token_counts, true,
+                false);
             TORCH_CHECK(finalizer_loss >= 0.0 && finalizer_phase >= 1,
                 "dynamic pipeline finalizer failed");
             const int64_t completed_microbatches = window.num_microbatches;
@@ -12456,10 +12619,13 @@ double qwen36_train_multi_lora_impl(
     at::Tensor* token_counts_out = nullptr,
     bool allow_pipeline = false,
     const at::Tensor* token_counts_override = nullptr,
-    bool accumulators_are_numerators = false
+    bool accumulators_are_numerators = false,
+    bool retain_adam_shadows = false
 ) {
     try {
         auto* ctx = reinterpret_cast<TrainingContext*>(ctx_ptr);
+        DynamicAdamShadowLeaseScope shadow_scope{
+            ctx, retain_adam_shadows, false};
         const bool train_only = mode == DynamicMultiLoraMode::TrainOnly;
         const bool finalize_only = mode == DynamicMultiLoraMode::FinalizeOnly;
         if (finalize_only && finalizer_phase) *finalizer_phase = 0;
@@ -13113,13 +13279,17 @@ double qwen36_train_multi_lora_impl(
                 }
                 bool local_optimizer_state_ready = true;
                 try {
+                    TORCH_CHECK(!ctx->dynamic_adam_transaction_active,
+                        "dynamic Adam transaction is already active");
+                    ctx->dynamic_adam_transaction_active = true;
+                    shadow_scope.active = true;
                     for (size_t adapter_index = 0;
                          adapter_index < ctx->adapters.size();
                          ++adapter_index) {
                         if (!adapter_has_global_tokens[adapter_index])
                             continue;
                         materialize_dynamic_optimizer_state(
-                            ctx->adapters[adapter_index]);
+                            ctx, ctx->adapters[adapter_index]);
                     }
                 } catch (...) {
                     local_optimizer_state_ready = false;
@@ -13870,6 +14040,8 @@ static double qwen36_train_multi_lora_selected_impl(
             recovery_failed = true;
             fprintf(stderr, "[train_multi_selected_v2] rollback FAILED\n");
         }
+        release_dynamic_adam_shadows(ctx, selected);
+        if (ctx) ctx->dynamic_adam_transaction_active = false;
         try {
             restore_registry();
         } catch (const std::exception& e) {
@@ -14160,7 +14332,7 @@ static double qwen36_train_multi_lora_selected_impl(
         const double finalizer_result = qwen36_train_multi_lora_impl(
             ctx, input_ids_ptr, target_mask_ptr, attention_mask_ptr,
             n_adapters, 0, DynamicMultiLoraMode::FinalizeOnly,
-            &finalizer_phase);
+            &finalizer_phase, nullptr, nullptr, false, nullptr, false, true);
         selected.swap(ctx->adapters);
         selected_registry_installed = false;
         if (finalizer_phase < 1) {
@@ -14175,6 +14347,8 @@ static double qwen36_train_multi_lora_selected_impl(
             "heterogeneous adapter finalizer failed on at least one "
             "distributed rank");
         restore_registry();
+        release_dynamic_adam_shadows(ctx);
+        if (ctx) ctx->dynamic_adam_transaction_active = false;
         return train_loss;
     } catch (const std::exception& e) {
         recover();
@@ -15172,9 +15346,12 @@ static int64_t qwen36_add_lora_impl(
                 std::vector<std::pair<at::Tensor, at::Tensor>> pairs;
                 std::vector<std::array<at::Tensor, 4>> adam_states;
                 std::vector<std::array<at::Tensor, 6>> adam_shadows;
+                std::vector<int64_t> adam_shadow_slots;
                 std::vector<std::array<at::Tensor, 2>> grad_accumulators;
                 const bool lazy_optimizer_state = env_enabled(
                     "QWEN36_LAZY_DYNAMIC_OPTIMIZER_STATE", true);
+                const bool pooled_optimizer_shadow = env_enabled(
+                    "QWEN36_DYNAMIC_ADAM_SHADOW_POOL", true);
                 for (int64_t k = 0; k < num_pairs; k++) {
                     const auto& projection = projection_table.entries[k];
                     auto* base =
@@ -15243,7 +15420,9 @@ static int64_t qwen36_add_lora_impl(
                             at::zeros(a.sizes(), opts_f32),
                             at::zeros(b.sizes(), opts_f32),
                             at::zeros(b.sizes(), opts_f32)});
-                    adam_shadows.push_back(active && !lazy_optimizer_state
+                    adam_shadows.push_back(
+                        active && !lazy_optimizer_state &&
+                                !pooled_optimizer_shadow
                         ? std::array<at::Tensor, 6>{
                             at::empty_like(a).set_requires_grad(true),
                             at::empty(a.sizes(), opts_f32),
@@ -15252,6 +15431,7 @@ static int64_t qwen36_add_lora_impl(
                             at::empty(b.sizes(), opts_f32),
                             at::empty(b.sizes(), opts_f32)}
                         : std::array<at::Tensor, 6>{});
+                    adam_shadow_slots.push_back(-1);
                     grad_accumulators.push_back(
                         std::array<at::Tensor, 2>{
                             at::Tensor(), at::Tensor()});
@@ -15260,6 +15440,8 @@ static int64_t qwen36_add_lora_impl(
                 adapter.params[i] = std::move(pairs);
                 adapter.adam_state[i] = std::move(adam_states);
                 adapter.adam_shadow[i] = std::move(adam_shadows);
+                adapter.adam_shadow_slots[i] =
+                    std::move(adam_shadow_slots);
                 adapter.grad_accum[i] = std::move(grad_accumulators);
             }
             bind_adapter_lora_gradient_slab(ctx, adapter);
