@@ -2396,19 +2396,21 @@ impl TrainingSession for Qwen36Session {
                     }
                 }
                 let adapter_id = dynamic.manifest.id;
+                let optimizer_step = i64::try_from(dynamic.manifest.optimizer_step)
+                    .context("dynamic adapter optimizer step exceeds native range")?;
                 let load_result = (|| -> Result<()> {
                     let global_slots =
                         rustrain_qwen3_6::lora::native_lora_slots(&runtime_config, &lora_config);
                     let slots = stage_lora_slots(&global_slots, &stage);
-                    let mut optimizer_index = 0usize;
+                    let active_slots = slots
+                        .iter()
+                        .filter(|slot| slot.active)
+                        .collect::<Vec<_>>();
                     let restore_optimizer = dynamic.manifest.optimizer_count != 0;
-                    for (slot_index, slot) in slots.iter().filter(|slot| slot.active).enumerate() {
+                    for (slot_index, slot) in active_slots.iter().enumerate() {
                         let module = slot.module.cpp_name();
                         if slot_index >= dynamic.lora_a.len()
                             || slot_index >= dynamic.lora_b.len()
-                            || (restore_optimizer
-                                && (optimizer_index + 1 >= dynamic.adam_m.len()
-                                    || optimizer_index + 1 >= dynamic.adam_v.len()))
                         {
                             bail!(
                                 "dynamic adapter {} tensor count mismatch",
@@ -2430,57 +2432,30 @@ impl TrainingSession for Qwen36Session {
                             true,
                             &dynamic.lora_b[slot_index],
                         )?;
-                        if restore_optimizer {
-                            ctx.set_adapter_optimizer_tensor(
-                                adapter_id,
-                                slot.layer as i64,
-                                module,
-                                false,
-                                false,
-                                &dynamic.adam_m[optimizer_index],
-                            )?;
-                            ctx.set_adapter_optimizer_tensor(
-                                adapter_id,
-                                slot.layer as i64,
-                                module,
-                                true,
-                                false,
-                                &dynamic.adam_m[optimizer_index + 1],
-                            )?;
-                            ctx.set_adapter_optimizer_tensor(
-                                adapter_id,
-                                slot.layer as i64,
-                                module,
-                                false,
-                                true,
-                                &dynamic.adam_v[optimizer_index],
-                            )?;
-                            ctx.set_adapter_optimizer_tensor(
-                                adapter_id,
-                                slot.layer as i64,
-                                module,
-                                true,
-                                true,
-                                &dynamic.adam_v[optimizer_index + 1],
-                            )?;
-                            optimizer_index += 2;
-                        }
                     }
-                    if optimizer_index != dynamic.manifest.optimizer_count {
-                        bail!(
-                            "dynamic adapter {} optimizer count mismatch",
-                            dynamic.manifest.id
-                        );
+                    if restore_optimizer || (active_slots.is_empty() && optimizer_step > 0) {
+                        let layers = active_slots
+                            .iter()
+                            .map(|slot| slot.layer as i64)
+                            .collect::<Vec<_>>();
+                        let modules = active_slots
+                            .iter()
+                            .map(|slot| slot.module.cpp_name())
+                            .collect::<Vec<_>>();
+                        ctx.import_adapter_optimizer_state_host(
+                            adapter_id,
+                            optimizer_step,
+                            &layers,
+                            &modules,
+                            &dynamic.adam_m,
+                            &dynamic.adam_v,
+                        )?;
+                    } else {
+                        ctx.set_adapter_step_count(adapter_id, optimizer_step)?;
                     }
                     Ok(())
                 })();
                 if let Err(error) = load_result {
-                    let _ = ctx.remove_lora(adapter_id);
-                    return Err(error);
-                }
-                let optimizer_step = i64::try_from(dynamic.manifest.optimizer_step)
-                    .context("dynamic adapter optimizer step exceeds native range")?;
-                if let Err(error) = ctx.set_adapter_step_count(adapter_id, optimizer_step) {
                     let _ = ctx.remove_lora(adapter_id);
                     return Err(error);
                 }

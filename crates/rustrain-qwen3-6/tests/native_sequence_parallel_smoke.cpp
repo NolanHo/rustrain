@@ -130,7 +130,7 @@ static void install_dynamic_fixture(
 }
 
 int main() {
-    assert(qwen36_kernel_abi_version() == 30);
+    assert(qwen36_kernel_abi_version() == 31);
     const int rank = std::atoi(std::getenv("RANK"));
     const int world = std::atoi(std::getenv("WORLD_SIZE"));
     const int local_rank = std::atoi(std::getenv("LOCAL_RANK"));

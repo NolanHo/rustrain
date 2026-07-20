@@ -293,6 +293,17 @@ type FnExportAdapterOptimizerTensorCpuV1 = unsafe extern "C" fn(
     i32,
     *mut *mut c_void,
 ) -> i32;
+type FnImportAdapterOptimizerStateHostV1 = unsafe extern "C" fn(
+    *mut c_void,
+    i64,
+    *const i64,
+    *const *const i8,
+    *const *mut c_void,
+    i64,
+    i64,
+) -> i32;
+type FnGetAdapterOptimizerResidentCountV1 =
+    unsafe extern "C" fn(*mut c_void, i64) -> i64;
 type FnSetAdapterOptimizerTensor =
     unsafe extern "C" fn(*mut c_void, i64, i64, *const i8, i32, i32, *mut c_void) -> i32;
 type FnGetAdapterStepCount = unsafe extern "C" fn(*mut c_void, i64) -> i64;
@@ -383,6 +394,8 @@ struct KernelHandles {
     set_adapter_id: FnSetAdapterId,
     get_adapter_optimizer_tensor: FnGetAdapterOptimizerTensor,
     export_adapter_optimizer_tensor_cpu: FnExportAdapterOptimizerTensorCpuV1,
+    import_adapter_optimizer_state_host: FnImportAdapterOptimizerStateHostV1,
+    get_adapter_optimizer_resident_count: FnGetAdapterOptimizerResidentCountV1,
     set_adapter_optimizer_tensor: FnSetAdapterOptimizerTensor,
     get_adapter_step_count: FnGetAdapterStepCount,
     set_adapter_step_count: FnSetAdapterStepCount,
@@ -428,7 +441,7 @@ unsafe fn load_kernels() -> Option<KernelHandles> {
         }};
     }
     let abi_version: FnKernelAbiVersion = sym!("qwen36_kernel_abi_version");
-    if abi_version() != 30 {
+    if abi_version() != 31 {
         return None;
     }
     let add_lora_with_optimizer = {
@@ -584,6 +597,12 @@ unsafe fn load_kernels() -> Option<KernelHandles> {
         get_adapter_optimizer_tensor: sym!("qwen36_get_adapter_optimizer_tensor"),
         export_adapter_optimizer_tensor_cpu: sym!(
             "qwen36_export_adapter_optimizer_tensor_cpu_v1"
+        ),
+        import_adapter_optimizer_state_host: sym!(
+            "qwen36_import_adapter_optimizer_state_host_v1"
+        ),
+        get_adapter_optimizer_resident_count: sym!(
+            "qwen36_get_adapter_optimizer_resident_count_v1"
         ),
         set_adapter_optimizer_tensor: sym!("qwen36_set_adapter_optimizer_tensor"),
         get_adapter_step_count: sym!("qwen36_get_adapter_step_count"),
@@ -2531,6 +2550,70 @@ impl CppTrainingContext {
                 );
             }
         }
+    }
+
+    /// Atomically install a complete stage-local Adam checkpoint on CPU.
+    pub fn import_adapter_optimizer_state_host(
+        &self,
+        adapter_id: i64,
+        optimizer_step: i64,
+        global_layers: &[i64],
+        modules: &[&str],
+        adam_m: &[Tensor],
+        adam_v: &[Tensor],
+    ) -> Result<()> {
+        if optimizer_step < 0 {
+            bail!("dynamic Adam host import step must be non-negative");
+        }
+        if global_layers.len() != modules.len() ||
+            adam_m.len() != global_layers.len().saturating_mul(2) ||
+            adam_v.len() != global_layers.len().saturating_mul(2)
+        {
+            bail!(
+                "dynamic Adam host import layout mismatch: layers={} modules={} m={} v={}",
+                global_layers.len(), modules.len(), adam_m.len(), adam_v.len()
+            );
+        }
+        let kh = get_kernels().ok_or_else(|| anyhow::anyhow!("kernels not loaded"))?;
+        let modules = modules
+            .iter()
+            .map(|module| std::ffi::CString::new(*module))
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let module_ptrs = modules
+            .iter()
+            .map(|module| module.as_ptr())
+            .collect::<Vec<_>>();
+        let mut state_ptrs = Vec::with_capacity(global_layers.len().saturating_mul(4));
+        for slot in 0..global_layers.len() {
+            state_ptrs.push(adam_m[slot * 2].as_ptr() as *mut c_void);
+            state_ptrs.push(adam_v[slot * 2].as_ptr() as *mut c_void);
+            state_ptrs.push(adam_m[slot * 2 + 1].as_ptr() as *mut c_void);
+            state_ptrs.push(adam_v[slot * 2 + 1].as_ptr() as *mut c_void);
+        }
+        let status = unsafe {
+            (kh.import_adapter_optimizer_state_host)(
+                self.ptr,
+                adapter_id,
+                global_layers.as_ptr(),
+                module_ptrs.as_ptr(),
+                state_ptrs.as_ptr(),
+                i64::try_from(global_layers.len()).context("optimizer slot count exceeds i64")?,
+                optimizer_step,
+            )
+        };
+        if status != 0 {
+            bail!("C++ dynamic Adam host import failed for adapter {adapter_id}");
+        }
+        Ok(())
+    }
+
+    pub fn get_adapter_optimizer_resident_count(&self, adapter_id: i64) -> Result<i64> {
+        let kh = get_kernels().ok_or_else(|| anyhow::anyhow!("kernels not loaded"))?;
+        let count = unsafe { (kh.get_adapter_optimizer_resident_count)(self.ptr, adapter_id) };
+        if count < 0 {
+            bail!("C++ dynamic Adam resident count failed for adapter {adapter_id}");
+        }
+        Ok(count)
     }
 
     pub fn set_adapter_optimizer_tensor(

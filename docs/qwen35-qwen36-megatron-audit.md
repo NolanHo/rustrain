@@ -254,12 +254,13 @@ Transformer Engine、DeepEP、FLA 或 standalone flash-attn 预编译包；PyTor
 自带 Flash-SDPA 在 H20 上可用。没有安装依赖、没有 JIT workaround，当前 native
 ATen/C++ kernel 路径因此仍是可复现基线。
 
-动态 Adam checkpoint 保存新增 host-authoritative CPU snapshot（ABI30）。
+动态 Adam checkpoint 保存新增 host-authoritative CPU snapshot（ABI31）。
 第一次导出按 tenant optimizer clock 将完整 FP32 m/v 从 GPU 拷到临时 host map，
 原子发布后四个 getter 复用该 snapshot；step 0 仍使用隐式零状态，restore 路径
-暂时保持旧的 GPU materialize 语义。H20 local 与 TP2xEP2 distributed smoke
-验证了 step-0/step-1、重复 snapshot、恢复 parity；这减少保存时的重复 GPU
-materialization，但还不是完整 CPU optimizer paging/offload。
+现在通过 bulk host import 保持 restore 后 GPU resident count 为 0，首次选中 tenant
+时才按 pair hydrate。H20 local 与 TP2xEP2 distributed smoke 验证了 step-0/step-1、
+重复 snapshot、partial-import 原子失败、恢复 parity 和 resident count；这减少保存
+与恢复时的 GPU materialization，但还不是完整 CPU optimizer paging/offload/LRU。
 
 ## 继续达到 Megatron 级别所需的最小工作包
 

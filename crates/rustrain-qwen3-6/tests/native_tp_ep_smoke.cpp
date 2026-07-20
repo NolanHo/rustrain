@@ -73,6 +73,11 @@ extern "C" void* qwen36_get_adapter_optimizer_tensor(
     void*, int64_t, int64_t, const char*, int32_t, int32_t);
 extern "C" int32_t qwen36_export_adapter_optimizer_tensor_cpu_v1(
     void*, int64_t, int64_t, const char*, int32_t, int32_t, void**);
+extern "C" int32_t qwen36_import_adapter_optimizer_state_host_v1(
+    void*, int64_t, const int64_t*, const char* const*, void* const*,
+    int64_t, int64_t);
+extern "C" int64_t qwen36_get_adapter_optimizer_resident_count_v1(
+    void*, int64_t);
 extern "C" int32_t qwen36_set_adapter_optimizer_tensor(
     void*, int64_t, int64_t, const char*, int32_t, int32_t, void*);
 extern "C" int64_t qwen36_get_adapter_step_count(void*, int64_t);
@@ -96,7 +101,7 @@ extern "C" void qwen36_free_tensor(void*);
 
 namespace {
 
-constexpr int64_t kAbiVersion = 30;
+constexpr int64_t kAbiVersion = 31;
 constexpr int32_t kBaseTpAttention = 1 << 0;
 constexpr int32_t kDataParallel = 1 << 1;
 constexpr int32_t kVocabParallel = 1 << 2;
@@ -1342,6 +1347,12 @@ int main() {
         resumed, kLoraRank, kLoraRank, dynamic_targets, 1, targets);
     assert(resumed_tenant_one == tenant_one);
     assert(resumed_tenant_two == tenant_two);
+    std::vector<int64_t> checkpoint_layers;
+    std::vector<const char*> checkpoint_modules;
+    std::vector<void*> checkpoint_state_ptrs;
+    checkpoint_layers.reserve(dynamic_one.size());
+    checkpoint_modules.reserve(dynamic_one.size());
+    checkpoint_state_ptrs.reserve(dynamic_one.size() * 4);
     for (size_t index = 0; index < dynamic_one.size(); ++index) {
         const char* module = dynamic_one[index].module;
         auto& state = dynamic_checkpoint[index];
@@ -1349,20 +1360,29 @@ int main() {
             resumed, resumed_tenant_one, 0, module, 0, &state[0]) == 0);
         assert(qwen36_set_adapter_lora_tensor(
             resumed, resumed_tenant_one, 0, module, 1, &state[1]) == 0);
-        assert(qwen36_set_adapter_optimizer_tensor(
-            resumed, resumed_tenant_one, 0, module, 0, 0, &state[2]) == 0);
-        assert(qwen36_set_adapter_optimizer_tensor(
-            resumed, resumed_tenant_one, 0, module, 0, 1, &state[3]) == 0);
-        assert(qwen36_set_adapter_optimizer_tensor(
-            resumed, resumed_tenant_one, 0, module, 1, 0, &state[4]) == 0);
-        assert(qwen36_set_adapter_optimizer_tensor(
-            resumed, resumed_tenant_one, 0, module, 1, 1, &state[5]) == 0);
+        checkpoint_layers.push_back(0);
+        checkpoint_modules.push_back(module);
+        checkpoint_state_ptrs.insert(checkpoint_state_ptrs.end(), {
+            &state[2], &state[3], &state[4], &state[5]});
     }
-    assert(qwen36_set_adapter_step_count(
+    // A partial descriptor set must fail before publishing a host snapshot or
+    // advancing the tenant clock.
+    assert(qwen36_import_adapter_optimizer_state_host_v1(
+        resumed, resumed_tenant_two, checkpoint_layers.data(),
+        checkpoint_modules.data(), checkpoint_state_ptrs.data(), 1, 1) < 0);
+    assert(qwen36_get_adapter_step_count(resumed, resumed_tenant_two) == 0);
+    assert(qwen36_get_adapter_optimizer_resident_count_v1(
+        resumed, resumed_tenant_two) == 0);
+
+    assert(qwen36_import_adapter_optimizer_state_host_v1(
         resumed, resumed_tenant_one,
+        checkpoint_layers.data(), checkpoint_modules.data(),
+        checkpoint_state_ptrs.data(), checkpoint_layers.size(),
         qwen36_get_adapter_step_count(distributed, tenant_one)) == 0);
     assert(qwen36_get_adapter_step_count(resumed, resumed_tenant_one) ==
         qwen36_get_adapter_step_count(distributed, tenant_one));
+    assert(qwen36_get_adapter_optimizer_resident_count_v1(
+        resumed, resumed_tenant_one) == 0);
     double restored_dynamic_diff = 0.0;
     for (const auto& fixture : dynamic_one) {
         for (int is_b = 0; is_b < 2; ++is_b) {
@@ -1370,15 +1390,18 @@ int main() {
                 *dynamic_tensor(distributed, tenant_one, fixture.module, is_b),
                 *dynamic_tensor(resumed, resumed_tenant_one, fixture.module, is_b)));
             for (int is_v = 0; is_v < 2; ++is_v) {
+                const auto restored_state = dynamic_state_cpu(
+                    resumed, resumed_tenant_one, fixture.module, is_b, is_v);
                 restored_dynamic_diff = std::max(restored_dynamic_diff, max_diff(
-                    *dynamic_state(
+                    dynamic_state_cpu(
                         distributed, tenant_one, fixture.module, is_b, is_v),
-                    *dynamic_state(
-                        resumed, resumed_tenant_one, fixture.module, is_b, is_v)));
+                    restored_state));
             }
         }
     }
     assert(restored_dynamic_diff == 0.0);
+    assert(qwen36_get_adapter_optimizer_resident_count_v1(
+        resumed, resumed_tenant_one) == 0);
     const int64_t fixed_step_before_resumed_dynamic =
         qwen36_get_step_count(distributed);
     const double continued_dynamic_loss = qwen36_train_multi_lora_selected(
@@ -1391,6 +1414,9 @@ int main() {
     assert(qwen36_get_adapter_step_count(distributed, tenant_one) == 2);
     assert(qwen36_get_adapter_step_count(resumed, resumed_tenant_one) == 2);
     assert(qwen36_get_adapter_step_count(resumed, resumed_tenant_two) == 0);
+    assert(qwen36_get_adapter_optimizer_resident_count_v1(
+        resumed, resumed_tenant_one) ==
+        static_cast<int64_t>(dynamic_one.size() * 4));
     assert(qwen36_get_step_count(distributed) == fixed_step_before_resumed_dynamic);
     assert(qwen36_get_step_count(resumed) == fixed_step_before_resumed_dynamic);
     double resumed_dynamic_diff = 0.0;

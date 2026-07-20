@@ -228,7 +228,7 @@ static StateDiff compare_fixed_state(
 }
 
 int main() {
-    assert(qwen36_kernel_abi_version() == 30);
+    assert(qwen36_kernel_abi_version() == 31);
     const int rank = std::atoi(std::getenv("RANK") ? std::getenv("RANK") : "0");
     const int local_rank = std::atoi(
         std::getenv("LOCAL_RANK") ? std::getenv("LOCAL_RANK") : "0");

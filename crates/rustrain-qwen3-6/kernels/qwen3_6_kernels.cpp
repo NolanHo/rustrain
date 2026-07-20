@@ -5935,6 +5935,8 @@ static void materialize_dynamic_adam_state(
     TrainingContext::LoRAAdapter& adapter
 ) {
     at::NoGradGuard guard;
+    const bool host_state_current =
+        adapter.adam_host_step == adapter.optimizer_step;
     for (auto& [layer_idx, pairs] : adapter.params) {
         auto& states = adapter.adam_state[layer_idx];
         auto& shadows = adapter.adam_shadow[layer_idx];
@@ -5950,10 +5952,68 @@ static void materialize_dynamic_adam_state(
             auto& [m_a, v_a, m_b, v_b] = states[pair_idx];
             auto f32_options = at::TensorOptions().dtype(at::kFloat)
                 .device(a.device());
-            if (!m_a.defined()) m_a = at::zeros(a.sizes(), f32_options);
-            if (!v_a.defined()) v_a = at::zeros(a.sizes(), f32_options);
-            if (!m_b.defined()) m_b = at::zeros(b.sizes(), f32_options);
-            if (!v_b.defined()) v_b = at::zeros(b.sizes(), f32_options);
+            const bool device_state_complete =
+                m_a.defined() && v_a.defined() &&
+                m_b.defined() && v_b.defined();
+            if (device_state_complete) continue;
+
+            const std::array<at::Tensor, 4>* host_state = nullptr;
+            if (host_state_current) {
+                auto host_it = adapter.adam_host_state.find(layer_idx);
+                TORCH_CHECK(host_it != adapter.adam_host_state.end() &&
+                        host_it->second.size() == pairs.size(),
+                    "dynamic Adam host-state layout mismatch for adapter ",
+                    adapter.id, " layer ", layer_idx);
+                host_state = &host_it->second[pair_idx];
+                for (const auto& tensor : *host_state) {
+                    TORCH_CHECK(tensor.defined() && tensor.device().is_cpu() &&
+                            tensor.is_contiguous() &&
+                            tensor.scalar_type() == at::kFloat,
+                        "dynamic Adam host state is incomplete for adapter ",
+                        adapter.id, " layer ", layer_idx,
+                        " pair ", pair_idx);
+                }
+                TORCH_CHECK((*host_state)[0].sizes() == a.sizes() &&
+                        (*host_state)[1].sizes() == a.sizes() &&
+                        (*host_state)[2].sizes() == b.sizes() &&
+                        (*host_state)[3].sizes() == b.sizes(),
+                    "dynamic Adam host-state shape mismatch for adapter ",
+                    adapter.id, " layer ", layer_idx,
+                    " pair ", pair_idx);
+            } else {
+                TORCH_CHECK(adapter.optimizer_step == 0,
+                    "trained dynamic adapter has neither device nor current "
+                    "host Adam state: adapter ", adapter.id,
+                    " step ", adapter.optimizer_step);
+            }
+            if (!m_a.defined()) m_a = host_state
+                ? (*host_state)[0].to(a.device())
+                : at::zeros(a.sizes(), f32_options);
+            if (!v_a.defined()) v_a = host_state
+                ? (*host_state)[1].to(a.device())
+                : at::zeros(a.sizes(), f32_options);
+            if (!m_b.defined()) m_b = host_state
+                ? (*host_state)[2].to(b.device())
+                : at::zeros(b.sizes(), f32_options);
+            if (!v_b.defined()) v_b = host_state
+                ? (*host_state)[3].to(b.device())
+                : at::zeros(b.sizes(), f32_options);
+            TORCH_CHECK(m_a.device() == a.device() &&
+                    v_a.device() == a.device() &&
+                    m_b.device() == b.device() &&
+                    v_b.device() == b.device() &&
+                    m_a.scalar_type() == at::kFloat &&
+                    v_a.scalar_type() == at::kFloat &&
+                    m_b.scalar_type() == at::kFloat &&
+                    v_b.scalar_type() == at::kFloat &&
+                    m_a.is_contiguous() && v_a.is_contiguous() &&
+                    m_b.is_contiguous() && v_b.is_contiguous() &&
+                    m_a.sizes() == a.sizes() &&
+                    v_a.sizes() == a.sizes() &&
+                    m_b.sizes() == b.sizes() &&
+                    v_b.sizes() == b.sizes(),
+                "dynamic Adam materialized-state mismatch for adapter ",
+                adapter.id, " layer ", layer_idx, " pair ", pair_idx);
         }
     }
 }
@@ -11578,7 +11638,7 @@ static MtpLossResult mtp_compute_loss(
 extern "C" {
 
 __attribute__((visibility("default"))) int64_t qwen36_kernel_abi_version() {
-    return 30;
+    return 31;
 }
 
 // Benchmark/metrics helper. Reducing over every orthogonal axis propagates the
@@ -16392,6 +16452,141 @@ int32_t qwen36_export_adapter_optimizer_tensor_cpu_v1(
             e.what());
         return -1;
     }
+}
+
+// Atomically restore one tenant's complete stage-local Adam state into host
+// memory. Each slot contributes [m_a, v_a, m_b, v_b]. Device state remains
+// undefined until that tenant is selected for training.
+__attribute__((visibility("default")))
+int32_t qwen36_import_adapter_optimizer_state_host_v1(
+    void* ctx_ptr, int64_t adapter_id,
+    const int64_t* global_layers, const char* const* module_names,
+    void* const* state_ptrs, int64_t slot_count, int64_t optimizer_step
+) {
+    try {
+        auto* ctx = reinterpret_cast<TrainingContext*>(ctx_ptr);
+        TORCH_CHECK(ctx && adapter_id > 0 && slot_count >= 0 &&
+                optimizer_step >= 0,
+            "invalid dynamic Adam host import arguments");
+        TORCH_CHECK(!ctx->dynamic_adam_transaction_active,
+            "cannot import dynamic Adam during an active transaction");
+        require_clear_accumulation_for_registry_mutation(ctx);
+        TORCH_CHECK(slot_count == 0 ||
+                (global_layers && module_names && state_ptrs),
+            "dynamic Adam host import is missing slot arrays");
+        size_t adapter_index = 0;
+        TORCH_CHECK(find_canonical_adapter_index(
+                ctx, adapter_id, adapter_index),
+            "dynamic Adam host import adapter not found: ", adapter_id);
+        auto& adapter = ctx->adapters[adapter_index];
+        TORCH_CHECK(adapter.optimizer_step == 0 &&
+                adapter.adam_host_step == -1,
+            "dynamic Adam host import requires a fresh restore adapter: ",
+            adapter_id);
+
+        int64_t expected_slots = 0;
+        std::map<int64_t, std::vector<std::array<at::Tensor, 4>>> snapshot;
+        std::map<int64_t, std::vector<std::array<at::Tensor, 4>>> empty_device;
+        for (const auto& [layer_idx, pairs] : adapter.params) {
+            snapshot.emplace(layer_idx,
+                std::vector<std::array<at::Tensor, 4>>(pairs.size()));
+            empty_device.emplace(layer_idx,
+                std::vector<std::array<at::Tensor, 4>>(pairs.size()));
+            for (const auto& [a, b] : pairs) {
+                TORCH_CHECK(a.requires_grad() == b.requires_grad(),
+                    "dynamic Adam parameter activity mismatch for adapter ",
+                    adapter_id, " layer ", layer_idx);
+                if (a.requires_grad()) ++expected_slots;
+            }
+        }
+        TORCH_CHECK(slot_count == expected_slots,
+            "dynamic Adam host import slot count mismatch for adapter ",
+            adapter_id, ": got ", slot_count,
+            " expected ", expected_slots);
+
+        std::set<std::pair<int64_t, int64_t>> seen;
+        at::NoGradGuard guard;
+        for (int64_t slot = 0; slot < slot_count; ++slot) {
+            TORCH_CHECK(module_names[slot] && module_names[slot][0] != '\0',
+                "dynamic Adam host import has an empty module at slot ", slot);
+            int64_t layer_idx = -1;
+            TORCH_CHECK(global_to_local_layer(
+                    ctx, global_layers[slot], layer_idx),
+                "dynamic Adam host import layer is not owned by this stage: ",
+                global_layers[slot]);
+            const int64_t pair_idx = lora_pair_index(
+                ctx->layer_configs[layer_idx], module_names[slot]);
+            auto params_it = adapter.params.find(layer_idx);
+            TORCH_CHECK(pair_idx >= 0 &&
+                    params_it != adapter.params.end() &&
+                    pair_idx < static_cast<int64_t>(params_it->second.size()),
+                "dynamic Adam host import slot is not in adapter layout: layer=",
+                global_layers[slot], " module=", module_names[slot]);
+            TORCH_CHECK(seen.emplace(layer_idx, pair_idx).second,
+                "duplicate dynamic Adam host import slot: layer=",
+                global_layers[slot], " module=", module_names[slot]);
+            const auto& [a, b] = params_it->second[pair_idx];
+            TORCH_CHECK(a.requires_grad() && b.requires_grad(),
+                "dynamic Adam host import slot is inactive: layer=",
+                global_layers[slot], " module=", module_names[slot]);
+            std::array<at::Tensor, 4> sources;
+            for (int state_index = 0; state_index < 4; ++state_index) {
+                auto* source = reinterpret_cast<at::Tensor*>(
+                    state_ptrs[slot * 4 + state_index]);
+                TORCH_CHECK(source && source->defined() &&
+                        source->device().is_cpu() && source->is_contiguous() &&
+                        source->scalar_type() == at::kFloat,
+                    "dynamic Adam host import requires contiguous CPU FP32 "
+                    "state at slot ", slot, " index ", state_index);
+                sources[state_index] = source->clone();
+            }
+            TORCH_CHECK(sources[0].sizes() == a.sizes() &&
+                    sources[1].sizes() == a.sizes() &&
+                    sources[2].sizes() == b.sizes() &&
+                    sources[3].sizes() == b.sizes(),
+                "dynamic Adam host import shape mismatch at slot ", slot,
+                " layer ", global_layers[slot],
+                " module ", module_names[slot]);
+            snapshot.at(layer_idx)[pair_idx] = std::move(sources);
+        }
+        TORCH_CHECK(static_cast<int64_t>(seen.size()) == expected_slots,
+            "dynamic Adam host import did not cover every active slot");
+        TORCH_CHECK(!ctx->dynamic_adam_transaction_active &&
+                adapter.optimizer_step == 0 &&
+                adapter.adam_host_step == -1,
+            "dynamic Adam changed while preparing host import");
+        adapter.adam_state.swap(empty_device);
+        adapter.adam_host_state.swap(snapshot);
+        adapter.adam_host_step = optimizer_step;
+        adapter.optimizer_step = optimizer_step;
+        return 0;
+    } catch (const std::exception& e) {
+        fprintf(stderr,
+            "[q36] import_adapter_optimizer_state_host FAILED: %s\n",
+            e.what());
+        return -1;
+    }
+}
+
+__attribute__((visibility("default")))
+int64_t qwen36_get_adapter_optimizer_resident_count_v1(
+    void* ctx_ptr, int64_t adapter_id
+) {
+    auto* ctx = reinterpret_cast<TrainingContext*>(ctx_ptr);
+    if (!ctx || adapter_id <= 0) return -1;
+    size_t adapter_index = 0;
+    if (!find_canonical_adapter_index(ctx, adapter_id, adapter_index))
+        return -1;
+    int64_t count = 0;
+    for (const auto& [layer_idx, states] :
+         ctx->adapters[adapter_index].adam_state) {
+        (void)layer_idx;
+        for (const auto& state : states) {
+            for (const auto& tensor : state)
+                if (tensor.defined()) ++count;
+        }
+    }
+    return count;
 }
 
 __attribute__((visibility("default")))
