@@ -4,7 +4,7 @@ use axum::{
     extract::DefaultBodyLimit,
     extract::Request,
     extract::{Path, State},
-    http::StatusCode,
+    http::{HeaderMap, HeaderValue, StatusCode},
     middleware::{self, Next},
     response::sse::{Event, KeepAlive, Sse},
     response::{IntoResponse, Response},
@@ -51,6 +51,13 @@ const DEFAULT_MULTI_LORA_BATCH_ADAPTERS: usize = 64;
 // AdapterLoss is JSON-encoded into a fixed 256 KiB IPC result slot. Keep a
 // conservative margin for worst-case i64/f64 strings and the result envelope.
 const HARD_MAX_MULTI_LORA_BATCH_ADAPTERS: usize = 2_048;
+const MULTI_LORA_CAPABILITY_HEADER: &str = "x-rustrain-multi-lora-capability";
+const MULTI_LORA_CAPABILITY_V1: &str = "v1";
+const MULTI_LORA_RESPONSE_CAPABILITIES: &[&str] = &[
+    "per_adapter_loss_v1",
+    "optimizer_steps_v1",
+    "coalesced_loss_scope_v1",
+];
 
 #[derive(Clone, Copy)]
 struct MultiLoraBatchConfig {
@@ -701,6 +708,8 @@ struct TrainStepResponse {
 
 #[derive(Serialize)]
 struct TrainMultiLoraResponse {
+    capability_version: u32,
+    capabilities: &'static [&'static str],
     loss: f64,
     step: u64,
     loss_scope: &'static str,
@@ -709,6 +718,18 @@ struct TrainMultiLoraResponse {
     adapter_losses: Vec<rustrain_ipc::command::AdapterLoss>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     adapter_steps: Vec<rustrain_ipc::command::AdapterStep>,
+}
+
+fn multi_lora_capability_v1(headers: &HeaderMap) -> bool {
+    headers
+        .get(MULTI_LORA_CAPABILITY_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| {
+            value
+                .split(',')
+                .map(str::trim)
+                .any(|token| token.eq_ignore_ascii_case(MULTI_LORA_CAPABILITY_V1))
+        })
 }
 
 /// Decode the little-endian wire representation without materializing host values.
@@ -1733,6 +1754,7 @@ async fn ep_eval_multi_lora(
 async fn ep_train_multi_lora(
     State(state): State<Arc<EpRouterState>>,
     Path(id): Path<String>,
+    headers: HeaderMap,
     Json(req): Json<TrainMultiLoraHttp>,
 ) -> Result<Json<TrainMultiLoraResponse>, (StatusCode, Json<ErrorResponse>)> {
     let (batch_size, seq_len) = validate_multi_lora_http_shapes(
@@ -1802,7 +1824,10 @@ async fn ep_train_multi_lora(
         expected_steps: req.expected_steps,
         source_count,
         normalized_payload_bytes,
-        allow_aggregate_loss: req.allow_aggregate_loss,
+        // Capability v1 means the client understands per-adapter losses,
+        // optimizer steps, and the explicit coalesced loss scope returned
+        // below. Keep the body flag as a backwards-compatible override.
+        allow_aggregate_loss: req.allow_aggregate_loss || multi_lora_capability_v1(&headers),
         response,
     };
     {
@@ -1825,6 +1850,8 @@ async fn ep_train_multi_lora(
             adapter_losses,
             adapter_steps,
         } => Ok(Json(TrainMultiLoraResponse {
+            capability_version: 1,
+            capabilities: MULTI_LORA_RESPONSE_CAPABILITIES,
             loss,
             step,
             loss_scope: if outcome.request_count > 1 {
@@ -1837,6 +1864,8 @@ async fn ep_train_multi_lora(
             adapter_steps,
         })),
         rustrain_ipc::EpResult::Train { loss, step } => Ok(Json(TrainMultiLoraResponse {
+            capability_version: 1,
+            capabilities: MULTI_LORA_RESPONSE_CAPABILITIES,
             loss,
             step,
             loss_scope: if outcome.request_count > 1 {
@@ -1932,11 +1961,11 @@ mod tensor_http_shape_tests {
 
     use super::{
         build_multi_lora_window_payload, decode_int64_bytes, ep_dispatch_schedule_error,
-        multi_lora_source_count, normalized_multi_lora_payload_bytes, pack_tensor_slab,
-        project_multi_lora_result, validate_multi_lora_http_shapes,
+        multi_lora_capability_v1, multi_lora_source_count, normalized_multi_lora_payload_bytes,
+        pack_tensor_slab, project_multi_lora_result, validate_multi_lora_http_shapes,
         validate_selected_eval_http_shapes, validate_train_http_shapes, EpDispatchScheduleError,
-        MultiLoraBatchConfig, MultiLoraBatcher, MultiLoraDispatchRequest, MultiLoraWindow,
-        StatusCode, TensorHttp,
+        HeaderMap, HeaderValue, MultiLoraBatchConfig, MultiLoraBatcher, MultiLoraDispatchRequest,
+        MultiLoraWindow, StatusCode, TensorHttp, MULTI_LORA_CAPABILITY_HEADER,
     };
 
     fn tensor(shape: &[i64]) -> TensorHttp {
@@ -2019,6 +2048,24 @@ mod tensor_http_shape_tests {
             validate_train_http_shapes(&input, &target, &attention).unwrap(),
             (8, 128)
         );
+    }
+
+    #[test]
+    fn multi_lora_capability_v1_accepts_versioned_header_tokens() {
+        let mut headers = HeaderMap::new();
+        assert!(!multi_lora_capability_v1(&headers));
+        headers.insert(MULTI_LORA_CAPABILITY_HEADER, HeaderValue::from_static("v1"));
+        assert!(multi_lora_capability_v1(&headers));
+        headers.insert(
+            MULTI_LORA_CAPABILITY_HEADER,
+            HeaderValue::from_static("v0, V1"),
+        );
+        assert!(multi_lora_capability_v1(&headers));
+        headers.insert(
+            MULTI_LORA_CAPABILITY_HEADER,
+            HeaderValue::from_static("v10"),
+        );
+        assert!(!multi_lora_capability_v1(&headers));
     }
 
     #[test]
