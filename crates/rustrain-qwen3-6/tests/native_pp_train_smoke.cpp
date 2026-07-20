@@ -419,6 +419,19 @@ int main() {
         window_context, &runtime_mismatch_window) != 0);
     unsetenv("QWEN36_EP_A2A_PACKED");
 
+    // The v1 implementation has one slot per microbatch and a canonical
+    // non-interleaved 1F1B schedule.  Reject unsupported scheduler/chunk
+    // encodings collectively instead of silently treating them as chunk 0.
+    Qwen36PipelineWindowV1 unsupported_schedule_window{
+        sizeof(Qwen36PipelineWindowV1), 1, 15, 1, 1, 1, 0};
+    assert(qwen36_pipeline_begin_v1(
+        window_context, &unsupported_schedule_window) != 0);
+    unsupported_schedule_window.window_id = 16;
+    unsupported_schedule_window.schedule = 0;
+    unsupported_schedule_window.num_chunks = 2;
+    assert(qwen36_pipeline_begin_v1(
+        window_context, &unsupported_schedule_window) != 0);
+
     setenv("QWEN36_GDN_STATE_CHECKPOINT_STRIDE", "invalid", 1);
     runtime_mismatch_window.window_id = 5;
     assert(qwen36_pipeline_begin_v1(
