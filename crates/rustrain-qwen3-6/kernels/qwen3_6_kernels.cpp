@@ -246,6 +246,17 @@ extern "C" {
         void** d_grad_ptrs, int* d_sizes, int* d_groups,
         int n_tensors, const float* d_norm_squares, float max_norm,
         void* stream);
+    void launch_fused_moe_weighted_unpermute_forward(
+        const void* returned, const void* assignment_weights,
+        const int64_t* send_index, int64_t* inverse_order, void* output,
+        int64_t assignments, int64_t tokens, int64_t hidden, int top_k,
+        int dtype, void* stream);
+    void launch_fused_moe_weighted_unpermute_backward(
+        const void* returned, const void* assignment_weights,
+        const int64_t* inverse_order, const void* grad_output,
+        void* grad_returned, void* grad_assignment_weights,
+        int64_t assignments, int64_t hidden, int top_k,
+        int dtype, void* stream);
 }
 
 /// Fused RMSNorm — single CUDA kernel (replaces 3 ATen ops)
@@ -1903,6 +1914,110 @@ struct Qwen36A2ACombineFunction : public torch::autograd::Function<Qwen36A2AComb
     }
 };
 
+struct Qwen36FusedWeightedUnpermuteFunction
+    : public torch::autograd::Function<Qwen36FusedWeightedUnpermuteFunction> {
+    static int dtype_code(at::ScalarType type) {
+        switch (type) {
+            case at::kBFloat16: return 0;
+            case at::kFloat: return 1;
+            case at::kHalf: return 2;
+            default:
+                TORCH_CHECK(false,
+                    "fused MoE weighted unpermute does not support dtype ",
+                    type);
+        }
+    }
+
+    static at::Tensor forward(torch::autograd::AutogradContext* ctx,
+        at::Tensor returned, at::Tensor assignment_weights,
+        at::Tensor send_index, int64_t top_k) {
+        TORCH_CHECK(returned.is_cuda() && assignment_weights.is_cuda() &&
+                send_index.is_cuda(),
+            "fused MoE weighted unpermute expects CUDA tensors");
+        TORCH_CHECK(returned.device() == assignment_weights.device() &&
+                returned.device() == send_index.device(),
+            "fused MoE weighted unpermute tensors must share one CUDA device");
+        TORCH_CHECK(returned.dim() == 2 && assignment_weights.dim() == 1 &&
+                send_index.dim() == 1,
+            "invalid fused MoE weighted unpermute tensor ranks");
+        TORCH_CHECK(returned.is_contiguous() &&
+                assignment_weights.is_contiguous() && send_index.is_contiguous(),
+            "fused MoE weighted unpermute expects contiguous tensors");
+        TORCH_CHECK(send_index.scalar_type() == at::kLong,
+            "fused MoE weighted unpermute expects int64 send_index");
+        TORCH_CHECK(returned.scalar_type() == assignment_weights.scalar_type(),
+            "fused MoE weighted unpermute requires matching activation and "
+            "routing-weight dtypes");
+        TORCH_CHECK(returned.size(0) == assignment_weights.numel() &&
+                send_index.numel() == assignment_weights.numel(),
+            "fused MoE weighted unpermute assignment count mismatch");
+        TORCH_CHECK(top_k > 0 && assignment_weights.numel() % top_k == 0,
+            "invalid fused MoE weighted unpermute top_k");
+        TORCH_CHECK(top_k <= std::numeric_limits<int>::max() &&
+                assignment_weights.numel() <=
+                    std::numeric_limits<int>::max(),
+            "fused MoE weighted unpermute assignment grid is too large");
+
+        const int dtype = dtype_code(returned.scalar_type());
+        const int64_t assignments = assignment_weights.numel();
+        const int64_t tokens = assignments / top_k;
+        auto inverse_order = at::empty_like(send_index);
+        auto output = at::empty(
+            {tokens, returned.size(1)}, returned.options());
+        auto stream = c10::cuda::getCurrentCUDAStream(
+            returned.device().index()).stream();
+        launch_fused_moe_weighted_unpermute_forward(
+            returned.data_ptr(), assignment_weights.data_ptr(),
+            send_index.data_ptr<int64_t>(), inverse_order.data_ptr<int64_t>(),
+            output.data_ptr(), assignments, tokens, returned.size(1),
+            static_cast<int>(top_k), dtype, stream);
+        const auto launch_error = cudaGetLastError();
+        TORCH_CHECK(launch_error == cudaSuccess,
+            "fused MoE weighted unpermute forward launch failed: ",
+            cudaGetErrorString(launch_error));
+
+        ctx->save_for_backward(
+            {returned, assignment_weights, inverse_order});
+        ctx->saved_data["top_k"] = top_k;
+        ctx->saved_data["dtype"] = dtype;
+        return output;
+    }
+
+    static std::vector<at::Tensor> backward(
+        torch::autograd::AutogradContext* ctx,
+        std::vector<at::Tensor> grad_output) {
+        auto saved = ctx->get_saved_variables();
+        auto returned = saved[0];
+        auto assignment_weights = saved[1];
+        auto inverse_order = saved[2];
+        const int64_t top_k = ctx->saved_data["top_k"].toInt();
+        auto grad = grad_output[0].contiguous();
+        TORCH_CHECK(grad.scalar_type() == returned.scalar_type() &&
+                grad.dim() == 2 &&
+                grad.size(0) == assignment_weights.numel() / top_k &&
+                grad.size(1) == returned.size(1),
+            "invalid fused MoE weighted unpermute output gradient");
+        auto grad_returned = at::empty_like(returned);
+        auto grad_assignment_weights = at::empty_like(assignment_weights);
+        const int dtype = static_cast<int>(
+            ctx->saved_data["dtype"].toInt());
+        auto stream = c10::cuda::getCurrentCUDAStream(
+            returned.device().index()).stream();
+        launch_fused_moe_weighted_unpermute_backward(
+            returned.data_ptr(), assignment_weights.data_ptr(),
+            inverse_order.data_ptr<int64_t>(), grad.data_ptr(),
+            grad_returned.data_ptr(), grad_assignment_weights.data_ptr(),
+            assignment_weights.numel(), returned.size(1),
+            static_cast<int>(top_k), dtype, stream);
+        const auto launch_error = cudaGetLastError();
+        TORCH_CHECK(launch_error == cudaSuccess,
+            "fused MoE weighted unpermute backward launch failed: ",
+            cudaGetErrorString(launch_error));
+        return {grad_returned, grad_assignment_weights, at::Tensor(),
+            at::Tensor()};
+    }
+};
+
 struct RoutedExpertLora {
     const at::Tensor* gate_up_a = nullptr;  // [local_experts, rank, hidden]
     const at::Tensor* gate_up_b = nullptr;  // [local_experts, 2*intermediate, rank]
@@ -2229,7 +2344,8 @@ static at::Tensor moe_routed_a2a(
     auto dispatch_and_combine = [&](const at::Tensor& assignment_input,
                                     const at::Tensor& assignment_experts,
                                     const at::Tensor& assignment_tokens,
-                                    const at::Tensor& assignment_weights) {
+                                    const at::Tensor& assignment_weights,
+                                    bool packed_assignments) {
         // `received_tokens` preserves the source flattened row index through
         // dispatch so dynamic multi-LoRA can recover the tenant/sample row.
         auto dispatched = Qwen36A2ADispatchFunction::apply(
@@ -2250,11 +2366,17 @@ static at::Tensor moe_routed_a2a(
             static_cast<int64_t>(reinterpret_cast<uintptr_t>(comm)),
             static_cast<int64_t>(reinterpret_cast<uintptr_t>(requested_stream)));
         returned = tp_allreduce_base_mlp(training_ctx, returned);
-        auto source_tokens = assignment_tokens.index_select(0, send_index);
-        auto source_weights = assignment_weights
-            .index_select(0, send_index).unsqueeze(-1);
-        routed_output = routed_output.index_add(
-            0, source_tokens, returned * source_weights);
+        if (packed_assignments &&
+            env_enabled("QWEN36_MOE_FUSED_UNPERMUTE")) {
+            routed_output = Qwen36FusedWeightedUnpermuteFunction::apply(
+                returned, assignment_weights, send_index, top_k);
+        } else {
+            auto source_tokens = assignment_tokens.index_select(0, send_index);
+            auto source_weights = assignment_weights
+                .index_select(0, send_index).unsqueeze(-1);
+            routed_output = routed_output.index_add(
+                0, source_tokens, returned * source_weights);
+        }
     };
 
     if (env_enabled("QWEN36_EP_A2A_PACKED", true)) {
@@ -2264,13 +2386,13 @@ static at::Tensor moe_routed_a2a(
         auto assignment_weights = topk_weights.reshape({-1}).contiguous();
         dispatch_and_combine(
             flat, assignment_experts, assignment_tokens,
-            assignment_weights);
+            assignment_weights, true);
     } else {
         for (int64_t kk = 0; kk < top_k; ++kk) {
             auto expert_indices = topk_indices.select(-1, kk).contiguous();
             auto expert_weights = topk_weights.select(-1, kk).contiguous();
             dispatch_and_combine(
-                flat, expert_indices, token_indices, expert_weights);
+                flat, expert_indices, token_indices, expert_weights, false);
         }
     }
     return routed_output;
@@ -3663,6 +3785,7 @@ static void hash_collective_runtime_environment(AdapterRegistryHash& hash) {
     hash.add_u64(env_enabled("QWEN36_EP_A2A_SHARDED"));
     hash.add_u64(env_enabled("QWEN36_EP_A2A_PACKED", true));
     hash.add_u64(env_enabled("QWEN36_EP_A2A_PACKED_METADATA", true));
+    hash.add_u64(env_enabled("QWEN36_MOE_FUSED_UNPERMUTE"));
     hash.add_u64(env_enabled("QWEN36_DISABLE_GROUPED_MM"));
     hash.add_u64(env_enabled("QWEN36_GROUPED_LORA_SYNC", true));
     hash.add_u64(env_enabled("QWEN36_PACKED_LORA_SYNC", true));

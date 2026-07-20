@@ -10,6 +10,8 @@
 
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
+#include <cuda_fp16.h>
+#include <cstdint>
 #include <cmath>
 
 // ──────────────────────────────────────────────────────────────────────
@@ -184,7 +186,133 @@ __global__ void fused_rmsnorm_matmul_kernel(
 }
 
 // ──────────────────────────────────────────────────────────────────────
-// 4. Multi-tensor Fused Adam
+// 4. Fused MoE weighted unpermute
+// ──────────────────────────────────────────────────────────────────────
+
+template <typename T>
+__device__ __forceinline__ float moe_to_float(T value);
+
+template <>
+__device__ __forceinline__ float moe_to_float<float>(float value) {
+    return value;
+}
+
+template <>
+__device__ __forceinline__ float moe_to_float<__nv_bfloat16>(
+    __nv_bfloat16 value
+) {
+    return __bfloat162float(value);
+}
+
+template <>
+__device__ __forceinline__ float moe_to_float<__half>(__half value) {
+    return __half2float(value);
+}
+
+template <typename T>
+__device__ __forceinline__ T moe_from_float(float value);
+
+template <>
+__device__ __forceinline__ float moe_from_float<float>(float value) {
+    return value;
+}
+
+template <>
+__device__ __forceinline__ __nv_bfloat16 moe_from_float<__nv_bfloat16>(
+    float value
+) {
+    return __float2bfloat16_rn(value);
+}
+
+template <>
+__device__ __forceinline__ __half moe_from_float<__half>(float value) {
+    return __float2half_rn(value);
+}
+
+__global__ void moe_inverse_order_kernel(
+    const int64_t* __restrict__ send_index,
+    int64_t* __restrict__ inverse_order,
+    int64_t assignments
+) {
+    const int64_t sorted =
+        static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (sorted >= assignments) return;
+    inverse_order[send_index[sorted]] = sorted;
+}
+
+template <typename T>
+__global__ void moe_weighted_unpermute_forward_kernel(
+    const T* __restrict__ returned,
+    const T* __restrict__ assignment_weights,
+    const int64_t* __restrict__ inverse_order,
+    T* __restrict__ output,
+    int64_t tokens,
+    int64_t hidden,
+    int top_k
+) {
+    const int64_t token = blockIdx.x;
+    if (token >= tokens) return;
+    for (int64_t column = threadIdx.x;
+         column < hidden; column += blockDim.x) {
+        float sum = 0.0f;
+        const int64_t first_assignment = token * top_k;
+        for (int route = 0; route < top_k; ++route) {
+            const int64_t original = first_assignment + route;
+            const int64_t sorted = inverse_order[original];
+            sum += moe_to_float(returned[sorted * hidden + column]) *
+                moe_to_float(assignment_weights[original]);
+        }
+        output[token * hidden + column] = moe_from_float<T>(sum);
+    }
+}
+
+template <typename T>
+__global__ void moe_weighted_unpermute_backward_kernel(
+    const T* __restrict__ returned,
+    const T* __restrict__ assignment_weights,
+    const int64_t* __restrict__ inverse_order,
+    const T* __restrict__ grad_output,
+    T* __restrict__ grad_returned,
+    T* __restrict__ grad_assignment_weights,
+    int64_t assignments,
+    int64_t hidden,
+    int top_k
+) {
+    const int64_t original = blockIdx.x;
+    if (original >= assignments) return;
+    const int64_t token = original / top_k;
+    const int64_t sorted = inverse_order[original];
+    const float weight = moe_to_float(assignment_weights[original]);
+    float weight_grad = 0.0f;
+    for (int64_t column = threadIdx.x;
+         column < hidden; column += blockDim.x) {
+        const float grad = moe_to_float(grad_output[token * hidden + column]);
+        weight_grad += grad * moe_to_float(returned[sorted * hidden + column]);
+        grad_returned[sorted * hidden + column] =
+            moe_from_float<T>(grad * weight);
+    }
+
+    for (int offset = 16; offset > 0; offset >>= 1)
+        weight_grad += __shfl_down_sync(0xffffffff, weight_grad, offset);
+    __shared__ float warp_sums[8];
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    if (lane == 0) warp_sums[warp] = weight_grad;
+    __syncthreads();
+    if (warp == 0) {
+        weight_grad = lane < (blockDim.x + 31) / 32
+            ? warp_sums[lane] : 0.0f;
+        for (int offset = 16; offset > 0; offset >>= 1)
+            weight_grad += __shfl_down_sync(
+                0xffffffff, weight_grad, offset);
+        if (lane == 0)
+            grad_assignment_weights[original] =
+                moe_from_float<T>(weight_grad);
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// 5. Multi-tensor Fused Adam
 // ──────────────────────────────────────────────────────────────────────
 // One block per param tensor. Each thread processes multiple elements.
 // Handles BF16 params with FP32 accumulated grads and FP32 m/v.
@@ -378,6 +506,87 @@ void launch_fused_rmsnorm_matmul(
         (const __nv_bfloat16*)matmul_w, (__nv_bfloat16*)output,
         M, N, K, eps, (float)scale_mode
     );
+}
+
+void launch_fused_moe_weighted_unpermute_forward(
+    const void* returned, const void* assignment_weights,
+    const int64_t* send_index, int64_t* inverse_order, void* output,
+    int64_t assignments, int64_t tokens, int64_t hidden, int top_k,
+    int dtype, cudaStream_t stream
+) {
+    if (assignments <= 0) return;
+    constexpr int threads = 256;
+    const int inverse_blocks = static_cast<int>(
+        (assignments + threads - 1) / threads);
+    moe_inverse_order_kernel<<<inverse_blocks, threads, 0, stream>>>(
+        send_index, inverse_order, assignments);
+    switch (dtype) {
+        case 0:
+            moe_weighted_unpermute_forward_kernel<<<
+                static_cast<unsigned int>(tokens), threads, 0, stream>>>(
+                static_cast<const __nv_bfloat16*>(returned),
+                static_cast<const __nv_bfloat16*>(assignment_weights),
+                inverse_order, static_cast<__nv_bfloat16*>(output),
+                tokens, hidden, top_k);
+            break;
+        case 1:
+            moe_weighted_unpermute_forward_kernel<<<
+                static_cast<unsigned int>(tokens), threads, 0, stream>>>(
+                static_cast<const float*>(returned),
+                static_cast<const float*>(assignment_weights),
+                inverse_order, static_cast<float*>(output),
+                tokens, hidden, top_k);
+            break;
+        case 2:
+            moe_weighted_unpermute_forward_kernel<<<
+                static_cast<unsigned int>(tokens), threads, 0, stream>>>(
+                static_cast<const __half*>(returned),
+                static_cast<const __half*>(assignment_weights),
+                inverse_order, static_cast<__half*>(output),
+                tokens, hidden, top_k);
+            break;
+    }
+}
+
+void launch_fused_moe_weighted_unpermute_backward(
+    const void* returned, const void* assignment_weights,
+    const int64_t* inverse_order, const void* grad_output,
+    void* grad_returned, void* grad_assignment_weights,
+    int64_t assignments, int64_t hidden, int top_k,
+    int dtype, cudaStream_t stream
+) {
+    if (assignments <= 0) return;
+    constexpr int threads = 256;
+    const auto blocks = static_cast<unsigned int>(assignments);
+    switch (dtype) {
+        case 0:
+            moe_weighted_unpermute_backward_kernel<<<blocks, threads, 0, stream>>>(
+                static_cast<const __nv_bfloat16*>(returned),
+                static_cast<const __nv_bfloat16*>(assignment_weights),
+                inverse_order, static_cast<const __nv_bfloat16*>(grad_output),
+                static_cast<__nv_bfloat16*>(grad_returned),
+                static_cast<__nv_bfloat16*>(grad_assignment_weights),
+                assignments, hidden, top_k);
+            break;
+        case 1:
+            moe_weighted_unpermute_backward_kernel<<<blocks, threads, 0, stream>>>(
+                static_cast<const float*>(returned),
+                static_cast<const float*>(assignment_weights),
+                inverse_order, static_cast<const float*>(grad_output),
+                static_cast<float*>(grad_returned),
+                static_cast<float*>(grad_assignment_weights),
+                assignments, hidden, top_k);
+            break;
+        case 2:
+            moe_weighted_unpermute_backward_kernel<<<blocks, threads, 0, stream>>>(
+                static_cast<const __half*>(returned),
+                static_cast<const __half*>(assignment_weights),
+                inverse_order, static_cast<const __half*>(grad_output),
+                static_cast<__half*>(grad_returned),
+                static_cast<__half*>(grad_assignment_weights),
+                assignments, hidden, top_k);
+            break;
+    }
 }
 
 void launch_fused_adam_multi(
