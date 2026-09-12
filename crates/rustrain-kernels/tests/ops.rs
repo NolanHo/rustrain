@@ -253,7 +253,7 @@ fn op(name: &str) -> &'static RsOpDesc {
 
 unsafe fn last_err(o: &'static RsOpDesc) -> String { unsafe {
     let f = o.last_error.unwrap();
-    let p = unsafe { f(ptr::null_mut()) };
+    let p = f(ptr::null_mut());
     if p.is_null() {
         "(no message)".to_string()
     } else {
