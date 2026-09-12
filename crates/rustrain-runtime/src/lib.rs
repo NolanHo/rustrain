@@ -23,7 +23,7 @@ use std::ffi::c_void;
 
 use rustrain_abi::ffi::{RsCollectiveKind, RsCtx, RsDeviceKind, RsDtype, RsServices, RsTensor};
 use rustrain_parallel::{GroupKind, ReduceOp};
-use rustrain_plan::{CompiledPlan, CompiledStep, Slot, SlotId, SlotKind};
+use rustrain_plan::{CompiledPlan, CompiledStep, SlotId, SlotKind};
 
 /// Anything that can go wrong while running a plan.
 #[derive(Debug, thiserror::Error)]
@@ -58,6 +58,19 @@ pub enum RuntimeError {
 
     #[error("unknown dtype `{dtype}`")]
     UnknownDtype { dtype: String },
+
+    #[error("slot {slot:?} ({name}) has no placement in the memory plan")]
+    UnplannedSlot { slot: SlotId, name: String },
+
+    #[error(
+        "node {node} ({op}) asks for memory policy `{policy}`, which this runtime cannot \
+         execute; a plan must not rely on a strategy that is not implemented"
+    )]
+    UnsupportedMemoryPolicy {
+        node: usize,
+        op: String,
+        policy: String,
+    },
 
     #[error("cannot allocate {bytes} bytes for slot {slot:?}: {reason}")]
     Alloc {
@@ -214,9 +227,7 @@ struct SlotBuffer {
     /// executor's own buffer — which is what the conformance gate caught the
     /// first time it ran.
     ptr: *mut c_void,
-    /// The allocation this executor owns and must free, if any. A view slot
-    /// adopts a pointer but still owns nothing.
-    owned: Option<(*mut c_void, u64)>,
+
     /// The slot's logical shape and strides, adopted from the descriptor the
     /// operator returned. A view can change both: `broadcast` gives size-1 dims
     /// stride 0, so the elements are *not* laid out contiguously and reading
@@ -228,9 +239,6 @@ struct SlotBuffer {
     rank: u32,
     elem_width: u32,
     bytes: u64,
-    /// Set when this slot shares another slot's storage — true for the output of
-    /// a spliced collective, which reduces in place.
-    alias_of: Option<SlotId>,
 }
 
 /// What a run did.
@@ -249,18 +257,37 @@ pub struct Executor {
     collectives: Box<dyn CollectiveBackend + Send>,
     buffers: Vec<Option<SlotBuffer>>,
     aliases: Vec<Option<SlotId>>,
+    /// The two allocations every slot lives inside. `persistent` holds weights,
+    /// gradients and optimizer state for the whole run; `pool` holds activations
+    /// whose offsets the planner already assigned so that non-overlapping
+    /// lifetimes share storage.
+    persistent_region: Option<(*mut c_void, u64)>,
+    pool_region: Option<(*mut c_void, u64)>,
     services: Box<RsServices>,
     stats: RunStats,
 }
 
 impl Executor {
-    /// Prepares storage for every slot the plan declares.
+    /// Prepares storage for every slot the plan declares, at the offsets the
+    /// memory planner assigned.
+    ///
+    /// Allocation is two regions rather than one per slot, which is what makes
+    /// the planner's reuse decisions real instead of advisory: two activations
+    /// the planner found non-overlapping are literally the same bytes here.
     pub fn new(
         plan: CompiledPlan,
         mut allocator: Box<dyn Allocator + Send>,
         collectives: Box<dyn CollectiveBackend + Send>,
     ) -> Result<Self, RuntimeError> {
         let n = plan.plan.slots.len();
+
+        if let Some((node, op, policy)) = plan.memory.unsupported.first() {
+            return Err(RuntimeError::UnsupportedMemoryPolicy {
+                node: node.0,
+                op: op.clone(),
+                policy: format!("{policy:?}"),
+            });
+        }
 
         // A spliced collective reduces a tensor in place, so its output slot is
         // the input slot's storage under another name. Resolving the chain up
@@ -274,40 +301,92 @@ impl Executor {
         }
 
         let device = allocator.device();
+
+        // Two regions, sized by the planner. A zero-sized region is skipped
+        // rather than allocated, so a plan with no activations costs one
+        // allocation instead of one per slot.
+        let mut alloc_region =
+            |bytes: u64, what: &str| -> Result<Option<(*mut c_void, u64)>, RuntimeError> {
+                if bytes == 0 {
+                    return Ok(None);
+                }
+                let ptr = allocator
+                    .alloc(bytes, device)
+                    .map_err(|reason| RuntimeError::Alloc {
+                        slot: SlotId(0),
+                        bytes,
+                        reason: format!("{what} region: {reason}"),
+                    })?;
+                Ok(Some((ptr, bytes)))
+            };
+        let persistent_region = alloc_region(plan.memory.persistent_bytes, "persistent")?;
+        let pool_region = alloc_region(plan.memory.transient_pool_bytes, "activation pool")?;
+
+        let base = |region: Option<(*mut c_void, u64)>, what: &str| -> Result<*mut c_void, RuntimeError> {
+            region
+                .map(|(p, _)| p)
+                .ok_or(RuntimeError::Alloc {
+                    slot: SlotId(0),
+                    bytes: 0,
+                    reason: format!("the plan needs a {what} region but none was allocated"),
+                })
+        };
+
         let mut buffers: Vec<Option<SlotBuffer>> = Vec::with_capacity(n);
         for (i, alias) in aliases.iter().enumerate().take(n) {
+            let slot = &plan.plan.slots[i];
+
             if let Some(root) = *alias {
-                let root_buf = buffers[root.0].as_ref().map(|b| (b.ptr, b.bytes));
-                let (ptr, bytes) = root_buf.ok_or(RuntimeError::NullData { slot: root })?;
-                let src = buffers[root.0].as_ref().expect("checked above");
+                let src = buffers[root.0]
+                    .as_ref()
+                    .ok_or(RuntimeError::NullData { slot: root })?;
                 buffers.push(Some(SlotBuffer {
-                    ptr,
-                    owned: None,
+                    ptr: src.ptr,
                     shape: src.shape,
                     strides: src.strides,
                     rank: src.rank,
                     elem_width: src.elem_width,
-                    bytes,
-                    alias_of: Some(root),
+                    bytes: src.bytes,
                 }));
                 continue;
             }
 
-            let bytes = slot_element_bytes(&plan.plan.slots[i]).map_err(|reason| {
-                RuntimeError::Alloc {
+            let alloc = plan
+                .memory
+                .allocation(SlotId(i))
+                .ok_or_else(|| RuntimeError::UnplannedSlot {
                     slot: SlotId(i),
-                    bytes: 0,
-                    reason,
-                }
-            })?;
-            let ptr = allocator
-                .alloc(bytes, device)
-                .map_err(|reason| RuntimeError::Alloc {
-                    slot: SlotId(i),
-                    bytes,
-                    reason,
+                    name: slot.name.clone(),
                 })?;
-            let slot = &plan.plan.slots[i];
+
+            let ptr = match alloc.placement {
+                // SAFETY: the planner sized each region to cover every offset it
+                // assigned into it, so `offset..offset + bytes` is in bounds.
+                rustrain_plan::Placement::Persistent { offset } => unsafe {
+                    (base(persistent_region, "persistent")? as *mut u8).add(offset as usize)
+                        as *mut c_void
+                },
+                rustrain_plan::Placement::Pool { offset } => unsafe {
+                    (base(pool_region, "activation pool")? as *mut u8).add(offset as usize)
+                        as *mut c_void
+                },
+                rustrain_plan::Placement::Aliased(root) => buffers
+                    .get(root.0)
+                    .and_then(Option::as_ref)
+                    .ok_or(RuntimeError::NullData { slot: root })?
+                    .ptr,
+                // The compiler records a policy the runtime cannot execute, and
+                // `new` refuses such a plan above; reaching here means a slot was
+                // planned as non-resident without being reported.
+                rustrain_plan::Placement::NonResident => {
+                    return Err(RuntimeError::UnsupportedMemoryPolicy {
+                        node: 0,
+                        op: slot.name.clone(),
+                        policy: format!("{:?}", alloc.policy),
+                    });
+                }
+            };
+
             let mut shape = [0i64; rustrain_abi::ffi::MAX_RANK];
             let mut strides = [0i64; rustrain_abi::ffi::MAX_RANK];
             let rank = (slot.shape.len() as u32).min(rustrain_abi::ffi::MAX_RANK as u32);
@@ -319,22 +398,17 @@ impl Executor {
             }
             buffers.push(Some(SlotBuffer {
                 ptr,
-                owned: Some((ptr, bytes)),
                 shape,
                 strides,
                 rank,
                 elem_width: slot.dtype.byte_width().unwrap_or(4),
-                bytes,
-                alias_of: None,
+                bytes: alloc.bytes,
             }));
         }
 
-        let resident_bytes = buffers
-            .iter()
-            .filter_map(Option::as_ref)
-            .filter(|b| b.alias_of.is_none())
-            .map(|b| b.bytes)
-            .sum();
+        // The planner's projection, so a caller comparing `RunStats` against
+        // `plan explain` sees the same number.
+        let resident_bytes = plan.memory.peak_bytes;
 
         Ok(Self {
             plan,
@@ -342,6 +416,8 @@ impl Executor {
             collectives,
             buffers,
             aliases,
+            persistent_region,
+            pool_region,
             services: Box::new(no_services()),
             stats: RunStats {
                 resident_bytes,
@@ -643,10 +719,8 @@ impl Executor {
 impl Drop for Executor {
     fn drop(&mut self) {
         // Only owners free; aliases point into the same allocation.
-        for buf in self.buffers.iter().flatten() {
-            if let Some((ptr, bytes)) = buf.owned {
-                self.allocator.dealloc(ptr, bytes);
-            }
+        for region in [self.persistent_region, self.pool_region].into_iter().flatten() {
+            self.allocator.dealloc(region.0, region.1);
         }
     }
 }
@@ -697,19 +771,6 @@ fn materialise(
         }
     }
     out
-}
-
-/// Byte size of one slot's element buffer.
-///
-/// Sub-byte dtypes (fp4) have no whole-byte width yet, and the runtime refuses
-/// them rather than guessing a packing.
-fn slot_element_bytes(slot: &Slot) -> Result<u64, String> {
-    let width = slot
-        .dtype
-        .byte_width()
-        .ok_or_else(|| format!("dtype {} has no whole-byte width", slot.dtype))?;
-    let numel = slot.shape.iter().product::<i64>().max(0) as u64;
-    Ok(numel * width as u64)
 }
 
 /// The service table handed to plugins.

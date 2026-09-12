@@ -426,6 +426,79 @@ fn host_allocator_tracks_residency_and_frees_on_drop() {
     drop(ex); // must not leak or double-free; run under a sanitizer to prove more
 }
 
+/// The memory plan is not advice: two activations the planner found
+/// non-overlapping must be the same bytes, and writing one must show in the
+/// other. That is what makes the pool real rather than a second bookkeeping
+/// system that happens to agree with the first.
+#[test]
+fn non_overlapping_activations_share_one_buffer() {
+    let (registry, _default, env) = setup();
+    let recipe = Recipe::from_toml(
+        "[kernel]\ndefault = \"test\"\n[kernel.memory]\npool = \"slab\"\n",
+    )
+    .unwrap();
+
+    // A chain of four distinct slots, each consumed once by the next. Their
+    // lifetimes interleave but never coincide beyond the hand-off, so the
+    // planner should pack them into far less than four buffers' worth.
+    let mut b = PlanBuilder::new("chain", Phase::Forward, ParallelConfig::default());
+    let x = b.slot("x", RsDtype::F32, vec![64], SlotKind::Input);
+    let s1 = b.slot("s1", RsDtype::F32, vec![64], SlotKind::Activation);
+    let s2 = b.slot("s2", RsDtype::F32, vec![64], SlotKind::Activation);
+    let s3 = b.slot("s3", RsDtype::F32, vec![64], SlotKind::Activation);
+    let s4 = b.slot("s4", RsDtype::F32, vec![64], SlotKind::Activation);
+    let out = b.slot("out", RsDtype::F32, vec![64], SlotKind::Output);
+    for (i, (a, c)) in [(x, s1), (s1, s2), (s2, s3), (s3, s4), (s4, out)]
+        .into_iter()
+        .enumerate()
+    {
+        b.node(
+            OpRef::new("scale"),
+            vec![a],
+            vec![c],
+            Attrs::new().set("factor", 1.0),
+            format!("step{i}"),
+        );
+    }
+    let compiled = rustrain_plan::Compiler::new(&registry, &recipe, env, ParallelConfig::default())
+        .compile(&b.build().unwrap())
+        .unwrap();
+
+    let reused = compiled.memory.reuse.len();
+    let slot_bytes = 64 * 4;
+    assert!(
+        reused >= 3,
+        "five same-sized activations in a chain should reuse storage at least three times, got {reused}          (pool {} B)",
+        compiled.memory.transient_pool_bytes
+    );
+    assert!(
+        compiled.memory.transient_pool_bytes < 5 * slot_bytes,
+        "pool {} B should be well under {} B",
+        compiled.memory.transient_pool_bytes,
+        5 * slot_bytes
+    );
+
+    let mut ex = Executor::new(
+        compiled,
+        Box::new(HostAllocator::new()),
+        Box::new(SingleRank::new(1)),
+    )
+    .unwrap();
+
+    // Two slots the planner aliased must be the same address.
+    let (later, earlier, _) = ex.plan().memory.reuse[0];
+    let p_later = ex.descriptor(later).unwrap().data as usize;
+    let p_earlier = ex.descriptor(earlier).unwrap().data as usize;
+    assert_eq!(
+        p_later, p_earlier,
+        "slots the planner reported as sharing storage must resolve to one address"
+    );
+
+    ex.write_f32(x, &vec![1.0; 64]).unwrap();
+    ex.run().unwrap();
+    assert_eq!(ex.read_f32(out).unwrap(), vec![1.0; 64]);
+}
+
 #[test]
 fn device_kind_is_exposed_so_a_gpu_allocator_can_slot_in() {
     let a = HostAllocator::new();

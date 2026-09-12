@@ -765,7 +765,10 @@ mod tests {
     #[test]
     fn no_pool_allocates_every_slot_separately() {
         let plan = plan_with(4);
-        let recipe = MemoryRecipe::default(); // pool = none
+        let recipe = MemoryRecipe {
+            pool: MemoryPool::None,
+            ..Default::default()
+        };
         let mem = run_memory_pass(&plan, &no_ops(&plan), &recipe, RuntimeCapabilities::none()).unwrap();
         let transient: u64 = mem
             .allocations

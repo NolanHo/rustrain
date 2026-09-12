@@ -403,7 +403,11 @@ kv_block    = 64
 `rustrain-runtime`：slot 显存池、扁平调用序列驱动、phase 排序、通信调度与 overlap。
 验收：`cargo test -p rustrain-runtime`；含通信节点的 plan 在本地 mock 通信后端上执行，
 结果与逐节点手写调用一致；`side_stream` 通信按声明的顺序出现。
-状态：`- [x]` — 执行器、slot 显存池、扁平调用序列驱动、collective 后端抽象（`Allocator` / `CollectiveBackend`）已实现。`cargo test -p rustrain-runtime` 8 通过，其中 `row_parallel_weight_inserts_a_collective_the_runtime_drives` 是**全链路证据**：Rust 编写的插件经 ABI 注册 → 注册表按 recipe 解析 → plan 编译时自动插入 all_reduce → 执行器真实驱动该 collective。`SingleRank` 在 world_size>1 时**拒绝执行**而不是假装完成。未完成：`rs_services` 的 alloc/stream/collective 回调尚未接线（provider 目前在自己运行时内部分配）。
+状态：`- [x]` — 执行器、扁平调用序列驱动、collective 后端抽象（`Allocator` / `CollectiveBackend`）已实现，并且**执行器真正使用 `MemoryPlan` 的偏移**：只分配两块区域（常驻 + 激活池），槽位按规划器给的 offset 落位 —— 规划器判定寿命不相交的两个激活就是同一块字节。`cargo test -p rustrain-runtime` 15 通过，其中：
+  - `row_parallel_weight_inserts_a_collective_the_runtime_drives`：Rust 插件经 ABI 注册 → 按 recipe 解析 → 编译期自动插入 all_reduce → 执行器真实驱动它；
+  - `non_overlapping_activations_share_one_buffer`：5 个同尺寸激活串成链，复用 ≥3 次，池远小于 5×单槽，且规划器标记为共享的两个槽位解析到**同一个地址**；
+  - `conformance_gate.rs` 6 个测试证明门禁会失败（见 D7）。
+`SingleRank` 在 world_size>1 时**拒绝执行**而不是假装完成；执行器拒绝任何依赖运行时未实现显存策略的 plan。未完成：`rs_services` 的 alloc/stream 回调尚未接线（provider 目前在自己运行时内部分配）。
 
 **D6 · reference provider（纯 Rust）**
 `rustrain-kernels` 的 `reference` 实现：覆盖 §2.4 全部原语（CPU、纯 Rust、无 torch）。
@@ -418,6 +422,11 @@ kv_block    = 64
 改 recipe 一个字段后 `plan explain` 输出随之改变，**期间不重编译**；
 `rg -n 'getenv|env::var' crates/` 在算子路径上零命中。
 状态：`- [x]` — `ops list` / `plan explain` / **`ops check`** 均已可用（文本 + `--json`）。
+`rustrain ops check` 对 17 个算子跑数值（对照 `reference.f32`）、展开等价（重放声明的 `expansion`）、
+确定性与梯度（**跳过并写明理由**：反向推导未实现）四项，通过退出码 0、失败非零。
+**门禁已被证明会失败**：`conformance_gate.rs` 注入一个"把 add 算成减"的实现 → 数值检查抓到；
+注入一个每次调用多加一个常数的实现 → 确定性检查抓到；参考实现自身被如实标为 `skip` 而非 `pass`（
+"和自己是同一次执行"不是证据）；未注册的变体报错而不回落。无 case 的 8 个算子由 CLI 明确列出并给出理由。
 `rustrain ops check` 对 17 个算子跑数值（对照 `reference.f32`）、展开等价（重放声明的 `expansion`）、
 确定性与梯度（**跳过并写明理由**：反向推导未实现）四项，通过退出码 0、失败非零。
 **门禁已被证明会失败**：`conformance_gate.rs` 注入一个"把 add 算成减"的实现 → 数值检查抓到；
@@ -463,7 +472,7 @@ TP（或 CP/EP）≥2 的配置跑通，通信由传播插入而非手写。
 产出 `MemoryPlan`。编译期调用每个算子的 `memory()` 取 workspace 与 save-for-backward。
 验收：`cargo test -p rustrain-plan`；手工可算的小图峰值与预期一致；寿命不相交的两槽位被分到同一偏移；
 `rustrain plan explain` 打印峰值与复用表。
-状态：`- [x]` — 寿命分析、峰值投影、不相交寿命的槽位复用（`MemoryPool::Slab` 首次适配）已实现，编译期调用每个算子的 `memory()` 取 workspace。`cargo test -p rustrain-plan` 22 通过，含 8 个显存测试：寿命区间、峰值=常驻+池+workspace、复用确实发生（4 层 MLP 的激活池远小于逐槽之和）、关掉池化则逐槽独立。`plan explain` 打印峰值与复用表。
+状态：`- [x]` — 寿命分析、峰值投影、不相交寿命的槽位复用（首次适配）已实现，编译期调用每个算子的 `memory()` 取 workspace。`pool` 默认为 `slab`（复用正是寿命分析存在的理由，默认关掉等于白白浪费已证明可省的内存）。`cargo test -p rustrain-plan` 22 通过，含 8 个显存测试。**执行器已按这些偏移分配**（见 D5），所以 `MemoryPlan` 是执行事实而非建议。
 
 **D14 · 预算门禁与策略降级**
 超预算时编译失败并指出峰值步骤与可用策略；`activation_policy = "auto"` 按确定顺序降级并记录决策。

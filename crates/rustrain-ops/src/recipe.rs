@@ -197,10 +197,12 @@ pub enum OptimizerState {
 #[derive(Copy, Clone, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MemoryPool {
-    /// One allocation per slot.
-    #[default]
+    /// One allocation per slot. Wastes the memory that lifetime analysis
+    /// already proved was free, so it is not the default.
     None,
     /// Interval-based reuse: slots whose lifetimes do not overlap share storage.
+    /// This is what the lifetime analysis exists to enable.
+    #[default]
     Slab,
 }
 
