@@ -114,7 +114,7 @@ Rust 侧 `#[repr(C)]` 镜像并做尺寸与偏移断言。
 | 类别 | 算子 |
 |---|---|
 | 元数据（零计算，planner 级） | `view` `reshape` `transpose` `narrow` `cat` `broadcast` |
-| L0 计算 | `matmul` `linear` `bmm` `elementwise_unary` `elementwise_binary` `reduce` `softmax` `rmsnorm` `layernorm` `rope` |
+| L0 计算 | `matmul` `linear` `bmm` `elementwise_unary` `elementwise_binary` `compare` `reduce` `softmax` `rmsnorm` `layernorm` `rope` |
 | 量化 | `quantize` `dequantize` `amax_update` |
 | 数据搬运 | `embedding` `gather` `scatter` |
 | 通信 | `all_reduce` `all_gather` `reduce_scatter` `send_recv` |
@@ -339,17 +339,21 @@ kv_block    = 64
 **契约 B-7（确定性）**：反向图是 forward 图与 VJP 表的纯函数，因此同一 forward 图必得同一反向图，
 并可进入 digest。
 
-**前置条件：词表缺口。** 照现有 §2.4 词表无法写出下列 VJP，必须先补：
+**词表补全（原为 P3 的前置条件，现已闭合）。** 照原 §2.4 词表无法写出下列 VJP，缺的五样已按下表补齐：
 
-| 缺什么 | 谁需要 |
-|---|---|
-| `reduce` 的 `keepdim` | softmax / layernorm 的 VJP |
-| `rsqrt` / `pow` | rmsnorm 的 VJP |
-| 比较与 mask（`where` / `select`） | max-reduce 的 VJP、带 mask 的 loss |
-| 激活函数的导数 kind | silu′ / gelu′ —— 否则 `elementwise_unary` 的 VJP 写不出来 |
-| `scatter_add` | 部分累积（`scatter` 是覆盖语义） |
+| 缺什么 | 谁需要 | 补法 |
+|---|---|---|
+| `reduce` 的 `keepdim` | softmax / layernorm 的 VJP | `reduce` 增加 `keepdim` 属性（bool，默认 false） |
+| `rsqrt` / `pow` | rmsnorm 的 VJP | `elementwise_unary` 增 `rsqrt`；`elementwise_binary` 增 `pow` |
+| 比较与 mask | max-reduce 的 VJP、带 mask 的 loss | 新原语 `compare`：两输入同形状 → f32 输出恰好为 1.0/0.0，属性 `kind ∈ {eq,ne,lt,le,gt,ge}`，NaN 一律为 0.0（IEEE） |
+| 激活函数的导数 | silu′ / gelu′ | `elementwise_unary` 增 `silu_grad` / `gelu_grad` / `sigmoid_grad` / `tanh_grad` / `relu_grad`，取值为 f′(x) |
+| 部分累积 | `scatter_add` | `scatter` 增加 `reduce ∈ {assign, add}` 属性；`add` 按**升序源索引**累积以保证逐位可复现 |
 
-词表定不下来，VJP 就写不出来，所以这是 P3 的**前置条件**而非后续优化。
+**设计取舍**：一律用"新增 kind/属性"而非"新增原语"来补，只有比较必须成为新原语（它产生 mask，语义上不是逐元素算术）。
+这样 VJP 片段可以用 `elementwise_binary(mul, elementwise_unary(silu_grad, x), dy)` 这种组合表达，词表增长最小。
+
+**注意（词表与切分规则必须同步）**：新增原语若忘记加进 `shard::rule_for`，不会报错 —— 它会静默落到 `Declared`，
+即"分布取自 plan 而非推导"，于是它周围永远不会有集合通信被插入。安全但静默，所以两者必须一起改。
 
 **已知缺口（P3 的前置条件之二）：反向输出的接线约定。**
 

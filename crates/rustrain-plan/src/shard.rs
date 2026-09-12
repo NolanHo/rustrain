@@ -63,11 +63,16 @@ pub enum ShardRule {
 /// Classifies a primitive by name. Unknown names are [`ShardRule::Declared`],
 /// which is the conservative choice: the framework will not invent distribution
 /// semantics for an operator it does not understand.
+///
+/// An operator added to the vocabulary without a rule here does not fail — it
+/// silently falls to `Declared`, which means its distribution is taken from the
+/// plan rather than derived. That is safe but means no collective is ever
+/// inserted around it, so the vocabulary and this table have to move together.
 pub fn rule_for(op: &str) -> ShardRule {
     match op {
-        "elementwise_unary" | "elementwise_binary" | "softmax" | "rmsnorm" | "layernorm"
-        | "rope" | "quantize" | "dequantize" | "amax_update" | "view" | "reshape"
-        | "transpose" | "narrow" | "cat" | "broadcast" | "gather" | "scatter"
+        "elementwise_unary" | "elementwise_binary" | "compare" | "softmax" | "rmsnorm"
+        | "layernorm" | "rope" | "quantize" | "dequantize" | "amax_update" | "view"
+        | "reshape" | "transpose" | "narrow" | "cat" | "broadcast" | "gather" | "scatter"
         | "embedding" | "cross_entropy" => ShardRule::Elementwise,
         "linear" => ShardRule::Linear,
         "matmul" | "bmm" => ShardRule::MatMul,

@@ -372,9 +372,10 @@ fn plugin_loads_through_the_abi_loader() {
         .unwrap_or_else(|e| panic!("loader rejected {so:?}: {e}"));
     assert_eq!(plugin.name(), "reference");
     let ops = plugin.ops();
-    assert_eq!(ops.len(), 26);
+    assert_eq!(ops.len(), 27);
     assert_eq!(ops[0].spec_name(), "view@reference.f32");
-    assert_eq!(ops[25].spec_name(), "topk_router@reference.f32");
+    assert_eq!(ops[11].spec_name(), "compare@reference.f32");
+    assert_eq!(ops[26].spec_name(), "topk_router@reference.f32");
     for o in &ops {
         assert!(o.variant() == "reference.f32", "{}: variant", o.name());
     }
@@ -394,7 +395,7 @@ fn plugin_publishes_the_expected_ops() {
         env!("CARGO_PKG_VERSION")
     );
     let ops = unsafe { slice::from_raw_parts(p.ops, p.n_ops as usize) };
-    assert_eq!(p.n_ops, 26, "one variant per vocabulary op");
+    assert_eq!(p.n_ops, 27, "one variant per vocabulary op");
     let names: Vec<&str> = ops
         .iter()
         .map(|d| unsafe { CStr::from_ptr((**d).id.name) }.to_str().unwrap())
@@ -403,9 +404,9 @@ fn plugin_publishes_the_expected_ops() {
         names,
         vec![
             "view", "reshape", "transpose", "narrow", "cat", "broadcast", "matmul", "linear",
-            "bmm", "elementwise_unary", "elementwise_binary", "reduce", "softmax", "rmsnorm",
-            "layernorm", "rope", "quantize", "dequantize", "amax_update", "embedding", "gather",
-            "scatter", "sdpa", "cross_entropy", "adamw", "topk_router",
+            "bmm", "elementwise_unary", "elementwise_binary", "compare", "reduce", "softmax",
+            "rmsnorm", "layernorm", "rope", "quantize", "dequantize", "amax_update", "embedding",
+            "gather", "scatter", "sdpa", "cross_entropy", "adamw", "topk_router",
         ]
     );
     for d in ops {
@@ -818,6 +819,79 @@ fn elementwise_unary_hand_values() {
     assert_close(exp[3], std::f32::consts::E, 1e-6, "exp(1)");
     let log = run("log");
     assert_close(log[3], 0.0, 1e-7, "ln(1)");
+
+    // rsqrt = 1/sqrt(x): IEEE at the edges.
+    let rsqrt = run("rsqrt");
+    assert!(rsqrt[0].is_nan() && rsqrt[1].is_nan(), "rsqrt of negatives is NaN");
+    assert_eq!(rsqrt[2], f32::INFINITY, "rsqrt(0) = +inf");
+    assert_eq!(rsqrt[3], 1.0, "rsqrt(1)");
+    let x4 = Owned::f32(&[1], vec![4.0]);
+    let outs = unsafe { run_op(op("elementwise_unary"), &[&x4.t], &[astr("kind", "rsqrt")], 1) }
+        .unwrap();
+    assert_eq!(outs[0].fdata(), &[0.5], "rsqrt(4) = 1/2");
+
+    // Hand-computed *_grad values at the sample points (the central finite
+    // difference check below is the real contract).
+    let sig_g = run("sigmoid_grad");
+    assert_close(sig_g[2], 0.25, 1e-7, "sigmoid_grad(0) = σ(1-σ)");
+    assert_close(sig_g[3], 0.196_611_94, 1e-6, "sigmoid_grad(1)");
+    let tanh_g = run("tanh_grad");
+    assert_close(tanh_g[2], 1.0, 1e-7, "tanh_grad(0)");
+    assert_close(tanh_g[3], 0.419_974_34, 1e-6, "tanh_grad(1) = 1 - tanh(1)^2");
+    let relu_g = run("relu_grad");
+    assert_eq!(relu_g, vec![0.0, 0.0, 0.0, 1.0], "relu_grad: 0 at 0 by convention");
+    let silu_g = run("silu_grad");
+    assert_close(silu_g[2], 0.5, 1e-7, "silu_grad(0)");
+    assert_close(silu_g[3], 0.927_670_5, 1e-6, "silu_grad(1)");
+    let gelu_g = run("gelu_grad");
+    assert_close(gelu_g[2], 0.5, 1e-7, "gelu_grad(0) of the tanh approximation");
+}
+
+/// The `*_grad` kinds exist so VJPs are writable; their entire contract is
+/// that they equal the derivative of the provider's own forward function. So
+/// they are checked against a central finite difference of that forward op —
+/// not against a separately hardcoded derivative.
+#[test]
+fn unary_grad_kinds_match_central_finite_difference() {
+    let h = 1e-3f32;
+    let xs = [-4.0, -2.0, -1.0, -0.3, 0.0, 0.3, 1.0, 2.0, 4.0];
+    for (fwd, grad) in [
+        ("silu", "silu_grad"),
+        ("gelu", "gelu_grad"),
+        ("sigmoid", "sigmoid_grad"),
+        ("tanh", "tanh_grad"),
+        ("relu", "relu_grad"),
+    ] {
+        for &x in &xs {
+            // relu is not differentiable at 0: the subgradient convention is
+            // 0 while a central difference reads 0.5, so skip that point.
+            if fwd == "relu" && x == 0.0 {
+                continue;
+            }
+            let xp = Owned::f32(&[1], vec![x + h]);
+            let xm = Owned::f32(&[1], vec![x - h]);
+            let fp =
+                unsafe { run_op(op("elementwise_unary"), &[&xp.t], &[astr("kind", fwd)], 1) }
+                    .unwrap();
+            let fm =
+                unsafe { run_op(op("elementwise_unary"), &[&xm.t], &[astr("kind", fwd)], 1) }
+                    .unwrap();
+            let x0 = Owned::f32(&[1], vec![x]);
+            let g =
+                unsafe { run_op(op("elementwise_unary"), &[&x0.t], &[astr("kind", grad)], 1) }
+                    .unwrap();
+            // Central difference in f64 so the FD itself is not the limiting
+            // error; the tolerance covers f32 rounding of the two forward
+            // calls (two ~1e-7 absolute roundings over a 2h = 2e-3 step).
+            let fd = (fp[0].fdata()[0] as f64 - fm[0].fdata()[0] as f64) / (2.0 * h as f64);
+            assert_close(
+                g[0].fdata()[0],
+                fd as f32,
+                2e-3,
+                &format!("{grad} vs central difference of {fwd} at x={x}"),
+            );
+        }
+    }
 }
 
 #[test]
@@ -836,6 +910,18 @@ fn elementwise_binary_hand_values() {
     assert_eq!(run("mul"), vec![10.0, 40.0, 90.0, 160.0]);
     assert_eq!(run("div"), vec![0.1, 0.1, 0.1, 0.1]);
     assert_eq!(run("maximum"), vec![10.0, 20.0, 30.0, 40.0]);
+
+    // pow: x^y elementwise; 0^0 = 1 per IEEE.
+    let base = Owned::f32(&[4], vec![2.0, 3.0, 4.0, 0.0]);
+    let exp = Owned::f32(&[4], vec![3.0, 2.0, 0.5, 0.0]);
+    let outs = unsafe {
+        run_op(op("elementwise_binary"), &[&base.t, &exp.t], &[astr("kind", "pow")], 1)
+    }
+    .unwrap();
+    let got = outs[0].fdata();
+    for (i, want) in [8.0f32, 9.0, 2.0, 1.0].iter().enumerate() {
+        assert_close(got[i], *want, 1e-6, "pow hand value");
+    }
 
     // Broadcasting: [2,1] + [1,3].
     let a = Owned::f32(&[2, 1], vec![1.0, 2.0]);
@@ -857,6 +943,64 @@ fn elementwise_binary_hand_values() {
     }
     .unwrap();
     assert_eq!(outs[0].fdata(), &[2.0, 4.0, 6.0]);
+}
+
+#[test]
+fn compare_all_kinds_and_nan_policy() {
+    // Mask convention: exactly 1.0 where the comparison holds, 0.0 elsewhere.
+    let a = Owned::f32(&[4], vec![1.0, 2.0, 2.0, 0.0]);
+    let b = Owned::f32(&[4], vec![1.0, 2.0, 3.0, -1.0]);
+    let run = |kind: &str| {
+        let outs = unsafe { run_op(op("compare"), &[&a.t, &b.t], &[astr("kind", kind)], 1) }
+            .unwrap();
+        assert_eq!(outs[0].t.dims(), &[4]);
+        assert_eq!(outs[0].t.dtype, RsDtype::F32);
+        outs[0].fdata().to_vec()
+    };
+    assert_eq!(run("eq"), vec![1.0, 1.0, 0.0, 0.0]);
+    assert_eq!(run("ne"), vec![0.0, 0.0, 1.0, 1.0]);
+    assert_eq!(run("lt"), vec![0.0, 0.0, 1.0, 0.0]);
+    assert_eq!(run("le"), vec![1.0, 1.0, 1.0, 0.0]);
+    assert_eq!(run("gt"), vec![0.0, 0.0, 0.0, 1.0]);
+    assert_eq!(run("ge"), vec![1.0, 1.0, 0.0, 1.0]);
+
+    // NaN policy (documented): any NaN operand yields 0.0 for EVERY kind —
+    // a NaN never smuggles a 1 into a mask, not even through 'ne'.
+    let nan = Owned::f32(&[1], vec![f32::NAN]);
+    let one = Owned::f32(&[1], vec![1.0]);
+    for kind in ["eq", "ne", "lt", "le", "gt", "ge"] {
+        let outs = unsafe { run_op(op("compare"), &[&nan.t, &one.t], &[astr("kind", kind)], 1) }
+            .unwrap();
+        assert_eq!(outs[0].fdata(), &[0.0], "NaN on the left, kind {kind}");
+        let outs = unsafe { run_op(op("compare"), &[&one.t, &nan.t], &[astr("kind", kind)], 1) }
+            .unwrap();
+        assert_eq!(outs[0].fdata(), &[0.0], "NaN on the right, kind {kind}");
+    }
+}
+
+#[test]
+fn compare_shape_mismatch_is_a_hard_error_naming_both_shapes() {
+    unsafe {
+        let a = Owned::f32(&[4], vec![1.0; 4]);
+        let b = Owned::f32(&[2, 2], vec![1.0; 4]);
+        let mut out = RsTensor::default();
+        let err = call_exec(
+            op("compare"),
+            &[&a.t, &b.t],
+            &mut [&mut out],
+            &[astr("kind", "eq")],
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("[4]") && err.contains("[2, 2]"),
+            "shape mismatch message must name both shapes: {err}"
+        );
+        // infer must reject the same pair.
+        let mut outs = [RsTensor::default()];
+        let err = call_infer(op("compare"), &[&a.t, &b.t], &mut outs, &[astr("kind", "eq")])
+            .unwrap_err();
+        assert!(err.contains("[4]") && err.contains("[2, 2]"), "infer message: {err}");
+    }
 }
 
 #[test]
@@ -887,6 +1031,42 @@ fn reduce_hand_values() {
     let neg = Owned::f32(&[2], vec![-5.0, -2.0]);
     let outs = unsafe { run_op(op("reduce"), &[&neg.t], &[astr("kind", "max")], 1) }.unwrap();
     assert_eq!(outs[0].fdata(), &[-2.0]);
+
+    // keepdim = true: the reduced axis survives as size 1 (the softmax/
+    // layernorm VJPs need the rank preserved); values agree with the
+    // axis-removed run after squeezing.
+    let run_kd = |kind: &str, axis: i64| {
+        let outs = unsafe {
+            run_op(
+                op("reduce"),
+                &[&x.t],
+                &[astr("kind", kind), ai64("axis", axis), abool("keepdim", true)],
+                1,
+            )
+        }
+        .unwrap();
+        outs.into_iter().next().unwrap()
+    };
+    let kd0 = run_kd("sum", 0);
+    assert_eq!(kd0.t.dims(), &[1, 3]);
+    assert_eq!(kd0.fdata(), &[5.0, 7.0, 9.0]);
+    let kd1 = run_kd("sum", 1);
+    assert_eq!(kd1.t.dims(), &[2, 1]);
+    assert_eq!(kd1.fdata(), &[6.0, 15.0]);
+    assert_eq!(run("sum", Some(0)).fdata(), kd0.fdata(), "squeezed values agree");
+    assert_eq!(run("sum", Some(1)).fdata(), kd1.fdata(), "squeezed values agree");
+    // Negative axis with keepdim.
+    let kdm1 = run_kd("mean", -1);
+    assert_eq!(kdm1.t.dims(), &[2, 1]);
+    assert_eq!(kdm1.fdata(), &[2.0, 5.0]);
+    // No axis + keepdim: every dim becomes 1 (torch convention), value the
+    // same as the rank-0 scalar.
+    let all_kd = unsafe {
+        run_op(op("reduce"), &[&x.t], &[astr("kind", "sum"), abool("keepdim", true)], 1)
+    }
+    .unwrap();
+    assert_eq!(all_kd[0].t.dims(), &[1, 1]);
+    assert_eq!(all_kd[0].fdata(), &[21.0]);
 }
 
 #[test]
@@ -1093,6 +1273,38 @@ fn scatter_hand_values_and_last_writer_wins() {
         unsafe { run_op(op("scatter"), &[&x.t, &idx.t, &values.t], &[ai64("axis", -1)], 1) }
             .unwrap();
     assert_eq!(outs[0].fdata(), &[0.0, 5.0, 0.0, 0.0, 0.0, 7.0, 0.0, 0.0, 0.0, 7.0, 0.0, 0.0]);
+}
+
+#[test]
+fn scatter_reduce_add_accumulates_duplicates_bitwise_deterministically() {
+    let x = Owned::f32(&[3, 4], vec![0.0; 12]);
+    // Duplicate indices [1, 1]: values is [3, 2] row-major, so the k=0
+    // column is [1,2,3] and the k=1 column is [4,5,6]; with reduce = "add"
+    // out[:,1] accumulates to [5,7,9].
+    let idx = Owned::i32(&[2], vec![1, 1]);
+    let values = Owned::f32(&[3, 2], vec![1.0, 4.0, 2.0, 5.0, 3.0, 6.0]);
+    let attrs = [astr("reduce", "add")];
+    let r1 = unsafe { run_op(op("scatter"), &[&x.t, &idx.t, &values.t], &attrs, 1) }.unwrap();
+    assert_eq!(r1[0].t.dims(), &[3, 4]);
+    assert_eq!(r1[0].fdata(), &[0.0, 5.0, 0.0, 0.0, 0.0, 7.0, 0.0, 0.0, 0.0, 9.0, 0.0, 0.0]);
+    // Fixed ascending-k accumulation order: two runs are bitwise identical.
+    let r2 = unsafe { run_op(op("scatter"), &[&x.t, &idx.t, &values.t], &attrs, 1) }.unwrap();
+    assert_eq!(r1[0].bytes(), r2[0].bytes(), "scatter add must be bitwise reproducible");
+    // The default (assign) keeps last-writer-wins: out[:,1] ends as [4,5,6].
+    let r3 = unsafe { run_op(op("scatter"), &[&x.t, &idx.t, &values.t], &[ai64("axis", -1)], 1) }
+        .unwrap();
+    assert_eq!(r3[0].fdata(), &[0.0, 4.0, 0.0, 0.0, 0.0, 5.0, 0.0, 0.0, 0.0, 6.0, 0.0, 0.0]);
+    // assign is also the behaviour when 'reduce' is passed explicitly.
+    let r4 = unsafe {
+        run_op(
+            op("scatter"),
+            &[&x.t, &idx.t, &values.t],
+            &[ai64("axis", -1), astr("reduce", "assign")],
+            1,
+        )
+    }
+    .unwrap();
+    assert_eq!(r4[0].fdata(), r3[0].fdata());
 }
 
 #[test]
@@ -1414,6 +1626,15 @@ fn determinism_cases() -> Vec<(&'static str, Vec<Owned>, Vec<RsAttr>, usize)> {
         1,
     ));
     cases.push((
+        "compare",
+        vec![
+            Owned::f32(&[2, 2], vec![1.0, 2.0, 3.0, 4.0]),
+            Owned::f32(&[2, 2], vec![1.0, 9.0, 3.0, 4.0]),
+        ],
+        vec![astr("kind", "ge")],
+        1,
+    ));
+    cases.push((
         "reduce",
         vec![Owned::f32(&[2, 3], vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0])],
         vec![astr("kind", "mean"), ai64("axis", -1)],
@@ -1504,6 +1725,16 @@ fn determinism_cases() -> Vec<(&'static str, Vec<Owned>, Vec<RsAttr>, usize)> {
             Owned::f32(&[3, 2], vec![1.0, 1.0, 1.0, 2.0, 2.0, 2.0]),
         ],
         vec![ai64("axis", -1)],
+        1,
+    ));
+    cases.push((
+        "scatter",
+        vec![
+            Owned::f32(&[3, 4], vec![0.0; 12]),
+            Owned::i32(&[3], vec![1, 1, 2]),
+            Owned::f32(&[3, 3], vec![0.5, 1.5, 2.5, -0.5, -1.5, -2.5, 0.25, 0.5, 1.0]),
+        ],
+        vec![astr("reduce", "add")],
         1,
     ));
     cases.push((
@@ -1606,6 +1837,28 @@ fn infer_produces_documented_shapes_and_dtypes() {
         assert_eq!(d[0].rank, 0);
         assert_eq!(d[0].numel(), 1);
         assert_eq!(d[0].dtype, RsDtype::F32);
+
+        // reduce keepdim: the reduced axis survives as size 1.
+        let d = infer_ok(
+            op("reduce"),
+            &[&x.t],
+            &[astr("kind", "sum"), ai64("axis", -1), abool("keepdim", true)],
+            1,
+        );
+        assert_eq!(d[0].dims(), &[2, 3, 1]);
+        assert_eq!(d[0].dtype, RsDtype::F32);
+
+        // compare: equal-shape f32 inputs -> f32 of the same shape.
+        let d = infer_ok(op("compare"), &[&x.t, &x.t], &[astr("kind", "eq")], 1);
+        assert_eq!(d[0].dims(), &[2, 3, 4]);
+        assert_eq!(d[0].dtype, RsDtype::F32);
+
+        // scatter's 'reduce' attribute is validated at infer time.
+        let sx = Owned::f32(&[4], vec![0.0; 4]);
+        let si = Owned::i32(&[2], vec![0, 1]);
+        let sv = Owned::f32(&[2], vec![1.0, 2.0]);
+        let d = infer_ok(op("scatter"), &[&sx.t, &si.t, &sv.t], &[astr("reduce", "add")], 1);
+        assert_eq!(d[0].dims(), &[4]);
 
         // gather: torch convention — indices share x's rank; the gathered
         // axis takes the indices' dim.
@@ -1763,6 +2016,35 @@ fn unknown_attribute_values_are_hard_errors_naming_the_accepted_values() {
         assert!(
             err.contains("sum") && err.contains("amax") && err.contains("product"),
             "reduce message: {err}"
+        );
+
+        // compare: an unknown kind names the accepted set.
+        let err = call_exec(
+            op("compare"),
+            &[&x.t, &x.t],
+            &mut [&mut out],
+            &[astr("kind", "xor")],
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("accepted values") && err.contains("eq") && err.contains("xor"),
+            "compare message: {err}"
+        );
+
+        // scatter: an unknown 'reduce' names the accepted set.
+        let sx = Owned::f32(&[4], vec![0.0; 4]);
+        let si = Owned::i32(&[2], vec![0, 1]);
+        let sv = Owned::f32(&[2], vec![1.0, 2.0]);
+        let err = call_exec(
+            op("scatter"),
+            &[&sx.t, &si.t, &sv.t],
+            &mut [&mut out],
+            &[astr("reduce", "mul")],
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("assign") && err.contains("add") && err.contains("mul"),
+            "scatter reduce message: {err}"
         );
 
         // Missing required attribute is also a non-zero status with a

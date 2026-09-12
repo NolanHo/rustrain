@@ -1034,6 +1034,46 @@ pub fn default_cases() -> Vec<Case> {
         )
         .attrs(Attrs::new().set("eps", 1e-5f64)),
     );
+    // The vocabulary the backward pass needs (spec §2.11). These exercise the
+    // implementations' shape inference and determinism; the numeric comparison
+    // activates as soon as a second provider exists.
+    cases.push(
+        Case::new("elementwise_unary", vec![InputSpec::f32("x", vec![4, 8], Ones)])
+            .attrs(Attrs::new().set("kind", "rsqrt")),
+    );
+    cases.push(
+        Case::new("elementwise_unary", vec![InputSpec::f32("x", vec![4, 8], Ramp)])
+            .attrs(Attrs::new().set("kind", "silu_grad")),
+    );
+    cases.push(
+        Case::new(
+            "elementwise_binary",
+            vec![
+                InputSpec::f32("a", vec![4, 8], Ones),
+                InputSpec::f32("b", vec![4, 8], Ones),
+            ],
+        )
+        .attrs(Attrs::new().set("kind", "pow")),
+    );
+    cases.push(
+        Case::new("reduce", vec![InputSpec::f32("x", vec![4, 8], Ramp)])
+            .attrs(
+                Attrs::new()
+                    .set("kind", "max")
+                    .set("axis", -1i64)
+                    .set("keepdim", true),
+            ),
+    );
+    cases.push(
+        Case::new(
+            "compare",
+            vec![
+                InputSpec::f32("a", vec![4, 8], Ramp),
+                InputSpec::f32("b", vec![4, 8], Pseudo { seed: 31 }),
+            ],
+        )
+        .attrs(Attrs::new().set("kind", "ge")),
+    );
     cases.push(Case::new(
         "matmul",
         vec![

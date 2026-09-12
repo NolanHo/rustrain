@@ -1,5 +1,6 @@
 //! L0 compute operators: `matmul`, `linear`, `bmm`, `elementwise_unary`,
-//! `elementwise_binary`, `reduce`, `softmax`, `rmsnorm`, `layernorm`, `rope`.
+//! `elementwise_binary`, `compare`, `reduce`, `softmax`, `rmsnorm`,
+//! `layernorm`, `rope`.
 //!
 //! Determinism rules used throughout (and why): every reduction accumulates
 //! in ascending index order with plain f32 adds — no threads, no trees, no
@@ -9,7 +10,7 @@
 use ndarray::{ArrayView1, ArrayViewD, Axis, Dimension, IxDyn, Zip};
 use rustrain_abi::ffi::{RsAttrs, RsTensor};
 
-use crate::attrs::{attr_f64, attr_i64, require_str_of};
+use crate::attrs::{attr_bool, attr_f64, attr_i64, require_str_of};
 use crate::dispatch::{Call, run};
 use crate::error::{OpResult, err, fail};
 use crate::tensor::{
@@ -369,9 +370,26 @@ fn bmm_exec_body(c: &mut Call, a: &RsAttrs) -> OpResult<()> {
 /// Accepted `kind` values. `neg` and `sqrt` extend the core list because the
 /// declared expansions of `cross_entropy` (negation of the gathered
 /// log-probability) and `adamw` (sqrt of the second moment) must be
-/// expressible in the fixed primitive vocabulary; see the op doc.
-pub(crate) const UNARY_KINDS: &[&str] =
-    &["silu", "gelu", "sigmoid", "tanh", "relu", "exp", "log", "neg", "sqrt"];
+/// expressible in the fixed primitive vocabulary; `rsqrt` and the `*_grad`
+/// kinds close the §2.11 vocabulary gaps for the backward pass; see the op
+/// doc.
+pub(crate) const UNARY_KINDS: &[&str] = &[
+    "silu",
+    "gelu",
+    "sigmoid",
+    "tanh",
+    "relu",
+    "exp",
+    "log",
+    "neg",
+    "sqrt",
+    "rsqrt",
+    "silu_grad",
+    "gelu_grad",
+    "sigmoid_grad",
+    "tanh_grad",
+    "relu_grad",
+];
 
 fn unary_fn(op: &'static str, kind: &str) -> OpResult<fn(f32) -> f32> {
     Ok(match kind {
@@ -392,6 +410,50 @@ fn unary_fn(op: &'static str, kind: &str) -> OpResult<fn(f32) -> f32> {
         "log" => f32::ln,
         "neg" => |x: f32| -x,
         "sqrt" => f32::sqrt,
+        // 1/sqrt(x), written as the literal composition the doc promises
+        // (IEEE: rsqrt(0) = +inf, rsqrt of a negative is NaN). Not the
+        // separately-rounded rsqrt intrinsic, so the doc's "1/sqrt(x)" is
+        // exactly what runs.
+        "rsqrt" => |x: f32| 1.0 / x.sqrt(),
+        // silu(x) = x*σ(x) ⇒ silu' = σ(x)*(1 + x*(1 - σ(x))). σ comes from
+        // the same 1/(1+e^-x) as the forward silu, so a central finite
+        // difference of the forward op matches to rounding error.
+        "silu_grad" => |x: f32| {
+            let s = 1.0 / (1.0 + (-x).exp());
+            s * (1.0 + x * (1.0 - s))
+        },
+        // Derivative of the tanh-approximation gelu above (NOT the erf form):
+        // with c = s*(x + a*x^3), f = x/2*(1 + tanh c),
+        // f' = (1 + tanh c)/2 + x/2*(1 - tanh^2 c)*dc/dx. Same constants s
+        // and a as the forward, so the finite-difference check is exact by
+        // construction.
+        "gelu_grad" => |x: f32| {
+            let s = std::f32::consts::FRAC_2_PI.sqrt();
+            let c = s * (x + 0.044_715 * x.powi(3));
+            let t = c.tanh();
+            let dcdx = s * (1.0 + 3.0 * 0.044_715 * x * x);
+            0.5 * (1.0 + t) + 0.5 * x * (1.0 - t * t) * dcdx
+        },
+        // sigmoid' = σ(1-σ).
+        "sigmoid_grad" => |x: f32| {
+            let s = 1.0 / (1.0 + (-x).exp());
+            s * (1.0 - s)
+        },
+        // tanh' = 1 - tanh^2.
+        "tanh_grad" => |x: f32| {
+            let t = x.tanh();
+            1.0 - t * t
+        },
+        // Subgradient convention at x = 0 (the derivative is undefined
+        // there): 0. The strict '>' follows IEEE — NaN compares false, so
+        // relu_grad(NaN) = 0, matching relu(NaN) = 0 via f32::max.
+        "relu_grad" => |x: f32| {
+            if x > 0.0 {
+                1.0
+            } else {
+                0.0
+            }
+        },
         other => {
             return Err(err(
                 op,
@@ -433,7 +495,7 @@ fn unary_exec_body(c: &mut Call, a: &RsAttrs) -> OpResult<()> {
 
 // ── elementwise_binary ──────────────────────────────────────────────────────
 
-pub(crate) const BINARY_KINDS: &[&str] = &["add", "sub", "mul", "div", "maximum"];
+pub(crate) const BINARY_KINDS: &[&str] = &["add", "sub", "mul", "div", "maximum", "pow"];
 
 fn binary_fn(op: &'static str, kind: &str) -> OpResult<fn(f32, f32) -> f32> {
     Ok(match kind {
@@ -445,6 +507,10 @@ fn binary_fn(op: &'static str, kind: &str) -> OpResult<fn(f32, f32) -> f32> {
         // f32::max ignores NaN like IEEE maximumNumber; NaN inputs are
         // outside the reference provider's contract anyway.
         "maximum" => f32::max,
+        // IEEE powf: 0^0 = 1, a negative base with a fractional exponent is
+        // NaN. libm's powf is deterministic on the reference target (no
+        // fast-math variance to worry about).
+        "pow" => f32::powf,
         other => {
             return Err(err(
                 op,
@@ -529,6 +595,83 @@ fn binary_exec_body(c: &mut Call, a: &RsAttrs) -> OpResult<()> {
     Ok(())
 }
 
+// ── compare ─────────────────────────────────────────────────────────────────
+
+pub(crate) const COMPARE_KINDS: &[&str] = &["eq", "ne", "lt", "le", "gt", "ge"];
+
+/// The comparison as an f32 mask: exactly 1.0 where it holds, 0.0 elsewhere.
+/// NaN policy (documented in the op doc): any NaN operand yields 0.0 for
+/// every kind. For eq/lt/le/gt/ge that is IEEE itself (comparisons with NaN
+/// are false); 'ne' deliberately follows suit — C's `NaN != x` would be true,
+/// but a true result would smuggle a 1 into a mask through a NaN, so 'ne' is
+/// the logical negation of 'eq' instead.
+fn compare_fn(op: &'static str, kind: &str) -> OpResult<fn(f32, f32) -> f32> {
+    Ok(match kind {
+        "eq" => |a, b| (a == b) as u32 as f32,
+        "ne" => |a, b| (a != b && !a.is_nan() && !b.is_nan()) as u32 as f32,
+        "lt" => |a, b| (a < b) as u32 as f32,
+        "le" => |a, b| (a <= b) as u32 as f32,
+        "gt" => |a, b| (a > b) as u32 as f32,
+        "ge" => |a, b| (a >= b) as u32 as f32,
+        other => {
+            return Err(err(
+                op,
+                format!(
+                    "unknown kind '{other}' for compare; accepted values: {}",
+                    COMPARE_KINDS.join(", ")
+                ),
+            ));
+        }
+    })
+}
+
+/// Shared compare validation: both inputs must be f32 with identical shapes.
+fn compare_plan(x: &RsTensor, b: &RsTensor, op: &'static str) -> OpResult<()> {
+    check_f32_desc(x, op, "a")?;
+    check_f32_desc(b, op, "b")?;
+    if x.dims() != b.dims() {
+        return Err(fail!(
+            op,
+            "compare expects both inputs to have the same shape and dtype (f32), \
+             got a {:?} and b {:?}",
+            x.dims(),
+            b.dims()
+        ));
+    }
+    Ok(())
+}
+
+fn compare_infer_body(c: &mut Call, a: &RsAttrs) -> OpResult<()> {
+    c.expect_arity((2, 2))?;
+    c.expect_out_count(1)?;
+    let x = c.in_t(0);
+    require_str_of(a, "kind", COMPARE_KINDS, c.op)?;
+    compare_plan(x, c.in_t(1), c.op)?;
+    let o = c.out_t(0);
+    set_output_desc(o, rustrain_abi::ffi::RsDtype::F32, x.dims());
+    Ok(())
+}
+
+fn compare_exec_body(c: &mut Call, a: &RsAttrs) -> OpResult<()> {
+    c.expect_arity((2, 2))?;
+    c.expect_out_count(1)?;
+    let x = c.in_t(0);
+    let kind = require_str_of(a, "kind", COMPARE_KINDS, c.op)?;
+    let f = compare_fn(c.op, kind)?;
+    compare_plan(x, c.in_t(1), c.op)?;
+    expect_out(c.out_t(0), c.op, rustrain_abi::ffi::RsDtype::F32, x.dims())?;
+    // SAFETY: descriptor liveness is the ABI caller's contract.
+    let av = unsafe { crate::tensor::f32_in(c.op, "a", x) }?;
+    let bv = unsafe { crate::tensor::f32_in(c.op, "b", c.in_t(1)) }?;
+    let mut yv = unsafe { crate::tensor::f32_out(c.op, c.out_t(0)) }?;
+    // Equal shapes means the plain iterators stay paired in the same fixed
+    // logical order — no broadcast machinery, no allocation.
+    for ((o, &a), &b) in yv.iter_mut().zip(av.iter()).zip(bv.iter()) {
+        *o = f(a, b);
+    }
+    Ok(())
+}
+
 // ── reduce ──────────────────────────────────────────────────────────────────
 
 pub(crate) const REDUCE_KINDS: &[&str] = &["sum", "mean", "max", "amax"];
@@ -561,36 +704,58 @@ fn reduce_lane(op: &'static str, kind: &str, lane: ArrayView1<f32>) -> OpResult<
     })
 }
 
+/// Shared reduce output shape for infer and execute. With an 'axis', the
+/// reduced axis is removed — unless 'keepdim' (default false) keeps it as a
+/// size-1 dim, which the softmax/layernorm VJPs need. With no 'axis', the
+/// output is a rank-0 scalar, or all-ones when keepdim is set (torch
+/// convention). Pure and allocation-free.
+fn reduce_out_shape(x: &RsTensor, attrs: &RsAttrs, op: &'static str) -> OpResult<SmallShape> {
+    let keepdim = attr_bool(attrs, "keepdim").unwrap_or(false);
+    let rank = x.rank as usize;
+    match attr_i64(attrs, "axis") {
+        None => {
+            let mut s = SmallShape {
+                len: if keepdim { rank } else { 0 },
+                dims: [0; rustrain_abi::ffi::MAX_RANK],
+            };
+            if keepdim {
+                // Every dim survives as size 1.
+                s.dims[..rank].fill(1);
+            }
+            Ok(s)
+        }
+        Some(axis) => {
+            let ax = resolve_axis(axis, rank, op)?;
+            let mut s = SmallShape {
+                len: if keepdim { rank } else { rank - 1 },
+                dims: [0; rustrain_abi::ffi::MAX_RANK],
+            };
+            if keepdim {
+                s.dims[..rank].copy_from_slice(x.dims());
+                s.dims[ax] = 1;
+            } else {
+                let mut it = 0usize;
+                for d in 0..rank {
+                    if d != ax {
+                        s.dims[it] = x.shape[d];
+                        it += 1;
+                    }
+                }
+            }
+            Ok(s)
+        }
+    }
+}
+
 fn reduce_infer_body(c: &mut Call, a: &RsAttrs) -> OpResult<()> {
     c.expect_arity((1, 1))?;
     c.expect_out_count(1)?;
     let x = c.in_t(0);
     check_f32_desc(x, c.op, "x")?;
     require_str_of(a, "kind", REDUCE_KINDS, c.op)?;
+    let shape = reduce_out_shape(x, a, c.op)?;
     let o = c.out_t(0);
-    match attr_i64(a, "axis") {
-        None => {
-            // No axis: reduce everything into a rank-0 scalar.
-            set_output_desc(o, rustrain_abi::ffi::RsDtype::F32, &[]);
-        }
-        Some(axis) => {
-            let rank = x.rank as usize;
-            let ax = resolve_axis(axis, rank, c.op)?;
-            let mut shape = SmallShape {
-                len: rank - 1,
-                dims: [0; rustrain_abi::ffi::MAX_RANK],
-            };
-            let mut it = 0usize;
-            for d in 0..rank {
-                if d != ax {
-                    shape.dims[it] = x.shape[d];
-                    it += 1;
-                }
-            }
-            let o = c.out_t(0);
-            set_output_desc(o, rustrain_abi::ffi::RsDtype::F32, shape.as_slice());
-        }
-    }
+    set_output_desc(o, rustrain_abi::ffi::RsDtype::F32, shape.as_slice());
     Ok(())
 }
 
@@ -599,35 +764,16 @@ fn reduce_exec_body(c: &mut Call, a: &RsAttrs) -> OpResult<()> {
     c.expect_out_count(1)?;
     let x = c.in_t(0);
     let kind = require_str_of(a, "kind", REDUCE_KINDS, c.op)?;
-    let out_shape: SmallShape = match attr_i64(a, "axis") {
-        None => SmallShape {
-            len: 0,
-            dims: [0; rustrain_abi::ffi::MAX_RANK],
-        },
-        Some(axis) => {
-            let rank = x.rank as usize;
-            let ax = resolve_axis(axis, rank, c.op)?;
-            let mut s = SmallShape {
-                len: rank - 1,
-                dims: [0; rustrain_abi::ffi::MAX_RANK],
-            };
-            let mut it = 0usize;
-            for d in 0..rank {
-                if d != ax {
-                    s.dims[it] = x.shape[d];
-                    it += 1;
-                }
-            }
-            s
-        }
-    };
+    let out_shape = reduce_out_shape(x, a, c.op)?;
     expect_out(c.out_t(0), c.op, rustrain_abi::ffi::RsDtype::F32, out_shape.as_slice())?;
     // SAFETY: descriptor liveness is the ABI caller's contract.
     let xv = unsafe { crate::tensor::f32_in(c.op, "x", x) }?;
     let mut yv = unsafe { crate::tensor::f32_out(c.op, c.out_t(0)) }?;
     match attr_i64(a, "axis") {
         None => {
-            // Reduce-all: iterate the whole buffer in order.
+            // Reduce-all: iterate the whole buffer in order. Works for both
+            // the rank-0 scalar shape and the all-ones keepdim shape (both
+            // hold exactly one element).
             let flat = xv.as_slice().ok_or_else(|| {
                 err(c.op, "input is not contiguous in memory (unexpected)")
             })?;
@@ -640,8 +786,9 @@ fn reduce_exec_body(c: &mut Call, a: &RsAttrs) -> OpResult<()> {
         Some(axis) => {
             let ax = Axis(resolve_axis(axis, x.rank as usize, c.op)?);
             // Lanes over the reduced axis come out in exactly the order of
-            // y's elements (y is x with that axis removed), so a positional
-            // zip is the pairing — and it fixes the iteration order.
+            // y's elements (y is x with that axis removed, or kept as size 1
+            // under keepdim), so a positional zip is the pairing — and it
+            // fixes the iteration order.
             for (lane, o) in xv.lanes(ax).into_iter().zip(yv.iter_mut()) {
                 *o = reduce_lane(c.op, kind, lane)?;
             }
@@ -968,6 +1115,8 @@ infer_entry!(unary_infer, "elementwise_unary", unary_infer_body);
 exec_entry!(unary_exec, "elementwise_unary", unary_exec_body);
 infer_entry!(binary_infer, "elementwise_binary", binary_infer_body);
 exec_entry!(binary_exec, "elementwise_binary", binary_exec_body);
+infer_entry!(compare_infer, "compare", compare_infer_body);
+exec_entry!(compare_exec, "compare", compare_exec_body);
 infer_entry!(reduce_infer, "reduce", reduce_infer_body);
 exec_entry!(reduce_exec, "reduce", reduce_exec_body);
 infer_entry!(softmax_infer, "softmax", softmax_infer_body);

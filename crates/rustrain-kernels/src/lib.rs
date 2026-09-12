@@ -50,9 +50,10 @@ use crate::op::composite::{
     sdpa_exec, sdpa_expansion, sdpa_infer, sdpa_memory, topk_exec, topk_expansion, topk_infer,
 };
 use crate::op::compute::{
-    binary_exec, binary_infer, bmm_exec, bmm_infer, layernorm_exec, layernorm_infer,
-    linear_exec, linear_infer, matmul_exec, matmul_infer, reduce_exec, reduce_infer, rmsnorm_exec,
-    rmsnorm_infer, rope_exec, rope_infer, softmax_exec, softmax_infer, unary_exec, unary_infer,
+    binary_exec, binary_infer, bmm_exec, bmm_infer, compare_exec, compare_infer, layernorm_exec,
+    layernorm_infer, linear_exec, linear_infer, matmul_exec, matmul_infer, reduce_exec,
+    reduce_infer, rmsnorm_exec, rmsnorm_infer, rope_exec, rope_infer, softmax_exec, softmax_infer,
+    unary_exec, unary_infer,
 };
 use crate::op::meta::{
     broadcast_exec, broadcast_infer, cat_exec, cat_infer, narrow_exec, narrow_infer, reshape_exec,
@@ -121,11 +122,13 @@ const LINEAR_DOC: &str = "y = x @ w (+ b). Conventions: w is [K, N] (output feat
 
 const BMM_DOC: &str = "Batched matmul: [L..., M, K] x [L..., K, N] -> [L..., M, N]. Optional 'transpose_b' (bool, default false) computes A @ B^T with B as [L..., N, K]. Batch dims must be identical (no batch broadcasting). Per-batch naive triple loop with k ascending (deterministic).";
 
-const UNARY_DOC: &str = "Applies the 'kind' attribute (required string) elementwise: silu, gelu, sigmoid, tanh, relu, exp, log, neg, sqrt. Choices: gelu uses the tanh approximation (the vocabulary has no erf); log is natural. 'neg' and 'sqrt' extend the core list because the declared expansions of cross_entropy and adamw must be expressible in the fixed vocabulary. An unknown kind is a hard error naming the accepted values.";
+const UNARY_DOC: &str = "Applies the 'kind' attribute (required string) elementwise: silu, gelu, sigmoid, tanh, relu, exp, log, neg, sqrt, rsqrt, silu_grad, gelu_grad, sigmoid_grad, tanh_grad, relu_grad. Choices: gelu uses the tanh approximation (the vocabulary has no erf); log is natural; rsqrt = 1/sqrt(x) (rsqrt(0) = +inf, rsqrt of a negative is NaN per IEEE). The *_grad kinds compute f'(x) at x, same shape, so a VJP is written as elementwise_binary(mul, f_grad(x), dy) — composable, no new ops. gelu_grad is the derivative of the tanh-approximation gelu above, not of the erf form. relu_grad is the subgradient convention 0 at x = 0 (the strict '>' follows IEEE, so relu_grad(NaN) = 0). 'neg' and 'sqrt' extend the core list because the declared expansions of cross_entropy and adamw must be expressible in the fixed vocabulary. An unknown kind is a hard error naming the accepted values.";
 
-const BINARY_DOC: &str = "Applies the 'kind' attribute (required: add, sub, mul, div, maximum) with right-aligned broadcasting. One input is allowed when the scalar attribute 'rhs' (f64) is given (y = x op rhs) — the adamw expansion uses that form. div follows IEEE (x/0 -> +/-inf); maximum uses f32::max, which ignores NaN (NaN inputs are outside the contract).";
+const BINARY_DOC: &str = "Applies the 'kind' attribute (required: add, sub, mul, div, maximum, pow) with right-aligned broadcasting. One input is allowed when the scalar attribute 'rhs' (f64) is given (y = x op rhs) — the adamw expansion uses that form. div follows IEEE (x/0 -> +/-inf); pow follows IEEE powf (0^0 = 1, a negative base with a fractional exponent is NaN); maximum uses f32::max, which ignores NaN (NaN inputs are outside the contract).";
 
-const REDUCE_DOC: &str = "Reduces along 'axis' with 'kind' (required: sum, mean, max, amax; amax = max|x|). With no 'axis', reduces everything to a rank-0 scalar. The reduced axis is removed (no keepdim). Negative axes count from the end. All accumulations run in ascending index order (deterministic).";
+const COMPARE_DOC: &str = "Elementwise comparison — the vocabulary's mask primitive: two equal-shape f32 inputs to one f32 output with exactly 1.0 where the comparison holds and 0.0 elsewhere. 'kind' (required: eq, ne, lt, le, gt, ge). NaN policy: every comparison involving NaN yields 0.0 — IEEE ordered comparisons are false with NaN, and 'ne' deliberately follows suit (C's NaN != x would be true) so a NaN never smuggles a 1 into a mask. The mask is f32 by design: the ABI has no boolean dtype, so masking composes as elementwise_binary(mul, x, compare(...)). Both inputs must have the same shape and dtype; a mismatch is a hard error naming both.";
+
+const REDUCE_DOC: &str = "Reduces along 'axis' with 'kind' (required: sum, mean, max, amax; amax = max|x|). With no 'axis', reduces everything to a rank-0 scalar. The reduced axis is removed by default; 'keepdim' (bool, default false) keeps it as a size-1 dim — the softmax/layernorm VJPs need the rank preserved. With no 'axis', keepdim = true makes every dim size 1 (torch convention). Negative axes count from the end. All accumulations run in ascending index order (deterministic).";
 
 const SOFTMAX_DOC: &str = "Stable softmax over 'axis' (i64, default -1) of x*scale, 'scale' (f64) defaulting to 1.0; shape is preserved. Per-lane max subtraction keeps large-magnitude inputs finite; sums accumulate in ascending order.";
 
@@ -145,7 +148,7 @@ const EMBEDDING_DOC: &str = "out = w[indices]: weight w [V, D] (f32), indices i3
 
 const GATHER_DOC: &str = "Torch-gather convention: indices (i32/i64) have the same rank as x, dims equal to x's except along 'axis' (i64, default -1), and the output has the indices' shape: out[i] = x[i with axis value indices[i]]. Negative indices are rejected (no wrap-around).";
 
-const SCATTER_DOC: &str = "Copy of x, then out[..., indices[k], ...] = values[..., k, ...] along 'axis' (default -1), k ascending. values has x's shape with the axis dim equal to K. Duplicate indices: the last writer (largest k) wins — deterministic and documented.";
+const SCATTER_DOC: &str = "Copy of x, then out[..., indices[k], ...] = values[..., k, ...] along 'axis' (default -1), k ascending. values has x's shape with the axis dim equal to K. 'reduce' ('assign' | 'add', default 'assign'): assign is the existing semantics — duplicate indices: the last writer (largest k) wins; add accumulates duplicates instead, and because accumulation runs in the fixed ascending-k order, two runs are bitwise identical. Deterministic and documented either way.";
 
 const SDPA_DOC: &str = "Scaled-dot-product attention: o = softmax(q @ k^T * scale) @ v, with q [.., S, D], k [.., T, D], v [.., T, Dv] and identical batch dims. 'scale' (f64) defaults to 1.0 — the caller passes 1/sqrt(D) explicitly, because the declared expansion's softmax node uses the same default and a reference backend must keep fused == expansion. No causal mask: the primitive vocabulary has no mask operator. Expansion: bmm(q, k, transpose_b=true) -> softmax -> bmm(p, v).";
 
@@ -244,6 +247,14 @@ fn build_plugin() -> &'static RsPlugin {
             RsBackwardKind::AUTODIFF,
             binary_infer,
             binary_exec,
+        ))
+        .op(spec(
+            "compare",
+            COMPARE_DOC,
+            F32,
+            RsBackwardKind::AUTODIFF,
+            compare_infer,
+            compare_exec,
         ))
         .op(spec(
             "reduce",

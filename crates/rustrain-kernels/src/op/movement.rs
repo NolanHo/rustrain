@@ -8,11 +8,13 @@
 //! * `gather` reads rank-1 indices `[K]` and replaces the `axis` dim (default
 //!   `-1`, the last) of the input with `K`.
 //! * `scatter` copies the input and then writes, in ascending `k` order, so
-//!   on duplicate indices the **last writer wins**, deterministically.
+//!   with the default `reduce = "assign"` on duplicate indices the **last
+//!   writer wins**, deterministically; `reduce = "add"` accumulates
+//!   duplicates in the same fixed order instead.
 
 use rustrain_abi::ffi::{MAX_RANK, RsAttrs, RsDtype, RsTensor};
 
-use crate::attrs::attr_i64;
+use crate::attrs::{attr_i64, attr_str, require_str_of};
 use crate::dispatch::{Call, run};
 use crate::error::{OpResult, err, fail};
 use crate::tensor::{SmallShape, expect_out, resolve_axis, set_output_desc};
@@ -251,9 +253,24 @@ fn gather_exec_body(c: &mut Call, a: &RsAttrs) -> OpResult<()> {
 
 // ── scatter ─────────────────────────────────────────────────────────────────
 
+/// Accepted `reduce` values: `assign` (default — the existing last-writer-
+/// wins semantics) or `add` (duplicates accumulate in fixed ascending-k
+/// order, so two runs are bitwise identical).
+const SCATTER_REDUCES: &[&str] = &["assign", "add"];
+
+/// Resolves the 'reduce' attribute to a validated mode string: absent means
+/// `assign`. An unknown value is a hard error naming the accepted values.
+fn scatter_mode<'a>(a: &'a RsAttrs, op: &'static str) -> OpResult<&'a str> {
+    match attr_str(a, "reduce") {
+        None => Ok("assign"),
+        Some(_) => require_str_of(a, "reduce", SCATTER_REDUCES, op),
+    }
+}
+
 fn scatter_infer_body(c: &mut Call, a: &RsAttrs) -> OpResult<()> {
     c.expect_arity((3, 3))?;
     c.expect_out_count(1)?;
+    scatter_mode(a, c.op)?;
     let x = c.in_t(0);
     let idx = c.in_t(1);
     let values = c.in_t(2);
@@ -297,6 +314,7 @@ fn scatter_infer_body(c: &mut Call, a: &RsAttrs) -> OpResult<()> {
 fn scatter_exec_body(c: &mut Call, a: &RsAttrs) -> OpResult<()> {
     c.expect_arity((3, 3))?;
     c.expect_out_count(1)?;
+    let mode = scatter_mode(a, c.op)?;
     let x = c.in_t(0);
     let idx = c.in_t(1);
     let values = c.in_t(2);
@@ -333,8 +351,10 @@ fn scatter_exec_body(c: &mut Call, a: &RsAttrs) -> OpResult<()> {
     let ids = unsafe { crate::tensor::indices_i64(c.op, "indices", idx) }?;
     let vv = unsafe { crate::tensor::f32_in(c.op, "values", values) }?;
     let mut yv = unsafe { crate::tensor::f32_out(c.op, c.out_t(0)) }?;
-    // y starts as a copy of x, then k ascends: on duplicate indices the last
-    // writer (largest k) wins — deterministic and documented.
+    // y starts as a copy of x, then k ascends (both modes). assign: on
+    // duplicate indices the last writer (largest k) wins. add: duplicates
+    // accumulate instead, still in the fixed ascending-k order of this loop,
+    // which is what makes two runs bitwise identical.
     for (o, &v) in yv.iter_mut().zip(xv.iter()) {
         *o = v;
     }
@@ -363,7 +383,15 @@ fn scatter_exec_body(c: &mut Call, a: &RsAttrs) -> OpResult<()> {
             }
             let src = (oi * ids.len() + kk) * inner;
             let dst = (oi * dim_size as usize + id as usize) * inner;
-            ys[dst..dst + inner].copy_from_slice(&vs[src..src + inner]);
+            if mode == "add" {
+                // Accumulate in the fixed ascending-k order of this loop;
+                // f32 adds in a fixed order are bitwise reproducible.
+                for i in 0..inner {
+                    ys[dst + i] += vs[src + i];
+                }
+            } else {
+                ys[dst..dst + inner].copy_from_slice(&vs[src..src + inner]);
+            }
         }
     }
     Ok(())
