@@ -2,8 +2,8 @@
 
 ## 核心原则：编排是第一公民，算子是插件
 
-rustrain 是一个训练框架，不是 kernel 库。差异化价值在**并行策略、通信调度、显存与精度编排**，
-不在手写 GEMM——那些交给 cuBLAS / CUTLASS / FlashAttention / Tilelang。
+rustrain 是训练框架，不是 kernel 库。差异化价值在**并行策略、通信调度、显存与精度编排**，
+不在手写 GEMM —— 那些交给 cuBLAS / CUTLASS / FlashAttention / Tilelang。
 
 框架不认识任何模型，也不认识任何具体 kernel。它只做三件事：
 
@@ -13,80 +13,67 @@ rustrain 是一个训练框架，不是 kernel 库。差异化价值在**并行�
 
 模型是数据。算子是插件。精度是配置。
 
-设计契约见 `docs/design/kernel-first/spec.md`。
+## 开工前先读
+
+| 文件 | 内容 |
+|---|---|
+| **`skills/architecture/SKILL.md`** | **架构操作规则：边界契约、不变式、三类变更的 checklist、验证门禁、禁止模式。改动 crate 边界 / ABI / plan IR / 算子注册 / 切分 / 显存策略之前必须读。** |
+| `docs/architecture.md` | 架构是什么：边界契约、计算路径、加载路径、crate 职责与依赖、缺口、待定决定 |
+| `docs/design/kernel-first/spec.md` | 这次重构的变更规格与交付物验收 |
+
+**规则只有一份，在 skill 里。** 这份文件不重复它 —— 两份不变式一定会漂移，而这个代码库的架构
+存在的理由就是消灭"同一个事实有两个来源"。
 
 ## 分层与依赖方向
 
 ```
-rustrain-cli        train | ops | plan
-rustrain-runtime    执行器 / 显存池 / 流与 collective 调度
-rustrain-plan       Plan IR / 切分传播 / 校验 / 编译 / digest
-rustrain-parallel   进程组 / rank 布局 / 切分规格 / 通信规划
-rustrain-ops        算子描述 / 注册表 / requires / numerics / expansion / recipe
-rustrain-abi        插件 ABI v1 / 装载
-──────────────────────────────────────────────────────
-plugins (.so)       aten / reference / 第三方高性能 kernel
+rustrain-cli        train | ops | plan          （组合根）
+rustrain-runtime    执行器 / 显存池 / collective 后端 / 一致性门禁
+rustrain-plan       Plan IR / 切分校验与通信插入 / 显存规划 / 编译 / digest
+rustrain-parallel   进程组 / rank 布局 / 切分规格与转换规则
+rustrain-ops        算子字典 / 注册表 / recipe 解析
+rustrain-abi        插件 ABI v1 / 装载 / 作者辅助
+──────────────────────────────────────────────────────────
+plugins (.so)       reference（语义真值） / aten / 第三方高性能 kernel
 ```
 
-### 不变式（违反即架构破坏）
-
-- **I-1**：`rustrain-{abi,ops,parallel,plan,runtime}` 的依赖闭包中不得出现 `tch`、`libtorch`、`cuda`。
-  这是"换 kernel 不重编框架"的全部依据，也是核心能在无 GPU 机器上跑完整测试的前提。
-- **I-2**：算子实现只能通过 ABI 注册，不能被框架静态引用。`rustrain-kernels` 是**一个插件**，不是框架的一部分。
-- **I-3**：并行切分是 plan 里的数据（`ParallelLayout`），不是手写在训练循环里的通信调用。
-  布局不匹配处的 `all_reduce`/`all_gather`/`reduce_scatter` 由传播 pass 插入。
-
-## 禁止的模式
+实际依赖图（`cargo tree` 实测，非声明）：
 
 ```
-❌ 用环境变量选择算子实现        → 写进 recipe（配置来自文件）
-❌ 静默 fallback 到另一个实现    → 显式声明 fallback 列表，解析不到就报错
-❌ 在 C++/kernel 里硬编码量化方案 → 量化格式/粒度/block/scale 模式由 rs_numerics 声明
-❌ 从张量形状反推量化方案        → 同上；形状碰巧对不代表方案对
-❌ 直接在框架里 unsafe 调某个 kernel → 通过 ABI 注册 + 注册表解析
-❌ 融合算子不声明原语展开        → expansion 是等价性验收的唯一依据
-❌ 算子内自己 malloc/建 stream/建 NCCL comm → 通过 rs_services 向框架申请
+parallel  abi                       ← 无内部依赖
+   │       │
+   │       ├── ops ──┬── plan ── runtime
+   │       │         │     ▲        ▲
+   │       └─────────┴─────┴────────┘
+   │       └── kernels（插件，不是框架的一部分）
+   └────────────── cli（组合根）
 ```
 
-## 如何新增一个算子实现
+## 一条最重要的判据
 
-1. 新建插件 crate，`extern "C"` 导出**唯一**符号 `rustrain_plugin_v1`（见 `crates/rustrain-abi/include/rustrain_op.h`）。
-2. 填写 `rs_op_desc`：`requires`（dtype/SM/world_size/group）、`numerics`、`memory`、
-   `backward` 模式、`collectives`；若是融合算子，必须填 `expansion`。
-3. 跑 `rustrain ops check`：数值 / 展开等价 / 梯度 / 确定性四项全过，才允许被 plan 选中。
+**T1 / T2 自由，T3 重编框架。** 换实现体、换声明契约 = 丢一个 `.so`；出现框架没见过的
+**数学形态** = 重编。所以：
 
-**不需要改框架任何一行代码，也不需要重编译框架。**
+- 随实现变化 → **插件**
+- 描述契约 → **描述符里的数据**
+- 框架必须自己判断 → **框架代码**（新增一种"判断"就是 T3，应罕见且应被注意到）
 
-## 如何切换算子 / 精度 / 量化
-
-改 recipe：
-
-```toml
-[kernel.ops.mlp_swiglu]
-forward  = "cuda.fp8_block128"
-backward = "autodiff"
-
-[kernel.precision]
-compute      = "bf16"
-accumulate   = "fp32"
-weights      = "fp8_e4m3"
-quant_scheme = "per_block"
-block        = [128, 128]
-```
-
-前向与反向精度独立可选。改动会反映在 plan digest 与 run manifest 里。
+推论：**规则不得按算子名查框架侧的表**。`match op { "linear" => ... }` 会把 T2 泄漏成 T3。
+细节与 checklist 见 skill。
 
 ## GOTCHAS
 
 - **QKV split layout**：Qwen3.5/3.6 `in_proj_qkv` 输出 **flat** 布局 `[Q_all | K_all | V_all]`，
   不是 per-head 交错。用 `split(qkv, [q_size, k_size, v_size])` / `narrow(-1, offset, size)`。
+- **执行器必须采纳算子返回的指针与 strides**：view 算子（`transpose`/`narrow`/`reshape`/`broadcast`）
+  会把 `out.data` 指回输入，`broadcast` 更会给出 stride=0。按"形状 × 宽度"线性读会读到缓冲区外，
+  而且**前几个元素恰好正确** —— 一致性门禁第一次运行抓到的就是这个。
 - **`emptyCache()` 是隐式同步**：`CUDACachingAllocator::emptyCache()` 内部 `cudaDeviceSynchronize()`。
   不得出现在训练循环里，只在 seq>4096 时调用。
-- **CXX11 ABI**：插件与宿主必须用同一个 `_GLIBCXX_USE_CXX11_ABI` 和同一个 libtorch 构建，
-  否则跨界传 `at::Tensor*` 会静默出错。
-- **GLIBC**：编译机与运行机的 GLIBC 版本必须匹配（2.39 编译的二进制在 2.35 上跑不起来）。
+- **CXX11 ABI**：插件与宿主必须用同一个 `_GLIBCXX_USE_CXX11_ABI` 和同一个 libtorch 构建。
+- **GLIBC**：编译机与运行机版本必须匹配（2.39 编译的二进制在 2.35 上跑不起来）。
 
-## 知识文件
+## 验证宿主
 
-- `docs/design/kernel-first/spec.md` — 架构契约、交付物、验收标准
-- `docs/agent/linear-attention.md` — 线性注意力结构、QKV 布局、delta rule（重启前遗留，仍然准确）
+`root@47.94.214.197:26002`（8× L20X，CUDA 13，torch 2.11，Rust 1.98.1）。
+本机无 GPU / 无 torch，是编辑与编译盒。门禁命令见 skill §6。
