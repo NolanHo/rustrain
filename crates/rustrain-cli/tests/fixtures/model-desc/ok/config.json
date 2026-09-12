@@ -1,0 +1,8 @@
+{
+  "model_type": "tiny_text",
+  "text_config": {
+    "hidden_size": 16,
+    "num_hidden_layers": 3,
+    "max_position_embeddings": 8
+  }
+}

@@ -1,0 +1,68 @@
+{
+  "format": "rustrain.model.v1",
+  "name": "tiny-text",
+  "dtype": "f32",
+  "inputs": {
+    "hidden_in": { "shape": ["seq", "hidden"], "kind": "input" }
+  },
+  "params": {
+    "seq": { "from": "text_config.max_position_embeddings", "default": 8 },
+    "hidden": { "from": "text_config.hidden_size" },
+    "inter": { "expr": "2 * hidden" },
+    "layers": { "from": "text_config.num_hidden_layers" }
+  },
+  "templates": {
+    "norm": {
+      "inputs": { "x": { "shape": ["seq", "hidden"], "kind": "activation" } },
+      "outputs": { "y": { "shape": ["seq", "hidden"], "kind": "activation" } },
+      "slots": [
+        { "name": "w", "kind": "weight", "shape": ["hidden"] }
+      ],
+      "nodes": [
+        { "op": "rmsnorm", "in": ["x", "w"], "out": ["y"] }
+      ]
+    },
+    "decoder": {
+      "inputs": { "x": { "shape": ["seq", "hidden"], "kind": "activation" } },
+      "outputs": { "y": { "shape": ["seq", "hidden"], "kind": "activation" } },
+      "slots": [
+        { "name": "attn_norm", "kind": "weight", "shape": ["hidden"] },
+        { "name": "qkv", "kind": "weight", "shape": ["hidden", "hidden"] },
+        { "name": "wo", "kind": "weight", "shape": ["hidden", "hidden"] },
+        { "name": "mlp_norm", "kind": "weight", "shape": ["hidden"] },
+        { "name": "wg", "kind": "weight", "shape": ["hidden", "inter"] },
+        { "name": "wu", "kind": "weight", "shape": ["hidden", "inter"] },
+        { "name": "wd", "kind": "weight", "shape": ["inter", "hidden"] }
+      ],
+      "nodes": [
+        { "op": "rmsnorm", "in": ["x", "attn_norm"], "out": ["h1"] },
+        { "op": "linear", "in": ["h1", "qkv"], "out": ["q"] },
+        { "op": "elementwise_unary", "in": ["q"], "out": ["qa"], "attrs": { "kind": "silu" } },
+        { "op": "linear", "in": ["qa", "wo"], "out": ["attn"] },
+        { "op": "elementwise_binary", "in": ["h1", "attn"], "out": ["h2"], "attrs": { "kind": "mul" } },
+        { "op": "rmsnorm", "in": ["h2", "mlp_norm"], "out": ["h3"] },
+        { "op": "linear", "in": ["h3", "wg"], "out": ["g"] },
+        { "op": "elementwise_unary", "in": ["g"], "out": ["gs"], "attrs": { "kind": "silu" } },
+        { "op": "linear", "in": ["h3", "wu"], "out": ["u"] },
+        { "op": "elementwise_binary", "in": ["gs", "u"], "out": ["gu"], "attrs": { "kind": "mul" } },
+        { "op": "linear", "in": ["gu", "wd"], "out": ["y"] }
+      ]
+    }
+  },
+  "stack": [
+    { "template": "norm", "prefix": "norm_in", "inputs": { "x": "hidden_in" } },
+    { "template": "decoder", "prefix": "layers.{l}", "repeat": { "count": "layers", "index": "l" } },
+    { "template": "norm", "prefix": "norm_out" }
+  ],
+  "binding": [
+    { "slot": "norm_in.w", "source": "model.norm_in.weight" },
+    { "slot": "norm_out.w", "source": "model.norm.weight" },
+    { "slot": "layers.*.attn_norm", "source": "model.layers.{*}.attn_norm.weight" },
+    { "slot": "layers.*.qkv", "source": "model.layers.{*}.qkv.weight" },
+    { "slot": "layers.*.wo", "source": "model.layers.{*}.wo.weight" },
+    { "slot": "layers.*.mlp_norm", "source": "model.layers.{*}.mlp_norm.weight" },
+    { "slot": "layers.*.wg", "source": "model.layers.{*}.wg.weight" },
+    { "slot": "layers.*.wu", "source": "model.layers.{*}.wu.weight" },
+    { "slot": "layers.*.wd", "source": "model.layers.{*}.wd.weight" }
+  ]
+}

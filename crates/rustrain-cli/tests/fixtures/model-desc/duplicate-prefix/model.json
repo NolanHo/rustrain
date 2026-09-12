@@ -1,0 +1,35 @@
+{
+  "format": "rustrain.model.v1",
+  "name": "tiny-text-duplicate-prefix",
+  "dtype": "f32",
+  "inputs": {
+    "hidden_in": { "shape": ["seq", "hidden"], "kind": "input" }
+  },
+  "params": {
+    "seq": { "from": "text_config.max_position_embeddings", "default": 8 },
+    "hidden": { "from": "text_config.hidden_size" }
+  },
+  "templates": {
+    "norm": {
+      "inputs": { "x": { "shape": ["seq", "hidden"], "kind": "activation" } },
+      "outputs": { "y": { "shape": ["seq", "hidden"], "kind": "activation" } },
+      "slots": [
+        { "name": "w", "kind": "weight", "shape": ["hidden"] }
+      ],
+      "nodes": [
+        { "op": "rmsnorm", "in": ["x", "w"], "out": ["y"] }
+      ]
+    }
+  },
+  "stack": [
+    { "template": "norm", "prefix": "norm_in", "inputs": { "x": "hidden_in" } },
+    { "template": "norm", "prefix": "twin" },
+    { "template": "norm", "prefix": "twin" },
+    { "template": "norm", "prefix": "norm_out" }
+  ],
+  "binding": [
+    { "slot": "norm_in.w", "source": "model.norm_in.weight" },
+    { "slot": "twin.w", "source": "model.twin.weight" },
+    { "slot": "norm_out.w", "source": "model.norm.weight" }
+  ]
+}
