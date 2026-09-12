@@ -218,6 +218,36 @@ EP 用形状算术表达不了：rank 0 有 expert 0–3、rank 1 有 4–7，"�
 对 EP/PP 放弃"一个 plan 跑所有度数"，改成更弱但够用的性质：**同一份模型描述 + 不同切分参数 →
 各实例化一个 plan，且实例化可在无 GPU 机器上完成**（接 §5）。
 
+### 4.6 外部先例，以及它修正的一处（实测）
+
+读到代码的事实（证据为 file:line，取自 `/data/user/nolanho/code/Megatron-LM`）：
+
+- **层结构基本是代码。** 槽位名是类的字段；`ModuleSpec` 持有的是 Python **类对象**，`build_module` 直接实例化它
+  （`spec_utils.py:13-41, 99-122`）。数据只覆盖两件事："哪一层用哪套参数"
+  （`heterogeneous_config.py:157-179` 的 `block_configs` + `heterogeneous_layer_specs.py:196-215`）与
+  "哪一层在第几个 stage"（`pipeline_model_parallel_layout` 字符串 DSL `'Et*3|(tt|)*29,m|L'`，
+  `transformer_config.py:108-128`，解析在 `pipeline_parallel_layer_layout.py:283-321`）。
+  **子模块顺序与残差接线永远是代码**（`transformer_layer.py:362-460`、`860-868`）—— 两种数据路径都表达不了
+  "换一种子模块顺序"或"换一条连接"。
+- **checkpoint → 参数**：名字字符串 + 每个类自己的 `sharded_state_dict()` + 前缀重命名表
+  （`gpt_layer_specs.py:484-487` 的 `sharded_state_dict_keys_map`，应用在 `transformer_layer.py:1168-1173`）。
+  没有全局表。
+- **切分轴是类里的字面 dict**：`ColumnParallelLinear` → `{"weight": 0, "bias": 0}`
+  （`tensor_parallel/layers.py:1116-1126`），`RowParallelLinear` → `{"weight": 1}`（`:1379-1389`）。
+
+**它修正的一处**：Megatron 的切分轴出现在 `sharded_state_dict()` 里，也就是**加载侧**。
+这说明**"切分轴"和"从 checkpoint 取哪一块"是同一条事实**——Megatron 把它存在类里（代码），
+我们错在把它存在 `rule_for(op: &str)` 里（也是代码，而且是按名字猜）。正确位置是**参数/slot 的描述符**：
+一份声明同时被 L2 的名字映射和形状算术读取。这比"把 `rule_for` 改成描述符"更准确。
+
+**风险**：最数据驱动的生产系统也只做到"每块用哪些参数"，没有做到"图怎么连"——也就是**没有现成格式可抄**
+（是否存在反例由 Q5 核实中）。模型描述的 schema 是我们自己设计的，它错了不会编译报错，只能靠 L1/L2 与参考实现对账。
+
+**反过来看，这个风险比表面小**：Megatron 的数据路径停在图的入口，是因为它**根本没有显式的图** —— 图隐含在
+类的层次里，没有东西可以序列化，所以它只能把"选择"做成数据、把"连接"留给代码。rustrain 的图产物
+（`Plan{slots,nodes}`）本来就是一等公民，因此"模型即数据"不是外加特性，而是"如何生成这个 Plan"的直接推广：
+**模型描述 = 参数 + 带重复的子图模板 + checkpoint 名字映射**，schema 由我们自己的 IR 决定，不依赖任何外部格式。
+
 ---
 
 ## 5. 无 GPU check 阶梯（提案）
@@ -227,7 +257,7 @@ EP 用形状算术表达不了：rank 0 有 expert 0–3、rank 1 有 4–7，"�
 | 级 | 需要什么 | 查什么 | 现状 |
 |---|---|---|---|
 | **L1 结构** | 无（零设备、零权重） | plan 可编译；每个节点的算子可解析到实现；每个算子的 `infer()` 与声明形状一致；layout 传播完成、每个 `Partial` 都被兑现、每个 collective 都绑了轴；内存规划无重叠且不超预算 | 能力已具备（`validate_shapes`），**缺驱动**：今天跑的是 CLI 里手写的 demo plan（`plan explain --tp N`），不是"指定 model 路径" |
-| **L2 加载** | checkpoint 的 **metadata**，不读数据 | 每个 slot 都能从某个 checkpoint tensor 得到（名字 + 变换：slice / transpose / qkv split）；每个 checkpoint tensor 要么被消费、要么显式声明忽略；dtype / shape / 切片范围一致 | **缺失**。safetensors 头部即 JSON（名字 / dtype / shape / offset），读它不需要读权重数据 |
+| **L2 加载** | checkpoint 的 **metadata**，不读数据 | 每个 slot 都能从某个 checkpoint tensor 得到（名字 + 变换：slice / transpose / qkv split）；每个 checkpoint tensor 要么被消费、要么显式声明忽略；dtype / shape / 切片范围一致 | **缺失**。safetensors 头部即 JSON（名字 / dtype / shape / offset），读它不需要读权重数据。实测：4 GB / 1386 tensor 的 checkpoint，头部 198 KB —— 开销可忽略。真实 checkpoint 命名很脏（`base_model.model.model.layers.0.mlp.down_proj.lora_A.weight`），所以映射必须是 pattern/前缀表，且 L2 要能报告"没被消费的 tensor" |
 | **L3 数值** | 设备（或 CPU 参考实现） | 同一算子的两个实现算同一件事 + 数值参考 | 已有（conformance gate） |
 
 CLI 形状：
