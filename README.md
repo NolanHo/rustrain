@@ -49,7 +49,8 @@ cargo run -q -p rustrain-cli -- plan explain --tp 2   # 一个 plan 编译成了
 ## 下一步
 
 **模型描述格式**（`docs/architecture.md` §1.2 与 §8 D8）：结构是数据（子图模板 + 重复），插件只提供原语。
-判据是它能把旧代码里 Qwen3.5/3.6 与 GLM-5.2 硬编码的结构完整表达成数据。
+**第一个验证样本：`Qwen/Qwen3.6-35B-A3B`** —— 先用它把架构走通、看会不会出问题；通过了再加其他模型。
+模型事实（config、1045 个张量的命名与真实形状、TP 可整除性约束）在 `docs/design/qwen36-5d-example.md`。
 
 ## 验证宿主
 

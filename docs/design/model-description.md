@@ -135,9 +135,10 @@ local[d] = global[d] / Π { degree(轴) : 轴 ∈ spec.group, spec ∈ dims, nor
 | `{"expr": "2 * heads * head_dim"}` | 参数表达式：整数、参数名、`+ - * / ( )` |
 | `["full_attention", "linear_attention", ...]` | 列表值（逐层类型） |
 
-**不做"标量 → 结构"的隐藏推导。** 例如 Qwen 的 `full_attention_interval: 4`（旧代码解析了却不读，
-`config.rs:145-146`）与 GLM5 的 indexer 取模回退（`glm5/model.rs:342-343`）：这类派生由**生成器**算成
-显式列表写进描述，描述语言本身只需要**按下标取列表**。理由：少自动推导；列表可见、可审、可 diff。
+**不做"标量 → 结构"的隐藏推导。** 目标模型的层类型在 checkpoint 里就是**显式列表**
+（`layer_types`，40 项），描述按 `list[i]` 取值即可。框架不提供"间隔/取模"这类派生语法 ——
+一旦需要，由**生成器**算成显式列表写进描述。理由：少自动推导；列表可见、可审、可 diff。
+（旧代码里 `full_attention_interval` 解析了却不读，`config.rs:145-146`，也是"标量派生不可信"的实物。）
 
 ### 3.2 `templates` —— 具名子图，只管数学与连接
 

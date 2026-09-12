@@ -88,8 +88,9 @@ kernel 做对照**，对研究比编译期检查更有价值。
 | 实例化 | 重复与逐层覆盖；必须同时容纳"纯列表"与"列表 + 派生回退"两种形式（§5.2） |
 | 参数映射 | slot ↔ checkpoint 名字 + 变换 + **切分轴**（§1.4），直接喂 L2 |
 
-**判据**：描述格式完成的标志是它能**把 `rustrain-qwen3-6` 与 `rustrain-glm5` 硬编码的结构完整表达成数据**
-（§5.2 是实物样本）。具体语法与展开语义是 §8 的 D8。
+**判据**：描述格式完成的标志是它能**把第一个验证样本（`Qwen/Qwen3.6-35B-A3B`）完整表达成数据**，
+并且**不需要为别的模型改语言** —— 收窄的是验证范围，不是设计。
+具体语法与展开语义见 `docs/design/model-description.md`（D8）。
 
 ### 1.3 切分不是一个算子
 
@@ -386,7 +387,8 @@ strides / dtype 一致；每个 buffer 都被分配、无别名冲突、在预�
   它看起来像支持。
 - **两种 layer-kind 表达形式并存**：Qwen3.6 是**纯列表**（`layer_types`，代码里没有取模路径，
   `full_attention_interval` 解析后不使用）；GLM5 的 indexer kind 是**列表 + 取模回退**
-  （`glm5/src/model.rs:342-343, 361-363`）。**只建模一种形式的 schema 表达不了 GLM5。**
+  （`glm5/src/model.rs:342-343, 361-363`）。**验证阶段只看前者**，但语言不需要为后者改：
+  派生一律由生成器 materialize 成显式列表（§1.2 的"四部分"里 params 只做取值与算术表达式）。
 - **状态**：Qwen3.6 **没有 KV cache**；delta-rule 的 state 是 per-forward scratch
   （`Q/model.rs:368`）；唯一的跨层状态是 GLM5 的 `IndexShareState`（`glm5/src/model.rs:810-819`）。
 - **并行实现极不对称**：Qwen3.6 只有 EP（把 `WORLD_SIZE` 当 EP 用）；GLM5 有 TP + EP + CP；

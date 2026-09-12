@@ -113,7 +113,8 @@ description: rustrain 的架构操作规则。改动 crate 边界、ABI、plan I
 
 ### 4.4 改**模型描述**格式（T2/T3 边界）
 
-1. 判据只有一个：**它能不能把 `rustrain-qwen3-6` 与 `rustrain-glm5` 表达成数据。** 表达不了就是设计不够。
+1. 判据有两个：**（a）它能不能把 `Qwen/Qwen3.6-35B-A3B`（第一个验证样本）完整表达成数据**；
+   **（b）加第二个模型时要不要改语言** —— 要改就是设计不够。模型事实见 `docs/design/qwen36-5d-example.md`。
 2. 每次改动都要在**无 GPU** 的机器上跑 L1 + L2（`rustrain check`），两条都要。
 3. 结构进描述、实现进 recipe —— 越界就是把两件事捆在一起。
 
