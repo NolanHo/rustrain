@@ -424,6 +424,22 @@ P2/P6 直接服务 §0 的边界契约，优先级高于 P1/P4/P5。
 
 ## 7. 缺口（重构输入）
 
+**与 §1 / §2 定义的差距**（逐条实测见 `docs/design/plan-ir-baseline.md`）
+
+- `shard::propagate` 收到 `ProcessGroups` 后丢弃（`shard.rs:236`）→ `GroupUnavailable` 从未被构造：
+  plan 可以声明 `GroupKind::Ep` 而拓扑里 expert=1 而不报错。**§1.1 的"编译期求值拓扑"缺的就是这一步。**
+- `CollectiveBackend::execute` 的签名里没有 rank / world size / 组句柄（`runtime/lib.rs:170-179`）→
+  **§2.2 说的"执行期由 runtime 绑定句柄"今天没有通道**；`intrinsic.sync` 与 `intrinsic.broadcast`
+  编译期被接受、运行期落空。
+- digest 把 `seed` / `checkpoint` / `Trace.path`（后者只是诊断字符串）纳入，却把**整个 `MemoryPlan`** 排除
+  （`compile.rs:696-716`）→ 改诊断路径会改 digest，改内存策略不会。与 §0 推论 3 的意图相反。
+- `GroupKind` 是封闭六值枚举 + `ProcessGroups.groups: [_; 6]` 定长数组（`group.rs:20-49, 142`）→
+  §1.1 的 opaque axis id 迁移是表达 hybrid mesh 的前置条件。
+- `SlotKind::State` / `Gradient` 无任何构造点（`memory.rs:551` 会读）→ §1.7 的状态管理今天没有承载。
+- `PlanMeta.parallel` 在 plan crate 内无读者，CLI 靠手工传两次（`cli/main.rs:340-343`）→
+  §1.1 的"描述 × 拓扑"没有单一入口。
+- 没有 plan 的持久化入口（`Plan` 派生 `Serialize` 但全仓无读写路径）→ 描述层的产物今天只能走内存对象。
+
 **计算路径**
 - 模型描述与展开（§1.2）—— 下一个设计产物
 - 反向图（`derive_backward`）—— 设计已定（spec §2.11），未实现
