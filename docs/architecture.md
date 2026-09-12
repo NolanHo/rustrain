@@ -1,15 +1,15 @@
-# rustrain 架构定义
+# rustrain 架构
 
-> 状态：**讨论中**。第 0 章（边界契约）已定；第 1–3 章是当前系统的事实描述，等待核对；
-> 第 4、5 章是讨论中形成的提案（4 切分与模型表达、5 无 GPU check 阶梯），第 6 章列出两条路径上的缺口。
+> **状态**：本次重构的架构定义。重构前的设计已作废，归档在 `_internal_docs/archive/pre-rewrite/`。
 >
-> 这份文档描述**架构是什么**。实现规则（constraints、checklist、禁止模式）另有一份 skill，归属待定。
+> 这份文件描述**架构是什么**。实现规则（边界契约的操作化、不变式、三类变更 checklist、禁止模式、
+> 验证门禁）在 `skills/architecture/SKILL.md` —— **规则只有一份，这里不重复它。**
 
 ---
 
-## 0. 边界契约（已定）
+## 0. 边界契约（T1 / T2 / T3）
 
-**T1 / T2 自由，T3 重编框架。**
+**T1 实现体自由，T2 声明契约自由，T3 数学形态重编框架。**
 
 | 层 | 变什么 | 代价 |
 |---|---|---|
@@ -18,41 +18,216 @@
 | **T3 数学形态** | 出现框架没见过的规则种类 | **重编框架，接受** —— 形状都变了。 |
 
 **为什么这个自由值得**：Kernel 的正确性是 **Kernel 的责任，不是框架的责任**。框架只需要能
-（a）拿到一个实现、(b) 知道它的契约、(c) 有办法验证它和别人算的是同一件事。
-在此之上，能**随时装卸 kernel 做对照**，对研究比编译期检查更有价值。
+（a）拿到一个实现、(b) 知道它的契约、(c) 有办法验证它和别人算的是同一件事。在此之上，能**随时装卸
+kernel 做对照**，对研究比编译期检查更有价值。
 
-**因此明确放弃**：类型化/编译期的接口检查。插件是运行时对象，错的插件是运行时错误。
+**因此明确放弃**：类型化 / 编译期的接口检查。插件是运行时对象，错的插件是运行时错误。
 代价由一致性门禁承担 —— **门禁不是"顺手做的检查"，它是这条边界的承重结构**。
 
-**推论（必须写进实现规则）**：
+**推论**：
 
 1. 声明错了编译器不会发现，只有门禁会发现 → 任何实现进入 plan 之前必须过门禁。
 2. ABI 稳定性是纪律：`struct_size` 前向兼容、字段不得重排、C 枚举用 newtype 包住任意值。
 3. digest 必须记插件身份（`plugin@version` + origin），否则同配置不可复现。
-4. 切分规则与 VJP 规则**不得按算子名查表** —— 那会把 T2 泄漏成 T3。规则要作为**描述符里的声明**
-   （`{kind, 参数}`），新算子只要规则种类已存在就不重编框架。
-   现状违反这一条：`shard::rule_for(op: &str)` 是按名字 match 的。
+4. **规则不得按算子名查框架侧的表** —— 那会把 T2 泄漏成 T3。规则要作为**描述符里的声明**
+   （`{kind, 参数}`）出现；新算子只要规则种类已存在就不重编框架。
 
 ---
 
-## 1. 计算路径
+## 1. 核心模型
 
-从"用户下达一个训练任务"到"一个 kernel 被执行"。
+### 1.1 三层产物：描述 → 编译 → plan
+
+```
+模型描述（数据，拓扑无关，可移植）
+      │   × 拓扑（编译输入）
+      ▼
+   编译（纯 CPU，位于 launch 路径）
+      ▼
+   plan（具体：形状、layout、axis id、节点集合）   ← 每个 rank 一份
+```
+
+| 事实 | 归属 | 求值时机 |
+|---|---|---|
+| mesh：轴名 → degree / ranks | 编译输入 + 运行输入（`ProcessGroups`）。**不进 plan。** | 编译期 |
+| 张量轴 → mesh 轴的**指派** | 模型描述（符号：`Shard{dim, Axis("tp")}`） | 编译期求值 |
+| 具体 layout（含度数）、axis id、形状、节点集合 | **plan 产物** | 编译后 |
+| topology **指纹**（不是对象） | plan 的 meta / digest | 编译后 |
+
+**Plan 里没有"topology"这个概念，只有它的结果。** 说不出"谁遍历它"的东西不进设计，拓扑对象没有消费者。
+只有三个地方用到拓扑，各自的归属必须分清 —— 这是 topology 溜进 plan 的唯一通道：
+
+- **collective 执行**：要组句柄 → plan 存 **axis id**，runtime 拿它在 mesh 里查句柄。
+- **加载器**：要"我持有哪一片" → 由 (slot.layout, 组内 rank) 算出；mesh 是运行输入，
+  所以需要拓扑的是 loader，不是 plan。
+- **PP / EP 实例化**：节点集合是拓扑的函数 → **编译期求值**，产物里节点集合已经具体。
+
+**推论（重要）**：**描述是可移植产物，plan 是拓扑相关的产品。**
+因此 checkpoint 映射挂在**描述**上（全局参数空间），不挂在 plan 上（局部）。
+副产品：§4.4 的 L2 检查**完全不需要 topology**，只有 L1 需要。
+
+**必须改的钉子**：`GroupKind` 现在是封闭枚举（Tp/Dp/Pp/Ep），hybrid mesh（HSDP、tp×ep×dp 组合）表达不了。
+它应演进成 **opaque axis id**（编译期 mesh 里的索引）。
+
+### 1.2 模型是数据
+
+- **结构**（哪些算子、什么顺序、怎么连）→ 描述文件里的**子图模板 + 重复**。
+- **实现**（这个算子用哪个 kernel）→ recipe。
+- **`expansion`（契约 R-4）** 只承载"融合实现 ↔ 原语分解"的**实现**语义，**不承载结构** ——
+  否则"这条边是融合还是展开"会和"模型是什么"纠缠在一起。
+
+框架**不提供任何模型模板**（框架不认识任何模型）：模板住在模型目录里，与 config / checkpoint 同处。
+于是"支持一个模型" = 一份描述 +（必要时）原语 kernel；只用现有原语时**零 Rust**。
+
+描述的四个部分：
+
+| 部分 | 内容 |
+|---|---|
+| 参数 | 从 `config.json` 取；描述引用参数名，不重复数值 |
+| 模板 | 子图（一层、一个 attention、一个 MLP），用参数名作形状 |
+| 实例化 | 重复与逐层覆盖；必须同时容纳"纯列表"与"列表 + 派生回退"两种形式（§5.2） |
+| 参数映射 | slot ↔ checkpoint 名字 + 变换 + **切分轴**（§1.4），直接喂 L2 |
+
+**判据**：描述格式完成的标志是它能**把 `rustrain-qwen3-6` 与 `rustrain-glm5` 硬编码的结构完整表达成数据**
+（§5.2 是实物样本）。具体语法与展开语义是 §8 的 D8。
+
+### 1.3 切分不是一个算子
+
+切分不产生运行时计算，因此**不进入计算图**。写成算子（`shard(x, dim, group) -> x_local`）有三个硬后果：
+图变成"按 rank 切过的程序"（不再描述模型本身）；layout 从**声明**降级为算子的**输出**（传播的输入没了）；
+权重切分表达不了（它发生在 step 0 之前，由加载器决定读哪一块）→ 于是出现两套切分机制。
+
+正确形状：**切分是 slot 的属性，它在图里唯一的可见后果是一个集合通信节点。**
+
+**三样不许混**：
+
+| 概念 | 载体 | 是什么 |
+|---|---|---|
+| 度数（tp=8 / ep=2） | `ProcessGroups`（`ParallelConfig`） | 编译输入；进程生命周期常量 |
+| 轴（这条边属于哪条 mesh 轴） | axis id + 节点属性 `ATTR_GROUP` | **节点属性**，不是 tensor operand |
+| layout（哪个张量轴被切） | `ParallelLayout::{Shard,Partial}` | **slot 声明** |
+
+**group 不做 tensor operand 的三条理由**：
+
+1. 它是常量 —— 做成 operand 等于把常量塞进数据流，并让图的**拓扑**变成数据依赖
+   （"这条边要不要通信"运行时才知道），AOT 的扁平 step 列表不成立。
+2. 它必须一致 —— tensor 值可以在 rank 间不一致；属性在 startup 校验一次。
+3. 它不需要"被计算" —— 由 (mesh 拓扑, 轴) 唯一决定，是查表，不是 kernel。
+
+### 1.4 两类并行机制，以及它们与 Kernel 的关系
+
+| | 切什么 | 机制 | 与 Kernel 的关系 | 图中的体现 |
+|---|---|---|---|---|
+| **layout**（TP / SP / DP） | 同一批节点的**张量轴** | 形状算术 + 通信插入 | **相关**：输入输出形状与是否通信变了 | 节点集合不变，多出 intrinsic |
+| **instantiation**（EP / PP） | **节点集合本身** | 按 (rank, 度数) 枚举节点 | **无关**：kernel 代码不会因 pp=4 而改变 | 节点集合随 rank 变 |
+
+EP 用形状算术表达不了：rank 0 有 expert 0–3、rank 1 有 4–7，"哪些节点存在"变了。PP 同理。
+对 EP/PP 放弃"一个 plan 跑所有度数"，改为：**同一份描述 + 不同切分参数 → 各实例化一个 plan，
+且实例化可在无 GPU 机器上完成**（§4.4）。
+
+**切分轴属于参数声明**：一个权重 slot 的 `Shard{dim, axis}` 与"从 checkpoint 取哪一块"是**同一条事实**，
+必须住在同一个地方（参数映射）—— 一份声明同时被加载器和形状算术读取。
+按算子名或张量名查框架侧的表是禁止的（P6）。
+
+### 1.5 推导的口径：兑现义务，不猜声明
+
+- **可以推**：某 slot 声明 `Shard{dim:0, axis:tp}` → 每个 rank 只有部分和 → 该处必须 all_reduce。
+  这是**把声明的后果算出来**。
+- **不可以推**：看到算子名叫 `linear` 就假定权重是 `[K,N]`，看到 `qkv` 就假定 column parallel。这是**猜**。
+
+**推导的输入必须是描述符，不是名字。** 现有违规：`shard::rule_for(op: &str)`（P6）。
+
+### 1.6 度数：编译输入，不是运行期参数
+
+- **方案 A（符号 / 晚绑定）**：plan 里只有轴名，startup 时把度数代进去；一个产物跨度数复用。
+- **方案 B（度数作为编译输入）—— 采用**：每次启动重新编译（编译是纯 CPU 的，本就在 launch 路径上）。
+  编译器**内部**用符号算术（`local = global[dim] / N`），**产物里只有具体值**。
+
+B 与"非解释"一致且机制更少：产物里没有"度"的痕迹，扁平循环，每步开销与 tp=1 相同；
+`N ∤ shape[dim]` 在编译期就是错误，不是运行期 fallback。A 的唯一收益（一个产物跨度数）在训练里用不到，
+而"同一份描述在不同度数下各产出一个 plan 再 diff"更便宜、也更好调试。
+
+现状已经长成 B 的形状（`shard::propagate(plan, &groups)` 收度数），缺的是 `let _ = groups;`。
+
+### 1.7 状态
+
+训练里 **KV cache 不是必需的**（那是推理期的东西），§5.2 的实测也证实旧实现没有 KV cache。
+训练中真正需要管理的状态是三类：**激活**（由 memory plan 管）、**optimizer state**（缺失）、
+**循环 / 增量层的 state**（旧实现是 per-forward scratch）。`SlotKind::State` 与持久化策略见 §8 D10。
+
+---
+
+## 2. 算子与 Kernel 契约
+
+### 2.1 "Kernel 与拓扑无关"的准确含义
+
+kernel **不持有 mesh、不按度数分支**。它持有的只有三样：
+
+1. **本地张量** —— 本地形状已经在张量里，所以多数 kernel 不需要任何拓扑信息
+   （row/column parallel linear 都只做一个 local GEMM）。
+2. **描述符里声明的轴 id** —— "我吸收 `axis='tp'` 上的 all_reduce"。
+3. **执行期的组句柄** —— runtime 绑定，进程生命周期不变。
+
+### 2.2 框架注入什么
+
+| 注入物 | 时机 | 例子 |
+|---|---|---|
+| **静态常量** | 编译 / 实例化期，烤进 plan 或描述符 | 本地 expert 范围、vocab shard 偏移、stage 索引 |
+| **组句柄**（opaque communicator） | 启动期绑定一次，进程内不变 | `axis("tp")` → 该轴的 communicator |
+| ~~每步的 TP 参数~~ | ✗ | 需要它 = plan 没定下来 |
+
+- **禁**：给 kernel 传独立的度数标量（`tp_size: usize`）。它是同一事实的第二个来源，一定会和句柄漂移。
+  度数从 communicator 读。
+- 看起来像拓扑、其实是数据的例子：**SP 的序列偏移** —— 它是输入数据（`position_ids` 按本地 chunk 生成），
+  不是拓扑参数。这类东西最容易被误诊成"要注入的 TP 参数"。
+- **白拿的对照能力**：`tp=1` 就是 size=1 的组，all_reduce 是恒等运算。**同一个 kernel 在 tp=1 直接能跑**，
+  于是"装卸 TP 做对照"不需要两套代码 —— 这正是 §0 要的自由。
+
+### 2.3 planner 只规划 expansion，不规划融合体
+
+> **planner 永远规划 primitive expansion。融合是解析期的一次替换，只有当门禁证明"融合体 ≡ 它的 expansion"
+> 时才合法。**
+
+由此，"这个 kernel 能不能被拆"有了确定答案 —— **不由框架猜，由声明决定**：
+
+- **有 `expansion`** → 框架**总是**能规划它的原语分解。问题不是"能不能拆"，而是"拆了是否更慢"
+  （recipe 的性能取舍，不是正确性问题）。
+- **融合体声明的 `collectives` 必须与 planner 在它的 expansion 上决定插入的 collectives 集合相等**；
+  不等 → **拒绝这次融合**，回落到分解形式（不是报错）。这是**机械校验**，不是猜。
+
+所以"通信写在 kernel 里"不是问题；**问题是写在里面而没人知道**。
+
+### 2.4 EXPLICIT 算子
+
+做的事不在原语词表里时，必须声明：(a) 布局规则的**种类**，(b) 它内部吸收的 collectives。
+规则种类已存在 → T2；需要新种类 → T3（应罕见，且应被注意到）。
+
+### 2.5 设备纪律
+
+**插件在 `init()` 之前不得碰设备。** 否则 `dlopen` 会把 CUDA 上下文拉起来，无 GPU check 就真的"执行"了。
+`Plugin::load` 已经保证"校验通过之后才 `init`"（被拒的插件不执行任何代码）；这条纪律是它的另一半。
+
+---
+
+## 3. 计算路径
+
+从"一份模型描述"到"一个 kernel 被执行"。
 
 ```
 入口
  │
- ├─ 模型构造        ← 缺失。今天只有 CLI 里手写的 demo_plan
- │    模块树 → PlanBuilder 调用序列，产出 Plan
+ ├─ 模型描述（数据）        ← 待建。参数 + 模板 + 实例化 + 参数映射
+ │    展开 expand()          → 一份（拓扑无关的）结构化模型
+ │    × 拓扑                 → PlanBuilder 调用序列
  │
  ├─ Plan            slots[] + nodes[]；每个 slot 带 dtype / shape / ParallelLayout
  │
  ├─ Compiler::compile
  │    1 check_structure      节点拓扑序、槽位唯一写者
- │    2 shard::propagate     按规则校验/推导每个算子输入输出所需的布局，
+ │    2 shard::propagate     按描述符规则校验/推导每个算子输入输出所需的布局，
  │     │                      在布局不匹配处**插入** intrinsic 集合通信节点
  │    3 resolve_node ×N      Registry + Recipe → 每个节点的具体实现
- │     │                      反向节点在此追踪其 backward_op
+ │     │                      融合体在此替换其 expansion；替换前校验 collectives 集合相等（§2.3）
  │    4 memory::plan         寿命分析 → 偏移复用 → 峰值投影；调每个算子的 memory() 取 workspace
  │    5 enforce_budget       峰值超 budget_bytes 则**编译失败**
  │    6 validate_shapes      调插件的 infer()，与 plan 声明的形状比对
@@ -73,9 +248,9 @@ CLI 只走到 `Compiler::compile`（为了 `plan explain`），执行器只在�
 
 ---
 
-## 2. 加载路径
+## 4. 加载路径
 
-### 2.1 插件（kernel）加载 —— 已实现
+### 4.1 插件（kernel）加载 —— 已实现
 
 ```
 插件 .so（只导出 rustrain_plugin_v1）
@@ -97,20 +272,110 @@ CLI 只走到 `Compiler::compile`（为了 `plan explain`），执行器只在�
 
 **进程内插件**同一条路径：`Plugin::from_static` 跳过 dlopen，其余校验完全一致。
 
-### 2.2 权重 / 状态加载 —— 缺失
+### 4.2 权重 / 状态加载 —— 缺失
 
 没有权重加载、没有 checkpoint/resume、没有 `SlotKind::State` 的管理。
 模型权重今天只是 plan 里的一个 slot，没有来源。
+参数映射（slot ↔ checkpoint 名字 + 变换 + 切分轴）挂在**描述**上（§1.1）。
 
-### 2.3 插件发现 —— 缺失
+L2 的变换词表最小集（由真实 checkpoint 反推，不是想出来的）：`take(name)` / `slice(dim, range)` /
+`transpose` / `split` / `concat(dim)`。Megatron 用到的全部机制都落在这几种里 —— 前缀重命名
+（`sharded_state_dict_keys_map`）、按轴切片（`{"weight": 0}`）、MLA 的 `torch.cat([q, kv], dim=0)`。
+
+### 4.3 插件发现 —— 缺失
 
 今天必须显式 `--plugin <path>`。没有扫描目录、没有 manifests、没有版本约束求解。
 
+### 4.4 无 GPU check 阶梯
+
+**它不实际执行计算**，是一种**声明一致性检查**。这是"支持一个模型"的主循环。
+
+| 级 | 需要什么 | 查什么 | 现状 |
+|---|---|---|---|
+| **L1 结构** | 无（零设备、零权重） | plan 可编译；每个节点的算子可解析到实现；每个算子的 `infer()` 与声明形状一致；layout 传播完成、每个 `Partial` 都被兑现、每个 collective 都绑了轴；内存规划无重叠且不超预算 | 能力已具备（`validate_shapes`），**缺驱动**：今天跑的是 CLI 里手写的 demo plan，不是"指定 model 路径" |
+| **L2 加载** | checkpoint 的 **metadata**，不读数据 | 每个 slot 都能从某个 checkpoint tensor 得到（名字 + 变换）；每个 checkpoint tensor 要么被消费、要么显式声明忽略；dtype / shape / 切片范围一致 | **缺失**。safetensors 头部即 JSON（名字 / dtype / shape / offset），读它不需要读权重。实测：4 GB / 1386 tensor 的 checkpoint，头部 198 KB |
+| **L3 数值** | 设备（或 CPU 参考实现） | 同一算子的两个实现算同一件事 + 数值参考 | 已有（conformance gate） |
+
+```
+rustrain check --model <model-dir> --plugin <p.so> [--tp N --pp N --ep N] [--json]
+```
+
+- 退出码非零即失败；每条 skip 必须写原因（沿用门禁纪律）。
+- `--json` 的用途是**机器消费**：L2 的自然用户是从 HF 模型"拆碎"出描述 + 名字映射的生成器，
+  `decompose → check → 修映射 → check` 全在笔记本 CPU 上跑。
+- 顺带可查**算子覆盖**：模型需要的算子本机有没有实现、有没有目标精度的变体
+  （`uncovered_operators()` 是种子）。
+
+**它保证什么**（声明之间自洽）：每个节点都有实现（dtype / layout / target 满足）；每个边界的形状 /
+strides / dtype 一致；每个 buffer 都被分配、无别名冲突、在预算内；每个 collective 都有组且组在拓扑里存在；
+每个 slot 都有来源（L2）；每个算子有反向接线或可推导。
+
+**它不保证什么**：**数值**（NaN / Inf / 精度 / 发散 —— 那是 kernel 的责任）；**模型是对的**
+（形状全对而数学错，§5.2 有实物反例）；性能；确定性（那是门禁的另一条轴）。
+
+**它不是类型论意义的类型检查**：声明是**不可信输入**（T2 自由的代价）。它证明的是"声明彼此自洽"，
+不是"声明是真的" —— 后者只有 L3（两个实现 + 一个数值参考）能证。
+
 ---
 
-## 3. crate 职责与依赖
+## 5. 先例与证据
 
-### 3.1 实际依赖图（`cargo tree` 实测）
+### 5.1 外部（实测，非转述）
+
+**Megatron-LM**：层结构基本是**代码**（`ModuleSpec` 持有 Python 类对象，`spec_utils.py:29-31, 99-122`）。
+数据只覆盖"哪一层用哪套参数"（`heterogeneous_config.py:157-179`）与"哪一层在第几个 stage"
+（字符串 DSL `'Et*3|(tt|)*29,m|L'`，`transformer_config.py:108-128`）；**子模块顺序与残差接线永远是代码**
+（`transformer_layer.py:362-460, 860-868`）。checkpoint → 参数是名字字符串 + 每个类自己的
+`sharded_state_dict()` + 前缀重命名表（`gpt_layer_specs.py:484-487`）。
+**切分轴是类里的字面 dict**：`ColumnParallelLinear` → `{"weight": 0, "bias": 0}`（`layers.py:1116-1126`）、
+`RowParallelLinear` → `{"weight": 1}`（`:1379-1389`）—— 注意它在 `sharded_state_dict` 里，也就是**加载侧**。
+
+**HuggingFace**：`layer_types` / `full_attention_interval` / `sliding_window_pattern` 是数据，
+但 `layer_types` 是在 config 代码里**从一个标量生成**的；类别分派（`if block_type == "linear_attention"`）、
+合法词表、子模块顺序、残差接线全是代码。GLM-4.6 两个字段都没有。
+
+**vLLM / SGLang / JAX MaxText / torchtitan：没有一个把图本身表达成数据。** 最接近的四例都停在图的门口：
+
+- vLLM 有 `splitting_ops: list[str]`，但那是"在哪些算子上切"；pass 流水线是代码，最后生成 Python 源码字符串 `exec` 掉。
+- SGLang 手里是运行时的 `torch.cuda.CUDAGraph` 对象。
+- MaxText 是 `layer_map = {DecoderBlockType.DEFAULT: [NNXDecoderLayer], ...}` —— 配置枚举选 Python 类。
+- torchtitan 的 `Config(layers=[...])` 只描述**构造**；算子顺序与连接写死在 `forward()` 里。
+  （`experiments/graph_trainer` 序列化 FX trace，但那是**派生的缓存**，不是被编写的源头。）
+
+**根因**：它们的图就是 `forward()` —— 图存在，但不是一等产物，是 Python 控制流，没有东西可以序列化。
+**它们的 `forward()` 就是我们的 `Plan{slots,nodes}`。**
+
+**风险（要正视）**：据我们所知，这是第一个把图当作**编写对象**的框架。写错的图**编译不会报错**，
+而且没有现成工具能替我们验证它。因此：
+
+> **§4.4 的 check 阶梯不是便利功能，它是"模型即数据"的前置条件。**
+
+### 5.2 我们自己的 legacy（`archive/pre-rewrite-20260803` 实测）
+
+- **层图有两个来源**：同一层的算子顺序与残差布局在 Rust（`rustrain-qwen3-6/src/model.rs:664-692`）
+  与 C++（`kernels/qwen3_6_kernels.cpp:777-853`）**各写一遍**。这不是"代码没整理好"，
+  而是**结构没有数据来源**的必然后果。
+- **切分轴按张量名硬编码**：`rustrain-glm5/src/tp_cp.rs:240, 264, 495-515, 650-666` ——
+  column-parallel 取 `shape[0]`、row-parallel 取 `shape[1]`、`q_b_proj` 取 dim0 的
+  `head_start*(qk_nope+qk_rope)`、`o_proj` 取 dim1。这正是 P6 要消灭的形态，
+  也是 §1.4"切分轴属于参数声明"的实物依据。
+- **配置解析了但从不读**：`full_attention_interval`、`mrope_*`、`attn_output_gate`、
+  `shared_expert_intermediate_size`、`hidden_act`、`attention_bias` …（`Q/config.rs` 有定义，
+  模型代码零引用）。**死钩子的实物**：声明了却没人读，等于没有声明，而且比没有更糟 ——
+  它看起来像支持。
+- **两种 layer-kind 表达形式并存**：Qwen3.6 是**纯列表**（`layer_types`，代码里没有取模路径，
+  `full_attention_interval` 解析后不使用）；GLM5 的 indexer kind 是**列表 + 取模回退**
+  （`glm5/src/model.rs:342-343, 361-363`）。**只建模一种形式的 schema 表达不了 GLM5。**
+- **状态**：Qwen3.6 **没有 KV cache**；delta-rule 的 state 是 per-forward scratch
+  （`Q/model.rs:368`）；唯一的跨层状态是 GLM5 的 `IndexShareState`（`glm5/src/model.rs:810-819`）。
+- **并行实现极不对称**：Qwen3.6 只有 EP（把 `WORLD_SIZE` 当 EP 用）；GLM5 有 TP + EP + CP；
+  **两者都没有 PP**。
+
+---
+
+## 6. crate 职责与依赖
+
+### 6.1 实际依赖图（`cargo tree` 实测）
 
 ```
 rustrain-parallel     （无内部依赖）
@@ -127,7 +392,7 @@ rustrain-abi          （无内部依赖）
      └── rustrain-cli  → abi, ops, parallel, plan, runtime, kernels   （组合根）
 ```
 
-### 3.2 职责
+### 6.2 职责
 
 | crate | 职责 | 明确不负责 |
 |---|---|---|
@@ -140,9 +405,9 @@ rustrain-abi          （无内部依赖）
 | `rustrain-cli` | 组合根 | 不含业务逻辑 |
 
 **不变式 I-1**：`abi / ops / parallel / plan / runtime` 的依赖闭包中不得出现 tch、libtorch、cuda。
-实测为 0。这是"核心能在无 GPU 机器上跑完整测试"的依据（本机 215 个测试证明了这一点）。
+实测为 0。这是"核心能在无 GPU 机器上跑完整测试"的依据，也是 §4.4 check 能在无设备机器上跑的前提。
 
-### 3.3 已知的分层偏差（待这次重构处理）
+### 6.3 已知的分层偏差
 
 | # | 问题 | 修法 |
 |---|---|---|
@@ -151,190 +416,48 @@ rustrain-abi          （无内部依赖）
 | P4 | 没有训练层：无 train / data / checkpoint / manifest | 新增 `rustrain-train`、`rustrain-data` |
 | P5 | `rustrain-kernels` 同时是"语义真值（必须纯）"和 aten provider 的预定住址（必须链 libtorch） | 拆成 `-reference` 与 `-aten` |
 | P6 | `shard::rule_for(op: &str)` 按算子名查表，把 T2 泄漏成 T3 | 规则进描述符，作为 `{kind, 参数}` 声明 |
-| P7 | 模型表达层不存在 —— 78 层模型按今天的写法要手工标注每张量的布局 | 模型描述 + 结构化模板（形状见 §4，形态见 D2） |
+| P7 | 模型表达层不存在 —— 78 层模型按今天的写法要手工标注每张量的布局 | 模型描述 + 结构化模板（§1.2） |
 
-P2/P6 直接服务第 0 章的边界契约，优先级高于 P1/P4/P5。
-
----
-
-## 4. 切分与模型表达（提案）
-
-> 4.4 是用户已同意的口径；4.1–4.3、4.5 是本次讨论中新提出的形状，**尚未定案**。
-
-### 4.1 切分不是一个算子
-
-切分不产生运行时计算，因此它**不进入计算图**。写成算子（`shard(x, dim, group) -> x_local`）有三个硬后果：
-
-1. 图变成"按 rank 切过的程序"，不再描述模型本身 —— `plan explain` 在两个 rank 上输出不同，我们丢掉最便宜的调试工具（diff 两个 plan）。
-2. layout 从**声明**降级成算子的**输出**：传播的输入没了，"这个 tensor 应该是什么布局"要顺着图跑一遍才知道。
-3. 权重切分表达不了 —— 它发生在 step 0 之前（加载器决定从 checkpoint 读哪一块），不是图里的运算。于是出现两套切分机制：算子的给激活，加载器的给权重。
-
-正确的形状：**切分是 slot 的属性，它在图里唯一的可见后果是一个集合通信节点。**
-
-### 4.2 三样不许混的东西
-
-| 概念 | 载体 | 是什么 |
-|---|---|---|
-| 度数（tp=8 / ep=2） | `ProcessGroups`（`ParallelConfig`） | 编译输入；进程生命周期常量 |
-| 轴（这条边属于哪条 mesh 轴） | `GroupKind` + 节点属性 `ATTR_GROUP` | **节点属性**，不是 tensor operand |
-| layout（哪个张量轴被切） | `ParallelLayout::{Shard,Partial}` | **slot 声明** |
-
-`intrinsic_for()` 把 group 写成节点属性（`attrs.set(ATTR_GROUP, group_name(group))`）已经是正确形状，保持。
-**group 不做 side input 的三条理由**：
-
-1. 它是常量 —— 做成 operand 等于把常量塞进数据流，并且让图的**拓扑**变成数据依赖（"这条边要不要通信"运行时才知道），AOT 的扁平 step 列表不成立。
-2. 它必须一致 —— tensor 值可以在 rank 间不一致；属性在 startup 校验一次。不一致的 group 是最不该在 step 5000 才发现的东西。
-3. 它不需要"被计算" —— group 由 (mesh 拓扑, 轴) 唯一决定，是查表，不是 kernel。
-
-### 4.3 度数：编译输入，不是运行期参数（方案 B）
-
-- **方案 A（符号/晚绑定）**：plan 里只有轴名，startup 时把度数代进去；一个产物跨度数复用。
-- **方案 B（度数作为编译输入）**：每次启动重新编译（编译是纯 CPU 的，且在 launch 路径上）；编译器**内部**用符号算术（`local = global[dim] / N`），**产物里只有具体值**。
-
-**推荐 B**，与"非解释"一致且机制更少：产物里没有"度"的痕迹，扁平循环，每步开销与 tp=1 相同；
-`N ∤ shape[dim]` 在编译期就是错误，不是运行期 fallback。A 的唯一收益（一个产物跨度数）在训练里用不到，
-而"同一份描述在不同度数下各产出一个 plan 再 diff"更便宜、也更好调试。
-
-现状已经长成 B 的形状（`shard::propagate(plan, &groups)` 收度数），缺的是 `let _ = groups;` ——
-度数还没被用来算本地形状。
-
-### 4.4 推导的口径：兑现义务，不猜声明（已同意）
-
-- **可以推**：某 slot 声明 `Shard{dim:0, group:Tp}` → 每个 rank 只有部分和 → 该处必须 all_reduce。这是把声明的后果算出来。
-- **不可以推**：看到算子名叫 `linear` 就假定权重是 `[K,N]`，看到 `qkv` 就假定 column parallel。这是猜。
-
-今天两者混在 `shard.rs`：`propagate()` 是前者，`rule_for()` 是后者（P6 / I-5）。
-修法：**推导的输入必须是描述符，不是名字。**
-
-### 4.5 TP 和 EP 不是一类机制
-
-| | 切什么 | 机制 | 图中的体现 |
-|---|---|---|---|
-| **layout**（TP / SP / DP） | 同一批节点的张量轴 | 形状算术 + 通信插入 | 节点集合不变，多出 intrinsic |
-| **instantiation**（EP / PP） | **节点集合本身**（本地有哪几个 expert / 哪几层） | 按 (rank, 度数) 枚举节点 | 节点集合随 rank 变 |
-
-EP 用形状算术表达不了：rank 0 有 expert 0–3、rank 1 有 4–7，"哪些节点存在"变了。PP 同理。
-
-对 EP/PP 放弃"一个 plan 跑所有度数"，改成更弱但够用的性质：**同一份模型描述 + 不同切分参数 →
-各实例化一个 plan，且实例化可在无 GPU 机器上完成**（接 §5）。
-
-### 4.6 外部先例，以及它修正的一处（实测）
-
-读到代码的事实（证据为 file:line，取自 `/data/user/nolanho/code/Megatron-LM`）：
-
-- **层结构基本是代码。** 槽位名是类的字段；`ModuleSpec` 持有的是 Python **类对象**，`build_module` 直接实例化它
-  （`spec_utils.py:13-41, 99-122`）。数据只覆盖两件事："哪一层用哪套参数"
-  （`heterogeneous_config.py:157-179` 的 `block_configs` + `heterogeneous_layer_specs.py:196-215`）与
-  "哪一层在第几个 stage"（`pipeline_model_parallel_layout` 字符串 DSL `'Et*3|(tt|)*29,m|L'`，
-  `transformer_config.py:108-128`，解析在 `pipeline_parallel_layer_layout.py:283-321`）。
-  **子模块顺序与残差接线永远是代码**（`transformer_layer.py:362-460`、`860-868`）—— 两种数据路径都表达不了
-  "换一种子模块顺序"或"换一条连接"。
-- **checkpoint → 参数**：名字字符串 + 每个类自己的 `sharded_state_dict()` + 前缀重命名表
-  （`gpt_layer_specs.py:484-487` 的 `sharded_state_dict_keys_map`，应用在 `transformer_layer.py:1168-1173`）。
-  没有全局表。
-- **切分轴是类里的字面 dict**：`ColumnParallelLinear` → `{"weight": 0, "bias": 0}`
-  （`tensor_parallel/layers.py:1116-1126`），`RowParallelLinear` → `{"weight": 1}`（`:1379-1389`）。
-
-**它修正的一处**：Megatron 的切分轴出现在 `sharded_state_dict()` 里，也就是**加载侧**。
-这说明**"切分轴"和"从 checkpoint 取哪一块"是同一条事实**——Megatron 把它存在类里（代码），
-我们错在把它存在 `rule_for(op: &str)` 里（也是代码，而且是按名字猜）。正确位置是**参数/slot 的描述符**：
-一份声明同时被 L2 的名字映射和形状算术读取。这比"把 `rule_for` 改成描述符"更准确。
-
-**Q5 核实完毕：没有先例。** vLLM / SGLang / JAX MaxText / torchtitan 都不把图本身（哪些算子、什么顺序、怎么连）表达成数据。
-四个最接近的形态，都停在图的门口：
-
-- vLLM 有 `splitting_ops: list[str]` 这类数据，但那是"在哪些算子上切"；pass 流水线是代码（`if self.pass_config.enable_sp: ...`），
-  最后还 `generate_execution_code()` 生成 Python 源码字符串再 `exec`。
-- SGLang 手里是运行时的 `torch.cuda.CUDAGraph` 对象，`--cuda-graph-config` 只描述 batch 尺寸与 backend。
-- MaxText 是 `layer_map = {DecoderBlockType.DEFAULT: [NNXDecoderLayer], ...}` —— 配置枚举选 Python 类。
-- torchtitan 最接近：`Llama3Model.Config(layers=[...])` 是数据的层列表，但只描述**构造**；算子顺序与连接写死在
-  `decoder.py` 的 `forward()` 里，`ModelSpec` 没有算子/边字段。（它的 `experiments/graph_trainer` 确实序列化了 FX trace，
-  但那是**派生的缓存**，不是被编写的源头。）
-
-**根因**：它们的图就是 `forward()` —— 图存在，但不是一等产物，是 Python 控制流，没有东西可以序列化。所以只能把"选择"
-做成数据、把"连接"留给代码。**它们的 `forward()` 就是我们的 `Plan{slots,nodes}`。**
-
-**风险（要正视）**：据我们所知，这是一个把图当作**编写对象**的框架。生态里唯一被序列化的图（vLLM codegen、
-torchtitan graph_trainer）都是派生产物，只服务于性能，从不当真值来源。后果是：写错的图**编译不会报错**，
-而且没有任何现成工具能替我们验证它。因此——
-
-> **§5 的 check 阶梯不是便利功能，它是"模型即数据"的前置条件。**
-> 没有 L1/L2/L3 加参考实现对账，"图即数据"就是莽撞的。
-
-而这件事之所以可做，恰恰因为 rustrain 早就把图做成了一等产物（`Plan` 早于模型层存在），
-所以"模型即数据"不是新机制，只是**生成这个 Plan 的输入**：参数 + 带重复的子图模板 + checkpoint 名字映射。
+P2/P6 直接服务 §0 的边界契约，优先级高于 P1/P4/P5。
 
 ---
 
-## 5. 无 GPU check 阶梯（提案）
-
-用户要求：**指定 kernel + model 路径就能检查形状，不需要 GPU**。这是"支持一个模型"的主循环。
-
-| 级 | 需要什么 | 查什么 | 现状 |
-|---|---|---|---|
-| **L1 结构** | 无（零设备、零权重） | plan 可编译；每个节点的算子可解析到实现；每个算子的 `infer()` 与声明形状一致；layout 传播完成、每个 `Partial` 都被兑现、每个 collective 都绑了轴；内存规划无重叠且不超预算 | 能力已具备（`validate_shapes`），**缺驱动**：今天跑的是 CLI 里手写的 demo plan（`plan explain --tp N`），不是"指定 model 路径" |
-| **L2 加载** | checkpoint 的 **metadata**，不读数据 | 每个 slot 都能从某个 checkpoint tensor 得到（名字 + 变换：slice / transpose / qkv split）；每个 checkpoint tensor 要么被消费、要么显式声明忽略；dtype / shape / 切片范围一致 | **缺失**。safetensors 头部即 JSON（名字 / dtype / shape / offset），读它不需要读权重数据。实测：4 GB / 1386 tensor 的 checkpoint，头部 198 KB —— 开销可忽略。真实 checkpoint 命名很脏（`base_model.model.model.layers.0.mlp.down_proj.lora_A.weight`），所以映射必须是 pattern/前缀表，且 L2 要能报告"没被消费的 tensor" |
-| **L3 数值** | 设备（或 CPU 参考实现） | 同一算子的两个实现算同一件事 + 数值参考 | 已有（conformance gate） |
-
-L2 的变换词表最小集（由真实 checkpoint 反推，不是想出来的）：`take(name)` / `slice(dim, range)` / `transpose` /
-`split` / `concat(dim)`。Megatron 用到的全部机制都落在这几种里 —— 前缀重命名（`sharded_state_dict_keys_map`，
-`gpt_layer_specs.py:484-487`）、按轴切片（`{"weight": 0}`，`layers.py:1116-1126`）、
-以及 MLA 的 `torch.cat([q_weight, kv_weight], dim=0)`（`multi_latent_attention.py:1479-1497`）。
-
-CLI 形状：
-
-```
-rustrain check --model <model-dir> --plugin <p.so> [--tp N --pp N --ep N] [--json]
-```
-
-- 退出码非零即失败；每条 skip 必须写原因（沿用门禁纪律）。
-- `--json` 的用途是**机器消费**：L2 的自然用户是从 HF 模型"拆碎"出 plan 描述 + 名字映射的生成器，
-  `decompose → check → 修映射 → check` 全在笔记本 CPU 上跑。
-- 顺带可查**算子覆盖**：模型需要的算子本机有没有实现、有没有目标精度的变体（`uncovered_operators()` 是种子）。
-
-**边界（必须写死，否则这个 check 会骗人）**：L1+L2 只抓**接线错误**，抓不了"这个分解算的是别的东西"。
-仓库内有现成反例：切分规则的权重约定反了，而**全部测试通过**。所以 check 是开发内环，不是正确性证明；
-最后一道仍是 L3，以及与参考实现（HF logits/loss）对齐。
-
-**成本分层**（"支持一个模型"的三种价位）：
-
-1. 只用现有原语 → 纯数据：结构 + 名字映射，由 L1/L2 在 CPU 上验证。**零 Rust。**
-2. 需要新原语 → + 一个 kernel（T2，丢一个 `.so`）。
-3. 框架没见过的数学形态 → T3，重编框架。应罕见，且每次都应能说清"为什么它是 T3"。
-
-目标：绝大多数模型支持落在第 1 档。
-
----
-
-## 6. 两条路径上的缺口（重构输入）
+## 7. 缺口（重构输入）
 
 **计算路径**
+- 模型描述与展开（§1.2）—— 下一个设计产物
 - 反向图（`derive_backward`）—— 设计已定（spec §2.11），未实现
 - 优化器步、梯度累积、微批调度
 - collective 的流分配与 overlap 调度（`StreamPolicy::Side` 已存在但无消费者）
 - 训练循环本身
+- 融合替换的合法性检查（§2.3）—— 需要 ABI 的 `collectives` 语义明确
 
 **加载路径**
 - 权重加载（safetensors → slot）
-- **L2 加载检查**：名字映射（checkpoint tensor → slot）的机械验证，见 §5
-- checkpoint / resume，以及 `SlotKind::State` 的持久化
+- L2 加载检查（§4.4）
+- checkpoint / resume，以及 `SlotKind::State` 的持久化（§1.7）
 - 插件的发现与版本约束（现在靠手写 `--plugin`）
 - 一个正式的插件 SDK：现在"新增一个实现"没有模板，只有散在测试里的样例
 
 **模型面**
-- 模型描述格式：结构（哪些算子、怎么连）是数据还是插件，见 D2 / §4
+- 模型描述格式：结构由数据承载（§1.2 / D8）
+- `GroupKind` → opaque axis id（§1.1 / D9）
 - 模块树是否必要：今天它只贡献 `Trace.path` 这一个可读字符串，没有任何东西**遍历**它。
-  只有当某个消费者必须走树时（checkpoint 映射、显式 optimizer 分区、state/KV 管理）才值得引入
+  只有当某个消费者必须走树时（checkpoint 映射、显式 optimizer 分区、state 管理）才值得引入
 
 ---
 
-## 7. 待定
+## 8. 待定
 
 | # | 决定 | 状态 |
 |---|---|---|
-| D2 | 模型描述的具体形态 + 切分谁决定 | **已收窄**：切分 = slot 声明 + 通信插入（§4.1）、度数 = 编译输入（§4.3）、推导只兑现声明（§4.4）已定。**未定**：结构本身是数据（模板/子图）还是由插件提供的复合算子；用户倾向后者（b），待综合性能与可用性定案 |
-| D3 | recipe 作用域：算子名 vs 结构路径 | 依赖 D2 |
+| D2 | 模型描述形态 + 切分谁决定 | **已定**：结构是数据（子图模板 + 重复），插件只提供原语，`expansion` 只承载实现语义（§1.2） |
 | D4 | VJP 规则表归属：框架侧 / 描述符 / 两者 | 未定；倾向描述符（与 P6 同一理由） |
+| D3 | recipe 作用域：算子名 vs 描述里的结构路径 | 依赖 D8 |
 | D5 | 训练循环归属、微批与梯度累积对 plan 的影响 | 未定 |
-| D7 | `rustrain check` 的层级划分与 L1/L2 落地顺序（§5） | 依赖 D2 |
-| D6 | 上述 P1/P2/P4/P5/P6/P7 的落地顺序 | 待 D2 定 |
+| D6 | P1/P2/P4/P5/P6/P7 的落地顺序 | 待 D8 定 |
+| D8 | **描述文件的具体语法与展开语义**（重复、逐层覆盖、按名接线；必须容纳 §5.2 的两种形式） | **下一个设计产物** |
+| D9 | `GroupKind` → opaque axis id 的迁移（涉及 ABI 面） | 未定 |
+| D10 | `SlotKind::State` 与持久化：激活 / optimizer state / 循环层 state | 未定 |
+| D11 | 融合替换的合法性检查落地（collectives 集合相等） | 未定 |
+| D7 | `rustrain check` 的层级划分与 L1/L2 落地顺序（§4.4） | 依赖 D8 |
