@@ -1,0 +1,201 @@
+---
+type: ChangeSpec
+title: Qwen3.6-35B-A3B 文本路径：从模型描述到前向对齐 HuggingFace
+description: 把 Qwen/Qwen3.6-35B-A3B 的文本解码路径表达成数据、编译成 plan、在无 GPU 机器上通过 L1/L2、并在验证宿主上让前向数值对齐 HF。
+tags: [rustrain, qwen36, model-description, plan, check-ladder]
+timestamp: 2026-09-12T12:00:00Z
+---
+
+# Spec — Qwen3.6-35B-A3B 文本路径
+
+> **本文件是执行者的唯一 checkpoint 工件。** 零对话历史的 agent 从本文件恢复：先读契约层，再读上下文层，
+> 校验 `待解决` 为空且各交付物状态与代码一致，然后从状态标记处继续。**禁止靠对话历史脑补。**
+
+---
+
+## 目标
+
+把 **`Qwen/Qwen3.6-35B-A3B` 的文本解码路径**从"硬编码的 C++ 实现"变成"数据 + 插件"，
+并让它在新的算子管线里跑通到**前向数值对齐 HuggingFace**。这是整套架构（描述 → 编译 → plan → 门禁）
+的第一个端到端验证样本；通过之后才谈第二个模型。
+
+**已完成的前置设计**（契约层的稳定来源，执行者必读）：
+
+| 文档 | 它定什么 |
+|---|---|
+| `docs/architecture.md` | 边界契约 T1/T2/T3、不变式、kernel 契约、check 阶梯、五轴归类 |
+| `docs/design/model-description.md` | 描述语言的四个部分、`expand`/`instantiate` 语义、轴与 mesh、layout 推广 |
+| `docs/design/op-vocabulary.md` | 算子词表（唯一权威）、一层的分解图、融合粒度 |
+| `docs/design/qwen36-5d-example.md` | 真实 config、1045 个张量的命名与形状、TP 可整除性约束、五轴走查 |
+| `docs/design/plan-ir-baseline.md` | 现状基线（编译器 7 个 pass、死钩子、运行期消费方式） |
+
+---
+
+## 契约层（durable）
+
+### 行为与稳定接口
+
+**C1 · 描述文件的行为。** 一个 JSON 文件（`format: "rustrain.model.v1"`）加一个模型目录（含 `config.json`），
+必须能确定性地产出**全局 Plan**：全部 slot 形状具体、`layout` 全 `Replicate`、每个 weight slot 带符号 binding。
+同名冲突、表达式成环、binding 未命中任何 slot → 报错并指出冲突双方。
+
+**C2 · 检查命令的行为。**
+
+```
+rustrain check --model <model-dir> [--checkpoint <dir>] [--tp N --cp N --ep N --dp N --pp N] [--json]
+```
+
+- **总是**跑 L1（结构）：plan 可编译、每个节点有实现、每个算子的 `infer()` 与声明形状一致、
+  layout 传播完成、每个 `Partial` 都被兑现、每个 collective 都绑了轴、每个 slot 都有分配且无别名冲突。
+- 给了 `--checkpoint` 时**追加** L2（加载）：每个 weight slot 恰好被一条 binding 命中；checkpoint 的每个
+  张量要么被消费、要么被显式 `ignore`；transform + axes 推出的本地形状与 slot 形状一致。
+- **内存预算只产生 warning，不影响退出码**（见 `docs/architecture.md` §8 D12）。
+- 退出码 0 = 全绿；非 0 = 有失败项。`--json` 输出机器可读报告（失败项、告警项、skip 及理由）。
+- **不执行任何计算，不需要设备**：不得创建 CUDA 上下文；插件在 `init()` 之前不得碰设备。
+
+**C3 · 并行语义。** axis 是 mesh 里的**有序命名轴**，组是轴掩码；一个 slot 的 layout 是
+**多个 `(dim, group)` 分片 + 至多一个 partial**。本地形状 = 全局形状沿分片维除以该组度数之积，
+**不整除 = 编译期错误**。转换只做单步单轴；多步转换必须由描述显式写出中间 layout。
+五轴里 TP/CP/DP/EP 只改形状与通信，**只有 PP 改节点集合**。
+
+**C4 · 前向语义。** `run --model <dir> --seq <n>` 在**单进程**下跑一次前向，输出 logits 与每层 hidden 的摘要。
+
+### 不变量（违反即失败）
+
+- **I-1**：`rustrain-{abi,ops,parallel,plan,runtime}` 的依赖闭包里不得出现 tch / libtorch / cuda。
+- **I-2**：模型结构只出现在描述文件里；框架代码与 kernel 实现里不得出现本模型的任何张量名或层数。
+- **I-3**：路由/通信要么由布局算术推出，要么由算子的 `collectives` 声明 —— 不得有第三条路。
+- **I-4**：切分轴住在 binding（参数映射）里；不得在框架侧按算子名或张量名查表。
+- **I-5**：写错的描述必须**报错**，不得静默降级。
+
+### 已确认约束（来源标注）
+
+| 约束 | 来源 |
+|---|---|
+| 只做**文本路径**；视觉塔（333 个张量）本 spec 排除 | 用户陈述 |
+| 第一个验证样本是 Qwen3.6-35B-A3B；设计不得为它窄化（加第二个模型不应改语言） | 用户陈述 |
+| 只做**前向**；反向、优化器、训练循环、五轴实际运行不在本 spec | 用户陈述 + 本 spec 范围 |
+| 内存管理留空：峰值只 warn，不拦编译 | 用户陈述（`architecture.md` D12） |
+| 不引入新的融合算子；先跑展开形态 | 用户陈述（粒度选"中"，迭代 1 只需原语 + 模板） |
+| 可复现性：fixture 用**再生脚本**，不 vendor 72GB 权重 | dev-sop 宪法 |
+| 无 GPU 机器必须能跑全部 L1/L2 测试 | `architecture.md` I-1 |
+
+---
+
+## 交付物
+
+（状态标记：`- [ ]` 未开始 / `[-]` 进行中 / `- [x]` 完成。完成须带证据：commit / 测试输出。）
+
+### D1 — 描述文件能表达这个模型
+
+**可观察结果**：存在一份 `qwen3.6-35b-a3b.json` + 一个模型目录（`config.json` 来自 HF 公开仓库），
+展开后得到节点数 ≈ 1000、weight slot 数 = 690（文本）+ 16（MTP）的全局 Plan。
+**交付位置**：模型描述文件随 fixture 一起（见 D2），格式定义在 `docs/design/model-description.md` §3。
+**验收与证据**：
+- `cargo run -q -p rustrain-cli -- plan explain --model <dir> --json | jq '.nodes|length'` > 900
+- 同一输入两次运行得到**逐字节相同**的 plan JSON（确定性）
+- 同名冲突 / 表达式成环 / binding 未命中，各有一条测试证明会报错
+
+### D2 — L2 加载检查对账真实的 1045 个张量
+
+**可观察结果**：`rustrain check --model <dir> --checkpoint <ckpt-meta>` 退出 0，
+报告 `slots_unbound = 0`、`tensors_unconsumed = 0`、`shape_mismatch = 0`。
+**交付位置**：`rustrain check` 子命令 + 一个再生脚本（拉 `model.safetensors.index.json` 与分片头部，
+通过 HTTP Range，不下载权重）。
+**验收与证据**：
+- 一个**故意漏掉一条 binding** 的用例必须失败并指出漏了哪个 slot 模式
+- 一个**故意多声明一个不存在的 checkpoint 张量** 的用例必须失败
+- `tensors_unconsumed` 走的是显式 `ignore` 列表（视觉 333 个 + 明确不用的）
+
+### D3 — 轴与 mesh：任意组合组 + 形状算术
+
+**可观察结果**：`GroupMask` 能表达 `tp|ep`、`tp|dp` 等任意组合；`ParallelLayout` 能表达同一张量上
+多条互不相干的分片；本地形状算术对 `docs/design/qwen36-5d-example.md` §5 的表格逐行成立。
+**验收与证据**：
+- `cargo test -p rustrain-parallel -p rustrain-plan` 全绿
+- 一个测试用**真实形状**断言：`ep=4, tp=2` 下 `experts.gate_up_proj` 的 gate 段本地形状 = `[64, 256, 2048]`
+- 一个测试断言 `tp=3`（`16 % 3 != 0`）在编译期报错，而不是运行期
+
+### D4 — instantiate 与 L1 全绿
+
+**可观察结果**：给定 mesh，`instantiate` 产出具体 Plan（本地形状、组掩码、位置常量），L1 全绿；
+`--json` 报告里内存是 warning 而不是 failure。
+**验收与证据**：
+- `rustrain check --model <dir> --tp 2 --cp 2 --ep 4 --dp 2 --pp 2` 退出 0（L1 部分）
+- `rustrain check ... --tp 3` 非 0，且错误信息指出是**哪个约束**（`num_attention_heads % tp`）
+- 一个测试证明 `Partial` 被兑现：row-parallel linear 之后插入了 `all_reduce({tp})`
+- 一个测试证明 PP 裁剪：`pp=2` 时 stage 0 的节点集合不含 layers 20–39
+
+### D5 — 前向数值对齐 HuggingFace
+
+**可观察结果**：在验证宿主（8× L20X）上，同一段 token、同样的 `input_ids`，rustrain 的 logits 与
+HF transformers 的 logits 在容差内一致；每层 hidden 的 mean/std/max 差异 < 1%（沿用旧框架验证过的方法）。
+**交付位置**：`rustrain-kernels` 的 5 个新原语 reference 实现 + 3 处 T2 声明补齐 + 一个对比脚本。
+**验收与证据**：
+- bf16 下 `max_abs_diff(logits) / max_abs(logits)` < 1%
+- 逐层 hidden 摘要差异 < 1%（前 n 层逐层打印，定位第一处发散的层）
+- `rustrain ops check` 退出 0，每条 skip 写明理由
+
+---
+
+## 依赖与门
+
+- D2 依赖 D1；D4 依赖 D3；D5 依赖 D4。
+- **人类门**：D5 需要在验证宿主上跑，且需要 HF 作为对照实现 —— 提交前需用户确认可在该机跑（占用 GPU）。
+- **不在本 spec**：反向图、优化器、训练循环、PP 微批调度、五轴真实运行、视觉塔、MRoPE、量化、内存管理。
+- 本 spec 默认**单 PR**；拆多 PR 是偏离，需用户显式指定。
+
+---
+
+## 待解决
+
+（空 —— 非空则阻塞执行。）
+
+---
+
+## 上下文层（volatile 快照）
+
+> **快照于 `ae61912` + 2026-09-12**。会过时；执行者须重新探索核对，不盲信本层。
+
+### 基线锁定
+
+- 目标分支：`main`；基线提交：`ae61912`。
+- 工作树：干净（本 spec 提交时）。验证宿主：`root@47.94.214.197:26002`（8× L20X，CUDA 13，torch 2.11，Rust 1.98.1）。
+- 本机（编辑/编译盒）：无 GPU、无 torch。`CARGO_TARGET_DIR=/tmp/tgt-lead`，cargo 在 `/root/.cargo/bin`。
+- 门禁现状：`cargo test --workspace` 219 通过、clippy 零 warning、`ops check` 退出 0。
+
+### 探索证据（快照，file:line 会漂移）
+
+- 编译器 7 个 pass 与其真实行为：见 `docs/design/plan-ir-baseline.md`（含死钩子清单）。
+- `shard::propagate` 收到 `ProcessGroups` 后 `let _ = groups;` 丢弃 —— 拓扑今天没人校验。
+- `ParallelLayout` 是单值 `Shard{dim, group}`；`GroupKind` 封闭六值 + `ProcessGroups.groups: [_; 6]` 定长。
+- `memory.rs` 只取 `req.workspace_bytes`，从不累加 `save_for_backward_bytes`（D12 已决定延后）。
+- 真实模型事实（config、1045 张量、形状、可整除性）见 `docs/design/qwen36-5d-example.md`。
+
+### 探索笔记的位置（与 spec 异地的说明）
+
+本 spec 未新建 `qwen36-text/notes.md`：探索笔记就是上面五份设计文档，它们同时被
+`docs/README.md` 与 `architecture.md` 索引。**移动它们会破坏索引**，所以采用"引用而非复制"。
+这是对 spec 规范"co-locate"的**有意偏离**，已在此披露。
+
+### 驱动力
+
+旧实现把模型结构写在 Rust + C++ 两处（`docs/architecture.md` §5.2），七个模型的权重加载各写一遍，
+新增一个模型 = 改框架。本 spec 验证的假设是：**结构是数据，插件只提供原语，那么支持一个模型 = 写一份
+描述 +（必要时）几个原语**，并且这份描述能在无 GPU 机器上被机械检查。
+
+### 被放弃的方案（指针）
+
+- 细粒度（每个数学步骤一个节点）/ 粗粒度（每层一个算子）→ 选"中"：`op-vocabulary.md` §0。
+- 结构化分片（一个 slot 记住段边界）→ 选"拆成多个 slot"：`op-vocabulary.md` §8.1。
+- EP 当作 instantiation → 修正为 layout + 显式 routing：`model-description.md` §6.1。
+- 度数晚绑定（一个 plan 跑所有度数）→ 选"度数作为编译输入"：`architecture.md` §1.6。
+- 内存预算硬失败 → 改为 warning：`architecture.md` §8 D12。
+
+### 交付物履行状态
+
+- [ ] D1 — 描述文件能表达这个模型
+- [ ] D2 — L2 加载检查对账 1045 个张量
+- [ ] D3 — 轴与 mesh + 形状算术
+- [ ] D4 — instantiate 与 L1 全绿
+- [ ] D5 — 前向数值对齐 HuggingFace
