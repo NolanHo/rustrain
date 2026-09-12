@@ -234,6 +234,31 @@ kernel **不持有 mesh、不按度数分支**。它持有的只有三样：
 **插件在 `init()` 之前不得碰设备。** 否则 `dlopen` 会把 CUDA 上下文拉起来，无 GPU check 就真的"执行"了。
 `Plugin::load` 已经保证"校验通过之后才 `init`"（被拒的插件不执行任何代码）；这条纪律是它的另一半。
 
+### 2.6 算子声明的显存：`workspace_bytes` 与 `save_for_backward_bytes`
+
+`memory()` 回调填 `RsMemReq`（`ffi.rs:411-419`、`rustrain_op.h:139-144`）：
+
+| 字段 | 语义 | 生存期 | 今天 |
+|---|---|---|---|
+| `workspace_bytes` | **这次调用期间**要的临时空间 | 调用结束即释放 | ✅ planner 计入峰值（`memory.rs:648`） |
+| `save_for_backward_bytes` | **调用结束之后仍然持有**、直到反向才释放的字节 | 前向 → 反向，全程占着 | ❌ **死钩子**：ABI 里有，planner 从不累加 |
+| `save_tensor_count` | 持有了几个张量（bookkeeping 与粒度） | 同上 | ❌ 同上 |
+
+**为什么必须声明**：plan 的寿命分析**只看得到 slot**。普通算子的反向输入就是它的输入 slot，planner 看得见；
+但**融合算子内部的中间量不是 slot** —— 它要留到反向，planner 一无所知。于是投影峰值偏低、预算门禁放行，
+然后**训练时 OOM** —— 与"编译期失败，而不是 step 5000 失败"直接冲突。
+
+**为什么只能声明**：留多少是**实现选择**（T1）—— 参考实现可以什么都不留（反向重算），调优实现可能全留。
+同一个算子的两个 variant 可以声明不同的值，所以它属于描述符，不能是框架假设。
+
+**它是另一半的对手**：`PlanNode.checkpoint: CheckpointPolicy{None|Recompute|Offload}` 也是死钩子。
+两个钩子其实是**同一个缺失子系统**的两半 —— 反向激活的显存管理：`save_for_backward_bytes` 是代价，
+`CheckpointPolicy` 是杠杆。旧框架手写了这套东西（激活卸载到 CPU pinned、子层 checkpoint、手工 sequential
+checkpoint），所以它确实需要，且不是新需求。
+
+**落地时框架该做什么**：executor **预留**声明的字节；kernel 实际保存超过声明 → 在那个算子处分配失败，
+而不是静默 OOM。声明错仍只能靠"跑起来"发现 —— **门禁证的是数值等价，不是内存**。
+
 ---
 
 ## 3. 计算路径
