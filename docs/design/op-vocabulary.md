@@ -198,3 +198,67 @@ plan 到千节点量级是正常的，**但这也说明"人读 plan"要靠 `plan
 
 **验收**：`rustrain check --model <qwen36 dir>` 在无 GPU 机器上过 L1 + L2；
 L3 在验证宿主上跑通（数值对齐 HF）。
+
+---
+
+## 8. 融合的粒度：从原语到整模型（Megakernel 可行性）
+
+"Megakernel" 底下混着三件不同的事，必须分开回答：
+
+| | 是什么 | 支持情况 |
+|---|---|---|
+| **A 算子级融合** | 把 N 个原语合成一个 kernel（一层 = 1 个 kernel） | **支持**，但要把 `expansion` 的含义收紧（§8.1）+ 一个前置条件（§8.3） |
+| **B 执行器级融合** | 一次 launch 跑完整个 step（CUDA graph / persistent kernel） | **天然支持**：`CompiledPlan` 本来就是"扁平 step 列表 + 预分配缓冲"，正是可 capture 的形状。graph-replay 是**执行器变体**，不是 plan 变更 |
+| **C 整模型一个算子** | 一个 kernel 里跑完 40 层 | 可以表达（`EXPLICIT`，输入 ids 输出 logits），**但与 PP/EP 冲突**（§8.4） |
+
+### 8.1 收紧 `expansion`：替换点是**模板实例**，不是深度 ≤ 2 的树
+
+spec P-1（`expansion` 深度 ≤ 2）是为"粗描述"场景写的。我们选的是**细描述**：描述本身已经把一层
+展开成子图（§3）。于是融合的定义变成：
+
+> **融合 = 一次图重写：把"某个模板实例"的整段子图替换成一个算子节点。**
+
+- 替换点由**名字**定位（`layers.17` 是 `decoder_full` 的一个实例），**不做结构模式匹配** ——
+  否则框架就要"认识"某种子图形状，那是 T3 泄漏。
+- **不需要在描述符里重复声明深层 expansion**：被替换的子图已经在 plan 里，
+  "等价"由门禁数值证明（融合体 vs 展开体，即"两个实现 + 一个数值基准"）。
+- 描述符只需要声明"我能替换模板 X 的展开形态"，外加它自己的 `infer`/`numerics`/`collectives`/`memory`。
+
+于是粒度是**每模板实例一个开关**：不融合 → 展开图；融合 `attn_full`/`gdn_layer`/`moe_layer` → 块级；
+融合 `decoder_full`/`decoder_linear` → 层级；融合整个 stack → 就要显式加一个"model 模板"（即 C）。
+
+**同一份 plan + 两个 recipe = 融合与展开的对照实验**，门禁负责证等价 ——
+这正是"随时装卸 kernel 做对照"的落地形态。
+
+### 8.2 代价必须说清：每次融合都在拿"可检查性"换速度
+
+| 粒度 | plan 节点数（本模型） | L1 能查什么 | 正确性由谁承担 |
+|---|---|---|---|
+| 原语 | ~1000 | 全查：形状、布局、每个 collective、内存 | 框架 + 门禁 |
+| 块（attn / gdn / moe） | ~400 | 块边界 + 块内推导出的布局 | 块内部 = kernel + 门禁 |
+| 层 | ~120 | 层边界 + PP/EP 位置 | kernel + 门禁 |
+| 整模型 | ~1 | 只有 I/O | 全在 kernel |
+
+**关键**：即使融合，**planner 仍然规划展开形态**，所以 L1 的检查照样全跑，只是 resolve/执行用融合体。
+**可检查性不因融合而消失**；消失的是"框架能替你优化内部"的能力 —— 那是自愿放弃的，不是丢失的。
+
+### 8.3 前置条件：让 `save_for_backward_bytes` 活过来（今天它是死钩子）
+
+`RsMemReq.save_for_backward_bytes` 在 ABI 里（`ffi.rs:418`、`rustrain_op.h:142`），
+但**只有测试读它**；`memory.rs:644` 构造 `RsMemReq` 后从不累加这个字段。
+
+融合 kernel 自己保存中间激活，planner 看不见 → **激活预算被低估 → 训练时 OOM**。
+所以"支持任意粒度融合"的第一条具体工作就是：算子声明 save-for-backward 字节 → planner 计入峰值 →
+超预算照样编译失败。它同时也是**层融合能不能用于训练**的判定条件。
+
+（第二条已有：融合体声明的 `collectives` 必须等于它替换掉的子图里 planner 会插入的集合，
+见 `architecture.md` §2.3。层融合会把 `all_reduce{tp}`、KV `all_gather{cp}`、`all_to_all{tp,ep}`
+全吸进一个 kernel，必须声明，否则调度器不知道有通信、无法 overlap、也无法检查。）
+
+### 8.4 边界（诚实说）
+
+- **层融合一旦吸入 CP 的 KV gather**，它就得自己管跨 rank 的 KV —— 那是 attention kernel 的复杂度
+  （FlashAttention + ring），"编排"帮不上。
+- **C（整模型）与五轴并行正交甚至冲突**：PP 的微批调度与 EP 的专家放置都依赖 plan 里节点可见。
+  一个整模型算子没有"哪些层在本 rank"这个概念。所以 C 是"放弃编排换极限性能"的显式选择，不是免费选项。
+- 融合体**不能**跨 PP 边界（那是进程间通信），也**不能**跨 `EXPLICIT` 算子的数据依赖边界（MoE 的 routing）。

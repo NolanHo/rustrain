@@ -210,6 +210,11 @@ kernel **不持有 mesh、不按度数分支**。它持有的只有三样：
 > **planner 永远规划 primitive expansion。融合是解析期的一次替换，只有当门禁证明"融合体 ≡ 它的 expansion"
 > 时才合法。**
 
+**替换点是"模板实例"**（精确化见 `docs/design/op-vocabulary.md` §8.1）：描述产生的是一张细粒度图，
+融合就是把某个模板实例的整段子图**按名字**换成一个算子节点。不做结构模式匹配 —— 那要求框架"认识"某种
+子图形状，是 T3 泄漏。于是粒度可以是每模板实例一个开关：原语 → 块 → 层 → （显式加 model 模板的）整模型，
+**同一份 plan 换 recipe 就能做融合/展开的对照**。
+
 由此，"这个 kernel 能不能被拆"有了确定答案 —— **不由框架猜，由声明决定**：
 
 - **有 `expansion`** → 框架**总是**能规划它的原语分解。问题不是"能不能拆"，而是"拆了是否更慢"
@@ -458,7 +463,10 @@ P2/P6 直接服务 §0 的边界契约，优先级高于 P1/P4/P5。
   （`compile.rs:696-716`）→ 改诊断路径会改 digest，改内存策略不会。与 §0 推论 3 的意图相反。
 - `GroupKind` 是封闭六值枚举 + `ProcessGroups.groups: [_; 6]` 定长数组（`group.rs:20-49, 142`）→
   §1.1 的 opaque axis id 迁移是表达 hybrid mesh 的前置条件。
-- `SlotKind::State` / `Gradient` 无任何构造点（`memory.rs:551` 会读）→ §1.7 的状态管理今天没有承载。
+- **`SlotKind::State` / `Gradient` 无任何构造点（`memory.rs:551` 会读）→ §1.7 的状态管理今天没有承载。**
+- **`RsMemReq.save_for_backward_bytes` 是死钩子**（ABI 里有，`ffi.rs:418`；只有测试读，
+  `memory.rs:644` 构造后从不累加）→ 融合 kernel 自己保存的激活不计入预算，**激活峰值被低估**。
+  这是"支持任意粒度融合（含 Megakernel）"的前置条件，见 `docs/design/op-vocabulary.md` §8.3。
 - `PlanMeta.parallel` 在 plan crate 内无读者，CLI 靠手工传两次（`cli/main.rs:340-343`）→
   §1.1 的"描述 × 拓扑"没有单一入口。
 - 没有 plan 的持久化入口（`Plan` 派生 `Serialize` 但全仓无读写路径）→ 描述层的产物今天只能走内存对象。
