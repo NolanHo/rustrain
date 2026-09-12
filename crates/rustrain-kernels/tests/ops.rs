@@ -251,7 +251,7 @@ fn op(name: &str) -> &'static RsOpDesc {
         .unwrap_or_else(|| panic!("op '{name}' not registered"))
 }
 
-unsafe fn last_err(o: &'static RsOpDesc) -> String {
+unsafe fn last_err(o: &'static RsOpDesc) -> String { unsafe {
     let f = o.last_error.unwrap();
     let p = unsafe { f(ptr::null_mut()) };
     if p.is_null() {
@@ -259,7 +259,7 @@ unsafe fn last_err(o: &'static RsOpDesc) -> String {
     } else {
         CStr::from_ptr(p).to_string_lossy().into_owned()
     }
-}
+}}
 
 unsafe fn call_infer(
     o: &'static RsOpDesc,
