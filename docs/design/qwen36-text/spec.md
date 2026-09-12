@@ -88,12 +88,20 @@ rustrain check --model <model-dir> [--checkpoint <dir>] [--tp N --cp N --ep N --
 
 ### D1 — 描述文件能表达这个模型
 
-**可观察结果**：存在一份 `qwen3.6-35b-a3b.json` + 一个模型目录（`config.json` 来自 HF 公开仓库），
-展开后得到节点数 ≈ 1000、weight slot 数 = 693（文本：根 3 + 层内合计 80+270+60+280）+ 19（MTP）= **712** 的全局 Plan；
-其余 333 是视觉塔（本 spec 排除）。
-**交付位置**：模型描述文件随 fixture 一起（见 D2），格式定义在 `docs/design/model-description.md` §3。
+**可观察结果**：存在一份 `model.json` + 一个模型目录（`config.json` 来自 HF 公开仓库），
+展开后得到一个全局 Plan：**节点数 > 900**、**总 slot 数 > 900**。实测：**1047 节点 / 1943 slot**。
+
+> **注意：weight slot 数与 checkpoint 张量数不相等，也不该相等。**
+> checkpoint 有 **712** 个文本+MTP 权重张量（文本 693 = 根 3 + 层内合计 80+270+60+280，加 MTP 19），
+> 描述要**拆开融合存储**（`q_proj` → `q` + `gate`、`in_proj_qkv` → Q/K/V、融合 `gate_up` → gate/up），
+> 因为 HF 的 `[gate|up]` 布局按 TP 连续切一刀会切开语义边界（`docs/design/qwen36-5d-example.md` §3）。
+> **weight slot 实测 = 884**（= 712 + 2×30 + 2×30 + 11 + 41）。权威验收是上面两个 `> 900`；
+> **不要为了凑 weight slot 的数字把被拆掉的融合张量本身也留成 slot** —— 那会造出无人读取的 slot。
+> "每个 slot 都有来源、每个张量都被消费"的对账是 **D2** 的验收（离线预演已通过：46 条 binding 精确覆盖 712/712，0 缺失 0 编造）。
+
+**交付位置**：描述文件与 fixture 同处（见 D2），格式定义在 `docs/design/model-description.md` §3 与 §3.6。
 **验收与证据**：
-- `cargo run -q -p rustrain-cli -- plan explain --model <dir> --json | jq '.nodes|length'` > 900
+- `cargo run -q -p rustrain-cli -- plan explain --model <dir> --json | jq '.nodes|length'` > 900 且 `'.slots|length'` > 900
 - 同一输入两次运行得到**逐字节相同**的 plan JSON（确定性）
 - 同名冲突 / 表达式成环 / binding 未命中，各有一条测试证明会报错
 

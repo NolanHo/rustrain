@@ -279,6 +279,21 @@ D1 的验收测试暴露了十处未定义。以下裁定**是契约的一部分
 | 9 | 二进制名 | **`rustrain`**（`crates/rustrain-cli/Cargo.toml` 加 `[[bin]] name = "rustrain"`）。文档里所有 `rustrain …` 命令以此为准 |
 | 10 | `dtype` 没有可用实现时 `explain` 的行为 | `plan explain` **不因缺实现而失败**：它在 `implementations` 里报告未解析的算子与原因，退出码仍为 0。**`check` 才要求解析成功**（那是 L1 的一部分）。这样"用真实 bf16 描述看结构"与"用 f32 跑门禁"两件事都能做 |
 
+### 3.7 第二轮裁定（D1 实现反馈）
+
+| # | 问题 | 裁定 |
+|---|---|---|
+| 1 | **中间激活的形状没有声明位置** | **模板必须声明所有被节点写入的 slot**（含中间激活），`{name, kind, dtype, shape}` 齐全；节点的 `out` 只能引用已声明的 slot 或该实例的 `outputs`，否则**报错**。<br>**为什么不能"由编译器 infer 回填"**：那会让无 GPU 的 L1 形状检查依赖"存在可解析的实现"，而真实描述是 bf16、reference provider 只有 f32 —— **整条 L1 就废了**。声明齐全后 L1 才能做"声明 vs infer"的全量比对。这条**修语言** |
+| 2 | weight slot 数不是 > 900 | **实测 884**（= 712 + 2×30 `in_proj_qkv` + 2×30 `conv1d` + 11 `q_proj` + 41 `gate_up`）。**不去凑这个数字**：权威验收是 `nodes > 900` 与总 `slots > 900`（实测 1047 / 1943）。为了凑数把被拆掉的融合张量本身也留成 slot 是错的 —— 那会造出**无人读取的 slot**，正是本项目的头号禁忌 |
+| 3 | `digest` / `steps` / `memory` 在未编译的模型路径上 | 照 `--model` 的语义定义：`counts.steps = 0`；`digest` = 全局 Plan JSON 的 blake3；`memory` 全 0；`collectives` 为空。它们是**编译产物的占位**，不是谎报 —— `plan explain --model` 的语义是"展开 + 报告"，不是"编译" |
+| 4 | §3.5 的三条强制性在 expand 阶段做不了 | 划清边界：§3.5 的三条（本地形状一致、split 区间、张量消费）**属于 L2 / D2**；expand 阶段只做**模式层**校验（每个 weight slot 被恰好一条 binding 命中、source 不重复、两侧 `{*}` 数相等） |
+| 5 | `attrs` 只能是字面量 | **接受**：本迭代不支持参数化属性（`rotary_dim`、`theta` 等写成字面量，与 config 重复）。这是**已知的重复**，等有需要再加表达式 |
+| 6 | `params.*.from` 也要能取字符串列表 | **接受**：否则 40 项 `layer_types` 要抄进描述，成为第二个事实来源 |
+| 7 | `--model` 与 `--tp` 同用 | `--model` 路径**忽略** `--tp`（全局 Plan 无 mesh），stderr 一行提示；`--tp` 属于 `check`（D3/D4） |
+| 8 | `until` / `{last}` 的语义 | 按实现采纳并固化：`until: "<param>"` = 按该参数计数展开，索引变量 `l`，`0` = 不展开；`{last}` = 最近一次重复展开的最后一个下标 |
+| 9 | dtype 在 plan JSON 里的拼写 | 呈现层用 `RsDtype::name()` 的小写拼写；IR 自身的 serde 形态不在本 spec 范围 |
+| 10 | fixture 的 `seq` 取 `max_position_embeddings`（262144） | **改为显式小值（512）**：序列长度是**运行期**选择，不是模型常量；262144 会污染形状表并误导后续的本地形状推导 |
+
 ---
 
 ## 4. 展开与实例化语义

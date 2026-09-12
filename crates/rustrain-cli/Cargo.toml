@@ -5,15 +5,24 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
+# The binary is `rustrain` (§3.6 #9); `src/main.rs` is claimed explicitly, so no
+# second target is auto-discovered under the package name.
+autobins = false
+
+[[bin]]
+name = "rustrain"
+path = "src/main.rs"
 
 # Invariant I-1: no tch / libtorch / cuda in the dependency closure.
 [dependencies]
 rustrain-abi.workspace = true
 rustrain-ops.workspace = true
 rustrain-plan.workspace = true
+rustrain-model.workspace = true
 rustrain-runtime.workspace = true
 rustrain-kernels.workspace = true
 rustrain-parallel.workspace = true
+blake3.workspace = true
 clap.workspace = true
 anyhow.workspace = true
 serde_json.workspace = true

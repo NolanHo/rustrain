@@ -1,0 +1,340 @@
+//! `expand` 的行为：链式接线、`select` 按列表下标、`split` → `targets`、以及六条错误路径。
+//!
+//! 用小描述在内存里跑（不动文件系统），真实模型的 fixture 在 `tests/qwen36_text.rs`。
+
+use rustrain_model::{ModelDesc, ModelError, expand};
+use rustrain_plan::SlotKind;
+
+fn config() -> serde_json::Value {
+    serde_json::json!({
+        "text_config": {
+            "hidden_size": 16,
+            "num_hidden_layers": 3,
+            "max_position_embeddings": 8
+        }
+    })
+}
+
+/// 与 `crates/rustrain-cli/tests/fixtures/model-desc/ok` 同构的最小模型。
+fn tiny() -> ModelDesc {
+    serde_json::from_str(
+        r#"{
+        "format": "rustrain.model.v1",
+        "name": "tiny-text",
+        "dtype": "f32",
+        "inputs": { "hidden_in": { "shape": ["seq", "hidden"], "kind": "input" } },
+        "params": {
+            "seq": { "from": "text_config.max_position_embeddings", "default": 8 },
+            "hidden": { "from": "text_config.hidden_size" },
+            "inter": { "expr": "2 * hidden" },
+            "layers": { "from": "text_config.num_hidden_layers" }
+        },
+        "templates": {
+            "norm": {
+                "inputs": { "x": { "shape": ["seq", "hidden"], "kind": "activation" } },
+                "outputs": { "y": { "shape": ["seq", "hidden"], "kind": "activation" } },
+                "slots": [ { "name": "w", "kind": "weight", "shape": ["hidden"] } ],
+                "nodes": [ { "op": "rmsnorm", "in": ["x", "w"], "out": ["y"] } ]
+            },
+            "decoder": {
+                "inputs": { "x": { "shape": ["seq", "hidden"], "kind": "activation" } },
+                "outputs": { "y": { "shape": ["seq", "hidden"], "kind": "activation" } },
+                "slots": [
+                    { "name": "attn_norm", "kind": "weight", "shape": ["hidden"] },
+                    { "name": "qkv", "kind": "weight", "shape": ["hidden", "hidden"] },
+                    { "name": "wo", "kind": "weight", "shape": ["hidden", "hidden"] },
+                    { "name": "mlp_norm", "kind": "weight", "shape": ["hidden"] },
+                    { "name": "wg", "kind": "weight", "shape": ["hidden", "inter"] },
+                    { "name": "wu", "kind": "weight", "shape": ["hidden", "inter"] },
+                    { "name": "wd", "kind": "weight", "shape": ["inter", "hidden"] }
+                ],
+                "nodes": [
+                    { "op": "rmsnorm", "in": ["x", "attn_norm"], "out": ["h1"] },
+                    { "op": "linear", "in": ["h1", "qkv"], "out": ["q"] },
+                    { "op": "elementwise_unary", "in": ["q"], "out": ["qa"], "attrs": { "kind": "silu" } },
+                    { "op": "linear", "in": ["qa", "wo"], "out": ["attn"] },
+                    { "op": "elementwise_binary", "in": ["h1", "attn"], "out": ["h2"], "attrs": { "kind": "mul" } },
+                    { "op": "rmsnorm", "in": ["h2", "mlp_norm"], "out": ["h3"] },
+                    { "op": "linear", "in": ["h3", "wg"], "out": ["g"] },
+                    { "op": "elementwise_unary", "in": ["g"], "out": ["gs"], "attrs": { "kind": "silu" } },
+                    { "op": "linear", "in": ["h3", "wu"], "out": ["u"] },
+                    { "op": "elementwise_binary", "in": ["gs", "u"], "out": ["gu"], "attrs": { "kind": "mul" } },
+                    { "op": "linear", "in": ["gu", "wd"], "out": ["y"] }
+                ]
+            }
+        },
+        "stack": [
+            { "template": "norm", "prefix": "norm_in", "inputs": { "x": "hidden_in" } },
+            { "template": "decoder", "prefix": "layers.{l}", "repeat": { "count": "layers", "index": "l" } },
+            { "template": "norm", "prefix": "norm_out" }
+        ],
+        "binding": [
+            { "slot": "norm_in.w", "source": "model.norm_in.weight" },
+            { "slot": "norm_out.w", "source": "model.norm.weight" },
+            { "slot": "layers.*.attn_norm", "source": "model.layers.{*}.attn_norm.weight" },
+            { "slot": "layers.*.qkv", "source": "model.layers.{*}.qkv.weight" },
+            { "slot": "layers.*.wo", "source": "model.layers.{*}.wo.weight" },
+            { "slot": "layers.*.mlp_norm", "source": "model.layers.{*}.mlp_norm.weight" },
+            { "slot": "layers.*.wg", "source": "model.layers.{*}.wg.weight" },
+            { "slot": "layers.*.wu", "source": "model.layers.{*}.wu.weight" },
+            { "slot": "layers.*.wd", "source": "model.layers.{*}.wd.weight" }
+        ]
+    }"#,
+    )
+    .unwrap()
+}
+
+fn weight_slots(plan: &rustrain_plan::Plan) -> usize {
+    plan.slots
+        .iter()
+        .filter(|slot| slot.kind == SlotKind::Weight)
+        .count()
+}
+
+#[test]
+fn expands_the_stack_with_chained_wiring() {
+    let expanded = expand(&tiny(), &config()).unwrap();
+    let plan = &expanded.plan;
+
+    assert_eq!(plan.nodes.len(), 35, "1 norm + 3 decoder + 1 norm");
+    assert_eq!(weight_slots(plan), 23);
+    assert_eq!(plan.slots.len(), 59);
+
+    // 链式接线：第一层的输入是 norm_in 的输出，之后是上一层的输出。
+    for layer in 0..3 {
+        let node = plan
+            .nodes
+            .iter()
+            .find(|n| n.source.path == format!("layers.{layer}.h1"))
+            .expect("每一层都有 input_layernorm 节点");
+        let expected = if layer == 0 {
+            "norm_in.y".to_string()
+        } else {
+            format!("layers.{}.y", layer - 1)
+        };
+        assert_eq!(plan.slot(node.inputs[0]).name, expected);
+    }
+    // 实例端口接的是已存在的全局 slot，不会为每个实例新造一个 `layers.N.x`。
+    assert!(plan.slot_id("layers.0.x").is_none());
+
+    // 中间激活没有声明形状 → 继承第一个输入。
+    let h1 = plan.slot_id("layers.0.h1").unwrap();
+    assert_eq!(plan.slot(h1).shape, vec![8, 16]);
+    assert_eq!(plan.slot(h1).kind, SlotKind::Activation);
+    // 声明的 output 用自己的形状。
+    let y = plan.slot_id("layers.0.y").unwrap();
+    assert_eq!(plan.slot(y).shape, vec![8, 16]);
+}
+
+#[test]
+fn bindings_cover_every_weight_slot_and_the_plan_is_deterministic() {
+    let first = expand(&tiny(), &config()).unwrap();
+    let second = expand(&tiny(), &config()).unwrap();
+
+    let bound: usize = first.bindings.iter().map(|b| b.slots.len()).sum();
+    assert_eq!(bound, weight_slots(&first.plan));
+    assert_eq!(first.bindings.len(), 9);
+
+    let a = serde_json::to_string(&first.plan).unwrap();
+    let b = serde_json::to_string(&second.plan).unwrap();
+    assert_eq!(a, b, "同一份描述必须得到同一个 Plan");
+    assert!(
+        a.contains("\"replicate\""),
+        "全局 Plan 的 layout 全 Replicate"
+    );
+}
+
+#[test]
+fn select_picks_a_template_by_list_index() {
+    let mut desc = tiny();
+    let mut extra: ModelDesc = serde_json::from_str(
+        r#"{
+        "format": "rustrain.model.v1",
+        "name": "two-templates",
+        "dtype": "f32",
+        "inputs": { "hidden_in": { "shape": ["seq", "hidden"], "kind": "input" } },
+        "params": {
+            "seq": { "from": "text_config.max_position_embeddings", "default": 8 },
+            "hidden": { "from": "text_config.hidden_size" },
+            "layers": { "from": "text_config.num_hidden_layers" },
+            "layer_types": ["full", "linear", "full"]
+        },
+        "templates": {
+            "full": {
+                "inputs": { "x": { "shape": ["seq", "hidden"], "kind": "activation" } },
+                "outputs": { "y": { "shape": ["seq", "hidden"], "kind": "activation" } },
+                "slots": [ { "name": "w", "kind": "weight", "shape": ["hidden"] } ],
+                "nodes": [ { "op": "rmsnorm", "in": ["x", "w"], "out": ["y"] } ]
+            },
+            "linear": {
+                "inputs": { "x": { "shape": ["seq", "hidden"], "kind": "activation" } },
+                "outputs": { "y": { "shape": ["seq", "hidden"], "kind": "activation" } },
+                "slots": [ { "name": "w", "kind": "weight", "shape": ["hidden"] } ],
+                "nodes": [ { "op": "silu_gate", "in": ["x", "w"], "out": ["y"] } ]
+            }
+        },
+        "stack": [
+            { "template": "full", "prefix": "layers.{l}", "repeat": { "count": "layers", "index": "l" },
+              "inputs": { "x": "hidden_in" },
+              "select": { "by": "layer_types[l]", "cases": { "full": "full", "linear": "linear" } } }
+        ],
+        "binding": [ { "slot": "layers.*.w", "source": "model.layers.{*}.w" } ]
+    }"#,
+    )
+    .unwrap();
+    extra.inputs = desc.inputs.clone();
+    desc = extra;
+
+    let expanded = expand(&desc, &config()).unwrap();
+    let ops: Vec<&str> = expanded
+        .plan
+        .nodes
+        .iter()
+        .map(|n| n.op.name.as_str())
+        .collect();
+    assert_eq!(ops, vec!["rmsnorm", "silu_gate", "rmsnorm"]);
+}
+
+#[test]
+fn a_binding_that_matches_nothing_names_the_pattern() {
+    let mut desc = tiny();
+    desc.binding.push(
+        serde_json::from_str(
+            r#"{ "slot": "layers.*.no_such_weight", "source": "model.layers.{*}.no_such_weight" }"#,
+        )
+        .unwrap(),
+    );
+    let err = expand(&desc, &config()).unwrap_err();
+    assert!(err.to_string().contains("layers.*.no_such_weight"), "{err}");
+}
+
+#[test]
+fn a_weight_slot_without_a_binding_is_rejected() {
+    let mut desc = tiny();
+    desc.binding
+        .retain(|b| b.slot.as_deref() != Some("layers.*.wd"));
+    let err = expand(&desc, &config()).unwrap_err();
+    assert!(err.to_string().contains("layers.0.wd"), "{err}");
+}
+
+#[test]
+fn a_duplicate_instance_prefix_names_it() {
+    let mut desc = tiny();
+    let mut entry = desc.stack[0].clone();
+    entry.prefix = "norm_in".to_string();
+    desc.stack.insert(1, entry);
+    let err = expand(&desc, &config()).unwrap_err();
+    assert!(err.to_string().contains("norm_in"), "{err}");
+}
+
+#[test]
+fn a_split_binding_feeds_several_slots() {
+    let mut desc = tiny();
+
+    // layers.*.qkv -> q | k：一条 source 拆成两个 slot。
+    desc.binding
+        .retain(|b| b.slot.as_deref() != Some("layers.*.qkv"));
+    let decoder = desc.templates.get_mut("decoder").unwrap();
+    decoder.slots.retain(|s| s.name != "qkv");
+    decoder.slots.push(
+        serde_json::from_str(
+            r#"{ "name": "wq", "kind": "weight", "shape": ["hidden", "hidden"] }"#,
+        )
+        .unwrap(),
+    );
+    decoder.slots.push(
+        serde_json::from_str(
+            r#"{ "name": "wk", "kind": "weight", "shape": ["hidden", "hidden"] }"#,
+        )
+        .unwrap(),
+    );
+    let node = decoder
+        .nodes
+        .iter_mut()
+        .find(|n| n.inputs == vec!["h1".to_string(), "qkv".to_string()])
+        .expect("第一个 linear 消费 qkv");
+    node.inputs[1] = "wq".to_string();
+    desc.binding.push(
+        serde_json::from_str(
+            r#"{
+                "source": "model.layers.{*}.qkv.weight",
+                "transform": ["transpose(0,1)"],
+                "split": { "dim": 0, "sizes": ["hidden", "hidden"] },
+                "targets": [
+                    { "slot": "layers.*.wq", "axes": { "1": ["tp"] } },
+                    { "slot": "layers.*.wk", "axes": { "1": ["tp"] } }
+                ]
+            }"#,
+        )
+        .unwrap(),
+    );
+
+    let expanded = expand(&desc, &config()).unwrap();
+    let split = expanded
+        .bindings
+        .iter()
+        .find(|b| b.split.is_some())
+        .expect("split binding");
+    assert_eq!(split.slots.len(), 6, "3 层 × 2 个 target");
+    assert_eq!(split.split.as_ref().unwrap().sizes, vec![16, 16]);
+    assert_eq!(
+        split.slots[0].axes.get("1").unwrap(),
+        &vec!["tp".to_string()]
+    );
+}
+
+#[test]
+fn a_duplicate_slot_name_names_both_origins() {
+    let mut desc = tiny();
+    let duplicate = desc.templates["norm"].slots[0].clone();
+    desc.templates
+        .get_mut("norm")
+        .unwrap()
+        .slots
+        .push(duplicate);
+    let err = expand(&desc, &config()).unwrap_err();
+    let text = err.to_string();
+    assert!(text.contains("norm_in.w"), "{text}");
+    assert!(text.contains("declared twice"), "{text}");
+    assert!(text.contains("template slot `w`"), "{text}");
+}
+
+#[test]
+fn a_node_may_not_write_a_weight_slot() {
+    let mut desc = tiny();
+    let decoder = desc.templates.get_mut("decoder").unwrap();
+    // 第一个 linear 的输出去写它自己读的权重 slot。
+    let node = decoder
+        .nodes
+        .iter_mut()
+        .find(|n| n.inputs == vec!["h1".to_string(), "qkv".to_string()])
+        .unwrap();
+    node.outputs = vec!["qkv".to_string()];
+    let err = expand(&desc, &config()).unwrap_err();
+    let text = err.to_string();
+    assert!(text.contains("qkv"), "{text}");
+    assert!(text.contains("Weight"), "{text}");
+}
+
+#[test]
+fn a_wrong_format_string_is_rejected() {
+    let mut desc = tiny();
+    desc.format = "rustrain.model.v2".to_string();
+    match expand(&desc, &config()) {
+        Err(ModelError::Format { found, expected }) => {
+            assert_eq!(found, "rustrain.model.v2");
+            assert_eq!(expected, "rustrain.model.v1");
+        }
+        other => panic!(
+            "expected a format error, got {other:?}",
+            other = other.err()
+        ),
+    }
+}
+
+#[test]
+fn a_typo_in_the_description_is_not_silently_ignored() {
+    let text = r#"{ "format": "rustrain.model.v1", "name": "x", "stak": [] }"#;
+    let err = serde_json::from_str::<ModelDesc>(text).unwrap_err();
+    assert!(err.to_string().contains("stak"), "{err}");
+}

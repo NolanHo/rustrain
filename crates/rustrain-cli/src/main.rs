@@ -5,10 +5,13 @@
 //! * `ops list` — what implementations exist on this machine.
 //! * `plan explain` — what will actually run, with which implementation, at
 //!   which precision, with which communication spliced in, and how much memory
-//!   it projects.
+//!   it projects. With `--model <dir>` it instead expands a model description
+//!   into the *global* plan (topology-free, every layout replicated) and reports
+//!   which operators this machine has an implementation for.
 //!
 //! Neither reads an environment variable, and neither needs a GPU.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
@@ -17,7 +20,7 @@ use clap::{Args, Parser, Subcommand};
 use rustrain_abi::Plugin;
 use rustrain_ops::{Phase, Recipe, Registry, TargetEnv};
 use rustrain_parallel::{GroupKind, ParallelConfig, ParallelLayout};
-use rustrain_plan::{Attrs, OpRef, PlanBuilder, SlotKind};
+use rustrain_plan::{Attrs, OpRef, Plan, PlanBuilder, PlanNode, Slot, SlotKind};
 
 #[derive(Parser)]
 #[command(name = "rustrain", about = "Operator-first training framework", version)]
@@ -78,6 +81,10 @@ enum PlanCommand {
         /// Recipe file. Omitted: the built-in reference provider is selected.
         #[arg(long, value_name = "PATH")]
         recipe: Option<PathBuf>,
+        /// Model directory (`config.json` + `model.json`). Given it, the global
+        /// plan is expanded instead of the demonstration plan being compiled.
+        #[arg(long, value_name = "DIR")]
+        model: Option<PathBuf>,
         /// Tensor-parallel degree for the demonstration plan.
         #[arg(long, default_value_t = 1)]
         tp: usize,
@@ -100,10 +107,14 @@ fn main() -> Result<()> {
         Command::Plan(args) => match args.command {
             PlanCommand::Explain {
                 recipe,
+                model,
                 tp,
                 plugins,
                 json,
-            } => plan_explain(recipe.as_deref(), tp, &plugins, json),
+            } => match model {
+                Some(dir) => plan_explain_model(&dir, recipe.as_deref(), tp, &plugins, json),
+                None => plan_explain(recipe.as_deref(), tp, &plugins, json),
+            },
         },
     }
 }
@@ -348,8 +359,13 @@ fn plan_explain(
             "name": compiled.plan.meta.name,
             "digest": compiled.digest,
             "world_size": compiled.parallel.world_size(),
-            "slots": compiled.plan.slots.len(),
-            "steps": compiled.steps.len(),
+            "counts": {
+                "slots": compiled.plan.slots.len(),
+                "nodes": compiled.plan.nodes.len(),
+                "steps": compiled.steps.len(),
+            },
+            "slots": compiled.plan.slots.iter().map(slot_json).collect::<Vec<_>>(),
+            "nodes": plan_nodes_json(&compiled.plan),
             "implementations": compiled.resolved.iter().map(|r| serde_json::json!({
                 "node": r.node.0,
                 "op": r.spec_name,
@@ -375,4 +391,164 @@ fn plan_explain(
 
     print!("{}", compiled.explain());
     Ok(())
+}
+
+/// `plan explain --model <dir>`：描述 → **全局 Plan**，再报告每个算子在本机有没有实现。
+///
+/// 这里**不编译**：全局 Plan 的形状与 `layout` 是"全量 + 全 Replicate"，要到 `instantiate`
+/// 拿到 mesh 才能编译（`docs/design/model-description.md` §0）。而契约 §3.6 #10 要的正是
+/// "dtype 没有可用实现时 explain 不失败"：未解析的算子进 `implementations` 报告，退出码仍为 0。
+fn plan_explain_model(
+    dir: &Path,
+    recipe_path: Option<&Path>,
+    tp: usize,
+    plugins: &[PathBuf],
+    json: bool,
+) -> Result<()> {
+    let expanded = rustrain_model::expand_dir(dir)
+        .with_context(|| format!("expanding the model description in {}", dir.display()))?;
+    if tp != 1 {
+        eprintln!(
+            "note: --tp {tp} is ignored with --model: the global plan is topology-free and every \
+             layout is replicate"
+        );
+    }
+
+    let registry = load_registry(plugins)?;
+    let recipe = load_recipe(recipe_path)?;
+    let env = TargetEnv::default();
+    let plan = expanded.plan;
+
+    // 逐节点解析：哪种实现会跑，或者为什么没有（契约 R-1 的拒绝理由原样带出）。
+    let mut implementations = Vec::with_capacity(plan.nodes.len());
+    let mut unresolved: BTreeMap<(String, String), usize> = BTreeMap::new();
+    for (index, node) in plan.nodes.iter().enumerate() {
+        let dtypes: Vec<_> = node
+            .inputs
+            .iter()
+            .map(|slot| plan.slot(*slot).dtype)
+            .collect();
+        match recipe.resolve(&registry, &node.op.name, node.phase, &dtypes, &env) {
+            Ok(op) => implementations.push(serde_json::json!({
+                "node": index,
+                "op": op.op.spec_name(),
+                "plugin": op.op.plugin_identity(),
+            })),
+            Err(e) => {
+                let reason = e.to_string();
+                *unresolved
+                    .entry((node.op.name.clone(), reason.clone()))
+                    .or_default() += 1;
+                implementations.push(serde_json::json!({
+                    "node": index,
+                    "op": node.op.name,
+                    "resolved": false,
+                    "reason": reason,
+                }));
+            }
+        }
+    }
+
+    let digest = blake3::hash(&serde_json::to_vec(&plan)?)
+        .to_hex()
+        .to_string();
+    let weights = plan
+        .slots
+        .iter()
+        .filter(|slot| slot.kind == SlotKind::Weight)
+        .count();
+
+    if json {
+        let doc = serde_json::json!({
+            "name": plan.meta.name,
+            "digest": digest,
+            "world_size": plan.meta.parallel.world_size(),
+            "counts": {
+                "slots": plan.slots.len(),
+                "nodes": plan.nodes.len(),
+                // 全局 Plan 没有编译过，所以没有 step（每个节点在 instantiate 之后才成为 step）。
+                "steps": 0,
+                "weights": weights,
+                "bindings": expanded.bindings.len(),
+            },
+            "slots": plan.slots.iter().map(slot_json).collect::<Vec<_>>(),
+            "nodes": plan_nodes_json(&plan),
+            "implementations": implementations,
+            "collectives": Vec::<serde_json::Value>::new(),
+            "memory": {
+                "peak_bytes": 0,
+                "persistent_bytes": 0,
+                "activation_pool_bytes": 0,
+                "max_workspace_bytes": 0,
+                "budget_bytes": 0,
+            },
+        });
+        println!("{}", serde_json::to_string_pretty(&doc)?);
+        return Ok(());
+    }
+
+    println!(
+        "plan {}  digest {}  global (no mesh; every layout is replicate)",
+        plan.meta.name,
+        &digest[..12.min(digest.len())]
+    );
+    println!(
+        "  counts  slots {}  nodes {}  weights {}  bindings {}",
+        plan.slots.len(),
+        plan.nodes.len(),
+        weights,
+        expanded.bindings.len()
+    );
+    let unresolved_nodes: usize = unresolved.values().sum();
+    if unresolved_nodes == 0 {
+        println!(
+            "  implementations: all {} node(s) resolve on this machine",
+            plan.nodes.len()
+        );
+    } else {
+        println!(
+            "  implementations: {unresolved_nodes} of {} node(s) have no implementation here \
+             (exit code stays 0, §3.6 #10):",
+            plan.nodes.len()
+        );
+        for ((op, reason), count) in &unresolved {
+            // 解析失败的第一行就够定位；候选表与契约引用在 `--json` 里。
+            let headline = reason.lines().next().unwrap_or(reason);
+            println!("    {op} × {count}: {headline}");
+        }
+    }
+    Ok(())
+}
+
+/// 一个 slot 的 JSON 形态。
+///
+/// `dtype` 用 [`rustrain_abi::ffi::RsDtype::name`] 的拼写（§3.6 #5 的词表）——派生 `Serialize`
+/// 写的是 ABI 的整数编号，对读 plan 的人没有意义。
+fn slot_json(slot: &Slot) -> serde_json::Value {
+    serde_json::json!({
+        "name": slot.name,
+        "dtype": slot.dtype.name(),
+        "shape": slot.shape,
+        "kind": format!("{:?}", slot.kind).to_lowercase(),
+        "layout": slot.layout,
+    })
+}
+
+/// 一个节点的 JSON 形态。输入输出按 slot 名列出，因为 1000 个节点的 plan 里索引不可读。
+fn plan_nodes_json(plan: &Plan) -> Vec<serde_json::Value> {
+    plan.nodes
+        .iter()
+        .enumerate()
+        .map(|(index, node): (usize, &PlanNode)| {
+            serde_json::json!({
+                "id": index,
+                "op": node.op.display(),
+                "inputs": node.inputs.iter().map(|s| plan.slot(*s).name.clone()).collect::<Vec<_>>(),
+                "outputs": node.outputs.iter().map(|s| plan.slot(*s).name.clone()).collect::<Vec<_>>(),
+                "attrs": node.attrs,
+                "phase": node.phase,
+                "source": node.source.path,
+            })
+        })
+        .collect()
 }

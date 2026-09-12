@@ -5,6 +5,7 @@ members = [
     "crates/rustrain-ops",
     "crates/rustrain-parallel",
     "crates/rustrain-plan",
+    "crates/rustrain-model",
     "crates/rustrain-runtime",
     "crates/rustrain-kernels",
     "crates/rustrain-cli",
@@ -23,6 +24,7 @@ rustrain-abi = { path = "crates/rustrain-abi" }
 rustrain-ops = { path = "crates/rustrain-ops" }
 rustrain-parallel = { path = "crates/rustrain-parallel" }
 rustrain-plan = { path = "crates/rustrain-plan" }
+rustrain-model = { path = "crates/rustrain-model" }
 rustrain-runtime = { path = "crates/rustrain-runtime" }
 rustrain-kernels = { path = "crates/rustrain-kernels" }
 
