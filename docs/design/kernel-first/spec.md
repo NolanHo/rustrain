@@ -248,6 +248,54 @@ overlap_collectives = true
 
 **契约 M-1**：给定同一个 manifest，`rustrain plan digest --manifest <path>` 必须复现相同 digest。
 
+
+### 2.10 显存策略
+
+训练时的绑定约束是**激活寿命**，不是 KV cache。KV cache 只在三处重要：rollout/生成（推理缓存，
+需分页与淘汰）、有状态注意力（GLM-5 IndexShare / Qwen3.6 gated delta rule —— 序列内持久且带梯度）、
+长序列分块或 ring attention（当前 chunk 的 K/V 必须实体化）。两者共用分配器，策略完全不同。
+
+要管的是五类：权重与主权重、梯度、优化器状态、**激活**、workspace 与通信缓冲。
+
+**契约 MEM-1（策略是声明的）**：每个节点的激活策略来自 recipe，优先级与算子选择一致
+（node 级 → 算子级 → 默认）。任何 kernel 不得自行决定是否 offload / recompute。
+
+**契约 MEM-2（峰值在编译期计算）**：slot 的寿命由图上"生产者 → 最后消费者"静态确定
+（forward 产出的激活要到 backward 才死）。编译器据此投影整个 step 的峰值显存：
+存活槽位 + workspace + 通信缓冲。**不得依赖运行时 OOM 才发现放不下。**
+
+**契约 MEM-3（预算门禁）**：峰值超过 `budget_bytes` 时编译失败，错误必须指出峰值出现在哪一步、
+以及哪些策略能把它压下来。`auto` 模式按 keep → offload → recompute 的确定顺序降级，
+并把每一次降级决策记入 plan digest 与日志（与 R-2 同一原则：降级必须显式且可追溯）。
+
+**契约 MEM-4（寿命复用）**：寿命区间不相交的槽位必须复用同一块缓冲，产出 `MemoryPlan`。
+复用决策是 digest 的一部分（它决定执行期的地址，而地址影响 CUDA graph 捕获）。
+
+**契约 MEM-5（state 是独立一类）**：`SlotKind` 区分 `State { kind: Recurrent | Kv { capacity,
+paging, block } }` 与激活。state 有容量维度与淘汰/分页策略，激活没有；把两者混为一类会让
+KV 的分页策略污染激活的寿命复用。
+
+**配置面**：
+
+```toml
+[kernel.memory]
+budget_bytes      = 120_000_000_000
+activation_policy = "auto"        # auto | keep | recompute | offload
+auto_target       = 0.85
+recompute_groups  = 4
+prefetch_depth    = 2
+optimizer_state   = "shard"       # replicate | shard
+pool              = "slab"
+
+[kernel.memory.ops.mlp_swiglu]
+activation_policy = "offload"
+
+[kernel.memory.state]
+kv_capacity = 131072
+kv_paging   = "block"
+kv_block    = 64
+```
+
 ---
 
 ## 3. 交付物
@@ -332,13 +380,38 @@ TP（或 CP/EP）≥2 的配置跑通，通信由传播插入而非手写。
 验收：`ops check --op <该算子>` 通过；fused 与 primitive 展开结果在容差内一致。
 状态：`- [ ]`
 
+### P3 — 显存策略
+
+**D13 · 寿命分析与峰值投影**
+`rustrain-plan` 增加 memory pass：slot 寿命区间、按策略投影峰值、不相交寿命的槽位复用，
+产出 `MemoryPlan`。编译期调用每个算子的 `memory()` 取 workspace 与 save-for-backward。
+验收：`cargo test -p rustrain-plan`；手工可算的小图峰值与预期一致；寿命不相交的两槽位被分到同一偏移；
+`rustrain plan explain` 打印峰值与复用表。
+状态：`- [ ]`
+
+**D14 · 预算门禁与策略降级**
+超预算时编译失败并指出峰值步骤与可用策略；`activation_policy = "auto"` 按确定顺序降级并记录决策。
+验收：`cargo test -p rustrain-plan`；把 `budget_bytes` 调到峰值以下必失败且错误可读；
+`auto` 在两次运行中做出**相同**的降级序列（确定性）。
+状态：`- [ ]`
+
+**D15 · state 槽位与 KV 策略**
+`SlotKind` 区分 `Recurrent` 与 `Kv { capacity, paging, block }`；state 槽位按容量预分配，
+KV 按 block 分页。为 rollout / 有状态注意力 / ring attention 提供统一的 state 分配。
+验收：`cargo test -p rustrain-plan`；prefill 与 decode 两种访问模式下 KV 分配与回收次数可预测；
+容量超限是显式错误而非静默重分配。
+状态：`- [ ]`
+
+
 ---
 
 ## 4. 依赖与门
 
 - **门 G1**：D1–D7 全部完成且有可跑验收证据，才能进入 P1。
 - **门 G2**：D4 的切分传播通过，D5/D9 才有意义；否则通信仍是手写。
-- **依赖**：D2←D1；D4←D2,D3；D5←D4；D7←D1..D6。
+- **依赖**：D2←D1；D4←D2,D3；D5←D4；D7←D1..D6；D13←D4；D14←D13；D15←D13。
+- **门 G3**：D13/D14 在 D9（端到端训练）**之前**完成。否则第一次真实训练就会用手改代码绕开它，
+  而绕过一次之后就不会再回来。
 - **环境事实**：本机有 `cargo 1.96`，**无 torch、无 CUDA、无 GPU**。P0 必须能在本机完整验证。
 - **验证宿主**：`root@47.94.214.197:26002`（8× NVIDIA L20X 143GB，sm_89，CUDA 13.0 + nvcc，
   torch 2.11.0+cu130，1600GB RAM，Rust 1.98.1 已装）。
@@ -356,6 +429,8 @@ TP（或 CP/EP）≥2 的配置跑通，通信由传播插入而非手写。
 | 融合算子必须声明展开 | 等价性验收唯一依据 |
 | **不自研 kernel，计算交给 ATen/CUTLASS/第三方** | 用户明确：框架重点在通信与编排，kernel 次要 |
 | **并行切分进 plan，通信由传播插入** | 用户确认"编排第一公民"；避免 Megatron 式手写通信 |
+| **显存策略进 plan，峰值编译期门禁** | 用户要求"显存管理机制要可控"；旧代码这一维有 6 个 env var |
+| **state（含 KV）是独立槽位类别** | 用户点名 KV cache；其容量/分页语义与激活不同 |
 | 验证必须在 `47.94.214.197:26002` | 用户明确指定 |
 | 旧 rustrain 副本与 legacy kernel 源码已删除 | 用户明确要求（归档中保全） |
 
