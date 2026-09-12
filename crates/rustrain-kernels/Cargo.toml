@@ -1,6 +1,6 @@
 [package]
-name = "rustrain-parallel"
-description = "Process groups, rank layout, parallel sharding specs, collective inference"
+name = "rustrain-kernels"
+description = "Built-in operator providers: reference (pure Rust) and aten (plugin)"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -8,6 +8,6 @@ rust-version.workspace = true
 
 # Invariant I-1: no tch / libtorch / cuda in the dependency closure.
 [dependencies]
-serde.workspace = true
+rustrain-abi.workspace = true
+ndarray.workspace = true
 thiserror.workspace = true
-tracing.workspace = true

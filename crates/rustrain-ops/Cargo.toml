@@ -1,0 +1,22 @@
+[package]
+name = "rustrain-ops"
+description = "Operator registry, capability filtering, recipe resolution"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+# Invariant I-1: no tch / libtorch / cuda in the dependency closure.
+[dependencies]
+rustrain-abi.workspace = true
+serde.workspace = true
+toml.workspace = true
+thiserror.workspace = true
+# Contract R-2: a degraded resolution has to be visible in the log, not only in
+# the returned data.
+tracing.workspace = true
+
+[dev-dependencies]
+# `OpSummary` is serialised into `manifest.json` by the caller; the round-trip
+# is asserted here, so the JSON encoder belongs to the test build only.
+serde_json.workspace = true

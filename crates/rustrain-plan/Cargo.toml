@@ -1,0 +1,18 @@
+[package]
+name = "rustrain-plan"
+description = "Plan IR, sharding propagation, validation, compilation, digest"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+# Invariant I-1: no tch / libtorch / cuda in the dependency closure.
+[dependencies]
+rustrain-abi = { workspace = true, features = ["serde"] }
+rustrain-ops.workspace = true
+rustrain-parallel.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+blake3.workspace = true
+thiserror.workspace = true
+tracing.workspace = true

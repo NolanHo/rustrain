@@ -1,0 +1,22 @@
+[package]
+name = "rustrain-abi"
+description = "rustrain operator plugin ABI v1: POD descriptors, plugin entry, dynamic loading"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+# Invariant I-1: this crate's dependency closure must not contain tch, libtorch
+# or cuda. Keep it that way.
+[dependencies]
+thiserror.workspace = true
+libloading.workspace = true
+# Serialization of the enum newtypes is what lets a plan IR embed them in a
+# digest; the descriptor structs stay non-serializable (raw pointers).
+serde = { workspace = true, optional = true }
+
+[features]
+serde = ["dep:serde"]
+
+[dev-dependencies]
+tempfile = "3"

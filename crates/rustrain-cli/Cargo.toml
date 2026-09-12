@@ -1,0 +1,19 @@
+[package]
+name = "rustrain-cli"
+description = "rustrain command line: train, ops, plan"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+# Invariant I-1: no tch / libtorch / cuda in the dependency closure.
+[dependencies]
+rustrain-abi.workspace = true
+rustrain-ops.workspace = true
+rustrain-plan.workspace = true
+rustrain-runtime.workspace = true
+rustrain-parallel.workspace = true
+clap.workspace = true
+anyhow.workspace = true
+serde_json.workspace = true
+tracing-subscriber.workspace = true
