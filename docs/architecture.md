@@ -240,13 +240,29 @@ EP 用形状算术表达不了：rank 0 有 expert 0–3、rank 1 有 4–7，"�
 我们错在把它存在 `rule_for(op: &str)` 里（也是代码，而且是按名字猜）。正确位置是**参数/slot 的描述符**：
 一份声明同时被 L2 的名字映射和形状算术读取。这比"把 `rule_for` 改成描述符"更准确。
 
-**风险**：最数据驱动的生产系统也只做到"每块用哪些参数"，没有做到"图怎么连"——也就是**没有现成格式可抄**
-（是否存在反例由 Q5 核实中）。模型描述的 schema 是我们自己设计的，它错了不会编译报错，只能靠 L1/L2 与参考实现对账。
+**Q5 核实完毕：没有先例。** vLLM / SGLang / JAX MaxText / torchtitan 都不把图本身（哪些算子、什么顺序、怎么连）表达成数据。
+四个最接近的形态，都停在图的门口：
 
-**反过来看，这个风险比表面小**：Megatron 的数据路径停在图的入口，是因为它**根本没有显式的图** —— 图隐含在
-类的层次里，没有东西可以序列化，所以它只能把"选择"做成数据、把"连接"留给代码。rustrain 的图产物
-（`Plan{slots,nodes}`）本来就是一等公民，因此"模型即数据"不是外加特性，而是"如何生成这个 Plan"的直接推广：
-**模型描述 = 参数 + 带重复的子图模板 + checkpoint 名字映射**，schema 由我们自己的 IR 决定，不依赖任何外部格式。
+- vLLM 有 `splitting_ops: list[str]` 这类数据，但那是"在哪些算子上切"；pass 流水线是代码（`if self.pass_config.enable_sp: ...`），
+  最后还 `generate_execution_code()` 生成 Python 源码字符串再 `exec`。
+- SGLang 手里是运行时的 `torch.cuda.CUDAGraph` 对象，`--cuda-graph-config` 只描述 batch 尺寸与 backend。
+- MaxText 是 `layer_map = {DecoderBlockType.DEFAULT: [NNXDecoderLayer], ...}` —— 配置枚举选 Python 类。
+- torchtitan 最接近：`Llama3Model.Config(layers=[...])` 是数据的层列表，但只描述**构造**；算子顺序与连接写死在
+  `decoder.py` 的 `forward()` 里，`ModelSpec` 没有算子/边字段。（它的 `experiments/graph_trainer` 确实序列化了 FX trace，
+  但那是**派生的缓存**，不是被编写的源头。）
+
+**根因**：它们的图就是 `forward()` —— 图存在，但不是一等产物，是 Python 控制流，没有东西可以序列化。所以只能把"选择"
+做成数据、把"连接"留给代码。**它们的 `forward()` 就是我们的 `Plan{slots,nodes}`。**
+
+**风险（要正视）**：据我们所知，这是一个把图当作**编写对象**的框架。生态里唯一被序列化的图（vLLM codegen、
+torchtitan graph_trainer）都是派生产物，只服务于性能，从不当真值来源。后果是：写错的图**编译不会报错**，
+而且没有任何现成工具能替我们验证它。因此——
+
+> **§5 的 check 阶梯不是便利功能，它是"模型即数据"的前置条件。**
+> 没有 L1/L2/L3 加参考实现对账，"图即数据"就是莽撞的。
+
+而这件事之所以可做，恰恰因为 rustrain 早就把图做成了一等产物（`Plan` 早于模型层存在），
+所以"模型即数据"不是新机制，只是**生成这个 Plan 的输入**：参数 + 带重复的子图模板 + checkpoint 名字映射。
 
 ---
 
@@ -259,6 +275,11 @@ EP 用形状算术表达不了：rank 0 有 expert 0–3、rank 1 有 4–7，"�
 | **L1 结构** | 无（零设备、零权重） | plan 可编译；每个节点的算子可解析到实现；每个算子的 `infer()` 与声明形状一致；layout 传播完成、每个 `Partial` 都被兑现、每个 collective 都绑了轴；内存规划无重叠且不超预算 | 能力已具备（`validate_shapes`），**缺驱动**：今天跑的是 CLI 里手写的 demo plan（`plan explain --tp N`），不是"指定 model 路径" |
 | **L2 加载** | checkpoint 的 **metadata**，不读数据 | 每个 slot 都能从某个 checkpoint tensor 得到（名字 + 变换：slice / transpose / qkv split）；每个 checkpoint tensor 要么被消费、要么显式声明忽略；dtype / shape / 切片范围一致 | **缺失**。safetensors 头部即 JSON（名字 / dtype / shape / offset），读它不需要读权重数据。实测：4 GB / 1386 tensor 的 checkpoint，头部 198 KB —— 开销可忽略。真实 checkpoint 命名很脏（`base_model.model.model.layers.0.mlp.down_proj.lora_A.weight`），所以映射必须是 pattern/前缀表，且 L2 要能报告"没被消费的 tensor" |
 | **L3 数值** | 设备（或 CPU 参考实现） | 同一算子的两个实现算同一件事 + 数值参考 | 已有（conformance gate） |
+
+L2 的变换词表最小集（由真实 checkpoint 反推，不是想出来的）：`take(name)` / `slice(dim, range)` / `transpose` /
+`split` / `concat(dim)`。Megatron 用到的全部机制都落在这几种里 —— 前缀重命名（`sharded_state_dict_keys_map`，
+`gpt_layer_specs.py:484-487`）、按轴切片（`{"weight": 0}`，`layers.py:1116-1126`）、
+以及 MLA 的 `torch.cat([q_weight, kv_weight], dim=0)`（`multi_latent_attention.py:1479-1497`）。
 
 CLI 形状：
 
