@@ -245,8 +245,8 @@ kernel **不持有 mesh、不按度数分支**。它持有的只有三样：
 | `save_tensor_count` | 持有了几个张量（bookkeeping 与粒度） | 同上 | ❌ 同上 |
 
 **为什么必须声明**：plan 的寿命分析**只看得到 slot**。普通算子的反向输入就是它的输入 slot，planner 看得见；
-但**融合算子内部的中间量不是 slot** —— 它要留到反向，planner 一无所知。于是投影峰值偏低、预算门禁放行，
-然后**训练时 OOM** —— 与"编译期失败，而不是 step 5000 失败"直接冲突。
+但**融合算子内部的中间量不是 slot** —— 它要留到反向，planner 一无所知。于是投影峰值偏低 ——
+**告警本身就不可信**，而真实占用要到训练时才以 OOM 的形式暴露。
 
 **为什么只能声明**：留多少是**实现选择**（T1）—— 参考实现可以什么都不留（反向重算），调优实现可能全留。
 同一个算子的两个 variant 可以声明不同的值，所以它属于描述符，不能是框架假设。
@@ -258,6 +258,9 @@ checkpoint），所以它确实需要，且不是新需求。
 
 **落地时框架该做什么**：executor **预留**声明的字节；kernel 实际保存超过声明 → 在那个算子处分配失败，
 而不是静默 OOM。声明错仍只能靠"跑起来"发现 —— **门禁证的是数值等价，不是内存**。
+
+**但这一条现在不做**（§8 D12）：内存管理整个留空，预算只警告不拦。好消息是这两件事不冲突 ——
+正因为预算不再拦编译，**融合实验不会被内存投影阻塞**，等做内存管理时再激活这两个钩子。
 
 ---
 
@@ -281,7 +284,7 @@ checkpoint），所以它确实需要，且不是新需求。
  │    3 resolve_node ×N      Registry + Recipe → 每个节点的具体实现
  │     │                      融合体在此替换其 expansion；替换前校验 collectives 集合相等（§2.3）
  │    4 memory::plan         寿命分析 → 偏移复用 → 峰值投影；调每个算子的 memory() 取 workspace
- │    5 enforce_budget       峰值超 budget_bytes 则**编译失败**
+ │    5 enforce_budget       峰值**投影**超 budget_bytes → **只 Warning，不拦编译**（§8 D12）
  │    6 validate_shapes      调插件的 infer()，与 plan 声明的形状比对
  │    7 compute_digest       把全部决策哈希（不含 recipe 原文，只含它产生的决策）
  │
@@ -344,7 +347,7 @@ L2 的变换词表最小集（由真实 checkpoint 反推，不是想出来的�
 
 | 级 | 需要什么 | 查什么 | 现状 |
 |---|---|---|---|
-| **L1 结构** | 无（零设备、零权重） | plan 可编译；每个节点的算子可解析到实现；每个算子的 `infer()` 与声明形状一致；layout 传播完成、每个 `Partial` 都被兑现、每个 collective 都绑了轴；内存规划无重叠且不超预算 | 能力已具备（`validate_shapes`），**缺驱动**：今天跑的是 CLI 里手写的 demo plan，不是"指定 model 路径" |
+| **L1 结构** | 无（零设备、零权重） | plan 可编译；每个节点的算子可解析到实现；每个算子的 `infer()` 与声明形状一致；layout 传播完成、每个 `Partial` 都被兑现、每个 collective 都绑了轴；每个 slot 都有分配、无别名冲突（**内存预算只报告，不拦**，D12） | 能力已具备（`validate_shapes`），**缺驱动**：今天跑的是 CLI 里手写的 demo plan，不是"指定 model 路径" |
 | **L2 加载** | checkpoint 的 **metadata**，不读数据 | 每个 slot 都能从某个 checkpoint tensor 得到（名字 + 变换）；每个 checkpoint tensor 要么被消费、要么显式声明忽略；dtype / shape / 切片范围一致 | **缺失**。safetensors 头部即 JSON（名字 / dtype / shape / offset），读它不需要读权重。实测：4 GB / 1386 tensor 的 checkpoint，头部 198 KB |
 | **L3 数值** | 设备（或 CPU 参考实现） | 同一算子的两个实现算同一件事 + 数值参考 | 已有（conformance gate） |
 
@@ -359,7 +362,7 @@ rustrain check --model <model-dir> --plugin <p.so> [--tp N --pp N --ep N] [--jso
   （`uncovered_operators()` 是种子）。
 
 **它保证什么**（声明之间自洽）：每个节点都有实现（dtype / layout / target 满足）；每个边界的形状 /
-strides / dtype 一致；每个 buffer 都被分配、无别名冲突、在预算内；每个 collective 都有组且组在拓扑里存在；
+strides / dtype 一致；每个 buffer 都被分配、无别名冲突；每个 collective 都有组且组在拓扑里存在；
 每个 slot 都有来源（L2）；每个算子有反向接线或可推导。
 
 **它不保证什么**：**数值**（NaN / Inf / 精度 / 发散 —— 那是 kernel 的责任）；**模型是对的**
@@ -533,3 +536,17 @@ P2/P6 直接服务 §0 的边界契约，优先级高于 P1/P4/P5。
 | D10 | `SlotKind::State` 与持久化：激活 / optimizer state / 循环层 state | 未定 |
 | D11 | 融合替换的合法性检查落地（collectives 集合相等） | 未定 |
 | D7 | `rustrain check` 的层级划分与 L1/L2 落地顺序（§4.4） | 依赖 D8 |
+| D12 | **内存管理模型** | **留空（用户决定）**：峰值只报 Warning，不拦编译；未来按 vLLM 的方式做 —— 声明式的 `gpu_memory_utilization` 预算 + 框架自管的分配器 + **测量而非纯计算**。`save_for_backward_bytes` / `CheckpointPolicy` 两个钩子随之延后激活（§2.6） |
+
+**D12 的理由与未来方向**
+
+峰值是**估**出来的，而估错的代价是**单向**的：投影偏低（融合体保存量未声明、分配器碎片、重算/卸载策略尚未实现）
+会在训练时 OOM；投影偏高会**错杀**一个本来跑得动的配置。**让不准的东西去否决准的东西，是划不来的。**
+所以现在：`memory::plan` 照旧算（它仍是 executor 分配"常驻区 + 激活池"两块的依据），但 `enforce_budget` 只 Warning。
+**告警仍然要求 `save_for_backward_bytes` 被声明** —— 不声明的话，连警告都是错的。
+
+**vLLM 的先例支持这个方向**：它不解析式地算激活峰值，而是跑一次 `profile_run` **测量**，
+再用 `总显存 × gpu_memory_utilization − 权重 − 非 torch 内存 − 激活峰值 = KV cache 预算`
+（[PR #12126 的真实日志](https://github.com/vllm-project/vllm/pull/12126)：79.22GiB × 0.90 = 71.29GiB，权重 19.86 +
+非 torch 0.16 + 激活峰值 36.63，余 14.65GiB 给 KV）。对我们训练框架的对应物是：
+**预算由声明给出，分配由框架自管的池子做，峰值靠测量而不是靠计算**；届时 plan 里的偏移从"分配依据"退化为"复用提示"。

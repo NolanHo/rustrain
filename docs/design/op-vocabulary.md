@@ -245,8 +245,10 @@ spec P-1（`expansion` 深度 ≤ 2）是为"粗描述"场景写的。我们选�
 ### 8.3 前置条件：让 `save_for_backward_bytes` 活过来
 
 **语义与落地见 `docs/architecture.md` §2.6**（该字段今天在 ABI 里但从没被 planner 累加）。
-一句话：融合 kernel 自己保存的中间激活不是 plan 的 slot，planner 看不见 → **激活预算低估 → 训练时 OOM**。
-所以"支持任意粒度融合"的第一条具体工作就是让它活过来，且它同时是**层融合能不能用于训练**的判定条件。
+一句话：融合 kernel 自己保存的中间激活不是 plan 的 slot，planner 看不见 → 投影峰值偏低、**告警不可信**。
+
+**但它不阻塞融合实验**：内存管理整个留空（`architecture.md` §8 **D12**），预算只 Warning 不拦编译。
+所以现在可以放心写融合 kernel，等做内存管理时再激活这个钩子。
 
 （第二条已有：融合体声明的 `collectives` 必须等于它替换掉的子图里 planner 会插入的集合，
 见 `architecture.md` §2.3。层融合会把 `all_reduce{tp}`、KV `all_gather{cp}`、`all_to_all{tp,ep}`
