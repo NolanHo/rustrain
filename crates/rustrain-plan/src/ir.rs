@@ -59,6 +59,13 @@ impl Slot {
         self.shape.iter().product()
     }
 
+    /// Byte size of the element buffer, or `None` for a dtype with no
+    /// whole-byte width (sub-byte packing is not implemented).
+    pub fn element_bytes(&self) -> Option<u64> {
+        let width = self.dtype.byte_width()?;
+        Some(self.numel().max(0) as u64 * width as u64)
+    }
+
     /// Element count along one (possibly negative) dimension.
     pub fn dim(&self, axis: i64) -> Option<i64> {
         let r = self.shape.len() as i64;

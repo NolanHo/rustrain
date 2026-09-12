@@ -40,9 +40,18 @@ pub enum ShardRule {
     /// Every operand and result must share one layout. Covers elementwise ops,
     /// norms, softmax, RoPE, quantization and shape manipulation.
     Elementwise,
-    /// `y = x @ w^T` (PyTorch `linear`). `w` is `[out, in]`, so sharding `w` on
-    /// dim 0 splits the output features (column parallel, no collective) and
-    /// sharding it on dim 1 splits the contraction (row parallel, all-reduce).
+    /// `y = x @ w`, with `w` as `[K, N]` — the contraction last-but-one, the
+    /// output features last.
+    ///
+    /// Sharding `w` on its output dim (1 or -1) splits the output features:
+    /// column parallel, no collective. Sharding it on the contraction dim
+    /// (0 or -2) leaves each rank holding a partial sum: row parallel, which
+    /// is what forces an all-reduce downstream.
+    ///
+    /// The convention is stated here because it is not inferable from the rule
+    /// table, and getting it backwards shards silently. Before a second
+    /// provider with a different weight layout is added, the layout must become
+    /// a declared property of the operator rather than a framework assumption.
     Linear,
     /// `a @ b` with the contraction on `a`'s last and `b`'s second-to-last dim.
     MatMul,
@@ -108,21 +117,22 @@ pub fn derive(
                 .unwrap_or(ParallelLayout::Replicate);
             let out = match w {
                 ParallelLayout::Replicate => x,
-                // Column parallel: each rank owns a slice of the output features.
-                ParallelLayout::Shard {
-                    dim: 0,
-                    group,
-                } => ParallelLayout::Shard { dim: -1, group },
-                // Row parallel: each rank holds a partial sum. This is the case
-                // that forces an all-reduce downstream — the classic Megatron
-                // pattern the old code hand-wrote as a detach trick.
-                ParallelLayout::Shard {
-                    dim: -1,
-                    group,
-                } => ParallelLayout::Partial {
-                    op: ReduceOp::Sum,
-                    group,
-                },
+                // Output features split across ranks (column parallel): each
+                // rank computes a complete slice of the result, so no
+                // collective is owed.
+                ParallelLayout::Shard { dim, group } if dim == 1 || dim == -1 => {
+                    ParallelLayout::Shard { dim: -1, group }
+                }
+                // Contraction split across ranks (row parallel): every rank
+                // holds a partial sum. This is the case that forces an
+                // all-reduce downstream — the classic Megatron pattern the old
+                // code hand-wrote as a detach trick.
+                ParallelLayout::Shard { dim, group } if dim == 0 || dim == -2 => {
+                    ParallelLayout::Partial {
+                        op: ReduceOp::Sum,
+                        group,
+                    }
+                }
                 other => {
                     return Err(DeriveError::UnsupportedWeightLayout {
                         op: op.to_string(),
@@ -359,9 +369,27 @@ pub fn propagate(plan: &Plan, groups: &ProcessGroups) -> Result<ShardPropagation
             source,
         })?;
         if cs.is_empty() {
-            // The transition is local (e.g. replicate -> shard): the producer's
-            // output is already in the right place, so nothing is spliced.
-            continue;
+            if c.from == c.to {
+                continue;
+            }
+            // The rules say some pairs need no collective because the change is
+            // a *local view* (replicate -> shard: each rank keeps its own
+            // slice). That is not free — it is a narrow on every rank — and the
+            // planner has no view node to insert, so the honest answer is to
+            // refuse rather than emit a plan whose declared layout is not what
+            // the producer actually wrote.
+            return Err(PlanError::LayoutConflict {
+                node: c.producer,
+                slot: c.slot,
+                index: 0,
+                needed: format!("{}", c.to),
+                held: format!(
+                    "{} — no collective performs this conversion; it is a local view, so either \
+                     declare the slot's layout as what the producer yields or make the view an \
+                     explicit node",
+                    c.from
+                ),
+            });
         }
         if cs.len() > 1 {
             return Err(PlanError::LayoutConflict {
@@ -530,52 +558,61 @@ mod tests {
         })
     }
 
+    /// `w` is `[K, N]`; sharding the output dim (1 / -1) is column parallel and
+    /// owes nothing.
     #[test]
     fn column_parallel_linear_needs_no_collective() {
-        let d = derive(
-            ShardRule::Linear,
-            "linear",
-            &[
-                ParallelLayout::Replicate,
-                ParallelLayout::Shard {
-                    dim: 0,
-                    group: GroupKind::Tp,
-                },
-            ],
-            &[ParallelLayout::Replicate],
-        )
-        .unwrap();
-        assert_eq!(
-            d.outputs[0],
-            ParallelLayout::Shard {
-                dim: -1,
-                group: GroupKind::Tp
-            }
-        );
-    }
-
-    #[test]
-    fn row_parallel_linear_yields_partial_sum() {
-        let d = derive(
-            ShardRule::Linear,
-            "linear",
-            &[
-                ParallelLayout::Replicate,
+        for dim in [1, -1] {
+            let d = derive(
+                ShardRule::Linear,
+                "linear",
+                &[
+                    ParallelLayout::Replicate,
+                    ParallelLayout::Shard {
+                        dim,
+                        group: GroupKind::Tp,
+                    },
+                ],
+                &[ParallelLayout::Replicate],
+            )
+            .unwrap();
+            assert_eq!(
+                d.outputs[0],
                 ParallelLayout::Shard {
                     dim: -1,
-                    group: GroupKind::Tp,
+                    group: GroupKind::Tp
                 },
-            ],
-            &[ParallelLayout::Replicate],
-        )
-        .unwrap();
-        assert_eq!(
-            d.outputs[0],
-            ParallelLayout::Partial {
-                op: ReduceOp::Sum,
-                group: GroupKind::Tp
-            }
-        );
+                "sharding the weight's output dim {dim} must stay column parallel"
+            );
+        }
+    }
+
+    /// Sharding the contraction dim (0 / -2) leaves a partial sum in every rank.
+    #[test]
+    fn row_parallel_linear_yields_partial_sum() {
+        for dim in [0, -2] {
+            let d = derive(
+                ShardRule::Linear,
+                "linear",
+                &[
+                    ParallelLayout::Replicate,
+                    ParallelLayout::Shard {
+                        dim,
+                        group: GroupKind::Tp,
+                    },
+                ],
+                &[ParallelLayout::Replicate],
+            )
+            .unwrap();
+            assert_eq!(
+                d.outputs[0],
+                ParallelLayout::Partial {
+                    op: ReduceOp::Sum,
+                    group: GroupKind::Tp
+                },
+                "sharding the weight's contraction dim {dim} must produce a partial sum"
+            );
+        }
     }
 
     /// The headline behaviour: a row-parallel linear feeding a replicate slot
@@ -597,8 +634,9 @@ mod tests {
             RsDtype::F32,
             vec![8, 8],
             SlotKind::Weight,
+            // Contraction dim => every rank holds a partial sum.
             ParallelLayout::Shard {
-                dim: -1,
+                dim: 0,
                 group: GroupKind::Tp,
             },
         );
@@ -647,23 +685,15 @@ mod tests {
     /// layout: the compiler materialises the conversion once, and both
     /// consumers read the converted slot. Nothing is guessed silently — the
     /// collective appears in the plan and in `inserted`.
+    /// A declared layout the producer cannot deliver by any collective is a
+    /// contradiction, not a thing to paper over with a view nobody inserted.
     #[test]
-    fn each_consumer_reads_the_converted_slot() {
-        let mut b = PlanBuilder::new("conflict", Phase::Forward, ParallelConfig::default());
+    fn a_view_only_conversion_is_refused() {
+        let mut b = PlanBuilder::new("views", Phase::Forward, ParallelConfig::default());
         let x = b.slot("x", RsDtype::F32, vec![4, 8], SlotKind::Activation);
-        let w = b.slot_with_layout(
-            "w",
-            RsDtype::F32,
-            vec![8, 8],
-            SlotKind::Weight,
-            ParallelLayout::Shard {
-                dim: -1,
-                group: GroupKind::Tp,
-            },
-        );
-        // The linear produces Partial(Sum, tp).
-        let p = b.slot("p", RsDtype::F32, vec![4, 8], SlotKind::Activation);
+        // Produces Replicate...
         let r = b.slot("r", RsDtype::F32, vec![4, 8], SlotKind::Activation);
+        // ...but the consumer's slot claims to be sharded.
         let s = b.slot_with_layout(
             "s",
             RsDtype::F32,
@@ -674,6 +704,42 @@ mod tests {
                 group: GroupKind::Tp,
             },
         );
+        b.node(OpRef::new("elementwise_unary"), vec![x], vec![r], Attrs::new(), "a");
+        b.node(OpRef::new("elementwise_unary"), vec![r], vec![s], Attrs::new(), "b");
+        let plan = b.build().unwrap();
+
+        let err = propagate(&plan, &groups()).unwrap_err();
+        match err {
+            PlanError::LayoutConflict { held, .. } => {
+                assert!(
+                    held.contains("local view"),
+                    "the error must say why no collective applies: {held}"
+                );
+            }
+            other => panic!("expected a layout conflict, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn each_consumer_reads_the_converted_slot() {
+        let mut b = PlanBuilder::new("conflict", Phase::Forward, ParallelConfig::default());
+        let x = b.slot("x", RsDtype::F32, vec![4, 8], SlotKind::Activation);
+        let w = b.slot_with_layout(
+            "w",
+            RsDtype::F32,
+            vec![8, 8],
+            SlotKind::Weight,
+            // `w` is [K, N]; sharding dim 0 splits the contraction, so every
+            // rank ends up with a partial sum that has to be reduced.
+            ParallelLayout::Shard {
+                dim: 0,
+                group: GroupKind::Tp,
+            },
+        );
+        // The linear produces Partial(Sum, tp).
+        let p = b.slot("p", RsDtype::F32, vec![4, 8], SlotKind::Activation);
+        let r = b.slot("r", RsDtype::F32, vec![4, 8], SlotKind::Activation);
+        let s = b.slot("s", RsDtype::F32, vec![4, 8], SlotKind::Activation);
         b.node(OpRef::new("linear"), vec![x, w], vec![p], Attrs::new(), "lin");
         b.node(
             OpRef::new("elementwise_unary"),

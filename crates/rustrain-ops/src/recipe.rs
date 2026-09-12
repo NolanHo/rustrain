@@ -164,6 +164,126 @@ name_newtype! {
 /// see [`Recipe::backward_plan`].
 pub const AUTODIFF: &str = "autodiff";
 
+
+/// How a node's activations are allowed to be kept between the forward and the
+/// backward pass. Spec §2.10.
+///
+/// `Auto` is not a strategy: it asks the memory planner to choose. Every choice
+/// it makes is recorded, because a silent downgrade is the failure mode this
+/// architecture exists to remove.
+#[derive(Copy, Clone, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ActivationPolicy {
+    /// Keep resident; the honest default.
+    #[default]
+    Keep,
+    /// Resident during use, moved to host memory in between.
+    Offload,
+    /// Dropped after the forward pass and regenerated during the backward pass.
+    Recompute,
+}
+
+/// `optimizer_state = "replicate" | "shard"`.
+#[derive(Copy, Clone, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OptimizerState {
+    #[default]
+    Replicate,
+    /// Shard m/v across the data-parallel group (ZeRO-1 style).
+    Shard,
+}
+
+/// `pool = "none" | "slab"`.
+#[derive(Copy, Clone, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryPool {
+    /// One allocation per slot.
+    #[default]
+    None,
+    /// Interval-based reuse: slots whose lifetimes do not overlap share storage.
+    Slab,
+}
+
+fn default_auto_target() -> f64 {
+    0.85
+}
+
+fn default_recompute_groups() -> usize {
+    1
+}
+
+/// Per-operator memory override (`[kernel.memory.ops.<op>]`).
+#[derive(Clone, PartialEq, Debug, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OpMemoryRecipe {
+    #[serde(default)]
+    pub activation_policy: Option<ActivationPolicy>,
+}
+
+/// `[kernel.memory]` — how the plan is allowed to spend device memory.
+///
+/// Without this section the planner still computes the projected peak and still
+/// refuses a plan that cannot fit; what it cannot do is relax anything to make
+/// one fit. See spec contracts MEM-1 through MEM-5.
+#[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MemoryRecipe {
+    /// Hard ceiling on projected device memory. `None` means "project only,
+    /// never refuse".
+    #[serde(default)]
+    pub budget_bytes: Option<u64>,
+    #[serde(default)]
+    pub activation_policy: ActivationPolicy,
+    /// Fraction of `budget_bytes` the planner aims for when it has to relax
+    /// something. Below 1.0 leaves room for the allocator's fragmentation.
+    #[serde(default = "default_auto_target")]
+    pub auto_target: f64,
+    /// How many consecutive layers a `recompute` decision covers.
+    #[serde(default = "default_recompute_groups")]
+    pub recompute_groups: usize,
+    /// Host<->device copies in flight for `offload`.
+    #[serde(default)]
+    pub prefetch_depth: usize,
+    #[serde(default)]
+    pub optimizer_state: OptimizerState,
+    #[serde(default)]
+    pub pool: MemoryPool,
+    #[serde(default)]
+    pub ops: BTreeMap<String, OpMemoryRecipe>,
+}
+
+impl Default for MemoryRecipe {
+    fn default() -> Self {
+        Self {
+            budget_bytes: None,
+            activation_policy: ActivationPolicy::default(),
+            auto_target: default_auto_target(),
+            recompute_groups: default_recompute_groups(),
+            prefetch_depth: 0,
+            optimizer_state: OptimizerState::default(),
+            pool: MemoryPool::default(),
+            ops: BTreeMap::new(),
+        }
+    }
+}
+
+impl MemoryRecipe {
+    /// The policy that applies to `op`: the operator override wins, then the
+    /// global setting. Same precedence shape as operator selection.
+    pub fn policy_for(&self, op: &str) -> ActivationPolicy {
+        self.ops
+            .get(op)
+            .and_then(|entry| entry.activation_policy)
+            .unwrap_or(self.activation_policy)
+    }
+
+    /// Renders the target as a byte ceiling, if a budget is set.
+    pub fn target_bytes(&self) -> Option<u64> {
+        self.budget_bytes
+            .map(|b| (b as f64 * self.auto_target.clamp(0.0, 1.0)) as u64)
+    }
+}
+
 /// What `[kernel.ops.<op>].backward` asked for.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum BackwardPlan {
@@ -350,7 +470,12 @@ impl ParallelRecipe {
 }
 
 /// The `[kernel]` table of a recipe file.
-#[derive(Clone, Default, PartialEq, Eq, Debug, Serialize, Deserialize)]
+///
+/// `Eq` is unavailable because `[kernel.memory].auto_target` is a ratio (a
+/// float). Nothing compares recipes for full equality except tests, and the
+/// planner converts the ratio to an integer byte ceiling before it reaches a
+/// digest, so no float ever enters one.
+#[derive(Clone, Default, PartialEq, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Recipe {
     /// Plugin whose implementation wins when nothing else names one. Empty
@@ -368,6 +493,8 @@ pub struct Recipe {
     pub precision: PrecisionRecipe,
     #[serde(default)]
     pub parallel: ParallelRecipe,
+    #[serde(default)]
+    pub memory: MemoryRecipe,
 }
 
 /// The document shape of a recipe file: a single `[kernel]` table.

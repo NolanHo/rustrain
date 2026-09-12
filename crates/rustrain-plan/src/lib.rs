@@ -16,6 +16,7 @@
 pub mod attrs;
 pub mod compile;
 pub mod ir;
+pub mod memory;
 pub mod shard;
 
 pub use attrs::{AbiAttrs, AttrValue, Attrs};
@@ -23,6 +24,9 @@ pub use compile::{CompiledPlan, CompiledStep, Compiler, ResolvedNode, StreamId};
 pub use ir::{
     CheckpointPolicy, NodeId, OpRef, Phase, Plan, PlanBuilder, PlanMeta, PlanNode,
     PrecisionOverride, Slot, SlotId, SlotKind, StreamPolicy, Trace, intrinsic,
+};
+pub use memory::{
+    Lifetime, MemoryPlan, Placement, PolicyDecision, RuntimeCapabilities, SlotAllocation,
 };
 
 use rustrain_parallel::{GroupKind, ShardError};
@@ -157,6 +161,20 @@ pub enum PlanError {
 
     #[error("plan digest computation failed: {0}")]
     Digest(String),
+
+    #[error(
+        "projected peak memory {peak} B exceeds the {budget} B budget; the peak is reached at node \
+         {hottest_node} ({hottest_op}) with {hottest_bytes} B live.\n  - {}",
+        .suggestions.join("\n  - ")
+    )]
+    MemoryBudgetExceeded {
+        peak: u64,
+        budget: u64,
+        hottest_node: usize,
+        hottest_op: String,
+        hottest_bytes: u64,
+        suggestions: Vec<String>,
+    },
 }
 
 pub type Result<T> = std::result::Result<T, PlanError>;

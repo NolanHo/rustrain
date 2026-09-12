@@ -346,7 +346,7 @@ kv_block    = 64
 验收：`cargo run -p rustrain-cli -- ops check --json`；故意注入错误 kernel 被检出；
 改 recipe 一个字段后 `plan explain` 输出随之改变，**期间不重编译**；
 `rg -n 'getenv|env::var' crates/` 在算子路径上零命中。
-状态：`- [ ]`
+状态：`[-]` — `rustrain ops list` 与 `rustrain plan explain` 已可用（文本 + `--json`）：`cargo run -p rustrain-cli -- ops list` 列出 26 个实现；`cargo run -p rustrain-cli -- plan explain --tp 2` 打印解析后的计划、自动插入的通信、以及显存投影（`peak 77824 B (persistent 65536 + activations 12288 + workspace 0)`）。未完成：`ops check` 四查门禁本体（数值 / 展开等价 / 梯度 / 确定性）。
 
 ### P1 — 上 GPU
 
@@ -387,13 +387,13 @@ TP（或 CP/EP）≥2 的配置跑通，通信由传播插入而非手写。
 产出 `MemoryPlan`。编译期调用每个算子的 `memory()` 取 workspace 与 save-for-backward。
 验收：`cargo test -p rustrain-plan`；手工可算的小图峰值与预期一致；寿命不相交的两槽位被分到同一偏移；
 `rustrain plan explain` 打印峰值与复用表。
-状态：`- [ ]`
+状态：`- [x]` — 寿命分析、峰值投影、不相交寿命的槽位复用（`MemoryPool::Slab` 首次适配）已实现，编译期调用每个算子的 `memory()` 取 workspace。`cargo test -p rustrain-plan` 22 通过，含 8 个显存测试：寿命区间、峰值=常驻+池+workspace、复用确实发生（4 层 MLP 的激活池远小于逐槽之和）、关掉池化则逐槽独立。`plan explain` 打印峰值与复用表。
 
 **D14 · 预算门禁与策略降级**
 超预算时编译失败并指出峰值步骤与可用策略；`activation_policy = "auto"` 按确定顺序降级并记录决策。
 验收：`cargo test -p rustrain-plan`；把 `budget_bytes` 调到峰值以下必失败且错误可读；
 `auto` 在两次运行中做出**相同**的降级序列（确定性）。
-状态：`- [ ]`
+状态：`- [x]` — 超预算编译失败，错误指出峰值节点、该处活跃字节数、以及可用的缓解手段；`auto` 按 keep → offload → recompute 的确定顺序降级并逐条记录理由。`cargo test -p rustrain-plan` 覆盖：budget=1 必失败且错误可读、运行时无 offload/recompute 能力时**不谎报**（决策为空、门禁照常拒绝）、有支持时两次运行的降级序列**逐条相同**、运行时不支持却被 recipe 要求的策略进入 `unsupported` 并在 `explain` 中显式列出。
 
 **D15 · state 槽位与 KV 策略**
 `SlotKind` 区分 `Recurrent` 与 `Kv { capacity, paging, block }`；state 槽位按容量预分配，

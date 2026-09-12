@@ -256,14 +256,15 @@ fn row_parallel_weight_inserts_a_collective_the_runtime_drives() {
 
     let mut b = PlanBuilder::new("tp", Phase::Forward, parallel);
     let x = b.slot("x", RsDtype::F32, vec![4], SlotKind::Input);
-    // Weight sharded along its contraction dim => each rank holds a partial sum.
+    // A weight is [K, N]; sharding dim 0 splits the contraction, so each rank
+    // holds a partial sum from the same `linear` rule the framework applies.
     let w = b.slot_with_layout(
         "w",
         RsDtype::F32,
         vec![3],
         SlotKind::Weight,
         ParallelLayout::Shard {
-            dim: -1,
+            dim: 0,
             group: GroupKind::Tp,
         },
     );
@@ -325,7 +326,7 @@ fn single_rank_refuses_when_the_world_is_larger_than_one() {
         vec![3],
         SlotKind::Weight,
         ParallelLayout::Shard {
-            dim: -1,
+            dim: 0,
             group: GroupKind::Tp,
         },
     );

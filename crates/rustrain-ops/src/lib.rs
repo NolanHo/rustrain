@@ -52,8 +52,9 @@ pub use capability::{
     group_name, phase_reject_reason, reject_for, reject_reason,
 };
 pub use recipe::{
-    AUTODIFF, BackwardPlan, DtypeName, OpRecipe, ParallelRecipe, PrecisionRecipe, QuantName,
-    Recipe, RecipeError, ScaleName,
+    AUTODIFF, ActivationPolicy, BackwardPlan, DtypeName, MemoryPool, MemoryRecipe, OpMemoryRecipe,
+    OpRecipe, OptimizerState, ParallelRecipe, PrecisionRecipe, QuantName, Recipe, RecipeError,
+    ScaleName,
 };
 pub use registered::{OpSummary, RegisteredOp};
 pub use registry::{

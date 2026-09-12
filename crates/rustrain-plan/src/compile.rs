@@ -14,6 +14,7 @@ use rustrain_parallel::{GroupKind, ParallelConfig, ParallelLayout, ProcessGroups
 
 use crate::attrs::AbiAttrs;
 use crate::ir::{NodeId, Plan, Slot, SlotId, StreamPolicy, Trace, intrinsic};
+use crate::memory;
 use crate::shard::{self, InsertedCollective};
 use crate::PlanError;
 
@@ -103,6 +104,9 @@ pub struct CompiledPlan {
     pub parallel: ParallelConfig,
     pub resolved: Vec<ResolvedNode>,
     pub inserted: Vec<InsertedCollective>,
+    /// Lifetimes, storage placement and the projected peak. Computed here, not
+    /// discovered at run time.
+    pub memory: crate::memory::MemoryPlan,
 }
 
 impl std::fmt::Debug for CompiledPlan {
@@ -116,6 +120,7 @@ impl std::fmt::Debug for CompiledPlan {
             .field("slots", &self.plan.slots.len())
             .field("steps", &self.steps.len())
             .field("inserted_collectives", &self.inserted.len())
+            .field("peak_bytes", &self.memory.peak_bytes)
             .finish()
     }
 }
@@ -147,6 +152,7 @@ impl CompiledPlan {
                 step.source().path,
             ));
         }
+        out.push_str(&self.memory.explain());
         if !self.inserted.is_empty() {
             out.push_str("\ninserted communication:\n");
             for ins in &self.inserted {
@@ -190,6 +196,9 @@ pub struct Compiler<'a> {
     env: TargetEnv,
     parallel: ParallelConfig,
     deterministic: bool,
+    /// What the runtime can execute. A memory policy in this set may be planned
+    /// for; anything outside it is refused rather than projected as a saving.
+    caps: crate::memory::RuntimeCapabilities,
 }
 
 impl<'a> Compiler<'a> {
@@ -205,7 +214,14 @@ impl<'a> Compiler<'a> {
             env,
             parallel,
             deterministic: true,
+            caps: crate::memory::RuntimeCapabilities::default(),
         }
+    }
+
+    /// Declares which memory strategies the runtime can actually execute.
+    pub fn capabilities(mut self, caps: crate::memory::RuntimeCapabilities) -> Self {
+        self.caps = caps;
+        self
     }
 
     /// When false, operators that declare themselves non-deterministic are
@@ -229,6 +245,30 @@ impl<'a> Compiler<'a> {
         let propagation = shard::propagate(plan, &groups)?;
         let plan = propagation.plan;
 
+        // Pass 1: resolve everything first. The memory pass has to ask each
+        // implementation for its workspace before it can project a peak, and it
+        // must do that before any step is emitted.
+        let mut resolution: Vec<Option<(RegisteredOp, Vec<(String, String)>)>> =
+            vec![None; plan.nodes.len()];
+        for (i, node) in plan.nodes.iter().enumerate() {
+            if intrinsic::is_intrinsic(&node.op.name) {
+                continue;
+            }
+            resolution[i] = Some(self.resolve_node(NodeId(i), &plan, node)?);
+        }
+
+        let resolved_ops: Vec<Option<RegisteredOp>> = resolution
+            .iter()
+            .map(|r| r.as_ref().map(|(op, _)| op.clone()))
+            .collect();
+
+        // Project the peak and refuse a plan that cannot fit. Doing this here,
+        // rather than letting the allocator discover it, is the whole point of
+        // having the graph: the failure names the node and the strategy.
+        let memory = memory::plan(&plan, &resolved_ops, &self.recipe.memory, self.caps)?;
+        memory::enforce_budget(&memory, &plan)?;
+
+        // Pass 2: validate against the implementations and flatten.
         let mut steps = Vec::with_capacity(plan.nodes.len());
         let mut resolved = Vec::new();
 
@@ -238,7 +278,9 @@ impl<'a> Compiler<'a> {
                 steps.push(self.compile_intrinsic(id, node)?);
                 continue;
             }
-            let (op, rejections) = self.resolve_node(id, &plan, node)?;
+            let (op, rejections) = resolution[i]
+                .take()
+                .expect("every non-intrinsic node was resolved in pass 1");
             self.check_arity(id, node, &op)?;
 
             let attrs = node.attrs.to_abi();
@@ -275,6 +317,7 @@ impl<'a> Compiler<'a> {
             parallel: self.parallel,
             resolved,
             inserted: propagation.inserted,
+            memory,
         })
     }
 
