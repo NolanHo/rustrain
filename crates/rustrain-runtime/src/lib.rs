@@ -17,6 +17,8 @@
 // Same reasoning as `rustrain-plan`: the error carries structured diagnostics.
 #![allow(clippy::result_large_err)]
 
+pub mod conformance;
+
 use std::ffi::c_void;
 
 use rustrain_abi::ffi::{RsCollectiveKind, RsCtx, RsDeviceKind, RsDtype, RsServices, RsTensor};
@@ -45,6 +47,17 @@ pub enum RuntimeError {
         name: String,
         dtype: String,
     },
+
+    #[error("slot {slot:?} ({name}) holds {expected} bytes but {actual} were supplied")]
+    ByteLengthMismatch {
+        slot: SlotId,
+        name: String,
+        expected: u64,
+        actual: u64,
+    },
+
+    #[error("unknown dtype `{dtype}`")]
+    UnknownDtype { dtype: String },
 
     #[error("cannot allocate {bytes} bytes for slot {slot:?}: {reason}")]
     Alloc {
@@ -192,7 +205,28 @@ impl CollectiveBackend for SingleRank {
 
 /// One slot's backing storage.
 struct SlotBuffer {
+    /// Where the slot's data currently lives.
+    ///
+    /// Not always the allocation we made: a view operator (`transpose`,
+    /// `narrow`, `reshape`, `view`, `broadcast`) returns a descriptor whose
+    /// `data` points into its input, and the runtime has to adopt it. Ignoring
+    /// the returned pointer reads uninitialised memory belonging to the
+    /// executor's own buffer — which is what the conformance gate caught the
+    /// first time it ran.
     ptr: *mut c_void,
+    /// The allocation this executor owns and must free, if any. A view slot
+    /// adopts a pointer but still owns nothing.
+    owned: Option<(*mut c_void, u64)>,
+    /// The slot's logical shape and strides, adopted from the descriptor the
+    /// operator returned. A view can change both: `broadcast` gives size-1 dims
+    /// stride 0, so the elements are *not* laid out contiguously and reading
+    /// `numel * width` bytes from `ptr` walks off the end of the buffer. The
+    /// conformance gate caught exactly that, reporting two runs that produced
+    /// "different" bytes whose first few values matched.
+    shape: [i64; rustrain_abi::ffi::MAX_RANK],
+    strides: [i64; rustrain_abi::ffi::MAX_RANK],
+    rank: u32,
+    elem_width: u32,
     bytes: u64,
     /// Set when this slot shares another slot's storage — true for the output of
     /// a spliced collective, which reduces in place.
@@ -245,8 +279,14 @@ impl Executor {
             if let Some(root) = *alias {
                 let root_buf = buffers[root.0].as_ref().map(|b| (b.ptr, b.bytes));
                 let (ptr, bytes) = root_buf.ok_or(RuntimeError::NullData { slot: root })?;
+                let src = buffers[root.0].as_ref().expect("checked above");
                 buffers.push(Some(SlotBuffer {
                     ptr,
+                    owned: None,
+                    shape: src.shape,
+                    strides: src.strides,
+                    rank: src.rank,
+                    elem_width: src.elem_width,
                     bytes,
                     alias_of: Some(root),
                 }));
@@ -267,8 +307,23 @@ impl Executor {
                     bytes,
                     reason,
                 })?;
+            let slot = &plan.plan.slots[i];
+            let mut shape = [0i64; rustrain_abi::ffi::MAX_RANK];
+            let mut strides = [0i64; rustrain_abi::ffi::MAX_RANK];
+            let rank = (slot.shape.len() as u32).min(rustrain_abi::ffi::MAX_RANK as u32);
+            let mut acc = 1i64;
+            for d in (0..rank as usize).rev() {
+                shape[d] = slot.shape[d];
+                strides[d] = acc;
+                acc *= slot.shape[d].max(1);
+            }
             buffers.push(Some(SlotBuffer {
                 ptr,
+                owned: Some((ptr, bytes)),
+                shape,
+                strides,
+                rank,
+                elem_width: slot.dtype.byte_width().unwrap_or(4),
                 bytes,
                 alias_of: None,
             }));
@@ -318,9 +373,17 @@ impl Executor {
         if buf.ptr.is_null() {
             return Err(RuntimeError::NullData { slot: id });
         }
-        let mut t = RsTensor::new(slot.dtype, &slot.shape);
-        t.data = buf.ptr;
-        Ok(t)
+        // Built field by field rather than via `RsTensor::new`, because the slot
+        // may hold a strided view whose shape is not the plan's and whose
+        // strides are not contiguous.
+        Ok(RsTensor {
+            dtype: slot.dtype,
+            rank: buf.rank,
+            shape: buf.shape,
+            stride: buf.strides,
+            data: buf.ptr,
+            ..RsTensor::default()
+        })
     }
 
     /// Element count a slot expects.
@@ -363,6 +426,49 @@ impl Executor {
         Ok(out)
     }
 
+    /// Writes raw bytes into a slot, for inputs that are not f32 (indices,
+    /// masks). The caller is responsible for the layout matching the slot.
+    pub fn write_raw(&mut self, id: SlotId, bytes: &[u8]) -> Result<(), RuntimeError> {
+        let expected = self.slot_bytes(id)?;
+        if bytes.len() as u64 != expected {
+            return Err(RuntimeError::ByteLengthMismatch {
+                slot: id,
+                name: self.plan.plan.slot(id).name.clone(),
+                expected,
+                actual: bytes.len() as u64,
+            });
+        }
+        let ptr = self.data_ptr(id)?;
+        // SAFETY: the buffer is exactly `expected` bytes and `bytes` is too.
+        unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr as *mut u8, bytes.len()) };
+        Ok(())
+    }
+
+    /// Reads a slot back as a **contiguous** byte buffer, materialising a
+    /// strided view if the slot holds one.
+    pub fn read_raw(&self, id: SlotId) -> Result<Vec<u8>, RuntimeError> {
+        let root = self.aliases[id.0].unwrap_or(id);
+        let buf = self
+            .buffers
+            .get(root.0)
+            .and_then(Option::as_ref)
+            .ok_or(RuntimeError::NullData { slot: id })?;
+        if buf.ptr.is_null() {
+            return Err(RuntimeError::NullData { slot: id });
+        }
+        Ok(materialise(buf.ptr, buf.shape.as_slice(), buf.strides.as_slice(), buf.rank, buf.elem_width))
+    }
+
+    /// Byte size of a slot's buffer.
+    pub fn slot_bytes(&self, id: SlotId) -> Result<u64, RuntimeError> {
+        let root = self.aliases[id.0].unwrap_or(id);
+        self.buffers
+            .get(root.0)
+            .and_then(Option::as_ref)
+            .map(|b| b.bytes)
+            .ok_or(RuntimeError::NullData { slot: id })
+    }
+
     fn check_f32(&self, id: SlotId) -> Result<(), RuntimeError> {
         let slot = self.plan.plan.slot(id);
         if slot.dtype != RsDtype::F32 {
@@ -396,6 +502,7 @@ impl Executor {
         };
 
         for index in 0..self.plan.steps.len() {
+            let mut adopted: Vec<(SlotId, RsTensor)> = Vec::new();
             let (inputs, outputs, label) = {
                 let step = &self.plan.steps[index];
                 let inputs = match step {
@@ -499,8 +606,27 @@ impl Executor {
                             },
                         });
                     }
+                    // A view operator hands back a descriptor pointing into its
+                    // input. Adopt it, or every later read of this slot reads
+                    // the executor's own untouched buffer.
+                    for (slot, t) in outputs.iter().zip(&out_tensors) {
+                        if !t.data.is_null() {
+                            adopted.push((*slot, *t));
+                        }
+                    }
+
                     stats.ops += 1;
                     stats.steps += 1;
+                }
+            }
+
+            for (slot, t) in adopted {
+                let root = self.aliases[slot.0].unwrap_or(slot);
+                if let Some(buf) = self.buffers.get_mut(root.0).and_then(Option::as_mut) {
+                    buf.ptr = t.data;
+                    buf.shape = t.shape;
+                    buf.strides = t.stride;
+                    buf.rank = t.rank;
                 }
             }
         }
@@ -518,11 +644,59 @@ impl Drop for Executor {
     fn drop(&mut self) {
         // Only owners free; aliases point into the same allocation.
         for buf in self.buffers.iter().flatten() {
-            if buf.alias_of.is_none() && !buf.ptr.is_null() {
-                self.allocator.dealloc(buf.ptr, buf.bytes);
+            if let Some((ptr, bytes)) = buf.owned {
+                self.allocator.dealloc(ptr, bytes);
             }
         }
     }
+}
+
+/// Copies a strided view into a contiguous buffer.
+///
+/// Strides are in elements. A zero stride (from `broadcast`) repeats one element,
+/// which a flat `copy_nonoverlapping` cannot express — it would read past the
+/// allocation instead.
+fn materialise(
+    ptr: *const c_void,
+    shape: &[i64],
+    strides: &[i64],
+    rank: u32,
+    elem_width: u32,
+) -> Vec<u8> {
+    let rank = (rank as usize).min(shape.len());
+    let shape = &shape[..rank];
+    let strides = &strides[..rank];
+    let total: usize = shape.iter().product::<i64>().max(0) as usize;
+    let width = elem_width.max(1) as usize;
+    let mut out = vec![0u8; total * width];
+    if total == 0 || width == 0 {
+        return out;
+    }
+
+    let mut idx = vec![0i64; rank];
+    for linear in 0..total {
+        let mut offset = 0i64;
+        for d in 0..rank {
+            offset += idx[d] * strides[d];
+        }
+        // SAFETY: the operator that produced this descriptor declared these
+        // shape/strides over its own buffer, so `offset` is in bounds.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                (ptr as *const u8).add(offset as usize * width),
+                out.as_mut_ptr().add(linear * width),
+                width,
+            );
+        }
+        for d in (0..rank).rev() {
+            idx[d] += 1;
+            if idx[d] < shape[d] {
+                break;
+            }
+            idx[d] = 0;
+        }
+    }
+    out
 }
 
 /// Byte size of one slot's element buffer.

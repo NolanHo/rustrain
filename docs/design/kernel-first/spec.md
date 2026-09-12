@@ -417,7 +417,12 @@ kv_block    = 64
 验收：`cargo run -p rustrain-cli -- ops check --json`；故意注入错误 kernel 被检出；
 改 recipe 一个字段后 `plan explain` 输出随之改变，**期间不重编译**；
 `rg -n 'getenv|env::var' crates/` 在算子路径上零命中。
-状态：`[-]` — `rustrain ops list` 与 `rustrain plan explain` 已可用（文本 + `--json`）：`cargo run -p rustrain-cli -- ops list` 列出 26 个实现；`cargo run -p rustrain-cli -- plan explain --tp 2` 打印解析后的计划、自动插入的通信、以及显存投影（`peak 77824 B (persistent 65536 + activations 12288 + workspace 0)`）。未完成：`ops check` 四查门禁本体（数值 / 展开等价 / 梯度 / 确定性）。
+状态：`- [x]` — `ops list` / `plan explain` / **`ops check`** 均已可用（文本 + `--json`）。
+`rustrain ops check` 对 17 个算子跑数值（对照 `reference.f32`）、展开等价（重放声明的 `expansion`）、
+确定性与梯度（**跳过并写明理由**：反向推导未实现）四项，通过退出码 0、失败非零。
+**门禁已被证明会失败**：`conformance_gate.rs` 注入一个"把 add 算成减"的实现 → 数值检查抓到；
+注入一个每次调用多加一个常数的实现 → 确定性检查抓到；参考实现自身被如实标为 `skip` 而非 `pass`（
+"和自己是同一次执行"不是证据）；未注册的变体报错而不回落。无 case 的 8 个算子由 CLI 明确列出并给出理由。
 
 ### P1 — 上 GPU
 

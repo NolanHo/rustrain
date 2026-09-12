@@ -51,6 +51,18 @@ enum OpsCommand {
         #[arg(long)]
         json: bool,
     },
+    /// Run the conformance gate: is every implementation the same operator?
+    Check {
+        /// A plugin `.so` to load in addition to the built-in provider.
+        #[arg(long = "plugin", value_name = "PATH")]
+        plugins: Vec<PathBuf>,
+        /// Restrict to one operator.
+        #[arg(long = "op", value_name = "NAME")]
+        op: Option<String>,
+        /// Emit JSON instead of a table.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Args)]
@@ -83,6 +95,7 @@ fn main() -> Result<()> {
     match cli.command {
         Command::Ops(args) => match args.command {
             OpsCommand::List { plugins, json } => ops_list(&plugins, json),
+            OpsCommand::Check { plugins, op, json } => ops_check(&plugins, op.as_deref(), json),
         },
         Command::Plan(args) => match args.command {
             PlanCommand::Explain {
@@ -161,6 +174,58 @@ fn ops_list(plugins: &[PathBuf], json: bool) -> Result<()> {
         );
     }
     println!("\n{} implementation(s)", summaries.len());
+    Ok(())
+}
+
+fn ops_check(plugins: &[PathBuf], only: Option<&str>, json: bool) -> Result<()> {
+    use rustrain_runtime::conformance::{Harness, default_cases, uncovered_operators};
+
+    let registry = load_registry(plugins)?;
+    let recipe = load_recipe(None)?;
+    let harness = Harness::new(&registry, &recipe);
+
+    let mut cases = default_cases();
+    if let Some(name) = only {
+        cases.retain(|c| c.op == name);
+        if cases.is_empty() {
+            bail!(
+                "no conformance case for `{name}`; run without --op to see which operators are \
+                 covered, and check the uncovered list"
+            );
+        }
+    }
+
+    let mut report = rustrain_runtime::conformance::Report::default();
+    for case in &cases {
+        report.results.extend(harness.run(case));
+    }
+
+    if json {
+        let mut doc = report.to_json();
+        if let Some(obj) = doc.as_object_mut() {
+            obj.insert(
+                "uncovered".to_string(),
+                serde_json::json!(uncovered_operators()
+                    .iter()
+                    .map(|(op, why)| serde_json::json!({ "op": op, "reason": why }))
+                    .collect::<Vec<_>>()),
+            );
+        }
+        println!("{}", serde_json::to_string_pretty(&doc)?);
+    } else {
+        print!("{}", report.explain());
+        let uncovered = uncovered_operators();
+        if !uncovered.is_empty() {
+            println!("\nno case written yet:");
+            for (op, why) in uncovered {
+                println!("  {op}: {why}");
+            }
+        }
+    }
+
+    if !report.passed() {
+        std::process::exit(1);
+    }
     Ok(())
 }
 

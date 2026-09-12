@@ -11,7 +11,7 @@
 //! cannot execute ([`RuntimeCapabilities`]). Projecting savings from a strategy
 //! nobody implements would be the same silent lie as a fallback that never runs.
 
-use rustrain_abi::ffi::{RsAttrs, RsMemReq, RsTensor};
+use rustrain_abi::ffi::{RsMemReq, RsTensor};
 use rustrain_ops::{ActivationPolicy, MemoryPool, MemoryRecipe, RegisteredOp};
 
 use crate::PlanError;
@@ -164,7 +164,7 @@ impl MemoryPlan {
             for d in &self.decisions {
                 out.push_str(&format!(
                     "    [{}] {} -> {}: {}\n",
-                    d.node.0, d.to_name(), d.from_name(), d.reason
+                    d.node.0, name_of(d.to), name_of(d.from), d.reason
                 ));
             }
         }
@@ -185,16 +185,6 @@ impl MemoryPlan {
             }
         }
         out
-    }
-}
-
-impl PolicyDecision {
-    fn from_name(&self) -> &'static str {
-        name_of(self.from)
-    }
-
-    fn to_name(&self) -> &'static str {
-        name_of(self.to)
     }
 }
 
@@ -659,7 +649,7 @@ fn query_workspace(
             query(
                 io_ptrs.as_ptr(),
                 io_ptrs.len() as u32,
-                attrs.as_ptr() as *const RsAttrs,
+                attrs.as_ptr(),
                 &mut req,
             )
         };
@@ -754,8 +744,10 @@ mod tests {
     #[test]
     fn slab_pool_reuses_storage_for_disjoint_lifetimes() {
         let plan = plan_with(4);
-        let mut recipe = MemoryRecipe::default();
-        recipe.pool = MemoryPool::Slab;
+        let recipe = MemoryRecipe {
+            pool: MemoryPool::Slab,
+            ..Default::default()
+        };
         let mem = run_memory_pass(&plan, &no_ops(&plan), &recipe, RuntimeCapabilities::none()).unwrap();
 
         let activation_bytes = 8 * 64 * 4;
@@ -787,8 +779,10 @@ mod tests {
     #[test]
     fn budget_below_peak_is_refused_and_names_the_hottest_step() {
         let plan = plan_with(3);
-        let mut recipe = MemoryRecipe::default();
-        recipe.budget_bytes = Some(1); // impossible
+        let recipe = MemoryRecipe {
+            budget_bytes: Some(1), // impossible
+            ..Default::default()
+        };
         let mem = run_memory_pass(&plan, &no_ops(&plan), &recipe, RuntimeCapabilities::none()).unwrap();
         let err = enforce_budget(&mem, &plan).unwrap_err();
         match err {
@@ -811,8 +805,10 @@ mod tests {
     #[test]
     fn auto_cannot_relax_without_runtime_support() {
         let plan = plan_with(3);
-        let mut recipe = MemoryRecipe::default();
-        recipe.budget_bytes = Some(1);
+        let recipe = MemoryRecipe {
+            budget_bytes: Some(1),
+            ..Default::default()
+        };
         // No offload, no recompute: the planner must not pretend it can help.
         let mem = run_memory_pass(&plan, &no_ops(&plan), &recipe, RuntimeCapabilities::none()).unwrap();
         assert!(mem.decisions.is_empty(), "nothing was executable to try");
@@ -822,9 +818,11 @@ mod tests {
     #[test]
     fn auto_relaxes_deterministically_when_the_runtime_supports_it() {
         let plan = plan_with(3);
-        let mut recipe = MemoryRecipe::default();
-        recipe.budget_bytes = Some(1);
-        recipe.pool = MemoryPool::Slab;
+        let recipe = MemoryRecipe {
+            budget_bytes: Some(1),
+            pool: MemoryPool::Slab,
+            ..Default::default()
+        };
 
         let caps = RuntimeCapabilities {
             offload: true,

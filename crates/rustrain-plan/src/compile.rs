@@ -86,6 +86,10 @@ impl CompiledStep {
     }
 }
 
+/// `(implementation, skipped candidates with their reasons)`. Named because the
+/// tuple appears in signatures and clippy is right that spelling it out is worse.
+type ResolvedEntry = (RegisteredOp, Vec<(String, String)>);
+
 /// A node paired with the implementation it resolved to.
 #[derive(Clone, Debug)]
 pub struct ResolvedNode {
@@ -248,8 +252,7 @@ impl<'a> Compiler<'a> {
         // Pass 1: resolve everything first. The memory pass has to ask each
         // implementation for its workspace before it can project a peak, and it
         // must do that before any step is emitted.
-        let mut resolution: Vec<Option<(RegisteredOp, Vec<(String, String)>)>> =
-            vec![None; plan.nodes.len()];
+        let mut resolution: Vec<Option<ResolvedEntry>> = vec![None; plan.nodes.len()];
         for (i, node) in plan.nodes.iter().enumerate() {
             if intrinsic::is_intrinsic(&node.op.name) {
                 continue;

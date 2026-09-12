@@ -456,17 +456,29 @@ impl PlanBuilder {
 /// description of what happens, and so `plan explain` can show where
 /// communication lands (spec contract S-2).
 pub mod intrinsic {
-    pub const ALL_REDUCE: &str = "all_reduce";
-    pub const ALL_GATHER: &str = "all_gather";
-    pub const REDUCE_SCATTER: &str = "reduce_scatter";
-    pub const BROADCAST: &str = "broadcast";
-    pub const SYNC: &str = "sync";
+    /// Reserved prefix. The primitive vocabulary has no dots, so a name that
+    /// starts with this cannot collide with an operator.
+    ///
+    /// The prefix is not cosmetic: `broadcast` is both a primitive (a view that
+    /// stretches a size-1 dim) and, before this, an intrinsic. The compiler
+    /// checks for intrinsics first, so a plan calling the primitive was handed
+    /// to the collective path and rejected for a missing `group` attribute. A
+    /// reserved namespace is what makes the two sets disjoint by construction
+    /// rather than by nobody happening to pick the same word twice.
+    pub const PREFIX: &str = "intrinsic.";
+
+    pub const ALL_REDUCE: &str = "intrinsic.all_reduce";
+    pub const ALL_GATHER: &str = "intrinsic.all_gather";
+    pub const REDUCE_SCATTER: &str = "intrinsic.reduce_scatter";
+    pub const BROADCAST: &str = "intrinsic.broadcast";
+    pub const SYNC: &str = "intrinsic.sync";
 
     pub fn is_intrinsic(name: &str) -> bool {
-        matches!(
-            name,
-            ALL_REDUCE | ALL_GATHER | REDUCE_SCATTER | BROADCAST | SYNC
-        )
+        name.starts_with(PREFIX)
+            && matches!(
+                name,
+                ALL_REDUCE | ALL_GATHER | REDUCE_SCATTER | BROADCAST | SYNC
+            )
     }
 
     /// Attribute key carrying the [`super::ParallelLayout`]-ish group for an
