@@ -17,7 +17,7 @@ pub fn get<'a>(attrs: &'a RsAttrs, key: &str) -> Option<&'a RsAttr> {
         if a.key.is_null() {
             return false;
         }
-        // SAFETY: plugin-owned NUL-terminated string, valid for the call.
+        // SAFETY: caller-owned NUL-terminated string, valid for the call.
         unsafe { CStr::from_ptr(a.key) }.to_bytes() == key.as_bytes()
     })
 }
@@ -49,7 +49,7 @@ pub fn attr_str<'a>(attrs: &'a RsAttrs, key: &str) -> Option<&'a str> {
     if a.kind != RsAttrKind::STR || a.str.is_null() {
         return None;
     }
-    // SAFETY: plugin-owned NUL-terminated string, valid for the call.
+    // SAFETY: caller-owned NUL-terminated string, valid for the call.
     unsafe { CStr::from_ptr(a.str) }.to_str().ok()
 }
 
@@ -59,7 +59,7 @@ pub fn attr_i64s<'a>(attrs: &'a RsAttrs, key: &str) -> Option<&'a [i64]> {
     if a.kind != RsAttrKind::I64S || a.i64s.is_null() {
         return None;
     }
-    // SAFETY: plugin-owned array of `n_i64s` values, valid for the call.
+    // SAFETY: caller-owned array of `n_i64s` values, valid for the call.
     Some(unsafe { std::slice::from_raw_parts(a.i64s, a.n_i64s as usize) })
 }
 

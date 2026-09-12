@@ -268,6 +268,24 @@ pub unsafe fn indices_i64(
     Ok(out)
 }
 
+/// Checks a descriptor's rank without touching data (pure; usable in infer
+/// and cheap enough to repeat in execute).
+pub fn expect_rank(t: &RsTensor, op: &'static str, who: &str, want: usize) -> OpResult<()> {
+    if t.rank as usize != want {
+        return Err(err(
+            op,
+            format!("input '{who}' has rank {}, expected {want}", t.rank),
+        ));
+    }
+    if t.rank as usize > MAX_RANK {
+        return Err(err(
+            op,
+            format!("input '{who}' has rank {}, exceeding MAX_RANK", t.rank),
+        ));
+    }
+    Ok(())
+}
+
 /// Resolves an axis attribute: negative values count from the end, so `-1`
 /// is the last axis. Errors when out of range.
 pub fn resolve_axis(axis: i64, rank: usize, op: &'static str) -> OpResult<usize> {

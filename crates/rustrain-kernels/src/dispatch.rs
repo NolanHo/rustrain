@@ -143,6 +143,15 @@ pub unsafe fn run(
 ) -> i32 {
     // Panics must not unwind into C code (UB); report them like any failure.
     let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
+        // A null pointer with a non-zero count cannot even be turned into a
+        // slice (that construction is UB), so reject it before building the
+        // Call instead of trusting the host blindly.
+        if (in_.is_null() && n_in > 0) || (out.is_null() && n_out > 0) {
+            return Err(err(
+                op,
+                "null descriptor array with a non-zero count (malformed call)",
+            ));
+        }
         // SAFETY: forwarded from the C caller under the ABI contract.
         let mut call = unsafe { Call::from_raw(op, in_, n_in, out, n_out) };
         let attrs = attrs_of(attrs);

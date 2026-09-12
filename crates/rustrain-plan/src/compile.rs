@@ -8,7 +8,7 @@
 
 use serde::Serialize;
 
-use rustrain_abi::ffi::{RsAttrs, RsNumerics, RsTensor};
+use rustrain_abi::ffi::{RsNumerics, RsTensor};
 use rustrain_ops::{Phase, Recipe, RegisteredOp, Registry, ResolveRequest, TargetEnv};
 use rustrain_parallel::{GroupKind, ParallelConfig, ParallelLayout, ProcessGroups, ReduceOp};
 
@@ -216,7 +216,7 @@ impl<'a> Compiler<'a> {
     }
 
     pub fn groups(&self) -> ProcessGroups {
-        ProcessGroups::new(self.parallel.clone())
+        ProcessGroups::new(self.parallel)
     }
 
     pub fn compile(&self, plan: &Plan) -> Result<CompiledPlan, PlanError> {
@@ -272,7 +272,7 @@ impl<'a> Compiler<'a> {
             plan,
             steps,
             digest,
-            parallel: self.parallel.clone(),
+            parallel: self.parallel,
             resolved,
             inserted: propagation.inserted,
         })
@@ -404,12 +404,12 @@ impl<'a> Compiler<'a> {
         let in_tensors: Vec<RsTensor> = node
             .inputs
             .iter()
-            .map(|s| tensor_for(&plan.slot(*s)))
+            .map(|s| tensor_for(plan.slot(*s)))
             .collect();
         let mut out_tensors: Vec<RsTensor> = node
             .outputs
             .iter()
-            .map(|s| tensor_for(&plan.slot(*s)))
+            .map(|s| tensor_for(plan.slot(*s)))
             .collect();
 
         let in_ptrs: Vec<*const RsTensor> = in_tensors.iter().map(std::ptr::from_ref).collect();
@@ -427,7 +427,7 @@ impl<'a> Compiler<'a> {
                 in_ptrs.len() as u32,
                 out_ptrs.as_mut_ptr(),
                 n_out as u32,
-                attrs.as_ptr() as *const RsAttrs,
+                attrs.as_ptr(),
             )
         };
         if status != 0 {

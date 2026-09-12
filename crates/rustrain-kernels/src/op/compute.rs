@@ -55,54 +55,79 @@ fn check_f32_desc(t: &RsTensor, op: &'static str, who: &str) -> OpResult<()> {
 
 // ── matmul ──────────────────────────────────────────────────────────────────
 
-fn matmul_infer_body(c: &mut Call, _a: &RsAttrs) -> OpResult<()> {
-    c.expect_arity((2, 2))?;
-    c.expect_out_count(1)?;
-    let a = c.in_t(0);
-    let b = c.in_t(1);
-    check_f32_desc(a, c.op, "a")?;
-    check_f32_desc(b, c.op, "b")?;
+/// Shared matmul shape plan (used by infer and execute, so direct execute
+/// calls get the same validation): returns (m, k, n, transpose_b).
+fn matmul_plan(a: &RsTensor, b: &RsTensor, attrs: &RsAttrs, op: &'static str) -> OpResult<(i64, i64, i64, bool)> {
+    check_f32_desc(a, op, "a")?;
+    check_f32_desc(b, op, "b")?;
     if a.rank != 2 || b.rank != 2 {
         return Err(fail!(
-            c.op,
+            op,
             "matmul expects rank-2 inputs, got ranks {} and {}",
             a.rank,
             b.rank
         ));
     }
-    if a.shape[1] != b.shape[0] {
-        return Err(fail!(
-            c.op,
-            "matmul inner dims mismatch: a is {:?}, b is {:?}",
-            a.dims(),
-            b.dims()
-        ));
-    }
+    let b_t = crate::attrs::attr_bool(attrs, "transpose_b").unwrap_or(false);
+    // With transpose_b, b is [N, K] and the product is a @ b^T = [M, N];
+    // without it b is [K, N]. The attribute must be declared — the shapes
+    // are never used to guess it.
+    let (k, n) = if b_t {
+        if a.shape[1] != b.shape[1] {
+            return Err(fail!(
+                op,
+                "matmul inner dims mismatch with transpose_b: a is {:?}, b is {:?} \
+                 (b is [N, K] and must satisfy a.K == b.K)",
+                a.dims(),
+                b.dims()
+            ));
+        }
+        (a.shape[1], b.shape[0])
+    } else {
+        if a.shape[1] != b.shape[0] {
+            return Err(fail!(
+                op,
+                "matmul inner dims mismatch: a is {:?}, b is {:?}",
+                a.dims(),
+                b.dims()
+            ));
+        }
+        (a.shape[1], b.shape[1])
+    };
+    Ok((a.shape[0], k, n, b_t))
+}
+
+fn matmul_infer_body(c: &mut Call, a: &RsAttrs) -> OpResult<()> {
+    c.expect_arity((2, 2))?;
+    c.expect_out_count(1)?;
+    let (m, _k, n, _bt) = matmul_plan(c.in_t(0), c.in_t(1), a, c.op)?;
     let o = c.out_t(0);
-    set_output_desc(o, rustrain_abi::ffi::RsDtype::F32, &[a.shape[0], b.shape[1]]);
+    set_output_desc(o, rustrain_abi::ffi::RsDtype::F32, &[m, n]);
     Ok(())
 }
 
-fn matmul_exec_body(c: &mut Call, _a: &RsAttrs) -> OpResult<()> {
+fn matmul_exec_body(c: &mut Call, a: &RsAttrs) -> OpResult<()> {
     c.expect_arity((2, 2))?;
     c.expect_out_count(1)?;
-    let a = c.in_t(0);
-    let b = c.in_t(1);
-    let (m, k) = (a.shape[0] as usize, a.shape[1] as usize);
-    let n = b.shape[1] as usize;
-    let shape = [a.shape[0], b.shape[1]];
+    let (m, k, n, b_t) = matmul_plan(c.in_t(0), c.in_t(1), a, c.op)?;
+    let shape = [m, n];
     expect_out(c.out_t(0), c.op, rustrain_abi::ffi::RsDtype::F32, &shape)?;
     // SAFETY: descriptor liveness is the ABI caller's contract.
-    let av = unsafe { crate::tensor::f32_in(c.op, "a", a) }?;
-    let bv = unsafe { crate::tensor::f32_in(c.op, "b", b) }?;
+    let av = unsafe { crate::tensor::f32_in(c.op, "a", c.in_t(0)) }?;
+    let bv = unsafe { crate::tensor::f32_in(c.op, "b", c.in_t(1)) }?;
     let mut cv = unsafe { crate::tensor::f32_out(c.op, c.out_t(0)) }?;
+    let (m, k, n) = (m as usize, k as usize, n as usize);
     // Naive triple loop with k accumulated in ascending order: the fixed
     // summation order is what makes the result bitwise reproducible.
     for i in 0..m {
         for j in 0..n {
             let mut acc = 0f32;
             for kk in 0..k {
-                acc += av[[i, kk]] * bv[[kk, j]];
+                acc += if b_t {
+                    av[[i, kk]] * bv[[j, kk]]
+                } else {
+                    av[[i, kk]] * bv[[kk, j]]
+                };
             }
             cv[[i, j]] = acc;
         }
@@ -166,8 +191,37 @@ fn linear_exec_body(c: &mut Call, _a: &RsAttrs) -> OpResult<()> {
     c.expect_out_count(1)?;
     let x = c.in_t(0);
     let w = c.in_t(1);
+    check_f32_desc(x, c.op, "x")?;
+    check_f32_desc(w, c.op, "w")?;
+    if x.rank < 1 || x.rank as usize > rustrain_abi::ffi::MAX_RANK || w.rank != 2 {
+        return Err(fail!(
+            c.op,
+            "linear expects x with rank 1..=8 and w with rank 2, got ranks {} and {}",
+            x.rank,
+            w.rank
+        ));
+    }
     let k = x.dims()[x.rank as usize - 1] as usize;
+    if w.shape[0] != k as i64 {
+        return Err(fail!(
+            c.op,
+            "linear inner dim mismatch: x.last = {k}, w is {:?} (expected [K={k}, N])",
+            w.dims()
+        ));
+    }
     let n = w.shape[1] as usize;
+    if c.n_in() == 3 {
+        let b = c.in_t(2);
+        check_f32_desc(b, c.op, "b")?;
+        if b.rank != 1 || b.shape[0] != w.shape[1] {
+            return Err(fail!(
+                c.op,
+                "linear bias must be [N={}], got {:?}",
+                w.shape[1],
+                b.dims()
+            ));
+        }
+    }
     let mut shape = SmallShape {
         len: x.rank as usize,
         dims: [0; rustrain_abi::ffi::MAX_RANK],
@@ -185,16 +239,20 @@ fn linear_exec_body(c: &mut Call, _a: &RsAttrs) -> OpResult<()> {
         None
     };
     let mut yv = unsafe { crate::tensor::f32_out(c.op, c.out_t(0)) }?;
-    let batches = xv.len() / k;
-    // Deterministic per-batch triple loop, k ascending. Linear indexing is
-    // used on the flat (contiguous) buffers, so ordering is explicit.
+    // Contiguous flat slices: indexing is explicit, ordering is fixed.
+    let xs = xv.as_slice().expect("contiguous");
+    let ws = wv.as_slice().expect("contiguous");
+    let bs = bias.as_ref().map(|b| b.as_slice().expect("contiguous"));
+    let ys = yv.as_slice_mut().expect("contiguous");
+    let batches = xs.len() / k;
+    // Deterministic per-batch triple loop, k ascending.
     for b in 0..batches {
         for j in 0..n {
             let mut acc = 0f32;
             for kk in 0..k {
-                acc += xv[b * k + kk] * wv[kk * n + j];
+                acc += xs[b * k + kk] * ws[kk * n + j];
             }
-            yv[b * n + j] = match &bias {
+            ys[b * n + j] = match bs {
                 Some(bv) => acc + bv[j],
                 None => acc,
             };
@@ -205,16 +263,18 @@ fn linear_exec_body(c: &mut Call, _a: &RsAttrs) -> OpResult<()> {
 
 // ── bmm ─────────────────────────────────────────────────────────────────────
 
-fn bmm_infer_body(c: &mut Call, _a: &RsAttrs) -> OpResult<()> {
-    c.expect_arity((2, 2))?;
-    c.expect_out_count(1)?;
-    let a = c.in_t(0);
-    let b = c.in_t(1);
-    check_f32_desc(a, c.op, "a")?;
-    check_f32_desc(b, c.op, "b")?;
+/// Shared bmm shape plan for infer and execute: returns (rank, m, k, n, b_t).
+fn bmm_plan(
+    a: &RsTensor,
+    b: &RsTensor,
+    attrs: &RsAttrs,
+    op: &'static str,
+) -> OpResult<(usize, i64, i64, i64, bool)> {
+    check_f32_desc(a, op, "a")?;
+    check_f32_desc(b, op, "b")?;
     if a.rank != b.rank || a.rank < 3 {
         return Err(fail!(
-            c.op,
+            op,
             "bmm expects equal ranks >= 3, got ranks {} and {}",
             a.rank,
             b.rank
@@ -224,7 +284,7 @@ fn bmm_infer_body(c: &mut Call, _a: &RsAttrs) -> OpResult<()> {
     for d in 0..r - 2 {
         if a.shape[d] != b.shape[d] {
             return Err(fail!(
-                c.op,
+                op,
                 "bmm batch dim {d} mismatch: {} vs {} (batch dims must be identical, \
                  broadcasting is not supported)",
                 a.shape[d],
@@ -232,56 +292,72 @@ fn bmm_infer_body(c: &mut Call, _a: &RsAttrs) -> OpResult<()> {
             ));
         }
     }
+    let b_t = crate::attrs::attr_bool(attrs, "transpose_b").unwrap_or(false);
     let (m, k) = (a.shape[r - 2], a.shape[r - 1]);
-    let n = b.shape[r - 1];
-    if k != b.shape[r - 2] {
+    let (k2, n) = if b_t {
+        // b is [.., N, K] and the product is a @ b^T.
+        (b.shape[r - 1], b.shape[r - 2])
+    } else {
+        (b.shape[r - 2], b.shape[r - 1])
+    };
+    if k != k2 {
         return Err(fail!(
-            c.op,
-            "bmm inner dims mismatch: a is {:?}, b is {:?}",
+            op,
+            "bmm inner dims mismatch: a is {:?}, b is {:?} (transpose_b = {b_t})",
             a.dims(),
             b.dims()
         ));
     }
+    Ok((r, m, k, n, b_t))
+}
+
+fn bmm_infer_body(c: &mut Call, a: &RsAttrs) -> OpResult<()> {
+    c.expect_arity((2, 2))?;
+    c.expect_out_count(1)?;
+    let (r, _m, _k, n, _bt) = bmm_plan(c.in_t(0), c.in_t(1), a, c.op)?;
     let mut shape = SmallShape {
         len: r,
         dims: [0; rustrain_abi::ffi::MAX_RANK],
     };
-    shape.dims[..r].copy_from_slice(a.dims());
+    shape.dims[..r].copy_from_slice(c.in_t(0).dims());
     shape.dims[r - 1] = n;
     let o = c.out_t(0);
     set_output_desc(o, rustrain_abi::ffi::RsDtype::F32, shape.as_slice());
-    let _ = (m, k);
     Ok(())
 }
 
-fn bmm_exec_body(c: &mut Call, _a: &RsAttrs) -> OpResult<()> {
+fn bmm_exec_body(c: &mut Call, a: &RsAttrs) -> OpResult<()> {
     c.expect_arity((2, 2))?;
     c.expect_out_count(1)?;
-    let a = c.in_t(0);
-    let b = c.in_t(1);
-    let r = a.rank as usize;
-    let (m, k) = (a.shape[r - 2] as usize, a.shape[r - 1] as usize);
-    let n = b.shape[r - 1] as usize;
-    let batches: usize = a.dims()[..r - 2].iter().map(|&d| d as usize).product();
+    let (r, m, k, n, b_t) = bmm_plan(c.in_t(0), c.in_t(1), a, c.op)?;
+    let (m, k, n) = (m as usize, k as usize, n as usize);
+    let batches: usize = c.in_t(0).dims()[..r - 2].iter().map(|&d| d as usize).product();
     let mut shape = SmallShape {
         len: r,
         dims: [0; rustrain_abi::ffi::MAX_RANK],
     };
-    shape.dims[..r].copy_from_slice(a.dims());
-    shape.dims[r - 1] = b.shape[r - 1];
+    shape.dims[..r].copy_from_slice(c.in_t(0).dims());
+    shape.dims[r - 1] = n as i64;
     expect_out(c.out_t(0), c.op, rustrain_abi::ffi::RsDtype::F32, shape.as_slice())?;
     // SAFETY: descriptor liveness is the ABI caller's contract.
-    let av = unsafe { crate::tensor::f32_in(c.op, "a", a) }?;
-    let bv = unsafe { crate::tensor::f32_in(c.op, "b", b) }?;
+    let av = unsafe { crate::tensor::f32_in(c.op, "a", c.in_t(0)) }?;
+    let bv = unsafe { crate::tensor::f32_in(c.op, "b", c.in_t(1)) }?;
     let mut cv = unsafe { crate::tensor::f32_out(c.op, c.out_t(0)) }?;
+    let xs = av.as_slice().expect("contiguous");
+    let bs = bv.as_slice().expect("contiguous");
+    let ys = cv.as_slice_mut().expect("contiguous");
     for batch in 0..batches {
         for i in 0..m {
             for j in 0..n {
                 let mut acc = 0f32;
                 for kk in 0..k {
-                    acc += av[batch * (m * k) + i * k + kk] * bv[batch * (k * n) + kk * n + j];
+                    acc += if b_t {
+                        xs[batch * (m * k) + i * k + kk] * bs[batch * (n * k) + j * k + kk]
+                    } else {
+                        xs[batch * (m * k) + i * k + kk] * bs[batch * (k * n) + kk * n + j]
+                    };
                 }
-                cv[batch * (m * n) + i * n + j] = acc;
+                ys[batch * (m * n) + i * n + j] = acc;
             }
         }
     }
@@ -609,7 +685,7 @@ fn softmax_exec_body(c: &mut Call, a: &RsAttrs) -> OpResult<()> {
     let mut yv = unsafe { crate::tensor::f32_out(c.op, c.out_t(0)) }?;
     // Stable softmax: subtract the lane max before exponentiating, so a
     // large-magnitude lane (e.g. [1000, 1000, 0]) cannot overflow to inf/NaN.
-    for (lane, mut out) in xv.lanes(ax).into_iter().zip(yv.lanes_mut(ax).into_iter()) {
+    for (lane, mut out) in xv.lanes(ax).into_iter().zip(yv.lanes_mut(ax)) {
         let m = lane.iter().fold(f32::NEG_INFINITY, |acc, &v| acc.max(v));
         let s = lane.iter().fold(0.0f32, |acc, &v| acc + ((v - m) * scale).exp());
         for (o, &v) in out.iter_mut().zip(lane.iter()) {
@@ -656,6 +732,9 @@ fn rmsnorm_exec_body(c: &mut Call, a: &RsAttrs) -> OpResult<()> {
     c.expect_arity((1, 2))?;
     c.expect_out_count(1)?;
     let x = c.in_t(0);
+    if x.rank < 1 {
+        return Err(err(c.op, "rmsnorm expects rank >= 1"));
+    }
     let rank = x.rank as usize;
     let eps = norm_eps(a) as f32;
     expect_out(c.out_t(0), c.op, rustrain_abi::ffi::RsDtype::F32, x.dims())?;
@@ -671,7 +750,7 @@ fn rmsnorm_exec_body(c: &mut Call, a: &RsAttrs) -> OpResult<()> {
     // Convention (documented): y = x / sqrt(mean(x^2) + eps) * w, eps inside
     // the sqrt. mean(x^2) is accumulated in ascending order.
     let ax = Axis(rank - 1);
-    for (lane, mut out) in xv.lanes(ax).into_iter().zip(yv.lanes_mut(ax).into_iter()) {
+    for (lane, mut out) in xv.lanes(ax).into_iter().zip(yv.lanes_mut(ax)) {
         let ss = lane.iter().fold(0.0f32, |acc, &v| acc + v * v) / lane.len() as f32;
         let r = (ss + eps).sqrt();
         for (i, (o, &v)) in out.iter_mut().zip(lane.iter()).enumerate() {
@@ -729,6 +808,9 @@ fn layernorm_exec_body(c: &mut Call, a: &RsAttrs) -> OpResult<()> {
     c.expect_arity((1, 3))?;
     c.expect_out_count(1)?;
     let x = c.in_t(0);
+    if x.rank < 1 {
+        return Err(err(c.op, "layernorm expects rank >= 1"));
+    }
     let rank = x.rank as usize;
     let eps = norm_eps(a) as f32;
     expect_out(c.out_t(0), c.op, rustrain_abi::ffi::RsDtype::F32, x.dims())?;
@@ -748,7 +830,7 @@ fn layernorm_exec_body(c: &mut Call, a: &RsAttrs) -> OpResult<()> {
     // Convention (documented): y = (x - mean) / sqrt(var + eps) * w + b with
     // the biased variance 1/D * sum((x - mean)^2), eps outside the sqrt.
     let ax = Axis(rank - 1);
-    for (lane, mut out) in xv.lanes(ax).into_iter().zip(yv.lanes_mut(ax).into_iter()) {
+    for (lane, mut out) in xv.lanes(ax).into_iter().zip(yv.lanes_mut(ax)) {
         let n = lane.len() as f32;
         let mean = lane.iter().fold(0.0f32, |acc, &v| acc + v) / n;
         let var = lane.iter().fold(0.0f32, |acc, &v| {
@@ -814,8 +896,17 @@ fn rope_exec_body(c: &mut Call, _a: &RsAttrs) -> OpResult<()> {
     c.expect_arity((3, 3))?;
     c.expect_out_count(1)?;
     let x = c.in_t(0);
+    if x.rank < 1 {
+        return Err(err(c.op, "rope expects rank >= 1"));
+    }
     let rank = x.rank as usize;
     let d = x.dims()[rank - 1] as usize;
+    if d % 2 != 0 {
+        return Err(err(
+            c.op,
+            format!("rope requires an even last dim (D={d})"),
+        ));
+    }
     let half = d / 2;
     expect_out(c.out_t(0), c.op, rustrain_abi::ffi::RsDtype::F32, x.dims())?;
     // SAFETY: descriptor liveness is the ABI caller's contract.
@@ -839,25 +930,30 @@ fn rope_exec_body(c: &mut Call, _a: &RsAttrs) -> OpResult<()> {
     //   y[2i+1] = x[2i+1] * cos[i] + x[2i] * sin[i]
     // cos/sin are caller-computed tables; the op only rotates, which keeps it
     // convention-free about theta bases and position encodings.
+    // Fixed-size index buffers: the hot loop must not allocate (the memory
+    // reporter would have to account for it, and per-element allocs are
+    // exactly the kind of hidden workspace the planning rule forbids).
     for ((idx, o), &v) in yv.indexed_iter_mut().zip(xv.iter()) {
         let idx = idx.slice();
-        let last = idx[idx.len() - 1];
+        let rank = idx.len();
+        let mut cidx = [0usize; rustrain_abi::ffi::MAX_RANK];
+        cidx[..rank].copy_from_slice(idx);
+        let last = cidx[rank - 1];
         let i = last / 2;
-        let mut cidx = idx.to_vec();
-        cidx[idx.len() - 1] = i;
-        let c = cd[IxDyn(&cidx)];
-        let s = sd[IxDyn(&cidx)];
+        cidx[rank - 1] = i;
+        let c = cd[IxDyn(&cidx[..rank])];
+        let s = sd[IxDyn(&cidx[..rank])];
         let (other, sign_even) = if last % 2 == 0 {
             // even element: paired with the odd element to its right
-            let mut oidx = idx.to_vec();
-            oidx[idx.len() - 1] = last + 1;
-            (xv[IxDyn(&oidx)], true)
+            let mut oidx = cidx;
+            oidx[rank - 1] = last + 1;
+            (xv[IxDyn(&oidx[..rank])], true)
         } else {
-            let mut oidx = idx.to_vec();
-            oidx[idx.len() - 1] = last - 1;
-            (xv[IxDyn(&oidx)], false)
+            let mut oidx = cidx;
+            oidx[rank - 1] = last - 1;
+            (xv[IxDyn(&oidx[..rank])], false)
         };
-        *o = if sign_even { v * c - other * s } else { other * c + v * s };
+        *o = if sign_even { v * c - other * s } else { v * c + other * s };
     }
     Ok(())
 }

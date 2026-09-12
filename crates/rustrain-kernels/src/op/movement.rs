@@ -98,6 +98,19 @@ fn embedding_exec_body(c: &mut Call, _a: &RsAttrs) -> OpResult<()> {
     c.expect_out_count(1)?;
     let w = c.in_t(0);
     let idx = c.in_t(1);
+    if w.dtype != RsDtype::F32 {
+        return Err(err(c.op, format!("input 'w' has dtype {}, expected f32", w.dtype)));
+    }
+    check_index_dtype(idx, c.op, "indices")?;
+    if w.rank != 2 || idx.rank < 1 || idx.rank as usize + 1 > MAX_RANK {
+        return Err(err(
+            c.op,
+            format!(
+                "embedding expects weight [V, D] and indices with rank 1..=7, got ranks {} and {}",
+                w.rank, idx.rank
+            ),
+        ));
+    }
     let r = idx.rank as usize;
     let mut shape = SmallShape {
         len: r + 1,
@@ -111,6 +124,8 @@ fn embedding_exec_body(c: &mut Call, _a: &RsAttrs) -> OpResult<()> {
     let ids = unsafe { crate::tensor::indices_i64(c.op, "indices", idx) }?;
     let mut yv = unsafe { crate::tensor::f32_out(c.op, c.out_t(0)) }?;
     let (v, d) = (wv.shape()[0], wv.shape()[1]);
+    let ws = wv.as_slice().expect("contiguous");
+    let ys = yv.as_slice_mut().expect("contiguous");
     for (n, &id) in ids.iter().enumerate() {
         if id < 0 || id >= v as i64 {
             return Err(fail!(
@@ -120,13 +135,51 @@ fn embedding_exec_body(c: &mut Call, _a: &RsAttrs) -> OpResult<()> {
         }
         let row = id as usize;
         for j in 0..d {
-            yv[n * d + j] = wv[row * d + j];
+            ys[n * d + j] = ws[row * d + j];
         }
     }
     Ok(())
 }
 
 // ── gather ──────────────────────────────────────────────────────────────────
+
+/// Gather validation shared by infer and execute: torch-gather convention —
+/// indices have the same rank as `x`, dims equal to `x`'s except along
+/// `axis`, and the output has the indices' shape. Returns (rank, axis).
+fn gather_plan(
+    x: &RsTensor,
+    idx: &RsTensor,
+    a: &RsAttrs,
+    op: &'static str,
+) -> OpResult<(usize, usize)> {
+    let rank = x.rank as usize;
+    if rank < 1 {
+        return Err(err(op, "gather expects x with rank >= 1"));
+    }
+    if idx.rank as usize != rank {
+        return Err(err(
+            op,
+            format!(
+                "gather indices must have the same rank as x ({rank}), got rank {} — \
+                 the torch-gather convention; reshape the indices if needed",
+                idx.rank
+            ),
+        ));
+    }
+    let ax = resolve_axis(attr_i64(a, "axis").unwrap_or(-1), rank, op)?;
+    for d in 0..rank {
+        if d != ax && idx.shape[d] != x.shape[d] {
+            return Err(fail!(
+                op,
+                "gather indices dim {d} = {} must equal x dim {d} = {} (dims other than \
+                 the gathered axis must match)",
+                idx.shape[d],
+                x.shape[d]
+            ));
+        }
+    }
+    Ok((rank, ax))
+}
 
 fn gather_infer_body(c: &mut Call, a: &RsAttrs) -> OpResult<()> {
     c.expect_arity((2, 2))?;
@@ -137,26 +190,10 @@ fn gather_infer_body(c: &mut Call, a: &RsAttrs) -> OpResult<()> {
         return Err(err(c.op, format!("input 'x' has dtype {}, expected f32", x.dtype)));
     }
     check_index_dtype(idx, c.op, "indices")?;
-    let rank = x.rank as usize;
-    if rank < 1 {
-        return Err(err(c.op, "gather expects x with rank >= 1"));
-    }
-    if idx.rank != 1 {
-        return Err(err(
-            c.op,
-            format!("gather indices must be rank 1 [K], got rank {}", idx.rank),
-        ));
-    }
-    let ax = resolve_axis(attr_i64(a, "axis").unwrap_or(-1), rank, c.op)?;
-    let k = idx.shape[0];
-    let mut shape = SmallShape {
-        len: rank,
-        dims: [0; MAX_RANK],
-    };
-    shape.dims[..rank].copy_from_slice(x.dims());
-    shape.dims[ax] = k;
+    let (rank, _ax) = gather_plan(x, idx, a, c.op)?;
     let o = c.out_t(0);
-    set_output_desc(o, RsDtype::F32, shape.as_slice());
+    set_output_desc(o, RsDtype::F32, idx.dims());
+    let _ = rank;
     Ok(())
 }
 
@@ -165,50 +202,49 @@ fn gather_exec_body(c: &mut Call, a: &RsAttrs) -> OpResult<()> {
     c.expect_out_count(1)?;
     let x = c.in_t(0);
     let idx = c.in_t(1);
-    let rank = x.rank as usize;
-    let ax = resolve_axis(attr_i64(a, "axis").unwrap_or(-1), rank, c.op)?;
-    let k = idx.shape[0] as usize;
-    let mut shape = SmallShape {
-        len: rank,
-        dims: [0; MAX_RANK],
-    };
-    shape.dims[..rank].copy_from_slice(x.dims());
-    shape.dims[ax] = idx.shape[0];
-    expect_out(c.out_t(0), c.op, RsDtype::F32, shape.as_slice())?;
+    if x.dtype != RsDtype::F32 {
+        return Err(err(c.op, format!("input 'x' has dtype {}, expected f32", x.dtype)));
+    }
+    check_index_dtype(idx, c.op, "indices")?;
+    let (rank, ax) = gather_plan(x, idx, a, c.op)?;
+    expect_out(c.out_t(0), c.op, RsDtype::F32, idx.dims())?;
     // SAFETY: descriptor liveness is the ABI caller's contract.
     let xv = unsafe { crate::tensor::f32_in(c.op, "x", x) }?;
     let ids = unsafe { crate::tensor::indices_i64(c.op, "indices", idx) }?;
     let mut yv = unsafe { crate::tensor::f32_out(c.op, c.out_t(0)) }?;
+    let xs = xv.as_slice().expect("contiguous");
+    let ys = yv.as_slice_mut().expect("contiguous");
     let dim_size = x.dims()[ax];
-    // Linear-index arithmetic with the axis removed; loops ascend so the
-    // order — and therefore the result — is fixed.
-    let (outer, inner) = {
-        let mut o = 1usize;
-        for &d in &x.dims()[..ax] {
-            o *= d as usize;
+    // Row-major strides of the (contiguous) input, so the gathered axis can
+    // be substituted per element. Ascending flat iteration — deterministic.
+    let mut strides = [0usize; MAX_RANK];
+    {
+        let mut acc = 1usize;
+        for d in (0..rank).rev() {
+            strides[d] = acc;
+            acc *= x.dims()[d] as usize;
         }
-        let mut i = 1usize;
-        for &d in &x.dims()[ax + 1..] {
-            i *= d as usize;
+    }
+    for (flat, &id) in ids.iter().enumerate() {
+        if id < 0 || id >= dim_size {
+            return Err(fail!(
+                c.op,
+                "index {id} out of range [0, {dim_size}) along axis {ax} \
+                 (negative indices are not wrapped)"
+            ));
         }
-        (o, i)
-    };
-    for oi in 0..outer {
-        for kk in 0..k {
-            let id = ids[kk];
-            if id < 0 || id >= dim_size {
-                return Err(fail!(
-                    c.op,
-                    "index {id} out of range [0, {dim_size}) along axis {ax} \
-                     (negative indices are not wrapped)"
-                ));
-            }
-            let src = (oi * dim_size as usize + id as usize) * inner;
-            let dst = (oi * k + kk) * inner;
-            for t in 0..inner {
-                yv[dst + t] = xv[src + t];
-            }
+        // Decompose the flat output index into a multi-index (least
+        // significant dim first), replace the gathered axis with the index
+        // value, and read x at that position.
+        let mut rem = flat;
+        let mut src = 0usize;
+        for d in (0..rank).rev() {
+            let dim = idx.dims()[d] as usize;
+            let coord = if d == ax { id as usize } else { rem % dim };
+            rem /= dim;
+            src += coord * strides[d];
         }
+        ys[flat] = xs[src];
     }
     Ok(())
 }
@@ -229,16 +265,6 @@ fn scatter_infer_body(c: &mut Call, a: &RsAttrs) -> OpResult<()> {
     if rank < 1 {
         return Err(err(c.op, "scatter expects x with rank >= 1"));
     }
-    if values.dims() != x.dims() {
-        return Err(err(
-            c.op,
-            format!(
-                "scatter 'values' must have the same shape as 'x': {:?} vs {:?}",
-                values.dims(),
-                x.dims()
-            ),
-        ));
-    }
     if idx.rank != 1 {
         return Err(err(
             c.op,
@@ -246,13 +272,20 @@ fn scatter_infer_body(c: &mut Call, a: &RsAttrs) -> OpResult<()> {
         ));
     }
     let ax = resolve_axis(attr_i64(a, "axis").unwrap_or(-1), rank, c.op)?;
-    if idx.shape[0] != values.dims()[ax] {
+    // Convention (documented): 'values' has x's shape with the axis dim
+    // equal to K.
+    if values.dims()[..ax] != x.dims()[..ax]
+        || values.dims()[ax + 1..] != x.dims()[ax + 1..]
+        || values.dims()[ax] != idx.shape[0]
+    {
         return Err(err(
             c.op,
             format!(
-                "scatter indices length {} must equal values dim {ax} = {}",
-                idx.shape[0],
-                values.dims()[ax]
+                "scatter 'values' must have x's shape with dim {ax} = K: values {:?}, \
+                 x {:?}, indices length {}",
+                values.dims(),
+                x.dims(),
+                idx.shape[0]
             ),
         ));
     }
@@ -267,8 +300,33 @@ fn scatter_exec_body(c: &mut Call, a: &RsAttrs) -> OpResult<()> {
     let x = c.in_t(0);
     let idx = c.in_t(1);
     let values = c.in_t(2);
+    if x.dtype != RsDtype::F32 || values.dtype != RsDtype::F32 {
+        return Err(err(c.op, "scatter expects f32 'x' and 'values'"));
+    }
+    check_index_dtype(idx, c.op, "indices")?;
     let rank = x.rank as usize;
+    if rank < 1 || idx.rank != 1 {
+        return Err(err(
+            c.op,
+            format!("scatter expects x with rank >= 1 and indices of rank 1, got ranks {} and {}", x.rank, idx.rank),
+        ));
+    }
     let ax = resolve_axis(attr_i64(a, "axis").unwrap_or(-1), rank, c.op)?;
+    if values.dims()[..ax] != x.dims()[..ax]
+        || values.dims()[ax + 1..] != x.dims()[ax + 1..]
+        || values.dims()[ax] != idx.shape[0]
+    {
+        return Err(err(
+            c.op,
+            format!(
+                "scatter 'values' must have x's shape with dim {ax} = K: values {:?}, \
+                 x {:?}, indices length {}",
+                values.dims(),
+                x.dims(),
+                idx.shape[0]
+            ),
+        ));
+    }
     expect_out(c.out_t(0), c.op, RsDtype::F32, x.dims())?;
     // SAFETY: descriptor liveness is the ABI caller's contract.
     let xv = unsafe { crate::tensor::f32_in(c.op, "x", x) }?;
@@ -292,6 +350,8 @@ fn scatter_exec_body(c: &mut Call, a: &RsAttrs) -> OpResult<()> {
         }
         (o, i)
     };
+    let vs = vv.as_slice().expect("contiguous");
+    let ys = yv.as_slice_mut().expect("contiguous");
     for oi in 0..outer {
         for (kk, &id) in ids.iter().enumerate() {
             if id < 0 || id >= dim_size {
@@ -303,9 +363,7 @@ fn scatter_exec_body(c: &mut Call, a: &RsAttrs) -> OpResult<()> {
             }
             let src = (oi * ids.len() + kk) * inner;
             let dst = (oi * dim_size as usize + id as usize) * inner;
-            for t in 0..inner {
-                yv[dst + t] = vv[src + t];
-            }
+            ys[dst..dst + inner].copy_from_slice(&vs[src..src + inner]);
         }
     }
     Ok(())

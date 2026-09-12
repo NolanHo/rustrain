@@ -11,3 +11,9 @@ rust-version.workspace = true
 rustrain-abi.workspace = true
 ndarray.workspace = true
 thiserror.workspace = true
+
+# The plugin must be dlopen-able by the framework's loader (contract C-1):
+# publish a cdylib alongside the rlib the tests link against.
+[lib]
+crate-type = ["rlib", "cdylib"]
+

@@ -254,7 +254,7 @@ fn row_parallel_weight_inserts_a_collective_the_runtime_drives() {
         ..Default::default()
     };
 
-    let mut b = PlanBuilder::new("tp", Phase::Forward, parallel.clone());
+    let mut b = PlanBuilder::new("tp", Phase::Forward, parallel);
     let x = b.slot("x", RsDtype::F32, vec![4], SlotKind::Input);
     // Weight sharded along its contraction dim => each rank holds a partial sum.
     let w = b.slot_with_layout(
@@ -317,7 +317,7 @@ fn single_rank_refuses_when_the_world_is_larger_than_one() {
         ..Default::default()
     };
 
-    let mut b = PlanBuilder::new("tp", Phase::Forward, parallel.clone());
+    let mut b = PlanBuilder::new("tp", Phase::Forward, parallel);
     let x = b.slot("x", RsDtype::F32, vec![4], SlotKind::Input);
     let w = b.slot_with_layout(
         "w",

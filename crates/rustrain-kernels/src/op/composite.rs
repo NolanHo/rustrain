@@ -15,7 +15,7 @@
 //! (e.g. by extending `ExpansionSpec` with `node_with_attrs`).
 
 use rustrain_abi::author::ExpansionSpec;
-use rustrain_abi::ffi::{MAX_RANK, RsAttrs, RsDtype, RsTensor};
+use rustrain_abi::ffi::{MAX_RANK, RsAttrs, RsDtype, RsMemReq, RsTensor};
 
 use crate::attrs::{attr_f64, attr_i64};
 use crate::dispatch::{Call, run};
@@ -117,10 +117,44 @@ fn sdpa_exec_body(c: &mut Call, a: &RsAttrs) -> OpResult<()> {
     let q = c.in_t(0);
     let k = c.in_t(1);
     let v = c.in_t(2);
+    for (i, t) in [(0usize, q), (1, k), (2, v)] {
+        if t.dtype != RsDtype::F32 {
+            return Err(err(c.op, format!("input {i} has dtype {}, expected f32", t.dtype)));
+        }
+    }
     let rank = q.rank as usize;
+    if rank < 3 || k.rank as usize != rank || v.rank as usize != rank {
+        return Err(fail!(
+            c.op,
+            "sdpa expects q, k, v of equal rank >= 3, got ranks {}, {}, {}",
+            q.rank,
+            k.rank,
+            v.rank
+        ));
+    }
+    for d in 0..rank - 2 {
+        if q.shape[d] != k.shape[d] || q.shape[d] != v.shape[d] {
+            return Err(fail!(
+                c.op,
+                "sdpa batch dim {d} mismatch: q={}, k={}, v={}",
+                q.shape[d],
+                k.shape[d],
+                v.shape[d]
+            ));
+        }
+    }
     let (s, d) = (q.dims()[rank - 2] as usize, q.dims()[rank - 1] as usize);
     let t = k.dims()[rank - 2] as usize;
     let dv = v.dims()[rank - 1] as usize;
+    if k.dims()[rank - 1] as usize != d || v.dims()[rank - 2] as usize != t {
+        return Err(fail!(
+            c.op,
+            "sdpa dim mismatch: q {:?}, k {:?}, v {:?}",
+            q.dims(),
+            k.dims(),
+            v.dims()
+        ));
+    }
     let batches: usize = q.dims()[..rank - 2].iter().map(|&x| x as usize).product();
     // Convention (documented): when `scale` is absent the fused body uses
     // scale = 1.0, exactly like the declared expansion's softmax node; the
@@ -180,16 +214,61 @@ fn sdpa_exec_body(c: &mut Call, a: &RsAttrs) -> OpResult<()> {
     Ok(())
 }
 
-/// Declared expansion of `sdpa` (unscaled form; see the op doc).
+/// Declared expansion of `sdpa`: `bmm(q, k, transpose_b=true)` -> `softmax`
+/// -> `bmm(p, v)`. The transposed-B form is chosen because this provider's
+/// matmul family requires contiguous inputs (documented policy), and a
+/// `transpose` view would be strided and therefore unusable downstream.
+///
+/// Node attribute table (the current `ExpansionSpec` API cannot attach
+/// per-node attrs — see the module doc):
+/// node 0: bmm, attrs {transpose_b: true};
+/// node 1: softmax, attrs {axis: -1, scale: 1.0} (defaults);
+/// node 2: bmm, no attrs.
 pub(crate) fn sdpa_expansion() -> ExpansionSpec {
     let mut e = ExpansionSpec::new(3, 1);
-    let kt = e.temp();
     let s = e.temp();
     let p = e.temp();
-    e.node("transpose", &[1], &[kt])
-        .node("matmul", &[0, kt], &[s])
+    e.node("bmm", &[0, 1], &[s])
         .node("softmax", &[s], &[p])
-        .node("matmul", &[p, 2], &[3])
+        .node("bmm", &[p, 2], &[3])
+}
+
+/// `sdpa`'s memory reporter. The fused body needs two f32 scratch buffers of
+/// S*T elements (scores and probabilities), allocated per call. The
+/// workspace rule (lib.rs): an op that needs scratch must report it here —
+/// a NULL memory slot means "cannot plan" to the compiler, and silently
+/// reporting zero while allocating would break planning. Every other op
+/// registers the shared zero reporter.
+///
+/// # Safety
+/// `io` must be null or point to `n_io` live descriptors; `out` must be
+/// null or a writable `RsMemReq`.
+pub(crate) unsafe extern "C" fn sdpa_memory(
+    io: *const *const RsTensor,
+    n_io: u32,
+    _attrs: *const RsAttrs,
+    out: *mut RsMemReq,
+) -> i32 {
+    if out.is_null() {
+        let e = err("sdpa", "null RsMemReq output pointer");
+        crate::error::set_last_error(&e);
+        return e.status();
+    }
+    // SAFETY: checked non-null above.
+    unsafe { *out = RsMemReq::default() };
+    if io.is_null() || n_io < 2 {
+        return 0;
+    }
+    // SAFETY: the ABI contract says `io` points to live descriptors.
+    let q = unsafe { &**io };
+    let k = unsafe { &**io.add(1) };
+    if q.rank >= 3 && k.rank >= 3 {
+        let s = q.shape[q.rank as usize - 2].max(0) as u64;
+        let t = k.shape[k.rank as usize - 2].max(0) as u64;
+        // Two f32 buffers of S*T elements each.
+        unsafe { (*out).workspace_bytes = 8 * s * t };
+    }
+    0
 }
 
 // ── cross_entropy ───────────────────────────────────────────────────────────
@@ -240,6 +319,31 @@ fn cross_entropy_exec_body(c: &mut Call, _a: &RsAttrs) -> OpResult<()> {
     c.expect_out_count(1)?;
     let logits = c.in_t(0);
     let targets = c.in_t(1);
+    if logits.dtype != RsDtype::F32 {
+        return Err(err(
+            c.op,
+            format!("input 'logits' has dtype {}, expected f32", logits.dtype),
+        ));
+    }
+    if logits.rank != 2 || targets.rank != 1 || targets.shape[0] != logits.shape[0] {
+        return Err(err(
+            c.op,
+            format!(
+                "cross_entropy expects logits [N, C] and targets [N], got {:?} and {:?}",
+                logits.dims(),
+                targets.dims()
+            ),
+        ));
+    }
+    match targets.dtype {
+        RsDtype::I32 | RsDtype::I64 => {}
+        other => {
+            return Err(err(
+                c.op,
+                format!("input 'targets' has dtype {other}, expected i32 or i64"),
+            ));
+        }
+    }
     expect_out(c.out_t(0), c.op, RsDtype::F32, &[])?;
     // SAFETY: descriptor liveness is the ABI caller's contract.
     let lv = unsafe { crate::tensor::f32_in(c.op, "logits", logits) }?;
@@ -251,12 +355,11 @@ fn cross_entropy_exec_body(c: &mut Call, _a: &RsAttrs) -> OpResult<()> {
     // where the naive log(softmax) expansion underflows to -inf; the two
     // agree within tolerance wherever the naive form is well-conditioned.
     let mut total = 0.0f64;
-    for i in 0..n {
+    for (i, &t) in ids.iter().enumerate() {
         let row = &lv.as_slice().expect("contiguous")[i * ch..(i + 1) * ch];
         let m = row.iter().fold(f32::NEG_INFINITY, |acc, &x| acc.max(x));
         let sum = row.iter().fold(0.0f32, |acc, &x| acc + (x - m).exp());
         let lse = m as f64 + (sum as f64).ln();
-        let t = ids[i];
         if t < 0 || t >= ch as i64 {
             return Err(fail!(
                 c.op,
@@ -271,21 +374,38 @@ fn cross_entropy_exec_body(c: &mut Call, _a: &RsAttrs) -> OpResult<()> {
     Ok(())
 }
 
-/// Declared expansion of `cross_entropy`.
+/// Declared expansion of `cross_entropy`:
+/// `softmax(logits)` -> `log` -> `reshape(targets, [N, 1])` ->
+/// `gather(axis=-1)` -> `neg` -> `reduce(mean, all axes)`.
 ///
-/// Node attributes required by the primitives (which the current
-/// `ExpansionSpec` API cannot attach — see the module doc):
-/// node 1: `elementwise_unary` kind=log; node 3: `elementwise_unary`
-/// kind=neg; node 4: `reduce` kind=mean (no axis → scalar).
+/// `gather` follows the torch convention (indices have the same rank as the
+/// input), so the targets must be reshaped to `[N, 1]` before gathering the
+/// per-row log-probability; the reshape node's `shape` attribute is
+/// `[-1, 1]`, which is shape-independent (the `-1` is filled from numel).
+///
+/// Node attribute table (the current `ExpansionSpec` API cannot attach
+/// per-node attrs — see the module doc):
+/// node 0: softmax, attrs {axis: -1} (default);
+/// node 1: elementwise_unary, attrs {kind: "log"};
+/// node 2: reshape, attrs {shape: [-1, 1]};
+/// node 3: gather, attrs {axis: -1} (default);
+/// node 4: elementwise_unary, attrs {kind: "neg"};
+/// node 5: reduce, attrs {kind: "mean"} (no axis → scalar).
+///
+/// The fused body uses the stable log-sum-exp form of the same loss; the
+/// two agree within tolerance wherever the naive log(softmax) path is
+/// well-conditioned (documented in the op doc).
 pub(crate) fn cross_entropy_expansion() -> ExpansionSpec {
     let mut e = ExpansionSpec::new(2, 1);
     let p = e.temp();
     let lp = e.temp();
+    let t2 = e.temp();
     let per = e.temp();
     let neg = e.temp();
     e.node("softmax", &[0], &[p])
         .node("elementwise_unary", &[p], &[lp])
-        .node("gather", &[lp, 1], &[per])
+        .node("reshape", &[1], &[t2])
+        .node("gather", &[lp, t2], &[per])
         .node("elementwise_unary", &[per], &[neg])
         .node("reduce", &[neg], &[2])
 }
@@ -342,6 +462,22 @@ fn adamw_exec_body(c: &mut Call, a: &RsAttrs) -> OpResult<()> {
     c.expect_arity((4, 4))?;
     c.expect_out_count(3)?;
     let p = c.in_t(0);
+    for (i, who) in [(1usize, "grad"), (2, "exp_avg"), (3, "exp_avg_sq")] {
+        let t = c.in_t(i);
+        if t.dtype != RsDtype::F32 {
+            return Err(err(c.op, format!("input '{who}' has dtype {}, expected f32", t.dtype)));
+        }
+        if t.dims() != p.dims() {
+            return Err(err(
+                c.op,
+                format!(
+                    "adamw input '{who}' shape {:?} must match param shape {:?}",
+                    t.dims(),
+                    p.dims()
+                ),
+            ));
+        }
+    }
     let (lr, b1, b2, eps, wd, step) = adamw_params(a, c.op)?;
     // Bias corrections are integer powers: exact and deterministic.
     let c1 = 1.0 - b1.powi(step as i32);
@@ -360,14 +496,21 @@ fn adamw_exec_body(c: &mut Call, a: &RsAttrs) -> OpResult<()> {
     // Pointwise in ascending index order (decoupled weight decay, standard
     // bias correction). exp_avg' and exp_avg_sq' are written back so the
     // caller can persist them.
-    for i in 0..pv.len() {
-        let m = b1 * mv[i] + (1.0 - b1) * gv[i];
-        let v = b2 * vv[i] + (1.0 - b2) * gv[i] * gv[i];
+    let ps = pv.as_slice().expect("contiguous");
+    let gs = gv.as_slice().expect("contiguous");
+    let ms = mv.as_slice().expect("contiguous");
+    let vs = vv.as_slice().expect("contiguous");
+    let pos = po.as_slice_mut().expect("contiguous");
+    let mos = mo.as_slice_mut().expect("contiguous");
+    let vos = vo.as_slice_mut().expect("contiguous");
+    for i in 0..ps.len() {
+        let m = b1 * ms[i] + (1.0 - b1) * gs[i];
+        let v = b2 * vs[i] + (1.0 - b2) * gs[i] * gs[i];
         let mh = m / c1;
         let vh = v / c2;
-        mo[i] = m;
-        vo[i] = v;
-        po[i] = pv[i] - lr * (mh / (vh.sqrt() + eps) + wd * pv[i]);
+        mos[i] = m;
+        vos[i] = v;
+        pos[i] = ps[i] - lr * (mh / (vh.sqrt() + eps) + wd * ps[i]);
     }
     Ok(())
 }
@@ -453,9 +596,27 @@ fn topk_exec_body(c: &mut Call, a: &RsAttrs) -> OpResult<()> {
     c.expect_arity((1, 1))?;
     c.expect_out_count(2)?;
     let logits = c.in_t(0);
+    if logits.dtype != RsDtype::F32 {
+        return Err(err(
+            c.op,
+            format!("input 'logits' has dtype {}, expected f32", logits.dtype),
+        ));
+    }
+    if logits.rank != 2 {
+        return Err(err(
+            c.op,
+            format!("topk_router expects logits [N, E], got rank {}", logits.rank),
+        ));
+    }
     let n = logits.shape[0] as usize;
     let e = logits.shape[1] as usize;
     let k = attr_i64(a, "top_k").unwrap_or(2) as usize;
+    if k < 1 || k > e {
+        return Err(err(
+            c.op,
+            format!("topk_router 'top_k' must be in [1, E={e}], got {k}"),
+        ));
+    }
     expect_out(c.out_t(0), c.op, RsDtype::F32, &[logits.shape[0], k as i64])?;
     expect_out(c.out_t(1), c.op, RsDtype::I32, &[logits.shape[0], k as i64])?;
     // SAFETY: descriptor liveness is the ABI caller's contract.
@@ -464,8 +625,11 @@ fn topk_exec_body(c: &mut Call, a: &RsAttrs) -> OpResult<()> {
     let mut io = unsafe { crate::tensor::i32_out(c.op, c.out_t(1)) }?;
     // Per-row stable softmax, then a deterministic insertion selection: the
     // comparison is strict `>`, so on ties the lower expert index wins.
+    let ls = lv.as_slice().expect("contiguous");
+    let ws = wo.as_slice_mut().expect("contiguous");
+    let is = io.as_slice_mut().expect("contiguous");
     for i in 0..n {
-        let row = &lv.as_slice().expect("contiguous")[i * e..(i + 1) * e];
+        let row = &ls[i * e..(i + 1) * e];
         let m = row.iter().fold(f32::NEG_INFINITY, |acc, &x| acc.max(x));
         let sum = row.iter().fold(0.0f32, |acc, &x| acc + (x - m).exp());
         let mut best: Vec<(f32, usize)> = Vec::with_capacity(k);
@@ -483,8 +647,8 @@ fn topk_exec_body(c: &mut Call, a: &RsAttrs) -> OpResult<()> {
             }
         }
         for (j, &(p, ex)) in best.iter().enumerate() {
-            wo[i * k + j] = p;
-            io[i * k + j] = ex as i32;
+            ws[i * k + j] = p;
+            is[i * k + j] = ex as i32;
         }
     }
     Ok(())

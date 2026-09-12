@@ -14,9 +14,12 @@
 //!   [`SingleRank`] is the identity, which is exactly right when the parallel
 //!   configuration is 1×1×1×1×1 and is what makes a TP plan testable on a laptop.
 
+// Same reasoning as `rustrain-plan`: the error carries structured diagnostics.
+#![allow(clippy::result_large_err)]
+
 use std::ffi::c_void;
 
-use rustrain_abi::ffi::{RsAttrs, RsCollectiveKind, RsCtx, RsDeviceKind, RsDtype, RsServices, RsTensor};
+use rustrain_abi::ffi::{RsCollectiveKind, RsCtx, RsDeviceKind, RsDtype, RsServices, RsTensor};
 use rustrain_parallel::{GroupKind, ReduceOp};
 use rustrain_plan::{CompiledPlan, CompiledStep, Slot, SlotId, SlotKind};
 
@@ -238,8 +241,8 @@ impl Executor {
 
         let device = allocator.device();
         let mut buffers: Vec<Option<SlotBuffer>> = Vec::with_capacity(n);
-        for i in 0..n {
-            if let Some(root) = aliases[i] {
+        for (i, alias) in aliases.iter().enumerate().take(n) {
+            if let Some(root) = *alias {
                 let root_buf = buffers[root.0].as_ref().map(|b| (b.ptr, b.bytes));
                 let (ptr, bytes) = root_buf.ok_or(RuntimeError::NullData { slot: root })?;
                 buffers.push(Some(SlotBuffer {
@@ -442,7 +445,7 @@ impl Executor {
                         in_tensors.iter().map(std::ptr::from_ref).collect();
                     let mut out_ptrs: Vec<*mut RsTensor> =
                         out_tensors.iter_mut().map(std::ptr::from_mut).collect();
-                    let attrs_ptr = attrs.as_ptr() as *const RsAttrs;
+                    let attrs_ptr = attrs.as_ptr();
 
                     let desc = op.desc();
                     let execute = desc.execute.ok_or_else(|| RuntimeError::Op {

@@ -7,6 +7,12 @@
 //!
 //! Nothing in this crate computes. Nothing in this crate reads the environment.
 
+// `PlanError` carries structured diagnostics (a layout, a sharding failure, the
+// candidate table from resolution) because those are what make the message
+// actionable. Boxing it to shrink the `Err` variant would push a deref onto
+// every caller for no benefit at the scale a compile runs at.
+#![allow(clippy::result_large_err)]
+
 pub mod attrs;
 pub mod compile;
 pub mod ir;

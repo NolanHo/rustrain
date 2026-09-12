@@ -275,10 +275,24 @@ fn narrow_exec_body(c: &mut Call, a: &RsAttrs) -> OpResult<()> {
     let x = c.in_t(0);
     let (rank, shape, stride, offset) = narrow_plan(x, a, c.op)?;
     let (dtype, data) = (x.dtype, x.data);
+    // Narrowing a null buffer is meaningless and `ptr::add` on null (even +0)
+    // is UB, so it must be rejected before any pointer arithmetic.
+    if data.is_null() {
+        return Err(err(c.op, "input 'x' has null data"));
+    }
     // Element size: reference.f32 is f32-only, so offsets are in units of 4
-    // bytes. If other dtypes are added, switch on byte_width().
-    let byte_offset = offset * 4;
+    // bytes. Checked arithmetic so a hostile descriptor cannot wrap the
+    // offset into a wild pointer.
+    let byte_offset = offset
+        .checked_mul(4)
+        .ok_or_else(|| err(c.op, "narrow byte offset overflows i64"))?;
+    if byte_offset < 0 {
+        return Err(err(c.op, "narrow produced a negative byte offset"));
+    }
     let o = c.out_t(0);
+    // SAFETY: data is non-null and the offset is a non-negative multiple of
+    // the element size within the declared shape, so the pointer stays
+    // inside the caller's buffer.
     set_view_desc(o, dtype, rank, &shape, &stride, unsafe { data.add(byte_offset as usize) });
     Ok(())
 }
@@ -340,6 +354,9 @@ fn cat_exec_body(c: &mut Call, a: &RsAttrs) -> OpResult<()> {
     c.expect_arity((1, usize::MAX))?;
     c.expect_out_count(1)?;
     let first = c.in_t(0);
+    if first.rank as usize > MAX_RANK {
+        return Err(fail!(c.op, "cat input has rank {}, exceeding MAX_RANK", first.rank));
+    }
     let rank = first.rank as usize;
     let dim = cat_dim(a, rank, c.op)?;
     let mut out_shape = first.shape;
@@ -364,17 +381,35 @@ fn cat_exec_body(c: &mut Call, a: &RsAttrs) -> OpResult<()> {
         &out_shape[..rank],
     )?;
     let mut out = unsafe { crate::tensor::f32_out(c.op, c.out_t(0)) }?;
+    let ys = out.as_slice_mut().expect("contiguous");
+    // Dim-aware concatenation: copy each input into the out slice along
+    // `dim`, in input order then index order (deterministic).
+    let mut outer = 1usize;
+    for &d in &first.dims()[..dim] {
+        outer *= d as usize;
+    }
+    let mut inner = 1usize;
+    for &d in &first.dims()[dim + 1..] {
+        inner *= d as usize;
+    }
+    let out_dim = out_shape[dim] as usize;
     let mut offset = 0usize;
     for i in 0..c.n_in() {
         let t = c.in_t(i);
         // SAFETY: descriptor liveness is the ABI caller's contract.
         let xv = unsafe { crate::tensor::f32_in(c.op, "in", t) }?;
-        let n = xv.len();
-        let mut dst = out.slice_mut(ndarray::s![offset..offset + n]);
-        for (d, &v) in dst.iter_mut().zip(xv.iter()) {
-            *d = v;
+        let xs = xv.as_slice().expect("contiguous");
+        let dlen = t.shape[dim] as usize;
+        for oi in 0..outer {
+            for d in 0..dlen {
+                for ti in 0..inner {
+                    let src = (oi * dlen + d) * inner + ti;
+                    let dst = (oi * out_dim + offset + d) * inner + ti;
+                    ys[dst] = xs[src];
+                }
+            }
         }
-        offset += n;
+        offset += dlen;
     }
     Ok(())
 }

@@ -207,7 +207,13 @@ pub fn f32_to_fp8(x: f32, fmt: Fp8Format) -> u8 {
 pub fn fp8_to_f32(b: u8, fmt: Fp8Format) -> f32 {
     let sign = if b >> 7 != 0 { -1.0f64 } else { 1.0f64 };
     let p = fmt.mant_bits();
-    let (e, mant) = (b >> p, b & ((1u8 << p) - 1));
+    // Mask the exponent field to its width: without the mask the sign bit
+    // leaks into the exponent of negative payloads (e.g. 0xF6 -> e=30).
+    let e = match fmt {
+        Fp8Format::E4M3 => (b >> 3) & 0x0F,
+        Fp8Format::E5M2 => (b >> 2) & 0x1F,
+    };
+    let mant = b & ((1u8 << p) - 1);
     let m = mant as f64;
     let v = match fmt {
         Fp8Format::E4M3 => {
@@ -243,6 +249,7 @@ pub fn fp8_to_f32(b: u8, fmt: Fp8Format) -> f32 {
 // ── scheme plumbing shared by quantize / dequantize / amax_update ───────────
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[allow(clippy::enum_variant_names)] // the Per* names mirror the declared scheme strings
 enum Scheme {
     PerTensor,
     PerToken,
@@ -413,38 +420,43 @@ fn quantize_exec_body(c: &mut Call, a: &RsAttrs) -> OpResult<()> {
     // scale = amax / max_finite, so every x/scale lands inside the finite
     // grid and the emulation never overflows. A zero amax gets scale 1.0 to
     // avoid 0/0; zero quantizes to zero under any scale.
+    let xs = xv.as_slice().expect("contiguous");
+    let ss = sv.as_slice_mut().expect("contiguous");
+    let qs = qv.as_slice_mut().expect("contiguous");
     // Uniform element order everywhere (ascending), per-scheme aggregation.
     match scheme {
         Scheme::PerTensor => {
             let mut amax = 0.0f32;
-            for &v in xv.iter() {
+            for &v in xs {
                 if v.is_nan() {
                     return Err(err(c.op, "input 'x' contains NaN; quantize refuses NaN"));
                 }
                 amax = amax.max(v.abs());
             }
             let scale = if amax == 0.0 { 1.0 } else { amax / maxf };
-            sv.iter_mut().next().map(|s| *s = scale);
-            for (q, &v) in qv.iter_mut().zip(xv.iter()) {
+            if let Some(s) = ss.first_mut() {
+                *s = scale;
+            }
+            for (q, &v) in qs.iter_mut().zip(xs.iter()) {
                 *q = f32_to_fp8(v / scale, fmt);
             }
         }
         Scheme::PerToken => {
             let last = xv.shape()[xv.ndim() - 1];
-            let outer = xv.len() / last;
+            let outer = xs.len() / last;
             for oi in 0..outer {
                 let mut amax = 0.0f32;
                 for j in 0..last {
-                    let v = xv[oi * last + j];
+                    let v = xs[oi * last + j];
                     if v.is_nan() {
                         return Err(err(c.op, "input 'x' contains NaN; quantize refuses NaN"));
                     }
                     amax = amax.max(v.abs());
                 }
                 let scale = if amax == 0.0 { 1.0 } else { amax / maxf };
-                sv[oi] = scale;
+                ss[oi] = scale;
                 for j in 0..last {
-                    qv[oi * last + j] = f32_to_fp8(xv[oi * last + j] / scale, fmt);
+                    qs[oi * last + j] = f32_to_fp8(xs[oi * last + j] / scale, fmt);
                 }
             }
         }
@@ -453,7 +465,7 @@ fn quantize_exec_body(c: &mut Call, a: &RsAttrs) -> OpResult<()> {
             let (bm, bn) = (bm as usize, bn as usize);
             let last_two = [xv.shape()[xv.ndim() - 2], xv.shape()[xv.ndim() - 1]];
             let (dr, dc) = (last_two[0], last_two[1]);
-            let outer = xv.len() / (dr * dc);
+            let outer = xs.len() / (dr * dc);
             let (gr, gc) = (dr / bm, dc / bn);
             for oi in 0..outer {
                 for br in 0..gr {
@@ -461,7 +473,7 @@ fn quantize_exec_body(c: &mut Call, a: &RsAttrs) -> OpResult<()> {
                         let mut amax = 0.0f32;
                         for i in 0..bm {
                             for j in 0..bn {
-                                let v = xv[oi * dr * dc + (br * bm + i) * dc + (bc * bn + j)];
+                                let v = xs[oi * dr * dc + (br * bm + i) * dc + (bc * bn + j)];
                                 if v.is_nan() {
                                     return Err(
                                         err(c.op, "input 'x' contains NaN; quantize refuses NaN"),
@@ -471,11 +483,11 @@ fn quantize_exec_body(c: &mut Call, a: &RsAttrs) -> OpResult<()> {
                             }
                         }
                         let scale = if amax == 0.0 { 1.0 } else { amax / maxf };
-                        sv[oi * gr * gc + br * gc + bc] = scale;
+                        ss[oi * gr * gc + br * gc + bc] = scale;
                         for i in 0..bm {
                             for j in 0..bn {
                                 let idx = oi * dr * dc + (br * bm + i) * dc + (bc * bn + j);
-                                qv[idx] = f32_to_fp8(xv[idx] / scale, fmt);
+                                qs[idx] = f32_to_fp8(xs[idx] / scale, fmt);
                             }
                         }
                     }
@@ -528,6 +540,19 @@ fn dequantize_exec_body(c: &mut Call, a: &RsAttrs) -> OpResult<()> {
     c.expect_out_count(1)?;
     let q = c.in_t(0);
     let fmt = parse_format(a, c.op)?;
+    // Re-check here too: execute must be safe even when called without a
+    // prior infer (the payload bytes are only meaningful under this dtype).
+    if q.dtype != fmt.dtype() {
+        return Err(err(
+            c.op,
+            format!(
+                "input 'q' has dtype {}, expected {} for format '{}'",
+                q.dtype,
+                fmt.dtype(),
+                fmt.name()
+            ),
+        ));
+    }
     let scheme = parse_scheme(a, c.op)?;
     let block = if scheme == Scheme::PerBlock {
         Some(block_attr(a, c.op)?)
@@ -544,20 +569,23 @@ fn dequantize_exec_body(c: &mut Call, a: &RsAttrs) -> OpResult<()> {
     let sv = unsafe { crate::tensor::f32_in(c.op, "scale", c.in_t(1)) }?;
     let mut xv = unsafe { crate::tensor::f32_out(c.op, c.out_t(0)) }?;
 
+    let qs = qb.as_slice().expect("contiguous");
+    let ss = sv.as_slice().expect("contiguous");
+    let ys = xv.as_slice_mut().expect("contiguous");
     match scheme {
         Scheme::PerTensor => {
-            let s = sv.iter().next().copied().unwrap_or(1.0);
-            for (o, &b) in xv.iter_mut().zip(qb.iter()) {
+            let s = ss.first().copied().unwrap_or(1.0);
+            for (o, &b) in ys.iter_mut().zip(qs.iter()) {
                 *o = fp8_to_f32(b, fmt) * s;
             }
         }
         Scheme::PerToken => {
             let last = q.dims()[q.rank as usize - 1] as usize;
-            let outer = qb.len() / last;
+            let outer = qs.len() / last;
             for oi in 0..outer {
-                let s = sv[oi];
+                let s = ss[oi];
                 for j in 0..last {
-                    xv[oi * last + j] = fp8_to_f32(qb[oi * last + j], fmt) * s;
+                    ys[oi * last + j] = fp8_to_f32(qs[oi * last + j], fmt) * s;
                 }
             }
         }
@@ -567,16 +595,16 @@ fn dequantize_exec_body(c: &mut Call, a: &RsAttrs) -> OpResult<()> {
             let rank = q.rank as usize;
             let dr = q.dims()[rank - 2] as usize;
             let dc = q.dims()[rank - 1] as usize;
-            let outer = qb.len() / (dr * dc);
+            let outer = qs.len() / (dr * dc);
             let (gr, gc) = (dr / bm, dc / bn);
             for oi in 0..outer {
                 for br in 0..gr {
                     for bc in 0..gc {
-                        let s = sv[oi * gr * gc + br * gc + bc];
+                        let s = ss[oi * gr * gc + br * gc + bc];
                         for i in 0..bm {
                             for j in 0..bn {
                                 let idx = oi * dr * dc + (br * bm + i) * dc + (bc * bn + j);
-                                xv[idx] = fp8_to_f32(qb[idx], fmt) * s;
+                                ys[idx] = fp8_to_f32(qs[idx], fmt) * s;
                             }
                         }
                     }
@@ -629,32 +657,35 @@ fn amax_exec_body(c: &mut Call, a: &RsAttrs) -> OpResult<()> {
 
     // amax' = max(amax, |x|) aggregated under the declared scheme. NaN is
     // rejected: it would silently poison the running max for all future steps.
+    let xs = xv.as_slice().expect("contiguous");
+    let as_ = av.as_slice().expect("contiguous");
+    let ys = yv.as_slice_mut().expect("contiguous");
     match scheme {
         Scheme::PerTensor => {
-            let mut m = av.iter().next().copied().unwrap_or(0.0);
-            for &v in xv.iter() {
+            let mut m = as_.first().copied().unwrap_or(0.0);
+            for &v in xs {
                 if v.is_nan() {
                     return Err(err(c.op, "input 'x' contains NaN; amax_update refuses NaN"));
                 }
                 m = m.max(v.abs());
             }
-            if let Some(o) = yv.iter_mut().next() {
+            if let Some(o) = ys.first_mut() {
                 *o = m;
             }
         }
         Scheme::PerToken => {
             let last = xv.shape()[xv.ndim() - 1];
-            let outer = xv.len() / last;
+            let outer = xs.len() / last;
             for oi in 0..outer {
-                let mut m = av[oi];
+                let mut m = as_[oi];
                 for j in 0..last {
-                    let v = xv[oi * last + j];
+                    let v = xs[oi * last + j];
                     if v.is_nan() {
                         return Err(err(c.op, "input 'x' contains NaN; amax_update refuses NaN"));
                     }
                     m = m.max(v.abs());
                 }
-                yv[oi] = m;
+                ys[oi] = m;
             }
         }
         Scheme::PerBlock => {
@@ -663,16 +694,16 @@ fn amax_exec_body(c: &mut Call, a: &RsAttrs) -> OpResult<()> {
             let rank = x.rank as usize;
             let dr = x.dims()[rank - 2] as usize;
             let dc = x.dims()[rank - 1] as usize;
-            let outer = xv.len() / (dr * dc);
+            let outer = xs.len() / (dr * dc);
             let (gr, gc) = (dr / bm, dc / bn);
             for oi in 0..outer {
                 for br in 0..gr {
                     for bc in 0..gc {
                         let s_idx = oi * gr * gc + br * gc + bc;
-                        let mut m = av[s_idx];
+                        let mut m = as_[s_idx];
                         for i in 0..bm {
                             for j in 0..bn {
-                                let v = xv[oi * dr * dc + (br * bm + i) * dc + (bc * bn + j)];
+                                let v = xs[oi * dr * dc + (br * bm + i) * dc + (bc * bn + j)];
                                 if v.is_nan() {
                                     return Err(
                                         err(c.op, "input 'x' contains NaN; amax_update refuses NaN"),
@@ -681,7 +712,7 @@ fn amax_exec_body(c: &mut Call, a: &RsAttrs) -> OpResult<()> {
                                 m = m.max(v.abs());
                             }
                         }
-                        yv[s_idx] = m;
+                        ys[s_idx] = m;
                     }
                 }
             }

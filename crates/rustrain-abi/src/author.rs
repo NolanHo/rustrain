@@ -301,6 +301,92 @@ impl OpSpec {
     }
 }
 
+/// Owned attributes for ONE expansion node.
+///
+/// A composite operator's expansion only describes the fused body if each node
+/// carries the attributes that select its behaviour — a `reduce` without its
+/// `kind`, or a `matmul` without `transpose_b`, does not describe the same
+/// computation. Keys, strings and slices are boxed so their addresses survive
+/// moving the owning [`ExpansionSpec`].
+#[derive(Default)]
+pub struct NodeAttrs {
+    keys: Vec<CString>,
+    strs: Vec<Option<CString>>,
+    slices: Vec<Option<Box<[i64]>>>,
+    items: Vec<RsAttr>,
+}
+
+impl NodeAttrs {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    fn blank(kind: RsAttrKind) -> RsAttr {
+        RsAttr {
+            key: std::ptr::null(),
+            kind,
+            _pad0: 0,
+            i64: 0,
+            f64: 0.0,
+            boolean: 0,
+            _pad1: 0,
+            str: std::ptr::null(),
+            i64s: std::ptr::null(),
+            n_i64s: 0,
+            _pad2: 0,
+        }
+    }
+
+    fn push(mut self, key: &str, mut item: RsAttr) -> Self {
+        let k = CString::new(key).expect("attribute key must not contain NUL");
+        self.keys.push(k);
+        item.key = self.keys.last().unwrap().as_ptr();
+        self.items.push(item);
+        self
+    }
+
+    pub fn i64(self, key: &str, v: i64) -> Self {
+        let mut a = Self::blank(RsAttrKind::I64);
+        a.i64 = v;
+        self.push(key, a)
+    }
+
+    pub fn f64(self, key: &str, v: f64) -> Self {
+        let mut a = Self::blank(RsAttrKind::F64);
+        a.f64 = v;
+        self.push(key, a)
+    }
+
+    pub fn bool(self, key: &str, v: bool) -> Self {
+        let mut a = Self::blank(RsAttrKind::BOOL);
+        a.boolean = i32::from(v);
+        self.push(key, a)
+    }
+
+    pub fn str(self, key: &str, v: &str) -> Self {
+        let mut a = Self::blank(RsAttrKind::STR);
+        let c = CString::new(v).expect("attribute value must not contain NUL");
+        let mut me = self;
+        me.strs.push(Some(c));
+        a.str = me.strs.last().unwrap().as_ref().unwrap().as_ptr();
+        me.push(key, a)
+    }
+
+    pub fn i64s(self, key: &str, v: &[i64]) -> Self {
+        let mut a = Self::blank(RsAttrKind::I64S);
+        let mut me = self;
+        me.slices.push(Some(v.to_vec().into_boxed_slice()));
+        let s = me.slices.last().unwrap().as_ref().unwrap();
+        a.i64s = s.as_ptr();
+        a.n_i64s = s.len() as u32;
+        me.push(key, a)
+    }
+
+    fn len(&self) -> usize {
+        self.items.len()
+    }
+}
+
 /// Builder for a declared primitive expansion (contract R-4).
 ///
 /// Like [`PluginBuilder`], it boxes what it publishes because the nodes carry
@@ -313,6 +399,9 @@ pub struct ExpansionSpec {
     /// Attribute arrays referenced by the nodes.
     attr_lists: Vec<Box<RsAttrs>>,
     attr_items: Vec<Box<[RsAttr]>>,
+    /// Keeps each node's keys, strings and slices alive behind the pointers in
+    /// the matching `attr_lists` entry.
+    attr_owners: Vec<NodeAttrs>,
     inputs: Vec<Box<[i32]>>,
     outputs: Vec<Box<[i32]>>,
     pub n_tensors: u32,
@@ -329,6 +418,7 @@ impl ExpansionSpec {
             names: Vec::new(),
             attr_lists: Vec::new(),
             attr_items: Vec::new(),
+            attr_owners: Vec::new(),
             inputs: Vec::new(),
             outputs: Vec::new(),
             n_tensors: n_inputs + n_outputs,
@@ -344,7 +434,58 @@ impl ExpansionSpec {
         id
     }
 
-    /// Appends a primitive node over local tensor ids.
+    /// Appends a primitive node that carries attributes.
+    ///
+    /// Use this whenever the node's identity depends on an attribute: a
+    /// conformance checker that replays an expansion has to receive the same
+    /// `kind`, `axis`, `transpose_b` and so on that the fused body used, or it
+    /// compares two different computations.
+    /// Appends a primitive node that carries attributes.
+    ///
+    /// Use this whenever the node's identity depends on an attribute: a
+    /// conformance checker replaying an expansion has to receive the same
+    /// `kind`, `axis`, `transpose_b` and so on that the fused body used, or it
+    /// compares two different computations.
+    pub fn node_with_attrs(
+        mut self,
+        op: &str,
+        inputs: &[i32],
+        outputs: &[i32],
+        attrs: NodeAttrs,
+    ) -> Self {
+        let name = CString::new(op).expect("op name must not contain NUL");
+        self.names.push(name);
+        let op_ptr = self.names.last().unwrap().as_ptr();
+
+        // The view points into the owner's boxed items; the owner itself is kept
+        // in `attr_owners` so the box outlives every use of the pointer.
+        let items = attrs.items.clone().into_boxed_slice();
+        let view = Box::new(RsAttrs {
+            items: items.as_ptr(),
+            len: attrs.len() as u32,
+            _pad: 0,
+        });
+        let attrs_ptr = view.as_ref() as *const RsAttrs;
+        self.attr_items.push(items);
+        self.attr_lists.push(view);
+        self.attr_owners.push(attrs);
+
+        let inputs = inputs.to_vec().into_boxed_slice();
+        let outputs = outputs.to_vec().into_boxed_slice();
+        self.nodes.push(RsExpansionNode {
+            op: op_ptr,
+            attrs: attrs_ptr,
+            inputs: inputs.as_ptr(),
+            n_inputs: inputs.len() as u32,
+            outputs: outputs.as_ptr(),
+            n_outputs: outputs.len() as u32,
+        });
+        self.inputs.push(inputs);
+        self.outputs.push(outputs);
+        self
+    }
+
+    /// Appends a primitive node over local tensor ids, with no attributes.
     pub fn node(mut self, op: &str, inputs: &[i32], outputs: &[i32]) -> Self {
         let name = CString::new(op).expect("op name must not contain NUL");
         self.names.push(name);
@@ -371,6 +512,7 @@ impl ExpansionSpec {
             names,
             attr_lists,
             attr_items,
+            attr_owners,
             inputs,
             outputs,
             n_tensors,
@@ -397,6 +539,9 @@ impl ExpansionSpec {
             std::mem::forget(b);
         }
         for b in attr_items {
+            std::mem::forget(b);
+        }
+        for b in attr_owners {
             std::mem::forget(b);
         }
         for b in inputs {
@@ -568,5 +713,65 @@ mod tests {
                     .backward(RsBackwardKind::EXPLICIT),
             )
             .build();
+    }
+
+    /// An expansion node's attributes must reach the plugin side intact, and
+    /// must still be readable after the owning spec has been moved into a plugin.
+    #[test]
+    fn expansion_node_attributes_survive_publication() {
+        let expansion = ExpansionSpec::new(2, 1)
+            .node_with_attrs(
+                "reduce",
+                &[0],
+                &[2],
+                NodeAttrs::new().str("kind", "sum").i64("axis", -1),
+            )
+            .node_with_attrs(
+                "matmul",
+                &[2, 1],
+                &[3],
+                NodeAttrs::new().bool("transpose_b", true).f64("beta", 0.5),
+            );
+
+        let plugin = PluginBuilder::new("attrs", "0.1.0")
+            .op(
+                OpSpec::new("fused", "test.f32")
+                    .dtypes(&[RsDtype::F32])
+                    .execute(noop_execute)
+                    .expansion(expansion),
+            )
+            .build();
+
+        let desc = unsafe { &**plugin.ops };
+        let expansion = unsafe { &*desc.expansion };
+        let nodes = unsafe { expansion.as_slice() };
+        assert_eq!(nodes.len(), 2);
+
+        let read = |node: &RsExpansionNode, key: &str| -> Option<RsAttr> {
+            assert!(!node.attrs.is_null(), "node must carry an attribute list");
+            let list = unsafe { (*node.attrs).as_slice() };
+            list.iter()
+                .find(|a| {
+                    !a.key.is_null()
+                        && unsafe { std::ffi::CStr::from_ptr(a.key) }.to_str().ok() == Some(key)
+                })
+                .copied()
+        };
+
+        let kind = read(&nodes[0], "kind").expect("kind on the reduce node");
+        assert_eq!(kind.kind, RsAttrKind::STR);
+        assert_eq!(
+            unsafe { std::ffi::CStr::from_ptr(kind.str) }.to_str().unwrap(),
+            "sum"
+        );
+
+        let axis = read(&nodes[0], "axis").expect("axis on the reduce node");
+        assert_eq!(axis.i64, -1);
+
+        let tb = read(&nodes[1], "transpose_b").expect("transpose_b on the matmul node");
+        assert_eq!(tb.boolean, 1);
+
+        let beta = read(&nodes[1], "beta").expect("beta on the matmul node");
+        assert_eq!(beta.f64, 0.5);
     }
 }

@@ -290,7 +290,7 @@ overlap_collectives = true
 `rustrain-kernels` 的 `reference` 实现：覆盖 §2.4 全部原语（CPU、纯 Rust、无 torch）。
 定位是**数值基准与本地可测的执行后端**，不是性能路径。
 验收：`cargo test -p rustrain-kernels`。
-状态：`[-]` 实现中。
+状态：`- [x]` — 26 个算子，变体统一为 `reference.f32`，每个都有 `infer`（纯计算、不分配）、`memory`、`execute`、`last_error`。`cargo test -p rustrain-kernels` 51 通过；clippy 零 warning；`cargo build -p rustrain-kernels` 产出 `librustrain_kernels.so`，并有测试经 `rustrain-abi` 的**真实 dlopen 装载器**驱动它。测试含：手算期望值、matmul 对比朴素三重循环（逐位）、数值稳定性（softmax 大值、CE 极端 logit、rmsnorm 近零）、量化往返在半 ULP 内、全部 26 个算子两次运行逐位一致、以及 sdpa/cross_entropy/adamw 的 fused≈expansion 逐步等价。
 
 **D7 · CLI：ops check / plan explain**
 `rustrain ops check`（四查门禁，机器可读报告，失败非零退出）；

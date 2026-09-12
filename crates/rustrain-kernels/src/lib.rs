@@ -12,11 +12,12 @@
 //! * **infer** is implemented for every op and is pure — it computes
 //!   shape/dtype into stack arrays, never allocates, never reads element
 //!   data. Plan validation depends on it.
-//! * **memory** is implemented for every op and reports zero workspace: the
-//!   reference provider never allocates on the output side (contract C-3).
-//!   A null `memory` slot means "cannot plan" to the compiler, so the shared
-//!   zero reporter is registered on every descriptor; any future workspace
-//!   need must be reported there.
+//! * **memory** is implemented for every op. Outputs are always
+//!   caller-provided (contract C-3); the reference provider never allocates
+//!   on the output side. A null `memory` slot means "cannot plan" to the
+//!   compiler, so every descriptor registers a reporter: the shared zero
+//!   reporter for ops that use no scratch, and a per-op reporter for `sdpa`,
+//!   whose fused body needs two S*T f32 scratch buffers per call.
 //! * Outputs are caller-provided: the executor allocates from `infer()`'s
 //!   declared shape/dtype, and `execute` validates that before writing. A
 //!   mismatch is a non-zero status with a message on `last_error`.
@@ -46,7 +47,7 @@ use rustrain_abi::ffi::{
 
 use crate::op::composite::{
     adamw_exec, adamw_expansion, adamw_infer, ce_exec, ce_infer, cross_entropy_expansion,
-    sdpa_exec, sdpa_expansion, sdpa_infer, topk_exec, topk_expansion, topk_infer,
+    sdpa_exec, sdpa_expansion, sdpa_infer, sdpa_memory, topk_exec, topk_expansion, topk_infer,
 };
 use crate::op::compute::{
     binary_exec, binary_infer, bmm_exec, bmm_infer, layernorm_exec, layernorm_infer,
@@ -114,11 +115,11 @@ const CAT_DOC: &str = "Concatenates inputs along 'dim' (default -1). The excepti
 
 const BROADCAST_DOC: &str = "Zero-copy view: right-aligns the input against the target 'shape' attribute (list of i64, required). Size-1 input dims get stride 0 (the same element is read repeatedly); new leading dims also get stride 0. out.data aliases the input.";
 
-const MATMUL_DOC: &str = "2D matrix multiply C = A@B: [M,K] x [K,N] -> [M,N], f32 accumulate. Naive triple loop with k accumulated in ascending order — the fixed summation order is what makes results bitwise reproducible. Inputs must be contiguous.";
+const MATMUL_DOC: &str = "2D matrix multiply C = A@B: [M,K] x [K,N] -> [M,N], f32 accumulate. Optional 'transpose_b' (bool, default false) computes A @ B^T with B as [N, K] — the sdpa expansion needs this form because its primitives require contiguous inputs and a transpose view would be strided. The attribute is declared, never inferred from shapes. Naive triple loop with k accumulated in ascending order — the fixed summation order is what makes results bitwise reproducible. Inputs must be contiguous.";
 
 const LINEAR_DOC: &str = "y = x @ w (+ b). Conventions: w is [K, N] (output features last), x is [..., K], optional bias is [N]; y is [..., N]. Literally a batched matmul plus optional bias broadcast over the last dim. 2 or 3 inputs.";
 
-const BMM_DOC: &str = "Batched matmul: [L..., M, K] x [L..., K, N] -> [L..., M, N]. Batch dims must be identical (no batch broadcasting). Per-batch naive triple loop with k ascending (deterministic).";
+const BMM_DOC: &str = "Batched matmul: [L..., M, K] x [L..., K, N] -> [L..., M, N]. Optional 'transpose_b' (bool, default false) computes A @ B^T with B as [L..., N, K]. Batch dims must be identical (no batch broadcasting). Per-batch naive triple loop with k ascending (deterministic).";
 
 const UNARY_DOC: &str = "Applies the 'kind' attribute (required string) elementwise: silu, gelu, sigmoid, tanh, relu, exp, log, neg, sqrt. Choices: gelu uses the tanh approximation (the vocabulary has no erf); log is natural. 'neg' and 'sqrt' extend the core list because the declared expansions of cross_entropy and adamw must be expressible in the fixed vocabulary. An unknown kind is a hard error naming the accepted values.";
 
@@ -142,13 +143,13 @@ const AMAX_DOC: &str = "amax' = max(amax, |x|) aggregated under the declared sch
 
 const EMBEDDING_DOC: &str = "out = w[indices]: weight w [V, D] (f32), indices i32/i64 of any rank -> out = indices.shape + [D]. Negative indices are rejected (no wrap-around — a reference backend must not guess).";
 
-const GATHER_DOC: &str = "out[..., k, ...] = x[..., indices[k], ...] along 'axis' (i64, default -1): indices are rank-1 [K] and replace the axis dim. Negative indices are rejected.";
+const GATHER_DOC: &str = "Torch-gather convention: indices (i32/i64) have the same rank as x, dims equal to x's except along 'axis' (i64, default -1), and the output has the indices' shape: out[i] = x[i with axis value indices[i]]. Negative indices are rejected (no wrap-around).";
 
 const SCATTER_DOC: &str = "Copy of x, then out[..., indices[k], ...] = values[..., k, ...] along 'axis' (default -1), k ascending. values has x's shape with the axis dim equal to K. Duplicate indices: the last writer (largest k) wins — deterministic and documented.";
 
-const SDPA_DOC: &str = "Scaled-dot-product attention: o = softmax(q @ k^T * scale) @ v, with q [.., S, D], k [.., T, D], v [.., T, Dv] and identical batch dims. 'scale' (f64) defaults to 1.0 — the caller passes 1/sqrt(D) explicitly, because the declared expansion's softmax node uses the same default and a reference backend must keep fused == expansion. No causal mask: the primitive vocabulary has no mask operator. Expansion: transpose(k) -> matmul -> softmax -> matmul.";
+const SDPA_DOC: &str = "Scaled-dot-product attention: o = softmax(q @ k^T * scale) @ v, with q [.., S, D], k [.., T, D], v [.., T, Dv] and identical batch dims. 'scale' (f64) defaults to 1.0 — the caller passes 1/sqrt(D) explicitly, because the declared expansion's softmax node uses the same default and a reference backend must keep fused == expansion. No causal mask: the primitive vocabulary has no mask operator. Expansion: bmm(q, k, transpose_b=true) -> softmax -> bmm(p, v).";
 
-const CE_DOC: &str = "Mean cross-entropy loss of logits [N, C] against targets (i32/i64, [N]): mean_n(logsumexp_n - logits[n, t_n]). The fused body uses the stable log-sum-exp form, finite even for extreme logits (e.g. [1000, -1000, 0] -> 1000); the declared expansion is the naive -mean(log(softmax)) composition (softmax -> log -> gather -> neg -> reduce mean), which agrees within tolerance wherever the naive form is well-conditioned.";
+const CE_DOC: &str = "Mean cross-entropy loss of logits [N, C] against targets (i32/i64, [N]): mean_n(logsumexp_n - logits[n, t_n]). The fused body uses the stable log-sum-exp form, finite even for extreme logits (e.g. [1000, -1000, 0] -> 1000); the declared expansion is the naive -mean(log(softmax)) composition (softmax -> log -> reshape(targets,[-1,1]) -> gather(axis=-1) -> neg -> reduce mean), which agrees within tolerance wherever the naive form is well-conditioned.";
 
 const ADAMW_DOC: &str = "AdamW step with decoupled weight decay: m' = b1*m + (1-b1)g; v' = b2*v + (1-b2)g^2; p' = p - lr * ((m'/(1-b1^t)) / (sqrt(v'/(1-b2^t)) + eps) + wd*p). Inputs (param, grad, exp_avg, exp_avg_sq), outputs (param', exp_avg', exp_avg_sq') so the caller persists the moments. Attributes: lr=1e-3, beta1=0.9, beta2=0.999, eps=1e-8, weight_decay=0.0, step=1 (i64, >= 1). Bias corrections use integer powers — exact and deterministic.";
 
@@ -340,6 +341,9 @@ fn build_plugin() -> &'static RsPlugin {
             sdpa_infer,
             sdpa_exec,
         )
+        // sdpa's fused body needs scratch (scores + probs); report it so
+        // planning sees the real footprint instead of the shared zeros.
+        .memory(sdpa_memory)
         .expansion(sdpa_expansion()))
         .op(spec(
             "cross_entropy",
@@ -371,27 +375,27 @@ fn build_plugin() -> &'static RsPlugin {
         .build()
 }
 
-/// Marker wrapper so the immutable, leaked plugin descriptor can live in a
-/// `OnceLock`. `RsPlugin` holds raw pointers and is therefore `!Sync`/`!Send`
-/// as a type; every pointer inside is `*const`, points at deliberately leaked
-/// process-lifetime data, and is never mutated after `build()`, so sharing
-/// the descriptor across threads is as sound as sharing `&'static` data.
-/// The `unsafe impl`s encode exactly that argument.
-struct SyncPlugin(&'static RsPlugin);
-// SAFETY: see the struct doc — immutable, process-lifetime, leaked data.
-unsafe impl Sync for SyncPlugin {}
-unsafe impl Send for SyncPlugin {}
-
 /// The process-lifetime plugin handle. Exposed for the in-process tests,
 /// which drive the operator bodies directly instead of going through dlopen.
+///
+/// `RsPlugin` is `Send + Sync` (declared by `rustrain-abi`, whose argument is
+/// the same one that makes `&'static` shared data sound: the descriptor and
+/// everything it points to is `*const`, leaked, and never mutated after
+/// `build()`).
 pub fn plugin() -> &'static RsPlugin {
-    static PLUGIN: OnceLock<SyncPlugin> = OnceLock::new();
-    PLUGIN.get_or_init(|| SyncPlugin(build_plugin())).0
+    static PLUGIN: OnceLock<&'static RsPlugin> = OnceLock::new();
+    PLUGIN.get_or_init(build_plugin)
 }
 
 /// The single exported symbol of this plugin (contract C-1). Built once over
 /// [`PluginBuilder`]; everything the descriptors point to is leaked on
 /// purpose, so the returned pointer stays valid for the process lifetime.
+///
+/// # Safety
+/// Safe to call from any thread at any time: the return value is a pointer
+/// to a process-lifetime immutable descriptor. (A panic in `build()` would
+/// abort, not unwind across the `extern "C"` boundary — the builder asserts
+/// on malformed specs, and this static table satisfies them.)
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rustrain_plugin_v1() -> *const RsPlugin {
     plugin() as *const RsPlugin

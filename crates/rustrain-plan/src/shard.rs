@@ -94,7 +94,7 @@ pub fn derive(
         ShardRule::Elementwise => {
             let l = first();
             Ok(DerivedShards {
-                required_inputs: vec![l.clone(); declared_inputs.len()],
+                required_inputs: vec![l; declared_inputs.len()],
                 outputs: vec![l; declared_outputs.len()],
             })
         }
@@ -107,7 +107,7 @@ pub fn derive(
                 .cloned()
                 .unwrap_or(ParallelLayout::Replicate);
             let out = match w {
-                ParallelLayout::Replicate => x.clone(),
+                ParallelLayout::Replicate => x,
                 // Column parallel: each rank owns a slice of the output features.
                 ParallelLayout::Shard {
                     dim: 0,
@@ -227,7 +227,7 @@ pub fn propagate(plan: &Plan, groups: &ProcessGroups) -> Result<ShardPropagation
     // the declared layout and is replaced whenever a producer turns out to
     // deliver something else, or a consumer forces a conversion.
     let mut effective: Vec<ParallelLayout> =
-        plan.slots.iter().map(|s| s.layout.clone()).collect();
+        plan.slots.iter().map(|s| s.layout).collect();
     let mut claimed: Vec<bool> = vec![false; n_slots];
     let mut producer_of: Vec<Option<usize>> = vec![None; n_slots];
     for (i, n) in plan.nodes.iter().enumerate() {
@@ -258,11 +258,11 @@ pub fn propagate(plan: &Plan, groups: &ProcessGroups) -> Result<ShardPropagation
         // promised. Using the declared layouts here was the bug that made a
         // partial sum never trigger an all-reduce.
         let eff_in: Vec<ParallelLayout> =
-            n.inputs.iter().map(|s| effective[s.0].clone()).collect();
+            n.inputs.iter().map(|s| effective[s.0]).collect();
         let declared_out: Vec<ParallelLayout> = n
             .outputs
             .iter()
-            .map(|s| plan.slot(*s).layout.clone())
+            .map(|s| plan.slot(*s).layout)
             .collect();
 
         let derived = derive(rule, &n.op.name, &eff_in, &declared_out)
@@ -273,7 +273,7 @@ pub fn propagate(plan: &Plan, groups: &ProcessGroups) -> Result<ShardPropagation
             let Some(need) = derived.required_inputs.get(k).cloned() else {
                 continue;
             };
-            let held = effective[inp.0].clone();
+            let held = effective[inp.0];
             if need == held {
                 continue;
             }
@@ -296,7 +296,7 @@ pub fn propagate(plan: &Plan, groups: &ProcessGroups) -> Result<ShardPropagation
             pending.push(Pending {
                 slot: *inp,
                 from: held,
-                to: need.clone(),
+                to: need,
                 producer: NodeId(producer),
                 reason: format!(
                     "node {i} ({}) input {k} needs {need} but slot {} holds {held}",
@@ -314,7 +314,7 @@ pub fn propagate(plan: &Plan, groups: &ProcessGroups) -> Result<ShardPropagation
                 .get(j)
                 .cloned()
                 .unwrap_or(ParallelLayout::Replicate);
-            let promised = declared_out[j].clone();
+            let promised = declared_out[j];
             if produced == promised {
                 effective[o.0] = produced;
                 continue;
@@ -330,8 +330,8 @@ pub fn propagate(plan: &Plan, groups: &ProcessGroups) -> Result<ShardPropagation
             }
             pending.push(Pending {
                 slot: *o,
-                from: produced.clone(),
-                to: promised.clone(),
+                from: produced,
+                to: promised,
                 producer: id,
                 reason: format!(
                     "node {i} ({}) produces {produced} on slot {} but the plan declared {promised}",
@@ -383,7 +383,7 @@ pub fn propagate(plan: &Plan, groups: &ProcessGroups) -> Result<ShardPropagation
 
         let mut converted = plan.slot(c.slot).clone();
         converted.name = format!("{}__{}", converted.name, op);
-        converted.layout = c.to.clone();
+        converted.layout = c.to;
 
         let mut attrs = Attrs::new().set(intrinsic::ATTR_GROUP, intrinsic::group_name(group));
         if let Some(r) = reduce {
