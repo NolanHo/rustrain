@@ -89,7 +89,8 @@ rustrain check --model <model-dir> [--checkpoint <dir>] [--tp N --cp N --ep N --
 ### D1 — 描述文件能表达这个模型
 
 **可观察结果**：存在一份 `qwen3.6-35b-a3b.json` + 一个模型目录（`config.json` 来自 HF 公开仓库），
-展开后得到节点数 ≈ 1000、weight slot 数 = 690（文本）+ 16（MTP）的全局 Plan。
+展开后得到节点数 ≈ 1000、weight slot 数 = 693（文本：根 3 + 层内合计 80+270+60+280）+ 19（MTP）= **712** 的全局 Plan；
+其余 333 是视觉塔（本 spec 排除）。
 **交付位置**：模型描述文件随 fixture 一起（见 D2），格式定义在 `docs/design/model-description.md` §3。
 **验收与证据**：
 - `cargo run -q -p rustrain-cli -- plan explain --model <dir> --json | jq '.nodes|length'` > 900

@@ -122,10 +122,11 @@ description: rustrain 的架构操作规则。改动 crate 边界、ABI、plan I
 
 ## 5. 过程纪律
 
-- **接口没有消费者就不进设计。** 这个代码库撞过*五次*死钩子：`CheckpointPolicy`（每个节点都声明，
-  从没被读过）、`RsMemReq.save_for_backward_bytes`（在 ABI 里，从没被查询）、`SlotKind::State`、
-  `StreamPolicy::Side`、以及 `MemoryPlan` 的偏移（算了，执行器却逐槽分配）。
-  旧代码里还有第六种形态：`config.json` 里解析了却从不读的字段（`full_attention_interval`、`mrope_*` …）——
+- **接口没有消费者就不进设计。** 这个代码库撞过*四条*死钩子：`CheckpointPolicy`（每个节点都声明，
+  从没被读过）、`RsMemReq.save_for_backward_bytes`（在 ABI 里，planner 从没累加过）、`SlotKind::State`、
+  `StreamPolicy::Side`。**完整清单见 `docs/design/plan-ir-baseline.md`** —— `MemoryPlan` 的偏移**不在**其中：
+  执行器按 `Persistent{offset}`/`Pool{offset}` 取 `base + offset`，那是活的。
+  旧代码里还有第五种形态：`config.json` 里解析了却从不读的字段（`full_attention_interval`、`mrope_*` …）——
   **它比没有更糟，因为它看起来像支持。**
   **写下一个字段时，同一步里就要写下谁读它。**
 - **凡是对错要靠事实判断的地方，必须有两个实现 + 一个数值基准。** 单一实现可以自洽且错误：
@@ -164,7 +165,8 @@ cargo run -q -p rustrain-cli -- ops check # exit 0；skip 必须写明理由
 `docs/architecture.md` §8 列了待定决定。**D2 已定**：结构是数据（子图模板 + 重复），插件只提供原语，
 `expansion` 只承载实现语义。
 
-**下一个设计产物是 D8（描述文件的语法与展开语义）。** 在它定案之前不要写"模型描述 → plan"的代码。
+**D8 / D9 已设计完成**（`docs/design/model-description.md`：描述文件的语法与展开语义、轴与 mesh 的表示）。
+**按 spec 执行**：执行入口是 `docs/design/qwen36-text/spec.md` —— "模型描述 → plan"的代码照它写，不再等定案。
 但 §1 / §2 的规则**已经生效**：切分不是算子、度数作为编译输入、推导只兑现声明不猜声明、
 planner 只规划 expansion、kernel 与拓扑无关、plan 不携带 topology 对象。
 

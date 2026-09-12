@@ -112,7 +112,9 @@ Rust 侧 `#[repr(C)]` 镜像并做尺寸与偏移断言。
 **词表的唯一权威是 `docs/design/op-vocabulary.md`。** 它含分类、对现有 27 个原语的逐项对账、
 Qwen3.6-35B-A3B 的完整分解图、以及每处通信的归属。本规格只保留契约：
 
-**契约 P-1**：复合算子的 `expansion` 深度不得超过 2 层（块 → 原语）。
+**契约 P-1（适用范围已收窄，指向 `docs/design/op-vocabulary.md` §8.1）**：P-1 只约束**描述符里自带展开声明**的
+复合算子（"粗描述"场景）；我们走的**细描述**路径下，融合是"**模板实例替换**"，不产生深层展开。
+（原表述"深度不得超过 2 层（块 → 原语）"仅对前一种场景成立。）
 
 **新增原语是一次框架演进（需 review），新增实现不需要。** 判定见 `skills/architecture/SKILL.md` §4.2。
 
@@ -123,6 +125,11 @@ Qwen3.6-35B-A3B 的完整分解图、以及每处通信的归属。本规格只�
 以及各组的成员集合。
 
 **切分规格 `ParallelLayout`**：
+
+> **已被取代（下表是现状描述）**：目标形态是**一个 slot 的 layout = 多个 `(dim, group)` 分片 + 至多一个 partial**
+> —— 因为同一个张量会被多条互不相干的轴切分（Qwen3.6 的专家权重同时被 `ep` 切专家维、被 `tp` 切特征维）。
+> 权威定义见 `docs/design/model-description.md` §2.1；实现改造完成后本表即过期。
+> 同理，下文出现的 `GroupKind`（封闭六值）已被 **`GroupMask`（轴掩码，可表达 `tp|ep`）** 取代。
 
 | 变体 | 含义 |
 |---|---|
@@ -257,16 +264,21 @@ overlap_collectives = true
 （forward 产出的激活要到 backward 才死）。编译器据此投影整个 step 的峰值显存：
 存活槽位 + workspace + 通信缓冲。**不得依赖运行时 OOM 才发现放不下。**
 
-**契约 MEM-3（预算门禁）**：峰值超过 `budget_bytes` 时编译失败，错误必须指出峰值出现在哪一步、
-以及哪些策略能把它压下来。`auto` 模式按 keep → offload → recompute 的确定顺序降级，
-并把每一次降级决策记入 plan digest 与日志（与 R-2 同一原则：降级必须显式且可追溯）。
+**契约 MEM-3（预算门禁）—— 已被推翻。** 原文（保留，读者需要知道它为什么在这儿）：「峰值超过 `budget_bytes` 时编译失败，
+错误必须指出峰值出现在哪一步、以及哪些策略能把它压下来。`auto` 模式按 keep → offload → recompute 的确定顺序降级，
+并把每一次降级决策记入 plan digest 与日志（与 R-2 同一原则：降级必须显式且可追溯）。」
+**权威版本**：峰值**只产生 warning，不影响退出码** —— 见 `docs/architecture.md` §8 D12。
 
-**契约 MEM-4（寿命复用）**：寿命区间不相交的槽位必须复用同一块缓冲，产出 `MemoryPlan`。
-复用决策是 digest 的一部分（它决定执行期的地址，而地址影响 CUDA graph 捕获）。
+**契约 MEM-4（寿命复用）—— 已被推翻（"复用决策进 digest"这一半）。** 原文（保留）：「寿命区间不相交的槽位
+必须复用同一块缓冲，产出 `MemoryPlan`。复用决策是 digest 的一部分（它决定执行期的地址，而地址影响 CUDA graph 捕获）。」
+**实际行为**：`MemoryPlan` **被排除**在 digest 之外（`compile.rs` 的 `DigestInput` 只有 plan / decisions / parallel），
+而 `seed` / `checkpoint` / `Trace.path` 反而进了 digest —— 方向与意图相反，是**已知缺口**（`docs/architecture.md` §7）。
 
-**契约 MEM-5（state 是独立一类）**：`SlotKind` 区分 `State { kind: Recurrent | Kv { capacity,
-paging, block } }` 与激活。state 有容量维度与淘汰/分页策略，激活没有；把两者混为一类会让
-KV 的分页策略污染激活的寿命复用。
+**契约 MEM-5（state 是独立一类）—— 未定。** 原文（保留）：「`SlotKind` 区分 `State { kind: Recurrent |
+Kv { capacity, paging, block } }` 与激活。state 有容量维度与淘汰/分页策略，激活没有；把两者混为一类会让
+KV 的分页策略污染激活的寿命复用。」
+**现状与归属**：IR 里今天是 **unit 变体**（`SlotKind::State` 无构造点，见 `docs/design/plan-ir-baseline.md` §1）；
+KV 的容量/分页策略属 `docs/architecture.md` §8 **D10**，且**训练不需要 KV cache**（`docs/architecture.md` §1.7）。
 
 **配置面**：
 
@@ -311,10 +323,13 @@ kv_block    = 64
 同一理由），所以原语的 VJP 规则也在框架侧。复合/融合算子不单独声明 VJP —— 它的 VJP 由自己声明的
 `expansion` 推导（契约 R-4）。因此 R-4 不是"可选的文档"，而是反向可用性的前提。
 
-**契约 B-3（save-for-backward 不是独立机制）**：ABI 的 `RsMemReq.save_for_backward_bytes` 不需要
-单独实现。"为反向保存激活"就是**该 slot 的最后一个消费者落在 backward 阶段**，而 `MemoryPlan`
-已经在算寿命。保存、释放、重算的显存账自动正确，不需要一套与 plan 并行的 checkpointing 子系统。
-（旧代码正是在这里长出了 `QWEN36_SUBCKPT` / `megakernel` / `OFFLOAD_ACTIVATIONS` 三条手写路径。）
+**契约 B-3（save-for-backward 不是独立机制）—— 已被推翻。** 原文（保留）：「ABI 的
+`RsMemReq.save_for_backward_bytes` 不需要单独实现。"为反向保存激活"就是**该 slot 的最后一个消费者落在
+backward 阶段**，而 `MemoryPlan` 已经在算寿命。保存、释放、重算的显存账自动正确，不需要一套与 plan
+并行的 checkpointing 子系统。（旧代码正是在这里长出了 `QWEN36_SUBCKPT` / `megakernel` /
+`OFFLOAD_ACTIVATIONS` 三条手写路径。）」
+**权威版本**：`save_for_backward_bytes` 与 `PlanNode.checkpoint: CheckpointPolicy` 是**同一个缺失子系统**
+（反向激活的显存管理）的两半 —— 见 `docs/architecture.md` §2.6。
 
 **契约 B-4（反向必须重跑切分传播）**：通信算子的伴随关系是
 `all_reduce` 自伴随、`all_gather ↔ reduce_scatter`。反向图的结构与前向不同，切分需求也不同，
@@ -471,11 +486,12 @@ TP（或 CP/EP）≥2 的配置跑通，通信由传播插入而非手写。
 `rustrain plan explain` 打印峰值与复用表。
 状态：`- [x]` — 寿命分析、峰值投影、不相交寿命的槽位复用（首次适配）已实现，编译期调用每个算子的 `memory()` 取 workspace。`pool` 默认为 `slab`（复用正是寿命分析存在的理由，默认关掉等于白白浪费已证明可省的内存）。`cargo test -p rustrain-plan` 22 通过，含 8 个显存测试。**执行器已按这些偏移分配**（见 D5），所以 `MemoryPlan` 是执行事实而非建议。
 
-**D14 · 预算门禁与策略降级**
-超预算时编译失败并指出峰值步骤与可用策略；`activation_policy = "auto"` 按确定顺序降级并记录决策。
-验收：`cargo test -p rustrain-plan`；把 `budget_bytes` 调到峰值以下必失败且错误可读；
+**D14 · 预算门禁与策略降级 —— 已被推翻。** 原文（保留）：「超预算时编译失败并指出峰值步骤与可用策略；
+`activation_policy = "auto"` 按确定顺序降级并记录决策。」
+**权威版本**：峰值**只产生 warning，不影响退出码**（`docs/architecture.md` §8 D12）。
+验收（历史，已不是当前判据）：`cargo test -p rustrain-plan`；把 `budget_bytes` 调到峰值以下必失败且错误可读；
 `auto` 在两次运行中做出**相同**的降级序列（确定性）。
-状态：`- [x]` — 超预算编译失败，错误指出峰值节点、该处活跃字节数、以及可用的缓解手段；`auto` 按 keep → offload → recompute 的确定顺序降级并逐条记录理由。`cargo test -p rustrain-plan` 覆盖：budget=1 必失败且错误可读、运行时无 offload/recompute 能力时**不谎报**（决策为空、门禁照常拒绝）、有支持时两次运行的降级序列**逐条相同**、运行时不支持却被 recipe 要求的策略进入 `unsupported` 并在 `explain` 中显式列出。
+状态：`- [x]` — **已被推翻的验收**：超预算时编译失败，错误指出峰值节点、该处活跃字节数、以及可用的缓解手段；`auto` 按 keep → offload → recompute 的确定顺序降级并逐条记录理由。`cargo test -p rustrain-plan` 覆盖：budget=1 必失败且错误可读、运行时无 offload/recompute 能力时**不谎报**（决策为空、门禁照常拒绝）、有支持时两次运行的降级序列**逐条相同**、运行时不支持却被 recipe 要求的策略进入 `unsupported` 并在 `explain` 中显式列出。
 
 **D15 · state 槽位与 KV 策略**
 `SlotKind` 区分 `Recurrent` 与 `Kv { capacity, paging, block }`；state 槽位按容量预分配，
@@ -569,8 +585,8 @@ KV 按 block 分页。为 rollout / 有状态注意力 / ring attention 提供�
 
 - **渐进式（保留现状 + 加一层注册表）**：用户否决——"不要在屎山上雕花"。
 - **自研 kernel 路线**：用户否决——框架重点在通信与编排，计算交给成熟实现。
-- **通用 IR 编译器（mini-XLA）**：否决。原语固定、展开限 2 层、切分传播只支持声明的 `shard_rule`，
-  不做通用图优化。
+- **通用 IR 编译器（mini-XLA）**：否决。原语固定、融合只到"模板实例替换"（P-1 的适用范围见
+  `docs/design/op-vocabulary.md` §8.1）、切分传播只支持声明的 `shard_rule`，不做通用图优化。
 
 ### 7.3 环境与资产
 

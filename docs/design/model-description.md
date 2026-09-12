@@ -301,7 +301,7 @@ HF / legacy 的 checkpoint 是 `[out, in]`，所以 binding 用 `transpose` 归�
 L2 不需要 topology，L1 需要 —— 与 `architecture.md` §4.4 一致。CLI 统一入口：
 
 ```
-rustrain check --model <model-dir|desc.json> [--tp N --cp N --ep N --dp N --pp N] [--json]
+rustrain check --model <model-dir|desc.json> [--checkpoint <dir>] [--tp N --cp N --ep N --dp N --pp N] [--json]
 ```
 
 `--model` 只给描述文件时，L2 需要额外的 `--checkpoint <dir>`（或从描述指向模型目录）。

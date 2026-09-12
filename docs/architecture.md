@@ -50,7 +50,7 @@ kernel 做对照**，对研究比编译期检查更有价值。
 | 事实 | 归属 | 求值时机 |
 |---|---|---|
 | mesh：轴名 → degree / ranks | 编译输入 + 运行输入（`ProcessGroups`）。**不进 plan。** | 编译期 |
-| 张量轴 → mesh 轴的**指派** | 模型描述（符号：`Shard{dim, Axis("tp")}`） | 编译期求值 |
+| 张量轴 → mesh 轴的**指派** | 模型描述（符号：**多个 `(dim, group)` 分片 + 至多一个 partial**） | 编译期求值 |
 | 具体 layout（含度数）、axis id、形状、节点集合 | **plan 产物** | 编译后 |
 | topology **指纹**（不是对象） | plan 的 meta / digest | 编译后 |
 
@@ -60,14 +60,16 @@ kernel 做对照**，对研究比编译期检查更有价值。
 - **collective 执行**：要组句柄 → plan 存 **axis id**，runtime 拿它在 mesh 里查句柄。
 - **加载器**：要"我持有哪一片" → 由 (slot.layout, 组内 rank) 算出；mesh 是运行输入，
   所以需要拓扑的是 loader，不是 plan。
-- **PP / EP 实例化**：节点集合是拓扑的函数 → **编译期求值**，产物里节点集合已经具体。
+- **PP 实例化**：节点集合是拓扑的函数 → **编译期求值**，产物里节点集合已经具体。
+  （**只有 PP**；EP 是 layout + 显式 routing，见 §1.4。）
 
 **推论（重要）**：**描述是可移植产物，plan 是拓扑相关的产品。**
 因此 checkpoint 映射挂在**描述**上（全局参数空间），不挂在 plan 上（局部）。
 副产品：§4.4 的 L2 检查**完全不需要 topology**，只有 L1 需要。
 
 **必须改的钉子**：`GroupKind` 现在是封闭枚举（Tp/Dp/Pp/Ep），hybrid mesh（HSDP、tp×ep×dp 组合）表达不了。
-它应演进成 **opaque axis id**（编译期 mesh 里的索引）。
+它应演进成 **`GroupMask`（轴掩码，可表达 `tp|ep` 这类组合组）** —— 单一的 axis id 表达不了组合，
+而掩码是结果、不是拓扑对象（`docs/design/model-description.md` §1.2）。
 
 ### 1.2 模型是数据
 
@@ -85,7 +87,7 @@ kernel 做对照**，对研究比编译期检查更有价值。
 |---|---|
 | 参数 | 从 `config.json` 取；描述引用参数名，不重复数值 |
 | 模板 | 子图（一层、一个 attention、一个 MLP），用参数名作形状 |
-| 实例化 | 重复与逐层覆盖；必须同时容纳"纯列表"与"列表 + 派生回退"两种形式（§5.2） |
+| 实例化 | **按下标取列表**；标量 → 结构的派生由生成器 materialize 成显式列表（§5.2） |
 | 参数映射 | slot ↔ checkpoint 名字 + 变换 + **切分轴**（§1.4），直接喂 L2 |
 
 **判据**：描述格式完成的标志是它能**把第一个验证样本（`Qwen/Qwen3.6-35B-A3B`）完整表达成数据**，
@@ -106,7 +108,7 @@ kernel 做对照**，对研究比编译期检查更有价值。
 |---|---|---|
 | 度数（tp=8 / ep=2） | `ProcessGroups`（`ParallelConfig`） | 编译输入；进程生命周期常量 |
 | 轴（这条边属于哪条 mesh 轴） | axis id + 节点属性 `ATTR_GROUP` | **节点属性**，不是 tensor operand |
-| layout（哪个张量轴被切） | `ParallelLayout::{Shard,Partial}` | **slot 声明** |
+| layout（哪个张量轴被切） | **多个 `(dim, group)` 分片 + 至多一个 partial**（`docs/design/model-description.md` §2.1） | **slot 声明** |
 
 **group 不做 tensor operand 的三条理由**：
 
@@ -134,7 +136,8 @@ kernel 做对照**，对研究比编译期检查更有价值。
 对 PP 放弃"一个 plan 跑所有度数"：**同一份描述 + 不同切分参数 → 各实例化一个 plan，
 且实例化可在无 GPU 机器上完成**（§4.4）。
 
-**切分轴属于参数声明**：一个权重 slot 的 `Shard{dim, axis}` 与"从 checkpoint 取哪一块"是**同一条事实**，
+**切分轴属于参数声明**：一个权重 slot 的 layout（**多个 `(dim, group)` 分片 + 至多一个 partial**，
+`docs/design/model-description.md` §2.1）与"从 checkpoint 取哪一块"是**同一条事实**，
 必须住在同一个地方（参数映射）—— 一份声明同时被加载器和形状算术读取。
 按算子名或张量名查框架侧的表是禁止的（P6）。
 
@@ -153,7 +156,7 @@ grad_reduce_mask(param) = 全掩码 \ (该张量已切分的轴 ∪ {pp})
 
 ### 1.5 推导的口径：兑现义务，不猜声明
 
-- **可以推**：某 slot 声明 `Shard{dim:0, axis:tp}` → 每个 rank 只有部分和 → 该处必须 all_reduce。
+- **可以推**：某 slot 声明沿 dim 0、组 `{tp}` 的分片 → 每个 rank 只有部分和 → 该处必须 all_reduce。
   这是**把声明的后果算出来**。
 - **不可以推**：看到算子名叫 `linear` 就假定权重是 `[K,N]`，看到 `qkv` 就假定 column parallel。这是**猜**。
 
@@ -259,8 +262,10 @@ checkpoint），所以它确实需要，且不是新需求。
 **落地时框架该做什么**：executor **预留**声明的字节；kernel 实际保存超过声明 → 在那个算子处分配失败，
 而不是静默 OOM。声明错仍只能靠"跑起来"发现 —— **门禁证的是数值等价，不是内存**。
 
-**但这一条现在不做**（§8 D12）：内存管理整个留空，预算只警告不拦。好消息是这两件事不冲突 ——
-正因为预算不再拦编译，**融合实验不会被内存投影阻塞**，等做内存管理时再激活这两个钩子。
+**但这一条现在不做**（§8 D12）：内存管理整个留空。**目标行为**是预算只警告、不拦编译；但**代码里
+`enforce_budget` 目前仍是硬失败**（`memory.rs` 返回 `MemoryBudgetExceeded`），这一项由
+`docs/design/qwen36-text/spec.md` 的 **D4** 交付。好消息是这两件事不冲突 —— 预算一旦不再拦编译，
+**融合实验就不会被内存投影阻塞**，等做内存管理时再激活这两个钩子。
 
 ---
 
@@ -284,7 +289,7 @@ checkpoint），所以它确实需要，且不是新需求。
  │    3 resolve_node ×N      Registry + Recipe → 每个节点的具体实现
  │     │                      融合体在此替换其 expansion；替换前校验 collectives 集合相等（§2.3）
  │    4 memory::plan         寿命分析 → 偏移复用 → 峰值投影；调每个算子的 memory() 取 workspace
- │    5 enforce_budget       峰值**投影**超 budget_bytes → **只 Warning，不拦编译**（§8 D12）
+ │    5 enforce_budget       峰值**投影**超 budget_bytes → **目标**只 Warning；**今天仍硬失败**（§8 D12，D4 交付）
  │    6 validate_shapes      调插件的 infer()，与 plan 声明的形状比对
  │    7 compute_digest       把全部决策哈希（不含 recipe 原文，只含它产生的决策）
  │
@@ -352,9 +357,10 @@ L2 的变换词表最小集（由真实 checkpoint 反推，不是想出来的�
 | **L3 数值** | 设备（或 CPU 参考实现） | 同一算子的两个实现算同一件事 + 数值参考 | 已有（conformance gate） |
 
 ```
-rustrain check --model <model-dir> --plugin <p.so> [--tp N --pp N --ep N] [--json]
+rustrain check --model <model-dir> [--checkpoint <dir>] [--tp N --cp N --ep N --dp N --pp N] [--json]
 ```
 
+- **插件发现尚未实现**，当前靠 `--plugin <path>` 显式指定（§4.3）。
 - 退出码非零即失败；每条 skip 必须写原因（沿用门禁纪律）。
 - `--json` 的用途是**机器消费**：L2 的自然用户是从 HF 模型"拆碎"出描述 + 名字映射的生成器，
   `decompose → check → 修映射 → check` 全在笔记本 CPU 上跑。
@@ -362,7 +368,8 @@ rustrain check --model <model-dir> --plugin <p.so> [--tp N --pp N --ep N] [--jso
   （`uncovered_operators()` 是种子）。
 
 **它保证什么**（声明之间自洽）：每个节点都有实现（dtype / layout / target 满足）；每个边界的形状 /
-strides / dtype 一致；每个 buffer 都被分配、无别名冲突；每个 collective 都有组且组在拓扑里存在；
+strides / dtype 一致；每个 buffer 都被分配、无别名冲突；每个 collective 都有组
+（"组在拓扑里存在"是**目标**：今天 `GroupUnavailable` 从未被构造，见 §7）；
 每个 slot 都有来源（L2）；每个算子有反向接线或可推导。
 
 **它不保证什么**：**数值**（NaN / Inf / 精度 / 发散 —— 那是 kernel 的责任）；**模型是对的**
@@ -482,6 +489,8 @@ P2/P6 直接服务 §0 的边界契约，优先级高于 P1/P4/P5。
 
 **与 §1 / §2 定义的差距**（逐条实测见 `docs/design/plan-ir-baseline.md`）
 
+**死钩子的完整清单见 `docs/design/plan-ir-baseline.md`** —— 本节只列与 §1 / §2 差距直接相关的那些，不复制全表。
+
 - `shard::propagate` 收到 `ProcessGroups` 后丢弃（`shard.rs:236`）→ `GroupUnavailable` 从未被构造：
   plan 可以声明 `GroupKind::Ep` 而拓扑里 expert=1 而不报错。**§1.1 的"编译期求值拓扑"缺的就是这一步。**
 - `CollectiveBackend::execute` 的签名里没有 rank / world size / 组句柄（`runtime/lib.rs:170-179`）→
@@ -490,7 +499,7 @@ P2/P6 直接服务 §0 的边界契约，优先级高于 P1/P4/P5。
 - digest 把 `seed` / `checkpoint` / `Trace.path`（后者只是诊断字符串）纳入，却把**整个 `MemoryPlan`** 排除
   （`compile.rs:696-716`）→ 改诊断路径会改 digest，改内存策略不会。与 §0 推论 3 的意图相反。
 - `GroupKind` 是封闭六值枚举 + `ProcessGroups.groups: [_; 6]` 定长数组（`group.rs:20-49, 142`）→
-  §1.1 的 opaque axis id 迁移是表达 hybrid mesh 的前置条件。
+  §1.1 的 `GroupMask`（轴掩码）迁移是表达 hybrid mesh 的前置条件。
 - **`SlotKind::State` / `Gradient` 无任何构造点（`memory.rs:551` 会读）→ §1.7 的状态管理今天没有承载。**
 - **`RsMemReq.save_for_backward_bytes` 是死钩子**（ABI 里有，`ffi.rs:418`；只有测试读，
   `memory.rs:644` 构造后从不累加）→ 融合 kernel 自己保存的激活不计入预算，**激活峰值被低估**。
@@ -500,7 +509,7 @@ P2/P6 直接服务 §0 的边界契约，优先级高于 P1/P4/P5。
 - 没有 plan 的持久化入口（`Plan` 派生 `Serialize` 但全仓无读写路径）→ 描述层的产物今天只能走内存对象。
 
 **计算路径**
-- 模型描述与展开（§1.2）—— 下一个设计产物
+- 模型描述与展开（§1.2）—— 设计已完成（`docs/design/model-description.md`），待实现；执行入口 `docs/design/qwen36-text/spec.md`
 - 反向图（`derive_backward`）—— 设计已定（spec §2.11），未实现
 - 优化器步、梯度累积、微批调度
 - collective 的流分配与 overlap 调度（`StreamPolicy::Side` 已存在但无消费者）
@@ -516,7 +525,7 @@ P2/P6 直接服务 §0 的边界契约，优先级高于 P1/P4/P5。
 
 **模型面**
 - 模型描述格式：结构由数据承载（§1.2 / D8）
-- `GroupKind` → opaque axis id（§1.1 / D9）
+- `GroupKind` → `GroupMask`（轴掩码，§1.1 / D9）
 - 模块树是否必要：今天它只贡献 `Trace.path` 这一个可读字符串，没有任何东西**遍历**它。
   只有当某个消费者必须走树时（checkpoint 映射、显式 optimizer 分区、state 管理）才值得引入
 
@@ -531,8 +540,8 @@ P2/P6 直接服务 §0 的边界契约，优先级高于 P1/P4/P5。
 | D3 | recipe 作用域：算子名 vs 描述里的结构路径 | 依赖 D8 |
 | D5 | 训练循环归属、微批与梯度累积对 plan 的影响 | 未定 |
 | D6 | P1/P2/P4/P5/P6/P7 的落地顺序 | 待 D8 定 |
-| D8 | **描述文件的具体语法与展开语义**（重复、逐层覆盖、按名接线；必须容纳 §5.2 的两种形式） | **下一个设计产物** |
-| D9 | `GroupKind` → opaque axis id 的迁移（涉及 ABI 面） | 未定 |
+| D8 | **描述文件的具体语法与展开语义**（重复、逐层覆盖、按名接线；必须容纳 §5.2 的两种形式） | **已设计完成**：`docs/design/model-description.md` §3–§4；执行入口是 `docs/design/qwen36-text/spec.md` |
+| D9 | `GroupKind` → `GroupMask`（轴掩码，可表达 `tp\|ep` 这类组合组）的迁移（涉及 ABI 面） | **已设计完成**：`docs/design/model-description.md` §1；执行入口是 `docs/design/qwen36-text/spec.md` |
 | D10 | `SlotKind::State` 与持久化：激活 / optimizer state / 循环层 state | 未定 |
 | D11 | 融合替换的合法性检查落地（collectives 集合相等） | 未定 |
 | D7 | `rustrain check` 的层级划分与 L1/L2 落地顺序（§4.4） | 依赖 D8 |
@@ -542,8 +551,10 @@ P2/P6 直接服务 §0 的边界契约，优先级高于 P1/P4/P5。
 
 峰值是**估**出来的，而估错的代价是**单向**的：投影偏低（融合体保存量未声明、分配器碎片、重算/卸载策略尚未实现）
 会在训练时 OOM；投影偏高会**错杀**一个本来跑得动的配置。**让不准的东西去否决准的东西，是划不来的。**
-所以现在：`memory::plan` 照旧算（它仍是 executor 分配"常驻区 + 激活池"两块的依据），但 `enforce_budget` 只 Warning。
-**告警仍然要求 `save_for_backward_bytes` 被声明** —— 不声明的话，连警告都是错的。
+所以现在：`memory::plan` 照旧算（它仍是 executor 分配"常驻区 + 激活池"两块的依据）；**目标**是
+`enforce_budget` 只 Warning，但代码里它**今天仍是硬失败**（`MemoryBudgetExceeded`，由
+`docs/design/qwen36-text/spec.md` 的 D4 交付）。
+**未来**告警要准确，前提是该字段被声明；现在字段与预算一起留空（D12）。
 
 **vLLM 的先例支持这个方向**：它不解析式地算激活峰值，而是跑一次 `profile_run` **测量**，
 再用 `总显存 × gpu_memory_utilization − 权重 − 非 torch 内存 − 激活峰值 = KV cache 预算`
