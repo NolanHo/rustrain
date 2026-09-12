@@ -1,0 +1,42 @@
+[run]
+name = "qwen3_session_single"
+base_dir = "/tmp/rustrain-runs"
+seed = 42
+
+[model]
+name = "qwen3_0_6b_dense_single"
+architecture = "qwen3_trainable_session"
+model_path = "/vePFS-Mindverse/share/huggingface/hub/models--Qwen--Qwen3-0.6B/snapshots/c1899de289a04d12100db370d81485cdf75e47ca/"
+vocab_size = 151936
+hidden_size = 1024
+num_layers = 28
+num_attention_heads = 16
+num_key_value_heads = 8
+intermediate_size = 3072
+seq_len = 5
+norm = "rmsnorm"
+activation = "swiglu"
+rope = true
+rms_norm_eps = 0.000001
+
+[train]
+max_steps = 2
+backend = "tch"
+micro_batch_size = 1
+global_batch_size = 1
+gradient_accumulation_steps = 1
+learning_rate = 0.000001
+weight_decay = 0.0
+adam_beta1 = 0.9
+adam_beta2 = 0.999
+adam_eps = 0.00000001
+dtype = "fp32"
+device = "cuda"
+checkpoint_every = 0
+
+[parallel]
+tensor_model_parallel_size = 1
+pipeline_model_parallel_size = 1
+data_parallel_size = 1
+expert_model_parallel_size = 1
+context_parallel_size = 1

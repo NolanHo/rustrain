@@ -1,0 +1,43 @@
+[run]
+name = "deepseek_v3_2_session_single"
+base_dir = "/tmp/rustrain-runs"
+seed = 42
+
+[model]
+name = "deepseek_v3_2_dense_layer0"
+architecture = "deepseek_trainable_session"
+model_path = "/vePFS-Mindverse/share/huggingface/hub/models--deepseek-ai--DeepSeek-V3.2-Exp-Base"
+vocab_size = 129280
+hidden_size = 7168
+num_layers = 61
+num_attention_heads = 128
+num_key_value_heads = 128
+intermediate_size = 18432
+seq_len = 5
+norm = "rmsnorm"
+activation = "swiglu"
+rope = true
+rms_norm_eps = 0.000001
+trainable_layers = [0]
+
+[train]
+max_steps = 2
+backend = "tch"
+micro_batch_size = 1
+global_batch_size = 1
+gradient_accumulation_steps = 1
+learning_rate = 0.0000001
+weight_decay = 0.0
+adam_beta1 = 0.9
+adam_beta2 = 0.999
+adam_eps = 0.00000001
+dtype = "fp32"
+device = "cuda"
+checkpoint_every = 0
+
+[parallel]
+tensor_model_parallel_size = 1
+pipeline_model_parallel_size = 1
+data_parallel_size = 1
+expert_model_parallel_size = 1
+context_parallel_size = 1

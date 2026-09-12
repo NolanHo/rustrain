@@ -1,0 +1,23 @@
+[package]
+name = "rustrain-core"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow.workspace = true
+chrono.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+regex.workspace = true
+toml.workspace = true
+tracing.workspace = true
+tracing-appender.workspace = true
+tracing-subscriber.workspace = true
+
+[dependencies.tch]
+workspace = true
+optional = true
+
+[features]
+default = []
+tch = ["dep:tch"]

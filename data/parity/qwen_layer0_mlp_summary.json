@@ -1,0 +1,36 @@
+{
+  "embedded_hidden_shape": [
+    1,
+    13,
+    896
+  ],
+  "fixture": "runs/parity/qwen_layer0_mlp.safetensors",
+  "input_ids": [
+    2672,
+    77626,
+    49615,
+    1779,
+    25,
+    10339,
+    3170,
+    33789,
+    4862,
+    3880,
+    72349,
+    60788,
+    13
+  ],
+  "mlp_output_checksum": -14.770387649536133,
+  "mlp_output_shape": [
+    1,
+    13,
+    896
+  ],
+  "model_path": "/vePFS-Mindverse/share/huggingface/Qwen2.5-0.5B-Instruct",
+  "post_attention_normed_shape": [
+    1,
+    13,
+    896
+  ],
+  "prompt_file": "data/parity/qwen_prompt.txt"
+}

@@ -1,0 +1,48 @@
+[run]
+name = "qwen3_5_9b_lora_sft"
+base_dir = "/tmp/rustrain-runs"
+seed = 42
+
+[model]
+name = "qwen3_5_9b_lora_sft"
+architecture = "qwen3_6_lora_sft"
+model_path = "/vePFS-Mindverse/share/huggingface/hub/models--Qwen--Qwen3.5-9B/snapshots/c202236235762e1c871ad0ccb60c8ee5ba337b9a"
+vocab_size = 248320
+hidden_size = 4096
+num_layers = 32
+num_attention_heads = 16
+num_key_value_heads = 4
+intermediate_size = 12288
+seq_len = 512
+norm = "rmsnorm"
+activation = "swiglu"
+rope = true
+rms_norm_eps = 0.000001
+
+[train]
+micro_batch_size = 1
+global_batch_size = 1
+gradient_accumulation_steps = 1
+learning_rate = 0.0001
+weight_decay = 0.0
+adam_beta1 = 0.9
+adam_beta2 = 0.999
+adam_eps = 0.00000001
+max_steps = 20
+backend = "tch"
+dtype = "bf16"
+device = "cuda"
+checkpoint_every = 0
+
+[lora]
+target_layers = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31]
+rank = 8
+alpha = 16
+target_modules = ["q_proj", "k_proj", "v_proj", "o_proj", "in_proj_qkv", "in_proj_z", "out_proj"]
+
+[parallel]
+tensor_model_parallel_size = 1
+pipeline_model_parallel_size = 1
+data_parallel_size = 1
+expert_model_parallel_size = 1
+context_parallel_size = 1

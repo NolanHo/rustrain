@@ -1,0 +1,4 @@
+rustrain is a tiny rust training system.
+it starts with config, logs, checkpoints, and deterministic toy data.
+the trainer packs text into causal language model windows.
+loss should move down on this small local corpus.

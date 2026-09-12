@@ -1,0 +1,10 @@
+[package]
+name = "rustrain-train"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+rustrain-core = { path = "../rustrain-core" }
+anyhow.workspace = true
+ndarray.workspace = true
+tracing.workspace = true
