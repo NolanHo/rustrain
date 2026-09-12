@@ -114,15 +114,23 @@ kernel 做对照**，对研究比编译期检查更有价值。
 2. 它必须一致 —— tensor 值可以在 rank 间不一致；属性在 startup 校验一次。
 3. 它不需要"被计算" —— 由 (mesh 拓扑, 轴) 唯一决定，是查表，不是 kernel。
 
-### 1.4 两类并行机制，以及它们与 Kernel 的关系
+### 1.4 五轴 = 一种 layout 机制 + 一种 PP 机制
 
 | | 切什么 | 机制 | 与 Kernel 的关系 | 图中的体现 |
 |---|---|---|---|---|
-| **layout**（TP / SP / DP） | 同一批节点的**张量轴** | 形状算术 + 通信插入 | **相关**：输入输出形状与是否通信变了 | 节点集合不变，多出 intrinsic |
-| **instantiation**（EP / PP） | **节点集合本身** | 按 (rank, 度数) 枚举节点 | **无关**：kernel 代码不会因 pp=4 而改变 | 节点集合随 rank 变 |
+| **layout**（TP / CP / DP / **EP**） | 同一批节点的**张量轴** | 形状算术 + 通信插入 | **相关**：输入输出形状与是否通信变了 | 节点集合不变，多出通信节点 |
+| **instantiation**（**只有 PP**） | **节点集合本身**（本 rank 有哪几层） | 按 (rank, 度数) 枚举模板实例 | **无关**：kernel 代码不会因 pp=4 而改变 | 节点集合随 rank 变 |
 
-EP 用形状算术表达不了：rank 0 有 expert 0–3、rank 1 有 4–7，"哪些节点存在"变了。PP 同理。
-对 EP/PP 放弃"一个 plan 跑所有度数"，改为：**同一份描述 + 不同切分参数 → 各实例化一个 plan，
+**EP 属于 layout，不属于 instantiation**（这一条推翻过早期分类，以 Qwen3.6 MoE 走通之后修正，
+推导见 `docs/design/model-description.md` §6.1）：
+
+- **专家权重就是 dim 0 的分片**：`experts.gate_up_proj [E, 2I, H]` 在 `ep=4` 下本地形状 `[E/4, 2I, H]`
+  —— 纯形状算术，没有"哪些节点存在"的问题。
+- **激活侧的 routing 是数据依赖的**（token 去哪个 rank 由 router 的 top-k 决定），因此它推不出来，
+  必须是图中的显式算子（dispatch / combine），由 kernel 声明 `collectives: [all_to_all(ep)]`。
+- 于是 **五轴里只有 PP 改变节点集合**，也因此只有 PP 需要微批与 send/recv 调度 —— 那是独立子系统。
+
+对 PP 放弃"一个 plan 跑所有度数"：**同一份描述 + 不同切分参数 → 各实例化一个 plan，
 且实例化可在无 GPU 机器上完成**（§4.4）。
 
 **切分轴属于参数声明**：一个权重 slot 的 `Shard{dim, axis}` 与"从 checkpoint 取哪一块"是**同一条事实**，
