@@ -163,7 +163,7 @@ local[d] = global[d] / Π { degree(轴) : 轴 ∈ spec.group, spec ∈ dims, nor
 }
 ```
 
-- slot 名是**模板内局部名**；形状是 `params` 表达式。
+- slot 名是**模板内局部名**；形状是 `params` 表达式；每个 slot 还带 `dtype`（缺省继承顶层，见 §3.6 #6）。
 - 模板**不含任何切分信息** —— 切分住在 `binding`（§3.4），因为那是"参数从哪来"的同一个事实（§1.4）。
 
 ### 3.3 `stack` —— 实例化，按序展开
@@ -186,7 +186,7 @@ local[d] = global[d] / Π { degree(轴) : 轴 ∈ spec.group, spec ∈ dims, nor
 ```
 
 - **接线显式**：每项的 `inputs` 是 `{局部名: 全局名}`；缺省是链式（上一项的 `outputs`）。
-  首项的 inputs 来自描述的 `inputs` 段（`input_ids` 等）。模板是函数，stack 是带实参的调用。
+  首项的 inputs 来自描述的 `inputs` 段（`input_ids` 等，语法见 §3.6 #2）。模板是函数，stack 是带实参的调用。
 - **选择只按列表下标**（§3.1），不做算术。
 - `prefix` 里的 `{l}` / `{last}` 由实例化器替换；**名字就是 slot 的标识**，唯一的寻址方式是名字模式匹配
   （这也是"不需要模块树"的依据：只有名字约定 + 模式匹配，没有东西需要遍历树）。
@@ -261,6 +261,23 @@ HF / legacy 的 checkpoint 是 `[out, in]`，所以 binding 用 `transpose` 归�
 - 每个 checkpoint tensor 要么被消费，要么在描述里显式 `"ignore": [...]`；静默丢弃 → 报错。
 - `transform` + `axes` 推出的本地形状与 slot 形状必须一致 → 否则报错。
 - `slice`/`split` 的区间必须在范围内。
+
+### 3.6 已裁定的细节（原先是空白；实现者不得自行发明）
+
+D1 的验收测试暴露了十处未定义。以下裁定**是契约的一部分**。
+
+| # | 问题 | 裁定 |
+|---|---|---|
+| 1 | 描述文件的位置与名字 | **模型目录下的 `model.json`**（与 `config.json` 同级） |
+| 2 | 顶层键 | `format`(必填) / `name`(必填) / `dtype`(可选，默认值) / `inputs`(可选) / `params` / `templates` / `stack` / `binding`。`inputs` 与 `templates.*.inputs` 同构：`{shape, kind, dtype?}` |
+| 3 | `plan explain --json` 的形状 | 顶层 `slots` 与 `nodes` 是**数组**，计数移进 `counts`：<br>`{"name","digest","world_size","counts":{"slots","nodes","steps"},"slots":[…] ,"nodes":[…] ,"implementations":[…],"collectives":[…],"memory":{…}}`。<br>这是对现有 CLI 的**破坏性修改**（今天 `slots`/`steps` 是计数、没有 `nodes`），由 D1 承担 |
+| 4 | `binding.axes` / `transform` 是否必填 | **都可省**。省 `axes` = 不切分（全局 Plan 全 `Replicate`）；省 `transform` = 恒等 |
+| 5 | dtype 词表 | 小写字符串，与 `RsDtype::name()` 一致：`f32 f16 bf16 f8e4m3 f8e5m2 fp4e2m1 i32 i64 u8` |
+| 6 | 模板 slot 是否要 dtype | **要**。`{name, kind, dtype, shape}`，缺省继承顶层 `dtype`。没有它表达不了索引输入（`embedding` 的 `i64`）——**这是本表里唯一修语言的一条** |
+| 7 | 同名冲突由谁保证 | `expand` 保证 **slot 名全 plan 唯一**（冲突时指出重复的名字与两个来源）与 **stack 实例前缀唯一** |
+| 8 | 报错是否允许 panic | **不允许**。六条错误路径都必须"非 0 退出 + stderr 说明名字 / 模式 / 路径"，不得出现 `panicked at` |
+| 9 | 二进制名 | **`rustrain`**（`crates/rustrain-cli/Cargo.toml` 加 `[[bin]] name = "rustrain"`）。文档里所有 `rustrain …` 命令以此为准 |
+| 10 | `dtype` 没有可用实现时 `explain` 的行为 | `plan explain` **不因缺实现而失败**：它在 `implementations` 里报告未解析的算子与原因，退出码仍为 0。**`check` 才要求解析成功**（那是 L1 的一部分）。这样"用真实 bf16 描述看结构"与"用 f32 跑门禁"两件事都能做 |
 
 ---
 
