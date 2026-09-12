@@ -16,7 +16,10 @@ use crate::{ABI_VERSION, PLUGIN_SYMBOL};
 pub struct PluginInner {
     /// Dropping this unmaps the `.so`; every descriptor borrowed from it
     /// becomes dangling, which is why handles hold an `Arc<PluginInner>`.
-    _library: libloading::Library,
+    /// `None` for an in-process plugin — one whose descriptors were built by
+    /// `PluginBuilder` in this binary rather than loaded from disk. Those live
+    /// as long as the process and need no keeper.
+    _library: Option<libloading::Library>,
     /// Validated descriptors, in declaration order. Keeping them here (rather
     /// than re-walking the plugin's table) means the null-slot and null-table
     /// checks happen exactly once, at load time.
@@ -132,7 +135,64 @@ impl Plugin {
 
         Ok(Self {
             inner: Arc::new(PluginInner {
-                _library: library,
+                _library: Some(library),
+                ops,
+                origin,
+                name,
+                version,
+            }),
+        })
+    }
+
+    /// Registers a plugin whose descriptors are already in this binary.
+    ///
+    /// This is the same validation path as [`Plugin::load`] minus the dynamic
+    /// linking, which makes a Rust-authored provider (see
+    /// [`crate::author::PluginBuilder`]) usable without shipping a `.so`: the
+    /// framework's own built-in operators, and any test that wants a real
+    /// registered implementation, take this route.
+    ///
+    /// # Safety
+    /// `plugin` must point at a valid `RsPlugin` whose descriptors, strings and
+    /// expansion arrays stay alive for the rest of the process — which is what
+    /// `PluginBuilder::build` guarantees by leaking them.
+    pub unsafe fn from_static(
+        plugin: &'static RsPlugin,
+        origin: impl Into<PathBuf>,
+    ) -> Result<Self> {
+        let origin = origin.into();
+
+        if plugin.abi_version != ABI_VERSION {
+            return Err(AbiError::VersionMismatch {
+                path: origin,
+                found: plugin.abi_version,
+                expected: ABI_VERSION,
+            });
+        }
+        let min_size = std::mem::size_of::<RsPlugin>() as u32;
+        if plugin.struct_size < min_size {
+            return Err(AbiError::DescriptorTooSmall {
+                path: origin,
+                found: plugin.struct_size,
+                expected: min_size,
+            });
+        }
+
+        let name = unsafe { cstr(plugin.plugin_name) }
+            .unwrap_or("<unnamed>")
+            .to_string();
+        let version = unsafe { cstr(plugin.plugin_version) }
+            .unwrap_or("<unknown>")
+            .to_string();
+
+        let ops = parse_op_table(&origin, plugin)?;
+        for (index, desc) in ops.iter().enumerate() {
+            validate_op(&origin, index, desc)?;
+        }
+
+        Ok(Self {
+            inner: Arc::new(PluginInner {
+                _library: None,
                 ops,
                 origin,
                 name,

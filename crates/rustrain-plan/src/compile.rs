@@ -105,6 +105,21 @@ pub struct CompiledPlan {
     pub inserted: Vec<InsertedCollective>,
 }
 
+impl std::fmt::Debug for CompiledPlan {
+    /// Hand-written because the steps own raw ABI attribute storage; the useful
+    /// debugging surface is the digest, the step count and the graph, all of
+    /// which are printable.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CompiledPlan")
+            .field("name", &self.plan.meta.name)
+            .field("digest", &self.digest)
+            .field("slots", &self.plan.slots.len())
+            .field("steps", &self.steps.len())
+            .field("inserted_collectives", &self.inserted.len())
+            .finish()
+    }
+}
+
 impl CompiledPlan {
     /// Human-readable rendering, intended for `rustrain plan explain`.
     pub fn explain(&self) -> String {
@@ -636,14 +651,18 @@ fn compute_digest(
     struct DigestInput<'a> {
         plan: &'a Plan,
         decisions: &'a [Decision],
-        recipe: &'a Recipe,
         parallel: &'a ParallelConfig,
     }
 
+    // The recipe enters through the decisions it produced, not as text. Two
+    // recipes that resolve to the same operators, variants and numerics describe
+    // the same run and must digest identically — otherwise a cosmetic recipe
+    // edit would make two identical runs look different, which defeats the point
+    // of recording the digest at all.
+    let _ = recipe;
     let input = DigestInput {
         plan,
         decisions: &decisions,
-        recipe,
         parallel,
     };
     let json = serde_json::to_vec(&input).map_err(|e| PlanError::Digest(e.to_string()))?;

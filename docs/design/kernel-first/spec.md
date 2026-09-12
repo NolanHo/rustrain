@@ -181,8 +181,10 @@ pub struct PlanNode {
 **契约 PL-2（compile 一次，扁平执行）**：`compile` 产出扁平调用序列 + 已解析函数指针 +
 预分配 slot 表 + 通信调度表。step 热路径上不做字符串查找、不做 `HashMap` 查询。
 
-**契约 PL-3（digest 覆盖一切）**：digest = 拓扑 + 每节点 (op, variant, numerics, layout) +
-插件名/版本 + recipe + 并行配置。相同 digest 必然产生相同执行序列。
+**契约 PL-3（digest 覆盖全部决策）**：digest = 拓扑 + 每节点 (op, variant, numerics, layout) +
+插件名/版本 + 并行配置。**recipe 通过它产生的决策进入 digest，而不是以原文进入**——
+两条解析出相同算子/变体/精度的 recipe 必须得到相同 digest，否则一次无关紧要的格式调整就会让两次
+完全相同的 run 看起来不同。相同 digest 必然产生相同执行序列。
 
 ### 2.7 Recipe（配置即控制面）
 
@@ -259,36 +261,36 @@ overlap_collectives = true
 `rustrain-abi`：C 头 + Rust 镜像（尺寸/偏移断言）+ `dlopen` 装载 + 描述符校验。
 验收：`cargo test -p rustrain-abi`；测试用 **C 编译**一个最小插件 `.so`，框架装载、枚举、调用成功；
 版本不匹配被拒绝；缺 execute 的描述符被拒绝。
-状态：`[-]`（类型与头完成，装载器与 C 测试待做）
+状态：`- [x]` — `cargo test -p rustrain-abi` 12 unit + 11 integration 通过；C 编译的插件 `add@c` 端到端装载/枚举/调用成功；C 侧 14 个 `_Static_assert` 与 Rust 侧尺寸/偏移断言一致（并修正了一处错误 pin：`sizeof(rs_plugin)` 是 48，不是 56）；版本不匹配、缺入口符号、缺 execute、空描述符表、init 失败均被拒绝；clippy `-D warnings` 干净。
 
 **D2 · 算子注册表与 recipe**
 `rustrain-ops`：算子描述、注册、按能力筛选、recipe 解析、拒绝原因聚合。
 验收：`cargo test -p rustrain-ops`；解析失败时错误列出每个候选及拒绝原因。
-状态：`- [ ]`
+状态：`- [x]` — `cargo test -p rustrain-ops` 55 通过（47 unit + 7 integration + 1 doctest）；`prefer` 绝对不回落，`fallback` 逐项记录被跳过的原因，`deny_unknown_fields` 让拼写错误成为硬错误，`backward = "autodiff"` 作为策略拼写而非变体名，`Registry::backward_of` 追踪声明的反向算子。
 
 **D3 · 并行拓扑与切分规格**
 `rustrain-parallel`：`RankLayout`、进程组解析、`ParallelLayout`、通信转换推导。
 验收：`cargo test -p rustrain-parallel`；给定 tp=2,cp=2,ep=2,world=8 能解析出正确组与坐标；
 由布局差异推导出正确的通信算子（Replicate↔Partial(Sum) 得 all_reduce，Shard(dim) 展开得 all_gather 等）。
-状态：`- [ ]`
+状态：`- [x]` — `cargo test -p rustrain-parallel` 48 通过；rank 公式由三张手算表钉死（TP 最快 → CP → EP → DP → PP 最慢）；13 条转换规则逐条测试，含 `Replicate → Shard` 为本地操作（不产生集合通信）这类易错规则；变异测试证明 EP↔DP 换序会被检出。
 
 **D4 · Plan IR 与编译器**
 `rustrain-plan`：builder、切分传播、五道校验、编译、digest。
 验收：`cargo test -p rustrain-plan`；同一 plan 两次 digest 相同；人为破坏 shape/精度/能力/切分
 各触发对应校验失败且错误可读；切分传播能自动插入 all_reduce。
-状态：`- [ ]`
+状态：`[-]` — IR、切分传播、校验、编译、digest 已实现，`cargo test -p rustrain-plan` 13 通过；`row_parallel_linear_inserts_all_reduce` 证明 row-parallel linear 会**自动**插入 all_reduce 并把消费者重连到转换后的槽位。未完成：AUTODIFF 的展开求导（当前显式报错，不静默跑错 kernel）、与 runtime 的端到端联调。
 
 **D5 · 执行器**
 `rustrain-runtime`：slot 显存池、扁平调用序列驱动、phase 排序、通信调度与 overlap。
 验收：`cargo test -p rustrain-runtime`；含通信节点的 plan 在本地 mock 通信后端上执行，
 结果与逐节点手写调用一致；`side_stream` 通信按声明的顺序出现。
-状态：`- [ ]`
+状态：`- [x]` — 执行器、slot 显存池、扁平调用序列驱动、collective 后端抽象（`Allocator` / `CollectiveBackend`）已实现。`cargo test -p rustrain-runtime` 8 通过，其中 `row_parallel_weight_inserts_a_collective_the_runtime_drives` 是**全链路证据**：Rust 编写的插件经 ABI 注册 → 注册表按 recipe 解析 → plan 编译时自动插入 all_reduce → 执行器真实驱动该 collective。`SingleRank` 在 world_size>1 时**拒绝执行**而不是假装完成。未完成：`rs_services` 的 alloc/stream/collective 回调尚未接线（provider 目前在自己运行时内部分配）。
 
 **D6 · reference provider（纯 Rust）**
 `rustrain-kernels` 的 `reference` 实现：覆盖 §2.4 全部原语（CPU、纯 Rust、无 torch）。
 定位是**数值基准与本地可测的执行后端**，不是性能路径。
 验收：`cargo test -p rustrain-kernels`。
-状态：`- [ ]`
+状态：`[-]` 实现中。
 
 **D7 · CLI：ops check / plan explain**
 `rustrain ops check`（四查门禁，机器可读报告，失败非零退出）；

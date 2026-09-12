@@ -573,6 +573,19 @@ pub struct RsPlugin {
 
 pub type RustrainPluginV1Fn = unsafe extern "C" fn() -> *const RsPlugin;
 
+// A plugin descriptor is published once and then read by the framework from
+// whichever thread resolves or executes an operator. The ABI requires it to be
+// immutable after publication (contract C-1: the entry point returns a pointer
+// to a process-lifetime table), so sharing it across threads is sound.
+//
+// This does NOT make the plugin's *implementation* thread-safe: whether
+// `execute` may be called concurrently is the plugin's own contract, and
+// `rs_op_desc.execute` documents it.
+unsafe impl Send for RsPlugin {}
+unsafe impl Sync for RsPlugin {}
+unsafe impl Send for RsOpDesc {}
+unsafe impl Sync for RsOpDesc {}
+
 /// Reads a NUL-terminated C string as `&str`, returning `None` for null.
 ///
 /// # Safety
