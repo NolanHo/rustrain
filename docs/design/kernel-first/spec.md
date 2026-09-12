@@ -296,6 +296,61 @@ kv_paging   = "block"
 kv_block    = 64
 ```
 
+
+### 2.11 反向推导
+
+**三种反向语义，一套机制**：
+
+| `rs_backward_kind` | 谁提供 | 用途 |
+|---|---|---|
+| `EXPLICIT` | 注册的反向实现（通常是融合 kernel） | 性能路径 |
+| `AUTODIFF` | 由其声明的 `expansion` 推导 | 组合路径与验收基准 |
+| `NONDIFF` | 无 | 梯度不流过 |
+
+妙处在于 `AUTODIFF` 推导出的反向**正好是 `EXPLICIT` 反向的验收基准** —— §2.8 的"展开等价"检查即是此用。
+三者不是三套机制，而是一套机制加一道数值门禁。
+
+**契约 B-1（推导机制）**：反向拓扑遍历 forward 图。每个节点按其 `backward` 种类展开：
+`EXPLICIT` 发一个调用已注册反向实现的节点；`AUTODIFF` 对其 `expansion` 递归发 VJP 片段；
+`NONDIFF` 的输出若存在非空伴随即为错误。一个 slot 有多个消费者时，在汇合处插入累积节点。
+
+**契约 B-2（VJP 表在框架侧，融合的 VJP 来自 expansion）**：原语词表由框架拥有（与 `shard_rule`
+同一理由），所以原语的 VJP 规则也在框架侧。复合/融合算子不单独声明 VJP —— 它的 VJP 由自己声明的
+`expansion` 推导（契约 R-4）。因此 R-4 不是"可选的文档"，而是反向可用性的前提。
+
+**契约 B-3（save-for-backward 不是独立机制）**：ABI 的 `RsMemReq.save_for_backward_bytes` 不需要
+单独实现。"为反向保存激活"就是**该 slot 的最后一个消费者落在 backward 阶段**，而 `MemoryPlan`
+已经在算寿命。保存、释放、重算的显存账自动正确，不需要一套与 plan 并行的 checkpointing 子系统。
+（旧代码正是在这里长出了 `QWEN36_SUBCKPT` / `megakernel` / `OFFLOAD_ACTIVATIONS` 三条手写路径。）
+
+**契约 B-4（反向必须重跑切分传播）**：通信算子的伴随关系是
+`all_reduce` 自伴随、`all_gather ↔ reduce_scatter`。反向图的结构与前向不同，切分需求也不同，
+因此 **`shard::propagate` 必须在反向图生成之后对整张图再跑一次**。只对前向传播、反向复用其结论，
+在并行训练下必然错。
+
+**契约 B-5（量化在反向是策略，不是导数）**：FP8 训练惯例是直通估计（STE）—— 量化器的"导数"为 1，
+梯度走高精度。因此 `quantize` / `dequantize` 的 VJP 由一个有名字的策略决定
+（`straight_through` | `zero` | `custom`），而不是数学推导出来的。这是"配置控制精度与量化"在反向侧的落点。
+
+**契约 B-6（adjoint 存储模型 —— 镜像 + 寿命驱动释放）**：每个需要梯度的 forward slot 配一个伴随 slot，
+反向图是前向图的镜像。伴随 slot 的寿命由 `MemoryPlan` 自然给出（其最后消费者即最后一次累积），
+不需要引用计数。选它是因为零新增机制，且与显存规划共用同一本账。
+
+**契约 B-7（确定性）**：反向图是 forward 图与 VJP 表的纯函数，因此同一 forward 图必得同一反向图，
+并可进入 digest。
+
+**前置条件：词表缺口。** 照现有 §2.4 词表无法写出下列 VJP，必须先补：
+
+| 缺什么 | 谁需要 |
+|---|---|
+| `reduce` 的 `keepdim` | softmax / layernorm 的 VJP |
+| `rsqrt` / `pow` | rmsnorm 的 VJP |
+| 比较与 mask（`where` / `select`） | max-reduce 的 VJP、带 mask 的 loss |
+| 激活函数的导数 kind | silu′ / gelu′ —— 否则 `elementwise_unary` 的 VJP 写不出来 |
+| `scatter_add` | 部分累积（`scatter` 是覆盖语义） |
+
+词表定不下来，VJP 就写不出来，所以这是 P3 的**前置条件**而非后续优化。
+
 ---
 
 ## 3. 交付物
@@ -403,6 +458,24 @@ KV 按 block 分页。为 rollout / 有状态注意力 / ring attention 提供�
 状态：`- [ ]`
 
 
+**D16 · 词表补全与 VJP 表**
+补上 §2.11 列出的词汇缺口（`reduce.keepdim`、`rsqrt`/`pow`、比较与 mask、激活导数 kind、`scatter_add`），
+并在 `rustrain-plan` 建立原语 VJP 表。`rustrain-kernels` 的 reference provider 为每个新原语提供实现。
+验收：`cargo test -p rustrain-kernels`；每个新原语的 VJP 与有限差分一致（容差内）。
+状态：`- [ ]`
+
+**D17 · `derive_backward` pass**
+反向拓扑遍历 + 三种 `backward` 种类展开 + 汇合处累积 + 对整图重跑切分传播 + 进入 digest。
+验收：`cargo test -p rustrain-plan`；小 MLP 的推导反向与手写反向逐位一致（同一次序）；
+前向的一对 column/row-parallel linear 在反向图上得到**位置正确**的通信；同一 forward 图两次推导 digest 相同。
+状态：`- [ ]`
+
+**D18 · explicit 反向 ≈ 推导反向**
+把 `ops check` 的等价检查从"融合 ≈ 展开"扩展到"`EXPLICIT` 反向 ≈ 推导反向"。
+验收：`rustrain ops check` 对至少一个声明了显式反向的算子执行该检查并通过；故意注入不一致会被检出。
+状态：`- [ ]`
+
+
 ---
 
 ## 4. 依赖与门
@@ -412,6 +485,8 @@ KV 按 block 分页。为 rollout / 有状态注意力 / ring attention 提供�
 - **依赖**：D2←D1；D4←D2,D3；D5←D4；D7←D1..D6；D13←D4；D14←D13；D15←D13。
 - **门 G3**：D13/D14 在 D9（端到端训练）**之前**完成。否则第一次真实训练就会用手改代码绕开它，
   而绕过一次之后就不会再回来。
+- **门 G4**：D16 是 D17 的前置 —— 词表缺一个原语，对应算子的 VJP 就写不出来。
+- **门 G5**：D17 在 D9 之前。没有推导反向，"训练"无从谈起。
 - **环境事实**：本机有 `cargo 1.96`，**无 torch、无 CUDA、无 GPU**。P0 必须能在本机完整验证。
 - **验证宿主**：`root@47.94.214.197:26002`（8× NVIDIA L20X 143GB，sm_89，CUDA 13.0 + nvcc，
   torch 2.11.0+cu130，1600GB RAM，Rust 1.98.1 已装）。
@@ -431,6 +506,9 @@ KV 按 block 分页。为 rollout / 有状态注意力 / ring attention 提供�
 | **并行切分进 plan，通信由传播插入** | 用户确认"编排第一公民"；避免 Megatron 式手写通信 |
 | **显存策略进 plan，峰值编译期门禁** | 用户要求"显存管理机制要可控"；旧代码这一维有 6 个 env var |
 | **state（含 KV）是独立槽位类别** | 用户点名 KV cache；其容量/分页语义与激活不同 |
+| **反向由 plan 推导（非新增层、非全手工）** | 用户 P3 决策；`expansion` 因此真正承重 |
+| **VJP 表在框架侧，融合的 VJP 来自 expansion** | 与原语的切分规则同一理由：词表归框架所有 |
+| **反向必须重跑切分传播** | `all_gather ↔ reduce_scatter` 伴随关系使反向的切分需求与前向不同 |
 | 验证必须在 `47.94.214.197:26002` | 用户明确指定 |
 | 旧 rustrain 副本与 legacy kernel 源码已删除 | 用户明确要求（归档中保全） |
 
