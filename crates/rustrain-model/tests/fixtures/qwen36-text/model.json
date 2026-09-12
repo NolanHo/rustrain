@@ -13,7 +13,7 @@
   },
   "params": {
     "seq": {
-      "from": "text_config.max_position_embeddings"
+      "expr": "512"
     },
     "layers": {
       "from": "text_config.num_hidden_layers"
@@ -419,6 +419,7 @@
         {
           "name": "h1",
           "kind": "activation",
+          "dtype": "bf16",
           "shape": [
             "seq",
             "hidden"
@@ -427,6 +428,7 @@
         {
           "name": "q",
           "kind": "activation",
+          "dtype": "bf16",
           "shape": [
             "seq",
             "lin_qk"
@@ -435,6 +437,7 @@
         {
           "name": "k",
           "kind": "activation",
+          "dtype": "bf16",
           "shape": [
             "seq",
             "lin_qk"
@@ -443,6 +446,7 @@
         {
           "name": "v",
           "kind": "activation",
+          "dtype": "bf16",
           "shape": [
             "seq",
             "lin_v"
@@ -451,6 +455,7 @@
         {
           "name": "cq",
           "kind": "activation",
+          "dtype": "bf16",
           "shape": [
             "seq",
             "lin_qk"
@@ -459,6 +464,7 @@
         {
           "name": "ck",
           "kind": "activation",
+          "dtype": "bf16",
           "shape": [
             "seq",
             "lin_qk"
@@ -467,6 +473,7 @@
         {
           "name": "cv",
           "kind": "activation",
+          "dtype": "bf16",
           "shape": [
             "seq",
             "lin_v"
@@ -475,6 +482,7 @@
         {
           "name": "z",
           "kind": "activation",
+          "dtype": "bf16",
           "shape": [
             "seq",
             "lin_v"
@@ -483,6 +491,7 @@
         {
           "name": "a",
           "kind": "activation",
+          "dtype": "bf16",
           "shape": [
             "seq",
             "lin_v_heads"
@@ -491,6 +500,7 @@
         {
           "name": "b",
           "kind": "activation",
+          "dtype": "bf16",
           "shape": [
             "seq",
             "lin_v_heads"
@@ -499,6 +509,7 @@
         {
           "name": "dt",
           "kind": "activation",
+          "dtype": "bf16",
           "shape": [
             "seq",
             "lin_v_heads"
@@ -507,6 +518,7 @@
         {
           "name": "sp",
           "kind": "activation",
+          "dtype": "bf16",
           "shape": [
             "seq",
             "lin_v_heads"
@@ -515,6 +527,7 @@
         {
           "name": "aneg",
           "kind": "activation",
+          "dtype": "bf16",
           "shape": [
             "lin_v_heads"
           ]
@@ -522,6 +535,7 @@
         {
           "name": "g",
           "kind": "activation",
+          "dtype": "bf16",
           "shape": [
             "seq",
             "lin_v_heads"
@@ -530,6 +544,7 @@
         {
           "name": "beta",
           "kind": "activation",
+          "dtype": "bf16",
           "shape": [
             "seq",
             "lin_v_heads"
@@ -538,6 +553,7 @@
         {
           "name": "qn",
           "kind": "activation",
+          "dtype": "bf16",
           "shape": [
             "seq",
             "lin_qk"
@@ -546,6 +562,7 @@
         {
           "name": "kn",
           "kind": "activation",
+          "dtype": "bf16",
           "shape": [
             "seq",
             "lin_qk"
@@ -554,6 +571,7 @@
         {
           "name": "gdn",
           "kind": "activation",
+          "dtype": "bf16",
           "shape": [
             "seq",
             "lin_v"
@@ -562,6 +580,7 @@
         {
           "name": "gsilu",
           "kind": "activation",
+          "dtype": "bf16",
           "shape": [
             "seq",
             "lin_v"
@@ -570,6 +589,7 @@
         {
           "name": "gated",
           "kind": "activation",
+          "dtype": "bf16",
           "shape": [
             "seq",
             "lin_v"
@@ -578,6 +598,7 @@
         {
           "name": "normed",
           "kind": "activation",
+          "dtype": "bf16",
           "shape": [
             "seq",
             "lin_v"
@@ -586,6 +607,7 @@
         {
           "name": "attn",
           "kind": "activation",
+          "dtype": "bf16",
           "shape": [
             "seq",
             "hidden"
@@ -594,6 +616,7 @@
         {
           "name": "h2",
           "kind": "activation",
+          "dtype": "bf16",
           "shape": [
             "seq",
             "hidden"
@@ -602,6 +625,7 @@
         {
           "name": "h3",
           "kind": "activation",
+          "dtype": "bf16",
           "shape": [
             "seq",
             "hidden"
@@ -610,6 +634,7 @@
         {
           "name": "rlogits",
           "kind": "activation",
+          "dtype": "bf16",
           "shape": [
             "seq",
             "experts"
@@ -618,6 +643,7 @@
         {
           "name": "routing",
           "kind": "activation",
+          "dtype": "bf16",
           "shape": [
             "seq",
             "topk"
@@ -626,6 +652,7 @@
         {
           "name": "moe",
           "kind": "activation",
+          "dtype": "bf16",
           "shape": [
             "seq",
             "hidden"
@@ -1150,6 +1177,7 @@
         {
           "name": "h1",
           "kind": "activation",
+          "dtype": "bf16",
           "shape": [
             "seq",
             "hidden"
@@ -1158,6 +1186,7 @@
         {
           "name": "q",
           "kind": "activation",
+          "dtype": "bf16",
           "shape": [
             "seq",
             "q_size"
@@ -1166,6 +1195,7 @@
         {
           "name": "qg",
           "kind": "activation",
+          "dtype": "bf16",
           "shape": [
             "seq",
             "q_size"
@@ -1174,6 +1204,7 @@
         {
           "name": "k",
           "kind": "activation",
+          "dtype": "bf16",
           "shape": [
             "seq",
             "kv_size"
@@ -1182,6 +1213,7 @@
         {
           "name": "v",
           "kind": "activation",
+          "dtype": "bf16",
           "shape": [
             "seq",
             "kv_size"
@@ -1190,6 +1222,7 @@
         {
           "name": "qn",
           "kind": "activation",
+          "dtype": "bf16",
           "shape": [
             "seq",
             "head_dim"
@@ -1198,6 +1231,7 @@
         {
           "name": "kn",
           "kind": "activation",
+          "dtype": "bf16",
           "shape": [
             "seq",
             "head_dim"
@@ -1206,6 +1240,7 @@
         {
           "name": "qr",
           "kind": "activation",
+          "dtype": "bf16",
           "shape": [
             "seq",
             "head_dim"
@@ -1214,6 +1249,7 @@
         {
           "name": "kr",
           "kind": "activation",
+          "dtype": "bf16",
           "shape": [
             "seq",
             "head_dim"
@@ -1222,6 +1258,7 @@
         {
           "name": "o",
           "kind": "activation",
+          "dtype": "bf16",
           "shape": [
             "seq",
             "q_size"
@@ -1230,6 +1267,7 @@
         {
           "name": "gact",
           "kind": "activation",
+          "dtype": "bf16",
           "shape": [
             "seq",
             "q_size"
@@ -1238,6 +1276,7 @@
         {
           "name": "og",
           "kind": "activation",
+          "dtype": "bf16",
           "shape": [
             "seq",
             "q_size"
@@ -1246,6 +1285,7 @@
         {
           "name": "attn",
           "kind": "activation",
+          "dtype": "bf16",
           "shape": [
             "seq",
             "hidden"
@@ -1254,6 +1294,7 @@
         {
           "name": "h2",
           "kind": "activation",
+          "dtype": "bf16",
           "shape": [
             "seq",
             "hidden"
@@ -1262,6 +1303,7 @@
         {
           "name": "h3",
           "kind": "activation",
+          "dtype": "bf16",
           "shape": [
             "seq",
             "hidden"
@@ -1270,6 +1312,7 @@
         {
           "name": "rlogits",
           "kind": "activation",
+          "dtype": "bf16",
           "shape": [
             "seq",
             "experts"
@@ -1278,6 +1321,7 @@
         {
           "name": "routing",
           "kind": "activation",
+          "dtype": "bf16",
           "shape": [
             "seq",
             "topk"
@@ -1286,6 +1330,7 @@
         {
           "name": "moe",
           "kind": "activation",
+          "dtype": "bf16",
           "shape": [
             "seq",
             "hidden"
@@ -1576,6 +1621,7 @@
         {
           "name": "en",
           "kind": "activation",
+          "dtype": "bf16",
           "shape": [
             "seq",
             "hidden"
@@ -1584,6 +1630,7 @@
         {
           "name": "hn",
           "kind": "activation",
+          "dtype": "bf16",
           "shape": [
             "seq",
             "hidden"
@@ -1592,6 +1639,7 @@
         {
           "name": "cat",
           "kind": "activation",
+          "dtype": "bf16",
           "shape": [
             "seq",
             "mtp_fc_in"
@@ -1687,6 +1735,7 @@
         {
           "name": "hn",
           "kind": "activation",
+          "dtype": "bf16",
           "shape": [
             "seq",
             "hidden"

@@ -46,7 +46,17 @@ fn tiny() -> ModelDesc {
                     { "name": "mlp_norm", "kind": "weight", "shape": ["hidden"] },
                     { "name": "wg", "kind": "weight", "shape": ["hidden", "inter"] },
                     { "name": "wu", "kind": "weight", "shape": ["hidden", "inter"] },
-                    { "name": "wd", "kind": "weight", "shape": ["inter", "hidden"] }
+                    { "name": "wd", "kind": "weight", "shape": ["inter", "hidden"] },
+                    { "name": "h1", "kind": "activation", "dtype": "f32", "shape": ["seq", "hidden"] },
+                    { "name": "q", "kind": "activation", "dtype": "f32", "shape": ["seq", "hidden"] },
+                    { "name": "qa", "kind": "activation", "dtype": "f32", "shape": ["seq", "hidden"] },
+                    { "name": "attn", "kind": "activation", "dtype": "f32", "shape": ["seq", "hidden"] },
+                    { "name": "h2", "kind": "activation", "dtype": "f32", "shape": ["seq", "hidden"] },
+                    { "name": "h3", "kind": "activation", "dtype": "f32", "shape": ["seq", "hidden"] },
+                    { "name": "g", "kind": "activation", "dtype": "f32", "shape": ["seq", "inter"] },
+                    { "name": "gs", "kind": "activation", "dtype": "f32", "shape": ["seq", "inter"] },
+                    { "name": "u", "kind": "activation", "dtype": "f32", "shape": ["seq", "inter"] },
+                    { "name": "gu", "kind": "activation", "dtype": "f32", "shape": ["seq", "inter"] }
                 ],
                 "nodes": [
                     { "op": "rmsnorm", "in": ["x", "attn_norm"], "out": ["h1"] },
@@ -117,10 +127,13 @@ fn expands_the_stack_with_chained_wiring() {
     // 实例端口接的是已存在的全局 slot，不会为每个实例新造一个 `layers.N.x`。
     assert!(plan.slot_id("layers.0.x").is_none());
 
-    // 中间激活没有声明形状 → 继承第一个输入。
+    // 中间激活在模板里显式声明（§3.7 #1），形状来自声明本身。
     let h1 = plan.slot_id("layers.0.h1").unwrap();
     assert_eq!(plan.slot(h1).shape, vec![8, 16]);
     assert_eq!(plan.slot(h1).kind, SlotKind::Activation);
+    // MLP 中间激活有自己的形状（`inter = 2 * hidden`），不是第一个输入的形状。
+    let g = plan.slot_id("layers.0.g").unwrap();
+    assert_eq!(plan.slot(g).shape, vec![8, 32]);
     // 声明的 output 用自己的形状。
     let y = plan.slot_id("layers.0.y").unwrap();
     assert_eq!(plan.slot(y).shape, vec![8, 16]);
@@ -297,6 +310,27 @@ fn a_duplicate_slot_name_names_both_origins() {
     assert!(text.contains("norm_in.w"), "{text}");
     assert!(text.contains("declared twice"), "{text}");
     assert!(text.contains("template slot `w`"), "{text}");
+}
+
+#[test]
+fn a_node_writing_an_undeclared_slot_is_rejected() {
+    let mut desc = tiny();
+    let decoder = desc.templates.get_mut("decoder").unwrap();
+    // `h9` 既不是模板 slot，也不是这个实例的 output：没有声明的地方，也没有可继承的形状。
+    decoder.nodes[0].outputs = vec!["h9".to_string()];
+    let err = expand(&desc, &config()).unwrap_err();
+    assert!(matches!(err, ModelError::Invalid(_)), "{err}");
+}
+
+#[test]
+fn the_undeclared_slot_error_names_the_template_and_the_name() {
+    let mut desc = tiny();
+    let decoder = desc.templates.get_mut("decoder").unwrap();
+    decoder.nodes[0].outputs = vec!["h9".to_string()];
+    let err = expand(&desc, &config()).unwrap_err();
+    let text = err.to_string();
+    assert!(text.contains("decoder"), "报错必须指出模板名: {text}");
+    assert!(text.contains("h9"), "报错必须指出未声明的名字: {text}");
 }
 
 #[test]

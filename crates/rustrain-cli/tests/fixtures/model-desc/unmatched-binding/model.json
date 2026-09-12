@@ -32,7 +32,17 @@
         { "name": "mlp_norm", "kind": "weight", "shape": ["hidden"] },
         { "name": "wg", "kind": "weight", "shape": ["hidden", "inter"] },
         { "name": "wu", "kind": "weight", "shape": ["hidden", "inter"] },
-        { "name": "wd", "kind": "weight", "shape": ["inter", "hidden"] }
+        { "name": "wd", "kind": "weight", "shape": ["inter", "hidden"] },
+        { "name": "h1", "kind": "activation", "dtype": "f32", "shape": ["seq", "hidden"] },
+        { "name": "q", "kind": "activation", "dtype": "f32", "shape": ["seq", "hidden"] },
+        { "name": "qa", "kind": "activation", "dtype": "f32", "shape": ["seq", "hidden"] },
+        { "name": "attn", "kind": "activation", "dtype": "f32", "shape": ["seq", "hidden"] },
+        { "name": "h2", "kind": "activation", "dtype": "f32", "shape": ["seq", "hidden"] },
+        { "name": "h3", "kind": "activation", "dtype": "f32", "shape": ["seq", "hidden"] },
+        { "name": "g", "kind": "activation", "dtype": "f32", "shape": ["seq", "inter"] },
+        { "name": "gs", "kind": "activation", "dtype": "f32", "shape": ["seq", "inter"] },
+        { "name": "u", "kind": "activation", "dtype": "f32", "shape": ["seq", "inter"] },
+        { "name": "gu", "kind": "activation", "dtype": "f32", "shape": ["seq", "inter"] }
       ],
       "nodes": [
         { "op": "rmsnorm", "in": ["x", "attn_norm"], "out": ["h1"] },

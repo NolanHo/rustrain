@@ -202,7 +202,7 @@ impl<'a> Expander<'a> {
                 index_var,
                 &chained,
             )?;
-            chained = self.expand_instance(&prefix, template, &wiring)?;
+            chained = self.expand_instance(&prefix, &template_name, template, &wiring)?;
         }
         self.prev_outputs = chained;
         Ok(())
@@ -286,6 +286,7 @@ impl<'a> Expander<'a> {
     fn expand_instance(
         &mut self,
         prefix: &str,
+        template_name: &str,
         template: &Template,
         wiring: &BTreeMap<String, SlotId>,
     ) -> Result<Vec<SlotId>, ModelError> {
@@ -307,6 +308,7 @@ impl<'a> Expander<'a> {
         for (node_index, node) in template.nodes.iter().enumerate() {
             self.emit_node(
                 prefix,
+                template_name,
                 template,
                 node_index,
                 node,
@@ -329,9 +331,11 @@ impl<'a> Expander<'a> {
         Ok(outputs)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn emit_node(
         &mut self,
         prefix: &str,
+        template_name: &str,
         template: &Template,
         node_index: usize,
         node: &NodeDecl,
@@ -365,8 +369,14 @@ impl<'a> Expander<'a> {
                     "instance `{prefix}`: `{name}` is written by more than one node"
                 )));
             }
+
+            // §3.7 #1：节点的 `out` 只能引用模板已声明的 slot 或该实例声明的 `outputs`。
+            // **不能**由编译器 infer 回填（旧实现继承本节点第一个输入的形状）：那会让无 GPU 的
+            // L1 形状检查依赖"存在可解析的实现"，而真实描述是 bf16、reference provider 只有 f32 ——
+            // 整条 L1 就废了，而 L1 正是这套架构存在的理由。
+            let declared_slot = template.slots.iter().any(|decl| decl.name == *name);
             let id = match local.get(name) {
-                Some(id) => {
+                Some(id) if declared_slot => {
                     // 权重不是算子的产物：写到 weight slot 上说明描述把两件事混了。
                     let (kind, _) = self.info(*id);
                     if !matches!(
@@ -381,26 +391,19 @@ impl<'a> Expander<'a> {
                     }
                     *id
                 }
-                None => {
-                    let (dtype, kind, shape) = match template.outputs.get(name) {
-                        Some(port) => (
-                            self.dtype_of(port.dtype.as_deref())?,
-                            parse_kind(&port.kind)?,
-                            self.shape_of(&port.shape)?,
-                        ),
-                        None => {
-                            // §3.2 没有声明中间激活形状的位置：继承本节点第一个输入的形状。
-                            let first = *inputs.first().ok_or_else(|| {
-                                ModelError::Invalid(format!(
-                                    "instance `{prefix}`: node {node_index} (`{}`) produces `{name}` \
-                                     without a declared shape and takes no input to inherit one from",
-                                    node.op
-                                ))
-                            })?;
-                            let (_, shape) = self.info(first);
-                            (self.default_dtype, SlotKind::Activation, shape)
-                        }
+                _ => {
+                    // 只剩一种合法来源：该实例声明的 `outputs`（首次被写时才分配 slot）。
+                    let Some(port) = template.outputs.get(name) else {
+                        return Err(ModelError::Invalid(format!(
+                            "instance `{prefix}`: node {node_index} (`{}`) writes `{name}`, which \
+                             template `{template_name}` declares neither as a slot nor as an \
+                             output (§3.7 #1)",
+                            node.op
+                        )));
                     };
+                    let dtype = self.dtype_of(port.dtype.as_deref())?;
+                    let kind = parse_kind(&port.kind)?;
+                    let shape = self.shape_of(&port.shape)?;
                     let global = format!("{prefix}.{name}");
                     let origin = format!(
                         "instance `{prefix}`, output `{name}` of node {node_index} (`{}`)",
