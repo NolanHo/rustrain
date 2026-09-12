@@ -192,33 +192,67 @@ local[d] = global[d] / Π { degree(轴) : 轴 ∈ spec.group, spec ∈ dims, nor
 
 ### 3.4 `binding` —— 参数映射，也就是 L2 的定义
 
+**方向约定（必须写死）**：`axes` 永远指 **slot 的维度**，即 kernel 看到的那个张量。
+`linear` 的权重在 slot 方向是 `[K, N]`（收缩维在前，由 reference provider 固定）；
+HF / legacy 的 checkpoint 是 `[out, in]`，所以 binding 用 `transpose` 归一化。
+
 ```jsonc
 "binding": [
+  // HF [out, in] -> slot [in, out] = [K, N]
   { "slot":   "layers.*.self_attn.q_proj.weight",
     "source": "model.layers.{*}.self_attn.q_proj.weight",
-    "transform": [],
-    "axes": { "0": ["tp"] } },
+    "transform": ["transpose(0,1)"],
+    "axes": { "1": ["tp"] } },                       // column：切 N
 
+  { "slot":   "layers.*.self_attn.o_proj.weight",
+    "source": "model.layers.{*}.self_attn.o_proj.weight",
+    "transform": ["transpose(0,1)"],
+    "axes": { "0": ["tp"] } },                       // row：切 K -> partial
+
+  // 三通道专家权重：HF [E, out, in] -> slot [E, in, out]
   { "slot":   "layers.*.mlp.experts.gate_up_proj",
     "source": "model.layers.{*}.mlp.experts.gate_up_proj",
-    "transform": [],
-    "axes": { "0": ["ep"], "1": ["tp"] } },
+    "transform": ["transpose(1,2)"],
+    "axes": { "0": ["ep"], "2": ["tp"] } },
 
-  { "slot":   "layers.*.mlp.experts.down_proj",
-    "source": "model.layers.{*}.mlp.experts.down_proj",
-    "transform": [],
-    "axes": { "0": ["ep"], "2": ["tp"] } }
+  // 一个 source -> 多个 slot：fused [gate|up] 在 [gate|up] 布局下按 tp 连续切是错的
+  // （rank 0 会拿到全部 gate 行、rank 1 拿到全部 up 行，本地算不出来）。
+  // 拆成两个 slot 各自声明分片；"融合存储"与"融合计算"是两件事，kernel 仍可同时读两个指针做融合。
+  { "source": "model.layers.{*}.mlp.experts.gate_up_proj",
+    "transform": ["transpose(1,2)"],
+    "split": { "dim": 2, "sizes": ["moe_i", "moe_i"] },
+    "targets": [
+      { "slot": "layers.*.mlp.experts.gate_proj", "axes": { "0": ["ep"], "2": ["tp"] } },
+      { "slot": "layers.*.mlp.experts.up_proj",   "axes": { "0": ["ep"], "2": ["tp"] } }
+    ] }
 ]
 ```
 
 - `slot` / `source` 的 `*` 是**共享捕获**：两边同一个 `{*}` 指同一个下标段。
-- **`axes` 指的是 slot 的维度**（kernel 看到的那个张量），不是 checkpoint 的维度；
-  `transform` 负责 checkpoint → slot 的映射。这样"切哪一维"无歧义。
-- `transform` 词表：`take(name)` / `slice(dim, range)` / `transpose(i, j)` / `split(dims, sizes)` / `concat(dim)`。
+- `transform` 词表：`take(name)` / `slice(dim, range)` / `transpose(i, j)` / `split(dim, sizes)` / `concat(dim)`。
   这五种覆盖了 Megatron 用到的全部机制（前缀重命名、按轴切片、MLA 的 `cat([q, kv])`）。
 - `axes` 里是**符号轴名**；instantiate 时解析成 `GroupMask` 并执行 §2.2 的除法。
 - **切分轴住在这里**：不是模板，也不是框架侧规则表（I-5 / P6）。它与"从 checkpoint 取哪一块"
   是同一条事实，所以必须同一处声明、同一处被加载器与形状算术读取。
+
+### 3.4.1 EXPLICIT 算子的 `collectives` 声明
+
+有些通信**推不出来**，只能声明，因为它是数据依赖的或跨 rank 的：
+
+| 场景 | 通信 | 为什么推不出来 |
+|---|---|---|
+| MoE dispatch / combine | `all_to_all({tp, ep})` | 目标 rank 由 router 的运行期 top-k 决定 |
+| GDN 的 chunkwise CP | `all_gather({cp})` + fp32 链式 merge | 跨 chunk 的仿射映射必须在 rank 间传播 |
+| 全注意力的 CP | `all_gather({cp})` / ring | 每个 rank 需要完整 KV |
+
+形式：算子在描述符里声明 `collectives: [{ kind: "all_to_all", group: "tp|ep" }]`。
+
+**校验（能查的都要查，查不到的要诚实）**：
+- ✅ 声明的组的轴，必须是该张量**实际被切分的轴**之一 —— 在一个没有切分的轴上做 all_to_all 是错的。
+- ✅ 组的轴必须在 mesh 里存在（度数 > 1）。
+- ✅ 通信两侧的 layout 与本地形状必须自洽。
+- ❌ **不能**验证它的正确性（数据依赖的 routing 对不对、仿射 merge 对不对）—— 那由 L3 门禁承担。
+  这正是 §0 的边界契约：**推不出来的就声明，声明由门禁兜底，不假装推导。**
 
 ### 3.5 强制性（L2 的判据）
 
@@ -248,7 +282,8 @@ local[d] = global[d] / Π { degree(轴) : 轴 ∈ spec.group, spec ∈ dims, nor
 | 1. **PP** | 只保留本 stage 的模板实例（由描述里的 `split_layers` 规则或每项的 `stage` 给出）；跨界 slot 变成 plan 的 input/output |
 | 2. **形状** | 对每个 slot：把 `binding.axes` 与从激活传播来的 layout 解析成 `GroupMask`，执行 §2.2 除法；不整除 → 报错 |
 | 3. **组可用性** | 每个用到的 `GroupMask` 必须在 mesh 里有定义（度数 > 1）；否则 `GroupUnavailable`（今天从不触发） |
-| 4. **重写** | 重写 slot 名称（加 rank 无关的稳定后缀即可，形状已本地化），节点集合即为产物的节点集合 |
+| 4. **位置常量** | 把与 rank 有关的**编译期常量**烘进节点属性：flat QKV 的通道偏移、CP 的序列偏移、本地专家范围（`rank * local`）。它们在进程生命周期内不变，是常量不是运行期参数（`architecture.md` §2.2） |
+| 5. **重写** | 重写 slot 名称（加 rank 无关的稳定后缀即可，形状已本地化），节点集合即为产物的节点集合 |
 
 **PP 是唯一的"节点集合随 rank 变"的机制**（见 §6.1）。其余四轴都只改形状与通信。
 
@@ -300,6 +335,11 @@ rustrain check --model <model-dir|desc.json> [--tp N --cp N --ep N --dp N --pp N
   由 `binding` 声明 `axes`（§3.4）；`collectives: [all_to_all(ep)]`。
 
 这与 §0 的契约一致：**框架推不出来的东西就声明，声明由门禁兜底**，不假装推导。
+
+**退路**：若某个实现需要 dispatch 与专家计算分开（例如想单独用共享的 grouped-GEMM kernel），
+那就在描述里声明一个**容量上界**（`capacity`），把它当作 dispatch 输出槽的静态形状 ——
+代价是描述里多了一个与具体 kernel 相关的常量，收益是这一段回到可规划的原语。
+两条路都合法，按 kernel 的形态选。
 
 ---
 

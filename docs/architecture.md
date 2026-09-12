@@ -137,6 +137,19 @@ kernel 做对照**，对研究比编译期检查更有价值。
 必须住在同一个地方（参数映射）—— 一份声明同时被加载器和形状算术读取。
 按算子名或张量名查框架侧的表是禁止的（P6）。
 
+**DP 的梯度归约组是布局的函数**：
+
+```
+grad_reduce_mask(param) = 全掩码 \ (该张量已切分的轴 ∪ {pp})
+```
+
+被切分的维度上每个 rank 持有的是**不同的参数**，跨它们求和是错的；只有复制出来的那份需要跨副本求和。
+于是"哪些参数要 all-reduce、在哪个组上"**不需要任何额外标记位，也不需要训练循环手写** ——
+它是 `axes` 声明的又一个后果。实测对照：Megatron 用逐参数的 `allreduce` 布尔标记表达同一件事
+（`tensor_parallel/layers.py:928, 1278`），专家参数被分流到 expert-DP 组
+（`distributed/distributed_data_parallel.py:219-223`）。DP 用 all-reduce 还是 reduce-scatter 取决于
+优化器是否分片（`param_and_grad_buffer.py:761-783`），属于 D5。
+
 ### 1.5 推导的口径：兑现义务，不猜声明
 
 - **可以推**：某 slot 声明 `Shard{dim:0, axis:tp}` → 每个 rank 只有部分和 → 该处必须 all_reduce。
