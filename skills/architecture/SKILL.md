@@ -95,7 +95,7 @@ description: rustrain 的架构操作规则。改动 crate 边界、ABI、plan I
 ### 4.2 新增一个**原语**（T2/T3）
 
 1. 先问：能不能用现有的 kind / 属性表达？**能就别加原语。** 词表越小越好。
-2. 加进 spec §2.4 的词表，并在 `docs/architecture.md` 的词表处引用。
+2. 加进 `docs/design/op-vocabulary.md` 的词表（**词表的唯一权威**；spec §2.4 只是指针）。
 3. 在 reference provider 实现，含 `infer` / `memory` / `doc`（把不受数学约束的选择写进 doc）。
 4. 补切分规则 —— **作为描述符里的声明**，不是框架里的 `match`（I-5）。
 5. 补一致性门禁的 case。

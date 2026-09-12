@@ -109,19 +109,12 @@ Rust 侧 `#[repr(C)]` 镜像并做尺寸与偏移断言。
 
 ### 2.4 原语集
 
-固定词表。新增原语是一次框架演进（需 review），新增**实现**不需要。
-
-| 类别 | 算子 |
-|---|---|
-| 元数据（零计算，planner 级） | `view` `reshape` `transpose` `narrow` `cat` `broadcast` |
-| L0 计算 | `matmul` `linear` `bmm` `elementwise_unary` `elementwise_binary` `compare` `reduce` `softmax` `rmsnorm` `layernorm` `rope` |
-| 量化 | `quantize` `dequantize` `amax_update` |
-| 数据搬运 | `embedding` `gather` `scatter` |
-| 通信 | `all_reduce` `all_gather` `reduce_scatter` `send_recv` |
-| 复合（必须声明 expansion） | `sdpa` `flash_attn` `topk_router` `expert_dispatch` `expert_combine` `cross_entropy` `adamw` |
-| 模型块（必须声明 expansion） | `mlp_swiglu` `moe_layer` `transformer_layer` `dsa_attention` `gated_delta_rule` |
+**词表的唯一权威是 `docs/design/op-vocabulary.md`。** 它含分类、对现有 27 个原语的逐项对账、
+Qwen3.6-35B-A3B 的完整分解图、以及每处通信的归属。本规格只保留契约：
 
 **契约 P-1**：复合算子的 `expansion` 深度不得超过 2 层（块 → 原语）。
+
+**新增原语是一次框架演进（需 review），新增实现不需要。** 判定见 `skills/architecture/SKILL.md` §4.2。
 
 ### 2.5 并行与切分
 
