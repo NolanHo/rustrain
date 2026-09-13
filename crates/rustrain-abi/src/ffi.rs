@@ -144,6 +144,10 @@ c_enum! {
 c_enum! {
     pub RsCollectiveKind: i32 {
         ALL_REDUCE = 0; ALL_GATHER = 1; REDUCE_SCATTER = 2; SEND_RECV = 3;
+        /// Redistributes a tensor along one axis over a group (MoE dispatch /
+        /// combine, headwise CP). Appended (D5): existing values keep their
+        /// discriminants, so plugins built against the older enum stay valid.
+        ALL_TO_ALL = 4;
     }
 }
 
@@ -233,7 +237,9 @@ impl RsTensor {
 
     /// Byte footprint of the element buffer, or `None` for sub-byte dtypes.
     pub fn byte_len(&self) -> Option<u64> {
-        self.dtype.byte_width().map(|w| self.numel() as u64 * w as u64)
+        self.dtype
+            .byte_width()
+            .map(|w| self.numel() as u64 * w as u64)
     }
 
     pub fn is_null(&self) -> bool {

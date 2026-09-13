@@ -1039,6 +1039,21 @@ pub fn default_cases() -> Vec<Case> {
         )
         .attrs(Attrs::new().set("eps", 1e-6f64)),
     );
+    // The declared weight convention: the trunk's 1 + weight (offset 1.0).
+    cases.push(
+        Case::new(
+            "rmsnorm",
+            vec![
+                InputSpec::f32("x", vec![4, 8], Ramp),
+                InputSpec::f32("w", vec![8], Ones),
+            ],
+        )
+        .attrs(
+            Attrs::new()
+                .set("eps", 1e-6f64)
+                .set("weight_offset", 1.0f64),
+        ),
+    );
     cases.push(
         Case::new(
             "layernorm",
@@ -1174,6 +1189,92 @@ pub fn default_cases() -> Vec<Case> {
                     .set("format", "f8e4m3"),
             ),
     );
+    // D5's five new primitives (all_to_all is an intrinsic — see the runtime
+    // end-to-end test — so only the four compute ops get gate cases here).
+    cases.push(
+        Case::new("l2norm", vec![InputSpec::f32("x", vec![4, 8], Ramp)])
+            .attrs(Attrs::new().set("dim", -1i64).set("eps", 1e-6f64)),
+    );
+    cases.push(
+        Case::new(
+            "rmsnorm_gated",
+            vec![
+                InputSpec::f32("x", vec![4, 8], Ramp),
+                InputSpec::f32("w", vec![8], Ones),
+                InputSpec::f32("gate", vec![4, 8], Pseudo { seed: 43 }),
+            ],
+        )
+        .attrs(Attrs::new().set("eps", 1e-6f64).set("gate_act", "silu")),
+    );
+    cases.push(
+        Case::new(
+            "causal_conv1d",
+            vec![
+                InputSpec::f32("x", vec![4, 3], Ramp),
+                InputSpec::f32("w", vec![3, 1, 4], Pseudo { seed: 47 }),
+            ],
+        )
+        .attrs(
+            Attrs::new()
+                .set("kernel", 4i64)
+                .set("groups", "channels")
+                .set("activation", "silu"),
+        ),
+    );
+    cases.push(
+        Case::new(
+            "gated_delta_rule",
+            vec![
+                InputSpec::f32("q", vec![1, 4, 2], Ramp),
+                InputSpec::f32("k", vec![1, 4, 2], Pseudo { seed: 53 }),
+                InputSpec::f32("v", vec![1, 4, 2], Pseudo { seed: 59 }),
+                InputSpec::f32("g", vec![1, 4, 1], Pseudo { seed: 61 }),
+                InputSpec::f32("beta", vec![1, 4, 1], Pseudo { seed: 67 }),
+            ],
+        )
+        .attrs(
+            Attrs::new()
+                .set("state_dtype", "f32")
+                .set("chunk_size", 2i64),
+        ),
+    );
+    // rope's T2 completion: partial rotary + theta + position defaults, two
+    // outputs — the case the gate used to skip for lack of a convention.
+    cases.push(
+        Case::new(
+            "rope",
+            vec![
+                InputSpec::f32("q", vec![2, 6], Ramp),
+                InputSpec::f32("k", vec![2, 6], Pseudo { seed: 71 }),
+            ],
+        )
+        .outputs(2)
+        .attrs(
+            Attrs::new()
+                .set("rotary_dim", 4i64)
+                .set("theta", 1e7f64)
+                .set("partial_rotary", true),
+        ),
+    );
+    // sdpa's T2 completion: GQA + causal (the declared expansion cannot
+    // replay GQA, so its expansion check skips with that reason — the fused
+    // body and determinism are still exercised).
+    cases.push(
+        Case::new(
+            "sdpa",
+            vec![
+                InputSpec::f32("q", vec![1, 2, 2, 4], Ramp),
+                InputSpec::f32("k", vec![1, 2, 1, 4], Pseudo { seed: 73 }),
+                InputSpec::f32("v", vec![1, 2, 1, 4], Pseudo { seed: 79 }),
+            ],
+        )
+        .attrs(
+            Attrs::new()
+                .set("num_heads", 2i64)
+                .set("num_kv_heads", 1i64)
+                .set("causal", true),
+        ),
+    );
     cases
 }
 
@@ -1202,10 +1303,6 @@ pub fn uncovered_operators() -> Vec<(&'static str, &'static str)> {
         (
             "amax_update",
             "maintains state across calls; a single-invocation case would not exercise it",
-        ),
-        (
-            "rope",
-            "the position/cos/sin layout convention is not settled in the spec yet",
         ),
         (
             "view",

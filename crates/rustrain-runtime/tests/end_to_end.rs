@@ -552,3 +552,111 @@ fn device_kind_is_exposed_so_a_gpu_allocator_can_slot_in() {
     let a = HostAllocator::new();
     assert_eq!(rustrain_runtime::Allocator::device(&a), RsDeviceKind::CPU);
 }
+
+/// D5: `intrinsic.all_to_all` is a first-class collective step. The runtime
+/// drives it through the collective backend exactly like `all_reduce`; with
+/// world size 1 the backend is the identity and the tensor survives. The
+/// declared split (per-rank send sizes along dim 0) is carried from the
+/// compiled plan to the backend call.
+#[test]
+fn all_to_all_runs_through_the_collective_backend() {
+    let (registry, recipe, env) = setup();
+    let parallel = ParallelConfig {
+        tensor: 2,
+        expert: 2,
+        ..Default::default()
+    };
+    let mesh = Mesh::from_config(&parallel);
+    let tp = mesh
+        .index_of("tp")
+        .expect("the canonical mesh has a tp axis");
+    let ep = mesh
+        .index_of("ep")
+        .expect("the canonical mesh has an ep axis");
+    let group = GroupMask::single(tp)
+        .expect("tp fits in the mask")
+        .union(GroupMask::single(ep).expect("ep fits in the mask"));
+
+    let mut b = PlanBuilder::new("a2a", Phase::Forward, mesh.fingerprint());
+    let x = b.slot("x", RsDtype::F32, vec![8, 4], SlotKind::Input);
+    let y = b.slot("y", RsDtype::F32, vec![8, 4], SlotKind::Output);
+    b.node(
+        OpRef::new(rustrain_plan::intrinsic::ALL_TO_ALL),
+        vec![x],
+        vec![y],
+        Attrs::new()
+            .set(rustrain_plan::intrinsic::ATTR_GROUP, group.bits() as i64)
+            .set(rustrain_plan::intrinsic::ATTR_DIM, 0i64)
+            .set(rustrain_plan::intrinsic::ATTR_SPLIT, vec![2i64, 2, 2, 2]),
+        "a2a",
+    );
+    let plan = b.build().unwrap();
+
+    let compiled = rustrain_plan::Compiler::new(&registry, &recipe, env)
+        .compile(&plan)
+        .expect("the all_to_all intrinsic must compile");
+    let mut ex = Executor::new(
+        compiled,
+        Box::new(HostAllocator::new()),
+        Box::new(SingleRank::new(1)),
+    )
+    .unwrap();
+    let data: Vec<f32> = (1..=32).map(|v| v as f32).collect();
+    ex.write_f32(x, &data).unwrap();
+    let stats = ex.run().unwrap();
+    assert_eq!(
+        stats.collectives, 1,
+        "the runtime must drive the all_to_all"
+    );
+    // Single rank: the redistribution is the identity.
+    assert_eq!(ex.read_f32(y).unwrap(), data);
+}
+
+/// The single-rank refusal covers the new collective too: a plan whose
+/// `all_to_all` spans several ranks cannot be executed by doing nothing.
+#[test]
+fn single_rank_refuses_all_to_all_when_the_world_is_larger_than_one() {
+    let (registry, recipe, env) = setup();
+    let parallel = ParallelConfig {
+        tensor: 2,
+        ..Default::default()
+    };
+    let mesh = Mesh::from_config(&parallel);
+    let tp = mesh
+        .index_of("tp")
+        .expect("the canonical mesh has a tp axis");
+    let group = GroupMask::single(tp).expect("tp fits in the mask");
+
+    let mut b = PlanBuilder::new("a2a", Phase::Forward, mesh.fingerprint());
+    let x = b.slot("x", RsDtype::F32, vec![8, 4], SlotKind::Input);
+    let y = b.slot("y", RsDtype::F32, vec![8, 4], SlotKind::Output);
+    b.node(
+        OpRef::new(rustrain_plan::intrinsic::ALL_TO_ALL),
+        vec![x],
+        vec![y],
+        Attrs::new()
+            .set(rustrain_plan::intrinsic::ATTR_GROUP, group.bits() as i64)
+            .set(rustrain_plan::intrinsic::ATTR_DIM, 0i64),
+        "a2a",
+    );
+    let compiled = rustrain_plan::Compiler::new(&registry, &recipe, env)
+        .compile(&b.build().unwrap())
+        .unwrap();
+
+    let mut ex = Executor::new(
+        compiled,
+        Box::new(HostAllocator::new()),
+        Box::new(SingleRank::new(2)),
+    )
+    .unwrap();
+    ex.write_f32(x, &[0.0; 32]).unwrap();
+    match ex.run() {
+        Err(RuntimeError::Collective { reason, .. }) => {
+            assert!(
+                reason.contains("world_size=2"),
+                "the refusal must name the world size: {reason}"
+            );
+        }
+        other => panic!("expected a collective failure, got {other:?}"),
+    }
+}

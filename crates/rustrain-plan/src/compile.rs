@@ -49,6 +49,10 @@ pub enum CompiledStep {
         group: GroupMask,
         reduce: Option<ReduceOp>,
         dim: Option<i64>,
+        /// `all_to_all` only: the per-rank send sizes along `dim` (one entry
+        /// per rank in the group, validated against the group's degree and
+        /// the input's size along `dim`). `None` means equal split.
+        split: Option<Vec<i64>>,
         input: SlotId,
         output: SlotId,
         stream: StreamId,
@@ -320,7 +324,7 @@ impl<'a> Compiler<'a> {
         for (i, node) in plan.nodes.iter().enumerate() {
             let id = NodeId(i);
             if intrinsic::is_intrinsic(&node.op.name) {
-                steps.push(self.compile_intrinsic(id, node, &mesh)?);
+                steps.push(self.compile_intrinsic(id, node, &plan, &mesh)?);
                 continue;
             }
             let (op, rejections) = resolution[i]
@@ -561,6 +565,7 @@ impl<'a> Compiler<'a> {
         &self,
         id: NodeId,
         node: &crate::ir::PlanNode,
+        plan: &Plan,
         mesh: &rustrain_parallel::Mesh,
     ) -> Result<CompiledStep, PlanError> {
         let op = node.op.name.clone();
@@ -642,12 +647,80 @@ impl<'a> Compiler<'a> {
                 reason: "intrinsic needs exactly one output".to_string(),
             })?;
 
+        // `all_to_all` semantics the other intrinsics do not carry: no
+        // reduction, and the redistribution is described by `split` along
+        // `dim`. Validated here — never handed to the runtime unread.
+        let mut split: Option<Vec<i64>> = None;
+        if op == intrinsic::ALL_TO_ALL {
+            if reduce.is_some() {
+                return Err(PlanError::IntrinsicBadAttr {
+                    op,
+                    attr: intrinsic::ATTR_REDUCE.to_string(),
+                    value: "all_to_all performs no reduction; `reduce` belongs on all_reduce only"
+                        .to_string(),
+                });
+            }
+            let rank = plan.slot(input).shape.len() as i64;
+            let dim = node.attrs.i64(intrinsic::ATTR_DIM).unwrap_or(0);
+            let dim = if dim < 0 { dim + rank } else { dim };
+            if dim < 0 || dim >= rank {
+                return Err(PlanError::IntrinsicBadAttr {
+                    op,
+                    attr: intrinsic::ATTR_DIM.to_string(),
+                    value: format!("{dim} is out of range for the input of rank {rank}"),
+                });
+            }
+            let along = plan.slot(input).shape[dim as usize];
+            if let Some(sizes) = node.attrs.i64s(intrinsic::ATTR_SPLIT) {
+                if sizes.is_empty() || sizes.iter().any(|&s| s <= 0) {
+                    return Err(PlanError::IntrinsicBadAttr {
+                        op,
+                        attr: intrinsic::ATTR_SPLIT.to_string(),
+                        value: "the per-rank sizes must be a non-empty list of positive integers"
+                            .to_string(),
+                    });
+                }
+                let degree = group
+                    .degree(mesh)
+                    .map_err(|source| PlanError::Mesh { source })?;
+                if sizes.len() != degree {
+                    return Err(PlanError::IntrinsicBadAttr {
+                        op,
+                        attr: intrinsic::ATTR_SPLIT.to_string(),
+                        value: format!(
+                            "{size} entr(ies) for a group of degree {degree} — one size per rank",
+                            size = sizes.len()
+                        ),
+                    });
+                }
+                if sizes.iter().sum::<i64>() != along {
+                    return Err(PlanError::IntrinsicBadAttr {
+                        op,
+                        attr: intrinsic::ATTR_SPLIT.to_string(),
+                        value: format!(
+                            "the sizes sum to {sum}, but the input holds {along} element(s) along \
+                             dim {dim} — every element must be sent somewhere",
+                            sum = sizes.iter().sum::<i64>()
+                        ),
+                    });
+                }
+                split = Some(sizes.to_vec());
+            }
+        } else if node.attrs.get(intrinsic::ATTR_SPLIT).is_some() {
+            return Err(PlanError::IntrinsicBadAttr {
+                op: op.clone(),
+                attr: intrinsic::ATTR_SPLIT.to_string(),
+                value: "`split` is an all_to_all attribute".to_string(),
+            });
+        }
+
         Ok(CompiledStep::Intrinsic {
             node: id,
             op,
             group,
             reduce,
             dim: node.attrs.i64(intrinsic::ATTR_DIM),
+            split,
             input,
             output,
             stream: stream_of(node.stream),
@@ -740,6 +813,7 @@ fn compute_digest(
                 group,
                 reduce,
                 dim,
+                split,
                 input,
                 output,
                 stream,
@@ -749,7 +823,9 @@ fn compute_digest(
                 op: op.clone(),
                 // The mask renders as its bits (`mask(0b1)`): deterministic,
                 // and distinct per group without needing the mesh's names.
-                implementation: format!("intrinsic:{group}:{reduce:?}:{dim:?}"),
+                // `split` is part of the preimage: two plans that redistribute
+                // differently along the same axis are different runs.
+                implementation: format!("intrinsic:{group}:{reduce:?}:{dim:?}:{split:?}"),
                 numerics: None,
                 stream: *stream,
                 inputs: vec![input.0],
@@ -927,5 +1003,143 @@ mod tests {
         let a = compile_plan(&plan);
         let b = compile_plan(&plan);
         assert_eq!(a.digest, b.digest);
+    }
+
+    /// One explicit `all_to_all` node. The group covers tp|ep over a mesh with
+    /// tp=2, ep=2 (degree 4) and the input is redistributed along dim 0.
+    fn all_to_all_plan(mask: GroupMask, split: Option<Vec<i64>>) -> Plan {
+        let mesh = Mesh::from_config(&ParallelConfig {
+            tensor: 2,
+            expert: 2,
+            ..Default::default()
+        });
+        let mut b = PlanBuilder::new("a2a", Phase::Forward, mesh.fingerprint());
+        let x = b.slot("x", RsDtype::F32, vec![8, 4], SlotKind::Activation);
+        let y = b.slot("y", RsDtype::F32, vec![8, 4], SlotKind::Activation);
+        let mut attrs = Attrs::new()
+            .set(intrinsic::ATTR_GROUP, mask.bits() as i64)
+            .set(intrinsic::ATTR_DIM, 0i64);
+        if let Some(s) = split {
+            attrs.insert(intrinsic::ATTR_SPLIT, s);
+        }
+        b.node(
+            OpRef::new(intrinsic::ALL_TO_ALL),
+            vec![x],
+            vec![y],
+            attrs,
+            "a2a",
+        );
+        b.build().unwrap()
+    }
+
+    /// `all_to_all` compiles with the declared per-rank split, which must sum
+    /// to the input's size along the axis and have one entry per rank in the
+    /// group (D5: the split is validated at compile time, never re-derived by
+    /// the runtime).
+    #[test]
+    fn all_to_all_compiles_with_a_valid_split() {
+        let mask = GroupMask::from_bits(0b101); // tp | ep, degree 4 over tp=2, ep=2
+        let registry = Registry::new();
+        let recipe = Recipe::default();
+        let compiled = Compiler::new(&registry, &recipe, TargetEnv::default())
+            .compile(&all_to_all_plan(mask, Some(vec![2, 2, 2, 2])))
+            .unwrap();
+        let step = compiled
+            .steps
+            .iter()
+            .find(|s| matches!(s, CompiledStep::Intrinsic { .. }))
+            .expect("the plan has one intrinsic step");
+        match step {
+            CompiledStep::Intrinsic {
+                op,
+                group,
+                split,
+                dim,
+                reduce,
+                ..
+            } => {
+                assert_eq!(op, intrinsic::ALL_TO_ALL);
+                assert_eq!(*group, mask);
+                assert_eq!(*dim, Some(0));
+                assert_eq!(*reduce, None);
+                assert_eq!(split.as_deref(), Some(&[2i64, 2, 2, 2][..]));
+            }
+            CompiledStep::Op { .. } => unreachable!("intrinsic-only plan"),
+        }
+
+        // Equal split: no `split` attribute at all.
+        let registry = Registry::new();
+        let recipe = Recipe::default();
+        let compiled = Compiler::new(&registry, &recipe, TargetEnv::default())
+            .compile(&all_to_all_plan(mask, None))
+            .unwrap();
+        let step = compiled
+            .steps
+            .iter()
+            .find(|s| matches!(s, CompiledStep::Intrinsic { .. }))
+            .unwrap();
+        match step {
+            CompiledStep::Intrinsic { split, .. } => assert_eq!(split, &None),
+            CompiledStep::Op { .. } => unreachable!("intrinsic-only plan"),
+        }
+    }
+
+    /// A malformed split is a *reported* error naming the attribute — a wrong
+    /// redistribution must never compile into a different collective than the
+    /// plan declared.
+    #[test]
+    fn all_to_all_rejects_malformed_splits() {
+        let mask = GroupMask::from_bits(0b101); // degree 4
+        for bad in [
+            Some(vec![0i64, 2, 2, 4]), // non-positive entry
+            Some(vec![2, 2]),          // fewer entries than ranks
+            Some(vec![2, 2, 2, 2, 2]), // more entries than ranks
+            Some(vec![1, 2, 2, 2]),    // sums to 7, the input holds 8
+        ] {
+            let registry = Registry::new();
+            let recipe = Recipe::default();
+            let err = Compiler::new(&registry, &recipe, TargetEnv::default())
+                .compile(&all_to_all_plan(mask, bad))
+                .unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    PlanError::IntrinsicBadAttr { ref op, ref attr, .. }
+                        if op == intrinsic::ALL_TO_ALL && attr == intrinsic::ATTR_SPLIT
+                ),
+                "expected a split attribute error, got {err:?}"
+            );
+        }
+    }
+
+    /// `all_to_all` performs no reduction; declaring one is refused rather than
+    /// silently running a different collective.
+    #[test]
+    fn all_to_all_rejects_a_reduce_attribute() {
+        let mask = GroupMask::from_bits(0b101);
+        let mut b = PlanBuilder::new("a2a", Phase::Forward, default_mesh().fingerprint());
+        let x = b.slot("x", RsDtype::F32, vec![8, 4], SlotKind::Activation);
+        let y = b.slot("y", RsDtype::F32, vec![8, 4], SlotKind::Activation);
+        b.node(
+            OpRef::new(intrinsic::ALL_TO_ALL),
+            vec![x],
+            vec![y],
+            Attrs::new()
+                .set(intrinsic::ATTR_GROUP, mask.bits() as i64)
+                .set(intrinsic::ATTR_REDUCE, "sum"),
+            "a2a",
+        );
+        let registry = Registry::new();
+        let recipe = Recipe::default();
+        let err = Compiler::new(&registry, &recipe, TargetEnv::default())
+            .compile(&b.build().unwrap())
+            .unwrap_err();
+        match err {
+            PlanError::IntrinsicBadAttr { op, attr, .. } => {
+                assert_eq!(op, intrinsic::ALL_TO_ALL);
+                assert_eq!(attr, intrinsic::ATTR_REDUCE);
+            }
+            other => panic!("expected IntrinsicBadAttr, got {other:?}"),
+        }
     }
 }

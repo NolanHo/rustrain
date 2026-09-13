@@ -168,12 +168,17 @@ unsafe impl Allocator for HostAllocator {
 
 /// Performs the collective a spliced node represents.
 pub trait CollectiveBackend {
+    #[allow(clippy::too_many_arguments)]
     fn execute(
         &mut self,
         kind: RsCollectiveKind,
         group: GroupMask,
         reduce: Option<ReduceOp>,
         dim: Option<i64>,
+        // `all_to_all` only: the per-rank send sizes along `dim` (`None` =
+        // equal split). Compiled by `compile_intrinsic`; other collectives
+        // always pass `None`.
+        split: Option<&[i64]>,
         tensor: &mut RsTensor,
     ) -> Result<(), String>;
 }
@@ -202,6 +207,7 @@ impl CollectiveBackend for SingleRank {
         group: GroupMask,
         reduce: Option<ReduceOp>,
         dim: Option<i64>,
+        split: Option<&[i64]>,
         _tensor: &mut RsTensor,
     ) -> Result<(), String> {
         if self.world_size > 1 {
@@ -211,7 +217,10 @@ impl CollectiveBackend for SingleRank {
                 self.world_size
             ));
         }
-        let _ = (reduce, dim);
+        // World size 1: every collective is the identity, so the split (if
+        // declared) is trivially consistent — it has one entry, the whole
+        // tensor, validated at compile time against the input's size.
+        let _ = (reduce, dim, split);
         Ok(())
     }
 }
@@ -608,6 +617,7 @@ impl Executor {
                     group,
                     reduce,
                     dim,
+                    split,
                     ..
                 } => {
                     let kind = match op.as_str() {
@@ -616,6 +626,7 @@ impl Executor {
                         rustrain_plan::intrinsic::REDUCE_SCATTER => {
                             RsCollectiveKind::REDUCE_SCATTER
                         }
+                        rustrain_plan::intrinsic::ALL_TO_ALL => RsCollectiveKind::ALL_TO_ALL,
                         other => {
                             return Err(RuntimeError::Collective {
                                 index,
@@ -626,7 +637,7 @@ impl Executor {
                     };
                     let mut t = out_tensors.remove(0);
                     self.collectives
-                        .execute(kind, *group, *reduce, *dim, &mut t)
+                        .execute(kind, *group, *reduce, *dim, split.as_deref(), &mut t)
                         .map_err(|reason| RuntimeError::Collective {
                             index,
                             op: label.clone(),

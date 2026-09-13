@@ -127,7 +127,9 @@ typedef struct {
 typedef enum { RS_G_TP = 1u, RS_G_EP = 2u, RS_G_CP = 4u, RS_G_DP = 8u } rs_group_kind;
 typedef enum {
     RS_C_ALL_REDUCE = 0, RS_C_ALL_GATHER = 1,
-    RS_C_REDUCE_SCATTER = 2, RS_C_SEND_RECV = 3
+    RS_C_REDUCE_SCATTER = 2, RS_C_SEND_RECV = 3,
+    /* Appended (D5); existing discriminants are unchanged. */
+    RS_C_ALL_TO_ALL = 4
 } rs_collective_kind;
 
 typedef struct {

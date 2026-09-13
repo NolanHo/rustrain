@@ -475,13 +475,20 @@ pub mod intrinsic {
     pub const ALL_GATHER: &str = "intrinsic.all_gather";
     pub const REDUCE_SCATTER: &str = "intrinsic.reduce_scatter";
     pub const BROADCAST: &str = "intrinsic.broadcast";
+    /// Redistributes a tensor along one axis over a group (MoE dispatch /
+    /// combine, headwise CP). D5: the fifth collective the vocabulary was
+    /// missing; declared as an intrinsic like its siblings because a
+    /// collective needs the runtime's group handles — a plugin kernel is
+    /// topology-free (invariant I-7) and its service table does not provide
+    /// one.
+    pub const ALL_TO_ALL: &str = "intrinsic.all_to_all";
     pub const SYNC: &str = "intrinsic.sync";
 
     pub fn is_intrinsic(name: &str) -> bool {
         name.starts_with(PREFIX)
             && matches!(
                 name,
-                ALL_REDUCE | ALL_GATHER | REDUCE_SCATTER | BROADCAST | SYNC
+                ALL_REDUCE | ALL_GATHER | REDUCE_SCATTER | BROADCAST | ALL_TO_ALL | SYNC
             )
     }
 
@@ -499,6 +506,11 @@ pub mod intrinsic {
     pub const ATTR_REDUCE: &str = "reduce";
     /// Attribute key carrying the dimension for gather/scatter.
     pub const ATTR_DIM: &str = "dim";
+    /// Attribute key carrying the per-rank sizes `all_to_all` redistributes
+    /// along `dim`, as a list of positive i64s (one entry per rank in the
+    /// group). Absent means equal split: every rank sends and receives the
+    /// same number of elements along `dim`.
+    pub const ATTR_SPLIT: &str = "split";
 }
 
 #[cfg(test)]
@@ -593,6 +605,7 @@ mod tests {
         assert!(is_intrinsic(ALL_GATHER));
         assert!(is_intrinsic(REDUCE_SCATTER));
         assert!(is_intrinsic(BROADCAST));
+        assert!(is_intrinsic(ALL_TO_ALL));
         assert!(is_intrinsic(SYNC));
         assert!(!is_intrinsic("matmul"));
         assert!(!is_intrinsic("intrinsic.")); // the prefix alone is not an op
