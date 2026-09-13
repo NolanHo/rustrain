@@ -1,0 +1,75 @@
+{
+  "format": "rustrain.model.v1",
+  "name": "empty-stage",
+  "dtype": "f32",
+  "inputs": {
+    "x": {
+      "shape": [
+        "8",
+        "8"
+      ],
+      "kind": "input"
+    }
+  },
+  "params": {},
+  "templates": {
+    "only": {
+      "inputs": {
+        "x": {
+          "shape": [
+            "8",
+            "8"
+          ],
+          "kind": "activation"
+        }
+      },
+      "outputs": {
+        "y": {
+          "shape": [
+            "8",
+            "8"
+          ],
+          "kind": "activation"
+        }
+      },
+      "slots": [
+        {
+          "name": "w",
+          "kind": "weight",
+          "shape": [
+            "8",
+            "8"
+          ]
+        }
+      ],
+      "nodes": [
+        {
+          "op": "linear",
+          "in": [
+            "x",
+            "w"
+          ],
+          "out": [
+            "y"
+          ]
+        }
+      ]
+    }
+  },
+  "stack": [
+    {
+      "template": "only",
+      "prefix": "only",
+      "stage": 0,
+      "inputs": {
+        "x": "x"
+      }
+    }
+  ],
+  "binding": [
+    {
+      "slot": "only.w",
+      "source": "m.only.w"
+    }
+  ]
+}

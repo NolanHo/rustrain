@@ -1,0 +1,134 @@
+{
+  "format": "rustrain.model.v1",
+  "name": "stage1-bad",
+  "dtype": "f32",
+  "inputs": {
+    "x": {
+      "shape": [
+        "8",
+        "8"
+      ],
+      "kind": "input"
+    }
+  },
+  "params": {},
+  "templates": {
+    "pre": {
+      "inputs": {
+        "x": {
+          "shape": [
+            "8",
+            "8"
+          ],
+          "kind": "activation"
+        }
+      },
+      "outputs": {
+        "y": {
+          "shape": [
+            "8",
+            "8"
+          ],
+          "kind": "activation"
+        }
+      },
+      "slots": [
+        {
+          "name": "w",
+          "kind": "weight",
+          "shape": [
+            "8",
+            "8"
+          ]
+        }
+      ],
+      "nodes": [
+        {
+          "op": "linear",
+          "in": [
+            "x",
+            "w"
+          ],
+          "out": [
+            "y"
+          ]
+        }
+      ]
+    },
+    "post": {
+      "inputs": {
+        "x": {
+          "shape": [
+            "8",
+            "8"
+          ],
+          "kind": "activation"
+        }
+      },
+      "outputs": {
+        "y": {
+          "shape": [
+            "8",
+            "8"
+          ],
+          "kind": "activation"
+        }
+      },
+      "slots": [
+        {
+          "name": "w",
+          "kind": "weight",
+          "shape": [
+            "9",
+            "8"
+          ]
+        }
+      ],
+      "nodes": [
+        {
+          "op": "linear",
+          "in": [
+            "x",
+            "w"
+          ],
+          "out": [
+            "y"
+          ]
+        }
+      ]
+    }
+  },
+  "stack": [
+    {
+      "template": "pre",
+      "prefix": "pre",
+      "stage": 0,
+      "inputs": {
+        "x": "x"
+      }
+    },
+    {
+      "template": "post",
+      "prefix": "post",
+      "stage": 1,
+      "inputs": {
+        "x": "pre.y"
+      }
+    }
+  ],
+  "binding": [
+    {
+      "slot": "pre.w",
+      "source": "m.pre.w"
+    },
+    {
+      "slot": "post.w",
+      "source": "m.post.w",
+      "axes": {
+        "0": [
+          "tp"
+        ]
+      }
+    }
+  ]
+}

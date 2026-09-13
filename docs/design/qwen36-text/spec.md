@@ -108,15 +108,21 @@ rustrain check --model <model-dir> [--checkpoint <dir>] [--tp N --cp N --ep N --
   且 shape/dtype 两项改为 `skip`（不得在不可信的配对上给结论）。
 - **报告的 check id 完整清单**（C6 的六个 + 本轮新增）：
   `l1.structure`、`l1.compile`、`l1.operator_shapes`、`l1.layout_propagation`、`l1.partial_fulfillment`、
-  `l1.collective_axes`、`l1.slot_allocation`、`l1.implementation_availability`、`l1.binding_coverage`、
-  `l2.binding_coverage`、`l2.tensor_consumption`、`l2.shape_reconciliation`、`l2.dtype_compatibility`、
-  `l2.ignore_coverage`、`cli.arguments`。
+  `l1.collective_axes`、`l1.slot_allocation`、`l1.implementation_availability`、`l1.instantiate`、
+  `l1.binding_coverage`、`l2.binding_coverage`、`l2.tensor_consumption`、`l2.shape_reconciliation`、
+  `l2.dtype_compatibility`、`l2.ignore_coverage`、`cli.arguments`。
+- **`l1.instantiate` 检查什么**：用 mesh 与描述声明把全局 plan 实例化成**每个 PP stage 的一个代表
+  rank**（stage 的 pp 坐标；`pp=1` 即 rank 0 一个）——声明轴名必须在 mesh 里、每个声明分片必须整除成
+  本地形状、每个 stage 必须实例化出节点（空 stage 是 stage 声明错误，`fail`）。`details` 逐 stage 给出
+  该代表 rank 的节点数/槽数（机器可读绊线）。传播三项只评估 stage 0（rank 0），其余 stage 不传播
+  （跨 stage 接缝决策是 D5 的），且三项的 reason 必须写明这一点。
 - **`l1.structure` 只声称它真做的两件事**（load/expand + `check_structure`）：C2 里依赖 compile 的
-  **六条**（可编译 / `infer` 比对 / layout 传播 / `Partial` 兑现 / collective 绑轴 / slot 分配）由各自的
-  `l1.*` 项**显式 `skip` 并写明"缺什么、什么时候能补"**，不得用 `pass` 冒充"没跑"。
-- **门禁必须断言期望的 skip 集合**：`check_report_contract` 把 15 个 check id、7 个 `skip`、每项状态、
-  `counts` 的八个键**及其在真实 fixture 上的取值**、报告自称的 model / checkpoint / dtype、以及两处
-  `details` 的内容写死。将来某项从 skip 变真检查（D3/D4）会让它按设计变红 —— 那是绊线，不是噪音。
+  **三条**（可编译 / `infer` 比对 / slot 分配）由各自的 `l1.*` 项**显式 `skip` 并写明"缺什么、什么时候
+  能补"**，不得用 `pass` 冒充"没跑"（layout 传播 / `Partial` 兑现 / collective 绑轴自 D4 起是真检查）。
+- **门禁必须断言期望的 skip 集合**：`check_report_contract` 把 16 个 check id、4 个 `skip`、每项状态、
+  `counts` 的八个键**及其在真实 fixture 上的取值**、报告自称的 model / checkpoint / dtype、以及
+  `l1.instantiate` 的 `details`（逐 stage 的节点数/槽数，五轴 mesh 下钉死 PP 裁剪后的两 stage 计数）与
+  另外两处 `details` 的内容写死。将来某项从 skip 变真检查（D5）会让它按设计变红 —— 那是绊线，不是噪音。
 - **`ignore` 模式必须锚定**：首段必须是**字面名**。`**`、`*`、`{*}.visual.**`、`*.visual.**` 全在
   expand 期报错 —— "全部忽略"等于放弃显式声明（C5）。锚定只管首段（`model.**` 合法）；报告里
   **逐模式**给出命中数。
@@ -211,11 +217,13 @@ rustrain check --model <model-dir> [--checkpoint <dir>] [--tp N --cp N --ep N --
 
 ### D4 — instantiate 与 L1 全绿
 
-**可观察结果**：给定 mesh，`instantiate` 产出具体 Plan（本地形状、组掩码、位置常量），L1 全绿；
-`--json` 报告里内存是 warning 而不是 failure。
+**可观察结果**：给定 mesh，`instantiate` 产出具体 Plan（本地形状、组掩码；**位置常量推迟到 D5**），
+L1 全绿（按契约 skip 的四个项除外）；`l1.instantiate` 的 `details` 逐 PP stage 给出代表 rank 的
+节点数/槽数（机器可读绊线，钉在 `check_report_contract` 里）。
 **验收与证据**：
 - `rustrain check --model <dir> --tp 2 --cp 2 --ep 4 --dp 2 --pp 2` 退出 0（L1 部分）
-- `rustrain check ... --tp 3` 非 0，且错误信息指出是**哪个约束**（`num_attention_heads % tp`）
+- `rustrain check ... --tp 3` 非 0，且 `l1.instantiate` 点名**哪个约束**：`slot embed.w` + dim 0 +
+  全局 248320 + 除数 3（vocabulary 轴上的 tp 分片不整除，`248320 % 3 != 0`）
 - 一个测试证明 `Partial` 被兑现：row-parallel linear 之后插入了 `all_reduce({tp})`
 - 一个测试证明 PP 裁剪：`pp=2` 时 stage 0 的节点集合不含 layers 20–39
 

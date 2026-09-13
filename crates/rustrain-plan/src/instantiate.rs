@@ -362,3 +362,39 @@ fn axis_names(mesh: &Mesh) -> String {
         .collect::<Vec<_>>()
         .join(", ")
 }
+
+/// One PP stage's instantiation outcome: the representative rank (the rank whose pp
+/// coordinate is `stage`) and the plan it executes, or why it failed.
+pub struct StageInstantiation {
+    pub stage: usize,
+    pub rank: usize,
+    pub result: Result<Plan, PlanError>,
+}
+
+/// Instantiates one representative rank per PP stage — **every** stage, so a divisibility
+/// failure or an empty stage on a stage other than 0 is not masked by a clean stage 0
+/// (reviewer findings C3/C4). With `pp = 1` (or a mesh without a `pp` axis) that is one
+/// stage, exactly what `instantiate(&plan, .., 0)` was.
+///
+/// The representative rank is the minimal rank with that pp coordinate — `stage * stride(pp)`
+/// with every other coordinate 0 — which is the same arithmetic `instantiate` uses internally
+/// to read a rank's pp coordinate.
+pub fn instantiate_stages(
+    plan: &Plan,
+    declared: &DeclaredAxes,
+    mesh: &Mesh,
+) -> Vec<StageInstantiation> {
+    let pp_axis = mesh.index_of("pp");
+    let pp_degree = pp_axis.and_then(|axis| mesh.degree(axis)).unwrap_or(1);
+    let stride = pp_axis.and_then(|axis| mesh.stride(axis)).unwrap_or(1);
+    (0..pp_degree)
+        .map(|stage| {
+            let rank = stage.saturating_mul(stride);
+            StageInstantiation {
+                stage,
+                rank,
+                result: instantiate(plan, declared, mesh, rank),
+            }
+        })
+        .collect()
+}

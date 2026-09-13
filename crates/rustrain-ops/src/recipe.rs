@@ -224,14 +224,16 @@ pub struct OpMemoryRecipe {
 
 /// `[kernel.memory]` — how the plan is allowed to spend device memory.
 ///
-/// Without this section the planner still computes the projected peak and still
-/// refuses a plan that cannot fit; what it cannot do is relax anything to make
-/// one fit. See spec contracts MEM-1 through MEM-5.
+/// The planner always computes the projected peak. The budget is **advisory**
+/// since §8 D12 (landed in D4): a projection that exceeds it is reported in the
+/// compiled plan's warnings, never a refusal — so what this recipe cannot do is
+/// relax anything to make a plan fit one. See spec contracts MEM-1 through
+/// MEM-5.
 #[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MemoryRecipe {
-    /// Hard ceiling on projected device memory. `None` means "project only,
-    /// never refuse".
+    /// Advisory ceiling on projected device memory (D12: exceeding it is a
+    /// warning, never a refusal). `None` means "project only".
     #[serde(default)]
     pub budget_bytes: Option<u64>,
     #[serde(default)]

@@ -660,6 +660,13 @@ impl CheckItem {
         Self::new(id, Verdict::Pass, reason, Vec::new())
     }
 
+    /// A `pass` whose `details` carry the machine-readable witness C5 pins: the instantiated
+    /// node and slot counts per checked stage, so a no-op `instantiate` (returning the global
+    /// plan) turns the report-contract gate red instead of looking identical.
+    fn pass_with_details(id: &'static str, reason: String, details: Vec<String>) -> Self {
+        Self::new(id, Verdict::Pass, reason, details)
+    }
+
     fn fail(id: &'static str, reason: String, details: Vec<String>) -> Self {
         Self::new(id, Verdict::Fail, reason, details)
     }
@@ -959,7 +966,7 @@ fn check(args: CheckArgs) -> Result<()> {
         }
     }
 
-    // ---- L1: instantiate on rank 0, then the propagation checks (D4) ----------
+    // ---- L1: instantiate one representative rank per PP stage, then propagate stage 0 ----
     //
     // `instantiate` needs no implementation: it joins the description's declarations with the
     // mesh and the real shapes, so its errors — a shard that does not divide, an axis the mesh
@@ -967,64 +974,142 @@ fn check(args: CheckArgs) -> Result<()> {
     // resolution below is incomplete. Propagation is implementation-free too, which is what
     // turns `l1.layout_propagation`, `l1.partial_fulfillment` and `l1.collective_axes` from the
     // D2 `skip`s into real checks.
+    //
+    // C3: every PP stage is instantiated at one representative rank (the rank whose pp
+    // coordinate is the stage's), so a stage-1-only divisibility failure is not masked by a
+    // clean stage 0. C4: a stage that instantiates to no nodes is a stage-declaration error,
+    // not a clean bill of health. C5: the pass item's `details` carry the instantiated node
+    // and slot counts per stage — a machine-readable witness that `instantiate` really pruned
+    // and really ran (the report contract pins the numbers).
+    //
+    // Propagation deliberately stays stage-0-only: the cross-stage seam decision (complete the
+    // partial before the seam, or hand it over) is D5's, and every propagation reason says so.
     match (&expanded, mesh.as_ref()) {
         (Some((_, plan)), Some(mesh)) => {
-            match rustrain_plan::instantiate(&plan.plan, &plan.declarations(), mesh, 0) {
-                Err(e) => {
-                    report.checks.push(CheckItem::fail(
-                        "l1.instantiate",
-                        format!(
-                            "the plan does not instantiate on rank 0 of the {mesh_names} mesh: {e}"
-                        ),
-                        Vec::new(),
-                    ));
-                    for id in [
-                        "l1.layout_propagation",
-                        "l1.partial_fulfillment",
-                        "l1.collective_axes",
-                    ] {
-                        report.checks.push(CheckItem::skip(
-                            id,
-                            "not evaluated: `l1.instantiate` did not produce a rank-0 plan",
-                        ));
+            let stages = rustrain_plan::instantiate_stages(&plan.plan, &plan.declarations(), mesh);
+            let mut failures: Vec<String> = Vec::new();
+            let mut empty: Vec<usize> = Vec::new();
+            let mut stage_counts: Vec<String> = Vec::new();
+            let mut stage_zero: Option<rustrain_plan::Plan> = None;
+            for stage in stages {
+                match stage.result {
+                    Err(e) => {
+                        failures.push(format!("stage {} (rank {}): {e}", stage.stage, stage.rank))
+                    }
+                    Ok(stage_plan) => {
+                        if stage_plan.nodes.is_empty() {
+                            empty.push(stage.stage);
+                        } else {
+                            if stage.stage == 0 {
+                                stage_zero = Some(stage_plan.clone());
+                            }
+                            stage_counts.push(format!(
+                                "stage {} (rank {}): {} node(s), {} slot(s)",
+                                stage.stage,
+                                stage.rank,
+                                stage_plan.nodes.len(),
+                                stage_plan.slots.len()
+                            ));
+                        }
                     }
                 }
-                Ok(instantiated) => {
-                    report.checks.push(CheckItem::pass(
-                        "l1.instantiate",
+            }
+
+            if !failures.is_empty() {
+                report.checks.push(CheckItem::fail(
+                    "l1.instantiate",
+                    format!(
+                        "the plan does not instantiate on every PP stage of the {mesh_names} \
+                         mesh: {}",
+                        failures.join("; ")
+                    ),
+                    Vec::new(),
+                ));
+                for id in [
+                    "l1.layout_propagation",
+                    "l1.partial_fulfillment",
+                    "l1.collective_axes",
+                ] {
+                    report.checks.push(CheckItem::skip(
+                        id,
                         format!(
-                            "the global plan instantiates on rank 0 of the {mesh_names} mesh: {} \
-                             node(s), {} slot(s), every declared shard divides into a local shape",
-                            instantiated.nodes.len(),
-                            instantiated.slots.len()
+                            "not evaluated: `l1.instantiate` did not succeed on every PP stage; \
+                             {PROPAGATION_SCOPE}"
                         ),
                     ));
-                    match rustrain_plan::shard::propagate(&instantiated) {
-                        Err(e) => {
-                            report.checks.push(CheckItem::fail(
-                                "l1.layout_propagation",
-                                format!("sharding does not propagate on the rank-0 plan: {e}"),
-                                Vec::new(),
-                            ));
-                            for id in ["l1.partial_fulfillment", "l1.collective_axes"] {
-                                report.checks.push(CheckItem::skip(
-                                    id,
-                                    "not evaluated: layout propagation did not succeed",
-                                ));
-                            }
-                        }
-                        Ok(propagation) => {
-                            report.checks.push(CheckItem::pass(
-                                "l1.layout_propagation",
+                }
+            } else if !empty.is_empty() {
+                let stages = empty
+                    .iter()
+                    .map(|stage| format!("stage {stage}"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                report.checks.push(CheckItem::fail(
+                    "l1.instantiate",
+                    format!(
+                        "{stages} of the {mesh_names} mesh instantiates to no nodes and no \
+                         slots; a stage that owns no work is a stage-declaration error, not a \
+                         clean bill of health"
+                    ),
+                    Vec::new(),
+                ));
+                for id in [
+                    "l1.layout_propagation",
+                    "l1.partial_fulfillment",
+                    "l1.collective_axes",
+                ] {
+                    report.checks.push(CheckItem::skip(
+                        id,
+                        format!(
+                            "not evaluated: `l1.instantiate` did not succeed on every PP stage; \
+                             {PROPAGATION_SCOPE}"
+                        ),
+                    ));
+                }
+            } else {
+                let stage_zero =
+                    stage_zero.expect("stage 0 is not empty when every stage instantiated cleanly");
+                report.checks.push(CheckItem::pass_with_details(
+                    "l1.instantiate",
+                    format!(
+                        "the global plan instantiates on every PP stage of the {mesh_names} \
+                         mesh (one representative rank per stage): every declared shard divides \
+                         into a local shape"
+                    ),
+                    stage_counts,
+                ));
+                match rustrain_plan::shard::propagate(&stage_zero) {
+                    Err(e) => {
+                        report.checks.push(CheckItem::fail(
+                            "l1.layout_propagation",
+                            format!(
+                                "sharding does not propagate on the stage-0 (rank 0) plan: {e}; \
+                                 {PROPAGATION_SCOPE}"
+                            ),
+                            Vec::new(),
+                        ));
+                        for id in ["l1.partial_fulfillment", "l1.collective_axes"] {
+                            report.checks.push(CheckItem::skip(
+                                id,
                                 format!(
-                                    "sharding propagated on the rank-0 plan: {} collective(s) \
-                                     inserted to reconcile declared and derived layouts",
-                                    propagation.inserted.len()
+                                    "not evaluated: layout propagation did not succeed on the \
+                                     stage-0 (rank 0) plan; {PROPAGATION_SCOPE}"
                                 ),
                             ));
-                            report.checks.push(partial_fulfillment(&propagation));
-                            report.checks.push(collective_axes(&propagation, mesh));
                         }
+                    }
+                    Ok(propagation) => {
+                        report.checks.push(CheckItem::pass(
+                            "l1.layout_propagation",
+                            format!(
+                                "sharding propagated on the stage-0 (rank 0) plan: {} \
+                                 collective(s) inserted to reconcile declared and derived \
+                                 layouts; {PROPAGATION_SCOPE}",
+                                propagation.inserted.len()
+                            ),
+                        ));
+                        report.checks.push(partial_fulfillment(&propagation));
+                        report.checks.push(collective_axes(&propagation, mesh));
                     }
                 }
             }
@@ -1267,6 +1352,14 @@ fn binding_coverage_from_the_description(plan: &rustrain_model::Expanded) -> Che
     )
 }
 
+/// Why the propagation checks evaluate stage 0 (rank 0) only, appended to every propagation
+/// item's reason so a `pass` is never mistaken for "every stage was checked" (C3): the
+/// cross-stage seam decision — complete the partial before the seam, or hand it over to the
+/// next stage — is D5's. `propagate`'s honest seam refusal stays exactly as it is; this
+/// string only says the check does not go there.
+const PROPAGATION_SCOPE: &str = "propagation is evaluated on stage 0 (rank 0) only — the other PP stages are not \
+     propagated (the cross-stage seam decision is D5's)";
+
 /// C2's "every Partial is fulfilled": after propagation, a slot that still carries a partial must
 /// be consumed only by the intrinsic that completes it — a compute node reading a partial means
 /// no collective was inserted for it, and the plan is not runnable as declared. This is the
@@ -1296,8 +1389,9 @@ fn partial_fulfillment(propagation: &rustrain_plan::shard::ShardPropagation) -> 
         return CheckItem::pass(
             ID,
             format!(
-                "every one of the {fulfilled} partial slot(s) is fulfilled by an inserted \
-                 collective ({} insertion(s) in total)",
+                "every one of the {fulfilled} partial slot(s) on the stage-0 (rank 0) plan is \
+                 fulfilled by an inserted collective ({} insertion(s) in total); \
+                 {PROPAGATION_SCOPE}",
                 propagation.inserted.len()
             ),
         );
@@ -1305,8 +1399,8 @@ fn partial_fulfillment(propagation: &rustrain_plan::shard::ShardPropagation) -> 
     CheckItem::fail(
         ID,
         format!(
-            "{} partial slot(s) are read by a compute node with no inserted collective \
-             completing them: {}",
+            "{} partial slot(s) on the stage-0 (rank 0) plan are read by a compute node with \
+             no inserted collective completing them: {}; {PROPAGATION_SCOPE}",
             unfulfilled.len(),
             unfulfilled.join(", ")
         ),
@@ -1345,7 +1439,8 @@ fn collective_axes(
         return CheckItem::pass(
             ID,
             format!(
-                "all {} inserted collective(s) bind to axes of the mesh",
+                "all {} inserted collective(s) on the stage-0 (rank 0) plan bind to axes of the \
+                 mesh; {PROPAGATION_SCOPE}",
                 propagation.inserted.len()
             ),
         );
@@ -1353,7 +1448,8 @@ fn collective_axes(
     CheckItem::fail(
         ID,
         format!(
-            "{} inserted collective(s) are not bound to the mesh axes: {}",
+            "{} inserted collective(s) on the stage-0 (rank 0) plan are not bound to the mesh \
+             axes: {}; {PROPAGATION_SCOPE}",
             unbound.len(),
             unbound.join("; ")
         ),

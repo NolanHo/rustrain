@@ -10,8 +10,8 @@
 //! needs — splices in an intrinsic collective node and repoints the consumers.
 
 use rustrain_parallel::{
-    Collective, DimNormalizer, GroupMask, Mesh, ParallelLayout, ReduceOp, ShardError, ShardSpec,
-    transitions,
+    Collective, DimNormalizer, GroupMask, Mesh, ParallelLayout, PartialSpec, ReduceOp, ShardError,
+    ShardSpec, transitions,
 };
 
 use crate::PlanError;
@@ -31,6 +31,53 @@ pub enum DeriveError {
          or a single shard on the contraction dim (0 / -2, row parallel)"
     )]
     UnsupportedWeightLayout { op: String, layout: String },
+
+    #[error(
+        "cannot derive sharding for `{op}`: operand {index} layout {layout} has no rule; \
+         expected replicate or a single shard, never a partial or several shards"
+    )]
+    UnsupportedOperandLayout {
+        op: String,
+        index: usize,
+        layout: String,
+    },
+
+    #[error(
+        "cannot derive sharding for `{op}`: both operands shard the contraction dim over \
+         different groups ({a} vs {b}); the output would be a partial over a union of groups \
+         the table does not document — refuse rather than drop one operand's shard"
+    )]
+    ContractionGroupsDiffer {
+        op: String,
+        a: GroupMask,
+        b: GroupMask,
+    },
+
+    #[error(
+        "cannot derive sharding for `{op}`: both operands' surviving shards land on output \
+         dim {dim} over different groups ({a} vs {b}); the dim is shared, so the two splits \
+         contradict each other — refuse rather than drop one"
+    )]
+    OverlappingOutputShard {
+        op: String,
+        dim: i64,
+        a: GroupMask,
+        b: GroupMask,
+    },
+
+    #[error(
+        "cannot derive sharding for `{op}`: operand {operand} carries {layout} on rank {rank} \
+         but the output has rank {out_rank}; a rank-changing view has no shape algebra to \
+         remap the shard, so carrying it verbatim would rename the axis — declare the output \
+         layout explicitly instead"
+    )]
+    UnmappableViewShard {
+        op: String,
+        operand: usize,
+        layout: String,
+        rank: i64,
+        out_rank: i64,
+    },
 }
 
 /// How an operator relates the sharding of its operands to its results.
@@ -142,22 +189,34 @@ pub fn derive(
             // broadcast operand's layout is spelled on fewer axes, and copying it onto the output
             // (or a higher-rank operand) renames the axis — `shard(0, g)` on a rank-1 `[H]` is the
             // feature axis, while on a rank-2 `[S, H]` it is the sequence axis, and the walk then
-            // demands a conversion between two different distributions. The one exception is a
-            // single-operand view (`reshape`/`narrow`): its operand *is* the distribution, carried
-            // onto the output as-is — the table has no shape algebra to remap its axis, and the
-            // view's consumers are the description's responsibility.
+            // demands a conversion between two different distributions. When no operand has the
+            // output's rank (a rank-changing unary view, or a binary op broadcasting *both*
+            // operands), the first operand is still the distribution — but the mapping across the
+            // rank change is per-primitive, because the primitives' axis semantics differ.
+            // Broadcasting aligns trailing axes, so a unary `broadcast` — and a binary op
+            // broadcasting both operands — carries the shard right-aligned, `axis + (R - r)`. A
+            // rank-changing `reshape`/`narrow`/`view` refolds in row-major order, so the shard
+            // keeps its axis index — the explicit mapping the table commits to for those
+            // primitives. Any axis the output cannot hold is refused rather than renamed.
             let out_rank = output_ranks.first().copied().unwrap_or(0);
             let anchor = inputs
                 .iter()
                 .zip(input_ranks)
                 .find(|(_, rank)| **rank == out_rank)
-                .map(|(layout, _)| layout.clone())
-                .or_else(|| inputs.first().cloned())
-                .unwrap_or_else(ParallelLayout::replicate);
+                .map(|(layout, rank)| (layout.clone(), *rank))
+                .or_else(|| {
+                    inputs
+                        .first()
+                        .cloned()
+                        .map(|layout| (layout, input_ranks.first().copied().unwrap_or(0)))
+                });
+            let (anchor, anchor_rank) =
+                anchor.unwrap_or_else(|| (ParallelLayout::replicate(), out_rank));
+            let trailing = op == "broadcast" || inputs.len() > 1;
             let out = if anchor.partial.is_some() {
                 ParallelLayout::replicate()
             } else {
-                anchor
+                carry_to_output_rank(&anchor, anchor_rank, out_rank, op, 0, trailing)?
             };
 
             let required_inputs: Vec<ParallelLayout> = inputs
@@ -256,6 +315,14 @@ pub fn derive(
             // arrive resolved, so the contraction is `a`'s axis `rank_a - 1`
             // and `b`'s `rank_b - 2`, and b's output features are `rank_b - 1`
             // (exactly what the `-1`/`-2` spellings meant before resolution).
+            //
+            // Every distribution that can survive the contraction survives: a shard on either
+            // contraction dim becomes the documented partial, and a shard on any other dim
+            // rides the output (batch dims are left-aligned, `b`'s output dim is the output's
+            // last). The old arms answered with *one* layout, so `a`'s batch shard was dropped
+            // the moment `b` carried a shard — `instantiate` then stored a truncated layout and
+            // over-claimed the local batch extent. Anything the table cannot express is
+            // refused, never dropped.
             let a = first();
             let b = inputs
                 .get(1)
@@ -263,25 +330,83 @@ pub fn derive(
                 .unwrap_or_else(ParallelLayout::replicate);
             let rank_a = input_ranks.first().copied().unwrap_or(0);
             let rank_b = input_ranks.get(1).copied().unwrap_or(0);
+            let out_rank = output_ranks.first().copied().unwrap_or(0);
 
-            let out = match (single_shard(&a), single_shard(&b)) {
-                // The contraction is split: every rank holds a partial sum.
-                (Some(sa), _) if sa.dim == rank_a.saturating_sub(1) => {
-                    ParallelLayout::partial(ReduceOp::Sum, sa.group)
+            // A partial or multi-shard operand has no rule: the old arm silently answered
+            // `replicate` for it, which is a dropped distribution, not a derived one.
+            for (index, operand) in [&a, &b].into_iter().enumerate() {
+                if !(operand.is_replicated() || single_shard(operand).is_some()) {
+                    return Err(DeriveError::UnsupportedOperandLayout {
+                        op: op.to_string(),
+                        index,
+                        layout: format!("{operand}"),
+                    });
                 }
-                (_, Some(sb)) if sb.dim == rank_b.saturating_sub(2) => {
-                    ParallelLayout::partial(ReduceOp::Sum, sb.group)
+            }
+
+            let contract_a = single_shard(&a).filter(|s| s.dim == rank_a.saturating_sub(1));
+            let contract_b = single_shard(&b).filter(|s| s.dim == rank_b.saturating_sub(2));
+
+            // A shard on either contraction dim leaves every rank holding a partial sum. Two
+            // of them over the *same* group are one partial; over *different* groups the
+            // result would be a partial over a union of groups the table does not document —
+            // refuse rather than drop one.
+            let partial = match (contract_a, contract_b) {
+                (Some(sa), Some(sb)) if sa.group != sb.group => {
+                    return Err(DeriveError::ContractionGroupsDiffer {
+                        op: op.to_string(),
+                        a: sa.group,
+                        b: sb.group,
+                    });
                 }
-                // b's output dim is split: the result inherits that shard.
-                (_, Some(sb)) if sb.dim == rank_b.saturating_sub(1) => {
-                    ParallelLayout::shard(-1, sb.group)
-                }
-                // Any other single shard propagates to the output.
-                (Some(sa), _) => ParallelLayout::shard(sa.dim, sa.group),
-                // Anything multi-shard or partial: no rule, so no
-                // distribution is invented (as before the mask vocabulary).
-                _ => ParallelLayout::replicate(),
+                (Some(sa), _) => Some(PartialSpec {
+                    op: ReduceOp::Sum,
+                    group: sa.group,
+                }),
+                (_, Some(sb)) => Some(PartialSpec {
+                    op: ReduceOp::Sum,
+                    group: sb.group,
+                }),
+                (None, None) => None,
             };
+
+            // The surviving shards. Batch dims are left-aligned (torch broadcasts the leading
+            // dims of `a` against the leading dims of `b`), so a shard keeps its own index on
+            // both sides; `b`'s output dim is the output's last. Two shards landing on the
+            // same output dim over different groups contradict each other (the shared dim
+            // cannot be split two ways); over the same group they are one fact.
+            let mut dims: Vec<ShardSpec> = Vec::new();
+            let mut push = |spec: ShardSpec, dim: i64| -> Result<(), DeriveError> {
+                if let Some(existing) = dims.iter_mut().find(|d| d.dim == dim) {
+                    if existing.group != spec.group {
+                        return Err(DeriveError::OverlappingOutputShard {
+                            op: op.to_string(),
+                            dim,
+                            a: existing.group,
+                            b: spec.group,
+                        });
+                    }
+                } else {
+                    dims.push(ShardSpec {
+                        dim,
+                        group: spec.group,
+                    });
+                }
+                Ok(())
+            };
+            if let Some(spec) = single_shard(&a).filter(|s| s.dim != rank_a.saturating_sub(1)) {
+                push(spec, spec.dim)?;
+            }
+            if let Some(spec) = single_shard(&b).filter(|s| s.dim != rank_b.saturating_sub(2)) {
+                let dim = if spec.dim == rank_b.saturating_sub(1) {
+                    out_rank.saturating_sub(1)
+                } else {
+                    spec.dim
+                };
+                push(spec, dim)?;
+            }
+
+            let out = ParallelLayout { dims, partial };
             DerivedShards {
                 required_inputs: vec![a, b],
                 outputs: vec![out; declared_outputs.len()],
@@ -322,6 +447,62 @@ fn single_shard(l: &ParallelLayout) -> Option<ShardSpec> {
         ([spec], None) => Some(*spec),
         _ => None,
     }
+}
+
+/// Carries a layout from an operand of rank `rank` onto the output of rank `out_rank`.
+///
+/// Same-rank: verbatim. Rank-changing with `trailing` (broadcasting semantics): the operand's
+/// axes are the output's *trailing* axes, so every shard moves up by `out_rank - rank`; a
+/// shrink is impossible and refused. Rank-changing, axis-preserving (`reshape`/`narrow`/
+/// `view`, which refold in row-major order): the shard keeps its axis index, which is
+/// expressible exactly while the output still has that axis. In every case a shard whose
+/// mapped axis does not exist — a scalar operand, a dim that never resolved against its own
+/// rank, or a shrink past the shard's axis — is refused rather than renamed.
+fn carry_to_output_rank(
+    layout: &ParallelLayout,
+    rank: i64,
+    out_rank: i64,
+    op: &str,
+    operand: usize,
+    trailing: bool,
+) -> Result<ParallelLayout, DeriveError> {
+    if rank == out_rank {
+        return Ok(layout.clone());
+    }
+    if layout.dims.is_empty() {
+        return Ok(ParallelLayout::replicate());
+    }
+    if rank > out_rank && trailing {
+        return Err(DeriveError::UnmappableViewShard {
+            op: op.to_string(),
+            operand,
+            layout: format!("{layout}"),
+            rank,
+            out_rank,
+        });
+    }
+    let offset = if trailing { out_rank - rank } else { 0 };
+    let dims: Vec<ShardSpec> = layout
+        .dims
+        .iter()
+        .map(|spec| ShardSpec {
+            dim: spec.dim + offset,
+            group: spec.group,
+        })
+        .collect();
+    if dims.iter().any(|spec| spec.dim < 0 || spec.dim >= out_rank) {
+        return Err(DeriveError::UnmappableViewShard {
+            op: op.to_string(),
+            operand,
+            layout: format!("{layout}"),
+            rank,
+            out_rank,
+        });
+    }
+    Ok(ParallelLayout {
+        dims,
+        partial: None,
+    })
 }
 
 /// One spliced-in collective, reported so `plan explain` and the tests can show
@@ -981,10 +1162,11 @@ mod tests {
         );
     }
 
-    /// A single-operand view op carries its operand's distribution as-is, even
-    /// across a rank change: `reshape`/`narrow` have no shape algebra to remap
-    /// the axis, and demanding a conversion on the view's own input would insert
-    /// a collective the description never asked for.
+    /// A single-operand `reshape` carries its operand's distribution on the **same axis
+    /// index** across a rank change: a row-major refold keeps the shard's axis where it was,
+    /// and a reshape whose output rank cannot hold that axis is refused. The operand's own
+    /// requirement is unchanged — no conversion is owed at a view. (`broadcast` is the
+    /// opposite: its axes are the output's trailing axes, covered by the tests below.)
     #[test]
     fn a_single_operand_view_carries_its_operands_distribution() {
         let g = tp_mask();
@@ -1000,13 +1182,250 @@ mod tests {
         assert_eq!(
             d.outputs[0],
             ParallelLayout::shard(1, g),
-            "the view copies the operand's resolved layout"
+            "the reshape keeps the shard's axis index (the rank-2 last axis is the rank-4 \
+             axis 1), never renames it"
         );
         assert_eq!(
             d.required_inputs,
             vec![ParallelLayout::shard(1, g)],
             "the view's operand keeps its own layout — no conversion is owed at a view"
         );
+    }
+
+    /// The real Qwen3.6 reshape chain, both directions: the column-parallel QK weight shards
+    /// `qgw [512, 8192]` on its last axis, and rank `k` holds the flat columns
+    /// `[4096k, 4096k+4096)` — which row-major refolding turns into heads `8k..8k+8` of
+    /// `qgh [512, 16, 2, 256]` (axis 1, kept by index) and, after the rank-preserving narrow
+    /// to `qs [512, 16, 1, 256]`, back into the flat half of `q [512, 4096]` (axis 1 again).
+    /// Right-aligning these reshapes would silently move the shard onto the wrong axis.
+    #[test]
+    fn the_real_qwen36_reshape_chain_keeps_the_shard_axis_index() {
+        let g = tp_mask();
+        let grow = derive(
+            ShardRule::Elementwise,
+            "reshape",
+            &[ParallelLayout::shard(1, g)],
+            &[ParallelLayout::replicate()],
+            &[2],
+            &[4],
+        )
+        .unwrap();
+        assert_eq!(
+            grow.outputs[0],
+            ParallelLayout::shard(1, g),
+            "`qgw`'s flat half is the heads axis of `qgh` — axis 1, not the head_dim axis"
+        );
+        let shrink = derive(
+            ShardRule::Elementwise,
+            "reshape",
+            &[ParallelLayout::shard(1, g)],
+            &[ParallelLayout::replicate()],
+            &[4],
+            &[2],
+        )
+        .unwrap();
+        assert_eq!(
+            shrink.outputs[0],
+            ParallelLayout::shard(1, g),
+            "`qs`'s heads shard folds back onto `q`'s flat axis — axis 1 again"
+        );
+    }
+
+    /// **Reviewer C2 (HIGH).** A rank-growing unary view (`broadcast` of a rank-1 `[H]`
+    /// sharded `shard(0, tp)` to `[S, H]`) used to copy the operand's layout onto the output
+    /// verbatim, renaming the feature axis into the sequence axis. The right-aligned broadcast
+    /// mapping applies to the output too: the shard rides the output's trailing axis
+    /// (`shard(1, tp)`, local shape `[S, H/2]`), and the operand keeps its own axis.
+    #[test]
+    fn a_rank_growing_unary_view_maps_the_shard_to_the_output_axis() {
+        let g = tp_mask();
+        let d = derive(
+            ShardRule::Elementwise,
+            "broadcast",
+            &[ParallelLayout::shard(0, g)],
+            &[ParallelLayout::replicate()],
+            &[1],
+            &[2],
+        )
+        .unwrap();
+        assert_eq!(
+            d.outputs[0],
+            ParallelLayout::shard(1, g),
+            "the shard rides the output's trailing axis: dim 0 of `[H]` is dim 1 of `[S, H]`"
+        );
+        assert_eq!(
+            d.required_inputs,
+            vec![ParallelLayout::shard(0, g)],
+            "the operand keeps its own axis — no conversion is owed at the view"
+        );
+    }
+
+    /// A rank-**shrinking** view with a distributed operand has no expressible output: the
+    /// table has no shape algebra to remap a shard onto fewer axes, so it is refused rather
+    /// than renamed (the same refusal the walk already produced downstream, now at the rule).
+    #[test]
+    fn a_rank_shrinking_view_with_a_shard_is_refused() {
+        let g = tp_mask();
+        let err = derive(
+            ShardRule::Elementwise,
+            "reshape",
+            &[ParallelLayout::shard(1, g)],
+            &[ParallelLayout::replicate()],
+            &[2],
+            &[1],
+        )
+        .unwrap_err();
+        match err {
+            DeriveError::UnmappableViewShard { rank, out_rank, .. } => {
+                assert_eq!((rank, out_rank), (2, 1));
+            }
+            other => panic!("expected an unmappable-view refusal, got {other:?}"),
+        }
+    }
+
+    /// A shard whose mapped axis does not exist — a scalar operand (rank 0) that somehow
+    /// carries a shard — must be refused rather than renamed onto an axis it never named.
+    #[test]
+    fn a_view_shard_that_cannot_map_to_the_output_is_refused() {
+        let g = tp_mask();
+        let err = derive(
+            ShardRule::Elementwise,
+            "broadcast",
+            &[ParallelLayout::shard(0, g)],
+            &[ParallelLayout::replicate()],
+            &[0],
+            &[2],
+        )
+        .unwrap_err();
+        match err {
+            DeriveError::UnmappableViewShard { .. } => {}
+            other => panic!("expected an unmappable-view refusal, got {other:?}"),
+        }
+    }
+
+    /// **Reviewer C1 (HIGH).** `a = [B,S,K] shard(0, tp)` (batch axis), `b = [K,N] shard(1,
+    /// ep)` (output axis) must produce `{shard(0, tp), shard(2, ep)}`: the contraction axis is
+    /// complete on both operands, so nothing is partial, and **both** surviving distributions
+    /// belong to the output. The old arms answered with `b`'s shard alone, silently dropping
+    /// `a`'s batch shard — `instantiate` then stored a truncated layout and over-claimed the
+    /// local batch extent.
+    #[test]
+    fn a_matmul_keeps_every_surviving_shard_of_both_operands() {
+        let tp = tp_mask();
+        let ep = GroupMask::single(1).expect("bit 1 always fits");
+        let d = derive(
+            ShardRule::MatMul,
+            "matmul",
+            &[ParallelLayout::shard(0, tp), ParallelLayout::shard(1, ep)],
+            &[ParallelLayout::replicate()],
+            &[3, 2],
+            &[3],
+        )
+        .unwrap();
+        assert_eq!(
+            d.outputs[0],
+            ParallelLayout {
+                dims: vec![
+                    ShardSpec { dim: 0, group: tp },
+                    ShardSpec { dim: 2, group: ep },
+                ],
+                partial: None,
+            },
+            "`a`'s batch shard and `b`'s output shard both survive into the output"
+        );
+    }
+
+    /// A shard on either contraction dim is the documented partial. When **both** operands
+    /// shard the contraction over the *same* group it is one partial; over *different* groups
+    /// the output would be a partial over a union of groups the table does not document —
+    /// refused, never silently reduced to one group.
+    #[test]
+    fn a_matmul_contraction_shard_is_a_partial_and_differing_groups_are_refused() {
+        let tp = tp_mask();
+        let ep = GroupMask::single(1).expect("bit 1 always fits");
+        let d = derive(
+            ShardRule::MatMul,
+            "matmul",
+            &[ParallelLayout::shard(1, tp), ParallelLayout::replicate()],
+            &[ParallelLayout::replicate()],
+            &[2, 2],
+            &[1],
+        )
+        .unwrap();
+        assert_eq!(
+            d.outputs[0],
+            ParallelLayout::partial(ReduceOp::Sum, tp),
+            "a's contraction shard is the documented partial"
+        );
+        let d = derive(
+            ShardRule::MatMul,
+            "matmul",
+            &[ParallelLayout::shard(1, tp), ParallelLayout::shard(0, tp)],
+            &[ParallelLayout::replicate()],
+            &[2, 2],
+            &[1],
+        )
+        .unwrap();
+        assert_eq!(
+            d.outputs[0],
+            ParallelLayout::partial(ReduceOp::Sum, tp),
+            "the same group on both contraction dims is one partial"
+        );
+        let err = derive(
+            ShardRule::MatMul,
+            "matmul",
+            &[ParallelLayout::shard(1, tp), ParallelLayout::shard(0, ep)],
+            &[ParallelLayout::replicate()],
+            &[2, 2],
+            &[1],
+        )
+        .unwrap_err();
+        match err {
+            DeriveError::ContractionGroupsDiffer { .. } => {}
+            other => panic!("expected a contraction-groups refusal, got {other:?}"),
+        }
+    }
+
+    /// A partial or multi-shard operand has no rule in the table; the old arm silently
+    /// answered `replicate` for it, dropping the distribution. It is refused now — never
+    /// dropped.
+    #[test]
+    fn a_matmul_partial_or_multi_shard_operand_is_refused() {
+        let tp = tp_mask();
+        let ep = GroupMask::single(1).expect("bit 1 always fits");
+        for bad in [
+            ParallelLayout::partial(ReduceOp::Sum, tp),
+            ParallelLayout {
+                dims: vec![
+                    ShardSpec { dim: 0, group: tp },
+                    ShardSpec { dim: 1, group: ep },
+                ],
+                partial: None,
+            },
+        ] {
+            for index in [0, 1] {
+                let inputs = if index == 0 {
+                    vec![bad.clone(), ParallelLayout::replicate()]
+                } else {
+                    vec![ParallelLayout::replicate(), bad.clone()]
+                };
+                let err = derive(
+                    ShardRule::MatMul,
+                    "matmul",
+                    &inputs,
+                    &[ParallelLayout::replicate()],
+                    &[2, 2],
+                    &[1],
+                )
+                .unwrap_err();
+                match err {
+                    DeriveError::UnsupportedOperandLayout { index: i, .. } => {
+                        assert_eq!(i, index, "the refusal names the operand that carries it");
+                    }
+                    other => panic!("expected an operand refusal, got {other:?}"),
+                }
+            }
+        }
     }
 
     /// A broadcast operand that disagrees with the anchored output on its own
@@ -1081,6 +1500,7 @@ mod tests {
                         "the refusal must name the layout: {layout}"
                     );
                 }
+                other => panic!("expected the weight-layout refusal, got {other:?}"),
             }
         }
     }

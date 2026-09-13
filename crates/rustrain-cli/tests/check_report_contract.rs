@@ -2,14 +2,15 @@
 //! and which of them are `skip` on this machine (F3).
 //!
 //! `check_l2.rs` gates D2's *outcomes* (exit codes, counter values, the four rejections). It cannot
-//! see a check that stopped being run: six of C2's L1 sub-checks are `skip` today because
-//! `Plan::compile` needs a mesh (D3) and an implementation to ask for shapes, so a description that
-//! fails shape inference still reports `exit 0` and a green-looking report — a reviewer reproduced
-//! exactly that with a `matmul` declaring a rank-3 output. This file closes the other half of the
-//! gate: the report must contain **exactly** C6's fifteen ids, and exactly the seven of them that
-//! are expected to be `skip` must be `skip`. A check that starts running, stops running, disappears
-//! or is renamed turns this file red, and the *status* of every id is pinned, so "still skipped"
-//! cannot be mistaken for "still checked".
+//! see a check that stopped being run: four of C2's L1 sub-checks are `skip` today because operator
+//! resolution is incomplete on this host — three need a **resolved** implementation for every node
+//! (`Plan::compile`; five primitives have no provider here, D5), and implementation availability
+//! is a `skip` by contract — so a description that fails shape inference still reports `exit 0` and
+//! a green-looking report, which a reviewer reproduced with a `matmul` declaring a rank-3 output.
+//! This file closes the other half of the gate: the report must contain **exactly** C6's sixteen
+//! ids, and exactly the four of them that are expected to be `skip` must be `skip`. A check that
+//! starts running, stops running, disappears or is renamed turns this file red, and the *status*
+//! of every id is pinned, so "still skipped" cannot be mistaken for "still checked".
 //!
 //! It also pins **what the checks found**, not only that they ran: which model and checkpoint the
 //! report is about, the dtype it ran at, the value of each of the eight counters, and the per-object
@@ -63,7 +64,7 @@ const C6_CHECK_IDS: [&str; 16] = [
     "l2.tensor_consumption",
 ];
 
-/// The four L1 sub-checks that still need `Plan::compile` (a **resolved** implementation for
+/// The three L1 sub-checks that still need `Plan::compile` (a **resolved** implementation for
 /// every node), plus implementation availability — five primitives of this description have no
 /// implementation on this host, which C2 makes a `skip`, never a `fail` and never a silent
 /// `pass`. D4 turned the other three compile-dependent sub-checks real: with the mesh, `instantiate`
@@ -177,6 +178,21 @@ fn unpublished_component<'a>(table: &'a [(&'a str, i64, Unavailable)]) -> Vec<(&
 /// `pass` mean something on the real 1045-tensor snapshot.
 const IGNORE_PATTERN: &str = "model.visual.**";
 const IGNORED_TENSORS: i64 = 333;
+
+/// **C5's witness at `pp = 1`**: the single stage is the whole plan, so the detail line pins
+/// the global counts. A no-op `instantiate` (returning the global plan unchanged) would still
+/// produce this line — which is why the five-axis run below pins the *pruned* per-stage
+/// counts, where a no-op cannot hide.
+const STAGE0_ONLY: [&str; 1] = ["stage 0 (rank 0): 1031 node(s), 1916 slot(s)"];
+
+/// **C5's witness at the five-axis acceptance mesh**: the per-stage node/slot counts a real
+/// `instantiate` produces after PP pruning. `instantiate` replaced by `return Ok(plan.clone())`
+/// reports 1031 node(s)/1916 slot(s) for *both* stages and turns this gate red — the tripwire
+/// the reviewer's no-op attack walks into.
+const FIVE_AXIS_STAGES: [&str; 2] = [
+    "stage 0 (rank 0): 501 node(s), 933 slot(s)",
+    "stage 1 (rank 32): 530 node(s), 986 slot(s)",
+];
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Status {
@@ -418,14 +434,16 @@ fn assert_c6_shape(doc: &Value, expected_dtype: &str) {
     }
 }
 
-/// N1: the two items that carry per-object `details`, and what the rest must not carry.
+/// N1: the items that carry per-object `details`, and what the rest must not carry.
 ///
 /// The status table says which checks ran; `assert_c6_shape` says what the counters are. This is the
 /// third leg: the per-object lists that back the wording of a `pass` or a `skip`. `availability` is
 /// the table the run's dtype must produce — an emptied list, a truncated list, a renamed operator, a
 /// node count that drifts, a reason that enumerates a different set, or a `why` that does not match
-/// its cause all turn it red — while every id and status stays exactly as pinned.
-fn assert_details(doc: &Value, items: &[Item], availability: &Availability) {
+/// its cause all turn it red — while every id and status stays exactly as pinned. `stage_lines` is
+/// C5's witness: the `l1.instantiate` details must carry exactly the instantiated node and slot
+/// counts per checked stage, one line per stage.
+fn assert_details(doc: &Value, items: &[Item], availability: &Availability, stage_lines: &[&str]) {
     // The tables are constants; this makes a typo in either of them a self-inconsistency rather than
     // a re-definition of what the `skip`'s reason is asserted against.
     let sum: i64 = availability
@@ -449,8 +467,21 @@ fn assert_details(doc: &Value, items: &[Item], availability: &Availability) {
 
     let mut seen_availability = false;
     let mut seen_ignore = false;
+    let mut seen_instantiate = false;
     for item in items {
         match item.id.as_str() {
+            "l1.instantiate" => {
+                seen_instantiate = true;
+                let expected: Vec<String> =
+                    stage_lines.iter().map(|line| line.to_string()).collect();
+                assert_eq!(
+                    item.details, expected,
+                    "C5: the `l1.instantiate` details must carry the instantiated node and slot \
+                     counts per checked stage, in stage order — a no-op instantiate would report \
+                     the global counts for every stage and turn this red: {:?}",
+                    item.details
+                );
+            }
             "l1.implementation_availability" => {
                 seen_availability = true;
                 assert_eq!(
@@ -557,9 +588,9 @@ fn assert_details(doc: &Value, items: &[Item], availability: &Availability) {
     }
 
     assert!(
-        seen_availability && seen_ignore,
-        "the two items with per-object details must both be present (availability: \
-         {seen_availability}, ignore coverage: {seen_ignore})"
+        seen_availability && seen_ignore && seen_instantiate,
+        "the items with per-object details must all be present (availability: \
+         {seen_availability}, ignore coverage: {seen_ignore}, instantiate: {seen_instantiate})"
     );
 }
 
@@ -669,7 +700,7 @@ fn the_report_has_c6s_shape_and_exactly_c6s_check_ids() {
         "the f32 list must be exactly the unpublished primitives of the bf16 list: the same \
          primitives nothing publishes, with the same node counts"
     );
-    assert_details(&doc, &items, &F32_AVAILABILITY);
+    assert_details(&doc, &items, &F32_AVAILABILITY, &STAGE0_ONLY);
 }
 
 /// C2's other half: `--dtype` is optional, and without it the **description's own** dtype is what
@@ -684,7 +715,7 @@ fn the_default_dtype_run_is_the_same_report_at_the_descriptions_own_dtype() {
     // Counts, ids, statuses and the skip set are already pinned by `accepted_run`: the plan and the
     // checkpoint do not depend on the dtype. What differs is the availability list, and at bf16 it
     // is the whole plan — every node of the reference provider rejects the dtype.
-    assert_details(&doc, &items, &BF16_AVAILABILITY);
+    assert_details(&doc, &items, &BF16_AVAILABILITY, &STAGE0_ONLY);
 }
 
 /// An **explicitly given** dtype is not the same code path as an omitted one, and `bf16` is the one
@@ -699,7 +730,7 @@ fn the_default_dtype_run_is_the_same_report_at_the_descriptions_own_dtype() {
 fn an_explicit_dtype_run_is_gated_at_every_dtype_it_accepts() {
     for dtype in ["bf16", "f16"] {
         let (doc, items) = accepted_run(&["--dtype", dtype], dtype);
-        assert_details(&doc, &items, &BF16_AVAILABILITY);
+        assert_details(&doc, &items, &BF16_AVAILABILITY, &STAGE0_ONLY);
     }
 }
 
@@ -762,9 +793,10 @@ fn a_rejected_argument_emits_the_sixteenth_id_and_changes_nothing_else() {
 
 /// **D4's headline acceptance.** The five-axis mesh `tp=2, cp=2, ep=4, dp=2, pp=2` must produce
 /// exactly the same report an accepted run does: every id, every status, every counter, the same
-/// availability list — and exit 0. `instantiate` and the three propagation checks run for real on
-/// rank 0, so the whole `EXPECTED_STATUS` table (with the four `pass` items D4 made real) is
-/// re-pinned at the acceptance mesh, not only at the trivial all-ones mesh.
+/// availability list — and exit 0. `instantiate` runs for real on one representative rank per
+/// stage (C5's witness pins the pruned per-stage counts), and the three propagation checks run
+/// on stage 0 (rank 0), so the whole `EXPECTED_STATUS` table (with the four `pass` items D4 made
+/// real) is re-pinned at the acceptance mesh, not only at the trivial all-ones mesh.
 #[test]
 fn the_five_axis_acceptance_mesh_exits_zero_with_the_same_report() {
     let (doc, items) = accepted_run(
@@ -773,7 +805,7 @@ fn the_five_axis_acceptance_mesh_exits_zero_with_the_same_report() {
         ],
         "f32",
     );
-    assert_details(&doc, &items, &F32_AVAILABILITY);
+    assert_details(&doc, &items, &F32_AVAILABILITY, &FIVE_AXIS_STAGES);
 }
 
 /// **D4's rejection acceptance.** `--tp 3` must exit non-zero and name the constraint the
