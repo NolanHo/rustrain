@@ -311,7 +311,15 @@ HF transformers 的 logits 在容差内一致；每层 hidden 的 mean/std/max �
   `GroupUnavailable` 从"声明了从不构造"变成活的：`propagate` 拿 plan 自己的 mesh 指纹校验每个 layout，越界即报错并点名节点 / 算子 / 掩码；
   门禁：`cargo test -p rustrain-parallel -p rustrain-plan` 全绿；工作区 **345 passed** / clippy 0 warning / `ops check` exit 0；
   独立审查两条（不同视角）：**行为保持** = `APPROVED_WITH_NOTES` —— `check` 报告与 `ops check` 输出**逐字节不变**，三处差异全在设计内（digest、新的 `mesh` 字段、collective 组名 `Tp`→`tp`），42 处测试改动逐一核对**无一处被削弱**（多处被加强），findings 全是文档账，随 `a11d6c0` 修掉；**算术与转换表** = `CHANGES_REQUIRED` —— 审查者用**数据级模拟器**（把 layout 实例化成每 rank 的具体张量、逐元素执行发出的集合通信）复现 5 条：相交组的 `shard+partial` 被回答而非拒绝（只发一次集合通信，编译器会放行）、`reduce_scatter` 与 gather 的次序、同组双维分片不可能重建、未兑现的目标分片被接受、`ATTR_GROUP` 的 `i64→u32` 静默截断。随 `ce5bbca` 全部改为**拒绝**，并用审查者自己的 oracle 复跑验证：`attack3_table` 从 FAIL（8053 findings）变为 **PASS（9612 次模拟一致 / 0 findings / 0 panic）**，组算术与形状算术两次攻击保持 PASS。三条新规则写进 `model-description.md` §2.3。
-- [ ] D4 — instantiate 与 L1 全绿
+- [x] **D4 — instantiate 与 L1 全绿** —— 证据：提交 `2d00afa`（两条裁定：`stage` 与符号轴名）+ `98c84db`（`instantiate` + 规则表的 rank 感知）+ `c602c1c`（CLI 用真实 mesh 驱动 `check`、三项 L1 变真检查、内存预算改 advisory）；
+  `rustrain check --model <qwen36 描述> --checkpoint <真实快照> --dtype f32 --tp 2 --cp 2 --ep 4 --dp 2 --pp 2` **退出 0**：15 项中 11 pass / 4 skip / **0 fail**（新增 `l1.instantiate`；`l1.layout_propagation`、`l1.partial_fulfillment`、`l1.collective_axes` 由 skip 变真检查）；`--tp 3` **退出 1**，`l1.instantiate` 点名 `slot embed.w` + dim 0 + 全局 248320 + 除数 3；
+  `instantiate` **不碰注册表**，所以在"5 个原语本机没有实现"的真实 bf16 描述上照样跑 —— 不整除因此能在解析之前就 `fail`。剩下 4 条 skip 各自写明"解析不完整 / 本机没有实现"与何时能跑（C2：skip 必须回答缺什么、什么时候能补），**没有把没跑的检查写成 pass**；
+  **PP 裁剪**：`pp=2` 时 rank 0 的节点集合 = `embed` + layers 0–19，不含 20–39、`norm`、`lm_head`、MTP；跨界 slot 变成 plan 的 Input/Output（`pp_pruning_keeps_exactly_the_rank_stage` 按实例前缀与 slot kind 断言）；
+  **Partial 兑现**：row-parallel 的声明分片让 linear 输出成为 `partial(sum, tp)`，`Compiler::compile` 插入的 `all_reduce` 掩码就是 `tp`；vocabulary 分片的 embedding 同样欠一次 `all_reduce({tp})`（两条测试各一）；
+  **真实形状贯通**：声明的切分 → 本地形状在真实描述上端到端成立（`ep=4, tp=2` 的 gate / down 段）；
+  **预算改 advisory**：`enforce_budget` 仍是唯一检测点，但超预算只进 `CompiledPlan.warnings`（`plan explain` 打印、JSON 里也在），退出码不受影响 —— §8 D12 落地；
+  工作区 **368 passed** / clippy 0 warning / `ops check` exit 0；绊线按设计变红并更新为 D4 的新真相（16 个 id、4 个 skip、三项新状态），其余断言原样保留：8 个计数的**值**、provenance、两处 `details`、重复 id 规则、三条 dtype 路径；
+  **已知缺口（诚实记录，不是"以后再说"）**：① **位置常量**（flat QKV 通道偏移 / CP 序列偏移 / 本地专家范围）推迟到 D5，`instantiate` 里留注释指到 §4.2 第 4a 行；② **PP 接缝上的 partial 没有所属 rank**：stage 1 的 `propagate` 在 MTP 的 rmsnorm 处按"转换的所有者不在本 rank"拒绝 —— 把 partial 原样交给下一 stage，还是在 seam 前补完，是 D5 的跨 stage 通信决策；模型测试里钉住这个拒绝并注明 D5，不特判、不假装通过
 - [ ] D5 — 前向数值对齐 HuggingFace
 
 **D2 的已知输入（来自 D1 审查）已兑现**：`ResolvedBinding.slots` 的顺序是**按 target 分组**（先所有 `q` 槽、
