@@ -61,6 +61,7 @@ use crate::op::meta::{
     broadcast_exec, broadcast_infer, cat_exec, cat_infer, narrow_exec, narrow_infer, reshape_exec,
     reshape_infer, transpose_exec, transpose_infer, view_exec, view_infer,
 };
+use crate::op::moe::{moe_exec, moe_infer, moe_memory};
 use crate::op::movement::{
     embedding_exec, embedding_infer, gather_exec, gather_infer, scatter_exec, scatter_infer,
 };
@@ -170,6 +171,8 @@ const RMSNORM_GATED_DOC: &str = "GDN's output normalisation (HF Qwen3_5MoeRMSNor
 const CAUSAL_CONV1D_DOC: &str = "Qwen3.6's depthwise causal sequence convolution (HF causal_conv1d_fn): out[t, c] = sum_k w[c, 0, k] * x[t + k - pad, c] with x[j < 0] = 0, optionally fused with silu. Input x is [.., L, C] (sequence first, channels last); the weight is [C, 1, K] with one input channel per output channel (depthwise). Attributes: kernel (i64, default K — the weight's own tap count, which a declared kernel must equal: the checkpoint's kernel size is the contract, never a silent truncation), groups (string, default 'channels'; only 'channels' = depthwise exists), activation (string, default '' = none; 'silu' fuses the activation into the same sweep), pad (i64, default kernel - 1 — strictly causal; left-only padding of pad zeros, matching F.conv1d(padding=pad) cropped to the original length).";
 
 const GATED_DELTA_RULE_DOC: &str = "The GDN recurrence itself (HF torch_chunk_gated_delta_rule, chunked form): inputs (q, k, v, g, beta) with q/k [.., S, kh*D], v [.., S, vh*Dv], g/beta [.., S, vh] (identical batch dims), output [.., S, vh*Dv]. Conventions: the state is fp32 ('state_dtype' attr, only 'f32' accepted — the declaration is enforced, not assumed); 'chunk_size' (i64, default 64) sizes the chunked scan (padding to a multiple is internal, the output keeps S); k_head_dim == v_head_dim (declared — both 128 in Qwen3.6; a mismatch is a hard error); q and k heads are repeat_interleaved by vh/kh (GQA for the delta rule); the query is scaled by D^-0.5 inside (the L2 normalisation itself is the caller's l2norm nodes); g is log-space decay (<= 0) and beta gates the state update: S_t = S_{t-1} * exp(g_t) + k_t * ((v_t - S_{t-1} k_t) * beta_t), read AFTER the update o_t = q_t^T S_t. The CP>1 dependency is declared, not derived: this descriptor carries collectives = [all_gather {cp}] for the affine-map merge (op-vocabulary §4); the reference provider itself runs single-rank.";
+
+const MOE_LAYER_DOC: &str = "Qwen3.6's sparse MoE layer as ONE explicit operator (op-vocabulary §5, option A): the router (topk_router) runs upstream, and dispatch/combine are all_to_all({tp, ep}) exchanges whose per-rank token counts are only known at run time — so the whole layer is a single node with static [.., H] in/out and the two collectives declared on this descriptor (layout arithmetic cannot derive them: the routing is data, op-vocabulary §4). Nine inputs, in order: (0) h f32 [.., H] (rank >= 2, rows = product of leading dims); (1) routing_weights f32 [rows, K] — topk_router output 0, the softmax probabilities of the selected experts, already renormalised when the router runs norm_topk_prob, used as-is and never renormalised here; (2) routing_indices i32/i64 [rows, K] — topk_router output 1; (3) experts_gate_up_proj f32 [E, 2*I, H] in checkpoint orientation ([out, in] per expert) with gate = rows [0, I) and up = rows [I, 2*I) — the halves F.linear(x, W).chunk(2, dim=-1) splits, de-fused exactly as qwen36-5d-example.md §3 prescribes; (4) experts_down_proj f32 [E, H, I] ([out, in] per expert); (5/6) shared_gate_proj/shared_up_proj f32 [I, H]; (7) shared_down_proj f32 [H, I]; (8) shared_expert_gate f32 [1, H]. Output: h's exact shape. Numerics are HF's Qwen3_5MoeSparseMoeBlock: per token, EVERY selected expert runs (dropless — no capacity truncation), out = sum_k w_k * down_k(silu(gate_k(x)) * up_k(x)) with k ascending, plus sigmoid(shared_expert_gate @ x) * shared_expert(x). silu/sigmoid use the x/(1+e^-x) and 1/(1+e^-x) forms of elementwise_unary, and every accumulation runs in fixed ascending order (k, j, hidden), so two runs are bitwise identical. No attributes: K is the routing tensors' last dim (validated 1..=E), and the topk/norm_topk_prob attributes the description may attach belong to the topk_router node upstream, not to this op. Out-of-range expert indices are a hard error (no wrap-around). Collectives: two ALL_TO_ALL {tp, ep} — dispatch (tensor_index 0, the h input) and combine (tensor_index 9, the output at offset n_inputs in the io list); the reference provider runs single-rank and the declaration is the planner's data. Memory: one H-element f32 accumulation buffer per call, reported by this descriptor's memory hook (4*H bytes).";
 
 fn build_plugin() -> &'static RsPlugin {
     PluginBuilder::new("reference", env!("CARGO_PKG_VERSION"))
@@ -439,6 +442,35 @@ fn build_plugin() -> &'static RsPlugin {
             kind: RsCollectiveKind::ALL_GATHER,
             group: RsGroupKind::CP,
             tensor_index: 0,
+            on_side_stream: 0,
+        }))
+        .op(spec(
+            "moe_layer",
+            MOE_LAYER_DOC,
+            F32_IDX,
+            RsBackwardKind::AUTODIFF,
+            moe_infer,
+            moe_exec,
+        )
+        // The fused body allocates one H-element f32 accumulation buffer per
+        // call; report it so planning sees the real footprint.
+        .memory(moe_memory)
+        // Dispatch and combine are all_to_all({tp, ep}) — declared, not
+        // derivable: the routing is data (op-vocabulary §4), which is exactly
+        // why the layer is one EXPLICIT operator. tensor_index follows the
+        // expansion convention (inputs first, then outputs): 0 = the h input
+        // the dispatch sends, 9 = the output (offset n_inputs) the combine
+        // assembles.
+        .collective(RsCollective {
+            kind: RsCollectiveKind::ALL_TO_ALL,
+            group: RsGroupKind::from_raw(RsGroupKind::TP.raw() | RsGroupKind::EP.raw()),
+            tensor_index: 0,
+            on_side_stream: 0,
+        })
+        .collective(RsCollective {
+            kind: RsCollectiveKind::ALL_TO_ALL,
+            group: RsGroupKind::from_raw(RsGroupKind::TP.raw() | RsGroupKind::EP.raw()),
+            tensor_index: 9,
             on_side_stream: 0,
         }))
         .build()

@@ -3,6 +3,7 @@
 pub mod composite;
 pub mod compute;
 pub mod meta;
+pub mod moe;
 pub mod movement;
 pub mod quant;
 pub mod recurrent;

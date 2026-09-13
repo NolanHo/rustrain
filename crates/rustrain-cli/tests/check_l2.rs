@@ -145,6 +145,25 @@ fn check(model: &Path, checkpoint: &Path) -> Run {
     }
 }
 
+/// The same run without `--dtype`: the description's own `bf16` is the precision being checked,
+/// which the f32-only reference provider rejects for every node — the run where implementation
+/// availability is a reasoned `Skip`.
+fn check_at_declared_dtype(model: &Path, checkpoint: &Path) -> Run {
+    let output = Command::new(cli_binary())
+        .args(["check", "--model"])
+        .arg(model)
+        .arg("--checkpoint")
+        .arg(checkpoint)
+        .arg("--json")
+        .output()
+        .unwrap_or_else(|e| panic!("failed to start {}: {e}", cli_binary()));
+    Run {
+        code: output.status.code(),
+        stdout: output.stdout,
+        stderr: output.stderr,
+    }
+}
+
 /// D2's four counters, as integers. Absent `dtype_mismatch` is not silently zero.
 ///
 /// Read from `counts` itself, not from "the first `key` at any depth": the report carries a `checks`
@@ -539,10 +558,14 @@ fn an_unregistered_operator_is_a_reasoned_skip_not_a_fail() {
 }
 
 /// D2 + C5: the real description against the real checkpoint metadata (1045 tensors, shard headers
-/// only, no weights downloaded). Everything reconciles, and the one thing this machine cannot do —
-/// run it — is a reasoned `Skip`, not a `Fail`.
+/// only, no weights downloaded). Everything reconciles, and — at `--dtype f32` — every node now
+/// resolves to an implementation: `moe_layer` landed (D5's provider half is closed), so
+/// implementation availability is a `Pass`, not a `Skip`. At the description's own `bf16` the
+/// f32-only reference provider rejects every node instead, and that stays a reasoned `Skip` — an
+/// unresolved primitive is a skip, not a fail, and the reason names the operators.
 #[test]
 fn the_real_qwen36_description_reconciles_the_real_checkpoint_metadata() {
+    // f32: the availability item is now the pass form — no per-operator list.
     let run = check(&qwen36_model_dir(), &fixture_checkpoint("qwen36-35b-a3b"));
     run.expect_success();
 
@@ -553,26 +576,47 @@ fn the_real_qwen36_description_reconciles_the_real_checkpoint_metadata() {
     let availability = availability_item(&items);
     assert_eq!(
         availability.status,
-        Status::Skip,
-        "implementation availability on this machine must be Skip, not {}\n{}",
+        Status::Pass,
+        "at --dtype f32 every node resolves (moe_layer included), so implementation availability \
+         must be Pass, not {}\n{}",
         availability.status.label(),
         describe(&items)
     );
     assert!(
-        !availability.reason.trim().is_empty(),
-        "C2: the Skip must list its reasons one by one\n{}",
+        availability.reason.starts_with("all ") && mentions_number(&availability.reason, 1064),
+        "the pass must count the nodes it resolved: {}\n{}",
+        availability.reason,
         describe(&items)
     );
 
-    // D5's reference-provider half landed l2norm, rmsnorm_gated,
-    // causal_conv1d and gated_delta_rule; moe_layer (the EXPLICIT MoE op,
-    // the lead's half) is the one primitive still without a provider.
-    const UNIMPLEMENTED_PRIMITIVES: [&str; 1] = ["moe_layer"];
-    let text = items_text(&items);
+    // bf16 (the description's own dtype): the reference provider accepts f32 only, so every node
+    // is unresolved — still a reasoned Skip, and the reason names the operators (moe_layer among
+    // the sixteen, now rejected by dtype rather than unpublished).
+    let bf16 = check_at_declared_dtype(&qwen36_model_dir(), &fixture_checkpoint("qwen36-35b-a3b"));
+    bf16.expect_success();
+    let bf16_doc = bf16.json();
+    assert_zero_counters(&bf16_doc, &bf16);
+
+    let bf16_items = check_items(&bf16_doc);
+    let bf16_availability = availability_item(&bf16_items);
+    assert_eq!(
+        bf16_availability.status,
+        Status::Skip,
+        "at the description's own bf16 the f32-only reference provider rejects every node, so \
+         implementation availability must stay Skip, not {}\n{}",
+        bf16_availability.status.label(),
+        describe(&bf16_items)
+    );
     assert!(
-        UNIMPLEMENTED_PRIMITIVES.iter().all(|op| text.contains(op)),
-        "the availability Skip must say what is missing ({})\n{}",
-        UNIMPLEMENTED_PRIMITIVES.join(", "),
-        run.dump()
+        !bf16_availability.reason.trim().is_empty(),
+        "C2: the Skip must list its reasons one by one\n{}",
+        describe(&bf16_items)
+    );
+    let text = items_text(&bf16_items);
+    assert!(
+        text.contains("moe_layer"),
+        "the bf16 availability Skip must say what is missing (moe_layer among the rejected \
+         operators)\n{}",
+        bf16.dump()
     );
 }

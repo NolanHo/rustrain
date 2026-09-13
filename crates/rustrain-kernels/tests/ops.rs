@@ -382,7 +382,7 @@ fn plugin_loads_through_the_abi_loader() {
         .unwrap_or_else(|e| panic!("loader rejected {so:?}: {e}"));
     assert_eq!(plugin.name(), "reference");
     let ops = plugin.ops();
-    assert_eq!(ops.len(), 31);
+    assert_eq!(ops.len(), 32);
     assert_eq!(ops[0].spec_name(), "view@reference.f32");
     assert_eq!(ops[11].spec_name(), "compare@reference.f32");
     assert_eq!(ops[26].spec_name(), "topk_router@reference.f32");
@@ -390,6 +390,7 @@ fn plugin_loads_through_the_abi_loader() {
     assert_eq!(ops[28].spec_name(), "rmsnorm_gated@reference.f32");
     assert_eq!(ops[29].spec_name(), "causal_conv1d@reference.f32");
     assert_eq!(ops[30].spec_name(), "gated_delta_rule@reference.f32");
+    assert_eq!(ops[31].spec_name(), "moe_layer@reference.f32");
     for o in &ops {
         assert!(o.variant() == "reference.f32", "{}: variant", o.name());
     }
@@ -410,7 +411,7 @@ fn plugin_publishes_the_expected_ops() {
         env!("CARGO_PKG_VERSION")
     );
     let ops = unsafe { slice::from_raw_parts(p.ops, p.n_ops as usize) };
-    assert_eq!(p.n_ops, 31, "one variant per vocabulary op");
+    assert_eq!(p.n_ops, 32, "one variant per vocabulary op");
     let names: Vec<&str> = ops
         .iter()
         .map(|d| unsafe { CStr::from_ptr((**d).id.name) }.to_str().unwrap())
@@ -449,6 +450,7 @@ fn plugin_publishes_the_expected_ops() {
             "rmsnorm_gated",
             "causal_conv1d",
             "gated_delta_rule",
+            "moe_layer",
         ]
     );
     for d in ops {
@@ -1953,6 +1955,178 @@ fn topk_router_hand_values_and_tie_break() {
     assert_eq!(outs[1].i32s, vec![0]);
 }
 
+// ── moe_layer ────────────────────────────────────────────────────────────────
+
+#[test]
+fn moe_layer_hand_values() {
+    // One token (rows=1), H=2, E=3, I=2, K=2. x = [1, 2], routing weights
+    // [0.25, 0.75], indices [2, 0] — experts 2 and 0 BOTH run (dropless:
+    // every selected expert runs), expert 1 does not (its weights are the 7.0
+    // sentinel: a single read of it would blow the exact expected values).
+    //
+    // gate_up_proj is [E, 2I, H] with gate = rows [0, I), up = rows [I, 2I):
+    //   expert 0: gate rows (0, .5) -> g = 0*1 + .5*2 = 1; (2, -1) -> g = 0.
+    //             up rows (1, 0) -> u = 1; (0, 1) -> u = 2.
+    //             a = [silu(1)*1, silu(0)*2] = [0.7310586, 0]   (silu(0) = 0)
+    //   expert 2: gate rows (2, -1) -> g = 0; (0, .5) -> g = 1.
+    //             up rows (0, 1) -> u = 2; (1, 0) -> u = 1.
+    //             a = [silu(0)*2, silu(1)*1] = [0, 0.7310586]
+    // down_proj is [E, H, I] (out[h] = sum_j a[j] * down[e][h*I + j]):
+    //   expert 0: [[1, 0], [0, 1]] -> [0.7310586, 0]
+    //   expert 2: [[0, 3], [2, 0]] -> [3*0.7310586, 0]
+    // Expert sum (k ascending), weighted by the routing probabilities:
+    //   0.25 * [3*s, 0] + 0.75 * [s, 0] = [0.75*s + 0.75*s, 0] = [1.5*s, 0]
+    // Shared expert (same gate/up/down trick): a = [s, 0] -> s_out = [s, 0];
+    // shared_expert_gate [1, 2] = (1, -0.5) -> gs = 1*1 - 0.5*2 = 0, and
+    // sigmoid(0) = 0.5 exactly -> shared contribution [0.5*s, 0].
+    // Total: [1.5*s + 0.5*s, 0] = [2*s, 0], where s = silu(1) = 1/(1 + e^-1).
+    let h = Owned::f32(&[1, 2], vec![1.0, 2.0]);
+    let w = Owned::f32(&[1, 2], vec![0.25, 0.75]);
+    let idx = Owned::i32(&[1, 2], vec![2, 0]);
+    let gu = Owned::f32(
+        &[3, 4, 2],
+        vec![
+            0.0, 0.5, 2.0, -1.0, 1.0, 0.0, 0.0,
+            1.0, // expert 0: gate (0,.5),(2,-1); up (1,0),(0,1)
+            7.0, 7.0, 7.0, 7.0, 7.0, 7.0, 7.0, 7.0, // expert 1: sentinel, never read
+            2.0, -1.0, 0.0, 0.5, 0.0, 1.0, 1.0,
+            0.0, // expert 2: gate (2,-1),(0,.5); up (0,1),(1,0)
+        ],
+    );
+    let dn = Owned::f32(
+        &[3, 2, 2],
+        vec![
+            1.0, 0.0, 0.0, 1.0, // expert 0
+            7.0, 7.0, 7.0, 7.0, // expert 1: sentinel
+            0.0, 3.0, 2.0, 0.0, // expert 2
+        ],
+    );
+    let sg = Owned::f32(&[2, 2], vec![0.0, 0.5, 2.0, -1.0]);
+    let su = Owned::f32(&[2, 2], vec![1.0, 0.0, 0.0, 1.0]);
+    let sd = Owned::f32(&[2, 2], vec![1.0, 0.0, 0.0, 1.0]);
+    let sgg = Owned::f32(&[1, 2], vec![1.0, -0.5]);
+    let outs = unsafe {
+        run_op(
+            op("moe_layer"),
+            &[
+                &h.t, &w.t, &idx.t, &gu.t, &dn.t, &sg.t, &su.t, &sd.t, &sgg.t,
+            ],
+            &[],
+            1,
+        )
+    }
+    .unwrap();
+    assert_eq!(outs[0].t.dims(), &[1, 2]);
+    assert_eq!(outs[0].t.dtype, RsDtype::F32);
+    let s = 1.0 / (1.0 + (-1.0f32).exp()); // silu(1)
+    assert_close(outs[0].fdata()[0], 2.0 * s, 1e-6, "moe[0]");
+    assert_close(outs[0].fdata()[1], 0.0, 1e-6, "moe[1]");
+
+    // The 3D form [b, s, H] is the declared static in/out: the same math with
+    // the batch dim kept, output keeps h's shape.
+    let h3 = Owned::f32(&[1, 1, 2], vec![1.0, 2.0]);
+    let outs = unsafe {
+        run_op(
+            op("moe_layer"),
+            &[
+                &h3.t, &w.t, &idx.t, &gu.t, &dn.t, &sg.t, &su.t, &sd.t, &sgg.t,
+            ],
+            &[],
+            1,
+        )
+    }
+    .unwrap();
+    assert_eq!(outs[0].t.dims(), &[1, 1, 2]);
+    assert_close(outs[0].fdata()[0], 2.0 * s, 1e-6, "moe3d[0]");
+    assert_close(outs[0].fdata()[1], 0.0, 1e-6, "moe3d[1]");
+}
+
+#[test]
+fn moe_layer_declares_the_dispatch_and_combine_all_to_alls() {
+    // The two all_to_all({tp, ep}) collectives are declared, not derivable:
+    // the routing is data (op-vocabulary §4), so the planner learns them only
+    // from this descriptor. dispatch = the h input (io index 0), combine =
+    // the output (io index 9, at offset n_inputs).
+    let o = op("moe_layer");
+    assert_eq!(o.n_collectives, 2);
+    assert!(!o.collectives.is_null());
+    let cols = unsafe { slice::from_raw_parts(o.collectives, o.n_collectives as usize) };
+    let tp_ep = RsGroupKind::from_raw(RsGroupKind::TP.raw() | RsGroupKind::EP.raw());
+    for (i, c) in cols.iter().enumerate() {
+        assert_eq!(c.kind, RsCollectiveKind::ALL_TO_ALL, "collective {i} kind");
+        assert_eq!(c.group, tp_ep, "collective {i} group must be {{tp, ep}}");
+    }
+    assert_eq!(cols[0].tensor_index, 0, "dispatch sends the h input");
+    assert_eq!(cols[1].tensor_index, 9, "combine assembles the output");
+}
+
+#[test]
+fn moe_layer_memory_reports_its_scratch() {
+    // The fused body allocates one H-element f32 accumulation buffer per call.
+    let o = op("moe_layer");
+    let h = Owned::f32(&[1, 2], vec![0.0; 2]);
+    let w = Owned::f32(&[1, 1], vec![0.0]);
+    let idx = Owned::i32(&[1, 1], vec![0]);
+    let gu = Owned::f32(&[1, 2, 2], vec![0.0; 4]);
+    let dn = Owned::f32(&[1, 2, 1], vec![0.0; 2]);
+    let sg = Owned::f32(&[1, 2], vec![0.0; 2]);
+    let su = Owned::f32(&[1, 2], vec![0.0; 2]);
+    let sd = Owned::f32(&[2, 1], vec![0.0; 2]);
+    let sgg = Owned::f32(&[1, 2], vec![0.0; 2]);
+    let mut req = RsMemReq::default();
+    let io: Vec<*const RsTensor> = vec![
+        &h.t, &w.t, &idx.t, &gu.t, &dn.t, &sg.t, &su.t, &sd.t, &sgg.t,
+    ];
+    let st = unsafe { (o.memory.unwrap())(io.as_ptr(), io.len() as u32, ptr::null(), &mut req) };
+    assert_eq!(st, 0);
+    assert_eq!(req.workspace_bytes, 4 * 2); // one H=2 f32 buffer
+    assert_eq!(req.save_for_backward_bytes, 0);
+}
+
+#[test]
+fn moe_layer_rejects_out_of_range_expert_indices() {
+    // Indices are used as-is (no wrap-around): an expert id outside [0, E) is
+    // a hard error naming the token, the routing slot and the id.
+    let h = Owned::f32(&[1, 2], vec![1.0, 2.0]);
+    let w = Owned::f32(&[1, 1], vec![1.0]);
+    let idx = Owned::i32(&[1, 1], vec![3]); // E = 3 -> 3 is out of range
+    let gu = Owned::f32(&[3, 2, 2], vec![0.0; 12]);
+    let dn = Owned::f32(&[3, 2, 1], vec![0.0; 6]);
+    let sg = Owned::f32(&[1, 2], vec![0.0; 2]);
+    let su = Owned::f32(&[1, 2], vec![0.0; 2]);
+    let sd = Owned::f32(&[2, 1], vec![0.0; 2]);
+    let sgg = Owned::f32(&[1, 2], vec![0.0; 2]);
+    let o = op("moe_layer");
+    let mut descs: Vec<RsTensor> = (0..1).map(|_| RsTensor::default()).collect();
+    unsafe {
+        call_infer(
+            o,
+            &[
+                &h.t, &w.t, &idx.t, &gu.t, &dn.t, &sg.t, &su.t, &sd.t, &sgg.t,
+            ],
+            &mut descs,
+            &[],
+        )
+    }
+    .unwrap();
+    let mut out = Owned::zeros_for(&descs[0]);
+    let err = unsafe {
+        call_exec(
+            o,
+            &[
+                &h.t, &w.t, &idx.t, &gu.t, &dn.t, &sg.t, &su.t, &sd.t, &sgg.t,
+            ],
+            &mut [&mut out.t],
+            &[],
+        )
+    }
+    .unwrap_err();
+    assert!(
+        err.contains("expert 3") && err.contains("outside [0, 3)"),
+        "the error must name the offending index and the range: {err}"
+    );
+}
+
 // ── matmul vs naive reference on pseudo-random data ─────────────────────────
 
 /// Deterministic LCG; same stream every test run.
@@ -2411,6 +2585,22 @@ fn determinism_cases() -> Vec<(&'static str, Vec<Owned>, Vec<RsAttr>, usize)> {
             abool("partial_rotary", true),
         ],
         2,
+    ));
+    cases.push((
+        "moe_layer",
+        vec![
+            Owned::f32(&[1, 2], vec![1.0, 2.0]),
+            Owned::f32(&[1, 2], vec![0.25, 0.75]),
+            Owned::i32(&[1, 2], vec![2, 0]),
+            Owned::f32(&[3, 4, 2], (1..=24).map(|v| v as f32 * 0.25).collect()),
+            Owned::f32(&[3, 2, 2], (1..=12).map(|v| v as f32 * 0.5).collect()),
+            Owned::f32(&[2, 2], vec![0.5, -0.5, 0.25, -0.25]),
+            Owned::f32(&[2, 2], vec![0.25, -0.25, 0.5, -0.5]),
+            Owned::f32(&[2, 2], vec![0.5, 0.25, -0.25, 0.5]),
+            Owned::f32(&[1, 2], vec![0.1, -0.2]),
+        ],
+        vec![],
+        1,
     ));
     cases
 }

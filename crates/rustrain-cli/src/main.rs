@@ -1462,30 +1462,29 @@ fn collective_axes(
 /// C2 lists seven things L1 covers. `l1.structure` covers what `load` + `expand` +
 /// `check_structure` can answer, `l1.implementation_availability` covers operator resolution, and
 /// with D4 the mesh exists — `l1.instantiate`, `l1.layout_propagation`, `l1.partial_fulfillment`
-/// and `l1.collective_axes` now run for real. The three left over all need a **resolved**
-/// implementation for every node, which this host does not have, so each says so instead of
-/// claiming a compile that never ran.
+/// and `l1.collective_axes` now run for real. The three left over all need a compiled plan, and
+/// `rustrain check` does not run `Plan::compile` yet — the compiler is D5's planner half, still
+/// outstanding. (Resolution itself is no longer the reason: with `moe_layer` published, every node
+/// of the real description resolves at `--dtype f32`. A check that never runs its compile is still
+/// a skip, not a pass.)
 fn compile_dependent_l1_checks(expanded: bool) -> Vec<CheckItem> {
-    // `(id, why this sub-check needs a resolved plan)`, in C2's order.
+    // `(id, why this sub-check needs a compiled plan)`, in C2's order.
     const SUBCHECKS: [(&str, &str); 3] = [
         (
             "l1.compile",
-            "`Plan::compile` needs a resolved implementation for every node, and resolution is \
-             incomplete on this host: the EXPLICIT moe_layer primitive has no provider at f32, \
-             and the reference provider's f32-only variants reject every node at the \
-             description's own bf16 (D5's provider half landed four of the five primitives; the \
-             MoE op and the planner half remain — until then this sub-check cannot run)",
+            "`Plan::compile` is not run by `rustrain check` yet — the compiler is D5's planner \
+             half, still outstanding; until it lands this sub-check cannot run",
         ),
         (
             "l1.operator_shapes",
             "operators are only asked for their shapes by the compiler's shape-inference pass, \
-             which runs after resolution — and resolution is incomplete on this host (moe_layer \
-             has no implementation; D5)",
+             and `rustrain check` does not run the compiler yet (D5's planner half is \
+             outstanding)",
         ),
         (
             "l1.slot_allocation",
-            "allocation and alias analysis live in the plan's memory pass, which runs after \
-             resolution — and resolution is incomplete on this host (D5)",
+            "allocation and alias analysis live in the plan's memory pass, and `rustrain check` \
+             does not run the compiler yet (D5's planner half is outstanding)",
         ),
     ];
     SUBCHECKS

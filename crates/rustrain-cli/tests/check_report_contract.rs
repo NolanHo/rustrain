@@ -2,15 +2,17 @@
 //! and which of them are `skip` on this machine (F3).
 //!
 //! `check_l2.rs` gates D2's *outcomes* (exit codes, counter values, the four rejections). It cannot
-//! see a check that stopped being run: four of C2's L1 sub-checks are `skip` today because operator
-//! resolution is incomplete on this host — three need a **resolved** implementation for every node
-//! (`Plan::compile`; five primitives have no provider here, D5), and implementation availability
-//! is a `skip` by contract — so a description that fails shape inference still reports `exit 0` and
-//! a green-looking report, which a reviewer reproduced with a `matmul` declaring a rank-3 output.
+//! see a check that stopped being run: three of C2's L1 sub-checks are `skip` today because
+//! `rustrain check` does not run `Plan::compile` yet (the compiler is D5's planner half, still
+//! outstanding) — so a description that fails shape inference still reports `exit 0` and a
+//! green-looking report, which a reviewer reproduced with a `matmul` declaring a rank-3 output.
 //! This file closes the other half of the gate: the report must contain **exactly** C6's sixteen
-//! ids, and exactly the four of them that are expected to be `skip` must be `skip`. A check that
-//! starts running, stops running, disappears or is renamed turns this file red, and the *status*
-//! of every id is pinned, so "still skipped" cannot be mistaken for "still checked".
+//! ids, and exactly the ones expected to be `skip` must be `skip` — three compile-dependent skips
+//! always, plus implementation availability at every dtype the reference provider rejects (bf16 /
+//! f16 / the description's own bf16). At `--dtype f32` every node now resolves (moe_layer
+//! included), so availability is a `pass` there. A check that starts running, stops running,
+//! disappears or is renamed turns this file red, and the *status* of every id is pinned, so "still
+//! skipped" cannot be mistaken for "still checked".
 //!
 //! It also pins **what the checks found**, not only that they ran: which model and checkpoint the
 //! report is about, the dtype it ran at, the value of each of the eight counters, and the per-object
@@ -64,13 +66,25 @@ const C6_CHECK_IDS: [&str; 16] = [
     "l2.tensor_consumption",
 ];
 
-/// The three L1 sub-checks that still need `Plan::compile` (a **resolved** implementation for
-/// every node), plus implementation availability — five primitives of this description have no
-/// implementation on this host, which C2 makes a `skip`, never a `fail` and never a silent
-/// `pass`. D4 turned the other three compile-dependent sub-checks real: with the mesh, `instantiate`
-/// and the propagation pass run without any implementation, so `l1.layout_propagation`,
-/// `l1.partial_fulfillment` and `l1.collective_axes` are `pass` on this fixture now.
-const EXPECTED_SKIPS: [&str; 4] = [
+/// The three L1 sub-checks that still need `Plan::compile`, which `rustrain check` does not run
+/// yet (D5's planner half is outstanding) — a `skip` at every dtype, no matter how well
+/// resolution goes. D4 turned the other three compile-dependent sub-checks real: with the mesh,
+/// `instantiate` and the propagation pass run without any implementation, so
+/// `l1.layout_propagation`, `l1.partial_fulfillment` and `l1.collective_axes` are `pass` on this
+/// fixture now.
+const COMPILE_DEPENDENT_SKIPS: [&str; 3] =
+    ["l1.compile", "l1.operator_shapes", "l1.slot_allocation"];
+
+/// The `skip` set of an accepted run **at `--dtype f32`**: every node of the real fixture resolves
+/// (moe_layer included — D5's provider half is closed), so implementation availability is a
+/// `pass` and only the three compile-dependent sub-checks are left.
+const EXPECTED_SKIPS: [&str; 3] = COMPILE_DEPENDENT_SKIPS;
+
+/// The `skip` set at bf16 / f16 (and the description's own bf16): the reference provider accepts
+/// `f32` only, so every node is unresolved and implementation availability joins the three
+/// compile-dependent skips as the fourth — with its reasons spelled out (C2 makes an unresolved
+/// primitive a skip, never a fail and never a silent pass).
+const BF16_EXPECTED_SKIPS: [&str; 4] = [
     "l1.compile",
     "l1.implementation_availability",
     "l1.operator_shapes",
@@ -106,14 +120,15 @@ enum Unavailable {
     DtypeRejected,
 }
 
-/// One `--dtype`'s availability list: every `(operator, node count, why)` the `skip` must carry, and
-/// the total its `reason` must state.
+/// One `--dtype`'s availability list: every `(operator, node count, why)` a `skip` must carry, and
+/// the total its `reason` must state. An **empty** table is the pass form: every node resolved,
+/// no per-operator list, and the reason counts the whole plan as resolved.
 ///
-/// The two lists differ by **cause**, not only by length. At `--dtype f32` only the one primitive
-/// nothing publishes is left (`moe_layer`, 41 of 1064 nodes — D5's reference-provider half landed
-/// the other four); at the description's own `bf16` — which is also what an explicit `--dtype
-/// bf16` or `f16` asks for — every node whose `reference.f32` variant rejects that dtype joins
-/// them, which is the entire plan (1064 of 1064 nodes over 20 operators). A list that is merely
+/// The two lists differ by **cause**, not only by length. At `--dtype f32` nothing is left — with
+/// `moe_layer` published (D5's provider half is closed), all 1064 nodes resolve. At the
+/// description's own `bf16` — which is also what an explicit `--dtype bf16` or `f16` asks for —
+/// every node whose `reference.f32` variant rejects that dtype is unresolved, which is the entire
+/// plan (1064 of 1064 nodes over 16 operators, `moe_layer` among them). A list that is merely
 /// *truncated* while its reason keeps saying `41 of 1064` is exactly the false green this pins
 /// down.
 struct Availability {
@@ -121,16 +136,16 @@ struct Availability {
     total: i64,
 }
 
-/// `--dtype f32`: the four D5 compute primitives now resolve; `moe_layer` (the EXPLICIT MoE op,
-/// the lead's half of D5) is the one remaining unpublished primitive.
+/// `--dtype f32`: every node resolves, so the availability item is the **pass** form — no
+/// per-operator list, and the reason counts the whole plan.
 const F32_AVAILABILITY: Availability = Availability {
-    entries: &[("moe_layer", 41, Unavailable::NoProvider)],
-    total: 41,
+    entries: &[],
+    total: 0,
 };
 
 /// `bf16` (the description's dtype) or `f16`: the reference provider accepts `f32` only, so every
-/// node of the plan is unresolved — the four D5 primitives now rejected by dtype, `moe_layer`
-/// still unpublished.
+/// node of the plan is unresolved — `moe_layer` now published but rejected by dtype, like the
+/// other fifteen.
 const BF16_AVAILABILITY: Availability = Availability {
     entries: &[
         ("cat", 1, Unavailable::DtypeRejected),
@@ -141,7 +156,7 @@ const BF16_AVAILABILITY: Availability = Availability {
         ("gated_delta_rule", 30, Unavailable::DtypeRejected),
         ("l2norm", 60, Unavailable::DtypeRejected),
         ("linear", 298, Unavailable::DtypeRejected),
-        ("moe_layer", 41, Unavailable::NoProvider),
+        ("moe_layer", 41, Unavailable::DtypeRejected),
         ("narrow", 22, Unavailable::DtypeRejected),
         ("reshape", 66, Unavailable::DtypeRejected),
         ("rmsnorm", 108, Unavailable::DtypeRejected),
@@ -153,8 +168,9 @@ const BF16_AVAILABILITY: Availability = Availability {
     total: 1064,
 };
 
-/// Both tables must cover the same unpublished primitives with the same node counts: the
-/// `f32` list is the subset of the `bf16` one that nothing can do anything about.
+/// Both tables must agree on which primitives nothing publishes (now: none — `moe_layer` is
+/// published, so both lists' unpublished subsets are empty): the `f32` list is the subset of the
+/// `bf16` one that nothing can do anything about.
 fn unpublished_component<'a>(table: &'a [(&'a str, i64, Unavailable)]) -> Vec<(&'a str, i64)> {
     let mut out: Vec<(&'a str, i64)> = table
         .iter()
@@ -213,11 +229,17 @@ impl Status {
 /// The status of every id the real fixture produces **when the arguments are accepted**, which is
 /// the fifteen ids a normal run has: `cli.arguments` exists only to reject bad arguments.
 ///
+/// This table is the **bf16** truth (the description's own dtype): the reference provider accepts
+/// `f32` only, so `l1.implementation_availability` is a `skip` there. At `--dtype f32` every node
+/// resolves and that one id flips to `pass` — [`expected_status_for`] derives the f32 table from
+/// this one, one id at a time, never by editing the shared expectation.
+///
 /// Pinning the status is the point. `l1.structure` passing is not evidence that L1 ran: the three
-/// compile-dependent sub-checks that still need resolution and the availability check are the
-/// ones that would have caught a description that cannot compile, and they are `skip` today by
-/// contract — while `l1.instantiate` and the three propagation checks D4 made real must be `pass`
-/// on this fixture, or the D4 headline acceptance silently stopped running.
+/// compile-dependent sub-checks (which need `Plan::compile`, not run by `check` yet) and — at
+/// bf16 — the availability check are the ones that would have caught a description that cannot
+/// compile, and they are `skip` by contract — while `l1.instantiate` and the three propagation
+/// checks D4 made real must be `pass` on this fixture, or the D4 headline acceptance silently
+/// stopped running.
 const EXPECTED_STATUS: [(&str, Status); 15] = [
     ("l1.structure", Status::Pass),
     ("l1.instantiate", Status::Pass),
@@ -235,6 +257,39 @@ const EXPECTED_STATUS: [(&str, Status); 15] = [
     ("l2.shape_reconciliation", Status::Pass),
     ("l2.dtype_compatibility", Status::Pass),
 ];
+
+/// The status table a run expects, derived from [`EXPECTED_STATUS`] with the one dtype-dependent
+/// id overridden: implementation availability is a `pass` when the availability table is the
+/// empty (all-resolved) form and a `skip` otherwise. Deriving one id from the shared table is
+/// deliberate — the other fourteen ids are dtype-independent and stay pinned in one place.
+fn expected_status_for(availability: &Availability) -> BTreeMap<String, Status> {
+    let mut map: BTreeMap<String, Status> = EXPECTED_STATUS
+        .iter()
+        .map(|(id, status)| ((*id).to_string(), *status))
+        .collect();
+    let availability_status = if availability.entries.is_empty() {
+        Status::Pass
+    } else {
+        Status::Skip
+    };
+    map.insert(
+        "l1.implementation_availability".to_string(),
+        availability_status,
+    );
+    map
+}
+
+/// The `skip` set a run expects: the three compile-dependent skips, plus implementation
+/// availability exactly when that run's availability table is the non-empty (unresolved) form.
+/// Both sets are named constants — `EXPECTED_SKIPS` is the f32 pin (4 → 3 the day moe_layer
+/// landed), `BF16_EXPECTED_SKIPS` the dtype-rejected pin.
+fn skip_set_for(availability: &Availability) -> &'static [&'static str] {
+    if availability.entries.is_empty() {
+        &EXPECTED_SKIPS
+    } else {
+        &BF16_EXPECTED_SKIPS
+    }
+}
 
 fn cli_binary() -> &'static str {
     option_env!("CARGO_BIN_EXE_rustrain")
@@ -480,78 +535,105 @@ fn assert_details(doc: &Value, items: &[Item], availability: &Availability, stag
             }
             "l1.implementation_availability" => {
                 seen_availability = true;
-                assert_eq!(
-                    item.status,
-                    Status::Skip,
-                    "the availability item carries the per-operator list and is a `skip` on this \
-                     host"
-                );
-                assert_eq!(
-                    item.details.len(),
-                    availability.entries.len(),
-                    "the `skip` must list one entry per unavailable operator at this dtype; got: {:?}",
-                    item.details
-                );
-                for (op, nodes, why_kind) in availability.entries {
-                    let prefix = format!("{op}: {nodes} node(s)");
-                    let entry = item
-                        .details
-                        .iter()
-                        .find(|detail| detail.starts_with(&prefix))
-                        .unwrap_or_else(|| {
-                            panic!(
-                                "no `details` entry starts with `{prefix}`; the report says what is \
-                                 missing per operator and C6 keeps that list machine-readable. \
-                                 entries: {:?}",
-                                item.details
-                            )
-                        });
-                    // `{op}: {n} node(s): {why}` — the count is only half of it. C2 makes the `Skip`
-                    // answer *what is missing*, so the tail must state the cause the table gives,
-                    // not merely be non-empty.
-                    let why = entry[prefix.len()..].trim_start_matches(':').trim();
-                    match why_kind {
-                        Unavailable::NoProvider => assert_eq!(
-                            why,
-                            format!("no loaded plugin publishes `{op}`"),
-                            "`{op}` is listed as a missing primitive, but its entry does not say so: \
-                             {entry}"
-                        ),
-                        Unavailable::DtypeRejected => assert!(
-                            why.contains("is not accepted"),
-                            "`{op}` has a provider that rejects this dtype, but its entry does not \
-                             say that: {entry}"
-                        ),
-                    }
-                }
-
-                // The reason inlines the same list it hands to `details` (`op ×count (why)`), so the
-                // two must be the *same* list. The `×` spelling is this report's own convention:
-                // if it is ever reworded deliberately, this assertion is the one to update, and the
-                // message below names the operator it could not find.
-                assert_eq!(
-                    item.reason.matches('×').count(),
-                    availability.entries.len(),
-                    "the reason enumerates a different number of operators than `details` does: {}",
-                    item.reason
-                );
-                for (op, nodes, _) in availability.entries {
+                if availability.entries.is_empty() {
+                    // The pass form (--dtype f32): every node resolved, so the item is a `pass`
+                    // with NO per-operator list, and the reason counts the whole plan.
+                    assert_eq!(
+                        item.status,
+                        Status::Pass,
+                        "at a dtype every node resolves at, the availability item is a `pass`: \
+                         {}",
+                        item.reason
+                    );
                     assert!(
-                        item.reason.contains(&format!("{op} ×{nodes}")),
-                        "the reason does not carry the `{op} ×{nodes}` its `details` report: {}",
+                        item.details.is_empty(),
+                        "the pass form carries no per-operator list; got: {:?}",
+                        item.details
+                    );
+                    let lead = format!(
+                        "all {} node(s) resolve to an implementation on this host",
+                        plan_nodes
+                    );
+                    assert!(
+                        item.reason.starts_with(&lead),
+                        "the pass reason must open with `{lead}` — the number of resolved nodes \
+                         out of the plan: {}",
+                        item.reason
+                    );
+                } else {
+                    assert_eq!(
+                        item.status,
+                        Status::Skip,
+                        "the availability item carries the per-operator list and is a `skip` on \
+                         this host at this dtype"
+                    );
+                    assert_eq!(
+                        item.details.len(),
+                        availability.entries.len(),
+                        "the `skip` must list one entry per unavailable operator at this dtype; got: {:?}",
+                        item.details
+                    );
+                    for (op, nodes, why_kind) in availability.entries {
+                        let prefix = format!("{op}: {nodes} node(s)");
+                        let entry = item
+                            .details
+                            .iter()
+                            .find(|detail| detail.starts_with(&prefix))
+                            .unwrap_or_else(|| {
+                                panic!(
+                                    "no `details` entry starts with `{prefix}`; the report says what is \
+                                     missing per operator and C6 keeps that list machine-readable. \
+                                     entries: {:?}",
+                                    item.details
+                                )
+                            });
+                        // `{op}: {n} node(s): {why}` — the count is only half of it. C2 makes the `Skip`
+                        // answer *what is missing*, so the tail must state the cause the table gives,
+                        // not merely be non-empty.
+                        let why = entry[prefix.len()..].trim_start_matches(':').trim();
+                        match why_kind {
+                            Unavailable::NoProvider => assert_eq!(
+                                why,
+                                format!("no loaded plugin publishes `{op}`"),
+                                "`{op}` is listed as a missing primitive, but its entry does not say so: \
+                                 {entry}"
+                            ),
+                            Unavailable::DtypeRejected => assert!(
+                                why.contains("is not accepted"),
+                                "`{op}` has a provider that rejects this dtype, but its entry does not \
+                                 say that: {entry}"
+                            ),
+                        }
+                    }
+
+                    // The reason inlines the same list it hands to `details` (`op ×count (why)`), so the
+                    // two must be the *same* list. The `×` spelling is this report's own convention:
+                    // if it is ever reworded deliberately, this assertion is the one to update, and the
+                    // message below names the operator it could not find.
+                    assert_eq!(
+                        item.reason.matches('×').count(),
+                        availability.entries.len(),
+                        "the reason enumerates a different number of operators than `details` does: {}",
+                        item.reason
+                    );
+                    for (op, nodes, _) in availability.entries {
+                        assert!(
+                            item.reason.contains(&format!("{op} ×{nodes}")),
+                            "the reason does not carry the `{op} ×{nodes}` its `details` report: {}",
+                            item.reason
+                        );
+                    }
+
+                    // The reason's *leading* claim, not just "the plan size appears somewhere": a
+                    // reason reading `41 of 425273 node(s) … (the plan has 1064)` must not pass.
+                    let lead = format!("{} of {} node(s)", availability.total, plan_nodes);
+                    assert!(
+                        item.reason.starts_with(&lead),
+                        "the reason must open with `{lead}` — the number of unresolved nodes out of the \
+                         plan: {}",
                         item.reason
                     );
                 }
-
-                // The reason's *leading* claim, not just "the plan size appears somewhere": a
-                // reason reading `41 of 425273 node(s) … (the plan has 1064)` must not pass.
-                let lead = format!("{} of {} node(s)", availability.total, plan_nodes);
-                assert!(
-                    item.reason.starts_with(&lead),
-                    "the reason must open with `{lead}` — the number of unresolved nodes out of the \
-                     plan: {}",
-                    item.reason
-                );
             }
             "l2.ignore_coverage" => {
                 seen_ignore = true;
@@ -609,31 +691,37 @@ fn assert_id_set(observed: &BTreeMap<String, Status>, expected: &[&str], what: &
     );
 }
 
-/// F3: on this machine the three resolution-dependent L1 sub-checks and implementation
-/// availability are `skip` — no more, no fewer. If D5 makes one of them real, or a description
-/// stops expanding, this fails and says which.
-fn assert_skip_set(observed: &BTreeMap<String, Status>) {
+/// F3: the `skip` set of an accepted run is exactly what this machine is expected to have **at
+/// the run's dtype** — the three compile-dependent sub-checks always, plus implementation
+/// availability exactly when the reference provider rejects the dtype. If D5's planner half makes
+/// one of the three real, or a description stops expanding, this fails and says which.
+fn assert_skip_set(observed: &BTreeMap<String, Status>, expected: &[&str]) {
     let mut skips: Vec<&str> = observed
         .iter()
         .filter(|(_, status)| **status == Status::Skip)
         .map(|(id, _)| id.as_str())
         .collect();
     skips.sort_unstable();
-    let mut expected = EXPECTED_SKIPS.to_vec();
+    let mut expected = expected.to_vec();
     expected.sort_unstable();
     assert_eq!(
         skips, expected,
-        "the `skip` set is not the one this machine is expected to have"
+        "the `skip` set is not the one this machine is expected to have at this dtype"
     );
 }
 
 /// One **accepted** run: `check(&extra)` must exit 0, and the report must be C6's shape with exactly
-/// the fifteen ids a normal run has and the statuses pinned in `EXPECTED_STATUS`.
+/// the fifteen ids a normal run has and the statuses pinned per dtype (bf16: [`EXPECTED_STATUS`];
+/// f32: the same table with availability a `pass`, derived in [`expected_status_for`]).
 ///
 /// The per-object `details` are deliberately not part of this: availability is dtype-dependent (at
-/// `--dtype f32` the five primitives no plugin publishes are all that is left; at the description's
-/// own `bf16` every node whose plugin variant rejects bf16 joins them), so each run pins its own.
-fn accepted_run(extra: &[&str], expected_dtype: &str) -> (Value, Vec<Item>) {
+/// `--dtype f32` it is the empty pass form; at the description's own `bf16` every node whose
+/// plugin variant rejects bf16 is listed), so each run pins its own.
+fn accepted_run(
+    extra: &[&str],
+    expected_dtype: &str,
+    availability: &Availability,
+) -> (Value, Vec<Item>) {
     let run = check(extra);
     assert_eq!(
         run.code,
@@ -655,33 +743,30 @@ fn accepted_run(extra: &[&str], expected_dtype: &str) -> (Value, Vec<Item>) {
         .filter(|id| *id != "cli.arguments")
         .collect();
     assert_id_set(&observed, &accepted, "accepted arguments");
-    assert_skip_set(&observed);
+    let expected_skips = skip_set_for(availability);
+    assert_skip_set(&observed, expected_skips);
 
     // Every id's status, not just the skips: a check that silently stops running is the failure
     // mode this file exists for.
-    let expected: BTreeMap<String, Status> = EXPECTED_STATUS
-        .iter()
-        .map(|(id, status)| ((*id).to_string(), *status))
-        .collect();
+    let expected = expected_status_for(availability);
     assert_eq!(
         observed, expected,
         "the status of at least one check changed; the expectation is pinned in EXPECTED_STATUS"
     );
 
-    // The four skips are pinned twice on purpose: as a set (F3's assertion) and inside the status
+    // The skips are pinned twice on purpose: as a set (F3's assertion) and inside the status
     // table. A table that drifted from the set would make one of the two red.
-    let pinned: Vec<&str> = EXPECTED_STATUS
+    let mut pinned: Vec<&str> = expected
         .iter()
-        .filter(|(_, status)| *status == Status::Skip)
-        .map(|(id, _)| *id)
+        .filter(|(_, status)| **status == Status::Skip)
+        .map(|(id, _)| id.as_str())
         .collect();
-    let mut pinned_sorted = pinned.clone();
-    pinned_sorted.sort_unstable();
-    let mut skips_sorted = EXPECTED_SKIPS.to_vec();
+    pinned.sort_unstable();
+    let mut skips_sorted = expected_skips.to_vec();
     skips_sorted.sort_unstable();
     assert_eq!(
-        pinned_sorted, skips_sorted,
-        "EXPECTED_STATUS and EXPECTED_SKIPS disagree"
+        pinned, skips_sorted,
+        "EXPECTED_STATUS and the expected skip set disagree"
     );
 
     (doc, items)
@@ -689,7 +774,7 @@ fn accepted_run(extra: &[&str], expected_dtype: &str) -> (Value, Vec<Item>) {
 
 #[test]
 fn the_report_has_c6s_shape_and_exactly_c6s_check_ids() {
-    let (doc, items) = accepted_run(&["--dtype", "f32"], "f32");
+    let (doc, items) = accepted_run(&["--dtype", "f32"], "f32", &F32_AVAILABILITY);
     assert_eq!(
         unpublished_component(F32_AVAILABILITY.entries),
         unpublished_component(BF16_AVAILABILITY.entries),
@@ -707,7 +792,7 @@ fn the_report_has_c6s_shape_and_exactly_c6s_check_ids() {
 /// would have satisfied every other assertion in this file.
 #[test]
 fn the_default_dtype_run_is_the_same_report_at_the_descriptions_own_dtype() {
-    let (doc, items) = accepted_run(&[], "bf16");
+    let (doc, items) = accepted_run(&[], "bf16", &BF16_AVAILABILITY);
     // Counts, ids, statuses and the skip set are already pinned by `accepted_run`: the plan and the
     // checkpoint do not depend on the dtype. What differs is the availability list, and at bf16 it
     // is the whole plan — every node of the reference provider rejects the dtype.
@@ -725,7 +810,7 @@ fn the_default_dtype_run_is_the_same_report_at_the_descriptions_own_dtype() {
 #[test]
 fn an_explicit_dtype_run_is_gated_at_every_dtype_it_accepts() {
     for dtype in ["bf16", "f16"] {
-        let (doc, items) = accepted_run(&["--dtype", dtype], dtype);
+        let (doc, items) = accepted_run(&["--dtype", dtype], dtype, &BF16_AVAILABILITY);
         assert_details(&doc, &items, &BF16_AVAILABILITY, &STAGE0_ONLY);
     }
 }
@@ -735,10 +820,12 @@ fn an_explicit_dtype_run_is_gated_at_every_dtype_it_accepts() {
 /// the other fifteen unchanged: an argument error must not silently change what was checked.
 ///
 /// The counters are pinned here too (`assert_c6_shape` runs on both reports), because a rejected
-/// argument must not change what was *found* either. The availability `details` are deliberately not
-/// pinned on this run: a rejected `--dtype` changes the dtype the resolution pass asks the plugins
-/// for, so that list legitimately differs (C2's `skip` still says what is missing, one operator per
-/// line). The ignore coverage is dtype-independent and is covered by the accepted run above.
+/// argument must not change what was *found* either. The availability item is the one deliberate
+/// exception: a rejected `--dtype` falls back to the description's own `bf16`, so availability is
+/// a `skip` with the whole-plan list, while the accepted f32 run compared against it is a `pass` —
+/// the dtype legitimately decides that one item (C2's `skip` still says what is missing, one
+/// operator per line). The other fourteen statuses must not move, and the ignore coverage is
+/// dtype-independent.
 #[test]
 fn a_rejected_argument_emits_the_sixteenth_id_and_changes_nothing_else() {
     let accepted = statuses(&items(&check(&["--dtype", "f32"]).json()));
@@ -758,7 +845,7 @@ fn a_rejected_argument_emits_the_sixteenth_id_and_changes_nothing_else() {
     let rejected_items = items(&doc);
     let rejected = statuses(&rejected_items);
     assert_id_set(&rejected, &C6_CHECK_IDS, "rejected arguments");
-    assert_skip_set(&rejected);
+    assert_skip_set(&rejected, &BF16_EXPECTED_SKIPS);
     assert_eq!(
         rejected.get("cli.arguments"),
         Some(&Status::Fail),
@@ -767,6 +854,11 @@ fn a_rejected_argument_emits_the_sixteenth_id_and_changes_nothing_else() {
     );
 
     for (id, status) in &accepted {
+        if id == "l1.implementation_availability" {
+            // The one status the dtype legitimately decides: the fallback run is bf16 (skip with
+            // the whole-plan list), the accepted run is f32 (pass). See the doc comment.
+            continue;
+        }
         assert_eq!(
             rejected.get(id),
             Some(status),
@@ -789,10 +881,10 @@ fn a_rejected_argument_emits_the_sixteenth_id_and_changes_nothing_else() {
 
 /// **D4's headline acceptance.** The five-axis mesh `tp=2, cp=2, ep=4, dp=2, pp=2` must produce
 /// exactly the same report an accepted run does: every id, every status, every counter, the same
-/// availability list — and exit 0. `instantiate` runs for real on one representative rank per
+/// availability result — and exit 0. `instantiate` runs for real on one representative rank per
 /// stage (C5's witness pins the pruned per-stage counts), and the three propagation checks run
-/// on stage 0 (rank 0), so the whole `EXPECTED_STATUS` table (with the four `pass` items D4 made
-/// real) is re-pinned at the acceptance mesh, not only at the trivial all-ones mesh.
+/// on stage 0 (rank 0), so the whole status table (with the four `pass` items D4 made real) is
+/// re-pinned at the acceptance mesh, not only at the trivial all-ones mesh.
 #[test]
 fn the_five_axis_acceptance_mesh_exits_zero_with_the_same_report() {
     let (doc, items) = accepted_run(
@@ -800,6 +892,7 @@ fn the_five_axis_acceptance_mesh_exits_zero_with_the_same_report() {
             "--dtype", "f32", "--tp", "2", "--cp", "2", "--ep", "4", "--dp", "2", "--pp", "2",
         ],
         "f32",
+        &F32_AVAILABILITY,
     );
     assert_details(&doc, &items, &F32_AVAILABILITY, &FIVE_AXIS_STAGES);
 }
