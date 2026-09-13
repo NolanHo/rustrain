@@ -4,13 +4,13 @@
 //! templates (allocate slots, emit nodes) → evaluate shapes (fully concrete) → `check_structure()`
 //! → attach the symbolic declarations of `binding`.
 //!
-//! Every `layout` in the global plan is `Replicate`: axes and sharding wait for `instantiate` to
+//! Every `layout` in the global plan is replicated: axes and sharding wait for `instantiate` to
 //! see a mesh, so `expand` only records them ([`ResolvedBinding`]) and never touches a shape.
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use rustrain_abi::ffi::RsDtype;
-use rustrain_parallel::ParallelConfig;
+use rustrain_parallel::{Mesh, MeshFingerprint, ParallelConfig};
 use rustrain_plan::{AttrValue, Attrs, OpRef, Phase, Plan, PlanBuilder, SlotId, SlotKind};
 
 use crate::ModelError;
@@ -24,10 +24,19 @@ const UNTIL_INDEX: &str = "l";
 /// The `{last}` placeholder: the last index of the most recent repeat/until expansion.
 const LAST_INDEX: &str = "last";
 
+/// The mesh fingerprint every global plan is built with.
+///
+/// `expand` never sees a real mesh — axes and sharding are declared on `binding`s and applied by
+/// `instantiate` — so the default (all degree-1) config's fingerprint stands in. The two builder
+/// sites share this one helper so the fact stays visibly the same.
+fn global_mesh() -> MeshFingerprint {
+    Mesh::from_config(&ParallelConfig::default()).fingerprint()
+}
+
 /// What `expand` produces.
 #[derive(Debug)]
 pub struct Expanded {
-    /// The global plan: concrete shapes, every `layout` `Replicate`, nodes in emission order.
+    /// The global plan: concrete shapes, every `layout` replicated, nodes in emission order.
     pub plan: Plan,
     /// The slots every `binding` hit (input of the L2 load check,
     /// `docs/design/model-description.md` §3.5).
@@ -112,7 +121,7 @@ pub fn expand_lenient(desc: &ModelDesc, config: &serde_json::Value) -> Result<Ex
 
     let builder = std::mem::replace(
         &mut expander.builder,
-        PlanBuilder::new("", Phase::Forward, ParallelConfig::default()),
+        PlanBuilder::new("", Phase::Forward, global_mesh()),
     );
     let plan = builder.build()?;
     let (bindings, unbound_slots) = expander.bind()?;
@@ -295,7 +304,7 @@ impl<'a> Expander<'a> {
             desc,
             params,
             default_dtype,
-            builder: PlanBuilder::new(desc.name.clone(), Phase::Forward, ParallelConfig::default()),
+            builder: PlanBuilder::new(desc.name.clone(), Phase::Forward, global_mesh()),
             slots: BTreeMap::new(),
             names: Vec::new(),
             slot_info: Vec::new(),

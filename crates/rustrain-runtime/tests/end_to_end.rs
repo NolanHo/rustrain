@@ -7,13 +7,13 @@
 
 use std::sync::OnceLock;
 
+use rustrain_abi::Plugin;
 use rustrain_abi::author::{OpSpec, PluginBuilder};
 use rustrain_abi::ffi::{
     RsAttrKind, RsAttrs, RsCtx, RsDeviceKind, RsDtype, RsMemReq, RsPlugin, RsTensor,
 };
-use rustrain_abi::Plugin;
 use rustrain_ops::{Phase, Recipe, Registry, TargetEnv};
-use rustrain_parallel::{GroupKind, ParallelConfig, ParallelLayout, ReduceOp};
+use rustrain_parallel::{GroupMask, Mesh, ParallelConfig, ParallelLayout, ReduceOp};
 use rustrain_plan::{Attrs, OpRef, PlanBuilder, SlotKind};
 
 use rustrain_runtime::{Executor, HostAllocator, RuntimeError, SingleRank, required_inputs};
@@ -163,22 +163,18 @@ fn test_plugin() -> &'static RsPlugin {
     static PLUGIN: OnceLock<&'static RsPlugin> = OnceLock::new();
     PLUGIN.get_or_init(|| {
         PluginBuilder::new("test", "0.1.0")
-            .op(
-                OpSpec::new("scale", "test.f32")
-                    .doc("out = in * factor")
-                    .dtypes(&[RsDtype::F32])
-                    .execute(scale_execute)
-                    .infer(scale_infer)
-                    .memory(zero_memory),
-            )
-            .op(
-                OpSpec::new("linear", "test.f32")
-                    .doc("stand-in for a tensor-parallel linear")
-                    .dtypes(&[RsDtype::F32])
-                    .execute(linear_execute)
-                    .infer(scale_infer)
-                    .memory(zero_memory),
-            )
+            .op(OpSpec::new("scale", "test.f32")
+                .doc("out = in * factor")
+                .dtypes(&[RsDtype::F32])
+                .execute(scale_execute)
+                .infer(scale_infer)
+                .memory(zero_memory))
+            .op(OpSpec::new("linear", "test.f32")
+                .doc("stand-in for a tensor-parallel linear")
+                .dtypes(&[RsDtype::F32])
+                .execute(linear_execute)
+                .infer(scale_infer)
+                .memory(zero_memory))
             .build()
     })
 }
@@ -210,7 +206,11 @@ fn plugin_loads_registers_and_resolves_from_the_recipe() {
 fn compiled_plan_executes_and_produces_the_expected_numbers() {
     let (registry, recipe, env) = setup();
 
-    let mut b = PlanBuilder::new("scale", Phase::Forward, ParallelConfig::default());
+    let mut b = PlanBuilder::new(
+        "scale",
+        Phase::Forward,
+        Mesh::from_config(&ParallelConfig::default()).fingerprint(),
+    );
     let x = b.slot("x", RsDtype::F32, vec![4], SlotKind::Input);
     let y = b.slot("y", RsDtype::F32, vec![4], SlotKind::Output);
     b.node(
@@ -222,7 +222,7 @@ fn compiled_plan_executes_and_produces_the_expected_numbers() {
     );
     let plan = b.build().unwrap();
 
-    let compiled = rustrain_plan::Compiler::new(&registry, &recipe, env, ParallelConfig::default())
+    let compiled = rustrain_plan::Compiler::new(&registry, &recipe, env)
         .compile(&plan)
         .expect("compile");
 
@@ -253,8 +253,19 @@ fn row_parallel_weight_inserts_a_collective_the_runtime_drives() {
         tensor: 2,
         ..Default::default()
     };
+    let mesh = Mesh::from_config(&parallel);
+    // The mesh names the axis; the test must not hard-code the bit number.
+    let tp_axis = mesh
+        .index_of("tp")
+        .expect("the canonical mesh has a tp axis");
+    let tp = GroupMask::single(tp_axis).expect("the axis index fits in the mask");
+    assert_eq!(
+        mesh.group_name(tp).expect("the mask is over this mesh"),
+        "tp",
+        "the mask derived from the mesh must name out as the tp axis"
+    );
 
-    let mut b = PlanBuilder::new("tp", Phase::Forward, parallel);
+    let mut b = PlanBuilder::new("tp", Phase::Forward, mesh.fingerprint());
     let x = b.slot("x", RsDtype::F32, vec![4], SlotKind::Input);
     // A weight is [K, N]; sharding dim 0 splits the contraction, so each rank
     // holds a partial sum from the same `linear` rule the framework applies.
@@ -263,10 +274,7 @@ fn row_parallel_weight_inserts_a_collective_the_runtime_drives() {
         RsDtype::F32,
         vec![3],
         SlotKind::Weight,
-        ParallelLayout::Shard {
-            dim: 0,
-            group: GroupKind::Tp,
-        },
+        ParallelLayout::shard(0, tp),
     );
     // ...but the plan promises a complete tensor here, so a conversion is owed.
     let y = b.slot("y", RsDtype::F32, vec![4], SlotKind::Output);
@@ -279,7 +287,7 @@ fn row_parallel_weight_inserts_a_collective_the_runtime_drives() {
     );
     let plan = b.build().unwrap();
 
-    let compiled = rustrain_plan::Compiler::new(&registry, &recipe, env, parallel).compile(&plan);
+    let compiled = rustrain_plan::Compiler::new(&registry, &recipe, env).compile(&plan);
 
     // The weight layout is the only thing that could force communication, and
     // the shard rule for `linear` must have noticed it.
@@ -289,7 +297,10 @@ fn row_parallel_weight_inserts_a_collective_the_runtime_drives() {
         1,
         "exactly one collective should have been spliced in"
     );
-    assert_eq!(compiled.inserted[0].op, rustrain_plan::intrinsic::ALL_REDUCE);
+    assert_eq!(
+        compiled.inserted[0].op,
+        rustrain_plan::intrinsic::ALL_REDUCE
+    );
     assert_eq!(compiled.inserted[0].reduce, Some(ReduceOp::Sum));
 
     let mut ex = Executor::new(
@@ -302,7 +313,10 @@ fn row_parallel_weight_inserts_a_collective_the_runtime_drives() {
     ex.write_f32(w, &[1.0, 1.0, 1.0]).unwrap();
 
     let stats = ex.run().unwrap();
-    assert_eq!(stats.collectives, 1, "the runtime must drive the all-reduce");
+    assert_eq!(
+        stats.collectives, 1,
+        "the runtime must drive the all-reduce"
+    );
     assert_eq!(stats.ops, 1);
     // With one process the all-reduce is the identity, so the value survives.
     assert_eq!(ex.read_f32(y).unwrap(), vec![3.0, 6.0, 9.0, 12.0]);
@@ -317,22 +331,30 @@ fn single_rank_refuses_when_the_world_is_larger_than_one() {
         tensor: 2,
         ..Default::default()
     };
+    let mesh = Mesh::from_config(&parallel);
+    let tp_axis = mesh
+        .index_of("tp")
+        .expect("the canonical mesh has a tp axis");
+    let tp = GroupMask::single(tp_axis).expect("the axis index fits in the mask");
 
-    let mut b = PlanBuilder::new("tp", Phase::Forward, parallel);
+    let mut b = PlanBuilder::new("tp", Phase::Forward, mesh.fingerprint());
     let x = b.slot("x", RsDtype::F32, vec![4], SlotKind::Input);
     let w = b.slot_with_layout(
         "w",
         RsDtype::F32,
         vec![3],
         SlotKind::Weight,
-        ParallelLayout::Shard {
-            dim: 0,
-            group: GroupKind::Tp,
-        },
+        ParallelLayout::shard(0, tp),
     );
     let y = b.slot("y", RsDtype::F32, vec![4], SlotKind::Output);
-    b.node(OpRef::new("linear"), vec![x, w], vec![y], Attrs::new(), "lin");
-    let compiled = rustrain_plan::Compiler::new(&registry, &recipe, env, parallel)
+    b.node(
+        OpRef::new("linear"),
+        vec![x, w],
+        vec![y],
+        Attrs::new(),
+        "lin",
+    );
+    let compiled = rustrain_plan::Compiler::new(&registry, &recipe, env)
         .compile(&b.build().unwrap())
         .unwrap();
 
@@ -360,18 +382,22 @@ fn single_rank_refuses_when_the_world_is_larger_than_one() {
 #[test]
 fn resolved_implementation_is_recorded_in_the_digest() {
     let (registry, recipe, env) = setup();
-    let mut b = PlanBuilder::new("scale", Phase::Forward, ParallelConfig::default());
+    let mut b = PlanBuilder::new(
+        "scale",
+        Phase::Forward,
+        Mesh::from_config(&ParallelConfig::default()).fingerprint(),
+    );
     let x = b.slot("x", RsDtype::F32, vec![2], SlotKind::Input);
     let y = b.slot("y", RsDtype::F32, vec![2], SlotKind::Output);
     b.node(OpRef::new("scale"), vec![x], vec![y], Attrs::new(), "s");
     let plan = b.build().unwrap();
 
-    let a = rustrain_plan::Compiler::new(&registry, &recipe, env.clone(), ParallelConfig::default())
+    let a = rustrain_plan::Compiler::new(&registry, &recipe, env.clone())
         .compile(&plan)
         .unwrap();
 
     // Same inputs, same decision, same digest.
-    let b2 = rustrain_plan::Compiler::new(&registry, &recipe, env.clone(), ParallelConfig::default())
+    let b2 = rustrain_plan::Compiler::new(&registry, &recipe, env.clone())
         .compile(&plan)
         .unwrap();
     assert_eq!(a.digest, b2.digest);
@@ -380,25 +406,40 @@ fn resolved_implementation_is_recorded_in_the_digest() {
 
     // Naming a different implementation in the recipe changes the digest without
     // recompiling anything.
-    let other = Recipe::from_toml("[kernel]\ndefault = \"test\"\n[kernel.ops.scale]\nforward = \"test.f32\"\n")
-        .unwrap();
-    let c = rustrain_plan::Compiler::new(&registry, &other, env, ParallelConfig::default())
+    let other = Recipe::from_toml(
+        "[kernel]\ndefault = \"test\"\n[kernel.ops.scale]\nforward = \"test.f32\"\n",
+    )
+    .unwrap();
+    let c = rustrain_plan::Compiler::new(&registry, &other, env)
         .compile(&plan)
         .unwrap();
     assert_eq!(c.resolved[0].spec_name, "scale@test.f32");
-    assert_eq!(a.digest, c.digest, "an equivalent recipe must not churn the digest");
+    assert_eq!(
+        a.digest, c.digest,
+        "an equivalent recipe must not churn the digest"
+    );
 }
 
 #[test]
 fn unknown_operator_is_a_hard_error_not_a_fallback() {
     let (registry, recipe, env) = setup();
-    let mut b = PlanBuilder::new("bad", Phase::Forward, ParallelConfig::default());
+    let mut b = PlanBuilder::new(
+        "bad",
+        Phase::Forward,
+        Mesh::from_config(&ParallelConfig::default()).fingerprint(),
+    );
     let x = b.slot("x", RsDtype::F32, vec![2], SlotKind::Input);
     let y = b.slot("y", RsDtype::F32, vec![2], SlotKind::Output);
-    b.node(OpRef::new("does_not_exist"), vec![x], vec![y], Attrs::new(), "nope");
+    b.node(
+        OpRef::new("does_not_exist"),
+        vec![x],
+        vec![y],
+        Attrs::new(),
+        "nope",
+    );
     let plan = b.build().unwrap();
 
-    let err = rustrain_plan::Compiler::new(&registry, &recipe, env, ParallelConfig::default())
+    let err = rustrain_plan::Compiler::new(&registry, &recipe, env)
         .compile(&plan)
         .unwrap_err();
     let text = err.to_string();
@@ -408,11 +449,15 @@ fn unknown_operator_is_a_hard_error_not_a_fallback() {
 #[test]
 fn host_allocator_tracks_residency_and_frees_on_drop() {
     let (registry, recipe, env) = setup();
-    let mut b = PlanBuilder::new("scale", Phase::Forward, ParallelConfig::default());
+    let mut b = PlanBuilder::new(
+        "scale",
+        Phase::Forward,
+        Mesh::from_config(&ParallelConfig::default()).fingerprint(),
+    );
     let x = b.slot("x", RsDtype::F32, vec![1024], SlotKind::Input);
     let y = b.slot("y", RsDtype::F32, vec![1024], SlotKind::Output);
     b.node(OpRef::new("scale"), vec![x], vec![y], Attrs::new(), "s");
-    let compiled = rustrain_plan::Compiler::new(&registry, &recipe, env, ParallelConfig::default())
+    let compiled = rustrain_plan::Compiler::new(&registry, &recipe, env)
         .compile(&b.build().unwrap())
         .unwrap();
 
@@ -433,15 +478,18 @@ fn host_allocator_tracks_residency_and_frees_on_drop() {
 #[test]
 fn non_overlapping_activations_share_one_buffer() {
     let (registry, _default, env) = setup();
-    let recipe = Recipe::from_toml(
-        "[kernel]\ndefault = \"test\"\n[kernel.memory]\npool = \"slab\"\n",
-    )
-    .unwrap();
+    let recipe =
+        Recipe::from_toml("[kernel]\ndefault = \"test\"\n[kernel.memory]\npool = \"slab\"\n")
+            .unwrap();
 
     // A chain of four distinct slots, each consumed once by the next. Their
     // lifetimes interleave but never coincide beyond the hand-off, so the
     // planner should pack them into far less than four buffers' worth.
-    let mut b = PlanBuilder::new("chain", Phase::Forward, ParallelConfig::default());
+    let mut b = PlanBuilder::new(
+        "chain",
+        Phase::Forward,
+        Mesh::from_config(&ParallelConfig::default()).fingerprint(),
+    );
     let x = b.slot("x", RsDtype::F32, vec![64], SlotKind::Input);
     let s1 = b.slot("s1", RsDtype::F32, vec![64], SlotKind::Activation);
     let s2 = b.slot("s2", RsDtype::F32, vec![64], SlotKind::Activation);
@@ -460,7 +508,7 @@ fn non_overlapping_activations_share_one_buffer() {
             format!("step{i}"),
         );
     }
-    let compiled = rustrain_plan::Compiler::new(&registry, &recipe, env, ParallelConfig::default())
+    let compiled = rustrain_plan::Compiler::new(&registry, &recipe, env)
         .compile(&b.build().unwrap())
         .unwrap();
 
@@ -502,8 +550,5 @@ fn non_overlapping_activations_share_one_buffer() {
 #[test]
 fn device_kind_is_exposed_so_a_gpu_allocator_can_slot_in() {
     let a = HostAllocator::new();
-    assert_eq!(
-        rustrain_runtime::Allocator::device(&a),
-        RsDeviceKind::CPU
-    );
+    assert_eq!(rustrain_runtime::Allocator::device(&a), RsDeviceKind::CPU);
 }

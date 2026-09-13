@@ -151,9 +151,25 @@ fn bindings_cover_every_weight_slot_and_the_plan_is_deterministic() {
     let a = serde_json::to_string(&first.plan).unwrap();
     let b = serde_json::to_string(&second.plan).unwrap();
     assert_eq!(a, b, "同一份描述必须得到同一个 Plan");
+    // The global plan is fully replicated: the declared sharding is applied by `instantiate`
+    // (which does not exist yet), so `expand` pins the replicated layout on every slot.
     assert!(
-        a.contains("\"replicate\""),
-        "全局 Plan 的 layout 全 Replicate"
+        first
+            .plan
+            .slots
+            .iter()
+            .all(|slot| slot.layout.is_replicated()),
+        "every slot of the global plan must be replicated"
+    );
+    // One pin of the serialized form: the replicated encoding is {"dims":[],"partial":null},
+    // and the old "replicate" string no longer appears anywhere in the JSON.
+    assert!(
+        a.contains("\"layout\":{\"dims\":[],\"partial\":null}"),
+        "the JSON encoding of a replicated layout must be {{\"dims\":[],\"partial\":null}}"
+    );
+    assert!(
+        !a.contains("replicate"),
+        "the string \"replicate\" must not appear in the plan JSON"
     );
 }
 

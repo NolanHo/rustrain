@@ -14,7 +14,7 @@
 
 use rustrain_abi::ffi::{RsAttrs, RsDtype, RsTensor};
 use rustrain_ops::{Phase, Recipe, RegisteredOp, Registry, TargetEnv};
-use rustrain_parallel::ParallelConfig;
+use rustrain_parallel::{Mesh, ParallelConfig};
 use rustrain_plan::attrs::AbiAttrs;
 use rustrain_plan::{Attrs, Compiler, OpRef, Plan, PlanBuilder, SlotId, SlotKind};
 
@@ -46,10 +46,16 @@ impl Default for Tolerance {
 /// The outcome of one check.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Check {
-    Pass { detail: String },
-    Fail { detail: String },
+    Pass {
+        detail: String,
+    },
+    Fail {
+        detail: String,
+    },
     /// Not performed. The reason is mandatory and is printed.
-    Skipped { reason: String },
+    Skipped {
+        reason: String,
+    },
 }
 
 impl Check {
@@ -116,10 +122,15 @@ impl CaseResult {
     }
 
     pub fn skips(&self) -> usize {
-        [&self.numeric, &self.expansion, &self.gradient, &self.determinism]
-            .iter()
-            .filter(|c| c.is_skipped())
-            .count()
+        [
+            &self.numeric,
+            &self.expansion,
+            &self.gradient,
+            &self.determinism,
+        ]
+        .iter()
+        .filter(|c| c.is_skipped())
+        .count()
     }
 }
 
@@ -171,10 +182,7 @@ impl Report {
                     ("determinism", &r.determinism),
                 ] {
                     if let Check::Skipped { reason } = c {
-                        out.push_str(&format!(
-                            "  {}@{} {name}: {reason}\n",
-                            r.op, r.variant
-                        ));
+                        out.push_str(&format!("  {}@{} {name}: {reason}\n", r.op, r.variant));
                     }
                 }
             }
@@ -244,9 +252,13 @@ pub enum Fill {
     /// error or a missing scale shows up in the comparison.
     Ramp,
     /// A small LCG. Reproducible from the seed without a dependency.
-    Pseudo { seed: u64 },
+    Pseudo {
+        seed: u64,
+    },
     /// Indices in `[0, modulo)`, for i32/i64 inputs.
-    Indices { modulo: i64 },
+    Indices {
+        modulo: i64,
+    },
 }
 
 impl Fill {
@@ -258,7 +270,9 @@ impl Fill {
             Fill::Indices { .. } => 0.0,
             Fill::Pseudo { seed } => {
                 // xorshift64*: tiny, deterministic, no dependency.
-                let mut x = seed.wrapping_add(i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+                let mut x = seed
+                    .wrapping_add(i as u64)
+                    .wrapping_mul(0x9E37_79B9_7F4A_7C15);
                 x ^= x >> 30;
                 x = x.wrapping_mul(0xBF58_476D_1CE4_E5B9);
                 x ^= x >> 27;
@@ -431,10 +445,7 @@ impl<'a> Harness<'a> {
             return vec![CaseResult {
                 op: case.op.clone(),
                 variant: "<none>".to_string(),
-                numeric: Check::fail(format!(
-                    "no implementation of `{}` is registered",
-                    case.op
-                )),
+                numeric: Check::fail(format!("no implementation of `{}` is registered", case.op)),
                 expansion: Check::skipped("no implementation to check"),
                 gradient: Check::skipped("no implementation to check"),
                 determinism: Check::skipped("no implementation to check"),
@@ -592,7 +603,11 @@ impl<'a> Harness<'a> {
         }
 
         // Build and run a plan over the expansion.
-        let mut b = PlanBuilder::new("expansion", Phase::Forward, ParallelConfig::default());
+        let mut b = PlanBuilder::new(
+            "expansion",
+            Phase::Forward,
+            Mesh::from_config(&ParallelConfig::default()).fingerprint(),
+        );
         let mut slots: Vec<SlotId> = Vec::new();
         for (i, shape) in shapes.iter().enumerate() {
             let (dtype, dims) = shape.clone().ok_or_else(|| {
@@ -659,10 +674,8 @@ impl<'a> Harness<'a> {
         let mut out_tensors: Vec<RsTensor> = (0..case.n_outputs)
             .map(|_| RsTensor::new(RsDtype::F32, &[]))
             .collect();
-        let mut out_ptrs: Vec<*mut RsTensor> = out_tensors
-            .iter_mut()
-            .map(std::ptr::from_mut)
-            .collect();
+        let mut out_ptrs: Vec<*mut RsTensor> =
+            out_tensors.iter_mut().map(std::ptr::from_mut).collect();
 
         let Some(infer) = op.desc().infer else {
             return Err("the implementation has no shape inference".to_string());
@@ -686,7 +699,11 @@ impl<'a> Harness<'a> {
         }
 
         // Now a real plan with the inferred shapes.
-        let mut b = PlanBuilder::new("case", Phase::Forward, ParallelConfig::default());
+        let mut b = PlanBuilder::new(
+            "case",
+            Phase::Forward,
+            Mesh::from_config(&ParallelConfig::default()).fingerprint(),
+        );
         let mut in_slots = Vec::new();
         for s in &case.inputs {
             in_slots.push(b.slot(s.name.clone(), s.dtype, s.shape.clone(), SlotKind::Input));
@@ -694,7 +711,14 @@ impl<'a> Harness<'a> {
         let out_slots: Vec<SlotId> = out_tensors
             .iter()
             .enumerate()
-            .map(|(i, t)| b.slot(format!("out{i}"), t.dtype, t.dims().to_vec(), SlotKind::Output))
+            .map(|(i, t)| {
+                b.slot(
+                    format!("out{i}"),
+                    t.dtype,
+                    t.dims().to_vec(),
+                    SlotKind::Output,
+                )
+            })
             .collect();
         b.node(
             OpRef::variant(&case.op, variant),
@@ -707,7 +731,8 @@ impl<'a> Harness<'a> {
         let plan = b.build().map_err(|e| e.to_string())?;
         let mut ex = self.make_executor(&plan)?;
         for (slot, spec) in in_slots.iter().zip(&case.inputs) {
-            ex.write_raw(*slot, &spec.bytes()).map_err(|e| e.to_string())?;
+            ex.write_raw(*slot, &spec.bytes())
+                .map_err(|e| e.to_string())?;
         }
         ex.run().map_err(|e| e.to_string())?;
 
@@ -729,15 +754,10 @@ impl<'a> Harness<'a> {
     fn make_executor(&self, plan: &Plan) -> Result<Executor, String> {
         // Single-process, so no memory strategy beyond `keep` is available; the
         // compiler is told that rather than left to assume one.
-        let compiled = Compiler::new(
-            self.registry,
-            self.recipe,
-            TargetEnv::default(),
-            ParallelConfig::default(),
-        )
-        .capabilities(rustrain_plan::RuntimeCapabilities::default())
-        .compile(plan)
-        .map_err(|e| e.to_string())?;
+        let compiled = Compiler::new(self.registry, self.recipe, TargetEnv::default())
+            .capabilities(rustrain_plan::RuntimeCapabilities::default())
+            .compile(plan)
+            .map_err(|e| e.to_string())?;
         Executor::new(
             compiled,
             Box::new(HostAllocator::new()),
@@ -788,10 +808,7 @@ fn infer_for(
     let mut out_tensors: Vec<RsTensor> = (0..n_out)
         .map(|_| RsTensor::new(RsDtype::F32, &[]))
         .collect();
-    let mut out_ptrs: Vec<*mut RsTensor> = out_tensors
-        .iter_mut()
-        .map(std::ptr::from_mut)
-        .collect();
+    let mut out_ptrs: Vec<*mut RsTensor> = out_tensors.iter_mut().map(std::ptr::from_mut).collect();
 
     // SAFETY: as in `Harness::execute`.
     let status = unsafe {
@@ -872,11 +889,10 @@ unsafe fn read_attrs(p: *const RsAttrs) -> Result<Attrs, String> {
                     out.insert(key, s);
                 }
             }
-            k if k == rustrain_abi::ffi::RsAttrKind::I64S
-                && !a.i64s.is_null() => {
-                    let xs = unsafe { std::slice::from_raw_parts(a.i64s, a.n_i64s as usize) };
-                    out.insert(key, xs.to_vec());
-                }
+            k if k == rustrain_abi::ffi::RsAttrKind::I64S && !a.i64s.is_null() => {
+                let xs = unsafe { std::slice::from_raw_parts(a.i64s, a.n_i64s as usize) };
+                out.insert(key, xs.to_vec());
+            }
             _ => {}
         }
     }
@@ -1038,12 +1054,18 @@ pub fn default_cases() -> Vec<Case> {
     // implementations' shape inference and determinism; the numeric comparison
     // activates as soon as a second provider exists.
     cases.push(
-        Case::new("elementwise_unary", vec![InputSpec::f32("x", vec![4, 8], Ones)])
-            .attrs(Attrs::new().set("kind", "rsqrt")),
+        Case::new(
+            "elementwise_unary",
+            vec![InputSpec::f32("x", vec![4, 8], Ones)],
+        )
+        .attrs(Attrs::new().set("kind", "rsqrt")),
     );
     cases.push(
-        Case::new("elementwise_unary", vec![InputSpec::f32("x", vec![4, 8], Ramp)])
-            .attrs(Attrs::new().set("kind", "silu_grad")),
+        Case::new(
+            "elementwise_unary",
+            vec![InputSpec::f32("x", vec![4, 8], Ramp)],
+        )
+        .attrs(Attrs::new().set("kind", "silu_grad")),
     );
     cases.push(
         Case::new(
@@ -1056,13 +1078,12 @@ pub fn default_cases() -> Vec<Case> {
         .attrs(Attrs::new().set("kind", "pow")),
     );
     cases.push(
-        Case::new("reduce", vec![InputSpec::f32("x", vec![4, 8], Ramp)])
-            .attrs(
-                Attrs::new()
-                    .set("kind", "max")
-                    .set("axis", -1i64)
-                    .set("keepdim", true),
-            ),
+        Case::new("reduce", vec![InputSpec::f32("x", vec![4, 8], Ramp)]).attrs(
+            Attrs::new()
+                .set("kind", "max")
+                .set("axis", -1i64)
+                .set("keepdim", true),
+        ),
     );
     cases.push(
         Case::new(
@@ -1104,13 +1125,12 @@ pub fn default_cases() -> Vec<Case> {
             .attrs(Attrs::new().set("shape", vec![2i64, 16])),
     );
     cases.push(
-        Case::new("narrow", vec![InputSpec::f32("x", vec![4, 8], Ramp)])
-            .attrs(
-                Attrs::new()
-                    .set("dim", -1i64)
-                    .set("start", 2i64)
-                    .set("length", 4i64),
-            ),
+        Case::new("narrow", vec![InputSpec::f32("x", vec![4, 8], Ramp)]).attrs(
+            Attrs::new()
+                .set("dim", -1i64)
+                .set("start", 2i64)
+                .set("length", 4i64),
+        ),
     );
     cases.push(
         Case::new(
@@ -1183,7 +1203,10 @@ pub fn uncovered_operators() -> Vec<(&'static str, &'static str)> {
             "amax_update",
             "maintains state across calls; a single-invocation case would not exercise it",
         ),
-        ("rope", "the position/cos/sin layout convention is not settled in the spec yet"),
+        (
+            "rope",
+            "the position/cos/sin layout convention is not settled in the spec yet",
+        ),
         (
             "view",
             "aliases its input's buffer; a case has to compare the aliased pointer, not a buffer",

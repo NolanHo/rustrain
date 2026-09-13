@@ -22,7 +22,7 @@ pub mod conformance;
 use std::ffi::c_void;
 
 use rustrain_abi::ffi::{RsCollectiveKind, RsCtx, RsDeviceKind, RsDtype, RsServices, RsTensor};
-use rustrain_parallel::{GroupKind, ReduceOp};
+use rustrain_parallel::{GroupMask, ReduceOp};
 use rustrain_plan::{CompiledPlan, CompiledStep, SlotId, SlotKind};
 
 /// Anything that can go wrong while running a plan.
@@ -171,7 +171,7 @@ pub trait CollectiveBackend {
     fn execute(
         &mut self,
         kind: RsCollectiveKind,
-        group: GroupKind,
+        group: GroupMask,
         reduce: Option<ReduceOp>,
         dim: Option<i64>,
         tensor: &mut RsTensor,
@@ -199,7 +199,7 @@ impl CollectiveBackend for SingleRank {
     fn execute(
         &mut self,
         kind: RsCollectiveKind,
-        group: GroupKind,
+        group: GroupMask,
         reduce: Option<ReduceOp>,
         dim: Option<i64>,
         _tensor: &mut RsTensor,
@@ -322,15 +322,14 @@ impl Executor {
         let persistent_region = alloc_region(plan.memory.persistent_bytes, "persistent")?;
         let pool_region = alloc_region(plan.memory.transient_pool_bytes, "activation pool")?;
 
-        let base = |region: Option<(*mut c_void, u64)>, what: &str| -> Result<*mut c_void, RuntimeError> {
-            region
-                .map(|(p, _)| p)
-                .ok_or(RuntimeError::Alloc {
+        let base =
+            |region: Option<(*mut c_void, u64)>, what: &str| -> Result<*mut c_void, RuntimeError> {
+                region.map(|(p, _)| p).ok_or(RuntimeError::Alloc {
                     slot: SlotId(0),
                     bytes: 0,
                     reason: format!("the plan needs a {what} region but none was allocated"),
                 })
-        };
+            };
 
         let mut buffers: Vec<Option<SlotBuffer>> = Vec::with_capacity(n);
         for (i, alias) in aliases.iter().enumerate().take(n) {
@@ -351,13 +350,13 @@ impl Executor {
                 continue;
             }
 
-            let alloc = plan
-                .memory
-                .allocation(SlotId(i))
-                .ok_or_else(|| RuntimeError::UnplannedSlot {
-                    slot: SlotId(i),
-                    name: slot.name.clone(),
-                })?;
+            let alloc =
+                plan.memory
+                    .allocation(SlotId(i))
+                    .ok_or_else(|| RuntimeError::UnplannedSlot {
+                        slot: SlotId(i),
+                        name: slot.name.clone(),
+                    })?;
 
             let ptr = match alloc.placement {
                 // SAFETY: the planner sized each region to cover every offset it
@@ -370,11 +369,13 @@ impl Executor {
                     (base(pool_region, "activation pool")? as *mut u8).add(offset as usize)
                         as *mut c_void
                 },
-                rustrain_plan::Placement::Aliased(root) => buffers
-                    .get(root.0)
-                    .and_then(Option::as_ref)
-                    .ok_or(RuntimeError::NullData { slot: root })?
-                    .ptr,
+                rustrain_plan::Placement::Aliased(root) => {
+                    buffers
+                        .get(root.0)
+                        .and_then(Option::as_ref)
+                        .ok_or(RuntimeError::NullData { slot: root })?
+                        .ptr
+                }
                 // The compiler records a policy the runtime cannot execute, and
                 // `new` refuses such a plan above; reaching here means a slot was
                 // planned as non-resident without being reported.
@@ -532,7 +533,13 @@ impl Executor {
         if buf.ptr.is_null() {
             return Err(RuntimeError::NullData { slot: id });
         }
-        Ok(materialise(buf.ptr, buf.shape.as_slice(), buf.strides.as_slice(), buf.rank, buf.elem_width))
+        Ok(materialise(
+            buf.ptr,
+            buf.shape.as_slice(),
+            buf.strides.as_slice(),
+            buf.rank,
+            buf.elem_width,
+        ))
     }
 
     /// Byte size of a slot's buffer.
@@ -596,7 +603,13 @@ impl Executor {
             let mut out_tensors = self.descriptors(&outputs)?;
 
             match &self.plan.steps[index] {
-                CompiledStep::Intrinsic { op, group, reduce, dim, .. } => {
+                CompiledStep::Intrinsic {
+                    op,
+                    group,
+                    reduce,
+                    dim,
+                    ..
+                } => {
                     let kind = match op.as_str() {
                         rustrain_plan::intrinsic::ALL_REDUCE => RsCollectiveKind::ALL_REDUCE,
                         rustrain_plan::intrinsic::ALL_GATHER => RsCollectiveKind::ALL_GATHER,
@@ -719,7 +732,10 @@ impl Executor {
 impl Drop for Executor {
     fn drop(&mut self) {
         // Only owners free; aliases point into the same allocation.
-        for region in [self.persistent_region, self.pool_region].into_iter().flatten() {
+        for region in [self.persistent_region, self.pool_region]
+            .into_iter()
+            .flatten()
+        {
             self.allocator.dealloc(region.0, region.1);
         }
     }

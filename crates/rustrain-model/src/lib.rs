@@ -3,7 +3,7 @@
 //! A model directory holds two files: `config.json` (the model's own hyper-parameters, as published
 //! upstream) and `model.json` (the description: `params` / `templates` / `stack` / `binding`).
 //! [`expand_dir`] turns the pair into **one** [`rustrain_plan::Plan`] — the global model, every
-//! `layout` `Replicate`, every shape concrete, sharding recorded only as symbolic axes inside
+//! `layout` replicated, every shape concrete, sharding recorded only as symbolic axes inside
 //! [`ResolvedBinding`].
 //!
 //! Nothing here reads the environment, touches a device, or knows any operator: models are data.

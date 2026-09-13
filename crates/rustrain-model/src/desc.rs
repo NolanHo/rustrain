@@ -181,7 +181,7 @@ pub struct Binding {
     pub source: String,
     #[serde(default)]
     pub transform: Vec<String>,
-    /// slot dimension → symbolic axis names. The global plan is all `Replicate`; the axes are only
+    /// slot dimension → symbolic axis names. The global plan is fully replicated; the axes are only
     /// resolved once `instantiate` has a mesh.
     #[serde(default)]
     pub axes: BTreeMap<String, Vec<String>>,

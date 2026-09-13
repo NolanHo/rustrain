@@ -9,7 +9,6 @@ use std::collections::BTreeSet;
 use std::path::PathBuf;
 
 use rustrain_model::Expanded;
-use rustrain_parallel::ParallelLayout;
 use rustrain_plan::SlotKind;
 
 fn fixture_dir() -> PathBuf {
@@ -268,10 +267,9 @@ fn every_weight_slot_is_bound_exactly_once() {
 fn the_global_plan_is_replicated_and_bf16() {
     let expanded = expanded();
     for slot in &expanded.plan.slots {
-        assert_eq!(
-            slot.layout,
-            ParallelLayout::Replicate,
-            "全局 Plan 的 layout 必须全 Replicate（§4.1）：{}",
+        assert!(
+            slot.layout.is_replicated(),
+            "全局 Plan 的 layout 必须全 replicated（§4.1）：{}",
             slot.name
         );
     }

@@ -284,7 +284,7 @@ D1 的验收测试暴露了十处未定义。以下裁定**是契约的一部分
 |---|---|---|
 | 1 | 描述文件的位置与名字 | **模型目录下的 `model.json`**（与 `config.json` 同级） |
 | 2 | 顶层键 | `format`(必填) / `name`(必填) / `dtype`(可选，默认值) / `inputs`(可选) / `params` / `templates` / `stack` / `binding`。`inputs` 与 `templates.*.inputs` 同构：`{shape, kind, dtype?}` |
-| 3 | `plan explain --json` 的形状 | 顶层 `slots` 与 `nodes` 是**数组**，计数移进 `counts`：<br>`{"name","digest","world_size","counts":{"slots","nodes","steps"},"slots":[…] ,"nodes":[…] ,"implementations":[…],"collectives":[…],"memory":{…}}`。<br>这是对现有 CLI 的**破坏性修改**（今天 `slots`/`steps` 是计数、没有 `nodes`），由 D1 承担 |
+| 3 | `plan explain --json` 的形状 | 顶层 `slots` 与 `nodes` 是**数组**，计数移进 `counts`：<br>`{"name","digest","world_size","mesh":{"axes":[["tp",2],["cp",1],…]},"counts":{"slots","nodes","steps"},"slots":[…] ,"nodes":[…] ,"implementations":[…],"collectives":[…],"memory":{…}}`。<br>这是对现有 CLI 的**破坏性修改**（今天 `slots`/`steps` 是计数、没有 `nodes`），由 D1 承担。<br>**D3 追加 `mesh`**：组掩码是 bit 位置，没有轴表就翻不回名字（§1.2 / §1.3）—— 所以轴表必须出现在人读的那份 JSON 里，而不是只存在于 digest 里 |
 | 4 | `binding.axes` / `transform` 是否必填 | **都可省**。省 `axes` = 不切分（全局 Plan 全 `Replicate`）；省 `transform` = 恒等 |
 | 5 | dtype 词表 | 小写字符串，与 `RsDtype::name()` 一致：`f32 f16 bf16 f8e4m3 f8e5m2 fp4e2m1 i32 i64 u8` |
 | 6 | 模板 slot 是否要 dtype | **要**。`{name, kind, dtype, shape}`，缺省继承顶层 `dtype`。没有它表达不了索引输入（`embedding` 的 `i64`）——**这是本表里唯一修语言的一条** |

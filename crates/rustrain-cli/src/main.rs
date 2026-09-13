@@ -25,7 +25,7 @@ use clap::{Args, Parser, Subcommand};
 use rustrain_abi::Plugin;
 use rustrain_abi::ffi::RsDtype;
 use rustrain_ops::{Phase, Recipe, Registry, ResolveError, TargetEnv};
-use rustrain_parallel::{GroupKind, ParallelConfig, ParallelLayout};
+use rustrain_parallel::{GroupMask, Mesh, ParallelConfig, ParallelLayout};
 use rustrain_plan::{Attrs, OpRef, Plan, PlanBuilder, PlanNode, Slot, SlotKind};
 
 #[derive(Parser)]
@@ -265,8 +265,15 @@ fn demo_plan(tp: usize) -> Result<rustrain_plan::Plan> {
         tensor: tp,
         ..Default::default()
     };
+    // The mesh is the compile input; the plan only carries its fingerprint. The mask for `tp` is
+    // looked up by name rather than written as a bit, so the demo cannot drift from the axis order.
+    let mesh = Mesh::from_config(&parallel);
+    let tp_axis = mesh
+        .index_of("tp")
+        .context("the canonical mesh always has a `tp` axis")?;
+    let tp_mask = GroupMask::single(tp_axis).map_err(|e| anyhow::anyhow!("{e}"))?;
 
-    let mut b = PlanBuilder::new("demo-mlp", Phase::Forward, parallel);
+    let mut b = PlanBuilder::new("demo-mlp", Phase::Forward, mesh.fingerprint());
     let x = b.slot("hidden", RsDtype::F32, vec![8, 64], SlotKind::Input);
 
     // Column parallel: output features (dim 1 of a [K, N] weight) split.
@@ -275,10 +282,7 @@ fn demo_plan(tp: usize) -> Result<rustrain_plan::Plan> {
         RsDtype::F32,
         vec![64, 128],
         SlotKind::Weight,
-        ParallelLayout::Shard {
-            dim: 1,
-            group: GroupKind::Tp,
-        },
+        ParallelLayout::shard(1, tp_mask),
     );
     // The up-projection's output stays sharded: it feeds the row-parallel
     // down-projection directly, which is precisely why the pair needs a single
@@ -288,10 +292,7 @@ fn demo_plan(tp: usize) -> Result<rustrain_plan::Plan> {
         RsDtype::F32,
         vec![8, 128],
         SlotKind::Activation,
-        ParallelLayout::Shard {
-            dim: -1,
-            group: GroupKind::Tp,
-        },
+        ParallelLayout::shard(-1, tp_mask),
     );
     b.node(
         OpRef::new("linear"),
@@ -306,10 +307,7 @@ fn demo_plan(tp: usize) -> Result<rustrain_plan::Plan> {
         RsDtype::F32,
         vec![8, 128],
         SlotKind::Activation,
-        ParallelLayout::Shard {
-            dim: -1,
-            group: GroupKind::Tp,
-        },
+        ParallelLayout::shard(-1, tp_mask),
     );
     b.node(
         OpRef::new("elementwise_unary"),
@@ -325,10 +323,7 @@ fn demo_plan(tp: usize) -> Result<rustrain_plan::Plan> {
         RsDtype::F32,
         vec![128, 64],
         SlotKind::Weight,
-        ParallelLayout::Shard {
-            dim: 0,
-            group: GroupKind::Tp,
-        },
+        ParallelLayout::shard(0, tp_mask),
     );
     let out = b.slot(
         "mlp.down.out",
@@ -357,17 +352,23 @@ fn plan_explain(
     let registry = load_registry(plugins)?;
     let recipe = load_recipe(recipe_path)?;
     let plan = demo_plan(tp)?;
-    let parallel = plan.meta.parallel;
 
-    let compiled = rustrain_plan::Compiler::new(&registry, &recipe, TargetEnv::default(), parallel)
+    let compiled = rustrain_plan::Compiler::new(&registry, &recipe, TargetEnv::default())
         .compile(&plan)
         .map_err(|e| anyhow::anyhow!("{e}"))?;
+    // A group's name needs the mesh (a mask is only bit positions); the plan carries its
+    // fingerprint, so the JSON can stay human-readable without a second name table.
+    let mesh = compiled.mesh.clone();
 
     if json {
         let doc = serde_json::json!({
             "name": compiled.plan.meta.name,
             "digest": compiled.digest,
-            "world_size": compiled.parallel.world_size(),
+            // The mask vocabulary is bit positions, so the fingerprint is what makes a layout or a
+            // collective readable: `"group": 1` means `tp` only against this axis list (§1.3 keeps
+            // the fingerprint in the plan for exactly this).
+            "mesh": compiled.mesh,
+            "world_size": compiled.mesh.world_size(),
             "counts": {
                 "slots": compiled.plan.slots.len(),
                 "nodes": compiled.plan.nodes.len(),
@@ -382,7 +383,9 @@ fn plan_explain(
             })).collect::<Vec<_>>(),
             "collectives": compiled.inserted.iter().map(|c| serde_json::json!({
                 "op": c.op,
-                "group": format!("{:?}", c.group),
+                // Named through the mesh, falling back to the raw bits: a mask whose bit is outside
+                // the mesh has no name, and `GroupMask`'s `Display` is the honest answer.
+                "group": mesh.group_name(c.group).unwrap_or_else(|_| c.group.to_string()),
                 "reason": c.reason,
                 "source": c.source,
             })).collect::<Vec<_>>(),
@@ -474,7 +477,10 @@ fn plan_explain_model(
         let doc = serde_json::json!({
             "name": plan.meta.name,
             "digest": digest,
-            "world_size": plan.meta.parallel.world_size(),
+            // See the compiled path above: a group mask is bit positions, and this is the axis list
+            // they are positions *in*.
+            "mesh": plan.meta.mesh,
+            "world_size": plan.meta.mesh.world_size(),
             "counts": {
                 "slots": plan.slots.len(),
                 "nodes": plan.nodes.len(),
