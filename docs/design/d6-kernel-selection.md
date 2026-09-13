@@ -63,6 +63,28 @@ MoE grouped GEMM）。**不手写任何 kernel**；只有在某个算子三个�
 
 （§3 里"保留 reference provider 作为门禁 oracle"的建议，按这两条约束执行：**保留、但仅限小规模对照**。）
 
+## 3.6 预编译 wheel 坐标（用户提示 wheels.astral.sh，2026-09 核实）
+
+**不自己编译**。宿主是 CUDA 13.0 + torch 2.11 + py3.12，索引里正好有对应档：
+
+```
+causal_conv1d-1.6.2.post1+cu.13.0.torch.2.11-cp312-cp312-manylinux_2_28_x86_64.whl
+```
+
+索引根：`https://wheels.astral.sh/simple/cu130/`（17 个包），含我们需要的大部分：
+
+| 我们要的 | 索引里的包 |
+|---|---|
+| `causal_conv1d` | `causal-conv1d`（1.6.2.post1，有 torch 2.11 档） |
+| `sdpa` | `flash-attn`（2.8.3.post1） |
+| MoE grouped GEMM | `grouped-gemm`、`megablocks`，以及 `vllm`（内含 fused MoE Triton kernel） |
+| 别的可选 | `transformer-engine`、`deepgemm`、`deepep`、`sageattention` |
+| **FLA（`gated_delta_rule`/`RMSNormGated`/`l2_norm`）** | 索引里**没有** —— 它是纯 Python/Triton 包，PyPI 直接装，同样**不需要编译** |
+
+**调用路径**（这一点决定了插件的形态）：这些 wheel 是**带 CUDA 扩展的 Python 包**，注册成 torch 的自定义算子。所以我们的插件不写 kernel，而是**链 libtorch 的 C++ 分发器**：`at::matmul` / `at::scaled_dot_product_attention` 直接走 ATen，`causal_conv1d` 与 FLA 的算子通过 `torch.ops.*` 注册进分发器后同样能在 C++ 侧调到。换句话说：**一个链 libtorch 的 Rust 插件**，把我们的算子词表映射到 ATen + 那几个扩展已注册的算子 —— 零 kernel 编译、零手写。
+
+前置条件（宿主上逐条确认）：`_GLIBCXX_USE_CXX11_ABI` 与 wheel 的 `cxx11abiTRUE` 一致、torch 2.11.0+cu130 的 C++ 头文件与 libtorch 可链、Python 3.12。
+
 ## 4. 确认后我按什么顺序做
 
 1. **ATen 插件骨架**：`.so` + ABI v1 + 最小算子集（`linear` + `elementwise` + `rmsnorm`），
