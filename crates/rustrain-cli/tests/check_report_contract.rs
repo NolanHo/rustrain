@@ -23,6 +23,11 @@
 //! since they would match the constants here. `check_l2.rs`'s deliberately broken fixtures are what
 //! stand against the latter.
 //!
+//! One limit worth naming: `model`/`checkpoint` are pinned to the paths the test *passed*, which is
+//! what the report promises to echo — an implementation that echoed them while reading a different
+//! description inside that directory would still be green. Catching that needs a probe with a
+//! distinguishable witness, not a report-shape assertion.
+//!
 //! Everything goes through the real binary (`env!("CARGO_BIN_EXE_rustrain")`); no Rust internals.
 //! Contract: `docs/design/qwen36-text/spec.md` C2 (the report and the Pass/Fail/Warning/Skip
 //! discipline) + C6 (the report shape and the id list).
@@ -87,24 +92,87 @@ const EXPECTED_COUNTS: [(&str, i64); 8] = [
     ("weights", 873),
 ];
 
-/// The five primitives no loaded plugin publishes on this host, with the node count each covers, as
-/// `l1.implementation_availability` must list them. This is the half of the report a human reads to
-/// answer "what is missing"; the item's `reason` must state their sum (C2).
-const EXPECTED_UNAVAILABLE: [(&str, i64); 5] = [
-    ("causal_conv1d", 90),
-    ("gated_delta_rule", 30),
-    ("l2norm", 60),
-    ("moe_layer", 41),
-    ("rmsnorm_gated", 30),
-];
+/// Why one operator has no implementation on this host, as `l1.implementation_availability` says it:
+/// either nothing publishes the primitive, or a provider exists whose variant rejects the dtype the
+/// checks were asked to run at.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Unavailable {
+    /// No loaded plugin publishes the primitive at all — it is a missing primitive.
+    NoProvider,
+    /// A provider is loaded but its variant does not accept this dtype.
+    DtypeRejected,
+}
 
-/// `Σ EXPECTED_UNAVAILABLE`, and the number the `skip`'s reason must state. Kept as its own constant
-/// so the sum is asserted rather than assumed (a drifted table must not silently re-define it).
-const UNAVAILABLE_NODES: i64 = 251;
+/// One `--dtype`'s availability list: every `(operator, node count, why)` the `skip` must carry, and
+/// the total its `reason` must state.
+///
+/// The two lists differ by **cause**, not only by length. At `--dtype f32` only the five primitives
+/// nothing publishes are left (251 of 1031 nodes); at the description's own `bf16` — which is also
+/// what an explicit `--dtype bf16` or `f16` asks for — every node whose `reference.f32` variant
+/// rejects that dtype joins them, which is the entire plan (1031 of 1031 nodes over 16 operators).
+/// A list that is merely *truncated* to the five f32 rows while its reason keeps saying `251 of
+/// 1031` is exactly the false green this pins down.
+struct Availability {
+    entries: &'static [(&'static str, i64, Unavailable)],
+    total: i64,
+}
 
-/// The one `ignore` pattern of the description and how many tensors it covers. A pattern that stops
-/// matching anything makes `l2.ignore_coverage` a `fail` in the report; this pins the count that
-/// makes the `pass` mean something.
+/// `--dtype f32` (D2's acceptance run), and D2's `Skip` for "the 5 new primitives are not written
+/// yet".
+const F32_AVAILABILITY: Availability = Availability {
+    entries: &[
+        ("causal_conv1d", 90, Unavailable::NoProvider),
+        ("gated_delta_rule", 30, Unavailable::NoProvider),
+        ("l2norm", 60, Unavailable::NoProvider),
+        ("moe_layer", 41, Unavailable::NoProvider),
+        ("rmsnorm_gated", 30, Unavailable::NoProvider),
+    ],
+    total: 251,
+};
+
+/// `bf16` (the description's dtype) or `f16`: the reference provider accepts `f32` only, so every
+/// node of the plan is unresolved, the five unpublished primitives among them.
+const BF16_AVAILABILITY: Availability = Availability {
+    entries: &[
+        ("cat", 1, Unavailable::DtypeRejected),
+        ("causal_conv1d", 90, Unavailable::NoProvider),
+        ("elementwise_binary", 153, Unavailable::DtypeRejected),
+        ("elementwise_unary", 101, Unavailable::DtypeRejected),
+        ("embedding", 1, Unavailable::DtypeRejected),
+        ("gated_delta_rule", 30, Unavailable::NoProvider),
+        ("l2norm", 60, Unavailable::NoProvider),
+        ("linear", 298, Unavailable::DtypeRejected),
+        ("moe_layer", 41, Unavailable::NoProvider),
+        ("narrow", 22, Unavailable::DtypeRejected),
+        ("reshape", 33, Unavailable::DtypeRejected),
+        ("rmsnorm", 108, Unavailable::DtypeRejected),
+        ("rmsnorm_gated", 30, Unavailable::NoProvider),
+        ("rope", 11, Unavailable::DtypeRejected),
+        ("sdpa", 11, Unavailable::DtypeRejected),
+        ("topk_router", 41, Unavailable::DtypeRejected),
+    ],
+    total: 1031,
+};
+
+/// Both tables must cover the same five unpublished primitives with the same node counts: the
+/// `f32` list is the subset of the `bf16` one that nothing can do anything about.
+fn unpublished_component<'a>(table: &'a [(&'a str, i64, Unavailable)]) -> Vec<(&'a str, i64)> {
+    let mut out: Vec<(&'a str, i64)> = table
+        .iter()
+        .filter(|(_, _, why)| *why == Unavailable::NoProvider)
+        .map(|(op, nodes, _)| (*op, *nodes))
+        .collect();
+    out.sort_unstable();
+    out
+}
+
+/// The one `ignore` pattern of the description and how many tensors it covers.
+///
+/// A pattern that stops matching anything is a **`warning`** on `l2.ignore_coverage`, not a `fail`
+/// (C6: the same description may be checked against another checkpoint). What *is* a `fail` is the
+/// consequence: the tensors it stopped ignoring become unconsumed, and `check_l2.rs` gates exactly
+/// that pair with `models/tiny-ignore-typo`. Here the count is pinned because it is what makes the
+/// `pass` mean something on the real 1045-tensor snapshot.
 const IGNORE_PATTERN: &str = "model.visual.**";
 const IGNORED_TENSORS: i64 = 333;
 
@@ -348,16 +416,31 @@ fn assert_c6_shape(doc: &Value, expected_dtype: &str) {
 /// N1: the two items that carry per-object `details`, and what the rest must not carry.
 ///
 /// The status table says which checks ran; `assert_c6_shape` says what the counters are. This is the
-/// third leg: the per-object lists that back the wording of a `pass` or a `skip`. An emptied
-/// `details` array, a renamed operator, or a node count that drifts all turn it red — while every id
-/// and status stays exactly as pinned.
-fn assert_details(doc: &Value, items: &[Item]) {
-    let sum: i64 = EXPECTED_UNAVAILABLE.iter().map(|(_, nodes)| *nodes).sum();
+/// third leg: the per-object lists that back the wording of a `pass` or a `skip`. `availability` is
+/// the table the run's dtype must produce — an emptied list, a truncated list, a renamed operator, a
+/// node count that drifts, a reason that enumerates a different set, or a `why` that does not match
+/// its cause all turn it red — while every id and status stays exactly as pinned.
+fn assert_details(doc: &Value, items: &[Item], availability: &Availability) {
+    // The tables are constants; this makes a typo in either of them a self-inconsistency rather than
+    // a re-definition of what the `skip`'s reason is asserted against.
+    let sum: i64 = availability
+        .entries
+        .iter()
+        .map(|(_, nodes, _)| *nodes)
+        .sum();
     assert_eq!(
-        sum, UNAVAILABLE_NODES,
-        "EXPECTED_UNAVAILABLE's entries do not sum to UNAVAILABLE_NODES, which the `skip`'s reason \
-         is asserted against"
+        sum, availability.total,
+        "the availability table's entries do not sum to its own total"
     );
+    assert!(
+        availability.entries.iter().all(|(_, nodes, _)| *nodes > 0),
+        "every listed operator covers at least one node: {:?}",
+        availability.entries
+    );
+
+    let plan_nodes = doc["counts"]["nodes"]
+        .as_i64()
+        .unwrap_or_else(|| panic!("the plan size is a counter of the report: {doc}"));
 
     let mut seen_availability = false;
     let mut seen_ignore = false;
@@ -368,16 +451,16 @@ fn assert_details(doc: &Value, items: &[Item]) {
                 assert_eq!(
                     item.status,
                     Status::Skip,
-                    "the availability item carries the per-primitive list and is a `skip` on this \
+                    "the availability item carries the per-operator list and is a `skip` on this \
                      host"
                 );
                 assert_eq!(
                     item.details.len(),
-                    EXPECTED_UNAVAILABLE.len(),
-                    "the `skip` must list one entry per unavailable primitive, got: {:?}",
+                    availability.entries.len(),
+                    "the `skip` must list one entry per unavailable operator at this dtype; got: {:?}",
                     item.details
                 );
-                for (op, nodes) in EXPECTED_UNAVAILABLE {
+                for (op, nodes, why_kind) in availability.entries {
                     let prefix = format!("{op}: {nodes} node(s)");
                     let entry = item
                         .details
@@ -391,46 +474,50 @@ fn assert_details(doc: &Value, items: &[Item]) {
                                 item.details
                             )
                         });
-                    // `{op}: {n} node(s): {why}` — the count is only half of it; C2's Skip has to
-                    // answer *what is missing*, so an entry without its reason is a regression too.
+                    // `{op}: {n} node(s): {why}` — the count is only half of it. C2 makes the `Skip`
+                    // answer *what is missing*, so the tail must state the cause the table gives,
+                    // not merely be non-empty.
                     let why = entry[prefix.len()..].trim_start_matches(':').trim();
-                    assert!(
-                        !why.is_empty(),
-                        "the entry for `{op}` carries its count but no reason: {entry}"
-                    );
+                    match why_kind {
+                        Unavailable::NoProvider => assert_eq!(
+                            why,
+                            format!("no loaded plugin publishes `{op}`"),
+                            "`{op}` is listed as a missing primitive, but its entry does not say so: \
+                             {entry}"
+                        ),
+                        Unavailable::DtypeRejected => assert!(
+                            why.contains("is not accepted"),
+                            "`{op}` has a provider that rejects this dtype, but its entry does not \
+                             say that: {entry}"
+                        ),
+                    }
                 }
-                assert!(
-                    mentions_number(&item.reason, UNAVAILABLE_NODES),
-                    "the reason must state how many nodes have no implementation ({UNAVAILABLE_NODES}) \
-                     — a sum the reader cannot recompute from the reason alone: {}",
-                    item.reason
-                );
+
                 // The reason inlines the same list it hands to `details` (`op ×count (why)`), so the
-                // two must be the *same* list: a sixth entry appended to the reason would make it
-                // claim a total its `details` do not account for, and the count of `×` is the one
-                // thing the two share verbatim.
+                // two must be the *same* list. The `×` spelling is this report's own convention:
+                // if it is ever reworded deliberately, this assertion is the one to update, and the
+                // message below names the operator it could not find.
                 assert_eq!(
                     item.reason.matches('×').count(),
-                    EXPECTED_UNAVAILABLE.len(),
+                    availability.entries.len(),
                     "the reason enumerates a different number of operators than `details` does: {}",
                     item.reason
                 );
-                for (op, nodes) in EXPECTED_UNAVAILABLE {
+                for (op, nodes, _) in availability.entries {
                     assert!(
                         item.reason.contains(&format!("{op} ×{nodes}")),
                         "the reason does not carry the `{op} ×{nodes}` its `details` report: {}",
                         item.reason
                     );
                 }
+
+                // The reason's *leading* claim, not just "the plan size appears somewhere": a
+                // reason reading `251 of 425273 node(s) … (the plan has 1031)` must not pass.
+                let lead = format!("{} of {} node(s)", availability.total, plan_nodes);
                 assert!(
-                    mentions_number(
-                        &item.reason,
-                        doc["counts"]["nodes"].as_i64().unwrap_or_else(|| panic!(
-                            "the plan size is a counter of the report: {doc}"
-                        ))
-                    ),
-                    "the reason must name the plan size the {UNAVAILABLE_NODES} nodes are out of, so \
-                     `251 of 1031` cannot become `251 of ???`: {}",
+                    item.reason.starts_with(&lead),
+                    "the reason must open with `{lead}` — the number of unresolved nodes out of the \
+                     plan: {}",
                     item.reason
                 );
             }
@@ -456,9 +543,9 @@ fn assert_details(doc: &Value, items: &[Item]) {
             }
             id => assert!(
                 item.details.is_empty(),
-                "check `{id}` grew a `details` array while this test only knows two items that have \
-                 one; either pin its contents here or the report is being read by a gate that does \
-                 not look: {:?}",
+                "check `{id}` grew a `details` array and this test does not look at it; when a \
+                 check starts reporting per-object facts (D3/D4 turn six `l1.*` items from `skip` \
+                 into real checks), extend this function rather than leaving the facts unread: {:?}",
                 item.details
             ),
         }
@@ -571,65 +658,44 @@ fn accepted_run(extra: &[&str], expected_dtype: &str) -> (Value, Vec<Item>) {
 #[test]
 fn the_report_has_c6s_shape_and_exactly_c6s_check_ids() {
     let (doc, items) = accepted_run(&["--dtype", "f32"], "f32");
-    assert_details(&doc, &items);
+    assert_eq!(
+        unpublished_component(F32_AVAILABILITY.entries),
+        unpublished_component(BF16_AVAILABILITY.entries),
+        "the f32 list must be exactly the unpublished primitives of the bf16 list: the same \
+         primitives nothing publishes, with the same node counts"
+    );
+    assert_details(&doc, &items, &F32_AVAILABILITY);
 }
 
 /// C2's other half: `--dtype` is optional, and without it the **description's own** dtype is what
-/// the checks ran at (the real fixture declares `bf16`). That is a run in its own right, because its
-/// availability list is a superset of the f32 one — 16 lines instead of 5, every node whose plugin
-/// variant rejects bf16 joining the five primitives nothing publishes.
+/// the checks ran at (the real fixture declares `bf16`).
 ///
-/// This exists because a dtype-conditional branch is invisible to the two runs that pass `--dtype`:
-/// a report that emptied the per-object list only when no dtype was overridden would have satisfied
-/// every other assertion in this file.
+/// This run exists because a dtype-conditional branch is invisible to the run that passes
+/// `--dtype f32`: a report that emptied its per-operator list only when no dtype was overridden
+/// would have satisfied every other assertion in this file.
 #[test]
 fn the_default_dtype_run_is_the_same_report_at_the_descriptions_own_dtype() {
     let (doc, items) = accepted_run(&[], "bf16");
-
     // Counts, ids, statuses and the skip set are already pinned by `accepted_run`: the plan and the
-    // checkpoint do not depend on the dtype. What differs is the availability list.
-    let availability = items
-        .iter()
-        .find(|item| item.id == "l1.implementation_availability")
-        .expect("the availability item is one of EXPECTED_STATUS");
-    assert!(
-        availability.details.len() >= EXPECTED_UNAVAILABLE.len(),
-        "at bf16 the list is a superset of the f32 one; got: {:?}",
-        availability.details
-    );
-    for (op, nodes) in EXPECTED_UNAVAILABLE {
-        let prefix = format!("{op}: {nodes} node(s)");
-        assert!(
-            availability
-                .details
-                .iter()
-                .any(|detail| detail.starts_with(&prefix)),
-            "a primitive no plugin publishes is missing from the bf16 list (expected an entry \
-             starting `{prefix}`); got: {:?}",
-            availability.details
-        );
-    }
-    let plan_nodes = doc["counts"]["nodes"]
-        .as_i64()
-        .unwrap_or_else(|| panic!("the plan size is a counter of the report: {doc}"));
-    assert!(
-        mentions_number(&availability.reason, plan_nodes),
-        "the reasons must state the plan size at every dtype, not only at f32: {}",
-        availability.reason
-    );
+    // checkpoint do not depend on the dtype. What differs is the availability list, and at bf16 it
+    // is the whole plan — every node of the reference provider rejects the dtype.
+    assert_details(&doc, &items, &BF16_AVAILABILITY);
+}
 
-    // The ignore coverage is dtype-independent: same pattern, same 333 tensors, same single line.
-    let ignore = items
-        .iter()
-        .find(|item| item.id == "l2.ignore_coverage")
-        .expect("the ignore item is one of EXPECTED_STATUS");
-    assert_eq!(ignore.details.len(), 1, "{:?}", ignore.details);
-    assert!(
-        ignore.details[0].contains(IGNORE_PATTERN)
-            && mentions_number(&ignore.details[0], IGNORED_TENSORS),
-        "the ignore coverage must not depend on the dtype: {:?}",
-        ignore.details
-    );
+/// An **explicitly given** dtype is not the same code path as an omitted one, and `bf16` is the one
+/// value where the two are easy to confuse: on this fixture both end up reporting `bf16`, but the
+/// first goes through an override and the second through the description's declared dtype. On a
+/// description that declares `f32` (the `tiny` fixtures) they differ outright, so a bug that only
+/// fires on an explicit override — or only on an explicit `bf16`/`f16` — has no other gate here.
+///
+/// `f16` is pinned by the same table: the reference provider accepts `f32` alone, so every node is
+/// unresolved for it too, with the same operators and the same counts.
+#[test]
+fn an_explicit_dtype_run_is_gated_at_every_dtype_it_accepts() {
+    for dtype in ["bf16", "f16"] {
+        let (doc, items) = accepted_run(&["--dtype", dtype], dtype);
+        assert_details(&doc, &items, &BF16_AVAILABILITY);
+    }
 }
 
 /// `cli.arguments` is the one id a normal run does not have, and C2 wants a full report even when

@@ -146,6 +146,11 @@ fn check(model: &Path, checkpoint: &Path) -> Run {
 }
 
 /// D2's four counters, as integers. Absent `dtype_mismatch` is not silently zero.
+///
+/// Read from `counts` itself, not from "the first `key` at any depth": the report carries a `checks`
+/// array *before* `counts`, so a per-item field of the same name would shadow the counter, and
+/// `find_key` would happily report the shadow. C6 fixes the eight counters as one object, so that is
+/// where they are read.
 fn assert_zero_counters(doc: &Value, run: &Run) {
     for key in [
         "slots_unbound",
@@ -153,36 +158,23 @@ fn assert_zero_counters(doc: &Value, run: &Run) {
         "shape_mismatch",
         "dtype_mismatch",
     ] {
-        let found = find_key(doc, key);
+        let counts = doc["counts"]
+            .as_object()
+            .unwrap_or_else(|| panic!("the report has no `counts` object\n{}", run.dump()));
+        let found = counts.get(key);
         let value = match found {
             Some(Value::Number(n)) => {
                 n.as_i64()
-                    .or_else(|| n.as_f64().filter(|f| f.fract() == 0.0).map(|f| f as i64))
-                    .unwrap_or_else(|| panic!("report `{key}` = {n}, not an integer count\n{}", run.dump()))
+                    .unwrap_or_else(|| panic!("report `counts.{key}` = {n}, not an integer count\n{}", run.dump()))
             }
-            Some(other) => panic!("report `{key}` = {other}, not a count\n{}", run.dump()),
+            Some(other) => panic!("report `counts.{key}` = {other}, not a count\n{}", run.dump()),
             None => panic!(
-                "the report has no `{key}` counter (top-level keys: {:?})\n{}",
-                doc.as_object().map(|o| o.keys().cloned().collect::<Vec<_>>()),
+                "the report has no `counts.{key}` (keys: {:?})\n{}",
+                counts.keys().collect::<Vec<_>>(),
                 run.dump()
             ),
         };
-        assert_eq!(value, 0, "`{key}` = {value}, expected 0\n{}", run.dump());
-    }
-}
-
-/// First value stored under `key`, at any depth: the contract fixes the counter names, not where
-/// they sit in the report.
-fn find_key<'a>(node: &'a Value, key: &str) -> Option<&'a Value> {
-    match node {
-        Value::Object(map) => {
-            if let Some(found) = map.get(key) {
-                return Some(found);
-            }
-            map.values().find_map(|v| find_key(v, key))
-        }
-        Value::Array(items) => items.iter().find_map(|v| find_key(v, key)),
-        _ => None,
+        assert_eq!(value, 0, "`counts.{key}` = {value}, expected 0\n{}", run.dump());
     }
 }
 
@@ -486,10 +478,10 @@ fn a_misspelled_ignore_pattern_does_not_silently_uncover_a_tensor() {
 
     let doc = run.json();
     assert!(
-        find_key(&doc, "tensors_unconsumed")
-            .and_then(Value::as_i64)
+        doc["counts"]["tensors_unconsumed"]
+            .as_i64()
             .unwrap_or_else(|| panic!(
-                "the run must report `tensors_unconsumed` as a count\n{}",
+                "the run must report `counts.tensors_unconsumed` as a count\n{}",
                 run.dump()
             ))
             > 0,
