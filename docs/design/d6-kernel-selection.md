@@ -49,6 +49,20 @@ MoE grouped GEMM）。**不手写任何 kernel**；只有在某个算子三个�
 所以建议：**reference provider 保留为"仅门禁用的 oracle"，从执行路径上禁用**。
 如果你的意思是连门禁的对照物也不要，我照办 —— 但那会让"数值对齐"失去意义，需要你明确。
 
+## 3.5 用户确认（2026-09）与两条附加约束
+
+**Kernel 清单已确认**：ATen 插件（GEMM/逐元素/SDPA）+ `causal-conv1d` + FLA（`chunk_gated_delta_rule` /
+`RMSNormGated` / `l2_norm`）+ MoE grouped GEMM。**不手写 kernel**。
+
+用户附加的两条约束（比 §3 更严）：
+
+1. **CPU 执行不再允许** —— reference provider **只能作为"对照"（oracle）**，执行路径上一律走 GPU 插件。
+2. **对照要谨慎启动** —— CPU 太慢，不能拿来跑真模型：只用于**逐算子的小规模数值对照**与门禁用例，
+   不用于整模型前向。也就是说 `ops check` 的 conformance 用例继续用 CPU 是合适的（小张量），
+   但"整模型 CPU 前向"这条路彻底关闭 —— 包括此前考虑过的 CPU 多 rank 执行。
+
+（§3 里"保留 reference provider 作为门禁 oracle"的建议，按这两条约束执行：**保留、但仅限小规模对照**。）
+
 ## 4. 确认后我按什么顺序做
 
 1. **ATen 插件骨架**：`.so` + ABI v1 + 最小算子集（`linear` + `elementwise` + `rmsnorm`），
