@@ -261,8 +261,27 @@ L1 全绿（按契约 skip 的四个项除外）；`l1.instantiate` 的 `details
    即 logits 是错的。**离"对齐"还差得远，不是 bf16 舍入能解释的量级。**
 7. **下一步（正在做）**：把 1 层描述 + 只含 layer 0 的 checkpoint 跑出来，与 HF 的 1 层截断前向
    **逐元素**对比，再逐算子往层内走（HF 侧用 forward hook 抓中间张量；rustrain 侧把中间 slot 名写进
-   `outputs.hidden` 就能 dump）。首选怀疑：MoE（每层都有，系统性比例误差会逐层复合）、GDN 三件套、
-   trunk `rmsnorm` 的 `weight_offset` 约定、以及 head 拆分（`reshape` 的跨步输入已修，但拆得对不对只取决于描述）。
+   `outputs.hidden` 就能 dump）。
+8. **已排除的（逐条对着 HF 源码 + 实测核对，不是猜）**：
+   - `causal_conv1d` 的核朝向：宿主上实测 `causal_conv1d_fn(x, w) == F.conv1d(x, w, padding=K-1)[:, :, :L]`
+     **逐位相等**（差 0.0）→ 不需要翻转权重，我们 `at::conv1d` 的用法正确；`conv1d` 没有 bias
+     （`nn.Conv1d(bias=False)`，checkpoint 里也确实没有 `conv1d.bias`）。
+   - MoE 权重朝向：`gate_up_proj [E,2I,H]` → `transpose(1,2)` + `split(dim=2)` ✓；`down_proj [E,H,I]`
+     不转置、算子内 `h @ down[e]^T` ✓；`mlp.gate` 转置后按 `linear` 用 ✓；shared expert 三个权重是
+     `[out,in]` 按 `h @ W^T` 用 ✓；router 的**无条件重归一化**（`norm_topk_prob=true`）✓；
+     `hidden_act=silu` ✓。
+   - 全注意力层：`q_proj` 逐 head 的 `[q|gate]` 交错（`reshape [512,16,2,256]` + `narrow`）✓、
+     `q_norm`/`k_norm` 用 `1+w` 且只在 head 维 ✓、`rope` 只转前 64 维（`partial_rotary_factor=0.25`）✓、
+     `sdpa` 的 `1/sqrt(256)` ✓、`o * sigmoid(gate)` ✓、`o_proj` ✓；残差与两层 norm 的顺序与 HF 的
+     `Qwen3_5MoeDecoderLayer.forward` 逐行一致。
+   - `rmsnorm` 的 `weight_offset=1.0`（HF `Qwen3_5MoeRMSNorm` 确实是 `x_norm * (1 + weight)`）✓；
+     GDN 的 `rmsnorm_gated` 用**裸权重**（HF `RMSNormGated` 是 `w * x_norm * silu(gate)`）✓；
+     `l2norm` 的 eps=1e-6、逐 128 head ✓；`gated_delta_rule` 的 `1/sqrt(128)` 查询缩放 + l2norm 在
+     核外 ✓；`beta = sigmoid(b)`、`g = -exp(A_log) * softplus(a + dt_bias)` ✓。
+9. **当前假设（待验证）**：不是布线错误，而是**每层约 1% 的乘性偏差在复利**——证据是偏差随深度单调放大
+   （std 相对差 1% → 7% → 末端 1.5–2 倍），而 `norm.y`（RMSNorm 会归一掉尺度）只差 6%，末 token 的
+   `argmax` 两边都是 220（方向对了）。1% 的每层偏差：(1.01)^40 ≈ 1.5 与观测吻合。要定位它，只能像
+   §7 那样逐层逐算子对值，而不是看摘要。
 
 ### D5 — 前向数值对齐 HuggingFace
 
