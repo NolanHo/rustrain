@@ -9,12 +9,19 @@
 //! descriptor because layout arithmetic cannot derive them (the routing is
 //! data, `op-vocabulary.md` §4).
 //!
+//! The expert gate/up weights arrive **de-fused** as two separate `[E, H, I]`
+//! tensors — exactly the split the model description's binding already
+//! produces (the checkpoint's `gate_up_proj [E, 2*I, H]` transposed to
+//! `[E, H, 2*I]` and split on dim 2). The fused form cannot be sharded: the
+//! TP shard cuts the `2*I` axis across the gate/up boundary (see
+//! `docs/design/qwen36-5d-example.md` §3), so this op never re-fuses them.
+//!
 //! Numerics are HF's `Qwen3_5MoeSparseMoeBlock` (transformers
 //! `modeling_qwen3_5_moe.py`): per token, **every selected expert runs**
-//! (dropless — no capacity truncation, which is exactly why the fused form
-//! exists), each expert computes `down(silu(gate(x)) * up(x))`, the result is
-//! scaled by the (already normalised) routing probability and summed, and the
-//! shared expert's output is added gated by `sigmoid(shared_expert_gate(x))`.
+//! (dropless — no capacity truncation, which is exactly why the whole layer
+//! is one operator), each expert computes `down(silu(gate(x)) * up(x))`, the
+//! result is scaled by the routing probability and summed, and the shared
+//! expert's output is added gated by `sigmoid(shared_expert_gate(x))`.
 //! All accumulations run in fixed ascending orders (k, then j, then the
 //! hidden axis), so two runs are bitwise identical.
 
@@ -67,9 +74,9 @@ pub(crate) struct MoePlan {
     /// Top-k: the routing tensors' last dim (the router's declaration, not
     /// an attribute of this op).
     k: usize,
-    /// Number of experts (gate_up_proj dim 0).
+    /// Number of experts (gate_proj dim 0).
     e: usize,
-    /// Per-expert intermediate size (gate_up_proj's middle axis is 2*I).
+    /// Per-expert intermediate size (gate_proj's last dim).
     i: usize,
 }
 
@@ -85,24 +92,25 @@ fn sigmoid(x: f32) -> f32 {
     1.0 / (1.0 + (-x).exp())
 }
 
-/// Validates the nine declared inputs and derives the sizes. The input
+/// Validates the ten declared inputs and derives the sizes. The input
 /// contract (see the operator doc in `lib.rs`):
 ///
 /// 0. `h` f32 [.., H], rank >= 2 — the hidden states; rows = prod(leading).
 /// 1. `routing_weights` f32 [rows, K] — topk_router output 0, the softmax
-///    probabilities of the selected experts, already renormalised when the
-///    router runs norm_topk_prob. Used as-is, never renormalised here.
+///    probabilities of the selected experts. Used as-is, never renormalised
+///    here (renormalisation is the router's semantics).
 /// 2. `routing_indices` i32/i64 [rows, K] — topk_router output 1.
-/// 3. `experts_gate_up_proj` f32 [E, 2*I, H] — checkpoint orientation
-///    ([out, in] per expert): gate = rows [0, I), up = rows [I, 2*I) — the
-///    halves `F.linear(x, W).chunk(2, dim=-1)` splits.
-/// 4. `experts_down_proj` f32 [E, H, I] ([out, in] per expert).
-/// 5. `shared_gate_proj` f32 [I, H].
-/// 6. `shared_up_proj` f32 [I, H].
-/// 7. `shared_down_proj` f32 [H, I].
-/// 8. `shared_expert_gate` f32 [1, H].
+/// 3. `experts_gate_proj` f32 [E, H, I] — de-fused ([out, in] per expert:
+///    gate[j] = x @ gate_proj[e][:, j]), the first half the checkpoint
+///    binding splits off `gate_up_proj`.
+/// 4. `experts_up_proj` f32 [E, H, I] — the second half of that split.
+/// 5. `experts_down_proj` f32 [E, H, I] ([out, in] per expert).
+/// 6. `shared_gate_proj` f32 [I, H].
+/// 7. `shared_up_proj` f32 [I, H].
+/// 8. `shared_down_proj` f32 [H, I].
+/// 9. `shared_expert_gate` f32 [1, H].
 fn moe_plan(c: &mut Call) -> OpResult<MoePlan> {
-    c.expect_arity((9, 9))?;
+    c.expect_arity((10, 10))?;
     c.expect_out_count(1)?;
 
     let ht = c.in_t(0);
@@ -172,31 +180,41 @@ fn moe_plan(c: &mut Call) -> OpResult<MoePlan> {
     }
 
     let gut = c.in_t(3);
-    expect_dtype(gut, RsDtype::F32, c.op, "experts_gate_up_proj")?;
+    expect_dtype(gut, RsDtype::F32, c.op, "experts_gate_proj")?;
     if gut.rank != 3 {
         return Err(fail!(
             c.op,
-            "experts_gate_up_proj must be [E, 2*I, H], got rank {}",
+            "experts_gate_proj must be [E, H, I], got rank {}",
             gut.rank
         ));
     }
-    let (e, i2, gh) = (gut.shape[0], gut.shape[1], gut.shape[2]);
-    if e < 1 || i2 < 2 || i2 % 2 != 0 {
+    let (e, gh, gi) = (gut.shape[0], gut.shape[1], gut.shape[2]);
+    if e < 1 || gh < 1 || gi < 1 {
         return Err(fail!(
             c.op,
-            "experts_gate_up_proj must be [E, 2*I, H] with E >= 1, I >= 1, got {:?}",
+            "experts_gate_proj must be [E, H, I] with E >= 1, H >= 1, I >= 1, got {:?}",
             gut.dims()
         ));
     }
     if gh != h {
         return Err(fail!(
             c.op,
-            "experts_gate_up_proj hidden dim {gh} must equal h's hidden dim {h}"
+            "experts_gate_proj hidden dim {gh} must equal h's hidden dim {h}"
         ));
     }
-    let i = i2 / 2;
+    let i = gi;
 
-    let dnt = c.in_t(4);
+    let upt = c.in_t(4);
+    expect_dtype(upt, RsDtype::F32, c.op, "experts_up_proj")?;
+    if upt.rank != 3 || upt.shape[0] != e || upt.shape[1] != h || upt.shape[2] != i {
+        return Err(fail!(
+            c.op,
+            "experts_up_proj must be [E={e}, H={h}, I={i}] like experts_gate_proj, got {:?}",
+            upt.dims()
+        ));
+    }
+
+    let dnt = c.in_t(5);
     expect_dtype(dnt, RsDtype::F32, c.op, "experts_down_proj")?;
     if dnt.rank != 3 || dnt.shape[0] != e || dnt.shape[1] != h || dnt.shape[2] != i {
         return Err(fail!(
@@ -206,7 +224,7 @@ fn moe_plan(c: &mut Call) -> OpResult<MoePlan> {
         ));
     }
 
-    for (idx, who) in [(5usize, "shared_gate_proj"), (6, "shared_up_proj")] {
+    for (idx, who) in [(6usize, "shared_gate_proj"), (7, "shared_up_proj")] {
         let t = c.in_t(idx);
         expect_dtype(t, RsDtype::F32, c.op, who)?;
         if t.rank != 2 || t.shape[0] != i || t.shape[1] != h {
@@ -218,7 +236,7 @@ fn moe_plan(c: &mut Call) -> OpResult<MoePlan> {
         }
     }
 
-    let sdt = c.in_t(7);
+    let sdt = c.in_t(8);
     expect_dtype(sdt, RsDtype::F32, c.op, "shared_down_proj")?;
     if sdt.rank != 2 || sdt.shape[0] != h || sdt.shape[1] != i {
         return Err(fail!(
@@ -228,7 +246,7 @@ fn moe_plan(c: &mut Call) -> OpResult<MoePlan> {
         ));
     }
 
-    let sgt = c.in_t(8);
+    let sgt = c.in_t(9);
     expect_dtype(sgt, RsDtype::F32, c.op, "shared_expert_gate")?;
     if sgt.rank != 2 || sgt.shape[0] != 1 || sgt.shape[1] != h {
         return Err(fail!(
@@ -273,17 +291,19 @@ fn moe_exec_body(c: &mut Call, _a: &RsAttrs) -> OpResult<()> {
     let hv = unsafe { crate::tensor::f32_in(c.op, "h", ht) }?;
     let wv = unsafe { crate::tensor::f32_in(c.op, "routing_weights", c.in_t(1)) }?;
     let idx = unsafe { crate::tensor::indices_i64(c.op, "routing_indices", c.in_t(2)) }?;
-    let gu = unsafe { crate::tensor::f32_in(c.op, "experts_gate_up_proj", c.in_t(3)) }?;
-    let dn = unsafe { crate::tensor::f32_in(c.op, "experts_down_proj", c.in_t(4)) }?;
-    let sg = unsafe { crate::tensor::f32_in(c.op, "shared_gate_proj", c.in_t(5)) }?;
-    let su = unsafe { crate::tensor::f32_in(c.op, "shared_up_proj", c.in_t(6)) }?;
-    let sd = unsafe { crate::tensor::f32_in(c.op, "shared_down_proj", c.in_t(7)) }?;
-    let sgg = unsafe { crate::tensor::f32_in(c.op, "shared_expert_gate", c.in_t(8)) }?;
+    let gu = unsafe { crate::tensor::f32_in(c.op, "experts_gate_proj", c.in_t(3)) }?;
+    let up = unsafe { crate::tensor::f32_in(c.op, "experts_up_proj", c.in_t(4)) }?;
+    let dn = unsafe { crate::tensor::f32_in(c.op, "experts_down_proj", c.in_t(5)) }?;
+    let sg = unsafe { crate::tensor::f32_in(c.op, "shared_gate_proj", c.in_t(6)) }?;
+    let su = unsafe { crate::tensor::f32_in(c.op, "shared_up_proj", c.in_t(7)) }?;
+    let sd = unsafe { crate::tensor::f32_in(c.op, "shared_down_proj", c.in_t(8)) }?;
+    let sgg = unsafe { crate::tensor::f32_in(c.op, "shared_expert_gate", c.in_t(9)) }?;
     let mut ov = unsafe { crate::tensor::f32_out(c.op, c.out_t(0)) }?;
 
     let hs = hv.as_slice().expect("contiguous");
     let ws = wv.as_slice().expect("contiguous");
     let gus = gu.as_slice().expect("contiguous");
+    let ups = up.as_slice().expect("contiguous");
     let dns = dn.as_slice().expect("contiguous");
     let sgs = sg.as_slice().expect("contiguous");
     let sus = su.as_slice().expect("contiguous");
@@ -314,17 +334,18 @@ fn moe_exec_body(c: &mut Call, _a: &RsAttrs) -> OpResult<()> {
             }
             let ei = ei as usize;
             let w = ws[r * k + kk];
-            // Per-expert weight windows: gate_up_proj[e] is [2*I, H] (gate
-            // rows [0, I), up rows [I, 2*I)), down_proj[e] is [H, I].
-            let ge = &gus[ei * 2 * i * h..(ei + 1) * 2 * i * h];
+            // Per-expert weight windows: gate_proj[e] and up_proj[e] are
+            // [H, I] ([out, in] per expert, de-fused), down_proj[e] is [H, I].
+            let ge = &gus[ei * h * i..(ei + 1) * h * i];
+            let ue = &ups[ei * h * i..(ei + 1) * h * i];
             let de = &dns[ei * h * i..(ei + 1) * h * i];
             acc.fill(0.0);
             for j in 0..i {
                 let mut g = 0.0f32;
                 let mut u = 0.0f32;
                 for hh in 0..h {
-                    g += x[hh] * ge[j * h + hh];
-                    u += x[hh] * ge[(i + j) * h + hh];
+                    g += x[hh] * ge[hh * i + j];
+                    u += x[hh] * ue[hh * i + j];
                 }
                 let a = silu(g) * u;
                 for hh in 0..h {
@@ -386,7 +407,7 @@ pub(crate) unsafe extern "C" fn moe_memory(
     }
     // SAFETY: checked non-null above.
     unsafe { *out = RsMemReq::default() };
-    if io.is_null() || n_io < 9 {
+    if io.is_null() || n_io < 10 {
         return 0;
     }
     // SAFETY: the ABI contract says `io` points to live descriptors.

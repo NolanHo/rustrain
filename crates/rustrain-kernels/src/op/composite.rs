@@ -17,7 +17,7 @@
 use rustrain_abi::author::ExpansionSpec;
 use rustrain_abi::ffi::{MAX_RANK, RsAttrs, RsDtype, RsMemReq, RsTensor};
 
-use crate::attrs::{attr_f64, attr_i64};
+use crate::attrs::{attr_bool, attr_f64, attr_i64};
 use crate::dispatch::{Call, run};
 use crate::error::{OpResult, err, fail};
 use crate::tensor::{SmallShape, expect_out, set_output_desc};
@@ -837,6 +837,7 @@ fn topk_exec_body(c: &mut Call, a: &RsAttrs) -> OpResult<()> {
             format!("topk_router 'top_k' must be in [1, E={e}], got {k}"),
         ));
     }
+    let norm = attr_bool(a, "norm_topk_prob").unwrap_or(false);
     expect_out(c.out_t(0), c.op, RsDtype::F32, &[logits.shape[0], k as i64])?;
     expect_out(c.out_t(1), c.op, RsDtype::I32, &[logits.shape[0], k as i64])?;
     // SAFETY: descriptor liveness is the ABI caller's contract.
@@ -869,6 +870,17 @@ fn topk_exec_body(c: &mut Call, a: &RsAttrs) -> OpResult<()> {
         for (j, &(p, ex)) in best.iter().enumerate() {
             ws[i * k + j] = p;
             is[i * k + j] = ex as i32;
+        }
+        // HF's Qwen3_5MoeTopKRouter renormalises the selected weights to sum
+        // to 1 (unconditionally, `router_top_value /= router_top_value.sum(-1,
+        // keepdim=True)`); the declaration asks for it via `norm_topk_prob`.
+        // The sum runs in ascending k order (deterministic). A zero sum cannot
+        // occur: the top-k of a softmax row is positive.
+        if norm {
+            let s = ws[i * k..(i + 1) * k].iter().sum::<f32>();
+            for w in &mut ws[i * k..(i + 1) * k] {
+                *w /= s;
+            }
         }
     }
     Ok(())

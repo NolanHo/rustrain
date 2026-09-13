@@ -1953,6 +1953,24 @@ fn topk_router_hand_values_and_tie_break() {
     let logits = Owned::f32(&[1, 2], vec![0.0, 0.0]);
     let outs = unsafe { run_op(op("topk_router"), &[&logits.t], &[ai64("top_k", 1)], 2) }.unwrap();
     assert_eq!(outs[1].i32s, vec![0]);
+
+    // norm_topk_prob: the selected weights are renormalised to sum to 1 —
+    // HF's Qwen3_5MoeTopKRouter does this unconditionally, the declaration
+    // asks for it via the attribute. Indices unchanged.
+    let logits = Owned::f32(&[1, 4], vec![1.0, 3.0, 2.0, 4.0]);
+    let outs = unsafe {
+        run_op(
+            op("topk_router"),
+            &[&logits.t],
+            &[ai64("top_k", 2), abool("norm_topk_prob", true)],
+            2,
+        )
+    }
+    .unwrap();
+    assert_eq!(outs[1].i32s, vec![3, 1]);
+    let total = p3 + p1;
+    assert_close(outs[0].fdata()[0], p3 / total, 1e-6, "renormalised weight 0");
+    assert_close(outs[0].fdata()[1], p1 / total, 1e-6, "renormalised weight 1");
 }
 
 // ── moe_layer ────────────────────────────────────────────────────────────────
@@ -1962,14 +1980,17 @@ fn moe_layer_hand_values() {
     // One token (rows=1), H=2, E=3, I=2, K=2. x = [1, 2], routing weights
     // [0.25, 0.75], indices [2, 0] — experts 2 and 0 BOTH run (dropless:
     // every selected expert runs), expert 1 does not (its weights are the 7.0
-    // sentinel: a single read of it would blow the exact expected values).
+    // sentinel in gate_proj, up_proj AND down_proj: a single read of it would
+    // blow the exact expected values).
     //
-    // gate_up_proj is [E, 2I, H] with gate = rows [0, I), up = rows [I, 2I):
-    //   expert 0: gate rows (0, .5) -> g = 0*1 + .5*2 = 1; (2, -1) -> g = 0.
-    //             up rows (1, 0) -> u = 1; (0, 1) -> u = 2.
+    // gate_proj/up_proj are DE-FUSED [E, H, I] ([out, in] per expert:
+    // g[j] = x @ gate[e][:, j]), the halves the description's binding splits
+    // off the checkpoint's gate_up_proj:
+    //   expert 0: gate cols (0, .5) -> g = 0*1 + .5*2 = 1; (2, -1) -> g = 0.
+    //             up cols (1, 0) -> u = 1; (0, 1) -> u = 2.
     //             a = [silu(1)*1, silu(0)*2] = [0.7310586, 0]   (silu(0) = 0)
-    //   expert 2: gate rows (2, -1) -> g = 0; (0, .5) -> g = 1.
-    //             up rows (0, 1) -> u = 2; (1, 0) -> u = 1.
+    //   expert 2: gate cols (2, -1) -> g = 0; (0, .5) -> g = 1.
+    //             up cols (0, 1) -> u = 2; (1, 0) -> u = 1.
     //             a = [silu(0)*2, silu(1)*1] = [0, 0.7310586]
     // down_proj is [E, H, I] (out[h] = sum_j a[j] * down[e][h*I + j]):
     //   expert 0: [[1, 0], [0, 1]] -> [0.7310586, 0]
@@ -1983,14 +2004,20 @@ fn moe_layer_hand_values() {
     let h = Owned::f32(&[1, 2], vec![1.0, 2.0]);
     let w = Owned::f32(&[1, 2], vec![0.25, 0.75]);
     let idx = Owned::i32(&[1, 2], vec![2, 0]);
-    let gu = Owned::f32(
-        &[3, 4, 2],
+    let gp = Owned::f32(
+        &[3, 2, 2],
         vec![
-            0.0, 0.5, 2.0, -1.0, 1.0, 0.0, 0.0,
-            1.0, // expert 0: gate (0,.5),(2,-1); up (1,0),(0,1)
-            7.0, 7.0, 7.0, 7.0, 7.0, 7.0, 7.0, 7.0, // expert 1: sentinel, never read
-            2.0, -1.0, 0.0, 0.5, 0.0, 1.0, 1.0,
-            0.0, // expert 2: gate (2,-1),(0,.5); up (0,1),(1,0)
+            0.0, 2.0, 0.5, -1.0, // expert 0: gate cols (0,.5),(2,-1)
+            7.0, 7.0, 7.0, 7.0, // expert 1: sentinel, never read
+            2.0, 0.0, -1.0, 0.5, // expert 2: gate cols (2,-1),(0,.5)
+        ],
+    );
+    let up = Owned::f32(
+        &[3, 2, 2],
+        vec![
+            1.0, 0.0, 0.0, 1.0, // expert 0: up cols (1,0),(0,1)
+            7.0, 7.0, 7.0, 7.0, // expert 1: sentinel, never read
+            0.0, 1.0, 1.0, 0.0, // expert 2: up cols (0,1),(1,0)
         ],
     );
     let dn = Owned::f32(
@@ -2009,7 +2036,7 @@ fn moe_layer_hand_values() {
         run_op(
             op("moe_layer"),
             &[
-                &h.t, &w.t, &idx.t, &gu.t, &dn.t, &sg.t, &su.t, &sd.t, &sgg.t,
+                &h.t, &w.t, &idx.t, &gp.t, &up.t, &dn.t, &sg.t, &su.t, &sd.t, &sgg.t,
             ],
             &[],
             1,
@@ -2029,7 +2056,7 @@ fn moe_layer_hand_values() {
         run_op(
             op("moe_layer"),
             &[
-                &h3.t, &w.t, &idx.t, &gu.t, &dn.t, &sg.t, &su.t, &sd.t, &sgg.t,
+                &h3.t, &w.t, &idx.t, &gp.t, &up.t, &dn.t, &sg.t, &su.t, &sd.t, &sgg.t,
             ],
             &[],
             1,
@@ -2046,7 +2073,7 @@ fn moe_layer_declares_the_dispatch_and_combine_all_to_alls() {
     // The two all_to_all({tp, ep}) collectives are declared, not derivable:
     // the routing is data (op-vocabulary §4), so the planner learns them only
     // from this descriptor. dispatch = the h input (io index 0), combine =
-    // the output (io index 9, at offset n_inputs).
+    // the output (io index 10, at offset n_inputs).
     let o = op("moe_layer");
     assert_eq!(o.n_collectives, 2);
     assert!(!o.collectives.is_null());
@@ -2057,7 +2084,7 @@ fn moe_layer_declares_the_dispatch_and_combine_all_to_alls() {
         assert_eq!(c.group, tp_ep, "collective {i} group must be {{tp, ep}}");
     }
     assert_eq!(cols[0].tensor_index, 0, "dispatch sends the h input");
-    assert_eq!(cols[1].tensor_index, 9, "combine assembles the output");
+    assert_eq!(cols[1].tensor_index, 10, "combine assembles the output");
 }
 
 #[test]
@@ -2067,7 +2094,8 @@ fn moe_layer_memory_reports_its_scratch() {
     let h = Owned::f32(&[1, 2], vec![0.0; 2]);
     let w = Owned::f32(&[1, 1], vec![0.0]);
     let idx = Owned::i32(&[1, 1], vec![0]);
-    let gu = Owned::f32(&[1, 2, 2], vec![0.0; 4]);
+    let gp = Owned::f32(&[1, 2, 1], vec![0.0; 2]);
+    let up = Owned::f32(&[1, 2, 1], vec![0.0; 2]);
     let dn = Owned::f32(&[1, 2, 1], vec![0.0; 2]);
     let sg = Owned::f32(&[1, 2], vec![0.0; 2]);
     let su = Owned::f32(&[1, 2], vec![0.0; 2]);
@@ -2075,7 +2103,7 @@ fn moe_layer_memory_reports_its_scratch() {
     let sgg = Owned::f32(&[1, 2], vec![0.0; 2]);
     let mut req = RsMemReq::default();
     let io: Vec<*const RsTensor> = vec![
-        &h.t, &w.t, &idx.t, &gu.t, &dn.t, &sg.t, &su.t, &sd.t, &sgg.t,
+        &h.t, &w.t, &idx.t, &gp.t, &up.t, &dn.t, &sg.t, &su.t, &sd.t, &sgg.t,
     ];
     let st = unsafe { (o.memory.unwrap())(io.as_ptr(), io.len() as u32, ptr::null(), &mut req) };
     assert_eq!(st, 0);
@@ -2090,7 +2118,8 @@ fn moe_layer_rejects_out_of_range_expert_indices() {
     let h = Owned::f32(&[1, 2], vec![1.0, 2.0]);
     let w = Owned::f32(&[1, 1], vec![1.0]);
     let idx = Owned::i32(&[1, 1], vec![3]); // E = 3 -> 3 is out of range
-    let gu = Owned::f32(&[3, 2, 2], vec![0.0; 12]);
+    let gp = Owned::f32(&[3, 2, 1], vec![0.0; 6]);
+    let up = Owned::f32(&[3, 2, 1], vec![0.0; 6]);
     let dn = Owned::f32(&[3, 2, 1], vec![0.0; 6]);
     let sg = Owned::f32(&[1, 2], vec![0.0; 2]);
     let su = Owned::f32(&[1, 2], vec![0.0; 2]);
@@ -2102,7 +2131,7 @@ fn moe_layer_rejects_out_of_range_expert_indices() {
         call_infer(
             o,
             &[
-                &h.t, &w.t, &idx.t, &gu.t, &dn.t, &sg.t, &su.t, &sd.t, &sgg.t,
+                &h.t, &w.t, &idx.t, &gp.t, &up.t, &dn.t, &sg.t, &su.t, &sd.t, &sgg.t,
             ],
             &mut descs,
             &[],
@@ -2114,7 +2143,7 @@ fn moe_layer_rejects_out_of_range_expert_indices() {
         call_exec(
             o,
             &[
-                &h.t, &w.t, &idx.t, &gu.t, &dn.t, &sg.t, &su.t, &sd.t, &sgg.t,
+                &h.t, &w.t, &idx.t, &gp.t, &up.t, &dn.t, &sg.t, &su.t, &sd.t, &sgg.t,
             ],
             &mut [&mut out.t],
             &[],
@@ -2592,7 +2621,8 @@ fn determinism_cases() -> Vec<(&'static str, Vec<Owned>, Vec<RsAttr>, usize)> {
             Owned::f32(&[1, 2], vec![1.0, 2.0]),
             Owned::f32(&[1, 2], vec![0.25, 0.75]),
             Owned::i32(&[1, 2], vec![2, 0]),
-            Owned::f32(&[3, 4, 2], (1..=24).map(|v| v as f32 * 0.25).collect()),
+            Owned::f32(&[3, 2, 2], (1..=12).map(|v| v as f32 * 0.25).collect()),
+            Owned::f32(&[3, 2, 2], (1..=12).map(|v| v as f32 * 0.5).collect()),
             Owned::f32(&[3, 2, 2], (1..=12).map(|v| v as f32 * 0.5).collect()),
             Owned::f32(&[2, 2], vec![0.5, -0.5, 0.25, -0.25]),
             Owned::f32(&[2, 2], vec![0.25, -0.25, 0.5, -0.5]),

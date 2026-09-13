@@ -583,7 +583,7 @@ fn the_real_qwen36_description_reconciles_the_real_checkpoint_metadata() {
         describe(&items)
     );
     assert!(
-        availability.reason.starts_with("all ") && mentions_number(&availability.reason, 1064),
+        availability.reason.starts_with("all ") && mentions_number(&availability.reason, 1184),
         "the pass must count the nodes it resolved: {}\n{}",
         availability.reason,
         describe(&items)

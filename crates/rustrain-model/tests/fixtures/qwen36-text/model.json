@@ -474,6 +474,46 @@
           ]
         },
         {
+          "name": "qh",
+          "kind": "activation",
+          "dtype": "bf16",
+          "shape": [
+            "seq",
+            "lin_k_heads",
+            "lin_k_dim"
+          ]
+        },
+        {
+          "name": "qhn",
+          "kind": "activation",
+          "dtype": "bf16",
+          "shape": [
+            "seq",
+            "lin_k_heads",
+            "lin_k_dim"
+          ]
+        },
+        {
+          "name": "kh",
+          "kind": "activation",
+          "dtype": "bf16",
+          "shape": [
+            "seq",
+            "lin_k_heads",
+            "lin_k_dim"
+          ]
+        },
+        {
+          "name": "khn",
+          "kind": "activation",
+          "dtype": "bf16",
+          "shape": [
+            "seq",
+            "lin_k_heads",
+            "lin_k_dim"
+          ]
+        },
+        {
           "name": "cv",
           "kind": "activation",
           "dtype": "bf16",
@@ -626,9 +666,18 @@
           ]
         },
         {
-          "name": "routing",
+          "name": "routing_weights",
           "kind": "activation",
           "dtype": "bf16",
+          "shape": [
+            "seq",
+            "topk"
+          ]
+        },
+        {
+          "name": "routing_indices",
+          "kind": "activation",
+          "dtype": "i32",
           "shape": [
             "seq",
             "topk"
@@ -826,12 +875,28 @@
           }
         },
         {
-          "op": "l2norm",
+          "op": "reshape",
           "in": [
             "cq"
           ],
           "out": [
-            "qn"
+            "qh"
+          ],
+          "attrs": {
+            "shape": [
+              512,
+              16,
+              128
+            ]
+          }
+        },
+        {
+          "op": "l2norm",
+          "in": [
+            "qh"
+          ],
+          "out": [
+            "qhn"
           ],
           "attrs": {
             "dim": -1,
@@ -839,16 +904,62 @@
           }
         },
         {
-          "op": "l2norm",
+          "op": "reshape",
+          "in": [
+            "qhn"
+          ],
+          "out": [
+            "qn"
+          ],
+          "attrs": {
+            "shape": [
+              512,
+              2048
+            ]
+          }
+        },
+        {
+          "op": "reshape",
           "in": [
             "ck"
+          ],
+          "out": [
+            "kh"
+          ],
+          "attrs": {
+            "shape": [
+              512,
+              16,
+              128
+            ]
+          }
+        },
+        {
+          "op": "l2norm",
+          "in": [
+            "kh"
+          ],
+          "out": [
+            "khn"
+          ],
+          "attrs": {
+            "dim": -1,
+            "eps": 1e-06
+          }
+        },
+        {
+          "op": "reshape",
+          "in": [
+            "khn"
           ],
           "out": [
             "kn"
           ],
           "attrs": {
-            "dim": -1,
-            "eps": 1e-06
+            "shape": [
+              512,
+              2048
+            ]
           }
         },
         {
@@ -936,10 +1047,11 @@
             "rlogits"
           ],
           "out": [
-            "routing"
+            "routing_weights",
+            "routing_indices"
           ],
           "attrs": {
-            "topk": 8,
+            "top_k": 8,
             "norm_topk_prob": true
           }
         },
@@ -947,7 +1059,8 @@
           "op": "moe_layer",
           "in": [
             "h3",
-            "routing",
+            "routing_weights",
+            "routing_indices",
             "mlp.experts.gate_proj",
             "mlp.experts.up_proj",
             "mlp.experts.down_proj",
@@ -958,11 +1071,7 @@
           ],
           "out": [
             "moe"
-          ],
-          "attrs": {
-            "topk": 8,
-            "norm_topk_prob": true
-          }
+          ]
         },
         {
           "op": "elementwise_binary",
@@ -1351,9 +1460,18 @@
           ]
         },
         {
-          "name": "routing",
+          "name": "routing_weights",
           "kind": "activation",
           "dtype": "bf16",
+          "shape": [
+            "seq",
+            "topk"
+          ]
+        },
+        {
+          "name": "routing_indices",
+          "kind": "activation",
+          "dtype": "i32",
           "shape": [
             "seq",
             "topk"
@@ -1672,10 +1790,11 @@
             "rlogits"
           ],
           "out": [
-            "routing"
+            "routing_weights",
+            "routing_indices"
           ],
           "attrs": {
-            "topk": 8,
+            "top_k": 8,
             "norm_topk_prob": true
           }
         },
@@ -1683,7 +1802,8 @@
           "op": "moe_layer",
           "in": [
             "h3",
-            "routing",
+            "routing_weights",
+            "routing_indices",
             "mlp.experts.gate_proj",
             "mlp.experts.up_proj",
             "mlp.experts.down_proj",
@@ -1694,11 +1814,7 @@
           ],
           "out": [
             "moe"
-          ],
-          "attrs": {
-            "topk": 8,
-            "norm_topk_prob": true
-          }
+          ]
         },
         {
           "op": "elementwise_binary",
