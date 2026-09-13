@@ -167,25 +167,81 @@ int32_t linear_execute(rs_ctx*, const rs_tensor* const* in, uint32_t n_in, rs_te
     });
 }
 
+/// Right-aligned broadcast of two declared shapes, computed from the
+/// descriptors alone: `infer` runs before anything is allocated, so the data
+/// pointers are null and no ATen tensor can be built here.
+bool broadcast_shapes(const rs_tensor* a, const rs_tensor* b, const char* op,
+                      std::vector<int64_t>* out) {
+    uint32_t rank = a->rank > b->rank ? a->rank : b->rank;
+    out->assign(rank, 1);
+    for (uint32_t i = 0; i < rank; ++i) {
+        int64_t da = i < a->rank ? a->shape[a->rank - 1 - i] : 1;
+        int64_t db = i < b->rank ? b->shape[b->rank - 1 - i] : 1;
+        if (da == db) {
+            (*out)[rank - 1 - i] = da;
+        } else if (da == 1) {
+            (*out)[rank - 1 - i] = db;
+        } else if (db == 1) {
+            (*out)[rank - 1 - i] = da;
+        } else {
+            (void)fail(std::string(op) + ": dims " + std::to_string(da) + " and " +
+                       std::to_string(db) + " on axis " + std::to_string(rank - 1 - i) +
+                       " are not broadcastable");
+            return false;
+        }
+    }
+    return true;
+}
+
+/// Batched matmul shape: `a` is [L..., M, K], `b` is [L..., K, N] (or
+/// [L..., N, K] with `transpose_b`); the batch dims are identical and are never
+/// broadcast.
+bool bmm_shape(const rs_tensor* a, const rs_tensor* b, const rs_attrs* attrs,
+               std::vector<int64_t>* out) {
+    int rc = check_f32(a, "bmm", "a");
+    if (rc != 0) {
+        return false;
+    }
+    rc = check_f32(b, "bmm", "b");
+    if (rc != 0) {
+        return false;
+    }
+    if (a->rank < 2 || a->rank != b->rank) {
+        (void)fail("bmm expects two inputs of the same rank >= 2");
+        return false;
+    }
+    uint32_t rank = a->rank;
+    for (uint32_t d = 0; d + 2 < rank; ++d) {
+        if (a->shape[d] != b->shape[d]) {
+            (void)fail("bmm: batch dims differ (this operator does not broadcast batches)");
+            return false;
+        }
+    }
+    int64_t m = a->shape[rank - 2];
+    int64_t k = a->shape[rank - 1];
+    bool transpose_b = bool_or(attrs, "transpose_b", false);
+    int64_t n = transpose_b ? b->shape[rank - 2] : b->shape[rank - 1];
+    if ((transpose_b ? b->shape[rank - 1] : b->shape[rank - 2]) != k) {
+        (void)fail("bmm: inner dims mismatch (b must be [L..., K, N] or [L..., N, K])");
+        return false;
+    }
+    out->assign(a->shape, a->shape + rank);
+    (*out)[rank - 2] = m;
+    (*out)[rank - 1] = n;
+    return true;
+}
+
 int32_t bmm_infer(const rs_tensor* const* in, uint32_t n_in, rs_tensor* const* out,
                   uint32_t n_out, const rs_attrs* attrs) {
     return guard("bmm", [&] {
         if (n_in != 2 || n_out != 1) {
             return fail("bmm expects two inputs and one output");
         }
-        int rc = check_f32(in[0], "bmm", "a");
-        if (rc != 0) {
-            return rc;
+        std::vector<int64_t> shape;
+        if (!bmm_shape(in[0], in[1], attrs, &shape)) {
+            return 1;
         }
-        rc = check_f32(in[1], "bmm", "b");
-        if (rc != 0) {
-            return rc;
-        }
-        at::Tensor a = view(in[0]);
-        at::Tensor b = view(in[1]);
-        at::Tensor c =
-            bool_or(attrs, "transpose_b", false) ? at::matmul(a, b.transpose(-1, -2)) : at::matmul(a, b);
-        set_shape(out[0], c.sizes());
+        set_shape(out[0], shape);
         return 0;
     });
 }
@@ -347,9 +403,11 @@ int32_t binary_infer(const rs_tensor* const* in, uint32_t n_in, rs_tensor* const
         if (rc != 0) {
             return rc;
         }
-        at::Tensor a = view(in[0]);
-        at::Tensor b = view(in[1]);
-        set_shape(out[0], at::broadcast_tensors({a, b})[0].sizes());
+        std::vector<int64_t> shape;
+        if (!broadcast_shapes(in[0], in[1], "elementwise_binary", &shape)) {
+            return 1;
+        }
+        set_shape(out[0], shape);
         return 0;
     });
 }
@@ -454,31 +512,39 @@ int32_t reduce_infer(const rs_tensor* const* in, uint32_t n_in, rs_tensor* const
         if (!require_kind(attrs, "kind", REDUCE_KINDS, N_REDUCE_KINDS, "reduce", &kind)) {
             return 1;
         }
-        at::Tensor x = view(in[0]);
+        // The shape arithmetic is done on the descriptor: `infer` runs before
+        // any buffer exists (the data pointers are null), so building an ATen
+        // tensor here would ask ATen to find the device of a null pointer.
         bool keepdim = bool_or(attrs, "keepdim", false);
         int64_t axis = 0;
-        at::Tensor y;
         if (!attr_i64(attrs, "axis", &axis)) {
-            // No axis: reduce everything, and keepdim makes every dim size 1
-            // (torch's convention).
-            std::vector<int64_t> shape(static_cast<size_t>(x.dim()), 1);
-            set_shape(out[0], keepdim ? at::IntArrayRef(shape) : at::IntArrayRef({}));
+            // No axis: everything is reduced, and keepdim = true makes every
+            // dim size 1 (torch's convention, which the softmax/layernorm VJPs
+            // rely on).
+            if (keepdim) {
+                std::vector<int64_t> shape(static_cast<size_t>(in[0]->rank), 1);
+                set_shape(out[0], shape);
+            } else {
+                set_shape(out[0], {});
+            }
             return 0;
         }
         int64_t dim = 0;
         if (!resolve_dim(axis, in[0]->rank, "reduce", &dim)) {
             return 1;
         }
-        if (kind == "max") {
-            y = std::get<0>(at::max(x, dim, keepdim));
-        } else if (kind == "amax") {
-            y = x.abs().amax(dim, keepdim);
-        } else if (kind == "mean") {
-            y = x.mean(dim, keepdim);
-        } else {
-            y = x.sum(dim, keepdim);
+        std::vector<int64_t> shape;
+        shape.reserve(in[0]->rank);
+        for (uint32_t d = 0; d < in[0]->rank; ++d) {
+            if (static_cast<int64_t>(d) == dim) {
+                if (keepdim) {
+                    shape.push_back(1);
+                }
+            } else {
+                shape.push_back(in[0]->shape[d]);
+            }
         }
-        set_shape(out[0], y.sizes());
+        set_shape(out[0], shape);
         return 0;
     });
 }

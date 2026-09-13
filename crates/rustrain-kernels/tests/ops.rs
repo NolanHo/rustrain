@@ -790,6 +790,29 @@ fn transpose_swaps_shape_and_strides() {
     );
 }
 
+/// `reshape` of a strided view copies the LOGICAL order, not the memory order.
+///
+/// A `narrow` produces exactly this shape of descriptor (a slice of a flat
+/// projection: [rows, width] with the row stride of the whole projection), and
+/// `reshape` then groups it into per-head blocks. Reinterpreting memory instead
+/// of the logical order would read the neighbouring segments instead — values
+/// that are plausible, wrong, and invisible to a shape check. Before this, the
+/// reference provider refused the input outright, so the plan that needs it
+/// could not run at all.
+#[test]
+fn reshape_materialises_a_strided_view_in_logical_order() {
+    let base = Owned::f32(&[2, 4], vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]);
+    let mut strided = base.t;
+    strided.shape = [2, 2, 0, 0, 0, 0, 0, 0];
+    strided.stride = [4, 1, 0, 0, 0, 0, 0, 0];
+    assert!(!strided.is_contiguous());
+    let outs = unsafe { run_op(op("reshape"), &[&strided], &[ai64s("shape", &[4])], 1) }.unwrap();
+    let o = &outs[0];
+    assert_eq!(o.t.dims(), &[4]);
+    // The view reads (0,0)=1, (0,1)=2, (1,0)=5, (1,1)=6 — not 1,2,3,4.
+    assert_eq!(o.fdata(), &[1.0, 2.0, 5.0, 6.0]);
+}
+
 #[test]
 fn narrow_offsets_the_data_pointer() {
     let x = Owned::f32(&[3, 4], (1..=12).map(|v| v as f32).collect());

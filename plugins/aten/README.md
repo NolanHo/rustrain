@@ -36,6 +36,23 @@ rustrain run --plugin ... --recipe plugins/aten/aten.toml --device cuda \
         --tokens 9707,11,1879,0,323,358,314,279 --out /var/tmp/rustrain.npz
 ```
 
+## 验证（2026-09，宿主 8× L20X，sm_89）
+
+| 证据 | 命令 | 结果 |
+|---|---|---|
+| Rust 宿主 `dlopen` C++ 插件 | `rustrain ops list --plugin librustrain_aten.so` | 60 个实现（32 reference + 28 aten） |
+| 逐算子对拍（框架门禁） | `rustrain ops check --plugin … --recipe plugins/aten/aten.toml --device cuda` | **59 case / 0 failing**，exit 0；reference 留在 host、`cuda.*` 变体跑在显存里 |
+| 插件自检（对照 Rust oracle 源码） | 宿主 `gpu-work/smoke_aten.py` | 31/31 case，26 个算子，两次运行字节一致 |
+
+开发过程中被门禁抓到的两类真问题（都是"看起来对"的）：
+
+1. **`infer` 里建了 ATen 张量**（`bmm` / `elementwise_binary` / `reduce`）：infer 跑在任何分配之前，
+   descriptor 的 `data` 是 null，`at::from_blob(nullptr, …, CUDA)` 会去问"这个指针在哪块设备上"并报
+   `The specified pointer resides on host memory`。形状只能来自 shape/stride 算术。已修，并写进
+   `skills/architecture/SKILL.md` §3 的禁止模式。
+2. **MoE 的 down 投影漏了 `.t()`**：`experts_down_proj` 是 `[E, H, I]`（H 是输出），参考实现是
+   `act @ down[e]ᵀ`。H ≠ I 时报形状错，H == I 时**静默算错**（GPU 自检 maxdiff 1.06）。已修。
+
 ## 覆盖
 
 | 算子 | 怎么实现 |

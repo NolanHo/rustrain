@@ -612,8 +612,8 @@ fn run_rank(
 
         let mut summaries: Vec<[f32; 3]> = Vec::new();
         let mut hidden_names: Vec<String> = Vec::new();
-        for id in &hidden_ids {
-            let name = executor.plan().plan.slot(*id).name.clone();
+        for (id, name) in &hidden_ids {
+            let name = name.clone();
             let bytes = executor
                 .read_raw(*id)
                 .with_context(|| format!("reading the hidden state slot `{name}`"))?;
@@ -1033,8 +1033,17 @@ fn matching_slots(plan: &Plan, pattern: &str) -> Vec<SlotId> {
 /// `view` node at the end per slot (a view aliases its input, so the extension costs a
 /// descriptor, not a copy), with a uniquely named output slot the pool keeps alive.
 ///
-/// Returns the hidden slot ids in pattern order.
-fn keep_hidden_states(plan: &mut Plan, patterns: &[String]) -> Result<Vec<SlotId>> {
+/// Returns, in pattern order, **the keeper's output slot** paired with the display name of the
+/// hidden state it keeps.
+///
+/// The output — not the matched input — is what a caller must read back. The compiler rewires a
+/// consumer to the completed twin whenever a slot carries a partial (an embedding sharded over tp,
+/// say), the keeper included; the original slot is then dead after the collective, and the pool is
+/// free to hand its bytes to a later activation. Reading the original would return whatever was
+/// written over it — bytes with the right shape, the right name and the wrong values, which is
+/// exactly what the first D6 device run produced. The keeper's output dies with the plan, so its
+/// bytes are still its own at the end.
+fn keep_hidden_states(plan: &mut Plan, patterns: &[String]) -> Result<Vec<(SlotId, String)>> {
     let mut ids: Vec<SlotId> = Vec::new();
     for pattern in patterns {
         let matched = matching_slots(plan, pattern);
@@ -1044,6 +1053,7 @@ fn keep_hidden_states(plan: &mut Plan, patterns: &[String]) -> Result<Vec<SlotId
         ids.extend(matched);
     }
     let phase = plan.meta.phase;
+    let mut kept: Vec<(SlotId, String)> = Vec::with_capacity(ids.len());
     for (index, id) in ids.iter().enumerate() {
         let slot = plan.slot(*id);
         let mut out = slot.clone();
@@ -1063,6 +1073,7 @@ fn keep_hidden_states(plan: &mut Plan, patterns: &[String]) -> Result<Vec<SlotId
         }
         out.kind = rustrain_plan::SlotKind::Output;
         let out_id = SlotId(plan.slots.len());
+        kept.push((out_id, slot.name.clone()));
         plan.slots.push(out);
         plan.nodes.push(rustrain_plan::PlanNode {
             op: rustrain_plan::OpRef::new("view"),
@@ -1076,7 +1087,7 @@ fn keep_hidden_states(plan: &mut Plan, patterns: &[String]) -> Result<Vec<SlotId
             source: rustrain_plan::Trace::new(format!("run.hidden.{index}")),
         });
     }
-    Ok(ids)
+    Ok(kept)
 }
 
 /// When the logits slot is not replicated, appends one `view` node whose
@@ -1424,14 +1435,40 @@ mod tests {
         // HF's output_hidden_states = embedding output + 40 layer outputs + final norm = 42 rows.
         assert_eq!(hidden.len(), 42, "embed + layers.0..39 + norm");
         assert_eq!(
-            plan.slot(hidden[0]).name,
-            "embed.y",
+            hidden[0].1, "embed.y",
             "the first hidden state is the embedding output"
         );
         assert_eq!(
-            plan.slot(hidden[41]).name,
-            "norm.y",
+            hidden[41].1, "norm.y",
             "the last hidden state is the final norm"
+        );
+        // The ids the runner reads back are the keeper *outputs*, not the slots they were built
+        // from: the compiler rewires consumers to a completed twin (the embedding is sharded over
+        // tp and carries a partial), and the original slot is dead after that collective — the
+        // pool may hand its bytes to a later activation. Reading the original returned the right
+        // shape and the wrong numbers on the first D6 device run.
+        for (id, name) in &hidden {
+            let keeper = plan.slot(*id);
+            assert!(
+                keeper.name.starts_with("__run__.hidden."),
+                "hidden state `{name}` is read from `{}`, which is not the keeper's output",
+                keeper.name
+            );
+            assert_eq!(keeper.kind, rustrain_plan::SlotKind::Output);
+        }
+        let produced_by = plan
+            .nodes
+            .iter()
+            .find(|n| n.outputs.contains(&hidden[0].0))
+            .expect("the keeper output has a producer");
+        assert_eq!(
+            produced_by.op.name, "view",
+            "the keeper is a view node, so it costs a descriptor and not a copy"
+        );
+        assert_eq!(
+            produced_by.inputs.len(),
+            1,
+            "the keeper reads the one hidden slot it keeps"
         );
 
         let nodes_after = plan.nodes.len();

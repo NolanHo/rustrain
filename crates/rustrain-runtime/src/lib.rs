@@ -709,7 +709,7 @@ impl Executor {
                     let mut output = out_tensors.remove(0);
                     let report = self
                         .collectives
-                        .execute(&request, &input, &mut output)
+                        .execute(&request, &input, &mut output, self.allocator.as_mut())
                         .map_err(|reason| RuntimeError::Collective {
                             index,
                             op: label.clone(),

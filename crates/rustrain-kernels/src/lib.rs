@@ -112,7 +112,7 @@ fn spec(
 
 const VIEW_DOC: &str = "Zero-copy alias: the output descriptor (shape/stride/data) is an exact copy of the input and aliases its buffer (out.data = in.data). No allocation, no copy; the executor must not pre-allocate this output.";
 
-const RESHAPE_DOC: &str = "Zero-copy view: reinterprets a contiguous input with the 'shape' attribute (list of i64, required; one -1 allowed, filled so numel is preserved). out.data aliases the input buffer. Non-contiguous inputs are rejected (contiguity handling is a later improvement).";
+const RESHAPE_DOC: &str = "Reinterprets the input's ROW-MAJOR LOGICAL order as the 'shape' attribute (list of i64, required; one -1 allowed, filled so numel is preserved). A contiguous input is a zero-copy alias (out.data = in.data); a strided input (a narrow of a flat projection, say) is materialised into the output slot in logical order, which is what makes a per-head regroup of a flat QKV slice correct rather than a read of the neighbouring segments.";
 
 const TRANSPOSE_DOC: &str = "Zero-copy view: swaps axes dim0/dim1 (i64 attrs, defaults -2/-1; negative axes count from the end), swapping shape and strides while aliasing the input buffer. The result is usually non-contiguous; downstream compute ops reject it — by design.";
 

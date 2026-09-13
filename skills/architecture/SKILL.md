@@ -73,6 +73,9 @@ description: rustrain 的架构操作规则。改动 crate 边界、ABI、plan I
 ❌ planner 规划融合体本体          → 永远规划 primitive expansion，融合是解析期替换（§4.1）
 ❌ plan 里塞 mesh / rank 列表      → 只放结果与指纹（I-6）
 ❌ 插件在 init() 之前碰设备        → 否则无 GPU check 变成真执行
+❌ 在 infer() 里建张量 / 碰数据     → infer 跑在任何分配之前，descriptor 的 data 是 null；
+                                     `at::from_blob(nullptr)` 会去问"这个指针在哪块设备上"然后失败。
+                                     形状只能来自 shape/stride 算术（D6 GPU 首跑抓到的就是这条）
 ❌ 描述里重复 config 的数值        → 引用参数名，不复制数值
 ❌ 模型描述只支持"纯列表"或"纯派生"一种形式 → 两种都必须支持（Qwen 与 GLM5 各用一种）
 ```

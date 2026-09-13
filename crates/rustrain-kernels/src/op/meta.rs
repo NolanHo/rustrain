@@ -18,7 +18,7 @@ use rustrain_abi::ffi::{MAX_RANK, RsAttrs, RsTensor};
 use crate::attrs::{attr_i64, attr_i64s};
 use crate::dispatch::{Call, run};
 use crate::error::{OpResult, err, fail};
-use crate::tensor::{SmallShape, expect_contiguous, resolve_axis, set_output_desc, set_view_desc};
+use crate::tensor::{SmallShape, resolve_axis, set_output_desc, set_view_desc};
 
 /// Declares an `infer` trampoline for a body `fn(&mut Call, &RsAttrs)`.
 macro_rules! infer_entry {
@@ -176,15 +176,57 @@ fn reshape_exec_body(c: &mut Call, a: &RsAttrs) -> OpResult<()> {
     c.expect_arity((1, 1))?;
     c.expect_out_count(1)?;
     let x = c.in_t(0);
-    // A reshape of a non-contiguous input would need a copy; the reference
-    // provider is a view-only reshape, so it must be contiguous to alias.
-    expect_contiguous(x, c.op, "x")?;
     let shape = resolve_reshape(x, a, c.op)?;
-    let data = x.data;
-    let dtype = x.dtype;
     let o = c.out_t(0);
-    set_output_desc(o, dtype, shape.as_slice());
-    o.data = data;
+    // A contiguous input is reinterpreted in place: the output descriptor
+    // aliases the input's buffer and no byte moves.
+    if x.is_contiguous() {
+        let data = x.data;
+        let dtype = x.dtype;
+        set_output_desc(o, dtype, shape.as_slice());
+        o.data = data;
+        return Ok(());
+    }
+    // A strided input needs a copy, and the copy is well defined: `reshape`
+    // means "the same values in row-major logical order, read as `shape`" —
+    // the logical order, not the memory order. The plan layer reaches this
+    // through `narrow` (a slice of a flat QKV projection, for instance), where
+    // reinterpreting memory instead would silently read the neighbouring
+    // segments. The executor allocated the output slot at exactly `shape`, so
+    // the materialised values land in the caller's buffer.
+    crate::tensor::expect_out(o, c.op, x.dtype, shape.as_slice())?;
+    let dims = crate::tensor::dims_usize(x, c.op, "x")?;
+    let total: usize = dims.iter().product();
+    if total == 0 {
+        return Ok(());
+    }
+    if x.data.is_null() || o.data.is_null() {
+        return Err(err(
+            c.op,
+            "reshape needs live buffers on both sides".to_string(),
+        ));
+    }
+    let rank = dims.len();
+    let src = x.data as *const f32;
+    let dst = o.data as *mut f32;
+    let mut index = vec![0usize; rank];
+    for linear in 0..total {
+        let offset: isize = index
+            .iter()
+            .zip(x.stride[..rank].iter())
+            .map(|(i, s)| *i as isize * *s as isize)
+            .sum();
+        // SAFETY: shape and strides describe a live f32 buffer (the ABI
+        // caller's contract), and `total` matches the output slot exactly.
+        unsafe { *dst.add(linear) = *src.offset(offset) };
+        for d in (0..rank).rev() {
+            index[d] += 1;
+            if index[d] < dims[d] {
+                break;
+            }
+            index[d] = 0;
+        }
+    }
     Ok(())
 }
 

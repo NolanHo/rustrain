@@ -60,6 +60,8 @@ use std::sync::{Arc, Condvar, Mutex};
 use rustrain_abi::ffi::RsTensor;
 use rustrain_parallel::{GroupMask, Mesh, ReduceOp};
 
+use crate::Allocator;
+
 /// The collectives a runtime backend must perform. The plugin ABI's
 /// `RsCollectiveKind` does not carry `broadcast` or `sync`, so the runtime
 /// vocabulary is its own enum; the executor maps the plan's intrinsic names
@@ -119,11 +121,17 @@ pub struct CollectiveReport {
 /// `input` before writing `output` (the two may be one buffer) and must honour
 /// both descriptors' shapes and strides.
 pub trait CollectiveBackend {
+    /// `host` is where the operands' bytes actually live: slot buffers may be
+    /// host memory or device memory, and only the allocator created for them
+    /// knows how to move them. A backend that walked the descriptors' pointers
+    /// itself would read device memory from the host and fault (the D6 GPU run
+    /// found exactly that), so every read and write goes through it.
     fn execute(
         &mut self,
         req: &CollectiveRequest,
         input: &RsTensor,
         output: &mut RsTensor,
+        host: &mut dyn Allocator,
     ) -> Result<CollectiveReport, String>;
 }
 
@@ -151,6 +159,7 @@ impl CollectiveBackend for SingleRank {
         req: &CollectiveRequest,
         input: &RsTensor,
         output: &mut RsTensor,
+        host: &mut dyn Allocator,
     ) -> Result<CollectiveReport, String> {
         if self.world_size > 1 {
             return Err(format!(
@@ -165,7 +174,7 @@ impl CollectiveBackend for SingleRank {
         // makes the declared shapes agree by construction (the gather is over
         // one slice, the split has one entry — the whole tensor, validated at
         // compile time).
-        let bytes = copy_tensor(input, output)?;
+        let bytes = copy_tensor(input, output, host)?;
         Ok(CollectiveReport {
             sent_bytes: 0,
             recv_bytes: bytes,
@@ -317,6 +326,7 @@ impl CollectiveBackend for ThreadBackend {
         req: &CollectiveRequest,
         input: &RsTensor,
         output: &mut RsTensor,
+        host: &mut dyn Allocator,
     ) -> Result<CollectiveReport, String> {
         let ordinal = self.ordinal;
         self.ordinal += 1;
@@ -333,7 +343,7 @@ impl CollectiveBackend for ThreadBackend {
         // lockstep.
         if req.kind == CollectiveKind::Sync {
             self.shared.meet(read_gen)?;
-            let bytes = copy_tensor(input, output)?;
+            let bytes = copy_tensor(input, output, host)?;
             return Ok(CollectiveReport {
                 sent_bytes: 0,
                 recv_bytes: bytes,
@@ -359,7 +369,7 @@ impl CollectiveBackend for ThreadBackend {
                         req.group
                     ));
                 }
-                materialise(input, width)
+                materialise(input, width, host)?
             }
             CollectiveKind::AllGather => {
                 let dim = resolve_dim(req, &in_shape)?;
@@ -372,7 +382,7 @@ impl CollectiveBackend for ThreadBackend {
                 if expected != out_shape {
                     return Err(shape_error(req, &expected, &out_shape));
                 }
-                materialise(input, width)
+                materialise(input, width, host)?
             }
             CollectiveKind::ReduceScatter => {
                 let dim = resolve_dim(req, &in_shape)?;
@@ -389,7 +399,7 @@ impl CollectiveBackend for ThreadBackend {
                 if expected != out_shape {
                     return Err(shape_error(req, &expected, &out_shape));
                 }
-                materialise(input, width)
+                materialise(input, width, host)?
             }
             CollectiveKind::Broadcast => {
                 let src = req.src.unwrap_or(0);
@@ -404,7 +414,7 @@ impl CollectiveBackend for ThreadBackend {
                     return Err(shape_error(req, &in_shape, &out_shape));
                 }
                 if my_index == src {
-                    materialise(input, width)
+                    materialise(input, width, host)?
                 } else {
                     Vec::new()
                 }
@@ -455,7 +465,7 @@ impl CollectiveBackend for ThreadBackend {
                 if expected != out_shape {
                     return Err(shape_error(req, &expected, &out_shape));
                 }
-                materialise(input, width)
+                materialise(input, width, host)?
             }
             CollectiveKind::Sync => unreachable!("handled above"),
         };
@@ -561,7 +571,7 @@ impl CollectiveBackend for ThreadBackend {
         };
 
         let recv = result.len() as u64;
-        scatter(output, &result, width)?;
+        scatter(output, &result, width, host)?;
         Ok(CollectiveReport {
             sent_bytes: sent,
             recv_bytes: recv,
@@ -619,31 +629,51 @@ fn mismatched_contribution(req: &CollectiveRequest, rank: usize, members: &[usiz
     )
 }
 
-/// Copies a strided view into a contiguous buffer, in row-major logical order.
-fn materialise(t: &RsTensor, width: usize) -> Vec<u8> {
+/// The byte span a descriptor reads from its base pointer: the largest offset
+/// its shape and strides reach, plus one element. A device operand must come
+/// back in one transfer of the whole span — walking it element by element is
+/// only possible once it is host memory.
+fn span_of(t: &RsTensor, width: usize) -> u64 {
+    let shape = logical_shape(t);
+    let rank = (t.rank as usize).min(shape.len());
+    let mut max_offset = 0i64;
+    for (dim, stride) in shape[..rank].iter().zip(&t.stride[..rank]) {
+        if *dim > 0 {
+            max_offset += (*dim - 1) * (*stride).max(0);
+        }
+    }
+    (max_offset.max(0) as u64 + 1) * width.max(1) as u64
+}
+
+/// Copies a strided view into a contiguous host buffer, in row-major logical
+/// order. The operand's bytes are brought to the host through `host` first, so
+/// a device slot is staged in one transfer instead of being dereferenced here.
+fn materialise(t: &RsTensor, width: usize, host: &dyn Allocator) -> Result<Vec<u8>, String> {
     let shape = logical_shape(t);
     let rank = (t.rank as usize).min(shape.len());
     let strides = &t.stride[..rank];
     let total: usize = shape[..rank].iter().product::<i64>().max(0) as usize;
     let mut out = vec![0u8; total * width];
     if total == 0 || t.data.is_null() {
-        return out;
+        return Ok(out);
     }
+    let staged = host.copy_out(t.data, span_of(t, width))?;
     let mut index = vec![0i64; rank];
     for linear in 0..total {
         let mut offset = 0i64;
         for d in 0..rank {
             offset += index[d] * strides[d];
         }
-        // SAFETY: the descriptor was produced over a buffer holding exactly
-        // `total` reachable elements with these strides.
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                (t.data as *const u8).add(offset as usize * width),
-                out.as_mut_ptr().add(linear * width),
-                width,
-            );
+        let src = offset.max(0) as usize * width;
+        let dst = linear * width;
+        if src + width > staged.len() || dst + width > out.len() {
+            return Err(format!(
+                "the descriptor reads element {linear} at byte {src}, past the {} byte(s) its \
+                 buffer covers",
+                staged.len()
+            ));
         }
+        out[dst..dst + width].copy_from_slice(&staged[src..src + width]);
         for d in (0..rank).rev() {
             index[d] += 1;
             if index[d] < shape[d] {
@@ -652,11 +682,29 @@ fn materialise(t: &RsTensor, width: usize) -> Vec<u8> {
             index[d] = 0;
         }
     }
-    out
+    Ok(out)
+}
+
+/// Whether a descriptor's layout is plain row-major for its logical shape, so a
+/// transfer can move the bytes as they are instead of element by element.
+///
+/// Strides are in *elements* (`rs_tensor`'s contract), so the expected stride
+/// starts at one and grows by the shape, not by the element width.
+fn is_row_major(t: &RsTensor, shape: &[i64]) -> bool {
+    let mut expected = 1i64;
+    for d in (0..shape.len()).rev() {
+        if shape[d] > 1 && t.stride[d] != expected {
+            return false;
+        }
+        expected *= shape[d].max(1);
+    }
+    true
 }
 
 /// Writes a contiguous row-major result into a (possibly strided) descriptor.
-fn scatter(t: &mut RsTensor, data: &[u8], width: usize) -> Result<(), String> {
+/// A row-major output is one transfer; a strided one stages the span, edits it
+/// on the host and writes it back.
+fn scatter(t: &mut RsTensor, data: &[u8], width: usize, host: &mut dyn Allocator) -> Result<(), String> {
     let shape = logical_shape(t);
     let rank = (t.rank as usize).min(shape.len());
     let strides = &t.stride[..rank];
@@ -671,20 +719,26 @@ fn scatter(t: &mut RsTensor, data: &[u8], width: usize) -> Result<(), String> {
     if t.data.is_null() {
         return Err("the collective's output slot has no data pointer".to_string());
     }
+    if is_row_major(t, &shape[..rank]) {
+        return host.copy_in(t.data, data.len() as u64, data);
+    }
+    let span = span_of(t, width);
+    let mut staged = host.copy_out(t.data, span)?;
     let mut index = vec![0i64; rank];
     for linear in 0..total {
         let mut offset = 0i64;
         for d in 0..rank {
             offset += index[d] * strides[d];
         }
-        // SAFETY: as in `materialise`, mirrored for the write side.
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                data.as_ptr().add(linear * width),
-                (t.data as *mut u8).add(offset as usize * width),
-                width,
-            );
+        let dst = offset.max(0) as usize * width;
+        if dst + width > staged.len() {
+            return Err(format!(
+                "the output descriptor writes element {linear} at byte {dst}, past the {} \
+                 byte(s) its buffer covers",
+                staged.len()
+            ));
         }
+        staged[dst..dst + width].copy_from_slice(&data[linear * width..(linear + 1) * width]);
         for d in (0..rank).rev() {
             index[d] += 1;
             if index[d] < shape[d] {
@@ -693,12 +747,16 @@ fn scatter(t: &mut RsTensor, data: &[u8], width: usize) -> Result<(), String> {
             index[d] = 0;
         }
     }
-    Ok(())
+    host.copy_in(t.data, span, &staged)
 }
 
 /// Copies one tensor into another, honouring both descriptors' shapes and
 /// strides. The shapes must agree; the data layouts need not.
-fn copy_tensor(input: &RsTensor, output: &mut RsTensor) -> Result<u64, String> {
+fn copy_tensor(
+    input: &RsTensor,
+    output: &mut RsTensor,
+    host: &mut dyn Allocator,
+) -> Result<u64, String> {
     let width = {
         let in_width = input.dtype.byte_width().map(|w| w as usize);
         let out_width = output.dtype.byte_width().map(|w| w as usize);
@@ -719,8 +777,8 @@ fn copy_tensor(input: &RsTensor, output: &mut RsTensor) -> Result<u64, String> {
             logical_shape(output)
         ));
     }
-    let data = materialise(input, width);
-    scatter(output, &data, width)?;
+    let data = materialise(input, width, host)?;
+    scatter(output, &data, width, host)?;
     Ok(data.len() as u64)
 }
 
@@ -889,4 +947,106 @@ fn row_major_strides(shape: &[i64]) -> Vec<usize> {
         strides[d] = strides[d + 1] * shape[d + 1].max(0) as usize;
     }
     strides
+}
+
+#[cfg(test)]
+mod tests {
+    use std::ffi::c_void;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use rustrain_abi::ffi::{RsDeviceKind, RsDtype, RsTensor};
+    use rustrain_parallel::GroupMask;
+
+    use super::*;
+    use crate::HostAllocator;
+
+    /// The allocator is the only thing that knows where a buffer lives, so a
+    /// collective must move every byte through it. A backend that dereferenced
+    /// the descriptors itself would pass on the host and read device memory
+    /// from the host on a GPU — which is exactly how the first D6 device run
+    /// died, in `materialise`, with a SIGSEGV.
+    #[test]
+    fn single_rank_moves_bytes_through_the_allocator() {
+        struct RecordingAllocator {
+            inner: HostAllocator,
+            in_calls: Arc<AtomicUsize>,
+            out_calls: Arc<AtomicUsize>,
+        }
+
+        unsafe impl Allocator for RecordingAllocator {
+            fn alloc(&mut self, bytes: u64, device: RsDeviceKind) -> Result<*mut c_void, String> {
+                self.inner.alloc(bytes, device)
+            }
+
+            fn dealloc(&mut self, ptr: *mut c_void, bytes: u64) {
+                self.inner.dealloc(ptr, bytes);
+            }
+
+            fn device(&self) -> RsDeviceKind {
+                self.inner.device()
+            }
+
+            fn copy_in(&mut self, dst: *mut c_void, bytes: u64, src: &[u8]) -> Result<(), String> {
+                self.in_calls.fetch_add(1, Ordering::SeqCst);
+                self.inner.copy_in(dst, bytes, src)
+            }
+
+            fn copy_out(&self, src: *const c_void, bytes: u64) -> Result<Vec<u8>, String> {
+                self.out_calls.fetch_add(1, Ordering::SeqCst);
+                self.inner.copy_out(src, bytes)
+            }
+        }
+
+        let mut host = HostAllocator::new();
+        let input_bytes = 4u64 * 4;
+        let input_ptr = host.alloc(input_bytes, RsDeviceKind::CPU).unwrap();
+        host.copy_in(input_ptr, input_bytes, &[1.0f32.to_le_bytes(), 2.0f32.to_le_bytes(), 3.0f32.to_le_bytes(), 4.0f32.to_le_bytes()].concat())
+            .unwrap();
+        let output_ptr = host.alloc(input_bytes, RsDeviceKind::CPU).unwrap();
+
+        let mut input = RsTensor::new(RsDtype::F32, &[4]);
+        input.data = input_ptr;
+        let mut output = RsTensor::new(RsDtype::F32, &[4]);
+        output.data = output_ptr;
+
+        let in_calls = Arc::new(AtomicUsize::new(0));
+        let out_calls = Arc::new(AtomicUsize::new(0));
+        let mut allocator = RecordingAllocator {
+            inner: host,
+            in_calls: in_calls.clone(),
+            out_calls: out_calls.clone(),
+        };
+        let request = CollectiveRequest {
+            kind: CollectiveKind::AllReduce,
+            group: GroupMask::from_bits(1),
+            reduce: Some(ReduceOp::Sum),
+            dim: None,
+            split: None,
+            src: None,
+        };
+        let report = SingleRank::new(1)
+            .execute(&request, &input, &mut output, &mut allocator)
+            .expect("the identity collective on one rank");
+        assert_eq!(report.recv_bytes, input_bytes);
+        assert_eq!(
+            out_calls.load(Ordering::SeqCst),
+            1,
+            "the input was not read through the allocator"
+        );
+        assert_eq!(
+            in_calls.load(Ordering::SeqCst),
+            1,
+            "the output was not written through the allocator"
+        );
+
+        let written = allocator.inner.copy_out(output_ptr, input_bytes).unwrap();
+        let values: Vec<f32> = written
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        assert_eq!(values, vec![1.0, 2.0, 3.0, 4.0]);
+        allocator.inner.dealloc(input_ptr, input_bytes);
+        allocator.inner.dealloc(output_ptr, input_bytes);
+    }
 }

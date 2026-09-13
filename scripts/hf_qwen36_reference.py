@@ -62,6 +62,50 @@ SEQ = len(PROBE_TOKENS)
 TOLERANCE = 0.01
 
 
+def _forward(model, ids, torch) -> tuple[object, list, str]:
+    """One forward, returning `(logits, hidden states, where they came from)`.
+
+    `output_hidden_states=True` is not enough on transformers 5.12.1: its `capture_outputs`
+    hook collects embed + every layer, then `tie_last_hidden_states` overwrites the last
+    entry with the final norm's output — yielding L+1 rows and losing layer L's own hidden
+    state. The first dump taken that way had 41 rows against the description's 42, and
+    `compare` refuses mismatched shapes rather than silently dropping the layer it cannot
+    name (row 0 is the embedding, rows 1..L the layers, the last row the norm).
+
+    So the sequence is captured explicitly with forward hooks on the three module groups
+    the declaration names. The fallback keeps the run honest when a model's module layout
+    does not expose them: it uses whatever `output_hidden_states` returned and says so in
+    the sidecar, rather than pretending the rows mean the same thing.
+    """
+    captured: list = []
+    handles: list = []
+    inner = getattr(model, "model", None)
+    layers = getattr(inner, "layers", None) if inner is not None else None
+    embed = getattr(inner, "embed_tokens", None) if inner is not None else None
+    norm = getattr(inner, "norm", None) if inner is not None else None
+    expected = len(layers) + 2 if layers is not None else 0
+    if expected and embed is not None and norm is not None:
+
+        def capture(_module, _inputs, output):
+            captured.append(output[0] if isinstance(output, tuple) else output)
+
+        handles.append(embed.register_forward_hook(capture))
+        for layer in layers:
+            handles.append(layer.register_forward_hook(capture))
+        handles.append(norm.register_forward_hook(capture))
+
+    try:
+        with torch.no_grad():
+            out = model(input_ids=ids, output_hidden_states=True, use_cache=False)
+    finally:
+        for handle in handles:
+            handle.remove()
+
+    if len(captured) == expected:
+        return out.logits, list(captured), "forward_hooks"
+    return out.logits, list(out.hidden_states), "output_hidden_states"
+
+
 def dump(args: argparse.Namespace) -> int:
     import torch
     from transformers import AutoModelForCausalLM
@@ -79,24 +123,23 @@ def dump(args: argparse.Namespace) -> int:
 
     device = next(model.parameters()).device
     ids = torch.from_numpy(tokens).unsqueeze(0).to(device)
-    with torch.no_grad():
-        out = model(input_ids=ids, output_hidden_states=True, use_cache=False)
-
-    logits = out.logits[0].to(torch.float32).cpu().numpy()
-    # `hidden_states` is (embedding output, layer 1, ..., final norm) — num_hidden_layers + 2
-    # entries (42 for the 40-layer Qwen3.6-35B-A3B). The rustrain side must declare the same set:
-    # `outputs.hidden = ["embed.y", "layers.*.y", "norm.y"]` in the description's `outputs` section.
+    logits, hidden_states, hidden_source = _forward(model, ids, torch)
+    logits = logits[0].to(torch.float32).cpu().numpy()
+    # The summaries are taken on an f32 view of each hidden state: the tolerance is meant to
+    # absorb bf16's *value* rounding (which is what the rustrain side widens away), not the
+    # reduction-order noise of summing 16k bf16 values, which is larger. The population
+    # standard deviation (correction=0) is what the rustrain side computes.
     summaries = np.stack(
         [
             np.array(
                 [
-                    float(h.mean().to(torch.float32)),
-                    float(h.std().to(torch.float32)),
-                    float(h.abs().max().to(torch.float32)),
+                    float(h.to(torch.float32).mean()),
+                    float(h.to(torch.float32).std(correction=0)),
+                    float(h.to(torch.float32).abs().max()),
                 ],
                 dtype=np.float32,
             )
-            for h in out.hidden_states
+            for h in hidden_states
         ]
     )
 
@@ -117,6 +160,9 @@ def dump(args: argparse.Namespace) -> int:
                 "seq": SEQ,
                 "probe_tokens": PROBE_TOKENS,
                 "hidden_states": int(summaries.shape[0]),
+                "hidden_rows": "row 0 = embed.y, rows 1..L = layers.<i>.y, last row = norm.y",
+                "hidden_source": hidden_source,
+                "summary_convention": "f32 view, population std (correction=0), max = max|x|",
                 "transformers": __import__("transformers").__version__,
                 "torch": torch.__version__,
             },

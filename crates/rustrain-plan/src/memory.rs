@@ -233,8 +233,8 @@ pub fn plan(
         )));
     }
 
-    let lifetimes = compute_lifetimes(plan);
     let sizes = slot_bytes(plan);
+    let lifetimes = compute_lifetimes(plan, &sizes);
     let aliases = compute_aliases(plan, &sizes);
 
     // The requested policy per node. Intrinsics and plan inputs keep everything.
@@ -613,7 +613,7 @@ fn slot_bytes(plan: &Plan) -> Vec<u64> {
         .collect()
 }
 
-fn compute_lifetimes(plan: &Plan) -> Vec<Lifetime> {
+fn compute_lifetimes(plan: &Plan, sizes: &[u64]) -> Vec<Lifetime> {
     let n_steps = plan.nodes.len();
     let mut born = vec![0usize; plan.slots.len()];
     let mut dies: Vec<Option<usize>> = vec![None; plan.slots.len()];
@@ -646,6 +646,30 @@ fn compute_lifetimes(plan: &Plan) -> Vec<Lifetime> {
             let out_dies = dies[output.0].unwrap_or(n_steps);
             dies[input.0] = Some(dies[input.0].map_or(out_dies, |d: usize| d.max(out_dies)));
         }
+    }
+
+    // An in-place collective shares its input's storage: `compute_aliases` marks the output
+    // `Aliased(input)` whenever the result fits, and the executor then writes through the input's
+    // pointer. The input must therefore stay reserved exactly as long as the output does —
+    // otherwise the pool hands those bytes to a later activation and *both* slots read that later
+    // activation's values. The first D6 device run died here in a way a shape check cannot see:
+    // the embedding's `all_reduce` (degree-1, tp) aliased the embedding output, whose own last
+    // reader was that collective, so the pool gave its bytes to the next normalisation and every
+    // hidden-state summary after `embed.y` was computed from the wrong tensor.
+    for node in &plan.nodes {
+        if !intrinsic::is_intrinsic(&node.op.name) {
+            continue;
+        }
+        let (Some(input), Some(output)) = (node.inputs.first(), node.outputs.first()) else {
+            continue;
+        };
+        // Only when the output fits the input is the output aliased; otherwise it gets a buffer
+        // of its own and the input may die on schedule.
+        if sizes[output.0] > sizes[input.0] {
+            continue;
+        }
+        let out_dies = dies[output.0].unwrap_or(n_steps);
+        dies[input.0] = Some(dies[input.0].map_or(out_dies, |d: usize| d.max(out_dies)));
     }
 
     (0..plan.slots.len())
@@ -832,6 +856,99 @@ mod tests {
         }
     }
 
+    /// An in-place collective's input must stay reserved as long as its output.
+    ///
+    /// The executor writes the collective's result through the *input's* pointer when the planner
+    /// aliased them, so the input's live range has to cover the output's: otherwise the pool hands
+    /// those bytes to an activation born after the collective, and the input, the output and that
+    /// activation all describe the same memory. On the first D6 device run this is what made every
+    /// hidden-state summary after `embed.y` report a tensor that had been overwritten — right
+    /// shape, right name, wrong numbers, and invisible to every shape check.
+    #[test]
+    fn an_in_place_collectives_input_outlives_its_output() {
+        let mut b = PlanBuilder::new(
+            "collective-alias",
+            Phase::Forward,
+            Mesh::from_config(&ParallelConfig::default()).fingerprint(),
+        );
+        let x = b.slot("x", RsDtype::F32, vec![8], SlotKind::Input);
+        // `a` is read only by the collective; `done` is read twice afterwards, so without the
+        // extension `a` dies at the collective while its storage is still the collective's output.
+        let a = b.slot("a", RsDtype::F32, vec![2, 8], SlotKind::Activation);
+        let done = b.slot("done", RsDtype::F32, vec![2, 8], SlotKind::Activation);
+        let c = b.slot("c", RsDtype::F32, vec![2, 8], SlotKind::Activation);
+        let d = b.slot("d", RsDtype::F32, vec![2, 8], SlotKind::Activation);
+        b.node(
+            OpRef::new("elementwise_unary"),
+            vec![x],
+            vec![a],
+            Attrs::new(),
+            "n0",
+        );
+        b.node(
+            OpRef::new(crate::ir::intrinsic::ALL_REDUCE),
+            vec![a],
+            vec![done],
+            Attrs::new(),
+            "n1",
+        );
+        b.node(
+            OpRef::new("elementwise_unary"),
+            vec![done],
+            vec![c],
+            Attrs::new(),
+            "n2",
+        );
+        b.node(
+            OpRef::new("elementwise_unary"),
+            vec![done],
+            vec![d],
+            Attrs::new(),
+            "n3",
+        );
+
+        let plan = b.build().unwrap();
+        let sizes = slot_bytes(&plan);
+        let lt = compute_lifetimes(&plan, &sizes);
+
+        // The planner aliases the collective's output onto its input…
+        let aliases = compute_aliases(&plan, &sizes);
+        assert_eq!(
+            aliases[done.0],
+            Some(a),
+            "an in-place collective aliases its input"
+        );
+        // …so the input may not die before the output's last reader, nor before an activation
+        // born after the collective that could take those bytes.
+        assert_eq!(
+            lt[a.0].dies,
+            lt[done.0].dies,
+            "the collective's input must live exactly as long as its output"
+        );
+        assert!(
+            lt[a.0].dies >= lt[c.0].born,
+            "an activation born after the collective may not reuse its input's bytes"
+        );
+        assert!(
+            lt[a.0].dies > lt[a.0].born,
+            "the naive range (producer to the collective) is what the extension replaces"
+        );
+        // And the pool gives `c` bytes of its own, since `a`'s are still spoken for.
+        let mem = run_memory_pass(
+            &plan,
+            &no_ops(&plan),
+            &MemoryRecipe::default(),
+            RuntimeCapabilities::none(),
+            1,
+        )
+        .unwrap();
+        assert_ne!(
+            offset_of(&mem, a),
+            offset_of(&mem, c),
+            "the collective's input bytes were handed to a later activation"
+        );
+    }
+
     /// CPU alignment (1) must leave the pre-alignment layout byte-identical:
     /// every offset below is today's number, and any packing change that moves
     /// one of them fails this test.
@@ -898,7 +1015,7 @@ mod tests {
     #[test]
     fn lifetimes_follow_producer_and_last_consumer() {
         let plan = plan_with(3);
-        let lt = compute_lifetimes(&plan);
+        let lt = compute_lifetimes(&plan, &slot_bytes(&plan));
         // Slot 0 is the weight. Its live *range* ends at its last use (node 2,
         // the third layer) — but it is still persistent, because reuse decisions
         // key off the slot kind, not the range. The two are deliberately

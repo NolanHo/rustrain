@@ -109,18 +109,22 @@ int32_t reshape_execute(rs_ctx*, const rs_tensor* const* in, uint32_t n_in, rs_t
             return fail("reshape expects one input and one output");
         }
         at::Tensor x = view(in[0]);
-        // Reinterpreting a strided window would need a copy, and the contract
-        // says the executor must not be handed one silently.
-        if (!x.is_contiguous()) {
-            return fail("reshape: the input is not contiguous; the declared contract rejects "
-                        "strided inputs rather than copying them");
-        }
         std::vector<int64_t> target;
         if (!reshape_target(in[0], attrs, &target)) {
             return 1;
         }
-        adopt(out[0], x.reshape(target));
-        return 0;
+        at::Tensor reshaped = x.reshape(target);
+        // `reshape` means the values in row-major LOGICAL order, read as
+        // `target`. A contiguous input is a view of the framework's buffer and
+        // the executor adopts the pointer; a strided input (a `narrow` of a
+        // flat projection, say) makes ATen allocate, and that tensor dies with
+        // this call — so its values are copied into the plan's output slot
+        // instead of a dangling pointer being handed back.
+        if (x.is_contiguous()) {
+            adopt(out[0], reshaped);
+            return 0;
+        }
+        return write_out(out[0], reshaped, "reshape");
     });
 }
 
@@ -318,9 +322,9 @@ void add_meta_ops(std::vector<OpDef>& ops) {
                         "copy of the input and aliases its buffer. No allocation, no copy.",
                         f32_mask(), RS_AUTODIFF, view_infer, view_execute});
     ops.push_back(OpDef{"reshape",
-                        "Zero-copy view: reinterprets a contiguous input with the 'shape' "
-                        "attribute (one -1 allowed). out.data aliases the input buffer; a "
-                        "non-contiguous input is rejected rather than copied.",
+                        "Reinterprets the input's row-major LOGICAL order as 'shape' (one -1 "
+                        "allowed). A contiguous input aliases its buffer; a strided one is "
+                        "copied into the output slot in logical order.",
                         f32_mask(), RS_AUTODIFF, reshape_infer, reshape_execute});
     ops.push_back(OpDef{"transpose",
                         "Zero-copy view: swaps axes dim0/dim1 (defaults -2/-1), swapping shape "
