@@ -478,3 +478,93 @@ fn an_empty_ignore_pattern_is_rejected() {
     desc.ignore = vec!["model.visual.**".to_string()];
     assert!(expand(&desc, &config()).is_ok());
 }
+
+/// F2 (C5): `ignore` is the *explicit* declaration of the tensors a description drops on purpose, so
+/// every entry has to be anchored at a concrete segment. A pattern whose first segment is a wildcard
+/// declares nothing in particular — `**` and `*` drop the whole checkpoint, `*.visual.**` drops
+/// whatever the tower happens to be called — and three such spellings used to produce reports that
+/// differed only in the number written next to "ignored".
+#[test]
+fn an_unanchored_ignore_pattern_is_rejected() {
+    for pattern in ["**", "*", "{*}", "*.visual.**", "{*}.visual.**", "**.**"] {
+        let mut desc = tiny();
+        desc.ignore = vec![pattern.to_string()];
+        let err = expand(&desc, &config()).unwrap_err();
+        let text = err.to_string();
+        assert!(text.contains("ignore"), "{text}");
+        assert!(
+            text.contains(pattern),
+            "the error must name the pattern: {text}"
+        );
+    }
+
+    // The all-wildcard spelling has to say *why* it is not a declaration, not only that it is odd.
+    let mut desc = tiny();
+    desc.ignore = vec!["**".to_string()];
+    let text = expand(&desc, &config()).unwrap_err().to_string();
+    assert!(text.contains("explicit declaration"), "{text}");
+
+    // An anchored pattern stays legal, `**` included: naming the subtree to drop is the point.
+    for pattern in [
+        "model",
+        "model.**",
+        "model.visual.**",
+        "model.visual.*",
+        "model.visual.weight",
+    ] {
+        let mut desc = tiny();
+        desc.ignore = vec![pattern.to_string()];
+        assert!(
+            expand(&desc, &config()).is_ok(),
+            "`{pattern}` must stay legal"
+        );
+    }
+}
+
+/// F6: two ways to claim one slot read differently, so the message has to tell them apart — one
+/// binding naming the same target twice is a typo inside one entry, two bindings on one slot is a
+/// conflict between two entries. The old wording printed the same source name on both sides
+/// (`claimed by two bindings: s.a and s.a`) for the first case.
+#[test]
+fn a_slot_claimed_twice_says_which_of_the_two_conflicts_it_is() {
+    // One binding, the same target twice. The `split` is only there because `targets` requires one
+    // (§3.4); the duplicate is what the message has to name, before any shape is looked at.
+    let mut desc = tiny();
+    desc.binding[0] = serde_json::from_str(
+        r#"{
+            "source": "model.norm_in.weight",
+            "split": { "dim": 0, "sizes": ["1", "1"] },
+            "targets": [ { "slot": "norm_in.w" }, { "slot": "norm_in.w" } ]
+        }"#,
+    )
+    .unwrap();
+    let same = expand(&desc, &config()).unwrap_err().to_string();
+    assert!(same.contains("binding 0"), "{same}");
+    assert!(same.contains("names slot `norm_in.w` twice"), "{same}");
+    assert!(same.contains("`norm_in.w` and `norm_in.w`"), "{same}");
+    assert!(
+        !same.contains("claimed by two bindings"),
+        "one binding is not two bindings: {same}"
+    );
+
+    // Two bindings, one slot.
+    let mut desc = tiny();
+    desc.binding.push(
+        serde_json::from_str(r#"{ "slot": "norm_in.w", "source": "model.norm_in.weight_again" }"#)
+            .unwrap(),
+    );
+    let two = expand(&desc, &config()).unwrap_err().to_string();
+    assert!(
+        two.contains("slot `norm_in.w` is claimed by two bindings"),
+        "{two}"
+    );
+    assert!(two.contains("model.norm_in.weight_again"), "{two}");
+    assert!(
+        two.contains("binding 0") && two.contains("binding 9"),
+        "{two}"
+    );
+    assert!(
+        !two.contains("twice"),
+        "two bindings are not one binding: {two}"
+    );
+}

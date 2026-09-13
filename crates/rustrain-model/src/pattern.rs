@@ -56,6 +56,16 @@ fn is_single_star(segment: &str) -> bool {
     segment == SINGLE_STAR || segment == BRACED_STAR
 }
 
+/// `true` when `segment` is a wildcard rather than a literal name — either spelling of "exactly one
+/// segment" or the multi-segment `**`.
+///
+/// The distinction is what an `ignore` pattern's *anchoring* is made of: a pattern whose first
+/// segment is a wildcard describes no particular subtree, so it cannot be the explicit declaration
+/// C5 asks for (`expand` rejects it).
+pub fn is_wildcard_segment(segment: &str) -> bool {
+    is_single_star(segment) || segment == DOUBLE_STAR
+}
+
 /// `true` when `pattern` uses the multi-segment wildcard. Only `ignore` may (C6).
 pub fn has_double_star(pattern: &str) -> bool {
     pattern.split('.').any(|segment| segment == DOUBLE_STAR)
@@ -71,8 +81,13 @@ pub fn has_double_star(pattern: &str) -> bool {
 fn match_segments(pattern: &[&str], name: &[&str], captures: &mut Vec<String>) -> bool {
     let chunks = chunks_between_stars(pattern);
     if chunks.len() == 1 {
-        // No `**`: the pattern is an ordinary name of the same length.
-        return match_chunk(chunks[0], name, 0, captures);
+        // No `**`: the pattern is an ordinary name, and *the whole name* has to be consumed —
+        // `s.w` must not claim `s.w.extra`. Matching a prefix is not matching a name here: an
+        // `ignore` of `s.extra` would otherwise swallow the whole `s.extra.*` subtree, and a
+        // `binding.source` would match tensors it was never pointed at. The pre-rewrite matcher
+        // got this from its `return name.is_empty()` base case; the polynomial rewrite below has
+        // to state it, because `match_chunk` only guarantees the chunk fits inside the name.
+        return name.len() == chunks[0].len() && match_chunk(chunks[0], name, 0, captures);
     }
 
     // `S0 ** S1 ** … ** Sm`: `S0` is anchored at the start, `Sm` at the end, and every middle
@@ -159,6 +174,33 @@ mod tests {
         assert!(matches("layers.{*}.q", "layers.0.q"));
     }
 
+    /// A pattern with no `**` has to match the **whole** name. Prefix matching would let
+    /// `ignore: ["s.extra"]` drop `s.extra.deep`, and let a `binding.source` of `s.w` claim a
+    /// tensor the description never named.
+    #[test]
+    fn a_pattern_without_a_double_star_matches_the_whole_name() {
+        assert!(matches("s.w", "s.w"));
+        assert!(!matches("s.w", "s.w.extra"));
+        assert!(!matches("s.w", "s.w."));
+        assert!(!matches("s.w", "s.wx"));
+        assert!(!matches("s.w", "s.wx.y"));
+        assert!(!matches("s.w", "s"));
+        // Same rule with a wildcard: the wildcard consumes one segment, not a prefix of one.
+        assert!(!matches("s.*", "s.w.extra"));
+        assert!(matches("s.*", "s.w"));
+        // And the whole name must be consumed on the capture path too, not only the boolean one.
+        assert_eq!(match_name("s.w", "s.w.extra"), None);
+    }
+
+    /// The exact-match rule must not be applied to `**`: the multi-segment wildcard is the one
+    /// spelling that may end early, and the last chunk still has to end at the end of the name.
+    #[test]
+    fn a_double_star_still_ends_where_the_last_chunk_ends() {
+        assert!(matches("s.**", "s"));
+        assert!(matches("s.**", "s.w.extra"));
+        assert!(!matches("s.**.w", "s.w.extra"));
+    }
+
     #[test]
     fn a_double_star_spans_any_number_of_segments() {
         assert!(matches("model.visual.**", "model.visual.patch_embed.proj.weight"));
@@ -209,6 +251,16 @@ mod tests {
         assert!(!has_double_star("model.visual.*"));
         assert!(!has_double_star("model.visual.w**"));
         assert!(!has_double_star("model.visual.weight"));
+    }
+
+    #[test]
+    fn a_wildcard_segment_is_not_a_literal_name() {
+        assert!(is_wildcard_segment("*"));
+        assert!(is_wildcard_segment("**"));
+        assert!(is_wildcard_segment("{*}"));
+        assert!(!is_wildcard_segment("visual"));
+        assert!(!is_wildcard_segment("w**"));
+        assert!(!is_wildcard_segment(""));
     }
 
     /// Both sides of a match are unbounded input: a pattern from a description, a tensor name from

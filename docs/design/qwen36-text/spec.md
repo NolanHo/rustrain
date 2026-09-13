@@ -112,10 +112,19 @@ rustrain check --model <model-dir> [--checkpoint <dir>] [--tp N --cp N --ep N --
   `l2.binding_coverage`、`l2.tensor_consumption`、`l2.shape_reconciliation`、`l2.dtype_compatibility`、
   `l2.ignore_coverage`、`cli.arguments`。
 - **`l1.structure` 只声称它真做的两件事**（load/expand + `check_structure`）：C2 里依赖 compile 的
-  五条（可编译 / `infer` 比对 / layout 传播 / `Partial` 兑现 / collective 绑轴 / slot 分配）由各自的
+  **六条**（可编译 / `infer` 比对 / layout 传播 / `Partial` 兑现 / collective 绑轴 / slot 分配）由各自的
   `l1.*` 项**显式 `skip` 并写明"缺什么、什么时候能补"**，不得用 `pass` 冒充"没跑"。
+- **门禁必须断言期望的 skip 集合**：`check_report_contract` 把 15 个 check id、7 个 `skip`、每项状态与
+  `counts` 的八个键写死。将来某项从 skip 变真检查（D3/D4）会让它按设计变红 —— 那是绊线，不是噪音。
+- **`ignore` 模式必须锚定**：首段必须是**字面名**。`**`、`*`、`{*}.visual.**`、`*.visual.**` 全在
+  expand 期报错 —— "全部忽略"等于放弃显式声明（C5）。报告里**逐模式**给出命中数。
 - **`ignore` 模式命中 0 个张量 → `warning`**（不是 `fail`），reason 必须点名那个模式。
-- **没有任何配对可查**（空快照 / 无 weight slot）→ `warning`，不得 6/6 全绿。
+- **没有任何配对可查**（`pairs` 空 ∧ 配对本身一一对应 ∧ 无未绑 slot）→ 四个 L2 项**全部 `warning`**，
+  不得 6/6 全绿。
+- **"没测量"写 `null`，不写 `0`**：`shape_mismatch` / `dtype_mismatch` 在配对不可信（`pairs != covered`）
+  或为空时是 `null`。把"没查"写成 0 与本文件自己的原则冲突。
+- **已知边界（记录、不修）**：配对"一一对应"是**计数**不变式，保护漏配 / 重配 / 笛卡尔 / 一 tensor 两 slot，
+  **不保护"配错了人"**（source 与 target 互换且形状 dtype 全同 → 全绿）。真正的验证要靠数值对齐（D5）。
 
 **C3 · 并行语义。** axis 是 mesh 里的**有序命名轴**，组是轴掩码；一个 slot 的 layout 是
 **多个 `(dim, group)` 分片 + 至多一个 partial**。本地形状 = 全局形状沿分片维除以该组度数之积，

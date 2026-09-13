@@ -974,8 +974,10 @@ fn check(args: CheckArgs) -> Result<()> {
                     let l2 = l2_checks(plan, &model.desc, &meta);
                     report.counts.slots_unbound = Some(l2.slots_unbound);
                     report.counts.tensors_unconsumed = Some(l2.tensors_unconsumed);
-                    report.counts.shape_mismatch = Some(l2.shape_mismatch);
-                    report.counts.dtype_mismatch = Some(l2.dtype_mismatch);
+                    // C6's shape/dtype counters stay `null` when those two items are a skip or a
+                    // warning: nothing was compared, so there is no count to report.
+                    report.counts.shape_mismatch = l2.shape_mismatch;
+                    report.counts.dtype_mismatch = l2.dtype_mismatch;
                     report.checks.extend(l2.items);
                 }
                 None => {
@@ -1221,8 +1223,11 @@ struct L2Result {
     items: Vec<CheckItem>,
     slots_unbound: usize,
     tensors_unconsumed: usize,
-    shape_mismatch: usize,
-    dtype_mismatch: usize,
+    /// `None` when no shape (resp. dtype) was actually compared, which is the same "not measured"
+    /// rule [`Counts`] spells out: the two items are a `skip` or a `warning` there, and writing `0`
+    /// next to a check that compared nothing is a claim, not a measurement.
+    shape_mismatch: Option<usize>,
+    dtype_mismatch: Option<usize>,
 }
 
 fn l2_checks(
@@ -1322,6 +1327,19 @@ fn l2_checks(
     // product. Either way the shape and dtype checks below have nothing trustworthy to compare.
     let pairing_is_a_bijection = shared_tensors.is_empty() && pairs.len() == covered;
 
+    // C6's "nothing to reconcile" state: an empty pairing set that is nonetheless one-to-one — no
+    // weight slot any binding covers, and no unbound slot left to name. Only then is there nothing
+    // to check; a pairing set that came out empty while the bindings do cover slots is a *failed*
+    // pairing, which `l2.binding_coverage` reports as a failure (§3.5), and C6 keeps shape/dtype a
+    // `skip` there rather than dressing the outcome up as a warning.
+    let nothing_to_reconcile =
+        pairs.is_empty() && pairing_is_a_bijection && expanded.unbound_slots.is_empty();
+
+    // The shape/dtype counters are a measurement only when the pairing is one-to-one *and* there is
+    // a pairing to measure; every other state is a skip or a warning, and `0` would claim a
+    // comparison that never happened.
+    let compared = pairing_is_a_bijection && !pairs.is_empty();
+
     // ---- l2.binding_coverage: every weight slot has a binding, every source a tensor ----
     let mut coverage_details: Vec<String> = Vec::new();
     let mut coverage_reason: Vec<String> = Vec::new();
@@ -1369,7 +1387,17 @@ fn l2_checks(
             pairs.len()
         ));
     }
-    let coverage = if coverage_reason.is_empty() {
+    let coverage = if nothing_to_reconcile {
+        CheckItem::warning(
+            "l2.binding_coverage",
+            format!(
+                "no pairing to check: the description declares no weight slot a binding covers \
+                 ({} binding(s) in total) and leaves no weight slot unbound, so no checkpoint \
+                 tensor can be paired with a slot; nothing was measured here",
+                expanded.bindings.len()
+            ),
+        )
+    } else if coverage_reason.is_empty() {
         CheckItem::pass(
             "l2.binding_coverage",
             format!(
@@ -1427,7 +1455,20 @@ fn l2_checks(
             unconsumed.push(name.clone());
         }
     }
-    let consumption = if unconsumed.is_empty() {
+    let consumption = if unconsumed.is_empty() && nothing_to_reconcile {
+        CheckItem::warning(
+            "l2.tensor_consumption",
+            format!(
+                "no pairing to check: the description declares no weight slot, so no tensor of {} \
+                 could be consumed by a binding; {} of its {} tensor(s) are matched by the {} \
+                 explicit `ignore` pattern(s) and nothing was measured here",
+                meta.source,
+                ignored,
+                meta.tensors.len(),
+                desc.ignore.len()
+            ),
+        )
+    } else if unconsumed.is_empty() {
         CheckItem::pass(
             "l2.tensor_consumption",
             format!(
@@ -1455,6 +1496,16 @@ fn l2_checks(
     // C6: an `ignore` pattern that matches 0 tensors is a `warning`, not a `fail` — the same
     // description may be checked against another checkpoint, but a pattern that matches nothing is
     // usually a typo that only a report can show.
+    //
+    // Every pattern's own hit count goes into `details` (C5's "explicit declaration"): a single
+    // total cannot show *which* pattern drops what, so `model.visual.**` and a pattern that happens
+    // to cover the same 333 tensors would look alike in the report.
+    let ignore_details: Vec<String> = desc
+        .ignore
+        .iter()
+        .zip(&ignore_hits)
+        .map(|(pattern, hits)| format!("`{pattern}` matches {hits} tensor(s)"))
+        .collect();
     let mut ignore_checks: Vec<CheckItem> = Vec::new();
     if desc.ignore.is_empty() {
         ignore_checks.push(CheckItem::skip(
@@ -1465,25 +1516,29 @@ fn l2_checks(
     } else {
         for (pattern, hits) in desc.ignore.iter().zip(&ignore_hits) {
             if *hits == 0 {
-                ignore_checks.push(CheckItem::warning(
+                ignore_checks.push(CheckItem::new(
                     "l2.ignore_coverage",
+                    Verdict::Warning,
                     format!(
                         "`ignore` pattern `{pattern}` matches none of the {} tensor(s) of {}; a \
                          declared pattern that matches nothing is usually a typo",
                         meta.tensors.len(),
                         meta.source
                     ),
+                    ignore_details.clone(),
                 ));
             }
         }
         if ignore_checks.is_empty() {
-            ignore_checks.push(CheckItem::pass(
+            ignore_checks.push(CheckItem::new(
                 "l2.ignore_coverage",
+                Verdict::Pass,
                 format!(
                     "every one of the {} `ignore` pattern(s) matches at least one tensor ({ignored} \
                      tensor(s) ignored in total)",
                     desc.ignore.len()
                 ),
+                ignore_details,
             ));
         }
     }
@@ -1653,8 +1708,8 @@ fn l2_checks(
         items,
         slots_unbound: expanded.unbound_slots.len(),
         tensors_unconsumed: unconsumed.len(),
-        shape_mismatch,
-        dtype_mismatch,
+        shape_mismatch: compared.then_some(shape_mismatch),
+        dtype_mismatch: compared.then_some(dtype_mismatch),
     }
 }
 

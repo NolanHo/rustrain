@@ -16,6 +16,7 @@ use rustrain_plan::{AttrValue, Attrs, OpRef, Phase, Plan, PlanBuilder, SlotId, S
 use crate::ModelError;
 use crate::desc::{AttrLiteral, FORMAT, ModelDesc, NodeDecl, StackEntry, Target, Template};
 use crate::params::{Params, Value};
+use crate::pattern::is_wildcard_segment;
 use crate::transform::parse_transform;
 
 /// The index variable `until` expansion uses (the counterpart of `repeat.index`).
@@ -142,8 +143,14 @@ pub fn summarize(names: &[String]) -> String {
 
 /// `ignore`'s pattern syntax is `binding.source`'s plus `**` (C6). An entry that matches nothing is
 /// a warning at load-check time — the same description may be checked against another checkpoint —
-/// but an entry that names *no segment at all* is a typo nothing can ever match, so it is an error
-/// here (I-5).
+/// but an entry that cannot name a subtree is an error here (I-5).
+///
+/// The rule is **anchoring**: an `ignore` entry has to start with a concrete segment. `ignore` is
+/// C5's "explicit declaration" of the tensors a description drops on purpose, and a pattern whose
+/// first segment is a wildcard declares nothing in particular — `**` drops the entire checkpoint,
+/// `*` drops every tensor whose second segment happens to match, and `*.visual.**` drops whatever
+/// the tower is called today. Those are blanket exemptions written in the shape of a declaration,
+/// so they are rejected rather than reported as a very successful `ignore`.
 fn check_ignore_patterns(desc: &ModelDesc) -> Result<(), ModelError> {
     for pattern in &desc.ignore {
         if pattern.is_empty() {
@@ -157,6 +164,23 @@ fn check_ignore_patterns(desc: &ModelDesc) -> Result<(), ModelError> {
             return Err(ModelError::Invalid(format!(
                 "`ignore` pattern `{pattern}` has an empty segment: a `.` with nothing on one side \
                  of it matches no tensor name"
+            )));
+        }
+        let mut segments = pattern.split('.');
+        let first = segments.next().unwrap_or_default();
+        if is_wildcard_segment(first) {
+            let all_wildcards = pattern.split('.').all(is_wildcard_segment);
+            let what = if all_wildcards {
+                "is made of nothing but wildcards: ignoring every tensor is not an explicit \
+                 declaration, it is giving the declaration up (C5)"
+            } else {
+                "starts with a wildcard segment: an `ignore` entry declares *which* subtree the \
+                 description drops on purpose, so the first segment has to be a concrete name, not \
+                 a wildcard that blanket-drops whatever sits at that level"
+            };
+            return Err(ModelError::Invalid(format!(
+                "`ignore` pattern `{pattern}` {what}. Name the subtree to drop, e.g. \
+                 `model.visual.**`"
             )));
         }
     }
@@ -784,7 +808,10 @@ impl<'a> Expander<'a> {
             .map(|(id, _)| self.names[id].clone())
             .collect();
 
-        let mut claimed: BTreeMap<String, String> = BTreeMap::new();
+        // Slot → the claim on it: the binding index, its source and the pattern that hit the slot,
+        // so a collision can say *which* of the two things went wrong — one binding naming the same
+        // target twice reads very differently from two bindings fighting over one slot.
+        let mut claimed: BTreeMap<String, (usize, String, String)> = BTreeMap::new();
         let mut sources: BTreeMap<&str, usize> = BTreeMap::new();
         let mut resolved = Vec::with_capacity(self.desc.binding.len());
 
@@ -909,11 +936,27 @@ impl<'a> Expander<'a> {
                     )));
                 }
                 for hit in hits {
-                    if let Some(previous) = claimed.insert(hit.clone(), binding.source.clone()) {
-                        return Err(ModelError::Invalid(format!(
-                            "slot `{hit}` is claimed by two bindings: `{previous}` and `{}`",
-                            binding.source
-                        )));
+                    let claim = (index, binding.source.clone(), pattern.clone());
+                    if let Some((previous_index, previous_source, previous_pattern)) =
+                        claimed.insert(hit.clone(), claim)
+                    {
+                        let reason = if previous_index == index {
+                            format!(
+                                "binding {index} (`{}`) names slot `{hit}` twice: patterns \
+                                 `{previous_pattern}` and `{pattern}` both hit it, so the same slot \
+                                 would be loaded from two places",
+                                binding.source
+                            )
+                        } else {
+                            format!(
+                                "slot `{hit}` is claimed by two bindings: binding \
+                                 {previous_index} (`{previous_source}`, pattern \
+                                 `{previous_pattern}`) and binding {index} (`{}`, pattern \
+                                 `{pattern}`)",
+                                binding.source
+                            )
+                        };
+                        return Err(ModelError::Invalid(reason));
                     }
                     slots.push(ResolvedBindingSlot {
                         slot: hit.clone(),
