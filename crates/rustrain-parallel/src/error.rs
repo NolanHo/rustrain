@@ -1,9 +1,10 @@
 //! Error types for topology resolution and layout conversion.
 //!
 //! Two types, one per layer of the crate: [`ParallelError`] for anything that
-//! can go wrong while resolving a topology (bad config, rank out of range), and
-//! [`ShardError`] for anything that can go wrong while inferring communication
-//! from a pair of layouts.
+//! can go wrong while resolving a topology (bad config, bad mesh, mask bit
+//! outside the mesh, rank out of range), and [`ShardError`] for anything that
+//! can go wrong while inferring communication from a pair of layouts or while
+//! computing the local shape a layout implies.
 //!
 //! Every `ShardError` names both layouts: a propagation pass needs to report
 //! *which edge* could not be converted, and it only has the two layouts.
@@ -34,9 +35,43 @@ pub enum ParallelError {
 
     #[error("rank {rank} is out of range for world size {world_size}")]
     RankOutOfRange { rank: usize, world_size: usize },
+
+    #[error("a mesh must declare at least one axis (1..={max} allowed)")]
+    NoAxes { max: usize },
+
+    #[error("too many mesh axes: {count} declared, at most {max} allowed")]
+    TooManyAxes { count: usize, max: usize },
+
+    #[error(
+        "mesh world size overflows usize: the degrees {degrees:?} do not multiply into a rank \
+         number, so no rank can be enumerated and no group has members"
+    )]
+    MeshWorldSizeOverflow { degrees: Vec<usize> },
+
+    #[error("mesh axis {index} has an empty name; axis names must be non-empty")]
+    EmptyAxisName { index: usize },
+
+    #[error("duplicate mesh axis name `{name}`; axis names must be unique")]
+    DuplicateAxis { name: String },
+
+    #[error("mesh axis `{name}` has degree 0; every degree must be at least 1")]
+    ZeroDegree { name: String },
+
+    #[error(
+        "group mask bit {bit} is out of range: the mesh has {axes} axes, so mask bits \
+         address axes 0..{axes}"
+    )]
+    GroupOutOfRange { bit: usize, axes: usize },
+
+    #[error(
+        "axis {axis} does not fit in a group mask: a mask carries {max} bits, so the axis \
+         must be in 0..{max}"
+    )]
+    AxisOutOfRange { axis: usize, max: usize },
 }
 
-/// Two layouts could not be converted into one another.
+/// Two layouts could not be converted into one another, or a layout implies a
+/// local shape that does not exist.
 ///
 /// Each variant explains *why* the conversion is not a layout conversion, and
 /// what the caller should do instead. The reasons matter as much as the error:
@@ -45,9 +80,10 @@ pub enum ParallelError {
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ShardError {
     #[error(
-        "cannot convert {from} to {to}: the two partials carry different reduce ops, and a \
-         partial is only a reduction of itself; convert {from} to `replicate` first \
-         (all_reduce with the source op) and produce {to} from the computation"
+        "cannot convert {from} to {to}: the two partials are not the same reduction \
+         (different reduce op or different group), and a partial is only a reduction of \
+         itself; all_reduce {from} to `replicate` first, then produce {to} from the \
+         computation"
     )]
     PartialOpMismatch {
         from: ParallelLayout,
@@ -85,23 +121,12 @@ pub enum ShardError {
     },
 
     #[error(
-        "cannot convert {from} to {to}: the two layouts live on different process groups, \
-         and a layout transition is only defined inside one group; crossing groups is a \
-         redistribution (all-to-all) that no single collective here expresses. Convert one \
-         side to `replicate` first — that is correct but costs a full gather"
+        "cannot convert {from} to {to}: the layouts shard a common dimension over \
+         different groups, and a layout transition is only defined inside one group; \
+         crossing groups is a redistribution that no single collective here expresses. \
+         Convert one side to `replicate` first — that is correct but costs a full gather"
     )]
     GroupMismatch {
-        from: ParallelLayout,
-        to: ParallelLayout,
-    },
-
-    #[error(
-        "cannot convert {from} to {to}: no rule covers this pair; the conversion is not \
-         derivable from the layouts alone. Converting {from} to `replicate` first is always \
-         valid (and always costs a full gather), or express the source as a `shard`/`partial` \
-         so the named layout has a defined meaning"
-    )]
-    UnsupportedTransition {
         from: ParallelLayout,
         to: ParallelLayout,
     },
@@ -114,4 +139,17 @@ pub enum ShardError {
          against the rank, the axis must be in 0..{rank}"
     )]
     DimOutOfRange { dim: i64, rank: i64 },
+
+    #[error(
+        "cannot shard dim {dim}: the global size {global} is not divisible by the divisor \
+         {divisor} the layout imposes on that axis; no local shape exists, so this is a \
+         compile-time error, not a runtime fallback"
+    )]
+    NotDivisible { dim: i64, global: i64, divisor: i64 },
+
+    #[error(
+        "group mask bit {bit} is out of range: the mesh has {axes} axes, so mask bits \
+         address axes 0..{axes}"
+    )]
+    GroupOutOfRange { bit: usize, axes: usize },
 }

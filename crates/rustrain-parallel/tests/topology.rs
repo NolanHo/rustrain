@@ -1,5 +1,5 @@
 //! Topology tests: the rank order contract, the hand-computed rank tables, and
-//! process group membership.
+//! group membership over masks.
 //!
 //! The tables below are the point of this file. They are written out by hand
 //! from the contract in `src/rank.rs`, so a change to the rank order (a
@@ -11,9 +11,7 @@
 //! (world 16): a table that leaves `ep` or `dp` at size 1 cannot tell those two
 //! dimensions apart.
 
-use rustrain_parallel::{
-    GroupKind, ParallelConfig, ParallelDim, ParallelError, ProcessGroups, RankLayout,
-};
+use rustrain_parallel::{GroupMask, Mesh, ParallelConfig, ParallelDim, ParallelError, RankLayout};
 
 fn cfg(tp: usize, cp: usize, ep: usize, dp: usize, pp: usize) -> ParallelConfig {
     // Named fields on purpose: a positional constructor would make it easy to
@@ -25,6 +23,37 @@ fn cfg(tp: usize, cp: usize, ep: usize, dp: usize, pp: usize) -> ParallelConfig 
         data: dp,
         pipeline: pp,
     }
+}
+
+/// The canonical five-axis mesh of a config: `tp` is axis 0, `pp` is axis 4.
+fn mesh(c: ParallelConfig) -> Mesh {
+    Mesh::from_config(&c)
+}
+
+fn single(axis: usize) -> GroupMask {
+    GroupMask::single(axis).unwrap()
+}
+
+/// Enumerates every group of `mask`, ordered by first member, as `(id, members)`.
+///
+/// The first member of group `i` is at most the first member of group `i + 1`
+/// — the "groups ordered by first member" contract the runtime's communicator
+/// creation relies on.
+fn groups_by_first_member(mesh: &Mesh, mask: GroupMask) -> Vec<Vec<usize>> {
+    let mut groups: Vec<Vec<usize>> = Vec::new();
+    for rank in 0..mesh.world_size() {
+        let id = mesh.group_id(mask, rank).unwrap();
+        let members = mesh.group_ranks(mask, rank).unwrap();
+        if id == groups.len() {
+            groups.push(members);
+        } else {
+            assert_eq!(
+                groups[id], members,
+                "rank {rank} disagrees with the group of the first member"
+            );
+        }
+    }
+    groups
 }
 
 #[test]
@@ -83,6 +112,59 @@ fn overflowing_world_size_is_rejected() {
     // `world_size` saturates rather than wrapping: a wrapped product could look
     // like a plausible world size and silently pass a rank range check.
     assert_eq!(c.world_size(), usize::MAX);
+}
+
+/// The mesh of a config is the five canonical axes in rank order, so a mask
+/// bit is exactly a `ParallelDim` in axis order.
+#[test]
+fn from_config_produces_the_canonical_five_axes() {
+    let c = cfg(4, 3, 2, 5, 2);
+    let m = mesh(c);
+    assert_eq!(
+        m.axes(),
+        &[
+            ("tp".to_string(), 4),
+            ("cp".to_string(), 3),
+            ("ep".to_string(), 2),
+            ("dp".to_string(), 5),
+            ("pp".to_string(), 2),
+        ]
+    );
+    assert_eq!(m.axis_count(), 5);
+    assert_eq!(m.world_size(), 4 * 3 * 2 * 5 * 2);
+    for (axis, dim) in [
+        ParallelDim::Tp,
+        ParallelDim::Cp,
+        ParallelDim::Ep,
+        ParallelDim::Dp,
+        ParallelDim::Pp,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        assert_eq!(m.index_of(dim.as_str()), Some(axis));
+        assert_eq!(m.degree(axis), Some(c.dimension(dim)));
+    }
+    assert_eq!(m.index_of("nope"), None);
+    assert_eq!(m.degree(5), None);
+    assert_eq!(m.stride(5), None);
+    assert_eq!(m.stride(0), Some(1));
+    assert_eq!(m.stride(1), Some(4));
+    assert_eq!(m.stride(2), Some(12));
+    assert_eq!(m.stride(3), Some(24));
+    assert_eq!(m.stride(4), Some(120));
+
+    // All five axes are kept even at degree 1: a mask over such an axis is a
+    // size-1 group, legal, a no-op — not an out-of-range bit.
+    let degenerate = mesh(cfg(1, 1, 1, 1, 1));
+    assert_eq!(degenerate.axis_count(), 5);
+    for rank in 0..1 {
+        for axis in 0..5 {
+            assert_eq!(degenerate.group_ranks(single(axis), rank), Ok(vec![0]));
+            assert_eq!(degenerate.group_index(single(axis), rank), Ok(0));
+            assert_eq!(degenerate.group_id(single(axis), rank), Ok(0));
+        }
+    }
 }
 
 #[test]
@@ -289,17 +371,11 @@ fn hand_computed_rank_table_tp2_cp2_ep2_dp2() {
 #[test]
 fn groups_for_tp2_cp2_ep2_dp2_world_16() {
     let c = cfg(2, 2, 2, 2, 1);
-    let groups = ProcessGroups::new(c);
-    let ranks = |kind: GroupKind| -> Vec<Vec<usize>> {
-        groups
-            .groups(kind)
-            .iter()
-            .map(|group| group.ranks.clone())
-            .collect()
-    };
+    let m = mesh(c);
+    let ranks = |axis: usize| -> Vec<Vec<usize>> { groups_by_first_member(&m, single(axis)) };
 
     assert_eq!(
-        ranks(GroupKind::Tp),
+        ranks(0),
         vec![
             vec![0, 1],
             vec![2, 3],
@@ -312,7 +388,7 @@ fn groups_for_tp2_cp2_ep2_dp2_world_16() {
         ]
     );
     assert_eq!(
-        ranks(GroupKind::Cp),
+        ranks(1),
         vec![
             vec![0, 2],
             vec![1, 3],
@@ -326,7 +402,7 @@ fn groups_for_tp2_cp2_ep2_dp2_world_16() {
     );
     // EP's stride is tp * cp = 4.
     assert_eq!(
-        ranks(GroupKind::Ep),
+        ranks(2),
         vec![
             vec![0, 4],
             vec![1, 5],
@@ -340,7 +416,7 @@ fn groups_for_tp2_cp2_ep2_dp2_world_16() {
     );
     // DP's stride is tp * cp * ep = 8.
     assert_eq!(
-        ranks(GroupKind::Dp),
+        ranks(3),
         vec![
             vec![0, 8],
             vec![1, 9],
@@ -352,16 +428,18 @@ fn groups_for_tp2_cp2_ep2_dp2_world_16() {
             vec![7, 15]
         ]
     );
-    assert_eq!(ranks(GroupKind::Pp).len(), 16);
+    assert_eq!(ranks(4).len(), 16);
+    // The full mask is the whole world: one group of all 16 ranks.
+    let full = GroupMask::from_bits(0b11111);
     assert_eq!(
-        ranks(GroupKind::Global),
+        groups_by_first_member(&m, full),
         vec![(0..16).collect::<Vec<usize>>()]
     );
 
-    assert_eq!(groups.group_size(GroupKind::Ep), 2);
-    assert_eq!(groups.group_size(GroupKind::Dp), 2);
-    assert_eq!(groups.group_count(GroupKind::Ep), 8);
-    assert_eq!(groups.group_count(GroupKind::Dp), 8);
+    assert_eq!(single(2).degree(&m).unwrap(), 2);
+    assert_eq!(single(3).degree(&m).unwrap(), 2);
+    assert_eq!(ranks(2).len(), 8);
+    assert_eq!(ranks(3).len(), 8);
 }
 
 #[test]
@@ -390,31 +468,25 @@ fn rank_out_of_range_is_rejected() {
 fn groups_for_tp2_cp2_dp2_world_8() {
     let c = cfg(2, 2, 1, 2, 1);
     assert_eq!(c.world_size(), 8);
-    let groups = ProcessGroups::new(c);
-    assert_eq!(groups.world_size(), 8);
-    assert_eq!(groups.config(), c);
+    let m = mesh(c);
+    assert_eq!(m.world_size(), 8);
+    assert_eq!(m.axes(), Mesh::from_config(&c).axes());
 
-    let ranks = |kind: GroupKind| -> Vec<Vec<usize>> {
-        groups
-            .groups(kind)
-            .iter()
-            .map(|group| group.ranks.clone())
-            .collect()
-    };
+    let ranks = |axis: usize| -> Vec<Vec<usize>> { groups_by_first_member(&m, single(axis)) };
 
     // TP: the fastest dimension, so its groups are adjacent ranks.
     assert_eq!(
-        ranks(GroupKind::Tp),
+        ranks(0),
         vec![vec![0, 1], vec![2, 3], vec![4, 5], vec![6, 7]]
     );
     // CP: stride tp = 2.
     assert_eq!(
-        ranks(GroupKind::Cp),
+        ranks(1),
         vec![vec![0, 2], vec![1, 3], vec![4, 6], vec![5, 7]]
     );
-    // EP: size 1, so every rank is its own group.
+    // EP: size 1, so every rank is its own group — a legal, no-op axis.
     assert_eq!(
-        ranks(GroupKind::Ep),
+        ranks(2),
         vec![
             vec![0],
             vec![1],
@@ -428,60 +500,58 @@ fn groups_for_tp2_cp2_dp2_world_8() {
     );
     // DP: stride tp * cp = 4.
     assert_eq!(
-        ranks(GroupKind::Dp),
+        ranks(3),
         vec![vec![0, 4], vec![1, 5], vec![2, 6], vec![3, 7]]
     );
     // PP: size 1 as well.
-    assert_eq!(ranks(GroupKind::Pp).len(), 8);
-    for group in ranks(GroupKind::Pp) {
+    assert_eq!(ranks(4).len(), 8);
+    for group in ranks(4) {
         assert_eq!(group.len(), 1);
     }
-    // Global: everything.
-    assert_eq!(ranks(GroupKind::Global), vec![vec![0, 1, 2, 3, 4, 5, 6, 7]]);
-
-    assert_eq!(groups.group_size(GroupKind::Tp), 2);
-    assert_eq!(groups.group_size(GroupKind::Cp), 2);
-    assert_eq!(groups.group_size(GroupKind::Dp), 2);
-    assert_eq!(groups.group_size(GroupKind::Ep), 1);
-    assert_eq!(groups.group_size(GroupKind::Global), 8);
-    assert_eq!(groups.group_count(GroupKind::Tp), 4);
-    assert_eq!(groups.group_count(GroupKind::Dp), 4);
-    assert_eq!(groups.group_count(GroupKind::Global), 1);
+    // Full mask: everything.
+    let full = GroupMask::from_bits(0b11111);
+    assert_eq!(
+        groups_by_first_member(&m, full),
+        vec![vec![0, 1, 2, 3, 4, 5, 6, 7]]
+    );
 
     for rank in 0..8 {
         let layout = RankLayout::from_rank(rank, c).unwrap();
         // The rank's position inside a dimension's group is its coordinate on
-        // that dimension; inside the Global group it is the rank itself.
-        for (kind, coordinate) in [
-            (GroupKind::Tp, layout.tp_rank()),
-            (GroupKind::Cp, layout.cp_rank()),
-            (GroupKind::Ep, layout.ep_rank()),
-            (GroupKind::Dp, layout.dp_rank()),
-            (GroupKind::Pp, layout.pp_rank()),
-            (GroupKind::Global, rank),
+        // that dimension; inside the world group it is the rank itself.
+        for (axis, coordinate) in [
+            (0, layout.tp_rank()),
+            (1, layout.cp_rank()),
+            (2, layout.ep_rank()),
+            (3, layout.dp_rank()),
+            (4, layout.pp_rank()),
         ] {
+            let mask = single(axis);
             assert_eq!(
-                groups.group_index(rank, kind).unwrap(),
+                m.group_index(mask, rank).unwrap(),
                 coordinate,
-                "rank {rank} in {kind}"
+                "rank {rank} in axis {axis}"
             );
-            let group = groups.group_of(rank, kind).unwrap();
-            assert!(group.contains(rank), "rank {rank} must be in its own group");
-            assert_eq!(group.kind, kind);
-            assert_eq!(group.size(), groups.group_size(kind));
+            let members = m.group_ranks(mask, rank).unwrap();
+            assert!(
+                members.contains(&rank),
+                "rank {rank} must be in its own group"
+            );
             // The index really does address the rank inside the group.
-            assert_eq!(group.ranks[groups.group_index(rank, kind).unwrap()], rank);
+            assert_eq!(members[m.group_index(mask, rank).unwrap()], rank);
         }
+        assert_eq!(m.group_index(full, rank).unwrap(), rank);
+        assert_eq!(m.group_id(full, rank).unwrap(), 0);
     }
 
-    // Ranks are ascending inside every group of every kind (a property the
+    // Ranks are ascending inside every group of every axis (a property the
     // runtime relies on: the index is the local collective rank).
-    for kind in GroupKind::ALL {
-        for group in groups.groups(kind) {
+    for axis in 0..5 {
+        for group in ranks(axis) {
             assert!(
-                group.ranks.windows(2).all(|w| w[0] < w[1]),
-                "{kind} group is not ascending: {:?}",
-                group.ranks
+                group.windows(2).all(|w| w[0] < w[1]),
+                "axis {axis} group is not ascending: {:?}",
+                group
             );
         }
     }
@@ -494,31 +564,27 @@ fn groups_for_tp2_cp2_dp2_world_8() {
 fn groups_for_tp2_cp2_ep2_world_8() {
     let c = cfg(2, 2, 2, 1, 1);
     assert_eq!(c.world_size(), 8);
-    let groups = ProcessGroups::new(c);
-    let ranks = |kind: GroupKind| -> Vec<Vec<usize>> {
-        groups
-            .groups(kind)
-            .iter()
-            .map(|group| group.ranks.clone())
-            .collect()
-    };
+    let m = mesh(c);
+    let ranks = |axis: usize| -> Vec<Vec<usize>> { groups_by_first_member(&m, single(axis)) };
 
     assert_eq!(
-        ranks(GroupKind::Tp),
+        ranks(0),
         vec![vec![0, 1], vec![2, 3], vec![4, 5], vec![6, 7]]
     );
     assert_eq!(
-        ranks(GroupKind::Cp),
+        ranks(1),
         vec![vec![0, 2], vec![1, 3], vec![4, 6], vec![5, 7]]
     );
     // EP sits above CP in the rank order, so its stride is tp * cp = 4.
     assert_eq!(
-        ranks(GroupKind::Ep),
+        ranks(2),
         vec![vec![0, 4], vec![1, 5], vec![2, 6], vec![3, 7]]
     );
-    assert_eq!(ranks(GroupKind::Global), vec![vec![0, 1, 2, 3, 4, 5, 6, 7]]);
-    assert_eq!(groups.group_size(GroupKind::Ep), 2);
-    assert_eq!(groups.group_count(GroupKind::Ep), 4);
+    let full = GroupMask::from_bits(0b11111);
+    assert_eq!(
+        groups_by_first_member(&m, full),
+        vec![vec![0, 1, 2, 3, 4, 5, 6, 7]]
+    );
 
     // Coordinates and group positions agree, rank by rank.
     // (rank, tp, cp, ep, dp, pp)
@@ -547,11 +613,11 @@ fn groups_for_tp2_cp2_ep2_world_8() {
         );
         assert_eq!(
             (
-                groups.group_index(rank, GroupKind::Tp).unwrap(),
-                groups.group_index(rank, GroupKind::Cp).unwrap(),
-                groups.group_index(rank, GroupKind::Ep).unwrap(),
-                groups.group_index(rank, GroupKind::Dp).unwrap(),
-                groups.group_index(rank, GroupKind::Pp).unwrap(),
+                m.group_index(single(0), rank).unwrap(),
+                m.group_index(single(1), rank).unwrap(),
+                m.group_index(single(2), rank).unwrap(),
+                m.group_index(single(3), rank).unwrap(),
+                m.group_index(single(4), rank).unwrap(),
             ),
             (tp, cp, ep, dp, pp),
             "group index of rank {rank}"
@@ -561,51 +627,128 @@ fn groups_for_tp2_cp2_ep2_world_8() {
 
 #[test]
 fn group_lookup_rejects_ranks_outside_the_world() {
-    let groups = ProcessGroups::new(cfg(2, 2, 1, 2, 1));
+    let m = mesh(cfg(2, 2, 1, 2, 1));
     let err = ParallelError::RankOutOfRange {
         rank: 8,
         world_size: 8,
     };
-    assert_eq!(groups.group_of(8, GroupKind::Tp), Err(err.clone()));
-    assert_eq!(groups.group_index(8, GroupKind::Global), Err(err));
+    assert_eq!(m.group_ranks(single(0), 8), Err(err.clone()));
+    assert_eq!(m.group_index(single(0), 8), Err(err.clone()));
+    assert_eq!(m.group_id(single(0), 8), Err(err));
 }
 
+/// A mask bit outside the mesh is the error case, on every group query and on
+/// the mask's own degree.
 #[test]
-fn invalid_configs_do_not_build_process_groups() {
-    let bad = cfg(2, 0, 1, 1, 1);
-    assert_eq!(
-        ProcessGroups::try_new(bad),
-        Err(ParallelError::ZeroDimension {
-            dim: ParallelDim::Cp
-        })
-    );
+fn mask_bits_outside_the_mesh_are_rejected() {
+    let m = mesh(cfg(2, 2, 1, 2, 1));
+    let err = ParallelError::GroupOutOfRange { bit: 5, axes: 5 };
+    let stray = GroupMask::from_bits(0b100000);
+    assert_eq!(stray.validate(&m), Err(err.clone()));
+    assert_eq!(stray.degree(&m), Err(err.clone()));
+    assert_eq!(m.group_ranks(stray, 0), Err(err.clone()));
+    assert_eq!(m.group_index(stray, 0), Err(err.clone()));
+    assert_eq!(m.group_id(stray, 0), Err(err.clone()));
+    assert_eq!(m.group_name(stray), Err(err.clone()));
+    assert_eq!(m.fingerprint().group_name(stray), Err(err));
 }
 
+/// The mask arithmetic must be **numerically identical** to the historical
+/// `stride_extent`-based arithmetic the closed `GroupKind` used
+/// (`(rank / stride) % extent` group index, mixed-radix group id, members as
+/// `base + j*stride`). The old formulas are transcribed here verbatim as the
+/// reference implementation; this is the proof that the open vocabulary did
+/// not change any number for the single-axis groups.
 #[test]
-#[should_panic(expected = "invalid parallel config")]
-fn process_groups_new_panics_on_an_invalid_config() {
-    ProcessGroups::new(cfg(1, 1, 0, 1, 1));
-}
-
-/// The group kind ↔ dimension mapping is a bijection on the five topology
-/// dimensions, and `GroupKind::ALL` is the frozen iteration order.
-#[test]
-fn group_kind_maps_to_parallel_dim() {
-    let dims = [
-        ParallelDim::Tp,
-        ParallelDim::Cp,
-        ParallelDim::Ep,
-        ParallelDim::Dp,
-        ParallelDim::Pp,
+fn single_axis_masks_match_the_old_stride_extent_arithmetic() {
+    let configs = [
+        cfg(4, 3, 2, 5, 2),
+        cfg(2, 2, 2, 2, 2),
+        cfg(1, 1, 1, 1, 1),
+        cfg(8, 1, 1, 1, 1),
+        cfg(1, 4, 1, 1, 1),
+        cfg(1, 1, 3, 1, 1),
+        cfg(1, 1, 1, 5, 1),
+        cfg(1, 1, 1, 1, 7),
+        cfg(3, 5, 1, 1, 1),
+        cfg(1, 1, 1, 2, 2),
+        cfg(2, 2, 1, 2, 1),
     ];
-    for (index, dim) in dims.into_iter().enumerate() {
-        let kind = GroupKind::from_dim(dim);
-        assert_eq!(kind.dim(), Some(dim));
-        assert_eq!(kind, GroupKind::ALL[index]);
-        assert_eq!(kind.to_string(), dim.to_string());
-        assert_eq!(dim.group_kind(), kind);
+    for c in configs {
+        c.validate().unwrap();
+        let m = mesh(c);
+        let world = c.world_size();
+        assert_eq!(m.world_size(), world);
+        // The old closed-form stride/extent per kind (group.rs before D3).
+        let old = |axis: Option<usize>| -> (usize, usize) {
+            let tp = c.tensor;
+            let cp = c.context;
+            let ep = c.expert;
+            let dp = c.data;
+            match axis {
+                Some(0) => (1, tp),
+                Some(1) => (tp, cp),
+                Some(2) => (tp * cp, ep),
+                Some(3) => (tp * cp * ep, dp),
+                Some(4) => (tp * cp * ep * dp, c.pipeline),
+                // `None` is the old `Global`: stride 1, extent = world.
+                None => (1, world),
+                _ => unreachable!(),
+            }
+        };
+        for axis in [None, Some(0), Some(1), Some(2), Some(3), Some(4)] {
+            let mask = match axis {
+                None => GroupMask::from_bits(0b11111),
+                Some(a) => single(a),
+            };
+            let (stride, extent) = old(axis);
+            // The mesh strides agree with the old closed-form ones.
+            if let Some(a) = axis {
+                assert_eq!(m.stride(a), Some(stride), "{c:?} axis {a}");
+                assert_eq!(m.degree(a), Some(extent), "{c:?} axis {a}");
+            }
+            assert_eq!(mask.degree(&m).unwrap(), extent, "{c:?} {axis:?}");
+
+            let mut seen_ids = Vec::new();
+            for rank in 0..world {
+                // Old arithmetic, transcribed:
+                let old_index = (rank / stride) % extent;
+                let old_id = (rank / (stride * extent)) * stride + (rank % stride);
+                let old_members: Vec<usize> = (0..extent)
+                    .map(|j| {
+                        let outer = old_id / stride;
+                        let fastest = old_id % stride;
+                        outer * stride * extent + fastest + j * stride
+                    })
+                    .collect();
+
+                assert_eq!(
+                    m.group_index(mask, rank).unwrap(),
+                    old_index,
+                    "{c:?} {axis:?} rank {rank}"
+                );
+                assert_eq!(
+                    m.group_id(mask, rank).unwrap(),
+                    old_id,
+                    "{c:?} {axis:?} rank {rank}"
+                );
+                assert_eq!(
+                    m.group_ranks(mask, rank).unwrap(),
+                    old_members,
+                    "{c:?} {axis:?} rank {rank}"
+                );
+                if !seen_ids.contains(&old_id) {
+                    seen_ids.push(old_id);
+                }
+            }
+            // Group ids appear in ascending order when ranks are walked
+            // ascending: groups are ordered by their first member, which is the
+            // ordering contract the old `ProcessGroups::groups(kind)` had.
+            assert_eq!(
+                seen_ids,
+                (0..world / extent).collect::<Vec<usize>>(),
+                "{c:?} {axis:?}"
+            );
+        }
     }
-    assert_eq!(GroupKind::Global.dim(), None);
-    assert_eq!(GroupKind::ALL[5], GroupKind::Global);
-    assert_eq!(GroupKind::ALL.len(), 6);
 }

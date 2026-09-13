@@ -11,7 +11,9 @@ use crate::error::ParallelError;
 ///
 /// The global rank is a mixed-radix number whose digits are
 /// `[tp, cp, ep, dp, pp]` with **tensor varying fastest and pipeline varying
-/// slowest**. Written out, a rank is
+/// slowest**. This is exactly the mesh of [`crate::Mesh::from_config`]: with
+/// `stride_i` the product of the degrees before axis `i`, the rank is
+/// `Σ coord_i · stride_i`. Written out, a rank is
 ///
 /// ```text
 /// rank = ((((pp_rank * dp + dp_rank) * ep + ep_rank) * cp + cp_rank) * tp + tp_rank)

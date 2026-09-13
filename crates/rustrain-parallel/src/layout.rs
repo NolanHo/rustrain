@@ -4,28 +4,10 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
-use crate::error::ShardError;
-use crate::group::GroupKind;
+use crate::error::{ParallelError, ShardError};
+use crate::mesh::{GroupMask, Mesh};
 
-/// Logical position of the expert axis in an expert-parallel weight tensor:
-/// `[num_experts, ...]`, so the expert axis is dim 0.
-///
-/// Named here so that "gathering an expert shard" does not hard-code a 0 in the
-/// middle of the transition rules.
-pub const EXPERT_DIM: i64 = 0;
-
-/// Default logical position of the sequence axis: dim 1 of the canonical
-/// `[batch, sequence, ...]` activation layout.
-///
-/// Context parallelism splits the sequence axis, but "the sequence axis" is not
-/// a property a layout can carry — `ParallelLayout::SequenceShard` names the
-/// *kind* of sharding, not an index. This constant is the default assumption;
-/// a plan whose activations are laid out differently (for example
-/// `[batch, head, sequence, head_dim]`) overrides it with
-/// [`DimNormalizer::with_sequence_dim`].
-pub const DEFAULT_SEQUENCE_DIM: i64 = 1;
-
-/// Reduction carried by a [`ParallelLayout::Partial`].
+/// Reduction carried by a [`ParallelLayout`]'s partial.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ReduceOp {
@@ -54,74 +36,241 @@ impl fmt::Display for ReduceOp {
     }
 }
 
-/// How a tensor is distributed over the ranks of a process group.
+/// One independent shard of a tensor: dim `dim` is split evenly over the ranks
+/// of `group`, rank `i` of the group holding slice `i`.
+///
+/// `dim` is a *logical* dimension: it may be negative (Python-style) and is
+/// resolved against a concrete tensor rank when the layout is used. Logical
+/// dims keep a plan reusable across tensors of different ranks — the plan says
+/// "the last axis", not "axis 3".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct ShardSpec {
+    /// The (logical) tensor axis that is split.
+    pub dim: i64,
+    /// The group whose ranks hold the slices.
+    pub group: GroupMask,
+}
+
+/// A partial reduction: every rank of `group` holds a partial of the complete
+/// tensor, and the complete value is obtained by reducing them with `op`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct PartialSpec {
+    /// How the partials combine.
+    pub op: ReduceOp,
+    /// The group whose ranks hold one partial each.
+    pub group: GroupMask,
+}
+
+/// How a tensor is distributed over the ranks of a mesh.
 ///
 /// A layout is *data*: it travels with a plan slot and the propagation pass
 /// compares layouts to decide where communication is needed (invariant I-3).
 /// No kernel has to know about it, and no training loop writes a collective by
 /// hand.
 ///
-/// `dim` is a *logical* dimension: it may be negative (Python-style) and is
-/// resolved against a concrete tensor rank by [`DimNormalizer`] when a
-/// conversion is emitted. Logical dims keep a plan reusable across tensors of
-/// different ranks — the plan says "the last axis", not "axis 3".
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ParallelLayout {
-    /// Every rank of the group holds an identical, complete copy.
-    Replicate,
-
-    /// The tensor is split evenly along `dim` across `group`; rank `i` of the
-    /// group holds slice `i`.
-    Shard { dim: i64, group: GroupKind },
-
-    /// Every rank holds a partial reduction of the complete tensor. `op` is how
-    /// the partials combine: the complete value is obtained by reducing them
-    /// with `op` across `group`.
-    Partial { op: ReduceOp, group: GroupKind },
-
-    /// The expert axis is split across `group` (expert parallelism). Each rank
-    /// owns a disjoint set of experts and holds those weights in full.
-    ExpertShard { group: GroupKind },
-
-    /// The sequence axis is split across `group` (context parallelism).
-    /// `LocalAttention`-style kernels consume this layout directly; anything
-    /// that needs whole sequences all-gathers it.
-    SequenceShard { group: GroupKind },
+/// A layout is **several independent shards plus at most one partial**, because
+/// one tensor can be split along several axes at once: with `tp=2, ep=4` the
+/// MoE weight `[E, 2I, H]` is sharded dim 0 over `ep` *and* dim 1 over `tp`
+/// (`docs/design/model-description.md` §2.1). `partial` stays "at most one":
+/// no real layout needs two partial reductions, and the transition table has to
+/// stay exhaustible.
+///
+/// Not `Copy`: it owns a `Vec`. Serializes deterministically as
+/// `{"dims": [{"dim":..,"group":..}, ..], "partial": {"op":..,"group":..} | null}`
+/// (a vec, never a map).
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct ParallelLayout {
+    /// The independent shards; the local size of dim `d` divides by the product
+    /// of the degrees of every shard whose (normalized) dim is `d`.
+    pub dims: Vec<ShardSpec>,
+    /// The partial reduction, if any.
+    pub partial: Option<PartialSpec>,
 }
 
 impl ParallelLayout {
-    /// Whether every rank of the group holds the complete tensor.
-    pub fn is_replicated(&self) -> bool {
-        matches!(self, ParallelLayout::Replicate)
+    /// Every rank holds an identical, complete copy.
+    pub fn replicate() -> Self {
+        Self {
+            dims: Vec::new(),
+            partial: None,
+        }
     }
 
-    /// The group this layout is distributed over, or `None` for
-    /// [`ParallelLayout::Replicate`] (a replica has no communication group).
-    pub fn group(&self) -> Option<GroupKind> {
-        match self {
-            ParallelLayout::Replicate => None,
-            ParallelLayout::Shard { group, .. }
-            | ParallelLayout::Partial { group, .. }
-            | ParallelLayout::ExpertShard { group }
-            | ParallelLayout::SequenceShard { group } => Some(*group),
+    /// Split dim `dim` across `group`.
+    pub fn shard(dim: i64, group: GroupMask) -> Self {
+        Self {
+            dims: vec![ShardSpec { dim, group }],
+            partial: None,
         }
+    }
+
+    /// A partial reduction with `op` across `group`.
+    pub fn partial(op: ReduceOp, group: GroupMask) -> Self {
+        Self {
+            dims: Vec::new(),
+            partial: Some(PartialSpec { op, group }),
+        }
+    }
+
+    /// Whether every rank holds the complete tensor.
+    pub fn is_replicated(&self) -> bool {
+        self.dims.is_empty() && self.partial.is_none()
+    }
+
+    /// Every distinct group this layout distributes over: each shard's group in
+    /// declaration order, then the partial's group. Duplicates are dropped on
+    /// first occurrence, so the result is deterministic.
+    pub fn groups(&self) -> Vec<GroupMask> {
+        let mut groups = Vec::new();
+        for spec in &self.dims {
+            if !groups.contains(&spec.group) {
+                groups.push(spec.group);
+            }
+        }
+        if let Some(partial) = &self.partial {
+            if !groups.contains(&partial.group) {
+                groups.push(partial.group);
+            }
+        }
+        groups
+    }
+
+    /// The shard specs, in declaration order.
+    pub fn shards(&self) -> &[ShardSpec] {
+        &self.dims
+    }
+
+    /// The divisor this layout applies to logical dim `dim` (after
+    /// normalization): the product of the degrees of every shard spec whose
+    /// normalized dim is `dim`. 1 when the axis is unsharded.
+    ///
+    /// Every shard dim is validated first, so a plan that names an axis the
+    /// tensor does not have is reported whether or not it affects `dim`.
+    ///
+    /// # Errors
+    ///
+    /// [`ShardError::InvalidTensorRank`] if `tensor_rank` is negative,
+    /// [`ShardError::DimOutOfRange`] if `dim` or a shard dim does not exist on
+    /// a rank-`tensor_rank` tensor, or [`ShardError::GroupOutOfRange`] if a
+    /// shard's mask bit is outside `mesh`.
+    pub fn divisor(&self, dim: i64, tensor_rank: i64, mesh: &Mesh) -> Result<i64, ShardError> {
+        let norm = DimNormalizer::new(tensor_rank)?;
+        let target = norm.normalize(dim)?;
+        let mut divisor: i64 = 1;
+        for spec in &self.dims {
+            let resolved = norm.normalize(spec.dim)?;
+            spec.group.validate(mesh).map_err(to_shard_error)?;
+            if resolved == target {
+                let degree = degree_as_i64(spec.group.degree(mesh).expect("group validated"));
+                divisor = divisor.saturating_mul(degree);
+            }
+        }
+        Ok(divisor)
+    }
+
+    /// The local shape a rank holds: `local[d] = global[d] / divisor(d)`.
+    ///
+    /// **Non-divisibility is a hard compile-time error**, never a fallback and
+    /// never a runtime check (`docs/architecture.md` §1.5): the description
+    /// declared the shard, so the framework owes it the local shape — and if
+    /// the declared axis does not divide, the declaration is unsatisfiable
+    /// (`tp=3` with `num_attention_heads=16`).
+    ///
+    /// Every shard dim and every group (including the partial's) is validated
+    /// even on a scalar, so a broken layout is reported rather than skipped.
+    ///
+    /// # Errors
+    ///
+    /// [`ShardError::NotDivisible`] (naming the dim, the global size and the
+    /// divisor) when an axis does not divide, plus the validation errors of
+    /// [`Self::divisor`].
+    pub fn local_shape(&self, global: &[i64], mesh: &Mesh) -> Result<Vec<i64>, ShardError> {
+        let tensor_rank = global.len() as i64;
+        let norm = DimNormalizer::new(tensor_rank)?;
+        for spec in &self.dims {
+            norm.normalize(spec.dim)?;
+            spec.group.validate(mesh).map_err(to_shard_error)?;
+        }
+        if let Some(partial) = &self.partial {
+            partial.group.validate(mesh).map_err(to_shard_error)?;
+        }
+        let mut local = Vec::with_capacity(global.len());
+        for (d, &size) in global.iter().enumerate() {
+            let divisor = self.divisor(d as i64, tensor_rank, mesh)?;
+            if size % divisor != 0 {
+                return Err(ShardError::NotDivisible {
+                    dim: d as i64,
+                    global: size,
+                    divisor,
+                });
+            }
+            local.push(size / divisor);
+        }
+        Ok(local)
+    }
+
+    /// Human form with axis names, e.g. `shard(-1, tp)`, `shard(0, ep) +
+    /// shard(1, tp)`, `partial(sum, tp)`, `replicate`.
+    ///
+    /// A mask bit outside `mesh` has no name; it renders as its raw bit form
+    /// (the form [`ParallelLayout`]'s `Display` always uses) rather than
+    /// failing, because `describe` is for messages and dumps, not validation.
+    pub fn describe(&self, mesh: &Mesh) -> String {
+        if self.is_replicated() {
+            return "replicate".to_string();
+        }
+        let mut parts: Vec<String> =
+            Vec::with_capacity(self.dims.len() + usize::from(self.partial.is_some()));
+        for spec in &self.dims {
+            parts.push(format!("shard({}, {})", spec.dim, name(mesh, spec.group)));
+        }
+        if let Some(partial) = &self.partial {
+            parts.push(format!(
+                "partial({}, {})",
+                partial.op,
+                name(mesh, partial.group)
+            ));
+        }
+        parts.join(" + ")
+    }
+}
+
+fn name(mesh: &Mesh, mask: GroupMask) -> String {
+    mesh.group_name(mask).unwrap_or_else(|_| mask.to_string())
+}
+
+fn degree_as_i64(degree: usize) -> i64 {
+    i64::try_from(degree).unwrap_or(i64::MAX)
+}
+
+/// A [`ParallelError::GroupOutOfRange`] carried as a [`ShardError`], so the
+/// shape arithmetic can report a mask that does not belong to the mesh.
+fn to_shard_error(err: ParallelError) -> ShardError {
+    match err {
+        ParallelError::GroupOutOfRange { bit, axes } => ShardError::GroupOutOfRange { bit, axes },
+        other => unreachable!("only GroupOutOfRange can arise here, got: {other}"),
     }
 }
 
 impl fmt::Display for ParallelLayout {
-    /// Compact form, e.g. `shard(-1, tp)` or `partial(sum, tp)`.
+    /// Compact form without a mesh, so masks render as their raw bits:
+    /// `replicate`, `shard(-1, mask(0b1))`, `partial(sum, mask(0b1))`.
     ///
     /// Kept short because it appears inside error messages and plan dumps,
     /// where a reader compares two layouts at a glance.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            ParallelLayout::Replicate => f.write_str("replicate"),
-            ParallelLayout::Shard { dim, group } => write!(f, "shard({dim}, {group})"),
-            ParallelLayout::Partial { op, group } => write!(f, "partial({op}, {group})"),
-            ParallelLayout::ExpertShard { group } => write!(f, "expert({group})"),
-            ParallelLayout::SequenceShard { group } => write!(f, "seq({group})"),
+        if self.is_replicated() {
+            return f.write_str("replicate");
         }
+        let mut parts: Vec<String> =
+            Vec::with_capacity(self.dims.len() + usize::from(self.partial.is_some()));
+        for spec in &self.dims {
+            parts.push(format!("shard({}, {})", spec.dim, spec.group));
+        }
+        if let Some(partial) = &self.partial {
+            parts.push(format!("partial({}, {})", partial.op, partial.group));
+        }
+        f.write_str(&parts.join(" + "))
     }
 }
 
@@ -131,13 +280,12 @@ impl fmt::Display for ParallelLayout {
 /// at propagation time, so a layout stores a logical dim (`-1` = last axis) and
 /// the axis becomes a concrete non-negative index here. This is also the only
 /// place that decides whether a dim is legal at all: an axis outside
-/// `0..rank` is a plan bug, and it is reported (`ShardError::DimOutOfRange`)
+/// `0..rank` is a plan bug, and it is reported ([`ShardError::DimOutOfRange`])
 /// whether or not the conversion that mentioned it happens to need data
 /// movement.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DimNormalizer {
     rank: i64,
-    sequence_dim: i64,
 }
 
 impl DimNormalizer {
@@ -150,34 +298,12 @@ impl DimNormalizer {
         if rank < 0 {
             return Err(ShardError::InvalidTensorRank { rank });
         }
-        Ok(Self {
-            rank,
-            sequence_dim: DEFAULT_SEQUENCE_DIM,
-        })
-    }
-
-    /// Overrides the logical axis [`ParallelLayout::SequenceShard`] refers to.
-    ///
-    /// The override is stored as a logical dim, so it is resolved (and range
-    /// checked) by [`Self::sequence_dim`], not here.
-    pub fn with_sequence_dim(mut self, dim: i64) -> Self {
-        self.sequence_dim = dim;
-        self
+        Ok(Self { rank })
     }
 
     /// The tensor rank this normalizer was built for.
     pub fn rank(&self) -> i64 {
         self.rank
-    }
-
-    /// The resolved (non-negative) sequence axis.
-    ///
-    /// # Errors
-    ///
-    /// [`ShardError::DimOutOfRange`] if the configured sequence dim does not
-    /// exist on a tensor of this rank.
-    pub fn sequence_dim(&self) -> Result<i64, ShardError> {
-        self.normalize(self.sequence_dim)
     }
 
     /// Resolves `dim` to a non-negative axis: a negative dim counts from the
@@ -233,21 +359,6 @@ mod tests {
         assert_eq!(
             n.normalize(0),
             Err(ShardError::DimOutOfRange { dim: 0, rank: 0 })
-        );
-        assert_eq!(
-            n.sequence_dim(),
-            Err(ShardError::DimOutOfRange { dim: 1, rank: 0 })
-        );
-    }
-
-    #[test]
-    fn sequence_dim_can_be_overridden() {
-        let n = DimNormalizer::new(4).unwrap().with_sequence_dim(-2);
-        assert_eq!(n.sequence_dim().unwrap(), 2);
-        let bad = DimNormalizer::new(2).unwrap().with_sequence_dim(2);
-        assert_eq!(
-            bad.sequence_dim(),
-            Err(ShardError::DimOutOfRange { dim: 2, rank: 2 })
         );
     }
 

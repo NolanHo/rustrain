@@ -5,13 +5,14 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 
 use crate::error::ParallelError;
-use crate::group::GroupKind;
 
 /// One axis of the parallel topology.
 ///
 /// The axes are independent: their sizes multiply into the world size, and a
 /// rank's coordinate on each of them is packed into the global rank by
-/// [`crate::RankLayout`].
+/// [`crate::RankLayout`]. [`crate::Mesh::from_config`] lays the five axes out
+/// in this order (`tp` fastest), so a [`crate::GroupMask`] bit is exactly a
+/// [`ParallelDim`] in axis order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ParallelDim {
@@ -28,7 +29,8 @@ pub enum ParallelDim {
 }
 
 impl ParallelDim {
-    /// Stable lowercase name, used by `Display` and by [`GroupKind`].
+    /// Stable lowercase name, used by `Display` and as the axis name in
+    /// [`crate::Mesh::from_config`].
     pub const fn as_str(self) -> &'static str {
         match self {
             ParallelDim::Tp => "tp",
@@ -36,20 +38,6 @@ impl ParallelDim {
             ParallelDim::Ep => "ep",
             ParallelDim::Dp => "dp",
             ParallelDim::Pp => "pp",
-        }
-    }
-
-    /// The process group this dimension indexes.
-    ///
-    /// Kept next to `Display` so that there is exactly one place mapping a
-    /// topology axis to a collective group; [`GroupKind::dim`] is its inverse.
-    pub const fn group_kind(self) -> GroupKind {
-        match self {
-            ParallelDim::Tp => GroupKind::Tp,
-            ParallelDim::Cp => GroupKind::Cp,
-            ParallelDim::Ep => GroupKind::Ep,
-            ParallelDim::Dp => GroupKind::Dp,
-            ParallelDim::Pp => GroupKind::Pp,
         }
     }
 }

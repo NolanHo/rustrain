@@ -11,3 +11,7 @@ rust-version.workspace = true
 serde.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+
+# For pinning the serialization forms in tests.
+[dev-dependencies]
+serde_json.workspace = true
