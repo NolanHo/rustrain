@@ -99,6 +99,23 @@ rustrain check --model <model-dir> [--checkpoint <dir>] [--tp N --cp N --ep N --
   多段拆分由 binding 的 **`split` 字段**表达，不在 `transform` 里。
   早期列的 `take` / `concat` / `split(dim,sizes)` **移除** —— 没有消费者、也没有定义 = 死钩子。
   **未知动词在 `expand` 期报错**，不得降级成 `skip`（"契约没写"不是 skip 的理由）。
+- **`slice(dim, start, len)` 的语义**：把该轴长度换成 `len`；要求 `start >= 0`、`len > 0`、
+  `start + len <= size`（`checked_add`）；负 `dim` 从末尾数。越界 = `shape_mismatch`（`fail`），
+  **不存在"动词求不了值所以 skip"的分支**。
+- **`**` 只属于 `ignore`**：`binding.source` 里出现 `**` 在 `expand` 期报错 ——
+  一条 binding 的职责是"一个具体 checkpoint 张量 ↔ 一个具体 slot"，否则会退化成笛卡尔配对。
+- **配对必须是一一对应**：`pairs` 数必须等于 binding 覆盖的 weight slot 数；不等则 `fail` 并点名，
+  且 shape/dtype 两项改为 `skip`（不得在不可信的配对上给结论）。
+- **报告的 check id 完整清单**（C6 的六个 + 本轮新增）：
+  `l1.structure`、`l1.compile`、`l1.operator_shapes`、`l1.layout_propagation`、`l1.partial_fulfillment`、
+  `l1.collective_axes`、`l1.slot_allocation`、`l1.implementation_availability`、`l1.binding_coverage`、
+  `l2.binding_coverage`、`l2.tensor_consumption`、`l2.shape_reconciliation`、`l2.dtype_compatibility`、
+  `l2.ignore_coverage`、`cli.arguments`。
+- **`l1.structure` 只声称它真做的两件事**（load/expand + `check_structure`）：C2 里依赖 compile 的
+  五条（可编译 / `infer` 比对 / layout 传播 / `Partial` 兑现 / collective 绑轴 / slot 分配）由各自的
+  `l1.*` 项**显式 `skip` 并写明"缺什么、什么时候能补"**，不得用 `pass` 冒充"没跑"。
+- **`ignore` 模式命中 0 个张量 → `warning`**（不是 `fail`），reason 必须点名那个模式。
+- **没有任何配对可查**（空快照 / 无 weight slot）→ `warning`，不得 6/6 全绿。
 
 **C3 · 并行语义。** axis 是 mesh 里的**有序命名轴**，组是轴掩码；一个 slot 的 layout 是
 **多个 `(dim, group)` 分片 + 至多一个 partial**。本地形状 = 全局形状沿分片维除以该组度数之积，

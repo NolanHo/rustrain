@@ -23,6 +23,7 @@ mod desc;
 mod expand;
 mod params;
 mod pattern;
+mod transform;
 
 use std::path::{Path, PathBuf};
 
@@ -31,9 +32,10 @@ pub use desc::{
     ParamSpec, PortSpec, Select, SlotDecl, Split, StackEntry, Target, Template,
 };
 pub use expand::{
-    Expanded, ResolvedBinding, ResolvedBindingSlot, ResolvedSplit, expand, expand_lenient,
+    Expanded, ResolvedBinding, ResolvedBindingSlot, ResolvedSplit, expand, expand_lenient, summarize,
 };
-pub use pattern::{apply_captures, match_name, matches};
+pub use pattern::{apply_captures, has_double_star, match_name, matches};
+pub use transform::{TRANSFORM_VERBS, Transform, parse_transform};
 
 /// Everything that can fail in the description layer.
 ///

@@ -433,3 +433,48 @@ fn a_slot_that_no_node_reads_or_writes_is_rejected() {
     assert!(text.contains("norm"), "报错必须指出模板名: {text}");
     assert!(text.contains("dead"), "报错必须指出那个 slot: {text}");
 }
+
+/// §3.7 #4: one checkpoint tensor feeds one slot. Two bindings on the same source would load it
+/// into two places, and neither the expansion nor the load check would notice.
+#[test]
+fn two_bindings_on_one_source_are_rejected() {
+    let mut desc = tiny();
+    desc.binding[1].source = desc.binding[0].source.clone();
+    let err = expand(&desc, &config()).unwrap_err();
+    let text = err.to_string();
+    assert!(text.contains("binding 0"), "{text}");
+    assert!(text.contains("binding 1"), "{text}");
+    assert!(text.contains("model.norm_in.weight"), "{text}");
+}
+
+/// C6 gives `**` to `ignore` alone: in a binding it would pair one checkpoint tensor with a whole
+/// subtree of slots (the report then contradicts its own `weights` counter).
+#[test]
+fn a_multi_segment_wildcard_in_a_binding_source_is_rejected() {
+    let mut desc = tiny();
+    desc.binding[0].source = "model.**.weight".to_string();
+    let err = expand(&desc, &config()).unwrap_err();
+    let text = err.to_string();
+    assert!(text.contains("model.**.weight"), "{text}");
+    assert!(text.contains("ignore"), "{text}");
+}
+
+/// C6: an `ignore` entry that matches nothing is a warning at load-check time, but an entry with
+/// no segment at all can never match anything, so it is an error (I-5).
+#[test]
+fn an_empty_ignore_pattern_is_rejected() {
+    let mut desc = tiny();
+    desc.ignore = vec![String::new()];
+    let err = expand(&desc, &config()).unwrap_err();
+    assert!(err.to_string().contains("ignore"), "{err}");
+
+    let mut desc = tiny();
+    desc.ignore = vec!["model..visual".to_string()];
+    let err = expand(&desc, &config()).unwrap_err();
+    assert!(err.to_string().contains("model..visual"), "{err}");
+
+    // The syntax `ignore` is for: `**` spans any number of segments.
+    let mut desc = tiny();
+    desc.ignore = vec!["model.visual.**".to_string()];
+    assert!(expand(&desc, &config()).is_ok());
+}

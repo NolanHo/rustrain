@@ -34,25 +34,71 @@ INDEX_FILE = "model.safetensors.index.json"
 SNAPSHOT_FORMAT = "rustrain.ckpt_meta.v1"
 RETRIES = 3
 TIMEOUT_SECONDS = 60.0
+# The same bound the CLI applies to a safetensors header: a header claiming a gigabyte describes a
+# corrupt or non-safetensors file, not a big model.
+MAX_HEADER_BYTES = 1 << 30
+
+
+def range_header(byte_range: tuple[int, int]) -> str:
+    """`bytes=0-7`, the spelling used in both the request and the diagnostics."""
+    return f"bytes={byte_range[0]}-{byte_range[1]}"
+
+
+def check_partial_headers(response, source: str, byte_range: tuple[int, int]) -> None:
+    """A Range answer has to be a real `206` describing exactly the bytes asked for.
+
+    Checked **before** the body is read: a server that ignores `Range` answers `200` and starts
+    streaming the whole shard, and reading it to EOF would download 72 GB while looking like a
+    successful header fetch.
+    """
+    first, last = byte_range
+    status = getattr(response, "status", None)
+    if status != 206:
+        raise SystemExit(
+            f"{source}: the server answered HTTP {status} instead of 206 for {range_header(byte_range)}; "
+            "it ignored the Range request, so the read is aborted instead of downloading the whole shard"
+        )
+    content_range = response.headers.get("Content-Range")
+    if content_range is None:
+        raise SystemExit(
+            f"{source}: a 206 answer without `Content-Range`; cannot tell which bytes came back"
+        )
+    if not content_range.startswith(f"bytes {first}-{last}/"):
+        raise SystemExit(
+            f"{source}: `Content-Range: {content_range}` does not describe {range_header(byte_range)}"
+        )
 
 
 def read_bytes(source: str, byte_range: tuple[int, int] | None = None) -> bytes:
     """One read, over HTTP Range or from a local file. A URL without a scheme is a path."""
     if "://" not in source:
-        with open(source, "rb") as handle:
-            if byte_range is not None:
-                handle.seek(byte_range[0])
-                return handle.read(byte_range[1] - byte_range[0] + 1)
-            return handle.read()
+        try:
+            with open(source, "rb") as handle:
+                if byte_range is not None:
+                    handle.seek(byte_range[0])
+                    return handle.read(byte_range[1] - byte_range[0] + 1)
+                return handle.read()
+        except OSError as error:
+            raise SystemExit(f"cannot read {source}: {error}")
 
     request = urllib.request.Request(source, headers={"User-Agent": "rustrain-fetch-meta"})
     if byte_range is not None:
-        request.add_header("Range", f"bytes={byte_range[0]}-{byte_range[1]}")
+        request.add_header("Range", range_header(byte_range))
     last_error: Exception | None = None
     for attempt in range(RETRIES):
         try:
             with urllib.request.urlopen(request, timeout=TIMEOUT_SECONDS) as response:
-                return response.read()
+                if byte_range is not None:
+                    check_partial_headers(response, source, byte_range)
+                data = response.read()
+                if byte_range is not None:
+                    expected = byte_range[1] - byte_range[0] + 1
+                    if len(data) != expected:
+                        raise SystemExit(
+                            f"{source}: {range_header(byte_range)} asked for {expected} byte(s), "
+                            f"{len(data)} came back"
+                        )
+                return data
         except (urllib.error.URLError, TimeoutError) as error:
             last_error = error
             if attempt + 1 < RETRIES:
@@ -66,38 +112,68 @@ def read_shard_header(url: str) -> dict:
     if len(prefix) != 8:
         raise SystemExit(f"{url}: expected an 8-byte header length, got {len(prefix)} bytes")
     length = int.from_bytes(prefix, "little")
+    if length == 0:
+        raise SystemExit(f"{url}: the safetensors header announces 0 bytes")
+    if length > MAX_HEADER_BYTES:
+        raise SystemExit(
+            f"{url}: the safetensors header claims {length} bytes; refusing to read it "
+            f"(the limit is {MAX_HEADER_BYTES})"
+        )
     header = read_bytes(url, (8, 8 + length - 1))
-    if len(header) != length:
-        raise SystemExit(f"{url}: a {length}-byte header was announced, {len(header)} came back")
-    return json.loads(header)
+    try:
+        table = json.loads(header)
+    except json.JSONDecodeError as error:
+        raise SystemExit(f"{url}: the safetensors header is not JSON: {error}")
+    if not isinstance(table, dict):
+        raise SystemExit(f"{url}: the safetensors header is not a JSON object")
+    return table
 
 
 def snapshot(index_url: str) -> dict[str, dict]:
     """`{tensor name: {"dtype": ..., "shape": [...]}}` for every tensor the index maps."""
-    index = json.loads(read_bytes(index_url))
-    weight_map = index["weight_map"]
-    shards = sorted(set(weight_map.values()))
-    # The shard files are siblings of the index, whatever the index was read from.
-    base = index_url[: index_url.rindex("/") + 1]
+    raw_index = read_bytes(index_url)
+    try:
+        index = json.loads(raw_index)
+    except json.JSONDecodeError as error:
+        raise SystemExit(f"{index_url} is not JSON: {error}")
+    if not isinstance(index, dict):
+        raise SystemExit(f"{index_url}: the safetensors index is not a JSON object")
+    weight_map = index.get("weight_map")
+    if not isinstance(weight_map, dict):
+        raise SystemExit(f"{index_url} has no `weight_map` object")
 
     by_shard: dict[str, list[str]] = {}
     for name, shard in weight_map.items():
+        if not isinstance(shard, str) or not shard:
+            raise SystemExit(f"{index_url}: `{name}` maps to {shard!r}, not a shard file name")
         by_shard.setdefault(shard, []).append(name)
+    # The shard files are siblings of the index, whatever the index was read from.
+    base = index_url[: index_url.rindex("/") + 1]
 
     tensors: dict[str, dict] = {}
-    for number, shard in enumerate(shards, start=1):
+    for number, shard in enumerate(sorted(by_shard), start=1):
         header = read_shard_header(base + shard)
         for name in by_shard[shard]:
             entry = header.get(name)
-            if entry is None:
+            if not isinstance(entry, dict):
                 raise SystemExit(f"{shard}: the index lists `{name}`, but the shard header does not")
+            dtype = entry.get("dtype")
+            shape = entry.get("shape")
+            if not isinstance(dtype, str) or not dtype:
+                raise SystemExit(f"{shard}: tensor `{name}` has no `dtype` string")
+            if not isinstance(shape, list):
+                raise SystemExit(f"{shard}: tensor `{name}` has no `shape` list")
+            try:
+                dimensions = [int(dimension) for dimension in shape]
+            except (TypeError, ValueError):
+                raise SystemExit(f"{shard}: tensor `{name}` has a non-integer dimension in {shape!r}")
             tensors[name] = {
                 # safeTensors spells dtypes in upper case (`BF16`, `F8_E4M3`); the description
                 # language's vocabulary (model-description §3.6 #5) is the lower-case spelling.
-                "dtype": str(entry["dtype"]).lower().replace("_", ""),
-                "shape": [int(dim) for dim in entry["shape"]],
+                "dtype": dtype.lower().replace("_", ""),
+                "shape": dimensions,
             }
-        print(f"  [{number}/{len(shards)}] {shard}: {len(by_shard[shard])} tensor(s)", file=sys.stderr)
+        print(f"  [{number}/{len(by_shard)}] {shard}: {len(by_shard[shard])} tensor(s)", file=sys.stderr)
 
     missing = sorted(set(weight_map) - set(tensors))
     if missing:

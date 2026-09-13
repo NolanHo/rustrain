@@ -16,6 +16,7 @@ use rustrain_plan::{AttrValue, Attrs, OpRef, Phase, Plan, PlanBuilder, SlotId, S
 use crate::ModelError;
 use crate::desc::{AttrLiteral, FORMAT, ModelDesc, NodeDecl, StackEntry, Target, Template};
 use crate::params::{Params, Value};
+use crate::transform::parse_transform;
 
 /// The index variable `until` expansion uses (the counterpart of `repeat.index`).
 const UNTIL_INDEX: &str = "l";
@@ -98,6 +99,7 @@ pub fn expand_lenient(desc: &ModelDesc, config: &serde_json::Value) -> Result<Ex
 
     let params = Params::resolve(&desc.params, config)?;
     check_template_slots(desc)?;
+    check_ignore_patterns(desc)?;
     let default_dtype = match &desc.dtype {
         Some(name) => parse_dtype(name)?,
         None => RsDtype::F32,
@@ -122,8 +124,9 @@ pub fn expand_lenient(desc: &ModelDesc, config: &serde_json::Value) -> Result<Ex
 }
 
 /// `a, b, c` for the first few names, then `… (+N more)`: an error message has to stay readable
-/// when a whole description is unbound.
-fn summarize(names: &[String]) -> String {
+/// when a whole description is unchecked. The one summarizer, shared with the loading check's
+/// report.
+pub fn summarize(names: &[String]) -> String {
     const SHOWN: usize = 8;
     let mut list = names
         .iter()
@@ -135,6 +138,55 @@ fn summarize(names: &[String]) -> String {
         list.push_str(&format!(", … (+{} more)", names.len() - SHOWN));
     }
     list
+}
+
+/// `ignore`'s pattern syntax is `binding.source`'s plus `**` (C6). An entry that matches nothing is
+/// a warning at load-check time — the same description may be checked against another checkpoint —
+/// but an entry that names *no segment at all* is a typo nothing can ever match, so it is an error
+/// here (I-5).
+fn check_ignore_patterns(desc: &ModelDesc) -> Result<(), ModelError> {
+    for pattern in &desc.ignore {
+        if pattern.is_empty() {
+            return Err(ModelError::Invalid(
+                "`ignore` has an empty pattern; an entry must name at least one segment (the \
+                 vision tower is dropped by writing `model.visual.**`, C6)"
+                    .to_string(),
+            ));
+        }
+        if pattern.split('.').any(str::is_empty) {
+            return Err(ModelError::Invalid(format!(
+                "`ignore` pattern `{pattern}` has an empty segment: a `.` with nothing on one side \
+                 of it matches no tensor name"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// A `binding` pattern takes single-segment wildcards only: `{*}` in a source, `*` in a target
+/// (§3.4). `**` belongs to `ignore` alone (C6) — a multi-segment wildcard in a binding is how one
+/// checkpoint tensor silently feeds a whole subtree of slots.
+fn check_binding_pattern(pattern: &str, what: &str) -> Result<(), String> {
+    if pattern.is_empty() {
+        return Err(format!(
+            "{what} is empty; a pattern must name at least one segment"
+        ));
+    }
+    for segment in pattern.split('.') {
+        if segment.is_empty() {
+            return Err(format!(
+                "{what} `{pattern}` has an empty segment: a `.` with nothing on one side of it \
+                 matches no slot name"
+            ));
+        }
+        if segment == "**" {
+            return Err(format!(
+                "{what} `{pattern}` uses `**`: a multi-segment wildcard belongs to `ignore` only \
+                 (C6); a binding pairs one concrete checkpoint tensor with one concrete slot"
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Every declared template slot must be read or written by some node of that template (§3.7 #11).
@@ -733,9 +785,28 @@ impl<'a> Expander<'a> {
             .collect();
 
         let mut claimed: BTreeMap<String, String> = BTreeMap::new();
+        let mut sources: BTreeMap<&str, usize> = BTreeMap::new();
         let mut resolved = Vec::with_capacity(self.desc.binding.len());
 
         for (index, binding) in self.desc.binding.iter().enumerate() {
+            // §3.7 #4: one checkpoint tensor feeds one slot. Two bindings on the same source would
+            // load that tensor into two places and neither report would notice.
+            if let Some(first) = sources.insert(binding.source.as_str(), index) {
+                return Err(ModelError::Invalid(format!(
+                    "binding {first} and binding {index} both declare source `{}`: a checkpoint \
+                     tensor is consumed once, by one binding (§3.7 #4)",
+                    binding.source
+                )));
+            }
+            check_binding_pattern(&binding.source, "source").map_err(|e| {
+                ModelError::Invalid(format!("binding {index} (`{}`): {e}", binding.source))
+            })?;
+            if let Some(slot) = &binding.slot {
+                check_binding_pattern(slot, "slot").map_err(|e| {
+                    ModelError::Invalid(format!("binding {index} (`{}`): {e}", binding.source))
+                })?;
+            }
+
             let targets: Vec<(String, BTreeMap<String, Vec<String>>)> =
                 match (&binding.slot, binding.targets.is_empty()) {
                     (Some(slot), true) => vec![(slot.clone(), binding.axes.clone())],
@@ -758,6 +829,13 @@ impl<'a> Expander<'a> {
                         )));
                     }
                 };
+
+            for (target_index, target) in binding.targets.iter().enumerate() {
+                check_binding_pattern(&target.slot, &format!("targets[{target_index}].slot"))
+                    .map_err(|e| {
+                        ModelError::Invalid(format!("binding {index} (`{}`): {e}", binding.source))
+                    })?;
+            }
 
             let split = match &binding.split {
                 Some(split) => {
@@ -804,7 +882,7 @@ impl<'a> Expander<'a> {
             };
 
             for transform in &binding.transform {
-                validate_transform(transform).map_err(|e| {
+                parse_transform(transform).map_err(|e| {
                     ModelError::Invalid(format!("binding {index} (`{}`): {e}", binding.source))
                 })?;
             }
@@ -909,25 +987,6 @@ fn attrs_of(map: &BTreeMap<String, AttrLiteral>) -> Attrs {
     attrs
 }
 
-/// The `transform` vocabulary (§3.4): five verbs, and only five; argument semantics belong to the
-/// loader.
-fn validate_transform(text: &str) -> Result<(), String> {
-    const VERBS: [&str; 5] = ["take", "slice", "transpose", "split", "concat"];
-    let (verb, rest) = text
-        .split_once('(')
-        .ok_or_else(|| format!("transform `{text}` is not `<verb>(<args>)`"))?;
-    if !VERBS.contains(&verb) {
-        return Err(format!(
-            "transform `{text}`: unknown verb `{verb}`; expected one of {}",
-            VERBS.join(", ")
-        ));
-    }
-    if !rest.ends_with(')') {
-        return Err(format!("transform `{text}` is missing its closing `)`"));
-    }
-    Ok(())
-}
-
 /// The syntax of `select.by`: `<param name>[<index variable>]`.
 fn parse_indexed(text: &str) -> Option<(String, String)> {
     let (list, rest) = text.split_once('[')?;
@@ -967,12 +1026,28 @@ mod tests {
     }
 
     #[test]
-    fn transform_verbs_are_checked() {
-        assert!(validate_transform("transpose(0,1)").is_ok());
-        assert!(validate_transform("split(2, [a, b])").is_ok());
-        assert!(validate_transform("transpose").is_err());
-        assert!(validate_transform("flip(0)").is_err());
-        assert!(validate_transform("transpose(0,1").is_err());
+    fn the_transform_vocabulary_is_two_verbs_and_a_wrong_one_is_an_error() {
+        use crate::transform::parse_transform as parse;
+        assert!(parse("transpose(0,1)").is_ok());
+        assert!(parse("slice(1, 0, 96)").is_ok());
+        // C6 removed these three; they must not be accepted, least of all silently.
+        for removed in ["take(model.up.weight)", "concat(0)", "split(1, [96, 64])"] {
+            assert!(parse(removed).is_err(), "{removed} must not parse");
+        }
+        assert!(parse("transpose").is_err());
+        assert!(parse("flip(0)").is_err());
+        assert!(parse("transpose(0,1").is_err());
+    }
+
+    #[test]
+    fn a_binding_pattern_takes_single_segment_wildcards_only() {
+        assert!(check_binding_pattern("layers.{*}.q", "source").is_ok());
+        assert!(check_binding_pattern("layers.*.q", "slot").is_ok());
+        assert!(check_binding_pattern("model.visual.**", "source").is_err());
+        assert!(check_binding_pattern("", "source").is_err());
+        assert!(check_binding_pattern("layers..q", "slot").is_err());
+        let error = check_binding_pattern("model.**.weight", "source").unwrap_err();
+        assert!(error.contains("ignore"), "{error}");
     }
 
     #[test]

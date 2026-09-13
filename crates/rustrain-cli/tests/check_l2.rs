@@ -381,7 +381,8 @@ fn tiny_model_with_a_matching_snapshot_passes_l2() {
     );
 }
 
-/// D2: "一个故意漏掉一条 binding 的用例必须 Fail 并指出漏了哪个 slot 模式".
+/// D2: a case that deliberately drops one binding must `Fail` and name the slot pattern it left
+/// unbound.
 ///
 /// `models/missing-binding` is `models/tiny` without the `mlp.down` binding.
 #[test]
@@ -396,7 +397,8 @@ fn a_weight_slot_without_a_binding_is_reported_by_its_slot_name() {
     );
 }
 
-/// D2: "一个故意在描述里多声明一个不存在的 checkpoint 张量的用例必须 Fail 并指出那个模式".
+/// D2: a case that deliberately declares a checkpoint tensor the description cannot consume must
+/// `Fail` and name that pattern.
 ///
 /// `models/extra-declaration` binds `mlp.up` to `model.up.weight_v2`, which the snapshot does not
 /// have (the real `model.up.weight` then also ends up unconsumed — a second, expected report line
@@ -413,7 +415,7 @@ fn a_binding_for_a_tensor_the_checkpoint_lacks_is_reported_by_its_source() {
     );
 }
 
-/// D2: "一个故意写错 `transform`（例如漏掉 `transpose`）的用例必须 Fail".
+/// D2: a case with a deliberately wrong `transform` (a dropped `transpose`) must `Fail`.
 ///
 /// `models/wrong-transform` drops `transpose(0,1)` from the `mlp.up` binding, so the checkpoint's
 /// `[160, 96]` no longer maps onto the declared slot `[96, 160]`. Failing is not enough: the
@@ -460,9 +462,9 @@ fn an_ignored_checkpoint_tensor_stops_failing() {
     assert_zero_counters(&run.json(), &run);
 }
 
-/// C2's ruling: an unresolved implementation is a `Skip`, and "退出码只由 `Fail` 决定". The fixture
-/// uses `nonexistent_op`, which no provider publishes, so the whole run must still exit 0 and say
-/// what is missing.
+/// C2's ruling: an unresolved implementation is a `Skip`, and the exit code is decided by `Fail`
+/// alone. The fixture uses `nonexistent_op`, which no provider publishes, so the whole run must
+/// still exit 0 and say what is missing.
 #[test]
 fn an_unregistered_operator_is_a_reasoned_skip_not_a_fail() {
     let run = check(

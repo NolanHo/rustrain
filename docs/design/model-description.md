@@ -238,8 +238,14 @@ HF / legacy 的 checkpoint 是 `[out, in]`，所以 binding 用 `transpose` 归�
 ```
 
 - `slot` / `source` 的 `*` 是**共享捕获**：两边同一个 `{*}` 指同一个下标段。
-- `transform` 词表：`take(name)` / `slice(dim, range)` / `transpose(i, j)` / `split(dim, sizes)` / `concat(dim)`。
-  这五种覆盖了 Megatron 用到的全部机制（前缀重命名、按轴切片、MLA 的 `cat([q, kv])`）。
+  `source` 里**不得出现 `**`**（多段通配只属于 `ignore`）：一条 binding 的职责是"一个具体 checkpoint 张量 ↔ 一个具体 slot"。
+- `transform` 词表**只有两个动词**：`transpose(i, j)` 与 `slice(dim, start, len)`。
+  - `slice` 把该轴长度换成 `len`；要求 `start >= 0`、`len > 0`、`start + len <= size`（`checked_add`）；
+    负 `dim` 从末尾数（与 `transpose` 一致）。
+  - **多段拆分由 binding 的 `split` 字段表达**，不在 `transform` 里 —— 早期列的
+    `take` / `concat` / `split(dim,sizes)` **已移除**（没有消费者也没有定义 = 死钩子）。
+  - **未知动词在 `expand` 期报错**；`slice` 的越界是 `shape_mismatch`（fail）。
+    **不存在"动词没实现所以 skip"的分支** —— skip 不得用来掩盖契约未实现。
 - `axes` 里是**符号轴名**；instantiate 时解析成 `GroupMask` 并执行 §2.2 的除法。
 - **切分轴住在这里**：不是模板，也不是框架侧规则表（I-5 / P6）。它与"从 checkpoint 取哪一块"
   是同一条事实，所以必须同一处声明、同一处被加载器与形状算术读取。

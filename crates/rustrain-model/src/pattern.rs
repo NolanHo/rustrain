@@ -8,7 +8,9 @@
 //! by target).
 //!
 //! `**` matches **any number** of segments, including none, and captures nothing. It is the one
-//! extension `ignore` needs, to drop a whole subtree by declaration (`"model.visual.**"`).
+//! extension `ignore` needs, to drop a whole subtree by declaration (`"model.visual.**"`). The
+//! match runs in `O(segments(pattern) × segments(name))`: both sides are free-form input, so the
+//! cost of a pathological pattern has to stay polynomial.
 
 /// Any number of segments, capturing nothing.
 const DOUBLE_STAR: &str = "**";
@@ -54,37 +56,92 @@ fn is_single_star(segment: &str) -> bool {
     segment == SINGLE_STAR || segment == BRACED_STAR
 }
 
-/// Recursive match with backtracking: `**` is greedy in nothing, it tries the shortest prefix
-/// first, so captures stay deterministic.
+/// `true` when `pattern` uses the multi-segment wildcard. Only `ignore` may (C6).
+pub fn has_double_star(pattern: &str) -> bool {
+    pattern.split('.').any(|segment| segment == DOUBLE_STAR)
+}
+
+/// Match a segment pattern against a segment list, appending the single-segment captures.
+///
+/// `**` takes the shortest prefix that still lets the rest match — the same choice the recursive
+/// matcher made, so captures stay deterministic — but the work is bounded by
+/// `segments(pattern) × segments(name)`, not by the number of `**`. A pattern is free-form input
+/// from a description and a name is free-form input from a checkpoint, so exponential
+/// backtracking is a denial of service, not a match.
 fn match_segments(pattern: &[&str], name: &[&str], captures: &mut Vec<String>) -> bool {
-    let Some((head, rest)) = pattern.split_first() else {
-        return name.is_empty();
-    };
-    if *head == DOUBLE_STAR {
-        return (0..=name.len()).any(|taken| {
-            let mark = captures.len();
-            if match_segments(rest, &name[taken..], captures) {
-                true
-            } else {
-                captures.truncate(mark);
-                false
-            }
-        });
+    let chunks = chunks_between_stars(pattern);
+    if chunks.len() == 1 {
+        // No `**`: the pattern is an ordinary name of the same length.
+        return match_chunk(chunks[0], name, 0, captures);
     }
-    let Some((first, tail)) = name.split_first() else {
+
+    // `S0 ** S1 ** … ** Sm`: `S0` is anchored at the start, `Sm` at the end, and every middle
+    // chunk is floated as far forward as it goes. Earliest is optimal: the `**` after a chunk can
+    // always absorb the segments a later position would have consumed, so a match at the earliest
+    // position leaves the most room for everything that follows.
+    if !match_chunk(chunks[0], name, 0, captures) {
+        return false;
+    }
+    let mut position = chunks[0].len();
+
+    let last = chunks.len() - 1;
+    for chunk in &chunks[1..last] {
+        let limit = name.len().checked_sub(chunk.len());
+        let mut start = position;
+        loop {
+            let mark = captures.len();
+            if match_chunk(chunk, name, start, captures) {
+                position = start + chunk.len();
+                break;
+            }
+            captures.truncate(mark);
+            match limit {
+                Some(limit) if start < limit => start += 1,
+                _ => return false,
+            }
+        }
+    }
+
+    let Some(start) = name.len().checked_sub(chunks[last].len()) else {
         return false;
     };
-    if is_single_star(head) {
-        captures.push((*first).to_string());
-        if match_segments(rest, tail, captures) {
-            true
-        } else {
-            captures.pop();
-            false
+    start >= position && match_chunk(chunks[last], name, start, captures)
+}
+
+/// The `**`-free runs between the double stars: one chunk more than there are double stars.
+fn chunks_between_stars<'a>(pattern: &'a [&'a str]) -> Vec<&'a [&'a str]> {
+    let mut chunks = Vec::new();
+    let mut start = 0;
+    for (index, segment) in pattern.iter().enumerate() {
+        if *segment == DOUBLE_STAR {
+            chunks.push(&pattern[start..index]);
+            start = index + 1;
         }
-    } else {
-        *head == *first && match_segments(rest, tail, captures)
     }
+    chunks.push(&pattern[start..]);
+    chunks
+}
+
+/// Match one `**`-free chunk at `name[start..]`, appending the single-segment captures it takes.
+/// Every chunk segment consumes exactly one name segment, so the chunk's length is fixed.
+fn match_chunk(chunk: &[&str], name: &[&str], start: usize, captures: &mut Vec<String>) -> bool {
+    let Some(end) = start.checked_add(chunk.len()) else {
+        return false;
+    };
+    if end > name.len() {
+        return false;
+    }
+    let mark = captures.len();
+    for (offset, segment) in chunk.iter().enumerate() {
+        let candidate = name[start + offset];
+        if is_single_star(segment) {
+            captures.push(candidate.to_string());
+        } else if *segment != candidate {
+            captures.truncate(mark);
+            return false;
+        }
+    }
+    true
 }
 
 #[cfg(test)]
@@ -144,5 +201,53 @@ mod tests {
             None,
             "a pattern with no wildcard cannot absorb a capture"
         );
+    }
+
+    #[test]
+    fn a_double_star_is_recognised_by_the_segment_it_occupies() {
+        assert!(has_double_star("model.visual.**"));
+        assert!(!has_double_star("model.visual.*"));
+        assert!(!has_double_star("model.visual.w**"));
+        assert!(!has_double_star("model.visual.weight"));
+    }
+
+    /// Both sides of a match are unbounded input: a pattern from a description, a tensor name from
+    /// a checkpoint. Backtracking over `**` was exponential (eight double stars against a
+    /// 36-segment name took ~10 s, and this 48-segment shape never returned), so the bound is part
+    /// of the contract this matcher has to keep.
+    #[test]
+    fn a_pathological_double_star_pattern_returns_promptly() {
+        let name = std::iter::once("m".to_string())
+            .chain((0..47).map(|index| format!("s{index}")))
+            .collect::<Vec<_>>()
+            .join(".");
+        let pattern = format!("m.{}.nomatch", ["**"; 10].join("."));
+        assert_eq!(pattern.split('.').filter(|s| *s == "**").count(), 10);
+        assert_eq!(name.split('.').count(), 48);
+
+        let started = std::time::Instant::now();
+        assert!(!matches(&pattern, &name));
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_millis(500),
+            "matching {pattern} against {name} took {elapsed:?}; the bound is polynomial"
+        );
+    }
+
+    /// The shortest-prefix rule is observable through captures: the first `**` takes as little as
+    /// it can while the rest still matches.
+    #[test]
+    fn a_double_star_takes_the_shortest_prefix_that_still_matches() {
+        assert_eq!(
+            match_name("a.**.{*}.c", "a.b.d.c").as_deref(),
+            Some(["d".to_string()].as_slice())
+        );
+        // The capture may only come from where the `**` stopped, never from inside it.
+        assert_eq!(
+            match_name("a.**.c.**.{*}", "a.c.x.y").as_deref(),
+            Some(["y".to_string()].as_slice())
+        );
+        assert_eq!(match_name("**.{*}", "p.q"), Some(vec!["q".to_string()]));
+        assert_eq!(match_name("{*}.{*}", "p.q"), Some(vec!["p".to_string(), "q".to_string()]));
     }
 }

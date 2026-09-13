@@ -15,7 +15,7 @@
 //! None of them reads an environment variable, and none needs a GPU: `check`
 //! reads safetensors *headers*, never weights, and creates no device context.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
@@ -612,13 +612,8 @@ struct CheckArgs {
 enum Verdict {
     Pass,
     Fail,
-    /// Never affects the exit code. Nothing in this unit produces one yet — C2's first warning is
-    /// the memory budget, which needs an instantiated plan (D4) — but a report reader has to be
-    /// able to spell every verdict C2 defines.
-    #[expect(
-        dead_code,
-        reason = "C6's verdict vocabulary is complete here; the memory-budget warning arrives with D4"
-    )]
+    /// Never affects the exit code. Two real producers: an `ignore` pattern that matches no
+    /// checkpoint tensor (C6) and a pairing set with nothing in it.
     Warning,
     Skip,
 }
@@ -659,6 +654,10 @@ impl CheckItem {
 
     fn fail(id: &'static str, reason: String, details: Vec<String>) -> Self {
         Self::new(id, Verdict::Fail, reason, details)
+    }
+
+    fn warning(id: &'static str, reason: String) -> Self {
+        Self::new(id, Verdict::Warning, reason, Vec::new())
     }
 
     fn skip(id: &'static str, reason: impl Into<String>) -> Self {
@@ -818,19 +817,25 @@ fn check(args: CheckArgs) -> Result<()> {
 
     // C6: `--dtype` is an L1 input, never an L2 one, and the report records the precision the
     // checks actually ran at — the flag when given, else the description's own default.
-    let override_dtype = match &dtype {
-        Some(name) => Some(RsDtype::parse(name).ok_or_else(|| {
-            anyhow!(
-                "unknown dtype `{name}`; expected one of {}",
+    //
+    // C6 also requires a full report on stdout whether the run passes or fails, so an unusable
+    // `--dtype` is a `fail` item inside the report rather than an `anyhow` error that would leave
+    // stdout empty. The other checks then run at the dtype the description declares (which is what
+    // the report records), and the exit code already says the run is not to be trusted.
+    let override_dtype = dtype.as_deref().and_then(RsDtype::parse);
+    let dtype_error = dtype
+        .as_deref()
+        .filter(|name| RsDtype::parse(name).is_none())
+        .map(|name| {
+            format!(
+                "`--dtype {name}` is not a dtype; expected one of {}",
                 RsDtype::ALL
                     .iter()
                     .map(|d| d.name())
                     .collect::<Vec<_>>()
                     .join(", ")
             )
-        })?),
-        None => None,
-    };
+        });
 
     let mut report = CheckReport {
         model: model_dir.display().to_string(),
@@ -839,12 +844,20 @@ fn check(args: CheckArgs) -> Result<()> {
         counts: Counts::default(),
         checks: Vec::new(),
     };
+    if let Some(reason) = dtype_error {
+        report.checks.push(CheckItem::fail("cli.arguments", reason, Vec::new()));
+    }
 
     // ---- L1: the description expands into one sound global plan -------------
     //
-    // §3.5's unbound-slot mandate is deliberately *not* part of this item: with `--checkpoint` it
-    // belongs to `l2.binding_coverage`, which can name the slot and count it. Without one the
-    // mandate is simply not checked (C2 appends L2 only when a checkpoint is given).
+    // §3.5's unbound-slot mandate is deliberately *not* part of `l1.structure`: with `--checkpoint`
+    // it belongs to `l2.binding_coverage`, which can name the slot and count it. `l1.binding_coverage`
+    // reports the same number from the description alone, so a run without a checkpoint still sees
+    // it.
+    //
+    // What `l1.structure` covers is exactly what the `--model` path can run: load + expand +
+    // `check_structure`. C2's other L1 sub-checks all need `Plan::compile`, so they are reported
+    // separately as `skip` with their reasons — never folded into a `pass`.
     let mut expanded = None;
     match rustrain_model::Model::load(&model_dir) {
         Err(e) => report.checks.push(CheckItem::fail(
@@ -853,8 +866,8 @@ fn check(args: CheckArgs) -> Result<()> {
             Vec::new(),
         )),
         Ok(model) => {
-            report.dtype = dtype
-                .clone()
+            report.dtype = override_dtype
+                .map(|dtype| dtype.name().to_string())
                 .or_else(|| model.desc.dtype.clone())
                 .unwrap_or_else(|| RsDtype::F32.name().to_string());
             match model.expand_lenient() {
@@ -873,8 +886,11 @@ fn check(args: CheckArgs) -> Result<()> {
                         report.checks.push(CheckItem::pass(
                             "l1.structure",
                             format!(
-                                "the description expands into one global plan and passes \
-                                 check_structure: {} node(s), {} slot(s), every layout replicate",
+                                "the description loads and expands into one global plan that passes \
+                                 `check_structure` (topological order, every node produces \
+                                 something, no slot written twice): {} node(s), {} slot(s), every \
+                                 layout `Replicate`. C2's compile-dependent L1 sub-checks are not \
+                                 covered by this item; they are reported separately",
                                 plan.plan.nodes.len(),
                                 plan.plan.slots.len()
                             ),
@@ -889,12 +905,19 @@ fn check(args: CheckArgs) -> Result<()> {
                                 .count(),
                         );
                         report.counts.bindings = Some(plan.bindings.len());
+                        // The expander computes this whether or not a checkpoint follows; a run
+                        // without one has to show the number instead of leaving it unmeasured.
+                        report.counts.slots_unbound = Some(plan.unbound_slots.len());
                         expanded = Some((model, plan));
                     }
                 },
             }
         }
     }
+
+    report
+        .checks
+        .extend(compile_dependent_l1_checks(expanded.is_some()));
 
     // ---- L1: implementation availability (never a `fail`, always a reason) --
     match &expanded {
@@ -911,6 +934,18 @@ fn check(args: CheckArgs) -> Result<()> {
         None => report.checks.push(CheckItem::skip(
             "l1.implementation_availability",
             "not evaluated: the description did not expand into a plan to resolve operators for",
+        )),
+    }
+
+    // ---- L1: §3.5's first mandate, seen from the description alone ---------
+    match &expanded {
+        Some((_, plan)) => report
+            .checks
+            .push(binding_coverage_from_the_description(plan)),
+        None => report.checks.push(CheckItem::skip(
+            "l1.binding_coverage",
+            "not evaluated: the description did not expand into a plan whose weight slots could be \
+             counted",
         )),
     }
 
@@ -986,7 +1021,7 @@ fn check(args: CheckArgs) -> Result<()> {
 /// precision being checked**.
 ///
 /// A primitive this machine has no implementation for is a `skip` with its reasons spelled out —
-/// never a `fail` ("退出码只由 Fail 决定") and never a silent `pass`.
+/// never a `fail` (the exit code is decided by `Fail` alone) and never a silent `pass`.
 fn implementation_availability(
     plan: &Plan,
     registry: &Registry,
@@ -1048,21 +1083,101 @@ fn implementation_availability(
 /// notion — an index (`i64`) or a mask (`u8`) is not a precision, so it keeps its declared dtype.
 fn checked_dtype(declared: RsDtype, override_dtype: Option<RsDtype>) -> RsDtype {
     match override_dtype {
-        Some(dtype) if is_float(declared) => dtype,
+        Some(dtype) if declared.is_float() => dtype,
         _ => declared,
     }
 }
 
-fn is_float(dtype: RsDtype) -> bool {
-    [
-        RsDtype::F32,
-        RsDtype::F16,
-        RsDtype::BF16,
-        RsDtype::F8E4M3,
-        RsDtype::F8E5M2,
-        RsDtype::FP4E2M1,
-    ]
-    .contains(&dtype)
+/// §3.5's first mandate seen from the description alone: every weight slot is hit by a binding.
+///
+/// `l2.binding_coverage` answers the same question against a checkpoint and fails the run. This
+/// item always carries the number — a run without `--checkpoint` must still show how many slots
+/// the description leaves unbound — and it is a `warning`, not a `fail`, because C2 couples the
+/// mandate to the loading check (C2 appends L2 only when a `--checkpoint` is given).
+fn binding_coverage_from_the_description(plan: &rustrain_model::Expanded) -> CheckItem {
+    const ID: &str = "l1.binding_coverage";
+    let weights = plan
+        .plan
+        .slots
+        .iter()
+        .filter(|slot| slot.kind == SlotKind::Weight)
+        .count();
+    if plan.unbound_slots.is_empty() {
+        return CheckItem::pass(
+            ID,
+            format!("every one of the {weights} weight slot(s) is hit by a binding"),
+        );
+    }
+    CheckItem::warning(
+        ID,
+        format!(
+            "{} of {weights} weight slot(s) have no binding: {}. §3.5's first mandate is not met by \
+             the description itself; a run with `--checkpoint` reports this as a failure \
+             (`l2.binding_coverage`), and a run without one sees it here",
+            plan.unbound_slots.len(),
+            rustrain_model::summarize(&plan.unbound_slots)
+        ),
+    )
+}
+
+/// C2's L1 sub-checks that the `--model` path cannot run today, one `skip` each.
+///
+/// C2 lists seven things L1 covers. `l1.structure` covers what `load` + `expand` +
+/// `check_structure` can answer and `l1.implementation_availability` covers operator resolution;
+/// **everything else needs `Plan::compile`**, which needs a mesh (D3) and an implementation to ask
+/// for shapes. Reporting them as one `pass` would claim seven checks while running two, so each
+/// one is its own item, with what is missing and which delivery supplies it.
+fn compile_dependent_l1_checks(expanded: bool) -> Vec<CheckItem> {
+    // `(id, why this sub-check needs a compiled plan)`, in C2's order.
+    const SUBCHECKS: [(&str, &str); 6] = [
+        (
+            "l1.compile",
+            "`Plan::compile` needs a mesh to propagate into (D3) and a resolved implementation for \
+             every node, and `--model` expands without compiling",
+        ),
+        (
+            "l1.operator_shapes",
+            "operators are only asked for their shapes by the compiler's shape-inference pass, \
+             which runs after resolution (D4/D5: five primitives of this description have no \
+             implementation on this host)",
+        ),
+        (
+            "l1.layout_propagation",
+            "sharding is propagated by a compile pass, and the global plan stays `Replicate` until \
+             `instantiate` sees a mesh (D3)",
+        ),
+        (
+            "l1.partial_fulfillment",
+            "the collectives that fulfil a `Partial` are the compile pass's output (D3)",
+        ),
+        (
+            "l1.collective_axes",
+            "collectives are placed and bound to their axes by the compile pass (D3)",
+        ),
+        (
+            "l1.slot_allocation",
+            "allocation and alias analysis live in the plan's memory pass, which `Plan::compile` \
+             runs (D4)",
+        ),
+    ];
+    SUBCHECKS
+        .iter()
+        .map(|(id, why)| {
+            let reason = if expanded {
+                format!(
+                    "not evaluated: {why}. `l1.structure` covers expansion and `check_structure` \
+                     only and does not stand in for this sub-check, which becomes a real check \
+                     with D3/D4"
+                )
+            } else {
+                format!(
+                    "not evaluated: the description did not expand into a plan, and `{id}` needs a \
+                     compiled one (D3/D4)"
+                )
+            };
+            CheckItem::skip(id, reason)
+        })
+        .collect()
 }
 
 /// Why one node's operator did not resolve, as the single fact a 1000-node report can carry. The
@@ -1118,9 +1233,41 @@ fn l2_checks(
     let plan = &expanded.plan;
 
     // ---- pairing ----
+    //
+    // One checkpoint tensor instance → one slot, by capture substitution (C5 forbids zipping
+    // `ResolvedBinding::slots` against source order). `covered` is the number of weight slots the
+    // bindings declare; a pairing that does not come out one-to-one is not a pairing, and the
+    // counts below would be a Cartesian product dressed up as a reconciliation.
     let mut pairs: Vec<Pair> = Vec::new();
     let mut unpaired: Vec<String> = Vec::new();
     let mut missing_sources: Vec<String> = Vec::new();
+    let mut shared_tensors: Vec<String> = Vec::new();
+    let covered: usize = expanded
+        .bindings
+        .iter()
+        .map(|binding| binding.slots.len())
+        .sum();
+
+    // Distinct patterns cannot overlap today (`**` belongs to `ignore`), but nothing stops two
+    // *different* sources from matching the same tensor, which would feed it to two slots.
+    let mut shared: BTreeSet<&String> = BTreeSet::new();
+    for name in meta.tensors.keys() {
+        let sources: Vec<&str> = expanded
+            .bindings
+            .iter()
+            .filter(|binding| rustrain_model::matches(&binding.source, name))
+            .map(|binding| binding.source.as_str())
+            .collect();
+        if sources.len() > 1 {
+            shared.insert(name);
+            shared_tensors.push(format!(
+                "checkpoint tensor `{name}` is claimed by {} bindings: {}",
+                sources.len(),
+                sources.join(", ")
+            ));
+        }
+    }
+
     for (index, binding) in expanded.bindings.iter().enumerate() {
         let instances: Vec<(&String, Vec<String>)> = meta
             .tensors
@@ -1136,6 +1283,11 @@ fn l2_checks(
         }
         let patterns = target_patterns(binding);
         for (name, captures) in instances {
+            // A tensor two bindings claim is reported once, as itself; pairing it twice is what
+            // produced the "4 pairing(s)" that contradicted `counts.weights = 2`.
+            if shared.contains(name) {
+                continue;
+            }
             for (segment, pattern) in patterns.iter().enumerate() {
                 let Some(slot) = rustrain_model::apply_captures(pattern, &captures) else {
                     unpaired.push(format!(
@@ -1165,29 +1317,34 @@ fn l2_checks(
         }
     }
 
+    // The pairing is only a reconciliation when it is one-to-one. A short count means a source
+    // that matches no tensor or a capture that fills no target; a long one is the Cartesian
+    // product. Either way the shape and dtype checks below have nothing trustworthy to compare.
+    let pairing_is_a_bijection = shared_tensors.is_empty() && pairs.len() == covered;
+
     // ---- l2.binding_coverage: every weight slot has a binding, every source a tensor ----
     let mut coverage_details: Vec<String> = Vec::new();
     let mut coverage_reason: Vec<String> = Vec::new();
     if !expanded.unbound_slots.is_empty() {
         coverage_details.push(format!(
             "weight slot(s) no binding hits: {}",
-            summarize(&expanded.unbound_slots)
+            rustrain_model::summarize(&expanded.unbound_slots)
         ));
         coverage_reason.push(format!(
             "{} weight slot(s) have no binding: {}",
             expanded.unbound_slots.len(),
-            summarize(&expanded.unbound_slots)
+            rustrain_model::summarize(&expanded.unbound_slots)
         ));
     }
     if !missing_sources.is_empty() {
         coverage_details.push(format!(
             "binding source(s) no checkpoint tensor matches: {}",
-            summarize(&missing_sources)
+            rustrain_model::summarize(&missing_sources)
         ));
         coverage_reason.push(format!(
             "{} binding source(s) match no checkpoint tensor: {}",
             missing_sources.len(),
-            summarize(&missing_sources)
+            rustrain_model::summarize(&missing_sources)
         ));
     }
     if !unpaired.is_empty() {
@@ -1197,12 +1354,28 @@ fn l2_checks(
             unpaired.len()
         ));
     }
+    if !shared_tensors.is_empty() {
+        coverage_details.extend(shared_tensors.iter().cloned());
+        coverage_reason.push(format!(
+            "{} checkpoint tensor(s) are claimed by more than one binding, so one tensor would be \
+             loaded into two slots (§3.7 #4)",
+            shared_tensors.len()
+        ));
+    }
+    if shared_tensors.is_empty() && pairs.len() != covered {
+        coverage_reason.push(format!(
+            "the checkpoint↔slot pairing is not one-to-one: {} pairing(s) for the {covered} weight \
+             slot(s) the bindings cover",
+            pairs.len()
+        ));
+    }
     let coverage = if coverage_reason.is_empty() {
         CheckItem::pass(
             "l2.binding_coverage",
             format!(
-                "every one of the {} weight slot(s) is hit by a binding, and every one of the {} \
-                 binding source(s) matches a tensor of {}",
+                "every one of the {} weight slot(s) is hit by exactly one binding, every one of the \
+                 {} binding source(s) matches a tensor of {}, and the resulting pairing is \
+                 one-to-one ({covered} pairing(s))",
                 expanded
                     .plan
                     .slots
@@ -1217,8 +1390,8 @@ fn l2_checks(
         CheckItem::fail(
             "l2.binding_coverage",
             format!(
-                "{}; §3.5: every weight slot must be hit by exactly one binding, and every \
-                 binding's source must name checkpoint tensors",
+                "{}; §3.5: every weight slot must be hit by exactly one binding, every binding's \
+                 source must name checkpoint tensors, and one tensor must feed one slot",
                 coverage_reason.join("; ")
             ),
             coverage_details,
@@ -1228,23 +1401,31 @@ fn l2_checks(
     // ---- l2.tensor_consumption: consumed by a binding, or explicitly ignored ----
     let mut unconsumed: Vec<String> = Vec::new();
     let mut ignored = 0usize;
+    // C6: an `ignore` pattern that matches nothing is a warning. Per pattern, because the pattern
+    // that matched nothing is the fact worth reporting.
+    let mut ignore_hits = vec![0usize; desc.ignore.len()];
     for name in meta.tensors.keys() {
-        if expanded
+        let consumed = expanded
             .bindings
             .iter()
-            .any(|binding| rustrain_model::matches(&binding.source, name))
-        {
+            .any(|binding| rustrain_model::matches(&binding.source, name));
+        // Every pattern is asked about every tensor of the checkpoint: C6's warning is about a
+        // pattern that matches *nothing*, and two `ignore` entries may well overlap on one tensor.
+        let mut matched_by_ignore = false;
+        for (index, pattern) in desc.ignore.iter().enumerate() {
+            if rustrain_model::matches(pattern, name) {
+                ignore_hits[index] += 1;
+                matched_by_ignore = true;
+            }
+        }
+        if consumed {
             continue;
         }
-        if desc
-            .ignore
-            .iter()
-            .any(|pattern| rustrain_model::matches(pattern, name))
-        {
+        if matched_by_ignore {
             ignored += 1;
-            continue;
+        } else {
+            unconsumed.push(name.clone());
         }
-        unconsumed.push(name.clone());
     }
     let consumption = if unconsumed.is_empty() {
         CheckItem::pass(
@@ -1265,16 +1446,51 @@ fn l2_checks(
                  `ignore` entry: {}",
                 unconsumed.len(),
                 meta.tensors.len(),
-                summarize(&unconsumed)
+                rustrain_model::summarize(&unconsumed)
             ),
             unconsumed.clone(),
         )
     };
 
+    // C6: an `ignore` pattern that matches 0 tensors is a `warning`, not a `fail` — the same
+    // description may be checked against another checkpoint, but a pattern that matches nothing is
+    // usually a typo that only a report can show.
+    let mut ignore_checks: Vec<CheckItem> = Vec::new();
+    if desc.ignore.is_empty() {
+        ignore_checks.push(CheckItem::skip(
+            "l2.ignore_coverage",
+            "not evaluated: the description declares no `ignore` pattern, so there is none to match \
+             against this checkpoint",
+        ));
+    } else {
+        for (pattern, hits) in desc.ignore.iter().zip(&ignore_hits) {
+            if *hits == 0 {
+                ignore_checks.push(CheckItem::warning(
+                    "l2.ignore_coverage",
+                    format!(
+                        "`ignore` pattern `{pattern}` matches none of the {} tensor(s) of {}; a \
+                         declared pattern that matches nothing is usually a typo",
+                        meta.tensors.len(),
+                        meta.source
+                    ),
+                ));
+            }
+        }
+        if ignore_checks.is_empty() {
+            ignore_checks.push(CheckItem::pass(
+                "l2.ignore_coverage",
+                format!(
+                    "every one of the {} `ignore` pattern(s) matches at least one tensor ({ignored} \
+                     tensor(s) ignored in total)",
+                    desc.ignore.len()
+                ),
+            ));
+        }
+    }
+
     // ---- l2.shape_reconciliation + l2.dtype_compatibility ----
     let mut shape_details: Vec<String> = Vec::new();
     let mut shape_mismatch = 0usize;
-    let mut unevaluable: Vec<String> = Vec::new();
     let mut dtype_details: Vec<String> = Vec::new();
     let mut dtype_mismatch = 0usize;
 
@@ -1287,8 +1503,18 @@ fn l2_checks(
             continue;
         };
         let slot = plan.slot(slot_id);
+        // `transform` is evaluated, not guessed: C6's two verbs are implemented here, and a
+        // transform that does not fit *this* checkpoint shape is a mismatch, never a skip.
         match transformed_shape(&tensor.shape, &binding.transform) {
-            Err(why) => unevaluable.push(format!("slot `{}`: {why}", pair.slot)),
+            Err(why) => {
+                shape_mismatch += 1;
+                shape_details.push(format!(
+                    "slot `{}` <- `{}` {}: {why}",
+                    pair.slot,
+                    pair.tensor,
+                    shape_text(&tensor.shape)
+                ));
+            }
             Ok(shape) => {
                 let expected = match &binding.split {
                     Some(split) => split_shape(&shape, split, pair.segment),
@@ -1335,7 +1561,24 @@ fn l2_checks(
         }
     }
 
-    let shape = if shape_mismatch > 0 {
+    let not_a_bijection = |id: &'static str, what: &str| {
+        CheckItem::skip(
+            id,
+            format!(
+                "not evaluated: the checkpoint↔slot pairing is not one-to-one ({} pairing(s) for \
+                 {covered} weight slot(s)), so there is no {what} to compare; see \
+                 `l2.binding_coverage`",
+                pairs.len()
+            ),
+        )
+    };
+
+    let shape = if !pairing_is_a_bijection {
+        not_a_bijection(
+            "l2.shape_reconciliation",
+            "trustworthy checkpoint shape",
+        )
+    } else if shape_mismatch > 0 {
         CheckItem::fail(
             "l2.shape_reconciliation",
             format!(
@@ -1345,14 +1588,16 @@ fn l2_checks(
             ),
             shape_details,
         )
-    } else if !unevaluable.is_empty() {
-        CheckItem::skip(
+    } else if pairs.is_empty() {
+        // Nothing was compared: an empty checkpoint, or a description with no weight slot. A
+        // `pass` here would read as "verified" when nothing was.
+        CheckItem::warning(
             "l2.shape_reconciliation",
             format!(
-                "not evaluated for {} pairing(s): this build reconciles `take` and `transpose`, \
-                 and reports any other transform verb instead of guessing its arguments: {}",
-                unevaluable.len(),
-                summarize(&unevaluable)
+                "no pairing to reconcile: the description declares {covered} weight slot(s) and \
+                 {} declares {} tensor(s), so no checkpoint shape was compared with any slot",
+                meta.source,
+                meta.tensors.len()
             ),
         )
     } else {
@@ -1366,7 +1611,9 @@ fn l2_checks(
         )
     };
 
-    let dtype = if dtype_mismatch > 0 {
+    let dtype = if !pairing_is_a_bijection {
+        not_a_bijection("l2.dtype_compatibility", "trustworthy checkpoint dtype")
+    } else if dtype_mismatch > 0 {
         CheckItem::fail(
             "l2.dtype_compatibility",
             format!(
@@ -1376,6 +1623,16 @@ fn l2_checks(
                 pairs.len()
             ),
             dtype_details,
+        )
+    } else if pairs.is_empty() {
+        CheckItem::warning(
+            "l2.dtype_compatibility",
+            format!(
+                "no pairing to compare: the description declares {covered} weight slot(s) and {} \
+                 declares {} tensor(s), so no checkpoint dtype was compared with any slot",
+                meta.source,
+                meta.tensors.len()
+            ),
         )
     } else {
         CheckItem::pass(
@@ -1388,8 +1645,12 @@ fn l2_checks(
         )
     };
 
+    let mut items = vec![coverage, consumption];
+    items.extend(ignore_checks);
+    items.push(shape);
+    items.push(dtype);
     L2Result {
-        items: vec![coverage, consumption, shape, dtype],
+        items,
         slots_unbound: expanded.unbound_slots.len(),
         tensors_unconsumed: unconsumed.len(),
         shape_mismatch,
@@ -1409,45 +1670,53 @@ fn target_patterns(binding: &rustrain_model::ResolvedBinding) -> Vec<String> {
     patterns
 }
 
-/// Apply §3.4's `transform` to a checkpoint tensor's shape.
+/// Apply C6's `transform` vocabulary to a checkpoint tensor's shape.
 ///
-/// `take` renames (identity on shapes) and `transpose(i, j)` permutes; those are the two verbs
-/// shape reconciliation needs. `slice(dim, range)` / `concat(dim)` / `split(dim, sizes)` carry
-/// arguments whose spelling the contract does not fix, so they come back as `Err` and the check
-/// reports an unevaluated pairing instead of inventing a syntax.
+/// The two verbs are the whole vocabulary and both are evaluated: `transpose(i, j)` permutes, and
+/// `slice(dim, start, len)` keeps `len` positions from `start` along `dim`. The grammar is
+/// [`rustrain_model::parse_transform`]'s — the same parser `expand` validates descriptions with —
+/// so an error here is about *this* shape (an axis out of range, or a slice that leaves the axis),
+/// never about a verb nobody implemented.
 fn transformed_shape(shape: &[i64], transform: &[String]) -> Result<Vec<i64>, String> {
+    use rustrain_model::Transform;
+
     let mut shape = shape.to_vec();
     for step in transform {
-        let (verb, args) = step
-            .split_once('(')
-            .ok_or_else(|| format!("transform `{step}` is not `<verb>(<args>)`"))?;
-        let args = args
-            .strip_suffix(')')
-            .ok_or_else(|| format!("transform `{step}` is missing its closing `)`"))?;
-        match verb {
-            "take" => {}
-            "transpose" => {
-                let dims = args
-                    .split(',')
-                    .map(|arg| arg.trim().parse::<i64>())
-                    .collect::<std::result::Result<Vec<i64>, _>>()
-                    .map_err(|_| format!("transform `{step}`: expected two integer dimensions"))?;
-                let [a, b] = dims[..] else {
-                    return Err(format!(
-                        "transform `{step}`: `transpose` takes exactly two dimensions"
-                    ));
-                };
-                let a = axis(a, shape.len())
-                    .ok_or_else(|| format!("transform `{step}`: axis {a} is out of range"))?;
-                let b = axis(b, shape.len())
-                    .ok_or_else(|| format!("transform `{step}`: axis {b} is out of range"))?;
+        let parsed = rustrain_model::parse_transform(step)?;
+        match parsed {
+            Transform::Transpose { i, j } => {
+                let a = axis(i, shape.len()).ok_or_else(|| {
+                    format!(
+                        "transform `{step}`: axis {i} is out of range for {}",
+                        shape_text(&shape)
+                    )
+                })?;
+                let b = axis(j, shape.len()).ok_or_else(|| {
+                    format!(
+                        "transform `{step}`: axis {j} is out of range for {}",
+                        shape_text(&shape)
+                    )
+                })?;
                 shape.swap(a, b);
             }
-            other => {
-                return Err(format!(
-                    "transform `{step}`: this build reconciles `take` and `transpose` only, and \
-                     `{other}` is not evaluated"
-                ));
+            Transform::Slice { dim, start, len } => {
+                let d = axis(dim, shape.len()).ok_or_else(|| {
+                    format!(
+                        "transform `{step}`: axis {dim} is out of range for {}",
+                        shape_text(&shape)
+                    )
+                })?;
+                let size = shape[d];
+                let end = start.checked_add(len).ok_or_else(|| {
+                    format!("transform `{step}`: start {start} + len {len} overflows i64")
+                })?;
+                if end > size {
+                    return Err(format!(
+                        "transform `{step}`: the slice takes [{start}, {end}) along axis {dim}, \
+                         which has {size} position(s)"
+                    ));
+                }
+                shape[d] = len;
             }
         }
     }
@@ -1468,7 +1737,17 @@ fn split_shape(
             shape_text(shape)
         ));
     };
-    let total: i64 = split.sizes.iter().sum();
+    // A size is a description literal, so its sum can leave `i64`; adding the sizes unchecked is
+    // how a wrong description used to abort the whole report (§3.6 #8: report, never panic).
+    let mut total: i64 = 0;
+    for size in &split.sizes {
+        total = total.checked_add(*size).ok_or_else(|| {
+            format!(
+                "split sizes {:?} overflow i64 when summed: {total} + {size} along dim {dim}",
+                split.sizes
+            )
+        })?;
+    }
     if total != shape[dim] {
         return Err(format!(
             "split sizes {:?} sum to {total}, but the split axis of {} is {}",
@@ -1515,22 +1794,6 @@ fn transform_text(transform: &[String]) -> String {
     } else {
         transform.join(", ")
     }
-}
-
-/// `a, b, c` for the first few names, then `… (+N more)`: a reason has to stay readable when a
-/// whole checkpoint is off.
-fn summarize(names: &[String]) -> String {
-    const SHOWN: usize = 8;
-    let mut list = names
-        .iter()
-        .take(SHOWN)
-        .map(String::as_str)
-        .collect::<Vec<_>>()
-        .join(", ");
-    if names.len() > SHOWN {
-        list.push_str(&format!(", … (+{} more)", names.len() - SHOWN));
-    }
-    list
 }
 
 // ---- C5: checkpoint metadata, both accepted shapes -------------------------
@@ -1723,30 +1986,46 @@ mod tests {
             transformed_shape(&[32, 96, 2048], &steps(&["transpose(1,2)"])).unwrap(),
             vec![32, 2048, 96]
         );
-        // `take` renames; it does not reshape.
+        // `slice(dim, start, len)` keeps `len` positions from `start`: the 128 positions of axis 1
+        // become the 96 the slot declares, and the other axes are untouched.
         assert_eq!(
-            transformed_shape(&[96], &steps(&["take(other.name)"])).unwrap(),
-            vec![96]
+            transformed_shape(&[8, 128, 32], &steps(&["slice(1, 0, 96)"])).unwrap(),
+            vec![8, 96, 32]
+        );
+        assert_eq!(
+            transformed_shape(&[8, 128, 32], &steps(&["slice(1, 32, 96)"])).unwrap(),
+            vec![8, 96, 32]
         );
         // A negative axis counts from the end.
         assert_eq!(
             transformed_shape(&[4, 8], &steps(&["transpose(0,-1)"])).unwrap(),
             vec![8, 4]
         );
+        assert_eq!(
+            transformed_shape(&[4, 8], &steps(&["slice(-1, 0, 3)"])).unwrap(),
+            vec![4, 3]
+        );
     }
 
-    /// A verb whose arguments the contract does not spell is reported, never guessed: the check
-    /// turns this into a `skip` naming the transform.
+    /// The vocabulary is C6's two verbs; anything else is an error naming the step. `take` used to
+    /// pass through as a rename, which is exactly the silent acceptance C6 removed.
     #[test]
-    fn an_unevaluable_transform_is_an_error_not_a_guess() {
-        let error = transformed_shape(&[96, 160], &steps(&["slice(1, [0, 96])"])).unwrap_err();
-        assert!(error.contains("slice(1, [0, 96])"), "{error}");
+    fn a_transform_outside_the_vocabulary_is_an_error_not_a_guess() {
+        for step in ["take(other.name)", "concat(0)", "split(1, [96, 64])", "flip(0)"] {
+            let error = transformed_shape(&[96, 160], &steps(&[step])).unwrap_err();
+            assert!(error.contains(step), "{error}");
+        }
+        // A verb whose arguments do not fit *this* shape is reported too: a slice may not leave
+        // the axis, and an axis has to exist.
+        let error = transformed_shape(&[96, 160], &steps(&["slice(1, 96, 96)"])).unwrap_err();
+        assert!(error.contains("slice(1, 96, 96)"), "{error}");
         assert!(transformed_shape(&[96, 160], &steps(&["transpose(0,9)"])).is_err());
         assert!(transformed_shape(&[96, 160], &steps(&["transpose(0)"])).is_err());
-        assert!(transformed_shape(&[96, 160], &steps(&["flip(0)"])).is_err());
+        assert!(transformed_shape(&[96, 160], &steps(&["transpose(0,1"])).is_err());
     }
 
-    /// §3.5: "`slice`/`split` 的区间必须在范围内" — the segments have to add up to the axis.
+    /// §3.5: the intervals a `slice`/`split` cuts have to stay inside the axis — the segments must
+    /// add up to it.
     #[test]
     fn a_split_must_add_up_to_the_axis_it_splits() {
         let split = rustrain_model::ResolvedSplit {
@@ -1772,6 +2051,20 @@ mod tests {
             sizes: vec![64, 64],
         };
         assert!(split_shape(&[8, 128, 32], &out_of_range, 0).is_err());
+    }
+
+    /// §3.6 #8: a wrong description is reported, never panicked on. Two sizes that each fit in an
+    /// `i64` but do not fit together used to abort the process with an arithmetic overflow.
+    #[test]
+    fn split_sizes_that_overflow_i64_are_an_error() {
+        let split = rustrain_model::ResolvedSplit {
+            dim: 0,
+            sizes: vec![i64::MAX, i64::MAX],
+        };
+        let error = split_shape(&[4, 4], &split, 0).unwrap_err();
+        assert!(error.contains("overflow"), "{error}");
+        assert!(error.contains(&i64::MAX.to_string()), "{error}");
+        assert!(error.contains("dim 0"), "{error}");
     }
 
     #[test]
