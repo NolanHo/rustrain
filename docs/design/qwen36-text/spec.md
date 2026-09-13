@@ -278,6 +278,16 @@ L1 全绿（按契约 skip 的四个项除外）；`l1.instantiate` 的 `details
 
    也就是说：**我们与 HF f32 的差，比 HF 自己 bf16 与 f32 的差还小**（logits 上小得多），而两者的
    argmax 一致、top-5 有 4 个重合。末层 `norm.y`（lm_head 的输入）std 差 0.1%、max 差 1.5%。
+9b. **逐元素对比推翻了"只是累积误差"的说法（`4c0099a` 后测的）**：双方都 dump 每层 probe 行的原值后，
+   f32-vs-f32 的逐层 **rel_L2** 是：row 0（embedding）**0.0**（逐位相同）、row 1（**只过了一层 GDN**）
+   **4.9e-2**、row 2–3 约 6.5e-2、row 4–10 5–11e-2、row 11+ 稳定在 2.4–3.7e-2。
+   也就是说：**第一层之后就差了 ~5%，这不是四十层累积出来的**，而"std 只差 1%"之所以看起来还行，是因为
+   误差与信号近似正交（5% 的 L2 误差落在 std 上只有 ~0.1%）。摘要掩盖了它，逐元素暴露了它。
+   **下一步**：在 layer 0 内部逐算子对比——把 `outputs.hidden` 写成
+   `[embed.y, layers.0.h1, layers.0.attn, layers.0.h2, layers.0.h3, layers.0.moe, layers.0.y, layers.*.y, norm.y]`
+   就能 dump 出该层的每个中间张量；HF 侧用 forward hook 抓 `input_layernorm` / mixer / `post_attention_layernorm` /
+   MoE 的返回值，然后在同一个 8-token 探针上逐元素比。谁先偏 1% 就是谁。
+
 9. **关于"<1%"这条判据的结论（需要用户裁决）**：1% 是对 **bf16 参考** 定的，而这份模型自己的
    f32↔bf16 差就有 8–15%（logits）——即 1% **低于参考自身的噪声地板**。逐层的 mean 也几乎为 0
    （|Δmean|/std ≤ 3e-3），用"相对 mean"衡量只会放大噪声。诚实的判据应该是二者之一：
