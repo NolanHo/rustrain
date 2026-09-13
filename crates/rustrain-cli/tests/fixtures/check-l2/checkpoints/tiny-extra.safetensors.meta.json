@@ -1,0 +1,9 @@
+{
+  "format": "rustrain.ckpt_meta.v1",
+  "source": "synthetic: check-l2 tiny fixture plus one tensor no binding consumes (no network)",
+  "tensors": {
+    "model.down.weight": {"dtype": "f32", "shape": [96, 160]},
+    "model.extra.weight": {"dtype": "f32", "shape": [96]},
+    "model.up.weight": {"dtype": "f32", "shape": [160, 96]}
+  }
+}

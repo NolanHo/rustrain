@@ -34,6 +34,11 @@ pub struct ModelDesc {
     pub stack: Vec<StackEntry>,
     #[serde(default)]
     pub binding: Vec<Binding>,
+    /// Checkpoint tensors this description deliberately does not consume (C5, §3.5's second
+    /// mandate). The pattern syntax is `binding.source`'s, plus `**` for any number of segments:
+    /// the vision tower is dropped by writing `"model.visual.**"`, never silently.
+    #[serde(default)]
+    pub ignore: Vec<String>,
 }
 
 /// A declared port (input or output).

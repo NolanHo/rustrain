@@ -1,6 +1,6 @@
 //! `rustrain` — the operator-first command line.
 //!
-//! Two commands, both of which answer questions the old framework could not:
+//! Three commands, each of which answers a question the old framework could not:
 //!
 //! * `ops list` — what implementations exist on this machine.
 //! * `plan explain` — what will actually run, with which implementation, at
@@ -8,17 +8,23 @@
 //!   it projects. With `--model <dir>` it instead expands a model description
 //!   into the *global* plan (topology-free, every layout replicated) and reports
 //!   which operators this machine has an implementation for.
+//! * `check` — the L1/L2 ladder of spec C2: does the description expand into a
+//!   sound global plan, does every node resolve to an implementation here, and
+//!   does a checkpoint's metadata reconcile with the description's bindings.
 //!
-//! Neither reads an environment variable, and neither needs a GPU.
+//! None of them reads an environment variable, and none needs a GPU: `check`
+//! reads safetensors *headers*, never weights, and creates no device context.
 
 use std::collections::BTreeMap;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use clap::{Args, Parser, Subcommand};
 
 use rustrain_abi::Plugin;
-use rustrain_ops::{Phase, Recipe, Registry, TargetEnv};
+use rustrain_abi::ffi::RsDtype;
+use rustrain_ops::{Phase, Recipe, Registry, ResolveError, TargetEnv};
 use rustrain_parallel::{GroupKind, ParallelConfig, ParallelLayout};
 use rustrain_plan::{Attrs, OpRef, Plan, PlanBuilder, PlanNode, Slot, SlotKind};
 
@@ -35,6 +41,8 @@ enum Command {
     Ops(OpsArgs),
     /// Inspect what a plan resolves to.
     Plan(PlanArgs),
+    /// Run the L1 (structure) and L2 (loading) checks on a model description.
+    Check(CheckArgs),
 }
 
 #[derive(Args)]
@@ -116,6 +124,7 @@ fn main() -> Result<()> {
                 None => plan_explain(recipe.as_deref(), tp, &plugins, json),
             },
         },
+        Command::Check(args) => check(args),
     }
 }
 
@@ -558,4 +567,1234 @@ fn plan_nodes_json(plan: &Plan) -> Vec<serde_json::Value> {
             })
         })
         .collect()
+}
+
+// ===========================================================================
+// `check` — the L1/L2 ladder (spec C2, C5, C6; delivery D2)
+// ===========================================================================
+
+/// The report's format identifier (C6).
+const CHECK_FORMAT: &str = "rustrain.check.v1";
+
+#[derive(Args)]
+struct CheckArgs {
+    /// Model directory (`config.json` + `model.json`).
+    #[arg(long, value_name = "DIR")]
+    model: PathBuf,
+    /// Checkpoint to reconcile against: a `*.safetensors.meta.json` snapshot (C5), or a real model
+    /// directory / `model.safetensors.index.json`, whose shard headers are read without any weight.
+    #[arg(long, value_name = "PATH")]
+    checkpoint: Option<PathBuf>,
+    /// The precision L1 resolves implementations at (C6). L2 always compares the dtype the
+    /// description declares: "check the structure at f32" and "verify bf16 weights against the
+    /// description" are two independent questions, and this flag only answers the first.
+    #[arg(long, value_name = "NAME")]
+    dtype: Option<String>,
+    /// The five axes are part of `check`'s interface (C2). Structure and loading both need no
+    /// mesh, so this unit accepts them and does not use them yet (a mesh arrives with D3/D4).
+    #[arg(long, default_value_t = 1)]
+    tp: usize,
+    #[arg(long, default_value_t = 1)]
+    cp: usize,
+    #[arg(long, default_value_t = 1)]
+    ep: usize,
+    #[arg(long, default_value_t = 1)]
+    dp: usize,
+    #[arg(long, default_value_t = 1)]
+    pp: usize,
+    /// Emit the machine-readable report (C6) instead of text.
+    #[arg(long)]
+    json: bool,
+}
+
+/// C2's verdict vocabulary, in the spelling C6 fixes.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Verdict {
+    Pass,
+    Fail,
+    /// Never affects the exit code. Nothing in this unit produces one yet — C2's first warning is
+    /// the memory budget, which needs an instantiated plan (D4) — but a report reader has to be
+    /// able to spell every verdict C2 defines.
+    #[expect(
+        dead_code,
+        reason = "C6's verdict vocabulary is complete here; the memory-budget warning arrives with D4"
+    )]
+    Warning,
+    Skip,
+}
+
+impl Verdict {
+    fn as_str(self) -> &'static str {
+        match self {
+            Verdict::Pass => "pass",
+            Verdict::Fail => "fail",
+            Verdict::Warning => "warning",
+            Verdict::Skip => "skip",
+        }
+    }
+}
+
+/// One `checks[]` entry: a stable id, a verdict, a reason that is never empty, and the per-object
+/// lines that make the reason actionable.
+struct CheckItem {
+    id: &'static str,
+    status: Verdict,
+    reason: String,
+    details: Vec<String>,
+}
+
+impl CheckItem {
+    fn new(id: &'static str, status: Verdict, reason: String, details: Vec<String>) -> Self {
+        Self {
+            id,
+            status,
+            reason,
+            details,
+        }
+    }
+
+    fn pass(id: &'static str, reason: String) -> Self {
+        Self::new(id, Verdict::Pass, reason, Vec::new())
+    }
+
+    fn fail(id: &'static str, reason: String, details: Vec<String>) -> Self {
+        Self::new(id, Verdict::Fail, reason, details)
+    }
+
+    fn skip(id: &'static str, reason: impl Into<String>) -> Self {
+        Self::new(id, Verdict::Skip, reason.into(), Vec::new())
+    }
+
+    fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "id": self.id,
+            "status": self.status.as_str(),
+            "reason": self.reason,
+            "details": self.details,
+        })
+    }
+}
+
+/// C6's eight counters.
+///
+/// `None` means "not measured": a description that never expanded has no slot counts, and writing
+/// 0 there would be a claim instead of a measurement.
+#[derive(Default)]
+struct Counts {
+    slots: Option<usize>,
+    nodes: Option<usize>,
+    weights: Option<usize>,
+    bindings: Option<usize>,
+    slots_unbound: Option<usize>,
+    tensors_unconsumed: Option<usize>,
+    shape_mismatch: Option<usize>,
+    dtype_mismatch: Option<usize>,
+}
+
+impl Counts {
+    fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "slots": self.slots,
+            "nodes": self.nodes,
+            "weights": self.weights,
+            "bindings": self.bindings,
+            "slots_unbound": self.slots_unbound,
+            "tensors_unconsumed": self.tensors_unconsumed,
+            "shape_mismatch": self.shape_mismatch,
+            "dtype_mismatch": self.dtype_mismatch,
+        })
+    }
+
+    fn line(&self) -> String {
+        let show = |value: Option<usize>| match value {
+            Some(n) => n.to_string(),
+            None => "-".to_string(),
+        };
+        format!(
+            "slots {}  nodes {}  weights {}  bindings {}  slots_unbound {}  tensors_unconsumed {}  \
+             shape_mismatch {}  dtype_mismatch {}",
+            show(self.slots),
+            show(self.nodes),
+            show(self.weights),
+            show(self.bindings),
+            show(self.slots_unbound),
+            show(self.tensors_unconsumed),
+            show(self.shape_mismatch),
+            show(self.dtype_mismatch),
+        )
+    }
+}
+
+/// C6's report.
+struct CheckReport {
+    model: String,
+    checkpoint: Option<String>,
+    dtype: String,
+    counts: Counts,
+    checks: Vec<CheckItem>,
+}
+
+impl CheckReport {
+    /// C6: the exit code is 0 **iff** no check is a `fail`; `warning` and `skip` never count.
+    fn failed(&self) -> bool {
+        self.checks.iter().any(|item| item.status == Verdict::Fail)
+    }
+
+    fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "format": CHECK_FORMAT,
+            "model": self.model,
+            "checkpoint": self.checkpoint,
+            "dtype": self.dtype,
+            "counts": self.counts.to_json(),
+            "checks": self.checks.iter().map(CheckItem::to_json).collect::<Vec<_>>(),
+        })
+    }
+
+    fn explain(&self) -> String {
+        let mut text = format!("check {}  dtype {}", self.model, self.dtype);
+        if let Some(checkpoint) = &self.checkpoint {
+            text.push_str(&format!("  checkpoint {checkpoint}"));
+        }
+        text.push('\n');
+        text.push_str(&format!("  counts  {}\n", self.counts.line()));
+        for item in &self.checks {
+            text.push_str(&format!(
+                "  {:<7} {}: {}\n",
+                item.status.as_str(),
+                item.id,
+                item.reason
+            ));
+            for detail in &item.details {
+                text.push_str(&format!("          {detail}\n"));
+            }
+        }
+        let failed = self
+            .checks
+            .iter()
+            .filter(|item| item.status == Verdict::Fail)
+            .count();
+        if failed == 0 {
+            text.push_str("  no fail: exit code 0\n");
+        } else {
+            text.push_str(&format!("  {failed} fail(s): exit code 1\n"));
+        }
+        text
+    }
+}
+
+/// One tensor as a checkpoint declares it: dtype plus shape. No weights, no device (C5).
+#[derive(Clone, Debug)]
+struct CkptTensor {
+    dtype: String,
+    shape: Vec<i64>,
+}
+
+/// C5's checkpoint metadata, in both accepted shapes.
+struct CheckpointMeta {
+    /// Where the metadata came from: the snapshot's `source`, or the index that was read.
+    source: String,
+    tensors: BTreeMap<String, CkptTensor>,
+}
+
+fn check(args: CheckArgs) -> Result<()> {
+    let CheckArgs {
+        model: model_dir,
+        checkpoint,
+        dtype,
+        tp,
+        cp,
+        ep,
+        dp,
+        pp,
+        json,
+    } = args;
+    if [tp, cp, ep, dp, pp].iter().any(|degree| *degree != 1) {
+        eprintln!(
+            "note: --tp/--cp/--ep/--dp/--pp are accepted (C2's interface) but this unit does not \
+             use them: L1 structure and L2 loading are mesh-free, and instantiate is D3/D4"
+        );
+    }
+
+    // C6: `--dtype` is an L1 input, never an L2 one, and the report records the precision the
+    // checks actually ran at — the flag when given, else the description's own default.
+    let override_dtype = match &dtype {
+        Some(name) => Some(RsDtype::parse(name).ok_or_else(|| {
+            anyhow!(
+                "unknown dtype `{name}`; expected one of {}",
+                RsDtype::ALL
+                    .iter()
+                    .map(|d| d.name())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        })?),
+        None => None,
+    };
+
+    let mut report = CheckReport {
+        model: model_dir.display().to_string(),
+        checkpoint: checkpoint.as_ref().map(|path| path.display().to_string()),
+        dtype: RsDtype::F32.name().to_string(),
+        counts: Counts::default(),
+        checks: Vec::new(),
+    };
+
+    // ---- L1: the description expands into one sound global plan -------------
+    //
+    // §3.5's unbound-slot mandate is deliberately *not* part of this item: with `--checkpoint` it
+    // belongs to `l2.binding_coverage`, which can name the slot and count it. Without one the
+    // mandate is simply not checked (C2 appends L2 only when a checkpoint is given).
+    let mut expanded = None;
+    match rustrain_model::Model::load(&model_dir) {
+        Err(e) => report.checks.push(CheckItem::fail(
+            "l1.structure",
+            format!("the description did not load: {e}"),
+            Vec::new(),
+        )),
+        Ok(model) => {
+            report.dtype = dtype
+                .clone()
+                .or_else(|| model.desc.dtype.clone())
+                .unwrap_or_else(|| RsDtype::F32.name().to_string());
+            match model.expand_lenient() {
+                Err(e) => report.checks.push(CheckItem::fail(
+                    "l1.structure",
+                    format!("the description did not expand: {e}"),
+                    Vec::new(),
+                )),
+                Ok(plan) => match plan.plan.check_structure() {
+                    Err(e) => report.checks.push(CheckItem::fail(
+                        "l1.structure",
+                        format!("the expanded plan is not structurally sound: {e}"),
+                        Vec::new(),
+                    )),
+                    Ok(()) => {
+                        report.checks.push(CheckItem::pass(
+                            "l1.structure",
+                            format!(
+                                "the description expands into one global plan and passes \
+                                 check_structure: {} node(s), {} slot(s), every layout replicate",
+                                plan.plan.nodes.len(),
+                                plan.plan.slots.len()
+                            ),
+                        ));
+                        report.counts.slots = Some(plan.plan.slots.len());
+                        report.counts.nodes = Some(plan.plan.nodes.len());
+                        report.counts.weights = Some(
+                            plan.plan
+                                .slots
+                                .iter()
+                                .filter(|slot| slot.kind == SlotKind::Weight)
+                                .count(),
+                        );
+                        report.counts.bindings = Some(plan.bindings.len());
+                        expanded = Some((model, plan));
+                    }
+                },
+            }
+        }
+    }
+
+    // ---- L1: implementation availability (never a `fail`, always a reason) --
+    match &expanded {
+        Some((_, plan)) => {
+            let registry = load_registry(&[])?;
+            let recipe = load_recipe(None)?;
+            report.checks.push(implementation_availability(
+                &plan.plan,
+                &registry,
+                &recipe,
+                override_dtype,
+            ));
+        }
+        None => report.checks.push(CheckItem::skip(
+            "l1.implementation_availability",
+            "not evaluated: the description did not expand into a plan to resolve operators for",
+        )),
+    }
+
+    // ---- L2: the checkpoint reconciles with the description ----------------
+    if let Some(path) = &checkpoint {
+        match load_checkpoint(path) {
+            Err(e) => {
+                report.checks.push(CheckItem::fail(
+                    "l2.binding_coverage",
+                    format!("the checkpoint metadata could not be read: {e}"),
+                    Vec::new(),
+                ));
+                for id in [
+                    "l2.tensor_consumption",
+                    "l2.shape_reconciliation",
+                    "l2.dtype_compatibility",
+                ] {
+                    report.checks.push(CheckItem::skip(
+                        id,
+                        "not evaluated: the checkpoint metadata could not be read",
+                    ));
+                }
+            }
+            Ok(meta) => match &expanded {
+                Some((model, plan)) => {
+                    let l2 = l2_checks(plan, &model.desc, &meta);
+                    report.counts.slots_unbound = Some(l2.slots_unbound);
+                    report.counts.tensors_unconsumed = Some(l2.tensors_unconsumed);
+                    report.counts.shape_mismatch = Some(l2.shape_mismatch);
+                    report.counts.dtype_mismatch = Some(l2.dtype_mismatch);
+                    report.checks.extend(l2.items);
+                }
+                None => {
+                    for id in [
+                        "l2.binding_coverage",
+                        "l2.tensor_consumption",
+                        "l2.shape_reconciliation",
+                        "l2.dtype_compatibility",
+                    ] {
+                        report.checks.push(CheckItem::skip(
+                            id,
+                            "not evaluated: the description did not expand into a plan to check \
+                             the checkpoint against",
+                        ));
+                    }
+                }
+            },
+        }
+    }
+
+    // C6: `--json` writes the whole report to stdout whether it passes or fails; a text run gets
+    // the same content in a readable form. The exit code is the verdict, nothing else.
+    let failed = report.failed();
+    if json {
+        println!("{}", serde_json::to_string_pretty(&report.to_json())?);
+        for item in report
+            .checks
+            .iter()
+            .filter(|item| item.status == Verdict::Fail)
+        {
+            eprintln!("{}: {}", item.id, item.reason);
+        }
+    } else {
+        print!("{}", report.explain());
+    }
+    if failed {
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
+/// C2's "implementation availability": can every node resolve to an implementation **at the
+/// precision being checked**.
+///
+/// A primitive this machine has no implementation for is a `skip` with its reasons spelled out —
+/// never a `fail` ("退出码只由 Fail 决定") and never a silent `pass`.
+fn implementation_availability(
+    plan: &Plan,
+    registry: &Registry,
+    recipe: &Recipe,
+    override_dtype: Option<RsDtype>,
+) -> CheckItem {
+    const ID: &str = "l1.implementation_availability";
+    let env = TargetEnv::default();
+    let mut unresolved: BTreeMap<String, (usize, String)> = BTreeMap::new();
+
+    for node in &plan.nodes {
+        let dtypes: Vec<RsDtype> = node
+            .inputs
+            .iter()
+            .map(|slot| checked_dtype(plan.slot(*slot).dtype, override_dtype))
+            .collect();
+        if let Err(e) = recipe.resolve(registry, &node.op.name, node.phase, &dtypes, &env) {
+            let entry = unresolved
+                .entry(node.op.name.clone())
+                .or_insert_with(|| (0, unresolved_reason(&e)));
+            entry.0 += 1;
+        }
+    }
+
+    if unresolved.is_empty() {
+        return CheckItem::pass(
+            ID,
+            format!(
+                "all {} node(s) resolve to an implementation on this host ({env})",
+                plan.nodes.len()
+            ),
+        );
+    }
+
+    let nodes: usize = unresolved.values().map(|(count, _)| count).sum();
+    let listed = unresolved
+        .iter()
+        .map(|(op, (count, why))| format!("{op} ×{count} ({why})"))
+        .collect::<Vec<_>>()
+        .join("; ");
+    let details = unresolved
+        .iter()
+        .map(|(op, (count, why))| format!("{op}: {count} node(s): {why}"))
+        .collect();
+    CheckItem::new(
+        ID,
+        Verdict::Skip,
+        format!(
+            "{nodes} of {} node(s) have no implementation on this host: {listed}. An operator no \
+             loaded plugin publishes is a missing primitive, not a plan defect, so C2 makes it a \
+             skip and the exit code stays 0",
+            plan.nodes.len()
+        ),
+        details,
+    )
+}
+
+/// C6's `--dtype`: it replaces the **precision** being checked, and precision is a floating-point
+/// notion — an index (`i64`) or a mask (`u8`) is not a precision, so it keeps its declared dtype.
+fn checked_dtype(declared: RsDtype, override_dtype: Option<RsDtype>) -> RsDtype {
+    match override_dtype {
+        Some(dtype) if is_float(declared) => dtype,
+        _ => declared,
+    }
+}
+
+fn is_float(dtype: RsDtype) -> bool {
+    [
+        RsDtype::F32,
+        RsDtype::F16,
+        RsDtype::BF16,
+        RsDtype::F8E4M3,
+        RsDtype::F8E5M2,
+        RsDtype::FP4E2M1,
+    ]
+    .contains(&dtype)
+}
+
+/// Why one node's operator did not resolve, as the single fact a 1000-node report can carry. The
+/// candidate table and the contract references an error prints are for a human reading one
+/// failure.
+fn unresolved_reason(error: &ResolveError) -> String {
+    match error {
+        ResolveError::UnknownOp { name, .. } => format!("no loaded plugin publishes `{name}`"),
+        other => match other.failure() {
+            Some(failure) => failure
+                .candidates
+                .iter()
+                .map(|row| format!("{}: {}", row.variant, row.reason))
+                .collect::<Vec<_>>()
+                .join("; "),
+            None => other
+                .to_string()
+                .lines()
+                .next()
+                .unwrap_or_default()
+                .to_string(),
+        },
+    }
+}
+
+// ---- L2: the four checks §3.5 mandates -------------------------------------
+
+/// One `(checkpoint tensor → slot)` pairing, worked out by capture substitution rather than by
+/// position (C5: `ResolvedBinding::slots` is grouped by target, so a zip pairs the wrong layer).
+struct Pair {
+    /// Index into `Expanded::bindings`.
+    binding: usize,
+    tensor: String,
+    slot: String,
+    /// Which segment of the binding's `split` this slot is.
+    segment: usize,
+}
+
+/// What the four L2 checks found: C6's four counters plus the items that carry the reasons.
+struct L2Result {
+    items: Vec<CheckItem>,
+    slots_unbound: usize,
+    tensors_unconsumed: usize,
+    shape_mismatch: usize,
+    dtype_mismatch: usize,
+}
+
+fn l2_checks(
+    expanded: &rustrain_model::Expanded,
+    desc: &rustrain_model::ModelDesc,
+    meta: &CheckpointMeta,
+) -> L2Result {
+    let plan = &expanded.plan;
+
+    // ---- pairing ----
+    let mut pairs: Vec<Pair> = Vec::new();
+    let mut unpaired: Vec<String> = Vec::new();
+    let mut missing_sources: Vec<String> = Vec::new();
+    for (index, binding) in expanded.bindings.iter().enumerate() {
+        let instances: Vec<(&String, Vec<String>)> = meta
+            .tensors
+            .keys()
+            .filter_map(|name| {
+                rustrain_model::match_name(&binding.source, name)
+                    .map(|captures| (name, captures))
+            })
+            .collect();
+        if instances.is_empty() {
+            missing_sources.push(binding.source.clone());
+            continue;
+        }
+        let patterns = target_patterns(binding);
+        for (name, captures) in instances {
+            for (segment, pattern) in patterns.iter().enumerate() {
+                let Some(slot) = rustrain_model::apply_captures(pattern, &captures) else {
+                    unpaired.push(format!(
+                        "binding `{}`: tensor `{name}` matches, but its captures do not fill the \
+                         target pattern `{pattern}`",
+                        binding.source
+                    ));
+                    continue;
+                };
+                if plan.slot_id(&slot).is_none()
+                    || !binding.slots.iter().any(|resolved| resolved.slot == slot)
+                {
+                    unpaired.push(format!(
+                        "binding `{}`: tensor `{name}` maps onto slot `{slot}`, which the plan does \
+                         not declare as a target of this binding",
+                        binding.source
+                    ));
+                    continue;
+                }
+                pairs.push(Pair {
+                    binding: index,
+                    tensor: name.clone(),
+                    slot,
+                    segment,
+                });
+            }
+        }
+    }
+
+    // ---- l2.binding_coverage: every weight slot has a binding, every source a tensor ----
+    let mut coverage_details: Vec<String> = Vec::new();
+    let mut coverage_reason: Vec<String> = Vec::new();
+    if !expanded.unbound_slots.is_empty() {
+        coverage_details.push(format!(
+            "weight slot(s) no binding hits: {}",
+            summarize(&expanded.unbound_slots)
+        ));
+        coverage_reason.push(format!(
+            "{} weight slot(s) have no binding: {}",
+            expanded.unbound_slots.len(),
+            summarize(&expanded.unbound_slots)
+        ));
+    }
+    if !missing_sources.is_empty() {
+        coverage_details.push(format!(
+            "binding source(s) no checkpoint tensor matches: {}",
+            summarize(&missing_sources)
+        ));
+        coverage_reason.push(format!(
+            "{} binding source(s) match no checkpoint tensor: {}",
+            missing_sources.len(),
+            summarize(&missing_sources)
+        ));
+    }
+    if !unpaired.is_empty() {
+        coverage_details.extend(unpaired.iter().cloned());
+        coverage_reason.push(format!(
+            "{} pairing(s) between a checkpoint tensor and a slot could not be resolved",
+            unpaired.len()
+        ));
+    }
+    let coverage = if coverage_reason.is_empty() {
+        CheckItem::pass(
+            "l2.binding_coverage",
+            format!(
+                "every one of the {} weight slot(s) is hit by a binding, and every one of the {} \
+                 binding source(s) matches a tensor of {}",
+                expanded
+                    .plan
+                    .slots
+                    .iter()
+                    .filter(|slot| slot.kind == SlotKind::Weight)
+                    .count(),
+                expanded.bindings.len(),
+                meta.source
+            ),
+        )
+    } else {
+        CheckItem::fail(
+            "l2.binding_coverage",
+            format!(
+                "{}; §3.5: every weight slot must be hit by exactly one binding, and every \
+                 binding's source must name checkpoint tensors",
+                coverage_reason.join("; ")
+            ),
+            coverage_details,
+        )
+    };
+
+    // ---- l2.tensor_consumption: consumed by a binding, or explicitly ignored ----
+    let mut unconsumed: Vec<String> = Vec::new();
+    let mut ignored = 0usize;
+    for name in meta.tensors.keys() {
+        if expanded
+            .bindings
+            .iter()
+            .any(|binding| rustrain_model::matches(&binding.source, name))
+        {
+            continue;
+        }
+        if desc
+            .ignore
+            .iter()
+            .any(|pattern| rustrain_model::matches(pattern, name))
+        {
+            ignored += 1;
+            continue;
+        }
+        unconsumed.push(name.clone());
+    }
+    let consumption = if unconsumed.is_empty() {
+        CheckItem::pass(
+            "l2.tensor_consumption",
+            format!(
+                "all {} tensor(s) of {} are either consumed by a binding or matched by one of the \
+                 {} explicit `ignore` pattern(s) ({ignored} ignored)",
+                meta.tensors.len(),
+                meta.source,
+                desc.ignore.len()
+            ),
+        )
+    } else {
+        CheckItem::fail(
+            "l2.tensor_consumption",
+            format!(
+                "{} of {} checkpoint tensor(s) are neither consumed by a binding nor matched by an \
+                 `ignore` entry: {}",
+                unconsumed.len(),
+                meta.tensors.len(),
+                summarize(&unconsumed)
+            ),
+            unconsumed.clone(),
+        )
+    };
+
+    // ---- l2.shape_reconciliation + l2.dtype_compatibility ----
+    let mut shape_details: Vec<String> = Vec::new();
+    let mut shape_mismatch = 0usize;
+    let mut unevaluable: Vec<String> = Vec::new();
+    let mut dtype_details: Vec<String> = Vec::new();
+    let mut dtype_mismatch = 0usize;
+
+    for pair in &pairs {
+        let binding = &expanded.bindings[pair.binding];
+        let tensor = &meta.tensors[&pair.tensor];
+        // The pairing above already proved the slot exists; this repeats the lookup without a
+        // panic path, so a report can never be a crash.
+        let Some(slot_id) = plan.slot_id(&pair.slot) else {
+            continue;
+        };
+        let slot = plan.slot(slot_id);
+        match transformed_shape(&tensor.shape, &binding.transform) {
+            Err(why) => unevaluable.push(format!("slot `{}`: {why}", pair.slot)),
+            Ok(shape) => {
+                let expected = match &binding.split {
+                    Some(split) => split_shape(&shape, split, pair.segment),
+                    None => Ok(shape),
+                };
+                match expected {
+                    Err(why) => {
+                        shape_mismatch += 1;
+                        shape_details.push(format!(
+                            "slot `{}` <- `{}` {}: {why}",
+                            pair.slot,
+                            pair.tensor,
+                            shape_text(&tensor.shape)
+                        ));
+                    }
+                    Ok(expected) if expected != slot.shape => {
+                        shape_mismatch += 1;
+                        shape_details.push(format!(
+                            "slot `{}` <- `{}` {}: the checkpoint shape maps onto {} (transform: \
+                             {}), but the slot declares {}",
+                            pair.slot,
+                            pair.tensor,
+                            shape_text(&tensor.shape),
+                            shape_text(&expected),
+                            transform_text(&binding.transform),
+                            shape_text(&slot.shape)
+                        ));
+                    }
+                    Ok(_) => {}
+                }
+            }
+        }
+        if tensor.dtype != slot.dtype.name() {
+            dtype_mismatch += 1;
+            dtype_details.push(format!(
+                "slot `{}` <- `{}` ({}): the checkpoint declares `{}`, the description declares \
+                 `{}`",
+                pair.slot,
+                pair.tensor,
+                binding.source,
+                tensor.dtype,
+                slot.dtype.name()
+            ));
+        }
+    }
+
+    let shape = if shape_mismatch > 0 {
+        CheckItem::fail(
+            "l2.shape_reconciliation",
+            format!(
+                "{shape_mismatch} of {} pairing(s) do not reconcile: `transform` + `split` cannot \
+                 map the checkpoint shape onto the shape the slot declares",
+                pairs.len()
+            ),
+            shape_details,
+        )
+    } else if !unevaluable.is_empty() {
+        CheckItem::skip(
+            "l2.shape_reconciliation",
+            format!(
+                "not evaluated for {} pairing(s): this build reconciles `take` and `transpose`, \
+                 and reports any other transform verb instead of guessing its arguments: {}",
+                unevaluable.len(),
+                summarize(&unevaluable)
+            ),
+        )
+    } else {
+        CheckItem::pass(
+            "l2.shape_reconciliation",
+            format!(
+                "all {} pairing(s) reconcile: `transform` + `split` map every checkpoint shape \
+                 onto the shape its slot declares",
+                pairs.len()
+            ),
+        )
+    };
+
+    let dtype = if dtype_mismatch > 0 {
+        CheckItem::fail(
+            "l2.dtype_compatibility",
+            format!(
+                "{dtype_mismatch} of {} pairing(s) disagree about dtype: the checkpoint's dtype is \
+                 compared with the dtype the description declares (C6: `--dtype` does not change \
+                 this comparison)",
+                pairs.len()
+            ),
+            dtype_details,
+        )
+    } else {
+        CheckItem::pass(
+            "l2.dtype_compatibility",
+            format!(
+                "all {} pairing(s) agree: every checkpoint tensor has the dtype the description \
+                 declares for its slot",
+                pairs.len()
+            ),
+        )
+    };
+
+    L2Result {
+        items: vec![coverage, consumption, shape, dtype],
+        slots_unbound: expanded.unbound_slots.len(),
+        tensors_unconsumed: unconsumed.len(),
+        shape_mismatch,
+        dtype_mismatch,
+    }
+}
+
+/// One binding's distinct target patterns, in declaration order: the index of a pattern is the
+/// segment index of `ResolvedBinding::split`.
+fn target_patterns(binding: &rustrain_model::ResolvedBinding) -> Vec<String> {
+    let mut patterns: Vec<String> = Vec::new();
+    for slot in &binding.slots {
+        if !patterns.contains(&slot.pattern) {
+            patterns.push(slot.pattern.clone());
+        }
+    }
+    patterns
+}
+
+/// Apply §3.4's `transform` to a checkpoint tensor's shape.
+///
+/// `take` renames (identity on shapes) and `transpose(i, j)` permutes; those are the two verbs
+/// shape reconciliation needs. `slice(dim, range)` / `concat(dim)` / `split(dim, sizes)` carry
+/// arguments whose spelling the contract does not fix, so they come back as `Err` and the check
+/// reports an unevaluated pairing instead of inventing a syntax.
+fn transformed_shape(shape: &[i64], transform: &[String]) -> Result<Vec<i64>, String> {
+    let mut shape = shape.to_vec();
+    for step in transform {
+        let (verb, args) = step
+            .split_once('(')
+            .ok_or_else(|| format!("transform `{step}` is not `<verb>(<args>)`"))?;
+        let args = args
+            .strip_suffix(')')
+            .ok_or_else(|| format!("transform `{step}` is missing its closing `)`"))?;
+        match verb {
+            "take" => {}
+            "transpose" => {
+                let dims = args
+                    .split(',')
+                    .map(|arg| arg.trim().parse::<i64>())
+                    .collect::<std::result::Result<Vec<i64>, _>>()
+                    .map_err(|_| format!("transform `{step}`: expected two integer dimensions"))?;
+                let [a, b] = dims[..] else {
+                    return Err(format!(
+                        "transform `{step}`: `transpose` takes exactly two dimensions"
+                    ));
+                };
+                let a = axis(a, shape.len())
+                    .ok_or_else(|| format!("transform `{step}`: axis {a} is out of range"))?;
+                let b = axis(b, shape.len())
+                    .ok_or_else(|| format!("transform `{step}`: axis {b} is out of range"))?;
+                shape.swap(a, b);
+            }
+            other => {
+                return Err(format!(
+                    "transform `{step}`: this build reconciles `take` and `transpose` only, and \
+                     `{other}` is not evaluated"
+                ));
+            }
+        }
+    }
+    Ok(shape)
+}
+
+/// One segment of a fused storage (§3.4's `split`): the segment's size replaces the split axis, and
+/// the sizes must add up to the axis they split (§3.5: the intervals must be in range).
+fn split_shape(
+    shape: &[i64],
+    split: &rustrain_model::ResolvedSplit,
+    segment: usize,
+) -> Result<Vec<i64>, String> {
+    let Some(dim) = axis(split.dim, shape.len()) else {
+        return Err(format!(
+            "split dim {} is out of range for the {} the transform produced",
+            split.dim,
+            shape_text(shape)
+        ));
+    };
+    let total: i64 = split.sizes.iter().sum();
+    if total != shape[dim] {
+        return Err(format!(
+            "split sizes {:?} sum to {total}, but the split axis of {} is {}",
+            split.sizes,
+            shape_text(shape),
+            shape[dim]
+        ));
+    }
+    let Some(size) = split.sizes.get(segment) else {
+        return Err(format!(
+            "the split declares {} segment(s), so segment {segment} does not exist",
+            split.sizes.len()
+        ));
+    };
+    let mut out = shape.to_vec();
+    out[dim] = *size;
+    Ok(out)
+}
+
+/// A dimension index; negative counts from the end, as `transpose(i, j)` is a general permutation.
+fn axis(dim: i64, rank: usize) -> Option<usize> {
+    if dim < 0 {
+        let from_end = dim + rank as i64;
+        (from_end >= 0).then_some(from_end as usize)
+    } else {
+        ((dim as usize) < rank).then_some(dim as usize)
+    }
+}
+
+fn shape_text(shape: &[i64]) -> String {
+    format!(
+        "[{}]",
+        shape
+            .iter()
+            .map(i64::to_string)
+            .collect::<Vec<_>>()
+            .join(", ")
+    )
+}
+
+fn transform_text(transform: &[String]) -> String {
+    if transform.is_empty() {
+        "none".to_string()
+    } else {
+        transform.join(", ")
+    }
+}
+
+/// `a, b, c` for the first few names, then `… (+N more)`: a reason has to stay readable when a
+/// whole checkpoint is off.
+fn summarize(names: &[String]) -> String {
+    const SHOWN: usize = 8;
+    let mut list = names
+        .iter()
+        .take(SHOWN)
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .join(", ");
+    if names.len() > SHOWN {
+        list.push_str(&format!(", … (+{} more)", names.len() - SHOWN));
+    }
+    list
+}
+
+// ---- C5: checkpoint metadata, both accepted shapes -------------------------
+
+/// Read C5's checkpoint metadata from one of its two forms: a `*.safetensors.meta.json` snapshot,
+/// or a real model directory (or its index file), whose shard **headers** are read and no weight
+/// is ever touched.
+fn load_checkpoint(path: &Path) -> Result<CheckpointMeta> {
+    if path.is_dir() {
+        let index = path.join("model.safetensors.index.json");
+        if !index.is_file() {
+            bail!(
+                "{} is a directory without model.safetensors.index.json; C5 accepts a real model \
+                 directory or a `*.safetensors.meta.json` snapshot",
+                path.display()
+            );
+        }
+        return load_shard_index(&index);
+    }
+    if !path.is_file() {
+        bail!("no such file or directory: {}", path.display());
+    }
+    if path.file_name().is_some_and(|name| name == "model.safetensors.index.json") {
+        return load_shard_index(path);
+    }
+    load_snapshot(path)
+}
+
+/// C5's offline, reproducible form: `{"format": "rustrain.ckpt_meta.v1", "source": …, "tensors":
+/// {name: {dtype, shape}}}`.
+fn load_snapshot(path: &Path) -> Result<CheckpointMeta> {
+    let text = std::fs::read_to_string(path)
+        .with_context(|| format!("reading the checkpoint snapshot {}", path.display()))?;
+    let doc: serde_json::Value = serde_json::from_str(&text)
+        .with_context(|| format!("parsing the checkpoint snapshot {}", path.display()))?;
+    let format = doc
+        .get("format")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    if format != "rustrain.ckpt_meta.v1" {
+        bail!(
+            "{} is not a checkpoint metadata snapshot: `format` is `{format}`, expected \
+             `rustrain.ckpt_meta.v1`",
+            path.display()
+        );
+    }
+    let source = doc
+        .get("source")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let tensors = doc
+        .get("tensors")
+        .and_then(serde_json::Value::as_object)
+        .ok_or_else(|| anyhow!("{} has no `tensors` object", path.display()))?;
+    let mut out = BTreeMap::new();
+    for (name, entry) in tensors {
+        out.insert(name.clone(), tensor_of(entry, name)?);
+    }
+    Ok(CheckpointMeta {
+        source: if source.is_empty() {
+            path.display().to_string()
+        } else {
+            source
+        },
+        tensors: out,
+    })
+}
+
+/// The real form: an index maps every tensor to a shard, and each shard's header is read with two
+/// `read_exact`s — 8 bytes of length, then the JSON table. No weight byte is ever read.
+fn load_shard_index(index: &Path) -> Result<CheckpointMeta> {
+    let text = std::fs::read_to_string(index)
+        .with_context(|| format!("reading the safetensors index {}", index.display()))?;
+    let doc: serde_json::Value = serde_json::from_str(&text)
+        .with_context(|| format!("parsing the safetensors index {}", index.display()))?;
+    let weight_map = doc
+        .get("weight_map")
+        .and_then(serde_json::Value::as_object)
+        .ok_or_else(|| anyhow!("{} has no `weight_map` object", index.display()))?;
+    let dir = index.parent().unwrap_or_else(|| Path::new("."));
+
+    // Group by shard: one header read per shard, not one per tensor.
+    let mut by_shard: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for (tensor, shard) in weight_map {
+        let shard = shard
+            .as_str()
+            .ok_or_else(|| anyhow!("{}: `{tensor}` maps to a non-string shard", index.display()))?;
+        by_shard
+            .entry(shard.to_string())
+            .or_default()
+            .push(tensor.clone());
+    }
+
+    let mut tensors = BTreeMap::new();
+    for (shard, names) in by_shard {
+        let path = dir.join(&shard);
+        let header = read_safetensors_header(&path)?;
+        for name in names {
+            let entry = header.get(&name).ok_or_else(|| {
+                anyhow!(
+                    "{}: the index lists `{name}`, but the shard header does not",
+                    path.display()
+                )
+            })?;
+            tensors.insert(name, entry.clone());
+        }
+    }
+    Ok(CheckpointMeta {
+        source: index.display().to_string(),
+        tensors,
+    })
+}
+
+/// One `.safetensors` shard's tensor table, **header only**.
+fn read_safetensors_header(path: &Path) -> Result<BTreeMap<String, CkptTensor>> {
+    let mut file = std::fs::File::open(path)
+        .with_context(|| format!("opening the safetensors shard {}", path.display()))?;
+    let mut length = [0u8; 8];
+    file.read_exact(&mut length)
+        .with_context(|| format!("reading the header length of {}", path.display()))?;
+    let length = u64::from_le_bytes(length);
+    // A header that claims a gigabyte is a corrupt or non-safetensors file, not a big model.
+    if length > 1 << 30 {
+        bail!(
+            "{}: the safetensors header claims {length} bytes; refusing to read it",
+            path.display()
+        );
+    }
+    let mut header = vec![0u8; length as usize];
+    file.read_exact(&mut header)
+        .with_context(|| format!("reading the header of {}", path.display()))?;
+    let doc: serde_json::Value = serde_json::from_slice(&header)
+        .with_context(|| format!("parsing the header of {}", path.display()))?;
+    let entries = doc
+        .as_object()
+        .ok_or_else(|| anyhow!("{}: the safetensors header is not an object", path.display()))?;
+    let mut out = BTreeMap::new();
+    for (name, entry) in entries {
+        if name == "__metadata__" {
+            continue;
+        }
+        out.insert(name.clone(), tensor_of(entry, name)?);
+    }
+    Ok(out)
+}
+
+/// One `{"dtype": …, "shape": […]}` entry, from either metadata form.
+fn tensor_of(entry: &serde_json::Value, name: &str) -> Result<CkptTensor> {
+    let dtype = entry
+        .get("dtype")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| anyhow!("tensor `{name}` has no string `dtype`"))?;
+    let shape = entry
+        .get("shape")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| anyhow!("tensor `{name}` has no `shape` array"))?;
+    let shape = shape
+        .iter()
+        .map(|dim| {
+            dim.as_i64()
+                .ok_or_else(|| anyhow!("tensor `{name}`: a shape entry is not an integer"))
+        })
+        .collect::<Result<Vec<i64>>>()?;
+    Ok(CkptTensor {
+        // safetensors spells dtypes in upper case (`BF16`, `F8_E4M3`); §3.6 #5's vocabulary is
+        // `RsDtype::name()`'s lower-case spelling.
+        dtype: dtype.to_ascii_lowercase().replace('_', ""),
+        shape,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn steps(transform: &[&str]) -> Vec<String> {
+        transform.iter().map(|step| step.to_string()).collect()
+    }
+
+    /// §3.4's direction convention: the checkpoint is HF's `[out, in]`, the slot is `[in, out]`.
+    #[test]
+    fn transform_maps_the_checkpoint_shape_onto_the_slot_shape() {
+        assert_eq!(
+            transformed_shape(&[160, 96], &steps(&["transpose(0,1)"])).unwrap(),
+            vec![96, 160]
+        );
+        // The three-channel expert weight: [E, out, in] -> [E, in, out].
+        assert_eq!(
+            transformed_shape(&[32, 96, 2048], &steps(&["transpose(1,2)"])).unwrap(),
+            vec![32, 2048, 96]
+        );
+        // `take` renames; it does not reshape.
+        assert_eq!(
+            transformed_shape(&[96], &steps(&["take(other.name)"])).unwrap(),
+            vec![96]
+        );
+        // A negative axis counts from the end.
+        assert_eq!(
+            transformed_shape(&[4, 8], &steps(&["transpose(0,-1)"])).unwrap(),
+            vec![8, 4]
+        );
+    }
+
+    /// A verb whose arguments the contract does not spell is reported, never guessed: the check
+    /// turns this into a `skip` naming the transform.
+    #[test]
+    fn an_unevaluable_transform_is_an_error_not_a_guess() {
+        let error = transformed_shape(&[96, 160], &steps(&["slice(1, [0, 96])"])).unwrap_err();
+        assert!(error.contains("slice(1, [0, 96])"), "{error}");
+        assert!(transformed_shape(&[96, 160], &steps(&["transpose(0,9)"])).is_err());
+        assert!(transformed_shape(&[96, 160], &steps(&["transpose(0)"])).is_err());
+        assert!(transformed_shape(&[96, 160], &steps(&["flip(0)"])).is_err());
+    }
+
+    /// §3.5: "`slice`/`split` 的区间必须在范围内" — the segments have to add up to the axis.
+    #[test]
+    fn a_split_must_add_up_to_the_axis_it_splits() {
+        let split = rustrain_model::ResolvedSplit {
+            dim: 1,
+            sizes: vec![64, 64],
+        };
+        assert_eq!(
+            split_shape(&[8, 128, 32], &split, 0).unwrap(),
+            vec![8, 64, 32]
+        );
+        assert_eq!(
+            split_shape(&[8, 128, 32], &split, 1).unwrap(),
+            vec![8, 64, 32]
+        );
+        let short = rustrain_model::ResolvedSplit {
+            dim: 1,
+            sizes: vec![64, 32],
+        };
+        let error = split_shape(&[8, 128, 32], &short, 0).unwrap_err();
+        assert!(error.contains("sum to 96"), "{error}");
+        let out_of_range = rustrain_model::ResolvedSplit {
+            dim: 3,
+            sizes: vec![64, 64],
+        };
+        assert!(split_shape(&[8, 128, 32], &out_of_range, 0).is_err());
+    }
+
+    #[test]
+    fn axis_counts_from_the_end_for_negative_dimensions() {
+        assert_eq!(axis(-1, 3), Some(2));
+        assert_eq!(axis(-4, 3), None);
+        assert_eq!(axis(3, 3), None);
+        assert_eq!(axis(0, 0), None);
+    }
+
+    /// C6's verdict vocabulary, and C2's exit rule: only `fail` stops the run.
+    #[test]
+    fn only_a_fail_makes_the_report_fail() {
+        let item = |status: Verdict| CheckItem::new("l1.structure", status, "reason".to_string(), Vec::new());
+        let report = |status: Verdict| CheckReport {
+            model: "m".to_string(),
+            checkpoint: None,
+            dtype: "f32".to_string(),
+            counts: Counts::default(),
+            checks: vec![item(status)],
+        };
+        assert!(report(Verdict::Fail).failed());
+        assert!(!report(Verdict::Pass).failed());
+        assert!(!report(Verdict::Skip).failed());
+    }
 }

@@ -22,6 +22,7 @@
 mod desc;
 mod expand;
 mod params;
+mod pattern;
 
 use std::path::{Path, PathBuf};
 
@@ -29,7 +30,10 @@ pub use desc::{
     AttrLiteral, Binding, CONFIG_FILE, DESC_FILE, ExprSpec, FORMAT, FromSpec, ModelDesc, NodeDecl,
     ParamSpec, PortSpec, Select, SlotDecl, Split, StackEntry, Target, Template,
 };
-pub use expand::{Expanded, ResolvedBinding, ResolvedBindingSlot, ResolvedSplit, expand};
+pub use expand::{
+    Expanded, ResolvedBinding, ResolvedBindingSlot, ResolvedSplit, expand, expand_lenient,
+};
+pub use pattern::{apply_captures, match_name, matches};
 
 /// Everything that can fail in the description layer.
 ///
@@ -81,9 +85,16 @@ impl Model {
         })
     }
 
-    /// Expand into the global plan.
+    /// Expand into the global plan, applying every §3.5 mandate `expand` can check.
     pub fn expand(&self) -> Result<Expanded, ModelError> {
         expand::expand(&self.desc, &self.config)
+    }
+
+    /// [`Model::expand`] without §3.5's unbound-slot mandate: the plan comes back even when a
+    /// weight slot has no binding, and [`Expanded::unbound_slots`] names it. A loading check needs
+    /// exactly that — reporting the unbound slot is its job, not the expander's.
+    pub fn expand_lenient(&self) -> Result<Expanded, ModelError> {
+        expand::expand_lenient(&self.desc, &self.config)
     }
 }
 

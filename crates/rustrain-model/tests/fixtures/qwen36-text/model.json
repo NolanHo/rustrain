@@ -2409,5 +2409,8 @@
         "transpose(0,1)"
       ]
     }
+  ],
+  "ignore": [
+    "model.visual.**"
   ]
 }

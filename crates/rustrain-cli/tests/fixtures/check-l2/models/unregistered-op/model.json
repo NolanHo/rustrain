@@ -1,0 +1,32 @@
+{
+  "format": "rustrain.model.v1",
+  "name": "check-l2-unregistered-op",
+  "dtype": "f32",
+  "inputs": {
+    "hidden_in": { "shape": ["seq", "hidden"], "kind": "input" }
+  },
+  "params": {
+    "seq": { "from": "text_config.max_position_embeddings", "default": 8 },
+    "hidden": { "from": "text_config.hidden_size" }
+  },
+  "templates": {
+    "block": {
+      "inputs": { "x": { "shape": ["seq", "hidden"], "kind": "activation" } },
+      "outputs": { "y": { "shape": ["seq", "hidden"], "kind": "activation" } },
+      "slots": [
+        { "name": "w", "kind": "weight", "shape": ["hidden", "hidden"] },
+        { "name": "h", "kind": "activation", "shape": ["seq", "hidden"] }
+      ],
+      "nodes": [
+        { "op": "nonexistent_op", "in": ["x", "w"], "out": ["h"] },
+        { "op": "elementwise_unary", "in": ["h"], "out": ["y"], "attrs": { "kind": "silu" } }
+      ]
+    }
+  },
+  "stack": [
+    { "template": "block", "prefix": "block", "inputs": { "x": "hidden_in" } }
+  ],
+  "binding": [
+    { "slot": "block.w", "source": "model.block.weight", "transform": ["transpose(0,1)"] }
+  ]
+}

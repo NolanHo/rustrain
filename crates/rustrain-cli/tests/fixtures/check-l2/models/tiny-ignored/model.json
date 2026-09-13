@@ -1,0 +1,38 @@
+{
+  "format": "rustrain.model.v1",
+  "name": "check-l2-tiny-ignored",
+  "dtype": "f32",
+  "inputs": {
+    "hidden_in": { "shape": ["seq", "hidden"], "kind": "input" }
+  },
+  "params": {
+    "seq": { "from": "text_config.max_position_embeddings", "default": 8 },
+    "hidden": { "from": "text_config.hidden_size" },
+    "inter": { "from": "text_config.intermediate_size" }
+  },
+  "templates": {
+    "mlp": {
+      "inputs": { "x": { "shape": ["seq", "hidden"], "kind": "activation" } },
+      "outputs": { "y": { "shape": ["seq", "hidden"], "kind": "activation" } },
+      "slots": [
+        { "name": "up", "kind": "weight", "shape": ["hidden", "inter"] },
+        { "name": "down", "kind": "weight", "shape": ["inter", "hidden"] },
+        { "name": "h", "kind": "activation", "shape": ["seq", "inter"] }
+      ],
+      "nodes": [
+        { "op": "linear", "in": ["x", "up"], "out": ["h"] },
+        { "op": "linear", "in": ["h", "down"], "out": ["y"] }
+      ]
+    }
+  },
+  "stack": [
+    { "template": "mlp", "prefix": "mlp", "inputs": { "x": "hidden_in" } }
+  ],
+  "binding": [
+    { "slot": "mlp.up", "source": "model.up.weight", "transform": ["transpose(0,1)"] },
+    { "slot": "mlp.down", "source": "model.down.weight", "transform": ["transpose(0,1)"] }
+  ],
+  "ignore": [
+    "model.extra.weight"
+  ]
+}

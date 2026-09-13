@@ -1,0 +1,7 @@
+{
+  "format": "rustrain.ckpt_meta.v1",
+  "source": "synthetic: check-l2 unregistered-op fixture (1 tensor, f32, no weights, no network)",
+  "tensors": {
+    "model.block.weight": {"dtype": "f32", "shape": [96, 96]}
+  }
+}

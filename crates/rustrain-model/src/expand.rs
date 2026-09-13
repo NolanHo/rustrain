@@ -30,6 +30,10 @@ pub struct Expanded {
     /// The slots every `binding` hit (input of the L2 load check,
     /// `docs/design/model-description.md` §3.5).
     pub bindings: Vec<ResolvedBinding>,
+    /// Weight slots no `binding` hit, in plan order (§3.5's first mandate). [`expand`] rejects a
+    /// non-empty list; [`expand_lenient`] hands it back instead, because naming the unbound slot is
+    /// precisely what a loading check has to report.
+    pub unbound_slots: Vec<String>,
 }
 
 /// One `binding` after resolution.
@@ -56,12 +60,35 @@ pub struct ResolvedSplit {
 #[derive(Debug)]
 pub struct ResolvedBindingSlot {
     pub slot: String,
+    /// The `slot` / `targets[].slot` pattern this slot was resolved from. It is what pairs a
+    /// concrete checkpoint tensor with a concrete slot: substitute the tensor's captures and the
+    /// result is the slot name (§3.4's shared capture). Without it a loader could only zip source
+    /// instances against `slots` by position, which C5 forbids.
+    pub pattern: String,
     /// slot dimension (decimal string) → symbolic axis names.
     pub axes: BTreeMap<String, Vec<String>>,
 }
 
-/// Description → global plan.
+/// Description → global plan, applying every §3.5 mandate `expand` can check.
 pub fn expand(desc: &ModelDesc, config: &serde_json::Value) -> Result<Expanded, ModelError> {
+    let expanded = expand_lenient(desc, config)?;
+    if !expanded.unbound_slots.is_empty() {
+        return Err(ModelError::Invalid(format!(
+            "{} weight slot(s) are not bound to any checkpoint tensor: {}",
+            expanded.unbound_slots.len(),
+            summarize(&expanded.unbound_slots)
+        )));
+    }
+    Ok(expanded)
+}
+
+/// [`expand`] without §3.5's unbound-slot mandate: a description whose weight slots are not all
+/// bound still expands, and [`Expanded::unbound_slots`] says which are missing.
+///
+/// The mandate itself is unchanged — it lives in [`expand`], and in the L2 gate that reads
+/// `unbound_slots` (`rustrain check`'s `l2.binding_coverage`). §3.7 #4 keeps both out of the
+/// pattern layer.
+pub fn expand_lenient(desc: &ModelDesc, config: &serde_json::Value) -> Result<Expanded, ModelError> {
     if desc.format != FORMAT {
         return Err(ModelError::Format {
             found: desc.format.clone(),
@@ -85,9 +112,29 @@ pub fn expand(desc: &ModelDesc, config: &serde_json::Value) -> Result<Expanded, 
         PlanBuilder::new("", Phase::Forward, ParallelConfig::default()),
     );
     let plan = builder.build()?;
-    let bindings = expander.bind()?;
+    let (bindings, unbound_slots) = expander.bind()?;
 
-    Ok(Expanded { plan, bindings })
+    Ok(Expanded {
+        plan,
+        bindings,
+        unbound_slots,
+    })
+}
+
+/// `a, b, c` for the first few names, then `… (+N more)`: an error message has to stay readable
+/// when a whole description is unbound.
+fn summarize(names: &[String]) -> String {
+    const SHOWN: usize = 8;
+    let mut list = names
+        .iter()
+        .take(SHOWN)
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .join(", ");
+    if names.len() > SHOWN {
+        list.push_str(&format!(", … (+{} more)", names.len() - SHOWN));
+    }
+    list
 }
 
 /// Every declared template slot must be read or written by some node of that template (§3.7 #11).
@@ -673,7 +720,10 @@ impl<'a> Expander<'a> {
     // ---- binding ----------------------------------------------------------
 
     /// Check that every `binding` hits weight slots and only weight slots (§3.5, §4.1 step 5).
-    fn bind(&self) -> Result<Vec<ResolvedBinding>, ModelError> {
+    ///
+    /// Returns the resolved bindings plus the weight slots nothing claimed; [`expand`] turns a
+    /// non-empty second list into the §3.5 error, [`expand_lenient`] passes it on.
+    fn bind(&self) -> Result<(Vec<ResolvedBinding>, Vec<String>), ModelError> {
         let weights: Vec<String> = self
             .slot_info
             .iter()
@@ -789,6 +839,7 @@ impl<'a> Expander<'a> {
                     }
                     slots.push(ResolvedBindingSlot {
                         slot: hit.clone(),
+                        pattern: pattern.clone(),
                         axes: axes.clone(),
                     });
                 }
@@ -802,27 +853,13 @@ impl<'a> Expander<'a> {
             });
         }
 
-        let unbound: Vec<&String> = weights
+        let unbound: Vec<String> = weights
             .iter()
             .filter(|name| !claimed.contains_key(*name))
+            .cloned()
             .collect();
-        if !unbound.is_empty() {
-            let mut list = unbound
-                .iter()
-                .take(8)
-                .map(|name| name.as_str())
-                .collect::<Vec<_>>()
-                .join(", ");
-            if unbound.len() > 8 {
-                list.push_str(&format!(", … (+{} more)", unbound.len() - 8));
-            }
-            return Err(ModelError::Invalid(format!(
-                "{} weight slot(s) are not bound to any checkpoint tensor: {list}",
-                unbound.len()
-            )));
-        }
 
-        Ok(resolved)
+        Ok((resolved, unbound))
     }
 }
 
@@ -903,15 +940,9 @@ fn parse_indexed(text: &str) -> Option<(String, String)> {
     Some((list.to_string(), index.to_string()))
 }
 
-/// `*` matches **exactly one** dotted segment.
+/// `*` matches **exactly one** dotted segment (§3.4; the one matcher lives in [`crate::pattern`]).
 fn pattern_matches(pattern: &str, name: &str) -> bool {
-    let pattern: Vec<&str> = pattern.split('.').collect();
-    let name: Vec<&str> = name.split('.').collect();
-    pattern.len() == name.len()
-        && pattern
-            .iter()
-            .zip(name.iter())
-            .all(|(p, n)| *p == "*" || p == n)
+    crate::pattern::matches(pattern, name)
 }
 
 fn wildcard_count(pattern: &str) -> usize {

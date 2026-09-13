@@ -45,13 +45,60 @@ timestamp: 2026-09-12T12:00:00Z
 rustrain check --model <model-dir> [--checkpoint <dir>] [--tp N --cp N --ep N --dp N --pp N] [--json]
 ```
 
-- **总是**跑 L1（结构）：plan 可编译、每个节点有实现、每个算子的 `infer()` 与声明形状一致、
+- **总是**跑 L1（结构）：plan 可编译、每个节点的算子可解析到实现、每个算子的 `infer()` 与声明形状一致、
   layout 传播完成、每个 `Partial` 都被兑现、每个 collective 都绑了轴、每个 slot 都有分配且无别名冲突。
 - 给了 `--checkpoint` 时**追加** L2（加载）：每个 weight slot 恰好被一条 binding 命中；checkpoint 的每个
-  张量要么被消费、要么被显式 `ignore`；transform + axes 推出的本地形状与 slot 形状一致。
+  张量要么被消费、要么被显式 `ignore`；transform + axes 推出的本地形状与 slot 形状一致；dtype 相容。
 - **内存预算只产生 warning，不影响退出码**（见 `docs/architecture.md` §8 D12）。
-- 退出码 0 = 全绿；非 0 = 有失败项。`--json` 输出机器可读报告（失败项、告警项、skip 及理由）。
+- **退出码只由 `Fail` 决定。** 每个检查项的结果是 `Pass` / `Fail` / `Warning` / `Skip`，**每条 `Skip` 必须写明理由**
+  （沿用 `ops check` 的纪律：skip 不等于 pass，必须能回答"缺什么、什么时候能补上"）。
+- **本机对 bf16 的"实现可用性"是 `Skip` 而不是 `Fail`**：reference provider 只声明 `f32`，而真实描述是 `bf16`，
+  且 5 个新原语尚未实现 —— 这是**这台机器的限制 + 尚未开工的 D5**，不是 plan 的缺陷。理由必须逐条列出。
+- `--dtype <name>` 覆盖描述里的 dtype，用于显式声明"我在什么精度下检查"；报告里记录实际用的 dtype。
+- 退出码 0 = 无 `Fail`；`--json` 输出机器可读报告（逐项结果、`Skip`/`Warning` 及理由）。
 - **不执行任何计算，不需要设备**：不得创建 CUDA 上下文；插件在 `init()` 之前不得碰设备。
+
+**C5 · checkpoint 元数据的来源与形状检查**
+
+- `--checkpoint <path>` 接受两种形式：**真实模型目录**（`model.safetensors.index.json` + 分片，只读头部）
+  或**元数据快照文件**（`*.safetensors.meta.json`）。快照是小的纯 JSON，让测试可以离线、可重复。
+- 快照格式：`{"format":"rustrain.ckpt_meta.v1","source":<url或路径>,"tensors":{"<name>":{"dtype":"bf16","shape":[..]}}}`。
+- **再生脚本**：`scripts/fetch_qwen36_meta.py` 通过 HTTP Range 只读分片头部（**不下载权重**），
+  生成快照。脚本进仓库；快照进 fixture（约 100KB）；两者都能独立重建。
+- L2 的检查**必须显式按 slot 名配对**，**不得把 source 实例顺序与 `ResolvedBinding.slots` 直接 zip**
+  （后者的顺序是按 target 分组的，见 D1 审查记录）。
+- 视觉塔的 333 个张量由描述里的 `ignore` 列表**显式声明**，不得静默丢弃。
+
+**C6 · 报告形状与判据（精确定义，实现者不得自行发明）**
+
+`--json` 的报告形状固定为：
+
+```json
+{ "format": "rustrain.check.v1",
+  "model": "<path>", "checkpoint": "<path|null>", "dtype": "<生效的检查精度>",
+  "counts": { "slots": 0, "nodes": 0, "weights": 0, "bindings": 0,
+              "slots_unbound": 0, "tensors_unconsumed": 0, "shape_mismatch": 0, "dtype_mismatch": 0 },
+  "checks": [ { "id": "<稳定 id>", "status": "pass|fail|warning|skip",
+                "reason": "<必填，非空>", "details": ["<一行一条>"] } ] }
+```
+
+- **退出码 = 0 当且仅当没有任何 check 的 `status` 是 `fail`。** `warning`/`skip` 不影响退出码。
+- `--json` **无论成败都往 stdout 打完整报告**；诊断也可以同时进 stderr。
+- `check.id` 的稳定命名：`l1.structure`、`l1.implementation_availability`、`l2.binding_coverage`、
+  `l2.tensor_consumption`、`l2.shape_reconciliation`、`l2.dtype_compatibility`。
+- **`l1.implementation_availability` 是 `skip`**（不是 `fail`），当某算子**已知但本机没有可用实现**时；
+  `reason` 必须列出未解析的算子清单与原因（这既覆盖"reference provider 只声明 f32"，也覆盖
+  "5 个新原语尚未实现"）。**每条 skip 都要能回答"缺什么、什么时候能补上"**（沿用 `ops check` 纪律）。
+- **`--dtype <name>` 的语义**：只影响 **L1 解析实现时使用的精度**（默认取描述的顶层 `dtype`），
+  **不影响 L2 的 dtype 比对** —— L2 永远拿**描述声明的** dtype 与 checkpoint 的 dtype 比。
+  这样"在 f32 下检查结构"与"校验 bf16 权重与描述是否相符"两件事互不干扰。
+- `ignore` 的模式语法与 binding 的 source 一致，额外支持 **`**` = 任意多段**；视觉塔用 `"model.visual.**"`。
+- **`ignore` 模式命中 0 个张量 → `warning`（不是 `fail`）**：同一份描述可能被另一份 checkpoint 复用，
+  但"声明了却匹配不到任何东西"很可能就是拼错，必须有人看得见。
+- **`transform` 的完整词表只有两个动词**：`transpose(i, j)` 与 `slice(dim, start, len)`；
+  多段拆分由 binding 的 **`split` 字段**表达，不在 `transform` 里。
+  早期列的 `take` / `concat` / `split(dim,sizes)` **移除** —— 没有消费者、也没有定义 = 死钩子。
+  **未知动词在 `expand` 期报错**，不得降级成 `skip`（"契约没写"不是 skip 的理由）。
 
 **C3 · 并行语义。** axis 是 mesh 里的**有序命名轴**，组是轴掩码；一个 slot 的 layout 是
 **多个 `(dim, group)` 分片 + 至多一个 partial**。本地形状 = 全局形状沿分片维除以该组度数之积，
@@ -117,9 +164,14 @@ rustrain check --model <model-dir> [--checkpoint <dir>] [--tp N --cp N --ep N --
 **交付位置**：`rustrain check` 子命令 + 一个再生脚本（拉 `model.safetensors.index.json` 与分片头部，
 通过 HTTP Range，不下载权重）。
 **验收与证据**：
-- 一个**故意漏掉一条 binding** 的用例必须失败并指出漏了哪个 slot 模式
-- 一个**故意多声明一个不存在的 checkpoint 张量** 的用例必须失败
-- `tensors_unconsumed` 走的是显式 `ignore` 列表（视觉 333 个 + 明确不用的）
+- `rustrain check --model crates/rustrain-model/tests/fixtures/qwen36-text --checkpoint <快照> --dtype f32` 退出 0，
+  报告 `slots_unbound = 0`、`tensors_unconsumed = 0`、`shape_mismatch = 0`、`dtype_mismatch = 0`；
+  "实现可用性"为 `Skip` 且逐条写明理由（见 C2）
+- 一个**故意漏掉一条 binding** 的用例必须 `Fail` 并指出漏了哪个 slot 模式
+- 一个**故意在描述里多声明一个不存在的 checkpoint 张量**的用例必须 `Fail` 并指出那个模式
+- 一个**故意写错 `transform`**（例如漏掉 `transpose`）的用例必须 `Fail` —— 这正是 D1 里 `lm_head.w` 的漏网之鱼
+- `tensors_unconsumed` 走的是描述里显式的 `ignore` 列表（视觉 333 个）；删掉 `ignore` 必须 `Fail`
+- 形状对账是**机械**的（快照来自真实分片头部），不是人工核对
 
 ### D3 — 轴与 mesh：任意组合组 + 形状算术
 
