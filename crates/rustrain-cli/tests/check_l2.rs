@@ -462,6 +462,51 @@ fn an_ignored_checkpoint_tensor_stops_failing() {
     assert_zero_counters(&run.json(), &run);
 }
 
+/// §3.8 #2: a pattern's leading/trailing whitespace is a **literal segment**, never trimmed — and a
+/// `ignore` entry that misses is *not* allowed to swallow the tensors it meant to drop.
+///
+/// `models/tiny-ignore-typo` is `models/tiny-ignored` with the one space that turns the entry into a
+/// pattern for a tensor called `" model.extra.weight"`. Two things must hold, and the second is the
+/// one that matters: the pattern's own item is a **Warning** (0 hits is not a description error, C5),
+/// and `model.extra.weight` — which the typo silently stopped ignoring — makes the run **Fail** by
+/// being unconsumed. A misspelled `ignore` therefore cannot quietly drop a tensor on the floor.
+#[test]
+fn a_misspelled_ignore_pattern_does_not_silently_uncover_a_tensor() {
+    let run = check(
+        &fixture_model("tiny-ignore-typo"),
+        &fixture_checkpoint("tiny-extra"),
+    );
+    run.expect_readable_failure();
+
+    assert!(
+        run.diagnostic().contains("model.extra.weight"),
+        "the tensor the typo stopped ignoring must be named as unconsumed\n{}",
+        run.dump()
+    );
+
+    let doc = run.json();
+    assert!(
+        find_key(&doc, "tensors_unconsumed")
+            .and_then(Value::as_i64)
+            .unwrap_or_else(|| panic!(
+                "the run must report `tensors_unconsumed` as a count\n{}",
+                run.dump()
+            ))
+            > 0,
+        "the typo must show up as an unconsumed tensor, not only as a pattern warning\n{}",
+        run.dump()
+    );
+
+    let items = check_items(&doc);
+    assert!(
+        items.iter().any(|item| item.status == Status::Warning
+            && item.reason.contains(" model.extra.weight")),
+        "the 0-hit pattern is a Warning that names the pattern verbatim (the space is part of it), \
+         so a reader can see the typo:\n{}",
+        describe(&items)
+    );
+}
+
 /// C2's ruling: an unresolved implementation is a `Skip`, and the exit code is decided by `Fail`
 /// alone. The fixture uses `nonexistent_op`, which no provider publishes, so the whole run must
 /// still exit 0 and say what is missing.
@@ -501,9 +546,9 @@ fn an_unregistered_operator_is_a_reasoned_skip_not_a_fail() {
     );
 }
 
-/// D2 + C5: the real description against the real checkpoint metadata (26 shard headers, 1045
-/// tensors, no weights downloaded). Everything reconciles, and the one thing this machine cannot
-/// do — run it — is a reasoned `Skip`, not a `Fail`.
+/// D2 + C5: the real description against the real checkpoint metadata (1045 tensors, shard headers
+/// only, no weights downloaded). Everything reconciles, and the one thing this machine cannot do —
+/// run it — is a reasoned `Skip`, not a `Fail`.
 #[test]
 fn the_real_qwen36_description_reconciles_the_real_checkpoint_metadata() {
     let run = check(&qwen36_model_dir(), &fixture_checkpoint("qwen36-35b-a3b"));
@@ -536,9 +581,9 @@ fn the_real_qwen36_description_reconciles_the_real_checkpoint_metadata() {
     ];
     let text = items_text(&items);
     assert!(
-        UNIMPLEMENTED_PRIMITIVES.iter().any(|op| text.contains(op)),
-        "the availability Skip must say what is missing: the description uses five primitives no \
-         provider publishes on this machine ({})\n{}",
+        UNIMPLEMENTED_PRIMITIVES.iter().all(|op| text.contains(op)),
+        "the availability Skip must say what is missing, and it must say **all five**: the \
+         description uses five primitives no provider publishes on this machine ({})\n{}",
         UNIMPLEMENTED_PRIMITIVES.join(", "),
         run.dump()
     );
