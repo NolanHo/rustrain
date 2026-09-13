@@ -570,7 +570,19 @@ impl<'a> Compiler<'a> {
                 });
             }
         };
-        let group = GroupMask::from_bits(group_bits as u32);
+        let group = match u32::try_from(group_bits) {
+            Ok(bits) => GroupMask::from_bits(bits),
+            // A mask is 32 bits; a plan attribute outside `0..=u32::MAX`
+            // (including a negative) is rejected here instead of being
+            // silently truncated into a *different* group than declared.
+            Err(_) => {
+                return Err(PlanError::IntrinsicBadAttr {
+                    op: op.clone(),
+                    attr: intrinsic::ATTR_GROUP.to_string(),
+                    value: group_bits.to_string(),
+                });
+            }
+        };
         // Revalidate the mask against the mesh the plan was compiled for: the
         // attribute is plan data, so a plan from another topology (or a
         // hand-edited one) is reported here, never handed to the runtime.
@@ -843,6 +855,48 @@ mod tests {
                 assert_eq!(group, stray);
             }
             other => panic!("expected GroupUnavailable, got {other:?}"),
+        }
+    }
+
+    /// **Case F3 (reviewer finding, MEDIUM).** A group mask has 32 bits, so an
+    /// `ATTR_GROUP` value outside `0..=u32::MAX` (including negatives) must be
+    /// rejected naming the raw value — `2^32` used to be cast to
+    /// `GroupMask::NONE` and `2^32 + 1` to `tp`, silently compiling a
+    /// *different group than declared*.
+    #[test]
+    fn group_attr_outside_u32_is_reported_not_truncated() {
+        for raw in [1i64 << 32, (1i64 << 32) + 1, -1i64, i64::MAX] {
+            let mut b = PlanBuilder::new("big", Phase::Forward, default_mesh().fingerprint());
+            let x = b.slot("x", RsDtype::F32, vec![4], SlotKind::Activation);
+            let y = b.slot("y", RsDtype::F32, vec![4], SlotKind::Activation);
+            b.node(
+                OpRef::new(intrinsic::ALL_REDUCE),
+                vec![x],
+                vec![y],
+                Attrs::new()
+                    .set(intrinsic::ATTR_GROUP, raw)
+                    .set(intrinsic::ATTR_REDUCE, "sum"),
+                "redu",
+            );
+            let plan = b.build().unwrap();
+
+            let registry = Registry::new();
+            let recipe = Recipe::default();
+            let err = Compiler::new(&registry, &recipe, TargetEnv::default())
+                .compile(&plan)
+                .unwrap_err();
+            match err {
+                PlanError::IntrinsicBadAttr { op, attr, value } => {
+                    assert_eq!(op, intrinsic::ALL_REDUCE);
+                    assert_eq!(attr, intrinsic::ATTR_GROUP);
+                    assert_eq!(
+                        value,
+                        raw.to_string(),
+                        "the error must name the raw value, not a truncated mask"
+                    );
+                }
+                other => panic!("expected IntrinsicBadAttr for {raw}, got {other:?}"),
+            }
         }
     }
 

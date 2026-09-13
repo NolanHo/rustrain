@@ -93,6 +93,12 @@ impl fmt::Display for Collective {
 /// most one partial, so every rule below generalizes the single-shard table by
 /// matching shards pairwise on their normalized dim and their group.
 ///
+/// - **Overlapping groups are refused up front.** A layout whose shard groups
+///   and partial group are not pairwise disjoint has an ambiguous rank
+///   decomposition (two `tp` shards store only the diagonal tiles; a `tp` shard
+///   plus a `tp` partial lets a rank hold the partial of a slice it does not
+///   own), so no collective for it can be proven correct.
+///   [`ShardError::OverlappingGroups`] names both masks.
 /// - `Replicate -> Replicate`: empty. The data is already identical everywhere;
 ///   any collective here is pure overhead.
 /// - `Partial(op, g) -> Replicate`: `all_reduce(op, g)`. The partials are
@@ -111,6 +117,11 @@ impl fmt::Display for Collective {
 ///   With several shards, the scatter runs over the *first* target shard whose
 ///   group is the partial's group; the others are local narrows of the reduced
 ///   tensor.
+/// - **A partial is never completed while a source shard is dropped.** If the
+///   partial-completion path would also have to gather a source shard the
+///   target no longer has, the conversion is refused
+///   ([`ShardError::PartialCompletionDropsShard`]): the two steps' order cannot
+///   be proven, so the intermediate layout must be written explicitly.
 /// - `Shard(d, g) -> Replicate`: `all_gather(d, g)`. Every rank is missing
 ///   exactly the other ranks' slices. Several shards mean several gathers — one
 ///   per shard, in declaration order.
@@ -145,13 +156,30 @@ impl fmt::Display for Collective {
 ///
 /// [`ShardError`], naming both layouts: an out-of-range dim
 /// ([`ShardError::DimOutOfRange`]), a pair of groups that do not match
-/// ([`ShardError::GroupMismatch`]), or one of the conversions that no
-/// collective can perform.
+/// ([`ShardError::GroupMismatch`]), overlapping groups in either layout
+/// ([`ShardError::OverlappingGroups`]), a partial completion that would drop a
+/// source shard in the same step ([`ShardError::PartialCompletionDropsShard`]),
+/// or one of the conversions that no collective can perform.
 pub fn transitions(
     from: &ParallelLayout,
     to: &ParallelLayout,
     norm: &DimNormalizer,
 ) -> Result<Vec<Collective>, ShardError> {
+    // Refuse layouts with overlapping groups before any rule: the rank
+    // decomposition of such a layout is ambiguous, so no emitted collective
+    // could be proven correct. Checked before dim resolution, because the
+    // layout itself is inexpressible however it is normalized.
+    for offender in [from, to] {
+        if let Some((a, b)) = offender.overlapping_groups() {
+            return Err(ShardError::OverlappingGroups {
+                from: from.clone(),
+                to: to.clone(),
+                a,
+                b,
+            });
+        }
+    }
+
     // Resolve every logical dim in both operands before matching on the rules.
     // Doing it up front (rather than only where a dim is used by an emitted
     // collective) means a plan that names an axis the tensor does not have is
@@ -296,6 +324,18 @@ fn two_sided(
     // reduced tensor.
     if let Some(partial) = &from.partial {
         if to.partial.is_none() {
+            // Completing the partial changes what every rank holds, and so does
+            // gathering a source shard the target drops. Doing both in one step
+            // would need two collectives whose order cannot be proven (the
+            // scatter/gather order flips correctness with the dims), so the
+            // intermediate layout has to be written explicitly.
+            let dropped = from_shards.iter().any(|shard| !to_shards.contains(shard));
+            if dropped {
+                return Err(ShardError::PartialCompletionDropsShard {
+                    from: from.clone(),
+                    to: to.clone(),
+                });
+            }
             let scatter = to_shards.iter().find(|&&(dim, group)| {
                 group == partial.group && !from_shards.contains(&(dim, group))
             });

@@ -10,7 +10,8 @@
 //! needs — splices in an intrinsic collective node and repoints the consumers.
 
 use rustrain_parallel::{
-    Collective, DimNormalizer, GroupMask, Mesh, ParallelLayout, ReduceOp, ShardSpec, transitions,
+    Collective, DimNormalizer, GroupMask, Mesh, ParallelLayout, ReduceOp, ShardError, ShardSpec,
+    transitions,
 };
 
 use crate::PlanError;
@@ -229,6 +230,20 @@ fn intrinsic_for(c: &Collective) -> (&'static str, GroupMask, Option<ReduceOp>, 
         }
         Collective::Broadcast { group, .. } => (intrinsic::BROADCAST, *group, None, None),
     }
+}
+
+/// Resolves a layout's shard dims, mirroring the normalization `transitions`
+/// performs; used to check that the single emitted collective materializes
+/// every target shard.
+fn resolve_shards(
+    layout: &ParallelLayout,
+    norm: &DimNormalizer,
+) -> Result<Vec<(i64, GroupMask)>, ShardError> {
+    layout
+        .dims
+        .iter()
+        .map(|spec| Ok((norm.normalize(spec.dim)?, spec.group)))
+        .collect()
 }
 
 /// Validates every slot's declared layout against the mesh and the tensor's
@@ -497,6 +512,46 @@ pub fn propagate(plan: &Plan) -> Result<ShardPropagation, PlanError> {
                     "{} requires a {}-step conversion; express the intermediate layout explicitly",
                     c.from,
                     cs.len()
+                ),
+            });
+        }
+
+        // A single emitted collective still has to materialize every target
+        // shard: a shard already held by the source survives the collective,
+        // and a reduce_scatter produces exactly the shard it scatters onto.
+        // Anything else (a partial completed by all_reduce, then a target shard
+        // that is only a local narrow; a reduce_scatter that materializes one
+        // target shard while another is still a local narrow) leaves the slot's
+        // declared layout different from what the producer actually wrote, and
+        // the planner has no view node to insert — refuse it the same way the
+        // empty-sequence local view is refused.
+        let from_shards = resolve_shards(&c.from, &norm).map_err(|source| PlanError::Shard {
+            node: c.producer,
+            source,
+        })?;
+        let to_shards = resolve_shards(&c.to, &norm).map_err(|source| PlanError::Shard {
+            node: c.producer,
+            source,
+        })?;
+        let produced = match &cs[0] {
+            Collective::ReduceScatter { dim, group } => Some((*dim, *group)),
+            _ => None,
+        };
+        if to_shards
+            .iter()
+            .any(|shard| !from_shards.contains(shard) && produced != Some(*shard))
+        {
+            return Err(PlanError::LayoutConflict {
+                node: c.producer,
+                slot: c.slot,
+                index: 0,
+                needed: format!("{}", c.to),
+                held: format!(
+                    "{} — {} does not materialize every shard the target declares; the \
+                     plan's declared layout is not what the producer actually wrote, so \
+                     either declare the slot's layout as what the producer yields or make \
+                     the re-slicing an explicit node",
+                    c.from, cs[0]
                 ),
             });
         }
@@ -870,6 +925,200 @@ mod tests {
             }
             other => panic!("expected a layout conflict, got {other:?}"),
         }
+    }
+
+    /// A two-axis mesh (tp = bit 0, ep = bit 1) for the reviewer's attack
+    /// pairs: `tp` has degree 2, `ep` degree 3.
+    fn tp_ep_mesh() -> Mesh {
+        Mesh::new(vec![("tp".to_string(), 2), ("ep".to_string(), 3)]).unwrap()
+    }
+
+    fn tp_ep_masks() -> (GroupMask, GroupMask) {
+        (
+            GroupMask::single(0).expect("bit 0 always fits"),
+            GroupMask::single(1).expect("bit 1 always fits"),
+        )
+    }
+
+    /// A one-input elementwise plan whose input slot is declared with layout
+    /// `from` and whose output slot is declared with layout `to` — the
+    /// hand-declared pair the reviewer drove through `propagate`.
+    fn declared_pair_plan(from: ParallelLayout, to: ParallelLayout) -> Plan {
+        let mesh = tp_ep_mesh();
+        let mut b = PlanBuilder::new("pair", Phase::Forward, mesh.fingerprint());
+        let x = b.slot_with_layout("x", RsDtype::F32, vec![6, 6], SlotKind::Activation, from);
+        let y = b.slot_with_layout("y", RsDtype::F32, vec![6, 6], SlotKind::Activation, to);
+        b.node(
+            OpRef::new("elementwise_unary"),
+            vec![x],
+            vec![y],
+            Attrs::new().set("kind", "silu"),
+            "a",
+        );
+        b.build().unwrap()
+    }
+
+    /// **Case F2 (reviewer finding, MEDIUM).** `partial(Sum, tp) -> shard(0,
+    /// ep)`: `transitions` emits a single `all_reduce`, but that collective
+    /// produces a full-extent tensor — the target's ep shard is a local narrow
+    /// nobody materializes. The compiler used to accept the plan; it must
+    /// refuse it with the same "declared layout is not what the producer
+    /// actually wrote" wording as the empty-sequence refusal.
+    #[test]
+    fn an_unmaterialized_shard_after_all_reduce_is_refused() {
+        let (tp, ep) = tp_ep_masks();
+        let plan = declared_pair_plan(
+            ParallelLayout::partial(ReduceOp::Sum, tp),
+            ParallelLayout::shard(0, ep),
+        );
+
+        let err = propagate(&plan).unwrap_err();
+        match err {
+            PlanError::LayoutConflict { held, .. } => {
+                assert!(
+                    held.contains("not what the producer actually wrote"),
+                    "the refusal must carry the local-view wording: {held}"
+                );
+            }
+            other => panic!("expected a layout conflict, got {other:?}"),
+        }
+    }
+
+    /// **Case F2, second shape.** `partial(Sum, tp) -> {shard(0, tp),
+    /// shard(1, tp)}` used to be accepted after inserting only
+    /// `reduce_scatter`: the dim-1 narrow is never materialized. The target
+    /// layout's two shards overlap on `tp`, so it is now refused up front by
+    /// the table's overlap rule — the compiler never sees a plan to accept.
+    #[test]
+    fn a_two_shard_target_over_the_same_group_is_refused() {
+        let (tp, _) = tp_ep_masks();
+        let plan = declared_pair_plan(
+            ParallelLayout::partial(ReduceOp::Sum, tp),
+            ParallelLayout {
+                dims: vec![
+                    ShardSpec { dim: 0, group: tp },
+                    ShardSpec { dim: 1, group: tp },
+                ],
+                partial: None,
+            },
+        );
+
+        let err = propagate(&plan).unwrap_err();
+        match err {
+            PlanError::Shard {
+                source: ShardError::OverlappingGroups { a, b, .. },
+                ..
+            } => assert_eq!((a, b), (tp, tp)),
+            other => panic!("expected an overlapping-groups refusal, got {other:?}"),
+        }
+    }
+
+    /// The same F2 shape with *disjoint* groups: `partial(Sum, tp) ->
+    /// {shard(0, tp), shard(1, ep)}`. `transitions` emits a single
+    /// `reduce_scatter(0, tp)` that materializes only the dim-0 shard; the
+    /// dim-1 ep shard is still a local narrow, so the compiler refuses it.
+    #[test]
+    fn a_reduce_scatter_must_materialize_every_target_shard() {
+        let (tp, ep) = tp_ep_masks();
+        let plan = declared_pair_plan(
+            ParallelLayout::partial(ReduceOp::Sum, tp),
+            ParallelLayout {
+                dims: vec![
+                    ShardSpec { dim: 0, group: tp },
+                    ShardSpec { dim: 1, group: ep },
+                ],
+                partial: None,
+            },
+        );
+
+        let err = propagate(&plan).unwrap_err();
+        match err {
+            PlanError::LayoutConflict { held, .. } => {
+                assert!(
+                    held.contains("not what the producer actually wrote"),
+                    "the refusal must carry the local-view wording: {held}"
+                );
+            }
+            other => panic!("expected a layout conflict, got {other:?}"),
+        }
+    }
+
+    /// **Case F1b (reviewer finding, HIGH), end to end.** `{shard(0, tp),
+    /// partial(Sum, tp)} -> {shard(0, tp)}` used to be accepted after
+    /// inserting only `all_reduce` — a plan whose splice corrupts data. The
+    /// overlap refusal must reach `propagate` as a `Shard` error, never a
+    /// compiled plan.
+    #[test]
+    fn overlapping_shard_partial_pair_is_refused_end_to_end() {
+        let (tp, _) = tp_ep_masks();
+        let plan = declared_pair_plan(
+            ParallelLayout {
+                dims: vec![ShardSpec { dim: 0, group: tp }],
+                partial: Some(PartialSpec {
+                    op: ReduceOp::Sum,
+                    group: tp,
+                }),
+            },
+            ParallelLayout::shard(0, tp),
+        );
+
+        let err = propagate(&plan).unwrap_err();
+        match err {
+            PlanError::Shard {
+                source: ShardError::OverlappingGroups { a, b, .. },
+                ..
+            } => assert_eq!((a, b), (tp, tp)),
+            other => panic!("expected an overlapping-groups refusal, got {other:?}"),
+        }
+    }
+
+    /// **Case F1a (reviewer finding, MEDIUM), end to end.** `{shard(0, ep),
+    /// partial(Sum, tp)} -> {shard(0, tp)}` used to compile a two-collective
+    /// splice in the wrong order; the table now refuses the conversion and the
+    /// compiler reports it, telling the writer to make the intermediate layout
+    /// explicit.
+    #[test]
+    fn partial_completion_plus_dropped_shard_is_refused_end_to_end() {
+        let (tp, ep) = tp_ep_masks();
+        let plan = declared_pair_plan(
+            ParallelLayout {
+                dims: vec![ShardSpec { dim: 0, group: ep }],
+                partial: Some(PartialSpec {
+                    op: ReduceOp::Sum,
+                    group: tp,
+                }),
+            },
+            ParallelLayout::shard(0, tp),
+        );
+
+        let err = propagate(&plan).unwrap_err();
+        match err {
+            PlanError::Shard {
+                source: ShardError::PartialCompletionDropsShard { .. },
+                ..
+            } => {}
+            other => panic!("expected a partial-completion refusal, got {other:?}"),
+        }
+    }
+
+    /// The disjoint single-scatter pair stays accepted: `partial(Sum, tp) ->
+    /// shard(0, tp)` is one reduce_scatter that materializes the target shard,
+    /// so rule 3 must not over-refuse it.
+    #[test]
+    fn a_materialized_reduce_scatter_shard_is_accepted() {
+        let (tp, _) = tp_ep_masks();
+        let plan = declared_pair_plan(
+            ParallelLayout::partial(ReduceOp::Sum, tp),
+            ParallelLayout::shard(0, tp),
+        );
+
+        let prop = propagate(&plan).unwrap();
+        assert_eq!(prop.inserted.len(), 1);
+        assert_eq!(prop.inserted[0].op, intrinsic::REDUCE_SCATTER);
+        assert_eq!(
+            prop.plan.slot(prop.inserted[0].produced_slot).layout,
+            ParallelLayout::shard(0, tp)
+        );
     }
 
     #[test]

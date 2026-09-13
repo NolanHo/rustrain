@@ -302,18 +302,90 @@ fn partial_shard_combo_completes_with_reduce_scatter() {
         transitions(&from, &to, &norm()),
         Ok(vec![reduce_scatter(0, TP)])
     );
+    // The same pair stays expressible through the explicit two-step route:
+    // complete the partial to the intermediate layout, then convert from there.
+    assert_eq!(
+        transitions(&from, &replicate(), &norm()),
+        Ok(vec![all_reduce(ReduceOp::Sum, TP), all_gather(0, EP)])
+    );
+    assert_eq!(transitions(&replicate(), &to, &norm()), Ok(Vec::new()));
 }
 
+/// **Case F1b (reviewer finding, HIGH).** `{shard(0, tp), partial(Sum, tp)} ->
+/// {shard(0, tp)}` used to emit `[all_reduce(tp)]`: rank `r` holds the partial
+/// of *slice r*, so a plain all-reduce element-wise sums partials of different
+/// slices. The layout itself is inexpressible — its shard group and partial
+/// group overlap — so `transitions` must refuse it, naming both masks.
+#[test]
+fn overlapping_shard_and_partial_group_is_refused() {
+    let from = layout(&[(0, TP)], Some((ReduceOp::Sum, TP)));
+    let to = layout(&[(0, TP)], None);
+    let err = transitions(&from, &to, &norm()).unwrap_err();
+    assert_eq!(
+        err,
+        ShardError::OverlappingGroups {
+            from: from.clone(),
+            to: to.clone(),
+            a: TP,
+            b: TP,
+        }
+    );
+    let message = err.to_string();
+    assert!(message.contains("mask(0b1)"), "{message}");
+    assert!(message.contains("disjoint"), "{message}");
+}
+
+/// **Case F1c (reviewer finding, MEDIUM).** `{shard(0, tp), shard(1, tp)} ->
+/// Replicate` used to emit `[all_gather(0, tp), all_gather(1, tp)]`. No
+/// ordering is correct: rank `t` holds the diagonal tile `(t, t)`, so the
+/// off-diagonal data exists on no rank. Two shards over the same group make
+/// the layout inexpressible, and `transitions` must refuse it.
+#[test]
+fn two_shards_over_the_same_group_are_refused() {
+    let from = layout(&[(0, TP), (1, TP)], None);
+    let to = replicate();
+    let err = transitions(&from, &to, &norm()).unwrap_err();
+    assert_eq!(
+        err,
+        ShardError::OverlappingGroups {
+            from: from.clone(),
+            to: to.clone(),
+            a: TP,
+            b: TP,
+        }
+    );
+    let message = err.to_string();
+    assert!(message.contains("mask(0b1)"), "{message}");
+    assert!(message.contains("disjoint"), "{message}");
+}
+
+/// **Case F1a (reviewer finding, MEDIUM).** `{shard(0, ep), partial(Sum, tp)}
+/// -> {shard(0, tp)}` used to emit `[reduce_scatter(0, tp), all_gather(0,
+/// ep)]`; the data-level simulation proved `[all_gather(0, ep),
+/// reduce_scatter(0, tp)]` is the correct order. Completing the partial and
+/// dropping the source shard in one step cannot be proven sound, so the
+/// conversion is refused and the intermediate layout must be explicit.
+#[test]
+fn partial_completion_plus_dropped_shard_is_refused() {
+    let from = layout(&[(0, EP)], Some((ReduceOp::Sum, TP)));
+    let to = layout(&[(0, TP)], None);
+    let err = transitions(&from, &to, &norm()).unwrap_err();
+    assert_eq!(
+        err,
+        ShardError::PartialCompletionDropsShard {
+            from: from.clone(),
+            to: to.clone(),
+        }
+    );
+    let message = err.to_string();
+    assert!(message.contains("intermediate layout"), "{message}");
+}
+
+/// The disjoint ep × tp MoE case stays legal: the target keeps the source's ep
+/// shard, so completing the partial and adding the tp shard are one
+/// reduce_scatter with nothing dropped.
 #[test]
 fn a_partial_completed_without_a_scatter_all_reduces() {
-    // The target keeps the shard the source already has; only the partial
-    // disappears, so it is a plain all_reduce (any op qualifies).
-    let from = layout(&[(0, TP)], Some((ReduceOp::Max, TP)));
-    let to = layout(&[(0, TP)], None);
-    assert_eq!(
-        transitions(&from, &to, &norm()),
-        Ok(vec![all_reduce(ReduceOp::Max, TP)])
-    );
     // Target sharded over a *different* group than the partial: the shards are
     // local narrows of the reduced tensor, so an all_reduce suffices.
     let from = partial(ReduceOp::Max, TP);
@@ -324,11 +396,23 @@ fn a_partial_completed_without_a_scatter_all_reduces() {
     );
 }
 
+/// **Case F1b, target-side.** A layout carrying a shard and a partial over the
+/// *same* group is inexpressible on either side of the conversion, so keeping
+/// the partial while adding a same-group shard is refused too.
 #[test]
-fn a_partial_kept_plus_an_extra_shard_is_local() {
+fn a_partial_kept_plus_an_extra_same_group_shard_is_refused() {
     let from = partial(ReduceOp::Sum, TP);
     let to = layout(&[(0, TP)], Some((ReduceOp::Sum, TP)));
-    assert_eq!(transitions(&from, &to, &norm()), Ok(Vec::new()));
+    let err = transitions(&from, &to, &norm()).unwrap_err();
+    assert_eq!(
+        err,
+        ShardError::OverlappingGroups {
+            from: from.clone(),
+            to: to.clone(),
+            a: TP,
+            b: TP,
+        }
+    );
 }
 
 // --------------------------------------------------------------- error paths
@@ -410,15 +494,30 @@ fn replicate_to_partial_is_an_error() {
         );
         assert!(err.to_string().contains("computation"), "{err}");
     }
-    // Replicate -> (shards + partial) is refused for the same reason: the
-    // shards would be local narrows, but the partial cannot appear.
-    let to = layout(&[(0, TP)], Some((ReduceOp::Sum, TP)));
+    // Replicate -> (shards + partial) over *disjoint* groups is refused for the
+    // same reason: the shards would be local narrows, but the partial cannot
+    // appear.
+    let to = layout(&[(0, TP)], Some((ReduceOp::Sum, EP)));
     let err = transitions(&replicate(), &to, &norm()).unwrap_err();
     assert_eq!(
         err,
         ShardError::ReplicateToPartial {
             from: replicate(),
             to
+        }
+    );
+    // With the shard and the partial over the *same* group the target layout
+    // is itself inexpressible (case F1b's shape), so the refusal is the
+    // overlap error rather than the replicate-to-partial one.
+    let to = layout(&[(0, TP)], Some((ReduceOp::Sum, TP)));
+    let err = transitions(&replicate(), &to, &norm()).unwrap_err();
+    assert_eq!(
+        err,
+        ShardError::OverlappingGroups {
+            from: replicate(),
+            to: to.clone(),
+            a: TP,
+            b: TP,
         }
     );
 }

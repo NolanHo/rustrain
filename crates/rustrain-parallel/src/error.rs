@@ -11,6 +11,7 @@
 
 use crate::config::ParallelDim;
 use crate::layout::ParallelLayout;
+use crate::mesh::GroupMask;
 
 /// A topology could not be resolved.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -127,6 +128,30 @@ pub enum ShardError {
          Convert one side to `replicate` first — that is correct but costs a full gather"
     )]
     GroupMismatch {
+        from: ParallelLayout,
+        to: ParallelLayout,
+    },
+
+    #[error(
+        "cannot convert {from} to {to}: a layout distributes one tensor over overlapping groups \
+         {a} and {b}; the rank decomposition is ambiguous — the same ranks would both index \
+         slices of one distribution and carry pieces of the other. Shard groups and the \
+         partial's group must be pairwise disjoint"
+    )]
+    OverlappingGroups {
+        from: ParallelLayout,
+        to: ParallelLayout,
+        a: GroupMask,
+        b: GroupMask,
+    },
+
+    #[error(
+        "cannot convert {from} to {to}: completing the partial and dropping a source shard in \
+         the same step need two collectives whose order cannot be proven; express the \
+         intermediate layout explicitly (complete the partial to the intermediate layout \
+         first, then convert from there)"
+    )]
+    PartialCompletionDropsShard {
         from: ParallelLayout,
         to: ParallelLayout,
     },

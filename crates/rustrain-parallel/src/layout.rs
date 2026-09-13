@@ -140,6 +140,32 @@ impl ParallelLayout {
         &self.dims
     }
 
+    /// The first pair of overlapping group masks, if any: two shard groups, or
+    /// a shard group and the partial's group, that share at least one mesh axis.
+    ///
+    /// Overlapping groups make a layout inexpressible: the same ranks would
+    /// both index slices of one distribution and carry pieces of the other, so
+    /// the rank decomposition is ambiguous (e.g. two shards over `tp` store
+    /// only the diagonal tiles, and a `tp` shard plus a `tp` partial leaves a
+    /// rank holding the partial of a slice it does not own).
+    /// [`crate::transitions`] refuses such layouts with
+    /// [`ShardError::OverlappingGroups`] rather than guessing a collective for
+    /// them.
+    pub fn overlapping_groups(&self) -> Option<(GroupMask, GroupMask)> {
+        let mut groups: Vec<GroupMask> = self.dims.iter().map(|spec| spec.group).collect();
+        if let Some(partial) = &self.partial {
+            groups.push(partial.group);
+        }
+        for (i, a) in groups.iter().enumerate() {
+            for b in &groups[i + 1..] {
+                if !a.intersect(*b).is_empty() {
+                    return Some((*a, *b));
+                }
+            }
+        }
+        None
+    }
+
     /// The divisor this layout applies to logical dim `dim` (after
     /// normalization): the product of the degrees of every shard spec whose
     /// normalized dim is `dim`. 1 when the axis is unsharded.
@@ -368,5 +394,79 @@ mod tests {
             DimNormalizer::new(-1).unwrap_err(),
             ShardError::InvalidTensorRank { rank: -1 }
         );
+    }
+
+    #[test]
+    fn overlapping_groups_are_detected() {
+        use crate::mesh::GroupMask;
+        let tp = GroupMask::from_bits(0b1);
+        let ep = GroupMask::from_bits(0b10);
+        let tp_ep = tp.union(ep);
+
+        // Two shards over the same group (case F1c's shape).
+        let l = ParallelLayout {
+            dims: vec![
+                ShardSpec { dim: 0, group: tp },
+                ShardSpec { dim: 1, group: tp },
+            ],
+            partial: None,
+        };
+        assert_eq!(l.overlapping_groups(), Some((tp, tp)));
+
+        // A shard and a partial over the same group (case F1b's shape).
+        let l = ParallelLayout {
+            dims: vec![ShardSpec { dim: 0, group: tp }],
+            partial: Some(PartialSpec {
+                op: ReduceOp::Sum,
+                group: tp,
+            }),
+        };
+        assert_eq!(l.overlapping_groups(), Some((tp, tp)));
+
+        // A combined mask overlaps each of its own axes.
+        let l = ParallelLayout {
+            dims: vec![ShardSpec {
+                dim: 0,
+                group: tp_ep,
+            }],
+            partial: Some(PartialSpec {
+                op: ReduceOp::Sum,
+                group: tp,
+            }),
+        };
+        assert_eq!(l.overlapping_groups(), Some((tp_ep, tp)));
+
+        // The disjoint MoE ep x tp shape has none.
+        let l = ParallelLayout {
+            dims: vec![
+                ShardSpec { dim: 0, group: ep },
+                ShardSpec { dim: 1, group: tp },
+            ],
+            partial: None,
+        };
+        assert_eq!(l.overlapping_groups(), None);
+
+        // A shard plus a disjoint partial has none either.
+        let l = ParallelLayout {
+            dims: vec![ShardSpec { dim: 0, group: ep }],
+            partial: Some(PartialSpec {
+                op: ReduceOp::Sum,
+                group: tp,
+            }),
+        };
+        assert_eq!(l.overlapping_groups(), None);
+
+        // The empty mask never overlaps anything.
+        let l = ParallelLayout {
+            dims: vec![
+                ShardSpec {
+                    dim: 0,
+                    group: GroupMask::NONE,
+                },
+                ShardSpec { dim: 1, group: tp },
+            ],
+            partial: None,
+        };
+        assert_eq!(l.overlapping_groups(), None);
     }
 }
