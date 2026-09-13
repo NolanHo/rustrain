@@ -187,7 +187,7 @@ fn select_picks_a_template_by_list_index() {
             }
         },
         "stack": [
-            { "template": "full", "prefix": "layers.{l}", "repeat": { "count": "layers", "index": "l" },
+            { "prefix": "layers.{l}", "repeat": { "count": "layers", "index": "l" },
               "inputs": { "x": "hidden_in" },
               "select": { "by": "layer_types[l]", "cases": { "full": "full", "linear": "linear" } } }
         ],
@@ -267,6 +267,17 @@ fn a_split_binding_feeds_several_slots() {
         .find(|n| n.inputs == vec!["h1".to_string(), "qkv".to_string()])
         .expect("第一个 linear 消费 qkv");
     node.inputs[1] = "wq".to_string();
+    // `wk` has to be read too: a declared slot no node touches is a dead hook (§3.7 #11), so the
+    // second linear consumes it instead of `wo`.
+    let node = decoder
+        .nodes
+        .iter_mut()
+        .find(|n| n.inputs == vec!["qa".to_string(), "wo".to_string()])
+        .expect("第二个 linear 消费 wo");
+    node.inputs[1] = "wk".to_string();
+    decoder.slots.retain(|s| s.name != "wo");
+    desc.binding
+        .retain(|b| b.slot.as_deref() != Some("layers.*.wo"));
     desc.binding.push(
         serde_json::from_str(
             r#"{
@@ -371,4 +382,54 @@ fn a_typo_in_the_description_is_not_silently_ignored() {
     let text = r#"{ "format": "rustrain.model.v1", "name": "x", "stak": [] }"#;
     let err = serde_json::from_str::<ModelDesc>(text).unwrap_err();
     assert!(err.to_string().contains("stak"), "{err}");
+}
+
+/// §3.7 #13: `select` and `template` would be two sources for the same fact, so an entry that
+/// carries both is rejected instead of picking one of them.
+#[test]
+fn select_and_template_together_are_rejected_as_two_sources() {
+    let mut desc = tiny();
+    desc.stack[0].select = Some(
+        serde_json::from_str(r#"{ "by": "layer_types[l]", "cases": { "full": "norm" } }"#).unwrap(),
+    );
+    desc.stack[0].template = Some("norm".to_string());
+    let err = expand(&desc, &config()).unwrap_err();
+    let text = err.to_string();
+    assert!(
+        text.contains("`select`") && text.contains("`template`"),
+        "{text}"
+    );
+    assert!(text.contains("two"), "报错必须点明这是两个兜底来源: {text}");
+}
+
+/// The other half of the same ruling: with no `select`, `template` is still required.
+#[test]
+fn an_entry_with_neither_select_nor_template_is_rejected() {
+    let mut desc = tiny();
+    desc.stack[0].template = None;
+    let err = expand(&desc, &config()).unwrap_err();
+    let text = err.to_string();
+    assert!(
+        text.contains("template") && text.contains("select"),
+        "{text}"
+    );
+    assert!(text.contains("norm_in"), "报错必须能定位到那一项: {text}");
+}
+
+/// §3.7 #11: a declared slot that no node reads and no node writes is a dead hook. The positive
+/// half is the baseline `tiny()`, whose templates declare exactly the slots their nodes touch.
+#[test]
+fn a_slot_that_no_node_reads_or_writes_is_rejected() {
+    assert!(expand(&tiny(), &config()).is_ok(), "声明齐全的模板必须通过");
+
+    let mut desc = tiny();
+    desc.templates.get_mut("norm").unwrap().slots.push(
+        serde_json::from_str(r#"{ "name": "dead", "kind": "weight", "shape": ["hidden"] }"#)
+            .unwrap(),
+    );
+
+    let err = expand(&desc, &config()).unwrap_err();
+    let text = err.to_string();
+    assert!(text.contains("norm"), "报错必须指出模板名: {text}");
+    assert!(text.contains("dead"), "报错必须指出那个 slot: {text}");
 }

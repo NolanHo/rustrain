@@ -1778,7 +1778,6 @@
       }
     },
     {
-      "template": "decoder_full",
       "prefix": "layers.{l}",
       "repeat": {
         "count": "layers",

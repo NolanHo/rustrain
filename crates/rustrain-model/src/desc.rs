@@ -1,29 +1,32 @@
-//! 描述文件的 serde 类型：`docs/design/model-description.md` §3 的四个部分 + §3.6 的裁定。
+//! The serde types of a description file: the four sections of `docs/design/model-description.md`
+//! §3 plus the §3.6 rulings.
 //!
-//! 这一层只做「形状」的检查（键名、类型、必填），语义全在 [`crate::expand`] 里。
-//! 所有结构都 `deny_unknown_fields`：拼错的键必须报错，不能被静默忽略（不变式 I-5）。
+//! This layer checks *shape* only (key names, types, required fields); all semantics live in
+//! [`crate::expand`]. Every struct is `deny_unknown_fields`: a misspelled key must fail loudly
+//! rather than be silently dropped (invariant I-5).
 
 use std::collections::BTreeMap;
 
 use serde::Deserialize;
 
-/// 描述格式标识（§3.6 #1：文件固定在模型目录下的 `model.json`）。
+/// The description format identifier (§3.6 #1: the file always sits at `model.json` in the model
+/// directory).
 pub const FORMAT: &str = "rustrain.model.v1";
-/// 描述文件名，与 `config.json` 同级。
+/// The description file name, a sibling of `config.json`.
 pub const DESC_FILE: &str = "model.json";
-/// 模型自身的配置文件；`params.*.from` 从这里取。
+/// The model's own config file; `params.*.from` reads values out of it.
 pub const CONFIG_FILE: &str = "config.json";
 
-/// 一份模型描述。
+/// One model description.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ModelDesc {
     pub format: String,
     pub name: String,
-    /// 缺省 dtype；模板 slot 与端口没写 dtype 时用它（§3.6 #6）。
+    /// Default dtype, used by template slots and ports that declare none (§3.6 #6).
     #[serde(default)]
     pub dtype: Option<String>,
-    /// 模型的外部输入。与 `templates.*.inputs` 同构（§3.6 #2）。
+    /// The model's external inputs. Same shape as `templates.*.inputs` (§3.6 #2).
     #[serde(default)]
     pub inputs: BTreeMap<String, PortSpec>,
     pub params: BTreeMap<String, ParamSpec>,
@@ -33,7 +36,7 @@ pub struct ModelDesc {
     pub binding: Vec<Binding>,
 }
 
-/// 一个端口（输入或输出）的声明。
+/// A declared port (input or output).
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PortSpec {
@@ -43,17 +46,17 @@ pub struct PortSpec {
     pub dtype: Option<String>,
 }
 
-/// `params` 的一个值：来自 `config.json`、参数表达式、或一个字面列表（§3.1）。
+/// One `params` value: read from `config.json`, a parameter expression, or a literal list (§3.1).
 #[derive(Debug, Clone, Deserialize)]
 #[serde(untagged)]
 pub enum ParamSpec {
-    /// 列表值，逐层类型就是它的典型用法。
+    /// A literal list; per-layer type lists are its typical use.
     List(Vec<String>),
     From(FromSpec),
     Expr(ExprSpec),
 }
 
-/// `{"from": "text_config.hidden_size", "default": 4}`。
+/// `{"from": "text_config.hidden_size", "default": 4}`.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FromSpec {
@@ -62,14 +65,14 @@ pub struct FromSpec {
     pub default: Option<i64>,
 }
 
-/// `{"expr": "2 * heads * head_dim"}`。
+/// `{"expr": "2 * heads * head_dim"}`.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ExprSpec {
     pub expr: String,
 }
 
-/// 一个具名子图：只有数学与连接，切分住在 `binding`（§3.2）。
+/// A named subgraph: math and wiring only, sharding lives in `binding` (§3.2).
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Template {
@@ -83,7 +86,7 @@ pub struct Template {
     pub nodes: Vec<NodeDecl>,
 }
 
-/// 模板里的一个 slot：名字是模板内局部名。
+/// A slot inside a template; the name is local to that template.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SlotDecl {
@@ -94,7 +97,7 @@ pub struct SlotDecl {
     pub dtype: Option<String>,
 }
 
-/// 模板里的一个节点。
+/// A node inside a template.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NodeDecl {
@@ -107,7 +110,8 @@ pub struct NodeDecl {
     pub attrs: BTreeMap<String, AttrLiteral>,
 }
 
-/// 节点属性的字面量。属性只接受字面量，不接参数引用（契约没定义参数化属性）。
+/// A node attribute literal. Attributes take literals only, never parameter references (the
+/// contract defines no parameterised attributes).
 #[derive(Debug, Clone, Deserialize)]
 #[serde(untagged)]
 pub enum AttrLiteral {
@@ -117,27 +121,29 @@ pub enum AttrLiteral {
     Str(String),
 }
 
-/// `stack` 的一项：一次带实参的模板调用（§3.3）。
+/// One `stack` item: a template invocation with arguments (§3.3).
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct StackEntry {
-    /// 无 `select` 时实例化的模板；有 `select` 时是兜底名字。
-    pub template: String,
-    /// 实例前缀，`{l}` / `{last}` 由实例化器替换。
+    /// The template to instantiate when the entry has no `select`; required exactly then, because
+    /// `select` and `template` would otherwise be two sources for the same fact (§3.7 #13).
+    #[serde(default)]
+    pub template: Option<String>,
+    /// Instance prefix; `{l}` / `{last}` are substituted by the instantiator.
     pub prefix: String,
     #[serde(default)]
     pub repeat: Option<Repeat>,
-    /// 按参数计数展开（0 = 不展开）；索引变量固定为 `l`。
+    /// Expand to the count of a parameter (0 = no instances); the index variable is fixed at `l`.
     #[serde(default)]
     pub until: Option<String>,
     #[serde(default)]
     pub select: Option<Select>,
-    /// `{局部名: 全局名}`；缺省是链式（上一实例的 outputs）。
+    /// `{local name: global name}`; the default is chaining (the previous instance's outputs).
     #[serde(default, rename = "inputs")]
     pub inputs: Option<BTreeMap<String, String>>,
 }
 
-/// `{"count": "layers", "index": "l"}`。
+/// `{"count": "layers", "index": "l"}`.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Repeat {
@@ -145,11 +151,11 @@ pub struct Repeat {
     pub index: String,
 }
 
-/// 按列表下标选模板（§3.3：选择只按列表下标，不做算术）。
+/// Pick a template by list index (§3.3: selection goes by list index only, never arithmetic).
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Select {
-    /// `<参数名>[<索引变量>]`。
+    /// `<param name>[<index variable>]`.
     pub by: String,
     #[serde(default)]
     pub cases: BTreeMap<String, String>,
@@ -157,7 +163,7 @@ pub struct Select {
     pub default: Option<String>,
 }
 
-/// 一条参数映射（§3.4）。`slot` 与 `split`+`targets` 二选一。
+/// One parameter mapping (§3.4). `slot` and `split`+`targets` are mutually exclusive.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Binding {
@@ -166,7 +172,8 @@ pub struct Binding {
     pub source: String,
     #[serde(default)]
     pub transform: Vec<String>,
-    /// slot 维度 → 符号轴名。全局 Plan 全 `Replicate`，轴要到 instantiate 才解析。
+    /// slot dimension → symbolic axis names. The global plan is all `Replicate`; the axes are only
+    /// resolved once `instantiate` has a mesh.
     #[serde(default)]
     pub axes: BTreeMap<String, Vec<String>>,
     #[serde(default)]
@@ -175,7 +182,7 @@ pub struct Binding {
     pub targets: Vec<Target>,
 }
 
-/// 融合存储的一段切分。
+/// One segment of a fused-storage split.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Split {
@@ -183,7 +190,7 @@ pub struct Split {
     pub sizes: Vec<String>,
 }
 
-/// `split` 的一个目标 slot。
+/// One target slot of a `split`.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Target {

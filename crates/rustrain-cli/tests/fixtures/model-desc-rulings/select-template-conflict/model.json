@@ -1,0 +1,51 @@
+{
+  "format": "rustrain.model.v1",
+  "name": "ruling-select-template-conflict",
+  "dtype": "f32",
+  "inputs": {
+    "hidden_in": { "shape": ["seq", "hidden"], "kind": "input" }
+  },
+  "params": {
+    "seq": { "from": "text_config.max_position_embeddings", "default": 8 },
+    "hidden": { "from": "text_config.hidden_size" },
+    "layers": { "from": "text_config.num_hidden_layers" },
+    "layer_types": ["full", "linear", "full"]
+  },
+  "templates": {
+    "full": {
+      "inputs": { "x": { "shape": ["seq", "hidden"], "kind": "activation" } },
+      "outputs": { "y": { "shape": ["seq", "hidden"], "kind": "activation" } },
+      "slots": [
+        { "name": "w", "kind": "weight", "shape": ["hidden"] }
+      ],
+      "nodes": [
+        { "op": "rmsnorm", "in": ["x", "w"], "out": ["y"] }
+      ]
+    },
+    "linear": {
+      "inputs": { "x": { "shape": ["seq", "hidden"], "kind": "activation" } },
+      "outputs": { "y": { "shape": ["seq", "hidden"], "kind": "activation" } },
+      "slots": [
+        { "name": "w", "kind": "weight", "shape": ["hidden"] }
+      ],
+      "nodes": [
+        { "op": "silu_gate", "in": ["x", "w"], "out": ["y"] }
+      ]
+    }
+  },
+  "stack": [
+    {
+      "template": "full",
+      "prefix": "layers.{l}",
+      "repeat": { "count": "layers", "index": "l" },
+      "inputs": { "x": "hidden_in" },
+      "select": {
+        "by": "layer_types[l]",
+        "cases": { "full": "full", "linear": "linear" }
+      }
+    }
+  ],
+  "binding": [
+    { "slot": "layers.*.w", "source": "model.layers.{*}.w" }
+  ]
+}

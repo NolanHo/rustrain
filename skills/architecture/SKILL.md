@@ -152,6 +152,12 @@ cargo clippy --workspace --all-targets    # 零 warning
 cargo run -q -p rustrain-cli -- ops check # exit 0；skip 必须写明理由
 ```
 
+**不要设 `CARGO_TARGET_DIR=/tmp/...`。** `/tmp` 是 57G 的 tmpfs，会被构建缓存撑满 —— 实测撞过：
+全场 100%、别的进程开始报 `No space left on device`。仓库在 200T 的 vepfs 上，**用仓库自带的 `target/`**。
+
+**代码注释用英文，文档用中文。** 既有 crate 的 Rust 注释里几乎没有中文（实测 abi/ops/parallel/plan/runtime
+合计 1/2158 行含中文），中文只出现在 `docs/` 与这份 skill 的散文里。新代码要匹配这个约定。
+
 涉及 GPU 或宿主环境的改动，还要在验证宿主上跑一遍：
 `root@47.94.214.197:26002`（8× L20X，CUDA 13，Rust 1.98.1）。
 

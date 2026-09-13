@@ -1,29 +1,31 @@
-//! `params`：值的唯一来源（§3.1），按依赖序求值，环 → 报错（§4.1 第 1 步）。
+//! `params`: the single source of values (§3.1), evaluated in dependency order; a cycle is an
+//! error (§4.1 step 1).
 //!
-//! 三种形式：`{"from": "text_config.hidden_size"}` 从 `config.json` 取（可带 `default`）、
-//! `{"expr": "2 * heads * head_dim"}` 参数表达式、以及列表字面量（逐层类型）。
-//! **不做"标量 → 结构"的派生**：需要派生时由生成器算成显式列表写进描述。
+//! Three forms: `{"from": "text_config.hidden_size"}` reads `config.json` (optionally with a
+//! `default`), `{"expr": "2 * heads * head_dim"}` is a parameter expression, and a bare list is a
+//! literal (per-layer types). **No "scalar → structure" derivation**: when one is needed the
+//! generator computes it and writes an explicit list into the description.
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::ModelError;
 use crate::desc::ParamSpec;
 
-/// 一个参数值。
+/// One parameter value.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Value {
     Int(i64),
     List(Vec<String>),
 }
 
-/// 求值完成的参数表。
+/// The fully evaluated parameter table.
 #[derive(Debug, Clone)]
 pub struct Params {
     values: BTreeMap<String, Value>,
 }
 
 impl Params {
-    /// 按依赖序求值 `decls`，`from` 从 `config` 取值。
+    /// Evaluate `decls` in dependency order; `from` reads values out of `config`.
     pub fn resolve(
         decls: &BTreeMap<String, ParamSpec>,
         config: &serde_json::Value,
@@ -37,16 +39,25 @@ impl Params {
                     values.insert(name.clone(), Value::List(items.clone()));
                 }
                 ParamSpec::From(from) => {
-                    let value = from_config(config, &from.from)
-                        .or_else(|| from.default.map(Value::Int))
-                        .ok_or_else(|| {
-                            ModelError::Invalid(format!(
-                                "param `{name}`: `{}` is missing from {} (or is neither an integer \
-                                 nor a list of strings) and no `default` is given",
-                                from.from,
-                                crate::desc::CONFIG_FILE
-                            ))
-                        })?;
+                    let value = match from_config(config, &from.from).map_err(|why| {
+                        ModelError::Invalid(format!(
+                            "param `{name}`: {why}; a `default` covers only a missing key, never a \
+                             value this build cannot read"
+                        ))
+                    })? {
+                        Some(value) => value,
+                        None => match from.default {
+                            Some(default) => Value::Int(default),
+                            None => {
+                                return Err(ModelError::Invalid(format!(
+                                    "param `{name}`: `{}` is missing from {} and no `default` is \
+                                     given",
+                                    from.from,
+                                    crate::desc::CONFIG_FILE
+                                )));
+                            }
+                        },
+                    };
                     values.insert(name.clone(), value);
                 }
                 ParamSpec::Expr(expr) => {
@@ -94,7 +105,7 @@ impl Params {
                 break;
             }
             if !resolved_any {
-                // 没有任何一个能求值 —— 剩下的必然成环。
+                // Nothing was evaluable, so what is left must form a cycle.
                 let cycle = find_cycle(&next);
                 return Err(ModelError::Invalid(format!(
                     "params form a cycle: {}",
@@ -107,7 +118,7 @@ impl Params {
         Ok(Self { values })
     }
 
-    /// 取一个整数参数。
+    /// Read an integer parameter.
     pub fn int(&self, name: &str) -> Result<i64, ModelError> {
         match self.values.get(name) {
             Some(Value::Int(v)) => Ok(*v),
@@ -120,7 +131,7 @@ impl Params {
         }
     }
 
-    /// 取一个列表参数。
+    /// Read a list parameter.
     pub fn list(&self, name: &str) -> Result<&[String], ModelError> {
         match self.values.get(name) {
             Some(Value::List(items)) => Ok(items),
@@ -133,13 +144,13 @@ impl Params {
         }
     }
 
-    /// 参数是否已求值；用于区分"是参数"和"是字面量"。
+    /// Whether a parameter is already evaluated; used to tell a parameter from a literal.
     pub fn get(&self, name: &str) -> Option<&Value> {
         self.values.get(name)
     }
 }
 
-/// 在未求值的参数里找一条环，返回 `[a, b, a]` 形式的名字序列。
+/// Find a cycle among the unevaluated parameters; returns the name sequence as `[a, b, a]`.
 fn find_cycle(pending: &[(String, String, Ast)]) -> Vec<String> {
     let deps: BTreeMap<&str, BTreeSet<String>> = pending
         .iter()
@@ -152,7 +163,8 @@ fn find_cycle(pending: &[(String, String, Ast)]) -> Vec<String> {
             return path;
         }
     }
-    // 走不到这里：`pending` 非空且无可求值项时一定存在环。退化成一个可读的列表。
+    // Unreachable: a non-empty `pending` with nothing evaluable must contain a cycle. Degrade to a
+    // readable list anyway.
     pending.iter().map(|(name, _, _)| name.clone()).collect()
 }
 
@@ -181,33 +193,78 @@ fn dfs(
     false
 }
 
-/// 按点分路径在 `config.json` 里取值，并归一成 [`Value`]。
+/// Read a dotted path out of `config.json` and normalise it into a [`Value`].
 ///
-/// `from` 既能取整数（`hidden_size`），也能取字符串列表（`layer_types` —— 40 项逐层类型）。
-/// 后者必须能取，否则描述里就得复制一份层类型列表，那是第二个事实来源。
-fn from_config(config: &serde_json::Value, path: &str) -> Option<Value> {
-    let value = config_at(config, path)?;
+/// `from` has to read both integers (`hidden_size`) and lists of strings (`layer_types` — 40
+/// per-layer types). The list form is not optional: without it the description would have to carry
+/// a copy of the layer-type table, which is a second source for the same fact.
+///
+/// `Ok(None)` means the key is absent; `Err` means it is present but holds something this build
+/// cannot read. The two must stay apart — see the caller.
+fn from_config(config: &serde_json::Value, path: &str) -> Result<Option<Value>, String> {
+    let Some(value) = config_at(config, path)? else {
+        return Ok(None);
+    };
     if let Some(int) = value.as_i64() {
-        return Some(Value::Int(int));
+        return Ok(Some(Value::Int(int)));
     }
-    let list = value.as_array()?;
-    let items: Option<Vec<String>> = list
-        .iter()
-        .map(|item| item.as_str().map(str::to_string))
-        .collect();
-    Some(Value::List(items?))
+    let found = match value {
+        serde_json::Value::Array(list) => {
+            let items: Option<Vec<String>> = list
+                .iter()
+                .map(|item| item.as_str().map(str::to_string))
+                .collect();
+            match items {
+                Some(items) => return Ok(Some(Value::List(items))),
+                None => "a list whose entries are not all strings".to_string(),
+            }
+        }
+        serde_json::Value::Null => "null".to_string(),
+        serde_json::Value::Bool(_) => "a boolean".to_string(),
+        serde_json::Value::Number(number) => format!("the number {number}"),
+        serde_json::Value::String(text) => format!("the string {text:?}"),
+        serde_json::Value::Object(_) => "an object".to_string(),
+    };
+    Err(format!(
+        "`{path}` is present in {} but holds {found}, which is neither an integer nor a list of \
+         strings",
+        crate::desc::CONFIG_FILE
+    ))
 }
 
-/// 按点分路径在 `config.json` 里取值。
-fn config_at<'a>(config: &'a serde_json::Value, path: &str) -> Option<&'a serde_json::Value> {
+/// Look up a dotted path in `config.json`.
+///
+/// `Ok(None)` when a segment is absent. `Err` when a segment on the way exists but is not an
+/// object: the path is then unreadable rather than missing, and a `default` must not cover it
+/// either.
+fn config_at<'a>(
+    config: &'a serde_json::Value,
+    path: &str,
+) -> Result<Option<&'a serde_json::Value>, String> {
     let mut cur = config;
+    let mut walked: Vec<&str> = Vec::new();
     for segment in path.split('.') {
-        cur = cur.get(segment)?;
+        let Some(object) = cur.as_object() else {
+            let parent = walked.join(".");
+            let parent = if parent.is_empty() {
+                crate::desc::CONFIG_FILE
+            } else {
+                parent.as_str()
+            };
+            return Err(format!(
+                "`{parent}` is not an object, so `{path}` cannot be read"
+            ));
+        };
+        let Some(next) = object.get(segment) else {
+            return Ok(None);
+        };
+        cur = next;
+        walked.push(segment);
     }
-    Some(cur)
+    Ok(Some(cur))
 }
 
-/// 参数表达式：整数、参数名、`+ - * / ( )`。
+/// A parameter expression: integers, parameter names, `+ - * / ( )`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Ast {
     Num(i64),
@@ -447,6 +504,47 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("text_config.nope"), "{err}");
+    }
+
+    #[test]
+    fn missing_config_key_with_a_default_uses_it() {
+        let params = Params::resolve(
+            &decls(r#"{"seq": {"from": "text_config.max_position_embeddings", "default": 8}}"#),
+            &config(),
+        )
+        .unwrap();
+        assert_eq!(params.int("seq").unwrap(), 8);
+    }
+
+    /// A key that exists with a type this build cannot read is not a missing key: `default` must
+    /// not paper over what `config.json` actually says.
+    #[test]
+    fn a_config_value_of_an_unreadable_type_is_not_defaulted() {
+        let config = serde_json::json!({"text_config": {"rope_theta": 10000000.0}});
+        let err = Params::resolve(
+            &decls(r#"{"theta": {"from": "text_config.rope_theta", "default": 10000}}"#),
+            &config,
+        )
+        .unwrap_err();
+        let text = err.to_string();
+        assert!(text.contains("text_config.rope_theta"), "{text}");
+        assert!(text.contains("10000000"), "{text}");
+        assert!(text.contains("default"), "{text}");
+    }
+
+    /// The same distinction one level up: a path that walks through a non-object is unreadable,
+    /// not missing.
+    #[test]
+    fn a_from_path_through_a_non_object_is_not_defaulted() {
+        let config = serde_json::json!({"text_config": {"rope_scaling": 5}});
+        let err = Params::resolve(
+            &decls(r#"{"factor": {"from": "text_config.rope_scaling.factor", "default": 1}}"#),
+            &config,
+        )
+        .unwrap_err();
+        let text = err.to_string();
+        assert!(text.contains("text_config.rope_scaling"), "{text}");
+        assert!(text.contains("not an object"), "{text}");
     }
 
     #[test]

@@ -1,10 +1,11 @@
-//! `expand`：描述 + `config.json` → 全局 `Plan`（§4.1）。
+//! `expand`: description + `config.json` → the global `Plan` (§4.1).
 //!
-//! 五个步骤与契约一致：求值 `params` → 按 `stack` 顺序展开模板（分配 slot、发射节点）→
-//! 形状求值（全量形状）→ `check_structure()` → 挂 `binding` 的符号声明。
+//! The five steps follow the contract: evaluate `params` → walk `stack` in order instantiating
+//! templates (allocate slots, emit nodes) → evaluate shapes (fully concrete) → `check_structure()`
+//! → attach the symbolic declarations of `binding`.
 //!
-//! 全局 Plan 的 `layout` 全 `Replicate`：轴与切分要等 `instantiate` 拿到 mesh 才解析，
-//! `expand` 只记录它们（[`ResolvedBinding`]），不改形状。
+//! Every `layout` in the global plan is `Replicate`: axes and sharding wait for `instantiate` to
+//! see a mesh, so `expand` only records them ([`ResolvedBinding`]) and never touches a shape.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -16,49 +17,50 @@ use crate::ModelError;
 use crate::desc::{AttrLiteral, FORMAT, ModelDesc, NodeDecl, StackEntry, Target, Template};
 use crate::params::{Params, Value};
 
-/// `until` 展开使用的索引变量名（`repeat.index` 的对称物）。
+/// The index variable `until` expansion uses (the counterpart of `repeat.index`).
 const UNTIL_INDEX: &str = "l";
-/// `{last}` 占位符：最近一次 repeat/until 展开的最后一个下标。
+/// The `{last}` placeholder: the last index of the most recent repeat/until expansion.
 const LAST_INDEX: &str = "last";
 
-/// `expand` 的产物。
+/// What `expand` produces.
 #[derive(Debug)]
 pub struct Expanded {
-    /// 全局 Plan：形状全量、`layout` 全 `Replicate`、节点按发射顺序拓扑。
+    /// The global plan: concrete shapes, every `layout` `Replicate`, nodes in emission order.
     pub plan: Plan,
-    /// 每条 `binding` 命中的 slot（L2 加载检查的输入，`docs/design/model-description.md` §3.5）。
+    /// The slots every `binding` hit (input of the L2 load check,
+    /// `docs/design/model-description.md` §3.5).
     pub bindings: Vec<ResolvedBinding>,
 }
 
-/// 一条 `binding` 解析后的形态。
+/// One `binding` after resolution.
 #[derive(Debug)]
 pub struct ResolvedBinding {
-    /// checkpoint 侧的张量名模式。
+    /// The checkpoint-side tensor name pattern.
     pub source: String,
-    /// 取值前的变换，原样保留（`expand` 不执行它们）。
+    /// Transforms to apply before use, kept verbatim (`expand` never runs them).
     pub transform: Vec<String>,
-    /// 融合存储的切分；`None` 表示这条 binding 直接喂一个 slot。
+    /// The split of a fused storage; `None` means this binding feeds one slot directly.
     pub split: Option<ResolvedSplit>,
-    /// 这条 binding 喂的 slot，按声明顺序。
+    /// The slots this binding feeds, in declaration order.
     pub slots: Vec<ResolvedBindingSlot>,
 }
 
-/// 一条解析后的切分声明。
+/// One resolved split declaration.
 #[derive(Debug)]
 pub struct ResolvedSplit {
     pub dim: i64,
     pub sizes: Vec<i64>,
 }
 
-/// `binding` 命中的一个 slot。
+/// A slot hit by a `binding`.
 #[derive(Debug)]
 pub struct ResolvedBindingSlot {
     pub slot: String,
-    /// slot 维度（十进制字符串）→ 符号轴名。
+    /// slot dimension (decimal string) → symbolic axis names.
     pub axes: BTreeMap<String, Vec<String>>,
 }
 
-/// 描述 → 全局 Plan。
+/// Description → global plan.
 pub fn expand(desc: &ModelDesc, config: &serde_json::Value) -> Result<Expanded, ModelError> {
     if desc.format != FORMAT {
         return Err(ModelError::Format {
@@ -68,6 +70,7 @@ pub fn expand(desc: &ModelDesc, config: &serde_json::Value) -> Result<Expanded, 
     }
 
     let params = Params::resolve(&desc.params, config)?;
+    check_template_slots(desc)?;
     let default_dtype = match &desc.dtype {
         Some(name) => parse_dtype(name)?,
         None => RsDtype::F32,
@@ -87,24 +90,79 @@ pub fn expand(desc: &ModelDesc, config: &serde_json::Value) -> Result<Expanded, 
     Ok(Expanded { plan, bindings })
 }
 
+/// Every declared template slot must be read or written by some node of that template (§3.7 #11).
+///
+/// A slot nothing touches is a dead hook: it looks like part of the model, it costs a `Plan` slot
+/// and it will need a `binding`, but no computation ever reaches it. Checked per template rather
+/// than per instance so that a template instantiated zero times is caught too.
+fn check_template_slots(desc: &ModelDesc) -> Result<(), ModelError> {
+    for (template_name, template) in &desc.templates {
+        let mut touched: BTreeSet<&str> = BTreeSet::new();
+        for node in &template.nodes {
+            touched.extend(node.inputs.iter().map(String::as_str));
+            touched.extend(node.outputs.iter().map(String::as_str));
+        }
+        for decl in &template.slots {
+            if !touched.contains(decl.name.as_str()) {
+                return Err(ModelError::Invalid(format!(
+                    "template `{template_name}` declares slot `{}`, which no node in the template \
+                     reads or writes; a declared slot must be an input or an output of some node \
+                     (§3.7 #11)",
+                    decl.name
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// `select` and `template` name the same thing, so at most one of them may be present (§3.7 #13).
+///
+/// With `select` the only fallback is `select.default`; a `template` beside it would be a second
+/// source for the fallback, which is the exact failure this project exists to avoid. Without
+/// `select` the entry has no other way to name its template.
+fn check_template_source(index: usize, entry: &StackEntry) -> Result<(), ModelError> {
+    match (&entry.select, &entry.template) {
+        (Some(_), Some(_)) | (None, None) => Err(template_source_conflict(index, entry)),
+        _ => Ok(()),
+    }
+}
+
+/// Both "two sources" and "no source" are the same broken stack entry, reported the same way.
+fn template_source_conflict(index: usize, entry: &StackEntry) -> ModelError {
+    let prefix = &entry.prefix;
+    match (&entry.select, &entry.template) {
+        (Some(_), Some(_)) => ModelError::Invalid(format!(
+            "stack entry {index} (prefix `{prefix}`) declares both `select` and `template`: they \
+             are two fallback sources for one fact, and `select` already picks the template by \
+             list index — keep `select` (its only fallback is `select.default`) and drop `template` \
+             (§3.7 #13)"
+        )),
+        _ => ModelError::Invalid(format!(
+            "stack entry {index} (prefix `{prefix}`) declares neither `template` nor `select`; \
+             without `select` the entry must name its template with `template`"
+        )),
+    }
+}
+
 struct Expander<'a> {
     desc: &'a ModelDesc,
     params: Params,
     default_dtype: RsDtype,
     builder: PlanBuilder,
-    /// slot 全局名 → id。
+    /// slot global name → id.
     slots: BTreeMap<String, SlotId>,
-    /// id → slot 全局名（`SlotId` 就是分配序）。
+    /// id → slot global name (`SlotId` is allocation order).
     names: Vec<String>,
-    /// id → (kind, shape)。
+    /// id → (kind, shape).
     slot_info: Vec<(SlotKind, Vec<i64>)>,
-    /// slot 全局名 → 它是在哪里被声明的（重名时报出两个来源，§3.6 #7）。
+    /// slot global name → where it was declared (a duplicate reports both origins, §3.6 #7).
     origins: BTreeMap<String, String>,
-    /// 实例前缀 → 首次出现的 stack 下标，用于报出重名。
+    /// instance prefix → the stack index it first appeared at, used to report duplicates.
     prefixes: BTreeMap<String, usize>,
-    /// 上一个 stack 项最后一个实例的 outputs（链式接线的来源）。
+    /// The outputs of the previous stack entry's last instance (the source of chained wiring).
     prev_outputs: Vec<SlotId>,
-    /// 最近一次 repeat/until 的最后一个下标，供 `{last}` 使用。
+    /// The last index of the most recent repeat/until expansion, for `{last}`.
     last_index: Option<i64>,
 }
 
@@ -125,7 +183,7 @@ impl<'a> Expander<'a> {
         }
     }
 
-    // ---- 顶层：inputs 段 ---------------------------------------------------
+    // ---- top level: the inputs section --------------------------------------
 
     fn expand_inputs(&mut self) -> Result<(), ModelError> {
         let desc = self.desc;
@@ -139,7 +197,7 @@ impl<'a> Expander<'a> {
         Ok(())
     }
 
-    // ---- 顶层：stack 段 ---------------------------------------------------
+    // ---- top level: the stack section ---------------------------------------
 
     fn expand_stack(&mut self) -> Result<(), ModelError> {
         let desc = self.desc;
@@ -150,6 +208,10 @@ impl<'a> Expander<'a> {
     }
 
     fn expand_entry(&mut self, index: usize, entry: &'a StackEntry) -> Result<(), ModelError> {
+        // Checked before the zero-instance early return: a description that names its template
+        // twice is wrong even when this entry expands to nothing.
+        check_template_source(index, entry)?;
+
         let (count, index_var) = match (&entry.repeat, &entry.until) {
             (Some(repeat), None) => (
                 self.int_of(&repeat.count, "repeat.count")?,
@@ -172,7 +234,8 @@ impl<'a> Expander<'a> {
             self.last_index = Some(count - 1);
         }
 
-        // 链式接线：第 0 个实例接上一个 stack 项的最后一个实例，之后接上一个实例。
+        // Chained wiring: instance 0 takes the previous stack entry's last instance, every later
+        // instance takes the one before it.
         let mut chained: Vec<SlotId> = std::mem::take(&mut self.prev_outputs);
         for position in 0..count {
             let position = position as usize;
@@ -208,7 +271,7 @@ impl<'a> Expander<'a> {
         Ok(())
     }
 
-    /// 解析一个实例的输入接线，并检查端口形状与来源 slot 一致。
+    /// Resolve one instance's input wiring and check that port shapes match the source slots.
     #[allow(clippy::too_many_arguments)]
     fn wiring_for(
         &self,
@@ -270,12 +333,12 @@ impl<'a> Expander<'a> {
                 ))
             })?;
             let declared = self.shape_of(&port.shape)?;
-            let (_, held) = self.info(id);
+            let (_, held) = self.info(id)?;
             if declared != held {
                 return Err(ModelError::Invalid(format!(
                     "stack entry {entry_index} (prefix `{prefix}`) wires input `{local_name}` of \
                      template `{template_name}`, declared {declared:?}, to slot `{}` of shape {held:?}",
-                    self.name_of(id)
+                    self.name_of(id)?
                 )));
             }
         }
@@ -292,7 +355,7 @@ impl<'a> Expander<'a> {
     ) -> Result<Vec<SlotId>, ModelError> {
         let mut local: BTreeMap<String, SlotId> = wiring.clone();
 
-        // 1. 模板 slot：全局名 = 实例前缀 + 局部名。
+        // 1. Template slots: the global name is the instance prefix plus the local name.
         for decl in &template.slots {
             let name = format!("{prefix}.{}", decl.name);
             let dtype = self.dtype_of(decl.dtype.as_deref())?;
@@ -303,7 +366,7 @@ impl<'a> Expander<'a> {
             local.insert(decl.name.clone(), id);
         }
 
-        // 2. 节点：模板内顺序即发射顺序。
+        // 2. Nodes: template order is emission order.
         let mut produced: BTreeSet<String> = BTreeSet::new();
         for (node_index, node) in template.nodes.iter().enumerate() {
             self.emit_node(
@@ -317,7 +380,8 @@ impl<'a> Expander<'a> {
             )?;
         }
 
-        // 3. 声明的 outputs 必须真的被产出来，否则下游接线会接空气。
+        // 3. A declared output must actually be produced, otherwise downstream wiring connects to
+        // thin air.
         let mut outputs = Vec::with_capacity(template.outputs.len());
         for name in template.outputs.keys() {
             let id = local.get(name).ok_or_else(|| {
@@ -370,15 +434,18 @@ impl<'a> Expander<'a> {
                 )));
             }
 
-            // §3.7 #1：节点的 `out` 只能引用模板已声明的 slot 或该实例声明的 `outputs`。
-            // **不能**由编译器 infer 回填（旧实现继承本节点第一个输入的形状）：那会让无 GPU 的
-            // L1 形状检查依赖"存在可解析的实现"，而真实描述是 bf16、reference provider 只有 f32 ——
-            // 整条 L1 就废了，而 L1 正是这套架构存在的理由。
+            // §3.7 #1: a node's `out` may only reference a slot the template declares or an
+            // `outputs` entry of this instance. It may **not** be inferred by the compiler (the old
+            // implementation inherited the shape of the node's first input): that would make the
+            // GPU-free L1 shape check depend on "a resolvable implementation exists", and real
+            // descriptions are bf16 while the reference provider only has f32 — the whole of L1
+            // would be dead, and L1 is the reason this architecture exists.
             let declared_slot = template.slots.iter().any(|decl| decl.name == *name);
             let id = match local.get(name) {
                 Some(id) if declared_slot => {
-                    // 权重不是算子的产物：写到 weight slot 上说明描述把两件事混了。
-                    let (kind, _) = self.info(*id);
+                    // Weights are not produced by operators: writing to a weight slot means the
+                    // description conflated two different things.
+                    let (kind, _) = self.info(*id)?;
                     if !matches!(
                         kind,
                         SlotKind::Activation | SlotKind::Temp | SlotKind::Output
@@ -392,7 +459,8 @@ impl<'a> Expander<'a> {
                     *id
                 }
                 _ => {
-                    // 只剩一种合法来源：该实例声明的 `outputs`（首次被写时才分配 slot）。
+                    // Only one legal source is left: this instance's declared `outputs` (the slot is
+                    // allocated the first time the name is written).
                     let Some(port) = template.outputs.get(name) else {
                         return Err(ModelError::Invalid(format!(
                             "instance `{prefix}`: node {node_index} (`{}`) writes `{name}`, which \
@@ -425,9 +493,9 @@ impl<'a> Expander<'a> {
         Ok(())
     }
 
-    // ---- 辅助 -------------------------------------------------------------
+    // ---- helpers ------------------------------------------------------------
 
-    /// 全局名里的 slot：先按声明顺序分配，再登记名字与形状。
+    /// A slot by its global name: allocate in declaration order first, then record name and shape.
     fn add_slot(
         &mut self,
         name: &str,
@@ -452,18 +520,31 @@ impl<'a> Expander<'a> {
         Ok(id)
     }
 
-    fn name_of(&self, id: SlotId) -> String {
+    fn name_of(&self, id: SlotId) -> Result<String, ModelError> {
         self.names
             .get(id.0)
             .cloned()
-            .unwrap_or_else(|| format!("slot#{}", id.0))
+            .ok_or_else(|| self.unknown_slot(id))
     }
 
-    fn info(&self, id: SlotId) -> (SlotKind, Vec<i64>) {
+    fn info(&self, id: SlotId) -> Result<(SlotKind, Vec<i64>), ModelError> {
         self.slot_info
             .get(id.0)
             .cloned()
-            .unwrap_or((SlotKind::Activation, Vec::new()))
+            .ok_or_else(|| self.unknown_slot(id))
+    }
+
+    /// A `SlotId` outside this expander's own table.
+    ///
+    /// Ids come only from [`Self::add_slot`], so this is an internal invariant, not user input.
+    /// It must stay an error: defaulting to `Activation` (what this used to do) would let an
+    /// unknown id pass the "a node may not write a weight slot" check by accident.
+    fn unknown_slot(&self, id: SlotId) -> ModelError {
+        debug_assert!(false, "SlotId {id:?} was never allocated by this expander");
+        ModelError::Invalid(format!(
+            "internal error: slot id {} was never allocated by this expander",
+            id.0
+        ))
     }
 
     fn dtype_of(&self, name: Option<&str>) -> Result<RsDtype, ModelError> {
@@ -497,7 +578,8 @@ impl<'a> Expander<'a> {
             .map_err(|e| ModelError::Invalid(format!("{what}: {e}")))
     }
 
-    /// 按列表下标选模板（§3.3：选择只按列表下标，不做算术）。
+    /// Pick the template for one instance (§3.3: selection goes by list index only, never
+    /// arithmetic).
     fn select_template(
         &self,
         entry_index: usize,
@@ -505,8 +587,15 @@ impl<'a> Expander<'a> {
         position: usize,
         index_var: Option<&str>,
     ) -> Result<String, ModelError> {
-        let Some(select) = &entry.select else {
-            return Ok(entry.template.clone());
+        let select = match &entry.select {
+            Some(select) => select,
+            // `check_template_source` already rejected an entry with neither source.
+            None => {
+                return entry
+                    .template
+                    .clone()
+                    .ok_or_else(|| template_source_conflict(entry_index, entry));
+            }
         };
         let (list_name, index_name) = parse_indexed(&select.by).ok_or_else(|| {
             ModelError::Invalid(format!(
@@ -550,7 +639,7 @@ impl<'a> Expander<'a> {
         )))
     }
 
-    /// 替换 `{<索引变量>}` 与 `{last}`；还剩占位符就报错。
+    /// Substitute `{<index variable>}` and `{last}`; a leftover placeholder is an error.
     fn substitute(
         &self,
         entry_index: usize,
@@ -583,7 +672,7 @@ impl<'a> Expander<'a> {
 
     // ---- binding ----------------------------------------------------------
 
-    /// 校验每条 `binding` 命中且只命中 weight slot（§3.5、§4.1 第 5 步）。
+    /// Check that every `binding` hits weight slots and only weight slots (§3.5, §4.1 step 5).
     fn bind(&self) -> Result<Vec<ResolvedBinding>, ModelError> {
         let weights: Vec<String> = self
             .slot_info
@@ -737,7 +826,7 @@ impl<'a> Expander<'a> {
     }
 }
 
-/// `kind` 的规范拼写。
+/// The canonical spelling of `kind`.
 fn parse_kind(name: &str) -> Result<SlotKind, ModelError> {
     match name {
         "weight" => Ok(SlotKind::Weight),
@@ -754,7 +843,7 @@ fn parse_kind(name: &str) -> Result<SlotKind, ModelError> {
     }
 }
 
-/// `dtype` 的规范拼写与 [`RsDtype::name`] 一致（§3.6 #5）。
+/// The canonical spelling of `dtype`, identical to [`RsDtype::name`] (§3.6 #5).
 fn parse_dtype(name: &str) -> Result<RsDtype, ModelError> {
     RsDtype::parse(name).ok_or_else(|| {
         ModelError::Invalid(format!(
@@ -782,7 +871,8 @@ fn attrs_of(map: &BTreeMap<String, AttrLiteral>) -> Attrs {
     attrs
 }
 
-/// `transform` 词表（§3.4）：只认五个动词；参数语义属于加载器。
+/// The `transform` vocabulary (§3.4): five verbs, and only five; argument semantics belong to the
+/// loader.
 fn validate_transform(text: &str) -> Result<(), String> {
     const VERBS: [&str; 5] = ["take", "slice", "transpose", "split", "concat"];
     let (verb, rest) = text
@@ -800,7 +890,7 @@ fn validate_transform(text: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// `select.by` 的语法：`<参数名>[<索引变量>]`。
+/// The syntax of `select.by`: `<param name>[<index variable>]`.
 fn parse_indexed(text: &str) -> Option<(String, String)> {
     let (list, rest) = text.split_once('[')?;
     let index = rest.strip_suffix(']')?;
@@ -812,7 +902,7 @@ fn parse_indexed(text: &str) -> Option<(String, String)> {
     Some((list.to_string(), index.to_string()))
 }
 
-/// `*` 匹配**恰好一个**点分段。
+/// `*` matches **exactly one** dotted segment.
 fn pattern_matches(pattern: &str, name: &str) -> bool {
     let pattern: Vec<&str> = pattern.split('.').collect();
     let name: Vec<&str> = name.split('.').collect();

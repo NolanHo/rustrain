@@ -1,11 +1,12 @@
-//! 模型描述 → 全局 Plan（`docs/design/model-description.md` §0、§3、§4.1）。
+//! A model description becomes one global `Plan` (`docs/design/model-description.md` §0, §3, §4.1).
 //!
-//! 一个模型目录里有两个文件：`config.json`（模型自己的超参，来自公开仓库）与 `model.json`
-//! （描述：`params` / `templates` / `stack` / `binding`）。[`expand_dir`] 把两者变成**一个**
-//! [`rustrain_plan::Plan`] —— 全局模型，`layout` 全 `Replicate`，形状全量，切分只以符号轴的形式
-//! 记录在 [`ResolvedBinding`] 里。
+//! A model directory holds two files: `config.json` (the model's own hyper-parameters, as published
+//! upstream) and `model.json` (the description: `params` / `templates` / `stack` / `binding`).
+//! [`expand_dir`] turns the pair into **one** [`rustrain_plan::Plan`] — the global model, every
+//! `layout` `Replicate`, every shape concrete, sharding recorded only as symbolic axes inside
+//! [`ResolvedBinding`].
 //!
-//! 这里不读环境变量、不碰设备、不认识任何算子：模型是数据。
+//! Nothing here reads the environment, touches a device, or knows any operator: models are data.
 //!
 //! ```no_run
 //! let expanded = rustrain_model::expand_dir(std::path::Path::new("model-dir"))?;
@@ -13,9 +14,9 @@
 //! # Ok::<(), rustrain_model::ModelError>(())
 //! ```
 
-// 与 `rustrain-plan` 同样的取舍：`ModelError` 里带着路径、serde 错误与 `PlanError` 的候选表，
-// 那些正是让报错可操作的东西。为了缩小 `Err` 而装箱，等于给每次 `expand` 加一次解引用，
-// 而 expand 一次只跑一遍。
+// The same trade-off `rustrain-plan` makes: `ModelError` carries paths, serde errors and
+// `PlanError`'s candidate table, and those are exactly what makes a message actionable. Boxing it
+// to shrink the `Err` would push a deref onto every `expand`, and an expand runs once.
 #![allow(clippy::result_large_err)]
 
 mod desc;
@@ -30,10 +31,10 @@ pub use desc::{
 };
 pub use expand::{Expanded, ResolvedBinding, ResolvedBindingSlot, ResolvedSplit, expand};
 
-/// 描述层的一切失败。
+/// Everything that can fail in the description layer.
 ///
-/// 契约 §3.6 #8：六条错误路径都必须"非 0 退出 + stderr 说明名字 / 模式 / 路径"，不得 panic。
-/// 所以这里只有 `Result`，没有 `unwrap`。
+/// Contract §3.6 #8: all six error paths must "exit non-zero with a stderr message naming the
+/// name / pattern / path", never panic. Hence `Result` everywhere and no `unwrap`.
 #[derive(Debug, thiserror::Error)]
 pub enum ModelError {
     #[error("cannot read {path}: {source}")]
@@ -60,16 +61,16 @@ pub enum ModelError {
     Plan(#[from] rustrain_plan::PlanError),
 }
 
-/// 一个已加载的模型目录。
+/// A loaded model directory.
 pub struct Model {
     pub dir: PathBuf,
     pub desc: ModelDesc,
-    /// `config.json` 原样保留；`params.*.from` 按点分路径从这里取值。
+    /// `config.json` kept verbatim; `params.*.from` reads values out of it by dotted path.
     pub config: serde_json::Value,
 }
 
 impl Model {
-    /// 读模型目录下的 `config.json` 与 `model.json`。
+    /// Read `config.json` and `model.json` from a model directory.
     pub fn load(dir: &Path) -> Result<Self, ModelError> {
         let config: serde_json::Value = read_json(&dir.join(CONFIG_FILE))?;
         let desc: ModelDesc = read_json(&dir.join(DESC_FILE))?;
@@ -80,13 +81,13 @@ impl Model {
         })
     }
 
-    /// 展开成全局 Plan。
+    /// Expand into the global plan.
     pub fn expand(&self) -> Result<Expanded, ModelError> {
         expand::expand(&self.desc, &self.config)
     }
 }
 
-/// 便捷入口：`expand_dir(dir)` = `Model::load(dir)?.expand()`。
+/// Convenience entry point: `expand_dir(dir)` = `Model::load(dir)?.expand()`.
 pub fn expand_dir(dir: &Path) -> Result<Expanded, ModelError> {
     Model::load(dir)?.expand()
 }

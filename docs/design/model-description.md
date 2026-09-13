@@ -178,7 +178,8 @@ local[d] = global[d] / Π { degree(轴) : 轴 ∈ spec.group, spec ∈ dims, nor
 ```jsonc
 "stack": [
   { "template": "embed",   "prefix": "embed" },
-  { "template": "decoder", "prefix": "layers.{l}",
+  // `select` 与 `template` 互斥（§3.7 #13）：有 select 时兜底只有 default
+  { "prefix": "layers.{l}",
     "repeat": { "count": "layers", "index": "l" },
     "select": { "by": "layer_types[l]",
                 "cases": { "full_attention": "decoder_full",
@@ -302,6 +303,10 @@ D1 的验收测试暴露了十处未定义。以下裁定**是契约的一部分
 | 10 | fixture 的 `seq` 取 `max_position_embeddings`（262144） | **改为显式小值（512）**：序列长度是**运行期**选择，不是模型常量；262144 会污染形状表并误导后续的本地形状推导 |
 | 11 | 声明了却没人写的 slot | **应报错**（`expand` 期）：一个既不被任何节点读、也不被任何节点写的模板 slot 是**死钩子** —— 模板声明的 slot 必须至少是一个节点的输入或输出。**下发到下一单元实现**（本次未做），并补测试 |
 | 12 | 新增的 `out` 校验在 CLI 侧没有端到端用例 | 冻结的 `model_description.rs` 覆盖不到它（四个 fixture 补齐后都不触发）。**允许新增一个 fixture + 新测试文件**（不得改冻结的那个），与 #11 一起做 |
+| 13 | `select` 与 `template` 同时出现 | **互斥**：有 `select` 时 `template` 必须缺省，否则**报错** —— 两个兜底来源就是"同一个事实两个来源"；`select` 的兜底只有 `default`。§3.3 的示例据此修正 |
+| 14 | #13 的校验放在哪一层 | **entry 级最前**（早于 `count <= 0` 早退）：静态错误不该因为别的错误先报而被漏掉；`(None, None)` 同样报错 |
+| 15 | #11 的死钩子检查是模板级还是实例级 | **模板级**：只要是 `desc.templates` 里的模板就查（含从未被实例化的）。死数据不论用不用都该报出来 |
+| 16 | **JSON `null` 在 `from` 路径上** | **`null` 视为缺失**（HF config 里 `"rope_scaling": null` 就是"没配"的惯用写法，不是类型错误），`default` 生效；只有**非 null 的错误类型**（数字/字符串/数组出现在期望对象的位置）才报错 |
 
 ---
 

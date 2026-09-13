@@ -203,8 +203,16 @@ HF transformers 的 logits 在容差内一致；每层 hidden 的 mean/std/max �
 
 ### 交付物履行状态
 
-- [ ] D1 — 描述文件能表达这个模型
+- [x] **D1 — 描述文件能表达这个模型** —— 证据：提交 `746acc1`（主体）+ `3057544`（返工）；
+  实测 `nodes 1047 / slots 1943 / weight slots 884`，两次展开逐字节相同（sha256 `458ff756…`）；
+  6 条契约测试 + 29 条 model 测试 + 工作区 254 passed / clippy 0 warning / `ops check` exit 0；
+  46 条 binding 独立对账 **712/712** 文本+MTP 张量（0 未命中、0 未覆盖、0 重复、0 视觉）；
+  独立审查 `APPROVED_WITH_NOTES`（剩余为注释语言与若干 note，见下）。
 - [ ] D2 — L2 加载检查对账 1045 个张量
 - [ ] D3 — 轴与 mesh + 形状算术
 - [ ] D4 — instantiate 与 L1 全绿
 - [ ] D5 — 前向数值对齐 HuggingFace
+
+**D2 的已知输入（来自 D1 审查）**：`ResolvedBinding.slots` 的顺序是**按 target 分组**（先所有 `q` 槽、
+再所有 `gate` 槽），不是按 source 实例交错 —— **D2 的加载器不得把 source 实例顺序与 `slots` 顺序直接 zip**，
+否则会把第 7 层的 checkpoint 张量配到第 3 层的 gate 槽。要么在 D1 侧改成按实例交错，要么在 D2 侧显式配对。

@@ -393,11 +393,13 @@ fn plan_explain(
     Ok(())
 }
 
-/// `plan explain --model <dir>`：描述 → **全局 Plan**，再报告每个算子在本机有没有实现。
+/// `plan explain --model <dir>`: description → **global plan**, then report whether each operator
+/// has an implementation on this machine.
 ///
-/// 这里**不编译**：全局 Plan 的形状与 `layout` 是"全量 + 全 Replicate"，要到 `instantiate`
-/// 拿到 mesh 才能编译（`docs/design/model-description.md` §0）。而契约 §3.6 #10 要的正是
-/// "dtype 没有可用实现时 explain 不失败"：未解析的算子进 `implementations` 报告，退出码仍为 0。
+/// Nothing is compiled here: the global plan's shapes and `layout`s stay "fully concrete + all
+/// Replicate" until `instantiate` has a mesh (`docs/design/model-description.md` §0). That is what
+/// contract §3.6 #10 asks for: "`explain` does not fail when a dtype has no implementation" —
+/// unresolved operators go into the `implementations` report and the exit code stays 0.
 fn plan_explain_model(
     dir: &Path,
     recipe_path: Option<&Path>,
@@ -419,7 +421,8 @@ fn plan_explain_model(
     let env = TargetEnv::default();
     let plan = expanded.plan;
 
-    // 逐节点解析：哪种实现会跑，或者为什么没有（契约 R-1 的拒绝理由原样带出）。
+    // Node by node: which implementation would run, or why none can (contract R-1's rejection
+    // reason, passed through verbatim).
     let mut implementations = Vec::with_capacity(plan.nodes.len());
     let mut unresolved: BTreeMap<(String, String), usize> = BTreeMap::new();
     for (index, node) in plan.nodes.iter().enumerate() {
@@ -466,7 +469,8 @@ fn plan_explain_model(
             "counts": {
                 "slots": plan.slots.len(),
                 "nodes": plan.nodes.len(),
-                // 全局 Plan 没有编译过，所以没有 step（每个节点在 instantiate 之后才成为 step）。
+                // The global plan was never compiled, so there are no steps (a node becomes a step
+                // only after instantiate).
                 "steps": 0,
                 "weights": weights,
                 "bindings": expanded.bindings.len(),
@@ -512,7 +516,8 @@ fn plan_explain_model(
             plan.nodes.len()
         );
         for ((op, reason), count) in &unresolved {
-            // 解析失败的第一行就够定位；候选表与契约引用在 `--json` 里。
+            // The first line of a failure is enough to locate it; the candidate table and the
+            // contract references are in `--json`.
             let headline = reason.lines().next().unwrap_or(reason);
             println!("    {op} × {count}: {headline}");
         }
@@ -520,10 +525,11 @@ fn plan_explain_model(
     Ok(())
 }
 
-/// 一个 slot 的 JSON 形态。
+/// The JSON form of one slot.
 ///
-/// `dtype` 用 [`rustrain_abi::ffi::RsDtype::name`] 的拼写（§3.6 #5 的词表）——派生 `Serialize`
-/// 写的是 ABI 的整数编号，对读 plan 的人没有意义。
+/// `dtype` uses the spelling of [`rustrain_abi::ffi::RsDtype::name`] (§3.6 #5's vocabulary): the
+/// derived `Serialize` would write the ABI's integer code, which means nothing to a reader of the
+/// plan.
 fn slot_json(slot: &Slot) -> serde_json::Value {
     serde_json::json!({
         "name": slot.name,
@@ -534,7 +540,8 @@ fn slot_json(slot: &Slot) -> serde_json::Value {
     })
 }
 
-/// 一个节点的 JSON 形态。输入输出按 slot 名列出，因为 1000 个节点的 plan 里索引不可读。
+/// The JSON form of one node. Inputs and outputs are listed by slot name, because indices are
+/// unreadable in a plan of 1000 nodes.
 fn plan_nodes_json(plan: &Plan) -> Vec<serde_json::Value> {
     plan.nodes
         .iter()
