@@ -470,3 +470,30 @@ fn expansion_is_deterministic() {
         "同一份描述 + 同一份 config 必须得到同一个 Plan"
     );
 }
+
+/// 主干 `rmsnorm` 必须显式声明 `eps = text_config.rms_norm_eps`（1e-6）。
+///
+/// 这不是风格问题：provider 的缺省值是 1e-5，而 Qwen3.6 的 embedding 方差只有 ~9e-5，
+/// 两者差一个量级，归一化标度因此差 sqrt((9e-5 + 1e-5)/(9e-5 + 1e-6)) ≈ 0.954 —— **第一个
+/// 算子就带 ~4.6% 的尺度误差**，后面每一层都继承它。逐元素对比正是靠这个把
+/// `layers.0.h1` 从 5.5e-2 的 rel_L2 拉回 7e-8。
+#[test]
+fn the_trunk_rmsnorms_declare_the_config_eps() {
+    let expanded = expanded();
+    let plan = &expanded.plan;
+    let rmsnorms: Vec<&rustrain_plan::PlanNode> = plan
+        .nodes
+        .iter()
+        .filter(|node| node.op.name == "rmsnorm")
+        .collect();
+    assert!(!rmsnorms.is_empty(), "fixture 里必须有 rmsnorm 节点");
+    for node in rmsnorms {
+        assert_eq!(
+            node.attrs.f64("eps"),
+            Some(1e-6),
+            "主干 rmsnorm `{}` 必须声明 eps = text_config.rms_norm_eps (1e-6)；\
+             缺省时 provider 用 1e-5，embedding 方差 ~9e-5 下首算子就差 ~4.6%",
+            plan.slot(node.outputs[0]).name
+        );
+    }
+}
