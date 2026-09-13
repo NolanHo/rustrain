@@ -1,0 +1,14 @@
+# The recipe that runs everything on the ATen (CUDA) plugin.
+#
+# `default = "aten"` means "the implementation published by the plugin named
+# aten decides". Every operator in this plugin is published as exactly one
+# variant, `cuda.aten.f32`, so a forward plan that names an operator this plugin
+# does not implement fails resolution with the candidate table instead of
+# quietly falling back to the CPU reference provider — that quiet fallback is
+# exactly what "no CPU execution except the oracle" forbids.
+#
+# Nothing else is set: the numerics are f32 in / f32 out / f32 accumulate, which
+# is the precision section's default and the only dtype this variant declares.
+[kernel]
+default = "aten"
+strict = true

@@ -68,7 +68,7 @@ MoE grouped GEMM）。**不手写任何 kernel**；只有在某个算子三个�
 **不自己编译**。宿主是 CUDA 13.0 + torch 2.11 + py3.12，索引里正好有对应档：
 
 ```
-causal_conv1d-1.6.2.post1+cu.13.0.torch.2.11-cp312-cp312-manylinux_2_28_x86_64.whl
+causal_conv1d-1.6.2.post1+cu.13.0.torch.2.11-cp312-cp312-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl
 ```
 
 索引根：`https://wheels.astral.sh/simple/cu130/`（17 个包），含我们需要的大部分：
@@ -81,15 +81,57 @@ causal_conv1d-1.6.2.post1+cu.13.0.torch.2.11-cp312-cp312-manylinux_2_28_x86_64.w
 | 别的可选 | `transformer-engine`、`deepgemm`、`deepep`、`sageattention` |
 | **FLA（`gated_delta_rule`/`RMSNormGated`/`l2_norm`）** | 索引里**没有** —— 它是纯 Python/Triton 包，PyPI 直接装，同样**不需要编译** |
 
-**调用路径**（这一点决定了插件的形态）：这些 wheel 是**带 CUDA 扩展的 Python 包**，注册成 torch 的自定义算子。所以我们的插件不写 kernel，而是**链 libtorch 的 C++ 分发器**：`at::matmul` / `at::scaled_dot_product_attention` 直接走 ATen，`causal_conv1d` 与 FLA 的算子通过 `torch.ops.*` 注册进分发器后同样能在 C++ 侧调到。换句话说：**一个链 libtorch 的 Rust 插件**，把我们的算子词表映射到 ATen + 那几个扩展已注册的算子 —— 零 kernel 编译、零手写。
+## 3.7 落地时的实测结论（2026-09，逐包核对；**推翻上表三行**）
 
-前置条件（宿主上逐条确认）：`_GLIBCXX_USE_CXX11_ABI` 与 wheel 的 `cxx11abiTRUE` 一致、torch 2.11.0+cu130 的 C++ 头文件与 libtorch 可链、Python 3.12。
+上表是按"PyPI 上有包"写的，真正去把 wheel 拆开看之后，三处不成立：
 
-## 4. 确认后我按什么顺序做
+1. **`causal-conv1d` 的 wheel 里没有头文件，也没有可链接库。**
+   整个 wheel 只有 `causal_conv1d_cuda.cpython-312-x86_64-linux-gnu.so`（CPython 扩展）与 4 个
+   `.py`；`csrc/`、`include/` 不进 wheel。C++ 入口确实在（`nm -D` + `c++filt`）：
+   全局命名空间的
+   `causal_conv1d_fwd(const at::Tensor&, const at::Tensor&, const std::optional<at::Tensor>&, …, bool)`，
+   要用只能 `dlopen` + 自己声明 mangled 符号。分发器的注册在 Python 侧
+   （`torch.library.custom_op`，库名 `DaoAILab`，`import causal_conv1d` 之后才存在），
+   而那个 `.so` 的 `DT_NEEDED` 里有 **`libtorch_python.so`**。
+2. **FLA 在 C++ 侧按名字调不到。** `flash-linear-attention` / `fla-core` 全部是 `py3-none-any`
+   纯 Python 包；稀疏克隆整仓后 `.cpp/.cu/.cuh/.h/.hpp/.so` 数量为 **0**，`TORCH_LIBRARY` 与
+   `torch.ops.` 出现次数为 0。`chunk_gated_delta_rule` / `l2_norm` / `RMSNormGated`
+   （实际类名 `FusedRMSNormGated`）都是普通 Python 函数 → `@triton.jit`。`@dispatch` 是它自己的
+   Python 后端选择器，从不碰 torch 分发器。
+3. **MoE grouped GEMM 没有任何预编译二进制。** `grouped-gemm`（tgale96，0.3.0）与
+   `nv-grouped-gemm`（fanshiqing，1.1.4.post8）在 PyPI 上**只有 sdist**；`megablocks` 0.10.0
+   同样只有 sdist，且 `install_requires` 钉死 `torch>=2.7.0,<2.7.1`（排除 2.11）。
+   `wheels.astral.sh/simple/cu130` 里这三个包**不存在**。
 
-1. **ATen 插件骨架**：`.so` + ABI v1 + 最小算子集（`linear` + `elementwise` + `rmsnorm`），
-   在宿主上跑通一个真前向的一层；
-2. **SDPA + causal-conv1d + FLA** 三件接入，跑通 full-attention 层与 GDN 层各一层；
-3. **MoE grouped GEMM**；
-4. **NCCL 后端** → 8 卡 TP/EP 真跑，出你想要的并行效果数据；
-5. 每步都要有"与 reference provider 逐算子数值对齐"的门禁（这就是 oracle 的用处）。
+`torch.utils.cpp_extension` 也有一个要绕开的默认：`CppExtension` / `CUDAExtension` 会无条件
+追加 `-ltorch_python`（只有 `py_limited_api=True` 才跳过），而我们的插件是被**没有 Python
+解释器的 Rust 宿主** `dlopen` 的。构建因此只借它拿 include / library 路径，链接项自己写。
+
+**因此 D6 第一步的形态是**：一个链 libtorch 的 C++ 插件（`plugins/aten/`），把词表映射到 ATen
+——GEMM 走 cuBLAS、注意力走 ATen 的 FlashAttention-2 / mem-efficient、因果卷积走 cuDNN 的
+`conv1d`、GDN 走声明的 recurrence、MoE 走按专家的 ATen 组合。**上游专用 kernel（causal-conv1d
+的融合 silu、FLA 的分块、grouped GEMM）是"速度选项"，不是正确性前提**；引入它们要么把 CPython
+嵌进宿主、要么自己编译扩展，两条都超出"用户已确认"的范围，故未做。
+
+## 3.8 位置常量与下一步
+
+- `causal_conv1d` 的快速路径：`dlopen` 上游 `.so` + dlsym mangled 符号，或嵌 CPython 走
+  `DaoAILab::_causal_conv1d_fwd_cpp`。两者都需要用户点头。
+- MoE 快速路径：先看 torch 2.11 是否带 `torch._grouped_mm`（ATen 内置的 grouped GEMM，
+  零外部依赖）；否则按 sdist 自己编译 `nv-grouped-gemm`。
+- GDN 快速路径：FLA 的分块 kernel 只能通过嵌入式 Python bridge 到达。
+
+
+## 4. 实际执行顺序（按 §3.7 的实测修正）
+
+1. **ATen 插件骨架**（已做）：`plugins/aten/`，C++17 + ABI v1，28 个算子里先做完全套前向要用的
+   那批；`rustrain ops list --plugin librustrain_aten.so` 已经能列出 60 个实现（32 reference +
+   28 aten），证明 Rust 宿主 `dlopen` C++ 插件这条边界是通的；
+2. **框架的设备路径**（进行中）：`--device cuda` 的分配器（driver API，`dlopen`，核心 crate
+   仍然零 CUDA 依赖）、按设备对齐的显存打包、`run` / `ops check` 的插件与 recipe 参数；
+3. **逐算子门禁**：`rustrain ops check --plugin ... --recipe plugins/aten/aten.toml --device cuda`
+   ——每个 aten 变体都与 reference（CPU oracle，小张量）对拍；
+4. **一层真前向**：真实权重、单层、与 HF 的同层 hidden 对比；
+5. **NCCL 后端** → 8 卡 TP/EP 真跑，出并行效果数据（权重字节、步数、集合通信次数与字节量）；
+6. 速度选项（`causal-conv1d` / FLA / grouped GEMM / `_grouped_mm`）按 §3.8 逐个向用户确认后再接。
+
