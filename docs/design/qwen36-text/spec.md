@@ -169,7 +169,7 @@ rustrain check --model <model-dir> [--checkpoint <dir>] [--tp N --cp N --ep N --
 ### D1 — 描述文件能表达这个模型
 
 **可观察结果**：存在一份 `model.json` + 一个模型目录（`config.json` 来自 HF 公开仓库），
-展开后得到一个全局 Plan：**节点数 > 900**、**总 slot 数 > 900**。实测：**1064 节点 / 1949 slot / 873 weight slot**。
+展开后得到一个全局 Plan：**节点数 > 900**、**总 slot 数 > 900**。实测（D5 收尾后的描述）：**1184 节点 / 2110 slot / 873 weight slot** —— 数字随 D4/D5 的逐 head 修正与 MoE 契约对齐增长，权重槽与 binding 始终未变。
 
 > **注意：weight slot 数与 checkpoint 张量数不相等，也不该相等。**
 > checkpoint 有 **712** 个文本+MTP 权重张量（文本 693 = 根 3 + 层内合计 80+270+60+280，加 MTP 19）。
@@ -296,17 +296,17 @@ HF transformers 的 logits 在容差内一致；每层 hidden 的 mean/std/max �
 ### 交付物履行状态
 
 - [x] **D1 — 描述文件能表达这个模型** —— 证据：提交 `746acc1`（主体）+ `3057544`（返工）；
-  实测 `nodes 1064 / slots 1949 / weight slots 873`，两次展开逐字节相同（sha256 `8c2154e8…`）；
+  实测 `nodes 1184 / slots 2110 / weight slots 873`，两次展开逐字节相同（有专门测试钉确定性，不在此钉某个哈希 —— 描述改一次哈希就该变一次）；
   6 + 3 条契约测试 + 工作区 265 passed / clippy 0 warning / `ops check` exit 0；
   46 条 binding 独立对账 **712/712** 文本+MTP 张量（0 未命中、0 未覆盖、0 重复、0 视觉）；
   **形状对账 873/873**（快照取自真实分片头部，含 `transform`/`split` 的机械验证）；
   独立审查 `APPROVED_WITH_NOTES`，其指出的缺陷已全部修掉（见下）。
 - [x] **D2 — L2 加载检查对账 1045 个张量** —— 证据：提交 `460178f`（主体）+ `8f9728a`、`d37f936`（两轮返工）+ `b793362`、`27c4bfd`、`5da56ba`、`a2c47ca`（第四、五轮：审查复现的七条"假绿"全部关闭）；
   真实快照（1045 张量 / 仅分片头部 / 无权重 / 无网络）下 `rustrain check --dtype f32` 退出 0，
-  counts = `{bindings 46, nodes 1064, slots 1949, weights 873, slots_unbound 0, tensors_unconsumed 0, shape_mismatch 0, dtype_mismatch 0}`；
-  "实现可用性"为 `skip` 且逐条写明缺哪个原语（`moe_layer`×41 = **41 / 1064** 个节点；5 个新原语中其余 4 个已随 D5 的 kernels 工作落地）；
+  counts = `{bindings 46, nodes 1184, slots 2110, weights 873, slots_unbound 0, tensors_unconsumed 0, shape_mismatch 0, dtype_mismatch 0}`；
+  "实现可用性"在 `--dtype f32` 下已由 `skip` 变 **pass**（D5 把最后一个缺失算子 `moe_layer` 补齐后，1064 → 1184 个节点全部解析）；在描述自己的 `bf16` 下仍是 `skip` 且逐行写明成因（reference provider 只收 f32），该形态由 declared-dtype 那次运行钉住；
   四个故意破坏的用例各自 `Fail` 并点名：漏一条 binding → 槽名、多声明一个不存在的张量 → source 模式、漏掉 `transpose` → 槽名 + 两个形状数字、未被消费的张量 → 张量名；`ignore` 删掉即 `Fail`；
-  门禁 `check_l2.rs` **9 条** + `check_report_contract.rs` **4 条**：C6 的 15 个 id、14 个状态、8 个计数的**值**、报告自称的 model / checkpoint / dtype、两处 `details` 的**内容**（按 dtype 分表：`f32` 是 1 行 / 41，`bf16`·`f16` 与默认路径是 16 行 / 1064，每行还要求 `why` 与成因相符、reason 的**开头总数**与表一致）、以及**不带 `--dtype`** 与**显式 `--dtype bf16` / `f16`** 三条路径（这三条原本都没有门禁）；
+  门禁 `check_l2.rs` **9 条** + `check_report_contract.rs` **4 条**：C6 的 15 个 id、14 个状态、8 个计数的**值**、报告自称的 model / checkpoint / dtype、两处 `details` 的**内容**（按 dtype 分表：`f32` 该项为 pass、`details` 为空；`bf16`·`f16` 与默认路径是 16 行 / 1184，每行还要求 `why` 与成因相符、reason 的**开头总数**与表一致）、以及**不带 `--dtype`** 与**显式 `--dtype bf16` / `f16`** 三条路径（这三条原本都没有门禁）；
   每条新断言都用**变异反证**过，十四种变异全部变红：计数漂移 / 计数写成 `null` 或 `46.0` / 清空 `details` / 只在默认 dtype 下清空 / 把 bf16 表截断回 5 行 / 把显式 bf16 改成 `pass` / 单条算子计数改动 / 单条理由掏空 / 理由与成因矛盾 / 重复条目 / ignore 总数或 reason 总数改动 / reason 丢掉或篡改总数 / 表与和互不自洽 / `dtype` 谎报 / model 指向别的目录 / 同一 id 两次；
   工作区 **304 passed** / clippy 0 warning / `ops check` exit 0；
   独立审查**五轮**：第三轮 `APPROVED_WITH_NOTES`（N1 已关；N2 锚定只约束首段、N3 前后空白当字面段 → `model-description.md` §3.8）；第四、五轮（三个独立视角）各自复现了"报告无用但门禁全绿"的路径（`dtype`/`model`/`checkpoint` 谎报、同一 id 两条、reason 与 details 数目不符、默认 dtype 下清空 details、bf16 表可被截断、显式 dtype 无门禁、reason 可篡改总数、`why` 可自相矛盾），**全部已修并各自反证**。

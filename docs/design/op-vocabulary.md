@@ -96,7 +96,8 @@ causal_conv1d(Q|K|V, conv1d[8192,1,4], silu) → qkv_c
   in_proj_a → a[32] ; in_proj_b → b[32] ; in_proj_z → z[4096]
   g    = -exp(A_log) * softplus(a + dt_bias)                # elementwise
   beta = sigmoid(b)                                          # elementwise
-  l2norm(q)·scale , l2norm(k)·scale                          # scale = 1/sqrt(128)
+  reshape q,k → [b,s,16,128] ; l2norm(q,k, dim=-1) ; reshape 回 [b,s,2048]   # 逐 128 维 head 归一（HF: l2norm(...,dim=-1)）
+  # scale = 1/sqrt(128) 只作用于 q，且由 gated_delta_rule 内部施加（HF line 279）—— 不占图节点
   gated_delta_rule(qn, kn, v, g, beta) → o                  # 状态 float32
   rmsnorm_gated(o, norm[128], z) → og                        # 权重约定：原始 weight
   reshape(og, [b,s,4096]) → linear(out_proj) → y             # ⇒ Partial
@@ -111,14 +112,17 @@ post_attention_layernorm → moe_layer → x1 + moe_out → x2
 ### 3.3 `moe_layer`（40 层全有；1 个 EXPLICIT 算子）
 
 ```
-topk_router(h, gate[256,2048], topk=8, norm_topk_prob) → routing
-moe_layer(h, routing,                                            # EXPLICIT
-          experts.gate_up_proj [256,1024,2048],
-          experts.down_proj     [256,2048,512],
+topk_router(h, gate[256,2048], top_k=8, norm_topk_prob=true) → routing_weights, routing_indices
+  # 两个输出 = 算子自己的 out0/out1 顺序（weights 先、indices 后）；indices 是 i32 索引，不是精度
+  # HF 的 top-k 权重重归一化在这个 transformers 版本里是无条件的（line 773），所以该属性不是摆设
+moe_layer(h, routing_weights, routing_indices,                   # EXPLICIT，10 个输入
+          experts.gate_proj [256,2048,512],   # 拆开：融合 [E,2I,H] 的 2I 轴正是 TP 切过
+          experts.up_proj   [256,2048,512],   # gate/up 语义边界的那条轴（HF 用时才 chunk(2,-1)）
+          experts.down_proj [256,2048,512],
           shared_expert.{gate,up,down}_proj [512,2048]/[2048,512],
           shared_expert_gate [1,2048])
   collectives: [ all_to_all({tp, ep}) ] ×2（dispatch + combine 各一次）
-  in/out shape: [b, s, 2048]（静态）
+  in/out shape: [b, s, 2048]（静态）；无属性 —— top_k / norm_topk_prob 属于 router 节点
 ```
 
 **为什么是 EXPLICIT**：dispatch 之后每 rank 的 token 数是**运行期**才知道的，而 `Plan` 要求具体形状
