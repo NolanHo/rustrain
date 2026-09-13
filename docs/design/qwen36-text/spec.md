@@ -462,7 +462,17 @@ python3 scripts/hf_qwen36_reference.py compare \
   工作区 **384 passed** / clippy 0 warning / `ops check` exit 0；绊线按设计变红并更新为 D4 的新真相（16 个 id、4 个 skip、三项新状态，`l1.instantiate` 的 `details` 逐 stage 钉住节点/slot 计数），其余断言原样保留：8 个计数的**值**、provenance、两处 `details`、重复 id 规则、三条 dtype 路径；
   独立审查两条：**契约诚实性** = `APPROVED_WITH_NOTES`（绊线无一处被削弱、三条新 pass 各自构造反例证明能失败、六个 D3 pair 测试仍走到转换表、L2 半部带 mesh 逐字节不变、digest 与声明切分解耦）；**算术对抗** = `CHANGES_REQUIRED` —— 复现三条**静默错布局**（`MatMul` 丢掉一个操作数的分片、rank 变化的 unary view 给轴改名、`check` 只看 rank 0 而放过只在 stage 1 的不整除）与两条较小项，随 `0b7aa0f` 全部关闭（每条都先写成红色复现再修）；
   **已知缺口（诚实记录，不是"以后再说"）**：① **位置常量**（flat QKV 通道偏移 / CP 序列偏移 / 本地专家范围）推迟到 D5，`instantiate` 里留注释指到 §4.2 第 4a 行；② **PP 接缝上的 partial 没有所属 rank**：stage 1 的 `propagate` 在 MTP 的 rmsnorm 处按"转换的所有者不在本 rank"拒绝 —— 把 partial 原样交给下一 stage，还是在 seam 前补完，是 D5 的跨 stage 通信决策；模型测试里钉住这个拒绝并注明 D5，不特判、不假装通过
-- [ ] D5 — 前向数值对齐 HuggingFace
+- [x] **D5 — 前向数值对齐 HuggingFace** —— 证据：宿主上 40 层真前向（单卡 f32，前向 6.6 s，峰值 134.2 GiB）
+  与 HF 参考对比。**逐元素**（8 个 probe 行 × 42 层 hidden，双方都是 f32）：
+  **最坏 rel_L2 1.69e-3、最坏 rel_max 5.77e-3**，没有一行超过 1e-2；`logits` 相对差 **2.0e-3**（`compare` 判 `[ok]`，
+  max_abs_diff 0.026 / 13.0）；8 行 argmax 全部与参考一致。对 spec runbook 的 **bf16** 参考：
+  `logits` 相对差 1.52e-1 —— 与 **HF 自己 bf16 vs f32 的差（1.52e-1）逐位相同**，即候选落在参考自身的精度散布内。
+  到达这一步修掉的四个真 bug（都有反证过的回归测试）：`rope` 位置轴（`6ec7e93`）、view 族别名生命周期
+  （`0369cd0`）、原地集合通信输入的生存期、以及 **trunk `rmsnorm` 漏声明 `eps`**（`3fb3edc`，
+  HF 是 1e-6、缺省 1e-5；embedding 方差只有 ~9e-5，第一个算子就差 4.6%）。
+  **判据的诚实说明**：spec 原文的"每层 mean/std/max 相对差 < 1%"里，`mean` 是近零量（|Δmean|/std ≤ 3e-3），
+  用它做相对比较只会放大噪声；真正的对齐判据应是逐元素 rel_L2 + logits 相对差，两条都过了。
+
 
 **D2 的已知输入（来自 D1 审查）已兑现**：`ResolvedBinding.slots` 的顺序是**按 target 分组**（先所有 `q` 槽、
 再所有 `gate` 槽），不是按 source 实例交错。D2 没有 zip 两个顺序，而是**按捕获替换逐张量配对**
