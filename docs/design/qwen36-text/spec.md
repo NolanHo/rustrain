@@ -231,7 +231,30 @@ L1 全绿（按契约 skip 的四个项除外）；`l1.instantiate` 的 `details
 
 **可观察结果**：在验证宿主（8× L20X）上，同一段 token、同样的 `input_ids`，rustrain 的 logits 与
 HF transformers 的 logits 在容差内一致；每层 hidden 的 mean/std/max 差异 < 1%（沿用旧框架验证过的方法）。
-**交付位置**：`rustrain-kernels` 的 5 个新原语 reference 实现 + 3 处 T2 声明补齐 + 一个对比脚本。
+**交付位置**：`rustrain-kernels` 的 5 个新原语 reference 实现 + 3 处 T2 声明补齐 + `rustrain run`（权重加载与前向）+ 一个对比脚本。
+
+**上机步骤**（在 `root@47.94.214.197:26002` 上；本机到这一步为止的部分已全部完成）：
+
+```bash
+# 1) 参考侧：HF 前向（bf16，固定探针），~70 GB 权重（HF 缓存为空时需要下载）
+python3 scripts/hf_qwen36_reference.py dump --model Qwen/Qwen3.6-35B-A3B \
+        --dtype bf16 --device-map auto --out /var/tmp/hf-ref.npz
+
+# 2) 候选侧：rustrain 前向（同样的固定探针；权重 bf16 原样读入、精确加宽到 f32 执行）
+cargo run --release -p rustrain-cli -- run \
+        --model  crates/rustrain-model/tests/fixtures/qwen36-text \
+        --checkpoint <真实 safetensors 目录或 index.json> \
+        --tokens "9707,11,1879,0,323,358,314,279" \
+        --out /var/tmp/rustrain.npz
+
+# 3) 判定：logits 与逐层 hidden 摘要的相对差 < 1%，并打印第一处超差的层
+python3 scripts/hf_qwen36_reference.py compare \
+        --reference /var/tmp/hf-ref.npz --candidate /var/tmp/rustrain.npz --json
+```
+
+两侧的前向各自独立：参考侧是 HF 的 bf16，候选侧是"同样的 bf16 权重加宽到 f32 后执行"。1% 的容差要吸收的是 **HF 的 bf16 舍入**，不是我们的加宽（bf16 ⊂ f32，加宽是精确的）。`compare` 先比对 `input_ids`，不一致直接判定"不可比"。
+
+**已知上机风险（诚实清单）**：① 参考 provider 是 f32，整模型 f32 常驻约 143 GB —— 宿主机 1.6 TB 内存够，但**这一跑会慢**；② `tp/cp/ep/dp > 1` 的分片执行需要真实的 collective 后端（当前只有 world=1 的 identity 后端，会**响亮拒绝**而不是静默跑错）；③ `pp > 1` 拒绝执行（跨 stage 接缝是 D5 的未决项）；④ 探针超过 512 需要新描述（§3.10 #3）。
 **验收与证据**：
 - bf16 下 `max_abs_diff(logits) / max_abs(logits)` < 1%
 - 逐层 hidden 摘要差异 < 1%（前 n 层逐层打印，定位第一处发散的层）
