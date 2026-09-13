@@ -11,12 +11,17 @@
 //! or is renamed turns this file red, and the *status* of every id is pinned, so "still skipped"
 //! cannot be mistaken for "still checked".
 //!
-//! It also pins **what the checks found**, not only that they ran: the value of each of the eight
-//! counters, and the per-object `details` of the two items that carry any. A pinned key set alone
-//! would not catch a report that keeps every id and status while writing `nodes: null` or emptying
-//! the availability list — a green-looking report that says nothing is the false green this file is
-//! here to prevent, and the per-object lists are what back the wording of the one `skip` that has
-//! something concrete to say.
+//! It also pins **what the checks found**, not only that they ran: which model and checkpoint the
+//! report is about, the dtype it ran at, the value of each of the eight counters, and the per-object
+//! `details` of the two items that carry any. A pinned key set alone would not catch a report that
+//! keeps every id and status while writing `nodes: null`, emptying the availability list, naming a
+//! model it never read, or recording a `dtype` it never checked.
+//!
+//! What it deliberately does **not** claim: prose. The numbers this file reads are tied to each other
+//! (counters ↔ details ↔ the reason's totals), but a `reason` sentence that contradicts its own
+//! counters is not in scope — nor is a report whose numbers are fabricated rather than computed,
+//! since they would match the constants here. `check_l2.rs`'s deliberately broken fixtures are what
+//! stand against the latter.
 //!
 //! Everything goes through the real binary (`env!("CARGO_BIN_EXE_rustrain")`); no Rust internals.
 //! Contract: `docs/design/qwen36-text/spec.md` C2 (the report and the Pass/Fail/Warning/Skip
@@ -158,7 +163,7 @@ fn qwen36_model_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../rustrain-model/tests/fixtures/qwen36-text")
 }
 
-/// The 1045-tensor snapshot D2 reconciles (26 shard headers, no weights, no network).
+/// The 1045-tensor snapshot D2 reconciles (shard headers only, no weights, no network).
 fn qwen36_checkpoint() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures/check-l2/checkpoints/qwen36-35b-a3b.safetensors.meta.json")
@@ -262,15 +267,18 @@ fn items(doc: &Value) -> Vec<Item> {
         .collect()
 }
 
-/// id → status for a report; two items with the same id (C6 lets `l2.ignore_coverage` report one
-/// warning per unmatched pattern) must agree, or the report contradicts itself.
+/// id → status for a report. C6 gives every id **at most one** item: when a check has several
+/// per-object facts they go in that item's `details` (`l2.ignore_coverage` reports one line per
+/// unmatched pattern inside one item, never one item per pattern). So two items with the same id are
+/// a report that says two things about one check — and `assert_id_set` compares this map's *keys*,
+/// which would make the duplicate disappear from the comparison.
 fn statuses(items: &[Item]) -> BTreeMap<String, Status> {
     let mut map: BTreeMap<String, Status> = BTreeMap::new();
     for item in items {
         if let Some(previous) = map.insert(item.id.clone(), item.status) {
-            assert_eq!(
-                previous, item.status,
-                "`{}` appears twice with different statuses ({previous:?} vs {:?})",
+            panic!(
+                "`{}` appears twice (as {previous:?} and {:?}); C6 gives every id one item and one \
+                 status, with per-object facts in `details`",
                 item.id, item.status
             );
         }
@@ -278,17 +286,36 @@ fn statuses(items: &[Item]) -> BTreeMap<String, Status> {
     map
 }
 
-/// C6: the report's fixed shape — `format`, the eight counters **with their values**, and the
-/// per-item fields.
-fn assert_c6_shape(doc: &Value) {
+/// C6: the report's fixed shape — `format`, which model and checkpoint it is about, the dtype the
+/// checks ran at, the eight counters **with their values**, and the per-item fields.
+///
+/// `expected_dtype` is pinned per run rather than merely asserted to be a string (C6 calls the field
+/// "the dtype the checks ran at"): without `--dtype` the description's own `bf16` is used, and a
+/// *rejected* `--dtype` falls back to it as well — the argument error is the `fail`, and the checks
+/// still run at the declared precision.
+fn assert_c6_shape(doc: &Value, expected_dtype: &str) {
     assert_eq!(
         doc["format"].as_str(),
         Some("rustrain.check.v1"),
         "C6 fixes the report format: {doc}"
     );
-    assert!(
-        doc["dtype"].is_string(),
-        "C6: the report records the dtype the checks ran at: {doc}"
+    assert_eq!(
+        doc["dtype"].as_str(),
+        Some(expected_dtype),
+        "the report must record the dtype the checks actually ran at: {doc}"
+    );
+
+    // Both paths were passed to the binary, so the report has to name exactly them: a report about a
+    // *different* model or checkpoint would otherwise satisfy every shape assertion here.
+    assert_eq!(
+        doc["model"].as_str(),
+        Some(qwen36_model_dir().to_string_lossy().as_ref()),
+        "the report must name the model directory it was given: {doc}"
+    );
+    assert_eq!(
+        doc["checkpoint"].as_str(),
+        Some(qwen36_checkpoint().to_string_lossy().as_ref()),
+        "the report must name the checkpoint it was given: {doc}"
     );
 
     let counts = doc["counts"]
@@ -378,6 +405,23 @@ fn assert_details(doc: &Value, items: &[Item]) {
                      — a sum the reader cannot recompute from the reason alone: {}",
                     item.reason
                 );
+                // The reason inlines the same list it hands to `details` (`op ×count (why)`), so the
+                // two must be the *same* list: a sixth entry appended to the reason would make it
+                // claim a total its `details` do not account for, and the count of `×` is the one
+                // thing the two share verbatim.
+                assert_eq!(
+                    item.reason.matches('×').count(),
+                    EXPECTED_UNAVAILABLE.len(),
+                    "the reason enumerates a different number of operators than `details` does: {}",
+                    item.reason
+                );
+                for (op, nodes) in EXPECTED_UNAVAILABLE {
+                    assert!(
+                        item.reason.contains(&format!("{op} ×{nodes}")),
+                        "the reason does not carry the `{op} ×{nodes}` its `details` report: {}",
+                        item.reason
+                    );
+                }
                 assert!(
                     mentions_number(
                         &item.reason,
@@ -464,18 +508,23 @@ fn assert_skip_set(observed: &BTreeMap<String, Status>) {
     );
 }
 
-#[test]
-fn the_report_has_c6s_shape_and_exactly_c6s_check_ids() {
-    let run = check(&["--dtype", "f32"]);
+/// One **accepted** run: `check(&extra)` must exit 0, and the report must be C6's shape with exactly
+/// the fourteen ids a normal run has and the statuses pinned in `EXPECTED_STATUS`.
+///
+/// The per-object `details` are deliberately not part of this: availability is dtype-dependent (at
+/// `--dtype f32` the five primitives no plugin publishes are all that is left; at the description's
+/// own `bf16` every node whose plugin variant rejects bf16 joins them), so each run pins its own.
+fn accepted_run(extra: &[&str], expected_dtype: &str) -> (Value, Vec<Item>) {
+    let run = check(extra);
     assert_eq!(
         run.code,
         Some(0),
-        "the accepted-arguments run must exit 0 (no check is a `fail`)\n{}",
+        "an accepted run must exit 0 (no check is a `fail`)\n{}",
         run.stdout
     );
 
     let doc = run.json();
-    assert_c6_shape(&doc);
+    assert_c6_shape(&doc, expected_dtype);
     let items = items(&doc);
     let observed = statuses(&items);
 
@@ -488,7 +537,6 @@ fn the_report_has_c6s_shape_and_exactly_c6s_check_ids() {
         .collect();
     assert_id_set(&observed, &accepted, "accepted arguments");
     assert_skip_set(&observed);
-    assert_details(&doc, &items);
 
     // Every id's status, not just the skips: a check that silently stops running is the failure
     // mode this file exists for.
@@ -516,6 +564,72 @@ fn the_report_has_c6s_shape_and_exactly_c6s_check_ids() {
         pinned_sorted, skips_sorted,
         "EXPECTED_STATUS and EXPECTED_SKIPS disagree"
     );
+
+    (doc, items)
+}
+
+#[test]
+fn the_report_has_c6s_shape_and_exactly_c6s_check_ids() {
+    let (doc, items) = accepted_run(&["--dtype", "f32"], "f32");
+    assert_details(&doc, &items);
+}
+
+/// C2's other half: `--dtype` is optional, and without it the **description's own** dtype is what
+/// the checks ran at (the real fixture declares `bf16`). That is a run in its own right, because its
+/// availability list is a superset of the f32 one — 16 lines instead of 5, every node whose plugin
+/// variant rejects bf16 joining the five primitives nothing publishes.
+///
+/// This exists because a dtype-conditional branch is invisible to the two runs that pass `--dtype`:
+/// a report that emptied the per-object list only when no dtype was overridden would have satisfied
+/// every other assertion in this file.
+#[test]
+fn the_default_dtype_run_is_the_same_report_at_the_descriptions_own_dtype() {
+    let (doc, items) = accepted_run(&[], "bf16");
+
+    // Counts, ids, statuses and the skip set are already pinned by `accepted_run`: the plan and the
+    // checkpoint do not depend on the dtype. What differs is the availability list.
+    let availability = items
+        .iter()
+        .find(|item| item.id == "l1.implementation_availability")
+        .expect("the availability item is one of EXPECTED_STATUS");
+    assert!(
+        availability.details.len() >= EXPECTED_UNAVAILABLE.len(),
+        "at bf16 the list is a superset of the f32 one; got: {:?}",
+        availability.details
+    );
+    for (op, nodes) in EXPECTED_UNAVAILABLE {
+        let prefix = format!("{op}: {nodes} node(s)");
+        assert!(
+            availability
+                .details
+                .iter()
+                .any(|detail| detail.starts_with(&prefix)),
+            "a primitive no plugin publishes is missing from the bf16 list (expected an entry \
+             starting `{prefix}`); got: {:?}",
+            availability.details
+        );
+    }
+    let plan_nodes = doc["counts"]["nodes"]
+        .as_i64()
+        .unwrap_or_else(|| panic!("the plan size is a counter of the report: {doc}"));
+    assert!(
+        mentions_number(&availability.reason, plan_nodes),
+        "the reasons must state the plan size at every dtype, not only at f32: {}",
+        availability.reason
+    );
+
+    // The ignore coverage is dtype-independent: same pattern, same 333 tensors, same single line.
+    let ignore = items
+        .iter()
+        .find(|item| item.id == "l2.ignore_coverage")
+        .expect("the ignore item is one of EXPECTED_STATUS");
+    assert_eq!(ignore.details.len(), 1, "{:?}", ignore.details);
+    assert!(
+        ignore.details[0].contains(IGNORE_PATTERN)
+            && mentions_number(&ignore.details[0], IGNORED_TENSORS),
+        "the ignore coverage must not depend on the dtype: {:?}",
+        ignore.details
+    );
 }
 
 /// `cli.arguments` is the one id a normal run does not have, and C2 wants a full report even when
@@ -540,7 +654,9 @@ fn a_rejected_argument_emits_the_fifteenth_id_and_changes_nothing_else() {
     );
 
     let doc = run.json();
-    assert_c6_shape(&doc);
+    // The rejected dtype is not a dtype at all, so the checks fall back to the description's own
+    // `bf16`; the exit code is already decided by the `cli.arguments` failure either way.
+    assert_c6_shape(&doc, "bf16");
     let rejected_items = items(&doc);
     let rejected = statuses(&rejected_items);
     assert_id_set(&rejected, &C6_CHECK_IDS, "rejected arguments");
