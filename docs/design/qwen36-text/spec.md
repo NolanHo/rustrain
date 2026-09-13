@@ -241,6 +241,29 @@ L1 全绿（按契约 skip 的四个项除外）；`l1.instantiate` 的 `details
 
 **配置扫描**（每项都要跑通并出数）：`tp=8`；`tp=4,ep=2`；`tp=2,ep=4`；`tp=2,cp=2,ep=2`；`dp=8`；以及 world=1 作为基准。
 
+### D6 状态（2026-09，逐步推进）
+
+1. **ATen 插件**（提交 `14136b0`）：28 个算子映射到 ATen（cuBLAS / FlashAttention-2 / cuDNN /
+   ATen 组合），C++17 + ABI v1；宿主上 `ops list --plugin` 列出 60 个实现，GPU 逐算子自检 31/31。
+2. **框架设备路径**（`14a9255`）：`--device cuda` 的 driver-API 分配器（核心 crate 仍零 CUDA 依赖）、
+   按设备对齐的显存打包、`ops check` / `run` 的插件与 recipe 参数、按变体声明选设备执行。
+3. **框架门禁**：`ops check --plugin librustrain_aten.so --recipe plugins/aten/aten.toml
+   --device cuda` → **59 case / 0 failing**，reference 留在 host、`cuda.*` 跑在显存。
+4. **第一次真前向找到的 4 个 bug**（`612a33a`，全部是"形状对、数值错"）：集合通信自己解引用设备指针
+   （SIGSEGV）、`reshape` 拒绝跨步输入（4 层模型跑不动）、runner dump 读编译前的旧 slot（编译器把
+   消费者改写到补全后的 twin）、**原地集合通信的输入没有被保活到输出**（pool 把它的字节发给了之后的
+   激活）。四个都补了回归测试并各自反证。
+5. **全模型在 GPU 上跑通**：40 层、window 512、f32，前向 7.2 s（1382 步 / 1328 算子 / 54 次集合
+   通信），峰值 134.1 GiB，42 个 hidden 摘要——单卡 140 GiB 装得下。
+6. **判定结果：未达标（诚实记录）**。`compare` 的读数：row 0（embedding）2e-6 ✓；row 1 起开始
+   发散（最早以 `mean` 超差，而 `mean` 是近零统计量，被相对化放大）；`std` 约 1%（2 层）→ 7%
+   （第 11 层）→ 末层 `max` 54%；`logits` 相对差 **1.29**（max_abs_diff 16.75 / max_abs 13.0），
+   即 logits 是错的。**离"对齐"还差得远，不是 bf16 舍入能解释的量级。**
+7. **下一步（正在做）**：把 1 层描述 + 只含 layer 0 的 checkpoint 跑出来，与 HF 的 1 层截断前向
+   **逐元素**对比，再逐算子往层内走（HF 侧用 forward hook 抓中间张量；rustrain 侧把中间 slot 名写进
+   `outputs.hidden` 就能 dump）。首选怀疑：MoE（每层都有，系统性比例误差会逐层复合）、GDN 三件套、
+   trunk `rmsnorm` 的 `weight_offset` 约定、以及 head 拆分（`reshape` 的跨步输入已修，但拆得对不对只取决于描述）。
+
 ### D5 — 前向数值对齐 HuggingFace
 
 **可观察结果**：在验证宿主（8× L20X，sm_89）上，同一段 token、同样的 `input_ids`，rustrain 的 logits 与
