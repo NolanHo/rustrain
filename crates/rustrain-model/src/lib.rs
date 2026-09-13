@@ -28,8 +28,9 @@ mod transform;
 use std::path::{Path, PathBuf};
 
 pub use desc::{
-    AttrLiteral, Binding, CONFIG_FILE, DESC_FILE, ExprSpec, FORMAT, FromSpec, ModelDesc, NodeDecl,
-    ParamSpec, PortSpec, Select, SlotDecl, Split, StackEntry, StageDecl, Target, Template,
+    AttrLiteral, Binding, CONFIG_FILE, DESC_FILE, ExprSpec, FORMAT, FromSpec, ModelDesc,
+    ModelOutputs, NodeDecl, ParamSpec, PortSpec, Select, SlotDecl, Split, StackEntry, StageDecl,
+    Target, Template,
 };
 pub use expand::{
     Expanded, ResolvedBinding, ResolvedBindingSlot, ResolvedSplit, expand, expand_lenient,

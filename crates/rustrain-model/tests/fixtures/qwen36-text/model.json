@@ -119,8 +119,8 @@
         {
           "op": "embedding",
           "in": [
-            "ids",
-            "w"
+            "w",
+            "ids"
           ],
           "out": [
             "y"
@@ -383,28 +383,12 @@
           "kind": "weight",
           "shape": [
             "experts",
-            "moe_inter",
-            "hidden"
+            "hidden",
+            "moe_inter"
           ]
         },
         {
           "name": "mlp.shared_expert.gate_proj",
-          "kind": "weight",
-          "shape": [
-            "hidden",
-            "shared_inter"
-          ]
-        },
-        {
-          "name": "mlp.shared_expert.up_proj",
-          "kind": "weight",
-          "shape": [
-            "hidden",
-            "shared_inter"
-          ]
-        },
-        {
-          "name": "mlp.shared_expert.down_proj",
           "kind": "weight",
           "shape": [
             "shared_inter",
@@ -412,11 +396,27 @@
           ]
         },
         {
-          "name": "mlp.shared_expert_gate",
+          "name": "mlp.shared_expert.up_proj",
+          "kind": "weight",
+          "shape": [
+            "shared_inter",
+            "hidden"
+          ]
+        },
+        {
+          "name": "mlp.shared_expert.down_proj",
           "kind": "weight",
           "shape": [
             "hidden",
-            "1"
+            "shared_inter"
+          ]
+        },
+        {
+          "name": "mlp.shared_expert_gate",
+          "kind": "weight",
+          "shape": [
+            "1",
+            "hidden"
           ]
         },
         {
@@ -690,6 +690,33 @@
           "shape": [
             "seq",
             "hidden"
+          ]
+        },
+        {
+          "name": "gdn_h",
+          "kind": "activation",
+          "shape": [
+            "seq",
+            "lin_v_heads",
+            "lin_v_dim"
+          ]
+        },
+        {
+          "name": "zh",
+          "kind": "activation",
+          "shape": [
+            "seq",
+            "lin_v_heads",
+            "lin_v_dim"
+          ]
+        },
+        {
+          "name": "normed_h",
+          "kind": "activation",
+          "shape": [
+            "seq",
+            "lin_v_heads",
+            "lin_v_dim"
           ]
         }
       ],
@@ -980,19 +1007,66 @@
           }
         },
         {
-          "op": "rmsnorm_gated",
+          "op": "reshape",
           "in": [
-            "gdn",
-            "linear_attn.norm",
+            "gdn"
+          ],
+          "out": [
+            "gdn_h"
+          ],
+          "attrs": {
+            "shape": [
+              512,
+              32,
+              128
+            ]
+          }
+        },
+        {
+          "op": "reshape",
+          "in": [
             "z"
           ],
           "out": [
-            "normed"
+            "zh"
+          ],
+          "attrs": {
+            "shape": [
+              512,
+              32,
+              128
+            ]
+          }
+        },
+        {
+          "op": "rmsnorm_gated",
+          "in": [
+            "gdn_h",
+            "linear_attn.norm",
+            "zh"
+          ],
+          "out": [
+            "normed_h"
           ],
           "attrs": {
             "weight_offset": 0.0,
             "gate_act": "silu",
             "eps": 1e-06
+          }
+        },
+        {
+          "op": "reshape",
+          "in": [
+            "normed_h"
+          ],
+          "out": [
+            "normed"
+          ],
+          "attrs": {
+            "shape": [
+              512,
+              4096
+            ]
           }
         },
         {
@@ -1199,28 +1273,12 @@
           "kind": "weight",
           "shape": [
             "experts",
-            "moe_inter",
-            "hidden"
+            "hidden",
+            "moe_inter"
           ]
         },
         {
           "name": "mlp.shared_expert.gate_proj",
-          "kind": "weight",
-          "shape": [
-            "hidden",
-            "shared_inter"
-          ]
-        },
-        {
-          "name": "mlp.shared_expert.up_proj",
-          "kind": "weight",
-          "shape": [
-            "hidden",
-            "shared_inter"
-          ]
-        },
-        {
-          "name": "mlp.shared_expert.down_proj",
           "kind": "weight",
           "shape": [
             "shared_inter",
@@ -1228,11 +1286,27 @@
           ]
         },
         {
-          "name": "mlp.shared_expert_gate",
+          "name": "mlp.shared_expert.up_proj",
+          "kind": "weight",
+          "shape": [
+            "shared_inter",
+            "hidden"
+          ]
+        },
+        {
+          "name": "mlp.shared_expert.down_proj",
           "kind": "weight",
           "shape": [
             "hidden",
-            "1"
+            "shared_inter"
+          ]
+        },
+        {
+          "name": "mlp.shared_expert_gate",
+          "kind": "weight",
+          "shape": [
+            "1",
+            "hidden"
           ]
         },
         {
@@ -1485,6 +1559,24 @@
             "seq",
             "hidden"
           ]
+        },
+        {
+          "name": "qr_dummy",
+          "kind": "activation",
+          "shape": [
+            "seq",
+            "heads",
+            "head_dim"
+          ]
+        },
+        {
+          "name": "kr_dummy",
+          "kind": "activation",
+          "shape": [
+            "seq",
+            "kv_heads",
+            "head_dim"
+          ]
         }
       ],
       "nodes": [
@@ -1670,11 +1762,27 @@
           "op": "rope",
           "in": [
             "qn",
-            "kn"
+            "qn"
           ],
           "out": [
             "qr",
-            "kr"
+            "qr_dummy"
+          ],
+          "attrs": {
+            "rotary_dim": 64,
+            "theta": 10000000.0,
+            "partial_rotary": true
+          }
+        },
+        {
+          "op": "rope",
+          "in": [
+            "kn",
+            "kn"
+          ],
+          "out": [
+            "kr",
+            "kr_dummy"
           ],
           "attrs": {
             "rotary_dim": 64,
@@ -2043,8 +2151,46 @@
     {
       "prefix": "layers.{l}",
       "stage": [
-        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-        1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1
       ],
       "repeat": {
         "count": "layers",
@@ -2382,9 +2528,7 @@
     {
       "slot": "layers.*.mlp.experts.down_proj",
       "source": "model.language_model.layers.{*}.mlp.experts.down_proj",
-      "transform": [
-        "transpose(1,2)"
-      ],
+      "transform": [],
       "axes": {
         "0": [
           "ep"
@@ -2397,9 +2541,7 @@
     {
       "slot": "layers.*.mlp.shared_expert.gate_proj",
       "source": "model.language_model.layers.{*}.mlp.shared_expert.gate_proj.weight",
-      "transform": [
-        "transpose(0,1)"
-      ],
+      "transform": [],
       "axes": {
         "1": [
           "tp"
@@ -2409,9 +2551,7 @@
     {
       "slot": "layers.*.mlp.shared_expert.up_proj",
       "source": "model.language_model.layers.{*}.mlp.shared_expert.up_proj.weight",
-      "transform": [
-        "transpose(0,1)"
-      ],
+      "transform": [],
       "axes": {
         "1": [
           "tp"
@@ -2421,9 +2561,7 @@
     {
       "slot": "layers.*.mlp.shared_expert.down_proj",
       "source": "model.language_model.layers.{*}.mlp.shared_expert.down_proj.weight",
-      "transform": [
-        "transpose(0,1)"
-      ],
+      "transform": [],
       "axes": {
         "0": [
           "tp"
@@ -2433,9 +2571,7 @@
     {
       "slot": "layers.*.mlp.shared_expert_gate",
       "source": "model.language_model.layers.{*}.mlp.shared_expert_gate.weight",
-      "transform": [
-        "transpose(0,1)"
-      ]
+      "transform": []
     },
     {
       "slot": "mtp.fc",
@@ -2567,9 +2703,7 @@
     {
       "slot": "mtp.layers.*.mlp.experts.down_proj",
       "source": "mtp.layers.{*}.mlp.experts.down_proj",
-      "transform": [
-        "transpose(1,2)"
-      ],
+      "transform": [],
       "axes": {
         "0": [
           "ep"
@@ -2582,9 +2716,7 @@
     {
       "slot": "mtp.layers.*.mlp.shared_expert.gate_proj",
       "source": "mtp.layers.{*}.mlp.shared_expert.gate_proj.weight",
-      "transform": [
-        "transpose(0,1)"
-      ],
+      "transform": [],
       "axes": {
         "1": [
           "tp"
@@ -2594,9 +2726,7 @@
     {
       "slot": "mtp.layers.*.mlp.shared_expert.up_proj",
       "source": "mtp.layers.{*}.mlp.shared_expert.up_proj.weight",
-      "transform": [
-        "transpose(0,1)"
-      ],
+      "transform": [],
       "axes": {
         "1": [
           "tp"
@@ -2606,9 +2736,7 @@
     {
       "slot": "mtp.layers.*.mlp.shared_expert.down_proj",
       "source": "mtp.layers.{*}.mlp.shared_expert.down_proj.weight",
-      "transform": [
-        "transpose(0,1)"
-      ],
+      "transform": [],
       "axes": {
         "0": [
           "tp"
@@ -2618,12 +2746,18 @@
     {
       "slot": "mtp.layers.*.mlp.shared_expert_gate",
       "source": "mtp.layers.{*}.mlp.shared_expert_gate.weight",
-      "transform": [
-        "transpose(0,1)"
-      ]
+      "transform": []
     }
   ],
   "ignore": [
     "model.visual.**"
-  ]
+  ],
+  "outputs": {
+    "logits": "lm_head.y",
+    "hidden": [
+      "embed.y",
+      "layers.*.y",
+      "norm.y"
+    ]
+  }
 }

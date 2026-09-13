@@ -166,6 +166,7 @@ pub fn expand_lenient(
     let plan = builder.build()?;
     let (bindings, unbound_slots) = expander.bind()?;
     let stages = expander.stages;
+    check_outputs(desc, &plan)?;
 
     Ok(Expanded {
         plan,
@@ -173,6 +174,61 @@ pub fn expand_lenient(
         unbound_slots,
         stages,
     })
+}
+
+/// Validates `outputs` (D5's runner contract) against the expanded plan: every pattern uses the
+/// binding-target syntax (single-segment `*` only), and every pattern must name at least one slot
+/// of the plan — a declaration that matches nothing is a typo, and I-5 says a wrong description is
+/// a hard error at expand time, not a silent empty report at run time.
+fn check_outputs(desc: &ModelDesc, plan: &Plan) -> Result<(), ModelError> {
+    let Some(outputs) = &desc.outputs else {
+        return Ok(());
+    };
+    let mut patterns: Vec<(String, &str)> = Vec::new();
+    patterns.push((outputs.logits.clone(), "outputs.logits"));
+    for pattern in &outputs.hidden {
+        patterns.push((pattern.clone(), "outputs.hidden"));
+    }
+    for (pattern, what) in &patterns {
+        check_output_pattern(pattern, what)?;
+        let matched = plan
+            .slots
+            .iter()
+            .any(|slot| crate::pattern::matches(pattern, &slot.name));
+        if !matched {
+            return Err(ModelError::Invalid(format!(
+                "`{what}` pattern `{pattern}` matches none of the plan's {} slot(s); the \
+                 declaration must name the slots the runner reports",
+                plan.slots.len()
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// One `outputs` pattern: a non-empty dotted name with single-segment wildcards only.
+fn check_output_pattern(pattern: &str, what: &str) -> Result<(), ModelError> {
+    if pattern.is_empty() {
+        return Err(ModelError::Invalid(format!(
+            "`{what}` is empty; a pattern must name at least one segment"
+        )));
+    }
+    for segment in pattern.split('.') {
+        if segment.is_empty() {
+            return Err(ModelError::Invalid(format!(
+                "`{what}` pattern `{pattern}` has an empty segment: a `.` with nothing on one \
+                 side of it matches no slot name"
+            )));
+        }
+        if segment == "**" {
+            return Err(ModelError::Invalid(format!(
+                "`{what}` pattern `{pattern}` uses `**`: a multi-segment wildcard belongs to \
+                 `ignore` only; an outputs pattern names the slots a report reads, one pattern \
+                 one slot family"
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// `a, b, c` for the first few names, then `… (+N more)`: an error message has to stay readable

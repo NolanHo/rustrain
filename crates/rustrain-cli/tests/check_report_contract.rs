@@ -101,9 +101,9 @@ const BF16_EXPECTED_SKIPS: [&str; 4] = [
 const EXPECTED_COUNTS: [(&str, i64); 8] = [
     ("bindings", 46),
     ("dtype_mismatch", 0),
-    ("nodes", 1184),
+    ("nodes", 1285),
     ("shape_mismatch", 0),
-    ("slots", 2110),
+    ("slots", 2222),
     ("slots_unbound", 0),
     ("tensors_unconsumed", 0),
     ("weights", 873),
@@ -125,11 +125,11 @@ enum Unavailable {
 /// no per-operator list, and the reason counts the whole plan as resolved.
 ///
 /// The two lists differ by **cause**, not only by length. At `--dtype f32` nothing is left — with
-/// `moe_layer` published (D5's provider half is closed), all 1184 nodes resolve. At the
+/// `moe_layer` published (D5's provider half is closed), all 1285 nodes resolve. At the
 /// description's own `bf16` — which is also what an explicit `--dtype bf16` or `f16` asks for —
 /// every node whose `reference.f32` variant rejects that dtype is unresolved, which is the entire
-/// plan (1184 of 1184 nodes over 16 operators, `moe_layer` among them). A list that is merely
-/// *truncated* while its reason keeps saying `41 of 1184` is exactly the false green this pins
+/// plan (1285 of 1285 nodes over 16 operators, `moe_layer` among them). A list that is merely
+/// *truncated* while its reason keeps saying `41 of 1285` is exactly the false green this pins
 /// down.
 struct Availability {
     entries: &'static [(&'static str, i64, Unavailable)],
@@ -158,14 +158,14 @@ const BF16_AVAILABILITY: Availability = Availability {
         ("linear", 298, Unavailable::DtypeRejected),
         ("moe_layer", 41, Unavailable::DtypeRejected),
         ("narrow", 22, Unavailable::DtypeRejected),
-        ("reshape", 186, Unavailable::DtypeRejected),
+        ("reshape", 276, Unavailable::DtypeRejected),
         ("rmsnorm", 108, Unavailable::DtypeRejected),
         ("rmsnorm_gated", 30, Unavailable::DtypeRejected),
-        ("rope", 11, Unavailable::DtypeRejected),
+        ("rope", 22, Unavailable::DtypeRejected),
         ("sdpa", 11, Unavailable::DtypeRejected),
         ("topk_router", 41, Unavailable::DtypeRejected),
     ],
-    total: 1184,
+    total: 1285,
 };
 
 /// Both tables must agree on which primitives nothing publishes (now: none — `moe_layer` is
@@ -195,15 +195,15 @@ const IGNORED_TENSORS: i64 = 333;
 /// the global counts. A no-op `instantiate` (returning the global plan unchanged) would still
 /// produce this line — which is why the five-axis run below pins the *pruned* per-stage
 /// counts, where a no-op cannot hide.
-const STAGE0_ONLY: [&str; 1] = ["stage 0 (rank 0): 1184 node(s), 2110 slot(s)"];
+const STAGE0_ONLY: [&str; 1] = ["stage 0 (rank 0): 1285 node(s), 2222 slot(s)"];
 
 /// **C5's witness at the five-axis acceptance mesh**: the per-stage node/slot counts a real
 /// `instantiate` produces after PP pruning. `instantiate` replaced by `return Ok(plan.clone())`
-/// reports 1184 node(s)/2110 slot(s) for *both* stages and turns this gate red — the tripwire
+/// reports 1285 node(s)/2222 slot(s) for *both* stages and turns this gate red — the tripwire
 /// the reviewer's no-op attack walks into.
 const FIVE_AXIS_STAGES: [&str; 2] = [
-    "stage 0 (rank 0): 576 node(s), 1028 slot(s)",
-    "stage 1 (rank 32): 608 node(s), 1085 slot(s)",
+    "stage 0 (rank 0): 626 node(s), 1083 slot(s)",
+    "stage 1 (rank 32): 659 node(s), 1142 slot(s)",
 ];
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -625,7 +625,7 @@ fn assert_details(doc: &Value, items: &[Item], availability: &Availability, stag
                     }
 
                     // The reason's *leading* claim, not just "the plan size appears somewhere": a
-                    // reason reading `41 of 425273 node(s) … (the plan has 1184)` must not pass.
+                    // reason reading `41 of 425273 node(s) … (the plan has 1285)` must not pass.
                     let lead = format!("{} of {} node(s)", availability.total, plan_nodes);
                     assert!(
                         item.reason.starts_with(&lead),

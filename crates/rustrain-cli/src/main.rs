@@ -28,8 +28,16 @@ use rustrain_ops::{Phase, Recipe, Registry, ResolveError, TargetEnv};
 use rustrain_parallel::{GroupMask, Mesh, ParallelConfig, ParallelLayout};
 use rustrain_plan::{Attrs, OpRef, Plan, PlanBuilder, PlanNode, Slot, SlotKind};
 
+mod load;
+mod npz;
+mod run;
+
 #[derive(Parser)]
-#[command(name = "rustrain", about = "Operator-first training framework", version)]
+#[command(
+    name = "rustrain",
+    about = "Operator-first training framework",
+    version
+)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -43,6 +51,13 @@ enum Command {
     Plan(PlanArgs),
     /// Run the L1 (structure) and L2 (loading) checks on a model description.
     Check(CheckArgs),
+    /// Run one forward pass (spec C4) and write the D5 candidate dump (.npz + .json sidecar).
+    ///
+    /// Precision: the checkpoint and HF are bf16 while the reference provider is f32-only, so the
+    /// weights are widened bf16 -> f32 (exact — bf16 is a subset of f32) and the forward executes
+    /// f32; the HF reference is dumped with `--dtype bf16`, and the spec's 1% tolerance on the
+    /// logits and the per-layer summaries absorbs HF's bf16 rounding, not this widening.
+    Run(run::RunArgs),
 }
 
 #[derive(Args)]
@@ -125,6 +140,7 @@ fn main() -> Result<()> {
             },
         },
         Command::Check(args) => check(args),
+        Command::Run(args) => run::run(args),
     }
 }
 
@@ -133,7 +149,7 @@ fn main() -> Result<()> {
 /// Order matters: a duplicate `op@variant` is an error naming both origins, so
 /// registering the built-in first means a user's plugin cannot silently shadow
 /// it — it has to collide out loud.
-fn load_registry(plugins: &[PathBuf]) -> Result<Registry> {
+pub(crate) fn load_registry(plugins: &[PathBuf]) -> Result<Registry> {
     let mut registry = Registry::new();
 
     // SAFETY: the built-in descriptors are leaked by `PluginBuilder`, so they
@@ -158,7 +174,7 @@ fn load_registry(plugins: &[PathBuf]) -> Result<Registry> {
     Ok(registry)
 }
 
-fn load_recipe(path: Option<&Path>) -> Result<Recipe> {
+pub(crate) fn load_recipe(path: Option<&Path>) -> Result<Recipe> {
     match path {
         Some(p) => {
             let text = std::fs::read_to_string(p)
@@ -225,10 +241,12 @@ fn ops_check(plugins: &[PathBuf], only: Option<&str>, json: bool) -> Result<()> 
         if let Some(obj) = doc.as_object_mut() {
             obj.insert(
                 "uncovered".to_string(),
-                serde_json::json!(uncovered_operators()
-                    .iter()
-                    .map(|(op, why)| serde_json::json!({ "op": op, "reason": why }))
-                    .collect::<Vec<_>>()),
+                serde_json::json!(
+                    uncovered_operators()
+                        .iter()
+                        .map(|(op, why)| serde_json::json!({ "op": op, "reason": why }))
+                        .collect::<Vec<_>>()
+                ),
             );
         }
         println!("{}", serde_json::to_string_pretty(&doc)?);
@@ -325,12 +343,7 @@ fn demo_plan(tp: usize) -> Result<rustrain_plan::Plan> {
         SlotKind::Weight,
         ParallelLayout::shard(0, tp_mask),
     );
-    let out = b.slot(
-        "mlp.down.out",
-        RsDtype::F32,
-        vec![8, 64],
-        SlotKind::Output,
-    );
+    let out = b.slot("mlp.down.out", RsDtype::F32, vec![8, 64], SlotKind::Output);
     b.node(
         OpRef::new("linear"),
         vec![h2, w2],
@@ -797,11 +810,28 @@ impl CheckReport {
     }
 }
 
-/// One tensor as a checkpoint declares it: dtype plus shape. No weights, no device (C5).
+/// One tensor as a checkpoint declares it: dtype plus shape — and, when the metadata came from a
+/// real shard header, where the bytes live (`shard` = the file, `data` = the byte range in it).
+/// A snapshot has neither: no weights, no device (C5).
 #[derive(Clone, Debug)]
-struct CkptTensor {
+pub(crate) struct CkptTensor {
     dtype: String,
     shape: Vec<i64>,
+    /// The shard file this tensor's data lives in (`load_shard_index` only).
+    pub(crate) shard: Option<PathBuf>,
+    /// `[start, end)` of the tensor's bytes inside `shard` (`load_shard_index` only).
+    pub(crate) data: Option<(u64, u64)>,
+}
+
+impl CkptTensor {
+    fn new(dtype: String, shape: Vec<i64>) -> Self {
+        Self {
+            dtype,
+            shape,
+            shard: None,
+            data: None,
+        }
+    }
 }
 
 /// C5's checkpoint metadata, in both accepted shapes.
@@ -1411,10 +1441,7 @@ fn partial_fulfillment(propagation: &rustrain_plan::shard::ShardPropagation) -> 
 /// C2's "every collective is bound to its axes": each inserted collective's group mask must
 /// address axes of the mesh, and each dim must be an axis of the tensor it converts. Propagation
 /// already enforces both — the check re-reads its output so the contract is verified, not assumed.
-fn collective_axes(
-    propagation: &rustrain_plan::shard::ShardPropagation,
-    mesh: &Mesh,
-) -> CheckItem {
+fn collective_axes(propagation: &rustrain_plan::shard::ShardPropagation, mesh: &Mesh) -> CheckItem {
     const ID: &str = "l1.collective_axes";
     let mut unbound: Vec<String> = Vec::new();
     for collective in &propagation.inserted {
@@ -1533,40 +1560,42 @@ fn unresolved_reason(error: &ResolveError) -> String {
 
 /// One `(checkpoint tensor → slot)` pairing, worked out by capture substitution rather than by
 /// position (C5: `ResolvedBinding::slots` is grouped by target, so a zip pairs the wrong layer).
-struct Pair {
+///
+/// Both `check` (shape/dtype reconciliation) and `run` (loading the actual bytes) consume this
+/// list — the loader must move the *same* mapping the check verifies, not a second one.
+pub(crate) struct Pair {
     /// Index into `Expanded::bindings`.
-    binding: usize,
-    tensor: String,
-    slot: String,
+    pub(crate) binding: usize,
+    pub(crate) tensor: String,
+    pub(crate) slot: String,
     /// Which segment of the binding's `split` this slot is.
-    segment: usize,
+    pub(crate) segment: usize,
 }
 
-/// What the four L2 checks found: C6's four counters plus the items that carry the reasons.
-struct L2Result {
-    items: Vec<CheckItem>,
-    slots_unbound: usize,
-    tensors_unconsumed: usize,
-    /// `None` when no shape (resp. dtype) was actually compared, which is the same "not measured"
-    /// rule [`Counts`] spells out: the two items are a `skip` or a `warning` there, and writing `0`
-    /// next to a check that compared nothing is a claim, not a measurement.
-    shape_mismatch: Option<usize>,
-    dtype_mismatch: Option<usize>,
+/// What pairing a checkpoint against a description found, before any verdict is drawn.
+pub(crate) struct Pairing {
+    pub(crate) pairs: Vec<Pair>,
+    /// A source matched a tensor but its captures filled no target pattern.
+    pub(crate) unpaired: Vec<String>,
+    /// Binding sources no checkpoint tensor matched.
+    pub(crate) missing_sources: Vec<String>,
+    /// Tensors claimed by more than one binding.
+    pub(crate) shared_tensors: Vec<String>,
+    /// The number of weight slots the bindings declare.
+    pub(crate) covered: usize,
+    /// The pairing is only a reconciliation when it is one-to-one.
+    pub(crate) is_bijection: bool,
+    /// An empty pairing set that is nonetheless one-to-one: nothing to reconcile.
+    pub(crate) nothing_to_reconcile: bool,
 }
 
-fn l2_checks(
-    expanded: &rustrain_model::Expanded,
-    desc: &rustrain_model::ModelDesc,
-    meta: &CheckpointMeta,
-) -> L2Result {
-    let plan = &expanded.plan;
-
-    // ---- pairing ----
-    //
-    // One checkpoint tensor instance → one slot, by capture substitution (C5 forbids zipping
-    // `ResolvedBinding::slots` against source order). `covered` is the number of weight slots the
-    // bindings declare; a pairing that does not come out one-to-one is not a pairing, and the
-    // counts below would be a Cartesian product dressed up as a reconciliation.
+/// The `(checkpoint tensor → slot)` pairing, by capture substitution (C5 forbids zipping
+/// `ResolvedBinding::slots` against source order).
+fn pairing(expanded: &rustrain_model::Expanded, meta: &CheckpointMeta) -> Pairing {
+    // One checkpoint tensor instance → one slot, by capture substitution. `covered` is the
+    // number of weight slots the bindings declare; a pairing that does not come out one-to-one
+    // is not a pairing, and the counts below would be a Cartesian product dressed up as a
+    // reconciliation.
     let mut pairs: Vec<Pair> = Vec::new();
     let mut unpaired: Vec<String> = Vec::new();
     let mut missing_sources: Vec<String> = Vec::new();
@@ -1602,8 +1631,7 @@ fn l2_checks(
             .tensors
             .keys()
             .filter_map(|name| {
-                rustrain_model::match_name(&binding.source, name)
-                    .map(|captures| (name, captures))
+                rustrain_model::match_name(&binding.source, name).map(|captures| (name, captures))
             })
             .collect();
         if instances.is_empty() {
@@ -1626,7 +1654,7 @@ fn l2_checks(
                     ));
                     continue;
                 };
-                if plan.slot_id(&slot).is_none()
+                if expanded.plan.slot_id(&slot).is_none()
                     || !binding.slots.iter().any(|resolved| resolved.slot == slot)
                 {
                     unpaired.push(format!(
@@ -1646,18 +1674,56 @@ fn l2_checks(
         }
     }
 
-    // The pairing is only a reconciliation when it is one-to-one. A short count means a source
-    // that matches no tensor or a capture that fills no target; a long one is the Cartesian
-    // product. Either way the shape and dtype checks below have nothing trustworthy to compare.
-    let pairing_is_a_bijection = shared_tensors.is_empty() && pairs.len() == covered;
-
-    // C6's "nothing to reconcile" state: an empty pairing set that is nonetheless one-to-one — no
-    // weight slot any binding covers, and no unbound slot left to name. Only then is there nothing
-    // to check; a pairing set that came out empty while the bindings do cover slots is a *failed*
-    // pairing, which `l2.binding_coverage` reports as a failure (§3.5), and C6 keeps shape/dtype a
-    // `skip` there rather than dressing the outcome up as a warning.
+    let is_bijection = shared_tensors.is_empty() && pairs.len() == covered;
+    // C6's "nothing to reconcile" state: an empty pairing set that is nonetheless one-to-one.
     let nothing_to_reconcile =
-        pairs.is_empty() && pairing_is_a_bijection && expanded.unbound_slots.is_empty();
+        pairs.is_empty() && is_bijection && expanded.unbound_slots.is_empty();
+
+    Pairing {
+        pairs,
+        unpaired,
+        missing_sources,
+        shared_tensors,
+        covered,
+        is_bijection,
+        nothing_to_reconcile,
+    }
+}
+
+/// What the four L2 checks found: C6's four counters plus the items that carry the reasons.
+struct L2Result {
+    items: Vec<CheckItem>,
+    slots_unbound: usize,
+    tensors_unconsumed: usize,
+    /// `None` when no shape (resp. dtype) was actually compared, which is the same "not measured"
+    /// rule [`Counts`] spells out: the two items are a `skip` or a `warning` there, and writing `0`
+    /// next to a check that compared nothing is a claim, not a measurement.
+    shape_mismatch: Option<usize>,
+    dtype_mismatch: Option<usize>,
+}
+
+fn l2_checks(
+    expanded: &rustrain_model::Expanded,
+    desc: &rustrain_model::ModelDesc,
+    meta: &CheckpointMeta,
+) -> L2Result {
+    let plan = &expanded.plan;
+
+    // ---- pairing ----
+    //
+    // One checkpoint tensor instance → one slot, by capture substitution (C5 forbids zipping
+    // `ResolvedBinding::slots` against source order). `covered` is the number of weight slots the
+    // bindings declare; a pairing that does not come out one-to-one is not a pairing, and the
+    // counts below would be a Cartesian product dressed up as a reconciliation.
+    let Pairing {
+        pairs,
+        unpaired,
+        missing_sources,
+        shared_tensors,
+        covered,
+        is_bijection: pairing_is_a_bijection,
+        nothing_to_reconcile,
+    } = pairing(expanded, meta);
 
     // The shape/dtype counters are a measurement only when the pairing is one-to-one *and* there is
     // a pairing to measure; every other state is a skip or a warning, and `0` would claim a
@@ -1751,35 +1817,12 @@ fn l2_checks(
     };
 
     // ---- l2.tensor_consumption: consumed by a binding, or explicitly ignored ----
-    let mut unconsumed: Vec<String> = Vec::new();
-    let mut ignored = 0usize;
-    // C6: an `ignore` pattern that matches nothing is a warning. Per pattern, because the pattern
-    // that matched nothing is the fact worth reporting.
-    let mut ignore_hits = vec![0usize; desc.ignore.len()];
-    for name in meta.tensors.keys() {
-        let consumed = expanded
-            .bindings
-            .iter()
-            .any(|binding| rustrain_model::matches(&binding.source, name));
-        // Every pattern is asked about every tensor of the checkpoint: C6's warning is about a
-        // pattern that matches *nothing*, and two `ignore` entries may well overlap on one tensor.
-        let mut matched_by_ignore = false;
-        for (index, pattern) in desc.ignore.iter().enumerate() {
-            if rustrain_model::matches(pattern, name) {
-                ignore_hits[index] += 1;
-                matched_by_ignore = true;
-            }
-        }
-        if consumed {
-            continue;
-        }
-        if matched_by_ignore {
-            ignored += 1;
-        } else {
-            unconsumed.push(name.clone());
-        }
-    }
-    let consumption = if unconsumed.is_empty() && nothing_to_reconcile {
+    let Consumption {
+        unconsumed,
+        ignored,
+        ignore_hits,
+    } = consumption(expanded, desc, meta);
+    let consumption_item = if unconsumed.is_empty() && nothing_to_reconcile {
         CheckItem::warning(
             "l2.tensor_consumption",
             format!(
@@ -1953,10 +1996,7 @@ fn l2_checks(
     };
 
     let shape = if !pairing_is_a_bijection {
-        not_a_bijection(
-            "l2.shape_reconciliation",
-            "trustworthy checkpoint shape",
-        )
+        not_a_bijection("l2.shape_reconciliation", "trustworthy checkpoint shape")
     } else if shape_mismatch > 0 {
         CheckItem::fail(
             "l2.shape_reconciliation",
@@ -2024,7 +2064,7 @@ fn l2_checks(
         )
     };
 
-    let mut items = vec![coverage, consumption];
+    let mut items = vec![coverage, consumption_item];
     items.extend(ignore_checks);
     items.push(shape);
     items.push(dtype);
@@ -2037,9 +2077,61 @@ fn l2_checks(
     }
 }
 
+/// What the consumption pass found: which checkpoint tensors no binding consumes and no `ignore`
+/// pattern covers, plus the per-pattern hit counts.
+struct Consumption {
+    unconsumed: Vec<String>,
+    ignored: usize,
+    /// One hit count per `desc.ignore` entry, in declaration order.
+    ignore_hits: Vec<usize>,
+}
+
+/// §3.5's second mandate: every checkpoint tensor is consumed by a binding or explicitly ignored.
+/// Shared by `check`'s `l2.tensor_consumption` and the loader's extra-tensor error — one count,
+/// one source.
+fn consumption(
+    expanded: &rustrain_model::Expanded,
+    desc: &rustrain_model::ModelDesc,
+    meta: &CheckpointMeta,
+) -> Consumption {
+    let mut unconsumed: Vec<String> = Vec::new();
+    let mut ignored = 0usize;
+    // C6: an `ignore` pattern that matches nothing is a warning. Per pattern, because the pattern
+    // that matched nothing is the fact worth reporting.
+    let mut ignore_hits = vec![0usize; desc.ignore.len()];
+    for name in meta.tensors.keys() {
+        let consumed = expanded
+            .bindings
+            .iter()
+            .any(|binding| rustrain_model::matches(&binding.source, name));
+        // Every pattern is asked about every tensor of the checkpoint: C6's warning is about a
+        // pattern that matches *nothing*, and two `ignore` entries may well overlap on one tensor.
+        let mut matched_by_ignore = false;
+        for (index, pattern) in desc.ignore.iter().enumerate() {
+            if rustrain_model::matches(pattern, name) {
+                ignore_hits[index] += 1;
+                matched_by_ignore = true;
+            }
+        }
+        if consumed {
+            continue;
+        }
+        if matched_by_ignore {
+            ignored += 1;
+        } else {
+            unconsumed.push(name.clone());
+        }
+    }
+    Consumption {
+        unconsumed,
+        ignored,
+        ignore_hits,
+    }
+}
+
 /// One binding's distinct target patterns, in declaration order: the index of a pattern is the
 /// segment index of `ResolvedBinding::split`.
-fn target_patterns(binding: &rustrain_model::ResolvedBinding) -> Vec<String> {
+pub(crate) fn target_patterns(binding: &rustrain_model::ResolvedBinding) -> Vec<String> {
     let mut patterns: Vec<String> = Vec::new();
     for slot in &binding.slots {
         if !patterns.contains(&slot.pattern) {
@@ -2056,7 +2148,7 @@ fn target_patterns(binding: &rustrain_model::ResolvedBinding) -> Vec<String> {
 /// [`rustrain_model::parse_transform`]'s — the same parser `expand` validates descriptions with —
 /// so an error here is about *this* shape (an axis out of range, or a slice that leaves the axis),
 /// never about a verb nobody implemented.
-fn transformed_shape(shape: &[i64], transform: &[String]) -> Result<Vec<i64>, String> {
+pub(crate) fn transformed_shape(shape: &[i64], transform: &[String]) -> Result<Vec<i64>, String> {
     use rustrain_model::Transform;
 
     let mut shape = shape.to_vec();
@@ -2104,7 +2196,7 @@ fn transformed_shape(shape: &[i64], transform: &[String]) -> Result<Vec<i64>, St
 
 /// One segment of a fused storage (§3.4's `split`): the segment's size replaces the split axis, and
 /// the sizes must add up to the axis they split (§3.5: the intervals must be in range).
-fn split_shape(
+pub(crate) fn split_shape(
     shape: &[i64],
     split: &rustrain_model::ResolvedSplit,
     segment: usize,
@@ -2147,7 +2239,7 @@ fn split_shape(
 }
 
 /// A dimension index; negative counts from the end, as `transpose(i, j)` is a general permutation.
-fn axis(dim: i64, rank: usize) -> Option<usize> {
+pub(crate) fn axis(dim: i64, rank: usize) -> Option<usize> {
     if dim < 0 {
         let from_end = dim + rank as i64;
         (from_end >= 0).then_some(from_end as usize)
@@ -2156,7 +2248,7 @@ fn axis(dim: i64, rank: usize) -> Option<usize> {
     }
 }
 
-fn shape_text(shape: &[i64]) -> String {
+pub(crate) fn shape_text(shape: &[i64]) -> String {
     format!(
         "[{}]",
         shape
@@ -2167,7 +2259,7 @@ fn shape_text(shape: &[i64]) -> String {
     )
 }
 
-fn transform_text(transform: &[String]) -> String {
+pub(crate) fn transform_text(transform: &[String]) -> String {
     if transform.is_empty() {
         "none".to_string()
     } else {
@@ -2180,7 +2272,7 @@ fn transform_text(transform: &[String]) -> String {
 /// Read C5's checkpoint metadata from one of its two forms: a `*.safetensors.meta.json` snapshot,
 /// or a real model directory (or its index file), whose shard **headers** are read and no weight
 /// is ever touched.
-fn load_checkpoint(path: &Path) -> Result<CheckpointMeta> {
+pub(crate) fn load_checkpoint(path: &Path) -> Result<CheckpointMeta> {
     if path.is_dir() {
         let index = path.join("model.safetensors.index.json");
         if !index.is_file() {
@@ -2195,7 +2287,10 @@ fn load_checkpoint(path: &Path) -> Result<CheckpointMeta> {
     if !path.is_file() {
         bail!("no such file or directory: {}", path.display());
     }
-    if path.file_name().is_some_and(|name| name == "model.safetensors.index.json") {
+    if path
+        .file_name()
+        .is_some_and(|name| name == "model.safetensors.index.json")
+    {
         return load_shard_index(path);
     }
     load_snapshot(path)
@@ -2244,7 +2339,7 @@ fn load_snapshot(path: &Path) -> Result<CheckpointMeta> {
 
 /// The real form: an index maps every tensor to a shard, and each shard's header is read with two
 /// `read_exact`s — 8 bytes of length, then the JSON table. No weight byte is ever read.
-fn load_shard_index(index: &Path) -> Result<CheckpointMeta> {
+pub(crate) fn load_shard_index(index: &Path) -> Result<CheckpointMeta> {
     let text = std::fs::read_to_string(index)
         .with_context(|| format!("reading the safetensors index {}", index.display()))?;
     let doc: serde_json::Value = serde_json::from_str(&text)
@@ -2288,7 +2383,7 @@ fn load_shard_index(index: &Path) -> Result<CheckpointMeta> {
 }
 
 /// One `.safetensors` shard's tensor table, **header only**.
-fn read_safetensors_header(path: &Path) -> Result<BTreeMap<String, CkptTensor>> {
+pub(crate) fn read_safetensors_header(path: &Path) -> Result<BTreeMap<String, CkptTensor>> {
     let mut file = std::fs::File::open(path)
         .with_context(|| format!("opening the safetensors shard {}", path.display()))?;
     let mut length = [0u8; 8];
@@ -2307,21 +2402,29 @@ fn read_safetensors_header(path: &Path) -> Result<BTreeMap<String, CkptTensor>> 
         .with_context(|| format!("reading the header of {}", path.display()))?;
     let doc: serde_json::Value = serde_json::from_slice(&header)
         .with_context(|| format!("parsing the header of {}", path.display()))?;
-    let entries = doc
-        .as_object()
-        .ok_or_else(|| anyhow!("{}: the safetensors header is not an object", path.display()))?;
+    let entries = doc.as_object().ok_or_else(|| {
+        anyhow!(
+            "{}: the safetensors header is not an object",
+            path.display()
+        )
+    })?;
     let mut out = BTreeMap::new();
     for (name, entry) in entries {
         if name == "__metadata__" {
             continue;
         }
-        out.insert(name.clone(), tensor_of(entry, name)?);
+        let mut tensor = tensor_of(entry, name)?;
+        // A shard header also says where the bytes live — the byte range the loader seeks to.
+        tensor.shard = Some(path.to_path_buf());
+        out.insert(name.clone(), tensor);
     }
     Ok(out)
 }
 
-/// One `{"dtype": …, "shape": […]}` entry, from either metadata form.
-fn tensor_of(entry: &serde_json::Value, name: &str) -> Result<CkptTensor> {
+/// One `{"dtype": …, "shape": […], "data_offsets": [start, end]}` entry, from either metadata
+/// form. A snapshot has no `data_offsets`, so `CkptTensor::data` stays `None` there — which is
+/// exactly what marks it as metadata without bytes.
+pub(crate) fn tensor_of(entry: &serde_json::Value, name: &str) -> Result<CkptTensor> {
     let dtype = entry
         .get("dtype")
         .and_then(serde_json::Value::as_str)
@@ -2337,12 +2440,34 @@ fn tensor_of(entry: &serde_json::Value, name: &str) -> Result<CkptTensor> {
                 .ok_or_else(|| anyhow!("tensor `{name}`: a shape entry is not an integer"))
         })
         .collect::<Result<Vec<i64>>>()?;
-    Ok(CkptTensor {
+    let data = match entry.get("data_offsets") {
+        None => None,
+        Some(offsets) => {
+            let offsets = offsets
+                .as_array()
+                .ok_or_else(|| anyhow!("tensor `{name}`: `data_offsets` is not an array"))?;
+            let start = offsets
+                .first()
+                .and_then(serde_json::Value::as_u64)
+                .ok_or_else(|| anyhow!("tensor `{name}`: `data_offsets[0]` is not an integer"))?;
+            let end = offsets
+                .get(1)
+                .and_then(serde_json::Value::as_u64)
+                .ok_or_else(|| anyhow!("tensor `{name}`: `data_offsets[1]` is not an integer"))?;
+            if end < start {
+                bail!("tensor `{name}`: `data_offsets` [{start}, {end}) is empty or reversed");
+            }
+            Some((start, end))
+        }
+    };
+    let mut out = CkptTensor::new(
         // safetensors spells dtypes in upper case (`BF16`, `F8_E4M3`); §3.6 #5's vocabulary is
         // `RsDtype::name()`'s lower-case spelling.
-        dtype: dtype.to_ascii_lowercase().replace('_', ""),
+        dtype.to_ascii_lowercase().replace('_', ""),
         shape,
-    })
+    );
+    out.data = data;
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -2390,7 +2515,12 @@ mod tests {
     /// pass through as a rename, which is exactly the silent acceptance C6 removed.
     #[test]
     fn a_transform_outside_the_vocabulary_is_an_error_not_a_guess() {
-        for step in ["take(other.name)", "concat(0)", "split(1, [96, 64])", "flip(0)"] {
+        for step in [
+            "take(other.name)",
+            "concat(0)",
+            "split(1, [96, 64])",
+            "flip(0)",
+        ] {
             let error = transformed_shape(&[96, 160], &steps(&[step])).unwrap_err();
             assert!(error.contains(step), "{error}");
         }
@@ -2457,7 +2587,9 @@ mod tests {
     /// C6's verdict vocabulary, and C2's exit rule: only `fail` stops the run.
     #[test]
     fn only_a_fail_makes_the_report_fail() {
-        let item = |status: Verdict| CheckItem::new("l1.structure", status, "reason".to_string(), Vec::new());
+        let item = |status: Verdict| {
+            CheckItem::new("l1.structure", status, "reason".to_string(), Vec::new())
+        };
         let report = |status: Verdict| CheckReport {
             model: "m".to_string(),
             checkpoint: None,

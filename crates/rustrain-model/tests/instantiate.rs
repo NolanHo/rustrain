@@ -215,14 +215,14 @@ fn the_fixture_declares_its_forty_layer_stages_explicitly() {
 /// (`binding[].targets[].axes`) × the real checkpoint shapes × the mesh — no hand-built
 /// layout anywhere.
 ///
-/// `mlp.experts.gate_proj` is `[E = 256, H = 2048, I = 512]` (the slot orientation of the
-/// `[K, N]` convention, §3.4: per-expert `[H, I]`), declared `axes {0: [ep], 2: [tp]}` →
+/// `mlp.experts.gate_proj` is `[E = 256, H = 2048, I = 512]` (the `moe_layer` operator's slot
+/// orientation, §3.4: per-expert `[H, I]`), declared `axes {0: [ep], 2: [tp]}` →
 /// `[256/4, 2048, 512/2] = [64, 2048, 256]`. That is the transposed spelling of the frozen
 /// figure `[64, 256, 2048]` — the same fact in checkpoint orientation `[E, I, H]`, which is the
-/// shape the D3 test in `rustrain-parallel` pins; a description cannot write the slot as
-/// `[E, I, H]` without breaking `[K, N]`. The frozen figure appears **verbatim** on
-/// `mlp.experts.down_proj`, whose slot *is* `[E, I, H]` with `axes {0: [ep], 1: [tp]}` →
-/// `[256/4, 512/2, 2048] = [64, 256, 2048]`.
+/// shape the D3 test in `rustrain-parallel` pins. `mlp.experts.down_proj` is `[E, H, I]` in the
+/// operator's contract too (the checkpoint's own orientation — `moe_layer` reads the de-fused
+/// halves as `[H, I]` per expert), declared `axes {0: [ep], 1: [tp]}` → `[256/4, 2048/2, 512] =
+/// [64, 1024, 512]`.
 #[test]
 fn the_real_shape_join_resolves_declared_axes_end_to_end() {
     let m = mesh(2, 2, 4, 2, 2);
@@ -248,15 +248,16 @@ fn the_real_shape_join_resolves_declared_axes_end_to_end() {
         "ep × tp is two independent specs on one tensor"
     );
 
-    // The frozen figure, literally, on the slot whose orientation is [E, I, H].
+    // The down projection in the operator's own `[E, H, I]` orientation, ep on the experts and
+    // tp on the output-hidden axis.
     let down = plan
         .slot_id("layers.3.mlp.experts.down_proj")
         .expect("layer 3 is on stage 0");
     let down_slot = plan.slot(down);
     assert_eq!(
         down_slot.shape,
-        vec![64, 256, 2048],
-        "down_proj [256, 512, 2048] over axes {{0: ep, 1: tp}} must localize to [64, 256, 2048]"
+        vec![64, 1024, 512],
+        "down_proj [256, 2048, 512] over axes {{0: ep, 1: tp}} must localize to [64, 1024, 512]"
     );
     assert_eq!(
         down_slot.layout.dims,

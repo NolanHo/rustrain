@@ -14,7 +14,7 @@ Two modes, one tolerance table:
 
     input_ids         int64  [seq]      the fixed probe tokens below
     logits            f32    [seq, vocab]
-    hidden_summaries  f32    [L+1, 3]   per hidden state: mean, std, max
+    hidden_summaries  f32    [L+2, 3]   per hidden state: mean, std, max
 
 `compare` reads two such files and applies the acceptance from
 `docs/design/qwen36-text/spec.md` D5:
@@ -83,7 +83,9 @@ def dump(args: argparse.Namespace) -> int:
         out = model(input_ids=ids, output_hidden_states=True, use_cache=False)
 
     logits = out.logits[0].to(torch.float32).cpu().numpy()
-    # `hidden_states` is (embedding output, layer 1, ..., final norm) — L+1 entries.
+    # `hidden_states` is (embedding output, layer 1, ..., final norm) — num_hidden_layers + 2
+    # entries (42 for the 40-layer Qwen3.6-35B-A3B). The rustrain side must declare the same set:
+    # `outputs.hidden = ["embed.y", "layers.*.y", "norm.y"]` in the description's `outputs` section.
     summaries = np.stack(
         [
             np.array(

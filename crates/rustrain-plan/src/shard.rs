@@ -102,6 +102,15 @@ pub enum ShardRule {
     /// provider with a different weight layout is added, the layout must become
     /// a declared property of the operator rather than a framework assumption.
     Linear,
+    /// A lookup `out = w[ids]` is a linear over its table with the operands in
+    /// the *kernel's* order `(w, ids)`: the ids select rows of the table, so a
+    /// table sharded on its vocabulary axis owes exactly what a row-parallel
+    /// linear owes (a partial sum over the group, materialized by an
+    /// all-reduce) and one sharded on its embedding axis owes a column-parallel
+    /// output. The distribution arithmetic is [`ShardRule::Linear`]'s with the
+    /// activation read from input 1 and the weight from input 0 — a separate
+    /// rule because the positions are reversed relative to `linear`'s `(x, w)`.
+    Embedding,
     /// `a @ b` with the contraction on `a`'s last and `b`'s second-to-last dim.
     MatMul,
     /// The operator's distribution is not inferable; the plan's declared
@@ -128,8 +137,10 @@ pub fn rule_for(op: &str) -> ShardRule {
         // its vocabulary axis owes exactly what a row-parallel linear owes (a partial sum over the
         // group, materialized by an all-reduce) and one sharded on its embedding axis owes a
         // column-parallel output. Classifying it as `Elementwise` asked for the *activation's*
-        // layout instead, which turns the declared shard on the table into a conflict.
-        "linear" | "embedding" => ShardRule::Linear,
+        // layout instead, which turns the declared shard on the table into a conflict. The kernel's
+        // operand order is `(w, ids)` — the weight first — so the rule is `Embedding`, not `Linear`.
+        "linear" => ShardRule::Linear,
+        "embedding" => ShardRule::Embedding,
         "matmul" | "bmm" => ShardRule::MatMul,
         _ => ShardRule::Declared,
     }
@@ -306,6 +317,39 @@ pub fn derive(
             };
             DerivedShards {
                 required_inputs: vec![x, w],
+                outputs: vec![out; declared_outputs.len()],
+            }
+        }
+
+        ShardRule::Embedding => {
+            // out = w[ids]; declared_inputs = [w, ids] (the kernel's operand
+            // order — the weight first, unlike `linear`'s [x, w]). The lookup
+            // is still a linear over the table, so the arithmetic is `Linear`'s
+            // with the activation read from input 1 and the weight from
+            // input 0.
+            let x = inputs
+                .get(1)
+                .cloned()
+                .unwrap_or_else(ParallelLayout::replicate);
+            let w = first();
+
+            let out = match (w.is_replicated(), w.dims.as_slice(), w.partial.as_ref()) {
+                (true, _, _) => x.clone(),
+                (false, [ShardSpec { dim, group }], None) if *dim == 1 => {
+                    ParallelLayout::shard(-1, *group)
+                }
+                (false, [ShardSpec { dim, group }], None) if *dim == 0 => {
+                    ParallelLayout::partial(ReduceOp::Sum, *group)
+                }
+                _ => {
+                    return Err(DeriveError::UnsupportedWeightLayout {
+                        op: op.to_string(),
+                        layout: format!("{w}"),
+                    });
+                }
+            };
+            DerivedShards {
+                required_inputs: vec![w, x],
                 outputs: vec![out; declared_outputs.len()],
             }
         }

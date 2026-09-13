@@ -182,18 +182,28 @@ fn assert_zero_counters(doc: &Value, run: &Run) {
             .unwrap_or_else(|| panic!("the report has no `counts` object\n{}", run.dump()));
         let found = counts.get(key);
         let value = match found {
-            Some(Value::Number(n)) => {
-                n.as_i64()
-                    .unwrap_or_else(|| panic!("report `counts.{key}` = {n}, not an integer count\n{}", run.dump()))
-            }
-            Some(other) => panic!("report `counts.{key}` = {other}, not a count\n{}", run.dump()),
+            Some(Value::Number(n)) => n.as_i64().unwrap_or_else(|| {
+                panic!(
+                    "report `counts.{key}` = {n}, not an integer count\n{}",
+                    run.dump()
+                )
+            }),
+            Some(other) => panic!(
+                "report `counts.{key}` = {other}, not a count\n{}",
+                run.dump()
+            ),
             None => panic!(
                 "the report has no `counts.{key}` (keys: {:?})\n{}",
                 counts.keys().collect::<Vec<_>>(),
                 run.dump()
             ),
         };
-        assert_eq!(value, 0, "`counts.{key}` = {value}, expected 0\n{}", run.dump());
+        assert_eq!(
+            value,
+            0,
+            "`counts.{key}` = {value}, expected 0\n{}",
+            run.dump()
+        );
     }
 }
 
@@ -398,7 +408,10 @@ fn tiny_model_with_a_matching_snapshot_passes_l2() {
 /// `models/missing-binding` is `models/tiny` without the `mlp.down` binding.
 #[test]
 fn a_weight_slot_without_a_binding_is_reported_by_its_slot_name() {
-    let run = check(&fixture_model("missing-binding"), &fixture_checkpoint("tiny"));
+    let run = check(
+        &fixture_model("missing-binding"),
+        &fixture_checkpoint("tiny"),
+    );
     run.expect_readable_failure();
 
     assert!(
@@ -416,7 +429,10 @@ fn a_weight_slot_without_a_binding_is_reported_by_its_slot_name() {
 /// that this test does not depend on).
 #[test]
 fn a_binding_for_a_tensor_the_checkpoint_lacks_is_reported_by_its_source() {
-    let run = check(&fixture_model("extra-declaration"), &fixture_checkpoint("tiny"));
+    let run = check(
+        &fixture_model("extra-declaration"),
+        &fixture_checkpoint("tiny"),
+    );
     run.expect_readable_failure();
 
     assert!(
@@ -433,7 +449,10 @@ fn a_binding_for_a_tensor_the_checkpoint_lacks_is_reported_by_its_source() {
 /// report has to say *which* slot and *what* the gap is (§3.5's shape mandate).
 #[test]
 fn a_binding_missing_its_transpose_fails_and_shows_the_shape_gap() {
-    let run = check(&fixture_model("wrong-transform"), &fixture_checkpoint("tiny"));
+    let run = check(
+        &fixture_model("wrong-transform"),
+        &fixture_checkpoint("tiny"),
+    );
     run.expect_readable_failure();
 
     let text = run.diagnostic();
@@ -467,7 +486,10 @@ fn a_checkpoint_tensor_no_binding_consumes_is_reported_by_name() {
 /// the test above, with `models/tiny-ignored` (identical description plus one `ignore` entry).
 #[test]
 fn an_ignored_checkpoint_tensor_stops_failing() {
-    let run = check(&fixture_model("tiny-ignored"), &fixture_checkpoint("tiny-extra"));
+    let run = check(
+        &fixture_model("tiny-ignored"),
+        &fixture_checkpoint("tiny-extra"),
+    );
     run.expect_success();
 
     assert_zero_counters(&run.json(), &run);
@@ -510,8 +532,10 @@ fn a_misspelled_ignore_pattern_does_not_silently_uncover_a_tensor() {
 
     let items = check_items(&doc);
     assert!(
-        items.iter().any(|item| item.status == Status::Warning
-            && item.reason.contains(" model.extra.weight")),
+        items
+            .iter()
+            .any(|item| item.status == Status::Warning
+                && item.reason.contains(" model.extra.weight")),
         "the 0-hit pattern is a Warning that names the pattern verbatim (the space is part of it), \
          so a reader can see the typo:\n{}",
         describe(&items)
@@ -583,7 +607,7 @@ fn the_real_qwen36_description_reconciles_the_real_checkpoint_metadata() {
         describe(&items)
     );
     assert!(
-        availability.reason.starts_with("all ") && mentions_number(&availability.reason, 1184),
+        availability.reason.starts_with("all ") && mentions_number(&availability.reason, 1285),
         "the pass must count the nodes it resolved: {}\n{}",
         availability.reason,
         describe(&items)

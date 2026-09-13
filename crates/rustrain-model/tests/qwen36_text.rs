@@ -371,19 +371,15 @@ fn the_gdn_l2norm_is_per_head_and_the_router_moe_contract_is_de_fused() {
         "moe_layer 节点不得携带 router 的 top_k / norm_topk_prob 属性"
     );
 
-    // 权重 slot 保持 de-fused：gate/up 是 [experts, hidden, moe_inter]，
-    // down 是 [experts, moe_inter, hidden]（都不进融合张量）。
+    // 权重 slot 保持 de-fused，方向按 `moe_layer` 的 op 契约：gate/up 与 down 都是
+    // [experts, hidden, moe_inter]（per-expert [H, I]，checkpoint 的原生朝向，不进融合张量）。
     for name in [
         "layers.0.mlp.experts.gate_proj",
         "layers.0.mlp.experts.up_proj",
+        "layers.0.mlp.experts.down_proj",
     ] {
         assert_eq!(plan.slot(id(name)).shape, vec![256, 2048, 512], "{name}");
     }
-    assert_eq!(
-        plan.slot(id("layers.0.mlp.experts.down_proj")).shape,
-        vec![256, 512, 2048],
-        "layers.0.mlp.experts.down_proj"
-    );
 }
 
 #[test]

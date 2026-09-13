@@ -39,6 +39,24 @@ pub struct ModelDesc {
     /// the vision tower is dropped by writing `"model.visual.**"`, never silently.
     #[serde(default)]
     pub ignore: Vec<String>,
+    /// What a forward runner reports (D5's `run` command): which slot holds the logits, and
+    /// which slots — in order — are the per-layer hidden states the comparison summarises as
+    /// `[L+1, 3]` (mean, std, max). The patterns use the binding-target syntax (`*` for exactly
+    /// one segment; `**` is not allowed — one pattern names one slot or a uniform family of
+    /// slots). Read by `rustrain run`; `check` does not consult it.
+    #[serde(default)]
+    pub outputs: Option<ModelOutputs>,
+}
+
+/// The runner-facing outputs of a description (D5).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ModelOutputs {
+    /// Slot-name pattern of the logits tensor, e.g. `"lm_head.y"`.
+    pub logits: String,
+    /// Slot-name patterns of the hidden states, in report order — the order the comparison
+    /// contract fixes (embedding output, layer outputs, final norm = `L+1` rows).
+    pub hidden: Vec<String>,
 }
 
 /// A declared port (input or output).
