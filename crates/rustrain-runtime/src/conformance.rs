@@ -1238,6 +1238,27 @@ pub fn default_cases() -> Vec<Case> {
                 .set("chunk_size", 2i64),
         ),
     );
+    // moe_layer: the one-operator sparse layer with the static [.., H] in/out
+    // contract (op-vocabulary §3.3) — one token (rows=1), E=4, I=2, K=2. The
+    // routing indices stay inside [0, E) (the Indices fill is modulo 4, which
+    // is exactly the expert count here), so the dropless routing runs with
+    // both selected experts firing. No attributes: top_k / norm_topk_prob
+    // belong to the router node, not to this op.
+    cases.push(Case::new(
+        "moe_layer",
+        vec![
+            InputSpec::f32("h", vec![1, 2], Ramp),
+            InputSpec::f32("routing_weights", vec![1, 2], Pseudo { seed: 83 }),
+            InputSpec::indices("routing_indices", vec![1, 2]),
+            InputSpec::f32("experts_gate_proj", vec![4, 2, 2], Pseudo { seed: 89 }),
+            InputSpec::f32("experts_up_proj", vec![4, 2, 2], Pseudo { seed: 97 }),
+            InputSpec::f32("experts_down_proj", vec![4, 2, 2], Pseudo { seed: 101 }),
+            InputSpec::f32("shared_gate_proj", vec![2, 2], Pseudo { seed: 103 }),
+            InputSpec::f32("shared_up_proj", vec![2, 2], Pseudo { seed: 107 }),
+            InputSpec::f32("shared_down_proj", vec![2, 2], Pseudo { seed: 109 }),
+            InputSpec::f32("shared_expert_gate", vec![1, 2], Pseudo { seed: 113 }),
+        ],
+    ));
     // rope's T2 completion: partial rotary + theta + position defaults, two
     // outputs — the case the gate used to skip for lack of a convention.
     cases.push(
@@ -1313,4 +1334,113 @@ pub fn uncovered_operators() -> Vec<(&'static str, &'static str)> {
             "takes a quantized payload and its scale; the harness cannot yet feed one operator's              output into another's input",
         ),
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use rustrain_abi::Plugin;
+
+    fn moe_case() -> Case {
+        default_cases()
+            .into_iter()
+            .find(|c| c.op == "moe_layer")
+            .expect("the default table has a case for moe_layer")
+    }
+
+    /// The case must line up with the operator's declared contract
+    /// (`crates/rustrain-kernels/src/op/moe.rs`), inputs in the declared order:
+    /// a case that does not match the contract would run a different
+    /// computation than every provider implements.
+    #[test]
+    fn moe_layer_case_matches_the_declared_contract() {
+        let case = moe_case();
+        assert_eq!(case.n_outputs, 1, "one output, h's exact shape");
+        assert!(case.attrs.is_empty(), "moe_layer takes no attributes");
+
+        let expected: Vec<(&str, RsDtype, Vec<i64>)> = vec![
+            ("h", RsDtype::F32, vec![1, 2]),
+            ("routing_weights", RsDtype::F32, vec![1, 2]),
+            ("routing_indices", RsDtype::I32, vec![1, 2]),
+            ("experts_gate_proj", RsDtype::F32, vec![4, 2, 2]),
+            ("experts_up_proj", RsDtype::F32, vec![4, 2, 2]),
+            ("experts_down_proj", RsDtype::F32, vec![4, 2, 2]),
+            ("shared_gate_proj", RsDtype::F32, vec![2, 2]),
+            ("shared_up_proj", RsDtype::F32, vec![2, 2]),
+            ("shared_down_proj", RsDtype::F32, vec![2, 2]),
+            ("shared_expert_gate", RsDtype::F32, vec![1, 2]),
+        ];
+        assert_eq!(case.inputs.len(), expected.len(), "exactly ten inputs");
+        for (i, (spec, (name, dtype, shape))) in case.inputs.iter().zip(expected.iter()).enumerate()
+        {
+            assert_eq!(spec.name, *name, "input {i} name");
+            assert_eq!(spec.dtype, *dtype, "input {i} dtype");
+            assert_eq!(spec.shape, *shape, "input {i} shape");
+        }
+    }
+
+    /// The fused body uses routing indices as-is with no wrap-around and
+    /// rejects values outside [0, E), so the case's synthesized indices must
+    /// all land inside the expert range.
+    #[test]
+    fn moe_layer_case_routing_indices_are_in_range() {
+        let case = moe_case();
+        let rows = case.inputs[0].shape[0];
+        let e = case.inputs[3].shape[0];
+        let k = case.inputs[1].shape[1];
+        let spec = &case.inputs[2];
+        assert_eq!(spec.dtype, RsDtype::I32);
+        assert_eq!(spec.shape, vec![rows, k], "indices mirror [rows, K]");
+
+        let bytes = spec.bytes();
+        assert_eq!(bytes.len(), 4 * spec.numel());
+        for chunk in bytes.chunks_exact(4) {
+            let idx = i32::from_ne_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+            assert!(
+                (0..e).contains(&(idx as i64)),
+                "synthesized expert index {idx} is outside [0, {e})"
+            );
+        }
+    }
+
+    /// The case must run green against the real reference provider: the output
+    /// keeps h's exact shape and two runs agree bitwise. Numeric stays an
+    /// honest skip while the reference is the only provider.
+    #[test]
+    fn moe_layer_case_runs_green_against_the_reference() {
+        let mut registry = Registry::new();
+        // SAFETY: the built-in provider descriptor is leaked by `build_plugin`
+        // and lives for the process.
+        let reference = unsafe { Plugin::from_static(rustrain_kernels::plugin(), "<built-in>") }
+            .expect("the built-in provider passes ABI validation");
+        registry.add_plugin(reference).expect("registering it");
+
+        let recipe = Recipe::from_toml("[kernel]\ndefault = \"reference\"\n")
+            .expect("a recipe with the reference as default");
+        let harness = Harness::new(&registry, &recipe);
+        let case = moe_case();
+
+        // The output keeps h's exact shape — the option-A static in/out.
+        let outputs = harness
+            .execute(&case, REFERENCE_VARIANT)
+            .expect("the reference implements moe_layer for this case");
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0].dtype, RsDtype::F32);
+        assert_eq!(outputs[0].shape, vec![1, 2]);
+
+        for result in harness.run(&case) {
+            assert!(
+                result.ok(),
+                "moe_layer@{} must be green: {:?}",
+                result.variant,
+                result.determinism
+            );
+            assert!(
+                matches!(result.determinism, Check::Pass { .. }),
+                "the fused body is deterministic, got {:?}",
+                result.determinism
+            );
+        }
+    }
 }
