@@ -564,18 +564,14 @@ fn the_real_qwen36_description_reconciles_the_real_checkpoint_metadata() {
         describe(&items)
     );
 
-    const UNIMPLEMENTED_PRIMITIVES: [&str; 5] = [
-        "causal_conv1d",
-        "gated_delta_rule",
-        "l2norm",
-        "moe_layer",
-        "rmsnorm_gated",
-    ];
+    // D5's reference-provider half landed l2norm, rmsnorm_gated,
+    // causal_conv1d and gated_delta_rule; moe_layer (the EXPLICIT MoE op,
+    // the lead's half) is the one primitive still without a provider.
+    const UNIMPLEMENTED_PRIMITIVES: [&str; 1] = ["moe_layer"];
     let text = items_text(&items);
     assert!(
         UNIMPLEMENTED_PRIMITIVES.iter().all(|op| text.contains(op)),
-        "the availability Skip must say what is missing, and it must say **all five**: the \
-         description uses five primitives no provider publishes on this machine ({})\n{}",
+        "the availability Skip must say what is missing ({})\n{}",
         UNIMPLEMENTED_PRIMITIVES.join(", "),
         run.dump()
     );

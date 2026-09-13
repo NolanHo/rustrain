@@ -1183,7 +1183,8 @@
           "dtype": "bf16",
           "shape": [
             "seq",
-            "q_size"
+            "heads",
+            "head_dim"
           ]
         },
         {
@@ -1192,7 +1193,8 @@
           "dtype": "bf16",
           "shape": [
             "seq",
-            "q_size"
+            "heads",
+            "head_dim"
           ]
         },
         {
@@ -1205,6 +1207,16 @@
           ]
         },
         {
+          "name": "kh",
+          "kind": "activation",
+          "dtype": "bf16",
+          "shape": [
+            "seq",
+            "kv_heads",
+            "head_dim"
+          ]
+        },
+        {
           "name": "v",
           "kind": "activation",
           "dtype": "bf16",
@@ -1214,11 +1226,22 @@
           ]
         },
         {
+          "name": "vh",
+          "kind": "activation",
+          "dtype": "bf16",
+          "shape": [
+            "seq",
+            "kv_heads",
+            "head_dim"
+          ]
+        },
+        {
           "name": "qn",
           "kind": "activation",
           "dtype": "bf16",
           "shape": [
             "seq",
+            "heads",
             "head_dim"
           ]
         },
@@ -1228,6 +1251,7 @@
           "dtype": "bf16",
           "shape": [
             "seq",
+            "kv_heads",
             "head_dim"
           ]
         },
@@ -1237,6 +1261,7 @@
           "dtype": "bf16",
           "shape": [
             "seq",
+            "heads",
             "head_dim"
           ]
         },
@@ -1246,6 +1271,7 @@
           "dtype": "bf16",
           "shape": [
             "seq",
+            "kv_heads",
             "head_dim"
           ]
         },
@@ -1255,7 +1281,8 @@
           "dtype": "bf16",
           "shape": [
             "seq",
-            "q_size"
+            "heads",
+            "head_dim"
           ]
         },
         {
@@ -1264,11 +1291,22 @@
           "dtype": "bf16",
           "shape": [
             "seq",
-            "q_size"
+            "heads",
+            "head_dim"
           ]
         },
         {
           "name": "og",
+          "kind": "activation",
+          "dtype": "bf16",
+          "shape": [
+            "seq",
+            "heads",
+            "head_dim"
+          ]
+        },
+        {
+          "name": "ogf",
           "kind": "activation",
           "dtype": "bf16",
           "shape": [
@@ -1411,7 +1449,8 @@
           "attrs": {
             "shape": [
               512,
-              4096
+              16,
+              256
             ]
           }
         },
@@ -1426,7 +1465,8 @@
           "attrs": {
             "shape": [
               512,
-              4096
+              16,
+              256
             ]
           }
         },
@@ -1441,6 +1481,22 @@
           ]
         },
         {
+          "op": "reshape",
+          "in": [
+            "k"
+          ],
+          "out": [
+            "kh"
+          ],
+          "attrs": {
+            "shape": [
+              512,
+              2,
+              256
+            ]
+          }
+        },
+        {
           "op": "linear",
           "in": [
             "h1",
@@ -1449,6 +1505,22 @@
           "out": [
             "v"
           ]
+        },
+        {
+          "op": "reshape",
+          "in": [
+            "v"
+          ],
+          "out": [
+            "vh"
+          ],
+          "attrs": {
+            "shape": [
+              512,
+              2,
+              256
+            ]
+          }
         },
         {
           "op": "rmsnorm",
@@ -1466,7 +1538,7 @@
         {
           "op": "rmsnorm",
           "in": [
-            "k",
+            "kh",
             "self_attn.k_norm"
           ],
           "out": [
@@ -1497,7 +1569,7 @@
           "in": [
             "qr",
             "kr",
-            "v"
+            "vh"
           ],
           "out": [
             "o"
@@ -1534,9 +1606,24 @@
           }
         },
         {
+          "op": "reshape",
+          "in": [
+            "og"
+          ],
+          "out": [
+            "ogf"
+          ],
+          "attrs": {
+            "shape": [
+              512,
+              4096
+            ]
+          }
+        },
+        {
           "op": "linear",
           "in": [
-            "og",
+            "ogf",
             "self_attn.o_proj"
           ],
           "out": [

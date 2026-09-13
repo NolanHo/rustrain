@@ -53,7 +53,7 @@ rustrain check --model <model-dir> [--checkpoint <dir>] [--tp N --cp N --ep N --
 - **退出码只由 `Fail` 决定。** 每个检查项的结果是 `Pass` / `Fail` / `Warning` / `Skip`，**每条 `Skip` 必须写明理由**
   （沿用 `ops check` 的纪律：skip 不等于 pass，必须能回答"缺什么、什么时候能补上"）。
 - **本机对 bf16 的"实现可用性"是 `Skip` 而不是 `Fail`**：reference provider 只声明 `f32`，而真实描述是 `bf16`，
-  且 5 个新原语尚未实现 —— 这是**这台机器的限制 + 尚未开工的 D5**，不是 plan 的缺陷。理由必须逐条列出。
+  且 `moe_layer` 尚未实现（5 个新原语已有 4 个落地）—— 这是**这台机器的限制 + 尚未开工的 D5**，不是 plan 的缺陷。理由必须逐条列出。
 - `--dtype <name>` 覆盖描述里的 dtype，用于显式声明"我在什么精度下检查"；报告里记录实际用的 dtype。
 - 退出码 0 = 无 `Fail`；`--json` 输出机器可读报告（逐项结果、`Skip`/`Warning` 及理由）。
 - **不执行任何计算，不需要设备**：不得创建 CUDA 上下文；插件在 `init()` 之前不得碰设备。
@@ -88,7 +88,7 @@ rustrain check --model <model-dir> [--checkpoint <dir>] [--tp N --cp N --ep N --
   `l2.tensor_consumption`、`l2.shape_reconciliation`、`l2.dtype_compatibility`。
 - **`l1.implementation_availability` 是 `skip`**（不是 `fail`），当某算子**已知但本机没有可用实现**时；
   `reason` 必须列出未解析的算子清单与原因（这既覆盖"reference provider 只声明 f32"，也覆盖
-  "5 个新原语尚未实现"）。**每条 skip 都要能回答"缺什么、什么时候能补上"**（沿用 `ops check` 纪律）。
+  "尚未实现的新原语（如 `moe_layer`）"）。**每条 skip 都要能回答"缺什么、什么时候能补上"**（沿用 `ops check` 纪律）。
 - **`--dtype <name>` 的语义**：只影响 **L1 解析实现时使用的精度**（默认取描述的顶层 `dtype`），
   **不影响 L2 的 dtype 比对** —— L2 永远拿**描述声明的** dtype 与 checkpoint 的 dtype 比。
   这样"在 f32 下检查结构"与"校验 bf16 权重与描述是否相符"两件事互不干扰。
@@ -169,7 +169,7 @@ rustrain check --model <model-dir> [--checkpoint <dir>] [--tp N --cp N --ep N --
 ### D1 — 描述文件能表达这个模型
 
 **可观察结果**：存在一份 `model.json` + 一个模型目录（`config.json` 来自 HF 公开仓库），
-展开后得到一个全局 Plan：**节点数 > 900**、**总 slot 数 > 900**。实测：**1031 节点 / 1916 slot / 873 weight slot**。
+展开后得到一个全局 Plan：**节点数 > 900**、**总 slot 数 > 900**。实测：**1064 节点 / 1949 slot / 873 weight slot**。
 
 > **注意：weight slot 数与 checkpoint 张量数不相等，也不该相等。**
 > checkpoint 有 **712** 个文本+MTP 权重张量（文本 693 = 根 3 + 层内合计 80+270+60+280，加 MTP 19）。
@@ -296,17 +296,17 @@ HF transformers 的 logits 在容差内一致；每层 hidden 的 mean/std/max �
 ### 交付物履行状态
 
 - [x] **D1 — 描述文件能表达这个模型** —— 证据：提交 `746acc1`（主体）+ `3057544`（返工）；
-  实测 `nodes 1031 / slots 1916 / weight slots 873`，两次展开逐字节相同（sha256 `4450c731…`）；
+  实测 `nodes 1064 / slots 1949 / weight slots 873`，两次展开逐字节相同（sha256 `8c2154e8…`）；
   6 + 3 条契约测试 + 工作区 265 passed / clippy 0 warning / `ops check` exit 0；
   46 条 binding 独立对账 **712/712** 文本+MTP 张量（0 未命中、0 未覆盖、0 重复、0 视觉）；
   **形状对账 873/873**（快照取自真实分片头部，含 `transform`/`split` 的机械验证）；
   独立审查 `APPROVED_WITH_NOTES`，其指出的缺陷已全部修掉（见下）。
 - [x] **D2 — L2 加载检查对账 1045 个张量** —— 证据：提交 `460178f`（主体）+ `8f9728a`、`d37f936`（两轮返工）+ `b793362`、`27c4bfd`、`5da56ba`、`a2c47ca`（第四、五轮：审查复现的七条"假绿"全部关闭）；
   真实快照（1045 张量 / 仅分片头部 / 无权重 / 无网络）下 `rustrain check --dtype f32` 退出 0，
-  counts = `{bindings 46, nodes 1031, slots 1916, weights 873, slots_unbound 0, tensors_unconsumed 0, shape_mismatch 0, dtype_mismatch 0}`；
-  "实现可用性"为 `skip` 且逐条写明缺哪个原语（`causal_conv1d`×90 / `gated_delta_rule`×30 / `l2norm`×60 / `moe_layer`×41 / `rmsnorm_gated`×30 = **251 / 1031** 个节点）；
+  counts = `{bindings 46, nodes 1064, slots 1949, weights 873, slots_unbound 0, tensors_unconsumed 0, shape_mismatch 0, dtype_mismatch 0}`；
+  "实现可用性"为 `skip` 且逐条写明缺哪个原语（`moe_layer`×41 = **41 / 1064** 个节点；5 个新原语中其余 4 个已随 D5 的 kernels 工作落地）；
   四个故意破坏的用例各自 `Fail` 并点名：漏一条 binding → 槽名、多声明一个不存在的张量 → source 模式、漏掉 `transpose` → 槽名 + 两个形状数字、未被消费的张量 → 张量名；`ignore` 删掉即 `Fail`；
-  门禁 `check_l2.rs` **9 条** + `check_report_contract.rs` **4 条**：C6 的 15 个 id、14 个状态、8 个计数的**值**、报告自称的 model / checkpoint / dtype、两处 `details` 的**内容**（按 dtype 分表：`f32` 是 5 行 / 251，`bf16`·`f16` 与默认路径是 16 行 / 1031，每行还要求 `why` 与成因相符、reason 的**开头总数**与表一致）、以及**不带 `--dtype`** 与**显式 `--dtype bf16` / `f16`** 三条路径（这三条原本都没有门禁）；
+  门禁 `check_l2.rs` **9 条** + `check_report_contract.rs` **4 条**：C6 的 15 个 id、14 个状态、8 个计数的**值**、报告自称的 model / checkpoint / dtype、两处 `details` 的**内容**（按 dtype 分表：`f32` 是 1 行 / 41，`bf16`·`f16` 与默认路径是 16 行 / 1064，每行还要求 `why` 与成因相符、reason 的**开头总数**与表一致）、以及**不带 `--dtype`** 与**显式 `--dtype bf16` / `f16`** 三条路径（这三条原本都没有门禁）；
   每条新断言都用**变异反证**过，十四种变异全部变红：计数漂移 / 计数写成 `null` 或 `46.0` / 清空 `details` / 只在默认 dtype 下清空 / 把 bf16 表截断回 5 行 / 把显式 bf16 改成 `pass` / 单条算子计数改动 / 单条理由掏空 / 理由与成因矛盾 / 重复条目 / ignore 总数或 reason 总数改动 / reason 丢掉或篡改总数 / 表与和互不自洽 / `dtype` 谎报 / model 指向别的目录 / 同一 id 两次；
   工作区 **304 passed** / clippy 0 warning / `ops check` exit 0；
   独立审查**五轮**：第三轮 `APPROVED_WITH_NOTES`（N1 已关；N2 锚定只约束首段、N3 前后空白当字面段 → `model-description.md` §3.8）；第四、五轮（三个独立视角）各自复现了"报告无用但门禁全绿"的路径（`dtype`/`model`/`checkpoint` 谎报、同一 id 两条、reason 与 details 数目不符、默认 dtype 下清空 details、bf16 表可被截断、显式 dtype 无门禁、reason 可篡改总数、`why` 可自相矛盾），**全部已修并各自反证**。
@@ -321,7 +321,7 @@ HF transformers 的 logits 在容差内一致；每层 hidden 的 mean/std/max �
   独立审查两条（不同视角）：**行为保持** = `APPROVED_WITH_NOTES` —— `check` 报告与 `ops check` 输出**逐字节不变**，三处差异全在设计内（digest、新的 `mesh` 字段、collective 组名 `Tp`→`tp`），42 处测试改动逐一核对**无一处被削弱**（多处被加强），findings 全是文档账，随 `a11d6c0` 修掉；**算术与转换表** = `CHANGES_REQUIRED` —— 审查者用**数据级模拟器**（把 layout 实例化成每 rank 的具体张量、逐元素执行发出的集合通信）复现 5 条：相交组的 `shard+partial` 被回答而非拒绝（只发一次集合通信，编译器会放行）、`reduce_scatter` 与 gather 的次序、同组双维分片不可能重建、未兑现的目标分片被接受、`ATTR_GROUP` 的 `i64→u32` 静默截断。随 `ce5bbca` 全部改为**拒绝**，并用审查者自己的 oracle 复跑验证：`attack3_table` 从 FAIL（8053 findings）变为 **PASS（9612 次模拟一致 / 0 findings / 0 panic）**，组算术与形状算术两次攻击保持 PASS。三条新规则写进 `model-description.md` §2.3。
 - [x] **D4 — instantiate 与 L1 全绿** —— 证据：提交 `2d00afa`（两条裁定：`stage` 与符号轴名）+ `98c84db`（`instantiate` + 规则表的 rank 感知）+ `c602c1c`（CLI 用真实 mesh 驱动 `check`、三项 L1 变真检查、内存预算改 advisory）；
   `rustrain check --model <qwen36 描述> --checkpoint <真实快照> --dtype f32 --tp 2 --cp 2 --ep 4 --dp 2 --pp 2` **退出 0**：15 项中 11 pass / 4 skip / **0 fail**（新增 `l1.instantiate`；`l1.layout_propagation`、`l1.partial_fulfillment`、`l1.collective_axes` 由 skip 变真检查）；`--tp 3` **退出 1**，`l1.instantiate` 点名 `slot embed.w` + dim 0 + 全局 248320 + 除数 3；
-  `instantiate` **不碰注册表**，所以在"5 个原语本机没有实现"的真实 bf16 描述上照样跑 —— 不整除因此能在解析之前就 `fail`。剩下 4 条 skip 各自写明"解析不完整 / 本机没有实现"与何时能跑（C2：skip 必须回答缺什么、什么时候能补），**没有把没跑的检查写成 pass**；
+  `instantiate` **不碰注册表**，所以在"`moe_layer` 本机没有实现"的真实 bf16 描述上照样跑 —— 不整除因此能在解析之前就 `fail`。剩下 4 条 skip 各自写明"解析不完整 / 本机没有实现"与何时能跑（C2：skip 必须回答缺什么、什么时候能补），**没有把没跑的检查写成 pass**；
   **PP 裁剪**：`pp=2` 时 rank 0 的节点集合 = `embed` + layers 0–19，不含 20–39、`norm`、`lm_head`、MTP；跨界 slot 变成 plan 的 Input/Output（`pp_pruning_keeps_exactly_the_rank_stage` 按实例前缀与 slot kind 断言）；
   **Partial 兑现**：row-parallel 的声明分片让 linear 输出成为 `partial(sum, tp)`，`Compiler::compile` 插入的 `all_reduce` 掩码就是 `tp`；vocabulary 分片的 embedding 同样欠一次 `all_reduce({tp})`（两条测试各一）；
   **真实形状贯通**：声明的切分 → 本地形状在真实描述上端到端成立（`ep=4, tp=2` 的 gate / down 段）；

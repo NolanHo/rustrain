@@ -1471,15 +1471,16 @@ fn compile_dependent_l1_checks(expanded: bool) -> Vec<CheckItem> {
         (
             "l1.compile",
             "`Plan::compile` needs a resolved implementation for every node, and resolution is \
-             incomplete on this host: five primitives have no provider at f32, and the reference \
-             provider's f32-only variants reject every node at the description's own bf16 (D5 \
-             lands the missing primitives; until then this sub-check cannot run)",
+             incomplete on this host: the EXPLICIT moe_layer primitive has no provider at f32, \
+             and the reference provider's f32-only variants reject every node at the \
+             description's own bf16 (D5's provider half landed four of the five primitives; the \
+             MoE op and the planner half remain — until then this sub-check cannot run)",
         ),
         (
             "l1.operator_shapes",
             "operators are only asked for their shapes by the compiler's shape-inference pass, \
-             which runs after resolution — and resolution is incomplete on this host (five \
-             primitives of this description have no implementation; D5)",
+             which runs after resolution — and resolution is incomplete on this host (moe_layer \
+             has no implementation; D5)",
         ),
         (
             "l1.slot_allocation",

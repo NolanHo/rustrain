@@ -87,9 +87,9 @@ const EXPECTED_SKIPS: [&str; 4] = [
 const EXPECTED_COUNTS: [(&str, i64); 8] = [
     ("bindings", 46),
     ("dtype_mismatch", 0),
-    ("nodes", 1031),
+    ("nodes", 1064),
     ("shape_mismatch", 0),
-    ("slots", 1916),
+    ("slots", 1949),
     ("slots_unbound", 0),
     ("tensors_unconsumed", 0),
     ("weights", 873),
@@ -109,55 +109,51 @@ enum Unavailable {
 /// One `--dtype`'s availability list: every `(operator, node count, why)` the `skip` must carry, and
 /// the total its `reason` must state.
 ///
-/// The two lists differ by **cause**, not only by length. At `--dtype f32` only the five primitives
-/// nothing publishes are left (251 of 1031 nodes); at the description's own `bf16` — which is also
-/// what an explicit `--dtype bf16` or `f16` asks for — every node whose `reference.f32` variant
-/// rejects that dtype joins them, which is the entire plan (1031 of 1031 nodes over 16 operators).
-/// A list that is merely *truncated* to the five f32 rows while its reason keeps saying `251 of
-/// 1031` is exactly the false green this pins down.
+/// The two lists differ by **cause**, not only by length. At `--dtype f32` only the one primitive
+/// nothing publishes is left (`moe_layer`, 41 of 1064 nodes — D5's reference-provider half landed
+/// the other four); at the description's own `bf16` — which is also what an explicit `--dtype
+/// bf16` or `f16` asks for — every node whose `reference.f32` variant rejects that dtype joins
+/// them, which is the entire plan (1064 of 1064 nodes over 20 operators). A list that is merely
+/// *truncated* while its reason keeps saying `41 of 1064` is exactly the false green this pins
+/// down.
 struct Availability {
     entries: &'static [(&'static str, i64, Unavailable)],
     total: i64,
 }
 
-/// `--dtype f32` (D2's acceptance run), and D2's `Skip` for "the 5 new primitives are not written
-/// yet".
+/// `--dtype f32`: the four D5 compute primitives now resolve; `moe_layer` (the EXPLICIT MoE op,
+/// the lead's half of D5) is the one remaining unpublished primitive.
 const F32_AVAILABILITY: Availability = Availability {
-    entries: &[
-        ("causal_conv1d", 90, Unavailable::NoProvider),
-        ("gated_delta_rule", 30, Unavailable::NoProvider),
-        ("l2norm", 60, Unavailable::NoProvider),
-        ("moe_layer", 41, Unavailable::NoProvider),
-        ("rmsnorm_gated", 30, Unavailable::NoProvider),
-    ],
-    total: 251,
+    entries: &[("moe_layer", 41, Unavailable::NoProvider)],
+    total: 41,
 };
 
 /// `bf16` (the description's dtype) or `f16`: the reference provider accepts `f32` only, so every
-/// node of the plan is unresolved, the five unpublished primitives among them.
+/// node of the plan is unresolved — the four D5 primitives now rejected by dtype, `moe_layer`
+/// still unpublished.
 const BF16_AVAILABILITY: Availability = Availability {
     entries: &[
         ("cat", 1, Unavailable::DtypeRejected),
-        ("causal_conv1d", 90, Unavailable::NoProvider),
+        ("causal_conv1d", 90, Unavailable::DtypeRejected),
         ("elementwise_binary", 153, Unavailable::DtypeRejected),
         ("elementwise_unary", 101, Unavailable::DtypeRejected),
         ("embedding", 1, Unavailable::DtypeRejected),
-        ("gated_delta_rule", 30, Unavailable::NoProvider),
-        ("l2norm", 60, Unavailable::NoProvider),
+        ("gated_delta_rule", 30, Unavailable::DtypeRejected),
+        ("l2norm", 60, Unavailable::DtypeRejected),
         ("linear", 298, Unavailable::DtypeRejected),
         ("moe_layer", 41, Unavailable::NoProvider),
         ("narrow", 22, Unavailable::DtypeRejected),
-        ("reshape", 33, Unavailable::DtypeRejected),
+        ("reshape", 66, Unavailable::DtypeRejected),
         ("rmsnorm", 108, Unavailable::DtypeRejected),
-        ("rmsnorm_gated", 30, Unavailable::NoProvider),
+        ("rmsnorm_gated", 30, Unavailable::DtypeRejected),
         ("rope", 11, Unavailable::DtypeRejected),
         ("sdpa", 11, Unavailable::DtypeRejected),
         ("topk_router", 41, Unavailable::DtypeRejected),
     ],
-    total: 1031,
+    total: 1064,
 };
 
-/// Both tables must cover the same five unpublished primitives with the same node counts: the
+/// Both tables must cover the same unpublished primitives with the same node counts: the
 /// `f32` list is the subset of the `bf16` one that nothing can do anything about.
 fn unpublished_component<'a>(table: &'a [(&'a str, i64, Unavailable)]) -> Vec<(&'a str, i64)> {
     let mut out: Vec<(&'a str, i64)> = table
@@ -183,15 +179,15 @@ const IGNORED_TENSORS: i64 = 333;
 /// the global counts. A no-op `instantiate` (returning the global plan unchanged) would still
 /// produce this line — which is why the five-axis run below pins the *pruned* per-stage
 /// counts, where a no-op cannot hide.
-const STAGE0_ONLY: [&str; 1] = ["stage 0 (rank 0): 1031 node(s), 1916 slot(s)"];
+const STAGE0_ONLY: [&str; 1] = ["stage 0 (rank 0): 1064 node(s), 1949 slot(s)"];
 
 /// **C5's witness at the five-axis acceptance mesh**: the per-stage node/slot counts a real
 /// `instantiate` produces after PP pruning. `instantiate` replaced by `return Ok(plan.clone())`
-/// reports 1031 node(s)/1916 slot(s) for *both* stages and turns this gate red — the tripwire
+/// reports 1064 node(s)/1949 slot(s) for *both* stages and turns this gate red — the tripwire
 /// the reviewer's no-op attack walks into.
 const FIVE_AXIS_STAGES: [&str; 2] = [
-    "stage 0 (rank 0): 501 node(s), 933 slot(s)",
-    "stage 1 (rank 32): 530 node(s), 986 slot(s)",
+    "stage 0 (rank 0): 516 node(s), 948 slot(s)",
+    "stage 1 (rank 32): 548 node(s), 1004 slot(s)",
 ];
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -548,7 +544,7 @@ fn assert_details(doc: &Value, items: &[Item], availability: &Availability, stag
                 }
 
                 // The reason's *leading* claim, not just "the plan size appears somewhere": a
-                // reason reading `251 of 425273 node(s) … (the plan has 1031)` must not pass.
+                // reason reading `41 of 425273 node(s) … (the plan has 1064)` must not pass.
                 let lead = format!("{} of {} node(s)", availability.total, plan_nodes);
                 assert!(
                     item.reason.starts_with(&lead),

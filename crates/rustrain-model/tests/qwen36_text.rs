@@ -152,19 +152,21 @@ fn fused_storage_is_split_into_semantic_slots() {
 }
 
 /// §3：`q_proj` 的融合张量不拆，q 与 gate 的分离**画在图里** —— `reshape` 到
-/// `[seq, heads, 2, head_dim]`，两个 `narrow(dim=2)` 各取一半，再各自 `reshape` 回
-/// `[seq, heads * head_dim]`。于是"哪一半是 q"这件事是计划里的节点，不是加载期的隐式约定。
+/// `[seq, heads, 2, head_dim]`，两个 `narrow(dim=2)` 各取一半，再各自 `reshape` 成
+/// `[seq, heads, head_dim]` 的 per-head 视图。于是"哪一半是 q"这件事是计划里的节点，不是加载期的隐式约定。
 ///
-/// **未决（留给 D2/D5）**：末尾那两个 `reshape` 不是零拷贝的 stride 重解释 —— `narrow(dim=2)`
-/// 之后 q 的值在源行内相隔 `2 * head_dim`，"打包"成 `[seq, q_size]` 要么赋值复制，要么让
-/// consumer 直接吃 4 维视图（HF 就是把 4 维视图喂给 `q_norm`，`q_norm` 的 `[head_dim]` 也只对
-/// 最后一维成立）。本 fixture 记录的是 §3 的段序与取法；`reshape` 是否允许复制、以及
-/// `q_norm`/`rope`/`sdpa` 该吃 4 维还是 2 维，是尚未裁定的契约问题，不在本次改动范围内。
+/// **D5 已裁定（op-vocabulary §3.1）**：`q_norm` / `k_norm` / `rope` / `sdpa` 以及
+/// output gate 全部吃 **per-head** `[seq, heads, head_dim]`（`[head_dim]` 的 norm 权重只对最后一维成立），
+/// 只有 `o_proj` 之前才 `reshape` 回 `[seq, q_size]`。早期版本把 q 提前拍平回 `[512, 4096]`，
+/// 让 `q_norm` 在 4096 维的跨 head 轴上做归一 —— 那是描述缺陷，不是模型。
 #[test]
 fn the_q_gate_split_is_a_graph_fact_not_a_load_time_split() {
     let expanded = expanded();
     let plan = &expanded.plan;
-    let id = |name: &str| plan.slot_id(name).unwrap_or_else(|| panic!("缺少 slot {name}"));
+    let id = |name: &str| {
+        plan.slot_id(name)
+            .unwrap_or_else(|| panic!("缺少 slot {name}"))
+    };
     let name_of = |slot: rustrain_plan::SlotId| plan.slot(slot).name.clone();
 
     // 一个 linear 读融合权重，产出交错布局的 [seq, 2 * q_size]。
@@ -185,7 +187,10 @@ fn the_q_gate_split_is_a_graph_fact_not_a_load_time_split() {
         .iter()
         .find(|node| node.op.name == "reshape" && node.inputs.contains(&view))
         .expect("交错布局没有被 reshape 成 [seq, heads, 2, head_dim]");
-    assert_eq!(reshape.attrs.i64s("shape"), Some([512, 16, 2, 256].as_slice()));
+    assert_eq!(
+        reshape.attrs.i64s("shape"),
+        Some([512, 16, 2, 256].as_slice())
+    );
     assert_eq!(name_of(reshape.outputs[0]), "layers.3.qgh");
 
     // 两个 narrow(dim=2)：start 0 是 q，start 1 是 gate。
@@ -206,21 +211,34 @@ fn the_q_gate_split_is_a_graph_fact_not_a_load_time_split() {
         node.outputs[0]
     };
 
-    // 各自 reshape 回 [seq, heads * head_dim]：`q` 进 q_norm，`qg` 进门控 sigmoid。
+    // 各自 reshape 成 per-head `[seq, heads, head_dim]`（丢掉 narrow 留下的 1 维）：
+    // `q` 进 q_norm，`qg` 进门控 sigmoid —— 两者都按 head 作用（op-vocabulary §3.1）。
     for (source, target) in [(half(0), "layers.3.q"), (half(1), "layers.3.qg")] {
         let reshape = plan
             .nodes
             .iter()
             .find(|node| node.op.name == "reshape" && node.inputs.contains(&source))
-            .unwrap_or_else(|| panic!("{target} 的半边没有被 reshape 回来"));
+            .unwrap_or_else(|| panic!("{target} 的半边没有被 reshape 成 per-head"));
         assert_eq!(
             reshape.attrs.i64s("shape"),
-            Some([512, 4096].as_slice()),
+            Some([512, 16, 256].as_slice()),
             "{target}"
         );
         assert_eq!(name_of(reshape.outputs[0]), target);
-        assert_eq!(plan.slot(id(target)).shape, vec![512, 4096]);
+        assert_eq!(plan.slot(id(target)).shape, vec![512, 16, 256]);
     }
+
+    // k / v 在进 norm 与 sdpa 之前 reshape 成 per-head `[seq, kv_heads, head_dim]`（§3.1），
+    // 而 o（per-head，与 gate 同形相乘）在 o_proj 之前才拍平回 `[seq, q_size]`。
+    assert_eq!(plan.slot(id("layers.3.k")).shape, vec![512, 512]);
+    assert_eq!(plan.slot(id("layers.3.kh")).shape, vec![512, 2, 256]);
+    assert_eq!(plan.slot(id("layers.3.v")).shape, vec![512, 512]);
+    assert_eq!(plan.slot(id("layers.3.vh")).shape, vec![512, 2, 256]);
+    assert_eq!(plan.slot(id("layers.3.qn")).shape, vec![512, 16, 256]);
+    assert_eq!(plan.slot(id("layers.3.kn")).shape, vec![512, 2, 256]);
+    assert_eq!(plan.slot(id("layers.3.o")).shape, vec![512, 16, 256]);
+    assert_eq!(plan.slot(id("layers.3.og")).shape, vec![512, 16, 256]);
+    assert_eq!(plan.slot(id("layers.3.ogf")).shape, vec![512, 4096]);
 }
 
 #[test]
