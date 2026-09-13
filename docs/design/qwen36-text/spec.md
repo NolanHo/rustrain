@@ -227,6 +227,20 @@ L1 全绿（按契约 skip 的四个项除外）；`l1.instantiate` 的 `details
 - 一个测试证明 `Partial` 被兑现：row-parallel linear 之后插入了 `all_reduce({tp})`
 - 一个测试证明 PP 裁剪：`pp=2` 时 stage 0 的节点集合不含 layers 20–39
 
+### D6 — 多 rank 执行与并行效果（用户 2026-09 追加）
+
+**用户的三条决定**：① 权重用宿主上的共享路径 `/vePFS-Mindverse/share/huggingface/hub/models--Qwen--Qwen3.6-35B-A3B`（67 GB，**不下载**）；② **8 卡并行，要测出 TP / EP 等并行效果**；③ 卡上占显存的进程"没啥用"（但那 8 个进程在另一个 PID namespace 里，宿主 `ps` 看不到；且**本次不需要**——每卡 ~82 GB 空闲，8 卡分片后每 rank 只需 ~9 GB）。
+
+**必须说清的前提**：reference provider 是**纯 Rust CPU** 实现（I-1）。所以 D6 能测的是**并行机制的正确性与代价**，不是 GPU 壁钟加速：
+
+1. **正确性**：8 个 rank 进程（同机 localhost）按 mesh 各持自己的分片，真实执行集合通信，logits 必须与 world=1 的单进程前向一致（容差另定，与 HF 的 1% 是两回事）。
+2. **代价指标**（每 rank、每配置）：权重字节数（分片是否真的减少）、步骤数、集合通信次数与字节量、峰值显存/内存投影 —— 这些是"并行效果"在计划层的真实读数，也是 TP/EP 选择该看的数。
+3. **壁钟**：8 个 CPU rank 的吞吐不会加速（reference kernel 是标量 Rust，且 8 份进程争同一台机的核），把它测出来并如实报告，不假装是加速。
+
+**GPU 加速不在 D6**：需要一个新的 kernel 插件（CUDA/Tilelang/CUTLASS），按架构那是 T1 实现体，换插件不改框架。它是 D6 之后的独立交付，也是唯一能把"并行效果"变成倍数的路径。
+
+**配置扫描**（每项都要跑通并出数）：`tp=8`；`tp=4,ep=2`；`tp=2,ep=4`；`tp=2,cp=2,ep=2`；`dp=8`；以及 world=1 作为基准。
+
 ### D5 — 前向数值对齐 HuggingFace
 
 **可观察结果**：在验证宿主（8× L20X）上，同一段 token、同样的 `input_ids`，rustrain 的 logits 与
