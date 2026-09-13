@@ -293,15 +293,16 @@ HF transformers 的 logits 在容差内一致；每层 hidden 的 mean/std/max �
   46 条 binding 独立对账 **712/712** 文本+MTP 张量（0 未命中、0 未覆盖、0 重复、0 视觉）；
   **形状对账 873/873**（快照取自真实分片头部，含 `transform`/`split` 的机械验证）；
   独立审查 `APPROVED_WITH_NOTES`，其指出的缺陷已全部修掉（见下）。
-- [x] **D2 — L2 加载检查对账 1045 个张量** —— 证据：提交 `460178f`（主体）+ `8f9728a`、`d37f936`（两轮返工）+ `b793362`、`27c4bfd`、`5da56ba`（第四轮：审查复现的五条"假绿"全部关闭）；
+- [x] **D2 — L2 加载检查对账 1045 个张量** —— 证据：提交 `460178f`（主体）+ `8f9728a`、`d37f936`（两轮返工）+ `b793362`、`27c4bfd`、`5da56ba`、`a2c47ca`（第四、五轮：审查复现的七条"假绿"全部关闭）；
   真实快照（1045 张量 / 仅分片头部 / 无权重 / 无网络）下 `rustrain check --dtype f32` 退出 0，
   counts = `{bindings 46, nodes 1031, slots 1916, weights 873, slots_unbound 0, tensors_unconsumed 0, shape_mismatch 0, dtype_mismatch 0}`；
   "实现可用性"为 `skip` 且逐条写明缺哪个原语（`causal_conv1d`×90 / `gated_delta_rule`×30 / `l2norm`×60 / `moe_layer`×41 / `rmsnorm_gated`×30 = **251 / 1031** 个节点）；
   四个故意破坏的用例各自 `Fail` 并点名：漏一条 binding → 槽名、多声明一个不存在的张量 → source 模式、漏掉 `transpose` → 槽名 + 两个形状数字、未被消费的张量 → 张量名；`ignore` 删掉即 `Fail`；
-  门禁 `check_l2.rs` **9 条** + `check_report_contract.rs` **3 条**：C6 的 15 个 id、14 个状态、8 个计数的**值**、报告自称的 model / checkpoint / dtype、两处 `details` 的**内容**、以及**不带 `--dtype` 的默认路径**（描述自己的 `bf16`，可用性列表变成 16 行 —— 那条路径原本没有任何门禁）；
-  每条新断言都用**变异反证**过（改期望值 / 让产物清空 / 改常量 / 让两处互相矛盾），十三条变异全部变红；其中十条由主线程在提交前跑过，三条由独立审查复现；
-  工作区 **303 passed** / clippy 0 warning / `ops check` exit 0；
-  独立审查三轮，第三轮 `APPROVED_WITH_NOTES`：**N1**（计数与 `details` 未被钉住）已由 `b793362` 关闭；**N2**（锚定只约束首段）、**N3**（前后空白当字面段）是规范松紧而非行为错误，已作为裁定写进 `model-description.md` §3.8。第四轮（两个独立视角）各自复现了 5 条"报告无用但门禁全绿"的路径（`dtype`/`model`/`checkpoint` 谎报、同一 id 两条、reason 与 details 数目不符、默认 dtype 下清空 details），**全部已修并各自反证**。
+  门禁 `check_l2.rs` **9 条** + `check_report_contract.rs` **4 条**：C6 的 15 个 id、14 个状态、8 个计数的**值**、报告自称的 model / checkpoint / dtype、两处 `details` 的**内容**（按 dtype 分表：`f32` 是 5 行 / 251，`bf16`·`f16` 与默认路径是 16 行 / 1031，每行还要求 `why` 与成因相符、reason 的**开头总数**与表一致）、以及**不带 `--dtype`** 与**显式 `--dtype bf16` / `f16`** 三条路径（这三条原本都没有门禁）；
+  每条新断言都用**变异反证**过，十四种变异全部变红：计数漂移 / 计数写成 `null` 或 `46.0` / 清空 `details` / 只在默认 dtype 下清空 / 把 bf16 表截断回 5 行 / 把显式 bf16 改成 `pass` / 单条算子计数改动 / 单条理由掏空 / 理由与成因矛盾 / 重复条目 / ignore 总数或 reason 总数改动 / reason 丢掉或篡改总数 / 表与和互不自洽 / `dtype` 谎报 / model 指向别的目录 / 同一 id 两次；
+  工作区 **304 passed** / clippy 0 warning / `ops check` exit 0；
+  独立审查**五轮**：第三轮 `APPROVED_WITH_NOTES`（N1 已关；N2 锚定只约束首段、N3 前后空白当字面段 → `model-description.md` §3.8）；第四、五轮（三个独立视角）各自复现了"报告无用但门禁全绿"的路径（`dtype`/`model`/`checkpoint` 谎报、同一 id 两条、reason 与 details 数目不符、默认 dtype 下清空 details、bf16 表可被截断、显式 dtype 无门禁、reason 可篡改总数、`why` 可自相矛盾），**全部已修并各自反证**。
+  已知局限（写在这里而不是假装不存在）：`model`/`checkpoint` 只能断言"回显了传进去的路径"，一个回显 argv 却读别处描述的实现在这份门禁下仍是绿的；被拒绝的 `--dtype` 那一次运行的 `details` 内容按设计不钉（该列表随 dtype 变化）。
 - [ ] D3 — 轴与 mesh + 形状算术
 - [ ] D4 — instantiate 与 L1 全绿
 - [ ] D5 — 前向数值对齐 HuggingFace
