@@ -11,6 +11,13 @@
 //! or is renamed turns this file red, and the *status* of every id is pinned, so "still skipped"
 //! cannot be mistaken for "still checked".
 //!
+//! It also pins **what the checks found**, not only that they ran: the value of each of the eight
+//! counters, and the per-object `details` of the two items that carry any. A pinned key set alone
+//! would not catch a report that keeps every id and status while writing `nodes: null` or emptying
+//! the availability list — a green-looking report that says nothing is the false green this file is
+//! here to prevent, and the per-object lists are what back the wording of the one `skip` that has
+//! something concrete to say.
+//!
 //! Everything goes through the real binary (`env!("CARGO_BIN_EXE_rustrain")`); no Rust internals.
 //! Contract: `docs/design/qwen36-text/spec.md` C2 (the report and the Pass/Fail/Warning/Skip
 //! discipline) + C6 (the report shape and the id list).
@@ -57,6 +64,45 @@ const EXPECTED_SKIPS: [&str; 7] = [
     "l1.slot_allocation",
 ];
 
+/// C6's eight counters **with their values on the real fixture**. The status table above says which
+/// checks ran; this says what they found, and it is pinned for the same reason the statuses are:
+/// `bindings`/`nodes`/`slots`/`weights` come from the description alone and are exact, and D2's
+/// acceptance is the four zeros. A counter that stops being counted, or is emitted as `null`, keeps
+/// the eight keys intact and would otherwise stay green.
+///
+/// Every value is an integer count; `as_i64` is deliberately strict, so `46.0` is a failure too.
+const EXPECTED_COUNTS: [(&str, i64); 8] = [
+    ("bindings", 46),
+    ("dtype_mismatch", 0),
+    ("nodes", 1031),
+    ("shape_mismatch", 0),
+    ("slots", 1916),
+    ("slots_unbound", 0),
+    ("tensors_unconsumed", 0),
+    ("weights", 873),
+];
+
+/// The five primitives no loaded plugin publishes on this host, with the node count each covers, as
+/// `l1.implementation_availability` must list them. This is the half of the report a human reads to
+/// answer "what is missing"; the item's `reason` must state their sum (C2).
+const EXPECTED_UNAVAILABLE: [(&str, i64); 5] = [
+    ("causal_conv1d", 90),
+    ("gated_delta_rule", 30),
+    ("l2norm", 60),
+    ("moe_layer", 41),
+    ("rmsnorm_gated", 30),
+];
+
+/// `Σ EXPECTED_UNAVAILABLE`, and the number the `skip`'s reason must state. Kept as its own constant
+/// so the sum is asserted rather than assumed (a drifted table must not silently re-define it).
+const UNAVAILABLE_NODES: i64 = 251;
+
+/// The one `ignore` pattern of the description and how many tensors it covers. A pattern that stops
+/// matching anything makes `l2.ignore_coverage` a `fail` in the report; this pins the count that
+/// makes the `pass` mean something.
+const IGNORE_PATTERN: &str = "model.visual.**";
+const IGNORED_TENSORS: i64 = 333;
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Status {
     Pass,
@@ -98,18 +144,6 @@ const EXPECTED_STATUS: [(&str, Status); 14] = [
     ("l2.ignore_coverage", Status::Pass),
     ("l2.shape_reconciliation", Status::Pass),
     ("l2.dtype_compatibility", Status::Pass),
-];
-
-/// C6's eight counters, exactly.
-const COUNT_KEYS: [&str; 8] = [
-    "slots",
-    "nodes",
-    "weights",
-    "bindings",
-    "slots_unbound",
-    "tensors_unconsumed",
-    "shape_mismatch",
-    "dtype_mismatch",
 ];
 
 fn cli_binary() -> &'static str {
@@ -164,9 +198,17 @@ fn check(extra: &[&str]) -> Run {
     }
 }
 
-/// Every check item, as `(id, status, reason)`, with the report's own error text if an item does
-/// not carry all three fields (C6: `id`, `status`, `reason` are mandatory and `reason` is non-empty).
-fn items(doc: &Value) -> Vec<(String, Status, String)> {
+/// One check item. C6 fixes the shape: `id`, `status`, `reason` are mandatory, `reason` is
+/// non-empty, and `details` is always an array (empty when there is nothing per-object to list).
+struct Item {
+    id: String,
+    status: Status,
+    reason: String,
+    details: Vec<String>,
+}
+
+/// Every check item, with the report's own text if an item is malformed.
+fn items(doc: &Value) -> Vec<Item> {
     let checks = doc["checks"]
         .as_array()
         .unwrap_or_else(|| panic!("the report has no `checks` array: {doc}"));
@@ -192,32 +234,52 @@ fn items(doc: &Value) -> Vec<(String, Status, String)> {
                 !reason.trim().is_empty(),
                 "check `{id}` has an empty `reason`; C2 requires every Skip to say what is missing"
             );
-            assert!(
-                item["details"].is_array(),
-                "check `{id}` has no `details` array; C6's report shape fixes it, empty when there \
-                 is nothing per-object to list: {item}"
-            );
-            (id, status, reason.to_string())
+            let details = item["details"]
+                .as_array()
+                .unwrap_or_else(|| {
+                    panic!(
+                        "check `{id}` has no `details` array; C6's report shape fixes it, empty when \
+                         there is nothing per-object to list: {item}"
+                    )
+                })
+                .iter()
+                .map(|detail| {
+                    detail
+                        .as_str()
+                        .unwrap_or_else(|| {
+                            panic!("check `{id}` has a non-string `details` entry: {detail}")
+                        })
+                        .to_string()
+                })
+                .collect();
+            Item {
+                id,
+                status,
+                reason: reason.to_string(),
+                details,
+            }
         })
         .collect()
 }
 
 /// id → status for a report; two items with the same id (C6 lets `l2.ignore_coverage` report one
 /// warning per unmatched pattern) must agree, or the report contradicts itself.
-fn statuses(items: &[(String, Status, String)]) -> BTreeMap<String, Status> {
+fn statuses(items: &[Item]) -> BTreeMap<String, Status> {
     let mut map: BTreeMap<String, Status> = BTreeMap::new();
-    for (id, status, _) in items {
-        if let Some(previous) = map.insert(id.clone(), *status) {
+    for item in items {
+        if let Some(previous) = map.insert(item.id.clone(), item.status) {
             assert_eq!(
-                previous, *status,
-                "`{id}` appears twice with different statuses ({previous:?} vs {status:?})"
+                previous, item.status,
+                "`{}` appears twice with different statuses ({previous:?} vs {:?})",
+                item.id, item.status
             );
         }
     }
     map
 }
 
-/// C6: the report's fixed shape — `format`, the eight counters, and the per-item fields.
+/// C6: the report's fixed shape — `format`, the eight counters **with their values**, and the
+/// per-item fields.
 fn assert_c6_shape(doc: &Value) {
     assert_eq!(
         doc["format"].as_str(),
@@ -234,12 +296,143 @@ fn assert_c6_shape(doc: &Value) {
         .unwrap_or_else(|| panic!("the report has no `counts` object: {doc}"));
     let mut keys: Vec<&str> = counts.keys().map(String::as_str).collect();
     keys.sort_unstable();
-    let mut expected = COUNT_KEYS.to_vec();
+    let mut expected: Vec<&str> = EXPECTED_COUNTS.iter().map(|(key, _)| *key).collect();
     expected.sort_unstable();
     assert_eq!(
         keys, expected,
         "C6 fixes `counts` to exactly eight counters: {doc}"
     );
+
+    // The values, not just the keys: a counter that is no longer counted, or is emitted as `null`
+    // or `46.0`, keeps the key set and would otherwise pass every assertion in this file.
+    for (key, value) in EXPECTED_COUNTS {
+        let observed = counts.get(key).unwrap_or_else(|| {
+            panic!("the key-set assertion above means `{key}` is present: {doc}")
+        });
+        assert_eq!(
+            observed.as_i64(),
+            Some(value),
+            "counter `{key}` = {observed}, expected the integer {value}; C6's counters are what the \
+             report found, and this test pins them: {doc}"
+        );
+    }
+}
+
+/// N1: the two items that carry per-object `details`, and what the rest must not carry.
+///
+/// The status table says which checks ran; `assert_c6_shape` says what the counters are. This is the
+/// third leg: the per-object lists that back the wording of a `pass` or a `skip`. An emptied
+/// `details` array, a renamed operator, or a node count that drifts all turn it red — while every id
+/// and status stays exactly as pinned.
+fn assert_details(doc: &Value, items: &[Item]) {
+    let sum: i64 = EXPECTED_UNAVAILABLE.iter().map(|(_, nodes)| *nodes).sum();
+    assert_eq!(
+        sum, UNAVAILABLE_NODES,
+        "EXPECTED_UNAVAILABLE's entries do not sum to UNAVAILABLE_NODES, which the `skip`'s reason \
+         is asserted against"
+    );
+
+    let mut seen_availability = false;
+    let mut seen_ignore = false;
+    for item in items {
+        match item.id.as_str() {
+            "l1.implementation_availability" => {
+                seen_availability = true;
+                assert_eq!(
+                    item.status,
+                    Status::Skip,
+                    "the availability item carries the per-primitive list and is a `skip` on this \
+                     host"
+                );
+                assert_eq!(
+                    item.details.len(),
+                    EXPECTED_UNAVAILABLE.len(),
+                    "the `skip` must list one entry per unavailable primitive, got: {:?}",
+                    item.details
+                );
+                for (op, nodes) in EXPECTED_UNAVAILABLE {
+                    let prefix = format!("{op}: {nodes} node(s)");
+                    let entry = item
+                        .details
+                        .iter()
+                        .find(|detail| detail.starts_with(&prefix))
+                        .unwrap_or_else(|| {
+                            panic!(
+                                "no `details` entry starts with `{prefix}`; the report says what is \
+                                 missing per operator and C6 keeps that list machine-readable. \
+                                 entries: {:?}",
+                                item.details
+                            )
+                        });
+                    // `{op}: {n} node(s): {why}` — the count is only half of it; C2's Skip has to
+                    // answer *what is missing*, so an entry without its reason is a regression too.
+                    let why = entry[prefix.len()..].trim_start_matches(':').trim();
+                    assert!(
+                        !why.is_empty(),
+                        "the entry for `{op}` carries its count but no reason: {entry}"
+                    );
+                }
+                assert!(
+                    mentions_number(&item.reason, UNAVAILABLE_NODES),
+                    "the reason must state how many nodes have no implementation ({UNAVAILABLE_NODES}) \
+                     — a sum the reader cannot recompute from the reason alone: {}",
+                    item.reason
+                );
+                assert!(
+                    mentions_number(
+                        &item.reason,
+                        doc["counts"]["nodes"].as_i64().unwrap_or_else(|| panic!(
+                            "the plan size is a counter of the report: {doc}"
+                        ))
+                    ),
+                    "the reason must name the plan size the {UNAVAILABLE_NODES} nodes are out of, so \
+                     `251 of 1031` cannot become `251 of ???`: {}",
+                    item.reason
+                );
+            }
+            "l2.ignore_coverage" => {
+                seen_ignore = true;
+                assert_eq!(
+                    item.details.len(),
+                    1,
+                    "one `ignore` pattern, one detail line: {:?}",
+                    item.details
+                );
+                let detail = &item.details[0];
+                assert!(
+                    detail.contains(IGNORE_PATTERN) && mentions_number(detail, IGNORED_TENSORS),
+                    "the detail must name the pattern and how many tensors it covers \
+                     (`{IGNORE_PATTERN}`, {IGNORED_TENSORS}): {detail}"
+                );
+                assert!(
+                    mentions_number(&item.reason, IGNORED_TENSORS),
+                    "the reason must carry the same total as its detail: {}",
+                    item.reason
+                );
+            }
+            id => assert!(
+                item.details.is_empty(),
+                "check `{id}` grew a `details` array while this test only knows two items that have \
+                 one; either pin its contents here or the report is being read by a gate that does \
+                 not look: {:?}",
+                item.details
+            ),
+        }
+    }
+
+    assert!(
+        seen_availability && seen_ignore,
+        "the two items with per-object details must both be present (availability: \
+         {seen_availability}, ignore coverage: {seen_ignore})"
+    );
+}
+
+/// `text` contains `n` as a whole number (so `90` is not found inside `1900`), which is how the
+/// reasons and details are tied back to the pinned counters.
+fn mentions_number(text: &str, n: i64) -> bool {
+    let needle = n.to_string();
+    text.split(|c: char| !c.is_ascii_digit())
+        .any(|token| token == needle)
 }
 
 /// C6's id list: every id of the report comes from the list, and the list is covered exactly.
@@ -295,6 +488,7 @@ fn the_report_has_c6s_shape_and_exactly_c6s_check_ids() {
         .collect();
     assert_id_set(&observed, &accepted, "accepted arguments");
     assert_skip_set(&observed);
+    assert_details(&doc, &items);
 
     // Every id's status, not just the skips: a check that silently stops running is the failure
     // mode this file exists for.
@@ -327,6 +521,12 @@ fn the_report_has_c6s_shape_and_exactly_c6s_check_ids() {
 /// `cli.arguments` is the one id a normal run does not have, and C2 wants a full report even when
 /// the arguments are rejected. A rejected `--dtype` therefore produces **all fifteen** ids, with
 /// the other fourteen unchanged: an argument error must not silently change what was checked.
+///
+/// The counters are pinned here too (`assert_c6_shape` runs on both reports), because a rejected
+/// argument must not change what was *found* either. The availability `details` are deliberately not
+/// pinned on this run: a rejected `--dtype` changes the dtype the resolution pass asks the plugins
+/// for, so that list legitimately differs (C2's `skip` still says what is missing, one operator per
+/// line). The ignore coverage is dtype-independent and is covered by the accepted run above.
 #[test]
 fn a_rejected_argument_emits_the_fifteenth_id_and_changes_nothing_else() {
     let accepted = statuses(&items(&check(&["--dtype", "f32"]).json()));
@@ -364,11 +564,11 @@ fn a_rejected_argument_emits_the_fifteenth_id_and_changes_nothing_else() {
     // C2: the reason names the argument, so the report is actionable on its own.
     let argument = rejected_items
         .iter()
-        .find(|(id, _, _)| id == "cli.arguments")
+        .find(|item| item.id == "cli.arguments")
         .expect("cli.arguments must be present");
     assert!(
-        argument.2.contains("--dtype") && argument.2.contains("not-a-dtype"),
+        argument.reason.contains("--dtype") && argument.reason.contains("not-a-dtype"),
         "the `cli.arguments` reason must name the rejected flag and value: {}",
-        argument.2
+        argument.reason
     );
 }
