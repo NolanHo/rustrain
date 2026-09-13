@@ -94,7 +94,7 @@ rustrain check --model <model-dir> [--checkpoint <dir>] [--tp N --cp N --ep N --
   这样"在 f32 下检查结构"与"校验 bf16 权重与描述是否相符"两件事互不干扰。
 - `ignore` 的模式语法与 binding 的 source 一致，额外支持 **`**` = 任意多段**；视觉塔用 `"model.visual.**"`。
 - **`ignore` 模式命中 0 个张量 → `warning`（不是 `fail`）**：同一份描述可能被另一份 checkpoint 复用，
-  但"声明了却匹配不到任何东西"很可能就是拼错，必须有人看得见。
+  但"声明了却匹配不到任何东西"很可能就是拼错，必须有人看得见 —— reason 必须**点名那个模式**。
 - **`transform` 的完整词表只有两个动词**：`transpose(i, j)` 与 `slice(dim, start, len)`；
   多段拆分由 binding 的 **`split` 字段**表达，不在 `transform` 里。
   早期列的 `take` / `concat` / `split(dim,sizes)` **移除** —— 没有消费者、也没有定义 = 死钩子。
@@ -114,11 +114,12 @@ rustrain check --model <model-dir> [--checkpoint <dir>] [--tp N --cp N --ep N --
 - **`l1.structure` 只声称它真做的两件事**（load/expand + `check_structure`）：C2 里依赖 compile 的
   **六条**（可编译 / `infer` 比对 / layout 传播 / `Partial` 兑现 / collective 绑轴 / slot 分配）由各自的
   `l1.*` 项**显式 `skip` 并写明"缺什么、什么时候能补"**，不得用 `pass` 冒充"没跑"。
-- **门禁必须断言期望的 skip 集合**：`check_report_contract` 把 15 个 check id、7 个 `skip`、每项状态与
-  `counts` 的八个键写死。将来某项从 skip 变真检查（D3/D4）会让它按设计变红 —— 那是绊线，不是噪音。
+- **门禁必须断言期望的 skip 集合**：`check_report_contract` 把 15 个 check id、7 个 `skip`、每项状态、
+  `counts` 的八个键**及其在真实 fixture 上的取值**、报告自称的 model / checkpoint / dtype、以及两处
+  `details` 的内容写死。将来某项从 skip 变真检查（D3/D4）会让它按设计变红 —— 那是绊线，不是噪音。
 - **`ignore` 模式必须锚定**：首段必须是**字面名**。`**`、`*`、`{*}.visual.**`、`*.visual.**` 全在
-  expand 期报错 —— "全部忽略"等于放弃显式声明（C5）。报告里**逐模式**给出命中数。
-- **`ignore` 模式命中 0 个张量 → `warning`**（不是 `fail`），reason 必须点名那个模式。
+  expand 期报错 —— "全部忽略"等于放弃显式声明（C5）。锚定只管首段（`model.**` 合法）；报告里
+  **逐模式**给出命中数。
 - **没有任何配对可查**（`pairs` 空 ∧ 配对本身一一对应 ∧ 无未绑 slot）→ 四个 L2 项**全部 `warning`**，
   不得 6/6 全绿。
 - **"没测量"写 `null`，不写 `0`**：`shape_mismatch` / `dtype_mismatch` 在配对不可信（`pairs != covered`）
@@ -166,8 +167,8 @@ rustrain check --model <model-dir> [--checkpoint <dir>] [--tp N --cp N --ep N --
 
 > **注意：weight slot 数与 checkpoint 张量数不相等，也不该相等。**
 > checkpoint 有 **712** 个文本+MTP 权重张量（文本 693 = 根 3 + 层内合计 80+270+60+280，加 MTP 19）。
-> 描述只对**两处**拆开融合存储 —— `in_proj_qkv` → Q/K/V、融合 `gate_up` → gate/up —— 因为它们的段序是
-> 连续 `[Q\|K\|V]` / `[gate\|up]`，按 TP 连续切一刀会切开语义边界。
+> 描述只对**三处**拆开融合存储 —— `in_proj_qkv` → Q/K/V、`conv1d` → q/k/v、融合 `gate_up` → gate/up ——
+> 因为它们的段序是连续 `[Q\|K\|V]` / `[gate\|up]`，按 TP 连续切一刀会切开语义边界。
 > **`q_proj` 不拆**：HF 的真实段序是 **per-head 交错** `[q₀\|gate₀\|q₁\|…]`，连续切分正好给出完整 head 对；
 > q/gate 的分离在**激活**上用 `reshape`+`narrow` 做（`docs/design/qwen36-5d-example.md` §3）。
 > **weight slot 实测 = 873**（= 712 + 2×30 `in_proj_qkv` + 2×30 `conv1d` + 41 `gate_up`）。
@@ -181,7 +182,7 @@ rustrain check --model <model-dir> [--checkpoint <dir>] [--tp N --cp N --ep N --
 - 同一输入两次运行得到**逐字节相同**的 plan JSON（确定性）
 - 同名冲突 / 表达式成环 / binding 未命中 / 写未声明 slot / `select`+`template` 冲突 / 声明了没人读的 slot，各有测试证明会报错
 - **形状对账**：每个 weight slot 的 `transform`（+`split`）必须能把真实 checkpoint 形状映射成声明的 slot 形状 ——
-  已用 26 个分片头部独立跑过：**873/873 一致**（这是唯一能证伪 `transform` 的机械手段）
+  已用真实分片头部独立跑过（`scripts/fetch_qwen36_meta.py`：index 的 `weight_map` + 每个分片的头部，无权重）：**873/873 一致**（这是唯一能证伪 `transform` 的机械手段）
 
 ### D2 — L2 加载检查对账真实的 1045 个张量
 
@@ -290,13 +291,33 @@ HF transformers 的 logits 在容差内一致；每层 hidden 的 mean/std/max �
   实测 `nodes 1031 / slots 1916 / weight slots 873`，两次展开逐字节相同（sha256 `4450c731…`）；
   6 + 3 条契约测试 + 工作区 265 passed / clippy 0 warning / `ops check` exit 0；
   46 条 binding 独立对账 **712/712** 文本+MTP 张量（0 未命中、0 未覆盖、0 重复、0 视觉）；
-  **形状对账 873/873**（26 个分片头部，含 `transform`/`split` 的机械验证）；
+  **形状对账 873/873**（快照取自真实分片头部，含 `transform`/`split` 的机械验证）；
   独立审查 `APPROVED_WITH_NOTES`，其指出的缺陷已全部修掉（见下）。
-- [ ] D2 — L2 加载检查对账 1045 个张量
+- [x] **D2 — L2 加载检查对账 1045 个张量** —— 证据：提交 `460178f`（主体）+ `8f9728a`、`d37f936`（两轮返工）+ `b793362`、`27c4bfd`、`5da56ba`（第四轮：审查复现的五条"假绿"全部关闭）；
+  真实快照（1045 张量 / 仅分片头部 / 无权重 / 无网络）下 `rustrain check --dtype f32` 退出 0，
+  counts = `{bindings 46, nodes 1031, slots 1916, weights 873, slots_unbound 0, tensors_unconsumed 0, shape_mismatch 0, dtype_mismatch 0}`；
+  "实现可用性"为 `skip` 且逐条写明缺哪个原语（`causal_conv1d`×90 / `gated_delta_rule`×30 / `l2norm`×60 / `moe_layer`×41 / `rmsnorm_gated`×30 = **251 / 1031** 个节点）；
+  四个故意破坏的用例各自 `Fail` 并点名：漏一条 binding → 槽名、多声明一个不存在的张量 → source 模式、漏掉 `transpose` → 槽名 + 两个形状数字、未被消费的张量 → 张量名；`ignore` 删掉即 `Fail`；
+  门禁 `check_l2.rs` **9 条** + `check_report_contract.rs` **3 条**：C6 的 15 个 id、14 个状态、8 个计数的**值**、报告自称的 model / checkpoint / dtype、两处 `details` 的**内容**、以及**不带 `--dtype` 的默认路径**（描述自己的 `bf16`，可用性列表变成 16 行 —— 那条路径原本没有任何门禁）；
+  每条新断言都用**变异反证**过（改期望值 / 让产物清空 / 改常量 / 让两处互相矛盾），十三条变异全部变红；其中十条由主线程在提交前跑过，三条由独立审查复现；
+  工作区 **303 passed** / clippy 0 warning / `ops check` exit 0；
+  独立审查三轮，第三轮 `APPROVED_WITH_NOTES`：**N1**（计数与 `details` 未被钉住）已由 `b793362` 关闭；**N2**（锚定只约束首段）、**N3**（前后空白当字面段）是规范松紧而非行为错误，已作为裁定写进 `model-description.md` §3.8。第四轮（两个独立视角）各自复现了 5 条"报告无用但门禁全绿"的路径（`dtype`/`model`/`checkpoint` 谎报、同一 id 两条、reason 与 details 数目不符、默认 dtype 下清空 details），**全部已修并各自反证**。
 - [ ] D3 — 轴与 mesh + 形状算术
 - [ ] D4 — instantiate 与 L1 全绿
 - [ ] D5 — 前向数值对齐 HuggingFace
 
-**D2 的已知输入（来自 D1 审查）**：`ResolvedBinding.slots` 的顺序是**按 target 分组**（先所有 `q` 槽、
-再所有 `gate` 槽），不是按 source 实例交错 —— **D2 的加载器不得把 source 实例顺序与 `slots` 顺序直接 zip**，
-否则会把第 7 层的 checkpoint 张量配到第 3 层的 gate 槽。要么在 D1 侧改成按实例交错，要么在 D2 侧显式配对。
+**D2 的已知输入（来自 D1 审查）已兑现**：`ResolvedBinding.slots` 的顺序是**按 target 分组**（先所有 `q` 槽、
+再所有 `gate` 槽），不是按 source 实例交错。D2 没有 zip 两个顺序，而是**按捕获替换逐张量配对**
+（`main.rs` 的 `Pair`：source 命中哪些 checkpoint 张量、捕获如何替换成 slot 实例名），并要求结果**一一对应**，
+否则报"不是配对"而不是把笛卡尔积当对账。
+
+**D2 已知未设门禁的 C6 分支**（都是人手验证过的正确行为，只是没有 fixture 钉住；不是缺陷，但下一个动
+`check` 的人要知道它们没有绊线）：
+
+| C6 分支 | 现状 | 谁验过 |
+|---|---|---|
+| 没有任何配对可查 → 四个 L2 项**全部 `warning`**，不得 6/6 全绿 | 正确（空 weight slot 描述 + 空快照 → 4 warning，`l2.ignore_coverage` 是 `skip`，退出 0） | 独立验证（手工 fixture，未提交） |
+| "没测量"写 `null` 不写 `0` | 正确（不带 `--checkpoint` 时 `shape_mismatch` / `dtype_mismatch` / `tensors_unconsumed` = `null`，`slots_unbound` 是真测过的 0） | 独立验证（手工运行） |
+| `pairs != covered` → 点名 `fail`，shape/dtype 改 `skip` | 无 fixture 触发 | 未验 |
+| 多条 `ignore` 模式 → **一项**、N 行 `details` | 正确（2 条模式 → 1 项 2 行） | 独立验证（手工 fixture） |
+| 被拒绝的 `--dtype` 那次运行里可用性 `details` 的内容 | 故意不钉：该列表随 dtype 变化（拒绝后回落到描述自己的 `bf16`），只钉了计数与 id 集合 | 独立验证（16 行 vs 5 行） |

@@ -1,6 +1,6 @@
 [package]
 name = "rustrain-kernels"
-description = "Built-in operator providers: reference (pure Rust) and aten (plugin)"
+description = "Built-in operator provider: reference (pure Rust). The aten/torch plugin is not built here"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
