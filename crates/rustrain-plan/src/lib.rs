@@ -15,12 +15,14 @@
 
 pub mod attrs;
 pub mod compile;
+pub mod instantiate;
 pub mod ir;
 pub mod memory;
 pub mod shard;
 
 pub use attrs::{AbiAttrs, AttrValue, Attrs};
 pub use compile::{CompiledPlan, CompiledStep, Compiler, ResolvedNode, StreamId};
+pub use instantiate::{DeclaredAxes, InstanceStage, instantiate};
 pub use ir::{
     CheckpointPolicy, NodeId, OpRef, Phase, Plan, PlanBuilder, PlanMeta, PlanNode,
     PrecisionOverride, Slot, SlotId, SlotKind, StreamPolicy, Trace, intrinsic,
@@ -161,6 +163,50 @@ pub enum PlanError {
         op: String,
         group: GroupMask,
     },
+
+    #[error(
+        "slot `{slot}` declares axis `{axis}` on dim {dim}, which the mesh does not provide \
+         (mesh axes: {axes}); a declared axis must name an axis of the mesh — the name-level \
+         counterpart of a group mask bit outside the mesh"
+    )]
+    UnknownAxis {
+        slot: String,
+        dim: String,
+        axis: String,
+        axes: String,
+    },
+
+    #[error("declaration names slot `{slot}`, which the plan does not have")]
+    UnknownDeclaredSlot { slot: String },
+
+    #[error("declaration for slot `{slot}` names dim `{dim}`, which is not an integer")]
+    BadDeclaredDim { slot: String, dim: String },
+
+    #[error("slot `{slot}` cannot be instantiated: {source}")]
+    Instantiate {
+        slot: String,
+        #[source]
+        source: ShardError,
+    },
+
+    #[error(
+        "the mesh's `pp` degree is {pp}, but instance `{prefix}` declares no stage; an \
+         absent stage means stage 0 only when `pp` is 1"
+    )]
+    MissingStage { prefix: String, pp: usize },
+
+    #[error(
+        "instance `{prefix}` declares stage {stage}, but the mesh's `pp` degree is {pp}; \
+         every stage must be in 0..{pp}"
+    )]
+    StageOutOfRange {
+        prefix: String,
+        stage: i64,
+        pp: usize,
+    },
+
+    #[error("rank {rank} is out of range for the mesh's world size {world_size}")]
+    RankOutOfRange { rank: usize, world_size: usize },
 
     #[error("the plan's mesh fingerprint does not describe a valid mesh: {source}")]
     Mesh {

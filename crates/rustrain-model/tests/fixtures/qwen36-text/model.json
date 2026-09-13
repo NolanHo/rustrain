@@ -1832,12 +1832,17 @@
     {
       "template": "embed",
       "prefix": "embed",
+      "stage": 0,
       "inputs": {
         "ids": "input_ids"
       }
     },
     {
       "prefix": "layers.{l}",
+      "stage": [
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1
+      ],
       "repeat": {
         "count": "layers",
         "index": "l"
@@ -1852,15 +1857,18 @@
     },
     {
       "template": "final_norm",
-      "prefix": "norm"
+      "prefix": "norm",
+      "stage": 1
     },
     {
       "template": "lm_head",
-      "prefix": "lm_head"
+      "prefix": "lm_head",
+      "stage": 1
     },
     {
       "template": "mtp_pre",
       "prefix": "mtp",
+      "stage": 1,
       "until": "mtp_layers",
       "inputs": {
         "e": "embed.y",
@@ -1870,6 +1878,7 @@
     {
       "template": "decoder_full",
       "prefix": "mtp.layers.{l}",
+      "stage": 1,
       "until": "mtp_layers",
       "inputs": {
         "x": "mtp.y"
@@ -1878,6 +1887,7 @@
     {
       "template": "mtp_head",
       "prefix": "mtp.head",
+      "stage": 1,
       "until": "mtp_layers",
       "inputs": {
         "x": "mtp.layers.{last}.y",

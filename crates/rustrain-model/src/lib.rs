@@ -29,10 +29,11 @@ use std::path::{Path, PathBuf};
 
 pub use desc::{
     AttrLiteral, Binding, CONFIG_FILE, DESC_FILE, ExprSpec, FORMAT, FromSpec, ModelDesc, NodeDecl,
-    ParamSpec, PortSpec, Select, SlotDecl, Split, StackEntry, Target, Template,
+    ParamSpec, PortSpec, Select, SlotDecl, Split, StackEntry, StageDecl, Target, Template,
 };
 pub use expand::{
-    Expanded, ResolvedBinding, ResolvedBindingSlot, ResolvedSplit, expand, expand_lenient, summarize,
+    Expanded, ResolvedBinding, ResolvedBindingSlot, ResolvedSplit, expand, expand_lenient,
+    summarize,
 };
 pub use pattern::{apply_captures, has_double_star, match_name, matches};
 pub use transform::{TRANSFORM_VERBS, Transform, parse_transform};

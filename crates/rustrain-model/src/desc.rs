@@ -147,9 +147,27 @@ pub struct StackEntry {
     pub until: Option<String>,
     #[serde(default)]
     pub select: Option<Select>,
+    /// The pipeline stage of this entry's instances (R1, D4): an integer for every instance,
+    /// or a list of integers indexed by the entry's repeat counter — one per instance, written
+    /// out by the generator exactly like `layer_types`. Absent means stage 0, legal only while
+    /// the mesh's `pp` degree is 1; `instantiate` with `pp > 1` reports the entry otherwise.
+    #[serde(default)]
+    pub stage: Option<StageDecl>,
     /// `{local name: global name}`; the default is chaining (the previous instance's outputs).
     #[serde(default, rename = "inputs")]
     pub inputs: Option<BTreeMap<String, String>>,
+}
+
+/// A stack entry's `stage`: one stage for every instance of the entry, or one per instance
+/// indexed by the entry's repeat counter.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum StageDecl {
+    /// The stage of every instance of this entry.
+    Int(i64),
+    /// One stage per instance, indexed by the repeat counter; the length must equal the
+    /// entry's instance count.
+    List(Vec<i64>),
 }
 
 /// `{"count": "layers", "index": "l"}`.

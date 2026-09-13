@@ -326,10 +326,13 @@ pub fn plan(
     })
 }
 
-/// Refuses a plan whose projected peak exceeds its budget.
+/// Reports that a plan's projected peak exceeds its budget.
 ///
 /// Called separately from [`plan`] so the caller can inspect the projection
 /// before deciding, and so tests can exercise the arithmetic without the gate.
+/// **The verdict is advisory** (D12, `docs/architecture.md` §8): the compiler
+/// carries the error as a warning on the compiled plan instead of failing, and
+/// this function remains the single place that names the hottest step.
 pub fn enforce_budget(mem: &MemoryPlan, plan: &Plan) -> Result<(), PlanError> {
     let Some(budget) = mem.budget_bytes else {
         return Ok(());

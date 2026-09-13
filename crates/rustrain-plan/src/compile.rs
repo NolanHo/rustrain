@@ -131,6 +131,11 @@ pub struct CompiledPlan {
     /// Lifetimes, storage placement and the projected peak. Computed here, not
     /// discovered at run time.
     pub memory: crate::memory::MemoryPlan,
+    /// Advisories the compiler found but did not refuse (D12, `docs/architecture.md` §8):
+    /// exceeding the memory budget is one — the peak is a *projection*, and blocking a compile
+    /// on it was the wrong gate. A caller that wants the projection without the verdict reads
+    /// this instead of [`crate::memory::enforce_budget`] failing the whole compile.
+    pub warnings: Vec<String>,
 }
 
 impl std::fmt::Debug for CompiledPlan {
@@ -145,6 +150,7 @@ impl std::fmt::Debug for CompiledPlan {
             .field("steps", &self.steps.len())
             .field("inserted_collectives", &self.inserted.len())
             .field("peak_bytes", &self.memory.peak_bytes)
+            .field("warnings", &self.warnings.len())
             .finish()
     }
 }
@@ -181,6 +187,12 @@ impl CompiledPlan {
             ));
         }
         out.push_str(&self.memory.explain());
+        if !self.warnings.is_empty() {
+            out.push_str("\nwarnings:\n");
+            for warning in &self.warnings {
+                out.push_str(&format!("  - {warning}\n"));
+            }
+        }
         if !self.inserted.is_empty() {
             out.push_str("\ninserted communication:\n");
             for ins in &self.inserted {
@@ -291,11 +303,15 @@ impl<'a> Compiler<'a> {
             .map(|r| r.as_ref().map(|(op, _)| op.clone()))
             .collect();
 
-        // Project the peak and refuse a plan that cannot fit. Doing this here,
-        // rather than letting the allocator discover it, is the whole point of
-        // having the graph: the failure names the node and the strategy.
+        // Project the peak. Exceeding the budget is an advisory, not a refusal
+        // (D12, docs/architecture.md §8): the peak is a projection of a plan the
+        // runtime has not executed, and blocking it was the wrong gate — the
+        // warning travels with the compiled plan so `plan explain` prints it.
         let memory = memory::plan(&plan, &resolved_ops, &self.recipe.memory, self.caps)?;
-        memory::enforce_budget(&memory, &plan)?;
+        let mut warnings: Vec<String> = Vec::new();
+        if let Err(over) = memory::enforce_budget(&memory, &plan) {
+            warnings.push(over.to_string());
+        }
 
         // Pass 2: validate against the implementations and flatten.
         let mut steps = Vec::with_capacity(plan.nodes.len());
@@ -347,6 +363,7 @@ impl<'a> Compiler<'a> {
             resolved,
             inserted: propagation.inserted,
             memory,
+            warnings,
         })
     }
 

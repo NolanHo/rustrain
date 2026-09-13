@@ -14,7 +14,9 @@ use rustrain_parallel::{Mesh, MeshFingerprint, ParallelConfig};
 use rustrain_plan::{AttrValue, Attrs, OpRef, Phase, Plan, PlanBuilder, SlotId, SlotKind};
 
 use crate::ModelError;
-use crate::desc::{AttrLiteral, FORMAT, ModelDesc, NodeDecl, StackEntry, Target, Template};
+use crate::desc::{
+    AttrLiteral, FORMAT, ModelDesc, NodeDecl, StackEntry, StageDecl, Target, Template,
+};
 use crate::params::{Params, Value};
 use crate::pattern::is_wildcard_segment;
 use crate::transform::parse_transform;
@@ -45,6 +47,41 @@ pub struct Expanded {
     /// non-empty list; [`expand_lenient`] hands it back instead, because naming the unbound slot is
     /// precisely what a loading check has to report.
     pub unbound_slots: Vec<String>,
+    /// Every expanded stack instance in stack order: `(prefix, declared stage)`, `None` for an
+    /// entry without `stage`. Read by [`Expanded::declarations`]; not read anywhere else.
+    stages: Vec<(String, Option<i64>)>,
+}
+
+impl Expanded {
+    /// The declarations `instantiate` consumes: the `binding` axes by slot name, and the stage
+    /// of every expanded stack instance.
+    ///
+    /// They travel as **input** to `rustrain_plan::instantiate`, never inside the plan: the plan
+    /// stays portable and its digest does not change when a description declares a sharding
+    /// (`docs/design/model-description.md` §0, D4 rulings R2).
+    pub fn declarations(&self) -> rustrain_plan::DeclaredAxes {
+        let mut slots: BTreeMap<String, BTreeMap<String, Vec<String>>> = BTreeMap::new();
+        for binding in &self.bindings {
+            for hit in &binding.slots {
+                if hit.axes.is_empty() {
+                    // Absent axes = replicated: absent from the map, never an empty entry.
+                    continue;
+                }
+                slots.insert(hit.slot.clone(), hit.axes.clone());
+            }
+        }
+        rustrain_plan::DeclaredAxes {
+            slots,
+            instances: self
+                .stages
+                .iter()
+                .map(|(prefix, stage)| rustrain_plan::InstanceStage {
+                    prefix: prefix.clone(),
+                    stage: *stage,
+                })
+                .collect(),
+        }
+    }
 }
 
 /// One `binding` after resolution.
@@ -99,7 +136,10 @@ pub fn expand(desc: &ModelDesc, config: &serde_json::Value) -> Result<Expanded, 
 /// The mandate itself is unchanged — it lives in [`expand`], and in the L2 gate that reads
 /// `unbound_slots` (`rustrain check`'s `l2.binding_coverage`). §3.7 #4 keeps both out of the
 /// pattern layer.
-pub fn expand_lenient(desc: &ModelDesc, config: &serde_json::Value) -> Result<Expanded, ModelError> {
+pub fn expand_lenient(
+    desc: &ModelDesc,
+    config: &serde_json::Value,
+) -> Result<Expanded, ModelError> {
     if desc.format != FORMAT {
         return Err(ModelError::Format {
             found: desc.format.clone(),
@@ -125,11 +165,13 @@ pub fn expand_lenient(desc: &ModelDesc, config: &serde_json::Value) -> Result<Ex
     );
     let plan = builder.build()?;
     let (bindings, unbound_slots) = expander.bind()?;
+    let stages = expander.stages;
 
     Ok(Expanded {
         plan,
         bindings,
         unbound_slots,
+        stages,
     })
 }
 
@@ -296,6 +338,8 @@ struct Expander<'a> {
     prev_outputs: Vec<SlotId>,
     /// The last index of the most recent repeat/until expansion, for `{last}`.
     last_index: Option<i64>,
+    /// Every expanded instance in stack order: `(prefix, declared stage)`.
+    stages: Vec<(String, Option<i64>)>,
 }
 
 impl<'a> Expander<'a> {
@@ -312,6 +356,7 @@ impl<'a> Expander<'a> {
             prefixes: BTreeMap::new(),
             prev_outputs: Vec::new(),
             last_index: None,
+            stages: Vec::new(),
         }
     }
 
@@ -366,6 +411,25 @@ impl<'a> Expander<'a> {
             self.last_index = Some(count - 1);
         }
 
+        // R1: the stage of each instance, declared on the entry — an integer for every
+        // instance, or a list indexed by the repeat counter (one entry per instance). No
+        // derivation: the generator writes the list, exactly like `layer_types` (§3.1).
+        let stages: Vec<Option<i64>> = match &entry.stage {
+            None => vec![None; count as usize],
+            Some(StageDecl::Int(stage)) => vec![Some(*stage); count as usize],
+            Some(StageDecl::List(list)) => {
+                if list.len() != count as usize {
+                    return Err(ModelError::Invalid(format!(
+                        "stack entry {index} (prefix `{}`) declares {} stage(s) but expands to \
+                         {count} instance(s); a stage list must have one entry per instance",
+                        entry.prefix,
+                        list.len()
+                    )));
+                }
+                list.iter().copied().map(Some).collect()
+            }
+        };
+
         // Chained wiring: instance 0 takes the previous stack entry's last instance, every later
         // instance takes the one before it.
         let mut chained: Vec<SlotId> = std::mem::take(&mut self.prev_outputs);
@@ -386,6 +450,10 @@ impl<'a> Expander<'a> {
                      {index}); instance prefixes must be unique (§3.6 #7)"
                 )));
             }
+
+            // Recorded in stack order so `Expanded::declarations()` hands `instantiate` the
+            // instance list exactly as the description laid it out.
+            self.stages.push((prefix.clone(), stages[position]));
 
             let wiring = self.wiring_for(
                 index,

@@ -16,3 +16,9 @@ serde_json.workspace = true
 blake3.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+
+# Dev-only: the compile-path test registers the built-in reference provider so that
+# `Compiler::compile` on an instantiated plan resolves `linear` / `elementwise_binary`.
+# It never enters the crate's normal dependency closure (invariant I-1).
+[dev-dependencies]
+rustrain-kernels.workspace = true

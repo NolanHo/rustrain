@@ -74,9 +74,15 @@ pub fn rule_for(op: &str) -> ShardRule {
     match op {
         "elementwise_unary" | "elementwise_binary" | "compare" | "softmax" | "rmsnorm"
         | "layernorm" | "rope" | "quantize" | "dequantize" | "amax_update" | "view" | "reshape"
-        | "transpose" | "narrow" | "cat" | "broadcast" | "gather" | "scatter" | "embedding"
-        | "cross_entropy" => ShardRule::Elementwise,
-        "linear" => ShardRule::Linear,
+        | "transpose" | "narrow" | "cat" | "broadcast" | "gather" | "scatter" | "cross_entropy" => {
+            ShardRule::Elementwise
+        }
+        // A lookup **is** a linear over its table: the ids select rows of `w`, so a table sharded on
+        // its vocabulary axis owes exactly what a row-parallel linear owes (a partial sum over the
+        // group, materialized by an all-reduce) and one sharded on its embedding axis owes a
+        // column-parallel output. Classifying it as `Elementwise` asked for the *activation's*
+        // layout instead, which turns the declared shard on the table into a conflict.
+        "linear" | "embedding" => ShardRule::Linear,
         "matmul" | "bmm" => ShardRule::MatMul,
         _ => ShardRule::Declared,
     }
@@ -93,33 +99,121 @@ pub struct DerivedShards {
 ///
 /// `declared_inputs` are the layouts the plan assigned to the input slots; they
 /// are the starting point for the derivation, not a constraint to satisfy.
+/// `input_ranks` / `output_ranks` carry the tensor rank of each corresponding
+/// input and output (one entry per layout).
+///
+/// Every layout is resolved against its own rank on the way in **and** out, so
+/// the rules — and every layout the caller stores — see exactly one spelling
+/// of a dim. `shard(0, g)` on a rank-1 `[H]` and `shard(-1, g)` on a rank-2
+/// `[S, H]` are the same distribution there but *different axes* once the
+/// spellings are mixed: a rule that copied one onto the other renamed the axis,
+/// and the transition table then refused a conversion nobody should have asked
+/// for. Resolution is what makes the two spellings provably one fact.
 pub fn derive(
     rule: ShardRule,
     op: &str,
     declared_inputs: &[ParallelLayout],
     declared_outputs: &[ParallelLayout],
+    input_ranks: &[i64],
+    output_ranks: &[i64],
 ) -> Result<DerivedShards, DeriveError> {
+    let inputs: Vec<ParallelLayout> = declared_inputs
+        .iter()
+        .enumerate()
+        .map(|(i, layout)| canonicalize(layout, input_ranks.get(i).copied().unwrap_or(0)))
+        .collect();
     let first = || {
-        declared_inputs
+        inputs
             .first()
             .cloned()
             .unwrap_or_else(ParallelLayout::replicate)
     };
 
-    match rule {
+    let mut derived = match rule {
         ShardRule::Elementwise => {
-            let l = first();
-            Ok(DerivedShards {
-                required_inputs: vec![l.clone(); declared_inputs.len()],
-                outputs: vec![l; declared_outputs.len()],
-            })
+            // An elementwise op maps values pointwise, so it cannot consume an *incomplete* sum:
+            // `f(Σ x)` is not `Σ f(x)`, and the next layer is defined on the complete value. A
+            // partial operand therefore forces the node back to `Replicate` — the conversion is the
+            // all-reduce the transition table already emits — instead of being copied into every
+            // other operand (which is how a vocabulary-sharded embedding used to make its
+            // downstream norm demand a partial *weight*).
+            //
+            // The node's distribution is anchored on an operand whose rank is the output's. A
+            // broadcast operand's layout is spelled on fewer axes, and copying it onto the output
+            // (or a higher-rank operand) renames the axis — `shard(0, g)` on a rank-1 `[H]` is the
+            // feature axis, while on a rank-2 `[S, H]` it is the sequence axis, and the walk then
+            // demands a conversion between two different distributions. The one exception is a
+            // single-operand view (`reshape`/`narrow`): its operand *is* the distribution, carried
+            // onto the output as-is — the table has no shape algebra to remap its axis, and the
+            // view's consumers are the description's responsibility.
+            let out_rank = output_ranks.first().copied().unwrap_or(0);
+            let anchor = inputs
+                .iter()
+                .zip(input_ranks)
+                .find(|(_, rank)| **rank == out_rank)
+                .map(|(layout, _)| layout.clone())
+                .or_else(|| inputs.first().cloned())
+                .unwrap_or_else(ParallelLayout::replicate);
+            let out = if anchor.partial.is_some() {
+                ParallelLayout::replicate()
+            } else {
+                anchor
+            };
+
+            let required_inputs: Vec<ParallelLayout> = inputs
+                .iter()
+                .zip(input_ranks)
+                .map(|(declared, rank)| {
+                    // Operands that are replicated *by declaration* stay replicated. A replica is
+                    // broadcast locally by the kernel, while narrowing one to the activation's shard
+                    // is a local view the compiler refuses to materialize — so requiring `out` of a
+                    // replica would ask for a conversion that has no owner. A *partial* operand is
+                    // completed instead (the same fix-2 argument: the op cannot apply pointwise to
+                    // an incomplete sum).
+                    if declared.is_replicated() || declared.partial.is_some() {
+                        return ParallelLayout::replicate();
+                    }
+                    // A single-operand view carries its own distribution.
+                    if declared_inputs.len() == 1 {
+                        return declared.clone();
+                    }
+                    if *rank == out_rank {
+                        return out.clone();
+                    }
+                    // A broadcast operand (rank < output rank): require the output's shards on the
+                    // axes the operand has. Broadcasting aligns trailing axes, so an output shard
+                    // on axis `d` is the operand's axis `d - (out_rank - rank)`; output shards on
+                    // axes the operand lacks are broadcast from the group and need nothing here.
+                    let offset = out_rank.saturating_sub(*rank);
+                    ParallelLayout {
+                        dims: out
+                            .dims
+                            .iter()
+                            .filter(|spec| spec.dim >= offset)
+                            .map(|spec| ShardSpec {
+                                dim: spec.dim - offset,
+                                group: spec.group,
+                            })
+                            .collect(),
+                        partial: None,
+                    }
+                })
+                .collect();
+            DerivedShards {
+                required_inputs,
+                outputs: vec![out; declared_outputs.len()],
+            }
         }
 
         ShardRule::Linear => {
             // y = x @ w ; declared_inputs = [x, w], with w as [K, N]: the
-            // contraction last-but-one, the output features last.
+            // contraction last-but-one, the output features last. Dims arrive
+            // resolved against the weight's own rank, so on a rank-2 `[K, N]`
+            // weight the contraction is axis 0 and the output features axis 1
+            // (the spellings `0`/`-2` and `1`/`-1` name those axes before
+            // resolution).
             let x = first();
-            let w = declared_inputs
+            let w = inputs
                 .get(1)
                 .cloned()
                 .unwrap_or_else(ParallelLayout::replicate);
@@ -128,16 +222,16 @@ pub fn derive(
                 // An unsharded weight: the output keeps whatever layout the
                 // activation has.
                 (true, _, _) => x.clone(),
-                // Weight sharded on its output dim (1 / -1 against the
-                // weight's rank) as a *single* spec: output features split
-                // across ranks (column parallel), no collective owed.
-                (false, [ShardSpec { dim, group }], None) if *dim == 1 || *dim == -1 => {
+                // Weight sharded on its output dim as a *single* spec: output
+                // features split across ranks (column parallel), no collective
+                // owed.
+                (false, [ShardSpec { dim, group }], None) if *dim == 1 => {
                     ParallelLayout::shard(-1, *group)
                 }
                 // Contraction split across ranks (row parallel) as a single
                 // spec: every rank holds a partial sum, which forces the
                 // all-reduce downstream.
-                (false, [ShardSpec { dim, group }], None) if *dim == 0 || *dim == -2 => {
+                (false, [ShardSpec { dim, group }], None) if *dim == 0 => {
                     ParallelLayout::partial(ReduceOp::Sum, *group)
                 }
                 // Anything else — two shards on the weight, an existing
@@ -151,43 +245,74 @@ pub fn derive(
                     });
                 }
             };
-            Ok(DerivedShards {
+            DerivedShards {
                 required_inputs: vec![x, w],
                 outputs: vec![out; declared_outputs.len()],
-            })
+            }
         }
 
         ShardRule::MatMul => {
-            // a @ b ; contraction on a.dim(-1) and b.dim(-2).
+            // a @ b ; contraction on a's last and b's second-to-last dim. Dims
+            // arrive resolved, so the contraction is `a`'s axis `rank_a - 1`
+            // and `b`'s `rank_b - 2`, and b's output features are `rank_b - 1`
+            // (exactly what the `-1`/`-2` spellings meant before resolution).
             let a = first();
-            let b = declared_inputs
+            let b = inputs
                 .get(1)
                 .cloned()
                 .unwrap_or_else(ParallelLayout::replicate);
+            let rank_a = input_ranks.first().copied().unwrap_or(0);
+            let rank_b = input_ranks.get(1).copied().unwrap_or(0);
 
             let out = match (single_shard(&a), single_shard(&b)) {
                 // The contraction is split: every rank holds a partial sum.
-                (Some(sa), _) if sa.dim == -1 => ParallelLayout::partial(ReduceOp::Sum, sa.group),
-                (_, Some(sb)) if sb.dim == -2 => ParallelLayout::partial(ReduceOp::Sum, sb.group),
+                (Some(sa), _) if sa.dim == rank_a.saturating_sub(1) => {
+                    ParallelLayout::partial(ReduceOp::Sum, sa.group)
+                }
+                (_, Some(sb)) if sb.dim == rank_b.saturating_sub(2) => {
+                    ParallelLayout::partial(ReduceOp::Sum, sb.group)
+                }
                 // b's output dim is split: the result inherits that shard.
-                (_, Some(sb)) if sb.dim == -1 => ParallelLayout::shard(-1, sb.group),
+                (_, Some(sb)) if sb.dim == rank_b.saturating_sub(1) => {
+                    ParallelLayout::shard(-1, sb.group)
+                }
                 // Any other single shard propagates to the output.
                 (Some(sa), _) => ParallelLayout::shard(sa.dim, sa.group),
                 // Anything multi-shard or partial: no rule, so no
                 // distribution is invented (as before the mask vocabulary).
                 _ => ParallelLayout::replicate(),
             };
-            Ok(DerivedShards {
+            DerivedShards {
                 required_inputs: vec![a, b],
                 outputs: vec![out; declared_outputs.len()],
-            })
+            }
         }
 
-        ShardRule::Declared => Ok(DerivedShards {
-            required_inputs: declared_inputs.to_vec(),
-            outputs: declared_outputs.to_vec(),
-        }),
-    }
+        ShardRule::Declared => DerivedShards {
+            required_inputs: inputs.clone(),
+            outputs: declared_outputs
+                .iter()
+                .zip(output_ranks)
+                .map(|(layout, &rank)| canonicalize(layout, rank))
+                .collect(),
+        },
+    };
+
+    // One spelling leaves the function too: every answer is resolved against
+    // the rank it belongs to, so callers can store it verbatim.
+    derived.required_inputs = derived
+        .required_inputs
+        .iter()
+        .enumerate()
+        .map(|(i, layout)| canonicalize(layout, input_ranks.get(i).copied().unwrap_or(0)))
+        .collect();
+    derived.outputs = derived
+        .outputs
+        .iter()
+        .enumerate()
+        .map(|(i, layout)| canonicalize(layout, output_ranks.get(i).copied().unwrap_or(0)))
+        .collect();
+    Ok(derived)
 }
 
 /// The single shard of a layout, when it has exactly one shard and no
@@ -311,6 +436,33 @@ fn validate_layouts(plan: &Plan, mesh: &Mesh) -> Result<(), PlanError> {
 /// reported rather than silently resolved — the scaffold deliberately does not
 /// insert fan-out conversions, because doing so is a scheduling decision with
 /// real cost and it should be visible in the source plan.
+///
+/// Resolves a `layout`'s shard dims against a tensor of `rank` dimensions, in
+/// place of the caller's spelling.
+///
+/// Two layouts that differ only in how a dim is *spelled* are the same distribution: `shard(0, g)`
+/// and `shard(-1, g)` on a rank-1 tensor, or `shard(-1, g)` and `shard(1, g)` on a rank-2 one. The
+/// walks below compare layouts to decide whether a conversion is owed, and they **store** what they
+/// derived — so both the comparison and the stored layouts go through this: a plan must carry one
+/// spelling of each axis, otherwise a declared weight and the rule that reads it disagree about
+/// nothing, and the plan is reported as a conflict. (A 1-D norm weight sharded on its only axis is
+/// exactly that case.)
+///
+/// A dim that does not resolve is left as written: the validator reports it
+/// with its node context, and resolving it here silently would bury that.
+pub(crate) fn canonicalize(layout: &ParallelLayout, rank: i64) -> ParallelLayout {
+    let Ok(norm) = DimNormalizer::new(rank) else {
+        return layout.clone();
+    };
+    let mut resolved = layout.clone();
+    for spec in &mut resolved.dims {
+        if let Ok(dim) = norm.normalize(spec.dim) {
+            spec.dim = dim;
+        }
+    }
+    resolved
+}
+
 pub fn propagate(plan: &Plan) -> Result<ShardPropagation, PlanError> {
     // The mask vocabulary is only meaningful next to the mesh that produced
     // it, and a plan stores the fingerprint, not the mesh (invariant I-6):
@@ -366,21 +518,40 @@ pub fn propagate(plan: &Plan) -> Result<ShardPropagation, PlanError> {
         // promised. Using the declared layouts here was the bug that made a
         // partial sum never trigger an all-reduce.
         let eff_in: Vec<ParallelLayout> = n.inputs.iter().map(|s| effective[s.0].clone()).collect();
+        let input_ranks: Vec<i64> = n
+            .inputs
+            .iter()
+            .map(|s| plan.slot(*s).shape.len() as i64)
+            .collect();
         let declared_out: Vec<ParallelLayout> = n
             .outputs
             .iter()
             .map(|s| plan.slot(*s).layout.clone())
             .collect();
+        let output_ranks: Vec<i64> = n
+            .outputs
+            .iter()
+            .map(|s| plan.slot(*s).shape.len() as i64)
+            .collect();
 
-        let derived = derive(rule, &n.op.name, &eff_in, &declared_out)
-            .map_err(|source| PlanError::ShardDerivation { node: id, source })?;
+        let derived = derive(
+            rule,
+            &n.op.name,
+            &eff_in,
+            &declared_out,
+            &input_ranks,
+            &output_ranks,
+        )
+        .map_err(|source| PlanError::ShardDerivation { node: id, source })?;
 
         // Input side: a rule may demand a layout the operand does not have.
         for (k, inp) in n.inputs.iter().enumerate() {
             let Some(need) = derived.required_inputs.get(k).cloned() else {
                 continue;
             };
-            let held = effective[inp.0].clone();
+            let rank = plan.slot(SlotId(inp.0)).shape.len() as i64;
+            let need = canonicalize(&need, rank);
+            let held = canonicalize(&effective[inp.0], rank);
             if need == held {
                 continue;
             }
@@ -429,6 +600,9 @@ pub fn propagate(plan: &Plan) -> Result<ShardPropagation, PlanError> {
                 .cloned()
                 .unwrap_or_else(ParallelLayout::replicate);
             let promised = declared_out[j].clone();
+            let rank = plan.slot(*o).shape.len() as i64;
+            let produced = canonicalize(&produced, rank);
+            let promised = canonicalize(&promised, rank);
             if produced == promised {
                 effective[o.0] = produced;
                 continue;
@@ -725,7 +899,8 @@ mod tests {
     }
 
     /// `w` is `[K, N]`; sharding the output dim (1 / -1) is column parallel and
-    /// owes nothing.
+    /// owes nothing. Both spellings name the same axis, and `derive` returns the
+    /// canonical (resolved) one — one spelling leaves the function.
     #[test]
     fn column_parallel_linear_needs_no_collective() {
         for dim in [1, -1] {
@@ -737,12 +912,15 @@ mod tests {
                     ParallelLayout::shard(dim, tp_mask()),
                 ],
                 &[ParallelLayout::replicate()],
+                &[2, 2],
+                &[2],
             )
             .unwrap();
             assert_eq!(
                 d.outputs[0],
-                ParallelLayout::shard(-1, tp_mask()),
-                "sharding the weight's output dim {dim} must stay column parallel"
+                ParallelLayout::shard(1, tp_mask()),
+                "sharding the weight's output dim {dim} must stay column parallel, spelled \
+                 canonically as axis 1"
             );
         }
     }
@@ -759,6 +937,8 @@ mod tests {
                     ParallelLayout::shard(dim, tp_mask()),
                 ],
                 &[ParallelLayout::replicate()],
+                &[2, 2],
+                &[2],
             )
             .unwrap();
             assert_eq!(
@@ -767,6 +947,91 @@ mod tests {
                 "sharding the weight's contraction dim {dim} must produce a partial sum"
             );
         }
+    }
+
+    /// The broadcast case that first exposed the cross-rank copy: `g = aneg * sp`
+    /// with `aneg` a rank-1 `[H]` sharded on its only axis and `sp` a rank-2
+    /// `[S, H]` sharded on its last axis. The rule must anchor the output on the
+    /// operand that has the output's rank (`sp`) and translate the requirement
+    /// for the rank-1 operand back onto *its* axis — copying the first operand's
+    /// layout onto the rank-2 ones renamed `shard(0, g)` into the sequence axis
+    /// and made the walk demand an all-gather that no target layout owns.
+    #[test]
+    fn a_broadcast_elementwise_anchors_on_the_output_ranked_operand() {
+        let g = tp_mask();
+        let d = derive(
+            ShardRule::Elementwise,
+            "elementwise_binary",
+            &[ParallelLayout::shard(0, g), ParallelLayout::shard(-1, g)],
+            &[ParallelLayout::replicate()],
+            &[1, 2],
+            &[2],
+        )
+        .unwrap();
+        assert_eq!(
+            d.outputs[0],
+            ParallelLayout::shard(1, g),
+            "the output follows the operand that has the output's rank, spelled canonically"
+        );
+        assert_eq!(
+            d.required_inputs,
+            vec![ParallelLayout::shard(0, g), ParallelLayout::shard(1, g)],
+            "each operand is required on its *own* axes: the rank-1 operand keeps shard(0, g) on \
+             its only axis, the rank-2 operand is required on the feature axis"
+        );
+    }
+
+    /// A single-operand view op carries its operand's distribution as-is, even
+    /// across a rank change: `reshape`/`narrow` have no shape algebra to remap
+    /// the axis, and demanding a conversion on the view's own input would insert
+    /// a collective the description never asked for.
+    #[test]
+    fn a_single_operand_view_carries_its_operands_distribution() {
+        let g = tp_mask();
+        let d = derive(
+            ShardRule::Elementwise,
+            "reshape",
+            &[ParallelLayout::shard(-1, g)],
+            &[ParallelLayout::replicate()],
+            &[2],
+            &[4],
+        )
+        .unwrap();
+        assert_eq!(
+            d.outputs[0],
+            ParallelLayout::shard(1, g),
+            "the view copies the operand's resolved layout"
+        );
+        assert_eq!(
+            d.required_inputs,
+            vec![ParallelLayout::shard(1, g)],
+            "the view's operand keeps its own layout — no conversion is owed at a view"
+        );
+    }
+
+    /// A broadcast operand that disagrees with the anchored output on its own
+    /// axis is a real requirement, not a copy: `aneg` sharded over a *different*
+    /// group than the output's feature shard must be demanded, and the walk
+    /// turns that into the group-mismatch refusal.
+    #[test]
+    fn a_broadcast_operand_is_required_on_its_own_axis() {
+        let tp = tp_mask();
+        let ep = GroupMask::single(1).expect("bit 1 always fits");
+        let d = derive(
+            ShardRule::Elementwise,
+            "elementwise_binary",
+            &[ParallelLayout::shard(0, ep), ParallelLayout::shard(-1, tp)],
+            &[ParallelLayout::replicate()],
+            &[1, 2],
+            &[2],
+        )
+        .unwrap();
+        assert_eq!(
+            d.required_inputs,
+            vec![ParallelLayout::shard(0, tp), ParallelLayout::shard(1, tp)],
+            "the rank-1 operand is required on its own axis with the *output's* group, so the \
+             walk can refuse the mismatch instead of computing with misaligned slices"
+        );
     }
 
     /// Decision 6: a weight with several shards — or any partial — has no rule
@@ -805,6 +1070,8 @@ mod tests {
                 "linear",
                 &[ParallelLayout::replicate(), weight],
                 &[ParallelLayout::replicate()],
+                &[2, 2],
+                &[2],
             )
             .unwrap_err();
             match err {
@@ -940,22 +1207,57 @@ mod tests {
         )
     }
 
-    /// A one-input elementwise plan whose input slot is declared with layout
-    /// `from` and whose output slot is declared with layout `to` — the
+    /// A plan whose walk must decide the conversion `from -> to` on a slot that
+    /// **has a producer**, so the conversion reaches the transition table — the
     /// hand-declared pair the reviewer drove through `propagate`.
+    ///
+    /// Since the lead's fix 2, an elementwise node can no longer consume a
+    /// partial at all (it demands `replicate` of such an operand), so a
+    /// one-input elementwise pair — input declared `from`, output declared `to`
+    /// — refused on the *input* whenever `from` carried a partial, and the
+    /// transition table never saw the pair. A `linear` keeps the pair alive: its
+    /// rule demands the operands as they are (a linear legitimately consumes a
+    /// partial activation and produces a partial output), and with a replicated
+    /// weight its produced layout is exactly `from` — so the walk decides
+    /// `from -> to` on the **output** slot, the same shape the pair always had.
     fn declared_pair_plan(from: ParallelLayout, to: ParallelLayout) -> Plan {
         let mesh = tp_ep_mesh();
         let mut b = PlanBuilder::new("pair", Phase::Forward, mesh.fingerprint());
         let x = b.slot_with_layout("x", RsDtype::F32, vec![6, 6], SlotKind::Activation, from);
+        let w = b.slot("w", RsDtype::F32, vec![6, 6], SlotKind::Weight);
         let y = b.slot_with_layout("y", RsDtype::F32, vec![6, 6], SlotKind::Activation, to);
-        b.node(
-            OpRef::new("elementwise_unary"),
-            vec![x],
-            vec![y],
-            Attrs::new().set("kind", "silu"),
-            "a",
-        );
+        b.node(OpRef::new("linear"), vec![x, w], vec![y], Attrs::new(), "a");
         b.build().unwrap()
+    }
+
+    /// The lead's fix 2, pinned at the rule level: an elementwise op cannot
+    /// consume a partial (`f(Σx)` is not `Σf(x)`), so a partial operand is
+    /// demanded as `replicate` — the completion is the all-reduce the walk
+    /// inserts — and the output is `replicate` too. This is what moved the pair
+    /// tests below onto the two-input shape: with a partial `from`, the old
+    /// one-input pair refused on the model input before the transition table
+    /// could see the conversion.
+    #[test]
+    fn an_elementwise_partial_operand_is_demanded_as_replicate() {
+        let d = derive(
+            ShardRule::Elementwise,
+            "elementwise_unary",
+            &[ParallelLayout::partial(ReduceOp::Sum, tp_mask())],
+            &[ParallelLayout::replicate()],
+            &[2],
+            &[2],
+        )
+        .unwrap();
+        assert_eq!(
+            d.outputs,
+            vec![ParallelLayout::replicate()],
+            "a partial operand forces the node back to replicate"
+        );
+        assert_eq!(
+            d.required_inputs,
+            vec![ParallelLayout::replicate()],
+            "the partial operand itself is demanded complete — the conversion is the all-reduce"
+        );
     }
 
     /// **Case F2 (reviewer finding, MEDIUM).** `partial(Sum, tp) -> shard(0,

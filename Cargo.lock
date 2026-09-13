@@ -570,6 +570,7 @@ version = "0.2.0"
 dependencies = [
  "blake3",
  "rustrain-abi",
+ "rustrain-kernels",
  "rustrain-ops",
  "rustrain-parallel",
  "serde",
