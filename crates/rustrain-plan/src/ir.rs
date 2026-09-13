@@ -9,7 +9,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use rustrain_parallel::{ParallelConfig, ParallelLayout};
+use rustrain_parallel::{MeshFingerprint, ParallelLayout};
 
 use crate::attrs::Attrs;
 
@@ -209,7 +209,11 @@ pub struct PlanMeta {
     /// The phase this whole plan belongs to. Individual nodes may differ while
     /// a model is being staged, but a compiled plan is normally single-phase.
     pub phase: Phase,
-    pub parallel: ParallelConfig,
+    /// The mesh this plan is compiled for, as a fingerprint: the ordered
+    /// `[(name, degree)]` list and nothing else (design §1.3, invariant I-6).
+    /// A plan carries results, not a traversable topology; anything that needs
+    /// to check a mask against its axes resolves `mesh.to_mesh()`.
+    pub mesh: MeshFingerprint,
     pub seed: u64,
 }
 
@@ -336,12 +340,12 @@ pub struct PlanBuilder {
 }
 
 impl PlanBuilder {
-    pub fn new(name: impl Into<String>, phase: Phase, parallel: ParallelConfig) -> Self {
+    pub fn new(name: impl Into<String>, phase: Phase, mesh: MeshFingerprint) -> Self {
         Self {
             meta: PlanMeta {
                 name: name.into(),
                 phase,
-                parallel,
+                mesh,
                 seed: 0,
             },
             slots: Vec::new(),
@@ -367,7 +371,7 @@ impl PlanBuilder {
         shape: Vec<i64>,
         kind: SlotKind,
     ) -> SlotId {
-        self.slot_with_layout(name, dtype, shape, kind, ParallelLayout::Replicate)
+        self.slot_with_layout(name, dtype, shape, kind, ParallelLayout::replicate())
     }
 
     pub fn slot_with_layout(
@@ -481,47 +485,34 @@ pub mod intrinsic {
             )
     }
 
-    /// Attribute key carrying the [`super::ParallelLayout`]-ish group for an
-    /// inserted collective, as a string (`"tp"`, `"ep"`, ...).
+    /// Attribute key carrying the group of an inserted collective, as the
+    /// integer bits of a [`rustrain_parallel::GroupMask`]
+    /// (`GroupMask::bits() as i64`).
+    ///
+    /// A mask has no name without the mesh that produced it, and a plan
+    /// attribute is not the place for the mesh — so the bits travel on the
+    /// node, and the compiler reads them back with
+    /// [`rustrain_parallel::GroupMask::from_bits`] and revalidates them
+    /// against the plan's mesh.
     pub const ATTR_GROUP: &str = "group";
     /// Attribute key carrying the reduction for `all_reduce`.
     pub const ATTR_REDUCE: &str = "reduce";
     /// Attribute key carrying the dimension for gather/scatter.
     pub const ATTR_DIM: &str = "dim";
-
-    pub fn group_name(g: rustrain_parallel::GroupKind) -> &'static str {
-        match g {
-            rustrain_parallel::GroupKind::Tp => "tp",
-            rustrain_parallel::GroupKind::Cp => "cp",
-            rustrain_parallel::GroupKind::Ep => "ep",
-            rustrain_parallel::GroupKind::Dp => "dp",
-            rustrain_parallel::GroupKind::Pp => "pp",
-            rustrain_parallel::GroupKind::Global => "global",
-        }
-    }
-
-    pub fn parse_group(s: &str) -> Option<rustrain_parallel::GroupKind> {
-        use rustrain_parallel::GroupKind::*;
-        match s {
-            "tp" => Some(Tp),
-            "cp" => Some(Cp),
-            "ep" => Some(Ep),
-            "dp" => Some(Dp),
-            "pp" => Some(Pp),
-            "global" => Some(Global),
-            _ => None,
-        }
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use rustrain_abi::ffi::RsDtype;
-    use rustrain_parallel::GroupKind;
+    use rustrain_parallel::{Mesh, ParallelConfig};
 
     fn builder() -> PlanBuilder {
-        PlanBuilder::new("t", Phase::Forward, ParallelConfig::default())
+        PlanBuilder::new(
+            "t",
+            Phase::Forward,
+            Mesh::from_config(&ParallelConfig::default()).fingerprint(),
+        )
     }
 
     #[test]
@@ -530,7 +521,13 @@ mod tests {
         let x = b.slot("x", RsDtype::F32, vec![2, 4], SlotKind::Activation);
         let w = b.slot("w", RsDtype::F32, vec![4, 4], SlotKind::Weight);
         let y = b.slot("y", RsDtype::F32, vec![2, 4], SlotKind::Activation);
-        b.node(OpRef::new("matmul"), vec![x, w], vec![y], Attrs::new(), "l0");
+        b.node(
+            OpRef::new("matmul"),
+            vec![x, w],
+            vec![y],
+            Attrs::new(),
+            "l0",
+        );
         let p = b.build().unwrap();
         assert_eq!(p.nodes.len(), 1);
         assert_eq!(p.input_slots(), vec![x, w]);
@@ -575,7 +572,7 @@ mod tests {
             name: "s".into(),
             dtype: RsDtype::F32,
             shape: vec![2, 3, 4],
-            layout: ParallelLayout::Replicate,
+            layout: ParallelLayout::replicate(),
             kind: SlotKind::Activation,
         };
         assert_eq!(s.dim(-1), Some(4));
@@ -585,20 +582,19 @@ mod tests {
         assert_eq!(s.numel(), 24);
     }
 
+    /// The intrinsic namespace stays disjoint from the primitive vocabulary.
+    /// The group attribute codec (integer mask bits, written by
+    /// `shard::propagate` and read by `compile_intrinsic`) is pinned by the
+    /// round-trip tests in `compile.rs`.
     #[test]
-    fn intrinsic_names_round_trip() {
+    fn intrinsic_names_are_disjoint_from_primitives() {
         use intrinsic::*;
         assert!(is_intrinsic(ALL_REDUCE));
+        assert!(is_intrinsic(ALL_GATHER));
+        assert!(is_intrinsic(REDUCE_SCATTER));
+        assert!(is_intrinsic(BROADCAST));
+        assert!(is_intrinsic(SYNC));
         assert!(!is_intrinsic("matmul"));
-        for g in [
-            GroupKind::Tp,
-            GroupKind::Cp,
-            GroupKind::Ep,
-            GroupKind::Dp,
-            GroupKind::Pp,
-            GroupKind::Global,
-        ] {
-            assert_eq!(parse_group(group_name(g)), Some(g));
-        }
+        assert!(!is_intrinsic("intrinsic.")); // the prefix alone is not an op
     }
 }

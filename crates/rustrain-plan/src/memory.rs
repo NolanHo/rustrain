@@ -164,7 +164,10 @@ impl MemoryPlan {
             for d in &self.decisions {
                 out.push_str(&format!(
                     "    [{}] {} -> {}: {}\n",
-                    d.node.0, name_of(d.to), name_of(d.from), d.reason
+                    d.node.0,
+                    name_of(d.to),
+                    name_of(d.from),
+                    d.reason
                 ));
             }
         }
@@ -254,7 +257,14 @@ pub fn plan(
     let hard_budget = recipe.budget_bytes;
     let target = recipe.target_bytes();
     let mut mem = build(
-        plan, &lifetimes, &aliases, &sizes, &policy, &workspace, recipe, hard_budget,
+        plan,
+        &lifetimes,
+        &aliases,
+        &sizes,
+        &policy,
+        &workspace,
+        recipe,
+        hard_budget,
     );
 
     // Relaxation, in a deterministic order: steps in index order, and for each,
@@ -262,12 +272,10 @@ pub fn plan(
     if let Some(target) = target
         && mem.peak_bytes > target
     {
-        let ladder = [
-            ActivationPolicy::Offload,
-            ActivationPolicy::Recompute,
-        ];
+        let ladder = [ActivationPolicy::Offload, ActivationPolicy::Recompute];
         'outer: for step in 0..plan.nodes.len() {
-            if intrinsic::is_intrinsic(&plan.nodes[step].op.name) || policy[step] != ActivationPolicy::Keep
+            if intrinsic::is_intrinsic(&plan.nodes[step].op.name)
+                || policy[step] != ActivationPolicy::Keep
             {
                 continue;
             }
@@ -288,11 +296,20 @@ pub fn plan(
                     reason: format!(
                         "peak {} B is over the {} B target; {} on this node is the next rung of \
                          the ladder (keep -> offload -> recompute) for the lowest step index",
-                        mem.peak_bytes, target, name_of(next)
+                        mem.peak_bytes,
+                        target,
+                        name_of(next)
                     ),
                 });
                 mem = build(
-                    plan, &lifetimes, &aliases, &sizes, &policy, &workspace, recipe, hard_budget,
+                    plan,
+                    &lifetimes,
+                    &aliases,
+                    &sizes,
+                    &policy,
+                    &workspace,
+                    recipe,
+                    hard_budget,
                 );
                 if mem.peak_bytes <= target {
                     break 'outer;
@@ -313,10 +330,7 @@ pub fn plan(
 ///
 /// Called separately from [`plan`] so the caller can inspect the projection
 /// before deciding, and so tests can exercise the arithmetic without the gate.
-pub fn enforce_budget(
-    mem: &MemoryPlan,
-    plan: &Plan,
-) -> Result<(), PlanError> {
+pub fn enforce_budget(mem: &MemoryPlan, plan: &Plan) -> Result<(), PlanError> {
     let Some(budget) = mem.budget_bytes else {
         return Ok(());
     };
@@ -439,9 +453,7 @@ fn build(
 
     // Transients: interval allocation into one pool.
     let mut transient: Vec<usize> = (0..plan.slots.len())
-        .filter(|i| {
-            !is_persistent(plan.slots[*i].kind) && aliases[*i].is_none()
-        })
+        .filter(|i| !is_persistent(plan.slots[*i].kind) && aliases[*i].is_none())
         .collect();
     transient.sort_by_key(|i| (lifetimes[*i].born, *i));
 
@@ -453,7 +465,11 @@ fn build(
         let lt = lifetimes[*i];
         let bytes = sizes[*i];
         let pol = producer_policy[*i];
-        let counted = if pol == ActivationPolicy::Keep { bytes } else { 0 };
+        let counted = if pol == ActivationPolicy::Keep {
+            bytes
+        } else {
+            0
+        };
 
         // Release blocks whose slot has died.
         handed.retain(|(_, _, dies)| *dies >= lt.born);
@@ -613,11 +629,7 @@ fn compute_aliases(plan: &Plan) -> Vec<Option<SlotId>> {
 /// ABI's convention for "no workspace" — a provider that needs scratch and does
 /// not say so is a provider bug the conformance gate has to catch, not something
 /// the planner can infer.
-fn query_workspace(
-    plan: &Plan,
-    ops: &ResolvedOps,
-    sizes: &[u64],
-) -> Result<Vec<u64>, PlanError> {
+fn query_workspace(plan: &Plan, ops: &ResolvedOps, sizes: &[u64]) -> Result<Vec<u64>, PlanError> {
     let mut out = vec![0u64; plan.nodes.len()];
 
     for (i, node) in plan.nodes.iter().enumerate() {
@@ -671,10 +683,14 @@ mod tests {
     use crate::ir::{OpRef, Phase};
     use crate::{Attrs, PlanBuilder};
     use rustrain_abi::ffi::RsDtype;
-    use rustrain_parallel::ParallelConfig;
+    use rustrain_parallel::{Mesh, ParallelConfig};
 
     fn plan_with(n_layers: usize) -> Plan {
-        let mut b = PlanBuilder::new("mem", Phase::Forward, ParallelConfig::default());
+        let mut b = PlanBuilder::new(
+            "mem",
+            Phase::Forward,
+            Mesh::from_config(&ParallelConfig::default()).fingerprint(),
+        );
         let w = b.slot("w", RsDtype::F32, vec![64, 64], SlotKind::Weight);
         let mut prev = b.slot("x", RsDtype::F32, vec![8, 64], SlotKind::Input);
         for l in 0..n_layers {
@@ -731,7 +747,8 @@ mod tests {
     fn peak_accounts_persistent_plus_pool_plus_workspace() {
         let plan = plan_with(2);
         let recipe = MemoryRecipe::default();
-        let mem = run_memory_pass(&plan, &no_ops(&plan), &recipe, RuntimeCapabilities::none()).unwrap();
+        let mem =
+            run_memory_pass(&plan, &no_ops(&plan), &recipe, RuntimeCapabilities::none()).unwrap();
         // One 64x64 f32 weight = 16 KiB.
         assert_eq!(mem.persistent_bytes, 64 * 64 * 4);
         assert!(mem.transient_pool_bytes > 0);
@@ -748,7 +765,8 @@ mod tests {
             pool: MemoryPool::Slab,
             ..Default::default()
         };
-        let mem = run_memory_pass(&plan, &no_ops(&plan), &recipe, RuntimeCapabilities::none()).unwrap();
+        let mem =
+            run_memory_pass(&plan, &no_ops(&plan), &recipe, RuntimeCapabilities::none()).unwrap();
 
         let activation_bytes = 8 * 64 * 4;
         // Four layers, each 8x64 f32, but layer N's activation dies when layer
@@ -769,11 +787,18 @@ mod tests {
             pool: MemoryPool::None,
             ..Default::default()
         };
-        let mem = run_memory_pass(&plan, &no_ops(&plan), &recipe, RuntimeCapabilities::none()).unwrap();
+        let mem =
+            run_memory_pass(&plan, &no_ops(&plan), &recipe, RuntimeCapabilities::none()).unwrap();
         let transient: u64 = mem
             .allocations
             .iter()
-            .filter(|a| a.policy == ActivationPolicy::Keep && !matches!(a.placement, Placement::Persistent { .. } | Placement::Aliased(_)))
+            .filter(|a| {
+                a.policy == ActivationPolicy::Keep
+                    && !matches!(
+                        a.placement,
+                        Placement::Persistent { .. } | Placement::Aliased(_)
+                    )
+            })
             .map(|a| a.bytes)
             .sum();
         assert_eq!(mem.transient_pool_bytes, transient);
@@ -786,7 +811,8 @@ mod tests {
             budget_bytes: Some(1), // impossible
             ..Default::default()
         };
-        let mem = run_memory_pass(&plan, &no_ops(&plan), &recipe, RuntimeCapabilities::none()).unwrap();
+        let mem =
+            run_memory_pass(&plan, &no_ops(&plan), &recipe, RuntimeCapabilities::none()).unwrap();
         let err = enforce_budget(&mem, &plan).unwrap_err();
         match err {
             PlanError::MemoryBudgetExceeded {
@@ -813,7 +839,8 @@ mod tests {
             ..Default::default()
         };
         // No offload, no recompute: the planner must not pretend it can help.
-        let mem = run_memory_pass(&plan, &no_ops(&plan), &recipe, RuntimeCapabilities::none()).unwrap();
+        let mem =
+            run_memory_pass(&plan, &no_ops(&plan), &recipe, RuntimeCapabilities::none()).unwrap();
         assert!(mem.decisions.is_empty(), "nothing was executable to try");
         assert!(enforce_budget(&mem, &plan).is_err());
     }
@@ -857,7 +884,8 @@ mod tests {
                 activation_policy: Some(ActivationPolicy::Offload),
             },
         );
-        let mem = run_memory_pass(&plan, &no_ops(&plan), &recipe, RuntimeCapabilities::none()).unwrap();
+        let mem =
+            run_memory_pass(&plan, &no_ops(&plan), &recipe, RuntimeCapabilities::none()).unwrap();
         assert_eq!(mem.unsupported.len(), plan.nodes.len());
         assert!(
             mem.explain().contains("cannot execute"),

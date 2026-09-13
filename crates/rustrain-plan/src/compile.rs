@@ -10,13 +10,13 @@ use serde::Serialize;
 
 use rustrain_abi::ffi::{RsNumerics, RsTensor};
 use rustrain_ops::{Phase, Recipe, RegisteredOp, Registry, ResolveRequest, TargetEnv};
-use rustrain_parallel::{GroupKind, ParallelConfig, ParallelLayout, ProcessGroups, ReduceOp};
+use rustrain_parallel::{GroupMask, MeshFingerprint, ParallelLayout, ReduceOp};
 
-use crate::attrs::AbiAttrs;
+use crate::PlanError;
+use crate::attrs::{AbiAttrs, AttrValue};
 use crate::ir::{NodeId, Plan, Slot, SlotId, StreamPolicy, Trace, intrinsic};
 use crate::memory;
 use crate::shard::{self, InsertedCollective};
-use crate::PlanError;
 
 /// A CUDA stream. The scaffold has exactly two; the scheduler assigns them.
 pub type StreamId = u32;
@@ -46,7 +46,7 @@ pub enum CompiledStep {
     Intrinsic {
         node: NodeId,
         op: String,
-        group: GroupKind,
+        group: GroupMask,
         reduce: Option<ReduceOp>,
         dim: Option<i64>,
         input: SlotId,
@@ -76,11 +76,28 @@ impl CompiledStep {
     }
 
     /// Short label used by `plan explain` and by runtime logs.
+    ///
+    /// The group renders as its raw mask bits: a name needs the mesh, which a
+    /// bare step does not carry (`CompiledPlan::explain` renders names through
+    /// the private `label_with`).
     pub fn label(&self) -> String {
         match self {
             CompiledStep::Op { op, .. } => op.spec_name(),
+            CompiledStep::Intrinsic { op, group, .. } => format!("{op}[{group}]"),
+        }
+    }
+
+    /// Like [`Self::label`], with the group rendered by axis name against the
+    /// mesh the plan was compiled for.
+    fn label_with(&self, mesh: &MeshFingerprint) -> String {
+        match self {
+            CompiledStep::Op { op, .. } => op.spec_name(),
             CompiledStep::Intrinsic { op, group, .. } => {
-                format!("{op}[{}]", intrinsic::group_name(*group))
+                format!(
+                    "{op}[{}]",
+                    mesh.group_name(*group)
+                        .unwrap_or_else(|_| group.to_string())
+                )
             }
         }
     }
@@ -105,7 +122,10 @@ pub struct CompiledPlan {
     pub plan: Plan,
     pub steps: Vec<CompiledStep>,
     pub digest: String,
-    pub parallel: ParallelConfig,
+    /// The mesh this plan was compiled for, copied from `plan.meta.mesh` so
+    /// the topology fact has exactly one source (decision 4): the plan's
+    /// fingerprint, never a traversable mesh (invariant I-6).
+    pub mesh: MeshFingerprint,
     pub resolved: Vec<ResolvedNode>,
     pub inserted: Vec<InsertedCollective>,
     /// Lifetimes, storage placement and the projected peak. Computed here, not
@@ -137,7 +157,7 @@ impl CompiledPlan {
             "plan {}  digest {}  world {}\n",
             self.plan.meta.name,
             &self.digest[..12.min(self.digest.len())],
-            self.parallel.world_size()
+            self.mesh.world_size()
         ));
         out.push_str(&format!(
             "  slots {}  nodes {}  inserted collectives {}\n",
@@ -147,10 +167,14 @@ impl CompiledPlan {
         ));
 
         for (i, step) in self.steps.iter().enumerate() {
-            let mark = if step.source().is_inserted() { "*" } else { " " };
+            let mark = if step.source().is_inserted() {
+                "*"
+            } else {
+                " "
+            };
             out.push_str(&format!(
                 "{mark}[{i:>4}] {:>28}  <- {}  -> {}  @{}\n",
-                step.label(),
+                step.label_with(&self.mesh),
                 self.slot_list(step_inputs(step)),
                 self.slot_list(step_outputs(step)),
                 step.source().path,
@@ -160,7 +184,10 @@ impl CompiledPlan {
         if !self.inserted.is_empty() {
             out.push_str("\ninserted communication:\n");
             for ins in &self.inserted {
-                out.push_str(&format!("  {:<14} {}  ({})\n", ins.op, ins.reason, ins.source));
+                out.push_str(&format!(
+                    "  {:<14} {}  ({})\n",
+                    ins.op, ins.reason, ins.source
+                ));
             }
         }
         out
@@ -194,11 +221,14 @@ fn step_outputs(s: &CompiledStep) -> &[SlotId] {
 }
 
 /// Turns a plan into something the runtime can execute.
+///
+/// The compiler carries no copy of the topology: the mesh lives in the plan's
+/// fingerprint (`plan.meta.mesh`, decision 4), which every pass resolves when
+/// it needs one.
 pub struct Compiler<'a> {
     registry: &'a Registry,
     recipe: &'a Recipe,
     env: TargetEnv,
-    parallel: ParallelConfig,
     deterministic: bool,
     /// What the runtime can execute. A memory policy in this set may be planned
     /// for; anything outside it is refused rather than projected as a saving.
@@ -206,17 +236,11 @@ pub struct Compiler<'a> {
 }
 
 impl<'a> Compiler<'a> {
-    pub fn new(
-        registry: &'a Registry,
-        recipe: &'a Recipe,
-        env: TargetEnv,
-        parallel: ParallelConfig,
-    ) -> Self {
+    pub fn new(registry: &'a Registry, recipe: &'a Recipe, env: TargetEnv) -> Self {
         Self {
             registry,
             recipe,
             env,
-            parallel,
             deterministic: true,
             caps: crate::memory::RuntimeCapabilities::default(),
         }
@@ -235,18 +259,20 @@ impl<'a> Compiler<'a> {
         self
     }
 
-    pub fn groups(&self) -> ProcessGroups {
-        ProcessGroups::new(self.parallel)
-    }
-
     pub fn compile(&self, plan: &Plan) -> Result<CompiledPlan, PlanError> {
         if plan.nodes.is_empty() {
             return Err(PlanError::EmptyPlan);
         }
         plan.check_structure()?;
 
-        let groups = self.groups();
-        let propagation = shard::propagate(plan, &groups)?;
+        // The mesh intrinsic attrs are checked against, resolved once here.
+        // (Propagation already revalidates the fingerprint for slot layouts.)
+        let mesh_fingerprint = plan.meta.mesh.clone();
+        let mesh = mesh_fingerprint
+            .to_mesh()
+            .map_err(|source| PlanError::Mesh { source })?;
+
+        let propagation = shard::propagate(plan)?;
         let plan = propagation.plan;
 
         // Pass 1: resolve everything first. The memory pass has to ask each
@@ -278,7 +304,7 @@ impl<'a> Compiler<'a> {
         for (i, node) in plan.nodes.iter().enumerate() {
             let id = NodeId(i);
             if intrinsic::is_intrinsic(&node.op.name) {
-                steps.push(self.compile_intrinsic(id, node)?);
+                steps.push(self.compile_intrinsic(id, node, &mesh)?);
                 continue;
             }
             let (op, rejections) = resolution[i]
@@ -311,13 +337,13 @@ impl<'a> Compiler<'a> {
             });
         }
 
-        let digest = compute_digest(&plan, &steps, self.recipe, &self.parallel)?;
+        let digest = compute_digest(&plan, &steps, self.recipe)?;
 
         Ok(CompiledPlan {
             plan,
             steps,
             digest,
-            parallel: self.parallel,
+            mesh: mesh_fingerprint,
             resolved,
             inserted: propagation.inserted,
             memory,
@@ -337,11 +363,7 @@ impl<'a> Compiler<'a> {
         plan: &Plan,
         node: &crate::ir::PlanNode,
     ) -> Result<(RegisteredOp, Vec<(String, String)>), PlanError> {
-        let dtypes: Vec<_> = node
-            .inputs
-            .iter()
-            .map(|s| plan.slot(*s).dtype)
-            .collect();
+        let dtypes: Vec<_> = node.inputs.iter().map(|s| plan.slot(*s).dtype).collect();
 
         // The variant that implements the *forward* direction of this node.
         let selection_phase = if node.phase == Phase::Backward {
@@ -459,10 +481,8 @@ impl<'a> Compiler<'a> {
             .collect();
 
         let in_ptrs: Vec<*const RsTensor> = in_tensors.iter().map(std::ptr::from_ref).collect();
-        let mut out_ptrs: Vec<*mut RsTensor> = out_tensors
-            .iter_mut()
-            .map(std::ptr::from_mut)
-            .collect();
+        let mut out_ptrs: Vec<*mut RsTensor> =
+            out_tensors.iter_mut().map(std::ptr::from_mut).collect();
 
         // SAFETY: pointers are into the vectors above, which outlive the call,
         // and the descriptors are plain data the implementation only reads
@@ -524,24 +544,43 @@ impl<'a> Compiler<'a> {
         &self,
         id: NodeId,
         node: &crate::ir::PlanNode,
+        mesh: &rustrain_parallel::Mesh,
     ) -> Result<CompiledStep, PlanError> {
         let op = node.op.name.clone();
         if !intrinsic::is_intrinsic(&op) {
             return Err(PlanError::UnknownIntrinsic { node: id, op });
         }
-        let group_str = node
-            .attrs
-            .str(intrinsic::ATTR_GROUP)
-            .ok_or_else(|| PlanError::IntrinsicMissingAttr {
-                op: op.clone(),
-                attr: intrinsic::ATTR_GROUP.to_string(),
-            })?;
-        let group =
-            intrinsic::parse_group(group_str).ok_or_else(|| PlanError::IntrinsicBadAttr {
-                op: op.clone(),
-                attr: intrinsic::ATTR_GROUP.to_string(),
-                value: group_str.to_string(),
-            })?;
+        // The group attribute is the mask's integer bits (decision 2): a mask
+        // has no name without the mesh, and a node attribute is not the place
+        // for one. The wrong type is reported as a bad attribute, never
+        // silently coerced.
+        let group_bits = match node.attrs.get(intrinsic::ATTR_GROUP) {
+            Some(AttrValue::I64(bits)) => *bits,
+            Some(other) => {
+                return Err(PlanError::IntrinsicBadAttr {
+                    op: op.clone(),
+                    attr: intrinsic::ATTR_GROUP.to_string(),
+                    value: format!("{other:?}"),
+                });
+            }
+            None => {
+                return Err(PlanError::IntrinsicMissingAttr {
+                    op: op.clone(),
+                    attr: intrinsic::ATTR_GROUP.to_string(),
+                });
+            }
+        };
+        let group = GroupMask::from_bits(group_bits as u32);
+        // Revalidate the mask against the mesh the plan was compiled for: the
+        // attribute is plan data, so a plan from another topology (or a
+        // hand-edited one) is reported here, never handed to the runtime.
+        if group.validate(mesh).is_err() {
+            return Err(PlanError::GroupUnavailable {
+                node: id,
+                op,
+                group,
+            });
+        }
 
         let reduce = match node.attrs.str(intrinsic::ATTR_REDUCE) {
             Some("sum") => Some(ReduceOp::Sum),
@@ -595,7 +634,6 @@ fn stream_of(p: StreamPolicy) -> StreamId {
     }
 }
 
-
 /// Builds a shape-only descriptor for inference: no data pointer, no backend.
 fn tensor_for(slot: &Slot) -> RsTensor {
     let mut t = RsTensor::new(slot.dtype, &slot.shape);
@@ -613,7 +651,6 @@ fn compute_digest(
     plan: &Plan,
     steps: &[CompiledStep],
     recipe: &Recipe,
-    parallel: &ParallelConfig,
 ) -> Result<String, PlanError> {
     #[derive(Serialize)]
     struct NumericsKey {
@@ -681,10 +718,9 @@ fn compute_digest(
             } => Decision {
                 node: i,
                 op: op.clone(),
-                implementation: format!(
-                    "intrinsic:{}:{reduce:?}:{dim:?}",
-                    intrinsic::group_name(*group)
-                ),
+                // The mask renders as its bits (`mask(0b1)`): deterministic,
+                // and distinct per group without needing the mesh's names.
+                implementation: format!("intrinsic:{group}:{reduce:?}:{dim:?}"),
                 numerics: None,
                 stream: *stream,
                 inputs: vec![input.0],
@@ -697,7 +733,6 @@ fn compute_digest(
     struct DigestInput<'a> {
         plan: &'a Plan,
         decisions: &'a [Decision],
-        parallel: &'a ParallelConfig,
     }
 
     // The recipe enters through the decisions it produced, not as text. Two
@@ -705,11 +740,14 @@ fn compute_digest(
     // the same run and must digest identically — otherwise a cosmetic recipe
     // edit would make two identical runs look different, which defeats the point
     // of recording the digest at all.
+    //
+    // The plan carries the mesh fingerprint and the mask-based layouts, so the
+    // preimage keeps both without any map iteration that could leak order into
+    // the bytes (the plan's attrs are a `BTreeMap`; layouts are vecs).
     let _ = recipe;
     let input = DigestInput {
         plan,
         decisions: &decisions,
-        parallel,
     };
     let json = serde_json::to_vec(&input).map_err(|e| PlanError::Digest(e.to_string()))?;
     Ok(blake3::hash(&json).to_hex().to_string())
@@ -718,4 +756,105 @@ fn compute_digest(
 /// The layout a slot ended up with, for diagnostics and tests.
 pub fn slot_layout(plan: &Plan, id: SlotId) -> &ParallelLayout {
     &plan.slot(id).layout
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ir::{OpRef, SlotKind};
+    use crate::{Attrs, PlanBuilder};
+    use rustrain_abi::ffi::RsDtype;
+    use rustrain_parallel::{Mesh, ParallelConfig};
+
+    fn default_mesh() -> Mesh {
+        Mesh::from_config(&ParallelConfig::default())
+    }
+
+    /// Compiles `plan` with an empty registry and recipe: the plans below
+    /// contain only intrinsics, which are compiled without a lookup.
+    fn compile_plan(plan: &Plan) -> CompiledPlan {
+        let registry = Registry::new();
+        let recipe = Recipe::default();
+        Compiler::new(&registry, &recipe, TargetEnv::default())
+            .compile(plan)
+            .unwrap()
+    }
+
+    /// One explicit `all_reduce` node whose group attribute carries the mask
+    /// as integer bits.
+    fn all_reduce_plan(mask: GroupMask) -> Plan {
+        let mut b = PlanBuilder::new("attr", Phase::Forward, default_mesh().fingerprint());
+        let x = b.slot("x", RsDtype::F32, vec![4], SlotKind::Activation);
+        let y = b.slot("y", RsDtype::F32, vec![4], SlotKind::Activation);
+        b.node(
+            OpRef::new(intrinsic::ALL_REDUCE),
+            vec![x],
+            vec![y],
+            // The write side, exactly as `shard::propagate` does it for
+            // inserted collectives (decision 2).
+            Attrs::new()
+                .set(intrinsic::ATTR_GROUP, mask.bits() as i64)
+                .set(intrinsic::ATTR_REDUCE, "sum"),
+            "redu",
+        );
+        b.build().unwrap()
+    }
+
+    /// The group attribute round-trips as an integer: written as
+    /// `GroupMask::bits() as i64`, read back as `GroupMask::from_bits` and
+    /// equal to the original mask (decision 2).
+    #[test]
+    fn group_attr_round_trips_as_integer() {
+        let mask = GroupMask::from_bits(0b101); // tp | ep: both axes exist
+        let plan = all_reduce_plan(mask);
+
+        let compiled = compile_plan(&plan);
+        let step = compiled
+            .steps
+            .iter()
+            .find(|s| matches!(s, CompiledStep::Intrinsic { .. }))
+            .expect("the plan has one intrinsic step");
+        match step {
+            CompiledStep::Intrinsic { group, reduce, .. } => {
+                assert_eq!(*group, mask);
+                assert_eq!(*reduce, Some(ReduceOp::Sum));
+            }
+            CompiledStep::Op { .. } => unreachable!("intrinsic-only plan"),
+        }
+    }
+
+    /// An out-of-range mask in the attribute is a *reported* error naming
+    /// node, op and mask — never a panic and never a silent truncation
+    /// (decision 2 / 3).
+    #[test]
+    fn out_of_range_group_attr_is_reported() {
+        let stray = GroupMask::from_bits(1 << 10); // bit 10: the mesh has 5 axes
+        let plan = all_reduce_plan(stray);
+
+        let registry = Registry::new();
+        let recipe = Recipe::default();
+        let err = Compiler::new(&registry, &recipe, TargetEnv::default())
+            .compile(&plan)
+            .unwrap_err();
+        match err {
+            PlanError::GroupUnavailable { node, op, group } => {
+                assert_eq!(node, NodeId(0));
+                assert_eq!(op, intrinsic::ALL_REDUCE);
+                assert_eq!(group, stray);
+            }
+            other => panic!("expected GroupUnavailable, got {other:?}"),
+        }
+    }
+
+    /// The digest is a deterministic function of the plan: compiling the same
+    /// plan twice yields the same bytes. The preimage keeps the mesh
+    /// fingerprint and the mask-based layouts (decision 8), and nothing in
+    /// the encoding iterates a hash map.
+    #[test]
+    fn digest_is_deterministic() {
+        let plan = all_reduce_plan(GroupMask::from_bits(0b1));
+        let a = compile_plan(&plan);
+        let b = compile_plan(&plan);
+        assert_eq!(a.digest, b.digest);
+    }
 }

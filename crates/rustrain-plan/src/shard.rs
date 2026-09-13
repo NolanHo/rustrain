@@ -10,12 +10,12 @@
 //! needs — splices in an intrinsic collective node and repoints the consumers.
 
 use rustrain_parallel::{
-    Collective, DimNormalizer, GroupKind, ParallelLayout, ProcessGroups, ReduceOp, transitions,
+    Collective, DimNormalizer, GroupMask, Mesh, ParallelLayout, ReduceOp, ShardSpec, transitions,
 };
 
+use crate::PlanError;
 use crate::attrs::Attrs;
 use crate::ir::{NodeId, OpRef, Plan, PlanNode, Slot, SlotId, SlotKind, Trace, intrinsic};
-use crate::PlanError;
 
 /// Why a sharding rule could not produce an answer.
 ///
@@ -26,7 +26,8 @@ use crate::PlanError;
 pub enum DeriveError {
     #[error(
         "cannot derive sharding for `{op}`: weight layout {layout} has no rule; \
-         expected replicate, shard(0) (column parallel) or shard(-1) (row parallel)"
+         expected replicate, a single shard on the output dim (1 / -1, column parallel) \
+         or a single shard on the contraction dim (0 / -2, row parallel)"
     )]
     UnsupportedWeightLayout { op: String, layout: String },
 }
@@ -71,9 +72,9 @@ pub enum ShardRule {
 pub fn rule_for(op: &str) -> ShardRule {
     match op {
         "elementwise_unary" | "elementwise_binary" | "compare" | "softmax" | "rmsnorm"
-        | "layernorm" | "rope" | "quantize" | "dequantize" | "amax_update" | "view"
-        | "reshape" | "transpose" | "narrow" | "cat" | "broadcast" | "gather" | "scatter"
-        | "embedding" | "cross_entropy" => ShardRule::Elementwise,
+        | "layernorm" | "rope" | "quantize" | "dequantize" | "amax_update" | "view" | "reshape"
+        | "transpose" | "narrow" | "cat" | "broadcast" | "gather" | "scatter" | "embedding"
+        | "cross_entropy" => ShardRule::Elementwise,
         "linear" => ShardRule::Linear,
         "matmul" | "bmm" => ShardRule::MatMul,
         _ => ShardRule::Declared,
@@ -101,47 +102,51 @@ pub fn derive(
         declared_inputs
             .first()
             .cloned()
-            .unwrap_or(ParallelLayout::Replicate)
+            .unwrap_or_else(ParallelLayout::replicate)
     };
 
     match rule {
         ShardRule::Elementwise => {
             let l = first();
             Ok(DerivedShards {
-                required_inputs: vec![l; declared_inputs.len()],
+                required_inputs: vec![l.clone(); declared_inputs.len()],
                 outputs: vec![l; declared_outputs.len()],
             })
         }
 
         ShardRule::Linear => {
-            // y = x @ w^T ; declared_inputs = [x, w]
+            // y = x @ w ; declared_inputs = [x, w], with w as [K, N]: the
+            // contraction last-but-one, the output features last.
             let x = first();
             let w = declared_inputs
                 .get(1)
                 .cloned()
-                .unwrap_or(ParallelLayout::Replicate);
-            let out = match w {
-                ParallelLayout::Replicate => x,
-                // Output features split across ranks (column parallel): each
-                // rank computes a complete slice of the result, so no
-                // collective is owed.
-                ParallelLayout::Shard { dim, group } if dim == 1 || dim == -1 => {
-                    ParallelLayout::Shard { dim: -1, group }
+                .unwrap_or_else(ParallelLayout::replicate);
+
+            let out = match (w.is_replicated(), w.dims.as_slice(), w.partial.as_ref()) {
+                // An unsharded weight: the output keeps whatever layout the
+                // activation has.
+                (true, _, _) => x.clone(),
+                // Weight sharded on its output dim (1 / -1 against the
+                // weight's rank) as a *single* spec: output features split
+                // across ranks (column parallel), no collective owed.
+                (false, [ShardSpec { dim, group }], None) if *dim == 1 || *dim == -1 => {
+                    ParallelLayout::shard(-1, *group)
                 }
-                // Contraction split across ranks (row parallel): every rank
-                // holds a partial sum. This is the case that forces an
-                // all-reduce downstream — the classic Megatron pattern the old
-                // code hand-wrote as a detach trick.
-                ParallelLayout::Shard { dim, group } if dim == 0 || dim == -2 => {
-                    ParallelLayout::Partial {
-                        op: ReduceOp::Sum,
-                        group,
-                    }
+                // Contraction split across ranks (row parallel) as a single
+                // spec: every rank holds a partial sum, which forces the
+                // all-reduce downstream.
+                (false, [ShardSpec { dim, group }], None) if *dim == 0 || *dim == -2 => {
+                    ParallelLayout::partial(ReduceOp::Sum, *group)
                 }
-                other => {
+                // Anything else — two shards on the weight, an existing
+                // partial, a partial weight — has no rule in the table, and
+                // guessing here would silently pick a distribution nobody
+                // declared. Refuse and name the layout.
+                _ => {
                     return Err(DeriveError::UnsupportedWeightLayout {
                         op: op.to_string(),
-                        layout: format!("{other}"),
+                        layout: format!("{w}"),
                     });
                 }
             };
@@ -152,33 +157,25 @@ pub fn derive(
         }
 
         ShardRule::MatMul => {
-            // a @ b ; contraction on a.dim(-1) and b.dim(-2)
+            // a @ b ; contraction on a.dim(-1) and b.dim(-2).
             let a = first();
             let b = declared_inputs
                 .get(1)
                 .cloned()
-                .unwrap_or(ParallelLayout::Replicate);
+                .unwrap_or_else(ParallelLayout::replicate);
 
-            let out = match (&a, &b) {
-                (ParallelLayout::Shard { dim: -1, group }, _) => ParallelLayout::Partial {
-                    op: ReduceOp::Sum,
-                    group: *group,
-                },
-                (_, ParallelLayout::Shard { dim: -2, group }) => ParallelLayout::Partial {
-                    op: ReduceOp::Sum,
-                    group: *group,
-                },
-                (_, ParallelLayout::Shard { dim: -1, group }) => ParallelLayout::Shard {
-                    dim: -1,
-                    group: *group,
-                },
-                (ParallelLayout::Shard { dim, group }, _) => ParallelLayout::Shard {
-                    dim: *dim,
-                    group: *group,
-                },
-                _ => ParallelLayout::Replicate,
+            let out = match (single_shard(&a), single_shard(&b)) {
+                // The contraction is split: every rank holds a partial sum.
+                (Some(sa), _) if sa.dim == -1 => ParallelLayout::partial(ReduceOp::Sum, sa.group),
+                (_, Some(sb)) if sb.dim == -2 => ParallelLayout::partial(ReduceOp::Sum, sb.group),
+                // b's output dim is split: the result inherits that shard.
+                (_, Some(sb)) if sb.dim == -1 => ParallelLayout::shard(-1, sb.group),
+                // Any other single shard propagates to the output.
+                (Some(sa), _) => ParallelLayout::shard(sa.dim, sa.group),
+                // Anything multi-shard or partial: no rule, so no
+                // distribution is invented (as before the mask vocabulary).
+                _ => ParallelLayout::replicate(),
             };
-            let _ = op;
             Ok(DerivedShards {
                 required_inputs: vec![a, b],
                 outputs: vec![out; declared_outputs.len()],
@@ -192,13 +189,22 @@ pub fn derive(
     }
 }
 
+/// The single shard of a layout, when it has exactly one shard and no
+/// partial — the only shape the rule table reasons about.
+fn single_shard(l: &ParallelLayout) -> Option<ShardSpec> {
+    match (l.dims.as_slice(), l.partial.as_ref()) {
+        ([spec], None) => Some(*spec),
+        _ => None,
+    }
+}
+
 /// One spliced-in collective, reported so `plan explain` and the tests can show
 /// what the compiler decided and why.
 #[derive(Clone, Debug, PartialEq)]
 pub struct InsertedCollective {
     pub reason: String,
     pub op: &'static str,
-    pub group: GroupKind,
+    pub group: GroupMask,
     pub reduce: Option<ReduceOp>,
     pub dim: Option<i64>,
     pub source: String,
@@ -214,7 +220,7 @@ pub struct ShardPropagation {
 }
 
 /// Maps a layout transition to the intrinsic operator that performs it.
-fn intrinsic_for(c: &Collective) -> (&'static str, GroupKind, Option<ReduceOp>, Option<i64>) {
+fn intrinsic_for(c: &Collective) -> (&'static str, GroupMask, Option<ReduceOp>, Option<i64>) {
     match c {
         Collective::AllReduce { group, op } => (intrinsic::ALL_REDUCE, *group, Some(*op), None),
         Collective::AllGather { group, dim } => (intrinsic::ALL_GATHER, *group, None, Some(*dim)),
@@ -225,15 +231,88 @@ fn intrinsic_for(c: &Collective) -> (&'static str, GroupKind, Option<ReduceOp>, 
     }
 }
 
+/// Validates every slot's declared layout against the mesh and the tensor's
+/// rank: each shard dim must exist on the tensor, and every mask — the
+/// shards' and the partial's — must address axes of the mesh. A mask over
+/// axes whose degrees are all 1 is a legal size-1 group, never an error.
+///
+/// Reported up front, before the walk, so a broken declaration cannot flow
+/// into a derived layout and be smuggled into an inserted collective. Each
+/// failure is attributed to the node that owns the layout: the producer of
+/// the slot, or — for a plan input such as a weight — its first consumer.
+fn validate_layouts(plan: &Plan, mesh: &Mesh) -> Result<(), PlanError> {
+    let producer_of = plan.producers();
+    let mut first_consumer_of: Vec<Option<usize>> = vec![None; plan.slots.len()];
+    for (i, node) in plan.nodes.iter().enumerate() {
+        for input in &node.inputs {
+            first_consumer_of[input.0].get_or_insert(i);
+        }
+    }
+
+    for (idx, slot) in plan.slots.iter().enumerate() {
+        // A slot no node ever touches is inert: its layout participates in
+        // nothing that runs, and there is no node to blame it on.
+        let owner = producer_of[idx].map(|p| p.0).or(first_consumer_of[idx]);
+        let Some(owner) = owner else { continue };
+        let node = NodeId(owner);
+        let op = plan.nodes[owner].op.name.clone();
+
+        let norm = DimNormalizer::new(slot.shape.len() as i64)
+            .map_err(|source| PlanError::Shard { node, source })?;
+        for spec in &slot.layout.dims {
+            norm.normalize(spec.dim)
+                .map_err(|source| PlanError::Shard { node, source })?;
+            if spec.group.validate(mesh).is_err() {
+                return Err(PlanError::GroupUnavailable {
+                    node,
+                    op,
+                    group: spec.group,
+                });
+            }
+        }
+        if let Some(partial) = &slot.layout.partial
+            && partial.group.validate(mesh).is_err()
+        {
+            return Err(PlanError::GroupUnavailable {
+                node,
+                op,
+                group: partial.group,
+            });
+        }
+    }
+    Ok(())
+}
+
 /// Runs the propagation pass over a plan.
+///
+/// The mesh comes from the plan itself (`plan.meta.mesh`, design §1.3): the
+/// plan carries the fingerprint, and this is where it is resolved and where
+/// every layout's masks are checked against it. A mask bit outside the mesh
+/// is [`PlanError::GroupUnavailable`]; a mask over axes whose degrees are all
+/// 1 is a legal size-1 group and is never an error.
 ///
 /// Only conversions the framework can express as a single collective are
 /// inserted. If two consumers of the same slot demand different layouts, that is
 /// reported rather than silently resolved — the scaffold deliberately does not
 /// insert fan-out conversions, because doing so is a scheduling decision with
 /// real cost and it should be visible in the source plan.
-pub fn propagate(plan: &Plan, groups: &ProcessGroups) -> Result<ShardPropagation, PlanError> {
-    let _ = groups;
+pub fn propagate(plan: &Plan) -> Result<ShardPropagation, PlanError> {
+    // The mask vocabulary is only meaningful next to the mesh that produced
+    // it, and a plan stores the fingerprint, not the mesh (invariant I-6):
+    // resolve it here, and let a fingerprint that does not describe a valid
+    // mesh be reported rather than guessed at.
+    let mesh = plan
+        .meta
+        .mesh
+        .to_mesh()
+        .map_err(|source| PlanError::Mesh { source })?;
+    validate_layouts(plan, &mesh)?;
+
+    // Layouts are rendered through the mesh wherever a human reads them: a mask is bit positions,
+    // and `tp` is what the reader is thinking in (design §1.2). `ParallelLayout`'s `Display` (the
+    // bit form) stays for the places that have no mesh in hand.
+    let show = |layout: &ParallelLayout| layout.describe(&mesh);
+
     let mut out = plan.clone();
     let mut inserted: Vec<InsertedCollective> = Vec::new();
 
@@ -241,8 +320,7 @@ pub fn propagate(plan: &Plan, groups: &ProcessGroups) -> Result<ShardPropagation
     // The layout a slot *actually* holds at this point in the walk. It starts as
     // the declared layout and is replaced whenever a producer turns out to
     // deliver something else, or a consumer forces a conversion.
-    let mut effective: Vec<ParallelLayout> =
-        plan.slots.iter().map(|s| s.layout).collect();
+    let mut effective: Vec<ParallelLayout> = plan.slots.iter().map(|s| s.layout.clone()).collect();
     let mut claimed: Vec<bool> = vec![false; n_slots];
     let mut producer_of: Vec<Option<usize>> = vec![None; n_slots];
     for (i, n) in plan.nodes.iter().enumerate() {
@@ -272,12 +350,11 @@ pub fn propagate(plan: &Plan, groups: &ProcessGroups) -> Result<ShardPropagation
         // Feed the rule what the operands actually hold, not what the plan
         // promised. Using the declared layouts here was the bug that made a
         // partial sum never trigger an all-reduce.
-        let eff_in: Vec<ParallelLayout> =
-            n.inputs.iter().map(|s| effective[s.0]).collect();
+        let eff_in: Vec<ParallelLayout> = n.inputs.iter().map(|s| effective[s.0].clone()).collect();
         let declared_out: Vec<ParallelLayout> = n
             .outputs
             .iter()
-            .map(|s| plan.slot(*s).layout)
+            .map(|s| plan.slot(*s).layout.clone())
             .collect();
 
         let derived = derive(rule, &n.op.name, &eff_in, &declared_out)
@@ -288,7 +365,7 @@ pub fn propagate(plan: &Plan, groups: &ProcessGroups) -> Result<ShardPropagation
             let Some(need) = derived.required_inputs.get(k).cloned() else {
                 continue;
             };
-            let held = effective[inp.0];
+            let held = effective[inp.0].clone();
             if need == held {
                 continue;
             }
@@ -297,7 +374,7 @@ pub fn propagate(plan: &Plan, groups: &ProcessGroups) -> Result<ShardPropagation
                     node: id,
                     slot: *inp,
                     index: k,
-                    needed: format!("{need}"),
+                    needed: show(&need),
                     held: format!("{held} (a conversion for this slot was already decided)"),
                 });
             }
@@ -305,21 +382,28 @@ pub fn propagate(plan: &Plan, groups: &ProcessGroups) -> Result<ShardPropagation
                 node: id,
                 slot: *inp,
                 index: k,
-                needed: format!("{need}"),
-                held: format!("{held} (on a model input, which no node can convert)"),
+                needed: show(&need),
+                held: format!(
+                    "{} (on a model input, which no node can convert)",
+                    show(&held)
+                ),
             })?;
+            let reason = format!(
+                "node {i} ({}) input {k} needs {} but slot {} holds {}",
+                n.op.name,
+                show(&need),
+                inp.0,
+                show(&held)
+            );
+            claimed[inp.0] = true;
+            effective[inp.0] = need.clone();
             pending.push(Pending {
                 slot: *inp,
                 from: held,
                 to: need,
                 producer: NodeId(producer),
-                reason: format!(
-                    "node {i} ({}) input {k} needs {need} but slot {} holds {held}",
-                    n.op.name, inp.0
-                ),
+                reason,
             });
-            claimed[inp.0] = true;
-            effective[inp.0] = need;
         }
 
         // Output side: a producer must deliver the layout its slot promises.
@@ -328,8 +412,8 @@ pub fn propagate(plan: &Plan, groups: &ProcessGroups) -> Result<ShardPropagation
                 .outputs
                 .get(j)
                 .cloned()
-                .unwrap_or(ParallelLayout::Replicate);
-            let promised = declared_out[j];
+                .unwrap_or_else(ParallelLayout::replicate);
+            let promised = declared_out[j].clone();
             if produced == promised {
                 effective[o.0] = produced;
                 continue;
@@ -339,22 +423,29 @@ pub fn propagate(plan: &Plan, groups: &ProcessGroups) -> Result<ShardPropagation
                     node: id,
                     slot: *o,
                     index: j,
-                    needed: format!("{promised}"),
-                    held: format!("{produced} (a conversion for this slot was already decided)"),
+                    needed: show(&promised),
+                    held: format!(
+                        "{} (a conversion for this slot was already decided)",
+                        show(&produced)
+                    ),
                 });
             }
+            let reason = format!(
+                "node {i} ({}) produces {} on slot {} but the plan declared {}",
+                n.op.name,
+                show(&produced),
+                o.0,
+                show(&promised)
+            );
+            claimed[o.0] = true;
+            effective[o.0] = promised.clone();
             pending.push(Pending {
                 slot: *o,
                 from: produced,
                 to: promised,
                 producer: id,
-                reason: format!(
-                    "node {i} ({}) produces {produced} on slot {} but the plan declared {promised}",
-                    n.op.name, o.0
-                ),
+                reason,
             });
-            claimed[o.0] = true;
-            effective[o.0] = promised;
         }
     }
 
@@ -418,7 +509,10 @@ pub fn propagate(plan: &Plan, groups: &ProcessGroups) -> Result<ShardPropagation
         converted.name = format!("{}__{}", converted.name, op);
         converted.layout = c.to;
 
-        let mut attrs = Attrs::new().set(intrinsic::ATTR_GROUP, intrinsic::group_name(group));
+        // The group travels as the mask's integer bits (decision 2): a mask
+        // has no name without the mesh, and a node attribute is not the place
+        // for one. The compiler reads the bits back and revalidates them.
+        let mut attrs = Attrs::new().set(intrinsic::ATTR_GROUP, group.bits() as i64);
         if let Some(r) = reduce {
             attrs.insert(
                 intrinsic::ATTR_REDUCE,
@@ -455,7 +549,10 @@ pub fn propagate(plan: &Plan, groups: &ProcessGroups) -> Result<ShardPropagation
             precision: Default::default(),
             checkpoint: Default::default(),
             stream: Default::default(),
-            source: Trace::inserted(plan.nodes[c.producer.0].source.path.clone(), "shard-propagation"),
+            source: Trace::inserted(
+                plan.nodes[c.producer.0].source.path.clone(),
+                "shard-propagation",
+            ),
         };
         out.nodes.push(node);
     }
@@ -477,7 +574,10 @@ pub fn propagate(plan: &Plan, groups: &ProcessGroups) -> Result<ShardPropagation
     out = reorder_topologically(&out)?;
 
     let _ = &inserted;
-    Ok(ShardPropagation { plan: out, inserted })
+    Ok(ShardPropagation {
+        plan: out,
+        inserted,
+    })
 }
 
 /// Emits nodes so that every node follows the producers of its inputs.
@@ -552,15 +652,21 @@ pub fn is_distributable(slot: &Slot) -> bool {
 mod tests {
     use super::*;
     use crate::PlanBuilder;
-    use rustrain_ops::Phase;
     use rustrain_abi::ffi::RsDtype;
-    use rustrain_parallel::ParallelConfig;
+    use rustrain_ops::Phase;
+    use rustrain_parallel::{Mesh, ParallelConfig, PartialSpec};
 
-    fn groups() -> ProcessGroups {
-        ProcessGroups::new(ParallelConfig {
+    /// The canonical five axes with `tp = 2`; `tp` is the first axis of
+    /// [`Mesh::from_config`], so its mask is bit 0.
+    fn tp_mesh() -> Mesh {
+        Mesh::from_config(&ParallelConfig {
             tensor: 2,
             ..Default::default()
         })
+    }
+
+    fn tp_mask() -> GroupMask {
+        GroupMask::single(0).expect("bit 0 always fits")
     }
 
     /// `w` is `[K, N]`; sharding the output dim (1 / -1) is column parallel and
@@ -572,21 +678,15 @@ mod tests {
                 ShardRule::Linear,
                 "linear",
                 &[
-                    ParallelLayout::Replicate,
-                    ParallelLayout::Shard {
-                        dim,
-                        group: GroupKind::Tp,
-                    },
+                    ParallelLayout::replicate(),
+                    ParallelLayout::shard(dim, tp_mask()),
                 ],
-                &[ParallelLayout::Replicate],
+                &[ParallelLayout::replicate()],
             )
             .unwrap();
             assert_eq!(
                 d.outputs[0],
-                ParallelLayout::Shard {
-                    dim: -1,
-                    group: GroupKind::Tp
-                },
+                ParallelLayout::shard(-1, tp_mask()),
                 "sharding the weight's output dim {dim} must stay column parallel"
             );
         }
@@ -600,23 +700,66 @@ mod tests {
                 ShardRule::Linear,
                 "linear",
                 &[
-                    ParallelLayout::Replicate,
-                    ParallelLayout::Shard {
-                        dim,
-                        group: GroupKind::Tp,
-                    },
+                    ParallelLayout::replicate(),
+                    ParallelLayout::shard(dim, tp_mask()),
                 ],
-                &[ParallelLayout::Replicate],
+                &[ParallelLayout::replicate()],
             )
             .unwrap();
             assert_eq!(
                 d.outputs[0],
-                ParallelLayout::Partial {
-                    op: ReduceOp::Sum,
-                    group: GroupKind::Tp
-                },
+                ParallelLayout::partial(ReduceOp::Sum, tp_mask()),
                 "sharding the weight's contraction dim {dim} must produce a partial sum"
             );
+        }
+    }
+
+    /// Decision 6: a weight with several shards — or any partial — has no rule
+    /// in the table. Guessing (pick one shard? fold the groups?) would silently
+    /// choose distribution semantics nobody declared, so the honest answer is a
+    /// refusal that names the layout. This pins the refusal; if a real model
+    /// needs such a weight, the rule table grows a case and this test moves
+    /// with it.
+    #[test]
+    fn multi_shard_or_partial_weight_layout_is_refused() {
+        let g = tp_mask();
+        let weights = [
+            // Two independent shards: no single collective turns this into a
+            // `Partial` or a single `Shard`.
+            ParallelLayout {
+                dims: vec![
+                    ShardSpec { dim: 0, group: g },
+                    ShardSpec { dim: 1, group: g },
+                ],
+                partial: None,
+            },
+            // A partial weight is not a shard at all.
+            ParallelLayout::partial(ReduceOp::Sum, g),
+            // One shard plus a partial: two facts, no rule.
+            ParallelLayout {
+                dims: vec![ShardSpec { dim: 0, group: g }],
+                partial: Some(PartialSpec {
+                    op: ReduceOp::Sum,
+                    group: g,
+                }),
+            },
+        ];
+        for weight in weights {
+            let err = derive(
+                ShardRule::Linear,
+                "linear",
+                &[ParallelLayout::replicate(), weight],
+                &[ParallelLayout::replicate()],
+            )
+            .unwrap_err();
+            match err {
+                DeriveError::UnsupportedWeightLayout { ref layout, .. } => {
+                    assert!(
+                        layout.contains("shard") || layout.contains("partial"),
+                        "the refusal must name the layout: {layout}"
+                    );
+                }
+            }
         }
     }
 
@@ -625,14 +768,7 @@ mod tests {
     /// the plan (contract S-2).
     #[test]
     fn row_parallel_linear_inserts_all_reduce() {
-        let mut b = PlanBuilder::new(
-            "tp",
-            Phase::Forward,
-            ParallelConfig {
-                tensor: 2,
-                ..Default::default()
-            },
-        );
+        let mut b = PlanBuilder::new("tp", Phase::Forward, tp_mesh().fingerprint());
         let x = b.slot("x", RsDtype::F32, vec![4, 8], SlotKind::Activation);
         let w = b.slot_with_layout(
             "w",
@@ -640,10 +776,7 @@ mod tests {
             vec![8, 8],
             SlotKind::Weight,
             // Contraction dim => every rank holds a partial sum.
-            ParallelLayout::Shard {
-                dim: 0,
-                group: GroupKind::Tp,
-            },
+            ParallelLayout::shard(0, tp_mask()),
         );
         let y = b.slot("y", RsDtype::F32, vec![4, 8], SlotKind::Activation);
         let z = b.slot("z", RsDtype::F32, vec![4, 8], SlotKind::Activation);
@@ -663,11 +796,11 @@ mod tests {
         );
         let plan = b.build().unwrap();
 
-        let prop = propagate(&plan, &groups()).unwrap();
+        let prop = propagate(&plan).unwrap();
         assert_eq!(prop.inserted.len(), 1, "expected exactly one all-reduce");
         let ins = &prop.inserted[0];
         assert_eq!(ins.op, intrinsic::ALL_REDUCE);
-        assert_eq!(ins.group, GroupKind::Tp);
+        assert_eq!(ins.group, tp_mask());
         assert_eq!(ins.reduce, Some(ReduceOp::Sum));
         assert!(
             ins.reason.contains("partial") && ins.reason.contains("declared"),
@@ -683,37 +816,51 @@ mod tests {
             .find(|n| n.op.name == "elementwise_unary")
             .unwrap();
         assert_eq!(act.inputs[0], ins.produced_slot);
-        assert_eq!(prop.plan.slot(ins.produced_slot).layout, ParallelLayout::Replicate);
+        assert_eq!(
+            prop.plan.slot(ins.produced_slot).layout,
+            ParallelLayout::replicate()
+        );
     }
 
-    /// Two consumers of a partial sum, each declaring a different result
-    /// layout: the compiler materialises the conversion once, and both
-    /// consumers read the converted slot. Nothing is guessed silently — the
-    /// collective appears in the plan and in `inserted`.
     /// A declared layout the producer cannot deliver by any collective is a
     /// contradiction, not a thing to paper over with a view nobody inserted.
     #[test]
     fn a_view_only_conversion_is_refused() {
-        let mut b = PlanBuilder::new("views", Phase::Forward, ParallelConfig::default());
+        let mut b = PlanBuilder::new(
+            "views",
+            Phase::Forward,
+            Mesh::from_config(&ParallelConfig::default()).fingerprint(),
+        );
         let x = b.slot("x", RsDtype::F32, vec![4, 8], SlotKind::Activation);
-        // Produces Replicate...
+        // Produces a replicate layout...
         let r = b.slot("r", RsDtype::F32, vec![4, 8], SlotKind::Activation);
-        // ...but the consumer's slot claims to be sharded.
+        // ...but the consumer's slot claims to be sharded. The mesh's tp
+        // degree is 1, which is a legal size-1 group — the refusal below is
+        // about the missing view, not about the mask.
         let s = b.slot_with_layout(
             "s",
             RsDtype::F32,
             vec![4, 8],
             SlotKind::Activation,
-            ParallelLayout::Shard {
-                dim: -1,
-                group: GroupKind::Tp,
-            },
+            ParallelLayout::shard(-1, tp_mask()),
         );
-        b.node(OpRef::new("elementwise_unary"), vec![x], vec![r], Attrs::new(), "a");
-        b.node(OpRef::new("elementwise_unary"), vec![r], vec![s], Attrs::new(), "b");
+        b.node(
+            OpRef::new("elementwise_unary"),
+            vec![x],
+            vec![r],
+            Attrs::new(),
+            "a",
+        );
+        b.node(
+            OpRef::new("elementwise_unary"),
+            vec![r],
+            vec![s],
+            Attrs::new(),
+            "b",
+        );
         let plan = b.build().unwrap();
 
-        let err = propagate(&plan, &groups()).unwrap_err();
+        let err = propagate(&plan).unwrap_err();
         match err {
             PlanError::LayoutConflict { held, .. } => {
                 assert!(
@@ -727,7 +874,7 @@ mod tests {
 
     #[test]
     fn each_consumer_reads_the_converted_slot() {
-        let mut b = PlanBuilder::new("conflict", Phase::Forward, ParallelConfig::default());
+        let mut b = PlanBuilder::new("conflict", Phase::Forward, tp_mesh().fingerprint());
         let x = b.slot("x", RsDtype::F32, vec![4, 8], SlotKind::Activation);
         let w = b.slot_with_layout(
             "w",
@@ -736,16 +883,19 @@ mod tests {
             SlotKind::Weight,
             // `w` is [K, N]; sharding dim 0 splits the contraction, so every
             // rank ends up with a partial sum that has to be reduced.
-            ParallelLayout::Shard {
-                dim: 0,
-                group: GroupKind::Tp,
-            },
+            ParallelLayout::shard(0, tp_mask()),
         );
         // The linear produces Partial(Sum, tp).
         let p = b.slot("p", RsDtype::F32, vec![4, 8], SlotKind::Activation);
         let r = b.slot("r", RsDtype::F32, vec![4, 8], SlotKind::Activation);
         let s = b.slot("s", RsDtype::F32, vec![4, 8], SlotKind::Activation);
-        b.node(OpRef::new("linear"), vec![x, w], vec![p], Attrs::new(), "lin");
+        b.node(
+            OpRef::new("linear"),
+            vec![x, w],
+            vec![p],
+            Attrs::new(),
+            "lin",
+        );
         b.node(
             OpRef::new("elementwise_unary"),
             vec![p],
@@ -762,7 +912,7 @@ mod tests {
         );
         let plan = b.build().unwrap();
 
-        let prop = propagate(&plan, &groups()).unwrap();
+        let prop = propagate(&plan).unwrap();
         assert_eq!(prop.inserted.len(), 1, "one conversion, materialised once");
         let ins = &prop.inserted[0];
         assert_eq!(ins.op, intrinsic::ALL_REDUCE);
@@ -781,5 +931,84 @@ mod tests {
             );
         }
         prop.plan.check_structure().unwrap();
+    }
+
+    /// Decision 3: a mask bit outside the mesh is a reported error —
+    /// `GroupUnavailable` naming the node whose layout is unusable, the
+    /// operator, and the mask — never a panic and never a silent drop.
+    #[test]
+    fn group_outside_the_mesh_is_reported() {
+        // A one-axis mesh: only bit 0 (tp) exists.
+        let mesh = Mesh::new(vec![("tp".to_string(), 2)]).unwrap();
+        let stray = GroupMask::from_bits(0b100); // bit 2: axis 2 does not exist
+
+        let mut b = PlanBuilder::new("stray", Phase::Forward, mesh.fingerprint());
+        let x = b.slot("x", RsDtype::F32, vec![4, 8], SlotKind::Activation);
+        let w = b.slot_with_layout(
+            "w",
+            RsDtype::F32,
+            vec![8, 8],
+            SlotKind::Weight,
+            ParallelLayout::shard(0, stray),
+        );
+        let y = b.slot("y", RsDtype::F32, vec![4, 8], SlotKind::Activation);
+        b.node(
+            OpRef::new("linear"),
+            vec![x, w],
+            vec![y],
+            Attrs::new(),
+            "layer0.linear",
+        );
+        let plan = b.build().unwrap();
+
+        let err = propagate(&plan).unwrap_err();
+        match err {
+            PlanError::GroupUnavailable { node, op, group } => {
+                assert_eq!(
+                    node,
+                    NodeId(0),
+                    "the consuming node owns the weight's layout"
+                );
+                assert_eq!(op, "linear");
+                assert_eq!(group, stray);
+            }
+            other => panic!("expected GroupUnavailable, got {other:?}"),
+        }
+    }
+
+    /// A mask over axes whose degrees are all 1 is a legal size-1 group — the
+    /// no-op case, never an error (decision 3). `propagate` must accept it and
+    /// still insert the conversion the layouts ask for.
+    #[test]
+    fn mask_over_degree_one_axes_is_legal() {
+        let mut b = PlanBuilder::new(
+            "deg1",
+            Phase::Forward,
+            Mesh::from_config(&ParallelConfig::default()).fingerprint(),
+        );
+        let x = b.slot("x", RsDtype::F32, vec![4, 8], SlotKind::Activation);
+        let w = b.slot_with_layout(
+            "w",
+            RsDtype::F32,
+            vec![8, 8],
+            SlotKind::Weight,
+            ParallelLayout::shard(0, tp_mask()),
+        );
+        let y = b.slot("y", RsDtype::F32, vec![4, 8], SlotKind::Activation);
+        b.node(
+            OpRef::new("linear"),
+            vec![x, w],
+            vec![y],
+            Attrs::new(),
+            "lin",
+        );
+        let plan = b.build().unwrap();
+
+        // tp has degree 1, so the mask names a size-1 group: the row-parallel
+        // partial still collapses through an all-reduce (over that size-1
+        // group) rather than being rejected.
+        let prop = propagate(&plan).unwrap();
+        assert_eq!(prop.inserted.len(), 1);
+        assert_eq!(prop.inserted[0].op, intrinsic::ALL_REDUCE);
     }
 }

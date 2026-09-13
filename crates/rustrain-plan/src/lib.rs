@@ -29,7 +29,7 @@ pub use memory::{
     Lifetime, MemoryPlan, Placement, PolicyDecision, RuntimeCapabilities, SlotAllocation,
 };
 
-use rustrain_parallel::{GroupKind, ShardError};
+use rustrain_parallel::{GroupMask, ParallelError, ShardError};
 
 /// Everything that can make a plan invalid or unresolvable.
 ///
@@ -98,7 +98,9 @@ pub enum PlanError {
     #[error("node {node:?} ({op}) has no shape inference, so the plan cannot be validated")]
     InferMissing { node: NodeId, op: String },
 
-    #[error("node {node:?} ({op}) inferred output {index} shape {inferred:?} but slot {slot:?} declares {declared:?}")]
+    #[error(
+        "node {node:?} ({op}) inferred output {index} shape {inferred:?} but slot {slot:?} declares {declared:?}"
+    )]
     InferredShapeMismatch {
         node: NodeId,
         op: String,
@@ -151,12 +153,19 @@ pub enum PlanError {
     },
 
     #[error(
-        "node {node:?} ({op}) requires group {group:?} but the parallel topology does not provide it"
+        "node {node:?} ({op}) uses group {group}, which the plan's mesh does not provide: \
+         a mask bit addresses an axis the mesh does not have"
     )]
     GroupUnavailable {
         node: NodeId,
         op: String,
-        group: GroupKind,
+        group: GroupMask,
+    },
+
+    #[error("the plan's mesh fingerprint does not describe a valid mesh: {source}")]
+    Mesh {
+        #[source]
+        source: ParallelError,
     },
 
     #[error("plan digest computation failed: {0}")]
