@@ -1470,17 +1470,26 @@ fn rope_exec_body(c: &mut Call, a: &RsAttrs) -> OpResult<()> {
     let ys = yv.as_slice().expect("contiguous");
     let o0 = out0.as_slice_mut().expect("contiguous");
     let o1 = out1.as_slice_mut().expect("contiguous");
-    let batches: usize = xs.len() / (s * d);
+    // Rows per position: everything between the position axis and the last one.
+    // The position is the FIRST axis, so row `t * rows + b` of the flattened
+    // buffer belongs to position `t` — the sequence is the *outer* index. The
+    // pre-D5 loop indexed `(b * s + t)`, which puts the position on the middle
+    // axis of a `[seq, heads, head_dim]` tensor: for `[512, 16, 256]` it rotated
+    // a scrambled mix of positions and heads, the q/k fed to attention were
+    // turned by the wrong angles, and every full-attention layer inherited it.
+    // The rank-2 case (`rows == 1`) is the one the conformance case covers and
+    // the reason the gate never saw this.
+    let rows: usize = xs.len() / (s * d);
     // Half-split rotation over the first `rotary` dims of the last axis
     // (HF rotate_half: pairs (i, i+h) with h = rotary/2), pass-through for
     // the remaining dims. Deterministic ascending loops.
-    for b in 0..batches {
-        for t in 0..s {
+    for t in 0..s {
+        for b in 0..rows {
+            let base = (t * rows + b) * d;
             for j in 0..h {
                 let c = cos[t * h + j];
                 let sn = sin[t * h + j];
                 let i = j; // the first half of the rotary block
-                let base = (b * s + t) * d;
                 let (x_a, x_b) = (xs[base + i], xs[base + i + h]);
                 o0[base + i] = x_a * c - x_b * sn;
                 o0[base + i + h] = x_b * c + x_a * sn;
@@ -1488,7 +1497,6 @@ fn rope_exec_body(c: &mut Call, a: &RsAttrs) -> OpResult<()> {
                 o1[base + i] = y_a * c - y_b * sn;
                 o1[base + i + h] = y_b * c + y_a * sn;
             }
-            let base = (b * s + t) * d;
             o0[base + rotary..base + d].copy_from_slice(&xs[base + rotary..base + d]);
             o1[base + rotary..base + d].copy_from_slice(&ys[base + rotary..base + d]);
         }

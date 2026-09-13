@@ -813,6 +813,68 @@ fn reshape_materialises_a_strided_view_in_logical_order() {
     assert_eq!(o.fdata(), &[1.0, 2.0, 5.0, 6.0]);
 }
 
+/// Rope's positions live on the FIRST axis, so a `[seq, heads, head_dim]` input
+/// must turn each head of a position with that position's angle.
+///
+/// The pre-D5 loop indexed `(batch * seq + position)`, which puts the position on
+/// the *middle* axis: for the plan's `[512, 16, 256]` q/k it rotated a scrambled
+/// mix of positions and heads, and every full-attention layer inherited the wrong
+/// angles. The conformance case is rank-2 (`R = 1`), where the two index orders
+/// agree — which is why the gate never saw it.
+#[test]
+fn rope_uses_the_position_of_the_first_axis_for_every_head() {
+    let theta = 1e7f64;
+    let (s, heads, d, rotary) = (3usize, 2usize, 4usize, 4usize);
+    let mut data = vec![0.0f32; s * heads * d];
+    data[heads * d] = 1.0; // [seq = 1, head = 0, dim = 0]
+    let x = Owned::f32(&[s as i64, heads as i64, d as i64], data);
+    let outs = unsafe {
+        run_op(
+            op("rope"),
+            &[&x.t, &x.t],
+            &[ai64("rotary_dim", rotary as i64)],
+            2,
+        )
+    }
+    .unwrap();
+    let o = &outs[0];
+    // Row `t * heads + head` of the flattened buffer carries position `t`, so
+    // [seq = 1, head = 0] is row 2 and its first element sits at 2 * d. Only
+    // dim 0 is non-zero, so the pair it rotates with (dim h) is the only other
+    // element that moves.
+    let base = heads * d; // row (seq=1, head=0)
+    let h = rotary / 2;
+    let angle = 1.0 * (theta as f32).powf(0.0) as f64; // j = 0: inv_freq = theta^0 = 1
+    let (want_cos, want_sin) = (angle.cos() as f32, angle.sin() as f32);
+    assert!(
+        (o.fdata()[base] - want_cos).abs() < 1e-6,
+        "dim 0 rotated by {} but position 1's cos is {want_cos}",
+        o.fdata()[base]
+    );
+    assert!(
+        (o.fdata()[base + h] - want_sin).abs() < 1e-6,
+        "dim h rotated by {} but position 1's sin is {want_sin}",
+        o.fdata()[base + h]
+    );
+    for j in 1..h {
+        assert_eq!(o.fdata()[base + j], 0.0, "j={j}: a zero dim moved");
+        assert_eq!(o.fdata()[base + h + j], 0.0, "j={j}: a zero dim moved");
+    }
+    // Position 0's angle is cos = 1, which is what a wrong index order applies
+    // here (it reads the position off the middle axis instead of the first).
+    assert!(
+        (o.fdata()[base] - 1.0).abs() > 1e-3,
+        "the element was rotated as if it belonged to position 0"
+    );
+    // Nothing else in position 1's head moved.
+    for d in 0..d {
+        if d != 0 && d != h {
+            assert_eq!(o.fdata()[base + d], 0.0, "dim {d} should be untouched");
+        }
+    }
+    let _ = h;
+}
+
 #[test]
 fn narrow_offsets_the_data_pointer() {
     let x = Owned::f32(&[3, 4], (1..=12).map(|v| v as f32).collect());

@@ -982,18 +982,27 @@ bool rope_plan(const rs_tensor* x, const rs_attrs* attrs, int64_t* s, int64_t* d
 at::Tensor rope_apply(const at::Tensor& x, const at::Tensor& cos, const at::Tensor& sin, int64_t S,
                       int64_t D, int64_t rotary) {
     int64_t h = rotary / 2;
-    at::Tensor flat = x.reshape({-1, S, D});
+    // Rows per position: everything between the position axis and the last one.
+    // Positions vary along the FIRST axis, so row `t * rows + b` of the
+    // flattened buffer belongs to position `t` — the sequence is the outer
+    // index. Building `[S, rows, D]` and folding the position axis inside (the
+    // obvious `reshape({-1, S, D})`) instead treats the *middle* axis as the
+    // position, which for the plan's `[seq, heads, head_dim]` tensors rotates a
+    // scrambled mix of the two.
+    int64_t rows = x.numel() / (S * D);
+    at::Tensor flat = x.reshape({S * rows, D});
     if (!flat.is_contiguous()) {
         flat = flat.contiguous();
     }
-    at::Tensor cos_b = cos.reshape({1, S, h});
-    at::Tensor sin_b = sin.reshape({1, S, h});
-    at::Tensor first = flat.narrow(2, 0, h);
-    at::Tensor second = flat.narrow(2, h, h);
+    // Each position's cos/sin repeated for every row that shares it.
+    at::Tensor cos_rows = cos.reshape({S, h}).repeat_interleave(rows, /*dim=*/0);
+    at::Tensor sin_rows = sin.reshape({S, h}).repeat_interleave(rows, /*dim=*/0);
+    at::Tensor first = flat.narrow(1, 0, h);
+    at::Tensor second = flat.narrow(1, h, h);
     at::Tensor rotated =
-        at::cat({first * cos_b - second * sin_b, second * cos_b + first * sin_b}, 2);
+        at::cat({first * cos_rows - second * sin_rows, second * cos_rows + first * sin_rows}, 1);
     if (rotary < D) {
-        return at::cat({rotated, flat.narrow(2, rotary, D - rotary)}, 2).reshape(x.sizes());
+        return at::cat({rotated, flat.narrow(1, rotary, D - rotary)}, 1).reshape(x.sizes());
     }
     return rotated.reshape(x.sizes());
 }
