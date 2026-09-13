@@ -326,7 +326,8 @@ HF transformers 的 logits 在容差内一致；每层 hidden 的 mean/std/max �
   **Partial 兑现**：row-parallel 的声明分片让 linear 输出成为 `partial(sum, tp)`，`Compiler::compile` 插入的 `all_reduce` 掩码就是 `tp`；vocabulary 分片的 embedding 同样欠一次 `all_reduce({tp})`（两条测试各一）；
   **真实形状贯通**：声明的切分 → 本地形状在真实描述上端到端成立（`ep=4, tp=2` 的 gate / down 段）；
   **预算改 advisory**：`enforce_budget` 仍是唯一检测点，但超预算只进 `CompiledPlan.warnings`（`plan explain` 打印、JSON 里也在），退出码不受影响 —— §8 D12 落地；
-  工作区 **368 passed** / clippy 0 warning / `ops check` exit 0；绊线按设计变红并更新为 D4 的新真相（16 个 id、4 个 skip、三项新状态），其余断言原样保留：8 个计数的**值**、provenance、两处 `details`、重复 id 规则、三条 dtype 路径；
+  工作区 **384 passed** / clippy 0 warning / `ops check` exit 0；绊线按设计变红并更新为 D4 的新真相（16 个 id、4 个 skip、三项新状态，`l1.instantiate` 的 `details` 逐 stage 钉住节点/slot 计数），其余断言原样保留：8 个计数的**值**、provenance、两处 `details`、重复 id 规则、三条 dtype 路径；
+  独立审查两条：**契约诚实性** = `APPROVED_WITH_NOTES`（绊线无一处被削弱、三条新 pass 各自构造反例证明能失败、六个 D3 pair 测试仍走到转换表、L2 半部带 mesh 逐字节不变、digest 与声明切分解耦）；**算术对抗** = `CHANGES_REQUIRED` —— 复现三条**静默错布局**（`MatMul` 丢掉一个操作数的分片、rank 变化的 unary view 给轴改名、`check` 只看 rank 0 而放过只在 stage 1 的不整除）与两条较小项，随 `0b7aa0f` 全部关闭（每条都先写成红色复现再修）；
   **已知缺口（诚实记录，不是"以后再说"）**：① **位置常量**（flat QKV 通道偏移 / CP 序列偏移 / 本地专家范围）推迟到 D5，`instantiate` 里留注释指到 §4.2 第 4a 行；② **PP 接缝上的 partial 没有所属 rank**：stage 1 的 `propagate` 在 MTP 的 rmsnorm 处按"转换的所有者不在本 rank"拒绝 —— 把 partial 原样交给下一 stage，还是在 seam 前补完，是 D5 的跨 stage 通信决策；模型测试里钉住这个拒绝并注明 D5，不特判、不假装通过
 - [ ] D5 — 前向数值对齐 HuggingFace
 
