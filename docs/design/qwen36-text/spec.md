@@ -233,6 +233,10 @@ L1 全绿（按契约 skip 的四个项除外）；`l1.instantiate` 的 `details
 HF transformers 的 logits 在容差内一致；每层 hidden 的 mean/std/max 差异 < 1%（沿用旧框架验证过的方法）。
 **交付位置**：`rustrain-kernels` 的 5 个新原语 reference 实现 + 3 处 T2 声明补齐 + `rustrain run`（权重加载与前向）+ 一个对比脚本。
 
+**状态（本机侧已完成，缺的是上机那一步）**：5 个原语 + 3 处 T2 声明（`4972234`、`2147c77`）、`all_to_all` 归入 intrinsic（`a81684e`）、描述与算子契约按安装在本机的 HF 源码逐条对齐（`8de5f90`、`4bd2c1e`：逐 head 注意力、逐 head `l2norm`、MoE 拆开权重、router 双输出与无条件重归一化、`embedding` 操作数顺序、GQA 的 rope 拆分、专家权重朝向 —— **其中四项是"真的去编译"才暴露的**，`check` 只看算子名与 dtype，永远发现不了）、`rustrain run` 权重加载与 npz 输出（`62fcf1e`）、对比脚本与判定逻辑（`885adb6`，本机用合成数据验过）、`moe_layer` 的 conformance case（`3f8c630`）。
+本机门禁：工作区 **428 passed** / clippy 0 warning / `ops check` 30 个 case 0 failing / 真实 plan 在 f32 下**可编译**（1337 steps + 53 个 world=1 的 identity collective）。
+**未完成**：上面三命令的数值对比 —— 需要用户确认下载 ~70 GB 权重并占用验证宿主的 GPU（目标里写明不得自行占用）。
+
 **上机步骤**（在 `root@47.94.214.197:26002` 上；本机到这一步为止的部分已全部完成）：
 
 ```bash
