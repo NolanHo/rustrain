@@ -865,6 +865,7 @@ fn attrs_of(map: &BTreeMap<String, AttrLiteral>) -> Attrs {
             AttrLiteral::Int(v) => AttrValue::I64(*v),
             AttrLiteral::Float(v) => AttrValue::F64(*v),
             AttrLiteral::Str(v) => AttrValue::Str(v.clone()),
+            AttrLiteral::I64s(v) => AttrValue::I64s(v.clone()),
         };
         attrs.insert(key.clone(), value);
     }

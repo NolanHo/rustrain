@@ -89,21 +89,26 @@ rustrain check --model <model-dir> [--checkpoint <dir>] [--tp N --cp N --ep N --
 ### D1 — 描述文件能表达这个模型
 
 **可观察结果**：存在一份 `model.json` + 一个模型目录（`config.json` 来自 HF 公开仓库），
-展开后得到一个全局 Plan：**节点数 > 900**、**总 slot 数 > 900**。实测：**1047 节点 / 1943 slot**。
+展开后得到一个全局 Plan：**节点数 > 900**、**总 slot 数 > 900**。实测：**1031 节点 / 1916 slot / 873 weight slot**。
 
 > **注意：weight slot 数与 checkpoint 张量数不相等，也不该相等。**
-> checkpoint 有 **712** 个文本+MTP 权重张量（文本 693 = 根 3 + 层内合计 80+270+60+280，加 MTP 19），
-> 描述要**拆开融合存储**（`q_proj` → `q` + `gate`、`in_proj_qkv` → Q/K/V、融合 `gate_up` → gate/up），
-> 因为 HF 的 `[gate|up]` 布局按 TP 连续切一刀会切开语义边界（`docs/design/qwen36-5d-example.md` §3）。
-> **weight slot 实测 = 884**（= 712 + 2×30 + 2×30 + 11 + 41）。权威验收是上面两个 `> 900`；
-> **不要为了凑 weight slot 的数字把被拆掉的融合张量本身也留成 slot** —— 那会造出无人读取的 slot。
-> "每个 slot 都有来源、每个张量都被消费"的对账是 **D2** 的验收（离线预演已通过：46 条 binding 精确覆盖 712/712，0 缺失 0 编造）。
+> checkpoint 有 **712** 个文本+MTP 权重张量（文本 693 = 根 3 + 层内合计 80+270+60+280，加 MTP 19）。
+> 描述只对**两处**拆开融合存储 —— `in_proj_qkv` → Q/K/V、融合 `gate_up` → gate/up —— 因为它们的段序是
+> 连续 `[Q\|K\|V]` / `[gate\|up]`，按 TP 连续切一刀会切开语义边界。
+> **`q_proj` 不拆**：HF 的真实段序是 **per-head 交错** `[q₀\|gate₀\|q₁\|…]`，连续切分正好给出完整 head 对；
+> q/gate 的分离在**激活**上用 `reshape`+`narrow` 做（`docs/design/qwen36-5d-example.md` §3）。
+> **weight slot 实测 = 873**（= 712 + 2×30 `in_proj_qkv` + 2×30 `conv1d` + 41 `gate_up`）。
+> 权威验收是上面两个 `> 900`；**不要为了凑 weight slot 的数字把被拆掉的融合张量本身也留成 slot** ——
+> 那会造出无人读取的 slot。
+> "每个 slot 都有来源、每个张量都被消费"的对账是 **D2** 的验收（离线预演已通过：46 条 binding 精确覆盖 712/712）。
 
 **交付位置**：描述文件与 fixture 同处（见 D2），格式定义在 `docs/design/model-description.md` §3 与 §3.6。
 **验收与证据**：
 - `cargo run -q -p rustrain-cli -- plan explain --model <dir> --json | jq '.nodes|length'` > 900 且 `'.slots|length'` > 900
 - 同一输入两次运行得到**逐字节相同**的 plan JSON（确定性）
-- 同名冲突 / 表达式成环 / binding 未命中，各有一条测试证明会报错
+- 同名冲突 / 表达式成环 / binding 未命中 / 写未声明 slot / `select`+`template` 冲突 / 声明了没人读的 slot，各有测试证明会报错
+- **形状对账**：每个 weight slot 的 `transform`（+`split`）必须能把真实 checkpoint 形状映射成声明的 slot 形状 ——
+  已用 26 个分片头部独立跑过：**873/873 一致**（这是唯一能证伪 `transform` 的机械手段）
 
 ### D2 — L2 加载检查对账真实的 1045 个张量
 
@@ -204,10 +209,11 @@ HF transformers 的 logits 在容差内一致；每层 hidden 的 mean/std/max �
 ### 交付物履行状态
 
 - [x] **D1 — 描述文件能表达这个模型** —— 证据：提交 `746acc1`（主体）+ `3057544`（返工）；
-  实测 `nodes 1047 / slots 1943 / weight slots 884`，两次展开逐字节相同（sha256 `458ff756…`）；
-  6 条契约测试 + 29 条 model 测试 + 工作区 254 passed / clippy 0 warning / `ops check` exit 0；
+  实测 `nodes 1031 / slots 1916 / weight slots 873`，两次展开逐字节相同（sha256 `4450c731…`）；
+  6 + 3 条契约测试 + 工作区 265 passed / clippy 0 warning / `ops check` exit 0；
   46 条 binding 独立对账 **712/712** 文本+MTP 张量（0 未命中、0 未覆盖、0 重复、0 视觉）；
-  独立审查 `APPROVED_WITH_NOTES`（剩余为注释语言与若干 note，见下）。
+  **形状对账 873/873**（26 个分片头部，含 `transform`/`split` 的机械验证）；
+  独立审查 `APPROVED_WITH_NOTES`，其指出的缺陷已全部修掉（见下）。
 - [ ] D2 — L2 加载检查对账 1045 个张量
 - [ ] D3 — 轴与 mesh + 形状算术
 - [ ] D4 — instantiate 与 L1 全绿

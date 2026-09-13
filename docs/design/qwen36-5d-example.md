@@ -92,31 +92,47 @@ mtp.fc.weight                                       [2048, 4096]     # cat(e,h) 
 
 ---
 
-## 3. 最重要的一条：**融合存储与 TP 边界处处不对齐**
+## 3. 融合存储与 TP 边界：**两处不对齐，一处反而对齐**
 
-Megatron 用 `stride=2` 的交错存储把 `[gate, up]` 塞进一个张量，使每个 TP rank 拿到的是连续切片
-（`mlp.py:201` 注释）。**HF 的 checkpoint 不是那样**，它按 `[gate_all | up_all]` 排。
-于是"dim 上连续切一刀"会**切开语义边界**：
+> **本节曾被 HF 源码推翻一次。** 早期版本断言三处融合都需要 de-fuse，**`q_proj` 那条是错的**。
+> 形状完全看不出来（两种排法都是 `[8192] → [4096, 4096]`），必须读源码。以下是从
+> `transformers/models/qwen3_5_moe/modeling_qwen3_5_moe.py` 逐行确认的结果。
 
-| 张量 | dim 切一刀会得到 | 后果 |
-|---|---|---|
-| `q_proj [8192= q(4096) \| gate(4096), 2048]`，tp=2 | rank0 = 全部 q，rank1 = 全部 gate | 每 rank 只算一半，**错** |
-| `in_proj_qkv [8192= Q(2048) \| K(2048) \| V(4096), 2048]`，tp=2 | rank0 = Q+K，rank1 = V | delta 规则缺输入，**错** |
-| `experts.gate_up_proj [256, 1024 = gate(512) \| up(512), 2048]`，tp=2 | rank0 = gate，rank1 = up | **错** |
+源码里的三行（原文）：
 
-**解法是同一个机制：binding 的 `split` 把融合张量拆成语义段，每段再声明自己的 `axes`。**
-
-```jsonc
-{ "source": "model.language_model.layers.{*}.self_attn.q_proj.weight",
-  "transform": ["transpose(0,1)"],                    // -> [2048, 8192] = [K, N]
-  "split": { "dim": 1, "sizes": ["heads*hdim", "heads*hdim"] },   // q | gate
-  "targets": [
-    { "slot": "…self_attn.q",    "axes": { "1": ["tp"] } },
-    { "slot": "…self_attn.gate", "axes": { "1": ["tp"] } } ] }
+```python
+query_states, gate = torch.chunk(self.q_proj(x).view(b, s, -1, head_dim * 2), 2, dim=-1)  # :797
+gate, up          = F.linear(x, self.gate_up_proj[e]).chunk(2, dim=-1)                      # :875
+query, key, value = torch.split(mixed_qkv, [key_dim, key_dim, value_dim], dim=-1)           # :605
 ```
 
-这条机制在 **三个地方**是承重的（q 的 output gate、GDN 的 flat QKV、MoE 的 fused gate_up），
-不是特例。而且"融合存储"与"融合计算"是两件事：拆开存储不影响 kernel 同时读两个指针做融合。
+| 张量 | 真实段序 | TP 连续切一刀 | 结论 |
+|---|---|---|---|
+| `q_proj` `[8192]` | **per-head 交错**：`[q₀(256) \| gate₀(256) \| q₁ \| gate₁ \| …]`（先 view 成 `[16, 512]` 再 `chunk(2, -1)`） | 每 rank 拿到**完整的 head 对** | **不需要 de-fuse** —— 连续切反而正确 |
+| `in_proj_qkv` `[8192]` | 连续 `[Q(2048) \| K(2048) \| V(4096)]` | rank0 = Q+K，rank1 = V | **必须 de-fuse**（否则 delta 规则缺输入） |
+| `experts.gate_up_proj` `[256, 1024]` | 连续 `[gate(512) \| up(512)]` | rank0 = 只有 gate 行，rank1 = 只有 up 行 | **必须 de-fuse** |
+
+**解法**：
+
+- **`in_proj_qkv` / `gate_up_proj`**：binding 的 `split` 把融合张量拆成语义段，每段再声明自己的 `axes`。
+- **`q_proj`**：**保持一个 slot**，按输出维连续切分（`axes {1: ["tp"]}`）；q 与 gate 的**分离在激活上做**，
+  即模板里用 `reshape` + `narrow` 两个原语节点取出 `[16,256]` 的两半 —— 它们是 plannable 原语，
+  于是"哪一半是 q"这件事**写在图里**，不是加载期的隐式约定。
+
+```jsonc
+// 需要拆的（两处）
+{ "source": "model.language_model.layers.{*}.linear_attn.in_proj_qkv.weight",
+  "transform": ["transpose(0,1)"],                                    // -> [2048, 8192] = [K, N]
+  "split": { "dim": 1, "sizes": ["lin_qk", "lin_qk", "lin_v"] },      // Q | K | V
+  "targets": [ { "slot": "…in_proj_qkv.q", "axes": { "1": ["tp"] } }, … ] }
+
+// 不需要拆的（一处）
+{ "slot": "layers.*.self_attn.qg", "source": "…self_attn.q_proj.weight",
+  "transform": ["transpose(0,1)"], "axes": { "1": ["tp"] } }          // 一个 slot，交错布局，切分正确
+```
+
+**教训**：段序是**语义**，形状证明不了它。这类事实只有两个来源：读参考实现的源码，或数值探针。
+D5 与 HF 对齐时会再验一次（那是唯一能证伪的机械手段）。
 
 **另一个必须的结构化切分**：GDN 的 `A_log` / `dt_bias` 是**按 value head** 定义的（`[32]`），
 而 `in_proj_a/b` 的输出也是 32。它们必须沿 value-head 轴切（Megatron 同样：`partition_dim=0`，
@@ -152,29 +168,30 @@ rank = tp*1 + cp*2 + ep*4 + dp*8 + pp*16
 
 ### 5.1 TP（`{tp}`=2）
 
-> **方向提醒（容易出错）**：**本节的表用 checkpoint（HF）方向书写**，为的是能和真实张量形状直接对照。
-> 而 **binding 里的 `axes` 一律按 slot 方向**（`[K, N]`，见 §3.4），两者相差一次 `transpose`。
-> 例：`in_proj_a.weight` 在 checkpoint 里是 `[32, 2048]`（32 个 value head × hidden），本表切 dim0；
-> 转成 slot 方向是 `[2048, 32]`，所以 binding 写 **`{"1": ["tp"]}`**，不是 `{"0": ["tp"]}`。
-> **binding 是唯一的执行事实**，本表只用于人工对照。
+> **方向约定**：本表**统一用 slot 方向**（`linear` 的权重是 `[K, N]`，收缩维在前），
+> 与 binding 的 `axes` 完全一致 —— **binding 是唯一的执行事实**，本表只用于人工对照。
+> 早期版本的表混用了 checkpoint 方向（`experts.*`、`in_proj_a/b`、`embed/lm_head` 那几行），已修正。
+> checkpoint 方向的真实形状见 §2。
 
-| slot（归一化后） | 全局 | 切哪维 | 本地 | 通信 |
+| slot（slot 方向） | 全局 | 切哪维 | 本地 | 通信 |
 |---|---|---|---|---|
-| `q_proj` → `q` `[2048 hidden, 4096]` | 4096 = 16×256 | dim1 | `[2048, 2048]` | 无 |
-| `q_proj` → `gate` 同上 | | dim1 | `[2048, 2048]` | 无 |
-| `k_proj` `[2048, 512]` | 2×256 | dim1 | `[2048, 256]` | 无（tp≤2 时 kv 头够分） |
+| `qg`（`q_proj`，**交错布局**）`[2048, 8192]` | 8192 = 16 × 512 | dim1 | `[2048, 4096]` | 无 —— 交错布局使连续切分正好给出完整 head 对（§3）；q/gate 的分离在**激活**上用 `reshape`+`narrow` 做 |
+| `k_proj` / `v_proj` `[2048, 512]` | 2 kv 头 × 256 | dim1 | `[2048, 256]` | 无（tp≤2 够分；**tp≥4 需复制 KV**，见 §4） |
 | `o_proj` `[4096, 2048]` | | dim0（收缩） | `[2048, 2048]` | **partial → all_reduce{tp}** |
-| `q_norm`/`k_norm` `[256]` | | — | `[256]` | 复制；梯度需 all_reduce{tp} |
-| `in_proj_qkv` → Q `[2048, 2048]` / K / V `[2048, 4096]` | | dim1 各自 | Q/K `[2048,1024]`、V `[2048,2048]` | 无 |
-| `conv1d` 同样拆 3 段 | | dim0 | `[4096,1,4]` → 每段 tp 切 | 无（depthwise，按通道切是精确的） |
-| `A_log`/`dt_bias` `[32]` / `in_proj_a/b` `[32,2048]` | | dim0 | `[16]` / `[16,2048]` | 无 |
-| `out_proj` `[4096, 2048]` | | dim0 | `[2048, 2048]` | **partial → all_reduce{tp}** |
-| `linear_attn.norm` `[128]` | | — | `[128]` | 复制 |
-| `experts.gate_up_proj` → gate/up `[256, 512, 2048]` | | dim1 | `[256, 256, 2048]` | 无 |
-| `experts.down_proj` `[256, 2048, 512]` | | dim2（收缩） | `[256, 2048, 256]` | **partial → all_reduce{tp}** |
-| `mlp.gate` `[256, 2048]`、`shared_expert_gate` `[1, 2048]` | | — | 复制 | 复制（每 rank 算相同 top-k） |
-| `shared_expert.*` | | 同 dense MLP | | all_reduce{tp} |
-| `embed`/`lm_head` `[248320, 2048]` | | dim0（词表） | `[124160, 2048]` | embed 前向 all_reduce / lm_head 不 gather |
+| `q_norm` / `k_norm` `[256]` | | — | `[256]` | 复制；梯度需 all_reduce{tp} |
+| `in_proj_qkv` → Q、K `[2048, 2048]`；V `[2048, 4096]` | | dim1 各自 | Q/K `[2048, 1024]`、V `[2048, 2048]` | 无（连续 `[Q\|K\|V]`，必须 de-fuse，§3） |
+| `conv1d` 同拆 3 段：`[2048,1,4]`×2、`[4096,1,4]` | | dim0 | 各减半 | 无（depthwise，按通道切是精确的） |
+| `A_log` / `dt_bias` `[32]` | | dim0 | `[16]` | 无 |
+| `in_proj_a` / `in_proj_b` `[2048, 32]` | | dim1 | `[2048, 16]` | 无 |
+| `in_proj_z` `[2048, 4096]` | | dim1 | `[2048, 2048]` | 无 |
+| `linear_attn.norm` `[128]` | | — | `[128]` | 复制（按 head_dim，跨 head 共享） |
+| `out_proj` `[4096, 2048]` | | dim0（收缩） | `[2048, 2048]` | **partial → all_reduce{tp}** |
+| `experts.gate_up_proj` → gate / up `[256, 2048, 512]` | | dim2（**再叠 ep 切 dim0**） | `[256, 2048, 256]` | 无（连续 `[gate\|up]`，必须 de-fuse，§3） |
+| `experts.down_proj` `[256, 512, 2048]` | | dim1（收缩，**再叠 ep 切 dim0**） | `[256, 256, 2048]` | **partial → all_reduce{tp}** |
+| `mlp.gate` `[256, 2048]`、`shared_expert_gate` `[1, 2048]` | | — | 复制 | 复制（每 rank 算相同的 top-k） |
+| `shared_expert.gate_proj`/`up_proj` `[2048, 512]`、`down_proj` `[512, 2048]` | | dim1 / dim0 | | all_reduce{tp} |
+| `embed.w` `[248320, 2048]`（embedding，**不是 `[K,N]`**） | | dim0（词表） | `[124160, 2048]` | 前向 all_reduce{tp}（SP 时 reduce_scatter） |
+| `lm_head.w` `[2048, 248320]` | | dim1（词表） | `[2048, 124160]` | 不 gather（parallel output） |
 
 ### 5.2 EP（`{ep}`=4）
 

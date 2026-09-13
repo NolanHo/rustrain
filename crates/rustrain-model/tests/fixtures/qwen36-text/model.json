@@ -42,6 +42,9 @@
     "q_size": {
       "expr": "heads * head_dim"
     },
+    "qg_size": {
+      "expr": "2 * q_size"
+    },
     "kv_size": {
       "expr": "kv_heads * head_dim"
     },
@@ -578,24 +581,6 @@
           ]
         },
         {
-          "name": "gsilu",
-          "kind": "activation",
-          "dtype": "bf16",
-          "shape": [
-            "seq",
-            "lin_v"
-          ]
-        },
-        {
-          "name": "gated",
-          "kind": "activation",
-          "dtype": "bf16",
-          "shape": [
-            "seq",
-            "lin_v"
-          ]
-        },
-        {
           "name": "normed",
           "kind": "activation",
           "dtype": "bf16",
@@ -884,34 +869,9 @@
           }
         },
         {
-          "op": "elementwise_unary",
-          "in": [
-            "z"
-          ],
-          "out": [
-            "gsilu"
-          ],
-          "attrs": {
-            "kind": "silu"
-          }
-        },
-        {
-          "op": "elementwise_binary",
-          "in": [
-            "gdn",
-            "gsilu"
-          ],
-          "out": [
-            "gated"
-          ],
-          "attrs": {
-            "kind": "mul"
-          }
-        },
-        {
           "op": "rmsnorm_gated",
           "in": [
-            "gated",
+            "gdn",
             "linear_attn.norm",
             "z"
           ],
@@ -1047,19 +1007,11 @@
           ]
         },
         {
-          "name": "self_attn.q_proj",
+          "name": "self_attn.qg",
           "kind": "weight",
           "shape": [
             "hidden",
-            "q_size"
-          ]
-        },
-        {
-          "name": "self_attn.gate_proj",
-          "kind": "weight",
-          "shape": [
-            "hidden",
-            "q_size"
+            "qg_size"
           ]
         },
         {
@@ -1181,6 +1133,48 @@
           "shape": [
             "seq",
             "hidden"
+          ]
+        },
+        {
+          "name": "qgw",
+          "kind": "activation",
+          "dtype": "bf16",
+          "shape": [
+            "seq",
+            "qg_size"
+          ]
+        },
+        {
+          "name": "qgh",
+          "kind": "activation",
+          "dtype": "bf16",
+          "shape": [
+            "seq",
+            "heads",
+            "2",
+            "head_dim"
+          ]
+        },
+        {
+          "name": "qs",
+          "kind": "activation",
+          "dtype": "bf16",
+          "shape": [
+            "seq",
+            "heads",
+            "1",
+            "head_dim"
+          ]
+        },
+        {
+          "name": "gs",
+          "kind": "activation",
+          "dtype": "bf16",
+          "shape": [
+            "seq",
+            "heads",
+            "1",
+            "head_dim"
           ]
         },
         {
@@ -1355,21 +1349,86 @@
           "op": "linear",
           "in": [
             "h1",
-            "self_attn.q_proj"
+            "self_attn.qg"
           ],
           "out": [
-            "q"
+            "qgw"
           ]
         },
         {
-          "op": "linear",
+          "op": "reshape",
           "in": [
-            "h1",
-            "self_attn.gate_proj"
+            "qgw"
+          ],
+          "out": [
+            "qgh"
+          ],
+          "attrs": {
+            "shape": [
+              512,
+              16,
+              2,
+              256
+            ]
+          }
+        },
+        {
+          "op": "narrow",
+          "in": [
+            "qgh"
+          ],
+          "out": [
+            "qs"
+          ],
+          "attrs": {
+            "dim": 2,
+            "start": 0,
+            "length": 1
+          }
+        },
+        {
+          "op": "narrow",
+          "in": [
+            "qgh"
+          ],
+          "out": [
+            "gs"
+          ],
+          "attrs": {
+            "dim": 2,
+            "start": 1,
+            "length": 1
+          }
+        },
+        {
+          "op": "reshape",
+          "in": [
+            "qs"
+          ],
+          "out": [
+            "q"
+          ],
+          "attrs": {
+            "shape": [
+              512,
+              4096
+            ]
+          }
+        },
+        {
+          "op": "reshape",
+          "in": [
+            "gs"
           ],
           "out": [
             "qg"
-          ]
+          ],
+          "attrs": {
+            "shape": [
+              512,
+              4096
+            ]
+          }
         },
         {
           "op": "linear",
@@ -1829,7 +1888,12 @@
   "binding": [
     {
       "slot": "embed.w",
-      "source": "model.language_model.embed_tokens.weight"
+      "source": "model.language_model.embed_tokens.weight",
+      "axes": {
+        "0": [
+          "tp"
+        ]
+      }
     },
     {
       "slot": "norm.w",
@@ -1837,7 +1901,15 @@
     },
     {
       "slot": "lm_head.w",
-      "source": "lm_head.weight"
+      "source": "lm_head.weight",
+      "transform": [
+        "transpose(0,1)"
+      ],
+      "axes": {
+        "1": [
+          "tp"
+        ]
+      }
     },
     {
       "slot": "layers.*.input_layernorm",
@@ -1995,35 +2067,16 @@
       }
     },
     {
+      "slot": "layers.*.self_attn.qg",
       "source": "model.language_model.layers.{*}.self_attn.q_proj.weight",
       "transform": [
         "transpose(0,1)"
       ],
-      "split": {
-        "dim": 1,
-        "sizes": [
-          "q_size",
-          "q_size"
+      "axes": {
+        "1": [
+          "tp"
         ]
-      },
-      "targets": [
-        {
-          "slot": "layers.*.self_attn.q_proj",
-          "axes": {
-            "1": [
-              "tp"
-            ]
-          }
-        },
-        {
-          "slot": "layers.*.self_attn.gate_proj",
-          "axes": {
-            "1": [
-              "tp"
-            ]
-          }
-        }
-      ]
+      }
     },
     {
       "slot": "layers.*.self_attn.k_proj",
@@ -2199,35 +2252,16 @@
       "source": "mtp.layers.{*}.post_attention_layernorm.weight"
     },
     {
+      "slot": "mtp.layers.*.self_attn.qg",
       "source": "mtp.layers.{*}.self_attn.q_proj.weight",
       "transform": [
         "transpose(0,1)"
       ],
-      "split": {
-        "dim": 1,
-        "sizes": [
-          "q_size",
-          "q_size"
+      "axes": {
+        "1": [
+          "tp"
         ]
-      },
-      "targets": [
-        {
-          "slot": "mtp.layers.*.self_attn.q_proj",
-          "axes": {
-            "1": [
-              "tp"
-            ]
-          }
-        },
-        {
-          "slot": "mtp.layers.*.self_attn.gate_proj",
-          "axes": {
-            "1": [
-              "tp"
-            ]
-          }
-        }
-      ]
+      }
     },
     {
       "slot": "mtp.layers.*.self_attn.k_proj",

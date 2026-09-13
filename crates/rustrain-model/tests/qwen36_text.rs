@@ -31,10 +31,13 @@ fn weight_slots(expanded: &Expanded) -> usize {
 
 /// D1 的可观察结果：节点数 > 900、slot 数 > 900。
 ///
-/// **weight slot 的真实数是 884**，不是 D1 注释里估的 "约 903"：那条估算按
-/// `24 slot × 30 + 18 slot × 10 + 根 3` 算，而每一层真实是 23 / 17 个权重 slot —— 估算每层多算了 1
-/// （把被 `split` 拆掉的融合张量本身也当成一个 slot 了）。这里把真实值与它的算术钉住，
-/// 见交付报告"契约里仍不清楚或我认为有错的"。
+/// **weight slot 的真实数是 873**，而不是 D1 注释里估的 "约 903"：那条估算按
+/// `24 slot × 30 + 18 slot × 10 + 根 3` 算，而每一层真实是 23 / 16 个权重 slot —— 估算每层多算了 1
+/// （把被 `split` 拆掉的融合张量本身也当成一个 slot 了）。
+///
+/// `q_proj` 一项从 +11 变成 0：真实段序是 per-head 交错 `[q₀|gate₀|q₁|gate₁|…]`
+/// （`docs/design/qwen36-5d-example.md` §3），连续切分正好按 head 对切开，所以它**不需要 de-fuse**，
+/// 一个张量就是一个 slot。
 #[test]
 fn the_real_model_expands_to_a_plan_over_nine_hundred_nodes_and_slots() {
     let expanded = expanded();
@@ -52,14 +55,14 @@ fn the_real_model_expands_to_a_plan_over_nine_hundred_nodes_and_slots() {
     );
 
     // 712 个 checkpoint 张量（文本 693 = 根 3 + 层内 80+270+60+280，加 MTP 19）
-    // + de-fuse 增量 = 884 个 weight slot：
+    // + de-fuse 增量 = 873 个 weight slot：
     //   in_proj_qkv → Q|K|V：30 层 × (+2)  = +60
     //   conv1d      → q|k|v：30 层 × (+2)  = +60
-    //   q_proj      → q|gate：11 层 × (+1) = +11（10 个 full 层 + MTP 的那一层）
+    //   q_proj      → 不拆（per-head 交错）：      +0
     //   gate_up_proj→ gate|up：41 层 × (+1) = +41
     let tensors = 712;
-    let expected_weights = tensors + 2 * 30 + 2 * 30 + 11 + 41;
-    assert_eq!(expected_weights, 884);
+    let expected_weights = tensors + 2 * 30 + 2 * 30 + 41;
+    assert_eq!(expected_weights, 873);
     assert_eq!(
         weight_slots(&expanded),
         expected_weights,
@@ -109,19 +112,26 @@ fn fused_storage_is_split_into_semantic_slots() {
             .unwrap_or_else(|| panic!("missing binding for {needle}"))
     };
 
-    // q_proj [8192 = q(4096) | gate(4096), 2048]：10 个 full 层 × 2 段，MTP 那一层另有一条 binding。
+    // q_proj [8192, 2048]：真实段序是 per-head 交错 `[q₀(256)|gate₀(256)|q₁|gate₁|…]`（§3），
+    // 所以**不拆** —— 连续切分按 head 对切，每个 rank 都拿到完整的 head 对。
+    // q 与 gate 的分离在激活上做（`the_q_gate_split_is_a_graph_fact`）。
+    // 10 个 full 层各一个 slot，MTP 那一层另有一条 binding。
     let q = by_source("model.language_model.layers.{*}.self_attn.q_proj.weight");
-    assert_eq!(q.split.as_ref().unwrap().sizes, vec![4096, 4096]);
+    assert!(q.split.is_none(), "q_proj 不该 de-fuse（§3）");
     assert_eq!(q.transform, vec!["transpose(0,1)"]);
-    assert_eq!(q.slots.len(), 20);
-    assert!(
-        q.slots
-            .iter()
-            .any(|s| s.slot == "layers.3.self_attn.gate_proj")
-    );
+    assert_eq!(q.slots.len(), 10);
+    for slot in &q.slots {
+        assert!(
+            slot.slot.ends_with(".self_attn.qg"),
+            "q_proj 只喂一个融合 slot，实际 {}",
+            slot.slot
+        );
+        assert_eq!(slot.axes.get("1"), Some(&vec!["tp".to_string()]));
+    }
     let q_mtp = by_source("mtp.layers.{*}.self_attn.q_proj.weight");
-    assert_eq!(q_mtp.slots.len(), 2);
-    assert_eq!(q_mtp.slots[0].slot, "mtp.layers.0.self_attn.q_proj");
+    assert!(q_mtp.split.is_none());
+    assert_eq!(q_mtp.slots.len(), 1);
+    assert_eq!(q_mtp.slots[0].slot, "mtp.layers.0.self_attn.qg");
 
     // in_proj_qkv [8192 = Q | K | V, 2048]：30 层 × 3 段。
     let qkv = by_source("model.language_model.layers.{*}.linear_attn.in_proj_qkv.weight");
@@ -142,6 +152,78 @@ fn fused_storage_is_split_into_semantic_slots() {
     assert_eq!(gate_up_mtp.slots.len(), 2);
 }
 
+/// §3：`q_proj` 的融合张量不拆，q 与 gate 的分离**画在图里** —— `reshape` 到
+/// `[seq, heads, 2, head_dim]`，两个 `narrow(dim=2)` 各取一半，再各自 `reshape` 回
+/// `[seq, heads * head_dim]`。于是"哪一半是 q"这件事是计划里的节点，不是加载期的隐式约定。
+///
+/// **未决（留给 D2/D5）**：末尾那两个 `reshape` 不是零拷贝的 stride 重解释 —— `narrow(dim=2)`
+/// 之后 q 的值在源行内相隔 `2 * head_dim`，"打包"成 `[seq, q_size]` 要么赋值复制，要么让
+/// consumer 直接吃 4 维视图（HF 就是把 4 维视图喂给 `q_norm`，`q_norm` 的 `[head_dim]` 也只对
+/// 最后一维成立）。本 fixture 记录的是 §3 的段序与取法；`reshape` 是否允许复制、以及
+/// `q_norm`/`rope`/`sdpa` 该吃 4 维还是 2 维，是尚未裁定的契约问题，不在本次改动范围内。
+#[test]
+fn the_q_gate_split_is_a_graph_fact_not_a_load_time_split() {
+    let expanded = expanded();
+    let plan = &expanded.plan;
+    let id = |name: &str| plan.slot_id(name).unwrap_or_else(|| panic!("缺少 slot {name}"));
+    let name_of = |slot: rustrain_plan::SlotId| plan.slot(slot).name.clone();
+
+    // 一个 linear 读融合权重，产出交错布局的 [seq, 2 * q_size]。
+    let qg = id("layers.3.self_attn.qg");
+    assert_eq!(plan.slot(qg).shape, vec![2048, 8192]);
+    let linear = plan
+        .nodes
+        .iter()
+        .find(|node| node.op.name == "linear" && node.inputs.contains(&qg))
+        .expect("没有节点读 layers.3.self_attn.qg");
+    assert_eq!(name_of(linear.outputs[0]), "layers.3.qgw");
+    assert_eq!(plan.slot(linear.outputs[0]).shape, vec![512, 8192]);
+
+    // reshape → [seq, heads, 2, head_dim]。
+    let view = linear.outputs[0];
+    let reshape = plan
+        .nodes
+        .iter()
+        .find(|node| node.op.name == "reshape" && node.inputs.contains(&view))
+        .expect("交错布局没有被 reshape 成 [seq, heads, 2, head_dim]");
+    assert_eq!(reshape.attrs.i64s("shape"), Some([512, 16, 2, 256].as_slice()));
+    assert_eq!(name_of(reshape.outputs[0]), "layers.3.qgh");
+
+    // 两个 narrow(dim=2)：start 0 是 q，start 1 是 gate。
+    let halves: Vec<&rustrain_plan::PlanNode> = plan
+        .nodes
+        .iter()
+        .filter(|node| node.op.name == "narrow" && node.inputs.contains(&reshape.outputs[0]))
+        .collect();
+    assert_eq!(halves.len(), 2, "q 与 gate 各一次 narrow");
+    let half = |start: i64| {
+        let node = halves
+            .iter()
+            .find(|node| node.attrs.i64("start") == Some(start))
+            .unwrap_or_else(|| panic!("没有 start={start} 的 narrow"));
+        assert_eq!(node.attrs.i64("dim"), Some(2));
+        assert_eq!(node.attrs.i64("length"), Some(1));
+        assert_eq!(plan.slot(node.outputs[0]).shape, vec![512, 16, 1, 256]);
+        node.outputs[0]
+    };
+
+    // 各自 reshape 回 [seq, heads * head_dim]：`q` 进 q_norm，`qg` 进门控 sigmoid。
+    for (source, target) in [(half(0), "layers.3.q"), (half(1), "layers.3.qg")] {
+        let reshape = plan
+            .nodes
+            .iter()
+            .find(|node| node.op.name == "reshape" && node.inputs.contains(&source))
+            .unwrap_or_else(|| panic!("{target} 的半边没有被 reshape 回来"));
+        assert_eq!(
+            reshape.attrs.i64s("shape"),
+            Some([512, 4096].as_slice()),
+            "{target}"
+        );
+        assert_eq!(name_of(reshape.outputs[0]), target);
+        assert_eq!(plan.slot(id(target)).shape, vec![512, 4096]);
+    }
+}
+
 #[test]
 fn the_mtp_layer_is_described() {
     let expanded = expanded();
@@ -157,8 +239,7 @@ fn the_mtp_layer_is_described() {
         "mtp.pre_fc_norm_hidden",
         "mtp.head.norm",
         "mtp.layers.0.input_layernorm",
-        "mtp.layers.0.self_attn.q_proj",
-        "mtp.layers.0.self_attn.gate_proj",
+        "mtp.layers.0.self_attn.qg",
         "mtp.layers.0.mlp.experts.gate_proj",
         "mtp.layers.0.mlp.shared_expert_gate",
     ] {

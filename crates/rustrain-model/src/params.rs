@@ -199,8 +199,8 @@ fn dfs(
 /// per-layer types). The list form is not optional: without it the description would have to carry
 /// a copy of the layer-type table, which is a second source for the same fact.
 ///
-/// `Ok(None)` means the key is absent; `Err` means it is present but holds something this build
-/// cannot read. The two must stay apart — see the caller.
+/// `Ok(None)` means the key is absent (or `null`, §3.7 #16); `Err` means it is present with a
+/// non-null value this build cannot read. The two must stay apart — see the caller.
 fn from_config(config: &serde_json::Value, path: &str) -> Result<Option<Value>, String> {
     let Some(value) = config_at(config, path)? else {
         return Ok(None);
@@ -219,6 +219,8 @@ fn from_config(config: &serde_json::Value, path: &str) -> Result<Option<Value>, 
                 None => "a list whose entries are not all strings".to_string(),
             }
         }
+        // Unreachable while `config_at` reports a `null` segment as a missing key (§3.7 #16); the
+        // arm stays so the match remains exhaustive over `serde_json::Value`.
         serde_json::Value::Null => "null".to_string(),
         serde_json::Value::Bool(_) => "a boolean".to_string(),
         serde_json::Value::Number(number) => format!("the number {number}"),
@@ -234,9 +236,11 @@ fn from_config(config: &serde_json::Value, path: &str) -> Result<Option<Value>, 
 
 /// Look up a dotted path in `config.json`.
 ///
-/// `Ok(None)` when a segment is absent. `Err` when a segment on the way exists but is not an
-/// object: the path is then unreadable rather than missing, and a `default` must not cover it
-/// either.
+/// `Ok(None)` when a segment is absent **or `null`**: JSON `null` is the usual way of writing "not
+/// configured" (`"rope_scaling": null`), so it is a missing key, not a value of the wrong type
+/// (§3.7 #16) — a `default` covers it. `Err` when a segment on the way exists and holds a non-null
+/// value that is not an object: the path is then unreadable rather than missing, and a `default`
+/// must not cover it either.
 fn config_at<'a>(
     config: &'a serde_json::Value,
     path: &str,
@@ -258,6 +262,9 @@ fn config_at<'a>(
         let Some(next) = object.get(segment) else {
             return Ok(None);
         };
+        if next.is_null() {
+            return Ok(None);
+        }
         cur = next;
         walked.push(segment);
     }
@@ -545,6 +552,26 @@ mod tests {
         let text = err.to_string();
         assert!(text.contains("text_config.rope_scaling"), "{text}");
         assert!(text.contains("not an object"), "{text}");
+    }
+
+    /// §3.7 #16: JSON `null` is how HF writes "not configured" (`"rope_scaling": null`), so it
+    /// counts as a missing key — both when the path walks through it and when the path ends on it.
+    /// Only a *non-null* value of the wrong type is an error.
+    #[test]
+    fn a_null_config_value_is_treated_as_missing() {
+        let config = serde_json::json!({"text_config": {"rope_scaling": null, "sliding": null}});
+        let params = Params::resolve(
+            &decls(
+                r#"{
+                    "factor": {"from": "text_config.rope_scaling.factor", "default": 1},
+                    "window": {"from": "text_config.sliding", "default": 4}
+                }"#,
+            ),
+            &config,
+        )
+        .unwrap();
+        assert_eq!(params.int("factor").unwrap(), 1);
+        assert_eq!(params.int("window").unwrap(), 4);
     }
 
     #[test]

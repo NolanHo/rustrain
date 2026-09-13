@@ -119,6 +119,10 @@ pub enum AttrLiteral {
     Int(i64),
     Float(f64),
     Str(String),
+    /// A list of integers: `reshape` takes its target shape as a list (`rustrain-kernels` reads
+    /// `shape` as an `i64` list), and a list of literals is still a literal — no parameter
+    /// reference is involved (§3.7 #5).
+    I64s(Vec<i64>),
 }
 
 /// One `stack` item: a template invocation with arguments (§3.3).
