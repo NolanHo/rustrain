@@ -23,11 +23,12 @@ use anyhow::{Context, Result, anyhow, bail};
 use clap::{Args, Parser, Subcommand};
 
 use rustrain_abi::Plugin;
-use rustrain_abi::ffi::RsDtype;
+use rustrain_abi::ffi::{RsDeviceKind, RsDtype};
 use rustrain_ops::{Phase, Recipe, Registry, ResolveError, TargetEnv};
 use rustrain_parallel::{GroupMask, Mesh, ParallelConfig, ParallelLayout};
 use rustrain_plan::{Attrs, OpRef, Plan, PlanBuilder, PlanNode, Slot, SlotKind};
 
+mod device;
 mod load;
 mod npz;
 mod run;
@@ -82,6 +83,16 @@ enum OpsCommand {
         /// A plugin `.so` to load in addition to the built-in provider.
         #[arg(long = "plugin", value_name = "PATH")]
         plugins: Vec<PathBuf>,
+        /// Recipe file deciding which implementation runs. Omitted: the
+        /// built-in reference provider is selected.
+        #[arg(long, value_name = "PATH")]
+        recipe: Option<PathBuf>,
+        /// Run the gate against a device provider: `cpu` (default), `cuda`,
+        /// or `cuda:<index>` (`cuda` alone is device 0). With `cuda` the
+        /// candidates compile and execute on that device; an unavailable
+        /// device is a loud failure, never a skip.
+        #[arg(long, value_name = "SPEC", default_value = "cpu")]
+        device: String,
         /// Restrict to one operator.
         #[arg(long = "op", value_name = "NAME")]
         op: Option<String>,
@@ -125,7 +136,13 @@ fn main() -> Result<()> {
     match cli.command {
         Command::Ops(args) => match args.command {
             OpsCommand::List { plugins, json } => ops_list(&plugins, json),
-            OpsCommand::Check { plugins, op, json } => ops_check(&plugins, op.as_deref(), json),
+            OpsCommand::Check {
+                plugins,
+                recipe,
+                device,
+                op,
+                json,
+            } => ops_check(&plugins, recipe.as_deref(), &device, op.as_deref(), json),
         },
         Command::Plan(args) => match args.command {
             PlanCommand::Explain {
@@ -213,12 +230,30 @@ fn ops_list(plugins: &[PathBuf], json: bool) -> Result<()> {
     Ok(())
 }
 
-fn ops_check(plugins: &[PathBuf], only: Option<&str>, json: bool) -> Result<()> {
+fn ops_check(
+    plugins: &[PathBuf],
+    recipe_path: Option<&Path>,
+    device_spec: &str,
+    only: Option<&str>,
+    json: bool,
+) -> Result<()> {
     use rustrain_runtime::conformance::{Harness, default_cases, uncovered_operators};
 
     let registry = load_registry(plugins)?;
-    let recipe = load_recipe(None)?;
-    let harness = Harness::new(&registry, &recipe);
+    let recipe = load_recipe(recipe_path)?;
+    let device = device::DeviceSpec::parse(device_spec)?;
+    let mut harness = Harness::new(&registry, &recipe);
+    if let device::DeviceSpec::Cuda(index) = device {
+        // Fail up front, not per case: a device provider was requested, and
+        // the gate must say loudly when no device is available — never skip.
+        rustrain_runtime::CudaAllocator::new(index).map_err(|error| {
+            anyhow::anyhow!(
+                "`--device cuda:{index}`: no CUDA device is available for the gate to run on; \
+                 the driver could not be initialised: {error}"
+            )
+        })?;
+        harness = harness.device(RsDeviceKind::CUDA, index);
+    }
 
     let mut cases = default_cases();
     if let Some(name) = only {

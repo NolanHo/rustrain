@@ -126,6 +126,10 @@ pub struct MemoryPlan {
     /// `persistent_bytes + transient_pool_bytes + max_workspace_bytes`.
     pub peak_bytes: u64,
     pub budget_bytes: Option<u64>,
+    /// Byte alignment every offset in the persistent region and the activation
+    /// pool was rounded up to (CPU 1, CUDA 256; overridable in the recipe). The
+    /// region sizes already include the padding, so the peak changes with it.
+    pub align_bytes: u64,
     /// Policies a node wanted that the runtime cannot execute.
     pub unsupported: Vec<(NodeId, String, ActivationPolicy)>,
     /// `(slot, earlier_slot_it_reuses, bytes)` for every pool slot that took over
@@ -145,12 +149,13 @@ impl MemoryPlan {
             None => "unset".to_string(),
         };
         format!(
-            "peak {} B (persistent {} + activations {} + workspace {}) / budget {}",
+            "peak {} B (persistent {} + activations {} + workspace {}) / budget {} / align {} B",
             self.peak_bytes,
             self.persistent_bytes,
             self.transient_pool_bytes,
             self.max_workspace_bytes,
-            budget
+            budget,
+            self.align_bytes,
         )
     }
 
@@ -205,6 +210,12 @@ pub type ResolvedOps = [Option<RegisteredOp>];
 
 /// Runs the memory pass.
 ///
+/// `align_bytes` is the byte alignment every offset into the persistent region
+/// and the activation pool is rounded up to. It is resolved by the caller (the
+/// compiler): the recipe's override, or the target device's default (CPU 1,
+/// CUDA 256). The alignment is passed in rather than derived here, so this
+/// pass stays a pure function of its inputs.
+///
 /// Returns the plan and the selected policy per node. The caller decides what to
 /// do about the budget; [`enforce_budget`] is the policy for that.
 pub fn plan(
@@ -212,6 +223,7 @@ pub fn plan(
     ops: &ResolvedOps,
     recipe: &MemoryRecipe,
     caps: RuntimeCapabilities,
+    align_bytes: u64,
 ) -> Result<MemoryPlan, PlanError> {
     if ops.len() != plan.nodes.len() {
         return Err(PlanError::Digest(format!(
@@ -265,6 +277,7 @@ pub fn plan(
         &workspace,
         recipe,
         hard_budget,
+        align_bytes,
     );
 
     // Relaxation, in a deterministic order: steps in index order, and for each,
@@ -310,6 +323,7 @@ pub fn plan(
                     &workspace,
                     recipe,
                     hard_budget,
+                    align_bytes,
                 );
                 if mem.peak_bytes <= target {
                     break 'outer;
@@ -392,6 +406,13 @@ pub fn enforce_budget(mem: &MemoryPlan, plan: &Plan) -> Result<(), PlanError> {
     })
 }
 
+/// Rounds `x` up to a multiple of `align`. `align` is validated non-zero by
+/// the recipe, and `1` is the identity — which is what keeps the CPU layout
+/// byte-identical to the pre-alignment planner.
+fn round_up(x: u64, align: u64) -> u64 {
+    x.div_ceil(align) * align
+}
+
 #[allow(clippy::too_many_arguments)]
 fn build(
     plan: &Plan,
@@ -402,6 +423,7 @@ fn build(
     workspace: &[u64],
     recipe: &MemoryRecipe,
     budget: Option<u64>,
+    align: u64,
 ) -> MemoryPlan {
     let producer_policy: Vec<ActivationPolicy> = {
         let mut v = vec![ActivationPolicy::Keep; plan.slots.len()];
@@ -414,9 +436,11 @@ fn build(
     };
 
     let mut allocations = Vec::with_capacity(plan.slots.len());
-    let mut persistent_bytes = 0u64;
 
     // Persistent first: they are never reused and their sum is a floor.
+    // Every offset is rounded up to `align`: a `float` slot at offset 12 is
+    // harmless on the scalar CPU provider and a misaligned-device-pointer bug
+    // for an ATen kernel using 16-byte vector loads.
     let mut persistent_offset = 0u64;
     for (i, slot) in plan.slots.iter().enumerate() {
         if is_persistent(slot.kind) {
@@ -430,10 +454,11 @@ fn build(
                 },
                 policy: ActivationPolicy::Keep,
             });
-            persistent_offset += bytes;
-            persistent_bytes += bytes;
+            persistent_offset = round_up(persistent_offset + bytes, align);
         }
     }
+    // The padding between slots is part of the region the executor allocates.
+    let persistent_bytes = persistent_offset;
 
     // Aliases share storage outright.
     for (i, alias) in aliases.iter().enumerate() {
@@ -501,8 +526,16 @@ fn build(
                 free = next;
             }
             free.sort_by_key(|(off, _)| *off);
-            if let Some((off, _)) = free.iter().find(|(_, len)| *len >= bytes).copied() {
-                chosen = Some(off);
+            // A free block's start may sit in the padding after an earlier
+            // placement ended unaligned; only its aligned start is usable, and
+            // the fit must hold for the block that remains.
+            for (off, len) in &free {
+                let start = round_up(*off, align);
+                let pad = start - *off;
+                if *len >= pad && *len - pad >= bytes {
+                    chosen = Some(start);
+                    break;
+                }
             }
         }
 
@@ -511,7 +544,7 @@ fn build(
             None if counted == 0 => (0, Placement::NonResident),
             None => {
                 let off = pool_bytes;
-                pool_bytes += bytes;
+                pool_bytes = round_up(off + bytes, align);
                 (off, Placement::Pool { offset: off })
             }
         };
@@ -559,6 +592,7 @@ fn build(
         max_workspace_bytes,
         peak_bytes,
         budget_bytes: budget,
+        align_bytes: align,
         unsupported: Vec::new(),
         reuse,
     }
@@ -707,7 +741,7 @@ mod tests {
     use super::*;
     // The tests bind a local `plan`, which would shadow the pass itself.
     use super::plan as run_memory_pass;
-    use crate::ir::{OpRef, Phase};
+    use crate::ir::{OpRef, Phase, SlotId};
     use crate::{Attrs, PlanBuilder};
     use rustrain_abi::ffi::RsDtype;
     use rustrain_parallel::{Mesh, ParallelConfig};
@@ -751,6 +785,116 @@ mod tests {
         vec![None; plan.nodes.len()]
     }
 
+    /// A plan with mixed-size persistent and transient slots, so the offsets
+    /// are a non-trivial function of the packing order. The exact numbers the
+    /// alignment tests pin were produced by the pre-alignment planner and are
+    /// reproduced here from the slot sizes alone.
+    fn mixed_plan() -> Plan {
+        let mut b = PlanBuilder::new(
+            "mixed",
+            Phase::Forward,
+            Mesh::from_config(&ParallelConfig::default()).fingerprint(),
+        );
+        let w0 = b.slot("w0", RsDtype::F32, vec![64, 64], SlotKind::Weight); // 16384 B
+        let w1 = b.slot("w1", RsDtype::F32, vec![3, 5], SlotKind::Weight); // 60 B
+        let x = b.slot("x", RsDtype::F32, vec![3, 5], SlotKind::Input); // 60 B
+        let a = b.slot("a", RsDtype::F32, vec![8, 64], SlotKind::Activation); // 2048 B
+        b.node(
+            OpRef::new("elementwise_unary"),
+            vec![x, w0],
+            vec![a],
+            Attrs::new(),
+            "n0",
+        );
+        let y = b.slot("y", RsDtype::F32, vec![2, 7], SlotKind::Activation); // 56 B
+        b.node(
+            OpRef::new("elementwise_unary"),
+            vec![a, w1],
+            vec![y],
+            Attrs::new(),
+            "n1",
+        );
+        let out = b.slot("out", RsDtype::F32, vec![2, 7], SlotKind::Output); // 56 B
+        b.node(
+            OpRef::new("elementwise_unary"),
+            vec![y],
+            vec![out],
+            Attrs::new(),
+            "n2",
+        );
+        b.build().unwrap()
+    }
+
+    fn offset_of(mem: &MemoryPlan, slot: SlotId) -> u64 {
+        match mem.allocation(slot).unwrap().placement {
+            Placement::Persistent { offset } | Placement::Pool { offset } => offset,
+            other => panic!("slot {slot:?} is {other:?}, expected a real offset"),
+        }
+    }
+
+    /// CPU alignment (1) must leave the pre-alignment layout byte-identical:
+    /// every offset below is today's number, and any packing change that moves
+    /// one of them fails this test.
+    #[test]
+    fn cpu_alignment_1_keeps_the_exact_mixed_size_offsets() {
+        let plan = mixed_plan();
+        let recipe = MemoryRecipe::default();
+        let mem = run_memory_pass(
+            &plan,
+            &no_ops(&plan),
+            &recipe,
+            RuntimeCapabilities::none(),
+            1,
+        )
+        .unwrap();
+
+        // Persistent: w0 at 0, w1 immediately after w0's 16384 bytes.
+        assert_eq!(offset_of(&mem, SlotId(0)), 0);
+        assert_eq!(offset_of(&mem, SlotId(1)), 16384);
+        assert_eq!(mem.persistent_bytes, 16444);
+        // Pool: x appends at 0, a appends at 60, y reuses x's block at 0,
+        // and out reuses the gap after y at 56.
+        assert_eq!(offset_of(&mem, SlotId(2)), 0);
+        assert_eq!(offset_of(&mem, SlotId(3)), 60);
+        assert_eq!(offset_of(&mem, SlotId(4)), 0);
+        assert_eq!(offset_of(&mem, SlotId(5)), 56);
+        assert_eq!(mem.transient_pool_bytes, 2108);
+        assert_eq!(mem.peak_bytes, 18552);
+        assert_eq!(mem.align_bytes, 1);
+    }
+
+    /// CUDA alignment (256) rounds every offset up, and the padding is part of
+    /// the region sizes — the peak moves. Removing the rounding makes every
+    /// assertion here fail (the offsets collapse to the alignment-1 layout).
+    #[test]
+    fn cuda_alignment_256_rounds_offsets_and_moves_the_peak() {
+        let plan = mixed_plan();
+        let recipe = MemoryRecipe::default();
+        let mem = run_memory_pass(
+            &plan,
+            &no_ops(&plan),
+            &recipe,
+            RuntimeCapabilities::none(),
+            256,
+        )
+        .unwrap();
+
+        // Persistent: w0 at 0 (16384 is already 256-aligned), w1 still at
+        // 16384, but the region pads w1's 60 B up to the next multiple of 256.
+        assert_eq!(offset_of(&mem, SlotId(0)), 0);
+        assert_eq!(offset_of(&mem, SlotId(1)), 16384);
+        assert_eq!(mem.persistent_bytes, 16640);
+        // Pool: x at 0 pads its block up to 256, a lands at 256, y reuses 0,
+        // and out lands at 256 — not at 56, which is not 256-aligned.
+        assert_eq!(offset_of(&mem, SlotId(2)), 0);
+        assert_eq!(offset_of(&mem, SlotId(3)), 256);
+        assert_eq!(offset_of(&mem, SlotId(4)), 0);
+        assert_eq!(offset_of(&mem, SlotId(5)), 256);
+        assert_eq!(mem.transient_pool_bytes, 2304);
+        assert_eq!(mem.peak_bytes, 18944);
+        assert_eq!(mem.align_bytes, 256);
+    }
+
     #[test]
     fn lifetimes_follow_producer_and_last_consumer() {
         let plan = plan_with(3);
@@ -774,8 +918,14 @@ mod tests {
     fn peak_accounts_persistent_plus_pool_plus_workspace() {
         let plan = plan_with(2);
         let recipe = MemoryRecipe::default();
-        let mem =
-            run_memory_pass(&plan, &no_ops(&plan), &recipe, RuntimeCapabilities::none()).unwrap();
+        let mem = run_memory_pass(
+            &plan,
+            &no_ops(&plan),
+            &recipe,
+            RuntimeCapabilities::none(),
+            1,
+        )
+        .unwrap();
         // One 64x64 f32 weight = 16 KiB.
         assert_eq!(mem.persistent_bytes, 64 * 64 * 4);
         assert!(mem.transient_pool_bytes > 0);
@@ -792,8 +942,14 @@ mod tests {
             pool: MemoryPool::Slab,
             ..Default::default()
         };
-        let mem =
-            run_memory_pass(&plan, &no_ops(&plan), &recipe, RuntimeCapabilities::none()).unwrap();
+        let mem = run_memory_pass(
+            &plan,
+            &no_ops(&plan),
+            &recipe,
+            RuntimeCapabilities::none(),
+            1,
+        )
+        .unwrap();
 
         let activation_bytes = 8 * 64 * 4;
         // Four layers, each 8x64 f32, but layer N's activation dies when layer
@@ -814,8 +970,14 @@ mod tests {
             pool: MemoryPool::None,
             ..Default::default()
         };
-        let mem =
-            run_memory_pass(&plan, &no_ops(&plan), &recipe, RuntimeCapabilities::none()).unwrap();
+        let mem = run_memory_pass(
+            &plan,
+            &no_ops(&plan),
+            &recipe,
+            RuntimeCapabilities::none(),
+            1,
+        )
+        .unwrap();
         let transient: u64 = mem
             .allocations
             .iter()
@@ -838,8 +1000,14 @@ mod tests {
             budget_bytes: Some(1), // impossible
             ..Default::default()
         };
-        let mem =
-            run_memory_pass(&plan, &no_ops(&plan), &recipe, RuntimeCapabilities::none()).unwrap();
+        let mem = run_memory_pass(
+            &plan,
+            &no_ops(&plan),
+            &recipe,
+            RuntimeCapabilities::none(),
+            1,
+        )
+        .unwrap();
         let err = enforce_budget(&mem, &plan).unwrap_err();
         match err {
             PlanError::MemoryBudgetExceeded {
@@ -866,8 +1034,14 @@ mod tests {
             ..Default::default()
         };
         // No offload, no recompute: the planner must not pretend it can help.
-        let mem =
-            run_memory_pass(&plan, &no_ops(&plan), &recipe, RuntimeCapabilities::none()).unwrap();
+        let mem = run_memory_pass(
+            &plan,
+            &no_ops(&plan),
+            &recipe,
+            RuntimeCapabilities::none(),
+            1,
+        )
+        .unwrap();
         assert!(mem.decisions.is_empty(), "nothing was executable to try");
         assert!(enforce_budget(&mem, &plan).is_err());
     }
@@ -885,8 +1059,8 @@ mod tests {
             offload: true,
             recompute: true,
         };
-        let a = run_memory_pass(&plan, &no_ops(&plan), &recipe, caps).unwrap();
-        let b = run_memory_pass(&plan, &no_ops(&plan), &recipe, caps).unwrap();
+        let a = run_memory_pass(&plan, &no_ops(&plan), &recipe, caps, 1).unwrap();
+        let b = run_memory_pass(&plan, &no_ops(&plan), &recipe, caps, 1).unwrap();
         assert_eq!(
             a.decisions, b.decisions,
             "relaxation must be a deterministic function of the plan"
@@ -911,8 +1085,14 @@ mod tests {
                 activation_policy: Some(ActivationPolicy::Offload),
             },
         );
-        let mem =
-            run_memory_pass(&plan, &no_ops(&plan), &recipe, RuntimeCapabilities::none()).unwrap();
+        let mem = run_memory_pass(
+            &plan,
+            &no_ops(&plan),
+            &recipe,
+            RuntimeCapabilities::none(),
+            1,
+        )
+        .unwrap();
         assert_eq!(mem.unsupported.len(), plan.nodes.len());
         assert!(
             mem.explain().contains("cannot execute"),

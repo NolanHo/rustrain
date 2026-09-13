@@ -164,7 +164,6 @@ name_newtype! {
 /// see [`Recipe::backward_plan`].
 pub const AUTODIFF: &str = "autodiff";
 
-
 /// How a node's activations are allowed to be kept between the forward and the
 /// backward pass. Spec §2.10.
 ///
@@ -254,6 +253,12 @@ pub struct MemoryRecipe {
     pub pool: MemoryPool,
     #[serde(default)]
     pub ops: BTreeMap<String, OpMemoryRecipe>,
+    /// Byte alignment every slot offset is rounded up to. `None` derives it
+    /// from the target device (CPU 1, CUDA 256); `1` means "no padding" and
+    /// keeps the legacy offsets byte-identical. A zero alignment is rejected
+    /// in [`Recipe::validate`].
+    #[serde(default)]
+    pub align_bytes: Option<u64>,
 }
 
 impl Default for MemoryRecipe {
@@ -267,6 +272,7 @@ impl Default for MemoryRecipe {
             optimizer_state: OptimizerState::default(),
             pool: MemoryPool::default(),
             ops: BTreeMap::new(),
+            align_bytes: None,
         }
     }
 }
@@ -606,6 +612,15 @@ impl Recipe {
                 )));
             }
         }
+
+        if self.memory.align_bytes == Some(0) {
+            return Err(RecipeError::Invalid(
+                "kernel.memory.align_bytes = 0 is meaningless: a zero alignment would mean no \
+                 padding, which is what 1 (or omitting the key) already means; omit the key to \
+                 derive the alignment from the target device (CPU 1, CUDA 256)"
+                    .to_string(),
+            ));
+        }
         Ok(())
     }
 
@@ -743,4 +758,39 @@ pub enum RecipeError {
         value: String,
         accepted: String,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `align_bytes = 0` parses but cannot mean anything: it is rejected rather
+    /// than silently disabling the padding a CUDA target relies on.
+    #[test]
+    fn memory_align_bytes_of_zero_is_rejected() {
+        let err = Recipe::from_toml("[kernel.memory]\nalign_bytes = 0\n").unwrap_err();
+        match err {
+            RecipeError::Invalid(message) => {
+                assert!(
+                    message.contains("align_bytes"),
+                    "the error must name the field: {message}"
+                );
+            }
+            other => panic!("expected an Invalid error, got {other:?}"),
+        }
+    }
+
+    /// An alignment override round-trips through TOML, and an omitted key stays
+    /// `None` (derived from the target device by the compiler).
+    #[test]
+    fn memory_align_bytes_round_trips() {
+        let recipe = Recipe::from_toml("[kernel.memory]\nalign_bytes = 64\n").unwrap();
+        assert_eq!(recipe.memory.align_bytes, Some(64));
+
+        let rendered = recipe.to_toml().unwrap();
+        let reparsed = Recipe::from_toml(&rendered).unwrap();
+        assert_eq!(reparsed.memory.align_bytes, Some(64));
+
+        assert_eq!(Recipe::default().memory.align_bytes, None);
+    }
 }

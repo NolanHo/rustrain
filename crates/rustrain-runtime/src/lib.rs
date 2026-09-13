@@ -9,7 +9,8 @@
 //! a GPU:
 //!
 //! * [`Allocator`] — where slot buffers come from. [`HostAllocator`] is the
-//!   in-process one; a CUDA allocator implements the same trait later.
+//!   in-process one; [`CudaAllocator`] serves device memory through the
+//!   runtime-loaded CUDA driver (no CUDA in the dependency closure).
 //! * [`CollectiveBackend`] — what a spliced collective actually does.
 //!   [`collective::SingleRank`] is the identity at world 1;
 //!   [`collective::ThreadBackend`] is the D6 reference transport (N threads,
@@ -21,11 +22,13 @@
 
 pub mod collective;
 pub mod conformance;
+pub mod device;
 
 pub use collective::{
     CollectiveBackend, CollectiveKind, CollectiveReport, CollectiveRequest, SingleRank,
     ThreadBackend, ThreadShared,
 };
+pub use device::CudaAllocator;
 
 use std::ffi::c_void;
 
@@ -102,6 +105,13 @@ pub enum RuntimeError {
 
     #[error("slot {slot:?} has no data pointer")]
     NullData { slot: SlotId },
+
+    #[error("cannot copy {bytes} bytes for slot {slot:?}: {reason}")]
+    Copy {
+        slot: SlotId,
+        bytes: u64,
+        reason: String,
+    },
 }
 
 /// Where slot buffers come from.
@@ -113,6 +123,46 @@ pub unsafe trait Allocator {
     fn alloc(&mut self, bytes: u64, device: RsDeviceKind) -> Result<*mut c_void, String>;
     fn dealloc(&mut self, ptr: *mut c_void, bytes: u64);
     fn device(&self) -> RsDeviceKind;
+
+    /// Copies a host slice into an allocation this allocator made.
+    ///
+    /// The default is an honest host `memcpy`, correct for [`HostAllocator`];
+    /// a device allocator overrides it with a driver copy. The executor routes
+    /// every host write through this, never through the raw pointer, so the
+    /// memory's actual location stays the allocator's business.
+    fn copy_in(&mut self, dst: *mut c_void, bytes: u64, src: &[u8]) -> Result<(), String> {
+        if dst.is_null() {
+            return Err("copy_in: null destination".to_string());
+        }
+        if src.len() as u64 != bytes {
+            return Err(format!(
+                "copy_in: {bytes} byte(s) requested but the slice holds {}",
+                src.len()
+            ));
+        }
+        // SAFETY: the caller guarantees `dst` holds at least `bytes` (== the
+        // slice length) writable bytes, and the slice is valid to read.
+        unsafe { std::ptr::copy_nonoverlapping(src.as_ptr(), dst as *mut u8, src.len()) };
+        Ok(())
+    }
+
+    /// Copies an allocation back into a fresh host `Vec<u8>`.
+    ///
+    /// The default is an honest host `memcpy`; a device allocator overrides it
+    /// with a driver copy (synchronising first: the data may have been written
+    /// by kernels on a stream the driver copy does not order against).
+    fn copy_out(&self, src: *const c_void, bytes: u64) -> Result<Vec<u8>, String> {
+        if src.is_null() {
+            return Err("copy_out: null source".to_string());
+        }
+        let n = usize::try_from(bytes)
+            .map_err(|_| format!("copy_out: {bytes} bytes does not fit a host buffer"))?;
+        let mut out = vec![0u8; n];
+        // SAFETY: the caller guarantees `src` holds at least `bytes` readable
+        // bytes.
+        unsafe { std::ptr::copy_nonoverlapping(src as *const u8, out.as_mut_ptr(), n) };
+        Ok(out)
+    }
 }
 
 /// Host memory. Sufficient for the reference provider and for every test that
@@ -473,10 +523,17 @@ impl Executor {
             });
         }
         let ptr = self.data_ptr(id)?;
-        // SAFETY: the buffer holds at least `expected` f32 (sized from the same
-        // shape table) and `data` has exactly that many elements.
-        unsafe { std::ptr::copy_nonoverlapping(data.as_ptr(), ptr as *mut f32, data.len()) };
-        Ok(())
+        let bytes = std::mem::size_of_val(data) as u64;
+        // SAFETY: `data` holds exactly `expected` f32 (checked above), so the
+        // byte view covers exactly `bytes`.
+        let raw = unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, bytes as usize) };
+        self.allocator
+            .copy_in(ptr, bytes, raw)
+            .map_err(|reason| RuntimeError::Copy {
+                slot: id,
+                bytes,
+                reason,
+            })
     }
 
     /// Reads a slot back as host f32 data.
@@ -484,9 +541,20 @@ impl Executor {
         self.check_f32(id)?;
         let len = self.slot_len(id);
         let ptr = self.data_ptr(id)?;
+        let bytes = (len * std::mem::size_of::<f32>()) as u64;
+        let host = self
+            .allocator
+            .copy_out(ptr, bytes)
+            .map_err(|reason| RuntimeError::Copy {
+                slot: id,
+                bytes,
+                reason,
+            })?;
         let mut out = vec![0f32; len];
-        // SAFETY: as in `write_f32`.
-        unsafe { std::ptr::copy_nonoverlapping(ptr as *const f32, out.as_mut_ptr(), len) };
+        // SAFETY: `copy_out` returned exactly `bytes` = `len` f32.
+        unsafe {
+            std::ptr::copy_nonoverlapping(host.as_ptr() as *const f32, out.as_mut_ptr(), len)
+        };
         Ok(out)
     }
 
@@ -503,13 +571,23 @@ impl Executor {
             });
         }
         let ptr = self.data_ptr(id)?;
-        // SAFETY: the buffer is exactly `expected` bytes and `bytes` is too.
-        unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr as *mut u8, bytes.len()) };
-        Ok(())
+        self.allocator
+            .copy_in(ptr, expected, bytes)
+            .map_err(|reason| RuntimeError::Copy {
+                slot: id,
+                bytes: expected,
+                reason,
+            })
     }
 
     /// Reads a slot back as a **contiguous** byte buffer, materialising a
     /// strided view if the slot holds one.
+    ///
+    /// The whole buffer the view covers comes to host in one piece first
+    /// (`copy_out(buf.ptr, buf.bytes)`) and `materialise` walks that host
+    /// slice: a strided view cannot be walked element by element through
+    /// device memory, and `buf.bytes` is exactly the byte span the view reads
+    /// (see the adoption site in `run`).
     pub fn read_raw(&self, id: SlotId) -> Result<Vec<u8>, RuntimeError> {
         let buf = self
             .buffers
@@ -519,8 +597,16 @@ impl Executor {
         if buf.ptr.is_null() {
             return Err(RuntimeError::NullData { slot: id });
         }
+        let host = self
+            .allocator
+            .copy_out(buf.ptr, buf.bytes)
+            .map_err(|reason| RuntimeError::Copy {
+                slot: id,
+                bytes: buf.bytes,
+                reason,
+            })?;
         Ok(materialise(
-            buf.ptr,
+            host.as_ptr() as *const c_void,
             buf.shape.as_slice(),
             buf.strides.as_slice(),
             buf.rank,
@@ -721,6 +807,10 @@ impl Executor {
                     buf.shape = t.shape;
                     buf.strides = t.stride;
                     buf.rank = t.rank;
+                    // The slot now holds a strided view into another buffer, so
+                    // its bytes are the contiguous span the view reads — the
+                    // amount `read_raw` must copy to host before materialising.
+                    buf.bytes = span_bytes(buf.shape, buf.strides, buf.rank, buf.elem_width);
                 }
             }
         }
@@ -781,6 +871,27 @@ fn is_dense(buf: &SlotBuffer) -> bool {
         acc *= buf.shape[d].max(1);
     }
     buf.bytes == (numel.max(0) as u64) * (buf.elem_width.max(1) as u64)
+}
+
+/// The contiguous byte span a strided view covers: from its `data` pointer up
+/// to and including the highest element `materialise` walks. `read_raw` copies
+/// exactly this many bytes to host, so the span must be the largest offset
+/// plus one element width.
+fn span_bytes(shape: [i64; 8], strides: [i64; 8], rank: u32, elem_width: u32) -> u64 {
+    let rank = (rank as usize).min(shape.len());
+    let width = elem_width.max(1) as u64;
+    let mut max_offset = 0u64;
+    for d in 0..rank {
+        let dim = shape[d].max(0) as u64;
+        if dim == 0 {
+            continue;
+        }
+        // Negative strides do not occur in the operators this runtime has run;
+        // treating them as 0 matches a descriptor whose data points at the
+        // lowest address it reads.
+        max_offset += (dim - 1) * strides[d].max(0) as u64;
+    }
+    (max_offset + 1) * width
 }
 
 /// Copies a strided view into a contiguous buffer.
@@ -893,5 +1004,149 @@ mod tests {
         // A size-1 dim with stride 0 (broadcast) is not dense.
         let broadcast = buf([1, 3, 0, 0, 0, 0, 0, 0], [0, 1, 0, 0, 0, 0, 0, 0], 2, 4, 12);
         assert!(!is_dense(&broadcast));
+    }
+
+    /// The byte span a view covers: from its data pointer to its highest
+    /// element. `read_raw` copies exactly this much, so the span must never
+    /// under-count a strided view.
+    #[test]
+    fn span_bytes_covers_the_strided_view() {
+        // A narrow along the last dim of a [4, 8] f32 tensor: elements sit at
+        // offsets i*8 + j, so the highest one is 27 and the span is 28 f32.
+        let narrow = span_bytes([4, 4, 0, 0, 0, 0, 0, 0], [8, 1, 0, 0, 0, 0, 0, 0], 2, 4);
+        assert_eq!(narrow, 28 * 4);
+        // A transpose of [4, 8]: highest offset 7*1 + 3*8 = 31, span 32 f32.
+        let transposed = span_bytes([8, 4, 0, 0, 0, 0, 0, 0], [1, 8, 0, 0, 0, 0, 0, 0], 2, 4);
+        assert_eq!(transposed, 32 * 4);
+        // A broadcast [4, 1] -> [4, 8]: stride 0 contributes nothing, the span
+        // is the input's own 4 f32.
+        let broadcast = span_bytes([4, 8, 0, 0, 0, 0, 0, 0], [1, 0, 0, 0, 0, 0, 0, 0], 2, 4);
+        assert_eq!(broadcast, 4 * 4);
+    }
+
+    /// The default `copy_in`/`copy_out` do the honest host thing, so an
+    /// allocator that implements only the three core methods keeps working.
+    #[test]
+    fn allocator_defaults_copy_on_the_host() {
+        let mut allocator = HostAllocator::new();
+        let ptr = allocator.alloc(64, RsDeviceKind::CPU).unwrap();
+        let data: Vec<u8> = (0..64u8).collect();
+        allocator.copy_in(ptr, 64, &data).unwrap();
+        assert_eq!(allocator.copy_out(ptr, 64).unwrap(), data);
+        allocator.dealloc(ptr, 64);
+    }
+
+    /// Proves the executor moves host data through the allocator's copy hooks
+    /// instead of dereferencing the slot pointer directly: the counters only
+    /// move when `write_f32`/`write_raw`/`read_f32`/`read_raw` call the trait.
+    /// Without the routing, every counter stays 0 and this test fails.
+    #[test]
+    fn executor_routes_host_data_through_the_allocator_copy_hooks() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        use rustrain_abi::Plugin;
+        use rustrain_parallel::{Mesh, ParallelConfig};
+        use rustrain_plan::{Attrs, OpRef, PlanBuilder, SlotKind};
+
+        struct RecordingAllocator {
+            inner: HostAllocator,
+            copies_in: Arc<AtomicUsize>,
+            copies_out: Arc<AtomicUsize>,
+        }
+
+        unsafe impl Allocator for RecordingAllocator {
+            fn alloc(&mut self, bytes: u64, device: RsDeviceKind) -> Result<*mut c_void, String> {
+                self.inner.alloc(bytes, device)
+            }
+
+            fn dealloc(&mut self, ptr: *mut c_void, bytes: u64) {
+                self.inner.dealloc(ptr, bytes);
+            }
+
+            fn device(&self) -> RsDeviceKind {
+                self.inner.device()
+            }
+
+            fn copy_in(&mut self, dst: *mut c_void, bytes: u64, src: &[u8]) -> Result<(), String> {
+                self.copies_in.fetch_add(1, Ordering::SeqCst);
+                self.inner.copy_in(dst, bytes, src)
+            }
+
+            fn copy_out(&self, src: *const c_void, bytes: u64) -> Result<Vec<u8>, String> {
+                self.copies_out.fetch_add(1, Ordering::SeqCst);
+                self.inner.copy_out(src, bytes)
+            }
+        }
+
+        let mut registry = rustrain_ops::Registry::new();
+        // SAFETY: the built-in provider descriptor is leaked by the builder and
+        // lives for the process.
+        let reference = unsafe { Plugin::from_static(rustrain_kernels::plugin(), "<built-in>") }
+            .expect("the built-in provider passes ABI validation");
+        registry.add_plugin(reference).expect("registering it");
+        let recipe = rustrain_ops::Recipe::from_toml("[kernel]\ndefault = \"reference\"\n")
+            .expect("recipe parses");
+
+        let mut b = PlanBuilder::new(
+            "copy-routing",
+            rustrain_ops::Phase::Forward,
+            Mesh::from_config(&ParallelConfig::default()).fingerprint(),
+        );
+        let x = b.slot("x", RsDtype::F32, vec![4], SlotKind::Input);
+        let y = b.slot("y", RsDtype::F32, vec![4], SlotKind::Output);
+        b.node(
+            OpRef::new("elementwise_unary"),
+            vec![x],
+            vec![y],
+            Attrs::new().set("kind", "relu"),
+            "relu",
+        );
+        let plan = b.build().unwrap();
+        let compiled =
+            rustrain_plan::Compiler::new(&registry, &recipe, rustrain_ops::TargetEnv::default())
+                .compile(&plan)
+                .unwrap();
+
+        let copies_in = Arc::new(AtomicUsize::new(0));
+        let copies_out = Arc::new(AtomicUsize::new(0));
+        let mut executor = Executor::new(
+            compiled,
+            Box::new(RecordingAllocator {
+                inner: HostAllocator::new(),
+                copies_in: copies_in.clone(),
+                copies_out: copies_out.clone(),
+            }),
+            Box::new(SingleRank::new(1)),
+        )
+        .unwrap();
+
+        executor.write_f32(x, &[1.0, -2.0, 3.0, -4.0]).unwrap();
+        // The same values through the raw path, to exercise `write_raw` too.
+        let bytes: Vec<u8> = [1.0f32, -2.0, 3.0, -4.0]
+            .iter()
+            .flat_map(|v| v.to_ne_bytes())
+            .collect();
+        executor.write_raw(x, &bytes).unwrap();
+
+        executor.run().unwrap();
+        assert_eq!(executor.read_f32(y).unwrap(), vec![1.0, 0.0, 3.0, 0.0]);
+        // `read_raw` returns the kernel's relu output, in its byte form.
+        let relu_bytes: Vec<u8> = [1.0f32, 0.0, 3.0, 0.0]
+            .iter()
+            .flat_map(|v| v.to_ne_bytes())
+            .collect();
+        assert_eq!(executor.read_raw(y).unwrap(), relu_bytes);
+
+        assert_eq!(
+            copies_in.load(Ordering::SeqCst),
+            2,
+            "both write paths copy in"
+        );
+        assert_eq!(
+            copies_out.load(Ordering::SeqCst),
+            2,
+            "both read paths copy out"
+        );
     }
 }

@@ -12,13 +12,13 @@
 //! architecture exists to remove, and it would be ironic to reintroduce it in
 //! the gate itself.
 
-use rustrain_abi::ffi::{RsAttrs, RsDtype, RsTensor};
+use rustrain_abi::ffi::{RsAttrs, RsDeviceKind, RsDtype, RsTensor};
 use rustrain_ops::{Phase, Recipe, RegisteredOp, Registry, TargetEnv};
 use rustrain_parallel::{Mesh, ParallelConfig};
 use rustrain_plan::attrs::AbiAttrs;
 use rustrain_plan::{Attrs, Compiler, OpRef, Plan, PlanBuilder, SlotId, SlotKind};
 
-use crate::{Executor, HostAllocator, SingleRank};
+use crate::{Allocator, CudaAllocator, Executor, HostAllocator, SingleRank};
 
 /// The provider every other provider is measured against.
 pub const REFERENCE_VARIANT: &str = "reference.f32";
@@ -414,6 +414,15 @@ pub struct Harness<'a> {
     registry: &'a Registry,
     recipe: &'a Recipe,
     tolerance: Tolerance,
+    /// The environment candidate executors compile against. The reference
+    /// executor always compiles for the CPU host — it is the oracle, and its
+    /// kernel code dereferences raw pointers, so host code must never be
+    /// handed device memory.
+    env: TargetEnv,
+    /// Builds the allocator for a candidate executor. Defaults to host memory;
+    /// [`Harness::device`] switches it to a CUDA allocator, whose failure (no
+    /// driver, no device) surfaces as a loud candidate failure, never a skip.
+    allocator: Box<dyn Fn() -> Result<Box<dyn Allocator + Send>, String>>,
 }
 
 impl<'a> Harness<'a> {
@@ -422,11 +431,30 @@ impl<'a> Harness<'a> {
             registry,
             recipe,
             tolerance: Tolerance::default(),
+            env: TargetEnv::default(),
+            allocator: Box::new(|| Ok(Box::new(HostAllocator::new()) as Box<dyn Allocator + Send>)),
         }
     }
 
     pub fn tolerance(mut self, t: Tolerance) -> Self {
         self.tolerance = t;
+        self
+    }
+
+    /// Checks a device provider: every candidate executor allocates through a
+    /// [`CudaAllocator`] on `device_index` and compiles for that device, while
+    /// the reference provider keeps running on the host. When no device is
+    /// available, the candidate's execution fails loudly (its `numeric` check
+    /// is a `FAIL` naming the allocator's error) — a device provider that
+    /// cannot run is never silently skipped.
+    pub fn device(mut self, device: RsDeviceKind, device_index: usize) -> Self {
+        self.env.device = device;
+        self.allocator = match device {
+            RsDeviceKind::CUDA => Box::new(move || {
+                Ok(Box::new(CudaAllocator::new(device_index)?) as Box<dyn Allocator + Send>)
+            }),
+            _ => Box::new(|| Ok(Box::new(HostAllocator::new()) as Box<dyn Allocator + Send>)),
+        };
         self
     }
 
@@ -636,7 +664,10 @@ impl<'a> Harness<'a> {
         }
 
         let plan = b.build().map_err(|e| e.to_string())?;
-        let mut ex = self.make_executor(&plan)?;
+        // An expansion is replayed through the reference primitives, which are
+        // host code — always the host allocator, whatever device the candidate
+        // is checked on.
+        let mut ex = self.make_executor(&plan, true)?;
         for (i, spec) in case.inputs.iter().enumerate() {
             ex.write_raw(slots[i], &spec.bytes())
                 .map_err(|e| e.to_string())?;
@@ -729,7 +760,11 @@ impl<'a> Harness<'a> {
         );
 
         let plan = b.build().map_err(|e| e.to_string())?;
-        let mut ex = self.make_executor(&plan)?;
+        // The reference implementation is CPU code reading raw pointers, so it
+        // always runs on the host; a candidate runs where the harness was told
+        // to put it.
+        let on_host = variant == REFERENCE_VARIANT;
+        let mut ex = self.make_executor(&plan, on_host)?;
         for (slot, spec) in in_slots.iter().zip(&case.inputs) {
             ex.write_raw(*slot, &spec.bytes())
                 .map_err(|e| e.to_string())?;
@@ -751,19 +786,26 @@ impl<'a> Harness<'a> {
             .collect()
     }
 
-    fn make_executor(&self, plan: &Plan) -> Result<Executor, String> {
+    /// Builds one executor. `on_host` runs the plan on host memory and compiles
+    /// it for the CPU target — the reference implementation's place; `false`
+    /// uses the harness's configured device and allocator, so an unavailable
+    /// device is a *reported* error (which the caller turns into a `FAIL`),
+    /// never a skip.
+    fn make_executor(&self, plan: &Plan, on_host: bool) -> Result<Executor, String> {
         // Single-process, so no memory strategy beyond `keep` is available; the
         // compiler is told that rather than left to assume one.
-        let compiled = Compiler::new(self.registry, self.recipe, TargetEnv::default())
+        let (env, allocator): (TargetEnv, Box<dyn Allocator + Send>) = if on_host {
+            (TargetEnv::default(), Box::new(HostAllocator::new()))
+        } else {
+            let allocator = (self.allocator)()
+                .map_err(|e| format!("preparing the executor's allocator: {e}"))?;
+            (self.env.clone(), allocator)
+        };
+        let compiled = Compiler::new(self.registry, self.recipe, env)
             .capabilities(rustrain_plan::RuntimeCapabilities::default())
             .compile(plan)
             .map_err(|e| e.to_string())?;
-        Executor::new(
-            compiled,
-            Box::new(HostAllocator::new()),
-            Box::new(SingleRank::new(1)),
-        )
-        .map_err(|e| e.to_string())
+        Executor::new(compiled, allocator, Box::new(SingleRank::new(1))).map_err(|e| e.to_string())
     }
 
     fn lookup(&self, op: &str, variant: &str) -> Option<RegisteredOp> {

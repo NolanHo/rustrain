@@ -8,7 +8,7 @@
 
 use serde::Serialize;
 
-use rustrain_abi::ffi::{RsNumerics, RsTensor};
+use rustrain_abi::ffi::{RsDeviceKind, RsNumerics, RsTensor};
 use rustrain_ops::{Phase, Recipe, RegisteredOp, Registry, ResolveRequest, TargetEnv};
 use rustrain_parallel::{GroupMask, MeshFingerprint, ParallelLayout, ReduceOp};
 
@@ -314,7 +314,27 @@ impl<'a> Compiler<'a> {
         // (D12, docs/architecture.md §8): the peak is a projection of a plan the
         // runtime has not executed, and blocking it was the wrong gate — the
         // warning travels with the compiled plan so `plan explain` prints it.
-        let memory = memory::plan(&plan, &resolved_ops, &self.recipe.memory, self.caps)?;
+        //
+        // The alignment is the recipe's override, else the target's: CUDA
+        // kernels use 16-byte vector loads over cudaMalloc'd bases that are
+        // only 256-byte aligned, so slot offsets are rounded up to 256; the CPU
+        // provider needs no padding and keeps the legacy offsets with 1. A
+        // device kind the framework does not know falls back to 1 (no padding),
+        // never to a guess.
+        let align_bytes = self.recipe.memory.align_bytes.unwrap_or_else(|| {
+            if self.env.device == RsDeviceKind::CUDA {
+                256
+            } else {
+                1
+            }
+        });
+        let memory = memory::plan(
+            &plan,
+            &resolved_ops,
+            &self.recipe.memory,
+            self.caps,
+            align_bytes,
+        )?;
         let mut warnings: Vec<String> = Vec::new();
         if let Err(over) = memory::enforce_budget(&memory, &plan) {
             warnings.push(over.to_string());
@@ -912,7 +932,7 @@ mod tests {
     use super::*;
     use crate::ir::{OpRef, SlotKind};
     use crate::{Attrs, PlanBuilder};
-    use rustrain_abi::ffi::RsDtype;
+    use rustrain_abi::ffi::{RsDeviceKind, RsDtype};
     use rustrain_parallel::{Mesh, ParallelConfig};
 
     fn default_mesh() -> Mesh {
@@ -1047,6 +1067,52 @@ mod tests {
         let a = compile_plan(&plan);
         let b = compile_plan(&plan);
         assert_eq!(a.digest, b.digest);
+    }
+
+    /// The frozen derivation: an unset recipe alignment means 1 on a CPU
+    /// target (the legacy layout, byte-identical) and 256 on a CUDA target;
+    /// the recipe override wins over both. The plan's one pool slot is 16
+    /// bytes, so the peak (persistent 0 + pool + workspace 0) is exactly the
+    /// rounded pool size.
+    #[test]
+    fn memory_alignment_derives_from_the_target_and_obeys_the_override() {
+        let plan = all_reduce_plan(GroupMask::from_bits(0b1));
+        let registry = Registry::new();
+
+        // CPU target: alignment 1 keeps the legacy pool size.
+        let recipe = Recipe::default();
+        let cpu_compiled = Compiler::new(&registry, &recipe, TargetEnv::default())
+            .compile(&plan)
+            .unwrap();
+        assert_eq!(cpu_compiled.memory.align_bytes, 1);
+        assert_eq!(cpu_compiled.memory.transient_pool_bytes, 16);
+
+        // CUDA target: alignment 256 pads the pool up to 256.
+        let env = TargetEnv {
+            device: RsDeviceKind::CUDA,
+            ..TargetEnv::default()
+        };
+        let cuda_compiled = Compiler::new(&registry, &recipe, env.clone())
+            .compile(&plan)
+            .unwrap();
+        assert_eq!(cuda_compiled.memory.align_bytes, 256);
+        assert_eq!(cuda_compiled.memory.transient_pool_bytes, 256);
+
+        // The memory plan is not part of the digest preimage (the digest
+        // hashes the plan and the resolution decisions, not the offsets), so
+        // the alignment change does not move the digest. Pinned here so a
+        // later decision to include the memory plan is a *deliberate* digest
+        // change, not an accident.
+        assert_eq!(cpu_compiled.digest, cuda_compiled.digest);
+
+        // The recipe override wins over the target's default.
+        let mut recipe = Recipe::default();
+        recipe.memory.align_bytes = Some(64);
+        let compiled = Compiler::new(&registry, &recipe, env)
+            .compile(&plan)
+            .unwrap();
+        assert_eq!(compiled.memory.align_bytes, 64);
+        assert_eq!(compiled.memory.transient_pool_bytes, 64);
     }
 
     /// One explicit `all_to_all` node. The group covers tp|ep over a mesh with

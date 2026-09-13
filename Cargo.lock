@@ -583,6 +583,7 @@ dependencies = [
 name = "rustrain-runtime"
 version = "0.2.0"
 dependencies = [
+ "libloading",
  "rustrain-abi",
  "rustrain-kernels",
  "rustrain-ops",

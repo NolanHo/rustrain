@@ -31,6 +31,7 @@ use rustrain_runtime::{
     required_inputs,
 };
 
+use crate::device::DeviceSpec;
 use crate::load::load_weights;
 use crate::npz::{self, Npy};
 
@@ -95,6 +96,22 @@ pub(crate) struct RunArgs {
     /// rank-0 logits are compared against it with the D6 bound.
     #[arg(long, value_name = "LIST")]
     pub sweep: Option<String>,
+
+    /// A plugin `.so` to load in addition to the built-in provider.
+    #[arg(long = "plugin", value_name = "PATH")]
+    pub plugins: Vec<PathBuf>,
+
+    /// Recipe file deciding which implementation runs. Omitted: the built-in reference provider
+    /// is selected.
+    #[arg(long, value_name = "PATH")]
+    pub recipe: Option<PathBuf>,
+
+    /// Where the slot buffers live: `cpu` (default), `cuda`, or `cuda:<index>` (`cuda` alone is
+    /// device 0). A CUDA device with a mesh whose world size is > 1 is refused up front: one
+    /// CUDA context can only be current on one thread, so a multi-rank CUDA launch needs one
+    /// process per rank (the next step of D6).
+    #[arg(long, value_name = "SPEC", default_value = "cpu")]
+    pub device: String,
 }
 
 /// One hidden state's summary row, in the comparison's `[mean, std, max]` order.
@@ -107,6 +124,7 @@ fn summarize(values: &[f32]) -> [f32; 3] {
 }
 
 pub(crate) fn run(args: RunArgs) -> Result<()> {
+    let device = DeviceSpec::parse(&args.device)?;
     let degrees = [args.tp, args.cp, args.ep, args.dp, args.pp];
     if let Some(degree) = degrees.iter().find(|d| **d == 0) {
         bail!("a mesh degree of {degree} is not a mesh: every axis degree must be at least 1");
@@ -120,12 +138,25 @@ pub(crate) fn run(args: RunArgs) -> Result<()> {
             args.pp
         );
     }
+    // The CUDA guard, up front: a context is current on one thread, so one
+    // allocator serves one execution thread. Refused here, before anything
+    // touches the model or the device — multi-rank CUDA is one process per
+    // rank, which is the next step of D6.
+    let world = degrees.iter().fold(1usize, |a, b| a.saturating_mul(*b));
+    if device.is_cuda() && world > 1 {
+        bail!(
+            "`--device cuda` with a mesh of world size {world}: a CUDA context can only be \
+             current on one host thread at a time, so one allocator/context serves one execution \
+             thread; a multi-rank CUDA launch needs one process per rank, which is the next step \
+             of D6. Run one rank (every degree 1) or drop `--device cuda`"
+        );
+    }
 
     // ---- the probe tokens -----------------------------------------------
     let tokens = probe_tokens(args.tokens.as_deref(), args.seq)?;
 
     if let Some(list) = &args.sweep {
-        return run_sweep(&args, &tokens, list);
+        return run_sweep(&args, &tokens, list, device);
     }
 
     let config = ParallelConfig {
@@ -135,13 +166,21 @@ pub(crate) fn run(args: RunArgs) -> Result<()> {
         data: args.dp,
         pipeline: args.pp,
     };
-    let result =
-        execute_mesh(&args.model, &args.checkpoint, &tokens, &config).with_context(|| {
-            format!(
-                "executing the forward on the mesh degrees {}",
-                mesh_text(&config)
-            )
-        })?;
+    let result = execute_mesh(
+        &args.model,
+        &args.checkpoint,
+        &tokens,
+        &config,
+        &args.plugins,
+        args.recipe.as_deref(),
+        device,
+    )
+    .with_context(|| {
+        format!(
+            "executing the forward on the mesh degrees {}",
+            mesh_text(&config)
+        )
+    })?;
 
     let window = result.window;
     let vocab = result.vocab;
@@ -354,6 +393,7 @@ fn mesh_text(cfg: &ParallelConfig) -> String {
 /// One rank's forward, or why it failed. Everything the rank touches — model
 /// load, instantiate, weight load, compile, execute — happens inside, so a
 /// rank is a complete unit the multi-rank driver runs on its own thread.
+#[allow(clippy::too_many_arguments)]
 fn run_rank(
     model_dir: &Path,
     checkpoint: &Path,
@@ -361,6 +401,9 @@ fn run_rank(
     mesh: &Mesh,
     rank: usize,
     shared: Option<&Arc<ThreadShared>>,
+    plugins: &[PathBuf],
+    recipe_path: Option<&Path>,
+    device: DeviceSpec,
 ) -> Result<serde_json::Value> {
     // ---- description → global plan → this rank's plan --------------------
     let model = rustrain_model::Model::load(model_dir)
@@ -449,15 +492,21 @@ fn run_rank(
         .context("loading the checkpoint weights")?;
     let loaded_count = loaded.len();
 
-    // ---- compile against the reference provider -------------------------
-    let registry = crate::load_registry(&[]).context("loading the reference provider")?;
-    let recipe = crate::load_recipe(None).context("loading the default recipe")?;
-    let compiled =
-        rustrain_plan::Compiler::new(&registry, &recipe, rustrain_ops::TargetEnv::default())
-            .compile(&plan)
-            .context(
-                "compiling the plan (every node must resolve and its inferred shapes must agree)",
-            )?;
+    // ---- compile against the configured providers ------------------------
+    let registry = crate::load_registry(plugins).context("loading the operator providers")?;
+    let recipe = crate::load_recipe(recipe_path).context("loading the recipe")?;
+    // The compile target's device follows the allocator: a CUDA device means
+    // CUDA variants resolve and the memory plan aligns slot buffers for the
+    // device; the default stays exactly `TargetEnv::default()` (CPU).
+    let mut env = rustrain_ops::TargetEnv::default();
+    if device.is_cuda() {
+        env.device = device.kind();
+    }
+    let compiled = rustrain_plan::Compiler::new(&registry, &recipe, env)
+        .compile(&plan)
+        .context(
+            "compiling the plan (every node must resolve and its inferred shapes must agree)",
+        )?;
 
     let plan_steps = compiled.steps.len();
     let digest = compiled.digest.clone();
@@ -474,8 +523,22 @@ fn run_rank(
         None => Box::new(SingleRank::new(mesh.world_size())),
         Some(shared) => Box::new(ThreadBackend::new(rank, mesh.clone(), shared.clone())),
     };
-    let mut executor = Executor::new(compiled, Box::new(HostAllocator::new()), backend)
-        .context("preparing the executor")?;
+    // The framework owns the memory: host for the CPU default, the
+    // runtime-loaded CUDA driver for a device run. One CudaAllocator per rank
+    // thread (the CUDA guard above refuses world > 1 with a device).
+    let allocator: Box<dyn rustrain_runtime::Allocator + Send> = match device {
+        DeviceSpec::Cpu => Box::new(HostAllocator::new()),
+        DeviceSpec::Cuda(index) => Box::new(rustrain_runtime::CudaAllocator::new(index).map_err(
+            |error| {
+                anyhow::anyhow!(
+                    "initialising CUDA device {index} for `--device cuda:{index}`: the driver \
+                     could not be loaded or initialised: {error}"
+                )
+            },
+        )?),
+    };
+    let mut executor =
+        Executor::new(compiled, allocator, backend).context("preparing the executor")?;
 
     // Every slot no node produces must be fed: weights from the loader, the token stream from the
     // probe. Anything else is an input this runner cannot produce — named, not guessed.
@@ -615,6 +678,9 @@ fn execute_mesh(
     checkpoint: &Path,
     tokens: &[i64],
     cfg: &ParallelConfig,
+    plugins: &[PathBuf],
+    recipe_path: Option<&Path>,
+    device: DeviceSpec,
 ) -> Result<MeshResult> {
     let mesh = Mesh::from_config(cfg);
     let world = mesh.world_size();
@@ -626,7 +692,17 @@ fn execute_mesh(
         .clone();
 
     let rank_results: Vec<Result<serde_json::Value>> = if world == 1 {
-        vec![run_rank(model_dir, checkpoint, tokens, &mesh, 0, None)]
+        vec![run_rank(
+            model_dir,
+            checkpoint,
+            tokens,
+            &mesh,
+            0,
+            None,
+            plugins,
+            recipe_path,
+            device,
+        )]
     } else {
         let shared = ThreadShared::new(world);
         let (tx, rx) = mpsc::channel::<(usize, Result<serde_json::Value>)>();
@@ -638,8 +714,20 @@ fn execute_mesh(
             let model_dir = model_dir.to_path_buf();
             let checkpoint = checkpoint.to_path_buf();
             let tokens = tokens.to_vec();
+            let plugins = plugins.to_vec();
+            let recipe_path = recipe_path.map(Path::to_path_buf);
             handles.push(std::thread::spawn(move || {
-                let result = run_rank(&model_dir, &checkpoint, &tokens, &mesh, rank, Some(&shared));
+                let result = run_rank(
+                    &model_dir,
+                    &checkpoint,
+                    &tokens,
+                    &mesh,
+                    rank,
+                    Some(&shared),
+                    &plugins,
+                    recipe_path.as_deref(),
+                    device,
+                );
                 // Any failure must wake every rank blocked at a rendezvous —
                 // a silently hung world is worse than a reported one.
                 if let Err(error) = &result {
@@ -651,7 +739,17 @@ fn execute_mesh(
         drop(tx);
 
         let rank0 = {
-            let result = run_rank(model_dir, checkpoint, tokens, &mesh, 0, Some(&shared));
+            let result = run_rank(
+                model_dir,
+                checkpoint,
+                tokens,
+                &mesh,
+                0,
+                Some(&shared),
+                plugins,
+                recipe_path,
+                device,
+            );
             if let Err(error) = &result {
                 shared.poison(&format!("rank 0 failed: {error:#}"));
             }
@@ -1123,12 +1221,40 @@ fn max_abs_diff(a: &[f32], b: &[f32]) -> f64 {
 /// Runs the same forward over every listed mesh and writes ONE JSON report to
 /// `--out`. A world-1 baseline always runs first; every configuration's rank-0
 /// logits are compared against it with the D6 relative bound.
-fn run_sweep(args: &RunArgs, tokens: &[i64], list: &str) -> Result<()> {
+fn run_sweep(args: &RunArgs, tokens: &[i64], list: &str, device: DeviceSpec) -> Result<()> {
     let configs = parse_sweep(list)?;
 
+    // The same CUDA guard as the single run, checked for every listed mesh
+    // before anything executes.
+    for cfg in &configs {
+        let world = cfg
+            .tensor
+            .saturating_mul(cfg.expert)
+            .saturating_mul(cfg.context)
+            .saturating_mul(cfg.data)
+            .saturating_mul(cfg.pipeline);
+        if device.is_cuda() && world > 1 {
+            bail!(
+                "`--device cuda` with the {} config (world size {world}): a CUDA context can only \
+                 be current on one host thread at a time, so one allocator/context serves one \
+                 execution thread; a multi-rank CUDA launch needs one process per rank, which is \
+                 the next step of D6",
+                mesh_text(cfg)
+            );
+        }
+    }
+
     let baseline_cfg = ParallelConfig::default();
-    let baseline = execute_mesh(&args.model, &args.checkpoint, tokens, &baseline_cfg)
-        .context("running the world-1 baseline")?;
+    let baseline = execute_mesh(
+        &args.model,
+        &args.checkpoint,
+        tokens,
+        &baseline_cfg,
+        &args.plugins,
+        args.recipe.as_deref(),
+        device,
+    )
+    .context("running the world-1 baseline")?;
     let baseline_max = max_abs(&baseline.logits);
     if baseline.logits.is_empty() {
         bail!("the world-1 baseline produced no logits");
@@ -1136,8 +1262,16 @@ fn run_sweep(args: &RunArgs, tokens: &[i64], list: &str) -> Result<()> {
 
     let mut entries = Vec::with_capacity(configs.len());
     for cfg in &configs {
-        let result = execute_mesh(&args.model, &args.checkpoint, tokens, cfg)
-            .with_context(|| format!("executing the sweep config {}", mesh_text(cfg)))?;
+        let result = execute_mesh(
+            &args.model,
+            &args.checkpoint,
+            tokens,
+            cfg,
+            &args.plugins,
+            args.recipe.as_deref(),
+            device,
+        )
+        .with_context(|| format!("executing the sweep config {}", mesh_text(cfg)))?;
         if result.logits.len() != baseline.logits.len() {
             bail!(
                 "the {} config produced {} logits, the baseline {}: the meshes are not the same \

@@ -243,24 +243,31 @@ L1 全绿（按契约 skip 的四个项除外）；`l1.instantiate` 的 `details
 
 ### D5 — 前向数值对齐 HuggingFace
 
-**可观察结果**：在验证宿主（8× L20X）上，同一段 token、同样的 `input_ids`，rustrain 的 logits 与
+**可观察结果**：在验证宿主（8× L20X，sm_89）上，同一段 token、同样的 `input_ids`，rustrain 的 logits 与
 HF transformers 的 logits 在容差内一致；每层 hidden 的 mean/std/max 差异 < 1%（沿用旧框架验证过的方法）。
-**交付位置**：`rustrain-kernels` 的 5 个新原语 reference 实现 + 3 处 T2 声明补齐 + `rustrain run`（权重加载与前向）+ 一个对比脚本。
 
-**状态（本机侧已完成，缺的是上机那一步）**：5 个原语 + 3 处 T2 声明（`4972234`、`2147c77`）、`all_to_all` 归入 intrinsic（`a81684e`）、描述与算子契约按安装在本机的 HF 源码逐条对齐（`8de5f90`、`4bd2c1e`：逐 head 注意力、逐 head `l2norm`、MoE 拆开权重、router 双输出与无条件重归一化、`embedding` 操作数顺序、GQA 的 rope 拆分、专家权重朝向 —— **其中四项是"真的去编译"才暴露的**，`check` 只看算子名与 dtype，永远发现不了）、`rustrain run` 权重加载与 npz 输出（`62fcf1e`）、对比脚本与判定逻辑（`885adb6`，本机用合成数据验过）、`moe_layer` 的 conformance case（`3f8c630`）。
-本机门禁：工作区 **428 passed** / clippy 0 warning / `ops check` 30 个 case 0 failing / 真实 plan 在 f32 下**可编译**（1337 steps + 53 个 world=1 的 identity collective）。
-**未完成**：上面三命令的数值对比 —— 需要用户确认下载 ~70 GB 权重并占用验证宿主的 GPU（目标里写明不得自行占用）。
+**判定用哪条执行路径（2026-09 用户裁定后的修正）**：用户禁止**除对照以外**的 CPU 执行，且对照只能小规模
+谨慎启动。因此候选侧**不再是** CPU reference provider 的整模型 f32 前向，而是 **GPU 插件**：
+`plugins/aten/`（`cuda.aten.f32`，ATen 实现体），缓冲区在显存，recipe 用 `plugins/aten/aten.toml`。
+reference provider 退回它唯一该在的位置——`ops check` 的逐算子 oracle（小张量）。
 
 **上机步骤**（在 `root@47.94.214.197:26002` 上；本机到这一步为止的部分已全部完成）：
 
 ```bash
-# 1) 参考侧：HF 前向（bf16，固定探针），~70 GB 权重（HF 缓存为空时需要下载）
-python3 scripts/hf_qwen36_reference.py dump --model Qwen/Qwen3.6-35B-A3B \
+# 0) 构建 GPU 插件（宿主：python3.13 venv，torch 2.11.0+cu130）
+python3 plugins/aten/build.py --out /root/rustrain-gpu/aten-build
+
+# 1) 参考侧：HF 前向（bf16，固定探针，8 个 token），权重用共享路径、不下载
+HF_HUB_OFFLINE=1 CUDA_VISIBLE_DEVICES=<一张卡> python3 scripts/hf_qwen36_reference.py dump \
+        --model /vePFS-Mindverse/share/huggingface/hub/models--Qwen--Qwen3.6-35B-A3B/snapshots/<rev> \
         --dtype bf16 --device-map auto --out /var/tmp/hf-ref.npz
 
-# 2) 候选侧：rustrain 前向（同样的固定探针；权重 bf16 原样读入、精确加宽到 f32 执行）
+# 2) 候选侧：rustrain 前向（同一固定探针；权重 bf16 原样读入、精确加宽到 f32 执行）
 cargo run --release -p rustrain-cli -- run \
-        --model  crates/rustrain-model/tests/fixtures/qwen36-text \
+        --plugin  /root/rustrain-gpu/aten-build/librustrain_aten.so \
+        --recipe  plugins/aten/aten.toml \
+        --device  cuda \
+        --model   crates/rustrain-model/tests/fixtures/qwen36-text \
         --checkpoint <真实 safetensors 目录或 index.json> \
         --tokens "9707,11,1879,0,323,358,314,279" \
         --out /var/tmp/rustrain.npz
@@ -270,13 +277,20 @@ python3 scripts/hf_qwen36_reference.py compare \
         --reference /var/tmp/hf-ref.npz --candidate /var/tmp/rustrain.npz --json
 ```
 
-两侧的前向各自独立：参考侧是 HF 的 bf16，候选侧是"同样的 bf16 权重加宽到 f32 后执行"。1% 的容差要吸收的是 **HF 的 bf16 舍入**，不是我们的加宽（bf16 ⊂ f32，加宽是精确的）。`compare` 先比对 `input_ids`，不一致直接判定"不可比"。
+两侧的前向各自独立：参考侧是 HF 的 bf16（跑在 GPU 上），候选侧是"同样的 bf16 权重加宽到 f32 后执行"。
+1% 的容差要吸收的是 **HF 的 bf16 舍入**，不是我们的加宽（bf16 ⊂ f32，加宽是精确的）。`compare` 先比对
+`input_ids`，不一致直接判定"不可比"。
 
-**已知上机风险（诚实清单）**：① 参考 provider 是 f32，整模型 f32 常驻约 143 GB —— 宿主机 1.6 TB 内存够，但**这一跑会慢**；② `tp/cp/ep/dp > 1` 的分片执行需要真实的 collective 后端（当前只有 world=1 的 identity 后端，会**响亮拒绝**而不是静默跑错）；③ `pp > 1` 拒绝执行（跨 stage 接缝是 D5 的未决项）；④ 探针超过 512 需要新描述（§3.10 #3）。
+**已知上机风险（诚实清单）**：① 整模型 f32 常驻约 134 GB —— 单卡放不下，单卡跑必须分片（`--tp 2` 起）；
+② `tp/cp/ep/dp > 1` 的分片执行需要真实的 collective 后端，多卡 CUDA 还需要"一进程一卡"的启动形态
+（当前 `run` 的多 rank 是同进程多线程，只适用于 CPU 对照），NCCL 后端是 D6 第 4 步；
+③ `pp > 1` 拒绝执行（跨 stage 接缝是未决项）；④ 探针超过 512 需要新描述（§3.10 #3）。
+
 **验收与证据**：
 - bf16 下 `max_abs_diff(logits) / max_abs(logits)` < 1%
 - 逐层 hidden 摘要差异 < 1%（前 n 层逐层打印，定位第一处发散的层）
-- `rustrain ops check` 退出 0，每条 skip 写明理由
+- `rustrain ops check --plugin librustrain_aten.so --recipe aten.toml --device cuda` 退出 0，
+  每个 aten 变体都与 reference oracle 逐算子对齐；每条 skip 写明理由
 
 ---
 
